@@ -334,6 +334,9 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
+    /// Fixed seed so property runs are reproducible.
+    const PROPTEST_SEED: u64 = 0x5EED_0000_5143;
+
     /// How a test segment is stored.
     #[derive(Clone, Copy)]
     struct Spec<'a> {
@@ -549,7 +552,7 @@ mod tests {
     #[test]
     fn rejects_zbic_and_wrong_decompressed_sizes() {
         let mut file = build([plain(TEXT), plain(RODATA), plain(DATA)], 0);
-        file[FLAGS_OFFSET] |= 1 << 7;
+        file[FLAGS_OFFSET] |= u8::try_from(FLAG_ZBIC).unwrap();
         assert!(matches!(
             Nso::parse(&file),
             Err(NsoError::UnsupportedCompression)
@@ -589,6 +592,10 @@ mod tests {
     }
 
     proptest! {
+        #![proptest_config(ProptestConfig {
+            rng_seed: proptest::test_runner::RngSeed::Fixed(PROPTEST_SEED),
+            ..ProptestConfig::default()
+        })]
         #[test]
         fn arbitrary_bytes_never_panic(bytes in proptest::collection::vec(any::<u8>(), 0..2048)) {
             let _ = Nso::parse(&bytes);

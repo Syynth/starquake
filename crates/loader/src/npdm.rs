@@ -140,6 +140,15 @@ pub struct FileAccessHeader {
     pub unk_size_2: u32,
 }
 
+/// Where a top-level block (`ACI0` or `ACID`) sits in the file, as the `META` header declares it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockLocation {
+    /// Offset of the block from the start of the file.
+    pub offset: u32,
+    /// Size of the block in bytes.
+    pub size: u32,
+}
+
 /// The signed `ACID` block: what the title is allowed to ask for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Acid {
@@ -191,6 +200,10 @@ pub struct Npdm {
     pub main_thread_stack_size: u32,
     /// The program name, up to the first NUL.
     pub name: String,
+    /// Where the `ACI0` block sits in the file (`META` words at 0x70 and 0x74).
+    pub aci0_location: BlockLocation,
+    /// Where the `ACID` block sits in the file (`META` words at 0x78 and 0x7C).
+    pub acid_location: BlockLocation,
     /// The `ACID` block.
     pub acid: Acid,
     /// The `ACI0` block.
@@ -266,8 +279,16 @@ impl Npdm {
             other => return Err(NpdmError::InvalidAddressSpace(other)),
         };
 
-        let requested_block = block(bytes, u32_at(header, 0x70), u32_at(header, 0x74), "ACI0")?;
-        let signed_block = block(bytes, u32_at(header, 0x78), u32_at(header, 0x7C), "ACID")?;
+        let requested_at = BlockLocation {
+            offset: u32_at(header, 0x70),
+            size: u32_at(header, 0x74),
+        };
+        let signed_at = BlockLocation {
+            offset: u32_at(header, 0x78),
+            size: u32_at(header, 0x7C),
+        };
+        let requested_block = block(bytes, requested_at, "ACI0")?;
+        let signed_block = block(bytes, signed_at, "ACID")?;
 
         Ok(Self {
             is_64_bit: flags & 1 != 0,
@@ -278,6 +299,8 @@ impl Npdm {
             process_category: u32_at(header, 0x18),
             main_thread_stack_size: u32_at(header, 0x1C),
             name: read_name(header),
+            aci0_location: requested_at,
+            acid_location: signed_at,
             acid: parse_acid(signed_block)?,
             aci: parse_aci(requested_block)?,
         })
@@ -294,10 +317,10 @@ fn read_name(header: &[u8]) -> String {
 /// A top-level block: at or after the end of `META`, and inside the file.
 fn block<'a>(
     bytes: &'a [u8],
-    offset: u32,
-    size: u32,
+    location: BlockLocation,
     section: &'static str,
 ) -> Result<&'a [u8], NpdmError> {
+    let BlockLocation { offset, size } = location;
     let offset = usize::try_from(offset).map_err(|_| NpdmError::OutOfBounds { section })?;
     let size = usize::try_from(size).map_err(|_| NpdmError::OutOfBounds { section })?;
     if offset < META_SIZE {
@@ -451,6 +474,9 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
+    /// Fixed seed so property runs are reproducible.
+    const PROPTEST_SEED: u64 = 0x5EED_0000_5143;
+
     const TITLE_ID: u64 = 0x0400_C3F0_0006_E000;
 
     /// A test-side NPDM writer that places bytes at the documented offsets.
@@ -557,7 +583,7 @@ mod tests {
         }
     }
 
-    fn check_common(npdm: &Npdm) {
+    fn check_common(npdm: &Npdm, file: &[u8]) {
         assert!(npdm.is_64_bit);
         assert_eq!(npdm.address_space, AddressSpaceType::Is39Bit);
         assert_eq!(npdm.main_thread_priority, 44);
@@ -566,6 +592,34 @@ mod tests {
         assert_eq!(npdm.process_category, 1);
         assert_eq!(npdm.main_thread_stack_size, 0x0020_0000);
         assert_eq!(npdm.name, "example");
+
+        // The block locations are the META words, and the fixture lays ACI0 right after META
+        // and ACID right after ACI0, running to the end of the file.
+        let word = |at: usize| u32::from_le_bytes(file[at..at + 4].try_into().unwrap());
+        let meta_size = u32::try_from(META_SIZE).unwrap();
+        assert_eq!(
+            npdm.aci0_location,
+            BlockLocation {
+                offset: word(0x70),
+                size: word(0x74)
+            }
+        );
+        assert_eq!(
+            npdm.acid_location,
+            BlockLocation {
+                offset: word(0x78),
+                size: word(0x7C)
+            }
+        );
+        assert_eq!(npdm.aci0_location.offset, meta_size);
+        assert_eq!(
+            npdm.acid_location.offset,
+            npdm.aci0_location.offset + npdm.aci0_location.size
+        );
+        assert_eq!(
+            usize::try_from(npdm.acid_location.offset + npdm.acid_location.size).unwrap(),
+            file.len()
+        );
 
         assert!(npdm.acid.production);
         assert!(!npdm.acid.unqualified_approval);
@@ -629,7 +683,7 @@ mod tests {
 
         let npdm = Npdm::parse(&file).unwrap();
         assert_eq!(npdm.acid.layout, AcidLayout::Switch1);
-        check_common(&npdm);
+        check_common(&npdm, &file);
     }
 
     #[test]
@@ -641,7 +695,7 @@ mod tests {
 
         let npdm = Npdm::parse(&file).unwrap();
         assert_eq!(npdm.acid.layout, AcidLayout::Switch2);
-        check_common(&npdm);
+        check_common(&npdm, &file);
     }
 
     #[test]
@@ -788,6 +842,10 @@ mod tests {
     }
 
     proptest! {
+        #![proptest_config(ProptestConfig {
+            rng_seed: proptest::test_runner::RngSeed::Fixed(PROPTEST_SEED),
+            ..ProptestConfig::default()
+        })]
         #[test]
         fn arbitrary_bytes_never_panic(bytes in proptest::collection::vec(any::<u8>(), 0..1024)) {
             let _ = Npdm::parse(&bytes);

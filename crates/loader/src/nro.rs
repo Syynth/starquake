@@ -340,6 +340,9 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
+    /// Fixed seed so property runs are reproducible.
+    const PROPTEST_SEED: u64 = 0x5EED_0000_5143;
+
     const MOD0_AT: u32 = 0x80;
 
     /// Builds an NRO image of 0x200 bytes with a `MOD0` header at [`MOD0_AT`].
@@ -567,6 +570,10 @@ mod tests {
     }
 
     proptest! {
+        #![proptest_config(ProptestConfig {
+            rng_seed: proptest::test_runner::RngSeed::Fixed(PROPTEST_SEED),
+            ..ProptestConfig::default()
+        })]
         #[test]
         fn arbitrary_bytes_never_panic(bytes in proptest::collection::vec(any::<u8>(), 0..1024)) {
             let _ = Nro::parse(&bytes);

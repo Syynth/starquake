@@ -430,6 +430,9 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
+    /// Fixed seed so property runs are reproducible.
+    const PROPTEST_SEED: u64 = 0x5EED_0000_5143;
+
     // Test-side encoders: build descriptors from fields, independently of the decoder.
     fn thread_info(min_prio: u32, max_prio: u32, min_core: u32, max_core: u32) -> u32 {
         0b111 | (max_prio << 4) | (min_prio << 10) | (min_core << 16) | (max_core << 24)
@@ -509,7 +512,7 @@ mod tests {
             // MapRegion: DTB read-only in slot 0, OnMemoryBootImage read-write in slot 1.
             0x3FF | (3 << 11) | (1 << 17) | (2 << 18),
             // Interrupt pair: 0x41 and padding.
-            0x7FF | (0x41 << 12) | (0x3FF << 22),
+            0x7FF | (0x41 << 12) | (PADDING_INTERRUPT_ID << 22),
             // ProgramType 1.
             0x1FFF | (1 << 14),
             kernel_version(9, 1),
@@ -524,20 +527,20 @@ mod tests {
             caps.memory_maps,
             [
                 MemoryMap {
-                    address: 0x1234 * 0x1000,
-                    size: 0x10 * 0x1000,
+                    address: 0x1234 * PAGE_SIZE,
+                    size: 0x10 * PAGE_SIZE,
                     read_only: true,
                     kind: MemoryMapKind::Static
                 },
                 MemoryMap {
-                    address: 7 * 0x1000,
-                    size: 2 * 0x1000,
+                    address: 7 * PAGE_SIZE,
+                    size: 2 * PAGE_SIZE,
                     read_only: false,
                     kind: MemoryMapKind::Io
                 },
                 MemoryMap {
-                    address: 0xABCDE * 0x1000,
-                    size: 0x1000,
+                    address: 0xABCDE * PAGE_SIZE,
+                    size: PAGE_SIZE,
                     read_only: false,
                     kind: MemoryMapKind::IoPage
                 },
@@ -632,6 +635,10 @@ mod tests {
     }
 
     proptest! {
+        #![proptest_config(ProptestConfig {
+            rng_seed: proptest::test_runner::RngSeed::Fixed(PROPTEST_SEED),
+            ..ProptestConfig::default()
+        })]
         #[test]
         fn arbitrary_words_never_panic(words in proptest::collection::vec(any::<u32>(), 0..64)) {
             let _ = KernelCapabilities::parse(&words);

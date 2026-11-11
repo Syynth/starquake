@@ -74,9 +74,13 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
+    /// Fixed seed so property runs are reproducible.
+    const PROPTEST_SEED: u64 = 0x5EED_0000_5143;
+
     /// Encodes one entry the way the file does.
     fn entry(name: &str, server: bool) -> Vec<u8> {
-        let mut out = vec![u8::try_from(name.len() - 1).unwrap() | if server { 0x80 } else { 0 }];
+        let mut out =
+            vec![u8::try_from(name.len() - 1).unwrap() | if server { SERVER_FLAG } else { 0 }];
         out.extend_from_slice(name.as_bytes());
         out
     }
@@ -135,6 +139,10 @@ mod tests {
     }
 
     proptest! {
+        #![proptest_config(ProptestConfig {
+            rng_seed: proptest::test_runner::RngSeed::Fixed(PROPTEST_SEED),
+            ..ProptestConfig::default()
+        })]
         #[test]
         fn arbitrary_bytes_never_panic(bytes in proptest::collection::vec(any::<u8>(), 0..256)) {
             let _ = parse(&bytes);
