@@ -22,6 +22,12 @@ pub const CMIF_HEADER_BYTES: usize = 16;
 /// Size in bytes of a domain message header, request or reply
 /// (`eden/src/core/hle/ipc.h`, `static_assert(sizeof(DomainMessageHeader) == 16)`).
 pub const DOMAIN_HEADER_BYTES: usize = 16;
+/// Largest number of input object ids in a domain request: the count is bits 8..16 of the first
+/// domain header word (`eden/src/core/hle/ipc.h`, `DomainMessageHeader`).
+pub const MAX_DOMAIN_INPUT_OBJECTS: u32 = 0xFF;
+/// Largest value of a domain request's `size` field: bits 16..32 of the first domain header word
+/// (`eden/src/core/hle/ipc.h`, `DomainMessageHeader`).
+pub const MAX_DOMAIN_SIZE: u32 = 0xFFFF;
 
 /// What a domain request asks of an object
 /// (`eden/src/core/hle/ipc.h`, `DomainMessageHeader::CommandType`).
@@ -87,13 +93,13 @@ impl DomainRequestHeader {
 
     /// Encodes four words, checking the count and size fit their fields.
     pub fn encode(&self) -> Result<[u32; 4]> {
-        if self.input_object_count > 0xFF {
+        if self.input_object_count > MAX_DOMAIN_INPUT_OBJECTS {
             return Err(IpcError::FieldOutOfRange {
                 field: "domain input object count",
                 value: u64::from(self.input_object_count),
             });
         }
-        if self.size > 0xFFFF {
+        if self.size > MAX_DOMAIN_SIZE {
             return Err(IpcError::FieldOutOfRange {
                 field: "domain message size",
                 value: u64::from(self.size),

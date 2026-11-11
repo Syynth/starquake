@@ -14,7 +14,8 @@
 use crate::cmif::{CmifReplyHeader, DomainReplyHeader};
 use crate::error::{IpcError, Result};
 use crate::hipc::{
-    BUFFER_SIZE, CommandHeader, CommandType, MAX_TIPC_COMMAND_ID, ReceiveList, SpecialHeader,
+    CommandHeader, CommandType, MAX_TIPC_COMMAND_ID, ReceiveList, SpecialHeader, align_raw,
+    push_data, write_words,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,22 +110,7 @@ impl ReplyBuilder {
     /// a count or id is out of range, or if object ids were added to a non-domain reply; on
     /// failure `buf` is left unchanged.
     pub fn build(&self, buf: &mut [u8]) -> Result<usize> {
-        let words = self.words()?;
-        let needed = words.len().saturating_mul(4);
-        let capacity = buf.len().min(BUFFER_SIZE);
-        let out = buf
-            .get_mut(..needed)
-            .filter(|_| needed <= capacity)
-            .ok_or(IpcError::DoesNotFit { needed, capacity })?;
-        out.fill(0);
-        for (chunk, word) in out.as_chunks_mut::<4>().0.iter_mut().zip(&words) {
-            *chunk = word.to_le_bytes();
-        }
-        // Zero the rest of the usable area as well.
-        if let Some(tail) = buf.get_mut(needed..capacity) {
-            tail.fill(0);
-        }
-        Ok(needed)
+        write_words(&self.words()?, buf)
     }
 
     fn words(&self) -> Result<Vec<u32>> {
@@ -139,7 +125,7 @@ impl ReplyBuilder {
         let has_special_header = !self.copy_handles.is_empty() || !self.move_handles.is_empty();
 
         // The two header words are filled in last, once the raw data size is known.
-        let mut words = vec![0, 0];
+        let mut words = vec![0; CommandHeader::WORDS];
         if has_special_header {
             words.push(special.encode()?);
             words.extend_from_slice(&self.copy_handles);
@@ -153,12 +139,12 @@ impl ReplyBuilder {
                     return Err(IpcError::TipcCommandOutOfRange(command_id));
                 }
                 words.push(self.result);
-                self.push_data(&mut words);
+                push_data(&mut words, &self.data);
                 CommandType::Tipc(command_id)
             }
             Layout::Cmif { domain } => {
                 // Align the payload to 16 bytes, measured from the start of the buffer.
-                words.resize(words.len().next_multiple_of(4), 0);
+                align_raw(&mut words);
                 if domain {
                     words.extend_from_slice(
                         &DomainReplyHeader {
@@ -175,7 +161,7 @@ impl ReplyBuilder {
                     }
                     .encode(),
                 );
-                self.push_data(&mut words);
+                push_data(&mut words, &self.data);
                 words.extend_from_slice(&self.object_ids);
                 CommandType::Invalid
             }
@@ -195,16 +181,6 @@ impl ReplyBuilder {
         words[0] = w0;
         words[1] = w1;
         Ok(words)
-    }
-
-    fn push_data(&self, words: &mut Vec<u32>) {
-        for chunk in self.data.chunks(4) {
-            let mut word = [0_u8; 4];
-            for (slot, byte) in word.iter_mut().zip(chunk) {
-                *slot = *byte;
-            }
-            words.push(u32::from_le_bytes(word));
-        }
     }
 }
 

@@ -1,12 +1,13 @@
 //! Hand-assembled buffers: every word below was written out from the documented layout
 //! (`eden/src/core/hle/ipc.h`, `hle_ipc.cpp`, scoping doc row 22), not produced by this crate's
-//! builder. Each test then parses the bytes, and the reply tests also check that the builder
-//! produces exactly the same bytes.
+//! builder. Each test then parses the bytes, and also checks that the matching builder
+//! (`RequestBuilder` for requests, `ReplyBuilder` for replies) produces exactly the same bytes.
 
 use starquake_ipc::{
     BUFFER_SIZE, Body, BufferDescriptor, CmifReplyHeader, CmifRequest, CmifRequestHeader,
     CommandType, DomainCommand, DomainReplyHeader, DomainRequestHeader, IpcError, Message,
-    ReplyBuilder, SFCI_MAGIC, SFCO_MAGIC, SessionKind,
+    ReceiveDescriptor, ReceiveList, ReplyBuilder, RequestBuilder, SFCI_MAGIC, SFCO_MAGIC,
+    SessionKind,
 };
 
 /// Serialises words little-endian and zero-fills to a whole IPC buffer.
@@ -98,6 +99,20 @@ fn cmif_request_with_pid_copy_handle_and_a_descriptor() {
     );
     assert_eq!(request.data, le(&[0x1111_2222, 0x3333_4444]));
     assert_eq!(request.object_ids, [0_u32; 0]);
+
+    let mut built = [0x55_u8; BUFFER_SIZE];
+    RequestBuilder::cmif(CommandType::Request, 11)
+        .send_pid(0x42)
+        .copy_handle(0xAB)
+        .send_buffer(BufferDescriptor {
+            address: 0x51_2345_6000,
+            size: 0x2_0000_1234,
+            flags: 1,
+        })
+        .data(&le(&[0x1111_2222, 0x3333_4444]))
+        .build(&mut built)
+        .unwrap();
+    assert_eq!(built.as_slice(), bytes.as_slice());
 }
 
 #[test]
@@ -169,6 +184,14 @@ fn domain_request_with_input_object() {
         Message::parse_request(&bytes, SessionKind::Session),
         Err(IpcError::BadMagic { .. })
     ));
+
+    let mut built = [0x55_u8; BUFFER_SIZE];
+    RequestBuilder::domain(CommandType::Request, 3, 5)
+        .data(&le(&[0xCAFE_F00D]))
+        .object_id(7)
+        .build(&mut built)
+        .unwrap();
+    assert_eq!(built.as_slice(), bytes.as_slice());
 }
 
 /// Domain request closing a virtual handle: command 2, no SFCI header, no data.
@@ -195,6 +218,10 @@ fn domain_close_virtual_handle_has_no_sfci() {
             token: 0,
         })
     );
+
+    let mut built = [0x55_u8; BUFFER_SIZE];
+    RequestBuilder::domain_close(3).build(&mut built).unwrap();
+    assert_eq!(built.as_slice(), bytes.as_slice());
 }
 
 /// TIPC request, command id 3: the type is `16 + 3`; the raw data is the arguments, with no SFCI
@@ -217,6 +244,13 @@ fn tipc_request() {
             data: &le(&[0xAAAA_0001, 0xBBBB_0002])
         }
     );
+
+    let mut built = [0x55_u8; BUFFER_SIZE];
+    RequestBuilder::tipc(3)
+        .data(&le(&[0xAAAA_0001, 0xBBBB_0002]))
+        .build(&mut built)
+        .unwrap();
+    assert_eq!(built.as_slice(), bytes.as_slice());
 }
 
 /// TIPC reply carrying data. The result is ONE word, and the data starts at the very next word.
@@ -410,6 +444,12 @@ fn close_commands_only_need_the_header() {
         assert_eq!(message.body, Body::Close);
         assert!(message.command_type.is_close());
     }
+
+    let mut built = [0x55_u8; BUFFER_SIZE];
+    RequestBuilder::close().build(&mut built).unwrap();
+    assert_eq!(built.as_slice(), buffer(&[2, 0]).as_slice());
+    RequestBuilder::tipc_close().build(&mut built).unwrap();
+    assert_eq!(built.as_slice(), buffer(&[15, 0]).as_slice());
 }
 
 #[test]
@@ -532,12 +572,23 @@ fn receive_descriptors_follow_the_raw_data() {
     ];
     let bytes = buffer(&words);
     let message = Message::parse_request(&bytes, SessionKind::Session).unwrap();
-    assert_eq!(message.receive_list, starquake_ipc::ReceiveList::Many(1));
+    assert_eq!(message.receive_list, ReceiveList::Many(1));
     assert_eq!(
         message.receive_descriptors,
-        [starquake_ipc::ReceiveDescriptor {
+        [ReceiveDescriptor {
             address: 0x1_4000_0000,
             size: 0x40
         }]
     );
+
+    let mut built = [0x55_u8; BUFFER_SIZE];
+    RequestBuilder::cmif(CommandType::Request, 1)
+        .receive_list(ReceiveList::Many(1))
+        .receive_descriptor(ReceiveDescriptor {
+            address: 0x1_4000_0000,
+            size: 0x40,
+        })
+        .build(&mut built)
+        .unwrap();
+    assert_eq!(built.as_slice(), bytes.as_slice());
 }

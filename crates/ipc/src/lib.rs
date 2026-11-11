@@ -13,7 +13,9 @@
 //!   reply's raw data starts with a single result word. Eden's `ResponseBuilder::Push(Result)`
 //!   wrote the two-word CMIF result into TIPC replies, which put reply data one word late
 //!   (`docs/switch2-eden-diff-scoping.md`, row 22; `eden-nx2/NX2_NOTES.md`, row 22).
-//! - [`Message`] parses a whole buffer; [`ReplyBuilder`] writes CMIF, domain and TIPC replies.
+//! - [`Message`] parses a whole buffer; [`ReplyBuilder`] writes CMIF, domain and TIPC replies, and
+//!   [`RequestBuilder`] writes the matching requests (what a guest, a synthetic test program or a
+//!   golden-trace tool puts in its buffer).
 //!
 //! Ported from `eden/src/core/hle/ipc.h`, `eden/src/core/hle/service/hle_ipc.cpp` and
 //! `eden/src/core/hle/service/ipc_helpers.h` (GPL-3.0-or-later), with the TIPC reply layout taken
@@ -24,16 +26,19 @@ pub mod error;
 pub mod hipc;
 pub mod message;
 pub mod reply;
+pub mod request;
 
 pub use cmif::{
     CMIF_HEADER_BYTES, CmifReplyHeader, CmifRequestHeader, DOMAIN_HEADER_BYTES, DomainCommand,
-    DomainReplyHeader, DomainRequestHeader, SFCI_MAGIC, SFCO_MAGIC,
+    DomainReplyHeader, DomainRequestHeader, MAX_DOMAIN_INPUT_OBJECTS, MAX_DOMAIN_SIZE, SFCI_MAGIC,
+    SFCO_MAGIC,
 };
 pub use error::{IpcError, Result};
 pub use hipc::{
     BUFFER_SIZE, BufferDescriptor, CommandHeader, CommandType, MAX_DESCRIPTORS, MAX_HANDLES,
-    MAX_RAW_WORDS, MAX_TIPC_COMMAND_ID, ReceiveDescriptor, ReceiveList, SpecialHeader,
-    StaticDescriptor, TIPC_COMMAND_OFFSET,
+    MAX_RAW_WORDS, MAX_RECEIVE_DESCRIPTORS, MAX_TIPC_COMMAND_ID, RAW_ALIGNMENT_WORDS,
+    ReceiveDescriptor, ReceiveList, SpecialHeader, StaticDescriptor, TIPC_COMMAND_OFFSET,
 };
 pub use message::{Body, CmifReply, CmifRequest, Message, SessionKind};
 pub use reply::ReplyBuilder;
+pub use request::RequestBuilder;
