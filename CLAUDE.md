@@ -38,6 +38,8 @@ Platform-specific code must still compile (or be `cfg`-gated) on Linux; check wi
   reaching around a layer.
 - Guest-controlled values are untrusted: checked arithmetic and bounds on anything derived from
   guest memory, file contents or IPC words. A malformed input is an `Err`, never a panic.
+- Compatibility comes first. A design may defer a feature (server-side IPC, real system modules,
+  homebrew services), but must not rule it out, and must say how it could be added later.
 - Protocol facts (command ids, struct layouts) need a source in a comment: a scoping-doc row, a
   reference path and commit, or a trace. Mark guesses as guesses.
 
