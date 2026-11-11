@@ -486,4 +486,116 @@ pub fn main() {
         "VA +0x1000 -> PA +0x3000 and VA +0x2000 -> PA +0x1000 inside one 16 KiB page: {ok} ({:#x}, {:#x})",
         o.x[0], o.x[3]
     );
+
+    // ---- TLB invalidation across vCPUs ----
+    // Both vCPUs share the same stage-1 tables. The host repoints a page-table entry without
+    // flushing, and we watch when each vCPU starts seeing the new page.
+    println!("\n## TLB invalidation across vCPUs");
+    const TLB_VA: u64 = REMAP_VA + 0x3000;
+    const OLD: u64 = 0xC1C1_C1C1_0000_1000;
+    const NEW: u64 = 0xC3C3_C3C3_0000_3000;
+    const SPIN_TRIES: u64 = 4_000_000_000;
+    let l3b = PT_BASE + 0x3000;
+    let name = |value: u64| match value {
+        OLD => "old page",
+        NEW => "new page",
+        _ => "unexpected value",
+    };
+    let (tx, rx) = std::sync::mpsc::channel::<Test>();
+    let (rtx, rrx) = std::sync::mpsc::channel::<u64>();
+    let other = std::thread::spawn(move || {
+        let v = Vcpu::new();
+        let args = [
+            (HV_REG_X0 + 1, TLB_VA),
+            (HV_REG_X0 + 2, NEW),
+            (HV_REG_X0 + 3, SPIN_TRIES),
+        ];
+        for test in rx {
+            let o = run(&v, test, &args);
+            if rtx.send(o.x[0]).is_err() {
+                break;
+            }
+        }
+    });
+    let on_b = |test: Test| {
+        tx.send(test).ok();
+        rrx.recv().unwrap_or(0)
+    };
+    let on_a = |test: Test| run(&v, test, &[(HV_REG_X0 + 1, TLB_VA)]).x[0];
+    let old_entry = || l3_entry(l3b, TLB_VA, MARKERS + 0x1000, AP_EL1_RW | PXN | UXN);
+    let new_entry = || l3_entry(l3b, TLB_VA, MARKERS + 0x3000, AP_EL1_RW | PXN | UXN);
+
+    // 1. Does a cached translation survive a trip out to the host and back?
+    old_entry();
+    on_a(Test::TlbiIs);
+    on_b(Test::TlbiLocal);
+    let (a0, b0) = (on_a(Test::Read), on_b(Test::Read));
+    new_entry();
+    let (a1, b1) = (on_a(Test::Read), on_b(Test::Read));
+    println!(
+        "exit to host and re-enter: before the change A {}, B {}; after it (no flush) A {}, B {}",
+        name(a0),
+        name(b0),
+        name(a1),
+        name(b1)
+    );
+
+    // 2. A vCPU that stays inside the guest while the entry changes. Control rounds never
+    //    flush; the others flush from vCPU A after 10 ms. If the broadcast form works, B sees the
+    //    new page within microseconds of A's flush; without a flush it takes however long the
+    //    host needs to interrupt B for its own reasons.
+    let spin_round = |flush: bool| -> (bool, Duration) {
+        old_entry();
+        on_a(Test::TlbiIs);
+        on_b(Test::TlbiLocal);
+        tx.send(Test::SpinRead).ok();
+        std::thread::sleep(Duration::from_millis(20));
+        new_entry();
+        let changed = Instant::now();
+        if rrx.recv_timeout(Duration::from_millis(10)).is_ok() {
+            return (false, changed.elapsed());
+        }
+        let start = if flush {
+            on_a(Test::TlbiIs);
+            Instant::now()
+        } else {
+            changed
+        };
+        rrx.recv().ok();
+        (flush, start.elapsed())
+    };
+    let report = |label: &str, times: &mut Vec<Duration>| {
+        times.sort();
+        if let (Some(first), Some(last)) = (times.first(), times.last()) {
+            println!(
+                "{label}: {} rounds, min {:?}, median {:?}, max {:?}",
+                times.len(),
+                first,
+                times[times.len() / 2],
+                last
+            );
+        } else {
+            println!("{label}: 0 rounds");
+        }
+    };
+    let (mut early, mut unflushed, mut flushed) = (Vec::new(), Vec::new(), Vec::new());
+    for round in 0..40 {
+        let flush = round % 2 == 0;
+        match spin_round(flush) {
+            (true, t) => flushed.push(t),
+            (false, t) if t < Duration::from_millis(10) => early.push(t),
+            (false, t) => unflushed.push(t),
+        }
+    }
+    report("B saw the new page within 10 ms on its own", &mut early);
+    report(
+        "no flush: time from the change until B saw the new page",
+        &mut unflushed,
+    );
+    report(
+        "broadcast flush on A: time from the flush until B saw the new page",
+        &mut flushed,
+    );
+    drop(tx);
+    other.join().ok();
 }

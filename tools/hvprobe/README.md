@@ -30,7 +30,22 @@ entitlement first.
 | MTE `STG` | UNDEFINED, EC 0x0 to guest EL1; skipping it works | Handle it in the guest EL1 handler as a no-op (one site per title), or patch it at load time. |
 | 4 KiB stage-1 pages on a 16 KiB host | Works: two 4 KiB pages remapped out of order inside one 16 KiB host page read correctly | The guest's 4 KiB granule (`svcGetInfo` 33) is fine. Only stage-2 (IPA → host) mappings need 16 KiB alignment. |
 
-What this doesn't cover yet: multiple vCPUs running at once, VM-exit cost under contention,
+### TLB invalidation across vCPUs (added 2026-11-11)
+
+Two vCPUs share one set of stage-1 tables. The host repoints a page-table entry without flushing
+while vCPU B keeps reading that page inside the guest. 40 rounds, run twice:
+
+| Case | Time until B sees the new page |
+|---|---|
+| No flush at all | median 130–250 ms, up to ~1 s (B only notices when the host happens to interrupt it) |
+| vCPU A executes `tlbi vmalle1is` at EL1 | 42 ns – 7 µs after A's flush returns |
+| vCPU exits to the host and re-enters after the change | Sees the new page immediately in this test; don't rely on it |
+
+Consequence: **broadcast TLB invalidation works across vCPUs.** After changing stage-1 tables,
+one vCPU running the EL1 flush entry point is enough; other cores don't need to be interrupted.
+A change must never be left unflushed: a running vCPU keeps a stale translation for a long time.
+
+What this doesn't cover yet: VM-exit cost with six vCPUs running at once, full context-switch cost,
 `hv_vcpus_exit` for preempting a vCPU, stage-2 remapping cost (lazy backing of sparse regions),
 and exception-level details of a real HLE kernel (TPIDRRO_EL0, FP/SIMD state, EL0 data aborts
 for fastmem-style tracking).
