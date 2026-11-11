@@ -26,9 +26,10 @@ set, nextest, doctests. CI runs exactly this. Platform-specific code must still 
 
 ## Architecture rules
 
-- Dependencies point one way: `memory` → `cpu`, `ipc` → `kernel` → `services` → `gsv` → `gpu` →
-  `shader`, `render`. `core` wires everything; frontends depend only on `core`. No cycles, and
-  no reaching around a layer.
+- Dependencies point one way: `memory` → `cpu` → `kernel` → `services` → `gsv` → `gpu` →
+  `shader`, `render`. `ipc` is a leaf (byte slices only, no workspace dependencies) that `kernel`
+  depends on. `core` wires everything; frontends depend only on `core`. No cycles, and no
+  reaching around a layer.
 - Guest-controlled values are untrusted: checked arithmetic and bounds on anything derived from
   guest memory, file contents or IPC words. A malformed input is an `Err`, never a panic.
 - Protocol facts (command ids, struct layouts) need a source in a comment: a scoping-doc row, a
