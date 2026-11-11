@@ -10,8 +10,10 @@
 //! - **One `match`** from system-call number to a typed function. Arguments are decoded with the
 //!   call's [`Convention`], and outputs written back with it.
 //! - **Unknown and unimplemented calls** (an unlisted number, or a call whose [`Status`] isn't
-//!   [`Status::Implemented`]) are logged and return [`KernelError::NotImplemented`] in `x0`. No
-//!   input makes the dispatcher panic.
+//!   [`Status::Implemented`]) are logged and return [`KernelError::NotImplemented`] in `x0`. Any
+//!   system call number and any register values dispatch without a panic, given an [`Env`],
+//!   [`GuestMemory`] and [`DebugSink`] that don't panic themselves (tests: every unlisted number
+//!   in `0..=u16::MAX`, and a property test over any number, core and `x0`-`x7`).
 //! - **One recording point** (observability spec, "One recording point per boundary"): every
 //!   dispatch ends in a [`Record`] passed to a no-op hook while the lock is still held. When the
 //!   hook is wired to `starquake-trace`'s recorder, the recorder assigns the event's `seq` there,

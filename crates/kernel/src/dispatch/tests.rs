@@ -1,24 +1,46 @@
 //! The dispatcher driven with a fake register file, environment, memory and debug sink.
 
+use proptest::prelude::*;
+use proptest::test_runner::{Config, RngAlgorithm, RngSeed};
 use starquake_memory::FlatMemory;
 use starquake_trace::{EnvCall, FixedClock, LiveEnv, ReplayEnv};
 
 use super::*;
+use crate::handle::MAX_TABLE_SIZE;
+use crate::svc::tick::{CNTFREQ, NANOS_PER_SECOND};
 use crate::svc::{Arg, Kind};
 
 /// Above 4 GiB, so an address truncated to 32 bits would miss it.
 const BASE: u64 = 0x80_0000_0000;
-const TICK: u64 = 0xfedc_ba98_7654_3210;
+/// The first clock reading, in nanoseconds (what the `Env` reports): a whole number of seconds,
+/// so the expected guest ticks are `CLOCK_SECONDS * CNTFREQ` with no rounding.
+const CLOCK_SECONDS: u64 = 1_000_000_007;
+const CLOCK_START_NS: u64 = CLOCK_SECONDS * NANOS_PER_SECOND;
+/// What `GetSystemTick` returns for the first reading.
+const FIRST_TICKS: u64 = CLOCK_SECONDS * CNTFREQ;
 
-/// A live environment whose clock reads `TICK` first.
+/// Fixed seed so a run is reproducible; failures are not persisted to disk.
+const PROPTEST_SEED: u64 = 0x4449_5350_4154_4348;
+
+fn config() -> ProptestConfig {
+    ProptestConfig {
+        cases: 256,
+        rng_algorithm: RngAlgorithm::ChaCha,
+        rng_seed: RngSeed::Fixed(PROPTEST_SEED),
+        failure_persistence: None,
+        ..Config::default()
+    }
+}
+
+/// A live environment whose clock reads `CLOCK_START_NS` first, then one nanosecond more.
 fn env() -> LiveEnv {
-    LiveEnv::new(FixedClock::new(TICK, 1), 0)
+    LiveEnv::new(FixedClock::new(CLOCK_START_NS, 1), 0)
 }
 
 /// Fresh placeholder tables. The one place the tests build them.
 fn tables() -> Tables {
     Tables {
-        handles: HandleTable::default(),
+        handles: HandleTable::new(i32::from(MAX_TABLE_SIZE)).expect("a maximum-size handle table"),
         address_space: AddressSpace::default(),
         scheduler: Scheduler::default(),
         processes: Processes::default(),
@@ -95,8 +117,10 @@ fn get_system_tick_writes_the_environments_counter_to_x0() {
     );
     assert_eq!(record.outcome, Outcome::Completed);
     assert_eq!(record.id, Some(SvcId::GetSystemTick));
+    // The clock reports nanoseconds; the guest gets counter ticks (CNTFREQ), not the raw reading.
     // A full 64-bit value (int64_t), not truncated to a 32-bit word.
-    assert_eq!(regs.x[0], TICK);
+    assert_ne!(FIRST_TICKS >> 32, 0);
+    assert_eq!(regs.x[0], FIRST_TICKS);
     assert_untouched_from(&regs, &before, 1);
 }
 
@@ -221,6 +245,28 @@ fn every_unlisted_number_is_handled_without_panicking() {
     }
 }
 
+proptest! {
+    #![proptest_config(config())]
+
+    /// Any svc number with any register values, against an `Env`, memory and sink that don't
+    /// panic themselves, completes the dispatch and returns a record for that number.
+    #[test]
+    fn any_number_and_registers_dispatch_without_panicking(
+        number in any::<u16>(),
+        core in any::<u8>(),
+        x in prop::array::uniform8(any::<u64>()),
+    ) {
+        let memory = FlatMemory::new(BASE, 0x10);
+        let mut sink = Collect::default();
+        let mut regs = GuestRegs::default();
+        regs.x[..x.len()].copy_from_slice(&x);
+        let record = dispatch_one(number, &mut regs, core, &memory, &mut sink);
+        prop_assert_eq!(record.number, number);
+        prop_assert_eq!(record.core, core);
+        prop_assert_eq!(record.args, x);
+    }
+}
+
 #[test]
 fn a_deferred_call_returns_not_implemented_and_leaves_its_outputs_alone() {
     // SetHeapSize's convention outputs x0 (result) and x1 (address). Divergence from Eden's
@@ -308,8 +354,8 @@ fn one_dispatcher_serves_calls_in_turn_and_records_the_arguments_as_passed() {
     assert_eq!(
         env.recording(),
         [
-            starquake_trace::EnvRecord::Clock(starquake_trace::GuestTicks(TICK)),
-            starquake_trace::EnvRecord::Clock(starquake_trace::GuestTicks(TICK + 1)),
+            starquake_trace::EnvRecord::Clock(starquake_trace::GuestTicks(CLOCK_START_NS)),
+            starquake_trace::EnvRecord::Clock(starquake_trace::GuestTicks(CLOCK_START_NS + 1)),
         ]
     );
     let _tables: Tables = dispatcher.into_tables();
