@@ -26,19 +26,28 @@ fn config() -> ProptestConfig {
     }
 }
 
-/// The bytes of `file` a parsed segment names.
-fn segment_bytes<'a>(file: &'a [u8], segment: &NroSegment) -> &'a [u8] {
-    let start = usize::try_from(segment.offset).unwrap();
-    &file[start..start + usize::try_from(segment.size).unwrap()]
+/// Helpers, in a `cfg(test)` module so they may unwrap like the tests do.
+#[cfg(test)]
+mod support {
+    use super::*;
+
+    /// The bytes of `file` a parsed segment names.
+    pub(crate) fn segment_bytes(file: &[u8], segment: NroSegment) -> &[u8] {
+        let start = usize::try_from(segment.offset).unwrap();
+        &file[start..start + usize::try_from(segment.size).unwrap()]
+    }
+
+    /// Whether `segment` is a whole number of pages that starts with `content` and is zero after
+    /// it.
+    pub(crate) fn holds(file: &[u8], segment: NroSegment, content: &[u8]) -> bool {
+        let bytes = segment_bytes(file, segment);
+        bytes.len().is_multiple_of(built::PAGE_SIZE)
+            && bytes.starts_with(content)
+            && bytes[content.len()..].iter().all(|byte| *byte == 0)
+    }
 }
 
-/// Whether `segment` is a whole number of pages that starts with `content` and is zero after it.
-fn holds(file: &[u8], segment: &NroSegment, content: &[u8]) -> bool {
-    let bytes = segment_bytes(file, segment);
-    bytes.len().is_multiple_of(built::PAGE_SIZE)
-        && bytes.starts_with(content)
-        && bytes[content.len()..].iter().all(|byte| *byte == 0)
-}
+use support::{holds, segment_bytes};
 
 #[test]
 fn the_public_constants_agree() {
@@ -80,15 +89,15 @@ proptest! {
         prop_assert_eq!(nro.data.offset + nro.data.size, nro.size);
 
         // The text segment holds the headers and then the code.
-        let text = segment_bytes(&file, &nro.text);
+        let text = segment_bytes(&file, nro.text);
         prop_assert!(text.len().is_multiple_of(built::PAGE_SIZE));
         let code_bytes = a64::to_bytes(&code);
         prop_assert_eq!(
             &text[built::CODE_OFFSET..built::CODE_OFFSET + code_bytes.len()],
             &code_bytes[..]
         );
-        prop_assert!(holds(&file, &nro.rodata, &rodata), "rodata");
-        prop_assert!(holds(&file, &nro.data, &data), "data");
+        prop_assert!(holds(&file, nro.rodata, &rodata), "rodata");
+        prop_assert!(holds(&file, nro.data, &data), "data");
 
         prop_assert_eq!(nro.bss_size, u32::from(bss_size));
         prop_assert_eq!(nro.build_id, build_id);
