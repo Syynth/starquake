@@ -104,3 +104,11 @@ Entry format:
 - **SCOPE:** architectural
 - **WHAT:** (1) A service handles one request at a time per server by default, across all its sessions, as most real system modules do. A server that is multi-threaded on a console can opt in to several workers, with a stated reason. A deferred request doesn't hold the server. (2) The way service methods are written (a `commands!` table with hand-written unpacking) is a trial: `sm:`, `set:sys` and an `fsp-srv` subset are written that way, then judged before a fourth service is ported. If the methods are long or error-prone, the framework moves to a typed style where the method signature declares its inputs and outputs.
 - **WHY:** Per-server queueing keeps thread-safety out of ordinary service code, which is where agent-written code is most likely to have subtle bugs, and it matches the console. The handler style will be repeated thousands of times and is expensive to change once many services exist, so it should be chosen from evidence, not up front.
+
+## Test support is split by dependency; fixtures and snapshots are guarded
+- **WHEN:** 2026-11-11
+- **PROJECT:** starquake
+- **SYSTEM:** testing
+- **SCOPE:** moderate
+- **WHAT:** (1) `starquake-testkit` holds only test helpers that depend on none of our crates (instruction encoders, a synthetic program builder). Each crate exports its own fakes behind a `test-support` feature. (2) Prebuilt homebrew test binaries are committed next to their source, with a source-hash manifest that the gate checks. (3) A PR that changes a trace snapshot must explain each change in its description, and review checks the explanation against the diff.
+- **WHY:** Fakes in a shared crate break the defining crate's own unit tests (Rust builds two incompatible copies), and a large shared testkit is a merge hot spot and a shared blind spot. The hash check catches a binary drifting from its source without needing the toolchain in CI. Snapshots only protect anything if their changes are read, and agents can otherwise pass a test by accepting whatever the new output is.
