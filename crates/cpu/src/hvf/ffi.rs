@@ -106,6 +106,22 @@ unsafe extern "C" {
     pub(super) fn sys_icache_invalidate(start: *mut c_void, len: usize);
 }
 
+/// The host's `CNTFRQ_EL0`: the rate, in hertz, of the counter behind `CNTVCT_EL0`.
+pub(super) fn cntfrq_el0() -> u64 {
+    let hz: u64;
+    // SAFETY: `mrs` of `CNTFRQ_EL0` is permitted at EL0 on macOS (it is how user space times
+    // things) and only copies a system register into the output register: it reads and writes no
+    // memory, uses no stack and leaves the flags alone.
+    unsafe {
+        core::arch::asm!(
+            "mrs {hz}, cntfrq_el0",
+            hz = out(reg) hz,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    hz
+}
+
 /// Turns a Hypervisor.framework return code into a [`Result`], naming the call that failed.
 pub(super) fn check(what: &str, ret: HvReturn) -> Result<(), Error> {
     if ret == 0 {

@@ -10,6 +10,9 @@
 //! drives each vCPU from its own host thread: HVF requires a vCPU to run on the thread that
 //! created it, so [`Vcpu`] is deliberately not `Send`. Other threads stop a running vCPU through
 //! its [`Interrupter`].
+//!
+//! With the `test-support` feature the crate also exports `testing::ScriptedVcpu`, a [`Vcpu`]
+//! that plays back scripted exits on any host.
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[cfg_attr(
@@ -20,6 +23,9 @@
     )
 )]
 pub mod hvf;
+
+#[cfg(any(test, feature = "test-support"))]
+pub mod testing;
 
 /// Why a vCPU stopped running guest code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

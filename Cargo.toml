@@ -62,6 +62,9 @@ cargo = { level = "warn", priority = -1 }
 multiple_crate_versions = "allow"
 # Nothing here is published, so repository/readme/keywords metadata would be noise.
 cargo_common_metadata = "allow"
+# The test strategy names the feature behind which a crate exports its fakes `test-support`
+# (`docs/specs/testing.md`, "Shared test support"); this lint objects to the "-support" suffix.
+redundant_feature_names = "allow"
 
 # Restriction lints: cherry-picked for real bug prevention
 unwrap_used = "deny"
