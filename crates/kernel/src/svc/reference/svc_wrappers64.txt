@@ -1,0 +1,140 @@
+# 64-bit register convention of every system call, one line per call:
+#   Name | input:type:register ... | output:type:register ...
+# Extracted by script from the generated `SvcWrap_<Name>64` wrappers in
+# eden/src/core/hle/kernel/svc.cpp @ cf654052 (GPL-3.0-or-later): each
+# `T name = Convert<T>(GetArg64(args, n))` is an input, each `SetArg64(args, n, ...)` an output;
+# `name[k]` is element k of a struct scattered over several registers. Calls without a
+# generated wrapper are transcribed by hand at the end, with their source.
+# Checked against `CONVENTIONS` by the tests in `svc/convention.rs`.
+SetHeapSize | size:uint64_t:x1 | ret:Result:x0 out_address:uint64_t:x1
+SetMemoryPermission | address:uint64_t:x0 size:uint64_t:x1 perm:MemoryPermission:x2 | ret:Result:x0
+SetMemoryAttribute | address:uint64_t:x0 size:uint64_t:x1 mask:uint32_t:x2 attr:uint32_t:x3 | ret:Result:x0
+MapMemory | dst_address:uint64_t:x0 src_address:uint64_t:x1 size:uint64_t:x2 | ret:Result:x0
+UnmapMemory | dst_address:uint64_t:x0 src_address:uint64_t:x1 size:uint64_t:x2 | ret:Result:x0
+QueryMemory | out_memory_info:uint64_t:x0 address:uint64_t:x2 | ret:Result:x0 out_page_info:PageInfo:x1
+ExitProcess |  | 
+CreateThread | func:uint64_t:x1 arg:uint64_t:x2 stack_bottom:uint64_t:x3 priority:int32_t:x4 core_id:int32_t:x5 | ret:Result:x0 out_handle:Handle:x1
+StartThread | thread_handle:Handle:x0 | ret:Result:x0
+ExitThread |  | 
+SleepThread | ns:int64_t:x0 | 
+GetThreadPriority | thread_handle:Handle:x1 | ret:Result:x0 out_priority:int32_t:x1
+SetThreadPriority | thread_handle:Handle:x0 priority:int32_t:x1 | ret:Result:x0
+GetThreadCoreMask | thread_handle:Handle:x2 | ret:Result:x0 out_core_id:int32_t:x1 out_affinity_mask:uint64_t:x2
+SetThreadCoreMask | thread_handle:Handle:x0 core_id:int32_t:x1 affinity_mask:uint64_t:x2 | ret:Result:x0
+GetCurrentProcessorNumber |  | ret:int32_t:x0
+SignalEvent | event_handle:Handle:x0 | ret:Result:x0
+ClearEvent | event_handle:Handle:x0 | ret:Result:x0
+MapSharedMemory | shmem_handle:Handle:x0 address:uint64_t:x1 size:uint64_t:x2 map_perm:MemoryPermission:x3 | ret:Result:x0
+UnmapSharedMemory | shmem_handle:Handle:x0 address:uint64_t:x1 size:uint64_t:x2 | ret:Result:x0
+CreateTransferMemory | address:uint64_t:x1 size:uint64_t:x2 map_perm:MemoryPermission:x3 | ret:Result:x0 out_handle:Handle:x1
+CloseHandle | handle:Handle:x0 | ret:Result:x0
+ResetSignal | handle:Handle:x0 | ret:Result:x0
+WaitSynchronization | handles:uint64_t:x1 num_handles:int32_t:x2 timeout_ns:int64_t:x3 | ret:Result:x0 out_index:int32_t:x1
+CancelSynchronization | handle:Handle:x0 | ret:Result:x0
+ArbitrateLock | thread_handle:Handle:x0 address:uint64_t:x1 tag:uint32_t:x2 | ret:Result:x0
+ArbitrateUnlock | address:uint64_t:x0 | ret:Result:x0
+WaitProcessWideKeyAtomic | address:uint64_t:x0 cv_key:uint64_t:x1 tag:uint32_t:x2 timeout_ns:int64_t:x3 | ret:Result:x0
+SignalProcessWideKey | cv_key:uint64_t:x0 count:int32_t:x1 | 
+GetSystemTick |  | ret:int64_t:x0
+ConnectToNamedPort | name:uint64_t:x1 | ret:Result:x0 out_handle:Handle:x1
+SendSyncRequest | session_handle:Handle:x0 | ret:Result:x0
+SendSyncRequestWithUserBuffer | message_buffer:uint64_t:x0 message_buffer_size:uint64_t:x1 session_handle:Handle:x2 | ret:Result:x0
+SendAsyncRequestWithUserBuffer | message_buffer:uint64_t:x1 message_buffer_size:uint64_t:x2 session_handle:Handle:x3 | ret:Result:x0 out_event_handle:Handle:x1
+GetProcessId | process_handle:Handle:x1 | ret:Result:x0 out_process_id:uint64_t:x1
+GetThreadId | thread_handle:Handle:x1 | ret:Result:x0 out_thread_id:uint64_t:x1
+Break | break_reason:BreakReason:x0 arg:uint64_t:x1 size:uint64_t:x2 | 
+OutputDebugString | debug_str:uint64_t:x0 len:uint64_t:x1 | ret:Result:x0
+ReturnFromException | result:Result:x0 | 
+GetInfo | info_type:InfoType:x1 handle:Handle:x2 info_subtype:uint64_t:x3 | ret:Result:x0 out:uint64_t:x1
+FlushEntireDataCache |  | 
+FlushDataCache | address:uint64_t:x0 size:uint64_t:x1 | ret:Result:x0
+MapPhysicalMemory | address:uint64_t:x0 size:uint64_t:x1 | ret:Result:x0
+UnmapPhysicalMemory | address:uint64_t:x0 size:uint64_t:x1 | ret:Result:x0
+GetDebugFutureThreadInfo | debug_handle:Handle:x2 ns:int64_t:x3 | ret:Result:x0 out_context[0]:uint64_t:x1 out_context[1]:uint64_t:x2 out_context[2]:uint64_t:x3 out_context[3]:uint64_t:x4 out_thread_id:uint64_t:x5
+GetLastThreadInfo |  | ret:Result:x0 out_context[0]:uint64_t:x1 out_context[1]:uint64_t:x2 out_context[2]:uint64_t:x3 out_context[3]:uint64_t:x4 out_tls_address:uint64_t:x5 out_flags:uint32_t:x6
+GetResourceLimitLimitValue | resource_limit_handle:Handle:x1 which:LimitableResource:x2 | ret:Result:x0 out_limit_value:int64_t:x1
+GetResourceLimitCurrentValue | resource_limit_handle:Handle:x1 which:LimitableResource:x2 | ret:Result:x0 out_current_value:int64_t:x1
+SetThreadActivity | thread_handle:Handle:x0 thread_activity:ThreadActivity:x1 | ret:Result:x0
+GetThreadContext3 | out_context:uint64_t:x0 thread_handle:Handle:x1 | ret:Result:x0
+WaitForAddress | address:uint64_t:x0 arb_type:ArbitrationType:x1 value:int32_t:x2 timeout_ns:int64_t:x3 | ret:Result:x0
+SignalToAddress | address:uint64_t:x0 signal_type:SignalType:x1 value:int32_t:x2 count:int32_t:x3 | ret:Result:x0
+SynchronizePreemptionState |  | 
+GetResourceLimitPeakValue | resource_limit_handle:Handle:x1 which:LimitableResource:x2 | ret:Result:x0 out_peak_value:int64_t:x1
+CreateIoPool | which:IoPoolType:x1 | ret:Result:x0 out_handle:Handle:x1
+CreateIoRegion | io_pool:Handle:x1 physical_address:uint64_t:x2 size:uint64_t:x3 mapping:MemoryMapping:x4 perm:MemoryPermission:x5 | ret:Result:x0 out_handle:Handle:x1
+KernelDebug | kern_debug_type:KernelDebugType:x0 arg0:uint64_t:x1 arg1:uint64_t:x2 arg2:uint64_t:x3 | 
+ChangeKernelTraceState | kern_trace_state:KernelTraceState:x0 | 
+CreateSession | is_light:bool:x2 name:uint64_t:x3 | ret:Result:x0 out_server_session_handle:Handle:x1 out_client_session_handle:Handle:x2
+AcceptSession | port:Handle:x1 | ret:Result:x0 out_handle:Handle:x1
+ReplyAndReceive | handles:uint64_t:x1 num_handles:int32_t:x2 reply_target:Handle:x3 timeout_ns:int64_t:x4 | ret:Result:x0 out_index:int32_t:x1
+ReplyAndReceiveWithUserBuffer | message_buffer:uint64_t:x1 message_buffer_size:uint64_t:x2 handles:uint64_t:x3 num_handles:int32_t:x4 reply_target:Handle:x5 timeout_ns:int64_t:x6 | ret:Result:x0 out_index:int32_t:x1
+CreateEvent |  | ret:Result:x0 out_write_handle:Handle:x1 out_read_handle:Handle:x2
+MapIoRegion | io_region:Handle:x0 address:uint64_t:x1 size:uint64_t:x2 perm:MemoryPermission:x3 | ret:Result:x0
+UnmapIoRegion | io_region:Handle:x0 address:uint64_t:x1 size:uint64_t:x2 | ret:Result:x0
+MapPhysicalMemoryUnsafe | address:uint64_t:x0 size:uint64_t:x1 | ret:Result:x0
+UnmapPhysicalMemoryUnsafe | address:uint64_t:x0 size:uint64_t:x1 | ret:Result:x0
+SetUnsafeLimit | limit:uint64_t:x0 | ret:Result:x0
+CreateCodeMemory | address:uint64_t:x1 size:uint64_t:x2 | ret:Result:x0 out_handle:Handle:x1
+ControlCodeMemory | code_memory_handle:Handle:x0 operation:CodeMemoryOperation:x1 address:uint64_t:x2 size:uint64_t:x3 perm:MemoryPermission:x4 | ret:Result:x0
+SleepSystem |  | 
+ReadWriteRegister | address:uint64_t:x1 mask:uint32_t:x2 value:uint32_t:x3 | ret:Result:x0 out_value:uint32_t:x1
+SetProcessActivity | process_handle:Handle:x0 process_activity:ProcessActivity:x1 | ret:Result:x0
+CreateSharedMemory | size:uint64_t:x1 owner_perm:MemoryPermission:x2 remote_perm:MemoryPermission:x3 | ret:Result:x0 out_handle:Handle:x1
+MapTransferMemory | trmem_handle:Handle:x0 address:uint64_t:x1 size:uint64_t:x2 owner_perm:MemoryPermission:x3 | ret:Result:x0
+UnmapTransferMemory | trmem_handle:Handle:x0 address:uint64_t:x1 size:uint64_t:x2 | ret:Result:x0
+CreateInterruptEvent | interrupt_id:int32_t:x1 interrupt_type:InterruptType:x2 | ret:Result:x0 out_read_handle:Handle:x1
+QueryPhysicalAddress | address:uint64_t:x1 | ret:Result:x0 out_info[0]:uint64_t:x1 out_info[1]:uint64_t:x2 out_info[2]:uint64_t:x3
+QueryIoMapping | physical_address:uint64_t:x2 size:uint64_t:x3 | ret:Result:x0 out_address:uint64_t:x1 out_size:uint64_t:x2
+CreateDeviceAddressSpace | das_address:uint64_t:x1 das_size:uint64_t:x2 | ret:Result:x0 out_handle:Handle:x1
+AttachDeviceAddressSpace | device_name:DeviceName:x0 das_handle:Handle:x1 | ret:Result:x0
+DetachDeviceAddressSpace | device_name:DeviceName:x0 das_handle:Handle:x1 | ret:Result:x0
+MapDeviceAddressSpaceByForce | das_handle:Handle:x0 process_handle:Handle:x1 process_address:uint64_t:x2 size:uint64_t:x3 device_address:uint64_t:x4 option:uint32_t:x5 | ret:Result:x0
+MapDeviceAddressSpaceAligned | das_handle:Handle:x0 process_handle:Handle:x1 process_address:uint64_t:x2 size:uint64_t:x3 device_address:uint64_t:x4 option:uint32_t:x5 | ret:Result:x0
+UnmapDeviceAddressSpace | das_handle:Handle:x0 process_handle:Handle:x1 process_address:uint64_t:x2 size:uint64_t:x3 device_address:uint64_t:x4 | ret:Result:x0
+InvalidateProcessDataCache | process_handle:Handle:x0 address:uint64_t:x1 size:uint64_t:x2 | ret:Result:x0
+StoreProcessDataCache | process_handle:Handle:x0 address:uint64_t:x1 size:uint64_t:x2 | ret:Result:x0
+FlushProcessDataCache | process_handle:Handle:x0 address:uint64_t:x1 size:uint64_t:x2 | ret:Result:x0
+DebugActiveProcess | process_id:uint64_t:x1 | ret:Result:x0 out_handle:Handle:x1
+BreakDebugProcess | debug_handle:Handle:x0 | ret:Result:x0
+TerminateDebugProcess | debug_handle:Handle:x0 | ret:Result:x0
+GetDebugEvent | out_info:uint64_t:x0 debug_handle:Handle:x1 | ret:Result:x0
+ContinueDebugEvent | debug_handle:Handle:x0 flags:uint32_t:x1 thread_ids:uint64_t:x2 num_thread_ids:int32_t:x3 | ret:Result:x0
+GetProcessList | out_process_ids:uint64_t:x1 max_out_count:int32_t:x2 | ret:Result:x0 out_num_processes:int32_t:x1
+GetThreadList | out_thread_ids:uint64_t:x1 max_out_count:int32_t:x2 debug_handle:Handle:x3 | ret:Result:x0 out_num_threads:int32_t:x1
+GetDebugThreadContext | out_context:uint64_t:x0 debug_handle:Handle:x1 thread_id:uint64_t:x2 context_flags:uint32_t:x3 | ret:Result:x0
+SetDebugThreadContext | debug_handle:Handle:x0 thread_id:uint64_t:x1 context:uint64_t:x2 context_flags:uint32_t:x3 | ret:Result:x0
+QueryDebugProcessMemory | out_memory_info:uint64_t:x0 process_handle:Handle:x2 address:uint64_t:x3 | ret:Result:x0 out_page_info:PageInfo:x1
+ReadDebugProcessMemory | buffer:uint64_t:x0 debug_handle:Handle:x1 address:uint64_t:x2 size:uint64_t:x3 | ret:Result:x0
+WriteDebugProcessMemory | debug_handle:Handle:x0 buffer:uint64_t:x1 address:uint64_t:x2 size:uint64_t:x3 | ret:Result:x0
+SetHardwareBreakPoint | name:HardwareBreakPointRegisterName:x0 flags:uint64_t:x1 value:uint64_t:x2 | ret:Result:x0
+GetDebugThreadParam | debug_handle:Handle:x2 thread_id:uint64_t:x3 param:DebugThreadParam:x4 | ret:Result:x0 out_64:uint64_t:x1 out_32:uint32_t:x2
+GetSystemInfo | info_type:SystemInfoType:x1 handle:Handle:x2 info_subtype:uint64_t:x3 | ret:Result:x0 out:uint64_t:x1
+CreatePort | max_sessions:int32_t:x2 is_light:bool:x3 name:uint64_t:x4 | ret:Result:x0 out_server_handle:Handle:x1 out_client_handle:Handle:x2
+ManageNamedPort | name:uint64_t:x1 max_sessions:int32_t:x2 | ret:Result:x0 out_server_handle:Handle:x1
+ConnectToPort | port:Handle:x1 | ret:Result:x0 out_handle:Handle:x1
+SetProcessMemoryPermission | process_handle:Handle:x0 address:uint64_t:x1 size:uint64_t:x2 perm:MemoryPermission:x3 | ret:Result:x0
+MapProcessMemory | dst_address:uint64_t:x0 process_handle:Handle:x1 src_address:uint64_t:x2 size:uint64_t:x3 | ret:Result:x0
+UnmapProcessMemory | dst_address:uint64_t:x0 process_handle:Handle:x1 src_address:uint64_t:x2 size:uint64_t:x3 | ret:Result:x0
+QueryProcessMemory | out_memory_info:uint64_t:x0 process_handle:Handle:x2 address:uint64_t:x3 | ret:Result:x0 out_page_info:PageInfo:x1
+MapProcessCodeMemory | process_handle:Handle:x0 dst_address:uint64_t:x1 src_address:uint64_t:x2 size:uint64_t:x3 | ret:Result:x0
+UnmapProcessCodeMemory | process_handle:Handle:x0 dst_address:uint64_t:x1 src_address:uint64_t:x2 size:uint64_t:x3 | ret:Result:x0
+CreateProcess | parameters:uint64_t:x1 caps:uint64_t:x2 num_caps:int32_t:x3 | ret:Result:x0 out_handle:Handle:x1
+StartProcess | process_handle:Handle:x0 priority:int32_t:x1 core_id:int32_t:x2 main_thread_stack_size:uint64_t:x3 | ret:Result:x0
+TerminateProcess | process_handle:Handle:x0 | ret:Result:x0
+GetProcessInfo | process_handle:Handle:x1 info_type:ProcessInfoType:x2 | ret:Result:x0 out_info:int64_t:x1
+CreateResourceLimit |  | ret:Result:x0 out_handle:Handle:x1
+SetResourceLimitLimitValue | resource_limit_handle:Handle:x0 which:LimitableResource:x1 limit_value:int64_t:x2 | ret:Result:x0
+MapInsecureMemory | address:uint64_t:x0 size:uint64_t:x1 | ret:Result:x0
+UnmapInsecureMemory | address:uint64_t:x0 size:uint64_t:x1 | ret:Result:x0
+# Hand-transcribed: `SvcWrap_LightIpc` in eden/src/core/hle/kernel/svc/svc_light_ipc.cpp @ cf654052.
+# x0 is the session handle in and the result out; x1-x7 carry seven 32-bit words both ways.
+SendSyncRequestLight | session_handle:Handle:x0 args[0]:uint32_t:x1 args[1]:uint32_t:x2 args[2]:uint32_t:x3 args[3]:uint32_t:x4 args[4]:uint32_t:x5 args[5]:uint32_t:x6 args[6]:uint32_t:x7 | ret:Result:x0 args[0]:uint32_t:x1 args[1]:uint32_t:x2 args[2]:uint32_t:x3 args[3]:uint32_t:x4 args[4]:uint32_t:x5 args[5]:uint32_t:x6 args[6]:uint32_t:x7
+ReplyAndReceiveLight | session_handle:Handle:x0 args[0]:uint32_t:x1 args[1]:uint32_t:x2 args[2]:uint32_t:x3 args[3]:uint32_t:x4 args[4]:uint32_t:x5 args[5]:uint32_t:x6 args[6]:uint32_t:x7 | ret:Result:x0 args[0]:uint32_t:x1 args[1]:uint32_t:x2 args[2]:uint32_t:x3 args[3]:uint32_t:x4 args[4]:uint32_t:x5 args[5]:uint32_t:x6 args[6]:uint32_t:x7
+# Hand-transcribed: the `SetGpuMemoryAttribute` case of `Call64` in
+# eden-pr4588/src/core/hle/kernel/svc.cpp @ e5fb3b97 (`args[0..3]`, mask and attr cast to u32,
+# result written to `args[0]`).
+SetGpuMemoryAttribute | address:uint64_t:x0 size:uint64_t:x1 mask:uint32_t:x2 attr:uint32_t:x3 | ret:Result:x0
+# Hand-transcribed: `SvcWrap_CallSecureMonitor64` in
+# eden/src/core/hle/kernel/svc/svc_secure_monitor_call.cpp @ cf654052: x0-x7 copied into
+# `lp64::SecureMonitorArguments::r` and back.
+CallSecureMonitor | r[0]:uint64_t:x0 r[1]:uint64_t:x1 r[2]:uint64_t:x2 r[3]:uint64_t:x3 r[4]:uint64_t:x4 r[5]:uint64_t:x5 r[6]:uint64_t:x6 r[7]:uint64_t:x7 | r[0]:uint64_t:x0 r[1]:uint64_t:x1 r[2]:uint64_t:x2 r[3]:uint64_t:x3 r[4]:uint64_t:x4 r[5]:uint64_t:x5 r[6]:uint64_t:x6 r[7]:uint64_t:x7
