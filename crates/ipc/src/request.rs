@@ -14,7 +14,8 @@
 //! 4. the C (receive list) descriptors straight after the raw data section.
 //!
 //! Eden's HLE only parses requests (`IPC::RequestParser`) and has no request builder to port; this
-//! builder is the inverse of the parser, a design choice and not a protocol fact. Two details are guesses beyond the parser:
+//! builder is the inverse of the parser, a design choice and not a protocol fact. Two details are
+//! guesses beyond the parser:
 //!
 //! - Guess: a real client (libnx) may reserve extra padding words in the raw data size; this
 //!   builder writes the exact size, as [`crate::ReplyBuilder`] does.
@@ -25,8 +26,8 @@
 use crate::cmif::{CMIF_HEADER_BYTES, CmifRequestHeader, DomainCommand, DomainRequestHeader};
 use crate::error::{IpcError, Result};
 use crate::hipc::{
-    BUFFER_SIZE, BufferDescriptor, CommandHeader, CommandType, ReceiveDescriptor, ReceiveList,
-    SpecialHeader, StaticDescriptor, high32, low32,
+    BufferDescriptor, CommandHeader, CommandType, ReceiveDescriptor, ReceiveList, SpecialHeader,
+    StaticDescriptor, align_raw, high32, low32, push_data, write_words,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,8 +57,8 @@ enum Layout {
 /// The constructors pick the framing: [`RequestBuilder::cmif`] for an ordinary session (and for
 /// control messages on a domain), [`RequestBuilder::domain`] for a request to a domain object,
 /// [`RequestBuilder::domain_close`] to close a domain object's virtual handle,
-/// [`RequestBuilder::tipc`] for TIPC, and [`RequestBuilder::close`] / [`RequestBuilder::tipc_close`]
-/// to close the session. Data is padded with zeros to a whole number of words.
+/// [`RequestBuilder::tipc`] for TIPC, and [`RequestBuilder::close`] /
+/// [`RequestBuilder::tipc_close`] to close the session. Data is padded with zeros to a whole number of words.
 ///
 /// Nothing is checked until [`RequestBuilder::build`], which reports every problem as an
 /// [`IpcError`].
@@ -175,10 +176,11 @@ impl RequestBuilder {
         self
     }
 
-    /// Asks for the sender's process id to be attached, with `pid` in the two pid words. A real
-    /// client passes zero: the slot holds zero until the kernel fills it
-    /// (`eden/src/core/hle/service/hle_ipc.cpp` skips the two words and reads the pid from the
-    /// owning process).
+    /// Asks for the sender's process id to be attached, with `pid` in the two pid words.
+    ///
+    /// Guess: a real client passes zero, because the kernel fills the slot. The only source is
+    /// that `eden/src/core/hle/service/hle_ipc.cpp` skips the two words when parsing and reads
+    /// the pid from the owning process; nothing cited says what a client writes there.
     #[must_use]
     pub fn send_pid(mut self, pid: u64) -> Self {
         self.pid = Some(pid);
@@ -277,7 +279,7 @@ impl RequestBuilder {
             self.pid.is_some() || !self.copy_handles.is_empty() || !self.move_handles.is_empty();
 
         // The two header words are filled in last, once the raw data size is known.
-        let mut words = vec![0, 0];
+        let mut words = vec![0; CommandHeader::WORDS];
         if has_special_header {
             let special = SpecialHeader {
                 send_pid: self.pid.is_some(),
@@ -333,19 +335,19 @@ impl RequestBuilder {
     /// Appends the raw data section.
     fn push_raw(&self, words: &mut Vec<u32>) -> Result<()> {
         match self.layout {
-            Layout::Tipc { .. } => self.push_data(words),
+            Layout::Tipc { .. } => push_data(words, &self.data),
             Layout::Close { .. } => {}
             Layout::Cmif { command_id, .. } => {
-                align(words);
+                align_raw(words);
                 self.push_cmif_header(words, command_id);
-                self.push_data(words);
+                push_data(words, &self.data);
             }
             Layout::Domain {
                 object_id,
                 command_id,
                 ..
             } => {
-                align(words);
+                align_raw(words);
                 // The size counts the SFCI header and the arguments, padded to whole words.
                 let size = self
                     .data
@@ -368,11 +370,11 @@ impl RequestBuilder {
                     .encode()?,
                 );
                 self.push_cmif_header(words, command_id);
-                self.push_data(words);
+                push_data(words, &self.data);
                 words.extend_from_slice(&self.object_ids);
             }
             Layout::DomainClose { object_id } => {
-                align(words);
+                align_raw(words);
                 words.extend(
                     DomainRequestHeader {
                         command: DomainCommand::CloseVirtualHandle,
@@ -500,22 +502,6 @@ impl RequestBuilder {
             .encode(),
         );
     }
-
-    fn push_data(&self, words: &mut Vec<u32>) {
-        for chunk in self.data.chunks(4) {
-            let mut word = [0_u8; 4];
-            for (slot, byte) in word.iter_mut().zip(chunk) {
-                *slot = *byte;
-            }
-            words.push(u32::from_le_bytes(word));
-        }
-    }
-}
-
-/// Pads with zero words so the next word starts a 16-byte boundary, measured from the start of
-/// the buffer.
-fn align(words: &mut Vec<u32>) {
-    words.resize(words.len().next_multiple_of(4), 0);
 }
 
 fn out_of_range(field: &'static str, value: usize) -> IpcError {
@@ -528,22 +514,4 @@ fn out_of_range(field: &'static str, value: usize) -> IpcError {
 /// A count as a header word, or the out-of-range error naming `field`.
 fn to_u32(field: &'static str, value: usize) -> Result<u32> {
     u32::try_from(value).map_err(|_| out_of_range(field, value))
-}
-
-/// Writes `words` little-endian into the usable start of `buf` and zeroes the rest of the usable
-/// area; `buf` is untouched if they do not fit. Returns the bytes written.
-fn write_words(words: &[u32], buf: &mut [u8]) -> Result<usize> {
-    let needed = words.len().saturating_mul(4);
-    let capacity = buf.len().min(BUFFER_SIZE);
-    let usable = buf
-        .get_mut(..capacity)
-        .ok_or(IpcError::DoesNotFit { needed, capacity })?;
-    let (out, tail) = usable
-        .split_at_mut_checked(needed)
-        .ok_or(IpcError::DoesNotFit { needed, capacity })?;
-    for (chunk, word) in out.as_chunks_mut::<4>().0.iter_mut().zip(words) {
-        *chunk = word.to_le_bytes();
-    }
-    tail.fill(0);
-    Ok(needed)
 }

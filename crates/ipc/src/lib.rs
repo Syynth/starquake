@@ -30,13 +30,14 @@ pub mod request;
 
 pub use cmif::{
     CMIF_HEADER_BYTES, CmifReplyHeader, CmifRequestHeader, DOMAIN_HEADER_BYTES, DomainCommand,
-    DomainReplyHeader, DomainRequestHeader, SFCI_MAGIC, SFCO_MAGIC,
+    DomainReplyHeader, DomainRequestHeader, MAX_DOMAIN_INPUT_OBJECTS, MAX_DOMAIN_SIZE, SFCI_MAGIC,
+    SFCO_MAGIC,
 };
 pub use error::{IpcError, Result};
 pub use hipc::{
     BUFFER_SIZE, BufferDescriptor, CommandHeader, CommandType, MAX_DESCRIPTORS, MAX_HANDLES,
-    MAX_RAW_WORDS, MAX_TIPC_COMMAND_ID, ReceiveDescriptor, ReceiveList, SpecialHeader,
-    StaticDescriptor, TIPC_COMMAND_OFFSET,
+    MAX_RAW_WORDS, MAX_RECEIVE_DESCRIPTORS, MAX_TIPC_COMMAND_ID, RAW_ALIGNMENT_WORDS,
+    ReceiveDescriptor, ReceiveList, SpecialHeader, StaticDescriptor, TIPC_COMMAND_OFFSET,
 };
 pub use message::{Body, CmifReply, CmifRequest, Message, SessionKind};
 pub use reply::ReplyBuilder;

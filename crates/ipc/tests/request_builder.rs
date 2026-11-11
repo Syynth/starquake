@@ -7,8 +7,9 @@ use proptest::prelude::*;
 use proptest::test_runner::{Config, RngAlgorithm, RngSeed};
 use starquake_ipc::{
     BUFFER_SIZE, Body, BufferDescriptor, CMIF_HEADER_BYTES, CmifRequest, CmifRequestHeader,
-    CommandType, DOMAIN_HEADER_BYTES, DomainCommand, DomainRequestHeader, IpcError,
-    MAX_DESCRIPTORS, MAX_HANDLES, MAX_RAW_WORDS, MAX_TIPC_COMMAND_ID, Message, ReceiveDescriptor,
+    CommandHeader, CommandType, DOMAIN_HEADER_BYTES, DomainCommand, DomainRequestHeader, IpcError,
+    MAX_DESCRIPTORS, MAX_DOMAIN_INPUT_OBJECTS, MAX_DOMAIN_SIZE, MAX_HANDLES, MAX_RAW_WORDS,
+    MAX_RECEIVE_DESCRIPTORS, MAX_TIPC_COMMAND_ID, Message, RAW_ALIGNMENT_WORDS, ReceiveDescriptor,
     ReceiveList, RequestBuilder, SessionKind, StaticDescriptor,
 };
 
@@ -438,7 +439,7 @@ fn close_messages_are_only_the_header() {
     ] {
         let mut buf = [0xA5_u8; BUFFER_SIZE];
         let used = builder.build(&mut buf).unwrap();
-        assert_eq!(used, 8);
+        assert_eq!(used, CommandHeader::WORDS * size_of::<u32>());
         let message = Message::parse_request(&buf, SessionKind::Session).unwrap();
         assert_eq!(message.command_type, command_type);
         assert_eq!(message.body, Body::Close);
@@ -650,14 +651,24 @@ fn out_of_range_values_are_errors_and_leave_the_buffer_alone() {
         too_many_copies = too_many_copies.copy_handle(handle);
         too_many_moves = too_many_moves.move_handle(handle);
     }
-    // 0x400 words of data is one word past the 10-bit raw size; as it also overflows the buffer
-    // the field check must come first.
-    let raw_overflow = base().data(&vec![0; past(MAX_RAW_WORDS) * 4]);
-    // A domain message whose size does not fit 16 bits, and one with 256 input objects.
-    let domain_size_overflow = RequestBuilder::domain(CommandType::Request, 1, 1)
-        .data(&vec![0; usize::from(u16::MAX) + 1]);
+    // Raw section = alignment words + SFCI header + data. Size the data so that section is
+    // exactly one word past the 10-bit raw size; as it also overflows the buffer, the field check
+    // must come first.
+    let alignment_words =
+        CommandHeader::WORDS.next_multiple_of(RAW_ALIGNMENT_WORDS) - CommandHeader::WORDS;
+    let fixed_raw_words = alignment_words + CMIF_HEADER_BYTES / size_of::<u32>();
+    let raw_overflow_data_words = usize::try_from(MAX_RAW_WORDS).unwrap() + 1 - fixed_raw_words;
+    let raw_overflow = base().data(&vec![0; raw_overflow_data_words * size_of::<u32>()]);
+    // A domain message whose SFCI header plus arguments are one byte past the 16-bit size
+    // field, and one with one input object id past the 8-bit count.
+    let domain_size_overflow = RequestBuilder::domain(CommandType::Request, 1, 1).data(&vec![
+            0;
+            usize::try_from(MAX_DOMAIN_SIZE).unwrap()
+                + 1
+                - CMIF_HEADER_BYTES
+        ]);
     let mut domain_count_overflow = RequestBuilder::domain(CommandType::Request, 1, 1);
-    for id in 0..0x100 {
+    for id in 0..=MAX_DOMAIN_INPUT_OBJECTS {
         domain_count_overflow = domain_count_overflow.object_id(id);
     }
     let wide_address = base().send_buffer(BufferDescriptor {
@@ -692,6 +703,115 @@ fn out_of_range_values_are_errors_and_leave_the_buffer_alone() {
         tipc_too_high.build(&mut buf),
         Err(IpcError::TipcCommandOutOfRange(MAX_TIPC_COMMAND_ID + 1))
     );
+    assert!(buf.iter().all(|b| *b == 0x3C));
+}
+
+/// The three bounds that are sized by arithmetic fail on the field they overflow, with the value
+/// one past the bound; the buffer is left alone.
+#[test]
+fn sized_bounds_name_the_field_that_overflowed() {
+    let alignment_words =
+        CommandHeader::WORDS.next_multiple_of(RAW_ALIGNMENT_WORDS) - CommandHeader::WORDS;
+    let fixed_raw_words = alignment_words + CMIF_HEADER_BYTES / size_of::<u32>();
+    let raw_data_words = |raw_words: u32| usize::try_from(raw_words).unwrap() - fixed_raw_words;
+    let mut buf = [0x3C_u8; BUFFER_SIZE];
+
+    // Exactly the largest raw size passes the field check (and then overflows the buffer).
+    let at_bound = RequestBuilder::cmif(CommandType::Request, 1).data(&vec![
+        0;
+        raw_data_words(
+            MAX_RAW_WORDS
+        ) * size_of::<u32>()
+    ]);
+    assert!(matches!(
+        at_bound.build(&mut buf),
+        Err(IpcError::DoesNotFit { .. })
+    ));
+    // One word more does not fit the 10-bit field.
+    let past_bound = RequestBuilder::cmif(CommandType::Request, 1).data(&vec![
+        0;
+        raw_data_words(
+            MAX_RAW_WORDS + 1
+        ) * size_of::<u32>()
+    ]);
+    assert_eq!(
+        past_bound.build(&mut buf),
+        Err(IpcError::FieldOutOfRange {
+            field: "raw data words",
+            value: u64::from(MAX_RAW_WORDS) + 1,
+        })
+    );
+
+    // A whole number of words of arguments that makes SFCI header plus arguments exactly one
+    // past the 16-bit domain size.
+    let past_size = RequestBuilder::domain(CommandType::Request, 1, 1).data(&vec![
+            0;
+            usize::try_from(MAX_DOMAIN_SIZE).unwrap()
+                + 1
+                - CMIF_HEADER_BYTES
+        ]);
+    assert_eq!(
+        past_size.build(&mut buf),
+        Err(IpcError::FieldOutOfRange {
+            field: "domain message size",
+            value: u64::from(MAX_DOMAIN_SIZE) + 1,
+        })
+    );
+
+    let mut past_count = RequestBuilder::domain(CommandType::Request, 1, 1);
+    for id in 0..=MAX_DOMAIN_INPUT_OBJECTS {
+        past_count = past_count.object_id(id);
+    }
+    assert_eq!(
+        past_count.build(&mut buf),
+        Err(IpcError::FieldOutOfRange {
+            field: "domain input object count",
+            value: u64::from(MAX_DOMAIN_INPUT_OBJECTS) + 1,
+        })
+    );
+    assert!(buf.iter().all(|b| *b == 0x3C));
+}
+
+/// Receive lists resolved from the descriptors added (or set) must stay within the 4-bit flag.
+#[test]
+fn receive_lists_beyond_their_bounds_are_errors() {
+    let c = ReceiveDescriptor {
+        address: 0,
+        size: 0,
+    };
+    let mut buf = [0x3C_u8; BUFFER_SIZE];
+
+    // One C descriptor past the largest list: the flag defaults to Many(n) and cannot encode.
+    let mut too_many = RequestBuilder::cmif(CommandType::Request, 1);
+    for _ in 0..=MAX_RECEIVE_DESCRIPTORS {
+        too_many = too_many.receive_descriptor(c);
+    }
+    assert_eq!(
+        too_many.build(&mut buf),
+        Err(IpcError::FieldOutOfRange {
+            field: "receive list descriptor count",
+            value: u64::from(MAX_RECEIVE_DESCRIPTORS) + 1,
+        })
+    );
+
+    // An explicit list of zero descriptors is no list at all (that is Disabled).
+    let empty_many =
+        RequestBuilder::cmif(CommandType::Request, 1).receive_list(ReceiveList::Many(0));
+    assert_eq!(
+        empty_many.build(&mut buf),
+        Err(IpcError::FieldOutOfRange {
+            field: "receive list descriptor count",
+            value: 0,
+        })
+    );
+
+    // The largest list still builds.
+    let mut largest = RequestBuilder::cmif(CommandType::Request, 1);
+    for _ in 0..MAX_RECEIVE_DESCRIPTORS {
+        largest = largest.receive_descriptor(c);
+    }
+    assert!(largest.build(&mut [0_u8; BUFFER_SIZE]).is_ok());
+
     assert!(buf.iter().all(|b| *b == 0x3C));
 }
 
