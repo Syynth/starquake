@@ -3,6 +3,19 @@
 A Switch 2 emulator in Rust, for macOS (Apple Silicon) and Linux. GPLv3. Most code is written by
 agents, so the repo is built to make changes checkable.
 
+## Working mode (until milestone 1)
+
+The lead session runs autonomously until a program runs end to end (decision log, 2026-11-11):
+it decides design questions, amends specs and vets `docs/proposals.md` itself, and records every
+such choice for the owner to review afterwards. It stops only for things that need the owner
+(hardware, passwords, anything irreversible outside the repo). The route is **skeleton first**:
+get the thinnest end-to-end run working, then widen it, so the pieces are proven to fit.
+
+- Judgement-heavy or single-threaded work (integration, foundations, bring-up) goes to one agent
+  on the strongest model. Parallel waves are for well-specified ports.
+- Every PR gets two independent reviews: one for fidelity to the spec and the reference, one
+  that runs the code and tries to break its tests.
+
 ## Before you say a change is done
 
 Run `cargo xtask ci` (or `just ci`): fmt check, `cargo deny check` (licences, sources, advisories;
@@ -67,6 +80,10 @@ Platform-specific code must still compile (or be `cfg`-gated) on Linux; check wi
   why it's needed in the PR. Prefer pure-Rust crates; no C/C++ build steps in the default build.
 - Every public item gets a doc comment. `//!` docs at the top of each module say what it owns.
 - Modules are `foo.rs` + `foo/`, not `foo/mod.rs`.
+- When two crates share a unit or convention (ticks or nanoseconds, who converts), give the value
+  a distinct newtype or name the conversion's owner in one place.
+- Never derive deserialisation on a validated newtype; deserialise through the validating
+  constructor and test that an out-of-range value is an error.
 - Don't duplicate logic across sibling modules; extract one `pub(crate)` helper and call it from
   both.
 
@@ -80,6 +97,11 @@ Platform-specific code must still compile (or be `cfg`-gated) on Linux; check wi
   the shipping bound, with boundary cases exactly at the limit.
 - A parser or decoder that reads several ordered fields or lists gets a generated
   build-then-parse round-trip test that fails if any two reads are swapped.
+- Pin every serialised or on-disk layout with a golden-bytes test that covers every variant with
+  distinct non-zero values; changing the layout means bumping its version. Decode and check a
+  header's magic and version before the body.
+- A test invariant mirrors the reference's exact condition; no escape clause that switches the
+  assertion off in common generated cases.
 - Negative tests assert the exact error (variant, exit code, message), so a missing or broken
   implementation can't pass them.
 - Never hide a flaky test behind retries: reproduce it under plain `cargo test` as well as
