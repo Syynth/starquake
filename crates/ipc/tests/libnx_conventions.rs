@@ -243,6 +243,38 @@ fn builder_pads_domain_arguments_where_libnx_does_not() {
     }
 }
 
+/// libnx adds a table of one `u16` size per out pointer to the raw data (`cmifMakeRequest`:
+/// `out_pointer_size_table_size`, which also sets the C descriptor count); the builder writes no
+/// table, so its raw size does not change with the number of C descriptors. This is the listed
+/// divergence.
+#[test]
+fn receive_descriptors_add_no_size_table_where_libnx_adds_one() {
+    let c = ReceiveDescriptor {
+        address: 0x4000,
+        size: 0x40,
+    };
+    let data = [0x42_u8; 6];
+    let base = || RequestBuilder::cmif(CommandType::Request, 1).data(&data);
+    let without = raw_words(&built(&base())).unwrap();
+    // libnx's raw size in bytes before the table: the reserve, the `SFCI` header and the data,
+    // rounded up to a half word.
+    let libnx_before_table =
+        (RAW_ALIGNMENT_WORDS * WORD + CMIF_HEADER_BYTES + data.len()).next_multiple_of(2);
+    assert_eq!(
+        libnx_before_table.div_ceil(WORD),
+        libnx_cmif_raw_words(data.len(), None)
+    );
+    let mut builder = base();
+    let mut libnx_grew = false;
+    for count in 1..=6_usize {
+        builder = builder.receive_descriptor(c);
+        assert_eq!(raw_words(&built(&builder)), Some(without), "{count} C");
+        let libnx_words = (libnx_before_table + count * size_of::<u16>()).div_ceil(WORD);
+        libnx_grew |= libnx_words > libnx_cmif_raw_words(data.len(), None);
+    }
+    assert!(libnx_grew, "six out pointers must grow libnx's raw size");
+}
+
 /// libnx writes the receive list flag `2 + n` for `n` explicit C descriptors, so a single one is
 /// flag 3, and flag 2 only for `HIPC_AUTO_RECV_STATIC` (`hipc.h`, `hipcMakeRequest`).
 #[test]

@@ -16,30 +16,39 @@
 //! Eden's HLE only parses requests (`IPC::RequestParser`) and has no request builder to port, so
 //! this builder is the inverse of the parser. Its conventions are checked against libnx, the
 //! client side of the protocol (`libnx/nx/include/switch/sf/hipc.h`, `cmif.h` and `tipc.h`,
-//! ISC, pinned in `docs/references.md`); `tests/libnx_conventions.rs` pins each point below.
+//! ISC, pinned in `docs/references.md`). Each point below names the test that pins it.
 //!
 //! # Where the builder agrees with libnx
 //!
 //! - Field order: special header, pid slot, copy handles, move handles, X, A, B and W
-//!   descriptors, raw data, C descriptors (`hipcMakeRequest`, `hipcCalcRequestLayout`).
+//!   descriptors, raw data, C descriptors (`hipcMakeRequest`, `hipcCalcRequestLayout`). Pinned by
+//!   `every_list_lands_in_its_own_place` in `tests/request_builder.rs`.
 //! - CMIF content starts on a 16-byte boundary measured from the start of the buffer
-//!   (`cmifGetAlignedDataStart`), with an optional domain header, then the `SFCI` header.
+//!   (`cmifGetAlignedDataStart`), with an optional domain header, then the `SFCI` header. Pinned
+//!   by `domain_requests_are_aligned_to_sixteen_bytes` in `tests/request_builder.rs` and
+//!   `cmif_raw_size_differs_from_libnx_by_the_padding_reserve` in `tests/libnx_conventions.rs`.
 //! - The domain header is a send-message or close command, an input object count, a size, an
 //!   object id, a padding word and a token (`CmifDomainInHeader`); a request to a domain object
 //!   has the `Request` type, and a control message carries no domain header
-//!   (`cmifMakeControlRequest`).
+//!   (`cmifMakeControlRequest`). Pinned by `parser_accepts_the_domain_layout_libnx_writes` and
+//!   `control_and_context_conventions_are_expressible` in `tests/libnx_conventions.rs`.
 //! - Closing a domain object is a `Request` with a close-command domain header and no `SFCI`
-//!   header; closing a plain session is a bare `Close` message (`cmifMakeCloseRequest`).
+//!   header; closing a plain session is a bare `Close` message (`cmifMakeCloseRequest`). Pinned
+//!   by `domain_close_matches_libnx` and `close_messages_match_libnx` in
+//!   `tests/libnx_conventions.rs`.
 //! - TIPC: the type is `request_id + 16`, the raw data is the arguments rounded up to words with
 //!   no `SFCI` header and no padding, and closing is a bare type 15 message (`tipcMakeRequest`,
-//!   `tipcClose`).
+//!   `tipcClose`). Pinned by `tipc_requests_match_libnx` and `close_messages_match_libnx` in
+//!   `tests/libnx_conventions.rs`.
 //! - The receive list flag is `2 + n` for `n` C descriptors (`hipcMakeRequest`), so one
 //!   descriptor is flag 3; the builder follows that unless told otherwise (see
-//!   [`RequestBuilder::receive_list`]).
+//!   [`RequestBuilder::receive_list`]). Pinned by `one_receive_descriptor_is_flag_three_unless_set`
+//!   in `tests/libnx_conventions.rs`.
 //! - The `SFCI` token and version words are free for the caller to set. libnx writes version 0
 //!   and token 0 for ordinary requests and control messages; with a context it uses the
 //!   `RequestWithContext` type, version 1, and puts the context in the domain header's token
-//!   (in a domain) or the `SFCI` token (otherwise).
+//!   (in a domain) or the `SFCI` token (otherwise). Pinned by
+//!   `control_and_context_conventions_are_expressible` in `tests/libnx_conventions.rs`.
 //!
 //! # Where it differs, on purpose
 //!
@@ -47,25 +56,38 @@
 //!   alignment padding (`actual_size = 16`), then adds the headers and arguments, rounds up to
 //!   2 bytes, and adds a table of `u16` sizes for out pointers. This builder writes the exact size
 //!   (the real padding, 0 to 3 words, and no table) as [`crate::ReplyBuilder`] does. The parser
-//!   takes both. TIPC sizes are exact in libnx too.
+//!   takes both. TIPC sizes are exact in libnx too. Pinned by
+//!   `cmif_raw_size_differs_from_libnx_by_the_padding_reserve` in `tests/libnx_conventions.rs`.
 //! - **Domain `size` and object ids.** libnx's `size` is `CMIF_HEADER_BYTES` plus the exact
 //!   argument bytes and the object ids follow the arguments at once, unaligned. This builder
 //!   rounds the arguments up to a whole word with zero bytes, counts that padding in `size` and
 //!   starts the object ids on a word boundary. The two agree when the arguments are a whole
 //!   number of words; otherwise the builder's `size` is larger. The parser takes both because it
-//!   locates the ids from `size`.
+//!   locates the ids from `size`. Pinned by `builder_pads_domain_arguments_where_libnx_does_not`
+//!   and `parser_accepts_the_domain_layout_libnx_writes` in `tests/libnx_conventions.rs`.
 //! - **Field limits.** libnx casts the object count to 8 bits and the size to 16 bits without a
 //!   check; the builder returns [`IpcError::FieldOutOfRange`] above
-//!   [`crate::MAX_DOMAIN_INPUT_OBJECTS`] and [`crate::MAX_DOMAIN_SIZE`].
-//! - **Out pointer sizes.** The table of out pointer sizes (placed after the arguments and object
-//!   ids, `cmifMakeRequest`) is not modelled. A caller that needs it for a request without
-//!   object ids can append it to the arguments.
+//!   [`crate::MAX_DOMAIN_INPUT_OBJECTS`] and [`crate::MAX_DOMAIN_SIZE`]. The errors are pinned by
+//!   `sized_bounds_name_the_field_that_overflowed` in `tests/request_builder.rs`; the limits are
+//!   the field widths in `domain_limits_are_the_libnx_field_widths` in
+//!   `tests/libnx_conventions.rs`.
+//! - **Out pointer sizes.** libnx adds a table of one `u16` per out pointer and out auto-select
+//!   buffer to the raw data (`cmifMakeRequest`). The builder does not write it, so the raw size
+//!   of a request does not change with its C descriptors; this is pinned by
+//!   `receive_descriptors_add_no_size_table_where_libnx_adds_one` in
+//!   `tests/libnx_conventions.rs`. The table's offset is measured from the start of the raw data
+//!   section, with the 16-byte reserve counted: 16 bytes plus the domain header, object ids,
+//!   `SFCI` header and arguments, rounded up to 2 bytes. libnx's content starts 0, 4, 8 or 12
+//!   bytes into that section (the alignment padding), so the table sits 16 minus that padding
+//!   bytes, that is 4 to 16, past the rounded end of the object ids; it is never straight after
+//!   them. The builder offers no way to place it there.
 //!
 //! # Beyond libnx
 //!
 //! - The process id slot: libnx leaves the two words unwritten (`hipcMakeRequest` only skips
 //!   them) and the kernel fills them in. [`RequestBuilder::send_pid`] writes the value it is
-//!   given, which a libnx program never does; it exists so a test can see the value come back.
+//!   given, which a libnx program never does; it exists so a test can see the value come back
+//!   (`every_list_lands_in_its_own_place` in `tests/request_builder.rs`).
 
 use crate::builder::{Parts, fill_header, out_of_range, push_special_header, to_u32};
 use crate::cmif::{CMIF_HEADER_BYTES, CmifRequestHeader, DomainCommand, DomainRequestHeader};

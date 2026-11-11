@@ -23,9 +23,9 @@
 //! data. That only holds when the raw size is exact, as [`crate::ReplyBuilder`] writes it. Eden's
 //! `ResponseBuilder` reserves four extra padding words (`ipc_helpers.h`), and libnx's
 //! `cmifParseResponse` (`libnx/nx/include/switch/sf/cmif.h`) instead finds the objects at the
-//! `SFCO` header plus the data size it already knows. On a reply that keeps such a reserve this parser would return the padding as
-//! object ids and truncate the data. Parsing replies from a real guest needs the expected data
-//! size passed in, as libnx does.
+//! `SFCO` header plus the data size it already knows. On a reply that keeps such a reserve this
+//! parser would return the padding as object ids and truncate the data. Parsing replies from a
+//! real guest needs the expected data size passed in, as libnx does.
 
 use crate::cmif::{
     CMIF_HEADER_BYTES, CmifReplyHeader, CmifRequestHeader, DomainCommand, DomainReplyHeader,

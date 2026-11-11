@@ -232,6 +232,55 @@ mod tests {
         assert_eq!(SFCO_MAGIC.to_le_bytes(), *b"SFCO");
     }
 
+    fn domain_header(input_object_count: u32, size: u32) -> DomainRequestHeader {
+        DomainRequestHeader {
+            command: DomainCommand::SendMessage,
+            input_object_count,
+            size,
+            object_id: 0x0BAD_0001,
+            token: 0xC0DE_0002,
+        }
+    }
+
+    /// Both limits are inclusive: a header at exactly `MAX_DOMAIN_INPUT_OBJECTS` objects and one at
+    /// exactly `MAX_DOMAIN_SIZE` bytes encode and decode back unchanged, in separate headers so
+    /// neither field masks the other.
+    #[test]
+    fn domain_request_header_accepts_exactly_the_limits() {
+        for header in [
+            domain_header(MAX_DOMAIN_INPUT_OBJECTS, 1),
+            domain_header(1, MAX_DOMAIN_SIZE),
+            domain_header(MAX_DOMAIN_INPUT_OBJECTS, MAX_DOMAIN_SIZE),
+        ] {
+            let words = header.encode();
+            assert!(words.is_ok(), "{header:?}: {words:?}");
+            assert_eq!(
+                words.and_then(DomainRequestHeader::decode),
+                Ok(header),
+                "{header:?}"
+            );
+        }
+    }
+
+    /// One past either limit is a `FieldOutOfRange` naming the field and the value.
+    #[test]
+    fn domain_request_header_rejects_one_past_the_limits() {
+        assert_eq!(
+            domain_header(MAX_DOMAIN_INPUT_OBJECTS + 1, 1).encode(),
+            Err(IpcError::FieldOutOfRange {
+                field: "domain input object count",
+                value: u64::from(MAX_DOMAIN_INPUT_OBJECTS) + 1,
+            })
+        );
+        assert_eq!(
+            domain_header(1, MAX_DOMAIN_SIZE + 1).encode(),
+            Err(IpcError::FieldOutOfRange {
+                field: "domain message size",
+                value: u64::from(MAX_DOMAIN_SIZE) + 1,
+            })
+        );
+    }
+
     #[test]
     fn headers_are_sixteen_bytes() {
         assert_eq!(

@@ -273,16 +273,25 @@ fn builder_failures_are_clean_errors() {
             value: u64::from(MAX_HANDLES) + 1,
         })
     );
-    // The raw data size is checked against its 10-bit field before the buffer size.
-    let words = usize::try_from(MAX_RAW_WORDS).unwrap() + 1;
-    assert!(matches!(
+    // The raw data size is checked against its 10-bit field before the buffer size. A TIPC reply
+    // carries a result word ahead of the data, so MAX_RAW_WORDS data words make the raw size one
+    // word too many, and one word fewer is the largest that passes the field check (and then
+    // overflows the buffer).
+    let data_words = |words: u32| vec![0; usize::try_from(words).unwrap() * size_of::<u32>()];
+    assert_eq!(
         ReplyBuilder::tipc(0, 0)
-            .data(&vec![0; words * size_of::<u32>()])
+            .data(&data_words(MAX_RAW_WORDS))
             .build(&mut buf),
         Err(IpcError::FieldOutOfRange {
             field: "raw data words",
-            ..
+            value: u64::from(MAX_RAW_WORDS) + 1,
         })
+    );
+    assert!(matches!(
+        ReplyBuilder::tipc(0, 0)
+            .data(&data_words(MAX_RAW_WORDS - 1))
+            .build(&mut buf),
+        Err(IpcError::DoesNotFit { .. })
     ));
 }
 
