@@ -19,6 +19,13 @@ pub const MAX_HANDLES: u32 = 0xF;
 /// Largest raw data size in words: the `data_size` field is 10 bits wide
 /// (`eden/src/core/hle/ipc.h`, `CommandHeader`).
 pub const MAX_RAW_WORDS: u32 = 0x3FF;
+/// Largest number of C (receive list) descriptors: a [`ReceiveList::Many`] flag is the count plus
+/// two in a 4-bit field (`eden/src/core/hle/ipc.h`, `CommandHeader`).
+pub const MAX_RECEIVE_DESCRIPTORS: u32 = 0xF - 2;
+/// The raw data section of a CMIF message starts on a 16-byte boundary measured from the start of
+/// the buffer; this is that boundary in words (`eden/src/core/hle/service/hle_ipc.cpp`,
+/// `ParseCommandBuffer`).
+pub const RAW_ALIGNMENT_WORDS: usize = 4;
 /// A TIPC command's type is `TIPC_COMMAND_OFFSET + command id`
 /// (`eden/src/core/hle/ipc.h`, `CommandType::TIPC_CommandRegion`).
 pub const TIPC_COMMAND_OFFSET: u16 = 16;
@@ -34,6 +41,42 @@ const ADDRESS_BITS_C: u32 = 48;
 const SIZE_BITS_ABW: u32 = 36;
 /// The bits of an X descriptor counter that exist: 0..6 and 9..12 (bits 6..9 hold address bits).
 const COUNTER_MASK: u32 = 0xE3F;
+
+/// Pads with zero words so the next word starts a [`RAW_ALIGNMENT_WORDS`] boundary, measured from
+/// the start of the buffer.
+pub(crate) fn align_raw(words: &mut Vec<u32>) {
+    words.resize(words.len().next_multiple_of(RAW_ALIGNMENT_WORDS), 0);
+}
+
+/// Appends `data` as little-endian words, zero-padding a partial last word.
+pub(crate) fn push_data(words: &mut Vec<u32>, data: &[u8]) {
+    for chunk in data.chunks(size_of::<u32>()) {
+        let mut word = [0_u8; size_of::<u32>()];
+        for (slot, byte) in word.iter_mut().zip(chunk) {
+            *slot = *byte;
+        }
+        words.push(u32::from_le_bytes(word));
+    }
+}
+
+/// Writes `words` little-endian into the usable start of `buf` (at most [`BUFFER_SIZE`] bytes) and
+/// zeroes the rest of the usable area; `buf` is untouched if they do not fit. Returns the bytes
+/// written.
+pub(crate) fn write_words(words: &[u32], buf: &mut [u8]) -> Result<usize> {
+    let needed = words.len().saturating_mul(size_of::<u32>());
+    let capacity = buf.len().min(BUFFER_SIZE);
+    let usable = buf
+        .get_mut(..capacity)
+        .ok_or(IpcError::DoesNotFit { needed, capacity })?;
+    let (out, tail) = usable
+        .split_at_mut_checked(needed)
+        .ok_or(IpcError::DoesNotFit { needed, capacity })?;
+    for (chunk, word) in out.as_chunks_mut::<4>().0.iter_mut().zip(words) {
+        *chunk = word.to_le_bytes();
+    }
+    tail.fill(0);
+    Ok(needed)
+}
 
 /// The low 32 bits of `value`.
 pub(crate) fn low32(value: u64) -> u32 {
@@ -165,13 +208,13 @@ impl ReceiveList {
         }
     }
 
-    /// Encodes the 4-bit flag. [`ReceiveList::Many`] must hold 1 to 13.
+    /// Encodes the 4-bit flag. [`ReceiveList::Many`] must hold 1 to [`MAX_RECEIVE_DESCRIPTORS`].
     pub fn to_flag(self) -> Result<u32> {
         match self {
             Self::Disabled => Ok(0),
             Self::Inline => Ok(1),
             Self::One => Ok(2),
-            Self::Many(n) if (1..=13).contains(&n) => Ok(n + 2),
+            Self::Many(n) if (1..=MAX_RECEIVE_DESCRIPTORS).contains(&n) => Ok(n + 2),
             Self::Many(n) => Err(IpcError::FieldOutOfRange {
                 field: "receive list descriptor count",
                 value: u64::from(n),
@@ -216,6 +259,9 @@ pub struct CommandHeader {
 }
 
 impl CommandHeader {
+    /// Size of the header in 32-bit words.
+    pub const WORDS: usize = 2;
+
     /// Decodes the two header words.
     pub fn decode(words: [u32; 2]) -> Result<Self> {
         let [w0, w1] = words;

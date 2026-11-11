@@ -99,13 +99,14 @@ flowchart LR
     services --> kernel
     kernel --> cpu & ipc
     cpu --> memory
-    ipc --> memory
     loader --> memory
     gpu --> memory & shader & render
 ```
 
-Rules: no cycles, no reaching around a layer, frontends only see `core`. Backends are selected
-by `cfg` (target OS/arch) plus Cargo features, never by runtime checks scattered through code.
+Rules: no cycles, no reaching around a layer, frontends only see `core`. `ipc` works on byte
+slices and depends on no other workspace crate; its caller copies the buffer out of guest memory.
+Backends are selected by `cfg` (target OS/arch) plus Cargo features, never by runtime checks
+scattered through code.
 
 ## Platform matrix
 
