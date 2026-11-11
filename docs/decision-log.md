@@ -52,5 +52,23 @@ Entry format:
 - **PROJECT:** starquake (previously referred to as switch2-emu)
 - **SYSTEM:** cross-system
 - **SCOPE:** moderate
-- **WHAT:** The emulator is named "starquake". The repo folder is `~/code/rs/starquake`, and crates use a `starquake-` prefix or keep their role names in the workspace (e.g. `hos-cpu`). The name avoids Nintendo trademarks (switch, nx, nintendo).
+- **WHAT:** The emulator is named "starquake". The repo folder is named `starquake`, and crates use a `starquake-` prefix or keep their role names in the workspace (e.g. `hos-cpu`). The name avoids Nintendo trademarks (switch, nx, nintendo).
 - **WHY:** It continues the magnet theme the user liked in "magnetar" (a nod to the Switch 2's magnetic controllers): magnetars have starquakes. It's free on crates.io, no existing emulator uses it, and steering clear of trademarked terms lowers takedown risk.
+
+## Backlog and coordination live in a private GitHub repo
+- **WHEN:** 2026-11-11
+- **PROJECT:** starquake
+- **SYSTEM:** process
+- **SCOPE:** moderate
+- **STATUS:** tentative
+- **WHAT:** The repo is hosted privately on GitHub. The backlog is GitHub issues (one issue → one branch → one PR), and waves of port work run through the autonomous-pump process. Logged without the usual approval prompt because the owner asked for it and then went offline; confirm or edit.
+- **WHY:** A remote makes CI actually run on Linux, gives the pump its issue board, and allows cloud sessions that use no local disk. Private, because public console-emulator repositories have a history of takedowns.
+
+## Adopt the owner's standing Rust conventions
+- **WHEN:** 2026-11-11
+- **PROJECT:** starquake
+- **SYSTEM:** process
+- **SCOPE:** moderate
+- **STATUS:** tentative
+- **WHAT:** Starquake uses the same lint profile and habits as the owner's other Rust workspaces: clippy `pedantic` and `cargo` groups, the restriction denies (`unwrap_used`, `expect_used`, `panic`, `todo`, `dbg_macro`, printing, `undocumented_unsafe_blocks`, ...), `#[expect]` with a reason instead of `#[allow]`, `thiserror`, workspace-inherited dependencies, tests first, Conventional Commits, and no debug info in dev builds. Three deliberate differences, each open to a ruling: `unsafe_code` stays denied but the CPU crate opts in (an emulator must run guest code); `missing_docs` is on; and the gate is `cargo xtask ci` (with a `justfile` forwarding to it) because it also checks free disk space. Logged without the usual approval prompt because the owner asked for their preferences to be found and applied, then went offline; confirm or edit.
+- **WHY:** Consistency with the owner's other projects, and lint rules catch what review misses when most code is written by agents.

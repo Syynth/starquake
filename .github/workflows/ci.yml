@@ -5,32 +5,42 @@ on:
     branches: [main]
   pull_request:
 
+permissions: {}
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
 
 jobs:
   # Linux x86-64 runs on every PR and on main.
   linux:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: taiki-e/install-action@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
         with:
           tool: cargo-nextest
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       # rust-toolchain.toml pins the compiler; rustup installs it on first use.
       - run: cargo xtask ci
 
   # macOS arm64 runs on main only: hosted macOS minutes cost 10x, and every PR is already gated
-  # on a Mac locally before it is opened.
+  # on a Mac locally before it is opened. Hosted runners can't create VMs, so hypervisor tests
+  # skip themselves there (see CLAUDE.md).
   macos:
     if: github.event_name == 'push'
     runs-on: macos-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: taiki-e/install-action@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
         with:
           tool: cargo-nextest
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - run: cargo xtask ci

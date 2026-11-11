@@ -11,6 +11,8 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-starquake-memory = { path = "../memory" }
-starquake-cpu = { path = "../cpu" }
-starquake-ipc = { path = "../ipc" }
+starquake-memory.workspace = true
+starquake-cpu.workspace = true
+starquake-ipc.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

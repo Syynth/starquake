@@ -6,7 +6,8 @@
 //! [`GuestMemory`].
 
 /// An access to guest memory that isn't mapped, or isn't allowed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("guest memory fault at {address:#x}")]
 pub struct Fault {
     /// The first guest address that could not be accessed.
     pub address: u64,

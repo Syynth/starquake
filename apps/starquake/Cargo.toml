@@ -11,4 +11,4 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-starquake-core = { path = "../../crates/core" }
+starquake-core.workspace = true

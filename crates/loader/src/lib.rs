@@ -5,3 +5,8 @@
 //! - The load-time code patcher: rewrites `mrs xN, cntpct_el0` (and, where a backend needs it,
 //!   `svc` and PAuth returns) into branches to backend-provided stubs. Native backends need this
 //!   because counter reads exit to the host at ~760 ns each (see `tools/hvprobe/README.md`).
+
+pub mod npdm;
+pub mod nro;
+pub mod nso;
+pub mod patch;

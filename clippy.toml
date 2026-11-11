@@ -1,0 +1,7 @@
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-dbg-in-tests = true
+allow-print-in-tests = true
+
+# Console and GPU terms that are names, not code. ".." keeps clippy's defaults.
+doc-valid-idents = ["..", "AArch64", "ExeFS", "RomFS", "PAuth", "HiZ", "NvRm", "NvMap", "MoltenVK", "SwitchBrew", "QARMA"]

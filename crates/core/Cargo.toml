@@ -11,13 +11,14 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-starquake-memory = { path = "../memory" }
-starquake-cpu = { path = "../cpu" }
-starquake-ipc = { path = "../ipc" }
-starquake-kernel = { path = "../kernel" }
-starquake-loader = { path = "../loader" }
-starquake-services = { path = "../services" }
-starquake-shader = { path = "../shader" }
-starquake-render = { path = "../render" }
-starquake-gpu = { path = "../gpu" }
-starquake-gsv = { path = "../gsv" }
+starquake-memory.workspace = true
+starquake-cpu.workspace = true
+starquake-ipc.workspace = true
+starquake-kernel.workspace = true
+starquake-loader.workspace = true
+starquake-services.workspace = true
+starquake-shader.workspace = true
+starquake-render.workspace = true
+starquake-gpu.workspace = true
+starquake-gsv.workspace = true
+thiserror.workspace = true
