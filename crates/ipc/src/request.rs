@@ -13,8 +13,8 @@
 //!    header, the arguments and the domain input object ids; for TIPC, the arguments alone;
 //! 4. the C (receive list) descriptors straight after the raw data section.
 //!
-//! Eden only ever *parses* requests, so no Eden code builds one; this builder is a design choice
-//! that follows from the parser, not a protocol fact. Two details are guesses beyond the parser:
+//! Eden's HLE only parses requests (`IPC::RequestParser`) and has no request builder to port; this
+//! builder is the inverse of the parser, a design choice and not a protocol fact. Two details are guesses beyond the parser:
 //!
 //! - Guess: a real client (libnx) may reserve extra padding words in the raw data size; this
 //!   builder writes the exact size, as [`crate::ReplyBuilder`] does.
