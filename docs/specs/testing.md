@@ -62,6 +62,10 @@ call and IPC request, with decoded arguments and results, grouped per guest thre
 cross-thread timing doesn't change the file. Tests run a program and compare the trace with a
 committed snapshot (`insta`). A behaviour change shows up as a reviewable diff.
 
+The trace is one view of the event stream defined in the observability spec
+(`observability.md`, also a proposal), which also covers replaying the kernel and services from a
+recorded log, snapshots, and the deterministic interpreter backend that lets tier 3 run in CI.
+
 The same format is what auto-stubbed (unimplemented) calls are logged in, so a trace from a real
 title doubles as a to-do list.
 
