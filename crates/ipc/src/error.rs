@@ -60,7 +60,7 @@ pub enum IpcError {
         /// Usable capacity of the buffer.
         capacity: usize,
     },
-    /// Domain object ids were added to a reply that is not for a domain session.
-    #[error("object ids can only be sent in a domain reply")]
+    /// Domain object ids were added to a message that is not a domain reply or a domain request.
+    #[error("object ids can only be sent in a domain message")]
     ObjectIdsOutsideDomain,
 }
