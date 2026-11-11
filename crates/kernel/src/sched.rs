@@ -52,8 +52,9 @@
 //!   the core's next [`Scheduler::schedule`]) does nothing. Eden indexes the queues with core
 //!   `-1` there, which its `ASSERT(IsValidCore(core))` rejects. Test: `yield_without_active_core_is_a_no_op`.
 //! - Arguments Eden asserts on are errors: a priority outside 0..=63 cannot be built, a core the
-//!   scheduler doesn't have is [`KernelError::InvalidCoreId`], an empty core mask
-//!   [`KernelError::InvalidCombination`] (the checks `svcSetThreadCoreMask` makes first).
+//!   scheduler doesn't have is [`KernelError::InvalidCoreId`] (in an affinity mask, and as the
+//!   ideal core of `set_core_mask`), an empty core mask [`KernelError::InvalidCombination`] (the
+//!   checks `svcSetThreadCoreMask` makes first).
 //!   Test: `set_core_mask_rejects_what_eden_asserts`.
 //! - `SetCoreMask` with `IdealCoreNoUpdate` when the ideal core is "don't care" (-1): Eden
 //!   evaluates `1ULL << -1`, which C++ leaves undefined. Here it tests bit 63, what AArch64's
@@ -72,7 +73,9 @@ mod thread;
 
 use thiserror::Error;
 
-pub use cores::{APPLICATION_CORE_COUNT, AffinityMask, CoreId, CoreSignals, MAX_CORES};
+pub use cores::{
+    APPLICATION_CORE_COUNT, AffinityMask, CoreId, CoreIdOutOfRange, CoreSignals, MAX_CORES,
+};
 pub use scheduler::Scheduler;
 pub use thread::{
     HIGHEST_THREAD_PRIORITY, LOWEST_THREAD_PRIORITY, PRIORITY_COUNT, Priority, SuspendType, Thread,

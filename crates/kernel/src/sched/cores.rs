@@ -7,6 +7,7 @@
 //! rule 5) and an out-of-range mask is an error the scheduler returns.
 
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 /// The most cores a scheduler can have: one bit of a `u64` affinity mask each. Eden stores
 /// affinity as a `u64` (`k_affinity_mask.h`, `m_mask`) and asserts every core id is below
@@ -18,10 +19,26 @@ pub const MAX_CORES: u8 = 64;
 /// has this many cores.
 pub const APPLICATION_CORE_COUNT: u8 = 6;
 
+/// A core index that is not below [`MAX_CORES`]. Also what deserialising a [`CoreId`] from such a
+/// byte reports, so a saved state cannot hold a core whose [`CoreId::bit`] would overflow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
+#[error("core index {0} is not below the maximum of {MAX_CORES} cores")]
+pub struct CoreIdOutOfRange(pub u8);
+
 /// A physical core index, below [`MAX_CORES`]. Whether a scheduler has that core is checked by
-/// the scheduler.
+/// the scheduler. Serialised as the bare index (one byte); deserialising goes through
+/// [`CoreId::new`]'s bound.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "u8")]
 pub struct CoreId(u8);
+
+impl TryFrom<u8> for CoreId {
+    type Error = CoreIdOutOfRange;
+
+    fn try_from(index: u8) -> Result<Self, Self::Error> {
+        Self::new(index).ok_or(CoreIdOutOfRange(index))
+    }
+}
 
 impl CoreId {
     /// The core with this index, or `None` if it is not below [`MAX_CORES`].
@@ -168,5 +185,62 @@ mod tests {
         assert!(!mask.contains(CoreId::new(3).unwrap()));
         assert!(mask.without(two).is_empty());
         assert_eq!(mask.bits(), two.bit());
+    }
+
+    #[test]
+    fn core_id_serialises_as_its_index() {
+        // Golden bytes: postcard writes a u8 as itself.
+        let five = CoreId::new(5).unwrap();
+        assert_eq!(postcard::to_allocvec(&five).unwrap(), vec![five.index()]);
+        let top = CoreId::new(MAX_CORES - 1).unwrap();
+        assert_eq!(postcard::to_allocvec(&top).unwrap(), vec![MAX_CORES - 1]);
+        assert_eq!(postcard::from_bytes::<CoreId>(&[five.index()]), Ok(five));
+    }
+
+    #[test]
+    fn core_id_deserialising_enforces_the_bound() {
+        // Every possible byte: the in-range ones decode, the rest are errors, never a CoreId
+        // whose `bit()` would overflow its shift.
+        for byte in 0..=u8::MAX {
+            let decoded = postcard::from_bytes::<CoreId>(&[byte]);
+            if byte < MAX_CORES {
+                assert_eq!(decoded.map(CoreId::index), Ok(byte));
+            } else {
+                assert_eq!(decoded, Err(postcard::Error::SerdeDeCustom), "byte {byte}");
+            }
+        }
+    }
+
+    #[test]
+    fn core_id_out_of_range_error_names_the_index() {
+        assert_eq!(
+            CoreId::try_from(MAX_CORES),
+            Err(CoreIdOutOfRange(MAX_CORES))
+        );
+        assert_eq!(
+            CoreIdOutOfRange(MAX_CORES).to_string(),
+            format!("core index {MAX_CORES} is not below the maximum of {MAX_CORES} cores")
+        );
+    }
+
+    #[test]
+    fn affinity_mask_serialises_as_a_varint_u64() {
+        // Golden bytes. Cores 1 and 8: 0b1_0000_0010 = 0x102, LEB128 low group first with the
+        // continuation bit set: 0x82, 0x02.
+        let low =
+            AffinityMask::single(CoreId::new(1).unwrap()).bits() | CoreId::new(8).unwrap().bit();
+        let low = AffinityMask::from_bits(low);
+        assert_eq!(postcard::to_allocvec(&low).unwrap(), vec![0x82, 0x02]);
+        assert_eq!(postcard::from_bytes::<AffinityMask>(&[0x82, 0x02]), Ok(low));
+        // Cores 1 and 63: the low group 0x02 with the continuation bit, eight empty groups
+        // (0x80), and bit 63 alone in the tenth.
+        let high = AffinityMask::from_bits(
+            CoreId::new(1).unwrap().bit() | CoreId::new(MAX_CORES - 1).unwrap().bit(),
+        );
+        let mut want = vec![0x82];
+        want.extend([0x80; 8]);
+        want.push(0x01);
+        assert_eq!(postcard::to_allocvec(&high).unwrap(), want);
+        assert_eq!(postcard::from_bytes::<AffinityMask>(&want), Ok(high));
     }
 }

@@ -294,9 +294,10 @@ impl Scheduler {
     /// scheduler lock, with migration enabled).
     ///
     /// Errors, before anything changes: an empty mask is [`KernelError::InvalidCombination`];
-    /// a mask with a core the scheduler doesn't have is [`KernelError::InvalidCoreId`]; an ideal
-    /// core outside the mask, or [`IdealCore::NoUpdate`] when the current ideal core is outside
-    /// it, is [`KernelError::InvalidCombination`].
+    /// a mask with a core the scheduler doesn't have is [`KernelError::InvalidCoreId`], and so is
+    /// an [`IdealCore::Core`] the scheduler doesn't have (checked before the mask); an ideal core
+    /// the scheduler has but the mask lacks, or [`IdealCore::NoUpdate`] when the current ideal
+    /// core is outside the mask, is [`KernelError::InvalidCombination`].
     ///
     /// If the thread's active core leaves its mask, it moves to the ideal core, or with no ideal
     /// core to the highest core in the mask.
@@ -307,8 +308,8 @@ impl Scheduler {
         mask: AffinityMask,
     ) -> Result<(), SchedError> {
         // svcSetThreadCoreMask's checks (svc_thread.cpp): mask within the allowed cores
-        // (InvalidCoreId), non-empty (InvalidCombination), ideal core in the mask
-        // (InvalidCombination).
+        // (InvalidCoreId), non-empty (InvalidCombination), ideal core a valid core id
+        // (`IsValidVirtualCoreId`, else InvalidCoreId), then in the mask (InvalidCombination).
         if mask.bits() & !self.core_mask().bits() != 0 {
             return Err(KernelError::InvalidCoreId.into());
         }
@@ -318,6 +319,9 @@ impl Scheduler {
         let thread = self.thread(id)?;
         let new_ideal = match ideal {
             IdealCore::Core(core) => {
+                if self.core_mask().bits() & core.bit() == 0 {
+                    return Err(KernelError::InvalidCoreId.into());
+                }
                 if !mask.contains(core) {
                     return Err(KernelError::InvalidCombination.into());
                 }

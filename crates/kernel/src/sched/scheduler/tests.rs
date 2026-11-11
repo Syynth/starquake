@@ -399,6 +399,12 @@ fn set_core_mask_rejects_what_eden_asserts() {
         s.set_core_mask(a, IdealCore::Core(core(2)), mask(&[0, 1])),
         Err(kernel(KernelError::InvalidCombination))
     );
+    // svcSetThreadCoreMask: an ideal core that is not a valid core id is InvalidCoreId (the
+    // `!IsValidVirtualCoreId` arm), even though it is also outside the mask.
+    assert_eq!(
+        s.set_core_mask(a, IdealCore::Core(core(4)), mask(&[0])),
+        Err(kernel(KernelError::InvalidCoreId))
+    );
     assert_eq!(s.thread(a).unwrap(), &before, "failures change nothing");
 }
 
@@ -948,6 +954,39 @@ fn check_queues(s: &Scheduler) {
     }
 }
 
+/// `UpdateHighestPriorityThreadsImpl`'s migration walk, checked on the settled state: walking an
+/// idle core's suggested threads in queue order (most urgent level first, then list order),
+/// skipping those that are their own core's choice, the first thread that is not its core's
+/// choice would have been migrated here unless that core's choice is more urgent than
+/// [`HIGHEST_CORE_MIGRATION_ALLOWED_PRIORITY`] (`k_scheduler.cpp`, the `break` before
+/// `SetActiveCore`). A walk that runs out of threads has nothing to assert: the fallback that
+/// moves a candidate core's top thread depends on what else those cores can run.
+fn check_idle_core_walk(s: &Scheduler, chosen: &[Option<ThreadId>], idle: CoreId) {
+    for level in 0..=LOWEST_THREAD_PRIORITY {
+        for id in s
+            .queue
+            .suggested_list(&s.threads, prio(level), idle)
+            .unwrap()
+        {
+            let active = s.thread(id).unwrap().active_core;
+            let top = active.and_then(|c| chosen[usize::from(c.index())]);
+            if top == Some(id) {
+                continue;
+            }
+            assert!(
+                top.is_some(),
+                "idle core {idle:?} left {id:?} unmigrated with no top thread to block it"
+            );
+            let blocker = top.unwrap();
+            assert!(
+                s.thread(blocker).unwrap().priority < HIGHEST_CORE_MIGRATION_ALLOWED_PRIORITY,
+                "idle core {idle:?} skipped {id:?}, whose core's choice {blocker:?} is not too urgent to leave"
+            );
+            return;
+        }
+    }
+}
+
 /// The acceptance invariants after an update: each core's choice is its most urgent scheduled
 /// thread and is allowed there, no thread is chosen twice, and a core is idle only when no
 /// allowed thread could be migrated to it.
@@ -959,46 +998,33 @@ fn check_choices(s: &Scheduler) {
         }
     }
     let chosen: Vec<Option<ThreadId>> = (0..s.core_count()).map(|c| highest(s, c)).collect();
-    let too_urgent_somewhere = chosen
-        .iter()
-        .flatten()
-        .any(|&id| s.thread(id).unwrap().priority < HIGHEST_CORE_MIGRATION_ALLOWED_PRIORITY);
     for c in 0..s.core_count() {
         let here = core(c);
-        match chosen[usize::from(c)] {
-            Some(id) => {
-                let t = s.thread(id).unwrap();
-                assert!(t.is_queued(), "core {c} chose a thread that can't run");
-                assert!(
-                    t.affinity.contains(here),
-                    "core {c} chose a thread not allowed there"
-                );
-                assert_eq!(t.active_core, Some(here));
-                for (_, other) in &live {
-                    if other.is_queued() && other.active_core == Some(here) {
-                        assert!(
-                            t.priority <= other.priority,
-                            "core {c} skipped a more urgent thread"
-                        );
-                    }
+        if let Some(id) = chosen[usize::from(c)] {
+            let t = s.thread(id).unwrap();
+            assert!(t.is_queued(), "core {c} chose a thread that can't run");
+            assert!(
+                t.affinity.contains(here),
+                "core {c} chose a thread not allowed there"
+            );
+            assert_eq!(t.active_core, Some(here));
+            for (_, other) in &live {
+                if other.is_queued() && other.active_core == Some(here) {
+                    assert!(
+                        t.priority <= other.priority,
+                        "core {c} skipped a more urgent thread"
+                    );
                 }
-                let times = chosen.iter().filter(|&&x| x == Some(id)).count();
-                assert_eq!(times, 1, "a thread chosen by two cores");
             }
-            None => {
-                for (id, other) in &live {
-                    if !other.is_queued() {
-                        continue;
-                    }
+            let times = chosen.iter().filter(|&&x| x == Some(id)).count();
+            assert_eq!(times, 1, "a thread chosen by two cores");
+        } else {
+            for (_, other) in &live {
+                if other.is_queued() {
                     assert_ne!(other.active_core, Some(here), "core {c} idle with work");
-                    if other.affinity.contains(here) {
-                        assert!(
-                            chosen.contains(&Some(*id)) || too_urgent_somewhere,
-                            "core {c} idle while {id:?} could migrate to it"
-                        );
-                    }
                 }
             }
+            check_idle_core_walk(s, &chosen, here);
         }
     }
 }
@@ -1058,7 +1084,7 @@ proptest! {
                 check_running(&s);
             }
         }
-        settle(&mut s);
+        settle_at(&mut s, u64::try_from(ops.len()).unwrap() + 1);
         check_queues(&s);
         check_choices(&s);
         check_running(&s);
