@@ -46,14 +46,28 @@ without keys, firmware or games.
 
 ## Shared test support
 
-A small `starquake-testkit` crate (dev-dependency only) so each crate doesn't reinvent it:
+Two places, split by what the helper depends on:
+
+**`starquake-testkit`** (a dev-dependency) holds helpers that depend on none of our crates:
 
 - **A64 snippets:** encoders for the dozen instructions guest test programs need (`movz`, `svc`,
   `b`, `ldr`/`str`, `mrs`, `ret`, …), each verified once against a real assembler.
-- **Synthetic programs:** wrap a snippet as an NRO so the loader, kernel and CPU tests share one
-  way of producing a runnable guest.
-- **In-memory fakes:** a `GuestMemory`, a `Vcpu` that plays back scripted exits, and a host for
-  the macro processor.
+- **Synthetic programs:** wrap a snippet as NRO bytes, so the loader, kernel and CPU tests share
+  one way of producing a runnable guest.
+
+**Each crate exports its own fakes** behind a `test-support` feature: an in-memory `GuestMemory`
+in `starquake-memory`, a `Vcpu` that plays back scripted exits in `starquake-cpu`, a host for the
+macro processor in `starquake-gpu`.
+
+The split is forced by how Rust builds tests. If a fake for the CPU crate's `Vcpu` trait lived in
+the testkit, the CPU crate's own unit tests would see two copies of the crate (the one under
+test and the one the testkit links), whose types don't match, and wouldn't compile. A fake that
+lives in the crate that defines the trait has no such problem, and other crates enable it with
+the feature.
+
+The testkit stays small on purpose: many agents will want to add to it at once, and a bug in a
+shared helper is a blind spot in every crate's tests. A helper used by one crate belongs in that
+crate.
 
 ## Golden traces
 
@@ -61,6 +75,12 @@ A trace is a text log of what a guest program did at the system boundary: one li
 call and IPC request, with decoded arguments and results, grouped per guest thread so that
 cross-thread timing doesn't change the file. Tests run a program and compare the trace with a
 committed snapshot (`insta`). A behaviour change shows up as a reviewable diff.
+
+A snapshot only protects anything if its changes are read. So: **a PR that changes a snapshot
+says why in its description**, change by change, and the reviewer checks that explanation against
+the diff. Accepting a new snapshot to make a test pass, without an explanation, is a review
+rejection. Snapshots are kept small (homebrew programs, not long runs) so their diffs stay
+readable.
 
 The trace is one view of the event stream defined in the observability spec
 (`observability.md`, also a proposal), which also covers replaying the kernel and services from a
@@ -76,16 +96,32 @@ program's source in `tests/homebrew/`, build it with devkitA64 by hand when it c
 the small binary next to its source with the toolchain version recorded. CI doesn't need the
 toolchain.
 
+To stop a binary drifting from its source, a manifest next to each binary records a hash of its
+source files, and the gate fails when the sources no longer match the manifest. That doesn't
+prove the binary was built from those sources, only that nobody changed one without touching the
+other; rebuilding and comparing is a manual check when it matters.
+
 ## Fuzzing
 
 `cargo fuzz` targets for the parsers and decoders (IPC, NSO/NRO/NPDM, macro and shader
 decoding). Not part of the gate; run before releases and when a parser changes.
 
+## Not decided here
+
+The hypervisor tests run only on a real Mac, never in hosted CI, so a regression in the CPU
+backend is caught locally or not at all. A self-hosted CI runner on a Mac would close that gap,
+at the cost of keeping a machine available. The deterministic interpreter backend (#47) covers
+guest-code tests in CI, but not the hypervisor backend itself.
+
 ## Decisions asked of the owner
 
 1. **Commit prebuilt homebrew binaries** (built from in-repo source) rather than building them in
-   CI. Recommended: keeps the gate fast and toolchain-free.
-2. **A `starquake-testkit` crate** as the one place for test helpers.
+   CI, with a source-hash manifest the gate checks. Recommended: keeps the gate fast and
+   toolchain-free.
+2. **A small `starquake-testkit` crate for helpers that depend on none of our crates; each
+   crate exports its own fakes** behind a `test-support` feature. (Revised after owner review:
+   the first draft put the fakes in the testkit.)
 3. **Tier 2 tests fail, not skip, on a Mac that can't create a VM**, and skip only on hosted CI.
    That makes a broken entitlement or runner visible immediately.
-4. **`insta` snapshots for traces**, reviewed like code.
+4. **`insta` snapshots for traces**, with every snapshot change explained in the PR and checked
+   in review.
