@@ -1,7 +1,7 @@
 # Kernel: object model and port plan
 
-Status: **proposal, awaiting owner review** (issue #9). Builds on the execution model
-(`execution-model.md`, also a proposal); where that changes, this follows.
+Status: **approved by the owner, 2026-11-11** (issue #9). Builds on the execution model
+(`execution-model.md`).
 
 `crates/kernel` re-implements the parts of the Horizon kernel a game can observe: threads and
 scheduling, synchronisation, memory, handles, and the client side of IPC. Its behaviour is ported
@@ -214,7 +214,7 @@ belongs to, citing its row.
 
 ### Recording and replay
 
-The observability spec (`observability.md`, also a proposal) adds three requirements here: the
+The observability spec (`observability.md`) adds three requirements here: the
 system-call dispatcher, scheduler and address space each report to one event recorder; the clock,
 random numbers and host I/O are read through an injectable environment, never directly; and the
 tables are serialisable, for snapshots. All three are cheap with this design and are part of slice 2
@@ -247,7 +247,10 @@ Later slices: shared and transfer memory, `MapPhysicalMemory`, resource limits, 
 and context, code memory. Deferred until something needs them: the server-side calls, guest
 process creation, and IPC buffer mapping.
 
-## Decisions asked of the owner
+## Decisions
+
+Approved by the owner on 2026-11-11 as written. Where a decision names a recommendation, the
+recommendation stands.
 
 1. **Tables behind a dispatcher, objects referenced by id, one lock to start.** System calls
    declare the tables they touch; only the dispatcher locks. Recommended over mirroring Horizon's
