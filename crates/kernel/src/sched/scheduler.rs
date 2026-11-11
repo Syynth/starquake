@@ -423,6 +423,12 @@ impl Scheduler {
     /// (`KAbstractSchedulerLock::Unlock`): if anything changed, recompute each core's thread
     /// (migrating suggested threads to idle cores), then signal every core whose thread changed
     /// except `caller`. Returns the cores whose thread changed, `caller` included.
+    ///
+    /// `now` stamps the threads that stop being a core's choice (Eden stamps them with
+    /// `CoreTiming().GetClockTicks()`, the guest counter). The scheduler only compares stamps
+    /// with each other, in the yields, so any clock that never runs backwards works; the caller
+    /// passes guest counter ticks, converted from the environment's clock by
+    /// [`crate::svc::tick::nanos_to_ticks`], the kernel's one conversion point.
     pub fn update(
         &mut self,
         now: GuestTicks,

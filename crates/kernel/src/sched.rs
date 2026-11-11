@@ -86,6 +86,7 @@ use crate::slab::SlabError;
 /// `global_scheduler_context.h`, `HighestCoreMigrationAllowedPriority = 2`.
 pub const HIGHEST_CORE_MIGRATION_ALLOWED_PRIORITY: Priority = match Priority::new(2) {
     Some(priority) => priority,
+    // Unreachable: 2 is a valid priority. A `const` can't unwrap, so the match needs an arm.
     None => Priority::HIGHEST,
 };
 
