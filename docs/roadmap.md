@@ -27,6 +27,20 @@ things. Issues without them carry the `needs-design` label and stay out of waves
 | M4 | Correct frames in one title | Shader coverage, textures, queue synchronisation. |
 | M5 | Performance | Front/back GPU split tuned, macro memo, JITs. |
 
+## Route to milestone 1: skeleton first
+
+1. **Walking skeleton.** A synthetic guest program, built with the testkit, is loaded, run under
+   the hypervisor, makes system calls through the kernel dispatcher, and exits; the command-line
+   app writes a trace and an exit code. Provisional parts (bring-up memory, one thread, no
+   scheduler) are marked and get replaced below.
+2. **Widen behind it,** in waves and single-agent tasks: finish the dispatcher's table
+   borrows; stage-1 page tables; kernel slices 4–10; the service framework and `sm:`; loader
+   wiring; recorder wiring.
+3. **Milestone 1:** a real libnx homebrew program sends a request to `sm:` and exits, with a
+   golden trace. Needs devkitPro installed by the owner.
+
+Later: a desktop app frontend built with GPUI on top of `starquake-core`.
+
 ## Waves
 
 - **Wave 0, design:** execution model (CPU, memory, kernel threading), test strategy. Specs are

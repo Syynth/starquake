@@ -128,3 +128,27 @@ Entry format:
 - **SCOPE:** moderate
 - **WHAT:** The owner vetted the first 26 entries in `docs/proposals.md`. Six work items became issues (#63-#68), two were folded into existing work, one was dropped and one stays proposed (ExeFS/RomFS/NCA loading, until milestone 2 planning). Eight rules from the wave 1 and 2 reviews were adopted into `CLAUDE.md`: fixed proptest seeds; expectations from shipping constants at the exact limit; swap-detecting round-trip tests for parsers; guesses marked and divergences from the reference pinned by tests; whole-extent arithmetic checks on untrusted input; no retries for flaky tests and exact negative assertions; no duplicated logic across sibling modules; and the merge queue waits for a PR's own CI checks. Two candidates were dropped as house rules.
 - **WHY:** The rules each came from a real review finding in agent-written code, and the owner wants recurring mistakes turned into standing rules. Hygiene items were promoted where they are small and prevent recurrence; larger or premature items wait.
+
+## Autonomous mode until something runs; design delegated; stronger reviews
+- **WHEN:** 2026-11-11
+- **PROJECT:** starquake
+- **SYSTEM:** process
+- **SCOPE:** architectural
+- **WHAT:** Until the first program runs end to end (milestone 1), the lead session works autonomously: it makes design decisions itself, amends specs, and records what it decided for the owner to review afterwards. It stops only for things that need the owner (hardware, passwords, purchases, anything irreversible outside the repo) or when it is genuinely blocked. Reviews get stronger than one adversarial reviewer per PR. Work that is single-threaded or needs taste and judgement (integration, foundations, bring-up) goes to a single agent on the strongest model instead of a parallel wave; waves stay for well-specified ports. Token cost of waves is accepted.
+- **WHY:** Nothing runs end to end yet, and the owner's review of every decision was the bottleneck. The owner judges that code quality is better when judgement-heavy work is done by one strong agent with the whole picture, and wants reviews to catch more.
+
+## A GPUI app frontend later; a trace is the acceptance evidence for now
+- **WHEN:** 2026-11-11
+- **PROJECT:** starquake
+- **SYSTEM:** frontend
+- **SCOPE:** moderate
+- **WHAT:** The eventual user-facing frontend is a desktop app built with GPUI. Until then the command-line app is the only frontend, and "working" is shown by a trace and exit code from a headless run, provided the evidence is trustworthy (a known program with known expected output, checked independently). Frontends depend only on `starquake-core`, so the GPUI app is additive.
+- **WHY:** The owner wants a real app eventually but doesn't want UI work to delay getting something running, and is satisfied by a trace as long as it really proves the program ran.
+
+## In autonomous mode the lead logs decisions and vets proposals directly
+- **WHEN:** 2026-11-11
+- **PROJECT:** starquake
+- **SYSTEM:** process
+- **SCOPE:** moderate
+- **WHAT:** While autonomous mode lasts, the lead writes decision-log entries without asking for approval of each one: entries for decisions the owner states, and entries for decisions the lead makes under delegation, marked "Decided by the lead under delegation". The lead also vets `docs/proposals.md` itself: it promotes what the milestone 1 path needs, rules on spec deviations, and records each choice in the file. Anything off that path stays proposed. The owner reviews both afterwards and can overturn any of them.
+- **WHY:** Stopping for approval of every entry and every proposal was most of the ceremony in the process, and it blocked all remaining kernel and service work. The owner chose both options when asked.

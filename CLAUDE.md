@@ -3,6 +3,19 @@
 A Switch 2 emulator in Rust, for macOS (Apple Silicon) and Linux. GPLv3. Most code is written by
 agents, so the repo is built to make changes checkable.
 
+## Working mode (until milestone 1)
+
+The lead session runs autonomously until a program runs end to end (decision log, 2026-11-11):
+it decides design questions, amends specs and vets `docs/proposals.md` itself, and records every
+such choice for the owner to review afterwards. It stops only for things that need the owner
+(hardware, passwords, anything irreversible outside the repo). The route is **skeleton first**:
+get the thinnest end-to-end run working, then widen it, so the pieces are proven to fit.
+
+- Judgement-heavy or single-threaded work (integration, foundations, bring-up) goes to one agent
+  on the strongest model. Parallel waves are for well-specified ports.
+- Every PR gets two independent reviews: one for fidelity to the spec and the reference, one
+  that runs the code and tries to break its tests.
+
 ## Before you say a change is done
 
 Run `cargo xtask ci` (or `just ci`): fmt check, `cargo deny check` (licences, sources, advisories;
