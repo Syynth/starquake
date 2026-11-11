@@ -2,15 +2,17 @@ name: ci
 
 on:
   push:
+    branches: [main]
   pull_request:
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  gate:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-latest, ubuntu-latest] # macOS arm64, Linux x86-64
-    runs-on: ${{ matrix.os }}
+  # Linux x86-64 runs on every PR and on main.
+  linux:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: taiki-e/install-action@v2
@@ -18,4 +20,17 @@ jobs:
           tool: cargo-nextest
       - uses: Swatinem/rust-cache@v2
       # rust-toolchain.toml pins the compiler; rustup installs it on first use.
+      - run: cargo xtask ci
+
+  # macOS arm64 runs on main only: hosted macOS minutes cost 10x, and every PR is already gated
+  # on a Mac locally before it is opened.
+  macos:
+    if: github.event_name == 'push'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - uses: Swatinem/rust-cache@v2
       - run: cargo xtask ci
