@@ -351,6 +351,7 @@ impl Npdm {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::npdm::capabilities::encode::syscall_mask_words;
     use crate::npdm::capabilities::{
         DebugFlags, KernelCapabilities, KernelVersion, MemoryMap, MemoryMapKind, RegionMap,
         RegionType, ThreadInfo,
@@ -381,20 +382,10 @@ mod tests {
     }
 
     fn svc_mask(ids: &[u32]) -> crate::npdm::capabilities::SvcMask {
-        // Built through the public decoder: one descriptor per SVC index.
-        let mut words = Vec::new();
-        for index in 0..8u32 {
-            let mut mask = 0u32;
-            for &id in ids {
-                if id / 24 == index {
-                    mask |= 1 << (id % 24);
-                }
-            }
-            if mask != 0 {
-                words.push(0b1111 | (mask << 5) | (index << 29));
-            }
-        }
-        KernelCapabilities::parse(&words).unwrap().svc_mask
+        // Built through the public decoder from the shared test-side encoder.
+        KernelCapabilities::parse(&syscall_mask_words(ids))
+            .unwrap()
+            .svc_mask
     }
 
     /// The signed bound: everything a request in [`request`] asks for, and more.
@@ -853,8 +844,10 @@ mod tests {
             Ok(())
         );
         assert_eq!(
-            npdm(1, 64, info()).check_main_thread(4),
-            Err(MainThreadViolation::PriorityOutOfRange { priority: 64 })
+            npdm(1, LOWEST_THREAD_PRIORITY + 1, info()).check_main_thread(4),
+            Err(MainThreadViolation::PriorityOutOfRange {
+                priority: LOWEST_THREAD_PRIORITY + 1
+            })
         );
         assert_eq!(
             npdm(1, 27, info()).check_main_thread(4),

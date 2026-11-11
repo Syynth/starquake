@@ -50,8 +50,14 @@
 //!   the version. Whether it is a process category is not established by any source here.
 //!
 //! The `ACID` block's own service and kernel access control are read at body offsets 0x28 and
-//! 0x30 (`AcidHeader::sac_offset`, `kac_offset`) with the same relative-to-block rule as the
-//! FAC, and decoded like their `ACI0` counterparts. How the `ACI0` relates to the `ACID` is in
+//! 0x30 (`AcidHeader::sac_offset`, `kac_offset`) and decoded like their `ACI0` counterparts. The
+//! field offsets come from `AcidHeader`, but the base they are added to is a guess: this port
+//! assumes the start of the `ACID` block, by analogy with the FAC fix in `eden-pr4588`. No pinned
+//! source reads the `ACID` SAC or KAC (`eden`, `eden-nx2` and `eden-pr4588` read only
+//! `acid_header.fac_offset`; `npdm_info.py` reads only the `ACI0` lists). A retail Switch 2
+//! `main.npdm` whose `ACID` SAC and KAC decode to sensible service names and capability words at
+//! block-relative offsets would confirm it; a different base (for example the magic) would show
+//! up as garbage or a parse error there. How the `ACI0` relates to the `ACID` is in
 //! [`validate`]; every rule there is a guess.
 
 pub mod capabilities;
@@ -195,9 +201,12 @@ pub struct Acid {
     /// File access control.
     pub file_access: FileAccessControl,
     /// Services the title may be granted (the `ACID`'s own service access control; wildcard
-    /// entries are grants, see [`service_access`]).
+    /// entries are grants, see [`service_access`]). Guess: the SAC offset is read relative to the
+    /// `ACID` block; no pinned source reads this list (see the module docs).
     pub services: Vec<ServiceAccess>,
-    /// Kernel capabilities the title may be granted (the `ACID`'s own KAC).
+    /// Kernel capabilities the title may be granted (the `ACID`'s own KAC). Guess: the KAC offset
+    /// is read relative to the `ACID` block; no pinned source reads this list (see the module
+    /// docs).
     pub kernel_capabilities: KernelCapabilities,
 }
 
@@ -397,7 +406,8 @@ fn parse_acid(block: &[u8]) -> Result<Acid, NpdmError> {
 
     // Body layout, relative to the magic (`AcidHeader` after the signature area): flags at 0xC,
     // title id range at 0x10 and 0x18, FAC, SAC and KAC offset/size pairs at 0x20, 0x28 and 0x30.
-    // The offsets are relative to the start of the ACID block.
+    // The FAC offset is relative to the start of the ACID block (eden-pr4588). The SAC and KAC
+    // offsets are read the same way, but that is a guess: no pinned source reads them.
     let acid_flags = u32_at(body, 0xC);
     let fac_offset = to_usize(u32_at(body, 0x20), "FAC")?;
     let fac_size = to_usize(u32_at(body, 0x24), "FAC")?;
@@ -547,19 +557,14 @@ mod tests {
     /// resource size and which SwitchBrew calls the Switch 2 remote memory size.
     const WORD_0X10: u32 = 0xA5A5_0010;
 
-    /// Test-side `CorePriority` descriptor: priorities `min..=max`, cores `min_core..=max_core`.
-    fn thread_info_word(min_prio: u32, max_prio: u32, min_core: u32, max_core: u32) -> u32 {
-        0b111 | (max_prio << 4) | (min_prio << 10) | (min_core << 16) | (max_core << 24)
-    }
+    use capabilities::encode::thread_info as thread_info_word;
 
     /// Test-side SAC encoder: `(name, server)` entries, `*` in a name kept as the wildcard.
     fn sac_bytes(entries: &[(&str, bool)]) -> Vec<u8> {
-        let mut out = Vec::new();
-        for (name, server) in entries {
-            out.push(u8::try_from(name.len() - 1).unwrap() | if *server { 0x80 } else { 0 });
-            out.extend_from_slice(name.as_bytes());
-        }
-        out
+        entries
+            .iter()
+            .flat_map(|(name, server)| service_access::encode::entry(name, *server))
+            .collect()
     }
 
     /// A test-side NPDM writer that places bytes at the documented offsets.

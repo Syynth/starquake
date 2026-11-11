@@ -102,6 +102,26 @@ pub fn parse(bytes: &[u8]) -> Result<Vec<ServiceAccess>, ServiceAccessError> {
     Ok(services)
 }
 
+/// Test-side encoder shared by the `npdm` tests.
+#[cfg(test)]
+pub(crate) mod encode {
+    use super::*;
+
+    /// Encodes one entry the way the file does: control byte (server flag, name length minus
+    /// one), then the name.
+    pub(crate) fn entry(name: &str, server: bool) -> Vec<u8> {
+        let length_field = u8::try_from(name.len() - 1).unwrap();
+        assert_eq!(
+            length_field & !LENGTH_MASK,
+            0,
+            "name too long for one entry"
+        );
+        let mut out = vec![length_field | if server { SERVER_FLAG } else { 0 }];
+        out.extend_from_slice(name.as_bytes());
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,13 +130,7 @@ mod tests {
     /// Fixed seed so property runs are reproducible.
     const PROPTEST_SEED: u64 = 0x5EED_0000_5143;
 
-    /// Encodes one entry the way the file does.
-    fn entry(name: &str, server: bool) -> Vec<u8> {
-        let mut out =
-            vec![u8::try_from(name.len() - 1).unwrap() | if server { SERVER_FLAG } else { 0 }];
-        out.extend_from_slice(name.as_bytes());
-        out
-    }
+    use super::encode::entry;
 
     #[test]
     fn decodes_names_server_flag_and_wildcards() {
