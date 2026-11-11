@@ -71,7 +71,9 @@ Platform-specific code must still compile (or be `cfg`-gated) on Linux; check wi
 ## Git and GitHub
 
 - Conventional Commits (`feat(ipc): ...`, `fix(loader): ...`, `docs: ...`, `chore: ...`).
-  Commit at every green checkpoint; one logical change per commit.
+  Commit at every green checkpoint; one logical change per commit. Run `just setup` once per clone:
+  it points `core.hooksPath` at `.githooks`, whose `commit-msg` hook rejects non-conventional subjects. CI
+  applies the same check to PR titles.
 - One issue → one branch → one PR, with an honest `Closes #N`. Findings become issues; design
   questions become `needs-design` issues.
 - Implementation PRs may merge on a green gate and review. Design and spec PRs wait for the owner.

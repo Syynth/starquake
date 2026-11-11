@@ -1,0 +1,33 @@
+name: pr-title
+
+# Squash and merge commits take their subject from the PR title, and the title is what the
+# history shows, so it must follow Conventional Commits like every commit does. This runs the
+# same script as the local commit-msg hook (see `just setup`).
+on:
+  pull_request:
+    types: [opened, edited, reopened]
+
+permissions: {}
+
+concurrency:
+  group: pr-title-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  title:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      # The title is attacker-controlled text: it reaches the shell only through an environment
+      # variable, never by interpolating the expression into the script.
+      - name: Check the PR title
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          printf '%s\n' "$PR_TITLE" > "$RUNNER_TEMP/pr-title.txt"
+          sh .githooks/commit-msg --title "$RUNNER_TEMP/pr-title.txt"
