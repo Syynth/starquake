@@ -125,24 +125,25 @@ mod tests {
 
     #[test]
     fn an_extent_that_wraps_the_address_space_is_rejected() {
-        // Divergence: Eden doesn't check. address + len == 2^64 overflows by one.
-        let memory = FlatMemory::new(BASE, 0x10);
+        // Divergence: Eden doesn't check. The first MAX_DEBUG_STRING_LEN bytes are readable, so
+        // only the extent check can reject these.
+        let limit = usize::try_from(MAX_DEBUG_STRING_LEN).unwrap();
+        let memory = FlatMemory::new(BASE, limit);
         let mut sink = Collect::default();
+        // address + len == 2^64: overflows by exactly one.
+        let wraps = u64::MAX - BASE + 1;
         assert_eq!(
-            output_debug_string(&memory, &mut sink, u64::MAX, 1),
+            output_debug_string(&memory, &mut sink, BASE, wraps),
             Err(KernelError::InvalidCurrentMemory)
         );
         assert_eq!(
-            output_debug_string(&memory, &mut sink, 1, u64::MAX),
-            Err(KernelError::InvalidCurrentMemory)
-        );
-        // Ending exactly at the top of the address space doesn't overflow; it is then an
-        // unreadable address in this memory.
-        assert_eq!(
-            output_debug_string(&memory, &mut sink, u64::MAX - 1, 1),
+            output_debug_string(&memory, &mut sink, BASE, u64::MAX),
             Err(KernelError::InvalidCurrentMemory)
         );
         assert_eq!(sink.0, Vec::<Vec<u8>>::new());
+        // One less ends exactly at the top of the address space, which doesn't overflow.
+        output_debug_string(&memory, &mut sink, BASE, wraps - 1).unwrap();
+        assert_eq!(sink.0.len(), 1);
     }
 
     #[test]
