@@ -4,6 +4,14 @@
 //! the guest's stage-1 tables (we manage stage-2, which must be 16 KiB aligned on Apple hosts),
 //! while a JIT translates in software. Everything above the CPU layer (kernel, IPC, GPU) only sees
 //! [`GuestMemory`].
+//!
+//! [`translation`] holds the [`Translation`] trait that maps guest virtual ranges; [`stage1`]
+//! implements it with AArch64 stage-1 tables for the native backends.
+
+pub mod stage1;
+pub mod translation;
+
+pub use translation::{Access, BackingRange, MapError, PAGE_SIZE, Perms, Translation};
 
 /// An access to guest memory that isn't mapped, or isn't allowed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
