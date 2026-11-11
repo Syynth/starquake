@@ -178,10 +178,11 @@ pub enum EventKind {
         value: u64,
     },
     /// A line the guest logged. The flight recorder keeps the size and a hash, not the text.
+    /// Build it with [`EventKind::guest_log`].
     GuestLog {
         /// Length of the text in bytes.
         len: u32,
-        /// A hash of the text, computed by the producer (this crate does not interpret it).
+        /// The FNV-1a 64-bit hash of the text.
         hash: u64,
     },
     /// A lifecycle step.
@@ -193,15 +194,39 @@ pub enum EventKind {
     },
 }
 
+/// FNV-1a 64-bit offset basis (Fowler, Noll, Vo, "FNV Hash", the 64-bit parameters).
+const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+/// FNV-1a 64-bit prime.
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
 impl EventKind {
     /// Whether the golden-trace view shows this event.
     ///
-    /// Every kind except [`EventKind::Schedule`]: which core a thread ran on is a property of the
-    /// run, not of what the guest did, and differs between runs with the same guest behaviour.
-    /// This narrows the spec's "per-thread view of this stream" and is pinned by a test.
+    /// System calls, IPC requests, guest log lines, lifecycle steps and service notes are shown.
+    /// [`EventKind::Wake`], [`EventKind::Map`], [`EventKind::Fault`] and [`EventKind::Schedule`]
+    /// are left out: they depend on timing, so they differ between runs in which the guest did
+    /// the same thing (observability spec, "The event stream"). The spec's list of what the view
+    /// holds does not mention service notes either way; showing them is this crate's reading.
     #[must_use]
     pub fn in_golden_trace(&self) -> bool {
-        !matches!(self, Self::Schedule { .. })
+        !matches!(
+            self,
+            Self::Wake { .. } | Self::Map { .. } | Self::Fault { .. } | Self::Schedule { .. }
+        )
+    }
+
+    /// The [`EventKind::GuestLog`] event for a line of `text` the guest logged: its length and
+    /// its FNV-1a 64-bit hash. Every producer builds the event here, so one text always gives
+    /// one trace line. A length above `u32::MAX` is recorded as `u32::MAX`.
+    #[must_use]
+    pub fn guest_log(text: &[u8]) -> Self {
+        let hash = text.iter().fold(FNV_OFFSET_BASIS, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(FNV_PRIME)
+        });
+        Self::GuestLog {
+            len: u32::try_from(text.len()).unwrap_or(u32::MAX),
+            hash,
+        }
     }
 }
 
@@ -305,15 +330,85 @@ mod tests {
     }
 
     #[test]
-    fn only_schedule_is_hidden_from_the_golden_trace() {
+    fn the_golden_trace_holds_calls_requests_logs_and_lifecycle_only() {
+        // Observability spec, "The event stream": "It holds system calls, IPC requests, guest
+        // log lines and lifecycle events; wake, map, fault and schedule events are left out
+        // because they depend on timing."
+        let shown = [
+            EventKind::Svc {
+                id: 1,
+                args: [0; SVC_ARG_COUNT],
+                result: ResultCode(0),
+            },
+            EventKind::Ipc {
+                session: SessionId(1),
+                service: ServiceId(2),
+                command: 3,
+                request_size: 4,
+                reply_size: 5,
+                result: ResultCode(0),
+                outcome: IpcOutcome::Done,
+            },
+            EventKind::GuestLog { len: 3, hash: 9 },
+            EventKind::Lifecycle {
+                phase: LifecyclePhase::ProcessStart,
+                subject: 1,
+            },
+        ];
+        for kind in shown {
+            assert!(kind.in_golden_trace(), "{kind}");
+        }
         let schedule = EventKind::Schedule {
             core: 1,
             from: None,
             to: Some(ThreadId(2)),
         };
-        assert!(!schedule.in_golden_trace());
         assert_eq!(schedule.to_string(), "schedule core=1 idle -> 2");
-        let log = EventKind::GuestLog { len: 3, hash: 9 };
-        assert!(log.in_golden_trace());
+        let hidden = [
+            schedule,
+            EventKind::Wake {
+                thread: ThreadId(1),
+                reason: WakeReason::Signalled,
+            },
+            EventKind::Map {
+                va: 0x1000,
+                size: 0x1000,
+                perms: 3,
+                kind: MapKind::Map,
+            },
+            EventKind::Fault {
+                address: 0x10,
+                write: true,
+                action: FaultAction::Fatal,
+            },
+        ];
+        for kind in hidden {
+            assert!(!kind.in_golden_trace(), "{kind}");
+        }
+    }
+
+    #[test]
+    fn a_guest_log_event_carries_the_length_and_the_fnv_1a_hash_of_the_text() {
+        // FNV-1a 64-bit test vectors from the reference implementation's test suite
+        // (Fowler, Noll, Vo; `test_fnv.c`): "", "a" and "foobar".
+        for (text, hash) in [
+            (&b""[..], 0xcbf2_9ce4_8422_2325_u64),
+            (b"a", 0xaf63_dc4c_8601_ec8c),
+            (b"foobar", 0x8594_4171_f739_67e8),
+        ] {
+            assert_eq!(
+                EventKind::guest_log(text),
+                EventKind::GuestLog {
+                    len: u32::try_from(text.len()).unwrap(),
+                    hash
+                },
+                "{text:?}"
+            );
+        }
+        // The text of a line is its bytes: one changed byte changes the hash.
+        assert_ne!(
+            EventKind::guest_log(b"hello"),
+            EventKind::guest_log(b"hellp")
+        );
     }
 }

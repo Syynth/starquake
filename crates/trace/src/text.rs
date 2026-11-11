@@ -8,13 +8,12 @@
 //! The view is a function of each thread's own event sequence only. It leaves out `seq`, `time`
 //! and `core` (all differ between runs that did the same thing), orders threads by id, and keeps
 //! each thread's events in the order they were recorded. Two recordings that interleave the same
-//! per-thread sequences differently therefore render to identical text. [`Schedule`] events are
-//! left out (see [`EventKind::in_golden_trace`]).
+//! per-thread sequences differently therefore render to identical text. Wake, map, fault and
+//! schedule events are left out, because they depend on timing (see
+//! [`EventKind::in_golden_trace`]).
 //!
 //! The line format itself is this crate's own design (the spec gives none); it is the
 //! `Display` of [`EventKind`], pinned by tests here and in `event.rs`.
-//!
-//! [`Schedule`]: EventKind::Schedule
 
 use std::collections::BTreeMap;
 
@@ -83,7 +82,8 @@ mod tests {
     use super::*;
     use crate::Recorder;
     use crate::event::{
-        EventKind, GuestTicks, LifecyclePhase, ResultCode, SVC_ARG_COUNT, WakeReason,
+        EventKind, FaultAction, GuestTicks, LifecyclePhase, MapKind, ResultCode, SVC_ARG_COUNT,
+        WakeReason,
     };
 
     fn config() -> ProptestConfig {
@@ -125,9 +125,9 @@ mod tests {
     fn two_interleavings_of_the_same_threads_render_identically() {
         let a = [svc(1), svc(2), svc(3)];
         let b = [
-            EventKind::Wake {
-                thread: ThreadId(1),
-                reason: WakeReason::Signalled,
+            EventKind::Lifecycle {
+                phase: LifecyclePhase::ThreadCreate,
+                subject: 2,
             },
             svc(9),
         ];
@@ -145,7 +145,7 @@ mod tests {
             "thread 1\n  svc 0x1(0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1) -> 0x0\n  \
              svc 0x2(0x2, 0x2, 0x2, 0x2, 0x2, 0x2, 0x2, 0x2) -> 0x0\n  \
              svc 0x3(0x3, 0x3, 0x3, 0x3, 0x3, 0x3, 0x3, 0x3) -> 0x0\n\
-             thread 2\n  wake thread=1 Signalled\n  \
+             thread 2\n  lifecycle ThreadCreate 2\n  \
              svc 0x9(0x9, 0x9, 0x9, 0x9, 0x9, 0x9, 0x9, 0x9) -> 0x0\n"
         );
     }
@@ -157,13 +157,38 @@ mod tests {
     }
 
     #[test]
-    fn schedule_events_are_not_shown_and_an_empty_view_is_empty() {
-        let schedule = EventKind::Schedule {
-            core: 0,
-            from: None,
-            to: Some(ThreadId(1)),
-        };
-        assert_eq!(render(&[(1, schedule)]), "");
+    fn timing_dependent_events_are_not_shown_and_an_empty_view_is_empty() {
+        let hidden = [
+            EventKind::Schedule {
+                core: 0,
+                from: None,
+                to: Some(ThreadId(1)),
+            },
+            EventKind::Wake {
+                thread: ThreadId(1),
+                reason: WakeReason::Signalled,
+            },
+            EventKind::Map {
+                va: 0x1000,
+                size: 0x2000,
+                perms: 3,
+                kind: MapKind::Map,
+            },
+            EventKind::Fault {
+                address: 0x10,
+                write: true,
+                action: FaultAction::Fatal,
+            },
+        ];
+        for kind in hidden {
+            assert_eq!(render(&[(1, kind)]), "", "{kind}");
+            // Hidden events leave the lines around them as they are.
+            assert_eq!(
+                render(&[(1, svc(1)), (1, kind), (1, svc(2))]),
+                render(&[(1, svc(1)), (1, svc(2))]),
+                "{kind}"
+            );
+        }
         assert_eq!(render(&[]), "");
     }
 
