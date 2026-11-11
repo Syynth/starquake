@@ -16,15 +16,15 @@
 //!
 //! Intentional divergences from Eden, each pinned by a test:
 //!
-//! - Eden's `GetEntry` returns a zeroed entry for an offset outside the table, whose `sibling` of
-//!   0 sends `ProcessFile` and `ProcessDirectory` round the same entry forever; here that is
-//!   [`RomFsError::EntryOutOfBounds`]. Sibling and child links that revisit an entry are
-//!   [`RomFsError::Cycle`].
+//! - Eden's `GetEntry` returns a zeroed entry for an offset outside the table. Its `sibling` of 0
+//!   sends `ProcessFile` and `ProcessDirectory` back to the entry at offset 0, so a link past the
+//!   table can make them loop forever; here that is [`RomFsError::EntryOutOfBounds`]. Sibling and
+//!   child links that revisit an entry are [`RomFsError::Cycle`].
 //! - Eden clamps a name that runs past the table; here that is [`RomFsError::NameOutOfBounds`].
 //! - Eden's names are raw bytes; here a name must be UTF-8 ([`RomFsError::NameNotUtf8`]).
-//! - Eden ignores a file whose data lies past the end of the source until it is read; here
-//!   [`RomFs::file_extent`] and the reads reject it, checking `data offset + offset + size` for
-//!   overflow as well.
+//! - Eden does not check a file's data against the source until it is read, and then reads fewer
+//!   bytes; here [`RomFs::file_extent`] and the reads reject it, checking
+//!   `data offset + offset + size` for overflow as well.
 //! - Eden asserts that the root directory is named `""`; here a non-empty root name is
 //!   [`RomFsError::BadRoot`].
 //!

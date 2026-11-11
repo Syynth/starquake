@@ -14,8 +14,9 @@
 //!
 //! - Eden loops over the entries with a `u16` counter although the header count is a `u32`; here
 //!   the whole `u32` count is honoured (and bounded by the source length).
-//! - Eden does not check that an entry's data lies inside the source (reads are clamped later);
-//!   here an entry whose `content start + offset + size` overruns the source, or overflows, is
+//! - Eden does not check at parse time that an entry's data lies inside the source (an
+//!   `OffsetVfsFile` just returns fewer bytes when read); here an entry whose
+//!   `content start + offset + size` overruns the source, or overflows, is
 //!   [`Pfs0Error::EntryOutOfBounds`].
 //! - Eden reads a name from a string-table offset it never checks; here an offset past the table
 //!   is [`Pfs0Error::NameOffsetOutOfBounds`]. An offset equal to the table size yields an empty
@@ -24,7 +25,7 @@
 //! - Eden ignores the `HFS0` hash fields (`hash_region_size`, the 0x20-byte hash); so does this.
 //!
 //! Matching Eden: a name that is not NUL-terminated ends at the end of the string table; entries
-//! may share a name (Eden's by-name lookups return the first), so [`Pfs0::find`] does the same.
+//! may share a name (`VfsDirectory::GetFile` returns the first), so [`Pfs0::find`] does the same.
 
 use std::io::{Read, Seek, SeekFrom};
 use std::ops::Range;
