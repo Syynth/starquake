@@ -8,9 +8,9 @@
 //! comes from). `eden-nx2/tools/nx2/npdm_info.py` is the independent reader the layouts were
 //! cross-checked against.
 //!
-//! This decodes and validates structure; it does not enforce policy (the kernel decides whether a
-//! core id or physical address is acceptable), except where Eden rejects a descriptor outright:
-//! reserved bits set, a map-range without its pair, a zero kernel major version, duplicate
+//! This decodes and validates structure. Policy (whether a core id, priority or physical address
+//! is acceptable) is separate: [`KernelCapabilities::check_policy`]. Parsing itself rejects only
+//! what Eden rejects outright: reserved bits set, a map-range without its pair, a zero kernel major version, duplicate
 //! once-only descriptors and reversed core or priority ranges.
 //!
 //! Unknown descriptor types are collected in [`KernelCapabilities::unknown`] rather than rejected,
@@ -78,6 +78,13 @@ impl SvcMask {
     }
 }
 
+/// Bits of physical address a memory map may use
+/// (`KCapabilities::PhysicalMapAllowedMask = (1ULL << 36) - 1` in `k_capabilities.h`).
+pub const PHYSICAL_ADDRESS_BITS: u32 = 36;
+/// Number of thread priorities, from 0, that belong to the kernel and that a process capability
+/// must not include (`(m_priority_mask & 0xF) == 0` in `SetCorePriorityCapability`).
+pub const RESERVED_KERNEL_PRIORITIES: u8 = 4;
+
 /// Core and priority ranges the title may use (`KCapabilities::CorePriority`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThreadInfo {
@@ -85,6 +92,49 @@ pub struct ThreadInfo {
     pub priorities: RangeInclusive<u8>,
     /// Cores allowed, lowest to highest.
     pub cores: RangeInclusive<u8>,
+}
+
+impl ThreadInfo {
+    /// True if `core` is in the core range (the core-mask test in `CreateThread`,
+    /// `eden/src/core/hle/kernel/svc/svc_thread.cpp`).
+    pub fn allows_core(&self, core: u8) -> bool {
+        self.cores.contains(&core)
+    }
+
+    /// True if `priority` is in the priority range (`KProcess::CheckThreadPriority`).
+    pub fn allows_priority(&self, priority: u8) -> bool {
+        self.priorities.contains(&priority)
+    }
+}
+
+/// A capability that Eden accepts structurally but its kernel rejects as policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum PolicyViolation {
+    /// The highest core named is not below the number of cores
+    /// (`R_UNLESS(max_core < NumVirtualCores, ResultInvalidCoreId)`).
+    #[error("capability names core {max_core}, but there are only {core_count} cores")]
+    CoreOutOfRange {
+        /// Highest core in the range.
+        max_core: u8,
+        /// Cores the caller says exist.
+        core_count: u32,
+    },
+    /// The priority range includes a priority the kernel keeps for itself
+    /// (`R_UNLESS((m_priority_mask & 0xF) == 0, ResultInvalidArgument)`).
+    #[error("capability includes kernel thread priority {highest}")]
+    KernelPriority {
+        /// Numerically lowest (highest-priority) entry of the range.
+        highest: u8,
+    },
+    /// A memory map ends beyond the 36-bit physical address space
+    /// (`((phys_addr + size - 1) & ~PhysicalMapAllowedMask) == 0`).
+    #[error("memory map of {size:#x} bytes at {address:#x} leaves the 36-bit physical space")]
+    PhysicalRange {
+        /// Start of the map.
+        address: u64,
+        /// Size of the map.
+        size: u64,
+    },
 }
 
 /// What kind of mapping a [`MemoryMap`] asks for.
@@ -110,6 +160,21 @@ pub struct MemoryMap {
     pub read_only: bool,
     /// Which descriptor form this came from.
     pub kind: MemoryMapKind,
+}
+
+impl MemoryMap {
+    /// One past the last byte, or `None` if `address + size` overflows 64 bits.
+    pub fn end(&self) -> Option<u64> {
+        self.address.checked_add(self.size)
+    }
+
+    /// True if every byte of the map is below 2^[`PHYSICAL_ADDRESS_BITS`]. Checks the whole
+    /// extent, not just the start: the start alone always fits, because the descriptor's address
+    /// field is a 24-bit page number, but the size can carry the end past the limit.
+    pub fn fits_physical_address_space(&self) -> bool {
+        self.end()
+            .is_some_and(|end| end <= 1u64 << PHYSICAL_ADDRESS_BITS)
+    }
 }
 
 /// A kernel memory region a title may map (`KCapabilities::RegionType`).
@@ -233,6 +298,46 @@ pub enum CapabilityError {
 }
 
 impl KernelCapabilities {
+    /// Checks the policy rules Eden's kernel applies to a process's capabilities on top of the
+    /// structural checks in [`KernelCapabilities::parse`], and returns the first one broken.
+    ///
+    /// `core_count` is the number of cores the guest sees (Eden: `NumVirtualCores`; the pinned
+    /// references use 4 on mainline and 6 on Eden-NX2 and PR 4588). Rules, each from
+    /// `eden/src/core/hle/kernel/k_capabilities.cpp`:
+    ///
+    /// - the highest core is below `core_count`,
+    /// - the priority range excludes the first [`RESERVED_KERNEL_PRIORITIES`] priorities,
+    /// - every memory map ends within 2^[`PHYSICAL_ADDRESS_BITS`].
+    ///
+    /// The kernel checks the map rule when it applies the descriptor, so the map error here is
+    /// the first map in descriptor order that fails.
+    pub fn check_policy(&self, core_count: u32) -> Result<(), PolicyViolation> {
+        if let Some(info) = &self.thread_info {
+            let max_core = *info.cores.end();
+            if u32::from(max_core) >= core_count {
+                return Err(PolicyViolation::CoreOutOfRange {
+                    max_core,
+                    core_count,
+                });
+            }
+            let highest = *info.priorities.start();
+            if highest < RESERVED_KERNEL_PRIORITIES {
+                return Err(PolicyViolation::KernelPriority { highest });
+            }
+        }
+        match self
+            .memory_maps
+            .iter()
+            .find(|map| !map.fits_physical_address_space())
+        {
+            Some(map) => Err(PolicyViolation::PhysicalRange {
+                address: map.address,
+                size: map.size,
+            }),
+            None => Ok(()),
+        }
+    }
+
     /// Decodes a list of capability words.
     pub fn parse(words: &[u32]) -> Result<Self, CapabilityError> {
         let mut caps = Self::default();
@@ -634,11 +739,110 @@ mod tests {
         );
     }
 
+    /// `MapRange` address word and size word for the given page number and page count.
+    fn map_range(page: u32, pages: u32) -> [u32; 2] {
+        [0x3F | (page << 7), 0x3F | (pages << 7) | (1 << 31)]
+    }
+
+    #[test]
+    fn thread_info_answers_core_and_priority_queries() {
+        let info = ThreadInfo {
+            priorities: 28..=59,
+            cores: 1..=3,
+        };
+        assert!(!info.allows_core(0));
+        assert!(info.allows_core(1) && info.allows_core(3));
+        assert!(!info.allows_core(4));
+        assert!(!info.allows_priority(27));
+        assert!(info.allows_priority(28) && info.allows_priority(59));
+        assert!(!info.allows_priority(60));
+    }
+
+    #[test]
+    fn policy_accepts_the_switch_2_title_capabilities() {
+        // Cores 0..=5, priorities 28..=59 (NX2 notes, "Titles"): fine on six cores.
+        let caps = KernelCapabilities::parse(&[thread_info(28, 59, 0, 5)]).unwrap();
+        assert_eq!(caps.check_policy(6), Ok(()));
+        // The same capabilities on a four-core layout name core 5, which does not exist.
+        assert_eq!(
+            caps.check_policy(4),
+            Err(PolicyViolation::CoreOutOfRange {
+                max_core: 5,
+                core_count: 4
+            })
+        );
+    }
+
+    #[test]
+    fn policy_rejects_kernel_priorities() {
+        // Priorities 0..=3 are the kernel's (`m_priority_mask & 0xF` in k_capabilities.cpp).
+        let reserved = RESERVED_KERNEL_PRIORITIES;
+        let at = |lowest: u8| {
+            KernelCapabilities::parse(&[thread_info(u32::from(lowest), 63, 0, 3)])
+                .unwrap()
+                .check_policy(4)
+        };
+        assert_eq!(at(reserved), Ok(()));
+        assert_eq!(
+            at(reserved - 1),
+            Err(PolicyViolation::KernelPriority {
+                highest: reserved - 1
+            })
+        );
+        assert_eq!(at(0), Err(PolicyViolation::KernelPriority { highest: 0 }));
+    }
+
+    #[test]
+    fn policy_checks_physical_maps_against_the_36_bit_limit() {
+        let limit = 1u64 << PHYSICAL_ADDRESS_BITS;
+        let last_page = u32::try_from(limit / PAGE_SIZE).unwrap() - 1;
+        let check = |words: &[u32]| KernelCapabilities::parse(words).unwrap().check_policy(4);
+        // The last page of the 36-bit space is fine; one more page runs past it.
+        assert_eq!(check(&map_range(last_page, 1)), Ok(()));
+        let past = map_range(last_page, 2);
+        assert_eq!(
+            check(&past),
+            Err(PolicyViolation::PhysicalRange {
+                address: u64::from(last_page) * PAGE_SIZE,
+                size: 2 * PAGE_SIZE
+            })
+        );
+        // The largest range from page 0 still ends below the limit.
+        assert_eq!(check(&map_range(0, 0xF_FFFF)), Ok(()));
+        // IO pages: the last page fits (the 24-bit field cannot name a page beyond it).
+        assert_eq!(check(&[0x7F | (0xFF_FFFF << 8)]), Ok(()));
+    }
+
+    #[test]
+    fn memory_map_end_never_overflows() {
+        let map = |address, size| MemoryMap {
+            address,
+            size,
+            read_only: false,
+            kind: MemoryMapKind::Static,
+        };
+        assert_eq!(map(0x1000, 0x2000).end(), Some(0x3000));
+        assert_eq!(map(u64::MAX, 1).end(), None);
+        assert!(!map(u64::MAX, 1).fits_physical_address_space());
+        assert!(map(0, 1u64 << PHYSICAL_ADDRESS_BITS).fits_physical_address_space());
+        assert!(!map(1, 1u64 << PHYSICAL_ADDRESS_BITS).fits_physical_address_space());
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig {
             rng_seed: proptest::test_runner::RngSeed::Fixed(PROPTEST_SEED),
             ..ProptestConfig::default()
         })]
+        #[test]
+        fn arbitrary_words_never_panic_in_policy_checks(
+            words in proptest::collection::vec(any::<u32>(), 0..64),
+            core_count in any::<u32>(),
+        ) {
+            if let Ok(caps) = KernelCapabilities::parse(&words) {
+                let _ = caps.check_policy(core_count);
+            }
+        }
+
         #[test]
         fn arbitrary_words_never_panic(words in proptest::collection::vec(any::<u32>(), 0..64)) {
             let _ = KernelCapabilities::parse(&words);
