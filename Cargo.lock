@@ -570,6 +570,7 @@ name = "starquake-trace"
 version = "0.0.0"
 dependencies = [
  "postcard",
+ "proptest",
  "serde",
  "thiserror",
 ]

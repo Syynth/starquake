@@ -14,3 +14,6 @@ workspace = true
 postcard.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
