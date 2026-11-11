@@ -434,7 +434,14 @@ fn interrupts_never_lose_or_repeat_guest_work() {
         }
     });
     let (mut svcs, mut interrupts) = (0u64, 0u64);
-    while svcs < 2_000 {
+    // Keep going until interrupts have landed too, however late the interrupting thread gets
+    // scheduled on a loaded machine.
+    let started = std::time::Instant::now();
+    while svcs < 2_000 || interrupts < 10 {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(60),
+            "only {interrupts} interrupts landed in 60 s"
+        );
         let exit = vcpu.run().unwrap();
         let regs = vcpu.regs().unwrap();
         assert_eq!((regs.x[9], regs.x[10], regs.x[11]), (0x99, 0x1010, 0x1111));
@@ -455,4 +462,103 @@ fn interrupts_never_lose_or_repeat_guest_work() {
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     pest.join().unwrap();
     assert!(interrupts > 0, "no interrupt landed");
+}
+
+/// `movz x0, #imm`.
+fn movz_x0(imm: u16) -> u32 {
+    0xd280_0000 | (u32::from(imm) << 5)
+}
+
+/// `svc #imm`.
+fn svc(imm: u16) -> u32 {
+    SVC_0 | (u32::from(imm) << 5)
+}
+
+#[test]
+fn code_rewritten_by_the_host_runs_on_the_same_vcpu() {
+    let Some(guest) = Guest::new() else { return };
+    let mut vcpu = guest.vcpu(&[movz_x0(0), svc(0)], |_| {});
+    let base = guest.ram_base();
+    // Stale instruction-cache lines show up within a few rewrites; a thousand leave no doubt.
+    for i in 1..=1000 {
+        guest.load(&[movz_x0(i), svc(i)]);
+        let mut regs = vcpu.regs().unwrap();
+        regs.pc = base;
+        vcpu.set_regs(&regs).unwrap();
+        assert_eq!(vcpu.run().unwrap(), Exit::Svc(i), "rewrite {i}");
+        assert_eq!(vcpu.regs().unwrap().x[0], u64::from(i), "rewrite {i}");
+    }
+}
+
+#[test]
+fn code_written_in_pieces_is_seen_whole() {
+    let Some(guest) = Guest::new() else { return };
+    let mut vcpu = guest.vcpu(&[SVC_0], |_| {});
+    let base = guest.ram_base();
+    let memory = guest.backend.memory();
+    // Rewrites that straddle cache lines and end mid-line, one word at a time.
+    for i in 1..=200u16 {
+        for (word, offset) in [movz_x0(i), svc(i)].into_iter().zip([60, 64]) {
+            memory.write(base + offset, &word.to_le_bytes()).unwrap();
+        }
+        let mut regs = vcpu.regs().unwrap();
+        regs.pc = base + 60;
+        vcpu.set_regs(&regs).unwrap();
+        assert_eq!(vcpu.run().unwrap(), Exit::Svc(i), "rewrite {i}");
+        assert_eq!(vcpu.regs().unwrap().x[0], u64::from(i), "rewrite {i}");
+    }
+}
+
+#[test]
+fn a_new_vm_never_runs_the_previous_vms_code() {
+    // Each VM's RAM is fresh host memory, which the allocator and the kernel hand out again from
+    // pages an earlier VM's guest executed. Alternate two programs at the same address, with the
+    // run on a different thread each time (and so often on a different core), and check that
+    // every VM runs the program it was given.
+    for round in 0..100u16 {
+        let imm = 1 + round % 2;
+        std::thread::spawn(move || {
+            let Some(guest) = Guest::new() else { return };
+            let mut vcpu = guest.vcpu(&[movz_x0(imm), svc(imm), SVC_0], |_| {});
+            assert_eq!(vcpu.run().unwrap(), Exit::Svc(imm), "round {round}");
+            assert_eq!(vcpu.regs().unwrap().x[0], u64::from(imm), "round {round}");
+        })
+        .join()
+        .unwrap();
+    }
+}
+
+#[test]
+fn svc_reaches_the_host_whatever_x0_holds() {
+    // Hypervisor.framework answers an `hvc #0` itself, without exiting, when w0 looks like an
+    // SMCCC function id it knows (observed: top byte 0xc1). The guest's x0 is an arbitrary
+    // argument at every svc, so the shim must not forward with `hvc #0`
+    // (see "SMCCC" in `tools/hvprobe/README.md`).
+    let Some(guest) = Guest::new() else { return };
+    let mut vcpu = guest.vcpu(&[SVC_0], |_| {});
+    let base = guest.ram_base();
+    let mut values: Vec<u64> = (0..=0xff).map(|top| (top << 24) | 0x12_3456).collect();
+    values.extend([
+        0xc100_0000,
+        0xc100_0001,
+        0xc1ff_ffff,
+        0xffff_ffff_c100_0000,
+        0x29bb_c193_b0af, // a counter value that tripped it
+        0xc400_0003,
+        0x8400_0000,
+    ]);
+    for x0 in values {
+        let mut regs = GuestRegs {
+            pc: base,
+            sp: guest.data(),
+            ..GuestRegs::default()
+        };
+        regs.x[0] = x0;
+        regs.x[1] = 0x1111;
+        vcpu.set_regs(&regs).unwrap();
+        assert_eq!(vcpu.run().unwrap(), Exit::Svc(0), "x0 = {x0:#x}");
+        let after = vcpu.regs().unwrap();
+        assert_eq!((after.x[0], after.x[1]), (x0, 0x1111), "x0 = {x0:#x}");
+        assert_eq!(after.pc, base + 4, "x0 = {x0:#x}");
+    }
 }

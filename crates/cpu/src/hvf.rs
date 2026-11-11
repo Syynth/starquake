@@ -217,7 +217,21 @@ impl HostRegion {
         unsafe {
             std::ptr::copy_nonoverlapping(data.as_ptr(), self.ptr.as_ptr().add(start), data.len());
         }
+        // The guest may execute what was just written, and Hypervisor.framework does not keep its
+        // instruction fetches coherent with host stores (see "Instruction cache" in
+        // `tools/hvprobe/README.md`).
+        self.sync_icache(start, data.len());
         Some(())
+    }
+
+    /// Makes guest instruction fetches see everything written to `start..start + len` so far.
+    /// `start..start + len` must be inside the region (callers check it with `range`).
+    fn sync_icache(&self, start: usize, len: usize) {
+        debug_assert!(start.checked_add(len).is_some_and(|end| end <= self.len()));
+        // SAFETY: the range is inside the allocation, which stays live for the call, and the
+        // function only does cache maintenance by address: it neither reads nor writes through
+        // the pointer in a way Rust can observe.
+        unsafe { ffi::sys_icache_invalidate(self.ptr.as_ptr().add(start).cast(), len) };
     }
 }
 
@@ -613,7 +627,7 @@ impl HvfVcpu {
                 "unexpected exception exit: ESR_EL2 {syndrome:#x} at pc {pc:#x}"
             )));
         }
-        if syndrome & 0xffff != shim::HVC_EL0_EXCEPTION {
+        if syndrome & 0xffff != u64::from(shim::HVC_EL0_EXCEPTION) {
             return Err(Error::Host(format!(
                 "the EL1 shim took an unexpected exception: ESR_EL1 {esr:#x}, ELR_EL1 {elr:#x}"
             )));

@@ -97,6 +97,15 @@ unsafe extern "C" {
     pub(super) fn hv_vcpu_set_vtimer_mask(vcpu: VcpuId, masked: bool) -> HvReturn;
 }
 
+// libSystem is linked into every Rust binary on macOS, so no `#[link]` attribute is needed.
+unsafe extern "C" {
+    /// `sys_icache_invalidate` (`<libkern/OSCacheControl.h>`): makes instruction fetches on every
+    /// core see the bytes just written to `start..start + len`. It cleans the data cache to the
+    /// point of unification, invalidates the instruction cache by address (both broadcast to all
+    /// cores) and issues the barriers.
+    pub(super) fn sys_icache_invalidate(start: *mut c_void, len: usize);
+}
+
 /// Turns a Hypervisor.framework return code into a [`Result`], naming the call that failed.
 pub(super) fn check(what: &str, ret: HvReturn) -> Result<(), Error> {
     if ret == 0 {

@@ -45,6 +45,44 @@ Consequence: **broadcast TLB invalidation works across vCPUs.** After changing s
 one vCPU running the EL1 flush entry point is enough; other cores don't need to be interrupted.
 A change must never be left unflushed: a running vCPU keeps a stale translation for a long time.
 
+### Instruction cache and host writes (added 2026-11-11)
+
+Hypervisor.framework does not keep the guest's instruction fetches coherent with stores the host
+makes to guest RAM. A probe that rewrote `movz x0, #i; svc #i` in place between runs on one vCPU
+ran the old instructions in 199,949 of 200,000 iterations (the review that found it); calling
+`sys_icache_invalidate` (libSystem, `<libkern/OSCacheControl.h>`) on the written host range
+brought that to 0 of 200,000. The backend's integration tests reproduce it: without the call the
+second rewrite already runs the first program.
+
+Consequence: **every host write to guest RAM must be followed by `sys_icache_invalidate` on the
+written range.** The backend does this in its single write path (`HostRegion::write`), so
+`GuestMemory::write` never leaves stale instructions. The same stale instructions also showed up
+as rare failures across tests that create and destroy VMs in one process (3 of 240 full runs of the
+test binary on a loaded machine, with signatures such as a data abort at address 0 or the wrong
+`svc` immediate); they were gone after the invalidation (0 of 1,200 loaded runs). Jumping into RAM
+that was never written, in a VM created right after one that executed code at the same address,
+ran zeroes (a fault) every time in 1,500 trials, so no invalidation of untouched memory is done.
+
+### SMCCC: `hvc #0` is not a plain exit (added 2026-11-11)
+
+The EL1 shim reports an EL0 exception to the host with an `hvc`. Hypervisor.framework treats
+**`hvc #0` as an SMCCC call**: when `w0` looks like a function id it knows, it answers in the
+kernel, writes its result into `x0`-`x3`, and resumes the guest **without exiting to the host**.
+The shim's `eret` then returns to EL0 just past the `svc`, which executes whatever follows.
+
+| Observation | Value |
+|---|---|
+| `svc #0` with `x0` set to each possible top byte of `w0` (low 24 bits random, 400 each) | only top byte `0xc1` was swallowed (190 of 400); all others exited normally |
+| What the guest sees after a swallowed `hvc #0` | `x0` = `0xffffffff`, or `x0`,`x1` = `1`,`0`, or four unrelated words in `x0`-`x3`; `ESR_EL1` = `0x2000000` (an UNDEFINED taken at the instruction after the `svc`) |
+| The same `svc` with the shim using `hvc #2` | `x0` top byte `0xc1`: 0 of 300,000; every top byte exits normally |
+| Odds for a guest that reads a counter into `x0` just before an exit | about 1 in 256: a 24 MHz count has top byte `0xc1` in its low word for 2^24 ticks (0.7 s) every 2^32 ticks (179 s), which is the 0.3 to 0.5% flake rate of the counter test and why failures came in bursts |
+
+Only the top byte was scanned, so other function ids may be handled too. Consequence: **never
+forward an exception with `hvc #0`**, and never rely on `x0` at the point of the `hvc`: `x0` is
+the guest's own value (an `svc` argument) there. The shim uses `hvc #2` (`HVC_EL0_EXCEPTION`);
+`hvc #1` marks a vector the shim doesn't use. Real guests hit this on any `svc` whose first
+argument has top byte `0xc1` in its low word.
+
 What this doesn't cover yet: VM-exit cost with six vCPUs running at once, full context-switch cost,
 `hv_vcpus_exit` for preempting a vCPU, stage-2 remapping cost (lazy backing of sparse regions),
 and exception-level details of a real HLE kernel (TPIDRRO_EL0, FP/SIMD state, EL0 data aborts

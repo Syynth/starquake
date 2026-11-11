@@ -2,7 +2,7 @@
 //!
 //! Guest code runs at EL0. Every exception it takes lands in this table at EL1, which either
 //! handles it in the guest (a trapped `mrs xN, cntpct_el0`, answered from the virtual counter) or
-//! hands it to the host with `hvc #0`. The host then reads `ESR_EL1`, `FAR_EL1` and `ELR_EL1`
+//! hands it to the host with `hvc #2`. The host then reads `ESR_EL1`, `FAR_EL1` and `ELR_EL1`
 //! directly, so the shim passes nothing in general-purpose registers. Between runs a vCPU is
 //! *parked* on the shim's `eret`: its EL0 state lives in `ELR_EL1`/`SPSR_EL1`, and every run starts
 //! by returning to EL0.
@@ -29,7 +29,7 @@ pub(super) const AFTER_SAVE: usize = 0x408;
 pub(super) const ELR_BUMPED: usize = 0x44c;
 /// Start of the path that restores x9-x11 and exits to the host.
 pub(super) const TO_HOST: usize = 0x450;
-/// The `eret` a vCPU is parked on between runs (right after `hvc #0`).
+/// The `eret` a vCPU is parked on between runs (right after the `hvc`).
 pub(super) const PARKED: usize = 0x45c;
 /// Start of the 32 counter stubs, one per `Rt` (31 is `xzr`).
 pub(super) const STUBS: usize = 0x800;
@@ -43,8 +43,13 @@ const STUBS_END: usize = STUBS + 32 * STUB_LEN;
 /// How far below `SP_EL1` the shim saves x9 (x10 and x11 follow at +8 and +16).
 pub(super) const SCRATCH_BELOW_SP: u64 = 32;
 
-/// `hvc` immediate for "EL0 took an exception the host must handle".
-pub(super) const HVC_EL0_EXCEPTION: u64 = 0;
+/// `hvc` immediate for "EL0 took an exception the host must handle". It must not be 0: the
+/// guest's x0 is arbitrary at an exception (an `svc` argument, a counter value), and
+/// Hypervisor.framework treats `hvc #0` as an SMCCC call and answers it itself, without exiting,
+/// when w0 looks like a function id it knows (observed: top byte 0xc1). The guest then resumes
+/// past the `svc` with x0-x3 overwritten (`tools/hvprobe/README.md`, "SMCCC"). Other immediates
+/// always reach the host.
+pub(super) const HVC_EL0_EXCEPTION: u16 = 2;
 
 /// `CPSR` of a parked vCPU: `EL1h` with D, A, I and F masked (`tools/hvprobe/src/probe.rs`).
 pub(super) const CPSR_EL1H_MASKED: u64 = 0x3c5;
@@ -63,7 +68,13 @@ const EC_DATA_ABORT_LOWER: u64 = 0x24;
 /// `ESR_ELx.ISS.WnR` for data aborts.
 const ISS_WNR: u64 = 1 << 6;
 
-const HVC_1: u32 = 0xd400_0022; // hvc #1: an exception the shim doesn't expect
+/// `hvc #imm`.
+const fn hvc(imm: u16) -> u32 {
+    0xd400_0002 | ((imm as u32) << 5)
+}
+
+const HVC_TO_HOST: u32 = hvc(HVC_EL0_EXCEPTION);
+const HVC_1: u32 = hvc(1); // hvc #1: an exception the shim doesn't expect
 const ERET: u32 = 0xd69f_03e0; // eret
 const STUB_RESTORE: [u32; 2] = [
     0xa97e_2be9, // ldp  x9, x10, [sp, #-32]
@@ -95,7 +106,7 @@ const EL0_SYNC_HANDLER: [u32; 24] = [
     0xd61f_0160, // 0x44c  br   x11                         ELR_BUMPED
     0xa97e_2be9, // 0x450  ldp  x9, x10, [sp, #-32]         TO_HOST
     0xf85f_03eb, // 0x454  ldur x11, [sp, #-16]
-    0xd400_0002, // 0x458  hvc  #0                          HVC_EL0_EXCEPTION
+    HVC_TO_HOST, // 0x458  hvc  #HVC_EL0_EXCEPTION
     ERET,        // 0x45c  eret                             PARKED
 ];
 
@@ -132,7 +143,8 @@ pub(super) const fn exception_class(esr: u64) -> u64 {
 ///
 /// SVCs carry their immediate, and `ELR_EL1` already points past the `svc`. Instruction and data
 /// aborts report `FAR_EL1`. Anything else (UNDEFINED, a failed `AUT*`, a trapped system register
-/// access the shim doesn't emulate, alignment faults) is [`Exit::Undefined`] at `ELR_EL1`.
+/// access the shim doesn't emulate, PC and SP alignment faults) is [`Exit::Undefined`] at
+/// `ELR_EL1`. Data-access alignment faults are data aborts (EC 0x24) and report `FAR_EL1`.
 pub(super) fn decode_el0_exception(esr: u64, far: u64, elr: u64) -> Exit {
     match exception_class(esr) {
         EC_SVC64 => {
@@ -209,10 +221,14 @@ mod tests {
         assert_eq!(word(ELR_BUMPED - 4), 0xd518_402a); // msr elr_el1, x10
         assert_eq!(word(ELR_BUMPED), 0xd61f_0160); // br x11
         assert_eq!(word(TO_HOST), STUB_RESTORE[0]);
-        assert_eq!(
-            word(PARKED - 4),
-            0xd400_0002 | (u32::try_from(HVC_EL0_EXCEPTION).unwrap() << 5)
+        assert_eq!(word(PARKED - 4), HVC_TO_HOST);
+        assert_ne!(
+            HVC_EL0_EXCEPTION, 0,
+            "hvc #0 is an SMCCC call to Hypervisor.framework"
         );
+        assert_ne!(HVC_EL0_EXCEPTION, 1, "hvc #1 means an unexpected vector");
+        assert_eq!(hvc(1), 0xd400_0022);
+        assert_eq!(hvc(0), 0xd400_0002);
         assert_eq!(word(PARKED), ERET);
         assert_eq!(STUBS_END, LEN);
     }
@@ -278,7 +294,16 @@ mod tests {
                 write: false
             }
         );
-        for undefined in [1 << 25, (0x1c << 26) | (1 << 25), CNTPCT_ESR] {
+        // PC (EC 0x22) and SP (EC 0x26) alignment faults are undefined; a misaligned data access
+        // is a data abort (EC 0x24, above).
+        let alignment = |ec: u64| (ec << 26) | (1 << 25);
+        for undefined in [
+            1 << 25,
+            (0x1c << 26) | (1 << 25),
+            CNTPCT_ESR,
+            alignment(0x22),
+            alignment(0x26),
+        ] {
             assert_eq!(
                 decode_el0_exception(undefined, far, elr),
                 Exit::Undefined { pc: elr }
