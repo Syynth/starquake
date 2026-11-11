@@ -4,11 +4,15 @@
 //! `eden/src/core/hle/service/hle_ipc.cpp` (`ParseCommandBuffer`) and
 //! `eden/src/core/hle/service/ipc_helpers.h` (`ResponseBuilder`), GPL-3.0-or-later.
 //!
-//! Guesses, because Eden treats these words as padding or never reads them: the name `token` for
-//! the fourth word of the `SFCI`/`SFCO` headers and of the domain request header (the issue
-//! brief names them so), and that the domain request `size` counts the `SFCI` header plus the
-//! arguments (Eden never reads `size`; this is the only reading under which the trailing object
-//! ids can be located).
+//! Field names and layout were checked against libnx (`libnx/nx/include/switch/sf/cmif.h`,
+//! `CmifInHeader`, `CmifOutHeader`, `CmifDomainInHeader`, `CmifDomainOutHeader`; ISC): the fourth
+//! word of the `SFCI`/`SFCO` headers and of the domain request header is called `token` there,
+//! and the third word of the domain request header and the last three of the domain reply header
+//! are padding. Eden never reads these words.
+//!
+//! The domain request `size` field is the `SFCI` header plus the arguments. Eden never reads it;
+//! libnx writes the exact argument length and places the object ids straight after it, and
+//! [`DomainRequestHeader::size`] documents how [`crate::RequestBuilder`] differs.
 
 use crate::error::{IpcError, Result};
 
@@ -70,7 +74,8 @@ pub struct DomainRequestHeader {
     pub command: DomainCommand,
     /// How many object ids follow the arguments.
     pub input_object_count: u32,
-    /// Bytes of `SFCI` header plus arguments that follow this header (see the module guesses).
+    /// Bytes of `SFCI` header plus arguments that follow this header. libnx writes the exact
+    /// argument length; [`crate::RequestBuilder`] rounds it up to a whole word.
     pub size: u32,
     /// The target object.
     pub object_id: u32,

@@ -13,15 +13,59 @@
 //!    header, the arguments and the domain input object ids; for TIPC, the arguments alone;
 //! 4. the C (receive list) descriptors straight after the raw data section.
 //!
-//! Eden's HLE only parses requests (`IPC::RequestParser`) and has no request builder to port; this
-//! builder is the inverse of the parser, a design choice and not a protocol fact. Two details are
-//! guesses beyond the parser:
+//! Eden's HLE only parses requests (`IPC::RequestParser`) and has no request builder to port, so
+//! this builder is the inverse of the parser. Its conventions are checked against libnx, the
+//! client side of the protocol (`libnx/nx/include/switch/sf/hipc.h`, `cmif.h` and `tipc.h`,
+//! ISC, pinned in `docs/references.md`); `tests/libnx_conventions.rs` pins each point below.
 //!
-//! - Guess: a real client (libnx) may reserve extra padding words in the raw data size; this
-//!   builder writes the exact size, as [`crate::ReplyBuilder`] does.
-//! - Guess: in a domain request the `size` field counts the `SFCI` header plus the arguments
-//!   **including** the zero padding that rounds them up to a whole word (see `cmif.rs`: the only
-//!   reading under which the trailing object ids can be located).
+//! # Where the builder agrees with libnx
+//!
+//! - Field order: special header, pid slot, copy handles, move handles, X, A, B and W
+//!   descriptors, raw data, C descriptors (`hipcMakeRequest`, `hipcCalcRequestLayout`).
+//! - CMIF content starts on a 16-byte boundary measured from the start of the buffer
+//!   (`cmifGetAlignedDataStart`), with an optional domain header, then the `SFCI` header.
+//! - The domain header is a send-message or close command, an input object count, a size, an
+//!   object id, a padding word and a token (`CmifDomainInHeader`); a request to a domain object
+//!   has the `Request` type, and a control message carries no domain header
+//!   (`cmifMakeControlRequest`).
+//! - Closing a domain object is a `Request` with a close-command domain header and no `SFCI`
+//!   header; closing a plain session is a bare `Close` message (`cmifMakeCloseRequest`).
+//! - TIPC: the type is `request_id + 16`, the raw data is the arguments rounded up to words with
+//!   no `SFCI` header and no padding, and closing is a bare type 15 message (`tipcMakeRequest`,
+//!   `tipcClose`).
+//! - The receive list flag is `2 + n` for `n` C descriptors (`hipcMakeRequest`), so one
+//!   descriptor is flag 3; the builder follows that unless told otherwise (see
+//!   [`RequestBuilder::receive_list`]).
+//! - The `SFCI` token and version words are free for the caller to set. libnx writes version 0
+//!   and token 0 for ordinary requests and control messages; with a context it uses the
+//!   `RequestWithContext` type, version 1, and puts the context in the domain header's token
+//!   (in a domain) or the `SFCI` token (otherwise).
+//!
+//! # Where it differs, on purpose
+//!
+//! - **Raw data size.** libnx starts every CMIF raw size from a fixed 16-byte reserve for the
+//!   alignment padding (`actual_size = 16`), then adds the headers and arguments, rounds up to
+//!   2 bytes, and adds a table of `u16` sizes for out pointers. This builder writes the exact size
+//!   (the real padding, 0 to 3 words, and no table) as [`crate::ReplyBuilder`] does. The parser
+//!   takes both. TIPC sizes are exact in libnx too.
+//! - **Domain `size` and object ids.** libnx's `size` is `CMIF_HEADER_BYTES` plus the exact
+//!   argument bytes and the object ids follow the arguments at once, unaligned. This builder
+//!   rounds the arguments up to a whole word with zero bytes, counts that padding in `size` and
+//!   starts the object ids on a word boundary. The two agree when the arguments are a whole
+//!   number of words; otherwise the builder's `size` is larger. The parser takes both because it
+//!   locates the ids from `size`.
+//! - **Field limits.** libnx casts the object count to 8 bits and the size to 16 bits without a
+//!   check; the builder returns [`IpcError::FieldOutOfRange`] above
+//!   [`crate::MAX_DOMAIN_INPUT_OBJECTS`] and [`crate::MAX_DOMAIN_SIZE`].
+//! - **Out pointer sizes.** The table of out pointer sizes (placed after the arguments and object
+//!   ids, `cmifMakeRequest`) is not modelled. A caller that needs it for a request without
+//!   object ids can append it to the arguments.
+//!
+//! # Beyond libnx
+//!
+//! - The process id slot: libnx leaves the two words unwritten (`hipcMakeRequest` only skips
+//!   them) and the kernel fills them in. [`RequestBuilder::send_pid`] writes the value it is
+//!   given, which a libnx program never does; it exists so a test can see the value come back.
 
 use crate::cmif::{CMIF_HEADER_BYTES, CmifRequestHeader, DomainCommand, DomainRequestHeader};
 use crate::error::{IpcError, Result};
@@ -178,9 +222,9 @@ impl RequestBuilder {
 
     /// Asks for the sender's process id to be attached, with `pid` in the two pid words.
     ///
-    /// Guess: a real client passes zero, because the kernel fills the slot. The only source is
-    /// that `eden/src/core/hle/service/hle_ipc.cpp` skips the two words when parsing and reads
-    /// the pid from the owning process; nothing cited says what a client writes there.
+    /// A libnx program writes nothing into those words and the kernel fills them in
+    /// (`libnx/nx/include/switch/sf/hipc.h`, `hipcMakeRequest`), so the value matters only to a
+    /// test that wants to see it come back; pass zero for the nearest thing to an unwritten slot.
     #[must_use]
     pub fn send_pid(mut self, pid: u64) -> Self {
         self.pid = Some(pid);
@@ -230,10 +274,12 @@ impl RequestBuilder {
     }
 
     /// Sets how the receive list is described. Without this it follows the number of C
-    /// descriptors added: none is [`ReceiveList::Disabled`], one is [`ReceiveList::One`], `n` is
-    /// [`ReceiveList::Many`]`(n)`. Set it to say [`ReceiveList::Inline`], or to use
-    /// [`ReceiveList::Many`]`(1)` (flag 3) rather than [`ReceiveList::One`] (flag 2). Building
-    /// fails with [`IpcError::Inconsistent`] if it disagrees with the C descriptors added.
+    /// descriptors added: none is [`ReceiveList::Disabled`] and `n` is [`ReceiveList::Many`]`(n)`,
+    /// so a single descriptor is flag 3, as libnx writes it (`flag = 2 + n`,
+    /// `libnx/nx/include/switch/sf/hipc.h`, `hipcMakeRequest`). Set it to say
+    /// [`ReceiveList::Inline`], or to use [`ReceiveList::One`] (flag 2, libnx's
+    /// `HIPC_AUTO_RECV_STATIC`) for one descriptor. Building fails with [`IpcError::Inconsistent`]
+    /// if it disagrees with the C descriptors added.
     #[must_use]
     pub fn receive_list(mut self, receive_list: ReceiveList) -> Self {
         self.receive_list = Some(receive_list);
@@ -480,7 +526,6 @@ impl RequestBuilder {
         let count = to_u32("receive descriptor count", self.receive_descriptors.len())?;
         let list = self.receive_list.unwrap_or(match count {
             0 => ReceiveList::Disabled,
-            1 => ReceiveList::One,
             n => ReceiveList::Many(n),
         });
         if list.descriptor_count() == count {
