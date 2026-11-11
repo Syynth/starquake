@@ -11,6 +11,9 @@
 //! takes its table pages from a pool inside that memory and writes descriptors there. The
 //! backing that pages map onto may lie anywhere below [`OUTPUT_ADDRESS_END`] except inside the
 //! pool. It is shared by the Hypervisor.framework and KVM backends; neither uses it yet.
+//! Each descriptor is written with one eight-byte [`GuestMemory::write`], and a new table is
+//! linked only after it is zeroed; a backend whose tables are live under a running vCPU must
+//! make that write single-copy atomic so the hardware walker never sees half a descriptor.
 //!
 //! # What the builder writes
 //!
@@ -201,6 +204,9 @@ impl<M: GuestMemory> Stage1Tables<M> {
         self.memory.write(page, &ZEROES)
     }
 
+    /// Takes a pool page for a new table. It needs no zeroing: [`Self::new`] zeroed every pool
+    /// page, the builder invalidates a descriptor by writing 0, and a table is freed only when
+    /// none of its descriptors is valid, so a freed page holds only zeros.
     fn allocate(&self, pool: &mut Pool) -> Result<u64, MapError> {
         let page = if let Some(page) = pool.free.pop() {
             page
@@ -211,10 +217,6 @@ impl<M: GuestMemory> Stage1Tables<M> {
         } else {
             return Err(MapError::OutOfTablePages);
         };
-        if let Err(fault) = self.zero(page) {
-            pool.free.push(page);
-            return Err(fault.into());
-        }
         pool.in_use = pool.in_use.saturating_add(1);
         Ok(page)
     }

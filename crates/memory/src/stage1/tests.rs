@@ -347,16 +347,13 @@ fn table_pages_are_reclaimed_and_reused() {
         .unwrap();
     assert_eq!(t.table_pages_in_use(), t.pool_pages());
 
-    // Unmapping everything leaves just an empty root.
+    // Unmapping everything leaves just an empty root, and every freed page all zeros, ready
+    // for reuse without zeroing.
     t.unmap(va_of(1, 0, 0), pages(2)).unwrap();
     t.unmap(far, PAGE_SIZE).unwrap();
     t.unmap(va_of(7, 7, 7), PAGE_SIZE).unwrap();
     assert_eq!(t.table_pages_in_use(), 1);
-    assert!(
-        image(&t)[..usize::try_from(PAGE_SIZE).unwrap()]
-            .iter()
-            .all(|&b| b == 0)
-    );
+    assert!(image(&t).iter().all(|&b| b == 0));
 }
 
 #[test]
