@@ -72,3 +72,11 @@ Entry format:
 - **STATUS:** tentative
 - **WHAT:** Starquake uses the same lint profile and habits as the owner's other Rust workspaces: clippy `pedantic` and `cargo` groups, the restriction denies (`unwrap_used`, `expect_used`, `panic`, `todo`, `dbg_macro`, printing, `undocumented_unsafe_blocks`, ...), `#[expect]` with a reason instead of `#[allow]`, `thiserror`, workspace-inherited dependencies, tests first, Conventional Commits, and no debug info in dev builds. Three deliberate differences, each open to a ruling: `unsafe_code` stays denied but the CPU crate opts in (an emulator must run guest code); `missing_docs` is on; and the gate is `cargo xtask ci` (with a `justfile` forwarding to it) because it also checks free disk space. Logged without the usual approval prompt because the owner asked for their preferences to be found and applied, then went offline; confirm or edit.
 - **WHY:** Consistency with the owner's other projects, and lint rules catch what review misses when most code is written by agents.
+
+## Proposed work goes in a file first; GitHub issues are for vetted work
+- **WHEN:** 2026-11-11
+- **PROJECT:** starquake
+- **SYSTEM:** process
+- **SCOPE:** moderate
+- **WHAT:** Work that agents propose (wave scope-review follow-ups, review findings, ideas) is recorded in a proposals file in the repo, `docs/proposals.md`, not filed as GitHub issues. An entry is promoted to a GitHub issue only after the owner has vetted it; dropped entries stay in the file with the reason. This replaces the earlier rule that findings become issues. Issues already filed stay as they are.
+- **WHY:** Agents generate follow-ups faster than they can be judged, and most are hygiene. Keeping them in a file keeps the issue board a list of work the owner has actually chosen to do, and makes the proposals reviewable in one place and in PRs.

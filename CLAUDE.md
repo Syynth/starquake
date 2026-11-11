@@ -17,6 +17,8 @@ Platform-specific code must still compile (or be `cfg`-gated) on Linux; check wi
 ## Where things are
 
 - `docs/roadmap.md`: milestones, waves, and how work is scheduled. The backlog is GitHub issues.
+- `docs/proposals.md`: work and house rules that agents have proposed and the owner hasn't vetted
+  yet. Nothing in it is a commitment.
 - `docs/architecture.md`: how the pieces fit, threads, and dependency direction. Read it first.
 - `docs/decision-log.md`: the owner's decisions and why. Follow them; propose changes, don't drift.
 - `docs/port-map.md`: layer by layer, what to port from Eden (and its Switch 2 forks) and what to
@@ -75,8 +77,10 @@ Platform-specific code must still compile (or be `cfg`-gated) on Linux; check wi
   Commit at every green checkpoint; one logical change per commit. Run `just setup` once per clone:
   it points `core.hooksPath` at `.githooks`, whose `commit-msg` hook rejects non-conventional subjects. CI
   applies the same check to PR titles.
-- One issue → one branch → one PR, with an honest `Closes #N`. Findings become issues; design
-  questions become `needs-design` issues.
+- One issue → one branch → one PR, with an honest `Closes #N`.
+- **Don't file GitHub issues for work you propose.** Follow-ups, findings and ideas go into
+  `docs/proposals.md`; the owner promotes the ones worth doing to issues. Work that belongs to
+  an existing issue goes there as a comment.
 - Implementation PRs may merge on a green gate and review. Design and spec PRs wait for the owner.
 - Never `git stash` (worktrees share one stash). Stage explicit paths.
 - No local paths, usernames or unrelated personal-project details in code, docs, issues, PRs or

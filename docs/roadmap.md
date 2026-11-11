@@ -1,7 +1,8 @@
 # Roadmap
 
 How the work is planned and scheduled. The backlog itself lives in GitHub issues; this file
-explains the shape. Detailed planning only goes as far as the next milestone.
+explains the shape. Work that agents propose waits in `docs/proposals.md` until the owner promotes
+it to an issue. Detailed planning only goes as far as the next milestone.
 
 ## Three kinds of work
 
