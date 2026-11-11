@@ -171,8 +171,16 @@ impl NroBuilder {
         self
     }
 
-    /// Lays out and returns the file.
-    pub fn build(&self) -> Result<Vec<u8>, NroBuildError> {
+    /// Where the text, read-only data and data segments start in the image this builder would
+    /// produce, as offsets from its first byte. A program that addresses its own data needs these
+    /// before its code is final; they depend only on the number of instructions and the sizes of
+    /// the two data segments, not on their contents.
+    pub fn segment_offsets(&self) -> Result<[u32; 3], NroBuildError> {
+        Ok(self.layout()?.segments.map(|(offset, _)| offset))
+    }
+
+    /// The layout for the current code and data.
+    fn layout(&self) -> Result<Layout, NroBuildError> {
         if self.code.is_empty() {
             return Err(NroBuildError::EmptyCode);
         }
@@ -181,7 +189,12 @@ impl NroBuilder {
             .len()
             .checked_mul(usize::try_from(a64::INSN_SIZE).map_err(|_| NroBuildError::TooLarge)?)
             .ok_or(NroBuildError::TooLarge)?;
-        let layout = Layout::new(code_len, self.rodata.len(), self.data.len())?;
+        Layout::new(code_len, self.rodata.len(), self.data.len())
+    }
+
+    /// Lays out and returns the file.
+    pub fn build(&self) -> Result<Vec<u8>, NroBuildError> {
+        let layout = self.layout()?;
         let bss_start = layout.image_size;
         let bss_end = bss_start
             .checked_add(self.bss_size)
@@ -485,6 +498,21 @@ mod tests {
                 .any(|(at, size)| (*at..at + size).contains(&offset));
             assert!(in_field || *byte == 0, "stray byte at {offset:#x}");
         }
+    }
+
+    #[test]
+    fn segment_offsets_are_the_ones_the_header_records() {
+        let (builder, file) = sample();
+        let offsets = builder.segment_offsets().unwrap();
+        let recorded =
+            [TEXT_OFFSET, RO_OFFSET, RW_OFFSET].map(|name| u32_at(&file, reference_offset(name)));
+        assert_eq!(offsets, recorded);
+        // Distinct and increasing here, so a swapped pair would show.
+        assert!(offsets[0] < offsets[1] && offsets[1] < offsets[2]);
+        assert_eq!(
+            NroBuilder::new(&[]).segment_offsets(),
+            Err(NroBuildError::EmptyCode)
+        );
     }
 
     #[test]
