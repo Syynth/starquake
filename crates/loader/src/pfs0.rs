@@ -432,8 +432,6 @@ mod tests {
         content_offset: u64,
         /// Per file: offset from the content start.
         offsets: Vec<u64>,
-        /// Per file: string-table offset of its name.
-        name_offsets: Vec<u32>,
     }
 
     /// Lays out a partition: header, entry table, string table (names optionally stored in
@@ -487,7 +485,6 @@ mod tests {
             bytes,
             content_offset,
             offsets,
-            name_offsets,
         }
     }
 
@@ -809,7 +806,6 @@ mod tests {
                 prop_assert_eq!(entry.size, file.content.len() as u64);
                 prop_assert_eq!(pfs.extent(&entry).unwrap().start, built.content_offset + built.offsets[i]);
                 prop_assert_eq!(pfs.read(&entry).unwrap(), file.content.clone());
-                prop_assert!(built.name_offsets[i] as usize <= built.bytes.len());
             }
         }
 

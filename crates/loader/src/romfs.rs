@@ -28,6 +28,16 @@
 //! - Eden asserts that the root directory is named `""`; here a non-empty root name is
 //!   [`RomFsError::BadRoot`].
 //!
+//! - A `dir_meta` or `file_meta` table that lies partly outside the source is
+//!   [`RomFsError::TableOutOfBounds`]. Eden's `ReadBytes` returns a short table, and `GetEntry`
+//!   treats entries past it as missing (`rejects_tables_outside_the_source`).
+//! - [`RomFs::new`] loads and validates both hash tables, so an image whose hash tables are
+//!   absent, zero-sized, not a multiple of 4 bytes or out of bounds fails to open, although
+//!   `ExtractRomFS` never reads them (`hash_tables_must_be_a_non_zero_multiple_of_four_bytes`).
+//! - [`RomFs::walk`] fails the whole listing with [`RomFsError::PathTooLong`] for any path over
+//!   [`MAX_PATH_LEN`], while `ExtractRomFS` has no path limit
+//!   (`walked_paths_are_limited_to_the_maximum_path_length`).
+//!
 //! Guesses, not backed by a pinned reference source (the builder never produces these, so they
 //! cannot be checked against it):
 //!
@@ -436,8 +446,7 @@ impl<R: Read + Seek> RomFs<R> {
             }
         }
         let hash = path_hash(parent, name.as_bytes());
-        let limit = self.file_meta.len();
-        lookup_chain(Table::FileMeta, &self.file_buckets, limit, hash, |id| {
+        lookup_chain(Table::FileMeta, &self.file_buckets, hash, |id| {
             let entry = file_at(&self.file_meta, id)?;
             Ok(if entry.parent == parent && entry.name == name {
                 ControlFlow::Break(entry)
@@ -484,8 +493,7 @@ impl<R: Read + Seek> RomFs<R> {
     /// The subdirectory `name` of the directory at `parent`, through the directory hash table.
     fn child_dir(&self, parent: u32, name: &str) -> Result<Option<DirEntry>, RomFsError> {
         let hash = path_hash(parent, name.as_bytes());
-        let limit = self.dir_meta.len();
-        lookup_chain(Table::DirMeta, &self.dir_buckets, limit, hash, |id| {
+        lookup_chain(Table::DirMeta, &self.dir_buckets, hash, |id| {
             let entry = dir_at(&self.dir_meta, id)?;
             Ok(if entry.parent == parent && entry.name == name {
                 ControlFlow::Break(entry)
@@ -543,12 +551,11 @@ impl<R: Read + Seek> RomFs<R> {
 }
 
 /// Walks the hash chain for `hash`, handing each entry offset to `step` until it breaks with a
-/// result or the chain ends. A chain longer than `limit` (the table's byte size, an upper bound
-/// on the distinct entry offsets) must revisit an entry and is a cycle.
+/// result or the chain ends. An entry offset met twice is a cycle, reported with that offset, so a
+/// loop costs about its own length however large the table is.
 fn lookup_chain<T>(
     table: Table,
     buckets: &[u32],
-    limit: usize,
     hash: u32,
     mut step: impl FnMut(u32) -> Result<ControlFlow<T, Option<u32>>, RomFsError>,
 ) -> Result<Option<T>, RomFsError> {
@@ -558,18 +565,17 @@ fn lookup_chain<T>(
         .and_then(|bucket| buckets.get(bucket))
         .copied();
     let mut next = bucket.and_then(link);
-    let mut last = ENTRY_EMPTY;
-    for _ in 0..=limit {
-        let Some(id) = next else {
-            return Ok(None);
-        };
-        last = id;
+    let mut seen = HashSet::new();
+    while let Some(id) = next {
+        if !seen.insert(id) {
+            return Err(RomFsError::Cycle { table, id });
+        }
         match step(id)? {
             ControlFlow::Break(found) => return Ok(Some(found)),
             ControlFlow::Continue(after) => next = after,
         }
     }
-    Err(RomFsError::Cycle { table, id: last })
+    Ok(None)
 }
 
 /// A link word as an optional entry offset.
@@ -1527,6 +1533,89 @@ mod tests {
                 id: ROOT_OFFSET
             })
         ));
+    }
+
+    #[test]
+    fn a_hash_chain_loop_in_a_large_table_reports_the_entry_revisited() {
+        // Many files make file_meta far larger than the loop, so a lookup must stop on the
+        // revisit itself, not after a count derived from the table's byte size.
+        let spec = TreeSpec {
+            dirs: Vec::new(),
+            files: (0..2000)
+                .map(|i| (0, format!("f{i:04}"), Vec::new()))
+                .collect(),
+        };
+        let built = build(&spec, 1, &IDENTITY);
+        assert!(built.header.file_meta.size > 64 * 1024);
+        let [a, b, c] = [0, 1, 2].map(|i| built.files[i].1.id);
+
+        let point_every_file_bucket_at = |bytes: &mut [u8], id: u32| {
+            let at = usize_of64(built.header.file_hash.offset);
+            let len = usize_of64(built.header.file_hash.size);
+            for word in bytes[at..at + len].as_chunks_mut::<4>().0 {
+                word.copy_from_slice(&id.to_le_bytes());
+            }
+        };
+
+        // A -> B -> A.
+        let mut bytes = built.bytes.clone();
+        put(
+            &mut bytes,
+            file_entry_at(&built, a) + FILE_HASH_NEXT,
+            &b.to_le_bytes(),
+        );
+        put(
+            &mut bytes,
+            file_entry_at(&built, b) + FILE_HASH_NEXT,
+            &a.to_le_bytes(),
+        );
+        point_every_file_bucket_at(&mut bytes, a);
+        let fs = open(&bytes).unwrap();
+        assert!(matches!(
+            fs.find_file("/missing"),
+            Err(RomFsError::Cycle { table: Table::FileMeta, id }) if id == a
+        ));
+
+        // A -> B -> C -> B: the entry revisited is B, not the entry the walk happened to be on
+        // after some number of steps.
+        put(
+            &mut bytes,
+            file_entry_at(&built, a) + FILE_HASH_NEXT,
+            &b.to_le_bytes(),
+        );
+        put(
+            &mut bytes,
+            file_entry_at(&built, b) + FILE_HASH_NEXT,
+            &c.to_le_bytes(),
+        );
+        put(
+            &mut bytes,
+            file_entry_at(&built, c) + FILE_HASH_NEXT,
+            &b.to_le_bytes(),
+        );
+        let fs = open(&bytes).unwrap();
+        assert!(matches!(
+            fs.find_file("/missing"),
+            Err(RomFsError::Cycle { table: Table::FileMeta, id }) if id == b
+        ));
+    }
+
+    #[test]
+    fn a_hash_chain_loop_costs_about_its_own_length() {
+        // 0 -> 1 -> 0 -> ...: the walk must stop on the first revisit, whatever the table size.
+        let mut steps = 0usize;
+        let result = lookup_chain::<()>(Table::FileMeta, &[0], 0, |id| {
+            steps += 1;
+            Ok(ControlFlow::Continue(Some(1 - id)))
+        });
+        assert!(matches!(
+            result,
+            Err(RomFsError::Cycle {
+                table: Table::FileMeta,
+                id: 0
+            })
+        ));
+        assert_eq!(steps, 2);
     }
 
     #[test]
