@@ -1,6 +1,6 @@
 # Execution model: vCPUs, guest memory and kernel threading
 
-Status: **proposal, awaiting owner review** (issue #7). Nothing here is implemented beyond the
+Status: **approved by the owner, 2026-11-11** (issue #7). Not yet implemented beyond the
 `Vcpu`/`Backend`/`GuestMemory` traits and the hypervisor backend's bring-up memory.
 
 This spec decides how guest code, guest memory and the HLE kernel fit together. It is written for
@@ -212,7 +212,10 @@ Measurements to add to `tools/hvprobe`, in order of how much they could change t
 3. Cost of a stage-1 write-protection fault round trip, and of the EL1 flush entry point.
 4. System call round-trip cost with six vCPUs running at once.
 
-## Decisions asked of the owner
+## Decisions
+
+Approved by the owner on 2026-11-11 as written. Where a decision names a recommendation, the
+recommendation stands.
 
 1. **Deferred replies instead of service threads** for services that wait. Recommended: it keeps
    one mechanism (guest threads wait on kernel objects) and makes traces deterministic in order.
