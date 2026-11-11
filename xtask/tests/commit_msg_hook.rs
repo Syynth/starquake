@@ -172,12 +172,64 @@ fn git_generated_subjects_pass_only_as_commit_messages() {
         "Merge remote-tracking branch 'origin/main' into topic\n",
         "Merge tag 'v1.0' into main\n",
         "Merge commit 'abc1234' into main\n",
-        "Revert \"feat: something\"\n",
         "fixup! feat: something\n",
         "squash! feat: something\n",
         "amend! feat: something\n",
     ] {
         assert!(accepted(message), "rejected {message:?}");
+        assert_rejected(message, true);
+    }
+}
+
+/// The titles GitHub generates for a revert PR: `Revert "<title of the reverted PR>"`, where the
+/// reverted PR's own title is conventional. A revert of a revert nests the same wrapper.
+const GITHUB_REVERT_TITLES: [&str; 5] = [
+    "Revert \"feat: something\"",
+    "Revert \"fix(cpu,memory): align the walk\"",
+    "Revert \"feat(kernel)!: drop the old API\"",
+    "Revert \"Revert \"feat: something\"\"",
+    "Revert \"Revert \"Revert \"chore(xtask): x\"\"\"",
+];
+
+#[test]
+fn github_revert_titles_pass_as_titles_and_as_commit_messages() {
+    for title in GITHUB_REVERT_TITLES {
+        let message = format!("{title}\n");
+        assert!(accepted(&message), "rejected as a commit: {message:?}");
+        let (code, stderr) = run(&message, true);
+        assert_eq!(
+            code, EXIT_ACCEPTED,
+            "rejected as a title: {message:?}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn a_revert_commit_message_may_carry_gits_body() {
+    let message = "Revert \"feat: something\"\n\nThis reverts commit 0123abc.\n";
+    assert!(accepted(message));
+    assert_eq!(run(message, true).0, EXIT_ACCEPTED);
+}
+
+#[test]
+fn revert_titles_must_wrap_a_conventional_title_exactly() {
+    for message in [
+        // The wrapped title is not conventional.
+        "Revert \"Add a thing\"\n",
+        "Revert \"Revert \"Add a thing\"\"\n",
+        "Revert \"\"\n",
+        "Revert \"Revert \"\"\n",
+        // Not the generated form: unclosed, trailing text, lower case, no space, no quotes.
+        "Revert \"feat: something\n",
+        "Revert \"feat: something\" (#12)\n",
+        "Revert \"feat: something\" and more\n",
+        "revert \"feat: something\"\n",
+        "Revert\"feat: something\"\n",
+        "Revert feat: something\n",
+        "Reapply \"feat: something\"\n",
+        // Unbalanced nesting.
+        "Revert \"Revert \"feat: something\"\n",
+    ] {
         assert_rejected(message, true);
     }
 }
