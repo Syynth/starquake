@@ -437,9 +437,8 @@ impl HandleTable {
         refs: &mut R,
         handle: Handle,
     ) -> Result<Removed, HandleError> {
-        if handle.is_pseudo() {
-            return Err(HandleError::InvalidHandle { raw: handle.raw() });
-        }
+        // The reference rejects pseudo-handles first (`Svc::IsPseudoHandle`); here `locate` does,
+        // because both have their reserved bits set.
         let (index, entry) = self.locate(handle)?;
         let object = entry.object;
         let Some(slot) = self.entries.get_mut(usize::from(index)) else {
