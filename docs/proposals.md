@@ -82,6 +82,21 @@ accept it and amend the spec, or change the code.
 |---|---|---|
 | proposed | **Shared build folder: stale cross-target artifacts** | One agent's Linux-target clippy run failed with spurious import errors from a sibling's build in the shared folder; an isolated folder passed. Wider than #67, which covers only the `xtask` binary. |
 
+### From wave 4, the scheduler trial (ledger: #22)
+
+The trial's verdict (#59, PR #72): the scheduler ported onto tables and ids without needing to
+borrow two rows at once. Copying neighbour ids out and editing one row at a time was enough, and
+queue walks are bounded loops over lookups by id. The awkward part was error handling for lookups
+of ids the kernel itself stored. The verdict is partial: walking wait lists is only exercised by
+slices 4 and 5.
+
+| Status | Proposal | Why | Suggested |
+|---|---|---|---|
+| proposed | **decision: how the scheduler table is serialised** (validate every link on load, or rebuild the queues from the rows keeping per-level order), and amend the kernel spec | The spec says tables are serialisable from slice 2, but the scheduler's linked queues aren't yet. Snapshots depend on it. | owner, area:kernel |
+| proposed | **chore(kernel): a slab helper for internal lookups**, with one fixed error for a stale id the kernel itself stored | Removes repeated error-mapping noise in the scheduler and every later slice. Recommended by the trial; do before slice 4. | area:kernel, M1 |
+| proposed | **feat(kernel): pinned threads** (the pinned-thread lookup, core-migration disables, suspend-allowed flags) | No port slice owns it, and Eden's scheduler depends on it. Needs a row in the spec's port plan. | area:kernel, M1 |
+| proposed | **Additions to the briefs for kernel slices 4–10** when they are filed: slice 5 splits requested and in-state suspend flags and adds kernel-waiter checks; slice 8 makes the yield count per process and adds virtual-to-physical core translation and the core-mask call's checks and waits; slice 10 takes queue rotation (time slicing) | Found while porting the scheduler; each belongs to a later slice. | area:kernel |
+
 ## House-rule candidates
 
 Rules distilled from review findings. A vetted rule moves into `CLAUDE.md`; until then it is
@@ -111,3 +126,12 @@ passed to build agents as a provisional rule for the next wave.
 | proposed | Pin every serialised or on-disk layout with a golden-bytes test covering every variant with distinct non-zero values; a layout change requires a version bump. |
 | proposed | Don't wrap a type in a second type that repeats its storage and logic; compose by wrapping the existing one. |
 | proposed | Before merging, test-merge current `main`, build, and re-run the full gate; re-verify numbers quoted in the PR body. |
+
+### From wave 4
+
+| Status | Rule |
+|---|---|
+| proposed | Never derive deserialisation on a validated newtype over a primitive; deserialise through the validating constructor, and test that an out-of-range value is an error. |
+| proposed | When a doc or PR states an error for every argument, probe each argument against the reference, including the reference's order of checks, and pin each case with a test. |
+| proposed | A test invariant mirrors the reference's exact condition; no broad escape clause that switches the assertion off in common generated cases. |
+| proposed | Property tests that drive a clock keep time monotonic, including in their final step. |
