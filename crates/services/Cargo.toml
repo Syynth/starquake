@@ -11,5 +11,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-starquake-kernel = { path = "../kernel" }
-starquake-ipc = { path = "../ipc" }
+starquake-kernel.workspace = true
+starquake-ipc.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

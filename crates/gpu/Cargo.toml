@@ -11,6 +11,11 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-starquake-memory = { path = "../memory" }
-starquake-shader = { path = "../shader" }
-starquake-render = { path = "../render" }
+starquake-memory.workspace = true
+starquake-shader.workspace = true
+starquake-render.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

@@ -5,3 +5,5 @@
 //! (interpreter, memo of pure calls, later a JIT) and drops same-value register writes; the
 //! *back* owns engine state (3D, compute/QMD, DMA, inline-to-memory) and records draws into the
 //! render backend.
+
+pub mod mme;

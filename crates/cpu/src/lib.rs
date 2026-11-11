@@ -39,24 +39,26 @@ pub enum Exit {
 pub struct GuestRegs {
     /// X0-X30.
     pub x: [u64; 31],
-    /// SP_EL0.
+    /// `SP_EL0`.
     pub sp: u64,
     /// Program counter.
     pub pc: u64,
     /// NZCV and the other PSTATE bits visible at EL0.
     pub pstate: u64,
-    /// TPIDR_EL0 (user thread pointer).
+    /// `TPIDR_EL0` (user thread pointer).
     pub tpidr: u64,
-    /// TPIDRRO_EL0 (read-only thread pointer: the kernel's TLS address).
+    /// `TPIDRRO_EL0` (read-only thread pointer: the kernel's TLS address).
     pub tpidrro: u64,
 }
 
 /// Errors from creating or driving a vCPU.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Error {
     /// This backend can't run on this host.
+    #[error("this CPU backend is not supported on this host")]
     Unsupported,
     /// The host API failed.
+    #[error("host API error: {0}")]
     Host(String),
 }
 

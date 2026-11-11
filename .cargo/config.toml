@@ -1,2 +1,6 @@
 [alias]
 xtask = "run --package xtask --quiet --"
+
+# Signs binaries with the hypervisor entitlement before running them.
+[target.aarch64-apple-darwin]
+runner = "tools/macos-runner.sh"

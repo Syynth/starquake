@@ -6,8 +6,11 @@ table, and runs hand-written guest tests at EL1 and EL0. The guest code is in `s
 the Hypervisor.framework bindings are in `src/hv.rs`.
 
 ```sh
-./run.sh   # cargo build --release, ad-hoc sign with the hypervisor entitlement, run
+cargo run --release -p hvprobe
 ```
+
+The workspace's cargo runner (`tools/macos-runner.sh`) signs the binary with the hypervisor
+entitlement first.
 
 ## Results: Apple M2, macOS 27.0.1 (2026-11-11)
 
