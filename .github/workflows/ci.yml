@@ -30,8 +30,9 @@ jobs:
       # Under CI the gate fails if cargo-deny is missing, so the supply-chain check always runs.
       - run: cargo xtask ci
 
-  # macOS arm64 runs on main only: hosted macOS minutes cost 10x, and every PR is already gated
-  # on a Mac locally before it is opened. Hosted runners can't create VMs, so hypervisor tests
+  # The full macOS gate runs on main only: hosted macOS minutes cost 10x, and every PR is already
+  # gated on a Mac locally before it is opened. PRs that touch the CPU crate get a narrow
+  # fmt/clippy/build job from macos-pr.yml. Hosted runners can't create VMs, so hypervisor tests
   # skip themselves there (see CLAUDE.md).
   macos:
     if: github.event_name == 'push'

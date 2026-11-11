@@ -47,4 +47,8 @@ reviewed adversarially, and landed one at a time through a merge queue behind `c
   incremental compilation off. Dev builds carry no debug info.
 - `cargo xtask ci` refuses to build with less than 15 GiB free.
 - Worktrees are removed when their PR lands; reference sources are one shared checkout.
-- CI: Linux on every PR; macOS only on `main`, because hosted macOS minutes cost ten times as much.
+- CI: Linux on every PR; macOS on `main`, and on PRs only for a narrow fmt/clippy/build job when
+  `crates/cpu`, `crates/memory` (a dependency of the hvf backend), `tools/hvprobe`,
+  `tools/macos-runner.sh`, `.cargo`, the root `Cargo.toml` (workspace lints and dependencies),
+  `Cargo.lock`, `rust-toolchain.toml` or `clippy.toml` change, because hosted macOS minutes cost
+  ten times as much. The list lives in `.github/workflows/macos-pr.yml`; keep the two in step.
