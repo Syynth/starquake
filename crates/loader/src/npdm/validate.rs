@@ -285,9 +285,9 @@ fn permits_capabilities(
         });
     }
     if let Some(requested) = request.handle_table_size
-        && !bound
+        && bound
             .handle_table_size
-            .is_some_and(|allowed| requested <= allowed)
+            .is_none_or(|allowed| requested > allowed)
     {
         return Err(AcidViolation::HandleTableTooLarge {
             requested,

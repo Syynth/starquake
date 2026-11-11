@@ -40,7 +40,7 @@
 //! `version`. Eden puts 4 reserved bytes at 0x10 and the system resource size at 0x14, then the
 //! word it calls `process_category` at 0x18. The SwitchBrew NPDM page (see "Documentation
 //! sources" in `docs/references.md`) agrees with Eden's offsets and differs from the script:
-//! 0x10 is "RemoteMemorySize" (marked Switch 2 only), 0x14 the system resource size and 0x18
+//! 0x10 is "`RemoteMemorySize`" (marked Switch 2 only), 0x14 the system resource size and 0x18
 //! "Version". So this parser follows Eden for the offsets, and the script's two labels are
 //! treated as its mistake; a test pins that the word at 0x10 is not the system resource size.
 //! Two consequences, both deliberate:
@@ -703,6 +703,36 @@ mod tests {
         }
     }
 
+    /// The ACID's own lists are its own, not the ACI0's, and the fixture validates.
+    fn check_acid_lists(npdm: &Npdm) {
+        let acid_services: Vec<_> = npdm
+            .acid
+            .services
+            .iter()
+            .map(|s| (s.name.as_str(), s.server, s.wildcard))
+            .collect();
+        assert_eq!(
+            acid_services,
+            [
+                ("fs:ro", false, false),
+                ("sm:m", true, false),
+                ("ldr:", false, true),
+                ("pl:u", false, false)
+            ]
+        );
+        let acid_caps = &npdm.acid.kernel_capabilities;
+        let acid_info = acid_caps.thread_info.as_ref().unwrap();
+        assert_eq!(acid_info.cores, 0..=5);
+        assert_eq!(acid_info.priorities, 24..=63);
+        assert_eq!(acid_caps.svc_mask.iter().count(), 24);
+        assert_eq!(acid_caps.handle_table_size, Some(0x300));
+        assert_eq!(npdm.validate_against_acid(), Ok(()));
+
+        // META words 0x10 and 0x14: Eden's layout, not `npdm_info.py`'s labels. The sentinel at
+        // 0x10 must not leak into the system resource size.
+        assert_ne!(npdm.system_resource_size, WORD_0X10);
+    }
+
     fn check_common(npdm: &Npdm, file: &[u8]) {
         assert!(npdm.is_64_bit);
         assert_eq!(npdm.address_space, AddressSpaceType::Is39Bit);
@@ -750,33 +780,7 @@ mod tests {
         assert_eq!(npdm.acid.file_access.permissions, 0x8000_0000_0000_0001);
         assert_eq!(npdm.acid.file_access.unknown[0], 0x5A);
 
-        // The ACID's own lists are its own, not the ACI0's.
-        let acid_services: Vec<_> = npdm
-            .acid
-            .services
-            .iter()
-            .map(|s| (s.name.as_str(), s.server, s.wildcard))
-            .collect();
-        assert_eq!(
-            acid_services,
-            [
-                ("fs:ro", false, false),
-                ("sm:m", true, false),
-                ("ldr:", false, true),
-                ("pl:u", false, false)
-            ]
-        );
-        let acid_caps = &npdm.acid.kernel_capabilities;
-        let acid_info = acid_caps.thread_info.as_ref().unwrap();
-        assert_eq!(acid_info.cores, 0..=5);
-        assert_eq!(acid_info.priorities, 24..=63);
-        assert_eq!(acid_caps.svc_mask.iter().count(), 24);
-        assert_eq!(acid_caps.handle_table_size, Some(0x300));
-        assert_eq!(npdm.validate_against_acid(), Ok(()));
-
-        // META words 0x10 and 0x14: Eden's layout, not `npdm_info.py`'s labels. The sentinel at
-        // 0x10 must not leak into the system resource size.
-        assert_ne!(npdm.system_resource_size, WORD_0X10);
+        check_acid_lists(npdm);
 
         assert_eq!(npdm.aci.title_id, TITLE_ID);
         let fah = npdm.aci.file_access;
