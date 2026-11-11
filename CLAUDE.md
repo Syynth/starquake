@@ -16,6 +16,8 @@ compile (or be `cfg`-gated) on both; check with
 - `docs/decision-log.md`: the user's decisions and why. Follow them; propose changes, don't drift.
 - `docs/switch2-eden-diff-scoping.md`: what Switch 2 support actually requires, from Eden-NX2's
   149-row blocker log and PR #4588. Cite its rows when implementing protocol behaviour.
+- `docs/port-map.md`: layer by layer, what to port from Eden (and its Switch 2 forks) and what to
+  redesign. Check it before porting anything.
 - `docs/oboromi-evaluation.md`: why this is a fresh repo, and what is worth borrowing.
 - `tools/hvprobe`: measured Hypervisor.framework behaviour (`tools/hvprobe/README.md`).
 
