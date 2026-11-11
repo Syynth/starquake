@@ -1,0 +1,16 @@
+[package]
+name = "starquake-kernel"
+description = "HLE Horizon kernel: threads, SVCs, handles, sync"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+starquake-memory = { path = "../memory" }
+starquake-cpu = { path = "../cpu" }
+starquake-ipc = { path = "../ipc" }

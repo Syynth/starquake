@@ -1,0 +1,15 @@
+[package]
+name = "starquake-services"
+description = "HLE system services (sm, fs, am, hid, audio, ...)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+starquake-kernel = { path = "../kernel" }
+starquake-ipc = { path = "../ipc" }

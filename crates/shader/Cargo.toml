@@ -1,0 +1,13 @@
+[package]
+name = "starquake-shader"
+description = "SM86 shader decoding and translation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

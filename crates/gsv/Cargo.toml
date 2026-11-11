@@ -1,0 +1,17 @@
+[package]
+name = "starquake-gsv"
+description = "Graphics server: gsv, syncpt, GPU VM, vi2, codec sessions"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+starquake-kernel = { path = "../kernel" }
+starquake-ipc = { path = "../ipc" }
+starquake-services = { path = "../services" }
+starquake-gpu = { path = "../gpu" }
