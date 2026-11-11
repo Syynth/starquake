@@ -1,0 +1,16 @@
+[package]
+name = "starquake-trace"
+description = "The event stream, flight recorder and injectable environment"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+postcard.workspace = true
+serde.workspace = true
+thiserror.workspace = true

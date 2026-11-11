@@ -14,5 +14,9 @@ workspace = true
 starquake-memory.workspace = true
 starquake-cpu.workspace = true
 starquake-ipc.workspace = true
+serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

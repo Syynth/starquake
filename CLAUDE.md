@@ -17,6 +17,8 @@ Platform-specific code must still compile (or be `cfg`-gated) on Linux; check wi
 ## Where things are
 
 - `docs/roadmap.md`: milestones, waves, and how work is scheduled. The backlog is GitHub issues.
+- `docs/specs/`: the approved designs (execution model, kernel, service framework, observability
+  and replay, test strategy). Code follows them; changing one needs the owner's approval.
 - `docs/proposals.md`: work and house rules that agents have proposed and the owner hasn't vetted
   yet. Nothing in it is a commitment.
 - `docs/architecture.md`: how the pieces fit, threads, and dependency direction. Read it first.
@@ -33,8 +35,8 @@ Platform-specific code must still compile (or be `cfg`-gated) on Linux; check wi
 ## Architecture rules
 
 - Dependencies point one way: `memory` → `cpu` → `kernel` → `services` → `gsv` → `gpu` →
-  `shader`, `render`. `ipc` is a leaf (byte slices only, no workspace dependencies) that `kernel`
-  depends on. `core` wires everything; frontends depend only on `core`. No cycles, and no
+  `shader`, `render`. `ipc` and `trace` are leaves (no workspace dependencies) that the layers
+  above depend on; `testkit` is a dev-dependency only and depends on none of our crates. `core` wires everything; frontends depend only on `core`. No cycles, and no
   reaching around a layer.
 - Guest-controlled values are untrusted: checked arithmetic and bounds on anything derived from
   guest memory, file contents or IPC words. A malformed input is an `Err`, never a panic.
