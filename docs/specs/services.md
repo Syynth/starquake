@@ -1,7 +1,7 @@
 # Service framework
 
-Status: **proposal, awaiting owner review** (issue #10). Builds on the execution model and the
-kernel spec, both also proposals.
+Status: **approved by the owner, 2026-11-11** (issue #10). Builds on the execution model and the
+kernel spec.
 
 `crates/services` holds the HLE system services: Rust code that answers the IPC requests a game
 would otherwise send to system processes. Eden has 74 service families. This spec defines the
@@ -189,7 +189,10 @@ declares its inputs and outputs and the framework unpacks the message (the direc
 been migrating in), while only three services need rewriting. Struct-mapped payloads can be
 added alongside explicit reads at any time and don't need this trial.
 
-## Decisions asked of the owner
+## Decisions
+
+Approved by the owner on 2026-11-11 as written. Where a decision names a recommendation, the
+recommendation stands.
 
 1. **A declarative `commands!` macro and hand-written unpacking, as a trial.** The first three
    services use it; the style is confirmed or replaced by a typed style before a fourth is
