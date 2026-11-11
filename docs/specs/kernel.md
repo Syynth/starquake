@@ -140,6 +140,14 @@ when violated at first, then enforced once milestone 2 titles boot.
 the 12 GB layout (scoping doc, "Process, memory, kernel"). Each lands with the port slice it
 belongs to, citing its row.
 
+### Recording and replay
+
+The observability spec (`observability.md`, also a proposal) adds three requirements here: the
+system-call dispatcher, scheduler and address space each report to one event recorder; the clock,
+random numbers and host I/O are read through an injectable environment, never directly; and the
+arena is serialisable, for snapshots. All three are cheap with this design and are part of slice 2
+onwards.
+
 ## Port plan
 
 Each slice is one issue with its own tests. Slices 1–5 touch only kernel bookkeeping and can run
