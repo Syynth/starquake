@@ -28,8 +28,9 @@ Nintendo's real system modules as a fallback and for homebrew that provides its 
 ### Rules that keep the deferred column cheap to add
 
 1. **Sessions are modelled as Horizon models them:** a client end, a server end, and a queue of
-   requests between them. A Rust handler is one kind of server end; a guest process calling
-   `ReplyAndReceive` would be another. Nothing in the client path knows which it is.
+   requests between them, with a server that owns many server ends. A Rust handler is one kind of
+   server; a guest process calling `ReplyAndReceive` would be another. Nothing in the client path
+   knows which it is.
 2. **Nothing assumes a single process.** Processes live in the tables like any other object, each
    with its own address space, handle table and memory pool.
 3. **Handle transfer is a kernel primitive** between any two handle tables, not a special case
@@ -166,30 +167,34 @@ reproduce; a seed can turn randomisation on.
 
 ### IPC
 
-A session has two ends and a request queue:
+Modelled as Horizon models it: a **server** owns the server ends of many sessions and takes
+requests from them one at a time.
 
 ```rust
-struct Session { queue: VecDeque<Request>, current: Option<Request>, server: ServerEnd, client_open: bool }
-enum ServerEnd { Hle(Box<dyn SessionHandler>), /* later: Guest { .. } */ }
+struct Session { server: ServerId, in_flight: Option<Request>, waiting: VecDeque<Request>, client_open: bool }
+struct Server  { kind: ServerKind, ready: VecDeque<SessionId>, running: u8, workers: u8 }
+enum ServerKind { Hle(Box<dyn SessionHandler>), /* later: Guest { .. } */ }
 ```
 
-- `ConnectToNamedPort("sm:")` returns a handle to the client end of a session whose server end is
-  the service manager.
+- `ConnectToNamedPort("sm:")` returns a handle to the client end of a session on the service
+  manager's server.
 - `SendSyncRequest` copies the 0x100-byte message out of the thread's TLS block and queues a
-  request. If the session is idle the request starts at once; if another request is in flight
-  (for example, waiting on a deferred reply), **the sender waits as a guest thread**, exactly as
-  it would on a console. A core thread never waits on a host lock for a session.
-- Starting a request on an HLE server end: parse the message with `starquake-ipc`, resolve copy
-  and move handles against the caller's handle table, and call the handler **without holding
-  the kernel lock**. Reply handles are inserted into the caller's table on the way back, the
-  caller is woken, and the next queued request starts.
-- Closing either end follows Horizon: queued and in-flight requests complete with the
+  request on the session. **The sender then waits as a guest thread** whenever the request can't
+  start at once, exactly as it would on a console. A core thread never waits on a host lock.
+- A request starts when its session has nothing in flight **and** its server has a free worker.
+  Servers have one worker by default, so one handler per server runs at a time (`services.md`,
+  "Concurrency"); a deferred request is in flight on its session but doesn't hold the worker.
+- Starting a request on an HLE server: parse the message with `starquake-ipc`, resolve copy and
+  move handles against the caller's handle table, and call the handler **without holding the
+  kernel lock**. Reply handles are inserted into the caller's table on the way back, the caller
+  is woken, and the core that finished starts the server's next ready request.
+- Closing either end follows Horizon: waiting and in-flight requests complete with the
   session-closed result.
 - The handler interface is defined here (`SessionHandler`: parsed request in, `Done` or
-  `Deferred` out) and implemented by the service framework (`services.md`).
+  `Deferred` out) and implemented by the service framework.
 
-A guest server end would take requests from the same queue with `ReplyAndReceive`; that, server
-ports and buffer mapping are the deferred work.
+A guest server would take requests from the same queues with `ReplyAndReceive`, which waits on
+many sessions at once; that, server ports and buffer mapping are the deferred work.
 
 ### System calls
 
@@ -235,7 +240,7 @@ design is revisited before slices 4–10 depend on it.
 | 6 | Memory blocks, regions, heap, map/unmap/permissions, `QueryMemory` | `k_memory_block*.h`, `k_page_table_base.*` | Model test against a naive page-by-page map; Horizon's error for each invalid request |
 | 7 | Pools, accounting, `GetInfo` | `k_memory_manager.*`, `svc_info.cpp`, PR #4588's additions | Accounting adds up after random operations; Switch 2 ids |
 | 8 | Process creation, TLS pages, thread lifecycle calls | `k_process.*`, `k_thread_local_page.*`, `svc_thread.cpp` | Create, start, exit, join; TLS slot reuse |
-| 9 | Sessions (both ends and the request queue), named ports, `SendSyncRequest` with handle translation | `k_session.*`, `k_client_session.*`, `k_server_session.*` (queueing and close semantics only), `svc_ipc.cpp`, `hle_ipc.cpp` | Fake handler; a second sender queues behind a deferred request; deferred reply wakes the caller; closing either end; handle copy and move |
+| 9 | Sessions and servers (both ends, request queues, workers), named ports, `SendSyncRequest` with handle translation | `k_session.*`, `k_client_session.*`, `k_server_session.*` (queueing and close semantics only), `svc_ipc.cpp`, `hle_ipc.cpp` | Fake handler; a second sender on a session queues behind a deferred request; two sessions of one server don't run handlers at once; deferred reply wakes the caller; closing either end; handle copy and move |
 | 10 | Core loop and timers | none (new) | Scripted fake vCPUs drive six cores deterministically |
 
 Later slices: shared and transfer memory, `MapPhysicalMemory`, resource limits, thread activity
