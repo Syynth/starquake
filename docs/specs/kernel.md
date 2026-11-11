@@ -7,21 +7,43 @@ Status: **proposal, awaiting owner review** (issue #9). Builds on the execution 
 scheduling, synchronisation, memory, handles, and the client side of IPC. Its behaviour is ported
 from Eden (`eden/src/core/hle/kernel`, 183 files); its structure is not.
 
-## What is ported and what is not
+## What is built now, what is deferred, and what is not planned
 
-Starquake runs one application process against services written in Rust. That removes a large
-part of the kernel:
+Compatibility comes first (decision log, 2026-11-11): a feature may be deferred, but the design
+must not rule it out. Starquake starts with one application process talking to services written in
+Rust, so a large part of the kernel can wait. It is sorted into three groups:
 
-| Ported | Not ported |
-|---|---|
-| Threads, the priority scheduler, core affinity, yields | Fibers, `cpu_manager`, `physical_core` (replaced by the execution model) |
-| Events, `WaitSynchronization`, address arbiter, condition variables, lock arbitration with priority inheritance | Server-side IPC (`ReplyAndReceive`, `AcceptSession`, server ports): services aren't guest processes |
-| Address-space bookkeeping: regions, memory blocks, heap, map/unmap, permissions, shared and transfer memory | Horizon's internal allocators (slab heaps, page heaps, dynamic page managers): replaced by simple pool accounting |
-| Handle table, client sessions, named ports | Debugging, I/O pool, interrupt-event, secure-monitor and device-address-space system calls |
-| `GetInfo`, ticks, thread and process lifecycle | Mapping IPC buffers into a server's address space: handlers read the client's memory directly |
+| Built now | Deferred, and designed for | Not planned |
+|---|---|---|
+| Threads, the priority scheduler, core affinity, yields | **Server-side IPC**: `ReplyAndReceive`, `AcceptSession`, `CreateSession`, server ports, light sessions | Fibers, `cpu_manager`, `physical_core` (replaced by the execution model) |
+| Events, `WaitSynchronization`, address arbiter, condition variables, lock arbitration with priority inheritance | **More guest processes**: real system modules, real applets, homebrew that hosts services; process creation calls | Horizon's internal allocators (slab heaps, page heaps): replaced by pool accounting |
+| Address-space bookkeeping: regions, memory blocks, heap, map/unmap, permissions, shared and transfer memory | **Mapping IPC buffers into a server's address space** (HLE handlers read the client's memory directly) | Hardware-facing calls (I/O pools, interrupt events, device address spaces, secure monitor), unless a specific module justifies emulating the device behind them |
+| Handle table, sessions with a Rust handler, named ports | Debugging system calls | |
+| `GetInfo`, ticks, thread and process lifecycle | | |
 
-The cost of the right-hand column: real system modules can never run inside starquake. That
-matches the decision to re-implement the OS, and it is the single biggest simplification here.
+Retail titles can't use the deferred calls: the Switch 2 titles Eden-NX2 examined are permitted
+system calls 0x01–0x36 and 0x80 only, and the server side starts at 0x40. They matter for running
+Nintendo's real system modules as a fallback and for homebrew that provides its own services.
+
+### Rules that keep the deferred column cheap to add
+
+1. **Sessions are modelled as Horizon models them:** a client end, a server end, and a queue of
+   requests between them. A Rust handler is one kind of server end; a guest process calling
+   `ReplyAndReceive` would be another. Nothing in the client path knows which it is.
+2. **Nothing assumes a single process.** Processes live in the arena like any other object, each
+   with its own address space, handle table and memory pool.
+3. **Handle transfer is a kernel primitive** between any two handle tables, not a special case
+   of calling a Rust handler.
+4. **Memory blocks carry Horizon's full attribute set** (IPC lock count, device share count)
+   from the first slice, even where nothing sets them yet, so mapping IPC buffers into a server is
+   additive.
+5. **Cores are configuration.** Application cores 0–5 are what exists at first; system cores can
+   be added without touching the scheduler's logic.
+6. **The system-call table lists every Horizon call** with a status: implemented, deferred or
+   not planned. A deferred call returns "not implemented" and is logged, so a program that needs
+   one says so in its trace.
+7. **The service manager routes a name to a server**, which today is always a Rust factory.
+   Letting a guest register a service later means adding one more kind of entry.
 
 ## Object model
 
@@ -59,11 +81,12 @@ struct State {
 ### A closed set of object kinds
 
 ```rust
-enum Object { Event(Event), Session(ClientSession), SharedMemory(..), TransferMemory(..), Thread(ThreadId), Process(ProcessId), ResourceLimit(..) }
+enum Object { Event(Event), Session(Session), SharedMemory(..), TransferMemory(..), Thread(ThreadId), Process(ProcessId), ResourceLimit(..) }
 ```
 
 An enum, not trait objects: the set is fixed by the system-call table, matches are exhaustive,
-and there are no downcasts. Reference counts are explicit (handles and in-flight waits hold
+and there are no downcasts. Deferred kinds (server ports, light sessions) get their variants when
+they are built; the compiler then points at every match that must handle them. Reference counts are explicit (handles and in-flight waits hold
 them), so "closing the last handle destroys the object" is testable.
 
 ### Handles
@@ -113,16 +136,32 @@ hardware part:
 Region placement is **deterministic by default** (no randomisation) so traces and crash addresses
 reproduce; a seed can turn randomisation on.
 
-### IPC, client side
+### IPC
 
-- `ConnectToNamedPort("sm:")` returns a handle to a session whose handler is the service
-  manager.
-- `SendSyncRequest` copies the 0x100-byte message out of the thread's TLS block, parses it with
-  `starquake-ipc`, resolves copy and move handles against the caller's handle table, and calls
-  the session's handler **without holding the kernel lock**. Reply handles are inserted into the
-  caller's table on the way back.
+A session has two ends and a request queue:
+
+```rust
+struct Session { queue: VecDeque<Request>, current: Option<Request>, server: ServerEnd, client_open: bool }
+enum ServerEnd { Hle(Box<dyn SessionHandler>), /* later: Guest { .. } */ }
+```
+
+- `ConnectToNamedPort("sm:")` returns a handle to the client end of a session whose server end is
+  the service manager.
+- `SendSyncRequest` copies the 0x100-byte message out of the thread's TLS block and queues a
+  request. If the session is idle the request starts at once; if another request is in flight
+  (for example, waiting on a deferred reply), **the sender waits as a guest thread**, exactly as
+  it would on a console. A core thread never waits on a host lock for a session.
+- Starting a request on an HLE server end: parse the message with `starquake-ipc`, resolve copy
+  and move handles against the caller's handle table, and call the handler **without holding
+  the kernel lock**. Reply handles are inserted into the caller's table on the way back, the
+  caller is woken, and the next queued request starts.
+- Closing either end follows Horizon: queued and in-flight requests complete with the
+  session-closed result.
 - The handler interface is defined here (`SessionHandler`: parsed request in, `Done` or
   `Deferred` out) and implemented by the service framework (`services.md`).
+
+A guest server end would take requests from the same queue with `ReplyAndReceive`; that, server
+ports and buffer mapping are the deferred work.
 
 ### System calls
 
@@ -163,11 +202,12 @@ in parallel once this spec and the execution model are approved; 6–10 build on
 | 6 | Memory blocks, regions, heap, map/unmap/permissions, `QueryMemory` | `k_memory_block*.h`, `k_page_table_base.*` | Model test against a naive page-by-page map; Horizon's error for each invalid request |
 | 7 | Pools, accounting, `GetInfo` | `k_memory_manager.*`, `svc_info.cpp`, PR #4588's additions | Accounting adds up after random operations; Switch 2 ids |
 | 8 | Process creation, TLS pages, thread lifecycle calls | `k_process.*`, `k_thread_local_page.*`, `svc_thread.cpp` | Create, start, exit, join; TLS slot reuse |
-| 9 | Sessions, named ports, `SendSyncRequest` with handle translation | `k_client_session.*`, `svc_ipc.cpp`, `hle_ipc.cpp` | Fake handler; deferred reply wakes the caller; handle copy and move |
+| 9 | Sessions (both ends and the request queue), named ports, `SendSyncRequest` with handle translation | `k_session.*`, `k_client_session.*`, `k_server_session.*` (queueing and close semantics only), `svc_ipc.cpp`, `hle_ipc.cpp` | Fake handler; a second sender queues behind a deferred request; deferred reply wakes the caller; closing either end; handle copy and move |
 | 10 | Core loop and timers | none (new) | Scripted fake vCPUs drive six cores deterministically |
 
 Later slices: shared and transfer memory, `MapPhysicalMemory`, resource limits, thread activity
-and context, code memory.
+and context, code memory. Deferred until something needs them: the server-side calls, guest
+process creation, and IPC buffer mapping.
 
 ## Decisions asked of the owner
 
@@ -175,7 +215,8 @@ and context, code memory.
    Horizon's linked, reference-counted objects: no `unsafe`, deterministic tests, and the known
    contention point can be split out later.
 2. **A closed `enum` of object kinds** rather than trait objects.
-3. **No server-side IPC and no system-process system calls, ever.** This rules out running real
-   system modules.
+3. **Server-side IPC, guest-hosted services and real system modules are deferred, not excluded.**
+   The seven rules above keep them additive. (Revised after owner review: the first draft ruled
+   them out.)
 4. **Deterministic address-space layout by default.**
 5. **Capabilities are logged first, enforced later.**
