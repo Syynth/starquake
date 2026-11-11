@@ -31,8 +31,8 @@ pub use cmif::{
 };
 pub use error::{IpcError, Result};
 pub use hipc::{
-    BUFFER_SIZE, BUFFER_WORDS, BufferDescriptor, CommandHeader, CommandType, MAX_DESCRIPTORS,
-    MAX_HANDLES, MAX_RAW_WORDS, MAX_TIPC_COMMAND_ID, ReceiveDescriptor, ReceiveList, SpecialHeader,
+    BUFFER_SIZE, BufferDescriptor, CommandHeader, CommandType, MAX_DESCRIPTORS, MAX_HANDLES,
+    MAX_RAW_WORDS, MAX_TIPC_COMMAND_ID, ReceiveDescriptor, ReceiveList, SpecialHeader,
     StaticDescriptor, TIPC_COMMAND_OFFSET,
 };
 pub use message::{Body, CmifReply, CmifRequest, Message, SessionKind};

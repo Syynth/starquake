@@ -10,8 +10,6 @@ use crate::error::{IpcError, Result};
 /// Size of a thread's IPC buffer in bytes (`COMMAND_BUFFER_LENGTH` is `0x100 / 4` words in
 /// `eden/src/core/hle/ipc.h`).
 pub const BUFFER_SIZE: usize = 0x100;
-/// Size of the IPC buffer in 32-bit words.
-pub const BUFFER_WORDS: usize = BUFFER_SIZE / 4;
 /// Largest count of X, A, B or W descriptors: each count is a 4-bit field of the first header
 /// word (`eden/src/core/hle/ipc.h`, `CommandHeader`).
 pub const MAX_DESCRIPTORS: u32 = 0xF;
