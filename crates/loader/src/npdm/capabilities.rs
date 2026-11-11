@@ -81,6 +81,9 @@ impl SvcMask {
 /// Bits of physical address a memory map may use
 /// (`KCapabilities::PhysicalMapAllowedMask = (1ULL << 36) - 1` in `k_capabilities.h`).
 pub const PHYSICAL_ADDRESS_BITS: u32 = 36;
+/// Numerically largest (lowest-priority) thread priority
+/// (`Svc::LowestThreadPriority` in `eden/src/core/hle/kernel/svc_types.h`; the highest is 0).
+pub const LOWEST_THREAD_PRIORITY: u8 = 63;
 /// Number of thread priorities, from 0, that belong to the kernel and that a process capability
 /// must not include (`(m_priority_mask & 0xF) == 0` in `SetCorePriorityCapability`).
 pub const RESERVED_KERNEL_PRIORITIES: u8 = 4;

@@ -1,8 +1,10 @@
 //! NPDM program metadata: META header, ACID (Switch 1 and Switch 2 layouts), ACI0, kernel capabilities.
 //!
-//! Parsing only: [`Npdm::parse`] takes the bytes of a `main.npdm` and returns owned, validated
-//! data. Kernel capabilities are decoded in [`capabilities`], service access control in
-//! [`service_access`].
+//! [`Npdm::parse`] takes the bytes of a `main.npdm` and returns owned, structurally validated
+//! data. Kernel capabilities are decoded in [`capabilities`] (with their policy checks), service
+//! access control in [`service_access`]; the cross-checks that relate the parts to each other
+//! (`ACI0` against `ACID`, the main thread against the capabilities) are in [`validate`] and are
+//! never run by `parse`.
 //!
 //! Ported from `eden/src/core/file_sys/program_metadata.{h,cpp}` @ cf654052 (GPL-3.0-or-later):
 //! the `Header`, `AcidHeader`, `AciHeader`, `FileAccessControl` and `FileAccessHeader` layouts.
@@ -30,11 +32,31 @@
 //! type), main thread priority at 0xE and core at 0xF, system resource size at 0x14, process
 //! category at 0x18, main thread stack size at 0x1C, a 16-byte name at 0x20, then the `ACI0`
 //! offset and size at 0x70 and the `ACID` offset and size at 0x78 (`program_metadata.h`,
-//! `Header`). `npdm_info.py` labels the words at 0x10 and 0x14 differently (`sys_res` at 0x10,
-//! `version` at 0x14); Eden's offsets are used here, and the discrepancy is recorded in the PR.
+//! `Header`).
+//!
+//! # Where Eden and `npdm_info.py` disagree
+//!
+//! `eden-nx2/tools/nx2/npdm_info.py` prints the word at 0x10 as `sys_res` and the word at 0x14 as
+//! `version`. Eden puts 4 reserved bytes at 0x10 and the system resource size at 0x14, then the
+//! word it calls `process_category` at 0x18. The SwitchBrew NPDM page (see "Documentation
+//! sources" in `docs/references.md`) agrees with Eden's offsets and differs from the script:
+//! 0x10 is "RemoteMemorySize" (marked Switch 2 only), 0x14 the system resource size and 0x18
+//! "Version". So this parser follows Eden for the offsets, and the script's two labels are
+//! treated as its mistake; a test pins that the word at 0x10 is not the system resource size.
+//! Two consequences, both deliberate:
+//!
+//! - The word at 0x10 is not exposed (no consumer needs it yet).
+//! - [`Npdm::process_category`] keeps Eden's name for the word at 0x18, which SwitchBrew calls
+//!   the version. Whether it is a process category is not established by any source here.
+//!
+//! The `ACID` block's own service and kernel access control are read at body offsets 0x28 and
+//! 0x30 (`AcidHeader::sac_offset`, `kac_offset`) with the same relative-to-block rule as the
+//! FAC, and decoded like their `ACI0` counterparts. How the `ACI0` relates to the `ACID` is in
+//! [`validate`]; every rule there is a guess.
 
 pub mod capabilities;
 pub mod service_access;
+pub mod validate;
 
 use capabilities::{CapabilityError, KernelCapabilities};
 use service_access::{ServiceAccess, ServiceAccessError};
@@ -56,6 +78,12 @@ pub const ACID_MAGIC_OFFSET_SWITCH2: usize = 0x300;
 /// Bytes of the `ACID` body, from its magic to the end of the `AcidHeader` struct:
 /// `sizeof(AcidHeader) - 0x200` (`static_assert(sizeof(AcidHeader) == 0x240)`).
 const ACID_BODY_SIZE: usize = 0x40;
+/// Offset, within the `ACID` body, of the SAC offset word; the size word follows
+/// (`AcidHeader::sac_offset`, `sac_size`).
+const ACID_BODY_SAC_FIELD: usize = 0x28;
+/// Offset, within the `ACID` body, of the KAC offset word; the size word follows
+/// (`AcidHeader::kac_offset`, `kac_size`).
+const ACID_BODY_KAC_FIELD: usize = 0x30;
 /// Size of the `ACI0` header (`static_assert(sizeof(AciHeader) == 0x40)`).
 const ACI0_HEADER_SIZE: usize = 0x40;
 /// Bytes read from a file access control block: version, 3 padding, u64 permissions, 0x20 unknown
@@ -166,6 +194,11 @@ pub struct Acid {
     pub title_id_max: u64,
     /// File access control.
     pub file_access: FileAccessControl,
+    /// Services the title may be granted (the `ACID`'s own service access control; wildcard
+    /// entries are grants, see [`service_access`]).
+    pub services: Vec<ServiceAccess>,
+    /// Kernel capabilities the title may be granted (the `ACID`'s own KAC).
+    pub kernel_capabilities: KernelCapabilities,
 }
 
 /// The `ACI0` block: what the title actually asks for.
@@ -194,7 +227,7 @@ pub struct Npdm {
     pub main_thread_core: u8,
     /// System resource size in bytes.
     pub system_resource_size: u32,
-    /// Process category (Eden: `process_category`).
+    /// The word at 0x18. Eden names it `process_category`; SwitchBrew calls it the version.
     pub process_category: u32,
     /// Main thread stack size in bytes.
     pub main_thread_stack_size: u32,
@@ -250,12 +283,21 @@ pub enum NpdmError {
     /// The kernel capability block is not a whole number of words.
     #[error("NPDM KAC size {0:#x} is not a multiple of 4")]
     UnalignedKac(usize),
-    /// The service access block is malformed.
+    /// The `ACID` kernel capability block is not a whole number of words.
+    #[error("NPDM ACID KAC size {0:#x} is not a multiple of 4")]
+    UnalignedAcidKac(usize),
+    /// The `ACI0` service access block is malformed.
     #[error("NPDM service access control is malformed")]
     ServiceAccess(#[from] ServiceAccessError),
-    /// The kernel capabilities are malformed.
+    /// The `ACI0` kernel capabilities are malformed.
     #[error("NPDM kernel capabilities are malformed")]
     Capabilities(#[from] CapabilityError),
+    /// The `ACID` service access block is malformed.
+    #[error("NPDM ACID service access control is malformed")]
+    AcidServiceAccess(#[source] ServiceAccessError),
+    /// The `ACID` kernel capabilities are malformed.
+    #[error("NPDM ACID kernel capabilities are malformed")]
+    AcidCapabilities(#[source] CapabilityError),
 }
 
 impl Npdm {
@@ -353,8 +395,9 @@ fn parse_acid(block: &[u8]) -> Result<Acid, NpdmError> {
         })
         .ok_or(NpdmError::AcidNotFound)?;
 
-    // Body layout, relative to the magic (`AcidHeader` after the 0x200-byte signature area):
-    // flags at 0xC, title id range at 0x10 and 0x18, FAC offset and size at 0x20.
+    // Body layout, relative to the magic (`AcidHeader` after the signature area): flags at 0xC,
+    // title id range at 0x10 and 0x18, FAC, SAC and KAC offset/size pairs at 0x20, 0x28 and 0x30.
+    // The offsets are relative to the start of the ACID block.
     let acid_flags = u32_at(body, 0xC);
     let fac_offset = to_usize(u32_at(body, 0x20), "FAC")?;
     let fac_size = to_usize(u32_at(body, 0x24), "FAC")?;
@@ -366,6 +409,19 @@ fn parse_acid(block: &[u8]) -> Result<Acid, NpdmError> {
             needed: FAC_SIZE,
         });
     }
+    let sac = sub_block(
+        block,
+        to_usize(u32_at(body, ACID_BODY_SAC_FIELD), "ACID SAC")?,
+        to_usize(u32_at(body, ACID_BODY_SAC_FIELD + 4), "ACID SAC")?,
+        "ACID SAC",
+    )?;
+    let kac = sub_block(
+        block,
+        to_usize(u32_at(body, ACID_BODY_KAC_FIELD), "ACID KAC")?,
+        to_usize(u32_at(body, ACID_BODY_KAC_FIELD + 4), "ACID KAC")?,
+        "ACID KAC",
+    )?;
+    let kac_words = kac_words(kac).ok_or(NpdmError::UnalignedAcidKac(kac.len()))?;
     Ok(Acid {
         layout,
         production: acid_flags & 1 != 0,
@@ -384,6 +440,21 @@ fn parse_acid(block: &[u8]) -> Result<Acid, NpdmError> {
             permissions: u64_at(fac, 4),
             unknown: read_array::<0x20>(fac, 0xC).unwrap_or([0; 0x20]),
         },
+        services: service_access::parse(sac).map_err(NpdmError::AcidServiceAccess)?,
+        kernel_capabilities: KernelCapabilities::parse(&kac_words)
+            .map_err(NpdmError::AcidCapabilities)?,
+    })
+}
+
+/// The little-endian words of a kernel capability block, or `None` if its length is not a
+/// multiple of 4.
+fn kac_words(kac: &[u8]) -> Option<Vec<u32>> {
+    let (chunks, rest) = kac.as_chunks::<4>();
+    rest.is_empty().then(|| {
+        chunks
+            .iter()
+            .map(|chunk| u32::from_le_bytes(*chunk))
+            .collect()
     })
 }
 
@@ -418,15 +489,7 @@ fn parse_aci(block: &[u8]) -> Result<Aci0, NpdmError> {
     }
     let sac = sub_block(block, sac_offset, sac_size, "SAC")?;
     let kac = sub_block(block, kac_offset, kac_size, "KAC")?;
-    if kac.len() % 4 != 0 {
-        return Err(NpdmError::UnalignedKac(kac.len()));
-    }
-    let words: Vec<u32> = kac
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|chunk| u32::from_le_bytes(*chunk))
-        .collect();
+    let words = kac_words(kac).ok_or(NpdmError::UnalignedKac(kac.len()))?;
 
     Ok(Aci0 {
         title_id: u64_at(block, 0x10),
@@ -473,17 +536,39 @@ fn u64_at(bytes: &[u8], offset: usize) -> u64 {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+    use validate::{AcidViolation, MainThreadViolation};
 
     /// Fixed seed so property runs are reproducible.
     const PROPTEST_SEED: u64 = 0x5EED_0000_5143;
 
     const TITLE_ID: u64 = 0x0400_C3F0_0006_E000;
 
+    /// Distinct sentinel for the META word at 0x10, which `npdm_info.py` calls the system
+    /// resource size and which SwitchBrew calls the Switch 2 remote memory size.
+    const WORD_0X10: u32 = 0xA5A5_0010;
+
+    /// Test-side `CorePriority` descriptor: priorities `min..=max`, cores `min_core..=max_core`.
+    fn thread_info_word(min_prio: u32, max_prio: u32, min_core: u32, max_core: u32) -> u32 {
+        0b111 | (max_prio << 4) | (min_prio << 10) | (min_core << 16) | (max_core << 24)
+    }
+
+    /// Test-side SAC encoder: `(name, server)` entries, `*` in a name kept as the wildcard.
+    fn sac_bytes(entries: &[(&str, bool)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (name, server) in entries {
+            out.push(u8::try_from(name.len() - 1).unwrap() | if *server { 0x80 } else { 0 });
+            out.extend_from_slice(name.as_bytes());
+        }
+        out
+    }
+
     /// A test-side NPDM writer that places bytes at the documented offsets.
     struct Fixture {
         layout: AcidLayout,
         sac: Vec<u8>,
         kac: Vec<u32>,
+        acid_sac: Vec<u8>,
+        acid_kac: Vec<u32>,
     }
 
     impl Fixture {
@@ -492,6 +577,23 @@ mod tests {
                 layout,
                 // fs:ro (client), sm:m (server flag), ldr:* wildcard.
                 sac: [&[0x04][..], b"fs:ro", &[0x83], b"sm:m", &[0x04], b"ldr:*"].concat(),
+                // The signed list is a superset of the requested one, plus one more service.
+                acid_sac: sac_bytes(&[
+                    ("fs:ro", false),
+                    ("sm:m", true),
+                    ("ldr:*", false),
+                    ("pl:u", false),
+                ]),
+                acid_kac: vec![
+                    // Cores 0..=5, priorities 24..=63.
+                    thread_info_word(24, 63, 0, 5),
+                    // SVCs 0x00..=0x17 on index 0 (mask bits 0..=23).
+                    0b1111 | (0xFF_FFFF << 5),
+                    // Kernel version 9.1.
+                    0x3FFF | (1 << 15) | (9 << 19),
+                    // Handle table size 0x300.
+                    0x7FFF | (0x300 << 16),
+                ],
                 kac: vec![
                     // Cores 0..=5, priorities 28..=59.
                     0x0500_73B7,
@@ -514,6 +616,7 @@ mod tests {
             file[0xC] = 1 | (3 << 1);
             file[0xE] = 44;
             file[0xF] = 2;
+            file[0x10..0x14].copy_from_slice(&WORD_0X10.to_le_bytes());
             file[0x14..0x18].copy_from_slice(&0x0010_0000u32.to_le_bytes());
             file[0x18..0x1C].copy_from_slice(&1u32.to_le_bytes());
             file[0x1C..0x20].copy_from_slice(&0x0020_0000u32.to_le_bytes());
@@ -526,7 +629,7 @@ mod tests {
             let fah_offset = aci.len();
             let mut fah = vec![0u8; FAH_SIZE];
             fah[0] = 1;
-            fah[4..12].copy_from_slice(&0xFFFF_FFFF_FFFF_FFFFu64.to_le_bytes());
+            fah[4..12].copy_from_slice(&0x8000_0000_0000_0001u64.to_le_bytes());
             fah[0xC..0x10].copy_from_slice(&0x1Cu32.to_le_bytes());
             fah[0x10..0x14].copy_from_slice(&0x8u32.to_le_bytes());
             fah[0x14..0x18].copy_from_slice(&0x24u32.to_le_bytes());
@@ -561,12 +664,29 @@ mod tests {
             let fac_offset = magic_at + ACID_BODY_SIZE;
             body[0x20..0x24].copy_from_slice(&u32::try_from(fac_offset).unwrap().to_le_bytes());
             body[0x24..0x28].copy_from_slice(&u32::try_from(FAC_SIZE).unwrap().to_le_bytes());
+            let fac_end = fac_offset + FAC_SIZE;
+            let acid_kac_bytes: Vec<u8> = self
+                .acid_kac
+                .iter()
+                .flat_map(|word| word.to_le_bytes())
+                .collect();
+            let sac_at = ACID_BODY_SAC_FIELD;
+            let kac_at = ACID_BODY_KAC_FIELD;
+            for (at, offset, len) in [
+                (sac_at, fac_end, self.acid_sac.len()),
+                (kac_at, fac_end + self.acid_sac.len(), acid_kac_bytes.len()),
+            ] {
+                body[at..at + 4].copy_from_slice(&u32::try_from(offset).unwrap().to_le_bytes());
+                body[at + 4..at + 8].copy_from_slice(&u32::try_from(len).unwrap().to_le_bytes());
+            }
             acid.extend_from_slice(&body);
             let mut fac = vec![0u8; FAC_SIZE];
             fac[0] = 1;
             fac[4..12].copy_from_slice(&0x8000_0000_0000_0001u64.to_le_bytes());
             fac[0xC] = 0x5A;
             acid.extend_from_slice(&fac);
+            acid.extend_from_slice(&self.acid_sac);
+            acid.extend_from_slice(&acid_kac_bytes);
 
             let meta_end = file.len();
             let acid_file_offset = meta_end + aci.len();
@@ -630,10 +750,38 @@ mod tests {
         assert_eq!(npdm.acid.file_access.permissions, 0x8000_0000_0000_0001);
         assert_eq!(npdm.acid.file_access.unknown[0], 0x5A);
 
+        // The ACID's own lists are its own, not the ACI0's.
+        let acid_services: Vec<_> = npdm
+            .acid
+            .services
+            .iter()
+            .map(|s| (s.name.as_str(), s.server, s.wildcard))
+            .collect();
+        assert_eq!(
+            acid_services,
+            [
+                ("fs:ro", false, false),
+                ("sm:m", true, false),
+                ("ldr:", false, true),
+                ("pl:u", false, false)
+            ]
+        );
+        let acid_caps = &npdm.acid.kernel_capabilities;
+        let acid_info = acid_caps.thread_info.as_ref().unwrap();
+        assert_eq!(acid_info.cores, 0..=5);
+        assert_eq!(acid_info.priorities, 24..=63);
+        assert_eq!(acid_caps.svc_mask.iter().count(), 24);
+        assert_eq!(acid_caps.handle_table_size, Some(0x300));
+        assert_eq!(npdm.validate_against_acid(), Ok(()));
+
+        // META words 0x10 and 0x14: Eden's layout, not `npdm_info.py`'s labels. The sentinel at
+        // 0x10 must not leak into the system resource size.
+        assert_ne!(npdm.system_resource_size, WORD_0X10);
+
         assert_eq!(npdm.aci.title_id, TITLE_ID);
         let fah = npdm.aci.file_access;
         assert_eq!(fah.version, 1);
-        assert_eq!(fah.permissions, u64::MAX);
+        assert_eq!(fah.permissions, 0x8000_0000_0000_0001);
         assert_eq!(
             (
                 fah.unk_offset,
@@ -841,11 +989,206 @@ mod tests {
         ));
     }
 
+    /// Where the ACID block starts in a built Switch 1 fixture, and its body.
+    fn acid_body_at(file: &[u8]) -> usize {
+        let acid_at = u32::from_le_bytes(file[0x78..0x7C].try_into().unwrap()) as usize;
+        acid_at + ACID_MAGIC_OFFSET_SWITCH1
+    }
+
+    fn put_word(file: &mut [u8], at: usize, value: u32) {
+        file[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    #[test]
+    fn rejects_malformed_acid_sac_and_kac_blocks() {
+        let good = Fixture::new(AcidLayout::Switch1).build();
+        let body = acid_body_at(&good);
+
+        // Offset past the block, and an offset plus size that runs off the end.
+        let mut file = good.clone();
+        put_word(&mut file, body + ACID_BODY_SAC_FIELD, u32::MAX);
+        assert_eq!(
+            Npdm::parse(&file),
+            Err(NpdmError::OutOfBounds {
+                section: "ACID SAC"
+            })
+        );
+        let mut file = good.clone();
+        put_word(&mut file, body + ACID_BODY_KAC_FIELD + 4, u32::MAX);
+        assert_eq!(
+            Npdm::parse(&file),
+            Err(NpdmError::OutOfBounds {
+                section: "ACID KAC"
+            })
+        );
+        let mut file = good.clone();
+        put_word(&mut file, body + ACID_BODY_KAC_FIELD, u32::MAX);
+        put_word(&mut file, body + ACID_BODY_KAC_FIELD + 4, u32::MAX);
+        assert_eq!(
+            Npdm::parse(&file),
+            Err(NpdmError::OutOfBounds {
+                section: "ACID KAC"
+            })
+        );
+        // A KAC that is not a whole number of words.
+        let mut file = good.clone();
+        put_word(&mut file, body + ACID_BODY_KAC_FIELD + 4, 6);
+        assert_eq!(Npdm::parse(&file), Err(NpdmError::UnalignedAcidKac(6)));
+    }
+
+    #[test]
+    fn acid_list_decode_errors_propagate_under_their_own_variants() {
+        let mut fixture = Fixture::new(AcidLayout::Switch1);
+        fixture.acid_kac = vec![0];
+        assert!(matches!(
+            Npdm::parse(&fixture.build()),
+            Err(NpdmError::AcidCapabilities(
+                CapabilityError::InvalidDescriptor { .. }
+            ))
+        ));
+        let mut fixture = Fixture::new(AcidLayout::Switch1);
+        fixture.acid_sac = vec![0x07, b'a'];
+        assert!(matches!(
+            Npdm::parse(&fixture.build()),
+            Err(NpdmError::AcidServiceAccess(
+                ServiceAccessError::Truncated { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn parsed_files_can_be_validated_against_their_acid() {
+        for layout in [AcidLayout::Switch1, AcidLayout::Switch2] {
+            let mut fixture = Fixture::new(layout);
+            // The ACI0 asks for a service the ACID does not list.
+            fixture.sac = sac_bytes(&[("fs:ro", false), ("nfc:u", false)]);
+            let npdm = Npdm::parse(&fixture.build()).unwrap();
+            assert_eq!(
+                npdm.validate_against_acid(),
+                Err(AcidViolation::ServiceNotAllowed {
+                    name: "nfc:u".into(),
+                    server: false,
+                    wildcard: false
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn main_thread_of_the_fixture_fits_its_capabilities() {
+        // META: core 2, priority 44; ThreadInfo cores 0..=5, priorities 28..=59.
+        let npdm = Npdm::parse(&Fixture::new(AcidLayout::Switch2).build()).unwrap();
+        assert_eq!(npdm.check_main_thread(6), Ok(()));
+        assert_eq!(
+            npdm.check_main_thread(2),
+            Err(MainThreadViolation::CoreOutOfRange {
+                core: 2,
+                core_count: 2
+            })
+        );
+        assert_eq!(npdm.aci.kernel_capabilities.check_policy(6), Ok(()));
+    }
+
+    /// `(name, server, wildcard)` entries for a generated SAC.
+    type Services = Vec<(String, bool, bool)>;
+    /// `(min priority, extra priorities, min core, extra cores, handle table, major, minor)`.
+    type Caps = (u32, u32, u32, u32, u32, u32, u32);
+
+    fn services_strategy() -> impl Strategy<Value = Services> {
+        proptest::collection::vec(("[a-z:]{1,7}", any::<bool>(), any::<bool>()), 0..6)
+    }
+
+    fn caps_strategy() -> impl Strategy<Value = Caps> {
+        (
+            0u32..32,
+            0u32..32,
+            0u32..3,
+            0u32..3,
+            1u32..0x400,
+            1u32..0x2000,
+            0u32..16,
+        )
+    }
+
+    fn encode_services(services: &Services) -> Vec<u8> {
+        let owned: Vec<String> = services
+            .iter()
+            .map(|(name, _, wildcard)| format!("{name}{}", if *wildcard { "*" } else { "" }))
+            .collect();
+        let entries: Vec<(&str, bool)> = owned
+            .iter()
+            .zip(services)
+            .map(|(text, (_, server, _))| (text.as_str(), *server))
+            .collect();
+        sac_bytes(&entries)
+    }
+
+    fn encode_caps(&(p, dp, c, dc, handles, major, minor): &Caps) -> Vec<u32> {
+        vec![
+            thread_info_word(p, p + dp, c, c + dc),
+            0x7FFF | (handles << 16),
+            0x3FFF | (minor << 15) | (major << 19),
+        ]
+    }
+
+    fn check_services(parsed: &[ServiceAccess], expected: &Services) {
+        let got: Vec<_> = parsed
+            .iter()
+            .map(|s| (s.name.clone(), s.server, s.wildcard))
+            .collect();
+        assert_eq!(&got, expected);
+    }
+
+    fn check_caps(caps: &KernelCapabilities, &(p, dp, c, dc, handles, major, minor): &Caps) {
+        let info = caps.thread_info.as_ref().unwrap();
+        assert_eq!(
+            info.priorities,
+            u8::try_from(p).unwrap()..=u8::try_from(p + dp).unwrap()
+        );
+        assert_eq!(
+            info.cores,
+            u8::try_from(c).unwrap()..=u8::try_from(c + dc).unwrap()
+        );
+        assert_eq!(
+            caps.handle_table_size,
+            Some(u16::try_from(handles).unwrap())
+        );
+        let version = caps.kernel_version.unwrap();
+        assert_eq!(
+            (u32::from(version.major), u32::from(version.minor)),
+            (major, minor)
+        );
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig {
             rng_seed: proptest::test_runner::RngSeed::Fixed(PROPTEST_SEED),
             ..ProptestConfig::default()
         })]
+        /// The ACI0 and the ACID each get their own generated service list and capability list,
+        /// so a parser that read the ACID's SAC from the ACI0's offset (or the KAC from the SAC
+        /// field, or either block from the other) returns the wrong lists.
+        #[test]
+        fn generated_service_and_capability_lists_round_trip(
+            switch2 in any::<bool>(),
+            aci_services in services_strategy(),
+            acid_services in services_strategy(),
+            aci_caps in caps_strategy(),
+            acid_caps in caps_strategy(),
+        ) {
+            let layout = if switch2 { AcidLayout::Switch2 } else { AcidLayout::Switch1 };
+            let mut fixture = Fixture::new(layout);
+            fixture.sac = encode_services(&aci_services);
+            fixture.acid_sac = encode_services(&acid_services);
+            fixture.kac = encode_caps(&aci_caps);
+            fixture.acid_kac = encode_caps(&acid_caps);
+            let npdm = Npdm::parse(&fixture.build()).unwrap();
+            check_services(&npdm.aci.services, &aci_services);
+            check_services(&npdm.acid.services, &acid_services);
+            check_caps(&npdm.aci.kernel_capabilities, &aci_caps);
+            check_caps(&npdm.acid.kernel_capabilities, &acid_caps);
+        }
+
         #[test]
         fn arbitrary_bytes_never_panic(bytes in proptest::collection::vec(any::<u8>(), 0..1024)) {
             let _ = Npdm::parse(&bytes);

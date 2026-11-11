@@ -5,9 +5,19 @@
 //! three bits hold the name length minus one. This is the loop in
 //! `eden-nx2/tools/nx2/npdm_info.py` (`ctl & 0x80`, `(ctl & 7) + 1`).
 //!
-//! A trailing `*` in a name makes it a wildcard (a prefix match). That is from the SwitchBrew NPDM
-//! page and is not in the pinned references; it is reported as a separate flag, with the `*`
-//! removed from the name.
+//! A trailing `*` in a name makes it a wildcard (a prefix match); it is reported as a separate
+//! flag, with the `*` removed from the name.
+//!
+//! # Sourcing: a guess that stays
+//!
+//! The pinned references never handle `*` (Eden does not check service access at all, and
+//! `npdm_info.py` prints names verbatim). The SwitchBrew NPDM page says the name "supports the
+//! wildcard `*` character" (see "Documentation sources" in `docs/references.md`), but it does not
+//! say that the `*` must be last or that the match is a prefix match. So **the trailing-only,
+//! prefix-match reading is a guess**, kept because it is the simplest reading of "supports the
+//! wildcard"; no fixture built from homebrew exercises it. A `*` anywhere else in a name is kept
+//! as a literal character. If a real ACID disagrees, [`ServiceAccess::covers`] and the `wildcard`
+//! flag are the two places to fix.
 
 /// One service access entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -16,8 +26,31 @@ pub struct ServiceAccess {
     pub name: String,
     /// True when the title hosts the service (control byte bit 7).
     pub server: bool,
-    /// True when the name ended in `*` (a prefix match). SwitchBrew; not in the pinned references.
+    /// True when the name ended in `*` (a prefix match). A guess; see the module docs.
     pub wildcard: bool,
+}
+
+impl ServiceAccess {
+    /// True if `self`, read as an entry of the signed `ACID` list, permits `request`, an entry of
+    /// the `ACI0` list: the same role (`server`), and either the same name or, when `self` is a
+    /// wildcard, a request whose name starts with `self`'s prefix.
+    ///
+    /// A wildcard request is permitted only by a wildcard grant whose prefix it extends, so an
+    /// `ACI0` cannot widen an exact grant.
+    ///
+    /// Neither Eden nor any pinned reference validates `ACI0` against `ACID`, so the matching is
+    /// a guess, chosen as the least permissive reading consistent with the wildcard being a
+    /// prefix match (see the module docs).
+    pub fn covers(&self, request: &Self) -> bool {
+        if self.server != request.server {
+            return false;
+        }
+        if self.wildcard {
+            request.name.starts_with(&self.name)
+        } else {
+            !request.wildcard && request.name == self.name
+        }
+    }
 }
 
 /// Why a service access block could not be parsed.
@@ -114,6 +147,39 @@ mod tests {
                 },
             ]
         );
+    }
+
+    fn service(name: &str, server: bool, wildcard: bool) -> ServiceAccess {
+        ServiceAccess {
+            name: name.into(),
+            server,
+            wildcard,
+        }
+    }
+
+    #[test]
+    fn a_grant_covers_an_exact_request_with_the_same_role() {
+        let grant = service("fs:ro", false, false);
+        assert!(grant.covers(&service("fs:ro", false, false)));
+        // Different name, different role, and a wildcard request against an exact grant.
+        assert!(!grant.covers(&service("fs:rw", false, false)));
+        assert!(!grant.covers(&service("fs:ro", true, false)));
+        assert!(!grant.covers(&service("fs:", false, true)));
+        // A prefix of the grant's name is not covered either.
+        assert!(!grant.covers(&service("fs:r", false, false)));
+    }
+
+    #[test]
+    fn a_wildcard_grant_covers_names_with_its_prefix() {
+        let grant = service("ldr:", false, true);
+        assert!(grant.covers(&service("ldr:ro", false, false)));
+        assert!(grant.covers(&service("ldr:", false, false)));
+        assert!(grant.covers(&service("ldr:", false, true)));
+        assert!(grant.covers(&service("ldr:r", false, true)));
+        assert!(!grant.covers(&service("ld", false, false)));
+        assert!(!grant.covers(&service("ld", false, true)));
+        assert!(!grant.covers(&service("sm:", false, false)));
+        assert!(!grant.covers(&service("ldr:ro", true, false)));
     }
 
     #[test]
