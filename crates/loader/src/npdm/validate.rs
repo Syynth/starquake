@@ -843,6 +843,15 @@ mod tests {
             npdm(0, 28, info()).check_main_thread(4),
             Err(MainThreadViolation::CoreNotAllowed { core: 0 })
         );
+        // The lowest priority (numerically largest) is still a priority.
+        let to_lowest = Some(ThreadInfo {
+            priorities: 28..=LOWEST_THREAD_PRIORITY,
+            cores: 1..=3,
+        });
+        assert_eq!(
+            npdm(1, LOWEST_THREAD_PRIORITY, to_lowest).check_main_thread(4),
+            Ok(())
+        );
         assert_eq!(
             npdm(1, 64, info()).check_main_thread(4),
             Err(MainThreadViolation::PriorityOutOfRange { priority: 64 })
