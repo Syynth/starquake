@@ -16,14 +16,15 @@
 //! ...    text padded to a page; then rodata, then data, each padded to a page
 //! ```
 //!
-//! The text segment starts at offset 0 and so contains the header, as `eden/src/core/loader/nro.cpp`
-//! implies by mapping segment `offset` as the segment's address from the image base. Segment sizes
-//! are page multiples, as Eden rounds them up (`PageAlignSize`) with `YUZU_PAGESIZE` = 0x1000.
+//! Segment sizes are page multiples, as Eden rounds them up (`PageAlignSize`) with `YUZU_PAGESIZE` = 0x1000.
 //! There is no `ASET` block. `.bss` is described by the header's size and by `MOD0`, and starts
 //! right after the data segment.
 //!
 //! Guesses, not backed by a pinned source (`docs/references.md`):
 //!
+//! - The text segment starts at offset 0 and so contains the header. `eden/src/core/loader/nro.cpp`
+//!   maps each segment's `offset` from the image base, which is consistent with this but does not
+//!   require it; no reference states it.
 //! - The first word is a `b` to the code. The references only call it the entry instruction
 //!   (`m_entrypoint_insn`); that it is a branch over the header is a guess, and the loader tests
 //!   should not depend on it.
@@ -45,6 +46,12 @@ pub const HOMEBREW_MARKER: [u8; 8] = *b"HOMEBREW";
 pub const HEADER_SIZE: usize = 0x80;
 /// Size of the `MOD0` header (`static_assert(sizeof(ModHeader) == 0x1c)`).
 pub const MOD0_SIZE: usize = 0x1C;
+/// Size of one segment header, `{offset, size}` (`NroSegmentHeader`, `0x8` bytes).
+pub const SEGMENT_HEADER_SIZE: usize = 0x8;
+/// Offset of the size within a segment header.
+pub const SEGMENT_SIZE_OFFSET: usize = 0x4;
+/// Size of one `MOD0` field (a `u32`; the magic is one as well).
+pub const MOD0_FIELD_SIZE: usize = 0x4;
 /// Size of the build id, `NroHeader::m_module_id` in `ro_types.h`.
 pub const BUILD_ID_SIZE: usize = 0x20;
 /// Size of the one dynamic entry, an ELF `Elf64_Dyn` of two `u64`s.
@@ -194,9 +201,9 @@ impl NroBuilder {
         image.put(MAGIC_OFFSET, &MAGIC)?;
         image.put_u32(SIZE_OFFSET, layout.image_size)?;
         for (index, (offset, size)) in layout.segments.into_iter().enumerate() {
-            let at = SEGMENTS_OFFSET + index * 8;
+            let at = SEGMENTS_OFFSET + index * SEGMENT_HEADER_SIZE;
             image.put_u32(at, offset)?;
-            image.put_u32(at + 4, size)?;
+            image.put_u32(at + SEGMENT_SIZE_OFFSET, size)?;
         }
         image.put_u32(BSS_SIZE_OFFSET, self.bss_size)?;
         image.put(BUILD_ID_OFFSET, &self.build_id)?;
@@ -220,7 +227,10 @@ impl NroBuilder {
             bss_start_rel,             // module_offset, "typically equal to .bss base"
         ];
         for (index, word) in mod0_words.into_iter().enumerate() {
-            image.put_u32(MOD0_OFFSET + 4 + index * 4, word)?;
+            image.put_u32(
+                MOD0_OFFSET + MOD0_FIELD_SIZE + index * MOD0_FIELD_SIZE,
+                word,
+            )?;
         }
         // The dynamic section is already all zero: one DT_NULL.
 
@@ -359,7 +369,12 @@ mod tests {
     }
 
     fn mod0_field_offset(name: &str) -> usize {
-        MOD0_OFFSET + 4 * REFERENCE_MOD0.iter().position(|f| *f == name).unwrap()
+        MOD0_OFFSET + MOD0_FIELD_SIZE * REFERENCE_MOD0.iter().position(|f| *f == name).unwrap()
+    }
+
+    /// The size of one instruction as a byte count.
+    fn insn_size() -> usize {
+        usize::try_from(a64::INSN_SIZE).unwrap()
     }
 
     fn u32_at(file: &[u8], offset: usize) -> u32 {
@@ -411,7 +426,7 @@ mod tests {
                 .unwrap()
                 .1
         );
-        assert_eq!(MOD0_SIZE, REFERENCE_MOD0.len() * 4);
+        assert_eq!(MOD0_SIZE, REFERENCE_MOD0.len() * MOD0_FIELD_SIZE);
     }
 
     #[test]
@@ -423,8 +438,14 @@ mod tests {
         assert_eq!(file.len(), image);
         let at = |name: &str| u32_at(&file, reference_offset(name));
         assert_eq!(at(MOD_OFFSET), u32::try_from(MOD0_OFFSET).unwrap());
-        assert_eq!(&file[reference_offset(MARKER)..][..8], b"HOMEBREW");
-        assert_eq!(&file[reference_offset(MAGIC_FIELD)..][..4], b"NRO0");
+        assert_eq!(
+            &file[reference_offset(MARKER)..][..HOMEBREW_MARKER.len()],
+            &HOMEBREW_MARKER
+        );
+        assert_eq!(
+            &file[reference_offset(MAGIC_FIELD)..][..MAGIC.len()],
+            &MAGIC
+        );
         assert_eq!(at(SIZE), u32::try_from(image).unwrap());
         assert_eq!(at(TEXT_OFFSET), 0);
         assert_eq!(at(TEXT_SIZE), u32::try_from(text).unwrap());
@@ -474,7 +495,7 @@ mod tests {
         // And the code is there, in order.
         let code = [movz(0, 1, 0).unwrap(), brk(0x77).unwrap(), ret()];
         assert_eq!(
-            file[CODE_OFFSET..CODE_OFFSET + 12],
+            file[CODE_OFFSET..CODE_OFFSET + code.len() * insn_size()],
             crate::a64::to_bytes(&code)[..]
         );
     }
@@ -487,7 +508,10 @@ mod tests {
         let dynamic = u32::try_from(DYNAMIC_OFFSET).unwrap();
         let dynamic_end = u32::try_from(DYNAMIC_OFFSET + DYNAMIC_SIZE).unwrap();
         let at = |name: &str| u32_at(&file, mod0_field_offset(name));
-        assert_eq!(&file[mod0_field_offset("magic")..][..4], b"MOD0");
+        assert_eq!(
+            &file[mod0_field_offset("magic")..][..MOD0_MAGIC.len()],
+            &MOD0_MAGIC
+        );
         assert_eq!(at("dynamic_offset"), dynamic - mod0);
         assert_eq!(at("bss_start_offset"), image - mod0);
         assert_eq!(at("bss_end_offset"), image - mod0 + 0x1234);
@@ -526,15 +550,25 @@ mod tests {
         assert_eq!(file[data_at..data_at + 5], pattern(0x20, 5)[..]);
         assert!(file[data_at + 5..].iter().all(|b| *b == 0));
         // The text segment's tail after the code is zero as well.
-        assert!(file[CODE_OFFSET + 12..rodata_at].iter().all(|b| *b == 0));
+        assert!(
+            file[CODE_OFFSET + 3 * insn_size()..rodata_at]
+                .iter()
+                .all(|b| *b == 0)
+        );
     }
 
     #[test]
     fn the_homebrew_marker_is_optional() {
         let file = NroBuilder::new(&[nop()]).homebrew(false).build().unwrap();
-        assert_eq!(file[HOMEBREW_OFFSET..HOMEBREW_OFFSET + 8], [0; 8]);
+        assert_eq!(
+            file[HOMEBREW_OFFSET..HOMEBREW_OFFSET + HOMEBREW_MARKER.len()],
+            [0; HOMEBREW_MARKER.len()]
+        );
         let file = NroBuilder::new(&[nop()]).build().unwrap();
-        assert_eq!(file[HOMEBREW_OFFSET..HOMEBREW_OFFSET + 8], HOMEBREW_MARKER);
+        assert_eq!(
+            file[HOMEBREW_OFFSET..HOMEBREW_OFFSET + HOMEBREW_MARKER.len()],
+            HOMEBREW_MARKER
+        );
     }
 
     #[test]
@@ -550,7 +584,7 @@ mod tests {
 
     #[test]
     fn code_that_fills_the_text_page_exactly_does_not_grow_it() {
-        let words = (PAGE_SIZE - CODE_OFFSET) / 4;
+        let words = (PAGE_SIZE - CODE_OFFSET) / insn_size();
         let file = NroBuilder::new(&vec![nop(); words]).build().unwrap();
         assert_eq!(file.len(), PAGE_SIZE);
         let file = NroBuilder::new(&vec![nop(); words + 1]).build().unwrap();
@@ -641,8 +675,8 @@ mod tests {
             prop_assert_eq!(next, file.len());
             prop_assert_eq!(field(SIZE), file.len());
             let (_, text_size) = segments[0];
-            prop_assert!(text_size >= CODE_OFFSET + code_words * 4);
-            prop_assert_eq!(text_size, (CODE_OFFSET + code_words * 4).next_multiple_of(PAGE_SIZE));
+            prop_assert!(text_size >= CODE_OFFSET + code_words * insn_size());
+            prop_assert_eq!(text_size, (CODE_OFFSET + code_words * insn_size()).next_multiple_of(PAGE_SIZE));
             prop_assert_eq!(segments[1].1, rodata_len.next_multiple_of(PAGE_SIZE));
             prop_assert_eq!(segments[2].1, data_len.next_multiple_of(PAGE_SIZE));
             prop_assert_eq!(&file[segments[1].0..][..rodata_len], &rodata[..]);

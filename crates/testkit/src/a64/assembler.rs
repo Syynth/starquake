@@ -17,7 +17,7 @@ pub struct Label(usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum AsmError {
     /// An operand does not fit its field (a register number, say).
-    #[error("{0}")]
+    #[error(transparent)]
     Encode(#[from] EncodeError),
     /// A branch to a label that was never bound.
     #[error("label {label} is used by the branch at word {at} but never bound")]
@@ -225,7 +225,7 @@ fn word_distance(from: usize, to: usize) -> Result<i64, AsmError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::a64::{COMPARE_BRANCH_IMM_BITS, add_imm, movz, nop, ret, sub_imm};
+    use crate::a64::{COMPARE_BRANCH_IMM_BITS, MAX_REG, add_imm, movz, nop, ret, sub_imm};
 
     /// Expected words come from assembling the same program (the assembly is in the comments)
     /// with `clang -target arm64-apple-macos -c` and reading it back with `llvm-objdump -d`, once.
@@ -342,8 +342,8 @@ mod tests {
         let mut asm = Assembler::new();
         let label = asm.label();
         assert_eq!(
-            asm.cbz(32, label),
-            Err(AsmError::Encode(EncodeError::Register { reg: 32 }))
+            asm.cbz(MAX_REG + 1, label),
+            Err(AsmError::Encode(EncodeError::Register { reg: MAX_REG + 1 }))
         );
         assert!(asm.is_empty());
     }
@@ -382,5 +382,49 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_branch_beyond_the_backward_compare_branch_reach_is_an_error() {
+        // The mirror of the forward test: a `cbz` at word `p` back to word 0 is `p` words
+        // backward, and the lowest encodable distance is -2^(bits - 1) words.
+        let max_back_words = 1usize << (COMPARE_BRANCH_IMM_BITS - 1);
+        for (padding, reachable) in [(max_back_words, true), (max_back_words + 1, false)] {
+            let mut asm = Assembler::new();
+            let start = asm.label();
+            asm.bind(start).unwrap();
+            for _ in 0..padding {
+                asm.emit(add_imm(0, 0, 0).unwrap());
+            }
+            asm.cbz(0, start).unwrap();
+            let result = asm.finish();
+            if reachable {
+                assert_eq!(result.unwrap().len(), padding + 1);
+            } else {
+                let distance = -(i64::try_from(padding).unwrap() * i64::from(INSN_SIZE));
+                let limit = i64::from(INSN_SIZE) << (COMPARE_BRANCH_IMM_BITS - 1);
+                assert_eq!(
+                    result,
+                    Err(AsmError::Unreachable {
+                        at: padding,
+                        label: 0,
+                        source: EncodeError::Offset {
+                            offset: distance,
+                            min: -limit,
+                            max: limit - i64::from(INSN_SIZE),
+                        },
+                    })
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_encode_error_is_reported_once_in_the_error_chain() {
+        use std::error::Error as _;
+        let inner = EncodeError::Register { reg: MAX_REG + 1 };
+        let outer = AsmError::Encode(inner);
+        assert_eq!(outer.to_string(), inner.to_string());
+        assert!(outer.source().is_none());
     }
 }

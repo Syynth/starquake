@@ -276,8 +276,8 @@ mod tests {
 
     /// Furthest branch distances in bytes (lowest, highest) for a field of `bits` word-offset
     /// bits.
-    const fn reach(bits: u32) -> (i64, i64) {
-        (-(1 << (bits + 1)), (1 << (bits + 1)) - 4)
+    fn reach(bits: u32) -> (i64, i64) {
+        (-(1 << (bits + 1)), (1 << (bits + 1)) - i64::from(INSN_SIZE))
     }
 
     /// Every expected word below was produced by `clang -target arm64-apple-macos -c` and read
@@ -546,6 +546,16 @@ mod tests {
         assert_eq!(to_bytes(&[]), Vec::<u8>::new());
     }
 
+    /// The mask of the low `bits` bits.
+    const fn low_mask(bits: u32) -> u32 {
+        (1 << bits) - 1
+    }
+
+    /// The mask of one register field.
+    fn reg_mask() -> u32 {
+        u32::from(MAX_REG)
+    }
+
     /// Sign-extends the low `bits` bits of `value`.
     fn sign_extend(value: u32, bits: u32) -> i64 {
         let shift = 64 - bits;
@@ -571,28 +581,28 @@ mod tests {
         ) {
             let (rd32, rn32, rm32) = (u32::from(rd), u32::from(rn), u32::from(rm));
             for word in [add_imm(rd, rn, imm12).unwrap(), sub_imm(rd, rn, imm12).unwrap()] {
-                prop_assert_eq!(word & 0x1F, rd32);
-                prop_assert_eq!((word >> 5) & 0x1F, rn32);
-                prop_assert_eq!((word >> 10) & 0xFFF, imm12);
+                prop_assert_eq!(word & reg_mask(), rd32);
+                prop_assert_eq!((word >> 5) & reg_mask(), rn32);
+                prop_assert_eq!((word >> 10) & MAX_IMM12, imm12);
             }
             let offset = slot * MEM_OFFSET_ALIGN;
             for word in [ldr(rd, rn, offset).unwrap(), str(rd, rn, offset).unwrap()] {
-                prop_assert_eq!(word & 0x1F, rd32);
-                prop_assert_eq!((word >> 5) & 0x1F, rn32);
-                prop_assert_eq!((word >> 10) & 0xFFF, slot);
+                prop_assert_eq!(word & reg_mask(), rd32);
+                prop_assert_eq!((word >> 5) & reg_mask(), rn32);
+                prop_assert_eq!((word >> 10) & MAX_IMM12, slot);
             }
             for word in [movz(rd, imm16, hw * 16).unwrap(), movk(rd, imm16, hw * 16).unwrap()] {
-                prop_assert_eq!(word & 0x1F, rd32);
-                prop_assert_eq!((word >> 5) & 0xFFFF, imm16);
+                prop_assert_eq!(word & reg_mask(), rd32);
+                prop_assert_eq!((word >> 5) & MAX_IMM16, imm16);
                 prop_assert_eq!((word >> 21) & 0x3, hw);
             }
             let word = mov(rd, rm).unwrap();
-            prop_assert_eq!(word & 0x1F, rd32);
-            prop_assert_eq!((word >> 16) & 0x1F, rm32);
-            prop_assert_eq!((svc(imm16).unwrap() >> 5) & 0xFFFF, imm16);
-            prop_assert_eq!((brk(imm16).unwrap() >> 5) & 0xFFFF, imm16);
+            prop_assert_eq!(word & reg_mask(), rd32);
+            prop_assert_eq!((word >> 16) & reg_mask(), rm32);
+            prop_assert_eq!((svc(imm16).unwrap() >> 5) & MAX_IMM16, imm16);
+            prop_assert_eq!((brk(imm16).unwrap() >> 5) & MAX_IMM16, imm16);
             let word = mrs(rd, SysReg::TpidrEl0).unwrap();
-            prop_assert_eq!(word & 0x1F, rd32);
+            prop_assert_eq!(word & reg_mask(), rd32);
         }
 
         /// Every encodable branch distance decodes back to itself with an independent decoder.
@@ -604,14 +614,14 @@ mod tests {
         ) {
             let insn = i64::from(INSN_SIZE);
             for word in [b(words26 * insn).unwrap(), bl(words26 * insn).unwrap()] {
-                prop_assert_eq!(sign_extend(word & 0x03FF_FFFF, BRANCH_IMM_BITS), words26);
+                prop_assert_eq!(sign_extend(word & low_mask(BRANCH_IMM_BITS), BRANCH_IMM_BITS), words26);
             }
             for word in [cbz(rt, words19 * insn).unwrap(), cbnz(rt, words19 * insn).unwrap()] {
                 prop_assert_eq!(
-                    sign_extend((word >> 5) & 0x7_FFFF, COMPARE_BRANCH_IMM_BITS),
+                    sign_extend((word >> 5) & low_mask(COMPARE_BRANCH_IMM_BITS), COMPARE_BRANCH_IMM_BITS),
                     words19
                 );
-                prop_assert_eq!(word & 0x1F, u32::from(rt));
+                prop_assert_eq!(word & reg_mask(), u32::from(rt));
             }
         }
 
