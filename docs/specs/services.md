@@ -82,15 +82,26 @@ impl SetSys {
 
 ## Concurrency
 
-- Requests on one session are serialised by the kernel's request queue (kernel spec, "IPC"):
-  a second sender waits as a guest thread until the first request has been answered, as on a
-  console. A service method therefore takes `&mut self`, and no core thread ever waits on a host
-  lock for a session.
-- Different sessions run at the same time on different cores. State shared between sessions
-  (settings, the file system, input state) is passed in at construction as `Arc<...>` and must be
-  thread-safe.
-- Methods never block: no sleeping, no blocking I/O, no waiting on another guest thread. Work
-  that takes time goes to a worker and completes a deferred reply.
+A **server** is one service family's state plus the sessions opened on it, as on a console, where
+a system module is one program serving all its sessions.
+
+- **One request at a time per server, by default.** Requests from all of a server's sessions go
+  through one queue (kernel spec, "IPC"), and only one handler of that server runs at any moment.
+  A service's own state therefore needs no thread-safety work, and a method takes `&mut self`.
+  This is what most real system modules do: a single loop over all their sessions.
+- **One request in flight per session.** A session with an unanswered request (including a
+  deferred one) accepts no second request; a second sender on it waits as a guest thread.
+- **A deferred request doesn't hold the server.** Once a handler returns `Deferred`, the server
+  takes the next request from another session, as a real module does.
+- **Opting in to parallelism.** A server known to be multi-threaded on a console (the file
+  system) can declare a number of workers. Its shared state must then be thread-safe, and the
+  declaration is reviewed like an `unsafe` block: with a reason.
+- **Different servers run at the same time** on different cores. State shared *between* servers
+  (settings, the clock) is passed in at construction as `Arc<...>` and must be thread-safe.
+- **Nobody waits on a host lock.** A sender that finds its server busy waits as a guest thread;
+  the core that finishes the running handler starts the next queued request.
+- **Methods never block:** no sleeping, no blocking I/O, no waiting on another guest thread.
+  Work that takes time goes to a worker and completes a deferred reply.
 
 ## The service manager
 
@@ -157,18 +168,37 @@ One service family is one issue:
 | 3 | Deferred replies and the trace sink | 1, kernel sessions | Fake kernel; a completed token wakes the caller; a dropped token errors |
 | 4 | `sm:` with the generic stub session | 1–2 | `GetService` round trip; unknown name under both policies; TIPC |
 | 5 | `set:sys` (firmware version) | 1 | Reply bytes against the documented layout |
+| 6 | `fsp-srv`, a first subset: open a file system, open a file, read, get size, close | 1–3 | Requests with buffers and sub-interfaces, with and without a domain; a read that defers |
 
 Slices 1 and 2 need only the IPC crate and a fake kernel, so they can start as soon as this spec
 is approved.
 
+### The first three services are a trial of the handler style
+
+`sm:`, `set:sys` and the `fsp-srv` subset are written in the style above: a `commands!` table and
+explicit reads and writes. Between them they cover plain payloads, buffers, handles,
+sub-interfaces, domains and a deferred reply. Before a fourth service is ported, judge the
+result:
+
+- How much of each method is unpacking and packing, compared with behaviour?
+- How many layout mistakes (wrong offset, missing padding) did review catch?
+- Could someone check a method against its reference at a glance?
+
+If the methods are long and error-prone, switch to a typed style, where a method's signature
+declares its inputs and outputs and the framework unpacks the message (the direction Eden has
+been migrating in), while only three services need rewriting. Struct-mapped payloads can be
+added alongside explicit reads at any time and don't need this trial.
+
 ## Decisions asked of the owner
 
-1. **A declarative `commands!` macro, no procedural macros.** Recommended: cheap to compile and
-   easy for agents to read and extend.
+1. **A declarative `commands!` macro and hand-written unpacking, as a trial.** The first three
+   services use it; the style is confirmed or replaced by a typed style before a fourth is
+   ported. (Revised after owner review: the first draft fixed the style up front.)
 2. **Explicit readers and writers for payloads** rather than a zero-copy struct crate.
    Recommended while layouts are still being verified; revisit if it becomes repetitive.
 3. **Auto-stub on by default for title bring-up, strict in tests.**
-4. **One request at a time per session, queued by the kernel; shared state is `Arc` and
-   thread-safe.**
+4. **One request at a time per server by default**, as most real system modules behave, with
+   opt-in workers for servers that are multi-threaded on a console. (Revised after owner review:
+   the first draft serialised per session only, which put thread-safety on every service.)
 5. **Milestone 1's homebrew overrides libnx start-up** so the first end-to-end run needs two
    services, not seven.
