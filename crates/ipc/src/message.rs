@@ -15,6 +15,17 @@
 //! is the payload itself, and a reply's payload starts with one result word.
 //!
 //! The parser is zero-copy for raw data and never panics: every offset is checked.
+//!
+//! # Guess: where a domain reply keeps its object ids
+//!
+//! This is a guess, not a protocol fact. The parser takes a domain reply's object ids from the
+//! **end** of the raw data section and treats everything between the `SFCO` header and them as
+//! data. That only holds when the raw size is exact, as [`crate::ReplyBuilder`] writes it. Eden's
+//! `ResponseBuilder` reserves four extra padding words (`ipc_helpers.h`), and libnx's
+//! `cmifParseResponse` instead finds the objects at the `SFCO` header plus the data size it
+//! already knows. On a reply that keeps such a reserve this parser would return the padding as
+//! object ids and truncate the data. Parsing replies from a real guest needs the expected data
+//! size passed in, as libnx does.
 
 use crate::cmif::{
     CMIF_HEADER_BYTES, CmifReplyHeader, CmifRequestHeader, DomainCommand, DomainReplyHeader,
@@ -33,8 +44,11 @@ use crate::hipc::{
 pub enum SessionKind {
     /// An ordinary session: no domain headers.
     Session,
-    /// A domain: requests of type request/request-with-context carry a domain header, and every
-    /// CMIF reply does.
+    /// A domain: requests of type request/request-with-context carry a domain header, and so do
+    /// their replies. Eden writes the reply's domain header only when the request had one
+    /// (`ipc_helpers.h`: `mgr->IsDomain() && ctx.HasDomainMessageHeader()`), so a reply to a
+    /// control or control-with-context request on a domain has none: parse such a reply with
+    /// [`SessionKind::Session`].
     Domain,
 }
 
@@ -56,13 +70,20 @@ pub struct CmifRequest<'a> {
 /// A CMIF reply payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CmifReply<'a> {
-    /// The domain header, present on every reply from a domain.
+    /// The domain header, present on replies to domain request/request-with-context messages
+    /// (parsed with [`SessionKind::Domain`]).
     pub domain: Option<DomainReplyHeader>,
     /// The `SFCO` header.
     pub header: CmifReplyHeader,
     /// The data bytes between the `SFCO` header and the object ids.
+    ///
+    /// Guess: in a domain reply this assumes the raw size is exact (see the module docs). If the
+    /// sender kept padding after the object ids, it is wrongly included here.
     pub data: &'a [u8],
     /// The object ids that trail the data in a domain reply.
+    ///
+    /// Guess: they are taken from the end of the raw data section, which assumes the raw size is
+    /// exact (see the module docs). Padding after them would be returned as ids.
     pub object_ids: Vec<u32>,
 }
 

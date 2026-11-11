@@ -57,6 +57,11 @@ impl ReplyBuilder {
 
     /// A reply on a domain: as [`ReplyBuilder::cmif`], plus the domain reply header and any
     /// object ids added with [`ReplyBuilder::object_id`].
+    ///
+    /// Use this only for replies to request/request-with-context messages that carried a domain
+    /// header. Eden writes the domain reply header only in that case
+    /// (`eden/src/core/hle/service/ipc_helpers.h`: `mgr->IsDomain() && ctx.HasDomainMessageHeader()`),
+    /// so replies to control requests on a domain use [`ReplyBuilder::cmif`].
     pub fn domain(result: u32) -> Self {
         Self::new(Layout::Cmif { domain: true }, result)
     }
