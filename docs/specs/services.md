@@ -82,8 +82,10 @@ impl SetSys {
 
 ## Concurrency
 
-- Requests on one session are serialised: the session object sits behind its own mutex, like a
-  real server session. A service method therefore takes `&mut self`.
+- Requests on one session are serialised by the kernel's request queue (kernel spec, "IPC"):
+  a second sender waits as a guest thread until the first request has been answered, as on a
+  console. A service method therefore takes `&mut self`, and no core thread ever waits on a host
+  lock for a session.
 - Different sessions run at the same time on different cores. State shared between sessions
   (settings, the file system, input state) is passed in at construction as `Arc<...>` and must be
   thread-safe.
@@ -92,13 +94,29 @@ impl SetSys {
 
 ## The service manager
 
-`sm:` is a named port. It maps service names to factories that create a session object:
+`sm:` is a named port. It maps service names to servers. Today a server is always a factory
+that creates a Rust session object; the registry is written so that a guest process registering
+a service (deferred, see the kernel spec) is one more kind of entry, and a title can't tell the
+difference:
 
 - `Initialize`, `GetService` (returns a moved session handle), and the TIPC forms of both.
 - A name with no factory is logged. Under auto-stub it gets a generic session that stubs every
   command, so a title's service list can be discovered in one run; under strict it is an error.
 - Access control from the NPDM (which names the title may open) is logged at first, like
   kernel capabilities.
+
+## Real system modules and guest-hosted services
+
+Deferred, not excluded (decision log, 2026-11-11). What this framework does so they stay additive:
+
+- A service is reached only through its session's server end. Replacing a Rust service with a
+  real module, or the other way round, is a change in the service manager's registry, not in any
+  caller.
+- Services talk to each other through the same registry and sessions a title uses, never by
+  calling each other's Rust types directly, so a Rust service can depend on one that is later
+  provided by a real module.
+- Auto-stubbing and tracing sit at the session boundary, so they work the same for either kind
+  of server.
 
 ## Milestone 1 services
 
@@ -150,6 +168,7 @@ is approved.
 2. **Explicit readers and writers for payloads** rather than a zero-copy struct crate.
    Recommended while layouts are still being verified; revisit if it becomes repetitive.
 3. **Auto-stub on by default for title bring-up, strict in tests.**
-4. **One mutex per session; shared state is `Arc` and thread-safe.**
+4. **One request at a time per session, queued by the kernel; shared state is `Arc` and
+   thread-safe.**
 5. **Milestone 1's homebrew overrides libnx start-up** so the first end-to-end run needs two
    services, not seven.
