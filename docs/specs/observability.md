@@ -1,7 +1,7 @@
 # Observability, recording and replay
 
-Status: **proposal, awaiting owner review** (issue #46). Builds on the execution model and the
-kernel spec, both also proposals, and adds requirements to each.
+Status: **approved by the owner, 2026-11-11** (issue #46). Builds on the execution model and the
+kernel spec, and adds requirements to each.
 
 Most debugging on this project will be done by agents working from files, often on machines with
 no hypervisor, no GPU and no games. This spec decides what starquake records while it runs, what
@@ -184,7 +184,10 @@ Written as data first and text second:
 6. Snapshots: kernel and memory first, services as they are written.
 7. The interpreter backend (#47), in parallel from step 1.
 
-## Decisions asked of the owner
+## Decisions
+
+Approved by the owner on 2026-11-11 as written. Where a decision names a recommendation, the
+recommendation stands.
 
 1. **One event stream with an always-on flight recorder**, and no ad hoc logging at boundaries.
 2. **All nondeterminism through an injectable environment**, enforced by lint, so the kernel and
