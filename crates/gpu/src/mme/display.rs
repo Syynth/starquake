@@ -8,7 +8,7 @@
 
 use std::fmt::{self, Display, Formatter};
 
-use super::inst::{AluOp, Instruction, OutOp, Pred, Reg};
+use super::inst::{AluOp, Instruction, OutOp, Pred, Reg, branch_offset, is_exit_offset};
 
 impl Display for Pred {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
@@ -126,11 +126,10 @@ fn alu_line(inst: &Instruction, slot: usize) -> Option<String> {
         AluOp::Dwrite => format!("DWRITE {a} {b}"),
         AluOp::Mulh | AluOp::Extended if alu.src == [Reg::Zero; 2] => alu.op.name().to_owned(),
         AluOp::Blt | AluOp::Bltu | AluOp::Ble | AluOp::Bleu | AluOp::Beq => {
-            let raw = imm & 0x1fff;
-            let target = if raw == 0x1000 {
+            let target = if is_exit_offset(imm) {
                 "exit".to_owned()
             } else {
-                format!("{}", (raw << 3).cast_signed() >> 3)
+                branch_offset(imm).to_string()
             };
             format!("{} {a} {b} ({target}, {})", alu.op, imm & 0x8000 != 0)
         }

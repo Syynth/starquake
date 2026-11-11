@@ -18,11 +18,11 @@ use super::testing::{
 use super::{
     Alu, AluOp, DATA_RAM_WORDS, DataRam, DecodeError, EncodeError, GPR_COUNT, INSTRUCTION_WORDS,
     Instruction, LOAD_BARRIER, METHOD_MASK, MacroError, Out, OutOp, Pred, Reg, StepLimit,
-    decode_program, encode_program, run,
+    decode_program, encode_program, inst, run,
 };
 
-/// The branch offset that ends the macro (the low 13 bits of the immediate are 0x1000).
-const EXIT_OFFSET: i16 = 0x1000;
+/// The branch offset that ends the macro, as the signed offset the `branch` helper takes.
+const EXIT_OFFSET: i16 = inst::EXIT_OFFSET.cast_signed();
 
 fn lo(value: u64) -> u32 {
     u32::try_from(value & 0xffff_ffff).unwrap()
@@ -171,6 +171,32 @@ fn state_reads_mask_the_method_index_to_fourteen_bits() {
         &[0x4000, 5],
     );
     assert_eq!(host.state_reads, [5]);
+}
+
+#[test]
+fn both_alu_slots_may_be_state() {
+    // Mesa's `mme_tu104_sim_core` asserts that ALU slots 0 and 1 are not both STATE ("No idea why
+    // the HW has this rule but it does"); Eden-NX2 allows it, and so does this interpreter (see
+    // the module docs of `interp`). Pin the permissive behaviour: both reads happen, in order.
+    let pair = inst01(
+        alu(AluOp::State, r(0), Reg::Imm, Reg::Zero),
+        alu(AluOp::State, r(1), Reg::Imm, Reg::Zero),
+    );
+    let (_, host) = go(vec![with_imm(pair, 3, 9), store(0, 0)], &[]);
+    assert_eq!(host.state_reads, [3, 9]);
+}
+
+#[test]
+fn branch_offsets_sign_extend_thirteen_bits_and_exit_is_distinct() {
+    assert_eq!(inst::branch_offset(0), 0);
+    assert_eq!(inst::branch_offset(5), 5);
+    assert_eq!(inst::branch_offset(0x1fff), -1);
+    assert_eq!(inst::branch_offset(0x1ffe), -2);
+    // Bits 14 and 15 are not part of the offset.
+    assert_eq!(inst::branch_offset(0xe003), 3);
+    assert!(inst::is_exit_offset(inst::EXIT_OFFSET));
+    assert!(inst::is_exit_offset(0x8000 | inst::EXIT_OFFSET));
+    assert!(!inst::is_exit_offset(inst::EXIT_OFFSET + 1));
 }
 
 #[test]
@@ -1510,12 +1536,13 @@ fn runnable_instruction() -> impl Strategy<Value = Instruction> {
 }
 
 /// Everything a run leaves behind, for comparing two runs.
-fn outcome(
-    program: &[Instruction],
-    params: &[u32],
-    limit: u32,
-) -> (Result<(), MacroError>, Host, DataRam) {
-    let mut host = Host::with_params(params);
+/// Runs `program` against an endless load FIFO, so that parameter underflow never ends the run
+/// early and the step limit is what stops a program that loops.
+fn outcome(program: &[Instruction], limit: u32) -> (Result<(), MacroError>, Host, DataRam) {
+    let mut host = Host {
+        endless: true,
+        ..Host::default()
+    };
     let mut ram = DataRam::new();
     let result = run(program, &mut ram, &mut host, StepLimit::new(limit));
     (result, host, ram)
@@ -1546,17 +1573,17 @@ proptest! {
     #[test]
     fn arbitrary_words_never_panic_and_stop_within_the_limit(
         words in prop::collection::vec(any::<u32>(), 0..96),
-        params in prop::collection::vec(any::<u32>(), 0..16),
     ) {
         let words = &words[..words.len() / INSTRUCTION_WORDS * INSTRUCTION_WORDS];
         let program = decode_program(words).unwrap();
         let limit = 200;
-        let (result, host, ram) = outcome(&program, &params, limit);
-        // Each step loads at most two parameters, so this bounds the steps that ran.
+        let (result, host, ram) = outcome(&program, limit);
+        // The FIFO never runs dry and each step loads at most two parameters, so this bounds the
+        // steps that ran.
         prop_assert!(host.loads <= 2 * limit);
         prop_assert_eq!(ram.as_slice().len(), DATA_RAM_WORDS);
         // Same program, same inputs, same outcome.
-        let (again, host_again, ram_again) = outcome(&program, &params, limit);
+        let (again, host_again, ram_again) = outcome(&program, limit);
         prop_assert_eq!(result, again);
         prop_assert_eq!(host.calls, host_again.calls);
         prop_assert_eq!(ram, ram_again);

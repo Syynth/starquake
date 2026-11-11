@@ -19,6 +19,23 @@ pub const INSTRUCTION_WORDS: usize = 3;
 /// Number of general registers, `R0` to `R23` (`mme_tu104.h`, `enum mme_tu104_reg`).
 pub const GPR_COUNT: u8 = 24;
 
+/// Branch immediate (low 13 bits) that means "stop the macro" instead of a jump
+/// (`mme_tu104_sim.c`: `(uint16_t)offset == 0xf000`; `mme_tu104_exit_if` adds `0x1000`).
+pub const EXIT_OFFSET: u16 = 0x1000;
+
+/// The signed instruction offset of a conditional branch: the low 13 bits of its immediate,
+/// sign-extended (`mme_tu104_sim.c`). Bit 15 (which outcome branches) and bit 14 (ignored) are
+/// not part of the offset. The [`EXIT_OFFSET`] marker is not a real offset; callers check
+/// [`is_exit_offset`] first.
+pub const fn branch_offset(imm: u16) -> i16 {
+    ((imm & 0x1fff) << 3).cast_signed() >> 3
+}
+
+/// Whether the branch immediate `imm` carries the [`EXIT_OFFSET`] marker in its low 13 bits.
+pub const fn is_exit_offset(imm: u16) -> bool {
+    imm & 0x1fff == EXIT_OFFSET
+}
+
 /// Predicate mode: one letter per lane (ALU 0, ALU 1, output 0, output 1).
 ///
 /// A `T` lane is disabled when the predicate register is non-zero, an `F` lane is disabled when it

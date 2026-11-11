@@ -3,7 +3,7 @@
 //! Ported from `mesa-nouveau/src/nouveau/mme/mme_tu104_sim.c` and `mme_sim.h` @ 52238762 (MIT,
 //! Copyright 2022 Collabora Ltd.), cross-checked against `eden-nx2/src/video_core/macro_turing.h`
 //! @ 50fa86bb (GPL-3.0-or-later). Where the two disagree this follows Mesa, which was checked
-//! against hardware:
+//! against hardware, except where noted:
 //!
 //! - `LOOP` with a count of zero runs the body once (`MAX2(1, x) - 1` extra passes); Eden-NX2
 //!   skips the body, citing macros the native SDK emits around FIFO reads. Mesa's hardware tests
@@ -16,13 +16,32 @@
 //!   cancels a pending end".
 //! - `STATE` masks the method index to 14 bits (`(uint16_t)(x + y) * 4` stored in a 16-bit
 //!   method address); Eden-NX2 masks to 16 bits.
+//! - One exception, where this follows Eden-NX2: Mesa asserts that ALU slots 0 and 1 are not both
+//!   `STATE` (`mme_tu104_sim_core`: "No idea why the HW has this rule but it does"), which makes
+//!   it a hardware rule. Eden-NX2 allows it and so does this interpreter: both slots read state,
+//!   in slot order, and nothing is reported (pinned by `both_alu_slots_may_be_state`).
 //!
-//! Guest programs are untrusted: every failure Mesa asserts on is an [`MacroError`] here, and a
-//! [`StepLimit`] bounds the number of instructions executed.
+//! Guest programs are untrusted, and a [`StepLimit`] bounds the number of instructions executed.
+//! Mesa's asserts on malformed programs become [`MacroError`]s where running on past them would
+//! be unsound or meaningless: a register or output selector that does not exist, a load past the
+//! end of the FIFO, a branch or program counter outside the program, a data RAM index past the
+//! end, a `MERGE` destination of 32 or more, a `LOOP` shorter than two instructions or nested
+//! inside a loop, and an `EXTENDED` operation other than the load barrier. Several other Mesa
+//! asserts are deliberately not enforced, because Eden-NX2 does not trip on them and the
+//! interpreter has a defined result for each:
+//!
+//! - bit 15 of a `JAL` immediate (ignored);
+//! - `ADDC` and `SUBB` slot placement and pairing with the instruction that sets the carry;
+//! - `MULH` with non-zero sources (the sources are ignored);
+//! - destination and source constraints on `LOOP`, `JAL`, the branches and `DWRITE`;
+//! - `DREAD` with a second source other than `ZERO`;
+//! - `EXTENDED` with `y != 1` (see [`LOAD_BARRIER`]);
+//! - `LOAD1` read without `LOAD0` (Eden-NX2 consumes one parameter and fills both; pinned by
+//!   the `load1_alone_consumes_one_parameter_and_both_load_in_order` test).
 
 use thiserror::Error;
 
-use super::inst::{AluOp, GPR_COUNT, Instruction, OutOp, Pred, Reg};
+use super::inst::{AluOp, GPR_COUNT, Instruction, OutOp, Pred, Reg, branch_offset, is_exit_offset};
 
 /// Words of macro data RAM (`MME_TU104_DRAM_COUNT` in `mme_tu104.h`).
 pub const DATA_RAM_WORDS: usize = 0xc00;
@@ -31,10 +50,6 @@ pub const DATA_RAM_WORDS: usize = 0xc00;
 /// `mme_tu104_builder.c`; `eval_extended` in `mme_tu104_sim.c`). Mesa also passes `y == 1`;
 /// Eden-NX2 ignores `y`, and so does this.
 pub const LOAD_BARRIER: u32 = 0x1000;
-
-/// Branch immediate (low 13 bits) that means "stop the macro" instead of a jump
-/// (`mme_tu104_sim.c`: `(uint16_t)offset == 0xf000`; `mme_tu104_exit_if` adds `0x1000`).
-const EXIT_OFFSET: u16 = 0x1000;
 
 /// Method indices are dwords (byte address / 4) and wrap at 14 bits, because Mesa keeps the
 /// byte address in 16 bits.
@@ -444,12 +459,10 @@ impl<H: MacroHost> Machine<'_, H> {
                 // Bit 15 says which outcome of the comparison takes the branch; the low 13 bits
                 // are a signed offset.
                 if compare(alu.op, x, y) == (imm & 0x8000 != 0) {
-                    let raw = imm & 0x1fff;
-                    if raw == EXIT_OFFSET {
+                    if is_exit_offset(imm) {
                         self.stop = true;
                     } else {
-                        let offset = (raw << 3).cast_signed() >> 3;
-                        self.branch_to(i32::from(offset))?;
+                        self.branch_to(i32::from(branch_offset(imm)))?;
                     }
                 }
             }
