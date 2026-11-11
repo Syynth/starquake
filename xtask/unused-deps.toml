@@ -1,0 +1,90 @@
+# Dependencies that are declared but not used yet, because the crate is a scaffold and the task
+# that uses them has not landed. `cargo xtask ci` runs `cargo machete` and compares its findings
+# with this list in both directions (see xtask/src/unused_deps.rs):
+#
+#   - a finding that is not listed here fails the gate: remove the dependency, or list it with
+#     the reason it is declared early;
+#   - an entry here that `cargo machete` no longer reports fails the gate too: the dependency is
+#     now used (or gone), so delete the entry in the same change.
+#
+# `[[allow_workspace]]` is the same for the root Cargo.toml's `[workspace.dependencies]`: a registry
+# dependency declared there that no member inherits (`name.workspace = true`).
+#
+# `package` is the package name as `cargo machete` prints it, which is also the name in the
+# crate's own Cargo.toml. Each entry has a non-blank `reason`; an entry names the planned task or
+# the document row that says why the dependency is wanted.
+
+[[allow]]
+package = "starquake"
+dependencies = ["starquake-core"]
+reason = "frontends depend only on core (docs/architecture.md, 'Crates and dependency direction'); the binary calls it once core exposes the system object"
+
+[[allow]]
+package = "starquake-core"
+dependencies = [
+    "starquake-cpu",
+    "starquake-gpu",
+    "starquake-gsv",
+    "starquake-ipc",
+    "starquake-kernel",
+    "starquake-loader",
+    "starquake-memory",
+    "starquake-render",
+    "starquake-services",
+    "starquake-shader",
+]
+reason = "core wires the whole stack (docs/architecture.md, 'Crates and dependency direction'); its system object is the end-to-end skeleton of milestone 1 (docs/roadmap.md) and does not exist yet"
+
+[[allow]]
+package = "starquake-core"
+dependencies = ["thiserror"]
+reason = "the system object's error type arrives with the skeleton run that wires the stack"
+
+[[allow]]
+package = "starquake-gpu"
+dependencies = ["starquake-memory", "starquake-render", "starquake-shader"]
+reason = "gpu depends on memory, shader and render (docs/architecture.md, 'Crates and dependency direction'); the front reads pushbuffers from guest memory and the back records into the render backend, neither of which is written yet (only the macro interpreter is)"
+
+[[allow]]
+package = "starquake-gpu"
+dependencies = ["tracing"]
+reason = "engine and front/back logging arrives with the command processor; only the macro interpreter exists"
+
+[[allow]]
+package = "starquake-gsv"
+dependencies = ["starquake-gpu", "starquake-ipc", "starquake-kernel", "starquake-services"]
+reason = "the graphics service layer sits on services and gpu (docs/architecture.md); the crate is a scaffold with no code yet"
+
+[[allow]]
+package = "starquake-gsv"
+dependencies = ["thiserror", "tracing"]
+reason = "error type and logging arrive with the crate's first handler"
+
+[[allow]]
+package = "starquake-kernel"
+dependencies = ["starquake-ipc"]
+reason = "sessions and SendSyncRequest parse requests with starquake-ipc (docs/specs/kernel.md, slice 9); the kernel slices before it do not touch IPC"
+
+[[allow]]
+package = "starquake-loader"
+dependencies = ["starquake-memory"]
+reason = "loaders will map segments into guest memory (docs/architecture.md: loader to memory); today every format parser works on byte slices"
+
+[[allow]]
+package = "starquake-render"
+dependencies = ["thiserror"]
+reason = "scaffold crate with no code; its error type arrives with the first fallible render call"
+
+[[allow]]
+package = "starquake-services"
+dependencies = ["starquake-ipc", "starquake-kernel", "thiserror", "tracing"]
+reason = "the service framework builds on the kernel's sessions and the IPC codec (docs/specs/services.md); the crate is a scaffold with no code yet"
+
+[[allow]]
+package = "starquake-shader"
+dependencies = ["thiserror"]
+reason = "scaffold crate with no code; its error type arrives with the first translator pass"
+
+[[allow_workspace]]
+dependencies = ["insta"]
+reason = "snapshot tests for traces and decoded structures (docs/specs/testing.md, 'insta snapshots for traces'); the first crate to snapshot adds `insta.workspace = true` and deletes this entry"
