@@ -530,7 +530,15 @@ fn receive_list_follows_the_descriptor_count_unless_set() {
     };
     let base = || RequestBuilder::cmif(CommandType::Request, 1);
     assert_eq!(lists(base()), ReceiveList::Disabled);
-    assert_eq!(lists(base().receive_descriptor(c)), ReceiveList::One);
+    // libnx writes flag `2 + n` for `n` explicit C descriptors, so one descriptor is flag 3
+    // (`libnx/nx/include/switch/sf/hipc.h`, `hipcMakeRequest`, `recv_static_mode`).
+    assert_eq!(lists(base().receive_descriptor(c)), ReceiveList::Many(1));
+    // Flag 2 (`ReceiveList::One`) is libnx's `HIPC_AUTO_RECV_STATIC`; only an explicit setting
+    // produces it.
+    assert_eq!(
+        lists(base().receive_list(ReceiveList::One).receive_descriptor(c)),
+        ReceiveList::One
+    );
     assert_eq!(
         lists(base().receive_descriptor(c).receive_descriptor(c)),
         ReceiveList::Many(2)

@@ -4,11 +4,15 @@
 //! `eden/src/core/hle/service/hle_ipc.cpp` (`ParseCommandBuffer`) and
 //! `eden/src/core/hle/service/ipc_helpers.h` (`ResponseBuilder`), GPL-3.0-or-later.
 //!
-//! Guesses, because Eden treats these words as padding or never reads them: the name `token` for
-//! the fourth word of the `SFCI`/`SFCO` headers and of the domain request header (the issue
-//! brief names them so), and that the domain request `size` counts the `SFCI` header plus the
-//! arguments (Eden never reads `size`; this is the only reading under which the trailing object
-//! ids can be located).
+//! Field names and layout were checked against libnx (`libnx/nx/include/switch/sf/cmif.h`,
+//! `CmifInHeader`, `CmifOutHeader`, `CmifDomainInHeader`, `CmifDomainOutHeader`; ISC): the fourth
+//! word of the `SFCI`/`SFCO` headers and of the domain request header is called `token` there,
+//! and the third word of the domain request header and the last three of the domain reply header
+//! are padding. Eden never reads these words.
+//!
+//! The domain request `size` field is the `SFCI` header plus the arguments. Eden never reads it;
+//! libnx writes the exact argument length and places the object ids straight after it, and
+//! [`DomainRequestHeader::size`] documents how [`crate::RequestBuilder`] differs.
 
 use crate::error::{IpcError, Result};
 
@@ -22,12 +26,20 @@ pub const CMIF_HEADER_BYTES: usize = 16;
 /// Size in bytes of a domain message header, request or reply
 /// (`eden/src/core/hle/ipc.h`, `static_assert(sizeof(DomainMessageHeader) == 16)`).
 pub const DOMAIN_HEADER_BYTES: usize = 16;
+/// Bit position of the input object count in the first domain request header word.
+const DOMAIN_COUNT_SHIFT: u32 = 8;
+/// Bit position of the size in the first domain request header word.
+const DOMAIN_SIZE_SHIFT: u32 = 16;
+/// Mask of the 8-bit command at the bottom of the first domain request header word.
+const DOMAIN_COMMAND_MASK: u32 = (1 << DOMAIN_COUNT_SHIFT) - 1;
 /// Largest number of input object ids in a domain request: the count is bits 8..16 of the first
-/// domain header word (`eden/src/core/hle/ipc.h`, `DomainMessageHeader`).
-pub const MAX_DOMAIN_INPUT_OBJECTS: u32 = 0xFF;
+/// domain header word (`eden/src/core/hle/ipc.h`, `DomainMessageHeader`; `num_in_objects` is a
+/// `u8` in `libnx/nx/include/switch/sf/cmif.h`, `CmifDomainInHeader`).
+pub const MAX_DOMAIN_INPUT_OBJECTS: u32 = (1 << (DOMAIN_SIZE_SHIFT - DOMAIN_COUNT_SHIFT)) - 1;
 /// Largest value of a domain request's `size` field: bits 16..32 of the first domain header word
-/// (`eden/src/core/hle/ipc.h`, `DomainMessageHeader`).
-pub const MAX_DOMAIN_SIZE: u32 = 0xFFFF;
+/// (`eden/src/core/hle/ipc.h`, `DomainMessageHeader`; `data_size` is a `u16` in libnx's
+/// `CmifDomainInHeader`).
+pub const MAX_DOMAIN_SIZE: u32 = u32::MAX >> DOMAIN_SIZE_SHIFT;
 
 /// What a domain request asks of an object
 /// (`eden/src/core/hle/ipc.h`, `DomainMessageHeader::CommandType`).
@@ -70,7 +82,8 @@ pub struct DomainRequestHeader {
     pub command: DomainCommand,
     /// How many object ids follow the arguments.
     pub input_object_count: u32,
-    /// Bytes of `SFCI` header plus arguments that follow this header (see the module guesses).
+    /// Bytes of `SFCI` header plus arguments that follow this header. libnx writes the exact
+    /// argument length; [`crate::RequestBuilder`] rounds it up to a whole word.
     pub size: u32,
     /// The target object.
     pub object_id: u32,
@@ -83,9 +96,9 @@ impl DomainRequestHeader {
     pub fn decode(words: [u32; 4]) -> Result<Self> {
         let [w0, object_id, _padding, token] = words;
         Ok(Self {
-            command: DomainCommand::from_raw(w0 & 0xFF)?,
-            input_object_count: (w0 >> 8) & 0xFF,
-            size: w0 >> 16,
+            command: DomainCommand::from_raw(w0 & DOMAIN_COMMAND_MASK)?,
+            input_object_count: (w0 >> DOMAIN_COUNT_SHIFT) & MAX_DOMAIN_INPUT_OBJECTS,
+            size: w0 >> DOMAIN_SIZE_SHIFT,
             object_id,
             token,
         })
@@ -105,7 +118,9 @@ impl DomainRequestHeader {
                 value: u64::from(self.size),
             });
         }
-        let w0 = self.command.to_raw() | self.input_object_count << 8 | self.size << 16;
+        let w0 = self.command.to_raw()
+            | self.input_object_count << DOMAIN_COUNT_SHIFT
+            | self.size << DOMAIN_SIZE_SHIFT;
         Ok([w0, self.object_id, 0, self.token])
     }
 }
@@ -215,6 +230,55 @@ mod tests {
     fn magics_spell_their_names_in_memory_order() {
         assert_eq!(SFCI_MAGIC.to_le_bytes(), *b"SFCI");
         assert_eq!(SFCO_MAGIC.to_le_bytes(), *b"SFCO");
+    }
+
+    fn domain_header(input_object_count: u32, size: u32) -> DomainRequestHeader {
+        DomainRequestHeader {
+            command: DomainCommand::SendMessage,
+            input_object_count,
+            size,
+            object_id: 0x0BAD_0001,
+            token: 0xC0DE_0002,
+        }
+    }
+
+    /// Both limits are inclusive: a header at exactly `MAX_DOMAIN_INPUT_OBJECTS` objects and one at
+    /// exactly `MAX_DOMAIN_SIZE` bytes encode and decode back unchanged, in separate headers so
+    /// neither field masks the other.
+    #[test]
+    fn domain_request_header_accepts_exactly_the_limits() {
+        for header in [
+            domain_header(MAX_DOMAIN_INPUT_OBJECTS, 1),
+            domain_header(1, MAX_DOMAIN_SIZE),
+            domain_header(MAX_DOMAIN_INPUT_OBJECTS, MAX_DOMAIN_SIZE),
+        ] {
+            let words = header.encode();
+            assert!(words.is_ok(), "{header:?}: {words:?}");
+            assert_eq!(
+                words.and_then(DomainRequestHeader::decode),
+                Ok(header),
+                "{header:?}"
+            );
+        }
+    }
+
+    /// One past either limit is a `FieldOutOfRange` naming the field and the value.
+    #[test]
+    fn domain_request_header_rejects_one_past_the_limits() {
+        assert_eq!(
+            domain_header(MAX_DOMAIN_INPUT_OBJECTS + 1, 1).encode(),
+            Err(IpcError::FieldOutOfRange {
+                field: "domain input object count",
+                value: u64::from(MAX_DOMAIN_INPUT_OBJECTS) + 1,
+            })
+        );
+        assert_eq!(
+            domain_header(1, MAX_DOMAIN_SIZE + 1).encode(),
+            Err(IpcError::FieldOutOfRange {
+                field: "domain message size",
+                value: u64::from(MAX_DOMAIN_SIZE) + 1,
+            })
+        );
     }
 
     #[test]
