@@ -80,6 +80,10 @@ Platform-specific code must still compile (or be `cfg`-gated) on Linux; check wi
   why it's needed in the PR. Prefer pure-Rust crates; no C/C++ build steps in the default build.
 - Every public item gets a doc comment. `//!` docs at the top of each module say what it owns.
 - Modules are `foo.rs` + `foo/`, not `foo/mod.rs`.
+- When two crates share a unit or convention (ticks or nanoseconds, who converts), give the value
+  a distinct newtype or name the conversion's owner in one place.
+- Never derive deserialisation on a validated newtype; deserialise through the validating
+  constructor and test that an out-of-range value is an error.
 - Don't duplicate logic across sibling modules; extract one `pub(crate)` helper and call it from
   both.
 
@@ -93,6 +97,11 @@ Platform-specific code must still compile (or be `cfg`-gated) on Linux; check wi
   the shipping bound, with boundary cases exactly at the limit.
 - A parser or decoder that reads several ordered fields or lists gets a generated
   build-then-parse round-trip test that fails if any two reads are swapped.
+- Pin every serialised or on-disk layout with a golden-bytes test that covers every variant with
+  distinct non-zero values; changing the layout means bumping its version. Decode and check a
+  header's magic and version before the body.
+- A test invariant mirrors the reference's exact condition; no escape clause that switches the
+  assertion off in common generated cases.
 - Negative tests assert the exact error (variant, exit code, message), so a missing or broken
   implementation can't pass them.
 - Never hide a flaky test behind retries: reproduce it under plain `cargo test` as well as

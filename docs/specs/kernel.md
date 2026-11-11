@@ -71,7 +71,7 @@ locks for each memory map and handle table.
 ```rust
 fn set_heap_size(mem: &mut AddressSpace, size: u64) -> SvcResult<u64>;
 fn signal_event(sched: &mut Scheduler, handles: &HandleTable, handle: Handle) -> SvcResult<()>;
-fn get_system_tick(env: &dyn Env) -> u64;                       // no table at all
+fn get_system_tick(env: &dyn Env) -> SvcResult<u64>;            // no table at all
 ```
 
 The **dispatcher** is the only code that locks. It acquires what the signature asks for, in one
@@ -205,6 +205,19 @@ the trace and returns Horizon's "not implemented" result; it never panics.
 
 NPDM capabilities (allowed system calls, core mask, priority range) are checked and **logged**
 when violated at first, then enforced once milestone 2 titles boot.
+
+### Guest time
+
+The kernel owns guest ticks. The environment returns host nanoseconds (a distinct type), and the
+kernel converts them with the process's counter frequency: 31.25 MHz for a Switch 2 process,
+19.2 MHz for a Switch 1 process. `core` hands the same host and guest frequencies to the loader's
+counter patcher, and a test checks that a tick read through a patched instruction and one read
+through `GetSystemTick` agree. A replay whose recorded clock runs out or disagrees stops the run
+with a replay error; a guest never sees that as a result code. (Added by the lead under
+delegation, 2026-11-11, after wave 3 found that no crate owned the conversion.)
+
+The system-call table has four statuses: implemented, planned (its slice hasn't landed),
+deferred and not planned.
 
 ### Switch 2 specifics
 

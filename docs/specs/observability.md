@@ -44,7 +44,9 @@ enum EventKind {
   - the flight recorder (below), always on;
   - a full binary log, when recording for replay;
   - the golden-trace text format from the test strategy, which is a per-thread view of this
-    stream with timing removed.
+    stream with timing removed. It holds system calls, IPC requests, guest log lines and
+    lifecycle events; wake, map, fault and schedule events are left out because they depend on
+    timing. (Settled by the lead under delegation, 2026-11-11.)
 - **Budget:** well under 100 ns per event with only the flight recorder attached. A title makes
   about 1,400 system calls a frame, so this is noise.
 - **GPU register writes are not events.** At several million a second they go to the GPU's own
