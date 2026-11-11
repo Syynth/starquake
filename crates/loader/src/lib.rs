@@ -10,3 +10,5 @@ pub mod npdm;
 pub mod nro;
 pub mod nso;
 pub mod patch;
+pub mod pfs0;
+pub mod romfs;
