@@ -5,9 +5,13 @@ agents, so the repo is built to make changes checkable.
 
 ## Before you say a change is done
 
-Run `cargo xtask ci` (or `just ci`): fmt check, clippy with `-D warnings` and the workspace lint
-set, nextest, doctests. CI runs exactly this. Platform-specific code must still compile (or be
-`cfg`-gated) on Linux; check with
+Run `cargo xtask ci` (or `just ci`): fmt check, `cargo deny check` (licences, sources, advisories;
+`deny.toml`), clippy with `-D warnings` and the workspace lint set, nextest, doctests. CI runs
+exactly this. The deny step is skipped locally, with a notice, when `cargo-deny` isn't installed
+(`cargo install cargo-deny --locked`); under CI a missing `cargo-deny` fails the gate. It fetches
+the advisory database, so it needs network access.
+
+Platform-specific code must still compile (or be `cfg`-gated) on Linux; check with
 `cargo clippy --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings`.
 
 ## Where things are
@@ -68,7 +72,9 @@ set, nextest, doctests. CI runs exactly this. Platform-specific code must still 
 ## Git and GitHub
 
 - Conventional Commits (`feat(ipc): ...`, `fix(loader): ...`, `docs: ...`, `chore: ...`).
-  Commit at every green checkpoint; one logical change per commit.
+  Commit at every green checkpoint; one logical change per commit. Run `just setup` once per clone:
+  it points `core.hooksPath` at `.githooks`, whose `commit-msg` hook rejects non-conventional subjects. CI
+  applies the same check to PR titles.
 - One issue → one branch → one PR, with an honest `Closes #N`. Findings become issues; design
   questions become `needs-design` issues.
 - Implementation PRs may merge on a green gate and review. Design and spec PRs wait for the owner.

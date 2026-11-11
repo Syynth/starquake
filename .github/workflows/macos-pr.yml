@@ -1,0 +1,51 @@
+name: macos-pr
+
+# The hypervisor backend (crates/cpu/src/hvf) is compiled out on Linux, and the full macOS job in
+# ci.yml runs on main only, so nothing else compiles or lints it before a PR merges. This job
+# fills that gap, and only for the paths that can break it (the cpu crate, the crates/memory
+# crate it imports, the hypervisor tools and the workspace-wide configuration): hosted macOS
+# minutes cost 10x the Linux rate. It runs fmt, clippy and a build, not tests: hosted runners
+# can't create VMs, so the hypervisor tests would skip anyway (see CLAUDE.md). The workflow file
+# itself is in the filter so a change to it is exercised.
+on:
+  pull_request:
+    paths:
+      - "crates/cpu/**"
+      # starquake-cpu's hvf backend imports Fault and GuestMemory from here.
+      - "crates/memory/**"
+      - "tools/hvprobe/**"
+      - "tools/macos-runner.sh"
+      - ".cargo/**"
+      # Workspace lints and dependency versions, the resolved lockfile, the pinned compiler and
+      # the clippy config all change what clippy or the build accepts.
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "clippy.toml"
+      - ".github/workflows/macos-pr.yml"
+
+permissions: {}
+
+concurrency:
+  group: macos-pr-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      # rust-toolchain.toml pins the compiler; rustup installs it on first use.
+      - run: cargo fmt --all --check
+      # Only the two packages that use the hypervisor, with their dependencies.
+      - run: cargo clippy -p starquake-cpu -p hvprobe --all-targets --locked -- -D warnings
+      - run: cargo build -p starquake-cpu -p hvprobe --all-targets --locked
