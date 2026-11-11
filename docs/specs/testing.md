@@ -1,6 +1,6 @@
 # Test strategy
 
-Status: **proposal, awaiting owner review** (issue #8).
+Status: **approved by the owner, 2026-11-11** (issue #8).
 
 Most of starquake is written by agents and merged on a green gate, so the tests are the real
 specification. This spec says how each layer is tested without the rest of the emulator, and
@@ -83,7 +83,7 @@ rejection. Snapshots are kept small (homebrew programs, not long runs) so their 
 readable.
 
 The trace is one view of the event stream defined in the observability spec
-(`observability.md`, also a proposal), which also covers replaying the kernel and services from a
+(`observability.md`), which also covers replaying the kernel and services from a
 recorded log, snapshots, and the deterministic interpreter backend that lets tier 3 run in CI.
 
 The same format is what auto-stubbed (unimplemented) calls are logged in, so a trace from a real
@@ -113,7 +113,10 @@ backend is caught locally or not at all. A self-hosted CI runner on a Mac would 
 at the cost of keeping a machine available. The deterministic interpreter backend (#47) covers
 guest-code tests in CI, but not the hypervisor backend itself.
 
-## Decisions asked of the owner
+## Decisions
+
+Approved by the owner on 2026-11-11 as written. Where a decision names a recommendation, the
+recommendation stands.
 
 1. **Commit prebuilt homebrew binaries** (built from in-repo source) rather than building them in
    CI, with a source-hash manifest the gate checks. Recommended: keeps the gate fast and
