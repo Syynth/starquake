@@ -15,6 +15,7 @@ tools/refs-path.sh      # prints the folder; STARQUAKE_REFS overrides it
 | `eden-nx2` | Eden-NX2 (`Takoroka/eden-nx2`, branch `eden-nx2`) | `50fa86bbbc40` | GPL-3.0-or-later | Switch 2 behaviour: `NX2_NOTES.md`, gsv/syncpt/vi2, Turing macros, GPU fixes |
 | `eden-pr4588` | Eden PR #4588 (`ponting/eden`, branch `ns2-support`) | `e5fb3b97c94b` | GPL-3.0-or-later | Native Ampere shader frontend and its tests, six cores, graphics supervisor protocol |
 | `mesa-nouveau` | Mesa (`src/nouveau/{compiler,headers,nil,mme}` only) | `52238762dd44` | MIT | NAK shader encodings, NVIDIA class headers, image layout, MME simulator |
+| `libnx` | libnx (`switchbrew/libnx`, branch `master`) | `b156b4774fb2` | ISC | The client side of IPC: how a homebrew program lays out CMIF, domain and TIPC requests (`nx/include/switch/sf/{hipc,cmif,tipc}.h`) |
 | `rapid-arm-emu` | rapid-arm-emu | `d762465dfd05` | GPL-3.0-only (no "or later" grant) | A64 decoder and software MMU, for a later x86-64 JIT |
 
 Rules:
