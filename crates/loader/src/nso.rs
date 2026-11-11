@@ -8,10 +8,26 @@
 //! and the segment loop). Where Eden asserts on bad input (`ASSERT(r == size)`), this returns an
 //! error instead.
 //!
-//! Facts that are not in the pinned references, taken from the SwitchBrew NSO page and marked
-//! where they are used: the segment-hash check flags (flags bits 3 to 5, hash over the
-//! decompressed segment) and the meaning of the first two segments' `extra` words (module name
-//! offset and size). Eden never checks hashes and calls the `extra` word an alignment.
+//! # Sourcing
+//!
+//! Layout facts and where they come from:
+//!
+//! - Header layout, build id (0x40), compressed sizes (0x60), the three rodata-relative extents
+//!   (0x88, 0x90, 0x98) and the three hashes (0xA0): `NSOHeader` in
+//!   `eden/src/core/loader/nso.h` @ cf654052. Eden names the extents `api_info_extent`,
+//!   `dynstr_extent` and `dynsyn_extent` (sic) and the struct `RODataRelativeExtent`, which is
+//!   the source for "relative to the start of rodata". Eden never reads them.
+//! - Compression flag bits 0 to 2 and the ZBIC bit 7: `NSOHeader::IsSegmentCompressed` and
+//!   `IsZBICCompressed`.
+//! - Hash-check flag bits 3 to 5 (hash over the decompressed segment), and the last words of the
+//!   first two segment headers being the module name offset and size: **SwitchBrew NSO page
+//!   only** (see "Documentation sources" in `docs/references.md`). Neither is in the pinned git
+//!   references and no fixture built from homebrew exercises them. Eden never checks hashes and
+//!   calls that word an `alignment`. `eden-nx2/tools/nx2/nso_syms.py` reads the third segment
+//!   header's last word as the bss size, which agrees with this parser.
+//!
+//! The extents are exposed raw; [`Nso::extent_bytes`] resolves one against the decompressed
+//! rodata and returns `None` when it does not fit.
 
 use lz4_flex::block::DecompressError;
 use sha2::{Digest, Sha256};
@@ -40,7 +56,17 @@ const HASH_SIZE: usize = 0x20;
 
 /// Flag bit `n` set: segment `n` is LZ4 compressed (`NSOHeader::IsSegmentCompressed`).
 const FLAG_COMPRESSED_SHIFT: u32 = 0;
-/// Flag bit `3 + n` set: segment `n`'s hash must be checked (SwitchBrew; not in the refs).
+/// Offset of the `.api_info` extent (`NSOHeader::api_info_extent`).
+const API_INFO_EXTENT_OFFSET: usize = 0x88;
+/// Offset of the `.dynstr` extent (`NSOHeader::dynstr_extent`).
+const DYNSTR_EXTENT_OFFSET: usize = 0x90;
+/// Offset of the `.dynsym` extent (`NSOHeader::dynsyn_extent`, sic).
+const DYNSYM_EXTENT_OFFSET: usize = 0x98;
+/// Offset of the last word of a segment header (`NSOSegmentHeader`: alignment / bss size).
+const EXTRA_WORD: usize = 0xC;
+
+/// Flag bit `3 + n` set: segment `n`'s hash must be checked (SwitchBrew NSO page only; not in the
+/// pinned references).
 const FLAG_HASH_CHECK_SHIFT: u32 = 3;
 /// Flag bit 7: the segments use ZBIC rather than LZ4 (`NSOHeader::IsZBICCompressed`, an Eden-only
 /// extension that this crate does not implement).
@@ -60,6 +86,16 @@ pub struct NsoSegment {
     pub data: Vec<u8>,
 }
 
+/// An `{offset, size}` pair relative to the start of the decompressed rodata segment
+/// (`NSOHeader::RODataRelativeExtent`). Raw, as read from the header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RodataExtent {
+    /// Offset from the start of rodata (`data_offset`).
+    pub offset: u32,
+    /// Size in bytes.
+    pub size: u32,
+}
+
 /// A parsed NSO.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Nso {
@@ -76,15 +112,33 @@ pub struct Nso {
     /// The raw header flags word (compression and hash-check bits).
     pub flags: u32,
     /// Module name offset: the first segment header's last word. Eden calls this word an
-    /// alignment; SwitchBrew calls it the module name offset. A guess, exposed raw and not
-    /// resolved.
+    /// alignment; SwitchBrew calls it the module name offset (see the module docs for the
+    /// sourcing). Exposed raw and not resolved: SwitchBrew does not say what the offset is
+    /// relative to.
     pub module_name_offset: u32,
-    /// Module name size: the second segment header's last word (same caveat as
+    /// Module name size: the second segment header's last word (same sourcing as
     /// [`Nso::module_name_offset`]).
     pub module_name_size: u32,
+    /// The `.api_info` extent (header offset 0x88), raw.
+    pub api_info: RodataExtent,
+    /// The `.dynstr` extent (header offset 0x90), raw.
+    pub dynstr: RodataExtent,
+    /// The `.dynsym` extent (header offset 0x98), raw.
+    pub dynsym: RodataExtent,
 }
 
 impl Nso {
+    /// The bytes of `extent` within the decompressed rodata, or `None` when it does not lie
+    /// entirely inside it. The sum of offset and size is computed in 64 bits, so no pair of
+    /// header words can overflow it.
+    pub fn extent_bytes(&self, extent: RodataExtent) -> Option<&[u8]> {
+        get_range(
+            &self.rodata.data,
+            u64::from(extent.offset),
+            u64::from(extent.size),
+        )
+    }
+
     /// The segments in header order: text, rodata, data.
     pub fn segments(&self) -> [&NsoSegment; SEGMENT_COUNT] {
         [&self.text, &self.rodata, &self.data]
@@ -116,7 +170,7 @@ impl Nso {
             let file_offset = u32_at(bytes, header)?;
             let memory_offset = u32_at(bytes, header + 4)?;
             let size = u32_at(bytes, header + 8)?;
-            *extra_word = u32_at(bytes, header + 12)?;
+            *extra_word = u32_at(bytes, header + EXTRA_WORD)?;
             let compressed_size = u32_at(bytes, COMPRESSED_SIZES_OFFSET + index * 4)?;
 
             let compressed = (flags >> (FLAG_COMPRESSED_SHIFT + shift(index))) & 1 != 0;
@@ -193,6 +247,9 @@ impl Nso {
             flags,
             module_name_offset: extra[0],
             module_name_size: extra[1],
+            api_info: extent_at(bytes, API_INFO_EXTENT_OFFSET)?,
+            dynstr: extent_at(bytes, DYNSTR_EXTENT_OFFSET)?,
+            dynsym: extent_at(bytes, DYNSYM_EXTENT_OFFSET)?,
         })
     }
 }
@@ -273,6 +330,14 @@ pub enum NsoError {
     },
 }
 
+/// The `{offset, size}` extent at `at` in the header.
+fn extent_at(bytes: &[u8], at: usize) -> Result<RodataExtent, NsoError> {
+    Ok(RodataExtent {
+        offset: u32_at(bytes, at)?,
+        size: u32_at(bytes, at + 4)?,
+    })
+}
+
 /// Decompresses one LZ4 block into exactly `size` bytes.
 fn decompress(segment: usize, stored: &[u8], size: u32) -> Result<Vec<u8>, NsoError> {
     let limit = (stored.len() as u64)
@@ -345,9 +410,50 @@ mod tests {
         check_hash: bool,
     }
 
+    /// The header words that are not part of the segment bytes.
+    #[derive(Clone, Copy)]
+    struct Words {
+        module_name_offset: u32,
+        module_name_size: u32,
+        build_id: [u8; 0x20],
+        api_info: RodataExtent,
+        dynstr: RodataExtent,
+        dynsym: RodataExtent,
+    }
+
+    impl Default for Words {
+        fn default() -> Self {
+            let mut build_id = [0u8; 0x20];
+            for (i, byte) in build_id.iter_mut().enumerate() {
+                *byte = u8::try_from(i).unwrap();
+            }
+            Self {
+                module_name_offset: 0x1234,
+                module_name_size: 0x56,
+                build_id,
+                api_info: RodataExtent {
+                    offset: 0x4,
+                    size: 0x10,
+                },
+                dynstr: RodataExtent {
+                    offset: 0x14,
+                    size: 0x8,
+                },
+                dynsym: RodataExtent {
+                    offset: 0x1C,
+                    size: 0x6,
+                },
+            }
+        }
+    }
+
+    fn build(specs: [Spec<'_>; 3], bss_size: u32) -> Vec<u8> {
+        build_with(specs, bss_size, Words::default())
+    }
+
     /// Builds an NSO by writing bytes at the documented offsets, with segment contents laid out
     /// back to back after the header and memory offsets at 0x1000 intervals.
-    fn build(specs: [Spec<'_>; 3], bss_size: u32) -> Vec<u8> {
+    fn build_with(specs: [Spec<'_>; 3], bss_size: u32, words: Words) -> Vec<u8> {
         let mut header = vec![0u8; HEADER_SIZE];
         header[..4].copy_from_slice(&MAGIC);
         let mut flags = 0u32;
@@ -381,15 +487,20 @@ mod tests {
             body.extend_from_slice(&stored);
         }
         header[FLAGS_OFFSET..FLAGS_OFFSET + 4].copy_from_slice(&flags.to_le_bytes());
-        // Third segment header's last word is the bss size; the first two carry the module name.
-        header[0x1C..0x20].copy_from_slice(&0x1234u32.to_le_bytes());
-        header[0x2C..0x30].copy_from_slice(&0x56u32.to_le_bytes());
-        header[0x3C..0x40].copy_from_slice(&bss_size.to_le_bytes());
-        for (i, byte) in header[BUILD_ID_OFFSET..BUILD_ID_OFFSET + 0x20]
-            .iter_mut()
-            .enumerate()
-        {
-            *byte = u8::try_from(i).unwrap();
+        // The last word of each segment header: module name offset, module name size, bss size.
+        let extra =
+            |index: usize| SEGMENT_HEADERS_OFFSET + index * SEGMENT_HEADER_SIZE + EXTRA_WORD;
+        header[extra(0)..extra(0) + 4].copy_from_slice(&words.module_name_offset.to_le_bytes());
+        header[extra(1)..extra(1) + 4].copy_from_slice(&words.module_name_size.to_le_bytes());
+        header[extra(2)..extra(2) + 4].copy_from_slice(&bss_size.to_le_bytes());
+        header[BUILD_ID_OFFSET..BUILD_ID_OFFSET + 0x20].copy_from_slice(&words.build_id);
+        for (at, extent) in [
+            (API_INFO_EXTENT_OFFSET, words.api_info),
+            (DYNSTR_EXTENT_OFFSET, words.dynstr),
+            (DYNSYM_EXTENT_OFFSET, words.dynsym),
+        ] {
+            header[at..at + 4].copy_from_slice(&extent.offset.to_le_bytes());
+            header[at + 4..at + 8].copy_from_slice(&extent.size.to_le_bytes());
         }
         header.extend_from_slice(&body);
         header
@@ -591,11 +702,80 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn extents_resolve_inside_rodata_and_nowhere_else() {
+        let nso = Nso::parse(&build([plain(TEXT), plain(RODATA), plain(DATA)], 0)).unwrap();
+        let len = u32::try_from(RODATA.len()).unwrap();
+        let at = |offset, size| nso.extent_bytes(RodataExtent { offset, size });
+        // In bounds, empty at the very end, one byte over, past the end, and sums that overflow.
+        assert_eq!(at(6, 6), Some(&RODATA[6..12]));
+        assert_eq!(at(len, 0), Some(&RODATA[RODATA.len()..]));
+        assert_eq!(at(len - 1, 1), Some(&RODATA[RODATA.len() - 1..]));
+        assert_eq!(at(len - 1, 2), None);
+        assert_eq!(at(len + 1, 0), None);
+        assert_eq!(at(u32::MAX, 1), None);
+        assert_eq!(at(1, u32::MAX), None);
+        // The fixture declares three distinct extents, all inside RODATA.
+        let words = Words::default();
+        assert_eq!(
+            (nso.api_info, nso.dynstr, nso.dynsym),
+            (words.api_info, words.dynstr, words.dynsym)
+        );
+        assert_eq!(nso.extent_bytes(nso.api_info), Some(&RODATA[0x4..0x14]));
+        assert_eq!(nso.extent_bytes(nso.dynstr), Some(&RODATA[0x14..0x1C]));
+        assert_eq!(nso.extent_bytes(nso.dynsym), Some(&RODATA[0x1C..0x22]));
+    }
+
+    #[test]
+    fn extents_outside_rodata_are_not_a_parse_error() {
+        let words = Words {
+            dynsym: RodataExtent {
+                offset: u32::MAX,
+                size: u32::MAX,
+            },
+            ..Words::default()
+        };
+        let file = build_with([plain(TEXT), plain(RODATA), plain(DATA)], 0, words);
+        let nso = Nso::parse(&file).unwrap();
+        assert_eq!(nso.dynsym, words.dynsym);
+        assert_eq!(nso.extent_bytes(nso.dynsym), None);
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig {
             rng_seed: proptest::test_runner::RngSeed::Fixed(PROPTEST_SEED),
             ..ProptestConfig::default()
         })]
+        /// Every header word read in sequence gets a distinct generated value, so a parser that
+        /// swapped two reads (module name offset and size, any two extents, ...) returns the wrong
+        /// field.
+        #[test]
+        fn generated_headers_round_trip(
+            module_name_offset in any::<u32>(),
+            module_name_size in any::<u32>(),
+            build_id in proptest::array::uniform32(any::<u8>()),
+            extents in proptest::array::uniform6(any::<u32>()),
+            bss_size in 0u32..0x1000_0000,
+        ) {
+            let words = Words {
+                module_name_offset,
+                module_name_size,
+                build_id,
+                api_info: RodataExtent { offset: extents[0], size: extents[1] },
+                dynstr: RodataExtent { offset: extents[2], size: extents[3] },
+                dynsym: RodataExtent { offset: extents[4], size: extents[5] },
+            };
+            let file = build_with([plain(TEXT), plain(RODATA), plain(DATA)], bss_size, words);
+            let nso = Nso::parse(&file).unwrap();
+            prop_assert_eq!(nso.module_name_offset, module_name_offset);
+            prop_assert_eq!(nso.module_name_size, module_name_size);
+            prop_assert_eq!(nso.build_id, build_id);
+            prop_assert_eq!(nso.api_info, words.api_info);
+            prop_assert_eq!(nso.dynstr, words.dynstr);
+            prop_assert_eq!(nso.dynsym, words.dynsym);
+            prop_assert_eq!(nso.bss_size, bss_size);
+        }
+
         #[test]
         fn arbitrary_bytes_never_panic(bytes in proptest::collection::vec(any::<u8>(), 0..2048)) {
             let _ = Nso::parse(&bytes);
