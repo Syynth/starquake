@@ -343,11 +343,48 @@ fn the_linear_id_wraps_after_the_maximum_and_a_stale_handle_revives_then() {
     }
     assert_eq!(last.linear_id(), u32::from(MAX_LINEAR_ID));
     // The next add wraps to MIN_LINEAR_ID and reissues the very first handle value. This is
-    // Horizon's behaviour (a 15-bit counter); a stale handle is only rejected for MAX_LINEAR_ID
-    // further adds.
+    // Horizon's behaviour (a 15-bit counter). A stale handle (i, L) is accepted again only while
+    // slot i holds an entry stamped L: not before the MAX_LINEAR_ID-th add after the issuing
+    // add, and then only if that add (or a later one stamping L) lands on index i. Here there is
+    // one slot, so the MAX_LINEAR_ID-th add after the issuing one revives it.
     let wrapped = t.add(&mut refs, obj(3)).unwrap();
     assert_eq!(wrapped, first);
     assert_eq!(t.get(first), Ok(obj(3)));
+}
+
+#[test]
+fn a_stale_handle_stays_rejected_when_the_wrapping_add_lands_on_another_index() {
+    // Two slots. The handle under test is (1, MIN_LINEAR_ID); a second entry then holds index 1,
+    // so every later add lands on index 0.
+    let mut t = table(2);
+    let mut refs = RefCounts::new();
+    let stale = t.add(&mut refs, obj(1)).unwrap();
+    assert_eq!(
+        (stale.index(), stale.linear_id()),
+        (1, u32::from(MIN_LINEAR_ID))
+    );
+    t.remove(&mut refs, stale).unwrap();
+    let holder = t.add(&mut refs, obj(2)).unwrap();
+    assert_eq!(holder.index(), stale.index());
+    // `holder` took MIN_LINEAR_ID + 1. Every linear id after it, up to the maximum, is stamped on
+    // index 0; the next add is the MAX_LINEAR_ID-th add after the one that issued `stale`, and it
+    // stamps MIN_LINEAR_ID.
+    assert_eq!(holder.linear_id(), u32::from(MIN_LINEAR_ID) + 1);
+    let mut last = holder;
+    for _ in MIN_LINEAR_ID + 2..=MAX_LINEAR_ID {
+        last = t.add(&mut refs, obj(3)).unwrap();
+        t.remove(&mut refs, last).unwrap();
+    }
+    assert_eq!(last.linear_id(), u32::from(MAX_LINEAR_ID));
+    let wrapped = t.add(&mut refs, obj(4)).unwrap();
+    assert_eq!(
+        (wrapped.index(), wrapped.linear_id()),
+        (0, u32::from(MIN_LINEAR_ID))
+    );
+    // The counter has come round to the stale handle's linear id, but on the other index, where
+    // `holder` sits with a different stamp: still rejected.
+    assert_eq!(t.get(stale), Err(invalid(stale)));
+    assert_eq!(t.get(holder), Ok(obj(2)));
 }
 
 // --- Reference counting ---------------------------------------------------------------------
@@ -511,8 +548,8 @@ struct RawTable {
     max_count: u16,
 }
 
-/// A named way to damage a [`RawTable`].
-type Damage = (&'static str, Box<dyn Fn(&mut RawTable)>);
+/// A named way to damage a [`RawTable`], and the exact error loading it must give.
+type Damage = (&'static str, Box<dyn Fn(&mut RawTable)>, HandleLayoutError);
 
 fn raw_of(t: &HandleTable) -> RawTable {
     RawTable {
@@ -527,8 +564,11 @@ fn deserialise(raw: &RawTable) -> Result<HandleTable, postcard::Error> {
     postcard::from_bytes(&postcard::to_allocvec(raw).unwrap())
 }
 
+/// The size of the table [`used_table`] builds.
+const USED_SIZE: i32 = 6;
+
 fn used_table() -> (HandleTable, RefCounts, Vec<Handle>) {
-    let mut t = table(6);
+    let mut t = table(USED_SIZE);
     let mut refs = RefCounts::new();
     let h: Vec<_> = (0..5)
         .map(|n| t.add(&mut refs, obj(n % 3)).unwrap())
@@ -571,9 +611,24 @@ fn deserialising_accepts_a_consistent_layout() {
     assert_eq!(deserialise(&raw_of(&t)).unwrap(), t);
 }
 
-#[test]
-fn deserialising_rejects_damaged_layouts() {
-    let damage: Vec<Damage> = vec![
+fn data_of(raw: &RawTable) -> HandleTableData {
+    HandleTableData {
+        entries: raw.entries.clone(),
+        free: raw.free.clone(),
+        next_linear_id: raw.next_linear_id,
+        max_count: raw.max_count,
+    }
+}
+
+/// Every way to damage the [`used_table`] layout that deserialisation must refuse, with the error
+/// it gives. Indices and counts are read off the table, not restated.
+fn damage_cases() -> Vec<Damage> {
+    let (t, _, _) = used_table();
+    let occupied = t.entries.iter().position(Option::is_some).unwrap();
+    let vacant = t.free[0];
+    let past_the_end = u16::try_from(t.entries.len()).unwrap();
+    let in_use = u16::try_from(t.len()).unwrap();
+    vec![
         (
             "no entries",
             Box::new(|r| {
@@ -581,6 +636,7 @@ fn deserialising_rejects_damaged_layouts() {
                 r.free.clear();
                 r.max_count = 0;
             }),
+            HandleLayoutError::Size { size: 0 },
         ),
         (
             "too many entries",
@@ -588,21 +644,37 @@ fn deserialising_rejects_damaged_layouts() {
                 r.entries = vec![None; usize::from(MAX_TABLE_SIZE) + 1];
                 r.free = (0..=MAX_TABLE_SIZE).collect();
             }),
+            HandleLayoutError::Size {
+                size: usize::from(MAX_TABLE_SIZE) + 1,
+            },
         ),
-        ("free entry out of range", Box::new(|r| r.free[0] = 99)),
         (
-            "free entry names an occupied slot",
-            Box::new(|r| {
-                let occupied = r.entries.iter().position(Option::is_some).unwrap();
-                r.free[0] = u16::try_from(occupied).unwrap();
+            "free entry out of range",
+            Box::new(move |r| r.free[0] = past_the_end),
+            HandleLayoutError::FreeStack(FreeStackError::OutOfRange {
+                index: u32::from(past_the_end),
             }),
         ),
-        ("free entry repeated", Box::new(|r| r.free[1] = r.free[0])),
+        (
+            "free entry names an occupied slot",
+            Box::new(move |r| r.free[0] = u16::try_from(occupied).unwrap()),
+            HandleLayoutError::FreeStack(FreeStackError::NotVacant {
+                index: u32::try_from(occupied).unwrap(),
+            }),
+        ),
+        (
+            "free entry repeated",
+            Box::new(|r| r.free[1] = r.free[0]),
+            HandleLayoutError::FreeStack(FreeStackError::Duplicate {
+                index: u32::from(vacant),
+            }),
+        ),
         (
             "free entry missing",
             Box::new(|r| {
                 r.free.pop();
             }),
+            HandleLayoutError::FreeCount,
         ),
         (
             "linear id zero",
@@ -610,6 +682,10 @@ fn deserialising_rejects_damaged_layouts() {
                 let slot = r.entries.iter_mut().flatten().next().unwrap();
                 slot.linear_id = 0;
             }),
+            HandleLayoutError::LinearId {
+                index: occupied,
+                linear_id: 0,
+            },
         ),
         (
             "linear id too large",
@@ -617,26 +693,57 @@ fn deserialising_rejects_damaged_layouts() {
                 let slot = r.entries.iter_mut().flatten().next().unwrap();
                 slot.linear_id = MAX_LINEAR_ID + 1;
             }),
+            HandleLayoutError::LinearId {
+                index: occupied,
+                linear_id: MAX_LINEAR_ID + 1,
+            },
         ),
-        ("next linear id zero", Box::new(|r| r.next_linear_id = 0)),
+        (
+            "next linear id zero",
+            Box::new(|r| r.next_linear_id = 0),
+            HandleLayoutError::NextLinearId(0),
+        ),
         (
             "next linear id too large",
             Box::new(|r| r.next_linear_id = MAX_LINEAR_ID + 1),
+            HandleLayoutError::NextLinearId(MAX_LINEAR_ID + 1),
         ),
         (
             "high-water mark below the entries in use",
-            Box::new(|r| r.max_count = 2),
+            Box::new(move |r| r.max_count = in_use - 1),
+            HandleLayoutError::MaxCount(in_use - 1),
         ),
         (
             "high-water mark above the table size",
-            Box::new(|r| r.max_count = 7),
+            Box::new(move |r| r.max_count = past_the_end + 1),
+            HandleLayoutError::MaxCount(past_the_end + 1),
         ),
-    ];
-    for (name, apply) in damage {
+    ]
+}
+
+/// Smoke test of the serde path only: the error that `postcard` reports carries no variant, so
+/// the exact errors are asserted through `TryFrom` below.
+#[test]
+fn deserialising_rejects_damaged_layouts() {
+    for (name, apply, _) in damage_cases() {
         let (t, _, _) = used_table();
         let mut raw = raw_of(&t);
         apply(&mut raw);
         assert!(deserialise(&raw).is_err(), "{name} was accepted");
+    }
+}
+
+#[test]
+fn damaged_layouts_are_rejected_with_the_exact_error() {
+    for (name, apply, expected) in damage_cases() {
+        let (t, _, _) = used_table();
+        let mut raw = raw_of(&t);
+        apply(&mut raw);
+        assert_eq!(
+            HandleTable::try_from(data_of(&raw)).err(),
+            Some(expected),
+            "{name}"
+        );
     }
 }
 
@@ -788,4 +895,65 @@ proptest! {
         prop_assert_eq!(&back, &t);
         prop_assert_eq!(back.add(&mut refs_back, obj(0)), t.add(&mut refs, obj(0)));
     }
+}
+
+#[test]
+fn errors_display_their_documented_text() {
+    assert_eq!(
+        HandleError::TableTooLarge { requested: 2000 }.to_string(),
+        format!("handle table size 2000 exceeds the maximum of {MAX_TABLE_SIZE}")
+    );
+    assert_eq!(
+        HandleError::OutOfHandles.to_string(),
+        "the handle table is full"
+    );
+    assert_eq!(
+        HandleError::InvalidHandle { raw: 0x1234 }.to_string(),
+        "handle 0x00001234 does not name an object"
+    );
+    let overflow = RefError::Overflow { object: obj(1) };
+    assert_eq!(
+        HandleError::Refs(overflow).to_string(),
+        format!("reference count: {overflow}")
+    );
+    assert_eq!(
+        HandleError::Corrupt.to_string(),
+        "handle table bookkeeping is inconsistent"
+    );
+    assert_eq!(
+        overflow.to_string(),
+        format!("reference count of {:?} overflowed", obj(1))
+    );
+    assert_eq!(
+        RefError::NotReferenced { object: obj(2) }.to_string(),
+        format!("{:?} has no references to close", obj(2))
+    );
+    assert_eq!(
+        HandleLayoutError::Size { size: 0 }.to_string(),
+        format!("table size 0 is outside 1..={MAX_TABLE_SIZE}")
+    );
+    assert_eq!(
+        HandleLayoutError::LinearId {
+            index: 3,
+            linear_id: 0
+        }
+        .to_string(),
+        "entry 3 has linear id 0 outside the valid range"
+    );
+    assert_eq!(
+        HandleLayoutError::NextLinearId(0).to_string(),
+        "next linear id 0 is outside the valid range"
+    );
+    assert_eq!(
+        HandleLayoutError::FreeStack(FreeStackError::NotVacant { index: 2 }).to_string(),
+        "free stack is damaged: entry 2 names an occupied slot"
+    );
+    assert_eq!(
+        HandleLayoutError::FreeCount.to_string(),
+        "free entries and the free stack disagree"
+    );
+    assert_eq!(
+        HandleLayoutError::MaxCount(9).to_string(),
+        "high-water mark 9 is inconsistent"
+    );
 }

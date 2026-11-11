@@ -8,11 +8,14 @@
 //! A [`Handle`] is a 32-bit value: bits 0-14 the table index, bits 15-29 a "linear id" (what the
 //! task calls the generation), bits 30-31 reserved and zero. The linear id is **not** a
 //! per-slot generation: the table keeps one counter that runs `1..=0x7FFF` and wraps, and
-//! `Add` stamps the next value on whichever slot it takes. A stale handle is therefore rejected
-//! until the counter has wrapped all the way round, after exactly [`MAX_LINEAR_ID`] further adds
-//! (pinned by a test); that is Horizon's behaviour, kept so handle values match what a guest
-//! would see. (The generic [`Slab`](crate::slab::Slab) does not have this limit; it is for
-//! kernel-internal ids, which guests never see.)
+//! `Add` stamps the next value on whichever slot it takes. A stale handle `(i, L)` is accepted
+//! again only while slot `i` holds an entry stamped `L`. That cannot happen before the
+//! [`MAX_LINEAR_ID`]-th add after the one that issued the handle (the counter has to come all the
+//! way round to `L`), and then only if that add, or a later add stamping `L`, lands on index `i`;
+//! otherwise the handle stays rejected. A one-slot table, where every add lands on index 0, pins
+//! the earliest revival with a test. That is Horizon's behaviour, kept so handle values match
+//! what a guest would see. (The generic [`Slab`](crate::slab::Slab) does not have this limit; it
+//! is for kernel-internal ids, which guests never see.)
 //!
 //! The free list is a stack that starts so that the first `Add` takes the **highest** index
 //! (`Initialize` links entry `i` to `i - 1` and leaves the head on the last one), and a removed

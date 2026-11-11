@@ -12,6 +12,16 @@
 //! their creator, which the creating call closes after inserting a handle. [`RefCounts`] has no
 //! creation step: the first `open` creates the entry at one. Callers that want Horizon's
 //! creator reference call `open` themselves, and `close` it when done.
+//!
+//! Second divergence, the reference-count path is fallible. In Horizon, `KHandleTable::Add`
+//! allocates the linear id and the entry and then calls an infallible `obj->Open()`, and
+//! `KHandleTable::Remove` calls `FreeEntry` before an infallible `obj->Close()`
+//! (`eden/src/core/hle/kernel/k_handle_table.cpp`). Here [`ObjectRefs::open`] and
+//! [`ObjectRefs::close`] return a [`RefError`], and the table is changed only after they succeed:
+//! a failed `open` in [`HandleTable::add`](super::HandleTable::add) consumes no linear id and
+//! leaves the table unchanged, and a failed `close` in
+//! [`HandleTable::remove`](super::HandleTable::remove) keeps the handle in the table. Two tests
+//! pin this: `a_failed_open_leaves_the_table_untouched` and `a_failed_close_keeps_the_handle`.
 
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;

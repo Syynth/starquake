@@ -263,8 +263,8 @@ fn the_wire_form_has_exactly_the_documented_fields() {
     );
 }
 
-/// A named way to damage a [`RawSlab`].
-type Damage = (&'static str, Box<dyn Fn(&mut RawSlab)>);
+/// A named way to damage a [`RawSlab`], and the exact error loading it must give.
+type Damage = (&'static str, Box<dyn Fn(&mut RawSlab)>, SlabLayoutError);
 
 fn valid_raw() -> RawSlab {
     RawSlab {
@@ -282,33 +282,63 @@ fn valid_raw() -> RawSlab {
     }
 }
 
-#[test]
-fn deserialising_accepts_a_consistent_layout() {
-    let slab = deserialise(&valid_raw()).unwrap();
-    assert_eq!(slab.len(), 1);
-    assert_eq!(slab.get(ObjectId::from_parts(0, 2)), Ok(&1));
+fn data_of(raw: &RawSlab) -> SlabData<i64> {
+    SlabData::new(raw.slots.clone(), raw.free.clone(), raw.max_slots, raw.live)
 }
 
-#[test]
-fn deserialising_rejects_damaged_layouts() {
-    let damage: Vec<Damage> = vec![
-        ("free entry out of range", Box::new(|r| r.free = vec![3])),
+/// Every way to damage [`valid_raw`] that deserialisation must refuse, with the error it gives.
+/// Indices are derived from the layout: slot 0 is occupied, slot 1 vacant, slot 2 retired.
+fn damage_cases() -> Vec<Damage> {
+    let valid = valid_raw();
+    let (occupied, vacant, retired) = (0_u32, 1_u32, 2_u32);
+    let past_the_end = u32::try_from(valid.slots.len()).unwrap();
+    let live = valid.live;
+    vec![
+        (
+            "free entry out of range",
+            Box::new(move |r| r.free = vec![past_the_end]),
+            SlabLayoutError::FreeStack(FreeStackError::OutOfRange {
+                index: past_the_end,
+            }),
+        ),
         (
             "free entry names an occupied slot",
-            Box::new(|r| r.free = vec![0]),
+            Box::new(move |r| r.free = vec![occupied]),
+            SlabLayoutError::FreeStack(FreeStackError::NotVacant { index: occupied }),
         ),
         (
             "free entry names a retired slot",
-            Box::new(|r| r.free = vec![2]),
+            Box::new(move |r| r.free = vec![retired]),
+            SlabLayoutError::FreeStack(FreeStackError::NotVacant { index: retired }),
         ),
-        ("free entry repeated", Box::new(|r| r.free = vec![1, 1])),
+        (
+            "free entry repeated",
+            Box::new(move |r| r.free = vec![vacant, vacant]),
+            SlabLayoutError::FreeStack(FreeStackError::Duplicate { index: vacant }),
+        ),
         (
             "vacant slot missing from the stack",
             Box::new(|r| r.free = vec![]),
+            SlabLayoutError::Counts,
         ),
-        ("live count too high", Box::new(|r| r.live = 2)),
-        ("live count too low", Box::new(|r| r.live = 0)),
-        ("more slots than the limit", Box::new(|r| r.max_slots = 2)),
+        (
+            "live count too high",
+            Box::new(move |r| r.live = live + 1),
+            SlabLayoutError::Counts,
+        ),
+        (
+            "live count too low",
+            Box::new(move |r| r.live = live - 1),
+            SlabLayoutError::Counts,
+        ),
+        (
+            "more slots than the limit",
+            Box::new(move |r| r.max_slots = past_the_end - 1),
+            SlabLayoutError::TooManySlots {
+                slots: valid.slots.len(),
+                max_slots: past_the_end - 1,
+            },
+        ),
         (
             "zero generation (occupied)",
             Box::new(|r| {
@@ -317,16 +347,48 @@ fn deserialising_rejects_damaged_layouts() {
                     value: 1,
                 }
             }),
+            SlabLayoutError::ZeroGeneration {
+                index: occupied as usize,
+            },
         ),
         (
             "zero generation (vacant)",
             Box::new(|r| r.slots[1] = Slot::Vacant { generation: 0 }),
+            SlabLayoutError::ZeroGeneration {
+                index: vacant as usize,
+            },
         ),
-    ];
-    for (name, apply) in damage {
+    ]
+}
+
+#[test]
+fn deserialising_accepts_a_consistent_layout() {
+    let slab = deserialise(&valid_raw()).unwrap();
+    assert_eq!(slab.len(), 1);
+    assert_eq!(slab.get(ObjectId::from_parts(0, 2)), Ok(&1));
+}
+
+/// Smoke test of the serde path only: the error that `postcard` reports carries no variant, so
+/// the exact errors are asserted through `TryFrom` below.
+#[test]
+fn deserialising_rejects_damaged_layouts() {
+    for (name, apply, _) in damage_cases() {
         let mut raw = valid_raw();
         apply(&mut raw);
         assert!(deserialise(&raw).is_err(), "{name} was accepted");
+    }
+}
+
+#[test]
+fn damaged_layouts_are_rejected_with_the_exact_error() {
+    for (name, apply, expected) in damage_cases() {
+        let mut raw = valid_raw();
+        apply(&mut raw);
+        assert_eq!(
+            TestSlab::try_from(data_of(&raw)).err(),
+            Some(expected),
+            "{name}"
+        );
     }
 }
 
@@ -448,4 +510,56 @@ proptest! {
         prop_assert_eq!(&back, &slab);
         prop_assert_eq!(back.insert(1), slab.insert(1));
     }
+}
+
+#[test]
+fn errors_display_their_documented_text() {
+    assert_eq!(
+        SlabError::Stale {
+            index: 3,
+            generation: 7
+        }
+        .to_string(),
+        "stale or unknown id (index 3, generation 7)"
+    );
+    assert_eq!(
+        SlabError::Full { max_slots: 9 }.to_string(),
+        "slab is full (9 slots)"
+    );
+    assert_eq!(
+        SlabError::Corrupt.to_string(),
+        "slab bookkeeping is inconsistent"
+    );
+    assert_eq!(
+        SlabLayoutError::TooManySlots {
+            slots: 5,
+            max_slots: 4
+        }
+        .to_string(),
+        "5 slots exceed the limit of 4"
+    );
+    assert_eq!(
+        SlabLayoutError::ZeroGeneration { index: 2 }.to_string(),
+        "slot 2 has generation zero"
+    );
+    assert_eq!(
+        SlabLayoutError::FreeStack(FreeStackError::Duplicate { index: 1 }).to_string(),
+        "free stack is damaged: entry 1 appears twice"
+    );
+    assert_eq!(
+        SlabLayoutError::Counts.to_string(),
+        "counts disagree with the slots"
+    );
+    assert_eq!(
+        FreeStackError::OutOfRange { index: 8 }.to_string(),
+        "entry 8 is out of range"
+    );
+    assert_eq!(
+        FreeStackError::NotVacant { index: 4 }.to_string(),
+        "entry 4 names an occupied slot"
+    );
+    assert_eq!(
+        FreeStackError::Duplicate { index: 6 }.to_string(),
+        "entry 6 appears twice"
+    );
 }
