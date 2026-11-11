@@ -96,3 +96,11 @@ Entry format:
 - **SCOPE:** architectural
 - **WHAT:** Kernel state lives in a few tables (scheduler, per-process address space, per-process handle table), with objects referenced by id. Each system call declares the tables it touches in its function signature, and only the dispatcher takes locks, in one fixed order. One lock guards all tables at first; it is split table by table later, when measurements justify it, without changing the system calls. The first three port slices (dispatcher, handle table, scheduler) are a trial of the design before the rest depend on it.
 - **WHY:** The owner wanted the single-arena design to leave room for parallelism, the way Bevy runs systems in parallel when they don't need exclusive world access. Declaring table access per call gives that option cheaply, matches Horizon's own lock structure, and keeps the benefits of the arena: no unsafe, a deterministic kernel, replay and snapshots.
+
+## Services: one request at a time per server; handler style decided by a trial
+- **WHEN:** 2026-11-11
+- **PROJECT:** starquake
+- **SYSTEM:** services (and kernel IPC)
+- **SCOPE:** architectural
+- **WHAT:** (1) A service handles one request at a time per server by default, across all its sessions, as most real system modules do. A server that is multi-threaded on a console can opt in to several workers, with a stated reason. A deferred request doesn't hold the server. (2) The way service methods are written (a `commands!` table with hand-written unpacking) is a trial: `sm:`, `set:sys` and an `fsp-srv` subset are written that way, then judged before a fourth service is ported. If the methods are long or error-prone, the framework moves to a typed style where the method signature declares its inputs and outputs.
+- **WHY:** Per-server queueing keeps thread-safety out of ordinary service code, which is where agent-written code is most likely to have subtle bugs, and it matches the console. The handler style will be repeated thousands of times and is expensive to change once many services exist, so it should be chosen from evidence, not up front.
