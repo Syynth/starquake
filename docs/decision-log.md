@@ -112,3 +112,11 @@ Entry format:
 - **SCOPE:** moderate
 - **WHAT:** (1) `starquake-testkit` holds only test helpers that depend on none of our crates (instruction encoders, a synthetic program builder). Each crate exports its own fakes behind a `test-support` feature. (2) Prebuilt homebrew test binaries are committed next to their source, with a source-hash manifest that the gate checks. (3) A PR that changes a trace snapshot must explain each change in its description, and review checks the explanation against the diff.
 - **WHY:** Fakes in a shared crate break the defining crate's own unit tests (Rust builds two incompatible copies), and a large shared testkit is a merge hot spot and a shared blind spot. The hash check catches a binary drifting from its source without needing the toolchain in CI. Snapshots only protect anything if their changes are read, and agents can otherwise pass a test by accepting whatever the new output is.
+
+## Five foundation specs approved
+- **WHEN:** 2026-11-11
+- **PROJECT:** starquake
+- **SYSTEM:** cross-system
+- **SCOPE:** architectural
+- **WHAT:** The owner approved the execution model, observability and replay, kernel, service framework and test strategy specs (`docs/specs/`) as written on 2026-11-11, with each spec's recommended option standing where the owner didn't revise it. Notably: deferred replies instead of service threads; stage-1 page tables carry all fine-grained mapping; one event stream with an always-on flight recorder; all nondeterminism through an injectable environment; snapshots as a standing rule for kernel and service state; a deterministic interpreter backend for tests; a fixed memory layout by default; permission violations logged before they are enforced; auto-stub on for bring-up and strict in tests. Changing any of these means amending the spec with the owner's approval.
+- **WHY:** The owner walked through each spec's decisions and tradeoffs, revised the ones they were concerned about (the kernel's server side and state model, service queueing and handler style, test support), and accepted the recommendations for the rest so that kernel work could start.
