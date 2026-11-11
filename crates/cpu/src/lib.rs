@@ -2,15 +2,23 @@
 //!
 //! | Backend | Host | Status |
 //! |---|---|---|
-//! | [`hvf`] | macOS arm64 (Hypervisor.framework) | planned: port of `tools/hvprobe` |
+//! | [`hvf`] | macOS arm64 (Hypervisor.framework) | bring-up (port of `tools/hvprobe`) |
 //! | `kvm` | Linux arm64 | planned |
 //! | `jit` | x86-64 (Steam Deck class) | planned |
 //!
 //! A vCPU runs guest code until it needs the host, and says why with an [`Exit`]. The HLE kernel
 //! drives each vCPU from its own host thread: HVF requires a vCPU to run on the thread that
-//! created it, so [`Vcpu`] is deliberately not `Send`.
+//! created it, so [`Vcpu`] is deliberately not `Send`. Other threads stop a running vCPU through
+//! its [`Interrupter`].
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg_attr(
+    all(target_os = "macos", target_arch = "aarch64"),
+    expect(
+        unsafe_code,
+        reason = "Hypervisor.framework is a C API, and guest RAM is shared with the running guest"
+    )
+)]
 pub mod hvf;
 
 /// Why a vCPU stopped running guest code.
@@ -62,10 +70,23 @@ pub enum Error {
     Host(String),
 }
 
+/// Stops a running vCPU from another host thread (preemption, shutdown).
+pub trait Interrupter: Send + Sync {
+    /// Makes the vCPU's current [`Vcpu::run`] return [`Exit::Interrupted`]. If the vCPU isn't
+    /// running, its next `run` returns `Exit::Interrupted` without running guest code. Once the
+    /// vCPU is gone this does nothing.
+    fn interrupt(&self) -> Result<(), Error>;
+}
+
 /// One virtual CPU.
 pub trait Vcpu {
+    /// The handle other threads use to interrupt this vCPU.
+    type Interrupter: Interrupter + Clone + 'static;
+
     /// Runs guest code until the next [`Exit`].
     fn run(&mut self) -> Result<Exit, Error>;
+    /// Returns a handle that can stop [`Vcpu::run`] from another thread.
+    fn interrupter(&self) -> Self::Interrupter;
     /// Reads the register state.
     fn regs(&self) -> Result<GuestRegs, Error>;
     /// Replaces the register state (context switch, SVC return values).
