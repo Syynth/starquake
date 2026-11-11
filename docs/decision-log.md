@@ -88,3 +88,11 @@ Entry format:
 - **SCOPE:** architectural
 - **WHAT:** Very good compatibility is a project goal. The kernel doesn't have to implement server-side IPC, guest-hosted services or Nintendo's real system modules now, but its design must let them be added later without a redesign: sessions have a client end, a server end and a request queue; multiple guest processes are supported. More generally, a spec may defer a compatibility feature but must not rule it out, and must say how it could be added.
 - **WHY:** The owner wants very good compatibility, including the option to fall back on real system modules and to run homebrew that provides its own services. Ruling these out to save work now would trade compatibility away permanently.
+
+## Kernel state is tables behind a dispatcher; one lock to start
+- **WHEN:** 2026-11-11
+- **PROJECT:** starquake
+- **SYSTEM:** kernel
+- **SCOPE:** architectural
+- **WHAT:** Kernel state lives in a few tables (scheduler, per-process address space, per-process handle table), with objects referenced by id. Each system call declares the tables it touches in its function signature, and only the dispatcher takes locks, in one fixed order. One lock guards all tables at first; it is split table by table later, when measurements justify it, without changing the system calls. The first three port slices (dispatcher, handle table, scheduler) are a trial of the design before the rest depend on it.
+- **WHY:** The owner wanted the single-arena design to leave room for parallelism, the way Bevy runs systems in parallel when they don't need exclusive world access. Declaring table access per call gives that option cheaply, matches Horizon's own lock structure, and keeps the benefits of the arena: no unsafe, a deterministic kernel, replay and snapshots.
