@@ -30,7 +30,7 @@ Nintendo's real system modules as a fallback and for homebrew that provides its 
 1. **Sessions are modelled as Horizon models them:** a client end, a server end, and a queue of
    requests between them. A Rust handler is one kind of server end; a guest process calling
    `ReplyAndReceive` would be another. Nothing in the client path knows which it is.
-2. **Nothing assumes a single process.** Processes live in the arena like any other object, each
+2. **Nothing assumes a single process.** Processes live in the tables like any other object, each
    with its own address space, handle table and memory pool.
 3. **Handle transfer is a kernel primitive** between any two handle tables, not a special case
    of calling a Rust handler.
@@ -47,36 +47,64 @@ Nintendo's real system modules as a fallback and for homebrew that provides its 
 
 ## Object model
 
-### One arena behind one lock
+### Tables behind a dispatcher, one lock to start
 
-Horizon's kernel objects are intrusively reference-counted and linked into each other's queues,
-all guarded by the scheduler lock. Translating that literally into Rust means `Arc<Mutex<...>>`
-everywhere, lock-order rules nobody can check, or `unsafe`.
+Horizon's kernel objects are intrusively reference-counted and linked into each other's queues.
+Translating that literally into Rust means `Arc<Mutex<...>>` on every object, lock-order rules
+that depend on the data, or `unsafe`.
 
-Instead, everything the scheduler lock protects lives in **one struct owned by one mutex**, and
-objects refer to each other by typed ids:
+Instead, kernel state lives in a few **tables**, and objects refer to each other by typed ids:
+
+| Table | Holds | Horizon's equivalent lock |
+|---|---|---|
+| `Scheduler` | Threads (run state, priority, affinity, wait reason, saved context), per-core run queues, wait lists, events and sessions, the address-arbiter map, timers | The scheduler lock (`k_scheduler_lock.h`) |
+| `AddressSpace`, one per process | Memory blocks, regions, heap; plus the memory pools | Each page table's own lock (`m_general_lock` in `k_page_table_base.h`) |
+| `HandleTable`, one per process | Handle slots | The handle table's own lock (`k_handle_table.h`) |
+| `Processes` | Per-process facts fixed at creation (capabilities, ids) | None needed |
+
+The split follows Horizon's own: it has one lock for everything about thread state and separate
+locks for each memory map and handle table.
+
+**A system call declares the tables it needs in its signature**, and receives nothing else:
 
 ```rust
-pub struct Kernel { state: Mutex<State>, cores: [CoreHandle; 6], /* immutable config */ }
-
-struct State {
-    threads: Slab<ThreadId, Thread>,        // run state, priority, affinity, wait reason, saved context
-    objects: Slab<ObjectId, Object>,        // events, sessions, shared memory, ...
-    run_queues: PriorityQueues,             // per core, 64 priorities, scheduled + suggested
-    arbiter: BTreeMap<u64, WaitList>,       // address arbiter and condition-variable keys
-    timers: BinaryHeap<Deadline>,
-    processes: Slab<ProcessId, Process>,    // address space, handle table, pools
-}
+fn set_heap_size(mem: &mut AddressSpace, size: u64) -> SvcResult<u64>;
+fn signal_event(sched: &mut Scheduler, handles: &HandleTable, handle: Handle) -> SvcResult<()>;
+fn get_system_tick(env: &dyn Env) -> u64;                       // no table at all
 ```
 
-- A system call locks `State`, does its bookkeeping, and returns `Done`, `Wait` or `Yield`
-  (execution model). Nothing else can observe a half-updated wait queue.
-- No `unsafe` in the crate, no per-object locks, no lock ordering. Stale ids are caught by
-  generation counters in the slabs.
-- The whole kernel is a deterministic state machine: given the same calls in the same order it
-  ends in the same state. Tests drive it directly without threads or a hypervisor.
-- When the one lock becomes the bottleneck (Eden-NX2 notes, row 109), the address arbiter moves to
-  its own sharded map. It is already a separate field with a narrow interface.
+The **dispatcher** is the only code that locks. It acquires what the signature asks for, in one
+fixed order (handle table, then address space, then scheduler), calls the function, and assigns
+the event's sequence number before releasing. System calls never lock, so they can't deadlock,
+and the compiler rejects a call that reaches for a table it didn't declare.
+
+**To start, one mutex guards all the tables.** The dispatcher takes it and hands each call
+disjoint borrows of the tables it declared. That keeps the first implementation simple and gives
+one global order of events for free. Splitting later, when a measurement says so, changes the
+dispatcher and nothing else:
+
+1. Give `AddressSpace` its own lock, so a long memory operation doesn't stall scheduling.
+2. Make `HandleTable` a reader-writer lock; almost every call only reads it.
+3. Shard the address arbiter's wait lists by address, so the hot `WaitForAddress` and
+   `SignalToAddress` pair (about 1,400 calls a frame) holds the scheduler lock only for the
+   final wake-up. Table-level splitting alone doesn't help these calls: every wake-up touches
+   the run queues.
+
+After a split, the sequence number taken while holding a call's locks still gives one order that
+is consistent with every table's own order, so replay keeps working.
+
+What this buys, at any stage:
+
+- No `unsafe` in the crate and no per-object locks. Stale ids are caught by generation counters.
+- The kernel is a deterministic state machine: the same calls in the same order end in the same
+  state. Tests drive it directly, without threads or a hypervisor.
+- Tables are plain data, so snapshots serialise them directly (taking every lock at once).
+- Separate table structs can be edited at the same time, which removes most of the
+  borrow-checker friction a single struct would cause.
+
+The dispatcher reports how long calls wait for each lock in the run's summary, so the decision
+to split is made from measurements. Eden-NX2 saw three of six cores waiting on its scheduler
+lock (row 109); whether starquake does is not yet known.
 
 ### A closed set of object kinds
 
@@ -184,7 +212,7 @@ belongs to, citing its row.
 The observability spec (`observability.md`, also a proposal) adds three requirements here: the
 system-call dispatcher, scheduler and address space each report to one event recorder; the clock,
 random numbers and host I/O are read through an injectable environment, never directly; and the
-arena is serialisable, for snapshots. All three are cheap with this design and are part of slice 2
+tables are serialisable, for snapshots. All three are cheap with this design and are part of slice 2
 onwards.
 
 ## Port plan
@@ -192,9 +220,14 @@ onwards.
 Each slice is one issue with its own tests. Slices 1–5 touch only kernel bookkeeping and can run
 in parallel once this spec and the execution model are approved; 6–10 build on them.
 
+**Slices 1–3 are a trial of this design.** The scheduler is the most pointer-heavy part of
+Eden's kernel. If it ports cleanly onto tables and ids, the patterns it establishes (editing two
+rows at once, walking wait lists by id) become the house style for the rest. If it doesn't, the
+design is revisited before slices 4–10 depend on it.
+
 | # | Slice | Eden source | Test |
 |---|---|---|---|
-| 1 | Result codes, system-call ids and register convention table | `svc_results.h`, `svc.h`, `svc.cpp` | Table test per call |
+| 1 | Result codes, system-call ids, register convention table, and the dispatcher with table parameters | `svc_results.h`, `svc.h`, `svc.cpp` | Table test per call; a call can't reach a table it didn't declare (compile-fail test) |
 | 2 | Slabs, typed ids, handle table | `k_handle_table.*`, `k_auto_object.h` | Encoding fixtures; generation reuse; property test against a model |
 | 3 | Thread state, priority queues, scheduler | `k_priority_queue.h`, `k_scheduler.*`, `k_thread.*` | Invariants under random operations (highest-priority runnable thread runs, no thread on two cores, affinity respected); scenario tests for yields and migration |
 | 4 | Events and `WaitSynchronization` | `k_event.*`, `k_readable_event.*`, `k_synchronization_object.*` | Wake order, cancellation, timeouts, signalled-before-wait |
@@ -211,9 +244,11 @@ process creation, and IPC buffer mapping.
 
 ## Decisions asked of the owner
 
-1. **One arena behind one lock, objects referenced by id.** Recommended over mirroring
-   Horizon's linked, reference-counted objects: no `unsafe`, deterministic tests, and the known
-   contention point can be split out later.
+1. **Tables behind a dispatcher, objects referenced by id, one lock to start.** System calls
+   declare the tables they touch; only the dispatcher locks. Recommended over mirroring Horizon's
+   linked, reference-counted objects: no `unsafe`, deterministic tests, and the single lock can
+   be split table by table later without touching the system calls. (Revised after owner review:
+   the first draft had one undivided arena.)
 2. **A closed `enum` of object kinds** rather than trait objects.
 3. **Server-side IPC, guest-hosted services and real system modules are deferred, not excluded.**
    The seven rules above keep them additive. (Revised after owner review: the first draft ruled
