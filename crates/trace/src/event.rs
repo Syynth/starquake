@@ -271,7 +271,8 @@ impl fmt::Display for EventKind {
 /// One structured event (spec: `Event`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Event {
-    /// Position in the global order, assigned by the recorder; strictly increasing.
+    /// Position in the global order, assigned by the recorder; strictly increasing until the
+    /// recorder's counter saturates (see [`Recorder::record`](crate::Recorder::record)).
     pub seq: u64,
     /// When it happened.
     pub time: GuestTicks,

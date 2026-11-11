@@ -71,7 +71,7 @@ pub enum EnvCall {
 /// One answer an [`Env`] gave, in the order given.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EnvRecord {
-    /// A clock reading.
+    /// A clock reading, in the unit of the clock that produced it (see [`Env::now`]).
     Clock(GuestTicks),
     /// A random number.
     Random(u64),
@@ -140,6 +140,12 @@ pub enum EnvError {
 /// because services run on several host threads.
 pub trait Env: Send + Sync {
     /// Read the clock.
+    ///
+    /// The unit is the unit of whatever [`HostClock`] the environment reads, not guest ticks:
+    /// [`SystemClock`] reports host nanoseconds and [`FixedClock`] reports whatever its caller
+    /// chose. [`GuestTicks`] is only the carrier type here. Converting to the guest counter's
+    /// frequency is the consumer's job (guess: the kernel's tick conversion; the spec does not
+    /// say where it happens).
     fn now(&self) -> Result<GuestTicks, EnvError>;
 
     /// Draw a random number.

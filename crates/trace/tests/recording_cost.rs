@@ -8,8 +8,9 @@
 //! cargo test --release -p starquake-trace --test recording_cost -- --ignored --nocapture
 //! ```
 //!
-//! It prints the mean cost per event over several rounds and asserts only that every event was
-//! recorded and kept, so it also cannot pass by measuring a no-op.
+//! It prints the mean cost per event over several rounds and asserts only that the rings are full
+//! and that the newest event kept is the last one the recorder numbered, so it also cannot pass by
+//! measuring a no-op.
 
 use std::hint::black_box;
 use std::io::Write;
@@ -34,26 +35,24 @@ fn cost_of_recording_one_event_with_only_the_flight_recorder() {
 
     let kind = EventKind::Svc {
         id: 0x1f,
-        args: [1, 2, 3, 4, 5, 6, 7, 8],
+        args: core::array::from_fn::<u64, SVC_ARG_COUNT, _>(|i| u64::try_from(i + 1).unwrap()),
         result: ResultCode(0),
     };
-    debug_assert_eq!(SVC_ARG_COUNT, 8);
 
     let mut per_event_ns = Vec::new();
-    let mut events_made = 0u64;
+    let mut last_seq = None;
     for _ in 0..ROUNDS {
         let start = Instant::now();
         for n in 0..EVENTS_PER_ROUND {
             let core = u8::try_from(usize::try_from(n).unwrap() % CORES).unwrap();
-            black_box(recorder.record(
+            last_seq = Some(black_box(recorder.record(
                 GuestTicks(u64::from(n)),
                 core,
                 ThreadId(0),
                 black_box(kind),
-            ));
+            )));
         }
         let elapsed = start.elapsed();
-        events_made += u64::from(EVENTS_PER_ROUND);
         per_event_ns.push(elapsed.as_secs_f64() * 1e9 / f64::from(EVENTS_PER_ROUND));
     }
 
@@ -67,16 +66,13 @@ fn cost_of_recording_one_event_with_only_the_flight_recorder() {
     )
     .unwrap();
 
-    // Every event was numbered and every ring is full of the newest events.
-    assert_eq!(
-        events_made,
-        u64::from(EVENTS_PER_ROUND) * u64::try_from(ROUNDS).unwrap()
-    );
+    // Every ring is full of the newest events, and the newest one kept is the last one the
+    // recorder numbered.
     let dump = flight.snapshot();
     assert_eq!(flight.unrouted(), 0);
     for core in &dump.cores {
         assert_eq!(core.events.len(), RING);
     }
     let newest = dump.merged().last().map(|e| e.seq);
-    assert_eq!(newest, Some(events_made - 1));
+    assert_eq!(newest, last_seq);
 }

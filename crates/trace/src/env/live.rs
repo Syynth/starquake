@@ -9,13 +9,16 @@ use crate::recorder::lock;
 
 /// Where a [`LiveEnv`] gets the time from.
 pub trait HostClock: Send {
-    /// The current time. Successive readings from one clock should not decrease.
+    /// The current time, in this clock's own unit. The [`GuestTicks`] type only carries the
+    /// number: it does not mean the unit is guest ticks (see [`Env::now`]). Successive readings
+    /// from one clock should not decrease.
     fn now(&mut self) -> GuestTicks;
 }
 
 /// The real monotonic host clock: nanoseconds since the clock was created, saturating at
-/// `u64::MAX`. The unit is host nanoseconds, not the guest counter's frequency; converting to
-/// guest ticks is the consumer's job.
+/// `u64::MAX`. The unit is host nanoseconds, not the guest counter's frequency, although the
+/// reading is carried in a [`GuestTicks`]; converting to guest ticks is the consumer's job
+/// (guess: see [`Env::now`]).
 #[derive(Debug)]
 pub struct SystemClock {
     start: Instant,

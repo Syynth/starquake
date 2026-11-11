@@ -6,7 +6,8 @@
 //! The kernel lock is not part of this crate, so the [`Recorder`] has its own: sequence
 //! assignment and delivery to every sink happen under one mutex. That makes two things hold even
 //! when several host threads record at once, without the caller holding any lock: sequence
-//! numbers are unique and strictly increasing, and every sink sees events in sequence order.
+//! numbers are unique and strictly increasing (up to the saturation point described on
+//! [`Recorder::record`]), and every sink sees events in sequence order.
 //! The cost is one uncontended-mutex acquisition per event; the measured total is in
 //! `tests/recording_cost.rs`.
 
@@ -88,8 +89,10 @@ impl Recorder {
     /// Record one event: assign it the next sequence number, deliver it to every sink in the
     /// order they were attached, and return the number.
     ///
-    /// The counter saturates at `u64::MAX` (reaching it takes 2^64 events) rather than wrapping,
-    /// so order is never silently broken.
+    /// The counter saturates at `u64::MAX` rather than wrapping. The first 2^64 - 1 events get
+    /// the numbers 0 to `u64::MAX` - 1, each once; from the 2^64th event on, every event gets
+    /// `u64::MAX`, so from then on `seq` is no longer strictly increasing and sorting by it no
+    /// longer reproduces the recording order. (Reaching that point takes 2^64 events.)
     pub fn record(&self, time: GuestTicks, core: u8, thread: ThreadId, kind: EventKind) -> u64 {
         let mut state = lock(&self.state);
         let seq = state.next_seq;
@@ -160,6 +163,16 @@ mod tests {
         let seen = late.events();
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].seq, 1);
+    }
+
+    #[test]
+    fn the_counter_saturates_and_repeats_the_last_number() {
+        let recorder = Recorder::new();
+        lock(&recorder.state).next_seq = u64::MAX - 1;
+        let seqs: Vec<u64> = (0..4)
+            .map(|n| recorder.record(GuestTicks(0), 0, ThreadId(0), note(n)))
+            .collect();
+        assert_eq!(seqs, [u64::MAX - 1, u64::MAX, u64::MAX, u64::MAX]);
     }
 
     #[test]

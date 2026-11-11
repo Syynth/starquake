@@ -17,10 +17,9 @@
 //! [`Schedule`]: EventKind::Schedule
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
 
 use crate::event::{Event, ThreadId};
-use crate::recorder::{Sink, lock};
+use crate::recorder::{Sink, VecSink};
 
 /// Render events as the golden-trace view.
 ///
@@ -51,7 +50,7 @@ pub fn golden_trace<'a>(events: impl IntoIterator<Item = &'a Event>) -> String {
 /// is meant for tests and for short homebrew runs, not long ones.
 #[derive(Debug, Default)]
 pub struct TextSink {
-    events: Mutex<Vec<Event>>,
+    events: VecSink,
 }
 
 impl TextSink {
@@ -64,13 +63,13 @@ impl TextSink {
     /// The golden-trace view of everything received so far (see [`golden_trace`]).
     #[must_use]
     pub fn render(&self) -> String {
-        golden_trace(lock(&self.events).iter())
+        golden_trace(self.events.events().iter())
     }
 }
 
 impl Sink for TextSink {
     fn record(&self, event: &Event) {
-        lock(&self.events).push(*event);
+        self.events.record(event);
     }
 }
 
