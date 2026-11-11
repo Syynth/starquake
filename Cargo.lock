@@ -529,6 +529,7 @@ dependencies = [
  "proptest",
  "sha2",
  "starquake-memory",
+ "starquake-testkit",
  "thiserror",
 ]
 
