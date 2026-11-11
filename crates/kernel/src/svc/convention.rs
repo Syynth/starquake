@@ -2,12 +2,13 @@
 //! which register each output goes to.
 //!
 //! Taken from Eden's generated wrappers (`SvcWrap_<Name>64` in `eden/src/core/hle/kernel/svc.cpp`
-//! @ cf654052, GPL-3.0-or-later), which read arguments from and write outputs to the first
-//! [`SVC_ARGUMENT_REGISTERS`] general registers. Two calls have no generated wrapper and are
-//! transcribed from their hand-written ones: `SendSyncRequestLight` (`SvcWrap_LightIpc` in
-//! `eden/src/core/hle/kernel/svc/svc_light_ipc.cpp` @ cf654052) and `SetGpuMemoryAttribute` (the
-//! 0x80 case of `Call64` in `eden-pr4588/src/core/hle/kernel/svc.cpp` @ e5fb3b97). The tests
-//! check [`CONVENTIONS`] entry by entry against a copy of those wrappers
+//! @ cf654052, GPL-3.0-or-later), which read arguments from and write outputs to `x0`-`x7`: they
+//! take `std::span<uint64_t, 8>`, which confirms the guess behind `starquake-trace`'s
+//! [`SVC_ARG_COUNT`], the count this module uses. Two of the calls with an entry here have no
+//! generated wrapper and are transcribed from their hand-written ones: `SendSyncRequestLight`
+//! (`SvcWrap_LightIpc` in `eden/src/core/hle/kernel/svc/svc_light_ipc.cpp` @ cf654052) and
+//! `SetGpuMemoryAttribute` (the 0x80 case of `Call64` in `eden-pr4588/src/core/hle/kernel/svc.cpp`
+//! @ e5fb3b97). The tests check [`CONVENTIONS`] entry by entry against a copy of those wrappers
 //! (`reference/svc_wrappers64.txt`).
 //!
 //! Only the calls retail titles may make have an entry ([`is_retail`]): milestones 1 and 2 need
@@ -19,16 +20,13 @@
 //! `static_assert`s to be 4 bytes.
 
 use starquake_cpu::GuestRegs;
+use starquake_trace::SVC_ARG_COUNT;
 
 use super::SvcId;
 
 mod table;
 
 pub use table::CONVENTIONS;
-
-/// How many registers carry system-call arguments and outputs: `x0`-`x7` (Eden's wrappers take
-/// `std::span<uint64_t, 8>`).
-pub const SVC_ARGUMENT_REGISTERS: usize = 8;
 
 /// The type of one argument or output, as it sits in a register.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -126,7 +124,7 @@ pub enum ConventionError {
 
 fn register_index(arg: &Arg) -> Result<usize, ConventionError> {
     let index = usize::from(arg.reg);
-    if index < SVC_ARGUMENT_REGISTERS {
+    if index < SVC_ARG_COUNT {
         Ok(index)
     } else {
         Err(ConventionError::Register(arg.reg))
@@ -310,7 +308,7 @@ mod tests {
         for (id, convention) in CONVENTIONS {
             for arg in convention.inputs.iter().chain(convention.outputs) {
                 assert!(
-                    usize::from(arg.reg) < SVC_ARGUMENT_REGISTERS,
+                    usize::from(arg.reg) < SVC_ARG_COUNT,
                     "{} {}",
                     id.name(),
                     arg.name

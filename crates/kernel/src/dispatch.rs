@@ -13,8 +13,9 @@
 //!   [`Status::Implemented`]) are logged and return [`KernelError::NotImplemented`] in `x0`. No
 //!   input makes the dispatcher panic.
 //! - **One recording point** (observability spec, "One recording point per boundary"): every
-//!   dispatch produces a [`Record`] with its sequence number, assigned and recorded while the lock
-//!   is held, so sorting by `seq` gives the kernel's order.
+//!   dispatch ends in a [`Record`] passed to a no-op hook while the lock is still held. When the
+//!   hook is wired to `starquake-trace`'s recorder, the recorder assigns the event's `seq` there,
+//!   under the kernel lock, so sorting by `seq` gives the kernel's order.
 //!
 //! Intentional divergences from Eden (`eden/src/core/hle/kernel/svc.cpp` @ cf654052, `Call64`),
 //! pinned by tests in `dispatch/tests.rs`:
@@ -23,6 +24,9 @@
 //! - Eden's generated wrapper for a call writes every output its convention lists (a void call
 //!   writes none). Here a call that isn't implemented writes [`KernelError::NotImplemented`] to
 //!   `x0` and leaves `x1`-`x7` as they were, whatever its convention lists, void calls included.
+//! - When the environment fails (a replay that doesn't match its recording), the call writes
+//!   nothing and the dispatch ends in [`Outcome::EnvFailed`]: there is no honest value to give the
+//!   guest, and the run has already diverged. Eden reads its clock directly and can't fail here.
 //!
 //! # A call can't reach a table it didn't declare
 //!
@@ -32,10 +36,10 @@
 //!
 //! ```
 //! use starquake_kernel::dispatch::Dispatcher;
-//! use starquake_kernel::svc::Env;
+//! use starquake_trace::{Env, EnvError, GuestTicks};
 //!
-//! fn get_system_tick(env: &dyn Env, _dispatcher: &Dispatcher) -> u64 {
-//!     env.system_tick()
+//! fn get_system_tick(env: &dyn Env, _dispatcher: &Dispatcher) -> Result<u64, EnvError> {
+//!     env.now().map(|GuestTicks(ticks)| ticks)
 //! }
 //! ```
 //!
@@ -44,11 +48,11 @@
 //!
 //! ```compile_fail,E0616
 //! use starquake_kernel::dispatch::Dispatcher;
-//! use starquake_kernel::svc::Env;
+//! use starquake_trace::{Env, EnvError, GuestTicks};
 //!
-//! fn get_system_tick(env: &dyn Env, _dispatcher: &Dispatcher) -> u64 {
-//!     let _scheduler = &_dispatcher.state;
-//!     env.system_tick()
+//! fn get_system_tick(env: &dyn Env, _dispatcher: &Dispatcher) -> Result<u64, EnvError> {
+//!     let _scheduler = &_dispatcher.tables;
+//!     env.now().map(|GuestTicks(ticks)| ticks)
 //! }
 //! ```
 //!
@@ -57,11 +61,11 @@
 //!
 //! ```compile_fail,E0507
 //! use starquake_kernel::dispatch::Dispatcher;
-//! use starquake_kernel::svc::Env;
+//! use starquake_trace::{Env, EnvError, GuestTicks};
 //!
-//! fn get_system_tick(env: &dyn Env, _dispatcher: &Dispatcher) -> u64 {
+//! fn get_system_tick(env: &dyn Env, _dispatcher: &Dispatcher) -> Result<u64, EnvError> {
 //!     let _scheduler = _dispatcher.into_tables().scheduler;
-//!     env.system_tick()
+//!     env.now().map(|GuestTicks(ticks)| ticks)
 //! }
 //! ```
 //!
@@ -71,12 +75,11 @@ use std::sync::{Mutex, PoisonError};
 
 use starquake_cpu::GuestRegs;
 use starquake_memory::GuestMemory;
+use starquake_trace::{Env, EnvError, SVC_ARG_COUNT};
 
 use crate::handle::HandleTable;
 use crate::result::{KernelError, ResultCode, result_code};
-use crate::svc::{
-    Convention, ConventionError, DebugSink, Env, Status, SvcId, debug, processor, tick,
-};
+use crate::svc::{Convention, ConventionError, DebugSink, Status, SvcId, debug, processor, tick};
 use crate::tables::{AddressSpace, Processes, Scheduler};
 
 #[cfg(test)]
@@ -89,7 +92,7 @@ const RESULT_REGISTER: usize = 0;
 ///
 /// One of each for now: a second process brings its own handle table and address space (kernel
 /// spec, rule 2), and this struct grows per-process maps.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Tables {
     /// The process's handle table; first in lock order.
     pub handles: HandleTable,
@@ -106,7 +109,7 @@ pub struct Tables {
 pub struct Caller<'a> {
     /// The index of the core making the call.
     pub core: u8,
-    /// The injectable environment (clock).
+    /// The injectable environment (observability spec, rule 1).
     pub env: &'a dyn Env,
     /// The calling process's memory.
     pub memory: &'a dyn GuestMemory,
@@ -115,52 +118,46 @@ pub struct Caller<'a> {
 }
 
 /// How a dispatch ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     /// An implemented call ran and wrote its outputs (which may include an error result).
     Completed,
     /// The number is unlisted or the call isn't implemented: `x0` holds
     /// [`KernelError::NotImplemented`].
     NotImplemented,
+    /// The environment failed, so the call wrote nothing. Only a replay that has diverged from its
+    /// recording does this; the caller should stop the run and report it.
+    EnvFailed(EnvError),
 }
 
-/// One dispatched system call, as the recording point sees it.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// One dispatched system call, as the recording point sees it: the fields of the event stream's
+/// `EventKind::Svc` that only the dispatcher knows.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Record {
-    /// Position in the kernel's global order, assigned under the lock; starts at 0.
-    pub seq: u64,
     /// The calling core.
     pub core: u8,
     /// The `svc` immediate.
     pub number: u16,
     /// The call, if the number is listed.
     pub id: Option<SvcId>,
+    /// `x0`-`x7` as the guest passed them, before the call.
+    pub args: [u64; SVC_ARG_COUNT],
     /// How it ended.
     pub outcome: Outcome,
-}
-
-/// The lock's contents: the tables and the next sequence number.
-#[derive(Debug)]
-struct State {
-    tables: Tables,
-    next_seq: u64,
 }
 
 /// Runs system calls against the kernel's tables, one at a time.
 #[derive(Debug)]
 pub struct Dispatcher {
-    state: Mutex<State>,
+    tables: Mutex<Tables>,
 }
 
 impl Dispatcher {
-    /// A dispatcher over these tables. The first dispatch gets sequence number 0.
+    /// A dispatcher over these tables.
     #[must_use]
     pub fn new(tables: Tables) -> Self {
         Self {
-            state: Mutex::new(State {
-                tables,
-                next_seq: 0,
-            }),
+            tables: Mutex::new(tables),
         }
     }
 
@@ -168,11 +165,12 @@ impl Dispatcher {
     /// writes its outputs back to `regs`.
     pub fn dispatch(&self, number: u16, regs: &mut GuestRegs, caller: &mut Caller<'_>) -> Record {
         // A poisoned lock means a panic elsewhere; the tables are still plain data, so carry on.
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        let seq = state.next_seq;
-        // Not guest-controlled: one per call, so it can't wrap in practice.
-        state.next_seq = seq.wrapping_add(1);
+        let guard = self.tables.lock().unwrap_or_else(PoisonError::into_inner);
 
+        let mut args = [0; SVC_ARG_COUNT];
+        for (arg, register) in args.iter_mut().zip(&regs.x) {
+            *arg = *register;
+        }
         let id = SvcId::from_number(number);
         let outcome = if let Some(id) = id {
             run(id, regs, caller)
@@ -181,30 +179,30 @@ impl Dispatcher {
             not_implemented(regs)
         };
         let record = Record {
-            seq,
             core: caller.core,
             number,
             id,
+            args,
             outcome,
         };
         record_point(&record);
-        drop(state);
+        drop(guard);
         record
     }
 
     /// Takes the tables back, for a snapshot or a test's inspection.
     #[must_use]
     pub fn into_tables(self) -> Tables {
-        self.state
+        self.tables
             .into_inner()
             .unwrap_or_else(PoisonError::into_inner)
-            .tables
     }
 }
 
 /// RECORDING POINT for the event stream: the dispatcher's one call into the recorder
-/// (observability spec, "The event stream"). A no-op until the recorder lands. It runs with the
-/// kernel lock held, after the call, so events are recorded in `seq` order.
+/// (observability spec, "The event stream"). A no-op until it is wired to `starquake-trace`'s
+/// `Recorder`. It runs after the call with the kernel lock still held, so the recorder's `seq`
+/// follows the kernel's order.
 fn record_point(_record: &Record) {}
 
 /// Runs one listed call. Calls that touch tables will get them here, borrowed from the locked
@@ -218,10 +216,13 @@ fn run(id: SvcId, regs: &mut GuestRegs, caller: &mut Caller<'_>) -> Outcome {
             let core = processor::get_current_processor_number(caller.core);
             complete(id, convention, regs, &[u64::from(core.cast_unsigned())])
         }
-        SvcId::GetSystemTick => {
-            let tick = tick::get_system_tick(caller.env);
-            complete(id, convention, regs, &[tick])
-        }
+        SvcId::GetSystemTick => match tick::get_system_tick(caller.env) {
+            Ok(tick) => complete(id, convention, regs, &[tick]),
+            Err(error) => {
+                tracing::error!(name = id.name(), %error, "environment failed");
+                Outcome::EnvFailed(error)
+            }
+        },
         SvcId::OutputDebugString => match convention.read(regs) {
             Ok([address, len]) => {
                 let result =

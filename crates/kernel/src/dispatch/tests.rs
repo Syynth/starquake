@@ -1,6 +1,7 @@
 //! The dispatcher driven with a fake register file, environment, memory and debug sink.
 
 use starquake_memory::FlatMemory;
+use starquake_trace::{EnvCall, FixedClock, LiveEnv, ReplayEnv};
 
 use super::*;
 use crate::svc::{Arg, Kind};
@@ -9,11 +10,18 @@ use crate::svc::{Arg, Kind};
 const BASE: u64 = 0x80_0000_0000;
 const TICK: u64 = 0xfedc_ba98_7654_3210;
 
-struct FakeEnv;
+/// A live environment whose clock reads `TICK` first.
+fn env() -> LiveEnv {
+    LiveEnv::new(FixedClock::new(TICK, 1), 0)
+}
 
-impl Env for FakeEnv {
-    fn system_tick(&self) -> u64 {
-        TICK
+/// Fresh placeholder tables. The one place the tests build them.
+fn tables() -> Tables {
+    Tables {
+        handles: HandleTable::default(),
+        address_space: AddressSpace::default(),
+        scheduler: Scheduler::default(),
+        processes: Processes::default(),
     }
 }
 
@@ -47,10 +55,11 @@ fn dispatch_one(
     memory: &FlatMemory,
     sink: &mut Collect,
 ) -> Record {
-    let dispatcher = Dispatcher::new(Tables::default());
+    let dispatcher = Dispatcher::new(tables());
+    let env = env();
     let mut caller = Caller {
         core,
-        env: &FakeEnv,
+        env: &env,
         memory,
         debug: sink,
     };
@@ -175,13 +184,15 @@ fn unknown_numbers_return_not_implemented_and_touch_only_x0() {
         let mut regs = regs();
         let before = regs.clone();
         let record = dispatch_one(number, &mut regs, 1, &memory, &mut sink);
+        let mut args = [0; SVC_ARG_COUNT];
+        args.copy_from_slice(&before.x[..SVC_ARG_COUNT]);
         assert_eq!(
             record,
             Record {
-                seq: 0,
                 core: 1,
                 number,
                 id: None,
+                args,
                 outcome: Outcome::NotImplemented,
             }
         );
@@ -194,10 +205,11 @@ fn unknown_numbers_return_not_implemented_and_touch_only_x0() {
 fn every_unlisted_number_is_handled_without_panicking() {
     let memory = FlatMemory::new(BASE, 0x10);
     let mut sink = Collect::default();
-    let dispatcher = Dispatcher::new(Tables::default());
+    let dispatcher = Dispatcher::new(tables());
+    let env = env();
     let mut caller = Caller {
         core: 0,
-        env: &FakeEnv,
+        env: &env,
         memory: &memory,
         debug: &mut sink,
     };
@@ -267,28 +279,66 @@ fn the_dispatcher_runs_exactly_the_calls_marked_implemented() {
 }
 
 #[test]
-fn sequence_numbers_count_every_dispatch_in_order() {
+fn one_dispatcher_serves_calls_in_turn_and_records_the_arguments_as_passed() {
     let memory = FlatMemory::new(BASE, 0x10);
     let mut sink = Collect::default();
-    let dispatcher = Dispatcher::new(Tables::default());
+    let dispatcher = Dispatcher::new(tables());
+    let env = env();
     let mut caller = Caller {
         core: 2,
-        env: &FakeEnv,
+        env: &env,
         memory: &memory,
         debug: &mut sink,
     };
-    let numbers = [
+    for number in [
         SvcId::GetSystemTick.number(),
         u16::MAX,
         SvcId::SetHeapSize.number(),
-        SvcId::GetCurrentProcessorNumber.number(),
-    ];
-    let seqs: Vec<u64> = numbers
-        .iter()
-        .map(|&n| dispatcher.dispatch(n, &mut regs(), &mut caller).seq)
-        .collect();
-    assert_eq!(seqs, [0, 1, 2, 3]);
+        SvcId::GetSystemTick.number(),
+    ] {
+        let mut regs = regs();
+        let before = regs.clone();
+        let record = dispatcher.dispatch(number, &mut regs, &mut caller);
+        // The record holds x0-x7 from before the call, not the outputs written over them.
+        assert_eq!(record.args[..], before.x[..SVC_ARG_COUNT]);
+        assert_ne!(regs.x[0], before.x[0]);
+        assert_eq!((record.core, record.number), (2, number));
+    }
+    // The clock was read once per GetSystemTick, in order, and nothing else touched it.
+    assert_eq!(
+        env.recording(),
+        [
+            starquake_trace::EnvRecord::Clock(starquake_trace::GuestTicks(TICK)),
+            starquake_trace::EnvRecord::Clock(starquake_trace::GuestTicks(TICK + 1)),
+        ]
+    );
     let _tables: Tables = dispatcher.into_tables();
+}
+
+#[test]
+fn a_failing_environment_ends_the_call_without_writing_registers() {
+    // A replay with no clock reading left: Env::now fails, so GetSystemTick has nothing to return.
+    let memory = FlatMemory::new(BASE, 0x10);
+    let mut sink = Collect::default();
+    let dispatcher = Dispatcher::new(tables());
+    let env = ReplayEnv::new(Vec::new());
+    let mut caller = Caller {
+        core: 0,
+        env: &env,
+        memory: &memory,
+        debug: &mut sink,
+    };
+    let mut regs = regs();
+    let before = regs.clone();
+    let record = dispatcher.dispatch(SvcId::GetSystemTick.number(), &mut regs, &mut caller);
+    assert_eq!(
+        record.outcome,
+        Outcome::EnvFailed(EnvError::Exhausted {
+            index: 0,
+            requested: EnvCall::Clock
+        })
+    );
+    assert_untouched_from(&regs, &before, 0);
 }
 
 #[test]

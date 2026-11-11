@@ -7,7 +7,7 @@
 //! | Call | Function | Parameters |
 //! |---|---|---|
 //! | `GetCurrentProcessorNumber` (0x10) | [`processor::get_current_processor_number`] | the calling core |
-//! | `GetSystemTick` (0x1e) | [`tick::get_system_tick`] | the [`Env`] |
+//! | `GetSystemTick` (0x1e) | [`tick::get_system_tick`] | the [`Env`](starquake_trace::Env) |
 //! | `OutputDebugString` (0x27) | [`debug::output_debug_string`] | guest memory and a [`DebugSink`] |
 //!
 //! Only the [dispatcher](crate::dispatch) calls them, decoding their arguments with the call's
@@ -15,14 +15,10 @@
 
 mod convention;
 pub mod debug;
-mod env;
 mod ids;
 pub mod processor;
 pub mod tick;
 
-pub use convention::{
-    Arg, CONVENTIONS, Convention, ConventionError, Kind, SVC_ARGUMENT_REGISTERS, is_retail,
-};
+pub use convention::{Arg, CONVENTIONS, Convention, ConventionError, Kind, is_retail};
 pub use debug::DebugSink;
-pub use env::Env;
 pub use ids::{Status, SvcId};

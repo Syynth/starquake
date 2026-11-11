@@ -515,6 +515,7 @@ dependencies = [
  "starquake-cpu",
  "starquake-ipc",
  "starquake-memory",
+ "starquake-trace",
  "thiserror",
  "tracing",
 ]
