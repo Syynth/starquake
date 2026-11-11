@@ -40,10 +40,15 @@ Platform-specific code must still compile (or be `cfg`-gated) on Linux; check wi
   reaching around a layer.
 - Guest-controlled values are untrusted: checked arithmetic and bounds on anything derived from
   guest memory, file contents or IPC words. A malformed input is an `Err`, never a panic.
+  Check arithmetic for the whole extent written or read (start, end, trailing data), not just
+  the start, and bound loops over untrusted structures by the structure actually walked.
 - Compatibility comes first. A design may defer a feature (server-side IPC, real system modules,
   homebrew services), but must not rule it out, and must say how it could be added later.
 - Protocol facts (command ids, struct layouts) need a source in a comment: a scoping-doc row, a
-  reference path and commit, or a trace. Mark guesses as guesses.
+  reference path and commit, or a trace. Mark guesses as guesses, and say what would confirm them.
+- When mirroring reference behaviour, cite the exact check and its constant. Where starquake is
+  stricter or looser than the reference, list the divergence in the module docs and pin it with
+  a test. No blanket claims ("every failure", "all replies"): state the exact set or condition.
 
 ## Code style
 
@@ -62,12 +67,23 @@ Platform-specific code must still compile (or be `cfg`-gated) on Linux; check wi
   why it's needed in the PR. Prefer pure-Rust crates; no C/C++ build steps in the default build.
 - Every public item gets a doc comment. `//!` docs at the top of each module say what it owns.
 - Modules are `foo.rs` + `foo/`, not `foo/mod.rs`.
+- Don't duplicate logic across sibling modules; extract one `pub(crate)` helper and call it from
+  both.
 
 ## Tests
 
-- Write the test first and watch it fail before making it pass.
-- Deterministic: explicit seeds, and no `HashMap` iteration where order affects output.
-- Tests import the shipping constants; they don't restate literals.
+- Write the test first and watch it fail before making it pass. A test added for a fix is run
+  against the unfixed code first; say in the PR that it failed.
+- Deterministic: explicit seeds, and no `HashMap` iteration where order affects output. Every
+  `proptest!` block sets a fixed `rng_seed`.
+- Tests import the shipping constants; they don't restate literals. Expectations are derived from
+  the shipping bound, with boundary cases exactly at the limit.
+- A parser or decoder that reads several ordered fields or lists gets a generated
+  build-then-parse round-trip test that fails if any two reads are swapped.
+- Negative tests assert the exact error (variant, exit code, message), so a missing or broken
+  implementation can't pass them.
+- Never hide a flaky test behind retries: reproduce it under plain `cargo test` as well as
+  nextest, find the root cause, and document a platform quirk where it is one.
 - Unit tests in `#[cfg(test)] mod tests`; cross-module tests in `tests/`. `proptest` for parsers
   and encoders, `insta` for snapshots.
 - Hypervisor tests need a real Mac. They skip themselves only when the `CI` environment variable
@@ -86,6 +102,9 @@ Platform-specific code must still compile (or be `cfg`-gated) on Linux; check wi
   `docs/proposals.md`; the owner promotes the ones worth doing to issues. Work that belongs to
   an existing issue goes there as a comment.
 - Implementation PRs may merge on a green gate and review. Design and spec PRs wait for the owner.
+- Never merge before the PR's own CI checks have been reported and passed; a green local gate is
+  not enough, and "no checks reported" means wait. Verify PR-body claims (test counts, how tests
+  were run) before stating them.
 - Never `git stash` (worktrees share one stash). Stage explicit paths.
 - No local paths, usernames or unrelated personal-project details in code, docs, issues, PRs or
   commit messages.

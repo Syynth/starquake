@@ -120,3 +120,11 @@ Entry format:
 - **SCOPE:** architectural
 - **WHAT:** The owner approved the execution model, observability and replay, kernel, service framework and test strategy specs (`docs/specs/`) as written on 2026-11-11, with each spec's recommended option standing where the owner didn't revise it. Notably: deferred replies instead of service threads; stage-1 page tables carry all fine-grained mapping; one event stream with an always-on flight recorder; all nondeterminism through an injectable environment; snapshots as a standing rule for kernel and service state; a deterministic interpreter backend for tests; a fixed memory layout by default; permission violations logged before they are enforced; auto-stub on for bring-up and strict in tests. Changing any of these means amending the spec with the owner's approval.
 - **WHY:** The owner walked through each spec's decisions and tradeoffs, revised the ones they were concerned about (the kernel's server side and state model, service queueing and handler style, test support), and accepted the recommendations for the rest so that kernel work could start.
+
+## First proposals vetted: six promoted, eight house rules adopted
+- **WHEN:** 2026-11-11
+- **PROJECT:** starquake
+- **SYSTEM:** process
+- **SCOPE:** moderate
+- **WHAT:** The owner vetted the first 26 entries in `docs/proposals.md`. Six work items became issues (#63-#68), two were folded into existing work, one was dropped and one stays proposed (ExeFS/RomFS/NCA loading, until milestone 2 planning). Eight rules from the wave 1 and 2 reviews were adopted into `CLAUDE.md`: fixed proptest seeds; expectations from shipping constants at the exact limit; swap-detecting round-trip tests for parsers; guesses marked and divergences from the reference pinned by tests; whole-extent arithmetic checks on untrusted input; no retries for flaky tests and exact negative assertions; no duplicated logic across sibling modules; and the merge queue waits for a PR's own CI checks. Two candidates were dropped as house rules.
+- **WHY:** The rules each came from a real review finding in agent-written code, and the owner wants recurring mistakes turned into standing rules. Hygiene items were promoted where they are small and prevent recurrence; larger or premature items wait.
