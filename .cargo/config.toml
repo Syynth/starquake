@@ -1,5 +1,10 @@
+# `cargo xtask` builds and runs the xtask binary in a folder inside the checkout, not in
+# CARGO_TARGET_DIR: worktrees of a wave share that variable's folder, and a shared
+# `debug/xtask` would run whichever checkout built it last. The cargo commands xtask spawns do
+# not see the flag, so they keep using CARGO_TARGET_DIR (or `target/`). The path is relative to
+# the directory cargo is invoked in, so run `cargo xtask` (or `just ci`) from the repository root.
 [alias]
-xtask = "run --package xtask --quiet --"
+xtask = "run --package xtask --quiet --target-dir target/xtask --"
 
 # Signs binaries with the hypervisor entitlement before running them.
 [target.aarch64-apple-darwin]

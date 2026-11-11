@@ -61,6 +61,14 @@ reviewed adversarially, and landed one at a time through a merge queue behind `c
 - One shared build folder for a wave (`CARGO_TARGET_DIR`), warmed before the wave starts, with
   incremental compilation off. Dev builds carry no debug info.
 - `cargo xtask ci` refuses to build with less than 15 GiB free.
+- The `xtask` binary is per checkout, not shared. The `cargo xtask` alias (`.cargo/config.toml`)
+  passes `--target-dir target/xtask`, so the binary is built and run from a folder inside the
+  checkout, while the cargo commands it spawns inherit `CARGO_TARGET_DIR` and keep building in the
+  shared folder. Without this, worktrees sharing a build folder overwrite each other's
+  `debug/xtask` and one runs another's gate. Run `cargo xtask` (or `just ci`) from the repository
+  root: the path is relative to the directory cargo is started in.
+  `xtask/tests/per_checkout_binary.rs` runs two checkouts with different `xtask` sources against
+  one shared folder and checks that each runs its own.
 - Worktrees are removed when their PR lands; reference sources are one shared checkout.
 - CI: Linux on every PR; macOS on `main`, and on PRs only for a narrow fmt/clippy/build job when
   `crates/cpu`, `crates/memory` (a dependency of the hvf backend), `tools/hvprobe`,
