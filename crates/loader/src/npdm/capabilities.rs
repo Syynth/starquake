@@ -8,10 +8,10 @@
 //! comes from). `eden-nx2/tools/nx2/npdm_info.py` is the independent reader the layouts were
 //! cross-checked against.
 //!
-//! This decodes and validates structure; it does not enforce policy (the kernel decides whether a
-//! core id or physical address is acceptable), except where Eden rejects a descriptor outright:
-//! reserved bits set, a map-range without its pair, a zero kernel major version, duplicate
-//! once-only descriptors and reversed core or priority ranges.
+//! This decodes and validates structure. Policy (whether a core id, priority or physical address
+//! is acceptable) is separate: [`KernelCapabilities::check_policy`]. Parsing itself rejects only
+//! what Eden rejects outright: reserved bits set, a map-range without its pair, a zero kernel
+//! major version, duplicate once-only descriptors and reversed core or priority ranges.
 //!
 //! Unknown descriptor types are collected in [`KernelCapabilities::unknown`] rather than rejected,
 //! because Switch 2 titles may add types that the Eden reference predates. A word with bit 0
@@ -38,11 +38,41 @@ const TYPE_KERNEL_VERSION: u32 = 14;
 const TYPE_HANDLE_TABLE: u32 = 15;
 const TYPE_DEBUG_FLAGS: u32 = 16;
 
-/// Number of SVC ids the mask can express: 8 indices of 24 bits (`SyscallMask::index` is 3 bits,
-/// `SyscallMask::mask` 24).
-pub const SVC_ID_LIMIT: u32 = 8 * 24;
-/// Bits per `SyscallMask` descriptor.
+/// Bits per `SyscallMask` descriptor (`SyscallMask::mask` is 24 bits wide).
 const SVC_BITS_PER_INDEX: u32 = 24;
+/// Bit position of `SyscallMask::mask` in the descriptor.
+const SVC_MASK_SHIFT: u32 = 5;
+/// Bit position of `SyscallMask::index` in the descriptor.
+const SVC_INDEX_SHIFT: u32 = 29;
+/// Width of `SyscallMask::index`.
+const SVC_INDEX_WIDTH: u32 = 3;
+/// Number of `SyscallMask` indices (`SyscallMask::index` is 3 bits).
+const SVC_INDEX_COUNT: u32 = 1 << SVC_INDEX_WIDTH;
+/// Number of SVC ids the mask can express: [`SVC_INDEX_COUNT`] indices of [`SVC_BITS_PER_INDEX`]
+/// bits.
+pub const SVC_ID_LIMIT: u32 = SVC_INDEX_COUNT * SVC_BITS_PER_INDEX;
+
+/// Width of each priority field in `CorePriority`.
+const PRIORITY_WIDTH: u32 = 6;
+/// Width of each core field in `CorePriority`.
+const CORE_WIDTH: u32 = 8;
+/// Bit position of `CorePriority::lowest_thread_priority` (the numerically largest priority).
+const MAX_PRIORITY_SHIFT: u32 = 4;
+/// Bit position of `CorePriority::highest_thread_priority` (the numerically smallest priority).
+const MIN_PRIORITY_SHIFT: u32 = 10;
+/// Bit position of `CorePriority::minimum_core_id`.
+const MIN_CORE_SHIFT: u32 = 16;
+/// Bit position of `CorePriority::maximum_core_id`.
+const MAX_CORE_SHIFT: u32 = 24;
+
+/// Width of `KernelVersion::major_version`; it sits at the top of the descriptor.
+const KERNEL_MAJOR_WIDTH: u32 = 13;
+/// Width of `KernelVersion::minor_version`.
+const KERNEL_MINOR_WIDTH: u32 = 4;
+/// Bit position of `KernelVersion::minor_version`.
+const KERNEL_MINOR_SHIFT: u32 = 15;
+/// Bit position of `KernelVersion::major_version`.
+const KERNEL_MAJOR_SHIFT: u32 = KERNEL_MINOR_SHIFT + KERNEL_MINOR_WIDTH;
 
 /// A set of SVC numbers, decoded from the syscall-mask descriptors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -78,6 +108,21 @@ impl SvcMask {
     }
 }
 
+/// Bits of physical address a memory map may use
+/// (`KCapabilities::PhysicalMapAllowedMask = (1ULL << 36) - 1` in `k_capabilities.h`).
+pub const PHYSICAL_ADDRESS_BITS: u32 = 36;
+/// Numerically largest (lowest-priority) thread priority
+/// (`Svc::LowestThreadPriority` in `eden/src/core/hle/kernel/svc_types.h`; the highest is 0).
+pub const LOWEST_THREAD_PRIORITY: u8 = 63;
+/// Eden's bound on the highest core a capability may name: `Core::Hardware::NumVirtualCores`,
+/// which is `Common::BitSize<u64>()` (64) in `eden/src/core/hardware_properties.h` and in the
+/// Eden-NX2 and PR 4588 trees. Pass this to [`KernelCapabilities::check_policy`] to apply exactly
+/// Eden's rule.
+pub const EDEN_CAPABILITY_CORE_LIMIT: u32 = 64;
+/// Number of thread priorities, from 0, that belong to the kernel and that a process capability
+/// must not include (`(m_priority_mask & 0xF) == 0` in `SetCorePriorityCapability`).
+pub const RESERVED_KERNEL_PRIORITIES: u8 = 4;
+
 /// Core and priority ranges the title may use (`KCapabilities::CorePriority`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThreadInfo {
@@ -85,6 +130,51 @@ pub struct ThreadInfo {
     pub priorities: RangeInclusive<u8>,
     /// Cores allowed, lowest to highest.
     pub cores: RangeInclusive<u8>,
+}
+
+impl ThreadInfo {
+    /// True if `core` is in the core range (the core-mask test in `CreateThread`,
+    /// `eden/src/core/hle/kernel/svc/svc_thread.cpp`).
+    pub fn allows_core(&self, core: u8) -> bool {
+        self.cores.contains(&core)
+    }
+
+    /// True if `priority` is in the priority range (`KProcess::CheckThreadPriority`).
+    pub fn allows_priority(&self, priority: u8) -> bool {
+        self.priorities.contains(&priority)
+    }
+}
+
+/// A capability that Eden accepts structurally but its kernel rejects as policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum PolicyViolation {
+    /// The highest core named is not below the `core_count` the caller passed. Eden's rule is
+    /// `R_UNLESS(max_core < NumVirtualCores, ResultInvalidCoreId)` with `NumVirtualCores` = 64
+    /// ([`EDEN_CAPABILITY_CORE_LIMIT`]); with a smaller `core_count` this is stricter than Eden
+    /// (see [`KernelCapabilities::check_policy`]).
+    #[error("capability names core {max_core}, but there are only {core_count} cores")]
+    CoreOutOfRange {
+        /// Highest core in the range.
+        max_core: u8,
+        /// Cores the caller says exist.
+        core_count: u32,
+    },
+    /// The priority range includes a priority the kernel keeps for itself
+    /// (`R_UNLESS((m_priority_mask & 0xF) == 0, ResultInvalidArgument)`).
+    #[error("capability includes kernel thread priority {highest}")]
+    KernelPriority {
+        /// Numerically lowest (highest-priority) entry of the range.
+        highest: u8,
+    },
+    /// A memory map ends beyond the 36-bit physical address space
+    /// (`((phys_addr + size - 1) & ~PhysicalMapAllowedMask) == 0`).
+    #[error("memory map of {size:#x} bytes at {address:#x} leaves the 36-bit physical space")]
+    PhysicalRange {
+        /// Start of the map.
+        address: u64,
+        /// Size of the map.
+        size: u64,
+    },
 }
 
 /// What kind of mapping a [`MemoryMap`] asks for.
@@ -110,6 +200,21 @@ pub struct MemoryMap {
     pub read_only: bool,
     /// Which descriptor form this came from.
     pub kind: MemoryMapKind,
+}
+
+impl MemoryMap {
+    /// One past the last byte, or `None` if `address + size` overflows 64 bits.
+    pub fn end(&self) -> Option<u64> {
+        self.address.checked_add(self.size)
+    }
+
+    /// True if every byte of the map is below 2^[`PHYSICAL_ADDRESS_BITS`]. Checks the whole
+    /// extent, not just the start: the start alone always fits, because the descriptor's address
+    /// field is a 24-bit page number, but the size can carry the end past the limit.
+    pub fn fits_physical_address_space(&self) -> bool {
+        self.end()
+            .is_some_and(|end| end <= 1u64 << PHYSICAL_ADDRESS_BITS)
+    }
 }
 
 /// A kernel memory region a title may map (`KCapabilities::RegionType`).
@@ -233,6 +338,56 @@ pub enum CapabilityError {
 }
 
 impl KernelCapabilities {
+    /// Checks the policy rules Eden's kernel applies to a process's capabilities on top of the
+    /// structural checks in [`KernelCapabilities::parse`], and returns the first one broken.
+    ///
+    /// Rules, each from `eden/src/core/hle/kernel/k_capabilities.cpp`:
+    ///
+    /// - the highest core is below `core_count`,
+    /// - the priority range excludes the first [`RESERVED_KERNEL_PRIORITIES`] priorities,
+    /// - every memory map ends within 2^[`PHYSICAL_ADDRESS_BITS`].
+    ///
+    /// The kernel checks the map rule when it applies the descriptor, so the map error here is
+    /// the first map in descriptor order that fails.
+    ///
+    /// # Intentional divergence: the core bound
+    ///
+    /// Eden bounds the highest core by `NumVirtualCores`, which is 64 in all three pinned trees
+    /// (`Common::BitSize<u64>()` in `hardware_properties.h`), so mainline Eden accepts cores
+    /// 0..=63 in a capability. The 4 (mainline) and 6 (Eden-NX2) core counts in those trees are
+    /// `NUM_CPU_CORES`, which bounds `IsValidVirtualCoreId` in `svc_thread.cpp`, a different
+    /// check on a thread's core at `CreateThread`. `core_count` is a parameter here so a caller
+    /// can check titles against the cores its own guest has; with `core_count` below 64 this
+    /// rejects capabilities that Eden accepts. That strictness is a guess (no source says a
+    /// console refuses such a title); [`EDEN_CAPABILITY_CORE_LIMIT`] gives Eden's behaviour. A
+    /// test pins both.
+    pub fn check_policy(&self, core_count: u32) -> Result<(), PolicyViolation> {
+        if let Some(info) = &self.thread_info {
+            let max_core = *info.cores.end();
+            if u32::from(max_core) >= core_count {
+                return Err(PolicyViolation::CoreOutOfRange {
+                    max_core,
+                    core_count,
+                });
+            }
+            let highest = *info.priorities.start();
+            if highest < RESERVED_KERNEL_PRIORITIES {
+                return Err(PolicyViolation::KernelPriority { highest });
+            }
+        }
+        match self
+            .memory_maps
+            .iter()
+            .find(|map| !map.fits_physical_address_space())
+        {
+            Some(map) => Err(PolicyViolation::PhysicalRange {
+                address: map.address,
+                size: map.size,
+            }),
+            None => Ok(()),
+        }
+    }
+
     /// Decodes a list of capability words.
     pub fn parse(words: &[u32]) -> Result<Self, CapabilityError> {
         let mut caps = Self::default();
@@ -289,13 +444,13 @@ impl KernelCapabilities {
                     if caps.kernel_version.is_some() {
                         return Err(CapabilityError::Duplicate { index: at });
                     }
-                    let major = field(raw, 19, 13);
+                    let major = field(raw, KERNEL_MAJOR_SHIFT, KERNEL_MAJOR_WIDTH);
                     if major == 0 {
                         return Err(CapabilityError::ZeroKernelVersion { index: at });
                     }
                     caps.kernel_version = Some(KernelVersion {
                         major: narrow(major),
-                        minor: narrow(field(raw, 15, 4)),
+                        minor: narrow(field(raw, KERNEL_MINOR_SHIFT, KERNEL_MINOR_WIDTH)),
                     });
                 }
                 TYPE_HANDLE_TABLE => {
@@ -333,10 +488,10 @@ impl KernelCapabilities {
         if self.thread_info.is_some() {
             return Err(CapabilityError::Duplicate { index });
         }
-        let max_priority = field(raw, 4, 6);
-        let min_priority = field(raw, 10, 6);
-        let min_core = field(raw, 16, 8);
-        let max_core = field(raw, 24, 8);
+        let max_priority = field(raw, MAX_PRIORITY_SHIFT, PRIORITY_WIDTH);
+        let min_priority = field(raw, MIN_PRIORITY_SHIFT, PRIORITY_WIDTH);
+        let min_core = field(raw, MIN_CORE_SHIFT, CORE_WIDTH);
+        let max_core = field(raw, MAX_CORE_SHIFT, CORE_WIDTH);
         if min_priority > max_priority || min_core > max_core {
             return Err(CapabilityError::ReversedRange { index });
         }
@@ -354,8 +509,8 @@ impl KernelCapabilities {
         index: usize,
         seen: &mut u32,
     ) -> Result<(), CapabilityError> {
-        let mask = field(raw, 5, 24);
-        let svc_index = field(raw, 29, 3);
+        let mask = field(raw, SVC_MASK_SHIFT, SVC_BITS_PER_INDEX);
+        let svc_index = field(raw, SVC_INDEX_SHIFT, SVC_INDEX_WIDTH);
         let flag = 1u32 << svc_index;
         if *seen & flag != 0 {
             return Err(CapabilityError::Duplicate { index });
@@ -425,6 +580,52 @@ fn narrow<T: TryFrom<u32> + Default>(value: u32) -> T {
     T::try_from(value).unwrap_or_default()
 }
 
+/// Test-side encoders shared by the `npdm` tests: build descriptors from fields with the
+/// shipping layout constants, independently of the decoder's control flow.
+#[cfg(test)]
+pub(crate) mod encode {
+    use super::*;
+
+    /// Low bits of a descriptor of type `ty`: `ty` one bits, then a zero.
+    pub(crate) const fn type_prefix(ty: u32) -> u32 {
+        (1u32 << ty) - 1
+    }
+
+    /// `CorePriority` descriptor: priorities `min_prio..=max_prio`, cores `min_core..=max_core`.
+    pub(crate) fn thread_info(min_prio: u32, max_prio: u32, min_core: u32, max_core: u32) -> u32 {
+        type_prefix(TYPE_THREAD_INFO)
+            | (max_prio << MAX_PRIORITY_SHIFT)
+            | (min_prio << MIN_PRIORITY_SHIFT)
+            | (min_core << MIN_CORE_SHIFT)
+            | (max_core << MAX_CORE_SHIFT)
+    }
+
+    /// One `SyscallMask` descriptor.
+    pub(crate) fn syscall_mask(index: u32, mask: u32) -> u32 {
+        type_prefix(TYPE_SYSCALL_MASK) | (mask << SVC_MASK_SHIFT) | (index << SVC_INDEX_SHIFT)
+    }
+
+    /// The `SyscallMask` descriptors (one per non-empty index) that allow exactly `ids`.
+    pub(crate) fn syscall_mask_words(ids: &[u32]) -> Vec<u32> {
+        (0..SVC_INDEX_COUNT)
+            .filter_map(|index| {
+                let mask = ids
+                    .iter()
+                    .filter(|&&id| id / SVC_BITS_PER_INDEX == index)
+                    .fold(0u32, |mask, &id| mask | 1 << (id % SVC_BITS_PER_INDEX));
+                (mask != 0).then(|| syscall_mask(index, mask))
+            })
+            .collect()
+    }
+
+    /// `KernelVersion` descriptor.
+    pub(crate) fn kernel_version(major: u32, minor: u32) -> u32 {
+        type_prefix(TYPE_KERNEL_VERSION)
+            | (minor << KERNEL_MINOR_SHIFT)
+            | (major << KERNEL_MAJOR_SHIFT)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -433,16 +634,7 @@ mod tests {
     /// Fixed seed so property runs are reproducible.
     const PROPTEST_SEED: u64 = 0x5EED_0000_5143;
 
-    // Test-side encoders: build descriptors from fields, independently of the decoder.
-    fn thread_info(min_prio: u32, max_prio: u32, min_core: u32, max_core: u32) -> u32 {
-        0b111 | (max_prio << 4) | (min_prio << 10) | (min_core << 16) | (max_core << 24)
-    }
-    fn syscall_mask(index: u32, mask: u32) -> u32 {
-        0b1111 | (mask << 5) | (index << 29)
-    }
-    fn kernel_version(major: u32, minor: u32) -> u32 {
-        0x3FFF | (minor << 15) | (major << 19)
-    }
+    use encode::{kernel_version, syscall_mask, thread_info};
 
     #[test]
     fn core_range_0_to_5_and_priorities_28_to_59() {
@@ -634,11 +826,137 @@ mod tests {
         );
     }
 
+    /// `MapRange` address word and size word for the given page number and page count.
+    fn map_range(page: u32, pages: u32) -> [u32; 2] {
+        [0x3F | (page << 7), 0x3F | (pages << 7) | (1 << 31)]
+    }
+
+    #[test]
+    fn thread_info_answers_core_and_priority_queries() {
+        let info = ThreadInfo {
+            priorities: 28..=59,
+            cores: 1..=3,
+        };
+        assert!(!info.allows_core(0));
+        assert!(info.allows_core(1) && info.allows_core(3));
+        assert!(!info.allows_core(4));
+        assert!(!info.allows_priority(27));
+        assert!(info.allows_priority(28) && info.allows_priority(59));
+        assert!(!info.allows_priority(60));
+    }
+
+    #[test]
+    fn policy_accepts_the_switch_2_title_capabilities() {
+        // Cores 0..=5, priorities 28..=59 (NX2 notes, "Titles"): fine on six cores.
+        let caps = KernelCapabilities::parse(&[encode::thread_info(28, 59, 0, 5)]).unwrap();
+        assert_eq!(caps.check_policy(6), Ok(()));
+        assert_eq!(caps.check_policy(EDEN_CAPABILITY_CORE_LIMIT), Ok(()));
+    }
+
+    #[test]
+    fn policy_core_bound_is_edens_unless_the_caller_narrows_it() {
+        // Eden accepts any capability core below 64 (`NumVirtualCores`), so mainline Eden
+        // accepts cores 0..=5. Passing `EDEN_CAPABILITY_CORE_LIMIT` is Eden's rule.
+        let at = |max_core: u32, core_count: u32| {
+            KernelCapabilities::parse(&[encode::thread_info(28, 59, 0, max_core)])
+                .unwrap()
+                .check_policy(core_count)
+        };
+        let last = EDEN_CAPABILITY_CORE_LIMIT - 1;
+        assert_eq!(at(last, EDEN_CAPABILITY_CORE_LIMIT), Ok(()));
+        assert_eq!(
+            at(last + 1, EDEN_CAPABILITY_CORE_LIMIT),
+            Err(PolicyViolation::CoreOutOfRange {
+                max_core: u8::try_from(last + 1).unwrap(),
+                core_count: EDEN_CAPABILITY_CORE_LIMIT
+            })
+        );
+        // Divergence from Eden: a narrower `core_count` rejects a core Eden would accept.
+        assert_eq!(at(5, EDEN_CAPABILITY_CORE_LIMIT), Ok(()));
+        assert_eq!(
+            at(5, 4),
+            Err(PolicyViolation::CoreOutOfRange {
+                max_core: 5,
+                core_count: 4
+            })
+        );
+    }
+
+    #[test]
+    fn policy_rejects_kernel_priorities() {
+        // Priorities 0..=3 are the kernel's (`m_priority_mask & 0xF` in k_capabilities.cpp).
+        let reserved = RESERVED_KERNEL_PRIORITIES;
+        let at = |lowest: u8| {
+            KernelCapabilities::parse(&[encode::thread_info(
+                u32::from(lowest),
+                u32::from(LOWEST_THREAD_PRIORITY),
+                0,
+                3,
+            )])
+            .unwrap()
+            .check_policy(4)
+        };
+        assert_eq!(at(reserved), Ok(()));
+        assert_eq!(
+            at(reserved - 1),
+            Err(PolicyViolation::KernelPriority {
+                highest: reserved - 1
+            })
+        );
+        assert_eq!(at(0), Err(PolicyViolation::KernelPriority { highest: 0 }));
+    }
+
+    #[test]
+    fn policy_checks_physical_maps_against_the_36_bit_limit() {
+        let limit = 1u64 << PHYSICAL_ADDRESS_BITS;
+        let last_page = u32::try_from(limit / PAGE_SIZE).unwrap() - 1;
+        let check = |words: &[u32]| KernelCapabilities::parse(words).unwrap().check_policy(4);
+        // The last page of the 36-bit space is fine; one more page runs past it.
+        assert_eq!(check(&map_range(last_page, 1)), Ok(()));
+        let past = map_range(last_page, 2);
+        assert_eq!(
+            check(&past),
+            Err(PolicyViolation::PhysicalRange {
+                address: u64::from(last_page) * PAGE_SIZE,
+                size: 2 * PAGE_SIZE
+            })
+        );
+        // The largest range from page 0 still ends below the limit.
+        assert_eq!(check(&map_range(0, 0xF_FFFF)), Ok(()));
+        // IO pages: the last page fits (the 24-bit field cannot name a page beyond it).
+        assert_eq!(check(&[0x7F | (0xFF_FFFF << 8)]), Ok(()));
+    }
+
+    #[test]
+    fn memory_map_end_never_overflows() {
+        let map = |address, size| MemoryMap {
+            address,
+            size,
+            read_only: false,
+            kind: MemoryMapKind::Static,
+        };
+        assert_eq!(map(0x1000, 0x2000).end(), Some(0x3000));
+        assert_eq!(map(u64::MAX, 1).end(), None);
+        assert!(!map(u64::MAX, 1).fits_physical_address_space());
+        assert!(map(0, 1u64 << PHYSICAL_ADDRESS_BITS).fits_physical_address_space());
+        assert!(!map(1, 1u64 << PHYSICAL_ADDRESS_BITS).fits_physical_address_space());
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig {
             rng_seed: proptest::test_runner::RngSeed::Fixed(PROPTEST_SEED),
             ..ProptestConfig::default()
         })]
+        #[test]
+        fn arbitrary_words_never_panic_in_policy_checks(
+            words in proptest::collection::vec(any::<u32>(), 0..64),
+            core_count in any::<u32>(),
+        ) {
+            if let Ok(caps) = KernelCapabilities::parse(&words) {
+                let _ = caps.check_policy(core_count);
+            }
+        }
+
         #[test]
         fn arbitrary_words_never_panic(words in proptest::collection::vec(any::<u32>(), 0..64)) {
             let _ = KernelCapabilities::parse(&words);

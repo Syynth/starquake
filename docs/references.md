@@ -26,3 +26,23 @@ Rules:
 - `rapid-arm-emu`'s decoder is 228k lines of generated Rust and slow to compile. Don't vendor it
   for the load-time patcher, which only needs to recognise a handful of encodings; revisit when the
   x86-64 JIT starts.
+
+## Documentation sources
+
+A few layout facts are in none of the pinned sources above. They come from the SwitchBrew wiki,
+which is not a git repository, so it cannot be pinned to a commit. The pages were read on
+2026-11-11; no revision id is recorded because the ids the wiki reported on two lookups did not
+agree. Treat these as third-party documentation, weaker than the pinned sources: nothing here has
+been cross-checked against a file built from homebrew.
+
+| Page | Used for | Status |
+|---|---|---|
+| NSO (`switchbrew.org/wiki/NSO`) | Hash-check flag bits 3 to 5 (hash over the decompressed segment); the last words of the first two segment headers are the module name offset and size | Documented, unverified: no fixture exercises either (`crates/loader/src/nso.rs`) |
+| NPDM (`switchbrew.org/wiki/NPDM`) | META words 0x10 (Switch 2 remote memory size), 0x14 (system resource size), 0x18 (version); that service names support a `*` wildcard | Offsets agree with Eden. The trailing-only, prefix-match reading of `*` is a **guess**: the page does not say it (`crates/loader/src/npdm/service_access.rs`) |
+
+Rules:
+
+- Code that depends on a fact from these pages says so next to the fact, and says what would
+  confirm it.
+- A rule that appears in no source at all (for example how an `ACI0` is checked against its
+  `ACID`) is a guess, stated as one in the module docs, not a documentation-sourced fact.

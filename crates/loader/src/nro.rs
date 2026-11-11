@@ -9,8 +9,9 @@
 //! `MOD0` header and the asset sections without bounds checks; here every offset and size is
 //! checked against the input.
 //!
-//! The build id at header offset 0x40 is not in the pinned references (Eden skips it as padding);
-//! it comes from the SwitchBrew NRO page and is marked as such on [`Nro::build_id`].
+//! The build id at header offset 0x40 is `NroHeader::m_module_id` (0x20 bytes) in
+//! `eden/src/core/hle/service/ro/ro_types.h` @ cf654052, which `ro.cpp` compares to detect an
+//! already-loaded module. `nro.cpp`'s own `NroHeader` skips those bytes as padding.
 
 use std::ops::Range;
 
@@ -41,7 +42,7 @@ const SIZE_OFFSET: usize = 0x18;
 const SEGMENTS_OFFSET: usize = 0x20;
 /// Offset of the bss size (`NroHeader::bss_size`).
 const BSS_SIZE_OFFSET: usize = 0x38;
-/// Offset of the build id (SwitchBrew; not in the pinned references).
+/// Offset of the build id (`NroHeader::m_module_id` in `eden/src/core/hle/service/ro/ro_types.h`).
 const BUILD_ID_OFFSET: usize = 0x40;
 
 /// An NRO segment: a byte range of the image.
@@ -130,7 +131,8 @@ pub struct Nro {
     pub data: NroSegment,
     /// Size of `.bss` from the NRO header. Use [`Mod0::bss_size`] first when `MOD0` is present.
     pub bss_size: u32,
-    /// Build id. From SwitchBrew (offset 0x40), not from the pinned references; unverified.
+    /// Build id (the module id), header offset 0x40 (`NroHeader::m_module_id` in
+    /// `eden/src/core/hle/service/ro/ro_types.h`).
     pub build_id: [u8; 0x20],
     /// True when the header carries the `HOMEBREW` marker (`AppLoader_NRO::IsHomebrew`).
     pub is_homebrew: bool,
@@ -405,6 +407,22 @@ mod tests {
         // Rodata segment header at 0x28, bss size at 0x38.
         assert_eq!(&file[0x28..0x2C], &0x100u32.to_le_bytes());
         assert_eq!(&file[0x38..0x3C], &0x1000u32.to_le_bytes());
+    }
+
+    #[test]
+    fn build_id_offset_follows_the_reference_header_layout() {
+        // `NroHeader` in `eden/src/core/hle/service/ro/ro_types.h` lists, in order, the byte
+        // sizes of the fields before `m_module_id`: entrypoint, mod offset, 8 padding, magic, 4
+        // padding, size, 4 padding, three {offset, size} segment pairs, bss size, 4 padding.
+        let before_module_id: usize = [4, 4, 8, 4, 4, 4, 4, 6 * 4, 4, 4].iter().sum();
+        assert_eq!(BUILD_ID_OFFSET, before_module_id);
+        // The ids bracketing the field stay out of it, and every byte of it is read in order.
+        let mut file = image();
+        file[BUILD_ID_OFFSET - 1] = 0xEE;
+        file[BUILD_ID_OFFSET + 0x20] = 0xEE;
+        let nro = Nro::parse(&file).unwrap();
+        let expected: Vec<u8> = (0..0x20u8).map(|i| i | 0x80).collect();
+        assert_eq!(nro.build_id.as_slice(), expected.as_slice());
     }
 
     #[test]
