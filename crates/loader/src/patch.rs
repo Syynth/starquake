@@ -269,6 +269,14 @@ pub fn patch_text(
         let resume = address.checked_add(4).ok_or_else(|| overflow(address))?;
         let body = build_trampoline(kind, register, &rescale, &ratio, trampoline, resume)?;
         edits.push((index, branch(address, trampoline)?));
+        // The last byte of the area (literals included) must stay inside the address space.
+        patched
+            .trampolines
+            .len()
+            .checked_add(body.len())
+            .and_then(|total| u64::try_from(total - 1).ok())
+            .and_then(|end| trampoline_address.checked_add(end))
+            .ok_or_else(|| overflow(trampoline_address))?;
         patched.trampolines.extend_from_slice(&body);
         patched.sites.push(Site {
             address,
@@ -327,7 +335,7 @@ fn build_trampoline(
 ) -> Result<Vec<u8>, PatchError> {
     // Scratch registers: x0/x1, or x2/x3 when the destination is one of those.
     let (a, b) = if rt < 2 { (2, 3) } else { (0, 1) };
-    let mrs = 0xD53B_E040 | rt;
+    let mrs = MRS_CNTVCT | rt;
     let (mut ops, literals): (Vec<Op>, Vec<u64>) = match kind {
         SiteKind::CntFrq => (vec![Op::LdrLit { rt, literal: 0 }], vec![rescale.guest_hz]),
         SiteKind::CntPct | SiteKind::CntVct => match (ratio.int, ratio.frac) {
@@ -436,6 +444,7 @@ const fn madd(rd: u32, rn: u32, rm: u32, ra: u32) -> u32 {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+    use proptest::test_runner::RngSeed;
     use std::collections::BTreeMap;
 
     // Rates from `tools/hvprobe/README.md`: Apple Silicon's counter and the console's.
@@ -1109,6 +1118,36 @@ mod tests {
         assert_eq!(words_of(&text), [site]);
     }
 
+    #[test]
+    fn trampoline_area_past_the_address_space_is_an_error() {
+        // `mrs x5, cntfrq_el0` needs a 16-byte trampoline (`ldr`, `b`, 8-byte literal). Starting
+        // at 2^64 - 8, its literal would land at 2^64, which wraps to 0.
+        let site = mrs(MRS_CNTFRQ, 5);
+        let mut text = text_of(&[site]);
+        let result = patch_text(
+            &mut text,
+            u64::MAX - 0xF,
+            u64::MAX - 0x7,
+            &config(CONSOLE_HZ),
+        );
+        assert!(matches!(result, Err(PatchError::AddressOverflow { .. })));
+        assert_eq!(words_of(&text), [site]);
+    }
+
+    #[test]
+    fn trampoline_area_ending_at_the_top_of_the_address_space_is_accepted() {
+        // The same 16-byte trampoline, placed so its last byte is the last address.
+        let mut text = text_of(&[mrs(MRS_CNTFRQ, 5)]);
+        let result = patch_text(
+            &mut text,
+            u64::MAX - 0xF,
+            u64::MAX - 0xF,
+            &config(CONSOLE_HZ),
+        );
+        let patched = result.unwrap();
+        assert_eq!(patched.trampolines.len(), 16);
+    }
+
     /// Where the range tests put their site: far from zero so both directions fit.
     const FAR_SITE: u64 = 0x1000_0000;
 
@@ -1180,7 +1219,15 @@ mod tests {
         );
     }
 
+    /// Fixed so every run draws the same cases.
+    const PROPTEST_SEED: u64 = 0x5EED_0004;
+
     proptest! {
+        #![proptest_config(ProptestConfig {
+            rng_seed: RngSeed::Fixed(PROPTEST_SEED),
+            ..ProptestConfig::default()
+        })]
+
         #[test]
         fn rescale_matches_u128_for_the_console_rate(raw in any::<u64>()) {
             within_one_tick(HOST_HZ, CONSOLE_HZ, clamp_ticks(raw, HOST_HZ, CONSOLE_HZ));
