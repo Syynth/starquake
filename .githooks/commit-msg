@@ -1,0 +1,78 @@
+#!/bin/sh
+# Conventional Commits check (https://www.conventionalcommits.org/en/v1.0.0/), written in plain
+# POSIX shell so it needs no toolchain and no dependencies.
+#
+#   commit-msg FILE            git's commit-msg hook: FILE is the commit message. Install the
+#                              hooks with `just setup`.
+#   commit-msg --title FILE    the same rule for a pull-request title (CI: .github/workflows/
+#                              pr-title.yml). Subjects git writes itself are not accepted there.
+#
+# Only the first line that is neither blank nor a `#` comment is judged:
+#
+#   type(scope)!: description
+#
+# where `type` is one of the list below, `(scope)` and `!` are optional, and `description` starts
+# right after a single space. Body and footers are free text.
+set -eu
+
+title=0
+if [ "${1:-}" = "--title" ]; then
+    title=1
+    shift
+fi
+if [ "$#" -ne 1 ]; then
+    echo "usage: commit-msg [--title] FILE" >&2
+    exit 2
+fi
+file="$1"
+if [ ! -r "$file" ]; then
+    echo "commit-msg: cannot read $file" >&2
+    exit 2
+fi
+
+# The first line that is neither blank nor a comment, without any trailing carriage return.
+subject=""
+while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%"$(printf '\r')"}"
+    case "$line" in
+    '#'*) continue ;;
+    esac
+    if [ -n "$(printf '%s' "$line" | tr -d '[:space:]')" ]; then
+        subject="$line"
+        break
+    fi
+done <"$file"
+
+types='feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert'
+pattern="^($types)(\\([[:alnum:]._/,-]+\\))?!?: [^[:space:]]"
+
+if printf '%s\n' "$subject" | grep -Eq "$pattern"; then
+    exit 0
+fi
+
+# Subjects git and GitHub generate themselves (merges, reverts, autosquash markers) are fine as
+# commit messages, but a PR title is written by a person. Merge subjects are matched by the exact
+# prefixes the tools write, not by a bare "Merge ", so a hand-written "Merge sort: ..." is judged
+# like any other subject.
+if [ "$title" -eq 0 ]; then
+    case "$subject" in
+    "Merge branch '"* | "Merge branches '"* | "Merge remote-tracking branch '"* | \
+        "Merge tag '"* | "Merge commit '"* | 'Merge pull request #'*) exit 0 ;;
+    'Revert "'* | 'fixup! '* | 'squash! '* | 'amend! '*) exit 0 ;;
+    esac
+fi
+
+cat >&2 <<EOF
+The subject line is not in the Conventional Commits format:
+
+    ${subject:-<empty>}
+
+Expected:  type(scope)!: description
+  type:    $(printf '%s' "$types" | sed 's/|/, /g')
+  scope:   optional, e.g. (cpu) or (ipc,kernel)
+  !:       optional, marks a breaking change
+Examples:  feat(ipc): add the command table
+           fix(loader): bound the segment table
+           docs: describe the wave process
+EOF
+exit 1

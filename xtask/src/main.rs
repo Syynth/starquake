@@ -67,16 +67,38 @@ fn disk_ok() -> bool {
     }
 }
 
-fn ci() -> ExitCode {
-    if !disk_ok() {
-        return ExitCode::FAILURE;
+/// One gate step: a display name and the arguments passed to `cargo`.
+#[derive(Debug, PartialEq, Eq)]
+struct Step {
+    name: &'static str,
+    args: Vec<&'static str>,
+}
+
+/// What the gate does about `cargo deny`.
+#[derive(Debug, PartialEq, Eq)]
+enum Deny {
+    /// Run the check.
+    Run,
+    /// The tool is not installed and this is a local run: skip, and say so.
+    SkipNotInstalled,
+    /// The tool is not installed under CI, where the check is mandatory: fail the gate.
+    MissingInCi,
+}
+
+/// Decides whether `cargo deny` runs: whenever it is installed, and always under CI, where being
+/// absent is a failure rather than a skip (so CI can never silently lose the check).
+fn deny_decision(installed: bool, in_ci: bool) -> Deny {
+    match (installed, in_ci) {
+        (true, _) => Deny::Run,
+        (false, false) => Deny::SkipNotInstalled,
+        (false, true) => Deny::MissingInCi,
     }
-    let has_nextest = cargo()
-        .args(["nextest", "--version"])
-        .output()
-        .is_ok_and(|output| output.status.success());
-    let tests: &[&str] = if has_nextest {
-        &[
+}
+
+/// The gate's steps in order. The checks that need no compilation (fmt, deny) come first.
+fn steps(has_nextest: bool, run_deny: bool) -> Vec<Step> {
+    let tests = if has_nextest {
+        vec![
             "nextest",
             "run",
             "--workspace",
@@ -84,13 +106,24 @@ fn ci() -> ExitCode {
             "--no-tests=pass",
         ]
     } else {
-        &["test", "--workspace", "--locked"]
+        vec!["test", "--workspace", "--locked"]
     };
-    let steps: [(&str, &[&str]); 4] = [
-        ("fmt", &["fmt", "--all", "--check"]),
-        (
-            "clippy",
-            &[
+    let mut steps = vec![Step {
+        name: "fmt",
+        args: vec!["fmt", "--all", "--check"],
+    }];
+    if run_deny {
+        // Licences, bans, sources and advisories, configured in `deny.toml`. The advisory
+        // database is fetched, so this step needs network access.
+        steps.push(Step {
+            name: "deny",
+            args: vec!["deny", "--locked", "check"],
+        });
+    }
+    steps.extend([
+        Step {
+            name: "clippy",
+            args: vec![
                 "clippy",
                 "--workspace",
                 "--all-targets",
@@ -99,16 +132,52 @@ fn ci() -> ExitCode {
                 "-D",
                 "warnings",
             ],
-        ),
-        ("test", tests),
-        ("doctest", &["test", "--workspace", "--doc", "--locked"]),
-    ];
+        },
+        Step {
+            name: "test",
+            args: tests,
+        },
+        Step {
+            name: "doctest",
+            args: vec!["test", "--workspace", "--doc", "--locked"],
+        },
+    ]);
+    steps
+}
+
+/// Whether `cargo <subcommand> --version` works, i.e. the cargo plugin is installed.
+fn has_cargo_plugin(subcommand: &str) -> bool {
+    cargo()
+        .args([subcommand, "--version"])
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+fn ci() -> ExitCode {
+    if !disk_ok() {
+        return ExitCode::FAILURE;
+    }
+    let in_ci = std::env::var_os("CI").is_some();
+    let run_deny = match deny_decision(has_cargo_plugin("deny"), in_ci) {
+        Deny::Run => true,
+        Deny::SkipNotInstalled => {
+            eprintln!(
+                "==> deny: SKIPPED, cargo-deny is not installed (CI always runs it; \
+                 `cargo install cargo-deny --locked` to run it here)"
+            );
+            false
+        }
+        Deny::MissingInCi => {
+            eprintln!("==> deny FAILED: cargo-deny must be installed when CI is set");
+            return ExitCode::FAILURE;
+        }
+    };
     let total = Instant::now();
-    for (name, args) in steps {
+    for Step { name, args } in steps(has_cargo_plugin("nextest"), run_deny) {
         let start = Instant::now();
         eprintln!("==> {name}: cargo {}", args.join(" "));
         let ok = cargo()
-            .args(args)
+            .args(&args)
             .status()
             .is_ok_and(|status| status.success());
         if !ok {
@@ -119,4 +188,64 @@ fn ci() -> ExitCode {
     }
     eprintln!("==> gate passed in {:.1}s", total.elapsed().as_secs_f64());
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn names(steps: &[Step]) -> Vec<&'static str> {
+        steps.iter().map(|step| step.name).collect()
+    }
+
+    fn args_of<'a>(steps: &'a [Step], name: &str) -> Option<&'a [&'static str]> {
+        steps
+            .iter()
+            .find(|step| step.name == name)
+            .map(|step| step.args.as_slice())
+    }
+
+    #[test]
+    fn deny_runs_when_installed_locally_and_in_ci() {
+        assert_eq!(deny_decision(true, false), Deny::Run);
+        assert_eq!(deny_decision(true, true), Deny::Run);
+    }
+
+    #[test]
+    fn deny_is_skipped_locally_but_mandatory_in_ci() {
+        assert_eq!(deny_decision(false, false), Deny::SkipNotInstalled);
+        assert_eq!(deny_decision(false, true), Deny::MissingInCi);
+    }
+
+    #[test]
+    fn the_gate_includes_deny_only_when_asked() {
+        assert_eq!(
+            names(&steps(true, true)),
+            ["fmt", "deny", "clippy", "test", "doctest"]
+        );
+        assert_eq!(
+            names(&steps(true, false)),
+            ["fmt", "clippy", "test", "doctest"]
+        );
+    }
+
+    #[test]
+    fn deny_checks_against_the_lockfile() {
+        assert_eq!(
+            args_of(&steps(false, true), "deny"),
+            Some(&["deny", "--locked", "check"][..])
+        );
+    }
+
+    #[test]
+    fn tests_use_nextest_only_when_present() {
+        assert_eq!(
+            args_of(&steps(true, false), "test").and_then(|args| args.first()),
+            Some(&"nextest")
+        );
+        assert_eq!(
+            args_of(&steps(false, false), "test").and_then(|args| args.first()),
+            Some(&"test")
+        );
+    }
 }

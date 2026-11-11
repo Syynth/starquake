@@ -14,3 +14,8 @@ refs:
 # Measure Hypervisor.framework behaviour (macOS on Apple Silicon only)
 hvprobe:
     cargo run --release -p hvprobe
+
+# One-time setup after cloning: use the repo's git hooks (.githooks/commit-msg checks that commit
+# messages follow Conventional Commits)
+setup:
+    git config core.hooksPath .githooks
