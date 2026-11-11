@@ -1,0 +1,213 @@
+//! Building replies into an IPC buffer.
+//!
+//! Ported from `eden/src/core/hle/service/ipc_helpers.h` (`ResponseBuilder`), with two
+//! deliberate differences:
+//!
+//! - A TIPC reply's raw data is **one** result word followed directly by the data, as in
+//!   `eden-nx2/src/core/hle/service/nx2_gsv.h` (`TipcReplyWords`). Eden's builder wrote the
+//!   two-word CMIF result there, which put TIPC data one word late (scoping doc row 22).
+//! - The raw data size in the header is exact (alignment padding plus the words actually
+//!   written). Eden's `ResponseBuilder` adds the payload size twice and reserves four extra
+//!   padding words; real clients locate reply fields by the sizes they know, not by this field, so
+//!   an exact count is the least surprising choice. This is a design choice, not a protocol fact.
+
+use crate::cmif::{CmifReplyHeader, DomainReplyHeader};
+use crate::error::{IpcError, Result};
+use crate::hipc::{
+    BUFFER_SIZE, CommandHeader, CommandType, MAX_TIPC_COMMAND_ID, ReceiveList, SpecialHeader,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Layout {
+    Cmif { domain: bool },
+    Tipc { command_id: u16 },
+}
+
+/// Accumulates the parts of a reply and writes them into a buffer.
+///
+/// The three constructors pick the framing: [`ReplyBuilder::cmif`] for an ordinary session,
+/// [`ReplyBuilder::domain`] for a domain, [`ReplyBuilder::tipc`] for TIPC. Data is padded with
+/// zeros to a whole number of words.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplyBuilder {
+    layout: Layout,
+    result: u32,
+    copy_handles: Vec<u32>,
+    move_handles: Vec<u32>,
+    data: Vec<u8>,
+    object_ids: Vec<u32>,
+}
+
+impl ReplyBuilder {
+    fn new(layout: Layout, result: u32) -> Self {
+        Self {
+            layout,
+            result,
+            copy_handles: Vec::new(),
+            move_handles: Vec::new(),
+            data: Vec::new(),
+            object_ids: Vec::new(),
+        }
+    }
+
+    /// A reply on an ordinary CMIF session: command type zero, `SFCO` header with `result`.
+    pub fn cmif(result: u32) -> Self {
+        Self::new(Layout::Cmif { domain: false }, result)
+    }
+
+    /// A reply on a domain: as [`ReplyBuilder::cmif`], plus the domain reply header and any
+    /// object ids added with [`ReplyBuilder::object_id`].
+    ///
+    /// Use this only for replies to request/request-with-context messages that carried a domain
+    /// header. Eden writes the domain reply header only in that case
+    /// (`eden/src/core/hle/service/ipc_helpers.h`: `mgr->IsDomain() && ctx.HasDomainMessageHeader()`),
+    /// so replies to control requests on a domain use [`ReplyBuilder::cmif`].
+    pub fn domain(result: u32) -> Self {
+        Self::new(Layout::Cmif { domain: true }, result)
+    }
+
+    /// A TIPC reply to the TIPC request with this command id: the reply echoes the request's
+    /// type (`16 + command_id`), and its raw data is `result` followed by the data. No `SFCO`
+    /// header, no alignment padding.
+    pub fn tipc(command_id: u16, result: u32) -> Self {
+        Self::new(Layout::Tipc { command_id }, result)
+    }
+
+    /// Adds a handle to copy to the receiver.
+    #[must_use]
+    pub fn copy_handle(mut self, handle: u32) -> Self {
+        self.copy_handles.push(handle);
+        self
+    }
+
+    /// Adds a handle to move to the receiver.
+    #[must_use]
+    pub fn move_handle(mut self, handle: u32) -> Self {
+        self.move_handles.push(handle);
+        self
+    }
+
+    /// Appends data bytes.
+    #[must_use]
+    pub fn data(mut self, bytes: &[u8]) -> Self {
+        self.data.extend_from_slice(bytes);
+        self
+    }
+
+    /// Appends a domain object id after the data. Building fails unless the reply is a domain
+    /// reply.
+    #[must_use]
+    pub fn object_id(mut self, id: u32) -> Self {
+        self.object_ids.push(id);
+        self
+    }
+
+    /// Writes the reply into `buf` and returns the number of bytes used.
+    ///
+    /// At most the first [`BUFFER_SIZE`] bytes of `buf` are used. The whole usable area is zeroed
+    /// first, so no stale words survive. Fails without panicking if the message does not fit, if
+    /// a count or id is out of range, or if object ids were added to a non-domain reply; on
+    /// failure `buf` is left unchanged.
+    pub fn build(&self, buf: &mut [u8]) -> Result<usize> {
+        let words = self.words()?;
+        let needed = words.len().saturating_mul(4);
+        let capacity = buf.len().min(BUFFER_SIZE);
+        let out = buf
+            .get_mut(..needed)
+            .filter(|_| needed <= capacity)
+            .ok_or(IpcError::DoesNotFit { needed, capacity })?;
+        out.fill(0);
+        for (chunk, word) in out.as_chunks_mut::<4>().0.iter_mut().zip(&words) {
+            *chunk = word.to_le_bytes();
+        }
+        // Zero the rest of the usable area as well.
+        if let Some(tail) = buf.get_mut(needed..capacity) {
+            tail.fill(0);
+        }
+        Ok(needed)
+    }
+
+    fn words(&self) -> Result<Vec<u32>> {
+        if !self.object_ids.is_empty() && self.layout != (Layout::Cmif { domain: true }) {
+            return Err(IpcError::ObjectIdsOutsideDomain);
+        }
+        let special = SpecialHeader {
+            send_pid: false,
+            num_copy_handles: to_u32(self.copy_handles.len()),
+            num_move_handles: to_u32(self.move_handles.len()),
+        };
+        let has_special_header = !self.copy_handles.is_empty() || !self.move_handles.is_empty();
+
+        // The two header words are filled in last, once the raw data size is known.
+        let mut words = vec![0, 0];
+        if has_special_header {
+            words.push(special.encode()?);
+            words.extend_from_slice(&self.copy_handles);
+            words.extend_from_slice(&self.move_handles);
+        }
+        let raw_start = words.len();
+
+        let command_type = match self.layout {
+            Layout::Tipc { command_id } => {
+                if command_id > MAX_TIPC_COMMAND_ID {
+                    return Err(IpcError::TipcCommandOutOfRange(command_id));
+                }
+                words.push(self.result);
+                self.push_data(&mut words);
+                CommandType::Tipc(command_id)
+            }
+            Layout::Cmif { domain } => {
+                // Align the payload to 16 bytes, measured from the start of the buffer.
+                words.resize(words.len().next_multiple_of(4), 0);
+                if domain {
+                    words.extend_from_slice(
+                        &DomainReplyHeader {
+                            num_objects: to_u32(self.object_ids.len()),
+                        }
+                        .encode(),
+                    );
+                }
+                words.extend_from_slice(
+                    &CmifReplyHeader {
+                        version: 0,
+                        result: self.result,
+                        token: 0,
+                    }
+                    .encode(),
+                );
+                self.push_data(&mut words);
+                words.extend_from_slice(&self.object_ids);
+                CommandType::Invalid
+            }
+        };
+
+        let header = CommandHeader {
+            command_type,
+            num_x: 0,
+            num_a: 0,
+            num_b: 0,
+            num_w: 0,
+            raw_data_words: to_u32(words.len() - raw_start),
+            receive_list: ReceiveList::Disabled,
+            has_special_header,
+        };
+        let [w0, w1] = header.encode()?;
+        words[0] = w0;
+        words[1] = w1;
+        Ok(words)
+    }
+
+    fn push_data(&self, words: &mut Vec<u32>) {
+        for chunk in self.data.chunks(4) {
+            let mut word = [0_u8; 4];
+            for (slot, byte) in word.iter_mut().zip(chunk) {
+                *slot = *byte;
+            }
+            words.push(u32::from_le_bytes(word));
+        }
+    }
+}
+
+fn to_u32(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
+}
