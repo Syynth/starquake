@@ -26,12 +26,20 @@ pub const CMIF_HEADER_BYTES: usize = 16;
 /// Size in bytes of a domain message header, request or reply
 /// (`eden/src/core/hle/ipc.h`, `static_assert(sizeof(DomainMessageHeader) == 16)`).
 pub const DOMAIN_HEADER_BYTES: usize = 16;
+/// Bit position of the input object count in the first domain request header word.
+const DOMAIN_COUNT_SHIFT: u32 = 8;
+/// Bit position of the size in the first domain request header word.
+const DOMAIN_SIZE_SHIFT: u32 = 16;
+/// Mask of the 8-bit command at the bottom of the first domain request header word.
+const DOMAIN_COMMAND_MASK: u32 = (1 << DOMAIN_COUNT_SHIFT) - 1;
 /// Largest number of input object ids in a domain request: the count is bits 8..16 of the first
-/// domain header word (`eden/src/core/hle/ipc.h`, `DomainMessageHeader`).
-pub const MAX_DOMAIN_INPUT_OBJECTS: u32 = 0xFF;
+/// domain header word (`eden/src/core/hle/ipc.h`, `DomainMessageHeader`; `num_in_objects` is a
+/// `u8` in `libnx/nx/include/switch/sf/cmif.h`, `CmifDomainInHeader`).
+pub const MAX_DOMAIN_INPUT_OBJECTS: u32 = (1 << (DOMAIN_SIZE_SHIFT - DOMAIN_COUNT_SHIFT)) - 1;
 /// Largest value of a domain request's `size` field: bits 16..32 of the first domain header word
-/// (`eden/src/core/hle/ipc.h`, `DomainMessageHeader`).
-pub const MAX_DOMAIN_SIZE: u32 = 0xFFFF;
+/// (`eden/src/core/hle/ipc.h`, `DomainMessageHeader`; `data_size` is a `u16` in libnx's
+/// `CmifDomainInHeader`).
+pub const MAX_DOMAIN_SIZE: u32 = u32::MAX >> DOMAIN_SIZE_SHIFT;
 
 /// What a domain request asks of an object
 /// (`eden/src/core/hle/ipc.h`, `DomainMessageHeader::CommandType`).
@@ -88,9 +96,9 @@ impl DomainRequestHeader {
     pub fn decode(words: [u32; 4]) -> Result<Self> {
         let [w0, object_id, _padding, token] = words;
         Ok(Self {
-            command: DomainCommand::from_raw(w0 & 0xFF)?,
-            input_object_count: (w0 >> 8) & 0xFF,
-            size: w0 >> 16,
+            command: DomainCommand::from_raw(w0 & DOMAIN_COMMAND_MASK)?,
+            input_object_count: (w0 >> DOMAIN_COUNT_SHIFT) & MAX_DOMAIN_INPUT_OBJECTS,
+            size: w0 >> DOMAIN_SIZE_SHIFT,
             object_id,
             token,
         })
@@ -110,7 +118,9 @@ impl DomainRequestHeader {
                 value: u64::from(self.size),
             });
         }
-        let w0 = self.command.to_raw() | self.input_object_count << 8 | self.size << 16;
+        let w0 = self.command.to_raw()
+            | self.input_object_count << DOMAIN_COUNT_SHIFT
+            | self.size << DOMAIN_SIZE_SHIFT;
         Ok([w0, self.object_id, 0, self.token])
     }
 }

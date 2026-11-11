@@ -128,6 +128,37 @@ fn cmif_request_tolerates_the_reserved_padding_word_count() {
     assert!(request.data[8..].iter().all(|b| *b == 0));
 }
 
+/// A special header that announces nothing: no pid and no handles. The builders never write one
+/// (they omit the header when it would be empty), but the parser must take it, and the lists it
+/// returns are empty.
+///
+/// ```text
+/// word 0  0x0000_0004  type 4 (Request)
+/// word 1  0x8000_0005  5 raw words, bit 31: special header follows
+/// word 2  0x0000_0000  special header: no pid, no copy handles, no move handles
+/// word 3  0x0000_0000  padding to the 16-byte boundary at word 4
+/// word 4..8            SFCI, version 0, command 11, token 0
+/// ```
+#[test]
+fn empty_special_header_parses_to_empty_lists() {
+    let bytes = buffer(&[0x0000_0004, 0x8000_0005, 0, 0, SFCI_MAGIC, 0, 11, 0]);
+    let message = Message::parse_request(&bytes, SessionKind::Session).unwrap();
+    assert_eq!(message.command_type, CommandType::Request);
+    assert_eq!(message.pid, None);
+    assert_eq!(message.copy_handles, Vec::<u32>::new());
+    assert_eq!(message.move_handles, Vec::<u32>::new());
+    let request = cmif_request(&message).unwrap();
+    assert_eq!(
+        request.header,
+        CmifRequestHeader {
+            version: 0,
+            command_id: 11,
+            token: 0,
+        }
+    );
+    assert_eq!(request.data, Vec::<u8>::new());
+}
+
 /// Domain request with one input object.
 ///
 /// ```text
@@ -529,7 +560,7 @@ fn inconsistent_domain_sizes_are_errors() {
         Message::parse_request(&overrun, SessionKind::Domain),
         Err(IpcError::Inconsistent(_))
     ));
-    // 255 input objects cannot fit.
+    // The most input objects the count field holds (`MAX_DOMAIN_INPUT_OBJECTS`) cannot fit.
     let ids = buffer(&[4, 10, 0, 0, 0x0010_FF01, 3, 0, 0, SFCI_MAGIC, 0, 0, 0]);
     assert!(matches!(
         Message::parse_request(&ids, SessionKind::Domain),

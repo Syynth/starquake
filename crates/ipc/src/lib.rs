@@ -23,6 +23,7 @@
 //! The request layouts are also checked against libnx, the client side (`libnx/nx/include/switch/sf/`,
 //! ISC); [`request`] lists where the builder follows it and where it differs.
 
+mod builder;
 pub mod cmif;
 pub mod error;
 pub mod hipc;

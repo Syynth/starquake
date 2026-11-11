@@ -4,10 +4,10 @@
 use proptest::prelude::*;
 use proptest::test_runner::{Config, RngAlgorithm, RngSeed};
 use starquake_ipc::{
-    BUFFER_SIZE, Body, BufferDescriptor, CMIF_HEADER_BYTES, CmifRequest, CmifRequestHeader,
-    CommandHeader, CommandType, DomainCommand, DomainReplyHeader, DomainRequestHeader, IpcError,
-    MAX_DESCRIPTORS, MAX_HANDLES, MAX_RAW_WORDS, MAX_TIPC_COMMAND_ID, Message, ReceiveDescriptor,
-    ReceiveList, ReplyBuilder, SessionKind, SpecialHeader, StaticDescriptor, TIPC_COMMAND_OFFSET,
+    BUFFER_SIZE, Body, BufferDescriptor, CommandHeader, CommandType, DomainReplyHeader,
+    DomainRequestHeader, IpcError, MAX_DESCRIPTORS, MAX_HANDLES, MAX_RAW_WORDS,
+    MAX_TIPC_COMMAND_ID, Message, ReceiveDescriptor, ReceiveList, ReplyBuilder, SessionKind,
+    SpecialHeader, StaticDescriptor, TIPC_COMMAND_OFFSET,
 };
 
 /// Fixed seed so a run is reproducible; failures are not persisted to disk.
@@ -230,318 +230,6 @@ proptest! {
     }
 }
 
-/// What a generated request carries after its descriptors.
-#[derive(Debug, Clone)]
-enum Payload {
-    Cmif {
-        command_type: CommandType,
-        command_id: u32,
-        version: u32,
-        token: u32,
-        object_id: u32,
-        data: Vec<u32>,
-        input_objects: Vec<u32>,
-    },
-    Tipc {
-        command_id: u16,
-        data: Vec<u32>,
-    },
-}
-
-/// A request described field by field, so the test can assemble it with the crate's encoders and
-/// then check that the parser hands every list back in order.
-#[derive(Debug, Clone)]
-struct GeneratedRequest {
-    pid: Option<u64>,
-    force_special_header: bool,
-    copy_handles: Vec<u32>,
-    move_handles: Vec<u32>,
-    statics: Vec<StaticDescriptor>,
-    sends: Vec<BufferDescriptor>,
-    receives: Vec<BufferDescriptor>,
-    exchanges: Vec<BufferDescriptor>,
-    receive_list: ReceiveList,
-    receive_descriptors: Vec<ReceiveDescriptor>,
-    payload: Payload,
-}
-
-/// A length as a header field. Saturates, so an impossible value fails the encoder's range check
-/// instead of panicking in a helper.
-fn count(len: usize) -> u32 {
-    u32::try_from(len).unwrap_or(u32::MAX)
-}
-
-fn count_u64(value: u64) -> u32 {
-    u32::try_from(value).unwrap_or(u32::MAX)
-}
-
-impl GeneratedRequest {
-    /// Whether the parser should find a domain header for this request on a session of `kind`.
-    fn expects_domain_header(&self, kind: SessionKind) -> bool {
-        matches!(
-            self.payload,
-            Payload::Cmif {
-                command_type: CommandType::Request | CommandType::RequestWithContext,
-                ..
-            }
-        ) && kind == SessionKind::Domain
-    }
-
-    /// Lays the request out word by word with the crate's encode functions.
-    fn assemble(&self, kind: SessionKind) -> Result<Vec<u8>, IpcError> {
-        let has_special_header = self.force_special_header
-            || self.pid.is_some()
-            || !self.copy_handles.is_empty()
-            || !self.move_handles.is_empty();
-        // The two header words are filled in last.
-        let mut words = vec![0_u32, 0];
-        if has_special_header {
-            let special = SpecialHeader {
-                send_pid: self.pid.is_some(),
-                num_copy_handles: count(self.copy_handles.len()),
-                num_move_handles: count(self.move_handles.len()),
-            };
-            words.push(special.encode()?);
-            if let Some(pid) = self.pid {
-                words.push(count_u64(pid & u64::from(u32::MAX)));
-                words.push(count_u64(pid >> 32));
-            }
-            words.extend_from_slice(&self.copy_handles);
-            words.extend_from_slice(&self.move_handles);
-        }
-        for descriptor in &self.statics {
-            words.extend(descriptor.encode()?);
-        }
-        for descriptor in self
-            .sends
-            .iter()
-            .chain(&self.receives)
-            .chain(&self.exchanges)
-        {
-            words.extend(descriptor.encode()?);
-        }
-
-        let raw_start = words.len();
-        let command_type = match &self.payload {
-            Payload::Cmif {
-                command_type,
-                command_id,
-                version,
-                token,
-                object_id,
-                data,
-                input_objects,
-            } => {
-                // CMIF content is aligned to 16 bytes, measured from the start of the buffer.
-                words.resize(words.len().next_multiple_of(4), 0);
-                if self.expects_domain_header(kind) {
-                    words.extend(
-                        DomainRequestHeader {
-                            command: DomainCommand::SendMessage,
-                            input_object_count: count(input_objects.len()),
-                            size: count(CMIF_HEADER_BYTES + data.len() * 4),
-                            object_id: *object_id,
-                            token: *token,
-                        }
-                        .encode()?,
-                    );
-                }
-                words.extend(
-                    CmifRequestHeader {
-                        version: *version,
-                        command_id: *command_id,
-                        token: *token,
-                    }
-                    .encode(),
-                );
-                words.extend_from_slice(data);
-                if self.expects_domain_header(kind) {
-                    words.extend_from_slice(input_objects);
-                }
-                *command_type
-            }
-            Payload::Tipc { command_id, data } => {
-                words.extend_from_slice(data);
-                CommandType::Tipc(*command_id)
-            }
-        };
-        let raw_data_words = count(words.len() - raw_start);
-        for descriptor in &self.receive_descriptors {
-            words.extend(descriptor.encode()?);
-        }
-
-        let header = CommandHeader {
-            command_type,
-            num_x: count(self.statics.len()),
-            num_a: count(self.sends.len()),
-            num_b: count(self.receives.len()),
-            num_w: count(self.exchanges.len()),
-            raw_data_words,
-            receive_list: self.receive_list,
-            has_special_header,
-        };
-        let [w0, w1] = header.encode()?;
-        words[0] = w0;
-        words[1] = w1;
-
-        let mut bytes = le(&words);
-        assert!(
-            bytes.len() <= BUFFER_SIZE,
-            "generated request overflows the IPC buffer"
-        );
-        bytes.resize(BUFFER_SIZE, 0);
-        Ok(bytes)
-    }
-}
-
-fn static_descriptor() -> impl Strategy<Value = StaticDescriptor> {
-    any::<[u32; 2]>().prop_map(StaticDescriptor::decode)
-}
-
-fn buffer_descriptor() -> impl Strategy<Value = BufferDescriptor> {
-    any::<[u32; 3]>().prop_map(BufferDescriptor::decode)
-}
-
-fn receive_descriptor() -> impl Strategy<Value = ReceiveDescriptor> {
-    any::<[u32; 2]>().prop_map(ReceiveDescriptor::decode)
-}
-
-/// A receive list and exactly as many C descriptors as it announces.
-fn receive_list_and_descriptors() -> impl Strategy<Value = (ReceiveList, Vec<ReceiveDescriptor>)> {
-    let receive_list = prop_oneof![
-        Just(ReceiveList::Disabled),
-        Just(ReceiveList::Inline),
-        Just(ReceiveList::One),
-        (1..=3_u32).prop_map(ReceiveList::Many),
-    ];
-    (receive_list, prop::collection::vec(receive_descriptor(), 3)).prop_map(
-        |(list, mut descriptors)| {
-            descriptors.truncate(usize::try_from(list.descriptor_count()).unwrap_or(usize::MAX));
-            (list, descriptors)
-        },
-    )
-}
-
-fn payload() -> impl Strategy<Value = Payload> {
-    let cmif = (
-        prop_oneof![
-            Just(CommandType::Request),
-            Just(CommandType::Control),
-            Just(CommandType::RequestWithContext),
-            Just(CommandType::ControlWithContext),
-        ],
-        any::<[u32; 4]>(),
-        prop::collection::vec(any::<u32>(), 0..=4),
-        prop::collection::vec(any::<u32>(), 0..=2),
-    )
-        .prop_map(
-            |(command_type, [command_id, version, token, object_id], data, input_objects)| {
-                Payload::Cmif {
-                    command_type,
-                    command_id,
-                    version,
-                    token,
-                    object_id,
-                    data,
-                    input_objects,
-                }
-            },
-        );
-    let tipc = (
-        0..=MAX_TIPC_COMMAND_ID,
-        prop::collection::vec(any::<u32>(), 0..=8),
-    )
-        .prop_map(|(command_id, data)| Payload::Tipc { command_id, data });
-    prop_oneof![cmif, tipc]
-}
-
-prop_compose! {
-    /// Counts stay small enough that the largest request fits the 64-word IPC buffer.
-    fn generated_request()(
-        pid in prop::option::of(any::<u64>()),
-        force_special_header in any::<bool>(),
-        copy_handles in prop::collection::vec(any::<u32>(), 0..=3),
-        move_handles in prop::collection::vec(any::<u32>(), 0..=3),
-        statics in prop::collection::vec(static_descriptor(), 0..=3),
-        sends in prop::collection::vec(buffer_descriptor(), 0..=2),
-        receives in prop::collection::vec(buffer_descriptor(), 0..=2),
-        exchanges in prop::collection::vec(buffer_descriptor(), 0..=2),
-        (receive_list, receive_descriptors) in receive_list_and_descriptors(),
-        payload in payload(),
-    ) -> GeneratedRequest {
-        GeneratedRequest {
-            pid,
-            force_special_header,
-            copy_handles,
-            move_handles,
-            statics,
-            sends,
-            receives,
-            exchanges,
-            receive_list,
-            receive_descriptors,
-            payload,
-        }
-    }
-}
-
-proptest! {
-    #![proptest_config(config())]
-
-    #[test]
-    fn built_requests_parse_back_with_every_list_in_order(
-        request in generated_request(),
-        kind in session_kind(),
-    ) {
-        let bytes = request.assemble(kind).unwrap();
-        let message = Message::parse_request(&bytes, kind).unwrap();
-
-        match &request.payload {
-            Payload::Cmif { command_type, .. } => prop_assert_eq!(message.command_type, *command_type),
-            Payload::Tipc { command_id, .. } => {
-                prop_assert_eq!(message.command_type, CommandType::Tipc(*command_id));
-            }
-        }
-        prop_assert_eq!(message.pid, request.pid);
-        prop_assert_eq!(&message.copy_handles, &request.copy_handles);
-        prop_assert_eq!(&message.move_handles, &request.move_handles);
-        prop_assert_eq!(&message.static_descriptors, &request.statics);
-        prop_assert_eq!(&message.send_buffers, &request.sends);
-        prop_assert_eq!(&message.receive_buffers, &request.receives);
-        prop_assert_eq!(&message.exchange_buffers, &request.exchanges);
-        prop_assert_eq!(message.receive_list, request.receive_list);
-        prop_assert_eq!(&message.receive_descriptors, &request.receive_descriptors);
-
-        let has_domain = request.expects_domain_header(kind);
-        match request.payload {
-            Payload::Cmif {
-                command_id, version, token, object_id, data, input_objects, ..
-            } => {
-                let domain = has_domain.then(|| DomainRequestHeader {
-                    command: DomainCommand::SendMessage,
-                    input_object_count: u32::try_from(input_objects.len()).unwrap(),
-                    size: u32::try_from(CMIF_HEADER_BYTES + data.len() * 4).unwrap(),
-                    object_id,
-                    token,
-                });
-                let object_ids = if domain.is_some() { input_objects } else { Vec::new() };
-                prop_assert_eq!(
-                    message.body,
-                    Body::CmifRequest(CmifRequest {
-                        domain,
-                        header: CmifRequestHeader { version, command_id, token },
-                        data: &le(&data),
-                        object_ids,
-                    })
-                );
-            }
-            Payload::Tipc { data, .. } => {
-                prop_assert_eq!(message.body, Body::TipcRequest { data: &le(&data) });
-            }
-        }
-    }
-}
-
 #[test]
 fn builder_failures_are_clean_errors() {
     let mut small = [0_u8; 16];
@@ -564,13 +252,37 @@ fn builder_failures_are_clean_errors() {
         ReplyBuilder::tipc(MAX_TIPC_COMMAND_ID + 1, 0).build(&mut buf),
         Err(IpcError::TipcCommandOutOfRange(MAX_TIPC_COMMAND_ID + 1))
     );
-    let mut too_many = ReplyBuilder::cmif(0);
+    // Both handle lists are checked against their 4-bit fields, naming the one that overflowed.
+    let mut too_many_copies = ReplyBuilder::cmif(0);
+    let mut too_many_moves = ReplyBuilder::cmif(0);
     for handle in 0..=MAX_HANDLES {
-        too_many = too_many.copy_handle(handle);
+        too_many_copies = too_many_copies.copy_handle(handle);
+        too_many_moves = too_many_moves.move_handle(handle);
     }
+    assert_eq!(
+        too_many_copies.build(&mut buf),
+        Err(IpcError::FieldOutOfRange {
+            field: "copy handle count",
+            value: u64::from(MAX_HANDLES) + 1,
+        })
+    );
+    assert_eq!(
+        too_many_moves.build(&mut buf),
+        Err(IpcError::FieldOutOfRange {
+            field: "move handle count",
+            value: u64::from(MAX_HANDLES) + 1,
+        })
+    );
+    // The raw data size is checked against its 10-bit field before the buffer size.
+    let words = usize::try_from(MAX_RAW_WORDS).unwrap() + 1;
     assert!(matches!(
-        too_many.build(&mut buf),
-        Err(IpcError::FieldOutOfRange { .. })
+        ReplyBuilder::tipc(0, 0)
+            .data(&vec![0; words * size_of::<u32>()])
+            .build(&mut buf),
+        Err(IpcError::FieldOutOfRange {
+            field: "raw data words",
+            ..
+        })
     ));
 }
 

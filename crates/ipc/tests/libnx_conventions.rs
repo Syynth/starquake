@@ -8,8 +8,9 @@
 
 use starquake_ipc::{
     BUFFER_SIZE, Body, CMIF_HEADER_BYTES, CmifRequest, CommandHeader, CommandType,
-    DOMAIN_HEADER_BYTES, DomainCommand, DomainRequestHeader, Message, RAW_ALIGNMENT_WORDS,
-    ReceiveDescriptor, ReceiveList, RequestBuilder, SFCI_MAGIC, SessionKind, TIPC_COMMAND_OFFSET,
+    DOMAIN_HEADER_BYTES, DomainCommand, DomainRequestHeader, MAX_DOMAIN_INPUT_OBJECTS,
+    MAX_DOMAIN_SIZE, Message, RAW_ALIGNMENT_WORDS, ReceiveDescriptor, ReceiveList, RequestBuilder,
+    SFCI_MAGIC, SessionKind, TIPC_COMMAND_OFFSET,
 };
 
 const WORD: usize = size_of::<u32>();
@@ -295,4 +296,12 @@ fn control_and_context_conventions_are_expressible() {
     let request = cmif_request(message).unwrap();
     assert_eq!((request.header.version, request.header.token), (1, 0));
     assert_eq!(request.domain.map(|d| d.token), Some(context));
+}
+
+/// libnx stores the domain object count in a `u8` and the data size in a `u16`
+/// (`CmifDomainInHeader`); the exported limits are those field widths.
+#[test]
+fn domain_limits_are_the_libnx_field_widths() {
+    assert_eq!(MAX_DOMAIN_INPUT_OBJECTS, u32::from(u8::MAX));
+    assert_eq!(MAX_DOMAIN_SIZE, u32::from(u16::MAX));
 }

@@ -67,11 +67,12 @@
 //!   them) and the kernel fills them in. [`RequestBuilder::send_pid`] writes the value it is
 //!   given, which a libnx program never does; it exists so a test can see the value come back.
 
+use crate::builder::{Parts, fill_header, out_of_range, push_special_header, to_u32};
 use crate::cmif::{CMIF_HEADER_BYTES, CmifRequestHeader, DomainCommand, DomainRequestHeader};
 use crate::error::{IpcError, Result};
 use crate::hipc::{
-    BufferDescriptor, CommandHeader, CommandType, ReceiveDescriptor, ReceiveList, SpecialHeader,
-    StaticDescriptor, align_raw, high32, low32, push_data, write_words,
+    BufferDescriptor, CommandHeader, CommandType, ReceiveDescriptor, ReceiveList, StaticDescriptor,
+    align_raw, push_data, write_words,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,16 +114,13 @@ pub struct RequestBuilder {
     token: Option<u32>,
     domain_token: Option<u32>,
     pid: Option<u64>,
-    copy_handles: Vec<u32>,
-    move_handles: Vec<u32>,
+    parts: Parts,
     statics: Vec<StaticDescriptor>,
     sends: Vec<BufferDescriptor>,
     receives: Vec<BufferDescriptor>,
     exchanges: Vec<BufferDescriptor>,
     receive_list: Option<ReceiveList>,
     receive_descriptors: Vec<ReceiveDescriptor>,
-    data: Vec<u8>,
-    object_ids: Vec<u32>,
 }
 
 impl RequestBuilder {
@@ -133,16 +131,13 @@ impl RequestBuilder {
             token: None,
             domain_token: None,
             pid: None,
-            copy_handles: Vec::new(),
-            move_handles: Vec::new(),
+            parts: Parts::default(),
             statics: Vec::new(),
             sends: Vec::new(),
             receives: Vec::new(),
             exchanges: Vec::new(),
             receive_list: None,
             receive_descriptors: Vec::new(),
-            data: Vec::new(),
-            object_ids: Vec::new(),
         }
     }
 
@@ -234,14 +229,14 @@ impl RequestBuilder {
     /// Adds a handle to copy to the receiver.
     #[must_use]
     pub fn copy_handle(mut self, handle: u32) -> Self {
-        self.copy_handles.push(handle);
+        self.parts.copy_handles.push(handle);
         self
     }
 
     /// Adds a handle to move to the receiver.
     #[must_use]
     pub fn move_handle(mut self, handle: u32) -> Self {
-        self.move_handles.push(handle);
+        self.parts.move_handles.push(handle);
         self
     }
 
@@ -296,7 +291,7 @@ impl RequestBuilder {
     /// Appends argument bytes.
     #[must_use]
     pub fn data(mut self, bytes: &[u8]) -> Self {
-        self.data.extend_from_slice(bytes);
+        self.parts.data.extend_from_slice(bytes);
         self
     }
 
@@ -305,7 +300,7 @@ impl RequestBuilder {
     /// [`RequestBuilder::domain`].
     #[must_use]
     pub fn object_id(mut self, id: u32) -> Self {
-        self.object_ids.push(id);
+        self.parts.object_ids.push(id);
         self
     }
 
@@ -321,24 +316,15 @@ impl RequestBuilder {
 
     fn words(&self) -> Result<Vec<u32>> {
         let command_type = self.validate()?;
-        let has_special_header =
-            self.pid.is_some() || !self.copy_handles.is_empty() || !self.move_handles.is_empty();
 
         // The two header words are filled in last, once the raw data size is known.
         let mut words = vec![0; CommandHeader::WORDS];
-        if has_special_header {
-            let special = SpecialHeader {
-                send_pid: self.pid.is_some(),
-                num_copy_handles: to_u32("copy handle count", self.copy_handles.len())?,
-                num_move_handles: to_u32("move handle count", self.move_handles.len())?,
-            };
-            words.push(special.encode()?);
-            if let Some(pid) = self.pid {
-                words.extend([low32(pid), high32(pid)]);
-            }
-            words.extend_from_slice(&self.copy_handles);
-            words.extend_from_slice(&self.move_handles);
-        }
+        let has_special_header = push_special_header(
+            &mut words,
+            self.pid,
+            &self.parts.copy_handles,
+            &self.parts.move_handles,
+        )?;
         for descriptor in &self.statics {
             words.extend(descriptor.encode()?);
         }
@@ -370,23 +356,19 @@ impl RequestBuilder {
             receive_list,
             has_special_header,
         };
-        let [w0, w1] = header.encode()?;
-        if let [first, second, ..] = words.as_mut_slice() {
-            *first = w0;
-            *second = w1;
-        }
+        fill_header(&mut words, &header)?;
         Ok(words)
     }
 
     /// Appends the raw data section.
     fn push_raw(&self, words: &mut Vec<u32>) -> Result<()> {
         match self.layout {
-            Layout::Tipc { .. } => push_data(words, &self.data),
+            Layout::Tipc { .. } => push_data(words, &self.parts.data),
             Layout::Close { .. } => {}
             Layout::Cmif { command_id, .. } => {
                 align_raw(words);
                 self.push_cmif_header(words, command_id);
-                push_data(words, &self.data);
+                push_data(words, &self.parts.data);
             }
             Layout::Domain {
                 object_id,
@@ -396,10 +378,10 @@ impl RequestBuilder {
                 align_raw(words);
                 // The size counts the SFCI header and the arguments, padded to whole words.
                 let size = self
+                    .parts
                     .data
                     .len()
-                    .div_ceil(4)
-                    .checked_mul(4)
+                    .checked_next_multiple_of(size_of::<u32>())
                     .and_then(|bytes| bytes.checked_add(CMIF_HEADER_BYTES))
                     .ok_or_else(|| out_of_range("domain message size", usize::MAX))?;
                 words.extend(
@@ -407,7 +389,7 @@ impl RequestBuilder {
                         command: DomainCommand::SendMessage,
                         input_object_count: to_u32(
                             "domain input object count",
-                            self.object_ids.len(),
+                            self.parts.object_ids.len(),
                         )?,
                         size: to_u32("domain message size", size)?,
                         object_id,
@@ -416,8 +398,8 @@ impl RequestBuilder {
                     .encode()?,
                 );
                 self.push_cmif_header(words, command_id);
-                push_data(words, &self.data);
-                words.extend_from_slice(&self.object_ids);
+                push_data(words, &self.parts.data);
+                words.extend_from_slice(&self.parts.object_ids);
             }
             Layout::DomainClose { object_id } => {
                 align_raw(words);
@@ -474,14 +456,14 @@ impl RequestBuilder {
         match self.layout {
             Layout::Domain { .. } => {}
             Layout::DomainClose { .. } => {
-                if !self.object_ids.is_empty() || !self.data.is_empty() {
+                if !self.parts.object_ids.is_empty() || !self.parts.data.is_empty() {
                     return Err(IpcError::Inconsistent(
                         "closing a domain virtual handle carries no data or object ids",
                     ));
                 }
             }
             _ => {
-                if !self.object_ids.is_empty() {
+                if !self.parts.object_ids.is_empty() {
                     return Err(IpcError::ObjectIdsOutsideDomain);
                 }
             }
@@ -508,16 +490,16 @@ impl RequestBuilder {
     /// Whether anything beyond the layout itself was added.
     fn carries_anything(&self) -> bool {
         self.pid.is_some()
-            || !self.copy_handles.is_empty()
-            || !self.move_handles.is_empty()
+            || !self.parts.copy_handles.is_empty()
+            || !self.parts.move_handles.is_empty()
             || !self.statics.is_empty()
             || !self.sends.is_empty()
             || !self.receives.is_empty()
             || !self.exchanges.is_empty()
             || self.receive_list.is_some()
             || !self.receive_descriptors.is_empty()
-            || !self.data.is_empty()
-            || !self.object_ids.is_empty()
+            || !self.parts.data.is_empty()
+            || !self.parts.object_ids.is_empty()
     }
 
     /// The receive list flag: as set, or following the C descriptors added; either way it must
@@ -547,16 +529,4 @@ impl RequestBuilder {
             .encode(),
         );
     }
-}
-
-fn out_of_range(field: &'static str, value: usize) -> IpcError {
-    IpcError::FieldOutOfRange {
-        field,
-        value: u64::try_from(value).unwrap_or(u64::MAX),
-    }
-}
-
-/// A count as a header word, or the out-of-range error naming `field`.
-fn to_u32(field: &'static str, value: usize) -> Result<u32> {
-    u32::try_from(value).map_err(|_| out_of_range(field, value))
 }
