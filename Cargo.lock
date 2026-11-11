@@ -565,12 +565,17 @@ dependencies = [
 [[package]]
 name = "starquake-testkit"
 version = "0.0.0"
+dependencies = [
+ "proptest",
+ "thiserror",
+]
 
 [[package]]
 name = "starquake-trace"
 version = "0.0.0"
 dependencies = [
  "postcard",
+ "proptest",
  "serde",
  "thiserror",
 ]
