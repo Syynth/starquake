@@ -82,6 +82,10 @@ allow_attributes = "warn"
 # separate worktrees at once.
 [profile.dev]
 debug = 0
+# With no debug info cargo would strip the standard library's, using the toolchain's bundled
+# rust-objcopy. On macOS that tool fails to load its LLVM library in 1.99.1 and every build prints
+# a warning, so leave binaries unstripped.
+strip = "none"
 
 # Emulators are unusably slow unoptimised; keep our crates quick to rebuild but optimise deps.
 [profile.dev.package."*"]

@@ -165,6 +165,36 @@ global_asm!(
     "ldr x0, [x1]",
     "ldr x3, [x2]",
     "hvc #0",
+    // ---- EL1: read one word (x1 = address) ----
+    ".globl _t_read",
+    "_t_read:",
+    "ldr x0, [x1]",
+    "hvc #0",
+    // ---- EL1: keep reading [x1] without leaving the guest until it equals x2 (x3 = max tries) ----
+    ".globl _t_spin_read",
+    "_t_spin_read:",
+    "1:",
+    "ldr x0, [x1]",
+    "cmp x0, x2",
+    "b.eq 2f",
+    "subs x3, x3, #1",
+    "b.ne 1b",
+    "2:",
+    "hvc #0",
+    // ---- EL1: flush this VM's stage-1 TLB entries on every vCPU (broadcast form) ----
+    ".globl _t_tlbi_is",
+    "_t_tlbi_is:",
+    "tlbi vmalle1is",
+    "dsb ish",
+    "isb",
+    "hvc #0",
+    // ---- EL1: flush this vCPU's stage-1 TLB entries only ----
+    ".globl _t_tlbi_local",
+    "_t_tlbi_local:",
+    "tlbi vmalle1",
+    "dsb nsh",
+    "isb",
+    "hvc #0",
     ".globl _guest_blob_end",
     "_guest_blob_end:",
 );
@@ -182,6 +212,10 @@ unsafe extern "C" {
     static t_el0_atomics: u8;
     static t_mte: u8;
     static t_remap: u8;
+    static t_read: u8;
+    static t_spin_read: u8;
+    static t_tlbi_is: u8;
+    static t_tlbi_local: u8;
 }
 
 pub fn blob() -> &'static [u8] {
@@ -208,6 +242,10 @@ pub enum Test {
     El0Atomics,
     Mte,
     Remap,
+    Read,
+    SpinRead,
+    TlbiIs,
+    TlbiLocal,
 }
 
 impl Test {
@@ -224,6 +262,10 @@ impl Test {
                 Test::El0Atomics => &t_el0_atomics,
                 Test::Mte => &t_mte,
                 Test::Remap => &t_remap,
+                Test::Read => &t_read,
+                Test::SpinRead => &t_spin_read,
+                Test::TlbiIs => &t_tlbi_is,
+                Test::TlbiLocal => &t_tlbi_local,
             })
         }
     }
