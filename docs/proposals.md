@@ -39,6 +39,49 @@ Statuses: `proposed`, `promoted #N`, `folded into ...`, `adopted`, `dropped: <re
 - Wiring the request builder into synthetic guests and golden traces → #8.
 - Whether `proptest-regressions/` is committed → #38.
 
+### From wave 3 (ledger: #22)
+
+| Status | Proposal | Why | Suggested |
+|---|---|---|---|
+| proposed | **feat(kernel): finish the dispatcher: pass declared tables to calls as disjoint borrows**, with a real compile-fail demonstration and the first calls that touch a table | #56 landed the dispatcher, but no implemented call takes a table yet: the lock is held and never read, and the two `compile_fail` doctests only show that a field is private. The table-parameter convention the kernel spec is built on isn't exercised until this exists. | area:kernel, M1; do before kernel slices 4–10 |
+| proposed | **chore(kernel): one result-code encoding and one `Handle` type** | #57 and #56 were built side by side: `handle.rs` encodes Horizon results itself, duplicating `result.rs`, and the two may define `Handle` twice. | area:kernel, M1 |
+| proposed | **feat(trace): wire the recorder into the dispatcher, scheduler and address space; write `events.bin` on crash or timeout; one result word shared with the kernel** | The dispatcher's recording point is a no-op, and trace and kernel each have a `ResultCode`. Milestone 1's hello-world is meant to produce the first replay log. | M1 |
+| proposed | **infra: lint banning direct host clock and file-system calls in the kernel and service crates** | Observability spec, order of work step 2. #55 left it out and nothing owns it. It is what keeps replay deterministic. | infra, M1 |
+| proposed | **chore(kernel): a `Bool` kind and a word-size test in the system-call convention table** | `Kind::Word` accepts any type name and assumes 4 bytes; `CreateSession` and `CreatePort` take 1-byte bools, so rows beyond the retail calls would convert wrongly. Also commit the script that generated the table from Eden's wrappers. | area:kernel |
+| proposed | **test(loader): NRO round trip against the testkit's builder; share the `MOD0` and homebrew constants** | Nothing checks the loader's and the testkit's NRO layouts against each other, and they duplicate constants. | area:loader, M1 |
+| proposed | **feat(services): framework core, then control requests and domains** (service port slices 1–2) | The service spec is approved and these slices need only the IPC crate and a fake kernel, but no issue exists. Milestone 1 needs a request to reach `sm:`. | area:services, M1 |
+| proposed | **feat(kernel): port slices 4–10**, filed after the scheduler trial (#59) reports | Milestone 1's critical path. Deliberately waiting on the trial's verdict on the tables-and-ids design. | area:kernel, M1 |
+
+### Spec deviations from wave 3, awaiting the owner
+
+Places where wave 3's code narrowed or departed from an approved spec. Each needs a ruling:
+accept it and amend the spec, or change the code.
+
+| Status | Deviation | Spec |
+|---|---|---|
+| proposed | `get_system_tick` is fallible: the environment's clock returns an error when a replay runs out or disagrees, and the dispatcher then writes no registers. The spec sketched an infallible call. | kernel, observability |
+| proposed | **Nothing owns the conversion from the host clock to guest ticks.** The kernel assumes its environment already counts guest ticks, and converts nanoseconds at 19.2 MHz (the Switch 1 rate) in one place; Switch 2 processes need 31.25 MHz. Kernel, core and trace each leave it to another crate. | execution model, kernel |
+| proposed | The golden-trace text view omits `Schedule` events; whether `Wake`, `Map`, `Fault` and `Lifecycle` lines belong in it is open. | observability, testing |
+| proposed | The recorder has its own mutex, because the kernel lock isn't in its crate. The spec has sequence numbers assigned under the kernel's lock. | observability, kernel |
+| proposed | The system-call table has three statuses; calls the spec lists as "built now" but whose slice hasn't landed are marked deferred. A fourth status or a slice field may be wanted. | kernel |
+| proposed | `QueryIoMapping`, `ReadWriteRegister` and `QueryPhysicalAddress` are classified "not planned"; `SleepSystem` is left deferred. | kernel |
+| proposed | Event field types and the flight-recorder dump layout are guesses; typed environment methods for input and host file and network I/O are deferred behind a generic extension point; no event yet records the completion order of deferred replies (observability rule 3). | observability |
+
+### Folded into existing issues (wave 3)
+
+- NPDM handle-table size, capability check-and-log, and clock-to-guest-ticks placement → #33.
+- A real libnx-built NRO as a pinned fixture → #68.
+- Unported handle-table parts and the typed current-process and current-thread lookups → kernel slices 4, 8 and 9.
+- The deferred-reply completion event → kernel slice 9 and service slice 3.
+- Lock-wait measurement in the dispatcher → kernel slice 6.
+- Golden-trace line kinds → the milestone 1 bring-up (#20).
+
+### Infrastructure observed in wave 3
+
+| Status | Proposal | Why |
+|---|---|---|
+| proposed | **Shared build folder: stale cross-target artifacts** | One agent's Linux-target clippy run failed with spurious import errors from a sibling's build in the shared folder; an isolated folder passed. Wider than #67, which covers only the `xtask` binary. |
+
 ## House-rule candidates
 
 Rules distilled from review findings. A vetted rule moves into `CLAUDE.md`; until then it is
@@ -58,3 +101,13 @@ passed to build agents as a provisional rule for the next wave.
 | adopted | The merge queue waits for a PR's own CI checks before merging. |
 | dropped: a fact about the CPU backend, not a house rule; folded into #36 | Host writes into guest-executable memory do instruction-cache maintenance. |
 | dropped: a one-off fix, already applied | Widen CI path filters to cover every input that can break the job. |
+
+### From wave 3
+
+| Status | Rule |
+|---|---|
+| proposed | When two crates share a unit or convention (ticks or nanoseconds, who converts), give the value a distinct newtype or name the conversion's owner in one place, so neither side can assume the other converts. |
+| proposed | Decode and validate a header's magic and version before decoding the body, so a layout change is reported as an unsupported version. |
+| proposed | Pin every serialised or on-disk layout with a golden-bytes test covering every variant with distinct non-zero values; a layout change requires a version bump. |
+| proposed | Don't wrap a type in a second type that repeats its storage and logic; compose by wrapping the existing one. |
+| proposed | Before merging, test-merge current `main`, build, and re-run the full gate; re-verify numbers quoted in the PR body. |
