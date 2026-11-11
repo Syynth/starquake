@@ -788,7 +788,10 @@ mod tests {
             return entries | 1;
         }
         let mut count = entries;
-        while [2, 3, 5, 7, 11, 13, 17].iter().any(|p| count % p == 0) {
+        while [2, 3, 5, 7, 11, 13, 17]
+            .iter()
+            .any(|p| count.is_multiple_of(*p))
+        {
             count += 1;
         }
         count
@@ -814,49 +817,78 @@ mod tests {
         bytes[at..at + value.len()].copy_from_slice(value);
     }
 
-    /// Lays out an image the way Eden's `RomFSBuildContext::Build` does (entries sorted by path,
-    /// 4-aligned names, 16-aligned file data, chained hash buckets), except that the file data
-    /// starts `data_pad` * 16 bytes later than the minimum and the four tables are placed in the
-    /// order `table_order` (a permutation of 0..4: dir hash, dir meta, file hash, file meta).
-    fn build(spec: &TreeSpec, data_pad: usize, table_order: &[usize]) -> Built {
-        let mut dir_paths = vec![String::new()];
-        for (parent, name) in &spec.dirs {
-            let path = format!("{}/{}", dir_paths[*parent], name);
-            dir_paths.push(path);
-        }
-        let dir_name = |i: usize| -> &str { if i == 0 { "" } else { &spec.dirs[i - 1].1 } };
-        let dir_parent = |i: usize| -> usize { if i == 0 { 0 } else { spec.dirs[i - 1].0 } };
-        let file_paths: Vec<String> = spec
-            .files
-            .iter()
-            .map(|(parent, name, _)| format!("{}/{}", dir_paths[*parent], name))
-            .collect();
+    /// Table offsets of every entry and data offsets of every file (in the order given).
+    struct Offsets {
+        dir_id: Vec<u32>,
+        file_id: Vec<u32>,
+        file_data: Vec<usize>,
+        /// Size of the file data area.
+        partition: usize,
+    }
 
-        let mut dir_order: Vec<usize> = (0..dir_paths.len()).collect();
-        dir_order.sort_by(|&a, &b| dir_paths[a].cmp(&dir_paths[b]));
-        let mut file_order: Vec<usize> = (0..spec.files.len()).collect();
-        file_order.sort_by(|&a, &b| file_paths[a].cmp(&file_paths[b]));
-
-        // Entry offsets.
-        let mut dir_id = vec![0u32; dir_paths.len()];
+    fn assign_offsets(spec: &TreeSpec, dir_order: &[usize], file_order: &[usize]) -> Offsets {
+        let mut dir_id = vec![0u32; spec.dirs.len() + 1];
         let mut cursor = 0usize;
-        for &i in &dir_order {
+        for &i in dir_order {
             dir_id[i] = u32_of(cursor);
-            cursor += DIR_ENTRY_SIZE + dir_name(i).len().next_multiple_of(4);
+            let name_len = if i == 0 { 0 } else { spec.dirs[i - 1].1.len() };
+            cursor += DIR_ENTRY_SIZE + name_len.next_multiple_of(4);
         }
-        let dir_table_size = cursor;
         let mut file_id = vec![0u32; spec.files.len()];
         let mut file_data = vec![0usize; spec.files.len()];
         let mut cursor = 0usize;
         let mut partition = 0usize;
-        for &i in &file_order {
+        for &i in file_order {
             file_id[i] = u32_of(cursor);
             cursor += FILE_ENTRY_SIZE + spec.files[i].1.len().next_multiple_of(4);
             partition = partition.next_multiple_of(16);
             file_data[i] = partition;
             partition += spec.files[i].2.len();
         }
-        let file_table_size = cursor;
+        Offsets {
+            dir_id,
+            file_id,
+            file_data,
+            partition,
+        }
+    }
+
+    /// Relative-to-root paths (no leading `/` for the root, which is empty) of every directory
+    /// (root first) and every file.
+    fn paths(spec: &TreeSpec) -> (Vec<String>, Vec<String>) {
+        let mut dir_paths = vec![String::new()];
+        for (parent, name) in &spec.dirs {
+            let path = format!("{}/{}", dir_paths[*parent], name);
+            dir_paths.push(path);
+        }
+        let file_paths = spec
+            .files
+            .iter()
+            .map(|(parent, name, _)| format!("{}/{}", dir_paths[*parent], name))
+            .collect();
+        (dir_paths, file_paths)
+    }
+
+    /// Lays out an image the way Eden's `RomFSBuildContext::Build` does (entries sorted by path,
+    /// 4-aligned names, 16-aligned file data, chained hash buckets), except that the file data
+    /// starts `data_pad` * 16 bytes later than the minimum and the four tables are placed in the
+    /// order `table_order` (a permutation of 0..4: dir hash, dir meta, file hash, file meta).
+    fn build(spec: &TreeSpec, data_pad: usize, table_order: &[usize]) -> Built {
+        let (dir_paths, file_paths) = paths(spec);
+        let dir_name = |i: usize| -> &str { if i == 0 { "" } else { &spec.dirs[i - 1].1 } };
+        let dir_parent = |i: usize| -> usize { if i == 0 { 0 } else { spec.dirs[i - 1].0 } };
+
+        let mut dir_order: Vec<usize> = (0..dir_paths.len()).collect();
+        dir_order.sort_by(|&a, &b| dir_paths[a].cmp(&dir_paths[b]));
+        let mut file_order: Vec<usize> = (0..spec.files.len()).collect();
+        file_order.sort_by(|&a, &b| file_paths[a].cmp(&file_paths[b]));
+
+        let Offsets {
+            dir_id,
+            file_id,
+            file_data,
+            partition,
+        } = assign_offsets(spec, &dir_order, &file_order);
 
         // Links.
         let mut dir_buckets = vec![ENTRY_EMPTY; bucket_count(dir_paths.len())];
@@ -927,45 +959,71 @@ mod tests {
             ));
         }
 
-        // Encode the tables.
-        let word = |value: Option<u32>| value.unwrap_or(ENTRY_EMPTY).to_le_bytes();
-        let mut dir_meta = Vec::new();
-        for (_, entry) in &dirs {
-            dir_meta.extend_from_slice(&entry.parent.to_le_bytes());
-            dir_meta.extend_from_slice(&word(entry.sibling));
-            dir_meta.extend_from_slice(&word(entry.child_dir));
-            dir_meta.extend_from_slice(&word(entry.child_file));
-            dir_meta.extend_from_slice(&word(entry.hash_next));
-            dir_meta.extend_from_slice(&u32_of(entry.name.len()).to_le_bytes());
-            dir_meta.extend_from_slice(entry.name.as_bytes());
-            dir_meta.resize(dir_meta.len().next_multiple_of(4), 0);
-        }
-        assert_eq!(dir_meta.len(), dir_table_size);
-        let mut file_meta = Vec::new();
-        for (_, entry, _) in &files {
-            file_meta.extend_from_slice(&entry.parent.to_le_bytes());
-            file_meta.extend_from_slice(&word(entry.sibling));
-            file_meta.extend_from_slice(&entry.offset.to_le_bytes());
-            file_meta.extend_from_slice(&entry.size.to_le_bytes());
-            file_meta.extend_from_slice(&word(entry.hash_next));
-            file_meta.extend_from_slice(&u32_of(entry.name.len()).to_le_bytes());
-            file_meta.extend_from_slice(entry.name.as_bytes());
-            file_meta.resize(file_meta.len().next_multiple_of(4), 0);
-        }
-        assert_eq!(file_meta.len(), file_table_size);
-        let encode_buckets =
-            |buckets: &[u32]| -> Vec<u8> { buckets.iter().flat_map(|b| b.to_le_bytes()).collect() };
         let tables = [
             encode_buckets(&dir_buckets),
-            dir_meta,
+            encode_dirs(&dirs),
             encode_buckets(&file_buckets),
-            file_meta,
+            encode_files(&files),
         ];
+        let (bytes, header) = place(&files, partition, &tables, data_pad, table_order);
+        Built {
+            bytes,
+            header,
+            dirs,
+            files,
+        }
+    }
 
-        // Place the file data, then the tables in the requested order.
+    fn link_word(value: Option<u32>) -> [u8; 4] {
+        value.unwrap_or(ENTRY_EMPTY).to_le_bytes()
+    }
+
+    fn encode_buckets(buckets: &[u32]) -> Vec<u8> {
+        buckets.iter().flat_map(|b| b.to_le_bytes()).collect()
+    }
+
+    fn encode_dirs(dirs: &[(String, DirEntry)]) -> Vec<u8> {
+        let mut table = Vec::new();
+        for (_, entry) in dirs {
+            table.extend_from_slice(&entry.parent.to_le_bytes());
+            table.extend_from_slice(&link_word(entry.sibling));
+            table.extend_from_slice(&link_word(entry.child_dir));
+            table.extend_from_slice(&link_word(entry.child_file));
+            table.extend_from_slice(&link_word(entry.hash_next));
+            table.extend_from_slice(&u32_of(entry.name.len()).to_le_bytes());
+            table.extend_from_slice(entry.name.as_bytes());
+            table.resize(table.len().next_multiple_of(4), 0);
+        }
+        table
+    }
+
+    fn encode_files(files: &[(String, FileEntry, Vec<u8>)]) -> Vec<u8> {
+        let mut table = Vec::new();
+        for (_, entry, _) in files {
+            table.extend_from_slice(&entry.parent.to_le_bytes());
+            table.extend_from_slice(&link_word(entry.sibling));
+            table.extend_from_slice(&entry.offset.to_le_bytes());
+            table.extend_from_slice(&entry.size.to_le_bytes());
+            table.extend_from_slice(&link_word(entry.hash_next));
+            table.extend_from_slice(&u32_of(entry.name.len()).to_le_bytes());
+            table.extend_from_slice(entry.name.as_bytes());
+            table.resize(table.len().next_multiple_of(4), 0);
+        }
+        table
+    }
+
+    /// Writes the header, the file data (`partition` bytes after the header, `data_pad` * 16
+    /// bytes late) and the tables in `table_order`.
+    fn place(
+        files: &[(String, FileEntry, Vec<u8>)],
+        partition: usize,
+        tables: &[Vec<u8>; 4],
+        data_pad: usize,
+        table_order: &[usize],
+    ) -> (Vec<u8>, RomFsHeader) {
         let data_offset = HEADER_SIZE + 16 * data_pad;
         let mut bytes = vec![0u8; data_offset + partition];
-        for (_, entry, content) in &files {
+        for (_, entry, content) in files {
             let at = data_offset + usize_of64(entry.offset);
             bytes[at..at + content.len()].copy_from_slice(content);
         }
@@ -995,12 +1053,7 @@ mod tests {
             DATA_OFFSET_AT,
             &header.data_offset.to_le_bytes(),
         );
-        Built {
-            bytes,
-            header,
-            dirs,
-            files,
-        }
+        (bytes, header)
     }
 
     /// Offset within the header of table `n`'s offset (`+ 8` for its size).
@@ -1106,7 +1159,7 @@ mod tests {
     fn path_hash_known_answers() {
         // Worked by hand from `hash = parent ^ SEED; for each byte: hash = rotr(hash, 5) ^ byte`,
         // with the rotation written out as shifts.
-        let rotr5 = |h: u32| (h >> 5) | (h << 27);
+        let rotr5 = |h: u32| h / 32 + (h % 32) * (1 << 27);
         assert_eq!(path_hash(0, b""), HASH_SEED);
         assert_eq!(path_hash(0x40, b""), 0x40 ^ HASH_SEED);
         assert_eq!(path_hash(0, b"a"), rotr5(HASH_SEED) ^ 0x61);
@@ -1166,7 +1219,7 @@ mod tests {
         );
         check_image(&built);
         let fs = open(&built.bytes).unwrap();
-        assert!(fs.walk().unwrap().files.is_empty());
+        assert_eq!(fs.walk().unwrap().files.len(), 0);
     }
 
     #[test]
@@ -1436,7 +1489,10 @@ mod tests {
         let first = built.files[0].1.id;
         let buckets_at = usize_of64(built.header.file_hash.offset);
         let bucket_bytes = usize_of64(built.header.file_hash.size);
-        for word in bytes[buckets_at..buckets_at + bucket_bytes].chunks_exact_mut(4) {
+        for word in bytes[buckets_at..buckets_at + bucket_bytes]
+            .as_chunks_mut::<4>()
+            .0
+        {
             word.copy_from_slice(&first.to_le_bytes());
         }
         let fs = open(&bytes).unwrap();
@@ -1457,7 +1513,10 @@ mod tests {
         );
         let buckets_at = usize_of64(built.header.dir_hash.offset);
         let bucket_bytes = usize_of64(built.header.dir_hash.size);
-        for word in bytes[buckets_at..buckets_at + bucket_bytes].chunks_exact_mut(4) {
+        for word in bytes[buckets_at..buckets_at + bucket_bytes]
+            .as_chunks_mut::<4>()
+            .0
+        {
             word.copy_from_slice(&ROOT_OFFSET.to_le_bytes());
         }
         let fs = open(&bytes).unwrap();
