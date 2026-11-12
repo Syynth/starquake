@@ -115,3 +115,35 @@ when the `CI` environment variable is set: so on a gate run on a Mac. On the hos
 its `comparison` module runs, which checks the comparison itself against made-up runs; the same
 conversation with `sm:` and `set:sys` runs on every host without a vCPU in
 `crates/core/src/hle/tests.rs`.
+
+## `startup/`
+
+A libnx program built the ordinary way (`startup.c`): it keeps libnx's own `__appInit`, so
+start-up opens `sm:`, then `set:sys`, `apm`, `appletOE`, `hid`, `time:u`, `fsp-srv` and `vi:m`
+before `main` (`libnx/nx/source/runtime/init.c`, `services/applet.c`, whose `_appletInitialize`
+opens `apm` for an application, and `display/default_window.c` @ b156b477).
+`main` prints one line on the console, which opens `nvdrv` for the framebuffer, and returns;
+libnx then closes everything and ends the process through `appletOE`.
+
+| File | What it is | Built by |
+|---|---|---|
+| `startup.c` | The program | |
+| `Makefile` | Builds the NRO and writes `manifest.toml`, with the hello fixture's flags | |
+| `startup.nro` | What `starquake run` loads, with an `ASET` block holding a NACP | `elf2nro` |
+| `manifest.toml` | Toolchain versions, the ELF's build id, and the SHA-256 of every source and binary | `make` |
+| `reference/` | The reference emulator's normalised trace and its README, with the gap list | `tools/oracle/` |
+
+`crates/loader/tests/homebrew_fixture.rs` checks the manifest as it does the hello fixture's.
+Rebuild with `make -C tests/homebrew/startup` (same set-up as above).
+
+### How far `startup.nro` runs
+
+Not far yet, and that is the point of it: starquake's run matches the start of the reference
+trace (`startup/reference/startup.trace`), and `crates/core/tests/homebrew.rs` fails if a change
+makes it match fewer lines than its `STARTUP_MATCHED` records (the change that makes it match
+more raises that constant). When the fixture was added (#113), the run matched start-up,
+`set:sys`, and `sm:`'s `GetService` for `apm`, and differed at the next request: starquake has
+no `apm`, so `sm:`'s auto-stub hands out a session whose requests are logged under `sm:`'s
+number, where the reference has `apm`'s. `startup/reference/README.md` lists every system call
+and request in the trace that starquake does not implement yet, in order of first use, written
+from the trace by the same test file.

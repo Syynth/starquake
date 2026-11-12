@@ -983,6 +983,7 @@ mod tests {
             address_space: AddressSpaceType::Is39Bit,
             main_thread_priority: priority,
             main_thread_core: core,
+            remote_memory_size: 0,
             system_resource_size: 0,
             process_category: 0,
             main_thread_stack_size: 0,

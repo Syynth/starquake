@@ -7,7 +7,8 @@
 //! - `eden/src/core/hle/kernel/k_scheduler_lock.h`: `Unlock`, as [`Scheduler::update`].
 //! - `eden/src/core/hle/kernel/k_thread.cpp`: `Initialize` (scheduler fields), `Run`,
 //!   `SetState`, `RequestSuspend`, `Resume`, `TrySuspend`, `UpdateState`, `SetActivity`,
-//!   `SetBasePriority`, `RestorePriority` (without inheritance) and `SetCoreMask`.
+//!   `SetBasePriority`, `SetPriority` and `SetCoreMask`. `RestorePriority`, with inheritance
+//!   over held locks, is `crate::sync::lock`'s.
 //!
 //! Every method that takes a [`ThreadId`] looks the row up once to check it, then works through
 //! ids: Eden's `KThread*` becomes an id, and `thread->Field()` a slab lookup. An id a caller
@@ -16,6 +17,8 @@
 //! bookkeeping, [`SchedError::Corrupt`]). See the module docs of `sched` for what is deferred
 //! and where starquake diverges.
 
+use std::collections::BTreeMap;
+
 use starquake_cpu::GuestRegs;
 use starquake_trace::GuestTicks;
 
@@ -23,10 +26,20 @@ use super::cores::{APPLICATION_CORE_COUNT, AffinityMask, CoreId, CoreSignals, MA
 use super::queue::{PriorityQueue, Threads, Walk};
 use super::thread::{Priority, QueueLink, SuspendType, Thread, ThreadState};
 use super::{HIGHEST_CORE_MIGRATION_ALLOWED_PRIORITY, IdealCore, SchedError, ThreadActivity};
-use crate::id::ThreadId;
+use crate::id::{ProcessId, ThreadId};
 use crate::ipc::Ipc;
 use crate::object::Objects;
+use crate::process::ProcessRecord;
 use crate::result::KernelError;
+use crate::sync::SyncTable;
+
+mod lifecycle;
+
+pub use lifecycle::{ThreadExit, UserThread};
+
+/// The id the first thread gets: Eden's `next_thread_id{1}` (`eden/src/core/hle/kernel/kernel.cpp`
+/// @ cf654052).
+pub const FIRST_THREAD_ID: u64 = 1;
 
 /// One core's scheduling state: the scheduler's `SchedulingState` and current thread
 /// (`k_scheduler.h`).
@@ -59,13 +72,22 @@ pub struct Scheduler {
     objects: Objects,
     /// Servers, sessions and named ports (kernel spec: sessions live in this table).
     ipc: Ipc,
+    /// Wait lists, wait records and timers (kernel spec: wait lists and timers live in this
+    /// table; see [`crate::sync`]).
+    sync: SyncTable,
     threads: Threads,
     queue: PriorityQueue,
     cores: Vec<CoreState>,
     /// `GlobalSchedulerContext::m_scheduler_update_needed`.
     update_needed: bool,
-    /// `KProcess::m_schedule_count`, one for the table (a listed divergence).
+    /// `KProcess::m_schedule_count` for the threads that belong to no process; each process
+    /// keeps its own ([`ProcessRecord::scheduled_count`]).
     scheduled_count: u64,
+    /// What changes about each process while it runs: its state, threads and thread-local
+    /// pages (kernel slice 8). Its fixed facts are in [`crate::tables::Processes`].
+    processes: BTreeMap<ProcessId, ProcessRecord>,
+    /// The id the next thread gets (`KernelCore::CreateNewThreadID`, from 1).
+    next_thread_id: u64,
 }
 
 impl Default for Scheduler {
@@ -80,11 +102,14 @@ impl Scheduler {
         Self {
             objects: Objects::new(),
             ipc: Ipc::new(),
+            sync: SyncTable::default(),
             threads: Threads::new(),
             queue: PriorityQueue::new(core_count),
             cores: vec![CoreState::new(); usize::from(core_count)],
             update_needed: false,
             scheduled_count: 0,
+            processes: BTreeMap::new(),
+            next_thread_id: FIRST_THREAD_ID,
         }
     }
 
@@ -156,6 +181,25 @@ impl Scheduler {
         (&mut self.objects, &mut self.ipc)
     }
 
+    /// The synchronisation rows, for [`crate::sync`]'s operations on this table.
+    pub(crate) fn sync_table(&self) -> &SyncTable {
+        &self.sync
+    }
+
+    /// The synchronisation rows, to change, for [`crate::sync`]'s operations on this table.
+    pub(crate) fn sync_table_mut(&mut self) -> &mut SyncTable {
+        &mut self.sync
+    }
+
+    /// Clears a thread's queue links, so that the next run-queue operation on it fails with
+    /// [`SchedError::Corrupt`]. Test support for the paths that must undo their work when the
+    /// queue fails.
+    #[cfg(test)]
+    pub(crate) fn sever_queue_links(&mut self, id: ThreadId) -> Result<(), SchedError> {
+        self.thread_mut(id)?.links.clear();
+        Ok(())
+    }
+
     /// The thread `id` names.
     pub fn thread(&self, id: ThreadId) -> Result<&Thread, SchedError> {
         Ok(self.threads.get(id)?)
@@ -206,12 +250,35 @@ impl Scheduler {
         priority: Priority,
         core: CoreId,
     ) -> Result<ThreadId, SchedError> {
+        self.insert_thread(priority, core, None)
+    }
+
+    /// Mints the next guest thread id (`CreateNewThreadID`). Ids are never reused; running out
+    /// of 64 bits is a table that cannot grow.
+    fn next_thread_id(&mut self) -> Result<u64, SchedError> {
+        let id = self.next_thread_id;
+        self.next_thread_id = id.checked_add(1).ok_or(SchedError::Corrupt)?;
+        Ok(id)
+    }
+
+    /// Inserts a thread row for [`Scheduler::create_thread`] and the lifecycle's user threads:
+    /// the scheduler fields of `KThread::Initialize`, bound to the physical `core`, with the
+    /// virtual ideal core and mask `virtual_core` (the physical core when it is `None`).
+    fn insert_thread(
+        &mut self,
+        priority: Priority,
+        core: CoreId,
+        virtual_core: Option<u8>,
+    ) -> Result<ThreadId, SchedError> {
         if !self.core_mask().contains(core) {
             return Err(KernelError::InvalidCoreId.into());
         }
+        let virtual_core = virtual_core.unwrap_or(core.index());
+        let thread_id = self.next_thread_id()?;
         let thread = Thread {
             state: ThreadState::Initialized,
             suspend_flags: 0,
+            suspend_requested: 0,
             priority,
             base_priority: priority,
             affinity: AffinityMask::single(core),
@@ -222,15 +289,38 @@ impl Scheduler {
             yield_schedule_count: None,
             links: vec![QueueLink::default(); self.cores.len()],
             context: GuestRegs::default(),
+            process: None,
+            object: None,
+            holds_itself: false,
+            guest_id: thread_id,
+            tls_address: 0,
+            virtual_ideal_core: i32::from(virtual_core),
+            virtual_affinity: 1_u64.checked_shl(u32::from(virtual_core)).unwrap_or(0),
         };
         Ok(self.threads.insert(thread)?)
     }
 
     /// Starts a created thread (`KThread::Run`): it must be [`ThreadState::Initialized`], or
-    /// the result is [`KernelError::InvalidState`].
+    /// the result is [`KernelError::InvalidState`]. A thread of a process counts as one of its
+    /// running threads (`IncrementRunningThreadCount`), and a thread with an object row takes a
+    /// reference to it (`this->Open`), which it holds until it ends.
     pub fn start(&mut self, id: ThreadId) -> Result<(), SchedError> {
-        if self.thread(id)?.state != ThreadState::Initialized {
+        let thread = self.thread(id)?;
+        if thread.state != ThreadState::Initialized {
             return Err(KernelError::InvalidState.into());
+        }
+        let (process, object) = (thread.process, thread.object);
+        if let Some(process) = process {
+            let record = self.record_mut(process)?;
+            record.running_threads = record
+                .running_threads
+                .checked_add(1)
+                .ok_or(SchedError::Corrupt)?;
+        }
+        if let Some(object) = object {
+            crate::handle::ObjectRefs::open(&mut self.objects, object)
+                .map_err(|_| SchedError::Corrupt)?;
+            self.thread_mut(id)?.holds_itself = true;
         }
         self.set_state(id, ThreadState::Runnable)
     }
@@ -248,27 +338,38 @@ impl Scheduler {
         Ok(())
     }
 
-    /// Adds a suspend request (`KThread::RequestSuspend`, then `TrySuspend`, which always
-    /// suspends until slice 5 adds kernel waiters).
+    /// Adds a suspend request (`KThread::RequestSuspend`), then tries to suspend
+    /// (`TrySuspend`): a thread that kernel waiters wait on keeps running with the request
+    /// noted ([`Thread::suspend_requested`]) but not in its state ([`Thread::suspend_flags`]).
     pub fn request_suspend(&mut self, id: ThreadId, kind: SuspendType) -> Result<(), SchedError> {
         let thread = self.thread_mut(id)?;
-        let flags = thread.suspend_flags | kind.bit();
-        self.update_suspend_flags(id, flags)
+        thread.suspend_requested |= kind.bit();
+        if self.sync.locks().kernel_waiters(id) > 0 {
+            return Ok(());
+        }
+        self.update_suspend_flags(id)
     }
 
-    /// Withdraws a suspend request (`KThread::Resume`).
+    /// Withdraws a suspend request (`KThread::Resume`), and puts the requests into the state.
     pub fn resume(&mut self, id: ThreadId, kind: SuspendType) -> Result<(), SchedError> {
         let thread = self.thread_mut(id)?;
-        let flags = thread.suspend_flags & !kind.bit();
-        self.update_suspend_flags(id, flags)
+        thread.suspend_requested &= !kind.bit();
+        self.update_suspend_flags(id)
+    }
+
+    /// Lets the scheduler's other tables ask for the cores' threads to be worked out again at
+    /// the next [`Scheduler::update`] (`KScheduler::SetSchedulerUpdateNeeded`).
+    pub(crate) fn note_update_needed(&mut self) {
+        self.update_needed = true;
     }
 
     /// `KThread::UpdateState`: put the requested flags into the state and tell the scheduler
     /// if that changed it.
-    fn update_suspend_flags(&mut self, id: ThreadId, flags: u8) -> Result<(), SchedError> {
+    fn update_suspend_flags(&mut self, id: ThreadId) -> Result<(), SchedError> {
         let thread = self.thread_mut(id)?;
         let was_queued = thread.is_queued();
         let old_flags = thread.suspend_flags;
+        let flags = thread.suspend_requested;
         thread.suspend_flags = flags;
         if old_flags != flags {
             self.on_thread_state_changed(id, was_queued)?;
@@ -312,16 +413,29 @@ impl Scheduler {
         self.restore_priority(caller, id)
     }
 
-    /// `KThread::RestorePriority` for one thread with no held locks: the effective priority
-    /// becomes the base priority. Inheritance (slice 5) walks lock owners from here.
+    /// `KThread::RestorePriority`: the effective priority becomes the most urgent of the base
+    /// priority and what the thread inherits from its locks' waiters, and the change walks up
+    /// the owners of the locks it waits on (`crate::sync::lock`).
     fn restore_priority(&mut self, caller: CoreId, id: ThreadId) -> Result<(), SchedError> {
+        self.restore_priority_chain(Some(caller), id)
+    }
+
+    /// Sets a thread's effective priority (`KThread::SetPriority`) and, if that changed it,
+    /// tells the queues (`KScheduler::OnThreadPriorityChanged`). `caller` is the core making
+    /// the call, if a core is: if `id` is its current thread it stays at the front of its new
+    /// level. The priority-inheritance walk (`crate::sync::lock`) is the only caller.
+    pub(crate) fn set_effective_priority(
+        &mut self,
+        caller: Option<CoreId>,
+        id: ThreadId,
+        priority: Priority,
+    ) -> Result<(), SchedError> {
         let thread = self.thread_mut(id)?;
-        let new_priority = thread.base_priority;
-        if new_priority == thread.priority {
+        let old_priority = thread.priority;
+        if old_priority == priority {
             return Ok(());
         }
-        let old_priority = thread.priority;
-        thread.priority = new_priority;
+        thread.priority = priority;
         self.on_thread_priority_changed(caller, id, old_priority)
     }
 
@@ -376,6 +490,18 @@ impl Scheduler {
             }
         };
 
+        self.apply_core_mask(id, new_ideal, mask)
+    }
+
+    /// Gives a thread a new physical ideal core and affinity mask, already checked
+    /// (`KThread::SetCoreMask`, the part with migration enabled): if its active core leaves the
+    /// mask, it moves to the ideal core, or with no ideal core to the highest core in the mask.
+    fn apply_core_mask(
+        &mut self,
+        id: ThreadId,
+        new_ideal: Option<CoreId>,
+        mask: AffinityMask,
+    ) -> Result<(), SchedError> {
         let thread = self.thread_mut(id)?;
         let old_mask = thread.affinity;
         thread.ideal_core = new_ideal;
@@ -396,10 +522,25 @@ impl Scheduler {
     // Notifications (k_scheduler.cpp, OnThread*Changed)
     // ---------------------------------------------------------------------------------------
 
-    /// `IncrementScheduledCount`.
-    fn count_scheduled(&mut self) {
+    /// `IncrementScheduledCount(thread)`: the count of the thread's process, or the table's own
+    /// for a thread that belongs to no process.
+    fn count_scheduled(&mut self, thread: ThreadId) -> Result<(), SchedError> {
+        let count = match self.threads.stored(thread)?.process {
+            Some(process) => &mut self.record_mut(process)?.scheduled_count,
+            None => &mut self.scheduled_count,
+        };
         // A counter compared only for equality; wrapping keeps it total.
-        self.scheduled_count = self.scheduled_count.wrapping_add(1);
+        *count = count.wrapping_add(1);
+        Ok(())
+    }
+
+    /// The scheduled count a thread's yields are compared with (`GetScheduledCount` of its
+    /// process).
+    fn scheduled_count_of(&self, thread: ThreadId) -> Result<u64, SchedError> {
+        Ok(match self.threads.stored(thread)?.process {
+            Some(process) => self.record(process)?.scheduled_count,
+            None => self.scheduled_count,
+        })
     }
 
     /// `KScheduler::OnThreadStateChanged`, given whether the thread was queued before.
@@ -416,23 +557,27 @@ impl Scheduler {
         } else {
             return Ok(());
         }
-        self.count_scheduled();
+        self.count_scheduled(id)?;
         self.update_needed = true;
         Ok(())
     }
 
-    /// `KScheduler::OnThreadPriorityChanged`.
+    /// `KScheduler::OnThreadPriorityChanged`. `caller` is the core making the call, if a core
+    /// is (a timer or a host thread is not): its current thread is "running".
     fn on_thread_priority_changed(
         &mut self,
-        caller: CoreId,
+        caller: Option<CoreId>,
         id: ThreadId,
         old_priority: Priority,
     ) -> Result<(), SchedError> {
         if self.thread(id)?.is_queued() {
-            let is_running = self.core(caller)?.current == Some(id);
+            let is_running = match caller {
+                Some(caller) => self.core(caller)?.current == Some(id),
+                None => false,
+            };
             self.queue
                 .change_priority(&mut self.threads, old_priority, is_running, id)?;
-            self.count_scheduled();
+            self.count_scheduled(id)?;
             self.update_needed = true;
         }
         Ok(())
@@ -448,7 +593,7 @@ impl Scheduler {
         if self.thread(id)?.is_queued() {
             self.queue
                 .change_affinity_mask(&mut self.threads, old_core, old_affinity, id)?;
-            self.count_scheduled();
+            self.count_scheduled(id)?;
             self.update_needed = true;
         }
         Ok(())
@@ -507,7 +652,7 @@ impl Scheduler {
             return Ok(0);
         }
         if let Some(previous) = previous {
-            self.count_scheduled();
+            self.count_scheduled(previous)?;
             self.threads.stored_mut(previous)?.last_scheduled_tick = now;
         }
         let state = self.core_mut(core)?;
@@ -690,11 +835,11 @@ impl Scheduler {
     /// Whether a yield can return at once: the thread's yield count matches the scheduled
     /// count, so nothing changed since its last fruitless yield.
     fn yield_is_redundant(&self, id: ThreadId) -> Result<bool, SchedError> {
-        Ok(self.thread(id)?.yield_schedule_count == Some(self.scheduled_count))
+        Ok(self.thread(id)?.yield_schedule_count == Some(self.scheduled_count_of(id)?))
     }
 
     fn note_fruitless_yield(&mut self, id: ThreadId) -> Result<(), SchedError> {
-        let count = self.scheduled_count;
+        let count = self.scheduled_count_of(id)?;
         self.thread_mut(id)?.yield_schedule_count = Some(count);
         Ok(())
     }
@@ -716,7 +861,7 @@ impl Scheduler {
         let next = self
             .queue
             .move_to_scheduled_back(&mut self.threads, current, active)?;
-        self.count_scheduled();
+        self.count_scheduled(current)?;
         if next == Some(current) {
             self.note_fruitless_yield(current)?;
         } else {
@@ -745,7 +890,7 @@ impl Scheduler {
         let next = self
             .queue
             .move_to_scheduled_back(&mut self.threads, current, core_id)?;
-        self.count_scheduled();
+        self.count_scheduled(current)?;
 
         let mut recheck = false;
         let mut suggested = self.queue.suggested_front(core_id)?;
@@ -782,7 +927,7 @@ impl Scheduler {
                 };
                 if allowed {
                     self.migrate(candidate, suggested_core, Some(core_id), true)?;
-                    self.count_scheduled();
+                    self.count_scheduled(candidate)?;
                     break;
                 }
                 // Couldn't migrate now; a later yield should look again.
@@ -819,7 +964,7 @@ impl Scheduler {
         };
 
         self.migrate(current, Some(core_id), None, false)?;
-        self.count_scheduled();
+        self.count_scheduled(current)?;
 
         if self.queue.scheduled_front(core_id)?.is_some() {
             self.update_needed = true;
@@ -842,7 +987,7 @@ impl Scheduler {
                 };
                 if allowed {
                     self.migrate(candidate, suggested_core, Some(core_id), false)?;
-                    self.count_scheduled();
+                    self.count_scheduled(candidate)?;
                 }
                 // Whether or not it moved, there was a candidate.
                 break;

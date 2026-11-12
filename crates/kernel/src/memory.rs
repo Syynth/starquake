@@ -11,8 +11,11 @@
 //! - [`pool`]: the console's memory arrangement and a process's memory count.
 //! - [`space`]: [`AddressSpace`], the table a system call declares, and its operations.
 //! - [`mapper`]: [`Mapper`], through which a change becomes real for guest code.
+//! - [`shared`]: shared and transfer memory as kernel objects, and the pages of a shared
+//!   memory as host code reaches them.
 //!
-//! The system calls that use it are in [`crate::svc::memory`] and [`crate::svc::info`].
+//! The system calls that use it are in [`crate::svc::memory`], [`crate::svc::info`],
+//! [`crate::svc::shared_memory`] and [`crate::svc::transfer_memory`].
 //!
 //! # Not built in this slice
 //!
@@ -36,6 +39,7 @@ pub(crate) mod fixture;
 pub mod layout;
 pub mod mapper;
 pub mod pool;
+pub mod shared;
 pub mod space;
 pub mod state;
 #[cfg(any(test, feature = "test-support"))]
@@ -45,5 +49,9 @@ pub use block::{MemoryBlock, SvcMemoryInfo};
 pub use layout::{Region, RegionOffsets, Regions};
 pub use mapper::{Mapper, MapperError};
 pub use pool::{MemoryArrangement, MemoryLimit};
+pub use shared::{
+    SharedMemory, SharedPages, TransferMemory, is_shared_memory_permission,
+    is_transfer_memory_permission, shared_memory_size,
+};
 pub use space::{AddressSpace, CreateError, GUARD_PAGES, ProcessMemory};
 pub use state::{MemoryAttribute, MemoryPermission, MemoryState, SvcPermission};

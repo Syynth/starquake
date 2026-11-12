@@ -13,15 +13,15 @@ use starquake_memory::{FlatMemory, PAGE_SIZE};
 use starquake_trace::{Event, FixedClock, LiveEnv, VecSink};
 
 use super::*;
-use crate::dispatch::{Record, Tables};
+use crate::dispatch::Record;
 use crate::handle::{MAX_TABLE_SIZE, ObjectRefs};
 use crate::id::{SlabId, ThreadId as KernelThreadId};
 use crate::ipc::message::{PROCESS_ID_SIZE, PROCESS_ID_SLOT};
 use crate::ipc::{DEFAULT_WORKERS, HandlerError};
 use crate::memory::fixture::{self, CODE, CODE_SIZE, DATA, DATA_PAGES};
+use crate::process::{Console, ProcessDescription};
 use crate::svc::DebugSink;
-use crate::tables::{FIRST_USER_PROCESS_ID, Processes};
-use crate::time::CounterRate;
+use crate::tables::FIRST_USER_PROCESS_ID;
 
 /// The guest threads of these tests, distinct so a swap shows.
 const A: ThreadId = ThreadId(0xA1);
@@ -285,12 +285,10 @@ impl World {
     }
 
     fn with_handle_table(size: i32) -> Self {
-        let dispatcher = Dispatcher::new(Tables {
-            handles: HandleTable::new(size).unwrap(),
-            address_space: fixture::loaded().0,
-            scheduler: Scheduler::default(),
-            processes: Processes::new(CounterRate::SWITCH_2),
-        });
+        let mut description = ProcessDescription::homebrew(Console::Switch2);
+        description.handle_table_size = size;
+        let dispatcher =
+            Dispatcher::new(crate::process::create(&description, fixture::loaded().0).unwrap());
         let first = add_server(
             &dispatcher,
             "first",
@@ -755,6 +753,22 @@ fn closing_the_last_handle_tells_the_server_and_one_of_two_does_not() {
     });
 }
 
+#[test]
+fn exiting_the_process_closes_its_sessions_and_the_server_is_told() {
+    let world = World::new();
+    let handle = world.session();
+    let session = world.object(handle);
+    assert_eq!(world.first.log().closed, Vec::<ObjectId>::new());
+    let (record, _) = world.call(A, SvcId::ExitProcess, 0, 0);
+    assert_eq!(record.outcome, Outcome::ProcessExited);
+    assert_eq!(world.first.log().closed, [session]);
+    world.with_tables(|handles, scheduler| {
+        assert!(handles.is_empty());
+        assert!(scheduler.objects().is_empty());
+        assert!(!scheduler.ipc().is_session(session));
+    });
+}
+
 // ----- What a handler reaches the kernel through ---------------------------------------------
 
 #[test]
@@ -818,7 +832,6 @@ fn a_handler_reads_and_writes_only_what_the_guest_may() {
             cx.read_memory(u64::MAX - 1, &mut bytes),
             Err(KernelError::InvalidCurrentMemory)
         );
-        assert_eq!(cx.create_event(), Err(KernelError::NotImplemented));
         message.fill(0);
         Ok(Handled::Replied)
     }));

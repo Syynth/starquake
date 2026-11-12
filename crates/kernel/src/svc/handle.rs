@@ -11,12 +11,13 @@
 //! whose object table holds the reference the handle had. When that was the object's last
 //! reference its row is freed. A session's client end is then torn down as
 //! `KClientSession::Destroy` does (`eden/src/core/hle/kernel/k_client_session.cpp`): the
-//! session's row goes and its server is told ([`crate::ipc::Ipc::forget`]). Tearing down what
-//! another kind of row named (a thread, say) belongs to the slice that builds that kind's
-//! lifecycle; see [`crate::object`].
+//! session's row goes and its server is told ([`crate::ipc::Ipc::forget`]); a thread that has
+//! ended or never started is destroyed and its thread-local region given back
+//! (`KThread::Finalize`). [`crate::sched::Scheduler::tear_down`] is the one place that decides
+//! this, for every way a last reference goes.
 
 use crate::handle::{Closed, Handle, HandleTable};
-use crate::result::CallResult;
+use crate::result::{CallResult, SvcError};
 use crate::tables::Scheduler;
 
 /// Closes `handle` in the caller's handle table, dropping its reference to the object it names.
@@ -28,12 +29,28 @@ pub fn close_handle(
     scheduler: &mut Scheduler,
     handle: Handle,
 ) -> CallResult<()> {
-    let (objects, ipc) = scheduler.ipc_mut();
-    let removed = handles.remove(objects, handle)?;
+    remove_handle(handles, scheduler, handle)
+}
+
+/// Removes `handle` from `handles` and closes its reference, tearing down what it named when
+/// that was the last reference ([`Scheduler::tear_down`]): what `CloseHandle` does, and what
+/// closing every handle of an ending process does for each (`KHandleTable::Finalize`).
+pub(crate) fn remove_handle(
+    handles: &mut HandleTable,
+    scheduler: &mut Scheduler,
+    handle: Handle,
+) -> CallResult<()> {
+    // What the handle names, read before the reference goes (and with it, on the last one, the
+    // object's row).
+    let named = handles
+        .get(handle)
+        .ok()
+        .and_then(|object| scheduler.objects().get(object).ok());
+    let removed = handles.remove(scheduler.objects_mut(), handle)?;
     if removed.closed == Closed::Last {
-        // The client end of a session is destroyed with its last reference
-        // (`KClientSession::Destroy`): the session goes, and its server is told.
-        ipc.forget(removed.object)?;
+        let kind = named
+            .ok_or_else(|| SvcError::Internal(format!("{handle:?} named an object with no row")))?;
+        scheduler.tear_down(removed.object, kind)?;
     }
     Ok(())
 }
@@ -42,7 +59,7 @@ pub fn close_handle(
 mod tests {
     use super::*;
     use crate::handle::ObjectRefs;
-    use crate::id::{SlabId, ThreadId};
+    use crate::id::{ProcessId, SlabId};
     use crate::object::{Object, ObjectError};
     use crate::result::{KernelError, SvcError};
 
@@ -53,7 +70,7 @@ mod tests {
         let mut scheduler = Scheduler::default();
         let object = scheduler
             .objects_mut()
-            .create(Object::Thread(ThreadId::from_parts(0, 1)))
+            .create(Object::Process(ProcessId::from_parts(0, 1)))
             .unwrap();
         let handle = handles.add(scheduler.objects_mut(), object).unwrap();
         scheduler.objects_mut().close(object).unwrap();

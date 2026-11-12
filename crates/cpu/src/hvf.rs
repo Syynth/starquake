@@ -6,6 +6,43 @@
 //! are answered in the guest from the virtual counter, without a host exit. `cntvct_el0` reads,
 //! FP/SIMD and pointer authentication run natively.
 //!
+//! # Registers
+//!
+//! [`Vcpu::regs`] and [`Vcpu::set_regs`] move the whole context through Hypervisor.framework's
+//! register calls: x0-x30, `FPCR` and `FPSR` as registers, V0-V31 as SIMD&FP registers, and the
+//! EL0 state a parked vCPU keeps in EL1's registers (`ELR_EL1` is the program counter,
+//! `SPSR_EL1` holds `PSTATE`, of which only [`crate::GUEST_PSTATE_MASK`] is the guest's).
+//!
+//! `FPCR` and `FPSR` hold what the FP unit implements once the guest has run: measured on an
+//! Apple M2 with every bit written, the guest reads back `FPCR` `0x07ff_9f00` and `FPSR`
+//! `0x0800_009f` (`tests/hvf.rs`, `after_a_run_the_host_reads_the_fpcr_and_fpsr_the_guest_reads`
+//! checks that the host reads the same). Before the guest has run, the host reads back the low
+//! 32 bits of what it wrote. The kept `FPCR` bits are the ones Eden's recompiler keeps too
+//! (`eden/src/dynarmic/src/dynarmic/common/fp/fpcr.h`, `FPCR::mask = 0x07FF9F00`), and among
+//! them are the floating-point trap enables (bits 15 and 12:8).
+//!
+//! Divergence from Eden: Eden never delivers a trapped floating-point exception. Its
+//! `FPProcessException` (`eden/src/dynarmic/src/dynarmic/common/fp/process_exception.cpp`)
+//! asserts that the enable of the exception raised (`IOE`, `DZE`, `OFE`, `UFE`, `IXE`, `IDE`) is
+//! clear ("Raising floating point exceptions unimplemented") and only sets the cumulative flag,
+//! so under Eden a set trap enable has no effect on the guest. Here the host's FP unit honours
+//! it: the guest takes a floating-point exception, it comes back as an [`Exit::Undefined`] of
+//! class 0x2c, and the run crashes (`tests/hvf.rs`,
+//! `a_guest_that_enables_a_floating_point_trap_takes_it_on_this_host`). Whether the Switch 2's
+//! Cortex-A78C itself implements the trap enables is a guess either way: no pinned reference
+//! records its behaviour.
+//!
+//! # Wait hints
+//!
+//! Hypervisor.framework traps an EL0 `wfi` to the host (`ESR_EL2` `0x07e0_0000`: class 0x01,
+//! `TI` = `wfi`). `wfe` stayed in the guest: measured on an Apple M2 before the backend handled
+//! either, the program of `tests/hvf.rs`, `wait_hints_resume_past_themselves_without_an_exit`,
+//! ran its bare `wfe` (the one after `sevl; wfe` had used the event up) and stopped first at the
+//! `wfi`. Whether a `wfe` can trap on another host is not known, so the backend handles both:
+//! it steps over a trapped wait (`TI` of any value) and enters the guest again, inside
+//! [`Vcpu::run`], as the crate docs require ("Wait hints"). The shim never sees either:
+//! `SCTLR_EL1.nTWI` and `nTWE` are set, so neither traps to EL1.
+//!
 //! Design: `docs/specs/execution-model.md`, "Guest memory" ("Native backends: stage 1 is ours,
 //! stage 2 is coarse").
 //!
@@ -83,7 +120,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use starquake_memory::stage1::{FlushRange, Stage1Tables, TableRoot};
 use starquake_memory::{BackingRange, GuestMemory};
 
-use crate::{Backend, Error, ExceptionClass, Exit, GuestRegs, Interrupter, Syndrome, Vcpu};
+use crate::{
+    Backend, Error, ExceptionClass, Exit, GUEST_PSTATE_MASK, GuestRegs, Interrupter, Syndrome, Vcpu,
+};
 use ffi::VcpuId;
 use flush::FlushOp;
 use memory::{Extent, HOST_PAGE, HostRegion, Kind};
@@ -186,7 +225,8 @@ const CPACR_FP_ON: u64 = 3 << 20;
 /// `CNTKCTL_EL1`: EL0VCTEN only, so EL0 reads of `cntpct_el0` trap to the shim
 /// (`CNTKCTL_EL0_VCT_ONLY` in the probe).
 const CNTKCTL_VCT_ONLY: u64 = 0b10;
-/// `SCTLR_EL1`: RES1 bits, MMU and caches on, WFI/WFE not trapped, the four PAuth enables
+/// `SCTLR_EL1`: RES1 bits, MMU and caches on, WFI/WFE not trapped to EL1 (the hypervisor
+/// itself traps `wfi`: see "Wait hints" in the module docs), the four PAuth enables
 /// (`EnIA`, `EnIB` from the probe; `EnDA`, `EnDB` added), and EL0 access to `CTR_EL0` (`UCT`),
 /// `DC ZVA` (`DZE`) and cache maintenance by address (`UCI`), which ordinary user-space code
 /// relies on. `WXN` is clear: a writable page may be executable, as the software walker assumes.
@@ -197,8 +237,8 @@ const SCTLR: u64 = 0x30d0_0800 // RES1
     | (1 << 27) | (1 << 13) // EnDA, EnDB
     | (1 << 15) | (1 << 14) | (1 << 26); // UCT, DZE, UCI
 
-/// `PSTATE` bits the host can see and set: NZCV. The mode and interrupt masks are the backend's.
-const PSTATE_EL0_MASK: u64 = 0xf000_0000;
+/// Bytes in one A64 instruction: what stepping over a trapped wait adds to the program counter.
+const INSTRUCTION_LEN: u64 = 4;
 
 /// Why a [`RamConfig`] is invalid, or the backend's own address space can't be built.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -780,6 +820,26 @@ impl HvfVcpu {
         })
     }
 
+    /// FP/SIMD register `Vn`, as one little-endian value.
+    fn simd(&self, n: u32) -> Result<u128, Error> {
+        let mut value = ffi::SimdFpBytes::default();
+        // SAFETY: called on the owning thread with a live id and a valid out-pointer to 16
+        // bytes, aligned as the header's vector type.
+        ffi::check("hv_vcpu_get_simd_fp_reg", unsafe {
+            ffi::hv_vcpu_get_simd_fp_reg(self.id, ffi::SIMD_FP_REG_Q0 + n, &raw mut value)
+        })?;
+        Ok(u128::from_le_bytes(value.0))
+    }
+
+    /// Sets FP/SIMD register `Vn` to `value`, a little-endian value.
+    fn set_simd(&self, n: u32, value: u128) -> Result<(), Error> {
+        let bytes = ffi::SimdFpBytes(value.to_le_bytes());
+        // SAFETY: called on the owning thread with a live id.
+        ffi::check("hv_vcpu_set_simd_fp_reg", unsafe {
+            ffi::set_simd_fp_reg(self.id, ffi::SIMD_FP_REG_Q0 + n, &bytes)
+        })
+    }
+
     fn sys(&self, reg: u16) -> Result<u64, Error> {
         let mut value = 0;
         // SAFETY: called on the owning thread with a live id and a valid out-pointer.
@@ -838,6 +898,17 @@ impl HvfVcpu {
         Ok(shim::decode_el0_exception(esr, far, elr))
     }
 
+    /// Steps the guest over the wait hint the hypervisor trapped, so the next entry runs the
+    /// instruction after it. The trap must have come from guest code at EL0: the shim never
+    /// waits, so a wait trapped at EL1 is an error, and so is one at the very end of the
+    /// address space.
+    fn step_over_wait(&self, exception: &ffi::ExitException) -> Result<(), Error> {
+        let cpsr = self.reg(ffi::REG_CPSR)?;
+        let pc = self.reg(ffi::REG_PC)?;
+        let next = after_wait(exception.syndrome, cpsr, pc)?;
+        self.set_reg(ffi::REG_PC, next)
+    }
+
     /// Brings an interrupted vCPU back to a parked state with exact EL0 registers.
     fn interrupted(&self) -> Result<Exit, Error> {
         let cpsr = self.reg(ffi::REG_CPSR)?;
@@ -879,6 +950,50 @@ impl HvfVcpu {
     }
 }
 
+/// Whether `ESR_EL2` value `syndrome` describes a trapped `wfi` or `wfe` (class 0x01, any
+/// `ISS.TI`).
+fn is_trapped_wait(syndrome: u64) -> bool {
+    Syndrome::from_esr(syndrome).class() == ExceptionClass::TrappedWait
+}
+
+/// What [`Vcpu::run`] does with one exit from the hypervisor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExitAction {
+    /// A wait hint the hypervisor trapped: step over it and enter the guest again (see "Wait
+    /// hints" in the module docs).
+    StepOverWait,
+    /// Any other exception: decode it and report it.
+    Exception,
+    /// The run was canceled: report an interrupt.
+    Interrupted,
+}
+
+/// What the run loop does with an exit of `reason` whose `ESR_EL2` value is `syndrome` (read
+/// only for an exception). The vtimer is masked at creation, so its reason and unknown ones are
+/// both errors.
+fn exit_action(reason: u32, syndrome: u64) -> Result<ExitAction, Error> {
+    match reason {
+        ffi::EXIT_REASON_EXCEPTION if is_trapped_wait(syndrome) => Ok(ExitAction::StepOverWait),
+        ffi::EXIT_REASON_EXCEPTION => Ok(ExitAction::Exception),
+        ffi::EXIT_REASON_CANCELED => Ok(ExitAction::Interrupted),
+        reason => Err(Error::Host(format!("unexpected exit reason {reason}"))),
+    }
+}
+
+/// Where the guest resumes after a wait with `ESR_EL2` value `syndrome` was trapped with the
+/// vCPU's `cpsr` and `pc`: the next instruction. A wait trapped outside EL0 guest code, or at
+/// the very end of the address space, is an error.
+fn after_wait(syndrome: u64, cpsr: u64, pc: u64) -> Result<u64, Error> {
+    if cpsr & shim::MODE_MASK != shim::MODE_EL0T {
+        return Err(Error::Host(format!(
+            "a wait was trapped outside guest code: ESR_EL2 {syndrome:#x} at pc {pc:#x}, cpsr \
+             {cpsr:#x}"
+        )));
+    }
+    pc.checked_add(INSTRUCTION_LEN)
+        .ok_or_else(|| Error::Host(format!("a wait at pc {pc:#x} has no instruction after it")))
+}
+
 /// The immediate of the `hvc` that `ESR_EL2` value `syndrome` describes; `None` if it describes
 /// anything else.
 fn hvc_immediate(syndrome: u64) -> Option<u16> {
@@ -915,12 +1030,14 @@ impl Vcpu for HvfVcpu {
             // The interrupt was used up by a flush: report it now, before any guest code.
             return Ok(Exit::Interrupted);
         }
-        let exit = self.enter()?;
-        match exit.reason {
-            ffi::EXIT_REASON_EXCEPTION => self.exception(&exit.exception),
-            ffi::EXIT_REASON_CANCELED => self.interrupted(),
-            // The vtimer is masked at creation, so this and unknown reasons are both unexpected.
-            reason => Err(Error::Host(format!("unexpected exit reason {reason}"))),
+        loop {
+            let exit = self.enter()?;
+            match exit_action(exit.reason, exit.exception.syndrome)? {
+                // An interrupt requested meanwhile ends the next entry.
+                ExitAction::StepOverWait => self.step_over_wait(&exit.exception)?,
+                ExitAction::Exception => return self.exception(&exit.exception),
+                ExitAction::Interrupted => return self.interrupted(),
+            }
         }
     }
 
@@ -935,9 +1052,14 @@ impl Vcpu for HvfVcpu {
         }
         regs.sp = self.sys(ffi::SP_EL0)?;
         regs.pc = self.sys(ffi::ELR_EL1)?;
-        regs.pstate = self.sys(ffi::SPSR_EL1)? & PSTATE_EL0_MASK;
+        regs.pstate = self.sys(ffi::SPSR_EL1)? & GUEST_PSTATE_MASK;
         regs.tpidr = self.sys(ffi::TPIDR_EL0)?;
         regs.tpidrro = self.sys(ffi::TPIDRRO_EL0)?;
+        for (n, v) in (0..).zip(regs.v.iter_mut()) {
+            *v = self.simd(n)?;
+        }
+        regs.fpcr = self.reg(ffi::REG_FPCR)?;
+        regs.fpsr = self.reg(ffi::REG_FPSR)?;
         Ok(regs)
     }
 
@@ -947,14 +1069,19 @@ impl Vcpu for HvfVcpu {
         }
         self.set_sys(ffi::SP_EL0, regs.sp)?;
         self.set_sys(ffi::ELR_EL1, regs.pc)?;
-        // Only the flags come from the caller: the guest always resumes at EL0t, interrupts
-        // masked.
+        // Only the guest's bits come from the caller: the guest always resumes at EL0t,
+        // interrupts masked.
         self.set_sys(
             ffi::SPSR_EL1,
-            (regs.pstate & PSTATE_EL0_MASK) | shim::SPSR_EL0T_MASKED,
+            (regs.pstate & GUEST_PSTATE_MASK) | shim::SPSR_EL0T_MASKED,
         )?;
         self.set_sys(ffi::TPIDR_EL0, regs.tpidr)?;
-        self.set_sys(ffi::TPIDRRO_EL0, regs.tpidrro)
+        self.set_sys(ffi::TPIDRRO_EL0, regs.tpidrro)?;
+        for (n, &v) in (0..).zip(regs.v.iter()) {
+            self.set_simd(n, v)?;
+        }
+        self.set_reg(ffi::REG_FPCR, regs.fpcr)?;
+        self.set_reg(ffi::REG_FPSR, regs.fpsr)
     }
 
     /// The root's table page must lie inside [`HvfBackend::table_pool`]
@@ -1150,6 +1277,102 @@ mod tests {
         let root = TableRoot::new(TABLE_POOL_BASE + 0x3000).unwrap();
         assert_eq!(ttbr0(root, 0), 0x0000_000f_1000_3000);
         assert_eq!(ttbr0(root, 0xbeef), 0xbeef_000f_1000_3000);
+    }
+
+    /// `ESR_EL2` of the trapped `wfi` measured on an Apple M2 (`tests/hvf.rs`,
+    /// `wait_hints_resume_past_themselves_without_an_exit`): EC 0x01, IL, CV with condition AL
+    /// (ISS bits 24:20), TI = 0b00. A `wfe` differs only in TI = 0b01, and the `WFIT` and `WFET`
+    /// forms in TI = 0b10 and 0b11 (Arm ARM, `ESR_ELx`, "ISS encoding for an exception from a
+    /// WF* instruction").
+    const WFI: u64 = 0x07e0_0000;
+
+    /// `ESR_EL2` values that are not waits: an `hvc` from the shim, an `svc`, an undefined
+    /// instruction and a data abort.
+    const NOT_WAITS: [u64; 4] = [0x5a00_0002, 0x5600_0002, 0x0200_0000, 0x9200_004f];
+
+    #[test]
+    fn only_class_0x01_is_a_trapped_wait() {
+        for ti in 0..=0b11 {
+            assert!(is_trapped_wait(WFI | ti), "TI {ti:#b}");
+        }
+        for other in NOT_WAITS {
+            assert!(!is_trapped_wait(other), "{other:#x}");
+        }
+    }
+
+    #[test]
+    fn the_run_loop_steps_over_every_trapped_wait_and_reports_the_rest() {
+        // A trapped wait of every `TI` value (wfi, wfe, WFIT, WFET) is stepped over.
+        for ti in 0..=0b11 {
+            assert_eq!(
+                exit_action(ffi::EXIT_REASON_EXCEPTION, WFI | ti),
+                Ok(ExitAction::StepOverWait),
+                "TI {ti:#b}"
+            );
+        }
+        // Every other exception is reported.
+        for other in NOT_WAITS {
+            assert_eq!(
+                exit_action(ffi::EXIT_REASON_EXCEPTION, other),
+                Ok(ExitAction::Exception),
+                "{other:#x}"
+            );
+        }
+        // A canceled run is an interrupt, whatever stale syndrome the exit still holds.
+        for syndrome in [0, WFI, NOT_WAITS[0]] {
+            assert_eq!(
+                exit_action(ffi::EXIT_REASON_CANCELED, syndrome),
+                Ok(ExitAction::Interrupted),
+                "{syndrome:#x}"
+            );
+        }
+        // Any other reason is an error, even with a wait's syndrome: the vtimer's
+        // (`HV_EXIT_REASON_VTIMER_ACTIVATED`, 2 in the framework's header; the backend does not
+        // use it, as the vtimer is masked at creation) and an unknown one.
+        for reason in [2, u32::MAX] {
+            assert_eq!(
+                exit_action(reason, WFI),
+                Err(Error::Host(format!("unexpected exit reason {reason}")))
+            );
+        }
+    }
+
+    #[test]
+    fn a_wait_is_stepped_over_only_in_guest_code_with_an_instruction_after_it() {
+        // At EL0t (with the guest's flags and masks in the other bits), the next instruction.
+        let el0 = shim::SPSR_EL0T_MASKED | crate::PSTATE_NZCV;
+        assert_eq!(after_wait(WFI, el0, 0x8000_0000), Ok(0x8000_0004));
+        // The last address with an instruction after it, and the first without.
+        assert_eq!(
+            after_wait(WFI, el0, u64::MAX - INSTRUCTION_LEN),
+            Ok(u64::MAX)
+        );
+        let last = u64::MAX - INSTRUCTION_LEN + 1;
+        assert_eq!(
+            after_wait(WFI, el0, last),
+            Err(Error::Host(format!(
+                "a wait at pc {last:#x} has no instruction after it"
+            )))
+        );
+        // In the shim (EL1h) it is an error, whatever the pc.
+        assert_eq!(
+            after_wait(WFI, shim::CPSR_EL1H_MASKED, 0x8000_0000),
+            Err(Error::Host(format!(
+                "a wait was trapped outside guest code: ESR_EL2 {WFI:#x} at pc 0x80000000, cpsr \
+                 {:#x}",
+                shim::CPSR_EL1H_MASKED
+            )))
+        );
+        // At EL1t (`M[3:0]` = 0b0100, Arm ARM `SPSR_EL1`) too: SP-select clear is not enough to
+        // make it guest code.
+        let el1t = shim::SPSR_EL0T_MASKED | 0x4;
+        assert_eq!(
+            after_wait(WFI, el1t, 0x8000_0000),
+            Err(Error::Host(format!(
+                "a wait was trapped outside guest code: ESR_EL2 {WFI:#x} at pc 0x80000000, cpsr \
+                 {el1t:#x}"
+            )))
+        );
     }
 
     #[test]

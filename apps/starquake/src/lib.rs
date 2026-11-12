@@ -283,6 +283,7 @@ fn run(
     let options = RunOptions {
         timeout: args.timeout,
         command_line,
+        sd_card: None,
     };
     let failed = |message: String| RunReport::emulator_error(message, started.elapsed());
     let report = match std::fs::read(&args.program) {

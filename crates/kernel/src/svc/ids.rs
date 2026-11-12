@@ -108,36 +108,36 @@ svc_ids! {
     UnmapMemory = 0x05, Planned;
     QueryMemory = 0x06, Implemented;
     ExitProcess = 0x07, Implemented;
-    CreateThread = 0x08, Planned;
-    StartThread = 0x09, Planned;
-    ExitThread = 0x0a, Planned;
-    SleepThread = 0x0b, Planned;
+    CreateThread = 0x08, Implemented;
+    StartThread = 0x09, Implemented;
+    ExitThread = 0x0a, Implemented;
+    SleepThread = 0x0b, Implemented;
     GetThreadPriority = 0x0c, Implemented;
-    SetThreadPriority = 0x0d, Planned;
-    GetThreadCoreMask = 0x0e, Planned;
-    SetThreadCoreMask = 0x0f, Planned;
+    SetThreadPriority = 0x0d, Implemented;
+    GetThreadCoreMask = 0x0e, Implemented;
+    SetThreadCoreMask = 0x0f, Implemented;
     GetCurrentProcessorNumber = 0x10, Implemented;
-    SignalEvent = 0x11, Planned;
-    ClearEvent = 0x12, Planned;
-    MapSharedMemory = 0x13, Planned;
-    UnmapSharedMemory = 0x14, Planned;
-    CreateTransferMemory = 0x15, Planned;
+    SignalEvent = 0x11, Implemented;
+    ClearEvent = 0x12, Implemented;
+    MapSharedMemory = 0x13, Implemented;
+    UnmapSharedMemory = 0x14, Implemented;
+    CreateTransferMemory = 0x15, Implemented;
     CloseHandle = 0x16, Implemented;
-    ResetSignal = 0x17, Planned;
-    WaitSynchronization = 0x18, Planned;
-    CancelSynchronization = 0x19, Planned;
-    ArbitrateLock = 0x1a, Planned;
-    ArbitrateUnlock = 0x1b, Planned;
-    WaitProcessWideKeyAtomic = 0x1c, Planned;
-    SignalProcessWideKey = 0x1d, Planned;
+    ResetSignal = 0x17, Implemented;
+    WaitSynchronization = 0x18, Implemented;
+    CancelSynchronization = 0x19, Implemented;
+    ArbitrateLock = 0x1a, Implemented;
+    ArbitrateUnlock = 0x1b, Implemented;
+    WaitProcessWideKeyAtomic = 0x1c, Implemented;
+    SignalProcessWideKey = 0x1d, Implemented;
     GetSystemTick = 0x1e, Implemented;
     ConnectToNamedPort = 0x1f, Implemented;
     SendSyncRequestLight = 0x20, Deferred;
     SendSyncRequest = 0x21, Implemented;
     SendSyncRequestWithUserBuffer = 0x22, Planned;
     SendAsyncRequestWithUserBuffer = 0x23, Planned;
-    GetProcessId = 0x24, Planned;
-    GetThreadId = 0x25, Planned;
+    GetProcessId = 0x24, Implemented;
+    GetThreadId = 0x25, Implemented;
     Break = 0x26, Planned;
     OutputDebugString = 0x27, Implemented;
     ReturnFromException = 0x28, Planned;
@@ -152,8 +152,8 @@ svc_ids! {
     GetResourceLimitCurrentValue = 0x31, Planned;
     SetThreadActivity = 0x32, Planned;
     GetThreadContext3 = 0x33, Planned;
-    WaitForAddress = 0x34, Planned;
-    SignalToAddress = 0x35, Planned;
+    WaitForAddress = 0x34, Implemented;
+    SignalToAddress = 0x35, Implemented;
     SynchronizePreemptionState = 0x36, Planned;
     GetResourceLimitPeakValue = 0x37, Deferred;
     CreateIoPool = 0x39, NotPlanned;
@@ -165,7 +165,7 @@ svc_ids! {
     ReplyAndReceiveLight = 0x42, Deferred;
     ReplyAndReceive = 0x43, Deferred;
     ReplyAndReceiveWithUserBuffer = 0x44, Deferred;
-    CreateEvent = 0x45, Deferred;
+    CreateEvent = 0x45, Implemented;
     MapIoRegion = 0x46, NotPlanned;
     UnmapIoRegion = 0x47, NotPlanned;
     MapPhysicalMemoryUnsafe = 0x48, Deferred;
@@ -308,14 +308,39 @@ mod tests {
                 | SvcId::SetMemoryAttribute
                 | SvcId::QueryMemory
                 | SvcId::ExitProcess
+                | SvcId::CreateThread
+                | SvcId::StartThread
+                | SvcId::ExitThread
+                | SvcId::SleepThread
                 | SvcId::GetThreadPriority
+                | SvcId::SetThreadPriority
+                | SvcId::GetThreadCoreMask
+                | SvcId::SetThreadCoreMask
                 | SvcId::GetCurrentProcessorNumber
+                | SvcId::SignalEvent
+                | SvcId::ClearEvent
+                | SvcId::MapSharedMemory
+                | SvcId::UnmapSharedMemory
+                | SvcId::CreateTransferMemory
                 | SvcId::CloseHandle
+                | SvcId::ResetSignal
+                | SvcId::WaitSynchronization
+                | SvcId::CancelSynchronization
+                | SvcId::ArbitrateLock
+                | SvcId::ArbitrateUnlock
+                | SvcId::WaitProcessWideKeyAtomic
+                | SvcId::SignalProcessWideKey
+                | SvcId::WaitForAddress
+                | SvcId::SignalToAddress
                 | SvcId::GetSystemTick
                 | SvcId::ConnectToNamedPort
                 | SvcId::SendSyncRequest
+                | SvcId::GetProcessId
+                | SvcId::GetThreadId
                 | SvcId::OutputDebugString
-                | SvcId::GetInfo => Status::Implemented,
+                | SvcId::GetInfo
+                // Not a retail call, but the kernel spec builds events (kernel slice 4).
+                | SvcId::CreateEvent => Status::Implemented,
                 _ if hardware_facing(id.name()) => Status::NotPlanned,
                 // Light sessions are in the spec's deferred column.
                 SvcId::SendSyncRequestLight => Status::Deferred,

@@ -29,6 +29,7 @@ fn add(threads: &mut Threads, priority: u8, active: Option<u8>, allowed: &[u8]) 
         .insert(Thread {
             state: ThreadState::Runnable,
             suspend_flags: 0,
+            suspend_requested: 0,
             priority: prio(priority),
             base_priority: prio(priority),
             affinity: mask(allowed),
@@ -39,6 +40,13 @@ fn add(threads: &mut Threads, priority: u8, active: Option<u8>, allowed: &[u8]) 
             yield_schedule_count: None,
             links: vec![QueueLink::default(); usize::from(CORES)],
             context: GuestRegs::default(),
+            process: None,
+            object: None,
+            holds_itself: false,
+            guest_id: 0,
+            tls_address: 0,
+            virtual_ideal_core: active.map_or(-1, |core| i32::from(core.index())),
+            virtual_affinity: mask(allowed).bits(),
         })
         .unwrap()
 }

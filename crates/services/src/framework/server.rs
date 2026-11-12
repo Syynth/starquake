@@ -9,7 +9,7 @@ use starquake_ipc::{
 use starquake_kernel::handle::Handle;
 use starquake_kernel::id::ObjectId;
 use starquake_kernel::result::{KernelError, ResultCode};
-use starquake_trace::{IpcOutcome, ServiceId};
+use starquake_trace::{Env, IpcOutcome, ServiceId};
 
 use super::commands::{Protocol, Session};
 use super::context::Context;
@@ -27,6 +27,7 @@ use super::result::{
 use super::snapshot::{Family, Interfaces};
 use super::targets::{Domain, TargetError, TargetId, Targets};
 use super::trace::{self, Asked};
+use super::work::Executor;
 
 /// What a server does with a command its interface does not list
 /// (`docs/specs/services.md`, "Unknown commands").
@@ -282,6 +283,10 @@ pub struct Server {
     pub(super) next_token: u64,
     pub(super) mailbox: Arc<Mailbox>,
     pub(super) notify: Option<Arc<dyn Notify>>,
+    /// The environment methods reach the host through; not saved.
+    env: Option<Arc<dyn Env>>,
+    /// Where methods send work that takes time; not saved.
+    executor: Option<Arc<dyn Executor>>,
     stubbed: BTreeSet<StubbedCommand>,
     stub_record_full: bool,
 }
@@ -305,6 +310,8 @@ impl Server {
             next_token: 0,
             mailbox: Arc::new(Mailbox::new(None)),
             notify: None,
+            env: None,
+            executor: None,
             stubbed: BTreeSet::new(),
             stub_record_full: false,
         }
@@ -356,6 +363,23 @@ impl Server {
     pub fn with_notify(mut self, notify: Arc<dyn Notify>) -> Self {
         self.mailbox = Arc::new(Mailbox::new(Some(Arc::clone(&notify))));
         self.notify = Some(notify);
+        self
+    }
+
+    /// Sets the injectable environment the server's methods read the host through
+    /// ([`Context::env`]). It is how a run reaches its host, not state: a snapshot neither saves
+    /// nor replaces it.
+    #[must_use]
+    pub fn with_env(mut self, env: Arc<dyn Env>) -> Self {
+        self.env = Some(env);
+        self
+    }
+
+    /// Sets the executor the server's methods hand work that takes time to ([`Context::executor`],
+    /// [`work`](super::work)). Like the environment, it is not part of a snapshot.
+    #[must_use]
+    pub fn with_executor(mut self, executor: Arc<dyn Executor>) -> Self {
+        self.executor = Some(executor);
         self
     }
 
@@ -800,6 +824,8 @@ impl Server {
                 next_token: &mut self.next_token,
                 taken: None,
             },
+            env: self.env.as_ref(),
+            executor: self.executor.as_ref(),
         };
         let outcome = object.dispatch(protocol, command_id, &mut cx, &request, &mut reply);
         let token = cx.deferral.taken;
@@ -894,11 +920,14 @@ impl Server {
         self.stubbed.insert(command);
     }
 
-    /// Builds a successful reply: adds its handles to the caller's table and opens its new
+    /// Builds a successful reply: writes its bytes into the caller's out buffers
+    /// ([`Reply::write_buffer`]), adds its handles to the caller's table and opens its new
     /// interfaces, as sessions or as domain objects.
     ///
     /// Nothing is changed unless the whole reply fits the buffer, the domain has room, and the
     /// reply is one the IPC crate can frame (see "Not here yet" in the [module docs](super)).
+    /// The buffers are written first, in the order the method added them; a write the kernel
+    /// refuses makes the reply its error, with no handle added and no interface opened.
     /// Handles are added in Eden's order, copies and then moves
     /// (`eden/src/core/hle/service/hle_ipc.cpp`, `WriteToOutgoingCommandBuffer`). If the caller's
     /// handle table fills up part-way, the reply is the kernel's error and the handles and
@@ -908,8 +937,9 @@ impl Server {
         &mut self,
         kernel: &mut dyn Kernel,
         frame: Frame,
-        reply: Reply,
+        mut reply: Reply,
     ) -> Result<Answer, Refusal> {
+        let writes = reply.take_writes();
         let (payload, copies, moves) = reply.into_parts();
         if !fits(frame, &payload, copies.len(), &moves) {
             tracing::error!(service = %self.name, "reply does not fit a message buffer");
@@ -937,6 +967,11 @@ impl Server {
             }
         }
 
+        for (buffer, data) in writes {
+            if !data.is_empty() {
+                kernel.write_memory(buffer.address, &data)?;
+            }
+        }
         let mut builder = frame.reply(ResultCode::SUCCESS).data(payload.as_bytes());
         for object in copies {
             builder = builder.copy_handle(kernel.insert_handle(object)?.raw());

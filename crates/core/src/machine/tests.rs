@@ -9,7 +9,8 @@ use std::time::{Duration, Instant};
 
 use starquake_cpu::testing::ScriptedVcpu;
 use starquake_cpu::{Exit, FaultStatus, Interrupter, Syndrome, Vcpu};
-use starquake_kernel::handle::{MAX_TABLE_SIZE, MIN_LINEAR_ID};
+use starquake_kernel::handle::{Handle, MAX_TABLE_SIZE, MIN_LINEAR_ID};
+use starquake_kernel::memory::GUARD_PAGES;
 use starquake_kernel::memory::testing::RecordingMapper;
 use starquake_kernel::result::KernelError;
 use starquake_kernel::svc::SvcId;
@@ -21,8 +22,10 @@ use starquake_trace::{
 };
 
 use super::*;
-use crate::clock::PROCESS_COUNTER_RATE;
-use crate::crash::Location;
+use starquake_kernel::process::{Console, ProcessDescription};
+
+use crate::clock::NRO_CONSOLE;
+use crate::crash::{Location, SyndromeReport};
 use crate::image::{Loaded, Program, load};
 use crate::report::{empty_dump, exit_code};
 use crate::space::SpaceError;
@@ -37,7 +40,7 @@ const RAM_SIZE: usize = 2 << 20;
 /// monotonic clock. Nothing here reads a counter in the guest, so the clock's zero is free.
 fn timebase() -> Timebase<SystemClock> {
     Timebase {
-        rate: PROCESS_COUNTER_RATE,
+        console: NRO_CONSOLE,
         clock: SystemClock::new(),
     }
 }
@@ -61,6 +64,9 @@ struct Guest {
     placed: Placement,
     /// The kernel's address space, until a run takes it.
     address_space: Cell<Option<AddressSpace>>,
+    /// Where the kernel will put the main thread's thread-local region: the first page of the
+    /// kernel-map region past its guard pages.
+    tls: u64,
 }
 
 impl Guest {
@@ -72,10 +78,12 @@ impl Guest {
             placed,
             address_space,
         } = load(&program, None, Box::new(mapper), &memory).unwrap();
+        let tls = address_space.regions().kernel_map.start + GUARD_PAGES * crate::image::PAGE;
         Self {
             memory,
             placed,
             address_space: Cell::new(Some(address_space)),
+            tls,
         }
     }
 
@@ -102,6 +110,19 @@ impl Guest {
             Instant::now(),
             timebase(),
         )
+    }
+
+    /// What a run's memory map holds: the loader's mappings, and the page of the main thread's
+    /// thread-local region, in address order.
+    fn memory_map(&self) -> Vec<crate::report::Mapping> {
+        let mut map = self.placed.mappings.clone();
+        map.push(crate::report::Mapping {
+            name: "tls".to_owned(),
+            start: self.tls,
+            end: self.tls + crate::image::PAGE,
+        });
+        map.sort_by_key(|mapping| mapping.start);
+        map
     }
 
     /// Where the mapping called `name` starts.
@@ -203,7 +224,7 @@ fn the_guest_programs_use_the_kernels_system_call_numbers() {
         u32::from(SvcId::OutputDebugString.number())
     );
     // And the rate the example's counter program expects is the one the kernel gives a process.
-    assert_eq!(programs::COUNTER_HZ, PROCESS_COUNTER_RATE.hz());
+    assert_eq!(programs::COUNTER_HZ, NRO_CONSOLE.counter_rate().hz());
 }
 
 #[test]
@@ -213,7 +234,7 @@ fn a_guest_that_prints_two_lines_and_exits_is_reported_in_full() {
     let first_at = guest.start_of("main.rodata");
     let second_at = first_at + first.len() as u64;
     let (first_len, second_len) = (first.len() as u64, second.len() as u64);
-    let (entry, stack_top, tls) = (guest.placed.entry, guest.placed.stack_top, guest.placed.tls);
+    let (entry, stack_top, tls) = (guest.placed.entry, guest.placed.stack_top, guest.tls);
     let main_thread = Handle::from_parts(MAX_TABLE_SIZE - 1, MIN_LINEAR_ID).unwrap();
     assert_eq!(main_thread.raw(), 0x83ff);
 
@@ -283,7 +304,8 @@ fn a_guest_that_prints_two_lines_and_exits_is_reported_in_full() {
         ])
     );
     assert_eq!(report.stubbed, BTreeSet::new());
-    assert_eq!(report.memory_map, guest.placed.mappings);
+    // The loader's mappings, and the main thread's thread-local page the kernel placed.
+    assert_eq!(report.memory_map, guest.memory_map());
     assert_eq!(report.patched_counter_reads, Vec::<u64>::new());
 }
 
@@ -345,6 +367,7 @@ fn a_data_abort_is_a_crash_that_names_the_address_and_the_instruction() {
     let options = RunOptions {
         timeout: None,
         command_line: vec!["starquake".into(), "run".into(), "crash.nro".into()],
+        sd_card: None,
     };
     let report = guest.run(vcpu, &options);
 
@@ -359,6 +382,11 @@ fn a_data_abort_is_a_crash_that_names_the_address_and_the_instruction() {
     );
     assert_eq!(report_crash.pc, instruction);
     assert_eq!(
+        report_crash.syndrome,
+        Some(SyndromeReport::new(UNMAPPED_STORE)),
+        "the report carries the exit's syndrome"
+    );
+    assert_eq!(
         report_crash.pc_location,
         Some(Location {
             module: "main".into(),
@@ -369,11 +397,8 @@ fn a_data_abort_is_a_crash_that_names_the_address_and_the_instruction() {
     assert_eq!(report_crash.registers.x[..2], [address - 8, 0x1234]);
     assert_eq!(report_crash.registers.sp, guest.placed.stack_top);
     assert_eq!(report_crash.command_line, options.command_line);
-    assert_eq!(report_crash.memory_map, guest.placed.mappings);
-    assert_eq!(
-        report_crash.modules,
-        std::slice::from_ref(&guest.placed.module)
-    );
+    assert_eq!(report_crash.memory_map, guest.memory_map());
+    assert_eq!(report_crash.modules, guest.placed.modules);
     // The fault is in the flight recorder and the crash report's last events, and not in the
     // golden trace, which leaves faults out.
     let fault = EventKind::Fault {
@@ -411,6 +436,12 @@ fn an_instruction_abort_is_a_crash_that_names_the_address_fetched_from() {
     assert_eq!(report.exit_code(), exit_code::GUEST_CRASHED);
     let crash = report.crash().expect("a crash report");
     assert_eq!(crash.exception, Exception::InstructionAbort { address });
+    assert_eq!(
+        crash.syndrome,
+        Some(SyndromeReport::new(Syndrome::instruction_abort(
+            FaultStatus::Permission { level: 3 }
+        )))
+    );
     assert_eq!(crash.pc, address);
     assert_eq!(crash.pc_location, None);
     assert_eq!(crash.fault_mapping.as_deref(), Some("stack"));
@@ -426,21 +457,79 @@ fn an_instruction_abort_is_a_crash_that_names_the_address_fetched_from() {
 }
 
 #[test]
+fn each_abort_crash_carries_its_own_exits_syndrome() {
+    // Two different syndromes per abort kind, so a report that carried a fixed syndrome in place
+    // of the exit's would get one of each pair wrong.
+    let crash = programs::crash().unwrap();
+    for syndrome in [
+        UNMAPPED_STORE,
+        Syndrome::data_abort(FaultStatus::Permission { level: 3 }, true),
+    ] {
+        let guest = Guest::new(&crash.nro);
+        let instruction = guest.placed.entry + crash.store_offset;
+        let address = crash.fault_address;
+        let vcpu = ScriptedVcpu::new().then(
+            move |regs| regs.pc = instruction,
+            Exit::DataAbort {
+                address,
+                write: true,
+                syndrome,
+            },
+        );
+        let report = guest.run(vcpu, &RunOptions::default());
+        let report_crash = report.crash().expect("a crash report");
+        assert_eq!(
+            report_crash.syndrome,
+            Some(SyndromeReport::new(syndrome)),
+            "{:#x}",
+            syndrome.esr()
+        );
+    }
+    for syndrome in [
+        Syndrome::instruction_abort(FaultStatus::Translation { level: 2 }),
+        Syndrome::instruction_abort(FaultStatus::Permission { level: 3 }),
+    ] {
+        let guest = Guest::new(&programs::hello().unwrap());
+        let address = guest.start_of("stack") + 0x40;
+        let vcpu = ScriptedVcpu::new().then(
+            move |regs| regs.pc = address,
+            Exit::InstructionAbort { address, syndrome },
+        );
+        let report = guest.run(vcpu, &RunOptions::default());
+        let crash = report.crash().expect("a crash report");
+        assert_eq!(
+            crash.syndrome,
+            Some(SyndromeReport::new(syndrome)),
+            "{:#x}",
+            syndrome.esr()
+        );
+    }
+}
+
+#[test]
 fn an_undefined_instruction_is_a_crash_at_its_address() {
     let guest = Guest::new(&programs::hello().unwrap());
     let pc = guest.placed.entry + 0x40;
+    // A `brk #0x123` (class 0x3c, `IL`, the immediate in `ISS`), not the plain undefined
+    // syndrome, so the report shows the one the exit carried.
+    let brk = Syndrome::from_esr(0xf200_0123);
     let vcpu = ScriptedVcpu::new().then(
         move |regs| regs.pc = pc,
-        Exit::Undefined {
-            pc,
-            syndrome: Syndrome::undefined(),
-        },
+        Exit::Undefined { pc, syndrome: brk },
     );
     let report = guest.run(vcpu, &RunOptions::default());
     assert_eq!(report.exit_code(), exit_code::GUEST_CRASHED);
     let crash = report.crash().expect("a crash report");
     assert_eq!(crash.exception, Exception::UndefinedInstruction);
     assert_eq!(crash.pc, pc);
+    assert_eq!(crash.syndrome, Some(SyndromeReport::new(brk)));
+    assert!(
+        crash
+            .to_text()
+            .contains("syndrome: 0xf2000123 (brk #0x123)\n"),
+        "{}",
+        crash.to_text()
+    );
     assert_eq!(
         crash.pc_location.as_ref().map(|location| location.offset),
         Some(0x40)
@@ -454,6 +543,7 @@ fn a_guest_that_never_stops_is_ended_by_the_timeout() {
     let options = RunOptions {
         timeout: Some(timeout),
         command_line: Vec::new(),
+        sd_card: None,
     };
     let report = guest.run(ScriptedVcpu::new().then_spin(), &options);
     assert_eq!(report.exit, ExitReason::Timeout);
@@ -468,6 +558,7 @@ fn a_run_that_ends_before_its_timeout_does_not_wait_for_it() {
     let options = RunOptions {
         timeout: Some(Duration::from_secs(3600)),
         command_line: Vec::new(),
+        sd_card: None,
     };
     let vcpu = ScriptedVcpu::new().then(|_| {}, svc(SvcId::ExitProcess));
     let started = Instant::now();
@@ -573,8 +664,11 @@ fn get_system_tick_is_the_clock_at_the_rate_the_run_was_given() {
     // guest.
     const SECONDS: u64 = 1_000_003;
     let start = SECONDS * starquake_kernel::time::NANOS_PER_SECOND;
-    for rate in [CounterRate::SWITCH_1, CounterRate::SWITCH_2] {
-        let guest = Guest::new(&programs::hello().unwrap());
+    for console in [Console::Switch1, Console::Switch2] {
+        let rate = console.counter_rate();
+        let mut guest = Guest::new(&programs::hello().unwrap());
+        // The process is described as built for the console the clock counts for.
+        guest.placed.description.console = console;
         let tick = Rc::new(Cell::new(0));
         let seen = Rc::clone(&tick);
         // The second step's closure sees what the first call wrote to x0.
@@ -587,7 +681,7 @@ fn get_system_tick_is_the_clock_at_the_rate_the_run_was_given() {
             &RunOptions::default(),
             Instant::now(),
             Timebase {
-                rate,
+                console,
                 clock: FixedClock::new(start, 1),
             },
         );
@@ -618,7 +712,6 @@ fn the_environments_recording_is_dropped_as_it_is_made() {
     let options = RunOptions::default();
     let session = Session {
         memory: &guest.memory,
-        placed: &guest.placed,
         options: &options,
         clock: RunClock::new(timebase()),
         recorder: Recorder::new(),
@@ -638,10 +731,7 @@ fn the_environments_recording_is_dropped_as_it_is_made() {
     }
     let mut vcpu = vcpu.then(|_| {}, svc(SvcId::ExitProcess));
 
-    let process = Process {
-        space: &guest.memory,
-        address_space: guest.address_space(),
-    };
+    let (process, _) = boot(&guest.memory, guest.address_space(), &guest.placed).unwrap();
     let ending = drive(&mut vcpu, process, &session, &env, &mut log, &mut tally);
     assert!(matches!(ending, Ending::Exited));
     // The calls were made, through this environment...
@@ -1124,11 +1214,77 @@ fn the_main_threads_handle_names_a_thread_with_the_default_priority() {
         .then(|_| {}, svc(SvcId::GetThreadPriority))
         .then(
             |regs| {
-                assert_eq!((regs.x[0], regs.x[1]), (0, u64::from(MAIN_THREAD_PRIORITY)));
+                let priority = ProcessDescription::homebrew(NRO_CONSOLE).main_thread_priority;
+                assert_eq!((regs.x[0], regs.x[1]), (0, u64::from(priority)));
             },
             svc(SvcId::ExitProcess),
         );
     let report = guest.run(vcpu, &RunOptions::default());
     assert_eq!(report.exit, ExitReason::ProcessExited);
     assert!(report.stubbed.is_empty(), "{:?}", report.stubbed);
+}
+
+#[test]
+fn the_process_is_created_from_the_placements_description() {
+    // A description whose main thread priority differs from the default: the main thread runs
+    // at that priority.
+    let mut guest = Guest::new(&programs::hello().unwrap());
+    let default = ProcessDescription::homebrew(NRO_CONSOLE);
+    let priority = default.main_thread_priority + 1;
+    guest.placed.description.main_thread_priority = priority;
+    let vcpu = ScriptedVcpu::new()
+        .then(|_| {}, svc(SvcId::GetThreadPriority))
+        .then(
+            move |regs| assert_eq!((regs.x[0], regs.x[1]), (0, u64::from(priority))),
+            svc(SvcId::ExitProcess),
+        );
+    let report = guest.run(vcpu, &RunOptions::default());
+    assert_eq!(report.exit, ExitReason::ProcessExited);
+    // A description the kernel refuses ends the run before the guest runs.
+    let mut refused = Guest::new(&programs::hello().unwrap());
+    refused.placed.description.main_thread_priority = default.priorities.first - 1;
+    let report = refused.run(ScriptedVcpu::new(), &RunOptions::default());
+    assert_eq!(
+        report.exit,
+        ExitReason::EmulatorError(format!(
+            "the kernel could not be set up: the main thread's priority {} is outside the \
+             process's priorities",
+            default.priorities.first - 1
+        ))
+    );
+}
+
+#[test]
+fn a_clock_for_another_console_than_the_descriptions_ends_the_run_before_the_guest_runs() {
+    // The program's reads were patched for its description's console; a clock counting at the
+    // other console's rate would give `GetSystemTick` a different rate.
+    let guest = Guest::new(&programs::hello().unwrap());
+    assert_eq!(guest.placed.description.console, Console::Switch1);
+    let report = run(
+        &mut ScriptedVcpu::new(),
+        guest.program(&guest.memory),
+        &RunOptions::default(),
+        Instant::now(),
+        Timebase {
+            console: Console::Switch2,
+            clock: SystemClock::new(),
+        },
+    );
+    assert_eq!(
+        report.exit,
+        ExitReason::EmulatorError(CONSOLE_MISMATCH.to_owned())
+    );
+    assert!(report.system_calls.is_empty());
+    assert_eq!(
+        CONSOLE_MISMATCH,
+        "the run's clock and the process's description name different consoles, so the \
+         counter rates would differ"
+    );
+    // The same guest with the description's console runs.
+    let matching = Guest::new(&programs::hello().unwrap());
+    let vcpu = ScriptedVcpu::new().then(|_| {}, svc(SvcId::ExitProcess));
+    assert_eq!(
+        matching.run(vcpu, &RunOptions::default()).exit,
+        ExitReason::ProcessExited
+    );
 }

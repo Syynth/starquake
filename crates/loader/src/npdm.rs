@@ -45,7 +45,10 @@
 //! treated as its mistake; a test pins that the word at 0x10 is not the system resource size.
 //! Two consequences, both deliberate:
 //!
-//! - The word at 0x10 is not exposed (no consumer needs it yet).
+//! - The word at 0x10 is exposed under SwitchBrew's name, [`Npdm::remote_memory_size`], raw.
+//!   What it sizes is not established by any source here (guess: memory a Switch 2 process
+//!   shares with another device); Eden's three trees read the four bytes as reserved, so nothing
+//!   of process creation depends on it yet.
 //! - [`Npdm::process_category`] keeps Eden's name for the word at 0x18, which SwitchBrew calls
 //!   the version. Whether it is a process category is not established by any source here.
 //!
@@ -243,6 +246,9 @@ pub struct Npdm {
     pub main_thread_priority: u8,
     /// Main thread core.
     pub main_thread_core: u8,
+    /// The word at 0x10, raw: SwitchBrew's `RemoteMemorySize`, marked Switch 2 only (see the
+    /// module docs). Eden reads it as reserved.
+    pub remote_memory_size: u32,
     /// System resource size in bytes.
     pub system_resource_size: u32,
     /// The word at 0x18. Eden names it `process_category`; SwitchBrew calls it the version.
@@ -355,6 +361,7 @@ impl Npdm {
             address_space,
             main_thread_priority: byte_at(header, 0xE),
             main_thread_core: byte_at(header, 0xF),
+            remote_memory_size: u32_at(header, 0x10),
             system_resource_size: u32_at(header, 0x14),
             process_category: u32_at(header, 0x18),
             main_thread_stack_size: u32_at(header, 0x1C),
@@ -743,8 +750,9 @@ mod tests {
         assert_eq!(npdm.validate_against_acid(), Ok(()));
 
         // META words 0x10 and 0x14: Eden's layout, not `npdm_info.py`'s labels. The sentinel at
-        // 0x10 must not leak into the system resource size.
+        // 0x10 must not leak into the system resource size; it is the remote memory size.
         assert_ne!(npdm.system_resource_size, WORD_0X10);
+        assert_eq!(npdm.remote_memory_size, WORD_0X10);
     }
 
     fn check_common(npdm: &Npdm, file: &[u8]) {

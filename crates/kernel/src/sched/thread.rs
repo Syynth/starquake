@@ -6,14 +6,21 @@
 //! fields `KThread` keeps for the scheduler (`m_thread_state`, `m_suspend_request_flags`,
 //! `m_priority`, `m_base_priority`, `m_physical_affinity_mask`, `m_physical_ideal_core_id`,
 //! `m_core_id`, `m_current_core_id`, `m_last_scheduled_tick`, `m_schedule_count`, and the
-//! per-core `QueueEntry` array). Fields for later slices (wait queue, held locks, TLS, the
-//! owning process) are added by those slices.
+//! per-core `QueueEntry` array), and the lifecycle fields of kernel slice 8 (`m_parent`,
+//! `m_thread_id`, `m_tls_address`, `m_virtual_ideal_core_id`, `m_virtual_affinity_mask`).
+//! The wait queue, held locks and address keys are rows of the scheduler's
+//! [`SyncTable`](crate::sync::SyncTable), keyed by thread (kernel slices 4 and 5).
+//!
+//! Eden keeps a thread's requested suspends (`m_suspend_request_flags`) apart from those in its
+//! state (the bits of `m_thread_state` above `SuspendShift`), which `UpdateState` copies from the
+//! requests (masked by `m_suspend_allowed_flags`, all ones until pinned threads exist). They
+//! differ while `TrySuspend` declines to suspend a thread with kernel waiters.
 
 use starquake_cpu::GuestRegs;
 use starquake_trace::GuestTicks;
 
 use super::cores::{AffinityMask, CoreId};
-use crate::id::ThreadId;
+use crate::id::{ObjectId, ProcessId, ThreadId};
 
 /// The highest (most urgent) thread priority: Eden `svc_types.h`, `HighestThreadPriority = 0`.
 pub const HIGHEST_THREAD_PRIORITY: u8 = 0;
@@ -125,7 +132,10 @@ pub(super) struct QueueLink {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Thread {
     pub(super) state: ThreadState,
+    /// The suspends in the state: what decides whether the thread is queued.
     pub(super) suspend_flags: u8,
+    /// The suspends requested (`m_suspend_request_flags`).
+    pub(super) suspend_requested: u8,
     pub(super) priority: Priority,
     pub(super) base_priority: Priority,
     pub(super) affinity: AffinityMask,
@@ -136,6 +146,23 @@ pub struct Thread {
     pub(super) yield_schedule_count: Option<u64>,
     pub(super) links: Vec<QueueLink>,
     pub(super) context: GuestRegs,
+    /// The owning process (`m_parent`); `None` for a thread made outside any process, as the
+    /// scheduler's own tests make them.
+    pub(super) process: Option<ProcessId>,
+    /// The thread's row in the object table, once it has one.
+    pub(super) object: Option<ObjectId>,
+    /// Whether the thread holds a reference to its own object: from `KThread::Run`
+    /// (`this->Open`) until it ends (`FinishTermination`'s `this->Close`).
+    pub(super) holds_itself: bool,
+    /// The id the guest knows it by (`m_thread_id`).
+    pub(super) guest_id: u64,
+    /// Its thread-local region, or zero for none (`m_tls_address`).
+    pub(super) tls_address: u64,
+    /// The ideal core as the guest named it (`m_virtual_ideal_core_id`): a virtual core, or
+    /// `IdealCoreDontCare` (-1).
+    pub(super) virtual_ideal_core: i32,
+    /// The affinity mask as the guest named it (`m_virtual_affinity_mask`).
+    pub(super) virtual_affinity: u64,
 }
 
 impl Thread {
@@ -145,16 +172,25 @@ impl Thread {
         self.state
     }
 
-    /// The outstanding suspend requests, one [`SuspendType::bit`] each.
+    /// The suspends in effect, one [`SuspendType::bit`] each: the requests as of the last time
+    /// they were put into the state (`UpdateState`). A thread is suspended while any is set.
     #[must_use]
     pub fn suspend_flags(&self) -> u8 {
         self.suspend_flags
     }
 
+    /// The outstanding suspend requests, one [`SuspendType::bit`] each
+    /// (`m_suspend_request_flags`). They are in effect ([`Thread::suspend_flags`]) unless a
+    /// suspend was declined because kernel waiters wait on the thread.
+    #[must_use]
+    pub fn suspend_requested(&self) -> u8 {
+        self.suspend_requested
+    }
+
     /// Whether a suspend of this type is requested (`KThread::IsSuspendRequested(type)`).
     #[must_use]
     pub fn is_suspend_requested(&self, kind: SuspendType) -> bool {
-        self.suspend_flags & kind.bit() != 0
+        self.suspend_requested & kind.bit() != 0
     }
 
     /// The effective priority (`GetPriority`).
@@ -205,6 +241,37 @@ impl Thread {
     #[must_use]
     pub fn context(&self) -> &GuestRegs {
         &self.context
+    }
+
+    /// The owning process, if any.
+    #[must_use]
+    pub fn process(&self) -> Option<ProcessId> {
+        self.process
+    }
+
+    /// The thread's row in the object table, if it has one.
+    #[must_use]
+    pub fn object(&self) -> Option<ObjectId> {
+        self.object
+    }
+
+    /// The id the guest knows the thread by (`GetThreadId`).
+    #[must_use]
+    pub fn thread_id(&self) -> u64 {
+        self.guest_id
+    }
+
+    /// The address of its thread-local region, or zero for a thread that has none.
+    #[must_use]
+    pub fn tls_address(&self) -> u64 {
+        self.tls_address
+    }
+
+    /// The ideal core and affinity mask as the guest named them (`KThread::GetCoreMask`): the
+    /// virtual values, before translation to the scheduler's cores.
+    #[must_use]
+    pub fn virtual_core_mask(&self) -> (i32, u64) {
+        (self.virtual_ideal_core, self.virtual_affinity)
     }
 
     /// Whether the thread belongs in the priority queues: runnable with no suspend in effect.

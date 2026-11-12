@@ -14,7 +14,7 @@ workspace = true
 # Test doubles (`framework::fake`) for this crate's own tests and for downstream crates' dev
 # builds: the name every crate gives the feature that exports its fakes
 # (`docs/specs/testing.md`, "Shared test support").
-test-support = []
+test-support = ["starquake-kernel/test-support"]
 
 [dependencies]
 starquake-kernel.workspace = true

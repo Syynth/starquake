@@ -14,8 +14,9 @@ the repo), and records its own choices in `docs/proposals.md` and the decision l
 
 - Judgement-heavy or single-threaded work (integration, foundations, bring-up) goes to one agent,
   not a wave. Parallel waves are for well-specified ports.
-- Fable is used sparingly (decision log, 2026-11-12). Build and fix agents run on Opus. Fable is
-  for the fidelity review of a foundation PR; a Fable build needs a stated reason.
+- Build, fix and review agents run on Opus (decision log, 2026-11-12). Fable is used sparingly
+  and only when the owner's allowance has room; where a Fable review was planned, two Opus
+  reviews stand in.
 - Every PR gets two independent reviews: one for fidelity to the spec and the reference, one
   that runs the code and tries to break its tests.
 
