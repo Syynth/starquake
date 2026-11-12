@@ -1,6 +1,9 @@
 # GPU front/back protocol and engine state model
 
 Status: draft for the owner's review (issue #12). Not approved; nothing is built on it yet.
+Amended on 2026-11-12 to follow the owner's six graphics decisions (`docs/decision-log.md`) and
+the seam resolutions of the graphics review guide (`docs/specs/graphics-review-guide.md`); the
+decided items are marked in "Decisions for the owner".
 
 This spec designs `crates/gpu` from a GPFIFO submission to a recorded draw: how command buffers
 are parsed, how a channel waits on a semaphore without stalling anything else, where macros run,
@@ -29,23 +32,36 @@ states exactly what this spec assumes of each and what it offers them.
   (row 50). Other channels keep running, and the front never stalls on the back to check a
   semaphore: it rechecks when the back reports a release, when a submission arrives, or on a
   short poll for semaphores the CPU releases.
-- **Releases happen after the work they follow.** A semaphore release or syncpoint increment
-  is performed by the back, in ring order, once the host GPU has finished the recorded work
-  before it (with Eden-NX2's empty-fence skip and batching, rows 123–124). Waiters a release
-  satisfies are latched, so an equal-acquire never misses a value (row 70).
+- **Releases happen after the work they follow** (decided by the owner, decision 2). A semaphore
+  release or syncpoint increment is performed by the back, in ring order, once the host GPU has
+  finished the recorded work before it (with Eden-NX2's empty-fence skip and batching, rows
+  123–124). Waiters a release satisfies are latched, so an equal-acquire never misses a value
+  (row 70).
+- **Syncpoints and the GPU address table are this crate's plain data** (owner's decision of
+  2026-11-12). `Syncpoints` (the counters) and `GpuVm` (the versioned table from GPU addresses to
+  targets) live in `crates/gpu`. The graphics server (#11) allocates counters, computes each
+  submission's fence and writes mappings; the GPU performs increments after host completion,
+  reads the table on every access, and applies unmaps, kind changes and destroys as ordered
+  updates, reported done only when no earlier work, on the front or the back thread, can still
+  use the old mapping.
 - **Ampere classes are modelled natively** (`C797` 3D, `C7C0` compute with QMD 3.0, `C7B5`
   DMA copy, `A140` inline-to-memory, `902D` 2D, the `C76F` host methods), from register tables
   generated from Mesa's class headers. Nothing is aliased to Maxwell.
-- **Backend-neutral output.** The back hands the render backend plain-data commands (passes,
-  draws, dispatches, copies, clears, fence actions) and asks the shader pipeline to translate a
-  program read through a recorded environment. A recording backend makes the whole path
-  testable without a GPU.
+- **Backend-neutral output** (decided by the owner: command lists as data, caches split by
+  key). The back hands the render backend `CommandList`s of plain-data `Command`s, the render
+  backend's own types (#14), and keeps every cache keyed by guest memory or register state. It
+  asks the shader cache for programs with the non-blocking `lookup`, answering its questions
+  from engine state (#13). A recording backend makes the whole path testable without a GPU.
 - **Capture and replay.** A capture holds the submissions, every byte each GPU thread read (in
   order, deduplicated), and the engine state at the start. Replaying it runs the real front and
   back on any host and diffs the ring and the recorded commands against goldens.
 - **Block-linear tiling is a pure leaf crate** (`starquake-layout`), ported from Mesa's `nil`,
-  safe Rust, tested offline. Eden-NX2's "Switch 2 GOB swizzle" (row 69) is Mesa's Turing colour
-  GOB, by the derivation below.
+  safe Rust, tested offline. This crate does all detiling and write-back with it; the render
+  backend receives linear data. Eden-NX2's "Switch 2 GOB swizzle" (row 69) is Mesa's Turing
+  colour GOB, by the derivation below.
+- **Presents carry no fence wait.** The graphics server latches a frame only once its fence is
+  reached and paces the game through a buffer queue (owner's decision of 2026-11-12); this crate
+  orders the present after earlier work and hands it on.
 
 ## Sources and how facts are cited
 
@@ -87,7 +103,8 @@ states exactly what this spec assumes of each and what it offers them.
 ## Threads and data flow
 
 ```text
- vCPU threads ──(gsv #11: submit, present)──▶ submission queue (MPSC, per channel)
+ gsv #11 (vCPU threads: submit, update_vm, barrier;
+          timer thread: present) ──────────────▶ submission queue (MPSC, per channel)
                                                    │
                                                    ▼
                                       ┌──────── front thread ────────┐
@@ -107,14 +124,16 @@ states exactly what this spec assumes of each and what it offers them.
 
 | Thread | Owns | Never touches |
 |---|---|---|
-| vCPU threads (through gsv) | Nothing in the GPU; they call `Gpu::submit` and `Gpu::present`, which never block | Engine state, caches |
-| Front | Per-channel submission queues, pusher state (current method, count, mode, position), host-method state, the per-channel register files, macro code and data RAM, the memo, acquire registrations | Caches, the render backend |
-| Back | Engine mirrors and dirty flags, the QMD table, the texture and buffer caches, the open render recording, pending fence actions | Register files, macro state |
+| gsv's handler threads (vCPU) and timer thread | Nothing in the GPU; they call the `GpuFront` methods (#11), which never block | Engine state, caches |
+| Front | Per-channel submission queues, pusher state (current method, count, mode, position), host-method state, the per-channel register files, macro code and data RAM, the memo, acquire and fence-wait registrations, pending ordered updates | Caches, the render backend |
+| Back | Engine mirrors and dirty flags, the QMD table, the texture, buffer and pipeline-key caches, the GPU-only store, the open command list, pending fence actions | Register files, macro state |
 | Render submit (#14) | Host queues, swapchain, completion of host submissions | Engine state |
 
 Every piece of state has exactly one owning thread. The only shared structures are the ring,
-the submission queues, the acquire waiter table (a small mutex-guarded list) and the write-track
-dirty log (see "GPU memory access").
+the submission queues, the acquire waiter table (a small mutex-guarded list), the write-track
+dirty log (see "GPU memory access"), `Syncpoints` (atomic counters, written by the back thread
+and gsv's video worker, read by anyone), `GpuVm` (versioned; gsv writes maps, the GPU applies
+ordered updates) and gsv's completion queue (this crate only pushes to it).
 
 ## The front thread
 
@@ -122,14 +141,29 @@ dirty log (see "GPU memory access").
 
 A channel is created by gsv (#11) for a GPU session and is identified by a `ChannelId`. Each
 channel has its own GP entry queue, pusher state, subchannel bindings, register files and macro
-data RAM. `Gpu::submit(channel, entries)` copies the 8-byte GP entries (gsv has already copied
-them out of the guest's request) into the channel's queue and wakes the front. It never blocks a
-vCPU thread.
+data RAM, an address space (`AsId`) and the syncpoint gsv allocated for it (`ChannelConfig`).
+`GpuFront::submit(channel, submission)` moves a `Submission` (the 8-byte GP entries gsv has
+already copied out of the guest's request, the optional fence to wait on first, the number of
+syncpoint increments to perform after them, and the wait-for-idle flag) into the channel's queue
+and wakes the front. It never blocks a vCPU thread. gsv computes the fence the increments will
+reach; this crate only performs them.
+
+- **The fence to wait on** (submit flag bit 0) is handled like an acquire: before the
+  submission's first entry, the front checks `Syncpoints::reached(wait)`, and if it is not met
+  registers a waiter and parks the channel. The back's report of an increment rechecks it.
+- **The increments** (row 32: NVN2 sets bit 8 and expects them though its commands contain
+  none) are appended by the front after the submission's last entry, as `Syncpoint` ring entries
+  for the channel's syncpoint, so the back performs them after the host GPU has finished the
+  submission's work.
+- **A full queue.** Whether a channel's queue is bounded is open (graphics-server decision 12,
+  coupled with "Back-pressure" below). If bounded, `submit` returns `Submitted::Full`, and the
+  front pushes `GpuCompletion::GpuQueueRoom` when the queue drains; otherwise it always returns
+  `Submitted::Queued`.
 
 **Command words are read when they are executed, never at submission.** NVN2 writes a command
 buffer after submitting the GP entry that points at it, and gates it with an acquire (row 50), so
 reading at submission time would run stale commands. Words are read through `GpuMemory` (below)
-in chunks, as copies.
+in chunks, as copies, so the front reads through the same address table as the back.
 
 The front loop:
 
@@ -209,9 +243,11 @@ Eden-NX2 never suspends on a `SEM_EXECUTE` acquire; it checks once and continues
 wait is not an acquire. Whether NVN2 uses `SEM_EXECUTE` acquires at all is to be traced
 ("What to verify").
 
-A release whose address lies in the syncpoint shim range that gsv reports (row 46) is passed to
-gsv as a syncpoint operation instead of a memory write (**guess** about how increments reach
-syncpoints on this GPU; confirm with a trace of NVN2's fence path).
+A release whose address translates to `Target::SyncpointShim` in `GpuVm` (the page nvhost-as-gpu
+ioctl 0xB reports, row 46) becomes an increment of that syncpoint in `Syncpoints` instead of a
+memory write, performed like any fenced release (**guess** about how increments reach
+syncpoints on this GPU; confirm with a trace of NVN2's fence path). An acquire that reads the
+shim reads `Syncpoints::read`.
 
 ### Split methods
 
@@ -221,6 +257,37 @@ level (row 73). A submission that ends with a method unfinished keeps it pending
 submission of that channel, and this is logged once per method (Eden-NX2 drops parked methods at
 the end of a submission; with continuous state there is nothing to drop). A macro call's
 parameters may therefore arrive across entries; the call runs only when its last word arrives.
+
+### Ordered address-table updates and barriers
+
+gsv (#11) writes new mappings into `GpuVm` itself, at once: no earlier work can name a range
+the guest has not yet been told is mapped. Unmaps, kind changes, destroys and sparse-region
+destroys come to this crate instead, as `GpuFront::update_vm(space, update, done)`; a bare
+`GpuFront::barrier(done)` asks only for the report. Each must be reported done
+(`GpuCompletion::GpuOrdered { ticket }`) only when no work queued before it can still use the
+old mapping, including the front thread, which reads command words through the same table
+(owner's decision of 2026-11-12; row 68). The mechanism:
+
+1. The call is queued to the front in call order with submissions. The front records, for every
+   channel of that process, the last submission queued before the call.
+2. When every channel's pusher has read past its recorded submission, the front emits a `Marker`
+   into the ring.
+3. The back reports the marker once everything before it is performed, including fenced
+   releases and increments, which wait for host completion.
+4. The GPU then applies the update to `GpuVm` (bumping its version, so every thread's
+   translation cache drops stale entries), drops the range from its caches, calls the shader
+   cache's `invalidate` for it, frees GPU-only storage for a destroyed sparse range, and pushes
+   `GpuOrdered { ticket }` to gsv's completion queue.
+
+**Open, surfaced by applying the decision:** two cases the texts do not settle. (a) A channel
+parked on an acquire holds every later ordered update of its process until it resumes; if the
+guest waits for the unmap's job event before releasing that acquire, the two wait on each other.
+Hardware probably behaves the same way (**guess**; a trace of an unmap issued while a channel
+waits would show it). (b) Work queued *after* the update but run before it is applied still sees
+the old mapping. For an unmap that is harmless, since the guest has not been told the range is
+free; for a kind change, a few later draws may see the old kind. The alternative, holding all
+later work until the update applies, would stall every channel behind a parked one. This draft
+takes the first behaviour and lists it for review.
 
 ### Engine methods: the register file
 
@@ -313,7 +380,8 @@ enum RingEntry<'a> {
     WaitForIdle { channel: ChannelId },
     Invalidate { channel: ChannelId, what: Invalidation },
     Marker { token: MarkerToken },    // the back reports when it has performed everything before it
-    Present(PresentRequest),
+                                      // (ordered updates and barriers use it)
+    Present(PresentRequest),          // no fence: gsv latched it after its fence was reached
     CaptureControl(CaptureCommand),
 }
 
@@ -328,9 +396,13 @@ There are no closures in the ring (Eden-NX2's ring carries function pointers,
 The ring holds 1 Mi words (8 MiB, Eden-NX2's size; **guess** that it is enough, to be measured
 as peak occupancy). The front publishes in batches (every 256 words, or when it parks) and waits
 for space when the ring is full; that waits only the front, never a vCPU. Submission queues are
-unbounded lists of GP entries, but the guest bounds them itself: it paces on present (row 55)
-and on its own semaphores. A queue longer than 65,536 entries (**guess**) is reported in the
-flight recorder; nothing is dropped.
+unbounded lists of GP entries in this draft, but the guest bounds them itself: it paces on free
+present buffers (row 55; owner's decision of 2026-11-12, buffer queue) and on its own semaphores.
+A queue longer than 65,536 entries (**guess**) is reported in the flight recorder; nothing is
+dropped. Still open, and coupled: graphics-server decision 12 asks for a bounded queue whose
+full state defers the guest's submit reply; the review guide recommends that, at this 65,536
+figure. If chosen, `submit` returns `Submitted::Full` as described under "Channels and
+submissions".
 
 ### Ordering guarantees
 
@@ -343,6 +415,11 @@ flight recorder; nothing is dropped.
    first out, even when host submissions complete out of order.
 5. A `Marker` is reported after everything before it is performed, including fenced releases.
 6. A `Present` is ordered after everything emitted before it.
+7. Submissions, ordered updates, barriers and presents take effect in the order the `GpuFront`
+   methods were called, across all channels of one process (graphics-server's assumption). An
+   ordered update or barrier is reported done only after every submission queued before it has
+   been read by the front and its work performed, fenced actions included ("Ordered
+   address-table updates and barriers").
 
 ## The back thread: engine state
 
@@ -368,15 +445,18 @@ A draw method (`DRAW_VERTEX_ARRAY_BEGIN_END_A/B`, `DRAW_INDEX_BUFFER_BEGIN_END_A
 1. For each dirty group, re-derive its part of the draw description and keep it. Clean groups
    reuse the previous part, so a draw that changed one constant buffer binding rebuilds only that.
 2. Resolve programs: for each enabled stage, the program address (`SET_PROGRAM_REGION` plus
-   `SET_PIPELINE_PROGRAM_ADDRESS(j)`) is looked up in the shader cache; a miss asks the shader
-   pipeline to translate it (see #13 below). The translated shader says which constant
-   buffers, textures, samplers, images and storage buffers it uses, and where bindless handles
-   come from.
+   `SET_PIPELINE_PROGRAM_ADDRESS(j)`) goes into a `ProgramRequest`, and the back builds the
+   `VariantKey` (engine state, plus the render backend's `EmulationFlags` and, when
+   `Caps::view_swizzle` is false, each texture binding's swizzle). `ShaderCache::lookup` never
+   blocks (see #13 below): `Ready` gives a `ShaderSet`; `Pending(Ticket)` follows this crate's
+   one wait-while-compiling setting (decision 9); `Rejected` skips the draw. The shader set says
+   which constant buffers, textures, samplers, images and storage buffers it uses, and where
+   bindless handles come from.
 3. Resolve resources: constant buffers from `BIND_GROUP_CONSTANT_BUFFER(j)` (and root tables for
    banks 24–31), textures and samplers from the header and sampler pools by handle, vertex and
    index buffers, render targets. Each becomes a host resource through the buffer and texture
-   caches.
-4. Emit a `Draw` command (see "What the back hands the render backend").
+   caches, and the pipeline through the pipeline-key cache (guest state → `PipelineId`).
+4. Emit a `Command::Draw` (see "What the back hands the render backend").
 
 A draw whose shader was rejected is skipped and counted, once per program in the log (negative
 cache, rows 90, 112). Conditional rendering (`SET_RENDER_ENABLE_*`) is evaluated here from the
@@ -399,7 +479,7 @@ methods as ordinary writes; the back:
    limits (4,096 QMDs, chains of 256) are those of `eden-nx2/src/video_core/native_qmd.h`, each
    an `Err` here, not a silent stop.
 3. A QMD that runs is read again from guest memory first, because NVN2 patches its release
-   payloads while it waits (comment in `native_qmd.h`). It becomes a `Dispatch` command: program
+   payloads while it waits (comment in `native_qmd.h`). It becomes a `Command::Dispatch`: program
    address (words 48–49), grid (words 12–14), block (words 18–19), shared memory, local memory,
    and the eight constant buffers (words 32–47), as `DispatchNativeCompute` reads them.
 4. After the dispatch is recorded, each enabled release slot (24, 28, 52) becomes a fenced
@@ -431,22 +511,31 @@ a listed divergence pinned by a test, until a trace settles it ("What to verify"
 
 ### Releases and completion
 
-The back records commands into an open host submission. A fenced action (release, syncpoint
-increment, marker) is attached to the open submission if it has recorded work since the last
-submission was closed; otherwise to the newest submission still in flight; if nothing is in
-flight, it is performed at once (Eden-NX2's empty-fence skip, row 123).
+The back records commands into an open `CommandList`. A fenced action (release, syncpoint
+increment, marker) is attached to the open list if it has recorded work since the last list was
+submitted; otherwise to the newest list still in flight; if nothing is in flight, it is
+performed at once (Eden-NX2's empty-fence skip, row 123; the owner's decision: "signals with no
+host work behind them are written at once").
 
-The open submission is closed and handed to the render backend when: the ring is empty, a
-present arrives, a wait for idle arrives, a fenced action's address has a registered waiter (a
-channel is parked on it), or 1 ms of recording has passed (**guess**, so that a CPU spinning on a
-semaphore is not starved; measure).
+The open list is closed and submitted to the render backend (`Backend::submit`, which returns its
+`FenceValue`) when: the ring is empty, a present arrives, a wait for idle arrives, a fenced
+action's address has a registered waiter (a channel is parked on it), or 1 ms of recording has
+passed (**guess**, so that a CPU spinning on a semaphore is not starved; measure). The back keeps
+a first-in, first-out list of (`FenceValue`, fenced actions).
 
-When the render backend reports a submission complete, the back performs its actions in order:
+When `Backend::completed()` passes a list's fence, the back performs its actions in order:
 writes the release (4 or 16 bytes, with the timestamp for 16-byte releases, row 52), or applies
-the reduction; latches any registered waiter the new value satisfies; tells gsv about syncpoint
-increments; reports markers. Then it wakes the front if anything was latched or reported.
-Completions are batched: one wake for all actions of all submissions completed at that point
-(row 124).
+the reduction; latches any registered waiter the new value satisfies; increments `Syncpoints`
+(which pushes `GpuCompletion::SyncpointChanged` to gsv's completion queue when the counter is
+watched); reports markers. Then it wakes the front if anything was latched or reported.
+Completions are batched: one wake for all actions of all lists completed at that point (row 124;
+the owner's decision: "several are batched into one completion check"). Performing these at
+record time instead is kept only as a debugging switch.
+
+**Open, shared with render-backend (#14):** how the back thread sleeps until its ring has entries
+*or* `completed()` moves. The render backend's `completed()` and `wait()` alone cannot wake it;
+a wake hook the back thread installs on the backend is one way (review guide, M14). Slice G15
+needs the answer.
 
 Release writes happen on the back thread only, so their order is the ring's order.
 
@@ -454,11 +543,15 @@ Release writes happen on the back thread only, so their order is the ring's orde
 
 ### Reading and writing guest memory
 
-The GPU reads and writes through `GpuMemory`, a trait this crate defines and gsv implements for
-a GPU address space (#11). GPU addresses equal CPU addresses for memory registered with the
-session (row 30); GPU-only regions (sparse regions the graphics server backs, rows 57, 80, 85)
-are resolved by the same implementation. Following the execution model, access is by copy or
-through the memory crate's raw view type, never a Rust slice into guest memory.
+The GPU reads and writes through `GpuMemory`, a trait this crate defines. Its production
+implementation is also in this crate (owner's decision of 2026-11-12): it translates through the
+address space's `GpuVm` and reads `Target::Guest` memory through `GuestMemory` at the CPU
+address, `Target::GpuOnly` through the GPU-only store (below) and `Target::SyncpointShim`
+through `Syncpoints::read`. The production type is concrete, so the hot path can call it
+directly; the trait exists for the capture-replay implementation ("Replay") and for tests. GPU
+addresses equal CPU addresses for memory registered with the session (row 30). Following the
+execution model, access is by copy or through the memory crate's raw view type, never a Rust
+slice into guest memory.
 
 ```rust
 pub trait GpuMemory: Send + Sync {
@@ -466,13 +559,34 @@ pub trait GpuMemory: Send + Sync {
     fn write(&self, va: u64, data: &[u8]) -> Result<(), GpuFault>;
     /// Raw view for hot paths (command words, large uploads), as in the execution model.
     fn view(&self, va: u64, len: u64) -> Result<RawView<'_>, GpuFault>;
-    /// Bumped by every map, unmap or kind change, for per-thread translation caches.
+    /// The `GpuVm` version: moved by every map, ordered update or kind change,
+    /// for per-thread translation caches.
     fn generation(&self) -> u64;
 }
 ```
 
-Each GPU thread keeps its own translation cache, invalidated by the generation counter. A cache
-shared between threads crashed in Eden-NX2 when a service thread remapped memory (row 125).
+Each GPU thread keeps its own translation cache, invalidated by the version. A cache shared
+between threads crashed in Eden-NX2 when a service thread remapped memory (row 125). A version
+says only that something changed; which range changed reaches the caches through the ordered
+updates, which carry it.
+
+### GPU-only memory
+
+Sparse regions (gsv 214) are GPU ranges with nothing of the title's behind them, yet render
+targets live there (rows 57, 80, 81, 85). This crate owns their backing, because only GPU
+threads touch it (review guide, M6; graphics-server decision 4 chose lazy host backing, still
+open):
+
+- a render target in such a region stays a host-only texture in the texture cache, never
+  detiled or written back;
+- other bytes go in a sparse page store, allocated on the host the first time the GPU writes a
+  page; a page never written reads as zero (**guess**, graphics-server verification 6);
+- nothing is charged to the title's memory pools; gsv keeps the region extents and accounting
+  only;
+- a sparse-region destroy is an ordered update: the store frees the range only when it is
+  applied.
+
+The store's contents are not in gsv's snapshot; a GPU snapshot reads them back (Deferred).
 
 ### Learning of CPU writes
 
@@ -491,10 +605,14 @@ impl WriteWatch {
 ```
 
 The kernel side (applying protections, which needs a TLB flush on some core, and recording
-faults) is the kernel's; what this design assumes of it is listed under "Interfaces". Until a
-watch is armed, the cache treats the range as untracked and reads it again at each use. The back
-drains the dirty log before each draw, dispatch and copy; with nothing dirty, that is one atomic
-load.
+faults) is the kernel's; what this design assumes of it is listed under "Interfaces", and no
+slice in any draft owns it yet (review guide, section 4). Until a watch is armed, the cache
+treats the range as untracked and reads it again at each use. The back drains the dirty log
+before each draw, dispatch and copy; with nothing dirty, that is one atomic load. It drops the
+dirty ranges from its own caches and calls the shader cache's `invalidate` for the same ranges
+(review guide, M7): the back thread is the one place CPU writes reach any GPU-side cache, and no
+fault handler calls into the shader crate. The ranges come from `ShaderCache::tracked_ranges`
+and the caches' own uploads.
 
 A range the guest is known to rewrite constantly (streamed uniform data, row 141) costs one
 fault per page per tracking period. The caches may mark a range "streamed" after repeated faults
@@ -503,7 +621,9 @@ and stop tracking it, re-reading it each use instead.
 ### GPU writes and the CPU
 
 Where the render backend can alias guest memory (unified memory, `MTLStorageModeShared`), GPU
-writes to buffers land in guest memory directly. Images are stored in host layouts and are not
+writes to buffers land in guest memory directly. The wgpu backend chosen first cannot alias
+(render-backend decision 7), so until a direct backend exists GPU-written buffers are copied back
+like images, on the same demand rules. Images are stored in host layouts and are not
 written back by default (decision 4). They are written back, through the layout crate, when a
 DMA copy or inline write reads them as plain memory, when an MME DMA read touches them, and on
 request in tests. Eden-NX2 measured that guest CPUs read GPU-written buffer memory at most 64
@@ -511,13 +631,18 @@ times in 200 seconds, while downloading at every fence cost 250–330 MB/s (row 
 
 ### Caches
 
-The buffer cache and the texture cache live in this crate, on the back thread. They map guest
-ranges to host resources created through the render backend, and own invalidation: CPU writes
-(dirty log), GPU writes (copies, inline writes, render targets) and unmaps (generation). Texture
+The buffer cache, the texture cache and the pipeline-key cache live in this crate, on the back
+thread (owner's decision of 2026-11-12: caches keyed by game memory or register state live in
+the GPU crate). They map guest ranges and guest state to host resources and pipelines created
+through the render backend, and own invalidation: CPU writes (dirty log), GPU writes (copies,
+inline writes, render targets) and unmaps (ordered updates, which carry the range). Texture
 headers (`classes/clc797tex.h`) are decoded here into an image description handed to the layout
-crate and the render backend. Unmapped GPU addresses get a stand-in identity fixed by the GPU
-address, so an image is found again (row 103). Eviction thresholds come from the render backend's
-memory budget (rows 119, 139).
+crate and the render backend; their component swizzle goes into the view when the backend's
+`Caps::view_swizzle` is true and into the shader variant key otherwise. Unmapped GPU addresses
+get a stand-in identity fixed by the GPU address, so an image is found again (row 103). Eviction
+thresholds come from the render backend's memory budget (rows 119, 139). The pipeline-key cache
+also keeps the list of keys seen, so the next boot can precompile them (render-backend,
+"Compiling without stalling a frame").
 
 ## Block-linear layout: `starquake-layout`
 
@@ -528,9 +653,13 @@ total size, and converts between linear and tiled bytes for a region. It is port
 crate with no workspace dependencies, in safe Rust (nil's copy routines use raw pointers;
 `copy.rs`), operating on byte slices the caller has already copied out of guest memory.
 
-Three users need it: the back (CPU copies, 2D fallback, write-back), the render backend (a GPU
-compute deswizzle must agree with it), and gsv (sizes for its native image and window requests,
-rows 33, 47, 96). A leaf crate is the only place all three can reach (decision 5).
+Its callers (review guide, M8): this crate's back thread, which does all detiling and write-back
+(CPU copies, 2D fallback, uploads, write-back; the render backend receives linear data); later
+the render backend, if GPU detiling is built (its "Deferred"), because a GPU compute deswizzle
+must agree with it; and gsv only in a test that checks its native-image size formula, ported from
+PR #4588 because it reproduces the system module's answer, against this crate's size for the same
+description (graphics-server slice 8). A leaf crate is the only place all three can reach
+(decision 5).
 
 **The Switch 2 GOB is Mesa's Turing colour GOB.** Eden's GOB swizzle (`SwizzleOffset` in
 `astc_decoder.comp`) puts byte offset bits 0–3 = x bits 0–3, bit 4 = y bit 0, bit 5 = x bit 4,
@@ -548,37 +677,27 @@ Tegra GOB; property tests that no description panics or overflows (huge images, 
 
 ## What the back hands the render backend
 
-The back produces a stream of plain-data commands and hands it over in submissions. Sketch,
-names provisional; the render backend spec (#14) owns the final types:
+The back produces plain-data commands and hands them over as command lists. The types are the
+render backend's (render-backend, "Commands" and "The trait"); this draft's earlier sketch
+(`RenderCommand` with `BeginPass`, `EndPass` and `Barrier`, a render `Submission`, a
+`present(PresentFrame)` method) is replaced by them (owner's decision of 2026-11-12, command
+lists as data; review guide, M14):
 
-```rust
-enum RenderCommand {
-    BeginPass(PassDesc),          // colour targets (image views), depth target, render area, load ops
-    EndPass,
-    Draw(DrawDesc),
-    Dispatch(DispatchDesc),
-    Copy(CopyDesc),               // buffer/image, either direction, with regions
-    Blit(BlitDesc),               // 2D engine: scaled, filtered
-    Clear(ClearDesc),
-    Upload(UploadDesc),           // bytes the back read from guest memory, already linear
-    Barrier(BarrierDesc),
-}
-
-struct DrawDesc {
-    pipeline: PipelineKey,        // shader ids per stage + fixed-function state, hashable
-    bindings: StageBindings,      // per stage: uniform buffers, textures+samplers, images, storage
-    vertex: VertexInput,          // streams (buffer slice, stride, divisor) and attributes
-    index: Option<IndexInput>,
-    params: DrawParams,           // direct (first, count, base vertex, instances) or indirect
-    dynamic: DynamicState,        // viewports, scissors, blend constants, stencil refs, depth bias
-}
-
-struct Submission { commands: Vec<RenderCommand>, id: SubmissionId }
-```
+- a `CommandList` is a `Vec<Command>`; `Backend::submit(list)` returns the `FenceValue` it signals
+  when the host GPU has finished it, and `Backend::completed()` gives the highest finished value;
+- `Command` is `Upload`, `Copy`, `Blit`, `Clear`, `SetRenderTargets`, `Draw(DrawDesc)`,
+  `Dispatch(DispatchDesc)`, `Readback`, `Present(PresentDesc)` or `Marker`;
+- render passes and barriers are the backend's business: the back sets render targets, and the
+  backend opens and closes host passes and inserts barriers from what each command reads and
+  writes;
+- a present is a `Command::Present` in a list, not a trait method.
 
 Every value in a command is already decoded from guest registers and validated. A host resource
-appears only as a typed id from the render backend. A recording implementation of the backend
-turns a submission into text, which is what the offline tests snapshot.
+appears only as a typed id from the render backend; no guest address and no wgpu type crosses.
+Shaders cross as the shader crate's naga module, which the back puts in a `ShaderDesc` as
+`ShaderSource::Naga`, converting the shader's resource, input and output tables into the render
+crate's `ShaderInterface`. The recording backend turns a list into text, which is what the
+offline tests snapshot.
 
 ## Capture and replay
 
@@ -594,9 +713,13 @@ A capture starts at a present boundary and covers one or more frames:
    bindings, macro code and data RAM; the back's QMD table. Caches are emptied at capture start,
    so every resource is read during the capture.
 3. **One input log per GPU thread**, each in the order that thread consumed things:
-   - front: submissions taken (channel, GP entries), memory reads (address, length, content
-     hash), acquire checks (value seen), back reports received, poll ticks;
-   - back: memory reads, completions received, write-tracking drains.
+   - front: submissions taken (channel, GP entries, wait fence, increments), ordered updates and
+     barriers taken, memory reads (address, length, content hash), acquire and fence-wait checks
+     (value seen), back reports received, poll ticks;
+   - back: memory reads, completions received, write-tracking drains, and shader lookups with
+     the requests, variant keys and answers given to the shader cache's questions, so that
+     `cargo xtask shader-replay` can retranslate them offline (shader-pipeline slice 20; review
+     guide, M15).
 4. **A blob table** of read contents, deduplicated by hash, so a command buffer read twice is
    stored once.
 5. **The outputs**, for comparison: a hash per ring entry, the render command stream, and the
@@ -611,7 +734,9 @@ submission, between the GPU's reads (decision 8).
 `starquake gpu-replay <capture> --until present=N --dump ring|render|writes` builds a `Gpu` with
 a replay `GpuMemory` that answers reads from the log, runs the real front on its log, then the
 real back on the resulting ring and its log, with the recording render backend and a shader
-pipeline in recording mode (#13: translate, validate, no host compile). A read that is not the
+pipeline in recording mode (#13: translate, validate, no host compile). The command name is this
+crate's: the render backend's host-level capture replays with `starquake render-replay`, and the
+shader capture with `cargo xtask shader-replay` (review guide, M15). A read that is not the
 next one in the log, or a ring entry whose hash differs, stops the replay with the position: a
 divergence is a finding, as in the kernel replay. Single-threaded replay is deterministic on any
 host.
@@ -637,88 +762,142 @@ values, and a header check before the body, as the test strategy requires.
   skipped as empty. `summary.json` gets them per run.
 - GPU register writes are not events in the kernel's stream (`observability.md`); acquires and
   releases are not either. The GPU's link to the event stream is through gsv: submissions and
-  presents are IPC requests, and the order in which presents complete deferred replies is
-  recorded there.
+  presents are IPC requests, and gsv records, from its timer thread, the syncpoint changes,
+  ordered-update reports and latched frames it acts on (graphics-server, "What is recorded").
 
 ## Interfaces to neighbouring designs
 
+The four graphics drafts were amended together on 2026-11-12 so that every shared type and call
+below has the same name in each.
+
 ### Graphics server sessions (#11)
+
+The types gsv shares with the GPU live in this crate, because gsv depends on gpu (owner's
+decision of 2026-11-12: syncpoints and the GPU address table in the GPU crate). This block is the
+same in graphics-server's "What this spec offers and assumes of the GPU front/back":
+
+```rust
+pub struct SyncpointId(u8);                 // < SYNCPOINT_COUNT (192)
+pub struct Fence { pub id: SyncpointId, pub value: u32 }
+pub struct Syncpoints { /* [AtomicU32; 192], max values, watched bitmap */ }
+impl Syncpoints {
+    pub fn read(&self, id: SyncpointId) -> u32;
+    pub fn increment(&self, id: SyncpointId) -> u32;   // pushes SyncpointChanged if watched
+    pub fn reached(&self, fence: Fence) -> bool;       // 32-bit wrapping comparison
+}
+
+pub struct GpuVm { /* versioned translation table: GPU range -> Target, kind */ }
+pub enum Target { Guest { cpu_va: u64 }, GpuOnly { region: RegionId, offset: u64 }, SyncpointShim }
+pub enum VmUpdate { /* unmap, kind change, memory destroy, sparse-region destroy; each with its range */ }
+
+pub struct ChannelConfig { pub space: AsId, pub syncpoint: SyncpointId }
+pub struct Submission { pub entries: Vec<GpfifoEntry>, pub wait: Option<Fence>, pub increments: u32, pub wfi: bool }
+pub enum Submitted { Queued, Full }         // Full only if queues are bounded (graphics-server decision 12)
+pub struct PresentRequest {
+    pub image: ImageDesc,        // GPU address, width, height, pitch, block height, format
+    pub shown: Rect,             // the area word 7 of 229 names
+    pub layer: LayerId,
+    pub display: DisplayId,
+}
+
+pub trait GpuFront: Send + Sync {                       // implemented by `Gpu` in crates/gpu
+    fn create_address_space(&self, space: AsId, vm: Arc<GpuVm>);
+    fn update_vm(&self, space: AsId, update: VmUpdate, done: Option<Ticket>); // ordered
+    fn create_channel(&self, config: ChannelConfig) -> Result<ChannelId, GpuError>;
+    fn bind_class(&self, channel: ChannelId, class: u32) -> Result<(), GpuError>;
+    fn submit(&self, channel: ChannelId, submission: Submission) -> Submitted;
+    fn barrier(&self, done: Ticket);          // done once all work queued before it is finished
+    fn present(&self, request: PresentRequest);   // no fence: gsv latched it after its fence was reached
+    fn channel_error(&self, channel: ChannelId) -> Option<ChannelError>;
+    fn destroy_channel(&self, channel: ChannelId);
+}
+
+pub enum GpuCompletion {
+    SyncpointChanged { id: SyncpointId, value: u32 },   // back thread (after host completion), video worker
+    GpuOrdered { ticket: Ticket },                       // an ordered update or barrier is done
+    GpuQueueRoom { channel: ChannelId },                 // a full queue drained (bounded queues only)
+}
+pub trait Completions: Send + Sync { fn push(&self, completion: GpuCompletion); } // implemented by gsv
+```
+
+`core` creates the `Gpu` (`Gpu::new(deps, config)`, which starts both threads) with the
+`Syncpoints`, gsv's `Completions` and the render backend, and hands it to gsv as an
+`Arc<dyn GpuFront>`.
 
 What this spec assumes of gsv:
 
-- gsv creates and destroys channels, one per GPU channel the guest opens, each on a GPU address
-  space, and implements `GpuMemory` for that space (registered memory at GPU VA == CPU VA, sparse
-  and GPU-only regions, kind changes, row 149). It bumps the generation on every change.
-- gsv copies GP entries out of the guest's submit request and calls `Gpu::submit` from the vCPU
-  thread handling the request. If a submit asks for a fence (an increment of the channel's
-  syncpoint, row 32), gsv passes it and gets the value it will reach.
-- gsv owns syncpoints: it implements `SyncpointSink`, which the back calls (from the back
-  thread) when an increment is performed, and it tells the GPU the shim page range (row 46).
-- gsv answers vi2 present (229) and paces the guest on it (rows 55, 59). It calls
-  `Gpu::present` after the frame's fence is reached, or with the fence for the GPU to wait on.
+- gsv creates address spaces and writes new mappings into their `GpuVm` itself (registered
+  memory at GPU VA == CPU VA, maps inside sparse regions, the syncpoint shim). Unmaps, kind
+  changes (row 149) and destroys it sends as `update_vm`; it signals the guest's job event only
+  on `GpuOrdered` (row 68).
+- gsv allocates syncpoints and their maxima, computes each submission's fence, and passes the
+  number of increments to perform; it never increments a channel's syncpoint itself.
+- gsv copies GP entries out of the guest's submit request and calls `submit` from the vCPU thread
+  handling the request.
+- gsv answers vi2 present (229) at once and paces the guest with its buffer queue (owner's
+  decision of 2026-11-12). It calls `present` from its timer thread when a vsync tick latches a
+  frame whose fence is reached, and frees the buffer that frame replaces on the same tick; this
+  crate is not asked to wait on a fence or to report the buffer free.
+- gsv tells this crate which registrations are two pages long (the semaphore mirror question,
+  row 35).
 
-What this spec offers gsv (sketch):
-
-```rust
-impl Gpu {
-    pub fn new(deps: GpuDeps, config: GpuConfig) -> Result<Gpu, GpuError>;   // starts both threads
-    pub fn create_channel(&self, memory: Arc<dyn GpuMemory>) -> Result<ChannelId, GpuError>;
-    pub fn destroy_channel(&self, channel: ChannelId);
-    pub fn submit(&self, channel: ChannelId, entries: &[GpEntry], fence: Option<FenceRequest>)
-        -> Result<Option<SyncpointValue>, SubmitError>;                          // never blocks
-    pub fn present(&self, request: PresentRequest);   // image address + layout + crop + fence
-    pub fn channel_error(&self, channel: ChannelId) -> Option<ChannelError>;
-}
-pub trait SyncpointSink: Send + Sync {
-    fn increment(&self, id: SyncpointId);
-}
-```
-
-Thread rules: `submit` and `present` are called on vCPU threads and only enqueue. `SyncpointSink`
-is called on the back thread and must not block (gsv wakes its waiters through kernel handles,
-as the execution model's active services do). Present waiting with a bounded timeout is gsv's.
+Thread rules: every `GpuFront` method only enqueues and never blocks. `Completions::push` is
+called from the front thread (`GpuQueueRoom`), the back thread (`SyncpointChanged`,
+`GpuOrdered`) and gsv's video worker, never blocks, and is the only call into gsv; gsv wakes
+guest waiters from its timer thread when it drains the queue, so the order is recorded
+(observability rule 3).
 
 ### Shader pipeline (#13)
 
-What the back asks of the shader pipeline:
+The back uses the shader cache's non-blocking form (shader-pipeline, "What the GPU front/back
+protocol and engine state (#12) gets"; review guide, M9). This draft's earlier synchronous
+`translate(request, env)` is dropped.
 
-- `translate(request, env) -> Result<Arc<TranslatedShader>, Rejected>`, called synchronously on
-  the back thread, in linear time (row 121). The request names the stage and the program's
-  guest address. The environment is implemented by the back and valid only during the call: it
-  reads program words (copies), constant buffer words (for bindless handles and jump tables),
-  and texture types by handle. The translator returns what it read from the environment, and
-  those reads become part of the cache key, checked again on lookup (Eden's
-  `shader_environment.cpp` model).
-- A `TranslatedShader` carries a `ShaderId` and its resource usage: constant buffers by bank and
-  range, textures, samplers, images and storage buffers by binding or bindless source, inputs
-  and outputs, local and shared memory sizes. The back needs this to bind resources.
-- `Rejected` carries a reason and is cached negatively until the program's memory is written
-  (rows 90, 112).
-- Whether host pipeline compilation is asynchronous, and what a draw does when its pipeline is
-  not ready, is the pipeline's and the backend's (#13, #14); decision 9 records what this design
-  recommends.
+- `ShaderCache::lookup(req: &[ProgramRequest], variant: &VariantKey, mem: &dyn ProgramMemory,
+  state: &dyn EngineState) -> Lookup` never blocks and never translates. `Lookup::Ready` carries
+  an `Arc<ShaderSet>` of `HostShader`s; `Lookup::Pending(Ticket)` means translation is running on
+  the shared compile pool; `Lookup::Rejected` carries a reason and is cached negatively until the
+  program's memory is written (rows 90, 112).
+- The back implements `ProgramMemory` (over `GpuVm`) and `EngineState` (constant-buffer words and
+  texture kinds from its mirrors). The answers it gives become part of the shader entry's key.
+- The back builds the `VariantKey`, copying in the render backend's `EmulationFlags` and, when
+  `Caps::view_swizzle` is false, each texture binding's swizzle (review guide, M13; owner's
+  decision 1).
+- A `HostShader` carries the naga module (`HostCode::Naga`), its resource table (constant buffers
+  by bank and range, textures, samplers, images and storage buffers by binding or bindless
+  source, with group and binding numbers), inputs and outputs, local and shared memory sizes, and
+  the driver-constants layout. The back needs this to bind resources and fill driver constants.
+- What a draw does while a ticket is pending, and while its pipeline is compiling, is one
+  setting owned here (decision 9; review guide, M10). Translation waits block the back thread;
+  pipeline waits block the render thread.
 
-What the back offers: the environment, program invalidation when the code's memory is written
-(dirty log), and the console-provided root table contents for banks 24–31.
+What the back offers: the two answering traits, `invalidate` calls from the back thread for CPU
+writes (dirty log), GPU writes and unmaps, registration of `tracked_ranges` with `WriteWatch`,
+the console-provided root table contents for banks 24–31, and shader lookups with their answers
+in the `SQGC` capture.
 
 ### Render backend (#14)
 
-What the back assumes of the render backend, used only from the back thread:
+What the back assumes of the render backend (its types, used as they are), used only from the
+back thread:
 
-- resource creation and destruction by description (buffers, possibly aliasing a guest range on
-  unified memory; images with format, extent, levels, layers; samplers), returning typed ids;
-- `submit(Submission)` that hands a recorded command list to the render submit thread, and a
-  completion signal per submission that the back can wait on together with the ring;
-- a memory budget the caches read for eviction;
-- `present(PresentFrame)` with a host image id, crop and transform;
-- a recording implementation behind its `test-support` feature, which prints submissions as text.
+- resource creation and destruction by description (buffers, images with format, extent, levels,
+  layers, views, samplers, shaders from `ShaderDesc`, pipelines), returning typed ids;
+- `submit(CommandList)`, which hands a list to the render thread and returns its `FenceValue`,
+  and `completed()`; the wake on completion is open (see "Releases and completion");
+- `budget()`, which the caches read for eviction;
+- `Caps`, including `view_swizzle`, and `emulation()`;
+- a present as `Command::Present(PresentDesc)` with a host view, the source rectangle, the
+  transform and a frame number; no fence wait;
+- the recording backend, which prints lists as text.
 
-What the back offers: the command stream above, fully decoded; host layouts produced by the
-layout crate; and the rule that every resource referenced by a submission stays alive until that
-submission completes (the back defers destruction until then).
+What the back offers: command lists fully decoded, linear data produced by the layout crate, and
+the rule that every resource referenced by a list stays alive until that list completes (the
+back destroys with `destroy(id, after)`).
 
-Ownership: the back owns which guest ranges map to which host resources; the render backend owns
-the host objects and host memory.
+Ownership: the back owns which guest ranges and guest states map to which host resources and
+pipelines; the render backend owns the host objects and host memory, and never sees a guest
+address.
 
 ### Approved specs this design leans on
 
@@ -730,11 +909,14 @@ should reconcile with the kernel's port plan:
   requests from the GPU's back thread at the next kernel entry on any core (it cannot flush the
   TLB itself), records the faulting page as dirty, and restores access.
 - **Observability:** GPU capture in its own format (this spec); a `gpu.txt` artifact and GPU
-  counters in `summary.json` (additions).
+  counters in `summary.json` (additions); the headless contract gains `starquake gpu-replay`
+  (this spec) and `starquake render-replay` (render-backend R11). All are proposals for the
+  owner; this draft does not change the approved spec.
 - **Test strategy:** "recorded method streams replayed into the front end, compared against
   expected engine state" is the capture replay above; Mesa's simulator tests stay the macro
   oracle.
-- **Architecture:** adds the leaf crate `starquake-layout` (decision 5).
+- **Architecture:** adds the leaf crate `starquake-layout` (decision 5); a present goes
+  gsv → gpu → render, not gsv → render as `architecture.md` draws it (a proposal for the owner).
 
 ## Port slices
 
@@ -751,32 +933,36 @@ same time.
 | G4 | `gpu::ring`: the SPSC ring, entry encoding, text form, back-pressure, publish and park | none | `eden-nx2/src/video_core/gpu_split.{h,cpp}` (structure only) | Encode/decode round trip for every entry kind; ordering and wrap tests with two threads and a fixed schedule; a full-ring test | A |
 | G5 | `starquake-layout`: GOB kinds, block-linear offsets, image layout, mip tails, tile/untile of regions | none | `mesa-nouveau/src/nouveau/nil/{tiling,image,extent,format,copy}.rs` (MIT) | The GOB derivation test above; hand-computed offsets; round trips; overflow property tests | A |
 | G6 | MME memo | existing `gpu::mme` | `eden-nx2/src/video_core/macro_memo.h` | The interpreter as oracle: generated programs and calls, memo replay equals a fresh run; guard failure when data RAM changes | A |
-| G7 | `GpuMemory` trait, test implementation, per-thread translation cache with generation; `WriteWatch` in `starquake-memory` (the type and its fake; the kernel side is a kernel slice) | none | Row 125; execution model | Generation invalidation; fake watch arming and dirty drain | A |
+| G7 | `GpuMemory` trait, test implementation, per-thread translation cache keyed by a version; `WriteWatch` in `starquake-memory` (the type and its fake; the kernel side is a kernel slice) | none | Row 125; execution model | Version invalidation; fake watch arming and dirty drain | A |
 | G8 | `gpu::channel`: per-channel pusher state machine with host methods, acquire parking and resume at the exact word, split methods across entries and submissions, malformed-stream errors | G1, G2, G7 | `dma_pusher.cpp`, `puller.cpp` | Streams built with G1's encoder: suspend mid-entry and resume re-reading changed words; split method across entries; every error variant asserted | B |
 | G9 | `gpu::regs`: front register files, shadow RAM control, side-effect registers, same-value dropping, run batching | G3 | `maxwell_3d.cpp` (`ProcessShadowRam`, `CallMethod`), `kepler_compute.cpp` | Shadow RAM modes; each side-effect register; a same-value write dropped, a trigger never dropped; unknown methods pass | B |
 | G10 | `gpu::back::state`: mirrors, dirty groups, typed accessors for 3D and compute | G3 | `eden/src/video_core/dirty_flags.{h,cpp}` (model) | Each method marks its groups; accessor bounds and enum errors | B |
 | G11 | `gpu::back::copy`: DMA copy, inline-to-memory, 2D (CPU paths) | G3, G5, G7 | `eden-nx2/src/video_core/engines/{maxwell_dma,engine_upload,kepler_memory,fermi_2d}.cpp` | Copies between pitch and block-linear in a fake memory against G5; inline writes; semaphore fields | B |
 | G12 | `gpu::back::qmd`: QMD 3.0 decode, PCAS scheduler, release slots, dependent QMDs | G2, G3 | `native_qmd.h`, `kepler_compute.cpp` (`ProcessNativeMethod`, `DispatchNativeCompute`) | Golden QMD words from header bit positions; the cross-channel decrement-before-schedule case (row 84); rejected QMD still releases (row 61); every limit as an error | B |
 | G13 | Front macro host: uploads, start tables, calls across entries, per-channel data RAM, buffered writes, MME DMA reads with catch-up, memo hook | G6, G8, G9 | `maxwell_3d.cpp` (`ProcessMacro`, `CallMacroMethod`), `kepler_compute.cpp`, row 58 | Recorded-call style tests with a fake back; a DMA read that forces a catch-up commits nothing on the first run | C |
-| G14 | `gpu::front`: the front loop, channel scheduling, waiter table, parking and wake-ups, acquire poll | G4, G8, G9, G13 | `gpu_split.cpp`, `nx2.h` (`Nx2SemaphoreWaiters`) | Scripted multi-channel scenarios with a fake back and fake clock: a parked channel does not block another; latching an equal-acquire whose value moves on (row 70) | D |
-| G15 | `gpu::back::fence`: open submission, fenced actions, empty-fence skip, completion batching, release writes, latching, syncpoint sink calls | G2, G4, #14's submission and completion types | Rows 123, 124; `kepler_compute.cpp` (release callbacks) | Fake render backend completing out of order; actions still FIFO; empty fences skipped | C |
-| G16 | Buffer cache: guest range to host buffer, write-watch integration, streamed ranges, eviction by budget | G7, #14's resource types | `eden/src/video_core/buffer_cache` (reference only); rows 120, 131, 139 | Fake memory, fake watch, recording backend: CPU write re-uploads once; unmap drops | C |
-| G17 | Texture cache: texture header decode, image identity by address and layout, uploads through G5, render targets, write-back on demand | G5, G7, G10, #14's resource types | `eden/src/video_core/texture_cache` (reference only); rows 69, 87, 103 | Recording backend: same header twice is one image; CPU write invalidates; write-back matches G5 untile | C |
-| G18 | `gpu::back::draw`: derive `DrawDesc` from 3D state, shader requests, bindings, conditional render | G10, G16, G17, #13's request types | `eden-nx2/src/video_core/engines/{maxwell_3d,draw_manager}.cpp` (reference) | Register scripts to golden draw descriptions (`insta`), with a fake shader pipeline returning fixed usage | D |
-| G19 | `gpu::back` executor: ring entries to engines, compute dispatch emission, present | G10, G11, G12, G15, G18 | none (new) | Ring text in, render command text out (`insta`) | E |
-| G20 | Capture writer and reader, replay memory, `gpu-replay` command, capture builder in `test-support` | G14, G19 | none (new) | Golden bytes for every record kind; a built capture replays to its expected outputs; a tampered read is reported as a divergence | F |
-| G21 | Wiring: `Gpu` handle, threads, gsv submission and present path, counters, flight recorder, `gpu.txt` | G14, G19, #11's session types | none (new) | A homebrew-style synthetic stream submitted through a fake gsv produces the expected render commands | F |
+| G14 | `gpu::front`: the front loop, channel scheduling, waiter table, parking and wake-ups, acquire poll, submission fence waits and appended increments, ordered updates and barriers (recorded per-channel positions, the marker) | G4, G8, G9, G13 | `gpu_split.cpp`, `nx2.h` (`Nx2SemaphoreWaiters`); row 32, row 68 | Scripted multi-channel scenarios with a fake back and fake clock: a parked channel does not block another; latching an equal-acquire whose value moves on (row 70); an unmap is not reported done while an earlier submission on another channel is unread | D |
+| G15 | `gpu::back::fence`: open command list, fenced actions per `FenceValue`, empty-fence skip, completion batching, release writes, latching, `Syncpoints` increments after host completion, applying ordered updates on their marker, the record-time debugging switch | G2, G4, G7, #14's `CommandList`, `FenceValue` and `completed()`; the completion wake (open, M14) | Rows 123, 124; `kepler_compute.cpp` (release callbacks) | Recording backend completing late: no release, increment or ordered-update report is visible before its list completes; actions still FIFO; empty fences skipped; a watched increment pushes `SyncpointChanged` | C |
+| G16 | Buffer cache: guest range to host buffer, write-watch integration (dirty drain also calls the shader cache's `invalidate`), streamed ranges, eviction by budget | G7, #14's resource types | `eden/src/video_core/buffer_cache` (reference only); rows 120, 131, 139 | Fake memory, fake watch, recording backend: CPU write re-uploads once; an ordered unmap drops the range | C |
+| G17 | Texture cache: texture header decode, image identity by address and layout, uploads through G5, render targets, write-back on demand, swizzle in the view or in the variant key by `Caps::view_swizzle` | G5, G7, G10, #14's resource types | `eden/src/video_core/texture_cache` (reference only); rows 69, 87, 103 | Recording backend: same header twice is one image; CPU write invalidates; write-back matches G5 untile; a swizzled texture under a no-swizzle `Caps` gets an identity view | C |
+| G18 | `gpu::back::draw`: derive `DrawDesc` from 3D state; shader lookups (`ProgramMemory`, `EngineState`, `VariantKey` with `EmulationFlags` and swizzles copied in, driver constants, the wait-while-compiling setting); bindings; conditional render | G10, G16, G17, G23, #13's `lookup` types | `eden-nx2/src/video_core/engines/{maxwell_3d,draw_manager}.cpp` (reference) | Register scripts to golden draw descriptions (`insta`), with a fake shader cache returning fixed sets, pending tickets and rejections; every `EmulationFlags` field reaches the key | D |
+| G19 | `gpu::back` executor: ring entries to engines, compute dispatch emission, present as `Command::Present` (no fence wait) | G10, G11, G12, G15, G18 | none (new) | Ring text in, command list text out (`insta`) | E |
+| G20 | Capture writer and reader (`SQGC`, including shader lookups with their answers), replay memory, `starquake gpu-replay` command, capture builder in `test-support` | G14, G19 | none (new) | Golden bytes for every record kind; a built capture replays to its expected outputs; a tampered read is reported as a divergence | F |
+| G21 | Wiring: `Gpu` implementing `GpuFront`, threads, `Completions` pushes, counters, flight recorder, `gpu.txt` | G14, G19, #11's session types | none (new) | A homebrew-style synthetic stream submitted through a fake gsv produces the expected command lists and completions | F |
+| G22 | Production memory: `GpuMemory` over `GpuVm` and `GuestMemory`, shim reads through `Syncpoints`; the GPU-only store (lazy host pages for sparse regions, host-only render targets in the texture cache, zero reads, free on an applied destroy; review guide, M6) | G7, G17; graphics-server slices 2 and 6 (`Syncpoints` and `GpuVm`, built in this crate) | Rows 30, 57, 80, 85 | Each `Target` kind resolves; first write allocates, unwritten pages read zero, a destroy frees only when applied; nothing charged to guest pools | D |
+| G23 | Pipeline-key cache: guest state to `PipelineId` through the render trait, keyed only on what `Caps` says is not dynamic; the list of keys seen for precompiling next boot (serialise, version) | G10, #14's pipeline types | Eden `renderer_vulkan/vk_pipeline_cache.cpp` (`LoadDiskResources`, policy only) | Recording backend: the same state twice is one pipeline; a dynamic-state change makes no new pipeline under a `Caps` that has it; golden bytes for the key list | C |
 
 Notes on scheduling:
 
 - **Wave A (G1–G7) is seven independent slices**, each in its own module or crate. They are
-  well-specified ports and suit a parallel wave.
+  well-specified ports and suit a parallel wave. Graphics-server's slices 2 (`Syncpoints`) and 6
+  (`GpuVm`) also build code in this crate and are equally free; G22 joins them to `GpuMemory`.
 - G8 (the channel state machine), G13 (the macro host) and G14 (the front loop) carry the
   design's subtle parts (exact-word resume, catch-ups, latching). They are judgement-heavy and
   should go to one agent in sequence, as the working mode prefers for foundations.
-- G16, G17 and G18 depend on the render backend's and shader pipeline's types. If those specs
-  land later, the slices start against provisional types in a `pending` module and are adjusted
-  when the sibling specs settle.
+- G15, G16, G17, G18 and G23 depend on the render backend's and shader pipeline's types. If
+  those specs land later, the slices start against provisional types in a `pending` module and
+  are adjusted when the sibling specs settle. G15 also waits on the completion wake (open,
+  shared with render-backend).
 - The kernel half of `WriteWatch` (applying protections, recording faults) is a kernel slice,
   not listed here.
 
@@ -827,7 +1013,12 @@ Each decision stands on its own. The recommendation comes last in each.
    little to do, losing most of the split's gain; (c) is fast but carries two copies that can
    drift. **Recommended: (a).** Eden-NX2 found the macros-on-the-front arrangement the
    fastest, and making the front the single owner removes the drift its checker had to catch.
-2. **When a GPU "done" signal becomes visible to the game.** The GPU tells the game it has
+2. **Decided by the owner, 2026-11-12:** (b). A release or syncpoint increment becomes visible
+   to the game once the host GPU has finished the work before it; signals with no host work
+   behind them are written at once, several are batched into one completion check, and (a) is
+   kept only as a debugging switch.
+
+   **When a GPU "done" signal becomes visible to the game.** The GPU tells the game it has
    finished work by writing a value (a semaphore release). Options: (a) write it as soon as the
    back thread has *recorded* the work; (b) write it once the host GPU has actually *finished*
    it. (a) is faster but lets the game reuse memory the host GPU is still reading or read
@@ -851,13 +1042,20 @@ Each decision stands on its own. The recommendation comes last in each.
    a rendered image with the CPU sees stale data; (b) cost Eden-NX2 250–330 MB/s for almost no
    benefit (row 131); (c) is exact but read traps were expensive in Eden-NX2 (row 115).
    **Recommended: (a)**, with (c) deferred as an accuracy option. Buffers on unified memory
-   need no copy at all.
+   need no copy at all. Changed by the owner's decision 1 (wgpu first): wgpu cannot alias guest
+   memory, so until a direct backend exists GPU-written *buffers* are in the same position as
+   images, and under (a) a game that reads one with the CPU sees stale data. Row 131 says such
+   reads are rare (at most 64 in 200 seconds), so (a) still stands, but it now covers buffers
+   too. Coupled with render-backend decision 7 and shader-pipeline decision 9.
 5. **Where texture tiling code lives** (issue #17). Options: (a) inside the GPU crate; (b) a new
    small crate with no dependencies, `starquake-layout`; (c) inside the render backend. The GPU
    back thread, the render backend's GPU deswizzle and the graphics server's size calculations
    all need it, and (a) and (c) are each unreachable from one of them under the dependency
    rules. (b) adds a crate to the architecture. **Recommended: (b).** It is pure, ported from
-   MIT code, testable offline, and the only place all three users can reach.
+   MIT code, testable offline, and the only place all three users can reach. Since the review
+   guide's M8 (applied 2026-11-12), this crate is the only caller in production code; the render
+   backend calls it only once GPU detiling is built, and gsv only in a test. (a) would therefore
+   work today, at the cost of moving the code out later.
 6. **Where register definitions come from.** Options: (a) generate Rust tables from Mesa's
    NVIDIA class headers with an `xtask` command and commit the output; (b) write register
    definitions by hand as each feature needs them. (a) gives every method name and field at once
@@ -881,7 +1079,9 @@ Each decision stands on its own. The recommendation comes last in each.
    this frame (pop-in). (a) stutters on first use but always draws correctly and makes captures
    deterministic; (b) keeps frames smooth but objects flicker in. **Recommended: (a) to start**,
    with (b) as an option later. A shader that can never be translated is always skipped and
-   remembered (rows 90, 112). This decision is shared with #13 and #14.
+   remembered (rows 90, 112). This decision is shared with #13 and #14 (shader-pipeline 6,
+   render-backend 5); the review guide makes it one setting owned by this crate, covering
+   translation and pipelines (M10). Still open.
 10. **When the references disagree.** Mesa's class headers (from NVIDIA's documentation) and
     Eden-NX2's observed behaviour sometimes conflict, as with QMD release bit 19 (row 62).
     Options: (a) follow the headers; (b) follow Eden-NX2; (c) follow the headers for layouts and
