@@ -21,7 +21,9 @@
 //! # Two layouts
 //!
 //! [`RequestLayout`] picks how the raw data section of a CMIF request is sized and filled. TIPC
-//! and close messages are the same in both.
+//! and close messages are the same in both, byte for byte
+//! (`tipc_request_is_byte_exact_in_both_layouts` and `close_requests_are_byte_exact_in_both_layouts`
+//! in `tests/libnx_golden.rs`).
 //!
 //! - [`RequestLayout::Libnx`] writes what libnx writes, byte for byte: `cmifMakeRequest`
 //!   (`cmif.h:100-157`), `cmifMakeControlRequest` (`cmif.h:159-174`), `cmifMakeCloseRequest`
@@ -38,8 +40,10 @@
 //!   length is odd, so 4 to 17 bytes. Pinned by the golden-bytes tests in `tests/libnx_golden.rs`
 //!   (`plain_request_is_byte_exact`, `domain_request_is_byte_exact`,
 //!   `pointer_request_is_byte_exact`, `tipc_request_is_byte_exact_in_both_layouts`,
-//!   `control_request_is_byte_exact`, `domain_close_request_is_byte_exact`) and, over generated
-//!   inputs, by `libnx_layout_matches_the_libnx_arithmetic` in `tests/libnx_golden.rs`.
+//!   `control_request_is_byte_exact`, `domain_close_request_is_byte_exact`), for each of the
+//!   paddings 0, 4, 8 and 12 bytes by `out_pointer_table_follows_every_alignment_padding`, and,
+//!   over generated inputs (handles, a process id and X descriptors move the section start), by
+//!   `libnx_layout_matches_the_libnx_arithmetic`, all in `tests/libnx_golden.rs`.
 //! - [`RequestLayout::Exact`], the default, writes the exact size as [`crate::ReplyBuilder`]
 //!   does: the real padding (0 to 3 words), no reserve and no out-pointer size table. A domain
 //!   header's `size` counts the arguments rounded up to a whole word, and the object ids start on
@@ -111,7 +115,7 @@
 //!   `ControlWithContext`, [`RequestLayout::Libnx`] applies the same arithmetic; that is this
 //!   builder's choice, not something libnx shows.
 
-use crate::builder::{Parts, fill_header, out_of_range, push_special_header, to_u32};
+use crate::builder::{Parts, extend_words, fill_header, out_of_range, push_special_header, to_u32};
 use crate::cmif::{CMIF_HEADER_BYTES, CmifRequestHeader, DomainCommand, DomainRequestHeader};
 use crate::error::{IpcError, Result};
 use crate::hipc::{
@@ -703,12 +707,5 @@ impl RequestBuilder {
             token: self.token.unwrap_or_default(),
         }
         .encode()
-    }
-}
-
-/// Appends `words` as little-endian bytes.
-fn extend_words(out: &mut Vec<u8>, words: &[u32]) {
-    for word in words {
-        out.extend_from_slice(&word.to_le_bytes());
     }
 }

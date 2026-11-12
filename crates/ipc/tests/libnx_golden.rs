@@ -24,8 +24,8 @@ use proptest::test_runner::{Config, RngAlgorithm, RngSeed};
 use starquake_ipc::{
     BUFFER_SIZE, Body, BufferDescriptor, CMIF_HEADER_BYTES, CmifReply, CmifReplyHeader,
     CmifRequest, CommandHeader, CommandType, DOMAIN_HEADER_BYTES, DomainReplyHeader, IpcError,
-    MAX_RAW_WORDS, Message, RAW_ALIGNMENT_WORDS, ReceiveDescriptor, ReplyBuilder, RequestBuilder,
-    RequestLayout, SFCI_MAGIC, SFCO_MAGIC, SessionKind, StaticDescriptor,
+    MAX_RAW_WORDS, Message, RAW_ALIGNMENT_WORDS, ReceiveDescriptor, ReceiveList, ReplyBuilder,
+    RequestBuilder, RequestLayout, SFCI_MAGIC, SFCO_MAGIC, SessionKind, StaticDescriptor,
 };
 
 const WORD: usize = size_of::<u32>();
@@ -410,6 +410,25 @@ fn domain_close_request_is_byte_exact() {
     assert_eq!(request_bytes(&builder), golden(&DOMAIN_CLOSE_REQUEST));
 }
 
+/// `cmifMakeCloseRequest(base, 0)` (`cmif.h:188-191`): a bare close, type `Close` (`cmif.h:28`),
+/// and nothing else. Close messages are the same in both layouts (the reserve and the alignment
+/// belong to CMIF raw data, which a close does not have), so the libnx layout must not add them.
+const CLOSE_REQUEST: [u32; 2] = [0x0000_0002, 0x0000_0000];
+
+/// `tipcClose` (`tipc.h:61-67`): `hipcMakeRequestInline` with type `TipcCommandType_Close`
+/// (`tipc.h:14`), 15.
+const TIPC_CLOSE_REQUEST: [u32; 2] = [0x0000_000F, 0x0000_0000];
+
+#[test]
+fn close_requests_are_byte_exact_in_both_layouts() {
+    for layout in [RequestLayout::Exact, RequestLayout::Libnx] {
+        let close = request_bytes(&RequestBuilder::close().layout(layout));
+        assert_eq!(close, golden(&CLOSE_REQUEST), "{layout:?}");
+        let tipc_close = request_bytes(&RequestBuilder::tipc_close().layout(layout));
+        assert_eq!(tipc_close, golden(&TIPC_CLOSE_REQUEST), "{layout:?}");
+    }
+}
+
 /// The literal magics above are libnx's (`cmif.h:11-12`); the shipping constants must agree.
 #[test]
 fn golden_magics_are_the_shipping_constants() {
@@ -583,6 +602,55 @@ fn failed_replies_carry_no_data_or_objects() {
     }
 }
 
+/// libnx's `R_FAILED` test does not depend on a domain (`cmif.h:277-278` follows the domain header
+/// read at `cmif.h:267-269` only when there is one): a failed reply on a plain session has no
+/// data whatever size the caller expects either.
+#[test]
+fn failed_plain_replies_carry_no_data() {
+    let bytes = reply_bytes(&ReplyBuilder::cmif(0xD401).data(&[0x11; 2 * WORD]));
+    for expected in [0, WORD, 2 * WORD, 64, usize::MAX] {
+        let message = Message::parse_reply_sized(&bytes, SessionKind::Session, expected).unwrap();
+        let reply = cmif_reply(message).unwrap();
+        assert_eq!(
+            reply.header,
+            CmifReplyHeader {
+                version: 0,
+                result: 0xD401,
+                token: 0
+            },
+            "{expected}"
+        );
+        assert_eq!(reply.domain, None, "{expected}");
+        assert_eq!(
+            (reply.data, reply.object_ids.as_slice()),
+            (&[][..], &[][..]),
+            "{expected}"
+        );
+    }
+}
+
+/// A failed domain reply that counts object ids still yields none: the ids are skipped, not just
+/// the data (`cmif.h:277-278` returns before `cmif.h:270`). The header's count is kept.
+#[test]
+fn failed_domain_replies_skip_the_counted_object_ids() {
+    let bytes = reply_bytes(&ReplyBuilder::domain(0xD401).object_id(7).object_id(9));
+    for expected in [0, WORD, 64, usize::MAX] {
+        let message = Message::parse_reply_sized(&bytes, SessionKind::Domain, expected).unwrap();
+        let reply = cmif_reply(message).unwrap();
+        assert_eq!(reply.header.result, 0xD401, "{expected}");
+        assert_eq!(
+            reply.domain,
+            Some(DomainReplyHeader { num_objects: 2 }),
+            "{expected}"
+        );
+        assert_eq!(
+            (reply.data, reply.object_ids.as_slice()),
+            (&[][..], &[][..]),
+            "{expected}"
+        );
+    }
+}
+
 const TIPC_REPLY_DATA: [u8; 6] = [0xC1, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6];
 
 /// A successful reply to [`TIPC_REQUEST`]: six data bytes, a copied handle and a moved handle
@@ -731,6 +799,144 @@ fn unsized_parse_splits_domain_replies_only_after_whole_words() {
     );
 }
 
+/// A change to a command header, applied before it is encoded.
+type HeaderEdit = fn(&mut CommandHeader);
+
+/// A CMIF reply whose raw data section runs to the end of the buffer: the header, eight bytes of
+/// alignment padding (the section starts at byte 8 and the content at byte 16), the `SFCO` header
+/// with a zero result, and zeros. `edit` changes the command header before it is encoded.
+fn full_reply(edit: impl FnOnce(&mut CommandHeader)) -> Option<Vec<u8>> {
+    let raw_words = (BUFFER_SIZE - CommandHeader::WORDS * WORD) / WORD;
+    let mut header = CommandHeader {
+        command_type: CommandType::Invalid,
+        num_x: 0,
+        num_a: 0,
+        num_b: 0,
+        num_w: 0,
+        raw_data_words: u32::try_from(raw_words).ok()?,
+        receive_list: ReceiveList::Disabled,
+        has_special_header: false,
+    };
+    edit(&mut header);
+    let mut words = header.encode().ok()?.to_vec();
+    words.extend([0; 2]);
+    words.extend(
+        CmifReplyHeader {
+            version: 0,
+            result: 0,
+            token: 0,
+        }
+        .encode(),
+    );
+    Some(golden(&words))
+}
+
+/// libnx reads no type word from a reply (`hipcParseResponse`, `hipc.h:316-363`): its caller
+/// picks `cmifParseResponse` or `tipcParseResponse`. The sized parser picks from the type word
+/// and refuses a reply whose type is neither zero (CMIF) nor a TIPC command (16 and above). A
+/// listed divergence; `tests/fixtures.rs` pins the same check for `parse_reply`.
+#[test]
+fn sized_parse_picks_cmif_or_tipc_from_the_type_word() {
+    let cmif = full_reply(|_| {}).unwrap();
+    let message = Message::parse_reply_sized(&cmif, SessionKind::Session, WORD).unwrap();
+    assert_eq!(message.command_type, CommandType::Invalid);
+    assert_eq!(cmif_reply(message).unwrap().data, [0; WORD]);
+
+    // The same bytes under a TIPC type are a TIPC reply: the result is the first raw word.
+    let tipc = full_reply(|header| header.command_type = CommandType::Tipc(3)).unwrap();
+    let message = Message::parse_reply_sized(&tipc, SessionKind::Session, WORD).unwrap();
+    assert_eq!(
+        message.body,
+        Body::TipcReply {
+            result: 0,
+            data: &[0; WORD],
+        }
+    );
+
+    for refused in [
+        CommandType::LegacyRequest,
+        CommandType::Close,
+        CommandType::LegacyControl,
+        CommandType::Request,
+        CommandType::Control,
+        CommandType::RequestWithContext,
+        CommandType::ControlWithContext,
+        CommandType::TipcClose,
+    ] {
+        let bytes = full_reply(|header| header.command_type = refused).unwrap();
+        assert_eq!(
+            Message::parse_reply_sized(&bytes, SessionKind::Session, WORD),
+            Err(IpcError::UnexpectedCommandType(refused)),
+            "{refused:?}"
+        );
+    }
+}
+
+/// libnx steps over the copy and move handles and the X descriptors only (`hipc.h:347-360`) and
+/// reads no C descriptor. The sized parser also steps over the A, B and W descriptors the header
+/// counts, so the raw data section moves 12 bytes for each, and reads the C descriptors the
+/// receive-list flag names after it. With a section that fills the buffer, either one runs past
+/// the end. A listed divergence.
+#[test]
+fn sized_parse_steps_over_abw_descriptors_and_reads_the_receive_list() {
+    let section_start = CommandHeader::WORDS * WORD;
+    let section_len = BUFFER_SIZE - section_start;
+    assert!(
+        Message::parse_reply_sized(&full_reply(|_| {}).unwrap(), SessionKind::Session, WORD)
+            .is_ok()
+    );
+
+    let shifted = section_start + BufferDescriptor::WORDS * WORD;
+    let edits: [(&str, HeaderEdit); 3] = [
+        ("A", |header| header.num_a = 1),
+        ("B", |header| header.num_b = 1),
+        ("W", |header| header.num_w = 1),
+    ];
+    for (name, edit) in edits {
+        assert_eq!(
+            Message::parse_reply_sized(&full_reply(edit).unwrap(), SessionKind::Session, WORD),
+            Err(IpcError::Truncated {
+                offset: shifted,
+                needed: section_len,
+                len: BUFFER_SIZE,
+            }),
+            "{name}"
+        );
+    }
+
+    // One C descriptor would follow the section, which ends the buffer.
+    let one = full_reply(|header| header.receive_list = ReceiveList::One).unwrap();
+    assert_eq!(
+        Message::parse_reply_sized(&one, SessionKind::Session, WORD),
+        Err(IpcError::Truncated {
+            offset: BUFFER_SIZE,
+            needed: WORD,
+            len: BUFFER_SIZE,
+        })
+    );
+    // An inline receive buffer has no descriptors.
+    let inline = full_reply(|header| header.receive_list = ReceiveList::Inline).unwrap();
+    assert!(Message::parse_reply_sized(&inline, SessionKind::Session, WORD).is_ok());
+}
+
+/// libnx never checks the raw data size against the buffer. The sized parser fails with
+/// `Truncated` when the section the header announces leaves the buffer: the edge is exact, one
+/// word too many fails and the full section does not.
+#[test]
+fn sized_parse_refuses_a_raw_section_that_leaves_the_buffer() {
+    let section_start = CommandHeader::WORDS * WORD;
+    let section_len = BUFFER_SIZE - section_start;
+    let one_word_more = full_reply(|header| header.raw_data_words += 1).unwrap();
+    assert_eq!(
+        Message::parse_reply_sized(&one_word_more, SessionKind::Session, WORD),
+        Err(IpcError::Truncated {
+            offset: section_start,
+            needed: section_len + WORD,
+            len: BUFFER_SIZE,
+        })
+    );
+}
+
 /// The out-pointer size table exists only in the libnx layout and only in a request with an
 /// `SFCI` header; anything else is refused with the exact reason, and the buffer is untouched.
 #[test]
@@ -746,6 +952,9 @@ fn out_pointers_need_the_libnx_layout_and_an_sfci_header() {
             RequestBuilder::domain(CommandType::Request, 1, 1).out_pointer(OUT_POINTER),
             exact_only,
         ),
+        // Both reasons apply (the layout is Exact and there is no SFCI header): the missing
+        // header is reported first.
+        (RequestBuilder::tipc(1).out_pointer(OUT_POINTER), no_sfci),
         (
             RequestBuilder::tipc(1)
                 .layout(RequestLayout::Libnx)
@@ -774,6 +983,71 @@ fn out_pointers_need_the_libnx_layout_and_an_sfci_header() {
         );
         assert!(buf.iter().all(|b| *b == 0x5A), "{builder:?}");
     }
+}
+
+/// `request.rs` documents the out-pointer table's place for every alignment padding the raw data
+/// section can have. The section start moves with the special header, a process id, handles and
+/// descriptors; sweep those with one out pointer and 0 to 9 argument bytes (both parities of the
+/// content length), check the table where `cmifMakeRequest` puts it (`cmif.h:108`, `cmif.h:153`),
+/// and check that every padding of 0, 4, 8 and 12 bytes occurred.
+#[test]
+fn out_pointer_table_follows_every_alignment_padding() {
+    let mut paddings = std::collections::BTreeSet::new();
+    for pid in [false, true] {
+        for handles in 0..=3_usize {
+            for statics in 0..=1_usize {
+                for sends in 0..=1_usize {
+                    let start = raw_start(handles, pid, statics, sends);
+                    paddings.insert(alignment_padding(start));
+                    for len in 0..=9_usize {
+                        let mut builder = RequestBuilder::cmif(CommandType::Request, 1)
+                            .layout(RequestLayout::Libnx)
+                            .data(&vec![0x5A; len])
+                            .out_pointer(OUT_POINTER);
+                        if pid {
+                            builder = builder.send_pid(0);
+                        }
+                        for handle in 0..handles {
+                            builder = builder.copy_handle(u32::try_from(handle).unwrap() + 1);
+                        }
+                        for _ in 0..statics {
+                            builder = builder.static_descriptor(IN_POINTERS[0]);
+                        }
+                        for _ in 0..sends {
+                            builder = builder.send_buffer(IN_BUFFER);
+                        }
+                        let bytes = request_bytes(&builder);
+                        let (table_offset, raw_words) = libnx_sizes(None, len, 1);
+                        let context = format!(
+                            "pid {pid}, {handles} handles, {statics} X, {sends} A, {len} bytes"
+                        );
+                        assert_eq!(
+                            le_u16(&bytes, start + table_offset),
+                            OUT_POINTER.size,
+                            "{context}"
+                        );
+                        let w1 = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+                        let header = CommandHeader::decode([0, w1]).unwrap();
+                        assert_eq!(
+                            usize::try_from(header.raw_data_words).unwrap(),
+                            raw_words,
+                            "{context}"
+                        );
+                        let message = Message::parse_request(&bytes, SessionKind::Session).unwrap();
+                        assert_eq!(message.receive_descriptors, [OUT_POINTER], "{context}");
+                        let request = cmif_request(message).unwrap();
+                        assert!(request.data.starts_with(&vec![0x5A; len]), "{context}");
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(
+        paddings.into_iter().collect::<Vec<_>>(),
+        (0..RAW_ALIGNMENT_WORDS)
+            .map(|words| words * WORD)
+            .collect::<Vec<_>>()
+    );
 }
 
 /// libnx's raw size (`cmif.h:103-111`) goes into the 10-bit field: arguments that make it
@@ -865,11 +1139,36 @@ fn libnx_sizes(domain_objects: Option<usize>, data: usize, out_pointers: usize) 
     (table_offset, words)
 }
 
-/// Where the raw data section starts: after the two header words and, with handles, the special
-/// header and the handles.
-fn raw_start(handles: usize) -> usize {
-    let special = if handles == 0 { 0 } else { 1 + handles };
-    (CommandHeader::WORDS + special) * WORD
+/// Where the raw data section starts, in bytes: after the two header words, the special header
+/// (present with a process id or handles) with its process id words and handles, and the X and A
+/// descriptors.
+fn raw_start(handles: usize, pid: bool, statics: usize, sends: usize) -> usize {
+    let special = if handles == 0 && !pid {
+        0
+    } else {
+        1 + if pid { 2 } else { 0 } + handles
+    };
+    let words = CommandHeader::WORDS
+        + special
+        + statics * StaticDescriptor::WORDS
+        + sends * BufferDescriptor::WORDS;
+    words * WORD
+}
+
+/// The bytes of alignment padding libnx's `cmifGetAlignedDataStart` (`cmif.h:94-98`) skips when
+/// the raw data section starts at byte `start`.
+fn alignment_padding(start: usize) -> usize {
+    start.next_multiple_of(RAW_ALIGNMENT_WORDS * WORD) - start
+}
+
+fn static_descriptor() -> impl Strategy<Value = StaticDescriptor> {
+    (0_u32..0x40, 0_u64..1 << 39, any::<u16>()).prop_map(|(counter, address, size)| {
+        StaticDescriptor {
+            counter,
+            address,
+            size,
+        }
+    })
 }
 
 fn le_u16(bytes: &[u8], at: usize) -> u16 {
@@ -890,6 +1189,8 @@ proptest! {
         args in prop::collection::vec(any::<u8>(), 0..=24),
         ids in prop::collection::vec(any::<u32>(), 0..=4),
         handles in prop::collection::vec(any::<u32>(), 0..=3),
+        pid in prop::option::of(any::<u64>()),
+        statics in prop::collection::vec(static_descriptor(), 0..=2),
         outs in prop::collection::vec(receive_descriptor(), 0..=3),
         fixed in prop::collection::vec(receive_descriptor(), 0..=2),
     ) {
@@ -903,13 +1204,15 @@ proptest! {
         .data(&args);
         for id in &ids { builder = builder.object_id(*id); }
         for handle in &handles { builder = builder.copy_handle(*handle); }
+        if let Some(pid) = pid { builder = builder.send_pid(pid); }
+        for descriptor in &statics { builder = builder.static_descriptor(*descriptor); }
         for out in &outs { builder = builder.out_pointer(*out); }
         for c in &fixed { builder = builder.receive_descriptor(*c); }
         let bytes = request_bytes(&builder);
 
         let (table_offset, raw_words) =
             libnx_sizes(domain.then_some(ids.len()), args.len(), outs.len());
-        let start = raw_start(handles.len());
+        let start = raw_start(handles.len(), pid.is_some(), statics.len(), 0);
         for (i, out) in outs.iter().enumerate() {
             prop_assert_eq!(le_u16(&bytes, start + table_offset + 2 * i), out.size);
         }
@@ -920,6 +1223,8 @@ proptest! {
         let kind = if domain { SessionKind::Domain } else { SessionKind::Session };
         let message = Message::parse_request(&bytes, kind).unwrap();
         prop_assert_eq!(&message.copy_handles, &handles);
+        prop_assert_eq!(message.pid, pid);
+        prop_assert_eq!(&message.static_descriptors, &statics);
         let receive: Vec<_> = outs.iter().chain(&fixed).copied().collect();
         prop_assert_eq!(&message.receive_descriptors, &receive);
         let request = cmif_request(message).unwrap();
@@ -951,7 +1256,7 @@ proptest! {
         let bytes = reply_bytes(&builder);
 
         // cmif.h:263 (cmif.h:94-98): the content starts at the next 16-byte boundary.
-        let start = raw_start(copies.len() + moves.len())
+        let start = raw_start(copies.len() + moves.len(), false, 0, 0)
             .next_multiple_of(RAW_ALIGNMENT_WORDS * WORD);
         let objects_at = start + DOMAIN_HEADER_BYTES + CMIF_HEADER_BYTES + data.len();
         for (i, id) in ids.iter().enumerate() {

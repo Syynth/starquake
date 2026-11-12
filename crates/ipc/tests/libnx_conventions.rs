@@ -4,7 +4,9 @@
 //! libnx is what a homebrew program uses to build requests, so these tests pin where the builder
 //! agrees with it and where it deliberately differs. Each helper below restates the arithmetic of
 //! one libnx function; the tests then check that the parser accepts the layout libnx writes and
-//! that the builder's differences are the ones listed in the `request` module docs.
+//! that the differences of the default `RequestLayout::Exact` are the ones listed in the
+//! `request` module docs. Every builder here is an `Exact` one (the default); the byte-exact
+//! `RequestLayout::Libnx` layout is pinned in `tests/libnx_golden.rs`.
 
 use starquake_ipc::{
     BUFFER_SIZE, Body, CMIF_HEADER_BYTES, CmifRequest, CommandHeader, CommandType,
@@ -56,7 +58,8 @@ fn raw_words(bytes: &[u8]) -> Option<usize> {
 /// The raw data size in words that `cmifMakeRequest` writes (`cmif.h`): it starts from a fixed
 /// 16-byte reserve for the alignment padding, adds the domain header and object ids if there is
 /// an object id, the `SFCI` header and the data, rounds up to a half word, and rounds up to words.
-/// This leaves out the out-pointer size table, which the builder does not model.
+/// This leaves out the out-pointer size table, which `RequestLayout::Exact` does not write
+/// (`RequestLayout::Libnx` does; see `tests/libnx_golden.rs`).
 fn libnx_cmif_raw_words(data_size: usize, domain_objects: Option<usize>) -> usize {
     let mut size = RAW_ALIGNMENT_WORDS * WORD;
     if let Some(objects) = domain_objects {
@@ -73,7 +76,7 @@ fn builder_padding_words() -> usize {
 }
 
 /// libnx always reserves a full alignment unit (`actual_size = 16`), whatever the real padding
-/// is; the builder writes the exact size. The parser takes both.
+/// is; `RequestLayout::Exact` (the default) writes the exact size. The parser takes both.
 #[test]
 fn cmif_raw_size_differs_from_libnx_by_the_padding_reserve() {
     for len in 0..=24_usize {
@@ -141,7 +144,9 @@ fn close_messages_match_libnx() {
 /// `cmifMakeCloseRequest` for a domain object: type 4, the domain header with type 2, the object
 /// id, a zero data size and a zero token, and no `SFCI` header. libnx's size reserves 16 bytes
 /// for the alignment padding (`(16 + sizeof(CmifDomainInHeader)) / 4` words), so its raw data is
-/// longer than the builder's; the parser stops after the domain header.
+/// longer than the `RequestLayout::Exact` builder's (`RequestLayout::Libnx` writes libnx's size,
+/// pinned by `domain_close_request_is_byte_exact` in `tests/libnx_golden.rs`); the parser stops
+/// after the domain header.
 #[test]
 fn domain_close_matches_libnx() {
     let object_id = 0x0B1D;
@@ -218,9 +223,10 @@ fn parser_accepts_the_domain_layout_libnx_writes() {
     );
 }
 
-/// The builder rounds the arguments up to a whole word before the object ids and counts that
-/// padding in `size`, where libnx counts the exact bytes; the two agree when the arguments are a
-/// whole number of words. This is the listed divergence.
+/// `RequestLayout::Exact` (the default) rounds the arguments up to a whole word before the object
+/// ids and counts that padding in `size`, where libnx counts the exact bytes; the two agree when
+/// the arguments are a whole number of words. This is the listed divergence of the `Exact`
+/// layout; `RequestLayout::Libnx` counts the exact bytes.
 #[test]
 fn builder_pads_domain_arguments_where_libnx_does_not() {
     for len in 0..=12_usize {
@@ -244,9 +250,10 @@ fn builder_pads_domain_arguments_where_libnx_does_not() {
 }
 
 /// libnx adds a table of one `u16` size per out pointer to the raw data (`cmifMakeRequest`:
-/// `out_pointer_size_table_size`, which also sets the C descriptor count); the builder writes no
-/// table, so its raw size does not change with the number of C descriptors. This is the listed
-/// divergence.
+/// `out_pointer_size_table_size`, which also sets the C descriptor count); the
+/// `RequestLayout::Exact` builder (the default) writes no table, so its raw size does not change
+/// with the number of C descriptors. This is the listed divergence of the `Exact` layout;
+/// `RequestLayout::Libnx` writes the table.
 #[test]
 fn receive_descriptors_add_no_size_table_where_libnx_adds_one() {
     let c = ReceiveDescriptor {

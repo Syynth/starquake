@@ -22,7 +22,7 @@
 //! `hipc.h:316-363`, reads only the counts, the size and the special header). This builder writes
 //! zero for CMIF and echoes the request's type for TIPC, as Eden's `ResponseBuilder` does.
 
-use crate::builder::{Parts, fill_header, push_special_header, to_u32};
+use crate::builder::{Parts, extend_words, fill_header, push_special_header, to_u32};
 use crate::cmif::{CmifReplyHeader, DomainReplyHeader};
 use crate::error::{IpcError, Result};
 use crate::hipc::{
@@ -110,7 +110,7 @@ impl ReplyBuilder {
 
     /// Writes the reply into `buf` and returns the number of bytes used.
     ///
-    /// At most the first [`BUFFER_SIZE`] bytes of `buf` are used. The whole usable area is zeroed
+    /// At most the first [`crate::BUFFER_SIZE`] bytes of `buf` are used. The whole usable area is zeroed
     /// first, so no stale words survive. Fails without panicking if the message does not fit, if
     /// a count or id is out of range, or if object ids were added to a non-domain reply; on
     /// failure `buf` is left unchanged.
@@ -161,9 +161,7 @@ impl ReplyBuilder {
                 // The object ids follow the data at once, unaligned: libnx reads them at the
                 // `SFCO` header plus the data size it expects (`cmif.h:270`).
                 let mut tail = parts.data.clone();
-                for id in &parts.object_ids {
-                    tail.extend_from_slice(&id.to_le_bytes());
-                }
+                extend_words(&mut tail, &parts.object_ids);
                 push_data(&mut words, &tail);
                 CommandType::Invalid
             }

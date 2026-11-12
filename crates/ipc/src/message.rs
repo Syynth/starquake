@@ -26,12 +26,28 @@
 //! `libnx/nx/include/switch/result.h:12`) has no data and no object ids: libnx returns the result
 //! before it looks for them (`cmif.h:277-278`, `tipc.h:208-209`).
 //!
-//! It differs from libnx in two ways, both pinned by tests in `tests/libnx_golden.rs`:
+//! It differs from libnx (`hipcParseResponse`, `libnx/nx/include/switch/sf/hipc.h:316-363`, then
+//! the two functions above) in these ways, each pinned by an exact-value or exact-error test in
+//! `tests/libnx_golden.rs`:
 //!
-//! - **Bounds.** libnx reads the data and the object ids wherever the sizes put them, inside the
-//!   raw data section or not. Here they must lie inside the raw data section, or the parse is an
-//!   [`IpcError::Inconsistent`] error (`sized_parse_refuses_data_or_objects_past_the_raw_data`).
-//!   Bytes past the section are not part of the message.
+//! - **Command type.** libnx reads no type word from a reply; its caller picks the CMIF or the
+//!   TIPC parser. Here the type word picks: zero is a CMIF reply, a TIPC type (16 and above) is a
+//!   TIPC reply, and any other type is [`IpcError::UnexpectedCommandType`]
+//!   (`sized_parse_picks_cmif_or_tipc_from_the_type_word`).
+//! - **Descriptors.** libnx steps over the copy and move handles and the X descriptors only
+//!   (`hipc.h:347-360`) and reads no C descriptor. Here the A, B and W descriptors the header
+//!   counts are stepped over too, so the raw data section starts after them, and the C descriptors
+//!   the receive-list flag names are read after the section
+//!   (`sized_parse_steps_over_abw_descriptors_and_reads_the_receive_list`).
+//! - **Buffer bounds.** libnx never checks the sizes it reads against the buffer. Here a raw data
+//!   section or a descriptor list that leaves the first [`BUFFER_SIZE`] bytes is
+//!   [`IpcError::Truncated`] (`sized_parse_refuses_a_raw_section_that_leaves_the_buffer` and the
+//!   test above).
+//! - **Data and object bounds.** libnx reads the data and the object ids wherever the sizes put
+//!   them, inside the raw data section or not. Here they must lie inside the raw data section, or
+//!   the parse is an [`IpcError::Inconsistent`] error
+//!   (`sized_parse_refuses_data_or_objects_past_the_raw_data`). Bytes past the section are not
+//!   part of the message.
 //! - **Object count.** libnx ignores the domain reply header's `num_out_objects` and reads as many
 //!   ids as the caller asks for (`cmifResponseGetObject`, `cmif.h:290-293`). Here the header's
 //!   count says how many ids to read (`domain_reply_object_count_comes_from_its_header`).

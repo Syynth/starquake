@@ -24,8 +24,9 @@
 //! (`libnx/nx/include/switch/sf/`, ISC); [`request`] lists where the builder follows it and where
 //! it differs. With [`RequestLayout::Libnx`] the builder writes libnx's requests byte for byte,
 //! [`ReplyBuilder`] puts a domain reply's object ids where libnx reads them, and
-//! [`Message::parse_reply_sized`] reads replies as libnx does, from the data size the caller
-//! expects; `tests/libnx_golden.rs` pins all three with bytes derived from the libnx headers.
+//! [`Message::parse_reply_sized`] locates a reply's data and object ids as libnx does, from the
+//! data size the caller expects ([`message`] lists every way it differs from libnx);
+//! `tests/libnx_golden.rs` pins all three with bytes derived from the libnx headers.
 
 mod builder;
 pub mod cmif;
