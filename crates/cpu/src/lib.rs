@@ -158,8 +158,8 @@ pub const GUEST_PSTATE_MASK: u64 = PSTATE_NZCV | PSTATE_DIT | PSTATE_SSBS;
 /// backend keeps every bit of `v`; what it keeps of `fpcr` and `fpsr` is what the host lets a
 /// guest write (see each backend).
 ///
-/// Not here yet: the SVE and SME state the Switch 2's Cortex-A78C does not have, and
-/// pointer-authentication keys, which belong to the process and are set separately (on the
+/// Not here yet: SVE and SME state, left out on the guess that the Switch 2's Cortex-A78C
+/// (Armv8.2) has neither (no reference in the pinned set says), and pointer-authentication keys, which belong to the process and are set separately (on the
 /// Hypervisor.framework backend, `hvf::HvfVcpu::set_pac_keys`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GuestRegs {

@@ -151,7 +151,8 @@ pub struct Registers {
     /// The program counter: the address of the instruction that took the exception.
     #[serde(serialize_with = "hex")]
     pub pc: u64,
-    /// The flags (NZCV).
+    /// The [`starquake_cpu::GUEST_PSTATE_MASK`] bits of `PSTATE` (the condition flags `NZCV`,
+    /// `DIT` and `SSBS`) in the `SPSR_EL1` layout; every other bit is zero.
     #[serde(serialize_with = "hex")]
     pub pstate: u64,
     /// `TPIDR_EL0`.
@@ -633,7 +634,7 @@ mod tests {
         assert_eq!(
             json,
             r##"{
-  "version": VERSION,
+  "version": 2,
   "emulator": "starquake 9.9.9",
   "command_line": [
     "starquake",
@@ -690,8 +691,10 @@ mod tests {
     "#0 core 0 thread 1: lifecycle ProcessStart 1"
   ]
 }"##
-            .replace("VERSION", &CRASH_VERSION.to_string())
         );
+        // The golden text pins the version as a literal, so a layout change that forgets to bump
+        // `CRASH_VERSION` fails here.
+        assert_eq!(CRASH_VERSION, 2);
         let undefined = serde_json::to_value(Exception::UndefinedInstruction).unwrap();
         assert_eq!(
             undefined,
@@ -709,6 +712,19 @@ mod tests {
         // A report built without a syndrome says so.
         let without =
             serde_json::to_value(super::tests::report(Exception::UndefinedInstruction)).unwrap();
-        assert_eq!(without["syndrome"], serde_json::Value::Null);
+        // The key is written as `null`, not left out (indexing a missing key would also give
+        // `Null`, so check the object itself).
+        let without = without.as_object().unwrap();
+        assert_eq!(without.get("syndrome"), Some(&serde_json::Value::Null));
+    }
+
+    #[test]
+    fn pstate_carries_dit_and_ssbs_as_well_as_the_flags() {
+        use starquake_cpu::{PSTATE_DIT, PSTATE_NZCV, PSTATE_SSBS};
+        let mut report = report(Exception::UndefinedInstruction);
+        report.registers.pstate = PSTATE_NZCV | PSTATE_DIT | PSTATE_SSBS;
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["registers"]["pstate"], "0xf1001000");
+        assert!(report.to_text().contains("pstate 0xf1001000\n"));
     }
 }

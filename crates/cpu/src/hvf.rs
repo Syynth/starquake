@@ -1363,6 +1363,16 @@ mod tests {
                 shim::CPSR_EL1H_MASKED
             )))
         );
+        // At EL1t (`M[3:0]` = 0b0100, Arm ARM `SPSR_EL1`) too: SP-select clear is not enough to
+        // make it guest code.
+        let el1t = shim::SPSR_EL0T_MASKED | 0x4;
+        assert_eq!(
+            after_wait(WFI, el1t, 0x8000_0000),
+            Err(Error::Host(format!(
+                "a wait was trapped outside guest code: ESR_EL2 {WFI:#x} at pc 0x80000000, cpsr \
+                 {el1t:#x}"
+            )))
+        );
     }
 
     #[test]
