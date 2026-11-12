@@ -2,8 +2,8 @@
 //! (`libnx/nx/source/services/set.c`, `_setsysGetFirmwareVersionImpl`).
 
 use starquake_ipc::{
-    BUFFER_SIZE, BufferDescriptor, CommandType, ReceiveDescriptor, RequestBuilder, SFCO_MAGIC,
-    TIPC_COMMAND_OFFSET,
+    BUFFER_SIZE, BufferDescriptor, CommandType, ReceiveDescriptor, RequestBuilder, RequestLayout,
+    SFCO_MAGIC, TIPC_COMMAND_OFFSET,
 };
 use starquake_kernel::id::ObjectId;
 use starquake_kernel::result::ResultCode;
@@ -99,14 +99,17 @@ impl Rig {
     }
 }
 
-/// The request as libnx builds it: no payload, and one fixed-size pointer buffer for the
-/// result, which is a receive-list (C) descriptor.
+/// The request as libnx builds it, byte for byte: no payload, and one fixed-size pointer buffer
+/// for the result (`cmifRequestOutFixedPointer`: a receive-list (C) descriptor, and no entry in
+/// the table of out-pointer sizes).
 fn get_firmware_version(command: u32, size: usize) -> RequestBuilder {
     let room = ReceiveDescriptor {
         address: AT,
         size: u16::try_from(size).unwrap(),
     };
-    RequestBuilder::cmif(CommandType::Request, command).receive_descriptor(room)
+    RequestBuilder::cmif(CommandType::Request, command)
+        .layout(RequestLayout::Libnx)
+        .receive_descriptor(room)
 }
 
 /// A CMIF reply that holds only a result: the header (6 raw words), padding to 16 bytes,

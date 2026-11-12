@@ -3,7 +3,7 @@
 
 use starquake_ipc::{
     BUFFER_SIZE, Body, CommandHeader, CommandType, Message, ReceiveList, RequestBuilder,
-    SFCO_MAGIC, SessionKind, SpecialHeader, TIPC_COMMAND_OFFSET,
+    RequestLayout, SFCO_MAGIC, SessionKind, SpecialHeader, TIPC_COMMAND_OFFSET,
 };
 use starquake_kernel::handle::Handle;
 use starquake_kernel::result::{KernelError, ResultCode};
@@ -106,17 +106,22 @@ fn moved_handle(buffer: &[u8]) -> Handle {
     Handle::from_raw(message.move_handles[0])
 }
 
+/// A CMIF request laid out byte for byte as libnx lays it out (`cmifMakeRequest`).
+fn libnx_request(command: u16) -> RequestBuilder {
+    RequestBuilder::cmif(CommandType::Request, u32::from(command)).layout(RequestLayout::Libnx)
+}
+
 /// `Initialize` as libnx sends it over CMIF (`_smCmifCmdInPid`): the process id in the header
 /// and a `u64` placeholder in the payload.
 fn cmif_initialize() -> RequestBuilder {
-    RequestBuilder::cmif(CommandType::Request, u32::from(INITIALIZE))
+    libnx_request(INITIALIZE)
         .send_pid(0)
         .data(&0_u64.to_le_bytes())
 }
 
 /// `GetService` as libnx sends it (`smGetServiceOriginal`): the name field.
 fn cmif_get_service(field: [u8; MAX_NAME_LEN]) -> RequestBuilder {
-    RequestBuilder::cmif(CommandType::Request, u32::from(GET_SERVICE)).data(&field)
+    libnx_request(GET_SERVICE).data(&field)
 }
 
 fn initialize(host: &mut FakeHost, sm: Handle) {
@@ -134,7 +139,7 @@ fn firmware_version(host: &mut FakeHost, set_sys: Handle) -> Vec<u8> {
         address: AT,
         size: u16::try_from(set::FIRMWARE_VERSION_SIZE).unwrap(),
     };
-    let ask = RequestBuilder::cmif(CommandType::Request, 4).receive_descriptor(room);
+    let ask = libnx_request(4).receive_descriptor(room);
     assert_eq!(send(host, set_sys, &ask), cmif_result(ResultCode::SUCCESS));
     host.kernel
         .memory(AT, set::FIRMWARE_VERSION_SIZE)

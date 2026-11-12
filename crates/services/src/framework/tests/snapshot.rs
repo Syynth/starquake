@@ -3,6 +3,9 @@
 
 use std::sync::Arc;
 
+use proptest::prelude::*;
+use proptest::sample::Index;
+use proptest::test_runner::{Config, RngAlgorithm, RngSeed};
 use serde::{Deserialize, Serialize};
 use starquake_ipc::RequestBuilder;
 use starquake_kernel::id::ObjectId;
@@ -113,6 +116,11 @@ fn carry_on(scene: &mut Scene, tokens: Vec<ReplyToken>) -> Vec<Vec<u8>> {
     replies.push(rig.send_on(domain, &domain_request(FIRST, child::TAG)));
     replies.push(rig.send_on(domain, &domain_request(FIRST + 1, child::TAG)));
     replies.push(rig.send_on(tipc, &request(toy::BUMP)));
+    // The next deferred request gets the token id after the last one the saved run handed out.
+    let token = rig.defer_on(tipc, &request(toy::WAIT));
+    replies.push(token.raw().to_le_bytes().to_vec());
+    drop(parked());
+    replies.push(rig.deliver().1);
     replies
 }
 
@@ -125,6 +133,8 @@ fn a_restored_server_carries_on_as_the_saved_one_would_have() {
 
     // The run that was saved carries on.
     let original = carry_on(&mut scene, parked());
+    let next_token = scene.tokens[2].raw() + 1;
+    assert!(original.contains(&next_token.to_le_bytes().to_vec()));
     // Nothing in the continuation gave out a handle, so the kernel is as it was.
     assert_eq!(scene.rig.kernel.handle_count(), handles);
     assert_ne!(scene.rig.server.save().unwrap(), saved);
@@ -244,6 +254,79 @@ const GOLDEN: &[u8] = &[
     // The family's state: present, one byte, two bumps.
     1, 1, 2,
 ];
+
+/// Gives `bytes` to a fresh toy server as a snapshot, and then uses the server. Nothing here
+/// may panic, whatever the bytes are: a snapshot is a file.
+fn restore_and_use(bytes: &[u8]) -> Result<(), TestCaseError> {
+    let wakes = Arc::new(Wakes::default());
+    let mut server = toy_server(UnknownPolicy::Strict, &wakes);
+    let before = server.save().unwrap();
+    if server.restore(bytes).is_err() {
+        // Refused: the server is as it was.
+        prop_assert_eq!(server.save().unwrap(), before);
+        return Ok(());
+    }
+    // Accepted: the state passed every check, so it can be saved again, read back, and used.
+    let saved = server.save().unwrap();
+    prop_assert_eq!(server.restore(&saved), Ok(()));
+    let mut kernel = super::FakeKernel::new(0).unwrap();
+    let sessions: Vec<ObjectId> = server.sessions.keys().copied().collect();
+    for session in sessions {
+        let _ = server.submit(session);
+        let mut buffer = super::built(&request(toy::OPEN_CHILD).data(&[1, 0, 0, 0]));
+        let _ = server.handle(&mut kernel, session, &mut buffer);
+        let mut buffer = super::built(&RequestBuilder::close());
+        let _ = server.handle(&mut kernel, session, &mut buffer);
+    }
+    let tokens: Vec<TokenId> = server.pending().map(|(token, _)| token).collect();
+    for token in tokens {
+        if let Some(token) = server.reissue(token) {
+            token.fail(ResultCode::SUCCESS);
+        }
+    }
+    while let Some(completed) = server.take_completed() {
+        let mut buffer = vec![0; starquake_ipc::BUFFER_SIZE];
+        let _ = server.deliver(&mut kernel, completed, &mut buffer);
+    }
+    while server.start_next().is_some() {}
+    Ok(())
+}
+
+fn config() -> ProptestConfig {
+    ProptestConfig {
+        cases: 1024,
+        failure_persistence: None,
+        rng_seed: RngSeed::Fixed(0x5351_534E_4150_5331),
+        rng_algorithm: RngAlgorithm::ChaCha,
+        ..Config::default()
+    }
+}
+
+proptest! {
+    #![proptest_config(config())]
+
+    /// A snapshot with one byte changed, or cut short, is refused or is a consistent state;
+    /// either way nothing panics and nothing is half restored.
+    #[test]
+    fn a_damaged_snapshot_is_refused_or_usable(at: Index, byte: u8, cut: Index) {
+        let mut damaged = GOLDEN.to_vec();
+        let at = at.index(damaged.len());
+        damaged[at] = byte;
+        restore_and_use(&damaged)?;
+        restore_and_use(&GOLDEN[..cut.index(GOLDEN.len())])?;
+    }
+
+    /// The same for bytes that never were a snapshot, with and without a valid header.
+    #[test]
+    fn arbitrary_bytes_are_refused_or_usable(
+        body in proptest::collection::vec(any::<u8>(), 0..256),
+    ) {
+        restore_and_use(&body)?;
+        let mut headed = GOLDEN[..=SNAPSHOT_MAGIC.len()].to_vec();
+        headed.extend(&body);
+        restore_and_use(&headed)?;
+    }
+}
 
 /// A toy server holding one plain session with a deferred request.
 fn deferred_rig() -> (Rig, TokenId) {
@@ -365,6 +448,8 @@ fn a_session_is_restored_only_as_an_interface_the_server_lists() {
         })
     );
     assert!(restore_with(toy_interfaces()).is_ok());
+    // Listing a type twice changes nothing.
+    assert!(restore_with(toy_interfaces().with::<Toy>().with::<super::Child>()).is_ok());
     // Both children listed: the saved one could be either, so it is neither.
     let both = toy_interfaces().with::<impostor::Child>();
     assert_eq!(
