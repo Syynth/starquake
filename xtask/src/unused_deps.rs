@@ -19,10 +19,12 @@
 //! `cargo machete` 0.9.2 analyses only a package's top-level `[dependencies]` table (its source
 //! has a `TODO extend to dev dependencies + build dependencies`). Checked by running it: an
 //! unused dependency in `[dev-dependencies]`, in `[build-dependencies]` or in a
-//! `[target.'cfg(..)'.dependencies]` table is not reported, so the gate does not catch it. The
-//! workspace check does not catch it either, because such a member still inherits the entry
-//! (`name.workspace = true`), and this module counts an inheritance from any of those tables as
-//! a use. Unused dependencies in those tables are therefore *not* checked.
+//! `[target.'cfg(..)'.dependencies]` table is not reported. The `table-deps` step
+//! ([`crate::table_deps`]) covers those tables with its own textual search, and its findings use
+//! the same allow-list under `[[allow_tables]]` ([`TABLES_SCOPE`]). The workspace check still
+//! counts an inheritance from any of those tables as a use of the root entry, which is correct
+//! for it: it asks whether the root entry is used by someone, and the `table-deps` step asks
+//! whether that someone uses it.
 //!
 //! # No silent ignores
 //!
@@ -47,6 +49,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+
+use crate::walk;
 
 /// The allow-list, compiled in so that a checkout's `xtask` binary always carries its own copy.
 pub const ALLOWLIST: &str = include_str!("../unused-deps.toml");
@@ -117,6 +121,15 @@ pub enum Error {
     },
 }
 
+impl From<crate::walk::Unreadable> for Error {
+    fn from(unreadable: crate::walk::Unreadable) -> Self {
+        Self::Io {
+            path: unreadable.path,
+            source: unreadable.source,
+        }
+    }
+}
+
 /// Parses the report `cargo machete` prints when it exits with status 1.
 ///
 /// The report is a header sentence, then for each package a line `name -- ./path/Cargo.toml:`
@@ -169,6 +182,17 @@ pub fn machete_findings(code: Option<i32>, stdout: &str) -> Result<Vec<Unused>, 
 /// rather than one crate. It cannot clash with a package name.
 pub const WORKSPACE_SCOPE: &str = "[workspace.dependencies]";
 
+/// The prefix of the `package` of an allow-list pair about a crate's dev, build or target-specific
+/// dependency tables (`[[allow_tables]]`) rather than its top-level `[dependencies]` (`[[allow]]`).
+/// It cannot clash with a package name, and keeps the two lists apart: `cargo machete` never
+/// reports the former, so its step must not call such an entry stale.
+pub const TABLES_SCOPE: &str = "[dev, build and target dependencies] ";
+
+/// The package an `[[allow_tables]]` or table-check pair carries for crate `package`.
+pub fn tables_package(package: &str) -> String {
+    format!("{TABLES_SCOPE}{package}")
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AllowFile {
@@ -176,6 +200,8 @@ struct AllowFile {
     allow: Vec<AllowEntry>,
     #[serde(default)]
     allow_workspace: Vec<WorkspaceEntry>,
+    #[serde(default)]
+    allow_tables: Vec<AllowEntry>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -210,8 +236,12 @@ impl Allowlist {
             dependencies: entry.dependencies,
             reason: entry.reason,
         });
+        let tables = file.allow_tables.into_iter().map(|entry| AllowEntry {
+            package: tables_package(&entry.package),
+            ..entry
+        });
         let mut entries: Vec<(Unused, String)> = Vec::new();
-        for entry in file.allow.into_iter().chain(workspace) {
+        for entry in file.allow.into_iter().chain(workspace).chain(tables) {
             if entry.reason.trim().is_empty() {
                 return Err(Error::AllowlistEntry(format!(
                     "{}: every entry needs a reason",
@@ -262,11 +292,24 @@ pub enum Scope {
     Crates,
     /// The root `[workspace.dependencies]`.
     Workspace,
+    /// The dev, build and target-specific dependency tables of the crates.
+    Tables,
 }
 
 impl Scope {
+    /// The scope an allow-list pair belongs to, from its package.
+    fn of(unused: &Unused) -> Self {
+        if unused.package == WORKSPACE_SCOPE {
+            Self::Workspace
+        } else if unused.package.starts_with(TABLES_SCOPE) {
+            Self::Tables
+        } else {
+            Self::Crates
+        }
+    }
+
     fn covers(self, unused: &Unused) -> bool {
-        (unused.package == WORKSPACE_SCOPE) == (self == Self::Workspace)
+        Self::of(unused) == self
     }
 }
 
@@ -303,9 +346,10 @@ pub fn judge(found: &[Unused], allowlist: &Allowlist, scope: Scope) -> Verdict {
 }
 
 /// The dependency tables of a manifest or of one `[target.*]` table.
-const DEPENDENCY_TABLES: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
+pub(crate) const DEPENDENCY_TABLES: [&str; 3] =
+    ["dependencies", "dev-dependencies", "build-dependencies"];
 
-fn parse_manifest(path: &str, text: &str) -> Result<toml::Table, Error> {
+pub(crate) fn parse_manifest(path: &str, text: &str) -> Result<toml::Table, Error> {
     text.parse().map_err(|source| Error::Manifest {
         path: path.to_owned(),
         source,
@@ -438,13 +482,12 @@ pub fn member_manifests(root_dir: &Path, root: &str) -> Result<Vec<PathBuf>, Err
             && !has_glob(parent)
         {
             let folder = root_dir.join(parent);
-            let io = |source| Error::Io {
-                path: folder.display().to_string(),
-                source,
-            };
             let mut found = Vec::new();
-            for entry in fs::read_dir(&folder).map_err(io)? {
-                let manifest = entry.map_err(io)?.path().join("Cargo.toml");
+            for entry in fs::read_dir(&folder).map_err(walk::unreadable(&folder))? {
+                let manifest = entry
+                    .map_err(walk::unreadable(&folder))?
+                    .path()
+                    .join("Cargo.toml");
                 if manifest.is_file() {
                     found.push(manifest);
                 }
@@ -470,12 +513,7 @@ pub fn member_manifests(root_dir: &Path, root: &str) -> Result<Vec<PathBuf>, Err
 
 /// Runs the workspace-dependency check against the checkout at `root_dir`.
 pub fn check_workspace_dependencies(root_dir: &Path) -> Result<Vec<Unused>, Error> {
-    let read = |path: &Path| {
-        fs::read_to_string(path).map_err(|source| Error::Io {
-            path: path.display().to_string(),
-            source,
-        })
-    };
+    let read = |path: &Path| walk::read_text(path).map_err(Error::from);
     let root = read(&root_dir.join("Cargo.toml"))?;
     let members = member_manifests(root_dir, &root)?
         .into_iter()

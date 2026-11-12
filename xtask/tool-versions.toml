@@ -1,0 +1,17 @@
+# The versions of the cargo plugins the gate runs. A plugin release can change what a check accepts
+# (`cargo-deny` has changed its configuration schema and advisory handling between minors,
+# `cargo-machete` its report format), so an unpinned install can turn `main` red with no code
+# change. This file is the one place the versions are written down:
+#
+#   - `.github/workflows/ci.yml` installs exactly these (`tool: cargo-deny@<version>`); a test in
+#     xtask/src/tools.rs fails when a workflow or CLAUDE.md names a different version;
+#   - `cargo xtask ci` compares the installed plugin with them: under CI a different version
+#     fails the gate, locally it prints a notice and carries on.
+#
+# To move a pin, change it here and in the workflow in one commit, install the new version
+# (`cargo install <tool>@<version> --locked`), and run the gate.
+
+[tools]
+cargo-nextest = "0.9.140"
+cargo-deny = "0.19.8"
+cargo-machete = "0.9.2"
