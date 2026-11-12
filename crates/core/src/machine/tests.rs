@@ -1012,9 +1012,13 @@ fn a_fault_the_address_space_refuses_after_one_it_backed_is_still_a_crash() {
 #[test]
 fn a_page_that_cannot_be_backed_is_an_emulator_error_not_a_crash() {
     let out_of_ram = SpaceError::OutOfRam {
-        size: 0x1000,
+        size: starquake_memory::PAGE_SIZE,
         available: 0,
     };
+    assert_eq!(
+        out_of_ram.to_string(),
+        "mapping 0x1000 bytes needs more guest RAM than the 0x0 bytes left"
+    );
     for fetch in [false, true] {
         let guest = Guest::new(&programs::hello().unwrap());
         let address = guest.start_of("stack") + 0x2000;
@@ -1042,8 +1046,7 @@ fn a_page_that_cannot_be_backed_is_an_emulator_error_not_a_crash() {
         assert_eq!(
             report.exit,
             ExitReason::EmulatorError(format!(
-                "guest memory at {address:#x} could not be backed: mapping 0x1000 bytes needs \
-                 more guest RAM than the 0x0 bytes left"
+                "guest memory at {address:#x} could not be backed: {out_of_ram}"
             )),
             "fetch: {fetch}"
         );
@@ -1057,17 +1060,18 @@ fn the_address_space_is_settled_after_every_system_call_before_the_guest_runs_ag
     let guest = Guest::new(&programs::hello().unwrap());
     let space = ScriptedSpace::new(&guest.memory, Vec::new());
     let settled = Arc::clone(&space.settled);
-    // Each closure is the guest running again: by then the call before it has been settled,
-    // whatever it returned (a result, "not implemented", an error result).
+    // Each closure is the guest running: before its first instruction the address space has
+    // been settled once (loading reprotected the segments), and by each later one the call
+    // before it has been, whatever it returned (a result, "not implemented", an error result).
     let expect = move |calls: usize| {
         let settled = Arc::clone(&settled);
         move |_: &mut GuestRegs| assert_eq!(settled.load(Ordering::SeqCst), calls)
     };
     let mut vcpu = ScriptedVcpu::new()
-        .then(expect(0), svc(SvcId::GetSystemTick))
-        .then(expect(1), svc(SvcId::Break))
-        .then(expect(2), svc(SvcId::CloseHandle))
-        .then(expect(3), svc(SvcId::ExitProcess));
+        .then(expect(1), svc(SvcId::GetSystemTick))
+        .then(expect(2), svc(SvcId::Break))
+        .then(expect(3), svc(SvcId::CloseHandle))
+        .then(expect(4), svc(SvcId::ExitProcess));
     let report = run(
         &mut vcpu,
         guest.program(&space),
@@ -1076,7 +1080,7 @@ fn the_address_space_is_settled_after_every_system_call_before_the_guest_runs_ag
         timebase(),
     );
     assert_eq!(report.exit, ExitReason::ProcessExited);
-    assert_eq!(space.settled.load(Ordering::SeqCst), 4);
+    assert_eq!(space.settled.load(Ordering::SeqCst), 5);
     // A fault settles nothing: only a system call changes mappings.
     assert_eq!(space.touched(), []);
 }
@@ -1085,7 +1089,8 @@ fn the_address_space_is_settled_after_every_system_call_before_the_guest_runs_ag
 fn a_settle_that_fails_ends_the_run_as_an_emulator_error() {
     let guest = Guest::new(&programs::hello().unwrap());
     let mut space = ScriptedSpace::new(&guest.memory, Vec::new());
-    space.failing_settle = Some(1);
+    // The settle after the second call (the third in all: one comes before the guest starts).
+    space.failing_settle = Some(2);
     let reached = Rc::new(Cell::new(0));
     let count = |reached: &Rc<Cell<u32>>| {
         let reached = Rc::clone(reached);

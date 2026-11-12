@@ -84,7 +84,7 @@ impl RecordingMapper {
     fn record(&self, call: MapperCall) -> Result<(), MapperError> {
         self.0.with(|state| {
             if state.refuse {
-                return Err(MapperError(format!("refused {call:?}")));
+                return Err(MapperError("the test told the mapper to refuse".into()));
             }
             state.calls.push(call);
             Ok(())

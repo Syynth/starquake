@@ -10,16 +10,21 @@ the file is what the next slices have to match.
 
 | | |
 |---|---|
-| Emulator | Eden-NX2 (`Takoroka/eden-nx2`, branch `eden-nx2`) at commit `50fa86bbbc40`: the source `docs/references.md` pins as `eden-nx2` |
-| Build | Its `eden-cli`, built on macOS (Apple Silicon) from that commit with one local patch, which moves a window-title update to the main thread (`src/yuzu_cmd/emu_window/emu_window_sdl3.cpp`) and touches nothing the guest can see |
-| Run | `eden-cli -n -s -g hello.nro` (null renderer, single core), with the emulator's own trace switches `EDEN_NX2_SVC_TRACE=1` and `EDEN_NX2_IPC_TRACE=1`, default settings otherwise (a 4 GiB console) |
+| Emulator | Eden-NX2 at commit `50fa86bbbc40` (`eden-nx2` in `docs/references.md`), built and run as `docs/reference-emulator.md` says, with the one patch it names (`tools/oracle/eden-nx2-oracle.patch`: a window-title fix, nothing the guest can see) |
+| Run | `tools/oracle/run-nro.sh` (null renderer, one core, the emulator's own system-call and IPC trace switches, default settings otherwise: a 4 GiB console), then `tools/oracle/summarize.py`, whose `startup.txt` is what `normalise.py` reads |
 | Program | `../hello.nro`, SHA-256 `d21c81c6e795ab9981e0757bf2b4b23184e974c30ded266e3098a468e7fb20df` (the hash `../manifest.toml` records) |
 | Recorded | 2026-11-11, three runs |
 
-The raw traces are not in the repository: they hold the emulator's randomised addresses and
-its timestamps, and nothing else that is not here. The three runs differ in exactly those and
-normalise to the same text, byte for byte, which is the check that the normalisation masks
-everything that varies and nothing else.
+The raw run folders are not in the repository (`docs/reference-emulator.md`, "What may be
+committed"): they hold the emulator's randomised addresses and its timestamps, and nothing
+else that is not here. The three runs differ in exactly those and normalise to the same text,
+byte for byte, which is the check that the normalisation masks everything that varies and
+nothing else.
+
+What the reference is trusted for, and where it is known to be wrong, is in
+`docs/reference-emulator.md`. Two of its notes concern this file: the two `SendSyncRequest`
+lines with result `0xf601` are its answer to a session's close request, which is unverified;
+and its `ExitProcess` returned to the guest, which this format does not show.
 
 ## Format
 
@@ -51,10 +56,10 @@ log starquake hello: line one
 
 ## Regenerating
 
-With a raw `startup.txt` from a run of the same emulator (its `svc`, `ipc` and guest-log lines):
+With the `startup.txt` of a run (`docs/reference-emulator.md`, "Running it"):
 
 ```sh
-tests/homebrew/hello/reference/normalise.py <raw startup.txt> > normalised.txt
+tests/homebrew/hello/reference/normalise.py <run-folder>/startup.txt > normalised.txt
 ```
 
 and put the file's five header lines back in front. The script refuses a trace it does not

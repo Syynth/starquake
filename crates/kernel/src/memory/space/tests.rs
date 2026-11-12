@@ -1009,20 +1009,20 @@ fn a_refusing_translation_fails_the_call_and_changes_nothing() {
     // Growing: the reservation is given back.
     internal(
         space.set_heap_size(4 * PAGE_SIZE).map(|_| ()),
-        "the translation refused to Map 0x2000 bytes at",
+        "the translation refused to map 0x2000 bytes at",
     );
     // Shrinking, reprotecting data and code, and mapping a page.
     internal(
         space.set_heap_size(0).map(|_| ()),
-        "the translation refused to Unmap 0x2000 bytes at",
+        "the translation refused to unmap 0x2000 bytes at",
     );
     internal(
         space.set_memory_permission(heap, PAGE_SIZE, SvcPermission::Read),
-        "the translation refused to Protect 0x1000 bytes at",
+        "the translation refused to reprotect 0x1000 bytes at",
     );
     internal(
         space.set_process_memory_permission(CODE, PAGE_SIZE, SvcPermission::Read),
-        "the translation refused to Protect 0x1000 bytes at",
+        "the translation refused to reprotect 0x1000 bytes at",
     );
     internal(
         space
@@ -1032,7 +1032,7 @@ fn a_refusing_translation_fails_the_call_and_changes_nothing() {
                 MemoryPermission::USER_READ_WRITE,
             )
             .map(|_| ()),
-        "the translation refused to Map 0x1000 bytes at",
+        "the translation refused to map 0x1000 bytes at",
     );
     assert_eq!(snapshot(&space), before);
     assert_eq!(log.take(), []);
@@ -1050,7 +1050,7 @@ fn a_refusing_translation_fails_the_call_and_changes_nothing() {
     fresh_log.refuse(true);
     internal(
         fresh.create_main_thread_stack(STACK_SIZE).map(|_| ()),
-        "the translation refused to Map 0x100000 bytes at",
+        "the translation refused to map 0x100000 bytes at",
     );
     assert_eq!(fresh.limit().reserved(), CODE_SIZE);
     // Once the translation works again, so does the call.

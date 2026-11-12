@@ -27,7 +27,9 @@
 //! Deriving offsets from a seed belongs to process creation (kernel slice 8).
 //!
 //! Divergence from Eden: a layout that does not fit, and offsets that are not multiples of the
-//! alignment or exceed the slack, are errors here. Eden returns `ResultOutOfMemory` for the
+//! alignment or exceed the slack, are errors here
+//! (`a_layout_that_does_not_fit_beside_the_code_is_refused_exactly_at_the_limit`,
+//! `the_slack_is_exact_one_region_alignment_decides`). Eden returns `ResultOutOfMemory` for the
 //! first and cannot produce the others (it draws the offsets itself), and it asserts, rather
 //! than checks, that the regions lie inside the address space.
 

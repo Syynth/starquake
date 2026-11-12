@@ -110,8 +110,9 @@ pub(crate) trait GuestSpace<V>: GuestMemory {
     fn touch(&self, address: u64, access: Access) -> Touch;
 
     /// Runs on `vcpu` whatever the address space owes its vCPUs since the last call: the TLB
-    /// invalidations for what was unmapped or reprotected. The loop calls it after every
-    /// system call, before the guest runs again, whatever the call returned.
+    /// invalidations for what was unmapped or reprotected. The loop calls it before the guest
+    /// first runs and after every system call, before the guest runs again, whatever the call
+    /// returned.
     fn settle(&self, vcpu: &mut V) -> Result<(), starquake_cpu::Error>;
 }
 
@@ -478,6 +479,28 @@ fn settle_dump(
     }
 }
 
+/// Readies `vcpu` to run the main thread from its first instruction: its registers as "Start
+/// state" in the module docs says (`x0` zero, `x1` the main thread's handle, everything else
+/// zero but the program counter, the stack pointer and `TPIDRRO_EL0`), and the address space
+/// settled, because loading reprotected the program's segments and the guest must not start
+/// with a flush owed.
+fn start<V: Vcpu>(
+    vcpu: &mut V,
+    space: &dyn GuestSpace<V>,
+    placed: &Placement,
+    main_thread: Handle,
+) -> Result<(), starquake_cpu::Error> {
+    let mut regs = GuestRegs {
+        pc: placed.entry,
+        sp: placed.stack_top,
+        tpidrro: placed.tls,
+        ..GuestRegs::default()
+    };
+    regs.x[1] = u64::from(main_thread.raw());
+    vcpu.set_regs(&regs)?;
+    space.settle(vcpu)
+}
+
 /// The process the loop runs, as far as its memory goes: the guest's address space, and the
 /// kernel's bookkeeping of it, which the loop hands to the kernel's tables.
 struct Process<'a, V> {
@@ -510,16 +533,7 @@ fn drive<V: Vcpu, C: HostClock + Clone + 'static>(
         Err(error) => return Ending::Failed(format!("the kernel could not be set up: {error}")),
     };
 
-    // PROVISIONAL: see "Start state" in the module docs. `x0` is zero and `x1` the main
-    // thread's handle; everything else starts at zero.
-    let mut start = GuestRegs {
-        pc: session.placed.entry,
-        sp: session.placed.stack_top,
-        tpidrro: session.placed.tls,
-        ..GuestRegs::default()
-    };
-    start.x[1] = u64::from(main_thread.raw());
-    if let Err(error) = vcpu.set_regs(&start) {
+    if let Err(error) = start(vcpu, space, session.placed, main_thread) {
         return vcpu_failed(error);
     }
     let watchdog = match Watchdog::arm(session.options.timeout, vcpu.interrupter()) {

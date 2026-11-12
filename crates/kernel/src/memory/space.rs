@@ -158,6 +158,17 @@ enum Effect {
     Protect,
 }
 
+impl Effect {
+    /// The effect as a verb, for an error message.
+    const fn verb(self) -> &'static str {
+        match self {
+            Self::Map => "map",
+            Self::Unmap => "unmap",
+            Self::Protect => "reprotect",
+        }
+    }
+}
+
 /// One process's memory blocks, regions, heap and memory accounting (kernel spec, "Tables
 /// behind a dispatcher": the `AddressSpace` table).
 pub struct AddressSpace {
@@ -444,7 +455,8 @@ impl AddressSpace {
         });
         let refused = |error: MapperError| {
             SvcError::Internal(format!(
-                "the translation refused to {effect:?} {size:#x} bytes at {address:#x}: {error}"
+                "the translation refused to {} {size:#x} bytes at {address:#x}: {error}",
+                effect.verb()
             ))
         };
         match effect {

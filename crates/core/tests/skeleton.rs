@@ -1116,14 +1116,13 @@ fn memory_a_program_never_touches_needs_no_guest_ram() {
     let ExitReason::EmulatorError(message) = &report.exit else {
         unreachable!("{:?}", report.exit);
     };
+    let out_of_ram = starquake_core::SpaceError::OutOfRam {
+        size: PAGE_SIZE,
+        available: 0,
+    };
     let address = message
         .strip_prefix("guest memory at 0x")
-        .and_then(|rest| {
-            rest.strip_suffix(
-                " could not be backed: mapping 0x1000 bytes needs more guest RAM than the 0x0 \
-                 bytes left",
-            )
-        })
+        .and_then(|rest| rest.strip_suffix(&format!(" could not be backed: {out_of_ram}")))
         .and_then(|digits| u64::from_str_radix(digits, 16).ok())
         .unwrap_or_else(|| unreachable!("{message}"));
     let bss = report

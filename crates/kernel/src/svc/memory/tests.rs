@@ -156,9 +156,18 @@ fn address_and_size_are_checked_in_horizons_order() {
             PAGE_SIZE + 1,
             KernelError::InvalidAddress,
         ),
-        // `R_UNLESS(Common::IsAligned(size, PageSize), ResultInvalidSize)`.
+        // `R_UNLESS(Common::IsAligned(size, PageSize), ResultInvalidSize)`, also when the
+        // range wraps or starts above the address space as well.
         (DATA, PAGE_SIZE + 1, KernelError::InvalidSize),
         (DATA, PAGE_SIZE - 1, KernelError::InvalidSize),
+        (
+            u64::MAX - PAGE_SIZE + 1,
+            PAGE_SIZE + 1,
+            KernelError::InvalidSize,
+        ),
+        (end, PAGE_SIZE + 1, KernelError::InvalidSize),
+        // `R_UNLESS(size > 0, ResultInvalidSize)`, also above the address space.
+        (end, 0, KernelError::InvalidSize),
         // `R_UNLESS(size > 0, ResultInvalidSize)`.
         (DATA, 0, KernelError::InvalidSize),
         // `R_UNLESS((address < address + size), ResultInvalidCurrentMemory)`: the sum wraps,
@@ -264,11 +273,16 @@ fn any_other_permission_is_an_invalid_new_memory_permission() {
             "{raw:#x}"
         );
     }
-    // The permission is checked before the range is looked up: free memory, same result.
-    assert_eq!(
-        set_memory_permission(&mut space, CODE - PAGE_SIZE, PAGE_SIZE, PERM_READ_EXECUTE),
-        kernel(KernelError::InvalidNewMemoryPermission)
-    );
+    // The permission is checked before the range is looked at: free memory, and a range
+    // above the address space, give the same result.
+    let end = space.regions().address_space.end;
+    for address in [CODE - PAGE_SIZE, end] {
+        assert_eq!(
+            set_memory_permission(&mut space, address, PAGE_SIZE, PERM_READ_EXECUTE),
+            kernel(KernelError::InvalidNewMemoryPermission),
+            "{address:#x}"
+        );
+    }
     // And after the address, the size and the wrap.
     assert_eq!(
         set_memory_permission(&mut space, DATA + 1, PAGE_SIZE, PERM_READ_EXECUTE),
@@ -357,11 +371,15 @@ fn a_mask_and_attribute_that_do_not_go_together_are_an_invalid_combination() {
             kernel(KernelError::InvalidCombination),
             "mask {mask:#x} attribute {attribute:#x}"
         );
-        // The combination is checked before the range is looked up, and after the address.
-        assert_eq!(
-            set_memory_attribute(&mut space, CODE - PAGE_SIZE, PAGE_SIZE, mask, attribute),
-            kernel(KernelError::InvalidCombination)
-        );
+        // The combination is checked before the range is looked at (free memory, and a
+        // range above the address space), and after the address.
+        for address in [CODE - PAGE_SIZE, space.regions().address_space.end] {
+            assert_eq!(
+                set_memory_attribute(&mut space, address, PAGE_SIZE, mask, attribute),
+                kernel(KernelError::InvalidCombination),
+                "{address:#x}"
+            );
+        }
         assert_eq!(
             set_memory_attribute(&mut space, DATA + 1, PAGE_SIZE, mask, attribute),
             kernel(KernelError::InvalidAddress)
