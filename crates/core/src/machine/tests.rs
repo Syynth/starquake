@@ -365,6 +365,7 @@ fn a_data_abort_is_a_crash_that_names_the_address_and_the_instruction() {
     let options = RunOptions {
         timeout: None,
         command_line: vec!["starquake".into(), "run".into(), "crash.nro".into()],
+        sd_card: None,
     };
     let report = guest.run(vcpu, &options);
 
@@ -543,6 +544,7 @@ fn a_guest_that_never_stops_is_ended_by_the_timeout() {
     let options = RunOptions {
         timeout: Some(timeout),
         command_line: Vec::new(),
+        sd_card: None,
     };
     let report = guest.run(ScriptedVcpu::new().then_spin(), &options);
     assert_eq!(report.exit, ExitReason::Timeout);
@@ -557,6 +559,7 @@ fn a_run_that_ends_before_its_timeout_does_not_wait_for_it() {
     let options = RunOptions {
         timeout: Some(Duration::from_secs(3600)),
         command_line: Vec::new(),
+        sd_card: None,
     };
     let vcpu = ScriptedVcpu::new().then(|_| {}, svc(SvcId::ExitProcess));
     let started = Instant::now();

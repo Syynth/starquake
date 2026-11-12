@@ -91,7 +91,7 @@ mod trace {
     use std::collections::BTreeMap;
     use std::fmt::Write as _;
 
-    use starquake_core::hle::{SET_SYS, SM, service_name};
+    use starquake_core::hle::{FSP_SRV, SET_SYS, SM, service_name};
     use starquake_kernel::handle::Handle;
     use starquake_kernel::memory::MemoryArrangement;
     use starquake_kernel::memory::layout::{LayoutRequest, Region, RegionOffsets, Regions};
@@ -100,6 +100,7 @@ mod trace {
     use starquake_memory::PAGE_SIZE;
     use starquake_services::framework::control::{CONTROL_COMMANDS, CONTROL_INTERFACE};
     use starquake_services::framework::{Protocol, Session};
+    use starquake_services::fsp::FspSrv;
     use starquake_services::set::SetSys;
     use starquake_services::sm::Sm;
     use starquake_trace::{EventKind, SVC_ARG_COUNT, ServiceId};
@@ -488,13 +489,14 @@ mod trace {
     }
 
     /// The services whose command tables starquake has, in the order of their numbers.
-    const SERVICES: [ServiceId; 2] = [SM, SET_SYS];
+    const SERVICES: [ServiceId; 3] = [SM, SET_SYS, FSP_SRV];
 
     /// The interface whose command table names a service's commands.
     fn interface(service: ServiceId) -> Option<Box<dyn Session>> {
         match service {
             SM => Some(Box::new(Sm::default())),
             SET_SYS => Some(Box::new(SetSys)),
+            FSP_SRV => Some(Box::new(FspSrv)),
             _ => None,
         }
     }

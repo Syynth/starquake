@@ -67,9 +67,10 @@ pub mod layout {
 }
 
 /// A file system the host provides.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Mount {
     /// The SD card (`OpenSdCardFileSystem`).
+    #[default]
     SdCard,
 }
 

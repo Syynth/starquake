@@ -265,8 +265,8 @@ impl FspSrv {
     }
 }
 
-/// A file system (`IFileSystem`): a host folder, read-only.
-#[derive(Debug, Serialize, Deserialize)]
+/// A file system (`IFileSystem`): a host folder, read-only. The default is the SD card.
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct IFileSystem {
     mount: Mount,
 }
@@ -326,8 +326,9 @@ impl IFileSystem {
     }
 }
 
-/// An open file (`IFile`), read-only.
-#[derive(Debug, Serialize, Deserialize)]
+/// An open file (`IFile`), read-only. The default has an empty path, which names no file: it is
+/// for looking at the command table without opening a file.
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct IFile {
     mount: Mount,
     /// The normalised path.
