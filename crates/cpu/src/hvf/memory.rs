@@ -14,6 +14,12 @@
 //!   descriptor as exactly one such word and zeroes a table as 512 of them
 //!   (`starquake_memory::stage1`, module docs). Anything else is copied byte-wise; nothing in
 //!   the workspace writes the pool that way.
+//!
+//! [`path`] decides between the two for every access, as a pure function of the kind of memory
+//! and whether the access is whole words. Its test
+//! (`the_path_of_an_access_is_fixed_for_every_kind_and_shape`) is what pins the atomic path: on
+//! this host a byte-wise copy of one aligned word is most likely a single store as well, so no
+//! test on a real vCPU can tell the two apart.
 
 use std::alloc::Layout;
 use std::ptr::NonNull;
@@ -46,6 +52,30 @@ pub(super) enum Kind {
     Tables,
     /// The backend's own pages, written once before the VM exists.
     System,
+}
+
+/// How an access to a region's bytes is carried out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Path {
+    /// One atomic load or store per eight-byte word.
+    AtomicWords,
+    /// A byte-wise copy. A write is followed by instruction-cache maintenance on the written
+    /// range when `sync_icache` is set; a read never needs any.
+    Bytes {
+        /// Whether a write must be followed by instruction-cache maintenance.
+        sync_icache: bool,
+    },
+}
+
+/// The path an access to memory of `kind` takes, given whether it is a whole number of aligned
+/// words ([`is_whole_words`]). See the module docs for the two rules this encodes.
+pub(super) const fn path(kind: Kind, whole_words: bool) -> Path {
+    match (kind, whole_words) {
+        (Kind::Tables, true) => Path::AtomicWords,
+        // Tables are never executed, so they need no instruction-cache maintenance.
+        (Kind::Tables, false) => Path::Bytes { sync_icache: false },
+        (Kind::Ram | Kind::System, _) => Path::Bytes { sync_icache: true },
+    }
 }
 
 /// Host memory with the alignment HVF needs, zeroed, freed on drop.
@@ -100,47 +130,58 @@ impl HostRegion {
 
     pub(super) fn read(&self, offset: u64, buf: &mut [u8]) -> Option<()> {
         let start = self.range(offset, buf.len())?;
-        if self.kind == Kind::Tables && is_whole_words(start, buf.len()) {
-            let (words, _) = buf.as_chunks_mut::<WORD>();
-            for (index, word) in words.iter_mut().enumerate() {
-                *word = self
-                    .word(start + index * WORD)
-                    .load(Ordering::Acquire)
-                    .to_ne_bytes();
+        match path(self.kind, is_whole_words(start, buf.len())) {
+            Path::AtomicWords => {
+                let (words, _) = buf.as_chunks_mut::<WORD>();
+                for (index, word) in words.iter_mut().enumerate() {
+                    *word = self
+                        .word(start + index * WORD)
+                        .load(Ordering::Acquire)
+                        .to_ne_bytes();
+                }
             }
-            return Some(());
-        }
-        // SAFETY: `start..start + buf.len()` is inside the allocation (checked by `range`), and
-        // `buf` is a separate Rust allocation, so the two don't overlap.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                self.ptr.as_ptr().add(start),
-                buf.as_mut_ptr(),
-                buf.len(),
-            );
+            Path::Bytes { .. } => {
+                // SAFETY: `start..start + buf.len()` is inside the allocation (checked by
+                // `range`), and `buf` is a separate Rust allocation, so the two don't overlap.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        self.ptr.as_ptr().add(start),
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                    );
+                }
+            }
         }
         Some(())
     }
 
     pub(super) fn write(&self, offset: u64, data: &[u8]) -> Option<()> {
         let start = self.range(offset, data.len())?;
-        if self.kind == Kind::Tables && is_whole_words(start, data.len()) {
-            let (words, _) = data.as_chunks::<WORD>();
-            for (index, word) in words.iter().enumerate() {
-                self.word(start + index * WORD)
-                    .store(u64::from_ne_bytes(*word), Ordering::Release);
+        match path(self.kind, is_whole_words(start, data.len())) {
+            Path::AtomicWords => {
+                let (words, _) = data.as_chunks::<WORD>();
+                for (index, word) in words.iter().enumerate() {
+                    self.word(start + index * WORD)
+                        .store(u64::from_ne_bytes(*word), Ordering::Release);
+                }
             }
-            return Some(());
-        }
-        // SAFETY: as in `read`, with the copy going the other way. The region is only ever
-        // accessed through raw pointers, so writing through `&self` aliases no Rust reference.
-        unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), self.ptr.as_ptr().add(start), data.len());
-        }
-        if self.kind != Kind::Tables {
-            // The guest may execute what was just written, and Hypervisor.framework does not
-            // keep its instruction fetches coherent with host stores.
-            self.sync_icache(start, data.len());
+            Path::Bytes { sync_icache } => {
+                // SAFETY: as in `read`, with the copy going the other way. The region is only
+                // ever accessed through raw pointers, so writing through `&self` aliases no Rust
+                // reference.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        data.as_ptr(),
+                        self.ptr.as_ptr().add(start),
+                        data.len(),
+                    );
+                }
+                if sync_icache {
+                    // The guest may execute what was just written, and Hypervisor.framework
+                    // does not keep its instruction fetches coherent with host stores.
+                    self.sync_icache(start, data.len());
+                }
+            }
         }
         Some(())
     }
@@ -276,6 +317,32 @@ mod tests {
         // One byte off in either the address or the length is not.
         for (start, len) in [(1, WORD), (WORD - 1, WORD), (0, WORD - 1), (0, WORD + 1)] {
             assert!(!is_whole_words(start, len), "{start} {len}");
+        }
+    }
+
+    #[test]
+    fn the_path_of_an_access_is_fixed_for_every_kind_and_shape() {
+        // Every kind of memory, whole words and not: only whole words of a table are atomic,
+        // and only a table is left without instruction-cache maintenance.
+        let cases = [
+            (Kind::Ram, true, Path::Bytes { sync_icache: true }),
+            (Kind::Ram, false, Path::Bytes { sync_icache: true }),
+            (Kind::Tables, true, Path::AtomicWords),
+            (Kind::Tables, false, Path::Bytes { sync_icache: false }),
+            (Kind::System, true, Path::Bytes { sync_icache: true }),
+            (Kind::System, false, Path::Bytes { sync_icache: true }),
+        ];
+        for (kind, whole_words, expected) in cases {
+            assert_eq!(path(kind, whole_words), expected, "{kind:?} {whole_words}");
+        }
+        // What `Stage1Tables` does to the pool takes the atomic path: one descriptor, and a
+        // whole table zeroed.
+        for (start, len) in [(0x3ff8, WORD), (0x3000, 0x1000)] {
+            assert_eq!(
+                path(Kind::Tables, is_whole_words(start, len)),
+                Path::AtomicWords,
+                "{start:#x} {len:#x}"
+            );
         }
     }
 

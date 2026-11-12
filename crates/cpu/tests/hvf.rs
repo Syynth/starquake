@@ -1088,10 +1088,39 @@ fn a_flush_on_one_vcpu_stops_another_that_never_leaves_the_guest() {
 }
 
 #[test]
+fn an_access_that_runs_past_the_end_of_ram_or_the_table_pool_faults_at_that_end() {
+    let Some(guest) = Guest::new() else { return };
+    let physical = guest.backend.physical();
+    for range in [guest.backend.ram(), guest.backend.table_pool()] {
+        let end = range.end();
+        let fault = Err(Fault { address: end });
+        // The last eight bytes fit exactly.
+        let mut last = [0; 8];
+        assert_eq!(physical.read(end - 8, &mut last), Ok(()), "{range:?}");
+        // An access that starts inside and runs four bytes past the end faults at the first
+        // address outside, not where it starts, and writes nothing.
+        assert_eq!(physical.read(end - 4, &mut [0; 8]), fault, "{range:?}");
+        assert_eq!(physical.write(end - 4, &[0xa5; 8]), fault, "{range:?}");
+        let mut after = [0; 8];
+        physical.read(end - 8, &mut after).unwrap();
+        assert_eq!(after, last, "{range:?}");
+        // One byte at the end itself is outside too.
+        assert_eq!(physical.read(end, &mut [0; 1]), fault, "{range:?}");
+    }
+}
+
+#[test]
 fn a_running_vcpu_never_sees_half_a_descriptor() {
     // Guest RAM above 4 GiB puts output-address bits in the upper half of every page
     // descriptor, so a descriptor with only its lower half written would send the walker to
     // memory that does not exist, and the vCPU would stop with a host error.
+    //
+    // What this cannot detect is a descriptor stored non-atomically by the host: on this host a
+    // byte-wise copy of one aligned word is most likely a single store too. That descriptors
+    // take the atomic path is pinned by a unit test of the pure function that picks it
+    // (`the_path_of_an_access_is_fixed_for_every_kind_and_shape` in `hvf/memory.rs`). This test
+    // checks the rest: that unmapping and remapping under a running vCPU only ever produces
+    // translation faults at the page.
     let Some(guest) = Guest::new() else { return };
     assert!(guest.backend.ram().base() > u64::from(u32::MAX));
     let memory = guest.memory();
