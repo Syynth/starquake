@@ -81,7 +81,9 @@ pub fn get_process_id(
                 .thread(thread)?
                 .process()
                 .ok_or(KernelError::InvalidHandle)?,
-            Object::Session => return Err(KernelError::InvalidHandle.into()),
+            Object::Session | Object::Event(_) | Object::ReadableEvent(_) => {
+                return Err(KernelError::InvalidHandle.into());
+            }
         },
     };
     processes

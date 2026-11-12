@@ -14,6 +14,7 @@ Writes, under `crates/kernel/src/svc/`:
                                     and each output
     reference/svc_type_sizes.txt    the size Eden asserts for each type the wrappers use
     convention/table.rs             the `CONVENTIONS` rows, for the calls retail titles may make
+                                    and the implemented calls beyond them (`BEYOND_RETAIL`)
 
 Usage, from the repository root:
 
@@ -45,6 +46,10 @@ EDEN_COMMIT = "cf654052"
 RETAIL_FIRST = 0x01
 RETAIL_LAST = 0x36
 RETAIL_EXTRA = 0x80
+
+# Calls outside the retail range that the kernel implements, so they need a row too
+# (`BEYOND_RETAIL` in `svc/convention.rs`, which the tests keep equal to this list).
+BEYOND_RETAIL = ["CreateEvent"]
 
 WRAPPERS_HEADER = f"""\
 # 64-bit register convention of every system call, one line per call:
@@ -234,7 +239,8 @@ def render_table(calls, sizes):
         + "const fn arg(name: &'static str, reg: u8, kind: Kind) -> Arg {\n"
         + "    Arg { name, reg, kind }\n"
         + "}\n\n"
-        + "/// The register convention of every [`is_retail`](super::is_retail) call, in number order.\n"
+        + "/// The register convention of every [`is_retail`](super::is_retail) call and every call in\n"
+        + "/// [`BEYOND_RETAIL`](super::BEYOND_RETAIL), in number order.\n"
         + "pub static CONVENTIONS: &[(SvcId, Convention)] = &[\n"
         + "\n".join(rows)
         + "\n];\n"
@@ -276,8 +282,12 @@ def main():
     for name, _, _ in calls:
         if name not in numbers:
             fail(f"{name} has a wrapper but no number in {IDS.name}")
+    for name in BEYOND_RETAIL:
+        if name not in numbers or is_retail(numbers[name]):
+            fail(f"{name} in BEYOND_RETAIL must be a listed call outside the retail range")
     retail = sorted(
-        (call for call in calls if is_retail(numbers[call[0]])), key=lambda call: numbers[call[0]]
+        (call for call in calls if is_retail(numbers[call[0]]) or call[0] in BEYOND_RETAIL),
+        key=lambda call: numbers[call[0]],
     )
     table_text = rustfmt(render_table(retail, sizes))
 

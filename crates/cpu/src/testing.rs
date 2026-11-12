@@ -15,7 +15,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 use starquake_memory::stage1::TableRoot;
 
-use crate::{Error, Exit, GuestRegs, Interrupter, Vcpu};
+use crate::{Error, Exit, GUEST_PSTATE_MASK, GuestRegs, Interrupter, Vcpu};
 
 /// What the scripted guest does to its registers before an exit.
 type Guest = Box<dyn FnOnce(&mut GuestRegs)>;
@@ -120,6 +120,8 @@ impl Vcpu for ScriptedVcpu {
             None => Err(Error::Host("the scripted vCPU has no more exits".into())),
             Some(Step::Exit { guest, exit }) => {
                 guest(&mut self.regs);
+                // The guest cannot set bits outside its own, whatever the script writes.
+                self.regs.pstate &= GUEST_PSTATE_MASK;
                 Ok(exit)
             }
             Some(Step::Spin) => {
@@ -148,8 +150,12 @@ impl Vcpu for ScriptedVcpu {
         Ok(self.regs.clone())
     }
 
+    /// Keeps only the [`GUEST_PSTATE_MASK`] bits of `pstate`, as every backend does.
     fn set_regs(&mut self, regs: &GuestRegs) -> Result<(), Error> {
-        self.regs = regs.clone();
+        self.regs = GuestRegs {
+            pstate: regs.pstate & GUEST_PSTATE_MASK,
+            ..regs.clone()
+        };
         Ok(())
     }
 
@@ -194,6 +200,40 @@ mod tests {
         );
         assert_eq!(vcpu.regs().unwrap().pc, 0x1000);
         assert_eq!(vcpu.remaining(), 0);
+    }
+
+    #[test]
+    fn set_regs_keeps_the_whole_context_but_only_the_guests_pstate_bits() {
+        let mut vcpu = ScriptedVcpu::new();
+        let mut regs = GuestRegs {
+            pstate: u64::MAX,
+            fpcr: 0x0300_0000,
+            fpsr: 0x0800_0010,
+            ..GuestRegs::default()
+        };
+        for (n, v) in (1u128..).zip(regs.v.iter_mut()) {
+            *v = n << 64 | n;
+        }
+        vcpu.set_regs(&regs).unwrap();
+        let kept = vcpu.regs().unwrap();
+        assert_eq!(kept.pstate, GUEST_PSTATE_MASK);
+        assert_eq!(
+            kept,
+            GuestRegs {
+                pstate: GUEST_PSTATE_MASK,
+                ..regs.clone()
+            }
+        );
+        // Bits inside the mask are kept as they are, one at a time.
+        for bit in [crate::PSTATE_NZCV, crate::PSTATE_DIT, crate::PSTATE_SSBS] {
+            regs.pstate = bit;
+            vcpu.set_regs(&regs).unwrap();
+            assert_eq!(vcpu.regs().unwrap().pstate, bit);
+        }
+        // A scripted guest that sets every bit leaves only the guest's.
+        let mut vcpu = ScriptedVcpu::new().then(|regs| regs.pstate = u64::MAX, Exit::Svc(1));
+        assert_eq!(vcpu.run(), Ok(Exit::Svc(1)));
+        assert_eq!(vcpu.regs().unwrap().pstate, GUEST_PSTATE_MASK);
     }
 
     #[test]

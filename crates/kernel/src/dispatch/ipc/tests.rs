@@ -832,7 +832,6 @@ fn a_handler_reads_and_writes_only_what_the_guest_may() {
             cx.read_memory(u64::MAX - 1, &mut bytes),
             Err(KernelError::InvalidCurrentMemory)
         );
-        assert_eq!(cx.create_event(), Err(KernelError::NotImplemented));
         message.fill(0);
         Ok(Handled::Replied)
     }));

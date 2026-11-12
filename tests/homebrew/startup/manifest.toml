@@ -11,7 +11,7 @@ switch-tools = "1.13.1-1"
 build-id = "e0fd8841b39546d6cd9bb732572bcb3c847782e6"
 
 [sources]
-"startup.c" = "10b02ec49f36e724587edfc7e839865da281f46abe791c3d54a7b59aa8f4a329"
+"startup.c" = "36f92f42dbc988f7d4105d16bd73fac5281655f16f676cf41f3bb93194dd23ab"
 "Makefile" = "6a6aa10592034e97ad710522c6fcd63a8f5d1a26df78dec23dedbaadf2a63ac0"
 
 [binaries]

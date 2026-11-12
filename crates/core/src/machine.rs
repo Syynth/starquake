@@ -59,10 +59,11 @@
 //!   keeps its first events and the guest log its first lines, and both say when they stopped.
 //!   The observability spec's size cap per run, with its own flags, replaces the constants.
 //! - **A thread that waits ends the run.** A `SendSyncRequest` whose request waits behind
-//!   another or is deferred leaves the calling thread waiting ([`Outcome::Waiting`]). With one
-//!   thread and nothing to deliver a deferred reply to it, the run ends there as an emulator
-//!   error ([`WAITING`]). None of the services a run has yet ([`crate::hle`]) defers. Kernel
-//!   slice 10 runs other threads while one waits, and delivers deferred replies.
+//!   another or is deferred, or a `WaitSynchronization` that nothing has ended yet, leaves the
+//!   calling thread waiting ([`Outcome::Waiting`]). With one thread and nothing to deliver a
+//!   deferred reply or signal an object, the run ends there as an emulator error ([`WAITING`]).
+//!   None of the services a run has yet ([`crate::hle`]) defers. Kernel slice 10 runs other
+//!   threads while one waits, and delivers deferred replies.
 //! - **The environment** is live, with a fixed random seed and nothing recorded to disk; the
 //!   `--clock`, `--seed` and `--record` flags of the headless contract are not built. Its
 //!   recording, which grows by a clock reading per system call, is dropped as it is made (test:
@@ -76,7 +77,7 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use starquake_cpu::{Exit, GuestRegs, Interrupter, Vcpu};
+use starquake_cpu::{Exit, GuestRegs, Interrupter, Syndrome, Vcpu};
 use starquake_kernel::dispatch::{Caller, Dispatcher, Outcome, Record};
 use starquake_kernel::process::{self, Console, ProcessDescription};
 use starquake_kernel::sched::{CoreId, CoreSignals};
@@ -108,9 +109,9 @@ const FLIGHT_CAPACITY: usize = 4096;
 const LAST_EVENTS: usize = 32;
 /// Seed of the environment's random numbers (the `--seed` flag is not built).
 const RANDOM_SEED: u64 = 0;
-/// How a run ends when its one guest thread waits for an IPC reply (see the module docs).
-pub(crate) const WAITING: &str = "the guest thread waits for an IPC reply, and this loop has no \
-                                  other thread to run until it comes";
+/// How a run ends when its one guest thread waits (see the module docs).
+pub(crate) const WAITING: &str = "the guest thread waits for an IPC reply or on an object, and this \
+                                  loop has no other thread to run until the wait ends";
 /// How a run ends when its one guest thread exits and its process has other threads (see the
 /// module docs).
 pub(crate) const THREAD_EXITED: &str = "the guest thread exited, and this loop has no other \
@@ -332,10 +333,13 @@ impl Drop for Watchdog {
     }
 }
 
+/// The exception an [`Exit::Undefined`] is reported as; its syndrome says what it really was.
+const UNDEFINED: Exception = Exception::UndefinedInstruction;
+
 /// How the loop ended.
 enum Ending {
     Exited,
-    Crashed(Exception, Box<GuestRegs>),
+    Crashed(Exception, Syndrome, Box<GuestRegs>),
     TimedOut,
     Failed(String),
 }
@@ -421,14 +425,17 @@ pub(crate) fn run_within<V: Vcpu, C: HostClock + Clone + 'static>(
             });
             ExitReason::EmulatorError(message)
         }
-        Ending::Crashed(exception, regs) => ExitReason::GuestCrashed(Box::new(CrashReport::new(
-            exception,
-            &regs,
-            &mappings,
-            std::slice::from_ref(&placed.module),
-            last_events(&flight),
-            &options.command_line,
-        ))),
+        Ending::Crashed(exception, syndrome, regs) => ExitReason::GuestCrashed(Box::new(
+            CrashReport::new(
+                exception,
+                &regs,
+                &mappings,
+                std::slice::from_ref(&placed.module),
+                last_events(&flight),
+                &options.command_line,
+            )
+            .with_syndrome(syndrome),
+        )),
     };
     let (exit, events, events_error) = settle_dump(flight.dump(), exit);
     RunReport {
@@ -632,18 +639,23 @@ fn drive<V: Vcpu, C: HostClock + Clone + 'static>(
                     Outcome::ThreadExited => return Ending::Failed(THREAD_EXITED.to_owned()),
                 }
             }
-            Exit::DataAbort { address, write, .. } => {
+            Exit::DataAbort {
+                address,
+                write,
+                syndrome,
+            } => {
                 let access = if write { Access::Write } else { Access::Read };
-                if let Some(ending) = aborted(vcpu, space, session, address, access) {
+                if let Some(ending) = aborted(vcpu, space, session, address, access, syndrome) {
                     return ending;
                 }
             }
-            Exit::InstructionAbort { address, .. } => {
-                if let Some(ending) = aborted(vcpu, space, session, address, Access::Execute) {
+            Exit::InstructionAbort { address, syndrome } => {
+                let access = Access::Execute;
+                if let Some(ending) = aborted(vcpu, space, session, address, access, syndrome) {
                     return ending;
                 }
             }
-            Exit::Undefined { .. } => return crashed(vcpu, Exception::UndefinedInstruction),
+            Exit::Undefined { syndrome, .. } => return crashed(vcpu, UNDEFINED, syndrome),
             Exit::Interrupted => {
                 if watchdog.fired() {
                     return Ending::TimedOut;
@@ -655,13 +667,15 @@ fn drive<V: Vcpu, C: HostClock + Clone + 'static>(
 }
 
 /// What an abort on an `access` to `address` comes to: `None` when the page only lacked backing
-/// and now has it, so the guest retries the access; otherwise how the run ends.
+/// and now has it, so the guest retries the access; otherwise how the run ends. `syndrome` is
+/// the abort's, for the crash report.
 fn aborted<V: Vcpu, C: HostClock + Clone>(
     vcpu: &V,
     space: &dyn GuestSpace<V>,
     session: &Session<'_, C>,
     address: u64,
     access: Access,
+    syndrome: Syndrome,
 ) -> Option<Ending> {
     match space.touch(address, access) {
         Touch::Backed => None,
@@ -685,7 +699,13 @@ fn aborted<V: Vcpu, C: HostClock + Clone>(
                     false,
                 ),
             };
-            Some(fatal_fault(vcpu, session, address, write, exception))
+            Some(fatal_fault(
+                vcpu,
+                session,
+                address,
+                write,
+                (exception, syndrome),
+            ))
         }
         Touch::Failed(error) => Some(unbacked(address, &error)),
     }
@@ -699,28 +719,30 @@ fn unbacked(address: u64, error: &crate::space::SpaceError) -> Ending {
     ))
 }
 
-/// Ends the run as a crash with `exception`, with the guest's registers as they are now.
-fn crashed<V: Vcpu>(vcpu: &V, exception: Exception) -> Ending {
+/// Ends the run as a crash with `exception` and its `syndrome`, with the guest's registers as
+/// they are now.
+fn crashed<V: Vcpu>(vcpu: &V, exception: Exception, syndrome: Syndrome) -> Ending {
     match vcpu.regs() {
-        Ok(regs) => Ending::Crashed(exception, Box::new(regs)),
+        Ok(regs) => Ending::Crashed(exception, syndrome, Box::new(regs)),
         Err(error) => Ending::Failed(format!("the vCPU failed: {error}")),
     }
 }
 
-/// Records an abort at `address` as a fatal fault and ends the run as a crash with `exception`.
+/// Records an abort at `address` as a fatal fault and ends the run as a crash with `exception`
+/// and its syndrome.
 fn fatal_fault<V: Vcpu, C: HostClock + Clone>(
     vcpu: &V,
     session: &Session<'_, C>,
     address: u64,
     write: bool,
-    exception: Exception,
+    (exception, syndrome): (Exception, Syndrome),
 ) -> Ending {
     session.record(EventKind::Fault {
         address,
         write,
         action: FaultAction::Fatal,
     });
-    crashed(vcpu, exception)
+    crashed(vcpu, exception, syndrome)
 }
 
 /// The newest events the flight recorder holds, oldest first, one line each.
