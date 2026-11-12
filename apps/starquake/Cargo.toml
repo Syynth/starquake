@@ -12,3 +12,10 @@ workspace = true
 
 [dependencies]
 starquake-core.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+starquake-testkit.workspace = true
+# Reads back the flight-recorder dump the command wrote.
+starquake-trace.workspace = true
+serde_json.workspace = true
