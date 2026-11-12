@@ -29,7 +29,10 @@ them it says exactly what it assumes, in "Interfaces to neighbouring designs".
   GPU path run on any host, and it is the oracle the real backends are checked against.
 - **Host API: Vulkan first, through `ash`, on every platform, with macOS running it through
   MoltenVK for bring-up; a native Metal backend second, behind the same trait** (recommended in
-  decision 1). The trait is shaped by neither API, so Metal stays additive.
+  decision 1). The trait is shaped by no API, so Metal stays additive. `wgpu`, which the owner
+  knows, was checked at 30.0.1: viable for first frames, short of a finished emulator; "wgpu
+  first behind our trait, direct backends later" is a sound alternative, not a trap, at the
+  cost of a third backend (decision 1 has the full answer).
 - **The guest is paced by the emulated 60 Hz clock, not by the host display.** Presenting never
   blocks the graphics server; a headless run has no swapchain at all and dumps frames as PNG.
 
@@ -599,29 +602,89 @@ In order of how much each could change the design:
 ## Decisions for the owner
 
 1. **The host API layer.** The emulator needs one way to drive the host GPU on macOS and Linux.
-   The options:
+   The owner already knows `wgpu` and asked whether it is a viable choice, so that question is
+   answered first, then the options are compared.
 
-   | | (a) `wgpu` 30.0.1, one portable layer | (b) Vulkan everywhere (`ash`), MoltenVK on macOS for bring-up, native Metal later | (c) Vulkan and native Metal from the start | (d) Metal first, Vulkan later |
-   |---|---|---|---|---|
-   | Console features | Missing: logic ops, geometry and tessellation shaders, transform feedback, sparse resources, per-view component swizzle, explicit primitive-restart control; mesh shaders experimental, and on Metal only with hand-written shaders (wgpu-types 30.0.1, `Features`) | Full on Linux. MoltenVK lacks geometry shaders, logic ops, cull distance and wide lines, and caps vertex attributes at 16 (Eden's workarounds) | Full where each API allows | Full on Mac; Linux waits |
-   | Memory control on unified memory | None through the safe API; wrapping a native buffer needs `unsafe` escapes into wgpu-hal | Vulkan: host-memory import where the driver offers it; through MoltenVK: to verify | Full | Full on Mac |
-   | CPU cost on the hot path | Validation and resource tracking on every call, on the thread that is already the bottleneck | Thin | Thin | Thin |
-   | Backends to maintain | One (but each missing feature means an escape hatch per API) | One until the Metal backend starts | Two from day one | Two, Linux late |
-   | Pure-Rust build | Yes | Yes (Vulkan loaded at run time); MoltenVK is a run-time library on Mac | Yes | Yes |
-   | Reference to port from | None for an emulator | Eden's Vulkan renderer, including its MoltenVK workarounds | Eden for Vulkan, nothing for Metal | Nothing |
-   | Testing without a GPU | Recording backend; wgpu can also run on lavapipe | Recording backend; real backend on lavapipe in Linux CI | Same, Metal untestable in CI | Metal untestable in CI |
-   | Stability | Breaking major releases several times a year (29.x and 30.x both in 2026) | `ash` is stable (0.38, 2024) | Same | Same |
+   **Is `wgpu` viable?** Checked against the published `wgpu` 30.0.1 (2026-08-22) source:
+   `wgpu-types` `Features` and `render.rs`, the `wgpu` device, buffer and render-pass API, and
+   `wgpu-hal`'s Metal adapter. "First frames" means milestone 3: a simple scene drawn and
+   presented.
 
-   **Recommended: (b).** One backend reaches first present on all three platforms, Eden's renderer
-   is a direct reference for it, its full path can be tested in Linux CI with no GPU, and the
-   trait is designed so that a native Metal backend is additive. The cost is honest: the Mac runs
-   through a translation layer at first, with the gaps listed, and every gap that matters
-   (mesh shaders, sparse textures, unified-memory aliasing, logic ops through framebuffer fetch,
-   MoltenVK bugs) is a reason to start the Metal backend. The trigger is a measurement or a
-   title's need, decided at milestone 4. (a) is the easiest start, but an emulator needs exactly
-   the features and the control a portable web-shaped API leaves out, and pays its checks on the
-   hottest thread. (c) doubles the work before anything is on screen. (d) leaves Linux, a
-   first-class target (decision log, 2026-11-11), behind.
+   | What a console GPU emulator needs | `wgpu` 30.0.1 | Needed for first frames? |
+   |---|---|---|
+   | Vertex, fragment and compute stages | Yes | Yes |
+   | Geometry and tessellation stages | No. There is no such stage in the API | No; some titles later |
+   | Mesh and task stages | Experimental (`EXPERIMENTAL_MESH_SHADER`); on Metal only from hand-written shaders, naga can't emit them there | No; needed later (row 89) |
+   | Transform feedback | No | No; some titles later |
+   | Logic ops | No | No; rare |
+   | Depth clamp / unclipped depth | Yes (`DEPTH_CLIP_CONTROL`, `unclipped_depth`) | Yes |
+   | Depth range −1..1 | No switch; vertex shader rewrite (the same as on Metal) | Yes, through the shader |
+   | Clip distances | Yes (`CLIP_DISTANCES`, Vulkan and Metal) | Likely |
+   | Polygon mode line and point, conservative raster | Yes, as optional features | No |
+   | Primitive restart control | Only implied by `strip_index_format`; can't be turned off for strips | Rarely |
+   | Per-texture component swizzle in a view | No. Must become a shader variant per binding | **Yes**: guest textures commonly swizzle |
+   | Dynamic state | Viewport, scissor, blend constant, stencil reference only; cull mode, depth bias, depth and stencil tests are baked into the pipeline | Works; more pipelines to compile |
+   | Border colours, clamp-to-zero | Yes, as optional features | Sometimes |
+   | ASTC | Yes on Apple Silicon Macs: `wgpu-hal`'s Metal adapter enables LDR on Apple2+, HDR on Apple6+, 3D on Apple3+. On Vulkan only where the driver has it | **Yes** |
+   | BC | Yes on Macs (Metal adapter) and desktop Vulkan | Yes, for some formats |
+   | D24S8 | Not guaranteed; D32 float + S8 is an optional feature | Yes, through a fallback |
+   | Host memory import or aliasing on unified memory | Not in the safe API. `Device::create_buffer_from_hal` wraps a raw Metal or Vulkan buffer (unsafe), but wgpu's tracking then treats guest-written memory as its own | No; a later performance step |
+   | Persistent mapping | No. Buffers are mapped with `map_async` and must be unmapped before the GPU uses them; `MAPPABLE_PRIMARY_BUFFERS` relaxes usages, not that rule. Uploads go through `Queue::write_buffer`, which copies into wgpu's own staging | No; costs one extra copy per upload |
+   | Pipeline compilation control | Creation is synchronous but may run on worker threads. No compile-in-background handle | Enough for first frames |
+   | Pipeline caching | `PIPELINE_CACHE`: Vulkan only; "unimplemented" on Metal | No; a startup-time issue later |
+   | Feeding our shaders | Yes: `ShaderSource::Naga` takes a `naga::Module` directly (feature `naga-ir`), or SPIR-V/MSL by `create_shader_module_passthrough` | Yes |
+   | CPU cost per call | Validation and resource-state tracking on every command | No; matters at milestone 5, on the thread Eden-NX2 found was the bottleneck |
+   | Sparse resources | No | No; needed later (row 87) |
+
+   **Escape hatches.** `wgpu` exposes the objects underneath (`as_hal` on the instance, adapter,
+   device, queue and buffers; `as_hal_mut` on a command encoder; `create_*_from_hal`). They work
+   for one-off interop: wrapping an external buffer, presenting into a shared image. They are not
+   a workable way to add a missing pipeline stage or transform feedback, because wgpu's own
+   barrier and lifetime tracking does not see commands recorded behind its back, and `wgpu-hal`
+   is an unsafe API that changes with every wgpu major version (they share the version number).
+   Adding a stage wgpu lacks means writing that part of a direct backend.
+
+   **So: viable for first frames, not for the finished emulator.** The one gap that bites at
+   first frames is the missing view swizzle (shader variants); the rest bite later: geometry,
+   tessellation, transform feedback and mesh stages as titles need them, then the extra copy,
+   per-call validation and no aliasing when performance work starts. Every one of those ends in
+   a direct Vulkan backend, a direct Metal backend, or both.
+
+   **Is "wgpu first behind our own trait, direct backends later" sound or a trap?** It is sound
+   if three things hold, and a trap if any slips: the trait and command lists stay ours (no wgpu
+   type crosses into `gpu`); the wgpu backend is planned as a bring-up and fallback backend, not
+   extended through escape hatches; and the direct backends are scheduled, not left for "later".
+   This design already has the first property, so wgpu would be one more implementation of the
+   same trait. Its cost is a third backend: wgpu now, then Vulkan and Metal, instead of two.
+
+   The options compared:
+
+   | | (a) `wgpu` as the only layer | (b) Vulkan everywhere (`ash`), MoltenVK on macOS for bring-up, native Metal later | (c) Vulkan and native Metal from the start | (d) Metal first, Vulkan later | (e) `wgpu` first behind our trait, direct Vulkan and Metal later |
+   |---|---|---|---|---|---|
+   | Console features | The table above | Full on Linux. MoltenVK lacks geometry shaders, logic ops, cull distance and wide lines, and caps vertex attributes at 16 (Eden's workarounds) | Full where each API allows | Full on Mac; Linux waits | The table above until the direct backends land |
+   | ASTC on the owner's Mac | Native (verified in `wgpu-hal`) | Through MoltenVK: to verify | Native | Native | Native |
+   | Memory control on unified memory | Only through unsafe interop | Vulkan import where the driver offers it; through MoltenVK to verify | Full | Full on Mac | Later, with the direct backends |
+   | CPU cost on the hot path | Validation on every call | Thin | Thin | Thin | Validation until replaced |
+   | Backends written in total | One, never finished | Two (Vulkan, then Metal) | Two at once | Two, Linux late | Three |
+   | Extra install on the Mac | None | MoltenVK (C++ library at run time) | None | None | None |
+   | Reference to port from | None for an emulator | Eden's Vulkan renderer | Eden for Vulkan only | None | Eden later |
+   | Testing without a GPU | Recording backend; lavapipe | Recording backend; real backend on lavapipe | Same; Metal not in CI | Metal not in CI | Same as (a), then (b) |
+   | Stability | Breaking major releases several times a year (29.x and 30.x both in 2026) | `ash` stable (0.38, 2024) | Same | Same | wgpu churn until replaced |
+   | Owner can read and debug it | Best: a familiar API | Vulkan is verbose and new to the owner | Two unfamiliar APIs | One unfamiliar API | Best at first |
+
+   **Recommended: (b), with (e) as a sound alternative.** (b) writes two backends in total, and
+   the first is the one Linux keeps for good, ported against Eden's renderer and testable in full
+   in Linux CI. (e) gets the first pixel on the owner's Mac with no install and with an API the
+   owner knows, which is a real benefit for reading and debugging, but it writes a backend that is
+   later replaced and lives with the swizzle variants, the extra copy and the validation cost
+   meanwhile. Two facts would flip the recommendation to (e): verification 1 finding that MoltenVK
+   lacks ASTC or is unreliable on this Mac, or the owner valuing a familiar API through
+   milestone 4 over one backend's worth of work. (a) alone is not recommended: an emulator needs
+   exactly the stages and the control a portable web-shaped API leaves out. (c) doubles the work
+   before anything is on screen. (d) leaves Linux, a first-class target (decision log,
+   2026-11-11), behind. Under (b) or (e), the native Metal backend starts when a measurement or a
+   title's need (mesh shaders, sparse textures, unified-memory aliasing, MoltenVK bugs) calls for
+   it, decided at milestone 4.
 
 2. **Vulkan bindings: `ash` (0.38.0, Vulkan headers 1.3.281, released 2024) or `vulkanalia`
    (0.35.0, 2026).** `ash` is what `wgpu-hal` 30 and `gpu-allocator` 0.28 use, and is the most
