@@ -895,15 +895,7 @@ impl HvfVcpu {
     fn step_over_wait(&self, exception: &ffi::ExitException) -> Result<(), Error> {
         let cpsr = self.reg(ffi::REG_CPSR)?;
         let pc = self.reg(ffi::REG_PC)?;
-        if cpsr & shim::MODE_MASK != shim::MODE_EL0T {
-            return Err(Error::Host(format!(
-                "a wait was trapped outside guest code: ESR_EL2 {:#x} at pc {pc:#x}, cpsr {cpsr:#x}",
-                exception.syndrome
-            )));
-        }
-        let next = after_instruction(pc).ok_or_else(|| {
-            Error::Host(format!("a wait at pc {pc:#x} has no instruction after it"))
-        })?;
+        let next = after_wait(exception.syndrome, cpsr, pc)?;
         self.set_reg(ffi::REG_PC, next)
     }
 
@@ -954,10 +946,18 @@ fn is_trapped_wait(syndrome: u64) -> bool {
     Syndrome::from_esr(syndrome).class() == ExceptionClass::TrappedWait
 }
 
-/// Where a guest at `pc` resumes after stepping over the one A64 instruction there; `None`
-/// past the end of the address space.
-fn after_instruction(pc: u64) -> Option<u64> {
+/// Where the guest resumes after a wait with `ESR_EL2` value `syndrome` was trapped with the
+/// vCPU's `cpsr` and `pc`: the next instruction. A wait trapped outside EL0 guest code, or at
+/// the very end of the address space, is an error.
+fn after_wait(syndrome: u64, cpsr: u64, pc: u64) -> Result<u64, Error> {
+    if cpsr & shim::MODE_MASK != shim::MODE_EL0T {
+        return Err(Error::Host(format!(
+            "a wait was trapped outside guest code: ESR_EL2 {syndrome:#x} at pc {pc:#x}, cpsr \
+             {cpsr:#x}"
+        )));
+    }
     pc.checked_add(INSTRUCTION_LEN)
+        .ok_or_else(|| Error::Host(format!("a wait at pc {pc:#x} has no instruction after it")))
 }
 
 /// The immediate of the `hvc` that `ESR_EL2` value `syndrome` describes; `None` if it describes
@@ -1268,13 +1268,32 @@ mod tests {
     }
 
     #[test]
-    fn stepping_over_an_instruction_stops_at_the_end_of_the_address_space() {
-        assert_eq!(after_instruction(0x8000_0000), Some(0x8000_0004));
+    fn a_wait_is_stepped_over_only_in_guest_code_with_an_instruction_after_it() {
+        const WFI: u64 = 0x07e0_0000;
+        // At EL0t (with the guest's flags and masks in the other bits), the next instruction.
+        let el0 = shim::SPSR_EL0T_MASKED | crate::PSTATE_NZCV;
+        assert_eq!(after_wait(WFI, el0, 0x8000_0000), Ok(0x8000_0004));
+        // The last address with an instruction after it, and the first without.
         assert_eq!(
-            after_instruction(u64::MAX - INSTRUCTION_LEN),
-            Some(u64::MAX)
+            after_wait(WFI, el0, u64::MAX - INSTRUCTION_LEN),
+            Ok(u64::MAX)
         );
-        assert_eq!(after_instruction(u64::MAX - INSTRUCTION_LEN + 1), None);
+        let last = u64::MAX - INSTRUCTION_LEN + 1;
+        assert_eq!(
+            after_wait(WFI, el0, last),
+            Err(Error::Host(format!(
+                "a wait at pc {last:#x} has no instruction after it"
+            )))
+        );
+        // In the shim (EL1h) it is an error, whatever the pc.
+        assert_eq!(
+            after_wait(WFI, shim::CPSR_EL1H_MASKED, 0x8000_0000),
+            Err(Error::Host(
+                "a wait was trapped outside guest code: ESR_EL2 0x7e00000 at pc 0x80000000, \
+                 cpsr 0x3c5"
+                    .into()
+            ))
+        );
     }
 
     #[test]
