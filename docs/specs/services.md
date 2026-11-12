@@ -106,6 +106,10 @@ a system module is one program serving all its sessions.
   the core that finishes the running handler starts the next queued request.
 - **Methods never block:** no sleeping, no blocking I/O, no waiting on another guest thread.
   Work that takes time goes to a worker and completes a deferred reply.
+  One accepted exception: short host metadata lookups (whether a path exists, a file's size,
+  opening a host file handle) may run on the calling thread. `fsp-srv`'s `OpenSdCardFileSystem`,
+  `OpenFile` and `GetSize` do; reading file data is always deferred. (Approved by the owner,
+  2026-11-12.)
 
 ## The service manager
 
@@ -196,6 +200,13 @@ If the methods are long and error-prone, switch to a typed style, where a method
 declares its inputs and outputs and the framework unpacks the message (the direction Eden has
 been migrating in), while only three services need rewriting. Struct-mapped payloads can be
 added alongside explicit reads at any time and don't need this trial.
+
+**Outcome (owner, 2026-11-12): keep the explicit style.** Across `sm:`, `set:sys` and the first
+`fsp-srv` subset, no method spends more than about a third of its lines unpacking or packing, and
+review found no layout mistakes in the handlers; every finding was in the framework (PR #130 has
+the count). Two additions cover what a glance cannot check: each buffer index declares its
+descriptor kind, and `commands!` accepts constant ids so tests import them instead of restating
+literals.
 
 ## Decisions
 
