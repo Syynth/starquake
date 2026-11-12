@@ -360,6 +360,14 @@ fn a_server_cannot_make_shared_memory_of_no_bytes_or_a_permission_a_mapping_cann
             Ok(2 * PAGE_SIZE),
         ]
     );
+    // Only the two that were made asked the translation for pages.
+    let allocations = world
+        .log
+        .take()
+        .into_iter()
+        .filter(|call| matches!(call, MapperCall::AllocateShared { .. }))
+        .count();
+    assert_eq!(allocations, 2);
 }
 
 #[test]

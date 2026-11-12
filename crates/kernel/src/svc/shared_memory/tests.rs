@@ -204,16 +204,17 @@ fn the_permission_must_be_the_user_permission() {
 }
 
 #[test]
-fn a_permission_that_is_neither_read_nor_read_write_is_refused_first() {
+fn a_permission_that_is_neither_read_nor_read_write_is_refused_before_the_handle_is_read() {
     let mut world = World::new();
-    let shared = world.shared(1, SvcPermission::Read);
+    world.shared(1, SvcPermission::Read);
+    // Each with a handle that names nothing, which a later check would refuse.
     for permission in [
         raw(SvcPermission::None),
         raw(SvcPermission::ReadExecute),
         u32::MAX,
     ] {
         assert_eq!(
-            world.map(shared.handle, SHARED, PAGE_SIZE, permission),
+            world.map(Handle::INVALID, SHARED, PAGE_SIZE, permission),
             refused(KernelError::InvalidNewMemoryPermission)
         );
     }
