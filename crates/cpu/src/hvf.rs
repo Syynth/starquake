@@ -83,7 +83,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use starquake_memory::stage1::{FlushRange, Stage1Tables, TableRoot};
 use starquake_memory::{BackingRange, GuestMemory};
 
-use crate::{Backend, Error, ExceptionClass, Exit, GuestRegs, Interrupter, Syndrome, Vcpu};
+use crate::{
+    Backend, Error, ExceptionClass, Exit, GUEST_PSTATE_MASK, GuestRegs, Interrupter, Syndrome, Vcpu,
+};
 use ffi::VcpuId;
 use flush::FlushOp;
 use memory::{Extent, HOST_PAGE, HostRegion, Kind};
@@ -197,8 +199,8 @@ const SCTLR: u64 = 0x30d0_0800 // RES1
     | (1 << 27) | (1 << 13) // EnDA, EnDB
     | (1 << 15) | (1 << 14) | (1 << 26); // UCT, DZE, UCI
 
-/// `PSTATE` bits the host can see and set: NZCV. The mode and interrupt masks are the backend's.
-const PSTATE_EL0_MASK: u64 = 0xf000_0000;
+/// Bytes in one A64 instruction: what stepping over a trapped wait adds to the program counter.
+const INSTRUCTION_LEN: u64 = 4;
 
 /// Why a [`RamConfig`] is invalid, or the backend's own address space can't be built.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -780,6 +782,26 @@ impl HvfVcpu {
         })
     }
 
+    /// FP/SIMD register `Vn`, as one little-endian value.
+    fn simd(&self, n: u32) -> Result<u128, Error> {
+        let mut value = ffi::SimdFpBytes::default();
+        // SAFETY: called on the owning thread with a live id and a valid out-pointer to 16
+        // bytes, aligned as the header's vector type.
+        ffi::check("hv_vcpu_get_simd_fp_reg", unsafe {
+            ffi::hv_vcpu_get_simd_fp_reg(self.id, ffi::SIMD_FP_REG_Q0 + n, &raw mut value)
+        })?;
+        Ok(u128::from_le_bytes(value.0))
+    }
+
+    /// Sets FP/SIMD register `Vn` to `value`, a little-endian value.
+    fn set_simd(&self, n: u32, value: u128) -> Result<(), Error> {
+        let bytes = ffi::SimdFpBytes(value.to_le_bytes());
+        // SAFETY: called on the owning thread with a live id.
+        ffi::check("hv_vcpu_set_simd_fp_reg", unsafe {
+            ffi::set_simd_fp_reg(self.id, ffi::SIMD_FP_REG_Q0 + n, &bytes)
+        })
+    }
+
     fn sys(&self, reg: u16) -> Result<u64, Error> {
         let mut value = 0;
         // SAFETY: called on the owning thread with a live id and a valid out-pointer.
@@ -838,6 +860,25 @@ impl HvfVcpu {
         Ok(shim::decode_el0_exception(esr, far, elr))
     }
 
+    /// Steps the guest over the wait hint the hypervisor trapped, so the next entry runs the
+    /// instruction after it. The trap must have come from guest code at EL0: the shim never
+    /// waits, so a wait trapped at EL1 is an error, and so is one at the very end of the
+    /// address space.
+    fn step_over_wait(&self, exception: &ffi::ExitException) -> Result<(), Error> {
+        let cpsr = self.reg(ffi::REG_CPSR)?;
+        let pc = self.reg(ffi::REG_PC)?;
+        if cpsr & shim::MODE_MASK != shim::MODE_EL0T {
+            return Err(Error::Host(format!(
+                "a wait was trapped outside guest code: ESR_EL2 {:#x} at pc {pc:#x}, cpsr {cpsr:#x}",
+                exception.syndrome
+            )));
+        }
+        let next = after_instruction(pc).ok_or_else(|| {
+            Error::Host(format!("a wait at pc {pc:#x} has no instruction after it"))
+        })?;
+        self.set_reg(ffi::REG_PC, next)
+    }
+
     /// Brings an interrupted vCPU back to a parked state with exact EL0 registers.
     fn interrupted(&self) -> Result<Exit, Error> {
         let cpsr = self.reg(ffi::REG_CPSR)?;
@@ -879,6 +920,18 @@ impl HvfVcpu {
     }
 }
 
+/// Whether `ESR_EL2` value `syndrome` describes a trapped `wfi` or `wfe` (class 0x01, any
+/// `ISS.TI`).
+fn is_trapped_wait(syndrome: u64) -> bool {
+    Syndrome::from_esr(syndrome).class() == ExceptionClass::TrappedWait
+}
+
+/// Where a guest at `pc` resumes after stepping over the one A64 instruction there; `None`
+/// past the end of the address space.
+fn after_instruction(pc: u64) -> Option<u64> {
+    pc.checked_add(INSTRUCTION_LEN)
+}
+
 /// The immediate of the `hvc` that `ESR_EL2` value `syndrome` describes; `None` if it describes
 /// anything else.
 fn hvc_immediate(syndrome: u64) -> Option<u16> {
@@ -915,12 +968,20 @@ impl Vcpu for HvfVcpu {
             // The interrupt was used up by a flush: report it now, before any guest code.
             return Ok(Exit::Interrupted);
         }
-        let exit = self.enter()?;
-        match exit.reason {
-            ffi::EXIT_REASON_EXCEPTION => self.exception(&exit.exception),
-            ffi::EXIT_REASON_CANCELED => self.interrupted(),
-            // The vtimer is masked at creation, so this and unknown reasons are both unexpected.
-            reason => Err(Error::Host(format!("unexpected exit reason {reason}"))),
+        loop {
+            let exit = self.enter()?;
+            match exit.reason {
+                // A wait hint the hypervisor trapped: step over it and go on (see "Wait hints"
+                // in the module docs). An interrupt requested meanwhile ends the next entry.
+                ffi::EXIT_REASON_EXCEPTION if is_trapped_wait(exit.exception.syndrome) => {
+                    self.step_over_wait(&exit.exception)?;
+                }
+                ffi::EXIT_REASON_EXCEPTION => return self.exception(&exit.exception),
+                ffi::EXIT_REASON_CANCELED => return self.interrupted(),
+                // The vtimer is masked at creation, so this and unknown reasons are both
+                // unexpected.
+                reason => return Err(Error::Host(format!("unexpected exit reason {reason}"))),
+            }
         }
     }
 
@@ -935,9 +996,14 @@ impl Vcpu for HvfVcpu {
         }
         regs.sp = self.sys(ffi::SP_EL0)?;
         regs.pc = self.sys(ffi::ELR_EL1)?;
-        regs.pstate = self.sys(ffi::SPSR_EL1)? & PSTATE_EL0_MASK;
+        regs.pstate = self.sys(ffi::SPSR_EL1)? & GUEST_PSTATE_MASK;
         regs.tpidr = self.sys(ffi::TPIDR_EL0)?;
         regs.tpidrro = self.sys(ffi::TPIDRRO_EL0)?;
+        for (n, v) in (0..).zip(regs.v.iter_mut()) {
+            *v = self.simd(n)?;
+        }
+        regs.fpcr = self.reg(ffi::REG_FPCR)?;
+        regs.fpsr = self.reg(ffi::REG_FPSR)?;
         Ok(regs)
     }
 
@@ -947,14 +1013,19 @@ impl Vcpu for HvfVcpu {
         }
         self.set_sys(ffi::SP_EL0, regs.sp)?;
         self.set_sys(ffi::ELR_EL1, regs.pc)?;
-        // Only the flags come from the caller: the guest always resumes at EL0t, interrupts
-        // masked.
+        // Only the guest's bits come from the caller: the guest always resumes at EL0t,
+        // interrupts masked.
         self.set_sys(
             ffi::SPSR_EL1,
-            (regs.pstate & PSTATE_EL0_MASK) | shim::SPSR_EL0T_MASKED,
+            (regs.pstate & GUEST_PSTATE_MASK) | shim::SPSR_EL0T_MASKED,
         )?;
         self.set_sys(ffi::TPIDR_EL0, regs.tpidr)?;
-        self.set_sys(ffi::TPIDRRO_EL0, regs.tpidrro)
+        self.set_sys(ffi::TPIDRRO_EL0, regs.tpidrro)?;
+        for (n, &v) in (0..).zip(regs.v.iter()) {
+            self.set_simd(n, v)?;
+        }
+        self.set_reg(ffi::REG_FPCR, regs.fpcr)?;
+        self.set_reg(ffi::REG_FPSR, regs.fpsr)
     }
 
     /// The root's table page must lie inside [`HvfBackend::table_pool`]

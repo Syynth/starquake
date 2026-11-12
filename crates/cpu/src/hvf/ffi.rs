@@ -42,7 +42,18 @@ pub(super) const MEMORY_EXEC: u64 = 4;
 // hv_reg_t: X0-X30 are 0-30.
 pub(super) const REG_X0: u32 = 0;
 pub(super) const REG_PC: u32 = 31;
+pub(super) const REG_FPCR: u32 = 32;
+pub(super) const REG_FPSR: u32 = 33;
 pub(super) const REG_CPSR: u32 = 34;
+
+// hv_simd_fp_reg_t: Q0-Q31 are 0-31.
+pub(super) const SIMD_FP_REG_Q0: u32 = 0;
+
+/// The bytes of an `hv_simd_fp_uchar16_t` (a 16-byte vector, 16-byte aligned) in memory,
+/// byte 0 first.
+#[repr(C, align(16))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct SimdFpBytes(pub [u8; 16]);
 
 // hv_sys_reg_t: (op0 << 14) | (op1 << 11) | (CRn << 7) | (CRm << 3) | op2
 pub(super) const ID_AA64MMFR0_EL1: u16 = 0xc038;
@@ -96,6 +107,15 @@ unsafe extern "C" {
     pub(super) fn hv_vcpu_set_reg(vcpu: VcpuId, reg: u32, value: u64) -> HvReturn;
     pub(super) fn hv_vcpu_get_sys_reg(vcpu: VcpuId, reg: u16, value: *mut u64) -> HvReturn;
     pub(super) fn hv_vcpu_set_sys_reg(vcpu: VcpuId, reg: u16, value: u64) -> HvReturn;
+    pub(super) fn hv_vcpu_get_simd_fp_reg(
+        vcpu: VcpuId,
+        reg: u32,
+        value: *mut SimdFpBytes,
+    ) -> HvReturn;
+    /// Takes `(hv_vcpu_t, hv_simd_fp_reg_t, hv_simd_fp_uchar16_t)`, the vector by value. Rust
+    /// cannot pass a vector to a foreign function yet (`simd_ffi` is unstable), so this is
+    /// declared without parameters and called only through [`set_simd_fp_reg`].
+    fn hv_vcpu_set_simd_fp_reg();
     pub(super) fn hv_vcpu_set_vtimer_mask(vcpu: VcpuId, masked: bool) -> HvReturn;
 }
 
@@ -106,6 +126,39 @@ unsafe extern "C" {
     /// point of unification, invalidates the instruction cache by address (both broadcast to all
     /// cores) and issues the barriers.
     pub(super) fn sys_icache_invalidate(start: *mut c_void, len: usize);
+}
+
+/// `hv_vcpu_set_simd_fp_reg(vcpu, reg, value)`, with the vector passed as the C compiler
+/// passes it.
+///
+/// The AArch64 procedure call standard (AAPCS64, "Parameter passing") passes a 128-bit short
+/// vector in the next free SIMD register and integers in the next free general registers, so
+/// the call is `x0` = `vcpu`, `w1` = `reg`, `q0` = the 16 bytes; the result comes back in `w0`.
+///
+/// # Safety
+///
+/// As for any `hv_vcpu_*` call: on the thread that owns the live vCPU `vcpu`.
+pub(super) unsafe fn set_simd_fp_reg(vcpu: VcpuId, reg: u32, value: &SimdFpBytes) -> HvReturn {
+    let function: unsafe extern "C" fn() = hv_vcpu_set_simd_fp_reg;
+    let ret: u64;
+    // SAFETY: the call follows AAPCS64 for the C prototype in `hv_vcpu.h`: the arguments are in
+    // x0, w1 and q0 (loaded from `value`, which is live and 16 bytes), `clobber_abi("C")` tells
+    // the compiler every register the callee may change, and without `nostack` the stack
+    // pointer is aligned for a call. The caller's contract makes the call itself valid.
+    unsafe {
+        core::arch::asm!(
+            "ldr q0, [{value}]",
+            "blr {function}",
+            value = in(reg) value.0.as_ptr(),
+            function = in(reg) function,
+            inout("x0") vcpu => ret,
+            inout("x1") u64::from(reg) => _,
+            clobber_abi("C"),
+        );
+    }
+    // `hv_return_t` is 32 bits, returned in w0: the upper half of x0 is not part of it.
+    let [b0, b1, b2, b3, ..] = ret.to_le_bytes();
+    HvReturn::from_le_bytes([b0, b1, b2, b3])
 }
 
 /// The host's `CNTFRQ_EL0`: the rate, in hertz, of the counter behind `CNTVCT_EL0`.

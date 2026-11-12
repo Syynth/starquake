@@ -42,6 +42,10 @@ const FSC_ALIGNMENT: u8 = 0b10_0001;
 pub enum ExceptionClass {
     /// 0x00, "unknown reason": an instruction that is undefined at EL0.
     Unknown,
+    /// 0x01: a trapped `wfi` or `wfe` (`ISS.TI` says which). EL0 never takes it with the
+    /// configuration the backends use; it is what the hypervisor reports when it traps a
+    /// guest's `wfi` to the host.
+    TrappedWait,
     /// 0x15: `svc` in AArch64 state.
     Svc,
     /// 0x18: a trapped `msr`, `mrs` or system instruction.
@@ -70,6 +74,7 @@ impl ExceptionClass {
     pub const fn from_ec(ec: u8) -> Self {
         match ec & 0x3f {
             0x00 => Self::Unknown,
+            0x01 => Self::TrappedWait,
             0x15 => Self::Svc,
             0x18 => Self::TrappedSystemAccess,
             0x1c => Self::PointerAuthentication,
@@ -87,6 +92,7 @@ impl ExceptionClass {
     pub const fn ec(self) -> u8 {
         match self {
             Self::Unknown => 0x00,
+            Self::TrappedWait => 0x01,
             Self::Svc => 0x15,
             Self::TrappedSystemAccess => 0x18,
             Self::PointerAuthentication => 0x1c,
@@ -269,6 +275,7 @@ mod tests {
     fn named_classes_have_the_architecture_values() {
         let named = [
             (ExceptionClass::Unknown, 0x00),
+            (ExceptionClass::TrappedWait, 0x01),
             (ExceptionClass::Svc, 0x15),
             (ExceptionClass::TrappedSystemAccess, 0x18),
             (ExceptionClass::PointerAuthentication, 0x1c),

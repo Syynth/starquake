@@ -89,7 +89,34 @@ pub enum Exit {
     Interrupted,
 }
 
-/// AArch64 user-visible register state the HLE kernel reads and writes.
+/// `PSTATE.{N,Z,C,V}`, the condition flags, in the `SPSR_EL1` layout (bits 31:28; Arm ARM,
+/// `SPSR_EL1`).
+pub const PSTATE_NZCV: u64 = 0xf << 28;
+/// `PSTATE.DIT`, data-independent timing (`FEAT_DIT`), in the `SPSR_EL1` layout (bit 24). EL0
+/// sets it with `msr dit, #imm`.
+pub const PSTATE_DIT: u64 = 1 << 24;
+/// `PSTATE.SSBS`, speculative store bypass safe (`FEAT_SSBS`), in the `SPSR_EL1` layout
+/// (bit 12). EL0 sets it with `msr ssbs, #imm`.
+pub const PSTATE_SSBS: u64 = 1 << 12;
+/// The `PSTATE` bits a guest thread's context keeps: [`PSTATE_NZCV`], [`PSTATE_DIT`] and
+/// [`PSTATE_SSBS`], the bits EL0 can change on the hosts the backends run on. The mode, the
+/// interrupt masks and every other bit are the backend's own: [`Vcpu::set_regs`] ignores them
+/// and [`Vcpu::regs`] reads them as zero.
+pub const GUEST_PSTATE_MASK: u64 = PSTATE_NZCV | PSTATE_DIT | PSTATE_SSBS;
+
+/// The register state of one guest thread at EL0: everything a context switch saves and
+/// restores (the execution model's `GuestContext`), and what the HLE kernel reads and writes.
+///
+/// The FP/SIMD part is the architecture's (Arm ARM, "SIMD and floating-point registers",
+/// `FPCR`, `FPSR`): 32 128-bit vector registers, each as one little-endian value (byte 0 of
+/// `Vn` is bits 7:0 of `v[n]`, so `Dn` is the low 64 bits and `Sn` the low 32), and the two
+/// control and status registers, as the 64-bit system registers EL0 reads with `mrs`. A
+/// backend keeps every bit of `v`; what it keeps of `fpcr` and `fpsr` is what the host lets a
+/// guest write (see each backend).
+///
+/// Not here yet: the SVE and SME state the Switch 2's Cortex-A78C does not have, and
+/// pointer-authentication keys, which belong to the process and are set separately (on the
+/// Hypervisor.framework backend, `hvf::HvfVcpu::set_pac_keys`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GuestRegs {
     /// X0-X30.
@@ -98,13 +125,23 @@ pub struct GuestRegs {
     pub sp: u64,
     /// Program counter.
     pub pc: u64,
-    /// NZCV and the other PSTATE bits visible at EL0.
+    /// The `PSTATE` bits in [`GUEST_PSTATE_MASK`] (condition flags, `DIT`, `SSBS`), in the
+    /// `SPSR_EL1` layout.
     pub pstate: u64,
     /// `TPIDR_EL0` (user thread pointer).
     pub tpidr: u64,
     /// `TPIDRRO_EL0` (read-only thread pointer: the kernel's TLS address).
     pub tpidrro: u64,
+    /// V0-V31, the FP/SIMD registers.
+    pub v: [u128; VECTOR_REGS],
+    /// `FPCR`: rounding mode, flush-to-zero, default NaN and the trap enables.
+    pub fpcr: u64,
+    /// `FPSR`: the cumulative exception flags and the saturation flag.
+    pub fpsr: u64,
 }
+
+/// How many FP/SIMD registers a context holds: V0-V31.
+pub const VECTOR_REGS: usize = 32;
 
 /// Errors from creating or driving a vCPU.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
