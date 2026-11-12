@@ -11,8 +11,9 @@
 //! When the last byte of the content has been delivered, the reader checks, in this order, that
 //! the frame holds nothing more ([`NupError::ContentTooLong`]), that the extent holds nothing
 //! after the frame ([`NupError::TrailingExtentBytes`]), and that the content matches the file's
-//! SHA-256 ([`NupError::HashMismatch`]). Stored bytes that end early are
-//! [`NupError::ContentTruncated`]. These errors reach a `Read` caller as an `io::Error` of kind
+//! SHA-256 ([`NupError::HashMismatch`]). A frame that ends cleanly before the file's size is
+//! reached is [`NupError::ContentTruncated`]; a frame cut short inside a block, or bytes that are
+//! not a frame, are whatever `ruzstd` reports, as [`NupError::Zstd`]. These errors reach a `Read` caller as an `io::Error` of kind
 //! `InvalidData` that carries the [`NupError`]; [`NupError::from_io`] takes it back out.
 
 use std::io::{self, Read, Seek, SeekFrom, Take};

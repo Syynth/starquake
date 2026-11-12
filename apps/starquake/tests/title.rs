@@ -345,8 +345,27 @@ fn inspect_reports_an_npdm_it_cannot_parse_or_will_not_read() {
         )
     );
 
-    // One byte over the read limit is refused before it is read.
+    // At the read limit it is read (and then is not an NPDM); one byte over, it is refused
+    // before it is read.
     let limit = usize::try_from(NPDM_READ_LIMIT).unwrap();
+    let at_limit = build::build(&[PackageSpec::new(
+        PackageKind::Base,
+        BASE_ID,
+        0,
+        tree(vec![0; limit]),
+    )])
+    .unwrap();
+    let path = write(&folder, "at-limit.nup", &at_limit.bytes);
+    let ran = starquake(&["inspect", text(&path)]);
+    assert_eq!(ran.code, exit::DAMAGED);
+    assert_eq!(
+        ran.stderr,
+        format!(
+            "starquake: {}: main.npdm: NPDM magic is not META\n",
+            path.display()
+        )
+    );
+
     let huge = build::build(&[PackageSpec::new(
         PackageKind::Base,
         BASE_ID,

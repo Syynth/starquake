@@ -22,25 +22,28 @@
 //! (`verify.py`). Nothing here is ported line by line; the checks are restated in Rust and each
 //! cites the rule it implements.
 //!
-//! What [`Nup::open`] checks, in this order:
+//! What [`Nup::open`] checks, one group after the other (the first failure is the error):
 //!
-//! - The superblock (SPEC §2, rules 1 to 5): magic `NUP` with major version 1, `header_size`
-//!   at least 0x80, `toc_offset == header_size`, the table of contents inside the file,
-//!   `blob_offset` 16-aligned, not before the end of the table of contents and not past the end
-//!   of the file, `file_size` equal to the source's length, at least one package, no flags.
-//!   Its 32 reserved bytes are zero (`parse_super`).
+//! - The superblock (SPEC §2, rules 1 to 5), in this order: magic `NUP` with major version 1,
+//!   `header_size` at least 0x80, its 32 reserved bytes zero (`parse_super`), no flags,
+//!   `file_size` equal to the source's length, `toc_offset == header_size`, the table of
+//!   contents inside the file, `blob_offset` 16-aligned, not before the end of the table of
+//!   contents and not past the end of the file, at least one package, and `toc_size` within
+//!   [`Limits::max_toc_size`].
 //! - The table of contents' SHA-256, before any value in it is used (§6.1 rule 1).
 //! - The table of contents: magic `TOC\x01`, the package count equal to the superblock's, the
 //!   records inside it, the string pool after the records and inside it, and the children array
 //!   (the bytes between the records and the pool, as `_parse_toc` derives it) a whole number of
 //!   4-byte slots.
-//! - Each package: a known kind (§6.1 rule 4), only flag bit 0, its two reserved fields at 0x1A
-//!   and 0x1C zero (`parse_pkg`), its directories in range, and its meta block inside the file.
-//!   An update in a container without a base has the standalone flag (§3.1.2; `_check_bounds`).
-//! - Each directory and file name inside the string pool; each directory's child range inside
-//!   the children array; each file's codec known, its codec flags zero, an empty file with no
-//!   extent, a non-empty one with one, and that extent inside the blob region and 16-aligned
-//!   (`parse_file`, `_check_bounds`; §4).
+//! - Each package: a known kind (§6.1 rule 4), its two reserved fields at 0x1A and 0x1C zero
+//!   (`parse_pkg`), only flag bit 0, its meta block after the table of contents and inside the
+//!   file, and its directories in range. Then, over all packages, at most one base, and an
+//!   update in a container without a base has the standalone flag (§3.1.2; `_check_bounds`).
+//! - Each directory's name inside the string pool and its child range inside the children
+//!   array; each file's name inside the pool, its codec known, its codec flags zero, an empty
+//!   file with no extent, a non-empty one with one, and that extent inside the blob region and
+//!   16-aligned (`parse_file`, `_check_bounds`; §4); each child slot naming an existing node.
+//! - The tree rules and then the overlap rules listed under "Divergences".
 //!
 //! # Divergences
 //!

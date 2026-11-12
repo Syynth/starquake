@@ -85,7 +85,7 @@ pub enum NupError {
     /// The container has no packages.
     #[error("the container has no packages")]
     NoPackages,
-    /// The table of contents is bigger than [`Limits::max_toc_size`].
+    /// The table of contents is bigger than [`Limits::max_toc_size`](super::Limits::max_toc_size).
     #[error("the table of contents is {size} bytes, more than the {limit} this reader accepts")]
     TocTooLarge {
         /// `toc_size`.
@@ -364,7 +364,7 @@ impl NupError {
         matches!(self, Self::Io(_))
     }
 
-    /// The error carried by an `io::Error` that [`FileReader`] returned: its own [`NupError`]
+    /// The error carried by an `io::Error` that [`FileReader`](super::FileReader) returned: its own [`NupError`]
     /// when it carries one, [`NupError::Io`] otherwise.
     pub fn from_io(error: std::io::Error) -> Self {
         if error.get_ref().is_some_and(carries_nup_error) {
@@ -380,7 +380,7 @@ impl NupError {
     }
 }
 
-/// A file whose hash did not match, or that could not be read, during [`Nup::verify`].
+/// A file whose hash did not match, or that could not be read, during [`Nup::verify`](super::Nup::verify).
 #[derive(Debug, thiserror::Error)]
 #[error("package {package}, {path}: {source}")]
 pub struct VerifyError {
@@ -393,7 +393,7 @@ pub struct VerifyError {
     pub source: NupError,
 }
 
-/// What [`Nup::verify`] checked.
+/// What [`Nup::verify`](super::Nup::verify) checked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct VerifySummary {
     /// Files whose content was checked (every file of every package).
