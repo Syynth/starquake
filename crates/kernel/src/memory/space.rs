@@ -808,6 +808,19 @@ impl AddressSpace {
     /// writable.
     #[must_use]
     pub fn user_can_write(&self, address: u64, size: u64) -> bool {
+        self.user_has(MemoryPermission::USER_WRITE, address, size)
+    }
+
+    /// Whether the guest may read all `size` bytes at `address`: every block the range touches
+    /// has [`MemoryPermission::USER_READ`]. The same rules as [`AddressSpace::user_can_write`]
+    /// otherwise.
+    #[must_use]
+    pub fn user_can_read(&self, address: u64, size: u64) -> bool {
+        self.user_has(MemoryPermission::USER_READ, address, size)
+    }
+
+    /// Whether every block the range touches has `permission`.
+    fn user_has(&self, permission: MemoryPermission, address: u64, size: u64) -> bool {
         let Some(offset) = size.checked_sub(1) else {
             return true;
         };
@@ -816,7 +829,7 @@ impl AddressSpace {
         };
         // The walk ends at the block holding `last`, or at the end of the map (false).
         for block in self.blocks.blocks_from(address) {
-            if !block.permission().contains(MemoryPermission::USER_WRITE) {
+            if !block.permission().contains(permission) {
                 return false;
             }
             if last <= block.last() {

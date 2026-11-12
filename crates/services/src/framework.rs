@@ -199,9 +199,10 @@ pub mod control;
 pub mod defer;
 #[cfg(any(test, feature = "test-support"))]
 pub mod fake;
+mod host;
 mod kernel;
 pub mod payload;
-pub mod queue;
+pub use starquake_kernel::ipc::queue;
 mod reply;
 pub mod request;
 pub mod result;

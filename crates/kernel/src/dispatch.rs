@@ -178,6 +178,7 @@
 //! Each failing example differs from the compiling one only in the lines the text above it
 //! names.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::marker::PhantomData;
 use std::sync::{Mutex, MutexGuard, PoisonError, TryLockError};
@@ -188,6 +189,8 @@ use starquake_memory::GuestMemory;
 use starquake_trace::{Env, EnvError, EventKind, GuestTicks, Recorder, SVC_ARG_COUNT, ThreadId};
 
 use crate::handle::{Handle, HandleTable};
+use crate::id::ServerId;
+use crate::ipc::SessionHandler;
 use crate::result::{CallResult, KernelError, ResultCode, SvcError};
 use crate::sched::CoreId;
 use crate::svc::{
@@ -196,8 +199,11 @@ use crate::svc::{
 };
 use crate::tables::{AddressSpace, Processes, Scheduler};
 
+mod ipc;
 #[cfg(test)]
 mod tests;
+
+pub use ipc::{IpcContext, Woken};
 
 /// The register that carries a call's result (Eden's wrappers: `SetArg64(args, 0, ret)`).
 const RESULT_REGISTER: usize = 0;
@@ -448,6 +454,11 @@ pub enum Outcome {
     /// `ExitProcess` ran: the calling process is over, and the caller must not resume the guest
     /// thread. No register was written.
     ProcessExited,
+    /// `SendSyncRequest` left the calling thread waiting for its reply: its request waits
+    /// behind another, or its server deferred it. No register was written and no event
+    /// recorded; both happen when the request ends, and the thread is then reported by
+    /// [`Dispatcher::take_woken`]. The caller must not resume the thread until then.
+    Waiting,
 }
 
 /// One dispatched system call, as the recording point sees it: the fields of the event stream's
@@ -471,6 +482,10 @@ pub struct Record {
 struct State {
     tables: Tables,
     waits: LockWaits,
+    /// Each server's handler, in its slot while no request runs on it (`dispatch::ipc`).
+    handlers: BTreeMap<ServerId, Option<Box<dyn SessionHandler>>>,
+    /// Senders woken by other threads' dispatches, for [`Dispatcher::take_woken`].
+    woken: Vec<Woken>,
 }
 
 /// The locked tables, as a call that declared `B` may see them.
@@ -524,6 +539,8 @@ impl Dispatcher {
             state: Mutex::new(State {
                 tables,
                 waits: LockWaits::default(),
+                handlers: BTreeMap::new(),
+                woken: Vec::new(),
             }),
             timer: None,
         }
@@ -704,15 +721,23 @@ impl Dispatcher {
                     &[u64::from(core.cast_unsigned())],
                 )
             }),
-            SvcId::CloseHandle => self.call::<(&mut HandleTable, &mut Scheduler)>(
-                call,
-                |(handles, scheduler), call, _| {
-                    returning(id, convention, call.regs, |[closing]| {
-                        handle::close_handle(handles, scheduler, Handle::from_register(closing))?;
-                        Ok([])
-                    })
-                },
-            ),
+            SvcId::CloseHandle => {
+                let outcome = self.call::<(&mut HandleTable, &mut Scheduler)>(
+                    call,
+                    |(handles, scheduler), call, _| {
+                        returning(id, convention, call.regs, |[closing]| {
+                            let closing = Handle::from_register(closing);
+                            handle::close_handle(handles, scheduler, closing)?;
+                            Ok([])
+                        })
+                    },
+                );
+                // A session whose last handle closed: its server forgets it now, if it is free.
+                self.settle_notices();
+                outcome
+            }
+            SvcId::ConnectToNamedPort => self.connect_to_named_port(call, id, convention),
+            SvcId::SendSyncRequest => self.send_sync_request(call, id, convention),
             SvcId::GetSystemTick => self.call::<()>(call, |(), call, time| {
                 complete(id, convention, call.regs, &[tick::get_system_tick(time)])
             }),
@@ -838,7 +863,7 @@ fn recorded_args(id: Option<SvcId>, passed: &[u64; SVC_ARG_COUNT]) -> [u64; SVC_
 /// the guest.
 fn recorded_result(id: Option<SvcId>, outcome: &Outcome, regs: &GuestRegs) -> Option<ResultCode> {
     match outcome {
-        Outcome::EnvFailed(_) => None,
+        Outcome::EnvFailed(_) | Outcome::Waiting => None,
         Outcome::NotImplemented => Some(KernelError::NotImplemented.code()),
         Outcome::ProcessExited => Some(ResultCode::SUCCESS),
         Outcome::Completed => {

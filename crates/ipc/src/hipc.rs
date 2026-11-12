@@ -232,6 +232,10 @@ impl ReceiveList {
     }
 }
 
+/// Where the second header word keeps its "a special header follows" flag
+/// (`eden/src/core/hle/ipc.h`, `CommandHeader::enable_handle_descriptor`, bit 31).
+const SPECIAL_HEADER_FLAG_BIT: u32 = 31;
+
 /// The two HIPC header words.
 ///
 /// Word 0: bits 0..16 type, then four 4-bit counts of X, A, B and W descriptors. Word 1: bits
@@ -273,8 +277,16 @@ impl CommandHeader {
             num_w: (w0 >> 28) & 0xF,
             raw_data_words: w1 & MAX_RAW_WORDS,
             receive_list: ReceiveList::from_flag((w1 >> 10) & 0xF),
-            has_special_header: w1 >> 31 != 0,
+            has_special_header: Self::special_header_follows(w1),
         })
+    }
+
+    /// Whether the second header word says a [`SpecialHeader`] follows (its bit 31), read
+    /// without decoding the rest. The kernel's half of a request (the process id and the
+    /// handles) is found from this and the special header alone, whatever the message type.
+    #[must_use]
+    pub const fn special_header_follows(word1: u32) -> bool {
+        word1 >> SPECIAL_HEADER_FLAG_BIT != 0
     }
 
     /// Encodes the two header words, checking every field against its bit-width.
@@ -295,7 +307,7 @@ impl CommandHeader {
             | self.num_w << 28;
         let w1 = self.raw_data_words
             | self.receive_list.to_flag()? << 10
-            | u32::from(self.has_special_header) << 31;
+            | u32::from(self.has_special_header) << SPECIAL_HEADER_FLAG_BIT;
         Ok([w0, w1])
     }
 }

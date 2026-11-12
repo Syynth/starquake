@@ -52,6 +52,11 @@
 //! - **What a run keeps in memory is capped by fixed numbers** ([`Limits`]): the golden trace
 //!   keeps its first events and the guest log its first lines, and both say when they stopped.
 //!   The observability spec's size cap per run, with its own flags, replaces the constants.
+//! - **A thread that waits ends the run.** A `SendSyncRequest` whose request waits behind
+//!   another or is deferred leaves the calling thread waiting ([`Outcome::Waiting`]). With one
+//!   thread and nothing to deliver a deferred reply to it, the run ends there as an emulator
+//!   error ([`WAITING`]). None of the services a run has yet ([`crate::hle`]) defers. Kernel
+//!   slice 10 runs other threads while one waits, and delivers deferred replies.
 //! - **The environment** is live, with a fixed random seed and nothing recorded to disk; the
 //!   `--clock`, `--seed` and `--record` flags of the headless contract are not built. Its
 //!   recording, which grows by a clock reading per system call, is dropped as it is made (test:
@@ -81,6 +86,7 @@ use starquake_trace::{
 
 use crate::clock::Timebase;
 use crate::crash::{CrashReport, Exception};
+use crate::hle;
 use crate::image::Placement;
 use crate::report::{ExitReason, RunOptions, RunReport, empty_dump};
 use crate::space::Touch;
@@ -101,6 +107,9 @@ const FLIGHT_CAPACITY: usize = 4096;
 const LAST_EVENTS: usize = 32;
 /// Seed of the environment's random numbers (the `--seed` flag is not built).
 const RANDOM_SEED: u64 = 0;
+/// How a run ends when its one guest thread waits for an IPC reply (see the module docs).
+pub(crate) const WAITING: &str = "the guest thread waits for an IPC reply, and this loop has no \
+                                  other thread to run until it comes";
 
 /// The guest's address space as the loop uses it: its memory, as the kernel reads and writes
 /// it, and the two things the loop itself asks of it. `V` is the vCPU the loop runs.
@@ -532,6 +541,9 @@ fn drive<V: Vcpu, C: HostClock + Clone + 'static>(
         Ok(handle) => handle,
         Err(error) => return Ending::Failed(format!("the kernel could not be set up: {error}")),
     };
+    if let Err(error) = hle::install(&dispatcher) {
+        return Ending::Failed(format!("the services could not be set up: {error}"));
+    }
 
     if let Err(error) = start(vcpu, space, session.placed, main_thread) {
         return vcpu_failed(error);
@@ -596,6 +608,7 @@ fn drive<V: Vcpu, C: HostClock + Clone + 'static>(
                             "the environment failed during svc {number:#x}: {error}"
                         ));
                     }
+                    Outcome::Waiting => return Ending::Failed(WAITING.to_owned()),
                 }
             }
             Exit::DataAbort { address, write, .. } => {

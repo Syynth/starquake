@@ -34,7 +34,6 @@ dependencies = [
     "starquake-gsv",
     "starquake-ipc",
     "starquake-render",
-    "starquake-services",
     "starquake-shader",
 ]
 reason = "core wires the whole stack (docs/architecture.md, 'Crates and dependency direction'); the walking skeleton joins the loader, cpu, kernel and trace crates, and the service, graphics and IPC layers join it as milestone 1's later steps land (docs/roadmap.md, 'Route to milestone 1')"
@@ -58,11 +57,6 @@ reason = "the graphics service layer sits on services and gpu (docs/architecture
 package = "starquake-gsv"
 dependencies = ["thiserror", "tracing"]
 reason = "error type and logging arrive with the crate's first handler"
-
-[[allow]]
-package = "starquake-kernel"
-dependencies = ["starquake-ipc"]
-reason = "sessions and SendSyncRequest parse requests with starquake-ipc (docs/specs/kernel.md, slice 9); the kernel slices before it do not touch IPC"
 
 [[allow]]
 package = "starquake-loader"
