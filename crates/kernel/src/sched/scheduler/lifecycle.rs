@@ -223,7 +223,9 @@ impl Scheduler {
     }
 
     /// `KThread::Finalize`: the thread's region goes back to its process, the process forgets
-    /// it, any core that still names it lets it go, and its row is removed. Only a thread that
+    /// it, the waiters of the locks it still holds end their waits with
+    /// [`KernelError::InvalidState`] (`Scheduler::release_held_locks`), any core that still
+    /// names it lets it go, and its row is removed. Only a thread that
     /// was never started or has ended can lose its last reference; anything else is broken
     /// bookkeeping.
     fn destroy_thread(&mut self, id: ThreadId) -> CallResult<()> {
@@ -245,6 +247,8 @@ impl Scheduler {
             }
             record.threads.remove(&id);
         }
+        // Finalize's "Release any waiters": the locks it still holds end their waiters' waits.
+        let released = self.release_held_locks(id);
         for core in &mut self.cores {
             if core.highest == Some(id) {
                 core.highest = None;
@@ -256,7 +260,7 @@ impl Scheduler {
             }
         }
         self.threads.remove(id).map_err(SchedError::from)?;
-        Ok(())
+        released
     }
 
     /// Ends a thread (`KThread::Exit` for the calling thread, `RequestTerminate` for another):

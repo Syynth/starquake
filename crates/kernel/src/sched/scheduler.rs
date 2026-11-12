@@ -7,7 +7,8 @@
 //! - `eden/src/core/hle/kernel/k_scheduler_lock.h`: `Unlock`, as [`Scheduler::update`].
 //! - `eden/src/core/hle/kernel/k_thread.cpp`: `Initialize` (scheduler fields), `Run`,
 //!   `SetState`, `RequestSuspend`, `Resume`, `TrySuspend`, `UpdateState`, `SetActivity`,
-//!   `SetBasePriority`, `RestorePriority` (without inheritance) and `SetCoreMask`.
+//!   `SetBasePriority`, `SetPriority` and `SetCoreMask`. `RestorePriority`, with inheritance
+//!   over held locks, is `crate::sync::lock`'s.
 //!
 //! Every method that takes a [`ThreadId`] looks the row up once to check it, then works through
 //! ids: Eden's `KThread*` becomes an id, and `thread->Field()` a slab lookup. An id a caller
@@ -277,6 +278,7 @@ impl Scheduler {
         let thread = Thread {
             state: ThreadState::Initialized,
             suspend_flags: 0,
+            suspend_requested: 0,
             priority,
             base_priority: priority,
             affinity: AffinityMask::single(core),
@@ -336,27 +338,38 @@ impl Scheduler {
         Ok(())
     }
 
-    /// Adds a suspend request (`KThread::RequestSuspend`, then `TrySuspend`, which always
-    /// suspends until slice 5 adds kernel waiters).
+    /// Adds a suspend request (`KThread::RequestSuspend`), then tries to suspend
+    /// (`TrySuspend`): a thread that kernel waiters wait on keeps running with the request
+    /// noted ([`Thread::suspend_requested`]) but not in its state ([`Thread::suspend_flags`]).
     pub fn request_suspend(&mut self, id: ThreadId, kind: SuspendType) -> Result<(), SchedError> {
         let thread = self.thread_mut(id)?;
-        let flags = thread.suspend_flags | kind.bit();
-        self.update_suspend_flags(id, flags)
+        thread.suspend_requested |= kind.bit();
+        if self.sync.locks().kernel_waiters(id) > 0 {
+            return Ok(());
+        }
+        self.update_suspend_flags(id)
     }
 
-    /// Withdraws a suspend request (`KThread::Resume`).
+    /// Withdraws a suspend request (`KThread::Resume`), and puts the requests into the state.
     pub fn resume(&mut self, id: ThreadId, kind: SuspendType) -> Result<(), SchedError> {
         let thread = self.thread_mut(id)?;
-        let flags = thread.suspend_flags & !kind.bit();
-        self.update_suspend_flags(id, flags)
+        thread.suspend_requested &= !kind.bit();
+        self.update_suspend_flags(id)
+    }
+
+    /// Lets the scheduler's other tables ask for the cores' threads to be worked out again at
+    /// the next [`Scheduler::update`] (`KScheduler::SetSchedulerUpdateNeeded`).
+    pub(crate) fn note_update_needed(&mut self) {
+        self.update_needed = true;
     }
 
     /// `KThread::UpdateState`: put the requested flags into the state and tell the scheduler
     /// if that changed it.
-    fn update_suspend_flags(&mut self, id: ThreadId, flags: u8) -> Result<(), SchedError> {
+    fn update_suspend_flags(&mut self, id: ThreadId) -> Result<(), SchedError> {
         let thread = self.thread_mut(id)?;
         let was_queued = thread.is_queued();
         let old_flags = thread.suspend_flags;
+        let flags = thread.suspend_requested;
         thread.suspend_flags = flags;
         if old_flags != flags {
             self.on_thread_state_changed(id, was_queued)?;
@@ -400,16 +413,29 @@ impl Scheduler {
         self.restore_priority(caller, id)
     }
 
-    /// `KThread::RestorePriority` for one thread with no held locks: the effective priority
-    /// becomes the base priority. Inheritance (slice 5) walks lock owners from here.
+    /// `KThread::RestorePriority`: the effective priority becomes the most urgent of the base
+    /// priority and what the thread inherits from its locks' waiters, and the change walks up
+    /// the owners of the locks it waits on (`crate::sync::lock`).
     fn restore_priority(&mut self, caller: CoreId, id: ThreadId) -> Result<(), SchedError> {
+        self.restore_priority_chain(Some(caller), id)
+    }
+
+    /// Sets a thread's effective priority (`KThread::SetPriority`) and, if that changed it,
+    /// tells the queues (`KScheduler::OnThreadPriorityChanged`). `caller` is the core making
+    /// the call, if a core is: if `id` is its current thread it stays at the front of its new
+    /// level. The priority-inheritance walk (`crate::sync::lock`) is the only caller.
+    pub(crate) fn set_effective_priority(
+        &mut self,
+        caller: Option<CoreId>,
+        id: ThreadId,
+        priority: Priority,
+    ) -> Result<(), SchedError> {
         let thread = self.thread_mut(id)?;
-        let new_priority = thread.base_priority;
-        if new_priority == thread.priority {
+        let old_priority = thread.priority;
+        if old_priority == priority {
             return Ok(());
         }
-        let old_priority = thread.priority;
-        thread.priority = new_priority;
+        thread.priority = priority;
         self.on_thread_priority_changed(caller, id, old_priority)
     }
 
@@ -536,15 +562,19 @@ impl Scheduler {
         Ok(())
     }
 
-    /// `KScheduler::OnThreadPriorityChanged`.
+    /// `KScheduler::OnThreadPriorityChanged`. `caller` is the core making the call, if a core
+    /// is (a timer or a host thread is not): its current thread is "running".
     fn on_thread_priority_changed(
         &mut self,
-        caller: CoreId,
+        caller: Option<CoreId>,
         id: ThreadId,
         old_priority: Priority,
     ) -> Result<(), SchedError> {
         if self.thread(id)?.is_queued() {
-            let is_running = self.core(caller)?.current == Some(id);
+            let is_running = match caller {
+                Some(caller) => self.core(caller)?.current == Some(id),
+                None => false,
+            };
             self.queue
                 .change_priority(&mut self.threads, old_priority, is_running, id)?;
             self.count_scheduled(id)?;

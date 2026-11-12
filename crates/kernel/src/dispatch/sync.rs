@@ -59,7 +59,8 @@ pub enum WakeError {
 }
 
 /// Records the event of every wait that ended since the last drain, at `time`, and reports its
-/// thread woken: the recording point for a `WaitSynchronization` that waited.
+/// thread woken: the recording point for a call that waited (`WaitSynchronization`, and the
+/// arbitration calls of `dispatch/arbitration.rs`), each event for the call its wake names.
 pub(super) fn drain_wakes(state: &mut State, recorder: &Recorder, time: GuestTicks) {
     for wake in state.tables.scheduler.take_wakes() {
         let origin = wake.origin;
@@ -68,7 +69,7 @@ pub(super) fn drain_wakes(state: &mut State, recorder: &Recorder, time: GuestTic
             origin.core,
             origin.thread,
             EventKind::Svc {
-                id: u32::from(SvcId::WaitSynchronization.number()),
+                id: u32::from(wake.call.number()),
                 args: origin.args,
                 // The one place a woken waiter's result becomes the event stream's word.
                 result: starquake_trace::ResultCode(wake.result.raw()),

@@ -57,6 +57,9 @@
 //!   [`Outcome::Waiting`] the way `SendSyncRequest` does, and its event is recorded when the
 //!   wait ends, by whichever dispatch (or [`Dispatcher::signal_event`],
 //!   [`Dispatcher::fire_timers`]) records the wake. `dispatch/sync.rs` says how.
+//! - **Arbitration** (`ArbitrateLock`, `ArbitrateUnlock`, `WaitProcessWideKeyAtomic`,
+//!   `SignalProcessWideKey`, `WaitForAddress`, `SignalToAddress`) has arms of its own, in
+//!   `dispatch/arbitration.rs`; the three that can wait use the same wait path.
 //! - **`ExitProcess`** ends the process ([`crate::svc::process::exit_process`]: its threads end
 //!   and its handles close, so the servers of its sessions are told) and the dispatch in
 //!   [`Outcome::ProcessExited`]; the caller stops running the guest. **`ExitThread`** ends the
@@ -214,6 +217,7 @@ use crate::svc::{
 };
 use crate::tables::{AddressSpace, Processes, Scheduler};
 
+mod arbitration;
 mod ipc;
 mod lifecycle;
 mod sync;
@@ -847,6 +851,7 @@ impl Dispatcher {
             | SvcId::WaitSynchronization
             | SvcId::CancelSynchronization
             | SvcId::CreateEvent => self.synchronization(call, id, convention),
+            _ if arbitration::ARMS.contains(&id) => self.arbitration(call, id, convention),
             SvcId::ConnectToNamedPort => self.connect_to_named_port(call, id, convention),
             SvcId::SendSyncRequest => self.send_sync_request(call, id, convention),
             SvcId::GetSystemTick => self.call::<()>(call, |(), call, time| {

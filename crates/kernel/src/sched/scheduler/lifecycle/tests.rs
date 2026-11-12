@@ -438,6 +438,7 @@ fn a_thread_that_terminates_wakes_its_waiters_and_the_last_wait_reference_destro
         vec![Wake {
             thread: waiter,
             origin: origin(),
+            call: crate::svc::SvcId::WaitSynchronization,
             result: ResultCode::SUCCESS,
             index: 0,
         }]

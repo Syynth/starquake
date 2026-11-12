@@ -107,14 +107,26 @@
 //!   Only server sessions do (`KServerSession`), and they are deferred (kernel spec, "IPC");
 //!   they bring the mapping with them.
 
+pub mod arbiter;
+pub mod condvar;
 pub mod event;
+pub mod lock;
+pub mod tree;
 pub mod wait;
+pub mod words;
 
+#[cfg(test)]
+mod testing;
 #[cfg(test)]
 mod tests;
 
+pub use arbiter::{ArbitrationType, SignalType, modified_value};
+pub use condvar::{HAS_NO_WAITER_FLAG, HAS_WAITER_FLAG};
 pub use event::{Event, ReadableEvent};
+pub use lock::{AddressKey, Arbitrated, HANDLE_WAIT_MASK, HeldLock, LockTable, NO_OWNER};
+pub use tree::{ProcessKey, WaitTree};
 pub use wait::{
     ARGUMENT_HANDLE_COUNT_MAX, SyncTable, TIMEOUT_SLACK_NS, Timeout, TimerEntry, Wait, WaitBegun,
-    WaitOrigin, WaitToken, Wake, is_synchronization_object,
+    WaitCall, WaitOrigin, WaitToken, Wake, is_synchronization_object,
 };
+pub use words::{GuestWords, UserWords, WORD_SIZE};
