@@ -24,11 +24,13 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
         with:
-          tool: cargo-nextest,cargo-deny,cargo-machete
+          tool: cargo-nextest@0.9.140,cargo-deny@0.19.8,cargo-machete@0.9.2
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       # rust-toolchain.toml pins the compiler; rustup installs it on first use.
       # Under CI the gate fails if cargo-deny or cargo-machete is missing, so the supply-chain and
-      # unused-dependency checks always run.
+      # unused-dependency checks always run. The versions are pinned (xtask/tool-versions.toml is
+      # the source; a test fails when this file differs from it, and the gate fails under CI when
+      # an installed plugin differs), so a tool release cannot turn main red.
       - run: cargo xtask ci
 
   # The full macOS gate runs on main only: hosted macOS minutes cost 10x, and every PR is already
@@ -44,7 +46,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
         with:
-          tool: cargo-nextest,cargo-deny,cargo-machete
+          tool: cargo-nextest@0.9.140,cargo-deny@0.19.8,cargo-machete@0.9.2
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       # Under CI the gate fails if cargo-deny or cargo-machete is missing, so the supply-chain and
       # unused-dependency checks always run.

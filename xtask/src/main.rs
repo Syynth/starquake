@@ -6,7 +6,11 @@
     reason = "a command-line tool: progress and errors go to stderr"
 )]
 
+mod host_access;
+mod table_deps;
+mod tools;
 mod unused_deps;
+mod walk;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
@@ -192,6 +196,11 @@ enum Action {
     Cargo(Vec<&'static str>),
     /// Fail if a registry dependency in the root `[workspace.dependencies]` has no user.
     WorkspaceDependencies,
+    /// Fail if a dev, build or target-specific dependency of a member is named by no source.
+    TableDependencies,
+    /// Fail if kernel or service code reaches the host clock, randomness, file system or
+    /// network directly (`host_access`).
+    HostAccess,
     /// Run `cargo machete` and compare its findings with `xtask/unused-deps.toml`.
     Machete,
 }
@@ -285,6 +294,14 @@ fn steps(plan: Plan) -> Vec<Step> {
             name: "workspace-deps",
             action: Action::WorkspaceDependencies,
         },
+        Step {
+            name: "table-deps",
+            action: Action::TableDependencies,
+        },
+        Step {
+            name: "host-access",
+            action: Action::HostAccess,
+        },
     ];
     if plan.machete {
         steps.push(Step {
@@ -323,12 +340,42 @@ fn steps(plan: Plan) -> Vec<Step> {
     steps
 }
 
-/// Whether `cargo <subcommand> --version` works, i.e. the cargo plugin is installed.
-fn has_cargo_plugin(subcommand: &str) -> bool {
-    cargo()
-        .args([subcommand, "--version"])
-        .output()
-        .is_ok_and(|output| output.status.success())
+/// The standard output of `cargo <subcommand> --version`, or `None` if the cargo plugin is not
+/// installed (the command fails).
+fn plugin_version_output(subcommand: &str) -> Option<String> {
+    let output = cargo().args([subcommand, "--version"]).output().ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Compares each installed plugin with its pin in `xtask/tool-versions.toml`. A mismatch is
+/// printed; under CI it also fails the step, locally it is a notice. Returns whether the gate
+/// may go on.
+fn check_tool_versions(pins: &tools::Pins, in_ci: bool) -> bool {
+    let mut checks = Vec::new();
+    for (subcommand, tool) in tools::PLUGINS {
+        let Some(output) = plugin_version_output(subcommand) else {
+            continue;
+        };
+        let Some(pinned) = pins.version(tool) else {
+            continue;
+        };
+        let check = tools::check_output(&output, pinned);
+        if let Some(notice) = tools::describe(tool, &check, pinned) {
+            eprintln!(
+                "==> {tool}: {}{notice}",
+                if tools::passes(&check, in_ci) {
+                    "NOTICE, "
+                } else {
+                    "FAILED, "
+                }
+            );
+        }
+        checks.push((tool, check));
+    }
+    tools::version_verdict(&checks, in_ci)
 }
 
 /// Which optional cargo plugins are installed.
@@ -452,6 +499,78 @@ fn workspace_dependencies() -> bool {
     verdict.is_clean()
 }
 
+/// Checks the dev, build and target-specific dependency tables (which `cargo machete` skips)
+/// against the sources and the `[[allow_tables]]` entries of the allow-list. Returns whether the
+/// step passes.
+fn table_dependencies() -> bool {
+    let allowlist = match unused_deps::Allowlist::parse(unused_deps::ALLOWLIST) {
+        Ok(allowlist) => allowlist,
+        Err(error) => {
+            eprintln!("{error}");
+            return false;
+        }
+    };
+    let found = match table_deps::check_table_dependencies(Path::new(".")) {
+        Ok(found) => found,
+        Err(error) => {
+            eprintln!("{error}");
+            return false;
+        }
+    };
+    let pairs: Vec<_> = found.iter().map(|found| found.unused.clone()).collect();
+    let verdict = unused_deps::judge(&pairs, &allowlist, unused_deps::Scope::Tables);
+    let plain = |package: &str| {
+        package
+            .strip_prefix(unused_deps::TABLES_SCOPE)
+            .unwrap_or(package)
+            .to_owned()
+    };
+    for unused in &verdict.unlisted {
+        let table = found
+            .iter()
+            .find(|found| found.unused == *unused)
+            .map_or("", |found| found.table.as_str());
+        eprintln!(
+            "unused dependency: {} / {} in [{table}] is named by none of the crate's sources: \
+             remove it, or, if it is used in a way a text search cannot see (a library name that \
+             differs from the package name, say) or is declared ahead of a planned task, list it \
+             with the reason under [[allow_tables]] in xtask/unused-deps.toml",
+            plain(&unused.package),
+            unused.dependency
+        );
+    }
+    for unused in &verdict.stale {
+        eprintln!(
+            "stale [[allow_tables]] entry in xtask/unused-deps.toml: {} / {} is now used or no \
+             longer declared; delete the entry",
+            plain(&unused.package),
+            unused.dependency
+        );
+    }
+    verdict.is_clean()
+}
+
+/// Checks that kernel and service code does not reach the host directly. Returns whether the
+/// step passes.
+fn host_access() -> bool {
+    let violations = match host_access::check(Path::new(".")) {
+        Ok(violations) => violations,
+        Err(error) => {
+            eprintln!("{error}");
+            return false;
+        }
+    };
+    for violation in &violations {
+        eprintln!(
+            "{}:{}: {} reaches {}; kernel and service code reads the clock, randomness and host \
+             I/O only through the injectable Env (docs/specs/observability.md, \"Replaying the \
+             kernel and services\"). Test code is exempt.",
+            violation.file, violation.finding.line, violation.finding.path, violation.finding.what
+        );
+    }
+    violations.is_empty()
+}
+
 fn ci(offline: bool) -> ExitCode {
     let in_ci = std::env::var_os("CI").is_some();
     if let Err(refusal) = start(offline, in_ci) {
@@ -461,10 +580,17 @@ fn ci(offline: bool) -> ExitCode {
     if !disk_ok() {
         return ExitCode::FAILURE;
     }
+    let pins = match tools::Pins::parse(tools::PINS) {
+        Ok(pins) => pins,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    };
     let installed = Installed {
-        nextest: has_cargo_plugin("nextest"),
-        deny: has_cargo_plugin("deny"),
-        machete: has_cargo_plugin("machete"),
+        nextest: plugin_version_output("nextest").is_some(),
+        deny: plugin_version_output("deny").is_some(),
+        machete: plugin_version_output("machete").is_some(),
     };
     let plan = match plan_for(installed, in_ci, offline) {
         Ok(plan) => plan,
@@ -473,11 +599,18 @@ fn ci(offline: bool) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    for (present, tool) in [(installed.deny, "deny"), (installed.machete, "machete")] {
+    if !check_tool_versions(&pins, in_ci) {
+        return ExitCode::FAILURE;
+    }
+    for (present, (_, crate_name)) in [
+        (installed.deny, tools::PLUGINS[1]),
+        (installed.machete, tools::PLUGINS[2]),
+    ] {
         if !present {
             eprintln!(
-                "==> {tool}: SKIPPED, cargo-{tool} is not installed (CI always runs it; \
-                 `cargo install cargo-{tool} --locked` to run it here)"
+                "==> {crate_name}: SKIPPED, not installed (CI always runs it; `cargo install {} \
+                 --locked` to run it here)",
+                tools::install_argument(crate_name, pins.version(crate_name).unwrap_or("*"))
             );
         }
     }
@@ -501,6 +634,17 @@ fn ci(offline: bool) -> ExitCode {
             Action::WorkspaceDependencies => {
                 eprintln!("==> {name}: [workspace.dependencies] against the members");
                 workspace_dependencies()
+            }
+            Action::TableDependencies => {
+                eprintln!("==> {name}: dev, build and target dependencies against the sources");
+                table_dependencies()
+            }
+            Action::HostAccess => {
+                eprintln!(
+                    "==> {name}: no host clock, randomness, file or network access in {}",
+                    host_access::CRATES.join(", ")
+                );
+                host_access()
             }
             Action::Machete => {
                 eprintln!("==> {name}: cargo machete against xtask/unused-deps.toml");
@@ -709,6 +853,8 @@ mod tests {
             [
                 "fmt",
                 "workspace-deps",
+                "table-deps",
+                "host-access",
                 "machete",
                 "deny",
                 "clippy",
@@ -727,7 +873,15 @@ mod tests {
         };
         assert_eq!(
             names(&steps(plan)),
-            ["fmt", "workspace-deps", "clippy", "test", "doctest"]
+            [
+                "fmt",
+                "workspace-deps",
+                "table-deps",
+                "host-access",
+                "clippy",
+                "test",
+                "doctest"
+            ]
         );
         let plan = Plan {
             machete: false,
@@ -746,6 +900,8 @@ mod tests {
             action_of("workspace-deps"),
             Some(&Action::WorkspaceDependencies)
         );
+        assert_eq!(action_of("table-deps"), Some(&Action::TableDependencies));
+        assert_eq!(action_of("host-access"), Some(&Action::HostAccess));
         assert_eq!(action_of("machete"), Some(&Action::Machete));
     }
 

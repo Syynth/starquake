@@ -16,10 +16,25 @@ tools/refs-path.sh      # prints the folder; STARQUAKE_REFS overrides it
 | `eden-pr4588` | Eden PR #4588 (`ponting/eden`, branch `ns2-support`) | `e5fb3b97c94b` | GPL-3.0-or-later | Native Ampere shader frontend and its tests, six cores, graphics supervisor protocol |
 | `mesa-nouveau` | Mesa (`src/nouveau/{compiler,headers,nil,mme}` only) | `52238762dd44` | MIT | NAK shader encodings, NVIDIA class headers, image layout, MME simulator |
 | `libnx` | libnx (`switchbrew/libnx`, branch `master`) | `b156b4774fb2` | ISC | The client side of IPC: how a homebrew program lays out CMIF, domain and TIPC requests (`nx/include/switch/sf/{hipc,cmif,tipc}.h`) |
+| `atmosphere` | Atmosphère (`Atmosphere-NX/Atmosphere`, branch `master`) | `4e3f37038d9e` | GPL-2.0-only | **Facts only**: result codes (`libraries/libvapours/include/vapours/results/`), kernel behaviour (`libraries/libmesosphere`), system-module command ids and layouts (`stratosphere`). Never ported from |
 | `rapid-arm-emu` | rapid-arm-emu | `d762465dfd05` | GPL-3.0-only (no "or later" grant) | A64 decoder and software MMU, for a later x86-64 JIT |
+
+`tools/fetch-refs.sh` never prompts for credentials (every source is fetched anonymously), stops at
+the first source it cannot fetch with a message naming it, and does not touch the network for a
+folder that is already at its pinned commit.
 
 Rules:
 
+- **Atmosphère is for facts only.** Its licence is GPL-2.0-only (its README says GPLv2; we found
+  no "or later" grant), which cannot be combined with this project's GPL-3.0-or-later, so none of
+  its code is ported, translated or paraphrased closely. Read it to settle a fact (a result code's
+  value, a command id, a struct layout), write the code from the fact, and cite the file in the
+  comment: `// Value from atmosphere/libraries/libvapours/include/vapours/results/<file> @ 4e3f3703 (fact only)`.
+  A comment that cites it says "fact only". Bring the fact, not the expression.
+- **libnx is ISC**, a permissive licence: code may be ported from it, but the ISC notice from
+  `libnx/LICENSE.md` (copyright line and permission text) travels with the port, in the file
+  header next to the citation. The source files carry only `@copyright libnx Authors`; the
+  permission text is in that file. (`CLAUDE.md`, "Licensing", has the whole list.)
 - Cite what you port: `// Ported from Eden src/core/hle/service/hle_ipc.cpp @ cf654052 (GPL-3.0-or-later)`.
 - Reference paths in code, docs, issues and PRs are relative to the reference folder
   (`eden/src/...`), never absolute paths on someone's machine.
@@ -29,6 +44,15 @@ Rules:
   x86-64 JIT starts.
 
 ## Documentation sources
+
+The **Arm Architecture Reference Manual for A-profile architecture (Arm DDI 0487)** is the source
+that comments in `crates/memory` and `crates/cpu` cite for descriptor bits, system registers and
+`ESR_EL1` layouts. It is not a git repository, and Arm distributes it as PDF and HTML only
+(`https://developer.arm.com/documentation/ddi0487/latest`), so it cannot be pinned to a commit and
+is not fetched. The issue letter is not recorded in the existing citations. Cite it as the code does:
+`Arm DDI 0487`, then the section **by name** (the numbering moves between issues), and mark a
+bit position you did not check against the manual as unchecked. Treat a layout taken from memory
+as a guess until a vCPU run (`tools/hvprobe`) or the manual confirms it.
 
 A few layout facts are in none of the pinned sources above. They come from the SwitchBrew wiki,
 which is not a git repository, so it cannot be pinned to a commit. The pages were read on
