@@ -4,14 +4,20 @@
 //! Structure from `eden-nx2/src/video_core/gpu_split.{h,cpp}` @ 50fa86bb (GPL-3.0-or-later): a
 //! power-of-two array of 64-bit words, a write position the producer *publishes* in batches,
 //! and a consumed position the consumer hands back; the consumer spins briefly and then sleeps
-//! when the ring is empty, and the producer waits (spinning, then sleeping) when it is full. Two
-//! differences, both invisible to the entries:
+//! when the ring is empty, and the producer waits when it is full. The differences, none of
+//! which changes what the consumer receives or in what order:
 //!
-//! - The words are atomics written and read with relaxed ordering, published by a release store
-//!   of the write position and acquired by the consumer, so the ring needs no `unsafe`.
+//! - The words are atomics written and read with relaxed ordering, published by a sequentially
+//!   consistent store of the write position that the consumer loads before reading them, so the
+//!   ring needs no `unsafe`.
 //! - An entry may wrap around the end of the array (each word's index is taken modulo the
 //!   capacity), so there is no wrap marker; Eden-NX2 writes a `Wrap` entry and skips to the
 //!   start.
+//! - There is no `Drain` (the front never waits for the back to empty the ring; the spec's
+//!   "Semaphore acquires"), so the batch size is fixed at [`PUBLISH_EVERY`]; Eden-NX2 drops it to
+//!   8 words after a drain and doubles it back.
+//! - A full producer spins, then sleeps until the consumer frees space; Eden-NX2's yields in a
+//!   loop.
 //!
 //! The ring delivers entries in exactly the order they were pushed, which is ordering guarantees
 //! 1 and 2 of the spec (within a channel in method order; across channels in the order the front
