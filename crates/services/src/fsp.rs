@@ -49,8 +49,10 @@
 //! reads the host itself: every question goes through the injectable environment's host I/O
 //! channel ([`host`]), which the server is given with
 //! [`Server::with_env`](crate::framework::Server::with_env). Opening the SD card asks whether it
-//! is there, opening a file and `GetSize` ask the file's size, and each answers at once: they
-//! read metadata, never the file's contents. `Read` is the one command whose cost grows with what
+//! is there, opening a file and `GetSize` ask the file's size, and each waits for the answer on
+//! the core thread: they read metadata, never the file's contents, but they are blocking host I/O
+//! all the same (see "Where this departs from the service spec"). `Read` is the one command whose
+//! cost grows with what
 //! the guest asks for, so it never blocks the handler: it takes a reply token and hands the read
 //! to the server's executor ([`work`](crate::framework::work)), whose job asks the host for the
 //! bytes and completes the token with them. The bytes go into the caller's buffer when the reply
@@ -59,7 +61,8 @@
 //! The host memory one read needs is the bytes it returns: at most the size the guest asked for,
 //! which is at most its buffer's size, and never more than the file holds from the offset on.
 //!
-//! Sessions hold plain data (a mount and a path), so they are saved with the server.
+//! Sessions hold plain data (a mount and a path), so they are saved with the server. Their bytes
+//! are pinned by `an_open_file_s_snapshot_bytes_are_pinned`.
 //!
 //! # Where this differs from Eden
 //!
@@ -79,12 +82,24 @@
 //!   (`set_current_process_without_a_process_id_is_target_not_found`). Eden stores the id for its
 //!   save-data and RomFS commands; none is in this subset, so nothing is kept.
 //! - **Paths.** Eden's `IFileSystem` hands the path to `VfsDirectoryServiceWrapper::OpenFile`
-//!   (`eden/src/core/hle/service/filesystem/filesystem.cpp`), which runs `Common::FS::SanitizePath`
-//!   (which turns backslashes into separators and drops a `..` at the root) and strips leading
-//!   separators, so a relative path, or one that climbs above the root, still names a file. Here the path goes through [`path::normalize`], as a RomFS lookup needs
+//!   (`eden/src/core/hle/service/filesystem/filesystem.cpp`), which runs
+//!   `Common::FS::SanitizePath` (which turns backslashes into separators and drops a `..` at the
+//!   root) and strips leading separators, so a relative path, or one that climbs above the root,
+//!   still names a file. Here the path goes through [`path::normalize`], as a RomFS lookup needs
 //!   (`docs/proposals.md`): it must start with `/`, may not climb above the root, and may not
 //!   hold `:*?<>|` (`a_relative_path_is_refused`, `a_path_above_the_root_is_unobtainable`,
 //!   `a_path_with_an_invalid_character_is_refused`).
+//!
+//!   The open mode is checked before the path, which is Eden's order: `Fsa::IFileSystem::OpenFile`
+//!   (`eden/src/core/file_sys/fsa/fs_i_filesystem.h`) checks the mode, then its `DoOpenFile`
+//!   reaches `SanitizePath`. The console normalises first (Atmosphère
+//!   `fssrv_filesystem_interface_adapter.cpp`, `FileSystemInterfaceAdapter::OpenFile` calls
+//!   `SetUpPath` before `m_base_fs->OpenFile`, which checks the mode; fact only), so a request
+//!   with both a bad mode and a bad path is [`result::INVALID_OPEN_MODE`] here and a path error
+//!   on the console (`open_file_checks_eden_s_modes_then_read_only`). Eden's order is kept
+//!   because this module ports Eden's `IFileSystem`, and only a request with both faults at once
+//!   can tell the orders apart. That no title sends one is **a guess**; a trace of a title that
+//!   does would settle it.
 //! - **The path's buffer.** Eden copies at most `sizeof(Sf::Path)` (0x301) bytes of the buffer
 //!   into a zeroed path and then reads it as a C string, past its end if none of the 0x301 bytes
 //!   is zero. Here the path ends there (`a_path_with_no_terminator_ends_at_its_struct`). A
@@ -107,11 +122,39 @@
 //! - **Host failures.** Eden's file system cannot fail to read a file it opened. A host failure
 //!   here (a file that went away, an I/O error, an environment that has no answer) is
 //!   [`result::PATH_NOT_FOUND`] for a missing file and [`result::HOST_IO_FAILED`] otherwise
-//!   (`a_host_failure_during_a_read_fails_the_read`).
+//!   (`a_host_failure_during_a_read_fails_the_read`). An environment that fails, or a host
+//!   failure code with no name, is [`result::HOST_IO_FAILED`] for `OpenFile` and for `Read`
+//!   (`a_broken_host_fails_open_file_and_read`). A size answer that is not exactly 8 bytes, or
+//!   that is over `i64::MAX`, is [`result::HOST_IO_FAILED`] for `OpenFile` and `GetSize`
+//!   (`a_size_answer_of_other_than_eight_bytes_fails`, `a_size_over_s64_max_fails`), and so is a
+//!   probe answered with any bytes (`a_probe_answered_with_bytes_opens_nothing`).
 //!
 //! The framework's own rules apply as for every service: an out buffer may be a B or a C
 //! descriptor, where Eden's `Read` takes B (`HipcMapAlias`) only, and an in buffer an A or an X
 //! (`framework::request`).
+//!
+//! # Where this departs from the service spec
+//!
+//! `docs/specs/services.md`, "Concurrency", says methods never block and do no blocking I/O:
+//! work that takes time goes to a worker. `OpenSdCardFileSystem`, `OpenFile` and `GetSize` do
+//! not follow it: each calls the environment's host I/O on the core thread and waits for the
+//! answer. Behind a host folder (`starquake-core`'s `HostFolder`) a probe is a `metadata` of the
+//! folder, and a size is two `canonicalize`s, a `metadata` and a `File::open`, all made while the
+//! live environment holds its lock. Only `Read` is deferred. This is a deliberate departure,
+//! left for the owner to accept or to have these three deferred like `Read`.
+//!
+//! # Snapshots and reads in flight
+//!
+//! A snapshot taken while a `Read` is deferred saves the request as pending, but not the read
+//! itself: its offset, length and buffer live only in the executor's job. A server restored
+//! from it holds a pending token that nothing completes, and [`Server::reissue`] cannot restart
+//! the read, so the guest waits for ever
+//! (`a_snapshot_with_a_read_in_flight_restores_a_read_nothing_completes`).
+//!
+//! A restored [`IFile`]'s path is checked as it is decoded: it must be what [`path::normalize`]
+//! makes of it, or the snapshot is refused
+//! (`a_snapshot_with_a_path_that_is_not_normalised_is_refused`,
+//! `a_saved_path_may_be_as_long_as_a_path_and_no_longer`).
 
 use std::sync::Arc;
 
@@ -289,6 +332,12 @@ fn check_open_mode(mode: u32) -> Result<(), ResultCode> {
     }
 }
 
+/// The form `OpenFile` gives a path before it asks the host, and that an [`IFile`] keeps: no
+/// drive or Windows forms, and only the characters paths may hold.
+fn normalise(raw: &[u8]) -> Result<Vec<u8>, path::PathError> {
+    path::normalize(raw, PATH_BUFFER_SIZE, false, false, false)
+}
+
 /// The path in a request's in buffer 0: its first [`PATH_BUFFER_SIZE`] bytes at most. It ends at
 /// its first zero byte, which is where [`path::normalize`] stops reading.
 fn read_path(cx: &mut Context<'_>, req: &Request<'_>) -> Result<Vec<u8>, crate::framework::Fault> {
@@ -311,8 +360,7 @@ impl IFileSystem {
         let mode = req.payload().read_u32()?;
         check_open_mode(mode)?;
         let raw = read_path(cx, req)?;
-        let path = path::normalize(&raw, PATH_BUFFER_SIZE, false, false, false)
-            .map_err(path::PathError::result)?;
+        let path = normalise(&raw).map_err(path::PathError::result)?;
         // The file must be there, and be a file.
         file_size(&*cx.env()?, this.mount, &path)?;
         reply.push_session(Box::new(IFile {
@@ -325,11 +373,42 @@ impl IFileSystem {
 
 /// An open file (`IFile`), read-only. The default has an empty path, which names no file: it is
 /// for looking at the command table without opening a file.
+///
+/// It is decoded from a snapshot through [`SavedFile`], which refuses a path that is not
+/// normalised (see the module docs, "Snapshots and reads in flight").
 #[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(try_from = "SavedFile")]
 pub struct IFile {
     mount: Mount,
-    /// The normalised path.
+    /// The normalised path: what [`path::normalize`] makes of it is itself.
     path: Vec<u8>,
+}
+
+/// An [`IFile`] as a snapshot holds it, before its path is checked. The fields are [`IFile`]'s,
+/// in its order, so the bytes are the same.
+#[derive(Deserialize)]
+struct SavedFile {
+    mount: Mount,
+    path: Vec<u8>,
+}
+
+/// A saved [`IFile`]'s path is not one [`IFileSystem::open_file`] could have made.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("the saved path of an open file is not a normalised path")]
+pub struct NotNormalised;
+
+impl TryFrom<SavedFile> for IFile {
+    type Error = NotNormalised;
+
+    fn try_from(saved: SavedFile) -> Result<Self, NotNormalised> {
+        if !normalise(&saved.path).is_ok_and(|normal| normal == saved.path) {
+            return Err(NotNormalised);
+        }
+        Ok(Self {
+            mount: saved.mount,
+            path: saved.path,
+        })
+    }
 }
 
 commands! {

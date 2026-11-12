@@ -13,14 +13,17 @@ use starquake_ipc::{
 use starquake_kernel::handle::Handle;
 use starquake_kernel::id::ObjectId;
 use starquake_kernel::result::{KernelError, ResultCode};
-use starquake_trace::{EnvError, HostIoReply, HostIoRequest, HostNanos};
+use starquake_trace::{EnvCall, EnvError, HostIoReply, HostIoRequest, HostNanos};
 
 use super::host::{CHANNEL, HostFailure, HostRequest, Mount};
 use super::*;
 use crate::framework::control::CONVERT_CURRENT_OBJECT_TO_DOMAIN;
 use crate::framework::fake::FakeKernel;
 use crate::framework::result::{INVALID_CMIF_REQUEST, NOT_SUPPORTED, UNKNOWN_COMMAND_ID};
-use crate::framework::{Executor, Handled, Job, Kernel, Notify, Session};
+use crate::framework::{
+    Executor, Handled, Job, Kernel, Notify, SNAPSHOT_MAGIC, SNAPSHOT_VERSION, Session,
+    SnapshotError,
+};
 
 /// Command ids, from Eden's tables (see the module docs).
 const SET_CURRENT_PROCESS: u32 = 1;
@@ -60,10 +63,30 @@ enum Mischief {
     Greedy,
 }
 
+/// A kind of host request, for [`FakeHost::forced`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Asked {
+    Probe,
+    Size,
+    Read,
+}
+
+impl Asked {
+    fn of(request: &HostRequest) -> Self {
+        match request {
+            HostRequest::Probe { .. } => Self::Probe,
+            HostRequest::Size { .. } => Self::Size,
+            HostRequest::Read { .. } => Self::Read,
+        }
+    }
+}
+
 /// The host behind the environment: an SD card in memory, answering the host file protocol.
 struct FakeHost {
     card: Option<BTreeMap<Vec<u8>, Entry>>,
     mischief: Mischief,
+    /// What the environment returns, in place of the card's answer, for every request of a kind.
+    forced: Option<(Asked, Result<HostIoReply, EnvError>)>,
     asked: Vec<HostRequest>,
 }
 
@@ -81,6 +104,7 @@ impl FakeEnv {
         Arc::new(Self(Mutex::new(FakeHost {
             card,
             mischief: Mischief::None,
+            forced: None,
             asked: Vec::new(),
         })))
     }
@@ -145,7 +169,10 @@ impl Env for FakeEnv {
         let decoded = HostRequest::decode(&request.payload).unwrap();
         let mut host = self.host();
         host.asked.push(decoded.clone());
-        Ok(host.answer(&decoded))
+        match &host.forced {
+            Some((kind, answer)) if *kind == Asked::of(&decoded) => answer.clone(),
+            _ => Ok(host.answer(&decoded)),
+        }
     }
 }
 
@@ -1051,4 +1078,249 @@ fn an_open_file_survives_a_snapshot() {
     rig.server = restored;
     let size = rig.send(To::Session(file), GET_SIZE, |r| r);
     assert_eq!(size, s64(i64::try_from(HELLO.len()).unwrap()));
+}
+
+impl Rig {
+    /// Makes the environment answer every request of `kind` with `answer`.
+    fn force(&self, kind: Asked, answer: Result<HostIoReply, EnvError>) {
+        self.env.host().forced = Some((kind, answer));
+    }
+}
+
+/// `OpenFile` of [`HELLO`] on a fresh file system, and `GetSize` of [`HELLO`] opened before, when
+/// the environment answers every size request with `answer`. A failed `OpenFile` must leave the
+/// server's sessions as they were.
+fn sized_by(answer: &Result<HostIoReply, EnvError>) -> (Answered, Answered) {
+    let mut rig = Rig::new();
+    let file = rig.hello();
+    let fs = rig.open_sd();
+    let sessions = rig.server.session_count();
+    rig.force(Asked::Size, answer.clone());
+    let opened = rig.open_file(fs, HELLO_PATH);
+    if opened.result != ResultCode::SUCCESS {
+        assert_eq!(rig.server.session_count(), sessions);
+    }
+    let size = rig.send(To::Session(file), GET_SIZE, |r| r);
+    (opened, size)
+}
+
+/// A size answer as the host writes one.
+fn size_answer(size: u64) -> HostIoReply {
+    HostIoReply::Data(size.to_le_bytes().to_vec())
+}
+
+#[test]
+fn a_size_answer_of_other_than_eight_bytes_fails() {
+    let width = size_of::<u64>();
+    // A size of 4, one byte short and one byte long: padded or cut to 8 bytes, either would read
+    // as 4.
+    let mut short = 4u64.to_le_bytes().to_vec();
+    short.truncate(width - 1);
+    let mut long = 4u64.to_le_bytes().to_vec();
+    long.push(0);
+    for bytes in [short, long] {
+        let failed = only(result::HOST_IO_FAILED);
+        let answer = Ok(HostIoReply::Data(bytes.clone()));
+        assert_eq!(sized_by(&answer), (failed.clone(), failed), "{bytes:?}");
+    }
+    // Exactly 8 bytes is a size.
+    let (opened, size) = sized_by(&Ok(size_answer(4)));
+    assert_eq!(opened.result, ResultCode::SUCCESS);
+    assert_eq!(size, s64(4));
+}
+
+#[test]
+fn a_size_over_s64_max_fails() {
+    let max = u64::try_from(i64::MAX).unwrap();
+    for over in [max + 1, u64::MAX] {
+        let failed = only(result::HOST_IO_FAILED);
+        assert_eq!(
+            sized_by(&Ok(size_answer(over))),
+            (failed.clone(), failed),
+            "{over:#x}"
+        );
+    }
+    // Exactly `i64::MAX` is a size.
+    let (opened, size) = sized_by(&Ok(size_answer(max)));
+    assert_eq!(opened.result, ResultCode::SUCCESS);
+    assert_eq!(size, s64(i64::MAX));
+}
+
+#[test]
+fn a_probe_answered_with_bytes_opens_nothing() {
+    let mut rig = Rig::new();
+    rig.force(Asked::Probe, Ok(HostIoReply::Data(vec![1])));
+    let reply = rig.send(To::Session(rig.session), OPEN_SD_CARD_FILE_SYSTEM, |r| r);
+    assert_eq!(reply, only(result::HOST_IO_FAILED));
+    assert_eq!(rig.server.session_count(), 1);
+    // An empty answer opens the file system.
+    rig.force(Asked::Probe, Ok(HostIoReply::Data(Vec::new())));
+    let reply = rig.send(To::Session(rig.session), OPEN_SD_CARD_FILE_SYSTEM, |r| r);
+    assert_eq!(reply.result, ResultCode::SUCCESS);
+    assert_eq!(rig.server.session_count(), 2);
+}
+
+/// What a broken host answers: an environment that fails, and a failure code with no name.
+fn broken() -> [Result<HostIoReply, EnvError>; 2] {
+    let unnamed = 99;
+    assert_eq!(HostFailure::from_code(unnamed), None);
+    let exhausted = EnvError::Exhausted {
+        index: 0,
+        requested: EnvCall::HostIo,
+    };
+    [Err(exhausted), Ok(HostIoReply::Failed(unnamed))]
+}
+
+#[test]
+fn a_broken_host_fails_open_file_and_read() {
+    for answer in broken() {
+        let mut rig = Rig::new();
+        let fs = rig.open_sd();
+        let sessions = rig.server.session_count();
+        rig.force(Asked::Size, answer.clone());
+        let opened = rig.open_file(fs, HELLO_PATH);
+        assert_eq!(opened, only(result::HOST_IO_FAILED), "{answer:?}");
+        assert_eq!(rig.server.session_count(), sessions);
+
+        let mut rig = Rig::new();
+        let file = To::Session(rig.hello());
+        rig.force(Asked::Read, answer.clone());
+        rig.defer(file, READ, read(0, 4, 16));
+        rig.jobs.run();
+        let reply = rig.deliver(SessionKind::Session);
+        assert_eq!(reply, only(result::HOST_IO_FAILED), "{answer:?}");
+        assert_eq!(rig.kernel.memory(DATA_AT, 16).unwrap(), [STALE; 16]);
+    }
+}
+
+#[test]
+fn a_snapshot_with_a_read_in_flight_restores_a_read_nothing_completes() {
+    let mut rig = Rig::new();
+    let file = rig.hello();
+    rig.defer(To::Session(file), READ, read(0, 4, 16));
+    let saved = rig.server.save().unwrap();
+
+    let env: Arc<dyn Env> = Arc::<FakeEnv>::clone(&rig.env);
+    let executor: Arc<dyn Executor> = Arc::<Jobs>::clone(&rig.jobs);
+    let mut restored = server(UnknownPolicy::Strict, env).with_executor(executor);
+    restored.restore(&saved).unwrap();
+    let pending: Vec<ObjectId> = restored.pending().map(|(_, session)| session).collect();
+    assert_eq!(pending, [file]);
+
+    // The one job there is completes the token of the server it was taken on.
+    assert_eq!(rig.jobs.len(), 1);
+    rig.jobs.run();
+    assert!(restored.take_completed().is_none());
+    assert_eq!(restored.pending().count(), 1);
+    assert!(rig.server.take_completed().is_some());
+}
+
+/// The snapshot of a server with [`HELLO`] open on a plain session (`postcard`: integers are
+/// varints, a sequence or a string starts with its length, an enum with its variant's index, an
+/// `Option` with 0 or 1; ids are an index and then a generation). The framework's part is
+/// described in `framework/tests/snapshot.rs`; the states are this module's.
+///
+/// The kernel objects, by index: 0 the `fsp-srv` session, 1 the file system's, 2 the file's. The
+/// targets, by slot, are the same three interfaces.
+#[rustfmt::skip]
+const SNAPSHOT: &[u8] = &[
+    // Header: magic, version.
+    b'S', b'Q', b'S', b'V', 1,
+    // The server's name.
+    7, b'f', b's', b'p', b'-', b's', b'r', b'v',
+    // Sessions: three, each a session object and the target it leads to.
+    3,
+    0, 1,  0, 1,
+    1, 1,  1, 1,
+    2, 1,  2, 1,
+    // Targets: three slots, each occupied (1) with its generation, then the row: its reference
+    // count, the kind of target (0 an interface), the interface's name and its state's bytes.
+    3,
+    1, 1,  1, 0, 6, b'F', b's', b'p', b'S', b'r', b'v',
+    0, // `FspSrv`'s state: no bytes.
+    1, 1,  1, 0, 11, b'I', b'F', b'i', b'l', b'e', b'S', b'y', b's', b't', b'e', b'm',
+    1, 0, // `IFileSystem`'s state: one byte, the mount (`SdCard`).
+    1, 1,  1, 0, 5, b'I', b'F', b'i', b'l', b'e',
+    // `IFile`'s state: 12 bytes, the mount (`SdCard`), then the path's length and bytes.
+    12, 0, 10, b'/', b'h', b'e', b'l', b'l', b'o', b'.', b't', b'x', b't',
+    // The slab's free list (empty), its slot limit (`u32::MAX`) and its count of rows.
+    0,  0xFF, 0xFF, 0xFF, 0xFF, 0x0F,  3,
+    // The queue: one worker, nothing running, nobody ready, no sessions with a request.
+    1, 0, 0, 0,
+    // No deferred requests; the next token is 0; no family state.
+    0, 0, 0,
+];
+
+#[test]
+fn an_open_file_s_snapshot_bytes_are_pinned() {
+    let mount = Mount::SdCard;
+    // `FspSrv` holds nothing; `Mount` has one variant, so its index is 0.
+    assert_eq!(FspSrv.save().unwrap(), []);
+    assert_eq!(IFileSystem { mount }.save().unwrap(), [0]);
+    let file = IFile {
+        mount,
+        path: HELLO_PATH.to_vec(),
+    };
+    let len = u8::try_from(HELLO_PATH.len()).unwrap();
+    assert_eq!(file.save().unwrap(), [&[0, len][..], HELLO_PATH].concat());
+
+    let mut rig = Rig::new();
+    rig.hello();
+    assert_eq!(rig.server.save().unwrap(), SNAPSHOT);
+    // The constants in the bytes are the shipping ones.
+    assert_eq!(SNAPSHOT[..4], SNAPSHOT_MAGIC);
+    assert_eq!(u32::from(SNAPSHOT[4]), SNAPSHOT_VERSION);
+    assert_eq!(SNAPSHOT[6..13], *NAME.as_bytes());
+}
+
+/// [`SNAPSHOT`] with [`HELLO_PATH`] in it replaced by `path`, of the same length.
+fn snapshot_with(path: &[u8]) -> Vec<u8> {
+    assert_eq!(path.len(), HELLO_PATH.len());
+    let at = SNAPSHOT
+        .windows(HELLO_PATH.len())
+        .position(|window| window == HELLO_PATH)
+        .unwrap();
+    let mut bytes = SNAPSHOT.to_vec();
+    bytes[at..at + path.len()].copy_from_slice(path);
+    bytes
+}
+
+#[test]
+fn a_snapshot_with_a_path_that_is_not_normalised_is_refused() {
+    let refused: [&[u8]; 5] = [
+        b"hello.txt/",
+        b"//ello.txt",
+        b"/hello.tx/",
+        b"/hello\0txt",
+        b"/./llo.txt",
+    ];
+    for path in refused {
+        let env: Arc<dyn Env> = FakeEnv::new(true);
+        let mut restored = server(UnknownPolicy::Strict, env);
+        let error = SnapshotError::State {
+            interface: "IFile".to_owned(),
+            error: postcard::Error::SerdeDeCustom,
+        };
+        let bytes = snapshot_with(path);
+        assert_eq!(restored.restore(&bytes), Err(error), "{path:?}");
+        assert_eq!(restored.session_count(), 0);
+    }
+    let env: Arc<dyn Env> = FakeEnv::new(true);
+    let mut restored = server(UnknownPolicy::Strict, env);
+    restored.restore(&snapshot_with(HELLO_PATH)).unwrap();
+    assert_eq!(restored.session_count(), 3);
+}
+
+#[test]
+fn a_saved_path_may_be_as_long_as_a_path_and_no_longer() {
+    let mut longest = vec![path::DIRECTORY_SEPARATOR];
+    longest.resize(path::ENTRY_NAME_LENGTH_MAX, b'a');
+    let bytes = postcard::to_allocvec(&(Mount::SdCard, &longest)).unwrap();
+    let file: IFile = postcard::from_bytes(&bytes).unwrap();
+    assert_eq!(file.path, longest);
+
+    longest.push(b'a');
+    let bytes = postcard::to_allocvec(&(Mount::SdCard, &longest)).unwrap();
+    let error = postcard::from_bytes::<IFile>(&bytes).unwrap_err();
+    assert_eq!(error, postcard::Error::SerdeDeCustom);
 }
