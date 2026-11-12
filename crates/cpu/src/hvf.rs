@@ -72,6 +72,8 @@
 
 mod ffi;
 mod flush;
+#[cfg(test)]
+mod hardware;
 mod memory;
 mod shim;
 mod tables;
