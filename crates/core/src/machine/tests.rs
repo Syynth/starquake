@@ -45,6 +45,17 @@ fn timebase() -> Timebase<SystemClock> {
     }
 }
 
+/// The vCPU of every core but core 0 in a scripted run: a script with no steps, so a thread
+/// the scheduler gives one of those cores fails the run ("no more exits").
+fn idle(_: CoreId) -> Result<ScriptedVcpu, starquake_cpu::Error> {
+    Ok(ScriptedVcpu::new())
+}
+
+/// A scripted run's vCPUs: `first` for core 0, and [`idle`] ones for the others.
+fn vcpus(first: &mut ScriptedVcpu) -> Vcpus<'_, ScriptedVcpu> {
+    Vcpus { first, make: &idle }
+}
+
 /// Flat memory as a guest's address space: it backs nothing lazily (every byte it has is
 /// there from the start) and owes its vCPUs nothing.
 impl<V> GuestSpace<V> for FlatMemory {
@@ -104,7 +115,7 @@ impl Guest {
     /// Runs `vcpu` as this guest.
     fn run(&self, mut vcpu: ScriptedVcpu, options: &RunOptions) -> RunReport {
         run(
-            &mut vcpu,
+            vcpus(&mut vcpu),
             self.program(&self.memory),
             options,
             Instant::now(),
@@ -634,7 +645,7 @@ fn a_log_line_and_the_call_that_wrote_it_carry_one_time() {
     // Reading the string takes 2 ms, far longer than a tick of the event clock: a second clock
     // reading for the log line would be later than the call's.
     let report = run(
-        &mut vcpu,
+        vcpus(&mut vcpu),
         guest.program(&SlowMemory(&guest.memory)),
         &RunOptions::default(),
         Instant::now(),
@@ -676,7 +687,7 @@ fn get_system_tick_is_the_clock_at_the_rate_the_run_was_given() {
             .then(|_| {}, svc(SvcId::GetSystemTick))
             .then(move |regs| seen.set(regs.x[0]), svc(SvcId::ExitProcess));
         let report = run(
-            &mut vcpu,
+            vcpus(&mut vcpu),
             guest.program(&guest.memory),
             &RunOptions::default(),
             Instant::now(),
@@ -716,14 +727,6 @@ fn the_environments_recording_is_dropped_as_it_is_made() {
         clock: RunClock::new(timebase()),
         recorder: Recorder::new(),
     };
-    let mut log = GuestLog {
-        lines: Vec::new(),
-        kept_bytes: 0,
-        limit: Limits::DEFAULT.guest_log_bytes,
-        dropped: 0,
-        session: &session,
-    };
-    let mut tally = Tally::default();
     let env = session.environment();
     let mut vcpu = ScriptedVcpu::new();
     for _ in 0..CALLS {
@@ -731,8 +734,16 @@ fn the_environments_recording_is_dropped_as_it_is_made() {
     }
     let mut vcpu = vcpu.then(|_| {}, svc(SvcId::ExitProcess));
 
-    let (process, _) = boot(&guest.memory, guest.address_space(), &guest.placed).unwrap();
-    let ending = drive(&mut vcpu, process, &session, &env, &mut log, &mut tally);
+    let (dispatcher, _) = boot(guest.address_space(), &guest.placed, &guest.memory).unwrap();
+    let (ending, _, tally) = drive(
+        vcpus(&mut vcpu),
+        dispatcher,
+        &guest.memory,
+        &session,
+        &env,
+        Limits::DEFAULT,
+        &real_services,
+    );
     assert!(matches!(ending, Ending::Exited));
     // The calls were made, through this environment...
     assert_eq!(
@@ -803,7 +814,7 @@ fn the_trace_and_the_guest_log_stop_growing_at_their_limits() {
     };
     let mut vcpu = printing(&guest.memory, &lines);
     let report = run_within(
-        &mut vcpu,
+        vcpus(&mut vcpu),
         guest.program(&guest.memory),
         &RunOptions::default(),
         Instant::now(),
@@ -849,7 +860,7 @@ fn a_run_within_its_limits_is_not_truncated() {
     };
     let mut vcpu = printing(&guest.memory, &lines);
     let report = run_within(
-        &mut vcpu,
+        vcpus(&mut vcpu),
         guest.program(&guest.memory),
         &RunOptions::default(),
         Instant::now(),
@@ -1024,7 +1035,7 @@ fn a_fault_on_a_page_that_only_lacked_backing_resumes_the_guest_and_is_not_an_ev
         .then(|_| {}, svc(SvcId::ExitProcess));
     let mut vcpu = vcpu;
     let report = run(
-        &mut vcpu,
+        vcpus(&mut vcpu),
         guest.program(&space),
         &RunOptions::default(),
         Instant::now(),
@@ -1070,7 +1081,7 @@ fn a_fault_the_address_space_refuses_after_one_it_backed_is_still_a_crash() {
         .then(|_| {}, abort(stack))
         .then(|_| {}, abort(stack - 8));
     let report = run(
-        &mut vcpu,
+        vcpus(&mut vcpu),
         guest.program(&space),
         &RunOptions::default(),
         Instant::now(),
@@ -1127,7 +1138,7 @@ fn a_page_that_cannot_be_backed_is_an_emulator_error_not_a_crash() {
         };
         let mut vcpu = ScriptedVcpu::new().then(|_| {}, exit);
         let report = run(
-            &mut vcpu,
+            vcpus(&mut vcpu),
             guest.program(&space),
             &RunOptions::default(),
             Instant::now(),
@@ -1163,7 +1174,7 @@ fn the_address_space_is_settled_after_every_system_call_before_the_guest_runs_ag
         .then(expect(3), svc(SvcId::CloseHandle))
         .then(expect(4), svc(SvcId::ExitProcess));
     let report = run(
-        &mut vcpu,
+        vcpus(&mut vcpu),
         guest.program(&space),
         &RunOptions::default(),
         Instant::now(),
@@ -1191,7 +1202,7 @@ fn a_settle_that_fails_ends_the_run_as_an_emulator_error() {
         .then(count(&reached), svc(SvcId::GetSystemTick))
         .then(count(&reached), svc(SvcId::ExitProcess));
     let report = run(
-        &mut vcpu,
+        vcpus(&mut vcpu),
         guest.program(&space),
         &RunOptions::default(),
         Instant::now(),
@@ -1261,7 +1272,7 @@ fn a_clock_for_another_console_than_the_descriptions_ends_the_run_before_the_gue
     let guest = Guest::new(&programs::hello().unwrap());
     assert_eq!(guest.placed.description.console, Console::Switch1);
     let report = run(
-        &mut ScriptedVcpu::new(),
+        vcpus(&mut ScriptedVcpu::new()),
         guest.program(&guest.memory),
         &RunOptions::default(),
         Instant::now(),

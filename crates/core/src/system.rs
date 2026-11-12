@@ -83,15 +83,17 @@ mod host {
     use std::sync::{Arc, Mutex, PoisonError};
     use std::time::Instant;
 
-    use starquake_cpu::hvf::{HvfBackend, HvfVcpu, PhysicalMemory, RamConfig};
+    use starquake_cpu::hvf::{HvfBackend, HvfVcpu, PacKeys, PhysicalMemory, RamConfig};
     use starquake_cpu::{Backend, Vcpu};
+    use starquake_kernel::sched::CoreId;
     use starquake_loader::patch::CounterRescale;
     use starquake_memory::Access;
 
     use super::Error;
     use crate::clock::{CounterClock, Timebase};
     use crate::image::{Loaded, Program, load};
-    use crate::machine::{self, GuestProgram, GuestSpace};
+    use crate::machine::{self, GuestProgram, GuestSpace, Vcpus};
+
     use crate::report::{RunOptions, RunReport};
     use crate::space::{AddressSpace, SpaceMapper, Touch};
 
@@ -153,15 +155,30 @@ mod host {
             placed,
             address_space,
         } = load(program, Some(counter), Box::new(mapper), &*space)?;
-        // Declared after the backend, so it is dropped first, as the VM requires.
-        let mut vcpu = backend.create_vcpu()?;
-        vcpu.set_address_space(space.root(), PROCESS_ASID)?;
+        // Every core's vCPU runs in the one address space, with the same pointer-authentication
+        // keys, so that a thread can move from core to core. PROVISIONAL: the keys are fixed
+        // (zero), not the process's own (`crate::machine`, "Start state").
+        let new_vcpu = || -> Result<HvfVcpu, starquake_cpu::Error> {
+            let mut vcpu = backend.create_vcpu()?;
+            vcpu.set_address_space(space.root(), PROCESS_ASID)?;
+            vcpu.set_pac_keys(&PacKeys::default())?;
+            Ok(vcpu)
+        };
+        let make = |_: CoreId| new_vcpu();
+        // Core 0's vCPU, made on this thread, which runs core 0. Declared after the backend, so
+        // it is dropped first, as the VM requires; the other cores' vCPUs are dropped on their
+        // own threads before `machine::run` returns.
+        let mut vcpu = new_vcpu()?;
         let guest = GuestProgram {
             space: &*space,
             placed: &placed,
             address_space,
         };
-        Ok(machine::run(&mut vcpu, guest, options, started, time))
+        let vcpus = Vcpus {
+            first: &mut vcpu,
+            make: &make,
+        };
+        Ok(machine::run(vcpus, guest, options, started, time))
     }
 }
 

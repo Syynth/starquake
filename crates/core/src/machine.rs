@@ -1,43 +1,59 @@
-//! The core loop of the walking skeleton: one vCPU runs one guest thread, and every exit is
-//! handled here.
+//! The core loop (kernel slice 10; execution model, "Guest threads on vCPUs"): one host thread
+//! per core of the kernel's scheduler (six for every process today), each owning one vCPU, and
+//! one timer thread. A guest thread is the saved context the scheduler names; a core loads it
+//! into its vCPU, and a context switch is a register swap.
 //!
 //! ```text
-//! loop
-//!   match vcpu.run()
-//!     Svc(n)            -> kernel dispatcher, with the vCPU's registers; ExitProcess ends the run;
-//!                          then the address space is settled (its pending TLB flushes run)
-//!     DataAbort         -> the address space backs the page and the guest resumes, or it crashed
-//!     InstructionAbort  -> the same, for a fetch
-//!     Undefined         -> the guest crashed
-//!     Interrupted       -> the timeout passed, or resume
+//! core thread (machine/core_loop.rs):
+//!   loop
+//!     if it must: dispatcher.switch(core)   // saves the old thread's registers, picks the next
+//!       Load(thread)  -> vcpu.set_regs(context); settle the address space
+//!       Park          -> park until the scheduler wakes the core (or every core is stalled)
+//!     match vcpu.run()
+//!       Svc(n)            -> kernel dispatcher; settle the address space; then reschedule
+//!                            (ExitProcess ends the run)
+//!       DataAbort         -> the address space backs the page and the guest resumes, or it crashed
+//!       InstructionAbort  -> the same, for a fetch
+//!       Undefined         -> the guest crashed
+//!       Interrupted       -> the run is stopping, or reschedule
+//!
+//! timer thread (machine/timer.rs):
+//!   loop
+//!     fire the kernel's timeouts that are due, then reschedule
+//!     every 10 ms: preempt (rotate each core's queue at its preemption priority)
+//!     deliver the deferred replies the run's services say are ready
+//!     end the run at its timeout
+//!     sleep until the next of those, or until a core or a service rings the timer
 //! ```
 //!
-//! It is generic over [`Vcpu`], so everything here runs on any host against a scripted vCPU; the
-//! hypervisor only enters in [`crate::system`].
+//! The scheduler talks to the cores through [`CoreSignals`] (`machine/cores.rs`): it interrupts
+//! a core running guest code (the vCPU's interrupter) and wakes a parked one (a condition
+//! variable). Stopping the run interrupts and wakes every core. A run whose cores have all
+//! parked while nothing could ever end a wait ([`Dispatcher::is_stalled`]) ends as an emulator
+//! error ([`WAITING`]).
 //!
-//! PROVISIONAL (walking skeleton, #74), and what replaces each part:
+//! It is generic over [`Vcpu`], so everything here runs on any host against scripted vCPUs; the
+//! hypervisor only enters in [`crate::system`]. Core 0 runs on the calling thread with the vCPU
+//! the caller made; every other core makes its own on its own thread ([`Vcpus::make`]), as
+//! Hypervisor.framework requires a vCPU to be run by the thread that created it.
 //!
-//! - **One guest thread on one core.** The kernel creates the process and starts its main
-//!   thread (`starquake_kernel::process::create` and `run`), and the scheduler is told that core
-//!   [`CORE`] runs it, so calls about "the calling thread" find it. The loop runs only that
-//!   thread: a call that leaves it waiting, or ends it while the process has other threads,
-//!   ends the run. The event stream still names the thread [`MAIN_THREAD`] and the process
-//!   [`PROCESS_ID`], both fixed. Kernel slice 10 (core loop and timers) replaces this loop with
-//!   six core threads driven by the scheduler.
+//! PROVISIONAL (walking skeleton, #74, and what is left of it after slice 10), and what replaces
+//! each part:
+//!
 //! - **The process is created from the program's description** ([`Placement::description`]:
 //!   its metadata's, or Eden's defaults for an NRO, `crate::image`). The run's [`Timebase`]
 //!   must name the description's console, whose rate the program's counter reads were patched
 //!   for; a run whose two consoles differ ends as an emulator error before the guest runs
 //!   ([`CONSOLE_MISMATCH`]).
-//! - **Whole register file per system call.** Each `svc` reads and writes all of [`GuestRegs`].
-//!   The execution model's single-register accessors on `Vcpu` replace that.
-//! - **Start state.** The vCPU is given the context the kernel's `process::run` gave the main
-//!   thread (`KProcess::Run`, `eden/src/core/hle/kernel/k_process.cpp` @ cf654052): its
-//!   program counter, stack pointer and `TPIDRRO_EL0` (its thread-local region) set, `x0` zero
-//!   and `x1` a handle to itself, which libnx will not start without (`envGetMainThreadHandle`
-//!   aborts on the invalid handle), and every other register zero. The vCPU's
-//!   pointer-authentication keys are left as the backend creates them; the process's are not
-//!   generated yet.
+//! - **Whole register file per system call.** Each `svc` reads and writes all of
+//!   [`GuestRegs`]. The execution model's single-register accessors on `Vcpu` replace that.
+//! - **Start state.** The main thread starts with the context the kernel's `process::run` gave
+//!   it (`KProcess::Run`, `eden/src/core/hle/kernel/k_process.cpp` @ cf654052): its program
+//!   counter, stack pointer and `TPIDRRO_EL0` (its thread-local region) set, `x0` zero and `x1`
+//!   a handle to itself, which libnx will not start without (`envGetMainThreadHandle` aborts on
+//!   the invalid handle), and every other register zero. The process's pointer-authentication
+//!   keys are not generated yet: the hypervisor gives every vCPU the same fixed keys
+//!   (`crate::system`), so a thread can move between cores.
 //! - **An abort is lazy backing or a crash.** The guest's address space ([`GuestSpace`]) is
 //!   asked what a faulting access comes to: a page the kernel mapped that has no backing yet
 //!   gets it and the guest resumes (execution model, "Sparse and lazy memory"); anything else
@@ -45,67 +61,76 @@
 //!   the translation, not the syndrome. Nothing is write-tracked yet (the GPU caches' slice).
 //!   A page that is backed this way is not an event: a console has no fault there, and a trace
 //!   must not depend on which pages the host happens to have backed.
-//! - **Lifecycle, fault and guest-log events are recorded here**, not by the kernel. Lifecycle
-//!   and fault events are recorded outside the kernel lock, which is harmless with one thread.
-//!   A guest-log event is recorded by this loop's [`DebugSink`] while the dispatcher runs
+//! - **Lifecycle, fault and guest-log events are recorded here**, not by the kernel, on the core
+//!   and thread they happened on (the process's start on core [`CORE`] and thread
+//!   [`MAIN_THREAD`]). Lifecycle and fault events are recorded outside the kernel lock, so
+//!   another core's event can come between a call and the event recorded after it. A guest-log
+//!   event is recorded by the calling core's [`DebugSink`] while the dispatcher runs
 //!   `OutputDebugString`, so under the kernel lock, just before the call's own event. All three
-//!   move to the kernel's own recording points (process and thread lifecycle in slice 8, faults
-//!   in slice 6).
+//!   move to the kernel's own recording points (process and thread lifecycle in slice 8,
+//!   faults in slice 6).
 //! - **Event times.** The kernel stamps a system call's event with guest time, and tells the
 //!   [`DebugSink`] the same time, so a log line carries the time of the call that wrote it. The
 //!   events this loop records itself (lifecycle and fault) are stamped from a second copy of
 //!   the run's host clock ([`Timebase`]), converted by the kernel's conversion at the process's
-//!   rate, so they are on the same scale; they go when those events move into the kernel.
+//!   rate, so they are on the same scale; they go when those events move into the kernel. The
+//!   timer thread reads the same copy to decide when to look at the kernel's timeouts; whether
+//!   one has expired is decided by the kernel against the environment's clock
+//!   (`machine/timer.rs`).
 //! - **What a run keeps in memory is capped by fixed numbers** ([`Limits`]): the golden trace
 //!   keeps its first events and the guest log its first lines, and both say when they stopped.
 //!   The observability spec's size cap per run, with its own flags, replaces the constants.
-//! - **A thread that waits ends the run.** A `SendSyncRequest` whose request waits behind
-//!   another or is deferred, or a `WaitSynchronization` that nothing has ended yet, leaves the
-//!   calling thread waiting ([`Outcome::Waiting`]). With one thread and nothing to deliver a
-//!   deferred reply or signal an object, the run ends there as an emulator error ([`WAITING`]).
-//!   None of the services a run has yet ([`crate::hle`]) defers: `fsp-srv`'s read would, and is
-//!   given no executor until then. Kernel slice 10 runs other threads while one waits, and
-//!   delivers deferred replies.
+//! - **Deferred replies.** A run's services are installed by a function the run is given
+//!   ([`Install`]; a real run's is [`crate::hle::install`]), which may keep a [`Ready`] to say
+//!   when a server's deferred replies are ready; the timer thread then delivers them
+//!   ([`Dispatcher::deliver_replies`]). None of the services a real run has defers yet:
+//!   `fsp-srv`'s read would, and is given no executor until then.
 //! - **The environment** is live, with a fixed random seed and nothing recorded to disk; the
 //!   `--clock`, `--seed` and `--record` flags of the headless contract are not built. Its
 //!   recording, which grows by a clock reading per system call, is dropped as it is made (test:
 //!   `the_environments_recording_is_dropped_as_it_is_made`).
 
-use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError};
-use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Instant;
 
-use starquake_cpu::{Exit, GuestRegs, Interrupter, Syndrome, Vcpu};
-use starquake_kernel::dispatch::{Caller, Dispatcher, Outcome, Record};
+use starquake_cpu::{GuestRegs, Syndrome, Vcpu};
+use starquake_kernel::dispatch::{Dispatcher, Outcome, Record};
+use starquake_kernel::id::ServerId;
 use starquake_kernel::process;
-use starquake_kernel::sched::{CoreId, CoreSignals};
+use starquake_kernel::sched::{APPLICATION_CORE_COUNT, CoreId};
 use starquake_kernel::svc::DebugSink;
 use starquake_kernel::tables::AddressSpace;
 use starquake_kernel::time::CounterRate;
 use starquake_memory::{Access, GuestMemory};
 use starquake_trace::{
-    DumpError, Env, EventKind, FaultAction, FlightRecorder, GuestTicks, HostClock, LifecyclePhase,
+    DumpError, Env, EventKind, FlightRecorder, GuestTicks, HostClock, HostNanos, LifecyclePhase,
     LiveEnv, Recorder, TextSink, ThreadId,
 };
 
 use crate::clock::Timebase;
 use crate::crash::{CrashReport, Exception};
-use crate::hle::{self, HostFolder};
+use crate::hle::HostFolder;
 use crate::image::{PAGE, Placement};
 use crate::report::{ExitReason, Mapping, RunOptions, RunReport, empty_dump};
 use crate::space::Touch;
 
-/// The core the one vCPU stands for.
+mod core_loop;
+mod cores;
+mod timer;
+
+use cores::Cores;
+
+/// The core the vCPU the caller made stands for, and the core the process's start is recorded
+/// on.
 pub(crate) const CORE: u8 = 0;
-/// The one guest thread, as the event stream names it.
-pub(crate) const MAIN_THREAD: ThreadId = ThreadId(1);
+/// The main thread, as the event stream names it: the first thread id the kernel hands out
+/// (`starquake_kernel::sched::FIRST_THREAD_ID`).
+pub(crate) const MAIN_THREAD: ThreadId = ThreadId(starquake_kernel::sched::FIRST_THREAD_ID);
 /// The one process, as lifecycle events name it.
 pub(crate) const PROCESS_ID: u64 = 1;
-/// Events the flight recorder keeps for the core (observability spec: "a few thousand each").
+/// Events the flight recorder keeps per core (observability spec: "a few thousand each").
 const FLIGHT_CAPACITY: usize = 4096;
 /// How many of the newest events a crash report quotes.
 const LAST_EVENTS: usize = 32;
@@ -115,13 +140,11 @@ const RANDOM_SEED: u64 = 0;
 /// description names (see the module docs).
 pub(crate) const CONSOLE_MISMATCH: &str = "the run's clock and the process's description name \
                                            different consoles, so the counter rates would differ";
-/// How a run ends when its one guest thread waits (see the module docs).
-pub(crate) const WAITING: &str = "the guest thread waits for an IPC reply or on an object, and this \
-                                  loop has no other thread to run until the wait ends";
-/// How a run ends when its one guest thread exits and its process has other threads (see the
-/// module docs).
-pub(crate) const THREAD_EXITED: &str = "the guest thread exited, and this loop has no other \
-                                        thread to run";
+/// How a run ends when every core has parked and nothing the run has could end a wait
+/// ([`Dispatcher::is_stalled`]): every guest thread waits on something only another guest
+/// thread could end.
+pub(crate) const WAITING: &str = "every guest thread waits, and nothing left in the run can end \
+                                  any of the waits";
 
 /// The guest's address space as the loop uses it: its memory, as the kernel reads and writes
 /// it, and the two things the loop itself asks of it. `V` is the vCPU the loop runs.
@@ -131,10 +154,63 @@ pub(crate) trait GuestSpace<V>: GuestMemory {
     fn touch(&self, address: u64, access: Access) -> Touch;
 
     /// Runs on `vcpu` whatever the address space owes its vCPUs since the last call: the TLB
-    /// invalidations for what was unmapped or reprotected. The loop calls it before the guest
-    /// first runs and after every system call, before the guest runs again, whatever the call
-    /// returned.
+    /// invalidations for what was unmapped or reprotected. A core calls it whenever it loads a
+    /// thread, before the thread first runs there, and after every system call, before the
+    /// guest runs again, whatever the call returned.
     fn settle(&self, vcpu: &mut V) -> Result<(), starquake_cpu::Error>;
+}
+
+/// The vCPUs of a run: core 0's, made by the caller on the calling thread, which runs core 0,
+/// and how every other core makes its own, on its own thread.
+pub(crate) struct Vcpus<'a, V> {
+    /// Core 0's vCPU.
+    pub(crate) first: &'a mut V,
+    /// Makes the vCPU of the core it is given, on the calling thread; it must be ready to run
+    /// in the run's address space.
+    pub(crate) make: &'a (dyn Fn(CoreId) -> Result<V, starquake_cpu::Error> + Sync),
+}
+
+/// Says that a server's deferred replies are ready: the timer thread then delivers them
+/// ([`Dispatcher::deliver_replies`]). Cloned freely; every clone rings the same timer.
+#[derive(Clone)]
+pub(crate) struct Ready {
+    servers: Arc<Mutex<Vec<ServerId>>>,
+    bell: Arc<timer::Bell>,
+}
+
+impl Ready {
+    /// The replies of `server` that its handler has ready are to be delivered.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no service of a real run defers yet (`fsp-srv` has no executor); the core \
+                      loop's tests install services that do"
+        )
+    )]
+    pub(crate) fn push(&self, server: ServerId) {
+        lock(&self.servers).push(server);
+        self.bell.ring();
+    }
+
+    /// The servers whose replies are ready, oldest first, each once.
+    fn take(&self) -> Vec<ServerId> {
+        let mut servers = std::mem::take(&mut *lock(&self.servers));
+        let mut seen = BTreeSet::new();
+        servers.retain(|server| seen.insert(*server));
+        servers
+    }
+}
+
+/// Puts a run's services in front of its dispatcher, with the environment they read the host
+/// through and a [`Ready`] to say when deferred replies are ready. A failure ends the run
+/// before the guest runs, with the message given.
+pub(crate) type Install = dyn Fn(&Dispatcher, Arc<dyn Env>, Ready) -> Result<(), String> + Sync;
+
+/// The services of a real run ([`crate::hle::install`]). None of them defers yet, so the
+/// [`Ready`] is not kept.
+fn real_services(dispatcher: &Dispatcher, env: Arc<dyn Env>, _: Ready) -> Result<(), String> {
+    crate::hle::install(dispatcher, env).map_err(|error| error.to_string())
 }
 
 /// How much of a run is kept in memory for its report. A guest can make system calls and write
@@ -160,44 +236,45 @@ impl Limits {
     };
 }
 
+/// Locks a mutex whatever a panicking holder left: everything these mutexes guard stays valid
+/// at each step.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// Stamps the events the loop records itself with guest time (see the module docs): the loop's
 /// copy of the run's host clock, and the process's counter rate.
 struct RunClock<C> {
-    clock: RefCell<C>,
+    clock: Mutex<C>,
     rate: CounterRate,
-}
-
-/// The loop's one core, as the scheduler signals it: there is no other core to interrupt or
-/// wake, so there is nothing to do.
-struct OneCore;
-
-impl CoreSignals for OneCore {
-    fn interrupt(&mut self, _: CoreId) {}
-
-    fn wake(&mut self, _: CoreId) {}
 }
 
 impl<C: HostClock + Clone> RunClock<C> {
     fn new(time: Timebase<C>) -> Self {
         let rate = time.rate();
         Self {
-            clock: RefCell::new(time.clock),
+            clock: Mutex::new(time.clock),
             rate,
         }
     }
 
+    /// The host clock now, as this copy reads it: not recorded for replay.
+    fn host_now(&self) -> HostNanos {
+        lock(&self.clock).now()
+    }
+
     /// Guest time now: the kernel's conversion of a reading that is not recorded for replay.
     fn now(&self) -> GuestTicks {
-        self.rate.ticks_at(self.clock.borrow_mut().now())
+        self.rate.ticks_at(self.host_now())
     }
 
     /// The other copy of the clock, for the environment.
     fn for_environment(&self) -> C {
-        self.clock.borrow().clone()
+        lock(&self.clock).clone()
     }
 }
 
-/// What the loop needs that outlives a single exit.
+/// What the loop needs that outlives a single exit, shared by every core.
 struct Session<'a, C> {
     memory: &'a dyn GuestMemory,
     options: &'a RunOptions,
@@ -206,14 +283,15 @@ struct Session<'a, C> {
 }
 
 impl<C: HostClock + Clone> Session<'_, C> {
-    /// Records an event on the one core and thread, stamped with the time now.
+    /// Records an event of the process as a whole, on core [`CORE`] and thread
+    /// [`MAIN_THREAD`], stamped with the time now.
     fn record(&self, kind: EventKind) {
-        self.record_at(self.clock.now(), kind);
+        self.record_on(CORE, MAIN_THREAD, kind);
     }
 
-    /// Records an event on the one core and thread, stamped with `time`.
-    fn record_at(&self, time: GuestTicks, kind: EventKind) {
-        self.recorder.record(time, CORE, MAIN_THREAD, kind);
+    /// Records an event on `core` and `thread`, stamped with the time now.
+    fn record_on(&self, core: u8, thread: ThreadId, kind: EventKind) {
+        self.recorder.record(self.clock.now(), core, thread, kind);
     }
 
     /// The environment the kernel and the services read during this run: live, on the other
@@ -231,9 +309,8 @@ impl<C: HostClock + Clone> Session<'_, C> {
     }
 }
 
-/// Collects what the guest writes with `OutputDebugString` and records each line as a guest-log
-/// event.
-struct GuestLog<'a, C> {
+/// What the guest wrote with `OutputDebugString`, as far as [`Limits::guest_log_bytes`] keeps.
+struct GuestLog {
     /// The lines kept: a prefix of what the guest wrote.
     lines: Vec<Vec<u8>>,
     /// Bytes in `lines`.
@@ -242,14 +319,19 @@ struct GuestLog<'a, C> {
     limit: usize,
     /// Lines that were not kept: the first that did not fit, and every line after it.
     dropped: u64,
-    session: &'a Session<'a, C>,
 }
 
-impl<C: HostClock + Clone> DebugSink for GuestLog<'_, C> {
-    fn output(&mut self, time: GuestTicks, message: &[u8]) {
-        // The event is recorded either way: it is fixed-size, and the trace has its own limit.
-        // `time` is the guest time of the `svc` being dispatched, which its own event carries.
-        self.session.record_at(time, EventKind::guest_log(message));
+impl GuestLog {
+    fn new(limit: usize) -> Self {
+        Self {
+            lines: Vec::new(),
+            kept_bytes: 0,
+            limit,
+            dropped: 0,
+        }
+    }
+
+    fn keep(&mut self, message: &[u8]) {
         let fits = self
             .kept_bytes
             .checked_add(message.len())
@@ -261,6 +343,26 @@ impl<C: HostClock + Clone> DebugSink for GuestLog<'_, C> {
             }
             _ => self.dropped = self.dropped.saturating_add(1),
         }
+    }
+}
+
+/// One core's way into the guest log: records each line as a guest-log event of the core and
+/// thread that wrote it, and keeps it.
+struct LogSink<'a, C> {
+    session: &'a Session<'a, C>,
+    log: &'a Mutex<GuestLog>,
+    core: u8,
+    thread: ThreadId,
+}
+
+impl<C: HostClock + Clone> DebugSink for LogSink<'_, C> {
+    fn output(&mut self, time: GuestTicks, message: &[u8]) {
+        // The event is recorded either way: it is fixed-size, and the trace has its own limit.
+        // `time` is the guest time of the `svc` being dispatched, which its own event carries.
+        self.session
+            .recorder
+            .record(time, self.core, self.thread, EventKind::guest_log(message));
+        lock(self.log).keep(message);
     }
 }
 
@@ -287,64 +389,8 @@ impl Tally {
     }
 }
 
-/// Interrupts the vCPU when the run's timeout passes.
-struct Watchdog {
-    fired: Arc<AtomicBool>,
-    /// Dropping the sender wakes the thread early, so a finished run doesn't wait out its
-    /// timeout.
-    cancel: Option<mpsc::Sender<()>>,
-    thread: Option<JoinHandle<()>>,
-}
-
-impl Watchdog {
-    /// Starts the timer, if there is a timeout.
-    fn arm<I: Interrupter + 'static>(
-        timeout: Option<Duration>,
-        interrupter: I,
-    ) -> std::io::Result<Self> {
-        let fired = Arc::new(AtomicBool::new(false));
-        let Some(timeout) = timeout else {
-            return Ok(Self {
-                fired,
-                cancel: None,
-                thread: None,
-            });
-        };
-        let (cancel, cancelled) = mpsc::channel::<()>();
-        let flag = Arc::clone(&fired);
-        let thread = std::thread::Builder::new()
-            .name("starquake-timeout".into())
-            .spawn(move || {
-                if cancelled.recv_timeout(timeout) == Err(RecvTimeoutError::Timeout) {
-                    flag.store(true, Ordering::SeqCst);
-                    if let Err(error) = interrupter.interrupt() {
-                        tracing::error!(%error, "the timeout could not interrupt the vCPU");
-                    }
-                }
-            })?;
-        Ok(Self {
-            fired,
-            cancel: Some(cancel),
-            thread: Some(thread),
-        })
-    }
-
-    fn fired(&self) -> bool {
-        self.fired.load(Ordering::SeqCst)
-    }
-}
-
-impl Drop for Watchdog {
-    fn drop(&mut self) {
-        drop(self.cancel.take());
-        if let Some(thread) = self.thread.take() {
-            // The thread only sleeps and interrupts; if it panicked there is nothing to recover.
-            let _ = thread.join();
-        }
-    }
-}
-
-/// The exception an [`Exit::Undefined`] is reported as; its syndrome says what it really was.
+/// The exception an [`Exit::Undefined`](starquake_cpu::Exit::Undefined) is reported as; its
+/// syndrome says what it really was.
 const UNDEFINED: Exception = Exception::UndefinedInstruction;
 
 /// How the loop ended.
@@ -353,6 +399,49 @@ enum Ending {
     Crashed(Exception, Syndrome, Box<GuestRegs>),
     TimedOut,
     Failed(String),
+}
+
+/// What every core and the timer thread share during a run.
+struct Machine<'a, V: Vcpu, C> {
+    session: &'a Session<'a, C>,
+    space: &'a dyn GuestSpace<V>,
+    dispatcher: Dispatcher,
+    env: &'a Arc<LiveEnv>,
+    log: Mutex<GuestLog>,
+    tally: Mutex<Tally>,
+    cores: Cores<V::Interrupter>,
+    /// How the run ended: the first ending wins.
+    ending: Mutex<Option<Ending>>,
+    stopped: AtomicBool,
+    /// Rung when the timer thread should look again: a wait began, replies are ready, or the
+    /// run is stopping.
+    bell: Arc<timer::Bell>,
+    ready: Ready,
+}
+
+impl<V: Vcpu, C: HostClock + Clone> Machine<'_, V, C> {
+    /// Ends the run as `ending`, unless it has already ended: every core and the timer thread
+    /// stop.
+    fn stop(&self, ending: Ending) {
+        {
+            let mut slot = lock(&self.ending);
+            if slot.is_none() {
+                *slot = Some(ending);
+            }
+        }
+        self.stopped.store(true, Ordering::SeqCst);
+        self.cores.stop();
+        self.bell.ring();
+    }
+
+    fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::SeqCst)
+    }
+
+    /// The scheduler's signals to the cores.
+    fn signals(&self) -> cores::Signals<'_, V::Interrupter> {
+        cores::Signals(&self.cores)
+    }
 }
 
 /// A loaded program, as the loop takes it: the guest's address space as host code and the
@@ -367,28 +456,48 @@ pub(crate) struct GuestProgram<'a, V> {
     pub(crate) address_space: AddressSpace,
 }
 
-/// Runs the loaded program `guest` on `vcpu` until it exits, crashes or times out, and reports
-/// what happened. `started` is when the run began, for the report's duration. `time` is the
-/// process's counter rate, which must be the rate the program's counter reads were patched
+/// Runs the loaded program `guest` on `vcpus` until it exits, crashes or times out, and
+/// reports what happened. `started` is when the run began, for the report's duration. `time` is
+/// the process's counter rate, which must be the rate the program's counter reads were patched
 /// for, and the host clock guest time is counted from.
 pub(crate) fn run<V: Vcpu, C: HostClock + Clone + 'static>(
-    vcpu: &mut V,
+    vcpus: Vcpus<'_, V>,
     guest: GuestProgram<'_, V>,
     options: &RunOptions,
     started: Instant,
     time: Timebase<C>,
 ) -> RunReport {
-    run_within(vcpu, guest, options, started, time, Limits::DEFAULT)
+    run_within(vcpus, guest, options, started, time, Limits::DEFAULT)
 }
 
 /// [`run`], keeping no more of the run in memory than `limits` allows.
 pub(crate) fn run_within<V: Vcpu, C: HostClock + Clone + 'static>(
-    vcpu: &mut V,
+    vcpus: Vcpus<'_, V>,
     guest: GuestProgram<'_, V>,
     options: &RunOptions,
     started: Instant,
     time: Timebase<C>,
     limits: Limits,
+) -> RunReport {
+    run_serving(
+        vcpus,
+        guest,
+        options,
+        (started, time),
+        limits,
+        &real_services,
+    )
+}
+
+/// [`run_within`], with the services `install` puts in front of the kernel instead of a real
+/// run's.
+pub(crate) fn run_serving<V: Vcpu, C: HostClock + Clone + 'static>(
+    vcpus: Vcpus<'_, V>,
+    guest: GuestProgram<'_, V>,
+    options: &RunOptions,
+    (started, time): (Instant, Timebase<C>),
+    limits: Limits,
+    install: &Install,
 ) -> RunReport {
     let GuestProgram {
         space,
@@ -403,32 +512,31 @@ pub(crate) fn run_within<V: Vcpu, C: HostClock + Clone + 'static>(
         recorder: Recorder::new(),
     };
     let text = Arc::new(TextSink::with_limit(limits.trace_events));
-    let flight = Arc::new(FlightRecorder::new(usize::from(CORE) + 1, FLIGHT_CAPACITY));
+    let flight = Arc::new(FlightRecorder::new(
+        usize::from(APPLICATION_CORE_COUNT),
+        FLIGHT_CAPACITY,
+    ));
     session.recorder.add_sink(Arc::clone(&text));
     session.recorder.add_sink(Arc::clone(&flight));
 
-    let mut log = GuestLog {
-        lines: Vec::new(),
-        kept_bytes: 0,
-        limit: limits.guest_log_bytes,
-        dropped: 0,
-        session: &session,
-    };
-    let mut tally = Tally::default();
     let env = session.environment();
     let mut mappings = placed.mappings.clone();
     let booted = if console == placed.description.console {
-        boot(space, address_space, placed)
+        boot(address_space, placed, space)
     } else {
         Err(CONSOLE_MISMATCH.to_owned())
     };
-    let ending = match booted {
-        Ok((process, tls)) => {
+    let (ending, log, tally) = match booted {
+        Ok((dispatcher, tls)) => {
             mappings.push(tls);
             mappings.sort_by_key(|mapping| mapping.start);
-            drive(vcpu, process, &session, &env, &mut log, &mut tally)
+            drive(vcpus, dispatcher, space, &session, &env, limits, install)
         }
-        Err(message) => Ending::Failed(message),
+        Err(message) => (
+            Ending::Failed(message),
+            GuestLog::new(limits.guest_log_bytes),
+            Tally::default(),
+        ),
     };
     let exit = match ending {
         Ending::Exited => ExitReason::ProcessExited,
@@ -497,267 +605,136 @@ fn settle_dump(
     }
 }
 
-/// Creates the process with the kernel and starts its main thread on [`CORE`]
+/// Creates the process with the kernel and starts its main thread
 /// (`starquake_kernel::process::create` and `run`, see "Start state" in the module docs): the
 /// process `placed` describes, whose memory is `address_space`, entering at the program's
-/// entry with the stack `placed` has. The
-/// scheduler is told the core runs the main thread. Returns the process, and the memory-map
-/// entry of the main thread's thread-local page.
-fn boot<'a, V>(
-    space: &'a dyn GuestSpace<V>,
+/// entry with the stack `placed` has; `memory` is where its thread-local page is cleared. The
+/// main thread is runnable and runs nowhere yet: the first core the scheduler gives it to loads
+/// it. Returns the dispatcher over the process's tables, and the memory-map entry of the main
+/// thread's thread-local page.
+fn boot(
     address_space: AddressSpace,
     placed: &Placement,
-) -> Result<(Process<'a, V>, Mapping), String> {
+    memory: &dyn GuestMemory,
+) -> Result<(Dispatcher, Mapping), String> {
     let failed = |error: &dyn std::fmt::Display| format!("the kernel could not be set up: {error}");
     let mut tables = process::create(&placed.description, address_space).map_err(|e| failed(&e))?;
-    let main =
-        process::run(&mut tables, space, placed.entry, placed.stack_top).map_err(|e| failed(&e))?;
-    let core = CoreId::new(CORE).ok_or("no core for the main thread")?;
-    let scheduler = &mut tables.scheduler;
-    scheduler
-        .update(GuestTicks(0), None, &mut OneCore)
+    let main = process::run(&mut tables, memory, placed.entry, placed.stack_top)
         .map_err(|e| failed(&e))?;
-    let running = scheduler
-        .schedule(core, &mut OneCore)
-        .map_err(|e| failed(&e))?;
-    if running != Some(main.thread) {
-        return Err(failed(
-            &"the scheduler did not give the core the main thread",
-        ));
-    }
-    let regs = scheduler
+    let tpidrro = tables
+        .scheduler
         .thread(main.thread)
         .map_err(|e| failed(&e))?
         .context()
-        .clone();
-    let page = regs.tpidrro - regs.tpidrro % PAGE;
+        .tpidrro;
+    let page = tpidrro - tpidrro % PAGE;
     let tls = Mapping {
         name: "tls".to_owned(),
         start: page,
         end: page + PAGE,
     };
-    let process = Process {
-        space,
-        dispatcher: Dispatcher::new(tables),
-        regs,
-    };
-    Ok((process, tls))
+    Ok((Dispatcher::new(tables), tls))
 }
 
-/// Readies `vcpu` to run the main thread from its first instruction: its registers as the
-/// kernel left them (see "Start state" in the module docs), and the address space settled,
-/// because loading reprotected the program's segments and the guest must not start with a
-/// flush owed.
-fn start<V: Vcpu>(
-    vcpu: &mut V,
-    space: &dyn GuestSpace<V>,
-    regs: &GuestRegs,
-) -> Result<(), starquake_cpu::Error> {
-    vcpu.set_regs(regs)?;
-    space.settle(vcpu)
-}
-
-/// The process the loop runs: the guest's address space, and the kernel's dispatcher over the
-/// process's tables, with its main thread started on [`CORE`] from `regs`.
-struct Process<'a, V> {
-    space: &'a dyn GuestSpace<V>,
-    dispatcher: Dispatcher,
-    regs: GuestRegs,
-}
-
-/// The loop itself (see the module docs). `env` is the environment the kernel reads
+/// The loop itself (see the module docs): installs the services, then runs every core and the
+/// timer thread until the run ends. `env` is the environment the kernel reads
 /// ([`Session::environment`]); the caller owns it so that a test can see what the loop leaves
-/// in its recording.
+/// in its recording. Returns how the run ended, the guest log and the call counts.
 fn drive<V: Vcpu, C: HostClock + Clone + 'static>(
-    vcpu: &mut V,
-    process: Process<'_, V>,
+    vcpus: Vcpus<'_, V>,
+    dispatcher: Dispatcher,
+    space: &dyn GuestSpace<V>,
     session: &Session<'_, C>,
     env: &Arc<LiveEnv>,
-    log: &mut GuestLog<'_, C>,
-    tally: &mut Tally,
-) -> Ending {
-    let Process {
+    limits: Limits,
+    install: &Install,
+) -> (Ending, GuestLog, Tally) {
+    let count = dispatcher.with::<(&starquake_kernel::tables::Scheduler,), _>(|(scheduler,)| {
+        scheduler.core_count()
+    });
+    let bell = Arc::new(timer::Bell::default());
+    let machine = Machine {
+        session,
         space,
         dispatcher,
-        regs,
-    } = process;
-    let vcpu_failed = |error| Ending::Failed(format!("the vCPU failed: {error}"));
-    let services_env: Arc<dyn Env> = Arc::<LiveEnv>::clone(env);
-    if let Err(error) = hle::install(&dispatcher, services_env) {
-        return Ending::Failed(format!("the services could not be set up: {error}"));
-    }
-
-    if let Err(error) = start(vcpu, space, &regs) {
-        return vcpu_failed(error);
-    }
-    let watchdog = match Watchdog::arm(session.options.timeout, vcpu.interrupter()) {
-        Ok(watchdog) => watchdog,
-        Err(error) => return Ending::Failed(format!("the timeout could not be armed: {error}")),
+        env,
+        log: Mutex::new(GuestLog::new(limits.guest_log_bytes)),
+        tally: Mutex::new(Tally::default()),
+        cores: Cores::new(count),
+        ending: Mutex::new(None),
+        stopped: AtomicBool::new(false),
+        ready: Ready {
+            servers: Arc::new(Mutex::new(Vec::new())),
+            bell: Arc::clone(&bell),
+        },
+        bell,
     };
+    let services_env: Arc<dyn Env> = Arc::<LiveEnv>::clone(env);
+    if let Err(error) = install(&machine.dispatcher, services_env, machine.ready.clone()) {
+        let ending = Ending::Failed(format!("the services could not be set up: {error}"));
+        return (ending, machine.log.into_inner_or_poisoned(), Tally::default());
+    }
     session.record(EventKind::Lifecycle {
         phase: LifecyclePhase::ProcessStart,
         subject: PROCESS_ID,
     });
 
-    loop {
-        let exit = match vcpu.run() {
-            Ok(exit) => exit,
-            Err(error) => return vcpu_failed(error),
-        };
-        match exit {
-            Exit::Svc(number) => {
-                let mut regs = match vcpu.regs() {
-                    Ok(regs) => regs,
-                    Err(error) => return vcpu_failed(error),
-                };
-                let record = dispatcher.dispatch(
-                    number,
-                    &mut regs,
-                    &mut Caller {
-                        core: CORE,
-                        thread: MAIN_THREAD,
-                        env: &**env,
-                        memory: session.memory,
-                        debug: log,
-                        recorder: &session.recorder,
-                    },
-                );
-                // PROVISIONAL: nothing keeps the environment's recording (see the module docs),
-                // and every dispatch adds a clock reading to it.
-                drop(env.take_recording());
-                tally.count(&record);
-                // The call may have unmapped or reprotected memory. What the vCPUs have cached
-                // about it must go before the guest runs again, also when the call failed
-                // part-way.
-                if let Err(error) = space.settle(vcpu) {
-                    return vcpu_failed(error);
-                }
-                match record.outcome {
-                    Outcome::Completed | Outcome::NotImplemented => {
-                        if let Err(error) = vcpu.set_regs(&regs) {
-                            return vcpu_failed(error);
-                        }
-                    }
-                    Outcome::ProcessExited => {
-                        session.record(EventKind::Lifecycle {
-                            phase: LifecyclePhase::ProcessExit,
-                            subject: PROCESS_ID,
-                        });
-                        return Ending::Exited;
-                    }
-                    Outcome::EnvFailed(error) => {
-                        return Ending::Failed(format!(
-                            "the environment failed during svc {number:#x}: {error}"
-                        ));
-                    }
-                    Outcome::Waiting => return Ending::Failed(WAITING.to_owned()),
-                    Outcome::ThreadExited => return Ending::Failed(THREAD_EXITED.to_owned()),
-                }
-            }
-            Exit::DataAbort {
-                address,
-                write,
-                syndrome,
-            } => {
-                let access = if write { Access::Write } else { Access::Read };
-                if let Some(ending) = aborted(vcpu, space, session, address, access, syndrome) {
-                    return ending;
-                }
-            }
-            Exit::InstructionAbort { address, syndrome } => {
-                let access = Access::Execute;
-                if let Some(ending) = aborted(vcpu, space, session, address, access, syndrome) {
-                    return ending;
-                }
-            }
-            Exit::Undefined { syndrome, .. } => return crashed(vcpu, UNDEFINED, syndrome),
-            Exit::Interrupted => {
-                if watchdog.fired() {
-                    return Ending::TimedOut;
-                }
-                // Nothing else interrupts the vCPU yet; resume.
-            }
+    let Vcpus { first, make } = vcpus;
+    std::thread::scope(|scope| {
+        let machine = &machine;
+        let timer = std::thread::Builder::new()
+            .name("starquake-timer".into())
+            .spawn_scoped(scope, move || timer::run(machine));
+        if let Err(error) = timer {
+            machine.stop(Ending::Failed(format!(
+                "the timer thread could not start: {error}"
+            )));
         }
-    }
-}
-
-/// What an abort on an `access` to `address` comes to: `None` when the page only lacked backing
-/// and now has it, so the guest retries the access; otherwise how the run ends. `syndrome` is
-/// the abort's, for the crash report.
-fn aborted<V: Vcpu, C: HostClock + Clone>(
-    vcpu: &V,
-    space: &dyn GuestSpace<V>,
-    session: &Session<'_, C>,
-    address: u64,
-    access: Access,
-    syndrome: Syndrome,
-) -> Option<Ending> {
-    match space.touch(address, access) {
-        Touch::Backed => None,
-        Touch::Refused => {
-            // The event stream has one kind of fault; a fetch is recorded as a read, as it
-            // was when the backend reported fetch faults as data aborts.
-            let (exception, write) = match access {
-                Access::Execute => (Exception::InstructionAbort { address }, false),
-                Access::Write => (
-                    Exception::DataAbort {
-                        address,
-                        write: true,
-                    },
-                    true,
-                ),
-                Access::Read => (
-                    Exception::DataAbort {
-                        address,
-                        write: false,
-                    },
-                    false,
-                ),
+        for index in 1..count {
+            let Some(core) = CoreId::new(index) else {
+                continue;
             };
-            Some(fatal_fault(
-                vcpu,
-                session,
-                address,
-                write,
-                (exception, syndrome),
-            ))
+            let spawned = std::thread::Builder::new()
+                .name(format!("starquake-core-{index}"))
+                .spawn_scoped(scope, move || match make(core) {
+                    Ok(mut vcpu) => core_loop::run(machine, core, &mut vcpu),
+                    Err(error) => machine.stop(Ending::Failed(format!(
+                        "the vCPU of core {index} could not be created: {error}"
+                    ))),
+                });
+            if let Err(error) = spawned {
+                machine.stop(Ending::Failed(format!(
+                    "core {index} could not start: {error}"
+                )));
+            }
         }
-        Touch::Failed(error) => Some(unbacked(address, &error)),
-    }
-}
-
-/// Ends the run because a page the guest may use could not be given backing: the emulator's
-/// failure, not the guest's.
-fn unbacked(address: u64, error: &crate::space::SpaceError) -> Ending {
-    Ending::Failed(format!(
-        "guest memory at {address:#x} could not be backed: {error}"
-    ))
-}
-
-/// Ends the run as a crash with `exception` and its `syndrome`, with the guest's registers as
-/// they are now.
-fn crashed<V: Vcpu>(vcpu: &V, exception: Exception, syndrome: Syndrome) -> Ending {
-    match vcpu.regs() {
-        Ok(regs) => Ending::Crashed(exception, syndrome, Box::new(regs)),
-        Err(error) => Ending::Failed(format!("the vCPU failed: {error}")),
-    }
-}
-
-/// Records an abort at `address` as a fatal fault and ends the run as a crash with `exception`
-/// and its syndrome.
-fn fatal_fault<V: Vcpu, C: HostClock + Clone>(
-    vcpu: &V,
-    session: &Session<'_, C>,
-    address: u64,
-    write: bool,
-    (exception, syndrome): (Exception, Syndrome),
-) -> Ending {
-    session.record(EventKind::Fault {
-        address,
-        write,
-        action: FaultAction::Fatal,
+        match CoreId::new(CORE) {
+            Some(core) => core_loop::run(machine, core, first),
+            None => machine.stop(Ending::Failed("there is no core 0".to_owned())),
+        }
     });
-    crashed(vcpu, exception, syndrome)
+    // PROVISIONAL: nothing keeps the environment's recording (see the module docs).
+    drop(env.take_recording());
+    let ending = lock(&machine.ending)
+        .take()
+        .unwrap_or_else(|| Ending::Failed("the run stopped without saying why".to_owned()));
+    let Machine { log, tally, .. } = machine;
+    (
+        ending,
+        log.into_inner_or_poisoned(),
+        tally.into_inner_or_poisoned(),
+    )
+}
+
+/// A mutex's value, whatever a panicking holder left.
+trait IntoInner<T> {
+    fn into_inner_or_poisoned(self) -> T;
+}
+
+impl<T> IntoInner<T> for Mutex<T> {
+    fn into_inner_or_poisoned(self) -> T {
+        self.into_inner().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 /// The newest events the flight recorder holds, oldest first, one line each.
