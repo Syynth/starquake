@@ -601,7 +601,7 @@ fn ending_the_process_stops_every_core_that_runs_guest_code() {
     let (arrived, arrivals) = mpsc::channel::<u8>();
     let arrived = Mutex::new(arrived);
     let interrupters = Interrupters::default();
-    let made = Arc::clone(&interrupters);
+    let registry = Arc::clone(&interrupters);
     let make = move |core: CoreId| -> Result<ScriptedVcpu, starquake_cpu::Error> {
         let index = core.index();
         let vcpu = if index == 1 || index == 2 {
@@ -615,7 +615,7 @@ fn ending_the_process_stops_every_core_that_runs_guest_code() {
         } else {
             ScriptedVcpu::new()
         };
-        lock(&made).push(vcpu.interrupter());
+        lock(&registry).push(vcpu.interrupter());
         Ok(vcpu)
     };
     let mut main = ScriptedVcpu::new()
@@ -663,14 +663,14 @@ fn ending_the_process_stops_every_core_that_runs_guest_code() {
 fn the_runs_timeout_stops_every_core() {
     let guest = Guest::new(&programs::hello().unwrap());
     let interrupters = Interrupters::default();
-    let made = Arc::clone(&interrupters);
+    let registry = Arc::clone(&interrupters);
     let make = move |core: CoreId| -> Result<ScriptedVcpu, starquake_cpu::Error> {
         let vcpu = if core.index() == 1 {
             ScriptedVcpu::new().then_spin()
         } else {
             ScriptedVcpu::new()
         };
-        lock(&made).push(vcpu.interrupter());
+        lock(&registry).push(vcpu.interrupter());
         Ok(vcpu)
     };
     // The main thread starts a thread on core 1, then both spin until the timeout.

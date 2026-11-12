@@ -1,9 +1,10 @@
 //! [`System`]: one program, loaded and run from start to finish.
 //!
 //! PROVISIONAL (walking skeleton, #74). A `System` is one program (an NRO, or an ExeFS's
-//! modules and metadata) run once as one guest thread on one vCPU of the hypervisor backend, in an address space of its own that the kernel keeps
-//! the books of (the `image`, `space` and `machine` modules say what is provisional about each
-//! and what replaces it). It is the
+//! modules and metadata) run once as one process on the hypervisor backend, one vCPU per core
+//! of the kernel's scheduler, in an address space of its own that the kernel keeps the books
+//! of (the `image`, `space` and `machine` modules say what is provisional about each and what
+//! replaces it). It is the
 //! thinnest thing that joins the loader, the code patcher, the CPU backend, the kernel
 //! dispatcher and the event stream, so that later work widens something that runs.
 //!
@@ -102,9 +103,9 @@ mod host {
 
     /// The address-space id of the one process: the first id the kernel's pool hands out
     /// (`starquake_kernel::process::AsidPool`). PROVISIONAL: with one process per run nothing
-    /// is given back, so the loop does not keep a pool; the core loop of kernel slice 10 takes
-    /// ids from one, sized by the width the backend reports (`HvfVcpu::asid_bits`), and reports
-    /// each flush to it.
+    /// is given back, so the loop does not keep a pool; a run with more processes takes ids
+    /// from one, sized by the width the backend reports (`HvfVcpu::asid_bits`), and reports
+    /// each flush to it. Every core's vCPU uses this id.
     const PROCESS_ASID: u16 = starquake_kernel::process::asid::FIRST_ASID;
 
     /// The one address space of a run, as the loop drives it on the vCPU.

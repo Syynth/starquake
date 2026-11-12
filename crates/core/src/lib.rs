@@ -10,8 +10,9 @@
 //! ([`System::from_exefs`]), parses them with the loader, creates the process the program's
 //! description names (its metadata's, or Eden's defaults for an NRO) with its memory in the
 //! kernel's address space (each module, a stack and a TLS page; text read-execute, rodata
-//! read-only, the rest read-write), patches its counter reads, and runs it as one guest thread
-//! on one vCPU of the hypervisor backend. Every `svc` goes through the kernel's dispatcher
+//! read-only, the rest read-write), patches its counter reads, and runs its threads on six
+//! cores of the hypervisor backend, one vCPU each, as the kernel's scheduler decides. Every
+//! `svc` goes through the kernel's dispatcher
 //! and is recorded in the event stream. The run ends when the guest calls `ExitProcess`, when it
 //! crashes, or at a timeout, and leaves a [`RunReport`] that [`artifacts::write`] turns into the
 //! artifacts folder of the headless contract (`docs/specs/observability.md`).
@@ -24,7 +25,8 @@
 //! - `space`: the address space as the host keeps it: stage-1 tables driven by the kernel's
 //!   address space, pages backed on first touch from the start of a small guest RAM (replaced
 //!   by the backing pools).
-//! - `machine`: one guest thread on one core with no scheduler (kernel slices 8 and 10).
+//! - `machine`: the core loop and the timer thread (kernel slice 10), with the loop recording
+//!   lifecycle and fault events itself and a whole register file moved per system call.
 //! - `clock`: an NRO's process counts time at the Switch 1 rate, a guess (an NRO does not say
 //!   which console it was built for).
 //! - [`system`]: one VM per run, hypervisor backend only.

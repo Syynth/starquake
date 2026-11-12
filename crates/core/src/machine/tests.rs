@@ -583,7 +583,10 @@ fn bounded<R>(interrupters: &Interrupters, body: impl FnOnce() -> R) -> R {
             }
         });
         let result = body();
-        drop(done.send(()));
+        assert!(
+            done.send(()).is_ok(),
+            "the watchdog fired: the test ran out of time"
+        );
         result
     })
 }

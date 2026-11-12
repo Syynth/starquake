@@ -44,8 +44,9 @@
 //!   with the light locks that make kernel waiters.
 //! - The waits in `SetCoreMask` and `SetActivity` after the scheduler lock is released (until
 //!   the thread is no longer running on a core it may not use, or stops running): the system
-//!   call layer, using [`Scheduler::running_on`], once the core loop (slice 10) and the wait
-//!   path (slice 4) exist; `SetThreadCoreMask` leaves a marked seam (`crate::svc::thread`).
+//!   call layer, using [`Scheduler::running_on`]; `SetThreadCoreMask` leaves a marked seam
+//!   (`crate::svc::thread`). The core loop and the wait path it needs exist since slices 4 and
+//!   10; the retry is not built.
 //!
 //! Kernel slice 8 added the thread and process lifecycle (`scheduler/lifecycle.rs`): user
 //! threads with an owner process, a guest thread id and a thread-local region; starting,
@@ -53,6 +54,11 @@
 //! virtual half of `SetCoreMask` ([`Scheduler::set_virtual_core_mask`]), which translates the
 //! cores a program names to the physical cores here (`VirtualToPhysicalCoreMap`). The process
 //! core-mask checks of `svcSetThreadCoreMask` are in the system call layer.
+//!
+//! Kernel slice 10 added time slicing: [`Scheduler::rotate_scheduled_queue`]
+//! (`KScheduler::RotateScheduledQueue`) and [`Scheduler::preempt_threads`]
+//! (`GlobalSchedulerContext::PreemptThreads`, at [`PREEMPTION_PRIORITIES`] every
+//! [`PREEMPTION_INTERVAL_NS`]), which the core loop's timer thread runs with no calling core.
 //! - Serialising the table for snapshots (observability spec): a follow-up, because a
 //!   deserialised queue must be validated link by link.
 //!

@@ -18,6 +18,17 @@
 //! the run stopping. Each turn also drains the dispatcher's report of woken threads
 //! ([`Dispatcher::take_woken`]), which the scheduler has already made runnable.
 //!
+//! Being rung only shortens a sleep: a deadline a sleeping timer thread has not seen is found
+//! at its next turn anyway, at the latest one [`PREEMPTION_INTERVAL_NS`] later. (So no test
+//! can tell a missing ring from a late timeout without timing the host.)
+//!
+//! A delivery runs a server's `take_reply` here, on a thread with no vCPU. That is safe for the
+//! address space because none of the calls `IpcContext` offers today changes a stage-1
+//! mapping: they read and write guest memory and handle tables, and make objects (a shared
+//! memory's backing included), which the guest maps with its own system calls, after which its
+//! core settles the address space as after any call. A context call that maps would need a
+//! settle here.
+//!
 //! Not here yet: vsync, and draining the graphics server's completion queue (both come with
 //! the graphics server).
 

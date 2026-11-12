@@ -200,7 +200,10 @@ mod tests {
                 }
             });
             let result = body();
-            drop(done.send(()));
+            assert!(
+                done.send(()).is_ok(),
+                "the watchdog fired: the test ran out of time"
+            );
             result
         })
     }
@@ -272,7 +275,7 @@ mod tests {
                 assert_eq!(cores.park(core(1), || false), Parked::Woken);
                 cores.stop();
                 assert_eq!(first.join().unwrap(), Parked::Stopped);
-            })
+            });
         });
     }
 }

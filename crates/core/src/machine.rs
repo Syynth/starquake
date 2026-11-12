@@ -26,7 +26,8 @@
 //!     sleep until the next of those, or until a core or a service rings the timer
 //! ```
 //!
-//! The scheduler talks to the cores through [`CoreSignals`] (`machine/cores.rs`): it interrupts
+//! The scheduler talks to the cores through
+//! [`CoreSignals`](starquake_kernel::sched::CoreSignals) (`machine/cores.rs`): it interrupts
 //! a core running guest code (the vCPU's interrupter) and wakes a parked one (a condition
 //! variable). Stopping the run interrupts and wakes every core. A run whose cores have all
 //! parked while nothing could ever end a wait ([`Dispatcher::is_stalled`]) ends as an emulator

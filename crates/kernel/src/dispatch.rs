@@ -454,9 +454,10 @@ pub struct Caller<'a> {
     pub core: u8,
     /// The guest thread making the call, as the event stream names it.
     ///
-    /// PROVISIONAL (walking skeleton, #74): the core loop names the thread. Once the scheduler
-    /// tracks which thread each core is running (kernel slice 10), the dispatcher reads it from
-    /// there and this field goes away.
+    /// PROVISIONAL (walking skeleton, #74): the core loop names the thread, as the scheduler
+    /// chose it for the core ([`Dispatcher::switch`]'s [`Loaded::guest_id`]). Reading it from
+    /// the scheduler's current thread of [`Caller::core`] instead removes this field; the
+    /// dispatcher's tests that drive calls with no scheduler thread are what keeps it.
     pub thread: ThreadId,
     /// The injectable environment (observability spec, rule 1). The dispatcher reads its clock
     /// once per dispatch.

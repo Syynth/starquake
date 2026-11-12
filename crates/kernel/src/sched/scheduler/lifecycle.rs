@@ -35,7 +35,9 @@
 //!   `a_thread_destroyed_while_a_core_names_it_leaves_that_core`.
 //! - **Termination is immediate.** Eden asks every other thread to terminate
 //!   (`RequestTerminate`) and waits for each. Here every thread is ended in the call, in thread
-//!   order: there is no other core running one of them yet (slice 10). Test (in
+//!   order. A thread another core is running stops being its choice, and that core is
+//!   interrupted at the next `Scheduler::update`; the only call that does this is `ExitProcess`,
+//!   which ends the run. Test (in
 //!   `svc/process/tests.rs`): `exiting_the_process_ends_every_thread_and_closes_every_handle`.
 //! - **A thread that ends while it waits leaves its wait at once** (see the module docs of
 //!   [`crate::sync`]). Test: `a_thread_that_terminates_while_waiting_leaves_every_wait_list`.
