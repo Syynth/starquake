@@ -2,12 +2,14 @@
 //! validated, before anything changes, into the [`Op`]s the apply pass carries out.
 //!
 //! A command's ids must name live resources of their kind; its descriptions must pass
-//! [`crate::validate`]; and these rules, which the validation functions cannot see because they
-//! need ids, apply too:
+//! [`crate::validate`] (which also refuses a copy whose sides overlap, from the ids its
+//! [`Resolved`] sides carry); and these rules, which need what the validation functions are not
+//! given (the texture a view id names, the readbacks waiting, the pipelines, the list's render
+//! targets), apply too:
 //!
-//! - a copy or blit must not read and write overlapping bytes of one buffer or one texture's mip
-//!   level (Vulkan leaves overlapping copies undefined; wgpu refuses copies within one buffer;
-//!   guess: both from memory of their documentation, to be confirmed by slice R5);
+//! - a blit must not read and write overlapping texels of one texture's mip level (the
+//!   [`ResolvedView`]s a blit is validated with carry no texture ids; Vulkan leaves overlapping
+//!   blits undefined; guess: from memory of its documentation, to be confirmed by slice R5);
 //! - a readback id must not already be waiting to be taken, nor be used twice in the list;
 //! - colour target views store colour and depth/stencil target views do not, and both come from
 //!   textures with the render-target usage;
@@ -16,6 +18,10 @@
 //!   sampled or storage usage, vertex buffers have the vertex usage, the index buffer the index
 //!   usage, and an indirect parameter buffer the indirect usage. (How far an indirect draw reads
 //!   is not checked: the backend that reads it, slice R7, owns that bound.)
+//!
+//! What a checked command does to the model is in the parent module's docs; the choices that
+//! leave bytes unknown are made here: `blit_copies` for blits, [`texel::buffer_copy_exact`] for
+//! uploads, readbacks and buffer copies, and the present arm of `command` for frame dumps.
 
 use super::store::BlockBox;
 use super::{
@@ -30,7 +36,7 @@ use crate::error::RenderError;
 use crate::format::{FormatAspect, PixelFormat};
 use crate::id::{BufferId, PipelineId, ReadbackId, TextureId, ViewId};
 use crate::resource::{BufferUsage, TextureDimension, TextureUsage};
-use crate::validate::{self, Resolved, ResolvedView};
+use crate::validate::{self, Resolved, ResolvedView, spans_overlap};
 use std::collections::BTreeSet;
 
 /// Bytes of one resource a command reads or writes.
@@ -69,8 +75,9 @@ pub(super) enum Op<'a> {
     Fill { to: Place, texel: Vec<u8> },
     /// Bytes made unknown.
     Forget(Vec<Place>),
-    /// Bytes read out under an id.
-    Readback { from: Place, id: ReadbackId },
+    /// Bytes read out under an id, from the place they come from when they can be read
+    /// exactly ([`texel::buffer_copy_exact`]).
+    Readback { from: Option<Place>, id: ReadbackId },
     /// A present, with the place its pixels come from when they can be read.
     Present {
         desc: &'a PresentDesc,
@@ -109,21 +116,30 @@ fn command<'a>(
         Command::Upload { from, to } => {
             let (resolved, place) = resolve(state, to)?;
             validate::validate_upload(len_u64(from.len()), resolved)?;
-            Ok(Op::Upload {
-                bytes: from.bytes(),
-                to: place,
+            Ok(if exact_buffer_side(resolved) {
+                Op::Upload {
+                    bytes: from.bytes(),
+                    to: place,
+                }
+            } else {
+                Op::Forget(vec![place])
             })
         }
         Command::Copy(copy) => {
             let (src, from) = resolve(state, &copy.src)?;
             let (dst, to) = resolve(state, &copy.dst)?;
             validate::validate_copy(src, dst)?;
-            if overlaps(&from, &to) {
-                return Err(RenderError::Invalid(
-                    "a copy's source and destination overlap",
-                ));
-            }
-            Ok(Op::Copy { from, to })
+            let texture_to_texture = matches!(
+                (src, dst),
+                (Resolved::Texture { .. }, Resolved::Texture { .. })
+            );
+            Ok(
+                if texture_to_texture || (exact_buffer_side(src) && exact_buffer_side(dst)) {
+                    Op::Copy { from, to }
+                } else {
+                    Op::Forget(vec![to])
+                },
+            )
         }
         Command::Blit(blit) => blit_op(state, blit),
         Command::Clear(clear) => clear_op(state, clear),
@@ -161,7 +177,7 @@ fn command<'a>(
                 ));
             }
             Ok(Op::Readback {
-                from: place,
+                from: exact_buffer_side(resolved).then_some(place),
                 id: *id,
             })
         }
@@ -169,7 +185,9 @@ fn command<'a>(
             let (view, tex) = state.view(present.view)?;
             validate::validate_present(resolved(view, tex), present)?;
             let format = view.desc.format;
-            let from = if format.is_compressed() {
+            // The present blit samples the view, so a swizzle applies; the dump does not model
+            // it, nor compressed texels.
+            let from = if format.is_compressed() || !view.desc.swizzle.is_identity() {
                 None
             } else {
                 Some(rect_place(view, tex, &present.src_rect)?)
@@ -196,13 +214,41 @@ fn blit_op<'a>(state: &State, blit: &BlitDesc) -> Result<Op<'a>, RenderError> {
             "a blit's source and destination overlap",
         ));
     }
-    let format = sv.desc.format;
+    Ok(if blit_copies(sv, dv, blit) {
+        Op::Copy { from, to }
+    } else {
+        Op::Forget(vec![to])
+    })
+}
+
+/// Whether a blit is a byte copy on every device: unscaled, between views of one integer
+/// colour format (`uint` or `sint`; the validation has made its filter the nearest one), and
+/// with the identity swizzle on both views.
+///
+/// Every other blit makes its destination unknown. A real blit (`vkCmdBlitImage` or a shader
+/// blit) converts a non-integer texel through float: a snorm `0x80` becomes -1.0 and is written
+/// back as `0x81`; float NaN payloads and subnormals (binary16 too), sRGB, unorm and depth
+/// texels are not guaranteed to round-trip either (the same cases [`texel`] refuses to claim
+/// for clears). A blit reads and writes through its views, so a swizzle on either one
+/// reorders channels the byte copy would not.
+fn blit_copies(src: &ViewRec, dst: &ViewRec, blit: &BlitDesc) -> bool {
+    let format = src.desc.format;
     let unscaled =
         blit.src_rect.width == blit.dst_rect.width && blit.src_rect.height == blit.dst_rect.height;
-    if unscaled && format == dv.desc.format && !format.is_compressed() {
-        Ok(Op::Copy { from, to })
-    } else {
-        Ok(Op::Forget(vec![to]))
+    unscaled
+        && format == dst.desc.format
+        && format.is_integer()
+        && src.desc.swizzle.is_identity()
+        && dst.desc.swizzle.is_identity()
+}
+
+/// Whether a buffer copy to or from `side` (an upload, a readback, a buffer copy) moves known
+/// bytes exactly: always for a buffer, and for a texture whose format
+/// [`texel::buffer_copy_exact`] allows.
+fn exact_buffer_side(side: Resolved<'_>) -> bool {
+    match side {
+        Resolved::Buffer { .. } => true,
+        Resolved::Texture { desc, .. } => texel::buffer_copy_exact(desc.format),
     }
 }
 
@@ -415,9 +461,6 @@ fn whole_view(view: &ViewRec, tex: &TextureRec) -> Result<Vec<Place>, RenderErro
 
 /// Whether two places share a byte.
 fn overlaps(a: &Place, b: &Place) -> bool {
-    let apart = |s1: u64, l1: u64, s2: u64, l2: u64| {
-        s1.saturating_add(l1) <= s2 || s2.saturating_add(l2) <= s1
-    };
     match (a, b) {
         (
             Place::Buffer {
@@ -430,7 +473,7 @@ fn overlaps(a: &Place, b: &Place) -> bool {
                 offset: o2,
                 size: s2,
             },
-        ) => i1 == i2 && !apart(*o1, *s1, *o2, *s2),
+        ) => i1 == i2 && spans_overlap(*o1, *s1, *o2, *s2),
         (
             Place::Texture {
                 id: i1,
@@ -444,7 +487,7 @@ fn overlaps(a: &Place, b: &Place) -> bool {
             },
         ) => {
             let axis = |s1: u32, l1: u32, s2: u32, l2: u32| {
-                !apart(s1.into(), l1.into(), s2.into(), l2.into())
+                spans_overlap(s1.into(), l1.into(), s2.into(), l2.into())
             };
             i1 == i2
                 && m1 == m2

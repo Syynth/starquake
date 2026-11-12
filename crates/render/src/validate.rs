@@ -30,6 +30,12 @@
 //!   formats that differ in sRGB, so the wgpu backend may refuse more.
 //! - The texture side of a buffer copy, an upload or a readback must have one sample, as both
 //!   Vulkan and wgpu require.
+//! - A copy must not read and write overlapping bytes of one buffer (same buffer id, byte ranges
+//!   sharing a byte) or of one texture's mip level (same texture id and mip, regions sharing a
+//!   texel on every axis): Vulkan leaves overlapping copies undefined and wgpu refuses copies
+//!   within one buffer (guess: both from memory of their documentation, to be confirmed by slice
+//!   R5). The check uses the ids the [`Resolved`] sides carry, so every backend refuses the same
+//!   lists.
 //! - Texture data outside a texture is tightly packed ([`packed_size`]; this crate's choice).
 //!
 //! Clears, blits and presents are checked in [`view_ops`], whose functions are re-exported here.
@@ -950,8 +956,54 @@ fn check_side(side: Side, resolved: Resolved<'_>) -> Result<u64, RenderError> {
     }
 }
 
-/// Checks a copy: each side in bounds and created for copying, and the two sides compatible.
+/// Whether the spans `a_start..a_start + a_len` and `b_start..b_start + b_len` share a point.
+/// The ends saturate, so no input overflows. Shared by the copy check here and the recording
+/// backend's blit check.
+pub(crate) fn spans_overlap(a_start: u64, a_len: u64, b_start: u64, b_len: u64) -> bool {
+    a_start < b_start.saturating_add(b_len) && b_start < a_start.saturating_add(a_len)
+}
+
+/// Whether the two sides of a copy read and write a shared byte of one resource (module docs).
+fn copy_sides_overlap(src: Resolved<'_>, dst: Resolved<'_>) -> bool {
+    match (src, dst) {
+        (Resolved::Buffer { slice: s, .. }, Resolved::Buffer { slice: d, .. }) => {
+            s.buffer == d.buffer && spans_overlap(s.offset, s.size, d.offset, d.size)
+        }
+        (Resolved::Texture { region: s, .. }, Resolved::Texture { region: d, .. }) => {
+            let axis = |a: u32, al: u32, b: u32, bl: u32| {
+                spans_overlap(a.into(), al.into(), b.into(), bl.into())
+            };
+            s.texture == d.texture
+                && s.mip == d.mip
+                && axis(s.origin.x, s.extent.width, d.origin.x, d.extent.width)
+                && axis(s.origin.y, s.extent.height, d.origin.y, d.extent.height)
+                && axis(
+                    s.origin.z,
+                    s.extent.depth_or_layers,
+                    d.origin.z,
+                    d.extent.depth_or_layers,
+                )
+        }
+        (Resolved::Buffer { .. }, Resolved::Texture { .. })
+        | (Resolved::Texture { .. }, Resolved::Buffer { .. }) => false,
+    }
+}
+
+/// Checks a copy, in the order: the source side in bounds and created for copying, the
+/// destination side likewise, the two sides compatible, and the two sides not overlapping in
+/// one resource (module docs).
 pub fn validate_copy(src: Resolved<'_>, dst: Resolved<'_>) -> Result<(), RenderError> {
+    copy_sides_compatible(src, dst)?;
+    if copy_sides_overlap(src, dst) {
+        return Err(RenderError::Invalid(
+            "a copy's source and destination overlap",
+        ));
+    }
+    Ok(())
+}
+
+/// Every check of [`validate_copy`] but the overlap.
+fn copy_sides_compatible(src: Resolved<'_>, dst: Resolved<'_>) -> Result<(), RenderError> {
     let src_bytes = check_side(Side::Source, src)?;
     let dst_bytes = check_side(Side::Destination, dst)?;
     match (src, dst) {

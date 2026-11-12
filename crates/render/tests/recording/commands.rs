@@ -170,6 +170,86 @@ fn draws_and_dispatches_forget_storage_bindings_only() {
     }
 }
 
+/// A 2D array view of mips `0..mips` and layer 0.
+fn mips_view(
+    b: &starquake_render::RecordingBackend,
+    t: starquake_render::TextureId,
+    format: PixelFormat,
+    mips: u32,
+) -> starquake_render::ViewId {
+    super::fixtures::ok(b.create_view(
+        t,
+        &starquake_render::ViewDesc {
+            format,
+            dimension: starquake_render::resource::ViewDimension::D2Array,
+            base_mip: 0,
+            mip_count: mips,
+            base_layer: 0,
+            layer_count: 1,
+            swizzle: starquake_render::resource::Swizzle::IDENTITY,
+        },
+    ))
+}
+
+/// The commands that write a view.
+type Run<'a> = dyn Fn(starquake_render::ViewId) -> Vec<Command> + 'a;
+
+#[test]
+fn draws_and_dispatches_forget_every_mip_of_a_view() {
+    let b = backend();
+    let g = graphics(&b);
+    let cp = compute(&b);
+    let format = PixelFormat::A8B8G8R8Unorm;
+    let dispatch = |view| {
+        Command::Dispatch(DispatchDesc {
+            pipeline: cp,
+            bindings: vec![Binding {
+                group: 0,
+                binding: 0,
+                resource: BindingResource::View(view),
+            }],
+            params: DispatchParams::Direct { x: 1, y: 1, z: 1 },
+        })
+    };
+    let draw_into = |view| vec![targets(view, None), Command::Draw(draw(g))];
+    let dispatch_on = |view| vec![dispatch(view)];
+    let runs: [(&str, &Run<'_>); 2] = [("draw", &draw_into), ("dispatch", &dispatch_on)];
+    for (what, run) in runs {
+        // Three mips (4x4, 2x2, 1x1); the view covers the first two.
+        let t = texture(&b, format, (4, 4), 1, 3);
+        let v = mips_view(&b, t, format, 2);
+        submit(
+            &b,
+            vec![
+                upload(&[1; 64], region(t, 0, (0, 0, 0), (4, 4, 1))),
+                upload(&[2; 16], region(t, 1, (0, 0, 0), (2, 2, 1))),
+                upload(&[3; 4], region(t, 2, (0, 0, 0), (1, 1, 1))),
+            ],
+        );
+        assert_eq!(
+            read(&b, region(t, 1, (0, 0, 0), (2, 2, 1))),
+            Readback::Bytes(vec![2; 16]),
+            "{what}: mip 1 known before"
+        );
+        submit(&b, run(v));
+        assert_eq!(
+            read(&b, region(t, 0, (0, 0, 0), (4, 4, 1))),
+            Readback::Unknown,
+            "{what}: mip 0"
+        );
+        assert_eq!(
+            read(&b, region(t, 1, (0, 0, 0), (2, 2, 1))),
+            Readback::Unknown,
+            "{what}: mip 1"
+        );
+        assert_eq!(
+            read(&b, region(t, 2, (0, 0, 0), (1, 1, 1))),
+            Readback::Bytes(vec![3; 4]),
+            "{what}: mip 2 is outside the view"
+        );
+    }
+}
+
 #[test]
 fn presents_give_feedback_and_dumps() {
     let b = backend();
@@ -265,6 +345,7 @@ fn every_command_runs() {
     let list = vec![
         Command::Marker(Marker { submit: 1, draw: 0 }),
         upload(&counting(0, 16), region(src, 0, (0, 0, 0), (2, 2, 1))),
+        upload(&[9; 16], region(dst, 0, (0, 0, 0), (2, 2, 1))),
         Command::Copy(CopyDesc {
             src: region(src, 0, (0, 0, 0), (2, 2, 1)),
             dst: slice(buf, 0, 16),
@@ -319,7 +400,8 @@ fn every_command_runs() {
     assert_eq!(b.take_readback(rb(1)), None, "taken");
     let dumps = b.take_frame_dumps();
     assert_eq!(dumps.len(), 1);
-    assert_eq!(dumps[0].pixels, Readback::Bytes(counting(0, 16)), "blitted");
+    // A unorm blit converts through float, so the oracle claims nothing of what it wrote.
+    assert_eq!(dumps[0].pixels, Readback::Unknown, "blitted");
     assert_eq!(b.take_present_feedback().len(), 1);
     let lists = b.lists();
     assert_eq!(

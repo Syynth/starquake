@@ -2,11 +2,17 @@
 //! by hand, and readbacks of what nothing (or a draw) wrote.
 
 use super::fixtures::{
-    backend, buffer, clear, counting, ok, read, rect, region, slice, submit, texture, upload, view,
+    MEMORY, backend, buffer, caps, clear, counting, ok, read, rect, region, slice, submit, texture,
+    upload, view,
 };
-use starquake_render::command::{BlitDesc, ClearValue, CopyDesc};
-use starquake_render::resource::{FilterMode, TextureDimension};
-use starquake_render::{Backend, BufferUsage, Command, PixelFormat, Readback};
+use starquake_render::command::{BlitDesc, ClearValue, CopyDesc, PresentDesc, PresentTransform};
+use starquake_render::resource::{
+    FilterMode, Swizzle, SwizzleSource, TextureDimension, ViewDimension,
+};
+use starquake_render::{
+    Backend, BufferUsage, Caps, Command, CommandList, PixelFormat, Readback, RecordingBackend,
+    TextureId, ViewDesc, ViewId,
+};
 
 fn bytes(v: Vec<u8>) -> Readback {
     Readback::Bytes(v)
@@ -347,24 +353,25 @@ fn a_clear_of_a_3d_view_covers_every_slice_of_its_level() {
 }
 
 fn blit(
-    src: starquake_render::ViewId,
+    src: ViewId,
     s: (u32, u32, u32, u32),
-    dst: starquake_render::ViewId,
+    dst: ViewId,
     d: (u32, u32, u32, u32),
+    filter: FilterMode,
 ) -> Command {
     Command::Blit(BlitDesc {
         src,
         src_rect: rect(s.0, s.1, s.2, s.3),
         dst,
         dst_rect: rect(d.0, d.1, d.2, d.3),
-        filter: FilterMode::Linear,
+        filter,
     })
 }
 
 #[test]
-fn an_unscaled_blit_of_one_format_copies_texels() {
+fn an_unscaled_integer_blit_copies_texels() {
     let b = backend();
-    let f = PixelFormat::A8B8G8R8Unorm;
+    let f = PixelFormat::A8B8G8R8Uint;
     let s = texture(&b, f, (4, 2), 2, 1);
     let d = texture(&b, f, (4, 4), 1, 1);
     // The blit reads the source view's base layer: layer 1.
@@ -374,7 +381,7 @@ fn an_unscaled_blit_of_one_format_copies_texels() {
         &b,
         vec![
             upload(&counting(0, 32), region(s, 0, (0, 0, 1), (4, 2, 1))),
-            blit(sv, (2, 0, 2, 2), dv, (0, 2, 2, 2)),
+            blit(sv, (2, 0, 2, 2), dv, (0, 2, 2, 2), FilterMode::Nearest),
         ],
     );
     // Source row 0 texels 2..4 are bytes 8..16, row 1 bytes 24..32.
@@ -388,19 +395,394 @@ fn an_unscaled_blit_of_one_format_copies_texels() {
         read(&b, region(d, 0, (0, 0, 0), (2, 2, 1))),
         Readback::Unknown
     );
+    // Signed integers copy too.
+    let sint = PixelFormat::R8Sint;
+    let (si, di) = (
+        texture(&b, sint, (2, 1), 1, 1),
+        texture(&b, sint, (2, 1), 1, 1),
+    );
+    let (siv, div) = (view(&b, si, sint, 0, (0, 1)), view(&b, di, sint, 0, (0, 1)));
+    submit(
+        &b,
+        vec![
+            upload(&[0x80, 0x7f], region(si, 0, (0, 0, 0), (2, 1, 1))),
+            blit(siv, (0, 0, 2, 1), div, (0, 0, 2, 1), FilterMode::Nearest),
+        ],
+    );
+    assert_eq!(
+        read(&b, region(di, 0, (0, 0, 0), (2, 1, 1))),
+        bytes(vec![0x80, 0x7f])
+    );
+}
+
+/// Uploads `src_bytes` to a `size` texture of `format`, `[9; ..]` to a second one, blits the
+/// whole first into the whole second (unscaled), and returns what the second reads back.
+fn unscaled_blit_of(format: PixelFormat, size: (u32, u32), src_bytes: &[u8]) -> Readback {
+    let b = backend();
+    let s = texture(&b, format, size, 1, 1);
+    let d = texture(&b, format, size, 1, 1);
+    let (sv, dv) = (
+        view(&b, s, format, 0, (0, 1)),
+        view(&b, d, format, 0, (0, 1)),
+    );
+    let whole = (0, 0, size.0, size.1);
+    submit(
+        &b,
+        vec![
+            upload(src_bytes, region(s, 0, (0, 0, 0), (size.0, size.1, 1))),
+            upload(
+                &vec![9; src_bytes.len()],
+                region(d, 0, (0, 0, 0), (size.0, size.1, 1)),
+            ),
+            blit(sv, whole, dv, whole, FilterMode::Nearest),
+        ],
+    );
+    read(&b, region(d, 0, (0, 0, 0), (size.0, size.1, 1)))
+}
+
+#[test]
+fn blits_that_convert_through_float_make_their_destination_unknown() {
+    // The review's probe: snorm 0x80 is -1.0 to a blit, written back as 0x81.
+    assert_eq!(
+        unscaled_blit_of(PixelFormat::R8Snorm, (1, 1), &[0x80]),
+        Readback::Unknown
+    );
+    for (format, texel) in [
+        (PixelFormat::R8Unorm, vec![0x80]),
+        (PixelFormat::A8B8G8R8Srgb, vec![1, 2, 3, 4]),
+        // A binary16 NaN with a payload, and a subnormal.
+        (PixelFormat::R16Float, vec![0x01, 0x7e]),
+        (PixelFormat::R16Float, vec![0x01, 0x00]),
+        (PixelFormat::R32Float, vec![0x01, 0x00, 0xc0, 0x7f]),
+        (PixelFormat::D32Float, vec![0, 0, 0x80, 0x3f]),
+        (PixelFormat::D16Unorm, vec![0x34, 0x12]),
+    ] {
+        assert_eq!(
+            unscaled_blit_of(format, (1, 1), &texel),
+            Readback::Unknown,
+            "{format}"
+        );
+    }
+    // The same blit of an integer format copies.
+    assert_eq!(
+        unscaled_blit_of(PixelFormat::R8Uint, (1, 1), &[0x80]),
+        bytes(vec![0x80])
+    );
+}
+
+#[test]
+fn a_blit_scaled_in_one_direction_makes_its_destination_unknown() {
+    let b = backend();
+    let f = PixelFormat::R8Uint;
+    let s = texture(&b, f, (4, 4), 1, 1);
+    let d = texture(&b, f, (4, 4), 1, 1);
+    let (sv, dv) = (view(&b, s, f, 0, (0, 1)), view(&b, d, f, 0, (0, 1)));
+    let known = |b: &RecordingBackend| {
+        submit(
+            b,
+            vec![
+                upload(&[5; 16], region(s, 0, (0, 0, 0), (4, 4, 1))),
+                upload(&[6; 16], region(d, 0, (0, 0, 0), (4, 4, 1))),
+            ],
+        );
+    };
+    // 2x2 to 2x4: equal widths, different heights. Applying it as a copy would fail the size
+    // check midway; it must run and leave the destination unknown.
+    known(&b);
+    assert_eq!(
+        b.submit(CommandList {
+            commands: vec![blit(
+                sv,
+                (0, 0, 2, 2),
+                dv,
+                (0, 0, 2, 4),
+                FilterMode::Nearest
+            )]
+        })
+        .map(|_| ()),
+        Ok(())
+    );
+    assert_eq!(
+        read(&b, region(d, 0, (0, 0, 0), (2, 4, 1))),
+        Readback::Unknown
+    );
+    assert_eq!(
+        read(&b, region(d, 0, (2, 0, 0), (2, 4, 1))),
+        bytes(vec![6; 8])
+    );
+    // 2x2 to 4x2: equal heights, different widths.
+    known(&b);
+    submit(
+        &b,
+        vec![blit(
+            sv,
+            (0, 0, 2, 2),
+            dv,
+            (0, 0, 4, 2),
+            FilterMode::Nearest,
+        )],
+    );
+    assert_eq!(
+        read(&b, region(d, 0, (0, 0, 0), (4, 2, 1))),
+        Readback::Unknown
+    );
+    assert_eq!(
+        read(&b, region(d, 0, (0, 2, 0), (4, 2, 1))),
+        bytes(vec![6; 8])
+    );
+}
+
+#[test]
+fn compressed_blits() {
+    let b = backend();
+    let bc = PixelFormat::Bc1RgbaUnorm;
+    let f = PixelFormat::A8B8G8R8Unorm;
+    let s = texture(&b, bc, (4, 4), 1, 1);
+    let d = texture(&b, f, (4, 4), 1, 1);
+    let other_bc = texture(&b, bc, (4, 4), 1, 1);
+    let sv = view(&b, s, bc, 0, (0, 1));
+    let dv = view(&b, d, f, 0, (0, 1));
+    let bv = view(&b, other_bc, bc, 0, (0, 1));
+    // Unscaled and block-aligned, between known blocks: still refused into a compressed view.
+    submit(
+        &b,
+        vec![
+            upload(&[1; 8], region(s, 0, (0, 0, 0), (4, 4, 1))),
+            upload(&[2; 8], region(other_bc, 0, (0, 0, 0), (4, 4, 1))),
+            upload(&[3; 64], region(d, 0, (0, 0, 0), (4, 4, 1))),
+        ],
+    );
+    assert_eq!(
+        b.submit(CommandList {
+            commands: vec![blit(
+                sv,
+                (0, 0, 4, 4),
+                bv,
+                (0, 0, 4, 4),
+                FilterMode::Nearest
+            )]
+        }),
+        Err(starquake_render::RenderError::Invalid(
+            "a blit destination must not be compressed"
+        ))
+    );
+    assert_eq!(
+        read(&b, region(other_bc, 0, (0, 0, 0), (4, 4, 1))),
+        bytes(vec![2; 8])
+    );
+    // A compressed source decodes through float: the destination is unknown.
+    submit(
+        &b,
+        vec![blit(
+            sv,
+            (0, 0, 4, 4),
+            dv,
+            (0, 0, 4, 4),
+            FilterMode::Nearest,
+        )],
+    );
+    assert_eq!(
+        read(&b, region(d, 0, (0, 0, 0), (4, 4, 1))),
+        Readback::Unknown
+    );
+}
+
+/// A backend that allows view swizzles.
+fn swizzling_backend() -> RecordingBackend {
+    RecordingBackend::new(
+        Caps {
+            view_swizzle: true,
+            ..caps()
+        },
+        MEMORY,
+    )
+}
+
+/// Red and blue swapped.
+const SWAP_RB: Swizzle = Swizzle {
+    r: SwizzleSource::B,
+    g: SwizzleSource::G,
+    b: SwizzleSource::R,
+    a: SwizzleSource::A,
+};
+
+fn swizzled_view(
+    b: &RecordingBackend,
+    t: TextureId,
+    format: PixelFormat,
+    swizzle: Swizzle,
+) -> ViewId {
+    ok(b.create_view(
+        t,
+        &ViewDesc {
+            format,
+            dimension: ViewDimension::D2Array,
+            base_mip: 0,
+            mip_count: 1,
+            base_layer: 0,
+            layer_count: 1,
+            swizzle,
+        },
+    ))
+}
+
+#[test]
+fn blits_and_dumps_through_swizzled_views_are_unknown() {
+    let b = swizzling_backend();
+    let uint = PixelFormat::A8B8G8R8Uint;
+    let s = texture(&b, uint, (1, 1), 1, 1);
+    let d = texture(&b, uint, (1, 1), 1, 1);
+    let (s_plain, s_swapped) = (
+        swizzled_view(&b, s, uint, Swizzle::IDENTITY),
+        swizzled_view(&b, s, uint, SWAP_RB),
+    );
+    let (d_plain, d_swapped) = (
+        swizzled_view(&b, d, uint, Swizzle::IDENTITY),
+        swizzled_view(&b, d, uint, SWAP_RB),
+    );
+    let one = (0, 0, 1, 1);
+    for (src, dst, expected, what) in [
+        (s_plain, d_plain, bytes(vec![1, 2, 3, 4]), "identity"),
+        (s_swapped, d_plain, Readback::Unknown, "swizzled source"),
+        (
+            s_plain,
+            d_swapped,
+            Readback::Unknown,
+            "swizzled destination",
+        ),
+    ] {
+        submit(
+            &b,
+            vec![
+                upload(&[1, 2, 3, 4], region(s, 0, (0, 0, 0), (1, 1, 1))),
+                upload(&[9; 4], region(d, 0, (0, 0, 0), (1, 1, 1))),
+                blit(src, one, dst, one, FilterMode::Nearest),
+            ],
+        );
+        assert_eq!(
+            read(&b, region(d, 0, (0, 0, 0), (1, 1, 1))),
+            expected,
+            "{what}"
+        );
+    }
+
+    // A present samples its view: a swizzled view's dump is unknown.
+    let unorm = PixelFormat::A8B8G8R8Unorm;
+    let t = texture(&b, unorm, (1, 1), 1, 1);
+    let present = |view, frame| {
+        Command::Present(PresentDesc {
+            view,
+            src_rect: rect(0, 0, 1, 1),
+            transform: PresentTransform::Identity,
+            frame,
+            dump: true,
+        })
+    };
+    submit(
+        &b,
+        vec![
+            upload(&[1, 2, 3, 4], region(t, 0, (0, 0, 0), (1, 1, 1))),
+            present(swizzled_view(&b, t, unorm, Swizzle::IDENTITY), 1),
+            present(swizzled_view(&b, t, unorm, SWAP_RB), 2),
+        ],
+    );
+    let pixels: Vec<(u64, Readback)> = b
+        .take_frame_dumps()
+        .into_iter()
+        .map(|d| (d.frame, d.pixels))
+        .collect();
+    assert_eq!(
+        pixels,
+        vec![(1, bytes(vec![1, 2, 3, 4])), (2, Readback::Unknown)]
+    );
+}
+
+#[test]
+fn combined_depth_stencil_and_x8_d24_bytes_are_never_known() {
+    const COPY_BUF: BufferUsage = COPY;
+    for format in [
+        PixelFormat::D24UnormS8Uint,
+        PixelFormat::S8UintD24Unorm,
+        PixelFormat::D32FloatS8Uint,
+        PixelFormat::X8D24Unorm,
+    ] {
+        let b = backend();
+        let t = texture(&b, format, (2, 1), 1, 1);
+        let u = texture(&b, format, (2, 1), 1, 1);
+        let len = usize::try_from(2 * format.bytes_per_block()).expect("small");
+        let size = u64::try_from(len).expect("small");
+        let image = counting(1, len);
+        // The review's probe: an upload read straight back.
+        submit(&b, vec![upload(&image, region(t, 0, (0, 0, 0), (2, 1, 1)))]);
+        assert_eq!(
+            read(&b, region(t, 0, (0, 0, 0), (2, 1, 1))),
+            Readback::Unknown,
+            "{format} readback"
+        );
+        // A copy out to a buffer makes the buffer's range unknown, and only that range.
+        let buf = buffer(&b, 2 * size, COPY_BUF);
+        submit(
+            &b,
+            vec![
+                upload(&vec![7; 2 * len], slice(buf, 0, 2 * size)),
+                Command::Copy(CopyDesc {
+                    src: region(t, 0, (0, 0, 0), (2, 1, 1)),
+                    dst: slice(buf, 0, size),
+                }),
+                // A buffer copied in leaves the texture unknown.
+                Command::Copy(CopyDesc {
+                    src: slice(buf, size, size),
+                    dst: region(u, 0, (0, 0, 0), (2, 1, 1)),
+                }),
+            ],
+        );
+        assert_eq!(read(&b, slice(buf, 0, size)), Readback::Unknown, "{format}");
+        assert_eq!(
+            read(&b, slice(buf, size, size)),
+            bytes(vec![7; len]),
+            "{format}"
+        );
+        assert_eq!(
+            read(&b, region(u, 0, (0, 0, 0), (2, 1, 1))),
+            Readback::Unknown,
+            "{format} copied in"
+        );
+    }
+    // One-aspect depth formats without padding move exactly.
+    for format in [
+        PixelFormat::D32Float,
+        PixelFormat::D16Unorm,
+        PixelFormat::S8Uint,
+    ] {
+        let b = backend();
+        let t = texture(&b, format, (2, 1), 1, 1);
+        let len = usize::try_from(2 * format.bytes_per_block()).expect("small");
+        submit(
+            &b,
+            vec![upload(
+                &counting(1, len),
+                region(t, 0, (0, 0, 0), (2, 1, 1)),
+            )],
+        );
+        assert_eq!(
+            read(&b, region(t, 0, (0, 0, 0), (2, 1, 1))),
+            bytes(counting(1, len)),
+            "{format}"
+        );
+    }
 }
 
 #[test]
 fn scaled_or_converting_blits_make_their_destination_unknown() {
     let b = backend();
-    let f = PixelFormat::A8B8G8R8Unorm;
+    let f = PixelFormat::A8B8G8R8Uint;
     let s = texture(&b, f, (4, 4), 1, 1);
     let d = texture(&b, f, (4, 4), 1, 1);
     let sv = view(&b, s, f, 0, (0, 1));
     let dv = view(&b, d, f, 0, (0, 1));
-    // The same storage seen as sRGB: same block size, another format.
-    let d_srgb = view(&b, d, PixelFormat::A8B8G8R8Srgb, 0, (0, 1));
-    let known = |b: &starquake_render::RecordingBackend| {
+    // The same storage seen as another integer format of the same kind and block size.
+    let d_other = view(&b, d, PixelFormat::R32Uint, 0, (0, 1));
+    let known = |b: &RecordingBackend| {
         submit(
             b,
             vec![
@@ -410,7 +792,16 @@ fn scaled_or_converting_blits_make_their_destination_unknown() {
         );
     };
     known(&b);
-    submit(&b, vec![blit(sv, (0, 0, 2, 2), dv, (0, 0, 4, 2))]);
+    submit(
+        &b,
+        vec![blit(
+            sv,
+            (0, 0, 2, 2),
+            dv,
+            (0, 0, 4, 2),
+            FilterMode::Nearest,
+        )],
+    );
     assert_eq!(
         read(&b, region(d, 0, (0, 0, 0), (4, 2, 1))),
         Readback::Unknown
@@ -420,7 +811,16 @@ fn scaled_or_converting_blits_make_their_destination_unknown() {
         bytes(vec![6; 32])
     );
     known(&b);
-    submit(&b, vec![blit(sv, (0, 0, 2, 2), d_srgb, (2, 2, 2, 2))]);
+    submit(
+        &b,
+        vec![blit(
+            sv,
+            (0, 0, 2, 2),
+            d_other,
+            (2, 2, 2, 2),
+            FilterMode::Nearest,
+        )],
+    );
     assert_eq!(
         read(&b, region(d, 0, (2, 2, 0), (2, 2, 1))),
         Readback::Unknown

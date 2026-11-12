@@ -140,6 +140,108 @@ fn only_written_levels_hold_memory() {
     assert_eq!(allocated(&b.state(), t), vec![false, true, false]);
 }
 
+/// The op `plan::check` makes of `command` on `b`'s current state.
+fn planned(b: &RecordingBackend, command: Command) -> String {
+    let list = CommandList {
+        commands: vec![command],
+    };
+    let state = b.state();
+    let ops = super::plan::check(&state, &caps(), &list).expect("valid");
+    format!("{ops:?}")
+}
+
+/// Each guard on buffer copies of combined depth-stencil and `X8_D24` textures, seen in the
+/// planned op itself: through the backend no byte of such a texture is ever known, so the
+/// readback and copy-out guards could not be told apart from the upload and copy-in ones.
+#[test]
+fn buffer_copies_of_depth_stencil_textures_are_planned_unknown() {
+    let b = RecordingBackend::new(caps(), 0);
+    let buf = b
+        .create_buffer(&BufferDesc {
+            size: 64,
+            usage: BufferUsage::COPY_SRC | BufferUsage::COPY_DST,
+        })
+        .expect("valid");
+    let texture = |format| {
+        b.create_texture(&TextureDesc {
+            format,
+            mip_levels: 1,
+            size: Extent3d {
+                width: 2,
+                height: 1,
+                depth_or_layers: 1,
+            },
+            ..texture_desc(1)
+        })
+        .expect("valid")
+    };
+    let region = |t| {
+        CopyRegion::Texture(TextureRegion {
+            texture: t,
+            mip: 0,
+            origin: Origin3d::default(),
+            extent: Extent3d {
+                width: 2,
+                height: 1,
+                depth_or_layers: 1,
+            },
+        })
+    };
+    for (format, exact) in [
+        (PixelFormat::D24UnormS8Uint, false),
+        (PixelFormat::S8UintD24Unorm, false),
+        (PixelFormat::D32FloatS8Uint, false),
+        (PixelFormat::X8D24Unorm, false),
+        (PixelFormat::D32Float, true),
+        (PixelFormat::S8Uint, true),
+    ] {
+        let (t, u) = (texture(format), texture(format));
+        let size = 2 * u64::from(format.bytes_per_block());
+        let range = CopyRegion::Buffer(BufferSlice {
+            buffer: buf,
+            offset: 0,
+            size,
+        });
+        let len = usize::try_from(size).expect("small");
+        let upload = planned(
+            &b,
+            Command::Upload {
+                from: crate::command::StagingSlice::from_bytes(vec![1; len]),
+                to: region(t),
+            },
+        );
+        let readback = planned(
+            &b,
+            Command::Readback {
+                from: region(t),
+                id: ReadbackId::new(0, 0),
+            },
+        );
+        let copy = |src, dst| planned(&b, Command::Copy(CopyDesc { src, dst }));
+        let out = copy(region(t), range);
+        let into = copy(range, region(t));
+        let between = copy(region(t), region(u));
+        assert_eq!(upload.starts_with("[Upload"), exact, "{format}: {upload}");
+        assert_eq!(upload.starts_with("[Forget"), !exact, "{format}: {upload}");
+        assert_eq!(
+            readback.starts_with("[Readback { from: None"),
+            !exact,
+            "{format}: {readback}"
+        );
+        assert_eq!(
+            readback.starts_with("[Readback { from: Some"),
+            exact,
+            "{format}: {readback}"
+        );
+        for (what, op) in [("out", &out), ("into", &into)] {
+            assert_eq!(op.starts_with("[Copy"), exact, "{format} {what}: {op}");
+            assert_eq!(op.starts_with("[Forget"), !exact, "{format} {what}: {op}");
+        }
+        // Between two textures of one format, bytes and known flags move as they are.
+        assert!(between.starts_with("[Copy"), "{format}: {between}");
+    }
+}
+
 #[test]
 fn pending_destroys_are_freed_in_call_order_once_their_value_passes() {
     let b = RecordingBackend::new(caps(), 0);

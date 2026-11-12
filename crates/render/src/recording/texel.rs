@@ -33,9 +33,24 @@
 //! - 16-bit float: a value exactly representable as a normal binary16 number, zero or infinity;
 //! - integers: a value representable in the channel's bits (Vulkan leaves others undefined);
 //! - depth: within 0..=1, under the float or normalised rule of the format; stencil: 0..=255.
+//!
+//! **Buffer copies.** An upload, a readback and a copy between a buffer and a texture move bytes
+//! exactly for every format but these, for which the oracle claims nothing
+//! ([`buffer_copy_exact`]):
+//!
+//! - the two-aspect depth-stencil formats (`D24_UNORM_S8_UINT`, `S8_UINT_D24_UNORM`,
+//!   `D32_FLOAT_S8_UINT`): Vulkan's buffer copies move one aspect per region, in a packing of
+//!   their own, and wgpu cannot copy the depth aspect of `Depth24PlusStencil8` at all (guess:
+//!   both from memory of their documentation, to be confirmed by slice R5);
+//! - `X8_D24_UNORM`: the X byte of a texel copied to a buffer is undefined in Vulkan (guess, as
+//!   above).
+//!
+//! A copy between two textures of one of these formats still moves bytes and their known flags,
+//! but no byte of such a texture is ever known: uploads and buffer copies into it, clears of it
+//! (left out above) and draws all leave it unknown.
 
 use crate::command::ClearValue;
-use crate::format::{NumericType, PixelFormat};
+use crate::format::{FormatAspect, NumericType, PixelFormat};
 
 /// A channel's position in a clear value: red, green, blue, alpha (depth and stencil use 0).
 #[derive(Clone, Copy, Debug)]
@@ -108,6 +123,13 @@ fn layout(format: PixelFormat) -> Option<&'static [Field]> {
         F::B8G8R8A8Unorm | F::B8G8R8A8Srgb => BGRA8,
         _ => return None,
     })
+}
+
+/// Whether a copy between a buffer and a texture of `format` (an upload, a readback, a buffer
+/// copy) moves bytes exactly: not for a two-aspect depth-stencil format nor `X8_D24_UNORM`
+/// (module docs).
+pub(super) fn buffer_copy_exact(format: PixelFormat) -> bool {
+    format.aspect() != FormatAspect::DepthStencil && format != PixelFormat::X8D24Unorm
 }
 
 /// The bytes one texel of `format` holds after a clear to `value`, or `None` when the answer is

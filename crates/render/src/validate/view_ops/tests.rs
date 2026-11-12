@@ -278,6 +278,81 @@ fn clear_needs_render_target_usage_and_an_uncompressed_format() {
     );
 }
 
+#[test]
+fn depth_clear_values_lie_between_zero_and_one() {
+    let check = |format: PixelFormat, value: ClearValue, r: Option<Rect>| {
+        let (t, v) = (texture(format, all_usage()), view(format, 0));
+        validate_clear(
+            ResolvedView {
+                texture: &t,
+                view: &v,
+            },
+            &clear(value, r),
+        )
+    };
+    let out = invalid("a depth clear value must be between 0 and 1");
+    let both = |depth| ClearValue::DepthStencil { depth, stencil: 1 };
+    for depth in [1.0, 0.0, -0.0, 0.5] {
+        assert_eq!(
+            check(PixelFormat::D32Float, ClearValue::Depth(depth), None),
+            Ok(()),
+            "{depth}"
+        );
+        assert_eq!(
+            check(PixelFormat::D24UnormS8Uint, both(depth), None),
+            Ok(()),
+            "{depth}"
+        );
+    }
+    // Just past each end, the review's probe (2.0), infinities and NaN.
+    for depth in [
+        1.0_f32.next_up(),
+        (-0.0_f32).next_down(),
+        2.0,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::NAN,
+    ] {
+        assert_eq!(
+            check(PixelFormat::D32Float, ClearValue::Depth(depth), None),
+            out,
+            "{depth}"
+        );
+        assert_eq!(
+            check(PixelFormat::D24UnormS8Uint, ClearValue::Depth(depth), None),
+            out,
+            "{depth}"
+        );
+        assert_eq!(
+            check(PixelFormat::D32FloatS8Uint, both(depth), None),
+            out,
+            "{depth}"
+        );
+    }
+    // A stencil-only value has no depth to check.
+    assert_eq!(
+        check(PixelFormat::D24UnormS8Uint, ClearValue::Stencil(0xff), None),
+        Ok(())
+    );
+    // Order: the value's kind before its range; the range before the rectangle.
+    assert_eq!(
+        check(
+            PixelFormat::A8B8G8R8Unorm,
+            ClearValue::Depth(2.0),
+            Some(rect(0, 0, 0, 0))
+        ),
+        invalid("the clear value does not suit the view's format")
+    );
+    assert_eq!(
+        check(
+            PixelFormat::D32Float,
+            ClearValue::Depth(f32::NAN),
+            Some(rect(0, 0, 0, 0))
+        ),
+        out
+    );
+}
+
 fn blit(src_rect: Rect, dst_rect: Rect, filter: FilterMode) -> BlitDesc {
     BlitDesc {
         src: ViewId::new(0, 0),
@@ -368,7 +443,7 @@ fn blit_rules() {
             "{s} to {other}"
         );
     }
-    // Same integer kind, different formats: allowed.
+    // Same integer kind, different formats: allowed (with the nearest filter, below).
     let (ut, uv) = (
         texture(PixelFormat::R32Uint, all_usage()),
         view(PixelFormat::R32Uint, 0),
@@ -377,7 +452,97 @@ fn blit_rules() {
         texture(PixelFormat::A8B8G8R8Uint, all_usage()),
         view(PixelFormat::A8B8G8R8Uint, 0),
     );
-    assert_eq!(check_blit((&ut, &uv), (&u8t, &u8v), &ok), Ok(()));
+    let nearest = blit(whole, rect(0, 0, W / 2, H / 2), FilterMode::Nearest);
+    assert_eq!(check_blit((&ut, &uv), (&u8t, &u8v), &nearest), Ok(()));
+}
+
+#[test]
+fn integer_blits_need_the_nearest_filter() {
+    // A 4x8 to 8x8 R8Uint blit, as in the review's probe; then sint, and unorm for contrast.
+    let src = rect(0, 0, W / 4, H);
+    let dst = rect(0, 0, W / 2, H);
+    for (format, linear) in [
+        (
+            PixelFormat::R8Uint,
+            invalid("an integer blit needs the nearest filter"),
+        ),
+        (
+            PixelFormat::R16G16Sint,
+            invalid("an integer blit needs the nearest filter"),
+        ),
+        (PixelFormat::R8Unorm, Ok(())),
+    ] {
+        let (t, v) = (texture(format, all_usage()), view(format, 0));
+        assert_eq!(
+            check_blit((&t, &v), (&t, &v), &blit(src, dst, FilterMode::Linear)),
+            linear,
+            "{format} linear"
+        );
+        assert_eq!(
+            check_blit((&t, &v), (&t, &v), &blit(src, dst, FilterMode::Nearest)),
+            Ok(()),
+            "{format} nearest"
+        );
+    }
+    // Order: the filter before the source rectangle.
+    let (t, v) = (
+        texture(PixelFormat::R8Uint, all_usage()),
+        view(PixelFormat::R8Uint, 0),
+    );
+    assert_eq!(
+        check_blit(
+            (&t, &v),
+            (&t, &v),
+            &blit(rect(1, 0, W, H), dst, FilterMode::Linear)
+        ),
+        invalid("an integer blit needs the nearest filter")
+    );
+}
+
+#[test]
+fn blit_destinations_must_not_be_compressed() {
+    let bc = PixelFormat::Bc1RgbaUnorm;
+    let (bt, bv) = (texture(bc, all_usage()), view(bc, 0));
+    let f = PixelFormat::A8B8G8R8Unorm;
+    let (t, v) = (texture(f, all_usage()), view(f, 0));
+    // A scaled BC1 to BC1 blit, as in the review's probe; then an unscaled one.
+    let small = rect(0, 0, W / 2, H / 2);
+    let whole = rect(0, 0, W, H);
+    for b in [
+        blit(small, whole, FilterMode::Linear),
+        blit(whole, whole, FilterMode::Nearest),
+    ] {
+        assert_eq!(
+            check_blit((&bt, &bv), (&bt, &bv), &b),
+            invalid("a blit destination must not be compressed")
+        );
+        assert_eq!(
+            check_blit((&t, &v), (&bt, &bv), &b),
+            invalid("a blit destination must not be compressed")
+        );
+        // A compressed source into an uncompressed destination is allowed.
+        assert_eq!(check_blit((&bt, &bv), (&t, &v), &b), Ok(()));
+    }
+    // Order: the integer kind before the compressed destination; the compressed destination
+    // before the source rectangle.
+    let u = PixelFormat::R8Uint;
+    let (ut, uv) = (texture(u, all_usage()), view(u, 0));
+    assert_eq!(
+        check_blit(
+            (&ut, &uv),
+            (&bt, &bv),
+            &blit(whole, whole, FilterMode::Nearest)
+        ),
+        invalid("a blit needs formats of the same integer kind")
+    );
+    assert_eq!(
+        check_blit(
+            (&t, &v),
+            (&bt, &bv),
+            &blit(rect(1, 0, W, H), whole, FilterMode::Nearest)
+        ),
+        invalid("a blit destination must not be compressed")
+    );
 }
 
 #[test]
@@ -490,4 +655,55 @@ fn present_rules() {
         invalid("a presented view must store colour"),
         "aspect before the rectangle"
     );
+}
+
+#[test]
+fn presented_views_must_not_store_integers() {
+    for format in [
+        PixelFormat::R8Uint,
+        PixelFormat::A8B8G8R8Uint,
+        PixelFormat::R32Sint,
+    ] {
+        let (t, v) = (texture(format, all_usage()), view(format, 0));
+        let at = |r| {
+            validate_present(
+                ResolvedView {
+                    texture: &t,
+                    view: &v,
+                },
+                &present(r),
+            )
+        };
+        assert_eq!(
+            at(rect(0, 0, W, H)),
+            invalid("a presented view must not store integers"),
+            "{format}"
+        );
+        // Order: the integer format before the rectangle.
+        assert_eq!(
+            at(rect(0, 0, 0, 0)),
+            invalid("a presented view must not store integers"),
+            "{format}"
+        );
+    }
+    // Normalised, sRGB and float colour views present.
+    for format in [
+        PixelFormat::R8Unorm,
+        PixelFormat::A8B8G8R8Snorm,
+        PixelFormat::A8B8G8R8Srgb,
+        PixelFormat::R16G16B16A16Float,
+    ] {
+        let (t, v) = (texture(format, all_usage()), view(format, 0));
+        assert_eq!(
+            validate_present(
+                ResolvedView {
+                    texture: &t,
+                    view: &v,
+                },
+                &present(rect(0, 0, W, H)),
+            ),
+            Ok(()),
+            "{format}"
+        );
+    }
 }

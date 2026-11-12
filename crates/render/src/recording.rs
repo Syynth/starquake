@@ -16,24 +16,30 @@
 //! - nothing is known of a new resource (wgpu zero-fills new resources, but a direct backend need
 //!   not, so the oracle claims nothing);
 //! - an upload makes its bytes known; a copy moves bytes and their known flags as they are;
+//!   except that an upload, a readback or a copy between a buffer and a texture of a two-aspect
+//!   depth-stencil format or `X8_D24_UNORM` makes its destination unknown (a readback reports
+//!   [`Readback::Unknown`]), because a real backend does not move those bytes as they are
+//!   ([`texel`]'s "Buffer copies");
 //! - a clear makes its area known when the value's encoding is exact on every device
 //!   ([`texel`]'s rules), and unknown otherwise;
-//! - a blit between views of one uncompressed format with equal source and destination sizes
-//!   copies texels; any other blit (scaled, converting, compressed) makes its destination
-//!   rectangle unknown;
+//! - a blit copies texels only when it is unscaled, between views of one integer colour format
+//!   (`uint` or `sint`), both with the identity swizzle; any other blit (scaled, converting,
+//!   swizzled, or of a normalised, sRGB, float, depth, stencil or compressed format, whose texels
+//!   a real blit converts through float) makes its destination rectangle unknown;
 //! - a draw makes every mip and layer of its colour and depth/stencil target views unknown, and
 //!   a draw or dispatch makes every bound storage resource unknown: each buffer range bound from
 //!   a buffer with the storage usage, and every mip and layer of each bound view whose texture
 //!   has the storage usage (whether the shader writes it is not known here);
 //! - a readback copies the bytes it reads, or reports them unknown; a present with `dump` set
-//!   keeps the presented rectangle the same way ([`FrameDump`]), untransformed;
+//!   keeps the presented rectangle the same way ([`FrameDump`]), untransformed, and reports it
+//!   unknown when the view has a non-identity swizzle (the present blit samples through it) or a
+//!   compressed format;
 //! - multisampled textures hold one copy of each texel: known bytes mean every sample holds them.
 //!
 //! **Lists.** `submit` checks the whole list before it changes anything (`plan::check`): every id
-//! names a live
-//! resource, every description passes [`crate::validate`], and a copy or blit does not read and
-//! write overlapping bytes of one resource (refused rather than modelled: Vulkan leaves
-//! overlapping copies undefined). A refused list leaves every resource, readback and the fence
+//! names a live resource, every description passes [`crate::validate`] (which refuses a copy
+//! whose sides overlap), and a blit does not read and write overlapping texels of one texture
+//! (refused rather than modelled: Vulkan leaves overlapping copies and blits undefined). A refused list leaves every resource, readback and the fence
 //! unchanged and is not kept. Applying a checked list looks the same ids up again in tables
 //! nothing has changed since, over regions the check bounded, so it meets no error the check did
 //! not; its error path exists only so that no lookup can panic. A list that passes is applied in order and completes at once: its
@@ -93,8 +99,8 @@ pub struct FrameDump {
     pub height: u32,
     /// The transform the present asked for, not applied to the bytes.
     pub transform: PresentTransform,
-    /// The rectangle's bytes, or [`Readback::Unknown`] when any of them is unknown (or the
-    /// format is compressed).
+    /// The rectangle's bytes, or [`Readback::Unknown`] when any of them is unknown, the format
+    /// is compressed, or the view has a non-identity swizzle.
     pub pixels: Readback,
 }
 
@@ -349,7 +355,10 @@ impl State {
                 Ok(())
             }
             Op::Readback { from, id } => {
-                let read = readback(self.gather(&from)?);
+                let read = match &from {
+                    Some(place) => readback(self.gather(place)?),
+                    None => Readback::Unknown,
+                };
                 self.readbacks.insert(id, read);
                 Ok(())
             }
