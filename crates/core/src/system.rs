@@ -1,8 +1,8 @@
 //! [`System`]: one program, loaded and run from start to finish.
 //!
 //! PROVISIONAL (walking skeleton, #74). A `System` is one NRO run once as one guest thread on
-//! one vCPU of the hypervisor backend, in its bring-up memory (see [`crate::image`] and
-//! [`crate::machine`] for what is provisional about each and what replaces it). It is the
+//! one vCPU of the hypervisor backend, in its bring-up memory (the `image` and `machine`
+//! modules say what is provisional about each and what replaces it). It is the
 //! thinnest thing that joins the loader, the code patcher, the CPU backend, the kernel
 //! dispatcher and the event stream, so that later work widens something that runs.
 //!

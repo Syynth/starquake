@@ -159,6 +159,30 @@ fn a_command_line_that_cannot_be_parsed_runs_nothing() {
 }
 
 #[test]
+fn an_artifacts_folder_that_cannot_be_written_is_an_emulator_error() {
+    let folder = scratch("blocked");
+    // A file is in the way of the artifacts folder.
+    let blocked = program(&folder, "artifacts", b"");
+    let (ran, artifacts) = run(&folder.join("nothing.nro"), &[]);
+    assert_eq!(artifacts, blocked);
+    assert_eq!(ran.code, exit_code::EMULATOR_ERROR);
+    assert!(
+        ran.stderr.starts_with(&format!(
+            "starquake: could not write {}: ",
+            blocked.display()
+        )),
+        "{}",
+        ran.stderr
+    );
+    assert!(
+        ran.stdout
+            .ends_with("(exit code 2); the artifacts could not be written\n"),
+        "{}",
+        ran.stdout
+    );
+}
+
+#[test]
 fn hello_exits_with_code_0_and_leaves_its_output_and_trace() {
     if !can_run_guests() {
         return;

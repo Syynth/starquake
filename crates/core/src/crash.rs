@@ -207,12 +207,9 @@ impl CrashReport {
         text
     }
 
-    fn write_text(&self, out: &mut String) -> std::fmt::Result {
-        writeln!(out, "{} crash report", self.emulator)?;
-        if !self.command_line.is_empty() {
-            writeln!(out, "command line: {}", self.command_line.join(" "))?;
-        }
-        writeln!(out)?;
+    /// What happened, in a few words: `data abort, a write at address 0xdea8 (not mapped)`.
+    #[must_use]
+    pub fn exception_text(&self) -> String {
         match self.exception {
             Exception::DataAbort { address, write } => {
                 let access = if write { "write" } else { "read" };
@@ -220,21 +217,31 @@ impl CrashReport {
                     .fault_mapping
                     .as_deref()
                     .map_or_else(|| "not mapped".to_owned(), |name| format!("in {name}"));
-                writeln!(
-                    out,
-                    "exception: data abort, a {access} at address {address:#x} ({block})"
-                )?;
+                format!("data abort, a {access} at address {address:#x} ({block})")
             }
-            Exception::UndefinedInstruction => {
-                writeln!(out, "exception: undefined instruction")?;
-            }
+            Exception::UndefinedInstruction => "undefined instruction".to_owned(),
         }
+    }
+
+    /// Where it happened: `pc 0x800000b8 (main+0xb8)`.
+    #[must_use]
+    pub fn instruction_text(&self) -> String {
         match &self.pc_location {
             Some(Location { module, offset }) => {
-                writeln!(out, "instruction: pc {:#x} ({module}+{offset:#x})", self.pc)?;
+                format!("pc {:#x} ({module}+{offset:#x})", self.pc)
             }
-            None => writeln!(out, "instruction: pc {:#x} (in no module)", self.pc)?,
+            None => format!("pc {:#x} (in no module)", self.pc),
         }
+    }
+
+    fn write_text(&self, out: &mut String) -> std::fmt::Result {
+        writeln!(out, "{} crash report", self.emulator)?;
+        if !self.command_line.is_empty() {
+            writeln!(out, "command line: {}", self.command_line.join(" "))?;
+        }
+        writeln!(out)?;
+        writeln!(out, "exception: {}", self.exception_text())?;
+        writeln!(out, "instruction: {}", self.instruction_text())?;
         writeln!(out, "\nregisters:")?;
         for (row, values) in self.registers.x.chunks(4).enumerate() {
             write!(out, " ")?;

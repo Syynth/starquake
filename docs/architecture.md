@@ -159,7 +159,7 @@ it lives, with what replaces it:
 |---|---|---|
 | The program sits in one identity-mapped region that the guest can read, write and execute everywhere: no page tables of our own, permissions, guard pages or address-space bookkeeping | `crates/core/src/image.rs`, `crates/cpu/src/hvf.rs` | Stage-1 page tables (execution model) and kernel slice 6 (memory blocks, regions) |
 | One guest thread on one core, with a fixed thread and process id; no scheduler; the whole register file is read and written on every `svc`; every abort is fatal | `crates/core/src/machine.rs` | Kernel slice 8 (process creation, thread lifecycle) and slice 10 (core loop and timers); single-register accessors on `Vcpu` |
-| The stack size, the TLS page and the registers the thread starts with are fixed by the loop | `crates/core/src/image.rs`, `machine.rs` | Kernel slice 8, with the NPDM's values |
+| The stack size, the TLS page and the registers the thread starts with are fixed by the loop; pointer-authentication keys are left as the backend creates them | `crates/core/src/image.rs`, `machine.rs` | Kernel slice 8, with the NPDM's values |
 | `ExitProcess` changes no kernel state: the dispatcher reports it and the loop stops | `crates/kernel/src/dispatch.rs` | Kernel slice 8 |
 | The dispatcher is told the calling thread and the event's time by its caller | `crates/kernel/src/dispatch.rs` (`Caller`) | Kernel slice 10 (the scheduler knows each core's thread) and the kernel's guest-time work |
 | Lifecycle, fault and guest-log events are recorded by the loop, outside the kernel lock | `crates/core/src/machine.rs` | The kernel's own recording points (slices 6 and 8) |

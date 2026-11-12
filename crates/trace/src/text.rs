@@ -10,10 +10,10 @@
 //! each thread's events in the order they were recorded. Two recordings that interleave the same
 //! per-thread sequences differently therefore render to identical text. Wake, map, fault and
 //! schedule events are left out, because they depend on timing (see
-//! [`EventKind::in_golden_trace`]).
+//! [`EventKind::in_golden_trace`](crate::EventKind::in_golden_trace)).
 //!
 //! The line format itself is this crate's own design (the spec gives none); it is the
-//! `Display` of [`EventKind`], pinned by tests here and in `event.rs`.
+//! `Display` of [`EventKind`](crate::EventKind), pinned by tests here and in `event.rs`.
 
 use std::collections::BTreeMap;
 

@@ -65,9 +65,13 @@ pub enum LoadError {
         /// Bytes of guest RAM.
         available: u64,
     },
-    /// Guest RAM does not start and end on a page boundary.
-    #[error("guest RAM at {base:#x}, {size:#x} bytes long, is not page-aligned")]
-    UnalignedRam {
+    /// Guest RAM does not start and end on a page boundary, or runs past the end of the
+    /// address space.
+    #[error(
+        "guest RAM at {base:#x}, {size:#x} bytes long, is not page-aligned or does not fit the \
+         address space"
+    )]
+    BadRam {
         /// RAM base.
         base: u64,
         /// RAM size.
@@ -155,14 +159,14 @@ pub(crate) fn place(
     ram_size: u64,
     counter: Option<CounterRescale>,
 ) -> Result<Placement, LoadError> {
-    let unaligned = LoadError::UnalignedRam {
+    let bad_ram = LoadError::BadRam {
         base: ram_base,
         size: ram_size,
     };
     if !ram_base.is_multiple_of(PAGE) || !ram_size.is_multiple_of(PAGE) {
-        return Err(unaligned);
+        return Err(bad_ram);
     }
-    let ram_end = ram_base.checked_add(ram_size).ok_or(unaligned)?;
+    let ram_end = ram_base.checked_add(ram_size).ok_or(bad_ram)?;
     let nro = &program.nro;
     let base = ram_base;
 
@@ -431,7 +435,7 @@ mod tests {
         ] {
             assert_eq!(
                 place(&program, base, size, None),
-                Err(LoadError::UnalignedRam { base, size }),
+                Err(LoadError::BadRam { base, size }),
                 "{base:#x} {size:#x}"
             );
         }

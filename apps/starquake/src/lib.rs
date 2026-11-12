@@ -32,7 +32,8 @@ usage: starquake run <program> [--until timeout=<n>s] [--artifacts <folder>]
 Runs an NRO program and writes what it did to an artifacts folder: summary.json,
 trace.txt, events.bin and guest_log.txt, plus crash.json and crash.txt when the
 guest crashed. Without --artifacts the folder is made under the system's
-temporary folder and its path is printed.
+temporary folder and its path is printed. Without --until the program runs
+until it exits or crashes, however long that takes.
 
 exit codes: 0 the program exited, 1 the guest crashed, 2 emulator error, 3 timeout
 ";
@@ -194,15 +195,11 @@ fn describe(report: &RunReport) -> String {
         ExitReason::ProcessExited => "the program exited".to_owned(),
         ExitReason::Timeout => "the timeout passed".to_owned(),
         ExitReason::EmulatorError(message) => format!("emulator error: {message}"),
-        ExitReason::GuestCrashed(crash) => {
-            // The first lines of the crash text that name the exception and the instruction.
-            let text = crash.to_text();
-            let detail: Vec<&str> = text
-                .lines()
-                .filter(|line| line.starts_with("exception:") || line.starts_with("instruction:"))
-                .collect();
-            format!("the guest crashed ({})", detail.join("; "))
-        }
+        ExitReason::GuestCrashed(crash) => format!(
+            "the guest crashed: {}, at {}",
+            crash.exception_text(),
+            crash.instruction_text()
+        ),
     }
 }
 
@@ -238,18 +235,23 @@ fn run(
         .artifacts
         .clone()
         .unwrap_or_else(default_artifacts_folder);
-    let code = match artifacts::write(&folder, &report) {
-        Ok(()) => report.exit_code(),
+    let (code, artifacts) = match artifacts::write(&folder, &report) {
+        Ok(()) => (
+            report.exit_code(),
+            format!("artifacts in {}", folder.display()),
+        ),
         Err(error) => {
             let _ = writeln!(stderr, "starquake: {error}");
-            exit_code::EMULATOR_ERROR
+            (
+                exit_code::EMULATOR_ERROR,
+                "the artifacts could not be written".to_owned(),
+            )
         }
     };
     let _ = writeln!(
         stdout,
-        "starquake: {} (exit code {code}); artifacts in {}",
-        describe(&report),
-        folder.display()
+        "starquake: {} (exit code {code}); {artifacts}",
+        describe(&report)
     );
     code
 }

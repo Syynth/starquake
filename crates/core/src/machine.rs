@@ -21,6 +21,10 @@
 //!   replaces this loop with six core threads driven by the scheduler.
 //! - **Whole register file per system call.** Each `svc` reads and writes all of [`GuestRegs`].
 //!   The execution model's single-register accessors on `Vcpu` replace that.
+//! - **Start state.** The thread starts with its program counter, stack pointer and
+//!   `TPIDRRO_EL0` set and every other register zero, and the vCPU's pointer-authentication keys
+//!   are left as the backend creates them. Kernel slice 8 sets what Horizon hands a main thread
+//!   and generates the process's keys.
 //! - **Every abort is fatal.** There is no address space to consult, so a data abort always ends
 //!   the run. Kernel slice 6 (memory blocks) decides between lazy backing, write tracking and a
 //!   crash.
@@ -295,8 +299,7 @@ fn drive<V: Vcpu>(
     let env = LiveEnv::new(SystemClock::new(), RANDOM_SEED);
     let vcpu_failed = |error| Ending::Failed(format!("the vCPU failed: {error}"));
 
-    // PROVISIONAL: everything else starts at zero. Kernel slice 8 sets what Horizon passes a
-    // process's main thread (its argument and its own thread handle).
+    // PROVISIONAL: everything else starts at zero (see "Start state" in the module docs).
     let start = GuestRegs {
         pc: session.placed.entry,
         sp: session.placed.stack_top,

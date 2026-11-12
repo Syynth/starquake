@@ -7,7 +7,7 @@
 //!
 //! Only 64-bit (`X`) forms are encoded, which is all the guest test programs need. Register
 //! number 31 means `XZR` or `SP` according to the instruction, as in the Arm encoding: `SP` for
-//! the base register of [`ldr`] and [`str`] and for both registers of [`add_imm`] and
+//! the base register of [`ldr`] and [`str()`] and for both registers of [`add_imm`] and
 //! [`sub_imm`], `XZR` everywhere else (including every operand of [`sub`]). [`Assembler`] adds
 //! labels for branches.
 //!
@@ -241,7 +241,7 @@ pub fn str(rt: u8, rn: u8, offset: u32) -> Result<u32, EncodeError> {
     mem_imm(0xF900_0000, rt, rn, offset)
 }
 
-/// Shared by [`ldr`] and [`str`]: the byte offset is stored divided by 8, at bit 10.
+/// Shared by [`ldr`] and [`str()`]: the byte offset is stored divided by 8, at bit 10.
 fn mem_imm(base: u32, rt: u8, rn: u8, offset: u32) -> Result<u32, EncodeError> {
     let (rt, rn) = (reg(rt)?, reg(rn)?);
     let offset = imm(offset, MAX_MEM_OFFSET)?;
