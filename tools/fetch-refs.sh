@@ -67,6 +67,9 @@ fetch_commit libnx https://github.com/switchbrew/libnx.git b156b4774fb2df7b93402
 # GPL-2.0-only: a reference for facts (result codes, ids, layouts), never for code.
 fetch_commit atmosphere https://github.com/Atmosphere-NX/Atmosphere.git 4e3f37038d9e82dde7054897213ab32b2ecf651f
 
+# MIT: the NUP container's specification and reference tool (branch `meow`).
+fetch_commit nup https://github.com/a55uka/nup.git a4840f06c94ddeb414eea5b33c9704ffe995f11c
+
 fetch_mesa_steps || give_up mesa-nouveau "$mesa_url" "$mesa_commit"
 
 fetch_commit rapid-arm-emu https://github.com/vrtgs/rapid-arm-emu.git d762465dfd0579acba81a8dc944296522a61f929
