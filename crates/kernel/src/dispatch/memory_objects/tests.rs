@@ -12,7 +12,7 @@ use starquake_trace::{FixedClock, GuestTicks, LiveEnv, Recorder, ServiceId, Thre
 
 use super::*;
 use crate::dispatch::{Caller, IpcContext, Record};
-use crate::id::ObjectId;
+use crate::id::{ObjectId, SlabId};
 use crate::ipc::{Handled, HandlerError, PortName, SessionHandler};
 use crate::memory::fixture::{self, CODE, CODE_SIZE, DATA, SHARED};
 use crate::memory::testing::{MapperCall, MapperLog};
@@ -482,6 +482,18 @@ fn a_server_reads_and_writes_a_transfer_memory_it_is_sent_within_its_bounds() {
     world.memory.write(DATA + 16, &[7, 8, 9]).unwrap();
     let handle = lend(&world, SvcPermission::None);
     let session = world.session();
+    // A transfer memory whose pages were never locked: one `CreateTransferMemory` is still
+    // making, which no handle names yet.
+    let unlocked = world
+        .dispatcher
+        .with::<(&mut Scheduler,), _>(|(scheduler,)| {
+            let owner = crate::id::ProcessId::from_parts(0, 1);
+            let made = TransferMemory::new(owner, DATA, PAGE_SIZE, SvcPermission::None);
+            scheduler
+                .objects_mut()
+                .create(Object::TransferMemory(made))
+                .unwrap()
+        });
     let results = Arc::new(Mutex::new(Vec::new()));
     let seen = Arc::clone(&results);
     let result = world.send(
@@ -508,6 +520,12 @@ fn a_server_reads_and_writes_a_transfer_memory_it_is_sent_within_its_bounds() {
             // A session is not a transfer memory.
             let session = cx.resolve_handle(session).unwrap();
             seen.push(cx.transfer_memory(session).map(|_| (0, 0)));
+            seen.push(cx.transfer_memory(unlocked).map(|_| (0, 0)));
+            let mut byte = [0];
+            seen.push(
+                cx.read_transfer_memory(unlocked, 0, &mut byte)
+                    .map(|()| (0, 0)),
+            );
             Ok(())
         }),
     );
@@ -521,6 +539,8 @@ fn a_server_reads_and_writes_a_transfer_memory_it_is_sent_within_its_bounds() {
             outside,
             outside,
             outside,
+            Err(KernelError::InvalidHandle),
+            Err(KernelError::InvalidHandle),
             Err(KernelError::InvalidHandle),
         ]
     );

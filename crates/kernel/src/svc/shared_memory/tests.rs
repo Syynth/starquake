@@ -524,3 +524,89 @@ fn the_size_checked_is_the_objects_not_the_one_asked_for() {
     assert_eq!(world.unmap(small.handle, SHARED, SIZE), size);
     assert_eq!(world.unmap(small.handle, SHARED, PAGE_SIZE), Ok(()));
 }
+
+/// A translation that hands out one page more than it is asked for.
+struct Generous;
+
+impl crate::memory::Mapper for Generous {
+    fn map(&mut self, _: u64, _: u64, _: Perms) -> Result<(), crate::memory::MapperError> {
+        Ok(())
+    }
+
+    fn unmap(&mut self, _: u64, _: u64) -> Result<(), crate::memory::MapperError> {
+        Ok(())
+    }
+
+    fn protect(&mut self, _: u64, _: u64, _: Perms) -> Result<(), crate::memory::MapperError> {
+        Ok(())
+    }
+
+    fn allocate_shared(&mut self, size: u64) -> Result<SharedPages, crate::memory::MapperError> {
+        Ok(crate::memory::testing::standalone_shared_pages(size + PAGE_SIZE).unwrap())
+    }
+}
+
+#[test]
+fn the_address_space_takes_only_whole_pages_of_the_size_it_asked_for() {
+    let memory = fixture::memory(crate::memory::MemoryArrangement::FourGb);
+    let mut generous = AddressSpace::new(&memory, Box::new(Generous)).unwrap();
+    assert_eq!(
+        generous
+            .allocate_shared(PAGE_SIZE)
+            .map(|pages| pages.size()),
+        Err(SvcError::Internal(format!(
+            "the translation gave {:#x} bytes of shared memory for {PAGE_SIZE:#x}",
+            2 * PAGE_SIZE
+        )))
+    );
+    let (mut space, _, _) = fixture::loaded();
+    for size in [0, PAGE_SIZE + 1] {
+        assert_eq!(
+            space.allocate_shared(size).map(|pages| pages.size()),
+            Err(SvcError::Internal(format!(
+                "shared memory of {size:#x} bytes is not whole pages"
+            )))
+        );
+    }
+    assert_eq!(
+        space.allocate_shared(PAGE_SIZE).map(|pages| pages.size()),
+        Ok(PAGE_SIZE)
+    );
+}
+
+#[test]
+fn a_translation_with_the_default_has_no_shared_backing() {
+    struct Plain;
+    impl crate::memory::Mapper for Plain {
+        fn map(&mut self, _: u64, _: u64, _: Perms) -> Result<(), crate::memory::MapperError> {
+            Ok(())
+        }
+
+        fn unmap(&mut self, _: u64, _: u64) -> Result<(), crate::memory::MapperError> {
+            Ok(())
+        }
+
+        fn protect(&mut self, _: u64, _: u64, _: Perms) -> Result<(), crate::memory::MapperError> {
+            Ok(())
+        }
+    }
+    let memory = fixture::memory(crate::memory::MemoryArrangement::FourGb);
+    let mut plain = Plain;
+    let refused = crate::memory::MapperError(crate::memory::mapper::NO_SHARED_BACKING.into());
+    assert_eq!(
+        crate::memory::Mapper::allocate_shared(&mut plain, PAGE_SIZE).map(|pages| pages.size()),
+        Err(refused.clone())
+    );
+    let backing = starquake_memory::BackingRange::new(0, PAGE_SIZE).unwrap();
+    assert_eq!(
+        crate::memory::Mapper::map_shared(&mut plain, SHARED, backing, Perms::Read),
+        Err(refused.clone())
+    );
+    let mut space = AddressSpace::new(&memory, Box::new(Plain)).unwrap();
+    assert_eq!(
+        space.allocate_shared(PAGE_SIZE).map(|pages| pages.size()),
+        Err(SvcError::Internal(format!(
+            "the translation gave no backing for {PAGE_SIZE:#x} bytes of shared memory: {refused}"
+        )))
+    );
+}
