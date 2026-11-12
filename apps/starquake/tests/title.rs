@@ -8,8 +8,8 @@ use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use starquake::title::{NPDM_READ_LIMIT, exit};
-use starquake_core::loader::npdm::Npdm;
+use starquake::title::{NPDM_READ_LIMIT, core_mask, exit};
+use starquake_core::loader::npdm::{AddressSpaceType, Npdm};
 use starquake_core::loader::nso::Nso;
 // The builder is behind the loader's `test-support` feature, which this crate's dev-dependency on
 // the loader turns on; it is the same crate `starquake_core::loader` re-exports.
@@ -97,9 +97,82 @@ mod support {
     pub(crate) fn text(path: &Path) -> &str {
         path.to_str().unwrap()
     }
+
+    /// The `main.npdm` lines that follow its name and program id, derived from the parsed fixture:
+    /// the address space, the main thread, the system resource size, the cores and priorities, and
+    /// every allowed system call and service name (issue #95 names them all).
+    pub(crate) fn npdm_lines(npdm: &Npdm) -> Vec<String> {
+        let address_space = match npdm.address_space {
+            AddressSpaceType::Is32Bit => "32-bit",
+            AddressSpaceType::Is36Bit => "36-bit",
+            AddressSpaceType::Is32BitNoMap => "32-bit, no map region",
+            AddressSpaceType::Is39Bit => "39-bit",
+        };
+        let caps = &npdm.aci.kernel_capabilities;
+        let info = caps
+            .thread_info
+            .as_ref()
+            .expect("the fixture declares thread info");
+        let svcs: Vec<String> = caps
+            .svc_mask
+            .iter()
+            .map(|id| format!("{id:#04x}"))
+            .collect();
+        let names = |server: bool| -> Vec<&str> {
+            npdm.aci
+                .services
+                .iter()
+                .filter(|s| s.server == server)
+                .map(|s| s.name.as_str())
+                .collect()
+        };
+        let (opened, hosted) = (names(false), names(true));
+        // The fixture has system calls and services to list, or this test would pin nothing.
+        assert!(!svcs.is_empty() && !opened.is_empty());
+        let mut lines = vec![
+            format!(
+                "  {}, address space {address_space}",
+                if npdm.is_64_bit { "64-bit" } else { "32-bit" }
+            ),
+            format!(
+                "  main thread: priority {}, core {}, stack {:#x} bytes",
+                npdm.main_thread_priority, npdm.main_thread_core, npdm.main_thread_stack_size
+            ),
+            format!(
+                "  system resource size: {:#x} bytes",
+                npdm.system_resource_size
+            ),
+            format!(
+                "  cores {}-{} (core mask {:#x}), priorities {}-{}",
+                info.cores.start(),
+                info.cores.end(),
+                core_mask(*info.cores.start(), *info.cores.end()),
+                info.priorities.start(),
+                info.priorities.end()
+            ),
+            format!(
+                "  allowed system calls ({}): {}",
+                svcs.len(),
+                svcs.join(" ")
+            ),
+            format!(
+                "  services it may open ({}): {}",
+                opened.len(),
+                opened.join(" ")
+            ),
+        ];
+        if !hosted.is_empty() {
+            lines.push(format!(
+                "  services it may host ({}): {}",
+                hosted.len(),
+                hosted.join(" ")
+            ));
+        }
+        lines
+    }
 }
 
-use support::{fixture, scratch, starquake, text, title, write};
+use support::{fixture, npdm_lines, scratch, starquake, text, title, write};
 
 #[test]
 fn inspect_prints_the_packages_the_newest_exefs_and_the_npdm() {
@@ -160,27 +233,13 @@ fn inspect_prints_the_packages_the_newest_exefs_and_the_npdm() {
             nso.bss_size
         ),
     ];
-    for line in expected_lines {
+    for line in expected_lines.into_iter().chain(npdm_lines(&npdm)) {
         assert!(
             ran.stdout.lines().any(|l| l == line),
             "missing {line:?} in:\n{}",
             ran.stdout
         );
     }
-    let svcs = npdm.aci.kernel_capabilities.svc_mask.iter().count();
-    assert!(
-        ran.stdout
-            .contains(&format!("  allowed system calls ({svcs}): ")),
-        "{}",
-        ran.stdout
-    );
-    let opened = npdm.aci.services.iter().filter(|s| !s.server).count();
-    assert!(
-        ran.stdout
-            .contains(&format!("  services it may open ({opened}): ")),
-        "{}",
-        ran.stdout
-    );
 }
 
 #[test]

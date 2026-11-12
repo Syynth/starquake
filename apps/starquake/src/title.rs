@@ -17,7 +17,7 @@
 
 use std::fmt::Write as _;
 use std::fs::File;
-use std::io::{BufReader, Write};
+use std::io::{BufReader, Read, Seek, Write};
 use std::path::Path;
 
 use starquake_core::loader::npdm::service_access::ServiceAccess;
@@ -77,6 +77,19 @@ pub fn verify(path: &Path, stdout: &mut dyn Write, stderr: &mut dyn Write) -> u8
         Ok(nup) => nup,
         Err(code) => return code,
     };
+    verify_open(&mut nup, path, stdout, stderr)
+}
+
+/// Verifies a container that is already open (read from `path`, which only names it in the
+/// output) and returns the exit code: [`exit::OK`] when every file matches its SHA-256,
+/// otherwise [`exit_code_for`] the first failure, so a file that cannot be read is
+/// [`exit::UNREADABLE`] and one that does not match is [`exit::DAMAGED`].
+pub fn verify_open<S: Read + Seek>(
+    nup: &mut Nup<S>,
+    path: &Path,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> u8 {
     match nup.verify() {
         Ok(summary) => {
             let _ = writeln!(
@@ -370,7 +383,78 @@ fn describe_nso(name: &str, nso: &Nso, out: &mut String) {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Cursor, SeekFrom};
+
+    use starquake_loader::nup::PackageKind;
+    use starquake_loader::nup::build::{self, Content, PackageSpec, Tree};
+
     use super::*;
+
+    /// A container in memory whose reads fail from `fail_from` on, as a disk that goes away
+    /// after the table of contents has been read.
+    struct FailingTail {
+        inner: Cursor<Vec<u8>>,
+        fail_from: u64,
+    }
+
+    impl Read for FailingTail {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.inner.position() >= self.fail_from {
+                return Err(std::io::Error::other("disk gone"));
+            }
+            self.inner.read(buf)
+        }
+    }
+
+    impl Seek for FailingTail {
+        fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(to)
+        }
+    }
+
+    #[test]
+    fn verify_exits_2_when_a_file_cannot_be_read_and_1_when_it_does_not_match() {
+        let tree = Tree::new()
+            .with_file("romfs/f", Content::raw(b"hello".to_vec()))
+            .unwrap();
+        let built = build::build(&[PackageSpec::new(
+            PackageKind::Base,
+            0x0100_0000_0000_5000,
+            0,
+            tree,
+        )])
+        .unwrap();
+        let path = Path::new("title.nup");
+        let run = |bytes: Vec<u8>, fail_from: u64| {
+            let source = FailingTail {
+                inner: Cursor::new(bytes),
+                fail_from,
+            };
+            let mut nup = Nup::open(source).unwrap();
+            let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+            let code = verify_open(&mut nup, path, &mut stdout, &mut stderr);
+            (code, String::from_utf8(stderr).unwrap())
+        };
+
+        // The source fails while the file's bytes are read.
+        let blob = u64::try_from(built.layout.blob_offset).unwrap();
+        let (code, stderr) = run(built.bytes.clone(), blob);
+        assert_eq!(code, exit::UNREADABLE);
+        assert_eq!(
+            stderr,
+            "starquake: title.nup: package 0, romfs/f: reading the container failed: disk gone\n"
+        );
+
+        // The same container read to the end with a damaged byte is damage, not an I/O error.
+        let mut damaged = built.bytes.clone();
+        damaged[built.layout.extents[0].0] ^= 1;
+        let (code, _) = run(damaged, u64::MAX);
+        assert_eq!(code, exit::DAMAGED);
+
+        // And an intact one, read to the end, is fine.
+        let (code, stderr) = run(built.bytes, u64::MAX);
+        assert_eq!((code, stderr.as_str()), (exit::OK, ""));
+    }
 
     #[test]
     fn an_io_error_is_unreadable_and_any_other_error_is_damage() {
