@@ -1,6 +1,7 @@
 //! [`Server`]: one service family's sessions, and the path a request takes through them.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use starquake_ipc::{
     BUFFER_SIZE, Body, CmifRequest, CommandType, IpcError, Message, ReplyBuilder, SessionKind,
@@ -8,17 +9,24 @@ use starquake_ipc::{
 use starquake_kernel::handle::Handle;
 use starquake_kernel::id::ObjectId;
 use starquake_kernel::result::{KernelError, ResultCode};
+use starquake_trace::{IpcOutcome, ServiceId};
 
 use super::commands::{Protocol, Session};
 use super::context::Context;
+use super::defer::ReplyToken;
+use super::defer::{Completed, Deferral, Framing, Mailbox, Notify, Pending, Posted, TokenId};
 use super::kernel::Kernel;
 use super::payload::Writer;
+use super::queue::{Admission, QueueError, RequestQueue};
 use super::reply::{Moved, Reply};
 use super::request::Request;
 use super::result::{
-    Completion, Fault, NOT_SUPPORTED, OUT_OF_DOMAIN_ENTRIES, TARGET_NOT_FOUND, UNKNOWN_COMMAND_ID,
+    Completion, DEFERRED_REPLY_DROPPED, Fault, NOT_SUPPORTED, OUT_OF_DOMAIN_ENTRIES,
+    TARGET_NOT_FOUND, UNKNOWN_COMMAND_ID,
 };
+use super::snapshot::{Family, Interfaces};
 use super::targets::{Domain, TargetError, TargetId, Targets};
+use super::trace::{self, Asked};
 
 /// What a server does with a command its interface does not list
 /// (`docs/specs/services.md`, "Unknown commands").
@@ -39,6 +47,10 @@ pub enum Handled {
     /// The message closed the session. The buffer is untouched and the session is gone from the
     /// server.
     Closed,
+    /// The method kept a reply token: the request stays in flight on its session, the buffer is
+    /// untouched, and the caller waits. The reply is written by [`Server::deliver`] once the
+    /// token completes.
+    Deferred(TokenId),
 }
 
 /// A command a server answered by auto-stub.
@@ -72,6 +84,14 @@ pub enum ServerError {
     /// The session is already open on this server.
     #[error("session {0:?} is already open on this server")]
     SessionExists(ObjectId),
+    /// The server was asked to accept a session and has no root interface to open for it.
+    #[error("the server has no root interface to open for a new session")]
+    NoRoot,
+    /// A request cannot start on the session now: one is in flight on it or senders wait ahead,
+    /// or the server has no free worker. The sender should have been queued
+    /// ([`Server::submit`]).
+    #[error("session {0:?} cannot start a request now")]
+    Busy(ObjectId),
     /// The buffer is smaller than a message buffer. Nothing was read from it.
     #[error("message buffer holds {len} bytes, fewer than the {BUFFER_SIZE} a message needs")]
     BufferTooShort {
@@ -88,6 +108,9 @@ pub enum ServerError {
     /// The server's own bookkeeping failed.
     #[error(transparent)]
     Targets(#[from] TargetError),
+    /// The request queue refused an operation.
+    #[error(transparent)]
+    Queue(#[from] QueueError),
 }
 
 /// Why a request ends without the reply its command would have built.
@@ -157,7 +180,25 @@ impl Frame {
         }
     }
 
-    /// A reply holding only a result.
+    /// The framing as a deferred request keeps it.
+    fn framing(self) -> Framing {
+        match self {
+            Self::Cmif => Framing::Cmif,
+            Self::Domain(_) => Framing::Domain,
+            Self::Tipc(command_id) => Framing::Tipc(command_id),
+        }
+    }
+
+    /// The framing of a deferred request on a session that leads to `target`.
+    fn of_deferred(framing: Framing, target: TargetId) -> Self {
+        match framing {
+            Framing::Cmif => Self::Cmif,
+            Framing::Domain => Self::Domain(target),
+            Framing::Tipc(command_id) => Self::Tipc(command_id),
+        }
+    }
+
+    /// The start of a reply with this result.
     pub(super) fn reply(self, result: ResultCode) -> ReplyBuilder {
         match self {
             Self::Cmif => ReplyBuilder::cmif(result.raw()),
@@ -165,6 +206,44 @@ impl Frame {
             Self::Tipc(command_id) => ReplyBuilder::tipc(command_id, result.raw()),
         }
     }
+
+    /// A reply holding only a result.
+    pub(super) fn only(self, result: ResultCode) -> Answer {
+        Answer {
+            builder: self.reply(result),
+            result,
+            payload: 0,
+            stubbed: false,
+        }
+    }
+
+    /// A successful reply holding `payload` and nothing else.
+    pub(super) fn with_payload(self, payload: &[u8]) -> Answer {
+        Answer {
+            builder: self.reply(ResultCode::SUCCESS).data(payload),
+            result: ResultCode::SUCCESS,
+            payload: payload.len(),
+            stubbed: false,
+        }
+    }
+}
+
+/// A reply ready to be written, and what its trace event says of it.
+pub(super) struct Answer {
+    pub(super) builder: ReplyBuilder,
+    pub(super) result: ResultCode,
+    /// Bytes of payload in the reply.
+    pub(super) payload: usize,
+    /// Whether an auto-stub wrote it.
+    pub(super) stubbed: bool,
+}
+
+/// What a request came to.
+enum Answered {
+    /// A reply to write now.
+    Now(Answer),
+    /// A reply token: the reply comes later.
+    Later(TokenId),
 }
 
 /// One command to dispatch.
@@ -177,17 +256,32 @@ struct Call<'m> {
     in_objects: Vec<Option<TargetId>>,
 }
 
+/// Makes the root interface of a new session.
+type Root = Box<dyn Fn() -> Box<dyn Session> + Send>;
+
 /// One service family's sessions and the interfaces behind them: the Rust side of a server
 /// (`docs/specs/services.md`, "Concurrency").
 ///
-/// The kernel's session code owns the queueing: it calls [`Server::handle`] for one request at a
-/// time, so nothing here locks and a service method takes `&mut self`.
+/// A method takes `&mut self` and nothing here locks: [`Server::handle`] takes the server
+/// exclusively, so one handler of a server runs at a time. Which request that is, is the
+/// server's [`RequestQueue`]'s to say ([`Server::submit`], [`Server::start_next`]).
 pub struct Server {
     pub(super) name: String,
+    service: ServiceId,
     pub(super) policy: UnknownPolicy,
     pub(super) pointer_buffer_size: u16,
+    root: Option<Root>,
+    pub(super) interfaces: Interfaces,
+    pub(super) family: Option<Box<dyn Family>>,
     pub(super) sessions: BTreeMap<ObjectId, TargetId>,
     pub(super) targets: Targets,
+    pub(super) queue: RequestQueue,
+    /// Deferred requests whose token has not completed, or whose completion has not been taken.
+    pub(super) pending: BTreeMap<TokenId, Pending>,
+    /// The id of the next reply token.
+    pub(super) next_token: u64,
+    pub(super) mailbox: Arc<Mailbox>,
+    pub(super) notify: Option<Arc<dyn Notify>>,
     stubbed: BTreeSet<StubbedCommand>,
     stub_record_full: bool,
 }
@@ -198,10 +292,19 @@ impl Server {
     pub fn new(name: impl Into<String>, policy: UnknownPolicy) -> Self {
         Self {
             name: name.into(),
+            service: ServiceId(0),
             policy,
             pointer_buffer_size: DEFAULT_POINTER_BUFFER_SIZE,
+            root: None,
+            interfaces: Interfaces::new(),
+            family: None,
             sessions: BTreeMap::new(),
             targets: Targets::default(),
+            queue: RequestQueue::new(),
+            pending: BTreeMap::new(),
+            next_token: 0,
+            mailbox: Arc::new(Mailbox::new(None)),
+            notify: None,
             stubbed: BTreeSet::new(),
             stub_record_full: false,
         }
@@ -215,10 +318,57 @@ impl Server {
         self
     }
 
+    /// Sets the number the service is known by: in the server's trace events, and to
+    /// [`Kernel::connect`] (default 0).
+    #[must_use]
+    pub fn with_service_id(mut self, service: ServiceId) -> Self {
+        self.service = service;
+        self
+    }
+
+    /// Sets how the server makes the root interface of a session it is told to
+    /// [`Server::accept`]: the service's own interface, new for each session.
+    #[must_use]
+    pub fn with_root(mut self, root: impl Fn() -> Box<dyn Session> + Send + 'static) -> Self {
+        self.root = Some(Box::new(root));
+        self
+    }
+
+    /// Sets the interface types the server's sessions can be, which a snapshot needs
+    /// ([`Server::save`], [`Server::restore`]).
+    #[must_use]
+    pub fn with_interfaces(mut self, interfaces: Interfaces) -> Self {
+        self.interfaces = interfaces;
+        self
+    }
+
+    /// Sets the family's own state: what all the server's sessions share, reached with
+    /// [`Context::family`]. It is saved once in the server's snapshot.
+    #[must_use]
+    pub fn with_family(mut self, family: impl Family) -> Self {
+        self.family = Some(Box::new(family));
+        self
+    }
+
+    /// Sets who is told when a reply token of this server completes. Tokens taken before this
+    /// call are not affected: set it before the server handles requests.
+    #[must_use]
+    pub fn with_notify(mut self, notify: Arc<dyn Notify>) -> Self {
+        self.mailbox = Arc::new(Mailbox::new(Some(Arc::clone(&notify))));
+        self.notify = Some(notify);
+        self
+    }
+
     /// The service's name.
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The number the service is known by.
+    #[must_use]
+    pub fn service_id(&self) -> ServiceId {
+        self.service
     }
 
     /// The policy for unknown commands.
@@ -246,6 +396,19 @@ impl Server {
         self.stubbed.iter()
     }
 
+    /// The family's state, as the family's own type, if the server has state of that type.
+    #[must_use]
+    pub fn family<T: Family>(&self) -> Option<&T> {
+        let family: &dyn core::any::Any = self.family.as_deref()?;
+        family.downcast_ref()
+    }
+
+    /// The server's request queue: which sessions have a request in flight, and who waits.
+    #[must_use]
+    pub fn queue(&self) -> &RequestQueue {
+        &self.queue
+    }
+
     /// Opens `session` (a session object the kernel created on this server) with `root` as the
     /// interface behind it.
     pub fn open(&mut self, session: ObjectId, root: Box<dyn Session>) -> Result<(), ServerError> {
@@ -257,18 +420,58 @@ impl Server {
         Ok(())
     }
 
-    /// Closes `session`. Interfaces no other session or domain still leads to are dropped.
+    /// Opens `session`, which a client made by connecting to the service (the `sm:` port, or
+    /// [`Kernel::connect`]), with a new root interface ([`Server::with_root`]).
+    pub fn accept(&mut self, session: ObjectId) -> Result<(), ServerError> {
+        let root = self.root.as_ref().ok_or(ServerError::NoRoot)?;
+        let root = root();
+        self.open(session, root)
+    }
+
+    /// Closes `session`. Interfaces no other session or domain still leads to are dropped, and
+    /// so is the session's place in the queue: a request in flight on it is never answered, and
+    /// a reply token for it completes into nothing. What the session's waiting senders are told
+    /// is the kernel's business.
     pub fn close(&mut self, session: ObjectId) -> Result<(), ServerError> {
         let target = self.sessions.remove(&session);
         let target = target.ok_or(ServerError::UnknownSession(session))?;
+        self.queue.close(session);
+        self.pending.retain(|_, request| request.session != session);
         Ok(self.targets.release(target)?)
+    }
+
+    /// A guest thread sent a request on `session`. [`Admission::Start`] means the kernel gives
+    /// the message to [`Server::handle`] now; [`Admission::Queued`] means the sender waits as a
+    /// guest thread until [`Server::start_next`] names its session.
+    pub fn submit(&mut self, session: ObjectId) -> Result<Admission, ServerError> {
+        if !self.sessions.contains_key(&session) {
+            return Err(ServerError::UnknownSession(session));
+        }
+        Ok(self.queue.submit(session)?)
+    }
+
+    /// A sender queued on `session` gave up before its request started.
+    pub fn withdraw(&mut self, session: ObjectId) -> Result<(), ServerError> {
+        Ok(self.queue.withdraw(session)?)
+    }
+
+    /// The session whose oldest waiting sender's request starts now, if any may: the kernel
+    /// gives that sender's message to [`Server::handle`]. Call it after every
+    /// [`Server::handle`], [`Server::deliver`] and [`Server::close`], until it returns `None`.
+    pub fn start_next(&mut self) -> Option<ObjectId> {
+        self.queue.start_next()
     }
 
     /// Handles the message a guest thread sent on `session`.
     ///
     /// `buffer` is the thread's message buffer, at least [`BUFFER_SIZE`] bytes, of which the first
     /// [`BUFFER_SIZE`] are used: the request is read from it and, for [`Handled::Replied`], the
-    /// reply is written over it. On an error the buffer is untouched.
+    /// reply is written over it. On an error, and for the other two outcomes, the buffer is
+    /// untouched.
+    ///
+    /// The request is one [`Server::submit`] or [`Server::start_next`] said to start. A request
+    /// given here without either starts if it may (nothing in flight on its session, nobody
+    /// waiting ahead of it, a free worker) and is [`ServerError::Busy`] otherwise.
     pub fn handle(
         &mut self,
         kernel: &mut dyn Kernel,
@@ -282,6 +485,42 @@ impl Server {
             .sessions
             .get(&session)
             .ok_or(ServerError::UnknownSession(session))?;
+        self.admit(session)?;
+        let handled = self.run(kernel, session, target, buffer);
+        // The request is over or deferred either way: its worker is free again.
+        let settled = match handled {
+            Ok(Handled::Deferred(_)) => self.queue.defer(session),
+            // Closing the session took it out of the queue.
+            Ok(Handled::Closed) => Ok(()),
+            Ok(Handled::Replied) | Err(_) => self.queue.finish(session),
+        };
+        let handled = handled?;
+        settled?;
+        Ok(handled)
+    }
+
+    /// Marks the session's request as running, unless it already is.
+    fn admit(&mut self, session: ObjectId) -> Result<(), ServerError> {
+        if self.queue.is_running(session) {
+            return Ok(());
+        }
+        match self.queue.submit(session)? {
+            Admission::Start => Ok(()),
+            Admission::Queued => {
+                self.queue.withdraw(session)?;
+                Err(ServerError::Busy(session))
+            }
+        }
+    }
+
+    /// Parses the message, answers it, and writes the reply and its trace event.
+    fn run(
+        &mut self,
+        kernel: &mut dyn Kernel,
+        session: ObjectId,
+        target: TargetId,
+        buffer: &mut [u8],
+    ) -> Result<Handled, ServerError> {
         let kind = if self.targets.is_domain(target)? {
             SessionKind::Domain
         } else {
@@ -293,13 +532,153 @@ impl Server {
             return Ok(Handled::Closed);
         }
         let frame = Frame::of(&message, target);
-        let reply = match self.answer(kernel, session, target, frame, &message) {
-            Ok(reply) => reply,
-            Err(Refusal::Result(code)) => frame.reply(code),
+        let asked = Asked::of(&message);
+        let answered = match self.answer(kernel, session, target, frame, &message) {
+            Ok(answered) => answered,
+            Err(Refusal::Result(code)) => Answered::Now(frame.only(code)),
             Err(Refusal::Server(error)) => return Err(error),
         };
-        reply.build(buffer).map_err(ServerError::Reply)?;
-        Ok(Handled::Replied)
+        match answered {
+            Answered::Now(answer) => {
+                self.send(kernel, session, asked, &answer, false, buffer)?;
+                Ok(Handled::Replied)
+            }
+            Answered::Later(token) => {
+                let request = Pending {
+                    session,
+                    framing: frame.framing(),
+                    command: asked.command,
+                    request_size: asked.request_size,
+                };
+                self.pending.insert(token, request);
+                Ok(Handled::Deferred(token))
+            }
+        }
+    }
+
+    /// Writes a reply into the caller's buffer and records the request's one trace event.
+    fn send(
+        &self,
+        kernel: &mut dyn Kernel,
+        session: ObjectId,
+        asked: Asked,
+        answer: &Answer,
+        deferred: bool,
+        buffer: &mut [u8],
+    ) -> Result<(), ServerError> {
+        answer.builder.build(buffer).map_err(ServerError::Reply)?;
+        let outcome = match (deferred, answer.stubbed) {
+            (true, _) => IpcOutcome::Deferred,
+            (false, true) => IpcOutcome::Stubbed,
+            (false, false) => IpcOutcome::Done,
+        };
+        let reply_size = trace::size(answer.payload);
+        let event = trace::event(
+            self.service,
+            session,
+            asked,
+            reply_size,
+            answer.result,
+            outcome,
+        );
+        kernel.record(event);
+        Ok(())
+    }
+
+    /// The oldest deferred request whose token has completed and whose reply is not written
+    /// yet. The kernel finds the thread that waits on [`Completed::session`] and gives its
+    /// message buffer to [`Server::deliver`] at once.
+    ///
+    /// A completion for a request that is no longer pending (its session was closed, or its
+    /// method answered at once and left its token behind) is logged and skipped.
+    pub fn take_completed(&mut self) -> Option<Completed> {
+        // Bounded by the mailbox: every turn takes one completion out of it.
+        loop {
+            let (token, posted) = self.mailbox.take()?;
+            if let Some(pending) = self.pending.remove(&token) {
+                return Some(Completed {
+                    token,
+                    pending,
+                    posted,
+                });
+            }
+            tracing::warn!(
+                service = %self.name,
+                token = token.raw(),
+                "a reply token completed for a request that is not pending: ignored"
+            );
+        }
+    }
+
+    /// Writes the reply of a deferred request into its caller's message buffer, and records the
+    /// request's trace event. `kernel` speaks for the thread that sent the request, and
+    /// `buffer` is that thread's message buffer, as for [`Server::handle`]; it need not still
+    /// hold the request.
+    ///
+    /// The request is no longer in flight afterwards, on an error too: a reply that could not
+    /// be written is lost, and what the caller sees is the kernel's to decide.
+    pub fn deliver(
+        &mut self,
+        kernel: &mut dyn Kernel,
+        completed: Completed,
+        buffer: &mut [u8],
+    ) -> Result<(), ServerError> {
+        let session = completed.pending.session;
+        let delivered = self.write_deferred(kernel, completed, buffer);
+        let settled = self.queue.complete(session);
+        delivered?;
+        Ok(settled?)
+    }
+
+    fn write_deferred(
+        &mut self,
+        kernel: &mut dyn Kernel,
+        completed: Completed,
+        buffer: &mut [u8],
+    ) -> Result<(), ServerError> {
+        let Completed {
+            pending, posted, ..
+        } = completed;
+        let session = pending.session;
+        if buffer.len() < BUFFER_SIZE {
+            return Err(ServerError::BufferTooShort { len: buffer.len() });
+        }
+        let target = *self
+            .sessions
+            .get(&session)
+            .ok_or(ServerError::UnknownSession(session))?;
+        let frame = Frame::of_deferred(pending.framing, target);
+        let answer = match posted {
+            Posted::Reply(reply) => match self.build_reply(kernel, frame, reply) {
+                Ok(answer) => answer,
+                Err(Refusal::Result(code)) => frame.only(code),
+                Err(Refusal::Server(error)) => return Err(error),
+            },
+            Posted::Failed(code) => frame.only(code),
+            Posted::Dropped => frame.only(DEFERRED_REPLY_DROPPED),
+        };
+        let asked = Asked {
+            command: pending.command,
+            request_size: pending.request_size,
+        };
+        self.send(kernel, session, asked, &answer, true, buffer)
+    }
+
+    /// The deferred requests whose reply has not been delivered, by token id, with the session
+    /// each was sent on.
+    pub fn pending(&self) -> impl Iterator<Item = (TokenId, ObjectId)> {
+        (self.pending.iter()).map(|(token, request)| (*token, request.session))
+    }
+
+    /// A new reply token for a deferred request that is still pending: how the work behind it is
+    /// resumed after a [`Server::restore`], which leaves the old tokens leading nowhere. `None`
+    /// if no such request is pending.
+    ///
+    /// Reissuing a token whose first holder is still at work gives the request two tokens; the
+    /// first to complete answers it, and the other is ignored and logged.
+    pub fn reissue(&self, token: TokenId) -> Option<ReplyToken> {
+        let pending = self.pending.contains_key(&token);
+        pending.then(|| ReplyToken::new(token, Arc::clone(&self.mailbox)))
     }
 
     /// Routes a message by its type: control, domain, plain or TIPC.
@@ -310,18 +689,19 @@ impl Server {
         target: TargetId,
         frame: Frame,
         message: &Message<'_>,
-    ) -> Result<ReplyBuilder, Refusal> {
+    ) -> Result<Answered, Refusal> {
         let (protocol, command_id, payload, interface, in_objects) =
             match (&message.body, message.command_type) {
                 (
                     Body::CmifRequest(body),
                     CommandType::Control | CommandType::ControlWithContext,
                 ) => {
-                    return self.control(kernel, session, target, body);
+                    let answer = self.control(kernel, session, target, body)?;
+                    return Ok(Answered::Now(answer));
                 }
                 (Body::DomainClose(header), _) => {
                     self.close_object(target, header.object_id)?;
-                    return Ok(frame.reply(ResultCode::SUCCESS));
+                    return Ok(Answered::Now(frame.only(ResultCode::SUCCESS)));
                 }
                 (
                     Body::CmifRequest(body),
@@ -382,7 +762,7 @@ impl Server {
         kernel: &mut dyn Kernel,
         interface: TargetId,
         call: Call<'_>,
-    ) -> Result<ReplyBuilder, Refusal> {
+    ) -> Result<Answered, Refusal> {
         let Call {
             frame,
             protocol,
@@ -402,14 +782,34 @@ impl Server {
         let mut cx = Context {
             kernel: &mut *kernel,
             targets: &mut self.targets,
+            family: self.family.as_deref_mut(),
+            deferral: Deferral {
+                mailbox: &self.mailbox,
+                next_token: &mut self.next_token,
+                taken: None,
+            },
         };
         let outcome = object.dispatch(protocol, command_id, &mut cx, &request, &mut reply);
+        let token = cx.deferral.taken;
         let name = object.name();
         let command_name = object.commands().name(protocol, command_id);
         self.targets.check_in(interface, object)?;
-        match outcome {
-            Some(Ok(Completion::Done)) => self.finish(kernel, frame, reply),
-            Some(Err(fault)) => {
+        match (outcome, token) {
+            (Some(Ok(Completion::Deferred)), Some(token)) => Ok(Answered::Later(token)),
+            (Some(Ok(Completion::Deferred)), None) => {
+                tracing::error!(
+                    service = %self.name,
+                    interface = name,
+                    ?protocol,
+                    command = command_id,
+                    "a method deferred its reply without taking a reply token"
+                );
+                Err(DEFERRED_REPLY_DROPPED.into())
+            }
+            (Some(Ok(Completion::Done)), _) => {
+                Ok(Answered::Now(self.build_reply(kernel, frame, reply)?))
+            }
+            (Some(Err(fault)), _) => {
                 tracing::warn!(
                     service = %self.name,
                     interface = name,
@@ -421,7 +821,9 @@ impl Server {
                 );
                 Err(fault.into())
             }
-            None => Ok(self.unknown(name, protocol, command_id, frame)),
+            (None, _) => Ok(Answered::Now(
+                self.unknown(name, protocol, command_id, frame),
+            )),
         }
     }
 
@@ -432,7 +834,7 @@ impl Server {
         protocol: Protocol,
         id: u32,
         frame: Frame,
-    ) -> ReplyBuilder {
+    ) -> Answer {
         let command = StubbedCommand {
             interface,
             protocol,
@@ -441,14 +843,17 @@ impl Server {
         match self.policy {
             UnknownPolicy::Strict => {
                 tracing::warn!(service = %self.name, ?command, "unknown command");
-                frame.reply(UNKNOWN_COMMAND_ID)
+                frame.only(UNKNOWN_COMMAND_ID)
             }
             UnknownPolicy::AutoStub => {
                 self.record_stub(command);
                 // Only the result: every byte after it in the caller's buffer is zero, because
                 // building a reply zeroes the buffer first. Nothing of the request is echoed
                 // (`eden-nx2/NX2_NOTES.md`, row 96).
-                frame.reply(ResultCode::SUCCESS)
+                Answer {
+                    stubbed: true,
+                    ..frame.only(ResultCode::SUCCESS)
+                }
             }
         }
     }
@@ -487,12 +892,12 @@ impl Server {
     /// handle table fills up part-way, the reply is the kernel's error and the handles and
     /// sessions already added stay, as in Eden (`R_TRY(handle_table.Add(...))` there returns
     /// part-way too); new domain objects are only added once every handle is in.
-    fn finish(
+    fn build_reply(
         &mut self,
         kernel: &mut dyn Kernel,
         frame: Frame,
         reply: Reply,
-    ) -> Result<ReplyBuilder, Refusal> {
+    ) -> Result<Answer, Refusal> {
         let (payload, copies, moves) = reply.into_parts();
         if !fits(frame, &payload, copies.len(), &moves) {
             tracing::error!(service = %self.name, "reply does not fit a message buffer");
@@ -533,6 +938,7 @@ impl Server {
                     continue;
                 }
                 Moved::Session(session) => self.open_new(kernel, session)?,
+                Moved::Service(service) => kernel.connect(service)?.1,
             };
             builder = builder.move_handle(handle.raw());
         }
@@ -541,7 +947,12 @@ impl Server {
                 builder = builder.object_id(self.add_object(domain, session)?);
             }
         }
-        Ok(builder)
+        Ok(Answer {
+            builder,
+            result: ResultCode::SUCCESS,
+            payload: payload.len(),
+            stubbed: false,
+        })
     }
 
     /// Opens a new kernel session on this server that leads to `target`, and returns the caller's

@@ -19,6 +19,8 @@ test-support = []
 [dependencies]
 starquake-kernel.workspace = true
 starquake-ipc.workspace = true
+starquake-trace.workspace = true
+postcard.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
@@ -26,5 +28,4 @@ tracing.workspace = true
 [dev-dependencies]
 # Turns `test-support` on for this crate's unit tests, integration tests and doctests.
 starquake-services = { workspace = true, features = ["test-support"] }
-postcard.workspace = true
 proptest.workspace = true

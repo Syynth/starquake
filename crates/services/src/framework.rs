@@ -9,6 +9,7 @@
 //! use starquake_services::commands;
 //! use starquake_services::framework::{Context, Outcome, Reply, Request};
 //!
+//! #[derive(serde::Serialize, serde::Deserialize)]
 //! pub struct Mixer {
 //!     volume: u32,
 //! }
@@ -156,6 +157,7 @@
 mod commands;
 mod context;
 pub mod control;
+pub mod defer;
 #[cfg(any(test, feature = "test-support"))]
 pub mod fake;
 mod kernel;
@@ -165,23 +167,29 @@ mod reply;
 pub mod request;
 pub mod result;
 mod server;
+pub mod snapshot;
 mod targets;
+pub mod trace;
 
 #[cfg(test)]
 mod tests;
 
 pub use commands::{Command, CommandTable, Protocol, Session};
 pub use context::Context;
+pub use defer::{Completed, Notify, ReplyToken, TokenId};
 pub use kernel::Kernel;
 pub use payload::{Reader, Writer};
+pub use queue::{Admission, DEFAULT_WORKERS, QueueError, RequestQueue};
 pub use reply::Reply;
 pub use request::{InBuffer, OutBuffer, Request};
 pub use result::{
-    Completion, Direction, Fault, HandleKind, NOT_SUPPORTED, OUT_OF_DOMAIN_ENTRIES, Outcome,
-    TARGET_NOT_FOUND, UNKNOWN_COMMAND_ID,
+    Completion, DEFERRED_REPLY_DROPPED, Direction, Fault, HandleKind, NOT_SUPPORTED,
+    OUT_OF_DOMAIN_ENTRIES, Outcome, TARGET_NOT_FOUND, UNKNOWN_COMMAND_ID,
 };
 pub use server::{
     DEFAULT_POINTER_BUFFER_SIZE, Handled, MAX_STUBBED_COMMANDS, Server, ServerError,
     StubbedCommand, UnknownPolicy,
 };
+pub use snapshot::{Family, Interfaces, SNAPSHOT_MAGIC, SNAPSHOT_VERSION, SnapshotError};
 pub use targets::{MAX_DOMAIN_OBJECTS, TargetError};
+pub use trace::NO_COMMAND_ID;

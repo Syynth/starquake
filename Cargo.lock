@@ -631,6 +631,7 @@ dependencies = [
  "starquake-ipc",
  "starquake-kernel",
  "starquake-services",
+ "starquake-trace",
  "thiserror",
  "tracing",
 ]

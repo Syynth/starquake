@@ -4,25 +4,35 @@
 //! Each test sends the bytes a guest would put in its message buffer to [`Server::handle`] and
 //! checks the bytes that come back, and what changed in the server and the kernel.
 
+use std::cell::RefCell;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use serde::{Deserialize, Serialize};
 use starquake_ipc::{BUFFER_SIZE, Body, CommandType, Message, RequestBuilder, SessionKind};
 use starquake_kernel::handle::Handle;
 use starquake_kernel::id::{ObjectId, SlabId};
 use starquake_kernel::result::ResultCode;
+use starquake_trace::ServiceId;
 
 use super::control::CONVERT_CURRENT_OBJECT_TO_DOMAIN;
 use super::fake::FakeKernel;
 use super::{
-    Context, Fault, Handled, Kernel, Outcome, Protocol, Reply, Request, Server, ServerError,
-    UnknownPolicy, Writer,
+    Context, Fault, Handled, Interfaces, Kernel, Notify, Outcome, Protocol, Reply, ReplyToken,
+    Request, Server, ServerError, UnknownPolicy, Writer,
 };
 use crate::commands;
 
 mod buffers;
 mod control;
+mod deferred;
 mod domain;
 mod handles;
 mod plain;
+mod queue;
 mod server;
+mod snapshot;
+mod trace;
 mod unknown;
 
 /// What fills a message buffer before a request is built into it, and the caller's memory
@@ -30,7 +40,7 @@ mod unknown;
 const STALE: u8 = 0xA5;
 
 /// The toy service's root interface.
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 struct Toy {
     /// Events made by `make_event`, oldest first.
     events: Vec<ObjectId>,
@@ -52,12 +62,44 @@ commands! {
         11 => signal,
         12 => open_mute,
         13 => odd,
+        14 => wait,
+        15 => wait_twice,
+        16 => forget,
+        17 => hasty,
+        18 => bump,
+        19 => lend,
         tipc {
             0 => sum,
             1 => open_child,
             2 => inspect,
+            3 => wait,
         }
     }
+}
+
+thread_local! {
+    /// Where the toy's deferring methods leave their reply tokens: the test's stand-in for the
+    /// worker a real service hands its token to. One per test thread, so tests do not see each
+    /// other's tokens.
+    static PARKED: RefCell<Vec<ReplyToken>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The tokens the toy has parked on this thread since the last call, oldest first.
+fn parked() -> Vec<ReplyToken> {
+    PARKED.take()
+}
+
+/// The one token the toy has parked since the last call.
+fn parked_one() -> ReplyToken {
+    let mut tokens = parked();
+    assert_eq!(tokens.len(), 1);
+    tokens.remove(0)
+}
+
+/// The toy family's state: what every toy session of a server shares.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Tally {
+    bumps: u32,
 }
 
 impl Toy {
@@ -235,6 +277,60 @@ impl Toy {
         reply.ok()
     }
 
+    /// Takes the request's reply token, parks it, and defers. What it writes into the reply
+    /// first must never be sent.
+    fn wait(_: &mut Self, cx: &mut Context<'_>, _req: &Request<'_>, reply: &mut Reply) -> Outcome {
+        reply.payload().write_u64(FAIL_PAYLOAD);
+        let token = cx.defer()?;
+        PARKED.with_borrow_mut(|parked| parked.push(token));
+        reply.deferred()
+    }
+
+    /// Asks for two reply tokens.
+    fn wait_twice(
+        this: &mut Self,
+        cx: &mut Context<'_>,
+        req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        Self::wait(this, cx, req, reply)?;
+        Self::wait(this, cx, req, reply)
+    }
+
+    /// Defers without taking a reply token.
+    fn forget(
+        _: &mut Self,
+        _cx: &mut Context<'_>,
+        _req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        reply.deferred()
+    }
+
+    /// Takes a reply token, parks it, and answers at once. out: `u32` [`HASTY`].
+    fn hasty(_: &mut Self, cx: &mut Context<'_>, _req: &Request<'_>, reply: &mut Reply) -> Outcome {
+        let token = cx.defer()?;
+        PARKED.with_borrow_mut(|parked| parked.push(token));
+        reply.payload().write_u32(HASTY);
+        reply.ok()
+    }
+
+    /// Counts in the family's state. out: `u32` the count so far, this call included.
+    fn bump(_: &mut Self, cx: &mut Context<'_>, _req: &Request<'_>, reply: &mut Reply) -> Outcome {
+        let tally = cx.family::<Tally>()?;
+        tally.bumps = tally.bumps.wrapping_add(1);
+        reply.payload().write_u32(tally.bumps);
+        reply.ok()
+    }
+
+    /// in: `u32` a service's number. out: a new session on that service, after a moved event.
+    fn lend(_: &mut Self, cx: &mut Context<'_>, req: &Request<'_>, reply: &mut Reply) -> Outcome {
+        let service = ServiceId(req.payload().read_u32()?);
+        reply.move_handle(cx.create_event()?);
+        reply.push_service(service);
+        reply.ok()
+    }
+
     /// TIPC 0. in: `u32 a`, `u32 b`. out: `u32 a + b`.
     fn sum(_: &mut Self, _cx: &mut Context<'_>, req: &Request<'_>, reply: &mut Reply) -> Outcome {
         let mut r = req.payload();
@@ -254,6 +350,10 @@ const INTERLEAVED_TAG: u32 = 0x1E;
 const ODD_BYTE: u8 = 0x0D;
 /// What `inspect` reports for something the request did not carry.
 const ABSENT: u32 = u32::MAX;
+/// What `hasty` answers.
+const HASTY: u32 = 0x4A57;
+/// The number the toy server is known by.
+const SERVICE: ServiceId = ServiceId(0x51);
 
 /// Toy command ids, named after their methods.
 mod toy {
@@ -271,14 +371,22 @@ mod toy {
     pub(super) const SIGNAL: u32 = 11;
     pub(super) const OPEN_MUTE: u32 = 12;
     pub(super) const ODD: u32 = 13;
+    pub(super) const WAIT: u32 = 14;
+    pub(super) const WAIT_TWICE: u32 = 15;
+    pub(super) const FORGET: u32 = 16;
+    pub(super) const HASTY: u32 = 17;
+    pub(super) const BUMP: u32 = 18;
+    pub(super) const LEND: u32 = 19;
     /// An id the toy does not list in either block.
     pub(super) const MISSING: u16 = 77;
     pub(super) const TIPC_SUM: u16 = 0;
     pub(super) const TIPC_OPEN_CHILD: u16 = 1;
     pub(super) const TIPC_INSPECT: u16 = 2;
+    pub(super) const TIPC_WAIT: u16 = 3;
 }
 
 /// The interface the toy hands out.
+#[derive(Serialize, Deserialize)]
 struct Child {
     tag: u32,
 }
@@ -311,10 +419,45 @@ mod child {
 }
 
 /// An interface with no commands at all.
+#[derive(Serialize, Deserialize)]
 struct Mute;
 
 commands! {
     impl Mute {}
+}
+
+/// Counts how often a server said a reply token completed.
+#[derive(Default)]
+struct Wakes(AtomicUsize);
+
+impl Wakes {
+    fn count(&self) -> usize {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+impl Notify for Wakes {
+    fn completion_posted(&self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// The interfaces a toy server's sessions can be.
+fn toy_interfaces() -> Interfaces {
+    let interfaces = Interfaces::new().with::<Toy>();
+    let interfaces = interfaces.and_then(Interfaces::with::<Child>);
+    interfaces.and_then(Interfaces::with::<Mute>).unwrap()
+}
+
+/// A toy server with no sessions, told to wake `wakes`.
+fn toy_server(policy: UnknownPolicy, wakes: &Arc<Wakes>) -> Server {
+    let notify: Arc<dyn Notify> = Arc::<Wakes>::clone(wakes);
+    Server::new("toy", policy)
+        .with_service_id(SERVICE)
+        .with_interfaces(toy_interfaces())
+        .with_family(Tally::default())
+        .with_root(|| Box::new(Toy::default()))
+        .with_notify(notify)
 }
 
 /// A toy server, a fake kernel and one open session.
@@ -322,6 +465,8 @@ struct Rig {
     kernel: FakeKernel,
     server: Server,
     session: ObjectId,
+    /// Told when a reply token of the server completes.
+    wakes: Arc<Wakes>,
 }
 
 impl Rig {
@@ -337,13 +482,46 @@ impl Rig {
     fn with_handle_table(policy: UnknownPolicy, size: i32) -> Self {
         let mut kernel = FakeKernel::new(size).unwrap();
         let session = kernel.new_object();
-        let mut server = Server::new("toy", policy);
+        let wakes = Arc::new(Wakes::default());
+        let mut server = toy_server(policy, &wakes);
         server.open(session, Box::new(Toy::default())).unwrap();
         Self {
             kernel,
             server,
             session,
+            wakes,
         }
+    }
+
+    /// Opens a second session on the server, with a toy of its own.
+    fn second_session(&mut self) -> ObjectId {
+        let session = self.kernel.new_object();
+        self.server.accept(session).unwrap();
+        session
+    }
+
+    /// Sends a request that must be deferred, and returns its token id. The buffer must come
+    /// back untouched.
+    fn defer_on(&mut self, session: ObjectId, request: &RequestBuilder) -> super::TokenId {
+        let (handled, buffer) = self.try_send_on(session, request);
+        assert_eq!(buffer, built(request));
+        match handled {
+            Ok(Handled::Deferred(token)) => token,
+            other => unreachable!("not deferred: {other:?}"),
+        }
+    }
+
+    /// Delivers the oldest completed deferred request into a buffer that held [`STALE`] bytes,
+    /// and returns the session it was sent on and the buffer.
+    fn deliver(&mut self) -> (ObjectId, Vec<u8>) {
+        let completed = self.server.take_completed().unwrap();
+        let session = completed.session();
+        let mut buffer = vec![STALE; BUFFER_SIZE];
+        let delivered = self
+            .server
+            .deliver(&mut self.kernel, completed, &mut buffer);
+        assert_eq!(delivered, Ok(()));
+        (session, buffer)
     }
 
     /// Sends a request on the rig's session and returns the buffer, which must hold a reply.
