@@ -29,6 +29,11 @@ starquake-testkit = { path = "crates/testkit" }
 starquake-trace = { path = "crates/trace" }
 
 lz4_flex = "0.14.0"
+# Shader IR the render crate's `ShaderSource::Naga` carries (docs/specs/render-backend.md, "Where
+# the backend sits"): the major version wgpu 30.0.1 depends on (`naga = "30.0.0"` in its manifest),
+# so the shader, gpu and render crates share one naga with wgpu. No features: the render crate only
+# names the module types.
+naga = "30.0.1"
 sha2 = "0.11.1"
 # Pure-Rust zstd decoder for NUP containers (crates/loader/src/nup.rs): the format stores each
 # compressed file as one zstd frame (docs/references.md, `nup`). Without default features: the
