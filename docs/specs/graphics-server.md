@@ -1,6 +1,9 @@
 # Graphics server: sessions, syncpoints, GPU memory and display
 
 Status: draft for the owner's review (issue #11). Not approved; nothing is built on it yet.
+Amended on 2026-11-12 to follow the owner's six graphics decisions (`docs/decision-log.md`) and
+the seam resolutions of the graphics review guide (`docs/specs/graphics-review-guide.md`); the
+decided items are marked in "Decisions for the owner".
 
 Builds on the execution model, the kernel spec, the service framework and the observability spec.
 Three sibling specs are drafted at the same time: the GPU front/back protocol (#12), the shader
@@ -20,18 +23,24 @@ counters, the GPU's view of memory, GPU channels, the display (vi2) and the vide
 - **Nothing in gsv blocks a core.** Work that waits on the GPU, a vsync or a decoded frame is a
   kernel event the guest waits on, or a deferred reply. Host threads (GPU, timer, video worker)
   report back through one completion queue, which the timer thread drains in a recorded order.
-- **Syncpoints are 192 counters shared with the GPU.** The GPU and the video worker increment
-  them. gsv allocates them, mirrors them into the title's shared syncpoint page, and turns armed
-  waits into kernel events.
+- **Syncpoints are 192 counters shared with the GPU,** a plain type in `crates/gpu` (decided by
+  the owner, decision 3). The GPU increments them only once the host GPU has finished the work
+  before them (owner's decision of 2026-11-12), and the video worker as it finishes frames. gsv
+  allocates them, computes each submission's fence, mirrors them into the title's shared
+  syncpoint page, and turns armed waits into kernel events.
 - **GPU addresses equal CPU addresses.** gsv keeps the bookkeeping (registered memory, mappings,
-  sparse regions) and publishes a translation table the GPU reads. A mapping that the guest's
-  own memory backs resolves to the same CPU address; GPU-only regions are backed lazily on the
-  host, outside the title's memory pools.
+  sparse regions) and writes a translation table the GPU reads (`GpuVm`, also in `crates/gpu`).
+  A mapping that the guest's own memory backs resolves to the same CPU address. Unmaps, kind
+  changes and destroys go to the GPU as ordered updates. GPU-only regions are backed lazily on
+  the host by the GPU crate, outside the title's memory pools.
 - **Submission is a hand-off.** nvsrv's channel ioctls validate a GPFIFO submission, compute its
   fence, and pass the entries to the GPU front thread. The reply does not wait for the GPU.
-- **Present never blocks.** vi2 229 queues the image with its fence and replies at once with the
-  buffers still free. A 60 Hz vsync on the timer thread latches one ready frame per tick, hands it
-  to the render backend, and frees the buffer it replaces. That is what paces the title.
+- **Present never blocks** (decided by the owner, decision 1: a buffer queue). vi2 229 queues
+  the image with its fence and replies at once with the buffers still free. A 60 Hz vsync on the
+  timer thread latches one ready frame per tick, hands it to the GPU, which orders it after
+  earlier work and passes it to the render backend, and frees the buffer it replaces. That is
+  what paces the title. The fence wait of the other reference is kept as a per-run fallback, as
+  a deferred reply.
 - **Video sessions exist from the start; decoding comes later.** Sessions, image pools and
   syncpoint-backed frame handles are built so titles get past movie playback; the decoder itself
   is deferred.
@@ -242,14 +251,16 @@ it the GPU ran nothing). PR maps only on an explicit 211. Decision 5.
 gsv owns the bookkeeping and validates every request against what it actually allocated
 (handles, ranges, overlaps), as `CLAUDE.md` requires of guest-supplied ids. The GPU reads only a
 **translation table** that gsv publishes. The table's type lives in `crates/gpu` (gsv depends on
-gpu, not the other way; decision 3). The GPU never sees gsv's bookkeeping.
+gpu, not the other way; decided by the owner, decision 3). The GPU never sees gsv's bookkeeping.
 
 - **A map** is published at once: no work queued before it can name the new range, because the
   title waits for the job's event before using it.
 - **An unmap, a kind change, a destroy and a sparse-region destroy** are sent to the GPU as an
-  ordered update. The GPU applies it only after every piece of work queued before it has stopped
-  reading through the old mapping, then reports the update done. Only then does gsv signal the
-  job's event and release the device-share lock or the backing. NX2 crashed after a save when
+  ordered update (`GpuFront::update_vm`). The GPU applies it only after every piece of work
+  queued before it has stopped reading through the old mapping, including the GPU thread that
+  reads command buffers and the releases that wait for the host GPU, then reports the update done
+  (`GpuCompletion::GpuOrdered`). Only then does gsv signal the job's event and release the
+  device-share lock or the backing. NX2 crashed after a save when
   102 and 213 completed at once: stale GPU writes landed in memory the title had reused as heap
   (row 68, observed).
 - The table is versioned. A GPU thread caches translations per thread and drops its cache when
@@ -261,9 +272,11 @@ gpu, not the other way; decision 3). The GPU never sees gsv's bookkeeping.
 A sparse region has no memory of the title's behind it, but render targets live there (row 57).
 NX2 backed each region with pages from the application pool and the title ran out of memory: the
 pool still reported those pages free (row 80). This design backs GPU-only memory **lazily and on
-the host**: the GPU side (#12, #14) allocates host storage for a part of a region the first time
-the GPU writes it, and it is never charged to the title's pools. Reads of a part never written
-return zero. Decision 4.
+the host**: the GPU crate (#12) owns the lazy store, because only GPU threads touch it (review
+guide, M6). A render target in such a region stays a host-only texture in the GPU crate's
+texture cache; other bytes get host storage the first time the GPU writes them. Nothing is
+charged to the title's pools, and gsv keeps only the region extents and their accounting. Reads
+of a part never written return zero. Decision 4.
 
 Two things are unknown. Whether the console charges these regions to the title's *remote memory*
 (`svcGetInfo` 31 and 32, the NPDM's remote memory size, and the bootstrap's remote mode) is not
@@ -305,14 +318,17 @@ syncpoint by 2 at the end, bit 4 skip the wait-for-idle, bit 8 increment by the 
 1. reads and bounds-checks the entries (count against the request's buffer, no wrap),
 2. computes the increment (`2 if bit 1` + `value if bit 8`), raises the channel syncpoint's
    maximum by it, and sets the reply's fence to (channel syncpoint, new maximum),
-3. hands the GPU front one `Submission`: the entries, the optional fence to wait on, the number
-   of increments to perform after them, and the wait-for-idle flag. NVN2 sets bit 8 and expects
-   the increments to happen even though its commands contain none; the front appends them
-   (row 32, observed),
+3. hands the GPU front one `Submission` (`GpuFront::submit`): the entries, the optional fence to
+   wait on, the number of increments to perform after them, and the wait-for-idle flag. NVN2 sets
+   bit 8 and expects the increments to happen even though its commands contain none; the front
+   appends them (row 32, observed), and the GPU performs them once the host GPU has finished the
+   work before them,
 4. replies at once. The GPU runs later; the title learns it finished through the fence.
 
-If the front's queue is full, the request takes a deferred reply that the front completes when
-it has room. A handler never waits (decision 12).
+If the front's queue is full (`Submitted::Full`), the request takes a deferred reply that gsv
+completes on `GpuCompletion::GpuQueueRoom`. A handler never waits. Whether the queue is bounded
+at all is decision 12, still open and coupled with gpu-protocol's "Back-pressure", which keeps
+queues unbounded.
 
 Channel creation (AllocGPFIFOEx2) allocates a syncpoint and asks the front to create a channel
 in the right address space; binding an object class goes to the front unchanged. The engine work
@@ -371,17 +387,30 @@ CPU running a full ring of command memory ahead of the GPU (row 55, observed) or
   (row 59), saw 8–56 ms of every frame lost to it (row 108), and deadlocked when it waited for
   the current frame instead of the previous one at a scene change (row 108).
 
-This design builds the buffer queue (decision 1). The handler never waits:
+This design builds the buffer queue (decided by the owner, decision 1). The handler never waits:
 
 1. 229 validates the client, slot and image, records `Queued { slot, image, fence }` in FIFO
    order, clears the slot's bit, and replies.
 2. Each vsync tick (timer thread, 60 Hz): take the oldest queued frame whose fence is reached.
-   If there is one, it becomes the shown frame; it is handed to the GPU front as a present
-   request (below), and the frame it replaces is marked "retiring".
-3. When the render backend reports it no longer reads the retiring frame's image, its slot's bit
-   is set again, the client's "buffer available" bit is raised in the notification bitmap, and
-   the notification event is signalled.
-4. 228 (cancel) gives a slot back with no image.
+   Under the owner's decision 3, "reached" means the host GPU has finished the work that made
+   the frame. If there is one, it becomes the shown frame and is handed to the GPU as a
+   `PresentRequest` (`GpuFront::present`; no fence, nothing waits). The frame it replaces is
+   freed on the same tick: its slot's bit is set again, the client's "buffer available" bit is
+   raised in the notification bitmap, and the notification event is signalled.
+3. 228 (cancel) gives a slot back with no image.
+
+Freeing on the tick, not on a report from the render backend, makes buffer return a pure
+function of the 60 Hz clock (review guide, M3, option b; the owner's decision 4: the tick "frees
+the buffer it replaces"). It is safe only because the present and any later draw into the same
+image reach the render backend in order and run in order on its one host queue (render-backend,
+"Submit"). That ordering is an inference the review guide flagged, so it is a **guess** until
+render-backend slice R8's test pins it; if it fails, the release moves back to a render report.
+
+**Fallback: the fence wait** (owner's decision of 2026-11-12). A per-run setting makes 229 hold
+its reply until the previous frame's fence is reached and the next tick has passed, and report
+every slot free, as NX2 does. It is written as a deferred reply completed by the timer thread, so
+it never blocks a core. It exists in case a title turns out not to wait for free buffers
+(verification 3).
 
 At most one frame is latched per tick, so a title that waits for free buffers runs at 60 frames a
 second at most, and at the rate the GPU sustains when that is lower. A frame that misses a tick
@@ -398,7 +427,9 @@ is `(width - 1) | (height - 1) << 16`, word 4 the block height (log2 of GOB rows
 pitch in 64-byte GOBs, word 6 the format (1 RGBA8, 4 RGB10A2) (observed, row 48; read, PR
 `native_image_layout.h`). Its memory is bound by 114 or 423, so its GPU address is known. vi2
 passes the GPU address, size, pitch, block height, format and the shown area to the GPU front;
-detiling (the Switch 2 GOB swizzle, row 69) is the render side's.
+the GPU crate detiles (the Switch 2 GOB swizzle, row 69) with the layout crate
+`starquake-layout`, and the render backend receives linear data or the GPU's own render target
+(review guide, M8).
 
 ### Native memory and images
 
@@ -406,8 +437,10 @@ Native memory (111) is an id with a size; 114 or 423 binds it to an address. Nat
 are a preference plus a memory id. Their size, for 435 and 1510, is
 `pitch_gobs × 64 × align(height, 1 << block_height) × count`, aligned to one page (read, PR
 `CalculateNativeImageRequirements`, "run against the real module"; NX2's alignment differs:
-**conflict**, PR's chosen). 1510 returning size 0 made the window fail to initialise (row 33,
-observed). These are small tables in gsv's root, shared by vi2 (presents) and video (pools).
+**conflict**, PR's chosen). gsv keeps this formula because it reproduces the system module's
+answer (a protocol fact); a test checks it against `starquake-layout`'s size for the same
+description, which needs the layout crate as a dev-dependency of gsv (review guide, M8). 1510
+returning size 0 made the window fail to initialise (row 33, observed). These are small tables in gsv's root, shared by vi2 (presents) and video (pools).
 
 ### Video codec sessions
 
@@ -447,32 +480,35 @@ Every wait in this design is one of two kinds:
 | Shared-page request (204) | Kernel event the guest waits on | Completion queue: request-event hook, counter change, or the 1 ms deadline |
 | gpu worker jobs (101–216) | Notification event named by the request | At once (maps, creates), or when the GPU reports an ordered update done (unmaps, destroys) |
 | vi2 vsync request groups | Kernel event | Vsync tick |
-| vi2 buffer available | Notification bit + event | Render backend's release of the replaced frame |
-| SubmitGPFIFO with a full GPU queue | Deferred reply | GPU front, when it has room |
+| vi2 buffer available | Notification bit + event | The vsync tick that latches the frame replacing it |
+| vi2 229 in the fence-wait fallback | Deferred reply | Vsync tick, once the previous frame's fence is reached |
+| SubmitGPFIFO with a full GPU queue (if bounded, decision 12) | Deferred reply | GPU front, when it has room |
 | Video ready-for-input, frame done | Kernel event; syncpoint fence | Video worker |
 
 ### Who signals what: the completion queue
 
 Host threads never touch gsv's tables or the kernel directly. They push a `Completion` onto one
-multi-producer queue owned by gsv and wake the timer thread:
+multi-producer queue owned by gsv and wake the timer thread. The GPU's part of it is a type in
+`crates/gpu` (`GpuCompletion`, pushed through the `Completions` trait gsv implements), because the
+GPU cannot name a gsv type:
 
 ```rust
 enum Completion {
-    SyncpointChanged { id: SyncpointId, value: u32 },   // GPU back thread, video worker
-    GpuOrdered { ticket: Ticket },                       // GPU: an ordered update or barrier is done
-    GpuQueueRoom { channel: ChannelId },                 // GPU front: a full queue drained
-    PresentReleased { ticket: Ticket },                  // render backend: done reading an image
+    Gpu(GpuCompletion),                                  // see "What this spec offers ... GPU front/back"
     VideoFrame { decoder: DecoderId, frame: FrameInfo }, // video worker
     GuestSignalled { event: ObjectId },                  // kernel hook on gsv's own events
 }
 ```
 
+The draft's `PresentReleased` completion is gone: no host thread reports a presented buffer free
+(the vsync tick frees it).
+
 The timer thread drains the queue (and runs gsv's deadlines: vsync, the 1 ms shared-page bound):
 it updates the waiter tables, writes the shared page, signals kernel events and completes
 deferred replies. Draining on one thread gives one order, which is the order recorded for replay
-(observability rule 3). `SyncpointChanged` is pushed only for counters someone waits on: gsv
-keeps an atomic bitmap of watched ids that the incrementing thread checks first, so the GPU pays
-one load per increment otherwise.
+(observability rule 3). `GpuCompletion::SyncpointChanged` is pushed only for counters someone
+waits on: gsv keeps an atomic bitmap of watched ids that the incrementing thread checks first, so
+the GPU pays one load per increment otherwise.
 
 Lock order: gsv's shared state lock, then the kernel lock. Nothing calls into gsv while holding
 the kernel lock or a GPU lock; the kernel's event hook queues a completion after releasing its
@@ -489,12 +525,14 @@ lock for longer than a copy.
 
 ## Interfaces to neighbouring designs
 
-The lead reconciles these with the sibling specs. Names are proposals.
+The four graphics drafts were amended together on 2026-11-12 so that every shared type and call
+below has the same name in each. Field names are still proposals.
 
 ### What this spec offers and assumes of the GPU front/back (#12)
 
-Types gsv needs to share with the GPU live in `crates/gpu`, because gsv depends on gpu
-(decision 3):
+Types gsv needs to share with the GPU live in `crates/gpu`, because gsv depends on gpu (decided
+by the owner, decision 3). The four graphics drafts were amended together on 2026-11-12, and
+this block is the same in gpu-protocol's "Graphics server sessions (#11)":
 
 ```rust
 pub struct SyncpointId(u8);                 // < SYNCPOINT_COUNT (192)
@@ -508,37 +546,62 @@ impl Syncpoints {
 
 pub struct GpuVm { /* versioned translation table: GPU range -> Target, kind */ }
 pub enum Target { Guest { cpu_va: u64 }, GpuOnly { region: RegionId, offset: u64 }, SyncpointShim }
+pub enum VmUpdate { /* unmap, kind change, memory destroy, sparse-region destroy; each with its range */ }
 
-pub trait GpuFront: Send + Sync {                       // implemented by #12
+pub struct ChannelConfig { pub space: AsId, pub syncpoint: SyncpointId }
+pub struct Submission { pub entries: Vec<GpfifoEntry>, pub wait: Option<Fence>, pub increments: u32, pub wfi: bool }
+pub enum Submitted { Queued, Full }         // Full only if queues are bounded (graphics-server decision 12)
+pub struct PresentRequest {
+    pub image: ImageDesc,        // GPU address, width, height, pitch, block height, format
+    pub shown: Rect,             // the area word 7 of 229 names
+    pub layer: LayerId,
+    pub display: DisplayId,
+}
+
+pub trait GpuFront: Send + Sync {                       // implemented by `Gpu` in crates/gpu
     fn create_address_space(&self, space: AsId, vm: Arc<GpuVm>);
     fn update_vm(&self, space: AsId, update: VmUpdate, done: Option<Ticket>); // ordered
     fn create_channel(&self, config: ChannelConfig) -> Result<ChannelId, GpuError>;
     fn bind_class(&self, channel: ChannelId, class: u32) -> Result<(), GpuError>;
-    fn submit(&self, channel: ChannelId, submission: Submission) -> Submitted; // Queued | Full
+    fn submit(&self, channel: ChannelId, submission: Submission) -> Submitted;
     fn barrier(&self, done: Ticket);          // done once all work queued before it is finished
-    fn present(&self, request: PresentRequest, released: Ticket);
+    fn present(&self, request: PresentRequest);   // no fence: gsv latched it after its fence was reached
+    fn channel_error(&self, channel: ChannelId) -> Option<ChannelError>;
     fn destroy_channel(&self, channel: ChannelId);
 }
 
-pub struct Submission { entries: Vec<GpfifoEntry>, wait: Option<Fence>, increments: u32, wfi: bool }
-pub trait Completions: Send + Sync { fn push(&self, completion: Completion); } // implemented by gsv
+pub enum GpuCompletion {
+    SyncpointChanged { id: SyncpointId, value: u32 },   // back thread (after host completion), video worker
+    GpuOrdered { ticket: Ticket },                       // an ordered update or barrier is done
+    GpuQueueRoom { channel: ChannelId },                 // a full queue drained (bounded queues only)
+}
+pub trait Completions: Send + Sync { fn push(&self, completion: GpuCompletion); } // implemented by gsv
 ```
+
+This draft first placed `PresentRequest` among the render backend's types and the whole
+`Completion` enum in gsv; both moved to `crates/gpu`, because the GPU consumes the one and
+produces the other and cannot depend on gsv. `present` lost its release ticket (see "Present
+(229) and pacing").
 
 What gsv assumes:
 
-- **Order.** Work, increments and ordered updates take effect in the order `submit`,
-  `update_vm` and `barrier` were called, across all channels of one process, as Eden's single
-  GPU thread does. Which of the front or back thread performs each is #12's choice. "Finished"
-  for an ordered update means no work queued before it can still read through the old mapping.
-- **Syncpoint increments** happen when the work before them has been executed by the back thread
-  (that is, recorded for the host GPU), not when the host GPU has finished it. Readbacks of
+- **Order.** Work, increments, ordered updates and presents take effect in the order `submit`,
+  `update_vm`, `barrier` and `present` were called, across all channels of one process, as Eden's
+  single GPU thread does. Which of the front or back thread performs each is #12's choice.
+  "Finished" for an ordered update means no work queued before it can still use the old mapping,
+  including the GPU thread that reads command buffers through the same table (owner's decision
+  of 2026-11-12). gpu-protocol lists two cases this leaves open (a parked channel holding an
+  update; later work seeing the old mapping until it applies).
+- **Syncpoint increments** happen once the host GPU has finished the work before them, not when
+  the work is recorded (owner's decision of 2026-11-12; this draft's earlier record-time
+  assumption is dropped). Signals with no host work behind them happen at once. Readbacks of
   GPU-written memory by the CPU are #12's problem (rows 115, 131).
 - **Fence waits** in a submission (flag bit 0) are waits on `Syncpoints` inside the GPU; gsv
   never waits for them.
 - **Translation.** The GPU resolves addresses only through `GpuVm`, caches per thread, and checks
   the version. `Target::Guest` addresses are read through `GuestMemory` at the CPU address.
   `SyncpointShim` reads return `Syncpoints::read`. `GpuOnly` storage and its lazy allocation are
-  #12's and #14's.
+  #12's.
 - **No callbacks into gsv except `Completions::push`,** which never blocks.
 
 What gsv gives #12: the GPU profile from the bootstrap (flags 5 → 0x807, 6 and 7 → 0x808; read,
@@ -549,23 +612,24 @@ question), and which classes a channel binds.
 
 Nothing at runtime. gsv passes the GPU profile above to #12, which may hand it on. Row 65 says
 binding the console's blit constant bank 24 is "the system's job"; no gsv command is known to do
-it, so this spec assumes #12 or #13 synthesises it, and says so as an open question.
+it. gpu-protocol and shader-pipeline agree that #12 supplies it; the fact itself is open
+(gpu-protocol verification 6). Unmaps and destroys reach the shader cache only through #12, which
+calls its `invalidate` when it applies the ordered update.
 
 ### What this spec offers and assumes of the render backend (#14)
 
-```rust
-pub struct PresentRequest {
-    pub image: ImageDesc,        // GPU address, width, height, pitch, block height, format
-    pub shown: Rect,             // the area word 7 of 229 names
-    pub layer: LayerId,
-    pub display: DisplayId,
-}
-```
+Nothing directly: presents reach the render backend only through the GPU
+(`GpuFront::present`), which orders each after the work that produced the image and records it
+as the render backend's `Command::Present`. The dependency direction is gsv → gpu → render.
 
-- Presents reach the render backend through the GPU front, after the work that produced the
-  image. The render thread owns the window or swapchain, scales the shown area to it, and in a
-  headless run writes `frames/` as the observability spec says.
-- It pushes `PresentReleased` once it no longer reads the image, so the buffer can be reused.
+- The render thread owns the window or swapchain, scales the shown area to it, and in a headless
+  run writes `frames/` as the observability spec says.
+- gsv frees a presented buffer on the tick that latches the next frame, not on a report from the
+  render backend. This relies on the render backend running the present and any later draw into
+  the same image in order on one host queue (render-backend, "Submit"; a **guess** until its
+  slice R8 pins it).
+- The render backend's `PresentFeedback` is statistics only; gsv never lets it change
+  guest-visible behaviour.
 - Vsync comes from gsv's timer, not from the host display (decision 2). A later option is to let
   the host display drive it; `PresentRequest` and the latch do not change.
 
@@ -589,7 +653,7 @@ for every input replay cannot reproduce, all from the timer thread as it drains 
 | `SyncptPageAnswered` | request bits answered, values written |
 | `GpuOrderedDone` | ticket |
 | `VsyncTick` | tick number |
-| `FrameLatched`, `BufferReleased` | client, slot, image |
+| `FrameLatched`, `BufferReleased` | client, slot, image (both written on the vsync tick that latches the frame) |
 | `VideoFrameDone` | decoder, image, pts |
 | `QueueRoom` | channel |
 
@@ -597,7 +661,8 @@ Submitted GPFIFO entries are part of the IPC payload, recorded in full mode like
 data. GPU method streams are not events (observability spec); they are #12's capture format.
 
 Replaying the kernel and services from a log replays gsv with no GPU: a fake `GpuFront` takes
-submissions, and the recorded notes are fed back in their order.
+submissions, and the recorded notes are fed back in their order. Because a buffer is freed by the
+tick and not by a host report, buffer return replays from the tick count alone.
 
 ## What is snapshotted
 
@@ -644,23 +709,24 @@ are in `eden-pr4588/src/core/hle/service/nvdrv/devices/`. "NX2" names classes in
 | # | Slice | Builds | Depends on | Ports from (`@` commits as above) | Offline test |
 |---|---|---|---|---|---|
 | 1 | Protocol facts and the root | The command table with marks and sources; the root's bootstrap (4, 11, 101, 126, 115) and every root command left as a logged stub with its known reply shape; the private registry entry; `am` 2000 | Services slices 1–3 | PR `graphics_supervisor_protocol.h`, `graphics_supervisor.cpp` (root); NX2 `INx2GraphicsSystemSession`; NX2 `am/service/self_controller.cpp`; PR `self_controller.cpp` | Each root command's reply bytes; bootstrap out of order is logged, not refused (decision 7) |
-| 2 | Syncpoints | `Syncpoints` in `crates/gpu`: counters, maxima, wrapping and 64-bit comparison, 64-bit extension, allocation with reserved ids, watched bitmap | None | Eden `nvdrv/core/syncpoint_manager.cpp`; PR `graphics_syncpoint_cache.h`, `IsSyncpointWaitSatisfied` | Comparisons at the wrap edge on both sides; extension across wraps; allocation exhausts at exactly the count |
-| 3 | Completion queue and timer hooks | `Completion`, the queue, the drain on the timer thread, the watched-id fast path, lock order | 2; kernel slice 10 (timers), with a fake until then | New | Scripted completions drain in push order; an unwatched increment pushes nothing |
+| 2 | Syncpoints | `Syncpoints` in `crates/gpu`: counters, maxima, wrapping and 64-bit comparison, 64-bit extension, allocation with reserved ids, watched bitmap, the `GpuCompletion` and `Completions` types | None | Eden `nvdrv/core/syncpoint_manager.cpp`; PR `graphics_syncpoint_cache.h`, `IsSyncpointWaitSatisfied` | Comparisons at the wrap edge on both sides; extension across wraps; allocation exhausts at exactly the count |
+| 3 | Completion queue and timer hooks | `Completion` (wrapping `GpuCompletion`), the queue and its `Completions` implementation, the drain on the timer thread, the watched-id fast path, lock order | 2; kernel slice 10 (timers), with a fake until then | New | Scripted completions drain in push order; an unwatched increment pushes nothing |
 | 4 | syncpt session | 0, 1, 21, 22, 103, 201, 202; waiter table | 1, 2, 3 | NX2 `INx2SyncptSession`; PR `ISyncpointSupervisor` | Wait fires exactly at the threshold, not one before; cancel always signals; arm clears a signalled slot (row 147) |
 | 5 | Shared syncpoint page | 204: header, request and acknowledge protocol, the three answer triggers | 1, 3, 4; kernel transfer memory | PR `BindSyncpointMemory`, `RefreshSyncpointCache`; NX2 `AttachSyncptMemory` | Golden bytes of the header; a request is answered on signal, on change and at exactly the 1 ms bound |
 | 6 | GPU VM table | `GpuVm` in `crates/gpu`: ranges, targets, kinds, versioning, overlap rules | None | New; NX2 `Nx2GpuMemoryRegistry` for behaviour | Model test against a page-by-page map under random map, unmap and modify |
 | 7 | gpu session and worker | 497 commands; 101, 102, 211–216; registrations with the attribute check and device lock; sparse regions; ordered completion of unmaps and destroys | 1, 3, 6; kernel address space (attribute, device lock) | PR `gpu_session.cpp`, `gpu_memory_registration.h`; NX2 `INx2GpuSession` | Every request's bounds checks at the edge; an unmap's event fires only after the fake front reports the barrier; a destroy releases the lock only then |
-| 8 | Native memory and images | 111, 112, 114, 115, 423, 429, 430, 435, 1510, 314, 315; layout sizes | 1, 7 (423) | PR `native_image_layout.h`, root native-memory handlers; NX2 `Nx2CalculateImageLayout` | Sizes against hand-computed values at block and pitch limits; invalid preferences are errors |
+| 8 | Native memory and images | 111, 112, 114, 115, 423, 429, 430, 435, 1510, 314, 315; layout sizes | 1, 7 (423); gpu-protocol G5 for the cross-check | PR `native_image_layout.h`, root native-memory handlers; NX2 `Nx2CalculateImageLayout` | Sizes against hand-computed values at block and pitch limits; invalid preferences are errors; the size formula agrees with `starquake-layout` for the same description |
 | 9 | nvsrv framing and nvmap | The nvdrv protocol (Open, Ioctl variants, Close, events), ioctl number decoding, nvmap | 1 | Eden `nvdrv/nvdrv_interface.cpp`, `devices/nvmap.cpp`, `ioctl_serialization.h` | Ioctl byte fixtures; unknown ioctl under both policies |
 | 10 | nvsrv GPU devices | ctrl-gpu characteristics, as-gpu (shared with slice 7's address spaces), tsg-gpu | 6, 7, 9 | Eden `devices/nvhost_ctrl_gpu.cpp`, `nvhost_as_gpu.cpp`; PR `native_gpu_characteristics.h`, `gpu_address_space_layout.h`, `nvhost_as_gpu.cpp`, `nvhost_tsg_gpu.cpp` | Golden bytes of the 0xD0 block, every listed bit; AllocAsEx ranges |
-| 11 | Channels and submission | nvhost-gpu: AllocGPFIFOEx2, AllocObjCtx, SubmitGPFIFO, channel events; deferred reply on a full queue | 2, 3, 10; #12's `GpuFront` (a fake here) | Eden `devices/nvhost_gpu.cpp`; NX2 `nvhost_gpu.cpp` | Fence arithmetic for every flag combination; entries reach the fake in order; a full queue defers and completes |
+| 11 | Channels and submission | nvhost-gpu: AllocGPFIFOEx2, AllocObjCtx, SubmitGPFIFO, channel events; deferred reply on a full queue (if decision 12 bounds it) | 2, 3, 10; #12's `GpuFront` (a fake here) | Eden `devices/nvhost_gpu.cpp`; NX2 `nvhost_gpu.cpp` | Fence arithmetic for every flag combination; entries reach the fake in order; a full queue defers and completes |
 | 12 | Vsync clock | The 60 Hz deadline from `Env`, no banking of lost time, request-group ticks | 3 | NX2 `PaceToVblank`; PR `StartGroupTick` | Fixed clock: ticks at exact multiples; a late tick does not double up |
 | 13 | vi2 session | Displays, clients, layers, request groups and monitors, notifications, display state | 1, 3, 12 | PR `IVi2Session`; NX2 `INx2Vi2Session` | Each command's reply bytes; monitor kind 0 ticks; the fallback ticks an unregistered group and logs |
-| 14 | Present and pacing | 228, 229, the FIFO latch, release, availability | 2, 8, 13; #14's release report (a fake here) | PR `QueueNativeImage`, `RefreshReleasedBuffers` | Scripted presents and ticks: one latch per tick, an unreached fence skips a tick, a slot returns only after release |
+| 14 | Present and pacing | 228, 229, the FIFO latch, release on the latching tick, availability, the fence-wait fallback as a deferred reply | 2, 8, 13; #12's `GpuFront` (a fake here) | PR `QueueNativeImage`, `RefreshReleasedBuffers`; NX2 `PaceToVblank` for the fallback | Scripted presents and ticks: one latch per tick, an unreached fence skips a tick, a slot returns exactly on the tick that latches the frame replacing it and not before; the fallback's reply completes on the first tick after the previous frame's fence |
 | 15 | Video sessions without decoding | 901–906, 911, 912, 961, 991, 426–428, the decoder service with a null decoder, 1001–1003 and 601/602 shapes | 2, 3, 8 | NX2 `INx2VideoSession`, `CalculateDecoderImagePoolBuffer`; PR `native_video_layout.h` | Pool sizes; sync handles count frames in order; flush keeps images already handed out |
 | 16 | Wiring | `core` builds `Syncpoints`, the queue, gsv's servers and #12's front; recorded notes replay with a fake front | All above; #12 | New | A recorded gsv session replays to the same state |
 
-**What can run in parallel.** Slices 2 and 6 are pure data structures and can start the moment
+**What can run in parallel.** Slices 2 and 6 are pure data structures (in `crates/gpu`, where
+gpu-protocol's slice G22 builds the production memory access on them) and can start the moment
 this spec is approved, with slice 1. After slices 1–3: slices 4, 7, 9 and 12 in parallel. Then 5
 (after 4), 8 and 10 (after 7), 13 (after 12). Then 11 (after 10), 14 (after 8 and 13) and 15
 (after 8), in parallel. Slice 16 is last and is single-agent work. Slices 2, 6, 11 and 14 touch
@@ -678,8 +744,8 @@ change a decision.
 2. **vi2 31/32:** does the title register request groups with 261 before waiting on them? (vsync
    fallback, slice 13)
 3. **Does the title wait for the "buffer available" notification before reusing a buffer?** If
-   not, decision 1's recommendation fails and NX2's fence wait is needed. Count presents per
-   vsync with the buffer queue.
+   not, the owner's decision 1 falls back to NX2's fence wait for that run (the per-run setting).
+   Count presents per vsync with the buffer queue.
 4. **Does GPU work read a 101 registration at its own address without a 211 there?** Log the
    first GPU access per registration. (decision 5)
 5. **Remote memory:** bootstrap flags, `svcGetInfo` 31 and 32, the NPDM's remote memory size: are
@@ -693,10 +759,20 @@ change a decision.
 9. **nvsrv framing:** CMIF or TIPC. NX2 serves it with Eden's CMIF nvdrv; nothing shows the wire.
 10. **Syncpoint count and reserved ids** on Switch 2 (192 and 26/27 are Eden's Switch 1 values).
 11. **Who binds constant bank 24** (row 65).
+12. **Freeing a buffer on the latching tick is safe** (render-backend slice R8's ordering test):
+    if a draw into a just-freed buffer can change the frame still being shown, the release moves
+    back to a report from the render backend, through the GPU.
 
 ## Decisions for the owner
 
-1. **How presents pace the title.**
+Decided items keep their original text below the ruling, for the record.
+
+1. **Decided by the owner, 2026-11-12:** the buffer queue. A present returns at once with the
+   buffers still in use; the 60 Hz tick shows one ready frame and frees the buffer it replaces;
+   the game waits only when it has no free buffer. The fence wait is a per-run fallback written
+   as a deferred reply.
+
+   **How presents pace the title.**
    - *Buffer queue:* the present reply comes back at once and says which buffers are still busy;
      a buffer comes back after a later frame has replaced it on screen. This is how one reference
      reads the console. Nothing waits inside the emulator, and frames can overlap with GPU work.
@@ -707,13 +783,25 @@ change a decision.
      The fence wait is kept as a per-run fallback in case a title turns out not to wait for free
      buffers (verification 3), written as a deferred reply so that it does not block a core
      either.
-2. **Where the 60 Hz vsync comes from.**
+2. **Implied by the owner's decision of 2026-11-12 (presents paced by a buffer queue), whose text
+   names "the graphics server's emulated 60 Hz clock"; not separately confirmed.** The same
+   question is render-backend decision 8.
+
+   **Where the 60 Hz vsync comes from.**
    - *Our own timer,* from the injectable clock: deterministic, replayable, works headless.
    - *The host display's refresh:* smoother on a 60 Hz monitor, but differs per machine, needs a
      window, and can't be replayed.
    - Recommendation: **our own timer**. The host display can drive it later without changing the
      design.
-3. **Where the syncpoint counters and the GPU's translation table live.**
+3. **Decided by the owner, 2026-11-12:** in `crates/gpu`, as plain data types. gsv allocates
+   counters, computes each submission's fence and writes mappings; the GPU performs increments
+   after host completion and reads the table on every access; counter changes go into a queue
+   the timer thread drains; unmaps, kind changes and destroys reach the GPU as ordered updates
+   with a barrier, reported only when no earlier GPU work, including the thread that reads
+   command buffers, can still use the old mapping. gpu-protocol's `GpuMemory` stays, with its
+   production implementation in `crates/gpu`; its `SyncpointSink` is dropped.
+
+   **Where the syncpoint counters and the GPU's translation table live.**
    - *In `crates/gpu`,* as plain types gsv creates and fills. The dependency direction
      (gsv → gpu) already allows it.
    - *In a new small crate* both depend on: cleaner ownership, one more crate.
@@ -728,6 +816,8 @@ change a decision.
    - *Not backed at all:* render targets there would be lost; frames went black this way.
    - Recommendation: **lazily on the host**, revisited if the console turns out to charge these
      regions to the title's remote memory (verification 5).
+   - Still open. Who builds the store is settled by the review guide's M6, applied on
+     2026-11-12: the GPU crate (gpu-protocol slice G22), with gsv keeping extents and accounting.
 5. **Whether registering memory for the GPU also maps it at its own address.**
    - *Yes* (one reference): it observed nothing running without it, though its explicit map
      command was a stub at the time.
@@ -776,6 +866,10 @@ change a decision.
     - *An unbounded queue:* simpler, but a title that runs far ahead grows host memory without
       limit.
     - Recommendation: **bounded, with a deferred reply**.
+   - Still open, and coupled: gpu-protocol keeps its submission queues unbounded ("Back-pressure").
+     Choosing bounded means `GpuFront::submit` returns `Submitted::Full` and the GPU pushes
+     `GpuCompletion::GpuQueueRoom`; both are already in the shared interface. The review guide
+     recommends bounded, at gpu-protocol's 65,536-entry figure.
 
 ## Deferred, not ruled out
 
