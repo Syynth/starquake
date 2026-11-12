@@ -53,9 +53,10 @@ set, nextest, doctests. CI runs exactly this.
   `crates/gsv` and fails on a direct use of the host clock (`Instant::now`, `SystemTime::now`),
   `std::fs`, `std::net`, thread sleeping or a random-number source (`rand`, `getrandom`,
   `fastrand`, a `RandomState`). Read these through the injectable `Env` instead, or replay breaks
-  silently (`docs/specs/observability.md`). Test code is exempt, nothing else is; there is no
-  escape comment. The step is a text search, not a sandbox: `xtask/src/host_access.rs` lists
-  what it cannot see.
+  silently (`docs/specs/observability.md`). Test code is exempt, and only that: `#[cfg(test)]`,
+  `#[cfg(all(test, ..))]`, `#[test]`-style functions and `#![cfg(test)]` (not `any(test, ..)`);
+  there is no escape comment. The step is a text search, not a sandbox: the module docs of
+  `xtask/src/host_access.rs` list what it cannot see.
 - `cargo xtask ci` moves to the workspace root itself, so it also works from a subfolder (the
   alias then builds its binary in that folder's own `target/`, which is git-ignored).
 - `cargo xtask` builds its own binary in `target/xtask` inside the checkout, so worktrees that
@@ -90,7 +91,9 @@ Platform-specific code must still compile (or be `cfg`-gated) on Linux; check wi
   reaching around a layer.
 - Kernel and service code (`kernel`, `services`, `gsv`) is replayable: the clock, random numbers
   and host file and network I/O come only through the injectable `Env`, never from `std`
-  directly. The gate's `host-access` step enforces it.
+  directly. The gate's `host-access` step catches the direct calls it lists (`xtask/src/host_access.rs`)
+  and nothing else: method calls such as `.elapsed()` and `Path::exists`, aliases and other
+  clock or random crates are for review to catch.
 - Guest-controlled values are untrusted: checked arithmetic and bounds on anything derived from
   guest memory, file contents or IPC words. A malformed input is an `Err`, never a panic.
   Check arithmetic for the whole extent written or read (start, end, trailing data), not just
@@ -188,8 +191,9 @@ Platform-specific code must still compile (or be `cfg`-gated) on Linux; check wi
 Code may be ported from GPL projects (Eden, oboromi, rapid-arm-emu) with attribution in the file
 header; MIT sources (Mesa) likewise. Don't use leaked or NDA material.
 
-- **libnx is ISC** (permissive): code may be ported, and the original file's ISC copyright and
-  permission notice go in the header of the file that holds the port.
+- **libnx is ISC** (permissive): code may be ported, and the notice in the reference folder's
+  `libnx/LICENSE.md` (its copyright line and permission text) goes in the header of the file that
+  holds the port. The source files themselves carry only `@copyright libnx Authors`.
 - **Atmosphère is GPL-2.0-only, so it is a reference for facts only.** Its licence can't be
   combined with this project's GPL-3.0-or-later: never port, translate or closely paraphrase its
   code. Read it to settle a fact (a result code, a command id, a layout), write the code from the

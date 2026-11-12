@@ -50,6 +50,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::walk;
+
 /// The allow-list, compiled in so that a checkout's `xtask` binary always carries its own copy.
 pub const ALLOWLIST: &str = include_str!("../unused-deps.toml");
 
@@ -117,6 +119,15 @@ pub enum Error {
         /// The operating-system error.
         source: std::io::Error,
     },
+}
+
+impl From<crate::walk::Unreadable> for Error {
+    fn from(unreadable: crate::walk::Unreadable) -> Self {
+        Self::Io {
+            path: unreadable.path,
+            source: unreadable.source,
+        }
+    }
 }
 
 /// Parses the report `cargo machete` prints when it exits with status 1.
@@ -335,7 +346,8 @@ pub fn judge(found: &[Unused], allowlist: &Allowlist, scope: Scope) -> Verdict {
 }
 
 /// The dependency tables of a manifest or of one `[target.*]` table.
-const DEPENDENCY_TABLES: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
+pub(crate) const DEPENDENCY_TABLES: [&str; 3] =
+    ["dependencies", "dev-dependencies", "build-dependencies"];
 
 pub(crate) fn parse_manifest(path: &str, text: &str) -> Result<toml::Table, Error> {
     text.parse().map_err(|source| Error::Manifest {
@@ -470,13 +482,12 @@ pub fn member_manifests(root_dir: &Path, root: &str) -> Result<Vec<PathBuf>, Err
             && !has_glob(parent)
         {
             let folder = root_dir.join(parent);
-            let io = |source| Error::Io {
-                path: folder.display().to_string(),
-                source,
-            };
             let mut found = Vec::new();
-            for entry in fs::read_dir(&folder).map_err(io)? {
-                let manifest = entry.map_err(io)?.path().join("Cargo.toml");
+            for entry in fs::read_dir(&folder).map_err(walk::unreadable(&folder))? {
+                let manifest = entry
+                    .map_err(walk::unreadable(&folder))?
+                    .path()
+                    .join("Cargo.toml");
                 if manifest.is_file() {
                     found.push(manifest);
                 }
@@ -502,12 +513,7 @@ pub fn member_manifests(root_dir: &Path, root: &str) -> Result<Vec<PathBuf>, Err
 
 /// Runs the workspace-dependency check against the checkout at `root_dir`.
 pub fn check_workspace_dependencies(root_dir: &Path) -> Result<Vec<Unused>, Error> {
-    let read = |path: &Path| {
-        fs::read_to_string(path).map_err(|source| Error::Io {
-            path: path.display().to_string(),
-            source,
-        })
-    };
+    let read = |path: &Path| walk::read_text(path).map_err(Error::from);
     let root = read(&root_dir.join("Cargo.toml"))?;
     let members = member_manifests(root_dir, &root)?
         .into_iter()

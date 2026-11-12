@@ -10,6 +10,7 @@ mod host_access;
 mod table_deps;
 mod tools;
 mod unused_deps;
+mod walk;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
@@ -353,8 +354,8 @@ fn plugin_version_output(subcommand: &str) -> Option<String> {
 /// printed; under CI it also fails the step, locally it is a notice. Returns whether the gate
 /// may go on.
 fn check_tool_versions(pins: &tools::Pins, in_ci: bool) -> bool {
-    let mut ok = true;
-    for (subcommand, tool) in PLUGINS {
+    let mut checks = Vec::new();
+    for (subcommand, tool) in tools::PLUGINS {
         let Some(output) = plugin_version_output(subcommand) else {
             continue;
         };
@@ -363,23 +364,19 @@ fn check_tool_versions(pins: &tools::Pins, in_ci: bool) -> bool {
         };
         let check = tools::check_output(&output, pinned);
         if let Some(notice) = tools::describe(tool, &check, pinned) {
-            let passes = tools::passes(&check, in_ci);
             eprintln!(
                 "==> {tool}: {}{notice}",
-                if passes { "NOTICE, " } else { "FAILED, " }
+                if tools::passes(&check, in_ci) {
+                    "NOTICE, "
+                } else {
+                    "FAILED, "
+                }
             );
-            ok &= passes;
         }
+        checks.push((tool, check));
     }
-    ok
+    tools::version_verdict(&checks, in_ci)
 }
-
-/// The optional cargo plugins as (`cargo` subcommand, crate name).
-const PLUGINS: [(&str, &str); 3] = [
-    ("nextest", "cargo-nextest"),
-    ("deny", "cargo-deny"),
-    ("machete", "cargo-machete"),
-];
 
 /// Which optional cargo plugins are installed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -606,8 +603,8 @@ fn ci(offline: bool) -> ExitCode {
         return ExitCode::FAILURE;
     }
     for (present, (_, crate_name)) in [
-        (installed.deny, PLUGINS[1]),
-        (installed.machete, PLUGINS[2]),
+        (installed.deny, tools::PLUGINS[1]),
+        (installed.machete, tools::PLUGINS[2]),
     ] {
         if !present {
             eprintln!(

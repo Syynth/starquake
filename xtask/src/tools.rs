@@ -18,9 +18,16 @@ use serde::Deserialize;
 /// The pins, compiled in so that a checkout's `xtask` binary carries its own copy.
 pub const PINS: &str = include_str!("../tool-versions.toml");
 
-/// The cargo plugins the gate can run, as their crate names (which are also the names
-/// `taiki-e/install-action` takes).
-pub const TOOLS: [&str; 3] = ["cargo-nextest", "cargo-deny", "cargo-machete"];
+/// The cargo plugins the gate can run, as (`cargo` subcommand, crate name). The crate names are
+/// also the names `taiki-e/install-action` takes.
+pub const PLUGINS: [(&str, &str); 3] = [
+    ("nextest", "cargo-nextest"),
+    ("deny", "cargo-deny"),
+    ("machete", "cargo-machete"),
+];
+
+/// The crate names of [`PLUGINS`].
+pub const TOOLS: [&str; 3] = [PLUGINS[0].1, PLUGINS[1].1, PLUGINS[2].1];
 
 /// Why `xtask/tool-versions.toml` cannot be used.
 #[derive(Debug, PartialEq, thiserror::Error)]
@@ -152,6 +159,12 @@ pub fn passes(check: &Check, in_ci: bool) -> bool {
     matches!(check, Check::Matches) || !in_ci
 }
 
+/// Whether the gate may go on given every installed plugin's check (tool name and check): only
+/// if [`passes`] holds for each of them.
+pub fn version_verdict(checks: &[(&str, Check)], in_ci: bool) -> bool {
+    checks.iter().all(|(_, check)| passes(check, in_ci))
+}
+
 /// The notice the gate prints for a check that is not [`Check::Matches`]; `None` when it matches.
 /// `tool` is the crate name (`cargo-deny`).
 pub fn describe(tool: &str, check: &Check, pinned: &str) -> Option<String> {
@@ -190,6 +203,57 @@ mod tests {
             assert!(pins.version(tool).is_some(), "{tool} has no pin");
         }
         assert_eq!(pins.version("cargo-audit"), None);
+    }
+
+    #[test]
+    fn every_plugin_subcommand_is_its_crate_name_without_the_cargo_prefix() {
+        for (subcommand, crate_name) in PLUGINS {
+            assert_eq!(crate_name.strip_prefix("cargo-"), Some(subcommand));
+        }
+        assert_eq!(TOOLS.len(), PLUGINS.len());
+    }
+
+    fn differs() -> Check {
+        Check::Differs {
+            installed: "1.0.0".to_owned(),
+            pinned: "2.0.0".to_owned(),
+        }
+    }
+
+    #[test]
+    fn one_mismatch_in_ci_stops_the_gate_whichever_tool_it_is() {
+        for bad in [differs(), Check::Unreadable] {
+            for position in 0..TOOLS.len() {
+                let checks: Vec<(&str, Check)> = TOOLS
+                    .iter()
+                    .enumerate()
+                    .map(|(index, tool)| {
+                        let check = if index == position {
+                            match &bad {
+                                Check::Unreadable => Check::Unreadable,
+                                _ => differs(),
+                            }
+                        } else {
+                            Check::Matches
+                        };
+                        (*tool, check)
+                    })
+                    .collect();
+                assert!(!version_verdict(&checks, true), "{bad:?} at {position}");
+                // The same findings are a notice locally.
+                assert!(version_verdict(&checks, false), "{bad:?} at {position}");
+            }
+        }
+    }
+
+    #[test]
+    fn matching_or_no_installed_plugins_pass_everywhere() {
+        let all_match: Vec<(&str, Check)> =
+            TOOLS.iter().map(|tool| (*tool, Check::Matches)).collect();
+        for in_ci in [true, false] {
+            assert!(version_verdict(&all_match, in_ci));
+            assert!(version_verdict(&[], in_ci));
+        }
     }
 
     #[test]

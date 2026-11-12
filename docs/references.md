@@ -31,9 +31,10 @@ Rules:
   value, a command id, a struct layout), write the code from the fact, and cite the file in the
   comment: `// Value from atmosphere/libraries/libvapours/include/vapours/results/<file> @ 4e3f3703 (fact only)`.
   A comment that cites it says "fact only". Bring the fact, not the expression.
-- **libnx is ISC**, a permissive licence: code may be ported from it, but the ISC notice (copyright
-  line and permission text) of the original file travels with the port, in the file header next to
-  the citation. (`CLAUDE.md`, "Licensing", has the whole list.)
+- **libnx is ISC**, a permissive licence: code may be ported from it, but the ISC notice from
+  `libnx/LICENSE.md` (copyright line and permission text) travels with the port, in the file
+  header next to the citation. The source files carry only `@copyright libnx Authors`; the
+  permission text is in that file. (`CLAUDE.md`, "Licensing", has the whole list.)
 - Cite what you port: `// Ported from Eden src/core/hle/service/hle_ipc.cpp @ cf654052 (GPL-3.0-or-later)`.
 - Reference paths in code, docs, issues and PRs are relative to the reference folder
   (`eden/src/...`), never absolute paths on someone's machine.

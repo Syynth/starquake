@@ -12,9 +12,10 @@
 //!
 //! - A **build dependency** is looked for in the build script only: `build.rs`, the file
 //!   `package.build` names, or nowhere when `build = false`.
-//! - Every other dependency is looked for in every `.rs` file below the package folder, skipping
-//!   folders named `target`. That includes `tests/`, `benches/` and `examples/`, and doc
-//!   comments, where doctests use dev-dependencies.
+//! - Every other dependency is looked for in every `.rs` file below the package folder except
+//!   the build script and the package's own `target/` folder (build output; a module folder
+//!   named `target` below `src/` is source and is read). That includes `tests/`, `benches/` and
+//!   `examples/`, and doc comments, where doctests use dev-dependencies.
 //!
 //! # Where it is imprecise
 //!
@@ -29,13 +30,12 @@
 //! Findings use the allow-list and its two-way rule (`[[allow_tables]]`, see
 //! [`crate::unused_deps::TABLES_SCOPE`]).
 
-use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::unused_deps::{Error, Unused, member_manifests, parse_manifest, tables_package};
-
-/// The dependency tables of a manifest or of one `[target.*]` table the check reads.
-const TABLES: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
+use crate::unused_deps::{
+    DEPENDENCY_TABLES, Error, Unused, member_manifests, parse_manifest, tables_package,
+};
+use crate::walk;
 
 /// One unused dependency in a table other than the top-level `[dependencies]`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -62,7 +62,8 @@ struct Declared {
 pub struct Sources {
     /// The build script's text; empty when the package has none.
     pub build_script: String,
-    /// The text of every other `.rs` file of the package, joined.
+    /// The text of every other `.rs` file of the package (not the build script, not `target/`),
+    /// joined.
     pub all: String,
 }
 
@@ -81,7 +82,7 @@ fn contains_word(text: &str, word: &str) -> bool {
 fn declared(manifest: &toml::Table) -> Vec<Declared> {
     let mut found = Vec::new();
     let mut read = |prefix: &str, table: &toml::Table| {
-        for kind in TABLES {
+        for kind in DEPENDENCY_TABLES {
             let Some(dependencies) = table.get(kind).and_then(toml::Value::as_table) else {
                 continue;
             };
@@ -149,57 +150,39 @@ pub fn unused_in_package(
     Ok(unused)
 }
 
-/// The build script of the package: `package.build` as a path, `build.rs` when the key is absent
-/// and the file exists, and none when `build = false`.
+/// The build script of the package: `package.build` as a path, `build.rs` when the key is
+/// `true`, or absent and the file exists, and none when `build = false`.
 fn build_script_path(manifest: &toml::Table, folder: &Path) -> Option<PathBuf> {
     let build = manifest
         .get("package")
         .and_then(|package| package.get("build"));
     match build {
         Some(toml::Value::String(path)) => Some(folder.join(path)),
+        // `build = true` is the default name, whether or not the file is there to be found.
+        Some(toml::Value::Boolean(true)) => Some(folder.join("build.rs")),
         Some(_) => None,
         None => Some(folder.join("build.rs")).filter(|path| path.is_file()),
     }
-}
-
-fn io_error(path: &Path) -> impl FnOnce(std::io::Error) -> Error {
-    let path = path.display().to_string();
-    move |source| Error::Io { path, source }
-}
-
-/// Every `.rs` file below `folder`, skipping folders named `target`, in path order.
-fn rust_files(folder: &Path, files: &mut Vec<PathBuf>) -> Result<(), Error> {
-    let mut entries = Vec::new();
-    for entry in fs::read_dir(folder).map_err(io_error(folder))? {
-        entries.push(entry.map_err(io_error(folder))?.path());
-    }
-    entries.sort();
-    for path in entries {
-        if path.is_dir() {
-            if path.file_name().is_some_and(|name| name != "target") {
-                rust_files(&path, files)?;
-            }
-        } else if path.extension().is_some_and(|extension| extension == "rs") {
-            files.push(path);
-        }
-    }
-    Ok(())
 }
 
 /// Reads the sources of the package whose manifest is `manifest_path`.
 fn read_sources(manifest_path: &Path, manifest: &str) -> Result<Sources, Error> {
     let folder = manifest_path.parent().unwrap_or_else(|| Path::new("."));
     let table = parse_manifest(&manifest_path.display().to_string(), manifest)?;
-    let read = |path: &Path| fs::read_to_string(path).map_err(io_error(path));
-    let build_script = match build_script_path(&table, folder) {
-        Some(path) => read(&path)?,
+    // Build output (`<package>/target`) is not source; neither is the build script, which is not
+    // one of the package's tests, benches or examples and so cannot use a dev dependency.
+    let script = build_script_path(&table, folder);
+    let build_script = match &script {
+        Some(path) => walk::read_text(path)?,
         None => String::new(),
     };
-    let mut files = Vec::new();
-    rust_files(folder, &mut files)?;
+    let target = folder.join("target");
+    let files = walk::rust_files(folder, &|path| {
+        path == target || script.as_deref() == Some(path)
+    })?;
     let mut all = String::new();
     for file in files {
-        all.push_str(&read(&file)?);
+        all.push_str(&walk::read_text(&file)?);
         all.push('\n');
     }
     Ok(Sources { build_script, all })
@@ -208,10 +191,10 @@ fn read_sources(manifest_path: &Path, manifest: &str) -> Result<Sources, Error> 
 /// Runs the check on every workspace member of the checkout at `root_dir`, in member order.
 pub fn check_table_dependencies(root_dir: &Path) -> Result<Vec<TableUnused>, Error> {
     let root_path = root_dir.join("Cargo.toml");
-    let root = fs::read_to_string(&root_path).map_err(io_error(&root_path))?;
+    let root = walk::read_text(&root_path)?;
     let mut found = Vec::new();
     for path in member_manifests(root_dir, &root)? {
-        let manifest = fs::read_to_string(&path).map_err(io_error(&path))?;
+        let manifest = walk::read_text(&path)?;
         let sources = read_sources(&path, &manifest)?;
         found.extend(unused_in_package(
             &path.display().to_string(),
@@ -225,6 +208,8 @@ pub fn check_table_dependencies(root_dir: &Path) -> Result<Vec<TableUnused>, Err
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
     use crate::unused_deps::{Allowlist, Scope, TABLES_SCOPE, Verdict, judge};
 
@@ -404,19 +389,17 @@ winres = "0.1"
             build_script_path(&parse("[package]\nbuild = false"), &root),
             None
         );
+        // `build = true` is the default name, `build.rs`, which exists here.
+        assert_eq!(
+            build_script_path(&parse("[package]\nbuild = true"), &root),
+            Some(root.join("build.rs"))
+        );
         fs::remove_dir_all(&root).unwrap();
     }
 
     /// A scratch checkout laid out as `files` says, for the test called `name`.
     fn checkout(name: &str, files: &[(&str, &str)]) -> PathBuf {
-        let root = std::env::temp_dir().join(format!("table-deps-{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        for (path, text) in files {
-            let path = root.join(path);
-            fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(path, text).unwrap();
-        }
-        root
+        walk::scratch_checkout("table-deps", name, files)
     }
 
     #[test]
@@ -458,6 +441,68 @@ winres = "0.1"
                 (format!("{TABLES_SCOPE}b"), "insta".to_owned()),
             ]
         );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_dev_dependency_named_only_by_the_build_script_is_unused() {
+        // The build script is not one of the package's tests or examples: a dev dependency that
+        // only it names is unused, whichever way the manifest points at the script.
+        for (build_key, script) in [
+            ("", "build.rs"),
+            ("build = true\n", "build.rs"),
+            ("build = \"gen/b.rs\"\n", "gen/b.rs"),
+        ] {
+            let manifest = format!(
+                "[package]\nname = \"a\"\n{build_key}[dev-dependencies]\ncc = \"1\"\n\
+                 [build-dependencies]\nsha = \"1\"\n"
+            );
+            let root = checkout(
+                "build-script",
+                &[
+                    ("Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n"),
+                    ("crates/a/Cargo.toml", manifest.as_str()),
+                    ("crates/a/src/lib.rs", ""),
+                    (
+                        &format!("crates/a/{script}"),
+                        "fn main() { cc::Build::new(); sha::x(); }",
+                    ),
+                ],
+            );
+            let got: Vec<(String, String)> = check_table_dependencies(&root)
+                .unwrap()
+                .into_iter()
+                .map(|found| (found.table, found.unused.dependency))
+                .collect();
+            assert_eq!(got, [pair("dev-dependencies", "cc")], "{build_key}");
+            fs::remove_dir_all(&root).unwrap();
+        }
+    }
+
+    #[test]
+    fn only_the_packages_own_target_folder_is_build_output() {
+        let root = checkout(
+            "target-module",
+            &[
+                ("Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n"),
+                (
+                    "crates/a/Cargo.toml",
+                    "[package]\nname = \"a\"\n[dev-dependencies]\ninsta = \"1\"\nproptest = \"1\"\n",
+                ),
+                ("crates/a/src/lib.rs", "mod target;"),
+                // `mod target;` with a test submodule is source.
+                ("crates/a/src/target.rs", "#[cfg(test)] mod tests;"),
+                ("crates/a/src/target/tests.rs", "use insta::x;"),
+                // The package's own `target/` is build output.
+                ("crates/a/target/debug/gen.rs", "use proptest::x;"),
+            ],
+        );
+        let got: Vec<(String, String)> = check_table_dependencies(&root)
+            .unwrap()
+            .into_iter()
+            .map(|found| (found.table, found.unused.dependency))
+            .collect();
+        assert_eq!(got, [pair("dev-dependencies", "proptest")]);
         fs::remove_dir_all(&root).unwrap();
     }
 
