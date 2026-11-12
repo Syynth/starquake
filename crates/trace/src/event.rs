@@ -110,7 +110,10 @@ pub enum EventKind {
     Svc {
         /// System-call number.
         id: u32,
-        /// Argument registers `x0`..`x7` as the guest passed them.
+        /// The call's decoded arguments, each in the slot of the register that carried it
+        /// (`x0`..`x7`) and truncated to its width; slots the call does not take are zero. A
+        /// call the producer has no register convention for carries all eight registers as the
+        /// guest passed them.
         args: [u64; SVC_ARG_COUNT],
         /// The result code returned to the guest.
         result: ResultCode,
@@ -235,8 +238,9 @@ impl fmt::Display for EventKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Svc { id, args, result } => {
-                // Trailing zero arguments are not shown: the stream does not record how many
-                // arguments a call takes, so this is a display convention only.
+                // Trailing zero arguments are not shown: slots a call does not take are zero,
+                // and the stream does not record how many it takes, so a last argument that is
+                // really zero is not shown either. A display convention only.
                 let shown = args.iter().rposition(|a| *a != 0).map_or(0, |i| i + 1);
                 write!(f, "svc {id:#x}(")?;
                 for (i, arg) in args.iter().take(shown).enumerate() {

@@ -145,7 +145,9 @@ a stack in the hypervisor backend's bring-up memory, rewrites its counter reads 
 loader's patcher, and runs it as one guest thread on one vCPU. Every `svc` goes through the
 kernel's dispatcher and is recorded in the event stream. The run ends when the guest calls
 `ExitProcess`, crashes, or reaches the timeout, and the artifacts folder gets `summary.json`,
-`trace.txt`, `events.bin`, `guest_log.txt`, and `crash.json` and `crash.txt` after a crash. The
+`trace.txt`, `events.bin`, `guest_log.txt`, and `crash.json` and `crash.txt` after a crash
+(`guest_log.txt` is an addition to the spec's table: an event keeps a log line's length and
+hash, not its text). The
 exit codes are the headless contract's (`specs/observability.md`). On other hosts the same
 command reports that no CPU backend is available (exit code 2).
 
@@ -162,7 +164,8 @@ it lives, with what replaces it:
 | The stack size, the TLS page and the registers the thread starts with are fixed by the loop; pointer-authentication keys are left as the backend creates them | `crates/core/src/image.rs`, `machine.rs` | Kernel slice 8, with the NPDM's values |
 | `ExitProcess` changes no kernel state: the dispatcher reports it and the loop stops | `crates/kernel/src/dispatch.rs` | Kernel slice 8 |
 | The dispatcher is told the calling thread and the event's time by its caller | `crates/kernel/src/dispatch.rs` (`Caller`) | Kernel slice 10 (the scheduler knows each core's thread) and the kernel's guest-time work |
-| Lifecycle, fault and guest-log events are recorded by the loop, outside the kernel lock | `crates/core/src/machine.rs` | The kernel's own recording points (slices 6 and 8) |
+| Lifecycle, fault and guest-log events are recorded by the loop, not the kernel (lifecycle and fault events outside the kernel lock; a guest-log event under it, from the loop's debug sink, with the same time as the call that wrote it) | `crates/core/src/machine.rs` | The kernel's own recording points (slices 6 and 8) |
+| What a run keeps in memory is capped by fixed numbers: the trace's first 100,000 events and the first 4 MiB of guest log text, each with a marker and a count in `summary.json` when it was cut short | `crates/core/src/machine.rs` (`Limits`) | The observability spec's size cap per run, with its flags |
 | A patched counter read and `GetSystemTick` share a rate (19.2 MHz) but not a zero point | `crates/core/src/system.rs` | The kernel's guest-time work (kernel spec, "Guest time") |
 | One VM per run; the hypervisor backend only | `crates/core/src/system.rs` | KVM and JIT backends; a `System` that outlives one program |
 | Crash reports have no backtrace or symbols, and an exception is only as detailed as the backend's exits | `crates/core/src/crash.rs` | The crash-report step of the observability spec; richer exits (#36) |

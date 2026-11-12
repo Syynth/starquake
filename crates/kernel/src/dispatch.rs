@@ -18,6 +18,13 @@
 //!   dispatch that returns to the guest ends in one `EventKind::Svc` event, recorded with the
 //!   caller's [`Recorder`] while the lock is still held. The recorder assigns the event's `seq`
 //!   there, under the kernel lock, so sorting by `seq` gives the kernel's order. The event's
+//!   `args` are the call's decoded arguments (observability spec: "system call, with decoded
+//!   arguments"): each input of the call's [`Convention`], truncated to its kind, in the slot of
+//!   the register that carried it, and zero everywhere else. What an earlier call left in a
+//!   register the call does not take never reaches the event, so a trace does not depend on it.
+//!   A number with no convention (an unlisted number, or a listed call whose row is not in the
+//!   table yet) keeps all eight registers as passed: nothing says which are arguments, and the
+//!   trace is the to-do list for such calls. The event's
 //!   `result` is the call's `Result` output (the word in `x0` when the call's convention begins
 //!   with one, or [`KernelError::NotImplemented`]); a call with no `Result` output
 //!   (`GetSystemTick`, `ExitProcess`) records success, and its other outputs are not in the
@@ -132,9 +139,13 @@ pub struct Caller<'a> {
     /// tracks which thread each core is running (kernel slice 10), the dispatcher reads it from
     /// there and this field goes away.
     pub thread: ThreadId,
-    /// When the call was made, for the event's `time`. The core loop supplies it; the dispatcher
-    /// does not read [`Env::now`] for it, so recording an event never adds a clock reading to the
-    /// replay log. The recorder does not interpret the unit.
+    /// When the call was made, for the event's `time`. The dispatcher does not read
+    /// [`Env::now`] for it, so recording an event never adds a clock reading to the replay log.
+    ///
+    /// PROVISIONAL (walking skeleton, #74): the core loop supplies the stamp, in a unit of its
+    /// own choosing that the recorder does not interpret. The kernel owns guest ticks (kernel
+    /// spec, "Guest time"); once it keeps guest time itself the dispatcher stamps events from
+    /// that and this field goes away.
     pub time: GuestTicks,
     /// The injectable environment (observability spec, rule 1).
     pub env: &'a dyn Env,
@@ -172,7 +183,8 @@ pub struct Record {
     pub number: u16,
     /// The call, if the number is listed.
     pub id: Option<SvcId>,
-    /// `x0`-`x7` as the guest passed them, before the call.
+    /// `x0`-`x7` as the guest passed them, before the call: every register, whether or not the
+    /// call takes it. (The recorded event carries the decoded arguments instead.)
     pub args: [u64; SVC_ARG_COUNT],
     /// How it ended.
     pub outcome: Outcome,
@@ -245,11 +257,27 @@ fn record_point(record: &Record, regs: &GuestRegs, caller: &Caller<'_>) {
         caller.thread,
         EventKind::Svc {
             id: u32::from(record.number),
-            args: record.args,
+            args: recorded_args(record),
             // The one place a kernel result becomes the event stream's result word.
             result: starquake_trace::ResultCode(result.raw()),
         },
     );
+}
+
+/// The arguments a dispatch is recorded with: the call's inputs, decoded with its convention,
+/// or every register as passed when the number has no convention (see the module docs).
+fn recorded_args(record: &Record) -> [u64; SVC_ARG_COUNT] {
+    let Some(convention) = record.id.and_then(SvcId::convention) else {
+        return record.args;
+    };
+    let mut args = [0; SVC_ARG_COUNT];
+    for input in convention.inputs {
+        let index = usize::from(input.reg);
+        if let (Some(slot), Some(passed)) = (args.get_mut(index), record.args.get(index)) {
+            *slot = input.kind.truncate(*passed);
+        }
+    }
+    args
 }
 
 /// The result word a finished dispatch is recorded with, or `None` if the call never returned to

@@ -22,6 +22,11 @@ pub const EVENTS_FILE: &str = "events.bin";
 /// The guest's `OutputDebugString` lines, one per line of the file, with every byte that is not
 /// printable ASCII escaped (`\n`, `\\`, `\xNN`), so a line break inside a guest string cannot be
 /// mistaken for the end of one.
+///
+/// A run keeps a limited amount of guest log text. When the guest wrote more, the file holds
+/// the first lines and ends with `[truncated: <n> later lines were not kept]`. A guest could
+/// print that text itself, so the authority is `guest_log_lines_dropped` in `summary.json`.
+/// (`trace.txt` ends with a line of its own when it was cut short; see `trace_events_dropped`.)
 pub const GUEST_LOG_FILE: &str = "guest_log.txt";
 /// The crash report as data. Only present when the guest crashed.
 pub const CRASH_JSON_FILE: &str = "crash.json";
@@ -79,6 +84,13 @@ pub fn write(folder: &Path, report: &RunReport) -> Result<(), ArtifactError> {
     for line in &report.guest_log {
         guest_log.extend(line.escape_ascii());
         guest_log.push(b'\n');
+    }
+    if report.guest_log_dropped > 0 {
+        let marker = format!(
+            "[truncated: {} later lines were not kept]\n",
+            report.guest_log_dropped
+        );
+        guest_log.extend(marker.bytes());
     }
     put(GUEST_LOG_FILE, &guest_log)?;
 

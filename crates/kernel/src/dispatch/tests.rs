@@ -121,10 +121,14 @@ fn recorder() -> (Recorder, Arc<VecSink>) {
     (recorder, sink)
 }
 
-/// The event a call with these arguments and this result must have been recorded as.
-fn svc_event(seq: u64, core: u8, number: u16, args: &GuestRegs, result: ResultCode) -> Event {
-    let mut passed = [0; SVC_ARG_COUNT];
-    passed.copy_from_slice(&args.x[..SVC_ARG_COUNT]);
+/// The event a call must have been recorded as, with `args` as the event carries them.
+fn svc_event(
+    seq: u64,
+    core: u8,
+    number: u16,
+    args: [u64; SVC_ARG_COUNT],
+    result: ResultCode,
+) -> Event {
     Event {
         seq,
         time: TIME,
@@ -132,7 +136,7 @@ fn svc_event(seq: u64, core: u8, number: u16, args: &GuestRegs, result: ResultCo
         thread: THREAD,
         kind: EventKind::Svc {
             id: u32::from(number),
-            args: passed,
+            args,
             result: starquake_trace::ResultCode(result.raw()),
         },
     }
@@ -475,52 +479,105 @@ fn exit_process_ends_the_process_and_writes_no_register() {
 }
 
 #[test]
-fn every_call_that_returns_is_recorded_once_with_its_arguments_and_result() {
+fn every_call_that_returns_is_recorded_once_with_its_decoded_arguments_and_result() {
     let memory = FlatMemory::new(BASE, 0x100);
     memory.write(BASE, b"line").unwrap();
     let not_implemented = KernelError::NotImplemented.code();
-    // (number, x0, x1, the result the event must carry)
+    // Every register holds something before each call (see `regs`), as a guest's registers do:
+    // what an earlier call left behind must not reach the event.
+    let stale = regs();
+    let raw = |x0: u64, x1: u64| {
+        let mut all = [0; SVC_ARG_COUNT];
+        all.copy_from_slice(&stale.x[..SVC_ARG_COUNT]);
+        all[0] = x0;
+        all[1] = x1;
+        all
+    };
+    // A handle is 32 bits: the upper half of its register is not part of the argument.
+    let handle_register = 0xdead_beef_0000_8001;
+    // (number, x0, x1, the arguments the event must carry, the result it must carry)
     let calls = [
-        // A `Result` output: success, then an error (one byte past the end of mapped memory).
+        // Two arguments and a `Result` output: success, then an error (one byte past the end
+        // of mapped memory).
         (
             SvcId::OutputDebugString.number(),
             BASE,
             4,
+            [BASE, 4, 0, 0, 0, 0, 0, 0],
             ResultCode::SUCCESS,
         ),
         (
             SvcId::OutputDebugString.number(),
             BASE + 0xff,
             2,
+            [BASE + 0xff, 2, 0, 0, 0, 0, 0, 0],
             KernelError::InvalidCurrentMemory.code(),
         ),
-        // Outputs that are not a `Result` (ticks, a core number) are not recorded as one.
-        (SvcId::GetSystemTick.number(), 1, 2, ResultCode::SUCCESS),
+        // No arguments. Outputs that are not a `Result` (ticks, a core number) are not
+        // recorded as one.
+        (
+            SvcId::GetSystemTick.number(),
+            1,
+            2,
+            [0; SVC_ARG_COUNT],
+            ResultCode::SUCCESS,
+        ),
         (
             SvcId::GetCurrentProcessorNumber.number(),
             3,
             4,
+            [0; SVC_ARG_COUNT],
             ResultCode::SUCCESS,
         ),
-        // A void call.
-        (SvcId::ExitProcess.number(), 5, 6, ResultCode::SUCCESS),
-        // A deferred call and an unlisted number.
-        (SvcId::SetHeapSize.number(), 7, 8, not_implemented),
-        (u16::MAX, 9, 10, not_implemented),
+        // A void call with no arguments.
+        (
+            SvcId::ExitProcess.number(),
+            5,
+            6,
+            [0; SVC_ARG_COUNT],
+            ResultCode::SUCCESS,
+        ),
+        // Deferred calls are decoded too. SetHeapSize's one argument is in x1, not x0.
+        (
+            SvcId::SetHeapSize.number(),
+            7,
+            8,
+            [0, 8, 0, 0, 0, 0, 0, 0],
+            not_implemented,
+        ),
+        (
+            SvcId::CloseHandle.number(),
+            handle_register,
+            9,
+            [0x8001, 0, 0, 0, 0, 0, 0, 0],
+            not_implemented,
+        ),
+        // A listed call with no convention entry yet, and an unlisted number: nothing says
+        // which registers are arguments, so all eight are kept as passed.
+        (
+            SvcId::CreateSession.number(),
+            10,
+            11,
+            raw(10, 11),
+            not_implemented,
+        ),
+        (u16::MAX, 12, 13, raw(12, 13), not_implemented),
     ];
-    for (number, x0, x1, result) in calls {
+    assert_eq!(SvcId::CreateSession.convention(), None);
+    for (number, x0, x1, args, result) in calls {
         let (recorder, events) = recorder();
         let mut sink = Collect::default();
-        let mut regs = regs();
+        let mut regs = stale.clone();
         regs.x[0] = x0;
         regs.x[1] = x1;
-        let before = regs.clone();
-        dispatch_recorded(number, &mut regs, 3, &memory, &mut sink, &recorder);
+        let record = dispatch_recorded(number, &mut regs, 3, &memory, &mut sink, &recorder);
         assert_eq!(
             events.events(),
-            [svc_event(0, 3, number, &before, result)],
+            [svc_event(0, 3, number, args, result)],
             "svc {number:#x}"
         );
+        // The dispatch's own record still has the registers as passed.
+        assert_eq!(record.args, raw(x0, x1), "svc {number:#x}");
     }
 }
 

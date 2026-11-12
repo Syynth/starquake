@@ -289,20 +289,31 @@ fn an_endless_loop_is_ended_by_the_timeout() {
 
 #[test]
 fn a_program_too_large_for_guest_memory_is_an_emulator_error() {
-    // More `.bss` than the backend's bring-up RAM holds.
+    /// More `.bss` than the backend's bring-up RAM holds; a whole number of pages.
+    const BSS: u32 = 64 << 20;
     let file = NroBuilder::new(&[a64::nop()])
-        .bss_size(64 << 20)
+        .bss_size(BSS)
         .build()
         .unwrap();
-    let Some(report) = run(&file, GENEROUS) else {
+    // What the layout costs is read off a run that fits, not restated: the TLS block and the
+    // stack are in its memory map, and guest RAM runs from the image to the end of the stack.
+    let Some(fits) = run(&programs::hello().unwrap(), GENEROUS) else {
         return;
     };
-    // One page of text, 64 MiB of `.bss`, the TLS page and the 1 MiB stack, against the
-    // backend's 16 MiB of bring-up RAM.
-    let error = Error::Load(LoadError::DoesNotFit {
-        needed: 0x1000 + (64 << 20) + 0x1000 + (1 << 20),
-        available: 16 << 20,
-    });
+    let mapping = |name: &str| {
+        fits.memory_map
+            .iter()
+            .find(|mapping| mapping.name == name)
+            .expect("the mapping is in the memory map")
+    };
+    let size = |name: &str| mapping(name).end - mapping(name).start;
+    let available = mapping("stack").end - image_base(&fits);
+    // The image is already whole pages, as the builder writes it.
+    let needed = file.len() as u64 + u64::from(BSS) + size("tls") + size("stack");
+    assert!(needed > available);
+
+    let report = run(&file, GENEROUS).unwrap();
+    let error = Error::Load(LoadError::DoesNotFit { needed, available });
     assert_eq!(report.exit, ExitReason::EmulatorError(error.to_string()));
     assert_eq!(report.exit_code(), exit_code::EMULATOR_ERROR);
     assert_eq!(report.trace, "");

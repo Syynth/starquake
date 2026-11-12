@@ -7,14 +7,15 @@ use starquake_cpu::testing::ScriptedVcpu;
 use starquake_cpu::{Exit, Interrupter, Vcpu};
 use starquake_kernel::result::KernelError;
 use starquake_kernel::svc::SvcId;
-use starquake_memory::FlatMemory;
+use starquake_kernel::svc::tick::CNTFREQ;
+use starquake_memory::{Fault, FlatMemory};
 use starquake_testkit::programs;
-use starquake_trace::{Dump, Event, EventKind, FaultAction, LifecyclePhase};
+use starquake_trace::{Dump, DumpError, Event, EventKind, FaultAction, LifecyclePhase};
 
 use super::*;
 use crate::crash::Location;
 use crate::image::{Program, place};
-use crate::report::exit_code;
+use crate::report::{empty_dump, exit_code};
 
 const RAM_BASE: u64 = 0x8000_0000;
 /// Room for a small image, its TLS block and the stack.
@@ -57,6 +58,45 @@ impl Guest {
     }
 }
 
+/// Where the tests put strings for the guest to print: free memory between the image and the
+/// stack.
+const SCRATCH: u64 = RAM_BASE + 0x8_0000;
+
+/// Guest memory whose every read takes a while, so two clock readings on either side of one
+/// cannot agree by accident.
+struct SlowMemory<'a>(&'a FlatMemory);
+
+impl GuestMemory for SlowMemory<'_> {
+    fn read(&self, va: u64, buf: &mut [u8]) -> Result<(), Fault> {
+        std::thread::sleep(Duration::from_millis(2));
+        self.0.read(va, buf)
+    }
+
+    fn write(&self, va: u64, data: &[u8]) -> Result<(), Fault> {
+        self.0.write(va, data)
+    }
+}
+
+/// A script that prints each of `lines` with `OutputDebugString` and then exits. The lines are
+/// written back to back at [`SCRATCH`] in `memory`.
+fn printing(memory: &FlatMemory, lines: &[&[u8]]) -> ScriptedVcpu {
+    let mut vcpu = ScriptedVcpu::new();
+    let mut at = SCRATCH;
+    for line in lines {
+        memory.write(at, line).unwrap();
+        let (address, len) = (at, line.len() as u64);
+        vcpu = vcpu.then(
+            move |regs| {
+                regs.x[0] = address;
+                regs.x[1] = len;
+            },
+            svc(SvcId::OutputDebugString),
+        );
+        at += len;
+    }
+    vcpu.then(|_| {}, svc(SvcId::ExitProcess))
+}
+
 fn svc(id: SvcId) -> Exit {
     Exit::Svc(id.number())
 }
@@ -92,6 +132,8 @@ fn the_guest_programs_use_the_kernels_system_call_numbers() {
         programs::SVC_OUTPUT_DEBUG_STRING,
         u32::from(SvcId::OutputDebugString.number())
     );
+    // And the rate the example's counter program expects is the one the kernel gives a process.
+    assert_eq!(programs::COUNTER_HZ, CNTFREQ);
 }
 
 #[test]
@@ -145,7 +187,9 @@ fn a_guest_that_prints_two_lines_and_exits_is_reported_in_full() {
         call(output, first_at, first_len),
         EventKind::guest_log(second),
         call(output, second_at, second_len),
-        call(exit, 0, second_len),
+        // ExitProcess takes no arguments: what the calls before it left in x0 and x1 is not
+        // part of the event.
+        call(exit, 0, 0),
         lifecycle(LifecyclePhase::ProcessExit),
     ];
     assert_eq!(recorded(&report), expected);
@@ -376,4 +420,200 @@ fn a_string_the_guest_cannot_read_is_an_error_result_and_no_log_line() {
         "{}",
         report.trace
     );
+}
+
+#[test]
+fn a_log_line_and_the_call_that_wrote_it_carry_one_time() {
+    let guest = Guest::new(&programs::hello().unwrap());
+    let mut vcpu = printing(&guest.memory, &[b"one", b"two"]);
+    // Reading the string takes 2 ms, far longer than a tick of the event clock: a second clock
+    // reading for the log line would be later than the call's.
+    let report = run(
+        &mut vcpu,
+        &SlowMemory(&guest.memory),
+        &guest.placed,
+        &RunOptions::default(),
+        Instant::now(),
+    );
+    assert_eq!(report.guest_log, [b"one".to_vec(), b"two".to_vec()]);
+    let events = Dump::from_bytes(&report.events).unwrap().merged();
+    let mut pairs = 0;
+    for pair in events.windows(2) {
+        if matches!(pair[0].kind, EventKind::GuestLog { .. }) {
+            assert!(matches!(pair[1].kind, EventKind::Svc { .. }));
+            assert_eq!(pair[0].time, pair[1].time, "{pair:?}");
+            pairs += 1;
+        }
+    }
+    assert_eq!(pairs, 2);
+    // Time still moves from one call to the next.
+    let times: Vec<_> = events.iter().map(|event| event.time).collect();
+    assert!(times.is_sorted(), "{times:?}");
+    assert!(times.first() < times.last(), "{times:?}");
+}
+
+#[test]
+fn a_crash_report_quotes_the_newest_events_and_no_more_than_its_window() {
+    let guest = Guest::new(&programs::hello().unwrap());
+    // More calls than the window holds, then the crash.
+    let calls = LAST_EVENTS + 8;
+    let mut vcpu = ScriptedVcpu::new();
+    for _ in 0..calls {
+        vcpu = vcpu.then(|_| {}, svc(SvcId::GetCurrentProcessorNumber));
+    }
+    let address = programs::CRASH_ADDRESS;
+    let vcpu = vcpu.then(
+        |_| {},
+        Exit::DataAbort {
+            address,
+            write: true,
+        },
+    );
+    let report = guest.run(vcpu, &RunOptions::default());
+    // The process start, the calls, and the fault.
+    let total = calls + 2;
+    assert_eq!(recorded(&report).len(), total);
+    let quoted = &report.crash().expect("a crash report").last_events;
+    assert_eq!(quoted.len(), LAST_EVENTS);
+    // The window ends at the newest event, the fault, and holds the events just before it in
+    // order.
+    let fault = EventKind::Fault {
+        address,
+        write: true,
+        action: FaultAction::Fatal,
+    };
+    assert_eq!(
+        quoted.last(),
+        Some(&format!("#{} core 0 thread 1: {fault}", total - 1))
+    );
+    for (line, seq) in quoted.iter().zip(total - LAST_EVENTS..total) {
+        assert!(line.starts_with(&format!("#{seq} core 0 ")), "{line}");
+    }
+}
+
+#[test]
+fn the_trace_and_the_guest_log_stop_growing_at_their_limits() {
+    let guest = Guest::new(&programs::hello().unwrap());
+    let lines: [&[u8]; 4] = [b"aaaa", b"bbbbbb", b"cc", b"d"];
+    // The first two lines are exactly the byte limit. The third does not fit, and the fourth,
+    // which would, comes after a dropped line, so it is not kept either: what is kept is a
+    // prefix of what the guest wrote.
+    let limits = Limits {
+        trace_events: 4,
+        guest_log_bytes: lines[0].len() + lines[1].len(),
+    };
+    let mut vcpu = printing(&guest.memory, &lines);
+    let report = run_within(
+        &mut vcpu,
+        &guest.memory,
+        &guest.placed,
+        &RunOptions::default(),
+        Instant::now(),
+        limits,
+    );
+    assert_eq!(report.exit, ExitReason::ProcessExited);
+    assert_eq!(report.guest_log, [lines[0].to_vec(), lines[1].to_vec()]);
+    assert_eq!(report.guest_log_dropped, 2);
+
+    // Eleven events in all: the start, a log line and a call for each of the four lines, the
+    // exit call and the exit. The flight recorder has every one.
+    let events = recorded(&report);
+    assert_eq!(events.len(), 11);
+    // The trace keeps the first four and says how many it left out.
+    let kept: Vec<String> = events[..limits.trace_events]
+        .iter()
+        .map(|kind| format!("  {kind}\n"))
+        .collect();
+    assert_eq!(
+        report.trace,
+        format!(
+            "thread 1\n{}truncated: 7 later events are not shown (the trace keeps its first 4)\n",
+            kept.concat()
+        )
+    );
+    assert_eq!(report.trace_events_dropped, 7);
+    assert_eq!(report.summary().guest_log_lines, 4);
+    assert_eq!(report.summary().guest_log_lines_dropped, 2);
+    assert_eq!(report.summary().trace_events_dropped, 7);
+    // Counts are of what the guest did, not of what was kept.
+    assert_eq!(report.system_calls["OutputDebugString"], 4);
+}
+
+#[test]
+fn a_run_within_its_limits_is_not_truncated() {
+    let guest = Guest::new(&programs::hello().unwrap());
+    let lines: [&[u8]; 2] = [b"aaaa", b"bbbbbb"];
+    // Start, two lines with their calls, the exit call and the exit: seven events, ten bytes.
+    let limits = Limits {
+        trace_events: 7,
+        guest_log_bytes: 10,
+    };
+    let mut vcpu = printing(&guest.memory, &lines);
+    let report = run_within(
+        &mut vcpu,
+        &guest.memory,
+        &guest.placed,
+        &RunOptions::default(),
+        Instant::now(),
+        limits,
+    );
+    assert_eq!(report.guest_log, [lines[0].to_vec(), lines[1].to_vec()]);
+    assert_eq!(
+        (report.guest_log_dropped, report.trace_events_dropped),
+        (0, 0)
+    );
+    assert!(!report.trace.contains("truncated"), "{}", report.trace);
+    assert_eq!(report.trace.lines().count(), 1 + limits.trace_events);
+    // The limits of a real run are the documented ones.
+    assert_eq!(
+        Limits::DEFAULT,
+        Limits {
+            trace_events: 100_000,
+            guest_log_bytes: 4 << 20
+        }
+    );
+}
+
+#[test]
+fn a_flight_recorder_that_cannot_be_written_out_is_reported_however_the_run_ended() {
+    let lost = || Err(DumpError::BadMagic);
+    let message = format!(
+        "the flight recorder could not be written out: {}",
+        DumpError::BadMagic
+    );
+    // A clean exit does not stay one.
+    assert_eq!(
+        settle_dump(lost(), ExitReason::ProcessExited),
+        (
+            ExitReason::EmulatorError(message.clone()),
+            empty_dump(),
+            Some(message.clone())
+        )
+    );
+    // A timeout, a crash and an emulator error keep their reason, and the loss is still said.
+    let crash = ExitReason::GuestCrashed(Box::new(CrashReport::new(
+        Exception::UndefinedInstruction,
+        &GuestRegs::default(),
+        &[],
+        &[],
+        Vec::new(),
+        &[],
+    )));
+    for exit in [
+        ExitReason::Timeout,
+        crash,
+        ExitReason::EmulatorError("the vCPU failed".into()),
+    ] {
+        assert_eq!(
+            settle_dump(lost(), exit.clone()),
+            (exit, empty_dump(), Some(message.clone()))
+        );
+    }
+    // A dump that was written is passed through.
+    assert_eq!(
+        settle_dump(Ok(vec![1, 2, 3]), ExitReason::Timeout),
+        (ExitReason::Timeout, vec![1, 2, 3], None)
+    );
+    // The file is still a readable dump, with nothing in it.
+    assert_eq!(Dump::from_bytes(&empty_dump()), Ok(Dump::new(Vec::new())));
 }

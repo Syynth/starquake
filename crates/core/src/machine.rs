@@ -28,12 +28,19 @@
 //! - **Every abort is fatal.** There is no address space to consult, so a data abort always ends
 //!   the run. Kernel slice 6 (memory blocks) decides between lazy backing, write tracking and a
 //!   crash.
-//! - **Lifecycle, fault and guest-log events are recorded here**, outside the kernel lock, which
-//!   is harmless with one thread. They move to the kernel's own recording points (process and
-//!   thread lifecycle in slice 8, faults in slice 6).
+//! - **Lifecycle, fault and guest-log events are recorded here**, not by the kernel. Lifecycle
+//!   and fault events are recorded outside the kernel lock, which is harmless with one thread.
+//!   A guest-log event is recorded by this loop's [`DebugSink`] while the dispatcher runs
+//!   `OutputDebugString`, so under the kernel lock, just before the call's own event. All three
+//!   move to the kernel's own recording points (process and thread lifecycle in slice 8, faults
+//!   in slice 6).
 //! - **Event times** are host nanoseconds since the run started, converted with the kernel's
-//!   tick conversion ([`nanos_to_ticks`]). Nothing reads them back; the kernel's guest-time work
-//!   (kernel spec, "Guest time") decides the real stamp.
+//!   tick conversion ([`nanos_to_ticks`]). The clock is read once per `svc`: the call's event
+//!   and a log line it writes carry the same time. Nothing reads the times back; the kernel's
+//!   guest-time work (kernel spec, "Guest time") decides the real stamp.
+//! - **What a run keeps in memory is capped by fixed numbers** ([`Limits`]): the golden trace
+//!   keeps its first events and the guest log its first lines, and both say when they stopped.
+//!   The observability spec's size cap per run, with its own flags, replaces the constants.
 //! - **The environment** is live, with a fixed random seed and nothing recorded to disk; the
 //!   `--clock`, `--seed` and `--record` flags of the headless contract are not built.
 
@@ -52,13 +59,13 @@ use starquake_kernel::svc::tick::nanos_to_ticks;
 use starquake_kernel::tables::{AddressSpace, Processes, Scheduler};
 use starquake_memory::GuestMemory;
 use starquake_trace::{
-    EventKind, FaultAction, FlightRecorder, GuestTicks, LifecyclePhase, LiveEnv, Recorder,
-    SystemClock, TextSink, ThreadId,
+    DumpError, EventKind, FaultAction, FlightRecorder, GuestTicks, LifecyclePhase, LiveEnv,
+    Recorder, SystemClock, TextSink, ThreadId,
 };
 
 use crate::crash::{CrashReport, Exception};
 use crate::image::Placement;
-use crate::report::{ExitReason, RunOptions, RunReport};
+use crate::report::{ExitReason, RunOptions, RunReport, empty_dump};
 
 /// The core the one vCPU stands for.
 pub(crate) const CORE: u8 = 0;
@@ -72,6 +79,29 @@ const FLIGHT_CAPACITY: usize = 4096;
 const LAST_EVENTS: usize = 32;
 /// Seed of the environment's random numbers (the `--seed` flag is not built).
 const RANDOM_SEED: u64 = 0;
+
+/// How much of a run is kept in memory for its report. A guest can make system calls and write
+/// log lines for as long as it runs, and a run has no timeout unless it is given one, so without
+/// these a looping guest would grow the host's memory without bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Limits {
+    /// Events the golden trace keeps: the first this many; later ones are counted, and the
+    /// trace ends with a line saying how many.
+    pub(crate) trace_events: usize,
+    /// Bytes of guest log text kept: whole lines, from the first, while their total stays at
+    /// or below this. From the first line that does not fit, lines are counted and not kept.
+    pub(crate) guest_log_bytes: usize,
+}
+
+impl Limits {
+    /// The limits of a real run: 100,000 trace events (about 10 MiB of events) and 4 MiB of
+    /// guest log text. Starquake's own numbers; the observability spec asks for a size cap per
+    /// run without fixing one.
+    pub(crate) const DEFAULT: Self = Self {
+        trace_events: 100_000,
+        guest_log_bytes: 4 << 20,
+    };
+}
 
 /// Stamps events with the time since the run started (see the module docs).
 struct RunClock {
@@ -95,24 +125,49 @@ struct Session<'a> {
 }
 
 impl Session<'_> {
-    /// Records an event on the one core and thread.
+    /// Records an event on the one core and thread, stamped with the time now.
     fn record(&self, kind: EventKind) {
-        self.recorder
-            .record(self.clock.now(), CORE, MAIN_THREAD, kind);
+        self.record_at(self.clock.now(), kind);
+    }
+
+    /// Records an event on the one core and thread, stamped with `time`.
+    fn record_at(&self, time: GuestTicks, kind: EventKind) {
+        self.recorder.record(time, CORE, MAIN_THREAD, kind);
     }
 }
 
 /// Collects what the guest writes with `OutputDebugString` and records each line as a guest-log
 /// event.
 struct GuestLog<'a> {
+    /// The lines kept: a prefix of what the guest wrote.
     lines: Vec<Vec<u8>>,
+    /// Bytes in `lines`.
+    kept_bytes: usize,
+    /// The most bytes `lines` may hold ([`Limits::guest_log_bytes`]).
+    limit: usize,
+    /// Lines that were not kept: the first that did not fit, and every line after it.
+    dropped: u64,
+    /// The time of the `svc` being dispatched, which its log line is stamped with.
+    time: GuestTicks,
     session: &'a Session<'a>,
 }
 
 impl DebugSink for GuestLog<'_> {
     fn output(&mut self, message: &[u8]) {
-        self.session.record(EventKind::guest_log(message));
-        self.lines.push(message.to_vec());
+        // The event is recorded either way: it is fixed-size, and the trace has its own limit.
+        self.session
+            .record_at(self.time, EventKind::guest_log(message));
+        let fits = self
+            .kept_bytes
+            .checked_add(message.len())
+            .filter(|total| *total <= self.limit);
+        match fits {
+            Some(total) if self.dropped == 0 => {
+                self.kept_bytes = total;
+                self.lines.push(message.to_vec());
+            }
+            _ => self.dropped = self.dropped.saturating_add(1),
+        }
     }
 }
 
@@ -226,6 +281,18 @@ pub(crate) fn run<V: Vcpu>(
     options: &RunOptions,
     started: Instant,
 ) -> RunReport {
+    run_within(vcpu, memory, placed, options, started, Limits::DEFAULT)
+}
+
+/// [`run`], keeping no more of the run in memory than `limits` allows.
+pub(crate) fn run_within<V: Vcpu>(
+    vcpu: &mut V,
+    memory: &dyn GuestMemory,
+    placed: &Placement,
+    options: &RunOptions,
+    started: Instant,
+    limits: Limits,
+) -> RunReport {
     let session = Session {
         memory,
         placed,
@@ -233,17 +300,21 @@ pub(crate) fn run<V: Vcpu>(
         clock: RunClock { started },
         recorder: Recorder::new(),
     };
-    let text = Arc::new(TextSink::new());
+    let text = Arc::new(TextSink::with_limit(limits.trace_events));
     let flight = Arc::new(FlightRecorder::new(usize::from(CORE) + 1, FLIGHT_CAPACITY));
     session.recorder.add_sink(Arc::clone(&text));
     session.recorder.add_sink(Arc::clone(&flight));
 
     let mut log = GuestLog {
         lines: Vec::new(),
+        kept_bytes: 0,
+        limit: limits.guest_log_bytes,
+        dropped: 0,
+        time: session.clock.now(),
         session: &session,
     };
     let mut tally = Tally::default();
-    let mut exit = match drive(vcpu, &session, &mut log, &mut tally) {
+    let exit = match drive(vcpu, &session, &mut log, &mut tally) {
         Ending::Exited => ExitReason::ProcessExited,
         Ending::TimedOut => ExitReason::Timeout,
         Ending::Failed(message) => {
@@ -263,25 +334,47 @@ pub(crate) fn run<V: Vcpu>(
             &options.command_line,
         ))),
     };
-    let events = flight.dump().unwrap_or_else(|error| {
-        // Losing the dump must not pass for a clean run.
-        if exit == ExitReason::ProcessExited {
-            exit = ExitReason::EmulatorError(format!(
-                "the flight recorder could not be written out: {error}"
-            ));
-        }
-        Vec::new()
-    });
+    let (exit, events, events_error) = settle_dump(flight.dump(), exit);
     RunReport {
         exit,
         duration: started.elapsed(),
         guest_log: log.lines,
+        guest_log_dropped: log.dropped,
         trace: text.render(),
+        trace_events_dropped: text.dropped(),
         events,
+        events_error,
         system_calls: tally.calls,
         stubbed: tally.stubbed,
         patched_counter_reads: placed.counter_reads.clone(),
         memory_map: placed.mappings.clone(),
+    }
+}
+
+/// Settles what `events.bin` holds when the flight recorder could or could not be written out,
+/// and whether losing it changes how the run ended. Returns the exit reason, the dump's bytes,
+/// and why the dump was lost if it was.
+///
+/// A lost dump is never silent. It is logged, the report says why (`events_error` in
+/// `summary.json`), and `events.bin` holds a dump with no cores. A run that otherwise exited
+/// cleanly becomes an emulator error; a crash, a timeout and an emulator error keep their own
+/// reason, which matters more.
+fn settle_dump(
+    dump: Result<Vec<u8>, DumpError>,
+    exit: ExitReason,
+) -> (ExitReason, Vec<u8>, Option<String>) {
+    match dump {
+        Ok(events) => (exit, events, None),
+        Err(error) => {
+            let message = format!("the flight recorder could not be written out: {error}");
+            tracing::error!(%error, "the flight recorder could not be written out");
+            let exit = if exit == ExitReason::ProcessExited {
+                ExitReason::EmulatorError(message.clone())
+            } else {
+                exit
+            };
+            (exit, empty_dump(), Some(message))
+        }
     }
 }
 
@@ -329,13 +422,16 @@ fn drive<V: Vcpu>(
                     Ok(regs) => regs,
                     Err(error) => return vcpu_failed(error),
                 };
+                // One reading for the call's event and for a log line the call writes.
+                let time = session.clock.now();
+                log.time = time;
                 let record = dispatcher.dispatch(
                     number,
                     &mut regs,
                     &mut Caller {
                         core: CORE,
                         thread: MAIN_THREAD,
-                        time: session.clock.now(),
+                        time,
                         env: &env,
                         memory: session.memory,
                         debug: log,

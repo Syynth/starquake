@@ -66,8 +66,11 @@ mod support {
                 b"two\nlines and a \\".to_vec(),
                 vec![0xff, b'x', 0x00],
             ],
+            guest_log_dropped: 0,
             trace: "thread 1\n  lifecycle ProcessStart 1\n".into(),
+            trace_events_dropped: 0,
             events: dump().to_bytes().unwrap(),
+            events_error: None,
             system_calls: BTreeMap::from([("OutputDebugString".to_owned(), 3)]),
             stubbed: BTreeSet::new(),
             patched_counter_reads: vec![0x8000_00b0],
@@ -143,6 +146,34 @@ fn a_clean_run_writes_the_summary_trace_events_and_guest_log_and_no_crash_report
         read(&folder, GUEST_LOG_FILE),
         b"plain\ntwo\\nlines and a \\\\\n\\xffx\\x00\n"
     );
+}
+
+#[test]
+fn a_run_that_reached_its_limits_says_so_in_the_guest_log_and_the_summary() {
+    let folder = folder("truncated");
+    let report = RunReport {
+        guest_log: vec![b"kept".to_vec()],
+        guest_log_dropped: 7,
+        trace_events_dropped: 12,
+        ..clean()
+    };
+    artifacts::write(&folder, &report).unwrap();
+    // The kept lines, then one line that no kept line can be mistaken for only by its place:
+    // it is the last, and the summary says whether it is there.
+    assert_eq!(
+        read(&folder, GUEST_LOG_FILE),
+        b"kept\n[truncated: 7 later lines were not kept]\n"
+    );
+    let summary = json(&folder, SUMMARY_FILE);
+    assert_eq!(summary["guest_log_lines"], 8);
+    assert_eq!(summary["guest_log_lines_dropped"], 7);
+    assert_eq!(summary["trace_events_dropped"], 12);
+    assert_eq!(summary["events_error"], serde_json::Value::Null);
+    // A complete log has no such line.
+    let complete = folder.join("complete");
+    artifacts::write(&complete, &clean()).unwrap();
+    assert!(!read(&complete, GUEST_LOG_FILE).ends_with(b"kept]\n"));
+    assert_eq!(json(&complete, SUMMARY_FILE)["guest_log_lines_dropped"], 0);
 }
 
 #[test]

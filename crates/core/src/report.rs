@@ -110,12 +110,23 @@ pub struct RunReport {
     pub exit: ExitReason,
     /// How long the run took, from loading the program to the guest stopping.
     pub duration: Duration,
-    /// Every string the guest wrote with `OutputDebugString`, in order, as the guest's bytes.
+    /// The strings the guest wrote with `OutputDebugString`, in order, as the guest's bytes:
+    /// every one of them, unless there were more than a run keeps (4 MiB of text), in which case
+    /// these are the first and [`RunReport::guest_log_dropped`] counts the rest.
     pub guest_log: Vec<Vec<u8>>,
-    /// The golden-trace view of the event stream (`trace.txt`).
+    /// How many later guest log lines were not kept because the limit was reached.
+    pub guest_log_dropped: u64,
+    /// The golden-trace view of the event stream (`trace.txt`). It holds the run's first
+    /// 100,000 events; when there were more, its last line says how many are missing.
     pub trace: String,
+    /// How many later events are missing from [`RunReport::trace`] because the limit was
+    /// reached. (The newest events are still in the flight recorder's dump.)
+    pub trace_events_dropped: u64,
     /// The flight recorder's dump (`events.bin`), readable with `starquake_trace::Dump`.
     pub events: Vec<u8>,
+    /// Why the flight recorder could not be written out, if it could not. [`RunReport::events`]
+    /// is then a dump with no cores in it.
+    pub events_error: Option<String>,
     /// How many times the guest made each system call, by the call's name (or its number in
     /// hex, for a number Horizon does not list).
     pub system_calls: BTreeMap<String, u64>,
@@ -138,10 +149,11 @@ impl RunReport {
             exit: ExitReason::EmulatorError(message),
             duration,
             guest_log: Vec::new(),
+            guest_log_dropped: 0,
             trace: String::new(),
-            // An empty dump still has its header, so `events.bin` is always readable. Encoding
-            // one cannot fail; if it ever did, an empty file is refused by the reader.
-            events: Dump::new(Vec::new()).to_bytes().unwrap_or_default(),
+            trace_events_dropped: 0,
+            events: empty_dump(),
+            events_error: None,
             system_calls: BTreeMap::new(),
             stubbed: BTreeSet::new(),
             patched_counter_reads: Vec::new(),
@@ -180,10 +192,22 @@ impl RunReport {
             system_calls: &self.system_calls,
             service_commands: BTreeMap::new(),
             stubbed: &self.stubbed,
-            guest_log_lines: self.guest_log.len(),
+            guest_log_lines: u64::try_from(self.guest_log.len())
+                .unwrap_or(u64::MAX)
+                .saturating_add(self.guest_log_dropped),
+            guest_log_lines_dropped: self.guest_log_dropped,
+            trace_events_dropped: self.trace_events_dropped,
+            events_error: self.events_error.as_ref(),
             patched_counter_reads: self.patched_counter_reads.len(),
         }
     }
+}
+
+/// A flight-recorder dump with no cores in it. It still has its header, so `events.bin` is
+/// always readable. Encoding one cannot fail; if it ever did, the empty file that results is
+/// refused by the reader.
+pub(crate) fn empty_dump() -> Vec<u8> {
+    Dump::new(Vec::new()).to_bytes().unwrap_or_default()
 }
 
 /// The contents of `summary.json` (`docs/specs/observability.md`, the artifacts table: "Exit
@@ -209,8 +233,17 @@ pub struct Summary<'a> {
     pub service_commands: BTreeMap<String, u64>,
     /// Every unimplemented system call the guest hit.
     pub stubbed: &'a BTreeSet<String>,
-    /// How many lines the guest wrote with `OutputDebugString`.
-    pub guest_log_lines: usize,
+    /// How many lines the guest wrote with `OutputDebugString`, kept or not.
+    pub guest_log_lines: u64,
+    /// How many of those lines are missing from `guest_log.txt` because the run reached its
+    /// limit of guest log text. Zero means the file is complete.
+    pub guest_log_lines_dropped: u64,
+    /// How many events are missing from the end of `trace.txt` because the run reached its
+    /// limit of trace events. Zero means the trace is complete.
+    pub trace_events_dropped: u64,
+    /// Why `events.bin` holds no events, when the flight recorder could not be written out;
+    /// `null` otherwise.
+    pub events_error: Option<&'a String>,
     /// How many counter reads the loader patched.
     pub patched_counter_reads: usize,
 }
@@ -264,8 +297,11 @@ mod tests {
             exit: ExitReason::EmulatorError("the vCPU failed".into()),
             duration: Duration::from_millis(1234),
             guest_log: vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec()],
+            guest_log_dropped: 5,
             trace: "ignored".into(),
+            trace_events_dropped: 9,
             events: vec![1, 2, 3],
+            events_error: Some("the dump could not be encoded".into()),
             system_calls: BTreeMap::from([
                 ("ExitProcess".to_owned(), 1),
                 ("OutputDebugString".to_owned(), 7),
@@ -293,7 +329,10 @@ mod tests {
     "0x99",
     "Break (0x26)"
   ],
-  "guest_log_lines": 3,
+  "guest_log_lines": 8,
+  "guest_log_lines_dropped": 5,
+  "trace_events_dropped": 9,
+  "events_error": "the dump could not be encoded",
   "patched_counter_reads": 2
 }"#
         );
