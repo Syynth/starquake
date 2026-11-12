@@ -225,3 +225,11 @@ Entry format:
 - **WHAT:** After milestone 1 the owner extended the lead's delegation toward milestone 2, for implementation work only. The lead files implementation issues that follow approved specs (kernel slices, CPU, loader, services, test fixtures), runs them in parallel lanes on Opus, and merges their PRs on a green gate and two reviews. It does not decide design questions, amend specs or merge design PRs: those wait for the owner, including the four graphics drafts.
 - **WHY:** Progress can continue in parallel while the owner reviews designs at their own pace. Implementation against an approved spec is checked by the gate, two reviewers and the reference traces; designs set direction, so they stay with the owner.
 
+## The render backend starts on wgpu, behind our own trait
+- **WHEN:** 2026-11-12
+- **PROJECT:** starquake
+- **SYSTEM:** render
+- **SCOPE:** architectural
+- **WHAT:** The first host graphics backend is wgpu, behind starquake's own backend trait and plain-data command lists; no wgpu type crosses into the GPU crate. A direct Vulkan backend is added when Linux work or a title needs a stage wgpu lacks (geometry, tessellation, transform feedback). A native Metal backend is written only if measurements at the performance milestone call for it. The draft's recommendation (Vulkan through ash, with MoltenVK on the Mac) was not taken.
+- **WHY:** The owner knows wgpu and will read and debug this code. It runs natively on Metal on the development Mac with nothing to install and no translation layer, it is safe pure Rust, and it takes the translated shaders directly, so first frames come sooner. Its gaps (checked against wgpu 30.0.1) bite after first frames, except texture channel remapping, which becomes shader variants. Keeping the trait ours means the choice can be revisited.
+
