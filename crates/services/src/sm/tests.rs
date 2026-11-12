@@ -584,6 +584,56 @@ fn the_record_of_unknown_names_stops_exactly_at_its_limit() {
 }
 
 #[test]
+fn a_saved_registry_is_checked_when_it_is_read_back() {
+    use crate::framework::{Family, SnapshotError};
+    // A registry with `count` unknown names, as bytes that never went through `note_unknown`.
+    let saved = |count: usize| {
+        let mut registry = Registry::new();
+        registry.register(name("set:sys"), SET_SYS).unwrap();
+        for n in 0..count {
+            registry.unknown.insert(name(&format!("u{n}")));
+        }
+        (postcard::to_allocvec(&registry).unwrap(), registry)
+    };
+    // Exactly at the limit: read back as it was written.
+    let (bytes, at_limit) = saved(MAX_UNKNOWN_NAMES);
+    assert_eq!(
+        postcard::from_bytes::<Registry>(&bytes),
+        Ok(at_limit.clone())
+    );
+    let mut loaded = Registry::new();
+    assert_eq!(loaded.load_state(&bytes), Ok(()));
+    assert_eq!(loaded.unknown_names().count(), MAX_UNKNOWN_NAMES);
+
+    // One past it: an error, and a registry asked to load it is left as it was.
+    let (bytes, _) = saved(MAX_UNKNOWN_NAMES + 1);
+    // postcard reports a failed `try_from` as a custom error and drops its text, so the error
+    // itself is checked on the same data.
+    let custom = postcard::Error::SerdeDeCustom;
+    assert_eq!(
+        postcard::from_bytes::<Registry>(&bytes),
+        Err(custom.clone())
+    );
+    assert_eq!(
+        loaded.load_state(&bytes),
+        Err(SnapshotError::Decode(custom))
+    );
+    assert_eq!(loaded, at_limit);
+    let data: RegistryData = postcard::from_bytes(&bytes).unwrap();
+    let too_many = RegistryLayoutError::TooManyUnknownNames {
+        count: MAX_UNKNOWN_NAMES + 1,
+    };
+    assert_eq!(Registry::try_from(data), Err(too_many));
+    assert_eq!(
+        too_many.to_string(),
+        format!(
+            "{} unknown names are on record, more than the {MAX_UNKNOWN_NAMES} a registry keeps",
+            MAX_UNKNOWN_NAMES + 1
+        )
+    );
+}
+
+#[test]
 fn result_codes_are_edens_words() {
     // Golden words: `ErrorModule::SM` is 21 (0x15) in bits 0..9, the description from bit 9.
     // Horizon prints them 2021-0002, 2021-0006 and 2021-0007.

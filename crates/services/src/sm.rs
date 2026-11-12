@@ -204,12 +204,52 @@ pub enum RegistryError {
     AlreadyRegistered(ServiceName),
 }
 
+/// Why serialised registry data was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum RegistryLayoutError {
+    /// More unknown names are on record than a registry keeps.
+    #[error(
+        "{count} unknown names are on record, more than the {MAX_UNKNOWN_NAMES} a registry keeps"
+    )]
+    TooManyUnknownNames {
+        /// The names in the data.
+        count: usize,
+    },
+}
+
 /// The service manager's map from names to providers. See the [module docs](self).
+///
+/// It is saved in a snapshot, so it derives `serde`. Deserialising goes through
+/// [`RegistryData`], which checks the one bound [`Registry`]'s own operations keep,
+/// [`MAX_UNKNOWN_NAMES`]; each name is checked as a [`ServiceName`] is.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RegistryData")]
 pub struct Registry {
     services: BTreeMap<ServiceName, Provider>,
-    /// Names that were asked for and that nothing provides.
+    /// Names that were asked for and that nothing provides. At most [`MAX_UNKNOWN_NAMES`].
     unknown: BTreeSet<ServiceName>,
+}
+
+/// The serialised form of a [`Registry`], and what deserialisation validates.
+#[derive(Deserialize)]
+struct RegistryData {
+    services: BTreeMap<ServiceName, Provider>,
+    unknown: BTreeSet<ServiceName>,
+}
+
+impl TryFrom<RegistryData> for Registry {
+    type Error = RegistryLayoutError;
+
+    fn try_from(data: RegistryData) -> Result<Self, Self::Error> {
+        let count = data.unknown.len();
+        if count > MAX_UNKNOWN_NAMES {
+            return Err(RegistryLayoutError::TooManyUnknownNames { count });
+        }
+        Ok(Self {
+            services: data.services,
+            unknown: data.unknown,
+        })
+    }
 }
 
 impl Registry {
