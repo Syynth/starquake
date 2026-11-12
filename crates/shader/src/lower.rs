@@ -10,7 +10,8 @@
 //!   `vec4<f32>` at location `n`. Its outputs are one struct: the position built-in, then
 //!   generic `n` at location `n`, with perspective interpolation at the pixel centre (a guess
 //!   until the SPH's interpolation modes are read, slice 15). Components the program does not
-//!   write are zero.
+//!   write are zero. Generics from [`HOST_LOCATIONS`] up (generic 31) are refused, read or
+//!   written, because wgpu on Metal binds no location past 30.
 //! - A pixel function's colour target `n` is a `vec4<f32>` output at location `n`; unwritten
 //!   components are zero. `SR_LANEID` is the subgroup invocation id built-in, which needs the
 //!   subgroup capability; naga 30.0.1 does not allow it in a vertex shader
@@ -23,7 +24,9 @@
 //! them (`eden/src/shader_recompiler/frontend/ir/attribute.h` @ cf654052: `Generic0X = 32`,
 //! `Generic31W = 159`, `GenericAttributeIndex`). Divergence: Eden's `IsGeneric` stops at
 //! `Generic31X` (156), so its words 157 to 159 are not generics there; here they are generic
-//! 31's Y, Z and W, pinned by `tests::generic_31_w_is_a_generic`.
+//! 31's Y, Z and W, and so refused with the rest of generic 31 as
+//! [`LowerError::GenericLocation`] rather than as an attribute the stage cannot use. Pinned by
+//! `tests::generic_31_w_is_a_generic`.
 //!
 //! Validation uses every naga flag except the uniformity analysis (spec, "The backend through
 //! naga"). Experiment E1 found that wgpu 30.0.1 validates with every flag and that naga 30.0.1
@@ -65,6 +68,15 @@ pub const GENERIC_0_X: u16 = 32;
 pub const GENERICS: u16 = 32;
 /// Words per attribute (X, Y, Z, W).
 const COMPONENTS: u16 = 4;
+/// How many locations a host stage binds: generic `n` uses location `n`, so generics from this
+/// one up are refused. wgpu 30.0.1 on Metal binds vertex attributes below 31 (`wgpu-hal`
+/// `metal/adapter.rs`: `max_vertex_attributes: 31`) and vertex outputs at locations up to
+/// `max_inter_stage_shader_variables - 1` (`wgpu-core` `validation.rs`), which is 31 on Apple
+/// GPUs (`metal/adapter.rs`: "min(124, 124 / 4)"); measured on an Apple M2. Devices with lower
+/// limits (other Mac GPUs, Vulkan drivers) are the GPU crate's to check against the device. To
+/// support generic 31 later, remap locations: the interface tables already keep the guest slot
+/// apart from the host binding.
+pub const HOST_LOCATIONS: u8 = 31;
 /// The size in bytes of a `vec4<f32>`, the stride of the output structs.
 const VEC4_BYTES: u32 = 16;
 
@@ -95,10 +107,10 @@ pub enum LowerError {
     #[error("the IR is malformed: {0}")]
     Verify(#[from] VerifyError),
     /// The stage is not handled yet.
-    #[error("{0:?} programs are not lowered yet")]
+    #[error("{0} programs are not lowered yet")]
     Stage(GuestStage),
     /// An attribute the stage cannot read.
-    #[error("a {stage:?} program cannot read attribute {attribute}")]
+    #[error("a {stage} program cannot read attribute {attribute}")]
     Input {
         /// The stage.
         stage: GuestStage,
@@ -106,12 +118,18 @@ pub enum LowerError {
         attribute: Attribute,
     },
     /// An attribute the stage cannot write.
-    #[error("a {stage:?} program cannot write attribute {attribute}")]
+    #[error("a {stage} program cannot write attribute {attribute}")]
     Output {
         /// The stage.
         stage: GuestStage,
         /// The attribute.
         attribute: Attribute,
+    },
+    /// A generic attribute with no host location (see [`HOST_LOCATIONS`]).
+    #[error("generic {generic} has no host location: locations stop at {last}", last = HOST_LOCATIONS - 1)]
+    GenericLocation {
+        /// The generic attribute's index.
+        generic: u8,
     },
     /// The lane id in a vertex program, which naga cannot express.
     #[error("the lane id cannot be read in a vertex program")]
@@ -125,7 +143,7 @@ pub enum LowerError {
         component: u8,
     },
     /// A colour output in a stage that has none.
-    #[error("a {0:?} program cannot write colour outputs")]
+    #[error("a {0} program cannot write colour outputs")]
     ColorInStage(GuestStage),
     /// naga rejected the module: a bug in this module, reported rather than handed out.
     #[error("naga rejected the module: {0}")]
@@ -145,6 +163,15 @@ pub fn capabilities(requirements: Requirements) -> Capabilities {
     let mut caps = Capabilities::empty();
     caps.set(Capabilities::SUBGROUP, requirements.subgroup);
     caps
+}
+
+/// The location of generic `generic`, if a host stage can bind it.
+fn host_location(generic: u8) -> Result<u8, LowerError> {
+    if generic < HOST_LOCATIONS {
+        Ok(generic)
+    } else {
+        Err(LowerError::GenericLocation { generic })
+    }
 }
 
 /// What a function reads and writes, collected before the module is built.
@@ -168,13 +195,13 @@ impl Interface {
                 }
                 Inst::GetAttribute(attribute) => match classify(attribute) {
                     Some(AttributeKind::Generic { index, .. }) if vertex => {
-                        found.inputs.insert(index);
+                        found.inputs.insert(host_location(index)?);
                     }
                     _ => return Err(LowerError::Input { stage, attribute }),
                 },
                 Inst::SetAttribute(attribute, _) => match classify(attribute) {
                     Some(AttributeKind::Generic { index, .. }) if vertex => {
-                        found.generic_outputs.insert(index);
+                        found.generic_outputs.insert(host_location(index)?);
                     }
                     Some(AttributeKind::Position { .. }) if vertex => {}
                     _ => return Err(LowerError::Output { stage, attribute }),
@@ -187,7 +214,7 @@ impl Interface {
                     if vertex {
                         return Err(LowerError::ColorInStage(stage));
                     }
-                    if usize::from(target) >= COLOR_TARGETS || component >= 4 {
+                    if usize::from(target) >= COLOR_TARGETS || u16::from(component) >= COMPONENTS {
                         return Err(LowerError::ColorOutput { target, component });
                     }
                     found.targets.insert(target);

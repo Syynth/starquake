@@ -198,24 +198,61 @@ fn s2r_lane_id() {
     );
 }
 
+/// `S2R` to `RZ` reads nothing, so it adds no lane id (and no subgroup requirement); the special
+/// register is still checked.
+#[test]
+fn s2r_to_rz_reads_nothing() {
+    let s2r = |sr| Instr::new(Op::S2R(OpS2R { dst: Gpr::RZ, sr }));
+    for stage in [VERTEX, pixel([0; COLOR_TARGETS])] {
+        let ir = translate(stage, &[s2r(SpecialReg::LANE_ID), exit()]).expect("translates");
+        assert_eq!(ir.to_string(), "block0:\n");
+    }
+    let tid = s2r(SpecialReg::TID_X);
+    assert_eq!(
+        one(tid),
+        unsupported(tid, Unsupported::SpecialRegister(SpecialReg::TID_X))
+    );
+}
+
+/// A guard on a real predicate, plain or negated, needs flow analysis (a listed divergence: the
+/// PR selects a pure instruction's result or makes a side effect its own block).
 #[test]
 fn guarded_instructions_are_rejected() {
-    for guard in [
-        PredSrc {
+    for negated in [false, true] {
+        let guard = PredSrc {
             reg: Pred::new(0).expect("p0"),
-            negated: false,
-        },
-        PredSrc {
-            reg: Pred::PT,
-            negated: true,
-        },
+            negated,
+        };
+        for instr in [
+            mov(r(0), MovSrc::Imm(1)),
+            Instr::new(Op::ASt(ast(r(0), 0x80, 1))),
+        ] {
+            let instr = Instr { guard, ..instr };
+            assert_eq!(one(instr), unsupported(instr, Unsupported::Guard));
+        }
+    }
+}
+
+/// `@!PT` never runs: the PR skips the instruction (`Visitor::Run`, `guard.Never()`), starquake
+/// rejects it (a listed divergence).
+#[test]
+fn never_guarded_instructions_are_rejected() {
+    let never = PredSrc {
+        reg: Pred::PT,
+        negated: true,
+    };
+    for instr in [
+        mov(r(0), MovSrc::Imm(1)),
+        Instr::new(Op::ASt(ast(r(0), 0x80, 1))),
     ] {
         let instr = Instr {
-            guard,
-            ..mov(r(0), MovSrc::Imm(1))
+            guard: never,
+            ..instr
         };
         assert_eq!(one(instr), unsupported(instr, Unsupported::Guard));
     }
+    // The same instruction under `PT` translates.
+    assert!(one(mov(r(0), MovSrc::Imm(1))).is_ok());
 }
 
 #[test]
@@ -562,8 +599,32 @@ fn rejections_read_as_words() {
     );
     assert_eq!(
         TranslateError::Stage(Unsupported::Stage(GuestStage::Geometry)).to_string(),
-        "Geometry programs are not supported yet"
+        "geometry programs are not supported yet"
     );
+}
+
+/// Every guest stage has a plain-words name.
+#[test]
+fn guest_stages_read_as_words() {
+    let names = [
+        (
+            GuestStage::VertexCullBeforeFetch,
+            "vertex (cull before fetch)",
+        ),
+        (GuestStage::Vertex, "vertex"),
+        (GuestStage::TessellationInit, "tessellation control"),
+        (GuestStage::Tessellation, "tessellation evaluation"),
+        (GuestStage::Geometry, "geometry"),
+        (GuestStage::Pixel, "pixel"),
+        (GuestStage::Compute, "compute"),
+    ];
+    for (stage, name) in names {
+        assert_eq!(stage.to_string(), name);
+        assert_eq!(
+            Unsupported::Stage(stage).to_string(),
+            format!("{name} programs are not supported yet")
+        );
+    }
 }
 
 proptest! {

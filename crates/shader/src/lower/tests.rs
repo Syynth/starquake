@@ -337,24 +337,24 @@ fn pair_is_accepted_by_wgpu() {
     );
 }
 
-/// Attribute words 157 to 159 are generic 31's Y, Z and W here; Eden's `IsGeneric` stops at
-/// 156 (the divergence in this module's docs). Word 160 is past the generics.
+/// Attribute words 156 to 159 are generic 31's X to W here, all refused because generic 31 has
+/// no host location; Eden's `IsGeneric` stops at 156 (the divergence in this module's docs), so
+/// 157 to 159 would not be generics there. Word 160 is past the generics. Read and write alike.
 #[test]
 fn generic_31_w_is_a_generic() {
+    let last_generic = u8::try_from(GENERICS - 1).expect("small");
+    assert_eq!(last_generic, HOST_LOCATIONS);
+    let generic_31_x = GENERIC_0_X + (GENERICS - 1) * COMPONENTS;
     let last = GENERIC_0_X + GENERICS * COMPONENTS - 1;
-    let addr = last * 4;
-    let program =
-        assemble_program(&[ald(r(0), addr, 1), ast(r(0), addr, 1), exit()]).expect("encodable");
-    let shader = translate_program(VERTEX, &program).expect("generic 31 W is a generic");
-    let generic = GuestSlot::Generic(u8::try_from(GENERICS - 1).expect("small"));
-    assert_eq!(
-        shader.inputs,
-        [slot(SlotBinding::Location(31), SlotType::F32x4, generic)]
-    );
-    assert_eq!(
-        shader.outputs.last(),
-        Some(&slot(SlotBinding::Location(31), SlotType::F32x4, generic))
-    );
+    let refused = Some(Rejection::Lower(LowerError::GenericLocation {
+        generic: last_generic,
+    }));
+    for word in generic_31_x..=last {
+        let read = assemble_program(&[ald(r(0), word * 4, 1), exit()]).expect("encodable");
+        assert_eq!(translate_program(VERTEX, &read).err(), refused, "{word}");
+        let write = assemble_program(&[ast(r(0), word * 4, 1), exit()]).expect("encodable");
+        assert_eq!(translate_program(VERTEX, &write).err(), refused, "{word}");
+    }
     let past = (last + 1) * 4;
     let program = assemble_program(&[ald(r(0), past, 1), exit()]).expect("encodable");
     assert_eq!(
@@ -363,6 +363,77 @@ fn generic_31_w_is_a_generic() {
             stage: GuestStage::Vertex,
             attribute: Attribute(last + 1)
         }))
+    );
+}
+
+/// The vertex program that reads and writes the last generic with a host location, W only.
+fn last_location_program() -> Vec<u8> {
+    let last = GENERIC_0_X + u16::from(HOST_LOCATIONS) * COMPONENTS - 1;
+    assemble_program(&[ald(r(0), last * 4, 1), ast(r(0), last * 4, 1), exit()]).expect("encodable")
+}
+
+/// The last generic below [`HOST_LOCATIONS`] lowers to that location in and out, and wgpu builds
+/// a pipeline from it (locally on a Mac; skipped with a notice where no GPU adapter exists).
+#[test]
+fn the_last_host_location_builds_a_pipeline() {
+    let vertex = translate_program(VERTEX, &last_location_program()).expect("generic 30");
+    let generic = HOST_LOCATIONS - 1;
+    let binding = SlotBinding::Location(u32::from(generic));
+    assert_eq!(
+        vertex.inputs,
+        [slot(binding, SlotType::F32x4, GuestSlot::Generic(generic))]
+    );
+    assert_eq!(
+        vertex.outputs.last(),
+        Some(&slot(binding, SlotType::F32x4, GuestSlot::Generic(generic)))
+    );
+    // A pixel program that writes colour target 0's X from an immediate (no subgroups needed).
+    let mut targets = [0; COLOR_TARGETS];
+    targets[0] = 0x1;
+    let pixel = translate_program(
+        Stage {
+            stage: GuestStage::Pixel,
+            color_outputs: ColorOutputs { targets },
+        },
+        &assemble_program(&[mov(r(0), MovSrc::Imm(ONE)), exit()]).expect("encodable"),
+    )
+    .expect("the pixel program");
+    let Some(gpu) = TestDevice::open(
+        "the_last_host_location_builds_a_pipeline",
+        wgpu::Features::empty(),
+    ) else {
+        return;
+    };
+    let attributes = [wgpu::VertexAttribute {
+        format: wgpu::VertexFormat::Float32x4,
+        offset: 0,
+        shader_location: u32::from(generic),
+    }];
+    let buffers = [Some(wgpu::VertexBufferLayout {
+        array_stride: u64::from(VEC4_BYTES),
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &attributes,
+    })];
+    let targets = [Some(wgpu::ColorTargetState {
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        blend: None,
+        write_mask: wgpu::ColorWrites::ALL,
+    })];
+    let vs = gpu
+        .module(naga_module(&vertex).clone())
+        .expect("wgpu takes the vertex module");
+    let fs = gpu
+        .module(naga_module(&pixel).clone())
+        .expect("wgpu takes the pixel module");
+    assert_eq!(
+        gpu.render_pipeline(
+            None,
+            (&vs, &vertex.entry),
+            (&fs, &pixel.entry),
+            &buffers,
+            &targets
+        ),
+        Ok(())
     );
 }
 
@@ -534,4 +605,222 @@ fn malformed_or_misplaced_ir_is_refused() {
         lower(GuestStage::Pixel, &f),
         Err(LowerError::Verify(VerifyError::Type { .. }))
     ));
+}
+
+/// Prints expression `handle` of `function` as a compact tree: locals and arguments by name, a
+/// load as the variable it reads, `f32(..)`/`u32(..)` for bit casts, `-x` for negation, naga's
+/// math function names, `base[index]` for an access by constant index. Anything else prints as
+/// "unexpected ...", which no golden line contains.
+fn print_expr(function: &naga::Function, handle: Handle<Expression>) -> String {
+    let print = |handle| print_expr(function, handle);
+    match function.expressions[handle] {
+        Expression::Literal(Literal::U32(bits)) => format!("{bits:#x}"),
+        Expression::LocalVariable(local) => {
+            function.local_variables[local].name.clone().expect("named")
+        }
+        Expression::FunctionArgument(index) => function.arguments
+            [usize::try_from(index).expect("small")]
+        .name
+        .clone()
+        .expect("named"),
+        Expression::Load { pointer } => print(pointer),
+        Expression::As { expr, kind, .. } => match kind {
+            ScalarKind::Float => format!("f32({})", print(expr)),
+            ScalarKind::Uint => format!("u32({})", print(expr)),
+            other => format!("unexpected cast to {other:?}"),
+        },
+        Expression::Unary {
+            op: UnaryOperator::Negate,
+            expr,
+        } => format!("-{}", print(expr)),
+        Expression::Math {
+            fun,
+            arg,
+            arg1,
+            arg2,
+            arg3,
+        } => {
+            let args: Vec<String> = [Some(arg), arg1, arg2, arg3]
+                .into_iter()
+                .flatten()
+                .map(print)
+                .collect();
+            format!("{fun:?}({})", args.join(", "))
+        }
+        Expression::AccessIndex { base, index } => format!("{}[{index}]", print(base)),
+        ref other => format!("unexpected expression {other:?}"),
+    }
+}
+
+/// The entry point's stores and return, one line each, in order.
+fn stores(shader: &HostShader) -> Vec<String> {
+    let function = &naga_module(shader).entry_points[0].function;
+    function
+        .body
+        .iter()
+        .filter_map(|statement| match *statement {
+            Statement::Emit(_) => None,
+            Statement::Store { pointer, value } => Some(format!(
+                "{} = {}",
+                print_expr(function, pointer),
+                print_expr(function, value)
+            )),
+            Statement::Return { value } => Some(match value {
+                Some(value) => format!("return {}", print_expr(function, value)),
+                None => "return".into(),
+            }),
+            ref other => Some(format!("unexpected statement {other:?}")),
+        })
+        .collect()
+}
+
+/// The pair's bodies: which input component each load reads, the order of `fma`'s operands
+/// (`a * b + c` is naga's `fma(a, b, c)`), and which output component each store hits. The
+/// output struct's member 0 is the position in the vertex program.
+#[test]
+fn pair_golden_bodies() {
+    let (vertex, pixel) = pair();
+    let half = 0.5_f32.to_bits();
+    let two = 2.0_f32.to_bits();
+    assert_eq!(
+        stores(&vertex),
+        [
+            "r0 = u32(in0[0])".to_string(),
+            "r1 = u32(in0[1])".into(),
+            "r2 = u32(in0[2])".into(),
+            "r3 = u32(in0[3])".into(),
+            "r4 = u32(in1[0])".into(),
+            "r5 = u32(in1[1])".into(),
+            format!("r0 = u32(Fma(f32(r0), f32({half:#x}), f32(r4)))"),
+            format!("r6 = {ONE:#x}"),
+            "out[0][0] = f32(r0)".into(),
+            "out[0][1] = f32(r1)".into(),
+            "out[0][2] = f32(r2)".into(),
+            "out[0][3] = f32(r3)".into(),
+            "out[1][0] = f32(r6)".into(),
+            "return out".into(),
+        ]
+    );
+    assert_eq!(
+        stores(&pixel),
+        [
+            "r4 = lane_id".to_string(),
+            format!("r0 = {ONE:#x}"),
+            format!("r1 = u32(Fma(f32(r4), f32({two:#x}), f32(r0)))"),
+            "r2 = 0x0".into(),
+            "r3 = r0".into(),
+            "out[0][0] = f32(r0)".into(),
+            "out[0][1] = f32(r1)".into(),
+            "out[0][2] = f32(r2)".into(),
+            "out[0][3] = f32(r3)".into(),
+            "return out".into(),
+        ]
+    );
+}
+
+/// Source modifiers and saturation: `|x|` is naga's `abs`, `-x` a negation applied after it,
+/// and a saturating `FFMA` clamps the `fma` with `saturate`. Every component of a generic output
+/// lands where its register says.
+#[test]
+fn modifiers_and_saturation_lower_to_their_naga_forms() {
+    let modified = |reg, abs, neg| FloatSrc::Reg { reg, abs, neg };
+    let program = assemble_program(&[
+        ald(r(0), GENERIC_0_X * 4, 3),
+        Instr::new(Op::FFma(OpFFma {
+            dst: r(3),
+            srcs: [
+                modified(r(0), false, true),
+                modified(r(1), true, false),
+                modified(r(2), true, true),
+            ],
+            saturate: true,
+            rnd: RoundMode::NearestEven,
+            ftz: false,
+            dnz: false,
+        })),
+        ast(r(0), (GENERIC_0_X + COMPONENTS) * 4, 4),
+        exit(),
+    ])
+    .expect("encodable");
+    let shader = translate_program(VERTEX, &program).expect("lowers");
+    assert_eq!(
+        stores(&shader),
+        [
+            "r0 = u32(in0[0])",
+            "r1 = u32(in0[1])",
+            "r2 = u32(in0[2])",
+            "r3 = u32(Saturate(Fma(-f32(r0), Abs(f32(r1)), -Abs(f32(r2)))))",
+            "out[1][0] = f32(r0)",
+            "out[1][1] = f32(r1)",
+            "out[1][2] = f32(r2)",
+            "out[1][3] = f32(r3)",
+            "return out",
+        ]
+    );
+}
+
+/// Every lowering error reads as plain words.
+#[test]
+fn lower_errors_read_as_words() {
+    let mut malformed = Function::new();
+    let b = malformed.entry();
+    let zero = malformed.push(b, Inst::Imm32(0)).expect("room");
+    malformed
+        .push(b, Inst::SetReg(Gpr::RZ, zero))
+        .expect("room");
+    let verify = lower(GuestStage::Vertex, &malformed).expect_err("a write to rz is malformed");
+    let attribute = Attribute(GENERIC_0_X);
+    let cases = [
+        (verify, "the IR is malformed: %1 reads or writes rz"),
+        (
+            LowerError::Stage(GuestStage::Geometry),
+            "geometry programs are not lowered yet",
+        ),
+        (
+            LowerError::Input {
+                stage: GuestStage::Pixel,
+                attribute,
+            },
+            "a pixel program cannot read attribute a0x80",
+        ),
+        (
+            LowerError::Output {
+                stage: GuestStage::Vertex,
+                attribute,
+            },
+            "a vertex program cannot write attribute a0x80",
+        ),
+        (
+            LowerError::GenericLocation {
+                generic: HOST_LOCATIONS,
+            },
+            "generic 31 has no host location: locations stop at 30",
+        ),
+        (
+            LowerError::LaneIdInVertex,
+            "the lane id cannot be read in a vertex program",
+        ),
+        (
+            LowerError::ColorOutput {
+                target: 8,
+                component: 0,
+            },
+            "colour output 8.0 does not exist",
+        ),
+        (
+            LowerError::ColorInStage(GuestStage::Vertex),
+            "a vertex program cannot write colour outputs",
+        ),
+        (
+            LowerError::Validation("why".into()),
+            "naga rejected the module: why",
+        ),
+        (
+            LowerError::Internal("what".into()),
+            "internal lowering error: what",
+        ),
+    ];
+    for (error, text) in cases {
+        assert_eq!(error.to_string(), text);
+    }
 }

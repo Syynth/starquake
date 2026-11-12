@@ -10,8 +10,13 @@
 //! Slice 1 handles linear flow only (spec, port slice 1). Where starquake is stricter than the
 //! PR, because the PR resolves the case in a part not built yet:
 //!
-//! - an instruction under a guard other than plain `PT` is rejected (the PR makes it a
-//!   conditional block; flow analysis is slice 10);
+//! - an instruction under a guard predicate other than `PT` and `!PT` is rejected (flow analysis
+//!   is slice 10). The PR turns a guard on a pure instruction (`MOV`, `FFMA`, `ALD` and `S2R`
+//!   here; `classify.h`, `Classify`) into a select of the result (`visitor.cpp`,
+//!   `Visitor::Run`: `guard_select`), and makes a guarded side effect (`AST` here) its own
+//!   conditional block (`flow.cpp`: "Guarded side effect: becomes its own conditional block");
+//! - an instruction under `@!PT` is rejected, where the PR skips it: `Visitor::Run` returns when
+//!   `guard.Never()`, which `flow.h` defines as `index == 7 && negated`;
 //! - an `EXIT` with its own predicate other than `PT` is rejected (the PR's control-flow builder
 //!   resolves it, `ops_attr.cpp`: "extra exit condition");
 //! - the program must end with its first `EXIT`: no `EXIT` and instructions after it are
@@ -21,12 +26,14 @@
 //! - `S2R` reads only `SR_LANEID` (the PR also reads the thread and block ids, the W scale
 //!   factors and the lane masks).
 //!
-//! Pinned by `tests::guarded_instructions_are_rejected`,
+//! Pinned by `tests::guarded_instructions_are_rejected`, `never_guarded_instructions_are_rejected`,
 //! `exit_modes_and_predicates_are_rejected`, `the_program_ends_at_its_only_exit`,
 //! `attribute_access_checks` and `s2r_lane_id`.
 
 #[cfg(test)]
 mod tests;
+
+use std::fmt::{self, Display, Formatter};
 
 use thiserror::Error;
 
@@ -53,6 +60,27 @@ pub enum GuestStage {
     Pixel,
     /// Compute.
     Compute,
+}
+
+impl GuestStage {
+    /// The stage's name in plain words, as error messages print it.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::VertexCullBeforeFetch => "vertex (cull before fetch)",
+            Self::Vertex => "vertex",
+            Self::TessellationInit => "tessellation control",
+            Self::Tessellation => "tessellation evaluation",
+            Self::Geometry => "geometry",
+            Self::Pixel => "pixel",
+            Self::Compute => "compute",
+        }
+    }
+}
+
+impl Display for GuestStage {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
 }
 
 /// How many colour targets a pixel program can write (`ops_attr.cpp`, `EXIT`: `render_target <
@@ -84,7 +112,7 @@ pub struct Stage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum Unsupported {
     /// The stage is not handled yet.
-    #[error("{0:?} programs are not supported yet")]
+    #[error("{0} programs are not supported yet")]
     Stage(GuestStage),
     /// A guard other than `PT` needs flow analysis.
     #[error("a guarded instruction (flow analysis is not built yet)")]
@@ -401,6 +429,10 @@ impl Translator {
             op.sr == SpecialReg::LANE_ID,
             Unsupported::SpecialRegister(op.sr),
         )?;
+        // A write to `RZ` is dropped, so the lane id is not read and needs no capability.
+        if op.dst.is_zero() {
+            return Ok(());
+        }
         let value = self.push(block, Inst::LaneId)?;
         self.set(block, op.dst, value)
     }

@@ -409,7 +409,7 @@ fn mov_register_form_rejects_source_modifier_bits() {
         assert_eq!(
             decode(mov.with_flag(bit, true)),
             Err(DecodeError::UnknownBit {
-                opcode: 0x202,
+                opcode: u16::try_from(MOV_REG).expect("12 bits"),
                 bit: bit.start
             })
         );
