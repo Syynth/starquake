@@ -625,6 +625,9 @@ dependencies = [
 name = "starquake-services"
 version = "0.0.0"
 dependencies = [
+ "postcard",
+ "proptest",
+ "serde",
  "starquake-ipc",
  "starquake-kernel",
  "starquake-services",

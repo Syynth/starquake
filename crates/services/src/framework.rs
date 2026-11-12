@@ -160,6 +160,7 @@ pub mod control;
 pub mod fake;
 mod kernel;
 pub mod payload;
+pub mod queue;
 mod reply;
 pub mod request;
 pub mod result;
