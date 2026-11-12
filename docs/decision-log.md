@@ -257,3 +257,11 @@ Entry format:
 - **WHAT:** A present returns at once with the list of buffers still in use. The graphics server's emulated 60 Hz clock shows one ready frame per tick and frees the buffer it replaces; the game waits only when it has no free buffer. The fence wait the other reference used (hold the reply until the previous frame is done and the next tick has passed) is kept as a per-run fallback setting, implemented as a deferred reply so it never blocks a core. The GPU and render drafts' assumption that a present waits on the frame's fence is dropped.
 - **WHY:** It never blocks the emulator and lets drawing overlap GPU work. The fence-wait approach lost up to half of each frame to waiting, needed a 4-second safety timeout and deadlocked when tuned. The risk, that a game does not wait for free buffers properly, is unconfirmed either way and is covered by the fallback.
 
+## Syncpoints and the GPU address table live in the GPU crate; the graphics server decides, the GPU applies
+- **WHEN:** 2026-11-12
+- **PROJECT:** starquake
+- **SYSTEM:** gsv, gpu
+- **SCOPE:** architectural
+- **WHAT:** The syncpoint counters and the GPU address table are plain data types in the GPU crate. The graphics server allocates counters, computes each submission's fence, and writes mappings; the GPU performs increments after host completion and reads the table on every access. Counter changes go into a queue that the graphics server's timer thread drains, so game threads are woken in a recorded order. Unmaps, kind changes and destroys reach the GPU as ordered updates with a barrier, and the game is told only when no earlier GPU work, including the thread that reads command buffers, can still use the old mapping. The GPU draft's memory-access interface is kept, with its production implementation in the GPU crate over the table. The GPU draft's interface for the graphics server to own syncpoints is dropped.
+- **WHY:** The graphics server already depends on the GPU crate, so no new crate is needed, and the GPU reads the table on its hottest path, where a call through an interface would cost on every access. Waking game threads from one recorded place keeps replay deterministic, as the observability spec requires. Ordered unmaps stop the GPU reading memory the game has already been told is free.
+
