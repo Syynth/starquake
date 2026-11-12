@@ -80,7 +80,7 @@ mod host {
     use starquake_memory::Access;
 
     use super::Error;
-    use crate::clock::{CounterClock, PROCESS_COUNTER_RATE, Timebase};
+    use crate::clock::{CounterClock, PROCESS_CONSOLE, Timebase};
     use crate::image::{Loaded, Program, load};
     use crate::machine::{self, GuestProgram, GuestSpace};
     use crate::report::{RunOptions, RunReport};
@@ -119,14 +119,14 @@ mod host {
         // with the same rate, and that clock is the backend's counter.
         let host_hz = backend.counter_frequency();
         let time = Timebase {
-            rate: PROCESS_COUNTER_RATE,
+            console: PROCESS_CONSOLE,
             clock: CounterClock::new(host_hz).ok_or_else(|| {
                 starquake_cpu::Error::Host("the host counter reports a rate of zero".into())
             })?,
         };
         let counter = CounterRescale {
             host_hz,
-            guest_hz: time.rate.hz(),
+            guest_hz: time.rate().hz(),
         };
         // The kernel's address space decides what is mapped; this one makes it real, and is
         // what the loader and the kernel read and write guest memory through.

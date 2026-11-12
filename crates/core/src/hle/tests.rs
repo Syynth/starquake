@@ -8,16 +8,15 @@ use starquake_ipc::{
     BUFFER_SIZE, CommandType, Message, ReceiveDescriptor, RequestBuilder, RequestLayout,
     SessionKind,
 };
-use starquake_kernel::dispatch::{Caller, Outcome, Tables};
-use starquake_kernel::handle::{Handle, HandleTable};
+use starquake_kernel::dispatch::{Caller, Outcome};
+use starquake_kernel::handle::Handle;
 use starquake_kernel::memory::testing::RecordingMapper;
 use starquake_kernel::memory::{
     AddressSpace, MemoryArrangement, ProcessMemory, RegionOffsets, SvcPermission,
 };
+use starquake_kernel::process::{self, Console, ProcessDescription};
 use starquake_kernel::result::{KernelError, ResultCode};
 use starquake_kernel::svc::{DebugSink, SvcId};
-use starquake_kernel::tables::{Processes, Scheduler};
-use starquake_kernel::time::CounterRate;
 use starquake_memory::{FlatMemory, GuestMemory, PAGE_SIZE};
 use starquake_services::framework::control::QUERY_POINTER_BUFFER_SIZE;
 use starquake_services::framework::{DEFAULT_POINTER_BUFFER_SIZE, Protocol, Session};
@@ -66,12 +65,8 @@ fn dispatcher() -> Dispatcher {
     space
         .set_process_memory_permission(BASE, PAGES * PAGE_SIZE, SvcPermission::ReadWrite)
         .unwrap();
-    Dispatcher::new(Tables {
-        handles: HandleTable::new(0).unwrap(),
-        address_space: space,
-        scheduler: Scheduler::default(),
-        processes: Processes::new(CounterRate::SWITCH_1),
-    })
+    let description = ProcessDescription::homebrew(Console::Switch1);
+    Dispatcher::new(process::create(&description, space).unwrap())
 }
 
 impl Rig {

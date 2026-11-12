@@ -1,29 +1,32 @@
-//! A run's time: the counter rate of its process and the host clock its guest time is counted
-//! from.
+//! A run's time: the console its process was built for, which decides its counter rate, and
+//! the host clock its guest time is counted from.
 //!
 //! The kernel owns guest time (`docs/specs/kernel.md`, "Guest time"): it converts the
 //! environment's clock, host nanoseconds, with the process's counter rate, and takes the
-//! clock's zero as guest tick zero. This module is the other half of that contract. It decides
-//! the rate, hands the same rate to the kernel and to the loader's counter patcher, and builds
-//! the environment's clock from the counter the patched instructions read, so that
-//! `GetSystemTick` and a patched counter read agree on the rate and on where the counter
-//! started. `tests/skeleton.rs` reads a tick each way and checks that they do.
+//! clock's zero as guest tick zero. Which rate a process gets is the kernel's choice too, made
+//! from the console in its description (`starquake_kernel::process::Console::counter_rate`).
+//! This module is the other half of that contract. It says which console the program was built
+//! for, hands that console's rate to the loader's counter patcher, and builds the environment's
+//! clock from the counter the patched instructions read, so that `GetSystemTick` and a patched
+//! counter read agree on the rate and on where the counter started. `tests/skeleton.rs` reads a
+//! tick each way and checks that they do.
 //!
-//! PROVISIONAL (walking skeleton, #74): every program runs as a Switch 1 process
-//! ([`PROCESS_COUNTER_RATE`]). An NRO carries nothing that says which console it was built for;
-//! the homebrew this skeleton runs is built for the first one (a guess, and the rate the
-//! skeleton ran at before the kernel kept guest time). Kernel slice 8 (process creation) takes
-//! the rate from the program's metadata.
+//! PROVISIONAL (walking skeleton, #74): every program is described as built for Switch 1
+//! ([`PROCESS_CONSOLE`]). An NRO carries nothing that says which console it was built for; the
+//! homebrew this skeleton runs is built for the first one (a guess, and the rate the skeleton
+//! ran at before the kernel kept guest time). Wiring the loader's NPDM into process creation
+//! (#33) takes the console from the program's metadata.
 
 use std::num::NonZeroU64;
 
+use starquake_kernel::process::Console;
 use starquake_kernel::time::{CounterRate, NANOS_PER_SECOND};
 use starquake_trace::HostNanos;
 
-/// The counter rate every process runs at, for now. See the module docs.
-pub(crate) const PROCESS_COUNTER_RATE: CounterRate = CounterRate::SWITCH_1;
+/// The console every program is described as built for, for now. See the module docs.
+pub(crate) const PROCESS_CONSOLE: Console = Console::Switch1;
 
-/// What a run counts time with: the rate of its process's counter, and the host clock.
+/// What a run counts time with: the console its process was built for, and the host clock.
 ///
 /// The clock is cloned: one copy goes into the environment, where the kernel reads it and every
 /// reading is recorded, and the loop keeps the other to stamp the events it records itself
@@ -32,10 +35,18 @@ pub(crate) const PROCESS_COUNTER_RATE: CounterRate = CounterRate::SWITCH_1;
 /// readings.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Timebase<C> {
-    /// The rate of the process's counter: the kernel's, and the patcher's guest rate.
-    pub(crate) rate: CounterRate,
+    /// The console the process was built for: the kernel gives it that console's counter rate,
+    /// which is the patcher's guest rate too ([`Timebase::rate`]).
+    pub(crate) console: Console,
     /// The host clock whose zero is guest tick zero.
     pub(crate) clock: C,
+}
+
+impl<C> Timebase<C> {
+    /// The rate of the process's counter, as the kernel decides it from the console.
+    pub(crate) const fn rate(&self) -> CounterRate {
+        self.console.counter_rate()
+    }
 }
 
 /// A count of a `hz` hertz host counter, as host nanoseconds since the counter's zero: rounded
