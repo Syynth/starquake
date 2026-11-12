@@ -30,7 +30,11 @@ fn arbitrate_lock_returns_at_once_unless_the_word_names_the_owner_with_the_wait_
     w.words.set(LOCK, NO_OWNER);
     assert_eq!(w.lock_with(1, owner, LOCK), Ok(Arbitrated::Done));
     assert!(!w.waiting(1));
-    assert_eq!(refs(&w, 0), 2, "the creator's and the handle's, nothing more");
+    assert_eq!(
+        refs(&w, 0),
+        2,
+        "the creator's and the handle's, nothing more"
+    );
     assert_eq!(w.scheduler.sync().locks().held(w.threads[0]), &[]);
 }
 
@@ -51,7 +55,8 @@ fn arbitrate_lock_checks_the_word_then_the_handle_and_changes_nothing_when_it_fa
         Err(KernelError::InvalidHandle.into())
     );
     // A pseudo-handle is no handle here (`GetObjectWithoutPseudoHandle`).
-    w.words.set(LOCK, Handle::CURRENT_THREAD.raw() | HANDLE_WAIT_MASK);
+    w.words
+        .set(LOCK, Handle::CURRENT_THREAD.raw() | HANDLE_WAIT_MASK);
     assert_eq!(
         w.lock_with(1, Handle::CURRENT_THREAD, LOCK),
         Err(KernelError::InvalidHandle.into())
@@ -90,7 +95,11 @@ fn unlock_hands_the_lock_to_the_most_urgent_waiter_with_the_others() {
         "most urgent first"
     );
     assert_eq!(refs(&w, 0), base_refs + 3, "each wait holds the owner");
-    assert_eq!(w.priority(0), 10, "the owner inherits the most urgent waiter's");
+    assert_eq!(
+        w.priority(0),
+        10,
+        "the owner inherits the most urgent waiter's"
+    );
     assert_eq!(
         w.scheduler.thread(w.threads[1]).unwrap().state(),
         ThreadState::Waiting
@@ -137,7 +146,10 @@ fn waiters_of_one_priority_get_the_lock_in_the_order_they_came() {
         w.lock(waiter, 0, LOCK).unwrap();
     }
     let held = w.scheduler.sync().locks().held(w.threads[0]);
-    assert_eq!(held[0].waiters(), &[w.threads[2], w.threads[1], w.threads[3]]);
+    assert_eq!(
+        held[0].waiters(),
+        &[w.threads[2], w.threads[1], w.threads[3]]
+    );
 }
 
 #[test]
@@ -222,7 +234,11 @@ fn an_owner_that_inherits_takes_its_core_from_a_less_urgent_thread() {
     w.lock(1, 0, LOCK).unwrap();
     w.update();
     assert_eq!(w.scheduler.highest(core(0)), Ok(Some(w.threads[0])));
-    assert_eq!(w.scheduler.highest(core(1)), Ok(None), "the waiter left core 1");
+    assert_eq!(
+        w.scheduler.highest(core(1)),
+        Ok(None),
+        "the waiter left core 1"
+    );
 
     // Letting go gives the priority back: the middle thread is chosen again, and the woken
     // waiter has core 1.
@@ -324,10 +340,7 @@ fn kernel_waiters_are_counted_moved_with_the_lock_and_stop_a_suspend() {
     assert_eq!(w.scheduler.thread(owner).unwrap().suspend_requested(), 0);
 
     // Letting go moves the lock, and the kernel waiter left, to the next owner.
-    let (next, has_waiters) = w
-        .scheduler
-        .remove_waiter_by_key(None, owner, key)
-        .unwrap();
+    let (next, has_waiters) = w.scheduler.remove_waiter_by_key(None, owner, key).unwrap();
     assert_eq!((next, has_waiters), (Some(first), true));
     let locks = w.scheduler.sync().locks();
     assert_eq!(locks.kernel_waiters(owner), 0);

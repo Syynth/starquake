@@ -5,7 +5,7 @@ use starquake_cpu::GuestRegs;
 use starquake_trace::{GuestTicks, HostNanos, SVC_ARG_COUNT};
 
 use super::words::testing::MapWords;
-use super::{Arbitrated, ArbitrationType, SignalType, Timeout, Wake, WaitCall, WaitOrigin};
+use super::{Arbitrated, ArbitrationType, SignalType, Timeout, WaitCall, WaitOrigin, Wake};
 use crate::handle::{Handle, HandleTable, MAX_TABLE_SIZE};
 use crate::id::{ObjectId, ThreadId};
 use crate::object::Object;
@@ -124,7 +124,11 @@ impl World {
 
     /// Thread `index`'s saved `x0`.
     pub(crate) fn x0(&self, index: usize) -> u64 {
-        self.scheduler.thread(self.threads[index]).unwrap().context().x[0]
+        self.scheduler
+            .thread(self.threads[index])
+            .unwrap()
+            .context()
+            .x[0]
     }
 
     /// Whether thread `index` is in a wait.
@@ -234,8 +238,13 @@ impl World {
 
     /// `SignalProcessWideKey` from thread `index`.
     pub(crate) fn cv_signal(&mut self, index: usize, cv_key: u64, count: i32) -> CallResult<()> {
-        self.scheduler
-            .signal_condition_variable(&self.handles, &self.words, core(index), cv_key, count)
+        self.scheduler.signal_condition_variable(
+            &self.handles,
+            &self.words,
+            core(index),
+            cv_key,
+            count,
+        )
     }
 
     /// Expires every timer due at `now`, and returns how many waits that ended.

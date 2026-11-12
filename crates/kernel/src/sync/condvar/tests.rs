@@ -21,7 +21,11 @@ fn cv_waiters(w: &World, cv_key: u64) -> Vec<ThreadId> {
         process: None,
         address: cv_key,
     };
-    w.scheduler.sync().condition_variables().waiters(key).to_vec()
+    w.scheduler
+        .sync()
+        .condition_variables()
+        .waiters(key)
+        .to_vec()
 }
 
 #[test]
@@ -41,7 +45,11 @@ fn waiting_hands_the_lock_to_its_most_urgent_waiter_and_flags_the_key() {
         w.scheduler.take_wakes(),
         [w.wake(1, SvcId::ArbitrateLock, ResultCode::SUCCESS)]
     );
-    assert_eq!(w.priority(0), 30, "the inherited priority went with the lock");
+    assert_eq!(
+        w.priority(0),
+        30,
+        "the inherited priority went with the lock"
+    );
     assert_eq!(cv_waiters(&w, CV), [w.threads[0]]);
     assert_eq!(
         w.scheduler.thread(w.threads[0]).unwrap().state(),
@@ -53,7 +61,11 @@ fn waiting_hands_the_lock_to_its_most_urgent_waiter_and_flags_the_key() {
         Some((AddressKey::user(LOCK), w.tag(0)))
     );
     assert_eq!(locks.owner_of(w.threads[2]), Some(w.threads[1]));
-    assert_eq!(locks.owner_of(w.threads[0]), None, "in the tree, on no lock");
+    assert_eq!(
+        locks.owner_of(w.threads[0]),
+        None,
+        "in the tree, on no lock"
+    );
 }
 
 #[test]
@@ -131,10 +143,21 @@ fn a_signal_with_the_lock_held_hands_the_waiter_to_the_owner_until_it_lets_go() 
     w.words.set(LOCK, w.tag(1));
     w.cv_signal(2, CV, 1).unwrap();
     assert_eq!(w.words.get(LOCK), w.tag(1) | HANDLE_WAIT_MASK);
-    assert_eq!(w.scheduler.take_wakes(), [], "still waiting, now for the lock");
+    assert_eq!(
+        w.scheduler.take_wakes(),
+        [],
+        "still waiting, now for the lock"
+    );
     assert!(w.waiting(0));
-    assert_eq!(w.scheduler.sync().locks().owner_of(w.threads[0]), Some(w.threads[1]));
-    assert_eq!(w.priority(1), 10, "the owner inherits the waiter's priority");
+    assert_eq!(
+        w.scheduler.sync().locks().owner_of(w.threads[0]),
+        Some(w.threads[1])
+    );
+    assert_eq!(
+        w.priority(1),
+        10,
+        "the owner inherits the waiter's priority"
+    );
     assert_eq!(cv_waiters(&w, CV), []);
 
     w.unlock(1, LOCK).unwrap();
@@ -158,7 +181,11 @@ fn a_lock_word_naming_no_thread_ends_the_wait_with_invalid_state() {
         w.cv_signal(1, CV, 1).unwrap();
         assert_eq!(
             w.scheduler.take_wakes(),
-            [w.wake(0, SvcId::WaitProcessWideKeyAtomic, KernelError::InvalidState.code())],
+            [w.wake(
+                0,
+                SvcId::WaitProcessWideKeyAtomic,
+                KernelError::InvalidState.code()
+            )],
             "{owner:#x}"
         );
         assert_eq!(w.words.get(LOCK), owner | HANDLE_WAIT_MASK);
@@ -197,7 +224,10 @@ fn a_signal_takes_count_waiters_most_urgent_first_and_flags_the_key_only_when_no
             let lock = LOCK + 4 * u64::try_from(waiter).unwrap();
             w.cv_wait(waiter, lock, CV, Timeout::Never).unwrap();
         }
-        assert_eq!(cv_waiters(&w, CV), [w.threads[2], w.threads[3], w.threads[1]]);
+        assert_eq!(
+            cv_waiters(&w, CV),
+            [w.threads[2], w.threads[3], w.threads[1]]
+        );
         w.cv_signal(0, CV, count).unwrap();
         let order = [2, 3, 1];
         let expected: Vec<_> = order[..woken]
@@ -234,9 +264,8 @@ fn a_signal_before_the_wait_clears_the_key_and_wakes_nothing() {
 #[test]
 fn a_timer_ends_the_wait_in_the_tree_and_while_it_waits_on_the_owner() {
     let timeout = Timeout::from_nanos(HostNanos(NOW), AFTER);
-    let Timeout::At(HostNanos(deadline)) = timeout else {
-        panic!("a positive timeout has a deadline");
-    };
+    let deadline = NOW + AFTER.unsigned_abs() + crate::sync::TIMEOUT_SLACK_NS;
+    assert_eq!(timeout, Timeout::At(HostNanos(deadline)));
 
     // In the tree.
     let mut w = World::new(&[10, 40, 30]);
@@ -244,7 +273,11 @@ fn a_timer_ends_the_wait_in_the_tree_and_while_it_waits_on_the_owner() {
     assert_eq!(w.fire(deadline), 1);
     assert_eq!(
         w.scheduler.take_wakes(),
-        [w.wake(0, SvcId::WaitProcessWideKeyAtomic, KernelError::TimedOut.code())]
+        [w.wake(
+            0,
+            SvcId::WaitProcessWideKeyAtomic,
+            KernelError::TimedOut.code()
+        )]
     );
     assert_eq!(cv_waiters(&w, CV), []);
 
@@ -257,7 +290,11 @@ fn a_timer_ends_the_wait_in_the_tree_and_while_it_waits_on_the_owner() {
     assert_eq!(w.fire(deadline * 2), 1);
     assert_eq!(
         w.scheduler.take_wakes(),
-        [w.wake(0, SvcId::WaitProcessWideKeyAtomic, KernelError::TimedOut.code())]
+        [w.wake(
+            0,
+            SvcId::WaitProcessWideKeyAtomic,
+            KernelError::TimedOut.code()
+        )]
     );
     assert_eq!(w.priority(1), 40);
     assert_eq!(w.scheduler.sync().locks(), &LockTable::default());
@@ -269,7 +306,10 @@ fn destroying_an_owner_ends_its_waiters_waits_with_invalid_state() {
     w.cv_wait(0, LOCK, CV, Timeout::Never).unwrap();
     w.words.set(LOCK, w.tag(1));
     w.cv_signal(2, CV, 1).unwrap();
-    assert_eq!(w.scheduler.sync().locks().owner_of(w.threads[0]), Some(w.threads[1]));
+    assert_eq!(
+        w.scheduler.sync().locks().owner_of(w.threads[0]),
+        Some(w.threads[1])
+    );
     // The owner ends, and its object's last two references (its creator's and the handle's)
     // go: it is destroyed, and the waiter's wait ends.
     w.scheduler.terminate_thread(w.threads[1]).unwrap();
@@ -279,7 +319,11 @@ fn destroying_an_owner_ends_its_waiters_waits_with_invalid_state() {
     w.scheduler.close_object(object).unwrap();
     assert_eq!(
         w.scheduler.take_wakes(),
-        [w.wake(0, SvcId::WaitProcessWideKeyAtomic, KernelError::InvalidState.code())]
+        [w.wake(
+            0,
+            SvcId::WaitProcessWideKeyAtomic,
+            KernelError::InvalidState.code()
+        )]
     );
     assert_eq!(w.scheduler.sync().locks(), &LockTable::default());
 }

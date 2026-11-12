@@ -78,14 +78,22 @@ fn every_arbitration_type_waits_only_when_its_comparison_holds() {
         set(&w, before);
         let result = w.wait_address(0, AT, kind, VALUE, NEVER);
         if waits {
-            assert_eq!(result, Ok(Arbitrated::Waiting(w.threads[0])), "{kind:?} {before}");
+            assert_eq!(
+                result,
+                Ok(Arbitrated::Waiting(w.threads[0])),
+                "{kind:?} {before}"
+            );
             assert_eq!(waiting_on(&w), [w.threads[0]]);
             assert_eq!(
                 w.scheduler.thread(w.threads[0]).unwrap().state(),
                 ThreadState::Waiting
             );
         } else {
-            assert_eq!(result, Err(KernelError::InvalidState.into()), "{kind:?} {before}");
+            assert_eq!(
+                result,
+                Err(KernelError::InvalidState.into()),
+                "{kind:?} {before}"
+            );
             assert!(!w.waiting(0));
         }
         assert_eq!(get(&w), after, "{kind:?} {before}");
@@ -178,7 +186,10 @@ fn signal_wakes_the_first_count_waiters_most_urgent_first_and_all_for_count_up_t
         for &index in &order[..woken] {
             assert_eq!(w.x0(index), word(ResultCode::SUCCESS));
         }
-        let left: Vec<_> = order[woken..].iter().map(|&index| w.threads[index]).collect();
+        let left: Vec<_> = order[woken..]
+            .iter()
+            .map(|&index| w.threads[index])
+            .collect();
         assert_eq!(waiting_on(&w), left, "count {count}");
     }
 }
@@ -194,7 +205,8 @@ fn a_signal_before_the_wait_wakes_nothing_and_the_wait_still_waits() {
         Ok(Arbitrated::Waiting(w.threads[0]))
     );
     // A signal on another address wakes nobody either.
-    w.signal_address(1, AT + 4, SignalType::Signal, 0, 0).unwrap();
+    w.signal_address(1, AT + 4, SignalType::Signal, 0, 0)
+        .unwrap();
     assert!(w.waiting(0));
 }
 
@@ -383,7 +395,10 @@ fn a_timer_ends_an_address_wait_with_timed_out() {
     w.wait_address(0, AT, ArbitrationType::WaitIfEqual, 0, timeout)
         .unwrap();
     let deadline = NOW + AFTER.unsigned_abs() + TIMEOUT_SLACK_NS;
-    assert_eq!(w.scheduler.sync().next_deadline(), Some(HostNanos(deadline)));
+    assert_eq!(
+        w.scheduler.sync().next_deadline(),
+        Some(HostNanos(deadline))
+    );
     assert_eq!(w.fire(deadline - 1), 0);
     assert_eq!(w.fire(deadline), 1);
     assert_eq!(
