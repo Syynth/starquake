@@ -95,11 +95,10 @@ impl Scheduler {
     /// `SignalProcessWideKey` for the thread `core` runs (`KConditionVariable::Signal`), with
     /// `cv_key` aligned down to a word: the first `count` threads waiting on `cv_key` in the
     /// process's tree (all of them for `count <= 0`), most urgent first, each leave the tree and
-    /// try to take their lock ([`Scheduler::signal_condition_variable`]'s `SignalImpl`, below).
-    /// Then, if no thread is left waiting on `cv_key`, [`HAS_NO_WAITER_FLAG`] is written to it;
-    /// a failed write is ignored.
+    /// try to take their lock (`SignalImpl`, below). Then, if no thread is left waiting on
+    /// `cv_key`, [`HAS_NO_WAITER_FLAG`] is written to it; a failed write is ignored.
     ///
-    /// Taking the lock: the lock word is updated atomically, to the thread's tag if it was
+    /// Taking the lock (`KConditionVariable::SignalImpl`): the lock word is updated atomically, to the thread's tag if it was
     /// zero and with [`HANDLE_WAIT_MASK`] set otherwise. A word the guest may not access
     /// atomically ends the thread's wait with [`KernelError::InvalidCurrentMemory`]; a zero word
     /// (no owner) ends it with success. Otherwise the word names the owner's handle (the mask
