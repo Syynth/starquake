@@ -11,27 +11,25 @@
 //! observability spec's order of work: a backtrace by frame pointer, symbol names, and the events
 //! split per thread (there is one guest thread). The exception is one of three kinds: a data
 //! abort, an instruction abort, and everything else as an undefined instruction. The CPU
-//! backend's exits now carry the exception's syndrome (which says whether an abort was a missing
-//! page or a refused access, and what an "undefined instruction" really was); putting it in the
-//! report is the crash-report step's.
+//! backend's syndrome for it ([`CrashReport::with_syndrome`]) says the rest: whether an abort was
+//! a missing page or a refused access, and what an "undefined instruction" really was.
 //!
 //! The JSON layout is this crate's own (the spec gives none), versioned by [`CRASH_VERSION`] and
 //! pinned by a test. Addresses and register values are hex strings, so no reader loses bits to a
-//! floating-point number. The `instruction_abort` kind was added without a new version: nothing
-//! was renamed or removed, and the reports of data aborts and undefined instructions are
-//! unchanged. (Before it, a fetch from an address nothing maps was reported as a `data_abort`
-//! read.)
+//! floating-point number. Version 2 added the `syndrome` field. (The `instruction_abort` kind
+//! came earlier, inside version 1; before it, a fetch from an address nothing maps was reported
+//! as a `data_abort` read.)
 
 use std::fmt::Write as _;
 
 use serde::{Serialize, Serializer};
-use starquake_cpu::GuestRegs;
+use starquake_cpu::{ExceptionClass, FaultStatus, GuestRegs, Syndrome};
 
 use crate::report::Mapping;
 
-/// Version of the `crash.json` layout. Bump it when a field is renamed, removed or changes
-/// meaning.
-pub const CRASH_VERSION: u32 = 1;
+/// Version of the `crash.json` layout. Any change to the layout bumps it: a field or exception
+/// kind added, renamed or removed, or a field's meaning changed.
+pub const CRASH_VERSION: u32 = 2;
 
 /// Serialises a `u64` as a hex string (`"0x80000000"`).
 #[expect(
@@ -83,6 +81,64 @@ pub enum Exception {
     UndefinedInstruction,
 }
 
+/// The exception's syndrome, as the CPU backend reported it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SyndromeReport {
+    /// The syndrome in the architecture's layout (`ESR_EL1`).
+    #[serde(serialize_with = "hex")]
+    pub esr: u64,
+    /// What it says, in words: `data abort, translation fault at level 3`.
+    pub text: String,
+}
+
+impl SyndromeReport {
+    /// The report of `syndrome`.
+    #[must_use]
+    pub fn new(syndrome: Syndrome) -> Self {
+        let class = class_text(syndrome.class());
+        let text = match (syndrome.fault(), syndrome.immediate()) {
+            (Some(fault), _) => format!("{class}, {}", fault_text(fault)),
+            (None, Some(immediate)) => format!("{class} #{immediate:#x}"),
+            (None, None) => class,
+        };
+        Self {
+            esr: syndrome.esr(),
+            text,
+        }
+    }
+}
+
+/// An exception class in words.
+fn class_text(class: ExceptionClass) -> String {
+    match class {
+        ExceptionClass::Unknown => "undefined instruction".to_owned(),
+        ExceptionClass::TrappedWait => "trapped wfi or wfe".to_owned(),
+        ExceptionClass::Svc => "svc".to_owned(),
+        ExceptionClass::TrappedSystemAccess => {
+            "system register or instruction not allowed at EL0".to_owned()
+        }
+        ExceptionClass::PointerAuthentication => "pointer authentication failure".to_owned(),
+        ExceptionClass::InstructionAbort => "instruction abort".to_owned(),
+        ExceptionClass::PcAlignment => "misaligned pc".to_owned(),
+        ExceptionClass::DataAbort => "data abort".to_owned(),
+        ExceptionClass::SpAlignment => "misaligned stack pointer".to_owned(),
+        ExceptionClass::Breakpoint => "brk".to_owned(),
+        ExceptionClass::Other(ec) => format!("exception class {ec:#04x}"),
+    }
+}
+
+/// Why an access aborted, in words.
+fn fault_text(fault: FaultStatus) -> String {
+    match fault {
+        FaultStatus::AddressSize { level } => format!("address size fault at level {level}"),
+        FaultStatus::Translation { level } => format!("translation fault at level {level}"),
+        FaultStatus::AccessFlag { level } => format!("access flag fault at level {level}"),
+        FaultStatus::Permission { level } => format!("permission fault at level {level}"),
+        FaultStatus::Alignment => "alignment fault".to_owned(),
+        FaultStatus::Other(code) => format!("fault status {code:#04x}"),
+    }
+}
+
 /// The guest's registers at the exception.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Registers {
@@ -95,7 +151,8 @@ pub struct Registers {
     /// The program counter: the address of the instruction that took the exception.
     #[serde(serialize_with = "hex")]
     pub pc: u64,
-    /// The flags (NZCV).
+    /// The [`starquake_cpu::GUEST_PSTATE_MASK`] bits of `PSTATE` (the condition flags `NZCV`,
+    /// `DIT` and `SSBS`) in the `SPSR_EL1` layout; every other bit is zero.
     #[serde(serialize_with = "hex")]
     pub pstate: u64,
     /// `TPIDR_EL0`.
@@ -143,6 +200,8 @@ pub struct CrashReport {
     pub command_line: Vec<String>,
     /// What happened.
     pub exception: Exception,
+    /// The exception's syndrome; `null` when the report was built without one.
+    pub syndrome: Option<SyndromeReport>,
     /// The address of the instruction that took the exception.
     #[serde(serialize_with = "hex")]
     pub pc: u64,
@@ -193,6 +252,7 @@ impl CrashReport {
             emulator: format!("starquake {}", env!("CARGO_PKG_VERSION")),
             command_line: command_line.to_vec(),
             exception,
+            syndrome: None,
             pc: regs.pc,
             pc_location,
             fault_mapping,
@@ -208,6 +268,13 @@ impl CrashReport {
             modules: modules.to_vec(),
             last_events,
         }
+    }
+
+    /// The report with `syndrome`, the one the CPU backend reported for the exception.
+    #[must_use]
+    pub fn with_syndrome(mut self, syndrome: Syndrome) -> Self {
+        self.syndrome = Some(SyndromeReport::new(syndrome));
+        self
     }
 
     /// The report as text, for `crash.txt`.
@@ -263,6 +330,9 @@ impl CrashReport {
         }
         writeln!(out)?;
         writeln!(out, "exception: {}", self.exception_text())?;
+        if let Some(SyndromeReport { esr, text }) = &self.syndrome {
+            writeln!(out, "syndrome: {esr:#010x} ({text})")?;
+        }
         writeln!(out, "instruction: {}", self.instruction_text())?;
         writeln!(out, "\nregisters:")?;
         for (row, values) in self.registers.x.chunks(4).enumerate() {
@@ -469,19 +539,102 @@ mod tests {
         );
     }
 
+    /// `ESR_EL1` with exception class `ec` and instruction-specific syndrome `iss`, `IL` set (Arm
+    /// ARM, `ESR_EL1`: `EC` bits 31:26, `IL` bit 25).
+    fn esr(ec: u64, iss: u64) -> Syndrome {
+        Syndrome::from_esr((ec << 26) | (1 << 25) | iss)
+    }
+
+    #[test]
+    fn every_class_and_fault_status_is_said_in_words() {
+        let cases = [
+            (Syndrome::undefined(), "undefined instruction"),
+            (esr(0x01, 0x1e0_0000), "trapped wfi or wfe"),
+            (esr(0x15, 0x27), "svc #0x27"),
+            (
+                esr(0x18, 0x32_0400),
+                "system register or instruction not allowed at EL0",
+            ),
+            (esr(0x1c, 0), "pointer authentication failure"),
+            (esr(0x22, 0), "misaligned pc"),
+            (esr(0x26, 0), "misaligned stack pointer"),
+            (esr(0x3c, 0x123), "brk #0x123"),
+            (esr(0x16, 2), "exception class 0x16"),
+            (
+                Syndrome::data_abort(FaultStatus::AddressSize { level: 1 }, false),
+                "data abort, address size fault at level 1",
+            ),
+            (
+                Syndrome::data_abort(FaultStatus::Translation { level: 2 }, true),
+                "data abort, translation fault at level 2",
+            ),
+            (
+                Syndrome::data_abort(FaultStatus::AccessFlag { level: 3 }, false),
+                "data abort, access flag fault at level 3",
+            ),
+            (
+                Syndrome::instruction_abort(FaultStatus::Permission { level: 3 }),
+                "instruction abort, permission fault at level 3",
+            ),
+            (
+                Syndrome::data_abort(FaultStatus::Alignment, true),
+                "data abort, alignment fault",
+            ),
+            (
+                Syndrome::instruction_abort(FaultStatus::Other(0x30)),
+                "instruction abort, fault status 0x30",
+            ),
+        ];
+        for (syndrome, text) in cases {
+            let report = SyndromeReport::new(syndrome);
+            assert_eq!(report.text, text, "{:#x}", syndrome.esr());
+            assert_eq!(report.esr, syndrome.esr());
+        }
+    }
+
+    #[test]
+    fn the_text_says_the_syndrome_after_the_exception_when_there_is_one() {
+        let plain = report(Exception::UndefinedInstruction);
+        assert_eq!(plain.syndrome, None);
+        assert!(!plain.to_text().contains("syndrome"));
+        let brk = plain.with_syndrome(esr(0x3c, 0x123));
+        assert!(
+            brk.to_text().contains(
+                "exception: undefined instruction\nsyndrome: 0xf2000123 (brk #0x123)\n\
+                 instruction: pc 0x800000b8 (main+0xb8)\n"
+            ),
+            "{}",
+            brk.to_text()
+        );
+        // The ESR is always eight digits, so a class 0x00 syndrome keeps its leading zero.
+        let undefined =
+            report(Exception::UndefinedInstruction).with_syndrome(Syndrome::undefined());
+        assert!(
+            undefined
+                .to_text()
+                .contains("syndrome: 0x02000000 (undefined instruction)\n"),
+            "{}",
+            undefined.to_text()
+        );
+    }
+
     #[test]
     fn the_json_layout_is_pinned() {
         let mut report = report(Exception::DataAbort {
             address: 0x80f0_0010,
             write: true,
-        });
+        })
+        .with_syndrome(Syndrome::data_abort(
+            FaultStatus::Permission { level: 3 },
+            true,
+        ));
         report.emulator = "starquake 9.9.9".into();
         report.registers.x.truncate(2);
         let json = serde_json::to_string_pretty(&report).unwrap();
         assert_eq!(
             json,
             r##"{
-  "version": 1,
+  "version": 2,
   "emulator": "starquake 9.9.9",
   "command_line": [
     "starquake",
@@ -492,6 +645,10 @@ mod tests {
     "kind": "data_abort",
     "address": "0x80f00010",
     "write": true
+  },
+  "syndrome": {
+    "esr": "0x9200004f",
+    "text": "data abort, permission fault at level 3"
   },
   "pc": "0x800000b8",
   "pc_location": {
@@ -535,6 +692,9 @@ mod tests {
   ]
 }"##
         );
+        // The golden text pins the version as a literal, so a layout change that forgets to bump
+        // `CRASH_VERSION` fails here.
+        assert_eq!(CRASH_VERSION, 2);
         let undefined = serde_json::to_value(Exception::UndefinedInstruction).unwrap();
         assert_eq!(
             undefined,
@@ -549,5 +709,22 @@ mod tests {
             serde_json::json!({ "kind": "instruction_abort", "address": "0x80f00010" })
         );
         assert_eq!(report.version, CRASH_VERSION);
+        // A report built without a syndrome says so.
+        let without =
+            serde_json::to_value(super::tests::report(Exception::UndefinedInstruction)).unwrap();
+        // The key is written as `null`, not left out (indexing a missing key would also give
+        // `Null`, so check the object itself).
+        let without = without.as_object().unwrap();
+        assert_eq!(without.get("syndrome"), Some(&serde_json::Value::Null));
+    }
+
+    #[test]
+    fn pstate_carries_dit_and_ssbs_as_well_as_the_flags() {
+        use starquake_cpu::{PSTATE_DIT, PSTATE_NZCV, PSTATE_SSBS};
+        let mut report = report(Exception::UndefinedInstruction);
+        report.registers.pstate = PSTATE_NZCV | PSTATE_DIT | PSTATE_SSBS;
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["registers"]["pstate"], "0xf1001000");
+        assert!(report.to_text().contains("pstate 0xf1001000\n"));
     }
 }
