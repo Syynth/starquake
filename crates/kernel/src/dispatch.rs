@@ -60,6 +60,11 @@
 //! - **Arbitration** (`ArbitrateLock`, `ArbitrateUnlock`, `WaitProcessWideKeyAtomic`,
 //!   `SignalProcessWideKey`, `WaitForAddress`, `SignalToAddress`) has arms of its own, in
 //!   `dispatch/arbitration.rs`; the three that can wait use the same wait path.
+//! - **Shared and transfer memory** (`MapSharedMemory`, `UnmapSharedMemory`,
+//!   `CreateTransferMemory`) have arms of their own, in `dispatch/memory_objects.rs`. A
+//!   transfer memory's last reference can go in any call that drops references; the pages it
+//!   lent are unlocked before the kernel lock is let go, whichever call that was (`Locked`'s
+//!   `Drop`, [`crate::svc::transfer_memory::unlock_released`]).
 //! - **`ExitProcess`** ends the process ([`crate::svc::process::exit_process`]: its threads end
 //!   and its handles close, so the servers of its sessions are told) and the dispatch in
 //!   [`Outcome::ProcessExited`]; the caller stops running the guest. **`ExitThread`** ends the
@@ -213,13 +218,14 @@ use crate::result::{CallResult, KernelError, ResultCode, SvcError};
 use crate::sched::CoreId;
 use crate::svc::{
     Convention, ConventionError, DebugSink, Kind, Status, SvcId, debug, handle, info, memory,
-    processor, thread, tick,
+    processor, thread, tick, transfer_memory,
 };
 use crate::tables::{AddressSpace, Processes, Scheduler};
 
 mod arbitration;
 mod ipc;
 mod lifecycle;
+mod memory_objects;
 mod sync;
 #[cfg(test)]
 mod tests;
@@ -537,6 +543,26 @@ struct Locked<'d, B> {
     declared: PhantomData<fn() -> B>,
 }
 
+/// Before the lock goes, the pages of every transfer memory that went while it was held are
+/// unlocked ([`transfer_memory::unlock_released`]): whatever call dropped the last reference,
+/// the next holder of the lock finds them as `KTransferMemory::Finalize` leaves them. A failure
+/// is the kernel's own bookkeeping, and is logged (see the divergences in
+/// [`crate::svc::transfer_memory`]).
+impl<B> Drop for Locked<'_, B> {
+    fn drop(&mut self) {
+        let tables = &mut self.state.tables;
+        if !tables.scheduler.objects().has_unlocks() {
+            return;
+        }
+        let own = tables.processes.own();
+        let unlocked =
+            transfer_memory::unlock_released(&mut tables.scheduler, &mut tables.address_space, own);
+        if let Err(error) = unlocked {
+            tracing::error!(%error, "unlocking a released transfer memory's pages failed");
+        }
+    }
+}
+
 impl<B: TableSet> Locked<'_, B> {
     /// The declared tables, and nothing else.
     fn tables(&mut self) -> B::Borrowed<'_> {
@@ -852,6 +878,9 @@ impl Dispatcher {
             | SvcId::CancelSynchronization
             | SvcId::CreateEvent => self.synchronization(call, id, convention),
             _ if arbitration::ARMS.contains(&id) => self.arbitration(call, id, convention),
+            SvcId::MapSharedMemory | SvcId::UnmapSharedMemory | SvcId::CreateTransferMemory => {
+                self.memory_object(call, id, convention)
+            }
             SvcId::ConnectToNamedPort => self.connect_to_named_port(call, id, convention),
             SvcId::SendSyncRequest => self.send_sync_request(call, id, convention),
             SvcId::GetSystemTick => self.call::<()>(call, |(), call, time| {

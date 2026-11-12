@@ -2,6 +2,8 @@
 //!
 //! - NSO/NRO executables, NPDM metadata (both the Switch 1 and the Switch 2 ACID layouts),
 //!   ExeFS and RomFS.
+//! - Code sets ([`codeset`]): a module's bytes, segments, `.bss` and size as process creation
+//!   places them, from an NRO or an NSO; an ExeFS's module set in placement order ([`exefs`]).
 //! - ZBIC ([`zbic`]): the zstd variant that compresses a Switch 2 NSO's segments.
 //! - NUP containers ([`nup`]): decrypted dumps that hold a base program, its updates and
 //!   add-ons in one file, read without loading the file whole.
@@ -9,6 +11,8 @@
 //!   `svc` and PAuth returns) into branches to backend-provided stubs. Native backends need this
 //!   because counter reads exit to the host at ~760 ns each (see `tools/hvprobe/README.md`).
 
+pub mod codeset;
+pub mod exefs;
 pub mod npdm;
 pub mod nro;
 pub mod nso;

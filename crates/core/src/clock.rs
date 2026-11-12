@@ -5,17 +5,18 @@
 //! environment's clock, host nanoseconds, with the process's counter rate, and takes the
 //! clock's zero as guest tick zero. Which rate a process gets is the kernel's choice too, made
 //! from the console in its description (`starquake_kernel::process::Console::counter_rate`).
-//! This module is the other half of that contract. It says which console the program was built
-//! for, hands that console's rate to the loader's counter patcher, and builds the environment's
-//! clock from the counter the patched instructions read, so that `GetSystemTick` and a patched
-//! counter read agree on the rate and on where the counter started. `tests/skeleton.rs` reads a
-//! tick each way and checks that they do.
+//! This module is the other half of that contract. The run takes the console from the
+//! program's description (`crate::image::Program::description`), hands that console's rate to
+//! the loader's counter patcher, and builds the environment's clock from the counter the
+//! patched instructions read, so that `GetSystemTick`, a patched counter read and a patched
+//! read of the counter's frequency agree on the rate and on where the counter started.
+//! `tests/skeleton.rs` reads a tick each way and checks that they do; the core loop refuses a
+//! run whose clock and process name different consoles (`crate::machine`).
 //!
-//! PROVISIONAL (walking skeleton, #74): every program is described as built for Switch 1
-//! ([`PROCESS_CONSOLE`]). An NRO carries nothing that says which console it was built for; the
-//! homebrew this skeleton runs is built for the first one (a guess, and the rate the skeleton
-//! ran at before the kernel kept guest time). Wiring the loader's NPDM into process creation
-//! (#33) takes the console from the program's metadata.
+//! An ExeFS's console is its metadata's (`crate::image`, "The process's description"). An NRO
+//! carries nothing that says which console it was built for, so it is described as built for
+//! [`NRO_CONSOLE`]: the homebrew this emulator runs is built for the first Switch (a guess, and
+//! the rate the skeleton ran at before the kernel kept guest time).
 
 use std::num::NonZeroU64;
 
@@ -23,8 +24,8 @@ use starquake_kernel::process::Console;
 use starquake_kernel::time::{CounterRate, NANOS_PER_SECOND};
 use starquake_trace::HostNanos;
 
-/// The console every program is described as built for, for now. See the module docs.
-pub(crate) const PROCESS_CONSOLE: Console = Console::Switch1;
+/// The console an NRO is described as built for. See the module docs.
+pub(crate) const NRO_CONSOLE: Console = Console::Switch1;
 
 /// What a run counts time with: the console its process was built for, and the host clock.
 ///

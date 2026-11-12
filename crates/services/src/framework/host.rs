@@ -21,6 +21,7 @@
 use starquake_kernel::handle::Handle;
 use starquake_kernel::id::ObjectId;
 use starquake_kernel::ipc::{Handled, HandlerError, IpcContext, SessionHandler};
+use starquake_kernel::memory::{SharedPages, SvcPermission};
 use starquake_kernel::result::SvcResult;
 use starquake_trace::{EventKind, ServiceId};
 
@@ -46,6 +47,14 @@ impl Kernel for IpcContext<'_> {
 
     fn signal_event(&mut self, event: ObjectId) -> SvcResult<()> {
         IpcContext::signal_event(self, event)
+    }
+
+    fn create_shared_memory(
+        &mut self,
+        size: u64,
+        permission: SvcPermission,
+    ) -> SvcResult<(ObjectId, SharedPages)> {
+        IpcContext::create_shared_memory(self, size, permission)
     }
 
     fn create_session(&mut self) -> SvcResult<(ObjectId, Handle)> {

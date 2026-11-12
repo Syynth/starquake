@@ -438,12 +438,16 @@ impl SyncTable {
 /// Whether threads can wait on `object`: Eden's classes derived from `KSynchronizationObject`
 /// that starquake has. `KReadableEvent` derives from it directly (`k_readable_event.h`), and
 /// `KThread` and `KProcess` through `KWorkerTask` (`k_worker_task.h`). `KEvent` (`k_event.h`) and
-/// `KClientSession` (`k_client_session.h`) derive from `KAutoObject` only, so they are not.
+/// `KClientSession` (`k_client_session.h`) derive from `KAutoObject` only, so they are not, and
+/// nor are `KSharedMemory` (`k_shared_memory.h`) and `KTransferMemory` (`k_transfer_memory.h`).
 #[must_use]
 pub const fn is_synchronization_object(object: Object) -> bool {
     match object {
         Object::ReadableEvent(_) | Object::Thread(_) | Object::Process(_) => true,
-        Object::Event(_) | Object::Session => false,
+        Object::Event(_)
+        | Object::Session
+        | Object::SharedMemory(_)
+        | Object::TransferMemory(_) => false,
     }
 }
 
@@ -484,7 +488,10 @@ impl Scheduler {
             Object::ReadableEvent(event) => Ok(event.is_signalled()),
             Object::Thread(thread) => Ok(self.thread(thread)?.state() == ThreadState::Terminated),
             Object::Process(_) => Ok(false),
-            other @ (Object::Event(_) | Object::Session) => Err(SvcError::Internal(format!(
+            other @ (Object::Event(_)
+            | Object::Session
+            | Object::SharedMemory(_)
+            | Object::TransferMemory(_)) => Err(SvcError::Internal(format!(
                 "{object:?} is {other:?}, not a synchronisation object"
             ))),
         }

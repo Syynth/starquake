@@ -5,9 +5,10 @@
 //! that are only an id into another table ([`Object::Thread`], [`Object::Process`]) and the
 //! client end of a session ([`Object::Session`], whose row in the IPC table, [`crate::ipc`], is
 //! keyed by the object's own id), and an event's two ends ([`Object::Event`],
-//! [`Object::ReadableEvent`], whose state is the row itself; see [`crate::sync`]); shared and
-//! transfer memory and resource limits get their variants from the slices that build them, and
-//! the compiler then points at every match that must handle them.
+//! [`Object::ReadableEvent`], whose state is the row itself; see [`crate::sync`]), and shared
+//! and transfer memory ([`Object::SharedMemory`], [`Object::TransferMemory`], whose state is the
+//! row itself too; see [`crate::memory::shared`]). Resource limits get their variant from the
+//! slice that builds them, and the compiler then points at every match that must handle it.
 //!
 //! Rows live in the scheduler table ([`Scheduler::objects`](crate::sched::Scheduler::objects)):
 //! the spec puts events and sessions under the scheduler's lock, and a thread's object row
@@ -39,6 +40,18 @@
 //!   here: closing the last reference frees the object's row and returns what it named, and
 //!   [`crate::sched::Scheduler::tear_down`] destroys that (a session, a thread). Test:
 //!   `closing_the_last_reference_frees_the_row_and_reports_what_it_named`.
+//!
+//! # A transfer memory's last reference
+//!
+//! Destroying a transfer memory whose owner's pages are locked unlocks them
+//! (`KTransferMemory::Finalize`), which needs the owner's address space, a table that most of
+//! the paths that drop a reference do not hold (closing a handle, settling an IPC request).
+//! So the one place every last reference goes through, [`Objects::release`], keeps the
+//! transfer memory as a follow-up ([`Objects::take_unlocks`]), and the dispatcher, the only
+//! code that holds every table, unlocks the pages before it lets the kernel lock go
+//! ([`crate::svc::transfer_memory::unlock_released`]). No other call can run in between, so no
+//! guest sees the pages locked by an object that is gone. Test:
+//! `releasing_a_locked_transfer_memory_leaves_its_unlock_to_do`.
 
 use std::num::NonZeroU32;
 
@@ -46,6 +59,7 @@ use thiserror::Error;
 
 use crate::handle::{Closed, ObjectRefs, RefError};
 use crate::id::{ObjectId, ProcessId, ThreadId};
+use crate::memory::{SharedMemory, TransferMemory};
 use crate::result::SvcError;
 use crate::slab::{Slab, SlabError};
 use crate::sync::{Event, ReadableEvent};
@@ -65,6 +79,10 @@ pub enum Object {
     Event(Event),
     /// The readable end of an event (Horizon's `KReadableEvent`): what threads wait on.
     ReadableEvent(ReadableEvent),
+    /// A shared memory (Horizon's `KSharedMemory`): what `MapSharedMemory` maps.
+    SharedMemory(SharedMemory),
+    /// A transfer memory (Horizon's `KTransferMemory`): what `CreateTransferMemory` makes.
+    TransferMemory(TransferMemory),
 }
 
 /// Why an object table operation failed.
@@ -118,6 +136,9 @@ struct Row {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Objects {
     rows: Slab<ObjectId, Row>,
+    /// Transfer memories whose last reference went while their owner's pages were locked, in
+    /// the order they went: the pages are still to be unlocked (see the module docs).
+    unlocks: Vec<TransferMemory>,
 }
 
 impl Default for Objects {
@@ -130,7 +151,10 @@ impl Objects {
     /// An empty table that can hold as many objects as an id can address.
     #[must_use]
     pub fn new() -> Self {
-        Self { rows: Slab::new() }
+        Self {
+            rows: Slab::new(),
+            unlocks: Vec::new(),
+        }
     }
 
     /// An empty table that holds at most `max_slots` objects.
@@ -138,6 +162,7 @@ impl Objects {
     pub fn with_max_slots(max_slots: u32) -> Self {
         Self {
             rows: Slab::with_max_slots(max_slots),
+            unlocks: Vec::new(),
         }
     }
 
@@ -192,7 +217,8 @@ impl Objects {
     }
 
     /// Drops one reference to `id`. If it was the last, the object's row is freed and the
-    /// object it held is returned, so the caller can tear down what it named.
+    /// object it held is returned, so the caller can tear down what it named. A transfer
+    /// memory whose owner's pages are locked is kept for [`Objects::take_unlocks`] as well.
     pub fn release(&mut self, id: ObjectId) -> Result<Option<Object>, ObjectError> {
         let row = self.rows.get_mut(id).map_err(|_| Self::stale(id))?;
         if let Some(left) = NonZeroU32::new(row.refs.get() - 1) {
@@ -200,7 +226,25 @@ impl Objects {
             return Ok(None);
         }
         let row = self.rows.remove(id).map_err(|_| ObjectError::Corrupt)?;
+        if let Object::TransferMemory(transfer) = row.object
+            && transfer.is_locked()
+        {
+            self.unlocks.push(transfer);
+        }
         Ok(Some(row.object))
+    }
+
+    /// Whether a transfer memory is gone whose owner's pages are still locked.
+    #[must_use]
+    pub fn has_unlocks(&self) -> bool {
+        !self.unlocks.is_empty()
+    }
+
+    /// The transfer memories that are gone while their owner's pages were locked, oldest
+    /// first, and forgets them: the caller unlocks the pages
+    /// ([`crate::svc::transfer_memory::unlock_released`]).
+    pub fn take_unlocks(&mut self) -> Vec<TransferMemory> {
+        std::mem::take(&mut self.unlocks)
     }
 }
 
@@ -379,6 +423,37 @@ mod tests {
         );
         assert!(handles.is_empty());
         assert_eq!(handles.get(Handle::INVALID).ok(), None);
+    }
+
+    #[test]
+    fn releasing_a_locked_transfer_memory_leaves_its_unlock_to_do() {
+        use crate::memory::SvcPermission;
+        let owner = ProcessId::from_parts(0, 1);
+        let lent = TransferMemory::new(owner, 0x20_0000, 0x3000, SvcPermission::None);
+        let locked = lent.with_pages_locked();
+        let mut objects = Objects::new();
+        // Pages never locked (a creation that failed before the lock): nothing to undo.
+        let never = objects.create(Object::TransferMemory(lent)).unwrap();
+        assert_eq!(
+            objects.release(never),
+            Ok(Some(Object::TransferMemory(lent)))
+        );
+        assert!(!objects.has_unlocks());
+        // Locked, and a reference left: nothing yet.
+        let id = objects.create(Object::TransferMemory(locked)).unwrap();
+        objects.open(id).unwrap();
+        assert_eq!(objects.release(id), Ok(None));
+        assert!(!objects.has_unlocks());
+        // The last reference, by a handle's close: the unlock waits for whoever holds the
+        // owner's address space.
+        assert_eq!(objects.close(id), Ok(Closed::Last));
+        assert!(objects.has_unlocks());
+        // Other kinds leave nothing to do.
+        let event = objects.create(thread(1)).unwrap();
+        objects.release(event).unwrap();
+        assert_eq!(objects.take_unlocks(), vec![locked]);
+        assert!(!objects.has_unlocks());
+        assert_eq!(objects.take_unlocks(), Vec::new());
     }
 
     #[test]

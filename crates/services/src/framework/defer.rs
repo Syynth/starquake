@@ -42,12 +42,10 @@
 //! re-run from the start, which is a different mechanism. This design is the execution model
 //! spec's.
 //!
-//! # Not here yet
-//!
-//! A completion carries a [`Reply`]: a payload, handles and new interfaces. It cannot write into
-//! the caller's buffers, because the thread that completes a token has no access to guest memory.
-//! The first service that defers a read (`fsp-srv`, service port slice 6) needs that; the
-//! delivery step has the kernel in hand, so it can be added there.
+//! A completion carries a [`Reply`]: a payload, handles, new interfaces, and bytes for the
+//! caller's out buffers ([`Reply::write_buffer`]). The thread that completes a token has no access
+//! to guest memory; the bytes are written when the reply is delivered, by the kernel that speaks
+//! for the caller then.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};

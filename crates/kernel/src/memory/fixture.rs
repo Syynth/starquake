@@ -61,3 +61,25 @@ pub(crate) fn loaded() -> (AddressSpace, MapperLog, u64) {
     drop(log.take());
     (space, log, stack_top)
 }
+
+/// A free place in the fixture's address space where shared memory may go: inside the code
+/// region (the alias-code region of a 39-bit space), below the code and outside the heap and
+/// alias regions.
+pub(crate) const SHARED: u64 = 0x4000_0000;
+
+/// Makes a shared memory of `pages` pages that processes map with `permission`, as a server
+/// does ([`crate::dispatch::IpcContext::create_shared_memory`]): its object, which holds the
+/// creator's reference, and its pages.
+pub(crate) fn shared_memory(
+    space: &mut AddressSpace,
+    objects: &mut crate::object::Objects,
+    pages: u64,
+    permission: SvcPermission,
+) -> (crate::id::ObjectId, super::SharedPages) {
+    let shared = space.allocate_shared(pages * PAGE_SIZE).unwrap();
+    let memory = super::SharedMemory::new(shared.backing(), permission).unwrap();
+    let object = objects
+        .create(crate::object::Object::SharedMemory(memory))
+        .unwrap();
+    (object, shared)
+}

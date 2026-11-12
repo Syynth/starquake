@@ -52,7 +52,7 @@ Every system call and service request in the trace that starquake does not imple
 each, in the order of first use. "Line" is the line of `startup.trace`, counting its comment
 lines from 1. A call is listed when its status in `starquake_kernel::svc::SvcId` is not
 `Implemented`; a request when it is not a control command the service framework answers
-(`IpcController`) and not a command of a service starquake has (`sm:`, `set:sys`) under the same
+(`IpcController`) and not a command of a service starquake has (`sm:`, `set:sys`, `fsp-srv`) under the same
 name. The result is the reference's: a call's own result, or for a request the result of the
 `SendSyncRequest` that carried it (the trace does not record a reply's own result code).
 Requests to a sub-interface (`IApplicationProxy`, `ISelfController`, ...) are named by the
@@ -89,7 +89,6 @@ the two markers below differs; its failure message holds the text to put there.
 | 87 | `ipc ISelfController::12 (SetPerformanceModeChangedNotification)` | `0x0` |
 | 93 | `ipc hid::0 (CreateAppletResource)` | `0x0` |
 | 95 | `ipc IAppletResource::0 (GetSharedMemoryHandle)` | `0x0` |
-| 102 | `svc 0x13 MapSharedMemory` | `0x0` |
 | 107 | `ipc time:u::0 (GetStandardUserSystemClock)` | `0x0` |
 | 109 | `ipc time:u::1 (GetStandardNetworkSystemClock)` | `0x0` |
 | 111 | `ipc time:u::2 (GetStandardSteadyClock)` | `0x0` |
@@ -97,8 +96,6 @@ the two markers below differs; its failure message holds the text to put there.
 | 115 | `ipc time:u::4 (GetStandardLocalSystemClock)` | `0x0` |
 | 117 | `ipc time:u::20 (GetSharedMemoryNativeHandle)` | `0x0` |
 | 121 | `ipc ITimeZoneService::101 (ToCalendarTimeWithMyRule)` | `0x0` |
-| 129 | `ipc fsp-srv::1 (SetCurrentProcess)` | `0x0` |
-| 135 | `ipc fsp-srv::18 (OpenSdCardFileSystem)` | `0x0` |
 | 141 | `ipc vi:m::2 (GetDisplayService)` | `0x0` |
 | 143 | `ipc IApplicationDisplayService::100 (GetRelayService)` | `0x0` |
 | 145 | `ipc IApplicationDisplayService::101 (GetSystemDisplayService)` | `0x0` |
@@ -111,7 +108,6 @@ the two markers below differs; its failure message holds the text to put there.
 | 159 | `ipc IHOSBinderDriver::1 (AdjustRefcount)` | `0x0` |
 | 163 | `ipc IHOSBinderDriver::2 (GetNativeHandle)` | `0x0` |
 | 165 | `ipc IHOSBinderDriver::3 (TransactParcelAuto)` | `0x0` |
-| 171 | `svc 0x15 CreateTransferMemory` | `0x0` |
 | 172 | `ipc nvdrv::3 (Initialize)` | `0x0` |
 | 177 | `ipc nvdrv::8 (SetAruid)` | `0x0` |
 | 179 | `ipc nvdrv::0 (Open)` | `0x0` |
@@ -119,7 +115,6 @@ the two markers below differs; its failure message holds the text to put there.
 | 204 | `ipc nvdrv::2 (Close)` | `0x0` |
 | 218 | `ipc IApplicationDisplayService::2021 (CloseLayer)` | `0x0` |
 | 220 | `ipc IApplicationDisplayService::1020 (CloseDisplay)` | `0x0` |
-| 241 | `svc 0x14 UnmapSharedMemory` | `0x0` |
 | 267 | `ipc ISelfController::0 (Exit)` | `0x7601` |
 <!-- end of the gap list -->
 

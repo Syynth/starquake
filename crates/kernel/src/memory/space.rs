@@ -11,6 +11,11 @@
 //!   `KProcess::Initialize` (reserve and map the code), of `KProcess::Run` (reserve and map the
 //!   main thread's stack, set the largest heap), and `GetUsedUserPhysicalMemorySize` and
 //!   `GetTotalUserPhysicalMemorySize`.
+//! - `eden/src/core/hle/kernel/k_page_table_base.cpp` @ cf654052, for shared and transfer
+//!   memory: `MapPageGroup` (the form with an address) and `UnmapPageGroup`, which
+//!   `KSharedMemory::Map` and `Unmap` call with `KMemoryState::Shared`;
+//!   `LockForTransferMemory` and `UnlockForTransferMemory`, through `LockMemoryAndOpen` and
+//!   `UnlockMemory`.
 //!
 //! Each operation checks the block map, makes the change real through the [`Mapper`], and
 //! then updates the block map, in Eden's order (`Operate`, then `m_memory_block_manager.Update`).
@@ -47,19 +52,44 @@
 //! - **A failed [`Mapper`]** ends the operation as an internal failure with nothing changed.
 //!   Eden's `Operate` cannot fail on the paths ported here. Test:
 //!   `a_refusing_translation_fails_the_call_and_changes_nothing`.
+//! - **No page groups.** `UnmapPageGroup` checks that the range holds the shared memory's own
+//!   pages (`IsValidPageGroup`, `ResultInvalidCurrentMemory` otherwise). With no physical pages
+//!   to compare, the address space records which shared memory each mapping it made holds and
+//!   where it starts, and refuses with the same result unless the range is exactly such a
+//!   mapping of the same shared memory. Eden's check passes in the same cases: a mapping is the
+//!   shared memory's pages in order from its first byte, so a range that starts anywhere else,
+//!   or holds another shared memory, fails it. Test:
+//!   `unmapping_shared_memory_needs_the_mapping_of_that_shared_memory_at_its_start`.
+//!   `UnlockForTransferMemory`'s page-group check (`IsValidPageGroup`,
+//!   `ResultInvalidMemoryRegion` otherwise) is not made at all: nothing but the transfer memory
+//!   that locked a range can unlock it (it is the only caller), and a locked range cannot change
+//!   underneath it. The operations here that change a range already in use refuse a block with
+//!   [`MemoryAttribute::LOCKED`]: [`AddressSpace::set_memory_permission`],
+//!   [`AddressSpace::set_process_memory_permission`], the heap shrink of
+//!   [`AddressSpace::set_heap_size`], [`AddressSpace::lock_for_transfer_memory`] and
+//!   [`AddressSpace::unmap_shared`] check for no attributes at all, and
+//!   [`AddressSpace::set_memory_attribute`] for none outside the settable ones and
+//!   `DeviceShared`; [`AddressSpace::map_shared`] and [`AddressSpace::map_pages`] (heap growth
+//!   too) need the range free, which a lent range never is. Test:
+//!   `svc::transfer_memory::tests::while_lent_the_owner_cannot_change_the_pages_and_closing_the_handle_gives_them_back`
+//!   (`SetMemoryPermission`, `SetMemoryAttribute`, the heap shrink and a second lend, each
+//!   refused while the pages are lent).
 
 use core::fmt;
+use std::collections::BTreeMap;
 
-use starquake_memory::PAGE_SIZE;
+use starquake_memory::{BackingRange, PAGE_SIZE};
 
 use super::block::MemoryBlock;
 use super::block_map::{BlockMap, BlockMapError};
 use super::layout::{LayoutError, LayoutRequest, Region, RegionOffsets, Regions, pages_to_bytes};
 use super::mapper::{Mapper, MapperError};
 use super::pool::{MemoryArrangement, MemoryLimit};
+use super::shared::{SharedMemory, SharedPages};
 use super::state::{
     DisableMerge, MemoryAttribute, MemoryPermission, MemoryState, STATE_ALL, SvcPermission, flag,
 };
+use crate::id::ObjectId;
 use crate::result::{CallResult, KernelError, SvcError, SvcResult};
 
 /// Free pages kept on each side of a mapping the kernel places for a process
@@ -146,6 +176,7 @@ struct Checked {
 struct Change {
     state: MemoryState,
     permission: MemoryPermission,
+    attribute: MemoryAttribute,
     set: DisableMerge,
     clear: DisableMerge,
 }
@@ -154,8 +185,12 @@ struct Change {
 #[derive(Debug, Clone, Copy)]
 enum Effect {
     Map,
+    /// Map the pages of a shared memory ([`Mapper::map_shared`]).
+    MapShared(BackingRange),
     Unmap,
     Protect,
+    /// Nothing: the change is to the bookkeeping alone (`Operate` is not called).
+    Keep,
 }
 
 impl Effect {
@@ -163,10 +198,20 @@ impl Effect {
     const fn verb(self) -> &'static str {
         match self {
             Self::Map => "map",
+            Self::MapShared(_) => "map shared memory over",
             Self::Unmap => "unmap",
             Self::Protect => "reprotect",
+            Self::Keep => "keep",
         }
     }
+}
+
+/// One shared memory mapping the address space made: which shared memory it holds, and how
+/// many bytes. Keyed by where it starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SharedMapping {
+    object: ObjectId,
+    size: u64,
 }
 
 /// One process's memory blocks, regions, heap and memory accounting (kernel spec, "Tables
@@ -186,6 +231,9 @@ pub struct AddressSpace {
     code_size: u64,
     /// Bytes of the main thread's stack (`KProcess::m_main_thread_stack_size`).
     main_thread_stack_size: u64,
+    /// The shared memory mapped here, by where each mapping starts (see "No page groups" in
+    /// the module docs).
+    shared: BTreeMap<u64, SharedMapping>,
     mapper: Box<dyn Mapper>,
 }
 
@@ -200,6 +248,7 @@ impl fmt::Debug for AddressSpace {
             .field("limit", &self.limit)
             .field("code_size", &self.code_size)
             .field("main_thread_stack_size", &self.main_thread_stack_size)
+            .field("shared", &self.shared)
             .finish_non_exhaustive()
     }
 }
@@ -247,6 +296,7 @@ impl AddressSpace {
             limit: MemoryLimit::new(memory.arrangement.application_pool_size()),
             code_size: memory.code_size,
             main_thread_stack_size: 0,
+            shared: BTreeMap::new(),
             mapper,
         };
         // Reserve memory for our code resource.
@@ -439,12 +489,12 @@ impl AddressSpace {
         let Change {
             state,
             permission,
+            attribute,
             set,
             clear,
         } = change;
-        let none = MemoryAttribute::NONE;
         self.blocks
-            .check_update(address, pages, state, permission, none)
+            .check_update(address, pages, state, permission, attribute)
             .map_err(broken)?;
         let size = pages_to_bytes(pages).ok_or(KernelError::InvalidCurrentMemory)?;
         let perms = permission.guest().ok_or_else(|| {
@@ -461,13 +511,15 @@ impl AddressSpace {
         };
         match effect {
             Effect::Map => self.mapper.map(address, size, perms?),
+            Effect::MapShared(backing) => self.mapper.map_shared(address, backing, perms?),
             Effect::Unmap => self.mapper.unmap(address, size),
             Effect::Protect => self.mapper.protect(address, size, perms?),
+            Effect::Keep => Ok(()),
         }
         .map_err(refused)?;
         // `check_update` passed and nothing has touched the map since, so this cannot fail.
         self.blocks
-            .update(address, pages, state, permission, none, set, clear)
+            .update(address, pages, state, permission, attribute, set, clear)
             .map_err(broken)
     }
 
@@ -494,6 +546,7 @@ impl AddressSpace {
         let change = Change {
             state,
             permission,
+            attribute: MemoryAttribute::NONE,
             set: DisableMerge::NORMAL,
             clear: DisableMerge::NONE,
         };
@@ -616,6 +669,7 @@ impl AddressSpace {
         let change = Change {
             state: new_state,
             permission: new_permission,
+            attribute: MemoryAttribute::NONE,
             set: DisableMerge::NONE,
             clear: DisableMerge::NONE,
         };
@@ -644,6 +698,7 @@ impl AddressSpace {
         let change = Change {
             state: old.state,
             permission: new_permission,
+            attribute: MemoryAttribute::NONE,
             set: DisableMerge::NONE,
             clear: DisableMerge::NONE,
         };
@@ -736,6 +791,7 @@ impl AddressSpace {
             let change = Change {
                 state: MemoryState::Free,
                 permission: MemoryPermission::NONE,
+                attribute: MemoryAttribute::NONE,
                 set: DisableMerge::NONE,
                 clear: if size == 0 {
                     DisableMerge::NORMAL
@@ -767,6 +823,7 @@ impl AddressSpace {
         let change = Change {
             state: MemoryState::Normal,
             permission: MemoryPermission::USER_READ_WRITE,
+            attribute: MemoryAttribute::NONE,
             set: if first {
                 DisableMerge::NORMAL
             } else {
@@ -775,6 +832,189 @@ impl AddressSpace {
             clear: DisableMerge::NONE,
         };
         self.apply(self.heap_end, pages, change, Effect::Map)
+    }
+
+    /// Backing for a new shared memory of `size` bytes, from the [`Mapper`]
+    /// ([`Mapper::allocate_shared`]). `size` is whole pages and not zero: the caller rounds it
+    /// ([`super::shared_memory_size`]). Pages of any other size than asked for are refused.
+    ///
+    /// An internal failure when the translation has no backing to share, or refuses.
+    pub fn allocate_shared(&mut self, size: u64) -> CallResult<SharedPages> {
+        if !size.is_multiple_of(PAGE_SIZE) || size == 0 {
+            return Err(SvcError::Internal(format!(
+                "shared memory of {size:#x} bytes is not whole pages"
+            )));
+        }
+        let pages = self.mapper.allocate_shared(size).map_err(|error| {
+            SvcError::Internal(format!(
+                "the translation gave no backing for {size:#x} bytes of shared memory: {error}"
+            ))
+        })?;
+        if pages.size() != size {
+            return Err(SvcError::Internal(format!(
+                "the translation gave {:#x} bytes of shared memory for {size:#x}",
+                pages.size()
+            )));
+        }
+        Ok(pages)
+    }
+
+    /// Maps the shared memory `memory`, which `object` names, at `address` with `permission`
+    /// (`MapPageGroup(addr, pg, KMemoryState::Shared, perm)`), and records the mapping for
+    /// [`Self::unmap_shared`]. The range is the shared memory's size.
+    ///
+    /// [`KernelError::InvalidCurrentMemory`] unless the range may hold shared memory
+    /// ([`Self::can_contain`]) and is free.
+    pub fn map_shared(
+        &mut self,
+        address: u64,
+        object: ObjectId,
+        memory: SharedMemory,
+        permission: SvcPermission,
+    ) -> CallResult<()> {
+        let size = memory.size();
+        // Ensure this is a valid map request.
+        if !self.can_contain(address, size, MemoryState::Shared) {
+            return Err(KernelError::InvalidCurrentMemory.into());
+        }
+        let pages = self.pages_of(address, size)?;
+        // Check if state allows us to map.
+        self.check_memory_state(address, size, &Check::FREE)?;
+        let change = Change {
+            state: MemoryState::Shared,
+            permission: MemoryPermission::from_svc(permission),
+            attribute: MemoryAttribute::NONE,
+            set: DisableMerge::NORMAL,
+            clear: DisableMerge::NONE,
+        };
+        self.apply(address, pages, change, Effect::MapShared(memory.backing()))?;
+        self.shared.insert(address, SharedMapping { object, size });
+        Ok(())
+    }
+
+    /// Unmaps the `size` bytes of shared memory at `address`, which must be a mapping of the
+    /// shared memory `object` names that [`Self::map_shared`] made there
+    /// (`UnmapPageGroup(address, pg, KMemoryState::Shared)`).
+    ///
+    /// [`KernelError::InvalidCurrentMemory`] unless the range may hold shared memory, is shared
+    /// memory with no attributes throughout, and is that mapping (see "No page groups" in the
+    /// module docs).
+    pub fn unmap_shared(&mut self, address: u64, size: u64, object: ObjectId) -> CallResult<()> {
+        let invalid = KernelError::InvalidCurrentMemory;
+        // Ensure this is a valid unmap request.
+        if !self.can_contain(address, size, MemoryState::Shared) {
+            return Err(invalid.into());
+        }
+        let pages = self.pages_of(address, size)?;
+        // Check if state allows us to unmap.
+        let check = Check {
+            state_mask: STATE_ALL,
+            state: MemoryState::Shared.word(),
+            permission_mask: MemoryPermission::NONE,
+            permission: MemoryPermission::NONE,
+            attribute_mask: MemoryAttribute::ALL,
+            attribute: MemoryAttribute::NONE,
+            ignore: MemoryAttribute::COUNTED,
+        };
+        self.check_memory_state(address, size, &check)?;
+        // Check that the page group is valid.
+        if self.shared.get(&address) != Some(&SharedMapping { object, size }) {
+            return Err(invalid.into());
+        }
+        let change = Change {
+            state: MemoryState::Free,
+            permission: MemoryPermission::NONE,
+            attribute: MemoryAttribute::NONE,
+            set: DisableMerge::NONE,
+            clear: DisableMerge::NORMAL,
+        };
+        self.apply(address, pages, change, Effect::Unmap)?;
+        self.shared.remove(&address);
+        Ok(())
+    }
+
+    /// Lends `size` bytes at `address` to a transfer memory (`LockForTransferMemory`): the
+    /// blocks get [`MemoryAttribute::LOCKED`], and the owner keeps `permission` of them.
+    ///
+    /// [`KernelError::InvalidCurrentMemory`] unless the range lies inside the address space
+    /// (`Contains`), is memory that can be transferred (a state with [`flag::CAN_TRANSFER`])
+    /// with one state throughout, is read-write for the user, and has no attributes but the
+    /// counted ones.
+    pub fn lock_for_transfer_memory(
+        &mut self,
+        address: u64,
+        size: u64,
+        permission: SvcPermission,
+    ) -> CallResult<()> {
+        let pages = self.pages_of(address, size)?;
+        // Check the state.
+        let lockable = flag::CAN_TRANSFER | flag::REFERENCE_COUNTED;
+        let check = Check {
+            state_mask: lockable,
+            state: lockable,
+            permission_mask: MemoryPermission::ALL,
+            permission: MemoryPermission::USER_READ_WRITE,
+            attribute_mask: MemoryAttribute::ALL,
+            attribute: MemoryAttribute::NONE,
+            ignore: MemoryAttribute::COUNTED,
+        };
+        let old = self.check_memory_state(address, size, &check)?;
+        // Decide on new perm and attr. (`ConvertToKMemoryPermission` always sets the kernel's
+        // read bit, so the new permission is never `None` and always replaces the old one.)
+        let new_permission = MemoryPermission::from_svc(permission);
+        let change = Change {
+            state: old.state,
+            permission: new_permission,
+            attribute: MemoryAttribute::LOCKED,
+            set: DisableMerge::LOCKED,
+            clear: DisableMerge::NONE,
+        };
+        // Update permission, if we need to.
+        let effect = if new_permission == old.permission {
+            Effect::Keep
+        } else {
+            Effect::Protect
+        };
+        self.apply(address, pages, change, effect)
+    }
+
+    /// Takes back `size` bytes at `address` from the transfer memory they were lent to
+    /// (`UnlockForTransferMemory`): [`MemoryAttribute::LOCKED`] goes, and the owner may read
+    /// and write them again.
+    ///
+    /// [`KernelError::InvalidCurrentMemory`] unless the range lies inside the address space, is
+    /// memory that can be transferred with one state and permission throughout, and has
+    /// [`MemoryAttribute::LOCKED`] and no other attribute but the counted ones.
+    pub fn unlock_for_transfer_memory(&mut self, address: u64, size: u64) -> CallResult<()> {
+        let pages = self.pages_of(address, size)?;
+        // Check the state.
+        let lockable = flag::CAN_TRANSFER | flag::REFERENCE_COUNTED;
+        let check = Check {
+            state_mask: lockable,
+            state: lockable,
+            permission_mask: MemoryPermission::NONE,
+            permission: MemoryPermission::NONE,
+            attribute_mask: MemoryAttribute::ALL,
+            attribute: MemoryAttribute::LOCKED,
+            ignore: MemoryAttribute::COUNTED,
+        };
+        let old = self.check_memory_state(address, size, &check)?;
+        // Decide on new perm and attr.
+        let new_permission = MemoryPermission::USER_READ_WRITE;
+        let change = Change {
+            state: old.state,
+            permission: new_permission,
+            attribute: MemoryAttribute::NONE,
+            set: DisableMerge::NONE,
+            clear: DisableMerge::LOCKED,
+        };
+        // Update permission, if we need to.
+        let effect = if new_permission == old.permission {
+            Effect::Keep
+        } else {
+            Effect::Protect
+        };
+        self.apply(address, pages, change, effect)
     }
 
     /// The block that holds `address` (`QueryInfo`). Above the address space it is one

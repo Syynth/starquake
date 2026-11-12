@@ -15,6 +15,10 @@ use std::sync::Arc;
 
 use starquake_kernel::handle::{Handle, HandleError, HandleTable, RefCounts};
 use starquake_kernel::id::{ObjectId, SlabId};
+use starquake_kernel::memory::testing::standalone_shared_pages;
+use starquake_kernel::memory::{
+    SharedPages, SvcPermission, is_shared_memory_permission, shared_memory_size,
+};
 use starquake_kernel::result::{KernelError, ResultCode, SvcResult};
 use starquake_trace::{
     Event, EventKind, GuestTicks, Recorder, ServiceId, ThreadId, VecSink, golden_trace,
@@ -56,6 +60,8 @@ pub struct FakeKernel {
     refs: RefCounts,
     minted: u32,
     events: BTreeMap<ObjectId, u32>,
+    /// The shared memories made, with the permission the caller maps each with.
+    shared: BTreeMap<ObjectId, (SharedPages, SvcPermission)>,
     sessions: Vec<ObjectId>,
     regions: Vec<Region>,
     /// The services [`Kernel::connect`] knows.
@@ -88,6 +94,7 @@ impl FakeKernel {
             refs: RefCounts::new(),
             minted: 0,
             events: BTreeMap::new(),
+            shared: BTreeMap::new(),
             sessions: Vec::new(),
             regions: Vec::new(),
             services: BTreeSet::new(),
@@ -169,6 +176,15 @@ impl FakeKernel {
         self.events.get(&event).copied()
     }
 
+    /// The pages of a shared memory [`Kernel::create_shared_memory`] made, and the permission
+    /// the caller maps it with; `None` for any other id.
+    #[must_use]
+    pub fn shared_memory(&self, object: ObjectId) -> Option<(&SharedPages, SvcPermission)> {
+        self.shared
+            .get(&object)
+            .map(|(pages, permission)| (pages, *permission))
+    }
+
     /// The sessions [`Kernel::create_session`] has created, oldest first.
     #[must_use]
     pub fn sessions(&self) -> &[ObjectId] {
@@ -221,6 +237,25 @@ impl Kernel for FakeKernel {
         let signals = signals.ok_or(KernelError::InvalidHandle)?;
         *signals = signals.saturating_add(1);
         Ok(())
+    }
+
+    /// The kernel's checks, in its order; the pages are host memory of their own, allocated
+    /// at once, so more than
+    /// [`SHARED_CAPACITY`](starquake_kernel::memory::testing::SHARED_CAPACITY) bytes is [`KernelError::OutOfMemory`]
+    /// ([`standalone_shared_pages`]).
+    fn create_shared_memory(
+        &mut self,
+        size: u64,
+        permission: SvcPermission,
+    ) -> SvcResult<(ObjectId, SharedPages)> {
+        let size = shared_memory_size(size).ok_or(KernelError::InvalidSize)?;
+        if !is_shared_memory_permission(permission) {
+            return Err(KernelError::InvalidNewMemoryPermission);
+        }
+        let pages = standalone_shared_pages(size).ok_or(KernelError::OutOfMemory)?;
+        let object = self.new_object();
+        self.shared.insert(object, (pages.clone(), permission));
+        Ok((object, pages))
     }
 
     fn create_session(&mut self) -> SvcResult<(ObjectId, Handle)> {

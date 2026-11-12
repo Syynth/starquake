@@ -534,9 +534,12 @@ impl Scheduler {
             .map_err(|_| KernelError::InvalidHandle)?;
         match self.objects().get(object)? {
             Object::Thread(thread) => Ok((object, thread)),
-            Object::Process(_) | Object::Session | Object::Event(_) | Object::ReadableEvent(_) => {
-                Err(KernelError::InvalidHandle.into())
-            }
+            Object::Process(_)
+            | Object::Session
+            | Object::Event(_)
+            | Object::ReadableEvent(_)
+            | Object::SharedMemory(_)
+            | Object::TransferMemory(_) => Err(KernelError::InvalidHandle.into()),
         }
     }
 
