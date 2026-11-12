@@ -35,9 +35,9 @@ use starquake_memory::GuestMemory;
 
 pub use asid::{AsidError, AsidPool};
 pub use description::{
-    AddressSpaceWidth, Console, KERNEL_PRIORITY_MASK, LEGACY_VIRTUAL_CORE_COUNT, ProcessDescription,
-    ProcessError, ProcessInfo, Range, VIRTUAL_CORE_COUNT, VIRTUAL_TO_PHYSICAL_CORE, physical_core,
-    physical_mask,
+    AddressSpaceWidth, Console, KERNEL_PRIORITY_MASK, LEGACY_VIRTUAL_CORE_COUNT,
+    ProcessDescription, ProcessError, ProcessInfo, Range, VIRTUAL_CORE_COUNT,
+    VIRTUAL_TO_PHYSICAL_CORE, physical_core, physical_mask,
 };
 pub use record::{ProcessRecord, ProcessState};
 pub use tls::{
@@ -102,39 +102,63 @@ pub struct MainThread {
     pub handle: Handle,
 }
 
-/// Starts the process `process` (`KProcess::Run`, after its stack): creates its main thread at
-/// the description's priority on its ideal core, entering at `entry` with `stack_top` as its
-/// stack, adds a handle to it, writes that handle into the thread's region
+/// Starts the process the tables belong to (`KProcess::Run`, after its stack): creates its main
+/// thread at the description's priority on its ideal core, entering at `entry` with
+/// `stack_top` as its stack, adds a handle to it, writes that handle into the thread's region
 /// ([`CURRENT_THREAD_HANDLE_OFFSET`]) through `memory`, marks the process running and starts
 /// the thread. The thread's context is what a core loads to run it
-/// ([`Scheduler::thread`]`.context()`).
+/// ([`Scheduler::thread`]`.context()`); which core runs it is the scheduler's to say
+/// ([`Scheduler::update`], then [`Scheduler::schedule`]).
 ///
 /// A process that is not [`ProcessState::Created`] is [`KernelError::InvalidState`], Eden's
 /// result, before anything is created. A failure after the thread exists destroys it again, so
 /// nothing of it is left.
 pub fn run(
-    (handles, space, scheduler): (&mut HandleTable, &mut AddressSpace, &mut Scheduler),
-    processes: &Processes,
-    process: ProcessId,
+    tables: &mut Tables,
     memory: &dyn GuestMemory,
     entry: u64,
     stack_top: u64,
 ) -> CallResult<MainThread> {
-    let info = processes.get(process).map_err(|error| SvcError::internal(&error))?;
+    let Tables {
+        handles,
+        address_space: space,
+        scheduler,
+        processes,
+    } = tables;
+    let process = processes.own();
+    let info = processes
+        .get(process)
+        .map_err(|error| SvcError::internal(&error))?;
     if scheduler.process(process)?.state() != ProcessState::Created {
         return Err(KernelError::InvalidState.into());
     }
-    let (thread, object) = scheduler.create_user_thread(
-        space,
-        process,
-        &UserThread {
-            entry,
-            argument: 0,
-            stack_top,
-            priority: info.main_thread_priority(),
-            virtual_core: info.ideal_core(),
-        },
-    )?;
+    let spec = UserThread {
+        entry,
+        argument: 0,
+        stack_top,
+        priority: info.main_thread_priority(),
+        virtual_core: info.ideal_core(),
+    };
+    let (thread, handle) =
+        create_thread_with_handle((handles, space, scheduler), process, &spec, memory)?;
+    scheduler.context_mut(thread)?.x[1] = u64::from(handle.raw());
+    scheduler.mark_running(process)?;
+    scheduler.start(thread)?;
+    Ok(MainThread { thread, handle })
+}
+
+/// Creates a thread of `process` ([`Scheduler::create_user_thread`]) and a handle to it, writes
+/// the handle into the thread's region, and closes the creator's reference, so that the handle
+/// holds the thread's only one: the steps `CreateThread` and `KProcess::Run` share. When the
+/// handle cannot be added, closing the creator's reference destroys the thread again and the
+/// handle table's error is returned.
+pub(crate) fn create_thread_with_handle(
+    (handles, space, scheduler): (&mut HandleTable, &mut AddressSpace, &mut Scheduler),
+    process: ProcessId,
+    spec: &UserThread,
+    memory: &dyn GuestMemory,
+) -> CallResult<(ThreadId, Handle)> {
+    let (thread, object) = scheduler.create_user_thread(space, process, spec)?;
     let handle = match handles.add(scheduler.objects_mut(), object) {
         Ok(handle) => handle,
         Err(error) => {
@@ -142,13 +166,10 @@ pub fn run(
             return Err(error.into());
         }
     };
-    scheduler.context_mut(thread)?.x[1] = u64::from(handle.raw());
     let tls = scheduler.thread(thread)?.tls_address();
     write_own_handle(memory, tls, handle);
-    scheduler.mark_running(process)?;
-    scheduler.start(thread)?;
     scheduler.close_object(object)?;
-    Ok(MainThread { thread, handle })
+    Ok((thread, handle))
 }
 
 /// Writes a new thread's handle into its region (`Write32(tls + 0x110, handle)`, as
@@ -161,7 +182,11 @@ pub(crate) fn write_own_handle(memory: &dyn GuestMemory, tls: u64, handle: Handl
         return;
     };
     if let Err(fault) = memory.write(address, &handle.raw().to_le_bytes()) {
-        tracing::error!(address, ?fault, "a thread's own handle could not be written");
+        tracing::error!(
+            address,
+            ?fault,
+            "a thread's own handle could not be written"
+        );
     }
 }
 

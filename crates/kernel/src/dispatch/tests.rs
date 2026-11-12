@@ -152,6 +152,44 @@ fn dispatch_recorded(
     dispatcher.dispatch(number, regs, &mut caller)
 }
 
+/// The tables of a process whose main thread runs on core 0 (`process::run`, then the
+/// scheduler told so), at entry [`BASE`] with no stack, and that thread.
+fn running_tables(memory: &FlatMemory) -> (Tables, crate::process::MainThread) {
+    let mut tables = tables();
+    let main = crate::process::run(&mut tables, memory, BASE, 0).expect("the main thread starts");
+    tables
+        .scheduler
+        .update(GuestTicks(0), None, &mut NoSignals)
+        .expect("the scheduler updates");
+    let core = CoreId::new(0).expect("core 0");
+    assert_eq!(
+        tables.scheduler.schedule(core, &mut NoSignals),
+        Ok(Some(main.thread))
+    );
+    (tables, main)
+}
+
+/// The dispatcher over [`running_tables`].
+fn running_dispatcher(memory: &FlatMemory) -> Dispatcher {
+    Dispatcher::new(running_tables(memory).0)
+}
+
+/// Runs one call on core 0 of [`running_dispatcher`].
+fn dispatch_running(number: u16, regs: &mut GuestRegs, memory: &FlatMemory) -> Record {
+    let dispatcher = running_dispatcher(memory);
+    let (env, recorder) = (env(), Recorder::new());
+    let mut sink = Collect::default();
+    let mut caller = Caller {
+        core: 0,
+        thread: THREAD,
+        env: &env,
+        memory,
+        debug: &mut sink,
+        recorder: &recorder,
+    };
+    dispatcher.dispatch(number, regs, &mut caller)
+}
+
 /// Runs one call on `dispatcher` from core `core`, with a fresh environment, no guest memory
 /// worth reading and a recorder that keeps the events.
 fn dispatch_on(
@@ -1429,15 +1467,16 @@ proptest! {
 
 #[test]
 fn a_planned_call_returns_not_implemented_and_leaves_its_outputs_alone() {
-    // GetProcessId's convention outputs x0 (result) and x1 (the id). Divergence from Eden's
-    // wrapper, which would write x1 too: only x0 changes. A deferred call with a convention
-    // (light IPC, which outputs x0-x7) behaves the same.
+    // GetResourceLimitLimitValue's convention outputs x0 (result) and x1 (the value).
+    // Divergence from Eden's wrapper, which would write x1 too: only x0 changes. A void planned
+    // call, and a deferred call with a convention (light IPC, which outputs x0-x7), behave the
+    // same.
     let memory = FlatMemory::new(BASE, 0x10);
     let mut sink = Collect::default();
     for (id, status) in [
-        (SvcId::GetProcessId, Status::Planned),
+        (SvcId::GetResourceLimitLimitValue, Status::Planned),
         (SvcId::SetGpuMemoryAttribute, Status::Planned),
-        (SvcId::ExitThread, Status::Planned),
+        (SvcId::SynchronizePreemptionState, Status::Planned),
         (SvcId::SendSyncRequestLight, Status::Deferred),
     ] {
         assert_eq!(id.status(), status);
@@ -1467,15 +1506,18 @@ fn a_not_planned_call_returns_not_implemented() {
 #[test]
 fn the_dispatcher_runs_exactly_the_calls_marked_implemented() {
     let memory = FlatMemory::new(BASE, 0x10);
-    let mut sink = Collect::default();
     for &id in SvcId::ALL {
-        // Zeroed registers: OutputDebugString then has length 0 and succeeds, and the calls
-        // that take a handle are given the invalid handle, which is a result, not a failure
-        // to run.
+        // Zeroed registers: OutputDebugString then has length 0 and succeeds, the calls that
+        // take a handle are given the invalid handle, and CreateThread and SetThreadPriority
+        // priority 0, a kernel priority: each a result, not a failure to run. Core 0 runs the
+        // process's main thread, so the calls about the calling thread find one, and the main
+        // thread is the process's only one, so ExitThread ends the process.
         let mut regs = GuestRegs::default();
-        let record = dispatch_one(id.number(), &mut regs, 0, &memory, &mut sink);
+        let record = dispatch_running(id.number(), &mut regs, &memory);
         let expected = match (id.status(), id) {
-            (Status::Implemented, SvcId::ExitProcess) => Outcome::ProcessExited,
+            (Status::Implemented, SvcId::ExitProcess | SvcId::ExitThread) => {
+                Outcome::ProcessExited
+            }
             (Status::Implemented, _) => Outcome::Completed,
             _ => Outcome::NotImplemented,
         };
@@ -1550,12 +1592,21 @@ fn every_call_that_returns_is_recorded_once_with_its_decoded_arguments_and_resul
             [0; SVC_ARG_COUNT],
             ResultCode::SUCCESS,
         ),
-        // Planned calls are decoded too. GetProcessId's one argument is in x1, not x0.
+        // GetProcessId's one argument is in x1, not x0; no handle in the fresh table has its
+        // value.
         (
             SvcId::GetProcessId.number(),
             7,
             8,
             [0, 8, 0, 0, 0, 0, 0, 0],
+            KernelError::InvalidHandle.code(),
+        ),
+        // Planned calls are decoded too: GetThreadContext3's are in x0 and x1.
+        (
+            SvcId::GetThreadContext3.number(),
+            7,
+            8,
+            [7, 8, 0, 0, 0, 0, 0, 0],
             not_implemented,
         ),
         // A call that takes tables and fails: no handle in the fresh table has this value.

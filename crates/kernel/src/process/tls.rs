@@ -106,7 +106,10 @@ impl ThreadLocalPages {
             return Err(invalid.into());
         }
         let index = usize::try_from(offset / THREAD_LOCAL_REGION_SIZE).map_err(|_| invalid)?;
-        let slot = used.get_mut(index).filter(|in_use| **in_use).ok_or(invalid)?;
+        let slot = used
+            .get_mut(index)
+            .filter(|in_use| **in_use)
+            .ok_or(invalid)?;
         *slot = false;
         Ok(())
     }
@@ -150,7 +153,11 @@ mod tests {
             let expected = first + (index as u64) * THREAD_LOCAL_REGION_SIZE;
             assert_eq!(tls.reserve(&mut space), Ok(expected));
         }
-        assert_eq!(log.take(), Vec::new(), "no page is mapped while one has room");
+        assert_eq!(
+            log.take(),
+            Vec::new(),
+            "no page is mapped while one has room"
+        );
         // The ninth region needs a second page.
         let second = tls.reserve(&mut space).unwrap();
         assert_eq!(second % PAGE_SIZE, 0);

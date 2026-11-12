@@ -151,7 +151,9 @@ mod tests {
         let mut pool = AsidPool::new(HOST_BITS).unwrap();
         let max = pool.max();
         assert_eq!(u32::from(max), (1 << HOST_BITS) - 1);
-        let ids: Vec<u16> = (FIRST_ASID..=max).map(|_| pool.allocate().unwrap()).collect();
+        let ids: Vec<u16> = (FIRST_ASID..=max)
+            .map(|_| pool.allocate().unwrap())
+            .collect();
         assert_eq!(ids.first(), Some(&FIRST_ASID));
         assert_eq!(ids.last(), Some(&max));
         assert_eq!(

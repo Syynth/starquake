@@ -31,6 +31,7 @@ pub mod handle;
 mod ids;
 pub mod info;
 pub mod memory;
+pub mod process;
 pub mod processor;
 pub mod thread;
 pub mod tick;

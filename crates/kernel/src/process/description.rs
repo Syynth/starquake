@@ -48,7 +48,8 @@ pub const LEGACY_VIRTUAL_CORE_COUNT: u8 = 4;
 /// application cores; 6, 7 and 63 (the system modules' cores) map to the system core, 3; every
 /// other virtual core maps to core 0.
 pub const VIRTUAL_TO_PHYSICAL_CORE: [u8; VIRTUAL_CORE_COUNT as usize] = [
-    0, 1, 2, 3, 4, 5, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, //
+    0, 1, 2, 3, 4, 5, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, //
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3,
 ];
 

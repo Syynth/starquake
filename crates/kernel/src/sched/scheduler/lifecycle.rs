@@ -313,9 +313,8 @@ impl Scheduler {
         let thread = self.thread(id)?;
         let core_id = if core_id == IDEAL_CORE_NO_UPDATE {
             let kept = thread.virtual_ideal_core;
-            let bit = u32::try_from(kept).map_or(1 << 63, |shift| {
-                1_u64.checked_shl(shift).unwrap_or(0)
-            });
+            let bit =
+                u32::try_from(kept).map_or(1 << 63, |shift| 1_u64.checked_shl(shift).unwrap_or(0));
             if virtual_mask & bit == 0 {
                 return Err(KernelError::InvalidCombination.into());
             }
@@ -341,3 +340,6 @@ impl Scheduler {
         self.apply_core_mask(id, physical_ideal, mask)
     }
 }
+
+#[cfg(test)]
+mod tests;

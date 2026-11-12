@@ -324,6 +324,21 @@ impl TryFrom<HandleTableData> for HandleTable {
 }
 
 impl HandleTable {
+    /// Every handle the table holds, lowest index first: the order in which
+    /// `KHandleTable::Finalize` closes them (`eden/src/core/hle/kernel/k_handle_table.cpp` @
+    /// cf654052, its loop over `m_table_size`).
+    #[must_use]
+    pub fn handles(&self) -> Vec<Handle> {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                let entry = entry.as_ref()?;
+                Handle::from_parts(u16::try_from(index).ok()?, entry.linear_id)
+            })
+            .collect()
+    }
+
     /// A table for `size` handles (`KHandleTable::Initialize`).
     ///
     /// A `size` of zero or less means the maximum, [`MAX_TABLE_SIZE`], as in Horizon; a larger
