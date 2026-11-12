@@ -722,18 +722,23 @@ impl Dispatcher {
                 )
             }),
             SvcId::CloseHandle => {
+                let mut notices = false;
                 let outcome = self.call::<(&mut HandleTable, &mut Scheduler)>(
                     call,
                     |(handles, scheduler), call, _| {
-                        returning(id, convention, call.regs, |[closing]| {
+                        let outcome = returning(id, convention, call.regs, |[closing]| {
                             let closing = Handle::from_register(closing);
                             handle::close_handle(handles, scheduler, closing)?;
                             Ok([])
-                        })
+                        });
+                        notices = scheduler.ipc().has_any_notices();
+                        outcome
                     },
                 );
                 // A session whose last handle closed: its server forgets it now, if it is free.
-                self.settle_notices();
+                if notices {
+                    self.settle_notices();
+                }
                 outcome
             }
             SvcId::ConnectToNamedPort => self.connect_to_named_port(call, id, convention),

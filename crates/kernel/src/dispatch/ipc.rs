@@ -423,20 +423,25 @@ impl Dispatcher {
         id: SvcId,
         convention: &Convention,
     ) -> Outcome {
+        let mut notices = false;
         let outcome = self.call::<(&mut HandleTable, &AddressSpace, &mut Scheduler)>(
             call,
             |(handles, space, scheduler), call, _| {
                 let memory = call.caller.memory;
-                super::returning(id, convention, call.regs, |[name]| {
+                let outcome = super::returning(id, convention, call.regs, |[name]| {
                     let name = PortName::read(space, memory, name)?;
                     let server = scheduler.ipc().port(&name).ok_or(KernelError::NotFound)?;
                     let (_, handle) = open_session_with_handle(handles, scheduler, server, true)?;
                     Ok([u64::from(handle.raw())])
-                })
+                });
+                notices = scheduler.ipc().has_any_notices();
+                outcome
             },
         );
         // The server accepts the session now, if it is free, rather than at its first request.
-        self.settle_notices();
+        if notices {
+            self.settle_notices();
+        }
         outcome
     }
 

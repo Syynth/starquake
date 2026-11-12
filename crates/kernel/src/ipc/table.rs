@@ -378,6 +378,12 @@ impl Ipc {
         Ok(self.server_mut(server)?.notices.drain(..).collect())
     }
 
+    /// Whether any server has notices waiting.
+    #[must_use]
+    pub fn has_any_notices(&self) -> bool {
+        self.servers.iter().any(|(_, row)| !row.notices.is_empty())
+    }
+
     /// Whether `server` has notices waiting.
     pub fn has_notices(&self, server: ServerId) -> Result<bool, IpcError> {
         Ok(!self.server(server)?.notices.is_empty())

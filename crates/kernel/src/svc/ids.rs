@@ -312,6 +312,8 @@ mod tests {
                 | SvcId::GetCurrentProcessorNumber
                 | SvcId::CloseHandle
                 | SvcId::GetSystemTick
+                | SvcId::ConnectToNamedPort
+                | SvcId::SendSyncRequest
                 | SvcId::OutputDebugString
                 | SvcId::GetInfo => Status::Implemented,
                 _ if hardware_facing(id.name()) => Status::NotPlanned,
