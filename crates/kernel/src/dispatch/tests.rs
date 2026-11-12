@@ -3,7 +3,12 @@
 use proptest::prelude::*;
 use proptest::test_runner::{Config, RngAlgorithm, RngSeed};
 use starquake_memory::FlatMemory;
-use starquake_trace::{EnvCall, FixedClock, LiveEnv, ReplayEnv};
+use std::sync::Arc;
+
+use starquake_trace::{
+    EnvCall, Event, EventKind, FixedClock, GuestTicks, LiveEnv, Recorder, ReplayEnv, ThreadId,
+    VecSink,
+};
 
 use super::*;
 use crate::handle::MAX_TABLE_SIZE;
@@ -18,6 +23,11 @@ const CLOCK_SECONDS: u64 = 1_000_000_007;
 const CLOCK_START_NS: u64 = CLOCK_SECONDS * NANOS_PER_SECOND;
 /// What `GetSystemTick` returns for the first reading.
 const FIRST_TICKS: u64 = CLOCK_SECONDS * CNTFREQ;
+
+/// The thread and time every test call is stamped with: distinct from each other, from the core
+/// numbers used and from zero, so a swapped or dropped field shows in the recorded event.
+const THREAD: ThreadId = ThreadId(0x7EAD);
+const TIME: GuestTicks = GuestTicks(0x71C5);
 
 /// Fixed seed so a run is reproducible; failures are not persisted to disk.
 const PROPTEST_SEED: u64 = 0x4449_5350_4154_4348;
@@ -77,15 +87,59 @@ fn dispatch_one(
     memory: &FlatMemory,
     sink: &mut Collect,
 ) -> Record {
+    dispatch_recorded(number, regs, core, memory, sink, &Recorder::new())
+}
+
+/// As [`dispatch_one`], recording into `recorder`.
+fn dispatch_recorded(
+    number: u16,
+    regs: &mut GuestRegs,
+    core: u8,
+    memory: &FlatMemory,
+    sink: &mut Collect,
+    recorder: &Recorder,
+) -> Record {
     let dispatcher = Dispatcher::new(tables());
     let env = env();
     let mut caller = Caller {
         core,
+        thread: THREAD,
+        time: TIME,
         env: &env,
         memory,
         debug: sink,
+        recorder,
     };
     dispatcher.dispatch(number, regs, &mut caller)
+}
+
+/// A recorder with one sink that keeps every event.
+fn recorder() -> (Recorder, Arc<VecSink>) {
+    let recorder = Recorder::new();
+    let sink = Arc::new(VecSink::new());
+    recorder.add_sink(Arc::clone(&sink));
+    (recorder, sink)
+}
+
+/// The event a call must have been recorded as, with `args` as the event carries them.
+fn svc_event(
+    seq: u64,
+    core: u8,
+    number: u16,
+    args: [u64; SVC_ARG_COUNT],
+    result: ResultCode,
+) -> Event {
+    Event {
+        seq,
+        time: TIME,
+        core,
+        thread: THREAD,
+        kind: EventKind::Svc {
+            id: u32::from(number),
+            args,
+            result: starquake_trace::ResultCode(result.raw()),
+        },
+    }
 }
 
 fn assert_untouched_from(regs: &GuestRegs, before: &GuestRegs, first: usize) {
@@ -231,11 +285,15 @@ fn every_unlisted_number_is_handled_without_panicking() {
     let mut sink = Collect::default();
     let dispatcher = Dispatcher::new(tables());
     let env = env();
+    let recorder = Recorder::new();
     let mut caller = Caller {
         core: 0,
+        thread: THREAD,
+        time: TIME,
         env: &env,
         memory: &memory,
         debug: &mut sink,
+        recorder: &recorder,
     };
     for number in (0..=u16::MAX).filter(|&n| SvcId::from_number(n).is_none()) {
         let mut regs = regs();
@@ -309,10 +367,10 @@ fn the_dispatcher_runs_exactly_the_calls_marked_implemented() {
         // Zeroed registers: OutputDebugString then has length 0 and succeeds.
         let mut regs = GuestRegs::default();
         let record = dispatch_one(id.number(), &mut regs, 0, &memory, &mut sink);
-        let expected = if id.status() == Status::Implemented {
-            Outcome::Completed
-        } else {
-            Outcome::NotImplemented
+        let expected = match (id.status(), id) {
+            (Status::Implemented, SvcId::ExitProcess) => Outcome::ProcessExited,
+            (Status::Implemented, _) => Outcome::Completed,
+            _ => Outcome::NotImplemented,
         };
         assert_eq!(
             record.outcome,
@@ -330,11 +388,15 @@ fn one_dispatcher_serves_calls_in_turn_and_records_the_arguments_as_passed() {
     let mut sink = Collect::default();
     let dispatcher = Dispatcher::new(tables());
     let env = env();
+    let (recorder, events) = recorder();
     let mut caller = Caller {
         core: 2,
+        thread: THREAD,
+        time: TIME,
         env: &env,
         memory: &memory,
         debug: &mut sink,
+        recorder: &recorder,
     };
     for number in [
         SvcId::GetSystemTick.number(),
@@ -350,7 +412,11 @@ fn one_dispatcher_serves_calls_in_turn_and_records_the_arguments_as_passed() {
         assert_ne!(regs.x[0], before.x[0]);
         assert_eq!((record.core, record.number), (2, number));
     }
-    // The clock was read once per GetSystemTick, in order, and nothing else touched it.
+    // One event per call, numbered in call order.
+    let seqs: Vec<u64> = events.events().iter().map(|event| event.seq).collect();
+    assert_eq!(seqs, [0, 1, 2, 3]);
+    // The clock was read once per GetSystemTick, in order, and nothing else touched it: stamping
+    // an event does not read the environment's clock.
     assert_eq!(
         env.recording(),
         [
@@ -368,11 +434,15 @@ fn a_failing_environment_ends_the_call_without_writing_registers() {
     let mut sink = Collect::default();
     let dispatcher = Dispatcher::new(tables());
     let env = ReplayEnv::new(Vec::new());
+    let (recorder, events) = recorder();
     let mut caller = Caller {
         core: 0,
+        thread: THREAD,
+        time: TIME,
         env: &env,
         memory: &memory,
         debug: &mut sink,
+        recorder: &recorder,
     };
     let mut regs = regs();
     let before = regs.clone();
@@ -385,6 +455,130 @@ fn a_failing_environment_ends_the_call_without_writing_registers() {
         })
     );
     assert_untouched_from(&regs, &before, 0);
+    // The call never returned to the guest, so it has no result and no event.
+    assert_eq!(events.events(), []);
+}
+
+#[test]
+fn exit_process_ends_the_process_and_writes_no_register() {
+    // Eden's `SvcWrap_ExitProcess64` takes no argument and writes no output.
+    let memory = FlatMemory::new(BASE, 0x10);
+    let mut sink = Collect::default();
+    let mut regs = regs();
+    let before = regs.clone();
+    let record = dispatch_one(
+        SvcId::ExitProcess.number(),
+        &mut regs,
+        4,
+        &memory,
+        &mut sink,
+    );
+    assert_eq!(record.outcome, Outcome::ProcessExited);
+    assert_eq!(record.id, Some(SvcId::ExitProcess));
+    assert_untouched_from(&regs, &before, 0);
+}
+
+#[test]
+fn every_call_that_returns_is_recorded_once_with_its_decoded_arguments_and_result() {
+    let memory = FlatMemory::new(BASE, 0x100);
+    memory.write(BASE, b"line").unwrap();
+    let not_implemented = KernelError::NotImplemented.code();
+    // Every register holds something before each call (see `regs`), as a guest's registers do:
+    // what an earlier call left behind must not reach the event.
+    let stale = regs();
+    let raw = |x0: u64, x1: u64| {
+        let mut all = [0; SVC_ARG_COUNT];
+        all.copy_from_slice(&stale.x[..SVC_ARG_COUNT]);
+        all[0] = x0;
+        all[1] = x1;
+        all
+    };
+    // A handle is 32 bits: the upper half of its register is not part of the argument.
+    let handle_register = 0xdead_beef_0000_8001;
+    // (number, x0, x1, the arguments the event must carry, the result it must carry)
+    let calls = [
+        // Two arguments and a `Result` output: success, then an error (one byte past the end
+        // of mapped memory).
+        (
+            SvcId::OutputDebugString.number(),
+            BASE,
+            4,
+            [BASE, 4, 0, 0, 0, 0, 0, 0],
+            ResultCode::SUCCESS,
+        ),
+        (
+            SvcId::OutputDebugString.number(),
+            BASE + 0xff,
+            2,
+            [BASE + 0xff, 2, 0, 0, 0, 0, 0, 0],
+            KernelError::InvalidCurrentMemory.code(),
+        ),
+        // No arguments. Outputs that are not a `Result` (ticks, a core number) are not
+        // recorded as one.
+        (
+            SvcId::GetSystemTick.number(),
+            1,
+            2,
+            [0; SVC_ARG_COUNT],
+            ResultCode::SUCCESS,
+        ),
+        (
+            SvcId::GetCurrentProcessorNumber.number(),
+            3,
+            4,
+            [0; SVC_ARG_COUNT],
+            ResultCode::SUCCESS,
+        ),
+        // A void call with no arguments.
+        (
+            SvcId::ExitProcess.number(),
+            5,
+            6,
+            [0; SVC_ARG_COUNT],
+            ResultCode::SUCCESS,
+        ),
+        // Deferred calls are decoded too. SetHeapSize's one argument is in x1, not x0.
+        (
+            SvcId::SetHeapSize.number(),
+            7,
+            8,
+            [0, 8, 0, 0, 0, 0, 0, 0],
+            not_implemented,
+        ),
+        (
+            SvcId::CloseHandle.number(),
+            handle_register,
+            9,
+            [0x8001, 0, 0, 0, 0, 0, 0, 0],
+            not_implemented,
+        ),
+        // A listed call with no convention entry yet, and an unlisted number: nothing says
+        // which registers are arguments, so all eight are kept as passed.
+        (
+            SvcId::CreateSession.number(),
+            10,
+            11,
+            raw(10, 11),
+            not_implemented,
+        ),
+        (u16::MAX, 12, 13, raw(12, 13), not_implemented),
+    ];
+    assert_eq!(SvcId::CreateSession.convention(), None);
+    for (number, x0, x1, args, result) in calls {
+        let (recorder, events) = recorder();
+        let mut sink = Collect::default();
+        let mut regs = stale.clone();
+        regs.x[0] = x0;
+        regs.x[1] = x1;
+        let record = dispatch_recorded(number, &mut regs, 3, &memory, &mut sink, &recorder);
+        assert_eq!(
+            events.events(),
+            [svc_event(0, 3, number, args, result)],
+            "svc {number:#x}"
+        );
+        // The dispatch's own record still has the registers as passed.
+        assert_eq!(record.args, raw(x0, x1), "svc {number:#x}");
+    }
 }
 
 #[test]

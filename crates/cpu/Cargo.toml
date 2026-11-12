@@ -10,6 +10,11 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Exports `testing::ScriptedVcpu`, a `Vcpu` that plays back scripted exits, for other crates'
+# tests (`docs/specs/testing.md`, "Shared test support").
+test-support = []
+
 [dependencies]
 starquake-memory.workspace = true
 thiserror.workspace = true

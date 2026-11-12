@@ -8,18 +8,19 @@
 //! The view is a function of each thread's own event sequence only. It leaves out `seq`, `time`
 //! and `core` (all differ between runs that did the same thing), orders threads by id, and keeps
 //! each thread's events in the order they were recorded. Two recordings that interleave the same
-//! per-thread sequences differently therefore render to identical text. [`Schedule`] events are
-//! left out (see [`EventKind::in_golden_trace`]).
+//! per-thread sequences differently therefore render to identical text. Wake, map, fault and
+//! schedule events are left out, because they depend on timing (see
+//! [`EventKind::in_golden_trace`](crate::EventKind::in_golden_trace)).
 //!
 //! The line format itself is this crate's own design (the spec gives none); it is the
-//! `Display` of [`EventKind`], pinned by tests here and in `event.rs`.
-//!
-//! [`Schedule`]: EventKind::Schedule
+//! `Display` of [`EventKind`](crate::EventKind), pinned by tests here and in `event.rs`.
 
 use std::collections::BTreeMap;
 
+use std::sync::Mutex;
+
 use crate::event::{Event, ThreadId};
-use crate::recorder::{Sink, VecSink};
+use crate::recorder::{Sink, lock};
 
 /// Render events as the golden-trace view.
 ///
@@ -46,30 +47,77 @@ pub fn golden_trace<'a>(events: impl IntoIterator<Item = &'a Event>) -> String {
     lines.join("\n") + if lines.is_empty() { "" } else { "\n" }
 }
 
-/// A sink that keeps every event and renders the golden-trace view on request. Unbounded, so it
-/// is meant for tests and for short homebrew runs, not long ones.
+/// A sink that keeps events and renders the golden-trace view on request.
+///
+/// [`TextSink::new`] keeps every event, so it is meant for tests. A run of unknown length uses
+/// [`TextSink::with_limit`], which keeps the first events up to a limit and counts the rest, so
+/// the sink's memory is bounded however long the guest runs. The first events are the ones kept
+/// because they are the reproducible part of a run; the newest are in the flight recorder.
+/// Events the view does not show ([`EventKind::in_golden_trace`](crate::EventKind::in_golden_trace))
+/// are not stored and do not count towards the limit.
 #[derive(Debug, Default)]
 pub struct TextSink {
-    events: VecSink,
+    state: Mutex<State>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Default)]
+struct State {
+    events: Vec<Event>,
+    dropped: u64,
 }
 
 impl TextSink {
-    /// An empty sink.
+    /// An empty sink that keeps every event.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// The golden-trace view of everything received so far (see [`golden_trace`]).
+    /// An empty sink that keeps the first `limit` events the view shows and counts the rest.
+    #[must_use]
+    pub fn with_limit(limit: usize) -> Self {
+        Self {
+            state: Mutex::default(),
+            limit: Some(limit),
+        }
+    }
+
+    /// How many events arrived after the limit was reached and are not in the view.
+    #[must_use]
+    pub fn dropped(&self) -> u64 {
+        lock(&self.state).dropped
+    }
+
+    /// The golden-trace view of the events kept (see [`golden_trace`]). When events were dropped,
+    /// one more line follows the view and says how many:
+    /// `truncated: <n> later events are not shown (the trace keeps its first <limit>)`.
     #[must_use]
     pub fn render(&self) -> String {
-        golden_trace(self.events.events().iter())
+        let state = lock(&self.state);
+        let mut text = golden_trace(state.events.iter());
+        if let (Some(limit), dropped @ 1..) = (self.limit, state.dropped) {
+            let marker = format!(
+                "truncated: {dropped} later events are not shown (the trace keeps its first \
+                 {limit})\n"
+            );
+            text.push_str(&marker);
+        }
+        text
     }
 }
 
 impl Sink for TextSink {
     fn record(&self, event: &Event) {
-        self.events.record(event);
+        if !event.kind.in_golden_trace() {
+            return;
+        }
+        let mut state = lock(&self.state);
+        if self.limit.is_some_and(|limit| state.events.len() >= limit) {
+            state.dropped = state.dropped.saturating_add(1);
+        } else {
+            state.events.push(*event);
+        }
     }
 }
 
@@ -83,7 +131,8 @@ mod tests {
     use super::*;
     use crate::Recorder;
     use crate::event::{
-        EventKind, GuestTicks, LifecyclePhase, ResultCode, SVC_ARG_COUNT, WakeReason,
+        EventKind, FaultAction, GuestTicks, LifecyclePhase, MapKind, ResultCode, SVC_ARG_COUNT,
+        WakeReason,
     };
 
     fn config() -> ProptestConfig {
@@ -125,9 +174,9 @@ mod tests {
     fn two_interleavings_of_the_same_threads_render_identically() {
         let a = [svc(1), svc(2), svc(3)];
         let b = [
-            EventKind::Wake {
-                thread: ThreadId(1),
-                reason: WakeReason::Signalled,
+            EventKind::Lifecycle {
+                phase: LifecyclePhase::ThreadCreate,
+                subject: 2,
             },
             svc(9),
         ];
@@ -145,9 +194,72 @@ mod tests {
             "thread 1\n  svc 0x1(0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1) -> 0x0\n  \
              svc 0x2(0x2, 0x2, 0x2, 0x2, 0x2, 0x2, 0x2, 0x2) -> 0x0\n  \
              svc 0x3(0x3, 0x3, 0x3, 0x3, 0x3, 0x3, 0x3, 0x3) -> 0x0\n\
-             thread 2\n  wake thread=1 Signalled\n  \
+             thread 2\n  lifecycle ThreadCreate 2\n  \
              svc 0x9(0x9, 0x9, 0x9, 0x9, 0x9, 0x9, 0x9, 0x9) -> 0x0\n"
         );
+    }
+
+    /// Records `kinds` in order on thread 1 into `sink`.
+    fn feed(sink: &Arc<TextSink>, kinds: &[EventKind]) {
+        let recorder = Recorder::new();
+        recorder.add_sink(Arc::clone(sink));
+        for kind in kinds {
+            recorder.record(GuestTicks(0), 0, ThreadId(1), *kind);
+        }
+    }
+
+    #[test]
+    fn a_limited_sink_keeps_its_first_events_and_says_how_many_it_dropped() {
+        const LIMIT: usize = 3;
+        let sink = Arc::new(TextSink::with_limit(LIMIT));
+        // A fault is not shown in the view, so it is neither kept nor counted.
+        let fault = EventKind::Fault {
+            address: 0x10,
+            write: true,
+            action: FaultAction::Fatal,
+        };
+        feed(
+            &sink,
+            &[svc(1), fault, svc(2), svc(3), svc(4), fault, svc(5)],
+        );
+        assert_eq!(sink.dropped(), 2);
+        assert_eq!(
+            sink.render(),
+            render(&[(1, svc(1)), (1, svc(2)), (1, svc(3))])
+                + "truncated: 2 later events are not shown (the trace keeps its first 3)\n"
+        );
+    }
+
+    #[test]
+    fn a_sink_exactly_at_its_limit_is_not_truncated() {
+        const LIMIT: usize = 3;
+        let sink = Arc::new(TextSink::with_limit(LIMIT));
+        let kinds = [svc(1), svc(2), svc(3)];
+        assert_eq!(kinds.len(), LIMIT);
+        feed(&sink, &kinds);
+        assert_eq!(sink.dropped(), 0);
+        assert_eq!(
+            sink.render(),
+            render(&[(1, svc(1)), (1, svc(2)), (1, svc(3))])
+        );
+        // One more is the first to be dropped.
+        feed(&sink, &[svc(4)]);
+        assert_eq!(sink.dropped(), 1);
+    }
+
+    #[test]
+    fn a_limit_of_zero_keeps_nothing_but_the_count_and_no_limit_keeps_everything() {
+        let none = Arc::new(TextSink::with_limit(0));
+        feed(&none, &[svc(1), svc(2)]);
+        assert_eq!(
+            none.render(),
+            "truncated: 2 later events are not shown (the trace keeps its first 0)\n"
+        );
+        let all = Arc::new(TextSink::new());
+        let many: Vec<EventKind> = (0..1000).map(svc).collect();
+        feed(&all, &many);
+        assert_eq!(all.dropped(), 0);
+        assert_eq!(all.render().lines().count(), 1001);
     }
 
     #[test]
@@ -157,13 +269,38 @@ mod tests {
     }
 
     #[test]
-    fn schedule_events_are_not_shown_and_an_empty_view_is_empty() {
-        let schedule = EventKind::Schedule {
-            core: 0,
-            from: None,
-            to: Some(ThreadId(1)),
-        };
-        assert_eq!(render(&[(1, schedule)]), "");
+    fn timing_dependent_events_are_not_shown_and_an_empty_view_is_empty() {
+        let hidden = [
+            EventKind::Schedule {
+                core: 0,
+                from: None,
+                to: Some(ThreadId(1)),
+            },
+            EventKind::Wake {
+                thread: ThreadId(1),
+                reason: WakeReason::Signalled,
+            },
+            EventKind::Map {
+                va: 0x1000,
+                size: 0x2000,
+                perms: 3,
+                kind: MapKind::Map,
+            },
+            EventKind::Fault {
+                address: 0x10,
+                write: true,
+                action: FaultAction::Fatal,
+            },
+        ];
+        for kind in hidden {
+            assert_eq!(render(&[(1, kind)]), "", "{kind}");
+            // Hidden events leave the lines around them as they are.
+            assert_eq!(
+                render(&[(1, svc(1)), (1, kind), (1, svc(2))]),
+                render(&[(1, svc(1)), (1, svc(2))]),
+                "{kind}"
+            );
+        }
         assert_eq!(render(&[]), "");
     }
 

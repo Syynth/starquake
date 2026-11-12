@@ -95,7 +95,7 @@ svc_ids! {
     MapMemory = 0x04, Deferred;
     UnmapMemory = 0x05, Deferred;
     QueryMemory = 0x06, Deferred;
-    ExitProcess = 0x07, Deferred;
+    ExitProcess = 0x07, Implemented;
     CreateThread = 0x08, Deferred;
     StartThread = 0x09, Deferred;
     ExitThread = 0x0a, Deferred;
@@ -290,7 +290,8 @@ mod tests {
     fn every_status_follows_the_spec() {
         for &id in SvcId::ALL {
             let expected = match id {
-                SvcId::GetCurrentProcessorNumber
+                SvcId::ExitProcess
+                | SvcId::GetCurrentProcessorNumber
                 | SvcId::GetSystemTick
                 | SvcId::OutputDebugString => Status::Implemented,
                 _ if hardware_facing(id.name()) => Status::NotPlanned,

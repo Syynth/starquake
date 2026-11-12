@@ -347,6 +347,29 @@ mod tests {
 
     const MOD0_AT: u32 = 0x80;
 
+    /// The testkit's builder restates this layout (it may not depend on this crate). Every
+    /// constant the two share is compared here, where the private offsets are visible.
+    #[test]
+    fn the_layout_constants_agree_with_the_testkits_builder() {
+        use starquake_testkit::nro as built;
+        assert_eq!(MAGIC, built::MAGIC);
+        assert_eq!(HEADER_SIZE, built::HEADER_SIZE);
+        assert_eq!(MOD0_MAGIC, built::MOD0_MAGIC);
+        assert_eq!(MOD0_SIZE, built::MOD0_SIZE);
+        assert_eq!(MOD0_POINTER_OFFSET, built::MOD0_POINTER_OFFSET);
+        assert_eq!(HOMEBREW_OFFSET, built::HOMEBREW_OFFSET);
+        assert_eq!(HOMEBREW_MARKER, built::HOMEBREW_MARKER);
+        assert_eq!(MAGIC_OFFSET, built::MAGIC_OFFSET);
+        assert_eq!(SIZE_OFFSET, built::SIZE_OFFSET);
+        assert_eq!(SEGMENTS_OFFSET, built::SEGMENTS_OFFSET);
+        assert_eq!(BSS_SIZE_OFFSET, built::BSS_SIZE_OFFSET);
+        assert_eq!(BUILD_ID_OFFSET, built::BUILD_ID_OFFSET);
+        assert_eq!(
+            Nro::parse(&image()).unwrap().build_id.len(),
+            built::BUILD_ID_SIZE
+        );
+    }
+
     /// Builds an NRO image of 0x200 bytes with a `MOD0` header at [`MOD0_AT`].
     fn image() -> Vec<u8> {
         let mut file = vec![0u8; 0x200];

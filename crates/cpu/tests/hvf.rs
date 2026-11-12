@@ -382,6 +382,22 @@ fn counters_read_at_el0_without_a_host_exit() {
 }
 
 #[test]
+fn the_guest_reads_the_counter_frequency_the_backend_reports() {
+    let Some(guest) = Guest::new() else { return };
+    let mut vcpu = guest.vcpu(
+        &[
+            0xd53b_e000, // mrs x0, cntfrq_el0
+            SVC_0,
+        ],
+        |regs| regs.x[0] = 0,
+    );
+    assert_eq!(vcpu.run().unwrap(), Exit::Svc(0));
+    let guest_reads = vcpu.regs().unwrap().x[0];
+    assert_ne!(guest_reads, 0);
+    assert_eq!(guest_reads, guest.backend.counter_frequency());
+}
+
+#[test]
 fn cache_maintenance_and_cache_info_work_at_el0() {
     let Some(guest) = Guest::new() else { return };
     let block = guest.data();

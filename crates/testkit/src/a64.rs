@@ -7,8 +7,9 @@
 //!
 //! Only 64-bit (`X`) forms are encoded, which is all the guest test programs need. Register
 //! number 31 means `XZR` or `SP` according to the instruction, as in the Arm encoding: `SP` for
-//! the base register of [`ldr`] and [`str`] and for both registers of [`add_imm`] and
-//! [`sub_imm`], `XZR` everywhere else. [`Assembler`] adds labels for branches.
+//! the base register of [`ldr`] and [`str()`] and for both registers of [`add_imm`] and
+//! [`sub_imm`], `XZR` everywhere else (including every operand of [`sub`]). [`Assembler`] adds
+//! labels for branches.
 //!
 //! The encodings follow the Arm Architecture Reference Manual (A64 instruction set) and are
 //! pinned by test constants, each with its assembly in a comment, that were checked once against
@@ -32,6 +33,12 @@ pub const MAX_IMM12: u32 = 0xFFF;
 pub const MEM_OFFSET_ALIGN: u32 = 8;
 /// Largest byte offset of `ldr` and `str` (unsigned 12-bit immediate scaled by 8).
 pub const MAX_MEM_OFFSET: u32 = MAX_IMM12 * MEM_OFFSET_ALIGN;
+/// Largest shift of `lsr` on a 64-bit register.
+pub const MAX_SHIFT: u32 = 63;
+/// Furthest forward byte offset of `adr` (a signed 21-bit byte offset).
+pub const MAX_ADR_OFFSET: i64 = (1 << 20) - 1;
+/// Furthest backward byte offset of `adr`.
+pub const MIN_ADR_OFFSET: i64 = -(1 << 20);
 /// Number of bits in the word offset of `b` and `bl`.
 pub const BRANCH_IMM_BITS: u32 = 26;
 /// Number of bits in the word offset of `cbz` and `cbnz`.
@@ -192,6 +199,37 @@ fn arith_imm(base: u32, rd: u8, rn: u8, imm12: u32) -> Result<u32, EncodeError> 
     Ok(base | (imm(imm12, MAX_IMM12)? << 10) | (reg(rn)? << 5) | reg(rd)?)
 }
 
+/// `sub xd, xn, xm` (shifted-register form, no shift). Register 31 is `XZR` for every operand.
+pub fn sub(rd: u8, rn: u8, rm: u8) -> Result<u32, EncodeError> {
+    Ok(0xCB00_0000 | (reg(rm)? << 16) | (reg(rn)? << 5) | reg(rd)?)
+}
+
+/// `lsr xd, xn, #shift`, which is `ubfm xd, xn, #shift, #63`. `shift` is at most [`MAX_SHIFT`].
+pub fn lsr_imm(rd: u8, rn: u8, shift: u32) -> Result<u32, EncodeError> {
+    Ok(0xD340_FC00 | (imm(shift, MAX_SHIFT)? << 16) | (reg(rn)? << 5) | reg(rd)?)
+}
+
+/// `adr xd, .+offset`: the address `offset` bytes from this instruction, between
+/// [`MIN_ADR_OFFSET`] and [`MAX_ADR_OFFSET`]. Any byte offset encodes; it need not be aligned.
+pub fn adr(rd: u8, offset: i64) -> Result<u32, EncodeError> {
+    let rd = reg(rd)?;
+    if !(MIN_ADR_OFFSET..=MAX_ADR_OFFSET).contains(&offset) {
+        return Err(EncodeError::Offset {
+            offset,
+            min: MIN_ADR_OFFSET,
+            max: MAX_ADR_OFFSET,
+        });
+    }
+    // The two's-complement 21-bit offset: `immlo` (its low 2 bits) at bit 29, `immhi` (the other
+    // 19) at bit 5.
+    let field = u32::try_from(offset & ((1 << 21) - 1)).map_err(|_| EncodeError::Offset {
+        offset,
+        min: MIN_ADR_OFFSET,
+        max: MAX_ADR_OFFSET,
+    })?;
+    Ok(0x1000_0000 | ((field & 0x3) << 29) | ((field >> 2) << 5) | rd)
+}
+
 /// `ldr xt, [xn, #offset]` (unsigned offset). `offset` is in bytes, a multiple of
 /// [`MEM_OFFSET_ALIGN`] up to [`MAX_MEM_OFFSET`]. Register 31 as `xn` is `SP`.
 pub fn ldr(rt: u8, rn: u8, offset: u32) -> Result<u32, EncodeError> {
@@ -203,7 +241,7 @@ pub fn str(rt: u8, rn: u8, offset: u32) -> Result<u32, EncodeError> {
     mem_imm(0xF900_0000, rt, rn, offset)
 }
 
-/// Shared by [`ldr`] and [`str`]: the byte offset is stored divided by 8, at bit 10.
+/// Shared by [`ldr`] and [`str()`]: the byte offset is stored divided by 8, at bit 10.
 fn mem_imm(base: u32, rt: u8, rn: u8, offset: u32) -> Result<u32, EncodeError> {
     let (rt, rn) = (reg(rt)?, reg(rn)?);
     let offset = imm(offset, MAX_MEM_OFFSET)?;
@@ -362,7 +400,57 @@ mod tests {
                 0xF93F_FFFE,
             ),
             ("str xzr, [x5, #0x1230]", str(31, 5, 0x1230), 0xF909_18BF),
+            ("sub x0, x1, x2", sub(0, 1, 2), 0xCB02_0020),
+            ("sub x21, x20, x19", sub(21, 20, 19), 0xCB13_0295),
+            ("sub x30, x0, x30", sub(30, 0, 30), 0xCB1E_001E),
+            ("sub x3, xzr, x4", sub(3, 31, 4), 0xCB04_03E3),
+            ("sub xzr, x5, x6", sub(31, 5, 6), 0xCB06_00BF),
+            ("lsr x0, x1, #1", lsr_imm(0, 1, 1), 0xD341_FC20),
+            ("lsr x22, x21, #63", lsr_imm(22, 21, MAX_SHIFT), 0xD37F_FEB6),
+            ("lsr x30, x0, #0", lsr_imm(30, 0, 0), 0xD340_FC1E),
+            ("lsr x3, x30, #32", lsr_imm(3, 30, 32), 0xD360_FFC3),
+            ("lsr xzr, x4, #7", lsr_imm(31, 4, 7), 0xD347_FC9F),
         ]);
+    }
+
+    #[test]
+    fn address_words_match_a_real_assembler() {
+        check(&[
+            ("adr x0, .", adr(0, 0), 0x1000_0000),
+            ("adr x1, .+4", adr(1, 4), 0x1000_0021),
+            ("adr x2, .-4", adr(2, -4), 0x10FF_FFE2),
+            ("adr x30, .+0xfffff", adr(30, MAX_ADR_OFFSET), 0x707F_FFFE),
+            ("adr x3, .-0x100000", adr(3, MIN_ADR_OFFSET), 0x1080_0003),
+            ("adr x4, .+0x1235", adr(4, 0x1235), 0x3000_91A4),
+            ("adr xzr, .+8", adr(31, 8), 0x1000_005F),
+        ]);
+    }
+
+    #[test]
+    fn adr_offsets_outside_one_mebibyte_are_errors() {
+        for offset in [MAX_ADR_OFFSET + 1, MIN_ADR_OFFSET - 1, i64::MAX, i64::MIN] {
+            assert_eq!(
+                adr(0, offset),
+                Err(EncodeError::Offset {
+                    offset,
+                    min: MIN_ADR_OFFSET,
+                    max: MAX_ADR_OFFSET
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn shift_amounts_above_63_are_errors() {
+        for shift in [MAX_SHIFT + 1, u32::MAX] {
+            assert_eq!(
+                lsr_imm(0, 0, shift),
+                Err(EncodeError::Immediate {
+                    value: shift,
+                    max: MAX_SHIFT
+                })
+            );
+        }
     }
 
     #[test]
@@ -447,6 +535,12 @@ mod tests {
             assert_eq!(ldr(0, bad, 0), err);
             assert_eq!(str(bad, 0, 0), err);
             assert_eq!(str(0, bad, 0), err);
+            assert_eq!(sub(bad, 0, 0), err);
+            assert_eq!(sub(0, bad, 0), err);
+            assert_eq!(sub(0, 0, bad), err);
+            assert_eq!(lsr_imm(bad, 0, 0), err);
+            assert_eq!(lsr_imm(0, bad, 0), err);
+            assert_eq!(adr(bad, 0), err);
             assert_eq!(cbz(bad, 0), err);
             assert_eq!(cbnz(bad, 0), err);
             assert_eq!(mrs(bad, SysReg::CntVctEl0), err);
@@ -599,6 +693,15 @@ mod tests {
             let word = mov(rd, rm).unwrap();
             prop_assert_eq!(word & reg_mask(), rd32);
             prop_assert_eq!((word >> 16) & reg_mask(), rm32);
+            let word = sub(rd, rn, rm).unwrap();
+            prop_assert_eq!(word & reg_mask(), rd32);
+            prop_assert_eq!((word >> 5) & reg_mask(), rn32);
+            prop_assert_eq!((word >> 16) & reg_mask(), rm32);
+            let shift = imm12 & MAX_SHIFT;
+            let word = lsr_imm(rd, rn, shift).unwrap();
+            prop_assert_eq!(word & reg_mask(), rd32);
+            prop_assert_eq!((word >> 5) & reg_mask(), rn32);
+            prop_assert_eq!((word >> 16) & MAX_SHIFT, shift);
             prop_assert_eq!((svc(imm16).unwrap() >> 5) & MAX_IMM16, imm16);
             prop_assert_eq!((brk(imm16).unwrap() >> 5) & MAX_IMM16, imm16);
             let word = mrs(rd, SysReg::TpidrEl0).unwrap();
@@ -623,6 +726,16 @@ mod tests {
                 );
                 prop_assert_eq!(word & reg_mask(), u32::from(rt));
             }
+        }
+
+        /// Every `adr` distance decodes back to itself with an independent decoder (`immhi` in
+        /// bits 23:5, `immlo` in bits 30:29).
+        #[test]
+        fn adr_offsets_decode_back(offset in MIN_ADR_OFFSET..=MAX_ADR_OFFSET, rd in 0..=MAX_REG) {
+            let word = adr(rd, offset).unwrap();
+            let raw = (((word >> 5) & low_mask(19)) << 2) | ((word >> 29) & 0x3);
+            prop_assert_eq!(sign_extend(raw, 21), offset);
+            prop_assert_eq!(word & reg_mask(), u32::from(rd));
         }
 
         /// Out-of-range operands are always errors, never another instruction.

@@ -15,9 +15,28 @@
 //!   [`GuestMemory`] and [`DebugSink`] that don't panic themselves (tests: every unlisted number
 //!   in `0..=u16::MAX`, and a property test over any number, core and `x0`-`x7`).
 //! - **One recording point** (observability spec, "One recording point per boundary"): every
-//!   dispatch ends in a [`Record`] passed to a no-op hook while the lock is still held. When the
-//!   hook is wired to `starquake-trace`'s recorder, the recorder assigns the event's `seq` there,
-//!   under the kernel lock, so sorting by `seq` gives the kernel's order.
+//!   dispatch that returns to the guest ends in one `EventKind::Svc` event, recorded with the
+//!   caller's [`Recorder`] while the lock is still held. The recorder assigns the event's `seq`
+//!   there, under the kernel lock, so sorting by `seq` gives the kernel's order. The event's
+//!   `args` are the call's decoded arguments (observability spec: "system call, with decoded
+//!   arguments"): each input of the call's [`Convention`], truncated to its kind, in the slot of
+//!   the register that carried it, and zero everywhere else. What an earlier call left in a
+//!   register the call does not take never reaches the event, so a trace does not depend on it.
+//!   A number with no convention (an unlisted number, or a listed call whose row is not in the
+//!   table yet) keeps all eight registers as passed: nothing says which are arguments, and the
+//!   trace is the to-do list for such calls. The event's
+//!   `result` is the call's `Result` output (the word in `x0` when the call's convention begins
+//!   with one, or [`KernelError::NotImplemented`]); a call with no `Result` output
+//!   (`GetSystemTick`, `ExitProcess`) records success, and its other outputs are not in the
+//!   event, which has no field for them. A dispatch that ends in [`Outcome::EnvFailed`] records
+//!   nothing: the call never returned, so it has no result, and the caller reports the failed
+//!   replay itself.
+//! - **`ExitProcess`** ends the dispatch in [`Outcome::ProcessExited`] and the caller stops
+//!   running the guest. PROVISIONAL (walking skeleton, #74): there is no process or thread
+//!   table to update yet, so the call changes no kernel state. Kernel slice 8 (process creation,
+//!   thread lifecycle) replaces the dispatch arm with a call that terminates the process's
+//!   threads, as Eden's does (`eden/src/core/hle/kernel/svc/svc_process.cpp` @ cf654052,
+//!   `ExitProcess`).
 //!
 //! Intentional divergences from Eden (`eden/src/core/hle/kernel/svc.cpp` @ cf654052, `Call64`),
 //! pinned by tests in `dispatch/tests.rs`:
@@ -77,11 +96,13 @@ use std::sync::{Mutex, PoisonError};
 
 use starquake_cpu::GuestRegs;
 use starquake_memory::GuestMemory;
-use starquake_trace::{Env, EnvError, SVC_ARG_COUNT};
+use starquake_trace::{Env, EnvError, EventKind, GuestTicks, Recorder, SVC_ARG_COUNT, ThreadId};
 
 use crate::handle::HandleTable;
 use crate::result::{KernelError, ResultCode, result_code};
-use crate::svc::{Convention, ConventionError, DebugSink, Status, SvcId, debug, processor, tick};
+use crate::svc::{
+    Convention, ConventionError, DebugSink, Kind, Status, SvcId, debug, processor, tick,
+};
 use crate::tables::{AddressSpace, Processes, Scheduler};
 
 #[cfg(test)]
@@ -106,17 +127,34 @@ pub struct Tables {
     pub processes: Processes,
 }
 
-/// What a dispatch needs from the calling core besides the tables: which core it is, the
-/// environment, the caller's memory, and where debug strings go.
+/// What a dispatch needs from the calling core besides the tables: which core and guest thread
+/// it is, when the call was made, the environment, the caller's memory, where debug strings go,
+/// and the event stream's recorder.
 pub struct Caller<'a> {
     /// The index of the core making the call.
     pub core: u8,
+    /// The guest thread making the call, as the event stream names it.
+    ///
+    /// PROVISIONAL (walking skeleton, #74): the core loop names the thread. Once the scheduler
+    /// tracks which thread each core is running (kernel slice 10), the dispatcher reads it from
+    /// there and this field goes away.
+    pub thread: ThreadId,
+    /// When the call was made, for the event's `time`. The dispatcher does not read
+    /// [`Env::now`] for it, so recording an event never adds a clock reading to the replay log.
+    ///
+    /// PROVISIONAL (walking skeleton, #74): the core loop supplies the stamp, in a unit of its
+    /// own choosing that the recorder does not interpret. The kernel owns guest ticks (kernel
+    /// spec, "Guest time"); once it keeps guest time itself the dispatcher stamps events from
+    /// that and this field goes away.
+    pub time: GuestTicks,
     /// The injectable environment (observability spec, rule 1).
     pub env: &'a dyn Env,
     /// The calling process's memory.
     pub memory: &'a dyn GuestMemory,
     /// Where `OutputDebugString` sends its text.
     pub debug: &'a mut dyn DebugSink,
+    /// The event stream's recorder: every call that returns to the guest is recorded here once.
+    pub recorder: &'a Recorder,
 }
 
 /// How a dispatch ended.
@@ -130,6 +168,9 @@ pub enum Outcome {
     /// The environment failed, so the call wrote nothing. Only a replay that has diverged from its
     /// recording does this; the caller should stop the run and report it.
     EnvFailed(EnvError),
+    /// `ExitProcess` ran: the calling process is over, and the caller must not resume the guest
+    /// thread. No register was written.
+    ProcessExited,
 }
 
 /// One dispatched system call, as the recording point sees it: the fields of the event stream's
@@ -142,7 +183,8 @@ pub struct Record {
     pub number: u16,
     /// The call, if the number is listed.
     pub id: Option<SvcId>,
-    /// `x0`-`x7` as the guest passed them, before the call.
+    /// `x0`-`x7` as the guest passed them, before the call: every register, whether or not the
+    /// call takes it. (The recorded event carries the decoded arguments instead.)
     pub args: [u64; SVC_ARG_COUNT],
     /// How it ended.
     pub outcome: Outcome,
@@ -187,7 +229,7 @@ impl Dispatcher {
             args,
             outcome,
         };
-        record_point(&record);
+        record_point(&record, regs, caller);
         drop(guard);
         record
     }
@@ -202,10 +244,63 @@ impl Dispatcher {
 }
 
 /// RECORDING POINT for the event stream: the dispatcher's one call into the recorder
-/// (observability spec, "The event stream"). A no-op until it is wired to `starquake-trace`'s
-/// `Recorder`. It runs after the call with the kernel lock still held, so the recorder's `seq`
-/// follows the kernel's order.
-fn record_point(_record: &Record) {}
+/// (observability spec, "The event stream"). It runs after the call with the kernel lock still
+/// held, so the recorder's `seq` follows the kernel's order. See the module docs for what the
+/// event's `result` holds and why a failed environment records nothing.
+fn record_point(record: &Record, regs: &GuestRegs, caller: &Caller<'_>) {
+    let Some(result) = recorded_result(record, regs) else {
+        return;
+    };
+    caller.recorder.record(
+        caller.time,
+        caller.core,
+        caller.thread,
+        EventKind::Svc {
+            id: u32::from(record.number),
+            args: recorded_args(record),
+            // The one place a kernel result becomes the event stream's result word.
+            result: starquake_trace::ResultCode(result.raw()),
+        },
+    );
+}
+
+/// The arguments a dispatch is recorded with: the call's inputs, decoded with its convention,
+/// or every register as passed when the number has no convention (see the module docs).
+fn recorded_args(record: &Record) -> [u64; SVC_ARG_COUNT] {
+    let Some(convention) = record.id.and_then(SvcId::convention) else {
+        return record.args;
+    };
+    let mut args = [0; SVC_ARG_COUNT];
+    for input in convention.inputs {
+        let index = usize::from(input.reg);
+        if let (Some(slot), Some(passed)) = (args.get_mut(index), record.args.get(index)) {
+            *slot = input.kind.truncate(*passed);
+        }
+    }
+    args
+}
+
+/// The result word a finished dispatch is recorded with, or `None` if the call never returned to
+/// the guest.
+fn recorded_result(record: &Record, regs: &GuestRegs) -> Option<ResultCode> {
+    match &record.outcome {
+        Outcome::EnvFailed(_) => None,
+        Outcome::NotImplemented => Some(KernelError::NotImplemented.code()),
+        Outcome::ProcessExited => Some(ResultCode::SUCCESS),
+        Outcome::Completed => {
+            let result = record
+                .id
+                .and_then(SvcId::convention)
+                .and_then(|convention| convention.outputs.first())
+                .filter(|output| output.kind == Kind::Result)
+                .and_then(|output| {
+                    let register = regs.x.get(usize::from(output.reg))?;
+                    u32::try_from(output.kind.truncate(*register)).ok()
+                });
+            Some(result.map_or(ResultCode::SUCCESS, ResultCode::from_raw))
+        }
+    }
+}
 
 /// Runs one listed call. Calls that touch tables will get them here, borrowed from the locked
 /// [`Tables`] in lock order; the calls implemented so far touch none.
@@ -214,6 +309,11 @@ fn run(id: SvcId, regs: &mut GuestRegs, caller: &mut Caller<'_>) -> Outcome {
         return unimplemented(id, regs);
     };
     match id {
+        SvcId::ExitProcess => {
+            // PROVISIONAL (walking skeleton, #74): see the module docs.
+            tracing::info!("the process called ExitProcess");
+            Outcome::ProcessExited
+        }
         SvcId::GetCurrentProcessorNumber => {
             let core = processor::get_current_processor_number(caller.core);
             complete(id, convention, regs, &[u64::from(core.cast_unsigned())])

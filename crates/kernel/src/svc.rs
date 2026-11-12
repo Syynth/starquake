@@ -11,7 +11,8 @@
 //! | `OutputDebugString` (0x27) | [`debug::output_debug_string`] | guest memory and a [`DebugSink`] |
 //!
 //! Only the [dispatcher](crate::dispatch) calls them, decoding their arguments with the call's
-//! [`Convention`].
+//! [`Convention`]. `ExitProcess` (0x07) is implemented too, provisionally as a dispatcher arm with
+//! no function behind it (see the dispatcher's module docs).
 
 mod convention;
 pub mod debug;

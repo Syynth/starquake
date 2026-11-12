@@ -1,0 +1,8 @@
+---
+source: crates/core/tests/skeleton.rs
+expression: report.trace
+---
+thread 1
+  lifecycle ProcessStart 1
+  svc 0x7() -> 0x0
+  lifecycle ProcessExit 1

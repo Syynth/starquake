@@ -22,30 +22,16 @@
 # the document row that says why the dependency is wanted.
 
 [[allow]]
-package = "starquake"
-dependencies = ["starquake-core"]
-reason = "frontends depend only on core (docs/architecture.md, 'Crates and dependency direction'); the binary calls it once core exposes the system object"
-
-[[allow]]
 package = "starquake-core"
 dependencies = [
-    "starquake-cpu",
     "starquake-gpu",
     "starquake-gsv",
     "starquake-ipc",
-    "starquake-kernel",
-    "starquake-loader",
-    "starquake-memory",
     "starquake-render",
     "starquake-services",
     "starquake-shader",
 ]
-reason = "core wires the whole stack (docs/architecture.md, 'Crates and dependency direction'); its system object is the end-to-end skeleton of milestone 1 (docs/roadmap.md) and does not exist yet"
-
-[[allow]]
-package = "starquake-core"
-dependencies = ["thiserror"]
-reason = "the system object's error type arrives with the skeleton run that wires the stack"
+reason = "core wires the whole stack (docs/architecture.md, 'Crates and dependency direction'); the walking skeleton joins the loader, cpu, kernel and trace crates, and the service, graphics and IPC layers join it as milestone 1's later steps land (docs/roadmap.md, 'Route to milestone 1')"
 
 [[allow]]
 package = "starquake-gpu"
@@ -86,7 +72,3 @@ reason = "scaffold crate with no code; its error type arrives with the first fal
 package = "starquake-shader"
 dependencies = ["thiserror"]
 reason = "scaffold crate with no code; its error type arrives with the first translator pass"
-
-[[allow_workspace]]
-dependencies = ["insta"]
-reason = "snapshot tests for traces and decoded structures (docs/specs/testing.md, 'insta snapshots for traces'); the first crate to snapshot adds `insta.workspace = true` and deletes this entry"

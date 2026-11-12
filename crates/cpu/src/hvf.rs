@@ -466,6 +466,15 @@ impl HvfBackend {
     pub fn memory(&self) -> &BringupRam {
         &self.vm.ram
     }
+
+    /// The rate, in hertz, of the counter guest code reads natively (`CNTVCT_EL0`), which is also
+    /// what an unpatched `mrs xN, cntfrq_el0` reads in the guest: the host's `CNTFRQ_EL0`
+    /// (24 MHz on Apple Silicon, `tools/hvprobe/README.md`). Hypervisor.framework can offset the
+    /// guest's counter but not scale it, so the loader's counter patcher needs this as its host
+    /// rate.
+    pub fn counter_frequency(&self) -> u64 {
+        ffi::cntfrq_el0()
+    }
 }
 
 impl Backend for HvfBackend {
