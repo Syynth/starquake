@@ -58,11 +58,6 @@ dependencies = ["thiserror", "tracing"]
 reason = "error type and logging arrive with the crate's first handler"
 
 [[allow]]
-package = "starquake-loader"
-dependencies = ["starquake-memory"]
-reason = "loaders will map segments into guest memory (docs/architecture.md: loader to memory); today every format parser works on byte slices"
-
-[[allow]]
 package = "starquake-render"
 dependencies = ["thiserror"]
 reason = "scaffold crate with no code; its error type arrives with the first fallible render call"

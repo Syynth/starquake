@@ -494,8 +494,8 @@ pub(crate) fn place(
     for (module, &module_base) in program.modules.iter().zip(&bases) {
         let text_address = add(module_base, module.code.text.offset)?;
         let near = text_address - text_address % TRAMPOLINE_ALIGN;
-        let (_, counted) = patch(&module.code, module_base, near, counter)?;
-        let len = u64::try_from(counted.trampolines.len()).map_err(|_| LoadError::Overflow)?;
+        let (_, first_pass) = patch(&module.code, module_base, near, counter)?;
+        let len = u64::try_from(first_pass.trampolines.len()).map_err(|_| LoadError::Overflow)?;
         offsets.push((total, len));
         total = add(total, len)?
             .checked_next_multiple_of(TRAMPOLINE_ALIGN)

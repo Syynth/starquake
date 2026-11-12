@@ -23,33 +23,56 @@ const GENEROUS: Duration = Duration::from_secs(30);
 /// Where the first module goes: Eden's address for 39-bit code (`crates/core/src/image.rs`).
 const CODE_ADDRESS: u64 = 0x8000_0000;
 
-/// Runs `system`, or returns `None` on hosted CI (see the module docs).
-fn run(system: &System) -> Option<RunReport> {
-    if std::env::var_os("CI").is_some() {
-        return None;
+/// Shared setup. In a `cfg(test)` module so it may unwrap like the tests do.
+#[cfg(test)]
+mod support {
+    use super::*;
+
+    /// Runs `system`, or returns `None` on hosted CI (see the module docs).
+    pub(crate) fn run(system: &System) -> Option<RunReport> {
+        if std::env::var_os("CI").is_some() {
+            return None;
+        }
+        Some(system.run(&RunOptions {
+            timeout: Some(GENEROUS),
+            command_line: Vec::new(),
+        }))
     }
-    Some(system.run(&RunOptions {
-        timeout: Some(GENEROUS),
-        command_line: Vec::new(),
-    }))
+
+    /// The ExeFS of the fixture's metadata and `modules`, each the fixture's NSO.
+    pub(crate) fn exefs(modules: &[&'static str]) -> System {
+        let mut files = vec![(NPDM_FILE, NPDM)];
+        files.extend(modules.iter().map(|name| (*name, NSO)));
+        System::from_exefs(ExeFs::parse(&files).expect("the fixture's ExeFS parses"))
+            .expect("the fixture's ExeFS loads")
+    }
+
+    /// The mapping called `name`.
+    pub(crate) fn mapping<'a>(report: &'a RunReport, name: &str) -> &'a Mapping {
+        report
+            .memory_map
+            .iter()
+            .find(|mapping| mapping.name == name)
+            .unwrap()
+    }
+
+    /// The size of module `name`: from its first mapping to the next module's or the end of its
+    /// last mapping, page-aligned.
+    pub(crate) fn report_module_size(report: &RunReport, name: &str) -> u64 {
+        let prefix = format!("{name}.");
+        let mine: Vec<_> = report
+            .memory_map
+            .iter()
+            .filter(|mapping| mapping.name.starts_with(&prefix))
+            .collect();
+        let start = mine.iter().map(|m| m.start).min().unwrap();
+        let end = mine.iter().map(|m| m.end).max().unwrap();
+        (end - start).next_multiple_of(starquake_memory::PAGE_SIZE)
+    }
 }
 
-/// The ExeFS of the fixture's metadata and `modules`, each the fixture's NSO.
-fn exefs(modules: &[&'static str]) -> System {
-    let mut files = vec![(NPDM_FILE, NPDM)];
-    files.extend(modules.iter().map(|name| (*name, NSO)));
-    System::from_exefs(ExeFs::parse(&files).expect("the fixture's ExeFS parses"))
-        .expect("the fixture's ExeFS loads")
-}
-
-/// The mapping called `name`.
-fn mapping<'a>(report: &'a RunReport, name: &str) -> &'a Mapping {
-    report
-        .memory_map
-        .iter()
-        .find(|mapping| mapping.name == name)
-        .unwrap_or_else(|| panic!("no {name} in {:?}", report.memory_map))
-}
+#[cfg(test)]
+use support::{exefs, mapping, report_module_size, run};
 
 #[test]
 fn the_hello_exefs_runs_to_exit_process_as_its_nro_twin_does() {
@@ -90,18 +113,4 @@ fn a_set_of_two_modules_runs_its_first_with_the_second_placed_after_it() {
     // The first module's data ends before the second starts.
     let rtld_end = mapping(&report, "rtld.data").end;
     assert!(rtld_end <= main.start, "{:?}", report.memory_map);
-}
-
-/// The size of module `name`: from its first mapping to the next module's or the end of its
-/// last mapping, page-aligned.
-fn report_module_size(report: &RunReport, name: &str) -> u64 {
-    let prefix = format!("{name}.");
-    let mine: Vec<_> = report
-        .memory_map
-        .iter()
-        .filter(|mapping| mapping.name.starts_with(&prefix))
-        .collect();
-    let start = mine.iter().map(|m| m.start).min().unwrap();
-    let end = mine.iter().map(|m| m.end).max().unwrap();
-    (end - start).next_multiple_of(starquake_memory::PAGE_SIZE)
 }
