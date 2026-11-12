@@ -32,8 +32,9 @@ impl Field {
     /// The field's bits as a mask over the whole instruction. Bits past bit 127 are dropped.
     pub const fn mask(self) -> u128 {
         let ones = match u128::MAX.checked_shr(128_u32.saturating_sub(self.width)) {
-            Some(ones) if self.width > 0 => ones,
-            _ => 0,
+            Some(ones) => ones,
+            // A zero width shifts by 128, which is no bits.
+            None => 0,
         };
         match ones.checked_shl(self.start) {
             Some(mask) => mask,
