@@ -321,7 +321,12 @@ impl IpcContext<'_> {
     ///
     /// PROVISIONAL: the owner is taken to be the sender, whose memory this context reaches
     /// (one process per set of tables, `crate::tables`).
-    pub fn read_transfer_memory(&self, object: ObjectId, offset: u64, out: &mut [u8]) -> SvcResult<()> {
+    pub fn read_transfer_memory(
+        &self,
+        object: ObjectId,
+        offset: u64,
+        out: &mut [u8],
+    ) -> SvcResult<()> {
         let address = self.lent_range(object, offset, out.len())?;
         self.memory
             .read(address, out)

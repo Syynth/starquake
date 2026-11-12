@@ -59,8 +59,8 @@ impl Dispatcher {
                         })
                     },
                 ),
-            SvcId::CreateTransferMemory => self
-                .call_in_process::<(&mut HandleTable, &mut AddressSpace, &mut Scheduler)>(
+            SvcId::CreateTransferMemory => {
+                self.call_in_process::<(&mut HandleTable, &mut AddressSpace, &mut Scheduler)>(
                     call,
                     |(handles, space, scheduler), call, _, processes| {
                         returning(id, convention, call.regs, |[address, size, permission]| {
@@ -76,7 +76,8 @@ impl Dispatcher {
                             Ok([u64::from(handle.raw())])
                         })
                     },
-                ),
+                )
+            }
             _ => self.call::<()>(call, |(), call, _| super::unimplemented(id, call.regs)),
         }
     }

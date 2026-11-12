@@ -149,7 +149,7 @@ impl SharedView {
             if end - start > backing.size() {
                 return Err(fault);
             }
-            Ok((state.physical.clone(), backing.base() + offset))
+            Ok((Arc::clone(&state.physical), backing.base() + offset))
         })
     }
 }
@@ -201,8 +201,11 @@ impl Mapper for RecordingMapper {
     fn unmap(&mut self, address: u64, size: u64) -> Result<(), MapperError> {
         self.record(MapperCall::Unmap { address, size })?;
         let end = address.saturating_add(size);
-        self.0
-            .with(|state| state.shared.retain(|start, _| !(address..end).contains(start)));
+        self.0.with(|state| {
+            state
+                .shared
+                .retain(|start, _| !(address..end).contains(start));
+        });
         Ok(())
     }
 
@@ -221,8 +224,10 @@ impl Mapper for RecordingMapper {
                 .checked_add(size)
                 .filter(|end| *end <= SHARED_BASE + SHARED_CAPACITY)
                 .and_then(|_| BackingRange::new(state.next, size).ok())
-                .ok_or_else(|| MapperError(format!("no room for {size:#x} bytes of shared memory")))?;
-            Ok::<_, MapperError>((backing, state.physical.clone()))
+                .ok_or_else(|| {
+                    MapperError(format!("no room for {size:#x} bytes of shared memory"))
+                })?;
+            Ok::<_, MapperError>((backing, Arc::clone(&state.physical)))
         })?;
         self.record(MapperCall::AllocateShared { backing })?;
         self.0.with(|state| state.next = backing.end());

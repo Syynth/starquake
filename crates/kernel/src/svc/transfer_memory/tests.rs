@@ -12,7 +12,9 @@ use crate::memory::testing::{MapperCall, MapperLog};
 use crate::memory::{MemoryAttribute, MemoryBlock, MemoryPermission, MemoryState};
 use crate::object::Objects;
 use crate::svc::handle::close_handle;
-use crate::svc::memory::{HEAP_SIZE_ALIGNMENT, set_heap_size, set_memory_attribute, set_memory_permission};
+use crate::svc::memory::{
+    HEAP_SIZE_ALIGNMENT, set_heap_size, set_memory_attribute, set_memory_permission,
+};
 
 /// Pages the tests usually lend.
 const PAGES: u64 = 2;
@@ -77,7 +79,7 @@ impl World {
         let object = self.handles.get(handle).unwrap();
         match self.scheduler.objects().get(object).unwrap() {
             Object::TransferMemory(transfer) => transfer,
-            other => panic!("{other:?} is not a transfer memory"),
+            other => unreachable!("{other:?} is not a transfer memory"),
         }
     }
 
@@ -188,10 +190,7 @@ fn while_lent_the_owner_cannot_change_the_pages_and_closing_the_handle_gives_the
         invalid
     );
     // Shrinking the heap would free them.
-    assert_eq!(
-        set_heap_size(&mut world.space, 0).map(|_| ()),
-        invalid
-    );
+    assert_eq!(set_heap_size(&mut world.space, 0).map(|_| ()), invalid);
     // Lending them, or a range that overlaps them by one page, a second time.
     assert_eq!(
         world.create(heap, SIZE, raw(SvcPermission::None)),
@@ -204,7 +203,9 @@ fn while_lent_the_owner_cannot_change_the_pages_and_closing_the_handle_gives_the
     assert_eq!(world.blocks(), lent);
     assert_eq!(world.log.take(), []);
     // The pages right after them can still be lent.
-    let next = world.create(heap + SIZE, SIZE, raw(SvcPermission::Read)).unwrap();
+    let next = world
+        .create(heap + SIZE, SIZE, raw(SvcPermission::Read))
+        .unwrap();
     drop(world.log.take());
     // The transfer memory goes with its handle; its pages come back read-write and unlocked,
     // and the neighbour lent after it is left as it is.
@@ -269,7 +270,10 @@ fn only_read_write_memory_that_can_be_transferred_with_one_state_throughout_is_l
     // Text and read-only data are code: no `FlagCanTransfer`.
     assert_eq!(world.create(fixture::CODE, PAGE_SIZE, none), invalid);
     // Free memory.
-    assert_eq!(world.create(heap + HEAP_SIZE_ALIGNMENT, PAGE_SIZE, none), invalid);
+    assert_eq!(
+        world.create(heap + HEAP_SIZE_ALIGNMENT, PAGE_SIZE, none),
+        invalid
+    );
     // Heap made read-only.
     set_memory_permission(&mut world.space, heap, PAGE_SIZE, raw(SvcPermission::Read)).unwrap();
     assert_eq!(world.create(heap, PAGE_SIZE, none), invalid);
@@ -294,10 +298,20 @@ fn each_refusal_has_its_result_in_eden_order_and_changes_nothing() {
         (heap, 0, none, KernelError::InvalidSize),
         (wraps, SIZE, execute, KernelError::InvalidCurrentMemory),
         (end, SIZE, execute, KernelError::InvalidNewMemoryPermission),
-        (heap, SIZE, u32::MAX, KernelError::InvalidNewMemoryPermission),
+        (
+            heap,
+            SIZE,
+            u32::MAX,
+            KernelError::InvalidNewMemoryPermission,
+        ),
         // Above the address space (`Contains`), and ending one page past it.
         (end, SIZE, none, KernelError::InvalidCurrentMemory),
-        (end - PAGE_SIZE, SIZE, none, KernelError::InvalidCurrentMemory),
+        (
+            end - PAGE_SIZE,
+            SIZE,
+            none,
+            KernelError::InvalidCurrentMemory,
+        ),
     ];
     let before = world.blocks();
     for (address, size, permission, error) in cases {
@@ -337,7 +351,9 @@ fn a_full_handle_table_gives_the_pages_back_before_the_call_returns() {
     let mut world = World::new();
     world.handles = HandleTable::new(1).unwrap();
     let heap = world.heap;
-    let first = world.create(heap, PAGE_SIZE, raw(SvcPermission::None)).unwrap();
+    let first = world
+        .create(heap, PAGE_SIZE, raw(SvcPermission::None))
+        .unwrap();
     drop(world.log.take());
     let before = world.blocks();
     assert_eq!(
@@ -371,7 +387,9 @@ fn a_full_handle_table_gives_the_pages_back_before_the_call_returns() {
 fn unlocking_goes_on_past_a_failure_and_reports_the_first() {
     let mut world = World::new();
     let heap = world.heap;
-    let first = world.create(heap, PAGE_SIZE, raw(SvcPermission::None)).unwrap();
+    let first = world
+        .create(heap, PAGE_SIZE, raw(SvcPermission::None))
+        .unwrap();
     let second = world
         .create(heap + PAGE_SIZE, PAGE_SIZE, raw(SvcPermission::None))
         .unwrap();
@@ -384,10 +402,7 @@ fn unlocking_goes_on_past_a_failure_and_reports_the_first() {
         .objects_mut()
         .create(Object::TransferMemory(foreign))
         .unwrap();
-    assert_eq!(
-        world.scheduler.objects_mut().close(stray),
-        Ok(Closed::Last)
-    );
+    assert_eq!(world.scheduler.objects_mut().close(stray), Ok(Closed::Last));
     close_handle(&mut world.handles, &mut world.scheduler, first).unwrap();
     close_handle(&mut world.handles, &mut world.scheduler, second).unwrap();
     let unlocked = unlock_released(&mut world.scheduler, &mut world.space, owner());

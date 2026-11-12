@@ -876,12 +876,7 @@ impl AddressSpace {
             set: DisableMerge::NORMAL,
             clear: DisableMerge::NONE,
         };
-        self.apply(
-            address,
-            pages,
-            change,
-            Effect::MapShared(memory.backing()),
-        )?;
+        self.apply(address, pages, change, Effect::MapShared(memory.backing()))?;
         self.shared.insert(address, SharedMapping { object, size });
         Ok(())
     }

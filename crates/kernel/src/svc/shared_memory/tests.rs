@@ -102,10 +102,7 @@ impl World {
     }
 
     /// The block at `address`: its first address, pages, state, permission and attributes.
-    fn block(
-        &self,
-        address: u64,
-    ) -> (u64, u64, MemoryState, MemoryPermission, MemoryAttribute) {
+    fn block(&self, address: u64) -> (u64, u64, MemoryState, MemoryPermission, MemoryAttribute) {
         let block = self.space.query_info(address).unwrap();
         (
             block.address(),
@@ -199,11 +196,11 @@ fn the_permission_must_be_the_user_permission() {
         (world.refs(read_only.object), world.refs(writable.object)),
         (2, 2)
     );
-    assert_eq!(world.map(writable.handle, SHARED, PAGE_SIZE, read_write), Ok(()));
     assert_eq!(
-        world.block(SHARED).3,
-        MemoryPermission::USER_READ_WRITE
+        world.map(writable.handle, SHARED, PAGE_SIZE, read_write),
+        Ok(())
     );
+    assert_eq!(world.block(SHARED).3, MemoryPermission::USER_READ_WRITE);
 }
 
 #[test]
@@ -222,14 +219,6 @@ fn a_permission_that_is_neither_read_nor_read_write_is_refused_first() {
     }
 }
 
-/// One way to call `MapSharedMemory`, built to fail at one check.
-struct Case {
-    handle: Handle,
-    address: u64,
-    size: u64,
-    permission: u32,
-}
-
 #[test]
 fn each_refusal_of_a_mapping_has_its_result_in_eden_order_and_changes_nothing() {
     let mut world = World::new();
@@ -240,114 +229,71 @@ fn each_refusal_of_a_mapping_has_its_result_in_eden_order_and_changes_nothing() 
         .objects_mut()
         .create(Object::Process(ProcessId::from_parts(0, 1)))
         .unwrap();
-    let not_shared = world
+    let other = world
         .handles
         .add(world.scheduler.objects_mut(), process)
         .unwrap();
-    let read = raw(SvcPermission::Read);
-    let read_write = raw(SvcPermission::ReadWrite);
-    let heap = world.space.regions().heap.start;
-    let good = Case {
-        handle: shared.handle,
-        address: SHARED,
-        size: SIZE,
-        permission: read,
-    };
-    // Something is already mapped where the last case maps.
-    let busy = fixture::DATA;
+    let (read, read_write) = (raw(SvcPermission::Read), raw(SvcPermission::ReadWrite));
+    // Read, write and execute: no shared memory permission.
+    let execute = read_write | raw(SvcPermission::ReadExecute);
+    let (heap, wraps) = (world.space.regions().heap.start, u64::MAX - PAGE_SIZE + 1);
+    let (good, busy) = (shared.handle, fixture::DATA);
+    // Each case breaks one check and, where there is one, the check after it too, so the
+    // first one wins.
     let cases = [
-        // Each case breaks one check and the one after it, so the first one wins.
+        (good, SHARED + 1, SIZE, execute, KernelError::InvalidAddress),
+        (good, wraps, SIZE + 1, read, KernelError::InvalidSize),
+        (good, SHARED, 0, read, KernelError::InvalidSize),
         (
-            Case {
-                address: SHARED + 1,
-                permission: read_write + 4,
-                ..good
-            },
-            KernelError::InvalidAddress,
-        ),
-        (
-            Case {
-                size: SIZE + 1,
-                address: u64::MAX - PAGE_SIZE + 1,
-                ..good
-            },
-            KernelError::InvalidSize,
-        ),
-        (
-            Case {
-                size: 0,
-                ..good
-            },
-            KernelError::InvalidSize,
-        ),
-        (
-            Case {
-                address: u64::MAX - PAGE_SIZE + 1,
-                permission: read_write + 4,
-                ..good
-            },
+            good,
+            wraps,
+            SIZE,
+            execute,
             KernelError::InvalidCurrentMemory,
         ),
         (
-            Case {
-                permission: read_write + 4,
-                handle: Handle::INVALID,
-                ..good
-            },
+            Handle::INVALID,
+            SHARED,
+            SIZE,
+            execute,
             KernelError::InvalidNewMemoryPermission,
         ),
+        (other, heap, SIZE, read, KernelError::InvalidHandle),
         (
-            Case {
-                handle: not_shared,
-                address: heap,
-                ..good
-            },
+            Handle::CURRENT_PROCESS,
+            SHARED,
+            SIZE,
+            read,
             KernelError::InvalidHandle,
         ),
         (
-            Case {
-                handle: Handle::CURRENT_PROCESS,
-                ..good
-            },
-            KernelError::InvalidHandle,
-        ),
-        (
-            Case {
-                address: heap,
-                size: PAGE_SIZE,
-                ..good
-            },
+            good,
+            heap,
+            PAGE_SIZE,
+            read,
             KernelError::InvalidMemoryRegion,
         ),
         (
-            Case {
-                size: PAGE_SIZE,
-                permission: read_write,
-                ..good
-            },
+            good,
+            SHARED,
+            PAGE_SIZE,
+            read_write,
             KernelError::InvalidSize,
         ),
         (
-            Case {
-                permission: read_write,
-                address: busy,
-                ..good
-            },
+            good,
+            busy,
+            SIZE,
+            read_write,
             KernelError::InvalidNewMemoryPermission,
         ),
-        (
-            Case {
-                address: busy,
-                ..good
-            },
-            KernelError::InvalidCurrentMemory,
-        ),
+        (good, busy, SIZE, read, KernelError::InvalidCurrentMemory),
     ];
     let before = world.blocks();
-    for (case, error) in cases {
-        let at = (case.handle, case.address, case.size, case.permission);
+    for (handle, address, size, permission, error) in cases {
+        let at = (handle, address, size, permission);
         assert_eq!(
-            world.map(case.handle, case.address, case.size, case.permission),
+            world.map(handle, address, size, permission),
             refused(error),
             "{at:x?}"
         );
@@ -450,7 +396,10 @@ fn unmapping_shared_memory_needs_the_mapping_of_that_shared_memory_at_its_start(
     // A range of the right size and state throughout, starting inside the first mapping and
     // ending inside the second: the state check passes, the page check does not.
     assert_eq!(world.unmap(first.handle, SHARED + PAGE_SIZE, SIZE), invalid);
-    assert_eq!(world.unmap(second.handle, SHARED + PAGE_SIZE, SIZE), invalid);
+    assert_eq!(
+        world.unmap(second.handle, SHARED + PAGE_SIZE, SIZE),
+        invalid
+    );
     assert_eq!(world.blocks(), before);
     assert_eq!(
         (world.refs(first.object), world.refs(second.object)),

@@ -298,7 +298,8 @@ mod tests {
         let size = count * PAGE_SIZE;
         let memory = Arc::new(FlatMemory::new(BASE, usize::try_from(size).unwrap()));
         let backing = BackingRange::new(BASE, size).unwrap();
-        (SharedPages::new(backing, memory.clone()), memory)
+        let erased: Arc<dyn GuestMemory> = Arc::<FlatMemory>::clone(&memory);
+        (SharedPages::new(backing, erased), memory)
     }
 
     #[test]

@@ -92,8 +92,7 @@ impl World {
     fn new() -> Self {
         let (space, log, _) = fixture::loaded();
         let tables =
-            crate::process::create(&ProcessDescription::homebrew(Console::Switch2), space)
-                .unwrap();
+            crate::process::create(&ProcessDescription::homebrew(Console::Switch2), space).unwrap();
         let dispatcher = Dispatcher::new(tables);
         let script = Arc::new(Mutex::new(None));
         dispatcher
@@ -197,7 +196,9 @@ impl World {
     fn object(&self, handle: Handle) -> SvcResult<Object> {
         self.dispatcher
             .with::<(&HandleTable, &Scheduler), _>(|(handles, scheduler)| {
-                let id = handles.get(handle).map_err(|_| KernelError::InvalidHandle)?;
+                let id = handles
+                    .get(handle)
+                    .map_err(|_| KernelError::InvalidHandle)?;
                 scheduler
                     .objects()
                     .get(id)
@@ -292,7 +293,7 @@ fn a_server_makes_shared_memory_the_guest_maps_and_each_sees_the_others_writes()
     let (handle, pages) = world.shared_memory(SvcPermission::ReadWrite);
     // The guest's handle names the server's shared memory, which the server still holds too.
     let Ok(Object::SharedMemory(memory)) = world.object(handle) else {
-        panic!("the reply's handle names no shared memory");
+        unreachable!("the reply's handle names no shared memory");
     };
     assert_eq!(
         (memory.backing(), memory.user_permission()),
@@ -333,11 +334,17 @@ fn a_server_cannot_make_shared_memory_of_no_bytes_or_a_permission_a_mapping_cann
                 (SIZE, SvcPermission::None),
                 (SIZE, SvcPermission::ReadExecute),
             ] {
-                seen.push(cx.create_shared_memory(size, permission).map(|(_, pages)| pages.size()));
+                seen.push(
+                    cx.create_shared_memory(size, permission)
+                        .map(|(_, pages)| pages.size()),
+                );
             }
             // One byte is a page, and one more is two.
             for size in [1, PAGE_SIZE + 1] {
-                seen.push(cx.create_shared_memory(size, SvcPermission::Read).map(|(_, pages)| pages.size()));
+                seen.push(
+                    cx.create_shared_memory(size, SvcPermission::Read)
+                        .map(|(_, pages)| pages.size()),
+                );
             }
             Ok(())
         }),
@@ -401,10 +408,14 @@ fn create_transfer_memory_reads_x1_to_x3_and_returns_its_handle_in_x1() {
     let world = World::new();
     let handle = lend(&world, SvcPermission::Read);
     let Ok(Object::TransferMemory(transfer)) = world.object(handle) else {
-        panic!("x1 names no transfer memory");
+        unreachable!("x1 names no transfer memory");
     };
     assert_eq!(
-        (transfer.address(), transfer.size(), transfer.owner_permission()),
+        (
+            transfer.address(),
+            transfer.size(),
+            transfer.owner_permission()
+        ),
         (DATA, PAGE_SIZE, SvcPermission::Read)
     );
     assert!(transfer.is_locked());
@@ -485,7 +496,8 @@ fn a_server_reads_and_writes_a_transfer_memory_it_is_sent_within_its_bounds() {
             let mut read = [0; 3];
             cx.read_transfer_memory(object, 16, &mut read).unwrap();
             seen.push(Ok((u64::from(read[0]), u64::from(read[2]))));
-            cx.write_transfer_memory(object, PAGE_SIZE - 1, &[0x42]).unwrap();
+            cx.write_transfer_memory(object, PAGE_SIZE - 1, &[0x42])
+                .unwrap();
             // One byte past the end, reading or writing, and an offset that wraps.
             let past = cx.read_transfer_memory(object, PAGE_SIZE - 1, &mut [0; 2]);
             seen.push(past.map(|()| (0, 0)));

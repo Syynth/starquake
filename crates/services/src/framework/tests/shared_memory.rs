@@ -85,7 +85,12 @@ fn the_caller_gets_a_handle_to_the_pages_the_service_wrote() {
     let (mut server, mut kernel, session) = rig();
     let page = shared_memory_size(1).unwrap();
     let read = u32::from(SvcPermission::Read.bits());
-    let reply = plain(&send(&mut server, &mut kernel, session, &make(page + 1, read)));
+    let reply = plain(&send(
+        &mut server,
+        &mut kernel,
+        session,
+        &make(page + 1, read),
+    ));
     assert_eq!(reply.result, ResultCode::SUCCESS.raw());
     assert_eq!(reply.copies.len(), 1);
     let object = kernel
@@ -104,11 +109,7 @@ fn the_kernels_refusals_are_the_replys_result_and_give_no_handle() {
     let (mut server, mut kernel, session) = rig();
     let page = shared_memory_size(1).unwrap();
     for (size, permission, error) in [
-        (
-            0,
-            SvcPermission::Read,
-            KernelError::InvalidSize,
-        ),
+        (0, SvcPermission::Read, KernelError::InvalidSize),
         (
             page,
             SvcPermission::None,

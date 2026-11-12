@@ -551,11 +551,8 @@ impl<B> Drop for Locked<'_, B> {
             return;
         }
         let own = tables.processes.own();
-        let unlocked = transfer_memory::unlock_released(
-            &mut tables.scheduler,
-            &mut tables.address_space,
-            own,
-        );
+        let unlocked =
+            transfer_memory::unlock_released(&mut tables.scheduler, &mut tables.address_space, own);
         if let Err(error) = unlocked {
             tracing::error!(%error, "unlocking a released transfer memory's pages failed");
         }
