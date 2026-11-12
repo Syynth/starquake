@@ -241,3 +241,11 @@ Entry format:
 - **WHAT:** The shader crate's output is a validated naga module plus tables describing its resources, inputs and outputs. The wgpu backend takes the module directly. A later direct backend asks the shader crate for final Vulkan or Metal code instead, which the shader crate emits; the backend says which form it wants. The shader and render crates do not depend on each other: the GPU crate carries the module across, and all three use the naga version wgpu uses. naga is the only shader backend at first; the project's own intermediate form stays independent of naga so a direct code writer can be added later. Game memory addresses stop at the GPU crate, and wgpu types stop at the wgpu backend crate.
 - **WHY:** wgpu is built on naga and accepts a module on its safe, supported path, so emitting final code now would add plumbing for a route wgpu does not need and would bypass its checks. naga cannot express geometry or tessellation stages, but wgpu cannot run them either, so nothing is lost by starting naga-only. Keeping emission in the shader crate for direct backends keeps naga's breaking changes in one place.
 
+## The game sees GPU work as done only when the host GPU has finished it
+- **WHEN:** 2026-11-12
+- **PROJECT:** starquake
+- **SYSTEM:** gpu
+- **SCOPE:** architectural
+- **WHAT:** A semaphore release or syncpoint increment becomes visible to the game once the host GPU has actually finished the work before it, not when the work is recorded. Signals with no host work behind them are written at once, and several are batched into one completion check. Signalling at record time is kept only as a debugging switch. The graphics server draft's assumption that increments happen at record time is dropped.
+- **WHY:** An early signal lets the game read back an image or a query result that does not exist yet, which shows up as occasional wrong pixels or stale data and is very hard to trace. A late one only costs latency, which is easy to measure. The project aims for correct frames before fast ones, and wgpu reports when submitted work has completed.
+
