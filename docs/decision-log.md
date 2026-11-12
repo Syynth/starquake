@@ -193,3 +193,11 @@ Entry format:
 - **WHAT:** Decided by the lead under delegation. Eight rules from review findings moved into `CLAUDE.md`: saving passes the checks restoring enforces; one named constant per decoded bit field; mutation-check new tests; a test with both faults present when an order of checks is promised; sticky streaming-read failures; bounds by what a hostile input can force; a hand-built accepting case per format feature; plain-word errors asserted exactly. The candidates that existing rules already cover were dropped (`docs/proposals.md`). Also ruled: adding a crash-report kind bumps the report's version.
 - **WHY:** Each came from a defect a reviewer found in agent-written code in these waves, and the owner wants recurring mistakes turned into standing rules.
 
+## Fable is used sparingly; builds and fixes run on Opus
+- **WHEN:** 2026-11-12
+- **PROJECT:** starquake
+- **SYSTEM:** process
+- **SCOPE:** moderate
+- **WHAT:** The owner's direction: keep using Fable, but much more sparingly, and not for build agents by default. The allocation that follows is the lead's reading of that. Build and fix agents run on Opus, and the routine steps (merging, lessons, scope review) on Sonnet or Opus. Fable is kept for work where one bounded pass of judgement matters most: the fidelity review of a foundation PR (the kernel, the execution model, anything later work builds on) and the lead session's own design decisions. A build goes to Fable only when the lead can say why Opus would not do, and the report says so. This amends "Autonomous mode until something runs", which sent judgement-heavy work to the strongest model.
+- **WHY:** One day of Fable builds and reviews used the owner's whole weekly allowance. Builds are where the tokens go: a build agent runs for hours of tool calls, while a review is one read of a finished change. Spending Fable on the review keeps the strongest judgement on what merges, at a fraction of the cost.
+
