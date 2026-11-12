@@ -177,3 +177,10 @@ Platform-specific code must still compile (or be `cfg`-gated) on Linux; check wi
 
 Code may be ported from GPL projects (Eden, oboromi, rapid-arm-emu) with attribution in the file
 header; MIT sources (Mesa) likewise. Don't use leaked or NDA material.
+
+- **libnx is ISC** (permissive): code may be ported, and the original file's ISC copyright and
+  permission notice go in the header of the file that holds the port.
+- **Atmosphère is GPL-2.0-only, so it is a reference for facts only.** Its licence can't be
+  combined with this project's GPL-3.0-or-later: never port, translate or closely paraphrase its
+  code. Read it to settle a fact (a result code, a command id, a layout), write the code from the
+  fact, and cite the file in a comment marked "fact only" (`docs/references.md`).
