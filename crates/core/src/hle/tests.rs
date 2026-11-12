@@ -157,10 +157,12 @@ fn libnx(id: u32) -> RequestBuilder {
 /// The reply's result and data, read as libnx reads a reply of `size` bytes.
 fn reply(buffer: &[u8], size: usize) -> (u32, Vec<u8>, Vec<u32>) {
     let message = Message::parse_reply_sized(buffer, SessionKind::Session, size).unwrap();
-    let starquake_ipc::Body::CmifReply(body) = message.body else {
-        panic!("not a CMIF reply: {message:?}");
-    };
-    (body.header.result, body.data.to_vec(), message.move_handles)
+    match message.body {
+        starquake_ipc::Body::CmifReply(body) => {
+            (body.header.result, body.data.to_vec(), message.move_handles)
+        }
+        other => unreachable!("not a CMIF reply: {other:?}"),
+    }
 }
 
 #[test]

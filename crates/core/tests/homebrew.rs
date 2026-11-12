@@ -422,7 +422,7 @@ mod trace {
         let declaration = format!("static const char {name}[] = \"");
         let (_, rest) = HELLO_SOURCE
             .split_once(&declaration)
-            .unwrap_or_else(|| panic!("hello.c declares {name}"));
+            .expect("hello.c declares the string");
         rest.split_once('"').expect("a closing quote").0
     }
 
@@ -608,8 +608,8 @@ mod trace {
                         mut args,
                         result,
                     } => {
-                        for register in 0..3 {
-                            args[register] = shift(args[register]);
+                        for arg in args.iter_mut().take(3) {
+                            *arg = shift(*arg);
                         }
                         Line::Svc {
                             number,
@@ -776,6 +776,48 @@ mod trace {
         }
 
         #[test]
+        fn three_kinds_of_event_are_lines_and_no_other_is() {
+            let svc = EventKind::Svc {
+                id: 0x21,
+                args: [7; SVC_ARG_COUNT],
+                result: starquake_trace::ResultCode(0xf601),
+            };
+            assert_eq!(
+                Line::of(&svc),
+                Some(Line::Svc {
+                    number: 0x21,
+                    args: [7; SVC_ARG_COUNT],
+                    result: 0xf601
+                })
+            );
+            let request = EventKind::Ipc {
+                session: starquake_trace::SessionId(5),
+                service: SET_SYS,
+                command: 3,
+                request_size: 8,
+                reply_size: 2,
+                result: starquake_trace::ResultCode(0),
+                outcome: starquake_trace::IpcOutcome::Done,
+            };
+            assert_eq!(
+                Line::of(&request),
+                Some(Line::Ipc {
+                    service: SET_SYS,
+                    command: 3
+                })
+            );
+            assert_eq!(
+                Line::of(&EventKind::GuestLog { len: 4, hash: 9 }),
+                Some(Line::Log { len: 4, hash: 9 })
+            );
+            let start = EventKind::Lifecycle {
+                phase: starquake_trace::LifecyclePhase::ProcessStart,
+                subject: 1,
+            };
+            assert_eq!(Line::of(&start), None);
+        }
+
+        #[test]
         fn the_fixtures_strings_are_read_from_its_source() {
             assert_eq!(source_string("LINE_ONE"), "starquake hello: line one");
             assert_eq!(
@@ -846,7 +888,7 @@ mod trace {
                 ]
             );
             // Every call it makes is implemented.
-            assert_eq!(report.stubbed, Default::default());
+            assert_eq!(report.stubbed, std::collections::BTreeSet::new());
             let made: Vec<_> = report
                 .system_calls
                 .iter()

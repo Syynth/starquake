@@ -32,11 +32,10 @@ package = "starquake-core"
 dependencies = [
     "starquake-gpu",
     "starquake-gsv",
-    "starquake-ipc",
     "starquake-render",
     "starquake-shader",
 ]
-reason = "core wires the whole stack (docs/architecture.md, 'Crates and dependency direction'); the walking skeleton joins the loader, cpu, kernel and trace crates, and the service, graphics and IPC layers join it as milestone 1's later steps land (docs/roadmap.md, 'Route to milestone 1')"
+reason = "core wires the whole stack (docs/architecture.md, 'Crates and dependency direction'); the walking skeleton joins the loader, cpu, kernel, trace, IPC and service crates, and the graphics layers join it as later milestones land (docs/roadmap.md, 'Route to milestone 1')"
 
 [[allow]]
 package = "starquake-gpu"

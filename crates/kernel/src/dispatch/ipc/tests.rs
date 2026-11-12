@@ -45,6 +45,10 @@ struct Log {
     handled: Vec<(ObjectId, MessageBuffer)>,
 }
 
+/// Deferred replies that are ready, oldest first: the session, and the byte to fill the reply
+/// with, or an error.
+type Ready = Arc<Mutex<VecDeque<(ObjectId, Result<u8, HandlerError>)>>>;
+
 type Script = Box<
     dyn FnMut(&mut IpcContext<'_>, ObjectId, &mut [u8]) -> Result<Handled, HandlerError> + Send,
 >;
@@ -53,9 +57,7 @@ type Script = Box<
 struct Scripted {
     log: Arc<Mutex<Log>>,
     script: Script,
-    /// Deferred replies that are ready, oldest first: the session, and the byte to fill the
-    /// reply with, or an error.
-    ready: Arc<Mutex<VecDeque<(ObjectId, Result<u8, HandlerError>)>>>,
+    ready: Ready,
 }
 
 impl SessionHandler for Scripted {
@@ -137,7 +139,7 @@ struct Server {
     id: ServerId,
     log: Arc<Mutex<Log>>,
     script: Arc<Mutex<Option<Script>>>,
-    ready: Arc<Mutex<VecDeque<(ObjectId, Result<u8, HandlerError>)>>>,
+    ready: Ready,
 }
 
 impl Server {
@@ -352,7 +354,7 @@ fn connecting_to_a_named_port_gives_a_session_the_server_accepts_at_once() {
         assert!(!scheduler.ipc().has_any_notices());
     });
     assert_eq!(world.first.log().accepted, [session]);
-    assert!(world.second.log().accepted.is_empty());
+    assert_eq!(world.second.log().accepted, Vec::<ObjectId>::new());
 }
 
 #[test]
@@ -381,7 +383,7 @@ fn a_bad_name_is_refused_before_the_port_is_looked_up() {
     world.memory.write(DATA_END - 2, b"fi").unwrap();
     let (_, regs) = world.call(A, SvcId::ConnectToNamedPort, 0, DATA_END - 2);
     assert_eq!(result(&regs), KernelError::InvalidPointer.code());
-    assert!(world.first.log().accepted.is_empty());
+    assert_eq!(world.first.log().accepted, Vec::<ObjectId>::new());
 }
 
 #[test]
@@ -459,7 +461,10 @@ fn a_handle_that_names_no_session_is_an_invalid_handle_and_reaches_no_server() {
             "{handle:?}"
         );
     }
-    assert!(world.first.log().handled.is_empty());
+    assert_eq!(
+        world.first.log().handled,
+        Vec::<(ObjectId, MessageBuffer)>::new()
+    );
     // Each was recorded with its result.
     let last = world.events().last().map(|event| event.kind);
     assert_eq!(
@@ -529,7 +534,10 @@ fn a_bad_handle_in_the_message_fails_the_request_before_the_server_sees_it() {
         &request().copy_handle(stale.raw()).move_handle(moved.raw()),
     );
     assert_eq!(result(&regs), KernelError::InvalidHandle.code());
-    assert!(world.first.log().handled.is_empty());
+    assert_eq!(
+        world.first.log().handled,
+        Vec::<(ObjectId, MessageBuffer)>::new()
+    );
     // The moved handle left the table anyway, and with it its session.
     world.with_tables(|handles, _| assert!(handles.get(moved).is_err()));
 }
@@ -556,7 +564,7 @@ fn a_close_request_ends_with_session_closed_and_the_session_stays_closed() {
     // Closing the handle destroys the session; the server, which closed it, is not told.
     assert_eq!(result(&world.close(handle)), ResultCode::SUCCESS);
     world.with_tables(|_, scheduler| assert!(!scheduler.ipc().is_session(session)));
-    assert!(world.first.log().closed.is_empty());
+    assert_eq!(world.first.log().closed, Vec::<ObjectId>::new());
 }
 
 #[test]
@@ -584,7 +592,7 @@ fn closing_the_last_handle_tells_the_server_and_one_of_two_does_not() {
             handles.add(scheduler.objects_mut(), session).unwrap()
         });
     world.close(handle);
-    assert!(world.first.log().closed.is_empty());
+    assert_eq!(world.first.log().closed, Vec::<ObjectId>::new());
     world.close(second);
     assert_eq!(world.first.log().closed, [session]);
     world.with_tables(|handles, scheduler| {
@@ -614,9 +622,8 @@ fn a_handler_runs_without_the_lock_and_can_hand_out_sessions_on_either_server() 
     }));
     world.send(A, handle, &request());
     let made = lock(&made).clone();
-    let [(own, own_handle), (other, other_handle)] = made[..] else {
-        panic!("two sessions: {made:?}");
-    };
+    assert_eq!(made.len(), 2, "{made:?}");
+    let ((own, own_handle), (other, other_handle)) = (made[0], made[1]);
     world.with_tables(|handles, scheduler| {
         assert_eq!(handles.get(own_handle), Ok(own));
         assert_eq!(handles.get(other_handle), Ok(other));
@@ -636,12 +643,12 @@ fn a_handler_reads_and_writes_only_what_the_guest_may() {
     let handle = world.session();
     world.memory.write(CODE, &[0x11; 4]).unwrap();
     world.first.script(Box::new(|cx, _, message| {
-        let mut word = [0; 4];
+        let mut bytes = [0; 4];
         // Text is readable but not writable.
-        assert_eq!(cx.read_memory(CODE, &mut word), Ok(()));
-        assert_eq!(word, [0x11; 4]);
+        assert_eq!(cx.read_memory(CODE, &mut bytes), Ok(()));
+        assert_eq!(bytes, [0x11; 4]);
         assert_eq!(
-            cx.write_memory(CODE, &word),
+            cx.write_memory(CODE, &bytes),
             Err(KernelError::InvalidCurrentMemory)
         );
         // Data is both, up to its last byte exactly.
@@ -651,11 +658,11 @@ fn a_handler_reads_and_writes_only_what_the_guest_may() {
             Err(KernelError::InvalidCurrentMemory)
         );
         assert_eq!(
-            cx.read_memory(DATA_END - 3, &mut word),
+            cx.read_memory(DATA_END - 3, &mut bytes),
             Err(KernelError::InvalidCurrentMemory)
         );
         assert_eq!(
-            cx.read_memory(u64::MAX - 1, &mut word),
+            cx.read_memory(u64::MAX - 1, &mut bytes),
             Err(KernelError::InvalidCurrentMemory)
         );
         assert_eq!(cx.create_event(), Err(KernelError::NotImplemented));
@@ -699,7 +706,7 @@ fn a_second_sender_waits_behind_a_deferred_request() {
         assert_eq!(scheduler.ipc().waiting(session), Ok(1));
         assert_eq!(scheduler.objects().refs(session), 3);
     });
-    assert!(world.dispatcher.take_woken().is_empty());
+    assert_eq!(world.dispatcher.take_woken(), Vec::<Woken>::new());
 
     // A's reply is ready: A wakes with it, and B's request runs and is answered at once.
     lock(&world.first.ready).push_back((session, Ok(0xA0)));
@@ -734,7 +741,7 @@ fn a_second_sender_waits_behind_a_deferred_request() {
         assert_eq!(scheduler.objects().refs(session), 1);
         assert_eq!(scheduler.ipc().queue(world.first.id).unwrap().running(), 0);
     });
-    assert!(world.dispatcher.take_woken().is_empty());
+    assert_eq!(world.dispatcher.take_woken(), Vec::<Woken>::new());
     assert_eq!(DEFAULT_WORKERS, 1);
 }
 
@@ -766,7 +773,7 @@ fn closing_the_client_end_of_a_deferred_request_waits_for_its_reply() {
     // Another thread closes the handle while A waits: the request keeps the session.
     world.call(B, SvcId::CloseHandle, u64::from(handle.raw()), 0);
     world.with_tables(|_, scheduler| assert!(scheduler.ipc().is_session(session)));
-    assert!(world.first.log().closed.is_empty());
+    assert_eq!(world.first.log().closed, Vec::<ObjectId>::new());
     lock(&world.first.ready).push_back((session, Ok(0x5E)));
     world.deliver(&world.first);
     assert_eq!(world.dispatcher.take_woken()[0].result, ResultCode::SUCCESS);
@@ -805,6 +812,6 @@ fn delivering_when_nothing_is_ready_changes_nothing() {
     let world = World::new();
     let before = world.events().len();
     world.deliver(&world.first);
-    assert!(world.dispatcher.take_woken().is_empty());
+    assert_eq!(world.dispatcher.take_woken(), Vec::<Woken>::new());
     assert_eq!(world.events().len(), before);
 }

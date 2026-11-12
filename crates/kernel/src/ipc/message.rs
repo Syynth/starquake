@@ -299,7 +299,7 @@ mod tests {
         );
         let (translated, result) = translate(&mut message, 0, &mut handles, &mut objects);
         assert_eq!(result, Err(KernelError::InvalidHandle));
-        assert!(translated.held.is_empty());
+        assert_eq!(translated.held, Vec::<ObjectId>::new());
         // The good handle after it still left the table, and its object with it.
         assert!(handles.is_empty());
         assert!(objects.is_empty());

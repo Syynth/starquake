@@ -550,13 +550,13 @@ impl Dispatcher {
         apply_notices(&mut *handler, server, notices);
         let mut cx = self.context(memory, server, process_id, request.translated);
         let mut message: MessageBuffer = *request.message;
-        let handled = handler.handle(&mut cx, session, &mut message);
+        let answered = handler.handle(&mut cx, session, &mut message);
 
         let mut locked = self.lock::<(&mut Scheduler,)>();
         locked.state.handlers.insert(server, Some(handler));
         let (scheduler,) = locked.tables();
         let ipc = scheduler.ipc_mut().1;
-        let ending = match handled {
+        let ending = match answered {
             Ok(Handled::Replied) => Finish::Replied(Box::new(message)),
             Ok(Handled::Deferred) => Finish::Deferred,
             Ok(Handled::Closed) => Finish::ServerClosed,
@@ -585,7 +585,7 @@ impl Dispatcher {
             };
             match next {
                 Ok(Some(session)) => {
-                    finished.extend(self.run_request(server, session, memory, process_id))
+                    finished.extend(self.run_request(server, session, memory, process_id));
                 }
                 Ok(None) => return finished,
                 Err(error) => {
