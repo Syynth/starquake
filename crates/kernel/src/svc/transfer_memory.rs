@@ -24,7 +24,10 @@
 //! | the handle table has room | `OutOfHandles` |
 //!
 //! When the handle cannot be added, the transfer memory goes with the creator's reference
-//! (Eden's `SCOPE_EXIT`), and its pages are unlocked before the call returns.
+//! (Eden's `SCOPE_EXIT`), and its pages are unlocked before the call returns. When the object
+//! cannot record that its pages are locked (an internal failure: the id the call just made no
+//! longer names it), the pages are unlocked at once, since the object would not unlock them.
+//! Test: `a_failure_after_the_pages_are_locked_unlocks_them_again`.
 //!
 //! # Divergences from Eden
 //!
@@ -106,8 +109,16 @@ fn lock_and_add(
     // Initialize the transfer memory: lock the memory.
     space.lock_for_transfer_memory(address, size, unlocked.owner_permission())?;
     let locked = Object::TransferMemory(unlocked.with_pages_locked());
-    scheduler.objects_mut().replace(object, locked)?;
-    // Add the transfer memory to the handle table.
+    if let Err(error) = scheduler.objects_mut().replace(object, locked) {
+        // The object does not say its pages are locked, so nothing would unlock them when it
+        // goes: unlock them now. The first failure is the one reported.
+        if let Err(unlock) = space.unlock_for_transfer_memory(address, size) {
+            tracing::error!(%unlock, "pages locked for a transfer memory stay locked");
+        }
+        return Err(error.into());
+    }
+    // Add the transfer memory to the handle table. From here on the object says its pages are
+    // locked, so its last reference going unlocks them (`unlock_released`).
     Ok(handles.add(scheduler.objects_mut(), object)?)
 }
 

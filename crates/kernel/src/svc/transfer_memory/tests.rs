@@ -10,7 +10,7 @@ use crate::id::SlabId;
 use crate::memory::fixture;
 use crate::memory::testing::{MapperCall, MapperLog};
 use crate::memory::{MemoryAttribute, MemoryBlock, MemoryPermission, MemoryState};
-use crate::object::Objects;
+use crate::object::{ObjectError, Objects};
 use crate::svc::handle::close_handle;
 use crate::svc::memory::{
     HEAP_SIZE_ALIGNMENT, set_heap_size, set_memory_attribute, set_memory_permission,
@@ -417,6 +417,50 @@ fn unlocking_goes_on_past_a_failure_and_reports_the_first() {
     assert_eq!(world.block(heap).4, MemoryAttribute::NONE);
     assert_eq!(world.block(heap).1, HEAP_SIZE_ALIGNMENT / PAGE_SIZE);
     assert!(!world.scheduler.objects().has_unlocks());
+}
+
+#[test]
+fn a_failure_after_the_pages_are_locked_unlocks_them_again() {
+    let mut world = World::new();
+    let heap = world.heap;
+    // An object id that names nothing any more, so recording the lock in it fails.
+    let unlocked = TransferMemory::new(owner(), heap, SIZE, SvcPermission::None);
+    let stale = world
+        .scheduler
+        .objects_mut()
+        .create(Object::TransferMemory(unlocked))
+        .unwrap();
+    assert_eq!(world.scheduler.objects_mut().close(stale), Ok(Closed::Last));
+    let before = world.blocks();
+    let added = lock_and_add(
+        &mut world.handles,
+        &mut world.space,
+        &mut world.scheduler,
+        stale,
+        unlocked,
+    );
+    assert_eq!(added, Err(SvcError::from(ObjectError::Stale { id: stale })));
+    // Locked, then unlocked again: the translation was told both, and the blocks are as before.
+    assert_eq!(world.blocks(), before);
+    assert_eq!(
+        world.log.take(),
+        [
+            MapperCall::Protect {
+                address: heap,
+                size: SIZE,
+                perms: Perms::None,
+            },
+            MapperCall::Protect {
+                address: heap,
+                size: SIZE,
+                perms: Perms::ReadWrite,
+            },
+        ]
+    );
+    assert!(world.handles.is_empty());
+    assert!(!world.scheduler.objects().has_unlocks());
+    // The pages can be lent again.
+    assert!(world.create(heap, SIZE, raw(SvcPermission::None)).is_ok());
 }
 
 /// Eden's limit on a process's transfer memories (`TransferMemoryCountMax`, set to 200 in
