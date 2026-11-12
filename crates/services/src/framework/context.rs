@@ -8,6 +8,7 @@ use starquake_kernel::id::ObjectId;
 use super::defer::{Deferral, ReplyToken, TokenId};
 use super::kernel::Kernel;
 use super::result::{Fault, NOT_SUPPORTED};
+use super::server::UnknownPolicy;
 use super::snapshot::Family;
 use super::targets::Targets;
 
@@ -24,10 +25,19 @@ pub struct Context<'a> {
     pub(super) kernel: &'a mut dyn Kernel,
     pub(super) targets: &'a mut Targets,
     pub(super) family: Option<&'a mut dyn Family>,
+    pub(super) policy: UnknownPolicy,
     pub(super) deferral: Deferral<'a>,
 }
 
 impl Context<'_> {
+    /// The server's policy for what it does not know. The framework applies it to unknown
+    /// commands itself; a service reads it where it has an unknown of its own to answer, as
+    /// `sm:` has for an unknown service name.
+    #[must_use]
+    pub fn policy(&self) -> UnknownPolicy {
+        self.policy
+    }
+
     /// Creates an event. Keep the id to signal it later; give the caller a handle with
     /// [`Reply::copy_handle`](super::Reply::copy_handle).
     pub fn create_event(&mut self) -> Result<ObjectId, Fault> {

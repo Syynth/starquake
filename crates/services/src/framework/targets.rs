@@ -370,10 +370,7 @@ impl Targets {
     pub(super) fn check_restorable(&self, interfaces: &Interfaces) -> Result<(), SnapshotError> {
         for (_, row) in self.rows.iter() {
             match &row.target {
-                Target::Interface(Slot::Live(session)) if interfaces.contains(session.name()) => {}
-                Target::Interface(Slot::Live(session)) => {
-                    return Err(SnapshotError::UnknownInterface(session.name().to_owned()));
-                }
+                Target::Interface(Slot::Live(session)) => interfaces.check(session.name())?,
                 Target::Interface(Slot::Out | Slot::Frozen { .. }) => {
                     let busy = "an interface is not in its row";
                     return Err(SnapshotError::Inconsistent(busy));
@@ -583,7 +580,7 @@ mod tests {
 
     /// The interfaces the tables of these tests hold.
     fn interfaces() -> Interfaces {
-        Interfaces::new().with::<Probe>().unwrap()
+        Interfaces::new().with::<Probe>()
     }
 
     /// A table as a snapshot holds it: written out and read back, every interface frozen.

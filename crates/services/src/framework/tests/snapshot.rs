@@ -350,13 +350,13 @@ fn a_session_is_restored_only_as_an_interface_the_server_lists() {
             .with_family(Tally::default());
         server.restore(&saved)
     };
-    let toy_only = Interfaces::new().with::<Toy>().unwrap();
+    let toy_only = Interfaces::new().with::<Toy>();
     assert_eq!(
         restore_with(toy_only.clone()),
         Err(SnapshotError::UnknownInterface("Child".to_owned()))
     );
     // A type of the right name whose state is laid out differently.
-    let wrong_child = toy_only.with::<impostor::Child>().unwrap();
+    let wrong_child = toy_only.with::<impostor::Child>();
     assert_eq!(
         restore_with(wrong_child),
         Err(SnapshotError::State {
@@ -365,6 +365,24 @@ fn a_session_is_restored_only_as_an_interface_the_server_lists() {
         })
     );
     assert!(restore_with(toy_interfaces()).is_ok());
+    // Both children listed: the saved one could be either, so it is neither.
+    let both = toy_interfaces().with::<impostor::Child>();
+    assert_eq!(
+        restore_with(both.clone()),
+        Err(SnapshotError::DuplicateInterface("Child"))
+    );
+    let mut ambiguous = Server::new("toy", UnknownPolicy::Strict).with_interfaces(both);
+    let session = rig.kernel.new_object();
+    let child = Box::new(impostor::Child { a: 1, b: [2; 9] });
+    ambiguous.open(session, child).unwrap();
+    assert_eq!(
+        ambiguous.save(),
+        Err(SnapshotError::DuplicateInterface("Child"))
+    );
+    assert_eq!(
+        SnapshotError::DuplicateInterface("Child").to_string(),
+        "two interface types are named \"Child\""
+    );
 
     // And no snapshot is written that the server itself could not restore.
     let mut unlisted = Server::new("toy", UnknownPolicy::Strict);

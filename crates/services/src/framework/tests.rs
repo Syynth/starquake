@@ -444,9 +444,10 @@ impl Notify for Wakes {
 
 /// The interfaces a toy server's sessions can be.
 fn toy_interfaces() -> Interfaces {
-    let interfaces = Interfaces::new().with::<Toy>();
-    let interfaces = interfaces.and_then(Interfaces::with::<Child>);
-    interfaces.and_then(Interfaces::with::<Mute>).unwrap()
+    Interfaces::new()
+        .with::<Toy>()
+        .with::<Child>()
+        .with::<Mute>()
 }
 
 /// A toy server with no sessions, told to wake `wakes`.

@@ -27,8 +27,9 @@ pub const CMIF_MODULE: u32 = 10;
 pub const HIPC_MODULE: u32 = 11;
 
 /// Packs a module and a description (the bit layout is the kernel crate's, from Eden's
-/// `result.h`). Every description below fits its field, which a test checks.
-const fn code(module: u32, description: u32) -> ResultCode {
+/// `result.h`). Every description below fits its field, which a test checks. The one place a
+/// service's result code is put together: services define theirs with it too.
+pub(crate) const fn code(module: u32, description: u32) -> ResultCode {
     ResultCode::from_raw(module | (description << MODULE_BITS))
 }
 

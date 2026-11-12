@@ -783,6 +783,7 @@ impl Server {
             kernel: &mut *kernel,
             targets: &mut self.targets,
             family: self.family.as_deref_mut(),
+            policy: self.policy,
             deferral: Deferral {
                 mailbox: &self.mailbox,
                 next_token: &mut self.next_token,

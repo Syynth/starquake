@@ -334,6 +334,7 @@ mod tests {
 
     use super::super::defer::{Deferral, Mailbox};
     use super::super::fake::FakeKernel;
+    use super::super::server::UnknownPolicy;
     use super::super::targets::Targets;
     use super::*;
     use crate::commands;
@@ -378,6 +379,7 @@ mod tests {
             kernel: &mut kernel,
             targets: &mut targets,
             family: None,
+            policy: UnknownPolicy::Strict,
             deferral: Deferral {
                 mailbox: &mailbox,
                 next_token: &mut next_token,

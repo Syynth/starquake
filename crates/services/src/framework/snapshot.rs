@@ -43,7 +43,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use core::any::Any;
+use core::any::{Any, TypeId};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -101,8 +101,9 @@ pub enum SnapshotError {
     /// restored.
     #[error("interface {0:?} is not one the server can restore")]
     UnknownInterface(String),
-    /// Two interface types with one name were registered.
-    #[error("interface {0:?} is registered twice")]
+    /// A session is of an interface whose name two different types were added under
+    /// ([`Interfaces::with`]), so its saved state could be either's.
+    #[error("two interface types are named {0:?}")]
     DuplicateInterface(&'static str),
     /// A session's saved state could not be decoded as its interface.
     #[error("the saved state of a {interface} could not be decoded: {error}")]
@@ -161,18 +162,26 @@ fn thaw<T: Session + DeserializeOwned>(bytes: &[u8]) -> Result<Box<dyn Session>,
 ///     impl Volume {}
 /// }
 ///
-/// let interfaces = Interfaces::new().with::<Volume>()?;
-/// assert!(interfaces.contains("Volume"));
-/// // A second type of the same name would be decoded as the first, so it is refused.
+/// // Adding a type again changes nothing.
+/// let interfaces = Interfaces::new().with::<Volume>().with::<Volume>();
+/// assert_eq!(interfaces.check("Volume"), Ok(()));
 /// assert_eq!(
-///     interfaces.with::<Volume>().err(),
-///     Some(SnapshotError::DuplicateInterface("Volume"))
+///     interfaces.check("Mixer"),
+///     Err(SnapshotError::UnknownInterface("Mixer".to_owned()))
 /// );
-/// # Ok::<(), SnapshotError>(())
 /// ```
+///
+/// Two different types with one name cannot be told apart in a snapshot, where a session is
+/// its interface's name and its state's bytes. Adding both is not refused at once (so that a
+/// server is put together without a fallible step), but the name is then one no snapshot can be
+/// written or read with: [`Interfaces::check`] reports
+/// [`SnapshotError::DuplicateInterface`], and so do [`Server::save`] and [`Server::restore`]
+/// when a session of that name is in the way.
 #[derive(Clone, Default)]
 pub struct Interfaces {
-    by_name: BTreeMap<&'static str, Thaw>,
+    by_name: BTreeMap<&'static str, (TypeId, Thaw)>,
+    /// Names two different types were added under.
+    ambiguous: BTreeSet<&'static str>,
 }
 
 impl Interfaces {
@@ -183,24 +192,34 @@ impl Interfaces {
     }
 
     /// Adds the interface `T`, under [`Session::interface`].
-    pub fn with<T: Session + DeserializeOwned>(mut self) -> Result<Self, SnapshotError> {
-        let name = T::interface();
-        if self.by_name.insert(name, thaw::<T>).is_some() {
-            return Err(SnapshotError::DuplicateInterface(name));
+    #[must_use]
+    pub fn with<T: Session + DeserializeOwned>(mut self) -> Self {
+        let (name, type_id) = (T::interface(), TypeId::of::<T>());
+        let thaw: Thaw = thaw::<T>;
+        let earlier = self.by_name.insert(name, (type_id, thaw));
+        if earlier.is_some_and(|(earlier, _)| earlier != type_id) {
+            self.ambiguous.insert(name);
         }
-        Ok(self)
+        self
     }
 
-    /// Whether an interface of this name was added.
-    #[must_use]
-    pub fn contains(&self, name: &str) -> bool {
-        self.by_name.contains_key(name)
+    /// Whether a session of the interface `name` can be saved and restored: exactly one type
+    /// was added under the name.
+    pub fn check(&self, name: &str) -> Result<(), SnapshotError> {
+        match self.by_name.get_key_value(name) {
+            Some((name, _)) if self.ambiguous.contains(name) => {
+                Err(SnapshotError::DuplicateInterface(name))
+            }
+            Some(_) => Ok(()),
+            None => Err(SnapshotError::UnknownInterface(name.to_owned())),
+        }
     }
 
     /// The session a saved state of the interface `name` holds.
     pub(super) fn thaw(&self, name: &str, state: &[u8]) -> Result<Box<dyn Session>, SnapshotError> {
+        self.check(name)?;
         let unknown = || SnapshotError::UnknownInterface(name.to_owned());
-        let thaw = self.by_name.get(name).ok_or_else(unknown)?;
+        let (_, thaw) = self.by_name.get(name).ok_or_else(unknown)?;
         thaw(state).map_err(|error| SnapshotError::State {
             interface: name.to_owned(),
             error,
@@ -217,18 +236,18 @@ impl Interfaces {
 /// server's snapshot and loaded back in place; nothing implements it by hand.
 pub trait Family: Any + Send {
     /// The state as bytes, for a snapshot.
-    fn save(&self) -> Result<Vec<u8>, SnapshotError>;
+    fn save_state(&self) -> Result<Vec<u8>, SnapshotError>;
 
     /// Replaces the state with what `bytes` hold. On an error the state is unchanged.
-    fn load(&mut self, bytes: &[u8]) -> Result<(), SnapshotError>;
+    fn load_state(&mut self, bytes: &[u8]) -> Result<(), SnapshotError>;
 }
 
 impl<T: Serialize + DeserializeOwned + Any + Send> Family for T {
-    fn save(&self) -> Result<Vec<u8>, SnapshotError> {
+    fn save_state(&self) -> Result<Vec<u8>, SnapshotError> {
         encode(self)
     }
 
-    fn load(&mut self, bytes: &[u8]) -> Result<(), SnapshotError> {
+    fn load_state(&mut self, bytes: &[u8]) -> Result<(), SnapshotError> {
         *self = decode(bytes).map_err(SnapshotError::Decode)?;
         Ok(())
     }
@@ -269,11 +288,11 @@ impl Server {
     /// The server's state as bytes. See the [module docs](self) for what is in them.
     ///
     /// Fails with [`SnapshotError::UnknownInterface`] if a session is of an interface the
-    /// server's [`Interfaces`] do not list, so that no snapshot is written that could not be
-    /// restored.
+    /// server's [`Interfaces`] do not list (or [`SnapshotError::DuplicateInterface`] if they
+    /// list it twice), so that no snapshot is written that could not be restored.
     pub fn save(&self) -> Result<Vec<u8>, SnapshotError> {
         self.targets.check_restorable(&self.interfaces)?;
-        let family = self.family.as_deref().map(Family::save).transpose()?;
+        let family = self.family.as_deref().map(Family::save_state).transpose()?;
         let header = Header {
             magic: SNAPSHOT_MAGIC,
             version: SNAPSHOT_VERSION,
@@ -323,7 +342,7 @@ impl Server {
         check_requests(&body.sessions, &body.queue, &body.pending, body.next_token)?;
         // The family is loaded last: it is the one step that changes the server and can fail.
         match (self.family.as_deref_mut(), body.family) {
-            (Some(family), Some(saved)) => family.load(&saved)?,
+            (Some(family), Some(saved)) => family.load_state(&saved)?,
             (None, None) => {}
             _ => return Err(SnapshotError::FamilyMismatch),
         }
@@ -394,18 +413,18 @@ mod tests {
             volume: 7,
             name: "console".to_owned(),
         };
-        let bytes = Family::save(&saved).unwrap();
+        let bytes = Family::save_state(&saved).unwrap();
         // Golden bytes: a `u8`, then a length-prefixed string.
         assert_eq!(bytes, [7, 7, b'c', b'o', b'n', b's', b'o', b'l', b'e']);
         let mut family = Settings {
             volume: 0,
             name: String::new(),
         };
-        family.load(&bytes).unwrap();
+        family.load_state(&bytes).unwrap();
         assert_eq!(family, saved);
 
         // Truncated, and one byte too many: an error, and the state is as it was.
-        let truncated = family.load(&bytes[..bytes.len() - 1]);
+        let truncated = family.load_state(&bytes[..bytes.len() - 1]);
         assert_eq!(
             truncated,
             Err(SnapshotError::Decode(
@@ -415,7 +434,7 @@ mod tests {
         let mut long = bytes.clone();
         long.push(0);
         assert_eq!(
-            family.load(&long),
+            family.load_state(&long),
             Err(SnapshotError::Decode(
                 postcard::Error::DeserializeBadEncoding
             ))
