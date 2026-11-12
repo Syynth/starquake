@@ -1,9 +1,9 @@
 //! The kernel as the service framework sees it: the [`Kernel`] trait.
 //!
-//! Defined here for now (issue #77). The kernel's session slice (kernel spec, port plan slice 9)
-//! will implement it over its tables; until then `FakeKernel` (in `framework::fake`, behind
-//! the `test-support` feature) stands in. Every call is about the request being handled: "the caller" is
-//! the guest thread that sent it, and its process's handle table and memory are the ones meant.
+//! The kernel's `IpcContext` implements it (`framework/host.rs`, kernel spec port plan slice 9);
+//! `FakeKernel` (in `framework::fake`, behind the `test-support` feature) stands in for tests.
+//! Every call is about the request being handled: "the caller" is the guest thread that sent
+//! it, and its process's handle table and memory are the ones meant.
 //! That holds for a deferred request too: when its reply is delivered, the kernel given to
 //! [`Server::deliver`](super::Server::deliver) speaks for the thread that sent it.
 //!

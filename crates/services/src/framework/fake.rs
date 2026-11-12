@@ -288,7 +288,7 @@ pub enum HostError {
 }
 
 /// A [`FakeKernel`] and the servers of several services: enough of a system to get a service
-/// from another one and talk to it. It stands where the kernel's session code will: it routes a
+/// from another one and talk to it. It stands in for the kernel's session code: it routes a
 /// message to the server its session is on, and tells a server of the sessions made on it.
 ///
 /// It does not queue: a message is handled at once, in the caller. Tests of the request queue

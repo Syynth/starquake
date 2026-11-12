@@ -47,10 +47,10 @@ expected.
 
 ## How far `hello.nro` runs
 
-`starquake run tests/homebrew/hello/hello.nro`, as of the kernel's address space (#97). The run
-now does everything the reference emulator's does before IPC, call for call
-(`hello/reference/`, and `crates/core/tests/homebrew.rs`), and stops at the first call that
-needs a session:
+All the way: `starquake run tests/homebrew/hello/hello.nro` exits with code 0, as of the kernel's
+sessions (#98, milestone 1). Every system call, IPC request and log line matches the reference
+emulator's, in order, through `ExitProcess` (`hello/reference/`, and
+`crates/core/tests/homebrew.rs`):
 
 ```text
 thread 1
@@ -62,8 +62,29 @@ thread 1
   svc 0x1(0x0, 0xcd000000) -> 0x0
   svc 0x6(0x1080303fc8, 0x0, 0x1080303fc8) -> 0x0
   svc 0x6(0x1080303fc8, 0x0, 0x80006000) -> 0x0
-  svc 0x1f(0x0, 0x80003148) -> 0x4201
-  svc 0x26(0x0, 0x1080303fdc, 0x4) -> 0x4201
+  svc 0x1f(0x0, 0x80003148) -> 0x0
+  ipc session=4294967297 service=1 command=3 req=8 rep=2 -> 0x0 Done
+  svc 0x21(0x103fe) -> 0x0
+  ipc session=4294967297 service=1 command=0 req=12 rep=0 -> 0x0 Done
+  svc 0x21(0x103fe) -> 0x0
+  log len=25 hash=0xb51b0fbfdb3b5bd2
+  svc 0x27(0x800030a0, 0x19) -> 0x0
+  log len=25 hash=0x8dab36c055e5ad88
+  svc 0x27(0x800030c0, 0x19) -> 0x0
+  ipc session=4294967297 service=1 command=1 req=16 rep=0 -> 0x0 Done
+  svc 0x21(0x103fe) -> 0x0
+  ipc session=4294967298 service=2 command=3 req=8 rep=2 -> 0x0 Done
+  svc 0x21(0x183fd) -> 0x0
+  ipc session=4294967298 service=2 command=3 req=8 rep=0 -> 0x0 Done
+  svc 0x21(0x183fd) -> 0x0
+  svc 0x21(0x183fd) -> 0xf601
+  svc 0x16(0x183fd) -> 0x0
+  log len=44 hash=0x7c7d5ae1b34ce652
+  svc 0x27(0x800030e0, 0x2c) -> 0x0
+  svc 0x21(0x103fe) -> 0xf601
+  svc 0x16(0x103fe) -> 0x0
+  svc 0x7() -> 0x0
+  lifecycle ProcessExit 1
 ```
 
 1. libnx's start-up applies the module's relocations, then makes the RELRO range read-only with
@@ -77,18 +98,20 @@ thread 1
 3. `svcQueryMemory` (0x06) twice: once about an address on its own stack, for the main
    thread's stack bounds (`libnx/nx/source/kernel/thread.c`), and once about the first address
    after its image, for arguments (`libnx/nx/source/runtime/argv.c`).
-4. The fixture's `__appInit` calls `smInitialize`, whose `svcConnectToNamedPort` (0x1f) on
-   `"sm:"` is not implemented and returns 0x4201. The fixture treats that as fatal:
-   `diagAbortWithResult` calls `svcBreak` (0x26), which is not implemented either.
-5. `diagAbortWithResult` does not expect `svcBreak` to return (`__builtin_unreachable()` in
-   `libnx/nx/source/runtime/diag.c`), and the compiler put `udf #0` after the call. The run
-   ends as a guest crash (exit code 1, undefined instruction) at `main+0xb5c`.
+4. The fixture's `__appInit` calls `smInitialize`: `svcConnectToNamedPort` (0x1f) on `"sm:"`,
+   then `svcSendSyncRequest` (0x21) twice, for the pointer buffer size (a control request,
+   which starquake's trace shows as command 3 on `sm:`, service 1) and for `Initialize`.
+5. `main` writes its two lines with `svcOutputDebugString` (0x27), asks `sm:` for `set:sys`
+   (`GetService`, command 1, which moves a session handle back), asks `set:sys` for its pointer
+   buffer size and the firmware version (`GetFirmwareVersion`, command 3, which writes into a
+   receive buffer), and closes it: a close request, which ends with the session closed
+   (0xf601), then `svcCloseHandle` (0x16).
+6. It writes "firmware version ok", returns from `main`, and libnx closes `sm:` the same way and
+   calls `svcExitProcess` (0x07), which ends the run.
 
-`crates/core/tests/homebrew.rs` runs the fixture and compares its calls with the reference's
+`crates/core/tests/homebrew.rs` runs the fixture and compares its trace with the reference's
 only in its `on_hardware` module, which is compiled for macOS on Apple Silicon and returns early
 when the `CI` environment variable is set: so on a gate run on a Mac. On the hosted CI gate only
-its `comparison` module runs, which checks the comparison itself against made-up runs.
-
-So the next missing piece is the session side of the kernel: `svcConnectToNamedPort` and
-`svcSendSyncRequest`, and behind them `sm:` and `set:sys`. The guest log is still empty: the
-fixture's first line comes after `smInitialize`.
+its `comparison` module runs, which checks the comparison itself against made-up runs; the same
+conversation with `sm:` and `set:sys` runs on every host without a vCPU in
+`crates/core/src/hle/tests.rs`.

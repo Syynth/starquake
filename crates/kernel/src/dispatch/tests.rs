@@ -335,7 +335,7 @@ fn every_dispatch_reads_the_clock_once_and_stamps_its_event_with_that_reading() 
     let numbers = [
         SvcId::GetSystemTick.number(),
         u16::MAX,
-        SvcId::ConnectToNamedPort.number(),
+        SvcId::GetProcessId.number(),
         SvcId::CloseHandle.number(),
         SvcId::GetSystemTick.number(),
     ];
@@ -520,6 +520,8 @@ fn a_failing_environment_ends_the_call_without_writing_registers() {
         SvcId::GetSystemTick.number(),
         SvcId::OutputDebugString.number(),
         SvcId::ConnectToNamedPort.number(),
+        // Its own arm, which takes the lock three times: the clock is read at the first.
+        SvcId::SendSyncRequest.number(),
         u16::MAX,
     ] {
         let memory = FlatMemory::new(BASE, 0x100);

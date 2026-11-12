@@ -147,7 +147,11 @@ reads with the loader's patcher, and runs it as one guest thread on one vCPU. Wh
 address space maps reaches guest code through stage-1 tables, a page at a time as the guest
 first touches it. Every `svc` goes through the kernel's dispatcher and is recorded in the event
 stream; the memory calls (`SetHeapSize`, `SetMemoryPermission`, `SetMemoryAttribute`,
-`QueryMemory`, and `GetInfo`'s memory ids) are real. The run ends when the guest calls
+`QueryMemory`, and `GetInfo`'s memory ids) are real, and so is IPC: `ConnectToNamedPort`,
+`SendSyncRequest` and closing a session reach the services `crates/core/src/hle.rs` registers
+(`sm:` on its port, and `set:sys` behind it), whose handlers run without the kernel lock. The
+homebrew fixture (`tests/homebrew/hello/hello.nro`) runs to `ExitProcess` with exit code 0, its
+trace matching the reference emulator's line for line. The run ends when the guest calls
 `ExitProcess`, crashes, or reaches the timeout, and the artifacts folder gets `summary.json`,
 `trace.txt`, `events.bin`, `guest_log.txt`, and `crash.json` and `crash.txt` after a crash
 (`guest_log.txt` is an addition to the spec's table: an event keeps a log line's length and
@@ -168,6 +172,8 @@ it lives, with what replaces it:
 | One guest thread on one core, with a fixed thread and process id; no scheduler; the whole register file is read and written on every `svc`; an abort is lazy backing or the end of the run (nothing is delivered to the guest or write-tracked) | `crates/core/src/machine.rs` | Kernel slice 8 (process creation, thread lifecycle) and slice 10 (core loop and timers); single-register accessors on `Vcpu` |
 | The registers the thread starts with are set by the loop (`x1` is a handle to a main thread the scheduler never runs); pointer-authentication keys are left as the backend creates them | `crates/core/src/machine.rs` | Kernel slice 8, with the NPDM's values |
 | `ExitProcess` changes no kernel state: the dispatcher reports it and the loop stops | `crates/kernel/src/dispatch.rs` | Kernel slice 8 |
+| A `SendSyncRequest` that has to wait (behind another request on its session, or for a deferred reply) ends the run as an emulator error, because the loop has no other thread to run; a sender woken by another thread's dispatch is reported (`Dispatcher::take_woken`), not made runnable. No service a run has defers yet | `crates/core/src/machine.rs`, `crates/kernel/src/dispatch/ipc.rs` | Kernel slice 10 (the core loop runs other threads, and delivers deferred replies) |
+| A request's sender is named by the event stream's thread id, and has the one process's id (`FIRST_USER_PROCESS_ID`); a service that asks the kernel for an event is told "not implemented" | `crates/kernel/src/ipc/table.rs`, `crates/kernel/src/tables.rs`, `crates/kernel/src/dispatch/ipc.rs` | Kernel slices 8 and 10 (threads and processes), slice 4 (events) |
 | The dispatcher is told the calling thread by its caller | `crates/kernel/src/dispatch.rs` (`Caller`) | Kernel slice 10 (the scheduler knows each core's thread) |
 | Lifecycle, fault and guest-log events are recorded by the loop, not the kernel (lifecycle and fault events outside the kernel lock; a guest-log event under it, from the loop's debug sink, with the same time as the call that wrote it). The kernel's address space records nothing: no `Map` event is produced, and its table is not serialisable | `crates/core/src/machine.rs`, `crates/kernel/src/memory.rs` | The kernel's own recording points: lifecycle events with process creation (slice 8); a `Map` event from each of the address space's mutators, a follow-up to slice 6 not yet scheduled; a serialisable address space with the observability spec's snapshots (its step 6) |
 | What a run keeps in memory is capped by fixed numbers: the trace's first 100,000 events and the first 4 MiB of guest log text, each with a marker and a count in `summary.json` when it was cut short | `crates/core/src/machine.rs` (`Limits`) | The observability spec's size cap per run, with its flags |

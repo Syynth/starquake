@@ -2,20 +2,23 @@
 //! handlers it keeps outside the tables, and [`IpcContext`], what a handler reaches the kernel
 //! through.
 //!
-//! Kernel spec, "IPC". `SendSyncRequest` takes the kernel lock three times:
+//! Kernel spec, "IPC". `SendSyncRequest` goes in steps, each of which takes the kernel lock
+//! for itself and none of which holds it while a handler runs:
 //!
-//! 1. To look the session up, copy the message out of the caller's TLS block, translate its
-//!    special header ([`crate::ipc::message`]) and queue the request ([`Ipc::send`]). A request
-//!    that cannot start leaves its sender waiting ([`Outcome::Waiting`]).
-//! 2. Briefly, to take the server's handler out of its slot. The handler then runs **without
-//!    the lock**; the calls it makes through [`IpcContext`] take it one at a time. One worker per
-//!    server means the slot is never empty when the queue starts a request.
-//! 3. To put the handler back, end the request ([`Ipc::finish`]), and start the server's next
-//!    ready request, if there is one, on this core: steps 2 and 3 repeat for it. Then every
-//!    request that is over is settled: its reply is written into its sender's TLS block, its
-//!    references are released, and its events are recorded, the IPC events the handler made
-//!    and then the system call's own, in the order the requests ended. The caller's own result
-//!    goes into its registers; every other sender that was waiting is woken
+//! 1. Under the lock: read the clock, look the session up, copy the message out of the caller's
+//!    TLS block, translate its special header ([`crate::ipc::message`]) and queue the request
+//!    ([`Ipc::send`]). A request that cannot start leaves its sender waiting
+//!    ([`Outcome::Waiting`]).
+//! 2. Take the server's handler out of its slot (under the lock), run it **without the lock**
+//!    (the calls it makes through [`IpcContext`] take the lock one at a time), and put it back
+//!    and end the request ([`Ipc::finish`]) under the lock. One worker per server means the slot
+//!    is never empty when the queue starts a request.
+//! 3. Start the server's next ready request, if one may start, on this core, and run it as in
+//!    step 2; repeat until none may.
+//! 4. Settle every request that is over, in the order they ended: its reply is written into its
+//!    sender's TLS block, and under the lock its references are released and its events
+//!    recorded, the IPC events its handler made and then its `SendSyncRequest` event. The
+//!    caller's own result goes into its registers; every other sender that was waiting is woken
 //!    ([`Dispatcher::take_woken`]).
 //!
 //! `ConnectToNamedPort` is ported from Eden `eden/src/core/hle/kernel/svc/svc_port.cpp` @
@@ -25,12 +28,16 @@
 //! `SendSyncRequestImpl` in `eden/src/core/hle/kernel/svc/svc_ipc.cpp` @ cf654052: a handle that
 //! names no client session is [`KernelError::InvalidHandle`].
 //!
-//! Where starquake is stricter than Eden, pinned by the tests named (in `dispatch/ipc/tests.rs`):
+//! Where starquake differs from Eden, pinned by the tests named (in `dispatch/ipc/tests.rs`):
 //!
-//! - A handler's own failure ([`HandlerError`](crate::ipc::HandlerError)) closes the server end of the session, and its
-//!   senders see [`KernelError::SessionClosed`], as a console's server framework closes a
-//!   session it fails to process (see [`HandlerError`](crate::ipc::HandlerError)). Eden's `ServerManager` logs the
-//!   failure and closes the session too. Test: `a_handler_that_fails_closes_the_session`.
+//! - A handler's own failure ([`crate::ipc::HandlerError`]) closes the server end of the
+//!   session, and its senders see [`KernelError::SessionClosed`], as a console's server
+//!   framework closes a session it fails to process (see [`crate::ipc::HandlerError`]). Eden
+//!   sends whatever reply the request's context holds, asserts on the failure (an assertion
+//!   logs and carries on, `eden/src/common/assert.h`) and keeps the session
+//!   (`eden/src/core/hle/service/server_manager.cpp`, `ServerManager::CompleteSyncRequest`:
+//!   `SendReplyHLE`, then `R_ASSERT(service_res)`). Test:
+//!   `a_handler_that_fails_closes_the_session`.
 //! - A server's handler can reply later ([`Handled::Deferred`]); Eden's HLE servers reply on
 //!   their own host threads instead. Test: `a_second_sender_waits_behind_a_deferred_request`.
 //!

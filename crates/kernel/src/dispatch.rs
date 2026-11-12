@@ -47,6 +47,11 @@
 //!   event, which has no field for them. A dispatch that ends in [`Outcome::EnvFailed`] records
 //!   nothing: the call never returned, so it has no result, and the caller reports the failed
 //!   replay itself.
+//! - **IPC** (`ConnectToNamedPort`, `SendSyncRequest`) has arms of its own, in `dispatch/ipc.rs`:
+//!   `SendSyncRequest` takes the lock more than once and calls a server's handler without it,
+//!   and a request that cannot be answered at once ends the dispatch in [`Outcome::Waiting`],
+//!   recording nothing until the request ends. Its event, and the IPC events its handler made
+//!   before it, are recorded under the lock then, with the dispatch's one clock reading.
 //! - **`ExitProcess`** ends the dispatch in [`Outcome::ProcessExited`] and the caller stops
 //!   running the guest. PROVISIONAL (walking skeleton, #74): there is no process or thread
 //!   table to update yet, so the call changes no kernel state. Kernel slice 8 (process creation,

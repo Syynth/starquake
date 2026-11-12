@@ -568,6 +568,25 @@ fn a_close_request_ends_with_session_closed_and_the_session_stays_closed() {
 }
 
 #[test]
+fn a_session_whose_server_end_closed_takes_nothing_of_a_new_message() {
+    let world = World::new();
+    let handle = world.session();
+    let moved = world.session();
+    world.first.script(Box::new(|_, _, _| Ok(Handled::Closed)));
+    world.send(A, handle, &RequestBuilder::close());
+    // Both faults at once: the session is closed, and the message moves a handle. The closed
+    // session is reported, and the handle stays with the sender (Horizon refuses the request
+    // before it reads the message: `KServerSession::OnRequest`).
+    let (_, regs) = world.send(A, handle, &request().move_handle(moved.raw()));
+    assert_eq!(result(&regs), KernelError::SessionClosed.code());
+    let session = world.object(moved);
+    world.with_tables(|handles, scheduler| {
+        assert_eq!(handles.get(moved), Ok(session));
+        assert_eq!(scheduler.objects().refs(session), 1);
+    });
+}
+
+#[test]
 fn a_handler_that_fails_closes_the_session() {
     let world = World::new();
     let handle = world.session();
