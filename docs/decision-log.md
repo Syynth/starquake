@@ -233,3 +233,11 @@ Entry format:
 - **WHAT:** The first host graphics backend is wgpu, behind starquake's own backend trait and plain-data command lists; no wgpu type crosses into the GPU crate. A direct Vulkan backend is added when Linux work or a title needs a stage wgpu lacks (geometry, tessellation, transform feedback). A native Metal backend is written only if measurements at the performance milestone call for it. The draft's recommendation (Vulkan through ash, with MoltenVK on the Mac) was not taken.
 - **WHY:** The owner knows wgpu and will read and debug this code. It runs natively on Metal on the development Mac with nothing to install and no translation layer, it is safe pure Rust, and it takes the translated shaders directly, so first frames come sooner. Its gaps (checked against wgpu 30.0.1) bite after first frames, except texture channel remapping, which becomes shader variants. Keeping the trait ours means the choice can be revisited.
 
+## Translated shaders reach the backend as a naga module; naga is the only shader backend for now
+- **WHEN:** 2026-11-12
+- **PROJECT:** starquake
+- **SYSTEM:** shader, render
+- **SCOPE:** architectural
+- **WHAT:** The shader crate's output is a validated naga module plus tables describing its resources, inputs and outputs. The wgpu backend takes the module directly. A later direct backend asks the shader crate for final Vulkan or Metal code instead, which the shader crate emits; the backend says which form it wants. The shader and render crates do not depend on each other: the GPU crate carries the module across, and all three use the naga version wgpu uses. naga is the only shader backend at first; the project's own intermediate form stays independent of naga so a direct code writer can be added later. Game memory addresses stop at the GPU crate, and wgpu types stop at the wgpu backend crate.
+- **WHY:** wgpu is built on naga and accepts a module on its safe, supported path, so emitting final code now would add plumbing for a route wgpu does not need and would bypass its checks. naga cannot express geometry or tessellation stages, but wgpu cannot run them either, so nothing is lost by starting naga-only. Keeping emission in the shader crate for direct backends keeps naga's breaking changes in one place.
+
