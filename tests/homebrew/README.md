@@ -64,8 +64,9 @@ thread 1
    0x4201.
 2. libnx treats the failure as fatal: `diagAbortWithResult` calls `svcBreak` (0x26), which is
    not implemented either and also returns 0x4201.
-3. `diagAbortWithResult` does not expect `svcBreak` to return; the next instruction is undefined,
-   and the run ends as a guest crash (exit code 1) at `main+0xb5c`.
+3. `diagAbortWithResult` does not expect `svcBreak` to return (`__builtin_unreachable()` in
+   `libnx/nx/source/runtime/diag.c`), and the compiler put `udf #0` after the call. The run
+   ends as a guest crash (exit code 1, undefined instruction) at `main+0xb5c`.
 
 So the first missing piece is `svcSetMemoryPermission`; the next one start-up reaches is
 `svcSetMemoryAttribute` (0x03), which libnx calls right after it and whose result it ignores.
