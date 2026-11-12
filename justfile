@@ -1,4 +1,5 @@
-# The gate: fmt check, clippy -D warnings, tests, doctests. CI runs exactly this.
+# The gate: fmt check, unused-dependency checks, cargo deny, clippy -D warnings, tests, doctests.
+# CI runs exactly this. `cargo xtask ci --offline` skips the advisory check when there is no network.
 ci:
     cargo xtask ci
 

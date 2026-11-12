@@ -11,11 +11,11 @@
 //!   padding words; real clients locate reply fields by the sizes they know, not by this field, so
 //!   an exact count is the least surprising choice. This is a design choice, not a protocol fact.
 
+use crate::builder::{Parts, fill_header, push_special_header, to_u32};
 use crate::cmif::{CmifReplyHeader, DomainReplyHeader};
 use crate::error::{IpcError, Result};
 use crate::hipc::{
-    CommandHeader, CommandType, MAX_TIPC_COMMAND_ID, ReceiveList, SpecialHeader, align_raw,
-    push_data, write_words,
+    CommandHeader, CommandType, MAX_TIPC_COMMAND_ID, ReceiveList, align_raw, push_data, write_words,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,10 +33,7 @@ enum Layout {
 pub struct ReplyBuilder {
     layout: Layout,
     result: u32,
-    copy_handles: Vec<u32>,
-    move_handles: Vec<u32>,
-    data: Vec<u8>,
-    object_ids: Vec<u32>,
+    parts: Parts,
 }
 
 impl ReplyBuilder {
@@ -44,10 +41,7 @@ impl ReplyBuilder {
         Self {
             layout,
             result,
-            copy_handles: Vec::new(),
-            move_handles: Vec::new(),
-            data: Vec::new(),
-            object_ids: Vec::new(),
+            parts: Parts::default(),
         }
     }
 
@@ -77,21 +71,21 @@ impl ReplyBuilder {
     /// Adds a handle to copy to the receiver.
     #[must_use]
     pub fn copy_handle(mut self, handle: u32) -> Self {
-        self.copy_handles.push(handle);
+        self.parts.copy_handles.push(handle);
         self
     }
 
     /// Adds a handle to move to the receiver.
     #[must_use]
     pub fn move_handle(mut self, handle: u32) -> Self {
-        self.move_handles.push(handle);
+        self.parts.move_handles.push(handle);
         self
     }
 
     /// Appends data bytes.
     #[must_use]
     pub fn data(mut self, bytes: &[u8]) -> Self {
-        self.data.extend_from_slice(bytes);
+        self.parts.data.extend_from_slice(bytes);
         self
     }
 
@@ -99,7 +93,7 @@ impl ReplyBuilder {
     /// reply.
     #[must_use]
     pub fn object_id(mut self, id: u32) -> Self {
-        self.object_ids.push(id);
+        self.parts.object_ids.push(id);
         self
     }
 
@@ -114,23 +108,15 @@ impl ReplyBuilder {
     }
 
     fn words(&self) -> Result<Vec<u32>> {
-        if !self.object_ids.is_empty() && self.layout != (Layout::Cmif { domain: true }) {
+        let parts = &self.parts;
+        if !parts.object_ids.is_empty() && self.layout != (Layout::Cmif { domain: true }) {
             return Err(IpcError::ObjectIdsOutsideDomain);
         }
-        let special = SpecialHeader {
-            send_pid: false,
-            num_copy_handles: to_u32(self.copy_handles.len()),
-            num_move_handles: to_u32(self.move_handles.len()),
-        };
-        let has_special_header = !self.copy_handles.is_empty() || !self.move_handles.is_empty();
 
         // The two header words are filled in last, once the raw data size is known.
         let mut words = vec![0; CommandHeader::WORDS];
-        if has_special_header {
-            words.push(special.encode()?);
-            words.extend_from_slice(&self.copy_handles);
-            words.extend_from_slice(&self.move_handles);
-        }
+        let has_special_header =
+            push_special_header(&mut words, None, &parts.copy_handles, &parts.move_handles)?;
         let raw_start = words.len();
 
         let command_type = match self.layout {
@@ -139,7 +125,7 @@ impl ReplyBuilder {
                     return Err(IpcError::TipcCommandOutOfRange(command_id));
                 }
                 words.push(self.result);
-                push_data(&mut words, &self.data);
+                push_data(&mut words, &parts.data);
                 CommandType::Tipc(command_id)
             }
             Layout::Cmif { domain } => {
@@ -148,7 +134,7 @@ impl ReplyBuilder {
                 if domain {
                     words.extend_from_slice(
                         &DomainReplyHeader {
-                            num_objects: to_u32(self.object_ids.len()),
+                            num_objects: to_u32("domain object count", parts.object_ids.len())?,
                         }
                         .encode(),
                     );
@@ -161,8 +147,8 @@ impl ReplyBuilder {
                     }
                     .encode(),
                 );
-                push_data(&mut words, &self.data);
-                words.extend_from_slice(&self.object_ids);
+                push_data(&mut words, &parts.data);
+                words.extend_from_slice(&parts.object_ids);
                 CommandType::Invalid
             }
         };
@@ -173,17 +159,11 @@ impl ReplyBuilder {
             num_a: 0,
             num_b: 0,
             num_w: 0,
-            raw_data_words: to_u32(words.len() - raw_start),
+            raw_data_words: to_u32("raw data words", words.len() - raw_start)?,
             receive_list: ReceiveList::Disabled,
             has_special_header,
         };
-        let [w0, w1] = header.encode()?;
-        words[0] = w0;
-        words[1] = w1;
+        fill_header(&mut words, &header)?;
         Ok(words)
     }
-}
-
-fn to_u32(value: usize) -> u32 {
-    u32::try_from(value).unwrap_or(u32::MAX)
 }
