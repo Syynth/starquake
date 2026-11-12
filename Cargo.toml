@@ -29,6 +29,13 @@ starquake-testkit = { path = "crates/testkit" }
 starquake-trace = { path = "crates/trace" }
 
 lz4_flex = "0.14.0"
+# Shader IR: the shader crate hands out a validated naga module (docs/specs/shader-pipeline.md,
+# "The backend through naga") and the render crate's `ShaderSource::Naga` carries it
+# (docs/specs/render-backend.md, "Where the backend sits"). Pinned exactly to the naga wgpu 30.0.1
+# uses, so the shader, gpu and render crates share one naga with wgpu (owner's decision of
+# 2026-11-12); upgrade it together with wgpu. No features here: the render crate only names the
+# module types.
+naga = "=30.0.1"
 sha2 = "0.11.1"
 # Pure-Rust zstd decoder for NUP containers (crates/loader/src/nup.rs): the format stores each
 # compressed file as one zstd frame (docs/references.md, `nup`). Without default features: the
@@ -40,10 +47,6 @@ serde_json = "1.0.154"
 thiserror = "2.0.21"
 toml = { version = "1.2.1", default-features = false, features = ["std", "parse", "serde"] }
 tracing = "0.1.44"
-# The shader crate hands out a validated naga module (docs/specs/shader-pipeline.md, "The backend
-# through naga"). Pinned exactly to the naga wgpu 30.0.1 uses, so the shader, gpu and render crates
-# share one naga (owner's decision of 2026-11-12); upgrade it together with wgpu.
-naga = "=30.0.1"
 
 # Dev-only
 insta = "1.49.0"

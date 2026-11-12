@@ -56,8 +56,3 @@ reason = "the graphics service layer sits on services and gpu (docs/architecture
 package = "starquake-gsv"
 dependencies = ["thiserror", "tracing"]
 reason = "error type and logging arrive with the crate's first handler"
-
-[[allow]]
-package = "starquake-render"
-dependencies = ["thiserror"]
-reason = "scaffold crate with no code; its error type arrives with the first fallible render call"
