@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["apps/*", "crates/*", "tools/*", "xtask"]
+# Scripts and a patch for the reference emulator, not a crate (docs/reference-emulator.md).
+exclude = ["tools/oracle"]
 
 [workspace.package]
 version = "0.0.0"
