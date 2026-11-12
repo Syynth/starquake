@@ -63,8 +63,9 @@
 //!   another or is deferred, or a `WaitSynchronization` that nothing has ended yet, leaves the
 //!   calling thread waiting ([`Outcome::Waiting`]). With one thread and nothing to deliver a
 //!   deferred reply or signal an object, the run ends there as an emulator error ([`WAITING`]).
-//!   None of the services a run has yet ([`crate::hle`]) defers. Kernel slice 10 runs other
-//!   threads while one waits, and delivers deferred replies.
+//!   None of the services a run has yet ([`crate::hle`]) defers: `fsp-srv`'s read would, and is
+//!   given no executor until then. Kernel slice 10 runs other threads while one waits, and
+//!   delivers deferred replies.
 //! - **The environment** is live, with a fixed random seed and nothing recorded to disk; the
 //!   `--clock`, `--seed` and `--record` flags of the headless contract are not built. Its
 //!   recording, which grows by a clock reading per system call, is dropped as it is made (test:
@@ -87,13 +88,13 @@ use starquake_kernel::tables::AddressSpace;
 use starquake_kernel::time::CounterRate;
 use starquake_memory::{Access, GuestMemory};
 use starquake_trace::{
-    DumpError, EventKind, FaultAction, FlightRecorder, GuestTicks, HostClock, LifecyclePhase,
+    DumpError, Env, EventKind, FaultAction, FlightRecorder, GuestTicks, HostClock, LifecyclePhase,
     LiveEnv, Recorder, TextSink, ThreadId,
 };
 
 use crate::clock::Timebase;
 use crate::crash::{CrashReport, Exception};
-use crate::hle;
+use crate::hle::{self, HostFolder};
 use crate::image::{PAGE, Placement};
 use crate::report::{ExitReason, Mapping, RunOptions, RunReport, empty_dump};
 use crate::space::Touch;
@@ -215,13 +216,18 @@ impl<C: HostClock + Clone> Session<'_, C> {
         self.recorder.record(time, CORE, MAIN_THREAD, kind);
     }
 
-    /// The environment the kernel reads during this run: live, on the other copy of the run's
-    /// clock, with the fixed random seed.
-    fn environment(&self) -> LiveEnv
+    /// The environment the kernel and the services read during this run: live, on the other
+    /// copy of the run's clock, with the fixed random seed, and serving the SD card folder the
+    /// run names ([`RunOptions::sd_card`]) to `fsp-srv`.
+    fn environment(&self) -> Arc<LiveEnv>
     where
         C: 'static,
     {
-        LiveEnv::new(self.clock.for_environment(), RANDOM_SEED)
+        let env = LiveEnv::new(self.clock.for_environment(), RANDOM_SEED);
+        Arc::new(match &self.options.sd_card {
+            Some(folder) => env.with_host_io(HostFolder::new(folder)),
+            None => env,
+        })
     }
 }
 
@@ -566,7 +572,7 @@ fn drive<V: Vcpu, C: HostClock + Clone + 'static>(
     vcpu: &mut V,
     process: Process<'_, V>,
     session: &Session<'_, C>,
-    env: &LiveEnv,
+    env: &Arc<LiveEnv>,
     log: &mut GuestLog<'_, C>,
     tally: &mut Tally,
 ) -> Ending {
@@ -576,7 +582,8 @@ fn drive<V: Vcpu, C: HostClock + Clone + 'static>(
         regs,
     } = process;
     let vcpu_failed = |error| Ending::Failed(format!("the vCPU failed: {error}"));
-    if let Err(error) = hle::install(&dispatcher) {
+    let services_env: Arc<dyn Env> = Arc::<LiveEnv>::clone(env);
+    if let Err(error) = hle::install(&dispatcher, services_env) {
         return Ending::Failed(format!("the services could not be set up: {error}"));
     }
 
@@ -609,7 +616,7 @@ fn drive<V: Vcpu, C: HostClock + Clone + 'static>(
                     &mut Caller {
                         core: CORE,
                         thread: MAIN_THREAD,
-                        env,
+                        env: &**env,
                         memory: session.memory,
                         debug: log,
                         recorder: &session.recorder,

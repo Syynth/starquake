@@ -37,6 +37,7 @@ mod support {
         Some(system.run(&RunOptions {
             timeout: Some(GENEROUS),
             command_line: Vec::new(),
+            sd_card: None,
         }))
     }
 

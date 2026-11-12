@@ -6,6 +6,7 @@
 //! crate's own, versioned by [`SUMMARY_VERSION`] and pinned by a test.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::Serialize;
@@ -42,6 +43,9 @@ pub struct RunOptions {
     pub timeout: Option<Duration>,
     /// The command line that started the run, for the crash report. Empty when there was none.
     pub command_line: Vec<String>,
+    /// The host folder the guest sees as its SD card, read-only (`fsp-srv`'s
+    /// `OpenSdCardFileSystem`). `None`: the run has no SD card.
+    pub sd_card: Option<PathBuf>,
 }
 
 /// How a run ended.

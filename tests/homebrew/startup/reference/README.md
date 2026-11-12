@@ -52,7 +52,7 @@ Every system call and service request in the trace that starquake does not imple
 each, in the order of first use. "Line" is the line of `startup.trace`, counting its comment
 lines from 1. A call is listed when its status in `starquake_kernel::svc::SvcId` is not
 `Implemented`; a request when it is not a control command the service framework answers
-(`IpcController`) and not a command of a service starquake has (`sm:`, `set:sys`) under the same
+(`IpcController`) and not a command of a service starquake has (`sm:`, `set:sys`, `fsp-srv`) under the same
 name. The result is the reference's: a call's own result, or for a request the result of the
 `SendSyncRequest` that carried it (the trace does not record a reply's own result code).
 Requests to a sub-interface (`IApplicationProxy`, `ISelfController`, ...) are named by the
@@ -96,8 +96,6 @@ the two markers below differs; its failure message holds the text to put there.
 | 115 | `ipc time:u::4 (GetStandardLocalSystemClock)` | `0x0` |
 | 117 | `ipc time:u::20 (GetSharedMemoryNativeHandle)` | `0x0` |
 | 121 | `ipc ITimeZoneService::101 (ToCalendarTimeWithMyRule)` | `0x0` |
-| 129 | `ipc fsp-srv::1 (SetCurrentProcess)` | `0x0` |
-| 135 | `ipc fsp-srv::18 (OpenSdCardFileSystem)` | `0x0` |
 | 141 | `ipc vi:m::2 (GetDisplayService)` | `0x0` |
 | 143 | `ipc IApplicationDisplayService::100 (GetRelayService)` | `0x0` |
 | 145 | `ipc IApplicationDisplayService::101 (GetSystemDisplayService)` | `0x0` |
