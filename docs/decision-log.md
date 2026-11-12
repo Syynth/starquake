@@ -201,3 +201,11 @@ Entry format:
 - **WHAT:** The owner's direction: keep using Fable, but much more sparingly, and not for build agents by default. The allocation that follows is the lead's reading of that. Build and fix agents run on Opus, and the routine steps (merging, lessons, scope review) on Sonnet or Opus. Fable is kept for work where one bounded pass of judgement matters most: the fidelity review of a foundation PR (the kernel, the execution model, anything later work builds on) and the lead session's own design decisions. A build goes to Fable only when the lead can say why Opus would not do, and the report says so. This amends "Autonomous mode until something runs", which sent judgement-heavy work to the strongest model.
 - **WHY:** One day of Fable builds and reviews used the owner's whole weekly allowance. Builds are where the tokens go: a build agent runs for hours of tool calls, while a review is one read of a finished change. Spending Fable on the review keeps the strongest judgement on what merges, at a fraction of the cost.
 
+## The graphics-half designs start now, before milestone 1 lands
+- **WHEN:** 2026-11-12
+- **PROJECT:** starquake
+- **SYSTEM:** gpu
+- **SCOPE:** architectural
+- **WHAT:** The owner asked to start the designs that block parallel work. Four specs are drafted at once, one agent each: the graphics server session model (#11), the GPU front/back protocol and engine state model (#12), the shader pipeline (#13) and the render backend (#14). Each draft lists its decisions for the owner, its interfaces to the other three, and its implementation cut into pull-request-sized slices marked as parallel or not and as testable offline or not. The lead reconciles the interfaces between the four. The drafts are design PRs: they wait for the owner's review and are not merged or built on under delegation.
+- **WHY:** The graphics half is the largest part of the project and nothing in it is built. It is blocked on these designs, not on code, and much of it can be built and tested offline by many agents at once as soon as the designs are approved. The kernel work that leads to milestone 1 is narrow and serial, so starting the designs now costs it nothing.
+
