@@ -8,7 +8,10 @@ this file; the rest is the design it grows into. Background: `switch2-eden-diff-
 A Switch 2 game is an ARM64 program that talks to an OS (Horizon) through system calls, and to a
 GPU (Ampere-class) through command buffers. Starquake runs the program's code directly where it
 can (Hypervisor.framework, KVM) or translates it (x86-64 JIT), re-implements the OS in Rust (HLE),
-and replays the GPU's work on the host GPU through Vulkan or Metal.
+and replays the GPU's work on the host GPU through starquake's own render backend trait: wgpu
+first on every platform, with direct backends later. The graphics half is specified in
+`specs/graphics-server.md`, `specs/gpu-protocol.md`, `specs/shader-pipeline.md` and
+`specs/render-backend.md`.
 
 ```mermaid
 flowchart TB
@@ -30,14 +33,14 @@ flowchart TB
     end
 
     subgraph gpu["GPU (starquake-gpu)"]
-        front["Front thread<br/>GPFIFO · acquires · MME64"]
+        front["Front thread<br/>GPFIFO · acquires · MME64 · register file"]
         back["Back thread<br/>3D · compute/QMD · DMA"]
-        caches["Texture / buffer / shader caches"]
+        caches["Texture / buffer / pipeline-key caches<br/>detiling (starquake-layout)"]
     end
 
     subgraph host["Host"]
-        shader["Shader translator<br/>SM86 → IR → naga"]
-        render{{"Render backend<br/>Vulkan · Metal"}}
+        shader["Shader translator<br/>SM86 → IR → naga module"]
+        render{{"Render backend trait<br/>wgpu · recording<br/>(direct Vulkan, Metal later)"}}
         io["Audio · input · video decode"]
     end
 
@@ -46,12 +49,13 @@ flowchart TB
     backend -->|"Exit::Svc"| kernel
     kernel --> ipc --> services
     ipc --> gsv
-    gsv -->|"GPFIFO submits, syncpoints"| front
+    gsv -->|"GPFIFO submits, ordered VM updates,<br/>latched presents"| front
     front -->|"lock-free ring"| back
-    back --> caches --> render
-    caches --> shader --> render
+    back --> caches
+    back <-->|"lookup · naga module"| shader
+    back -->|"command lists (data),<br/>naga modules"| render
+    back -->|"syncpoints, done reports<br/>(completion queue)"| gsv
     services --> io
-    gsv -->|"present (vi2)"| render
     mem -. "GPU VA == CPU VA" .- caches
 ```
 
@@ -69,38 +73,50 @@ flowchart TB
    target session's handler in `services` or `gsv`.
 4. **Graphics.** NVN2 writes command buffers into guest memory and submits GPFIFO entries
    through `gsv`/`nvsrv`. The GPU front thread parses them, honours semaphore acquires (the CPU
-   gates each command buffer this way), runs MME64 macros, and pushes engine methods into a
-   ring. The back thread applies them to engine state and records draws and dispatches.
-5. **Shaders and resources.** Draws pull shaders through the shader cache (SM86 → IR → `naga`
-   → SPIR-V/MSL) and resources through the texture and buffer caches (GOB deswizzle, ASTC
-   passthrough on Metal, transcode on Vulkan where needed).
-6. **Present.** vi2 present (`gsv` 229) hands the frame to the render backend, signals the
-   frame's fence, and paces the game at 60 Hz.
+   gates each command buffer this way), keeps the register file, runs MME64 macros, and pushes
+   the register changes into a ring. The back thread applies them to engine state and records
+   draws and dispatches as plain-data command lists, which the render thread turns into host
+   API calls. A semaphore release or syncpoint increment becomes visible to the game only once
+   the host GPU has finished the work before it.
+5. **Shaders and resources.** Draws ask the shader cache for shaders (SM86 → IR → a validated
+   `naga` module, which `gpu` carries to the render backend; wgpu takes it directly) and pull
+   resources through the texture and buffer caches (detiling with `starquake-layout`, ASTC
+   uploaded as is where the host GPU has it, decoded on the GPU where it does not).
+6. **Present.** vi2 present (`gsv` 229) queues the frame and replies at once with the buffers
+   still in use. On each 60 Hz tick of gsv's emulated clock, gsv latches one queued frame whose
+   fence is reached and hands it to `gpu`, which orders it after the work that drew it and
+   passes it to the render backend; the buffer it replaces is freed on the same tick. The game
+   waits only when it has no free buffer. A present goes gsv → gpu → render.
+
+(Steps 4–6 amended for the graphics specs. Approved by the owner, 2026-11-12.)
 
 ## Threads
 
 | Thread | Count | Does |
 |---|---|---|
 | vCPU | 6 | Runs guest code; handles SVCs and IPC inline |
-| GPU front | 1 | Parses command streams, runs macros, waits on acquires |
-| GPU back | 1 | Engine state, draws/dispatches, records into the render backend |
-| Render submit/present | 1 | Submits host command buffers, presents, owns the swapchain |
-| Shader compile workers | N | Pipeline compilation off the hot path |
+| GPU front | 1 | Parses command streams, keeps the register file, runs macros, waits on acquires |
+| GPU back | 1 | Engine state, draws/dispatches, guest-keyed caches; fills plain-data command lists |
+| Render submit/present | 1 | Turns command lists into host API calls, submits, presents, owns the swapchain |
+| Compile pool | N | One pool, created by `core`, shared by shader translation and pipeline builds |
 | Audio, input, video decode | 1 each | Host I/O |
-| Timers | 1 | Vsync events (vi2 31/32), syncpoint polling, kernel timeouts |
+| Timers | 1 | Vsync ticks (vi2 31/32 and the present latch), draining gsv's completion queue (syncpoint changes and GPU reports, in one recorded order), the shared syncpoint page's 1 ms bound, kernel timeouts |
+
+(Threads amended for the graphics specs. Approved by the owner, 2026-11-12.)
 
 ## Crates and dependency direction
 
 ```mermaid
 flowchart LR
     app["apps/starquake"] --> core
-    core --> gsv & loader
+    core --> gsv & loader & wgpu["render-wgpu"]
     gsv --> services & gpu
     services --> kernel
     kernel --> cpu & ipc
     cpu --> memory
     loader --> memory
-    gpu --> memory & shader & render
+    gpu --> memory & shader & render & layout
+    wgpu --> render
 ```
 
 Rules: no cycles, no reaching around a layer, frontends only see `core`. `ipc` works on byte
@@ -108,15 +124,33 @@ slices and depends on no other workspace crate; its caller copies the buffer out
 Backends are selected by `cfg` (target OS/arch) plus Cargo features, never by runtime checks
 scattered through code.
 
+The graphics crates (approved by the owner, 2026-11-12):
+
+- **`starquake-layout`** (block-linear tiling, ported from Mesa's `nil`) is a leaf like `ipc`:
+  no workspace dependencies. `gpu` does all detiling with it; gsv uses it only in a test.
+- **`starquake-shader` and `starquake-render` do not depend on each other.** The shader crate's
+  output is a validated naga module plus tables; `gpu` carries it to the render backend. All
+  three use the naga version wgpu uses.
+- **`starquake-render`** is the backend trait, its plain-data types and the recording backend,
+  with no workspace dependencies. Each host API is its own crate that depends on it:
+  **`starquake-render-wgpu`** first (the only crate that names a wgpu type), later a direct
+  Vulkan backend, and a native Metal backend only if measured to be needed. `core` picks one.
+- Game memory addresses stop at `gpu`; host API types stop at their backend crate.
+
 ## Platform matrix
 
 | | macOS arm64 | Linux arm64 | Linux x86-64 (Steam Deck class) |
 |---|---|---|---|
 | CPU backend | HVF (measured, works) | KVM (planned) | JIT (planned; must emulate PAuth, LSE, RCpc) |
 | Counter reads | Patched stub | Patched stub | JIT intrinsic |
-| Render backend | Metal (Vulkan via MoltenVK for bring-up) | Vulkan | Vulkan |
-| ASTC | Native | Depends on GPU | Transcode (AMD) |
-| Memory | Unified: alias guest buffers | Discrete or unified | Unified (Deck APU) |
+| Render backend | wgpu on Metal (nothing to install) | wgpu on Vulkan | wgpu on Vulkan |
+| Render backend later | Native Metal only if measured to be needed | Direct Vulkan when Linux work or a title needs a stage wgpu lacks | Same as Linux arm64 |
+| ASTC | Native | Native where the driver has it; else decoded on the GPU | Decoded on the GPU (AMD) |
+| Memory | Unified: copied (wgpu cannot alias guest memory) | Discrete or unified: copied | Unified (Deck APU): copied |
+
+Every platform starts on wgpu. Guest data is copied into host GPU memory until a direct backend
+can alias it on unified-memory hosts. (Platform matrix amended for the graphics specs. Approved by
+the owner, 2026-11-12.)
 
 ## What makes it agent-friendly
 

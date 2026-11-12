@@ -12,7 +12,7 @@ can be replayed afterwards, and what a run leaves behind.
 | Layer | Exact replay? | How |
 |---|---|---|
 | Kernel and services | Yes | Re-run them from the event log. No game, no hypervisor, any host |
-| GPU | Yes, later | Capture a frame's command stream and the memory it reads; replay it offline |
+| GPU | Yes, later | Capture every byte each GPU thread reads, in order, from a present boundary; replay it offline with no game and no GPU (`gpu-protocol.md`, "Capture and replay") |
 | Guest code on a native backend | No | Six real cores interleave differently every run. Use snapshots, the flight recorder and a live debugger |
 | Guest code, exactly | Only on the deterministic interpreter (#47) | Slow; practical for test programs and homebrew, not full titles |
 
@@ -118,7 +118,20 @@ starquake run <program>
     --record ring | full | off
     --snapshot-every 30s
     --artifacts <dir>
+    --window                    show frames in a plain window while running
+
+starquake gpu-replay <capture> --until present=N --dump ring|render|writes
+starquake render-replay <capture> --png <dir>
+cargo xtask shader-replay <folder>
 ```
+
+`--window` is for watching bring-up live; it changes nothing the guest sees, and a run without it
+needs no display (`render-backend.md`, decision 11). The three replay commands are offline and
+need no game: `gpu-replay` runs the real GPU front and back threads on a GPU capture
+(`gpu-protocol.md`, "Replay"); `render-replay` runs a host-level capture of command lists on any
+render backend (`render-backend.md`, slice R11); `shader-replay` retranslates local shader
+captures and prints a histogram of rejections (`shader-pipeline.md`, "The offline test
+harness"). (Approved by the owner, 2026-11-12.)
 
 Exit codes: 0 reached the stop condition, 1 the guest crashed, 2 emulator error, 3 timeout,
 4 an unimplemented feature was hit under the strict policy. Usage errors and unreadable or malformed
@@ -132,13 +145,21 @@ The artifacts folder always contains:
 
 | File | Contents |
 |---|---|
-| `summary.json` | Exit reason, duration, frames, counts per system call and service command, every stubbed command hit |
+| `summary.json` | Exit reason, duration, frames, counts per system call and service command, every stubbed command hit; GPU, shader and render counters (below) |
 | `trace.txt` | The golden-trace view of the event stream |
 | `events.bin` | Flight recorder dump, or the full log when recording |
 | `crash.json`, `crash.txt` | When the guest crashed (below) |
 | `frames/` | PNG frame dumps on request or at the end |
 | `guest_log.txt` | The text the guest wrote with debug output calls |
+| `gpu.txt` | The GPU's own flight recorder: recent submissions, acquires parked and resumed, releases, macro and channel errors, presents (`gpu-protocol.md`, "Observability") |
 | `snapshots/` | When requested |
+
+`summary.json` also carries the graphics counters, cheap enough to keep on: from the GPU, words
+parsed, writes dropped as same-value, macro calls and memo hits, acquires parked, catch-ups,
+ring peak occupancy, and fenced actions with how many were skipped as empty; from the shader
+pipeline, rejections counted once per program with their reason; from the render backend,
+skipped draws and failed pipelines. (`gpu.txt` and the counters approved by the owner,
+2026-11-12.)
 
 No window is needed for any of this. Configuration comes from flags and one file, not from
 scattered environment variables.
@@ -157,7 +178,11 @@ Written as data first and text second:
 ## Later
 
 - **GPU capture and replay**, and a render backend that records draw calls instead of drawing,
-  so GPU-path tests run without a GPU. Specified with the GPU (#12).
+  so GPU-path tests run without a GPU. Now specified: the GPU capture format (`SQGC`) and
+  `starquake gpu-replay` in `gpu-protocol.md`; the recording backend and
+  `starquake render-replay` in `render-backend.md`; the shader capture and
+  `cargo xtask shader-replay` in `shader-pipeline.md`. They are built with those specs' slices.
+  (Updated 2026-11-12.)
 - **A debugger stub** speaking the GDB remote protocol: breakpoints, single-step, register and
   memory access, and write watchpoints built on the stage-1 write-protection mechanism. It must be
   scriptable, so an agent can drive it without a terminal.

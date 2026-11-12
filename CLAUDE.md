@@ -72,7 +72,9 @@ Platform-specific code must still compile (or be `cfg`-gated) on Linux; check wi
 
 - `docs/roadmap.md`: milestones, waves, and how work is scheduled. The backlog is GitHub issues.
 - `docs/specs/`: the approved designs (execution model, kernel, service framework, observability
-  and replay, test strategy). Code follows them; changing one needs the owner's approval.
+  and replay, test strategy, and the graphics half: `graphics-server.md`, `gpu-protocol.md`,
+  `shader-pipeline.md`, `render-backend.md`). Code follows them; changing one needs the owner's
+  approval. `graphics-review-guide.md` records how the four graphics specs were reconciled.
 - `docs/proposals.md`: work and house rules that agents have proposed and the owner hasn't vetted
   yet. Nothing in it is a commitment.
 - `docs/architecture.md`: how the pieces fit, threads, and dependency direction. Read it first.
@@ -91,9 +93,13 @@ Platform-specific code must still compile (or be `cfg`-gated) on Linux; check wi
 ## Architecture rules
 
 - Dependencies point one way: `memory` → `cpu` → `kernel` → `services` → `gsv` → `gpu` →
-  `shader`, `render`. `ipc` and `trace` are leaves (no workspace dependencies) that the layers
-  above depend on; `testkit` is a dev-dependency only and depends on none of our crates. `core` wires everything; frontends depend only on `core`. No cycles, and no
-  reaching around a layer.
+  `shader`, `render`. `shader` and `render` do not depend on each other: `gpu` carries the shader
+  crate's naga module to the render backend. `ipc`, `trace` and `layout` (block-linear tiling)
+  are leaves (no workspace dependencies) that the layers above depend on; `testkit` is a
+  dev-dependency only and depends on none of our crates. A render backend crate
+  (`render-wgpu`, later direct backends) depends only on `render`, is the only crate that names
+  its host API's types, and is chosen by `core`. `core` wires everything; frontends depend only
+  on `core`. No cycles, and no reaching around a layer.
 - Kernel and service code (`kernel`, `services`, `gsv`) is replayable: the clock, random numbers
   and host file and network I/O come only through the injectable `Env`, never from `std`
   directly. The gate's `host-access` step catches the direct calls it lists (`xtask/src/host_access.rs`)
@@ -185,6 +191,12 @@ Platform-specific code must still compile (or be `cfg`-gated) on Linux; check wi
   and encoders, `insta` for snapshots.
 - Hypervisor tests need a real Mac. They skip themselves only when the `CI` environment variable
   is set (hosted runners can't create VMs); anywhere else, failing to create a VM is a failure.
+- GPU tests (the wgpu render backend's) are the reverse, once an experiment shows wgpu runs
+  cleanly and deterministically on Mesa's software Vulkan driver (lavapipe) on the hosted Linux
+  runners: required in Linux CI on lavapipe, and skipped locally, with a notice, where no GPU
+  adapter exists. Until that experiment passes they are local-only, like the hypervisor tests
+  (`docs/specs/render-backend.md`, decision 9). Golden images are compared exactly only for
+  scenes whose pixels can be computed; others use a stated tolerance.
 - Never commit keys, firmware, game files or dumps derived from them. Fixtures are synthetic or
   built from homebrew.
 
