@@ -297,3 +297,11 @@ Entry format:
 - **WHAT:** The GPU front thread keeps the only copy of every engine's register values, runs macros, and sends the back thread only the changes. Register writes with side effects (one register changing another, or triggering an action) are computed on the front thread, each rule covered by a per-engine fixture, and captures replayed against recorded frames catch rules that were missed. The back thread keeps a mirror with dirty flags and never changes a register itself (gpu 1).
 - **WHY:** Macros are a large share of the GPU's work, so running them on the front thread keeps most of the gain from splitting work across two threads; Eden-NX2 found this arrangement fastest. Keeping one copy avoids two copies drifting apart, which forced Eden-NX2 to build and maintain a checker. The risk, a missed side-effect rule, is a correctness bug that offline fixtures and replay can find.
 
+## The shader translator uses a new arena-based Rust IR
+- **WHEN:** 2026-11-12
+- **PROJECT:** starquake
+- **SYSTEM:** shader
+- **SCOPE:** architectural
+- **WHAT:** The shader crate's intermediate representation is a new Rust design that keeps Eden's operation set and pass behaviour but stores instructions in arenas referred to by typed ids, not pointer-linked objects. It has its own register class for Switch 2's uniform registers, a text form that can be printed and parsed for tests, and a verifier run after every pass in tests and debug builds. Eden's passes are ported by behaviour, not line by line (shader 1).
+- **WHY:** Eden's operations and passes are the proven part; its pointer-linked data layout fights Rust's ownership rules and tends toward `unsafe`, which the project bans outside host-facing crates. The kernel's move to tables and ids ported Eden's logic cleanly, and the same approach gives deterministic, testable IR. A native design also avoids Eden's Switch 1-era trick of packing uniform registers into the top of the regular register file.
+
