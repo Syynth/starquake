@@ -60,9 +60,20 @@
 //!   shared memory's pages in order from its first byte, so a range that starts anywhere else,
 //!   or holds another shared memory, fails it. Test:
 //!   `unmapping_shared_memory_needs_the_mapping_of_that_shared_memory_at_its_start`.
-//!   `UnlockForTransferMemory`'s page-group check is not made at all: nothing but the transfer
-//!   memory that locked a range can unlock it (it is the only caller), and a locked range
-//!   cannot change underneath it (every other operation refuses a locked block).
+//!   `UnlockForTransferMemory`'s page-group check (`IsValidPageGroup`,
+//!   `ResultInvalidMemoryRegion` otherwise) is not made at all: nothing but the transfer memory
+//!   that locked a range can unlock it (it is the only caller), and a locked range cannot change
+//!   underneath it. The operations here that change a range already in use refuse a block with
+//!   [`MemoryAttribute::LOCKED`]: [`AddressSpace::set_memory_permission`],
+//!   [`AddressSpace::set_process_memory_permission`], the heap shrink of
+//!   [`AddressSpace::set_heap_size`], [`AddressSpace::lock_for_transfer_memory`] and
+//!   [`AddressSpace::unmap_shared`] check for no attributes at all, and
+//!   [`AddressSpace::set_memory_attribute`] for none outside the settable ones and
+//!   `DeviceShared`; [`AddressSpace::map_shared`] and [`AddressSpace::map_pages`] (heap growth
+//!   too) need the range free, which a lent range never is. Test:
+//!   `svc::transfer_memory::tests::while_lent_the_owner_cannot_change_the_pages_and_closing_the_handle_gives_them_back`
+//!   (`SetMemoryPermission`, `SetMemoryAttribute`, the heap shrink and a second lend, each
+//!   refused while the pages are lent).
 
 use core::fmt;
 use std::collections::BTreeMap;
