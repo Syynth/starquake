@@ -56,11 +56,17 @@ itself). It leaves `svc.txt`, `ipc.txt`, `guest.txt` and the full log. `summariz
 
 Three runs of the fixture were identical apart from addresses and timestamps.
 
+A program that keeps libnx's own start-up (`tests/homebrew/startup`) never calls `ExitProcess`
+there: started without a homebrew loader, libnx ends it through `appletOE`'s
+`ISelfController::Exit`, after which the emulator stops the process and its `SendSyncRequest`
+returns `0x7601`. Pass `summarize.py` a stop pattern for that line, as the fixture's README says.
+
 ## What may be committed
 
 - A **normalised** trace of a homebrew program (addresses and timestamps masked), with a note
-  saying which reference commit and which program produced it. The fixture's is
-  `tests/homebrew/hello/reference/startup.trace`, made from a run's `startup.txt` by
-  `normalise.py` in that folder, whose README has the format.
+  saying which reference commit and which program produced it. The fixtures' are
+  `tests/homebrew/hello/reference/startup.trace` and
+  `tests/homebrew/startup/reference/startup.trace`, made from a run's `startup.txt` by
+  `tools/oracle/normalise.py`; the README beside the first has the format.
 - Never a raw run folder, and never anything from a run of a commercial title
   (`docs/specs/observability.md`, "Storage and what may be committed").

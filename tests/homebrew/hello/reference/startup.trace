@@ -1,6 +1,6 @@
 # The hello fixture's system calls, IPC requests and log lines from start to exit, as the
 # reference emulator ran it: Eden-NX2 @ 50fa86bbbc40 (`eden-nx2` in docs/references.md).
-# Normalised by normalise.py in this folder: no timestamps or thread ids, arguments decoded,
+# Normalised by tools/oracle/normalise.py: no timestamps or thread ids, arguments decoded,
 # addresses as `anchor+offset`. README.md in this folder has the provenance and the format.
 # Do not edit by hand; `crates/core/tests/homebrew.rs` compares starquake's run with it.
 svc 0x02 SetMemoryPermission(address=main+0x4000, size=0x1000, perm=0x1) -> 0x0
