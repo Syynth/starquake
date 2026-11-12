@@ -236,6 +236,23 @@ fn the_guest_programs_use_the_kernels_system_call_numbers() {
     );
     // And the rate the example's counter program expects is the one the kernel gives a process.
     assert_eq!(programs::COUNTER_HZ, NRO_CONSOLE.counter_rate().hz());
+    // The threads program's calls, and its second thread's priority: the main thread's.
+    for (restated, id) in [
+        (programs::SVC_CREATE_THREAD, SvcId::CreateThread),
+        (programs::SVC_START_THREAD, SvcId::StartThread),
+        (programs::SVC_EXIT_THREAD, SvcId::ExitThread),
+        (
+            programs::SVC_GET_CURRENT_PROCESSOR_NUMBER,
+            SvcId::GetCurrentProcessorNumber,
+        ),
+        (programs::SVC_WAIT_SYNCHRONIZATION, SvcId::WaitSynchronization),
+    ] {
+        assert_eq!(restated, u32::from(id.number()), "{}", id.name());
+    }
+    assert_eq!(
+        programs::THREAD_PRIORITY,
+        u32::from(ProcessDescription::homebrew(NRO_CONSOLE).main_thread_priority)
+    );
 }
 
 #[test]
