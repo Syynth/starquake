@@ -6,7 +6,8 @@
 //! - **The manifest check** (test strategy spec, `docs/specs/testing.md`, "Homebrew fixtures"):
 //!   every source and binary in the folder must hash to what `manifest.toml` records, and every
 //!   file must be listed, so a source can't change without a rebuild. This is what the gate runs;
-//!   it needs no toolchain.
+//!   it needs no toolchain. The `tests/homebrew/startup` fixture's manifest is checked the same
+//!   way.
 //! - **The loader against real files**: the NSO, the NRO and the NPDM parse, and what they say
 //!   matches `hello.json` (the NPDM description `npdmtool` was given), the ELF build id the
 //!   manifest records, and each other (the NRO and the NSO come from one ELF). These are the
@@ -146,6 +147,19 @@ mod homebrew {
             Ok(()),
             "tests/homebrew/hello no longer matches its manifest; rebuild it with `make` in that \
              folder and commit the result (tests/homebrew/README.md)"
+        );
+    }
+
+    /// The second fixture (`tests/homebrew/startup`, libnx's own start-up) has a manifest of the
+    /// same form, checked the same way.
+    #[test]
+    fn the_startup_fixture_matches_its_manifest() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/homebrew/startup");
+        assert_eq!(
+            check_manifest(&dir),
+            Ok(()),
+            "tests/homebrew/startup no longer matches its manifest; rebuild it with `make` in \
+             that folder and commit the result (tests/homebrew/README.md)"
         );
     }
 

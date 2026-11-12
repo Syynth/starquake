@@ -1,8 +1,16 @@
-//! The homebrew fixture (`tests/homebrew/hello/hello.nro`, a real libnx program) against the
-//! reference emulator: its run in starquake is compared, line for line, with the normalised
-//! trace of the same file under Eden-NX2 (`tests/homebrew/hello/reference/startup.trace`; the
-//! README beside it has the provenance and the format), from its first system call to
-//! `ExitProcess`.
+//! The homebrew fixtures (real libnx programs under `tests/homebrew/`) against the reference
+//! emulator: a fixture's run in starquake is compared, line for line, with the normalised trace
+//! of the same file under Eden-NX2 (`reference/startup.trace` in the fixture's folder; the
+//! README beside the hello fixture's has the provenance and the format).
+//!
+//! - **`hello`** (`tests/homebrew/hello/hello.nro`) runs from its first system call to
+//!   `ExitProcess`, and must match the reference all the way.
+//! - **`startup`** (`tests/homebrew/startup/startup.nro`) keeps libnx's own start-up, which
+//!   needs services starquake does not have yet. Its run is compared as far as it matches, and
+//!   the test fails if that is fewer lines than [`STARTUP_MATCHED`] records: a ratchet that
+//!   later work raises. The services and calls it is missing are listed in
+//!   `tests/homebrew/startup/reference/README.md`, a list this file derives from the trace and
+//!   checks (`the_startup_gap_list_in_its_readme_is_the_one_the_trace_gives`).
 //!
 //! Each line of the reference is one of three kinds, and matches when:
 //!
@@ -12,24 +20,35 @@
 //!   everything inside them. Handles are compared as a mapping: the first time a reference
 //!   handle value appears, the run's handle in the same place is paired with it, and from then
 //!   on each must appear only with the other (pseudo-handles and zero are compared as values).
-//!   `ExitProcess` has no result in the reference, which never saw it return; starquake ends the
-//!   run there (`docs/reference-emulator.md`). Outputs other than the result are not in
-//!   starquake's event stream; what `GetInfo` answers is checked against the same reference in
-//!   `starquake-kernel` (`svc/info/tests.rs`, `memory/layout.rs`).
+//!   A run's handle that is not paired is written `unpaired <value>`, so it cannot read as a
+//!   reference handle whose value it happens to have.
+//!   Placements (`placement1+0x1000`: a range libnx put at a random page of the ASLR region,
+//!   `tools/oracle/normalise.py` says how) are paired the same way: the first time the
+//!   reference names one, the run's address in the same place, less the same offset, is paired
+//!   with it, if both that address and the run's address lie where libnx may place one: in the
+//!   ASLR region, outside the module, the alias region and the heap region. libnx's
+//!   `_memregionFindRandom` (`libnx/nx/source/kernel/virtmem.c`) skips the alias and heap regions
+//!   and anything mapped, and the kernel lets a shared memory lie anywhere else in the ASLR
+//!   region (`eden/src/core/hle/kernel/k_page_table_base.cpp`, `KPageTableBase::CanContain`:
+//!   `is_in_region && !is_in_heap && !is_in_alias` for `MemoryState::Shared`), the stack
+//!   region included. `ExitProcess` has no result in the reference, which never saw it return;
+//!   starquake ends the run there (`docs/reference-emulator.md`). Outputs other than the result
+//!   are not in starquake's event stream; what `GetInfo` answers is checked against the same
+//!   reference in `starquake-kernel` (`svc/info/tests.rs`, `memory/layout.rs`).
 //! - **`ipc`**: the service, by the name starquake registered its number under
 //!   (`starquake_core::hle::service_name`), and the command id are the reference's, and the
 //!   reference's name for the command is the one starquake's command table lists, written in
-//!   the reference's case. A reference control request (`IpcController::3`) is a request with
-//!   that id on the session of the service the reference's next non-control request goes to:
-//!   starquake's IPC event does not say whether a request was a control request
+//!   the reference's case. A reference control request (`IpcController::<id>`) is a request
+//!   with that id on the session of the service the reference's next non-control request goes
+//!   to: starquake's IPC event does not say whether a request was a control request
 //!   (`starquake_services::framework::trace`), so this is the most the comparison can check.
 //! - **`log`**: the run logged a line of the same length and hash (an event keeps no text).
 //!   The text itself is checked against the fixture's source by the run's guest log.
 //!
 //! The comparison runs on every host, against made-up runs that must fail it: a wrong
 //! argument, result, service or command, a log line that differs, a handle used for two
-//! sessions, a missing line, a run that stops early. The run on a real vCPU needs a Mac with
-//! Apple Silicon and skips itself only when `CI` is set.
+//! sessions, a placement paired twice, a missing line, a run that stops early. The runs on a
+//! real vCPU need a Mac with Apple Silicon and skip themselves only when `CI` is set.
 
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 mod common;
@@ -38,37 +57,64 @@ mod common;
 #[cfg(test)]
 mod trace {
     use std::collections::BTreeMap;
+    use std::fmt::Write as _;
 
     use starquake_core::hle::{SET_SYS, SM, service_name};
     use starquake_kernel::handle::Handle;
     use starquake_kernel::memory::MemoryArrangement;
     use starquake_kernel::memory::layout::{LayoutRequest, Region, RegionOffsets, Regions};
-    use starquake_kernel::svc::{Kind, SvcId};
+    use starquake_kernel::svc::{Kind, Status, SvcId};
+    use starquake_loader::nro::Nro;
+    use starquake_memory::PAGE_SIZE;
     use starquake_services::framework::control::{CONTROL_COMMANDS, CONTROL_INTERFACE};
     use starquake_services::framework::{Protocol, Session};
     use starquake_services::set::SetSys;
     use starquake_services::sm::Sm;
     use starquake_trace::{EventKind, SVC_ARG_COUNT, ServiceId};
 
-    /// The reference emulator's run, normalised.
-    const REFERENCE: &str = include_str!("../../../tests/homebrew/hello/reference/startup.trace");
+    /// A homebrew fixture and the reference emulator's run of it, normalised.
+    #[derive(Debug, Clone, Copy)]
+    struct Fixture {
+        /// The NRO that is run.
+        nro: &'static [u8],
+        /// Its `reference/startup.trace`.
+        reference: &'static str,
+    }
 
-    /// The fixture, and the source it was built from.
-    const HELLO: &[u8] = include_bytes!("../../../tests/homebrew/hello/hello.nro");
+    /// The milestone 1 fixture: start-up opens only `sm:`.
+    const HELLO: Fixture = Fixture {
+        nro: include_bytes!("../../../tests/homebrew/hello/hello.nro"),
+        reference: include_str!("../../../tests/homebrew/hello/reference/startup.trace"),
+    };
+    /// The hello fixture's source.
     const HELLO_SOURCE: &str = include_str!("../../../tests/homebrew/hello/hello.c");
 
-    /// Where an NRO's header keeps the size of its image (`starquake_loader::nro`; the same offset
-    /// `normalise.py` reads).
-    const NRO_IMAGE_SIZE_OFFSET: usize = 0x18;
+    /// The fixture built with libnx's own start-up.
+    const STARTUP: Fixture = Fixture {
+        nro: include_bytes!("../../../tests/homebrew/startup/startup.nro"),
+        reference: include_str!("../../../tests/homebrew/startup/reference/startup.trace"),
+    };
+    /// The README beside the startup fixture's trace, which holds its gap list.
+    const STARTUP_README: &str =
+        include_str!("../../../tests/homebrew/startup/reference/README.md");
 
-    /// The arguments that are addresses, for each call the fixture makes: the same list as
-    /// `ADDRESSES` in `tests/homebrew/hello/reference/normalise.py`. A call that is not listed is
-    /// refused, so no address is compared as a number by oversight.
+    /// How many lines of the startup fixture's reference a run in starquake matches, at least:
+    /// the ratchet (see the module docs). Raise it when a change makes the run match more; the
+    /// on-hardware test prints the new count when it does.
+    const STARTUP_MATCHED: usize = 31;
+
+    /// The arguments that are addresses, for each call the fixtures make: the same list as
+    /// `ADDRESSES` in `tools/oracle/normalise.py`. A call that is not listed is refused, so no
+    /// address is compared as a number by oversight.
     const ADDRESS_ARGUMENTS: &[(SvcId, &[&str])] = &[
         (SvcId::SetHeapSize, &[]),
         (SvcId::SetMemoryPermission, &["address"]),
         (SvcId::SetMemoryAttribute, &["address"]),
         (SvcId::QueryMemory, &["out_memory_info", "address"]),
+        (SvcId::MapSharedMemory, &["address"]),
+        (SvcId::UnmapSharedMemory, &["address"]),
+        (SvcId::CreateTransferMemory, &["address"]),
+        (SvcId::WaitSynchronization, &["handles"]),
         (SvcId::GetInfo, &[]),
         (SvcId::ConnectToNamedPort, &["name"]),
         (SvcId::SendSyncRequest, &[]),
@@ -76,6 +122,11 @@ mod trace {
         (SvcId::OutputDebugString, &["debug_str"]),
         (SvcId::ExitProcess, &[]),
     ];
+
+    /// The name `normalise.py` gives the `n`th placement is this followed by `n`.
+    const PLACEMENT: &str = "placement";
+    /// The anchor `normalise.py` writes for the ASLR region.
+    const ASLR_REGION: &str = "aslr_region";
 
     /// One line of a run: what the event stream keeps of a system call, a request, or a line
     /// the guest logged.
@@ -118,17 +169,17 @@ mod trace {
     /// Where a run put things, for writing its addresses as `anchor+offset`.
     #[derive(Debug, Clone, Copy)]
     struct Anchors {
-        /// The module's image: its first byte to the first byte after it, inclusive (libnx asks
-        /// about that address).
+        /// The module's image and `.bss`: its first byte to the first byte after them, inclusive
+        /// (libnx asks about that address, `__argdata__`).
         main: Region,
         regions: Regions,
     }
 
     impl Anchors {
         /// The anchors of a run whose module is `module_size` bytes at `base`, of which the
-        /// first `image_size` are its image, on a 4 GiB console: the regions are where the kernel
-        /// places them around that code.
-        fn new(base: u64, image_size: u64, module_size: u64) -> Self {
+        /// first `extent` are its image and `.bss` ([`module_extent`]), on a 4 GiB console: the
+        /// regions are where the kernel places them around that code.
+        fn new(base: u64, extent: u64, module_size: u64) -> Self {
             let regions = Regions::new(&LayoutRequest {
                 code_address: base,
                 code_size: module_size,
@@ -140,7 +191,7 @@ mod trace {
             Self {
                 main: Region {
                     start: base,
-                    end: base + image_size,
+                    end: base + extent,
                 },
                 regions,
             }
@@ -156,7 +207,7 @@ mod trace {
                 ("stack_region", self.regions.stack),
                 ("alias_region", self.regions.alias),
                 ("heap_region", self.regions.heap),
-                ("aslr_region", self.regions.code),
+                (ASLR_REGION, self.regions.code),
             ];
             regions
                 .into_iter()
@@ -164,38 +215,117 @@ mod trace {
                 .map(|(name, region)| format!("{name}+{:#x}", address - region.start))
                 .ok_or_else(|| format!("address {address:#x} lies in no known region"))
         }
+
+        /// Whether libnx may place a shared memory at `address`: in the ASLR region, outside
+        /// the module (its last address included, as [`Anchors::symbol`] counts it), the alias
+        /// region and the heap region (see the module docs).
+        fn placeable(&self, address: u64) -> bool {
+            self.regions.code.holds(address, 1)
+                && !(self.main.start..=self.main.end).contains(&address)
+                && !self.regions.alias.holds(address, 1)
+                && !self.regions.heap.holds(address, 1)
+        }
     }
 
-    /// The pairing of the reference's handle values with the run's (see the module docs).
+    /// A one-to-one pairing of the reference's names for things (handle values, placements)
+    /// with the run's values (see the module docs).
     #[derive(Debug, Default)]
-    struct Handles {
+    struct Pairing {
         ours: BTreeMap<u64, String>,
         theirs: BTreeMap<String, u64>,
     }
 
-    impl Handles {
+    impl Pairing {
+        /// The reference name the run's `ours` is paired with, if it is.
+        fn get(&self, ours: u64) -> Option<&str> {
+            self.ours.get(&ours).map(String::as_str)
+        }
+
+        /// The run's value the reference name `theirs` is paired with, if it is.
+        fn ours_for(&self, theirs: &str) -> Option<u64> {
+            self.theirs.get(theirs).copied()
+        }
+
+        /// Pairs `ours` with `theirs` if neither is paired yet; whether it did.
+        fn pair(&mut self, ours: u64, theirs: &str) -> bool {
+            if self.ours.contains_key(&ours) || self.theirs.contains_key(theirs) {
+                return false;
+            }
+            self.ours.insert(ours, theirs.to_owned());
+            self.theirs.insert(theirs.to_owned(), ours);
+            true
+        }
+    }
+
+    /// What a comparison has paired so far.
+    #[derive(Debug, Default)]
+    struct Pairings {
+        /// The reference's handle values with the run's handles.
+        handles: Pairing,
+        /// The reference's placements with the run's anchors for them.
+        placements: Pairing,
+    }
+
+    impl Pairings {
         /// The run's handle `ours`, written as the reference handle it stands for. `expected` is
         /// the value the reference has in its place, which pairs the two the first time either
-        /// is seen.
-        fn text(&mut self, ours: u64, expected: Option<&str>) -> String {
-            let literal = format!("{ours:#x}");
+        /// is seen. A handle that cannot be paired is written `unpaired <value>`, which no
+        /// reference line has.
+        fn handle(&mut self, ours: u64, expected: Option<&str>) -> String {
             if ours == 0 || Handle::from_register(ours).is_pseudo() {
-                return literal;
+                return format!("{ours:#x}");
             }
-            if let Some(paired) = self.ours.get(&ours) {
-                return paired.clone();
+            if let Some(paired) = self.handles.get(ours) {
+                return paired.to_owned();
             }
-            let Some(expected) = expected else {
-                return literal;
-            };
-            if self.theirs.contains_key(expected) {
-                // The reference handle already stands for another of ours.
-                return literal;
+            match expected {
+                Some(expected) if self.handles.pair(ours, expected) => expected.to_owned(),
+                // Nothing to pair with, or the reference handle stands for another of ours.
+                _ => format!("unpaired {ours:#x}"),
             }
-            self.ours.insert(ours, expected.to_owned());
-            self.theirs.insert(expected.to_owned(), ours);
-            expected.to_owned()
         }
+
+        /// The run's address `ours`, written as the reference would: in a placement it is
+        /// paired with (or is paired with now, if `expected` names a placement and `ours` lies
+        /// where a placement may), or else in the module or a region.
+        fn address(
+            &mut self,
+            ours: u64,
+            expected: Option<&str>,
+            anchors: &Anchors,
+        ) -> Result<String, String> {
+            let symbol = anchors.symbol(ours)?;
+            let Some((name, offset)) = expected.and_then(placement) else {
+                return Ok(symbol);
+            };
+            // The anchor the run's placement has if this address is where the reference's is.
+            let Some(base) = ours.checked_sub(offset) else {
+                return Ok(symbol);
+            };
+            let placeable = anchors.placeable(ours) && anchors.placeable(base);
+            match self.placements.ours_for(name) {
+                Some(paired) => Ok(match ours.checked_sub(paired) {
+                    Some(offset) => format!("{name}+{offset:#x}"),
+                    None => symbol,
+                }),
+                None if placeable && self.placements.pair(base, name) => {
+                    Ok(format!("{name}+{offset:#x}"))
+                }
+                None => Ok(symbol),
+            }
+        }
+    }
+
+    /// A reference address that is in a placement, as (placement, offset):
+    /// `placement2+0x1000` is `("placement2", 0x1000)`.
+    fn placement(text: &str) -> Option<(&str, u64)> {
+        let (name, offset) = text.split_once('+')?;
+        let index = name.strip_prefix(PLACEMENT)?;
+        if index.is_empty() || !index.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        let offset = u64::from_str_radix(offset.strip_prefix("0x")?, 16).ok()?;
+        Some((name, offset))
     }
 
     /// The value a reference line gives argument `name`: `name=<value>` inside the parentheses.
@@ -214,7 +344,7 @@ mod trace {
         number: u32,
         args: &[u64; SVC_ARG_COUNT],
         anchors: &Anchors,
-        handles: &mut Handles,
+        pairings: &mut Pairings,
         expected: &str,
     ) -> Result<String, String> {
         let id = u16::try_from(number)
@@ -232,9 +362,9 @@ mod trace {
         for input in convention.inputs {
             let value = args[usize::from(input.reg)];
             let text = if addresses.contains(&input.name) {
-                anchors.symbol(value)?
+                pairings.address(value, argument(expected, input.name), anchors)?
             } else if input.kind == Kind::Handle {
-                handles.text(value, argument(expected, input.name))
+                pairings.handle(value, argument(expected, input.name))
             } else {
                 format!("{value:#x}")
             };
@@ -247,6 +377,9 @@ mod trace {
         ))
     }
 
+    /// The services whose command tables starquake has, in the order of their numbers.
+    const SERVICES: [ServiceId; 2] = [SM, SET_SYS];
+
     /// The interface whose command table names a service's commands.
     fn interface(service: ServiceId) -> Option<Box<dyn Session>> {
         match service {
@@ -254,6 +387,13 @@ mod trace {
             SET_SYS => Some(Box::new(SetSys)),
             _ => None,
         }
+    }
+
+    /// The number of the service starquake registered under `name`, if it has it.
+    fn service_id(name: &str) -> Option<ServiceId> {
+        SERVICES
+            .into_iter()
+            .find(|service| service_name(*service) == Some(name))
     }
 
     /// A command table's name (a method's, `get_service`) in the reference's case
@@ -269,15 +409,31 @@ mod trace {
             .collect()
     }
 
-    /// The reference's lines, without its comments and without each call's outputs, with every
-    /// control request (`IpcController::3`) written as a request to the service the next
-    /// non-control request goes to, and its command's name kept apart:
-    /// `(line, Some(name))` for a request.
-    fn reference() -> Vec<(String, Option<String>)> {
-        let lines: Vec<&str> = REFERENCE
+    /// The reference's lines, without its comments.
+    fn raw_lines(fixture: &Fixture) -> Vec<&'static str> {
+        fixture
+            .reference
             .lines()
             .filter(|line| !line.starts_with('#'))
-            .collect();
+            .collect()
+    }
+
+    /// A reference request line's parts: `ipc sm:::1 (GetService)` is `("sm:", "1",
+    /// "GetService")`.
+    fn request_parts(request: &str) -> (&str, &str, &str) {
+        let (target, name) = request.split_once(" (").expect("a named request");
+        let name = name.strip_suffix(')').expect("a closing parenthesis");
+        let (service, command) = target.rsplit_once("::").expect("service::command");
+        (service, command, name)
+    }
+
+    /// The reference's lines, without its comments and without each call's outputs, with every
+    /// control request (`IpcController::<id>`) written as a request to the service the next
+    /// non-control request goes to, and its command's name kept apart:
+    /// `(line, Some(name))` for a request. A control request with no other request after it is
+    /// an error naming its line (counted from 0, without the comments).
+    fn reference(fixture: &Fixture) -> Result<Vec<(String, Option<String>)>, String> {
+        let lines = raw_lines(fixture);
         let mut out = Vec::new();
         for (index, line) in lines.iter().enumerate() {
             if let Some(call) = line.strip_prefix("svc ") {
@@ -291,16 +447,19 @@ mod trace {
                 };
                 out.push((text, None));
             } else if let Some(request) = line.strip_prefix("ipc ") {
-                let (target, name) = request.split_once(" (").expect("a named request");
-                let name = name.strip_suffix(')').expect("a closing parenthesis");
-                let (service, command) = target.rsplit_once("::").expect("service::command");
+                let (service, command, name) = request_parts(request);
                 let service = if service == CONTROL_INTERFACE {
                     lines[index + 1..]
                         .iter()
                         .filter_map(|line| line.strip_prefix("ipc "))
-                        .map(|next| next.rsplit_once("::").expect("service::command").0)
+                        .map(|next| request_parts(next).0)
                         .find(|next| *next != CONTROL_INTERFACE)
-                        .expect("a request after the control request")
+                        .ok_or_else(|| {
+                            format!(
+                                "line {index}: the control request `{line}` has no request \
+                                 after it"
+                            )
+                        })?
                 } else {
                     service
                 };
@@ -309,14 +468,14 @@ mod trace {
                 out.push(((*line).to_owned(), None));
             }
         }
-        out
+        Ok(out)
     }
 
     /// One line of the run, written as the reference writes it.
     fn text(
         line: &Line,
         anchors: &Anchors,
-        handles: &mut Handles,
+        pairings: &mut Pairings,
         expected: &str,
     ) -> Result<String, String> {
         match *line {
@@ -325,7 +484,7 @@ mod trace {
                 args,
                 result,
             } => {
-                let call = call_text(number, &args, anchors, handles, expected)?;
+                let call = call_text(number, &args, anchors, pairings, expected)?;
                 if number == u32::from(SvcId::ExitProcess.number()) {
                     // The reference never saw it return.
                     return Ok(call);
@@ -338,10 +497,11 @@ mod trace {
                 Ok(format!("ipc {name}::{command}"))
             }
             Line::Log { len, hash } => {
-                // The reference's text, if it is this line's: an event keeps only the
-                // length and the hash.
-                let text = expected.strip_prefix("log ").unwrap_or_default();
-                if EventKind::guest_log(text.as_bytes()) == (EventKind::GuestLog { len, hash }) {
+                // The reference's text, if the reference has a log line here and it is this
+                // line's: an event keeps only the length and the hash.
+                if let Some(text) = expected.strip_prefix("log ")
+                    && EventKind::guest_log(text.as_bytes()) == (EventKind::GuestLog { len, hash })
+                {
                     return Ok(expected.to_owned());
                 }
                 Ok(format!("log len={len} hash={hash:#x}"))
@@ -372,52 +532,94 @@ mod trace {
         }
     }
 
-    /// Compares a run's lines with the reference's, in order, through `ExitProcess`. The error
-    /// names the first line that differs.
-    fn compare(ours: &[Line], anchors: &Anchors) -> Result<(), String> {
-        let expected = reference();
-        let raw: Vec<&str> = REFERENCE
-            .lines()
-            .filter(|line| !line.starts_with('#'))
-            .collect();
-        let mut handles = Handles::default();
+    /// How far a run matches a reference.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct Progress {
+        /// How many of the reference's lines the run matches, from the first.
+        matched: usize,
+        /// The first difference, naming its line (counted from 0, without the comments), or
+        /// `None` if the run matches the whole reference and stops where it does.
+        difference: Option<String>,
+    }
+
+    /// Compares a run's lines with a fixture's reference, in order, until the first that
+    /// differs.
+    fn progress(fixture: &Fixture, ours: &[Line], anchors: &Anchors) -> Progress {
+        let stop = |matched: usize, difference: String| Progress {
+            matched,
+            difference: Some(difference),
+        };
+        // A reference that cannot be read matches nothing.
+        let expected = match reference(fixture) {
+            Ok(expected) => expected,
+            Err(error) => return stop(0, error),
+        };
+        let raw = raw_lines(fixture);
+        let mut pairings = Pairings::default();
         for (index, (expected, name)) in expected.iter().enumerate() {
             let Some(line) = ours.get(index) else {
-                return Err(format!(
-                    "line {index}: expected `{expected}`, and the run has no more lines"
-                ));
+                return stop(
+                    index,
+                    format!("line {index}: expected `{expected}`, and the run has no more lines"),
+                );
             };
-            let found = text(line, anchors, &mut handles, expected)
-                .map_err(|error| format!("line {index}: {error}"))?;
+            let found = match text(line, anchors, &mut pairings, expected) {
+                Ok(found) => found,
+                Err(error) => return stop(index, format!("line {index}: {error}")),
+            };
             if found != *expected {
-                return Err(format!(
-                    "line {index}: expected `{expected}`, found `{found}`"
-                ));
+                return stop(
+                    index,
+                    format!("line {index}: expected `{expected}`, found `{found}`"),
+                );
             }
             if let Some(name) = name {
                 let control = raw[index].starts_with(&format!("ipc {CONTROL_INTERFACE}::"));
-                check_name(line, name, control)
-                    .map_err(|error| format!("line {index}: {error}"))?;
+                if let Err(error) = check_name(line, name, control) {
+                    return stop(index, format!("line {index}: {error}"));
+                }
             }
         }
         if ours.len() > expected.len() {
-            return Err(format!(
-                "line {}: the run goes on after the reference's last line",
-                expected.len()
-            ));
+            return stop(
+                expected.len(),
+                format!(
+                    "line {}: the run goes on after the reference's last line",
+                    expected.len()
+                ),
+            );
         }
-        Ok(())
+        Progress {
+            matched: expected.len(),
+            difference: None,
+        }
     }
 
-    /// The size of the fixture's image, from its header.
-    fn image_size() -> u64 {
-        let word: [u8; 4] = HELLO[NRO_IMAGE_SIZE_OFFSET..NRO_IMAGE_SIZE_OFFSET + 4]
-            .try_into()
-            .expect("four bytes");
-        u64::from(u32::from_le_bytes(word))
+    /// Compares a run's lines with a fixture's reference, in order, through its last line. The
+    /// error names the first line that differs.
+    fn compare(fixture: &Fixture, ours: &[Line], anchors: &Anchors) -> Result<(), String> {
+        match progress(fixture, ours, anchors).difference {
+            Some(difference) => Err(difference),
+            None => Ok(()),
+        }
     }
 
-    /// The text of `static const char <name>[] = "...";` in the fixture's source.
+    /// How far a fixture's module reaches past its base, to libnx's `__argdata__`, the address
+    /// start-up asks `QueryMemory` about (`libnx/nx/source/runtime/argv.c`), which libnx's linker
+    /// script puts at the first page boundary after `.bss` (`libnx/nx/switch.ld`): the image and
+    /// `.bss` sizes of its NRO header, each rounded up to a page, the same rule as
+    /// `tools/oracle/normalise.py`. For both fixtures this ends exactly at `__argdata__`
+    /// (checked against each ELF's symbol table); for other NROs that is a guess. It is not the
+    /// extent Eden maps: Eden's `LoadNroImpl` takes `.bss` from the `MOD0` header every libnx
+    /// NRO has (`eden/src/core/loader/nro.cpp`), which maps one page of `.bss` more for both
+    /// fixtures (`normalise.py`'s module docs give the sizes).
+    fn module_extent(fixture: &Fixture) -> u64 {
+        let nro = Nro::parse(fixture.nro).expect("the fixture parses");
+        let page_up = |size: u32| u64::from(size).next_multiple_of(PAGE_SIZE);
+        page_up(nro.size) + page_up(nro.bss_size)
+    }
+
+    /// The text of `static const char <name>[] = "...";` in the hello fixture's source.
     fn source_string(name: &str) -> &'static str {
         let declaration = format!("static const char {name}[] = \"");
         let (_, rest) = HELLO_SOURCE
@@ -426,12 +628,139 @@ mod trace {
         rest.split_once('"').expect("a closing quote").0
     }
 
-    /// The comparison against made-up runs, on every host.
+    // ----- The gap list ---------------------------------------------------------------------
+
+    /// One system call or service command a reference shows that starquake does not implement.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct Gap {
+        /// The line of the trace file (counted from 1, its comment lines included) where it is
+        /// first used.
+        line: usize,
+        /// The call (`svc 0x18 WaitSynchronization`) or the request
+        /// (`ipc apm::0 (OpenSession)`).
+        what: String,
+        /// What the reference returned there: the call's result (`none` for a call without
+        /// one), or, for a request, the result of the `SendSyncRequest` that carried it.
+        result: String,
+    }
+
+    /// Whether starquake implements a system call: its status is
+    /// [`Status::Implemented`].
+    fn implements_call(number: u16) -> bool {
+        SvcId::from_number(number).is_some_and(|id| id.status() == Status::Implemented)
+    }
+
+    /// Whether starquake implements a request: a control command the framework's table names
+    /// the same, or a command of a service starquake has, whose table names it the same.
+    fn implements_request(service: &str, command: u32, name: &str) -> bool {
+        if service == CONTROL_INTERFACE {
+            // Any service will do: the control table is the framework's.
+            return check_name(
+                &Line::Ipc {
+                    service: SM,
+                    command,
+                },
+                name,
+                true,
+            )
+            .is_ok();
+        }
+        service_id(service).is_some_and(|id| {
+            check_name(
+                &Line::Ipc {
+                    service: id,
+                    command,
+                },
+                name,
+                false,
+            )
+            .is_ok()
+        })
+    }
+
+    /// The result on a reference `svc` line: `0x0` in `... -> 0x0 out=...`, or `none`.
+    fn result_of(line: &str) -> String {
+        line.split_once(" -> ")
+            .and_then(|(_, rest)| rest.split(' ').next())
+            .unwrap_or("none")
+            .to_owned()
+    }
+
+    /// Every system call and request in `fixture`'s reference that starquake does not
+    /// implement, once each, in the order of first use.
+    fn gaps(fixture: &Fixture) -> Vec<Gap> {
+        let send = format!("svc {:#04x} ", SvcId::SendSyncRequest.number());
+        let lines: Vec<(usize, &str)> = fixture
+            .reference
+            .lines()
+            .enumerate()
+            .map(|(index, line)| (index + 1, line))
+            .filter(|(_, line)| !line.starts_with('#'))
+            .collect();
+        let mut seen = std::collections::BTreeSet::new();
+        let mut gaps = Vec::new();
+        for (position, (number, line)) in lines.iter().enumerate() {
+            let gap = if let Some(call) = line.strip_prefix("svc ") {
+                let (id, rest) = call.split_once(' ').expect("svc <number> <call>");
+                let id = u16::from_str_radix(id.trim_start_matches("0x"), 16).expect("a number");
+                let name = rest.split_once('(').expect("an argument list").0;
+                (!implements_call(id)).then(|| (format!("svc {id:#04x} {name}"), result_of(line)))
+            } else if let Some(request) = line.strip_prefix("ipc ") {
+                let (service, command, name) = request_parts(request);
+                let id: u32 = command.parse().expect("a command id");
+                let result = lines[position + 1..]
+                    .iter()
+                    .find(|(_, next)| next.starts_with(&send))
+                    .map_or_else(|| "none".to_owned(), |(_, next)| result_of(next));
+                (!implements_request(service, id, name)).then(|| ((*line).to_owned(), result))
+            } else {
+                None
+            };
+            if let Some((what, result)) = gap
+                && seen.insert(what.clone())
+            {
+                gaps.push(Gap {
+                    line: *number,
+                    what,
+                    result,
+                });
+            }
+        }
+        gaps
+    }
+
+    /// The first line of the gap list's block in a README.
+    const GAPS_BEGIN: &str = "<!-- gap list: written by crates/core/tests/homebrew.rs -->";
+    /// The last line of the gap list's block in a README.
+    const GAPS_END: &str = "<!-- end of the gap list -->";
+
+    /// The gap list as a README carries it, between [`GAPS_BEGIN`] and [`GAPS_END`].
+    fn gap_table(gaps: &[Gap]) -> String {
+        let mut table =
+            String::from("| Line | Call or request | Reference's result |\n|---:|---|---|\n");
+        for gap in gaps {
+            writeln!(
+                table,
+                "| {} | `{}` | `{}` |",
+                gap.line, gap.what, gap.result
+            )
+            .expect("writing to a string");
+        }
+        table
+    }
+
+    /// The text between [`GAPS_BEGIN`] and [`GAPS_END`] in `readme`.
+    fn gap_block(readme: &str) -> Option<&str> {
+        let (_, rest) = readme.split_once(&format!("{GAPS_BEGIN}\n"))?;
+        let (block, _) = rest.split_once(GAPS_END)?;
+        Some(block)
+    }
+
+    /// The comparison and the gap list against made-up runs and traces, on every host.
     #[cfg(test)]
     mod comparison {
         use starquake_kernel::memory::GUARD_PAGES;
         use starquake_kernel::result::KernelError;
-        use starquake_memory::PAGE_SIZE;
 
         use super::*;
 
@@ -444,7 +773,11 @@ mod trace {
         const SET_HANDLE: u64 = 0x4_0012;
 
         fn anchors() -> Anchors {
-            Anchors::new(BASE, image_size(), image_size() + PAGE_SIZE)
+            Anchors::new(
+                BASE,
+                module_extent(&HELLO),
+                module_extent(&HELLO) + PAGE_SIZE,
+            )
         }
 
         fn call(id: SvcId, registers: &[(usize, u64)], result: u32) -> Line {
@@ -506,7 +839,7 @@ mod trace {
                 call(SvcId::QueryMemory, &[(0, buffer), (2, buffer)], 0),
                 call(
                     SvcId::QueryMemory,
-                    &[(0, buffer), (2, BASE + image_size())],
+                    &[(0, buffer), (2, BASE + module_extent(&HELLO))],
                     0,
                 ),
                 call(SvcId::ConnectToNamedPort, &[(1, BASE + 0x3148)], 0),
@@ -536,22 +869,25 @@ mod trace {
         }
 
         fn failure(lines: &[Line]) -> String {
-            compare(lines, &anchors()).unwrap_err()
+            compare(&HELLO, lines, &anchors()).unwrap_err()
         }
 
         #[test]
         fn a_run_that_does_what_the_reference_did_passes() {
-            assert_eq!(compare(&matching(), &anchors()), Ok(()));
+            assert_eq!(compare(&HELLO, &matching(), &anchors()), Ok(()));
             // The reference's 38 lines: 17 calls up to the port; five requests, each with its
             // `SendSyncRequest`; two close requests and their `CloseHandle`s; three log lines,
             // each with its `OutputDebugString`; and the exit.
-            assert_eq!(matching().len(), reference().len());
-            assert_eq!(reference().len(), 17 + 5 * 2 + 2 * 2 + 3 * 2 + 1);
+            assert_eq!(matching().len(), reference(&HELLO).unwrap().len());
+            assert_eq!(
+                reference(&HELLO).unwrap().len(),
+                17 + 5 * 2 + 2 * 2 + 3 * 2 + 1
+            );
         }
 
         #[test]
         fn the_reference_is_read_as_the_module_docs_say() {
-            let lines = reference();
+            let lines = reference(&HELLO).unwrap();
             // A control request goes to the service of the next request after it.
             assert_eq!(
                 lines[17],
@@ -584,10 +920,57 @@ mod trace {
         }
 
         #[test]
+        fn the_startup_reference_is_read_the_same_way() {
+            let lines = reference(&STARTUP).unwrap();
+            // A control request other than `QueryPointerBufferSize` goes to the next service
+            // too: `ConvertCurrentObjectToDomain` before `appletOE`'s `OpenApplicationProxy`.
+            let index = lines
+                .iter()
+                .position(|(_, name)| name.as_deref() == Some("ConvertCurrentObjectToDomain"))
+                .unwrap();
+            assert_eq!(lines[index].0, "ipc appletOE::0");
+            assert_eq!(
+                lines[index + 2],
+                (
+                    "ipc appletOE::0".to_owned(),
+                    Some("OpenApplicationProxy".to_owned())
+                )
+            );
+            // A control request followed by another control request goes past it, to the
+            // next request that is not one: `QueryPointerBufferSize` before the conversion, and
+            // the two `CloneCurrentObject`s before `fsp-srv`'s `OpenSdCardFileSystem`.
+            assert_eq!(
+                lines[index - 2],
+                (
+                    "ipc appletOE::3".to_owned(),
+                    Some("QueryPointerBufferSize".to_owned())
+                )
+            );
+            let clones: Vec<&str> = lines
+                .iter()
+                .filter(|(_, name)| name.as_deref() == Some("CloneCurrentObject"))
+                .map(|(line, _)| line.as_str())
+                .collect();
+            assert_eq!(clones, ["ipc fsp-srv::2", "ipc fsp-srv::2"]);
+            // A random answer is an output, so it is dropped like the others.
+            assert!(lines.iter().any(|(line, _)| line
+                == "svc 0x29 GetInfo(info_type=0xb, handle=0x0, info_subtype=0x0) -> 0x0"));
+            // The run ends with the request that ends the process.
+            assert_eq!(
+                lines.last().unwrap().0,
+                "svc 0x21 SendSyncRequest(session_handle=0x303fb) -> 0x7601"
+            );
+        }
+
+        #[test]
         fn where_the_module_and_the_regions_are_does_not_matter() {
             // The same run with the module where the reference emulator put it in one of its
             // runs: every address moves with its anchor.
-            let moved = Anchors::new(0x80c0_1000, image_size(), image_size() + PAGE_SIZE);
+            let moved = Anchors::new(
+                0x80c0_1000,
+                module_extent(&HELLO),
+                module_extent(&HELLO) + PAGE_SIZE,
+            );
             let here = anchors();
             let shift = |address: u64| {
                 if (here.main.start..=here.main.end).contains(&address) {
@@ -621,9 +1004,9 @@ mod trace {
                 })
                 .collect();
             assert_ne!(lines, matching());
-            assert_eq!(compare(&lines, &moved), Ok(()));
+            assert_eq!(compare(&HELLO, &lines, &moved), Ok(()));
             // Against the wrong anchors the same run fails at its first address.
-            assert!(compare(&lines, &here).is_err());
+            assert!(compare(&HELLO, &lines, &here).is_err());
         }
 
         #[test]
@@ -716,6 +1099,39 @@ mod trace {
                 ),
                 "{found}"
             );
+            // A line of the same length: the hash tells them apart.
+            assert_eq!(
+                source_string("LINE_TWO").len(),
+                source_string("LINE_ONE").len()
+            );
+            let mut lines = matching();
+            lines[21] = log("LINE_TWO");
+            let Line::Log { len, hash } = lines[21] else {
+                unreachable!()
+            };
+            assert_eq!(
+                failure(&lines),
+                format!(
+                    "line 21: expected `log starquake hello: line one`, found `log len={len} \
+                     hash={hash:#x}`"
+                )
+            );
+        }
+
+        #[test]
+        fn an_empty_log_line_does_not_match_a_line_of_another_kind() {
+            let EventKind::GuestLog { len, hash } = EventKind::guest_log(b"") else {
+                unreachable!("a guest log event")
+            };
+            let mut lines = matching();
+            lines[0] = Line::Log { len, hash };
+            assert_eq!(
+                failure(&lines),
+                format!(
+                    "line 0: expected `svc 0x02 SetMemoryPermission(address=main+0x4000, \
+                     size=0x1000, perm=0x1) -> 0x0`, found `log len={len} hash={hash:#x}`"
+                )
+            );
         }
 
         #[test]
@@ -732,6 +1148,20 @@ mod trace {
             let mut lines = matching();
             lines[20] = call(SvcId::SendSyncRequest, &[(0, 0x6_0013)], 0);
             assert!(failure(&lines).starts_with("line 20: expected"));
+            // A second handle whose value is the reference's value for the first one: it is
+            // not paired, so it must not read as that value.
+            let expected = &reference(&HELLO).unwrap()[20].0;
+            let theirs = argument(expected, "session_handle").unwrap();
+            let theirs = u64::from_str_radix(theirs.strip_prefix("0x").unwrap(), 16).unwrap();
+            let mut lines = matching();
+            lines[20] = call(SvcId::SendSyncRequest, &[(0, theirs)], 0);
+            assert_eq!(
+                failure(&lines),
+                format!(
+                    "line 20: expected `{expected}`, found `svc 0x21 \
+                     SendSyncRequest(session_handle=unpaired {theirs:#x}) -> 0x0`"
+                )
+            );
         }
 
         #[test]
@@ -825,13 +1255,456 @@ mod trace {
                 "starquake hello: set:sys firmware version ok"
             );
         }
+
+        // ----- How far a run gets ---------------------------------------------------------
+
+        #[test]
+        fn progress_counts_the_lines_before_the_first_difference() {
+            let all = reference(&HELLO).unwrap().len();
+            assert_eq!(
+                progress(&HELLO, &matching(), &anchors()),
+                Progress {
+                    matched: all,
+                    difference: None
+                }
+            );
+            // A run that stops after a line, at the last line, and one that differs at the first.
+            for stop in [1, all - 1] {
+                let progress = progress(&HELLO, &matching()[..stop], &anchors());
+                assert_eq!(progress.matched, stop);
+                assert!(
+                    progress
+                        .difference
+                        .unwrap()
+                        .ends_with("and the run has no more lines")
+                );
+            }
+            let mut lines = matching();
+            lines[0] = ipc(SM, 0);
+            assert_eq!(
+                progress(&HELLO, &lines, &anchors()),
+                Progress {
+                    matched: 0,
+                    difference: Some(
+                        "line 0: expected `svc 0x02 SetMemoryPermission(address=main+0x4000, \
+                         size=0x1000, perm=0x1) -> 0x0`, found `ipc sm:::0`"
+                            .to_owned()
+                    )
+                }
+            );
+            // A command the reference names differently from starquake's table stops it at that
+            // line too, though the line's text matches.
+            let renamed = Fixture {
+                nro: HELLO.nro,
+                reference: "ipc sm:::0 (Initialize)\nipc sm:::1 (Initialize)\n",
+            };
+            assert_eq!(
+                progress(&renamed, &[ipc(SM, 0), ipc(SM, 1)], &anchors()),
+                Progress {
+                    matched: 1,
+                    difference: Some(
+                        "line 1: the reference calls command 1 Initialize, starquake \
+                         Some(\"GetService\")"
+                            .to_owned()
+                    )
+                }
+            );
+            // A line the comparison cannot write stops it at that line, with the lines before
+            // it matched.
+            for at in [0, 5] {
+                let mut lines = matching();
+                lines[at] = Line::Svc {
+                    number: 0x7777,
+                    args: [0; SVC_ARG_COUNT],
+                    result: 0,
+                };
+                assert_eq!(
+                    progress(&HELLO, &lines, &anchors()),
+                    Progress {
+                        matched: at,
+                        difference: Some(format!("line {at}: svc 0x7777 is not a listed call"))
+                    }
+                );
+            }
+            // A run that goes on matches every line and still differs.
+            let mut lines = matching();
+            lines.push(ipc(SM, 0));
+            let progress = progress(&HELLO, &lines, &anchors());
+            assert_eq!(progress.matched, all);
+            assert!(progress.difference.is_some());
+        }
+
+        #[test]
+        fn a_reference_that_ends_with_a_control_request_differs_at_that_line() {
+            let truncated = Fixture {
+                nro: HELLO.nro,
+                reference: "ipc sm:::0 (Initialize)\n\
+                    ipc IpcController::3 (QueryPointerBufferSize)\n",
+            };
+            assert_eq!(
+                progress(&truncated, &[ipc(SM, 0), ipc(SM, 3)], &anchors()),
+                Progress {
+                    matched: 0,
+                    difference: Some(
+                        "line 1: the control request `ipc IpcController::3 \
+                         (QueryPointerBufferSize)` has no request after it"
+                            .to_owned()
+                    )
+                }
+            );
+        }
+
+        #[test]
+        fn the_ratchet_is_inside_the_startup_reference() {
+            assert!(STARTUP_MATCHED <= reference(&STARTUP).unwrap().len());
+        }
+
+        // ----- Placements -----------------------------------------------------------------
+
+        /// A made-up reference that probes and maps two placements, with the hello fixture's
+        /// module.
+        const PLACED: Fixture = Fixture {
+            nro: HELLO.nro,
+            reference: "# comment\n\
+                svc 0x06 QueryMemory(out_memory_info=stack_region+0x0, address=placement1+0x0) -> 0x0\n\
+                svc 0x13 MapSharedMemory(shmem_handle=0x583f6, address=placement1+0x1000, size=0x40000, map_perm=0x1) -> 0x0\n\
+                svc 0x13 MapSharedMemory(shmem_handle=0x903ef, address=placement2+0x1000, size=0x1000, map_perm=0x1) -> 0x0\n\
+                svc 0x14 UnmapSharedMemory(shmem_handle=0x583f6, address=placement1+0x1000, size=0x40000) -> 0x0\n",
+        };
+
+        /// Where the made-up runs put the two placements: in the ASLR region, far above the
+        /// module and below the other regions.
+        fn placed(first: u64, second: u64) -> Vec<Line> {
+            let stack = anchors().regions.stack.start;
+            vec![
+                call(SvcId::QueryMemory, &[(0, stack), (2, first)], 0),
+                call(
+                    SvcId::MapSharedMemory,
+                    &[(0, 0x1_0001), (1, first + 0x1000), (2, 0x4_0000), (3, 1)],
+                    0,
+                ),
+                call(
+                    SvcId::MapSharedMemory,
+                    &[(0, 0x1_0002), (1, second + 0x1000), (2, 0x1000), (3, 1)],
+                    0,
+                ),
+                call(
+                    SvcId::UnmapSharedMemory,
+                    &[(0, 0x1_0001), (1, first + 0x1000), (2, 0x4_0000)],
+                    0,
+                ),
+            ]
+        }
+
+        /// Two pages of the ASLR region that no other region and not the module holds.
+        fn free_pages() -> (u64, u64) {
+            let anchors = anchors();
+            let first = anchors.main.end.next_multiple_of(PAGE_SIZE) + 0x10_0000;
+            let second = first + 0x10_0000;
+            for page in [first, second] {
+                assert!(
+                    anchors
+                        .symbol(page)
+                        .unwrap()
+                        .starts_with(&format!("{ASLR_REGION}+"))
+                );
+            }
+            (first, second)
+        }
+
+        #[test]
+        fn a_placement_is_paired_where_the_reference_first_names_it() {
+            let (first, second) = free_pages();
+            assert_eq!(compare(&PLACED, &placed(first, second), &anchors()), Ok(()));
+            // The same two placements, the other way round: each is paired on first use.
+            assert_eq!(compare(&PLACED, &placed(second, first), &anchors()), Ok(()));
+        }
+
+        #[test]
+        fn a_placement_must_stay_where_it_was_paired() {
+            let (first, second) = free_pages();
+            // The unmap at another page than the probe and the map paired.
+            let mut lines = placed(first, second);
+            let Line::Svc { args, .. } = &mut lines[3] else {
+                unreachable!()
+            };
+            args[1] += PAGE_SIZE;
+            assert_eq!(
+                compare(&PLACED, &lines, &anchors()),
+                Err(
+                    "line 3: expected `svc 0x14 UnmapSharedMemory(shmem_handle=0x583f6, \
+                     address=placement1+0x1000, size=0x40000) -> 0x0`, found `svc 0x14 \
+                     UnmapSharedMemory(shmem_handle=0x583f6, address=placement1+0x2000, \
+                     size=0x40000) -> 0x0`"
+                        .to_owned()
+                )
+            );
+            // The map below the probe that paired it.
+            let mut lines = placed(first, second);
+            let Line::Svc { args, .. } = &mut lines[1] else {
+                unreachable!()
+            };
+            args[1] = first - PAGE_SIZE;
+            let below = first - PAGE_SIZE - anchors().regions.code.start;
+            assert_eq!(
+                compare(&PLACED, &lines, &anchors()),
+                Err(format!(
+                    "line 1: expected `svc 0x13 MapSharedMemory(shmem_handle=0x583f6, \
+                     address=placement1+0x1000, size=0x40000, map_perm=0x1) -> 0x0`, found `svc \
+                     0x13 MapSharedMemory(shmem_handle=0x583f6, address=aslr_region+{below:#x}, \
+                     size=0x40000, map_perm=0x1) -> 0x0`"
+                ))
+            );
+        }
+
+        #[test]
+        fn two_placements_cannot_share_a_page_of_the_run() {
+            let (first, _) = free_pages();
+            let offset = first - anchors().regions.code.start + 0x1000;
+            assert_eq!(
+                compare(&PLACED, &placed(first, first), &anchors()),
+                Err(format!(
+                    "line 2: expected `svc 0x13 MapSharedMemory(shmem_handle=0x903ef, \
+                     address=placement2+0x1000, size=0x1000, map_perm=0x1) -> 0x0`, found `svc \
+                     0x13 MapSharedMemory(shmem_handle=0x903ef, address=aslr_region+{offset:#x}, \
+                     size=0x1000, map_perm=0x1) -> 0x0`"
+                ))
+            );
+        }
+
+        #[test]
+        fn a_placement_is_not_paired_where_libnx_does_not_place_one() {
+            let (_, second) = free_pages();
+            // The probe and the map in the heap region, and in the module.
+            let heap = anchors().regions.heap.start;
+            let found = compare(&PLACED, &placed(heap, second), &anchors()).unwrap_err();
+            assert_eq!(
+                found,
+                "line 0: expected `svc 0x06 QueryMemory(out_memory_info=stack_region+0x0, \
+                 address=placement1+0x0) -> 0x0`, found `svc 0x06 \
+                 QueryMemory(out_memory_info=stack_region+0x0, address=heap_region+0x0) -> 0x0`"
+            );
+            let found = compare(&PLACED, &placed(BASE, second), &anchors()).unwrap_err();
+            assert!(found.ends_with("address=main+0x0) -> 0x0`"), "{found}");
+            // The second placement's map at `address`, against the made-up reference.
+            let (first, _) = free_pages();
+            let second_map_at = |address: u64| {
+                let mut lines = placed(first, second);
+                let Line::Svc { args, .. } = &mut lines[2] else {
+                    unreachable!()
+                };
+                args[1] = address;
+                compare(&PLACED, &lines, &anchors())
+            };
+            let refused = |found: &str| {
+                Err(format!(
+                    "line 2: expected `svc 0x13 MapSharedMemory(shmem_handle=0x903ef, \
+                     address=placement2+0x1000, size=0x1000, map_perm=0x1) -> 0x0`, found `svc \
+                     0x13 MapSharedMemory(shmem_handle=0x903ef, address={found}, \
+                     size=0x1000, map_perm=0x1) -> 0x0`"
+                ))
+            };
+            // At the alias region's first byte, whose page below (the placement's anchor) is in
+            // the stack region, where a placement may lie: the anchor would be placeable, the
+            // map is not.
+            let regions = anchors().regions;
+            assert!(
+                anchors()
+                    .symbol(regions.alias.start - PAGE_SIZE)
+                    .unwrap()
+                    .starts_with("stack_region+")
+            );
+            assert_eq!(
+                second_map_at(regions.alias.start),
+                refused("alias_region+0x0")
+            );
+            // At the heap region's end, the first byte past it: the map is in the ASLR region
+            // alone, its anchor is the heap's last page.
+            assert!(
+                anchors()
+                    .symbol(regions.heap.end)
+                    .unwrap()
+                    .starts_with(&format!("{ASLR_REGION}+"))
+            );
+            let offset = regions.heap.end - regions.code.start;
+            assert_eq!(
+                second_map_at(regions.heap.end),
+                refused(&format!("{ASLR_REGION}+{offset:#x}"))
+            );
+            // At the ASLR region's first byte: its anchor is the page below the region.
+            assert_eq!(
+                second_map_at(regions.code.start),
+                refused(&format!("{ASLR_REGION}+0x0"))
+            );
+            // The second placement's map just past the module, in the ASLR region, so that its
+            // anchor (a page lower) would be inside the module.
+            let (first, _) = free_pages();
+            let past = anchors().main.end + 1;
+            let mut lines = placed(first, second);
+            let Line::Svc { args, .. } = &mut lines[2] else {
+                unreachable!()
+            };
+            args[1] = past;
+            let offset = past - anchors().regions.code.start;
+            assert_eq!(
+                compare(&PLACED, &lines, &anchors()),
+                Err(format!(
+                    "line 2: expected `svc 0x13 MapSharedMemory(shmem_handle=0x903ef, \
+                     address=placement2+0x1000, size=0x1000, map_perm=0x1) -> 0x0`, found `svc \
+                     0x13 MapSharedMemory(shmem_handle=0x903ef, address=aslr_region+{offset:#x}, \
+                     size=0x1000, map_perm=0x1) -> 0x0`"
+                ))
+            );
+        }
+
+        #[test]
+        fn a_placement_may_lie_in_the_stack_region_and_next_to_the_heap() {
+            // libnx keeps a placement out of the alias and the heap region only
+            // (`_memregionFindRandom`), and the kernel lets a shared memory be mapped in the
+            // stack region: so a placement whose probe is the stack region's first page, one
+            // further in, and one whose probe is the first page past the heap region, pair.
+            let regions = anchors().regions;
+            let (_, second) = free_pages();
+            for first in [regions.stack.start, regions.stack.start + 0x10_0000] {
+                assert!(
+                    anchors()
+                        .symbol(first + PAGE_SIZE)
+                        .unwrap()
+                        .starts_with("stack_region+")
+                );
+                assert_eq!(
+                    compare(&PLACED, &placed(first, second), &anchors()),
+                    Ok(()),
+                    "{first:#x}"
+                );
+            }
+            assert_eq!(
+                compare(&PLACED, &placed(regions.heap.end, second), &anchors()),
+                Ok(())
+            );
+        }
+
+        #[test]
+        fn a_placement_name_is_read_only_from_a_placement_address() {
+            assert_eq!(placement("placement1+0x1000"), Some(("placement1", 0x1000)));
+            assert_eq!(placement("placement12+0x0"), Some(("placement12", 0)));
+            assert_eq!(placement("placement+0x0"), None);
+            assert_eq!(placement("placementx+0x0"), None);
+            assert_eq!(placement("aslr_region+0x1000"), None);
+            assert_eq!(placement("placement1+1000"), None);
+            assert_eq!(placement("placement1"), None);
+        }
     }
 
-    /// The fixture on a real vCPU.
+    /// The gap list against made-up traces, and the startup fixture's README against its trace.
+    #[cfg(test)]
+    mod gap_list {
+        use super::*;
+
+        /// A made-up trace with one line of each case.
+        const TRACE: &str = "# comment\n\
+            svc 0x29 GetInfo(info_type=0xb, handle=0x0, info_subtype=0x0) -> 0x0 out=random\n\
+            ipc IpcController::3 (QueryPointerBufferSize)\n\
+            svc 0x21 SendSyncRequest(session_handle=0x203fd) -> 0x0\n\
+            ipc apm::0 (OpenSession)\n\
+            svc 0x21 SendSyncRequest(session_handle=0x203fd) -> 0x0\n\
+            ipc sm:::1 (GetService)\n\
+            svc 0x21 SendSyncRequest(session_handle=0x103fe) -> 0x0\n\
+            ipc set:sys::3 (GetSettingsItemValue)\n\
+            svc 0x15 CreateTransferMemory(address=heap_region+0x1000, size=0x800000, map_perm=0x0) -> 0xd401\n\
+            svc 0x21 SendSyncRequest(session_handle=0x183fd) -> 0xf601\n\
+            svc 0x15 CreateTransferMemory(address=heap_region+0x1000, size=0x800000, map_perm=0x0) -> 0x0 out_handle=0xf03e3\n\
+            ipc apm::0 (OpenSession)\n\
+            svc 0x21 SendSyncRequest(session_handle=0x203fd) -> 0x0\n\
+            ipc IpcController::7 (Unheard)\n\
+            ipc nvdrv::3 (Initialize)\n";
+
+        fn made_up() -> Vec<Gap> {
+            gaps(&Fixture {
+                nro: HELLO.nro,
+                reference: TRACE,
+            })
+        }
+
+        fn gap(line: usize, what: &str, result: &str) -> Gap {
+            Gap {
+                line,
+                what: what.to_owned(),
+                result: result.to_owned(),
+            }
+        }
+
+        #[test]
+        fn what_starquake_lacks_is_listed_once_in_order_of_first_use() {
+            assert_eq!(
+                made_up(),
+                [
+                    // An implemented call (GetInfo), a control command the framework answers
+                    // and a command `sm:` has are not gaps.
+                    gap(5, "ipc apm::0 (OpenSession)", "0x0"),
+                    // A command id a service has under another name is one; a request's result
+                    // is its `SendSyncRequest`'s, past the calls in between.
+                    gap(9, "ipc set:sys::3 (GetSettingsItemValue)", "0xf601"),
+                    // A planned call, with the result of its first use.
+                    gap(10, "svc 0x15 CreateTransferMemory", "0xd401"),
+                    // A control command the framework does not have, and a request with no
+                    // `SendSyncRequest` after it.
+                    gap(15, "ipc IpcController::7 (Unheard)", "none"),
+                    gap(16, "ipc nvdrv::3 (Initialize)", "none"),
+                ]
+            );
+        }
+
+        #[test]
+        fn what_starquake_implements_is_decided_by_its_tables() {
+            assert!(implements_call(SvcId::GetInfo.number()));
+            assert!(!implements_call(SvcId::WaitSynchronization.number()));
+            assert!(!implements_call(0x7777));
+            assert!(implements_request(
+                CONTROL_INTERFACE,
+                3,
+                "QueryPointerBufferSize"
+            ));
+            assert!(!implements_request(CONTROL_INTERFACE, 3, "GetService"));
+            assert!(implements_request("sm:", 1, "GetService"));
+            assert!(!implements_request("sm:", 1, "Initialize"));
+            assert!(implements_request("set:sys", 3, "GetFirmwareVersion"));
+            assert!(!implements_request("apm", 0, "OpenSession"));
+            assert_eq!(service_id("set:sys"), Some(SET_SYS));
+            assert_eq!(service_id("apm"), None);
+        }
+
+        #[test]
+        fn the_table_has_one_row_per_gap() {
+            assert_eq!(
+                gap_table(&made_up()[..2]),
+                "| Line | Call or request | Reference's result |\n\
+                 |---:|---|---|\n\
+                 | 5 | `ipc apm::0 (OpenSession)` | `0x0` |\n\
+                 | 9 | `ipc set:sys::3 (GetSettingsItemValue)` | `0xf601` |\n"
+            );
+            let readme = format!("before\n{GAPS_BEGIN}\nthe block\n{GAPS_END}\nafter\n");
+            assert_eq!(gap_block(&readme), Some("the block\n"));
+            assert_eq!(gap_block("no block\n"), None);
+            assert_eq!(gap_block(&format!("{GAPS_BEGIN}\nunended\n")), None);
+        }
+
+        #[test]
+        fn the_startup_gap_list_in_its_readme_is_the_one_the_trace_gives() {
+            let expected = gap_table(&gaps(&STARTUP));
+            assert_eq!(
+                gap_block(STARTUP_README),
+                Some(expected.as_str()),
+                "tests/homebrew/startup/reference/README.md's gap list is not the one its trace \
+                 gives; replace the lines between its two markers with:\n{expected}"
+            );
+        }
+    }
+
+    /// The fixtures on a real vCPU.
     #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
     mod on_hardware {
         use starquake_core::{ExitReason, RunReport, exit_code};
-        use starquake_memory::PAGE_SIZE;
         use starquake_trace::Dump;
 
         use super::*;
@@ -847,8 +1720,8 @@ mod trace {
                 .collect()
         }
 
-        /// Where the run put the module, from its memory map.
-        fn anchors(report: &RunReport) -> Anchors {
+        /// Where the run of `fixture` put the module, from its memory map.
+        fn anchors(fixture: &Fixture, report: &RunReport) -> Anchors {
             let module: Vec<_> = report
                 .memory_map
                 .iter()
@@ -856,16 +1729,20 @@ mod trace {
                 .collect();
             let base = module.iter().map(|mapping| mapping.start).min().unwrap();
             let end = module.iter().map(|mapping| mapping.end).max().unwrap();
-            Anchors::new(base, image_size(), end.next_multiple_of(PAGE_SIZE) - base)
+            Anchors::new(
+                base,
+                module_extent(fixture),
+                end.next_multiple_of(PAGE_SIZE) - base,
+            )
         }
 
         #[test]
         fn the_fixture_matches_the_reference_line_for_line_through_exit_process() {
-            let Some(report) = run(HELLO, GENEROUS) else {
+            let Some(report) = run(HELLO.nro, GENEROUS) else {
                 return;
             };
             assert_eq!(
-                compare(&lines(&report), &anchors(&report)),
+                compare(&HELLO, &lines(&report), &anchors(&HELLO, &report)),
                 Ok(()),
                 "{}",
                 report.trace
@@ -913,6 +1790,28 @@ mod trace {
             // in its address space.
             assert_eq!(report.patched_counter_reads, Vec::<u64>::new());
             insta::assert_snapshot!("hello_fixture_trace", report.trace);
+        }
+
+        #[test]
+        fn the_startup_fixture_matches_the_reference_at_least_as_far_as_recorded() {
+            let Some(report) = run(STARTUP.nro, GENEROUS) else {
+                return;
+            };
+            let progress = progress(&STARTUP, &lines(&report), &anchors(&STARTUP, &report));
+            assert!(
+                progress.matched >= STARTUP_MATCHED,
+                "the startup fixture's run matches its reference for {} lines, fewer than the \
+                 {STARTUP_MATCHED} recorded; first difference: {:?}\n{}",
+                progress.matched,
+                progress.difference,
+                report.trace
+            );
+            if progress.matched > STARTUP_MATCHED {
+                eprintln!(
+                    "the startup fixture's run now matches {} lines: raise STARTUP_MATCHED",
+                    progress.matched
+                );
+            }
         }
     }
 }
