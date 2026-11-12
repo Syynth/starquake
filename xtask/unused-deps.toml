@@ -8,11 +8,17 @@
 #     now used (or gone), so delete the entry in the same change.
 #
 # What is covered: `cargo machete` 0.9.2 analyses only a package's top-level `[dependencies]`
-# table. Unused entries in `[dev-dependencies]`, `[build-dependencies]` and `[target.*]` tables
-# are NOT checked (by machete, nor by the workspace check, which counts an inheritance from any
-# of those tables as a use). `ignored = [...]` under `[package.metadata.cargo-machete]` or
+# table. The unused entries in `[dev-dependencies]`, `[build-dependencies]` and `[target.*]`
+# tables are found by the gate's `table-deps` step (xtask/src/table_deps.rs): a dependency is
+# unused there when no source file of the crate names it (a build dependency: when the build
+# script does not). `ignored = [...]` under `[package.metadata.cargo-machete]` or
 # `[workspace.metadata.cargo-machete]` is refused by the gate: this file is the only way to
 # excuse an unused dependency, and every entry here has a reason.
+#
+# `[[allow_tables]]` is the same list for that step (the `package` key is the crate's name): a
+# dev, build or target-specific dependency that the text search cannot see being used (its
+# library name differs from the package name, or only a macro expansion names it), or that is
+# declared ahead of its task. It is exact in both directions like the others.
 #
 # `[[allow_workspace]]` is the same for the root Cargo.toml's `[workspace.dependencies]`: a registry
 # dependency declared there that no member inherits (`name.workspace = true`).

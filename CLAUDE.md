@@ -19,21 +19,33 @@ get the thinnest end-to-end run working, then widen it, so the pieces are proven
 ## Before you say a change is done
 
 Run `cargo xtask ci` (or `just ci`) from the repository root: fmt check, an unused-dependency
-check (the root `[workspace.dependencies]`, then `cargo machete` per crate), `cargo deny check`
+check (the root `[workspace.dependencies]`, the dev, build and target tables, then `cargo machete`
+per crate), `cargo deny check`
 (licences, sources, advisories; `deny.toml`), clippy with `-D warnings` and the workspace lint
 set, nextest, doctests. CI runs exactly this.
 
-- The unused-dependency check covers each crate's top-level `[dependencies]` table only: `cargo
-  machete` 0.9.2 does not look at `[dev-dependencies]`, `[build-dependencies]` or
-  `[target.*]` tables, and neither does our workspace check (an inheritance from any of them
-  counts as a use). Keep those tables tidy by hand. `ignored = [...]` under
+- The unused-dependency check covers every dependency table. `cargo machete` reads only each
+  crate's top-level `[dependencies]` (0.9.2 does not look at `[dev-dependencies]`,
+  `[build-dependencies]` or `[target.*]` tables); the gate's `table-deps` step covers those with
+  a text search: a dependency counts as used when its crate name (`-` written as `_`) appears as
+  a word in the crate's `.rs` files, or, for a build dependency, in its build script. Both
+  are checked against `xtask/unused-deps.toml`. `ignored = [...]` under
   `[package.metadata.cargo-machete]` or `[workspace.metadata.cargo-machete]` fails the gate:
   the reasoned list is `xtask/unused-deps.toml`.
 - `cargo-deny` and `cargo-machete` are skipped locally, with a notice, when not installed
-  (`cargo install cargo-deny cargo-machete --locked`); under CI a missing one fails the gate.
-- A dependency that is declared ahead of the task that uses it goes in `xtask/unused-deps.toml`
-  with a reason. The list is exact: an entry that is no longer needed fails the gate too, so
-  delete it in the same change that starts using the dependency.
+  (`cargo install cargo-deny@0.19.8 cargo-machete@0.9.2 --locked`); under CI a missing one fails
+  the gate.
+- The gate's plugins (`cargo-nextest`, `cargo-deny`, `cargo-machete`) are pinned in
+  `xtask/tool-versions.toml`, so a tool release cannot turn `main` red. CI installs exactly those
+  versions (`.github/workflows/ci.yml`; a test fails when the workflow or the install command
+  above differs from the file). The gate compares what is installed with the pins: a different
+  version is a notice locally and a failure under CI. To move a pin, change the file, the
+  workflow and this command in one commit.
+- A dependency that is declared ahead of the task that uses it, or that the text search cannot
+  see used (a library name that differs from the package name), goes in
+  `xtask/unused-deps.toml` with a reason (`[[allow]]` for `[dependencies]`, `[[allow_tables]]`
+  for the other tables). The list is exact: an entry that is no longer needed fails the gate too,
+  so delete it in the same change that starts using the dependency.
 - `cargo deny` fetches the advisory database, so the gate needs network access. Offline, run
   `cargo xtask ci --offline` (or set `STARQUAKE_OFFLINE=1`): only the advisory check is skipped,
   and the output says so. CI refuses the switch.

@@ -19,10 +19,12 @@
 //! `cargo machete` 0.9.2 analyses only a package's top-level `[dependencies]` table (its source
 //! has a `TODO extend to dev dependencies + build dependencies`). Checked by running it: an
 //! unused dependency in `[dev-dependencies]`, in `[build-dependencies]` or in a
-//! `[target.'cfg(..)'.dependencies]` table is not reported, so the gate does not catch it. The
-//! workspace check does not catch it either, because such a member still inherits the entry
-//! (`name.workspace = true`), and this module counts an inheritance from any of those tables as
-//! a use. Unused dependencies in those tables are therefore *not* checked.
+//! `[target.'cfg(..)'.dependencies]` table is not reported. The `table-deps` step
+//! ([`crate::table_deps`]) covers those tables with its own textual search, and its findings use
+//! the same allow-list under `[[allow_tables]]` ([`TABLES_SCOPE`]). The workspace check still
+//! counts an inheritance from any of those tables as a use of the root entry, which is correct
+//! for it: it asks whether the root entry is used by someone, and the `table-deps` step asks
+//! whether that someone uses it.
 //!
 //! # No silent ignores
 //!
@@ -169,6 +171,17 @@ pub fn machete_findings(code: Option<i32>, stdout: &str) -> Result<Vec<Unused>, 
 /// rather than one crate. It cannot clash with a package name.
 pub const WORKSPACE_SCOPE: &str = "[workspace.dependencies]";
 
+/// The prefix of the `package` of an allow-list pair about a crate's dev, build or target-specific
+/// dependency tables (`[[allow_tables]]`) rather than its top-level `[dependencies]` (`[[allow]]`).
+/// It cannot clash with a package name, and keeps the two lists apart: `cargo machete` never
+/// reports the former, so its step must not call such an entry stale.
+pub const TABLES_SCOPE: &str = "[dev, build and target dependencies] ";
+
+/// The package an `[[allow_tables]]` or table-check pair carries for crate `package`.
+pub fn tables_package(package: &str) -> String {
+    format!("{TABLES_SCOPE}{package}")
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AllowFile {
@@ -176,6 +189,8 @@ struct AllowFile {
     allow: Vec<AllowEntry>,
     #[serde(default)]
     allow_workspace: Vec<WorkspaceEntry>,
+    #[serde(default)]
+    allow_tables: Vec<AllowEntry>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -210,8 +225,12 @@ impl Allowlist {
             dependencies: entry.dependencies,
             reason: entry.reason,
         });
+        let tables = file.allow_tables.into_iter().map(|entry| AllowEntry {
+            package: tables_package(&entry.package),
+            ..entry
+        });
         let mut entries: Vec<(Unused, String)> = Vec::new();
-        for entry in file.allow.into_iter().chain(workspace) {
+        for entry in file.allow.into_iter().chain(workspace).chain(tables) {
             if entry.reason.trim().is_empty() {
                 return Err(Error::AllowlistEntry(format!(
                     "{}: every entry needs a reason",
@@ -262,11 +281,24 @@ pub enum Scope {
     Crates,
     /// The root `[workspace.dependencies]`.
     Workspace,
+    /// The dev, build and target-specific dependency tables of the crates.
+    Tables,
 }
 
 impl Scope {
+    /// The scope an allow-list pair belongs to, from its package.
+    fn of(unused: &Unused) -> Self {
+        if unused.package == WORKSPACE_SCOPE {
+            Self::Workspace
+        } else if unused.package.starts_with(TABLES_SCOPE) {
+            Self::Tables
+        } else {
+            Self::Crates
+        }
+    }
+
     fn covers(self, unused: &Unused) -> bool {
-        (unused.package == WORKSPACE_SCOPE) == (self == Self::Workspace)
+        Self::of(unused) == self
     }
 }
 
@@ -305,7 +337,7 @@ pub fn judge(found: &[Unused], allowlist: &Allowlist, scope: Scope) -> Verdict {
 /// The dependency tables of a manifest or of one `[target.*]` table.
 const DEPENDENCY_TABLES: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
 
-fn parse_manifest(path: &str, text: &str) -> Result<toml::Table, Error> {
+pub(crate) fn parse_manifest(path: &str, text: &str) -> Result<toml::Table, Error> {
     text.parse().map_err(|source| Error::Manifest {
         path: path.to_owned(),
         source,
