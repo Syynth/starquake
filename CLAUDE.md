@@ -3,13 +3,14 @@
 A Switch 2 emulator in Rust, for macOS (Apple Silicon) and Linux. GPLv3. Most code is written by
 agents, so the repo is built to make changes checkable.
 
-## Working mode (until milestone 1)
+## Working mode (toward milestone 2)
 
-The lead session runs autonomously until a program runs end to end (decision log, 2026-11-11):
-it decides design questions, amends specs and vets `docs/proposals.md` itself, and records every
-such choice for the owner to review afterwards. It stops only for things that need the owner
-(hardware, passwords, anything irreversible outside the repo). The route is **skeleton first**:
-get the thinnest end-to-end run working, then widen it, so the pieces are proven to fit.
+Milestone 1 is reached. The owner extended the lead session's delegation toward milestone 2 for
+**implementation only** (decision log, 2026-11-12): the lead files implementation issues that
+follow approved specs, runs them in parallel lanes, and merges their PRs on a green gate and two
+reviews. Design questions, spec changes and design PRs wait for the owner. The lead stops for
+those and for anything that needs the owner (hardware, passwords, anything irreversible outside
+the repo), and records its own choices in `docs/proposals.md` and the decision log.
 
 - Judgement-heavy or single-threaded work (integration, foundations, bring-up) goes to one agent,
   not a wave. Parallel waves are for well-specified ports.
