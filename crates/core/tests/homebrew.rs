@@ -2092,7 +2092,7 @@ mod trace {
         #[test]
         fn what_starquake_implements_is_decided_by_its_tables() {
             assert!(implements_call(SvcId::GetInfo.number()));
-            assert!(!implements_call(SvcId::WaitSynchronization.number()));
+            assert!(!implements_call(SvcId::CreateTransferMemory.number()));
             assert!(!implements_call(0x7777));
             assert!(implements_request(
                 CONTROL_INTERFACE,

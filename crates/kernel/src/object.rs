@@ -4,9 +4,10 @@
 //! so matches are exhaustive and there are no downcasts. The kinds built so far are the two
 //! that are only an id into another table ([`Object::Thread`], [`Object::Process`]) and the
 //! client end of a session ([`Object::Session`], whose row in the IPC table, [`crate::ipc`], is
-//! keyed by the object's own id); events, shared and transfer memory and resource limits get
-//! their variants from the slices that build them, and the compiler then points at every match
-//! that must handle them.
+//! keyed by the object's own id), and an event's two ends ([`Object::Event`],
+//! [`Object::ReadableEvent`], whose state is the row itself; see [`crate::sync`]); shared and
+//! transfer memory and resource limits get their variants from the slices that build them, and
+//! the compiler then points at every match that must handle them.
 //!
 //! Rows live in the scheduler table ([`Scheduler::objects`](crate::sched::Scheduler::objects)):
 //! the spec puts events and sessions under the scheduler's lock, and a thread's object row
@@ -47,6 +48,7 @@ use crate::handle::{Closed, ObjectRefs, RefError};
 use crate::id::{ObjectId, ProcessId, ThreadId};
 use crate::result::SvcError;
 use crate::slab::{Slab, SlabError};
+use crate::sync::{Event, ReadableEvent};
 
 /// A kernel object: what a handle names. See the module docs for the kinds still to come.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -59,6 +61,10 @@ pub enum Object {
     /// `ConnectToNamedPort` or a reply's moved handle names. The session's row in the IPC table
     /// ([`crate::ipc::Ipc`]) has the object's id as its key, so the variant carries nothing.
     Session,
+    /// The writable end of an event (Horizon's `KEvent`): what `SignalEvent` takes.
+    Event(Event),
+    /// The readable end of an event (Horizon's `KReadableEvent`): what threads wait on.
+    ReadableEvent(ReadableEvent),
 }
 
 /// Why an object table operation failed.
@@ -158,6 +164,13 @@ impl Objects {
             .get(id)
             .map(|row| row.object)
             .map_err(|_| Self::stale(id))
+    }
+
+    /// Replaces what `id` names, keeping its references, and returns what it named before: how
+    /// an object whose state is its row changes (an event being signalled).
+    pub fn replace(&mut self, id: ObjectId, object: Object) -> Result<Object, ObjectError> {
+        let row = self.rows.get_mut(id).map_err(|_| Self::stale(id))?;
+        Ok(std::mem::replace(&mut row.object, object))
     }
 
     /// References currently held to `id` (zero if it names no live object).
@@ -299,6 +312,22 @@ mod tests {
             objects.close(id),
             Ok(Closed::Remaining(NonZeroU32::new(u32::MAX - 1).unwrap()))
         );
+    }
+
+    #[test]
+    fn replacing_an_object_keeps_its_references_and_a_stale_id_is_refused() {
+        let mut objects = Objects::new();
+        let id = objects.create(thread(1)).unwrap();
+        objects.open(id).unwrap();
+        assert_eq!(objects.replace(id, thread(2)), Ok(thread(1)));
+        assert_eq!((objects.get(id), objects.refs(id)), (Ok(thread(2)), 2));
+        objects.release(id).unwrap();
+        objects.release(id).unwrap();
+        assert_eq!(
+            objects.replace(id, thread(3)),
+            Err(ObjectError::Stale { id })
+        );
+        assert!(objects.is_empty());
     }
 
     #[test]

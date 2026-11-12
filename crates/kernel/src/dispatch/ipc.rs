@@ -72,6 +72,7 @@ use starquake_trace::{
     EnvError, EventKind, GuestTicks, Recorder, SVC_ARG_COUNT, ServiceId, ThreadId,
 };
 
+use super::sync::drain_wakes;
 use super::{
     Call, Caller, Dispatcher, Outcome, State, Tables, complete, fault, mismatch, record_point,
     recorded_args, result_word,
@@ -85,21 +86,24 @@ use crate::ipc::{
 use crate::memory::AddressSpace;
 use crate::object::Object;
 use crate::result::{CallResult, KernelError, ResultCode, SvcError, SvcResult};
+use crate::svc::sync::read_user_memory;
 use crate::svc::{Convention, SvcId};
 use crate::tables::Scheduler;
 
 #[cfg(test)]
 mod tests;
 
-/// A guest thread whose `SendSyncRequest` ended while it waited, and its result. The reply, when
-/// the result is success, is already in its message buffer.
+/// A guest thread whose blocking system call ended while it waited, and its result: a
+/// `SendSyncRequest`, whose reply, when the result is success, is already in its message
+/// buffer, or a `WaitSynchronization`, whose result and index are already in its thread's saved
+/// registers (`dispatch/sync.rs`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Woken {
     /// The thread, as the event stream names it.
     pub thread: ThreadId,
     /// The core it called from.
     pub core: u8,
-    /// What its `SendSyncRequest` returns.
+    /// What its call returns in `x0`.
     pub result: ResultCode,
 }
 
@@ -117,6 +121,18 @@ fn handle_error(error: &HandleError) -> KernelError {
         tracing::error!(%error, "handle table bookkeeping failed during a request");
         KernelError::InvalidState
     })
+}
+
+/// The kernel error a handler sees for a failed table operation, logging the ones that are the
+/// kernel's own bookkeeping.
+fn call_error(error: SvcError) -> KernelError {
+    match error {
+        SvcError::Kernel(error) => error,
+        SvcError::Internal(what) => {
+            tracing::error!(what, "kernel bookkeeping failed during a request");
+            KernelError::InvalidState
+        }
+    }
 }
 
 /// The kernel error a handler sees for an IPC table failure, logging the ones that are the
@@ -171,18 +187,25 @@ impl IpcContext<'_> {
             .map_err(|error| handle_error(&error))
     }
 
-    /// Creates an event. Events are kernel slice 4, which has not landed: always
-    /// [`KernelError::NotImplemented`].
+    /// Creates an event for the server and returns its readable end
+    /// ([`Scheduler::create_readable_event`]), which the server gives the sender a copy handle
+    /// to and signals with [`IpcContext::signal_event`]. The server keeps the creator's
+    /// reference for as long as it lives; a service's event has no writable end (see the module
+    /// docs of [`crate::sync`]). [`KernelError::OutOfResource`] when the object table is full.
     pub fn create_event(&mut self) -> SvcResult<ObjectId> {
-        tracing::warn!("a service asked for an event, which the kernel does not have yet");
-        Err(KernelError::NotImplemented)
+        self.dispatcher
+            .with::<(&mut Scheduler,), _>(|(scheduler,)| scheduler.create_readable_event())
+            .map_err(call_error)
     }
 
-    /// Signals an event. As [`IpcContext::create_event`]: always
-    /// [`KernelError::NotImplemented`].
-    pub fn signal_event(&mut self, _event: ObjectId) -> SvcResult<()> {
-        tracing::warn!("a service signalled an event, which the kernel does not have yet");
-        Err(KernelError::NotImplemented)
+    /// Signals the event `event` is an end of ([`Scheduler::signal_object`]), waking the guest
+    /// threads waiting on it. Their events are recorded, and they are reported woken, when the
+    /// request ends (`dispatch/sync.rs`). [`KernelError::InvalidHandle`] for an id that names
+    /// no live event.
+    pub fn signal_event(&mut self, event: ObjectId) -> SvcResult<()> {
+        self.dispatcher
+            .with::<(&mut Scheduler,), _>(|(scheduler,)| scheduler.signal_object(event))
+            .map_err(call_error)
     }
 
     /// Opens a session on the server running this request, and adds a handle to it to the
@@ -213,15 +236,13 @@ impl IpcContext<'_> {
     /// Copies the sender's memory at `address` into `out`, if the guest may read all of it;
     /// [`KernelError::InvalidCurrentMemory`] otherwise, with nothing copied.
     pub fn read_memory(&self, address: u64, out: &mut [u8]) -> SvcResult<()> {
-        let len = u64::try_from(out.len()).map_err(|_| KernelError::InvalidCurrentMemory)?;
         let memory = self.memory;
         self.dispatcher.with::<(&AddressSpace,), _>(|(space,)| {
-            if !space.user_can_read(address, len) {
-                return Err(KernelError::InvalidCurrentMemory);
+            if read_user_memory(space, memory, address, out) {
+                Ok(())
+            } else {
+                Err(KernelError::InvalidCurrentMemory)
             }
-            memory
-                .read(address, out)
-                .map_err(|_| KernelError::InvalidCurrentMemory)
         })
     }
 
@@ -382,6 +403,8 @@ impl Dispatcher {
         let woken = self.settle(finished, caller.memory, caller.recorder, time);
         let mut locked = self.lock::<()>();
         locked.state.woken.extend(woken);
+        // Waits the handler's signals ended (`dispatch/sync.rs`).
+        drain_wakes(&mut locked.state, caller.recorder, time);
         drop(locked);
         self.settle_notices();
         Ok(())
@@ -524,6 +547,8 @@ impl Dispatcher {
         };
         let mut locked = self.lock::<()>();
         locked.state.woken.extend(woken);
+        // Waits the handler's signals ended (`dispatch/sync.rs`).
+        drain_wakes(&mut locked.state, call.caller.recorder, time);
         drop(locked);
         self.settle_notices();
         outcome

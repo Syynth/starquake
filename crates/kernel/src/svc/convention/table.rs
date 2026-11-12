@@ -10,7 +10,8 @@ const fn arg(name: &'static str, reg: u8, kind: Kind) -> Arg {
     Arg { name, reg, kind }
 }
 
-/// The register convention of every [`is_retail`](super::is_retail) call, in number order.
+/// The register convention of every [`is_retail`](super::is_retail) call and every call in
+/// [`BEYOND_RETAIL`](super::BEYOND_RETAIL), in number order.
 pub static CONVENTIONS: &[(SvcId, Convention)] = &[
     (
         SvcId::SetHeapSize,
@@ -522,6 +523,17 @@ pub static CONVENTIONS: &[(SvcId, Convention)] = &[
         Convention {
             inputs: &[],
             outputs: &[],
+        },
+    ),
+    (
+        SvcId::CreateEvent,
+        Convention {
+            inputs: &[],
+            outputs: &[
+                arg("ret", 0, Kind::Result),
+                arg("out_write_handle", 1, Handle),
+                arg("out_read_handle", 2, Handle),
+            ],
         },
     ),
     (

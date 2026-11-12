@@ -4,8 +4,9 @@
 use crate::time::CounterRate;
 
 /// Threads, per-core run queues, wait lists, events, sessions, the address arbiter and timers.
-/// Threads, run queues and the object table are built ([`crate::sched`], [`crate::object`]);
-/// the rest arrive with their slices.
+/// Threads, run queues and the object table are built ([`crate::sched`], [`crate::object`]), and
+/// so are events, wait lists and timers ([`crate::sync`]) and sessions ([`crate::ipc`]); the
+/// address arbiter arrives with its slice.
 pub use crate::sched::Scheduler;
 
 /// One process's memory blocks, regions, heap and memory accounting ([`crate::memory`]).

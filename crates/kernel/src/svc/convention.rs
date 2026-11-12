@@ -11,8 +11,9 @@
 //! @ e5fb3b97). The tests check [`CONVENTIONS`] entry by entry against a copy of those wrappers
 //! (`reference/svc_wrappers64.txt`).
 //!
-//! Only the calls retail titles may make have an entry ([`is_retail`]): milestones 1 and 2 need
-//! no others. Later slices add rows from the same reference file.
+//! The calls retail titles may make have an entry ([`is_retail`]), and so do the calls beyond
+//! them that the kernel implements ([`BEYOND_RETAIL`]); milestones 1 and 2 need no others.
+//! Later slices add rows from the same reference file.
 //!
 //! `convention/table.rs` and both reference files are written by `tools/gen-svc-conventions.py`
 //! from Eden's `svc.cpp`; run it with `--check` to see that they are current.
@@ -202,9 +203,14 @@ pub const fn is_retail(id: SvcId) -> bool {
         || n == SvcId::SetGpuMemoryAttribute.number()
 }
 
+/// The calls outside the retail range ([`is_retail`]) that have a convention row anyway,
+/// because the kernel implements them: `CreateEvent` (0x45), which homebrew calls to make an
+/// event (kernel slice 4, events). In number order.
+pub const BEYOND_RETAIL: &[SvcId] = &[SvcId::CreateEvent];
+
 impl SvcId {
     /// The call's register convention, or `None` if this table has no entry for it yet (only the
-    /// [`is_retail`] calls have one).
+    /// [`is_retail`] calls and [`BEYOND_RETAIL`] have one).
     #[must_use]
     pub fn convention(self) -> Option<&'static Convention> {
         CONVENTIONS
@@ -311,17 +317,40 @@ mod tests {
     }
 
     #[test]
-    fn exactly_the_retail_calls_have_a_convention_in_number_order() {
+    fn exactly_the_retail_calls_and_those_beyond_have_a_convention_in_number_order() {
         let with: Vec<_> = CONVENTIONS.iter().map(|(id, _)| *id).collect();
-        let retail: Vec<_> = SvcId::ALL
+        let listed = |id: SvcId| is_retail(id) || BEYOND_RETAIL.contains(&id);
+        let expected: Vec<_> = SvcId::ALL
             .iter()
             .copied()
-            .filter(|&id| is_retail(id))
+            .filter(|&id| listed(id))
             .collect();
-        assert_eq!(with, retail);
+        assert_eq!(with, expected);
         for &id in SvcId::ALL {
-            assert_eq!(id.convention().is_some(), is_retail(id), "{}", id.name());
+            assert_eq!(id.convention().is_some(), listed(id), "{}", id.name());
         }
+        // Each call beyond the retail range is outside it, and listed once, in number order.
+        for &id in BEYOND_RETAIL {
+            assert!(!is_retail(id), "{}", id.name());
+        }
+        for pair in BEYOND_RETAIL.windows(2) {
+            assert!(pair[0].number() < pair[1].number(), "{pair:?}");
+        }
+    }
+
+    #[test]
+    fn the_generator_lists_the_same_calls_beyond_retail() {
+        // `tools/gen-svc-conventions.py` writes the rows; its list must be this one.
+        const SCRIPT: &str = include_str!("../../../../tools/gen-svc-conventions.py");
+        let line = SCRIPT
+            .lines()
+            .find(|line| line.starts_with("BEYOND_RETAIL = "))
+            .unwrap();
+        let names: Vec<_> = BEYOND_RETAIL
+            .iter()
+            .map(|id| format!("\"{}\"", id.name()))
+            .collect();
+        assert_eq!(line, format!("BEYOND_RETAIL = [{}]", names.join(", ")));
     }
 
     #[test]
