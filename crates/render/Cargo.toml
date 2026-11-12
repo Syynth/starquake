@@ -16,5 +16,6 @@ serde.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+insta.workspace = true
 postcard.workspace = true
 proptest.workspace = true

@@ -31,6 +31,8 @@
 //! - The texture side of a buffer copy, an upload or a readback must have one sample, as both
 //!   Vulkan and wgpu require.
 //! - Texture data outside a texture is tightly packed ([`packed_size`]; this crate's choice).
+//!
+//! Clears, blits and presents are checked in [`view_ops`], whose functions are re-exported here.
 
 use crate::caps::{
     Caps, Features, FormatFeatures, GUEST_COLOR_TARGETS, GUEST_VERTEX_ATTRIBUTES,
@@ -1064,6 +1066,10 @@ pub fn validate_rect(width: u32, height: u32, rect: &Rect) -> Result<(), RenderE
         height.into(),
     )
 }
+
+pub mod view_ops;
+
+pub use view_ops::{ResolvedView, validate_blit, validate_clear, validate_present};
 
 #[cfg(test)]
 mod tests;
