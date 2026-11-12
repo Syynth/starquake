@@ -19,11 +19,15 @@
 //!   the source for "relative to the start of rodata". Eden never reads them.
 //! - Compression flag bits 0 to 2 and the ZBIC bit 7: `NSOHeader::IsSegmentCompressed` and
 //!   `IsZBICCompressed`.
-//! - Hash-check flag bits 3 to 5, with the hash taken over the decompressed segment: from the
-//!   SwitchBrew NSO page (see "Documentation sources" in `docs/references.md`), not in the pinned
-//!   git references (Eden never checks hashes). **Confirmed** against `tests/homebrew/hello/hello.nso`,
-//!   written by switch-tools' `elf2nso` (`crates/loader/tests/homebrew_fixture.rs`): it sets all
-//!   three bits, and each stored digest is the SHA-256 of the decompressed segment.
+//! - Hash-check flag bits 3 to 5, with the hash taken over the decompressed segment: Eden never
+//!   checks hashes, but Atmosphère's loader does (`NsoHeader::Flag_CheckHashText` = bit 3, shifted
+//!   by the segment index, in `atmosphere/libraries/libstratosphere/include/stratosphere/ldr/ldr_types.hpp`;
+//!   `CheckSegmentHash` hashes the segment's `size` bytes after decompression, in
+//!   `atmosphere/stratosphere/loader/source/ldr_process_creation.cpp`; both @ 4e3f3703, fact
+//!   only). The SwitchBrew NSO page says the same. Also **confirmed** against
+//!   `tests/homebrew/hello/hello.nso`, written by switch-tools' `elf2nso`
+//!   (`crates/loader/tests/homebrew_fixture.rs`): it sets all three bits, and each stored digest
+//!   is the SHA-256 of the decompressed segment.
 //! - The third segment header's last word is the bss size: `eden-nx2/tools/nx2/nso_syms.py`
 //!   reads it that way, and in the fixture the data segment plus that size ends exactly where
 //!   its NRO twin's `MOD0` says `.bss` ends.
@@ -31,11 +35,12 @@
 //! # Module name
 //!
 //! SwitchBrew calls the last words of the first two segment headers the module name offset and
-//! size; Eden calls the word an `alignment`. The fixture **corrects** the old reading that the name
-//! is found through them: `elf2nso` writes 1 to both, and the name (`--nx-module-name` in
-//! libnx's `switch.specs`) is at the start of rodata, in the layout creport reads
-//! ([`Nso::module_path`]). The words stay exposed raw. Whether Nintendo's own tools put
-//! something else there is not known from any source here.
+//! size; Eden calls the word an `alignment`, and Atmosphère's `NsoHeader` calls them
+//! `unk_file_offset` and `unk_size` and never reads them. The fixture **corrects** the old
+//! reading that the name is found through them: `elf2nso` writes 1 to both, and the name
+//! (`--nx-module-name` in libnx's `switch.specs`) is at the start of rodata, in the layout
+//! Atmosphère's creport reads ([`Nso::module_path`]). The words stay exposed raw. What Nintendo's
+//! own tools put there is not known from any source here.
 //!
 //! The extents are exposed raw; [`Nso::extent_bytes`] resolves one against the decompressed
 //! rodata and returns `None` when it does not fit.
@@ -78,8 +83,8 @@ const DYNSYM_EXTENT_OFFSET: usize = 0x98;
 const EXTRA_WORD: usize = 0xC;
 
 /// Flag bit `FLAG_HASH_CHECK_SHIFT + n` set: segment `n`'s SHA-256, over its decompressed bytes,
-/// must be checked. From the SwitchBrew NSO page; not in the pinned references, but confirmed
-/// by the homebrew fixture (see the module docs).
+/// must be checked (`NsoHeader::Flag_CheckHashText` in Atmosphère's `ldr_types.hpp`, fact only;
+/// confirmed by the homebrew fixture; see the module docs).
 pub const FLAG_HASH_CHECK_SHIFT: u32 = 3;
 /// Flag bit 7: the segments use ZBIC rather than LZ4 (`NSOHeader::IsZBICCompressed`, an Eden-only
 /// extension that this crate does not implement).

@@ -22,7 +22,7 @@ use std::ops::RangeInclusive;
 /// Padding word, skipped (`CapabilityType::Padding`).
 const PADDING: u32 = u32::MAX;
 /// Interrupt id meaning "no interrupt" (`KCapabilities::PaddingInterruptId`).
-const PADDING_INTERRUPT_ID: u32 = 0x3FF;
+pub(crate) const PADDING_INTERRUPT_ID: u32 = 0x3FF;
 /// Size of a physical page for address and size fields (`PageSize` in `k_capabilities.cpp`).
 const PAGE_SIZE: u64 = 0x1000;
 
@@ -623,6 +623,11 @@ pub(crate) mod encode {
         type_prefix(TYPE_KERNEL_VERSION)
             | (minor << KERNEL_MINOR_SHIFT)
             | (major << KERNEL_MAJOR_SHIFT)
+    }
+
+    /// `InterruptPair` descriptor: ids at bits 12..22 and 22..32.
+    pub(crate) fn interrupt_pair(first: u32, second: u32) -> u32 {
+        type_prefix(TYPE_INTERRUPT_PAIR) | (first << 12) | (second << 22)
     }
 }
 

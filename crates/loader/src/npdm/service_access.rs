@@ -8,16 +8,18 @@
 //! A trailing `*` in a name makes it a wildcard (a prefix match); it is reported as a separate
 //! flag, with the `*` removed from the name.
 //!
-//! # Sourcing: a guess that stays
+//! # Sourcing
 //!
-//! The pinned references never handle `*` (Eden does not check service access at all, and
-//! `npdm_info.py` prints names verbatim). The SwitchBrew NPDM page says the name "supports the
-//! wildcard `*` character" (see "Documentation sources" in `docs/references.md`), but it does not
-//! say that the `*` must be last or that the match is a prefix match. So **the trailing-only,
-//! prefix-match reading is a guess**, kept because it is the simplest reading of "supports the
-//! wildcard"; no fixture built from homebrew exercises it. A `*` anywhere else in a name is kept
-//! as a literal character. If a real ACID disagrees, [`ServiceAccess::covers`] and the `wildcard`
-//! flag are the two places to fix.
+//! Eden does not check service access at all, and `npdm_info.py` prints names verbatim. The
+//! wildcard form comes from Atmosphère's sm (`AccessControlEntry` in
+//! `atmosphere/stratosphere/sm/source/impl/sm_service_manager.cpp` @ 4e3f3703, fact only): an
+//! entry is a wildcard when the last byte of its name is `*` (`IsWildcard`:
+//! `m_entry[GetServiceNameSize()] == '*'`), and a wildcard grant matches the names that start
+//! with the bytes before the `*`. A `*` anywhere else in a name is an ordinary byte there and
+//! here. `tests/homebrew/hello/main.npdm`, written by switch-tools' `npdmtool` from a description
+//! listing `set:*`, stores the `*` as the name's last byte (`crates/loader/tests/homebrew_fixture.rs`).
+//! How a grant covers a request, and the one place this is stricter than sm, is in
+//! [`ServiceAccess::covers`].
 
 /// One service access entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,29 +28,32 @@ pub struct ServiceAccess {
     pub name: String,
     /// True when the title hosts the service (control byte bit 7).
     pub server: bool,
-    /// True when the name ended in `*` (a prefix match). A guess; see the module docs.
+    /// True when the name ended in `*` (a prefix match; see the module docs).
     pub wildcard: bool,
 }
 
 impl ServiceAccess {
     /// True if `self`, read as an entry of the signed `ACID` list, permits `request`, an entry of
-    /// the `ACI0` list: the same role (`server`), and either the same name or, when `self` is a
-    /// wildcard, a request whose name starts with `self`'s prefix.
+    /// the `ACI0` list.
     ///
-    /// A wildcard request is permitted only by a wildcard grant whose prefix it extends, so an
-    /// `ACI0` cannot widen an exact grant.
+    /// Mirrors one iteration of `ValidateAccessControl` in
+    /// `atmosphere/stratosphere/sm/source/impl/sm_service_manager.cpp` @ 4e3f3703 (fact only):
+    /// the roles must match (`IsHost() == is_host`); when both entries are wildcards or neither
+    /// is, the names must be equal; when only the grant is a wildcard, the request's name must
+    /// start with the grant's prefix (`memcmp` over `GetServiceNameSize() - 1` bytes).
     ///
-    /// Neither Eden nor any pinned reference validates `ACI0` against `ACID`, so the matching is
-    /// a guess, chosen as the least permissive reading consistent with the wildcard being a
-    /// prefix match (see the module docs).
+    /// One divergence, pinned by `a_wildcard_request_is_not_covered_by_an_exact_grant`: when only
+    /// the request is a wildcard, sm's check leaves `is_valid` true and accepts it against any
+    /// exact grant of the same role. That would let an `ACI0` widen an exact grant to every
+    /// name, so this refuses it.
     pub fn covers(&self, request: &Self) -> bool {
         if self.server != request.server {
             return false;
         }
-        if self.wildcard {
-            request.name.starts_with(&self.name)
-        } else {
-            !request.wildcard && request.name == self.name
+        match (self.wildcard, request.wildcard) {
+            (true, false) => request.name.starts_with(&self.name),
+            (false, true) => false,
+            (true, true) | (false, false) => request.name == self.name,
         }
     }
 }
@@ -188,12 +193,35 @@ mod tests {
         let grant = service("ldr:", false, true);
         assert!(grant.covers(&service("ldr:ro", false, false)));
         assert!(grant.covers(&service("ldr:", false, false)));
-        assert!(grant.covers(&service("ldr:", false, true)));
-        assert!(grant.covers(&service("ldr:r", false, true)));
         assert!(!grant.covers(&service("ld", false, false)));
         assert!(!grant.covers(&service("ld", false, true)));
         assert!(!grant.covers(&service("sm:", false, false)));
         assert!(!grant.covers(&service("ldr:ro", true, false)));
+    }
+
+    /// sm's rule when both entries are wildcards: the names must be equal, as for two exact
+    /// entries. A longer wildcard is not covered by a shorter one.
+    #[test]
+    fn a_wildcard_request_needs_the_same_wildcard_grant() {
+        let grant = service("ldr:", false, true);
+        assert!(grant.covers(&service("ldr:", false, true)));
+        assert!(!grant.covers(&service("ldr:r", false, true)));
+        assert!(!grant.covers(&service("ldr", false, true)));
+        assert!(!grant.covers(&service("ldr:", true, true)));
+    }
+
+    /// Divergence (module docs): sm accepts a wildcard request against an exact grant of the
+    /// same role, whatever the names; this refuses it.
+    #[test]
+    fn a_wildcard_request_is_not_covered_by_an_exact_grant() {
+        let grant = service("fs:ro", false, false);
+        for request in [
+            service("fs:", false, true),
+            service("fs:ro", false, true),
+            service("zz", false, true),
+        ] {
+            assert!(!grant.covers(&request), "{request:?}");
+        }
     }
 
     #[test]

@@ -50,15 +50,25 @@
 //!   the version. Whether it is a process category is not established by any source here.
 //!
 //! The `ACID` block's own service and kernel access control are read at body offsets 0x28 and
-//! 0x30 (`AcidHeader::sac_offset`, `kac_offset`) and decoded like their `ACI0` counterparts. The
-//! field offsets come from `AcidHeader`, but the base they are added to is a guess: this port
-//! assumes the start of the `ACID` block, by analogy with the FAC fix in `eden-pr4588`. No pinned
-//! source reads the `ACID` SAC or KAC (`eden`, `eden-nx2` and `eden-pr4588` read only
-//! `acid_header.fac_offset`; `npdm_info.py` reads only the `ACI0` lists). A retail Switch 2
-//! `main.npdm` whose `ACID` SAC and KAC decode to sensible service names and capability words at
-//! block-relative offsets would confirm it; a different base (for example the magic) would show
-//! up as garbage or a parse error there. How the `ACI0` relates to the `ACID` is in
-//! [`validate`]; every rule there is a guess.
+//! 0x30 (`AcidHeader::sac_offset`, `kac_offset`) and decoded like their `ACI0` counterparts, with
+//! the offsets added to the start of the `ACID` block. Eden's three trees read only
+//! `acid_header.fac_offset`, but Atmosphère's loader adds all three `ACID` offsets to the block
+//! start (`meta->acid_sac = reinterpret_cast<u8 *>(acid) + acid->sac_offset`, with `acid` the
+//! block start, in `LoadMetaFromFile`, `atmosphere/stratosphere/loader/source/ldr_meta.cpp`
+//! @ 4e3f3703, fact only), and `tests/homebrew/hello/main.npdm`, written by switch-tools'
+//! `npdmtool`, decodes to exactly the lists its description gives at that base
+//! (`crates/loader/tests/homebrew_fixture.rs`). Both are Switch 1 layouts; a retail Switch 2
+//! `main.npdm` has not been checked.
+//!
+//! # Divergence: where the access-control lists may sit
+//!
+//! Atmosphère's `ValidateAcid` and `ValidateAci` also require each FAC/FAH, SAC and KAC to start
+//! at or after the end of its block's header (`ValidateSubregion(sizeof(Acid), ...)` and
+//! `ValidateSubregion(sizeof(Aci), ...)`, with `sizeof(Acid)` 0x240 and `sizeof(Aci)` 0x40).
+//! This parser follows `eden-pr4588` and requires only that each list lies inside its block, so it
+//! accepts a list that overlaps the header. Pinned by `lists_overlapping_their_block_header_parse`.
+//!
+//! How the `ACI0` relates to the `ACID` is in [`validate`].
 
 pub mod capabilities;
 pub mod service_access;
@@ -201,12 +211,11 @@ pub struct Acid {
     /// File access control.
     pub file_access: FileAccessControl,
     /// Services the title may be granted (the `ACID`'s own service access control; wildcard
-    /// entries are grants, see [`service_access`]). Guess: the SAC offset is read relative to the
-    /// `ACID` block; no pinned source reads this list (see the module docs).
+    /// entries are grants, see [`service_access`]). Read relative to the start of the `ACID`
+    /// block, as Atmosphère's loader does (see the module docs).
     pub services: Vec<ServiceAccess>,
-    /// Kernel capabilities the title may be granted (the `ACID`'s own KAC). Guess: the KAC offset
-    /// is read relative to the `ACID` block; no pinned source reads this list (see the module
-    /// docs).
+    /// Kernel capabilities the title may be granted (the `ACID`'s own KAC). Read relative to the
+    /// start of the `ACID` block, as Atmosphère's loader does (see the module docs).
     pub kernel_capabilities: KernelCapabilities,
 }
 
@@ -406,8 +415,8 @@ fn parse_acid(block: &[u8]) -> Result<Acid, NpdmError> {
 
     // Body layout, relative to the magic (`AcidHeader` after the signature area): flags at 0xC,
     // title id range at 0x10 and 0x18, FAC, SAC and KAC offset/size pairs at 0x20, 0x28 and 0x30.
-    // The FAC offset is relative to the start of the ACID block (eden-pr4588). The SAC and KAC
-    // offsets are read the same way, but that is a guess: no pinned source reads them.
+    // All three offsets are relative to the start of the ACID block: the FAC as in eden-pr4588,
+    // all three as in Atmosphère's `LoadMetaFromFile` (see the module docs).
     let acid_flags = u32_at(body, 0xC);
     let fac_offset = to_usize(u32_at(body, 0x20), "FAC")?;
     let fac_size = to_usize(u32_at(body, 0x24), "FAC")?;
@@ -1043,6 +1052,28 @@ mod tests {
         let mut file = good.clone();
         put_word(&mut file, body + ACID_BODY_KAC_FIELD + 4, 6);
         assert_eq!(Npdm::parse(&file), Err(NpdmError::UnalignedAcidKac(6)));
+    }
+
+    /// Divergence from Atmosphère's `ValidateAcid`/`ValidateAci` (module docs): a list that
+    /// starts inside its block's header is still read, as long as it lies inside the block.
+    #[test]
+    fn lists_overlapping_their_block_header_parse() {
+        let good = Fixture::new(AcidLayout::Switch1).build();
+        let body = acid_body_at(&good);
+        // The ACID SAC moved to offset 0 (the signature area), empty. Atmosphère needs the
+        // offset to be at least 0x240.
+        let mut file = good.clone();
+        put_word(&mut file, body + ACID_BODY_SAC_FIELD, 0);
+        put_word(&mut file, body + ACID_BODY_SAC_FIELD + 4, 0);
+        let npdm = Npdm::parse(&file).unwrap();
+        assert_eq!(npdm.acid.services, vec![]);
+        // The ACI0 KAC moved onto its own header (offset 0, empty): Atmosphère needs 0x40.
+        let aci_at = u32::from_le_bytes(good[0x70..0x74].try_into().unwrap()) as usize;
+        let mut file = good;
+        put_word(&mut file, aci_at + 0x30, 0);
+        put_word(&mut file, aci_at + 0x34, 0);
+        let npdm = Npdm::parse(&file).unwrap();
+        assert_eq!(npdm.aci.kernel_capabilities, KernelCapabilities::default());
     }
 
     #[test]
