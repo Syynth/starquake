@@ -69,3 +69,8 @@ pub use image::LoadError;
 pub use report::{ExitReason, Mapping, RunOptions, RunReport, Summary, exit_code};
 pub use space::SpaceError;
 pub use system::{Error, System};
+
+/// The loader's formats (NUP containers, NPDM, NSO), for frontends, which see only this crate
+/// (`docs/architecture.md`, "Crates and dependency direction"): `starquake inspect` and
+/// `starquake verify` read titles through it.
+pub use starquake_loader as loader;
