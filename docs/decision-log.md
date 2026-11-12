@@ -209,3 +209,11 @@ Entry format:
 - **WHAT:** The owner asked to start the designs that block parallel work. Four specs are drafted at once, one agent each: the graphics server session model (#11), the GPU front/back protocol and engine state model (#12), the shader pipeline (#13) and the render backend (#14). Each draft lists its decisions for the owner, its interfaces to the other three, and its implementation cut into pull-request-sized slices marked as parallel or not and as testable offline or not. The lead reconciles the interfaces between the four. The drafts are design PRs: they wait for the owner's review and are not merged or built on under delegation.
 - **WHY:** The graphics half is the largest part of the project and nothing in it is built. It is blocked on these designs, not on code, and much of it can be built and tested offline by many agents at once as soon as the designs are approved. The kernel work that leads to milestone 1 is narrow and serial, so starting the designs now costs it nothing.
 
+## Milestone 1 reached; the lead's delegation ends with it
+- **WHEN:** 2026-11-12
+- **PROJECT:** starquake
+- **SYSTEM:** process
+- **SCOPE:** moderate
+- **WHAT:** Recorded by the lead. A real libnx homebrew program now runs from file to exit on `main`: 30 system calls and 5 service requests in the same order as the reference emulator, its three lines printed, exit code 0, nothing stubbed, checked by a test and re-run by the lead (#98, PR #106; issue #20 closed). "Autonomous mode until something runs" set this as its end, so from here the lead no longer decides design questions, amends specs or promotes proposals on its own: design and spec PRs wait for the owner, and proposals wait to be vetted. Implementation PRs for filed issues still merge on a green gate and two reviews, as before. Three house rules adopted while the last wave was in flight are marked as such in `docs/proposals.md`.
+- **WHY:** The owner granted the delegation to get past the point where nothing ran end to end, and tied it to this milestone. Whether to extend it toward milestone 2 is the owner's call.
+

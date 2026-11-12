@@ -21,7 +21,7 @@ things. Issues without them carry the `needs-design` label and stay out of waves
 | | Milestone | Done when |
 |---|---|---|
 | M0 | Foundation | Workspace, gate, CI, references, backlog. **Done.** |
-| M1 | Homebrew hello-world | A small homebrew program loads, runs natively under the hypervisor backend, makes system calls and IPC requests, and exits. No keys or firmware involved. |
+| M1 | Homebrew hello-world | A small homebrew program loads, runs natively under the hypervisor backend, makes system calls and IPC requests, and exits. No keys or firmware involved. **Reached 2026-11-12** (#98). |
 | M2 | A Switch 2 title boots to graphics init | Loader, kernel and services get a real title as far as its first GPU submission (Eden-NX2 notes rows 4–29). Needs titles dumped from the owner's own console. |
 | M3 | First present | The GPU memory model, gated command buffers, macros and a minimal shader path put a frame on screen (rows 30–57). |
 | M4 | Correct frames in one title | Shader coverage, textures, queue synchronisation. |
