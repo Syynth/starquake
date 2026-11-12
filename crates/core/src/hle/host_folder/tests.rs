@@ -99,7 +99,7 @@ fn reads_stop_at_the_end_of_the_file() {
 fn only_plain_paths_inside_the_folder_are_followed() {
     let (scratch, mut folder) = folder("paths");
     scratch.file("../outside.txt", b"secret");
-    let refused: [&[u8]; 9] = [
+    let refused: [&[u8]; 10] = [
         b"a.txt",
         b"",
         b"//a.txt",
@@ -109,6 +109,7 @@ fn only_plain_paths_inside_the_folder_are_followed() {
         b"/../outside.txt",
         b"/dir\\inner.bin",
         b"/a.txt/",
+        b"/a.txt\0x",
     ];
     for path in refused {
         assert_eq!(

@@ -5,8 +5,8 @@
 //! has normalised (`starquake_services::fsp::path`), but it comes from the guest, and a replayed
 //! log could hold anything, so it is checked again here before it touches the host: it must be
 //! UTF-8, start with `/`, and every component must be a plain name (not empty, not `.` or `..`,
-//! no backslash). What it names, once symbolic links are followed, must still be inside the
-//! folder. A path that fails any of these is [`HostFailure::NotFound`].
+//! no backslash, no NUL byte). What it names, once symbolic links are followed, must still be
+//! inside the folder. A path that fails any of these is [`HostFailure::NotFound`].
 
 use std::fs::{self, File};
 use std::io::{self, ErrorKind, Read, Seek, SeekFrom};
