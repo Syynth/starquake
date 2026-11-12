@@ -153,6 +153,32 @@ All vetted by the lead under delegation; open to the owner's review.
 | proposed | **NUP follow-ups**: read the meta block's TLVs (and raise the 0-based against 1-based numbering upstream); parse only the NSO header for `inspect`; cap the total path bytes of a directory walk (names that are prefixes of one pooled string make it quadratic); `verify` says "damaged" for an I/O error; the tree depth limit of 128 is a guess | Review findings on #99. |
 | proposed, for the title-loading design | **Three rules for combining a title's packages**: an update replaces the whole ExeFS or overlays it; the highest version wins; how a base and its update are related by title id | The reader reports packages and leaves the choice to its caller. The first needs a ruling against the reference before a title is mapped. |
 
+### From waves 10 to 12 (ledger: #22)
+
+Wave 10 landed the process address space (#97), wave 11 ZBIC decompression (#100) and wave 12
+sessions, servers and named ports (#98), which completed milestone 1. Recorded by the lead; the
+delegation that let the lead promote proposals ended with milestone 1, so everything here is
+`proposed` and waits for the owner.
+
+| Status | Proposal | Why |
+|---|---|---|
+| proposed | **The brief for kernel slice 10 (core loop and timers)** names: wiring `Dispatcher::deliver_replies` and `take_woken` into the loop; making the loop's service set injectable so its waiting arm can be tested; notices that arrive while a handler is out | These exist and are tested in the kernel but nothing in a real run reaches them, and the loop's waiting arm has no test. |
+| proposed | **One request queue per HLE server; serialisable IPC tables** | The kernel and the service framework each keep a queue that must agree. `Ipc`, `Request` and `Translated` are not serialisable, which snapshots need. |
+| proposed | **Trace: a protocol or control mark on IPC events; fill `service_commands` in `summary.json`** (a trace layout version bump) | The fixture's comparison infers which service a control request belongs to from the next request. A run's summary lists no service commands. Merge with the service-hardening proposal. |
+| proposed | **IPC failure paths**: roll back handles that a failed handler put in the sender's table | The error-path rule; nothing does this yet. No program on the current path triggers it. |
+| proposed | **Session limits on `ConnectToNamedPort`** | The reference can refuse with a limit error; starquake has no session limits. Listed as a divergence and pinned by a test. |
+| proposed, for the kernel spec | **Two notes**: the kernel does not read buffer descriptors when a request is sent; moving a handle into a guest server's table is untracked | Neither is ruled out by the design; both need a sentence in the spec when guest servers are taken up. |
+| proposed | **Record address-space changes in the event stream; a serialisable address-space table** | No kernel slice owns the recording point for map, unmap and protect. Snapshots must rebuild the table's mapper. |
+| proposed | **ZBIC follow-ups**: a fallback when a rewritten block crosses a zstd limit (hold until a title trips it); a cap on the decoder's up-front window reservation from an untrusted size; a strict verification mode; whether NRO and NRR can carry ZBIC | The reservation is the only one a hostile file can reach today; it is documented and pinned by a test, not prevented. |
+| proposed (the owner passed on it for now, 2026-11-12) | **`starquake ls` and `extract` for a title's files** | A first use of the RomFS reading path the file-system service needs. The `nup_tally` example in the loader covers looking around for now. |
+| proposed | **After milestone 1: kernel slices 4 (events, waits), 5 (address arbiter, condition variables), 8 (process and threads) and 10 (core loop); CPU #35 and #36; title mapping #33; then services** | The widest set of work that can run side by side before the graphics designs are approved: at most two kernel lanes, one CPU lane, one loader lane, then one lane per service. |
+
+### Folded or already recorded (waves 10 to 12)
+
+- The scope review of wave 10 did not run (the network dropped); its one follow-up is the
+  address-space recording row above.
+- The wave 9 rows (run a title, RomFS from NUP, a narrow title API in `core`) stand as written.
+
 ## House-rule candidates
 
 Rules distilled from review findings. A vetted rule moves into `CLAUDE.md`; until then it is
@@ -226,3 +252,19 @@ passed to build agents as a provisional rule for the next wave.
 | adopted (lead, under delegation) | A parser gets one hand-built accepting case per format feature, not only inputs made by the project's own builder or encoder. |
 | adopted (lead, under delegation) | User-facing errors and command output are plain words, not `Debug` forms, asserted as exact strings. |
 | dropped (lead, under delegation): covered by the both-sides-of-the-edge and name-the-test rules | Edge tests use the real alignment step; each "looser than the reference" item names its test. |
+
+### From waves 10 to 12
+
+| Status | Rule |
+|---|---|
+| adopted (lead, under delegation, before milestone 1 landed) | Test every range operation (map, protect, unmap, query) with a neighbour that starts exactly at the end bound, and assert the neighbour is unchanged. |
+| adopted (lead, under delegation, before milestone 1 landed) | Every state-transition branch gets a test of both the changed and the unchanged outcome. |
+| adopted (lead, under delegation, before milestone 1 landed) | When a layer relies on a permission or an error the reference documents, check that the production backend honours it end to end, or enforce it in the layer. |
+| proposed | A format limit that is a reference fact gets one golden test that states the literal with its citation. Every other test imports the constant. (Needs the owner: it qualifies the rule that tests never restate literals.) |
+| proposed | Bound every allocation a wrapped third-party decoder makes from an untrusted header, and test it with the smallest hostile input that states the largest size. |
+| proposed | A bound a test claims to pin must be observable: assert a measured peak or a pure helper, not only the final output. |
+| proposed | A feature in an issue's scope with end-to-end behaviour (a command's output) gets an app-level test with the exact expected line. |
+| proposed | Every commit that reaches `main` passed the gate: squash work-in-progress commits before opening the PR. |
+| proposed | Never discard with `let _ =` a result that reports a freed resource; route it through the one teardown path, on error paths too. |
+| proposed | When a shared resource is taken out and its lock released, the admission logic must know it is out; pin it with a threaded test that sends a second request meanwhile. |
+| dropped: covered by existing rules | Mutation-check new bounds; back every stated invariant with an assertion; test documented orderings with two competing items; grep the code before stating a docs claim. |

@@ -106,6 +106,8 @@ Platform-specific code must still compile (or be `cfg`-gated) on Linux; check wi
   homebrew services), but must not rule it out, and must say how it could be added later.
 - An id or pointer read from guest-writable or possibly corrupt data is validated against what
   was actually allocated, not just against a range.
+- When a layer relies on a permission or an error the reference documents, check that the
+  production backend honours it end to end, or enforce it in the layer.
 - When an operation can fail after it has begun changing shared state, its required side effect
   (flush, cleanup, rollback) happens on the error path too. A freed resource is not reusable
   until every pending follow-up on it (a TLB flush, a notification) has run.
@@ -162,6 +164,8 @@ Platform-specific code must still compile (or be `cfg`-gated) on Linux; check wi
   header's magic and version before the body.
 - A test invariant mirrors the reference's exact condition; no escape clause that switches the
   assertion off in common generated cases.
+- Test every range operation with a neighbour that starts exactly at the end bound, and every
+  state-transition branch for both the changed and the unchanged outcome.
 - Every boundary check gets a test at the exact edge on both sides. A claim that something is
   "pinned by a test" names the test.
 - Tests that touch the file system use a per-test unique folder and clean up; run a new test many
