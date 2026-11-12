@@ -185,7 +185,7 @@ impl Nso {
     ///   decompressed rodata holds, and a path that runs past its end is `None`.
     pub fn module_path(&self) -> Option<&[u8]> {
         let rodata = &self.rodata.data;
-        let zero =u32::from_le_bytes(read_array::<4>(rodata, 0)?);
+        let zero = u32::from_le_bytes(read_array::<4>(rodata, 0)?);
         let length = i32::from_le_bytes(read_array::<4>(rodata, MODULE_PATH_LENGTH_OFFSET)?);
         if zero != 0 || length <= 0 {
             return None;

@@ -895,7 +895,7 @@ mod tests {
     #[test]
     fn divergence_unknown_descriptors_listed_by_the_acid_are_permitted() {
         let unknown = bound().kernel_capabilities.unknown;
-        assert!(!unknown.is_empty());
+        assert_ne!(unknown, Vec::<u32>::new());
         assert_eq!(
             verdict(|aci| aci.kernel_capabilities.unknown.clone_from(&unknown)),
             Ok(())
