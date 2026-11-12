@@ -70,7 +70,7 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use starquake_cpu::{Exit, GuestRegs, Interrupter, Vcpu};
+use starquake_cpu::{Exit, GuestRegs, Interrupter, Syndrome, Vcpu};
 use starquake_kernel::dispatch::{Caller, Dispatcher, Outcome, Record, Tables};
 use starquake_kernel::handle::{Handle, HandleError, HandleTable, ObjectRefs};
 use starquake_kernel::object::Object;
@@ -320,7 +320,7 @@ impl Drop for Watchdog {
 /// How the loop ended.
 enum Ending {
     Exited,
-    Crashed(Exception, Box<GuestRegs>),
+    Crashed(Exception, Syndrome, Box<GuestRegs>),
     TimedOut,
     Failed(String),
 }
@@ -435,14 +435,17 @@ pub(crate) fn run_within<V: Vcpu, C: HostClock + Clone + 'static>(
             });
             ExitReason::EmulatorError(message)
         }
-        Ending::Crashed(exception, regs) => ExitReason::GuestCrashed(Box::new(CrashReport::new(
-            exception,
-            &regs,
-            &placed.mappings,
-            std::slice::from_ref(&placed.module),
-            last_events(&flight),
-            &options.command_line,
-        ))),
+        Ending::Crashed(exception, syndrome, regs) => ExitReason::GuestCrashed(Box::new(
+            CrashReport::new(
+                exception,
+                &regs,
+                &placed.mappings,
+                std::slice::from_ref(&placed.module),
+                last_events(&flight),
+                &options.command_line,
+            )
+            .with_syndrome(syndrome),
+        )),
     };
     let (exit, events, events_error) = settle_dump(flight.dump(), exit);
     RunReport {
@@ -611,18 +614,25 @@ fn drive<V: Vcpu, C: HostClock + Clone + 'static>(
                     Outcome::Waiting => return Ending::Failed(WAITING.to_owned()),
                 }
             }
-            Exit::DataAbort { address, write, .. } => {
+            Exit::DataAbort {
+                address,
+                write,
+                syndrome,
+            } => {
                 let access = if write { Access::Write } else { Access::Read };
-                if let Some(ending) = aborted(vcpu, space, session, address, access) {
+                if let Some(ending) = aborted(vcpu, space, session, address, access, syndrome) {
                     return ending;
                 }
             }
-            Exit::InstructionAbort { address, .. } => {
-                if let Some(ending) = aborted(vcpu, space, session, address, Access::Execute) {
+            Exit::InstructionAbort { address, syndrome } => {
+                let access = Access::Execute;
+                if let Some(ending) = aborted(vcpu, space, session, address, access, syndrome) {
                     return ending;
                 }
             }
-            Exit::Undefined { .. } => return crashed(vcpu, Exception::UndefinedInstruction),
+            Exit::Undefined { syndrome, .. } => {
+                return crashed(vcpu, Exception::UndefinedInstruction, syndrome);
+            }
             Exit::Interrupted => {
                 if watchdog.fired() {
                     return Ending::TimedOut;
@@ -634,13 +644,15 @@ fn drive<V: Vcpu, C: HostClock + Clone + 'static>(
 }
 
 /// What an abort on an `access` to `address` comes to: `None` when the page only lacked backing
-/// and now has it, so the guest retries the access; otherwise how the run ends.
+/// and now has it, so the guest retries the access; otherwise how the run ends. `syndrome` is
+/// the abort's, for the crash report.
 fn aborted<V: Vcpu, C: HostClock + Clone>(
     vcpu: &V,
     space: &dyn GuestSpace<V>,
     session: &Session<'_, C>,
     address: u64,
     access: Access,
+    syndrome: Syndrome,
 ) -> Option<Ending> {
     match space.touch(address, access) {
         Touch::Backed => None,
@@ -664,7 +676,13 @@ fn aborted<V: Vcpu, C: HostClock + Clone>(
                     false,
                 ),
             };
-            Some(fatal_fault(vcpu, session, address, write, exception))
+            Some(fatal_fault(
+                vcpu,
+                session,
+                address,
+                write,
+                (exception, syndrome),
+            ))
         }
         Touch::Failed(error) => Some(unbacked(address, &error)),
     }
@@ -678,28 +696,30 @@ fn unbacked(address: u64, error: &crate::space::SpaceError) -> Ending {
     ))
 }
 
-/// Ends the run as a crash with `exception`, with the guest's registers as they are now.
-fn crashed<V: Vcpu>(vcpu: &V, exception: Exception) -> Ending {
+/// Ends the run as a crash with `exception` and its `syndrome`, with the guest's registers as
+/// they are now.
+fn crashed<V: Vcpu>(vcpu: &V, exception: Exception, syndrome: Syndrome) -> Ending {
     match vcpu.regs() {
-        Ok(regs) => Ending::Crashed(exception, Box::new(regs)),
+        Ok(regs) => Ending::Crashed(exception, syndrome, Box::new(regs)),
         Err(error) => Ending::Failed(format!("the vCPU failed: {error}")),
     }
 }
 
-/// Records an abort at `address` as a fatal fault and ends the run as a crash with `exception`.
+/// Records an abort at `address` as a fatal fault and ends the run as a crash with `exception`
+/// and its syndrome.
 fn fatal_fault<V: Vcpu, C: HostClock + Clone>(
     vcpu: &V,
     session: &Session<'_, C>,
     address: u64,
     write: bool,
-    exception: Exception,
+    (exception, syndrome): (Exception, Syndrome),
 ) -> Ending {
     session.record(EventKind::Fault {
         address,
         write,
         action: FaultAction::Fatal,
     });
-    crashed(vcpu, exception)
+    crashed(vcpu, exception, syndrome)
 }
 
 /// The newest events the flight recorder holds, oldest first, one line each.

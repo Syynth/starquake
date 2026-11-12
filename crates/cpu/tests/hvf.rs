@@ -1641,6 +1641,44 @@ fn code_written_in_pieces_is_seen_whole() {
 }
 
 #[test]
+fn code_the_guest_rewrites_runs_after_its_own_cache_maintenance() {
+    let Some(guest) = Guest::new() else { return };
+    // The guest stores the word in w1 at the address in x2, makes it visible to instruction
+    // fetches the way the architecture asks of EL0 code (Arm ARM, "Concurrent modification and
+    // execution of instructions": `dc cvau`, `dsb ish`, `ic ivau`, `dsb ish`, `isb`; assembled
+    // with LLVM), and jumps to it. What it jumps to is `movz x0, #i; svc #7`, the `movz` being
+    // the word it stored. The host writes only the svc, once, so no host-side maintenance
+    // touches the rewritten line in the loop.
+    let target = guest.data();
+    guest
+        .memory()
+        .write(target + 4, &svc(7).to_le_bytes())
+        .unwrap();
+    let mut vcpu = guest.vcpu(
+        &[
+            0xb900_0041, // 0x00  str w1, [x2]
+            0xd50b_7b22, // 0x04  dc  cvau, x2
+            0xd503_3b9f, // 0x08  dsb ish
+            0xd50b_7522, // 0x0c  ic  ivau, x2
+            0xd503_3b9f, // 0x10  dsb ish
+            0xd503_3fdf, // 0x14  isb
+            0xd61f_0040, // 0x18  br  x2
+        ],
+        |_| {},
+    );
+    let base = guest.base();
+    for i in 1..=200u16 {
+        let mut regs = vcpu.regs().unwrap();
+        regs.pc = base;
+        regs.x[1] = u64::from(movz_x0(i));
+        regs.x[2] = target;
+        vcpu.set_regs(&regs).unwrap();
+        assert_eq!(vcpu.run().unwrap(), Exit::Svc(7), "rewrite {i}");
+        assert_eq!(vcpu.regs().unwrap().x[0], u64::from(i), "rewrite {i}");
+    }
+}
+
+#[test]
 fn a_new_vm_never_runs_the_previous_vms_code() {
     // Each VM's RAM is fresh host memory, which the allocator and the kernel hand out again from
     // pages an earlier VM's guest executed. Alternate two programs at the same address, with the
@@ -1743,7 +1781,10 @@ fn fp_state_written_by_the_guest_is_what_the_host_reads() {
     });
     // Before it runs, the host sees the zeroes it set.
     let before = vcpu.regs().unwrap();
-    assert_eq!((before.v, before.fpcr, before.fpsr), ([0; VECTOR_REGS], 0, 0));
+    assert_eq!(
+        (before.v, before.fpcr, before.fpsr),
+        ([0; VECTOR_REGS], 0, 0)
+    );
     assert_eq!(vcpu.run().unwrap(), Exit::Svc(0));
     let after = vcpu.regs().unwrap();
     for (n, &v) in after.v.iter().enumerate() {
@@ -1834,9 +1875,45 @@ fn after_a_run_the_host_reads_the_fpcr_and_fpsr_the_guest_reads() {
     assert_eq!(after.fpsr & FPSR_FLAGS, FPSR_FLAGS);
     // Both are 32-bit registers held in 64 bits.
     assert_eq!((after.fpcr >> 32, after.fpsr >> 32), (0, 0));
-    // And a context with those values loads back unchanged.
+    // A context with those values loads back unchanged.
     vcpu.set_regs(&after).unwrap();
     assert_eq!(vcpu.regs().unwrap(), after);
+    // Before a run, the host reads back the low 32 bits of what it wrote: the FP unit has not
+    // seen them yet (measured; see "Registers" in the backend's docs).
+    drop(vcpu);
+    let unrun = guest.vcpu(&[SVC_0], |regs| regs.fpcr = u64::MAX);
+    assert_eq!(unrun.regs().unwrap().fpcr, u64::from(u32::MAX));
+}
+
+#[test]
+fn a_guest_that_enables_a_floating_point_trap_takes_it_on_this_host() {
+    let Some(guest) = Guest::new() else { return };
+    // `FPCR.DZE` (bit 9) enables the divide-by-zero trap (Arm ARM, `FPCR`). The Apple M2 keeps
+    // it, so the division traps: a listed divergence from a core that ignores the bit.
+    let program = [
+        0x1e6e_1000, // 0x00  fmov d0, #1.0
+        0x9e67_03e1, // 0x04  fmov d1, xzr
+        0x1e61_1802, // 0x08  fdiv d2, d0, d1
+        SVC_0,       // 0x0c
+    ];
+    let mut vcpu = guest.vcpu(&program, |regs| regs.fpcr = 1 << 9);
+    let pc = guest.base() + 8;
+    match vcpu.run().unwrap() {
+        Exit::Undefined { pc: at, syndrome } => {
+            assert_eq!(at, pc);
+            assert_eq!(
+                syndrome.class(),
+                ExceptionClass::Other(0x2c),
+                "{syndrome:x?}"
+            );
+        }
+        other => panic!("expected a trapped division, got {other:?}"),
+    }
+    drop(vcpu);
+    // Without the enable the same division only sets the flag (`FPSR.DZC`, bit 1).
+    let mut vcpu = guest.vcpu(&program, |_| {});
+    assert_eq!(vcpu.run().unwrap(), Exit::Svc(0));
+    assert_eq!(vcpu.regs().unwrap().fpsr, 1 << 1);
 }
 
 /// `msr dit, #1`, `msr ssbs, #1`, `mrs x0, dit`, `mrs x1, ssbs`, `mrs x2, nzcv` (assembled with
@@ -1856,7 +1933,10 @@ fn pstate_bits_the_guest_sets_reach_the_host() {
     let cases: [(&[u32], u64); 3] = [
         (&[MSR_DIT_1], PSTATE_DIT),
         (&[MSR_SSBS_1], PSTATE_SSBS),
-        (&[MSR_DIT_1, MSR_SSBS_1, CMP_X0_X0], PSTATE_DIT | PSTATE_SSBS | 0x6000_0000),
+        (
+            &[MSR_DIT_1, MSR_SSBS_1, CMP_X0_X0],
+            PSTATE_DIT | PSTATE_SSBS | 0x6000_0000,
+        ),
     ];
     for (code, expected) in cases {
         let mut program = code.to_vec();
@@ -1945,7 +2025,10 @@ fn a_guest_waiting_in_a_loop_can_still_be_interrupted() {
         let waker = std::thread::spawn(move || {
             let started = Instant::now();
             while read_u64(&memory, flag) == 0 {
-                assert!(started.elapsed() < Duration::from_secs(60), "the guest never ran");
+                assert!(
+                    started.elapsed() < Duration::from_secs(60),
+                    "the guest never ran"
+                );
                 std::thread::yield_now();
             }
             interrupter.interrupt().unwrap();
@@ -1954,7 +2037,10 @@ fn a_guest_waiting_in_a_loop_can_still_be_interrupted() {
         waker.join().unwrap();
         let pc = vcpu.regs().unwrap().pc;
         let base = guest.base();
-        assert!((base + 0x08..=base + 0x0c).contains(&pc), "{wait:#x}: {pc:#x}");
+        assert!(
+            (base + 0x08..=base + 0x0c).contains(&pc),
+            "{wait:#x}: {pc:#x}"
+        );
     }
 }
 

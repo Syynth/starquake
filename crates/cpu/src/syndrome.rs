@@ -15,7 +15,9 @@
 //! What a real vCPU has reported (the hardware tests in `tests/hvf.rs` and
 //! `src/hvf/hardware.rs`, and `tools/hvprobe/README.md`): classes 0x00 (an undefined
 //! instruction), 0x15 (`svc`), 0x18 (a trapped system register access), 0x1c (a failed pointer
-//! authentication), 0x20, 0x24 and 0x3c (`brk`); translation faults at levels 0 to 3 and
+//! authentication), 0x20, 0x24, 0x2c (a trapped floating-point exception, which has no name
+//! here) and 0x3c (`brk`), and, in `ESR_EL2` from the hypervisor rather than from EL0, 0x01 (a
+//! trapped `wfi`, `0x07e0_0000`); translation faults at levels 0 to 3 and
 //! permission faults at level 3. For those aborts the whole syndrome was exactly what
 //! [`Syndrome::data_abort`] and [`Syndrome::instruction_abort`] build: no other `ISS` bit was
 //! set. The other encodings below are taken from the manual and have not been seen on

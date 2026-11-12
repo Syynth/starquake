@@ -6,6 +6,33 @@
 //! are answered in the guest from the virtual counter, without a host exit. `cntvct_el0` reads,
 //! FP/SIMD and pointer authentication run natively.
 //!
+//! # Registers
+//!
+//! [`Vcpu::regs`] and [`Vcpu::set_regs`] move the whole context through Hypervisor.framework's
+//! register calls: x0-x30, `FPCR` and `FPSR` as registers, V0-V31 as SIMD&FP registers, and the
+//! EL0 state a parked vCPU keeps in EL1's registers (`ELR_EL1` is the program counter,
+//! `SPSR_EL1` holds `PSTATE`, of which only [`crate::GUEST_PSTATE_MASK`] is the guest's).
+//!
+//! `FPCR` and `FPSR` hold what the FP unit implements once the guest has run: measured on an
+//! Apple M2 with every bit written, the guest reads back `FPCR` `0x07ff_9f00` and `FPSR`
+//! `0x0800_009f` (`tests/hvf.rs`, `after_a_run_the_host_reads_the_fpcr_and_fpsr_the_guest_reads`
+//! checks that the host reads the same). Before the guest has run, the host reads back the low
+//! 32 bits of what it wrote. Among the kept `FPCR` bits are the floating-point trap enables
+//! (bits 15 and 12:8), so a guest that sets one takes a floating-point exception on this host;
+//! it comes back as an [`Exit::Undefined`] of class 0x2c. That a Cortex-A78C ignores those bits
+//! instead is a guess, unchecked against any pinned reference.
+//!
+//! # Wait hints
+//!
+//! Hypervisor.framework traps an EL0 `wfi` to the host (`ESR_EL2` `0x07e0_0000`: class 0x01,
+//! `TI` = `wfi`). `wfe` stayed in the guest: measured on an Apple M2 before the backend handled
+//! either, the program of `tests/hvf.rs`, `wait_hints_resume_past_themselves_without_an_exit`,
+//! ran its bare `wfe` (the one after `sevl; wfe` had used the event up) and stopped first at the
+//! `wfi`. Whether a `wfe` can trap on another host is not known, so the backend handles both:
+//! it steps over a trapped wait (`TI` of any value) and enters the guest again, inside
+//! [`Vcpu::run`], as the crate docs require ("Wait hints"). The shim never sees either:
+//! `SCTLR_EL1.nTWI` and `nTWE` are set, so neither traps to EL1.
+//!
 //! Design: `docs/specs/execution-model.md`, "Guest memory" ("Native backends: stage 1 is ours,
 //! stage 2 is coarse").
 //!
@@ -188,7 +215,8 @@ const CPACR_FP_ON: u64 = 3 << 20;
 /// `CNTKCTL_EL1`: EL0VCTEN only, so EL0 reads of `cntpct_el0` trap to the shim
 /// (`CNTKCTL_EL0_VCT_ONLY` in the probe).
 const CNTKCTL_VCT_ONLY: u64 = 0b10;
-/// `SCTLR_EL1`: RES1 bits, MMU and caches on, WFI/WFE not trapped, the four PAuth enables
+/// `SCTLR_EL1`: RES1 bits, MMU and caches on, WFI/WFE not trapped to EL1 (the hypervisor
+/// itself traps `wfi`: see "Wait hints" in the module docs), the four PAuth enables
 /// (`EnIA`, `EnIB` from the probe; `EnDA`, `EnDB` added), and EL0 access to `CTR_EL0` (`UCT`),
 /// `DC ZVA` (`DZE`) and cache maintenance by address (`UCI`), which ordinary user-space code
 /// relies on. `WXN` is clear: a writable page may be executable, as the software walker assumes.
@@ -1221,6 +1249,32 @@ mod tests {
         let root = TableRoot::new(TABLE_POOL_BASE + 0x3000).unwrap();
         assert_eq!(ttbr0(root, 0), 0x0000_000f_1000_3000);
         assert_eq!(ttbr0(root, 0xbeef), 0xbeef_000f_1000_3000);
+    }
+
+    #[test]
+    fn only_class_0x01_is_a_trapped_wait() {
+        // ESR_EL2 of the trapped `wfi` measured on an Apple M2 (`tests/hvf.rs`,
+        // `wait_hints_resume_past_themselves_without_an_exit`): EC 0x01, IL, CV with condition
+        // AL (ISS bits 24:20), TI = 0b00. A `wfe` differs only in TI = 0b01, and the `WFIT` and
+        // `WFET` forms in TI = 0b10 and 0b11 (Arm ARM, `ESR_ELx`, "ISS encoding for an exception
+        // from a WF* instruction").
+        for ti in 0..=0b11 {
+            assert!(is_trapped_wait(0x07e0_0000 | ti), "TI {ti:#b}");
+        }
+        // An `hvc` from the shim, an `svc`, an undefined instruction and a data abort are not.
+        for other in [0x5a00_0002, 0x5600_0002, 0x0200_0000, 0x9200_004f] {
+            assert!(!is_trapped_wait(other), "{other:#x}");
+        }
+    }
+
+    #[test]
+    fn stepping_over_an_instruction_stops_at_the_end_of_the_address_space() {
+        assert_eq!(after_instruction(0x8000_0000), Some(0x8000_0004));
+        assert_eq!(
+            after_instruction(u64::MAX - INSTRUCTION_LEN),
+            Some(u64::MAX)
+        );
+        assert_eq!(after_instruction(u64::MAX - INSTRUCTION_LEN + 1), None);
     }
 
     #[test]

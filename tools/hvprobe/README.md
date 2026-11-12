@@ -105,10 +105,22 @@ The guest runs at EL0 on tables built by `starquake_memory::stage1::Stage1Tables
 | A 64-bit descriptor written by the host as two halves (2,000 spin-loop iterations apart) while a vCPU walks to it | The vCPU stopped with a stage-2 fault at once: the half-written descriptor named `0x1000a000`, the low half of a page at `0x1_1000_a000` | Descriptors are written with one atomic 64-bit store. Guest RAM sits above 4 GiB so that a torn write cannot go unnoticed. |
 | The shim's page made accessible to EL0 (`AP` = 0b01) | The vCPU never comes back: a page EL0 can write is not executable at EL1, so the shim faults into itself forever | The shim's mapping must stay EL1-only; the golden test of the static tables guards it. |
 
+### Wait hints, FP/SIMD state and PSTATE (added 2026-11-12)
+
+Measured by the same hardware tests on the same Apple M2 (`crates/cpu/tests/hvf.rs`).
+
+| Question | Result | Consequence |
+|---|---|---|
+| EL0 `wfi` with `SCTLR_EL1.nTWI` set | Exits to the host: `ESR_EL2` `0x07e0_0000` (class 0x01, `TI` = `wfi`), the vCPU at EL0 on the `wfi` | The backend steps over it and enters the guest again. |
+| EL0 `wfe` with `SCTLR_EL1.nTWE` set, the event already used up by `sevl; wfe` | Came back in the guest, no exit | Handled like `wfi` all the same, should another host trap it. |
+| V0-V31 through `hv_vcpu_get/set_simd_fp_reg` | Every byte of all 32 round-trips both ways, and a context moved to a vCPU on another thread keeps them | The vector is passed by value in `q0`; the backend makes that call with inline assembly because Rust cannot yet pass vectors to foreign functions. |
+| `FPCR`, `FPSR` with every bit written | The guest reads `0x07ff_9f00` and `0x0800_009f`; after a run the host reads the same. Before a run the host reads back the low 32 bits it wrote | The trap enables (`FPCR` bits 15, 12:8) are kept: a guest that sets `DZE` and divides by zero takes class 0x2c. |
+| `PSTATE.DIT`, `PSTATE.SSBS` | `msr dit`, `msr ssbs` work at EL0; both bits show in `SPSR_EL1` at an exit and reach the guest from it | A context keeps NZCV, DIT and SSBS. |
+
 What this doesn't cover yet: VM-exit cost with six vCPUs running at once, full context-switch cost,
 `hv_vcpus_exit` for preempting a vCPU, stage-2 remapping cost (lazy backing of sparse regions),
-and exception-level details of a real HLE kernel (TPIDRRO_EL0, FP/SIMD state, EL0 data aborts
-for fastmem-style tracking).
+and exception-level details of a real HLE kernel (TPIDRRO_EL0, EL0 data aborts for
+fastmem-style tracking).
 
 ## What it means across backends
 
