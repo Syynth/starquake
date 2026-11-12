@@ -1267,6 +1267,12 @@ fn pages_of(address: u64, size: u64) -> impl Iterator<Item = u64> {
 }
 
 impl Translated {
+    fn map(&mut self, address: u64, size: u64, perms: Perms) {
+        for page in pages_of(address, size) {
+            assert_eq!(self.0.insert(page, perms), None, "mapped twice: {page:#x}");
+        }
+    }
+
     fn replay(&mut self, log: &MapperLog) {
         for call in log.take() {
             match call {
@@ -1274,11 +1280,13 @@ impl Translated {
                     address,
                     size,
                     perms,
-                } => {
-                    for page in pages_of(address, size) {
-                        assert_eq!(self.0.insert(page, perms), None, "mapped twice: {page:#x}");
-                    }
-                }
+                } => self.map(address, size, perms),
+                MapperCall::MapShared {
+                    address,
+                    backing,
+                    perms,
+                } => self.map(address, backing.size(), perms),
+                MapperCall::AllocateShared { .. } => {}
                 MapperCall::Unmap { address, size } => {
                     for page in pages_of(address, size) {
                         assert!(self.0.remove(&page).is_some(), "not mapped: {page:#x}");

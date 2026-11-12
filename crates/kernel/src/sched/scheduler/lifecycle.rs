@@ -211,13 +211,19 @@ impl Scheduler {
     /// Tears down what an object named once its last reference has gone: the one place that
     /// decides what destroying each kind means. A session's client end goes and its server is
     /// told (`KClientSession::Destroy`); a thread is destroyed (`KThread::Finalize`); a process
-    /// object names a row that outlives it; an event's end is its row, which the object table
-    /// has removed already.
+    /// object names a row that outlives it; an event's end, and a shared memory, is its row,
+    /// which the object table has removed already. A transfer memory whose owner's pages are
+    /// locked has left their unlock to the dispatcher ([`crate::object::Objects::take_unlocks`]),
+    /// which holds the owner's address space.
     pub fn tear_down(&mut self, object: ObjectId, kind: Object) -> CallResult<()> {
         match kind {
             Object::Session => self.ipc.forget(object)?,
             Object::Thread(thread) => self.destroy_thread(thread)?,
-            Object::Process(_) | Object::Event(_) | Object::ReadableEvent(_) => {}
+            Object::Process(_)
+            | Object::Event(_)
+            | Object::ReadableEvent(_)
+            | Object::SharedMemory(_)
+            | Object::TransferMemory(_) => {}
         }
         Ok(())
     }

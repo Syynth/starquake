@@ -12,6 +12,7 @@
 
 use starquake_kernel::handle::Handle;
 use starquake_kernel::id::ObjectId;
+use starquake_kernel::memory::{SharedPages, SvcPermission};
 use starquake_kernel::result::SvcResult;
 use starquake_trace::{EventKind, ServiceId};
 
@@ -35,6 +36,18 @@ pub trait Kernel {
 
     /// Signals an event, waking the guest threads that wait on it.
     fn signal_event(&mut self, event: ObjectId) -> SvcResult<()>;
+
+    /// Creates a shared memory of `size` bytes, rounded up to whole pages, that the caller maps
+    /// with `permission` (read, or read and write), and returns it with its pages. The service
+    /// keeps the id and the pages: it writes the pages by offset, and gives the caller a handle
+    /// with [`Reply::copy_handle`](super::Reply::copy_handle), which the caller maps with
+    /// `MapSharedMemory`. A size of zero is the kernel's "invalid size" error, and any other
+    /// permission its "invalid new memory permission" error.
+    fn create_shared_memory(
+        &mut self,
+        size: u64,
+        permission: SvcPermission,
+    ) -> SvcResult<(ObjectId, SharedPages)>;
 
     /// Creates a new session on the server that is handling this request, and adds a handle to
     /// its client end to the caller's table. Returns the session and that handle. All or nothing:

@@ -83,7 +83,11 @@ use crate::ipc::message::{MessageBuffer, Translated, Translation, translate};
 use crate::ipc::{
     Admission, Done, Finish, Handled, IpcError, Notice, PortName, Request, Sender, SessionHandler,
 };
-use crate::memory::AddressSpace;
+use crate::memory::shared::span_within;
+use crate::memory::{
+    AddressSpace, SharedMemory, SharedPages, SvcPermission, TransferMemory,
+    is_shared_memory_permission, shared_memory_size,
+};
 use crate::object::Object;
 use crate::result::{CallResult, KernelError, ResultCode, SvcError, SvcResult};
 use crate::svc::sync::read_user_memory;
@@ -259,6 +263,97 @@ impl IpcContext<'_> {
                 .write(address, data)
                 .map_err(|_| KernelError::InvalidCurrentMemory)
         })
+    }
+
+    /// Creates a shared memory for the server (`KSharedMemory::Create` and `Initialize`, as
+    /// Eden's HLE services make theirs: no owner process, the owner permission `None`) of
+    /// `size` bytes rounded up to whole pages, which processes map with `permission`. Returns
+    /// the object, which the server gives the sender a copy handle to, and its pages, which the
+    /// server reads and writes by offset ([`SharedPages`]). The server keeps the creator's
+    /// reference for as long as it lives, as it does an event's.
+    ///
+    /// [`KernelError::InvalidSize`] for a size of zero or one that rounds past the 64-bit space
+    /// (a guess: see [`shared_memory_size`]), [`KernelError::InvalidNewMemoryPermission`] unless
+    /// `permission` is read or read-write, and [`KernelError::OutOfResource`] when the object
+    /// table is full. A translation with no backing to share
+    /// ([`Mapper::allocate_shared`](crate::memory::Mapper::allocate_shared)) is the kernel's
+    /// own failure, logged, and [`KernelError::InvalidState`] here.
+    pub fn create_shared_memory(
+        &mut self,
+        size: u64,
+        permission: SvcPermission,
+    ) -> SvcResult<(ObjectId, SharedPages)> {
+        let size = shared_memory_size(size).ok_or(KernelError::InvalidSize)?;
+        if !is_shared_memory_permission(permission) {
+            return Err(KernelError::InvalidNewMemoryPermission);
+        }
+        self.dispatcher
+            .with::<(&mut AddressSpace, &mut Scheduler), _>(|(space, scheduler)| {
+                let pages = space.allocate_shared(size)?;
+                let memory = SharedMemory::new(pages.backing(), permission)?;
+                let object = scheduler
+                    .objects_mut()
+                    .create(Object::SharedMemory(memory))?;
+                Ok((object, pages))
+            })
+            .map_err(call_error)
+    }
+
+    /// The transfer memory `object` names: one of the request's own handles resolved
+    /// ([`IpcContext::resolve_handle`]), as a server is given a transfer memory.
+    /// [`KernelError::InvalidHandle`] when it names no live transfer memory, or one whose pages
+    /// are not locked (one being made, which no handle names yet).
+    pub fn transfer_memory(&self, object: ObjectId) -> SvcResult<TransferMemory> {
+        let found = self
+            .dispatcher
+            .with::<(&Scheduler,), _>(|(scheduler,)| scheduler.objects().get(object));
+        match found {
+            Ok(Object::TransferMemory(transfer)) if transfer.is_locked() => Ok(transfer),
+            _ => Err(KernelError::InvalidHandle),
+        }
+    }
+
+    /// Copies `out.len()` bytes at `offset` into the transfer memory `object` names into
+    /// `out`: what an HLE server does instead of mapping it (see
+    /// [`crate::svc::transfer_memory`]). The bytes are read where the owner lent them, whatever
+    /// permission the owner kept. [`KernelError::InvalidHandle`] as for
+    /// [`IpcContext::transfer_memory`], and [`KernelError::InvalidCurrentMemory`] unless the
+    /// bytes lie wholly inside the transfer memory; nothing is copied then.
+    ///
+    /// PROVISIONAL: the owner is taken to be the sender, whose memory this context reaches
+    /// (one process per set of tables, `crate::tables`).
+    pub fn read_transfer_memory(
+        &self,
+        object: ObjectId,
+        offset: u64,
+        out: &mut [u8],
+    ) -> SvcResult<()> {
+        let address = self.lent_range(object, offset, out.len())?;
+        self.memory
+            .read(address, out)
+            .map_err(|_| KernelError::InvalidCurrentMemory)
+    }
+
+    /// Copies `data` into the transfer memory `object` names, at `offset`. The same rules as
+    /// [`IpcContext::read_transfer_memory`].
+    pub fn write_transfer_memory(
+        &mut self,
+        object: ObjectId,
+        offset: u64,
+        data: &[u8],
+    ) -> SvcResult<()> {
+        let address = self.lent_range(object, offset, data.len())?;
+        self.memory
+            .write(address, data)
+            .map_err(|_| KernelError::InvalidCurrentMemory)
+    }
+
+    /// The owner's address of `len` bytes at `offset` into the transfer memory `object` names,
+    /// if they lie wholly inside it.
+    fn lent_range(&self, object: ObjectId, offset: u64, len: usize) -> SvcResult<u64> {
+        let transfer = self.transfer_memory(object)?;
+        span_within(transfer.address(), transfer.size(), offset, len)
+            .ok_or(KernelError::InvalidCurrentMemory)
     }
 
     /// Records an event for the request. It is recorded, stamped with the request's sender and

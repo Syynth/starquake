@@ -4,6 +4,7 @@ use core::any::Any;
 use std::sync::Arc;
 
 use starquake_kernel::id::ObjectId;
+use starquake_kernel::memory::{SharedPages, SvcPermission};
 
 use super::defer::{Deferral, ReplyToken, TokenId};
 use super::kernel::Kernel;
@@ -47,6 +48,18 @@ impl Context<'_> {
     /// Signals an event.
     pub fn signal_event(&mut self, event: ObjectId) -> Result<(), Fault> {
         Ok(self.kernel.signal_event(event)?)
+    }
+
+    /// Creates a shared memory of `size` bytes (rounded up to whole pages) that the caller
+    /// maps with `permission`. Keep the id and the pages: write the pages by offset, and give
+    /// the caller a handle with [`Reply::copy_handle`](super::Reply::copy_handle).
+    /// See [`Kernel::create_shared_memory`] for the errors.
+    pub fn create_shared_memory(
+        &mut self,
+        size: u64,
+        permission: SvcPermission,
+    ) -> Result<(ObjectId, SharedPages), Fault> {
+        Ok(self.kernel.create_shared_memory(size, permission)?)
     }
 
     /// Copies `out.len()` bytes of the caller's memory at `address` into `out`.

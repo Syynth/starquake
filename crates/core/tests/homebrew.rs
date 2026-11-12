@@ -2045,9 +2045,9 @@ mod trace {
             ipc sm:::1 (GetService)\n\
             svc 0x21 SendSyncRequest(session_handle=0x103fe) -> 0x0\n\
             ipc set:sys::3 (GetSettingsItemValue)\n\
-            svc 0x15 CreateTransferMemory(address=heap_region+0x1000, size=0x800000, map_perm=0x0) -> 0xd401\n\
+            svc 0x2c MapPhysicalMemory(address=alias_region+0x1000, size=0x200000) -> 0xd401\n\
             svc 0x21 SendSyncRequest(session_handle=0x183fd) -> 0xf601\n\
-            svc 0x15 CreateTransferMemory(address=heap_region+0x1000, size=0x800000, map_perm=0x0) -> 0x0 out_handle=0xf03e3\n\
+            svc 0x2c MapPhysicalMemory(address=alias_region+0x1000, size=0x200000) -> 0x0\n\
             ipc apm::0 (OpenSession)\n\
             svc 0x21 SendSyncRequest(session_handle=0x203fd) -> 0x0\n\
             ipc IpcController::7 (Unheard)\n\
@@ -2080,7 +2080,7 @@ mod trace {
                     // is its `SendSyncRequest`'s, past the calls in between.
                     gap(9, "ipc set:sys::3 (GetSettingsItemValue)", "0xf601"),
                     // A planned call, with the result of its first use.
-                    gap(10, "svc 0x15 CreateTransferMemory", "0xd401"),
+                    gap(10, "svc 0x2c MapPhysicalMemory", "0xd401"),
                     // A control command the framework does not have, and a request with no
                     // `SendSyncRequest` after it.
                     gap(15, "ipc IpcController::7 (Unheard)", "none"),
@@ -2092,7 +2092,7 @@ mod trace {
         #[test]
         fn what_starquake_implements_is_decided_by_its_tables() {
             assert!(implements_call(SvcId::GetInfo.number()));
-            assert!(!implements_call(SvcId::CreateTransferMemory.number()));
+            assert!(!implements_call(SvcId::MapPhysicalMemory.number()));
             assert!(!implements_call(0x7777));
             assert!(implements_request(
                 CONTROL_INTERFACE,
