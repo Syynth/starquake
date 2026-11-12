@@ -350,6 +350,43 @@ mod goldens {
         );
     }
 
+    /// RGBA8, 3D 40 by 20 by 13, 3 levels: level 0 is 160 by 20 bytes, so with 1-GOB tiles it
+    /// is 3 tiles wide and 3 tall, and level 1 (80 by 10 bytes) 2 by 2. Every slice offset of
+    /// every level agrees with the block-linear offset of the slice's first byte, both with
+    /// tiles one slice deep (`z_log2` 0, where the slice is never inside a tile) and with tiles
+    /// four slices deep (`z_log2` 2). A level several tiles wide and tall is what makes the
+    /// tiles-per-plane factor observable.
+    #[test]
+    fn slice_offsets_match_block_linear_offsets_on_a_multi_tile_level() {
+        for z_log2 in [0, 2] {
+            let requested = tiling(GobType::TuringColor2d, 0, 0, z_log2);
+            let image = Image::new(&ImageDesc {
+                dim: ImageDim::D3,
+                format: rgba8(),
+                extent_px: Extent4D::new(40, 20, 13, 1),
+                levels: 3,
+                sample_layout: SampleLayout::S1x1,
+                tiling: requested,
+                pitch_b: None,
+            })
+            .unwrap();
+            let level_0 = image.level_extent_b(0).unwrap();
+            let tile = image.levels()[0].tiling.extent_b();
+            assert!(level_0.width.div_ceil(tile.width) > 1, "z_log2 {z_log2}");
+            assert!(level_0.height.div_ceil(tile.height) > 1, "z_log2 {z_log2}");
+            for (level, info) in (0u32..).zip(image.levels()) {
+                let extent_b = image.level_extent_b(level).unwrap();
+                for z in 0..extent_b.depth {
+                    assert_eq!(
+                        image.level_z_offset_b(level, z),
+                        block_linear_offset(&info.tiling, extent_b, Offset4D::new(0, 0, z, 0)),
+                        "z_log2 {z_log2}, level {level}, slice {z}"
+                    );
+                }
+            }
+        }
+    }
+
     /// ASTC 8 by 8 (16-byte blocks), 100 by 100 px: 13 by 13 blocks = 208 bytes by 13 rows. With
     /// tiles 1 by 16 GOBs requested, level 0 is 2 GOBs tall → tiles 1 by 2 GOBs (64 by 16), so the
     /// mip tail starts at level 0 (a difference from Mesa, which asserts a tail starts above level
@@ -584,8 +621,10 @@ mod goldens {
         );
     }
 
-    /// The image Eden-NX2 hit in blocker-log row 87: 8192 by 8192, 68 layers of RGBA8, about 18 GB.
-    /// It lays out without overflow; each layer is 8192 * 4 * 8192 bytes = 256 MiB.
+    /// The shape of the image Eden-NX2 hit in blocker-log row 87, 8192 by 8192 with 68 layers,
+    /// as RGBA8 to stress size: about 18 GB. (The scoping doc gives the guest's format as ASTC 8
+    /// by 8, 1.5 GB in guest memory, 23 GB once Eden decodes it to RGBA8.) It lays out without
+    /// overflow; each layer is 8192 * 4 * 8192 bytes = 256 MiB.
     #[test]
     fn a_huge_virtual_texture_lays_out() {
         let image = Image::new(&desc_2d(
