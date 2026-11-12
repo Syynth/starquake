@@ -19,6 +19,7 @@ starquake-gpu = { path = "crates/gpu" }
 starquake-gsv = { path = "crates/gsv" }
 starquake-ipc = { path = "crates/ipc" }
 starquake-kernel = { path = "crates/kernel" }
+starquake-layout = { path = "crates/layout" }
 starquake-loader = { path = "crates/loader" }
 starquake-memory = { path = "crates/memory" }
 starquake-render = { path = "crates/render" }
