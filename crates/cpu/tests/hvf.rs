@@ -1047,15 +1047,17 @@ fn a_flush_on_one_vcpu_stops_another_that_never_leaves_the_guest() {
         let Spin::Faulted { iterations, exit } = report else {
             return;
         };
-        assert_eq!(
-            exit,
-            Exit::DataAbort {
-                address: page,
-                write: false,
-                syndrome: Syndrome::data_abort(FaultStatus::Translation { level: 1 }, false),
-            },
-            "round {round}"
-        );
+        // A load from the page that found it unmapped. Once the flush has run that is at
+        // level 1 (the page was alone under its tables, which the unmap unlinked). But the
+        // spinner may lose its cached translation on its own, and walk while the unmap is
+        // still between its three descriptor writes (the page, then each table): then it
+        // faults at level 3 or 2. Seen as soon as the machine is busy.
+        let unmapped = [1, 2, 3].map(|level| Exit::DataAbort {
+            address: page,
+            write: false,
+            syndrome: Syndrome::data_abort(FaultStatus::Translation { level }, false),
+        });
+        assert!(unmapped.contains(&exit), "round {round}: {exit:?}");
         let after = iterations.saturating_sub(at_flush);
         assert!(
             after <= ITERATIONS_AFTER_A_FLUSH,
