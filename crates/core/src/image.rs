@@ -42,7 +42,9 @@
 //! [`Program::description`] is what the kernel creates the process from. For an ExeFS it comes
 //! from `main.npdm` as Eden's `KProcess::LoadFromMetadata` reads it
 //! (`eden/src/core/hle/kernel/k_process.cpp` and
-//! `eden-pr4588/src/core/file_sys/program_metadata.cpp` @ e5fb3b97):
+//! `eden-pr4588/src/core/file_sys/program_metadata.cpp` @ e5fb3b97), for the inputs in this
+//! table; the divergences below list the inputs of `LoadFromMetadata` that are refused or not
+//! read:
 //!
 //! | Description | NPDM | Eden |
 //! |---|---|---|
@@ -70,6 +72,19 @@
 //!
 //! Divergences from Eden in the description, each pinned by a test here:
 //!
+//! - **A 32-bit program** (`META` flags bit 0 clear) is [`LoadError::Not64Bit`], checked before
+//!   the thread info. Eden's `KProcess::LoadFromMetadata` sets `CreateProcessFlag::Is64Bit` only
+//!   when `metadata.Is64BitProgram()`, and `KProcess::InitializeInterfaces` then runs a process
+//!   without it under `Core::ArmDynarmic32`; starquake runs only 64-bit Arm code. Test:
+//!   `a_32_bit_program_is_refused`.
+//! - **The `ACID` pool partition is not read**, so the description does not follow
+//!   `KProcess::LoadFromMetadata` in this input. Eden sizes the process's resource limit from
+//!   `kernel.MemoryManager().GetSize(pool)`, with `pool` from `metadata.GetPoolPartition()`, and
+//!   sets `CreateProcessFlag::IsApplication` only for `KMemoryManager::Pool::Application`
+//!   (`KProcess::Initialize` then picks the application system resource, and NCE patching is
+//!   gated on it). Here the description has no such field: the resource limit is the console's
+//!   application pool whatever the partition ([`memory_arrangement`]), and no is-application
+//!   flag is kept. Test: `the_pool_partition_does_not_change_the_description`.
 //! - **No thread-info capability** is [`LoadError::NoThreadInfo`]. Eden leaves the process's
 //!   core and priority masks empty and goes on; its main thread then fails a soft assert
 //!   (`KThread::Initialize`). Test: `metadata_without_thread_info_is_refused`.
@@ -194,6 +209,11 @@ pub enum LoadError {
     /// A module cannot be loaded (the loader's code set refused it).
     #[error(transparent)]
     CodeSet(#[from] CodeSetError),
+    /// The program's metadata marks it as 32-bit (`META` flags bit 0 clear): its code is
+    /// 32-bit Arm, which starquake does not run (see "The process's description" in the module
+    /// docs).
+    #[error("the program's metadata marks it as 32-bit (AArch32) code, which cannot be run")]
+    Not64Bit,
     /// The program's metadata has no thread-info capability, so its process has no cores or
     /// priorities.
     #[error("the program's metadata gives its process no cores or priorities")]
@@ -1702,6 +1722,93 @@ mod tests {
             })
             .collect();
         assert_eq!(placed.writes, expected);
+    }
+
+    #[test]
+    fn each_module_starts_at_the_sum_of_the_sizes_before_it() {
+        // Three modules whose `.bss` makes each a different size (three, two and five pages), so
+        // a base advanced by any one module's size instead of its own is caught.
+        let page = u32::try_from(PAGE).unwrap();
+        let program = program_of(vec![
+            // A page of text, eight bytes of data, then `.bss`.
+            ("rtld", nso(&[], page)),
+            ("main", nso(&[], 0)),
+            ("sdk", nso(&[], 3 * page)),
+        ]);
+        let sizes: Vec<u64> = program.modules().iter().map(|m| m.code.size).collect();
+        assert_eq!(sizes, [3 * PAGE, 2 * PAGE, 5 * PAGE]);
+        let placed = place(&program, BASE, Some(RESCALE)).unwrap();
+        let mut expected = BASE;
+        for (module, size) in placed.modules.iter().zip(&sizes) {
+            assert_eq!(
+                (module.base, module.size),
+                (expected, *size),
+                "{}",
+                module.name
+            );
+            let text = format!("{}.text", module.name);
+            let found = placed.mappings.iter().find(|m| m.name == text).unwrap();
+            assert_eq!(found.start, expected, "{}", module.name);
+            expected += size;
+        }
+        assert_eq!(placed.code_end(), expected);
+        // The regions cover every module with no hole.
+        let mut at = BASE;
+        for region in &placed.module_regions {
+            assert_eq!(region.start, at);
+            at += region.size;
+        }
+        assert_eq!(at, expected);
+    }
+
+    #[test]
+    fn a_module_with_an_empty_text_is_placed_with_nothing_to_patch() {
+        // Rodata and data present, text empty: the text's page has no guest access, and the
+        // patcher has nothing to rewrite.
+        use starquake_loader::nso::{Nso, NsoSegment, RodataExtent};
+        let page = u32::try_from(PAGE).unwrap();
+        let none = RodataExtent { offset: 0, size: 0 };
+        let code = CodeSet::from_nso(Nso {
+            text: NsoSegment {
+                memory_offset: 0,
+                data: Vec::new(),
+            },
+            rodata: NsoSegment {
+                memory_offset: page,
+                data: vec![0xB2; 0x10],
+            },
+            data: NsoSegment {
+                memory_offset: 2 * page,
+                data: vec![0xC3; 8],
+            },
+            bss_size: 0,
+            build_id: [0x42; starquake_loader::codeset::BUILD_ID_SIZE],
+            flags: 0,
+            module_name_offset: 0,
+            module_name_size: 0,
+            api_info: none,
+            dynstr: none,
+            dynsym: none,
+        })
+        .unwrap();
+        let placed = place(&program_of(vec![("main", code)]), BASE, Some(RESCALE)).unwrap();
+        assert_eq!(
+            placed.regions(),
+            [
+                region(BASE, 1, Perms::None),
+                region(BASE + PAGE, 1, Perms::Read),
+                region(BASE + 2 * PAGE, 1, Perms::ReadWrite),
+            ]
+        );
+        assert_eq!(
+            placed.mappings,
+            [
+                mapping("main.rodata", BASE + PAGE, BASE + PAGE + 0x10),
+                mapping("main.data", BASE + 2 * PAGE, BASE + 2 * PAGE + 8),
+            ]
+        );
+        assert_eq!(placed.counter_reads, Vec::<u64>::new());
+        assert_eq!(placed.trampolines, None);
     }
 
     #[test]

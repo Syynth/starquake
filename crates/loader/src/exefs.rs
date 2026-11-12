@@ -218,6 +218,13 @@ mod tests {
     }
 
     #[test]
+    fn main_missing_is_reported_before_a_malformed_module() {
+        // Both faults at once: no `main`, and an `sdk` that is not an NSO.
+        let error = ExeFs::parse(&[(NPDM_FILE, NPDM), ("sdk", b"nope")]).unwrap_err();
+        assert!(matches!(error, ExeFsError::MissingMain), "{error:?}");
+    }
+
+    #[test]
     fn a_malformed_module_is_named() {
         let error =
             ExeFs::parse(&[(NPDM_FILE, NPDM), (MAIN_MODULE, NSO), ("sdk", b"nope")]).unwrap_err();

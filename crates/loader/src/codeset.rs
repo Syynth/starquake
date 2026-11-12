@@ -25,7 +25,9 @@
 //! data), text starts the module (`hdr.text_dst_offset == 0`), text ends at or before rodata
 //! starts and rodata at or before data starts (`text_end <= ro_dst_offset`,
 //! `ro_end <= rw_dst_offset`). Its `DecideAddressSpaceLayout` sizes the module the same way as
-//! Eden once those hold (the largest segment end plus `.bss`, aligned up), and its
+//! Eden once those hold (the largest segment end plus `.bss`, aligned up) and refuses a module
+//! whose size is then zero (`R_UNLESS(aligned_up_size > 0, ldr::ResultInvalidNso())`; the same
+//! line masks the size with `AutoLoadModuleSizeMax - 1`, which is not applied here), and its
 //! `LoadAutoLoadModule` gives data and `.bss` one read-write range
 //! (`util::AlignUp(nso_header->rw_size + nso_header->bss_size, os::MemoryPageSize)`).
 //!
@@ -41,8 +43,11 @@
 //!
 //! - **NSO: Atmosphère's checks**, which Eden does not make: each is an error here
 //!   ([`CodeSetError::TextNotAtStart`], [`CodeSetError::MisalignedSegment`],
-//!   [`CodeSetError::SegmentsOutOfOrder`]). Tests: `an_nso_whose_text_does_not_start_the_module_is_refused`,
-//!   `an_nso_segment_off_a_page_boundary_is_refused`, `nso_segments_out_of_order_are_refused`.
+//!   [`CodeSetError::SegmentsOutOfOrder`], [`CodeSetError::EmptyModule`]). Tests: `an_nso_whose_text_does_not_start_the_module_is_refused`,
+//!   `an_nso_segment_off_a_page_boundary_is_refused`, `nso_segments_out_of_order_are_refused`,
+//!   `an_nso_module_of_no_bytes_is_refused`. An empty `.text` in a module that is not empty is
+//!   loaded (none of the checks cited above refuses it), with nothing in it to rewrite
+//!   (`an_empty_text_is_an_empty_slice_to_rewrite`).
 //! - **NRO: a `MOD0` whose `.bss` ends before it starts** is [`CodeSetError::BadBss`]; Eden
 //!   subtracts the two unchecked. Test: `a_mod0_whose_bss_ends_before_it_starts_is_refused`.
 //! - **NRO: `.bss` is its own range**, the pages after the image ([`CodeSet::protections`]).
@@ -141,6 +146,9 @@ pub enum CodeSetError {
         /// The later segment's memory offset.
         offset: u32,
     },
+    /// The NSO's module has no bytes: every segment is empty and it has no `.bss`.
+    #[error("the NSO's module is empty: it has no segment bytes and no .bss")]
+    EmptyModule,
     /// A size, or an offset derived from one, does not fit 64 bits.
     #[error("the module's sizes overflow the address space")]
     Overflow,
@@ -220,7 +228,8 @@ impl CodeSet {
     /// Atmosphère's checks, in its order: text not at offset zero
     /// ([`CodeSetError::TextNotAtStart`]) is checked after each segment's alignment
     /// ([`CodeSetError::MisalignedSegment`], text then rodata then data), then the order of the
-    /// segments ([`CodeSetError::SegmentsOutOfOrder`], rodata then data).
+    /// segments ([`CodeSetError::SegmentsOutOfOrder`], rodata then data), then a module of no
+    /// bytes ([`CodeSetError::EmptyModule`]).
     pub fn from_nso(nso: Nso) -> Result<Self, CodeSetError> {
         let Nso {
             text,
@@ -260,6 +269,11 @@ impl CodeSet {
         // largest end are the same.
         let data_end = data_at.end().ok_or(CodeSetError::Overflow)?;
         let size = page_up(add(data_end, u64::from(bss_size))?)?;
+        // Atmosphère's `R_UNLESS(aligned_up_size > 0, ldr::ResultInvalidNso())` (see the module
+        // docs).
+        if size == 0 {
+            return Err(CodeSetError::EmptyModule);
+        }
         let pieces = [(text_at, text), (rodata_at, rodata), (data_at, data)]
             .into_iter()
             .filter(|(_, s)| !s.data.is_empty())
@@ -315,10 +329,14 @@ impl CodeSet {
         ranges
     }
 
-    /// The bytes of `.text`, to rewrite in place: the part of the piece that holds it. `None`
-    /// when no piece holds all of it.
+    /// The bytes of `.text`, to rewrite in place: the part of the piece that holds it, or an
+    /// empty slice for an empty `.text` (no piece holds it: empty segments are not pieces).
+    /// `None` when a non-empty `.text` is not held whole by one piece.
     pub fn text_mut(&mut self) -> Option<&mut [u8]> {
         let text = self.text;
+        if text.size == 0 {
+            return Some(&mut []);
+        }
         let end = text.end()?;
         self.pieces.iter_mut().find_map(|piece| {
             let start = usize::try_from(text.offset.checked_sub(piece.offset)?).ok()?;
@@ -504,6 +522,57 @@ mod tests {
             CodeSetError::SegmentsOutOfOrder { offset: 0x2000 }.to_string(),
             "the NSO's segment at 0x2000 starts before the segment ahead of it ends"
         );
+    }
+
+    /// [`nso`] with every segment emptied and no `.bss`, the segments at `offsets`.
+    fn empty_nso(offsets: [u32; 3]) -> Nso {
+        let mut file = nso();
+        for (segment, offset) in [&mut file.text, &mut file.rodata, &mut file.data]
+            .into_iter()
+            .zip(offsets)
+        {
+            segment.data.clear();
+            segment.memory_offset = offset;
+        }
+        file.bss_size = 0;
+        file
+    }
+
+    #[test]
+    fn an_nso_module_of_no_bytes_is_refused() {
+        // Atmosphère's `R_UNLESS(aligned_up_size > 0, ldr::ResultInvalidNso())` (see the module
+        // docs): every segment empty at offset zero, and no `.bss`.
+        assert_eq!(
+            CodeSet::from_nso(empty_nso([0, 0, 0])),
+            Err(CodeSetError::EmptyModule)
+        );
+        assert_eq!(
+            CodeSetError::EmptyModule.to_string(),
+            "the NSO's module is empty: it has no segment bytes and no .bss"
+        );
+        // One byte of `.bss`, or of data, makes a module of one page.
+        let mut bss = empty_nso([0, 0, 0]);
+        bss.bss_size = 1;
+        assert_eq!(CodeSet::from_nso(bss).unwrap().size, PAGE);
+        let mut data = empty_nso([0, 0, 0]);
+        data.data.data = vec![0xE5];
+        assert_eq!(CodeSet::from_nso(data).unwrap().size, PAGE);
+        // Empty segments that start further on still reach their offsets: Atmosphère's size is
+        // the largest segment end, so this module is two pages, not empty.
+        let far = CodeSet::from_nso(empty_nso([0, page_u32(), 2 * page_u32()])).unwrap();
+        assert_eq!(far.size, 2 * PAGE);
+    }
+
+    #[test]
+    fn an_empty_text_is_an_empty_slice_to_rewrite() {
+        // Rodata and data present, text empty: no check cited in the module docs refuses it,
+        // and the caller's patcher then has no reads to rewrite.
+        let mut file = nso();
+        file.text.data.clear();
+        let mut code = CodeSet::from_nso(file).unwrap();
+        assert_eq!(code.text, Segment { offset: 0, size: 0 });
+        assert_eq!(code.pieces.len(), 2);
+        assert_eq!(code.text_mut(), Some(&mut [][..]));
     }
 
     #[test]

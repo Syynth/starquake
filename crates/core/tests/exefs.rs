@@ -11,6 +11,7 @@
 use std::time::Duration;
 
 use starquake_core::loader::exefs::{ExeFs, MAIN_MODULE, NPDM_FILE};
+use starquake_core::loader::npdm::AcidLayout;
 use starquake_core::{ExitReason, Mapping, RunOptions, RunReport, System, exit_code};
 
 const NSO: &[u8] = include_bytes!("../../../tests/homebrew/hello/hello.nso");
@@ -94,6 +95,22 @@ fn the_hello_exefs_runs_to_exit_process_as_its_nro_twin_does() {
         stack.end - stack.start,
         u64::from(npdm.main_thread_stack_size)
     );
+}
+
+#[test]
+fn a_switch2_exefs_runs_with_its_own_consoles_counter() {
+    // The hello fixture's metadata says Switch 1; this makes it a Switch 2 program. The core
+    // loop must then run with the Switch 2 counter: a loop that took the NRO console's instead
+    // ends in a console mismatch, not an exit.
+    let mut exefs =
+        ExeFs::parse(&[(NPDM_FILE, NPDM), (MAIN_MODULE, NSO)]).expect("the fixture's ExeFS parses");
+    exefs.npdm.acid.layout = AcidLayout::Switch2;
+    let system = System::from_exefs(exefs).expect("the Switch 2 ExeFS loads");
+    let Some(report) = run(&system) else {
+        return;
+    };
+    assert_eq!(report.exit, ExitReason::ProcessExited, "{}", report.trace);
+    assert_eq!(report.guest_log.len(), 3);
 }
 
 #[test]

@@ -49,9 +49,14 @@ fn range(values: &RangeInclusive<u8>) -> Range {
     }
 }
 
-/// The process `npdm` describes. [`LoadError::NoThreadInfo`] when its `ACI0` kernel
-/// capabilities have no thread info.
+/// The process `npdm` describes. [`LoadError::Not64Bit`] when its `META` flags mark it as 32-bit,
+/// else [`LoadError::NoThreadInfo`] when its `ACI0` kernel capabilities have no thread info.
 pub(crate) fn describe(npdm: &Npdm) -> Result<ProcessDescription, LoadError> {
+    // Eden's `KProcess::LoadFromMetadata` sets `CreateProcessFlag::Is64Bit` only when
+    // `metadata.Is64BitProgram()`; without it the process runs as AArch32, which is refused here.
+    if !npdm.is_64_bit {
+        return Err(LoadError::Not64Bit);
+    }
     let capabilities = &npdm.aci.kernel_capabilities;
     let threads = capabilities
         .thread_info
@@ -74,6 +79,7 @@ pub(crate) fn describe(npdm: &Npdm) -> Result<ProcessDescription, LoadError> {
 
 #[cfg(test)]
 mod tests {
+    use starquake_loader::npdm::PoolPartition;
     use starquake_loader::npdm::capabilities::ThreadInfo;
 
     use super::*;
@@ -87,12 +93,12 @@ mod tests {
         npdm.name = "describe-me-please".to_owned();
         npdm.aci.title_id = 0x0100_0000_0000_1234;
         npdm.main_thread_priority = 45;
-        npdm.main_thread_core = 1;
+        npdm.main_thread_core = 2;
         npdm.main_thread_stack_size = 0x0003_4000;
         npdm.system_resource_size = 0x0020_0000;
         npdm.aci.kernel_capabilities.thread_info = Some(ThreadInfo {
             priorities: 24..=58,
-            cores: 1..=2,
+            cores: 1..=3,
         });
         npdm.aci.kernel_capabilities.handle_table_size = Some(0x123);
         npdm
@@ -106,13 +112,13 @@ mod tests {
                 name: "describe-me-".to_owned(),
                 program_id: 0x0100_0000_0000_1234,
                 address_space: AddressSpaceWidth::Is39Bit,
-                cores: Range { first: 1, last: 2 },
+                cores: Range { first: 1, last: 3 },
                 priorities: Range {
                     first: 24,
                     last: 58
                 },
                 main_thread_priority: 45,
-                main_thread_core: 1,
+                main_thread_core: 2,
                 main_thread_stack_size: 0x0003_4000,
                 system_resource_size: 0x0020_0000,
                 handle_table_size: 0x123,
@@ -164,6 +170,36 @@ mod tests {
             LoadError::NoThreadInfo.to_string(),
             "the program's metadata gives its process no cores or priorities"
         );
+    }
+
+    #[test]
+    fn a_32_bit_program_is_refused() {
+        // Divergence from Eden, which creates the process without `Is64Bit` and runs it as
+        // AArch32 code (see the parent module's docs).
+        let mut a32 = npdm();
+        a32.is_64_bit = false;
+        assert_eq!(describe(&a32), Err(LoadError::Not64Bit));
+        assert_eq!(
+            LoadError::Not64Bit.to_string(),
+            "the program's metadata marks it as 32-bit (AArch32) code, which cannot be run"
+        );
+        // Checked before the thread info: with both faults, the width is reported.
+        a32.aci.kernel_capabilities.thread_info = None;
+        assert_eq!(describe(&a32), Err(LoadError::Not64Bit));
+        // The fixture is 64-bit and is described.
+        assert!(npdm().is_64_bit);
+        assert!(describe(&npdm()).is_ok());
+    }
+
+    #[test]
+    fn the_pool_partition_does_not_change_the_description() {
+        // Divergence from Eden, which reads it for the resource limit and `IsApplication` (see
+        // the parent module's docs).
+        let mut application = npdm();
+        application.acid.pool_partition = PoolPartition::Application;
+        let mut system = npdm();
+        system.acid.pool_partition = PoolPartition::System;
+        assert_eq!(describe(&application), describe(&system));
     }
 
     #[test]
