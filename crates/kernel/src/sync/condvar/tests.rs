@@ -9,7 +9,7 @@ use super::*;
 use crate::sched::ThreadState;
 use crate::svc::SvcId;
 use crate::sync::LockTable;
-use crate::sync::testing::{World, word};
+use crate::sync::testing::{World, core, word};
 
 const LOCK: u64 = 0x8000_3000;
 const CV: u64 = 0x8000_3010;
@@ -326,6 +326,34 @@ fn destroying_an_owner_ends_its_waiters_waits_with_invalid_state() {
         )]
     );
     assert_eq!(w.scheduler.sync().locks(), &LockTable::default());
+}
+
+#[test]
+fn a_timer_restoring_an_owners_priority_puts_it_behind_its_equals() {
+    // 0 (10) waits on the condition variable; 1 (40) holds the lock on core 1; 2 signals.
+    let mut w = World::new(&[10, 40, 30]);
+    let equal = w
+        .scheduler
+        .create_thread(crate::sched::Priority::new(40).unwrap(), core(1))
+        .unwrap();
+    w.scheduler.start(equal).unwrap();
+    w.update();
+    assert_eq!(
+        w.scheduler.highest(core(1)),
+        Ok(Some(w.threads[1])),
+        "it came first"
+    );
+
+    let timeout = Timeout::from_nanos(HostNanos(NOW), AFTER);
+    w.cv_wait(0, LOCK, CV, timeout).unwrap();
+    w.words.set(LOCK, w.tag(1));
+    w.cv_signal(2, CV, 1).unwrap();
+    assert_eq!(w.priority(1), 10);
+    w.fire(NOW + AFTER.unsigned_abs() + crate::sync::TIMEOUT_SLACK_NS);
+    assert_eq!(w.priority(1), 40);
+    // No core made the change, so the owner did not keep its place: it is behind its equal.
+    w.update();
+    assert_eq!(w.scheduler.highest(core(1)), Ok(Some(equal)));
 }
 
 #[test]
