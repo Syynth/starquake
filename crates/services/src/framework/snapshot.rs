@@ -28,9 +28,15 @@
 //! layout is this crate's own design (the spec asks only that it be versioned) and is pinned by
 //! the golden-bytes test `the_byte_layout_is_pinned` in `framework/tests/snapshot.rs`. Changing
 //! it, or the fields of anything it holds, means bumping [`SNAPSHOT_VERSION`] in the same
-//! change. A session's own state is opaque bytes inside it: changing a session struct changes
-//! what its bytes mean without changing this layout, so a service whose state changes says so
-//! in its own version field or the snapshot is refused by its decoder.
+//! change.
+//!
+//! The version covers the framework's own layout and nothing more. A session's state and a
+//! family's state are opaque bytes inside it, and `postcard` does not describe what it holds:
+//! when a service's state struct changes shape, bytes an older build wrote can fail to decode
+//! ([`SnapshotError::State`]) or, if they happen to fit, be read as the wrong values. So a
+//! server snapshot is only good for the build that wrote it. The spec's rule that a snapshot
+//! from another build is refused belongs to the snapshot of a whole run, which will hold this
+//! one and can carry the build's identity; that format does not exist yet.
 //!
 //! # A snapshot is untrusted
 //!

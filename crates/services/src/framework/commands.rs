@@ -171,7 +171,7 @@ pub trait Session: Any + Send {
 /// auto-stub use. The interface's name is the type's name as written.
 ///
 /// The type must be `serde::Serialize`: the macro saves a session's state with it
-/// ([`Session::save`](crate::framework::Session::save)). To restore a snapshot the type must be
+/// ([`Session::save`]). To restore a snapshot the type must be
 /// `serde::Deserialize` as well, and registered in the server's
 /// [`Interfaces`](crate::framework::Interfaces).
 ///
