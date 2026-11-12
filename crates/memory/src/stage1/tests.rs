@@ -421,6 +421,269 @@ fn descriptors_the_builder_never_writes_are_errors() {
     );
 }
 
+/// Asserts that `map`, `unmap` and `protect` at `va` each fail with `UnexpectedDescriptor` for
+/// `descriptor` found at `level`, and that nothing changed.
+fn assert_all_operations_refuse(
+    t: &Stage1Tables<FlatMemory>,
+    va: u64,
+    level: u8,
+    descriptor: u64,
+    context: &str,
+) {
+    let before = image(t);
+    let in_use = t.table_pages_in_use();
+    let expected = Err(MapError::UnexpectedDescriptor {
+        va,
+        level,
+        descriptor,
+    });
+    assert_eq!(
+        t.map(va, backing(0x10_0000, 1), Perms::Read),
+        expected,
+        "map, {context}"
+    );
+    assert_eq!(t.unmap(va, PAGE_SIZE), expected, "unmap, {context}");
+    assert_eq!(
+        t.protect(va, PAGE_SIZE, Perms::Read),
+        expected,
+        "protect, {context}"
+    );
+    assert_eq!(image(t), before, "{context}");
+    assert_eq!(t.table_pages_in_use(), in_use, "{context}");
+    assert_eq!(t.take_pending_flushes(), [], "{context}");
+}
+
+#[test]
+fn table_descriptors_must_point_inside_the_pool_on_both_sides() {
+    // One page below the pool and the first page past it (`pool.end()`): both are refused.
+    let t = tables(3);
+    for (target, context) in [
+        (POOL_BASE - PAGE_SIZE, "just below the pool"),
+        (POOL_BASE + pages(3), "just past the pool"),
+    ] {
+        let descriptor = descriptor::table(target);
+        put(&t, POOL_BASE, descriptor);
+        assert_all_operations_refuse(&t, 0, START_LEVEL, descriptor, context);
+    }
+}
+
+#[test]
+fn table_descriptors_with_hierarchical_attributes_are_errors() {
+    for bit in descriptor::TABLE_ATTRIBUTES.trailing_zeros()..u64::BITS {
+        // A real level-2 table, linked with one hierarchical attribute bit set.
+        let t = tables(3);
+        t.map(0, backing(0x10_0000, 1), Perms::Read).unwrap();
+        t.take_pending_flushes();
+        let descriptor = descriptor::table(POOL_BASE + pages(1)) | (1 << bit);
+        put(&t, POOL_BASE, descriptor);
+        assert_all_operations_refuse(
+            &t,
+            PAGE_SIZE,
+            START_LEVEL,
+            descriptor,
+            &format!("bit {bit}"),
+        );
+        // The same descriptor without the bit is accepted.
+        put(&t, POOL_BASE, descriptor::table(POOL_BASE + pages(1)));
+        t.map(PAGE_SIZE, backing(0x20_0000, 1), Perms::Read)
+            .unwrap();
+    }
+}
+
+#[test]
+fn table_descriptors_must_point_at_a_table_of_the_next_level() {
+    // Pool pages: 0 the root, 1 a level-2 table, 2 a level-3 table, 3 never used.
+    let t = tables(4);
+    t.map(0, backing(0x10_0000, 1), Perms::Read).unwrap();
+    t.take_pending_flushes();
+    let (l2, l3, unused) = (
+        POOL_BASE + pages(1),
+        POOL_BASE + pages(2),
+        POOL_BASE + pages(3),
+    );
+    // Level-1 slot 1 is invalid; point it at pages that are not a level-2 table.
+    for (target, context) in [
+        (POOL_BASE, "the root"),
+        (l3, "a level-3 table"),
+        (unused, "a pool page that holds no table"),
+    ] {
+        let descriptor = descriptor::table(target);
+        put(&t, POOL_BASE + 8, descriptor);
+        assert_all_operations_refuse(&t, va_of(1, 0, 0), START_LEVEL, descriptor, context);
+    }
+    // Level-2 slot 1 is invalid; point it at a level-2 table instead of a level-3 one.
+    let descriptor = descriptor::table(l2);
+    put(&t, l2 + 8, descriptor);
+    assert_all_operations_refuse(&t, va_of(0, 1, 0), 2, descriptor, "a level-2 table");
+}
+
+/// The descriptor at `at`, for putting it back later.
+fn put_back(t: &Stage1Tables<FlatMemory>, at: u64) -> u64 {
+    let mut bytes = [0; 8];
+    t.memory().read(at, &mut bytes).unwrap();
+    u64::from_le_bytes(bytes)
+}
+
+#[test]
+fn a_freed_table_page_is_not_a_valid_target() {
+    let t = tables(4);
+    t.map(0, backing(0x10_0000, 1), Perms::Read).unwrap();
+    let (l2, l3) = (POOL_BASE + pages(1), POOL_BASE + pages(2));
+    t.unmap(0, PAGE_SIZE).unwrap();
+    t.take_pending_flushes();
+    assert_eq!(t.table_pages_in_use(), 1);
+    for freed in [l2, l3] {
+        let descriptor = descriptor::table(freed);
+        put(&t, POOL_BASE + 8, descriptor);
+        assert_all_operations_refuse(&t, va_of(1, 0, 0), START_LEVEL, descriptor, "freed page");
+    }
+}
+
+#[test]
+fn map_refuses_a_reserved_level_3_encoding_and_leaves_it_alone() {
+    let t = tables(3);
+    t.map(0, backing(0x10_0000, 1), Perms::Read).unwrap();
+    t.take_pending_flushes();
+    // Index 1 of the level-3 table: bits[1:0] = 0b01, reserved at level 3.
+    let reserved = descriptor::VALID | (0x10_0000 & descriptor::OUTPUT_ADDRESS_MASK);
+    let at = POOL_BASE + pages(2) + 8;
+    put(&t, at, reserved);
+    let before = image(&t);
+    assert_eq!(
+        t.map(PAGE_SIZE, backing(0x20_0000, 1), Perms::ReadWrite),
+        Err(MapError::UnexpectedDescriptor {
+            va: PAGE_SIZE,
+            level: LEAF_LEVEL,
+            descriptor: reserved
+        })
+    );
+    assert_eq!(put_back(&t, at), reserved);
+    assert_eq!(image(&t), before);
+}
+
+#[test]
+fn freed_table_pages_are_not_reused_before_their_flush_is_taken() {
+    // Unmapping the only page frees its level-3 and level-2 tables. Until the flush for that
+    // unmap is taken (and so executed), a walk cache may still point at them, so a new mapping
+    // must not be built in them.
+    let t = tables(3);
+    t.map(0, backing(0x10_0000, 1), Perms::ReadWrite).unwrap();
+    t.take_pending_flushes();
+    t.unmap(0, PAGE_SIZE).unwrap();
+    assert_eq!(t.table_pages_in_use(), 1);
+    let elsewhere = va_of(1, 0, 0);
+    let before = image(&t);
+    assert_eq!(
+        t.map(elsewhere, backing(0x20_0000, 1), Perms::Read),
+        Err(MapError::OutOfTablePages)
+    );
+    assert_eq!(image(&t), before);
+    // Taking the flush hands the pages back; the flush still names the unmapped range.
+    assert_eq!(
+        t.take_pending_flushes(),
+        [FlushRange {
+            va: 0,
+            size: PAGE_SIZE,
+            leaf_only: false
+        }]
+    );
+    t.map(elsewhere, backing(0x20_0000, 1), Perms::Read)
+        .unwrap();
+    assert_eq!(t.table_pages_in_use(), 3);
+}
+
+/// Memory that accepts a set number of writes and then faults, to hit the write phase's error
+/// path.
+#[derive(Debug)]
+struct FaultingMemory {
+    inner: FlatMemory,
+    writes_left: std::sync::atomic::AtomicU64,
+}
+
+impl FaultingMemory {
+    fn fail_after(&self, writes: u64) {
+        self.writes_left
+            .store(writes, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl GuestMemory for FaultingMemory {
+    fn read(&self, va: u64, buf: &mut [u8]) -> Result<(), Fault> {
+        self.inner.read(va, buf)
+    }
+
+    fn write(&self, va: u64, data: &[u8]) -> Result<(), Fault> {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.writes_left
+            .try_update(SeqCst, SeqCst, |left| left.checked_sub(1))
+            .map_err(|_| Fault { address: va })?;
+        self.inner.write(va, data)
+    }
+}
+
+/// Two adjacent pages mapped, then a memory that refuses every write after the first.
+fn faulting_tables() -> Stage1Tables<FaultingMemory> {
+    let size = pages(3);
+    let memory = FaultingMemory {
+        inner: FlatMemory::new(POOL_BASE, usize::try_from(size).unwrap()),
+        writes_left: std::sync::atomic::AtomicU64::new(u64::MAX),
+    };
+    let t = Stage1Tables::new(memory, BackingRange::new(POOL_BASE, size).unwrap()).unwrap();
+    t.map(0, backing(0x10_0000, 2), Perms::ReadWrite).unwrap();
+    t.take_pending_flushes();
+    t.memory().fail_after(1);
+    t
+}
+
+#[test]
+fn a_write_fault_part_way_through_unmap_still_records_the_flush() {
+    let t = faulting_tables();
+    // The first page's descriptor is written; the second page's write faults.
+    let second = POOL_BASE + pages(2) + 8;
+    assert_eq!(
+        t.unmap(0, pages(2)),
+        Err(MapError::Memory(Fault { address: second }))
+    );
+    assert_eq!(
+        t.walk(0),
+        Err(WalkError::Unmapped {
+            va: 0,
+            level: LEAF_LEVEL
+        })
+    );
+    assert!(t.walk(PAGE_SIZE).is_ok());
+    // The first page changed, so a flush is owed; table pages may have been unlinked, so it is
+    // not leaf-only.
+    assert_eq!(
+        t.take_pending_flushes(),
+        [FlushRange {
+            va: 0,
+            size: pages(2),
+            leaf_only: false
+        }]
+    );
+}
+
+#[test]
+fn a_write_fault_part_way_through_protect_still_records_the_flush() {
+    let t = faulting_tables();
+    let second = POOL_BASE + pages(2) + 8;
+    assert_eq!(
+        t.protect(0, pages(2), Perms::Read),
+        Err(MapError::Memory(Fault { address: second }))
+    );
+    assert_eq!(t.walk(0).map(|r| r.perms), Ok(Perms::Read));
+    assert_eq!(t.walk(PAGE_SIZE).map(|r| r.perms), Ok(Perms::ReadWrite));
+    assert_eq!(
+        t.take_pending_flushes(),
+        [FlushRange {
+            va: 0,
+            size: pages(2),
+            leaf_only: true
+        }]
+    );
+}
+
 #[test]
 fn new_checks_the_pool() {
     // The memory covers two of the pool's three pages: the first refused page is reported.

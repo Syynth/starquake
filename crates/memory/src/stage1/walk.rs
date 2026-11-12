@@ -7,8 +7,10 @@
 //!
 //! Bit layouts and walk geometry are in [`super::descriptor`], which cites Arm DDI 0487. The
 //! walker assumes the translation regime the native backends set up, as hvprobe did:
-//! `TCR_EL1.T0SZ` = 25 with a 4 KiB granule, `SCTLR_EL1.EE` = 0 (little-endian descriptors) and
-//! `SCTLR_EL1.WXN` = 0 (a writable page may be executable).
+//! `TCR_EL1.T0SZ` = 25 with a 4 KiB granule, `TCR_EL1.HA` = 0 (no hardware access-flag
+//! management, which is what makes [`WalkError::AccessFlag`] a fault; with `HA` = 1 the
+//! hardware would set `AF` instead of faulting), `SCTLR_EL1.EE` = 0 (little-endian descriptors)
+//! and `SCTLR_EL1.WXN` = 0 (a writable page may be executable).
 //!
 //! Divergences from the hardware walk, each pinned by a test:
 //!
@@ -41,8 +43,11 @@ pub struct Resolved {
 /// Why a walk did not produce a translation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum WalkError {
-    /// The address is at or above [`VA_SPACE_END`]. (Hardware would select `TTBR1_EL1` for
-    /// addresses with the top bits set; the native backends don't translate any.)
+    /// The address is at or above [`VA_SPACE_END`]. Hardware would select `TTBR1_EL1` only for
+    /// addresses whose top bits are all ones (as many as `TCR_EL1.T1SZ` says); an address
+    /// between 2^39 and that range faults instead. Assumption, not backed by a reference: the
+    /// walker translates only the `TTBR0_EL1` half, because no backend exists yet that needs
+    /// the other (the EL1 shim might).
     #[error("{va:#x} is outside the 39-bit address space")]
     OutOfRange {
         /// The address.
@@ -419,6 +424,157 @@ mod tests {
                 "bit {bit}"
             );
         }
+    }
+
+    /// Output address bits 51:48, which a 48-bit output address ignores.
+    const OUTPUT_BITS_51_48: u64 = 0b1111 << 48;
+    /// The contiguous hint (bit 52).
+    const CONTIGUOUS: u64 = 1 << 52;
+    /// `AttrIndx` (bits 4:2), all set.
+    const ATTR_INDX: u64 = 0b111 << 2;
+    /// `SH` (bits 9:8) = 0b10, outer shareable; the builder writes inner.
+    const SH_OUTER: u64 = 0b10 << 8;
+    /// Everything the walker ignores, set at once.
+    const IGNORED: u64 = OUTPUT_BITS_51_48
+        | CONTIGUOUS
+        | ATTR_INDX
+        | SH_OUTER
+        | descriptor::NOT_GLOBAL
+        | descriptor::PXN;
+    const TABLE: u64 = VALID | descriptor::TABLE_OR_PAGE;
+
+    /// The bits of a block's output address field below its size, which are `RES0`.
+    fn block_res0_bits(level: u8) -> u64 {
+        ((1 << descriptor::shift(level)) - 1) & OUTPUT_ADDRESS_MASK
+    }
+
+    #[test]
+    fn ignored_bits_do_not_change_the_translation() {
+        // The documented divergences: output address bits 51:48, a block's RES0 bits between
+        // its size and bit 12, and AttrIndx, SH, nG, the contiguous hint and PXN.
+        let (memory, root) = blank();
+        // Level-1 slot 0 -> level-2 table; slot 1 is a 1 GiB block.
+        put(&memory, ROOT, L2 | TABLE | OUTPUT_BITS_51_48);
+        let block1_pa = 0x1_c000_0000;
+        put(
+            &memory,
+            ROOT + 8,
+            block1_pa
+                | block_res0_bits(1)
+                | VALID
+                | AF
+                | descriptor::AP_EL0
+                | descriptor::UXN
+                | IGNORED,
+        );
+        // Level-2 slot 0 -> level-3 table; slot 1 is a 2 MiB block.
+        put(&memory, L2, L3 | TABLE | OUTPUT_BITS_51_48);
+        let block2_pa = 0x9_0060_0000;
+        put(
+            &memory,
+            L2 + 8,
+            block2_pa
+                | block_res0_bits(2)
+                | VALID
+                | AF
+                | descriptor::AP_EL0
+                | descriptor::AP_READ_ONLY
+                | IGNORED,
+        );
+        // Level-3 slot 1: a read-write page.
+        let page_pa = 0x1234_5000;
+        put(
+            &memory,
+            L3 + 8,
+            page_pa | TABLE | AF | descriptor::AP_EL0 | descriptor::UXN | IGNORED,
+        );
+
+        let in_page = PAGE_SIZE + 0x7f8;
+        assert_eq!(
+            walk(&memory, root, in_page),
+            Ok(Resolved {
+                pa: page_pa + 0x7f8,
+                perms: Perms::ReadWrite,
+                level: LEAF_LEVEL
+            })
+        );
+        let va_in_block2 = (1 << descriptor::shift(2)) | 0x1_2345;
+        assert_eq!(
+            walk(&memory, root, va_in_block2),
+            Ok(Resolved {
+                pa: block2_pa | 0x1_2345,
+                perms: Perms::ReadExecute,
+                level: 2
+            })
+        );
+        let va_in_block1 = (1 << descriptor::shift(1)) | 0x1234_5678;
+        assert_eq!(
+            walk(&memory, root, va_in_block1),
+            Ok(Resolved {
+                pa: block1_pa | 0x1234_5678,
+                perms: Perms::ReadWrite,
+                level: 1
+            })
+        );
+    }
+
+    #[test]
+    fn el1_read_only_el0_none_pages_are_never_el0_readable() {
+        // AP[2:1] = 0b10 (EL1 read-only, EL0 no access): EL0 gets nothing, whatever UXN says
+        // about execution. AP[2:1] = 0b00 is the same for EL0.
+        let (memory, root) = blank();
+        put(&memory, ROOT, L2 | TABLE);
+        put(&memory, L2, L3 | TABLE);
+        let page = |ap: u64, uxn: u64| 0x1234_5000 | TABLE | AF | ap | uxn;
+        let cases = [
+            (descriptor::AP_READ_ONLY, descriptor::UXN, Perms::None),
+            (descriptor::AP_READ_ONLY, 0, Perms::Execute),
+            (0, descriptor::UXN, Perms::None),
+            (0, 0, Perms::Execute),
+        ];
+        for (n, (ap, uxn, perms)) in (0..).zip(cases) {
+            put(&memory, L3 + n * 8, page(ap, uxn));
+            assert_eq!(
+                walk(&memory, root, n * PAGE_SIZE),
+                Ok(Resolved {
+                    pa: 0x1234_5000,
+                    perms,
+                    level: LEAF_LEVEL
+                }),
+                "AP {ap:#x} UXN {uxn:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn blocks_with_the_access_flag_clear_fault_at_their_own_level() {
+        let (memory, root) = blank();
+        // Level-1 slot 2: a 1 GiB block, AF clear. Slot 3 -> level-2 table whose slot 4 is a
+        // 2 MiB block, AF clear.
+        put(&memory, ROOT + 2 * 8, 0x1_c000_0000 | VALID);
+        put(&memory, ROOT + 3 * 8, L2 | TABLE);
+        put(&memory, L2 + 4 * 8, 0x9_0060_0000 | VALID);
+        let gib = 2 << descriptor::shift(1);
+        assert_eq!(
+            walk(&memory, root, gib | 0x10),
+            Err(WalkError::AccessFlag {
+                va: gib | 0x10,
+                level: 1
+            })
+        );
+        let mib = (3 << descriptor::shift(1)) | (4 << descriptor::shift(2));
+        assert_eq!(
+            walk(&memory, root, mib | 0x10),
+            Err(WalkError::AccessFlag {
+                va: mib | 0x10,
+                level: 2
+            })
+        );
+        // With AF set the same blocks translate.
+        put(&memory, ROOT + 2 * 8, 0x1_c000_0000 | VALID | AF);
+        put(&memory, L2 + 4 * 8, 0x9_0060_0000 | VALID | AF);
+        assert!(walk(&memory, root, gib).is_ok());
+        assert!(walk(&memory, root, mib).is_ok());
     }
 
     #[test]

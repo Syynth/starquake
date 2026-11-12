@@ -33,10 +33,19 @@
 //!
 //! - `map` needs every page of its range unmapped, `unmap` and `protect` need every page mapped;
 //!   otherwise they fail without writing anything. Before writing, `map` also counts the table
-//!   pages it will need and fails with [`MapError::OutOfTablePages`] if the pool is short.
-//! - A table page whose last valid descriptor is removed is unlinked and returned to the pool at
-//!   once, so the pages in use are always the root, one level-2 table per level-1 slot that
-//!   holds a mapping, and one level-3 table per level-2 slot that does.
+//!   pages it will need and fails with [`MapError::OutOfTablePages`] if the pool lacks that many
+//!   reusable pages (see "TLB invalidation" for which freed pages are not yet reusable).
+//! - A table page whose last valid descriptor is removed is unlinked at once, so the pages in use
+//!   ([`Stage1Tables::table_pages_in_use`]) are always the root, one level-2 table per level-1
+//!   slot that holds a mapping, and one level-3 table per level-2 slot that does. The page itself
+//!   returns to the pool for reuse when [`Stage1Tables::take_pending_flushes`] hands out the
+//!   flush that covers it.
+//! - A table descriptor is followed only if it is a plain table descriptor (no hierarchical
+//!   attribute bits) for a page this builder allocated as a table of the next level. A block, a
+//!   reserved level-3 encoding, or a table descriptor aimed at anything else (the root, a free
+//!   page, a page outside the pool, a table of another level) is
+//!   [`MapError::UnexpectedDescriptor`]; the tables are corrupt and the builder will not follow
+//!   or free what it did not allocate.
 //! - Backing that overlaps the pool is refused ([`MapError::OverlapsTables`]): the spec keeps
 //!   the tables in their own backing region, and mapping them would let the guest rewrite them.
 //!
@@ -45,16 +54,29 @@
 //! The host can't invalidate the guest's TLBs; the EL1 shim does (spec, "TLB invalidation").
 //! The builder records what needs invalidating as [`FlushRange`]s, collected with
 //! [`Stage1Tables::take_pending_flushes`]. Every successful `unmap` and `protect` records
-//! exactly one range, its own. `map` records none: it only replaces invalid descriptors, and
-//! Arm DDI 0487 (TLB maintenance requirements) does not let a TLB hold a translation table
-//! entry that generates a Translation fault. Valid descriptors are never re-pointed to a
-//! different output address, so no break-before-make sequence is needed.
+//! exactly one range, its own; so does an `unmap` or `protect` that fails with a
+//! [`MapError::Memory`] fault after it began writing (see [`MapError`]), conservatively
+//! `leaf_only: false` for `unmap`. `map` records none. That relies on two things:
+//!
+//! - Arm DDI 0487 (TLB maintenance requirements) does not let a TLB hold a translation table
+//!   entry that generates a Translation fault, and `map` only replaces invalid descriptors.
+//!   Valid descriptors are never re-pointed to a different output address, so no
+//!   break-before-make sequence is needed.
+//! - A table page that `unmap` unlinked may still be named by a cached intermediate (walk)
+//!   entry on another vCPU until that unmap's flush has run, so it is quarantined: it is not
+//!   reused for a new table until [`Stage1Tables::take_pending_flushes`] has handed out the
+//!   flushes recorded so far.
+//!
+//! The contract on the caller: flushes returned by `take_pending_flushes` must be executed
+//! (`TLBI` and the barriers, on every vCPU that may use the tables) before the next `map`,
+//! `unmap` or `protect`. Taking a flush is what lets the builder reuse the pages it freed.
 
 pub(crate) mod descriptor;
 mod walk;
 
 pub use walk::{Resolved, WalkError, translate, walk};
 
+use std::collections::BTreeMap;
 use std::sync::{Mutex, PoisonError};
 
 use crate::translation::{BackingRange, MapError, PAGE_SIZE, Perms, Translation, check_page_range};
@@ -107,19 +129,25 @@ pub struct FlushRange {
     pub size: u64,
     /// Only page descriptors changed, so last-level invalidation (`TLBI VALE1IS`) is enough.
     /// `false` when table pages were also unlinked, which needs invalidation of cached walk
-    /// entries too (`TLBI VAE1IS`).
+    /// entries too (`TLBI VAE1IS`). A range with `leaf_only` `false` must be executed before any
+    /// later `map`, because the builder reuses the unlinked table pages once the range has been
+    /// taken with [`Stage1Tables::take_pending_flushes`].
     pub leaf_only: bool,
 }
 
 /// The table page pool and the pending invalidations, behind the lock.
 #[derive(Debug)]
 struct Pool {
-    /// Freed table pages, reused last-freed first.
+    /// Freed table pages that may be reused, last-freed first.
     free: Vec<u64>,
+    /// Table pages unlinked since the last [`Stage1Tables::take_pending_flushes`]: not reusable
+    /// until their flush has been handed out.
+    quarantine: Vec<u64>,
     /// The next never-used pool page.
     next: u64,
-    /// Table pages in use, the root included.
-    in_use: u64,
+    /// The table pages in use (linked, plus the root) and the level of each; the root is at
+    /// [`START_LEVEL`]. The builder follows a table descriptor only to a page listed here.
+    tables: BTreeMap<u64, u8>,
     pending: Vec<FlushRange>,
 }
 
@@ -152,8 +180,9 @@ impl<M: GuestMemory> Stage1Tables<M> {
             pool,
             state: Mutex::new(Pool {
                 free: Vec::new(),
+                quarantine: Vec::new(),
                 next: pool.base().saturating_add(PAGE_SIZE),
-                in_use: 1,
+                tables: BTreeMap::from([(pool.base(), START_LEVEL)]),
                 pending: Vec::new(),
             }),
         };
@@ -182,12 +211,19 @@ impl<M: GuestMemory> Stage1Tables<M> {
 
     /// How many pool pages hold tables now, the root included.
     pub fn table_pages_in_use(&self) -> u64 {
-        self.lock().in_use
+        u64::try_from(self.lock().tables.len()).unwrap_or(u64::MAX)
     }
 
     /// Returns the ranges recorded since the last call, oldest first, and forgets them.
+    ///
+    /// The caller must execute the returned flushes before the next `map`, `unmap` or `protect`:
+    /// this call releases the table pages that `unmap` unlinked for reuse, and a vCPU that has
+    /// not yet invalidated may still reach them through a cached walk entry.
     pub fn take_pending_flushes(&self) -> Vec<FlushRange> {
-        std::mem::take(&mut self.lock().pending)
+        let mut pool = self.lock();
+        let pool = &mut *pool;
+        pool.free.append(&mut pool.quarantine);
+        std::mem::take(&mut pool.pending)
     }
 
     /// Resolves `va` through these tables with [`walk`].
@@ -204,10 +240,10 @@ impl<M: GuestMemory> Stage1Tables<M> {
         self.memory.write(page, &ZEROES)
     }
 
-    /// Takes a pool page for a new table. It needs no zeroing: [`Self::new`] zeroed every pool
-    /// page, the builder invalidates a descriptor by writing 0, and a table is freed only when
-    /// none of its descriptors is valid, so a freed page holds only zeros.
-    fn allocate(&self, pool: &mut Pool) -> Result<u64, MapError> {
+    /// Takes a pool page for a new table at `level`. It needs no zeroing: [`Self::new`] zeroed
+    /// every pool page, the builder invalidates a descriptor by writing 0, and a table is freed
+    /// only when none of its descriptors is valid, so a freed page holds only zeros.
+    fn allocate(&self, pool: &mut Pool, level: u8) -> Result<u64, MapError> {
         let page = if let Some(page) = pool.free.pop() {
             page
         } else if pool.next < self.pool.end() {
@@ -217,21 +253,31 @@ impl<M: GuestMemory> Stage1Tables<M> {
         } else {
             return Err(MapError::OutOfTablePages);
         };
-        pool.in_use = pool.in_use.saturating_add(1);
+        pool.tables.insert(page, level);
         Ok(page)
     }
 
-    /// The table a level-1 or level-2 descriptor points to, or `None` if it is invalid. A block,
-    /// or a table outside the pool, is [`MapError::UnexpectedDescriptor`].
-    fn child(&self, entry: u64, level: u8, va: u64) -> Result<Option<u64>, MapError> {
+    /// How many pages a new table could take now: the free list plus the never-used pages.
+    /// Pages unlinked since the last [`Self::take_pending_flushes`] are not counted.
+    fn reusable_pages(&self, pool: &Pool) -> u64 {
+        let never_used = self.pool.end().saturating_sub(pool.next) / PAGE_SIZE;
+        never_used.saturating_add(u64::try_from(pool.free.len()).unwrap_or(u64::MAX))
+    }
+
+    /// The table a level-1 or level-2 descriptor points to, or `None` if it is invalid.
+    ///
+    /// [`MapError::UnexpectedDescriptor`] for a block; a table descriptor with a hierarchical
+    /// attribute bit (63:59) set; and a table descriptor whose target is not a page this builder
+    /// allocated as a table of the next level, which covers a page below or above the pool, the
+    /// root, a free or never-allocated pool page, and a table of another level.
+    fn child(pool: &Pool, entry: u64, level: u8, va: u64) -> Result<Option<u64>, MapError> {
         if entry & VALID == 0 {
             return Ok(None);
         }
         let table = entry & OUTPUT_ADDRESS_MASK;
         if descriptor::is_table_or_page(entry)
             && entry & descriptor::TABLE_ATTRIBUTES == 0
-            && table >= self.pool.base()
-            && table < self.pool.end()
+            && pool.tables.get(&table) == Some(&(level + 1))
         {
             return Ok(Some(table));
         }
@@ -256,7 +302,14 @@ impl<M: GuestMemory> Stage1Tables<M> {
 
     /// Counts the table pages mapping `start..end` would create under `table` at `level`, or
     /// fails with the lowest page of the range that is already mapped.
-    fn tables_needed(&self, table: u64, level: u8, start: u64, end: u64) -> Result<u64, MapError> {
+    fn tables_needed(
+        &self,
+        pool: &Pool,
+        table: u64,
+        level: u8,
+        start: u64,
+        end: u64,
+    ) -> Result<u64, MapError> {
         let mut needed = 0u64;
         for (s, e) in entries(start, end, level) {
             let entry = descriptor::read(&self.memory, table, descriptor::index(s, level))?;
@@ -268,8 +321,8 @@ impl<M: GuestMemory> Stage1Tables<M> {
                 }
                 continue;
             }
-            let below = match self.child(entry, level, s)? {
-                Some(child) => self.tables_needed(child, level + 1, s, e)?,
+            let below = match Self::child(pool, entry, level, s)? {
+                Some(child) => self.tables_needed(pool, child, level + 1, s, e)?,
                 None => new_tables_below(level, s, e),
             };
             needed = needed.saturating_add(below);
@@ -278,7 +331,14 @@ impl<M: GuestMemory> Stage1Tables<M> {
     }
 
     /// Fails with the lowest page of `start..end` under `table` that is not mapped.
-    fn check_mapped(&self, table: u64, level: u8, start: u64, end: u64) -> Result<(), MapError> {
+    fn check_mapped(
+        &self,
+        pool: &Pool,
+        table: u64,
+        level: u8,
+        start: u64,
+        end: u64,
+    ) -> Result<(), MapError> {
         for (s, e) in entries(start, end, level) {
             let entry = descriptor::read(&self.memory, table, descriptor::index(s, level))?;
             if level == LEAF_LEVEL {
@@ -289,8 +349,8 @@ impl<M: GuestMemory> Stage1Tables<M> {
                 }
                 continue;
             }
-            match self.child(entry, level, s)? {
-                Some(child) => self.check_mapped(child, level + 1, s, e)?,
+            match Self::child(pool, entry, level, s)? {
+                Some(child) => self.check_mapped(pool, child, level + 1, s, e)?,
                 None => return Err(MapError::NotMapped { va: s }),
             }
         }
@@ -322,10 +382,10 @@ impl<M: GuestMemory> Stage1Tables<M> {
                 continue;
             }
             let entry = descriptor::read(&self.memory, table, index)?;
-            let child = if let Some(child) = self.child(entry, level, s)? {
+            let child = if let Some(child) = Self::child(pool, entry, level, s)? {
                 child
             } else {
-                let child = self.allocate(pool)?;
+                let child = self.allocate(pool, level + 1)?;
                 descriptor::write(&self.memory, table, index, descriptor::table(child))?;
                 child
             };
@@ -352,14 +412,12 @@ impl<M: GuestMemory> Stage1Tables<M> {
                 continue;
             }
             let entry = descriptor::read(&self.memory, table, index)?;
-            let child = self
-                .child(entry, level, s)?
-                .ok_or(MapError::NotMapped { va: s })?;
+            let child = Self::child(pool, entry, level, s)?.ok_or(MapError::NotMapped { va: s })?;
             freed |= self.write_unmap(pool, child, level + 1, s, e)?;
             if self.is_empty(child)? {
                 descriptor::write(&self.memory, table, index, 0)?;
-                pool.free.push(child);
-                pool.in_use = pool.in_use.saturating_sub(1);
+                pool.tables.remove(&child);
+                pool.quarantine.push(child);
                 freed = true;
             }
         }
@@ -369,6 +427,7 @@ impl<M: GuestMemory> Stage1Tables<M> {
     /// Rewrites the page descriptors for `start..end` under `table` with `perms`.
     fn write_protect(
         &self,
+        pool: &Pool,
         table: u64,
         level: u8,
         start: u64,
@@ -383,10 +442,8 @@ impl<M: GuestMemory> Stage1Tables<M> {
                 descriptor::write(&self.memory, table, index, page)?;
                 continue;
             }
-            let child = self
-                .child(entry, level, s)?
-                .ok_or(MapError::NotMapped { va: s })?;
-            self.write_protect(child, level + 1, s, e, perms)?;
+            let child = Self::child(pool, entry, level, s)?.ok_or(MapError::NotMapped { va: s })?;
+            self.write_protect(pool, child, level + 1, s, e, perms)?;
         }
         Ok(())
     }
@@ -419,8 +476,8 @@ impl<M: GuestMemory> Translation for Stage1Tables<M> {
         }
         let mut pool = self.lock();
         let root = self.root.pa();
-        let needed = self.tables_needed(root, START_LEVEL, va, end)?;
-        if needed > self.pool_pages().saturating_sub(pool.in_use) {
+        let needed = self.tables_needed(&pool, root, START_LEVEL, va, end)?;
+        if needed > self.reusable_pages(&pool) {
             return Err(MapError::OutOfTablePages);
         }
         self.write_map(
@@ -437,28 +494,32 @@ impl<M: GuestMemory> Translation for Stage1Tables<M> {
         let end = virtual_end(va, size)?;
         let mut pool = self.lock();
         let root = self.root.pa();
-        self.check_mapped(root, START_LEVEL, va, end)?;
-        let freed = self.write_unmap(&mut pool, root, START_LEVEL, va, end)?;
+        self.check_mapped(&pool, root, START_LEVEL, va, end)?;
+        let written = self.write_unmap(&mut pool, root, START_LEVEL, va, end);
+        // A flush is owed once the write phase began, also when a write fault ended it early:
+        // descriptors may have changed and tables may have been unlinked. After a fault that
+        // is not known, so it is conservatively not leaf-only.
         pool.pending.push(FlushRange {
             va,
             size,
-            leaf_only: !freed,
+            leaf_only: matches!(written, Ok(false)),
         });
-        Ok(())
+        written.map(|_| ())
     }
 
     fn protect(&self, va: u64, size: u64, perms: Perms) -> Result<(), MapError> {
         let end = virtual_end(va, size)?;
         let mut pool = self.lock();
         let root = self.root.pa();
-        self.check_mapped(root, START_LEVEL, va, end)?;
-        self.write_protect(root, START_LEVEL, va, end, perms)?;
+        self.check_mapped(&pool, root, START_LEVEL, va, end)?;
+        let written = self.write_protect(&pool, root, START_LEVEL, va, end, perms);
+        // As in `unmap`: a flush is owed once the write phase began, even if a fault ended it.
         pool.pending.push(FlushRange {
             va,
             size,
             leaf_only: true,
         });
-        Ok(())
+        written
     }
 }
 
