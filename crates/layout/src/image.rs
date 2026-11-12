@@ -15,16 +15,18 @@
 //! - The caller gives the tiling ([`ImageDesc::tiling`]) and, for a pitch-linear image, the
 //!   pitch; Mesa chooses them (`Tiling::choose`, DRM modifiers, sparse residency, video usage),
 //!   and none of that is ported. Neither are PTE kinds, the tile mode word, Kepler's 256-byte
-//!   linear alignment (no Ampere class needs it), or the view helpers (`image_for_level`,
-//!   `level_as_uncompressed`, `_3d_level_as_2d_array`, `msaa_as_samples`).
+//!   linear alignment (no Ampere class needs it), sparse residency's 64 KiB alignment,
+//!   `level_depth_stride_B`, or the view helpers (`image_for_level`, `level_as_uncompressed`,
+//!   `_3d_level_as_2d_array`, `msaa_as_samples`).
 //! - A pitch-linear image is chosen by [`Tiling::LINEAR`] rather than a usage bit.
 //! - Every Mesa `assert!` on the description is an error instead: [`LayoutError::Invalid1d`],
 //!   [`LayoutError::Invalid2d`], [`LayoutError::Invalid3d`], [`LayoutError::InvalidLinear`],
 //!   [`LayoutError::MultisampleMipmaps`] (Mesa asserts it in `level_extent_px` for any level but
 //!   0), [`LayoutError::InvalidSampleCount`] (Mesa's `SampleLayout::Invalid`, which panics when
 //!   used) and the level and layer range checks. A zero extent ([`LayoutError::ZeroExtent`]) and
-//!   a level count outside 1 to [`MAX_LEVELS`] ([`LayoutError::InvalidLevelCount`]; Mesa indexes
-//!   its 16-entry array out of bounds) are refused too.
+//!   a level count outside 1 to [`MAX_LEVELS`] ([`LayoutError::InvalidLevelCount`]; past 16
+//!   levels Mesa indexes its 16-entry array out of bounds, and for 0 it lays out an image with no
+//!   levels) are refused too.
 //! - Pitch checks are stricter: a pitch must be a multiple of [`LINEAR_PITCH_ALIGN_B`] in every
 //!   build (Mesa: `debug_assert!`), must hold one row of the image
 //!   ([`LayoutError::PitchTooSmall`]; Mesa does not check), and cannot be given for a
@@ -36,8 +38,7 @@
 //!   `None`, and a tail starting at level 0 (the requested tiling is larger than level 0) is
 //!   `Some(0)`, whose offset is 0; Mesa asserts the first tail level is above 0.
 //! - Sizes and offsets are `u64` with checked arithmetic throughout (Mesa computes
-//!   `level_z_offset_B` and `level_depth_stride_B` in `u32`, and returns the mip tail size as
-//!   `u32`).
+//!   `level_z_offset_B` in `u32`, and returns the mip tail size as `u32`).
 
 use crate::error::{LayoutError, Result};
 use crate::extent::Extent4D;
