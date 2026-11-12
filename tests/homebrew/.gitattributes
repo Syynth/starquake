@@ -1,0 +1,5 @@
+# Fixture files are checked byte for byte against their manifest: never convert line endings.
+* -text
+*.nro binary
+*.nso binary
+*.npdm binary
