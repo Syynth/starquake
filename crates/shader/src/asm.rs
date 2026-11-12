@@ -46,6 +46,20 @@ pub enum EncodeError {
 }
 
 /// Encodes `instr`.
+///
+/// ```
+/// use starquake_shader::asm::assemble;
+/// use starquake_shader::decode::{Instr, Op, OpExit, PredSrc, decode};
+///
+/// let exit = Instr::new(Op::Exit(OpExit {
+///     keep_ref_count: false,
+///     no_at_exit: false,
+///     pred: PredSrc::TRUE,
+/// }));
+/// let word = assemble(&exit)?;
+/// assert_eq!(decode(word)?.to_string(), "exit;");
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 pub fn assemble(instr: &Instr) -> Result<Instruction, EncodeError> {
     let word = pred(Instruction::default(), GUARD, GUARD_NOT, instr.guard);
     match instr.op {

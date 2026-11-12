@@ -61,8 +61,3 @@ reason = "error type and logging arrive with the crate's first handler"
 package = "starquake-render"
 dependencies = ["thiserror"]
 reason = "scaffold crate with no code; its error type arrives with the first fallible render call"
-
-[[allow]]
-package = "starquake-shader"
-dependencies = ["thiserror"]
-reason = "scaffold crate with no code; its error type arrives with the first translator pass"
