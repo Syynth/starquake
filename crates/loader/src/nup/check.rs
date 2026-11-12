@@ -16,7 +16,11 @@ use super::{
 
 /// The superblock checks of SPEC §2 (rules 1 to 5, except the hash, which needs the bytes) and
 /// `parse_super`, against the source's length and the reader's limits.
-pub(super) fn check_superblock(sb: &RawSuperblock, actual: u64, limits: Limits) -> Result<(), NupError> {
+pub(super) fn check_superblock(
+    sb: &RawSuperblock,
+    actual: u64,
+    limits: Limits,
+) -> Result<(), NupError> {
     let [n, u, p, major] = sb.magic;
     let [want_n, want_u, want_p, want_major] = MAGIC;
     if [n, u, p] != [want_n, want_u, want_p] {
@@ -133,9 +137,8 @@ fn areas(head: &RawTocHeader, toc_len: usize) -> Result<Areas, NupError> {
     // Every value here is at most `len`, so it fits a `usize`; the record counts multiplied by
     // their sizes were checked above.
     let at = |offset: u64| usize::try_from(offset).unwrap_or(usize::MAX);
-    let packages_end = TOC_HEADER_SIZE.saturating_add(
-        at(u64::from(head.package_count)).saturating_mul(PACKAGE_RECORD_SIZE),
-    );
+    let packages_end = TOC_HEADER_SIZE
+        .saturating_add(at(u64::from(head.package_count)).saturating_mul(PACKAGE_RECORD_SIZE));
     let dirs_end = packages_end.saturating_add(at(head.dir_count).saturating_mul(DIR_RECORD_SIZE));
     let files_end = dirs_end.saturating_add(at(head.file_count).saturating_mul(FILE_RECORD_SIZE));
     Ok(Areas {
@@ -180,15 +183,30 @@ pub(super) fn parse_toc(toc: &[u8], sb: &RawSuperblock) -> Result<ParsedToc, Nup
 
     let mut dirs = Vec::with_capacity(dir_records.len());
     for (index, record) in dir_records.iter().enumerate() {
-        dirs.push(check_dir(index, &RawDir::decode(record)?, pool.len(), slots.len())?);
+        dirs.push(check_dir(
+            index,
+            &RawDir::decode(record)?,
+            pool.len(),
+            slots.len(),
+        )?);
     }
     let mut files = Vec::with_capacity(file_records.len());
     for (index, record) in file_records.iter().enumerate() {
-        files.push(check_file(index, &RawFile::decode(record)?, pool.len(), sb)?);
+        files.push(check_file(
+            index,
+            &RawFile::decode(record)?,
+            pool.len(),
+            sb,
+        )?);
     }
     let mut children = Vec::with_capacity(slots.len());
     for (slot, word) in slots.iter().enumerate() {
-        children.push(child_node(slot, u32::from_le_bytes(*word), dirs.len(), files.len())?);
+        children.push(child_node(
+            slot,
+            u32::from_le_bytes(*word),
+            dirs.len(),
+            files.len(),
+        )?);
     }
 
     let parsed = ParsedToc {
@@ -211,12 +229,11 @@ fn check_dir(
     pool_len: usize,
     slot_count: usize,
 ) -> Result<DirEntry, NupError> {
-    let name = pool_range(raw.name_offset, raw.name_len, pool_len).ok_or(
-        NupError::NameOutOfPool {
+    let name =
+        pool_range(raw.name_offset, raw.name_len, pool_len).ok_or(NupError::NameOutOfPool {
             node: "directory",
             index,
-        },
-    )?;
+        })?;
     let first = index_of(raw.first_child);
     let children = first
         .checked_add(index_of(raw.child_count))
@@ -248,9 +265,7 @@ fn child_node(
 /// What the records of `head` would need, saturating, for the truncation message.
 fn needed_saturating(head: &RawTocHeader) -> u64 {
     to_u64(TOC_HEADER_SIZE)
-        .saturating_add(
-            u64::from(head.package_count).saturating_mul(to_u64(PACKAGE_RECORD_SIZE)),
-        )
+        .saturating_add(u64::from(head.package_count).saturating_mul(to_u64(PACKAGE_RECORD_SIZE)))
         .saturating_add(head.dir_count.saturating_mul(to_u64(DIR_RECORD_SIZE)))
         .saturating_add(head.file_count.saturating_mul(to_u64(FILE_RECORD_SIZE)))
 }
@@ -355,12 +370,11 @@ fn check_file(
     pool_len: usize,
     sb: &RawSuperblock,
 ) -> Result<FileEntry, NupError> {
-    let name = pool_range(raw.name_offset, raw.name_len, pool_len).ok_or(
-        NupError::NameOutOfPool {
+    let name =
+        pool_range(raw.name_offset, raw.name_len, pool_len).ok_or(NupError::NameOutOfPool {
             node: "file",
             index,
-        },
-    )?;
+        })?;
     let codec = Codec::from_byte(raw.codec).ok_or(NupError::UnknownCodec {
         file: index,
         codec: raw.codec,
@@ -583,4 +597,3 @@ fn check_regions(toc: &ParsedToc) -> Result<(), NupError> {
     }
     Ok(())
 }
-

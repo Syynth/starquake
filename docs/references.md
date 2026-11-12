@@ -18,6 +18,7 @@ tools/refs-path.sh      # prints the folder; STARQUAKE_REFS overrides it
 | `libnx` | libnx (`switchbrew/libnx`, branch `master`) | `b156b4774fb2` | ISC | The client side of IPC: how a homebrew program lays out CMIF, domain and TIPC requests (`nx/include/switch/sf/{hipc,cmif,tipc}.h`) |
 | `atmosphere` | Atmosphère (`Atmosphere-NX/Atmosphere`, branch `master`) | `4e3f37038d9e` | GPL-2.0-only | **Facts only**: result codes (`libraries/libvapours/include/vapours/results/`), kernel behaviour (`libraries/libmesosphere`), system-module command ids and layouts (`stratosphere`). Never ported from |
 | `rapid-arm-emu` | rapid-arm-emu | `d762465dfd05` | GPL-3.0-only (no "or later" grant) | A64 decoder and software MMU, for a later x86-64 JIT |
+| `nup` | NUP (`a55uka/nup`, branch `meow`) | `a4840f06c94d` | MIT (`LICENSE`, Copyright (c) 2026 a55uka) | The NUP container for decrypted dumps: `SPEC.md` (version 1.0-draft) and the reference tool's reader, verifier and packer (`tools/nup/nup/`), for `crates/loader/src/nup.rs` |
 
 `tools/fetch-refs.sh` never prompts for credentials (every source is fetched anonymously), stops at
 the first source it cannot fetch with a message naming it, and does not touch the network for a
@@ -39,6 +40,10 @@ Rules:
 - Reference paths in code, docs, issues and PRs are relative to the reference folder
   (`eden/src/...`), never absolute paths on someone's machine.
 - Update the commit here and in `tools/fetch-refs.sh` together.
+- **NUP: the spec wins over the tool.** `nup/SPEC.md` is the format's definition and the reader
+  follows it; the Python tool settles what the spec leaves open. Where they disagree the reader
+  follows the spec and says so: at the pinned commit the tool numbers the meta block's TLV types
+  from 0 (`format.py`, `class TVL`) while the spec numbers them from 1 (§5).
 - `rapid-arm-emu`'s decoder is 228k lines of generated Rust and slow to compile. Don't vendor it
   for the load-time patcher, which only needs to recognise a handful of encodings; revisit when the
   x86-64 JIT starts.

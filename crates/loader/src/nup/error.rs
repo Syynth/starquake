@@ -1,7 +1,7 @@
 //! The NUP reader's errors.
 
-use super::layout::SUPERBLOCK_SIZE;
 use super::Node;
+use super::layout::SUPERBLOCK_SIZE;
 
 /// Which region of the file an overlap error names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -54,7 +54,9 @@ pub enum NupError {
         actual: u64,
     },
     /// `toc_offset` is not `header_size`.
-    #[error("the table of contents starts at {toc_offset:#x}, not at the end of the superblock ({header_size:#x})")]
+    #[error(
+        "the table of contents starts at {toc_offset:#x}, not at the end of the superblock ({header_size:#x})"
+    )]
     TocNotAfterHeader {
         /// `toc_offset`.
         toc_offset: u64,
@@ -68,7 +70,9 @@ pub enum NupError {
     #[error("the blob region starts at {0:#x}, which is not 16-byte aligned")]
     BlobMisaligned(u64),
     /// `blob_offset` is before the end of the table of contents.
-    #[error("the blob region starts at {blob_offset:#x}, inside the table of contents (which ends at {toc_end:#x})")]
+    #[error(
+        "the blob region starts at {blob_offset:#x}, inside the table of contents (which ends at {toc_end:#x})"
+    )]
     BlobOverlapsToc {
         /// `blob_offset`.
         blob_offset: u64,
@@ -363,10 +367,7 @@ impl NupError {
     /// The error carried by an `io::Error` that [`FileReader`] returned: its own [`NupError`]
     /// when it carries one, [`NupError::Io`] otherwise.
     pub fn from_io(error: std::io::Error) -> Self {
-        if error
-            .get_ref()
-            .is_some_and(carries_nup_error)
-        {
+        if error.get_ref().is_some_and(carries_nup_error) {
             if let Some(inner) = error.into_inner() {
                 return match inner.downcast::<NupError>() {
                     Ok(nup) => *nup,
@@ -402,7 +403,6 @@ pub struct VerifySummary {
     /// Uncompressed bytes hashed.
     pub bytes: u64,
 }
-
 
 /// Whether an `io::Error`'s payload is a [`NupError`].
 fn carries_nup_error(inner: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {

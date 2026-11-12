@@ -246,7 +246,8 @@ impl<'a> Numbered<'a> {
     fn assign(&mut self, package: usize, name: &'a [u8], path: &str, dir: &'a Tree) -> usize {
         let index = self.dirs.len();
         self.dirs.push((name, 0, 0));
-        self.paths.push(((package, path.to_owned()), Slot::Dir(index)));
+        self.paths
+            .push(((package, path.to_owned()), Slot::Dir(index)));
         let first = self.children.len();
         // Files take their numbers first, then each subdirectory in turn (`Tree.assign`).
         for (child, entry) in &dir.entries {
@@ -463,12 +464,7 @@ fn write_packages(
                 .unwrap_or(usize::MAX);
             u32_of(dir, "content directory")
         };
-        let (meta_offset, meta_size) = layout
-            .meta
-            .get(index)
-            .copied()
-            .flatten()
-            .unwrap_or((0, 0));
+        let (meta_offset, meta_size) = layout.meta.get(index).copied().flatten().unwrap_or((0, 0));
         layout.package_records.push(layout.toc_offset + toc.len());
         toc.extend_from_slice(
             &RawPackage {
@@ -593,7 +589,11 @@ impl Built {
     /// Rewrites the table of contents header through `edit`, then rehashes the table.
     pub fn edit_toc_header(&mut self, edit: impl FnOnce(&mut RawTocHeader)) {
         let at = self.layout.toc_offset;
-        if let Some(mut header) = self.bytes.get(at..).and_then(|b| RawTocHeader::decode(b).ok()) {
+        if let Some(mut header) = self
+            .bytes
+            .get(at..)
+            .and_then(|b| RawTocHeader::decode(b).ok())
+        {
             edit(&mut header);
             self.write(at, &header.encode());
         }
@@ -603,7 +603,10 @@ impl Built {
     /// Rewrites package record `index` through `edit`, then rehashes the table of contents.
     pub fn edit_package(&mut self, index: usize, edit: impl FnOnce(&mut RawPackage)) {
         if let Some(&at) = self.layout.package_records.get(index)
-            && let Some(mut record) = self.bytes.get(at..).and_then(|b| RawPackage::decode(b).ok())
+            && let Some(mut record) = self
+                .bytes
+                .get(at..)
+                .and_then(|b| RawPackage::decode(b).ok())
         {
             edit(&mut record);
             self.write(at, &record.encode());
@@ -688,7 +691,11 @@ pub fn zstd_frame(data: &[u8]) -> Result<Vec<u8>, BuildError> {
     let mut out = Vec::with_capacity(frame.len() + 8);
     out.extend_from_slice(frame.get(..DESCRIPTOR_OFFSET).unwrap_or_default());
     out.push(descriptor | FCS_FLAG_8_BYTES);
-    out.extend_from_slice(frame.get(DESCRIPTOR_OFFSET + 1..window_end).unwrap_or_default());
+    out.extend_from_slice(
+        frame
+            .get(DESCRIPTOR_OFFSET + 1..window_end)
+            .unwrap_or_default(),
+    );
     out.extend_from_slice(&to_u64(data.len()).to_le_bytes());
     out.extend_from_slice(frame.get(window_end..).unwrap_or_default());
     Ok(out)

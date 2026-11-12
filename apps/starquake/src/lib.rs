@@ -1,8 +1,11 @@
 //! The starquake command line: `starquake run <program>`, the headless contract of
-//! `docs/specs/observability.md` as far as the walking skeleton goes.
+//! `docs/specs/observability.md` as far as the walking skeleton goes, and `starquake inspect`
+//! and `starquake verify`, which read a NUP title ([`title`]).
 //!
 //! ```text
 //! starquake run <program> [--until timeout=<n>s] [--artifacts <folder>]
+//! starquake inspect <title.nup>
+//! starquake verify <title.nup>
 //! ```
 //!
 //! The process exit code says how the run ended (`starquake_core::exit_code`): 0 the program
@@ -15,6 +18,10 @@
 //! other `--until` conditions are refused by name, so a script that uses one finds out. The stop
 //! condition of a run is the guest calling `ExitProcess`.
 //!
+//! `inspect` and `verify` have exit codes of their own ([`title::exit`]): 0 done and intact, 1
+//! the title is damaged or part of it could not be parsed, 2 the file could not be read or the
+//! command line is wrong.
+//!
 //! Everything here writes to the two streams it is handed, so tests can run a command in
 //! process; `main.rs` passes the real stdout and stderr.
 
@@ -25,17 +32,27 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use starquake_core::{ExitReason, RunOptions, RunReport, System, artifacts, exit_code};
 
+pub mod title;
+
 /// What `starquake` prints for `--help`, and after a command line it can't parse.
 pub const USAGE: &str = "\
 usage: starquake run <program> [--until timeout=<n>s] [--artifacts <folder>]
+       starquake inspect <title.nup>
+       starquake verify <title.nup>
 
-Runs an NRO program and writes what it did to an artifacts folder: summary.json,
-trace.txt, events.bin and guest_log.txt, plus crash.json and crash.txt when the
-guest crashed. Without --artifacts the folder is made under the system's
-temporary folder and its path is printed. Without --until the program runs
-until it exits or crashes, however long that takes.
-
+run: runs an NRO program and writes what it did to an artifacts folder:
+summary.json, trace.txt, events.bin and guest_log.txt, plus crash.json and
+crash.txt when the guest crashed. Without --artifacts the folder is made under
+the system's temporary folder and its path is printed. Without --until the
+program runs until it exits or crashes, however long that takes.
 exit codes: 0 the program exited, 1 the guest crashed, 2 emulator error, 3 timeout
+
+inspect: prints what a NUP title holds: its packages, the ExeFS of its newest
+update (or its base), a summary of its main.npdm and its modules' headers.
+verify: checks the SHA-256 of every file of a NUP title and names the first
+that does not match.
+exit codes: 0 done and intact, 1 the title is damaged or could not be parsed,
+2 the file could not be read or the command line is wrong
 ";
 
 /// The flags of the headless contract that are not built yet.
@@ -63,6 +80,10 @@ pub struct RunArgs {
 pub enum Command {
     /// `starquake run ...`.
     Run(RunArgs),
+    /// `starquake inspect <file>`.
+    Inspect(PathBuf),
+    /// `starquake verify <file>`.
+    Verify(PathBuf),
     /// `starquake --help`, `starquake help`, or no arguments at all.
     Help,
 }
@@ -79,6 +100,17 @@ pub enum UsageError {
     /// `run` was given more than one program.
     #[error("`run` takes one program file; `{0}` is a second one")]
     ExtraProgram(String),
+    /// `inspect` or `verify` was given no file.
+    #[error("`{0}` needs a NUP file")]
+    MissingFile(&'static str),
+    /// `inspect` or `verify` was given more than one file.
+    #[error("`{command}` takes one file; `{extra}` is a second one")]
+    ExtraFile {
+        /// The command.
+        command: &'static str,
+        /// The second file.
+        extra: String,
+    },
     /// A flag this tool has never heard of.
     #[error("unknown flag `{0}`")]
     UnknownFlag(String),
@@ -129,6 +161,8 @@ pub fn parse(args: &[OsString]) -> Result<Command, UsageError> {
     match text(command).as_str() {
         "help" | "--help" | "-h" => return Ok(Command::Help),
         "run" => {}
+        "inspect" => return parse_file_command("inspect", rest, Command::Inspect),
+        "verify" => return parse_file_command("verify", rest, Command::Verify),
         other => return Err(UsageError::UnknownCommand(other.to_owned())),
     }
 
@@ -181,6 +215,36 @@ pub fn parse(args: &[OsString]) -> Result<Command, UsageError> {
         timeout,
         artifacts,
     }))
+}
+
+/// Parses the arguments of `inspect` or `verify` (`command`): one file, which `make` turns into
+/// the command. An argument starting with `-` (but `-` alone) is a flag, and the only flags are
+/// `--help` and `-h`.
+fn parse_file_command(
+    command: &'static str,
+    rest: &[OsString],
+    make: fn(PathBuf) -> Command,
+) -> Result<Command, UsageError> {
+    let mut file = None;
+    for arg in rest {
+        let shown = text(arg);
+        match shown.as_str() {
+            "--help" | "-h" => return Ok(Command::Help),
+            flag if flag.starts_with('-') && flag.len() > 1 => {
+                let flag = flag.split_once('=').map_or(flag, |(name, _)| name);
+                return Err(UsageError::UnknownFlag(flag.to_owned()));
+            }
+            _ => {
+                if file.replace(PathBuf::from(arg)).is_some() {
+                    return Err(UsageError::ExtraFile {
+                        command,
+                        extra: shown,
+                    });
+                }
+            }
+        }
+    }
+    file.map(make).ok_or(UsageError::MissingFile(command))
 }
 
 /// A folder for a run that named none: under the system's temporary folder, outside any
@@ -302,6 +366,8 @@ pub fn execute(args: &[OsString], stdout: &mut dyn Write, stderr: &mut dyn Write
             let command_line = args.iter().map(text).collect();
             run(&run_args, command_line, stdout, stderr)
         }
+        Ok(Command::Inspect(file)) => title::inspect(&file, stdout, stderr),
+        Ok(Command::Verify(file)) => title::verify(&file, stdout, stderr),
         Err(error) => {
             let _ = write!(stderr, "starquake: {error}\n\n{USAGE}");
             exit_code::EMULATOR_ERROR
@@ -501,6 +567,68 @@ mod tests {
         assert_eq!(
             String::from_utf8(err).unwrap(),
             format!("starquake: `run` needs a program file\n\n{USAGE}")
+        );
+    }
+
+    #[test]
+    fn inspect_and_verify_take_exactly_one_file() {
+        type Make = fn(PathBuf) -> Command;
+        let commands: [(&str, Make); 2] =
+            [("inspect", Command::Inspect), ("verify", Command::Verify)];
+        for (command, make) in commands {
+            let parsed = |words: &[&str]| {
+                let mut line = vec![command];
+                line.extend_from_slice(words);
+                parse(&args(&line))
+            };
+            assert_eq!(parsed(&["t.nup"]), Ok(make(PathBuf::from("t.nup"))));
+            // `-` alone and names holding `=` are files.
+            assert_eq!(parsed(&["-"]), Ok(make(PathBuf::from("-"))));
+            assert_eq!(parsed(&["a=b.nup"]), Ok(make(PathBuf::from("a=b.nup"))));
+            assert_eq!(parsed(&["--help"]), Ok(Command::Help));
+            assert_eq!(parsed(&["t.nup", "-h"]), Ok(Command::Help));
+            assert_eq!(parsed(&[]), Err(UsageError::MissingFile(command)));
+            assert_eq!(
+                parsed(&["a.nup", "b.nup"]),
+                Err(UsageError::ExtraFile {
+                    command,
+                    extra: "b.nup".into()
+                })
+            );
+            assert_eq!(
+                parsed(&["t.nup", "--deep"]),
+                Err(UsageError::UnknownFlag("--deep".into()))
+            );
+            assert_eq!(
+                parsed(&["--until=timeout=1s", "t.nup"]),
+                Err(UsageError::UnknownFlag("--until".into()))
+            );
+            assert_eq!(parsed(&["-x"]), Err(UsageError::UnknownFlag("-x".into())));
+        }
+        assert_eq!(
+            UsageError::MissingFile("verify").to_string(),
+            "`verify` needs a NUP file"
+        );
+        assert_eq!(
+            UsageError::ExtraFile {
+                command: "inspect",
+                extra: "b.nup".into()
+            }
+            .to_string(),
+            "`inspect` takes one file; `b.nup` is a second one"
+        );
+    }
+
+    #[test]
+    fn a_usage_error_of_inspect_or_verify_exits_with_the_unreadable_code() {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = execute(&args(&["starquake", "verify"]), &mut out, &mut err);
+        assert_eq!(code, title::exit::UNREADABLE);
+        assert_eq!(code, exit_code::EMULATOR_ERROR);
+        assert_eq!(out, b"");
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            format!("starquake: `verify` needs a NUP file\n\n{USAGE}")
         );
     }
 }
