@@ -219,7 +219,10 @@ fn a_thread_destroyed_while_a_core_names_it_leaves_that_core() {
     run_on(&mut scheduler, thread, core(0));
     // A neighbouring core keeps what it had.
     assert_eq!(scheduler.current(core(1)), Ok(None));
-    assert_eq!(scheduler.exit_thread(core(0)), Ok(ThreadExit::LastOf(process())));
+    assert_eq!(
+        scheduler.exit_thread(core(0)),
+        Ok(ThreadExit::LastOf(process()))
+    );
     assert_eq!(scheduler.current(core(0)), Ok(None));
     assert_eq!(scheduler.highest(core(0)), Ok(None));
     assert_eq!(scheduler.needs_scheduling(core(0)), Ok(true));
@@ -295,7 +298,10 @@ fn the_virtual_mask_is_kept_and_its_translation_scheduled() {
         scheduler.set_virtual_core_mask(thread, IDEAL_CORE_NO_UPDATE, 1 << 1),
         Err(SchedError::Kernel(KernelError::InvalidCombination))
     );
-    assert_eq!(scheduler.thread(thread).unwrap().virtual_core_mask(), (6, mask));
+    assert_eq!(
+        scheduler.thread(thread).unwrap().virtual_core_mask(),
+        (6, mask)
+    );
     scheduler
         .set_virtual_core_mask(thread, IDEAL_CORE_NO_UPDATE, 1 << 6)
         .unwrap();

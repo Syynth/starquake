@@ -1515,9 +1515,7 @@ fn the_dispatcher_runs_exactly_the_calls_marked_implemented() {
         let mut regs = GuestRegs::default();
         let record = dispatch_running(id.number(), &mut regs, &memory);
         let expected = match (id.status(), id) {
-            (Status::Implemented, SvcId::ExitProcess | SvcId::ExitThread) => {
-                Outcome::ProcessExited
-            }
+            (Status::Implemented, SvcId::ExitProcess | SvcId::ExitThread) => Outcome::ProcessExited,
             (Status::Implemented, _) => Outcome::Completed,
             _ => Outcome::NotImplemented,
         };
