@@ -3,7 +3,7 @@
 use std::sync::Mutex;
 
 use crate::env::{Env, EnvCall, EnvError, EnvRecord, HostIoReply, HostIoRequest};
-use crate::event::GuestTicks;
+use crate::event::HostNanos;
 use crate::recorder::lock;
 
 struct State {
@@ -98,7 +98,7 @@ impl ReplayEnv {
 }
 
 impl Env for ReplayEnv {
-    fn now(&self) -> Result<GuestTicks, EnvError> {
+    fn now(&self) -> Result<HostNanos, EnvError> {
         lock(&self.state).take(EnvCall::Clock, |record| match record {
             EnvRecord::Clock(ticks) => Some(*ticks),
             _ => None,
@@ -166,7 +166,7 @@ mod tests {
 
     #[test]
     fn a_call_of_the_wrong_kind_is_a_mismatch_and_does_not_advance() {
-        let replay = ReplayEnv::new(vec![EnvRecord::Random(5), EnvRecord::Clock(GuestTicks(1))]);
+        let replay = ReplayEnv::new(vec![EnvRecord::Random(5), EnvRecord::Clock(HostNanos(1))]);
         let expected = EnvError::Mismatch {
             index: 0,
             requested: EnvCall::Clock,
@@ -179,7 +179,7 @@ mod tests {
 
     #[test]
     fn the_first_error_sticks_even_if_a_later_call_would_have_matched() {
-        let replay = ReplayEnv::new(vec![EnvRecord::Random(5), EnvRecord::Clock(GuestTicks(1))]);
+        let replay = ReplayEnv::new(vec![EnvRecord::Random(5), EnvRecord::Clock(HostNanos(1))]);
         let first = replay.now().unwrap_err();
         assert_eq!(replay.random_u64(), Err(first.clone()));
         assert_eq!(replay.finish(), Err(first));
@@ -187,8 +187,8 @@ mod tests {
 
     #[test]
     fn running_past_the_end_is_exhausted() {
-        let replay = ReplayEnv::new(vec![EnvRecord::Clock(GuestTicks(1))]);
-        assert_eq!(replay.now(), Ok(GuestTicks(1)));
+        let replay = ReplayEnv::new(vec![EnvRecord::Clock(HostNanos(1))]);
+        assert_eq!(replay.now(), Ok(HostNanos(1)));
         assert_eq!(
             replay.random_u64(),
             Err(EnvError::Exhausted {
@@ -226,7 +226,7 @@ mod tests {
     #[test]
     fn finish_reports_unconsumed_records() {
         let replay = ReplayEnv::new(vec![
-            EnvRecord::Clock(GuestTicks(1)),
+            EnvRecord::Clock(HostNanos(1)),
             EnvRecord::Random(2),
             EnvRecord::Random(3),
         ]);
@@ -238,6 +238,42 @@ mod tests {
                 remaining: 2
             })
         );
+    }
+
+    #[test]
+    fn the_recordings_layout_is_pinned() {
+        // Golden bytes, every variant with distinct non-zero values. Postcard writes the variant
+        // index, then the fields: a clock reading is a bare varint (`HostNanos` adds nothing),
+        // and byte strings carry their length.
+        let request = HostIoRequest {
+            channel: 3,
+            payload: vec![0xAA, 0xBB],
+        };
+        let host_io = |reply| EnvRecord::HostIo {
+            request: request.clone(),
+            reply,
+        };
+        let cases = [
+            // 0x81 needs two varint bytes: the low seven bits with the continuation bit, then 1.
+            (EnvRecord::Clock(HostNanos(0x81)), vec![0x00, 0x81, 0x01]),
+            (EnvRecord::Random(0x7F), vec![0x01, 0x7F]),
+            (
+                host_io(HostIoReply::Data(vec![0xCC])),
+                vec![0x02, 0x03, 0x02, 0xAA, 0xBB, 0x00, 0x01, 0xCC],
+            ),
+            (
+                host_io(HostIoReply::Failed(5)),
+                vec![0x02, 0x03, 0x02, 0xAA, 0xBB, 0x01, 0x05],
+            ),
+            (
+                host_io(HostIoReply::Unavailable),
+                vec![0x02, 0x03, 0x02, 0xAA, 0xBB, 0x02],
+            ),
+        ];
+        for (record, bytes) in cases {
+            assert_eq!(postcard::to_allocvec(&record).unwrap(), bytes, "{record:?}");
+            assert_eq!(postcard::from_bytes::<EnvRecord>(&bytes), Ok(record));
+        }
     }
 
     #[test]

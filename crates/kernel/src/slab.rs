@@ -18,6 +18,15 @@
 //!   to a generation that an old id could still hold.
 //! - **Capacity is configuration**: [`Slab::with_max_slots`] bounds the number of slots (the
 //!   default is `u32::MAX`, the most an id can address). A full slab is [`SlabError::Full`].
+//! - **Two kinds of lookup.** An id that came from outside the table (a handle resolved for a
+//!   guest, an id a caller passes in) may be stale, and [`Slab::get`] says so with a
+//!   [`SlabError::Stale`] the caller turns into a result. An id the kernel stored itself (a queue
+//!   link, a core's record of the thread it should run) is live by construction; if it is not, the
+//!   kernel's bookkeeping is broken. [`Slab::stored`] and [`Slab::stored_mut`] are the lookups
+//!   for those, and fail with the one fixed [`StoredIdStale`]. The scheduler is the one table
+//!   that uses them today: its `SchedError` converts [`StoredIdStale`] into `SchedError::Corrupt`,
+//!   so such a lookup there is a bare `?`. `HandleError` and `ObjectError` have no such
+//!   conversion; another table adds its own when it adopts the lookup.
 //! - **Serialisation validates**: the whole structure derives `serde`, and deserialising checks
 //!   every invariant (free list in range, vacant and duplicate-free; generations non-zero; counts
 //!   consistent), so a corrupt snapshot is an error instead of a later wrong row.
@@ -55,6 +64,13 @@ pub enum SlabError {
     #[error("slab bookkeeping is inconsistent")]
     Corrupt,
 }
+
+/// An id the kernel itself stored names no live row: its bookkeeping is inconsistent. Returned
+/// by [`Slab::stored`] and [`Slab::stored_mut`]. Never something a guest causes; Horizon follows
+/// a raw pointer here and has no such case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("an id the kernel stored names no live row")]
+pub struct StoredIdStale;
 
 /// One storage slot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -317,6 +333,17 @@ impl<Id: SlabId, T> Slab<Id, T> {
             }
             _ => Err(Self::stale(id)),
         }
+    }
+
+    /// The row named by `id`, an id the kernel stored itself (see the module docs). A stale one
+    /// is [`StoredIdStale`].
+    pub fn stored(&self, id: Id) -> Result<&T, StoredIdStale> {
+        self.get(id).map_err(|_| StoredIdStale)
+    }
+
+    /// The row named by `id`, an id the kernel stored itself, mutably.
+    pub fn stored_mut(&mut self, id: Id) -> Result<&mut T, StoredIdStale> {
+        self.get_mut(id).map_err(|_| StoredIdStale)
     }
 
     /// Whether `id` names a live row.

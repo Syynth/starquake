@@ -1,18 +1,23 @@
 //! The core loop driven by a scripted vCPU, on any host: the scripted guest makes the exits a
 //! real program would, against a real placed image in flat memory.
 
+use std::cell::Cell;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use starquake_cpu::testing::ScriptedVcpu;
 use starquake_cpu::{Exit, Interrupter, Vcpu};
 use starquake_kernel::result::KernelError;
 use starquake_kernel::svc::SvcId;
-use starquake_kernel::svc::tick::CNTFREQ;
 use starquake_memory::{Fault, FlatMemory};
 use starquake_testkit::programs;
-use starquake_trace::{Dump, DumpError, Event, EventKind, FaultAction, LifecyclePhase};
+use starquake_trace::{
+    Dump, DumpError, Env, EnvRecord, Event, EventKind, FaultAction, FixedClock, HostNanos,
+    LifecyclePhase, SystemClock,
+};
 
 use super::*;
+use crate::clock::PROCESS_COUNTER_RATE;
 use crate::crash::Location;
 use crate::image::{Program, place};
 use crate::report::{empty_dump, exit_code};
@@ -20,6 +25,15 @@ use crate::report::{empty_dump, exit_code};
 const RAM_BASE: u64 = 0x8000_0000;
 /// Room for a small image, its TLS block and the stack.
 const RAM_SIZE: usize = 2 << 20;
+
+/// The time a scripted run counts with: the rate every process has for now, and the host's
+/// monotonic clock. Nothing here reads a counter in the guest, so the clock's zero is free.
+fn timebase() -> Timebase<SystemClock> {
+    Timebase {
+        rate: PROCESS_COUNTER_RATE,
+        clock: SystemClock::new(),
+    }
+}
 
 /// A program placed in flat memory.
 struct Guest {
@@ -44,6 +58,7 @@ impl Guest {
             &self.placed,
             options,
             Instant::now(),
+            timebase(),
         )
     }
 
@@ -133,7 +148,7 @@ fn the_guest_programs_use_the_kernels_system_call_numbers() {
         u32::from(SvcId::OutputDebugString.number())
     );
     // And the rate the example's counter program expects is the one the kernel gives a process.
-    assert_eq!(programs::COUNTER_HZ, CNTFREQ);
+    assert_eq!(programs::COUNTER_HZ, PROCESS_COUNTER_RATE.hz());
 }
 
 #[test]
@@ -434,6 +449,7 @@ fn a_log_line_and_the_call_that_wrote_it_carry_one_time() {
         &guest.placed,
         &RunOptions::default(),
         Instant::now(),
+        timebase(),
     );
     assert_eq!(report.guest_log, [b"one".to_vec(), b"two".to_vec()]);
     let events = Dump::from_bytes(&report.events).unwrap().merged();
@@ -450,6 +466,97 @@ fn a_log_line_and_the_call_that_wrote_it_carry_one_time() {
     let times: Vec<_> = events.iter().map(|event| event.time).collect();
     assert!(times.is_sorted(), "{times:?}");
     assert!(times.first() < times.last(), "{times:?}");
+}
+
+#[test]
+fn get_system_tick_is_the_clock_at_the_rate_the_run_was_given() {
+    // A clock that reads a whole number of seconds, so the expected ticks are exact, and both
+    // console rates: the run's rate reaches the kernel, and the kernel's conversion reaches the
+    // guest.
+    const SECONDS: u64 = 1_000_003;
+    let start = SECONDS * starquake_kernel::time::NANOS_PER_SECOND;
+    for rate in [CounterRate::SWITCH_1, CounterRate::SWITCH_2] {
+        let guest = Guest::new(&programs::hello().unwrap());
+        let tick = Rc::new(Cell::new(0));
+        let seen = Rc::clone(&tick);
+        // The second step's closure sees what the first call wrote to x0.
+        let mut vcpu = ScriptedVcpu::new()
+            .then(|_| {}, svc(SvcId::GetSystemTick))
+            .then(move |regs| seen.set(regs.x[0]), svc(SvcId::ExitProcess));
+        let report = run(
+            &mut vcpu,
+            &guest.memory,
+            &guest.placed,
+            &RunOptions::default(),
+            Instant::now(),
+            Timebase {
+                rate,
+                clock: FixedClock::new(start, 1),
+            },
+        );
+        assert_eq!(report.exit, ExitReason::ProcessExited);
+        // The environment's first reading is the clock's first: guest tick zero is its zero.
+        assert_eq!(tick.get(), rate.ticks_at(HostNanos(start)).0);
+        assert_eq!(tick.get(), SECONDS * rate.hz());
+        // The call's event carries the same guest time.
+        let events = Dump::from_bytes(&report.events).unwrap().merged();
+        let stamped: Vec<u64> = events
+            .iter()
+            .filter(|event| {
+                matches!(event.kind, EventKind::Svc { id, .. } if id == u32::from(SvcId::GetSystemTick.number()))
+            })
+            .map(|event| event.time.0)
+            .collect();
+        assert_eq!(stamped, [tick.get()]);
+    }
+}
+
+#[test]
+fn the_environments_recording_is_dropped_as_it_is_made() {
+    // Every dispatch reads the environment's clock once, and a live environment keeps every
+    // answer it gives. Nothing in a run uses that recording, so the loop must not let it grow
+    // with the number of system calls the guest makes.
+    const CALLS: u64 = 1_000;
+    let guest = Guest::new(&programs::hello().unwrap());
+    let options = RunOptions::default();
+    let session = Session {
+        memory: &guest.memory,
+        placed: &guest.placed,
+        options: &options,
+        clock: RunClock::new(timebase()),
+        recorder: Recorder::new(),
+    };
+    let mut log = GuestLog {
+        lines: Vec::new(),
+        kept_bytes: 0,
+        limit: Limits::DEFAULT.guest_log_bytes,
+        dropped: 0,
+        session: &session,
+    };
+    let mut tally = Tally::default();
+    let env = session.environment();
+    let mut vcpu = ScriptedVcpu::new();
+    for _ in 0..CALLS {
+        vcpu = vcpu.then(|_| {}, svc(SvcId::GetSystemTick));
+    }
+    let mut vcpu = vcpu.then(|_| {}, svc(SvcId::ExitProcess));
+
+    let ending = drive(&mut vcpu, &session, &env, &mut log, &mut tally);
+    assert!(matches!(ending, Ending::Exited));
+    // The calls were made, through this environment...
+    assert_eq!(
+        tally.calls,
+        BTreeMap::from([
+            ("ExitProcess".to_owned(), 1),
+            ("GetSystemTick".to_owned(), CALLS)
+        ])
+    );
+    // ...and none of their clock readings is still held. (The count, not the records: a
+    // failure would otherwise print one record per call.)
+    assert_eq!(env.recording().len(), 0);
+    // It is an environment that records: one more reading is one record.
+    let reading = env.now().unwrap();
+    assert_eq!(env.recording(), [EnvRecord::Clock(reading)]);
 }
 
 #[test]
@@ -509,6 +616,7 @@ fn the_trace_and_the_guest_log_stop_growing_at_their_limits() {
         &guest.placed,
         &RunOptions::default(),
         Instant::now(),
+        timebase(),
         limits,
     );
     assert_eq!(report.exit, ExitReason::ProcessExited);
@@ -555,6 +663,7 @@ fn a_run_within_its_limits_is_not_truncated() {
         &guest.placed,
         &RunOptions::default(),
         Instant::now(),
+        timebase(),
         limits,
     );
     assert_eq!(report.guest_log, [lines[0].to_vec(), lines[1].to_vec()]);

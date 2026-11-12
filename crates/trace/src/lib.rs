@@ -25,8 +25,8 @@ pub use env::{
     HostIoRequest, LiveEnv, ReplayEnv, SystemClock,
 };
 pub use event::{
-    Event, EventKind, FaultAction, GuestTicks, IpcOutcome, LifecyclePhase, MapKind, ResultCode,
-    SVC_ARG_COUNT, ServiceId, SessionId, ThreadId, WakeReason,
+    Event, EventKind, FaultAction, GuestTicks, HostNanos, IpcOutcome, LifecyclePhase, MapKind,
+    ResultCode, SVC_ARG_COUNT, ServiceId, SessionId, ThreadId, WakeReason,
 };
 pub use flight::FlightRecorder;
 pub use recorder::{Recorder, Sink, VecSink};

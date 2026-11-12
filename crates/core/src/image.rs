@@ -256,7 +256,7 @@ mod tests {
     /// The counter rates of a real run: Apple Silicon's and the kernel's.
     const RESCALE: CounterRescale = CounterRescale {
         host_hz: 24_000_000,
-        guest_hz: starquake_kernel::svc::tick::CNTFREQ,
+        guest_hz: crate::clock::PROCESS_COUNTER_RATE.hz(),
     };
 
     fn mapping(name: &str, start: u64, end: u64) -> Mapping {
