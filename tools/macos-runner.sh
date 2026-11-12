@@ -9,8 +9,9 @@
 # records the inode, modification time and size of the file that was signed, and the binary is
 # signed again whenever those no longer match. A time comparison is not enough: before every
 # `cargo run`, cargo replaces target/<profile>/<name> with a fresh copy of the unsigned binary it
-# built earlier, which keeps its old modification time and so looks older than any marker.
-# (xtask/tests/macos_runner.rs replays that.)
+# built earlier, which keeps its old modification time and so looks older than any marker. The
+# inode is there because time (whole seconds) and size alone do not tell a new file from the one
+# that was signed. xtask/tests/macos_runner.rs replays both cases.
 #
 # Test runners start the same binary several times at once, and codesign replaces the file while
 # it works, so signing is done under a lock.
@@ -18,9 +19,10 @@ set -e
 bin="$1"
 marker="$bin.hvsigned"
 
-# Prints what identifies the file at $bin right now.
+# Prints what identifies the file at $bin right now. The system's own stat is named in full: with
+# GNU coreutils first on PATH, `stat -f` reports the file system instead of the file.
 identity() {
-    stat -f '%i %m %z' "$bin"
+    /usr/bin/stat -f '%i %m %z' "$bin"
 }
 
 # Succeeds if the file at $bin is the one this script last signed.

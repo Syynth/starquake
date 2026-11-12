@@ -72,7 +72,9 @@ mod support {
     }
 
     /// What cargo does before each `cargo run`: puts a copy of the built binary at `path`,
-    /// replacing whatever is there and keeping the built binary's modification time.
+    /// replacing whatever is there and keeping the built binary's modification time. (Any file
+    /// can stand in for the built binary: the copy is a new file with the old one's time and
+    /// size.)
     pub(crate) fn uplift(built: &Path, path: &Path) {
         if path.exists() {
             std::fs::remove_file(path).unwrap();
@@ -92,6 +94,18 @@ mod support {
         ran.0
     }
 
+    /// What the runner's marker can see of a file besides its inode: its modification time in
+    /// whole seconds, and its size.
+    pub(crate) fn seconds_and_size(path: &Path) -> (u64, u64) {
+        let metadata = std::fs::metadata(path).unwrap();
+        let modified = metadata
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        (modified.as_secs(), metadata.len())
+    }
+
     /// Whether `binary`'s signature carries the hypervisor entitlement.
     pub(crate) fn entitled(binary: &Path) -> bool {
         let shown = output(
@@ -104,7 +118,7 @@ mod support {
     }
 }
 
-use support::{built, entitled, run, scratch, uplift};
+use support::{built, entitled, run, scratch, seconds_and_size, uplift};
 
 #[test]
 fn a_binary_is_signed_with_the_entitlement_before_it_runs() {
@@ -150,4 +164,38 @@ fn a_binary_that_has_not_changed_is_not_signed_twice() {
     );
     assert_eq!(std::fs::read(&binary).unwrap(), signed);
     assert!(entitled(&binary));
+}
+
+#[test]
+fn a_different_file_with_the_same_time_and_size_is_signed_again() {
+    // Why the marker records the inode. Modification time (which `stat` gives in whole seconds)
+    // and size do not tell two files apart: a binary rebuilt within the second, or restored from
+    // a copy, can match both. The file here is a copy of the signed binary, so it has the signed
+    // binary's size and time, but it is not the file the runner signed.
+    let folder = scratch("same-time-and-size");
+    let built = built(&folder);
+    let binary = folder.join("binary");
+    uplift(&built, &binary);
+    assert_eq!(run(&binary), 0);
+
+    let twin = folder.join("twin");
+    uplift(&binary, &twin);
+    assert_eq!(seconds_and_size(&twin), seconds_and_size(&binary));
+    let before = std::fs::metadata(&twin).unwrap().modified().unwrap();
+    std::fs::rename(&twin, &binary).unwrap();
+
+    assert_eq!(run(&binary), 0);
+    // Signing rewrites the file, so its modification time moved.
+    let signed = std::fs::metadata(&binary).unwrap().modified().unwrap();
+    assert_ne!(
+        signed, before,
+        "the runner did not sign a file it had not seen"
+    );
+    assert!(entitled(&binary));
+    // Now it is the file the marker names, and it is left alone.
+    assert_eq!(run(&binary), 0);
+    assert_eq!(
+        std::fs::metadata(&binary).unwrap().modified().unwrap(),
+        signed
+    );
 }
