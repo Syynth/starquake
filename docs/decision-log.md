@@ -249,3 +249,11 @@ Entry format:
 - **WHAT:** A semaphore release or syncpoint increment becomes visible to the game once the host GPU has actually finished the work before it, not when the work is recorded. Signals with no host work behind them are written at once, and several are batched into one completion check. Signalling at record time is kept only as a debugging switch. The graphics server draft's assumption that increments happen at record time is dropped.
 - **WHY:** An early signal lets the game read back an image or a query result that does not exist yet, which shows up as occasional wrong pixels or stale data and is very hard to trace. A late one only costs latency, which is easy to measure. The project aims for correct frames before fast ones, and wgpu reports when submitted work has completed.
 
+## Presents pace the game through a buffer queue
+- **WHEN:** 2026-11-12
+- **PROJECT:** starquake
+- **SYSTEM:** gsv
+- **SCOPE:** architectural
+- **WHAT:** A present returns at once with the list of buffers still in use. The graphics server's emulated 60 Hz clock shows one ready frame per tick and frees the buffer it replaces; the game waits only when it has no free buffer. The fence wait the other reference used (hold the reply until the previous frame is done and the next tick has passed) is kept as a per-run fallback setting, implemented as a deferred reply so it never blocks a core. The GPU and render drafts' assumption that a present waits on the frame's fence is dropped.
+- **WHY:** It never blocks the emulator and lets drawing overlap GPU work. The fence-wait approach lost up to half of each frame to waiting, needed a 4-second safety timeout and deadlocked when tuned. The risk, that a game does not wait for free buffers properly, is unconfirmed either way and is covered by the fallback.
+
