@@ -1,7 +1,7 @@
 //! The dispatcher driven with a fake register file, environment, memory and debug sink.
 
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Barrier, Mutex, PoisonError};
 
 use proptest::prelude::*;
 use proptest::test_runner::{Config, RngAlgorithm, RngSeed};
@@ -366,6 +366,107 @@ fn every_dispatch_reads_the_clock_once_and_stamps_its_event_with_that_reading() 
         .collect();
     assert_eq!(env.recording(), readings);
     let _tables: Tables = dispatcher.into_tables();
+}
+
+/// How many threads dispatch at once in
+/// `event_times_follow_the_kernels_order_when_threads_race_to_dispatch`.
+const RACING_THREADS: u8 = 4;
+/// How many calls each of them makes.
+const CALLS_PER_THREAD: u64 = 500;
+
+#[test]
+fn event_times_follow_the_kernels_order_when_threads_race_to_dispatch() {
+    // Threads share one dispatcher, one environment and one recorder. The clock is read under
+    // the kernel lock, so the reading a dispatch gets and the `seq` its event gets are taken in
+    // the same order: sorted by `seq`, the times are the clock's readings in order. A reading
+    // taken before the lock could be overtaken on the way to it, and two events would be out of
+    // order.
+    let dispatcher = Dispatcher::new(tables());
+    let env = env();
+    let (recorder, events) = recorder();
+    let start = Barrier::new(usize::from(RACING_THREADS));
+    std::thread::scope(|scope| {
+        for core in 0..RACING_THREADS {
+            let (dispatcher, env, recorder, start) = (&dispatcher, &env, &recorder, &start);
+            scope.spawn(move || {
+                let memory = FlatMemory::new(BASE, 0x10);
+                let mut sink = Collect::default();
+                let mut caller = Caller {
+                    core,
+                    thread: THREAD,
+                    env,
+                    memory: &memory,
+                    debug: &mut sink,
+                    recorder,
+                };
+                start.wait();
+                for _ in 0..CALLS_PER_THREAD {
+                    let mut regs = GuestRegs::default();
+                    let number = SvcId::GetSystemTick.number();
+                    let record = dispatcher.dispatch(number, &mut regs, &mut caller);
+                    assert_eq!(record.outcome, Outcome::Completed);
+                }
+            });
+        }
+    });
+    let mut events = events.events();
+    events.sort_by_key(|event| event.seq);
+    let calls = u64::from(RACING_THREADS) * CALLS_PER_THREAD;
+    assert_eq!(u64::try_from(events.len()), Ok(calls));
+    // The first event whose time is not the reading its place in the order implies; each
+    // reading is a whole second of ticks after the one before, so this is also "strictly
+    // increasing".
+    let out_of_order = (0u64..)
+        .zip(&events)
+        .find(|(n, event)| event.time != time_of(*n))
+        .map(|(n, event)| (n, event.time, time_of(n)));
+    assert_eq!(out_of_order, None);
+    // And the environment's recording is those readings, in that order.
+    let readings: Vec<EnvRecord> = (0..calls)
+        .map(|n| EnvRecord::Clock(HostNanos(CLOCK_START_NS + n * CLOCK_STEP_NS)))
+        .collect();
+    assert_eq!(env.recording(), readings);
+}
+
+#[test]
+fn a_dispatch_that_waits_for_the_lock_reads_the_clock_only_once_it_holds_it() {
+    let (held, is_held) = mpsc::channel();
+    let (waiting, is_waiting) = mpsc::channel();
+    let dispatcher = Dispatcher::new(tables()).with_lock_timer(StepTimer::new(waiting));
+    let env = env();
+    let memory = FlatMemory::new(BASE, 0x10);
+    let mut sink = Collect::default();
+    let recorder = Recorder::new();
+    let mut regs = regs();
+    std::thread::scope(|scope| {
+        let (dispatcher, env) = (&dispatcher, &env);
+        scope.spawn(move || {
+            dispatcher.with::<(&mut Scheduler,), _>(|_| {
+                held.send(()).unwrap();
+                // The dispatch below has found the lock held: the lock timer is read for the
+                // first time only then.
+                is_waiting.recv().unwrap();
+                // It cannot go on until this closure returns, and it has not read the clock.
+                assert_eq!(env.recording(), []);
+            });
+        });
+        is_held.recv().unwrap();
+        let mut caller = Caller {
+            core: 0,
+            thread: THREAD,
+            env,
+            memory: &memory,
+            debug: &mut sink,
+            recorder: &recorder,
+        };
+        let record = dispatcher.dispatch(SvcId::GetSystemTick.number(), &mut regs, &mut caller);
+        assert_eq!(record.outcome, Outcome::Completed);
+    });
+    assert_eq!(GuestTicks(regs.x[0]), time_of(0));
+    assert_eq!(
+        env.recording(),
+        [EnvRecord::Clock(HostNanos(CLOCK_START_NS))]
+    );
 }
 
 #[test]
@@ -931,6 +1032,41 @@ fn a_wait_for_a_held_lock_is_timed_and_charged_to_each_declared_table() {
             handles: waits(1, 1, 1, STEP),
             address_space: Waits::default(),
             scheduler: waits(2, 2, 1, STEP),
+        }
+    );
+}
+
+#[test]
+fn a_poisoned_lock_is_taken_without_counting_a_wait() {
+    let dispatcher = Dispatcher::new(tables());
+    // A panic while the tables are held poisons the lock.
+    let panicked = std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                dispatcher.with::<(&mut Scheduler,), _>(|_| {
+                    panic!("a panic that poisons the dispatcher's lock")
+                });
+            })
+            .join()
+    });
+    assert!(panicked.is_err());
+    assert!(dispatcher.state.is_poisoned());
+    // The next dispatch takes it all the same, and it did not have to wait for it.
+    let mut regs = regs();
+    let (record, events) = dispatch_on(&dispatcher, SvcId::GetSystemTick.number(), &mut regs, 0);
+    assert_eq!(record.outcome, Outcome::Completed);
+    assert_eq!(GuestTicks(regs.x[0]), time_of(0));
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        dispatcher.lock_waits(),
+        LockWaits {
+            timed: false,
+            // The panicking holder, which declared the scheduler exclusively, and the dispatch,
+            // which declared no table. Neither found the lock held.
+            lock: waits(2, 1, 0, Duration::ZERO),
+            handles: Waits::default(),
+            address_space: Waits::default(),
+            scheduler: waits(1, 1, 0, Duration::ZERO),
         }
     );
 }

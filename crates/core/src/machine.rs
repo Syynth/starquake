@@ -44,7 +44,8 @@
 //!   The observability spec's size cap per run, with its own flags, replaces the constants.
 //! - **The environment** is live, with a fixed random seed and nothing recorded to disk; the
 //!   `--clock`, `--seed` and `--record` flags of the headless contract are not built. Its
-//!   recording, which grows by a clock reading per system call, is dropped as it is made.
+//!   recording, which grows by a clock reading per system call, is dropped as it is made (test:
+//!   `the_environments_recording_is_dropped_as_it_is_made`).
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -151,6 +152,15 @@ impl<C: HostClock + Clone> Session<'_, C> {
     /// Records an event on the one core and thread, stamped with `time`.
     fn record_at(&self, time: GuestTicks, kind: EventKind) {
         self.recorder.record(time, CORE, MAIN_THREAD, kind);
+    }
+
+    /// The environment the kernel reads during this run: live, on the other copy of the run's
+    /// clock, with the fixed random seed.
+    fn environment(&self) -> LiveEnv
+    where
+        C: 'static,
+    {
+        LiveEnv::new(self.clock.for_environment(), RANDOM_SEED)
     }
 }
 
@@ -341,7 +351,8 @@ pub(crate) fn run_within<V: Vcpu, C: HostClock + Clone + 'static>(
         session: &session,
     };
     let mut tally = Tally::default();
-    let exit = match drive(vcpu, &session, &mut log, &mut tally) {
+    let env = session.environment();
+    let exit = match drive(vcpu, &session, &env, &mut log, &mut tally) {
         Ending::Exited => ExitReason::ProcessExited,
         Ending::TimedOut => ExitReason::Timeout,
         Ending::Failed(message) => {
@@ -405,10 +416,13 @@ fn settle_dump(
     }
 }
 
-/// The loop itself (see the module docs).
+/// The loop itself (see the module docs). `env` is the environment the kernel reads
+/// ([`Session::environment`]); the caller owns it so that a test can see what the loop leaves
+/// in its recording.
 fn drive<V: Vcpu, C: HostClock + Clone + 'static>(
     vcpu: &mut V,
     session: &Session<'_, C>,
+    env: &LiveEnv,
     log: &mut GuestLog<'_, C>,
     tally: &mut Tally,
 ) -> Ending {
@@ -416,7 +430,6 @@ fn drive<V: Vcpu, C: HostClock + Clone + 'static>(
         Ok(tables) => Dispatcher::new(tables),
         Err(error) => return Ending::Failed(format!("the kernel could not be set up: {error}")),
     };
-    let env = LiveEnv::new(session.clock.for_environment(), RANDOM_SEED);
     let vcpu_failed = |error| Ending::Failed(format!("the vCPU failed: {error}"));
 
     // PROVISIONAL: everything else starts at zero (see "Start state" in the module docs).
@@ -455,7 +468,7 @@ fn drive<V: Vcpu, C: HostClock + Clone + 'static>(
                     &mut Caller {
                         core: CORE,
                         thread: MAIN_THREAD,
-                        env: &env,
+                        env,
                         memory: session.memory,
                         debug: log,
                         recorder: &session.recorder,

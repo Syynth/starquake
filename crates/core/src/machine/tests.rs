@@ -12,8 +12,8 @@ use starquake_kernel::svc::SvcId;
 use starquake_memory::{Fault, FlatMemory};
 use starquake_testkit::programs;
 use starquake_trace::{
-    Dump, DumpError, Event, EventKind, FaultAction, FixedClock, HostNanos, LifecyclePhase,
-    SystemClock,
+    Dump, DumpError, Env, EnvRecord, Event, EventKind, FaultAction, FixedClock, HostNanos,
+    LifecyclePhase, SystemClock,
 };
 
 use super::*;
@@ -509,6 +509,54 @@ fn get_system_tick_is_the_clock_at_the_rate_the_run_was_given() {
             .collect();
         assert_eq!(stamped, [tick.get()]);
     }
+}
+
+#[test]
+fn the_environments_recording_is_dropped_as_it_is_made() {
+    // Every dispatch reads the environment's clock once, and a live environment keeps every
+    // answer it gives. Nothing in a run uses that recording, so the loop must not let it grow
+    // with the number of system calls the guest makes.
+    const CALLS: u64 = 1_000;
+    let guest = Guest::new(&programs::hello().unwrap());
+    let options = RunOptions::default();
+    let session = Session {
+        memory: &guest.memory,
+        placed: &guest.placed,
+        options: &options,
+        clock: RunClock::new(timebase()),
+        recorder: Recorder::new(),
+    };
+    let mut log = GuestLog {
+        lines: Vec::new(),
+        kept_bytes: 0,
+        limit: Limits::DEFAULT.guest_log_bytes,
+        dropped: 0,
+        session: &session,
+    };
+    let mut tally = Tally::default();
+    let env = session.environment();
+    let mut vcpu = ScriptedVcpu::new();
+    for _ in 0..CALLS {
+        vcpu = vcpu.then(|_| {}, svc(SvcId::GetSystemTick));
+    }
+    let mut vcpu = vcpu.then(|_| {}, svc(SvcId::ExitProcess));
+
+    let ending = drive(&mut vcpu, &session, &env, &mut log, &mut tally);
+    assert!(matches!(ending, Ending::Exited));
+    // The calls were made, through this environment...
+    assert_eq!(
+        tally.calls,
+        BTreeMap::from([
+            ("ExitProcess".to_owned(), 1),
+            ("GetSystemTick".to_owned(), CALLS)
+        ])
+    );
+    // ...and none of their clock readings is still held. (The count, not the records: a
+    // failure would otherwise print one record per call.)
+    assert_eq!(env.recording().len(), 0);
+    // It is an environment that records: one more reading is one record.
+    let reading = env.now().unwrap();
+    assert_eq!(env.recording(), [EnvRecord::Clock(reading)]);
 }
 
 #[test]

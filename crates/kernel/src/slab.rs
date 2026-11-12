@@ -21,11 +21,12 @@
 //! - **Two kinds of lookup.** An id that came from outside the table (a handle resolved for a
 //!   guest, an id a caller passes in) may be stale, and [`Slab::get`] says so with a
 //!   [`SlabError::Stale`] the caller turns into a result. An id the kernel stored itself (a queue
-//!   link, a wait-list entry, an object row naming its thread) is live by construction; if it is
-//!   not, the kernel's bookkeeping is broken. [`Slab::stored`] and [`Slab::stored_mut`] are the
-//!   lookups for those, and fail with the one fixed [`StoredIdStale`], which every table's error
-//!   type converts into its own "bookkeeping is inconsistent" case, so such a lookup is a bare
-//!   `?`.
+//!   link, a core's record of the thread it runs) is live by construction; if it is not, the
+//!   kernel's bookkeeping is broken. [`Slab::stored`] and [`Slab::stored_mut`] are the lookups
+//!   for those, and fail with the one fixed [`StoredIdStale`]. The scheduler is the one table
+//!   that uses them today: its `SchedError` converts [`StoredIdStale`] into `SchedError::Corrupt`,
+//!   so such a lookup there is a bare `?`. `HandleError` and `ObjectError` have no such
+//!   conversion; another table adds its own when it adopts the lookup.
 //! - **Serialisation validates**: the whole structure derives `serde`, and deserialising checks
 //!   every invariant (free list in range, vacant and duplicate-free; generations non-zero; counts
 //!   consistent), so a corrupt snapshot is an error instead of a later wrong row.

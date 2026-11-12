@@ -30,7 +30,8 @@
 //!
 //! A call that isn't [`Status::Implemented`], and a number that isn't listed at all, returns
 //! [`KernelError::NotImplemented`](crate::result::KernelError::NotImplemented) from the
-//! dispatcher. The log line and the summary's list of stubbed calls say which status it had.
+//! dispatcher. For a listed call the dispatcher's log line names the status it had; an unlisted
+//! number has none and is logged as unknown.
 
 /// Where a system call stands in starquake (kernel spec, rule 6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
