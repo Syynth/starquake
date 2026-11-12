@@ -436,6 +436,22 @@ mod tests {
             ProcessInfo::new(&both, 1),
             refused(KernelError::InvalidCombination)
         );
+        // Each empty range alone.
+        let mut cores = homebrew();
+        cores.cores = Range { first: 2, last: 1 };
+        assert_eq!(
+            ProcessInfo::new(&cores, 1),
+            refused(KernelError::InvalidCombination)
+        );
+        let mut priorities = homebrew();
+        priorities.priorities = Range {
+            first: 40,
+            last: 30,
+        };
+        assert_eq!(
+            ProcessInfo::new(&priorities, 1),
+            refused(KernelError::InvalidCombination)
+        );
         // A core range ending past the virtual cores, with an empty priority range: the empty
         // range is checked first.
         let mut order = homebrew();
