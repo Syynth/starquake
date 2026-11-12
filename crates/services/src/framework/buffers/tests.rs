@@ -81,11 +81,20 @@ fn request_with(counts: Counts) -> Vec<u8> {
     bytes
 }
 
-/// What `check` says of a request carrying `counts` descriptors.
+/// What `check` says of a CMIF request carrying `counts` descriptors.
 fn check_counts(declared: &[DeclaredBuffer], counts: Counts) -> Result<(), Fault> {
+    check_counts_over(Protocol::Cmif, declared, counts)
+}
+
+/// What `check` says of a request carrying `counts` descriptors, as if it came in `protocol`.
+fn check_counts_over(
+    protocol: Protocol,
+    declared: &[DeclaredBuffer],
+    counts: Counts,
+) -> Result<(), Fault> {
     let bytes = request_with(counts);
     let message = Message::parse_request(&bytes, SessionKind::Session).unwrap();
-    check(declared, &message)
+    check(protocol, declared, &message)
 }
 
 fn buffer(direction: Direction, kind: BufferKind) -> DeclaredBuffer {
@@ -273,7 +282,11 @@ fn the_transfer_mode_is_not_checked() {
             .unwrap();
         let message = Message::parse_request(&bytes, SessionKind::Session).unwrap();
         assert_eq!(message.send_buffers[0].flags, flags);
-        assert_eq!(check(&declared, &message), Ok(()), "mode {flags}");
+        assert_eq!(
+            check(Protocol::Cmif, &declared, &message),
+            Ok(()),
+            "mode {flags}"
+        );
     }
 }
 
@@ -331,6 +344,44 @@ fn c_descriptors_must_cover_the_declared_buffers_and_may_be_more() {
     );
     assert_eq!(check_counts(&declared, with_c(2)), Ok(()));
     assert_eq!(check_counts(&declared, with_c(3)), Ok(()));
+}
+
+/// Divergence from CMIF, after the console's TIPC header check (module docs, "TIPC"): on TIPC
+/// the C descriptors must be exactly as many as the declared out pointer and auto-select
+/// buffers, so a command that declares none refuses a single one.
+#[test]
+fn c_descriptors_on_tipc_must_match_exactly() {
+    let tipc =
+        |declared: &[DeclaredBuffer], counts| check_counts_over(Protocol::Tipc, declared, counts);
+    let with_c = |counts: Counts, c| Counts { c, ..counts };
+    // Nothing declared: none is fine, one is refused over TIPC and accepted over CMIF.
+    assert_eq!(tipc(&[], Counts::default()), Ok(()));
+    assert_eq!(
+        tipc(&[], with_c(Counts::default(), 1)),
+        count(DescriptorList::C, 1, 0)
+    );
+    assert_eq!(check_counts(&[], with_c(Counts::default(), 1)), Ok(()));
+    // Two declared: one short, exactly two, and one more.
+    let declared = [
+        buffer(Direction::Out, BufferKind::Pointer),
+        buffer(Direction::Out, BufferKind::AutoSelect),
+    ];
+    let (_, counts) = as_a_client_sends(&declared);
+    assert_eq!(
+        tipc(&declared, with_c(counts, 1)),
+        count(DescriptorList::C, 1, 2)
+    );
+    assert_eq!(tipc(&declared, with_c(counts, 2)), Ok(()));
+    assert_eq!(
+        tipc(&declared, with_c(counts, 3)),
+        count(DescriptorList::C, 3, 2)
+    );
+    // The other lists are compared before C, as on CMIF.
+    let both = Counts {
+        a: 1,
+        ..with_c(counts, 3)
+    };
+    assert_eq!(tipc(&declared, both), count(DescriptorList::A, 1, 0));
 }
 
 #[test]

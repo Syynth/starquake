@@ -807,10 +807,11 @@ impl Server {
         } = call;
         let mut object = self.targets.check_out(interface)?;
         // The command's declared buffers, held against the request before the method is called
-        // (`framework/buffers.rs`, "The check"). A command the table lacks takes the unknown path.
+        // (`framework/buffers.rs`, "The check"). A command the table lacks takes the unknown path
+        // unchecked, whatever descriptors it carries.
         let row = object.commands().find(protocol, command_id);
         let declared = row.map_or(&[][..], |row| row.buffers);
-        let checked = row.map(|_| buffers::check(declared, call.message));
+        let checked = row.map(|_| buffers::check(protocol, declared, call.message));
         let request = Request::new(
             &*kernel,
             protocol,

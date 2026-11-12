@@ -43,11 +43,18 @@
 //! `HipcCommandProcessor::PrepareForProcess`, fact only): the number of X descriptors is the
 //! number of declared in buffers that are pointer or auto-select, of A descriptors the in
 //! buffers that are map-alias or auto-select, of B descriptors the out buffers that are map-alias
-//! or auto-select, and there are no W descriptors. A request that fails it is answered
-//! `INVALID_CMIF_REQUEST` ([`Fault::DescriptorCount`]), the console's
+//! or auto-select, and there are no W descriptors. The number of C descriptors is at least the
+//! number of declared out buffers that are pointer or auto-select on a CMIF request, and exactly
+//! that number on a TIPC request (see "C descriptors" and "TIPC" below). A request that fails it
+//! is answered `INVALID_CMIF_REQUEST` ([`Fault::DescriptorCount`]), the console's
 //! `sf::hipc::ResultInvalidCmifRequest`, and the method is not called. The counts are compared in
 //! the order the message header lists them, X, A, B, W, and then C, and the first that differs is
 //! the one reported.
+//!
+//! The check runs against the row of the request's own protocol: a TIPC request is held against
+//! the `tipc { .. }` row with its id, never the CMIF row with the same id. A request for an id
+//! its protocol's table lacks is not checked at all: it goes to the server's unknown-command
+//! policy whatever descriptors it carries.
 //!
 //! # Where this differs from the references
 //!
@@ -68,8 +75,10 @@
 //!   `PrepareForProcess`): its out pointer buffers are carved from the server's own pointer
 //!   buffer, sized by a table in the request's raw data. Here an out pointer (or auto-select)
 //!   buffer is written straight to the caller's C descriptor, as in Eden, so there must be at
-//!   least one per such buffer; more are accepted, as on the console
-//!   (`c_descriptors_must_cover_the_declared_buffers_and_may_be_more`).
+//!   least one per such buffer; on a CMIF request more are accepted, as on the console
+//!   (`c_descriptors_must_cover_the_declared_buffers_and_may_be_more`). A map-alias out buffer is
+//!   always its B descriptor, never a stray C descriptor beside it (`framework/tests/buffers.rs`:
+//!   `a_map_alias_out_buffer_never_reaches_a_stray_c_descriptor`).
 //! - **Choosing an auto-select buffer's descriptor.** The console takes the map-alias
 //!   descriptor when its address is not zero (`ProcessBufferImpl`: `is_buffer_map_alias =
 //!   hipcGetBufferAddress(map_desc) != 0`; fact only); here, as in Eden, when its size is not
@@ -80,15 +89,25 @@
 //! - **Transfer modes.** The console also refuses a map-alias descriptor whose mode is not the one
 //!   the command allows (`IsMapTransferModeValid`); Eden does not look at it, and neither does
 //!   this check (`the_transfer_mode_is_not_checked`).
-//! - **TIPC.** The console checks a TIPC request's whole header against the command and answers
-//!   `tipc::ResultInvalidMessageFormat` (Atmosphère `tipc_impl_command_serialization.hpp`,
-//!   `ValidateCommandFormat`; fact only). Here a TIPC request's descriptors are checked as a CMIF
-//!   request's are and a mismatch is `INVALID_CMIF_REQUEST`, as the framework also answers a TIPC
-//!   request whose payload is cut short (`sm/tests.rs`: `a_tipc_request_with_a_buffer_is_refused`,
-//!   and `a_name_is_its_printable_bytes_wherever_they_are` for the short payload).
+//! - **TIPC.** The console checks a TIPC request's whole message header against the command and
+//!   answers `tipc::ResultInvalidMessageFormat` (Atmosphère `tipc_impl_command_serialization.hpp`,
+//!   `ValidateCommandFormat`, which compares the header's first 64 bits with the command's
+//!   `InMessageHeader`; fact only). That header's pointer (X) count and receive-list (C) field are
+//!   always zero there, so the console refuses any X or C descriptor on TIPC. Here a TIPC
+//!   request's X, A, B and W counts are checked as a CMIF request's are, and its C count must
+//!   equal the declared out buffers that are pointer or auto-select: a TIPC request to a command
+//!   that declares none is refused for a single C descriptor, as on the console
+//!   (`c_descriptors_on_tipc_must_match_exactly`; `framework/tests/buffers.rs`:
+//!   `a_tipc_request_with_a_stray_c_descriptor_is_refused`). Two differences remain: a mismatch
+//!   is `INVALID_CMIF_REQUEST`, as the framework also answers a TIPC request whose payload is cut
+//!   short (`sm/tests.rs`: `a_tipc_request_with_a_buffer_is_refused`, and
+//!   `a_name_is_its_printable_bytes_wherever_they_are` for the short payload); and a TIPC row may
+//!   declare a pointer or auto-select buffer, which the console's TIPC cannot express. No
+//!   service's TIPC row declares one.
 
 use starquake_ipc::Message;
 
+use super::commands::Protocol;
 use super::result::{Direction, Fault};
 
 /// How a buffer travels: the transport flag of Eden's `BufferAttr` and libnx's `SfBufferAttr`.
@@ -171,7 +190,11 @@ fn needs_of<'a>(buffers: impl Iterator<Item = &'a DeclaredBuffer>) -> (usize, us
 
 /// Holds a request's descriptors against a command's declared buffers (see the
 /// [module docs](self), "The check").
-pub(crate) fn check(declared: &[DeclaredBuffer], message: &Message<'_>) -> Result<(), Fault> {
+pub(crate) fn check(
+    protocol: Protocol,
+    declared: &[DeclaredBuffer],
+    message: &Message<'_>,
+) -> Result<(), Fault> {
     let (in_map_alias, in_pointer) = needs(declared, Direction::In);
     let (out_map_alias, out_pointer) = needs(declared, Direction::Out);
     let exact = [
@@ -198,7 +221,12 @@ pub(crate) fn check(declared: &[DeclaredBuffer], message: &Message<'_>) -> Resul
         }
     }
     let sent = message.receive_descriptors.len();
-    if sent < out_pointer {
+    // CMIF accepts more C descriptors than declared; TIPC accepts exactly as many (module docs).
+    let refused = match protocol {
+        Protocol::Cmif => sent < out_pointer,
+        Protocol::Tipc => sent != out_pointer,
+    };
+    if refused {
         return Err(Fault::DescriptorCount {
             list: DescriptorList::C,
             sent,

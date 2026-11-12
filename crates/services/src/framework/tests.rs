@@ -73,12 +73,16 @@ commands! {
         toy::LEND => lend,
         toy::COPY_MIXED => copy_mixed [In(Pointer), In(MapAlias), Out(MapAlias), Out(Pointer)],
         toy::PEEK_UNDECLARED => peek_undeclared [In(MapAlias)],
+        toy::FILL => fill [Out(MapAlias)],
     }
     tipc {
         0 => sum,
         1 => open_child,
         2 => inspect,
         3 => wait,
+        // CMIF `upper` (also id 4) declares auto-select buffers; this row map-alias ones, the
+        // only kind the console's TIPC carries.
+        4 => upper [In(MapAlias), Out(MapAlias)],
     }
 }
 
@@ -365,6 +369,19 @@ impl Toy {
         reply.ok()
     }
 
+    /// out: out buffer 0 (map-alias) filled with [`FILL_BYTE`], up to [`UPPER_LIMIT`] bytes;
+    /// `u32` how many were written.
+    fn fill(_: &mut Self, cx: &mut Context<'_>, req: &Request<'_>, reply: &mut Reply) -> Outcome {
+        let mut out = req.out_buffer(cx, 0)?;
+        let room = usize::try_from(out.len()).unwrap_or(usize::MAX);
+        out.write(&vec![FILL_BYTE; room.min(UPPER_LIMIT)])?;
+        let written = out.written();
+        reply
+            .payload()
+            .write_u32(u32::try_from(written).unwrap_or(u32::MAX));
+        reply.ok()
+    }
+
     /// TIPC 0. in: `u32 a`, `u32 b`. out: `u32 a + b`.
     fn sum(_: &mut Self, _cx: &mut Context<'_>, req: &Request<'_>, reply: &mut Reply) -> Outcome {
         let mut r = req.payload();
@@ -384,6 +401,8 @@ const INTERLEAVED_TAG: u32 = 0x1E;
 const ODD_BYTE: u8 = 0x0D;
 /// What `inspect` reports for something the request did not carry.
 const ABSENT: u32 = u32::MAX;
+/// What `fill` writes.
+const FILL_BYTE: u8 = 0xF1;
 /// What `hasty` answers.
 const HASTY: u32 = 0x4A57;
 /// The number the toy server is known by.
@@ -413,12 +432,14 @@ mod toy {
     pub(super) const LEND: u32 = 19;
     pub(super) const COPY_MIXED: u32 = 20;
     pub(super) const PEEK_UNDECLARED: u32 = 21;
+    pub(super) const FILL: u32 = 22;
     /// An id the toy does not list in either block.
     pub(super) const MISSING: u16 = 77;
     pub(super) const TIPC_SUM: u16 = 0;
     pub(super) const TIPC_OPEN_CHILD: u16 = 1;
     pub(super) const TIPC_INSPECT: u16 = 2;
     pub(super) const TIPC_WAIT: u16 = 3;
+    pub(super) const TIPC_UPPER: u16 = 4;
 }
 
 /// The interface the toy hands out.
