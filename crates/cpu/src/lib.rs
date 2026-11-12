@@ -24,6 +24,16 @@
 )]
 pub mod hvf;
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg_attr(
+    all(target_os = "macos", target_arch = "aarch64"),
+    expect(
+        unsafe_code,
+        reason = "the host counter is read through a C function of libSystem"
+    )
+)]
+pub mod host_counter;
+
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing;
 

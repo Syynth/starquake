@@ -10,8 +10,11 @@
 //!   `SetBasePriority`, `RestorePriority` (without inheritance) and `SetCoreMask`.
 //!
 //! Every method that takes a [`ThreadId`] looks the row up once to check it, then works through
-//! ids: Eden's `KThread*` becomes an id, and `thread->Field()` a slab lookup. See the module
-//! docs of `sched` for what is deferred and where starquake diverges.
+//! ids: Eden's `KThread*` becomes an id, and `thread->Field()` a slab lookup. An id a caller
+//! passed in is looked up with `Slab::get` (stale is the caller's error, [`SchedError::Slab`]);
+//! an id read back out of a queue or a core's state with `Slab::stored` (stale is damaged
+//! bookkeeping, [`SchedError::Corrupt`]). See the module docs of `sched` for what is deferred
+//! and where starquake diverges.
 
 use starquake_cpu::GuestRegs;
 use starquake_trace::GuestTicks;
@@ -21,6 +24,7 @@ use super::queue::{PriorityQueue, Threads, Walk};
 use super::thread::{Priority, QueueLink, SuspendType, Thread, ThreadState};
 use super::{HIGHEST_CORE_MIGRATION_ALLOWED_PRIORITY, IdealCore, SchedError, ThreadActivity};
 use crate::id::ThreadId;
+use crate::object::Objects;
 use crate::result::KernelError;
 
 /// One core's scheduling state: the scheduler's `SchedulingState` and current thread
@@ -49,6 +53,9 @@ impl CoreState {
 /// Threads and their scheduling: the kernel's scheduler table. See the `sched` module docs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Scheduler {
+    /// What handles name (kernel spec: events and sessions live in this table; a thread's
+    /// object row names a row of `threads`).
+    objects: Objects,
     threads: Threads,
     queue: PriorityQueue,
     cores: Vec<CoreState>,
@@ -68,6 +75,7 @@ impl Default for Scheduler {
 impl Scheduler {
     fn build(core_count: u8) -> Self {
         Self {
+            objects: Objects::new(),
             threads: Threads::new(),
             queue: PriorityQueue::new(core_count),
             cores: vec![CoreState::new(); usize::from(core_count)],
@@ -119,6 +127,17 @@ impl Scheduler {
     /// The mask of every core this scheduler has.
     fn core_mask(&self) -> AffinityMask {
         AffinityMask::from_bits(self.all_cores().fold(0, |bits, core| bits | core.bit()))
+    }
+
+    /// The object table: what handles name, with their reference counts.
+    #[must_use]
+    pub fn objects(&self) -> &Objects {
+        &self.objects
+    }
+
+    /// The object table, to create objects in and to open and close references through.
+    pub fn objects_mut(&mut self) -> &mut Objects {
+        &mut self.objects
     }
 
     /// The thread `id` names.
@@ -431,8 +450,9 @@ impl Scheduler {
     /// `now` stamps the threads that stop being a core's choice (Eden stamps them with
     /// `CoreTiming().GetClockTicks()`, the guest counter). The scheduler only compares stamps
     /// with each other, in the yields, so any clock that never runs backwards works; the caller
-    /// passes guest counter ticks, converted from the environment's clock by
-    /// [`crate::svc::tick::nanos_to_ticks`], the kernel's one conversion point.
+    /// passes the dispatch's guest time, converted from the environment's clock by
+    /// [`CounterRate::ticks_at`](crate::time::CounterRate::ticks_at), the kernel's one conversion
+    /// point.
     pub fn update(
         &mut self,
         now: GuestTicks,
@@ -472,10 +492,7 @@ impl Scheduler {
         }
         if let Some(previous) = previous {
             self.count_scheduled();
-            self.threads
-                .get_mut(previous)
-                .map_err(|_| SchedError::Corrupt)?
-                .last_scheduled_tick = now;
+            self.threads.stored_mut(previous)?.last_scheduled_tick = now;
         }
         let state = self.core_mut(core)?;
         state.highest = thread;
@@ -485,20 +502,12 @@ impl Scheduler {
 
     /// The active core of a thread that a queue walk reached.
     fn active_core_of(&self, id: ThreadId) -> Result<Option<CoreId>, SchedError> {
-        Ok(self
-            .threads
-            .get(id)
-            .map_err(|_| SchedError::Corrupt)?
-            .active_core)
+        Ok(self.threads.stored(id)?.active_core)
     }
 
     /// The priority of a thread that a queue walk reached.
     fn priority_of(&self, id: ThreadId) -> Result<Priority, SchedError> {
-        Ok(self
-            .threads
-            .get(id)
-            .map_err(|_| SchedError::Corrupt)?
-            .priority)
+        Ok(self.threads.stored(id)?.priority)
     }
 
     /// Makes `core` the active core of `id`, which was `from` (`SetActiveCore` then
@@ -510,10 +519,7 @@ impl Scheduler {
         to: Option<CoreId>,
         to_front: bool,
     ) -> Result<(), SchedError> {
-        self.threads
-            .get_mut(id)
-            .map_err(|_| SchedError::Corrupt)?
-            .active_core = to;
+        self.threads.stored_mut(id)?.active_core = to;
         self.queue
             .change_core(&mut self.threads, from, id, to_front)
     }

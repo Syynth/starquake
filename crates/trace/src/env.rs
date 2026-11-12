@@ -28,7 +28,7 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::event::GuestTicks;
+use crate::event::HostNanos;
 
 mod live;
 mod replay;
@@ -71,8 +71,8 @@ pub enum EnvCall {
 /// One answer an [`Env`] gave, in the order given.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EnvRecord {
-    /// A clock reading, in the unit of the clock that produced it (see [`Env::now`]).
-    Clock(GuestTicks),
+    /// A clock reading (see [`Env::now`]).
+    Clock(HostNanos),
     /// A random number.
     Random(u64),
     /// A host I/O exchange.
@@ -139,14 +139,13 @@ pub enum EnvError {
 /// Object safe, with `&self` methods, so code takes `&dyn Env`; implementations are `Send + Sync`
 /// because services run on several host threads.
 pub trait Env: Send + Sync {
-    /// Read the clock.
+    /// Read the clock: host nanoseconds since the zero of the [`HostClock`] the environment
+    /// reads.
     ///
-    /// The unit is the unit of whatever [`HostClock`] the environment reads, not guest ticks:
-    /// [`SystemClock`] reports host nanoseconds and [`FixedClock`] reports whatever its caller
-    /// chose. [`GuestTicks`] is only the carrier type here. Converting to the guest counter's
-    /// frequency is the consumer's job (guess: the kernel's tick conversion; the spec does not
-    /// say where it happens).
-    fn now(&self) -> Result<GuestTicks, EnvError>;
+    /// Not guest time. The kernel owns guest ticks and converts this reading with the calling
+    /// process's counter rate (`docs/specs/kernel.md`, "Guest time"); the clock's zero is guest
+    /// tick zero, so whoever builds the environment decides where guest time starts.
+    fn now(&self) -> Result<HostNanos, EnvError>;
 
     /// Draw a random number.
     fn random_u64(&self) -> Result<u64, EnvError>;

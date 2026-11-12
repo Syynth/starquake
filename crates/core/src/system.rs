@@ -76,10 +76,10 @@ mod host {
 
     use starquake_cpu::Backend;
     use starquake_cpu::hvf::{HvfBackend, RamConfig};
-    use starquake_kernel::svc::tick::CNTFREQ;
     use starquake_loader::patch::CounterRescale;
 
     use super::Error;
+    use crate::clock::{CounterClock, PROCESS_COUNTER_RATE, Timebase};
     use crate::image::{LoadError, Program, place};
     use crate::machine;
     use crate::report::{RunOptions, RunReport};
@@ -96,19 +96,28 @@ mod host {
         // PROVISIONAL: the backend's default bring-up RAM (16 MiB), identity-mapped.
         let backend = HvfBackend::new(RamConfig::default())?;
         let ram = backend.memory();
-        // The guest rate is the one the kernel converts `GetSystemTick` with, so a patched
-        // counter read and the system call tick at the same rate. (Their zero points still
-        // differ; see the kernel spec, "Guest time".)
+        // One rate and one zero point for guest time (kernel spec, "Guest time"): the patcher
+        // rescales the backend's counter to the process's rate, the kernel converts its clock
+        // with the same rate, and that clock is the backend's counter.
+        let host_hz = backend.counter_frequency();
+        let time = Timebase {
+            rate: PROCESS_COUNTER_RATE,
+            clock: CounterClock::new(host_hz).ok_or_else(|| {
+                starquake_cpu::Error::Host("the host counter reports a rate of zero".into())
+            })?,
+        };
         let counter = CounterRescale {
-            host_hz: backend.counter_frequency(),
-            guest_hz: CNTFREQ,
+            host_hz,
+            guest_hz: time.rate.hz(),
         };
         let ram_size = u64::try_from(ram.size()).map_err(|_| LoadError::Overflow)?;
         let placed = place(program, ram.base(), ram_size, Some(counter))?;
         placed.write_into(ram).map_err(Error::Memory)?;
         // Declared after the backend, so it is dropped first, as the VM requires.
         let mut vcpu = backend.create_vcpu()?;
-        Ok(machine::run(&mut vcpu, ram, &placed, options, started))
+        Ok(machine::run(
+            &mut vcpu, ram, &placed, options, started, time,
+        ))
     }
 }
 

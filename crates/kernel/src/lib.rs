@@ -10,8 +10,10 @@
 pub mod dispatch;
 pub mod handle;
 pub mod id;
+pub mod object;
 pub mod result;
 pub mod sched;
 pub mod slab;
 pub mod svc;
 pub mod tables;
+pub mod time;

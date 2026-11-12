@@ -7,8 +7,15 @@
 //! that enum (`reference/svc_ids.txt`).
 //!
 //! Statuses follow the kernel spec ("What is built now, what is deferred, and what is not
-//! planned", rule 6):
+//! planned", rule 6, and "Guest time": "four statuses: implemented, planned (its slice hasn't
+//! landed), deferred and not planned"):
 //! - [`Status::Implemented`]: the dispatcher runs a real implementation.
+//! - [`Status::Planned`]: the spec builds it now, and the port slice that does hasn't landed.
+//!   These are the calls retail titles may make ([`is_retail`](super::is_retail): 0x01-0x36 and
+//!   0x80) that are not implemented yet, except `SendSyncRequestLight` (0x20), which needs light
+//!   sessions, a kind the spec defers. The spec builds "the parts of the Horizon kernel a game
+//!   can observe" and names features, not calls; counting exactly the retail calls as planned is
+//!   this table's reading of it.
 //! - [`Status::NotPlanned`]: the hardware-facing families the spec names, and the calls this table
 //!   counts in them: I/O pools and regions (`CreateIoPool` 0x39, `CreateIoRegion` 0x3a,
 //!   `MapIoRegion` 0x46, `UnmapIoRegion` 0x47, `QueryIoMapping` 0x55), interrupt events
@@ -17,19 +24,23 @@
 //!   (`ReadWriteRegister` 0x4e, `QueryPhysicalAddress` 0x54). Counting `QueryIoMapping`,
 //!   `ReadWriteRegister` and `QueryPhysicalAddress` as hardware-facing is this table's reading of
 //!   the spec, which names only the families.
-//! - [`Status::Deferred`]: every other call. That covers both calls the spec builds now whose port
-//!   slice hasn't landed yet and the spec's "deferred, designed for" column.
+//! - [`Status::Deferred`]: every other call: the spec's "deferred, designed for" column
+//!   (server-side IPC, light sessions, more guest processes, debugging) and the calls outside
+//!   the retail range that no port slice names yet.
 //!
 //! A call that isn't [`Status::Implemented`], and a number that isn't listed at all, returns
 //! [`KernelError::NotImplemented`](crate::result::KernelError::NotImplemented) from the
-//! dispatcher.
+//! dispatcher. The log line and the summary's list of stubbed calls say which status it had.
 
 /// Where a system call stands in starquake (kernel spec, rule 6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Status {
     /// The dispatcher runs a real implementation.
     Implemented,
-    /// Not implemented yet, and designed for: returns "not implemented" and is logged.
+    /// The spec builds it now, and its port slice hasn't landed: returns "not implemented" and
+    /// is logged.
+    Planned,
+    /// Not implemented, and designed for: returns "not implemented" and is logged.
     Deferred,
     /// A hardware-facing call starquake doesn't plan to emulate: returns "not implemented" and is
     /// logged.
@@ -89,60 +100,60 @@ macro_rules! svc_ids {
 }
 
 svc_ids! {
-    SetHeapSize = 0x01, Deferred;
-    SetMemoryPermission = 0x02, Deferred;
-    SetMemoryAttribute = 0x03, Deferred;
-    MapMemory = 0x04, Deferred;
-    UnmapMemory = 0x05, Deferred;
-    QueryMemory = 0x06, Deferred;
+    SetHeapSize = 0x01, Planned;
+    SetMemoryPermission = 0x02, Planned;
+    SetMemoryAttribute = 0x03, Planned;
+    MapMemory = 0x04, Planned;
+    UnmapMemory = 0x05, Planned;
+    QueryMemory = 0x06, Planned;
     ExitProcess = 0x07, Implemented;
-    CreateThread = 0x08, Deferred;
-    StartThread = 0x09, Deferred;
-    ExitThread = 0x0a, Deferred;
-    SleepThread = 0x0b, Deferred;
-    GetThreadPriority = 0x0c, Deferred;
-    SetThreadPriority = 0x0d, Deferred;
-    GetThreadCoreMask = 0x0e, Deferred;
-    SetThreadCoreMask = 0x0f, Deferred;
+    CreateThread = 0x08, Planned;
+    StartThread = 0x09, Planned;
+    ExitThread = 0x0a, Planned;
+    SleepThread = 0x0b, Planned;
+    GetThreadPriority = 0x0c, Implemented;
+    SetThreadPriority = 0x0d, Planned;
+    GetThreadCoreMask = 0x0e, Planned;
+    SetThreadCoreMask = 0x0f, Planned;
     GetCurrentProcessorNumber = 0x10, Implemented;
-    SignalEvent = 0x11, Deferred;
-    ClearEvent = 0x12, Deferred;
-    MapSharedMemory = 0x13, Deferred;
-    UnmapSharedMemory = 0x14, Deferred;
-    CreateTransferMemory = 0x15, Deferred;
-    CloseHandle = 0x16, Deferred;
-    ResetSignal = 0x17, Deferred;
-    WaitSynchronization = 0x18, Deferred;
-    CancelSynchronization = 0x19, Deferred;
-    ArbitrateLock = 0x1a, Deferred;
-    ArbitrateUnlock = 0x1b, Deferred;
-    WaitProcessWideKeyAtomic = 0x1c, Deferred;
-    SignalProcessWideKey = 0x1d, Deferred;
+    SignalEvent = 0x11, Planned;
+    ClearEvent = 0x12, Planned;
+    MapSharedMemory = 0x13, Planned;
+    UnmapSharedMemory = 0x14, Planned;
+    CreateTransferMemory = 0x15, Planned;
+    CloseHandle = 0x16, Implemented;
+    ResetSignal = 0x17, Planned;
+    WaitSynchronization = 0x18, Planned;
+    CancelSynchronization = 0x19, Planned;
+    ArbitrateLock = 0x1a, Planned;
+    ArbitrateUnlock = 0x1b, Planned;
+    WaitProcessWideKeyAtomic = 0x1c, Planned;
+    SignalProcessWideKey = 0x1d, Planned;
     GetSystemTick = 0x1e, Implemented;
-    ConnectToNamedPort = 0x1f, Deferred;
+    ConnectToNamedPort = 0x1f, Planned;
     SendSyncRequestLight = 0x20, Deferred;
-    SendSyncRequest = 0x21, Deferred;
-    SendSyncRequestWithUserBuffer = 0x22, Deferred;
-    SendAsyncRequestWithUserBuffer = 0x23, Deferred;
-    GetProcessId = 0x24, Deferred;
-    GetThreadId = 0x25, Deferred;
-    Break = 0x26, Deferred;
+    SendSyncRequest = 0x21, Planned;
+    SendSyncRequestWithUserBuffer = 0x22, Planned;
+    SendAsyncRequestWithUserBuffer = 0x23, Planned;
+    GetProcessId = 0x24, Planned;
+    GetThreadId = 0x25, Planned;
+    Break = 0x26, Planned;
     OutputDebugString = 0x27, Implemented;
-    ReturnFromException = 0x28, Deferred;
-    GetInfo = 0x29, Deferred;
-    FlushEntireDataCache = 0x2a, Deferred;
-    FlushDataCache = 0x2b, Deferred;
-    MapPhysicalMemory = 0x2c, Deferred;
-    UnmapPhysicalMemory = 0x2d, Deferred;
-    GetDebugFutureThreadInfo = 0x2e, Deferred;
-    GetLastThreadInfo = 0x2f, Deferred;
-    GetResourceLimitLimitValue = 0x30, Deferred;
-    GetResourceLimitCurrentValue = 0x31, Deferred;
-    SetThreadActivity = 0x32, Deferred;
-    GetThreadContext3 = 0x33, Deferred;
-    WaitForAddress = 0x34, Deferred;
-    SignalToAddress = 0x35, Deferred;
-    SynchronizePreemptionState = 0x36, Deferred;
+    ReturnFromException = 0x28, Planned;
+    GetInfo = 0x29, Planned;
+    FlushEntireDataCache = 0x2a, Planned;
+    FlushDataCache = 0x2b, Planned;
+    MapPhysicalMemory = 0x2c, Planned;
+    UnmapPhysicalMemory = 0x2d, Planned;
+    GetDebugFutureThreadInfo = 0x2e, Planned;
+    GetLastThreadInfo = 0x2f, Planned;
+    GetResourceLimitLimitValue = 0x30, Planned;
+    GetResourceLimitCurrentValue = 0x31, Planned;
+    SetThreadActivity = 0x32, Planned;
+    GetThreadContext3 = 0x33, Planned;
+    WaitForAddress = 0x34, Planned;
+    SignalToAddress = 0x35, Planned;
+    SynchronizePreemptionState = 0x36, Planned;
     GetResourceLimitPeakValue = 0x37, Deferred;
     CreateIoPool = 0x39, NotPlanned;
     CreateIoRegion = 0x3a, NotPlanned;
@@ -210,7 +221,7 @@ svc_ids! {
     CreateResourceLimit = 0x7d, Deferred;
     SetResourceLimitLimitValue = 0x7e, Deferred;
     CallSecureMonitor = 0x7f, NotPlanned;
-    SetGpuMemoryAttribute = 0x80, Deferred;
+    SetGpuMemoryAttribute = 0x80, Planned;
     MapInsecureMemory = 0x90, Deferred;
     UnmapInsecureMemory = 0x91, Deferred;
 }
@@ -218,6 +229,7 @@ svc_ids! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::svc::is_retail;
 
     /// Eden's `SvcId` enum, copied line for line (see the file's header).
     const REFERENCE: &str = include_str!("reference/svc_ids.txt");
@@ -291,13 +303,43 @@ mod tests {
         for &id in SvcId::ALL {
             let expected = match id {
                 SvcId::ExitProcess
+                | SvcId::GetThreadPriority
                 | SvcId::GetCurrentProcessorNumber
+                | SvcId::CloseHandle
                 | SvcId::GetSystemTick
                 | SvcId::OutputDebugString => Status::Implemented,
                 _ if hardware_facing(id.name()) => Status::NotPlanned,
+                // Light sessions are in the spec's deferred column.
+                SvcId::SendSyncRequestLight => Status::Deferred,
+                _ if is_retail(id) => Status::Planned,
                 _ => Status::Deferred,
             };
             assert_eq!(id.status(), expected, "{} ({:#x})", id.name(), id.number());
+        }
+    }
+
+    #[test]
+    fn planned_calls_are_retail_calls_and_every_status_is_in_use() {
+        for &id in SvcId::ALL {
+            if id.status() == Status::Planned {
+                assert!(is_retail(id), "{}", id.name());
+            }
+        }
+        // The edges of the retail range: the last retail call is planned, the first call past it
+        // is not, and the Switch 2 call is.
+        assert_eq!(SvcId::SynchronizePreemptionState.status(), Status::Planned);
+        assert_eq!(SvcId::GetResourceLimitPeakValue.status(), Status::Deferred);
+        assert_eq!(SvcId::SetGpuMemoryAttribute.status(), Status::Planned);
+        for status in [
+            Status::Implemented,
+            Status::Planned,
+            Status::Deferred,
+            Status::NotPlanned,
+        ] {
+            assert!(
+                SvcId::ALL.iter().any(|id| id.status() == status),
+                "{status:?}"
+            );
         }
     }
 
