@@ -16,16 +16,49 @@
 //!
 //! The parser is zero-copy for raw data and never panics: every offset is checked.
 //!
-//! # Guess: where a domain reply keeps its object ids
+//! # Replies: the caller says how much data it expects
 //!
-//! This is a guess, not a protocol fact. The parser takes a domain reply's object ids from the
-//! **end** of the raw data section and treats everything between the `SFCO` header and them as
-//! data. That only holds when the raw size is exact, as [`crate::ReplyBuilder`] writes it. Eden's
-//! `ResponseBuilder` reserves four extra padding words (`ipc_helpers.h`), and libnx's
-//! `cmifParseResponse` (`libnx/nx/include/switch/sf/cmif.h`) instead finds the objects at the
-//! `SFCO` header plus the data size it already knows. On a reply that keeps such a reserve this
-//! parser would return the padding as object ids and truncate the data. Parsing replies from a
-//! real guest needs the expected data size passed in, as libnx does.
+//! [`Message::parse_reply_sized`] reads a reply the way libnx's `cmifParseResponse`
+//! (`libnx/nx/include/switch/sf/cmif.h:260-288`) and `tipcParseResponse` (`tipc.h:199-228`) do:
+//! the caller passes the data size it expects, the data starts right after the `SFCO` header (or
+//! the TIPC result word), and a domain reply's object ids start right after that many bytes
+//! (`cmif.h:270`), with no padding between. A reply whose result is not zero (`R_FAILED`,
+//! `libnx/nx/include/switch/result.h:12`) has no data and no object ids: libnx returns the result
+//! before it looks for them (`cmif.h:277-278`, `tipc.h:208-209`).
+//!
+//! It differs from libnx (`hipcParseResponse`, `libnx/nx/include/switch/sf/hipc.h:316-363`, then
+//! the two functions above) in these ways, each pinned by an exact-value or exact-error test in
+//! `tests/libnx_golden.rs`:
+//!
+//! - **Command type.** libnx reads no type word from a reply; its caller picks the CMIF or the
+//!   TIPC parser. Here the type word picks: zero is a CMIF reply, a TIPC type (16 and above) is a
+//!   TIPC reply, and any other type is [`IpcError::UnexpectedCommandType`]
+//!   (`sized_parse_picks_cmif_or_tipc_from_the_type_word`).
+//! - **Descriptors.** libnx steps over the copy and move handles and the X descriptors only
+//!   (`hipc.h:347-360`) and reads no C descriptor. Here the A, B and W descriptors the header
+//!   counts are stepped over too, so the raw data section starts after them, and the C descriptors
+//!   the receive-list flag names are read after the section
+//!   (`sized_parse_steps_over_abw_descriptors_and_reads_the_receive_list`).
+//! - **Buffer bounds.** libnx never checks the sizes it reads against the buffer. Here a raw data
+//!   section or a descriptor list that leaves the first [`BUFFER_SIZE`] bytes is
+//!   [`IpcError::Truncated`] (`sized_parse_refuses_a_raw_section_that_leaves_the_buffer` and the
+//!   test above).
+//! - **Data and object bounds.** libnx reads the data and the object ids wherever the sizes put
+//!   them, inside the raw data section or not. Here they must lie inside the raw data section, or
+//!   the parse is an [`IpcError::Inconsistent`] error
+//!   (`sized_parse_refuses_data_or_objects_past_the_raw_data`). Bytes past the section are not
+//!   part of the message.
+//! - **Object count.** libnx ignores the domain reply header's `num_out_objects` and reads as many
+//!   ids as the caller asks for (`cmifResponseGetObject`, `cmif.h:290-293`). Here the header's
+//!   count says how many ids to read (`domain_reply_object_count_comes_from_its_header`).
+//!
+//! [`Message::parse_reply`] is for a caller that does not know the data size. The data then runs
+//! to the end of the raw data section, and a domain reply's object ids are taken from the end of
+//! that section. That finds the ids only when nothing follows them, which holds for a
+//! [`crate::ReplyBuilder`] reply whose data is a whole number of words (its raw size is exact).
+//! After data that is not, the section ends in padding and this split is wrong; libnx's split is
+//! the one [`Message::parse_reply_sized`] makes. Pinned by
+//! `unsized_parse_splits_domain_replies_only_after_whole_words` in `tests/libnx_golden.rs`.
 
 use crate::cmif::{
     CMIF_HEADER_BYTES, CmifReplyHeader, CmifRequestHeader, DomainCommand, DomainReplyHeader,
@@ -75,15 +108,12 @@ pub struct CmifReply<'a> {
     pub domain: Option<DomainReplyHeader>,
     /// The `SFCO` header.
     pub header: CmifReplyHeader,
-    /// The data bytes between the `SFCO` header and the object ids.
-    ///
-    /// Guess: in a domain reply this assumes the raw size is exact (see the module docs). If the
-    /// sender kept padding after the object ids, it is wrongly included here.
+    /// The data bytes after the `SFCO` header. From [`Message::parse_reply_sized`], exactly the
+    /// expected size, or empty when the result is not zero. From [`Message::parse_reply`], the
+    /// bytes up to the object ids, or to the end of the raw data section (see the module docs).
     pub data: &'a [u8],
-    /// The object ids that trail the data in a domain reply.
-    ///
-    /// Guess: they are taken from the end of the raw data section, which assumes the raw size is
-    /// exact (see the module docs). Padding after them would be returned as ids.
+    /// The object ids that follow the data in a domain reply, as many as the domain reply header
+    /// counts. Empty from [`Message::parse_reply_sized`] when the result is not zero.
     pub object_ids: Vec<u32>,
 }
 
@@ -109,7 +139,9 @@ pub enum Body<'a> {
     TipcReply {
         /// The result word.
         result: u32,
-        /// The raw data after the result word.
+        /// The data after the result word: from [`Message::parse_reply_sized`], exactly the
+        /// expected size, or empty when the result is not zero; from [`Message::parse_reply`],
+        /// the rest of the raw data section.
         data: &'a [u8],
     },
 }
@@ -198,6 +230,18 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// Which way a message travels, and for a reply the data size the caller expects, if known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    Request,
+    Reply(Option<usize>),
+}
+
+/// The expected reply data runs past the raw data section.
+const DATA_OVERRUNS: IpcError = IpcError::Inconsistent("reply data overruns the raw data");
+/// A domain message's object ids run past the raw data section.
+const IDS_OVERRUN: IpcError = IpcError::Inconsistent("domain object ids overrun the raw data");
+
 fn to_usize(value: u32) -> usize {
     usize::try_from(value).unwrap_or(usize::MAX)
 }
@@ -208,17 +252,33 @@ impl<'a> Message<'a> {
     /// Only the first [`BUFFER_SIZE`] bytes are read. `kind` says whether the session is a
     /// domain; it only matters for CMIF request/request-with-context messages.
     pub fn parse_request(buf: &'a [u8], kind: SessionKind) -> Result<Self> {
-        Self::parse(buf, kind, false)
+        Self::parse(buf, kind, Direction::Request)
     }
 
-    /// Parses a reply out of a thread's IPC buffer.
+    /// Parses a reply out of a thread's IPC buffer without knowing its data size: the data runs
+    /// to the end of the raw data section, and a domain reply's object ids are taken from the
+    /// end of the section. See the module docs for when that split is right; prefer
+    /// [`Message::parse_reply_sized`].
     ///
     /// A CMIF reply has command type zero; a TIPC reply echoes the request's TIPC type.
     pub fn parse_reply(buf: &'a [u8], kind: SessionKind) -> Result<Self> {
-        Self::parse(buf, kind, true)
+        Self::parse(buf, kind, Direction::Reply(None))
     }
 
-    fn parse(buf: &'a [u8], kind: SessionKind, reply: bool) -> Result<Self> {
+    /// Parses a reply out of a thread's IPC buffer as libnx does, given the number of data bytes
+    /// the caller expects (`cmifParseResponse`'s `size`, `tipcParseResponse`'s `out_size`).
+    ///
+    /// The data is the `data_size` bytes after the `SFCO` header (or the TIPC result word), and a
+    /// domain reply's object ids follow them at once. When the result is not zero the data and the
+    /// object ids are empty. Fails with [`IpcError::Inconsistent`] if the data or the object ids
+    /// would run past the raw data section. See the module docs for where this differs from
+    /// libnx.
+    pub fn parse_reply_sized(buf: &'a [u8], kind: SessionKind, data_size: usize) -> Result<Self> {
+        Self::parse(buf, kind, Direction::Reply(Some(data_size)))
+    }
+
+    fn parse(buf: &'a [u8], kind: SessionKind, direction: Direction) -> Result<Self> {
+        let reply = matches!(direction, Direction::Reply(_));
         let usable = buf.get(..BUFFER_SIZE).unwrap_or(buf);
         let mut r = Reader::new(usable);
         let header = CommandHeader::decode(r.words()?)?;
@@ -280,7 +340,7 @@ impl<'a> Message<'a> {
         )?;
 
         message.body = if command_type.is_tipc() {
-            Self::tipc_body(section, reply)?
+            Self::tipc_body(section, direction)?
         } else {
             // Padding to a 16-byte boundary, measured from the start of the buffer.
             let padding = raw_start
@@ -290,26 +350,30 @@ impl<'a> Message<'a> {
             let content = section.get(padding..).ok_or(IpcError::Inconsistent(
                 "raw data section ends inside its alignment padding",
             ))?;
-            if reply {
-                Self::cmif_reply_body(content, kind)?
-            } else {
-                Self::cmif_request_body(content, kind, command_type)?
+            match direction {
+                Direction::Reply(data_size) => Self::cmif_reply_body(content, kind, data_size)?,
+                Direction::Request => Self::cmif_request_body(content, kind, command_type)?,
             }
         };
         Ok(message)
     }
 
-    fn tipc_body(section: &'a [u8], reply: bool) -> Result<Body<'a>> {
-        if reply {
-            let mut r = Reader::new(section);
-            let result = r.word()?;
-            Ok(Body::TipcReply {
-                result,
-                data: r.rest(),
-            })
-        } else {
-            Ok(Body::TipcRequest { data: section })
-        }
+    fn tipc_body(section: &'a [u8], direction: Direction) -> Result<Body<'a>> {
+        let Direction::Reply(data_size) = direction else {
+            return Ok(Body::TipcRequest { data: section });
+        };
+        // tipc.h:207: the result is the first data word.
+        let mut r = Reader::new(section);
+        let result = r.word()?;
+        let rest = r.rest();
+        let data = match data_size {
+            None => rest,
+            // tipc.h:208-209: a failed reply returns before the data.
+            Some(_) if result != 0 => &[],
+            // tipc.h:211-212: the data follows the result word.
+            Some(size) => rest.get(..size).ok_or(DATA_OVERRUNS)?,
+        };
+        Ok(Body::TipcReply { result, data })
     }
 
     fn cmif_request_body(
@@ -367,31 +431,43 @@ impl<'a> Message<'a> {
         }))
     }
 
-    fn cmif_reply_body(content: &'a [u8], kind: SessionKind) -> Result<Body<'a>> {
+    fn cmif_reply_body(
+        content: &'a [u8],
+        kind: SessionKind,
+        data_size: Option<usize>,
+    ) -> Result<Body<'a>> {
         let mut r = Reader::new(content);
+        // cmif.h:267-269: in a domain the domain reply header comes first.
         let domain = if kind == SessionKind::Domain {
             Some(DomainReplyHeader::decode(r.words()?))
         } else {
             None
         };
+        // cmif.h:275: the magic is checked.
         let header = CmifReplyHeader::decode(r.words()?)?;
         let rest = r.rest();
-        let (data, object_ids) = match domain {
-            Some(domain) => {
-                let count = to_usize(domain.num_objects);
-                let ids_len = count
-                    .checked_mul(4)
-                    .ok_or(IpcError::Inconsistent("domain object count overflows"))?;
-                let data_len = rest
-                    .len()
-                    .checked_sub(ids_len)
-                    .ok_or(IpcError::Inconsistent(
-                        "domain object ids overrun the raw data",
-                    ))?;
-                let (data, ids) = rest.split_at(data_len);
-                (data, Self::read_ids(ids, count)?)
+        let count = domain.map_or(0, |domain| to_usize(domain.num_objects));
+        let ids_len = count
+            .checked_mul(4)
+            .ok_or(IpcError::Inconsistent("domain object count overflows"))?;
+        let (data, ids) = match data_size {
+            None => {
+                let data_len = rest.len().checked_sub(ids_len).ok_or(IDS_OVERRUN)?;
+                rest.split_at_checked(data_len).ok_or(IDS_OVERRUN)?
             }
-            None => (rest, Vec::new()),
+            // cmif.h:277-278: a failed reply returns before the data and the objects.
+            Some(_) if header.result != 0 => (&[][..], &[][..]),
+            // cmif.h:281: the data is right after the header; cmif.h:270: the objects follow the
+            // expected data size.
+            Some(size) => {
+                let (data, tail) = rest.split_at_checked(size).ok_or(DATA_OVERRUNS)?;
+                (data, tail.get(..ids_len).ok_or(IDS_OVERRUN)?)
+            }
+        };
+        let object_ids = if ids.is_empty() {
+            Vec::new()
+        } else {
+            Self::read_ids(ids, count)?
         };
         Ok(Body::CmifReply(CmifReply {
             domain,

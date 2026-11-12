@@ -22,7 +22,11 @@
 //! from `eden-nx2/src/core/hle/service/nx2_gsv.h` (`TipcReplyWords`).
 //! The request layouts are also checked against libnx, the client side
 //! (`libnx/nx/include/switch/sf/`, ISC); [`request`] lists where the builder follows it and where
-//! it differs.
+//! it differs. With [`RequestLayout::Libnx`] the builder writes libnx's requests byte for byte,
+//! [`ReplyBuilder`] puts a domain reply's object ids where libnx reads them, and
+//! [`Message::parse_reply_sized`] locates a reply's data and object ids as libnx does, from the
+//! data size the caller expects ([`message`] lists every way it differs from libnx);
+//! `tests/libnx_golden.rs` pins all three with bytes derived from the libnx headers.
 
 mod builder;
 pub mod cmif;
@@ -45,4 +49,4 @@ pub use hipc::{
 };
 pub use message::{Body, CmifReply, CmifRequest, Message, SessionKind};
 pub use reply::ReplyBuilder;
-pub use request::RequestBuilder;
+pub use request::{RequestBuilder, RequestLayout};
