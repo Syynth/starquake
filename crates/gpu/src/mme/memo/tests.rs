@@ -684,3 +684,160 @@ fn live_records_filling_exactly_three_quarters_clear_the_memo() {
     assert_eq!((stats.compactions, stats.clears), (1, 1));
     assert_eq!((memo.arena_words(), memo.len()), (record, 1));
 }
+
+/// Stores `program` at start 1 from data RAM word 0 = 0, then a neighbour record right after it,
+/// then calls `program` again with word 0 = 3, which changes one count of its record's shape. The
+/// new record must be appended, not written over the old one in place, where it would run into
+/// the neighbour; both records must then replay the interpreter's exact effects.
+fn a_new_shape_with_a_neighbour_is_appended(program: &[Instruction]) {
+    let neighbour = finish(vec![mov(1, 0x77), emit(METHOD + 7, 1)]);
+    let mut memo = MacroMemo::new();
+    let mut ram = DataRam::new();
+    assert_eq!(
+        checked_call(&mut memo, program, 1, &[], &mut ram),
+        Ok(CallOutcome::Stored)
+    );
+    assert_eq!(
+        checked_call(&mut memo, &neighbour, 2, &[], &mut ram),
+        Ok(CallOutcome::Stored)
+    );
+    *ram.get_mut(0).unwrap() = 3;
+    assert_eq!(
+        checked_call(&mut memo, program, 1, &[], &mut ram),
+        Ok(CallOutcome::Stored)
+    );
+    assert_eq!(memo.statistics().overwrites, 0);
+    assert_eq!(memo.len(), 2);
+    for _ in 0..2 {
+        assert_eq!(
+            checked_call(&mut memo, program, 1, &[], &mut ram),
+            Ok(CallOutcome::Replayed)
+        );
+        assert_eq!(
+            checked_call(&mut memo, &neighbour, 2, &[], &mut ram),
+            Ok(CallOutcome::Replayed)
+        );
+    }
+}
+
+#[test]
+fn a_new_method_write_count_is_not_written_in_place() {
+    // One method write from word 0 = 0, two from word 0 = 3.
+    a_new_shape_with_a_neighbour_is_appended(&guarded_shape_program());
+}
+
+#[test]
+fn a_new_read_count_is_not_written_in_place() {
+    // `R2 = ram[0]; if R2 != 0 R3 = ram[1]; write R2`: one read, or two.
+    a_new_shape_with_a_neighbour_is_appended(&finish(vec![
+        dread(2, 0),
+        branch(AluOp::Beq, r(2), Reg::Zero, true, 2),
+        dread(3, 1),
+        emit(METHOD, 2),
+    ]));
+}
+
+#[test]
+fn a_new_data_ram_write_count_is_not_written_in_place() {
+    // `R2 = ram[0]; if R2 != 0 ram[1] = R2; write R2`: no data RAM write, or one.
+    a_new_shape_with_a_neighbour_is_appended(&finish(vec![
+        dread(2, 0),
+        branch(AluOp::Beq, r(2), Reg::Zero, true, 2),
+        store(1, 2),
+        emit(METHOD, 2),
+    ]));
+}
+
+/// The record words that look like a header of a call at `start` with no parameters, no reads
+/// and no data RAM writes, writing `value` to [`METHOD`] once.
+fn forged_record(start: u32, value: u32) -> [u32; HEADER_WORDS + 2] {
+    [start, 0, 0, 0, 1, u32::from(METHOD), value]
+}
+
+/// A call at start 1 with no parameters that writes 0x77 to [`METHOD`]; a forged record of it
+/// writes another value.
+fn honest_program() -> Vec<Instruction> {
+    finish(vec![mov(1, 0x77), emit(METHOD, 1)])
+}
+
+#[test]
+fn a_compaction_forgets_every_starts_slot() {
+    // Start 2's first record goes stale (29 words), its second takes 31, and start 1's record
+    // lands at offset 60. The compaction that the next store triggers moves start 1's record
+    // down; the new record's parameters then put words that read as a start-1 record at offset
+    // 60, where start 1's slot pointed before the compaction.
+    let honest = honest_program();
+    let honest_words = HEADER_WORDS + 2;
+    let padding = [0_u32; 20];
+    let short = HEADER_WORDS + padding.len() + 2 * (1 + 1);
+    let long = HEADER_WORDS + padding.len() + 2 * (1 + 2);
+    let stale_at = short + long;
+    let limit = stale_at + honest_words - 2;
+    let mut memo = MacroMemo::with_limits(limit, StepLimit::DEFAULT);
+    let mut ram = DataRam::new();
+    let shaped = guarded_shape_program();
+
+    checked_call(&mut memo, &shaped, 2, &padding, &mut ram).unwrap();
+    *ram.get_mut(0).unwrap() = 3;
+    checked_call(&mut memo, &shaped, 2, &padding, &mut ram).unwrap();
+    assert_eq!(memo.arena_words(), stale_at);
+    assert_eq!(
+        checked_call(&mut memo, &honest, 1, &[], &mut ram),
+        Ok(CallOutcome::Stored)
+    );
+    assert_eq!(memo.arena_words(), limit + 2);
+
+    // After the compaction the live records take `long + honest_words`, below three quarters
+    // of the limit, so nothing is cleared; the new record starts right after them.
+    let new_at = long + honest_words;
+    assert!(new_at < limit / 4 * 3);
+    let mut forging = vec![0_u32; stale_at - new_at - HEADER_WORDS];
+    forging.extend(forged_record(1, 0x55));
+    assert!(HEADER_WORDS + forging.len() <= limit);
+    let empty = finish(vec![]);
+    assert_eq!(
+        checked_call(&mut memo, &empty, 4, &forging, &mut ram),
+        Ok(CallOutcome::Stored)
+    );
+    let stats = memo.statistics();
+    assert_eq!((stats.compactions, stats.clears), (1, 0));
+    assert_eq!(
+        memo.arena.get(stale_at..stale_at + HEADER_WORDS + 2),
+        Some(&forged_record(1, 0x55)[..])
+    );
+    // Start 1 is found through its hash at its new offset, not through the stale slot.
+    assert_eq!(
+        checked_call(&mut memo, &honest, 1, &[], &mut ram),
+        Ok(CallOutcome::Replayed)
+    );
+    assert_eq!(memo.statistics().slot_hits, 0);
+}
+
+#[test]
+fn a_new_code_generation_forgets_every_starts_slot() {
+    // Generation 0: a header-only record at offset 0, then start 1's record at offset 5.
+    let honest = honest_program();
+    let empty = finish(vec![]);
+    let mut memo = MacroMemo::new();
+    let mut ram = DataRam::new();
+    checked_call(&mut memo, &empty, 9, &[], &mut ram).unwrap();
+    assert_eq!(memo.arena_words(), HEADER_WORDS);
+    checked_call(&mut memo, &honest, 1, &[], &mut ram).unwrap();
+
+    // Generation 1: a start-2 record at offset 0 whose parameters, from offset 5, read as a
+    // start-1 record, where start 1's slot pointed in generation 0.
+    memo.synchronize(1);
+    let forged = forged_record(1, 0x55);
+    assert_eq!(
+        checked_call(&mut memo, &empty, 2, &forged, &mut ram),
+        Ok(CallOutcome::Stored)
+    );
+    assert_eq!(
+        memo.arena.get(HEADER_WORDS..2 * HEADER_WORDS + 2),
+        Some(&forged[..])
+    );
+    assert_eq!(
+        checked_call(&mut memo, &honest, 1, &[], &mut ram),
+        Ok(CallOutcome::Stored)
+    );
+}
