@@ -12,10 +12,9 @@ workspace = true
 
 [features]
 # Test doubles (`framework::fake`) for this crate's own tests and for downstream crates' dev
-# builds. The spec (`docs/specs/testing.md`, "Shared test support") names this feature
-# `test-support`; the workspace `cargo` lint group (`clippy::redundant_feature_names`) rejects
-# a `-support` suffix, so it is called `fakes`.
-fakes = []
+# builds: the name every crate gives the feature that exports its fakes
+# (`docs/specs/testing.md`, "Shared test support").
+test-support = []
 
 [dependencies]
 starquake-kernel.workspace = true
@@ -24,5 +23,5 @@ thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-# Turns `fakes` on for this crate's unit tests, integration tests and doctests.
-starquake-services = { workspace = true, features = ["fakes"] }
+# Turns `test-support` on for this crate's unit tests, integration tests and doctests.
+starquake-services = { workspace = true, features = ["test-support"] }

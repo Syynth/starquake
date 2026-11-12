@@ -66,7 +66,7 @@
 //! plan slice 9) owns queueing and calls [`Server::handle`] with the caller's message buffer, one
 //! request at a time per server; the reply is written over the request. The kernel is reached
 //! through the small [`Kernel`] trait, defined here until that slice implements it;
-//! `fake::FakeKernel` (behind the `fakes` feature) stands in for tests.
+//! `fake::FakeKernel` (behind the `test-support` feature) stands in for tests.
 //!
 //! The message is parsed here and not by the kernel, because how a request is framed depends on
 //! whether its session is a domain, which only the server knows.
@@ -156,7 +156,7 @@
 mod commands;
 mod context;
 pub mod control;
-#[cfg(any(test, feature = "fakes"))]
+#[cfg(any(test, feature = "test-support"))]
 pub mod fake;
 mod kernel;
 pub mod payload;
