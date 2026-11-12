@@ -204,6 +204,13 @@ impl SyncTable {
         self.timers.iter().copied()
     }
 
+    /// How many objects have a wait list. Test support for the rule that an object with no
+    /// waiters has no entry.
+    #[cfg(test)]
+    pub(super) fn list_count(&self) -> usize {
+        self.lists.len()
+    }
+
     /// Removes `thread`'s wait record, takes it off every wait list and out of the timer queue,
     /// and returns the record.
     fn detach(&mut self, thread: ThreadId) -> Option<Wait> {
@@ -507,15 +514,24 @@ impl Scheduler {
     }
 
     /// Takes and expires every entry due at `now` ([`Scheduler::take_due_timers`], then
-    /// [`Scheduler::expire`] each), and returns how many waits that ended.
+    /// [`Scheduler::expire`] each), and returns how many waits that ended. Every taken entry is
+    /// expired even if one fails, since a taken entry is no longer in the queue and nothing else
+    /// would end its wait; the first failure is returned.
     pub fn fire_timers(&mut self, now: HostNanos) -> CallResult<usize> {
         let mut ended = 0_usize;
+        let mut result = Ok(());
         for entry in self.take_due_timers(now) {
-            if self.expire(entry)? {
-                ended = ended.saturating_add(1);
+            match self.expire(entry) {
+                Ok(true) => ended = ended.saturating_add(1),
+                Ok(false) => {}
+                Err(error) => {
+                    if result.is_ok() {
+                        result = Err(error);
+                    }
+                }
             }
         }
-        Ok(ended)
+        result.map(|()| ended)
     }
 
     /// The waits that ended since the last call, in the order they ended. The dispatcher

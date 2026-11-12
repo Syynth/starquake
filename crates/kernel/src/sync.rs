@@ -69,10 +69,20 @@
 //!   `SCOPE_EXIT` in `WaitSynchronization` closes them after `Wait` returns). Nothing a guest
 //!   sees depends on when an object it no longer has a handle to is destroyed. Test:
 //!   `closing_the_last_handle_while_waiting_keeps_the_object_until_the_wait_ends`.
-//! - **Timer entries with the same deadline expire in the order their waits began.** Eden's
-//!   timer tree compares deadlines only (`KTimerTask::Compare`); its order among equal deadlines
-//!   is the tree's, which this does not try to reproduce (a guess that nothing depends on it).
-//!   Test: `timers_with_the_same_deadline_expire_in_the_order_their_waits_began`.
+//!
+//! # Matching Eden where it is easy to miss
+//!
+//! - **Timer entries with the same deadline expire in the order their waits began,** as in
+//!   Eden. `KTimerTask::Compare` (`eden/src/core/hle/kernel/k_timer_task.h`) returns -1 only
+//!   when the left task's time is earlier and 1 otherwise, never 0, so a tie compares greater;
+//!   `RB_INSERT` (`eden/src/common/tree.h`) sends `comp > 0` to the right, so a task registered
+//!   later sits right of an earlier one with the same time; and `DoInterruptTaskImpl`
+//!   (`k_hardware_timer_base.h`) takes the leftmost task first. A wait registers its timer task
+//!   as it begins, before the scheduler lock is released (`~KScopedSchedulerLockAndSleep` in
+//!   `k_scoped_scheduler_lock_and_sleep.h`, around `KSynchronizationObject::Wait`), so tasks are
+//!   registered in the order waits began. Here the queue is ordered by deadline, then by
+//!   [`WaitToken`], which grows with every wait begun. Test:
+//!   `timers_with_the_same_deadline_expire_in_the_order_their_waits_began`.
 //!
 //! # Not ported yet
 //!

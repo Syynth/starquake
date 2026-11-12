@@ -698,6 +698,145 @@ fn timers_with_the_same_deadline_expire_in_the_order_their_waits_began() {
 }
 
 #[test]
+fn a_failed_expiry_still_expires_every_other_due_timer() {
+    let mut s = Scheduler::default();
+    let first = spawn(&mut s, 30, 0);
+    let second = spawn(&mut s, 30, 1);
+    assert_eq!(switch(&mut s, 0), Some(first));
+    assert_eq!(switch(&mut s, 1), Some(second));
+    let (_, doomed) = event(&mut s);
+    let (_, kept) = event(&mut s);
+    let deadline = HostNanos(500);
+    wait(
+        &mut s,
+        0,
+        &[doomed],
+        Timeout::At(deadline),
+        &regs(1),
+        origin(0),
+    )
+    .unwrap();
+    wait(
+        &mut s,
+        1,
+        &[kept],
+        Timeout::At(deadline),
+        &regs(2),
+        origin(1),
+    )
+    .unwrap();
+    // The first wait's references are dropped behind the table's back: ending it fails when
+    // it releases them.
+    assert_eq!(
+        s.objects_mut().close(doomed),
+        Ok(Closed::Remaining(core::num::NonZeroU32::MIN))
+    );
+    assert_eq!(s.objects_mut().close(doomed), Ok(Closed::Last));
+    let order: Vec<ThreadId> = s.sync().timers().map(|entry| entry.thread).collect();
+    assert_eq!(order, [first, second]);
+
+    assert_eq!(
+        s.fire_timers(deadline),
+        Err(SvcError::internal(&ObjectError::Stale { id: doomed }))
+    );
+    // The second entry was expired all the same.
+    assert_eq!(s.sync().next_deadline(), None);
+    for thread in [first, second] {
+        assert_eq!(s.thread(thread).unwrap().state(), ThreadState::Runnable);
+        assert_eq!(s.sync().wait(thread), None);
+        let context = s.thread(thread).unwrap().context();
+        assert_eq!(
+            context.x[..2],
+            [word(KernelError::TimedOut.code()), MINUS_ONE]
+        );
+    }
+    assert_eq!(refs(&s, &[kept]), [1]);
+    assert_eq!(
+        s.take_wakes()
+            .iter()
+            .map(|w| (w.thread, w.result, w.index))
+            .collect::<Vec<_>>(),
+        [
+            (first, KernelError::TimedOut.code(), -1),
+            (second, KernelError::TimedOut.code(), -1)
+        ]
+    );
+    assert_eq!(s.sync().list_count(), 0);
+}
+
+#[test]
+fn an_object_keeps_no_wait_list_once_its_last_waiter_is_gone() {
+    // Each way a wait ends, with the object listed twice by one thread and once by another.
+    for way in ["signal", "cancel", "timeout"] {
+        let mut s = Scheduler::default();
+        let first = spawn(&mut s, 30, 0);
+        let second = spawn(&mut s, 30, 1);
+        assert_eq!(switch(&mut s, 0), Some(first));
+        assert_eq!(switch(&mut s, 1), Some(second));
+        let (_, other) = event(&mut s);
+        let (event, readable) = event(&mut s);
+        let deadline = HostNanos(500);
+        let objects = [readable, other, readable];
+        wait(
+            &mut s,
+            0,
+            &objects,
+            Timeout::At(deadline),
+            &regs(1),
+            origin(0),
+        )
+        .unwrap();
+        wait(
+            &mut s,
+            1,
+            &[readable],
+            Timeout::At(deadline),
+            &regs(2),
+            origin(1),
+        )
+        .unwrap();
+        assert_eq!(s.sync().list_count(), 2, "{way}");
+        match way {
+            "signal" => s.signal_event(event).unwrap(),
+            "cancel" => {
+                s.cancel_synchronization(first).unwrap();
+                // One waiter left: the list stays.
+                assert_eq!(s.sync().list_count(), 1, "{way}");
+                s.cancel_synchronization(second).unwrap();
+            }
+            _ => assert_eq!(s.fire_timers(deadline), Ok(2)),
+        }
+        assert_eq!(s.take_wakes().len(), 2, "{way}");
+        assert_eq!(s.sync().list_count(), 0, "{way}");
+        assert!(s.sync().waiters(readable).next().is_none(), "{way}");
+    }
+}
+
+#[test]
+fn a_wait_undone_because_the_thread_cannot_wait_leaves_no_wait_list() {
+    let (mut s, thread) = one_running();
+    let (_, readable) = event(&mut s);
+    // The thread's queue links are gone, so taking it off the run queue fails.
+    s.sever_queue_links(thread).unwrap();
+    assert_eq!(
+        wait(
+            &mut s,
+            0,
+            &[readable],
+            Timeout::At(HostNanos(500)),
+            &regs(1),
+            origin(1)
+        ),
+        Err(SvcError::from(SchedError::Corrupt))
+    );
+    assert_eq!(s.sync().list_count(), 0);
+    assert_eq!(s.sync().wait(thread), None);
+    assert_eq!(s.sync().next_deadline(), None);
+    assert_eq!(refs(&s, &[readable]), [1]);
+    assert_eq!(s.take_wakes(), []);
+}
+
+#[test]
 fn an_empty_wait_without_a_timeout_ends_only_by_cancel() {
     let (mut s, thread) = one_running();
     wait(&mut s, 0, &[], Timeout::Never, &regs(1), origin(1)).unwrap();

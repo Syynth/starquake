@@ -171,6 +171,15 @@ impl Scheduler {
         &mut self.sync
     }
 
+    /// Clears a thread's queue links, so that the next run-queue operation on it fails with
+    /// [`SchedError::Corrupt`]. Test support for the paths that must undo their work when the
+    /// queue fails.
+    #[cfg(test)]
+    pub(crate) fn sever_queue_links(&mut self, id: ThreadId) -> Result<(), SchedError> {
+        self.thread_mut(id)?.links.clear();
+        Ok(())
+    }
+
     /// The thread `id` names.
     pub fn thread(&self, id: ThreadId) -> Result<&Thread, SchedError> {
         Ok(self.threads.get(id)?)

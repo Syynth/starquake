@@ -387,10 +387,11 @@ fn the_array_must_lie_wholly_in_memory_the_guest_may_read() {
     let (writable, readable) = world.create_event();
     world.call(A, SvcId::SignalEvent, [u64::from(writable.raw()), 0, 0, 0]);
     let bytes = readable.raw().to_le_bytes();
+    let size = u64::try_from(sync::HANDLE_SIZE).unwrap();
     // Two handles whose second ends exactly at the end of the data: read.
-    let last = DATA_END - 2 * 4;
+    let last = DATA_END - 2 * size;
     world.memory.write(last, &bytes).unwrap();
-    world.memory.write(last + 4, &bytes).unwrap();
+    world.memory.write(last + size, &bytes).unwrap();
     let (_, regs) = world.call(A, SvcId::WaitSynchronization, [STALE, last, 2, 0]);
     assert_eq!(regs.x[..2], [0, 0]);
     // One byte further: the second handle's last byte is past it.
@@ -572,6 +573,14 @@ fn cancel_synchronization_ends_another_threads_wait_with_index_minus_one() {
             wait_event(ARRAY, 1, -1, KernelError::Cancelled.code())
         )]
     );
+    assert_eq!(
+        world.dispatcher.take_woken(),
+        [Woken {
+            thread: A,
+            core: CORE_A,
+            result: KernelError::Cancelled.code(),
+        }]
+    );
     // What GetObject<KThread> refuses.
     let (writable, _) = world.create_event();
     for refused in [writable, readable, Handle::CURRENT_PROCESS, Handle::INVALID] {
@@ -626,6 +635,38 @@ fn a_timeout_is_fired_by_the_timer_thread_and_recorded_then() {
         events[before].time,
         CounterRate::SWITCH_2.ticks_at(HostNanos(waited_at + 2 * CLOCK_STEP_NS))
     );
+    assert_eq!(
+        world.dispatcher.take_woken(),
+        [Woken {
+            thread: A,
+            core: CORE_A,
+            result: KernelError::TimedOut.code(),
+        }]
+    );
+}
+
+#[test]
+fn a_woken_thread_is_reported_with_the_core_it_waited_on() {
+    let world = World::new();
+    let (writable, readable) = world.create_event();
+    let (record, _) = world.wait(B, &[readable], -1);
+    assert_eq!(record.outcome, Outcome::Waiting);
+    let (_, regs) = world.call(A, SvcId::SignalEvent, [u64::from(writable.raw()), 0, 0, 0]);
+    assert_eq!(result(&regs), 0);
+    assert_eq!(
+        world.dispatcher.take_woken(),
+        [Woken {
+            thread: B,
+            core: CORE_B,
+            result: ResultCode::SUCCESS,
+        }]
+    );
+    let events = world.events();
+    assert_eq!(
+        who_and_what(&events[events.len() - 1..]),
+        [(B, CORE_B, wait_event(ARRAY, 1, -1, ResultCode::SUCCESS))]
+    );
+    assert_eq!(world.state(world.b), crate::sched::ThreadState::Runnable);
 }
 
 // ----- Waking from outside a system call -----------------------------------------------------
@@ -647,7 +688,14 @@ fn a_host_thread_signals_an_event_and_the_waiter_is_recorded() {
         who_and_what(&world.events()[before..]),
         [(A, CORE_A, wait_event(ARRAY, 1, -1, ResultCode::SUCCESS))]
     );
-    assert_eq!(world.dispatcher.take_woken().len(), 1);
+    assert_eq!(
+        world.dispatcher.take_woken(),
+        [Woken {
+            thread: A,
+            core: CORE_A,
+            result: ResultCode::SUCCESS,
+        }]
+    );
     // An id that names no event.
     let thread = world.object(world.thread_handle(world.b));
     assert_eq!(
