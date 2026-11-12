@@ -48,6 +48,7 @@ impl FunctionBuilder {
         handle
     }
 
+    #[cfg(test)]
     /// Appends a statement's result expression, which the statement itself defines.
     pub(crate) fn result(&mut self, expression: Expression) -> Handle<Expression> {
         self.function

@@ -574,20 +574,20 @@ fn derivative_in_divergent_flow() -> Module {
     })
 }
 
-/// A mesh entry point that writes one triangle.
-fn mesh_triangle() -> Module {
-    let mut module = Module::default();
-    let vec4 = vec4f(&mut module);
-    let u32_ty = scalar(&mut module, Scalar::U32);
+/// The mesh output types of one triangle: the vertex struct, the primitive struct and the
+/// output struct holding the counts and arrays.
+fn mesh_types(module: &mut Module) -> [Handle<Type>; 3] {
+    let vec4 = vec4f(module);
+    let u32_ty = scalar(module, Scalar::U32);
     let vec3u = ty(
-        &mut module,
+        module,
         TypeInner::Vector {
             size: VectorSize::Tri,
             scalar: Scalar::U32,
         },
     );
     let vertex = named_ty(
-        &mut module,
+        module,
         "MeshVertex",
         TypeInner::Struct {
             members: vec![StructMember {
@@ -600,7 +600,7 @@ fn mesh_triangle() -> Module {
         },
     );
     let primitive = named_ty(
-        &mut module,
+        module,
         "MeshPrimitive",
         TypeInner::Struct {
             members: vec![StructMember {
@@ -613,7 +613,7 @@ fn mesh_triangle() -> Module {
         },
     );
     let vertices = ty(
-        &mut module,
+        module,
         TypeInner::Array {
             base: vertex,
             size: ArraySize::Constant(NonZeroU32::MIN.saturating_add(2)),
@@ -621,7 +621,7 @@ fn mesh_triangle() -> Module {
         },
     );
     let primitives = ty(
-        &mut module,
+        module,
         TypeInner::Array {
             base: primitive,
             size: ArraySize::Constant(NonZeroU32::MIN),
@@ -629,7 +629,7 @@ fn mesh_triangle() -> Module {
         },
     );
     let output = named_ty(
-        &mut module,
+        module,
         "MeshOutput",
         TypeInner::Struct {
             members: vec![
@@ -661,6 +661,13 @@ fn mesh_triangle() -> Module {
             span: 80,
         },
     );
+    [vertex, primitive, output]
+}
+
+/// A mesh entry point that writes one triangle.
+fn mesh_triangle() -> Module {
+    let mut module = Module::default();
+    let [vertex, primitive, output] = mesh_types(&mut module);
     let global = module.global_variables.append(
         GlobalVariable {
             name: Some("mesh_output".into()),
