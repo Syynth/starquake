@@ -11,6 +11,7 @@ use starquake_kernel::id::ObjectId;
 use starquake_kernel::result::{KernelError, ResultCode};
 use starquake_trace::{Env, IpcOutcome, ServiceId};
 
+use super::buffers;
 use super::commands::{Protocol, Session};
 use super::context::Context;
 use super::defer::ReplyToken;
@@ -804,6 +805,12 @@ impl Server {
             command_id,
             ..
         } = call;
+        let mut object = self.targets.check_out(interface)?;
+        // The command's declared buffers, held against the request before the method is called
+        // (`framework/buffers.rs`, "The check"). A command the table lacks takes the unknown path.
+        let row = object.commands().find(protocol, command_id);
+        let declared = row.map_or(&[][..], |row| row.buffers);
+        let checked = row.map(|_| buffers::check(declared, call.message));
         let request = Request::new(
             &*kernel,
             protocol,
@@ -811,9 +818,9 @@ impl Server {
             call.payload,
             call.message,
             call.in_objects,
+            declared,
         );
         let mut reply = Reply::default();
-        let mut object = self.targets.check_out(interface)?;
         let mut cx = Context {
             kernel: &mut *kernel,
             targets: &mut self.targets,
@@ -827,10 +834,13 @@ impl Server {
             env: self.env.as_ref(),
             executor: self.executor.as_ref(),
         };
-        let outcome = object.dispatch(protocol, command_id, &mut cx, &request, &mut reply);
+        let outcome = match checked {
+            Some(Err(fault)) => Some(Err(fault)),
+            _ => object.dispatch(protocol, command_id, &mut cx, &request, &mut reply),
+        };
         let token = cx.deferral.taken;
         let name = object.name();
-        let command_name = object.commands().name(protocol, command_id);
+        let command_name = row.map(|row| row.name);
         self.targets.check_in(interface, object)?;
         match (outcome, token) {
             (Some(Ok(Completion::Deferred)), Some(token)) => Ok(Answered::Later(token)),

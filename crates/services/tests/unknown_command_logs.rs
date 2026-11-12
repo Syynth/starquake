@@ -43,9 +43,9 @@ struct Echo;
 commands! {
     impl Echo {
         0 => ping,
-        tipc {
-            0 => ping,
-        }
+    }
+    tipc {
+        0 => ping,
     }
 }
 

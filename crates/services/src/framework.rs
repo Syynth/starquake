@@ -54,11 +54,13 @@
 //! struct that holds something that cannot be saved does not compile as a service. See
 //! [`snapshot`].
 //!
-//! - [`commands!`](crate::commands) implements [`Session`] for the struct: the dispatch `match`
-//!   and the table of ids and names.
-//! - [`Request`] gives the command id, the raw payload through a [`Reader`], buffers by index
-//!   ([`InBuffer`], [`OutBuffer`]), the caller's process id when it was sent, handles resolved to
-//!   kernel objects, and a domain request's input objects.
+//! - [`commands!`](crate::commands) implements [`Session`] for the struct: the dispatch and the
+//!   table of ids, names and declared buffers. Ids may be named constants, which the service
+//!   exports for its tests.
+//! - [`Request`] gives the command id, the raw payload through a [`Reader`], the buffers the
+//!   command's row declares, by index ([`InBuffer`], [`OutBuffer`]; see [`buffers`]), the
+//!   caller's process id when it was sent, handles resolved to kernel objects, and a domain
+//!   request's input objects.
 //! - [`Reply`] takes a raw payload through a [`Writer`], handles to copy or move, new
 //!   interfaces, and sessions on other services. A method ends with `reply.ok()`, or with
 //!   `reply.deferred()` after taking a reply token, or fails with a [`Fault`]: `?` on any
@@ -158,13 +160,15 @@
 //! | A reply token is dropped without being completed, or a method returns "deferred" without taking one | reply [`DEFERRED_REPLY_DROPPED`] (`deferred.rs`: `a_dropped_token_replies_with_an_error`, `deferring_without_a_token_is_answered_at_once_with_an_error`) |
 //! | A method asks for a second reply token | reply [`NOT_SUPPORTED`] (`deferred.rs`: `a_request_has_one_token`) |
 //! | A method asks for family state its server was not given | reply [`NOT_SUPPORTED`] (`server.rs`: `a_method_that_needs_family_state_fails_on_a_server_without_it`) |
+//! | A method asks for a buffer its command's row does not declare | reply [`NOT_SUPPORTED`] (`buffers.rs`: `a_buffer_the_row_does_not_declare_is_not_supported`) |
 //!
 //! Two more come with the host: a method that asks for the environment or the executor its
 //! server was not given ([`Context::env`], [`Context::executor`]) replies [`NOT_SUPPORTED`]
 //! (`fsp/tests.rs`: `a_server_without_an_environment_fails_what_needs_the_host`,
 //! `a_server_without_an_executor_cannot_read`).
 //!
-//! More are listed where they belong: payload layout in [`payload`], buffers in [`request`],
+//! More are listed where they belong: payload layout in [`payload`], buffers in [`buffers`] and
+//! [`request`],
 //! control requests in [`control`], and the reuse of domain object ids on `Domain` in
 //! `framework/targets.rs`.
 //!
@@ -197,6 +201,7 @@
 //!   looks, such a reply is refused with [`NOT_SUPPORTED`] and an error in the log, and nothing
 //!   of it is kept, rather than sent with its ids one to three bytes late.
 
+pub mod buffers;
 mod commands;
 mod context;
 pub mod control;
@@ -219,6 +224,7 @@ pub mod work;
 #[cfg(test)]
 mod tests;
 
+pub use buffers::{BufferKind, DeclaredBuffer, DescriptorList};
 pub use commands::{Command, CommandTable, Protocol, Session};
 pub use context::Context;
 pub use defer::{Completed, Notify, ReplyToken, TokenId};

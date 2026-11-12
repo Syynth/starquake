@@ -48,34 +48,37 @@ struct Toy {
     events: Vec<ObjectId>,
 }
 
+// The CMIF rows name their ids by constant and the TIPC rows by literal: the macro takes both.
 commands! {
     impl Toy {
-        0 => add,
+        toy::ADD => add,
+        toy::OPEN_CHILD => open_child,
+        toy::CHILD_TAG => child_tag,
+        toy::INSPECT => inspect,
+        toy::UPPER => upper [In(AutoSelect), Out(AutoSelect)],
+        toy::MAKE_EVENT => make_event,
+        toy::FAIL => fail,
+        toy::FLOOD => flood,
+        toy::SPAWN => spawn,
+        toy::INTERLEAVE => interleave,
+        toy::POKE => poke,
+        toy::SIGNAL => signal,
+        toy::OPEN_MUTE => open_mute,
+        toy::ODD => odd,
+        toy::WAIT => wait,
+        toy::WAIT_TWICE => wait_twice,
+        toy::FORGET => forget,
+        toy::HASTY => hasty,
+        toy::BUMP => bump,
+        toy::LEND => lend,
+        toy::COPY_MIXED => copy_mixed [In(Pointer), In(MapAlias), Out(MapAlias), Out(Pointer)],
+        toy::PEEK_UNDECLARED => peek_undeclared [In(MapAlias)],
+    }
+    tipc {
+        0 => sum,
         1 => open_child,
-        2 => child_tag,
-        3 => inspect,
-        4 => upper,
-        5 => make_event,
-        6 => fail,
-        7 => flood,
-        8 => spawn,
-        9 => interleave,
-        10 => poke,
-        11 => signal,
-        12 => open_mute,
-        13 => odd,
-        14 => wait,
-        15 => wait_twice,
-        16 => forget,
-        17 => hasty,
-        18 => bump,
-        19 => lend,
-        tipc {
-            0 => sum,
-            1 => open_child,
-            2 => inspect,
-            3 => wait,
-        }
+        2 => inspect,
+        3 => wait,
     }
 }
 
@@ -188,8 +191,8 @@ impl Toy {
         reply.ok()
     }
 
-    /// in: in buffer 0, at most [`UPPER_LIMIT`] bytes of text. out: out buffer 0, the text in
-    /// upper case; `u32` its length.
+    /// in: in buffer 0 (auto-select), at most [`UPPER_LIMIT`] bytes of text. out: out buffer 0
+    /// (auto-select), the text in upper case; `u32` its length.
     fn upper(_: &mut Self, cx: &mut Context<'_>, req: &Request<'_>, reply: &mut Reply) -> Outcome {
         let text = req.in_buffer(cx, 0)?.read_all(UPPER_LIMIT)?;
         let mut out = req.out_buffer(cx, 0)?;
@@ -335,6 +338,33 @@ impl Toy {
         reply.ok()
     }
 
+    /// in: in buffer 0 (pointer) and in buffer 1 (map-alias), at most [`UPPER_LIMIT`] bytes each.
+    /// out: out buffer 0 (map-alias) gets in buffer 1's bytes and out buffer 1 (pointer) in
+    /// buffer 0's, so a test sees which descriptor each index was.
+    fn copy_mixed(
+        _: &mut Self,
+        cx: &mut Context<'_>,
+        req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        let pointer = req.in_buffer(cx, 0)?.read_all(UPPER_LIMIT)?;
+        let map_alias = req.in_buffer(cx, 1)?.read_all(UPPER_LIMIT)?;
+        req.out_buffer(cx, 0)?.write(&map_alias)?;
+        req.out_buffer(cx, 1)?.write(&pointer)?;
+        reply.ok()
+    }
+
+    /// Declares one in buffer and asks for a second.
+    fn peek_undeclared(
+        _: &mut Self,
+        cx: &mut Context<'_>,
+        req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        req.in_buffer(cx, 1)?;
+        reply.ok()
+    }
+
     /// TIPC 0. in: `u32 a`, `u32 b`. out: `u32 a + b`.
     fn sum(_: &mut Self, _cx: &mut Context<'_>, req: &Request<'_>, reply: &mut Reply) -> Outcome {
         let mut r = req.payload();
@@ -381,6 +411,8 @@ mod toy {
     pub(super) const HASTY: u32 = 17;
     pub(super) const BUMP: u32 = 18;
     pub(super) const LEND: u32 = 19;
+    pub(super) const COPY_MIXED: u32 = 20;
+    pub(super) const PEEK_UNDECLARED: u32 = 21;
     /// An id the toy does not list in either block.
     pub(super) const MISSING: u16 = 77;
     pub(super) const TIPC_SUM: u16 = 0;

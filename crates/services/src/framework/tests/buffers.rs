@@ -1,9 +1,10 @@
-//! Buffers by index: which descriptor an index means, and the bounds on reading and writing.
+//! Buffers by index: the check of a request against the declared buffers, which descriptor an
+//! index means, and the bounds on reading and writing.
 
 use starquake_ipc::{BufferDescriptor, ReceiveDescriptor, RequestBuilder, StaticDescriptor};
 use starquake_kernel::result::{KernelError, ResultCode};
 
-use super::super::result::INVALID_CMIF_REQUEST;
+use super::super::result::{INVALID_CMIF_REQUEST, NOT_SUPPORTED};
 use super::{Answer, Rig, STALE, UPPER_LIMIT, only, plain, request, toy};
 
 /// Where tests map the text `upper` reads.
@@ -56,6 +57,17 @@ fn upper() -> RequestBuilder {
     request(toy::UPPER)
 }
 
+/// `upper` sent as a client sends its two auto-select buffers through map-alias descriptors:
+/// `text` as the A descriptor and `room` as the B descriptor, each with an empty pointer
+/// descriptor beside it (libnx `cmifRequestInAutoBuffer`, `cmifRequestOutAutoBuffer`).
+fn upper_mapped(text: BufferDescriptor, room: BufferDescriptor) -> RequestBuilder {
+    upper()
+        .send_buffer(text)
+        .static_descriptor(x(0, 0))
+        .receive_buffer(room)
+        .receive_descriptor(c(0, 0))
+}
+
 fn send(rig: &mut Rig, build: &RequestBuilder) -> Answer {
     plain(&rig.send(build))
 }
@@ -69,34 +81,39 @@ fn wrote(len: usize) -> Answer {
 }
 
 /// What a mapped out range holds after `text` was written to its start.
-fn filled(text: &[u8]) -> Vec<u8> {
-    let mut bytes = text.to_ascii_uppercase();
+fn holding(text: &[u8]) -> Vec<u8> {
+    let mut bytes = text.to_vec();
     bytes.resize(OUT_ROOM, STALE);
     bytes
 }
 
+/// What a mapped out range holds after `upper` wrote `text` to its start.
+fn filled(text: &[u8]) -> Vec<u8> {
+    holding(&text.to_ascii_uppercase())
+}
+
 #[test]
-fn in_is_an_a_descriptor_and_out_is_a_b_descriptor() {
+fn an_auto_select_buffer_is_its_a_or_b_descriptor_when_that_is_not_empty() {
     let mut rig = rig();
-    let build = upper()
-        .send_buffer(a(IN, TEXT.len()))
-        .receive_buffer(a(OUT, OUT_ROOM));
+    let build = upper_mapped(a(IN, TEXT.len()), a(OUT, OUT_ROOM));
     assert_eq!(send(&mut rig, &build), wrote(TEXT.len()));
     assert_eq!(rig.kernel.memory(OUT, OUT_ROOM).unwrap(), filled(TEXT));
 }
 
 #[test]
-fn in_is_an_x_descriptor_and_out_is_a_c_descriptor_when_there_is_no_a_or_b() {
+fn an_auto_select_buffer_is_its_x_or_c_descriptor_when_the_a_or_b_is_empty() {
     let mut rig = rig();
     let build = upper()
+        .send_buffer(a(0, 0))
         .static_descriptor(x(IN, TEXT.len()))
+        .receive_buffer(a(0, 0))
         .receive_descriptor(c(OUT, OUT_ROOM));
     assert_eq!(send(&mut rig, &build), wrote(TEXT.len()));
     assert_eq!(rig.kernel.memory(OUT, OUT_ROOM).unwrap(), filled(TEXT));
 }
 
-/// Eden's rule: a non-empty A (or B) descriptor wins over the X (or C) descriptor with the same
-/// index, and an empty one gives way to it.
+/// Eden's rule: a non-empty A (or B) descriptor wins over its X (or C) descriptor, and an empty
+/// one gives way to it.
 #[test]
 fn a_non_empty_a_or_b_wins_and_an_empty_one_gives_way() {
     let mut rig = rig();
@@ -123,37 +140,80 @@ fn a_non_empty_a_or_b_wins_and_an_empty_one_gives_way() {
     );
 }
 
-/// Divergence from Eden, which logs a failed assertion: an empty A or B descriptor with no X or
-/// C behind it is an empty buffer.
+/// Both descriptors of an auto-select buffer empty: an empty buffer, as Eden reads it.
 #[test]
-fn an_empty_a_or_b_with_nothing_behind_it_is_an_empty_buffer() {
+fn an_auto_select_buffer_with_both_descriptors_empty_is_empty() {
     let mut rig = rig();
-    let nothing_to_read = upper()
-        .send_buffer(a(IN, 0))
-        .receive_buffer(a(OUT, OUT_ROOM));
+    let nothing_to_read = upper_mapped(a(IN, 0), a(OUT, OUT_ROOM));
     assert_eq!(send(&mut rig, &nothing_to_read), wrote(0));
     assert_eq!(rig.kernel.memory(OUT, OUT_ROOM).unwrap(), filled(b""));
 
     // No room to write, and nothing to write into it.
-    let no_room = upper().send_buffer(a(IN, 0)).receive_buffer(a(OUT, 0));
+    let no_room = upper_mapped(a(IN, 0), a(OUT, 0));
     assert_eq!(send(&mut rig, &no_room), wrote(0));
 }
 
-/// Divergence from Eden, which logs a failed assertion and reads or writes nothing: a buffer
-/// the request does not carry is an error reply.
+/// Divergence from Eden, which logs a failed assertion and reads or writes nothing: a request
+/// whose descriptors are not the declared buffers is refused, and the method never runs.
 #[test]
-fn a_buffer_the_request_does_not_carry_is_an_invalid_request() {
+fn a_request_that_fails_the_check_never_reaches_the_method() {
     let mut rig = rig();
-    let no_in = upper().receive_buffer(a(OUT, OUT_ROOM));
-    assert_eq!(send(&mut rig, &no_in), only(INVALID_CMIF_REQUEST));
-    let no_out = upper().send_buffer(a(IN, TEXT.len()));
-    assert_eq!(send(&mut rig, &no_out), only(INVALID_CMIF_REQUEST));
-    // Index 0 is asked for; a W descriptor is neither in nor out.
-    let exchange_only = upper()
-        .exchange_buffer(a(IN, TEXT.len()))
+    // Each lacks one of the four descriptors two auto-select buffers take.
+    let no_x = upper()
+        .send_buffer(a(IN, TEXT.len()))
+        .receive_buffer(a(OUT, OUT_ROOM))
+        .receive_descriptor(c(0, 0));
+    let no_a = upper()
+        .static_descriptor(x(IN, TEXT.len()))
+        .receive_buffer(a(OUT, OUT_ROOM))
+        .receive_descriptor(c(0, 0));
+    let no_b = upper()
+        .send_buffer(a(IN, TEXT.len()))
+        .static_descriptor(x(0, 0))
+        .receive_descriptor(c(OUT, OUT_ROOM));
+    let no_c = upper()
+        .send_buffer(a(IN, TEXT.len()))
+        .static_descriptor(x(0, 0))
         .receive_buffer(a(OUT, OUT_ROOM));
-    assert_eq!(send(&mut rig, &exchange_only), only(INVALID_CMIF_REQUEST));
+    // Everything, and a W descriptor besides.
+    let exchange = upper_mapped(a(IN, TEXT.len()), a(OUT, OUT_ROOM))
+        .exchange_buffer(a(IN_OTHER, OTHER_TEXT.len()));
+    for build in [no_x, no_a, no_b, no_c, exchange] {
+        assert_eq!(send(&mut rig, &build), only(INVALID_CMIF_REQUEST));
+    }
     assert_eq!(rig.kernel.memory(OUT, OUT_ROOM).unwrap(), filled(b""));
+}
+
+/// Divergence from Eden, which reads in buffer 1 from A descriptor 1: each descriptor list is
+/// numbered on its own, as a client fills it.
+#[test]
+fn each_list_is_numbered_on_its_own() {
+    let mut rig = rig();
+    // In buffer 0 is pointer (X 0), in buffer 1 map-alias (A 0); out buffer 0 is map-alias (B 0),
+    // out buffer 1 pointer (C 0).
+    let build = request(toy::COPY_MIXED)
+        .static_descriptor(x(IN, TEXT.len()))
+        .send_buffer(a(IN_OTHER, OTHER_TEXT.len()))
+        .receive_buffer(a(OUT, OUT_ROOM))
+        .receive_descriptor(c(OUT_OTHER, OUT_ROOM));
+    assert_eq!(send(&mut rig, &build), only(ResultCode::SUCCESS));
+    assert_eq!(
+        rig.kernel.memory(OUT, OUT_ROOM).unwrap(),
+        holding(OTHER_TEXT)
+    );
+    assert_eq!(
+        rig.kernel.memory(OUT_OTHER, OUT_ROOM).unwrap(),
+        holding(TEXT)
+    );
+}
+
+/// starquake's own: a method that asks for a buffer its row does not declare is a mistake in the
+/// service, answered `NOT_SUPPORTED`.
+#[test]
+fn a_buffer_the_row_does_not_declare_is_not_supported() {
+    let mut rig = rig();
+    let build = request(toy::PEEK_UNDECLARED).send_buffer(a(IN, TEXT.len()));
+    assert_eq!(send(&mut rig, &build), only(NOT_SUPPORTED));
 }
 
 #[test]
@@ -162,17 +222,13 @@ fn an_in_buffer_is_read_only_up_to_the_limit_the_method_states() {
     rig.kernel.map(IN, vec![b'a'; UPPER_LIMIT + 1]);
     rig.kernel.map(OUT, vec![STALE; OUT_ROOM]);
     // Exactly at the limit.
-    let at_limit = upper()
-        .send_buffer(a(IN, UPPER_LIMIT))
-        .receive_buffer(a(OUT, OUT_ROOM));
+    let at_limit = upper_mapped(a(IN, UPPER_LIMIT), a(OUT, OUT_ROOM));
     assert_eq!(send(&mut rig, &at_limit), wrote(UPPER_LIMIT));
     // One byte more is refused before anything is read or written.
     let mut rig = Rig::strict();
     rig.kernel.map(IN, vec![b'a'; UPPER_LIMIT + 1]);
     rig.kernel.map(OUT, vec![STALE; OUT_ROOM]);
-    let over = upper()
-        .send_buffer(a(IN, UPPER_LIMIT + 1))
-        .receive_buffer(a(OUT, OUT_ROOM));
+    let over = upper_mapped(a(IN, UPPER_LIMIT + 1), a(OUT, OUT_ROOM));
     assert_eq!(send(&mut rig, &over), only(INVALID_CMIF_REQUEST));
     assert_eq!(rig.kernel.memory(OUT, OUT_ROOM).unwrap(), filled(b""));
 }
@@ -183,15 +239,11 @@ fn an_in_buffer_is_read_only_up_to_the_limit_the_method_states() {
 fn a_write_past_the_end_of_an_out_buffer_writes_nothing() {
     let mut rig = rig();
     // Exactly enough room.
-    let exact = upper()
-        .send_buffer(a(IN, TEXT.len()))
-        .receive_buffer(a(OUT, TEXT.len()));
+    let exact = upper_mapped(a(IN, TEXT.len()), a(OUT, TEXT.len()));
     assert_eq!(send(&mut rig, &exact), wrote(TEXT.len()));
     assert_eq!(rig.kernel.memory(OUT, OUT_ROOM).unwrap(), filled(TEXT));
     // One byte short, into the other range.
-    let short = upper()
-        .send_buffer(a(IN, TEXT.len()))
-        .receive_buffer(a(OUT_OTHER, TEXT.len() - 1));
+    let short = upper_mapped(a(IN, TEXT.len()), a(OUT_OTHER, TEXT.len() - 1));
     assert_eq!(send(&mut rig, &short), only(INVALID_CMIF_REQUEST));
     assert_eq!(rig.kernel.memory(OUT_OTHER, OUT_ROOM).unwrap(), filled(b""));
 }
@@ -201,20 +253,14 @@ fn a_buffer_must_be_mapped_for_its_whole_extent() {
     let fault = only(KernelError::InvalidCurrentMemory.code());
     // The in buffer claims one byte more than is mapped.
     let mut rig = rig();
-    let in_past_end = upper()
-        .send_buffer(a(IN, TEXT.len() + 1))
-        .receive_buffer(a(OUT, OUT_ROOM));
+    let in_past_end = upper_mapped(a(IN, TEXT.len() + 1), a(OUT, OUT_ROOM));
     assert_eq!(send(&mut rig, &in_past_end), fault);
     // The out buffer starts one byte before the end of its range, and five bytes go in.
     let last = OUT + u64::try_from(OUT_ROOM).unwrap() - 1;
-    let out_past_end = upper()
-        .send_buffer(a(IN, TEXT.len()))
-        .receive_buffer(a(last, OUT_ROOM));
+    let out_past_end = upper_mapped(a(IN, TEXT.len()), a(last, OUT_ROOM));
     assert_eq!(send(&mut rig, &out_past_end), fault);
     assert_eq!(rig.kernel.memory(OUT, OUT_ROOM).unwrap(), filled(b""));
     // Nothing mapped at all.
-    let unmapped = upper()
-        .send_buffer(a(0x7000_0000, TEXT.len()))
-        .receive_buffer(a(OUT, OUT_ROOM));
+    let unmapped = upper_mapped(a(0x7000_0000, TEXT.len()), a(OUT, OUT_ROOM));
     assert_eq!(send(&mut rig, &unmapped), fault);
 }

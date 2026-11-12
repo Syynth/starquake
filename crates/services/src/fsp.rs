@@ -21,8 +21,8 @@
 //! |---|---|---|---|---|
 //! | `fsp-srv` ([`FspSrv`]) | 1 | `SetCurrentProcess` | the caller's process id, attached by the kernel; a `u64` placeholder in the payload, not read | nothing |
 //! | | 18 | `OpenSdCardFileSystem` | nothing | an [`IFileSystem`] |
-//! | [`IFileSystem`] | 8 | `OpenFile` | `u32` open mode; in buffer 0: the path | an [`IFile`] |
-//! | [`IFile`] | 0 | `Read` | `u32` option, 4 bytes of padding, `s64` offset, `s64` size; out buffer 0: room for the bytes | `s64` bytes read, and the bytes in out buffer 0 |
+//! | [`IFileSystem`] | 8 | `OpenFile` | `u32` open mode; in buffer 0 (pointer, an X descriptor): the path | an [`IFile`] |
+//! | [`IFile`] | 0 | `Read` | `u32` option, 4 bytes of padding, `s64` offset, `s64` size; out buffer 0 (map-alias, a B descriptor): room for the bytes | `s64` bytes read, and the bytes in out buffer 0 |
 //! | | 4 | `GetSize` | nothing | `s64` size |
 //!
 //! Layouts, each the client's and the reference's:
@@ -92,7 +92,10 @@
 //!
 //!   The open mode is checked before the path, which is Eden's order: `Fsa::IFileSystem::OpenFile`
 //!   (`eden/src/core/file_sys/fsa/fs_i_filesystem.h`) checks the mode, then its `DoOpenFile`
-//!   reaches `SanitizePath`. The console normalises first (Atmosphère
+//!   reaches `SanitizePath`. Before either, the framework checks that the request carries the
+//!   one pointer (X) buffer `OpenFile` declares, as the console does before calling the command,
+//!   so a request with a bad mode and no path is `INVALID_CMIF_REQUEST`
+//!   (`the_declared_buffers_are_checked_before_the_open_mode`). The console normalises first (Atmosphère
 //!   `fssrv_filesystem_interface_adapter.cpp`, `FileSystemInterfaceAdapter::OpenFile` calls
 //!   `SetUpPath` before `m_base_fs->OpenFile`, which checks the mode; fact only), so a request
 //!   with both a bad mode and a bad path is [`result::INVALID_OPEN_MODE`] here and a path error
@@ -103,8 +106,10 @@
 //! - **The path's buffer.** Eden copies at most `sizeof(Sf::Path)` (0x301) bytes of the buffer
 //!   into a zeroed path and then reads it as a C string, past its end if none of the 0x301 bytes
 //!   is zero. Here the path ends there (`a_path_with_no_terminator_ends_at_its_struct`). A
-//!   request with no in buffer 0 is the framework's `INVALID_CMIF_REQUEST`, where Eden logs a
-//!   failed assertion and reads an empty path (`open_file_without_a_path_is_an_invalid_request`).
+//!   request with no X descriptor for the path, or with an A descriptor, is the framework's
+//!   `INVALID_CMIF_REQUEST`, where Eden logs a failed assertion and reads an empty path, or
+//!   ignores the A descriptor (`open_file_without_a_path_is_an_invalid_request`,
+//!   `open_file_refuses_a_map_alias_path`).
 //! - **Read-only.** Eden's SD card can be written. Here a mode that is not exactly read is
 //!   [`result::INVALID_OPEN_MODE`], after Eden's own two mode checks, as the console's read-only
 //!   file systems answer (Atmosphère `fs_read_only_filesystem.hpp`, `ReadOnlyFileSystem::DoOpenFile`:
@@ -129,9 +134,11 @@
 //!   (`a_size_answer_of_other_than_eight_bytes_fails`, `a_size_over_s64_max_fails`), and so is a
 //!   probe answered with any bytes (`a_probe_answered_with_bytes_opens_nothing`).
 //!
-//! The framework's own rules apply as for every service: an out buffer may be a B or a C
-//! descriptor, where Eden's `Read` takes B (`HipcMapAlias`) only, and an in buffer an A or an X
-//! (`framework::request`).
+//! The framework's own rules apply as for every service: each command's buffers are declared in
+//! its table row with the kind Eden's signature gives them, and a request whose descriptors do
+//! not match is `INVALID_CMIF_REQUEST` before the command runs (`framework::buffers`): `Read`
+//! takes one B descriptor (`read_refuses_a_pointer_buffer`), `OpenFile` one X descriptor, and
+//! the other commands none.
 //!
 //! # Where this departs from the service spec
 //!
@@ -269,10 +276,36 @@ fn file_size(env: &dyn Env, mount: Mount, path: &[u8]) -> Result<i64, ResultCode
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct FspSrv;
 
+/// The ids of the commands of this subset, per interface (Eden's tables: `FSP_SRV::FSP_SRV`,
+/// `IFileSystem::IFileSystem`, `IFile::IFile`).
+pub mod command {
+    /// [`FspSrv`](super::FspSrv)'s commands.
+    pub mod fsp_srv {
+        /// `SetCurrentProcess` (`{1, D<&FSP_SRV::SetCurrentProcess>, ..}`).
+        pub const SET_CURRENT_PROCESS: u32 = 1;
+        /// `OpenSdCardFileSystem` (`{18, D<&FSP_SRV::OpenSdCardFileSystem>, ..}`).
+        pub const OPEN_SD_CARD_FILE_SYSTEM: u32 = 18;
+    }
+
+    /// [`IFileSystem`](super::IFileSystem)'s commands.
+    pub mod file_system {
+        /// `OpenFile` (`{8, D<&IFileSystem::OpenFile>, ..}`).
+        pub const OPEN_FILE: u32 = 8;
+    }
+
+    /// [`IFile`](super::IFile)'s commands.
+    pub mod file {
+        /// `Read` (`{0, D<&IFile::Read>, ..}`).
+        pub const READ: u32 = 0;
+        /// `GetSize` (`{4, D<&IFile::GetSize>, ..}`).
+        pub const GET_SIZE: u32 = 4;
+    }
+}
+
 commands! {
     impl FspSrv {
-        1 => set_current_process,
-        18 => open_sd_card_file_system,
+        command::fsp_srv::SET_CURRENT_PROCESS => set_current_process,
+        command::fsp_srv::OPEN_SD_CARD_FILE_SYSTEM => open_sd_card_file_system,
     }
 }
 
@@ -314,9 +347,10 @@ pub struct IFileSystem {
     mount: Mount,
 }
 
+// The path is a pointer buffer: Eden's `InLargeData<Sf::Path, BufferAttr_HipcPointer>`.
 commands! {
     impl IFileSystem {
-        8 => open_file,
+        command::file_system::OPEN_FILE => open_file [In(Pointer)],
     }
 }
 
@@ -374,7 +408,7 @@ impl IFileSystem {
 /// An open file (`IFile`), read-only. The default has an empty path, which names no file: it is
 /// for looking at the command table without opening a file.
 ///
-/// It is decoded from a snapshot through [`SavedFile`], which refuses a path that is not
+/// It is decoded from a snapshot through `SavedFile`, which refuses a path that is not
 /// normalised (see the module docs, "Snapshots and reads in flight").
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(try_from = "SavedFile")]
@@ -392,7 +426,7 @@ struct SavedFile {
     path: Vec<u8>,
 }
 
-/// A saved [`IFile`]'s path is not one [`IFileSystem::open_file`] could have made.
+/// A saved [`IFile`]'s path is not one `IFileSystem::open_file` could have made.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("the saved path of an open file is not a normalised path")]
 pub struct NotNormalised;
@@ -411,10 +445,13 @@ impl TryFrom<SavedFile> for IFile {
     }
 }
 
+// The bytes go to a map-alias buffer: Eden's `OutBuffer<BufferAttr_HipcMapAlias |
+// BufferAttr_HipcMapTransferAllowsNonSecure>` (the transfer mode is not checked; see
+// `framework::buffers`).
 commands! {
     impl IFile {
-        0 => read,
-        4 => get_size,
+        command::file::READ => read [Out(MapAlias)],
+        command::file::GET_SIZE => get_size,
     }
 }
 
