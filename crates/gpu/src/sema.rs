@@ -527,7 +527,11 @@ fn host_reduction_fields(reduction: Reduction) -> (u32, u32) {
 }
 
 /// Decodes a `RED_*`-encoded reduction (shared by `MME_DMA_REDUCTION` and QMD releases).
-pub(crate) fn red_reduction(word: &'static str, op: u32, format: u32) -> Result<Reduction, DecodeError> {
+pub(crate) fn red_reduction(
+    word: &'static str,
+    op: u32,
+    format: u32,
+) -> Result<Reduction, DecodeError> {
     let op = match op {
         RED_ADD => ReductionOp::Add,
         RED_MIN => ReductionOp::Min,

@@ -62,8 +62,10 @@ use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::ops::Range;
 
-use super::interp::{DATA_RAM_WORDS, DataRam, MacroError, MacroHost, RamAccess, StepLimit, run_with};
 use super::inst::Instruction;
+use super::interp::{
+    DATA_RAM_WORDS, DataRam, MacroError, MacroHost, RamAccess, StepLimit, run_with,
+};
 
 /// The most words the memo's arena holds before it compacts (Eden-NX2's `MaxArenaWords`,
 /// 16 MiB). Also the most a single record may take.
@@ -507,7 +509,9 @@ impl MacroMemo {
     /// Applies a matched record's effects.
     fn replay(&self, effects: &Effects, data_ram: &mut DataRam, host: &mut impl MacroHost) {
         let arena = &self.arena;
-        let data_ram_writes = arena.get(effects.data_ram_writes.clone()).unwrap_or_default();
+        let data_ram_writes = arena
+            .get(effects.data_ram_writes.clone())
+            .unwrap_or_default();
         for &[index, value] in data_ram_writes.as_chunks().0 {
             // Every index was recorded from a write that succeeded, so it is in range.
             if let Some(word) = data_ram.get_mut(index) {

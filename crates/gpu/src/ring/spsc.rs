@@ -94,7 +94,9 @@ pub enum PopError {
     /// The ring is empty and its producer is gone.
     #[error("the ring is empty and its producer is gone")]
     Disconnected,
-    /// The words at the read position are not an entry. Every later pop returns this again.
+    /// The words at the read position are not an entry. Nothing past them is consumed, so every
+    /// later pop returns this again (pinned by `a_corrupt_entry_stops_the_ring_for_good` and
+    /// `an_entry_longer_than_what_was_published_is_corrupt_for_good`).
     #[error("the ring is corrupt: {0}")]
     Corrupt(DecodeError),
 }
@@ -130,8 +132,7 @@ impl Shared {
     }
 
     fn slot(&self, position: u64) -> Option<&AtomicU64> {
-        self.words
-            .get(usize::try_from(position & self.mask).ok()?)
+        self.words.get(usize::try_from(position & self.mask).ok()?)
     }
 
     /// Wakes the consumer if it is waiting for data.
@@ -182,7 +183,6 @@ pub fn ring(capacity: usize) -> Result<(Producer, Consumer), CapacityError> {
         shared,
         read: 0,
         available: 0,
-        failed: None,
         scratch: Vec::new(),
     };
     Ok((producer, consumer))
@@ -336,8 +336,6 @@ pub struct Consumer {
     read: u64,
     /// The published position as last read.
     available: u64,
-    /// The decode error that stopped the ring, returned by every later pop.
-    failed: Option<DecodeError>,
     scratch: Vec<u64>,
 }
 
@@ -351,12 +349,12 @@ impl Consumer {
     }
 
     /// The entry at the read position, which must be visible.
+    ///
+    /// A bad entry is not consumed and the published position is not read again while one is
+    /// visible, so a failure repeats exactly on every later call: the words it reads cannot
+    /// change, since the producer never overwrites words that are not consumed.
     fn take(&mut self) -> Result<RingEntry<'static>, PopError> {
-        let result = self.decode_next();
-        if let Err(error) = result {
-            self.failed = Some(error);
-        }
-        result.map_err(PopError::Corrupt)
+        self.decode_next().map_err(PopError::Corrupt)
     }
 
     fn decode_next(&mut self) -> Result<RingEntry<'static>, DecodeError> {
@@ -388,9 +386,6 @@ impl Consumer {
     /// The next entry if one is visible: `Ok(None)` when the ring is empty and the producer is
     /// still there.
     pub fn try_pop(&mut self) -> Result<Option<RingEntry<'static>>, PopError> {
-        if let Some(error) = self.failed {
-            return Err(PopError::Corrupt(error));
-        }
         if self.has_entry() {
             return self.take().map(Some);
         }

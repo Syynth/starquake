@@ -34,8 +34,8 @@ use std::fmt;
 use thiserror::Error;
 
 use super::entry::{
-    CaptureCommand, ChannelId, ClassId, DisplayId, ImageDesc, Invalidation, LayerId,
-    MarkerToken, PresentRequest, Release, ReleaseOp, RingEntry, Subchannel, SyncpointId,
+    CaptureCommand, ChannelId, ClassId, DisplayId, ImageDesc, Invalidation, LayerId, MarkerToken,
+    PresentRequest, Release, ReleaseOp, RingEntry, Subchannel, SyncpointId,
 };
 use crate::field::Field;
 use crate::sema::{self, PayloadSize, ReleaseForm, red_reduction, red_reduction_fields};
@@ -262,9 +262,9 @@ fn header(kind: Kind) -> u32 {
 
 /// The bits of `fields`, as a mask of the low half.
 fn mask(fields: &[Field]) -> u32 {
-    fields
-        .iter()
-        .fold(KIND.max(), |mask, field| mask | field.insert_truncated(0, field.max()))
+    fields.iter().fold(KIND.max(), |mask, field| {
+        mask | field.insert_truncated(0, field.max())
+    })
 }
 
 /// Words a run of `words` words takes: the header, the channel word, then two per word.

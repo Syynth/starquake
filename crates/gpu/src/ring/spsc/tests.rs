@@ -85,7 +85,6 @@ fn write_words() -> usize {
     encoded_words(&write(0, 0))
 }
 
-
 #[test]
 fn a_capacity_must_be_a_power_of_two() {
     for words in [0, 3, 6, 1000] {
@@ -119,7 +118,9 @@ fn the_producer_publishes_on_its_own_at_the_batch_size() {
     let below = PUBLISH_EVERY / per_entry - 1;
     let (mut producer, mut consumer) = ring(1024).unwrap();
     for value in 0..below {
-        producer.push(&write(1, u32::try_from(value).unwrap())).unwrap();
+        producer
+            .push(&write(1, u32::try_from(value).unwrap()))
+            .unwrap();
     }
     assert_eq!(producer.unpublished(), PUBLISH_EVERY - per_entry);
     assert_eq!(consumer.try_pop(), Ok(None));
@@ -241,7 +242,10 @@ fn a_dropped_consumer_disconnects_the_producer() {
     let (mut producer, consumer) = ring(8).unwrap();
     producer.try_push(&write(1, 0)).unwrap();
     drop(consumer);
-    assert_eq!(producer.try_push(&write(1, 1)), Err(PushError::Disconnected));
+    assert_eq!(
+        producer.try_push(&write(1, 1)),
+        Err(PushError::Disconnected)
+    );
     assert_eq!(producer.push(&write(1, 1)), Err(PushError::Disconnected));
     assert_eq!(
         PushError::Disconnected.to_string(),
@@ -330,7 +334,10 @@ fn a_waiting_consumer_wakes_on_a_publish_and_on_a_drop() {
     producer.publish();
     assert_eq!(results.recv_timeout(PATIENCE), Ok(Ok(write(1, 7))));
     drop(producer);
-    assert_eq!(results.recv_timeout(PATIENCE), Ok(Err(PopError::Disconnected)));
+    assert_eq!(
+        results.recv_timeout(PATIENCE),
+        Ok(Err(PopError::Disconnected))
+    );
     within(move || reader.join().is_ok());
 }
 

@@ -335,4 +335,3 @@ impl RingEntry<'_> {
         }
     }
 }
-

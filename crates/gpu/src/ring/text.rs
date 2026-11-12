@@ -29,8 +29,8 @@ use thiserror::Error;
 
 use super::encode::Kind;
 use super::entry::{
-    CaptureCommand, ChannelId, ClassId, DisplayId, ImageDesc, Invalidation, LayerId,
-    MarkerToken, PresentRequest, Release, ReleaseOp, RingEntry, Subchannel, SyncpointId,
+    CaptureCommand, ChannelId, ClassId, DisplayId, ImageDesc, Invalidation, LayerId, MarkerToken,
+    PresentRequest, Release, ReleaseOp, RingEntry, Subchannel, SyncpointId,
 };
 use crate::sema::{PayloadSize, Reduction, ReductionFormat, ReductionOp, ReleaseForm};
 
@@ -73,8 +73,10 @@ const FORMAT_NAMES: [(ReductionFormat, &str); 2] = [
 ];
 
 /// Every capture command with its name.
-const CAPTURE_NAMES: [(CaptureCommand, &str); 2] =
-    [(CaptureCommand::Start, "start"), (CaptureCommand::Stop, "stop")];
+const CAPTURE_NAMES: [(CaptureCommand, &str); 2] = [
+    (CaptureCommand::Start, "start"),
+    (CaptureCommand::Stop, "stop"),
+];
 
 /// The name of `value` in `table`.
 fn name_of<T: PartialEq + Copy>(table: &[(T, &'static str)], value: T) -> &'static str {
@@ -465,9 +467,7 @@ pub fn parse_entry(line: &str) -> Result<RingEntry<'static>, ParseError> {
             token: MarkerToken(fields.number("token")?),
         },
         Kind::Present => present(&mut fields)?,
-        Kind::CaptureControl => {
-            RingEntry::CaptureControl(fields.named("command", &CAPTURE_NAMES)?)
-        }
+        Kind::CaptureControl => RingEntry::CaptureControl(fields.named("command", &CAPTURE_NAMES)?),
     };
     fields.finish()?;
     Ok(entry)

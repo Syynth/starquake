@@ -198,7 +198,10 @@ fn decode_reads_only_its_own_entry() {
 fn encode_appends_and_leaves_the_output_alone_on_an_error() {
     let mut out = vec![0x55];
     encode(&golden()[0].0, &mut out).unwrap();
-    assert_eq!(out, vec![0x55, 0x0000_0011_0000_0501, 0x0000_0000_0000_c797]);
+    assert_eq!(
+        out,
+        vec![0x55, 0x0000_0011_0000_0501, 0x0000_0000_0000_c797]
+    );
     let too_long = RingEntry::Run {
         channel: ChannelId(1),
         class: ClassId(2),
@@ -228,7 +231,9 @@ fn a_run_of_the_most_words_encodes_and_one_more_does_not() {
     assert_eq!(out.len(), 2 + MAX_RUN_WORDS / 2);
     assert_eq!(decode(&out), Ok((run(MAX_RUN_WORDS), out.len())));
     assert_eq!(
-        encode(&run(MAX_RUN_WORDS + 1), &mut Vec::new()).unwrap_err().to_string(),
+        encode(&run(MAX_RUN_WORDS + 1), &mut Vec::new())
+            .unwrap_err()
+            .to_string(),
         "a run of 8193 words is longer than the most one entry carries, 8192"
     );
     // A header claiming one word more is refused before its length is trusted.
@@ -285,10 +290,7 @@ fn malformed_words_are_exact_errors() {
                 bits: 0x1_0000_0000,
             },
         ),
-        (
-            vec![0x0801, 0],
-            DecodeError::Subchannel { value: 8 },
-        ),
+        (vec![0x0801, 0], DecodeError::Subchannel { value: 8 }),
         // Run of one word: the padding half must be zero.
         (
             vec![0x0000_0001_0000_0003, 0, 0x5_0000_0001],
@@ -384,7 +386,10 @@ fn malformed_host_entries_are_exact_errors() {
 
 #[test]
 fn decode_errors_read_as_plain_words() {
-    assert_eq!(DecodeError::Empty.to_string(), "there is no ring entry here");
+    assert_eq!(
+        DecodeError::Empty.to_string(),
+        "there is no ring entry here"
+    );
     assert_eq!(
         decode(&[0]).unwrap_err().to_string(),
         "ring entry kind 0 is not defined"
@@ -456,7 +461,10 @@ fn invalidations_follow_the_mem_op_d_operations() {
         assert_eq!(what.operation(), value);
         assert_eq!(Invalidation::from_operation(value), Some(what));
         // OPERATION is bits 31:27 of the word; the low bits carry other fields.
-        assert_eq!(Invalidation::from_mem_op_d((value << 27) | 0x7ff_ffff), Some(what));
+        assert_eq!(
+            Invalidation::from_mem_op_d((value << 27) | 0x7ff_ffff),
+            Some(what)
+        );
     }
     for value in (0..32).filter(|value| !table.iter().any(|&(_, op)| op == *value)) {
         assert_eq!(Invalidation::from_operation(value), None, "{value:#x}");
@@ -598,10 +606,7 @@ fn hand_written_lines_parse() {
                 what: Invalidation::Membar,
             },
         ),
-        (
-            "syncpoint id=0",
-            RingEntry::Syncpoint { id: syncpoint(0) },
-        ),
+        ("syncpoint id=0", RingEntry::Syncpoint { id: syncpoint(0) }),
     ];
     for (line, entry) in cases {
         assert_eq!(parse_entry(line), Ok(entry), "{line}");
@@ -637,7 +642,10 @@ fn every_invalidation_has_a_name_that_reads_back() {
     let mut seen = Vec::new();
     for name in names {
         let entry = parse_entry(&format!("invalidate channel=1 what={name}")).unwrap();
-        assert_eq!(entry.to_string(), format!("invalidate channel=1 what={name}"));
+        assert_eq!(
+            entry.to_string(),
+            format!("invalidate channel=1 what={name}")
+        );
         let what = match entry {
             RingEntry::Invalidate { what, .. } => Some(what),
             _ => None,
@@ -654,7 +662,10 @@ fn malformed_lines_are_exact_errors() {
         ("", "the line is empty"),
         ("   ", "the line is empty"),
         ("draw channel=1", "\"draw\" is not an entry kind"),
-        ("wait-for-idle", "a wait-for-idle entry needs channel next, but the line ends"),
+        (
+            "wait-for-idle",
+            "a wait-for-idle entry needs channel next, but the line ends",
+        ),
         (
             "write class=1 channel=2 method=3 value=4",
             "a write entry needs channel next, not \"class=1\"",
@@ -671,13 +682,37 @@ fn malformed_lines_are_exact_errors() {
         ("wait-for-idle channel=", "\"\" is not a valid channel"),
         ("wait-for-idle channel=0x", "\"0x\" is not a valid channel"),
         ("wait-for-idle channel=+1", "\"+1\" is not a valid channel"),
-        ("wait-for-idle channel=0x+1", "\"0x+1\" is not a valid channel"),
+        (
+            "wait-for-idle channel=0x+1",
+            "\"0x+1\" is not a valid channel",
+        ),
         ("wait-for-idle channel=-1", "\"-1\" is not a valid channel"),
         (
             "wait-for-idle channel=18446744073709551616",
             "\"18446744073709551616\" is not a valid channel",
         ),
-        ("wait-for-idle channel=4294967296", "channel 4294967296 is out of range"),
+    ];
+    assert_parse_errors(&cases);
+}
+
+/// Checks that each line fails to parse with exactly its message.
+fn assert_parse_errors(cases: &[(&str, &str)]) {
+    for &(line, message) in cases {
+        assert_eq!(
+            parse_entry(line).map_err(|error| error.to_string()),
+            Err(message.to_owned()),
+            "{line}"
+        );
+    }
+}
+
+#[test]
+fn out_of_range_and_unnamed_values_are_exact_errors() {
+    let cases = [
+        (
+            "wait-for-idle channel=4294967296",
+            "channel 4294967296 is out of range",
+        ),
         (
             "write channel=1 class=2 method=0x10000 value=4",
             "method 65536 is out of range",
@@ -711,7 +746,10 @@ fn malformed_lines_are_exact_errors() {
             "release address=0 payload=0 size=4 timestamp=no op=mul.signed",
             "\"mul.signed\" is not a valid op",
         ),
-        ("invalidate channel=1 what=flush", "\"flush\" is not a valid what"),
+        (
+            "invalidate channel=1 what=flush",
+            "\"flush\" is not a valid what",
+        ),
         ("capture command=pause", "\"pause\" is not a valid command"),
         (
             "run channel=1 class=2 method=3 words=1,,2",
@@ -732,13 +770,7 @@ fn malformed_lines_are_exact_errors() {
             "\"0,0,1,1,1\" is not a valid shown",
         ),
     ];
-    for (line, message) in cases {
-        assert_eq!(
-            parse_entry(line).map_err(|error| error.to_string()),
-            Err(message.to_owned()),
-            "{line}"
-        );
-    }
+    assert_parse_errors(&cases);
 }
 
 #[test]
