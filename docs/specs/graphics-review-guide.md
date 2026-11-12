@@ -1,9 +1,12 @@
 # Review guide: the four graphics drafts
 
-Status: a reading aid for the owner, not a spec. It compares four draft design PRs that were
-written in parallel by agents who could not see each other's work. On 2026-11-12 the owner took
-the six foundational decisions below, and the four drafts were amended to follow them and the
-seam resolutions marked "resolved" here. Everything else in this guide is still a recommendation.
+Status: a record of how the four graphics drafts were reconciled; approved with them, 2026-11-12.
+
+It compares four draft design PRs that were written in parallel by agents who could not see
+each other's work. On 2026-11-12 the owner took every open decision in them ("Decided"), the four
+drafts were amended to follow the rulings and the seam resolutions here, and all four were
+approved. The analysis below is kept for the record; where it recommended otherwise, the
+rulings win.
 
 | Short name | Draft | PR | Issue |
 |---|---|---|---|
@@ -13,14 +16,15 @@ seam resolutions marked "resolved" here. Everything else in this guide is still 
 | render-backend | `docs/specs/render-backend.md` on `design/render-backend` | #114 | #14 |
 
 "Decision N" below is the numbered item in that draft's "Decisions for the owner". A slice id is
-the draft's own (graphics-server 1–16, gpu-protocol G1–G21, shader-pipeline 1–21,
+the draft's own (graphics-server 1–16, gpu-protocol G1–G23, shader-pipeline 1–22,
 render-backend R0–R12). Every claim about a draft was checked against its text; where the texts
 do not settle something, this guide says so.
 
-## Decided so far
+## Decided
 
 The owner's rulings of 2026-11-12, in `docs/decision-log.md`. Each overrides anything in the
-drafts and in this guide; where this guide recommended otherwise (M1), the ruling wins.
+drafts and in this guide; where this guide recommended otherwise (M1), the ruling wins. The six
+foundational rulings came first:
 
 1. **wgpu first, behind our own trait** (render-backend decision 1, option e). No wgpu type
    crosses into `gpu`. A direct Vulkan backend comes when Linux work or a title needs a stage wgpu
@@ -41,6 +45,37 @@ drafts and in this guide; where this guide recommended otherwise (M1), the rulin
    implementation in `crates/gpu`.
 6. **Command lists as data; caches split by what they are keyed on** (render-backend decisions
    3 and 4).
+
+Then the rest, in the order of section 5:
+
+7. **Twenty-one decisions accepted as recommended:** B1 (wait by default, one setting owned by
+   `gpu`, skip as an opt-in once the persistent caches exist), B3 (one house rule when references
+   disagree: Nvidia's headers and module-cited readings for layouts and meanings; where one
+   answer contains the other, the larger; otherwise the one a title ran on; each case marked and
+   pinned by a test), B4 (`starquake-layout`; no separate decoder crate; `starquake-render` plus
+   `starquake-render-wgpu`), and eighteen local items: graphics-server 5, 6, 7, 11;
+   gpu-protocol 6, 7, 11, 12, 13; shader-pipeline 4, 10, 12, 15, 16; render-backend 6, 11, 12,
+   13.
+8. **Ten coupled decisions accepted as recommended:** bounded submission queues of 65,536
+   entries with a deferred reply (graphics-server 12); lazy, unpooled GPU-only memory
+   (graphics-server 4); copy-back only on plain-memory reads and untraceable shader addresses
+   rejected at first (gpu-protocol 4, shader-pipeline 9); polling for CPU semaphore releases
+   (gpu-protocol 3); the shared syncpoint page on demand, at most 1 ms stale (graphics-server
+   9); captures of every byte read, with the three replay commands (gpu-protocol 8); the
+   persistent shader cache storing inputs, built after milestone 3 (shader-pipeline 7); the
+   non-blocking lookup (shader-pipeline 5); traced texture handles first (shader-pipeline 8);
+   mesh and task shaders after milestone 3 (shader-pipeline 11).
+9. **The GPU front thread owns the register file** (gpu-protocol 1).
+10. **The shader translator uses a new arena-based Rust IR** (shader-pipeline 1).
+11. **The wgpu backend's GPU tests run in Linux CI on lavapipe, if it runs cleanly;** otherwise
+    local-only (render-backend 9).
+12. **No video decoding at first, then FFmpeg behind an off-by-default feature**
+    (graphics-server 10).
+13. **The approved specs are amended** as section 3 lists.
+
+Items with no ruling of their own carry an outcome that follows from these: graphics-server 2
+and render-backend 8 (implied by ruling 4), shader-pipeline 13 (implied by rulings 1 and 2),
+render-backend 2 (deferred by ruling 1) and render-backend 7 (moot until a direct backend).
 
 ## 1. How the four designs fit
 
@@ -98,7 +133,7 @@ code itself only for a later direct backend that asks (shader-pipeline slice 22)
 
 **Status: resolved by decision 4.** The render and gpu drafts now say back-pressure reaches the
 guest through later fences and later buffer returns, with no held reply. The route gsv → gpu →
-render stands; correcting `architecture.md` is still a proposal (section 3).
+render stands, and `architecture.md` is corrected (section 3, approved).
 
 - **Route: agreed by three drafts, against the architecture doc.** graphics-server ("What this
   spec offers and assumes of the render backend"), gpu-protocol (ring entry `Present`, ordering
@@ -206,7 +241,7 @@ mapping until it applies.
 
 **Status: resolved as recommended** (applied 2026-11-12). gpu-protocol has a "GPU-only memory"
 section and slice G22; graphics-server says gsv keeps extents and accounting. graphics-server
-decision 4 (lazy host backing at all) is still open.
+decision 4 is decided: lazy host backing, not charged to the title's pools (ruling 8).
 
 - **graphics-server** ("GPU-only memory"; decision 4): backed lazily on the host, "the GPU side
   (#12, #14) allocates host storage"; gsv keeps the extents.
@@ -221,8 +256,8 @@ decision 4 (lazy host backing at all) is still open.
 
 ### M7. Write tracking and shader-cache invalidation
 
-**Status: resolved as recommended** (applied). The kernel half of `WriteWatch` is still unowned
-(section 4), and the execution-model change is still a proposal (section 3).
+**Status: resolved as recommended** (applied). The execution-model change is approved (section
+3); the kernel half of `WriteWatch` still has no slice (section 4).
 
 - **gpu-protocol** ("Learning of CPU writes"): a new `WriteWatch` type in `starquake-memory`. The back
   thread requests protection; the kernel applies it (with a TLB flush) at the next kernel entry,
@@ -241,9 +276,8 @@ decision 4 (lazy host backing at all) is still open.
 
 ### M8. Tiling: the layout crate and who detiles
 
-**Status: resolved as recommended** (applied). gpu-protocol decision 5 (the crate itself) is
-still open; it now notes that with `gpu` as the only production caller, option (a) would work
-today.
+**Status: resolved as recommended** (applied). gpu-protocol decision 5 is decided: the leaf crate
+`starquake-layout` (ruling 7).
 
 - **gpu-protocol** ("Block-linear layout"; decision 5): a new leaf crate `starquake-layout`, ported
   from Mesa's `nil`, with three callers: the gpu back thread, the render backend (a GPU deswizzle
@@ -266,8 +300,8 @@ today.
 
 ### M9. How the GPU asks for a shader
 
-**Status: applied as recommended** (gpu-protocol now uses `lookup`). The owner's decision behind
-it, shader-pipeline decision 5, is still open.
+**Status: applied as recommended** (gpu-protocol now uses `lookup`). shader-pipeline decision 5
+is decided: the non-blocking lookup (ruling 8).
 
 - **gpu-protocol** ("Shader pipeline (#13)"): `translate(request, env)`, "called synchronously on
   the back thread"; `env` reads program words, constant-buffer words and texture types live during
@@ -285,8 +319,8 @@ it, shader-pipeline decision 5, is still open.
 
 ### M10. A draw whose shader or pipeline is not ready
 
-**Status: structure applied as recommended** (one setting owned by `gpu`; translation waits on
-the back thread, pipeline waits on the render thread). The default (B1) is still open.
+**Status: resolved as recommended** (one setting owned by `gpu`; translation waits on the back
+thread, pipeline waits on the render thread). B1 is decided: wait by default (ruling 7).
 
 All three drafts recommend **wait by default, skip as an option later**, so there is no conflict
 of substance. They differ in detail:
@@ -322,8 +356,9 @@ Vulkan backend.
 ### M12. Geometry, tessellation, transform feedback, mesh
 
 **Status: catch (1) resolved by decisions 1 and 2** (neither wgpu nor naga runs these stages,
-so they wait for a direct Vulkan backend; shader-pipeline decision 13 is settled in effect).
-**Catch (2), the mesh MSL fact, is still open**: shader-pipeline experiment E1 settles it.
+so they wait for a direct Vulkan backend; shader-pipeline decision 13 is implied by them).
+**Catch (2), the mesh MSL fact, stays open**: shader-pipeline experiment E1 settles it. It is
+not a decision; mesh and task shaders come after milestone 3 either way (ruling 8).
 
 - **Mostly consistent.** shader-pipeline defers geometry and tessellation (decision 13) and
   transform feedback; it keeps them representable (`GuestStage`, the SPH parser). render-backend
@@ -361,7 +396,8 @@ so they wait for a direct Vulkan backend; shader-pipeline decision 13 is settled
 
 **Status: types resolved by decision 6** (render-backend's `CommandList`, `Command`,
 `FenceValue`, `completed()`; gpu-protocol's sketch replaced). **The back thread's wake on
-completion is still open** in both drafts; gpu-protocol slice G15 waits on it.
+completion stays open** in both specs, listed under "What to verify before building"
+(gpu-protocol 13, render-backend 10); gpu-protocol slice G15 and render-backend R5 wait on it.
 
 - **gpu-protocol** ("What the back hands the render backend", "Render backend (#14)"): sketches
   `BeginPass`/`EndPass`/`Barrier` commands, a `present(PresentFrame)` trait method, and "a
@@ -378,8 +414,8 @@ completion is still open** in both drafts; gpu-protocol slice G15 waits on it.
 ### M15. Three capture formats, one command name
 
 **Status: resolved as recommended** (applied: render-backend R11 is `starquake render-replay`;
-shader answers are in `SQGC`). Recording the new commands in the observability spec is still a
-proposal.
+shader answers are in `SQGC`). The three commands are approved for the observability spec's
+headless contract (ruling 8, gpu-protocol 8).
 
 - gpu-protocol ("Capture and replay"; decision 8): format `SQGC` of GPU-thread inputs, replayed by
   `starquake gpu-replay <capture> --until present=N --dump ...`.
@@ -416,15 +452,16 @@ it).
 
 ## 3. Changes to approved specs that the drafts imply
 
-These need the owner's approval in their own right, separately from the drafts. The six
-decisions do not change approved specs by themselves; rows touched by them are updated below.
+The owner approved these on 2026-11-12 (ruling 13; `docs/decision-log.md`, "Approved specs
+amended for the graphics designs"), and they are written into the approved documents in the
+same set of pull requests as the four specs.
 
 | Spec | Change | Implied by |
 |---|---|---|
 | execution-model, "Write tracking for the GPU caches" | The kernel no longer "notifies the cache". A `WriteWatch` in `starquake-memory` is requested by the GPU back thread, applied by the kernel at the next kernel entry on any core, and drained as a dirty log | gpu-protocol ("Approved specs this design leans on") |
 | kernel, "Address space" and port plan | Device-share lock and unlock over a range, and a range query of the GPU-accessible attribute that `svc 0x80` sets, callable by gsv | graphics-server ("What this spec needs from the kernel") |
 | kernel | A hook on events a service created, run after the kernel lock is released | graphics-server (decision 9) |
-| kernel, "Address space" (pool accounting) | GPU-only memory is never charged to the title's pools. Probably consistent with "what was actually reserved", but the kernel spec names memory the graphics server takes; confirm | graphics-server (decision 4) |
+| kernel, "Address space" (pool accounting) | GPU-only memory is never charged to the title's pools | graphics-server (decision 4) |
 | services, "The service manager" | Registry entries reachable only from other services (gsv's root for `am` 2000) | graphics-server ("The root") |
 | services, `Context` | The "narrow kernel interface" grows: the event hook, the address-space queries, the device-share lock, transfer memory | graphics-server |
 | observability, artifacts table | A `gpu.txt` flight-recorder artifact | gpu-protocol ("Observability") |
@@ -433,14 +470,14 @@ decisions do not change approved specs by themselves; rows touched by them are u
 | observability, "Later" | The GPU capture format and the recording backend now have specs (anticipated there, so an update, not a reversal) | gpu-protocol, render-backend |
 | observability, `ServiceNote` | New note kinds (`VsyncTick`, `FrameLatched`, and others). Within the existing event shape; listed only for completeness | graphics-server ("What is recorded") |
 | architecture.md, diagram and "How a frame flows" step 6 | Present goes gsv → gpu → render, not gsv → render | graphics-server, gpu-protocol, render-backend |
-| architecture.md and `CLAUDE.md` dependency rules | New leaf crate `starquake-layout`; `starquake-render` split into a trait crate plus `starquake-render-wgpu` (working name; later `-vulkan`, and `-metal` only if measured to be needed), chosen by `core`; possibly `starquake-sm86` | gpu-protocol decision 5; render-backend decision 10 (implied by decision 2's wording); shader-pipeline decision 14 (recommends not) |
+| architecture.md and `CLAUDE.md` dependency rules | New leaf crate `starquake-layout`; `starquake-render` split into a trait crate plus `starquake-render-wgpu` (working name; later `-vulkan`, and `-metal` only if measured to be needed), chosen by `core`; no `starquake-sm86` | gpu-protocol decision 5; render-backend decision 10; shader-pipeline decision 14 |
 | architecture.md, platform matrix | Every platform starts on wgpu (Metal on the Mac, nothing to install; Vulkan on Linux); direct Vulkan later, native Metal only if measured; copies, no aliasing, until a direct backend | Decision 1; render-backend decision 7 (moot for now) |
 | architecture.md, threads | The timer thread also drains gsv's completion queue; compile workers are shared by translation and pipeline builds (M16) | graphics-server, shader-pipeline |
-| `CLAUDE.md`, "Tests" | If render-backend decision 9 (reframed for wgpu) says yes: GPU tests required in Linux CI through wgpu on lavapipe, skipped locally with a notice when no adapter exists. The reverse of the hypervisor-test rule, so it needs its own line | render-backend decision 9 |
+| `CLAUDE.md`, "Tests" | GPU tests required in Linux CI through wgpu on lavapipe and skipped locally with a notice when no adapter exists, if the lavapipe experiment passes; until then local-only, like the hypervisor tests. The reverse of the hypervisor-test rule, so it needs its own line | render-backend decision 9 |
 
 ## 4. Work the drafts assume from elsewhere
 
-No draft's port slices own these. Suggested owners in the last column.
+No spec's port slices own these. Suggested owners in the last column.
 
 | Work | Assumed by | Suggested owner |
 |---|---|---|
@@ -453,7 +490,7 @@ No draft's port slices own these. Suggested owners in the last column.
 | Answering the shader pipeline: `EngineState`, `ProgramMemory`, building `VariantKey`, filling driver constants, calling `invalidate` | shader-pipeline ("What the GPU front/back protocol ... gets") | **Owned:** gpu G18 (widened), G16 for `invalidate` |
 | Mapping render's `EmulationFlags` into the shader `VariantKey` | M13 | **Owned:** gpu G18 |
 | The pipeline-key cache (guest state → `PipelineId`) and the list of keys to precompile next boot | render-backend ("Resources and who owns the caches") | **Owned:** gpu G23 |
-| A wake-up for the back thread on host completion | gpu-protocol G15 (M14) | Still open; render-backend R5 once settled |
+| A wake-up for the back thread on host completion | gpu-protocol G15 (M14) | Open (gpu-protocol verification 13, render-backend verification 10); render-backend R5 once settled |
 | The shared compile pool | M16 | **Owned:** render-backend R12 |
 | Shader answers in the GPU capture | shader-pipeline | **Owned:** gpu G20 |
 | The semaphore mirror page, once a trace settles row 35 | graphics-server, gpu-protocol | gpu G15 |
@@ -462,7 +499,8 @@ No draft's port slices own these. Suggested owners in the last column.
 
 ### A. Foundational: take these first
 
-All six were decided on 2026-11-12 ("Decided so far"). The text below is kept for the record.
+All six were decided on 2026-11-12 ("Decided", rulings 1–6). The text below is kept for the
+record.
 
 1. **Host API layer:** render-backend, decision 1 (decision 2, `ash`, follows it). It decides
    how many backends get written, what the Mac needs installed, whether swizzles become shader
@@ -485,9 +523,8 @@ All six were decided on 2026-11-12 ("Decided so far"). The text below is kept fo
 
 ### B. One question, asked in several drafts
 
-Status after the six decisions: B1, B3 and B4 are open; B2 is implied by decision 4's wording
-(the "emulated 60 Hz clock"), to be confirmed; B5 is settled in effect by decisions 1 and 2.
-Render-backend decision 10 in B4 is implied by decision 2's wording ("the wgpu backend crate").
+Status: B1, B3 and B4 were accepted as recommended (ruling 7); B2 is implied by ruling 4's
+wording (the "emulated 60 Hz clock"); B5 is implied by rulings 1 and 2.
 
 1. **A draw whose shader or pipeline is not ready:** gpu-protocol 9, shader-pipeline 6,
    render-backend 5, and the timing in shader-pipeline 7. All say wait by default (M10). Decide
@@ -505,9 +542,9 @@ Render-backend decision 10 in B4 is implied by decision 2's wording ("the wgpu b
 
 ### C. Coupled: choosing one forces or favours another
 
-Status after the six decisions: the first item (swizzles) is resolved by decision 1; render 9
-is reframed for wgpu; render 7 is moot until a direct backend; render 12 holds under decision 2
-(WGSL is wgpu's own language). The rest are open.
+Status: the first item (swizzles) is resolved by ruling 1; render 7 is moot until a direct
+backend; the ten coupled decisions were accepted as recommended (ruling 8); render 9 was ruled on
+its own (ruling 11); render 12 was accepted with the local items (ruling 7).
 
 - **render-backend 1 ↔ shader-pipeline 16:** wgpu (option e) puts swizzles into the variant key,
   against shader-pipeline 16's "types and structure only" (M11).
@@ -539,6 +576,9 @@ is reframed for wgpu; render 7 is moot until a direct backend; render 12 holds u
 
 ### D. Local: take per draft, or accept as recommended in bulk
 
+Status: accepted as recommended in bulk (ruling 7), except gpu-protocol 1 and shader-pipeline 1
+(rulings 9 and 10), graphics-server 10 (ruling 12) and render-backend 2 (deferred by ruling 1).
+
 - **graphics-server** 5 (registration maps at its own address), 6 (one server per family), 7 (log
   the bootstrap order first), 10 (no video decoding at first, then FFmpeg off by default), 11 (only
   the nvdrv ioctl subset).
@@ -551,29 +591,30 @@ is reframed for wgpu; render 7 is moot until a direct backend; render 12 holds u
 - **render-backend** 2 (`ash`: deferred by decision 1 until a direct Vulkan backend), 6 (ASTC to
   RGBA8 first), 11 (`--window` flag), 13 (GPUI frames decided later).
 
-## 6. What can start before approval
+## 6. What can start first
 
-Slices that depend on no open decision, no seam above and no other slice. All are pure and test
-offline:
+With the four specs approved and every decision taken, these slices depend on no other slice in
+the four specs. Their outside dependencies are already on `main` or are experiments, not
+slices. They are the first implementation wave:
 
-| Draft | Slice | Why it is free |
-|---|---|---|
-| gpu-protocol | G1: GP entry and method header decoding, push-buffer encoder | Bit fields from `clc76f.h`; no seam touches it |
-| gpu-protocol | G2: acquire predicates, release sizes, reductions | Pure tables; the disputed QMD bit-19 rule is in G12, not here |
-| gpu-protocol | G6: MME memo | Builds on the existing `gpu::mme` with the interpreter as oracle. gpu-protocol 11 (macro store per process) changes only when the memo is cleared |
+| Spec | Slice | What it builds | Outside dependency |
+|---|---|---|---|
+| graphics-server | 1 | Protocol facts and the gsv root: the command table, bootstrap, logged stubs, the private registry entry, `am` 2000 | Services slices 1–3 (on `main`) |
+| graphics-server | 2 | `Syncpoints` in `crates/gpu`: counters, comparisons, allocation, watched bitmap, `GpuCompletion` | None |
+| graphics-server | 6 | `GpuVm` in `crates/gpu`: ranges, targets, kinds, versioning | None |
+| gpu-protocol | G1 | `gpu::fifo`: GP entry and method header decoding, the push-buffer encoder | None |
+| gpu-protocol | G2 | `gpu::sema`: acquire predicates, release sizes, reductions | None |
+| gpu-protocol | G3 | Class tables generated from Mesa's headers (`cargo xtask gen-classes`) | None |
+| gpu-protocol | G4 | `gpu::ring`: the ring, entry encoding, text form, back-pressure | None |
+| gpu-protocol | G5 | `starquake-layout`: GOB kinds, block-linear layout, tile and untile | None |
+| gpu-protocol | G6 | MME memo | The existing `gpu::mme` |
+| gpu-protocol | G7 | `GpuMemory` trait and test implementation; `WriteWatch` type and fake in `starquake-memory` | None |
+| shader-pipeline | 1 | Walking skeleton: six instruction forms to a validated naga module, one agent alone | Experiment E1 first |
+| render-backend | R0 | `starquake-render` types, `Caps`, `Command`, the trait, validation | None |
 
-Free after one local decision, with no seam involved:
-
-- gpu-protocol **G3** (class-table generator), once gpu-protocol 6 and 7 are taken.
-- gpu-protocol **G5** (`starquake-layout`), once gpu-protocol 5 is taken. Its first test also
-  closes render-backend verification 5.
-
-Not free: every graphics-server slice (slices 2 and 6 no longer wait on a decision or seam,
-since decision 3 and M4–M5 are settled, but still on the draft's approval; the rest depend on
-slices 1, 2 or 3); every shader-pipeline slice (all depend on slice 1, which waits on decision 1
-and experiment E1); every render-backend slice (R0's seams M1, M3, M13 and M14 are now settled in
-the drafts, except the completion wake, but the draft is not approved, and every other slice
-depends on R0). Experiments need no approval and can run now: shader-pipeline E1–E3 (E1 now
-includes creating the modules on wgpu on a Mac), and render-backend verifications 1, 2 and 3
-(verification 1 is a few lines printing wgpu's adapter features and limits; nothing to
-install).
+graphics-server 2 and 6 and gpu-protocol G7 all add to `crates/gpu`, and G5 adds a crate, so
+their pull requests touch the workspace manifest and the crate's module list; land them one at
+a time. Every other slice depends on at least one of these. Experiments need no slice and can
+run now: shader-pipeline E1–E3 (E1 includes creating the modules on wgpu on a Mac), and
+render-backend verifications 1, 2 and 3 (verification 1 is a few lines printing wgpu's adapter
+features and limits; nothing to install).
