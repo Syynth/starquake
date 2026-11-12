@@ -1,6 +1,7 @@
 //! [`Reply`]: what a service method sends back.
 
 use starquake_kernel::id::ObjectId;
+use starquake_trace::ServiceId;
 
 use super::commands::Session;
 use super::payload::Writer;
@@ -12,6 +13,8 @@ pub(super) enum Moved {
     Object(ObjectId),
     /// A new interface: the caller gets a session handle, or in a domain an object id.
     Session(Box<dyn Session>),
+    /// A new session on another service's server: the caller gets a session handle.
+    Service(ServiceId),
 }
 
 /// The reply to a request: a raw payload, handles, and new interfaces.
@@ -19,7 +22,8 @@ pub(super) enum Moved {
 /// A method fills this in and returns [`Reply::ok`]. If it returns a
 /// [`Fault`](super::Fault) instead, the caller gets the fault's result code and nothing that was
 /// put here: the payload is not sent, no handle is added to the caller's table, and pushed
-/// interfaces are dropped.
+/// interfaces are dropped. The same goes for a method that returns [`Reply::deferred`]: the
+/// reply that is sent is the one its [`ReplyToken`](super::ReplyToken) is completed with.
 #[derive(Default)]
 pub struct Reply {
     payload: Writer,
@@ -53,9 +57,26 @@ impl Reply {
         self
     }
 
+    /// Returns a new session on another service to the caller, as a moved session handle placed
+    /// among the moved handles in the order of the calls (in a domain too: the session is on
+    /// another server, so it cannot be an object of this one's domain). The session is created
+    /// when the reply is sent ([`Kernel::connect`](super::Kernel::connect)), and its server
+    /// opens the service's root interface for it. This is how `sm:` hands out services.
+    pub fn push_service(&mut self, service: ServiceId) -> &mut Self {
+        self.moves.push(Moved::Service(service));
+        self
+    }
+
     /// The value a method returns once the reply is complete: success.
     pub fn ok(&self) -> Outcome {
         Ok(Completion::Done)
+    }
+
+    /// The value a method returns after taking a reply token
+    /// ([`Context::defer`](super::Context::defer)): the request is answered later, by the
+    /// token, and nothing put in this reply is sent.
+    pub fn deferred(&self) -> Outcome {
+        Ok(Completion::Deferred)
     }
 
     pub(super) fn into_parts(self) -> (Writer, Vec<ObjectId>, Vec<Moved>) {

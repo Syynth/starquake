@@ -330,7 +330,11 @@ impl<'a> Request<'a> {
 mod tests {
     use starquake_ipc::{BUFFER_SIZE, CommandType, RequestBuilder, SessionKind};
 
+    use std::sync::Arc;
+
+    use super::super::defer::{Deferral, Mailbox};
     use super::super::fake::FakeKernel;
+    use super::super::server::UnknownPolicy;
     use super::super::targets::Targets;
     use super::*;
     use crate::commands;
@@ -338,6 +342,7 @@ mod tests {
     const BASE: u64 = 0x4000;
 
     /// An interface that holds a number.
+    #[derive(serde::Serialize)]
     struct Probe(u32);
 
     commands! {
@@ -345,6 +350,7 @@ mod tests {
     }
 
     /// A different interface.
+    #[derive(serde::Serialize)]
     struct Other;
 
     commands! {
@@ -367,9 +373,18 @@ mod tests {
         let message = Message::parse_request(&buffer, SessionKind::Session).unwrap();
         let in_objects = vec![Some(probe), None, Some(other), Some(busy)];
         let request = Request::new(&kernel, Protocol::Cmif, 9, &[], &message, in_objects);
+        let mailbox = Arc::new(Mailbox::new(None));
+        let mut next_token = 0;
         let mut cx = Context {
             kernel: &mut kernel,
             targets: &mut targets,
+            family: None,
+            policy: UnknownPolicy::Strict,
+            deferral: Deferral {
+                mailbox: &mailbox,
+                next_token: &mut next_token,
+                taken: None,
+            },
         };
 
         assert_eq!(

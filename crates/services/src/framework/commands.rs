@@ -7,6 +7,7 @@ use super::context::Context;
 use super::reply::Reply;
 use super::request::Request;
 use super::result::Outcome;
+use super::snapshot::SnapshotError;
 
 /// Which protocol a request came in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -76,9 +77,26 @@ impl CommandTable {
 /// [`commands!`](crate::commands) implement this trait.
 ///
 /// `Send`, because a server's requests may be handled on any core thread (one at a time).
+///
+/// The struct is the session's whole state, and it is plain serialisable data: the macro
+/// implements [`Session::save`] with `serde`, so a struct that holds a host handle, a closure or
+/// a lock does not compile as a service (`docs/specs/observability.md`, "Snapshots": "each
+/// session keeps its state in a plain serialisable struct"). State that several sessions share
+/// belongs to the server ([`Server::with_family`](super::Server::with_family)).
 pub trait Session: Any + Send {
+    /// The interface's name: what [`Session::name`] returns for every value of the type. A
+    /// snapshot stores it to find the type again
+    /// ([`Interfaces::with`](super::Interfaces::with)).
+    fn interface() -> &'static str
+    where
+        Self: Sized;
+
     /// The interface's name in logs and traces.
     fn name(&self) -> &'static str;
+
+    /// The session's state as bytes, for a snapshot. [`Interfaces`](super::Interfaces) turns
+    /// them back into the session.
+    fn save(&self) -> Result<Vec<u8>, SnapshotError>;
 
     /// The ids and names of the commands [`Session::dispatch`] knows.
     fn commands(&self) -> &'static CommandTable;
@@ -110,6 +128,7 @@ pub trait Session: Any + Send {
 /// use starquake_services::commands;
 /// use starquake_services::framework::{Context, Outcome, Protocol, Reply, Request, Session};
 ///
+/// #[derive(serde::Serialize, serde::Deserialize)]
 /// struct Counter {
 ///     count: u32,
 /// }
@@ -151,12 +170,18 @@ pub trait Session: Any + Send {
 /// The macro generates the dispatch `match`, and the table of ids and names that logs and the
 /// auto-stub use. The interface's name is the type's name as written.
 ///
+/// The type must be `serde::Serialize`: the macro saves a session's state with it
+/// ([`Session::save`]). To restore a snapshot the type must be
+/// `serde::Deserialize` as well, and registered in the server's
+/// [`Interfaces`](crate::framework::Interfaces).
+///
 /// Listing an id twice in one block is a compile error (`E0080`: the table's check fails while
 /// the constant is evaluated). This compiles:
 ///
 /// ```
 /// # use starquake_services::commands;
 /// # use starquake_services::framework::{Context, Outcome, Reply, Request};
+/// # #[derive(serde::Serialize)]
 /// # struct Counter;
 /// # impl Counter {
 /// #     fn get(&mut self, _: &mut Context<'_>, _: &Request<'_>, reply: &mut Reply) -> Outcome {
@@ -179,6 +204,7 @@ pub trait Session: Any + Send {
 /// ```compile_fail,E0080
 /// # use starquake_services::commands;
 /// # use starquake_services::framework::{Context, Outcome, Reply, Request};
+/// # #[derive(serde::Serialize)]
 /// # struct Counter;
 /// # impl Counter {
 /// #     fn get(&mut self, _: &mut Context<'_>, _: &Request<'_>, reply: &mut Reply) -> Outcome {
@@ -204,8 +230,21 @@ macro_rules! commands {
         }
     ) => {
         impl $crate::framework::Session for $service {
+            fn interface() -> &'static str {
+                ::core::stringify!($service)
+            }
+
             fn name(&self) -> &'static str {
                 ::core::stringify!($service)
+            }
+
+            fn save(
+                &self,
+            ) -> ::core::result::Result<
+                ::std::vec::Vec<u8>,
+                $crate::framework::SnapshotError,
+            > {
+                $crate::framework::snapshot::encode(self)
             }
 
             fn commands(&self) -> &'static $crate::framework::CommandTable {

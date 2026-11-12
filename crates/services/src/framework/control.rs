@@ -49,7 +49,8 @@
 //!   a console does, where the clone holds the object and not the session's state; a console
 //!   trace would confirm it.
 
-use starquake_ipc::{CmifRequest, ReplyBuilder};
+use starquake_ipc::CmifRequest;
+use starquake_kernel::handle::Handle;
 use starquake_kernel::id::ObjectId;
 use starquake_kernel::result::ResultCode;
 
@@ -57,7 +58,7 @@ use super::commands::{Command, CommandTable, Protocol};
 use super::kernel::Kernel;
 use super::payload::Reader;
 use super::result::{DOMAIN_OBJECT_NOT_FOUND, TARGET_NOT_DOMAIN};
-use super::server::{Frame, Refusal, Server};
+use super::server::{Answer, Frame, Refusal, Server};
 use super::targets::TargetId;
 
 /// Control command 0: make the session a domain.
@@ -109,23 +110,24 @@ impl Server {
         session: ObjectId,
         target: TargetId,
         body: &CmifRequest<'_>,
-    ) -> Result<ReplyBuilder, Refusal> {
+    ) -> Result<Answer, Refusal> {
         let mut payload = Reader::new(body.data);
-        let reply = Frame::Cmif.reply(ResultCode::SUCCESS);
         match body.header.command_id {
             CONVERT_CURRENT_OBJECT_TO_DOMAIN => {
                 let object_id = self.convert_to_domain(session, target)?;
-                Ok(reply.data(&object_id.to_le_bytes()))
+                Ok(Frame::Cmif.with_payload(&object_id.to_le_bytes()))
             }
             COPY_FROM_CURRENT_DOMAIN => {
                 let object_id = payload.read_u32()?;
                 let object = self.domain_object(target, object_id)?;
-                Ok(reply.move_handle(self.open_shared(kernel, object)?.raw()))
+                Ok(moved(self.open_shared(kernel, object)?))
             }
             CLONE_CURRENT_OBJECT | CLONE_CURRENT_OBJECT_EX => {
-                Ok(reply.move_handle(self.open_shared(kernel, target)?.raw()))
+                Ok(moved(self.open_shared(kernel, target)?))
             }
-            QUERY_POINTER_BUFFER_SIZE => Ok(reply.data(&self.pointer_buffer_size.to_le_bytes())),
+            QUERY_POINTER_BUFFER_SIZE => {
+                Ok(Frame::Cmif.with_payload(&self.pointer_buffer_size.to_le_bytes()))
+            }
             id => Ok(self.unknown(CONTROL_INTERFACE, Protocol::Cmif, id, Frame::Cmif)),
         }
     }
@@ -138,4 +140,11 @@ impl Server {
         let object = self.targets.domain(target)?.get(object_id);
         Ok(object.ok_or(DOMAIN_OBJECT_NOT_FOUND)?)
     }
+}
+
+/// A successful control reply that moves one handle to the caller.
+fn moved(handle: Handle) -> Answer {
+    let mut answer = Frame::Cmif.only(ResultCode::SUCCESS);
+    answer.builder = answer.builder.move_handle(handle.raw());
+    answer
 }

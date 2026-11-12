@@ -37,6 +37,7 @@ use tracing::{Event, Level, Metadata, Subscriber};
 type Check<T = ()> = Result<T, Box<dyn Error>>;
 
 /// A service with one command.
+#[derive(serde::Serialize)]
 struct Echo;
 
 commands! {
