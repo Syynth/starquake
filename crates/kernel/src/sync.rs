@@ -116,7 +116,7 @@ pub mod wait;
 pub mod words;
 
 #[cfg(test)]
-mod testing;
+pub(crate) mod testing;
 #[cfg(test)]
 mod tests;
 
