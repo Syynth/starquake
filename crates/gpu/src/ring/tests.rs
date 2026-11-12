@@ -248,6 +248,52 @@ fn a_run_of_the_most_words_encodes_and_one_more_does_not() {
 }
 
 #[test]
+fn a_run_line_of_the_most_words_parses_and_one_more_does_not() {
+    // The text form accepts exactly what `encode` accepts.
+    let line = |count: usize| {
+        let words: Vec<String> = (0..count).map(|word| format!("{word:#x}")).collect();
+        format!(
+            "run channel=1 class=0x2 method=0x3 words={}",
+            words.join(",")
+        )
+    };
+    let parsed = parse_entry(&line(MAX_RUN_WORDS)).unwrap();
+    assert_eq!(
+        parsed,
+        RingEntry::Run {
+            channel: ChannelId(1),
+            class: ClassId(2),
+            method: 3,
+            words: Cow::Owned((0..).take(MAX_RUN_WORDS).collect()),
+        }
+    );
+    encode(&parsed, &mut Vec::new()).unwrap();
+    let error = parse_entry(&line(MAX_RUN_WORDS + 1)).unwrap_err();
+    assert_eq!(
+        error,
+        ParseError::RunTooLong {
+            words: MAX_RUN_WORDS + 1
+        }
+    );
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "a run of {} words is longer than the most one entry carries, {MAX_RUN_WORDS}",
+            MAX_RUN_WORDS + 1
+        )
+    );
+    // The count is checked before the words, so a bad word past the limit is not what is
+    // reported.
+    let bad_word = format!("{},zz", line(MAX_RUN_WORDS));
+    assert_eq!(
+        parse_entry(&bad_word),
+        Err(ParseError::RunTooLong {
+            words: MAX_RUN_WORDS + 1
+        })
+    );
+}
+
+#[test]
 fn an_empty_run_is_two_words() {
     let run = RingEntry::Run {
         channel: ChannelId(7),

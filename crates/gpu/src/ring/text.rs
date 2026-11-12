@@ -18,7 +18,8 @@
 //! [`RingEntry`]'s `Display` writes this form, with addresses, classes, methods, values, payloads,
 //! tokens and run words in hexadecimal and the rest in decimal; [`parse_entry`] reads it back and
 //! accepts every number in either base (`0x` marks hexadecimal). A run with no words is
-//! `words=`. Blank lines are skipped by [`parse_text`].
+//! `words=`, and a run of more than [`MAX_RUN_WORDS`] words is an error
+//! ([`ParseError::RunTooLong`]), as it is for [`super::encode()`]. Blank lines are skipped by [`parse_text`].
 
 use std::borrow::Cow;
 use std::fmt::{self, Write as _};
@@ -27,7 +28,7 @@ use std::str::SplitWhitespace;
 use starquake_render::command::Rect;
 use thiserror::Error;
 
-use super::encode::Kind;
+use super::encode::{Kind, MAX_RUN_WORDS};
 use super::entry::{
     CaptureCommand, ClassId, Invalidation, MarkerToken, Release, ReleaseOp, RingEntry, Subchannel,
 };
@@ -136,6 +137,12 @@ pub enum ParseError {
         key: &'static str,
         /// The text.
         value: String,
+    },
+    /// A run lists more than [`MAX_RUN_WORDS`] words, which [`super::encode()`] refuses too.
+    #[error("a run of {words} words is longer than the most one entry carries, {MAX_RUN_WORDS}")]
+    RunTooLong {
+        /// The number of words listed.
+        words: usize,
     },
     /// A number is too large for its field.
     #[error("{key} {value} is out of range")]
@@ -340,6 +347,20 @@ fn list<T: TryFrom<u64>>(key: &'static str, text: &str) -> Result<Vec<T>, ParseE
         .collect()
 }
 
+/// A run's `words` field: at most [`MAX_RUN_WORDS`] words, so that what parses also encodes. The
+/// count is checked before any word is read or stored.
+fn run_words(text: &str) -> Result<Vec<u32>, ParseError> {
+    let words = if text.is_empty() {
+        0
+    } else {
+        text.split(',').count()
+    };
+    if words > MAX_RUN_WORDS {
+        return Err(ParseError::RunTooLong { words });
+    }
+    list("words", text)
+}
+
 /// A release's `op` field.
 fn release_op(text: &str) -> Result<ReleaseOp, ParseError> {
     if text == "write" {
@@ -445,7 +466,7 @@ pub fn parse_entry(line: &str) -> Result<RingEntry<'static>, ParseError> {
             channel: ChannelId(fields.number("channel")?),
             class: ClassId(fields.number("class")?),
             method: fields.number("method")?,
-            words: Cow::Owned(list("words", fields.text("words")?)?),
+            words: Cow::Owned(run_words(fields.text("words")?)?),
         },
         Kind::Release => release(&mut fields)?,
         Kind::Syncpoint => {
