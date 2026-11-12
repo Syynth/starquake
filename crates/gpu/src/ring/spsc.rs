@@ -18,6 +18,19 @@
 //!   8 words after a drain and doubles it back.
 //! - A full producer spins, then sleeps until the consumer frees space; Eden-NX2's yields in a
 //!   loop.
+//! - The consumer hands space back after every entry: it stores the consumed position
+//!   (sequentially consistent) and checks whether the producer is waiting each time. Eden-NX2's
+//!   back stores it every 4,096 words within a batch and at the batch's end
+//!   (`read_position - last_store >= 4096` in `GpuSplit`'s back loop), and its front only polls
+//!   it. Handing space back sooner lets a full producer go on sooner; it costs one store and one
+//!   load per entry.
+//! - Both sides spin [`SPINS_BEFORE_SLEEP`] (4,096) times before they sleep. Eden-NX2's front
+//!   pauses 4,096 times in `WaitForSpace` before it yields, but its back spins 8,192 times
+//!   (`spins < 8192`) before it sleeps, so an idle consumer here goes to sleep after half the
+//!   spins.
+//! - A sleeping side looks again after at most 100 ms even if no wake-up came; Eden-NX2's back
+//!   sleeps on its wake counter with no time limit. The bound is only a safety net: the tests
+//!   make it far longer than their patience, so a lost wake-up fails them.
 //!
 //! The ring delivers entries in exactly the order they were pushed, which is ordering guarantees
 //! 1 and 2 of the spec (within a channel in method order; across channels in the order the front
@@ -51,13 +64,20 @@ pub const RING_WORDS: usize = 1 << 20;
 /// `PublishEvery`).
 pub const PUBLISH_EVERY: u64 = 256;
 
-/// Times either side polls before it sleeps (Eden-NX2's `WaitForSpace` pauses 4,096 times
-/// before yielding).
+/// Times either side polls before it sleeps. Eden-NX2's front (`WaitForSpace`) pauses 4,096
+/// times before yielding; its back spins 8,192 times before sleeping, twice this (a listed
+/// difference in the module docs).
 pub const SPINS_BEFORE_SLEEP: u32 = 4096;
 
 /// The longest one sleep of either side lasts before it looks again (it is woken sooner by a
 /// publish or a pop; this only bounds a sleep against a lost wake-up).
+#[cfg(not(test))]
 const LONGEST_SLEEP: Duration = Duration::from_millis(100);
+
+/// Under test, far longer than any test waits, so that a lost wake-up fails a bounded test
+/// instead of being rescued by the next look.
+#[cfg(test)]
+const LONGEST_SLEEP: Duration = Duration::from_secs(3600);
 
 /// A capacity the ring cannot have.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
@@ -190,6 +210,8 @@ pub fn ring(capacity: usize) -> Result<(Producer, Consumer), CapacityError> {
         read: 0,
         available: 0,
         scratch: Vec::new(),
+        #[cfg(test)]
+        between_looks: None,
     };
     Ok((producer, consumer))
 }
@@ -343,6 +365,10 @@ pub struct Consumer {
     /// The published position as last read.
     available: u64,
     scratch: Vec<u64>,
+    /// Runs in [`Consumer::try_pop`] between its first look for an entry and its look at whether
+    /// the producer is gone, so a test can drop the producer exactly there.
+    #[cfg(test)]
+    between_looks: Option<Box<dyn FnMut() + Send>>,
 }
 
 impl Consumer {
@@ -394,6 +420,10 @@ impl Consumer {
     pub fn try_pop(&mut self) -> Result<Option<RingEntry<'static>>, PopError> {
         if self.has_entry() {
             return self.take().map(Some);
+        }
+        #[cfg(test)]
+        if let Some(hook) = self.between_looks.as_mut() {
+            hook();
         }
         if self.shared.producer_gone.load(Ordering::SeqCst) {
             // The producer publishes everything before it goes: look once more.

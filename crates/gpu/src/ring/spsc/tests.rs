@@ -375,6 +375,79 @@ fn a_waiting_producer_wakes_when_the_consumer_goes() {
     );
 }
 
+#[test]
+fn a_lost_wake_up_is_not_rescued_by_the_poll_under_test() {
+    // The wake-up tests below rely on this: a side that misses its wake-up sleeps past
+    // `PATIENCE`, so the bounded wait fails.
+    assert!(LONGEST_SLEEP > PATIENCE * 10);
+}
+
+/// Waits, bounded by [`PATIENCE`], until `flag` is set.
+fn until_set(flag: impl Fn() -> bool) {
+    let deadline = std::time::Instant::now() + PATIENCE;
+    while !flag() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the other side never went to sleep"
+        );
+        thread::yield_now();
+    }
+}
+
+#[test]
+fn a_sleeping_consumer_wakes_on_a_publish() {
+    let (mut producer, mut consumer) = ring(8).unwrap();
+    let shared = Arc::clone(&consumer.shared);
+    let (popped, results) = mpsc::channel();
+    let reader = thread::spawn(move || {
+        let _ = popped.send(consumer.pop_timeout(PATIENCE * 100));
+        consumer
+    });
+    // The consumer has spun out and is asleep (or about to sleep, holding the lock), so only
+    // the publish's wake-up can end its wait before `PATIENCE`.
+    until_set(|| shared.consumer_waiting.load(Ordering::SeqCst));
+    producer.try_push(&write(1, 7)).unwrap();
+    producer.publish();
+    assert_eq!(results.recv_timeout(PATIENCE), Ok(Ok(Some(write(1, 7)))));
+    within(move || reader.join().is_ok());
+}
+
+#[test]
+fn a_sleeping_full_producer_wakes_on_a_pop() {
+    let (mut producer, mut consumer) = ring(8).unwrap();
+    for value in 0..4 {
+        producer.try_push(&write(1, value)).unwrap();
+    }
+    producer.publish();
+    let shared = Arc::clone(&producer.shared);
+    let (pushed, results) = mpsc::channel();
+    let writer = thread::spawn(move || {
+        let _ = pushed.send(producer.push(&write(1, 4)));
+        producer
+    });
+    // The producer has spun out and is asleep, so only the pop's wake-up can end its wait.
+    until_set(|| shared.producer_waiting.load(Ordering::SeqCst));
+    assert_eq!(consumer.try_pop(), Ok(Some(write(1, 0))));
+    assert_eq!(results.recv_timeout(PATIENCE), Ok(Ok(())));
+    let mut producer = within(move || writer.join().unwrap());
+    producer.publish();
+    for value in 1..5 {
+        assert_eq!(consumer.try_pop(), Ok(Some(write(1, value))));
+    }
+}
+
+#[test]
+fn an_entry_published_by_a_drop_between_the_two_looks_is_not_lost() {
+    // The producer drops (publishing its last entry) after `try_pop` found nothing and before it
+    // sees the producer gone: the second look must find the entry, not report a disconnect.
+    let (mut producer, mut consumer) = ring(8).unwrap();
+    producer.try_push(&write(1, 3)).unwrap();
+    let mut producer = Some(producer);
+    consumer.between_looks = Some(Box::new(move || drop(producer.take())));
+    assert_eq!(consumer.try_pop(), Ok(Some(write(1, 3))));
+    assert_eq!(consumer.try_pop(), Err(PopError::Disconnected));
+}
+
 /// A fixed-seed generator for the ordering test's schedule (a 64-bit LCG, Knuth's MMIX
 /// constants), so every run pushes the same stream.
 struct Schedule(u64);
