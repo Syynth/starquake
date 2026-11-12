@@ -52,6 +52,11 @@
 //!   and a request that cannot be answered at once ends the dispatch in [`Outcome::Waiting`],
 //!   recording nothing until the request ends. Its event, and the IPC events its handler made
 //!   before it, are recorded under the lock then, with the dispatch's one clock reading.
+//! - **Synchronisation** (events, `WaitSynchronization`, `CancelSynchronization`) has arms of
+//!   its own, in `dispatch/sync.rs`. A `WaitSynchronization` that waits ends in
+//!   [`Outcome::Waiting`] the way `SendSyncRequest` does, and its event is recorded when the
+//!   wait ends, by whichever dispatch (or [`Dispatcher::signal_event`],
+//!   [`Dispatcher::fire_timers`]) records the wake. `dispatch/sync.rs` says how.
 //! - **`ExitProcess`** ends the dispatch in [`Outcome::ProcessExited`] and the caller stops
 //!   running the guest. PROVISIONAL (walking skeleton, #74): there is no process or thread
 //!   table to update yet, so the call changes no kernel state. Kernel slice 8 (process creation,
@@ -71,8 +76,9 @@
 //!   implemented call that fails with a result the guest sees does write them, as zeros. That
 //!   matches Eden's wrapper only for a call whose body assigns no output before it fails: the
 //!   wrapper value-initialises the outputs and writes whatever the body left in them.
-//!   `GetThreadPriority`, the one arm with a second output today, is such a call. The docs of
-//!   `returning`, the function that writes them, name a call that is not. Test:
+//!   `GetThreadPriority` is such a call. The docs of `answering`, the function that writes
+//!   them, name a call that is not, `WaitSynchronization`, which writes its index with an error
+//!   result. Test:
 //!   `a_failing_call_writes_its_result_and_zeroes_its_other_outputs`.)
 //! - When the environment's clock fails (a replay that doesn't match its recording), the call
 //!   does not run and writes nothing, and the dispatch ends in [`Outcome::EnvFailed`]: there is
@@ -191,7 +197,9 @@ use std::time::Duration;
 
 use starquake_cpu::GuestRegs;
 use starquake_memory::GuestMemory;
-use starquake_trace::{Env, EnvError, EventKind, GuestTicks, Recorder, SVC_ARG_COUNT, ThreadId};
+use starquake_trace::{
+    Env, EnvError, EventKind, GuestTicks, HostNanos, Recorder, SVC_ARG_COUNT, ThreadId,
+};
 
 use crate::handle::{Handle, HandleTable};
 use crate::id::{ObjectId, ServerId};
@@ -205,10 +213,12 @@ use crate::svc::{
 use crate::tables::{AddressSpace, Processes, Scheduler};
 
 mod ipc;
+mod sync;
 #[cfg(test)]
 mod tests;
 
 pub use ipc::{IpcContext, Woken};
+pub use sync::WakeError;
 
 /// The register that carries a call's result (Eden's wrappers: `SetArg64(args, 0, ret)`).
 const RESULT_REGISTER: usize = 0;
@@ -459,10 +469,13 @@ pub enum Outcome {
     /// `ExitProcess` ran: the calling process is over, and the caller must not resume the guest
     /// thread. No register was written.
     ProcessExited,
-    /// `SendSyncRequest` left the calling thread waiting for its reply: its request waits
-    /// behind another, or its server deferred it. No register was written and no event
-    /// recorded; both happen when the request ends, and the thread is then reported by
-    /// [`Dispatcher::take_woken`]. The caller must not resume the thread until then.
+    /// The calling thread waits: a `SendSyncRequest` whose request waits behind another or was
+    /// deferred, or a `WaitSynchronization` that nothing has ended yet. No register was written
+    /// and no event recorded; both happen when the wait ends, and the thread is then reported
+    /// by [`Dispatcher::take_woken`]. The caller must not resume the thread until then. After a
+    /// `WaitSynchronization` the caller's registers are already saved as its thread's context,
+    /// where the wake writes its result: the core loop must not save over them
+    /// (`dispatch/sync.rs`).
     Waiting,
 }
 
@@ -497,6 +510,15 @@ struct State {
     parked: BTreeMap<ServerId, Vec<ObjectId>>,
 }
 
+/// One reading of the environment's clock, as host nanoseconds and as the process's guest ticks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Now {
+    /// The reading itself: what timeouts are measured on.
+    host: HostNanos,
+    /// The reading in guest ticks: what events are stamped with.
+    guest: GuestTicks,
+}
+
 /// The locked tables, as a call that declared `B` may see them.
 struct Locked<'d, B> {
     state: MutexGuard<'d, State>,
@@ -509,10 +531,17 @@ impl<B: TableSet> Locked<'_, B> {
         B::split(&mut self.state.tables)
     }
 
+    /// One reading of the environment's clock, and the guest time it is at the process's
+    /// counter rate.
+    fn clock(&self, env: &dyn Env) -> Result<Now, EnvError> {
+        let host = env.now()?;
+        let guest = self.state.tables.processes.counter_rate().ticks_at(host);
+        Ok(Now { host, guest })
+    }
+
     /// Guest time at a reading of the environment's clock, at the process's counter rate.
     fn guest_time(&self, env: &dyn Env) -> Result<GuestTicks, EnvError> {
-        let now = env.now()?;
-        Ok(self.state.tables.processes.counter_rate().ticks_at(now))
+        self.clock(env).map(|now| now.guest)
     }
 }
 
@@ -655,17 +684,30 @@ impl Dispatcher {
         call: &mut Call<'_, '_>,
         body: impl for<'a> FnOnce(B::Borrowed<'a>, &mut Call<'_, '_>, GuestTicks) -> Outcome,
     ) -> Outcome {
+        self.call_at::<B>(call, |tables, call, now| body(tables, call, now.guest))
+    }
+
+    /// [`Dispatcher::call`], handing `body` the clock reading in both units. Waits that ended
+    /// since the last dispatch are recorded first, and the waits this one ended last
+    /// (`dispatch/sync.rs`).
+    fn call_at<B: TableSet>(
+        &self,
+        call: &mut Call<'_, '_>,
+        body: impl for<'a> FnOnce(B::Borrowed<'a>, &mut Call<'_, '_>, Now) -> Outcome,
+    ) -> Outcome {
         let mut locked = self.lock::<B>();
         // Read under the lock, so the environment's recording is in the kernel's order.
-        let time = match locked.guest_time(call.caller.env) {
-            Ok(time) => time,
+        let now = match locked.clock(call.caller.env) {
+            Ok(now) => now,
             Err(error) => {
                 tracing::error!(number = call.number, %error, "environment failed");
                 return Outcome::EnvFailed(error);
             }
         };
-        let outcome = body(locked.tables(), call, time);
-        record_point(call, time, &outcome);
+        sync::drain_wakes(&mut locked.state, call.caller.recorder, now.guest);
+        let outcome = body(locked.tables(), call, now);
+        record_point(call, now.guest, &outcome);
+        sync::drain_wakes(&mut locked.state, call.caller.recorder, now.guest);
         drop(locked);
         outcome
     }
@@ -751,6 +793,12 @@ impl Dispatcher {
                 }
                 outcome
             }
+            SvcId::SignalEvent
+            | SvcId::ClearEvent
+            | SvcId::ResetSignal
+            | SvcId::WaitSynchronization
+            | SvcId::CancelSynchronization
+            | SvcId::CreateEvent => self.synchronization(call, id, convention),
             SvcId::ConnectToNamedPort => self.connect_to_named_port(call, id, convention),
             SvcId::SendSyncRequest => self.send_sync_request(call, id, convention),
             SvcId::GetSystemTick => self.call::<()>(call, |(), call, time| {
@@ -915,36 +963,64 @@ fn word(argument: u64) -> CallResult<u32> {
 /// zeroes its other outputs. Eden's wrapper value-initialises its outputs
 /// (`int32_t out_priority{};`), runs the call, and writes whatever the call left in them
 /// (`SvcWrap_GetThreadPriority64` in `eden/src/core/hle/kernel/svc.cpp` @ cf654052). The two
-/// agree only for a call whose body assigns no output before it fails. That holds for
-/// `GetThreadPriority`, the only arm with a second output today: its one failure,
-/// `ResultInvalidHandle`, comes before `*out_priority` is assigned
-/// (`eden/src/core/hle/kernel/svc/svc_thread.cpp` @ cf654052, `GetThreadPriority`).
-///
-/// It does not hold for every call, and this function cannot express the ones it fails for: a
-/// `body` returns either its outputs or an error, never both. The counter-example is
-/// `KSynchronizationObject::Wait` (`eden/src/core/hle/kernel/k_synchronization_object.cpp` @
-/// cf654052). When the thread did begin to wait (`thread->BeginWait`), it clears the thread's
-/// synced index to `-1` first, and afterwards sets `*out_index = thread->GetSyncedIndex()` and
-/// returns the wait's result. A wait ended by its timer or by a cancel, not by an object, so
-/// returns `ResultTimedOut` or `ResultCancelled` with `*out_index` at `-1`, and
-/// `SvcWrap_WaitSynchronization64` (`svc.cpp`) writes that index to `x1`. (Its earlier exits, a
-/// zero timeout and a cancel already pending, return the same two results without assigning
-/// `*out_index`, which the wrapper then writes as zero.) A call like that (kernel slice 4,
-/// events and `WaitSynchronization`) needs a way to return outputs together with an error
-/// before it gets an arm; routing it through here as it stands would zero `x1` where Eden
-/// writes `-1`.
+/// agree only for a call whose body assigns no output before it fails, as for
+/// `GetThreadPriority`: its one failure, `ResultInvalidHandle`, comes before `*out_priority` is
+/// assigned (`eden/src/core/hle/kernel/svc/svc_thread.cpp` @ cf654052, `GetThreadPriority`). A
+/// call that assigns an output and then fails goes through [`answering`] instead.
 fn returning<const I: usize, const O: usize>(
     id: SvcId,
     convention: &Convention,
     regs: &mut GuestRegs,
     body: impl FnOnce([u64; I]) -> CallResult<[u64; O]>,
 ) -> Outcome {
+    answering(id, convention, regs, |inputs| {
+        body(inputs).map(|outputs| Answer::Now {
+            result: ResultCode::SUCCESS,
+            outputs,
+        })
+    })
+}
+
+/// How a call run by [`answering`] ends.
+enum Answer<const O: usize> {
+    /// It returns now: `result` in `x0` and `outputs` after it. An error result may come with
+    /// outputs: the "error with outputs" form.
+    Now {
+        /// The result.
+        result: ResultCode,
+        /// The other outputs, in the convention's order.
+        outputs: [u64; O],
+    },
+    /// The calling thread waits; nothing is written ([`Outcome::Waiting`]).
+    Later,
+}
+
+/// Runs an implemented call that returns a `Result` first and may return other outputs
+/// together with an error: decodes its `I` inputs, runs `body`, and writes what its [`Answer`]
+/// says. A [`SvcError::Kernel`] from `body` writes that result and zeroes the other outputs, as
+/// [`returning`] does.
+///
+/// The call that needs it is `WaitSynchronization`. `KSynchronizationObject::Wait`
+/// (`eden/src/core/hle/kernel/k_synchronization_object.cpp` @ cf654052), when the thread did
+/// begin to wait, clears its synced index to `-1` first, and afterwards sets
+/// `*out_index = thread->GetSyncedIndex()` and returns the wait's result. A wait ended by its
+/// timer or by a cancel, not by an object, so returns `ResultTimedOut` or `ResultCancelled`
+/// with `*out_index` at `-1`, and `SvcWrap_WaitSynchronization64` (`svc.cpp`) writes that index
+/// to `x1`. (Its earlier exits, a zero timeout and a cancel already pending, return the same
+/// two results without assigning `*out_index`, which the wrapper then writes as zero.)
+fn answering<const I: usize, const O: usize>(
+    id: SvcId,
+    convention: &Convention,
+    regs: &mut GuestRegs,
+    body: impl FnOnce([u64; I]) -> CallResult<Answer<O>>,
+) -> Outcome {
     let inputs = match convention.read::<I>(regs) {
         Ok(inputs) => inputs,
         Err(error) => return mismatch(id, error, regs),
     };
     let (code, outputs) = match body(inputs) {
-        Ok(outputs) => (ResultCode::SUCCESS, outputs),
+        Ok(Answer::Now { result, outputs }) => (result, outputs),
+        Ok(Answer::Later) => return Outcome::Waiting,
         Err(SvcError::Kernel(error)) => (error.code(), [0; O]),
         Err(SvcError::Internal(what)) => return fault(id, &what, regs),
     };

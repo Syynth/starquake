@@ -27,6 +27,7 @@ use crate::id::ThreadId;
 use crate::ipc::Ipc;
 use crate::object::Objects;
 use crate::result::KernelError;
+use crate::sync::SyncTable;
 
 /// One core's scheduling state: the scheduler's `SchedulingState` and current thread
 /// (`k_scheduler.h`).
@@ -59,6 +60,9 @@ pub struct Scheduler {
     objects: Objects,
     /// Servers, sessions and named ports (kernel spec: sessions live in this table).
     ipc: Ipc,
+    /// Wait lists, wait records and timers (kernel spec: wait lists and timers live in this
+    /// table; see [`crate::sync`]).
+    sync: SyncTable,
     threads: Threads,
     queue: PriorityQueue,
     cores: Vec<CoreState>,
@@ -80,6 +84,7 @@ impl Scheduler {
         Self {
             objects: Objects::new(),
             ipc: Ipc::new(),
+            sync: SyncTable::default(),
             threads: Threads::new(),
             queue: PriorityQueue::new(core_count),
             cores: vec![CoreState::new(); usize::from(core_count)],
@@ -154,6 +159,16 @@ impl Scheduler {
     /// session is an object, and a request holds references).
     pub fn ipc_mut(&mut self) -> (&mut Objects, &mut Ipc) {
         (&mut self.objects, &mut self.ipc)
+    }
+
+    /// The synchronisation rows, for [`crate::sync`]'s operations on this table.
+    pub(crate) fn sync_table(&self) -> &SyncTable {
+        &self.sync
+    }
+
+    /// The synchronisation rows, to change, for [`crate::sync`]'s operations on this table.
+    pub(crate) fn sync_table_mut(&mut self) -> &mut SyncTable {
+        &mut self.sync
     }
 
     /// The thread `id` names.

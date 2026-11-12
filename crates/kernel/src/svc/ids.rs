@@ -117,15 +117,15 @@ svc_ids! {
     GetThreadCoreMask = 0x0e, Planned;
     SetThreadCoreMask = 0x0f, Planned;
     GetCurrentProcessorNumber = 0x10, Implemented;
-    SignalEvent = 0x11, Planned;
-    ClearEvent = 0x12, Planned;
+    SignalEvent = 0x11, Implemented;
+    ClearEvent = 0x12, Implemented;
     MapSharedMemory = 0x13, Planned;
     UnmapSharedMemory = 0x14, Planned;
     CreateTransferMemory = 0x15, Planned;
     CloseHandle = 0x16, Implemented;
-    ResetSignal = 0x17, Planned;
-    WaitSynchronization = 0x18, Planned;
-    CancelSynchronization = 0x19, Planned;
+    ResetSignal = 0x17, Implemented;
+    WaitSynchronization = 0x18, Implemented;
+    CancelSynchronization = 0x19, Implemented;
     ArbitrateLock = 0x1a, Planned;
     ArbitrateUnlock = 0x1b, Planned;
     WaitProcessWideKeyAtomic = 0x1c, Planned;
@@ -165,7 +165,7 @@ svc_ids! {
     ReplyAndReceiveLight = 0x42, Deferred;
     ReplyAndReceive = 0x43, Deferred;
     ReplyAndReceiveWithUserBuffer = 0x44, Deferred;
-    CreateEvent = 0x45, Deferred;
+    CreateEvent = 0x45, Implemented;
     MapIoRegion = 0x46, NotPlanned;
     UnmapIoRegion = 0x47, NotPlanned;
     MapPhysicalMemoryUnsafe = 0x48, Deferred;
@@ -310,12 +310,19 @@ mod tests {
                 | SvcId::ExitProcess
                 | SvcId::GetThreadPriority
                 | SvcId::GetCurrentProcessorNumber
+                | SvcId::SignalEvent
+                | SvcId::ClearEvent
                 | SvcId::CloseHandle
+                | SvcId::ResetSignal
+                | SvcId::WaitSynchronization
+                | SvcId::CancelSynchronization
                 | SvcId::GetSystemTick
                 | SvcId::ConnectToNamedPort
                 | SvcId::SendSyncRequest
                 | SvcId::OutputDebugString
-                | SvcId::GetInfo => Status::Implemented,
+                | SvcId::GetInfo
+                // Not a retail call, but the kernel spec builds events (kernel slice 4).
+                | SvcId::CreateEvent => Status::Implemented,
                 _ if hardware_facing(id.name()) => Status::NotPlanned,
                 // Light sessions are in the spec's deferred column.
                 SvcId::SendSyncRequestLight => Status::Deferred,

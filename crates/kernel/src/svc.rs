@@ -12,10 +12,16 @@
 //! | `QueryMemory` (0x06) | [`memory::query_memory`] | the address space, shared, and guest memory |
 //! | `GetThreadPriority` (0x0c) | [`thread::get_thread_priority`] | the scheduler and the handle table, both shared |
 //! | `GetCurrentProcessorNumber` (0x10) | [`processor::get_current_processor_number`] | the calling core |
+//! | `SignalEvent` (0x11) | [`event::signal_event`] | the handle table, shared, and the scheduler |
+//! | `ClearEvent` (0x12) | [`event::clear_event`] | the handle table, shared, and the scheduler |
 //! | `CloseHandle` (0x16) | [`handle::close_handle`] | the handle table and the scheduler, both exclusive |
+//! | `ResetSignal` (0x17) | [`event::reset_signal`] | the handle table, shared, and the scheduler |
+//! | `WaitSynchronization` (0x18) | [`sync::wait_synchronization`] | the handle table and the address space, shared, the scheduler, guest memory, and the dispatch's clock reading |
+//! | `CancelSynchronization` (0x19) | [`sync::cancel_synchronization`] | the handle table, shared, the scheduler and the calling core |
 //! | `GetSystemTick` (0x1e) | [`tick::get_system_tick`] | the dispatch's guest time |
 //! | `OutputDebugString` (0x27) | [`debug::output_debug_string`] | guest memory, a [`DebugSink`] and the dispatch's guest time |
 //! | `GetInfo` (0x29) | [`info::get_info`] | the handle table, the address space and the scheduler, all shared |
+//! | `CreateEvent` (0x45) | [`event::create_event`] | the handle table and the scheduler, both exclusive |
 //!
 //! Only the [dispatcher](crate::dispatch) calls them, decoding their arguments with the call's
 //! [`Convention`]. No system call reads the clock: the dispatcher reads it once per dispatch and
@@ -27,14 +33,18 @@
 
 mod convention;
 pub mod debug;
+pub mod event;
 pub mod handle;
 mod ids;
 pub mod info;
 pub mod memory;
 pub mod processor;
+pub mod sync;
 pub mod thread;
 pub mod tick;
 
-pub use convention::{Arg, CONVENTIONS, Convention, ConventionError, Kind, is_retail};
+pub use convention::{
+    Arg, BEYOND_RETAIL, CONVENTIONS, Convention, ConventionError, Kind, is_retail,
+};
 pub use debug::DebugSink;
 pub use ids::{Status, SvcId};

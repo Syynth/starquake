@@ -1,7 +1,8 @@
 //! HLE Horizon kernel.
 //!
 //! Guest threads and their scheduling onto vCPUs, SVC dispatch, handles and kernel objects,
-//! synchronisation (`WaitForAddress`/`SignalToAddress` are hot: ~1,400 per frame), a process's
+//! synchronisation (events and `WaitSynchronization`, [`sync`]; `WaitForAddress`/`SignalToAddress`,
+//! still to come, are hot: ~1,400 per frame), a process's
 //! address space ([`memory`]), sessions and named ports ([`ipc`]), and `svcGetInfo` (its memory
 //! ids so far; the Switch 2 ids 29-33 are to come).
 //!
@@ -18,5 +19,6 @@ pub mod result;
 pub mod sched;
 pub mod slab;
 pub mod svc;
+pub mod sync;
 pub mod tables;
 pub mod time;
