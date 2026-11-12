@@ -412,6 +412,34 @@ impl PriorityQueue {
         self.suggested.front(core)
     }
 
+    /// `GetScheduledFront(core, priority)`: the head of one level of a core's scheduled lists.
+    pub(super) fn scheduled_front_at(
+        &self,
+        core: CoreId,
+        priority: Priority,
+    ) -> Result<Option<ThreadId>, SchedError> {
+        self.scheduled.front_at(priority, core)
+    }
+
+    /// `GetSuggestedFront(core, priority)`: the head of one level of a core's suggested lists.
+    pub(super) fn suggested_front_at(
+        &self,
+        core: CoreId,
+        priority: Priority,
+    ) -> Result<Option<ThreadId>, SchedError> {
+        self.suggested.front_at(priority, core)
+    }
+
+    /// `GetSamePriorityNext(core, member)`: the member's successor in the one list it is on for
+    /// `core` (scheduled or suggested), without moving to another level.
+    pub(super) fn same_priority_next(
+        threads: &Threads,
+        core: CoreId,
+        member: ThreadId,
+    ) -> Result<Option<ThreadId>, SchedError> {
+        Ok(link(threads, member, core)?.next)
+    }
+
     /// `GetScheduledNext(core, member)`.
     pub(super) fn scheduled_next(
         &self,

@@ -46,7 +46,6 @@
 //!   the thread is no longer running on a core it may not use, or stops running): the system
 //!   call layer, using [`Scheduler::running_on`], once the core loop (slice 10) and the wait
 //!   path (slice 4) exist; `SetThreadCoreMask` leaves a marked seam (`crate::svc::thread`).
-//! - `RotateScheduledQueue` (time slicing): slice 10.
 //!
 //! Kernel slice 8 added the thread and process lifecycle (`scheduler/lifecycle.rs`): user
 //! threads with an owner process, a guest thread id and a thread-local region; starting,
@@ -93,7 +92,10 @@ use thiserror::Error;
 pub use cores::{
     APPLICATION_CORE_COUNT, AffinityMask, CoreId, CoreIdOutOfRange, CoreSignals, MAX_CORES,
 };
-pub use scheduler::{FIRST_THREAD_ID, Scheduler, ThreadExit, UserThread};
+pub use scheduler::{
+    FIRST_THREAD_ID, PREEMPTION_INTERVAL_NS, PREEMPTION_PRIORITIES, Scheduler, ThreadExit,
+    UserThread,
+};
 pub use thread::{
     HIGHEST_THREAD_PRIORITY, LOWEST_THREAD_PRIORITY, PRIORITY_COUNT, Priority, SuspendType, Thread,
     ThreadState,

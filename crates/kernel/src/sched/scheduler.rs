@@ -1004,7 +1004,171 @@ impl Scheduler {
         }
         Ok(())
     }
+
+    // ---------------------------------------------------------------------------------------
+    // Time slicing (k_scheduler.cpp, global_scheduler_context.cpp)
+    // ---------------------------------------------------------------------------------------
+
+    /// `KScheduler::RotateScheduledQueue(core, priority)`: the front of `core`'s scheduled list
+    /// at `priority` goes to the back of that list; then a suggested thread of the same
+    /// priority that does not top its own core may migrate to the front of `core`'s queue
+    /// (unless the thread the rotation brought to the front has waited longer); then, if the
+    /// best thread `core` could switch to is no more urgent than `priority`, a more urgent
+    /// suggested thread may migrate in. The cores' threads are worked out again at the next
+    /// [`Scheduler::update`].
+    ///
+    /// `caller` is the core making the change, whose current thread Eden's
+    /// `GetCurrentThreadPointer` names in the last step; the timer thread is no core (`None`),
+    /// as Eden's preemption callback runs on its core-timing host thread, not a guest thread.
+    pub fn rotate_scheduled_queue(
+        &mut self,
+        caller: Option<CoreId>,
+        core: CoreId,
+        priority: Priority,
+    ) -> Result<(), SchedError> {
+        self.core(core)?;
+        // Rotate the front of the queue to the end.
+        let top = self.queue.scheduled_front_at(core, priority)?;
+        let mut next = None;
+        if let Some(top) = top {
+            next = self
+                .queue
+                .move_to_scheduled_back(&mut self.threads, top, core)?;
+            if next != Some(top) {
+                self.count_scheduled(top)?;
+                if let Some(next) = next {
+                    self.count_scheduled(next)?;
+                }
+            }
+        }
+
+        // While there is a suggested thread at this priority, try to migrate it.
+        let mut suggested = self.queue.suggested_front_at(core, priority)?;
+        let mut walk = Walk::new(&self.threads);
+        while let Some(candidate) = suggested {
+            walk.step()?;
+            let suggested_core = self.active_core_of(candidate)?;
+            let top_on_its_core = match suggested_core {
+                Some(c) => self.queue.scheduled_front(c)?,
+                None => None,
+            };
+            if top_on_its_core != Some(candidate) {
+                // A thread the rotation brought to the front that has waited longer than the
+                // suggestion is preferred to it.
+                if top != next
+                    && let Some(next) = next
+                    && self.thread(next)?.last_scheduled_tick
+                        < self.thread(candidate)?.last_scheduled_tick
+                {
+                    break;
+                }
+                if self.migration_allowed_from(top_on_its_core)? {
+                    // Unlike the migrations of `update`, this one goes to the front.
+                    self.migrate(candidate, suggested_core, Some(core), true)?;
+                    self.count_scheduled(candidate)?;
+                    break;
+                }
+            }
+            suggested = PriorityQueue::same_priority_next(&self.threads, core, candidate)?;
+        }
+
+        // With a thread of the same priority perhaps migrated, see whether a better one can be.
+        let current = match caller {
+            Some(caller) => self.core(caller)?.current,
+            None => None,
+        };
+        let mut best = self.queue.scheduled_front(core)?;
+        if let Some(front) = best
+            && Some(front) == current
+        {
+            best = self.queue.scheduled_next(&self.threads, core, front)?;
+        }
+        if let Some(best) = best {
+            let best_priority = self.priority_of(best)?;
+            if best_priority >= priority {
+                let mut suggested = self.queue.suggested_front(core)?;
+                let mut walk = Walk::new(&self.threads);
+                while let Some(candidate) = suggested {
+                    walk.step()?;
+                    // A suggestion no more urgent than the best thread is not worth moving.
+                    if self.priority_of(candidate)? >= best_priority {
+                        break;
+                    }
+                    let suggested_core = self.active_core_of(candidate)?;
+                    let top_on_its_core = match suggested_core {
+                        Some(c) => self.queue.scheduled_front(c)?,
+                        None => None,
+                    };
+                    if top_on_its_core != Some(candidate)
+                        && self.migration_allowed_from(top_on_its_core)?
+                    {
+                        self.migrate(candidate, suggested_core, Some(core), true)?;
+                        self.count_scheduled(candidate)?;
+                        break;
+                    }
+                    suggested = self
+                        .queue
+                        .suggested_next(&self.threads, core, candidate)?;
+                }
+            }
+        }
+
+        // After a rotation, the cores' threads must be worked out again.
+        self.update_needed = true;
+        Ok(())
+    }
+
+    /// Whether a thread may migrate away from a core whose top thread is `top`: Eden's
+    /// `top_on_suggested_core == nullptr || top_on_suggested_core->GetPriority() >=
+    /// HighestCoreMigrationAllowedPriority`.
+    fn migration_allowed_from(&self, top: Option<ThreadId>) -> Result<bool, SchedError> {
+        Ok(match top {
+            None => true,
+            Some(top) => self.priority_of(top)? >= HIGHEST_CORE_MIGRATION_ALLOWED_PRIORITY,
+        })
+    }
+
+    /// `GlobalSchedulerContext::PreemptThreads`: rotates each core's scheduled queue at its
+    /// preemption priority ([`PREEMPTION_PRIORITIES`]), as the timer thread does every
+    /// [`PREEMPTION_INTERVAL_NS`], with no calling core. A core beyond the table (a scheduler
+    /// configured with more than [`APPLICATION_CORE_COUNT`] cores) is not rotated; Eden has
+    /// exactly that many.
+    pub fn preempt_threads(&mut self) -> Result<(), SchedError> {
+        for (core, priority) in self.all_cores().zip(PREEMPTION_PRIORITIES) {
+            self.rotate_scheduled_queue(None, core, priority)?;
+        }
+        Ok(())
+    }
 }
+
+/// A priority from a constant known to be in range, for the tables below. A `const` can't
+/// unwrap, so an out-of-range value (none is given) would fall back to the lowest priority.
+const fn preemption_priority(value: u8) -> Priority {
+    match Priority::new(value) {
+        Some(priority) => priority,
+        None => Priority::LOWEST,
+    }
+}
+
+/// The priority at which each core's scheduled queue is rotated every
+/// [`PREEMPTION_INTERVAL_NS`], core 0 first: Eden PR #4588's six-core table
+/// (`eden-pr4588/src/core/hle/kernel/global_scheduler_context.cpp` @ e5fb3b97,
+/// `GlobalSchedulerContext::PreemptThreads`, `per_core{59, 59, 59, 63, 59, 59}`; Eden's own
+/// four-core table is `{59, 59, 59, 63}`). The environment switch that table's experiment reads
+/// (`EDEN_PREEMPT_ALL`) is not ported.
+pub const PREEMPTION_PRIORITIES: [Priority; 6] = [
+    preemption_priority(59),
+    preemption_priority(59),
+    preemption_priority(59),
+    preemption_priority(63),
+    preemption_priority(59),
+    preemption_priority(59),
+];
+
+/// How often the threads are preempted, in nanoseconds: Eden's looping preemption event,
+/// `std::chrono::milliseconds(10)` (`eden/src/core/hle/kernel/kernel.cpp` @ cf654052,
+/// `InitializePreemption`).
+pub const PREEMPTION_INTERVAL_NS: u64 = 10_000_000;
 
 #[cfg(test)]
 mod tests;
