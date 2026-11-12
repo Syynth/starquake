@@ -1195,11 +1195,23 @@ mod trace {
                     )
                 }
             );
-            // A wrong command name stops it at that line too.
-            let mut lines = matching();
-            lines[19] = ipc(SM, 0);
-            lines[29] = ipc(SET_SYS, 3);
-            assert_eq!(progress(&HELLO, &lines, &anchors()).matched, all);
+            // A command the reference names differently from starquake's table stops it at that
+            // line too, though the line's text matches.
+            let renamed = Fixture {
+                nro: HELLO.nro,
+                reference: "ipc sm:::0 (Initialize)\nipc sm:::1 (Initialize)\n",
+            };
+            assert_eq!(
+                progress(&renamed, &[ipc(SM, 0), ipc(SM, 1)], &anchors()),
+                Progress {
+                    matched: 1,
+                    difference: Some(
+                        "line 1: the reference calls command 1 Initialize, starquake \
+                         Some(\"GetService\")"
+                            .to_owned()
+                    )
+                }
+            );
             // A run that goes on matches every line and still differs.
             let mut lines = matching();
             lines.push(ipc(SM, 0));
@@ -1335,6 +1347,37 @@ mod trace {
             );
             let found = compare(&PLACED, &placed(BASE, second), &anchors()).unwrap_err();
             assert!(found.ends_with("address=main+0x0) -> 0x0`"), "{found}");
+            // The second placement's map at the first byte of a region whose page below is in
+            // the ASLR region alone: its anchor would be placeable, the map is not.
+            let (first, _) = free_pages();
+            let regions = anchors().regions;
+            let (name, start) = [
+                ("stack_region", regions.stack.start),
+                ("alias_region", regions.alias.start),
+                ("heap_region", regions.heap.start),
+            ]
+            .into_iter()
+            .find(|(_, start)| {
+                anchors()
+                    .symbol(start - PAGE_SIZE)
+                    .unwrap()
+                    .starts_with("aslr_region+")
+            })
+            .expect("a region with the ASLR region alone below it");
+            let mut lines = placed(first, second);
+            let Line::Svc { args, .. } = &mut lines[2] else {
+                unreachable!()
+            };
+            args[1] = start;
+            assert_eq!(
+                compare(&PLACED, &lines, &anchors()),
+                Err(format!(
+                    "line 2: expected `svc 0x13 MapSharedMemory(shmem_handle=0x903ef, \
+                     address=placement2+0x1000, size=0x1000, map_perm=0x1) -> 0x0`, found `svc \
+                     0x13 MapSharedMemory(shmem_handle=0x903ef, address={name}+0x0, \
+                     size=0x1000, map_perm=0x1) -> 0x0`"
+                ))
+            );
             // The second placement's map just past the module, in the ASLR region, so that its
             // anchor (a page lower) would be inside the module.
             let (first, _) = free_pages();
