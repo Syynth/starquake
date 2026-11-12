@@ -323,9 +323,11 @@ impl Toy {
         reply.ok()
     }
 
-    /// in: `u32` a service's number. out: a new session on that service, after a moved event.
+    /// in: `u32` a service's number. out: `u8` [`ODD_BYTE`]; a new session on that service,
+    /// after a moved event.
     fn lend(_: &mut Self, cx: &mut Context<'_>, req: &Request<'_>, reply: &mut Reply) -> Outcome {
         let service = ServiceId(req.payload().read_u32()?);
+        reply.payload().write_u8(ODD_BYTE);
         reply.move_handle(cx.create_event()?);
         reply.push_service(service);
         reply.ok()

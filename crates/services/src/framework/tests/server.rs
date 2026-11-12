@@ -13,8 +13,8 @@ use super::super::result::NOT_SUPPORTED;
 use super::super::targets::Domain;
 use super::super::{Handled, Kernel, Server, ServerError, UnknownPolicy};
 use super::{
-    Child, Rig, SERVICE, Tally, Toy, built, domain_request, in_domain, only, plain, request, toy,
-    toy_interfaces,
+    Child, ODD_BYTE, Rig, SERVICE, Tally, Toy, built, domain_request, in_domain, only, plain,
+    request, toy, toy_interfaces,
 };
 
 #[test]
@@ -136,6 +136,12 @@ fn a_pushed_service_is_a_handle_in_a_domain_too() {
     let reply = in_domain(&rig.send(&lend));
     assert_eq!(reply.result, ResultCode::SUCCESS.raw());
     assert_eq!((reply.moves.len(), reply.objects.len()), (2, 0));
+    // It is not an object of the domain, so the rule that a domain reply's objects follow a
+    // payload of whole words does not apply to it: `lend` returns one byte (which the reply
+    // carries with its padding to a word).
+    assert_eq!(reply.data.first(), Some(&ODD_BYTE));
+    assert!(reply.data.len() <= size_of::<u32>());
+    assert!(reply.data.iter().skip(1).all(|byte| *byte == 0));
     let session = rig.object_of(reply.moves[1]);
     assert_eq!(rig.kernel.take_connections(), [(OTHER, session)]);
 }
