@@ -10,6 +10,10 @@
 //! (`eden/src/core/hle/result.h`), and [`NOT_SUPPORTED`] is Eden's `IPC::ResultNotSupported`
 //! (`eden/src/core/hle/service/ipc_helpers.h`).
 //!
+//! [`INVALID_CMIF_REQUEST`] is the console's `sf::hipc::ResultInvalidCmifRequest` (Atmosphère
+//! `libvapours/include/vapours/results/hipc_results.hpp`: module 11, description 420; fact only,
+//! `docs/references.md`).
+//!
 //! **Every other description number here is a guess.** Eden defines none of them (what it
 //! does in the cases they answer is listed in the [module docs](super), in
 //! [`control`](super::control) and in [`request`](super::request)), and libnx, a client, has no
@@ -20,6 +24,8 @@
 //! test depends on a console agreeing: the tests compare replies with these constants.
 
 use starquake_kernel::result::{KernelError, MODULE_BITS, ResultCode};
+
+use super::buffers::DescriptorList;
 
 /// `ErrorModule::CMIF` (`eden/src/core/hle/result.h`).
 pub const CMIF_MODULE: u32 = 10;
@@ -49,8 +55,11 @@ pub const UNKNOWN_COMMAND_ID: ResultCode = code(CMIF_MODULE, 221);
 pub const TARGET_NOT_FOUND: ResultCode = code(CMIF_MODULE, 261);
 /// The domain has no room for the objects a reply returns. Guess: CMIF 301.
 pub const OUT_OF_DOMAIN_ENTRIES: ResultCode = code(CMIF_MODULE, 301);
-/// The request lacks something the command reads: payload bytes, a buffer, a handle or an input
-/// object. Guess: HIPC 420.
+/// The request lacks something the command reads (payload bytes, a buffer, a handle or an input
+/// object), or its descriptors are not the buffers the command declares. The console's
+/// `sf::hipc::ResultInvalidCmifRequest` (HIPC 420), which it answers when a request's descriptor
+/// counts differ from the command's (Atmosphère `sf_impl_command_serialization.hpp`,
+/// `PrepareForProcess`; fact only). Answering it in the other cases is starquake's own choice.
 pub const INVALID_CMIF_REQUEST: ResultCode = code(HIPC_MODULE, 420);
 /// A control request that needs a domain arrived on a session that is not one. Guess: HIPC 491.
 pub const TARGET_NOT_DOMAIN: ResultCode = code(HIPC_MODULE, 491);
@@ -82,6 +91,17 @@ pub enum Direction {
     Out,
 }
 
+impl Direction {
+    /// The direction as a word in a message: "in" or "out".
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::In => "in",
+            Self::Out => "out",
+        }
+    }
+}
+
 /// Which handle list of a message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HandleKind {
@@ -93,7 +113,7 @@ pub enum HandleKind {
 
 /// Why a service method could not answer its request.
 ///
-/// The first seven variants mean the request does not hold what the command reads; they all
+/// The first eight variants mean the request does not hold what the command reads; they all
 /// reply [`INVALID_CMIF_REQUEST`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum Fault {
@@ -114,6 +134,21 @@ pub enum Fault {
         direction: Direction,
         /// The index asked for.
         index: usize,
+    },
+    /// The request's descriptors are not the buffers the command declares
+    /// ([`buffers`](super::buffers), "The check"). For [`DescriptorList::C`], fewer than declared;
+    /// for every other list, a different number.
+    #[error(
+        "the request has {sent} {} descriptors where the command declares {declared}",
+        .list.letter()
+    )]
+    DescriptorCount {
+        /// The list whose count is wrong.
+        list: DescriptorList,
+        /// How many the request has.
+        sent: usize,
+        /// How many the command's declaration calls for.
+        declared: usize,
     },
     /// A read or write went past the end of a buffer.
     #[error("buffer access of {needed} bytes at offset {offset} passes its end ({len} bytes)")]
@@ -154,6 +189,15 @@ pub enum Fault {
         /// The index asked for.
         index: usize,
     },
+    /// The method asked for a buffer its command's row does not declare: a mistake in the
+    /// service, not in the request. Replies [`NOT_SUPPORTED`].
+    #[error("the command declares no {} buffer {index}", .direction.word())]
+    UndeclaredBuffer {
+        /// Which way the buffer was meant to carry data.
+        direction: Direction,
+        /// The index asked for.
+        index: usize,
+    },
     /// A kernel call failed: an invalid handle, unmapped guest memory, a full handle table.
     /// Replies the kernel error's own code.
     #[error("kernel: {0}")]
@@ -170,11 +214,13 @@ impl Fault {
         match self {
             Self::PayloadTruncated { .. }
             | Self::NoBuffer { .. }
+            | Self::DescriptorCount { .. }
             | Self::BufferOverrun { .. }
             | Self::BufferTooLarge { .. }
             | Self::NoHandle { .. }
             | Self::NoObject { .. }
             | Self::WrongObject { .. } => INVALID_CMIF_REQUEST,
+            Self::UndeclaredBuffer { .. } => NOT_SUPPORTED,
             Self::Kernel(error) => error.code(),
             Self::Result(code) => *code,
         }
@@ -237,8 +283,21 @@ mod tests {
     }
 
     #[test]
+    fn invalid_cmif_request_is_the_consoles_word() {
+        // Golden word: hipc_results.hpp `R_DEFINE_NAMESPACE_RESULT_MODULE(ams::sf::hipc, 11)` and
+        // `InvalidCmifRequest, 420`: module 11 in bits 0..9, description 420 (0x1A4) from bit 9.
+        // Horizon prints it 2011-0420.
+        assert_eq!(INVALID_CMIF_REQUEST.raw(), 0x3_480B);
+    }
+
+    #[test]
     fn a_fault_replies_the_code_its_docs_name() {
         let malformed = [
+            Fault::DescriptorCount {
+                list: DescriptorList::W,
+                sent: 1,
+                declared: 0,
+            },
             Fault::PayloadTruncated {
                 offset: 1,
                 needed: 2,
@@ -264,6 +323,11 @@ mod tests {
         for fault in malformed {
             assert_eq!(fault.result(), INVALID_CMIF_REQUEST, "{fault}");
         }
+        let undeclared = Fault::UndeclaredBuffer {
+            direction: Direction::In,
+            index: 0,
+        };
+        assert_eq!(undeclared.result(), NOT_SUPPORTED);
         assert_eq!(
             Fault::from(KernelError::InvalidHandle).result(),
             KernelError::InvalidHandle.code()
@@ -293,6 +357,31 @@ mod tests {
             }
             .to_string(),
             "the request has no Out buffer 2"
+        );
+        assert_eq!(
+            Fault::DescriptorCount {
+                list: DescriptorList::X,
+                sent: 2,
+                declared: 1
+            }
+            .to_string(),
+            "the request has 2 X descriptors where the command declares 1"
+        );
+        assert_eq!(
+            Fault::UndeclaredBuffer {
+                direction: Direction::Out,
+                index: 1
+            }
+            .to_string(),
+            "the command declares no out buffer 1"
+        );
+        assert_eq!(
+            Fault::UndeclaredBuffer {
+                direction: Direction::In,
+                index: 0
+            }
+            .to_string(),
+            "the command declares no in buffer 0"
         );
         assert_eq!(
             Fault::Result(NOT_SUPPORTED).to_string(),

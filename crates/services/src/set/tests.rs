@@ -13,9 +13,10 @@ use crate::framework::fake::FakeKernel;
 use crate::framework::result::{INVALID_CMIF_REQUEST, UNKNOWN_COMMAND_ID};
 use crate::framework::{Family, Handled, Session};
 
-/// `set:sys` command ids (`ISystemSettingsServer::ISystemSettingsServer`).
-const GET_FIRMWARE_VERSION: u32 = 3;
-const GET_FIRMWARE_VERSION2: u32 = 4;
+use super::command::{GET_FIRMWARE_VERSION, GET_FIRMWARE_VERSION2};
+
+/// A `set:sys` command this port leaves out (`ISystemSettingsServer::ISystemSettingsServer`:
+/// `{5, .., "GetFirmwareVersionDigest"}`), so it has no shipping constant.
 const GET_FIRMWARE_VERSION_DIGEST: u32 = 5;
 
 /// Where the caller's buffer is, and what fills it and the message buffer beforehand.
@@ -226,23 +227,29 @@ fn a_request_without_a_buffer_fails() {
     }
 }
 
-/// Divergence from Eden, whose `WriteBufferC` looks at C descriptors only and so writes nothing
-/// here: a caller that offers a map-alias (B) buffer gets the version in it.
+/// Divergence from Eden, whose `WriteBufferC` looks at C descriptors only: a caller that offers a
+/// map-alias (B) buffer, in place of the pointer buffer or as well as it, fails the check of the
+/// declared buffer, as on the console, and nothing is written to either.
 #[test]
-fn a_map_alias_buffer_is_written_too() {
-    let mut rig = rig();
-    rig.map(FIRMWARE_VERSION_SIZE);
+fn a_map_alias_buffer_is_refused() {
     let room = BufferDescriptor {
         address: AT,
         size: u64::try_from(FIRMWARE_VERSION_SIZE).unwrap(),
         flags: 0,
     };
-    let ask = RequestBuilder::cmif(CommandType::Request, GET_FIRMWARE_VERSION2);
-    assert_eq!(
-        rig.send(&ask.receive_buffer(room)),
-        only(ResultCode::SUCCESS)
-    );
-    assert_eq!(rig.written(FIRMWARE_VERSION_SIZE), version_bytes());
+    for command in [GET_FIRMWARE_VERSION, GET_FIRMWARE_VERSION2] {
+        let mut rig = rig();
+        rig.map(FIRMWARE_VERSION_SIZE);
+        let instead = RequestBuilder::cmif(CommandType::Request, command).receive_buffer(room);
+        assert_eq!(rig.send(&instead), only(INVALID_CMIF_REQUEST));
+        let as_well = get_firmware_version(command, FIRMWARE_VERSION_SIZE).receive_buffer(room);
+        assert_eq!(rig.send(&as_well), only(INVALID_CMIF_REQUEST));
+        assert!(
+            rig.written(FIRMWARE_VERSION_SIZE)
+                .iter()
+                .all(|byte| *byte == STALE)
+        );
+    }
 }
 
 #[test]

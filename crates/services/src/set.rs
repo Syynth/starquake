@@ -11,7 +11,7 @@
 //!
 //! | Id | Command | In | Out |
 //! |---|---|---|---|
-//! | 3 | `GetFirmwareVersion` | nothing | out buffer 0: a [`FirmwareVersion`], [`FIRMWARE_VERSION_SIZE`] bytes, with its minor revision zeroed |
+//! | 3 | `GetFirmwareVersion` | nothing | out buffer 0 (pointer, a C descriptor): a [`FirmwareVersion`], [`FIRMWARE_VERSION_SIZE`] bytes, with its minor revision zeroed |
 //! | 4 | `GetFirmwareVersion2` | nothing | out buffer 0: the same, minor revision included |
 //!
 //! Every other command of `set:sys` is left out and answered by the server's unknown-command
@@ -51,12 +51,13 @@
 //!   `INVALID_CMIF_REQUEST`, the framework's rule for every out buffer (`framework::request`)
 //!   (`a_buffer_too_small_gets_nothing_and_an_error`).
 //! - No buffer at all: Eden's `ASSERT(ctx.CanWriteBuffer(..))` logs, `WriteBufferC` writes
-//!   nothing, and the reply is success. Here the reply is `INVALID_CMIF_REQUEST`
-//!   (`a_request_without_a_buffer_fails`).
-//! - A map-alias (B) buffer in place of the pointer buffer: `WriteBufferC` looks at C
-//!   descriptors only, so Eden writes nothing and replies success. Here an out buffer is a B or
-//!   a C descriptor, and the version is written to it (`a_map_alias_buffer_is_written_too`).
-//!   libnx never sends one.
+//!   nothing, and the reply is success. Here the request fails the framework's check of the
+//!   declared buffer and the reply is `INVALID_CMIF_REQUEST` (`a_request_without_a_buffer_fails`).
+//! - A map-alias (B) buffer in place of the pointer buffer, or as well as it: `WriteBufferC`
+//!   looks at C descriptors only, so Eden ignores the B descriptor, and writes nothing and
+//!   replies success when there is no C descriptor. Here a B descriptor fails the framework's
+//!   check (`framework::buffers`), as on the console, and the reply is `INVALID_CMIF_REQUEST`
+//!   with nothing written (`a_map_alias_buffer_is_refused`). libnx never sends one.
 
 use serde::{Deserialize, Serialize};
 
@@ -296,10 +297,20 @@ pub struct Settings {
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct SetSys;
 
+/// The ids of [`SetSys`]'s commands (`ISystemSettingsServer::ISystemSettingsServer`).
+pub mod command {
+    /// `GetFirmwareVersion` (`{3, C<&ISystemSettingsServer::GetFirmwareVersion>, ..}`).
+    pub const GET_FIRMWARE_VERSION: u32 = 3;
+    /// `GetFirmwareVersion2` (`{4, C<&ISystemSettingsServer::GetFirmwareVersion2>, ..}`).
+    pub const GET_FIRMWARE_VERSION2: u32 = 4;
+}
+
+// Both write the version to a pointer buffer: Eden declares it
+// `OutLargeData<FirmwareVersionFormat, BufferAttr_HipcPointer>` (module docs, "Commands").
 commands! {
     impl SetSys {
-        3 => get_firmware_version,
-        4 => get_firmware_version2,
+        command::GET_FIRMWARE_VERSION => get_firmware_version [Out(Pointer)],
+        command::GET_FIRMWARE_VERSION2 => get_firmware_version2 [Out(Pointer)],
     }
 }
 
