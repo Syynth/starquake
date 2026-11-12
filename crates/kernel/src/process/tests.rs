@@ -180,3 +180,83 @@ fn a_region_memory_refuses_is_logged_and_the_thread_still_starts() {
         ThreadState::Runnable
     );
 }
+
+#[test]
+fn the_main_thread_takes_the_first_region_because_no_process_local_region_is_reserved() {
+    // Divergence: Eden reserves the process-local region first, so its main thread's region is
+    // the page's second (page + THREAD_LOCAL_REGION_SIZE) and two regions are in use.
+    let mut tables = create(&description(), fixture::loaded().0).unwrap();
+    let memory = tls_memory(&tables.address_space);
+    let main = run(&mut tables, &memory, ENTRY, STACK_TOP).unwrap();
+    let thread = tables.scheduler.thread(main.thread).unwrap();
+    assert_eq!(thread.tls_address(), first_tls_page(&tables.address_space));
+    let record = tables.scheduler.process(tables.processes.own()).unwrap();
+    assert_eq!(record.tls().used(), 1);
+}
+
+#[test]
+fn a_main_thread_that_fails_to_start_is_undone() {
+    // The two states `run` can fail in after the thread and its handle exist: before the thread
+    // is started (it holds no reference to itself) and after (it does).
+    for started in [false, true] {
+        let mut tables = create(&description(), fixture::loaded().0).unwrap();
+        let memory = tls_memory(&tables.address_space);
+        let own = tables.processes.own();
+        let spec = UserThread {
+            entry: ENTRY,
+            argument: 0,
+            stack_top: STACK_TOP,
+            priority: crate::sched::Priority::new(description().main_thread_priority).unwrap(),
+            virtual_core: description().main_thread_core,
+        };
+        let Tables {
+            handles,
+            address_space,
+            scheduler,
+            ..
+        } = &mut tables;
+        let (thread, handle) =
+            create_thread_with_handle((handles, address_space, scheduler), own, &spec, &memory)
+                .unwrap();
+        scheduler.mark_running(own).unwrap();
+        if started {
+            scheduler.start(thread).unwrap();
+        }
+        undo_run(handles, scheduler, own, MainThread { thread, handle }).unwrap();
+
+        assert!(tables.handles.is_empty(), "started: {started}");
+        assert!(
+            tables.scheduler.thread(thread).is_err(),
+            "started: {started}"
+        );
+        assert_eq!(tables.scheduler.objects().len(), 0, "started: {started}");
+        let record = tables.scheduler.process(own).unwrap();
+        assert_eq!(record.state(), ProcessState::Created, "started: {started}");
+        assert_eq!(record.threads().count(), 0, "started: {started}");
+        assert_eq!(record.running_threads(), 0, "started: {started}");
+        assert_eq!(record.tls().used(), 0, "started: {started}");
+        // Nothing is left over: the process runs as a fresh one would.
+        let main = run(&mut tables, &memory, ENTRY, STACK_TOP).unwrap();
+        assert_eq!(
+            tables.scheduler.thread(main.thread).unwrap().tls_address(),
+            first_tls_page(&tables.address_space)
+        );
+    }
+}
+
+#[test]
+fn a_region_whose_end_does_not_fit_is_refused_at_the_exact_edge() {
+    let memory = FlatMemory::new(0x1000, 0x10);
+    let handle = Handle::from_register(0x8001);
+    // The last address whose region end (exclusive) still fits: the write is tried, and this
+    // memory refuses it.
+    let last = u64::MAX - THREAD_LOCAL_REGION_SIZE;
+    assert!(matches!(
+        initialise_region(&memory, last, handle),
+        Err(RegionError::Refused { tls, .. }) if tls == last
+    ));
+    assert_eq!(
+        initialise_region(&memory, last + 1, handle),
+        Err(RegionError::TopOfMemory { tls: last + 1 })
+    );
+}

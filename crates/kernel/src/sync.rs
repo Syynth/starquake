@@ -60,11 +60,22 @@
 //!   ([`Scheduler::signal_object`]): the writable end of a service's event is something only the
 //!   service can reach, so it is not made an object. Test:
 //!   `a_service_event_is_a_readable_end_the_service_signals`.
-//! - **Threads are signalled when their state is `Terminated`, processes never.** Eden signals
-//!   a thread in `KThread::FinishTermination` (`m_signaled = true`) and a process when its state
-//!   changes (`m_is_signaled`). Thread termination and process state are kernel slice 8;
-//!   PROVISIONAL until then. Waiting on either is allowed, as in Eden. Test:
-//!   `a_thread_object_is_signalled_once_terminated_and_a_process_never`.
+//! - **Processes are never signalled.** Eden signals a process when its state changes
+//!   (`m_is_signaled`); here process state changes notify no one. PROVISIONAL. A thread is
+//!   signalled when its state is `Terminated`, and its waiters wake as it terminates
+//!   ([`Scheduler::terminate_thread`](crate::sched::Scheduler::terminate_thread)), as Eden's
+//!   `KThread::FinishTermination` sets `m_signaled` and calls `NotifyAvailable`. Waiting on
+//!   either is allowed, as in Eden. Tests:
+//!   `a_thread_object_is_signalled_once_terminated_and_a_process_never`, and in
+//!   `sched/scheduler/lifecycle/tests.rs`,
+//!   `a_thread_that_terminates_wakes_its_waiters_and_the_last_wait_reference_destroys_it`.
+//! - **A thread that terminates while it waits leaves its wait at once,** with no result
+//!   written and nothing reported (`Scheduler::forget_waits`),
+//!   and a pending cancel goes with it. Eden cancels the wait with
+//!   `ResultTerminationRequested` and the thread runs on to its exit; termination here ends
+//!   the thread in the call (`sched/scheduler/lifecycle.rs`). Test (in
+//!   `sched/scheduler/lifecycle/tests.rs`):
+//!   `a_thread_that_terminates_while_waiting_leaves_every_wait_list`.
 //! - **References are released when the wait ends,** not when the thread next runs (Eden's
 //!   `SCOPE_EXIT` in `WaitSynchronization` closes them after `Wait` returns). Nothing a guest
 //!   sees depends on when an object it no longer has a handle to is destroyed. Test:
@@ -86,17 +97,15 @@
 //!
 //! # Not ported yet
 //!
-//! - **`IsTerminationRequested`** is not checked before a thread waits: nothing can ask a
-//!   thread to terminate before kernel slice 8, which adds the check (and
-//!   `ResultTerminationRequested`). PROVISIONAL.
+//! - **`IsTerminationRequested`** is not checked before a thread waits: kernel slice 8 ends a
+//!   thread in the call that asks for its termination (`sched/scheduler/lifecycle.rs`), so no
+//!   thread that was asked to terminate runs again to wait. The check (and
+//!   `ResultTerminationRequested`) comes with termination that waits for other cores (kernel
+//!   slice 10). PROVISIONAL.
 //! - **`ResultSessionClosed` is not mapped to success** (`R_SUCCEED_IF(res ==
 //!   ResultSessionClosed)` in `svc_synchronization.cpp`): no object here ends a wait with it.
 //!   Only server sessions do (`KServerSession`), and they are deferred (kernel spec, "IPC");
 //!   they bring the mapping with them.
-//! - **A thread's pending cancel and wait record are not cleared when the thread goes**:
-//!   threads are never destroyed before kernel slice 8, whose thread exit must also call
-//!   [`Scheduler::notify_available`](crate::sched::Scheduler::notify_available) on the
-//!   thread's object so that its waiters wake.
 
 pub mod event;
 pub mod wait;

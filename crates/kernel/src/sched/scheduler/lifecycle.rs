@@ -22,7 +22,8 @@
 //!
 //! # Divergences
 //!
-//! Each is pinned by the named test in `sched/scheduler/tests.rs` or `svc/thread.rs`.
+//! Each is pinned by the named test in `sched/scheduler/lifecycle/tests.rs`, unless another
+//! file is named.
 //!
 //! - **`x18` starts at zero.** Eden's `ResetThreadContext64` seeds it with a random odd number
 //!   (`Common::Random::Random64(0) | 1`). Creation has no route to the environment's random
@@ -35,7 +36,9 @@
 //! - **Termination is immediate.** Eden asks every other thread to terminate
 //!   (`RequestTerminate`) and waits for each. Here every thread is ended in the call, in thread
 //!   order: there is no other core running one of them yet (slice 10). Test (in
-//!   `svc/process.rs`): `exiting_the_process_ends_every_thread_and_closes_every_handle`.
+//!   `svc/process/tests.rs`): `exiting_the_process_ends_every_thread_and_closes_every_handle`.
+//! - **A thread that ends while it waits leaves its wait at once** (see the module docs of
+//!   [`crate::sync`]). Test: `a_thread_that_terminates_while_waiting_leaves_every_wait_list`.
 
 use starquake_cpu::GuestRegs;
 
@@ -122,6 +125,19 @@ impl Scheduler {
             return Err(KernelError::InvalidState.into());
         }
         record.state = ProcessState::Running;
+        Ok(())
+    }
+
+    /// Puts a running process back to [`ProcessState::Created`]: `KProcess::Run`'s
+    /// `ON_RESULT_FAILURE_2 { ChangeState(state) }`, for a start that failed after the state
+    /// changed ([`crate::process::run`]). Anything but [`ProcessState::Running`] is
+    /// [`KernelError::InvalidState`].
+    pub fn unmark_running(&mut self, process: ProcessId) -> Result<(), SchedError> {
+        let record = self.record_mut(process)?;
+        if record.state != ProcessState::Running {
+            return Err(KernelError::InvalidState.into());
+        }
+        record.state = ProcessState::Created;
         Ok(())
     }
 
@@ -244,10 +260,12 @@ impl Scheduler {
     }
 
     /// Ends a thread (`KThread::Exit` for the calling thread, `RequestTerminate` for another):
-    /// it becomes [`ThreadState::Terminated`] and leaves the queues. A thread that was started
-    /// stops counting as one of its process's running threads, and closes its reference to
-    /// itself, which destroys it if no handle names it. A thread that has ended already is left
-    /// as it is.
+    /// a wait it is in ends without a result and its pending cancel goes
+    /// (`Scheduler::forget_waits`), it becomes [`ThreadState::Terminated`] and leaves the
+    /// queues, and the threads waiting on it wake ([`Scheduler::notify_available`]). A thread
+    /// that was started stops counting as one of its process's running threads, and closes its
+    /// reference to itself, which destroys it if no handle or wait names it. A thread that has
+    /// ended already is left as it is.
     pub fn terminate_thread(&mut self, id: ThreadId) -> CallResult<ThreadExit> {
         let thread = self.thread(id)?;
         if thread.state == ThreadState::Terminated {
@@ -255,7 +273,18 @@ impl Scheduler {
         }
         let started = thread.state != ThreadState::Initialized;
         let (process, object, holds_itself) = (thread.process, thread.object, thread.holds_itself);
+        // A terminated thread must not stay on a wait list, or a later signal would make it
+        // runnable again.
+        let forgotten = self.forget_waits(id);
         self.set_state(id, ThreadState::Terminated)?;
+        // WAIT SEAM (kernel slice 4): the thread is signalled now (`is_signalled` reads its
+        // state), and the threads waiting on it (a join) wake, as `KThread::FinishTermination`
+        // sets `m_signaled` and calls `NotifyAvailable` (`eden/src/core/hle/kernel/k_thread.cpp`
+        // @ cf654052, line 444), before the thread's reference to itself is closed below.
+        let notified = match object {
+            Some(object) => self.notify_available(object),
+            None => Ok(()),
+        };
         let mut exit = ThreadExit::Others;
         if started && let Some(process) = process {
             let record = self.record_mut(process)?;
@@ -271,6 +300,8 @@ impl Scheduler {
             self.thread_mut(id)?.holds_itself = false;
             self.close_object(object)?;
         }
+        forgotten?;
+        notified?;
         Ok(exit)
     }
 

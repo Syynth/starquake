@@ -25,6 +25,32 @@
 //! - **No resource limit**: Eden reserves a thread from the process's limit
 //!   (`ThreadCountMax`) and can fail with `ResultLimitReached`; the resource-limits slice
 //!   adds it.
+//!
+//! # Divergences from `KProcess::Initialize`
+//!
+//! - **No process-local region.** Eden's `KProcess::Initialize` reserves a thread-local region
+//!   for the process itself and zeroes it before any thread exists
+//!   (`CreateThreadLocalRegion(&m_plr_address)` then `ZeroBlock(m_plr_address,
+//!   Svc::ThreadLocalRegionSize)`, `eden/src/core/hle/kernel/k_process.cpp` @ cf654052, lines
+//!   188-193; both of Eden's callers pass `is_real = true`). Here nothing reserves it, so the
+//!   main thread's region is the first region of the first thread-local page where Eden's is
+//!   the second (page + `0x200`), and each process's count of regions in use is one lower than
+//!   Eden's. Nothing reads the process-local region yet; porting it is one reservation in
+//!   [`run`] before the main thread is created. PROVISIONAL. Test:
+//!   `the_main_thread_takes_the_first_region_because_no_process_local_region_is_reserved`.
+//!
+//! # One process per set of tables (PROVISIONAL)
+//!
+//! [`create`] builds a fresh [`Scheduler`] and a fresh [`Processes`] table for each process, and
+//! the system calls take the calling thread's process to be [`Processes::own`] (any other is an
+//! internal failure). A second `create` would also start its thread ids at
+//! [`crate::sched::FIRST_THREAD_ID`] and its process id at
+//! [`crate::tables::FIRST_USER_PROCESS_ID`] again. This is narrower than the kernel spec
+//! (`docs/specs/kernel.md`, rule 2, "Nothing assumes a single process", and its tables: one
+//! scheduler holding every thread). The replacement adds a process to the existing tables: a
+//! new row in the one [`Processes`] table and the one [`Scheduler`], with a handle table and an
+//! address space of its own, keyed by process. `docs/architecture.md` lists it with the other
+//! provisional parts.
 
 pub mod asid;
 pub mod description;
@@ -111,8 +137,12 @@ pub struct MainThread {
 /// ([`Scheduler::update`], then [`Scheduler::schedule`]).
 ///
 /// A process that is not [`ProcessState::Created`] is [`KernelError::InvalidState`], Eden's
-/// result, before anything is created. A failure after the thread exists destroys it again, so
-/// nothing of it is left.
+/// result, before anything is created. A failure while the thread and its handle are made
+/// leaves nothing of them ([`create_thread_with_handle`]). A failure after that (setting `x1`,
+/// marking the process running, starting the thread) is undone as Eden's `ON_RESULT_FAILURE_2`
+/// blocks in `KProcess::Run` undo it ([`undo_run`]): the thread ends, its handle is closed,
+/// which destroys it, and the process is [`ProcessState::Created`] again. Each of those later
+/// steps fails only when the kernel's own bookkeeping is broken.
 pub fn run(
     tables: &mut Tables,
     memory: &dyn GuestMemory,
@@ -141,17 +171,53 @@ pub fn run(
     };
     let (thread, handle) =
         create_thread_with_handle((handles, space, scheduler), process, &spec, memory)?;
-    scheduler.context_mut(thread)?.x[1] = u64::from(handle.raw());
-    scheduler.mark_running(process)?;
-    scheduler.start(thread)?;
+    let started = (|| -> CallResult<()> {
+        scheduler.context_mut(thread)?.x[1] = u64::from(handle.raw());
+        scheduler.mark_running(process)?;
+        scheduler.start(thread)?;
+        Ok(())
+    })();
+    if let Err(error) = started {
+        if let Err(undo) = undo_run(handles, scheduler, process, MainThread { thread, handle }) {
+            tracing::error!(%undo, "a main thread that failed to start could not be undone");
+        }
+        return Err(error);
+    }
     Ok(MainThread { thread, handle })
 }
 
-/// Creates a thread of `process` ([`Scheduler::create_user_thread`]) and a handle to it, writes
-/// the handle into the thread's region, and closes the creator's reference, so that the handle
-/// holds the thread's only one: the steps `CreateThread` and `KProcess::Run` share. When the
-/// handle cannot be added, closing the creator's reference destroys the thread again and the
-/// handle table's error is returned.
+/// Undoes what [`run`] did after the main thread and its handle were made, when a later step
+/// fails (Eden's `ON_RESULT_FAILURE_2` blocks in `KProcess::Run`: `FinalizeHandleTable`, and
+/// `ChangeState(state)` back): the thread ends ([`Scheduler::terminate_thread`], which also
+/// drops the reference it holds to itself if it was started), its handle is closed, which
+/// destroys it and frees its region, and a process marked running is
+/// [`ProcessState::Created`] again. Every step runs even if an earlier one failed; the first
+/// failure is returned.
+pub(crate) fn undo_run(
+    handles: &mut HandleTable,
+    scheduler: &mut Scheduler,
+    process: ProcessId,
+    main: MainThread,
+) -> CallResult<()> {
+    let ended = scheduler.terminate_thread(main.thread).map(|_| ());
+    let closed = crate::svc::handle::remove_handle(handles, scheduler, main.handle);
+    let state = match scheduler.process(process) {
+        Ok(record) if record.state() == ProcessState::Running => {
+            scheduler.unmark_running(process).map_err(SvcError::from)
+        }
+        Ok(_) => Ok(()),
+        Err(error) => Err(error.into()),
+    };
+    ended?;
+    closed?;
+    state
+}
+
+/// Creates a thread of `process` ([`Scheduler::create_user_thread`]) and a handle to it, zeroes
+/// the thread's region and writes the handle into it ([`initialise_region`]), and closes the
+/// creator's reference, so that the handle holds the thread's only one: the steps
+/// `CreateThread` and `KProcess::Run` share. When the handle cannot be added, closing the
+/// creator's reference destroys the thread again and the handle table's error is returned.
 pub(crate) fn create_thread_with_handle(
     (handles, space, scheduler): (&mut HandleTable, &mut AddressSpace, &mut Scheduler),
     process: ProcessId,
@@ -167,27 +233,66 @@ pub(crate) fn create_thread_with_handle(
         }
     };
     let tls = scheduler.thread(thread)?.tls_address();
-    write_own_handle(memory, tls, handle);
+    if let Err(error) = initialise_region(memory, tls, handle) {
+        tracing::error!(%error, "a new thread's region was not written");
+    }
     scheduler.close_object(object)?;
     Ok((thread, handle))
 }
 
-/// Writes a new thread's handle into its region (`Write32(tls + 0x110, handle)`, as
-/// `CreateThread` and `KProcess::Run` do). Eden's write cannot fail; here guest memory that
-/// refuses it is a host failure, logged, and the thread carries on without it, as a console's
-/// would with a region the kernel had zeroed.
-pub(crate) fn write_own_handle(memory: &dyn GuestMemory, tls: u64, handle: Handle) {
-    let Some(address) = tls.checked_add(CURRENT_THREAD_HANDLE_OFFSET) else {
-        tracing::error!(tls, "a thread-local region at the top of memory");
-        return;
-    };
-    if let Err(fault) = memory.write(address, &handle.raw().to_le_bytes()) {
-        tracing::error!(
-            address,
-            ?fault,
-            "a thread's own handle could not be written"
-        );
+/// Bytes of one thread-local region, as a buffer length.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "THREAD_LOCAL_REGION_SIZE is 0x200, which fits in a usize of any width"
+)]
+const REGION_BYTES: usize = THREAD_LOCAL_REGION_SIZE as usize;
+
+/// Why a new thread's region could not be written. Eden's writes cannot fail; here either is a
+/// host failure, logged, and the thread carries on.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum RegionError {
+    /// The region would run past the top of the address range.
+    #[error("a thread-local region at {tls:#x} runs past the top of memory")]
+    TopOfMemory {
+        /// The region's address.
+        tls: u64,
+    },
+    /// Guest memory refused the write.
+    #[error("guest memory refused the thread-local region at {tls:#x}: {fault}")]
+    Refused {
+        /// The region's address.
+        tls: u64,
+        /// What the memory said.
+        fault: starquake_memory::Fault,
+    },
+}
+
+/// Zeroes a new thread's whole region and writes its own handle into it, in one write: Eden's
+/// `KThread::Initialize` zeroes the region it reserves (`ZeroBlock(m_tls_address,
+/// Svc::ThreadLocalRegionSize)`, `eden/src/core/hle/kernel/k_thread.cpp` @ cf654052, lines
+/// 228-229), then `CreateThread` and `KProcess::Run` write the handle
+/// (`Write32(tls + 0x110, handle)`, [`CURRENT_THREAD_HANDLE_OFFSET`]). A region reused from an
+/// ended thread so keeps nothing of it.
+pub(crate) fn initialise_region(
+    memory: &dyn GuestMemory,
+    tls: u64,
+    handle: Handle,
+) -> Result<(), RegionError> {
+    if tls.checked_add(THREAD_LOCAL_REGION_SIZE).is_none() {
+        return Err(RegionError::TopOfMemory { tls });
     }
+    let mut region = [0_u8; REGION_BYTES];
+    let bytes = handle.raw().to_le_bytes();
+    let start = usize::try_from(CURRENT_THREAD_HANDLE_OFFSET).unwrap_or(REGION_BYTES);
+    if let Some(slot) = start
+        .checked_add(bytes.len())
+        .and_then(|end| region.get_mut(start..end))
+    {
+        slot.copy_from_slice(&bytes);
+    }
+    memory
+        .write(tls, &region)
+        .map_err(|fault| RegionError::Refused { tls, fault })
 }
 
 #[cfg(test)]

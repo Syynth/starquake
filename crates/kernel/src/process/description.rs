@@ -499,6 +499,22 @@ mod tests {
     }
 
     #[test]
+    fn the_kernel_priorities_are_eden_s_golden_zero_to_three() {
+        // Golden protocol fact, not derived from the constant: Eden's
+        // `R_UNLESS((m_priority_mask & 0xF) == 0, ResultInvalidArgument)` in
+        // `SetCorePriorityCapability` (`eden/src/core/hle/kernel/k_capabilities.cpp` @ cf654052,
+        // line 104) refuses a range that reaches priority 3 and accepts one from 4.
+        let mut kernel = homebrew();
+        kernel.priorities.first = 3;
+        assert_eq!(
+            ProcessInfo::new(&kernel, 1),
+            refused(KernelError::InvalidArgument)
+        );
+        kernel.priorities.first = 4;
+        assert!(ProcessInfo::new(&kernel, 1).is_ok());
+    }
+
+    #[test]
     fn a_main_thread_outside_the_process_ranges_is_refused() {
         let mut core = homebrew();
         core.main_thread_core = core.cores.last + 1;

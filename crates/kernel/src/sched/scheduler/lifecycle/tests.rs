@@ -1,15 +1,18 @@
 //! The scheduler's half of the lifecycle: user threads, their references, ending them, and the
 //! virtual core mask.
 
+use starquake_cpu::GuestRegs;
 use starquake_memory::PAGE_SIZE;
-use starquake_trace::GuestTicks;
+use starquake_trace::{GuestTicks, SVC_ARG_COUNT};
 
 use super::*;
 use crate::handle::ObjectRefs;
 use crate::id::SlabId;
 use crate::memory::{GUARD_PAGES, fixture};
 use crate::process::{THREAD_LOCAL_REGION_SIZE, VIRTUAL_CORE_COUNT};
+use crate::result::ResultCode;
 use crate::sched::{CoreId, CoreSignals, FIRST_THREAD_ID};
+use crate::sync::{Timeout, WaitBegun, WaitOrigin, Wake};
 
 struct NoSignals;
 
@@ -363,4 +366,188 @@ fn a_session_object_is_torn_down_by_the_ipc_table_and_a_process_object_by_nothin
     assert_eq!(scheduler.objects().refs(object), 0);
     // The process's row outlives its object.
     assert!(scheduler.process(process()).is_ok());
+}
+
+/// Who a test wait is for, with distinct non-zero values.
+fn origin() -> WaitOrigin {
+    let mut args = [0; SVC_ARG_COUNT];
+    args[1] = 0x5150;
+    WaitOrigin {
+        thread: starquake_trace::ThreadId(0x7001),
+        core: 0,
+        args,
+    }
+}
+
+/// Has the thread core 0 runs wait on `objects` with no timeout, opening the reference each
+/// object's wait holds, as `WaitSynchronization` does.
+fn wait_on(scheduler: &mut Scheduler, objects: &[ObjectId]) -> WaitBegun {
+    for object in objects {
+        scheduler.objects_mut().open(*object).unwrap();
+    }
+    scheduler
+        .wait_synchronization(
+            core(0),
+            objects,
+            Timeout::Never,
+            &GuestRegs::default(),
+            origin(),
+        )
+        .unwrap()
+}
+
+#[test]
+fn a_thread_id_that_cannot_be_given_frees_the_region_it_took() {
+    let (mut scheduler, mut space) = world();
+    create(&mut scheduler, &mut space, 0);
+    scheduler.next_thread_id = u64::MAX;
+    assert_eq!(
+        scheduler.create_user_thread(&mut space, process(), &spec(0)),
+        Err(SvcError::from(SchedError::Corrupt))
+    );
+    let record = scheduler.process(process()).unwrap();
+    assert_eq!(record.tls().used(), 1);
+    assert_eq!(record.threads().count(), 1);
+}
+
+#[test]
+fn a_thread_that_terminates_wakes_its_waiters_and_the_last_wait_reference_destroys_it() {
+    let (mut scheduler, mut space) = world();
+    let (waiter, _) = create(&mut scheduler, &mut space, 0);
+    let (joined, joined_object) = create(&mut scheduler, &mut space, 1);
+    scheduler.start(waiter).unwrap();
+    scheduler.start(joined).unwrap();
+    run_on(&mut scheduler, waiter, core(0));
+    assert_eq!(
+        wait_on(&mut scheduler, &[joined_object]),
+        WaitBegun::Waiting(waiter)
+    );
+    // The creator lets go: the joined thread's reference to itself and the wait's are left.
+    scheduler.close_object(joined_object).unwrap();
+    assert_eq!(scheduler.objects().refs(joined_object), 2);
+
+    // The join: ending the thread signals it, and its waiter wakes with success, index 0.
+    assert_eq!(scheduler.terminate_thread(joined), Ok(ThreadExit::Others));
+    assert_eq!(
+        scheduler.thread(waiter).unwrap().state(),
+        ThreadState::Runnable
+    );
+    assert_eq!(scheduler.sync().wait(waiter), None);
+    assert_eq!(
+        scheduler.take_wakes(),
+        vec![Wake {
+            thread: waiter,
+            origin: origin(),
+            result: ResultCode::SUCCESS,
+            index: 0,
+        }]
+    );
+    let context = scheduler.thread(waiter).unwrap().context();
+    assert_eq!(
+        (context.x[0], context.x[1]),
+        (u64::from(ResultCode::SUCCESS.raw()), 0)
+    );
+    // No reference is left, so the joined thread is gone and its region free.
+    assert!(scheduler.thread(joined).is_err());
+    assert_eq!(scheduler.process(process()).unwrap().tls().used(), 1);
+}
+
+#[test]
+fn a_wait_that_holds_the_last_reference_to_a_thread_destroys_it_when_it_ends() {
+    let (mut scheduler, mut space) = world();
+    let (waiter, _) = create(&mut scheduler, &mut space, 0);
+    // Never started, so it holds no reference to itself.
+    let (idle, idle_object) = create(&mut scheduler, &mut space, 1);
+    scheduler.start(waiter).unwrap();
+    run_on(&mut scheduler, waiter, core(0));
+    assert_eq!(
+        wait_on(&mut scheduler, &[idle_object]),
+        WaitBegun::Waiting(waiter)
+    );
+    scheduler.close_object(idle_object).unwrap();
+    assert_eq!(scheduler.objects().refs(idle_object), 1);
+    assert_eq!(scheduler.process(process()).unwrap().tls().used(), 2);
+    // Cancelling the wait releases the last reference: the thread is destroyed through the one
+    // teardown path, so its row and region go with the object.
+    scheduler.cancel_synchronization(waiter).unwrap();
+    assert!(scheduler.objects().get(idle_object).is_err());
+    assert!(scheduler.thread(idle).is_err());
+    let record = scheduler.process(process()).unwrap();
+    assert_eq!(record.tls().used(), 1);
+    assert_eq!(record.threads().collect::<Vec<_>>(), vec![waiter]);
+}
+
+#[test]
+fn a_thread_that_terminates_while_waiting_leaves_every_wait_list() {
+    let (mut scheduler, mut space) = world();
+    let (waiter, _) = create(&mut scheduler, &mut space, 0);
+    let (other, _) = create(&mut scheduler, &mut space, 1);
+    scheduler.start(waiter).unwrap();
+    scheduler.start(other).unwrap();
+    run_on(&mut scheduler, waiter, core(0));
+    let (writable, readable) = scheduler.create_event().unwrap();
+    assert_eq!(
+        wait_on(&mut scheduler, &[readable]),
+        WaitBegun::Waiting(waiter)
+    );
+    assert_eq!(scheduler.objects().refs(readable), 2);
+
+    assert_eq!(scheduler.terminate_thread(waiter), Ok(ThreadExit::Others));
+    assert_eq!(scheduler.sync().wait(waiter), None);
+    assert_eq!(scheduler.sync().waiters(readable).count(), 0);
+    // The wait's reference is released; the creator's is left.
+    assert_eq!(scheduler.objects().refs(readable), 1);
+    // A later signal wakes nothing: the ended thread stays ended and nothing is reported.
+    scheduler.signal_object(writable).unwrap();
+    assert_eq!(
+        scheduler.thread(waiter).unwrap().state(),
+        ThreadState::Terminated
+    );
+    assert_eq!(scheduler.take_wakes(), vec![]);
+    // The thread that was not waiting is untouched.
+    assert_eq!(
+        scheduler.thread(other).unwrap().state(),
+        ThreadState::Runnable
+    );
+}
+
+#[test]
+fn a_pending_cancel_goes_with_its_thread() {
+    let (mut scheduler, mut space) = world();
+    let (ending, _) = create(&mut scheduler, &mut space, 0);
+    let (staying, _) = create(&mut scheduler, &mut space, 1);
+    scheduler.start(ending).unwrap();
+    scheduler.start(staying).unwrap();
+    scheduler.cancel_synchronization(ending).unwrap();
+    scheduler.cancel_synchronization(staying).unwrap();
+    assert!(scheduler.sync().is_cancel_pending(ending));
+    scheduler.terminate_thread(ending).unwrap();
+    assert!(!scheduler.sync().is_cancel_pending(ending));
+    assert!(scheduler.sync().is_cancel_pending(staying));
+}
+
+#[test]
+fn a_running_process_goes_back_to_created_once() {
+    let (mut scheduler, _) = world();
+    assert_eq!(
+        scheduler.unmark_running(process()),
+        Err(SchedError::from(KernelError::InvalidState))
+    );
+    scheduler.mark_running(process()).unwrap();
+    scheduler.unmark_running(process()).unwrap();
+    assert_eq!(
+        scheduler.process(process()).unwrap().state(),
+        ProcessState::Created
+    );
+    scheduler.mark_running(process()).unwrap();
+    scheduler.mark_terminated(process()).unwrap();
+    assert_eq!(
+        scheduler.unmark_running(process()),
+        Err(SchedError::from(KernelError::InvalidState))
+    );
+    let stranger = ProcessId::from_parts(9, 9);
+    assert_eq!(
+        scheduler.unmark_running(stranger),
+        Err(SchedError::UnknownProcess(stranger))
+    );
 }

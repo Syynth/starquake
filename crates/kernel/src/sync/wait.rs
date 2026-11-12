@@ -260,12 +260,10 @@ impl Scheduler {
     }
 
     /// Drops one reference to `object` through the one teardown path the object table has
-    /// ([`crate::ipc::Ipc::release`]: the row goes with its last reference, and a session's
-    /// server is told).
+    /// ([`Scheduler::close_object`]: the row goes with its last reference, a session's server
+    /// is told and a thread is destroyed).
     pub(crate) fn release_object(&mut self, object: ObjectId) -> CallResult<()> {
-        let (objects, ipc) = self.ipc_mut();
-        ipc.release(objects, object)?;
-        Ok(())
+        self.close_object(object)
     }
 
     /// Drops one reference to each of `objects`, all of them even when one fails; the first
@@ -469,6 +467,21 @@ impl Scheduler {
             }
         }
         result
+    }
+
+    /// Forgets `thread`'s synchronisation state as it terminates: a wait it is in ends with no
+    /// result written and no [`Wake`] queued (the thread will not run again), the references
+    /// that wait held are released, and a pending cancel goes. Eden cancels a terminating
+    /// thread's wait with `ResultTerminationRequested` and lets the thread run to its exit
+    /// (`KThread::RequestTerminate`); termination here ends the thread in the call instead
+    /// ([`Scheduler::terminate_thread`]). Each step runs even if an earlier one failed.
+    pub(crate) fn forget_waits(&mut self, thread: ThreadId) -> CallResult<()> {
+        let table = self.sync_table_mut();
+        table.cancelled.remove(&thread);
+        match table.detach(thread) {
+            Some(Wait::Sync { objects, .. }) => self.release_objects(&objects),
+            None => Ok(()),
+        }
     }
 
     /// Cancels `thread`'s wait (`KThread::WaitCancel`): a thread in a synchronisation wait

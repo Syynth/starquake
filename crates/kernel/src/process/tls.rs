@@ -131,6 +131,14 @@ mod tests {
     use starquake_memory::Perms;
 
     #[test]
+    fn the_current_thread_handle_is_at_eden_s_golden_offset() {
+        // Golden protocol fact, not derived from the constant: Eden's
+        // `static_assert(offsetof(ThreadLocalRegion, current_thread_handle) == 0x110)`
+        // (`eden/src/core/hle/kernel/k_thread.cpp` @ cf654052, line 85).
+        assert_eq!(CURRENT_THREAD_HANDLE_OFFSET, 0x110);
+    }
+
+    #[test]
     fn a_page_holds_eight_regions_in_order_then_a_new_page_is_mapped() {
         let (mut space, log, _) = fixture::loaded();
         let mut tls = ThreadLocalPages::new();

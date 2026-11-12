@@ -151,6 +151,14 @@ mod tests {
         let info = processes.get(second).unwrap();
         assert_eq!(info.process_id(), FIRST_USER_PROCESS_ID + 1);
         assert_eq!(info.console(), Console::Switch1);
+        // Each later process takes the next id again, not the same one.
+        let third = processes
+            .create(&ProcessDescription::homebrew(Console::Switch2))
+            .unwrap();
+        assert_eq!(
+            processes.get(third).unwrap().process_id(),
+            FIRST_USER_PROCESS_ID + 2
+        );
         // The own process is still the first, and its rate is its own console's.
         assert_eq!(processes.process_id(), FIRST_USER_PROCESS_ID);
         assert_eq!(processes.counter_rate(), Console::Switch2.counter_rate());

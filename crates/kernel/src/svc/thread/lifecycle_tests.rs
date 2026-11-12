@@ -39,7 +39,13 @@ struct World {
 
 impl World {
     fn new(description: &ProcessDescription) -> Self {
+        Self::prepared(description, |_| {})
+    }
+
+    /// [`World::new`], with `prepare` changing the tables before the process runs.
+    fn prepared(description: &ProcessDescription, prepare: impl FnOnce(&mut Tables)) -> Self {
         let mut tables = crate::process::create(description, fixture::loaded().0).unwrap();
+        prepare(&mut tables);
         let first = tables.address_space.regions().kernel_map.start + GUARD_PAGES * PAGE_SIZE;
         let memory = FlatMemory::new(first, usize::try_from(TLS_PAGES * PAGE_SIZE).unwrap());
         let main = crate::process::run(&mut tables, &memory, ENTRY, STACK_TOP).unwrap();
@@ -238,8 +244,8 @@ fn create_start_and_exit_a_thread() {
     );
     // The handle still names it: the guest can still ask about it.
     assert_eq!(world.thread_id(handle), Ok(FIRST_THREAD_ID + 1));
-    // WAIT SEAM (kernel slice 4, #111): waiting on the handle for the exit (a join) belongs to
-    // `WaitSynchronization`; this checks only that the ended thread is what such a wait sees.
+    // Waiting on the handle for the exit (a join) is `Scheduler::terminate_thread`'s, tested in
+    // `sched/scheduler/lifecycle/tests.rs`.
     let own = world.tables.processes.own();
     assert_eq!(
         world
@@ -261,19 +267,50 @@ fn a_thread_that_exits_frees_its_tls_slot_and_the_slot_is_reused() {
     world.start(handle).unwrap();
     world.schedule(core(1), Some(thread));
     assert_eq!(world.tls_used(), 2);
+    // The thread leaves its region dirty, as libnx's thread variables at its end do.
+    let region_bytes = usize::try_from(THREAD_LOCAL_REGION_SIZE).unwrap();
+    world.memory.write(tls, &vec![0xA5; region_bytes]).unwrap();
     world.exit(core(1)).unwrap();
     // Its handle still holds it, so the slot is still taken.
     assert_eq!(world.tls_used(), 2);
     world.close(handle).unwrap();
     assert!(world.tables.scheduler.thread(thread).is_err());
     assert_eq!(world.tls_used(), 1);
-    // The next thread gets the same region.
-    let next = world.create(args(2)).unwrap();
-    let next = world.thread(next);
+    // The next thread gets the same region, zeroed but for its own handle.
+    let next_handle = world.create(args(2)).unwrap();
+    let next = world.thread(next_handle);
     assert_eq!(
         world.tables.scheduler.thread(next).unwrap().tls_address(),
         tls
     );
+    let mut region = vec![0; region_bytes];
+    world.memory.read(tls, &mut region).unwrap();
+    let mut expected = vec![0; region_bytes];
+    let at = usize::try_from(CURRENT_THREAD_HANDLE_OFFSET).unwrap();
+    let handle_bytes = next_handle.raw().to_le_bytes();
+    expected[at..at + handle_bytes.len()].copy_from_slice(&handle_bytes);
+    assert_eq!(region, expected);
+}
+
+#[test]
+fn a_full_object_table_makes_no_thread_and_frees_its_region() {
+    // One object: the main thread's, so `CreateThread`'s object is refused.
+    let mut world = World::prepared(&ProcessDescription::homebrew(Console::Switch1), |tables| {
+        *tables.scheduler.objects_mut() = crate::object::Objects::with_max_slots(1);
+    });
+    assert_eq!(world.tls_used(), 1);
+    assert_eq!(
+        world.create(args(1)),
+        Err(SvcError::Kernel(KernelError::OutOfResource))
+    );
+    assert_eq!(world.tls_used(), 1);
+    let own = world.tables.processes.own();
+    let record = world.tables.scheduler.process(own).unwrap();
+    assert_eq!(
+        record.threads().collect::<Vec<_>>(),
+        vec![world.main.thread]
+    );
+    assert_eq!(world.tables.handles.len(), 1);
 }
 
 #[test]
