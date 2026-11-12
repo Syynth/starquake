@@ -929,7 +929,8 @@ fn set_memory_permission_and_attribute_decode_their_registers() {
 #[test]
 fn query_memory_decodes_x0_and_x2_writes_the_callers_memory_and_zeroes_x1() {
     let dispatcher = Dispatcher::new(tables());
-    let memory = FlatMemory::new(BASE, 0x100);
+    // The fixture's code: the host may write all of it, as core's guest memory may.
+    let memory = FlatMemory::new(CODE, usize::try_from(CODE_SIZE).unwrap());
     let mut sink = Collect::default();
     let env = env();
     let (recorder, events) = recorder();
@@ -942,7 +943,7 @@ fn query_memory_decodes_x0_and_x2_writes_the_callers_memory_and_zeroes_x1() {
         recorder: &recorder,
     };
     let id = SvcId::QueryMemory;
-    let out = BASE + 0x40;
+    let out = DATA + 0x40;
     let mut regs = regs();
     regs.x[0] = out;
     regs.x[2] = CODE + 1;
@@ -960,20 +961,26 @@ fn query_memory_decodes_x0_and_x2_writes_the_callers_memory_and_zeroes_x1() {
     assert_eq!(text.state, MemoryState::Code.svc());
     assert_eq!(written, text.to_bytes());
 
-    // A pointer the caller cannot be written at: the result, and x1 still zero.
+    // A pointer into the caller's text, which the guest may not write though the host could:
+    // the result, x1 still zero, and the text unchanged.
+    let mut text_bytes = [0; SvcMemoryInfo::SIZE];
+    memory.read(CODE, &mut text_bytes).unwrap();
     let mut regs = before.clone();
-    regs.x[0] = BASE + 0x100;
+    regs.x[0] = CODE;
     let record = dispatcher.dispatch(id.number(), &mut regs, &mut caller);
     assert_eq!(record.outcome, Outcome::Completed);
     assert_eq!(
         (regs.x[0], regs.x[1]),
         (word(KernelError::InvalidPointer), 0)
     );
+    let mut after = [0; SvcMemoryInfo::SIZE];
+    memory.read(CODE, &mut after).unwrap();
+    assert_eq!(after, text_bytes);
     // x1 is not an argument of the call, so it is not in the events.
     let mut first = [0; SVC_ARG_COUNT];
     (first[0], first[2]) = (out, CODE + 1);
     let mut second = first;
-    second[0] = BASE + 0x100;
+    second[0] = CODE;
     let svc = |args, result: ResultCode| EventKind::Svc {
         id: u32::from(id.number()),
         args,

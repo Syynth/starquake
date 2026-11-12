@@ -6,7 +6,7 @@
 use starquake_memory::{FlatMemory, Perms};
 
 use super::*;
-use crate::memory::fixture::{CODE, DATA, DATA_PAGES, loaded, memory};
+use crate::memory::fixture::{CODE, CODE_SIZE, DATA, DATA_PAGES, RODATA, loaded, memory};
 use crate::memory::testing::{MapperCall, RecordingMapper};
 use crate::memory::{MemoryArrangement, MemoryPermission, MemoryState, SvcMemoryInfo};
 use crate::result::SvcError;
@@ -431,9 +431,26 @@ fn set_memory_attribute_on_memory_whose_state_forbids_it_is_invalid_current_memo
 
 // ----- QueryMemory ----------------------------------------------------------------------------
 
-/// Where the tests' guest memory is, and how large: room for one result with space around it.
-const OUT_BASE: u64 = 0x10_0000;
-const OUT_SIZE: usize = 0x100;
+/// The tests' guest memory: the fixture's code, filled with a marker. The host may write all of
+/// it, as core's guest memory may whatever the guest's permissions, so only the address space
+/// can refuse a pointer into text or read-only data.
+fn code_memory() -> FlatMemory {
+    let memory = FlatMemory::new(CODE, usize::try_from(CODE_SIZE).unwrap());
+    memory.write(CODE, &code_bytes_of(0xee)).unwrap();
+    memory
+}
+
+/// The fixture's code, every byte `byte`.
+fn code_bytes_of(byte: u8) -> Vec<u8> {
+    vec![byte; usize::try_from(CODE_SIZE).unwrap()]
+}
+
+/// All of the tests' guest memory.
+fn code_bytes(memory: &FlatMemory) -> Vec<u8> {
+    let mut bytes = code_bytes_of(0);
+    memory.read(CODE, &mut bytes).unwrap();
+    bytes
+}
 
 /// The bytes of the result `query_memory` wrote at `at`.
 fn written(memory: &FlatMemory, at: u64) -> [u8; SvcMemoryInfo::SIZE] {
@@ -445,9 +462,8 @@ fn written(memory: &FlatMemory, at: u64) -> [u8; SvcMemoryInfo::SIZE] {
 #[test]
 fn query_memory_writes_the_blocks_report_and_returns_no_page_flags() {
     let (space, _log, stack_top) = loaded();
-    let memory = FlatMemory::new(OUT_BASE, OUT_SIZE);
-    memory.write(OUT_BASE, &[0xee; OUT_SIZE]).unwrap();
-    let out = OUT_BASE + 0x20;
+    let memory = code_memory();
+    let out = DATA + 0x20;
     // The fixture's first query: an address on its stack.
     assert_eq!(
         query_memory(&space, &memory, out, stack_top - 0x38),
@@ -458,14 +474,10 @@ fn query_memory_writes_the_blocks_report_and_returns_no_page_flags() {
     assert_eq!(stack.svc_info().state, MemoryState::Stack.svc());
     assert_eq!(stack.svc_info().permission, PERM_READ_WRITE);
     // Nothing around the result was touched.
-    let mut around = [0; OUT_SIZE];
-    memory.read(OUT_BASE, &mut around).unwrap();
-    assert!(around[..0x20].iter().all(|byte| *byte == 0xee));
-    assert!(
-        around[0x20 + SvcMemoryInfo::SIZE..]
-            .iter()
-            .all(|byte| *byte == 0xee)
-    );
+    let mut expected = code_bytes_of(0xee);
+    let at = usize::try_from(out - CODE).unwrap();
+    expected[at..at + SvcMemoryInfo::SIZE].copy_from_slice(&stack.svc_info().to_bytes());
+    assert_eq!(code_bytes(&memory), expected);
 
     // Above the address space: one inaccessible block to the end of the 64-bit space.
     assert_eq!(query_memory(&space, &memory, out, u64::MAX), Ok(0));
@@ -485,21 +497,87 @@ fn query_memory_writes_the_blocks_report_and_returns_no_page_flags() {
 #[test]
 fn query_memory_to_a_pointer_that_cannot_be_written_is_invalid_pointer() {
     let (space, _log, _) = loaded();
-    let memory = FlatMemory::new(OUT_BASE, OUT_SIZE);
-    let end = OUT_BASE + OUT_SIZE as u64;
-    let fits = end - SvcMemoryInfo::SIZE as u64;
-    // The result ends exactly at the end of the memory: written.
+    let memory = code_memory();
+    let data_end = DATA + DATA_PAGES * PAGE_SIZE;
+    let fits = data_end - RESULT_SIZE;
+    // The result ends exactly at the end of the data: written.
     assert_eq!(query_memory(&space, &memory, fits, CODE), Ok(0));
-    // One byte further, below the memory, where the address wraps: nothing is written.
-    let before = written(&memory, fits);
-    for out in [fits + 1, OUT_BASE - 1, 0, u64::MAX] {
+    // One byte further, into the free memory above the code; free memory below it; and
+    // addresses where the result wraps: nothing is written.
+    let before = code_bytes(&memory);
+    for out in [
+        fits + 1,
+        CODE - RESULT_SIZE,
+        0,
+        u64::MAX - RESULT_SIZE + 2,
+        u64::MAX,
+    ] {
         assert_eq!(
             query_memory(&space, &memory, out, DATA),
             kernel(KernelError::InvalidPointer),
             "{out:#x}"
         );
     }
-    assert_eq!(written(&memory, fits), before);
+    assert_eq!(code_bytes(&memory), before);
+}
+
+#[test]
+fn query_memory_to_memory_the_guest_may_not_write_is_invalid_pointer() {
+    // Horizon copies the result out through the guest's own permissions (`KUserPointer`), so
+    // a pointer into memory the guest may not write is `ResultInvalidPointer` however the
+    // host could write it.
+    let (mut space, _log, _) = loaded();
+    let memory = code_memory();
+    // The data's middle page read-only, its last page no access.
+    assert_eq!(
+        set_memory_permission(&mut space, DATA + PAGE_SIZE, PAGE_SIZE, PERM_READ),
+        Ok(())
+    );
+    assert_eq!(
+        set_memory_permission(&mut space, DATA + 2 * PAGE_SIZE, PAGE_SIZE, PERM_NONE),
+        Ok(())
+    );
+    // A result that ends exactly where the read-only page starts is written.
+    let fits = DATA + PAGE_SIZE - RESULT_SIZE;
+    assert_eq!(query_memory(&space, &memory, fits, DATA), Ok(0));
+    let before = code_bytes(&memory);
+    for out in [
+        // Text (read-execute) and read-only data.
+        CODE,
+        RODATA,
+        // The page made read-only, and the page made no access.
+        DATA + PAGE_SIZE,
+        DATA + 2 * PAGE_SIZE,
+        // One byte further than `fits`: the last byte is on the read-only page.
+        fits + 1,
+        // Straddling the writable page and the read-only one.
+        DATA + PAGE_SIZE - 8,
+    ] {
+        assert_eq!(
+            query_memory(&space, &memory, out, DATA),
+            kernel(KernelError::InvalidPointer),
+            "{out:#x}"
+        );
+    }
+    assert_eq!(code_bytes(&memory), before);
+}
+
+#[test]
+fn query_memory_to_a_heap_page_made_inaccessible_is_invalid_pointer() {
+    let (mut space, _log, _) = loaded();
+    let heap = set_heap_size(&mut space, HEAP_SIZE_ALIGNMENT).unwrap();
+    let memory = FlatMemory::new(heap, usize::try_from(PAGE_SIZE).unwrap());
+    assert_eq!(query_memory(&space, &memory, heap, CODE), Ok(0));
+    let before = written(&memory, heap);
+    assert_eq!(
+        set_memory_permission(&mut space, heap, PAGE_SIZE, PERM_NONE),
+        Ok(())
+    );
+    assert_eq!(
+        query_memory(&space, &memory, heap, DATA),
+        kernel(KernelError::InvalidPointer)
+    );
+    assert_eq!(written(&memory, heap), before);
 }
 
 #[test]

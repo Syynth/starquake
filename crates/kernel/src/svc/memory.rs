@@ -34,7 +34,8 @@
 //! | | `PermissionLocked` is set if it is masked | `InvalidCombination` |
 //! | | the range lies inside the address space | `InvalidCurrentMemory` |
 //! | | the range's state allows the change | `InvalidCurrentMemory` |
-//! | `QueryMemory` | the result can be written to the caller's memory | `InvalidPointer` |
+//! | `QueryMemory` | the guest may write every byte of the result: each block the 0x28 bytes touch has user write permission | `InvalidPointer` |
+//! | | the result can be written to the caller's memory | `InvalidPointer` |
 //!
 //! # Divergences from Eden
 //!
@@ -44,13 +45,23 @@
 //!   alone. The two agree while the heap region is 8 GiB, which it is for a console with up
 //!   to 8 GiB of memory; with more, a Switch 2 heap may exceed 8 GiB. Test:
 //!   `the_heap_size_bound_is_the_larger_of_eight_gib_and_the_heap_region`.
-//! - **`QueryMemory` with a result pointer that cannot be written** returns
-//!   [`KernelError::InvalidPointer`]. Eden's `WriteBlock` logs and the call succeeds. The
-//!   result is Horizon's: its user-pointer copy fails with `svc::ResultInvalidPointer`
+//! - **`QueryMemory` with a result pointer the guest may not write** returns
+//!   [`KernelError::InvalidPointer`]: when any block the result's
+//!   [`SvcMemoryInfo::SIZE`] bytes touch lacks
+//!   [`USER_WRITE`](crate::memory::MemoryPermission::USER_WRITE) (free
+//!   memory, text, read-only data, a page made read-only or no access, or a range that wraps
+//!   or reaches above the address space), checked with [`AddressSpace::user_can_write`],
+//!   and when the caller's memory refuses the write. Eden's `WriteBlock` logs and the call
+//!   succeeds. The result is Horizon's: its user-pointer copy goes through the guest's own
+//!   permissions and fails with `svc::ResultInvalidPointer`
 //!   (`atmosphere/libraries/libmesosphere/include/mesosphere/svc/kern_svc_k_user_pointer.hpp`
-//!   @ 4e3f3703, fact only). Horizon checks the pointer before it queries; here the query
-//!   comes first, which no guest can tell apart, since the query cannot fail. Test:
-//!   `query_memory_to_a_pointer_that_cannot_be_written_is_invalid_pointer`.
+//!   @ 4e3f3703, fact only). The permission check is here because the caller's memory
+//!   (core's guest memory) writes as the host, whatever the guest's permissions. Horizon
+//!   checks the pointer before it queries; here the query comes first, which no guest can
+//!   tell apart, since the query cannot fail. Tests:
+//!   `query_memory_to_a_pointer_that_cannot_be_written_is_invalid_pointer`,
+//!   `query_memory_to_memory_the_guest_may_not_write_is_invalid_pointer`,
+//!   `query_memory_to_a_heap_page_made_inaccessible_is_invalid_pointer`.
 //! - **`QueryMemory` takes no handle**: Eden resolves the current-process pseudo-handle and
 //!   queries that process, which is the caller.
 //!
@@ -59,7 +70,7 @@
 
 use starquake_memory::{GuestMemory, PAGE_SIZE};
 
-use crate::memory::{AddressSpace, MemoryAttribute, SvcPermission};
+use crate::memory::{AddressSpace, MemoryAttribute, SvcMemoryInfo, SvcPermission};
 use crate::result::{CallResult, KernelError, SvcResult};
 
 /// What a heap's size must be a multiple of (`HeapSizeAlignment`): 2 MiB.
@@ -72,6 +83,9 @@ pub const MAIN_MEMORY_SIZE_MAX: u64 = 8 << 30;
 /// The value of `PageInfo::flags` that `QueryMemory` returns: always zero
 /// (`KPageTableBase::QueryInfoImpl`: `out_page->flags = 0`).
 pub const PAGE_INFO_FLAGS: u32 = 0;
+
+/// The size of what `QueryMemory` writes, as an address offset.
+const RESULT_SIZE: u64 = SvcMemoryInfo::SIZE as u64;
 
 /// The checks `SetMemoryPermission` and `SetMemoryAttribute` share: a page-aligned address, a
 /// page-aligned size that is not zero, and a range that does not wrap.
@@ -168,6 +182,10 @@ pub fn query_memory(
     address: u64,
 ) -> CallResult<u32> {
     let info = space.query_info(address)?.svc_info();
+    // The guest's permissions, which `memory`'s host writes do not check.
+    if !space.user_can_write(out_memory_info, RESULT_SIZE) {
+        return Err(KernelError::InvalidPointer.into());
+    }
     memory
         .write(out_memory_info, &info.to_bytes())
         .map_err(|_| KernelError::InvalidPointer)?;

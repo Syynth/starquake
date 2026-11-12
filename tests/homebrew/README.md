@@ -49,8 +49,8 @@ expected.
 
 `starquake run tests/homebrew/hello/hello.nro`, as of the kernel's address space (#97). The run
 now does everything the reference emulator's does before IPC, call for call
-(`hello/reference/`, and `crates/core/tests/homebrew.rs`, which compares the two on every gate
-run), and stops at the first call that needs a session:
+(`hello/reference/`, and `crates/core/tests/homebrew.rs`), and stops at the first call that
+needs a session:
 
 ```text
 thread 1
@@ -83,6 +83,11 @@ thread 1
 5. `diagAbortWithResult` does not expect `svcBreak` to return (`__builtin_unreachable()` in
    `libnx/nx/source/runtime/diag.c`), and the compiler put `udf #0` after the call. The run
    ends as a guest crash (exit code 1, undefined instruction) at `main+0xb5c`.
+
+`crates/core/tests/homebrew.rs` runs the fixture and compares its calls with the reference's
+only in its `on_hardware` module, which is compiled for macOS on Apple Silicon and returns early
+when the `CI` environment variable is set: so on a gate run on a Mac. On the hosted CI gate only
+its `comparison` module runs, which checks the comparison itself against made-up runs.
 
 So the next missing piece is the session side of the kernel: `svcConnectToNamedPort` and
 `svcSendSyncRequest`, and behind them `sm:` and `set:sys`. The guest log is still empty: the

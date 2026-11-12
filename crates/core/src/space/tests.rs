@@ -405,6 +405,51 @@ fn protect_changes_backed_pages_at_once_and_unbacked_ones_when_they_are_touched(
 }
 
 #[test]
+fn protect_leaves_the_mapping_that_starts_where_its_range_ends_alone() {
+    let space = space();
+    // Two neighbouring mappings, neither backed: read-write, then read-only.
+    space.map(LOW, PAGE_SIZE, Perms::ReadWrite).unwrap();
+    space.map(LOW + PAGE_SIZE, PAGE_SIZE, Perms::Read).unwrap();
+    assert_eq!(
+        space.protect(LOW, PAGE_SIZE, Perms::ReadWriteExecute),
+        Ok(())
+    );
+    // The upper mapping still refuses a store, and keeps its permission and its extent.
+    assert_eq!(space.touch(LOW + PAGE_SIZE, Access::Write), Touch::Refused);
+    assert_eq!(
+        space.shadow().mapping(LOW + PAGE_SIZE),
+        Some((
+            LOW + PAGE_SIZE,
+            Mapped {
+                end: LOW + 2 * PAGE_SIZE,
+                perms: Perms::Read
+            }
+        ))
+    );
+    assert_eq!(
+        space.shadow().mapping(LOW).unwrap().1.perms,
+        Perms::ReadWriteExecute
+    );
+}
+
+#[test]
+fn unmap_leaves_the_mapping_that_starts_where_its_range_ends_alone() {
+    let space = space();
+    // Two neighbouring mappings, neither backed, so only the mapping makes the upper page
+    // readable.
+    space.map(LOW, PAGE_SIZE, Perms::ReadWrite).unwrap();
+    space.map(LOW + PAGE_SIZE, PAGE_SIZE, Perms::Read).unwrap();
+    assert_eq!(space.unmap(LOW, PAGE_SIZE), Ok(()));
+    assert_eq!(space.touch(LOW, Access::Read), Touch::Refused);
+    // The upper page is still mapped: the host reads it as zero, and a load backs it.
+    let mut buf = [0xee; 4];
+    assert_eq!(space.read(LOW + PAGE_SIZE, &mut buf), Ok(()));
+    assert_eq!(buf, [0; 4]);
+    assert_eq!(space.touch(LOW + PAGE_SIZE, Access::Read), Touch::Backed);
+    assert_eq!(space.tables.walk(LOW + PAGE_SIZE), Ok(page(0, Perms::Read)));
+}
+
+#[test]
 fn unmap_removes_table_entries_and_a_new_mapping_there_reads_as_zero() {
     let space = space();
     space.map(LOW, 4 * PAGE_SIZE, Perms::ReadWrite).unwrap();

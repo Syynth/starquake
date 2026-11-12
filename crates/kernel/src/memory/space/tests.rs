@@ -248,6 +248,95 @@ fn only_code_memory_with_one_state_and_permission_can_be_reprotected_as_code() {
     assert_eq!(log.take(), []);
 }
 
+#[test]
+fn alias_code_made_writable_becomes_alias_code_data() {
+    // `KPageTableBase::SetProcessMemoryPermission`: `if (old_state == KMemoryState::AliasCode)
+    // new_state = KMemoryState::AliasCodeData` when the new permission is writable; any other
+    // permission keeps the state.
+    let (mut space, _log, _) = loaded();
+    let alias = CODE + CODE_SIZE;
+    space
+        .map_pages(
+            alias,
+            2,
+            MemoryState::AliasCode,
+            MemoryPermission::KERNEL_READ | MemoryPermission::NOT_MAPPED,
+        )
+        .unwrap();
+    let state_at = |space: &AddressSpace, address: u64| space.query_info(address).unwrap().state();
+    // Not writable: still alias code.
+    space
+        .set_process_memory_permission(alias, PAGE_SIZE, SvcPermission::ReadExecute)
+        .unwrap();
+    assert_eq!(state_at(&space, alias), MemoryState::AliasCode);
+    assert_eq!(
+        space.query_info(alias).unwrap().permission(),
+        MemoryPermission::USER_READ_EXECUTE
+    );
+    space
+        .set_process_memory_permission(alias + PAGE_SIZE, PAGE_SIZE, SvcPermission::Read)
+        .unwrap();
+    assert_eq!(state_at(&space, alias + PAGE_SIZE), MemoryState::AliasCode);
+    // Writable: alias code data.
+    space
+        .set_process_memory_permission(alias + PAGE_SIZE, PAGE_SIZE, SvcPermission::ReadWrite)
+        .unwrap();
+    let block = space.query_info(alias + PAGE_SIZE).unwrap();
+    assert_eq!(
+        (block.state(), block.permission()),
+        (
+            MemoryState::AliasCodeData,
+            MemoryPermission::USER_READ_WRITE
+        )
+    );
+    // The page below it is untouched.
+    assert_eq!(state_at(&space, alias), MemoryState::AliasCode);
+}
+
+// ----- What the guest may write ---------------------------------------------------------------
+
+#[test]
+fn the_user_can_write_a_range_only_if_every_block_it_touches_is_user_writable() {
+    let (mut space, _log, stack_top) = loaded();
+    // The data's middle page read-only, its last page no access: three blocks.
+    space
+        .set_memory_permission(DATA + PAGE_SIZE, PAGE_SIZE, SvcPermission::Read)
+        .unwrap();
+    space
+        .set_memory_permission(DATA + 2 * PAGE_SIZE, PAGE_SIZE, SvcPermission::None)
+        .unwrap();
+    let writable = |address: u64, size: u64| space.user_can_write(address, size);
+    // The writable data page, whole, and ending exactly at its end.
+    assert!(writable(DATA, PAGE_SIZE));
+    assert!(writable(DATA + PAGE_SIZE - 1, 1));
+    // One byte further reaches the read-only page.
+    assert!(!writable(DATA, PAGE_SIZE + 1));
+    assert!(!writable(DATA + PAGE_SIZE - 1, 2));
+    // Read-only, no access, text, rodata, free memory.
+    for address in [
+        DATA + PAGE_SIZE,
+        DATA + 2 * PAGE_SIZE,
+        CODE,
+        RODATA,
+        CODE - PAGE_SIZE,
+    ] {
+        assert!(!writable(address, 1), "{address:#x}");
+    }
+    // The stack, up to its top exactly; one byte past it is free memory.
+    assert!(writable(stack_top - STACK_SIZE, STACK_SIZE));
+    assert!(!writable(stack_top - 1, 2));
+    // Above the address space, at its last byte and past it, and a range that wraps.
+    let end = space.regions().address_space.end;
+    assert!(!writable(end, 1));
+    assert!(!writable(end - 1, 2));
+    assert!(!writable(u64::MAX, 1));
+    assert!(!writable(DATA, u64::MAX));
+    assert!(!writable(u64::MAX, 2));
+    // Nothing to write is always allowed.
+    assert!(writable(CODE, 0));
+    assert!(writable(u64::MAX, 0));
+}
+
 // ----- The main thread's stack ----------------------------------------------------------------
 
 #[test]

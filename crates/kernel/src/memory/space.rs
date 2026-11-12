@@ -798,6 +798,33 @@ impl AddressSpace {
             .copied()
             .ok_or_else(|| broken(BlockMapError::Broken { address }))
     }
+
+    /// Whether the guest may write all `size` bytes at `address`: every block the range
+    /// touches has [`MemoryPermission::USER_WRITE`]. False for a range that wraps or reaches
+    /// above the address space; true for `size == 0`, which writes nothing.
+    ///
+    /// Unlike the state check an operation makes of its range (`CheckMemoryState`), the blocks
+    /// need not be alike: a buffer may span two neighbouring blocks of different states, both
+    /// writable.
+    #[must_use]
+    pub fn user_can_write(&self, address: u64, size: u64) -> bool {
+        let Some(offset) = size.checked_sub(1) else {
+            return true;
+        };
+        let Some(last) = address.checked_add(offset) else {
+            return false;
+        };
+        // The walk ends at the block holding `last`, or at the end of the map (false).
+        for block in self.blocks.blocks_from(address) {
+            if !block.permission().contains(MemoryPermission::USER_WRITE) {
+                return false;
+            }
+            if last <= block.last() {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 #[cfg(test)]
