@@ -214,7 +214,6 @@ fn closing_the_session_drops_every_object_in_its_domain() {
     );
 }
 
-/// Divergence from Eden, which sends a TIPC request on a domain to the session's first handler.
 /// A handle the kernel refuses stops the reply before any object is added to the domain.
 #[test]
 fn a_reply_that_fails_on_a_handle_adds_no_object_to_the_domain() {
@@ -230,6 +229,7 @@ fn a_reply_that_fails_on_a_handle_adds_no_object_to_the_domain() {
     assert_eq!(open_child(&mut rig, 6), FIRST);
 }
 
+/// Divergence from Eden, which sends a TIPC request on a domain to the session's first handler.
 #[test]
 fn a_tipc_request_on_a_domain_is_not_supported() {
     let mut rig = Rig::domain();

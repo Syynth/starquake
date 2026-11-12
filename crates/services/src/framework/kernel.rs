@@ -1,9 +1,9 @@
 //! The kernel as the service framework sees it: the [`Kernel`] trait.
 //!
 //! Defined here for now (issue #77). The kernel's session slice (kernel spec, port plan slice 9)
-//! will implement it over its tables; until then [`FakeKernel`](super::fake::FakeKernel) stands
-//! in. Every call is about the request being handled: "the caller" is the guest thread that sent
-//! it, and its process's handle table and memory are the ones meant.
+//! will implement it over its tables; until then `FakeKernel` (in `framework::fake`, behind
+//! the `fakes` feature) stands in. Every call is about the request being handled: "the caller" is
+//! the guest thread that sent it, and its process's handle table and memory are the ones meant.
 //!
 //! Failures are the kernel's own result codes ([`KernelError`](starquake_kernel::result::KernelError)).
 //! When a service method lets one through with `?`, the caller sees that code.

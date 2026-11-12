@@ -42,6 +42,14 @@
 //! }
 //! ```
 //!
+//! The session struct is plain serialisable data: numbers, strings, collections, and ids for
+//! anything shared (an [`ObjectId`](starquake_kernel::id::ObjectId) or a `TargetId`, not a
+//! reference). State that several sessions share is kept once, outside them, and each session
+//! holds its id. A session holds no host handle, closure or lock, because none of those can be
+//! saved. This is the standing rule of the observability spec (`docs/specs/observability.md`,
+//! "Snapshots", decision 3): it is cheap only if it exists before the first service is written.
+//! Nothing here enforces it yet (see "Not here yet").
+//!
 //! - [`commands!`](crate::commands) implements [`Session`] for the struct: the dispatch `match`
 //!   and the table of ids and names.
 //! - [`Request`] gives the command id, the raw payload through a [`Reader`], buffers by index
@@ -58,7 +66,7 @@
 //! plan slice 9) owns queueing and calls [`Server::handle`] with the caller's message buffer, one
 //! request at a time per server; the reply is written over the request. The kernel is reached
 //! through the small [`Kernel`] trait, defined here until that slice implements it;
-//! [`fake::FakeKernel`] stands in for tests.
+//! `fake::FakeKernel` (behind the `fakes` feature) stands in for tests.
 //!
 //! The message is parsed here and not by the kernel, because how a request is framed depends on
 //! whether its session is a domain, which only the server knows.
@@ -126,6 +134,13 @@
 //!
 //! # Not here yet
 //!
+//! - Snapshots (`docs/specs/observability.md`, "Snapshots"). A [`Server`] already refers to its
+//!   interfaces by `TargetId` and its sessions by [`ObjectId`](starquake_kernel::id::ObjectId),
+//!   so its tables can be saved and re-linked by id. What is missing is a save and restore pair
+//!   for the `Box<dyn Session>` behind each table row: [`Session`] gives a snapshot no way to
+//!   reach a session's state. [`commands!`](crate::commands) is the natural place to require
+//!   that pair, since every session goes through it; that is a guess about where it fits, to be
+//!   confirmed when the snapshot format is designed.
 //! - Deferred replies and the per-request trace line are slice 3. Until then a method cannot
 //!   return "deferred", and requests are logged through `tracing` only where something went
 //!   wrong.
@@ -141,6 +156,7 @@
 mod commands;
 mod context;
 pub mod control;
+#[cfg(any(test, feature = "fakes"))]
 pub mod fake;
 mod kernel;
 pub mod payload;
