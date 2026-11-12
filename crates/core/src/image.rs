@@ -1,70 +1,146 @@
-//! Loading a program into a guest address space: where an NRO's segments, its `.bss` and the
-//! counter trampolines go ([`place`]), and creating the process's memory around them with the
-//! kernel ([`load`]): the code and the main thread's stack. The main thread itself, and its
-//! thread-local page, are the kernel's process creation's (`starquake_kernel::process::run`,
-//! called by the core loop).
+//! Loading a program into a guest address space: what process it is ([`Program`], with its
+//! description from its metadata), where its modules, their `.bss` and the counter trampolines
+//! go ([`place`]), and creating the process's memory around them with the kernel ([`load`]):
+//! the code and the main thread's stack. The main thread itself, and its thread-local page, are
+//! the kernel's process creation's (`starquake_kernel::process::run`, called by the core loop).
+//!
+//! A program is an NRO ([`Program::parse`]: one module, `main`) or an ExeFS
+//! ([`Program::from_exefs`]: `main.npdm` and up to thirteen NSO modules, in the loader's
+//! `starquake_loader::exefs::MODULE_NAMES` order). What each module puts in its pages is the
+//! loader's ([`CodeSet`]: segments, `MOD0` and `.bss`, the module's size); relocations are the
+//! guest's own (the loader's `codeset` module docs, "Relocations").
 //!
 //! [`load`] follows Eden's process start for a program (paths relative to the reference folder,
 //! all @ cf654052):
 //!
-//! 1. `KProcess::Initialize` (`eden/src/core/hle/kernel/k_process.cpp`): the kernel lays out
-//!    the address space around the code, reserves the code's memory and maps it with no guest
-//!    access (`starquake_kernel::memory::AddressSpace::new`).
-//! 2. `KProcess::LoadModule`: the image is written, then each segment is reprotected
-//!    (`set_process_memory_permission`).
-//! 3. `KProcess::Run`: the main thread's stack is reserved and mapped in the stack region
-//!    (`create_main_thread_stack`). The rest of `KProcess::Run` (the main thread and its
-//!    thread-local page, in the kernel-map region) is the kernel's `process::run`.
+//! 1. `KProcess::LoadFromMetadata` and `KProcess::Initialize`
+//!    (`eden/src/core/hle/kernel/k_process.cpp`): the kernel lays out the address space around
+//!    the code, reserves the code's memory and maps it with no guest access
+//!    (`starquake_kernel::memory::AddressSpace::new`). The code is every module, one after the
+//!    other from [`IMAGE_BASE`] (`AppLoader_DeconstructedRomDirectory::Load`,
+//!    `eden/src/core/loader/deconstructed_rom_directory.cpp`: `next_load_addr` is the end of the
+//!    module before).
+//! 2. `KProcess::LoadModule`, for each module: the module is written, then each segment is
+//!    reprotected (`set_process_memory_permission`).
+//! 3. `KProcess::Run`: the main thread's stack, of the description's size, is reserved and
+//!    mapped in the stack region (`create_main_thread_stack`). The rest of `KProcess::Run` (the
+//!    main thread and its thread-local page, in the kernel-map region) is the kernel's
+//!    `process::run`.
 //!
 //! ```text
-//! IMAGE_BASE - n pages   counter trampolines (only when a read was patched)
-//! IMAGE_BASE             the image (text, rodata, data), then .bss            "main"
+//! IMAGE_BASE - n pages   counter trampolines of every module (only when a read was patched)
+//! IMAGE_BASE             the first module (rtld, or main), then .bss
+//!                        each later module, from the end of the one before
 //! above the code, each 2 MiB aligned (starquake_kernel::memory::layout):
 //!   kernel-map region    the kernel's thread-local pages (not this module's)
 //!   stack region         the stack, four pages in
 //!   alias region, heap region
 //! ```
 //!
-//! PROVISIONAL, and what replaces each part: wiring the loader's NPDM into process creation
-//! (#33) places the code and sizes the stack from the program's metadata; until then this module
-//! does the steps above itself, with these fixed choices:
+//! # The process's description
+//!
+//! [`Program::description`] is what the kernel creates the process from. For an ExeFS it comes
+//! from `main.npdm` as Eden's `KProcess::LoadFromMetadata` reads it
+//! (`eden/src/core/hle/kernel/k_process.cpp` and
+//! `eden-pr4588/src/core/file_sys/program_metadata.cpp` @ e5fb3b97), for the inputs in this
+//! table; the divergences below list the inputs of `LoadFromMetadata` that are refused or not
+//! read:
+//!
+//! | Description | NPDM | Eden |
+//! |---|---|---|
+//! | name | `META` name, its first [`metadata::PROCESS_NAME_SIZE`] bytes | `std::memcpy(params.name.data(), name.data(), sizeof(params.name))`, `CreateProcessParameter::name` is 12 bytes (`eden/src/core/hle/kernel/svc_types.h`) |
+//! | program id | `ACI0` title id | `GetTitleID` returns `aci_header.title_id` |
+//! | address space | `META` flags bits 1-3 | `GetAddressSpaceType` |
+//! | cores, priorities | the `ACI0` kernel capabilities' thread info | `Initialize(kernel, params, metadata.GetKernelCapabilities(), ...)`, the `ACI0` list (`aci_kernel_capabilities`) |
+//! | main thread priority and core, stack size | `META` 0xE, 0xF, 0x1C | `LoadParameters{GetMainThreadPriority(), GetMainThreadStackSize()}`, `m_ideal_core_id = metadata.GetMainThreadCore()` |
+//! | system resource size | `META` 0x14 | `system_resource_num_pages = GetSystemResourceSize() / PageSize` |
+//! | handle table size | the `ACI0` handle-table capability, zero without one | `KCapabilities::SetHandleTableCapability`; `m_handle_table_size = 0` before the list is read |
+//! | console | Switch 2 when the `ACID` is in the Switch 2 layout | `m_uses_pauth_returns = metadata.UsesExtendedAcid()` (Eden PR #4588) |
+//!
+//! The console decides the counter rate (`crate::clock`), so the patcher's rate and the
+//! kernel's `GetSystemTick` follow the program's metadata, and the memory arrangement
+//! ([`memory_arrangement`]). The description is checked with the kernel's own checks
+//! (`starquake_kernel::process::ProcessInfo::new`) when the program is parsed, so a program
+//! the kernel would refuse is refused before a VM is made.
+//!
+//! The `ACI0` is checked against its `ACID` (`Npdm::validate_against_acid`) and a violation is
+//! logged, never refused: the loader's `npdm::validate` docs say to use it as a diagnostic, and
+//! Eden trusts both blocks. Test: `an_aci0_its_acid_does_not_permit_is_logged_not_refused`.
+//!
+//! An NRO has no metadata: it is described by Eden's defaults for a program with no NPDM
+//! (`ProcessDescription::homebrew`), built for [`crate::clock::NRO_CONSOLE`].
+//!
+//! Divergences from Eden in the description, each pinned by a test here:
+//!
+//! - **A 32-bit program** (`META` flags bit 0 clear) is [`LoadError::Not64Bit`], checked before
+//!   the thread info. Eden's `KProcess::LoadFromMetadata` sets `CreateProcessFlag::Is64Bit` only
+//!   when `metadata.Is64BitProgram()`, and `KProcess::InitializeInterfaces` then runs a process
+//!   without it under `Core::ArmDynarmic32`; starquake runs only 64-bit Arm code. Test:
+//!   `a_32_bit_program_is_refused`.
+//! - **The `ACID` pool partition is not read**, so the description does not follow
+//!   `KProcess::LoadFromMetadata` in this input. Eden sizes the process's resource limit from
+//!   `kernel.MemoryManager().GetSize(pool)`, with `pool` from `metadata.GetPoolPartition()`, and
+//!   sets `CreateProcessFlag::IsApplication` only for `KMemoryManager::Pool::Application`
+//!   (`KProcess::Initialize` then picks the application system resource, and NCE patching is
+//!   gated on it). Here the description has no such field: the resource limit is the console's
+//!   application pool whatever the partition ([`memory_arrangement`]), and no is-application
+//!   flag is kept. Test: `the_pool_partition_does_not_change_the_description`.
+//! - **No thread-info capability** is [`LoadError::NoThreadInfo`]. Eden leaves the process's
+//!   core and priority masks empty and goes on; its main thread then fails a soft assert
+//!   (`KThread::Initialize`). Test: `metadata_without_thread_info_is_refused`.
+//! - **A name cut inside a character** keeps the characters before the cut: the parser reads
+//!   the name as UTF-8 text, where Eden copies twelve raw bytes. Test:
+//!   `the_process_name_is_the_first_twelve_bytes_of_the_metadatas`.
+//!
+//! # Placement
 //!
 //! - **The code goes at [`IMAGE_BASE`]**, Eden's address for 39-bit code with no randomisation
 //!   (`KProcess::LoadFromMetadata`: `code_address = 0x8000'0000 + aslr_space_offset`), and the
-//!   regions are not randomised either (kernel spec: deterministic by default).
-//! - **The stack is [`STACK_SIZE`]**, what Eden gives a program with no NPDM, and there is one
-//!   thread.
-//! - **Every program gets the 4 GiB memory arrangement** ([`MEMORY_ARRANGEMENT`]), as every
-//!   program counts time at the Switch 1 rate (`crate::clock`). Process creation picks both by
-//!   what the program was built for.
+//!   regions are not randomised either (kernel spec: deterministic by default). Only a 39-bit
+//!   address space is built (the kernel's `ProcessError::AddressSpace`).
+//! - **The memory arrangement** is the console's ([`memory_arrangement`]): 4 GiB for a Switch 1
+//!   program, 12 GiB for a Switch 2 one.
 //!
 //! # Permissions
 //!
-//! [`Layout::module`] says what the module's pages are: whole pages, each with the permissions
-//! guest code has there. The permissions are Eden's (`eden/src/core/hle/kernel/k_process.cpp`
-//! @ cf654052):
+//! [`Layout::module_regions`] says what the modules' pages are: whole pages, each with the
+//! permissions guest code has there. The permissions are Eden's
+//! (`eden/src/core/hle/kernel/k_process.cpp` @ cf654052):
 //!
 //! | What | Guest code may | Eden |
 //! |---|---|---|
 //! | `.text` | read, execute | `KProcess::LoadModule`, `ReprotectSegment(CodeSegment, ReadExecute)` |
 //! | `.rodata` | read | `ReprotectSegment(RODataSegment, Read)` |
-//! | `.data`, `.bss` | read, write | `ReprotectSegment(DataSegment, ReadWrite)`; `LoadNroImpl` (`eden/src/core/loader/nro.cpp`) adds `.bss` to the data segment |
-//! | pages of the module in no segment | nothing (mapped, so the loader can write the image) | `KProcess::Initialize`, "Map the code region": `KernelRead \| NotMapped` |
+//! | `.data`, `.bss` | read, write | `ReprotectSegment(DataSegment, ReadWrite)`; both loaders add `.bss` to the data segment (the loader's `codeset` module docs) |
+//! | pages of a module in no segment | nothing (mapped, so the loader can write the image) | `KProcess::Initialize`, "Map the code region": `KernelRead \| NotMapped` |
 //! | stack | read, write | `KProcess::Run`, `KMemoryState::Stack`, `UserReadWrite` |
 //! | counter trampolines | read, execute | starquake's own: see below |
 //!
-//! A segment covers whole pages: its size is rounded up to a page, as `LoadNroImpl` does
-//! (`PageAlignSize`). Divergences from Eden, each pinned by a test here:
+//! A segment covers whole pages: its size is rounded up to a page, as `LoadNroImpl` and
+//! `AppLoader_NSO::LoadModule` do (`PageAlignSize`). Divergences from Eden, each pinned by a
+//! test here:
 //!
-//! - **The counter trampolines** are pages a console does not have. They are mapped as code,
-//!   read-execute, in the pages right below the image, where no region is placed and nothing a
-//!   program asks about lies: the pages after the module, where a console's loader would put
-//!   a program's arguments, are free as on a console
+//! - **The counter trampolines** are pages a console does not have. Every module's are in one
+//!   run of pages, mapped as code, read-execute, right below the first module, where no region
+//!   is placed and nothing a program asks about lies: the pages after the last module, where a
+//!   console's loader would put a program's arguments, are free as on a console
 //!   (`the_trampolines_lie_below_the_image_and_the_page_after_the_module_is_free`). They are
 //!   not counted as the process's memory, so `GetInfo` reports what a console would
 //!   (`the_trampolines_are_not_counted_as_the_processs_memory`). `QueryMemory` does show them.
-//!   Under NCE, Eden appends its patch section to the module's image instead
+//!   Under NCE, Eden appends its patch section to each module's image instead
 //!   (`eden/src/core/loader/nro.cpp`, `LoadNroImpl`, `HAS_NCE`), where it is counted.
+//!   A module's trampolines must be within a branch's reach (128 MiB) of every read the module
+//!   has: a set whose patched reads lie further above the trampolines is refused with the
+//!   patcher's `BranchOutOfRange` (`a_read_out_of_the_trampolines_reach_is_refused`); placing
+//!   trampolines between modules would lift that limit and move the modules off Eden's
+//!   addresses. Guess, not checked against any source here: a title's `rtld` finds modules by
+//!   walking the address space for code; it walks upwards from its own module, so it does not
+//!   meet pages below the first module. Running a retail title would confirm it.
+//!   While guest code is inside a trampoline its program counter is the trampoline's address,
+//!   not the patched read's: an exit there (a fault on the two stack words a trampoline saves,
+//!   or the timeout's interrupt) is reported at that address, which the memory map names
+//!   `trampolines`, and a resumed guest carries on in the trampoline. Nothing maps it back to
+//!   the read it stands for.
 //! - A segment that does not start on a page boundary is [`LoadError::MisalignedSegment`]
 //!   (`a_segment_that_starts_inside_a_page_is_an_error`). Eden does not refuse it.
 //!   `ReprotectSegment` in `KProcess::LoadModule` discards the result of
@@ -76,7 +152,8 @@
 //!   `eden/src/common/assert.cpp`, which carries on unless debug asserts are switched on)
 //!   before it calls `ProtectRegion` on the unaligned range and succeeds. Guess: what guest
 //!   code can then do with the pages that range touches was not traced past `ProtectRegion`;
-//!   running Eden on such a file would confirm it.
+//!   running Eden on such a file would confirm it. Only an NRO reaches this check: an NSO's
+//!   code set has refused a misaligned segment already.
 //! - Two segments that share a page (after rounding) are [`LoadError::OverlappingSegments`]
 //!   (`segments_that_share_a_page_are_an_error`). Eden reprotects in the order text, rodata,
 //!   data. When every page of the later segment has one memory state and one permission at
@@ -84,33 +161,29 @@
 //!   win for the shared pages. Otherwise `CheckMemoryState` fails
 //!   (`R_UNLESS(info.m_permission == first_perm, ResultInvalidCurrentMemory)`, and the same
 //!   check on `m_state`), the result is discarded, the shared page keeps the earlier segment's
-//!   permissions and the rest of the later segment stays `KernelRead | NotMapped`.
-//! - `.bss` is the pages `[image_end, bss_end)`: it starts where the image, rounded up to a
-//!   page, ends. `LoadNroImpl` does `codeset.DataSegment().size += bss_size` instead, so Eden's
-//!   read-write range is the data segment's pages plus `bss_size` bytes directly after them.
-//!   The two are the same pages only when the data segment ends at the page-rounded end of the
-//!   image (`bss_starts_on_the_page_after_the_image_and_is_read_write`). When it ends earlier,
-//!   Eden's range stops short of the end of `.bss` and takes in the image pages after the data
-//!   segment; here those pages keep what their own segment gives them, or no guest access
-//!   (`bss_is_read_write_where_it_lies_even_when_the_data_segment_ends_before_the_image`).
+//!   permissions and the rest of the later segment stays `KernelRead | NotMapped`. Only an NRO
+//!   reaches this check: an NSO's code set has refused segments out of order already.
+//! - An NRO's `.bss` is the pages `[image_end, bss_end)`, its own range, where `LoadNroImpl`
+//!   adds it to the data segment (the loader's `codeset` module docs;
+//!   `bss_is_read_write_where_it_lies_even_when_the_data_segment_ends_before_the_image`).
 //! - A reprotection the kernel refuses is [`LoadError::Map`], not ignored as Eden's
 //!   `ReprotectSegment` ignores it. [`place`] has refused the layouts that would make it fail.
 //!
-//! The module's size follows Eden's NRO loader (`eden/src/core/loader/nro.cpp` @ cf654052,
-//! `LoadNroImpl`): the image rounded up to a page, plus `.bss` rounded up to a page, with the
-//! `MOD0` header's `.bss` size preferred over the NRO header's when `MOD0` is present. Divergence:
-//! a `MOD0` whose `.bss` end precedes its start is [`LoadError::BadBss`] here; Eden subtracts
-//! the two unchecked.
-//!
 //! Memory the kernel maps reads as zero until it is written (`crate::space`), so `.bss` and the
 //! stack need no writes.
+
+mod metadata;
 
 use starquake_kernel::memory::{
     AddressSpace as KernelSpace, CreateError, Mapper, MemoryArrangement, MemoryPermission,
     MemoryState, ProcessMemory, RegionOffsets, SvcPermission,
 };
+use starquake_kernel::process::{Console, ProcessDescription, ProcessError};
 use starquake_kernel::result::SvcError;
-use starquake_loader::nro::{Nro, NroError};
+use starquake_loader::codeset::{CodeSet, CodeSetError, NroOrCodeSetError};
+use starquake_loader::exefs::ExeFs;
+use starquake_loader::npdm::validate::AcidViolation;
+use starquake_loader::nro::NroError;
 use starquake_loader::patch::{CounterRescale, PatchConfig, PatchError, patch_text};
 use starquake_memory::{Fault, GuestMemory, PAGE_SIZE, Perms};
 
@@ -119,18 +192,13 @@ use crate::report::Mapping;
 
 /// The guest's page size (`docs/specs/execution-model.md`: a 4 KiB granule).
 pub(crate) const PAGE: u64 = PAGE_SIZE;
-/// Guest virtual address the program's image goes at: Eden's address for 39-bit code without
-/// randomisation (see the module docs).
+/// Guest virtual address the program's first module goes at: Eden's address for 39-bit code
+/// without randomisation (see the module docs).
 pub(crate) const IMAGE_BASE: u64 = 0x8000_0000;
-/// Size of the main thread's stack: what Eden gives a program with no NPDM
-/// (`Core::Memory::DEFAULT_STACK_SIZE` in `eden/src/core/memory.h` @ cf654052, used by
-/// `eden/src/core/loader/nro.cpp`). PROVISIONAL: Horizon takes it from the NPDM.
-pub(crate) const STACK_SIZE: u64 = 0x10_0000;
-/// The console's memory arrangement every program runs with. PROVISIONAL (see the module
-/// docs).
-pub(crate) const MEMORY_ARRANGEMENT: MemoryArrangement = MemoryArrangement::FourGb;
-/// The name the program's module goes by in the memory map and crash reports.
-pub(crate) const MODULE_NAME: &str = "main";
+/// The name an NRO's one module goes by in the memory map and crash reports.
+pub(crate) const MODULE_NAME: &str = starquake_loader::exefs::MAIN_MODULE;
+/// Alignment of each module's first trampoline (`patch_text` requires 8).
+const TRAMPOLINE_ALIGN: u64 = 8;
 
 /// Why a program could not be loaded into guest memory.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -138,10 +206,22 @@ pub enum LoadError {
     /// The file is not a well-formed NRO.
     #[error("the program is not a loadable NRO: {0}")]
     Nro(#[from] NroError),
-    /// The `MOD0` header's `.bss` end precedes its start.
-    #[error("the NRO's MOD0 header describes a .bss that ends before it starts")]
-    BadBss,
-    /// The counter patcher rejected the text segment.
+    /// A module cannot be loaded (the loader's code set refused it).
+    #[error(transparent)]
+    CodeSet(#[from] CodeSetError),
+    /// The program's metadata marks it as 32-bit (`META` flags bit 0 clear): its code is
+    /// 32-bit Arm, which starquake does not run (see "The process's description" in the module
+    /// docs).
+    #[error("the program's metadata marks it as 32-bit (AArch32) code, which cannot be run")]
+    Not64Bit,
+    /// The program's metadata has no thread-info capability, so its process has no cores or
+    /// priorities.
+    #[error("the program's metadata gives its process no cores or priorities")]
+    NoThreadInfo,
+    /// The kernel would refuse the process the metadata describes.
+    #[error("the program's metadata describes a process the kernel refuses: {0}")]
+    Process(#[from] ProcessError),
+    /// The counter patcher rejected a module's text.
     #[error("the program's text could not be patched: {0}")]
     Patch(#[from] PatchError),
     /// A segment does not start on a page boundary.
@@ -156,7 +236,7 @@ pub enum LoadError {
         /// Offset in the image of the first shared page.
         offset: u64,
     },
-    /// A size in the NRO, or an address derived from one, does not fit 64 bits.
+    /// A size in the program, or an address derived from one, does not fit 64 bits.
     #[error("the program's sizes overflow the address space")]
     Overflow,
     /// The kernel could not create the program's address space: its code does not fit the
@@ -176,33 +256,105 @@ pub enum LoadError {
     Write(Fault),
 }
 
-/// A parsed program: the NRO's header fields and its image bytes.
+impl From<NroOrCodeSetError> for LoadError {
+    fn from(error: NroOrCodeSetError) -> Self {
+        match error {
+            NroOrCodeSetError::Nro(error) => Self::Nro(error),
+            NroOrCodeSetError::CodeSet(error) => Self::CodeSet(error),
+        }
+    }
+}
+
+/// One module of a program.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProgramModule {
+    /// Its name in the memory map and crash reports: its ExeFS file name, or `main`.
+    pub(crate) name: String,
+    /// What it puts in its pages.
+    pub(crate) code: CodeSet,
+}
+
+/// A parsed program: its modules in placement order, and the process it runs as.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Program {
-    nro: Nro,
-    /// The image: the first `nro.size` bytes of the file.
-    image: Vec<u8>,
+    modules: Vec<ProgramModule>,
+    description: ProcessDescription,
+    acid_violation: Option<AcidViolation>,
 }
 
 impl Program {
-    /// Parses `bytes` as an NRO.
+    /// Parses `bytes` as an NRO: one module, described by Eden's defaults for a program with no
+    /// NPDM (see the module docs).
     pub(crate) fn parse(bytes: &[u8]) -> Result<Self, LoadError> {
-        let nro = Nro::parse(bytes)?;
-        // `Nro::parse` has checked that the image fits the file.
-        let image = usize::try_from(nro.size)
-            .ok()
-            .and_then(|size| bytes.get(..size))
-            .ok_or(LoadError::Overflow)?
-            .to_vec();
-        Ok(Self { nro, image })
+        let code = CodeSet::parse_nro(bytes)?;
+        Self::new(
+            vec![ProgramModule {
+                name: MODULE_NAME.to_owned(),
+                code,
+            }],
+            ProcessDescription::homebrew(crate::clock::NRO_CONSOLE),
+            None,
+        )
     }
 
-    /// Size of `.bss` in bytes, before rounding (see the module docs).
-    fn bss_size(&self) -> Result<u32, LoadError> {
-        match &self.nro.mod0 {
-            Some(mod0) => mod0.bss_size().ok_or(LoadError::BadBss),
-            None => Ok(self.nro.bss_size),
+    /// The program an ExeFS holds: its modules, and the process its `main.npdm` describes (see
+    /// "The process's description" in the module docs). An `ACI0` its `ACID` does not permit
+    /// is logged, not refused.
+    pub(crate) fn from_exefs(exefs: ExeFs) -> Result<Self, LoadError> {
+        let ExeFs { npdm, modules } = exefs;
+        let description = metadata::describe(&npdm)?;
+        let acid_violation = npdm.validate_against_acid().err();
+        if let Some(violation) = &acid_violation {
+            tracing::warn!(%violation, "the program's ACI0 asks for more than its ACID permits");
         }
+        let modules = modules
+            .into_iter()
+            .map(|module| ProgramModule {
+                name: module.name.to_owned(),
+                code: module.code,
+            })
+            .collect();
+        Self::new(modules, description, acid_violation)
+    }
+
+    /// Checks `description` as the kernel will when it creates the process.
+    fn new(
+        modules: Vec<ProgramModule>,
+        description: ProcessDescription,
+        acid_violation: Option<AcidViolation>,
+    ) -> Result<Self, LoadError> {
+        // The id is the kernel's to give; the checks do not read it.
+        starquake_kernel::process::ProcessInfo::new(&description, 0)?;
+        Ok(Self {
+            modules,
+            description,
+            acid_violation,
+        })
+    }
+
+    /// What the kernel creates the program's process from.
+    pub(crate) fn description(&self) -> &ProcessDescription {
+        &self.description
+    }
+
+    /// What the program's `ACI0` breaks against its `ACID`, if anything (logged when parsed).
+    #[cfg(test)]
+    pub(crate) fn acid_violation(&self) -> Option<&AcidViolation> {
+        self.acid_violation.as_ref()
+    }
+
+    /// The modules, in placement order.
+    #[cfg(test)]
+    pub(crate) fn modules(&self) -> &[ProgramModule] {
+        &self.modules
+    }
+}
+
+/// The memory arrangement of a console: 4 GiB for a Switch 1, 12 GiB for a Switch 2.
+pub(crate) const fn memory_arrangement(console: Console) -> MemoryArrangement {
+    match console {
+        Console::Switch1 => MemoryArrangement::FourGb,
+        Console::Switch2 => MemoryArrangement::TwelveGb,
     }
 }
 
@@ -217,40 +369,51 @@ pub(crate) struct Region {
     pub(crate) perms: Perms,
 }
 
-/// Where a program's module and its trampolines go, and the bytes to put there: what [`place`]
-/// works out from the file alone.
+/// Where a program's modules and their trampolines go, and the bytes to put there: what
+/// [`place`] works out from the files alone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Layout {
-    /// Address the guest starts executing at: the first byte of the image.
+    /// Address the guest starts executing at: the first byte of the first module.
     pub(crate) entry: u64,
     /// `(address, bytes)` to copy into guest memory, in address order.
     pub(crate) writes: Vec<(u64, Vec<u8>)>,
     /// Everything that was laid out, in address order.
     pub(crate) mappings: Vec<Mapping>,
-    /// The module's pages, in address order, none overlapping: every page from the module's
-    /// base to its end (see "Permissions" in the module docs).
+    /// The modules' pages, in address order, none overlapping: every page from the first
+    /// module's base to the last one's end (see "Permissions" in the module docs).
     pub(crate) module_regions: Vec<Region>,
-    /// The counter trampolines' pages, right below the module, if a read was patched.
+    /// The counter trampolines' pages, right below the first module, if a read was patched.
     pub(crate) trampolines: Option<Region>,
-    /// The program's module.
-    pub(crate) module: Module,
+    /// The program's modules, in address order.
+    pub(crate) modules: Vec<Module>,
     /// Addresses of the counter reads that were patched, in address order.
     pub(crate) counter_reads: Vec<u64>,
+}
+
+impl Layout {
+    /// Where the code ends: one past the last module's last page.
+    fn code_end(&self) -> u64 {
+        self.modules
+            .last()
+            .map_or(self.entry, |module| module.base.saturating_add(module.size))
+    }
 }
 
 /// A loaded program, as the core loop and the run's report need it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Placement {
-    /// Address the guest starts executing at: the first byte of the image.
+    /// Address the guest starts executing at: the first byte of the first module.
     pub(crate) entry: u64,
     /// Initial stack pointer: the end of the stack.
     pub(crate) stack_top: u64,
     /// Everything that was mapped, in address order.
     pub(crate) mappings: Vec<Mapping>,
-    /// The program's module.
-    pub(crate) module: Module,
+    /// The program's modules, in address order.
+    pub(crate) modules: Vec<Module>,
     /// Addresses of the counter reads that were patched, in address order.
     pub(crate) counter_reads: Vec<u64>,
+    /// What the kernel creates the process from.
+    pub(crate) description: ProcessDescription,
 }
 
 /// What [`load`] hands back: where things are, and the kernel's address space that holds them.
@@ -273,34 +436,23 @@ fn add(a: u64, b: u64) -> Result<u64, LoadError> {
     a.checked_add(b).ok_or(LoadError::Overflow)
 }
 
-/// The module's pages: its segments and `.bss` with their permissions, and every other page of
-/// `base..bss_end` with none (see "Permissions" in the module docs).
-fn module_regions(
-    program: &Program,
-    base: u64,
-    image_end: u64,
-    bss_end: u64,
-) -> Result<Vec<Region>, LoadError> {
-    let segment_perms = [Perms::ReadExecute, Perms::Read, Perms::ReadWrite];
+/// A module's pages at `base`: its protected ranges with their permissions, and every other page
+/// of the module with none (see "Permissions" in the module docs).
+fn module_regions(code: &CodeSet, base: u64) -> Result<Vec<Region>, LoadError> {
     let mut parts = Vec::new();
-    for (segment, perms) in program.nro.segments().into_iter().zip(segment_perms) {
-        if segment.size == 0 {
-            continue;
-        }
-        if !u64::from(segment.offset).is_multiple_of(PAGE) {
+    for (range, perms) in code.protections() {
+        if !range.offset.is_multiple_of(PAGE) {
             return Err(LoadError::MisalignedSegment {
-                offset: segment.offset,
+                offset: u32::try_from(range.offset).map_err(|_| LoadError::Overflow)?,
             });
         }
-        let start = add(base, u64::from(segment.offset))?;
-        let end = add(start, page_up(u64::from(segment.size))?)?;
+        let start = add(base, range.offset)?;
+        let end = add(start, page_up(range.size)?)?;
         parts.push((start, end, perms));
-    }
-    if image_end < bss_end {
-        parts.push((image_end, bss_end, Perms::ReadWrite));
     }
     parts.sort_by_key(|&(start, _, _)| start);
 
+    let module_end = add(base, code.size)?;
     let mut regions = Vec::new();
     let mut push = |start: u64, end: u64, perms| {
         if start < end {
@@ -323,104 +475,139 @@ fn module_regions(
         push(start, end, perms);
         at = end;
     }
-    push(at, bss_end, Perms::None);
+    push(at, module_end, Perms::None);
     Ok(regions)
 }
 
-/// The program's image with its counter reads rewritten for `counter` to branch to
-/// trampolines at `trampolines_at`, and what the patcher did.
+/// `code` with its counter reads rewritten for `counter` to branch to trampolines at
+/// `trampolines_at`, for the module at `base`, and what the patcher did.
 fn patch(
-    program: &Program,
+    code: &CodeSet,
     base: u64,
     trampolines_at: u64,
     counter: Option<CounterRescale>,
-) -> Result<(Vec<u8>, starquake_loader::patch::Patched), LoadError> {
-    let nro = &program.nro;
-    let mut image = program.image.clone();
-    let text_address = add(base, u64::from(nro.text.offset))?;
-    let text = usize::try_from(nro.text.offset)
-        .ok()
-        .zip(usize::try_from(nro.text.size).ok())
-        .and_then(|(start, len)| Some(start..start.checked_add(len)?))
-        .and_then(|range| image.get_mut(range))
-        .ok_or(LoadError::Overflow)?;
+) -> Result<(CodeSet, starquake_loader::patch::Patched), LoadError> {
+    let mut code = code.clone();
+    let text_address = add(base, code.text.offset)?;
+    let text = code.text_mut().ok_or(LoadError::Overflow)?;
     let patched = patch_text(text, text_address, trampolines_at, &PatchConfig { counter })?;
-    Ok((image, patched))
+    Ok((code, patched))
 }
 
-/// Lays `program`'s module out at `base` (see the module docs), rewriting its counter reads
-/// for `counter` if one is given, with the trampolines in the pages right below `base`.
+/// Lays `program`'s modules out from `base`, one after the other (see the module docs),
+/// rewriting their counter reads for `counter` if one is given, with every module's
+/// trampolines in one run of pages right below `base`.
 pub(crate) fn place(
     program: &Program,
     base: u64,
     counter: Option<CounterRescale>,
 ) -> Result<Layout, LoadError> {
-    let nro = &program.nro;
-    let image_end = add(base, page_up(u64::from(nro.size))?)?;
-    let bss_end = add(image_end, page_up(u64::from(program.bss_size()?))?)?;
+    // Where each module goes.
+    let mut bases = Vec::with_capacity(program.modules.len());
+    let mut at = base;
+    for module in &program.modules {
+        bases.push(at);
+        at = add(at, module.code.size)?;
+    }
 
-    // The trampolines end where the image starts, so where they start depends on how many
-    // there are: patch once to count them (how many there are does not depend on where they
-    // go; the page after the module is as good a place as any), then again with their address.
-    let (mut image, mut patched) = patch(program, base, bss_end, counter)?;
-    let trampolines_len = u64::try_from(patched.trampolines.len())
-        .map_err(|_| LoadError::Overflow)
-        .and_then(page_up)?;
+    // The trampolines end where the first module starts, so where they start depends on how
+    // many there are: patch once to count each module's (how many there are does not depend on
+    // where they go; the start of the module's own text, rounded down, is always in reach),
+    // then again with their addresses.
+    let mut offsets = Vec::with_capacity(program.modules.len());
+    let mut total = 0_u64;
+    for (module, &module_base) in program.modules.iter().zip(&bases) {
+        let text_address = add(module_base, module.code.text.offset)?;
+        let near = text_address - text_address % TRAMPOLINE_ALIGN;
+        let (_, first_pass) = patch(&module.code, module_base, near, counter)?;
+        let len = u64::try_from(first_pass.trampolines.len()).map_err(|_| LoadError::Overflow)?;
+        offsets.push((total, len));
+        total = add(total, len)?
+            .checked_next_multiple_of(TRAMPOLINE_ALIGN)
+            .ok_or(LoadError::Overflow)?;
+    }
+    let trampolines_len = page_up(total)?;
     let trampolines_at = base
         .checked_sub(trampolines_len)
         .ok_or(LoadError::Overflow)?;
-    if trampolines_len != 0 {
-        let first_len = patched.trampolines.len();
-        (image, patched) = patch(program, base, trampolines_at, counter)?;
-        if patched.trampolines.len() != first_len {
-            return Err(LoadError::Overflow);
-        }
-    }
 
+    let mut area = Vec::new();
+    let mut writes = Vec::new();
     let mut mappings = Vec::new();
-    let mut map = |name: &str, start: u64, end: u64| {
+    let mut module_regions_all = Vec::new();
+    let mut modules = Vec::new();
+    let mut counter_reads = Vec::new();
+    let mut map = |name: String, start: u64, end: u64| {
         if start < end {
-            mappings.push(Mapping {
-                name: name.to_owned(),
-                start,
-                end,
-            });
+            mappings.push(Mapping { name, start, end });
         }
     };
-    map("trampolines", trampolines_at, base);
-    for (name, segment) in [".text", ".rodata", ".data"]
-        .into_iter()
-        .zip(nro.segments())
+    map("trampolines".to_owned(), trampolines_at, base);
+    for ((module, &module_base), &(offset, len)) in program.modules.iter().zip(&bases).zip(&offsets)
     {
-        let start = add(base, u64::from(segment.offset))?;
-        let end = add(start, u64::from(segment.size))?;
-        map(&format!("{MODULE_NAME}{name}"), start, end);
-    }
-    map(&format!("{MODULE_NAME}.bss"), image_end, bss_end);
-    mappings.sort_by_key(|mapping| mapping.start);
+        // Patched again even with no trampolines: a read into `xzr` becomes a `nop` and needs
+        // none.
+        let (code, patched) = patch(
+            &module.code,
+            module_base,
+            add(trampolines_at, offset)?,
+            counter,
+        )?;
+        let placed_len =
+            u64::try_from(patched.trampolines.len()).map_err(|_| LoadError::Overflow)?;
+        if placed_len != len {
+            return Err(LoadError::Overflow);
+        }
+        if !patched.trampolines.is_empty() {
+            let start = usize::try_from(offset).map_err(|_| LoadError::Overflow)?;
+            area.resize(start, 0);
+            area.extend_from_slice(&patched.trampolines);
+        }
+        counter_reads.extend(patched.sites.iter().map(|site| site.address));
 
-    let mut writes = Vec::new();
-    if !patched.trampolines.is_empty() {
-        writes.push((trampolines_at, patched.trampolines));
+        let name = &module.name;
+        for (segment, range) in [".text", ".rodata", ".data"]
+            .into_iter()
+            .zip(code.segments())
+        {
+            let start = add(module_base, range.offset)?;
+            map(format!("{name}{segment}"), start, add(start, range.size)?);
+        }
+        let module_end = add(module_base, code.size)?;
+        if code.bss.size != 0 {
+            map(
+                format!("{name}.bss"),
+                add(module_base, code.bss.offset)?,
+                module_end,
+            );
+        }
+        module_regions_all.extend(module_regions(&code, module_base)?);
+        for piece in &code.pieces {
+            writes.push((add(module_base, piece.offset)?, piece.bytes.clone()));
+        }
+        modules.push(Module {
+            name: name.clone(),
+            base: module_base,
+            size: code.size,
+            build_id: code.build_id.to_vec(),
+        });
     }
-    writes.push((base, image));
+    mappings.sort_by_key(|mapping| mapping.start);
+    if !area.is_empty() {
+        writes.insert(0, (trampolines_at, area));
+    }
     Ok(Layout {
         entry: base,
         writes,
         mappings,
-        module_regions: module_regions(program, base, image_end, bss_end)?,
+        module_regions: module_regions_all,
         trampolines: (trampolines_len != 0).then_some(Region {
             start: trampolines_at,
             size: trampolines_len,
             perms: Perms::ReadExecute,
         }),
-        module: Module {
-            name: MODULE_NAME.to_owned(),
-            base,
-            size: bss_end - base,
-            build_id: nro.build_id.to_vec(),
-        },
-        counter_reads: patched.sites.iter().map(|site| site.address).collect(),
+        modules,
+        counter_reads,
     })
 }
 
@@ -437,22 +624,24 @@ fn reprotection(perms: Perms) -> Option<SvcPermission> {
 }
 
 /// Loads `program` at [`IMAGE_BASE`]: creates its address space with the kernel, with `mapper`
-/// making the kernel's mappings real, copies the image into `memory` (that same address space,
-/// as host code sees it) and gives the process a main thread's stack. Counter
-/// reads are rewritten for `counter` if one is given. See the module docs for the steps.
+/// making the kernel's mappings real, copies the modules into `memory` (that same address
+/// space, as host code sees it) and gives the process a main thread's stack of the size its
+/// description asks for. Counter reads are rewritten for `counter` if one is given. See the
+/// module docs for the steps.
 pub(crate) fn load(
     program: &Program,
     counter: Option<CounterRescale>,
     mapper: Box<dyn Mapper>,
     memory: &dyn GuestMemory,
 ) -> Result<Loaded, LoadError> {
+    let description = program.description();
     let layout = place(program, IMAGE_BASE, counter)?;
     let refused = |what: &'static str| move |error: SvcError| LoadError::Map { what, error };
     let mut space = KernelSpace::new(
         &ProcessMemory {
-            code_address: layout.module.base,
-            code_size: layout.module.size,
-            arrangement: MEMORY_ARRANGEMENT,
+            code_address: layout.entry,
+            code_size: layout.code_end() - layout.entry,
+            arrangement: memory_arrangement(description.console),
             alias_region_extra: false,
             offsets: RegionOffsets::default(),
         },
@@ -479,23 +668,28 @@ pub(crate) fn load(
         }
     }
     let stack_top = space
-        .create_main_thread_stack(STACK_SIZE)
+        .create_main_thread_stack(description.main_thread_stack_size)
         .map_err(refused("stack"))?;
 
     let mut mappings = layout.mappings;
-    mappings.push(Mapping {
-        name: "stack".to_owned(),
-        start: stack_top - STACK_SIZE,
-        end: stack_top,
-    });
+    if stack_top != 0 {
+        // The kernel rounds the stack up to whole pages; a stack of no bytes has no top.
+        let stack_size = page_up(description.main_thread_stack_size)?;
+        mappings.push(Mapping {
+            name: "stack".to_owned(),
+            start: stack_top - stack_size,
+            end: stack_top,
+        });
+    }
     mappings.sort_by_key(|mapping| mapping.start);
     Ok(Loaded {
         placed: Placement {
             entry: layout.entry,
             stack_top,
             mappings,
-            module: layout.module,
+            modules: layout.modules,
             counter_reads: layout.counter_reads,
+            description: description.clone(),
         },
         address_space: space,
     })
@@ -511,13 +705,14 @@ mod tests {
     use starquake_testkit::{a64, programs};
 
     use super::*;
+    use crate::clock::NRO_CONSOLE;
 
     /// Where a real run puts the program.
     const BASE: u64 = IMAGE_BASE;
     /// The counter rates of a real run: Apple Silicon's and the kernel's.
     const RESCALE: CounterRescale = CounterRescale {
         host_hz: 24_000_000,
-        guest_hz: crate::clock::PROCESS_CONSOLE.counter_rate().hz(),
+        guest_hz: NRO_CONSOLE.counter_rate().hz(),
     };
     /// How much flat guest memory the loading tests have around [`IMAGE_BASE`]: a megabyte
     /// below it (for trampolines) and one from it (for the image).
@@ -565,6 +760,11 @@ mod tests {
         }
     }
 
+    /// The stack an NRO's process gets: Eden's default description's.
+    fn stack_size() -> u64 {
+        ProcessDescription::homebrew(NRO_CONSOLE).main_thread_stack_size
+    }
+
     /// Flat guest memory around [`IMAGE_BASE`].
     fn flat() -> FlatMemory {
         FlatMemory::new(BASE - FLAT_BELOW, FLAT_SIZE)
@@ -599,13 +799,13 @@ mod tests {
         assert_eq!(placed.counter_reads, Vec::<u64>::new());
         assert_eq!(placed.trampolines, None);
         assert_eq!(
-            placed.module,
-            Module {
+            placed.modules,
+            [Module {
                 name: "main".into(),
                 base: BASE,
                 size: 2 * PAGE,
                 build_id: vec![0; BUILD_ID_SIZE],
-            }
+            }]
         );
     }
 
@@ -704,7 +904,7 @@ mod tests {
                 mapping("main.bss", BASE + 2 * PAGE, BASE + 4 * PAGE),
             ]
         );
-        assert_eq!(placed.module.size, 4 * PAGE);
+        assert_eq!(placed.modules[0].size, 4 * PAGE);
         assert!(CODE_OFFSET < usize::try_from(PAGE).unwrap());
         // Data and .bss are both read-write, each its own run of pages.
         assert_eq!(
@@ -762,8 +962,8 @@ mod tests {
                 }
             }
             // The module's regions are exactly the module, with no hole.
-            let module_end = placed.module.base + placed.module.size;
-            let mut at = placed.module.base;
+            let module_end = placed.code_end();
+            let mut at = placed.modules[0].base;
             for r in &placed.module_regions {
                 assert_eq!(r.start, at);
                 at += r.size;
@@ -806,7 +1006,7 @@ mod tests {
             ]
         );
         // The module ends with that page, and the image is written whole.
-        assert_eq!(placed.module.size, 3 * PAGE);
+        assert_eq!(placed.modules[0].size, 3 * PAGE);
         assert_eq!(placed.writes, [(BASE, file)]);
     }
 
@@ -894,8 +1094,8 @@ mod tests {
             .find(|r| r.start == image_end)
             .expect("a .bss region");
         assert_eq!(*bss, region(image_end, 1, Perms::ReadWrite));
-        for segment in program.nro.segments() {
-            let end = BASE + u64::from(segment.offset) + u64::from(segment.size);
+        for segment in program.modules()[0].code.segments() {
+            let end = BASE + segment.offset + segment.size;
             assert!(end.next_multiple_of(PAGE) <= image_end);
         }
     }
@@ -960,8 +1160,14 @@ mod tests {
         let start_at = MOD0_OFFSET + 2 * MOD0_FIELD_SIZE;
         let end = word_at(&file, u64::try_from(start_at + MOD0_FIELD_SIZE).unwrap());
         file[start_at..start_at + 4].copy_from_slice(&(end + 1).to_le_bytes());
-        let program = Program::parse(&file).unwrap();
-        assert_eq!(place(&program, BASE, None), Err(LoadError::BadBss));
+        assert_eq!(
+            Program::parse(&file),
+            Err(LoadError::CodeSet(CodeSetError::BadBss))
+        );
+        assert_eq!(
+            LoadError::CodeSet(CodeSetError::BadBss).to_string(),
+            "the NRO's MOD0 header describes a .bss that ends before it starts"
+        );
     }
 
     // ----- load: the process's memory around the module -------------------------------------------
@@ -1013,7 +1219,7 @@ mod tests {
         let stack_bottom = regions.stack.start + guard;
         let first_tls_page = regions.kernel_map.start + guard;
         assert_eq!(placed.entry, IMAGE_BASE);
-        assert_eq!(placed.stack_top, stack_bottom + STACK_SIZE);
+        assert_eq!(placed.stack_top, stack_bottom + stack_size());
         assert_eq!(placed.stack_top % 16, 0, "SP must be 16-byte aligned");
         assert_eq!(
             placed.mappings,
@@ -1024,7 +1230,11 @@ mod tests {
                 mapping("stack", stack_bottom, placed.stack_top),
             ]
         );
-        assert_eq!(placed.module.size, 3 * PAGE);
+        assert_eq!(placed.modules[0].size, 3 * PAGE);
+        assert_eq!(
+            placed.description,
+            ProcessDescription::homebrew(NRO_CONSOLE)
+        );
 
         // The kernel's blocks: each segment with Eden's state and permission, and the stack. The
         // thread-local pages are the kernel's process creation's: none is mapped here.
@@ -1060,7 +1270,7 @@ mod tests {
             at(placed.stack_top - 1),
             (
                 stack_bottom,
-                STACK_SIZE,
+                stack_size(),
                 MemoryState::Stack,
                 MemoryPermission::USER_READ_WRITE
             )
@@ -1070,11 +1280,11 @@ mod tests {
         // (`KProcess::GetUsedUserPhysicalMemorySize`).
         assert_eq!(
             address_space.used_user_physical_memory_size(),
-            3 * PAGE + STACK_SIZE
+            3 * PAGE + stack_size()
         );
         assert_eq!(
             address_space.limit().limit(),
-            MEMORY_ARRANGEMENT.application_pool_size()
+            MemoryArrangement::FourGb.application_pool_size()
         );
 
         // The image is in guest memory.
@@ -1086,7 +1296,7 @@ mod tests {
     #[test]
     fn loading_asks_the_translation_for_each_mapping_in_edens_order() {
         let (Loaded { placed, .. }, _, calls) = loaded(&three_segments(), None);
-        let stack_bottom = placed.stack_top - STACK_SIZE;
+        let stack_bottom = placed.stack_top - stack_size();
         // The code with no guest access, the three segments reprotected, the stack.
         let map = |address, size, perms| MapperCall::Map {
             address,
@@ -1105,7 +1315,7 @@ mod tests {
                 protect(BASE, Perms::ReadExecute),
                 protect(BASE + PAGE, Perms::Read),
                 protect(BASE + 2 * PAGE, Perms::ReadWrite),
-                map(stack_bottom, STACK_SIZE, Perms::ReadWrite),
+                map(stack_bottom, stack_size(), Perms::ReadWrite),
             ]
         );
     }
@@ -1162,7 +1372,7 @@ mod tests {
         // The pages after the module are free, up to the kernel-map region (where the kernel
         // puts thread-local pages), as they are on a console (whose loader maps a program's
         // arguments there, when it has any).
-        let module_end = BASE + placed.module.size;
+        let module_end = BASE + placed.modules[0].size;
         let (start, size, state, _) = block(&address_space, module_end);
         assert_eq!((start, state), (module_end, MemoryState::Free));
         assert!(start + size >= address_space.regions().kernel_map.start);
@@ -1187,7 +1397,7 @@ mod tests {
         let (without, _, _) = loaded(&counter.nro, None);
         assert!(with.placed.mappings.iter().any(|m| m.name == "trampolines"));
         // `GetInfo` reports what a console would: the module and the stack.
-        let expected = with.placed.module.size + STACK_SIZE;
+        let expected = with.placed.modules[0].size + stack_size();
         for loaded in [&with, &without] {
             let space = &loaded.address_space;
             assert_eq!(space.used_user_physical_memory_size(), expected);
@@ -1278,7 +1488,7 @@ mod tests {
     #[test]
     fn a_program_larger_than_the_application_pool_is_refused() {
         // More `.bss` than an application may use: the kernel cannot reserve the code.
-        let pool = u32::try_from(MEMORY_ARRANGEMENT.application_pool_size()).unwrap();
+        let pool = u32::try_from(MemoryArrangement::FourGb.application_pool_size()).unwrap();
         let build = |bss: u32| {
             let file = NroBuilder::new(&[a64::nop()])
                 .bss_size(bss)
@@ -1331,5 +1541,501 @@ mod tests {
         let (mapper, _log) = RecordingMapper::new();
         let exact = FlatMemory::new(BASE, file.len());
         assert!(load(&program, None, Box::new(mapper), &exact).is_ok());
+    }
+
+    // ----- ExeFS programs: several modules, and a description from the metadata ---------------
+
+    const HELLO_NSO: &[u8] = include_bytes!("../../../tests/homebrew/hello/hello.nso");
+    const HELLO_NPDM: &[u8] = include_bytes!("../../../tests/homebrew/hello/main.npdm");
+    const HELLO_JSON: &str = include_str!("../../../tests/homebrew/hello/hello.json");
+
+    /// An ExeFS of the hello fixture's metadata and `modules`, each the fixture's NSO.
+    fn exefs(modules: &[&'static str]) -> ExeFs {
+        let mut files = vec![(starquake_loader::exefs::NPDM_FILE, HELLO_NPDM)];
+        files.extend(modules.iter().map(|name| (*name, HELLO_NSO)));
+        ExeFs::parse(&files).unwrap()
+    }
+
+    /// An NSO's code set: `text` padded with `nop`s to whole pages, no rodata, eight bytes of
+    /// data on the page after the text, and `bss_size` bytes of `.bss`.
+    fn nso(text: &[u32], bss_size: u32) -> CodeSet {
+        use starquake_loader::nso::{Nso, NsoSegment, RodataExtent};
+        let page_words = usize::try_from(PAGE).unwrap() / 4;
+        let mut words = text.to_vec();
+        words.resize(words.len().max(1).next_multiple_of(page_words), a64::nop());
+        let text = a64::to_bytes(&words);
+        let end = u32::try_from(text.len()).unwrap();
+        let none = RodataExtent { offset: 0, size: 0 };
+        CodeSet::from_nso(Nso {
+            text: NsoSegment {
+                memory_offset: 0,
+                data: text,
+            },
+            rodata: NsoSegment {
+                memory_offset: end,
+                data: Vec::new(),
+            },
+            data: NsoSegment {
+                memory_offset: end,
+                data: vec![0xD7; 8],
+            },
+            bss_size,
+            build_id: [0x42; starquake_loader::codeset::BUILD_ID_SIZE],
+            flags: 0,
+            module_name_offset: 0,
+            module_name_size: 0,
+            api_info: none,
+            dynstr: none,
+            dynsym: none,
+        })
+        .unwrap()
+    }
+
+    /// A program of `modules`, described as an NRO is.
+    fn program_of(modules: Vec<(&str, CodeSet)>) -> Program {
+        Program::new(
+            modules
+                .into_iter()
+                .map(|(name, code)| ProgramModule {
+                    name: name.to_owned(),
+                    code,
+                })
+                .collect(),
+            ProcessDescription::homebrew(NRO_CONSOLE),
+            None,
+        )
+        .unwrap()
+    }
+
+    fn read_counter() -> u32 {
+        a64::mrs(0, a64::SysReg::CntPctEl0).unwrap()
+    }
+
+    /// Where the `b` at `address`, in `bytes` placed at `at`, branches to.
+    fn branch_target(bytes: &[u8], at: u64, address: u64) -> u64 {
+        let word = word_at(bytes, address - at);
+        assert_eq!(word & 0xFC00_0000, 0x1400_0000, "not a b: {word:#x}");
+        let distance = (i64::from(word & 0x03FF_FFFF) << 38) >> 36;
+        address.checked_add_signed(distance).unwrap()
+    }
+
+    /// Loads `program` into flat memory with a recording mapper.
+    fn load_program(program: &Program) -> Loaded {
+        let (mapper, _log) = RecordingMapper::new();
+        load(program, None, Box::new(mapper), &flat()).unwrap()
+    }
+
+    #[test]
+    fn an_exefs_is_described_by_its_metadata() {
+        let json: serde_json::Value = serde_json::from_str(HELLO_JSON).unwrap();
+        let number = |value: &serde_json::Value| match value {
+            serde_json::Value::String(text) => {
+                u64::from_str_radix(text.trim_start_matches("0x"), 16).unwrap()
+            }
+            other => other.as_u64().unwrap(),
+        };
+        let byte = |value: &serde_json::Value| u8::try_from(number(value)).unwrap();
+        let capability = |kind: &str| {
+            json["kernel_capabilities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["type"] == kind)
+                .unwrap()["value"]
+                .clone()
+        };
+        let flags = capability("kernel_flags");
+        let program = Program::from_exefs(exefs(&["main"])).unwrap();
+        let description = program.description();
+        let name = json["name"].as_str().unwrap();
+        assert_eq!(description.name, name[..metadata::PROCESS_NAME_SIZE]);
+        assert_eq!(description.program_id, number(&json["title_id"]));
+        assert_eq!(
+            description.address_space,
+            starquake_kernel::process::AddressSpaceWidth::Is39Bit
+        );
+        // npdmtool's "highest" and "lowest" name the numbers, not the urgency.
+        assert_eq!(
+            (description.priorities.first, description.priorities.last),
+            (
+                byte(&flags["lowest_thread_priority"]),
+                byte(&flags["highest_thread_priority"])
+            )
+        );
+        assert_eq!(
+            (description.cores.first, description.cores.last),
+            (
+                byte(&flags["lowest_cpu_id"]),
+                byte(&flags["highest_cpu_id"])
+            )
+        );
+        assert_eq!(
+            description.main_thread_priority,
+            byte(&json["main_thread_priority"])
+        );
+        assert_eq!(description.main_thread_core, byte(&json["default_cpu_id"]));
+        assert_eq!(
+            description.main_thread_stack_size,
+            number(&json["main_thread_stack_size"])
+        );
+        assert_eq!(
+            u64::try_from(description.handle_table_size).unwrap(),
+            number(&capability("handle_table_size"))
+        );
+        assert_eq!(description.console, Console::Switch1);
+        // The fixture's ACI0 is inside its ACID.
+        assert_eq!(program.acid_violation(), None);
+        // It differs from what an NRO gets, so the metadata is what was used.
+        assert_ne!(*description, ProcessDescription::homebrew(NRO_CONSOLE));
+    }
+
+    #[test]
+    fn modules_follow_one_another_from_the_base() {
+        let program = Program::from_exefs(exefs(&["sdk", "main", "rtld"])).unwrap();
+        let placed = place(&program, BASE, None).unwrap();
+        let size = program.modules()[0].code.size;
+        let names: Vec<_> = placed.modules.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, ["rtld", "main", "sdk"]);
+        for (index, module) in (0_u64..).zip(&placed.modules) {
+            let base = BASE + size * index;
+            assert_eq!((module.base, module.size), (base, size), "{}", module.name);
+            let text = format!("{}.text", module.name);
+            let found = placed.mappings.iter().find(|m| m.name == text).unwrap();
+            assert_eq!(found.start, base);
+        }
+        assert_eq!(placed.entry, BASE);
+        assert_eq!(placed.code_end(), BASE + 3 * size);
+        // The regions cover the three modules with no hole and nothing outside them.
+        let mut at = BASE;
+        for region in &placed.module_regions {
+            assert_eq!(region.start, at);
+            at += region.size;
+        }
+        assert_eq!(at, placed.code_end());
+        // Every module's segments are written at its base, and nothing else is.
+        let code = &program.modules()[0].code;
+        let expected: Vec<_> = (0..3_u64)
+            .flat_map(|index| {
+                code.pieces
+                    .iter()
+                    .map(move |piece| (BASE + size * index + piece.offset, piece.bytes.clone()))
+            })
+            .collect();
+        assert_eq!(placed.writes, expected);
+    }
+
+    #[test]
+    fn each_module_starts_at_the_sum_of_the_sizes_before_it() {
+        // Three modules whose `.bss` makes each a different size (three, two and five pages), so
+        // a base advanced by any one module's size instead of its own is caught.
+        let page = u32::try_from(PAGE).unwrap();
+        let program = program_of(vec![
+            // A page of text, eight bytes of data, then `.bss`.
+            ("rtld", nso(&[], page)),
+            ("main", nso(&[], 0)),
+            ("sdk", nso(&[], 3 * page)),
+        ]);
+        let sizes: Vec<u64> = program.modules().iter().map(|m| m.code.size).collect();
+        assert_eq!(sizes, [3 * PAGE, 2 * PAGE, 5 * PAGE]);
+        let placed = place(&program, BASE, Some(RESCALE)).unwrap();
+        let mut expected = BASE;
+        for (module, size) in placed.modules.iter().zip(&sizes) {
+            assert_eq!(
+                (module.base, module.size),
+                (expected, *size),
+                "{}",
+                module.name
+            );
+            let text = format!("{}.text", module.name);
+            let found = placed.mappings.iter().find(|m| m.name == text).unwrap();
+            assert_eq!(found.start, expected, "{}", module.name);
+            expected += size;
+        }
+        assert_eq!(placed.code_end(), expected);
+        // The regions cover every module with no hole.
+        let mut at = BASE;
+        for region in &placed.module_regions {
+            assert_eq!(region.start, at);
+            at += region.size;
+        }
+        assert_eq!(at, expected);
+    }
+
+    #[test]
+    fn a_module_with_an_empty_text_is_placed_with_nothing_to_patch() {
+        // Rodata and data present, text empty: the text's page has no guest access, and the
+        // patcher has nothing to rewrite.
+        use starquake_loader::nso::{Nso, NsoSegment, RodataExtent};
+        let page = u32::try_from(PAGE).unwrap();
+        let none = RodataExtent { offset: 0, size: 0 };
+        let code = CodeSet::from_nso(Nso {
+            text: NsoSegment {
+                memory_offset: 0,
+                data: Vec::new(),
+            },
+            rodata: NsoSegment {
+                memory_offset: page,
+                data: vec![0xB2; 0x10],
+            },
+            data: NsoSegment {
+                memory_offset: 2 * page,
+                data: vec![0xC3; 8],
+            },
+            bss_size: 0,
+            build_id: [0x42; starquake_loader::codeset::BUILD_ID_SIZE],
+            flags: 0,
+            module_name_offset: 0,
+            module_name_size: 0,
+            api_info: none,
+            dynstr: none,
+            dynsym: none,
+        })
+        .unwrap();
+        let placed = place(&program_of(vec![("main", code)]), BASE, Some(RESCALE)).unwrap();
+        assert_eq!(
+            placed.regions(),
+            [
+                region(BASE, 1, Perms::None),
+                region(BASE + PAGE, 1, Perms::Read),
+                region(BASE + 2 * PAGE, 1, Perms::ReadWrite),
+            ]
+        );
+        assert_eq!(
+            placed.mappings,
+            [
+                mapping("main.rodata", BASE + PAGE, BASE + PAGE + 0x10),
+                mapping("main.data", BASE + 2 * PAGE, BASE + 2 * PAGE + 8),
+            ]
+        );
+        assert_eq!(placed.counter_reads, Vec::<u64>::new());
+        assert_eq!(placed.trampolines, None);
+    }
+
+    #[test]
+    fn an_nso_modules_bss_shares_its_datas_pages_and_runs_to_the_modules_end() {
+        let placed = place(&program_of(vec![("main", nso(&[], 0x1234))]), BASE, None).unwrap();
+        // One page of text; data's eight bytes and 0x1234 of .bss: two read-write pages.
+        assert_eq!(
+            placed.regions(),
+            [
+                region(BASE, 1, Perms::ReadExecute),
+                region(BASE + PAGE, 2, Perms::ReadWrite),
+            ]
+        );
+        assert_eq!(
+            placed.mappings,
+            [
+                mapping("main.text", BASE, BASE + PAGE),
+                mapping("main.data", BASE + PAGE, BASE + PAGE + 8),
+                mapping("main.bss", BASE + PAGE + 8, BASE + 3 * PAGE),
+            ]
+        );
+        // With no .bss there is no .bss mapping, and data keeps its one page.
+        let placed = place(&program_of(vec![("main", nso(&[], 0))]), BASE, None).unwrap();
+        assert!(placed.mappings.iter().all(|m| m.name != "main.bss"));
+        assert_eq!(
+            placed.regions()[1],
+            region(BASE + PAGE, 1, Perms::ReadWrite)
+        );
+    }
+
+    #[test]
+    fn every_modules_trampolines_share_one_run_below_the_first() {
+        let first = nso(&[read_counter()], 0);
+        let second = nso(&[a64::nop(), read_counter()], 0);
+        let size = first.size;
+        let program = program_of(vec![("rtld", first), ("main", second)]);
+        let placed = place(&program, BASE, Some(RESCALE)).unwrap();
+        let reads = [BASE, BASE + size + 4];
+        assert_eq!(placed.counter_reads, reads);
+        assert_eq!(
+            placed.trampolines,
+            Some(region(BASE - PAGE, 1, Perms::ReadExecute))
+        );
+        assert_eq!(
+            placed.mappings[0],
+            mapping("trampolines", BASE - PAGE, BASE)
+        );
+        // The area is written first, then each module's pieces (text, data); each read
+        // branches into the area, the second module's past the first's, 8-aligned.
+        let (area_at, area) = &placed.writes[0];
+        assert_eq!(*area_at, BASE - PAGE);
+        assert_eq!(placed.writes[1].0, BASE);
+        assert_eq!(placed.writes[3].0, BASE + size);
+        let first_target = branch_target(&placed.writes[1].1, BASE, reads[0]);
+        let second_target = branch_target(&placed.writes[3].1, BASE + size, reads[1]);
+        assert_eq!(first_target, BASE - PAGE);
+        assert!(first_target < second_target && second_target < BASE);
+        assert_eq!(second_target % TRAMPOLINE_ALIGN, 0);
+        // Both reads are the same shape, so each module's trampolines are one module's alone:
+        // the second starts at the first's length rounded up to 8, and the area ends with it.
+        let alone = place(
+            &program_of(vec![("main", nso(&[read_counter()], 0))]),
+            BASE,
+            Some(RESCALE),
+        )
+        .unwrap();
+        let one = alone.writes[0].1.len() as u64;
+        assert_eq!(
+            second_target - first_target,
+            one.next_multiple_of(TRAMPOLINE_ALIGN)
+        );
+        assert_eq!(area.len() as u64, second_target - first_target + one);
+        assert_eq!(&area[..alone.writes[0].1.len()], &alone.writes[0].1[..]);
+    }
+
+    #[test]
+    fn a_read_out_of_the_trampolines_reach_is_refused() {
+        // A first module with no reads, sized so that the second module starts 2^27 - PAGE
+        // above the trampolines (one page below the first module). `b` reaches -2^27..2^27
+        // bytes, so a read may be at most 2^27 above its trampoline.
+        let reach = 1_u64 << 27;
+        // One page of text, then eight bytes of data: .bss takes the module to 2^27 - 2 pages.
+        let filler_bss = u32::try_from(reach - 3 * PAGE - 8).unwrap();
+        let filler = || nso(&[], filler_bss);
+        assert_eq!(filler().size, reach - 2 * PAGE);
+        let read_at = |offset: u64| {
+            let mut words = vec![a64::nop(); usize::try_from(offset / 4).unwrap()];
+            words.push(read_counter());
+            nso(&words, 0)
+        };
+        // The first word of the second module's second page is 2^27 above: in reach.
+        let edge = place(
+            &program_of(vec![("rtld", filler()), ("main", read_at(PAGE))]),
+            BASE,
+            Some(RESCALE),
+        )
+        .unwrap();
+        assert_eq!(edge.counter_reads[0] - (BASE - PAGE), reach);
+        // The word after it is 2^27 + 4 above: out of reach.
+        let from = BASE + filler().size + PAGE + 4;
+        assert_eq!(from - (BASE - PAGE), reach + 4);
+        assert_eq!(
+            place(
+                &program_of(vec![("rtld", filler()), ("main", read_at(PAGE + 4))]),
+                BASE,
+                Some(RESCALE),
+            ),
+            Err(LoadError::Patch(PatchError::BranchOutOfRange {
+                from,
+                to: BASE - PAGE
+            }))
+        );
+    }
+
+    #[test]
+    fn a_read_into_xzr_in_any_module_becomes_a_nop_with_no_trampoline() {
+        let xzr = a64::mrs(31, a64::SysReg::CntPctEl0).unwrap();
+        let first = nso(&[], 0);
+        let size = first.size;
+        let program = program_of(vec![("rtld", first), ("main", nso(&[xzr], 0))]);
+        let placed = place(&program, BASE, Some(RESCALE)).unwrap();
+        assert_eq!(placed.counter_reads, [BASE + size]);
+        assert_eq!(placed.trampolines, None);
+        let (at, text) = &placed.writes[2];
+        assert_eq!(*at, BASE + size);
+        assert_eq!(word_at(text, 0), a64::nop());
+    }
+
+    #[test]
+    fn a_switch2_program_gets_the_12_gb_arrangement_and_its_own_stack_size() {
+        let mut files = exefs(&["main"]);
+        files.npdm.acid.layout = starquake_loader::npdm::AcidLayout::Switch2;
+        // Not a whole number of pages: the kernel rounds it up.
+        files.npdm.main_thread_stack_size = 0x3_4001;
+        let program = Program::from_exefs(files).unwrap();
+        assert_eq!(program.description().console, Console::Switch2);
+        let Loaded {
+            placed,
+            address_space,
+        } = load_program(&program);
+        assert_eq!(
+            address_space.limit().limit(),
+            MemoryArrangement::TwelveGb.application_pool_size()
+        );
+        let stack = placed.mappings.iter().find(|m| m.name == "stack").unwrap();
+        assert_eq!(stack.end - stack.start, 0x3_5000);
+        assert_eq!(stack.end, placed.stack_top);
+        assert_eq!(placed.description, *program.description());
+        assert_eq!(
+            memory_arrangement(Console::Switch1),
+            MemoryArrangement::FourGb
+        );
+    }
+
+    #[test]
+    fn a_stack_of_no_bytes_has_no_mapping() {
+        let mut files = exefs(&["main"]);
+        files.npdm.main_thread_stack_size = 0;
+        let placed = load_program(&Program::from_exefs(files).unwrap()).placed;
+        assert_eq!(placed.stack_top, 0);
+        assert!(placed.mappings.iter().all(|m| m.name != "stack"));
+    }
+
+    #[test]
+    fn an_aci0_its_acid_does_not_permit_is_logged_not_refused() {
+        let mut files = exefs(&["main"]);
+        let title_id = files.npdm.acid.title_id_max + 1;
+        files.npdm.aci.title_id = title_id;
+        let program = Program::from_exefs(files).unwrap();
+        assert!(matches!(
+            program.acid_violation(),
+            Some(AcidViolation::TitleIdOutOfRange { title_id: id, .. }) if *id == title_id
+        ));
+        assert_eq!(program.description().program_id, title_id);
+    }
+
+    #[test]
+    fn a_description_the_kernel_refuses_is_refused_when_parsed() {
+        let first = Program::from_exefs(exefs(&["main"]))
+            .unwrap()
+            .description()
+            .priorities
+            .first;
+        let mut below = exefs(&["main"]);
+        below.npdm.main_thread_priority = first - 1;
+        let error = Program::from_exefs(below).unwrap_err();
+        assert_eq!(
+            error,
+            LoadError::Process(ProcessError::MainThreadPriority {
+                priority: first - 1
+            })
+        );
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "the program's metadata describes a process the kernel refuses: the main \
+                 thread's priority {} is outside the process's priorities",
+                first - 1
+            )
+        );
+        let mut at = exefs(&["main"]);
+        at.npdm.main_thread_priority = first;
+        assert!(Program::from_exefs(at).is_ok());
+    }
+
+    #[test]
+    fn an_exefs_loads_every_module_into_guest_memory() {
+        let program = Program::from_exefs(exefs(&["rtld", "main"])).unwrap();
+        let (mapper, _log) = RecordingMapper::new();
+        let memory = flat();
+        let Loaded {
+            placed,
+            address_space,
+        } = load(&program, Some(RESCALE), Box::new(mapper), &memory).unwrap();
+        let size = program.modules()[0].code.size;
+        // The code is both modules, and the process counts it with its stack.
+        assert_eq!(
+            address_space.used_user_physical_memory_size(),
+            2 * size + program.description().main_thread_stack_size
+        );
+        // Each module's rodata is in guest memory at its base plus rodata's offset (the
+        // patcher changes only text).
+        let rodata = &program.modules()[0].code.pieces[1];
+        for module in &placed.modules {
+            let mut read = vec![0; rodata.bytes.len()];
+            memory.read(module.base + rodata.offset, &mut read).unwrap();
+            assert_eq!(read, rodata.bytes, "{}", module.name);
+        }
     }
 }
