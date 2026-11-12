@@ -12,7 +12,8 @@
 //!   completes, and the worker goes to the next session.
 //! - **Sessions take turns in the order they became ready**: a session joins the back of the
 //!   line when its first sender starts waiting, or when its request in flight ends with senders
-//!   still waiting.
+//!   still waiting. A sender that arrives while the line is not empty waits behind it, free
+//!   worker or not.
 //!
 //! The queue holds sessions and counts, not requests: a sender that has to wait waits as a guest
 //! thread, and the thread and its message buffer are the kernel's to keep. When [`RequestQueue::start_next`]
@@ -234,11 +235,14 @@ impl RequestQueue {
     }
 
     /// A guest thread sent a request on `session`. [`Admission::Start`] if the session has
-    /// nothing in flight, nobody waiting ahead, and the server has a free worker; otherwise the
-    /// sender is counted as waiting.
+    /// nothing in flight and no sender waiting, the server has a free worker, and no other
+    /// session is ready (a free worker is for the session at the front of the line, which
+    /// [`RequestQueue::start_next`] has yet to name); otherwise the sender is counted as
+    /// waiting.
     pub fn submit(&mut self, session: ObjectId) -> Result<Admission, QueueError> {
+        let free = self.running < self.workers && self.ready.is_empty();
         let line = self.lines.entry(session).or_default();
-        if line.flight.is_none() && line.waiting == 0 && self.running < self.workers {
+        if line.flight.is_none() && line.waiting == 0 && free {
             line.flight = Some(Flight::Running);
             self.running = self.running.saturating_add(1);
             return Ok(Admission::Start);
@@ -464,6 +468,39 @@ mod tests {
         assert_eq!(queue.start_next(), Some(b));
         queue.finish(b).unwrap();
         assert_eq!(queue.start_next(), Some(a));
+    }
+
+    #[test]
+    fn a_new_sender_does_not_start_ahead_of_a_session_that_is_ready() {
+        let (a, b, c) = (session(1), session(2), session(3));
+        let mut queue = RequestQueue::new();
+        assert_eq!(queue.submit(a), Ok(Admission::Start));
+        assert_eq!(queue.submit(b), Ok(Admission::Queued));
+        queue.finish(a).unwrap();
+        // The worker is free and `c` has nothing in flight, but `b` was ready first and has
+        // not been started yet: `c` joins the line behind it.
+        assert_eq!(queue.running(), 0);
+        assert_eq!(queue.submit(c), Ok(Admission::Queued));
+        assert_eq!(queue.waiting(c), 1);
+        assert_eq!(queue.start_next(), Some(b));
+        assert_eq!(queue.start_next(), None);
+        queue.finish(b).unwrap();
+        assert_eq!(queue.start_next(), Some(c));
+        queue.finish(c).unwrap();
+        // With nobody ready, the same sender starts at once.
+        assert_eq!(queue.submit(c), Ok(Admission::Start));
+        queue.finish(c).unwrap();
+        assert_eq!(queue, RequestQueue::new());
+
+        // The same with a second worker: a free worker is for the session at the front.
+        let mut queue = RequestQueue::with_workers(2).unwrap();
+        assert_eq!(queue.submit(a), Ok(Admission::Start));
+        assert_eq!(queue.submit(b), Ok(Admission::Start));
+        assert_eq!(queue.submit(c), Ok(Admission::Queued));
+        queue.finish(a).unwrap();
+        assert_eq!(queue.submit(a), Ok(Admission::Queued));
+        assert_eq!(queue.start_next(), Some(c));
+        assert_eq!(queue.start_next(), None);
     }
 
     #[test]

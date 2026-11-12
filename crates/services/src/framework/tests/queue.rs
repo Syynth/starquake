@@ -2,10 +2,11 @@
 //! submitted, the one that may start is handled, and the rest wait their turn
 //! (`docs/specs/services.md`, "Concurrency").
 
+use starquake_ipc::BUFFER_SIZE;
 use starquake_kernel::id::ObjectId;
 use starquake_kernel::result::ResultCode;
 
-use super::super::{Admission, DEFAULT_WORKERS, Handled, QueueError, ServerError};
+use super::super::{Admission, DEFAULT_WORKERS, QueueError, ServerError};
 use super::{Rig, parked_one, plain, request, toy};
 
 /// Handles a request on `session` that the queue said may start, and checks it was answered.
@@ -114,31 +115,77 @@ fn closing_a_session_drops_its_waiting_senders_and_frees_the_worker() {
 
 #[test]
 fn a_request_the_server_fails_on_still_frees_the_worker() {
+    // A buffer one byte short, which the server cannot read a message from, and a whole buffer
+    // that does not parse.
+    let short = vec![0; BUFFER_SIZE - 1];
+    let garbage = vec![0xFF; BUFFER_SIZE];
+    for mut bad in [short, garbage] {
+        let mut rig = Rig::strict();
+        let (first, second) = (rig.session, rig.second_session());
+        assert_eq!(rig.server.submit(first), Ok(Admission::Start));
+        assert_eq!(rig.server.submit(second), Ok(Admission::Queued));
+        let handled = rig.server.handle(&mut rig.kernel, first, &mut bad);
+        if bad.len() < BUFFER_SIZE {
+            assert_eq!(handled, Err(ServerError::BufferTooShort { len: bad.len() }));
+        } else {
+            assert!(matches!(handled, Err(ServerError::Malformed(_))));
+        }
+        // The request is over, on the error path too: the worker it held is free, and the
+        // session that waited starts.
+        assert!(!rig.server.queue().is_running(first));
+        assert_eq!(rig.server.queue().running(), 0);
+        assert_eq!(rig.server.start_next(), Some(second));
+        assert_eq!(rig.server.start_next(), None);
+        run(&mut rig, second);
+        assert_eq!(rig.server.queue().sessions().count(), 0);
+    }
+}
+
+#[test]
+fn a_short_buffer_does_not_let_a_request_start_out_of_turn() {
     let mut rig = Rig::strict();
     let (first, second) = (rig.session, rig.second_session());
-    rig.server.submit(first).unwrap();
-    rig.server.submit(second).unwrap();
-    // A buffer one byte short: the server fails before reading anything.
-    let mut short = vec![0; starquake_ipc::BUFFER_SIZE - 1];
-    let handled = rig.server.handle(&mut rig.kernel, first, &mut short);
-    assert_eq!(
-        handled,
-        Err(ServerError::BufferTooShort { len: short.len() })
-    );
-    // That check comes before the request starts, so it is still the running one.
+    assert_eq!(rig.server.submit(first), Ok(Admission::Start));
+    assert_eq!(rig.server.submit(second), Ok(Admission::Queued));
+    // The second session's request has not started: it is refused as busy before the buffer is
+    // looked at, its sender still waits, and the first is still the running one.
+    let mut short = vec![0; BUFFER_SIZE - 1];
+    let handled = rig.server.handle(&mut rig.kernel, second, &mut short);
+    assert_eq!(handled, Err(ServerError::Busy(second)));
+    assert_eq!(rig.server.queue().waiting(second), 1);
     assert!(rig.server.queue().is_running(first));
-    // A message that cannot be parsed fails after it started, and ends it.
-    let mut garbage = vec![0xFF; starquake_ipc::BUFFER_SIZE];
-    let handled = rig.server.handle(&mut rig.kernel, first, &mut garbage);
-    assert!(matches!(handled, Err(ServerError::Malformed(_))));
-    assert!(!rig.server.queue().is_running(first));
+    run(&mut rig, first);
     assert_eq!(rig.server.start_next(), Some(second));
-    assert_eq!(
-        rig.server.handle(
-            &mut rig.kernel,
-            second,
-            &mut super::built(&request(toy::INSPECT))
-        ),
-        Ok(Handled::Replied)
+}
+
+#[test]
+fn a_request_does_not_start_ahead_of_a_session_that_is_ready() {
+    let mut rig = Rig::strict();
+    let first = rig.session;
+    let (second, third, fourth) = (
+        rig.second_session(),
+        rig.second_session(),
+        rig.second_session(),
     );
+    assert_eq!(rig.server.submit(first), Ok(Admission::Start));
+    assert_eq!(rig.server.submit(second), Ok(Admission::Queued));
+    run(&mut rig, first);
+    // The worker is free, and the second session is ready and has not been started yet
+    // (`start_next` was not called). A new sender waits behind it,
+    assert_eq!(rig.server.queue().running(), 0);
+    assert_eq!(rig.server.submit(third), Ok(Admission::Queued));
+    // and a request given to `handle` without `submit` is refused and leaves nobody waiting.
+    let (handled, _) = rig.try_send_on(fourth, &request(toy::INSPECT));
+    assert_eq!(handled, Err(ServerError::Busy(fourth)));
+    assert_eq!(rig.server.queue().waiting(fourth), 0);
+
+    for expected in [second, third] {
+        assert_eq!(rig.server.start_next(), Some(expected));
+        assert_eq!(rig.server.start_next(), None);
+        run(&mut rig, expected);
+    }
+    assert_eq!(rig.server.start_next(), None);
+    // Nobody is ready now: the same request starts by itself.
+    run(&mut rig, fourth);
+    assert_eq!(rig.server.queue().sessions().count(), 0);
 }

@@ -470,17 +470,24 @@ impl Server {
     /// untouched.
     ///
     /// The request is one [`Server::submit`] or [`Server::start_next`] said to start. A request
-    /// given here without either starts if it may (nothing in flight on its session, nobody
-    /// waiting ahead of it, a free worker) and is [`ServerError::Busy`] otherwise.
+    /// given here without either starts if it may (nothing in flight on its session, no sender
+    /// waiting on it, no other session ready, a free worker) and is [`ServerError::Busy`]
+    /// otherwise.
+    ///
+    /// The request has started once its session is found open and the queue lets it start. The
+    /// errors from before that leave the queue as it was: [`ServerError::UnknownSession`],
+    /// [`ServerError::Busy`], and [`ServerError::Queue`] holding
+    /// [`QueueError::TooManyWaiting`]. A request that started is over when this returns,
+    /// unless it was deferred: after an error (a buffer that is too short or does not parse, a
+    /// reply that cannot be written, the server's own bookkeeping) its worker is free again,
+    /// as it is after a reply.
     pub fn handle(
         &mut self,
         kernel: &mut dyn Kernel,
         session: ObjectId,
         buffer: &mut [u8],
     ) -> Result<Handled, ServerError> {
-        if buffer.len() < BUFFER_SIZE {
-            return Err(ServerError::BufferTooShort { len: buffer.len() });
-        }
+        // A session that is not open has no place in the queue, so there is no worker to free.
         let target = *self
             .sessions
             .get(&session)
@@ -513,7 +520,8 @@ impl Server {
         }
     }
 
-    /// Parses the message, answers it, and writes the reply and its trace event.
+    /// Parses the message, answers it, and writes the reply and its trace event. The request
+    /// has started: every error from here is one [`Server::handle`] frees the worker after.
     fn run(
         &mut self,
         kernel: &mut dyn Kernel,
@@ -521,6 +529,9 @@ impl Server {
         target: TargetId,
         buffer: &mut [u8],
     ) -> Result<Handled, ServerError> {
+        if buffer.len() < BUFFER_SIZE {
+            return Err(ServerError::BufferTooShort { len: buffer.len() });
+        }
         let kind = if self.targets.is_domain(target)? {
             SessionKind::Domain
         } else {
@@ -664,8 +675,8 @@ impl Server {
         self.send(kernel, session, asked, &answer, true, buffer)
     }
 
-    /// The deferred requests whose reply has not been delivered, by token id, with the session
-    /// each was sent on.
+    /// The deferred requests whose completion [`Server::take_completed`] has not taken yet, by
+    /// token id, with the session each was sent on.
     pub fn pending(&self) -> impl Iterator<Item = (TokenId, ObjectId)> {
         (self.pending.iter()).map(|(token, request)| (*token, request.session))
     }
