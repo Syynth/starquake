@@ -57,6 +57,11 @@
 //!   [`Outcome::Waiting`] the way `SendSyncRequest` does, and its event is recorded when the
 //!   wait ends, by whichever dispatch (or [`Dispatcher::signal_event`],
 //!   [`Dispatcher::fire_timers`]) records the wake. `dispatch/sync.rs` says how.
+//! - **Shared and transfer memory** (`MapSharedMemory`, `UnmapSharedMemory`,
+//!   `CreateTransferMemory`) have arms of their own, in `dispatch/memory_objects.rs`. A
+//!   transfer memory's last reference can go in any call that drops references; the pages it
+//!   lent are unlocked before the kernel lock is let go, whichever call that was (`Locked`'s
+//!   `Drop`, [`crate::svc::transfer_memory::unlock_released`]).
 //! - **`ExitProcess`** ends the process ([`crate::svc::process::exit_process`]: its threads end
 //!   and its handles close, so the servers of its sessions are told) and the dispatch in
 //!   [`Outcome::ProcessExited`]; the caller stops running the guest. **`ExitThread`** ends the

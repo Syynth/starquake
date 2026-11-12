@@ -89,7 +89,6 @@ the two markers below differs; its failure message holds the text to put there.
 | 87 | `ipc ISelfController::12 (SetPerformanceModeChangedNotification)` | `0x0` |
 | 93 | `ipc hid::0 (CreateAppletResource)` | `0x0` |
 | 95 | `ipc IAppletResource::0 (GetSharedMemoryHandle)` | `0x0` |
-| 102 | `svc 0x13 MapSharedMemory` | `0x0` |
 | 107 | `ipc time:u::0 (GetStandardUserSystemClock)` | `0x0` |
 | 109 | `ipc time:u::1 (GetStandardNetworkSystemClock)` | `0x0` |
 | 111 | `ipc time:u::2 (GetStandardSteadyClock)` | `0x0` |
@@ -111,7 +110,6 @@ the two markers below differs; its failure message holds the text to put there.
 | 159 | `ipc IHOSBinderDriver::1 (AdjustRefcount)` | `0x0` |
 | 163 | `ipc IHOSBinderDriver::2 (GetNativeHandle)` | `0x0` |
 | 165 | `ipc IHOSBinderDriver::3 (TransactParcelAuto)` | `0x0` |
-| 171 | `svc 0x15 CreateTransferMemory` | `0x0` |
 | 172 | `ipc nvdrv::3 (Initialize)` | `0x0` |
 | 177 | `ipc nvdrv::8 (SetAruid)` | `0x0` |
 | 179 | `ipc nvdrv::0 (Open)` | `0x0` |
@@ -119,7 +117,6 @@ the two markers below differs; its failure message holds the text to put there.
 | 204 | `ipc nvdrv::2 (Close)` | `0x0` |
 | 218 | `ipc IApplicationDisplayService::2021 (CloseLayer)` | `0x0` |
 | 220 | `ipc IApplicationDisplayService::1020 (CloseDisplay)` | `0x0` |
-| 241 | `svc 0x14 UnmapSharedMemory` | `0x0` |
 | 267 | `ipc ISelfController::0 (Exit)` | `0x7601` |
 <!-- end of the gap list -->
 

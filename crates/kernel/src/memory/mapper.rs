@@ -17,7 +17,8 @@
 //! the service that writes them, so they are named. [`Mapper::allocate_shared`] hands out a
 //! range of backing as [`SharedPages`], and [`Mapper::map_shared`] maps that range. Both have a
 //! default that refuses, for a translation with no backing to share (the kernel then fails the
-//! call inside itself).
+//! call inside itself). PROVISIONAL: `starquake-core`'s translation keeps the defaults until it
+//! hands out guest RAM for shared memory (`docs/architecture.md`, the walking skeleton's table).
 
 use starquake_memory::{BackingRange, Perms};
 
