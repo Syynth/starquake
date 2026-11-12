@@ -33,12 +33,13 @@
 //!   and the input object ids follow the arguments at once, unaligned (`cmif.h:131-141`). The
 //!   out-pointer size table ([`RequestBuilder::out_pointer`]) sits at the rounded offset, measured
 //!   from the start of the raw data section with the reserve counted (`cmif.h:108`,
-//!   `cmif.h:153`): 4 to 16 bytes past the end of the object ids, since libnx's content starts 0
-//!   to 12 bytes into the section. Pinned by the golden-bytes tests in `tests/libnx_golden.rs`
+//!   `cmif.h:153`): after the content (the object ids in a domain, the arguments otherwise), by
+//!   16 bytes less the alignment padding (0 to 12 bytes) plus one more byte when the content's
+//!   length is odd, so 4 to 17 bytes. Pinned by the golden-bytes tests in `tests/libnx_golden.rs`
 //!   (`plain_request_is_byte_exact`, `domain_request_is_byte_exact`,
 //!   `pointer_request_is_byte_exact`, `tipc_request_is_byte_exact_in_both_layouts`,
 //!   `control_request_is_byte_exact`, `domain_close_request_is_byte_exact`) and, over generated
-//!   inputs, by `libnx_layout_matches_the_libnx_arithmetic` in `tests/libnx_conventions.rs`.
+//!   inputs, by `libnx_layout_matches_the_libnx_arithmetic` in `tests/libnx_golden.rs`.
 //! - [`RequestLayout::Exact`], the default, writes the exact size as [`crate::ReplyBuilder`]
 //!   does: the real padding (0 to 3 words), no reserve and no out-pointer size table. A domain
 //!   header's `size` counts the arguments rounded up to a whole word, and the object ids start on
@@ -99,7 +100,7 @@
 //!   reason an X descriptor's counter bits 9..12 (Eden's) are address bits 39..42 to libnx, whose
 //!   index is 6 bits (`hipc.h:50`); a counter below 64 and an address below `1 << 39` encode the
 //!   same either way. Pinned by `static_counter_high_bits_are_libnx_address_bits` in
-//!   `tests/libnx_conventions.rs`.
+//!   `tests/libnx_golden.rs`.
 //! - **The process id slot.** libnx leaves the two words unwritten (`hipc.h:256-257` only skips
 //!   them) and the kernel fills them in. [`RequestBuilder::send_pid`] writes the value it is
 //!   given, which a libnx program never does; it exists so a test can see the value come back
@@ -510,10 +511,12 @@ impl RequestBuilder {
             .get_mut(table_offset.saturating_sub(padding)..table_end.saturating_sub(padding))
             .ok_or(too_small)?;
         for (slot, size) in table
-            .chunks_exact_mut(size_of::<u16>())
+            .as_chunks_mut::<{ size_of::<u16>() }>()
+            .0
+            .iter_mut()
             .zip(&self.out_pointer_sizes)
         {
-            slot.copy_from_slice(&size.to_le_bytes());
+            *slot = size.to_le_bytes();
         }
         Ok(section)
     }
