@@ -570,7 +570,13 @@ fn a_run_whose_threads_all_wait_on_nothing_that_can_end_is_an_emulator_error() {
         |regs| regs.x[0] = i64::MAX.cast_unsigned(),
         svc(SvcId::SleepThread),
     );
-    let report = guest.run(main, &RunOptions::default());
+    // Bounded: a run that missed the stall would end at this timeout instead, and fail below.
+    let options = RunOptions {
+        timeout: Some(Duration::from_secs(30)),
+        command_line: Vec::new(),
+        sd_card: None,
+    };
+    let report = guest.run(main, &options);
     assert_eq!(report.exit, ExitReason::EmulatorError(WAITING.to_owned()));
     // A stepped run says the same.
     let main = ScriptedVcpu::new().then(
