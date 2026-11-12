@@ -63,10 +63,11 @@
 //!   writes none). Here a call that isn't implemented writes [`KernelError::NotImplemented`] to
 //!   `x0` and leaves `x1`-`x7` as they were, whatever its convention lists, void calls included.
 //!   Test: `a_planned_call_returns_not_implemented_and_leaves_its_outputs_alone`. (An
-//!   implemented call that fails does write them, as zeros. That matches Eden's wrapper only
-//!   for a call whose body assigns no output before it fails: the wrapper value-initialises the
-//!   outputs and writes whatever the body left in them. `GetThreadPriority`, the one arm with a
-//!   second output today, is such a call. See [`returning`] for the calls that are not. Test:
+//!   implemented call that fails with a result the guest sees does write them, as zeros. That
+//!   matches Eden's wrapper only for a call whose body assigns no output before it fails: the
+//!   wrapper value-initialises the outputs and writes whatever the body left in them.
+//!   `GetThreadPriority`, the one arm with a second output today, is such a call. The docs of
+//!   `returning`, the function that writes them, name a call that is not. Test:
 //!   `a_failing_call_writes_its_result_and_zeroes_its_other_outputs`.)
 //! - When the environment's clock fails (a replay that doesn't match its recording), the call
 //!   does not run and writes nothing, and the dispatch ends in [`Outcome::EnvFailed`]: there is
@@ -775,22 +776,28 @@ fn calling_core(core: u8) -> CallResult<CoreId> {
 /// Runs an implemented call that returns a `Result` first: decodes its `I` inputs, runs `body`,
 /// and writes the result and its `O` other outputs.
 ///
-/// A failing call writes its result and zeroes its other outputs. Eden's wrapper
-/// value-initialises its outputs (`int32_t out_priority{};`), runs the call, and writes whatever
-/// the call left in them (`SvcWrap_GetThreadPriority64` in `eden/src/core/hle/kernel/svc.cpp` @
-/// cf654052). The two agree only for a call whose body assigns no output before it fails. That
-/// holds for `GetThreadPriority`, the only arm with a second output today: its one failure,
+/// A call that fails with a result the guest sees ([`SvcError::Kernel`]) writes that result and
+/// zeroes its other outputs. Eden's wrapper value-initialises its outputs
+/// (`int32_t out_priority{};`), runs the call, and writes whatever the call left in them
+/// (`SvcWrap_GetThreadPriority64` in `eden/src/core/hle/kernel/svc.cpp` @ cf654052). The two
+/// agree only for a call whose body assigns no output before it fails. That holds for
+/// `GetThreadPriority`, the only arm with a second output today: its one failure,
 /// `ResultInvalidHandle`, comes before `*out_priority` is assigned
 /// (`eden/src/core/hle/kernel/svc/svc_thread.cpp` @ cf654052, `GetThreadPriority`).
 ///
 /// It does not hold for every call, and this function cannot express the ones it fails for: a
-/// `body` returns either its outputs or an error, never both. `KSynchronizationObject::Wait`
-/// (`eden/src/core/hle/kernel/k_synchronization_object.cpp` @ cf654052) sets
-/// `*out_index = thread->GetSyncedIndex()` (`-1` after a wait that no object ended) and returns
-/// `ResultTimedOut` or `ResultCancelled`, and `SvcWrap_WaitSynchronization64` writes that index
-/// to `x1`. A call like that (kernel slice 4, events and `WaitSynchronization`) needs a way to
-/// return outputs together with an error before it gets an arm; routing it through here as it
-/// stands would zero `x1` where Eden writes `-1`.
+/// `body` returns either its outputs or an error, never both. The counter-example is
+/// `KSynchronizationObject::Wait` (`eden/src/core/hle/kernel/k_synchronization_object.cpp` @
+/// cf654052). When the thread did begin to wait (`thread->BeginWait`), it clears the thread's
+/// synced index to `-1` first, and afterwards sets `*out_index = thread->GetSyncedIndex()` and
+/// returns the wait's result. A wait ended by its timer or by a cancel, not by an object, so
+/// returns `ResultTimedOut` or `ResultCancelled` with `*out_index` at `-1`, and
+/// `SvcWrap_WaitSynchronization64` (`svc.cpp`) writes that index to `x1`. (Its earlier exits, a
+/// zero timeout and a cancel already pending, return the same two results without assigning
+/// `*out_index`, which the wrapper then writes as zero.) A call like that (kernel slice 4,
+/// events and `WaitSynchronization`) needs a way to return outputs together with an error
+/// before it gets an arm; routing it through here as it stands would zero `x1` where Eden
+/// writes `-1`.
 fn returning<const I: usize, const O: usize>(
     id: SvcId,
     convention: &Convention,

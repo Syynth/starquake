@@ -21,7 +21,7 @@
 //! - **Two kinds of lookup.** An id that came from outside the table (a handle resolved for a
 //!   guest, an id a caller passes in) may be stale, and [`Slab::get`] says so with a
 //!   [`SlabError::Stale`] the caller turns into a result. An id the kernel stored itself (a queue
-//!   link, a core's record of the thread it runs) is live by construction; if it is not, the
+//!   link, a core's record of the thread it should run) is live by construction; if it is not, the
 //!   kernel's bookkeeping is broken. [`Slab::stored`] and [`Slab::stored_mut`] are the lookups
 //!   for those, and fail with the one fixed [`StoredIdStale`]. The scheduler is the one table
 //!   that uses them today: its `SchedError` converts [`StoredIdStale`] into `SchedError::Corrupt`,

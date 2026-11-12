@@ -742,8 +742,9 @@ fn the_current_thread_pseudo_handle_is_the_thread_the_calling_core_runs() {
 
 #[test]
 fn a_failing_call_writes_its_result_and_zeroes_its_other_outputs() {
-    // Eden's `SvcWrap_GetThreadPriority64` writes `ret` to x0 and the value-initialised
-    // `out_priority` to x1 whether or not the call succeeded.
+    // Eden's `SvcWrap_GetThreadPriority64` writes `ret` to x0 and `out_priority` to x1 whether
+    // or not the call succeeded. `GetThreadPriority` fails with `ResultInvalidHandle` before it
+    // assigns `out_priority`, which is then still the zero it was value-initialised to.
     let mut tables = tables();
     let process = tables
         .scheduler
@@ -1039,12 +1040,13 @@ fn a_wait_for_a_held_lock_is_timed_and_charged_to_each_declared_table() {
 #[test]
 fn a_poisoned_lock_is_taken_without_counting_a_wait() {
     let dispatcher = Dispatcher::new(tables());
-    // A panic while the tables are held poisons the lock.
+    // Unwinding out of `with` while the tables are held poisons the lock. (`resume_unwind`
+    // starts the unwind without the panic hook, so the test prints no panic message.)
     let panicked = std::thread::scope(|scope| {
         scope
             .spawn(|| {
-                dispatcher.with::<(&mut Scheduler,), _>(|_| {
-                    panic!("a panic that poisons the dispatcher's lock")
+                dispatcher.with::<(&mut Scheduler,), ()>(|_| {
+                    std::panic::resume_unwind(Box::new("poisons the dispatcher's lock"))
                 });
             })
             .join()
