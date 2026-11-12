@@ -19,8 +19,11 @@
 //! - [`RenderError`], in [`error`];
 //! - description checks against [`Caps`], in [`validate`].
 //!
-//! Later slices add the recording backend (R1), format fallbacks and `emulation()` (R2), the
-//! CPU ASTC decoder (R3) and the host shaders (R4).
+//! Slice R1 adds the [`RecordingBackend`], in [`recording`]: the trait with no GPU, recording
+//! every list and modelling on the CPU the commands with exact answers.
+//!
+//! Later slices add format fallbacks and `emulation()` (R2), the CPU ASTC decoder (R3) and the
+//! host shaders (R4).
 
 pub mod backend;
 pub mod caps;
@@ -30,6 +33,7 @@ mod flags;
 pub mod format;
 pub mod id;
 pub mod pipeline;
+pub mod recording;
 pub mod resource;
 pub mod shader;
 pub mod validate;
@@ -47,5 +51,6 @@ pub use id::{
     ViewId,
 };
 pub use pipeline::{ComputePipelineDesc, GraphicsPipelineDesc};
+pub use recording::{FrameDump, RecordingBackend};
 pub use resource::{BufferDesc, BufferUsage, SamplerDesc, TextureDesc, TextureUsage, ViewDesc};
 pub use shader::{ResourceBinding, ShaderDesc, ShaderInterface, ShaderSource, ShaderStage};

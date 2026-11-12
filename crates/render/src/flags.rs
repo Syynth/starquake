@@ -30,6 +30,9 @@ macro_rules! flag_set {
             /// Every defined flag.
             pub const ALL: Self = Self(0 $(| (1 << $bit))*);
 
+            /// Every defined flag with its name, in bit order.
+            pub const NAMED: &'static [(&'static str, Self)] = &[$((stringify!($flag), Self::$flag)),*];
+
             /// The raw bits.
             pub const fn bits(self) -> u32 {
                 self.0
@@ -132,6 +135,25 @@ mod tests {
         let first_unknown = 1 << all.bit_width();
         let bytes = postcard::to_allocvec(&(all | first_unknown)).expect("serialise");
         assert!(postcard::from_bytes::<FormatFeatures>(&bytes).is_err());
+    }
+
+    #[test]
+    fn named_flags_cover_every_bit_once() {
+        let mut seen = FormatFeatures::EMPTY;
+        for (name, flag) in FormatFeatures::NAMED {
+            assert_eq!(flag.bits().count_ones(), 1, "{name}");
+            assert!(!seen.intersects(*flag), "{name}");
+            seen = seen | *flag;
+        }
+        assert_eq!(seen, FormatFeatures::ALL);
+        assert_eq!(
+            FormatFeatures::NAMED.first(),
+            Some(&("SAMPLE", FormatFeatures::SAMPLE))
+        );
+        assert_eq!(
+            FormatFeatures::NAMED.last(),
+            Some(&("COPY", FormatFeatures::COPY))
+        );
     }
 
     #[test]
