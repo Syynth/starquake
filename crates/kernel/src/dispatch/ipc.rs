@@ -8,11 +8,12 @@
 //! 1. Under the lock: read the clock, look the session up, copy the message out of the caller's
 //!    TLS block, translate its special header ([`crate::ipc::message`]) and queue the request
 //!    ([`Ipc::send`]). A request that cannot start leaves its sender waiting
-//!    ([`Outcome::Waiting`]).
+//!    ([`Outcome::Waiting`]). A failed translation can destroy a session whose last handle the
+//!    message moved; that session is torn down as `CloseHandle` tears it down
+//!    ([`crate::ipc::Ipc::forget`]).
 //! 2. Take the server's handler out of its slot (under the lock), run it **without the lock**
-//!    (the calls it makes through [`IpcContext`] take the lock one at a time), and put it back
-//!    and end the request ([`Ipc::finish`]) under the lock. One worker per server means the slot
-//!    is never empty when the queue starts a request.
+//!    (the calls it makes through [`IpcContext`] take the lock one at a time), and end the
+//!    request ([`Ipc::finish`]) and put the handler back under the lock.
 //! 3. Start the server's next ready request, if one may start, on this core, and run it as in
 //!    step 2; repeat until none may.
 //! 4. Settle every request that is over, in the order they ended: its reply is written into its
@@ -20,6 +21,16 @@
 //!    recorded, the IPC events its handler made and then its `SendSyncRequest` event. The
 //!    caller's own result goes into its registers; every other sender that was waiting is woken
 //!    ([`Dispatcher::take_woken`]).
+//!
+//! The handler leaves its slot at two other times. Its notices (accept a session, forget a
+//! closed one) are given to it under the lock: [`SessionHandler::accept`] and
+//! [`SessionHandler::closed`] take no [`IpcContext`], so they cannot call back into the kernel.
+//! [`Dispatcher::deliver_replies`] takes it out without the lock and without a worker, because
+//! `take_reply` gets an [`IpcContext`]; a request the queue starts meanwhile (it has a free
+//! worker) finds the slot empty. It stays in flight, holding its worker, and is parked: its
+//! sender waits ([`Outcome::Waiting`]) and the core that puts the handler back runs it and
+//! reports the sender woken ([`Dispatcher::take_woken`]). Whenever a handler goes back in its
+//! slot it is first given the notices that arrived while it was out.
 //!
 //! `ConnectToNamedPort` is ported from Eden `eden/src/core/hle/kernel/svc/svc_port.cpp` @
 //! cf654052 (GPL-3.0-or-later), `ConnectToNamedPort`, with the name read as
@@ -40,10 +51,19 @@
 //!   `a_handler_that_fails_closes_the_session`.
 //! - A server's handler can reply later ([`Handled::Deferred`]); Eden's HLE servers reply on
 //!   their own host threads instead. Test: `a_second_sender_waits_behind_a_deferred_request`.
+//! - Sessions have no limit, so `ConnectToNamedPort` never fails for want of one. Eden's
+//!   `KClientPort::CreateSession` (`eden/src/core/hle/kernel/k_client_port.cpp` @ cf654052),
+//!   which runs after the handle is reserved, refuses with `ResultLimitReached` when the
+//!   process's `LimitableResource::SessionCountMax` reservation fails and with
+//!   `ResultOutOfSessions` when the port already has `m_max_sessions` sessions; neither error
+//!   can happen here. PROVISIONAL: resource limits are a later kernel slice (kernel spec, "Port
+//!   plan"). Test: `connecting_many_times_never_runs_out_of_sessions`.
 //!
 //! PROVISIONAL (walking skeleton, #74): the dispatcher is told its caller (`Caller`), there is
 //! one process, and a woken sender is reported, not made runnable: the scheduler does not know
 //! which guest thread is which yet. Kernel slice 10 (the core loop) makes waking real.
+
+use std::collections::VecDeque;
 
 use starquake_cpu::GuestRegs;
 use starquake_ipc::BUFFER_SIZE;
@@ -53,12 +73,12 @@ use starquake_trace::{
 };
 
 use super::{
-    Call, Caller, Dispatcher, Outcome, complete, fault, mismatch, record_point, recorded_args,
-    result_word,
+    Call, Caller, Dispatcher, Outcome, State, Tables, complete, fault, mismatch, record_point,
+    recorded_args, result_word,
 };
 use crate::handle::{Handle, HandleError, HandleTable};
 use crate::id::{ObjectId, ServerId};
-use crate::ipc::message::{MessageBuffer, Translated, translate};
+use crate::ipc::message::{MessageBuffer, Translated, Translation, translate};
 use crate::ipc::{
     Admission, Done, Finish, Handled, IpcError, Notice, PortName, Request, Sender, SessionHandler,
 };
@@ -357,8 +377,8 @@ impl Dispatcher {
                 }
             }
         }
-        self.put_back(server, handler);
-        finished.extend(self.run_ready(server, caller.memory, process_id));
+        let parked = self.put_back(server, handler);
+        finished.extend(self.run_ready(server, caller.memory, process_id, parked));
         let woken = self.settle(finished, caller.memory, caller.recorder, time);
         let mut locked = self.lock::<()>();
         locked.state.woken.extend(woken);
@@ -385,41 +405,28 @@ impl Dispatcher {
         }
     }
 
-    /// Puts a handler back in its server's slot.
-    fn put_back(&self, server: ServerId, handler: Box<dyn SessionHandler>) {
-        let mut locked = self.lock::<()>();
-        locked.state.handlers.insert(server, Some(handler));
+    /// Puts a handler back in its server's slot (see [`put_back`]), and returns the requests
+    /// parked for it, which the caller runs.
+    fn put_back(&self, server: ServerId, handler: Box<dyn SessionHandler>) -> Vec<ObjectId> {
+        let mut locked = self.lock::<(&mut Scheduler,)>();
+        put_back(&mut locked.state, server, handler)
     }
 
-    /// Gives every server whose handler is free the notices waiting for it, outside the lock.
+    /// Gives every server whose handler is in its slot the notices waiting for it, under the
+    /// lock. A handler out of its slot is given its notices when it is put back.
     pub(super) fn settle_notices(&self) {
+        let mut locked = self.lock::<(&mut Scheduler,)>();
+        let state = &mut *locked.state;
         let servers: Vec<ServerId> = {
-            let locked = self.lock::<()>();
-            let ipc = locked.state.tables.scheduler.ipc();
+            let ipc = state.tables.scheduler.ipc();
             ipc.servers()
                 .filter(|server| ipc.has_notices(*server).unwrap_or(false))
                 .collect()
         };
         for server in servers {
-            let mut locked = self.lock::<(&mut Scheduler,)>();
-            let Some(mut handler) = locked
-                .state
-                .handlers
-                .get_mut(&server)
-                .and_then(Option::take)
-            else {
-                // Running: it is given its notices before its next request.
-                continue;
-            };
-            let (scheduler,) = locked.tables();
-            let notices = scheduler
-                .ipc_mut()
-                .1
-                .take_notices(server)
-                .unwrap_or_default();
-            drop(locked);
-            apply_notices(&mut *handler, server, notices);
-            self.put_back(server, handler);
+            if let Some(Some(handler)) = state.handlers.get_mut(&server) {
+                give_notices(&mut state.tables, server, &mut **handler);
+            }
         }
     }
 
@@ -494,13 +501,17 @@ impl Dispatcher {
                     SvcError::Internal(what) => fault(id, &what, call.regs),
                 };
                 record_point(call, time, &outcome);
+                drop(locked);
+                // A session the failed message destroyed: its server forgets it now, if free.
+                self.settle_notices();
                 return outcome;
             }
         };
         drop(locked);
 
-        let mut finished = self.run_request(server, session, call.caller.memory, process_id);
-        finished.extend(self.run_ready(server, call.caller.memory, process_id));
+        let (mut finished, parked) =
+            self.run_request(server, session, call.caller.memory, process_id);
+        finished.extend(self.run_ready(server, call.caller.memory, process_id, parked));
         let own = call.caller.thread;
         let mut woken = self.settle(finished, call.caller.memory, call.caller.recorder, time);
         let outcome = match woken.iter().position(|woken| woken.thread == own) {
@@ -519,80 +530,91 @@ impl Dispatcher {
     }
 
     /// Runs the request in flight on `session`, a session of `server`, through the server's
-    /// handler without the lock, and ends it. Returns the requests that are over.
+    /// handler without the lock, and ends it. Returns the requests that are over, and the
+    /// requests parked for the handler while it ran, which the caller runs.
+    ///
+    /// When the handler is out of its slot (another core delivers its deferred replies), the
+    /// request is parked instead, still in flight: nothing is over yet.
     fn run_request(
         &self,
         server: ServerId,
         session: ObjectId,
         memory: &dyn GuestMemory,
         process_id: u64,
-    ) -> Vec<Finished> {
+    ) -> (Vec<Finished>, Vec<ObjectId>) {
         let mut locked = self.lock::<(&mut Scheduler,)>();
-        let (scheduler,) = locked.tables();
-        let request = scheduler.ipc().in_flight(session).ok().flatten().cloned();
-        let handler = match request {
-            Some(_) => locked
-                .state
-                .handlers
-                .get_mut(&server)
-                .and_then(Option::take),
-            None => None,
-        };
-        let (scheduler,) = locked.tables();
-        let ipc = scheduler.ipc_mut().1;
-        let (Some(mut handler), Some(request)) = (handler, request) else {
-            // One worker per server keeps the handler in its slot whenever a request starts,
-            // and a started request is in flight: the kernel's bookkeeping is broken.
+        let state = &mut *locked.state;
+        let ipc = state.tables.scheduler.ipc_mut().1;
+        // A started request is in flight, on a server that has a handler slot; anything else
+        // means the kernel's bookkeeping is broken.
+        let (Some(request), Some(slot)) = (
+            ipc.in_flight(session).ok().flatten().cloned(),
+            state.handlers.get_mut(&server),
+        ) else {
             tracing::error!(
                 ?server,
                 ?session,
-                "a started request has no handler to run it"
+                "a started request is not in flight, or its server has no handler"
             );
             let failed = Finish::Failed(KernelError::NotImplemented);
-            return finish(ipc, session, failed, Vec::new());
+            return (finish(ipc, session, failed, Vec::new()), Vec::new());
         };
-        let notices = ipc.take_notices(server).unwrap_or_default();
+        let Some(mut handler) = slot.take() else {
+            // Out of its slot without a worker: whoever puts it back runs this request.
+            state.parked.entry(server).or_default().push(session);
+            return (Vec::new(), Vec::new());
+        };
+        give_notices(&mut state.tables, server, &mut *handler);
         drop(locked);
 
-        apply_notices(&mut *handler, server, notices);
         let mut cx = self.context(memory, server, process_id, request.translated);
         let mut message: MessageBuffer = *request.message;
         let answered = handler.handle(&mut cx, session, &mut message);
 
         let mut locked = self.lock::<(&mut Scheduler,)>();
-        locked.state.handlers.insert(server, Some(handler));
         let (scheduler,) = locked.tables();
         let ipc = scheduler.ipc_mut().1;
-        let ending = match answered {
-            Ok(Handled::Replied) => Finish::Replied(Box::new(message)),
-            Ok(Handled::Deferred) => Finish::Deferred,
-            Ok(Handled::Closed) => Finish::ServerClosed,
+        let finished = match answered {
+            Ok(Handled::Replied) => {
+                finish(ipc, session, Finish::Replied(Box::new(message)), cx.events)
+            }
+            Ok(Handled::Deferred) => finish(ipc, session, Finish::Deferred, cx.events),
+            Ok(Handled::Closed) => finish(ipc, session, Finish::ServerClosed, cx.events),
             Err(error) => {
                 tracing::error!(%error, ?server, ?session, "closing the session");
-                return close_failed(ipc, server, session, cx.events);
+                close_failed(ipc, server, session, cx.events)
             }
         };
-        finish(ipc, session, ending, cx.events)
+        let parked = put_back(&mut locked.state, server, handler);
+        (finished, parked)
     }
 
-    /// Starts and runs the ready requests of `server`, one at a time, until none may start.
+    /// Runs the requests `parked` for the server's handler, oldest first, then starts and runs
+    /// the ready requests of `server`, one at a time, until none may start.
     fn run_ready(
         &self,
         server: ServerId,
         memory: &dyn GuestMemory,
         process_id: u64,
+        parked: Vec<ObjectId>,
     ) -> Vec<Finished> {
         let mut finished = Vec::new();
-        // Bounded by the requests waiting: every turn starts one of them.
+        let mut parked = VecDeque::from(parked);
+        // Bounded by the requests in flight and waiting: every turn runs a parked one, which
+        // is then over or deferred, or starts a waiting one.
         loop {
-            let next = {
+            let next = if let Some(session) = parked.pop_front() {
+                Ok(Some(session))
+            } else {
                 let mut locked = self.lock::<(&mut Scheduler,)>();
                 let (scheduler,) = locked.tables();
                 scheduler.ipc_mut().1.start_next(server)
             };
             match next {
                 Ok(Some(session)) => {
-                    finished.extend(self.run_request(server, session, memory, process_id));
+                    let (done, more) = self.run_request(server, session, memory, process_id);
+                    finished.extend(done);
+                    parked.extend(more);
                 }
                 Ok(None) => return finished,
                 Err(error) => {
@@ -682,11 +704,22 @@ fn begin(
                 sender.message_address
             ))
         })?;
-    let (translated, result) = translate(&mut message, process_id, handles, objects);
+    let Translation {
+        translated,
+        result,
+        destroyed,
+    } = translate(&mut message, process_id, handles, objects);
+    // What a moved handle's removal destroyed (only once the request has failed) is torn down
+    // as closing its last handle tears it down (`svc::handle::close_handle`).
+    let forgotten = destroyed
+        .into_iter()
+        .try_for_each(|object| ipc.forget(object));
     if let Err(error) = result {
         ipc.release_translated(objects, &translated)?;
+        forgotten?;
         return Err(error.into());
     }
+    forgotten?;
     let request = Request {
         sender,
         message: Box::new(message),
@@ -742,6 +775,26 @@ fn close_failed(
         tracing::error!(%error, ?server, "the server cannot be told of a session it lost");
     }
     finish(ipc, session, Finish::ServerClosed, events)
+}
+
+/// Puts a handler back in its server's slot, under the lock, after giving it the notices that
+/// arrived while it was out, and returns the requests parked for it meanwhile.
+fn put_back(
+    state: &mut State,
+    server: ServerId,
+    mut handler: Box<dyn SessionHandler>,
+) -> Vec<ObjectId> {
+    give_notices(&mut state.tables, server, &mut *handler);
+    state.handlers.insert(server, Some(handler));
+    state.parked.remove(&server).unwrap_or_default()
+}
+
+/// Gives the handler of `server` the notices waiting for it, under the lock.
+fn give_notices(tables: &mut Tables, server: ServerId, handler: &mut dyn SessionHandler) {
+    match tables.scheduler.ipc_mut().1.take_notices(server) {
+        Ok(notices) => apply_notices(handler, server, notices),
+        Err(error) => tracing::error!(%error, ?server, "a server's notices cannot be taken"),
+    }
 }
 
 /// Gives a handler its notices, in order.

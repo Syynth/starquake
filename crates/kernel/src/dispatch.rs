@@ -194,7 +194,7 @@ use starquake_memory::GuestMemory;
 use starquake_trace::{Env, EnvError, EventKind, GuestTicks, Recorder, SVC_ARG_COUNT, ThreadId};
 
 use crate::handle::{Handle, HandleTable};
-use crate::id::ServerId;
+use crate::id::{ObjectId, ServerId};
 use crate::ipc::SessionHandler;
 use crate::result::{CallResult, KernelError, ResultCode, SvcError};
 use crate::sched::CoreId;
@@ -491,6 +491,10 @@ struct State {
     handlers: BTreeMap<ServerId, Option<Box<dyn SessionHandler>>>,
     /// Senders woken by other threads' dispatches, for [`Dispatcher::take_woken`].
     woken: Vec<Woken>,
+    /// Requests started on a server while its handler was out of its slot without holding a
+    /// worker (delivering deferred replies), oldest first: whoever puts the handler back runs
+    /// them (`dispatch::ipc`).
+    parked: BTreeMap<ServerId, Vec<ObjectId>>,
 }
 
 /// The locked tables, as a call that declared `B` may see them.
@@ -546,6 +550,7 @@ impl Dispatcher {
                 waits: LockWaits::default(),
                 handlers: BTreeMap::new(),
                 woken: Vec::new(),
+                parked: BTreeMap::new(),
             }),
             timer: None,
         }

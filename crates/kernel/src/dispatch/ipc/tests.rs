@@ -4,7 +4,9 @@
 //! end of a session.
 
 use std::collections::VecDeque;
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use starquake_ipc::{CommandType, RequestBuilder};
 use starquake_memory::{FlatMemory, PAGE_SIZE};
@@ -14,20 +16,27 @@ use super::*;
 use crate::dispatch::{Record, Tables};
 use crate::handle::{MAX_TABLE_SIZE, ObjectRefs};
 use crate::id::{SlabId, ThreadId as KernelThreadId};
+use crate::ipc::message::{PROCESS_ID_SIZE, PROCESS_ID_SLOT};
 use crate::ipc::{DEFAULT_WORKERS, HandlerError};
 use crate::memory::fixture::{self, CODE, CODE_SIZE, DATA, DATA_PAGES};
 use crate::svc::DebugSink;
 use crate::tables::{FIRST_USER_PROCESS_ID, Processes};
 use crate::time::CounterRate;
 
-/// The two guest threads of these tests, distinct so a swap shows.
+/// The guest threads of these tests, distinct so a swap shows.
 const A: ThreadId = ThreadId(0xA1);
 const B: ThreadId = ThreadId(0xB2);
-/// Their message buffers: two pages of the fixture's data, which the guest may read and write.
+const C: ThreadId = ThreadId(0xC3);
+/// Their message buffers: two pages of the fixture's data, which the guest may read and write,
+/// and for C the middle of the third, clear of the port names at its start.
 const TLS_A: u64 = DATA;
 const TLS_B: u64 = DATA + PAGE_SIZE;
+const TLS_C: u64 = NAMES + PAGE_SIZE / 2;
 /// Where the tests put port names: the data's last page.
 const NAMES: u64 = DATA + 2 * PAGE_SIZE;
+/// How long a test lets another thread run into a lock the test expects it to wait on. Only a
+/// broken kernel finishes inside it; the assertions after it hold however long it is.
+const SETTLE: Duration = Duration::from_millis(200);
 /// The end of the data: nothing the guest may touch is mapped after it.
 const DATA_END: u64 = DATA + DATA_PAGES * PAGE_SIZE;
 /// The service numbers of the two servers.
@@ -53,15 +62,31 @@ type Script = Box<
     dyn FnMut(&mut IpcContext<'_>, ObjectId, &mut [u8]) -> Result<Handled, HandlerError> + Send,
 >;
 
+/// What a scripted handler does before each `take_reply`.
+type TakeReplyHook = Box<dyn FnMut(&mut IpcContext<'_>) + Send>;
+
+/// What a scripted handler does besides its script: run before its next `accept` (taken, so
+/// once) and before each `take_reply`.
+#[derive(Default)]
+struct Hooks {
+    accept: Option<Box<dyn FnOnce() + Send>>,
+    take_reply: Option<TakeReplyHook>,
+}
+
 /// A handler that does what its script says, and logs what it is told.
 struct Scripted {
     log: Arc<Mutex<Log>>,
     script: Script,
     ready: Ready,
+    hooks: Arc<Mutex<Hooks>>,
 }
 
 impl SessionHandler for Scripted {
     fn accept(&mut self, session: ObjectId) -> Result<(), HandlerError> {
+        let hook = lock(&self.hooks).accept.take();
+        if let Some(hook) = hook {
+            hook();
+        }
         lock(&self.log).accepted.push(session);
         Ok(())
     }
@@ -83,9 +108,12 @@ impl SessionHandler for Scripted {
 
     fn take_reply(
         &mut self,
-        _cx: &mut IpcContext<'_>,
+        cx: &mut IpcContext<'_>,
         message: &mut [u8],
     ) -> Option<(ObjectId, Result<(), HandlerError>)> {
+        if let Some(hook) = lock(&self.hooks).take_reply.as_mut() {
+            hook(cx);
+        }
         let (session, reply) = lock(&self.ready).pop_front()?;
         Some((session, reply.map(|fill| message.fill(fill))))
     }
@@ -134,12 +162,14 @@ struct World {
     second: Server,
 }
 
-/// One server's handles for a test: its id, its log, the script slot and its ready replies.
+/// One server's handles for a test: its id, its log, the script slot, its ready replies and
+/// its hooks.
 struct Server {
     id: ServerId,
     log: Arc<Mutex<Log>>,
     script: Arc<Mutex<Option<Script>>>,
     ready: Ready,
+    hooks: Arc<Mutex<Hooks>>,
 }
 
 impl Server {
@@ -171,10 +201,12 @@ fn add_server(
     let log = Arc::new(Mutex::new(Log::default()));
     let script = Arc::new(Mutex::new(None));
     let ready = Arc::new(Mutex::new(VecDeque::new()));
+    let hooks = Arc::new(Mutex::new(Hooks::default()));
     let handler = Scripted {
         log: Arc::clone(&log),
         script: swappable(Arc::clone(&script)),
         ready: Arc::clone(&ready),
+        hooks: Arc::clone(&hooks),
     };
     let id = dispatcher
         .add_server(name, service, port, Box::new(handler))
@@ -184,6 +216,66 @@ fn add_server(
         log,
         script,
         ready,
+        hooks,
+    }
+}
+
+/// A gate a handler stops at on another core: it says it has arrived, then waits to be let
+/// through. The test holds the other ends.
+struct Gate {
+    arrived: SyncSender<()>,
+    through: Receiver<()>,
+}
+
+/// The test's ends of a [`Gate`]: wait for the handler to arrive, then let it through.
+struct GateKeeper {
+    arrived: Receiver<()>,
+    through: SyncSender<()>,
+}
+
+fn gate() -> (Gate, GateKeeper) {
+    let (arrived, arrival) = mpsc::sync_channel(1);
+    let (open, through) = mpsc::sync_channel(1);
+    (
+        Gate { arrived, through },
+        GateKeeper {
+            arrived: arrival,
+            through: open,
+        },
+    )
+}
+
+impl Gate {
+    fn pass(&self) {
+        self.arrived.send(()).unwrap();
+        self.through.recv().unwrap();
+    }
+}
+
+impl GateKeeper {
+    fn wait(&self) {
+        self.arrived.recv().unwrap();
+    }
+
+    fn open(&self) {
+        self.through.send(()).unwrap();
+    }
+}
+
+/// Each thread's message buffer and core.
+fn tls_of(thread: ThreadId) -> u64 {
+    match thread {
+        A => TLS_A,
+        B => TLS_B,
+        _ => TLS_C,
+    }
+}
+
+fn core_of(thread: ThreadId) -> u8 {
+    match thread {
+        A => 1,
+        B => 2,
+        _ => 3,
     }
 }
 
@@ -228,7 +320,7 @@ impl World {
         // write debug strings, so a leaked zero-sized one is enough.
         let debug: &mut NoDebug = Box::leak(Box::new(NoDebug));
         Caller {
-            core: if thread == A { 1 } else { 2 },
+            core: core_of(thread),
             thread,
             env: &self.env,
             memory: &self.memory,
@@ -242,7 +334,7 @@ impl World {
         let mut regs = GuestRegs::default();
         regs.x[0] = x0;
         regs.x[1] = x1;
-        regs.tpidrro = if thread == A { TLS_A } else { TLS_B };
+        regs.tpidrro = tls_of(thread);
         let record = self
             .dispatcher
             .dispatch(number.number(), &mut regs, &mut self.caller(thread));
@@ -272,15 +364,13 @@ impl World {
     ) -> (Record, GuestRegs) {
         let mut buffer = [0; BUFFER_SIZE];
         message.build(&mut buffer).unwrap();
-        let tls = if thread == A { TLS_A } else { TLS_B };
-        self.memory.write(tls, &buffer).unwrap();
+        self.memory.write(tls_of(thread), &buffer).unwrap();
         self.call(thread, SvcId::SendSyncRequest, u64::from(handle.raw()), 0)
     }
 
     fn tls(&self, thread: ThreadId) -> MessageBuffer {
         let mut buffer = [0; BUFFER_SIZE];
-        let tls = if thread == A { TLS_A } else { TLS_B };
-        self.memory.read(tls, &mut buffer).unwrap();
+        self.memory.read(tls_of(thread), &mut buffer).unwrap();
         buffer
     }
 
@@ -371,6 +461,22 @@ fn a_port_nothing_is_registered_under_is_not_found() {
         assert!(handles.is_empty());
         assert!(scheduler.objects().is_empty());
     });
+}
+
+#[test]
+fn connecting_many_times_never_runs_out_of_sessions() {
+    // Eden's `KClientPort::CreateSession` can refuse with `ResultLimitReached` or
+    // `ResultOutOfSessions`; with no session limits, only the handle table runs out.
+    let world = World::new();
+    for _ in 0..MAX_TABLE_SIZE {
+        world.session();
+    }
+    let (_, regs) = world.connect(b"first:\0");
+    assert_eq!(result(&regs), KernelError::OutOfHandles.code());
+    assert_eq!(
+        world.first.log().accepted.len(),
+        usize::from(MAX_TABLE_SIZE)
+    );
 }
 
 #[test]
@@ -484,8 +590,8 @@ fn the_process_id_slot_holds_the_senders_process_id() {
     }));
     world.send(A, handle, &request().send_pid(0xDEAD_BEEF));
     let (_, seen) = world.first.log().handled[0];
-    // Two header words and the special header, then the id.
-    assert_eq!(seen[12..20], FIRST_USER_PROCESS_ID.to_le_bytes());
+    let slot = PROCESS_ID_SLOT..PROCESS_ID_SLOT + PROCESS_ID_SIZE;
+    assert_eq!(seen[slot], FIRST_USER_PROCESS_ID.to_le_bytes());
 }
 
 #[test]
@@ -526,6 +632,7 @@ fn a_bad_handle_in_the_message_fails_the_request_before_the_server_sees_it() {
     let world = World::new();
     let handle = world.session();
     let moved = world.session();
+    let (session, moved_object) = (world.object(handle), world.object(moved));
     world.first.script(reply_with(0));
     let stale = Handle::from_raw(0x7_0123);
     let (_, regs) = world.send(
@@ -538,8 +645,35 @@ fn a_bad_handle_in_the_message_fails_the_request_before_the_server_sees_it() {
         world.first.log().handled,
         Vec::<(ObjectId, MessageBuffer)>::new()
     );
-    // The moved handle left the table anyway, and with it its session.
-    world.with_tables(|handles, _| assert!(handles.get(moved).is_err()));
+    // The moved handle left the table anyway, and with it its session, whose server is told.
+    world.with_tables(|handles, scheduler| {
+        assert!(handles.get(moved).is_err());
+        assert!(!scheduler.ipc().is_session(moved_object));
+        assert!(scheduler.ipc().is_session(session));
+    });
+    assert_eq!(world.first.log().closed, [moved_object]);
+}
+
+#[test]
+fn a_request_that_moves_its_own_sessions_last_handle_after_a_bad_one_destroys_the_session() {
+    let world = World::new();
+    let handle = world.session();
+    let session = world.object(handle);
+    world.first.script(reply_with(0));
+    let stale = Handle::from_raw(0x7_0123);
+    let (_, regs) = world.send(
+        A,
+        handle,
+        &request().copy_handle(stale.raw()).move_handle(handle.raw()),
+    );
+    assert_eq!(result(&regs), KernelError::InvalidHandle.code());
+    world.with_tables(|handles, scheduler| {
+        assert!(handles.is_empty());
+        assert!(scheduler.objects().is_empty());
+        assert!(!scheduler.ipc().is_session(session));
+        assert!(!scheduler.ipc().has_any_notices());
+    });
+    assert_eq!(world.first.log().closed, [session]);
 }
 
 #[test]
@@ -833,4 +967,284 @@ fn delivering_when_nothing_is_ready_changes_nothing() {
     world.deliver(&world.first);
     assert_eq!(world.dispatcher.take_woken(), Vec::<Woken>::new());
     assert_eq!(world.events().len(), before);
+}
+
+#[test]
+fn a_failed_deferred_reply_records_its_events_with_the_first_request_it_ends() {
+    const LOST: u32 = 0x99;
+    let world = World::new();
+    let handle = world.session();
+    let session = world.object(handle);
+    world
+        .first
+        .script(Box::new(|_, _, _| Ok(Handled::Deferred)));
+    let before = world.events().len();
+    world.send(A, handle, &request());
+    world.send(B, handle, &request());
+    // The handler records an event while it fails to write A's reply.
+    lock(&world.first.hooks).take_reply = Some(Box::new(|cx| cx.record(ipc_event(LOST))));
+    lock(&world.first.ready).push_back((session, Err(HandlerError("lost".to_owned()))));
+    world.deliver(&world.first);
+    let closed = KernelError::SessionClosed.code();
+    // The event is A's, recorded before A's system call; B's request never ran.
+    assert_eq!(
+        threads_and_kinds(&world.events()[before..]),
+        [
+            (A, ipc_event(LOST)),
+            send_event(A, handle, closed),
+            send_event(B, handle, closed),
+        ]
+    );
+}
+
+#[test]
+fn a_request_that_ends_in_an_error_leaves_the_message_as_it_was_sent() {
+    // The process id slot is the one part of the message the kernel rewrites: a request that
+    // does not succeed leaves the sender's own value in it.
+    const SENT_PID: u64 = 0x0123_4567_89AB_CDEF;
+    let world = World::new();
+    let closing = world.session();
+    let failing = world.session();
+    let message = request().send_pid(SENT_PID);
+    let mut sent = [0; BUFFER_SIZE];
+    message.build(&mut sent).unwrap();
+    assert_ne!(SENT_PID, FIRST_USER_PROCESS_ID);
+
+    world.first.script(Box::new(|_, _, _| Ok(Handled::Closed)));
+    let (_, regs) = world.send(A, closing, &message);
+    assert_eq!(result(&regs), KernelError::SessionClosed.code());
+    assert_eq!(world.tls(A), sent);
+
+    world
+        .first
+        .script(Box::new(|_, _, _| Err(HandlerError("broken".to_owned()))));
+    let (_, regs) = world.send(B, failing, &message);
+    assert_eq!(result(&regs), KernelError::SessionClosed.code());
+    assert_eq!(world.tls(B), sent);
+    // Both handlers saw the kernel's id in the slot.
+    let slot = PROCESS_ID_SLOT..PROCESS_ID_SLOT + PROCESS_ID_SIZE;
+    for (_, seen) in &world.first.log().handled {
+        assert_eq!(seen[slot.clone()], FIRST_USER_PROCESS_ID.to_le_bytes());
+    }
+}
+
+#[test]
+fn a_session_connected_while_a_reply_is_delivered_is_accepted_before_the_next_request_runs() {
+    let world = World::new();
+    let handle = world.session();
+    let session = world.object(handle);
+    world
+        .first
+        .script(Box::new(|_, _, _| Ok(Handled::Deferred)));
+    world.send(A, handle, &request());
+    // B waits on the same session; when its request runs, it notes what the server accepted.
+    let accepted_then = Arc::new(Mutex::new(Vec::new()));
+    let note = Arc::clone(&accepted_then);
+    let log = Arc::clone(&world.first.log);
+    world.first.script(Box::new(move |_, _, message| {
+        *lock(&note) = lock(&log).accepted.clone();
+        message.fill(0xB0);
+        Ok(Handled::Replied)
+    }));
+    world.send(B, handle, &request());
+    // Writing A's reply connects a new session on the same server.
+    let connected = Arc::new(Mutex::new(None));
+    let keep = Arc::clone(&connected);
+    lock(&world.first.hooks).take_reply = Some(Box::new(move |cx| {
+        if lock(&keep).is_none() {
+            *lock(&keep) = Some(cx.connect(FIRST).unwrap().0);
+        }
+    }));
+    lock(&world.first.ready).push_back((session, Ok(0xA0)));
+    world.deliver(&world.first);
+    let new = lock(&connected).unwrap();
+    assert_eq!(world.first.log().accepted, [session, new]);
+    assert_eq!(*lock(&accepted_then), [session, new]);
+    let woken: Vec<_> = world
+        .dispatcher
+        .take_woken()
+        .iter()
+        .map(|woken| (woken.thread, woken.result))
+        .collect();
+    assert_eq!(woken, [(A, ResultCode::SUCCESS), (B, ResultCode::SUCCESS)]);
+}
+
+#[test]
+fn a_session_the_server_has_not_accepted_yet_is_accepted_before_a_request_on_it_runs() {
+    // `ConnectToNamedPort` queues the server's notice under the lock and gives it to the server
+    // under the lock again, later: another core can send on the new handle in between. The
+    // test opens the session as the first half does, and sends at once.
+    let world = World::new();
+    let (session, handle) = world
+        .dispatcher
+        .with::<(&mut HandleTable, &mut Scheduler), _>(|(handles, scheduler)| {
+            open_session_with_handle(handles, scheduler, world.first.id, true)
+        })
+        .unwrap();
+    let accepted_then = Arc::new(Mutex::new(Vec::new()));
+    let note = Arc::clone(&accepted_then);
+    let log = Arc::clone(&world.first.log);
+    world.first.script(Box::new(move |_, _, message| {
+        *lock(&note) = lock(&log).accepted.clone();
+        message.fill(0);
+        Ok(Handled::Replied)
+    }));
+    let (_, regs) = world.send(B, handle, &request());
+    assert_eq!(result(&regs), ResultCode::SUCCESS);
+    assert_eq!(*lock(&accepted_then), [session]);
+    assert_eq!(world.first.log().accepted, [session]);
+}
+
+// ----- Several cores at once -----------------------------------------------------------------
+
+#[test]
+fn a_request_sent_while_another_core_has_the_server_accept_a_session_is_answered() {
+    let world = World::new();
+    let handle = world.session();
+    world.first.script(reply_with(0xB0));
+    let (gate, keeper) = gate();
+    lock(&world.first.hooks).accept = Some(Box::new(move || gate.pass()));
+    let world = &world;
+    std::thread::scope(|scope| {
+        // A connects, and the server stops while it accepts the new session.
+        let connecting = scope.spawn(|| world.connect(b"first:\0"));
+        keeper.wait();
+        // B sends on the existing session meanwhile.
+        let (sent_tx, sent_rx) = mpsc::channel();
+        let sending = scope.spawn(move || {
+            let sent = world.send(B, handle, &request());
+            sent_tx.send(()).unwrap();
+            sent
+        });
+        // A kernel that runs B now has no handler to run it with; one that is right makes B
+        // wait for the server.
+        let _ = sent_rx.recv_timeout(SETTLE);
+        keeper.open();
+        let (record, regs) = sending.join().unwrap();
+        assert_eq!(record.outcome, Outcome::Completed);
+        assert_eq!(result(&regs), ResultCode::SUCCESS);
+        assert_eq!(world.tls(B), [0xB0; BUFFER_SIZE]);
+        let (_, regs) = connecting.join().unwrap();
+        assert_eq!(result(&regs), ResultCode::SUCCESS);
+    });
+    assert_eq!(world.first.log().accepted.len(), 2);
+    assert_eq!(world.first.log().handled.len(), 1);
+}
+
+#[test]
+fn a_session_connected_while_another_core_has_the_server_accept_one_is_accepted_too() {
+    let world = World::new();
+    let (gate, keeper) = gate();
+    lock(&world.first.hooks).accept = Some(Box::new(move || gate.pass()));
+    let world = &world;
+    std::thread::scope(|scope| {
+        let connecting = scope.spawn(|| world.connect(b"first:\0"));
+        keeper.wait();
+        let (sent_tx, sent_rx) = mpsc::channel();
+        let second = scope.spawn(move || {
+            let connected = world.call(B, SvcId::ConnectToNamedPort, 0, NAMES);
+            sent_tx.send(()).unwrap();
+            connected
+        });
+        let _ = sent_rx.recv_timeout(SETTLE);
+        keeper.open();
+        for joined in [connecting.join().unwrap(), second.join().unwrap()] {
+            assert_eq!(result(&joined.1), ResultCode::SUCCESS);
+        }
+    });
+    // The second session's notice did not wait for the server's next activity.
+    assert_eq!(world.first.log().accepted.len(), 2);
+    world.with_tables(|_, scheduler| assert!(!scheduler.ipc().has_any_notices()));
+}
+
+#[test]
+fn requests_sent_while_another_core_delivers_a_reply_wait_and_are_woken() {
+    let world = World::new();
+    let deferred = world.session();
+    let (b_session, c_session) = (world.session(), world.session());
+    let deferred_object = world.object(deferred);
+    world
+        .first
+        .script(Box::new(|_, _, _| Ok(Handled::Deferred)));
+    let (record, _) = world.send(A, deferred, &request());
+    assert_eq!(record.outcome, Outcome::Waiting);
+    world.first.script(reply_with(0xBC));
+    let (gate, keeper) = gate();
+    let gate = Mutex::new(Some(gate));
+    lock(&world.first.hooks).take_reply = Some(Box::new(move |_| {
+        if let Some(gate) = lock(&gate).take() {
+            gate.pass();
+        }
+    }));
+    lock(&world.first.ready).push_back((deferred_object, Ok(0xA0)));
+    std::thread::scope(|scope| {
+        // Another core writes A's reply, and the handler stops in the middle of it.
+        let delivering = scope.spawn(|| world.deliver(&world.first));
+        keeper.wait();
+        // B and C send on two other sessions of the same server meanwhile: both wait, B for
+        // the handler, C behind B for the server's one worker.
+        let (b_record, _) = world.send(B, b_session, &request());
+        let (c_record, _) = world.send(C, c_session, &request());
+        keeper.open();
+        delivering.join().unwrap();
+        assert_eq!(
+            (b_record.outcome, c_record.outcome),
+            (Outcome::Waiting, Outcome::Waiting)
+        );
+    });
+    let woken: Vec<_> = world
+        .dispatcher
+        .take_woken()
+        .iter()
+        .map(|woken| (woken.thread, woken.result))
+        .collect();
+    assert_eq!(
+        woken,
+        [
+            (A, ResultCode::SUCCESS),
+            (B, ResultCode::SUCCESS),
+            (C, ResultCode::SUCCESS),
+        ]
+    );
+    assert_eq!(world.tls(A), [0xA0; BUFFER_SIZE]);
+    assert_eq!(world.tls(B), [0xBC; BUFFER_SIZE]);
+    assert_eq!(world.tls(C), [0xBC; BUFFER_SIZE]);
+    world.with_tables(|_, scheduler| {
+        assert_eq!(scheduler.ipc().queue(world.first.id).unwrap().running(), 0);
+    });
+}
+
+#[test]
+fn a_request_on_a_second_session_waits_while_another_core_runs_the_handler() {
+    let world = World::new();
+    let (first, other) = (world.session(), world.session());
+    let first_object = world.object(first);
+    let (gate, keeper) = gate();
+    world.first.script(Box::new(move |_, session, message| {
+        if session == first_object {
+            gate.pass();
+        }
+        message.fill(0xEE);
+        Ok(Handled::Replied)
+    }));
+    std::thread::scope(|scope| {
+        let sending = scope.spawn(|| world.send(A, first, &request()));
+        keeper.wait();
+        let (b_record, _) = world.send(B, other, &request());
+        keeper.open();
+        assert_eq!(b_record.outcome, Outcome::Waiting);
+        let (record, regs) = sending.join().unwrap();
+        assert_eq!(record.outcome, Outcome::Completed);
+        assert_eq!(result(&regs), ResultCode::SUCCESS);
+    });
+    // A's core ran B's request after A's, and B is reported woken with its reply written.
+    assert_eq!(
+        world.dispatcher.take_woken(),
+        [Woken {
+            thread: B,
+            core: core_of(B),
+            result: ResultCode::SUCCESS
+        }]
+    );
+    assert_eq!(world.tls(B), [0xEE; BUFFER_SIZE]);
 }
