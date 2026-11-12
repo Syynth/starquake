@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use starquake_memory::{BackingRange, Fault, FlatMemory, GuestMemory, PAGE_SIZE, Perms};
 
 use super::mapper::{Mapper, MapperError};
-use super::shared::SharedPages;
+use super::shared::{SharedPages, span_within};
 
 /// Where the guest-physical memory that backs shared memory starts.
 pub const SHARED_BASE: u64 = 0x10_0000_0000;
@@ -141,15 +141,12 @@ impl SharedView {
     /// The guest-physical address of `len` bytes at `va`, if one mapping holds them all.
     fn resolve(&self, va: u64, len: usize) -> Result<(Arc<FlatMemory>, u64), Fault> {
         let fault = Fault { address: va };
-        let len = u64::try_from(len).map_err(|_| fault)?;
-        let end = va.checked_add(len).ok_or(fault)?;
         self.0.with(|state| {
             let (start, backing) = state.shared.range(..=va).next_back().ok_or(fault)?;
-            let offset = va - start;
-            if end - start > backing.size() {
-                return Err(fault);
-            }
-            Ok((Arc::clone(&state.physical), backing.base() + offset))
+            // `start <= va`: the mapping is the last one that starts at or before `va`.
+            let offset = va.checked_sub(*start).ok_or(fault)?;
+            let at = span_within(backing.base(), backing.size(), offset, len).ok_or(fault)?;
+            Ok((Arc::clone(&state.physical), at))
         })
     }
 }

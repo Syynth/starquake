@@ -91,6 +91,19 @@ pub const fn is_transfer_memory_permission(permission: SvcPermission) -> bool {
     )
 }
 
+/// Where `len` bytes at `offset` into `size` bytes that start at `base` begin: `base + offset`,
+/// if the whole extent `offset..offset + len` lies inside `0..size` and the sum does not wrap.
+/// `None` otherwise, which each caller turns into its own error. The one bounds check behind
+/// [`SharedPages`]' accesses, an HLE server's reach into a transfer memory
+/// (`IpcContext::lent_range`) and the test mapper's guest view (`testing::SharedView`).
+pub(crate) fn span_within(base: u64, size: u64, offset: u64, len: usize) -> Option<u64> {
+    let end = offset.checked_add(u64::try_from(len).ok()?)?;
+    if end > size {
+        return None;
+    }
+    base.checked_add(offset)
+}
+
 /// The pages of one shared memory as host code reaches them: a range of guest-physical memory,
 /// and the memory it lies in. Addresses given to its [`GuestMemory`] methods are offsets from
 /// the first page; an access that does not lie wholly inside the pages is a [`Fault`] at the
@@ -132,18 +145,9 @@ impl SharedPages {
     /// pages; otherwise a fault at the first offset outside them.
     fn physical(&self, offset: u64, len: usize) -> Result<u64, Fault> {
         let size = self.size();
-        let outside = Fault {
+        span_within(self.backing.base(), size, offset, len).ok_or(Fault {
             address: offset.max(size),
-        };
-        let end = u64::try_from(len)
-            .ok()
-            .and_then(|len| offset.checked_add(len))
-            .ok_or(outside)?;
-        if end > size {
-            return Err(outside);
-        }
-        // `offset < size` here unless `len` is zero, and `base + size` does not overflow.
-        self.backing.base().checked_add(offset).ok_or(outside)
+        })
     }
 
     /// Copies `buf.len()` bytes at `offset` into `buf`: [`GuestMemory::read`], callable without
@@ -382,6 +386,22 @@ mod tests {
         );
         // No bytes at the very end is fine.
         assert_eq!(shared.read(size, &mut []), Ok(()));
+    }
+
+    #[test]
+    fn a_span_lies_within_up_to_the_last_byte_and_no_further() {
+        const SIZE: u64 = 2 * PAGE_SIZE;
+        // The whole extent, ending exactly at the end, and nothing at the very end.
+        assert_eq!(span_within(BASE, SIZE, 0, 0x2000), Some(BASE));
+        assert_eq!(span_within(BASE, SIZE, SIZE - 1, 1), Some(BASE + SIZE - 1));
+        assert_eq!(span_within(BASE, SIZE, SIZE, 0), Some(BASE + SIZE));
+        // One byte past the end, by the start or by the length.
+        assert_eq!(span_within(BASE, SIZE, SIZE - 1, 2), None);
+        assert_eq!(span_within(BASE, SIZE, SIZE + 1, 0), None);
+        // An end that wraps the 64-bit space, and a start that wraps it once added to the base.
+        assert_eq!(span_within(BASE, u64::MAX, u64::MAX, 1), None);
+        assert_eq!(span_within(u64::MAX, SIZE, 1, 0), None);
+        assert_eq!(span_within(u64::MAX, SIZE, 0, 0), Some(u64::MAX));
     }
 
     #[test]

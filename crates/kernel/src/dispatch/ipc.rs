@@ -83,6 +83,7 @@ use crate::ipc::message::{MessageBuffer, Translated, Translation, translate};
 use crate::ipc::{
     Admission, Done, Finish, Handled, IpcError, Notice, PortName, Request, Sender, SessionHandler,
 };
+use crate::memory::shared::span_within;
 use crate::memory::{
     AddressSpace, SharedMemory, SharedPages, SvcPermission, TransferMemory,
     is_shared_memory_permission, shared_memory_size,
@@ -351,16 +352,8 @@ impl IpcContext<'_> {
     /// if they lie wholly inside it.
     fn lent_range(&self, object: ObjectId, offset: u64, len: usize) -> SvcResult<u64> {
         let transfer = self.transfer_memory(object)?;
-        let outside = KernelError::InvalidCurrentMemory;
-        let end = u64::try_from(len)
-            .ok()
-            .and_then(|len| offset.checked_add(len))
-            .ok_or(outside)?;
-        if end > transfer.size() {
-            return Err(outside);
-        }
-        // Inside the transfer memory, which lies inside the address space, so no wrap.
-        transfer.address().checked_add(offset).ok_or(outside)
+        span_within(transfer.address(), transfer.size(), offset, len)
+            .ok_or(KernelError::InvalidCurrentMemory)
     }
 
     /// Records an event for the request. It is recorded, stamped with the request's sender and
