@@ -160,7 +160,7 @@ fn process_from_handle(
         Resolved::CurrentThread => Err(KernelError::InvalidHandle.into()),
         Resolved::Object(object) => match scheduler.objects().get(object)? {
             Object::Process(_) => Ok(()),
-            Object::Thread(_) => Err(KernelError::InvalidHandle.into()),
+            Object::Thread(_) | Object::Session => Err(KernelError::InvalidHandle.into()),
         },
     }
 }

@@ -31,8 +31,8 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
+use crate::id::ObjectId;
 use serde::{Deserialize, Serialize};
-use starquake_kernel::id::ObjectId;
 
 /// The number of workers a server has unless it declares more: one, so one handler of the
 /// server runs at a time (`docs/specs/services.md`, decision 4).
@@ -394,9 +394,9 @@ impl RequestQueue {
 
 #[cfg(test)]
 mod tests {
+    use crate::id::SlabId;
     use proptest::prelude::*;
     use proptest::test_runner::{Config, RngAlgorithm, RngSeed};
-    use starquake_kernel::id::SlabId;
 
     use super::*;
 

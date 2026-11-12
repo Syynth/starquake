@@ -21,6 +21,14 @@ pub struct Processes {
     counter_rate: CounterRate,
 }
 
+/// The process id Horizon gives the first process it creates after its initial ones (the
+/// system modules it starts itself): `KProcess::ProcessIdMin`, `InitialProcessIdMax + 1`
+/// (`eden/src/core/hle/kernel/k_process.h` @ cf654052), where Eden's `next_user_process_id`
+/// starts (`eden/src/core/hle/kernel/kernel.cpp`).
+///
+/// PROVISIONAL: the one process has this id. Kernel slice 8 (process creation) hands ids out.
+pub const FIRST_USER_PROCESS_ID: u64 = 0x51;
+
 impl Processes {
     /// The facts of the one process: its counter runs at `counter_rate`
     /// ([`CounterRate::SWITCH_1`] or [`CounterRate::SWITCH_2`], by which console the program
@@ -28,6 +36,13 @@ impl Processes {
     #[must_use]
     pub const fn new(counter_rate: CounterRate) -> Self {
         Self { counter_rate }
+    }
+
+    /// The process's id as the guest knows it: what a request's process id slot is given
+    /// ([`FIRST_USER_PROCESS_ID`] for the one process).
+    #[must_use]
+    pub const fn process_id(&self) -> u64 {
+        FIRST_USER_PROCESS_ID
     }
 
     /// The rate of the process's counter: what the kernel converts the environment's clock with
@@ -42,6 +57,12 @@ impl Processes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_one_process_has_the_first_user_process_id() {
+        let processes = Processes::new(CounterRate::SWITCH_1);
+        assert_eq!(processes.process_id(), FIRST_USER_PROCESS_ID);
+    }
 
     #[test]
     fn a_process_keeps_the_counter_rate_it_was_created_with() {

@@ -337,6 +337,39 @@ fn the_user_can_write_a_range_only_if_every_block_it_touches_is_user_writable() 
     assert!(writable(u64::MAX, 0));
 }
 
+#[test]
+fn the_user_can_read_a_range_only_if_every_block_it_touches_is_user_readable() {
+    let (mut space, _log, stack_top) = loaded();
+    // The data's middle page read-only, its last page no access: three blocks.
+    space
+        .set_memory_permission(DATA + PAGE_SIZE, PAGE_SIZE, SvcPermission::Read)
+        .unwrap();
+    space
+        .set_memory_permission(DATA + 2 * PAGE_SIZE, PAGE_SIZE, SvcPermission::None)
+        .unwrap();
+    let readable = |address: u64, size: u64| space.user_can_read(address, size);
+    // Read-write and read-only pages, across their boundary, ending exactly at the no-access
+    // page; one byte further reaches it.
+    assert!(readable(DATA, 2 * PAGE_SIZE));
+    assert!(readable(DATA + 2 * PAGE_SIZE - 1, 1));
+    assert!(!readable(DATA, 2 * PAGE_SIZE + 1));
+    assert!(!readable(DATA + 2 * PAGE_SIZE, 1));
+    // Text and rodata are readable; free memory is not.
+    assert!(readable(CODE, 1));
+    assert!(readable(RODATA, 1));
+    assert!(!readable(CODE - PAGE_SIZE, 1));
+    // The stack, up to its top exactly; one byte past it is free memory.
+    assert!(readable(stack_top - STACK_SIZE, STACK_SIZE));
+    assert!(!readable(stack_top - 1, 2));
+    // Above the address space, and a range that wraps.
+    let end = space.regions().address_space.end;
+    assert!(!readable(end, 1));
+    assert!(!readable(end - 1, 2));
+    assert!(!readable(u64::MAX, 2));
+    // Nothing to read is always allowed.
+    assert!(readable(u64::MAX, 0));
+}
+
 // ----- The main thread's stack ----------------------------------------------------------------
 
 #[test]

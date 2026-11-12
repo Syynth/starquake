@@ -70,7 +70,8 @@
 //! # Running one
 //!
 //! A [`Server`] holds one service family's sessions, the state they share ([`Family`]) and its
-//! request queue. The kernel's session code (kernel spec, port plan slice 9) drives it:
+//! request queue. The kernel's session code (kernel spec, port plan slice 9) drives it, through
+//! the kernel's `SessionHandler` interface, which `Server` implements (`framework/host.rs`):
 //!
 //! - A session a client made by connecting to the service is opened with [`Server::accept`],
 //!   which gives it the service's root interface.
@@ -85,17 +86,19 @@
 //!   the reply written with [`Server::take_completed`] and [`Server::deliver`].
 //! - [`Server::save`] and [`Server::restore`] write and read the server's state ([`snapshot`]).
 //!
-//! The kernel is reached through the small [`Kernel`] trait, defined here until that slice
-//! implements it; `fake::FakeKernel` (behind the `test-support` feature) stands in for tests.
+//! The kernel is reached through the small [`Kernel`] trait. The kernel's `IpcContext`
+//! implements it (`framework/host.rs`); `fake::FakeKernel` (behind the `test-support` feature)
+//! stands in for tests.
 //!
 //! The message is parsed here and not by the kernel, because how a request is framed depends on
 //! whether its session is a domain, which only the server knows.
 //!
 //! The kernel spec's sketch of a server row keeps the list of ready sessions, the running count
-//! and the worker count in the kernel. Here they are in the server's [`RequestQueue`], which is
-//! plain data and is saved with the server; the kernel keeps what only it has, the waiting
-//! threads and their message buffers. Which of the two holds the queue once slice 9 exists is
-//! that slice's to settle: the type is public so that it can be either.
+//! and the worker count in the kernel, and slice 9 put them there: the kernel's server rows each
+//! hold a [`RequestQueue`] (the type lives in `starquake_kernel::ipc::queue`, re-exported here as
+//! [`queue`]), and decide which request starts when. A `Server` keeps one of its own as well,
+//! which is plain data saved with the server; it follows the same rules, so it admits every
+//! request the kernel starts (see `framework/host.rs`).
 //!
 //! # What the framework answers itself
 //!
@@ -199,9 +202,10 @@ pub mod control;
 pub mod defer;
 #[cfg(any(test, feature = "test-support"))]
 pub mod fake;
+mod host;
 mod kernel;
 pub mod payload;
-pub mod queue;
+pub use starquake_kernel::ipc::queue;
 mod reply;
 pub mod request;
 pub mod result;

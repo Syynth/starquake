@@ -83,6 +83,21 @@ proptest! {
     }
 
     #[test]
+    fn the_special_header_flag_reads_the_same_with_or_without_the_rest(words in any::<[u32; 2]>()) {
+        let follows = CommandHeader::special_header_follows(words[1]);
+        // The top bit, whatever the other bits of either word hold: libnx's `has_special_header`
+        // is bit 31 of the second word (`libnx/nx/include/switch/sf/hipc.h`), pinned here from
+        // the reference rather than from the crate's own private constant.
+        prop_assert_eq!(follows, words[1] >= 0x8000_0000);
+        if let Ok(header) = CommandHeader::decode(words) {
+            prop_assert_eq!(header.has_special_header, follows);
+            // And what the encoder writes, the flag reads back.
+            let [_, word1] = header.encode().unwrap();
+            prop_assert_eq!(CommandHeader::special_header_follows(word1), follows);
+        }
+    }
+
+    #[test]
     fn special_header_round_trips(word in any::<u32>()) {
         let header = SpecialHeader::decode(word);
         prop_assert!(header.num_copy_handles <= MAX_HANDLES);

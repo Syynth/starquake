@@ -69,6 +69,12 @@ typed_id! {
     ObjectId
 }
 
+typed_id! {
+    /// Names a server in the IPC table ([`crate::ipc`]): the owner of the server ends of many
+    /// sessions.
+    ServerId
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

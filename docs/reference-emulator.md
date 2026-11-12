@@ -18,6 +18,12 @@ Known places where the reference is wrong or unverified, which starquake does no
 
 - Its `ExitProcess` returns to the guest. Starquake ends the run.
 - It answers a session's close request with `0xf601`. This is unverified against a console.
+  Starquake returns the same, for a reason of its own: a console's server framework closes its
+  end of the session on a close request without replying (fact only:
+  `atmosphere/libraries/libstratosphere/source/sf/hipc/sf_hipc_server_session_manager.cpp`,
+  `ProcessRequest`), and the kernel ends a request whose server end closed with
+  `ResultSessionClosed`, `0xf601` (`eden/src/core/hle/kernel/k_server_session.cpp`,
+  `CleanupRequests`). Both are read from sources, not measured.
 
 Add to this list whenever a comparison turns up another.
 

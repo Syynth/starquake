@@ -38,6 +38,7 @@ pub mod artifacts;
 )]
 mod clock;
 pub mod crash;
+pub mod hle;
 #[cfg_attr(
     not(any(test, all(target_os = "macos", target_arch = "aarch64"))),
     expect(

@@ -131,9 +131,9 @@ svc_ids! {
     WaitProcessWideKeyAtomic = 0x1c, Planned;
     SignalProcessWideKey = 0x1d, Planned;
     GetSystemTick = 0x1e, Implemented;
-    ConnectToNamedPort = 0x1f, Planned;
+    ConnectToNamedPort = 0x1f, Implemented;
     SendSyncRequestLight = 0x20, Deferred;
-    SendSyncRequest = 0x21, Planned;
+    SendSyncRequest = 0x21, Implemented;
     SendSyncRequestWithUserBuffer = 0x22, Planned;
     SendAsyncRequestWithUserBuffer = 0x23, Planned;
     GetProcessId = 0x24, Planned;
@@ -312,6 +312,8 @@ mod tests {
                 | SvcId::GetCurrentProcessorNumber
                 | SvcId::CloseHandle
                 | SvcId::GetSystemTick
+                | SvcId::ConnectToNamedPort
+                | SvcId::SendSyncRequest
                 | SvcId::OutputDebugString
                 | SvcId::GetInfo => Status::Implemented,
                 _ if hardware_facing(id.name()) => Status::NotPlanned,

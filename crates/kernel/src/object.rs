@@ -2,9 +2,11 @@
 //!
 //! Kernel spec, "A closed set of object kinds": an [`Object`] is an enum, not a trait object,
 //! so matches are exhaustive and there are no downcasts. The kinds built so far are the two
-//! that are only an id into another table ([`Object::Thread`], [`Object::Process`]); events,
-//! sessions, shared and transfer memory and resource limits get their variants from the slices
-//! that build them, and the compiler then points at every match that must handle them.
+//! that are only an id into another table ([`Object::Thread`], [`Object::Process`]) and the
+//! client end of a session ([`Object::Session`], whose row in the IPC table, [`crate::ipc`], is
+//! keyed by the object's own id); events, shared and transfer memory and resource limits get
+//! their variants from the slices that build them, and the compiler then points at every match
+//! that must handle them.
 //!
 //! Rows live in the scheduler table ([`Scheduler::objects`](crate::sched::Scheduler::objects)):
 //! the spec puts events and sessions under the scheduler's lock, and a thread's object row
@@ -53,6 +55,10 @@ pub enum Object {
     Thread(ThreadId),
     /// A process, by its row in the process table.
     Process(ProcessId),
+    /// The client end of a session (Horizon's `KClientSession`): what a handle from
+    /// `ConnectToNamedPort` or a reply's moved handle names. The session's row in the IPC table
+    /// ([`crate::ipc::Ipc`]) has the object's id as its key, so the variant carries nothing.
+    Session,
 }
 
 /// Why an object table operation failed.

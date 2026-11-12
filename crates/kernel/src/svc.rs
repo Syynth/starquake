@@ -21,7 +21,9 @@
 //! [`Convention`]. No system call reads the clock: the dispatcher reads it once per dispatch and
 //! passes the guest time to the calls that need it. `ExitProcess` (0x07) is implemented too,
 //! provisionally as a dispatcher arm with no function behind it (see the dispatcher's module
-//! docs).
+//! docs). So are `ConnectToNamedPort` (0x1f) and `SendSyncRequest` (0x21): they are dispatcher
+//! arms over the IPC table ([`crate::ipc`]), because `SendSyncRequest` releases the kernel lock
+//! while a server's handler runs (`dispatch::ipc` says how).
 
 mod convention;
 pub mod debug;

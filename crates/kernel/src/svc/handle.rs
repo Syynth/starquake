@@ -9,10 +9,13 @@
 //!
 //! The call declares two tables: the handle table, which loses an entry, and the scheduler,
 //! whose object table holds the reference the handle had. When that was the object's last
-//! reference its row is freed. Tearing down what the row named (a thread, say) belongs to the
-//! slice that builds that kind's lifecycle; see [`crate::object`].
+//! reference its row is freed. A session's client end is then torn down as
+//! `KClientSession::Destroy` does (`eden/src/core/hle/kernel/k_client_session.cpp`): the
+//! session's row goes and its server is told ([`crate::ipc::Ipc::forget`]). Tearing down what
+//! another kind of row named (a thread, say) belongs to the slice that builds that kind's
+//! lifecycle; see [`crate::object`].
 
-use crate::handle::{Handle, HandleTable};
+use crate::handle::{Closed, Handle, HandleTable};
 use crate::result::CallResult;
 use crate::tables::Scheduler;
 
@@ -25,7 +28,13 @@ pub fn close_handle(
     scheduler: &mut Scheduler,
     handle: Handle,
 ) -> CallResult<()> {
-    handles.remove(scheduler.objects_mut(), handle)?;
+    let (objects, ipc) = scheduler.ipc_mut();
+    let removed = handles.remove(objects, handle)?;
+    if removed.closed == Closed::Last {
+        // The client end of a session is destroyed with its last reference
+        // (`KClientSession::Destroy`): the session goes, and its server is told.
+        ipc.forget(removed.object)?;
+    }
     Ok(())
 }
 

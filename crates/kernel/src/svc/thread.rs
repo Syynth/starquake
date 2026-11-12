@@ -36,7 +36,7 @@ pub fn thread_from_handle(
         Resolved::CurrentProcess => Err(KernelError::InvalidHandle.into()),
         Resolved::Object(object) => match scheduler.objects().get(object)? {
             Object::Thread(thread) => Ok(thread),
-            Object::Process(_) => Err(KernelError::InvalidHandle.into()),
+            Object::Process(_) | Object::Session => Err(KernelError::InvalidHandle.into()),
         },
     }
 }

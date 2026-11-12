@@ -3,8 +3,8 @@
 `startup.trace` is what `../hello.nro` does at the system boundary from its first instruction
 to `ExitProcess`, recorded from a reference emulator and normalised so that another emulator's
 run can be compared with it. `crates/core/tests/homebrew.rs` runs the fixture in starquake and
-compares its trace with this one, call by call, up to `ConnectToNamedPort("sm:")`; the rest of
-the file is what the next slices have to match.
+compares its trace with this one, line by line, through `ExitProcess`; its module docs say how
+each kind of line is compared.
 
 ## Provenance
 
@@ -52,7 +52,8 @@ log starquake hello: line one
   one that places something differently *inside* a region (the stack four pages into the
   stack region, say) does not.
 - Sizes, handles and results are as the emulator returned them. Handle values
-  (`out_handle=0x103fe`) are that emulator's; nothing compares them yet.
+  (`out_handle=0x103fe`) are that emulator's; the comparison pairs each with the handle
+  starquake used in the same place and checks that the pairing holds for the whole run.
 
 ## Regenerating
 

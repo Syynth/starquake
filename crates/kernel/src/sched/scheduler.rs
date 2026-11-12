@@ -24,6 +24,7 @@ use super::queue::{PriorityQueue, Threads, Walk};
 use super::thread::{Priority, QueueLink, SuspendType, Thread, ThreadState};
 use super::{HIGHEST_CORE_MIGRATION_ALLOWED_PRIORITY, IdealCore, SchedError, ThreadActivity};
 use crate::id::ThreadId;
+use crate::ipc::Ipc;
 use crate::object::Objects;
 use crate::result::KernelError;
 
@@ -56,6 +57,8 @@ pub struct Scheduler {
     /// What handles name (kernel spec: events and sessions live in this table; a thread's
     /// object row names a row of `threads`).
     objects: Objects,
+    /// Servers, sessions and named ports (kernel spec: sessions live in this table).
+    ipc: Ipc,
     threads: Threads,
     queue: PriorityQueue,
     cores: Vec<CoreState>,
@@ -76,6 +79,7 @@ impl Scheduler {
     fn build(core_count: u8) -> Self {
         Self {
             objects: Objects::new(),
+            ipc: Ipc::new(),
             threads: Threads::new(),
             queue: PriorityQueue::new(core_count),
             cores: vec![CoreState::new(); usize::from(core_count)],
@@ -138,6 +142,18 @@ impl Scheduler {
     /// The object table, to create objects in and to open and close references through.
     pub fn objects_mut(&mut self) -> &mut Objects {
         &mut self.objects
+    }
+
+    /// The IPC table: servers, sessions and named ports.
+    #[must_use]
+    pub fn ipc(&self) -> &Ipc {
+        &self.ipc
+    }
+
+    /// The object table and the IPC table together, for the operations that change both (a
+    /// session is an object, and a request holds references).
+    pub fn ipc_mut(&mut self) -> (&mut Objects, &mut Ipc) {
+        (&mut self.objects, &mut self.ipc)
     }
 
     /// The thread `id` names.

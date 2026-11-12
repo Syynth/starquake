@@ -335,7 +335,7 @@ fn every_dispatch_reads_the_clock_once_and_stamps_its_event_with_that_reading() 
     let numbers = [
         SvcId::GetSystemTick.number(),
         u16::MAX,
-        SvcId::ConnectToNamedPort.number(),
+        SvcId::GetProcessId.number(),
         SvcId::CloseHandle.number(),
         SvcId::GetSystemTick.number(),
     ];
@@ -520,6 +520,8 @@ fn a_failing_environment_ends_the_call_without_writing_registers() {
         SvcId::GetSystemTick.number(),
         SvcId::OutputDebugString.number(),
         SvcId::ConnectToNamedPort.number(),
+        // Its own arm, which takes the lock three times: the clock is read at the first.
+        SvcId::SendSyncRequest.number(),
         u16::MAX,
     ] {
         let memory = FlatMemory::new(BASE, 0x100);
@@ -1425,13 +1427,13 @@ proptest! {
 
 #[test]
 fn a_planned_call_returns_not_implemented_and_leaves_its_outputs_alone() {
-    // ConnectToNamedPort's convention outputs x0 (result) and x1 (a handle). Divergence from Eden's
+    // GetProcessId's convention outputs x0 (result) and x1 (the id). Divergence from Eden's
     // wrapper, which would write x1 too: only x0 changes. A deferred call with a convention
     // (light IPC, which outputs x0-x7) behaves the same.
     let memory = FlatMemory::new(BASE, 0x10);
     let mut sink = Collect::default();
     for (id, status) in [
-        (SvcId::ConnectToNamedPort, Status::Planned),
+        (SvcId::GetProcessId, Status::Planned),
         (SvcId::SetGpuMemoryAttribute, Status::Planned),
         (SvcId::ExitThread, Status::Planned),
         (SvcId::SendSyncRequestLight, Status::Deferred),
@@ -1546,9 +1548,9 @@ fn every_call_that_returns_is_recorded_once_with_its_decoded_arguments_and_resul
             [0; SVC_ARG_COUNT],
             ResultCode::SUCCESS,
         ),
-        // Planned calls are decoded too. ConnectToNamedPort's one argument is in x1, not x0.
+        // Planned calls are decoded too. GetProcessId's one argument is in x1, not x0.
         (
-            SvcId::ConnectToNamedPort.number(),
+            SvcId::GetProcessId.number(),
             7,
             8,
             [0, 8, 0, 0, 0, 0, 0, 0],
