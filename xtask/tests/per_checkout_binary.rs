@@ -32,14 +32,42 @@ mod support {
         config["alias"]["xtask"].as_str().unwrap().to_owned()
     }
 
-    /// A scratch folder unique to this test process, so concurrent test runs that share a
-    /// `CARGO_TARGET_TMPDIR` never touch each other's checkouts.
-    pub fn scratch_root() -> PathBuf {
-        let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-            .join(format!("per-checkout-{}", std::process::id()));
-        drop(fs::remove_dir_all(&root));
-        fs::create_dir_all(&root).unwrap();
-        root
+    /// A scratch folder that belongs to one test of one test process, deleted when the test
+    /// ends without failing.
+    ///
+    /// The folder is keyed by the process id (concurrent test runs that share a
+    /// `CARGO_TARGET_TMPDIR` never touch each other's checkouts) and by the test's name (under
+    /// plain `cargo test` the tests of one process are threads, and one test clearing the
+    /// folder of another deleted its checkouts mid-run). A failing test leaves its folder
+    /// behind to be looked at; the next run of the same test in a new process starts afresh.
+    pub struct Scratch {
+        root: PathBuf,
+    }
+
+    impl Scratch {
+        /// Creates the empty folder for the test called `test`.
+        pub fn new(test: &str) -> Self {
+            let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+                .join(format!("per-checkout-{}-{test}", std::process::id()));
+            drop(fs::remove_dir_all(&root));
+            fs::create_dir_all(&root).unwrap();
+            Self { root }
+        }
+
+        /// The folder.
+        pub fn path(&self) -> &Path {
+            &self.root
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            if !std::thread::panicking() {
+                // Each run leaves a few MiB of build output otherwise, in the folder that the
+                // checkouts of a wave share.
+                drop(fs::remove_dir_all(&self.root));
+            }
+        }
     }
 
     /// Writes a minimal workspace at `root/name` whose `xtask` prints `name`, the
@@ -107,15 +135,16 @@ mod support {
 
 use std::path::Path;
 
-use support::{checkout, real_alias, run_xtask, scratch_root};
+use support::{Scratch, checkout, real_alias, run_xtask};
 
 #[test]
 fn each_checkout_sharing_a_target_dir_runs_its_own_xtask() {
-    let root = scratch_root();
+    let scratch = Scratch::new("each_checkout_runs_its_own_xtask");
+    let root = scratch.path();
     let shared = root.join("shared-target");
     let alias = real_alias();
-    let alpha = checkout(&root, "alpha", &alias);
-    let beta = checkout(&root, "beta", &alias);
+    let alpha = checkout(root, "alpha", &alias);
+    let beta = checkout(root, "beta", &alias);
 
     // Alternate so that whichever checkout built last cannot be what both of them run.
     for _round in 0..2 {
@@ -126,9 +155,10 @@ fn each_checkout_sharing_a_target_dir_runs_its_own_xtask() {
 
 #[test]
 fn the_xtask_binary_stays_in_its_checkout_and_spawned_cargo_keeps_the_shared_folder() {
-    let root = scratch_root();
+    let scratch = Scratch::new("xtask_binary_stays_in_its_checkout");
+    let root = scratch.path();
     let shared = root.join("shared-target");
-    let alpha = checkout(&root, "alpha", &real_alias());
+    let alpha = checkout(root, "alpha", &real_alias());
 
     let report = run_xtask(&alpha, &shared);
     // /tmp is a symlink on macOS, so compare canonical paths.
