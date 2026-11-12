@@ -120,6 +120,8 @@ fn the_kernels_refusals_are_the_replys_result_and_give_no_handle() {
             SvcPermission::ReadExecute,
             KernelError::InvalidNewMemoryPermission,
         ),
+        // Both faults: the size is checked first, as the kernel checks it.
+        (0, SvcPermission::None, KernelError::InvalidSize),
     ] {
         let raw = u32::from(permission.bits());
         let reply = plain(&send(&mut server, &mut kernel, session, &make(size, raw)));

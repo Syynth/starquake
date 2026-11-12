@@ -393,16 +393,20 @@ fn unlocking_goes_on_past_a_failure_and_reports_the_first() {
     let second = world
         .create(heap + PAGE_SIZE, PAGE_SIZE, raw(SvcPermission::None))
         .unwrap();
-    // A transfer memory of another process went first; then both of these.
+    // Transfer memories of two other processes went first, one after the other; then both of
+    // these.
     let stranger = ProcessId::from_parts(7, 1);
-    let foreign =
-        TransferMemory::new(stranger, heap, PAGE_SIZE, SvcPermission::None).with_pages_locked();
-    let stray = world
-        .scheduler
-        .objects_mut()
-        .create(Object::TransferMemory(foreign))
-        .unwrap();
-    assert_eq!(world.scheduler.objects_mut().close(stray), Ok(Closed::Last));
+    let later_stranger = ProcessId::from_parts(8, 1);
+    for owner in [stranger, later_stranger] {
+        let foreign =
+            TransferMemory::new(owner, heap, PAGE_SIZE, SvcPermission::None).with_pages_locked();
+        let stray = world
+            .scheduler
+            .objects_mut()
+            .create(Object::TransferMemory(foreign))
+            .unwrap();
+        assert_eq!(world.scheduler.objects_mut().close(stray), Ok(Closed::Last));
+    }
     close_handle(&mut world.handles, &mut world.scheduler, first).unwrap();
     close_handle(&mut world.handles, &mut world.scheduler, second).unwrap();
     let unlocked = unlock_released(&mut world.scheduler, &mut world.space, owner());
@@ -417,6 +421,23 @@ fn unlocking_goes_on_past_a_failure_and_reports_the_first() {
     assert_eq!(world.block(heap).4, MemoryAttribute::NONE);
     assert_eq!(world.block(heap).1, HEAP_SIZE_ALIGNMENT / PAGE_SIZE);
     assert!(!world.scheduler.objects().has_unlocks());
+}
+
+#[test]
+fn adjacent_lends_stay_two_blocks() {
+    let mut world = World::new();
+    let heap = world.heap;
+    let kept = raw(SvcPermission::Read);
+    // The same state, permission and attributes on both sides: only the merge barrier that
+    // locking sets at each lent range's head keeps them apart.
+    let first = world.create(heap, SIZE, kept).unwrap();
+    let second = world.create(heap + SIZE, SIZE, kept).unwrap();
+    assert_eq!(world.block(heap).1, PAGES);
+    assert_eq!(world.block(heap + SIZE).0, heap + SIZE);
+    assert_eq!(world.block(heap + SIZE).1, PAGES);
+    world.close(first);
+    world.close(second);
+    assert_eq!(world.block(heap).1, HEAP_SIZE_ALIGNMENT / PAGE_SIZE);
 }
 
 #[test]

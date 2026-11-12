@@ -333,6 +333,8 @@ fn a_server_cannot_make_shared_memory_of_no_bytes_or_a_permission_a_mapping_cann
                 (u64::MAX, SvcPermission::Read),
                 (SIZE, SvcPermission::None),
                 (SIZE, SvcPermission::ReadExecute),
+                // Both faults: the size is checked first.
+                (0, SvcPermission::None),
             ] {
                 seen.push(
                     cx.create_shared_memory(size, permission)
@@ -356,6 +358,7 @@ fn a_server_cannot_make_shared_memory_of_no_bytes_or_a_permission_a_mapping_cann
             Err(KernelError::InvalidSize),
             Err(KernelError::InvalidNewMemoryPermission),
             Err(KernelError::InvalidNewMemoryPermission),
+            Err(KernelError::InvalidSize),
             Ok(PAGE_SIZE),
             Ok(2 * PAGE_SIZE),
         ]

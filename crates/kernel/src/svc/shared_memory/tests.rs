@@ -156,6 +156,19 @@ fn mapping_shared_memory_maps_its_pages_and_holds_a_reference_until_it_is_unmapp
 }
 
 #[test]
+fn unmapping_leaves_the_blocks_as_they_were_before_the_mapping() {
+    let mut world = World::new();
+    let shared = world.shared(PAGES, SvcPermission::ReadWrite);
+    let before = world.blocks();
+    let read_write = raw(SvcPermission::ReadWrite);
+    assert_eq!(world.map(shared.handle, SHARED, SIZE, read_write), Ok(()));
+    assert_ne!(world.blocks(), before);
+    assert_eq!(world.unmap(shared.handle, SHARED, SIZE), Ok(()));
+    // The freed range joins the free memory around it again: no barrier is left at its head.
+    assert_eq!(world.blocks(), before);
+}
+
+#[test]
 fn a_host_write_is_visible_through_the_guest_mapping_and_the_reverse() {
     let mut world = World::new();
     let shared = world.shared(PAGES, SvcPermission::ReadWrite);
