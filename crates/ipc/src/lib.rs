@@ -45,4 +45,4 @@ pub use hipc::{
 };
 pub use message::{Body, CmifReply, CmifRequest, Message, SessionKind};
 pub use reply::ReplyBuilder;
-pub use request::RequestBuilder;
+pub use request::{RequestBuilder, RequestLayout};

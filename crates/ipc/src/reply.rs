@@ -1,6 +1,6 @@
 //! Building replies into an IPC buffer.
 //!
-//! Ported from `eden/src/core/hle/service/ipc_helpers.h` (`ResponseBuilder`), with two
+//! Ported from `eden/src/core/hle/service/ipc_helpers.h` (`ResponseBuilder`), with three
 //! deliberate differences:
 //!
 //! - A TIPC reply's raw data is **one** result word followed directly by the data, as in
@@ -8,8 +8,19 @@
 //!   two-word CMIF result there, which put TIPC data one word late (scoping doc row 22).
 //! - The raw data size in the header is exact (alignment padding plus the words actually
 //!   written). Eden's `ResponseBuilder` adds the payload size twice and reserves four extra
-//!   padding words; real clients locate reply fields by the sizes they know, not by this field, so
-//!   an exact count is the least surprising choice. This is a design choice, not a protocol fact.
+//!   padding words. libnx locates reply fields by the sizes it knows, not by this field
+//!   (`cmifParseResponse`, `libnx/nx/include/switch/sf/cmif.h:260-288`, never reads it for CMIF;
+//!   `tipcParseResponse`, `tipc.h:199-228`, neither), so an exact count is the least surprising
+//!   choice. This is a design choice, not a protocol fact.
+//! - A domain reply's object ids follow the data at once, unaligned, where libnx's
+//!   `cmifParseResponse` reads them: at the `SFCO` header plus the data size the caller expects
+//!   (`cmif.h:270`). Data that is not a whole number of words is not padded before them; only the
+//!   end of the raw data section is padded to a word. Pinned by
+//!   `domain_reply_puts_objects_where_libnx_reads_them` in `tests/libnx_golden.rs`.
+//!
+//! Neither Eden nor libnx says what type word a reply carries (libnx's `hipcParseResponse`,
+//! `hipc.h:316-363`, reads only the counts, the size and the special header). This builder writes
+//! zero for CMIF and echoes the request's type for TIPC, as Eden's `ResponseBuilder` does.
 
 use crate::builder::{Parts, fill_header, push_special_header, to_u32};
 use crate::cmif::{CmifReplyHeader, DomainReplyHeader};
@@ -89,8 +100,8 @@ impl ReplyBuilder {
         self
     }
 
-    /// Appends a domain object id after the data. Building fails unless the reply is a domain
-    /// reply.
+    /// Appends a domain object id. The ids follow the data at once, with no padding between, in
+    /// the order added. Building fails unless the reply is a domain reply.
     #[must_use]
     pub fn object_id(mut self, id: u32) -> Self {
         self.parts.object_ids.push(id);
@@ -147,8 +158,13 @@ impl ReplyBuilder {
                     }
                     .encode(),
                 );
-                push_data(&mut words, &parts.data);
-                words.extend_from_slice(&parts.object_ids);
+                // The object ids follow the data at once, unaligned: libnx reads them at the
+                // `SFCO` header plus the data size it expects (`cmif.h:270`).
+                let mut tail = parts.data.clone();
+                for id in &parts.object_ids {
+                    tail.extend_from_slice(&id.to_le_bytes());
+                }
+                push_data(&mut words, &tail);
                 CommandType::Invalid
             }
         };
