@@ -716,6 +716,21 @@ fn a_path_with_no_terminator_ends_at_its_struct() {
     let mut beyond = longest.clone();
     beyond.extend_from_slice(b"\0\0\0\0");
     assert_eq!(open_and_ask(&beyond), (only(result::TOO_LONG_PATH), false));
+
+    // A struct full of a path that names the file, then more in a larger buffer that would name
+    // another: only the struct is read.
+    let mut full = HELLO_PATH.to_vec();
+    full.resize(PATH_BUFFER_SIZE, b'/');
+    let mut rig = Rig::new();
+    let fs = rig.open_sd();
+    let mut more = full.clone();
+    more.extend_from_slice(b"x\0");
+    assert_eq!(rig.open_file(fs, &more).result, ResultCode::SUCCESS);
+    let asked = HostRequest::Size {
+        mount: Mount::SdCard,
+        path: HELLO_PATH.to_vec(),
+    };
+    assert_eq!(rig.env.asked().pop(), Some(asked));
 }
 
 #[test]

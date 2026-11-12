@@ -156,6 +156,17 @@ fn a_separator_that_would_fill_the_buffer_is_too_long() {
         Err(PathError::TooLong)
     );
     assert_eq!(normalize(b"/a/b", 5, false, false, false).unwrap(), b"/a/b");
+    // The separator is refused even when what follows it would not have been written: a `.` or
+    // a `..` after it.
+    assert_eq!(
+        normalize(b"/a/.", 3, false, false, false),
+        Err(PathError::TooLong)
+    );
+    assert_eq!(
+        normalize(b"/a/..", 3, false, false, false),
+        Err(PathError::TooLong)
+    );
+    assert_eq!(normalize(b"/a/.", 4, false, false, false).unwrap(), b"/a");
 }
 
 #[test]

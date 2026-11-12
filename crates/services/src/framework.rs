@@ -159,6 +159,11 @@
 //! | A method asks for a second reply token | reply [`NOT_SUPPORTED`] (`deferred.rs`: `a_request_has_one_token`) |
 //! | A method asks for family state its server was not given | reply [`NOT_SUPPORTED`] (`server.rs`: `a_method_that_needs_family_state_fails_on_a_server_without_it`) |
 //!
+//! Two more come with the host: a method that asks for the environment or the executor its
+//! server was not given ([`Context::env`], [`Context::executor`]) replies [`NOT_SUPPORTED`]
+//! (`fsp/tests.rs`: `a_server_without_an_environment_fails_what_needs_the_host`,
+//! `a_server_without_an_executor_cannot_read`).
+//!
 //! More are listed where they belong: payload layout in [`payload`], buffers in [`request`],
 //! control requests in [`control`], and the reuse of domain object ids on `Domain` in
 //! `framework/targets.rs`.

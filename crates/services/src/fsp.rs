@@ -80,8 +80,8 @@
 //!   save-data and RomFS commands; none is in this subset, so nothing is kept.
 //! - **Paths.** Eden's `IFileSystem` hands the path to `VfsDirectoryServiceWrapper::OpenFile`
 //!   (`eden/src/core/hle/service/filesystem/filesystem.cpp`), which runs `Common::FS::SanitizePath`
-//!   and strips leading separators, so a relative path, or one that climbs above the root, still
-//!   names a file. Here the path goes through [`path::normalize`], as a RomFS lookup needs
+//!   (which turns backslashes into separators and drops a `..` at the root) and strips leading
+//!   separators, so a relative path, or one that climbs above the root, still names a file. Here the path goes through [`path::normalize`], as a RomFS lookup needs
 //!   (`docs/proposals.md`): it must start with `/`, may not climb above the root, and may not
 //!   hold `:*?<>|` (`a_relative_path_is_refused`, `a_path_above_the_root_is_unobtainable`,
 //!   `a_path_with_an_invalid_character_is_refused`).
@@ -289,17 +289,14 @@ fn check_open_mode(mode: u32) -> Result<(), ResultCode> {
     }
 }
 
-/// The path in a request's in buffer 0: its first [`PATH_BUFFER_SIZE`] bytes at most, up to the
-/// first zero byte.
+/// The path in a request's in buffer 0: its first [`PATH_BUFFER_SIZE`] bytes at most. It ends at
+/// its first zero byte, which is where [`path::normalize`] stops reading.
 fn read_path(cx: &mut Context<'_>, req: &Request<'_>) -> Result<Vec<u8>, crate::framework::Fault> {
     let mut buffer = req.in_buffer(cx, 0)?;
     let len =
         usize::try_from(buffer.len()).map_or(PATH_BUFFER_SIZE, |len| len.min(PATH_BUFFER_SIZE));
     let mut bytes = vec![0; len];
     buffer.read(&mut bytes)?;
-    if let Some(end) = bytes.iter().position(|byte| *byte == 0) {
-        bytes.truncate(end);
-    }
     Ok(bytes)
 }
 

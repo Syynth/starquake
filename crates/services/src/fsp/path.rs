@@ -18,7 +18,7 @@
 //!
 //! Each difference is a case where the reference's C++ reads or writes outside its buffers, or
 //! asserts something it then ignores. None changes the answer for a path that does not reach
-//! it. Each is pinned by the test named, in `fsp/path/tests.rs`:
+//! it. The first two are pinned by the tests named, in `fsp/path/tests.rs`:
 //!
 //! - `Normalize` writes into a caller's buffer of `max_out_size` bytes without checking the
 //!   leading separator it adds to a drive-relative path, and the terminator it adds at the end
@@ -29,6 +29,10 @@
 //!   `ResultTooLongPath`; here nothing is returned but the error. With `max_out_size` zero, the
 //!   reference's length arithmetic wraps; here every path is `ResultTooLongPath`
 //!   (`a_buffer_of_no_bytes_holds_no_path`).
+//!
+//! The other two have no test, because no input reaches the first and the second is about the
+//! function's shape, not its answers:
+//!
 //! - Removing a component for `..` walks back over the output with a counter that, in the
 //!   reference, wraps below zero if the output does not start with a separator (its `ASSERT`s say
 //!   that cannot happen, and only log when it does). Here the counter stops at zero.
