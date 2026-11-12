@@ -14,6 +14,7 @@ pub mod id;
 pub mod ipc;
 pub mod memory;
 pub mod object;
+pub mod process;
 pub mod result;
 pub mod sched;
 pub mod slab;

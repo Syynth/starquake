@@ -77,12 +77,13 @@ use thiserror::Error;
 pub use cores::{
     APPLICATION_CORE_COUNT, AffinityMask, CoreId, CoreIdOutOfRange, CoreSignals, MAX_CORES,
 };
-pub use scheduler::Scheduler;
+pub use scheduler::{FIRST_THREAD_ID, Scheduler, ThreadExit, UserThread};
 pub use thread::{
     HIGHEST_THREAD_PRIORITY, LOWEST_THREAD_PRIORITY, PRIORITY_COUNT, Priority, SuspendType, Thread,
     ThreadState,
 };
 
+use crate::id::ProcessId;
 use crate::result::{KernelError, SvcError};
 use crate::slab::{SlabError, StoredIdStale};
 
@@ -152,6 +153,10 @@ pub enum SchedError {
     /// damaged bookkeeping fails instead of panicking.
     #[error("scheduler bookkeeping is inconsistent")]
     Corrupt,
+    /// A process id the scheduler has no row for: the kernel created the process without
+    /// telling the scheduler, or named the wrong one.
+    #[error("the scheduler has no process {0:?}")]
+    UnknownProcess(ProcessId),
 }
 
 impl SchedError {
@@ -167,7 +172,8 @@ impl SchedError {
             | Self::NoSuchCore { .. }
             | Self::CoreCount { .. }
             | Self::NoCurrentThread { .. }
-            | Self::Corrupt => None,
+            | Self::Corrupt
+            | Self::UnknownProcess(_) => None,
         }
     }
 }
@@ -216,6 +222,10 @@ mod tests {
             (SchedError::CoreCount { count: 0 }, None),
             (SchedError::NoCurrentThread { core: 1 }, None),
             (SchedError::Corrupt, None),
+            (
+                SchedError::UnknownProcess(crate::id::SlabId::from_parts(2, 7)),
+                None,
+            ),
         ]
     }
 

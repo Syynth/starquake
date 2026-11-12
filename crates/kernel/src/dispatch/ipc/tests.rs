@@ -20,8 +20,8 @@ use crate::ipc::message::{PROCESS_ID_SIZE, PROCESS_ID_SLOT};
 use crate::ipc::{DEFAULT_WORKERS, HandlerError};
 use crate::memory::fixture::{self, CODE, CODE_SIZE, DATA, DATA_PAGES};
 use crate::svc::DebugSink;
+use crate::process::{Console, ProcessDescription};
 use crate::tables::{FIRST_USER_PROCESS_ID, Processes};
-use crate::time::CounterRate;
 
 /// The guest threads of these tests, distinct so a swap shows.
 const A: ThreadId = ThreadId(0xA1);
@@ -289,7 +289,7 @@ impl World {
             handles: HandleTable::new(size).unwrap(),
             address_space: fixture::loaded().0,
             scheduler: Scheduler::default(),
-            processes: Processes::new(CounterRate::SWITCH_2),
+            processes: Processes::new(&ProcessDescription::homebrew(Console::Switch2)).unwrap(),
         });
         let first = add_server(
             &dispatcher,

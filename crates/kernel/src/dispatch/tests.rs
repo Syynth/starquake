@@ -17,6 +17,7 @@ use crate::id::{ProcessId, SlabId};
 use crate::memory::fixture::{self, CODE, CODE_SIZE, DATA, STACK_SIZE};
 use crate::memory::{MemoryAttribute, MemoryState, SvcMemoryInfo};
 use crate::object::Object;
+use crate::process::{Console, ProcessDescription};
 use crate::sched::{CoreSignals, Priority, SchedError};
 use crate::svc::{Arg, Kind};
 use crate::time::{CounterRate, NANOS_PER_SECOND};
@@ -25,7 +26,9 @@ use crate::time::{CounterRate, NANOS_PER_SECOND};
 const BASE: u64 = 0x80_0000_0000;
 /// The counter rate of the process in these tests: the Switch 2 rate, so a conversion at the
 /// Switch 1 rate (the only rate the kernel had before it kept guest time) shows.
-const RATE: CounterRate = CounterRate::SWITCH_2;
+const CONSOLE: Console = Console::Switch2;
+/// [`CONSOLE`]'s counter rate.
+const RATE: CounterRate = CONSOLE.counter_rate();
 /// The first clock reading, in nanoseconds (what the `Env` reports): a whole number of seconds,
 /// so the expected guest ticks are `CLOCK_SECONDS * RATE.hz()` with no rounding.
 const CLOCK_SECONDS: u64 = 1_000_000_007;
@@ -62,19 +65,17 @@ fn time_of(n: u64) -> GuestTicks {
     RATE.ticks_at(HostNanos(CLOCK_START_NS + n * CLOCK_STEP_NS))
 }
 
-/// Fresh tables for a process at `rate`.
-fn tables_at(rate: CounterRate) -> Tables {
-    Tables {
-        handles: HandleTable::new(i32::from(MAX_TABLE_SIZE)).expect("a maximum-size handle table"),
-        address_space: fixture::loaded().0,
-        scheduler: Scheduler::default(),
-        processes: Processes::new(rate),
-    }
+/// Fresh tables for a process built for `console`, created as process creation creates them,
+/// with a handle table of the maximum size.
+fn tables_at(console: Console) -> Tables {
+    let mut description = ProcessDescription::homebrew(console);
+    description.handle_table_size = i32::from(MAX_TABLE_SIZE);
+    crate::process::create(&description, fixture::loaded().0).expect("the fixture's process")
 }
 
 /// Fresh tables. The one place the tests build them.
 fn tables() -> Tables {
-    tables_at(RATE)
+    tables_at(CONSOLE)
 }
 
 /// Collects debug strings with the time each was output at.
@@ -300,8 +301,9 @@ fn get_system_tick_writes_the_dispatchs_guest_time_to_x0() {
 fn guest_time_follows_the_rate_of_the_process() {
     // One clock, two processes: each reads its own rate's worth of ticks, and its events are
     // stamped with the same number.
-    for rate in [CounterRate::SWITCH_1, CounterRate::SWITCH_2] {
-        let dispatcher = Dispatcher::new(tables_at(rate));
+    for console in [Console::Switch1, Console::Switch2] {
+        let rate = console.counter_rate();
+        let dispatcher = Dispatcher::new(tables_at(console));
         let mut regs = regs();
         let (record, events) =
             dispatch_on(&dispatcher, SvcId::GetSystemTick.number(), &mut regs, 0);
