@@ -230,6 +230,13 @@ impl Scheduler {
         Ok(self.core(core)?.needs_scheduling)
     }
 
+    /// Whether any thread could run: one that is runnable and not suspended (in the queues),
+    /// whether or not a core has chosen it yet.
+    #[must_use]
+    pub fn has_runnable_thread(&self) -> bool {
+        self.threads.iter().any(|(_, thread)| thread.is_queued())
+    }
+
     /// The core a thread is running on, if any: the loop over every core's current thread in
     /// Eden's `SetCoreMask`.
     #[must_use]

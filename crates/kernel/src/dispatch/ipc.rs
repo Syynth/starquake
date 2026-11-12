@@ -954,7 +954,7 @@ fn await_reply(scheduler: &mut Scheduler, sender: Sender, session: ObjectId) -> 
     };
     if matches!(
         scheduler.sync().wait(waiter),
-        Some(crate::sync::Wait::Reply { session: waited, .. }) if *waited == session
+        Some(crate::sync::Wait::Reply { session: on, .. }) if *on == session
     ) {
         return true;
     }

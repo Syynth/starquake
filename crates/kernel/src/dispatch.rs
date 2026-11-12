@@ -223,6 +223,7 @@ use crate::svc::{
 use crate::tables::{AddressSpace, Processes, Scheduler};
 
 mod arbitration;
+mod cores;
 mod ipc;
 mod lifecycle;
 mod memory_objects;
@@ -230,6 +231,7 @@ mod sync;
 #[cfg(test)]
 mod tests;
 
+pub use cores::{Loaded, Switch};
 pub use ipc::{IpcContext, Woken};
 pub use sync::WakeError;
 
@@ -528,6 +530,9 @@ struct State {
     /// worker (delivering deferred replies), oldest first: whoever puts the handler back runs
     /// them (`dispatch::ipc`).
     parked: BTreeMap<ServerId, Vec<ObjectId>>,
+    /// The latest guest time any clock reading under the lock gave: what the core loop's
+    /// rescheduling stamps threads with (`dispatch/cores.rs`). It never runs backwards.
+    latest: GuestTicks,
 }
 
 /// One reading of the environment's clock, as host nanoseconds and as the process's guest ticks.
@@ -572,15 +577,16 @@ impl<B: TableSet> Locked<'_, B> {
     }
 
     /// One reading of the environment's clock, and the guest time it is at the process's
-    /// counter rate.
-    fn clock(&self, env: &dyn Env) -> Result<Now, EnvError> {
+    /// counter rate. The latest guest time read under the lock is kept ([`State::latest`]).
+    fn clock(&mut self, env: &dyn Env) -> Result<Now, EnvError> {
         let host = env.now()?;
         let guest = self.state.tables.processes.counter_rate().ticks_at(host);
+        self.state.latest = self.state.latest.max(guest);
         Ok(Now { host, guest })
     }
 
     /// Guest time at a reading of the environment's clock, at the process's counter rate.
-    fn guest_time(&self, env: &dyn Env) -> Result<GuestTicks, EnvError> {
+    fn guest_time(&mut self, env: &dyn Env) -> Result<GuestTicks, EnvError> {
         self.clock(env).map(|now| now.guest)
     }
 }
@@ -620,6 +626,7 @@ impl Dispatcher {
                 handlers: BTreeMap::new(),
                 woken: Vec::new(),
                 parked: BTreeMap::new(),
+                latest: GuestTicks(0),
             }),
             timer: None,
         }
