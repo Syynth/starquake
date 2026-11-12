@@ -10,6 +10,7 @@
 pub mod dispatch;
 pub mod handle;
 pub mod id;
+pub mod memory;
 pub mod object;
 pub mod result;
 pub mod sched;

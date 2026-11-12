@@ -6,11 +6,16 @@
 //!
 //! | Call | Function | Parameters |
 //! |---|---|---|
+//! | `SetHeapSize` (0x01) | [`memory::set_heap_size`] | the address space, exclusive |
+//! | `SetMemoryPermission` (0x02) | [`memory::set_memory_permission`] | the address space, exclusive |
+//! | `SetMemoryAttribute` (0x03) | [`memory::set_memory_attribute`] | the address space, exclusive |
+//! | `QueryMemory` (0x06) | [`memory::query_memory`] | the address space, shared, and guest memory |
 //! | `GetThreadPriority` (0x0c) | [`thread::get_thread_priority`] | the scheduler and the handle table, both shared |
 //! | `GetCurrentProcessorNumber` (0x10) | [`processor::get_current_processor_number`] | the calling core |
 //! | `CloseHandle` (0x16) | [`handle::close_handle`] | the handle table and the scheduler, both exclusive |
 //! | `GetSystemTick` (0x1e) | [`tick::get_system_tick`] | the dispatch's guest time |
 //! | `OutputDebugString` (0x27) | [`debug::output_debug_string`] | guest memory, a [`DebugSink`] and the dispatch's guest time |
+//! | `GetInfo` (0x29) | [`info::get_info`] | the handle table, the address space and the scheduler, all shared |
 //!
 //! Only the [dispatcher](crate::dispatch) calls them, decoding their arguments with the call's
 //! [`Convention`]. No system call reads the clock: the dispatcher reads it once per dispatch and
@@ -22,6 +27,8 @@ mod convention;
 pub mod debug;
 pub mod handle;
 mod ids;
+pub mod info;
+pub mod memory;
 pub mod processor;
 pub mod thread;
 pub mod tick;

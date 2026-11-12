@@ -1,5 +1,5 @@
 //! The kernel's tables. Each system call declares which of these it touches; nothing else can
-//! reach kernel state. The ones not yet built are placeholders until their port slices land.
+//! reach kernel state.
 
 use crate::time::CounterRate;
 
@@ -8,11 +8,8 @@ use crate::time::CounterRate;
 /// the rest arrive with their slices.
 pub use crate::sched::Scheduler;
 
-/// One process's memory blocks, regions and heap.
-#[derive(Debug, Default)]
-pub struct AddressSpace {
-    _private: (),
-}
+/// One process's memory blocks, regions, heap and memory accounting ([`crate::memory`]).
+pub use crate::memory::AddressSpace;
 
 /// Per-process facts fixed at creation (capabilities, ids, the counter rate).
 ///
