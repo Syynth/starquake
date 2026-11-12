@@ -10,5 +10,21 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# The test assembler (`asm`), which builds instruction words from decoded `Op` values, for this
+# crate's tests and downstream crates' dev builds: the name every crate gives the feature that
+# exports its test helpers (`docs/specs/testing.md`, "Shared test support").
+test-support = []
+
 [dependencies]
+naga.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+# Turns `test-support` on for this crate's unit tests, integration tests and doctests.
+starquake-shader = { workspace = true, features = ["test-support"] }
+# naga's MSL writer, for experiment E1's mesh case only: final code is not written outside tests
+# until a direct backend asks for it (spec, slice 22).
+naga = { workspace = true, features = ["msl-out"] }
+proptest.workspace = true
+wgpu.workspace = true

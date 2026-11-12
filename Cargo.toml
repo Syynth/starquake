@@ -39,10 +39,18 @@ serde_json = "1.0.154"
 thiserror = "2.0.21"
 toml = { version = "1.2.1", default-features = false, features = ["std", "parse", "serde"] }
 tracing = "0.1.44"
+# The shader crate hands out a validated naga module (docs/specs/shader-pipeline.md, "The backend
+# through naga"). Pinned exactly to the naga wgpu 30.0.1 uses, so the shader, gpu and render crates
+# share one naga (owner's decision of 2026-11-12); upgrade it together with wgpu.
+naga = "=30.0.1"
 
 # Dev-only
 insta = "1.49.0"
 proptest = "1.12.0"
+# Creates the shader crate's naga modules on a real device: experiment E1 and the wgpu acceptance
+# tests (docs/specs/shader-pipeline.md, "What to verify before building"). Takes a naga module
+# directly (`naga-ir`); Metal on macOS, Vulkan elsewhere. Pinned with naga.
+wgpu = { version = "=30.0.1", default-features = false, features = ["std", "metal", "vulkan", "naga-ir"] }
 
 [workspace.lints.rust]
 # Denied everywhere; the few crates that must talk to the host or run guest code (cpu, later
