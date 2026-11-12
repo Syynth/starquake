@@ -12,6 +12,24 @@ pub enum Region {
     Meta(usize),
 }
 
+impl Region {
+    /// The region in words, for messages: `file 3's extent`, `package 0's meta block`.
+    fn describe(self) -> String {
+        match self {
+            Self::Extent(file) => format!("file {file}'s extent"),
+            Self::Meta(package) => format!("package {package}'s meta block"),
+        }
+    }
+}
+
+/// A node in words, for messages: `directory 3`, `file 0`.
+fn describe_node(node: Node) -> String {
+    match node {
+        Node::Dir(dir) => format!("directory {}", dir.index()),
+        Node::File(file) => format!("file {}", file.index()),
+    }
+}
+
 /// Why a container could not be opened or a file of it could not be read.
 #[derive(Debug, thiserror::Error)]
 pub enum NupError {
@@ -199,11 +217,19 @@ pub enum NupError {
         node: u32,
     },
     /// A node is a package root or a child more than once.
-    #[error("{0:?} appears more than once in the tree")]
+    #[error("{} appears more than once in the tree", describe_node(*.0))]
     NodeReferencedTwice(Node),
     /// A node cannot be reached from any package root.
-    #[error("{0:?} is not reachable from any package root")]
+    #[error("{} is not reachable from any package root", describe_node(*.0))]
     UnreachableNode(Node),
+    /// A package's tree is nested deeper than [`MAX_TREE_DEPTH`](super::MAX_TREE_DEPTH).
+    #[error("directory {dir} is nested more than {limit} levels below its package root")]
+    TreeTooDeep {
+        /// Index of the first directory found past the limit.
+        dir: usize,
+        /// The limit.
+        limit: usize,
+    },
     /// A directory's children are not in strictly increasing order of name.
     #[error("directory {dir}'s children are not sorted by name, or two share a name")]
     ChildrenNotSorted {
@@ -273,7 +299,7 @@ pub enum NupError {
         offset: u64,
     },
     /// Two regions of the blob area overlap.
-    #[error("{first:?} and {second:?} overlap")]
+    #[error("{} and {} overlap", .first.describe(), .second.describe())]
     RegionsOverlap {
         /// The region that starts first.
         first: Region,

@@ -10,8 +10,8 @@ use super::layout::{
     RawSuperblock, RawTocHeader, SUPERBLOCK_SIZE, TOC_HEADER_SIZE, TOC_MAGIC,
 };
 use super::{
-    Codec, DirEntry, DirId, FileEntry, FileId, Limits, Node, NupError, Package, PackageKind,
-    Region, index_of, name_in, to_u64,
+    Codec, DirEntry, DirId, FileEntry, FileId, Limits, MAX_TREE_DEPTH, Node, NupError, Package,
+    PackageKind, Region, index_of, name_in, to_u64,
 };
 
 /// The superblock checks of SPEC §2 (rules 1 to 5, except the hash, which needs the bytes) and
@@ -455,11 +455,19 @@ fn check_tree(toc: &ParsedToc) -> Result<(), NupError> {
     }
 
     // Reachability, recording which package owns each directory. Each directory has one place,
-    // so the walk meets it at most once; the owner array doubles as the visited set.
+    // so the walk meets it at most once; the owner array doubles as the visited set. The walk
+    // also measures depth (a package root is at depth 0) and refuses a tree deeper than
+    // `MAX_TREE_DEPTH`, which is what keeps a path (and the walk that builds paths) short.
     let mut owner: Vec<Option<usize>> = vec![None; toc.dirs.len()];
     for package in &toc.packages {
-        let mut stack = vec![package.root];
-        while let Some(dir) = stack.pop() {
+        let mut stack = vec![(package.root, 0usize)];
+        while let Some((dir, depth)) = stack.pop() {
+            if depth > MAX_TREE_DEPTH {
+                return Err(NupError::TreeTooDeep {
+                    dir: dir.index(),
+                    limit: MAX_TREE_DEPTH,
+                });
+            }
             let Some(slot) = owner.get_mut(dir.index()) else {
                 continue;
             };
@@ -472,7 +480,7 @@ fn check_tree(toc: &ParsedToc) -> Result<(), NupError> {
             };
             for &child in toc.children.get(entry.children.clone()).unwrap_or_default() {
                 if let Node::Dir(sub) = child {
-                    stack.push(sub);
+                    stack.push((sub, depth.saturating_add(1)));
                 }
             }
         }

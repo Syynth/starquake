@@ -43,7 +43,8 @@
 //!   array; each file's name inside the pool, its codec known, its codec flags zero, an empty
 //!   file with no extent, a non-empty one with one, and that extent inside the blob region and
 //!   16-aligned (`parse_file`, `_check_bounds`; §4); each child slot naming an existing node.
-//! - The tree rules and then the overlap rules listed under "Divergences".
+//! - The tree rules (including the depth limit) and then the overlap rules listed under
+//!   "Divergences".
 //!
 //! # Divergences
 //!
@@ -51,13 +52,23 @@
 //!
 //! - **One parent per node, every node reachable.** Every node id appears in exactly one place:
 //!   as one package's root, or in one child slot. The directory child ranges are disjoint and
-//!   cover the children array. Every directory and file is reachable from a package root. The
-//!   reference reader checks none of this (its verifier reports overlapping ranges, cycles and
-//!   orphans as problems). It is what makes the tree a forest, so that a walk visits each node
-//!   once, a path names one file, and a cycle cannot exist. A child slot naming a node past the
-//!   last file is an error here; the reference reader would raise an index error.
+//!   cover the children array. Every directory and file is reachable from a package root. Of
+//!   this the reference reader checks only that the ranges' sizes add up to the number of slots
+//!   (`read.py`, `_check_bounds`: `used != slot_total`, "child slots used"); that is the
+//!   "leave slots unused" half of [`NupError::ChildRangesOverlap`] and mirrors the reference
+//!   rather than diverging from it. Disjoint ranges, cycles and orphans are left to its
+//!   verifier (`verify.py`, which reports them as problems). The checks make the tree a forest,
+//!   so that a walk visits each node once, a path names one file, and a cycle cannot exist. A
+//!   child slot naming a node past the last file is an error here; the reference reader would
+//!   raise an index error.
 //!   Tests: `a_node_with_two_parents_is_refused`, `an_unreachable_directory_is_refused`,
 //!   `a_child_slot_past_the_last_node_is_refused`, `overlapping_child_ranges_are_refused`.
+//! - **A depth limit** ([`MAX_TREE_DEPTH`], 128 directories below a package root). The spec and
+//!   the reference tool have none; a table of contents of a few megabytes could otherwise nest
+//!   millions of levels deep and make every path a walk builds that long. A tree deeper than
+//!   that is [`NupError::TreeTooDeep`]. Tests:
+//!   `a_tree_nested_past_the_depth_limit_is_refused_and_one_at_it_is_not`,
+//!   `the_depth_limit_is_per_package_not_cumulative`.
 //! - **Sorted children.** Each directory's children are in strictly increasing bytewise order
 //!   of name, so names are unique and lookups can binary search. The spec makes this a producer
 //!   rule (§3.3, §6.2 rule 1); the reference reader assumes it (`find_child` binary searches)
@@ -67,25 +78,43 @@
 //! - **A package's `ExeFS` and `RomFS` directories lie inside its own tree.** Not in the spec;
 //!   without it an update could name a directory of the base. Test:
 //!   `a_content_directory_outside_its_package_is_refused`.
-//! - **A raw extent is exactly the file's size** at open (§4.1 says `extent_size == size`; the
-//!   reference verifier checks it only with `--deep`). Test: `a_raw_extent_of_the_wrong_size_is_refused`.
+//! - **A raw extent is exactly the file's size** at open (§4.1 says `extent_size == size`). The
+//!   reference verifier checks it only in its deep pass (`verify.py`, `verify(deep=True)`, which
+//!   the command line runs by default and `--fast` skips); the reference reader notices a
+//!   difference only when it reads the file (`read.py`, `read_file`: it rejects a raw file whose
+//!   data length differs from `size`). Test: `a_raw_extent_of_the_wrong_size_is_refused`.
 //! - **No overlaps.** A meta block starts at or after the end of the table of contents and
 //!   overlaps no extent and no other meta block; two extents either are the same extent (same
 //!   offset and size, shared by dedup, §3.6) or do not overlap; and files that share an extent
 //!   agree on size, codec and SHA-256 (§3.6: producers must not share otherwise). §6.1 rule 2
 //!   asks for the overlap check without saying which regions; the reference reader checks only
-//!   that a meta block ends inside the file, and its verifier checks shared hashes with
-//!   `--deep`. Tests: `overlapping_extents_are_refused`, `a_meta_block_over_an_extent_is_refused`,
-//!   `files_sharing_an_extent_must_agree`.
+//!   that a meta block ends inside the file, and its verifier compares only the hashes of files
+//!   that share an extent, in its deep pass (`verify(deep=True)`, see above). Tests:
+//!   `overlapping_extents_are_refused`, `a_meta_block_over_an_extent_is_refused`,
+//!   `files_sharing_an_extent_must_agree`,
+//!   `files_sharing_an_extent_must_agree_on_each_of_size_codec_and_hash`.
 //! - **A size limit on the table of contents** ([`DEFAULT_MAX_TOC_SIZE`]), so a corrupt size
 //!   cannot make the reader allocate gigabytes. The reference tool maps the whole file instead.
 //!   Test: `the_table_of_contents_limit_holds_at_its_edge`.
 //!
-//! Looser, matching the reference reader: the reserved fields of the table of contents header,
-//! of directory and file records, and the package record's 20 bytes at 0x2C are not checked;
-//! names are bytes, not required to be UTF-8; a package's `standalone_update` flag is not
-//! refused when the container also has a base; bytes after the string pool inside the table of
-//! contents are allowed.
+//! Looser, matching the reference reader (each pinned by a test that opens a container with the
+//! thing in question set): the superblock's `header_version` and `uuid` (SPEC §2.1: the uuid is
+//! derived from the packages, and nothing here recomputes it), the reserved fields of the table
+//! of contents header, of directory records (`reserved`) and of file records (`reserved2` and
+//! `reserved3`), and the package record's 20 bytes at 0x2C (`reserved3`) are not checked, in
+//! `reserved_fields_and_the_headers_version_and_uuid_are_not_checked`; names are bytes, not
+//! required to be UTF-8, in `a_name_need_not_be_utf8`; a package's `standalone_update` flag is
+//! not refused when the container also has a base, in
+//! `a_standalone_update_next_to_a_base_is_accepted`; bytes after the string pool inside the
+//! table of contents are allowed, in
+//! `bytes_after_the_string_pool_inside_the_table_of_contents_are_accepted`. A zstd frame's
+//! content checksum is not compared either (see [`FileReader`]).
+//!
+//! Accepting edges the tests also pin: a header bigger than 0x80 with the table of contents at
+//! its end (`a_header_bigger_than_version_1s_opens_when_the_table_of_contents_follows_it`), a
+//! blob region that starts exactly at the end of the file
+//! (`a_blob_region_may_start_exactly_at_the_end_of_the_file`) and an empty children array
+//! (`a_package_whose_root_is_an_empty_directory_opens`).
 //!
 //! # Meta blocks
 //!
@@ -127,6 +156,13 @@ pub use title::{ExeFs, Title};
 /// The largest table of contents [`Nup::open`] reads: 256 MiB. A starquake limit, not the
 /// spec's: at 0x50 bytes per file record it leaves room for over three million files.
 pub const DEFAULT_MAX_TOC_SIZE: u64 = 256 << 20;
+
+/// The deepest nesting [`Nup::open`] accepts: 128 directories below a package's root, so a path
+/// from a package root has at most this many directory names and one file name. A starquake
+/// limit, not the spec's (guess: real titles nest a handful of levels; nothing in the spec or
+/// the reference tool bounds it). Without it a table of contents of a few megabytes could make
+/// every path the tree walks hold tens of thousands of names.
+pub const MAX_TREE_DEPTH: usize = 128;
 
 /// How much [`Nup::open_with_limits`] is willing to read into memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -385,32 +421,39 @@ impl<S> Nup<S> {
     }
 
     /// Every file below `dir` with its `/`-separated path from `dir`, depth first in name order.
-    /// The tree is a forest ([`Nup::open`] checks it), so each directory is visited once; the
-    /// walk also keeps a visited set, so it ends whatever the tree.
+    /// The tree is a forest at most [`MAX_TREE_DEPTH`] deep ([`Nup::open`] checks it), so each
+    /// directory is visited once; the walk also keeps a visited set, so it ends whatever the
+    /// tree. The walk keeps one path buffer for the whole stack, so apart from its result it
+    /// holds one path, not one per level.
     pub fn walk_files(&self, dir: DirId) -> Vec<(Vec<u8>, FileId)> {
         let mut out = Vec::new();
         let mut visited = vec![false; self.dirs.len()];
         if let Some(seen) = visited.get_mut(dir.index()) {
             *seen = true;
         }
-        // Each stack entry is a directory, its path prefix ("" or "a/b/") and the next child.
-        let mut stack = vec![(dir, Vec::new(), 0usize)];
-        while let Some((current, prefix, next)) = stack.last_mut() {
+        // The path of the directory being read ("" or "a/b/"), shared by the whole stack.
+        let mut path: Vec<u8> = Vec::new();
+        // Each stack entry is a directory, the length of `path` that names it ("a/b/" is 4),
+        // and the next child to read.
+        let mut stack = vec![(dir, 0usize, 0usize)];
+        while let Some((current, prefix_len, next)) = stack.last_mut() {
             let Some(&child) = self.children(*current).get(*next) else {
                 stack.pop();
                 continue;
             };
             *next += 1;
-            let mut path = prefix.clone();
+            // Back to the directory's own path (dropping the previous child's name), then
+            // this child's name.
+            path.truncate(*prefix_len);
             path.extend_from_slice(self.name(child));
             match child {
-                Node::File(file) => out.push((path, file)),
+                Node::File(file) => out.push((path.clone(), file)),
                 Node::Dir(sub) => {
                     if let Some(seen) = visited.get_mut(sub.index())
                         && !std::mem::replace(seen, true)
                     {
                         path.push(b'/');
-                        stack.push((sub, path, 0));
+                        stack.push((sub, path.len(), 0));
                     }
                 }
             }

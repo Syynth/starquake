@@ -6,7 +6,7 @@ use std::io::{Cursor, Read};
 use proptest::prelude::*;
 use proptest::test_runner::{Config, RngSeed};
 
-use super::build::{self, Built, Content, PackageSpec, Tree};
+use super::build::{self, Built, Content, Entry, PackageSpec, Tree};
 use super::layout::{
     CHILD_SLOT_SIZE, Codec, DIR_RECORD_SIZE, EXTENT_ALIGN, FILE_RECORD_SIZE, MAGIC,
     PACKAGE_FLAG_STANDALONE_UPDATE, PACKAGE_RECORD_SIZE, PackageKind, RawDir, RawFile, RawPackage,
@@ -63,12 +63,15 @@ fn update_tree() -> Tree {
 }
 
 /// A base (version 0) and an update (version 0x20000, 2.0.0).
-fn sample() -> Built {
-    build::build(&[
+fn sample_specs() -> [PackageSpec; 2] {
+    [
         PackageSpec::new(PackageKind::Base, BASE_ID, 0, base_tree()),
         PackageSpec::new(PackageKind::Update, UPDATE_ID, 0x2_0000, update_tree()),
-    ])
-    .unwrap()
+    ]
+}
+
+fn sample() -> Built {
+    build::build(&sample_specs()).unwrap()
 }
 
 fn open(bytes: &[u8]) -> Result<Nup<Cursor<&[u8]>>, NupError> {
@@ -825,6 +828,32 @@ fn a_header_bigger_than_version_1s_moves_the_table_of_contents_with_it() {
 }
 
 #[test]
+fn a_header_bigger_than_version_1s_opens_when_the_table_of_contents_follows_it() {
+    // SPEC §2 rules 2 and 3, the accepting side: `header_size` above 0x80 with the table of
+    // contents really at `header_size` opens, and its content reads back.
+    let header_size = SUPERBLOCK_SIZE + 16;
+    let built = build::build_with_header(&sample_specs(), header_size).unwrap();
+    assert_eq!(built.layout.toc_offset, header_size);
+    assert!(
+        built.bytes[SUPERBLOCK_SIZE..header_size]
+            .iter()
+            .all(|&b| b == 0)
+    );
+    let mut nup = open_built(&built).unwrap();
+    assert_eq!(usize::from(nup.superblock().header_size), header_size);
+    assert_eq!(nup.superblock().toc_offset, to_u64(header_size));
+    let plain = open_built(&sample()).unwrap().verify().unwrap();
+    assert_eq!(nup.verify().unwrap(), plain);
+    let title = nup.title().unwrap();
+    assert_eq!(exefs_names(&nup, &title), ["main", "main.npdm"]);
+    // A header below the superblock's size cannot be built.
+    assert_eq!(
+        build::build_with_header(&sample_specs(), SUPERBLOCK_SIZE - 1).unwrap_err(),
+        build::BuildError::NotAContainer
+    );
+}
+
+#[test]
 fn the_table_of_contents_must_end_inside_the_file() {
     let mut built = sample();
     let file_size = to_u64(built.bytes.len());
@@ -871,14 +900,61 @@ fn the_blob_region_is_aligned_after_the_table_of_contents_and_inside_the_file() 
         "{error}"
     );
 
+    // The first aligned offset past the end of the file is refused, whether or not the file's
+    // size is itself a multiple of the alignment.
     let mut past = built.clone();
     let file_size = to_u64(built.bytes.len());
-    let beyond = file_size.div_ceil(EXTENT_ALIGN) * EXTENT_ALIGN + EXTENT_ALIGN;
+    let beyond = (file_size / EXTENT_ALIGN + 1) * EXTENT_ALIGN;
+    assert!(beyond > file_size && beyond - file_size <= EXTENT_ALIGN);
     past.edit_superblock(|s| s.blob_offset = beyond);
     assert!(matches!(
         open_built(&past).unwrap_err(),
         NupError::BlobOutOfBounds
     ));
+}
+
+#[test]
+fn a_blob_region_may_start_exactly_at_the_end_of_the_file() {
+    // Only empty files: no extents and no meta block, so the blob region is empty and starts
+    // where the file ends. That is the accepted edge of `blob_offset <= file_size`.
+    let tree = Tree::new()
+        .with_file("romfs/empty", Content::raw(Vec::new()))
+        .unwrap();
+    let built = build::build(&[PackageSpec::new(PackageKind::Base, BASE_ID, 0, tree)]).unwrap();
+    assert_eq!(built.layout.blob_offset, built.bytes.len());
+    let mut nup = open_built(&built).unwrap();
+    assert_eq!(
+        nup.verify().unwrap(),
+        VerifySummary {
+            files: 1,
+            extents: 0,
+            bytes: 0
+        }
+    );
+    // One alignment step further is past the end.
+    let mut past = built.clone();
+    past.edit_superblock(|s| s.blob_offset += EXTENT_ALIGN);
+    assert!(matches!(
+        open_built(&past).unwrap_err(),
+        NupError::BlobOutOfBounds
+    ));
+}
+
+#[test]
+fn a_blob_offset_must_be_aligned_to_the_full_alignment() {
+    // Every offset that is a multiple of a smaller power of two but not of `EXTENT_ALIGN`.
+    let built = sample();
+    let blob = to_u64(built.layout.blob_offset);
+    for bit in 0..EXTENT_ALIGN.ilog2() {
+        let delta = 1u64 << bit;
+        let mut misaligned = built.clone();
+        misaligned.edit_superblock(|s| s.blob_offset += delta);
+        let error = open_built(&misaligned).unwrap_err();
+        assert!(
+            matches!(error, NupError::BlobMisaligned(at) if at == blob + delta),
+            "+{delta}: {error}"
+        );
+    }
 }
 
 #[test]
@@ -1033,6 +1109,21 @@ fn the_highest_defined_kind_is_accepted() {
 type Edit = fn(&mut RawPackage, u32);
 
 #[test]
+fn a_package_whose_root_is_an_empty_directory_opens() {
+    // No files and no child slots: the children array is empty, so the string pool starts
+    // exactly where the records end, and the blob region starts where the file ends.
+    let built =
+        build::build(&[PackageSpec::new(PackageKind::Base, BASE_ID, 0, Tree::new())]).unwrap();
+    assert_eq!(built.layout.children_offset, built.layout.pool_offset);
+    let mut nup = open_built(&built).unwrap();
+    assert_eq!((nup.dir_count(), nup.file_count()), (1, 0));
+    let root = nup.packages()[0].root;
+    assert_eq!(nup.children(root), &[]);
+    assert_eq!(nup.walk_files(root), Vec::new());
+    assert_eq!(nup.verify().unwrap(), VerifySummary::default());
+}
+
+#[test]
 fn a_package_directory_must_exist_and_no_dir_means_none() {
     let built = sample();
     let dirs = u32::try_from(built.layout.dir_records.len()).unwrap();
@@ -1148,6 +1239,114 @@ fn a_content_directory_outside_its_package_is_refused() {
             if dir == usize::try_from(base_exefs).unwrap()),
         "{error}"
     );
+    // The same for the `RomFS` directory, which is checked on its own.
+    let base_romfs = u32::try_from(built.dir_index(0, "romfs").unwrap()).unwrap();
+    let error = package_error(1, |p| p.romfs_dir = base_romfs);
+    assert!(
+        matches!(error, NupError::ContentDirOutsidePackage { package: 1, field: "romfs_dir", dir }
+            if dir == usize::try_from(base_romfs).unwrap()),
+        "{error}"
+    );
+    assert_eq!(
+        error.to_string(),
+        format!("package 1's romfs_dir is directory {base_romfs}, which is not in its tree")
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// What the reader does not check (the "Looser" list in the module docs)
+// ---------------------------------------------------------------------------------------------
+
+/// An edit of a built container.
+type BuiltEdit = fn(&mut Built);
+
+#[test]
+fn reserved_fields_and_the_headers_version_and_uuid_are_not_checked() {
+    // Each edit is made on its own, so a check added for any one of them fails here.
+    let edits: [(&str, BuiltEdit); 7] = [
+        ("header_version", |b| {
+            b.edit_superblock(|s| s.header_version = u16::MAX);
+        }),
+        ("uuid", |b| {
+            b.edit_superblock(|s| s.uuid = [0xA5; 16]);
+        }),
+        ("toc header reserved", |b| {
+            b.edit_toc_header(|h| h.reserved = u64::MAX);
+        }),
+        ("dir reserved", |b| {
+            b.edit_dir(1, |d| d.reserved = u64::MAX);
+        }),
+        ("file reserved2", |b| {
+            b.edit_file(0, |f| f.reserved2 = u16::MAX);
+        }),
+        ("file reserved3", |b| {
+            b.edit_file(0, |f| f.reserved3 = [0xFF; 12]);
+        }),
+        ("package reserved3", |b| {
+            b.edit_package(0, |p| p.reserved3 = [0xFF; 20]);
+        }),
+    ];
+    for (what, edit) in edits {
+        let mut built = sample();
+        edit(&mut built);
+        let opened = open_built(&built);
+        assert!(opened.is_ok(), "{what}: {:?}", opened.as_ref().err());
+        let verified = opened.unwrap().verify();
+        assert!(verified.is_ok(), "{what}: {:?}", verified.as_ref().err());
+    }
+}
+
+#[test]
+fn a_name_need_not_be_utf8() {
+    let name: &[u8] = &[0xFF, 0xFE, b'x'];
+    let mut tree = base_tree();
+    tree.entries
+        .insert(name.to_vec(), Entry::File(Content::raw(b"odd".to_vec())));
+    let built = build::build(&[PackageSpec::new(PackageKind::Base, BASE_ID, 0, tree)]).unwrap();
+    let mut nup = open_built(&built).unwrap();
+    let root = nup.packages()[0].root;
+    let found = nup.lookup(root, name);
+    assert!(matches!(found, Some(Node::File(_))), "{found:?}");
+    let Some(Node::File(file)) = found else {
+        unreachable!("checked above");
+    };
+    assert_eq!(nup.name(Node::File(file)), name);
+    assert_eq!(nup.read_to_vec(file, u64::MAX).unwrap(), b"odd");
+    assert!(nup.walk_files(root).iter().any(|(path, _)| path == name));
+    nup.verify().unwrap();
+}
+
+#[test]
+fn a_standalone_update_next_to_a_base_is_accepted() {
+    let mut built = sample();
+    built.edit_package(1, |p| p.flags = PACKAGE_FLAG_STANDALONE_UPDATE);
+    let nup = open_built(&built).unwrap();
+    assert!(nup.packages()[1].standalone_update);
+    assert_eq!(nup.packages()[0].kind, PackageKind::Base);
+}
+
+#[test]
+fn bytes_after_the_string_pool_inside_the_table_of_contents_are_accepted() {
+    let built = sample();
+    let toc_end = built.layout.toc_offset + built.layout.toc_size;
+    let gap = built.layout.blob_offset - toc_end;
+    assert!(
+        gap > 0,
+        "the sample pads its table of contents to the blob region"
+    );
+    // Grow the table of contents over the padding, up to the blob region and no further.
+    let mut grown = built.clone();
+    grown.edit_superblock(|s| s.toc_size += to_u64(gap));
+    build::rehash_toc(&mut grown.bytes).unwrap();
+    let mut nup = open_built(&grown).unwrap();
+    nup.verify().unwrap();
+    let mut over = built.clone();
+    over.edit_superblock(|s| s.toc_size += to_u64(gap) + 1);
+    build::rehash_toc(&mut over.bytes).unwrap();
+    assert!(matches!(
+        open_built(&over).unwrap_err(),
+        NupError::BlobOverlapsToc { .. }
+    ));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1261,11 +1460,28 @@ fn a_node_with_two_parents_is_refused() {
         matches!(error, NupError::NodeReferencedTwice(Node::Dir(DirId(d))) if d == update_root),
         "{error}"
     );
+    assert_eq!(
+        error.to_string(),
+        format!("directory {update_root} appears more than once in the tree")
+    );
     // Two packages sharing a root.
     let error = package_error(1, |p| p.root_dir = 0);
     assert!(
         matches!(error, NupError::NodeReferencedTwice(Node::Dir(DirId(0)))),
         "{error}"
+    );
+    assert_eq!(
+        error.to_string(),
+        "directory 0 appears more than once in the tree"
+    );
+    // A file with two places is named as a file.
+    let file_node = u32::try_from(built.layout.dir_records.len()).unwrap();
+    let mut file_twice = sample();
+    file_twice.set_child(0, file_node);
+    let error = open_built(&file_twice).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "file 0 appears more than once in the tree"
     );
 }
 
@@ -1304,6 +1520,112 @@ fn an_unreachable_directory_is_refused() {
         matches!(error, NupError::UnreachableNode(Node::Dir(DirId(d))) if usize::try_from(d).unwrap() == romfs),
         "{error}"
     );
+    assert_eq!(
+        error.to_string(),
+        format!("directory {romfs} is not reachable from any package root")
+    );
+}
+
+/// A package whose only file is `depth` directories below its root.
+fn nested(depth: usize) -> Built {
+    let path = format!("{}f", "d/".repeat(depth));
+    let tree = Tree::new()
+        .with_file(&path, Content::raw(b"x".to_vec()))
+        .unwrap();
+    build::build(&[PackageSpec::new(PackageKind::Base, BASE_ID, 0, tree)]).unwrap()
+}
+
+#[test]
+fn a_tree_nested_past_the_depth_limit_is_refused_and_one_at_it_is_not() {
+    // The deepest directory of a tree at the limit is `MAX_TREE_DEPTH` levels below the root.
+    let built = nested(MAX_TREE_DEPTH);
+    let mut nup = open_built(&built).unwrap();
+    let root = nup.packages()[0].root;
+    let walked = nup.walk_files(root);
+    assert_eq!(walked.len(), 1);
+    assert_eq!(
+        walked[0].0.len(),
+        2 * MAX_TREE_DEPTH + 1,
+        "{MAX_TREE_DEPTH} names and `f`"
+    );
+    nup.verify().unwrap();
+
+    let built = nested(MAX_TREE_DEPTH + 1);
+    let error = open_built(&built).unwrap_err();
+    assert!(
+        matches!(error, NupError::TreeTooDeep { dir, limit }
+            if dir == MAX_TREE_DEPTH + 1 && limit == MAX_TREE_DEPTH),
+        "{error}"
+    );
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "directory {} is nested more than {MAX_TREE_DEPTH} levels below its package root",
+            MAX_TREE_DEPTH + 1
+        )
+    );
+}
+
+#[test]
+fn the_depth_limit_is_per_package_not_cumulative() {
+    // Two packages, each at the limit: depth is measured from a package's own root.
+    let tree = || {
+        Tree::new()
+            .with_file(
+                &format!("{}f", "d/".repeat(MAX_TREE_DEPTH)),
+                Content::raw(b"x".to_vec()),
+            )
+            .unwrap()
+    };
+    let built = build::build(&[
+        PackageSpec::new(PackageKind::Base, BASE_ID, 0, tree()),
+        PackageSpec::new(PackageKind::Update, UPDATE_ID, 1, tree()),
+    ])
+    .unwrap();
+    assert!(open_built(&built).is_ok());
+}
+
+#[test]
+fn walking_files_names_each_by_its_own_path_across_siblings_and_levels() {
+    // After a deep directory is left, the next sibling's path must not carry its name.
+    let leaf = || Content::raw(b"x".to_vec());
+    let tree = Tree::new()
+        .with_file("a/b/c/z", leaf())
+        .unwrap()
+        .with_file("a/b/y", leaf())
+        .unwrap()
+        .with_file("a/w", leaf())
+        .unwrap()
+        .with_file("a/x", leaf())
+        .unwrap()
+        .with_file("v", leaf())
+        .unwrap();
+    let built = build::build(&[PackageSpec::new(PackageKind::Base, BASE_ID, 0, tree)]).unwrap();
+    let nup = open_built(&built).unwrap();
+    let root = nup.packages()[0].root;
+    let paths: Vec<String> = nup
+        .walk_files(root)
+        .into_iter()
+        .map(|(path, file)| {
+            assert_eq!(
+                file,
+                file_id(&built, 0, std::str::from_utf8(&path).unwrap())
+            );
+            String::from_utf8(path).unwrap()
+        })
+        .collect();
+    assert_eq!(paths, ["a/b/c/z", "a/b/y", "a/w", "a/x", "v"]);
+    // Below a directory, paths are relative to it.
+    let b = nup.resolve(root, "a/b").and_then(|n| match n {
+        Node::Dir(d) => Some(d),
+        Node::File(_) => None,
+    });
+    let below: Vec<String> = nup
+        .walk_files(b.unwrap())
+        .into_iter()
+        .map(|(path, _)| String::from_utf8(path).unwrap())
+        .collect();
+    assert_eq!(below, ["c/z", "y"]);
 }
 
 #[test]
@@ -1433,11 +1755,16 @@ fn an_extent_lies_inside_the_blob_region_and_is_aligned() {
         matches!(error, NupError::ExtentOutOfBounds { file } if file == level),
         "{error}"
     );
-    let error = file_error("romfs/data/level.bin", |f, _| f.extent_offset += 1);
-    assert!(
-        matches!(error, NupError::ExtentMisaligned { file, offset } if file == level && offset % EXTENT_ALIGN == 1),
-        "{error}"
-    );
+    // Every offset that is a multiple of a smaller power of two but not of `EXTENT_ALIGN`.
+    for bit in 0..EXTENT_ALIGN.ilog2() {
+        let delta = 1u64 << bit;
+        let error = file_error("romfs/data/level.bin", |f, _| f.extent_offset += delta);
+        assert!(
+            matches!(error, NupError::ExtentMisaligned { file, offset }
+                if file == level && offset % EXTENT_ALIGN == delta),
+            "+{delta}: {error}"
+        );
+    }
     // Ending exactly at the end of the file passes the bounds check (and then overlaps the
     // extents after it, which is the next check).
     let error = file_error("romfs/data/level.bin", |f, _| {
@@ -1455,15 +1782,21 @@ fn overlapping_extents_are_refused() {
     // offset with another size is an overlap, not a shared extent.
     assert_ne!(size, 5);
     let error = file_error("romfs/readme.txt", |f, _| f.extent_offset = to_u64(offset));
+    // Regions are ordered by start, then end: the shorter one is `first`.
+    let readme = built.file_index(0, "romfs/readme.txt").unwrap();
     assert!(
         matches!(
             error,
             NupError::RegionsOverlap {
-                first: Region::Extent(_),
-                second: Region::Extent(_)
-            }
+                first: Region::Extent(a),
+                second: Region::Extent(b)
+            } if (a, b) == (readme, first)
         ),
         "{error}"
+    );
+    assert_eq!(
+        error.to_string(),
+        format!("file {readme}'s extent and file {first}'s extent overlap")
     );
 }
 
@@ -1481,6 +1814,42 @@ fn files_sharing_an_extent_must_agree() {
 }
 
 #[test]
+fn files_sharing_an_extent_must_agree_on_each_of_size_codec_and_hash() {
+    let built = sample();
+    let copy = built.file_index(0, "romfs/copy.txt").unwrap();
+    let readme = built.file_index(0, "romfs/readme.txt").unwrap();
+    let both = (copy.min(readme), copy.max(readme));
+    // Only the codec differs (a zstd frame is not checked against a raw extent at open).
+    let error = file_error("romfs/readme.txt", |f, _| f.codec = Codec::Zstd.to_byte());
+    assert!(
+        matches!(error, NupError::SharedExtentMismatch { first, second } if (first, second) == both),
+        "{error}"
+    );
+    // Only the size differs. Raw files cannot show it (a raw extent is its file's size, so a
+    // different size is a different extent); two zstd files can.
+    let tree = Tree::new()
+        .with_file("romfs/a", Content::zstd(compressible(300)))
+        .unwrap()
+        .with_file("romfs/b", Content::zstd(compressible(300)))
+        .unwrap();
+    let mut pair = build::build(&[PackageSpec::new(PackageKind::Base, BASE_ID, 0, tree)]).unwrap();
+    assert_eq!(pair.layout.extents[0], pair.layout.extents[1]);
+    assert!(open_built(&pair).is_ok());
+    pair.edit_file(1, |f| f.size += 1);
+    let error = open_built(&pair).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            NupError::SharedExtentMismatch {
+                first: 0,
+                second: 1
+            }
+        ),
+        "{error}"
+    );
+}
+
+#[test]
 fn a_meta_block_over_an_extent_is_refused() {
     let built = sample();
     let (offset, size) = built.layout.extents[built.file_index(0, "exefs/main").unwrap()];
@@ -1488,15 +1857,20 @@ fn a_meta_block_over_an_extent_is_refused() {
         p.meta_offset = to_u64(offset + size - 1);
         p.meta_size = 1;
     });
+    let main = built.file_index(0, "exefs/main").unwrap();
     assert!(
         matches!(
             error,
             NupError::RegionsOverlap {
-                first: Region::Extent(_),
+                first: Region::Extent(a),
                 second: Region::Meta(0)
-            }
+            } if a == main
         ),
         "{error}"
+    );
+    assert_eq!(
+        error.to_string(),
+        format!("file {main}'s extent and package 0's meta block overlap")
     );
     // Starting exactly where the extent ends is no overlap.
     let mut after = sample();
@@ -1550,6 +1924,122 @@ fn a_damaged_stored_file_fails_its_hash_and_verify_names_it() {
         error.to_string(),
         format!("package 1, romfs/readme.txt: file {readme}'s content does not match its SHA-256")
     );
+}
+
+#[test]
+fn a_read_that_failed_fails_again_instead_of_ending_the_file() {
+    // After `ContentTooLong`, `TrailingExtentBytes` or `HashMismatch` the next read repeats the
+    // error; it is never a clean end of file.
+    let data = compressible(3000);
+    let mut too_long = build::zstd_frame(&compressible(3001)).unwrap();
+    too_long[6..14].copy_from_slice(&3000u64.to_le_bytes());
+    let mut trailing = build::zstd_frame(&data).unwrap();
+    trailing.push(0);
+    let cases: [(&str, Vec<u8>, Want); 2] = [
+        ("too long", too_long, |e| {
+            matches!(e, NupError::ContentTooLong { .. })
+        }),
+        ("trailing", trailing, |e| {
+            matches!(e, NupError::TrailingExtentBytes { .. })
+        }),
+    ];
+    for (what, stored, want) in cases {
+        let (built, file) = with_stored(&data, stored);
+        assert_sticky(&built, file, what, want);
+    }
+    // A raw file whose stored bytes were damaged.
+    let mut built = sample();
+    let readme = file_id(&built, 1, "romfs/readme.txt");
+    let (offset, _) = built.layout.extents[readme.index()];
+    built.bytes[offset] ^= 0x20;
+    assert_sticky(&built, readme, "hash", |e| {
+        matches!(e, NupError::HashMismatch { .. })
+    });
+}
+
+/// What an error should be.
+type Want = fn(&NupError) -> bool;
+
+/// Reads `file` until it fails, then again: the second read must carry the same error.
+fn assert_sticky(built: &Built, file: FileId, what: &str, want: Want) {
+    let mut nup = open_built(built).unwrap();
+    let mut reader = nup.reader(file).unwrap();
+    let mut buf = vec![0u8; 8192];
+    let first = loop {
+        match reader.read(&mut buf) {
+            Ok(0) => unreachable!("{what}: the file ended cleanly"),
+            Ok(_) => {}
+            Err(error) => break NupError::from_io(error),
+        }
+    };
+    assert!(want(&first), "{what}: {first}");
+    for again in 0..2 {
+        let error = reader.read(&mut buf).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::InvalidData,
+            "{what} {again}"
+        );
+        let error = NupError::from_io(error);
+        assert!(want(&error), "{what} {again}: {error}");
+        assert_eq!(error.to_string(), first.to_string(), "{what} {again}");
+    }
+    // An empty buffer is no way around it either.
+    assert!(reader.read(&mut []).is_err(), "{what}");
+}
+
+#[test]
+fn the_end_checks_run_in_the_documented_order() {
+    // Too long, then trailing bytes, then the hash: with all three faults at once the first
+    // one speaks, and each fault alone is reported as itself.
+    let data = compressible(3000);
+    let wrong_hash = |built: &mut Built| {
+        let file = built.file_index(0, "romfs/f").unwrap();
+        built.edit_file(file, |f| f.sha256[0] ^= 1);
+    };
+    let verify = |built: &Built, file| open_built(built).unwrap().verify_file(file).unwrap_err();
+
+    let mut trailing = build::zstd_frame(&data).unwrap();
+    trailing.push(0);
+    let (mut built, file) = with_stored(&data, trailing.clone());
+    wrong_hash(&mut built);
+    let error = verify(&built, file);
+    assert!(
+        matches!(error, NupError::TrailingExtentBytes { .. }),
+        "{error}"
+    );
+
+    let mut too_long = build::zstd_frame(&compressible(3001)).unwrap();
+    too_long[6..14].copy_from_slice(&3000u64.to_le_bytes());
+    too_long.push(0);
+    let (mut built, file) = with_stored(&data, too_long);
+    wrong_hash(&mut built);
+    let error = verify(&built, file);
+    assert!(matches!(error, NupError::ContentTooLong { .. }), "{error}");
+
+    let (mut built, file) = with_stored(&data, build::zstd_frame(&data).unwrap());
+    wrong_hash(&mut built);
+    let error = verify(&built, file);
+    assert!(matches!(error, NupError::HashMismatch { .. }), "{error}");
+}
+
+#[test]
+fn verify_checks_every_empty_file_against_its_hash() {
+    // Empty files all have the extent (0, 0), but each has its own record and hash; none is
+    // skipped as a shared extent already read.
+    let tree = Tree::new()
+        .with_file("romfs/a", Content::raw(Vec::new()))
+        .unwrap()
+        .with_file("romfs/b", Content::raw(Vec::new()))
+        .unwrap();
+    let mut built = build::build(&[PackageSpec::new(PackageKind::Base, BASE_ID, 0, tree)]).unwrap();
+    assert_eq!(open_built(&built).unwrap().verify().unwrap().files, 2);
+    let b = built.file_index(0, "romfs/b").unwrap();
+    built.edit_file(b, |f| f.sha256[0] ^= 1);
+    let mut nup = open_built(&built).unwrap();
+    let error = nup.verify().unwrap_err();
+    assert_eq!((error.package, error.path.as_str()), (0, "romfs/b"));
+    assert!(matches!(error.source, NupError::HashMismatch { file } if file == b));
 }
 
 #[test]
@@ -1655,6 +2145,147 @@ fn a_zstd_frame_that_holds_more_or_less_than_it_declares_is_refused() {
     let error = open_built(&built).unwrap().verify_file(file).unwrap_err();
     assert!(
         matches!(error, NupError::ContentTruncated { .. }),
+        "{error}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Hand-written zstd frames (RFC 8878), not made by the builder's encoder
+// ---------------------------------------------------------------------------------------------
+
+/// `Content_Checksum_flag`, bit 2 of the frame header descriptor (RFC 8878, 3.1.1.1.1).
+const CONTENT_CHECKSUM_FLAG: u8 = 0b0000_0100;
+/// `Window_Descriptor`'s window is `1 << (WINDOW_LOG_BASE + exponent)` bytes with a zero
+/// mantissa (RFC 8878, 3.1.1.1.2); the exponent is the byte's top five bits.
+const WINDOW_LOG_BASE: u32 = 10;
+
+/// A raw block (RFC 8878, 3.1.1.2): a three-byte little-endian header holding `Last_Block` in
+/// bit 0, `Block_Type` raw (0) in bits 1-2 and `Block_Size` from bit 3, then the bytes.
+fn raw_block(last: bool, data: &[u8]) -> Vec<u8> {
+    let header = (u32::try_from(data.len()).unwrap() << 3) | u32::from(last);
+    let mut out = header.to_le_bytes()[..3].to_vec();
+    out.extend_from_slice(data);
+    out
+}
+
+/// The frame magic, taken from a frame the encoder wrote.
+fn frame_magic() -> Vec<u8> {
+    build::zstd_frame(&[0]).unwrap()[..4].to_vec()
+}
+
+/// A frame: magic, `descriptor`, an optional window descriptor, the content size field, then
+/// `body` (the blocks and any checksum).
+fn hand_frame(descriptor: u8, window: Option<u8>, content_size: &[u8], body: &[u8]) -> Vec<u8> {
+    let mut frame = frame_magic();
+    frame.push(descriptor);
+    frame.extend(window);
+    frame.extend_from_slice(content_size);
+    frame.extend_from_slice(body);
+    frame
+}
+
+/// A single-segment frame whose content size is the one byte `data.len()`: `Frame_Content_Size
+/// _flag` 0 with `Single_Segment_flag` set means a one-byte field (RFC 8878, 3.1.1.1.4).
+fn single_segment_frame(data: &[u8], flags: u8, body: &[u8]) -> Vec<u8> {
+    hand_frame(
+        build::SINGLE_SEGMENT_FLAG | flags,
+        None,
+        &[u8::try_from(data.len()).unwrap()],
+        body,
+    )
+}
+
+const HELLO: &[u8] = b"hello";
+
+/// The container holding `HELLO` stored as `frame`.
+fn hello_in(frame: Vec<u8>) -> (Built, FileId) {
+    with_stored(HELLO, frame)
+}
+
+fn read_back(built: &Built, file: FileId) -> Result<Vec<u8>, NupError> {
+    open_built(built).unwrap().read_to_vec(file, u64::MAX)
+}
+
+#[test]
+fn a_single_segment_frame_with_a_one_byte_content_size_reads_back() {
+    let frame = single_segment_frame(HELLO, 0, &raw_block(true, HELLO));
+    // Magic, descriptor, size, block header, content.
+    assert_eq!(frame.len(), 4 + 1 + 1 + 3 + HELLO.len());
+    let (built, file) = hello_in(frame);
+    assert_eq!(read_back(&built, file).unwrap(), HELLO);
+    open_built(&built).unwrap().verify().unwrap();
+}
+
+#[test]
+fn a_frame_with_a_content_checksum_ends_with_its_four_bytes() {
+    // `ruzstd` reads the four checksum bytes but does not compare them with the content (the
+    // file's SHA-256 is the integrity check), so any four bytes stand for the checksum here.
+    let checksum = [0xDE, 0xAD, 0xBE, 0xEF];
+    let mut body = raw_block(true, HELLO);
+    body.extend_from_slice(&checksum);
+    let frame = single_segment_frame(HELLO, CONTENT_CHECKSUM_FLAG, &body);
+    let (built, file) = hello_in(frame.clone());
+    assert_eq!(read_back(&built, file).unwrap(), HELLO);
+    open_built(&built).unwrap().verify().unwrap();
+
+    // One byte after the checksum is a byte after the frame.
+    let mut longer = frame.clone();
+    longer.push(0);
+    let (built, file) = hello_in(longer);
+    let error = open_built(&built).unwrap().verify_file(file).unwrap_err();
+    assert!(
+        matches!(error, NupError::TrailingExtentBytes { file: f } if f == file.index()),
+        "{error}"
+    );
+
+    // A frame that announces a checksum but stops before it is cut short inside the frame.
+    let (built, file) = hello_in(frame[..frame.len() - checksum.len()].to_vec());
+    let error = open_built(&built).unwrap().verify_file(file).unwrap_err();
+    assert!(matches!(error, NupError::Zstd { .. }), "{error}");
+}
+
+#[test]
+fn content_followed_by_an_empty_last_block_reads_back() {
+    let mut body = raw_block(false, HELLO);
+    body.extend(raw_block(true, &[]));
+    let frame = single_segment_frame(HELLO, 0, &body);
+    let (built, file) = hello_in(frame.clone());
+    assert_eq!(read_back(&built, file).unwrap(), HELLO);
+    open_built(&built).unwrap().verify().unwrap();
+
+    // The empty block is part of the frame: dropping its bytes cuts the frame short.
+    let (built, file) = hello_in(frame[..frame.len() - 1].to_vec());
+    let error = open_built(&built).unwrap().verify_file(file).unwrap_err();
+    assert!(matches!(error, NupError::Zstd { .. }), "{error}");
+}
+
+#[test]
+fn a_window_over_the_decoders_limit_is_a_decode_error_and_one_at_it_is_not() {
+    use ruzstd::decoding::DEFAULT_MAX_WINDOW_SIZE;
+
+    // A frame with a window descriptor (no single-segment flag) and an eight-byte content size.
+    let framed = |exponent: u32| {
+        let window = u8::try_from(exponent << 3).unwrap();
+        hand_frame(
+            build::FCS_FLAG_8_BYTES,
+            Some(window),
+            &to_u64(HELLO.len()).to_le_bytes(),
+            &raw_block(true, HELLO),
+        )
+    };
+    let at_limit = DEFAULT_MAX_WINDOW_SIZE.ilog2() - WINDOW_LOG_BASE;
+    assert_eq!(
+        1u64 << (WINDOW_LOG_BASE + at_limit),
+        DEFAULT_MAX_WINDOW_SIZE,
+        "the limit is a power of two, so a zero-mantissa window can sit exactly on it"
+    );
+    let (built, file) = hello_in(framed(at_limit));
+    assert_eq!(read_back(&built, file).unwrap(), HELLO);
+
+    let (built, file) = hello_in(framed(at_limit + 1));
+    let error = open_built(&built).unwrap().reader(file).unwrap_err();
+    assert!(
+        matches!(&error, NupError::Zstd { file: f, .. } if *f == file.index()),
         "{error}"
     );
 }

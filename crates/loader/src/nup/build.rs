@@ -304,6 +304,21 @@ type ExtentKey = (Vec<u8>, Codec, Option<Vec<u8>>);
 
 /// Lays out `packages` as a NUP container (see the module docs).
 pub fn build(packages: &[PackageSpec]) -> Result<Built, BuildError> {
+    build_with_header(packages, SUPERBLOCK_SIZE)
+}
+
+/// Like [`build`], with a superblock that declares `header_size` bytes: the bytes after the
+/// 0x80 the format defines are zero and the table of contents starts at `header_size` (SPEC §2,
+/// rules 2 and 3). A `header_size` below 0x80 cannot hold the superblock and is refused as
+/// [`BuildError::NotAContainer`].
+pub fn build_with_header(
+    packages: &[PackageSpec],
+    header_size: usize,
+) -> Result<Built, BuildError> {
+    if header_size < SUPERBLOCK_SIZE {
+        return Err(BuildError::NotAContainer);
+    }
+    let declared = u16::try_from(header_size).map_err(|_| BuildError::TooLarge("header"))?;
     let mut numbered = Numbered::default();
     let roots: Vec<usize> = packages
         .iter()
@@ -331,7 +346,7 @@ pub fn build(packages: &[PackageSpec]) -> Result<Built, BuildError> {
         + numbered.files.len() * FILE_RECORD_SIZE
         + numbered.children.len() * CHILD_SLOT_SIZE
         + pool.len();
-    let toc_offset = SUPERBLOCK_SIZE;
+    let toc_offset = header_size;
     let blob_offset = align(toc_offset + toc_size);
 
     let mut bytes = vec![0u8; blob_offset];
@@ -375,7 +390,7 @@ pub fn build(packages: &[PackageSpec]) -> Result<Built, BuildError> {
 
     let superblock = RawSuperblock {
         magic: MAGIC,
-        header_size: u16::try_from(SUPERBLOCK_SIZE).map_err(|_| BuildError::TooLarge("header"))?,
+        header_size: declared,
         header_version: 1,
         toc_offset: to_u64(toc_offset),
         toc_size: to_u64(toc_size),
@@ -669,10 +684,10 @@ impl Built {
 /// Frame header descriptor bits (RFC 8878, section 3.1.1.1.1): `Frame_Content_Size_flag` in bits
 /// 7-6, `Single_Segment_flag` bit 5, `Dictionary_ID_flag` bits 1-0.
 const FCS_FLAG_MASK: u8 = 0b1100_0000;
-const SINGLE_SEGMENT_FLAG: u8 = 0b0010_0000;
+pub(super) const SINGLE_SEGMENT_FLAG: u8 = 0b0010_0000;
 const DICTIONARY_ID_MASK: u8 = 0b0000_0011;
 /// `Frame_Content_Size_flag` 3: an 8-byte content size field.
-const FCS_FLAG_8_BYTES: u8 = 0b1100_0000;
+pub(super) const FCS_FLAG_8_BYTES: u8 = 0b1100_0000;
 /// Offset of the frame header descriptor, after the 4-byte magic.
 const DESCRIPTOR_OFFSET: usize = 4;
 
