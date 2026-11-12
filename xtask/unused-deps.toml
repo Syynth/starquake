@@ -83,11 +83,6 @@ dependencies = ["thiserror"]
 reason = "scaffold crate with no code; its error type arrives with the first fallible render call"
 
 [[allow]]
-package = "starquake-services"
-dependencies = ["starquake-ipc", "starquake-kernel", "thiserror", "tracing"]
-reason = "the service framework builds on the kernel's sessions and the IPC codec (docs/specs/services.md); the crate is a scaffold with no code yet"
-
-[[allow]]
 package = "starquake-shader"
 dependencies = ["thiserror"]
 reason = "scaffold crate with no code; its error type arrives with the first translator pass"
