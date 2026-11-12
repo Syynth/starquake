@@ -10,10 +10,13 @@
 //! `Stage1Tables` is plain data over a [`GuestMemory`] whose addresses are guest-physical: it
 //! takes its table pages from a pool inside that memory and writes descriptors there. The
 //! backing that pages map onto may lie anywhere below [`OUTPUT_ADDRESS_END`] except inside the
-//! pool. It is shared by the Hypervisor.framework and KVM backends; neither uses it yet.
-//! Each descriptor is written with one eight-byte [`GuestMemory::write`], and a new table is
-//! linked only after it is zeroed; a backend whose tables are live under a running vCPU must
-//! make that write single-copy atomic so the hardware walker never sees half a descriptor.
+//! pool. It is shared by the Hypervisor.framework and KVM backends; the Hypervisor.framework
+//! backend runs guests on it (`starquake_cpu::hvf`), the KVM backend does not exist yet.
+//! Each descriptor is written with one eight-byte [`GuestMemory::write`] at an eight-byte
+//! aligned address, and a new table is linked only after it is zeroed; a backend whose tables
+//! are live under a running vCPU must make that write single-copy atomic so the hardware walker
+//! never sees half a descriptor. The Hypervisor.framework backend's memory does
+//! (`PhysicalMemory`), and its hardware tests run a vCPU against tables that change under it.
 //!
 //! # What the builder writes
 //!
@@ -22,12 +25,16 @@
 //! - Every page descriptor has the access flag set, is inner shareable with `AttrIndx` 0, is
 //!   never executable at EL1 (`PXN`), and is non-global (`nG`), so its TLB entries are tagged
 //!   with the process's ASID. hvprobe wrote global entries and EL1-executable code pages; `nG`
-//!   and `PXN` on code pages are therefore not yet verified on hardware, only taken from the
-//!   manual.
+//!   and `PXN` on code pages were first run on hardware by the Hypervisor.framework backend,
+//!   whose every guest page is one (`crates/cpu/tests/hvf.rs`; two address spaces with
+//!   different ids keep their own translations in
+//!   `address_spaces_keep_their_own_translations_without_a_flush_between_them`).
 //! - EL0 permissions map to `AP[2:1]` and `UXN` as [`descriptor::page`] shows. An EL0-
 //!   inaccessible page ([`Perms::None`], [`Perms::Execute`]) gets `AP[2:1]` = 0b00, read-write
-//!   at EL1, as hvprobe's marker pages did. Execute-only ([`Perms::Execute`]) is from the
-//!   manual and not verified on hardware.
+//!   at EL1, as hvprobe's marker pages did. All six [`Perms`], execute-only among them, behave
+//!   on a real vCPU as [`translate`] says
+//!   (`the_software_walker_and_a_real_vcpu_agree_for_every_permission` in
+//!   `crates/cpu/tests/hvf.rs`).
 //!
 //! # Rules this builder adds
 //!
@@ -70,6 +77,8 @@
 //! The contract on the caller: flushes returned by `take_pending_flushes` must be executed
 //! (`TLBI` and the barriers, on every vCPU that may use the tables) before the next `map`,
 //! `unmap` or `protect`. Taking a flush is what lets the builder reuse the pages it freed.
+//! [`Stage1Tables::flush_pending_with`] keeps that contract for the caller: it runs the flush
+//! with the tables locked and releases the pages only if the flush succeeded.
 
 pub(crate) mod descriptor;
 mod walk;

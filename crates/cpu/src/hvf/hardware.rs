@@ -160,44 +160,78 @@ fn the_rest_of_the_upper_half_and_the_gap_between_the_halves_are_not_mapped() {
     }
 }
 
-#[test]
-fn a_guest_store_to_a_translation_table_is_stopped_by_stage_2() {
-    let Some(mut machine) = Machine::new() else {
-        return;
-    };
-    // `Stage1Tables` refuses to map its own pool. Map a page of the *other* half of the table
-    // pool instead, writable: the tables say yes, stage 2 says no.
-    let pool = machine.backend.table_pool();
-    let target = pool.base() + pool.size() / 2;
+/// Maps a page at guest-physical `target` into a fresh machine's address space, readable and
+/// writable, and has the guest load from it and then store to it. Returns what the load and
+/// the store came to, and the address the store would have written.
+fn load_then_store_through(target: u64) -> Option<(Result<Exit, Error>, Result<Exit, Error>)> {
+    let mut machine = Machine::new()?;
     let va = 0x10_0000_0000;
     let backing = BackingRange::new(target, PAGE_SIZE).unwrap();
+    machine.tables.map(va, backing, Perms::ReadWrite).unwrap();
+    let load = machine.probe(LOAD, va + 0x18);
+    let store = machine.probe(STORE, va + 0x18);
+    Some((load, store))
+}
+
+/// The error a guest store to guest-physical `address` must stop the vCPU with.
+fn assert_stopped_by_stage_2(store: &Result<Exit, Error>, address: u64) {
+    let message = match store {
+        Err(Error::Host(message)) => message.as_str(),
+        _ => "",
+    };
+    let expected = format!(
+        "the guest reached guest-physical address {address:#x} in a way stage 2 does not allow ("
+    );
+    assert!(message.starts_with(&expected), "{store:?}");
+    assert!(message.ends_with(&format!("pc {STORE:#x})")), "{store:?}");
+}
+
+#[test]
+fn a_guest_store_to_a_translation_table_is_stopped_by_stage_2() {
+    let Some(machine) = Machine::new() else {
+        return;
+    };
+    // `Stage1Tables` refuses to map its own pool. A page of the *other* half of the table pool
+    // it does map, writable: the tables say yes, stage 2 says no.
+    let pool = machine.backend.table_pool();
     assert_eq!(
-        machine.tables.map(va, pool, Perms::ReadWrite),
+        machine.tables.map(0x10_0000_0000, pool, Perms::ReadWrite),
         Err(starquake_memory::MapError::OverlapsTables {
             pa: pool.base(),
             size: pool.size()
         })
     );
-    machine.tables.map(va, backing, Perms::ReadWrite).unwrap();
-    // A load is allowed (the tables are readable; the guest's own walker reads them).
-    assert_eq!(machine.probe(LOAD, va + 0x18), Ok(Exit::Svc(1)));
-    // A store stops the vCPU with an error that names the guest-physical address.
-    let error = machine.probe(STORE, va + 0x18).unwrap_err();
-    let Error::Host(message) = &error else {
-        unreachable!("{error:?}");
+    drop(machine);
+    let target = pool.base() + pool.size() / 2;
+    let (load, store) = load_then_store_through(target).unwrap();
+    // A load is allowed: the guest's own walker reads the tables.
+    assert_eq!(load, Ok(Exit::Svc(1)));
+    assert_stopped_by_stage_2(&store, target + 0x18);
+}
+
+#[test]
+fn a_guest_store_to_the_shim_or_its_tables_is_stopped_by_stage_2() {
+    // Even if a guest address space wrongly mapped the backend's own pages, writable, the
+    // guest could not change the shim or the tables that map it.
+    for offset in [CODE_OFFSET, SYSTEM_TABLES_OFFSET] {
+        let target = SYSTEM_BASE + offset;
+        let Some((load, store)) = load_then_store_through(target) else {
+            return;
+        };
+        assert_eq!(load, Ok(Exit::Svc(1)), "{target:#x}");
+        assert_stopped_by_stage_2(&store, target + 0x18);
+    }
+    // The shim's bytes are what the backend wrote.
+    let [(_, shim), _] = system_image().unwrap();
+    let Some(machine) = Machine::new() else {
+        return;
     };
-    let expected = format!(
-        "the guest reached guest-physical address {:#x} in a way stage 2 does not allow (",
-        target + 0x18
-    );
-    assert!(message.starts_with(&expected), "{message}");
-    assert!(message.ends_with(&format!("pc {STORE:#x})")), "{message}");
-    // Nothing was written.
-    let mut word = [0xff; 8];
+    let mut bytes = vec![0; shim.len()];
     machine
         .backend
-        .physical()
-        .read(target + 0x18, &mut word)
+        .vm
+        .system
+        .read(CODE_OFFSET, &mut bytes)
         .unwrap();
-    assert_eq!(word, [0; 8]);
+    assert_eq!(bytes, shim);
 }

@@ -10,7 +10,9 @@
 //!
 //! Every bit below that `tools/hvprobe/src/probe.rs` also wrote (valid and type bits, `AF`,
 //! `SH`, `AP[2:1]`, `PXN`, `UXN`, the table index widths with `T0SZ` = 25) was walked by a real
-//! vCPU there. `nG` and the hierarchical table bits were not.
+//! vCPU there, and `nG` by the Hypervisor.framework backend's hardware tests
+//! (`crates/cpu/tests/hvf.rs`). The hierarchical table bits were not: the builder never sets
+//! them.
 
 use crate::translation::PAGE_SIZE;
 use crate::{Fault, GuestMemory, Perms};

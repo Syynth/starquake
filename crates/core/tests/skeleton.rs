@@ -657,7 +657,7 @@ fn an_endless_loop_is_ended_by_the_timeout() {
 
 #[test]
 fn a_program_too_large_for_guest_memory_is_an_emulator_error() {
-    /// More `.bss` than the backend's bring-up RAM holds; a whole number of pages.
+    /// More `.bss` than the backend's guest RAM holds; a whole number of pages.
     const BSS: u32 = 64 << 20;
     let file = NroBuilder::new(&[a64::nop()])
         .bss_size(BSS)

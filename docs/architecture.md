@@ -140,8 +140,9 @@ cargo run -p starquake-testkit --example guest_programs -- <folder>   # writes f
 cargo run -p starquake -- run <folder>/hello.nro --until timeout=10s --artifacts <folder>/out
 ```
 
-`starquake-core`'s `System` parses the NRO with the loader, places its segments, a TLS block and
-a stack in the hypervisor backend's bring-up memory, rewrites its counter reads with the
+`starquake-core`'s `System` parses the NRO with the loader, maps its segments, a TLS block and
+a stack into a guest address space of their own on stage-1 tables (text read-execute, rodata
+read-only, the rest read-write, nothing else mapped), rewrites its counter reads with the
 loader's patcher, and runs it as one guest thread on one vCPU. Every `svc` goes through the
 kernel's dispatcher and is recorded in the event stream. The run ends when the guest calls
 `ExitProcess`, crashes, or reaches the timeout, and the artifacts folder gets `summary.json`,
@@ -159,7 +160,7 @@ it lives, with what replaces it:
 
 | Provisional part | Where | Replaced by |
 |---|---|---|
-| The program sits in one identity-mapped region that the guest can read, write and execute everywhere: no page tables of our own, permissions, guard pages or address-space bookkeeping | `crates/core/src/image.rs`, `crates/cpu/src/hvf.rs` | Stage-1 page tables (execution model) and kernel slice 6 (memory blocks, regions) |
+| The program's address space has real permissions but nothing else: a fixed layout with no relocation, backing handed out from the start of one RAM region and never returned, a host-side shadow that knows addresses but not permissions, and no unmapping or re-protecting (so no TLB flush is ever owed) | `crates/core/src/image.rs`, `crates/core/src/space.rs`, `crates/cpu/src/hvf.rs` | Kernel slice 6 (memory blocks, regions) and the backing pools of the execution model |
 | One guest thread on one core, with a fixed thread and process id; no scheduler; the whole register file is read and written on every `svc`; every abort is fatal | `crates/core/src/machine.rs` | Kernel slice 8 (process creation, thread lifecycle) and slice 10 (core loop and timers); single-register accessors on `Vcpu` |
 | The stack size, the TLS page and the registers the thread starts with are fixed by the loop; pointer-authentication keys are left as the backend creates them | `crates/core/src/image.rs`, `machine.rs` | Kernel slice 8, with the NPDM's values |
 | `ExitProcess` changes no kernel state: the dispatcher reports it and the loop stops | `crates/kernel/src/dispatch.rs` | Kernel slice 8 |

@@ -12,12 +12,14 @@
 //! for Data Aborts and Instruction Aborts (the fault status code in bits 5:0, `WnR` in bit 6).
 //! Sections are cited by name because the numbering moves between issues of the manual.
 //!
-//! What a real vCPU has reported (the hardware tests in `tests/hvf.rs`, and
-//! `tools/hvprobe/README.md`): classes 0x00 (an undefined instruction), 0x15 (`svc`), 0x18 (a
-//! trapped system register access), 0x1c (a failed pointer authentication), 0x20, 0x24 and 0x3c
-//! (`brk`); translation faults at levels 1 to 3, permission faults and access flag faults at
-//! level 3. The other encodings below are taken from the manual and have not been seen on
-//! hardware: classes 0x22 and 0x26, address size faults and alignment faults.
+//! What a real vCPU has reported (the hardware tests in `tests/hvf.rs` and
+//! `src/hvf/hardware.rs`, and `tools/hvprobe/README.md`): classes 0x00 (an undefined
+//! instruction), 0x15 (`svc`), 0x18 (a trapped system register access), 0x1c (a failed pointer
+//! authentication), 0x20, 0x24 and 0x3c (`brk`); translation faults at levels 0 to 3 and
+//! permission faults at level 3. For those aborts the whole syndrome was exactly what
+//! [`Syndrome::data_abort`] and [`Syndrome::instruction_abort`] build: no other `ISS` bit was
+//! set. The other encodings below are taken from the manual and have not been seen on
+//! hardware: classes 0x22 and 0x26, and address size, access flag and alignment faults.
 
 /// `ESR_ELx.EC` starts at this bit.
 const EC_SHIFT: u32 = 26;
@@ -102,7 +104,7 @@ impl ExceptionClass {
 ///
 /// `level` is the translation table level the fault was found at, 0 to 3. With the tables
 /// [`starquake_memory::stage1::Stage1Tables`] builds the walk starts at level 1 and pages are at
-/// level 3.
+/// level 3; a translation fault at level 0 is an address in neither half of the address space.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FaultStatus {
     /// Codes 0b0000LL: an address outside what the translation regime can address.
