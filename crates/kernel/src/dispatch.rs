@@ -231,7 +231,7 @@ mod sync;
 #[cfg(test)]
 mod tests;
 
-pub use cores::{Loaded, Switch};
+pub use cores::{Held, Loaded, Switch};
 pub use ipc::{IpcContext, Woken};
 pub use sync::WakeError;
 

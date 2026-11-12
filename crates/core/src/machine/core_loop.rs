@@ -2,13 +2,16 @@
 //! (see the module docs of `machine`).
 //!
 //! The vCPU's registers are the running thread's while it runs. They go back into the thread's
-//! saved context only when the core switches away from it ([`Dispatcher::switch`], under the
-//! kernel lock, so no other core can load a stale copy), and not after a call that began a
-//! wait, which saved them itself. A core reschedules after every system call and every
-//! interrupt; an abort that only lacked backing resumes the thread without asking.
+//! saved context only when the core switches away from it
+//! ([`Dispatcher::switch`](starquake_kernel::dispatch::Dispatcher::switch), under the kernel
+//! lock, so no other core can load a stale copy), and not after a call that began a wait,
+//! which saved them itself: then the saved context is the newer, and a core that keeps the
+//! thread (it was woken before its core rescheduled) loads it again, with the result its wake
+//! wrote. A core reschedules after every system call and every interrupt; an abort that only
+//! lacked backing resumes the thread without asking.
 
 use starquake_cpu::{Exit, GuestRegs, Syndrome, Vcpu};
-use starquake_kernel::dispatch::{Caller, Outcome, Switch};
+use starquake_kernel::dispatch::{Caller, Held, Outcome, Switch};
 use starquake_kernel::sched::CoreId;
 use starquake_memory::Access;
 use starquake_trace::{EventKind, FaultAction, HostClock, LifecyclePhase, ThreadId};
@@ -60,13 +63,31 @@ pub(super) fn run<V: Vcpu, C: HostClock + Clone>(
     }
 }
 
+/// What a core's vCPU holds of the thread it runs, against the thread's saved context: the
+/// owned form of [`Held`].
+enum Holds {
+    Same,
+    Newer(GuestRegs),
+    Older,
+}
+
+impl Holds {
+    fn held(&self) -> Held<'_> {
+        match self {
+            Self::Same => Held::Same,
+            Self::Newer(regs) => Held::Newer(regs),
+            Self::Older => Held::Older,
+        }
+    }
+}
+
 /// A core's state between steps.
 pub(super) struct Core<'m, 'a, V: Vcpu, C> {
     machine: &'m Machine<'a, V, C>,
     core: CoreId,
     running: Option<Running>,
-    /// The vCPU's registers when they are newer than the running thread's saved context.
-    save: Option<GuestRegs>,
+    /// What the vCPU holds of the running thread, against its saved context.
+    holds: Holds,
     /// Whether to ask the scheduler before the guest runs again.
     must_switch: bool,
 }
@@ -78,7 +99,7 @@ impl<'m, 'a, V: Vcpu, C: HostClock + Clone> Core<'m, 'a, V, C> {
             machine,
             core,
             running: None,
-            save: None,
+            holds: Holds::Same,
             must_switch: true,
         }
     }
@@ -118,7 +139,7 @@ impl<'m, 'a, V: Vcpu, C: HostClock + Clone> Core<'m, 'a, V, C> {
                     return Ok(Stepped::Running);
                 }
                 // Something changed elsewhere (a wake, a rotation): the scheduler says what.
-                self.save = Some(vcpu.regs().map_err(|error| Self::failed(&error))?);
+                self.holds = Holds::Newer(vcpu.regs().map_err(|error| Self::failed(&error))?);
                 self.must_switch = true;
                 Ok(())
             }
@@ -132,9 +153,8 @@ impl<'m, 'a, V: Vcpu, C: HostClock + Clone> Core<'m, 'a, V, C> {
         let mut signals = machine.signals();
         let switch = machine
             .dispatcher
-            .switch(self.core, self.save.as_ref(), &mut signals)
+            .switch(self.core, self.holds.held(), &mut signals)
             .map_err(|error| Ending::Failed(format!("the scheduler failed: {error}")))?;
-        self.save = None;
         match switch {
             Switch::Stay if self.running.is_none() => Err(Ending::Failed(
                 "the scheduler kept a core on a thread it never loaded".to_owned(),
@@ -151,10 +171,12 @@ impl<'m, 'a, V: Vcpu, C: HostClock + Clone> Core<'m, 'a, V, C> {
                 self.running = Some(Running {
                     guest_id: loaded.guest_id,
                 });
+                self.holds = Holds::Same;
                 Ok(true)
             }
             Switch::Park => {
                 self.running = None;
+                self.holds = Holds::Same;
                 Ok(false)
             }
         }
@@ -196,16 +218,20 @@ impl<'m, 'a, V: Vcpu, C: HostClock + Clone> Core<'m, 'a, V, C> {
         match record.outcome {
             Outcome::Completed | Outcome::NotImplemented => {
                 vcpu.set_regs(&regs).map_err(|error| Self::failed(&error))?;
-                self.save = Some(regs);
+                self.holds = Holds::Newer(regs);
                 Ok(())
             }
             Outcome::Waiting => {
-                // The call saved the thread's registers; its wait may have a timeout the timer
-                // thread has not seen.
+                // The call saved the thread's registers, where its wake writes its result; its
+                // wait may have a timeout the timer thread has not seen.
+                self.holds = Holds::Older;
                 machine.bell.ring();
                 Ok(())
             }
-            Outcome::ThreadExited => Ok(()),
+            Outcome::ThreadExited => {
+                self.holds = Holds::Same;
+                Ok(())
+            }
             Outcome::ProcessExited => {
                 machine.session.record_on(
                     self.core.index(),

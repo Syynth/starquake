@@ -1299,3 +1299,5 @@ fn a_clock_for_another_console_than_the_descriptions_ends_the_run_before_the_gue
         ExitReason::ProcessExited
     );
 }
+
+mod six_cores;

@@ -129,7 +129,7 @@ fn turns<V: Vcpu, C: HostClock + Clone>(machine: &Machine<'_, V, C>) -> Result<(
 
 /// Delivers the deferred replies of every server a [`Ready`](super::Ready) named since the last
 /// turn ([`Dispatcher::deliver_replies`]), then tells the cores whose thread changed.
-fn deliver<V: Vcpu, C: HostClock + Clone>(machine: &Machine<'_, V, C>) -> Result<(), Ending> {
+pub(super) fn deliver<V: Vcpu, C: HostClock + Clone>(machine: &Machine<'_, V, C>) -> Result<(), Ending> {
     let servers = machine.ready.take();
     if servers.is_empty() {
         return Ok(());

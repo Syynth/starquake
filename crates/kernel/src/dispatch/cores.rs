@@ -32,6 +32,22 @@ pub struct Loaded {
     pub context: GuestRegs,
 }
 
+/// What a core's vCPU holds of the thread the core runs, as [`Dispatcher::switch`] needs to
+/// know it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Held<'a> {
+    /// Nothing newer than the thread's saved context: the core runs no thread, or it has just
+    /// loaded it.
+    Same,
+    /// These registers, newer than the saved context (the thread ran since it was loaded):
+    /// they become the saved context if the core switches away from it.
+    Newer(&'a GuestRegs),
+    /// Something older than the saved context: the thread's last call began a wait, which
+    /// saved its registers, and a wake may have written its result there. If the core keeps
+    /// the thread, it loads them again.
+    Older,
+}
+
 /// What a core does after [`Dispatcher::switch`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Switch {
@@ -46,39 +62,38 @@ pub enum Switch {
 impl Dispatcher {
     /// Works out every core's thread again, signalling the other cores whose thread changed
     /// through `signals`, then, if `core` must reschedule, switches it
-    /// ([`Scheduler::schedule`]): the thread it ran gets `save` as its context first, unless it
-    /// waits (a call that began a wait saved its registers already, and a wake may have
-    /// written its result into them). Pass `save` whenever the vCPU's registers are newer than
-    /// the thread's saved context; it is ignored when the core stays on its thread.
+    /// ([`Scheduler::schedule`]). `held` says what the core's vCPU holds of the thread it ran:
+    /// [`Held::Newer`] registers become its saved context before it is let go, unless it waits
+    /// (a call that began a wait saved its registers already, and a wake may have written its
+    /// result into them); with [`Held::Older`], a core that keeps its thread loads its saved
+    /// context again, because the thread waited and was woken before its core rescheduled.
     ///
     /// A core that runs nothing the scheduler knows and has nothing chosen parks.
     pub fn switch(
         &self,
         core: CoreId,
-        save: Option<&GuestRegs>,
+        held: Held<'_>,
         signals: &mut dyn CoreSignals,
     ) -> Result<Switch, SchedError> {
         let mut locked = self.lock::<(&mut Scheduler,)>();
         let latest = locked.state.latest;
         let (scheduler,) = locked.tables();
         scheduler.update(latest, Some(core), signals)?;
-        if !scheduler.needs_scheduling(core)? {
-            return Ok(match scheduler.current(core)? {
-                Some(_) => Switch::Stay,
-                None => Switch::Park,
-            });
-        }
         let previous = scheduler.current(core)?;
-        if let (Some(previous), Some(regs)) = (previous, save)
-            && let Ok(thread) = scheduler.thread(previous)
-            && thread.state() != ThreadState::Waiting
-        {
-            *scheduler.context_mut(previous)? = regs.clone();
-        }
-        let next = scheduler.schedule(core, signals)?;
+        let next = if scheduler.needs_scheduling(core)? {
+            if let (Some(previous), Held::Newer(regs)) = (previous, held)
+                && let Ok(thread) = scheduler.thread(previous)
+                && thread.state() != ThreadState::Waiting
+            {
+                *scheduler.context_mut(previous)? = regs.clone();
+            }
+            scheduler.schedule(core, signals)?
+        } else {
+            previous
+        };
         Ok(match next {
             None => Switch::Park,
-            Some(next) if Some(next) == previous => Switch::Stay,
+            Some(next) if Some(next) == previous && held != Held::Older => Switch::Stay,
             Some(next) => {
                 let thread = scheduler.thread(next)?;
                 Switch::Load(Box::new(Loaded {

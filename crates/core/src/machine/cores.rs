@@ -59,6 +59,11 @@ impl<I: Interrupter> Cores<I> {
         }
     }
 
+    /// How many cores there are.
+    pub(super) fn count(&self) -> u8 {
+        u8::try_from(self.slots.len()).unwrap_or(u8::MAX)
+    }
+
     fn slot(&self, core: CoreId) -> Option<&Slot<I>> {
         self.slots.get(usize::from(core.index()))
     }
@@ -89,6 +94,14 @@ impl<I: Interrupter> Cores<I> {
         };
         *lock(&slot.woken) = true;
         slot.wake.notify_all();
+    }
+
+    /// Takes `core`'s waiting wake without parking: whether there was one. What a test that
+    /// steps every core on one thread does instead of parking.
+    #[cfg(test)]
+    pub(super) fn take_wake(&self, core: CoreId) -> bool {
+        self.slot(core)
+            .is_some_and(|slot| std::mem::take(&mut *lock(&slot.woken)))
     }
 
     /// Stops every core: each is interrupted and woken, and parks no more.

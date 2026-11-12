@@ -649,36 +649,11 @@ fn drive<V: Vcpu, C: HostClock + Clone + 'static>(
     limits: Limits,
     install: &Install,
 ) -> (Ending, GuestLog, Tally) {
-    let count = dispatcher.with::<(&starquake_kernel::tables::Scheduler,), _>(|(scheduler,)| {
-        scheduler.core_count()
-    });
-    let bell = Arc::new(timer::Bell::default());
-    let machine = Machine {
-        session,
-        space,
-        dispatcher,
-        env,
-        log: Mutex::new(GuestLog::new(limits.guest_log_bytes)),
-        tally: Mutex::new(Tally::default()),
-        cores: Cores::new(count),
-        ending: Mutex::new(None),
-        stopped: AtomicBool::new(false),
-        ready: Ready {
-            servers: Arc::new(Mutex::new(Vec::new())),
-            bell: Arc::clone(&bell),
-        },
-        bell,
+    let machine = match Machine::start(dispatcher, space, session, env, limits, install) {
+        Ok(machine) => machine,
+        Err(failed) => return failed,
     };
-    let services_env: Arc<dyn Env> = Arc::<LiveEnv>::clone(env);
-    if let Err(error) = install(&machine.dispatcher, services_env, machine.ready.clone()) {
-        let ending = Ending::Failed(format!("the services could not be set up: {error}"));
-        return (ending, machine.log.into_inner_or_poisoned(), Tally::default());
-    }
-    session.record(EventKind::Lifecycle {
-        phase: LifecyclePhase::ProcessStart,
-        subject: PROCESS_ID,
-    });
-
+    let count = machine.cores.count();
     let Vcpus { first, make } = vcpus;
     std::thread::scope(|scope| {
         let machine = &machine;
@@ -713,17 +688,72 @@ fn drive<V: Vcpu, C: HostClock + Clone + 'static>(
             None => machine.stop(Ending::Failed("there is no core 0".to_owned())),
         }
     });
-    // PROVISIONAL: nothing keeps the environment's recording (see the module docs).
-    drop(env.take_recording());
-    let ending = lock(&machine.ending)
-        .take()
-        .unwrap_or_else(|| Ending::Failed("the run stopped without saying why".to_owned()));
-    let Machine { log, tally, .. } = machine;
-    (
-        ending,
-        log.into_inner_or_poisoned(),
-        tally.into_inner_or_poisoned(),
-    )
+    machine.finish()
+}
+
+impl<'a, V: Vcpu, C: HostClock + Clone> Machine<'a, V, C> {
+    /// The machine over `dispatcher`'s tables with one core per core of its scheduler, with
+    /// the run's services installed ([`Install`]) and the process's start recorded. A failure
+    /// to install the services is how the run ends, with the guest log and call counts it had.
+    fn start(
+        dispatcher: Dispatcher,
+        space: &'a dyn GuestSpace<V>,
+        session: &'a Session<'a, C>,
+        env: &'a Arc<LiveEnv>,
+        limits: Limits,
+        install: &Install,
+    ) -> Result<Self, (Ending, GuestLog, Tally)> {
+        let count = dispatcher
+            .with::<(&starquake_kernel::tables::Scheduler,), _>(|(scheduler,)| {
+                scheduler.core_count()
+            });
+        let bell = Arc::new(timer::Bell::default());
+        let machine = Self {
+            session,
+            space,
+            dispatcher,
+            env,
+            log: Mutex::new(GuestLog::new(limits.guest_log_bytes)),
+            tally: Mutex::new(Tally::default()),
+            cores: Cores::new(count),
+            ending: Mutex::new(None),
+            stopped: AtomicBool::new(false),
+            ready: Ready {
+                servers: Arc::new(Mutex::new(Vec::new())),
+                bell: Arc::clone(&bell),
+            },
+            bell,
+        };
+        let services_env: Arc<dyn Env> = Arc::<LiveEnv>::clone(env);
+        if let Err(error) = install(&machine.dispatcher, services_env, machine.ready.clone()) {
+            let ending = Ending::Failed(format!("the services could not be set up: {error}"));
+            return Err((
+                ending,
+                machine.log.into_inner_or_poisoned(),
+                Tally::default(),
+            ));
+        }
+        session.record(EventKind::Lifecycle {
+            phase: LifecyclePhase::ProcessStart,
+            subject: PROCESS_ID,
+        });
+        Ok(machine)
+    }
+
+    /// How the run ended, the guest log and the call counts, once every core and the timer
+    /// thread have stopped.
+    fn finish(self) -> (Ending, GuestLog, Tally) {
+        // PROVISIONAL: nothing keeps the environment's recording (see the module docs).
+        drop(self.env.take_recording());
+        let ending = lock(&self.ending)
+            .take()
+            .unwrap_or_else(|| Ending::Failed("the run stopped without saying why".to_owned()));
+        (
+            ending,
+            self.log.into_inner_or_poisoned(),
+            self.tally.into_inner_or_poisoned(),
+        )
+    }
 }
 
 /// A mutex's value, whatever a panicking holder left.

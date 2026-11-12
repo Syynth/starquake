@@ -88,11 +88,11 @@ impl World {
         self.dispatcher.dispatch(id.number(), regs, &mut caller)
     }
 
-    fn switch(&self, on: u8, save: Option<&GuestRegs>) -> (Switch, Vec<Signal>) {
+    fn switch(&self, on: u8, held: Held<'_>) -> (Switch, Vec<Signal>) {
         let mut signals = Signals::default();
         let switch = self
             .dispatcher
-            .switch(core(on), save, &mut signals)
+            .switch(core(on), held, &mut signals)
             .unwrap();
         (switch, signals.log)
     }
@@ -119,7 +119,7 @@ impl World {
 
     /// Runs the main thread on core 0 and returns its registers.
     fn run_main(&self) -> GuestRegs {
-        let loaded = load(self.switch(0, None).0);
+        let loaded = load(self.switch(0, Held::Same).0);
         assert_eq!(loaded.thread, self.main.thread);
         loaded.context
     }
@@ -145,7 +145,7 @@ fn marked(mark: u64) -> GuestRegs {
 #[test]
 fn a_core_loads_the_thread_chosen_for_it_then_stays_on_it() {
     let world = World::new();
-    let (switch, signals) = world.switch(0, None);
+    let (switch, signals) = world.switch(0, Held::Same);
     let loaded = load(switch);
     assert_eq!(loaded.thread, world.main.thread);
     assert_eq!(loaded.guest_id, EventThread(crate::sched::FIRST_THREAD_ID));
@@ -155,15 +155,15 @@ fn a_core_loads_the_thread_chosen_for_it_then_stays_on_it() {
     assert_eq!(signals, vec![]);
     // Nothing changed since: it stays, and what it would have saved is ignored.
     let before = world.context(world.main.thread);
-    assert_eq!(world.switch(0, Some(&marked(1))).0, Switch::Stay);
+    assert_eq!(world.switch(0, Held::Newer(&marked(1))).0, Switch::Stay);
     assert_eq!(world.context(world.main.thread), before);
 }
 
 #[test]
 fn a_core_with_nothing_to_run_parks() {
     let world = World::new();
-    assert_eq!(world.switch(1, None).0, Switch::Park);
-    assert_eq!(world.switch(1, None).0, Switch::Park);
+    assert_eq!(world.switch(1, Held::Same).0, Switch::Park);
+    assert_eq!(world.switch(1, Held::Same).0, Switch::Park);
 }
 
 #[test]
@@ -181,7 +181,7 @@ fn switching_away_saves_the_registers_the_core_gives_and_loads_the_next_thread()
     // The main thread yields: the second one is next on its level.
     world.scheduler(|scheduler| scheduler.yield_without_core_migration(core(0)).unwrap());
     let running = marked(7);
-    let (switch, _) = world.switch(0, Some(&running));
+    let (switch, _) = world.switch(0, Held::Newer(&running));
     let loaded = load(switch);
     assert_eq!(loaded.thread, second);
     assert_eq!(world.context(world.main.thread), running);
@@ -196,9 +196,32 @@ fn a_thread_that_began_a_wait_keeps_the_context_its_wait_saved() {
     let record = world.call(0, SvcId::SleepThread, &mut regs);
     assert_eq!(record.outcome, Outcome::Waiting);
     // A core that wrongly passes newer registers does not overwrite the saved ones.
-    let (switch, _) = world.switch(0, Some(&marked(4)));
+    let (switch, _) = world.switch(0, Held::Newer(&marked(4)));
     assert_eq!(switch, Switch::Park);
     assert_eq!(world.context(world.main.thread), regs);
+}
+
+#[test]
+fn a_thread_woken_before_its_core_rescheduled_is_loaded_again_not_kept() {
+    let world = World::new();
+    world.run_main();
+    let mut regs = marked(8);
+    regs.x[0] = 5;
+    assert_eq!(
+        world.call(0, SvcId::SleepThread, &mut regs).outcome,
+        Outcome::Waiting
+    );
+    // The timer ends the sleep before core 0 asks what to run: its thread is the same, but the
+    // vCPU holds older registers than the saved context, so the core loads it again.
+    world
+        .dispatcher
+        .fire_timers(&world.env, &world.recorder)
+        .unwrap();
+    let loaded = load(world.switch(0, Held::Older).0);
+    assert_eq!(loaded.thread, world.main.thread);
+    assert_eq!(loaded.context, regs);
+    // Told the vCPU holds the context, the same core stays.
+    assert_eq!(world.switch(0, Held::Same).0, Switch::Stay);
 }
 
 #[test]
@@ -207,7 +230,7 @@ fn a_woken_thread_more_urgent_than_a_cores_thread_interrupts_that_core() {
     world.run_main();
     // A more urgent thread of core 0 that sleeps on core 1's behalf: it runs on core 1 first.
     let urgent = world.spawn(20, 1);
-    let loaded = load(world.switch(1, None).0);
+    let loaded = load(world.switch(1, Held::Same).0);
     assert_eq!(loaded.thread, urgent);
     let mut regs = marked(5);
     regs.x[0] = 5;
@@ -215,7 +238,7 @@ fn a_woken_thread_more_urgent_than_a_cores_thread_interrupts_that_core() {
         world.call(1, SvcId::SleepThread, &mut regs).outcome,
         Outcome::Waiting
     );
-    assert_eq!(world.switch(1, None).0, Switch::Park);
+    assert_eq!(world.switch(1, Held::Same).0, Switch::Park);
     // Move it to core 0, whose thread is less urgent, while it sleeps.
     world.scheduler(|scheduler| {
         scheduler
@@ -235,7 +258,7 @@ fn a_woken_thread_more_urgent_than_a_cores_thread_interrupts_that_core() {
     let changed = world.dispatcher.reschedule(&mut signals).unwrap();
     assert_eq!(changed, AffinityMask::single(core(0)));
     assert_eq!(signals.log, vec![Signal::Interrupt(0)]);
-    let (switch, _) = world.switch(0, Some(&marked(6)));
+    let (switch, _) = world.switch(0, Held::Newer(&marked(6)));
     let loaded = load(switch);
     assert_eq!(loaded.thread, urgent);
     assert_eq!(loaded.context, regs);
@@ -260,14 +283,14 @@ fn preemption_takes_turns_between_threads_at_a_cores_preemption_level() {
     let level = PREEMPTION_PRIORITIES[1].get();
     let first = world.spawn(level, 1);
     let second = world.spawn(level, 1);
-    let loaded = load(world.switch(1, None).0);
+    let loaded = load(world.switch(1, Held::Same).0);
     assert_eq!(loaded.thread, first);
     for expected in [second, first] {
         let mut signals = Signals::default();
         let changed = world.dispatcher.preempt(&mut signals).unwrap();
         assert!(changed.contains(core(1)));
         assert!(signals.log.contains(&Signal::Interrupt(1)));
-        let loaded = load(world.switch(1, Some(&marked(9))).0);
+        let loaded = load(world.switch(1, Held::Newer(&marked(9))).0);
         assert_eq!(loaded.thread, expected);
     }
 }
@@ -289,7 +312,7 @@ fn a_process_is_stalled_only_when_nothing_can_run_or_end_a_wait() {
         .unwrap();
     assert!(!world.dispatcher.is_stalled());
     // It sleeps with no timer: nothing can end it.
-    world.switch(0, None);
+    world.switch(0, Held::Same);
     let mut forever = marked(2);
     forever.x[0] = i64::MAX.cast_unsigned();
     assert_eq!(
