@@ -265,3 +265,11 @@ Entry format:
 - **WHAT:** The syncpoint counters and the GPU address table are plain data types in the GPU crate. The graphics server allocates counters, computes each submission's fence, and writes mappings; the GPU performs increments after host completion and reads the table on every access. Counter changes go into a queue that the graphics server's timer thread drains, so game threads are woken in a recorded order. Unmaps, kind changes and destroys reach the GPU as ordered updates with a barrier, and the game is told only when no earlier GPU work, including the thread that reads command buffers, can still use the old mapping. The GPU draft's memory-access interface is kept, with its production implementation in the GPU crate over the table. The GPU draft's interface for the graphics server to own syncpoints is dropped.
 - **WHY:** The graphics server already depends on the GPU crate, so no new crate is needed, and the GPU reads the table on its hottest path, where a call through an interface would cost on every access. Waking game threads from one recorded place keeps replay deterministic, as the observability spec requires. Ordered unmaps stop the GPU reading memory the game has already been told is free.
 
+## Draw commands cross to the backend as plain data; caches are split by what they are keyed on
+- **WHEN:** 2026-11-12
+- **PROJECT:** starquake
+- **SYSTEM:** gpu, render
+- **SCOPE:** architectural
+- **WHAT:** The GPU crate's back thread writes draw and dispatch commands as plain data (handles and numbers); the render backend's own thread turns them into host API calls, submits and presents. Caches keyed by game memory or register state (textures, buffers, pipeline keys, write tracking, eviction, detiling) live in the GPU crate; host objects live in the backend and are referred to by handle. Each backend implements the same trait and never sees a game memory address.
+- **WHY:** Eden-NX2 measured the thread that issues host calls as its bottleneck, so the back thread should not wait on the graphics driver. Plain-data lists give a recording backend for GPU-free tests and host-level captures without extra work, and keep wgpu types out of the GPU crate so a direct backend can be added. Writing cache policy once, in the GPU crate, means it is tested without a GPU and not repeated per backend.
+
