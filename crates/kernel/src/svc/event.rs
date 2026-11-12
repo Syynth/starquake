@@ -123,9 +123,11 @@ pub fn reset_signal(
         Resolved::Object(id) => match scheduler.objects().get(id)? {
             Object::ReadableEvent(_) => scheduler.reset_readable(id),
             Object::Process(_) => process_reset,
-            Object::Thread(_) | Object::Session | Object::Event(_) => {
-                Err(KernelError::InvalidHandle.into())
-            }
+            Object::Thread(_)
+            | Object::Session
+            | Object::Event(_)
+            | Object::SharedMemory(_)
+            | Object::TransferMemory(_) => Err(KernelError::InvalidHandle.into()),
         },
     }
 }

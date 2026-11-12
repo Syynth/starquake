@@ -22,6 +22,9 @@
 //! | `GetCurrentProcessorNumber` (0x10) | [`processor::get_current_processor_number`] | the calling core |
 //! | `SignalEvent` (0x11) | [`event::signal_event`] | the handle table, shared, and the scheduler |
 //! | `ClearEvent` (0x12) | [`event::clear_event`] | the handle table, shared, and the scheduler |
+//! | `MapSharedMemory` (0x13) | [`shared_memory::map_shared_memory`] | the handle table, shared, the address space and the scheduler, both exclusive |
+//! | `UnmapSharedMemory` (0x14) | [`shared_memory::unmap_shared_memory`] | the handle table, shared, the address space and the scheduler, both exclusive |
+//! | `CreateTransferMemory` (0x15) | [`transfer_memory::create_transfer_memory`] | the handle table, the address space and the scheduler, all exclusive, and the process facts |
 //! | `CloseHandle` (0x16) | [`handle::close_handle`] | the handle table and the scheduler, both exclusive |
 //! | `ResetSignal` (0x17) | [`event::reset_signal`] | the handle table, shared, and the scheduler |
 //! | `WaitSynchronization` (0x18) | [`sync::wait_synchronization`] | the handle table and the address space, shared, the scheduler, guest memory, and the dispatch's clock reading |
@@ -51,9 +54,11 @@ pub mod info;
 pub mod memory;
 pub mod process;
 pub mod processor;
+pub mod shared_memory;
 pub mod sync;
 pub mod thread;
 pub mod tick;
+pub mod transfer_memory;
 
 pub use convention::{
     Arg, BEYOND_RETAIL, CONVENTIONS, Convention, ConventionError, Kind, is_retail,

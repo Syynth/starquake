@@ -119,9 +119,9 @@ svc_ids! {
     GetCurrentProcessorNumber = 0x10, Implemented;
     SignalEvent = 0x11, Implemented;
     ClearEvent = 0x12, Implemented;
-    MapSharedMemory = 0x13, Planned;
-    UnmapSharedMemory = 0x14, Planned;
-    CreateTransferMemory = 0x15, Planned;
+    MapSharedMemory = 0x13, Implemented;
+    UnmapSharedMemory = 0x14, Implemented;
+    CreateTransferMemory = 0x15, Implemented;
     CloseHandle = 0x16, Implemented;
     ResetSignal = 0x17, Implemented;
     WaitSynchronization = 0x18, Implemented;

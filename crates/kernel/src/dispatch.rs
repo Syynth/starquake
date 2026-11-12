@@ -210,12 +210,13 @@ use crate::result::{CallResult, KernelError, ResultCode, SvcError};
 use crate::sched::CoreId;
 use crate::svc::{
     Convention, ConventionError, DebugSink, Kind, Status, SvcId, debug, handle, info, memory,
-    processor, thread, tick,
+    processor, thread, tick, transfer_memory,
 };
 use crate::tables::{AddressSpace, Processes, Scheduler};
 
 mod ipc;
 mod lifecycle;
+mod memory_objects;
 mod sync;
 #[cfg(test)]
 mod tests;
@@ -533,6 +534,29 @@ struct Locked<'d, B> {
     declared: PhantomData<fn() -> B>,
 }
 
+/// Before the lock goes, the pages of every transfer memory that went while it was held are
+/// unlocked ([`transfer_memory::unlock_released`]): whatever call dropped the last reference,
+/// the next holder of the lock finds them as `KTransferMemory::Finalize` leaves them. A failure
+/// is the kernel's own bookkeeping, and is logged (see the divergences in
+/// [`crate::svc::transfer_memory`]).
+impl<B> Drop for Locked<'_, B> {
+    fn drop(&mut self) {
+        let tables = &mut self.state.tables;
+        if !tables.scheduler.objects().has_unlocks() {
+            return;
+        }
+        let own = tables.processes.own();
+        let unlocked = transfer_memory::unlock_released(
+            &mut tables.scheduler,
+            &mut tables.address_space,
+            own,
+        );
+        if let Err(error) = unlocked {
+            tracing::error!(%error, "unlocking a released transfer memory's pages failed");
+        }
+    }
+}
+
 impl<B: TableSet> Locked<'_, B> {
     /// The declared tables, and nothing else.
     fn tables(&mut self) -> B::Borrowed<'_> {
@@ -847,6 +871,9 @@ impl Dispatcher {
             | SvcId::WaitSynchronization
             | SvcId::CancelSynchronization
             | SvcId::CreateEvent => self.synchronization(call, id, convention),
+            SvcId::MapSharedMemory | SvcId::UnmapSharedMemory | SvcId::CreateTransferMemory => {
+                self.memory_object(call, id, convention)
+            }
             SvcId::ConnectToNamedPort => self.connect_to_named_port(call, id, convention),
             SvcId::SendSyncRequest => self.send_sync_request(call, id, convention),
             SvcId::GetSystemTick => self.call::<()>(call, |(), call, time| {
