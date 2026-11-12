@@ -1049,9 +1049,15 @@ fn a_flush_on_one_vcpu_stops_another_that_never_leaves_the_guest() {
         };
         // A load from the page that found it unmapped. Once the flush has run that is at
         // level 1 (the page was alone under its tables, which the unmap unlinked). But the
-        // spinner may lose its cached translation on its own, and walk while the unmap is
-        // still between its three descriptor writes (the page, then each table): then it
-        // faults at level 3 or 2. Seen as soon as the machine is busy.
+        // spinner does not always keep its cached translation until the flush: on a busy
+        // host it often walks again earlier, and then faults at level 3 or 2. Measured with
+        // level 1 as the only accepted answer: 32 of 40 runs of this test failed while other
+        // builds kept all eight cores busy (17 at level 2, 15 at level 3); the same assertion
+        // had passed while the machine was quieter. Two ways to get there, which this test does
+        // not tell apart (a guess): the walk falls between the unmap's three descriptor
+        // writes (the page, then each table), or it starts from a cached walk entry that
+        // still points at a table the unmap has unlinked. Either way the page is gone for
+        // the spinner at that moment, which is all the caller of `unmap` may rely on.
         let unmapped = [1, 2, 3].map(|level| Exit::DataAbort {
             address: page,
             write: false,
