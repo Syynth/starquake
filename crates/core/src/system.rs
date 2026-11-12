@@ -171,6 +171,21 @@ mod tests {
     }
 
     #[test]
+    fn an_address_space_that_cannot_be_built_is_reported_with_its_cause() {
+        let cause = SpaceError::OutOfRam {
+            size: 0x2000,
+            available: 0x1000,
+        };
+        let error = Error::from(cause);
+        assert_eq!(error, Error::AddressSpace(cause));
+        assert_eq!(
+            error.to_string(),
+            "the program could not be mapped into guest memory: mapping 0x2000 bytes needs more \
+             guest RAM than the 0x1000 bytes left"
+        );
+    }
+
+    #[test]
     fn the_missing_backend_error_says_what_is_needed() {
         assert_eq!(
             Error::NoCpuBackend.to_string(),
