@@ -313,3 +313,11 @@ Entry format:
 - **WHAT:** If an experiment shows wgpu runs cleanly and deterministically on Mesa's software Vulkan driver (lavapipe) on GitHub's hosted Linux runners, the render backend's GPU tests are required in Linux CI and skipped locally, with a notice, where no GPU adapter exists. Golden images are compared exactly only for scenes whose pixels can be computed; others use a stated tolerance. If the experiment fails, the GPU tests are local-only, like the hypervisor tests (render 9).
 - **WHY:** Most changes are made by agents, and an agent that breaks the render backend should learn it from the PR's checks, not from the owner noticing a broken frame later. The recording backend already tests most logic without a GPU, so these tests only need to cover what is specific to wgpu, and the cost is a package install and somewhat slower CI.
 
+## No video decoding at first, then FFmpeg behind an off-by-default feature
+- **WHEN:** 2026-11-12
+- **PROJECT:** starquake
+- **SYSTEM:** gsv
+- **SCOPE:** moderate
+- **WHAT:** The first graphics-server slices answer video codec sessions without decoding, so movies show a frozen picture and the game carries on. Later, FFmpeg is added behind a Cargo feature that is off by default, covering VP9, AV1 and H.264; each format moves to a pure-Rust decoder when a good enough one exists. The decoder sits behind the video session protocol, so it can be swapped without changing the sessions (gsv 10).
+- **WHY:** Movies matter for the experience but not for getting frames on screen. FFmpeg covers every relevant format but is a C library, which the project keeps out of the default build, so it stays opt-in. A game that waits for a movie to finish may sit on a frozen frame; that is found when a real title hits it.
+
