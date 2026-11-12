@@ -1,7 +1,7 @@
 # Architecture (proposal)
 
-Status: proposal, 2026-11-11. Nothing here is implemented yet beyond the crate skeleton, the
-`memory`/`cpu` traits, and `tools/hvprobe`. Background: `switch2-eden-diff-scoping.md`.
+Status: proposal, 2026-11-11. What runs today is the walking skeleton described at the end of
+this file; the rest is the design it grows into. Background: `switch2-eden-diff-scoping.md`.
 
 ## The big picture
 
@@ -129,3 +129,41 @@ scattered through code.
   checked against `nvdisasm`, `naga` validation of every translated shader.
 - **Auto-stub plus trace** for unknown IPC commands and SVCs, the same tool that let Eden-NX2
   boot titles quickly.
+
+## What runs today: the walking skeleton
+
+The thinnest end-to-end run (`roadmap.md`, "Route to milestone 1"), so that the pieces are
+proven to fit before more are built. On macOS on Apple Silicon:
+
+```sh
+cargo run -p starquake-testkit --example guest_programs -- <folder>   # writes four test NROs
+cargo run -p starquake -- run <folder>/hello.nro --until timeout=10s --artifacts <folder>/out
+```
+
+`starquake-core`'s `System` parses the NRO with the loader, places its segments, a TLS block and
+a stack in the hypervisor backend's bring-up memory, rewrites its counter reads with the
+loader's patcher, and runs it as one guest thread on one vCPU. Every `svc` goes through the
+kernel's dispatcher and is recorded in the event stream. The run ends when the guest calls
+`ExitProcess`, crashes, or reaches the timeout, and the artifacts folder gets `summary.json`,
+`trace.txt`, `events.bin`, `guest_log.txt`, and `crash.json` and `crash.txt` after a crash. The
+exit codes are the headless contract's (`specs/observability.md`). On other hosts the same
+command reports that no CPU backend is available (exit code 2).
+
+The tests are in `crates/core`: `src/machine/tests.rs` drives the loop with a scripted vCPU on
+every host, and `tests/skeleton.rs` runs the testkit's guest programs natively.
+
+It is deliberately thinner than the specs. Each provisional part is marked `PROVISIONAL` where
+it lives, with what replaces it:
+
+| Provisional part | Where | Replaced by |
+|---|---|---|
+| The program sits in one identity-mapped region that the guest can read, write and execute everywhere: no page tables of our own, permissions, guard pages or address-space bookkeeping | `crates/core/src/image.rs`, `crates/cpu/src/hvf.rs` | Stage-1 page tables (execution model) and kernel slice 6 (memory blocks, regions) |
+| One guest thread on one core, with a fixed thread and process id; no scheduler; the whole register file is read and written on every `svc`; every abort is fatal | `crates/core/src/machine.rs` | Kernel slice 8 (process creation, thread lifecycle) and slice 10 (core loop and timers); single-register accessors on `Vcpu` |
+| The stack size, the TLS page and the registers the thread starts with are fixed by the loop | `crates/core/src/image.rs`, `machine.rs` | Kernel slice 8, with the NPDM's values |
+| `ExitProcess` changes no kernel state: the dispatcher reports it and the loop stops | `crates/kernel/src/dispatch.rs` | Kernel slice 8 |
+| The dispatcher is told the calling thread and the event's time by its caller | `crates/kernel/src/dispatch.rs` (`Caller`) | Kernel slice 10 (the scheduler knows each core's thread) and the kernel's guest-time work |
+| Lifecycle, fault and guest-log events are recorded by the loop, outside the kernel lock | `crates/core/src/machine.rs` | The kernel's own recording points (slices 6 and 8) |
+| A patched counter read and `GetSystemTick` share a rate (19.2 MHz) but not a zero point | `crates/core/src/system.rs` | The kernel's guest-time work (kernel spec, "Guest time") |
+| One VM per run; the hypervisor backend only | `crates/core/src/system.rs` | KVM and JIT backends; a `System` that outlives one program |
+| Crash reports have no backtrace or symbols, and an exception is only as detailed as the backend's exits | `crates/core/src/crash.rs` | The crash-report step of the observability spec; richer exits (#36) |
+| Of the headless flags only `--until timeout=<n>s` and `--artifacts` exist | `apps/starquake/src/lib.rs` | The observability spec's order of work |
