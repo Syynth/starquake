@@ -120,7 +120,8 @@ conversation with `sm:` and `set:sys` runs on every host without a vCPU in
 
 A libnx program built the ordinary way (`startup.c`): it keeps libnx's own `__appInit`, so
 start-up opens `sm:`, then `set:sys`, `apm`, `appletOE`, `hid`, `time:u`, `fsp-srv` and `vi:m`
-before `main` (`libnx/nx/source/runtime/init.c` and `display/default_window.c` @ b156b477).
+before `main` (`libnx/nx/source/runtime/init.c`, `services/applet.c`, whose `_appletInitialize`
+opens `apm` for an application, and `display/default_window.c` @ b156b477).
 `main` prints one line on the console, which opens `nvdrv` for the framebuffer, and returns;
 libnx then closes everything and ends the process through `appletOE`.
 

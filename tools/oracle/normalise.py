@@ -32,13 +32,37 @@ before it, and maps there if the range is free (libnx/nx/source/kernel/virtmem.c
 libnx/nx/source/kernel/shmem.c, `shmemMap`). The generator is seeded from `GetInfo`'s random
 entropy, so the page differs from run to run. Each range a call in `PLACEMENTS` maps is a
 placement, named `placement1`, `placement2`, ... in the order the trace maps them, and anchored
-at the range's start less the guard (the address libnx's probe asks about). A placement must lie
-where libnx may put one, or the trace is refused: in the ASLR region, outside the module, the
-alias region and the heap region. `_memregionFindRandom` skips the alias and heap regions and
-anything mapped, and the kernel lets a shared memory lie anywhere else in the ASLR region
-(eden/src/core/hle/kernel/k_page_table_base.cpp, `KPageTableBase::CanContain`:
-`is_in_region && !is_in_heap && !is_in_alias` for `MemoryState::Shared`), so a placement in the
-stack region is accepted. `crates/core/tests/homebrew.rs` pairs placements by the same rule.
+at the range's start less the guard (the address libnx's probe asks about).
+
+A placement must lie where libnx may put one, or the trace is refused. `_memregionFindRandom`
+draws the mapped range `[start, start + size)` inside the ASLR region and refuses it if it
+overlaps the alias or the heap region (`_memregionOverlaps`); `_memregionIsMapped` refuses it if
+anything is mapped in it or in a guard page on either side. The guard pages may lie in the alias
+or the heap region, where nothing is mapped there. The kernel lets a shared memory lie anywhere
+else in the ASLR region (eden/src/core/hle/kernel/k_page_table_base.cpp,
+`KPageTableBase::CanContain`: `is_in_region && !is_in_heap && !is_in_alias` for
+`MemoryState::Shared`, on the mapped range), the stack region included. So the script checks
+that:
+
+- the mapped range overlaps neither the alias nor the heap region;
+- the range with its guard pages lies in the ASLR region, and overlaps neither the module nor
+  another placement's mapped range (what the script knows to be mapped).
+
+A guard page above the ASLR region is refused as libnx refuses it: for a 39-bit address space
+the region ends where the address space does (eden/src/core/hle/kernel/k_address_space_info.cpp,
+`Map39Bit`), and `KPageTableBase::QueryInfo` reports an address outside it as `Inaccessible`,
+which `_memregionIsMapped` counts as mapped. Two divergences are the script's own, both stricter
+than libnx and neither reached by the fixtures' traces:
+
+- A guard page below the ASLR region is refused, so a range that starts exactly at the region's
+  start is refused. The address space starts below the region (at 0,
+  `KPageTableBase::InitializeForProcess`), so libnx only needs that page unmapped; whether it is
+  unmapped there in the reference is a guess the script does not rely on.
+- A placement's range stays taken after it is unmapped, so a later placement over it is refused.
+  The fixtures' traces map every placement before they unmap one.
+
+`crates/core/tests/homebrew.rs` pairs placements by the same conditions, with the same two
+divergences, and its module docs list the tests that pin them.
 
 Usage, from the repository root:
 
@@ -256,22 +280,30 @@ def main():
         sys.exit(f"the image {module[0]:#x}..{module[1]:#x} does not hold every code address")
 
     inner = ["stack_region", "alias_region", "heap_region"]
-    # The regions libnx keeps placements out of (see the module docs).
+    # The regions libnx keeps a placement's mapped range out of (see the module docs).
     avoided = ["alias_region", "heap_region"]
-    for start, end in placements:
-        outside = all(
-            end <= anchors[name][0] or anchors[name][1] <= start
-            for name in avoided
-            if name in anchors
-        )
-        aslr = anchors.get("aslr_region")
+
+    def overlaps(a, b):
+        # libnx's `_memregionOverlaps`.
+        return a[0] < b[1] and b[0] < a[1]
+
+    aslr = anchors.get("aslr_region")
+    for index, (start, end) in enumerate(placements):
+        mapped = (start + PLACEMENT_GUARD, end - PLACEMENT_GUARD)
+        others = [
+            (other_start + PLACEMENT_GUARD, other_end - PLACEMENT_GUARD)
+            for other, (other_start, other_end) in enumerate(placements)
+            if other != index
+        ]
         if (
-            not outside
+            any(overlaps(mapped, anchors[name]) for name in avoided if name in anchors)
             or aslr is None
             or not (aslr[0] <= start and end <= aslr[1])
+            # The module's end is included: libnx asks about it.
             or not (end <= module[0] or module[1] < start)
+            or any(overlaps((start, end), other) for other in others)
         ):
-            sys.exit(f"the placement {start:#x}..{end:#x} is not in the ASLR region alone")
+            sys.exit(f"the placement {start:#x}..{end:#x} is not where libnx may map one")
 
     def symbol(value):
         # The module first (its end included: libnx asks about it), then the
@@ -279,8 +311,10 @@ def main():
         # others, so it goes last.
         if module[0] <= value <= module[1]:
             return f"main+{value - module[0]:#x}"
+        # A placement's upper guard page may be the next one's anchor, which libnx probes;
+        # libnx never names an upper guard page, so it is not matched.
         for index, (start, end) in enumerate(placements, start=1):
-            if start <= value < end:
+            if start <= value < end - PLACEMENT_GUARD:
                 return f"placement{index}+{value - start:#x}"
         for name in inner + ["aslr_region"]:
             if name in anchors and anchors[name][0] <= value < anchors[name][1]:

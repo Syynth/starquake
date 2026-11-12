@@ -24,14 +24,46 @@
 //!   reference handle whose value it happens to have.
 //!   Placements (`placement1+0x1000`: a range libnx put at a random page of the ASLR region,
 //!   `tools/oracle/normalise.py` says how) are paired the same way: the first time the
-//!   reference names one, the run's address in the same place, less the same offset, is paired
-//!   with it, if both that address and the run's address lie where libnx may place one: in the
-//!   ASLR region, outside the module, the alias region and the heap region. libnx's
-//!   `_memregionFindRandom` (`libnx/nx/source/kernel/virtmem.c`) skips the alias and heap regions
-//!   and anything mapped, and the kernel lets a shared memory lie anywhere else in the ASLR
-//!   region (`eden/src/core/hle/kernel/k_page_table_base.cpp`, `KPageTableBase::CanContain`:
-//!   `is_in_region && !is_in_heap && !is_in_alias` for `MemoryState::Shared`), the stack
-//!   region included. `ExitProcess` has no result in the reference, which never saw it return;
+//!   reference names one, the run's address in the same place, less the same offset, is the
+//!   placement's anchor (the guard page below its range, which libnx probes) and is paired
+//!   with it. libnx's `_memregionFindRandom` (`libnx/nx/source/kernel/virtmem.c`) draws the
+//!   range `[map, map + size)` inside the ASLR region, refuses it if it overlaps the alias or
+//!   the heap region (`_memregionOverlaps`), and refuses it if anything is mapped in it or in a
+//!   guard page on either side (`_memregionIsMapped`, guard 0x1000 from `shmemMap` in
+//!   `libnx/nx/source/kernel/shmem.c`): the guard pages themselves may lie in the alias or the
+//!   heap region, where nothing is mapped there. The kernel lets a shared memory lie anywhere
+//!   else in the ASLR region (`eden/src/core/hle/kernel/k_page_table_base.cpp`,
+//!   `KPageTableBase::CanContain`: `is_in_region && !is_in_heap && !is_in_alias` for
+//!   `MemoryState::Shared`, all three on the mapped range), the stack region included. So a
+//!   placement pairs when:
+//!   - first named, before its size is known: its anchor lies in the ASLR region and outside
+//!     the module, and the page above the anchor (the range's first) outside the alias and the
+//!     heap region;
+//!   - on the line that maps it (`MapSharedMemory`), with its size: the range lies outside the
+//!     alias and the heap region, and the range with its two guard pages lies in the ASLR
+//!     region and overlaps neither the module nor the range of another placement the run has
+//!     mapped.
+//!
+//!   These are libnx's conditions, with what is mapped narrowed to what the comparison knows
+//!   (the module, through `__argdata__`, and the placements). A guard page above the ASLR
+//!   region is refused as libnx refuses it: for a 39-bit address space the ASLR region ends
+//!   where the address space does (`eden/src/core/hle/kernel/k_address_space_info.cpp`,
+//!   `Map39Bit`; pinned by `the_aslr_region_ends_where_the_address_space_does`), and
+//!   `KPageTableBase::QueryInfo` reports an address outside it as `Inaccessible`, which
+//!   `_memregionIsMapped` counts as mapped. Two divergences are the comparison's own, both
+//!   stricter than libnx, both shared with `normalise.py`, and neither reached by the
+//!   fixtures' traces:
+//!   - A guard page below the ASLR region is refused, so a range that starts exactly at the
+//!     region's start does not pair (pinned in
+//!     `a_placement_is_not_paired_where_libnx_does_not_place_one`). The address space starts
+//!     below the region (at 0, `KPageTableBase::InitializeForProcess`), so libnx only needs
+//!     that page unmapped; that it is unmapped there in the reference is a guess the
+//!     comparison does not rely on. It costs one page of the region per placement.
+//!   - A placement's range stays taken after it is unmapped, so a later placement over it does
+//!     not pair (pinned by `a_placement_over_an_unmapped_one_does_not_pair`); the traces map
+//!     every placement before they unmap one.
+//!
+//!   `ExitProcess` has no result in the reference, which never saw it return;
 //!   starquake ends the run there (`docs/reference-emulator.md`). Outputs other than the result
 //!   are not in starquake's event stream; what `GetInfo` answers is checked against the same
 //!   reference in `starquake-kernel` (`svc/info/tests.rs`, `memory/layout.rs`).
@@ -122,6 +154,14 @@ mod trace {
         (SvcId::OutputDebugString, &["debug_str"]),
         (SvcId::ExitProcess, &[]),
     ];
+
+    /// The calls that map a placement, with the arguments holding its range's start and size:
+    /// the same list as `PLACEMENTS` in `tools/oracle/normalise.py`.
+    const PLACEMENTS: &[(SvcId, &str, &str)] = &[(SvcId::MapSharedMemory, "address", "size")];
+    /// The guard libnx keeps free on each side of a placement: `virtmemFindAslr(s->size,
+    /// 0x1000)` in `shmemMap` (`libnx/nx/source/kernel/shmem.c`), `PLACEMENT_GUARD` in
+    /// `normalise.py`. A placement's anchor is its range's start less this.
+    const PLACEMENT_GUARD: u64 = 0x1000;
 
     /// The name `normalise.py` gives the `n`th placement is this followed by `n`.
     const PLACEMENT: &str = "placement";
@@ -216,15 +256,53 @@ mod trace {
                 .ok_or_else(|| format!("address {address:#x} lies in no known region"))
         }
 
-        /// Whether libnx may place a shared memory at `address`: in the ASLR region, outside
-        /// the module (its last address included, as [`Anchors::symbol`] counts it), the alias
-        /// region and the heap region (see the module docs).
-        fn placeable(&self, address: u64) -> bool {
-            self.regions.code.holds(address, 1)
-                && !(self.main.start..=self.main.end).contains(&address)
-                && !self.regions.alias.holds(address, 1)
-                && !self.regions.heap.holds(address, 1)
+        /// Whether `address` is in the module, its last address included, as
+        /// [`Anchors::symbol`] counts it.
+        fn in_module(&self, address: u64) -> bool {
+            (self.main.start..=self.main.end).contains(&address)
         }
+
+        /// Whether a placement may be anchored at `anchor`, before its size is known: the
+        /// anchor in the ASLR region and outside the module, the page above it (its range's
+        /// first) outside the alias and the heap region (see the module docs).
+        fn anchorable(&self, anchor: u64) -> bool {
+            let Some(start) = anchor.checked_add(PLACEMENT_GUARD) else {
+                return false;
+            };
+            self.regions.code.holds(anchor, 1)
+                && !self.in_module(anchor)
+                && !self.regions.alias.holds(start, 1)
+                && !self.regions.heap.holds(start, 1)
+        }
+
+        /// Whether a placement may map `range`, with `others` the ranges the run's other
+        /// placements map: the range outside the alias and the heap region, and the range with
+        /// its guard pages in the ASLR region, outside the module and outside `others` (see the
+        /// module docs).
+        fn mappable(&self, range: Region, mut others: impl Iterator<Item = Region>) -> bool {
+            let (Some(start), Some(end)) = (
+                range.start.checked_sub(PLACEMENT_GUARD),
+                range.end.checked_add(PLACEMENT_GUARD),
+            ) else {
+                return false;
+            };
+            let guarded = Region { start, end };
+            range.start < range.end
+                && !overlaps(range, self.regions.alias)
+                && !overlaps(range, self.regions.heap)
+                && self
+                    .regions
+                    .code
+                    .holds(guarded.start, guarded.end - guarded.start)
+                && !(guarded.start <= self.main.end && self.main.start < guarded.end)
+                && others.all(|other| !overlaps(guarded, other))
+        }
+    }
+
+    /// Whether two ranges share an address: libnx's `_memregionOverlaps`
+    /// (`libnx/nx/source/kernel/virtmem.c`), `start < r->end && r->start < end`.
+    fn overlaps(a: Region, b: Region) -> bool {
+        a.start < b.end && b.start < a.end
     }
 
     /// A one-to-one pairing of the reference's names for things (handle values, placements)
@@ -264,6 +342,9 @@ mod trace {
         handles: Pairing,
         /// The reference's placements with the run's anchors for them.
         placements: Pairing,
+        /// The range each placement maps in the run, by the reference's name for it, from the
+        /// line that maps it.
+        mapped: BTreeMap<String, Region>,
     }
 
     impl Pairings {
@@ -286,12 +367,15 @@ mod trace {
         }
 
         /// The run's address `ours`, written as the reference would: in a placement it is
-        /// paired with (or is paired with now, if `expected` names a placement and `ours` lies
-        /// where a placement may), or else in the module or a region.
+        /// paired with (or is paired with now, if `expected` names a placement and its anchor
+        /// lies where one may), or else in the module or a region. `size` is set when `ours`
+        /// starts a range that a placement maps ([`PLACEMENTS`]): the placement is then
+        /// written only if that range lies where libnx may map it (see the module docs).
         fn address(
             &mut self,
             ours: u64,
             expected: Option<&str>,
+            size: Option<u64>,
             anchors: &Anchors,
         ) -> Result<String, String> {
             let symbol = anchors.symbol(ours)?;
@@ -302,17 +386,30 @@ mod trace {
             let Some(base) = ours.checked_sub(offset) else {
                 return Ok(symbol);
             };
-            let placeable = anchors.placeable(ours) && anchors.placeable(base);
-            match self.placements.ours_for(name) {
-                Some(paired) => Ok(match ours.checked_sub(paired) {
-                    Some(offset) => format!("{name}+{offset:#x}"),
-                    None => symbol,
-                }),
-                None if placeable && self.placements.pair(base, name) => {
-                    Ok(format!("{name}+{offset:#x}"))
+            let anchor = match self.placements.ours_for(name) {
+                Some(paired) => paired,
+                None if anchors.anchorable(base) && self.placements.pair(base, name) => base,
+                None => return Ok(symbol),
+            };
+            let Some(offset) = ours.checked_sub(anchor) else {
+                return Ok(symbol);
+            };
+            if let Some(size) = size {
+                let Some(end) = ours.checked_add(size) else {
+                    return Ok(symbol);
+                };
+                let range = Region { start: ours, end };
+                let others = self
+                    .mapped
+                    .iter()
+                    .filter(|(other, _)| other.as_str() != name)
+                    .map(|(_, other)| *other);
+                if !anchors.mappable(range, others) {
+                    return Ok(symbol);
                 }
-                None => Ok(symbol),
+                self.mapped.insert(name.to_owned(), range);
             }
+            Ok(format!("{name}+{offset:#x}"))
         }
     }
 
@@ -358,11 +455,24 @@ mod trace {
             .iter()
             .find(|(listed, _)| *listed == id)
             .ok_or_else(|| format!("no address rule for {}", id.name()))?;
+        // The value of the argument called `name`.
+        let value_of = |name: &str| {
+            convention
+                .inputs
+                .iter()
+                .find(|input| input.name == name)
+                .map(|input| args[usize::from(input.reg)])
+        };
         let mut arguments = Vec::new();
         for input in convention.inputs {
             let value = args[usize::from(input.reg)];
             let text = if addresses.contains(&input.name) {
-                pairings.address(value, argument(expected, input.name), anchors)?
+                // The size of the range a placement maps from here, if this call maps one.
+                let size = PLACEMENTS
+                    .iter()
+                    .find(|(listed, start, _)| *listed == id && *start == input.name)
+                    .and_then(|(_, _, size)| value_of(size));
+                pairings.address(value, argument(expected, input.name), size, anchors)?
             } else if input.kind == Kind::Handle {
                 pairings.handle(value, argument(expected, input.name))
             } else {
@@ -418,13 +528,17 @@ mod trace {
             .collect()
     }
 
-    /// A reference request line's parts: `ipc sm:::1 (GetService)` is `("sm:", "1",
-    /// "GetService")`.
-    fn request_parts(request: &str) -> (&str, &str, &str) {
-        let (target, name) = request.split_once(" (").expect("a named request");
-        let name = name.strip_suffix(')').expect("a closing parenthesis");
-        let (service, command) = target.rsplit_once("::").expect("service::command");
-        (service, command, name)
+    /// A reference request line's parts, without its `ipc `: `sm:::1 (GetService)` is
+    /// `("sm:", "1", "GetService")`. The error says the line is not written that way.
+    fn request_parts(request: &str) -> Result<(&str, &str, &str), String> {
+        let parts = request.split_once(" (").and_then(|(target, name)| {
+            let name = name.strip_suffix(')')?;
+            let (service, command) = target.rsplit_once("::")?;
+            Some((service, command, name))
+        });
+        parts.ok_or_else(|| {
+            format!("the request `{request}` is not written `<service>::<command> (<name>)`")
+        })
     }
 
     /// The reference's lines, without its comments and without each call's outputs, with every
@@ -447,12 +561,16 @@ mod trace {
                 };
                 out.push((text, None));
             } else if let Some(request) = line.strip_prefix("ipc ") {
-                let (service, command, name) = request_parts(request);
+                let (service, command, name) =
+                    request_parts(request).map_err(|error| format!("line {index}: {error}"))?;
                 let service = if service == CONTROL_INTERFACE {
+                    // A request after it that cannot be read is skipped here; it is an error
+                    // when this loop reaches its own line.
                     lines[index + 1..]
                         .iter()
                         .filter_map(|line| line.strip_prefix("ipc "))
-                        .map(|next| request_parts(next).0)
+                        .filter_map(|next| request_parts(next).ok())
+                        .map(|(next, _, _)| next)
                         .find(|next| *next != CONTROL_INTERFACE)
                         .ok_or_else(|| {
                             format!(
@@ -706,7 +824,7 @@ mod trace {
                 let name = rest.split_once('(').expect("an argument list").0;
                 (!implements_call(id)).then(|| (format!("svc {id:#04x} {name}"), result_of(line)))
             } else if let Some(request) = line.strip_prefix("ipc ") {
-                let (service, command, name) = request_parts(request);
+                let (service, command, name) = request_parts(request).expect("a request line");
                 let id: u32 = command.parse().expect("a command id");
                 let result = lines[position + 1..]
                     .iter()
@@ -1205,6 +1323,102 @@ mod trace {
             );
         }
 
+        /// A call with the arguments `named` in their registers, by the call's convention.
+        fn call_named(id: SvcId, named: &[(&str, u64)], result: u32) -> Line {
+            let inputs = id.convention().unwrap().inputs;
+            let registers: Vec<(usize, u64)> = named
+                .iter()
+                .map(|(name, value)| {
+                    let input = inputs.iter().find(|input| input.name == *name).unwrap();
+                    (usize::from(input.reg), *value)
+                })
+                .collect();
+            call(id, &registers, result)
+        }
+
+        #[test]
+        fn the_address_of_a_transfer_memory_and_of_a_handle_list_is_compared_by_anchor() {
+            // Made-up lines in the startup trace's form (its lines 171 and 193), which the
+            // startup run does not reach yet.
+            let fixture = Fixture {
+                nro: HELLO.nro,
+                reference: "svc 0x15 CreateTransferMemory(address=heap_region+0x1000, \
+                    size=0x800000, map_perm=0x0) -> 0x0 out_handle=0xf03e3\n\
+                    svc 0x18 WaitSynchronization(handles=stack_region+0x103da0, num_handles=0x1, \
+                    timeout_ns=0xffffffffffffffff) -> 0x0 out_index=0x0\n",
+            };
+            let regions = anchors().regions;
+            let lines = |transfer: u64, handles: u64| {
+                [
+                    call_named(
+                        SvcId::CreateTransferMemory,
+                        &[("address", transfer), ("size", 0x80_0000), ("map_perm", 0)],
+                        0,
+                    ),
+                    call_named(
+                        SvcId::WaitSynchronization,
+                        &[
+                            ("handles", handles),
+                            ("num_handles", 1),
+                            ("timeout_ns", u64::MAX),
+                        ],
+                        0,
+                    ),
+                ]
+            };
+            let transfer = regions.heap.start + 0x1000;
+            let handles = regions.stack.start + 0x10_3da0;
+            assert_eq!(
+                compare(&fixture, &lines(transfer, handles), &anchors()),
+                Ok(())
+            );
+            // Each at another address of its region.
+            assert_eq!(
+                compare(&fixture, &lines(transfer + 0x1000, handles), &anchors()),
+                Err(
+                    "line 0: expected `svc 0x15 CreateTransferMemory(address=heap_region+0x1000, \
+                     size=0x800000, map_perm=0x0) -> 0x0`, found `svc 0x15 \
+                     CreateTransferMemory(address=heap_region+0x2000, size=0x800000, \
+                     map_perm=0x0) -> 0x0`"
+                        .to_owned()
+                )
+            );
+            assert_eq!(
+                compare(&fixture, &lines(transfer, handles + 8), &anchors()),
+                Err("line 1: expected `svc 0x18 \
+                     WaitSynchronization(handles=stack_region+0x103da0, num_handles=0x1, \
+                     timeout_ns=0xffffffffffffffff) -> 0x0`, found `svc 0x18 \
+                     WaitSynchronization(handles=stack_region+0x103da8, num_handles=0x1, \
+                     timeout_ns=0xffffffffffffffff) -> 0x0`"
+                    .to_owned())
+            );
+        }
+
+        #[test]
+        fn a_reference_request_that_cannot_be_read_differs_at_that_line() {
+            // No parentheses, no closing one, and no `::` between the service and the command.
+            for request in [
+                "sm:::1 GetService",
+                "sm:::1 (GetService",
+                "sm: (GetService)",
+            ] {
+                let fixture = Fixture {
+                    nro: HELLO.nro,
+                    reference: format!("ipc sm:::0 (Initialize)\nipc {request}\n").leak(),
+                };
+                assert_eq!(
+                    progress(&fixture, &[ipc(SM, 0), ipc(SM, 1)], &anchors()),
+                    Progress {
+                        matched: 0,
+                        difference: Some(format!(
+                            "line 1: the request `{request}` is not written \
+                             `<service>::<command> (<name>)`"
+                        ))
+                    }
+                );
+            }
+        }
+
         #[test]
         fn three_kinds_of_event_are_lines_and_no_other_is() {
             let svc = EventKind::Svc {
@@ -1472,116 +1686,336 @@ mod trace {
             );
         }
 
-        #[test]
-        fn a_placement_is_not_paired_where_libnx_does_not_place_one() {
-            let (_, second) = free_pages();
-            // The probe and the map in the heap region, and in the module.
-            let heap = anchors().regions.heap.start;
-            let found = compare(&PLACED, &placed(heap, second), &anchors()).unwrap_err();
-            assert_eq!(
-                found,
-                "line 0: expected `svc 0x06 QueryMemory(out_memory_info=stack_region+0x0, \
-                 address=placement1+0x0) -> 0x0`, found `svc 0x06 \
-                 QueryMemory(out_memory_info=stack_region+0x0, address=heap_region+0x0) -> 0x0`"
-            );
-            let found = compare(&PLACED, &placed(BASE, second), &anchors()).unwrap_err();
-            assert!(found.ends_with("address=main+0x0) -> 0x0`"), "{found}");
-            // The second placement's map at `address`, against the made-up reference.
-            let (first, _) = free_pages();
-            let second_map_at = |address: u64| {
-                let mut lines = placed(first, second);
-                let Line::Svc { args, .. } = &mut lines[2] else {
-                    unreachable!()
-                };
-                args[1] = address;
-                compare(&PLACED, &lines, &anchors())
-            };
-            let refused = |found: &str| {
-                Err(format!(
-                    "line 2: expected `svc 0x13 MapSharedMemory(shmem_handle=0x903ef, \
-                     address=placement2+0x1000, size=0x1000, map_perm=0x1) -> 0x0`, found `svc \
-                     0x13 MapSharedMemory(shmem_handle=0x903ef, address={found}, \
-                     size=0x1000, map_perm=0x1) -> 0x0`"
-                ))
-            };
-            // At the alias region's first byte, whose page below (the placement's anchor) is in
-            // the stack region, where a placement may lie: the anchor would be placeable, the
-            // map is not.
-            let regions = anchors().regions;
-            assert!(
-                anchors()
-                    .symbol(regions.alias.start - PAGE_SIZE)
-                    .unwrap()
-                    .starts_with("stack_region+")
-            );
-            assert_eq!(
-                second_map_at(regions.alias.start),
-                refused("alias_region+0x0")
-            );
-            // At the heap region's end, the first byte past it: the map is in the ASLR region
-            // alone, its anchor is the heap's last page.
-            assert!(
-                anchors()
-                    .symbol(regions.heap.end)
-                    .unwrap()
-                    .starts_with(&format!("{ASLR_REGION}+"))
-            );
-            let offset = regions.heap.end - regions.code.start;
-            assert_eq!(
-                second_map_at(regions.heap.end),
-                refused(&format!("{ASLR_REGION}+{offset:#x}"))
-            );
-            // At the ASLR region's first byte: its anchor is the page below the region.
-            assert_eq!(
-                second_map_at(regions.code.start),
-                refused(&format!("{ASLR_REGION}+0x0"))
-            );
-            // The second placement's map just past the module, in the ASLR region, so that its
-            // anchor (a page lower) would be inside the module.
-            let (first, _) = free_pages();
-            let past = anchors().main.end + 1;
+        /// The made-up runs against [`PLACED`] with the second placement's map at `address`.
+        fn second_map_at(address: u64) -> Result<(), String> {
+            let (first, second) = free_pages();
             let mut lines = placed(first, second);
             let Line::Svc { args, .. } = &mut lines[2] else {
                 unreachable!()
             };
-            args[1] = past;
-            let offset = past - anchors().regions.code.start;
+            args[1] = address;
+            compare(&PLACED, &lines, &anchors())
+        }
+
+        /// The difference [`second_map_at`] reports when its map does not pair: the address
+        /// is written as `found`.
+        fn second_refused(found: &str) -> Result<(), String> {
+            Err(format!(
+                "line 2: expected `svc 0x13 MapSharedMemory(shmem_handle=0x903ef, \
+                 address=placement2+0x1000, size=0x1000, map_perm=0x1) -> 0x0`, found `svc \
+                 0x13 MapSharedMemory(shmem_handle=0x903ef, address={found}, size=0x1000, \
+                 map_perm=0x1) -> 0x0`"
+            ))
+        }
+
+        /// The difference the made-up runs report when the first placement's map, at `found`,
+        /// does not pair though its probe did.
+        fn first_map_refused(found: &str) -> Result<(), String> {
+            Err(format!(
+                "line 1: expected `svc 0x13 MapSharedMemory(shmem_handle=0x583f6, \
+                 address=placement1+0x1000, size=0x40000, map_perm=0x1) -> 0x0`, found `svc \
+                 0x13 MapSharedMemory(shmem_handle=0x583f6, address={found}, size=0x40000, \
+                 map_perm=0x1) -> 0x0`"
+            ))
+        }
+
+        /// The difference the made-up runs report when the first placement's probe, at
+        /// `found`, does not pair.
+        fn probe_refused(found: &str) -> Result<(), String> {
+            Err(format!(
+                "line 0: expected `svc 0x06 QueryMemory(out_memory_info=stack_region+0x0, \
+                 address=placement1+0x0) -> 0x0`, found `svc 0x06 \
+                 QueryMemory(out_memory_info=stack_region+0x0, address={found}) -> 0x0`"
+            ))
+        }
+
+        /// The size of the first placement's range in [`PLACED`] and [`placed`].
+        const FIRST_SIZE: u64 = 0x4_0000;
+
+        /// [`anchors`] with the heap region moved a gigabyte above its place. In the layout
+        /// the made-up runs use, the alias region ends where the heap region starts, so no
+        /// placement can lie just below the heap region; here free pages of the ASLR region do.
+        fn moved_heap() -> Anchors {
+            let mut moved = anchors();
+            let heap = moved.regions.heap;
+            let start = heap.end + 0x4000_0000;
+            moved.regions.heap = Region {
+                start,
+                end: start + heap.size(),
+            };
+            assert!(moved.regions.code.holds(start, heap.size()));
+            moved
+        }
+
+        #[test]
+        fn a_placement_is_not_paired_where_libnx_does_not_place_one() {
+            let anchors = anchors();
+            let regions = anchors.regions;
+            let (_, second) = free_pages();
+            // The probe, and so the range above it, in the heap region.
             assert_eq!(
-                compare(&PLACED, &lines, &anchors()),
+                compare(&PLACED, &placed(regions.heap.start, second), &anchors),
+                probe_refused("heap_region+0x0")
+            );
+            // The probe in the module, at its first page and at its last address, which libnx
+            // asks about (`__argdata__`); a page past that it pairs
+            // (`a_placement_may_lie_next_to_the_module_and_the_other_regions`).
+            assert_eq!(
+                compare(&PLACED, &placed(BASE, second), &anchors),
+                probe_refused("main+0x0")
+            );
+            let extent = anchors.main.end - anchors.main.start;
+            assert_eq!(
+                compare(&PLACED, &placed(anchors.main.end, second), &anchors),
+                probe_refused(&format!("main+{extent:#x}"))
+            );
+            // The probe on the stack region's last page, so that the range above it starts at
+            // the alias region's first byte: the probe alone would be placeable, the range is
+            // not.
+            let probe = regions.alias.start - PLACEMENT_GUARD;
+            assert!(regions.stack.holds(probe, PLACEMENT_GUARD));
+            assert_eq!(
+                compare(&PLACED, &placed(probe, second), &anchors),
+                probe_refused(&format!("stack_region+{:#x}", probe - regions.stack.start))
+            );
+            // The second placement's map (no probe names it first) at the alias region's
+            // first byte, whose anchor is in the stack region.
+            assert_eq!(
+                second_map_at(regions.alias.start),
+                second_refused("alias_region+0x0")
+            );
+            // At the ASLR region's first byte: its anchor is the page below the region, which
+            // the comparison refuses (a divergence the module docs list).
+            assert_eq!(
+                second_map_at(regions.code.start),
+                second_refused(&format!("{ASLR_REGION}+0x0"))
+            );
+            // A line that names a placement past its anchor first, without mapping it, at the
+            // ASLR region's first byte: its anchor would be the page below the region.
+            let unmapped = Fixture {
+                nro: HELLO.nro,
+                reference: "svc 0x06 QueryMemory(out_memory_info=stack_region+0x0, \
+                    address=placement1+0x1000) -> 0x0\n",
+            };
+            let query = call(
+                SvcId::QueryMemory,
+                &[(0, regions.stack.start), (2, regions.code.start)],
+                0,
+            );
+            assert_eq!(
+                compare(&unmapped, &[query], &anchors),
+                Err(format!(
+                    "line 0: expected `svc 0x06 QueryMemory(out_memory_info=stack_region+0x0, \
+                     address=placement1+0x1000) -> 0x0`, found `svc 0x06 \
+                     QueryMemory(out_memory_info=stack_region+0x0, address={ASLR_REGION}+0x0) \
+                     -> 0x0`"
+                ))
+            );
+            // Just past the module, so that its anchor (a page lower) is inside the module.
+            let past = anchors.main.end + 1;
+            assert_eq!(
+                second_map_at(past),
+                second_refused(&format!("{ASLR_REGION}+{:#x}", past - regions.code.start))
+            );
+        }
+
+        #[test]
+        fn a_placement_may_lie_next_to_the_module_and_the_other_regions() {
+            // libnx keeps a placement's range, not its guard pages, out of the alias and the
+            // heap region (`_memregionFindRandom`), and the kernel lets a shared memory be
+            // mapped in the stack region.
+            let anchors = anchors();
+            let regions = anchors.regions;
+            let (first, second) = free_pages();
+            let pairs = |first: u64, second: u64| {
+                assert_eq!(
+                    compare(&PLACED, &placed(first, second), &anchors),
+                    Ok(()),
+                    "{first:#x} {second:#x}"
+                );
+            };
+            // In the stack region: the probe at its first page, and one further in.
+            for probe in [regions.stack.start, regions.stack.start + 0x10_0000] {
+                assert!(regions.stack.holds(probe + PLACEMENT_GUARD, 1));
+                pairs(probe, second);
+            }
+            // The range ending exactly where the alias region starts: its upper guard page is
+            // the alias region's first.
+            pairs(regions.alias.start - FIRST_SIZE - PLACEMENT_GUARD, second);
+            assert_eq!(second_map_at(regions.alias.start - PAGE_SIZE), Ok(()));
+            // The range starting exactly at the heap region's end: its anchor is the heap
+            // region's last page. The alias region ends where the heap region starts here, so
+            // a range at the alias region's end lies in the heap region.
+            assert_eq!(regions.alias.end, regions.heap.start);
+            pairs(regions.heap.end - PLACEMENT_GUARD, second);
+            assert_eq!(second_map_at(regions.heap.end), Ok(()));
+            // The range ending exactly where the heap region starts, with the heap region moved
+            // (`moved_heap`) so that free pages of the ASLR region lie below it.
+            let moved = moved_heap();
+            let probe = moved.regions.heap.start - FIRST_SIZE - PLACEMENT_GUARD;
+            assert_eq!(compare(&PLACED, &placed(probe, second), &moved), Ok(()));
+            // The probe one page past the module's last address.
+            pairs(anchors.main.end + PAGE_SIZE, second);
+            // The second range's upper guard page just below the module, and its anchor just
+            // above the first placement's range (that range's upper guard page).
+            assert_eq!(
+                second_map_at(anchors.main.start - PAGE_SIZE - PLACEMENT_GUARD),
+                Ok(())
+            );
+            pairs(first, first + PLACEMENT_GUARD + FIRST_SIZE);
+            // The second range's upper guard page on the first range's anchor, and the range
+            // ending just below the ASLR region's end, with its upper guard page the region's
+            // last.
+            pairs(first, first - 2 * PLACEMENT_GUARD);
+            assert_eq!(
+                second_map_at(regions.code.end - PAGE_SIZE - PLACEMENT_GUARD),
+                Ok(())
+            );
+        }
+
+        #[test]
+        fn a_placement_range_must_lie_where_libnx_maps_one() {
+            let anchors = anchors();
+            let regions = anchors.regions;
+            let (_, second) = free_pages();
+            let symbol = |address: u64| anchors.symbol(address).unwrap();
+            // A probe that pairs, whose 0x40000-byte range reaches a page into the alias
+            // region, and one into the heap region, moved so that the pages below it are free.
+            let moved = moved_heap();
+            for (anchors, region) in [(anchors, regions.alias), (moved, moved.regions.heap)] {
+                let probe = region.start - FIRST_SIZE;
+                let map = probe + PLACEMENT_GUARD;
+                assert!(!overlaps(
+                    Region {
+                        start: probe,
+                        end: map
+                    },
+                    region
+                ));
+                assert_eq!(
+                    compare(&PLACED, &placed(probe, second), &anchors),
+                    first_map_refused(&anchors.symbol(map).unwrap())
+                );
+            }
+            // The second range with its upper guard page on the module's first page.
+            let map = anchors.main.start - PAGE_SIZE;
+            assert_eq!(second_map_at(map), second_refused(&symbol(map)));
+            // The second range ending at the ASLR region's end, so that its upper guard page
+            // lies above the region, outside the address space.
+            assert_eq!(regions.code.end, regions.address_space.end);
+            let map = regions.code.end - PAGE_SIZE;
+            assert_eq!(second_map_at(map), second_refused(&symbol(map)));
+        }
+
+        #[test]
+        fn two_placements_cannot_overlap() {
+            let (first, _) = free_pages();
+            let anchors = anchors();
+            let offset = |address: u64| address - anchors.regions.code.start;
+            // The second anchored inside the first's range, the second's map two pages in.
+            for second in [
+                first + 2 * PLACEMENT_GUARD,
+                first + FIRST_SIZE,
+                // Below the first, with the second's upper guard page the first range's first.
+                first - PLACEMENT_GUARD,
+            ] {
+                let map = second + PLACEMENT_GUARD;
+                assert_eq!(
+                    compare(&PLACED, &placed(first, second), &anchors),
+                    second_refused(&format!("{ASLR_REGION}+{:#x}", offset(map))),
+                    "{second:#x}"
+                );
+            }
+        }
+
+        /// A made-up reference that maps a placement, unmaps it, and maps another.
+        const REPLACED: Fixture = Fixture {
+            nro: HELLO.nro,
+            reference: "svc 0x13 MapSharedMemory(shmem_handle=0x583f6, address=placement1+0x1000, size=0x1000, map_perm=0x1) -> 0x0\n\
+                svc 0x14 UnmapSharedMemory(shmem_handle=0x583f6, address=placement1+0x1000, size=0x1000) -> 0x0\n\
+                svc 0x13 MapSharedMemory(shmem_handle=0x903ef, address=placement2+0x1000, size=0x1000, map_perm=0x1) -> 0x0\n",
+        };
+
+        #[test]
+        fn a_placement_may_be_mapped_again_where_it_was() {
+            // Its own earlier range does not count as taken.
+            let fixture = Fixture {
+                nro: HELLO.nro,
+                reference: "svc 0x13 MapSharedMemory(shmem_handle=0x583f6, \
+                    address=placement1+0x1000, size=0x1000, map_perm=0x1) -> 0x0\n\
+                    svc 0x14 UnmapSharedMemory(shmem_handle=0x583f6, \
+                    address=placement1+0x1000, size=0x1000) -> 0x0\n\
+                    svc 0x13 MapSharedMemory(shmem_handle=0x583f6, \
+                    address=placement1+0x1000, size=0x1000, map_perm=0x1) -> 0x0\n",
+            };
+            let (first, _) = free_pages();
+            let map = call(
+                SvcId::MapSharedMemory,
+                &[
+                    (0, 0x1_0001),
+                    (1, first + PLACEMENT_GUARD),
+                    (2, PAGE_SIZE),
+                    (3, 1),
+                ],
+                0,
+            );
+            let unmap = call(
+                SvcId::UnmapSharedMemory,
+                &[(0, 0x1_0001), (1, first + PLACEMENT_GUARD), (2, PAGE_SIZE)],
+                0,
+            );
+            assert_eq!(compare(&fixture, &[map, unmap, map], &anchors()), Ok(()));
+        }
+
+        #[test]
+        fn a_placement_over_an_unmapped_one_does_not_pair() {
+            // A divergence the module docs list: libnx could map the second placement where
+            // the first was, but the comparison keeps the first's range taken.
+            let (first, second) = free_pages();
+            let replaced = |second: u64| {
+                let map = |handle, at: u64| {
+                    call(
+                        SvcId::MapSharedMemory,
+                        &[
+                            (0, handle),
+                            (1, at + PLACEMENT_GUARD),
+                            (2, PAGE_SIZE),
+                            (3, 1),
+                        ],
+                        0,
+                    )
+                };
+                let unmap = call(
+                    SvcId::UnmapSharedMemory,
+                    &[(0, 0x1_0001), (1, first + PLACEMENT_GUARD), (2, PAGE_SIZE)],
+                    0,
+                );
+                compare(
+                    &REPLACED,
+                    &[map(0x1_0001, first), unmap, map(0x1_0002, second)],
+                    &anchors(),
+                )
+            };
+            assert_eq!(replaced(second), Ok(()));
+            let offset = first + PLACEMENT_GUARD - anchors().regions.code.start;
+            assert_eq!(
+                replaced(first + PLACEMENT_GUARD),
                 Err(format!(
                     "line 2: expected `svc 0x13 MapSharedMemory(shmem_handle=0x903ef, \
                      address=placement2+0x1000, size=0x1000, map_perm=0x1) -> 0x0`, found `svc \
-                     0x13 MapSharedMemory(shmem_handle=0x903ef, address=aslr_region+{offset:#x}, \
-                     size=0x1000, map_perm=0x1) -> 0x0`"
+                     0x13 MapSharedMemory(shmem_handle=0x903ef, \
+                     address={ASLR_REGION}+{:#x}, size=0x1000, map_perm=0x1) -> 0x0`",
+                    offset + PLACEMENT_GUARD
                 ))
             );
         }
 
         #[test]
-        fn a_placement_may_lie_in_the_stack_region_and_next_to_the_heap() {
-            // libnx keeps a placement out of the alias and the heap region only
-            // (`_memregionFindRandom`), and the kernel lets a shared memory be mapped in the
-            // stack region: so a placement whose probe is the stack region's first page, one
-            // further in, and one whose probe is the first page past the heap region, pair.
+        fn the_aslr_region_ends_where_the_address_space_does() {
+            // What the module docs rely on to refuse a guard page above the ASLR region.
             let regions = anchors().regions;
-            let (_, second) = free_pages();
-            for first in [regions.stack.start, regions.stack.start + 0x10_0000] {
-                assert!(
-                    anchors()
-                        .symbol(first + PAGE_SIZE)
-                        .unwrap()
-                        .starts_with("stack_region+")
-                );
-                assert_eq!(
-                    compare(&PLACED, &placed(first, second), &anchors()),
-                    Ok(()),
-                    "{first:#x}"
-                );
-            }
-            assert_eq!(
-                compare(&PLACED, &placed(regions.heap.end, second), &anchors()),
-                Ok(())
-            );
+            assert_eq!(regions.code.end, regions.address_space.end);
+            assert!(regions.address_space.start < regions.code.start);
         }
 
         #[test]

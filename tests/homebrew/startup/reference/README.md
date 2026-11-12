@@ -8,7 +8,9 @@ emulator's run can be compared with it. The format is the hello fixture's
 - `placement<n>+<offset>`: an address in a range libnx placed at a random page of the ASLR
   region (the shared memories of `hid` and `time:u`). Placements are numbered in the order the
   trace maps them, and anchored at the page libnx probes with `QueryMemory` before mapping, a
-  guard page below the range (`tools/oracle/normalise.py` cites the libnx source).
+  guard page below the range (`tools/oracle/normalise.py` cites the libnx source). The script
+  refuses a trace with a placement where libnx would not map one; its module docs give libnx's
+  conditions and the two cases where it is stricter, which these traces do not reach.
 - `out=random`: `GetInfo`'s answer for the random entropy (info type `0xb`), which differs from
   run to run.
 
