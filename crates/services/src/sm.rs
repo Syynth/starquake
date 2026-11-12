@@ -50,6 +50,7 @@
 //! | `GetService` for a name nothing is registered under, strict policy | `GetServiceImpl` marks the request deferred and it is re-run whenever a service is registered (`ServerManager::OnDeferralEvent`); the caller waits until one is | reply [`NOT_REGISTERED`], the result Eden's `GetServicePort` returns for it (`an_unknown_name_is_an_error_under_strict`) |
 //! | The same, auto-stub policy | as above | the name is logged and recorded ([`Registry::unknown_names`]) and the caller gets a session on a [`Stub`], which has no commands, so every command sent to it is auto-stubbed (`an_unknown_name_gets_a_stub_under_auto_stub`). This is the service spec's rule, after Eden-NX2's auto-stub |
 //! | TIPC `GetService` that fails | `GetServiceTipc` replies the result and one moved handle slot holding zero | the reply holds the result only, like every failed reply of the framework. libnx reads no handle from a failed reply (`libnx/nx/include/switch/sf/tipc.h`, `tipcParseResponse`: `if (R_FAILED(rc)) return rc`) (`a_failed_tipc_get_service_carries_no_handle`) |
+//! | A request that carries a buffer descriptor | `Initialize` and `GetService` read no buffer, and the descriptor is ignored | the framework refuses it before the command runs, as the console does: `INVALID_CMIF_REQUEST`, over TIPC too, where the console answers `tipc::ResultInvalidMessageFormat` (`framework::buffers`) (`a_tipc_request_with_a_buffer_is_refused`) |
 //! | The caller's handle table is full | the session is created, then `PushMoveObjects` fails to add its handle | no session is created ([`Kernel::connect`](crate::framework::Kernel::connect) is all or nothing); the reply is the kernel's "out of handles" (`a_full_handle_table_gets_no_session`) |
 //!
 //! Access control from the NPDM (which names a title may open) is not checked or logged yet:
@@ -220,7 +221,7 @@ pub enum RegistryLayoutError {
 /// The service manager's map from names to providers. See the [module docs](self).
 ///
 /// It is saved in a snapshot, so it derives `serde`. Deserialising goes through
-/// [`RegistryData`], which checks the one bound [`Registry`]'s own operations keep,
+/// `RegistryData`, which checks the one bound [`Registry`]'s own operations keep,
 /// [`MAX_UNKNOWN_NAMES`]; each name is checked as a [`ServiceName`] is.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "RegistryData")]
@@ -302,14 +303,26 @@ pub struct Sm {
     initialized: bool,
 }
 
+/// The ids of [`Sm`]'s commands. Eden's CMIF and TIPC tables (`SM::SM`) give each the same id,
+/// so one constant serves both blocks.
+pub mod command {
+    /// `Initialize` (`SM::SM`: `{0, &SM::Initialize, "Initialize"}`).
+    pub const INITIALIZE: u32 = 0;
+    /// `GetService` (`SM::SM`: `{1, &SM::GetServiceCmif, "GetService"}` and
+    /// `{1, &SM::GetServiceTipc, "GetService"}`).
+    pub const GET_SERVICE: u32 = 1;
+}
+
+// Neither command takes a buffer: Eden's `SM::Initialize` and `GetServiceImpl` read none, and
+// libnx's `smInitialize` and `smGetServiceOriginal` send none (`libnx/nx/source/services/sm.c`).
 commands! {
     impl Sm {
-        0 => initialize,
-        1 => get_service,
-        tipc {
-            0 => initialize,
-            1 => get_service,
-        }
+        command::INITIALIZE => initialize,
+        command::GET_SERVICE => get_service,
+    }
+    tipc {
+        command::INITIALIZE => initialize,
+        command::GET_SERVICE => get_service,
     }
 }
 

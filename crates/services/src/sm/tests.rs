@@ -19,10 +19,21 @@ use crate::set;
 const SM: ServiceId = ServiceId(1);
 const SET_SYS: ServiceId = ServiceId(2);
 
-/// `sm:` command ids (`eden/src/core/hle/service/sm/sm.cpp`, `SM::SM`).
-const INITIALIZE: u16 = 0;
-const GET_SERVICE: u16 = 1;
-const REGISTER_SERVICE: u16 = 2;
+use super::command::{GET_SERVICE, INITIALIZE};
+
+/// An `sm:` command this port leaves out (`eden/src/core/hle/service/sm/sm.cpp`, `SM::SM`:
+/// `{2, &SM::RegisterServiceCmif, "RegisterService"}`), so it has no shipping constant.
+const REGISTER_SERVICE: u32 = 2;
+
+/// A command id as a TIPC message's type field carries it (16 bits).
+fn tipc_id(id: u32) -> u16 {
+    u16::try_from(id).unwrap()
+}
+
+/// A TIPC request for command `id`.
+fn tipc_request(id: u32) -> RequestBuilder {
+    RequestBuilder::tipc(tipc_id(id))
+}
 
 /// What fills a message buffer before a request is built into it.
 const STALE: u8 = 0xA5;
@@ -72,8 +83,12 @@ fn cmif_result(result: ResultCode) -> Vec<u8> {
 }
 
 /// A TIPC reply to command `id` that holds only a result.
-fn tipc_result(id: u16, result: ResultCode) -> Vec<u8> {
-    buffer_of(&[u32::from(TIPC_COMMAND_OFFSET + id), 1, result.raw()])
+fn tipc_result(id: u32, result: ResultCode) -> Vec<u8> {
+    buffer_of(&[
+        u32::from(TIPC_COMMAND_OFFSET + tipc_id(id)),
+        1,
+        result.raw(),
+    ])
 }
 
 /// The header words of a reply that moves one handle: the command header with the special
@@ -107,8 +122,8 @@ fn moved_handle(buffer: &[u8]) -> Handle {
 }
 
 /// A CMIF request laid out byte for byte as libnx lays it out (`cmifMakeRequest`).
-fn libnx_request(command: u16) -> RequestBuilder {
-    RequestBuilder::cmif(CommandType::Request, u32::from(command)).layout(RequestLayout::Libnx)
+fn libnx_request(command: u32) -> RequestBuilder {
+    RequestBuilder::cmif(CommandType::Request, command).layout(RequestLayout::Libnx)
 }
 
 /// `Initialize` as libnx sends it over CMIF (`_smCmifCmdInPid`): the process id in the header
@@ -139,7 +154,7 @@ fn firmware_version(host: &mut FakeHost, set_sys: Handle) -> Vec<u8> {
         address: AT,
         size: u16::try_from(set::FIRMWARE_VERSION_SIZE).unwrap(),
     };
-    let ask = libnx_request(4).receive_descriptor(room);
+    let ask = libnx_request(set::command::GET_FIRMWARE_VERSION2).receive_descriptor(room);
     assert_eq!(send(host, set_sys, &ask), cmif_result(ResultCode::SUCCESS));
     host.kernel
         .memory(AT, set::FIRMWARE_VERSION_SIZE)
@@ -189,16 +204,16 @@ fn get_service_hands_out_a_session_on_the_named_service() {
 fn the_tipc_forms_do_the_same() {
     let (mut host, sm) = host(UnknownPolicy::Strict);
     // `_smTipcCmdInPid`: the process id in the header, no payload.
-    let init = RequestBuilder::tipc(INITIALIZE).send_pid(0);
+    let init = tipc_request(INITIALIZE).send_pid(0);
     assert_eq!(
         send(&mut host, sm, &init),
         tipc_result(INITIALIZE, ResultCode::SUCCESS)
     );
-    let ask = RequestBuilder::tipc(GET_SERVICE).data(&name(set::SYS_NAME).to_field());
+    let ask = tipc_request(GET_SERVICE).data(&name(set::SYS_NAME).to_field());
     let reply = send(&mut host, sm, &ask);
     let handle = moved_handle(&reply);
     // The reply echoes the request's type; its raw data is the result word alone.
-    let reply_type = CommandType::Tipc(GET_SERVICE);
+    let reply_type = CommandType::Tipc(tipc_id(GET_SERVICE));
     let [w0, w1, special] = moved_handle_header(reply_type, 1);
     let expected = [w0, w1, special, handle.raw(), ResultCode::SUCCESS.raw()];
     assert_eq!(reply, buffer_of(&expected));
@@ -208,15 +223,51 @@ fn the_tipc_forms_do_the_same() {
     );
 }
 
+/// Neither command declares a buffer, so a request that carries one is refused before the
+/// command runs, over either protocol (`framework::buffers`). Over TIPC the console answers
+/// `tipc::ResultInvalidMessageFormat` instead (Atmosphère `tipc_impl_command_serialization.hpp`,
+/// `ValidateCommandFormat`; fact only), a listed divergence.
+#[test]
+fn a_tipc_request_with_a_buffer_is_refused() {
+    use starquake_ipc::{BufferDescriptor, StaticDescriptor};
+    let (mut host, sm) = host(UnknownPolicy::Strict);
+    initialize(&mut host, sm);
+    let field = name(set::SYS_NAME).to_field();
+    let stray = BufferDescriptor {
+        address: 0x7000,
+        size: 8,
+        flags: 0,
+    };
+    let tipc = tipc_request(GET_SERVICE).data(&field).send_buffer(stray);
+    assert_eq!(
+        send(&mut host, sm, &tipc),
+        tipc_result(GET_SERVICE, INVALID_CMIF_REQUEST)
+    );
+    let pointer = StaticDescriptor {
+        counter: 0,
+        address: 0x7000,
+        size: 8,
+    };
+    let cmif = cmif_get_service(field).static_descriptor(pointer);
+    assert_eq!(
+        send(&mut host, sm, &cmif),
+        cmif_result(INVALID_CMIF_REQUEST)
+    );
+    // Neither reached `GetService`: no session was opened. The same request without the buffer
+    // gets one.
+    assert_eq!(host.server(SET_SYS).unwrap().session_count(), 0);
+    moved_handle(&send(&mut host, sm, &cmif_get_service(field)));
+}
+
 #[test]
 fn initialize_over_either_protocol_initialises_the_session_for_both() {
     for tipc_first in [false, true] {
         let (mut host, sm) = host(UnknownPolicy::Strict);
         let field = name(set::SYS_NAME).to_field();
         let cmif = cmif_get_service(field);
-        let tipc = RequestBuilder::tipc(GET_SERVICE).data(&field);
+        let tipc = tipc_request(GET_SERVICE).data(&field);
         if tipc_first {
-            send(&mut host, sm, &RequestBuilder::tipc(INITIALIZE).send_pid(0));
+            send(&mut host, sm, &tipc_request(INITIALIZE).send_pid(0));
         } else {
             initialize(&mut host, sm);
         }
@@ -231,7 +282,7 @@ fn get_service_before_initialize_is_an_invalid_client() {
     let ask = cmif_get_service(name(set::SYS_NAME).to_field());
     assert_eq!(send(&mut host, sm, &ask), cmif_result(INVALID_CLIENT));
     // Checked before the name is read: a request with no name fails the same way.
-    let nameless = RequestBuilder::tipc(GET_SERVICE);
+    let nameless = tipc_request(GET_SERVICE);
     assert_eq!(
         send(&mut host, sm, &nameless),
         tipc_result(GET_SERVICE, INVALID_CLIENT)
@@ -287,7 +338,7 @@ fn a_name_is_its_printable_bytes_wherever_they_are() {
     }
     // A name field that is cut short is a malformed request. (A TIPC payload is whole words,
     // so the longest payload that is too short is one word less than the field.)
-    let cut = RequestBuilder::tipc(GET_SERVICE).data(&[b'a'; MAX_NAME_LEN - size_of::<u32>()]);
+    let cut = tipc_request(GET_SERVICE).data(&[b'a'; MAX_NAME_LEN - size_of::<u32>()]);
     assert_eq!(
         send(&mut host, sm, &cut),
         tipc_result(GET_SERVICE, INVALID_CMIF_REQUEST)
@@ -387,8 +438,8 @@ fn an_unknown_name_gets_a_stub_under_auto_stub() {
 #[test]
 fn a_failed_tipc_get_service_carries_no_handle() {
     let (mut host, sm) = host(UnknownPolicy::Strict);
-    send(&mut host, sm, &RequestBuilder::tipc(INITIALIZE).send_pid(0));
-    let ask = RequestBuilder::tipc(GET_SERVICE).data(&name("nope").to_field());
+    send(&mut host, sm, &tipc_request(INITIALIZE).send_pid(0));
+    let ask = tipc_request(GET_SERVICE).data(&name("nope").to_field());
     let reply = send(&mut host, sm, &ask);
     assert_eq!(reply, tipc_result(GET_SERVICE, NOT_REGISTERED));
     let message = Message::parse_reply(&reply, SessionKind::Session).unwrap();
@@ -413,7 +464,7 @@ fn a_full_handle_table_gets_no_session() {
 
 #[test]
 fn commands_that_are_left_out_go_to_the_unknown_command_policy() {
-    let register = RequestBuilder::cmif(CommandType::Request, u32::from(REGISTER_SERVICE));
+    let register = RequestBuilder::cmif(CommandType::Request, REGISTER_SERVICE);
     let (mut host, sm) = host(UnknownPolicy::Strict);
     assert_eq!(
         send(&mut host, sm, &register),
@@ -428,7 +479,7 @@ fn commands_that_are_left_out_go_to_the_unknown_command_policy() {
     assert_eq!(stubbed.len(), 1);
     assert_eq!(
         (stubbed[0].interface, stubbed[0].id),
-        ("Sm", u32::from(REGISTER_SERVICE))
+        ("Sm", REGISTER_SERVICE)
     );
 }
 

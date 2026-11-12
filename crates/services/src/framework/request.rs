@@ -2,27 +2,31 @@
 //!
 //! # Buffers by index
 //!
-//! A command numbers its "in" buffers and its "out" buffers from zero. Which descriptor an index
-//! means is Eden's rule (`eden/src/core/hle/service/hle_ipc.cpp`):
+//! A command numbers its "in" buffers and its "out" buffers from zero, in the order its row in
+//! [`commands!`](crate::commands) declares them. Which descriptor an index means follows from
+//! the declared kind ([`buffers`](super::buffers)): a map-alias buffer is an A (in) or B (out)
+//! descriptor, a pointer buffer an X (in) or C (out) descriptor, each list numbered on its own,
+//! and an auto-select buffer is Eden's rule (`eden/src/core/hle/service/hle_ipc.cpp`):
 //!
-//! - **In** (`ReadBuffer`, `GetReadBufferSize`): the A descriptor with that index if there is one
-//!   and its size is not zero; otherwise the X descriptor with that index.
-//! - **Out** (`WriteBuffer`, `GetWriteBufferSize`): the B descriptor with that index if there is
-//!   one and its size is not zero; otherwise the C descriptor with that index.
+//! - **In** (`ReadBuffer`, `GetReadBufferSize`): its A descriptor if that descriptor's size is
+//!   not zero; otherwise its X descriptor.
+//! - **Out** (`WriteBuffer`, `GetWriteBufferSize`): its B descriptor if that descriptor's size is
+//!   not zero; otherwise its C descriptor.
+//!
+//! The server checks the request's descriptors against the declaration before the method runs,
+//! so a declared buffer is always there. A method that asks for an index its row does not declare
+//! gets [`Fault::UndeclaredBuffer`].
 //!
 //! X descriptors are taken in the order they appear, not by their counter field, as in Eden.
 //!
-//! Divergences from Eden, each pinned by a test in `framework/tests/buffers.rs`:
-//!
-//! - Where there is no X (or C) descriptor with that index to fall back on, Eden logs a failed
-//!   assertion and carries on with an empty read, or writes nothing. Here the two ways of
-//!   getting there are told apart. A zero-sized A (or B) descriptor with nothing behind it is an
-//!   empty buffer and nothing is logged: a command may be sent nothing to read, or no room to
-//!   write. No descriptor of either kind at that index is [`Fault::NoBuffer`], and the command
-//!   fails.
-//! - Eden's `WriteBuffer` cuts a write down to the buffer's size and carries on (marked "This
-//!   needs to be HW tested" there). Here a write past the end is [`Fault::BufferOverrun`] and
-//!   writes nothing; a method that means to fill what fits says so with [`OutBuffer::len`].
+//! Where a declared buffer's descriptor is missing, Eden logs a failed assertion and carries on
+//! with an empty read, or writes nothing; here the request never reaches the method (see
+//! [`buffers`](super::buffers) for that and the other differences in which descriptor is read).
+//! One more divergence from Eden, pinned by `a_write_past_the_end_of_an_out_buffer_writes_nothing`
+//! in `framework/tests/buffers.rs`: Eden's `WriteBuffer` cuts a write down to the buffer's size
+//! and carries on (marked "This needs to be HW tested" there). Here a write past the end is
+//! [`Fault::BufferOverrun`] and writes nothing; a method that means to fill what fits says so
+//! with [`OutBuffer::len`].
 //!
 //! # Buffers written later
 //!
@@ -42,6 +46,7 @@ use starquake_kernel::handle::Handle;
 use starquake_kernel::id::ObjectId;
 use starquake_kernel::result::{KernelError, SvcResult};
 
+use super::buffers::{BufferKind, DeclaredBuffer, locate};
 use super::commands::{Protocol, Session};
 use super::context::Context;
 use super::kernel::Kernel;
@@ -59,6 +64,8 @@ pub struct Request<'a> {
     move_handles: Vec<SvcResult<ObjectId>>,
     message: &'a Message<'a>,
     in_objects: Vec<Option<TargetId>>,
+    /// The buffers the command's row declares.
+    buffers: &'static [DeclaredBuffer],
 }
 
 /// An address range in the caller's memory and a cursor inside it.
@@ -213,9 +220,9 @@ impl DeferredBuffer {
     }
 }
 
-/// Eden's choice between two descriptor lists: the first if it has a non-empty entry, otherwise
-/// the second; and, where Eden logs a failed assertion because there is no second, the first's
-/// empty entry.
+/// Eden's choice for an auto-select buffer between its map-alias and its pointer descriptor: the
+/// first if it is not empty, otherwise the second; and, where Eden logs a failed assertion
+/// because there is no second (which the server's check rules out), the first's empty entry.
 fn pick(first: Option<(u64, u64)>, second: Option<(u64, u64)>) -> Option<(u64, u64)> {
     match first {
         Some((_, size)) if size != 0 => first,
@@ -231,6 +238,7 @@ impl<'a> Request<'a> {
         payload: &'a [u8],
         message: &'a Message<'a>,
         in_objects: Vec<Option<TargetId>>,
+        buffers: &'static [DeclaredBuffer],
     ) -> Self {
         let resolve = |handles: &[u32]| {
             let resolved = handles.iter().map(|raw| Handle::from_raw(*raw));
@@ -247,6 +255,7 @@ impl<'a> Request<'a> {
             move_handles: resolve(&message.move_handles),
             message,
             in_objects,
+            buffers,
         }
     }
 
@@ -299,22 +308,32 @@ impl<'a> Request<'a> {
     }
 
     fn span(&self, direction: Direction, index: usize) -> Result<Span, Fault> {
+        let place = locate(self.buffers, direction, index);
+        let place = place.ok_or(Fault::UndeclaredBuffer { direction, index })?;
         let message = self.message;
-        let (first, second) = match direction {
+        let (map_alias, pointer) = match direction {
             Direction::In => (
-                message.send_buffers.get(index).map(|d| (d.address, d.size)),
-                (message.static_descriptors.get(index)).map(|d| (d.address, u64::from(d.size))),
+                (message.send_buffers.get(place.map_alias)).map(|d| (d.address, d.size)),
+                (message.static_descriptors.get(place.pointer))
+                    .map(|d| (d.address, u64::from(d.size))),
             ),
             Direction::Out => (
-                (message.receive_buffers.get(index)).map(|d| (d.address, d.size)),
-                (message.receive_descriptors.get(index)).map(|d| (d.address, u64::from(d.size))),
+                (message.receive_buffers.get(place.map_alias)).map(|d| (d.address, d.size)),
+                (message.receive_descriptors.get(place.pointer))
+                    .map(|d| (d.address, u64::from(d.size))),
             ),
         };
-        let range = pick(first, second).ok_or(Fault::NoBuffer { direction, index })?;
+        let range = match place.kind {
+            BufferKind::MapAlias => map_alias,
+            BufferKind::Pointer => pointer,
+            BufferKind::AutoSelect => pick(map_alias, pointer),
+        };
+        let range = range.ok_or(Fault::NoBuffer { direction, index })?;
         Ok(Span::new(range))
     }
 
-    /// The `index`th in buffer (an A or X descriptor; see the [module docs](self)).
+    /// The `index`th in buffer (an A or X descriptor, as declared; see the
+    /// [module docs](self)).
     pub fn in_buffer<'c>(
         &self,
         cx: &'c mut Context<'_>,
@@ -327,7 +346,8 @@ impl<'a> Request<'a> {
         })
     }
 
-    /// The `index`th out buffer (a B or C descriptor; see the [module docs](self)).
+    /// The `index`th out buffer (a B or C descriptor, as declared; see the
+    /// [module docs](self)).
     pub fn out_buffer<'c>(
         &self,
         cx: &'c mut Context<'_>,
@@ -399,6 +419,20 @@ mod tests {
         impl Other {}
     }
 
+    /// One buffer each way, which the request in `each_accessor_names_exactly_what_the_request_lacks`
+    /// does not carry: the server's check would refuse it, so only a request made here reaches
+    /// the accessors without them.
+    const DECLARED: &[DeclaredBuffer] = &[
+        DeclaredBuffer {
+            direction: Direction::In,
+            kind: BufferKind::MapAlias,
+        },
+        DeclaredBuffer {
+            direction: Direction::Out,
+            kind: BufferKind::Pointer,
+        },
+    ];
+
     #[test]
     fn each_accessor_names_exactly_what_the_request_lacks() {
         let mut kernel = FakeKernel::new(0).unwrap();
@@ -414,7 +448,15 @@ mod tests {
         built.unwrap();
         let message = Message::parse_request(&buffer, SessionKind::Session).unwrap();
         let in_objects = vec![Some(probe), None, Some(other), Some(busy)];
-        let request = Request::new(&kernel, Protocol::Cmif, 9, &[], &message, in_objects);
+        let request = Request::new(
+            &kernel,
+            Protocol::Cmif,
+            9,
+            &[],
+            &message,
+            in_objects,
+            DECLARED,
+        );
         let mailbox = Arc::new(Mailbox::new(None));
         let mut next_token = 0;
         let mut cx = Context {
@@ -448,6 +490,19 @@ mod tests {
         assert_eq!(in_buffer, Err(no_buffer(Direction::In)));
         let out_buffer = request.out_buffer(&mut cx, 0).map(|b| b.len());
         assert_eq!(out_buffer, Err(no_buffer(Direction::Out)));
+        let deferred = request.deferred_out_buffer(0).map(|b| b.len());
+        assert_eq!(deferred, Err(no_buffer(Direction::Out)));
+        // Index 1 is declared in neither direction.
+        let undeclared = |direction| Fault::UndeclaredBuffer {
+            direction,
+            index: 1,
+        };
+        let in_buffer = request.in_buffer(&mut cx, 1).map(|b| b.len());
+        assert_eq!(in_buffer, Err(undeclared(Direction::In)));
+        let out_buffer = request.out_buffer(&mut cx, 1).map(|b| b.len());
+        assert_eq!(out_buffer, Err(undeclared(Direction::Out)));
+        let deferred = request.deferred_out_buffer(1).map(|b| b.len());
+        assert_eq!(deferred, Err(undeclared(Direction::Out)));
 
         let mut number = |index| request.in_object::<Probe>(&mut cx, index).map(|p| p.0);
         assert_eq!(number(0), Ok(7));

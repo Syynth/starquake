@@ -2333,8 +2333,24 @@ fn copy_usages() {
     let r = region(1, 0, (0, 0, 0), (2, 2, 1));
     let buf = |desc| Resolved::Buffer { desc, slice: &s };
     let tex = |desc| Resolved::Texture { desc, region: &r };
-    assert_eq!(validate_copy(buf(&readable), buf(&readable)), Ok(()));
-    assert_eq!(validate_copy(tex(&copyable), tex(&copyable)), Ok(()));
+    // Other resources of the same shape, so the accepted copies do not overlap.
+    let s2 = BufferSlice {
+        buffer: BufferId::new(2, 0),
+        ..s
+    };
+    let r2 = region(2, 0, (0, 0, 0), (2, 2, 1));
+    let (buf2, tex2) = (
+        Resolved::Buffer {
+            desc: &readable,
+            slice: &s2,
+        },
+        Resolved::Texture {
+            desc: &copyable,
+            region: &r2,
+        },
+    );
+    assert_eq!(validate_copy(buf(&readable), buf2), Ok(()));
+    assert_eq!(validate_copy(tex(&copyable), tex2), Ok(()));
     for (src, dst, resource, usage) in [
         (
             buf(&unreadable),
@@ -2558,18 +2574,23 @@ fn texture_copies_need_matching_blocks_and_extents() {
         validate_copy(res(&a, &r), res(&a, &deeper)),
         Err(RenderError::Invalid("a texture copy needs equal extents"))
     );
-    assert_eq!(validate_copy(res(&a, &deeper), res(&a, &deeper)), Ok(()));
+    let deeper_elsewhere = region(3, 0, (0, 0, 0), (4, 4, 2));
+    assert_eq!(
+        validate_copy(res(&a, &deeper), res(&a, &deeper_elsewhere)),
+        Ok(())
+    );
     // Same block width and bits per block, different block height.
     let astc_8x8 = copy_texture(PixelFormat::Astc2d8x8Unorm, usage);
     let astc_8x5 = copy_texture(PixelFormat::Astc2d8x5Unorm, usage);
     let whole = region(1, 0, (0, 0, 0), (16, 16, 1));
+    let whole_elsewhere = region(2, 0, (0, 0, 0), (16, 16, 1));
     assert_eq!(astc_8x8.format.block_width(), astc_8x5.format.block_width());
     assert_eq!(
         astc_8x8.format.bits_per_block(),
         astc_8x5.format.bits_per_block()
     );
     assert_eq!(
-        validate_copy(res(&astc_8x5, &whole), res(&astc_8x5, &whole)),
+        validate_copy(res(&astc_8x5, &whole), res(&astc_8x5, &whole_elsewhere)),
         Ok(())
     );
     assert_eq!(
@@ -2584,15 +2605,17 @@ fn texture_copies_need_matching_blocks_and_extents() {
 fn texture_copies_need_matching_aspects_and_samples() {
     let usage = TextureUsage::COPY_SRC | TextureUsage::COPY_DST;
     let r = region(1, 0, (0, 0, 0), (4, 4, 1));
+    // The same box in another texture: the accepted copies must not overlap.
+    let r2 = region(2, 0, (0, 0, 0), (4, 4, 1));
     let res = |desc, region| Resolved::Texture { desc, region };
     let depth = copy_texture(PixelFormat::D32Float, usage);
     let colour = copy_texture(PixelFormat::R32Float, usage);
     let other_depth = copy_texture(PixelFormat::X8D24Unorm, usage);
     let colour_uint = copy_texture(PixelFormat::R32Uint, usage);
     // Each pair has the same block size, so only the aspect or the format differs.
-    assert_eq!(validate_copy(res(&depth, &r), res(&depth, &r)), Ok(()));
+    assert_eq!(validate_copy(res(&depth, &r), res(&depth, &r2)), Ok(()));
     assert_eq!(
-        validate_copy(res(&colour, &r), res(&colour_uint, &r)),
+        validate_copy(res(&colour, &r), res(&colour_uint, &r2)),
         Ok(()),
         "colour formats of one block size may differ"
     );
@@ -2617,8 +2640,8 @@ fn texture_copies_need_matching_aspects_and_samples() {
         sample_count: 4,
         ..single
     };
-    assert_eq!(validate_copy(res(&multi, &r), res(&multi, &r)), Ok(()));
-    assert_eq!(validate_copy(res(&single, &r), res(&single, &r)), Ok(()));
+    assert_eq!(validate_copy(res(&multi, &r), res(&multi, &r2)), Ok(()));
+    assert_eq!(validate_copy(res(&single, &r), res(&single, &r2)), Ok(()));
     for (src, dst) in [(&multi, &single), (&single, &multi)] {
         assert_eq!(
             validate_copy(res(src, &r), res(dst, &r)),
@@ -2627,6 +2650,166 @@ fn texture_copies_need_matching_aspects_and_samples() {
             ))
         );
     }
+}
+
+#[test]
+fn buffer_copies_must_not_overlap_in_one_buffer() {
+    let b = buffer(64);
+    let at = |id: u32, offset: u64, size: u64| BufferSlice {
+        buffer: BufferId::new(id, 0),
+        offset,
+        size,
+    };
+    let bufs = |s: &BufferSlice, d: &BufferSlice| {
+        validate_copy(
+            Resolved::Buffer { desc: &b, slice: s },
+            Resolved::Buffer { desc: &b, slice: d },
+        )
+    };
+    let overlap = || {
+        Err(RenderError::Invalid(
+            "a copy's source and destination overlap",
+        ))
+    };
+    // Buffer ranges: touching at the end on either side runs, one byte more overlaps.
+    assert_eq!(bufs(&at(1, 0, 8), &at(1, 8, 8)), Ok(()));
+    assert_eq!(bufs(&at(1, 8, 8), &at(1, 0, 8)), Ok(()));
+    assert_eq!(bufs(&at(1, 0, 9), &at(1, 8, 9)), overlap());
+    assert_eq!(bufs(&at(1, 8, 9), &at(1, 0, 9)), overlap());
+    assert_eq!(bufs(&at(1, 0, 8), &at(2, 0, 8)), Ok(()), "other buffer");
+    assert_eq!(
+        bufs(
+            &at(1, 0, 8),
+            &BufferSlice {
+                buffer: BufferId::new(1, 1),
+                ..at(1, 0, 8)
+            }
+        ),
+        Ok(()),
+        "other generation"
+    );
+    // Order: the sides' sizes before the overlap.
+    assert_eq!(
+        bufs(&at(1, 0, 8), &at(1, 4, 9)),
+        Err(RenderError::SizeMismatch {
+            what: "copy destination buffer range",
+            expected: 8,
+            actual: 9
+        })
+    );
+}
+
+#[test]
+fn texture_copies_must_not_overlap_in_one_level() {
+    let overlap = || {
+        Err(RenderError::Invalid(
+            "a copy's source and destination overlap",
+        ))
+    };
+    // Touching on each axis runs; one texel more overlaps; another mip, texture or layer runs.
+    let t = TextureDesc {
+        mip_levels: 2,
+        ..copy_texture(
+            PixelFormat::R8Uint,
+            TextureUsage::COPY_SRC | TextureUsage::COPY_DST,
+        )
+    };
+    let texs = |s: &TextureRegion, d: &TextureRegion| {
+        validate_copy(
+            Resolved::Texture {
+                desc: &t,
+                region: s,
+            },
+            Resolved::Texture {
+                desc: &t,
+                region: d,
+            },
+        )
+    };
+    let base = region(1, 0, (2, 2, 0), (2, 2, 1));
+    for (other, expected, what) in [
+        (region(1, 0, (4, 2, 0), (2, 2, 1)), Ok(()), "touching in x"),
+        (
+            region(1, 0, (0, 2, 0), (2, 2, 1)),
+            Ok(()),
+            "touching in x, before",
+        ),
+        (region(1, 0, (2, 4, 0), (2, 2, 1)), Ok(()), "touching in y"),
+        (
+            region(1, 0, (2, 0, 0), (2, 2, 1)),
+            Ok(()),
+            "touching in y, before",
+        ),
+        (region(1, 0, (2, 2, 1), (2, 2, 1)), Ok(()), "next layer"),
+        (region(1, 1, (2, 2, 0), (2, 2, 1)), Ok(()), "other mip"),
+        (region(2, 0, (2, 2, 0), (2, 2, 1)), Ok(()), "other texture"),
+        (region(1, 0, (3, 3, 0), (2, 2, 1)), overlap(), "one texel"),
+        (
+            region(1, 0, (1, 1, 0), (2, 2, 1)),
+            overlap(),
+            "one texel, before",
+        ),
+    ] {
+        assert_eq!(texs(&base, &other), expected, "{what}");
+        assert_eq!(texs(&other, &base), expected, "{what}, swapped");
+    }
+    // Two layers from layer 0 reach layer 1 (the texture has two).
+    assert_eq!(
+        texs(
+            &region(1, 0, (2, 2, 0), (2, 2, 2)),
+            &region(1, 0, (3, 3, 1), (2, 2, 1))
+        ),
+        Err(RenderError::Invalid("a texture copy needs equal extents")),
+        "extents are checked before the overlap"
+    );
+    assert_eq!(
+        texs(
+            &region(1, 0, (2, 2, 0), (2, 2, 2)),
+            &region(1, 0, (3, 3, 0), (2, 2, 2))
+        ),
+        overlap(),
+        "both layers"
+    );
+    assert_eq!(
+        texs(
+            &region(1, 0, (0, 0, 0), (2, 2, 2)),
+            &region(1, 0, (2, 2, 0), (2, 2, 2))
+        ),
+        Ok(()),
+        "apart in x and y"
+    );
+    // A buffer and a texture never overlap, even with equal id numbers.
+    let tex_side = region(1, 0, (0, 0, 0), (2, 2, 1));
+    let b = buffer(64);
+    let s = BufferSlice {
+        buffer: BufferId::new(1, 0),
+        offset: 0,
+        size: 4,
+    };
+    assert_eq!(
+        validate_copy(
+            Resolved::Buffer {
+                desc: &b,
+                slice: &s
+            },
+            Resolved::Texture {
+                desc: &t,
+                region: &tex_side
+            }
+        ),
+        Ok(())
+    );
+}
+
+#[test]
+fn spans_overlap_at_the_edges() {
+    assert!(!spans_overlap(0, 4, 4, 4));
+    assert!(!spans_overlap(4, 4, 0, 4));
+    assert!(spans_overlap(0, 5, 4, 4));
+    assert!(spans_overlap(4, 4, 0, 5));
+    // Ends saturate instead of wrapping.
+    assert!(spans_overlap(u64::MAX - 1, u64::MAX, u64::MAX - 1, 1));
+    assert!(!spans_overlap(0, 1, u64::MAX, u64::MAX));
 }
 
 #[test]
