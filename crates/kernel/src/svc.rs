@@ -14,7 +14,7 @@
 //! | `CreateThread` (0x08) | [`thread::create_thread`] | the handle table, the address space and the scheduler, all exclusive, the process facts, guest memory and the calling core |
 //! | `StartThread` (0x09) | [`thread::start_thread`] | the handle table, shared, the scheduler, exclusive, and the calling core |
 //! | `ExitThread` (0x0a) | [`thread::exit_thread`] | the handle table and the scheduler, both exclusive, and the calling core |
-//! | `SleepThread` (0x0b) | [`thread::sleep_thread`] | the scheduler, exclusive, and the calling core |
+//! | `SleepThread` (0x0b) | [`thread::sleep_thread`] | the scheduler, exclusive, and the caller as a waiter (core, clock reading, registers) |
 //! | `GetThreadPriority` (0x0c) | [`thread::get_thread_priority`] | the scheduler and the handle table, both shared |
 //! | `SetThreadPriority` (0x0d) | [`thread::set_thread_priority`] | the handle table, shared, the scheduler, exclusive, the process facts and the calling core |
 //! | `GetThreadCoreMask` (0x0e) | [`thread::get_thread_core_mask`] | the scheduler and the handle table, both shared, and the calling core |

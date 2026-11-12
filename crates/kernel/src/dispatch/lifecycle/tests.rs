@@ -3,7 +3,9 @@
 
 use starquake_cpu::GuestRegs;
 use starquake_memory::{FlatMemory, PAGE_SIZE};
-use starquake_trace::{FixedClock, GuestTicks, LiveEnv, Recorder, ThreadId as EventThread};
+use starquake_trace::{
+    EventKind, FixedClock, GuestTicks, LiveEnv, Recorder, ThreadId as EventThread,
+};
 
 use super::*;
 use crate::dispatch::{Caller, Record};
@@ -209,7 +211,7 @@ fn exit_thread_ends_the_thread_or_with_the_last_one_the_process() {
 #[test]
 fn sleep_thread_writes_no_register() {
     let world = World::new();
-    for ns in [0_i64, -1, -2, -3, 1] {
+    for ns in [0_i64, -1, -2, -3] {
         let mut regs = regs();
         regs.x[0] = ns.cast_unsigned();
         let before = regs.clone();
@@ -217,6 +219,43 @@ fn sleep_thread_writes_no_register() {
         assert_eq!(record.outcome, Outcome::Completed, "{ns}");
         assert_eq!(regs, before, "{ns}");
     }
+}
+
+#[test]
+fn a_positive_sleep_waits_and_its_event_is_recorded_when_its_timer_ends_it() {
+    let sink = std::sync::Arc::new(starquake_trace::VecSink::new());
+    let world = World::new();
+    world.recorder.add_sink(std::sync::Arc::clone(&sink));
+    let mut regs = regs();
+    regs.x[0] = 5;
+    let before = regs.clone();
+    let record = world.call(0, SvcId::SleepThread, &mut regs);
+    assert_eq!(record.outcome, Outcome::Waiting);
+    assert_eq!(regs, before, "a sleep writes no register");
+    assert!(sink.events().is_empty(), "nothing is recorded yet");
+    world.with_tables(|_, scheduler| {
+        let main = scheduler.thread(world.main.thread).unwrap();
+        assert_eq!(main.state(), ThreadState::Waiting);
+        assert_eq!(main.context(), &before);
+    });
+    // The clock steps 1,000 ns a reading, far past the 5 ns sleep: the next firing ends it.
+    world.dispatcher.fire_timers(&world.env, &world.recorder).unwrap();
+    let events: Vec<_> = sink.events().into_iter().map(|event| event.kind).collect();
+    let mut args = [0; starquake_trace::SVC_ARG_COUNT];
+    args[0] = 5;
+    assert_eq!(
+        events,
+        vec![EventKind::Svc {
+            id: u32::from(SvcId::SleepThread.number()),
+            args,
+            result: starquake_trace::ResultCode(0),
+        }]
+    );
+    world.with_tables(|_, scheduler| {
+        let main = scheduler.thread(world.main.thread).unwrap();
+        assert_eq!(main.state(), ThreadState::Runnable);
+        assert_eq!(main.context(), &before);
+    });
 }
 
 #[test]

@@ -130,8 +130,8 @@ pub struct WaitCall<'a> {
     pub origin: WaitOrigin,
 }
 
-/// What a blocked thread waits on (kernel spec, "Waiting and waking"). Sleep and reply waits
-/// are added by the slices that build them.
+/// What a blocked thread waits on (kernel spec, "Waiting and waking"). The reply wait of an IPC
+/// request is the IPC table's (`crate::ipc`), not a record here: a request ends it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Wait {
     /// A `WaitSynchronization`: any of `objects` being signalled ends it.
@@ -188,6 +188,18 @@ pub enum Wait {
         /// Who to record the call's event for when it ends.
         origin: WaitOrigin,
     },
+    /// A `SleepThread` with a positive time (`KThread::Sleep`): only its timer ends it, and the
+    /// call returns nothing (`svcSleepThread` is void, and Eden notes that Nintendo does not
+    /// check the sleep's result), so its event records success.
+    Sleep {
+        /// This wait's token.
+        token: WaitToken,
+        /// When it ends: `None` for a time so long that the deadline does not fit, which Eden
+        /// turns into `i64::MAX`, a deadline no clock reaches.
+        deadline: Option<HostNanos>,
+        /// Who to record the call's event for when it ends.
+        origin: WaitOrigin,
+    },
 }
 
 impl Wait {
@@ -198,7 +210,8 @@ impl Wait {
             Self::Sync { token, .. }
             | Self::Address { token, .. }
             | Self::CondVar { token, .. }
-            | Self::Lock { token, .. } => *token,
+            | Self::Lock { token, .. }
+            | Self::Sleep { token, .. } => *token,
         }
     }
 
@@ -208,7 +221,8 @@ impl Wait {
         match self {
             Self::Sync { deadline, .. }
             | Self::Address { deadline, .. }
-            | Self::CondVar { deadline, .. } => *deadline,
+            | Self::CondVar { deadline, .. }
+            | Self::Sleep { deadline, .. } => *deadline,
             Self::Lock { .. } => None,
         }
     }
@@ -220,7 +234,8 @@ impl Wait {
             Self::Sync { origin, .. }
             | Self::Address { origin, .. }
             | Self::CondVar { origin, .. }
-            | Self::Lock { origin, .. } => *origin,
+            | Self::Lock { origin, .. }
+            | Self::Sleep { origin, .. } => *origin,
         }
     }
 
@@ -233,6 +248,7 @@ impl Wait {
             Self::Address { .. } => SvcId::WaitForAddress,
             Self::CondVar { .. } => SvcId::WaitProcessWideKeyAtomic,
             Self::Lock { .. } => SvcId::ArbitrateLock,
+            Self::Sleep { .. } => SvcId::SleepThread,
         }
     }
 
@@ -241,7 +257,7 @@ impl Wait {
         match self {
             Self::Sync { objects, .. } => objects,
             Self::Lock { owner, .. } => std::slice::from_ref(owner),
-            Self::Address { .. } | Self::CondVar { .. } => &[],
+            Self::Address { .. } | Self::CondVar { .. } | Self::Sleep { .. } => &[],
         }
     }
 
@@ -251,7 +267,7 @@ impl Wait {
         match self {
             Self::Address { key, .. } => Some((Tree::Arbiter, *key)),
             Self::CondVar { key, .. } => Some((Tree::CondVar, *key)),
-            Self::Sync { .. } | Self::Lock { .. } => None,
+            Self::Sync { .. } | Self::Lock { .. } | Self::Sleep { .. } => None,
         }
     }
 }
@@ -738,6 +754,10 @@ impl Scheduler {
         let convention = call.convention().ok_or_else(|| {
             SvcError::Internal(format!("{} has no register convention", call.name()))
         })?;
+        if convention.outputs.is_empty() {
+            // `SleepThread` returns nothing: its saved registers stay as they were.
+            return Ok(());
+        }
         let result = u64::from(result.raw());
         let with_index = [result, u64::from(index.cast_unsigned())];
         let outputs: &[u64] = if call == SvcId::WaitSynchronization {
@@ -837,17 +857,34 @@ impl Scheduler {
     }
 
     /// Expires a timer entry (`KThread::OnTimer`): if its thread is still in the wait the
-    /// entry was made for, the wait ends with [`KernelError::TimedOut`] (and index -1), and the
-    /// result is `true`. A late entry (the wait already ended, or the thread is in a later
-    /// wait) is ignored: `false`.
+    /// entry was made for, the wait ends with [`KernelError::TimedOut`] (and index -1), or for
+    /// a sleep with success (see [`Wait::Sleep`]), and the result is `true`. A late entry (the
+    /// wait already ended, or the thread is in a later wait) is ignored: `false`.
     pub fn expire(&mut self, entry: TimerEntry) -> CallResult<bool> {
-        match self.sync_table().waits.get(&entry.thread) {
-            Some(wait) if wait.token() == entry.token => {
-                self.end_wait(entry.thread, KernelError::TimedOut.code(), NO_INDEX)?;
-                Ok(true)
-            }
-            _ => Ok(false),
-        }
+        let result = match self.sync_table().waits.get(&entry.thread) {
+            Some(Wait::Sleep { token, .. }) if *token == entry.token => ResultCode::SUCCESS,
+            Some(wait) if wait.token() == entry.token => KernelError::TimedOut.code(),
+            _ => return Ok(false),
+        };
+        self.end_wait(entry.thread, result, NO_INDEX)?;
+        Ok(true)
+    }
+
+    /// `KThread::Sleep` for the thread `core` runs, which makes the call with `regs` and is
+    /// recorded as `origin`: the thread waits until `timeout` ([`Wait::Sleep`]). A
+    /// [`Timeout::Poll`], which no positive time converts to, does not wait (`None`); a
+    /// [`Timeout::Never`] waits with no timer, as Eden's `i64::MAX` deadline does.
+    pub fn sleep(&mut self, call: WaitCall<'_>, timeout: Timeout) -> CallResult<Option<ThreadId>> {
+        let Ok(deadline) = timeout.deadline() else {
+            return Ok(None);
+        };
+        let thread = self.calling_thread(call.core)?;
+        self.block(thread, call.regs, Some(call.core), |token| Wait::Sleep {
+            token,
+            deadline,
+            origin: call.origin,
+        })?;
+        Ok(Some(thread))
     }
 
     /// Takes and expires every entry due at `now` ([`Scheduler::take_due_timers`], then

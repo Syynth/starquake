@@ -1,7 +1,8 @@
 //! The thread lifecycle calls, driven against a process whose main thread runs on core 0.
 
+use starquake_cpu::GuestRegs;
 use starquake_memory::{FlatMemory, PAGE_SIZE};
-use starquake_trace::GuestTicks;
+use starquake_trace::{GuestTicks, HostNanos};
 
 use super::*;
 use crate::dispatch::Tables;
@@ -11,7 +12,9 @@ use crate::process::{
     THREAD_LOCAL_REGION_SIZE,
 };
 use crate::sched::{CoreSignals, FIRST_THREAD_ID, ThreadState};
+use crate::svc::SvcId;
 use crate::svc::handle::close_handle;
+use crate::sync::{TIMEOUT_SLACK_NS, WaitOrigin};
 
 struct NoSignals;
 
@@ -597,7 +600,9 @@ fn sleep_thread_yields_by_its_three_negative_values() {
         let second = world.thread(handle);
         world.start(handle).unwrap();
         world.schedule(core(0), Some(world.main.thread));
-        sleep_thread(world.scheduler(), core(0), ns).unwrap();
+        let regs = GuestRegs::default();
+        let slept = sleep_thread(world.scheduler(), waiter(&regs, 0), ns).unwrap();
+        assert_eq!(slept, Arbitrated::Done, "{ns}");
         world
             .scheduler()
             .update(GuestTicks(1), None, &mut NoSignals)
@@ -615,17 +620,111 @@ fn sleep_thread_yields_by_its_three_negative_values() {
     }
 }
 
-#[test]
-fn a_positive_sleep_returns_at_once_and_changes_nothing() {
-    for ns in [1, i64::MAX] {
-        let mut world = World::homebrew();
-        let handle = world.create(args(0)).unwrap();
-        world.start(handle).unwrap();
-        world.schedule(core(0), Some(world.main.thread));
-        let before = world.tables.scheduler.clone();
-        sleep_thread(world.scheduler(), core(0), ns).unwrap();
-        assert_eq!(world.tables.scheduler, before, "{ns}");
+/// What a call on core 0 at host time `now` with `regs` is, as a sleep sees it.
+fn waiter(regs: &GuestRegs, now: u64) -> Waiter<'_> {
+    Waiter {
+        core: core(0),
+        now: HostNanos(now),
+        regs,
+        origin: WaitOrigin {
+            thread: starquake_trace::ThreadId(FIRST_THREAD_ID),
+            core: 0,
+            args: [7, 0, 0, 0, 0, 0, 0, 0],
+        },
     }
+}
+
+#[test]
+fn a_positive_sleep_waits_until_its_deadline_with_edens_slack() {
+    const NOW: u64 = 500;
+    for ns in [1_i64, 1_000] {
+        let mut world = World::homebrew();
+        let mut regs = GuestRegs::default();
+        regs.x[0] = ns.cast_unsigned();
+        regs.x[5] = 0x55;
+        let slept = sleep_thread(world.scheduler(), waiter(&regs, NOW), ns).unwrap();
+        assert_eq!(slept, Arbitrated::Waiting(world.main.thread), "{ns}");
+        let scheduler = &world.tables.scheduler;
+        let thread = scheduler.thread(world.main.thread).unwrap();
+        assert_eq!(thread.state(), ThreadState::Waiting);
+        // The registers of the call are its context, which a switch loads.
+        assert_eq!(thread.context(), &regs);
+        let deadline = NOW + ns.cast_unsigned() + TIMEOUT_SLACK_NS;
+        let timers: Vec<_> = scheduler.sync().timers().collect();
+        assert_eq!(timers.len(), 1);
+        assert_eq!(timers[0].deadline, HostNanos(deadline));
+        assert_eq!(timers[0].thread, world.main.thread);
+    }
+}
+
+#[test]
+fn a_sleep_too_long_for_a_deadline_waits_with_no_timer() {
+    let mut world = World::homebrew();
+    let regs = GuestRegs::default();
+    let slept = sleep_thread(world.scheduler(), waiter(&regs, 1), i64::MAX).unwrap();
+    assert_eq!(slept, Arbitrated::Waiting(world.main.thread));
+    assert_eq!(world.tables.scheduler.sync().timers().count(), 0);
+    assert_eq!(
+        world
+            .tables
+            .scheduler
+            .thread(world.main.thread)
+            .unwrap()
+            .state(),
+        ThreadState::Waiting
+    );
+}
+
+#[test]
+fn a_sleep_ends_once_at_its_deadline_with_success_and_its_registers_as_they_were() {
+    const NOW: u64 = 100;
+    const NS: i64 = 50;
+    let deadline = NOW + NS.cast_unsigned() + TIMEOUT_SLACK_NS;
+    let mut world = World::homebrew();
+    let mut regs = GuestRegs::default();
+    regs.x[0] = NS.cast_unsigned();
+    regs.x[1] = 0x1111;
+    sleep_thread(world.scheduler(), waiter(&regs, NOW), NS).unwrap();
+    let main = world.main.thread;
+    // One nanosecond early: nothing ends.
+    assert_eq!(
+        world.scheduler().fire_timers(HostNanos(deadline - 1)),
+        Ok(0)
+    );
+    assert_eq!(
+        world.tables.scheduler.thread(main).unwrap().state(),
+        ThreadState::Waiting
+    );
+    let entry = world.tables.scheduler.sync().timers().next().unwrap();
+    // At the deadline the sleep ends, with success, and writes no register.
+    assert_eq!(world.scheduler().fire_timers(HostNanos(deadline)), Ok(1));
+    let thread = world.tables.scheduler.thread(main).unwrap();
+    assert_eq!(thread.state(), ThreadState::Runnable);
+    assert_eq!(thread.context(), &regs);
+    let wakes = world.scheduler().take_wakes();
+    assert_eq!(wakes.len(), 1);
+    assert_eq!(wakes[0].call, SvcId::SleepThread);
+    assert_eq!(wakes[0].result, crate::result::ResultCode::SUCCESS);
+    // The same entry a second time is late: ignored.
+    assert_eq!(world.scheduler().expire(entry), Ok(false));
+    assert_eq!(world.scheduler().fire_timers(HostNanos(u64::MAX)), Ok(0));
+}
+
+#[test]
+fn a_thread_that_ends_while_it_sleeps_leaves_the_timer_queue() {
+    let mut world = World::homebrew();
+    let handle = world.create(args(0)).unwrap();
+    let second = world.thread(handle);
+    world.start(handle).unwrap();
+    let regs = GuestRegs::default();
+    sleep_thread(world.scheduler(), waiter(&regs, 0), 10).unwrap();
+    world.schedule(core(0), Some(second));
+    world.exit(core(0)).unwrap();
+    // The main thread still sleeps; ending the second left its timer alone.
+    assert_eq!(world.tables.scheduler.sync().timers().count(), 1);
+    let main = world.main.thread;
+    world.scheduler().terminate_thread(main).unwrap();
+    assert_eq!(world.tables.scheduler.sync().timers().count(), 0);
 }
 
 #[test]

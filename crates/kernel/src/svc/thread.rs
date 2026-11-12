@@ -23,9 +23,6 @@
 //!
 //! Each is pinned by the named test in `svc/thread/lifecycle_tests.rs`.
 //!
-//! - **`SleepThread` with a positive time does not sleep.** Waiting needs a timer, which
-//!   kernel slice 10 brings; until then the call returns at once and changes nothing. Test:
-//!   `a_positive_sleep_returns_at_once_and_changes_nothing`.
 //! - **`SetThreadCoreMask` does not wait.** When the thread runs on a core its new mask leaves
 //!   out, Eden releases the scheduler lock and retries until that core lets it go (or, for a
 //!   pinned thread, waits on it). Here the change is made and the call returns; the core finds
@@ -54,6 +51,8 @@ use crate::sched::{
     UserThread,
 };
 use crate::svc::process::terminate_process;
+use crate::svc::sync::Waiter;
+use crate::sync::{Arbitrated, Timeout, WaitCall};
 use crate::tables::{Processes, Scheduler};
 
 /// `Svc::YieldType::WithoutCoreMigration` (`eden/src/core/hle/kernel/svc_types.h`).
@@ -233,22 +232,38 @@ pub fn exit_thread(
     Ok(exit)
 }
 
-/// `SleepThread`: `ns` of [`YIELD_WITHOUT_CORE_MIGRATION`], [`YIELD_WITH_CORE_MIGRATION`] and
-/// [`YIELD_TO_ANY_THREAD`] are the scheduler's three yields for the thread `core` runs; any
-/// other value below zero does nothing, as in Eden; a positive time does not sleep (a listed
-/// divergence).
-pub fn sleep_thread(scheduler: &mut Scheduler, core: CoreId, ns: i64) -> CallResult<()> {
+/// `SleepThread` for the thread `waiter` names: `ns` of [`YIELD_WITHOUT_CORE_MIGRATION`],
+/// [`YIELD_WITH_CORE_MIGRATION`] and [`YIELD_TO_ANY_THREAD`] are the scheduler's three yields;
+/// any other value below zero does nothing, as in Eden; a positive time sleeps
+/// ([`Scheduler::sleep`]) until `waiter.now + ns +`
+/// [`TIMEOUT_SLACK_NS`](crate::sync::TIMEOUT_SLACK_NS), Eden's
+/// `GetTick() + offset_tick + 2` (`eden/src/core/hle/kernel/svc/svc_thread.cpp` @ cf654052,
+/// `SleepThread`), converted as [`Timeout::from_nanos`] converts it. Returns whether the thread
+/// waits.
+pub fn sleep_thread(
+    scheduler: &mut Scheduler,
+    waiter: Waiter<'_>,
+    ns: i64,
+) -> CallResult<Arbitrated> {
+    let core = waiter.core;
     match ns {
         YIELD_WITHOUT_CORE_MIGRATION => scheduler.yield_without_core_migration(core)?,
         YIELD_WITH_CORE_MIGRATION => scheduler.yield_with_core_migration(core)?,
         YIELD_TO_ANY_THREAD => scheduler.yield_to_any_thread(core)?,
         1.. => {
-            // WAIT SEAM (kernel slice 10, timers): a sleep for `ns` nanoseconds.
-            tracing::debug!(ns, "SleepThread does not sleep yet");
+            let call = WaitCall {
+                core,
+                regs: waiter.regs,
+                origin: waiter.origin,
+            };
+            let timeout = Timeout::from_nanos(waiter.now, ns);
+            if let Some(thread) = scheduler.sleep(call, timeout)? {
+                return Ok(Arbitrated::Waiting(thread));
+            }
         }
         _ => {}
     }
-    Ok(())
+    Ok(Arbitrated::Done)
 }
 
 /// `SetThreadPriority`. Checks, in Eden's order: the priority
