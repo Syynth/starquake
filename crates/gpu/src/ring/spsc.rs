@@ -49,8 +49,8 @@ pub const PUBLISH_EVERY: u64 = 256;
 /// before yielding).
 pub const SPINS_BEFORE_SLEEP: u32 = 4096;
 
-/// The longest one sleep of the consumer lasts before it looks again (it is woken sooner by a
-/// publish; this only bounds a sleep against a lost wake-up).
+/// The longest one sleep of either side lasts before it looks again (it is woken sooner by a
+/// publish or a pop; this only bounds a sleep against a lost wake-up).
 const LONGEST_SLEEP: Duration = Duration::from_millis(100);
 
 /// A capacity the ring cannot have.
@@ -292,7 +292,7 @@ impl Producer {
             if !self.fits(needed) && !shared.consumer_gone.load(Ordering::SeqCst) {
                 let _guard = shared
                     .space
-                    .wait(guard)
+                    .wait_timeout(guard, LONGEST_SLEEP)
                     .unwrap_or_else(PoisonError::into_inner);
             }
             shared.producer_waiting.store(false, Ordering::SeqCst);

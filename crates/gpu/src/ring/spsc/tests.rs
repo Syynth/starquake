@@ -292,19 +292,23 @@ fn a_corrupt_entry_stops_the_ring_for_good() {
 }
 
 #[test]
-fn an_entry_longer_than_what_was_published_is_corrupt() {
+fn an_entry_longer_than_what_was_published_is_corrupt_for_good() {
     let (mut producer, mut consumer) = ring(64).unwrap();
-    // A run header promising two words of data, published alone.
-    producer.push_raw(&[(4 << 32) | 0x45_03]);
+    // A run header promising two data words (three ring words), published alone.
+    producer.push_raw(&[(2 << 32) | 0x45_03]);
     producer.publish();
-    assert_eq!(
-        consumer.try_pop(),
-        Err(PopError::Corrupt(DecodeError::Truncated {
-            kind: Kind::Run,
-            needed: 4,
-            available: 1,
-        }))
-    );
+    let corrupt = PopError::Corrupt(DecodeError::Truncated {
+        kind: Kind::Run,
+        needed: 3,
+        available: 1,
+    });
+    assert_eq!(consumer.try_pop(), Err(corrupt));
+    // With more words published the header would now decode, as a run of whatever follows;
+    // the error stays.
+    producer.try_push(&write(1, 0)).unwrap();
+    producer.try_push(&write(1, 1)).unwrap();
+    producer.publish();
+    assert_eq!(consumer.try_pop(), Err(corrupt));
 }
 
 #[test]
