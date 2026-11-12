@@ -1091,6 +1091,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "starquake-layout"
+version = "0.0.0"
+dependencies = [
+ "proptest",
+ "thiserror",
+]
+
+[[package]]
 name = "starquake-loader"
 version = "0.0.0"
 dependencies = [
