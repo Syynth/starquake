@@ -1,0 +1,32 @@
+diff --git a/src/yuzu_cmd/emu_window/emu_window_sdl3.cpp b/src/yuzu_cmd/emu_window/emu_window_sdl3.cpp
+index 174f8b5..9d3cc38 100644
+--- a/src/yuzu_cmd/emu_window/emu_window_sdl3.cpp
++++ b/src/yuzu_cmd/emu_window/emu_window_sdl3.cpp
+@@ -24,6 +24,8 @@
+ #include "input_common/drivers/mouse.h"
+ #include "input_common/drivers/touch_screen.h"
+ #include "input_common/main.h"
++#include <memory>
++#include <string>
+ #include "yuzu_cmd/emu_window/emu_window_sdl3.h"
+ #include "yuzu_cmd/yuzu_icon.h"
+ 
+@@ -38,7 +40,17 @@ EmuWindow_SDL3::EmuWindow_SDL3(InputCommon::InputSubsystem* input_subsystem_, Co
+         auto* this_ = (EmuWindow_SDL3*)userdata;
+         auto const results = this_->system.GetAndResetPerfStats();
+         auto const title = fmt::format("{} | {}-{} | FPS: {:.0f} ({:.0f}%)", Common::g_build_fullname, Common::g_scm_branch, Common::g_scm_desc, results.average_game_fps, results.emulation_speed * 100.0f);
+-        SDL_SetWindowTitle(this_->render_window, title.c_str());
++        // starquake oracle patch: AppKit aborts (NSInternalInconsistencyException) when a window
++        // title is set off the main thread, and SDL timers run on their own thread. Hand the
++        // update to the main thread instead.
++        struct TitleUpdate { SDL_Window* window; std::string title; };
++        auto* update = new TitleUpdate{this_->render_window, title};
++        if (!SDL_RunOnMainThread([](void* data) {
++                std::unique_ptr<TitleUpdate> u{static_cast<TitleUpdate*>(data)};
++                SDL_SetWindowTitle(u->window, u->title.c_str());
++            }, update, false)) {
++            delete update;
++        }
+         return 2000;
+     }, this);
+     mouse_timer = SDL_AddTimer(100, [](void *userdata, SDL_TimerID, Uint32) -> Uint32 {
