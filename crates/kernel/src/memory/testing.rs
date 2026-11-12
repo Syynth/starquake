@@ -125,9 +125,13 @@ impl MapperLog {
 
 /// Shared memory pages of `size` bytes in host memory of their own, with no address space
 /// behind them: what a fake kernel that has no [`Mapper`] hands a service. `None` unless `size`
-/// is whole pages and not zero. The pages are allocated at once, so a test asks for few.
+/// is whole pages, not zero, and at most [`SHARED_CAPACITY`]: the pages are allocated at once,
+/// and the size can be a guest's, so it is capped as a [`RecordingMapper`]'s room is.
 #[must_use]
 pub fn standalone_shared_pages(size: u64) -> Option<SharedPages> {
+    if size > SHARED_CAPACITY {
+        return None;
+    }
     let backing = BackingRange::new(0, size).ok()?;
     let memory = FlatMemory::new(0, usize::try_from(size).ok()?);
     Some(SharedPages::new(backing, Arc::new(memory)))

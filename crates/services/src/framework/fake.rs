@@ -240,7 +240,9 @@ impl Kernel for FakeKernel {
     }
 
     /// The kernel's checks, in its order; the pages are host memory of their own, allocated
-    /// at once.
+    /// at once, so more than
+    /// [`SHARED_CAPACITY`](starquake_kernel::memory::testing::SHARED_CAPACITY) bytes is [`KernelError::OutOfMemory`]
+    /// ([`standalone_shared_pages`]).
     fn create_shared_memory(
         &mut self,
         size: u64,

@@ -5,6 +5,7 @@
 use serde::{Deserialize, Serialize};
 use starquake_ipc::RequestBuilder;
 use starquake_kernel::handle::Handle;
+use starquake_kernel::memory::testing::SHARED_CAPACITY;
 use starquake_kernel::memory::{SharedPages, SvcPermission, shared_memory_size};
 use starquake_kernel::result::{KernelError, ResultCode};
 use starquake_trace::ServiceId;
@@ -128,4 +129,26 @@ fn the_kernels_refusals_are_the_replys_result_and_give_no_handle() {
         assert_eq!(reply, only(error.code()), "{size:#x} {permission:?}");
     }
     assert_eq!(kernel.handle_count(), 0);
+}
+
+#[test]
+fn the_fake_refuses_more_shared_memory_than_it_has_room_for() {
+    let (mut server, mut kernel, session) = rig();
+    let page = shared_memory_size(1).unwrap();
+    let read = u32::from(SvcPermission::Read.bits());
+    // Exactly the room there is.
+    let reply = plain(&send(
+        &mut server,
+        &mut kernel,
+        session,
+        &make(SHARED_CAPACITY, read),
+    ));
+    assert_eq!(reply.result, ResultCode::SUCCESS.raw());
+    // One page more, and the last size that rounds up inside the 64-bit space: a guest can ask
+    // for either, and the fake must answer, not allocate.
+    for size in [SHARED_CAPACITY + page, u64::MAX - (page - 1)] {
+        let reply = plain(&send(&mut server, &mut kernel, session, &make(size, read)));
+        assert_eq!(reply, only(KernelError::OutOfMemory.code()), "{size:#x}");
+    }
+    assert_eq!(kernel.handle_count(), 1);
 }
