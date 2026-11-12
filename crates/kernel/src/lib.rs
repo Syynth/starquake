@@ -1,8 +1,9 @@
 //! HLE Horizon kernel.
 //!
 //! Guest threads and their scheduling onto vCPUs, SVC dispatch, handles and kernel objects,
-//! synchronisation (events and `WaitSynchronization`, [`sync`]; `WaitForAddress`/`SignalToAddress`,
-//! still to come, are hot: ~1,400 per frame), a process's address space ([`memory`]), sessions
+//! synchronisation ([`sync`]: events and `WaitSynchronization`, lock arbitration with priority
+//! inheritance, condition variables, and the address arbiter, whose
+//! `WaitForAddress`/`SignalToAddress` are hot: ~1,400 per frame), a process's address space ([`memory`]), sessions
 //! and named ports ([`ipc`]), processes and the thread lifecycle ([`process`]), and `svcGetInfo`
 //! (its memory ids so far; the Switch 2 ids 29-33 are to come).
 //!

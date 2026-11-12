@@ -275,6 +275,21 @@ fn a_read_only_word_reads_but_takes_no_write_or_atomic_update() {
         Err(KernelError::InvalidCurrentMemory.into())
     );
     assert_eq!(s.get(word), 5);
+    // Atomic access is checked before the word is compared, so a comparison that would write
+    // nothing fails the same way (`CanAccessAtomic` comes first).
+    assert_eq!(
+        s.wait(
+            0,
+            word,
+            ArbitrationType::DecrementAndWaitIfLessThan.raw(),
+            1
+        ),
+        Err(KernelError::InvalidCurrentMemory.into())
+    );
+    assert_eq!(
+        s.signal(1, word, SignalType::SignalAndIncrementIfEqual.raw(), 4),
+        Err(KernelError::InvalidCurrentMemory.into())
+    );
     assert_eq!(
         s.signal(1, word, SignalType::SignalAndIncrementIfEqual.raw(), 5),
         Err(KernelError::InvalidCurrentMemory.into())
