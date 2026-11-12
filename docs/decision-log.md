@@ -273,3 +273,11 @@ Entry format:
 - **WHAT:** The GPU crate's back thread writes draw and dispatch commands as plain data (handles and numbers); the render backend's own thread turns them into host API calls, submits and presents. Caches keyed by game memory or register state (textures, buffers, pipeline keys, write tracking, eviction, detiling) live in the GPU crate; host objects live in the backend and are referred to by handle. Each backend implements the same trait and never sees a game memory address.
 - **WHY:** Eden-NX2 measured the thread that issues host calls as its bottleneck, so the back thread should not wait on the graphics driver. Plain-data lists give a recording backend for GPU-free tests and host-level captures without extra work, and keep wgpu types out of the GPU crate so a direct backend can be added. Writing cache policy once, in the GPU crate, means it is tested without a GPU and not repeated per backend.
 
+## Twenty-one graphics decisions accepted as recommended
+- **WHEN:** 2026-11-12
+- **PROJECT:** starquake
+- **SYSTEM:** gsv, gpu, shader, render
+- **SCOPE:** moderate
+- **WHAT:** The owner accepted, as the drafts recommend: (1) a draw whose shader or pipeline is not ready waits, one setting owned by the GPU crate, with skipping as an opt-in setting after the persistent caches exist (gpu 9, shader 6, render 5); (2) one house rule when references disagree: Nvidia's headers and module-cited readings for layouts and meanings; where one answer contains the other, the larger; otherwise the one a title ran on; each case marked in code and pinned by a test (gsv 8, gpu 10); (3) new crates: a leaf `starquake-layout` crate for tiling, no separate shader-decoder crate for now, and `starquake-render` plus `starquake-render-wgpu` (gpu 5, shader 14, render 10); and eighteen local items: gsv 5, 6, 7, 11; gpu 6, 7, 11, 12, 13; shader 4, 10, 12, 15, 16; render 6, 11, 12, 13, each as its draft recommends. Item numbers refer to each draft's "Decisions for the owner".
+- **WHY:** Each is the conservative or conventional choice, follows from the six foundational rulings, or keeps an option open for later; none sets direction beyond its own area. Accepting them together lets the drafts settle and the review focus on the coupled groups and the four contested items.
+
