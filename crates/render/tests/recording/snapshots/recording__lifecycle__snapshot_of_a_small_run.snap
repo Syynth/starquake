@@ -1,0 +1,29 @@
+---
+source: crates/render/tests/recording/lifecycle.rs
+expression: b.snapshot()
+---
+present target offscreen
+create b0: buffer 16 bytes, usage VERTEX|COPY_SRC|COPY_DST
+create t0: texture D2 A8B8G8R8_UNORM 2x2x1, 1 mips, 1 samples, usage SAMPLED|STORAGE|RENDER_TARGET|COPY_SRC|COPY_DST
+create v0: view of t0 as A8B8G8R8_UNORM D2Array, mips 0+1, layers 0+1, swizzle RGBA
+create s0: sampler SamplerDesc { mag_filter: Nearest, min_filter: Nearest, mip_filter: Nearest, address: [ClampToEdge, ClampToEdge, ClampToEdge], border_color: TransparentBlack, lod_bias: 0.0, min_lod: 0.0, max_lod: 0.0, max_anisotropy: 1, compare: None, reduction: Average }
+create sh0: shader vertex "main", SPIR-V 1 words, resources [], inputs [], outputs []
+create sh1: shader fragment "main", SPIR-V 1 words, resources [], inputs [], outputs []
+create p0: graphics pipeline vertex sh0, fragment sh1, Triangles, restart false, vertex input VertexLayout { buffers: [], attributes: [] }, raster RasterState { cull: None, front_face: Ccw, polygon_mode: Fill, depth_clamp: false, depth_bias: DepthBias { constant: 0.0, slope_scale: 0.0, clamp: 0.0 }, line_width: 1.0 }, depth/stencil DepthStencilState { depth_test: None, depth_write: false, stencil: None }, colour [0=A8B8G8R8_UNORM writes RED|GREEN|BLUE|ALPHA], depth/stencil target none, 1 samples, logic op None, emulation none
+create sh2: shader compute "main", SPIR-V 1 words, resources [], inputs [], outputs []
+create p1: compute pipeline of sh2
+submit fence 1:
+  marker submit 7 draw 0
+  upload 4 bytes fnv1a 0xbe7a5e775165785d to b0[0..4]
+  clear v0 to float [0.0, 0.0, 0.0, 1.0] in (0,0 1x1)
+  set render targets colour [0=v0] depth/stencil none
+  draw p0 Direct { vertex_count: 3, instance_count: 1, first_vertex: 0, first_instance: 0 }, bindings [0:1=s0], vertex buffers [b0[0..16]], index none, dynamic DynamicValues { viewports: [Viewport { x: 0.0, y: 0.0, width: 4.0, height: 4.0, min_depth: 0.0, max_depth: 1.0 }], scissors: [], blend_constant: [0.0, 0.0, 0.0, 0.0], stencil_reference: 0, stencil_read_mask: 255, stencil_write_mask: 255, depth_bias: DepthBias { constant: 0.0, slope_scale: 0.0, clamp: 0.0 }, line_width: 1.0 }
+  dispatch p1 2x1x1 groups, bindings []
+  readback t0 mip 0 at (0,0,0) size 2x2x1 as r3
+  present v0 (0,0 2x2) FlipVertical frame 1 dump
+destroy t0 after fence 2: pending
+destroy b0 after fence 0: now
+freed b0
+destroy b0 after fence 0: refused
+submit fence 2:
+freed t0

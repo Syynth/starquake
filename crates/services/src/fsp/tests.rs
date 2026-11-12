@@ -25,13 +25,12 @@ use crate::framework::{
     SnapshotError,
 };
 
-/// Command ids, from Eden's tables (see the module docs).
-const SET_CURRENT_PROCESS: u32 = 1;
-const OPEN_SD_CARD_FILE_SYSTEM: u32 = 18;
-const OPEN_FILE: u32 = 8;
-const READ: u32 = 0;
-const GET_SIZE: u32 = 4;
-/// `IFile::Write`, which this subset leaves out.
+use super::command::file::{GET_SIZE, READ};
+use super::command::file_system::OPEN_FILE;
+use super::command::fsp_srv::{OPEN_SD_CARD_FILE_SYSTEM, SET_CURRENT_PROCESS};
+
+/// `IFile::Write`, which this subset leaves out, so it has no shipping constant
+/// (`eden/src/core/hle/service/filesystem/fsp/fs_i_file.cpp`: `{1, D<&IFile::Write>, "Write"}`).
 const WRITE: u32 = 1;
 
 /// The process the caller is in.
@@ -792,6 +791,76 @@ fn open_file_without_a_path_is_an_invalid_request() {
         r.static_descriptor(descriptor)
     });
     assert_eq!(reply, only(INVALID_CMIF_REQUEST));
+}
+
+/// `OpenFile` declares its path a pointer (X) buffer, as Eden's signature does. The same path as
+/// a map-alias (A) descriptor, in place of the X descriptor or as well as it, is refused before
+/// the command runs, and the host is not asked.
+#[test]
+fn open_file_refuses_a_map_alias_path() {
+    let mut rig = Rig::new();
+    let fs = rig.open_sd();
+    let pointer = rig.map_path(HELLO_PATH);
+    let alias = BufferDescriptor {
+        address: pointer.address,
+        size: u64::from(pointer.size),
+        flags: 0,
+    };
+    let before = rig.env.asked().len();
+    let mode = open_mode::READ.to_le_bytes();
+    let instead = rig.send(To::Session(fs), OPEN_FILE, |r| {
+        r.data(&mode).send_buffer(alias)
+    });
+    assert_eq!(instead, only(INVALID_CMIF_REQUEST));
+    let as_well = rig.send(To::Session(fs), OPEN_FILE, |r| {
+        r.data(&mode).static_descriptor(pointer).send_buffer(alias)
+    });
+    assert_eq!(as_well, only(INVALID_CMIF_REQUEST));
+    assert_eq!(rig.env.asked().len(), before);
+    // The X descriptor alone opens the file.
+    assert_eq!(rig.open_file(fs, HELLO_PATH).result, ResultCode::SUCCESS);
+}
+
+/// The framework's check of the declared buffers comes before the command's own checks, as on
+/// the console: a bad mode and no path at once is the missing path's error.
+#[test]
+fn the_declared_buffers_are_checked_before_the_open_mode() {
+    let mut rig = Rig::new();
+    let fs = rig.open_sd();
+    let bad_mode = open_mode::WRITE.to_le_bytes();
+    let reply = rig.send(To::Session(fs), OPEN_FILE, |r| r.data(&bad_mode));
+    assert_eq!(reply, only(INVALID_CMIF_REQUEST));
+    // With the path, the same mode is the mode's error.
+    assert_eq!(
+        rig.open_file_with(fs, HELLO_PATH, open_mode::WRITE),
+        only(result::INVALID_OPEN_MODE)
+    );
+}
+
+/// `Read` declares its buffer a map-alias (B) buffer, as Eden's signature does. A pointer (C)
+/// buffer in its place is refused before the command runs: nothing is deferred or written.
+#[test]
+fn read_refuses_a_pointer_buffer() {
+    use starquake_ipc::ReceiveDescriptor;
+    let mut rig = Rig::new();
+    let file = rig.hello();
+    let len = HELLO.len();
+    rig.kernel.map(DATA_AT, vec![STALE; len]);
+    let pointer = ReceiveDescriptor {
+        address: DATA_AT,
+        size: u16::try_from(len).unwrap(),
+    };
+    let size = i64::try_from(len).unwrap();
+    let reply = rig.send(To::Session(file), READ, |r| {
+        r.data(&read_payload(0, size)).receive_descriptor(pointer)
+    });
+    assert_eq!(reply, only(INVALID_CMIF_REQUEST));
+    assert_eq!(rig.kernel.memory(DATA_AT, len).unwrap(), vec![STALE; len]);
+    // A B descriptor beside the C descriptor is what `Read` declares, and it is read into.
+    let len_u64 = u64::try_from(len).unwrap();
+    rig.defer(To::Session(file), READ, |r| {
+        read(0, size, len_u64)(r).receive_descriptor(pointer)
+    });
 }
 
 #[test]

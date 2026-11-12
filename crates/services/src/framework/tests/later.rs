@@ -36,9 +36,9 @@ mod cmd {
 
 commands! {
     impl Filler {
-        0 => fill,
-        1 => fill_and_handle,
-        2 => fill_and_flood,
+        cmd::FILL => fill [Out(MapAlias)],
+        cmd::FILL_AND_HANDLE => fill_and_handle [Out(MapAlias)],
+        cmd::FILL_AND_FLOOD => fill_and_flood [Out(MapAlias)],
     }
 }
 

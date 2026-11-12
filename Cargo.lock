@@ -1126,6 +1126,7 @@ dependencies = [
 name = "starquake-render"
 version = "0.0.0"
 dependencies = [
+ "insta",
  "naga",
  "postcard",
  "proptest",

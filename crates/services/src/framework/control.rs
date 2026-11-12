@@ -81,22 +81,27 @@ pub const CONTROL_COMMANDS: CommandTable = CommandTable {
         Command {
             id: CONVERT_CURRENT_OBJECT_TO_DOMAIN,
             name: "ConvertCurrentObjectToDomain",
+            buffers: &[],
         },
         Command {
             id: COPY_FROM_CURRENT_DOMAIN,
             name: "CopyFromCurrentDomain",
+            buffers: &[],
         },
         Command {
             id: CLONE_CURRENT_OBJECT,
             name: "CloneCurrentObject",
+            buffers: &[],
         },
         Command {
             id: QUERY_POINTER_BUFFER_SIZE,
             name: "QueryPointerBufferSize",
+            buffers: &[],
         },
         Command {
             id: CLONE_CURRENT_OBJECT_EX,
             name: "CloneCurrentObjectEx",
+            buffers: &[],
         },
     ],
     tipc: &[],
