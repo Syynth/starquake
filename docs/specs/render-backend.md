@@ -1,9 +1,10 @@
 # Render backend: the seam between the emulated GPU and the host GPU
 
-Status: draft for the owner's review (issue #14). Not approved; nothing is built on it yet.
-Amended on 2026-11-12 to follow the owner's six graphics decisions (`docs/decision-log.md`) and
-the seam resolutions of the graphics review guide (`docs/specs/graphics-review-guide.md`); the
-decided items are marked in "Decisions for the owner".
+Status: approved by the owner, 2026-11-12 (issue #14).
+
+Every item in "Decisions for the owner" carries the owner's ruling (`docs/decision-log.md`,
+2026-11-12), and the text follows them and the seam resolutions of the graphics review guide
+(`docs/specs/graphics-review-guide.md`).
 
 This spec decides what `crates/render` is: the one interface through which the emulated GPU
 (`crates/gpu`) gets work done on the host GPU, the backends behind it, the thread that submits
@@ -11,7 +12,7 @@ and presents, and how a run with no GPU and no window still produces checkable o
 API layer, the largest decision in the graphics half, is now taken: wgpu first, behind our own
 trait (decision 1). The draft's comparison of the options is kept in decision 1 for the record.
 
-Three sibling specs are drafted at the same time: the graphics server (#11), the GPU front/back
+Three sibling specs were drafted at the same time: the graphics server (#11), the GPU front/back
 protocol and engine state model (#12) and the shader pipeline (#13). Where this spec depends on
 them it says exactly what it assumes, in "Interfaces to neighbouring designs".
 
@@ -81,7 +82,7 @@ crate"):
 | Crate | Contains | `unsafe` |
 |---|---|---|
 | `starquake-render` | The trait, every type in it, the recording backend, format tables, the choice of format fallbacks and shader emulation (pure functions), the host shaders' WGSL sources | Denied |
-| `starquake-render-wgpu` (working name) | The wgpu backend: the only crate that names a wgpu type | Denied if wgpu's safe API is enough. Creating a surface from the frontend's raw window handles may need wgpu's unsafe surface constructor (guess; settled in slice R8); if so, a crate-level opt-in for that one call |
+| `starquake-render-wgpu` (working name) | The wgpu backend: the only crate that names a wgpu type | Denied if wgpu's safe API is enough. Creating a surface from the frontend's raw window handles may need wgpu's unsafe surface constructor (guess; open, verification 11, settled in slice R8); if so, a crate-level opt-in for that one call |
 | `starquake-render-vulkan` | Later, when scheduled: a direct Vulkan backend | Crate-level opt-in |
 | `starquake-render-metal` | Later, only if measurements call for it: a native Metal backend (`objc2-metal`) | Crate-level opt-in |
 
@@ -167,7 +168,7 @@ wait-while-compiling setting (below); neither is a trait method.
 *or* a submitted list has completed, because releases and syncpoint increments wait on
 completion. `completed()` and `wait()` alone cannot wake it. One way is a wake hook the back thread
 installs on the backend, called by the render thread when the completed value moves; neither
-draft has settled it (review guide, M14).
+spec has settled it (review guide, M14). It is an open item, verification 10.
 
 ### Commands
 
@@ -362,7 +363,7 @@ copy.
 
 `budget()` reports the memory the device allows and what the backend uses (Vulkan
 `VK_EXT_memory_budget`; Metal's recommended working set). How the wgpu backend learns the
-device's budget is not settled: this draft did not check what wgpu 30 exposes (verification 8).
+device's budget is not settled: what wgpu 30 exposes was not checked (open, verification 8).
 Until then the wgpu backend reports a configured limit and its own allocations. The caches in
 `gpu` decide what to
 evict. Eden-NX2's lesson is to size collection by each cache's own use, not by the whole device's
@@ -447,7 +448,8 @@ with naga at startup. Naga is pure Rust, so neither path needs a build step.
 - The render thread meets a draw whose pipeline is still compiling. What it does follows the
   GPU crate's single wait-while-compiling setting, which covers shader translation and pipeline
   builds alike and which `core` passes to the backend when it creates it (review guide, M10;
-  the default is decision 5, shared with gpu-protocol 9 and shader-pipeline 6): **wait** for it
+  decision 5, shared with gpu-protocol 9 and shader-pipeline 6, makes waiting the default and
+  skipping an opt-in once the persistent caches exist): **wait** for it
   (correct frames, deterministic frame dumps; the back thread keeps running until the queue
   fills) or **skip** the draw and count it (smooth, with visible gaps, what Eden calls
   asynchronous shaders: `vk_pipeline_cache.cpp`, `use_asynchronous_shaders`). Translation waits
@@ -577,7 +579,7 @@ bit-identical readbacks wherever the recording backend has an answer.
 | ASTC | Native on Apple GPUs (verified in `wgpu-hal`'s Metal adapter) | Native on most Arm GPUs where the driver exposes it; else GPU decode | GPU decode (AMD has none) |
 | Memory | Unified: copy (wgpu has no safe aliasing; decision 7) | Unified or discrete: copy | Unified APU: copy |
 | Window | wgpu surface over the frontend's window (`CAMetalLayer`) | wgpu surface over X11 or Wayland | wgpu surface over X11 or Wayland |
-| CI with no GPU | Recording backend | Recording backend | Recording backend; the wgpu backend on lavapipe is decision 9 |
+| CI with no GPU | Recording backend | Recording backend | Recording backend; the wgpu backend on lavapipe if the experiment passes (decision 9) |
 
 wgpu drives Metal directly on the Mac, so nothing is installed there (owner's decision of
 2026-11-12). On Linux it uses the system's Vulkan driver at run time. The owner's decision records
@@ -666,8 +668,8 @@ Assumed of #13 (through `gpu`; `shader` and `render` do not depend on each other
   bounds-check policy that backend states (`HostCode::SpirV`, `HostCode::Msl`).
 
 Offered to #13: the `EmulationFlags` table and `Caps` facts, and, for testing, the recording
-backend and a wgpu backend that can run a translated shader (locally on the Mac; in Linux CI if
-decision 9 says so).
+backend and a wgpu backend that can run a translated shader (locally on the Mac; in Linux CI on
+lavapipe if the experiment passes, decision 9).
 
 `ShaderDesc` accepts a naga module, SPIR-V or MSL (`ShaderSource::{Naga, SpirV, Msl}`). Under
 wgpu, guest shaders always come as `Naga`; SPIR-V and MSL serve a later direct backend, captures
@@ -679,8 +681,9 @@ One pull request each. "Offline" means no game; "no GPU" means it runs in the ga
 Slices in the same parallel group can be built at once once their dependencies have landed. The
 slices were re-cut on 2026-11-12 for a wgpu backend crate (`starquake-render-wgpu`, working name)
 instead of a Vulkan backend running on MoltenVK; the recording backend still comes first. "Needs
-a GPU" means the test runs locally on the Mac through wgpu on Metal, and in Linux CI only if
-decision 9 adds lavapipe.
+a GPU" means the test runs locally on the Mac through wgpu on Metal, skipped with a notice where
+no GPU adapter exists, and is required in Linux CI on lavapipe if verification 3 passes; until
+then it is local-only, like the hypervisor tests (decision 9).
 
 | # | Slice | Depends on | References | Test, offline? | Parallel group |
 |---|---|---|---|---|---|
@@ -726,7 +729,8 @@ In order of how much each could change the design:
    experiment E1.
 3. **wgpu on lavapipe on the CI runner:** that Ubuntu's Mesa package installs lavapipe, which
    version, whether wgpu's Vulkan backend runs this backend's tests on it, whether its output is
-   bit-identical between runs, and whether it offers ASTC. Decides decision 9.
+   bit-identical between runs, and whether it offers ASTC. Decision 9 makes the GPU tests
+   required in Linux CI if this passes, and local-only if it fails.
 4. **Aliasing a guest backing pool as a GPU buffer on Apple Silicon:** largest buffer the device
    accepts, 16 KiB alignment, cost, and how GPU writes interact with the execution model's write
    tracking (a GPU write does not fault, so the caches must learn of it another way). Needs a
@@ -745,16 +749,22 @@ In order of how much each could change the design:
    use and limits, if anything. Until known, `budget()` reports a configured limit.
 9. **The present-then-write ordering under wgpu** ("Submit"), which the graphics server's buffer
    release relies on. Slice R8's test; listed here because a failure changes #11's release rule.
+10. **The completion wake-up** (review guide, M14; "The trait"): how the GPU back thread sleeps
+    until its ring has entries or a submitted list completes. A wake hook the back thread
+    installs, called by the render thread when the completed value moves, is the leading
+    candidate. Settled with gpu-protocol (its verification 13) before R5 and G15.
+11. **Whether surface creation needs `unsafe`:** whether wgpu 30 can create a surface from the
+    frontend's raw window handles through its safe API, or only through its unsafe constructor.
+    If only the latter, `starquake-render-wgpu` opts in at crate level for that one call ("Where
+    the backend sits"). Settled in slice R8.
 
 ## Decisions for the owner
 
-Decided items keep their original text below the ruling, for the record.
+Every item carries its outcome; the original text stays below it, for the record. The rulings
+are in `docs/decision-log.md` (2026-11-12).
 
-1. **Decided by the owner, 2026-11-12:** wgpu first, behind starquake's own trait and plain-data
-   command lists, with no wgpu type crossing into `gpu`; a direct Vulkan backend when Linux work
-   or a title needs a stage wgpu lacks; a native Metal backend only if measurements at the
-   performance milestone call for it. This is option (e), taken against this draft's
-   recommendation (b); the analysis below is kept.
+1. **Decided by the owner, 2026-11-12:** (e), wgpu first behind our own trait, against this
+   draft's recommendation (b); direct Vulkan when needed, native Metal only if measured.
 
    **The host API layer.** The emulator needs one way to drive the host GPU on macOS and Linux.
    The owner already knows `wgpu` and asked whether it is a viable choice, so that question is
@@ -841,8 +851,8 @@ Decided items keep their original text below the ruling, for the record.
    title's need (mesh shaders, sparse textures, unified-memory aliasing, MoltenVK bugs) calls for
    it, decided at milestone 4.
 
-2. **Deferred by the owner's decision 1, 2026-11-12:** chosen when a direct Vulkan backend is
-   scheduled; nothing in the wgpu-first plan needs Vulkan bindings.
+2. **Deferred, by decision 1 (2026-11-12):** chosen when a direct Vulkan backend is scheduled;
+   nothing in the wgpu-first plan needs Vulkan bindings.
 
    **Vulkan bindings: `ash` (0.38.0, Vulkan headers 1.3.281, released 2024) or `vulkanalia`
    (0.35.0, 2026).** `ash` is what `wgpu-hal` 30 and `gpu-allocator` 0.28 use, and is the most
@@ -850,8 +860,8 @@ Decided items keep their original text below the ruling, for the record.
    `vulkanalia` is more recent but less used. **Recommended: `ash`**, for the ecosystem
    (`gpu-allocator` plugs straight in) and stability; revisit if a needed extension is missing.
 
-3. **Decided by the owner, 2026-11-12:** command lists as data (handles and numbers), turned
-   into host API calls on the backend's own render thread, which also submits and presents.
+3. **Decided by the owner, 2026-11-12:** data, turned into host API calls on the backend's own
+   render thread, which also submits and presents.
 
    **Command lists as data, encoded on a render thread** (this spec's design) or **the back
    thread calling the host API directly** (the back thread would then hold the backend's host
@@ -861,32 +871,35 @@ Decided items keep their original text below the ruling, for the record.
    the measured bottleneck (rows 98, 133) and data lists give the recording backend and
    host-level captures for free.
 
-4. **Decided by the owner, 2026-11-12:** caches keyed by game memory or register state live in
-   `gpu`; host objects live in the backend, referred to by handle; every backend implements the
-   same trait and never sees a game memory address.
+4. **Decided by the owner, 2026-11-12:** split as here: guest-keyed caches in `gpu`, host objects
+   in the backend by handle.
 
    **Where the caches live:** guest-keyed caches in `gpu`, host objects in the backend (this
    spec), or whole caches inside each backend (Eden's layout). **Recommended: split as here**, so
    cache policy is written once, tested without a GPU, and not repeated in the Metal backend.
 
-5. **A draw whose pipeline is still compiling: wait or skip by default.** Still open. The same
-   question is gpu-protocol decision 9 and shader-pipeline decision 6; the review guide makes it
-   one setting owned by `gpu`, covering translation and pipelines, which `core` passes to the
-   backend (M10). Waiting gives correct frames and reproducible dumps but stutters the first time
-   each effect appears; skipping keeps frames smooth but draws them incomplete for a moment.
-   **Recommended: wait by default until milestone 4 (correctness first, and tests need
-   determinism), skip as a setting**, revisited with the disk cache at milestone 5.
+5. **Decided by the owner, 2026-11-12:** wait by default, as one setting owned by `gpu`, with
+   skipping as an opt-in setting after the persistent caches exist.
 
-6. **ASTC on GPUs without it: decode to RGBA8 first, or decode and recompress to BC.** Still
-   open; under wgpu it only matters on Linux. Recompressing cuts memory four to eight times (rows
-   99, 103) but adds an encoder and some quality loss. **Recommended: RGBA8 first**, BC later when
-   a Linux machine runs out of memory; it does not matter on Apple GPUs, which decode ASTC
-   natively.
+   **A draw whose pipeline is still compiling: wait or skip by default.** The same question is
+   gpu-protocol decision 9 and shader-pipeline decision 6; the review guide makes it one setting
+   owned by `gpu`, covering translation and pipelines, which `core` passes to the backend (M10).
+   Waiting gives correct frames and reproducible dumps but stutters the first time each effect
+   appears; skipping keeps frames smooth but draws them incomplete for a moment. **Recommended: wait
+   by default until milestone 4 (correctness first, and tests need determinism), skip as a
+   setting**, revisited with the disk cache at milestone 5.
 
-7. **Made moot for now by the owner's decision 1, 2026-11-12:** wgpu's safe API cannot alias
-   guest memory (decision 1's table), so the wgpu backend copies. The question returns when a
-   direct backend is scheduled, with verification 4. Coupled then with gpu-protocol decision 4
-   and shader-pipeline decision 9.
+6. **Decided by the owner, 2026-11-12:** RGBA8 first, as recommended.
+
+   **ASTC on GPUs without it: decode to RGBA8 first, or decode and recompress to BC.** Under wgpu it
+   only matters on Linux. Recompressing cuts memory four to eight times (rows 99, 103) but adds an
+   encoder and some quality loss. **Recommended: RGBA8 first**, BC later when a Linux machine runs
+   out of memory; it does not matter on Apple GPUs, which decode ASTC natively.
+
+7. **Moot for now, by decision 1 (2026-11-12):** wgpu's safe API cannot alias guest memory, so
+   the wgpu backend copies; the question returns with a direct backend, together with
+   gpu-protocol decision 4 and shader-pipeline decision 9, which the owner's ruling says are
+   revisited then.
 
    **Unified memory: copy guest data into GPU memory, or alias guest memory as GPU buffers.**
    Aliasing saves the copy and makes GPU writes visible to the guest at once, but bypasses write
@@ -894,25 +907,30 @@ Decided items keep their original text below the ruling, for the record.
    **Recommended: copy first**, design the staging API so aliasing can replace it, and decide
    after verification 4.
 
-8. **Implied by the owner's decision of 2026-11-12 (presents paced by a buffer queue), whose text
-   names "the graphics server's emulated 60 Hz clock"; not separately confirmed.** The same
-   question is graphics-server decision 2.
+8. **Implied by graphics-server decision 1 (2026-11-12):** the emulated clock; the buffer-queue
+   ruling names "the graphics server's emulated 60 Hz clock". The same question is
+   graphics-server decision 2.
 
    **What paces the guest: the emulated 60 Hz clock or the host display's vblank.** **Recommended:
    the emulated clock** (gsv's vsync events and present reply): it works with no display, at any
    refresh rate, with `--clock fixed`, and under replay. The host display only decides which
    finished frame is shown.
 
-9. **Testing the GPU backend in CI with Mesa's software driver (lavapipe).** Still open, in a new
-   form. The original question was about a Vulkan backend; it moves to "Deferred" with the
-   direct Vulkan backend. Under wgpu first: should the wgpu backend's GPU tests also run in Linux
-   CI through wgpu's Vulkan backend on lavapipe, or only locally on the Mac? Running them in CI
-   catches backend bugs on every PR, at the cost of a package install, images from a software
-   rasterizer, and a new rule in `CLAUDE.md` "Tests" (the reverse of the hypervisor rule:
-   required in CI, skipped locally with a notice when no adapter exists). Whether wgpu runs
-   cleanly on lavapipe on the hosted runner is verification 3. **Recommended: yes, if
-   verification 3 passes**, with golden images compared exactly only for scenes whose pixels are
-   computable; otherwise local-only, like the hypervisor tests.
+9. **Decided by the owner, 2026-11-12:** if verification 3 shows wgpu runs cleanly and
+   deterministically on lavapipe on the hosted Linux runners, the GPU tests are required in Linux
+   CI and skipped locally, with a notice, where no GPU adapter exists; golden images compare
+   exactly only where pixels can be computed. Otherwise they are local-only, like the hypervisor
+   tests.
+
+   **Testing the GPU backend in CI with Mesa's software driver (lavapipe).** The original question
+   was about a Vulkan backend; it moves to "Deferred" with the direct Vulkan backend. Under wgpu
+   first: should the wgpu backend's GPU tests also run in Linux CI through wgpu's Vulkan backend on
+   lavapipe, or only locally on the Mac? Running them in CI catches backend bugs on every PR, at the
+   cost of a package install, images from a software rasterizer, and a new rule in `CLAUDE.md`
+   "Tests" (the reverse of the hypervisor rule: required in CI, skipped locally with a notice when
+   no adapter exists). Whether wgpu runs cleanly on lavapipe on the hosted runner is verification 3.
+   **Recommended: yes, if verification 3 passes**, with golden images compared exactly only for
+   scenes whose pixels are computable; otherwise local-only, like the hypervisor tests.
 
    Original text: **Testing the Vulkan backend in CI with Mesa's software driver (lavapipe).** It
    runs the real backend with no GPU, at the cost of a package install in CI and images from a
@@ -922,28 +940,33 @@ Decided items keep their original text below the ruling, for the record.
    not installed, so agents without MoltenVK can still run the gate. Golden images are compared
    exactly only for scenes whose pixels are computable.
 
-10. **Implied by the owner's decision of 2026-11-12 (shaders as a naga module), whose text says
-    "wgpu types stop at the wgpu backend crate"; not separately confirmed.** One crate per
-    backend: `starquake-render` plus `starquake-render-wgpu` (working name). The same question
-    of new crates is gpu-protocol decision 5 and shader-pipeline decision 14.
+10. **Decided by the owner, 2026-11-12:** one crate per backend, `starquake-render` plus
+    `starquake-render-wgpu`. The same question of new crates is gpu-protocol decision 5 and
+    shader-pipeline decision 14.
 
     **Crates: one `starquake-render` crate with backends behind features, or the trait crate plus
     one crate per backend.** **Recommended: one crate per backend**: `unsafe` stays in the
     backend crates, `gpu` compiles without Vulkan, and a backend's build time is paid only where
     it is used.
 
-11. **A window before the GPUI frontend.** The command-line app can stay headless (frames only as
+11. **Decided by the owner, 2026-11-12:** a `--window` flag, as recommended.
+
+    **A window before the GPUI frontend.** The command-line app can stay headless (frames only as
     PNG dumps) or open a plain window with `winit` (0.30.13, pure Rust) behind `--window`.
     **Recommended: a `--window` flag in the command-line app**, because bring-up is much faster
     when frames can be watched live; it is throwaway once GPUI arrives and touches only `apps/`.
 
-12. **Language for the backend's own helper shaders: WGSL through naga, GLSL, or hand-written
+12. **Decided by the owner, 2026-11-12:** WGSL through naga, as recommended.
+
+    **Language for the backend's own helper shaders: WGSL through naga, GLSL, or hand-written
     SPIR-V and MSL.** GLSL needs a C++ compiler (glslang) or naga's less complete GLSL reader;
     hand-written pairs double the work. **Recommended: WGSL through naga**, one source for both
     backends, no build step. With wgpu first this is stronger: WGSL is wgpu's own language, and
     naga translates it only for a later direct backend.
 
-13. **How the GPUI frontend will get frames.** GPUI renders with Metal on macOS and `wgpu` on
+13. **Decided by the owner, 2026-11-12:** decide when the frontend starts, as recommended.
+
+    **How the GPUI frontend will get frames.** GPUI renders with Metal on macOS and `wgpu` on
     Linux (gpui-pre 0.3.3, a published snapshot of Zed's gpui: `gpui-pre-wgpu` uses wgpu 29.0.4),
     and its `surface` element accepts only a macOS `CVPixelBuffer`. Options: present into a native
     child view or layer the frontend reserves; export each frame as a shared image (IOSurface on
