@@ -35,16 +35,20 @@
 //!   `OutputDebugString`, so under the kernel lock, just before the call's own event. All three
 //!   move to the kernel's own recording points (process and thread lifecycle in slice 8, faults
 //!   in slice 6).
-//! - **Event times** are host nanoseconds since the run started, converted with the kernel's
-//!   tick conversion ([`nanos_to_ticks`]). The clock is read once per `svc`: the call's event
-//!   and a log line it writes carry the same time. Nothing reads the times back; the kernel's
-//!   guest-time work (kernel spec, "Guest time") decides the real stamp.
+//! - **Event times.** The kernel stamps a system call's event with guest time, and tells the
+//!   [`DebugSink`] the same time, so a log line carries the time of the call that wrote it. The
+//!   events this loop records itself (lifecycle and fault) are stamped from a second copy of
+//!   the run's host clock ([`Timebase`]), converted by the kernel's conversion at the process's
+//!   rate, so they are on the same scale; they go when those events move into the kernel.
 //! - **What a run keeps in memory is capped by fixed numbers** ([`Limits`]): the golden trace
 //!   keeps its first events and the guest log its first lines, and both say when they stopped.
 //!   The observability spec's size cap per run, with its own flags, replaces the constants.
 //! - **The environment** is live, with a fixed random seed and nothing recorded to disk; the
-//!   `--clock`, `--seed` and `--record` flags of the headless contract are not built.
+//!   `--clock`, `--seed` and `--record` flags of the headless contract are not built. Its
+//!   recording, which grows by a clock reading per system call, is dropped as it is made (test:
+//!   `the_environments_recording_is_dropped_as_it_is_made`).
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -56,14 +60,15 @@ use starquake_cpu::{Exit, GuestRegs, Interrupter, Vcpu};
 use starquake_kernel::dispatch::{Caller, Dispatcher, Outcome, Record, Tables};
 use starquake_kernel::handle::{HandleError, HandleTable};
 use starquake_kernel::svc::DebugSink;
-use starquake_kernel::svc::tick::nanos_to_ticks;
 use starquake_kernel::tables::{AddressSpace, Processes, Scheduler};
+use starquake_kernel::time::CounterRate;
 use starquake_memory::GuestMemory;
 use starquake_trace::{
-    DumpError, EventKind, FaultAction, FlightRecorder, GuestTicks, LifecyclePhase, LiveEnv,
-    Recorder, SystemClock, TextSink, ThreadId,
+    DumpError, EventKind, FaultAction, FlightRecorder, GuestTicks, HostClock, LifecyclePhase,
+    LiveEnv, Recorder, TextSink, ThreadId,
 };
 
+use crate::clock::Timebase;
 use crate::crash::{CrashReport, Exception};
 use crate::image::Placement;
 use crate::report::{ExitReason, RunOptions, RunReport, empty_dump};
@@ -104,28 +109,42 @@ impl Limits {
     };
 }
 
-/// Stamps events with the time since the run started (see the module docs).
-struct RunClock {
-    started: Instant,
+/// Stamps the events the loop records itself with guest time (see the module docs): the loop's
+/// copy of the run's host clock, and the process's counter rate.
+struct RunClock<C> {
+    clock: RefCell<C>,
+    rate: CounterRate,
 }
 
-impl RunClock {
+impl<C: HostClock + Clone> RunClock<C> {
+    fn new(time: Timebase<C>) -> Self {
+        Self {
+            clock: RefCell::new(time.clock),
+            rate: time.rate,
+        }
+    }
+
+    /// Guest time now: the kernel's conversion of a reading that is not recorded for replay.
     fn now(&self) -> GuestTicks {
-        let nanos = u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        GuestTicks(nanos_to_ticks(nanos))
+        self.rate.ticks_at(self.clock.borrow_mut().now())
+    }
+
+    /// The other copy of the clock, for the environment.
+    fn for_environment(&self) -> C {
+        self.clock.borrow().clone()
     }
 }
 
 /// What the loop needs that outlives a single exit.
-struct Session<'a> {
+struct Session<'a, C> {
     memory: &'a dyn GuestMemory,
     placed: &'a Placement,
     options: &'a RunOptions,
-    clock: RunClock,
+    clock: RunClock<C>,
     recorder: Recorder,
 }
 
-impl Session<'_> {
+impl<C: HostClock + Clone> Session<'_, C> {
     /// Records an event on the one core and thread, stamped with the time now.
     fn record(&self, kind: EventKind) {
         self.record_at(self.clock.now(), kind);
@@ -135,11 +154,20 @@ impl Session<'_> {
     fn record_at(&self, time: GuestTicks, kind: EventKind) {
         self.recorder.record(time, CORE, MAIN_THREAD, kind);
     }
+
+    /// The environment the kernel reads during this run: live, on the other copy of the run's
+    /// clock, with the fixed random seed.
+    fn environment(&self) -> LiveEnv
+    where
+        C: 'static,
+    {
+        LiveEnv::new(self.clock.for_environment(), RANDOM_SEED)
+    }
 }
 
 /// Collects what the guest writes with `OutputDebugString` and records each line as a guest-log
 /// event.
-struct GuestLog<'a> {
+struct GuestLog<'a, C> {
     /// The lines kept: a prefix of what the guest wrote.
     lines: Vec<Vec<u8>>,
     /// Bytes in `lines`.
@@ -148,16 +176,14 @@ struct GuestLog<'a> {
     limit: usize,
     /// Lines that were not kept: the first that did not fit, and every line after it.
     dropped: u64,
-    /// The time of the `svc` being dispatched, which its log line is stamped with.
-    time: GuestTicks,
-    session: &'a Session<'a>,
+    session: &'a Session<'a, C>,
 }
 
-impl DebugSink for GuestLog<'_> {
-    fn output(&mut self, message: &[u8]) {
+impl<C: HostClock + Clone> DebugSink for GuestLog<'_, C> {
+    fn output(&mut self, time: GuestTicks, message: &[u8]) {
         // The event is recorded either way: it is fixed-size, and the trace has its own limit.
-        self.session
-            .record_at(self.time, EventKind::guest_log(message));
+        // `time` is the guest time of the `svc` being dispatched, which its own event carries.
+        self.session.record_at(time, EventKind::guest_log(message));
         let fits = self
             .kept_bytes
             .checked_add(message.len())
@@ -260,45 +286,57 @@ enum Ending {
     Failed(String),
 }
 
-/// The kernel's tables for one process. PROVISIONAL: the address space and the process table are
-/// still placeholders in the kernel, and the handle table has Horizon's maximum size because an
-/// NRO carries no NPDM to say otherwise.
-fn tables() -> Result<Tables, HandleError> {
+/// The kernel's tables for one process, whose counter runs at `rate`. PROVISIONAL: the address
+/// space is still a placeholder in the kernel, and the handle table has Horizon's maximum size
+/// because an NRO carries no NPDM to say otherwise.
+fn tables(rate: CounterRate) -> Result<Tables, HandleError> {
     Ok(Tables {
         handles: HandleTable::new(0)?,
         address_space: AddressSpace::default(),
         scheduler: Scheduler::default(),
-        processes: Processes::default(),
+        processes: Processes::new(rate),
     })
 }
 
 /// Runs the placed program on `vcpu` until it exits, crashes or times out, and reports what
 /// happened. `memory` must already hold the program ([`Placement::write_into`]); `started` is
-/// when the run began, for the report's duration and the events' times.
-pub(crate) fn run<V: Vcpu>(
+/// when the run began, for the report's duration. `time` is the process's counter rate, which
+/// must be the rate the program's counter reads were patched for, and the host clock guest
+/// time is counted from.
+pub(crate) fn run<V: Vcpu, C: HostClock + Clone + 'static>(
     vcpu: &mut V,
     memory: &dyn GuestMemory,
     placed: &Placement,
     options: &RunOptions,
     started: Instant,
+    time: Timebase<C>,
 ) -> RunReport {
-    run_within(vcpu, memory, placed, options, started, Limits::DEFAULT)
+    run_within(
+        vcpu,
+        memory,
+        placed,
+        options,
+        started,
+        time,
+        Limits::DEFAULT,
+    )
 }
 
 /// [`run`], keeping no more of the run in memory than `limits` allows.
-pub(crate) fn run_within<V: Vcpu>(
+pub(crate) fn run_within<V: Vcpu, C: HostClock + Clone + 'static>(
     vcpu: &mut V,
     memory: &dyn GuestMemory,
     placed: &Placement,
     options: &RunOptions,
     started: Instant,
+    time: Timebase<C>,
     limits: Limits,
 ) -> RunReport {
     let session = Session {
         memory,
         placed,
         options,
-        clock: RunClock { started },
+        clock: RunClock::new(time),
         recorder: Recorder::new(),
     };
     let text = Arc::new(TextSink::with_limit(limits.trace_events));
@@ -311,11 +349,11 @@ pub(crate) fn run_within<V: Vcpu>(
         kept_bytes: 0,
         limit: limits.guest_log_bytes,
         dropped: 0,
-        time: session.clock.now(),
         session: &session,
     };
     let mut tally = Tally::default();
-    let exit = match drive(vcpu, &session, &mut log, &mut tally) {
+    let env = session.environment();
+    let exit = match drive(vcpu, &session, &env, &mut log, &mut tally) {
         Ending::Exited => ExitReason::ProcessExited,
         Ending::TimedOut => ExitReason::Timeout,
         Ending::Failed(message) => {
@@ -379,18 +417,20 @@ fn settle_dump(
     }
 }
 
-/// The loop itself (see the module docs).
-fn drive<V: Vcpu>(
+/// The loop itself (see the module docs). `env` is the environment the kernel reads
+/// ([`Session::environment`]); the caller owns it so that a test can see what the loop leaves
+/// in its recording.
+fn drive<V: Vcpu, C: HostClock + Clone + 'static>(
     vcpu: &mut V,
-    session: &Session<'_>,
-    log: &mut GuestLog<'_>,
+    session: &Session<'_, C>,
+    env: &LiveEnv,
+    log: &mut GuestLog<'_, C>,
     tally: &mut Tally,
 ) -> Ending {
-    let dispatcher = match tables() {
+    let dispatcher = match tables(session.clock.rate) {
         Ok(tables) => Dispatcher::new(tables),
         Err(error) => return Ending::Failed(format!("the kernel could not be set up: {error}")),
     };
-    let env = LiveEnv::new(SystemClock::new(), RANDOM_SEED);
     let vcpu_failed = |error| Ending::Failed(format!("the vCPU failed: {error}"));
 
     // PROVISIONAL: everything else starts at zero (see "Start state" in the module docs).
@@ -423,22 +463,21 @@ fn drive<V: Vcpu>(
                     Ok(regs) => regs,
                     Err(error) => return vcpu_failed(error),
                 };
-                // One reading for the call's event and for a log line the call writes.
-                let time = session.clock.now();
-                log.time = time;
                 let record = dispatcher.dispatch(
                     number,
                     &mut regs,
                     &mut Caller {
                         core: CORE,
                         thread: MAIN_THREAD,
-                        time,
-                        env: &env,
+                        env,
                         memory: session.memory,
                         debug: log,
                         recorder: &session.recorder,
                     },
                 );
+                // PROVISIONAL: nothing keeps the environment's recording (see the module docs),
+                // and every dispatch adds a clock reading to it.
+                drop(env.take_recording());
                 tally.count(&record);
                 match record.outcome {
                     Outcome::Completed | Outcome::NotImplemented => {
@@ -490,9 +529,9 @@ fn crashed<V: Vcpu>(vcpu: &V, exception: Exception) -> Ending {
 }
 
 /// Records an abort at `address` as a fatal fault and ends the run as a crash with `exception`.
-fn fatal_fault<V: Vcpu>(
+fn fatal_fault<V: Vcpu, C: HostClock + Clone>(
     vcpu: &V,
-    session: &Session<'_>,
+    session: &Session<'_, C>,
     address: u64,
     write: bool,
     exception: Exception,

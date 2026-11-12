@@ -80,10 +80,10 @@ mod host {
 
     use starquake_cpu::hvf::{HvfBackend, RamConfig};
     use starquake_cpu::{Backend, Vcpu};
-    use starquake_kernel::svc::tick::CNTFREQ;
     use starquake_loader::patch::CounterRescale;
 
     use super::Error;
+    use crate::clock::{CounterClock, PROCESS_COUNTER_RATE, Timebase};
     use crate::image::{IMAGE_BASE, Program, place};
     use crate::machine;
     use crate::report::{RunOptions, RunReport};
@@ -106,12 +106,19 @@ mod host {
         // the one address space.
         let backend = HvfBackend::new(RamConfig::default())?;
         let ram = backend.ram();
-        // The guest rate is the one the kernel converts `GetSystemTick` with, so a patched
-        // counter read and the system call tick at the same rate. (Their zero points still
-        // differ; see the kernel spec, "Guest time".)
+        // One rate and one zero point for guest time (kernel spec, "Guest time"): the patcher
+        // rescales the backend's counter to the process's rate, the kernel converts its clock
+        // with the same rate, and that clock is the backend's counter.
+        let host_hz = backend.counter_frequency();
+        let time = Timebase {
+            rate: PROCESS_COUNTER_RATE,
+            clock: CounterClock::new(host_hz).ok_or_else(|| {
+                starquake_cpu::Error::Host("the host counter reports a rate of zero".into())
+            })?,
+        };
         let counter = CounterRescale {
-            host_hz: backend.counter_frequency(),
-            guest_hz: CNTFREQ,
+            host_hz,
+            guest_hz: time.rate.hz(),
         };
         // The program's window of virtual addresses is as large as RAM, so what fits one fits
         // the other. Guest code sees each region with its own permissions; the loader writes
@@ -125,7 +132,9 @@ mod host {
         // Declared after the backend, so it is dropped first, as the VM requires.
         let mut vcpu = backend.create_vcpu()?;
         vcpu.set_address_space(space.root(), PROCESS_ASID)?;
-        Ok(machine::run(&mut vcpu, &space, &placed, options, started))
+        Ok(machine::run(
+            &mut vcpu, &space, &placed, options, started, time,
+        ))
     }
 }
 

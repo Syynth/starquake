@@ -16,8 +16,9 @@
 //! the rows one after another. That is the pattern the rest of the kernel can follow; the slab
 //! did not need a "borrow two rows mutably" method.
 //!
-//! **Walking by id.** A walk reads the next id out of a row and looks it up again. Each lookup
-//! is fallible (a stale id is a [`SchedError::Corrupt`]), and loops in the scheduler bound
+//! **Walking by id.** A walk reads the next id out of a row and looks it up again with
+//! [`Slab::stored`], the lookup for ids the kernel stored itself. Each lookup is fallible (a
+//! stale id is a [`SchedError::Corrupt`], through `?`), and loops in the scheduler bound
 //! themselves with a [`Walk`] by the number of live threads, the most entries any list can hold.
 //!
 //! Differences from Eden, none observable:
@@ -56,12 +57,9 @@ impl Walk {
     }
 }
 
-fn row(threads: &Threads, id: ThreadId) -> Result<&Thread, SchedError> {
-    threads.get(id).map_err(|_| SchedError::Corrupt)
-}
-
 fn link(threads: &Threads, id: ThreadId, core: CoreId) -> Result<QueueLink, SchedError> {
-    row(threads, id)?
+    threads
+        .stored(id)?
         .links
         .get(usize::from(core.index()))
         .copied()
@@ -74,8 +72,7 @@ fn link_mut(
     core: CoreId,
 ) -> Result<&mut QueueLink, SchedError> {
     threads
-        .get_mut(id)
-        .map_err(|_| SchedError::Corrupt)?
+        .stored_mut(id)?
         .links
         .get_mut(usize::from(core.index()))
         .ok_or(SchedError::Corrupt)
@@ -260,7 +257,7 @@ impl Levels {
         if let Some(next) = link(threads, member, core)?.next {
             return Ok(Some(next));
         }
-        let level = row(threads, member)?.priority.level();
+        let level = threads.stored(member)?.priority.level();
         let available = *self
             .available
             .get(usize::from(core.index()))
@@ -391,7 +388,7 @@ impl PriorityQueue {
         threads: &mut Threads,
         member: ThreadId,
     ) -> Result<(), SchedError> {
-        let priority = row(threads, member)?.priority;
+        let priority = threads.stored(member)?.priority;
         self.push_back_at(threads, priority, member)
     }
 
@@ -401,7 +398,7 @@ impl PriorityQueue {
         threads: &mut Threads,
         member: ThreadId,
     ) -> Result<(), SchedError> {
-        let priority = row(threads, member)?.priority;
+        let priority = threads.stored(member)?.priority;
         self.remove_at(threads, priority, member)
     }
 
@@ -443,7 +440,7 @@ impl PriorityQueue {
         member: ThreadId,
         core: CoreId,
     ) -> Result<Option<ThreadId>, SchedError> {
-        let priority = row(threads, member)?.priority;
+        let priority = threads.stored(member)?.priority;
         self.scheduled.move_to_back(threads, priority, core, member)
     }
 
@@ -456,7 +453,7 @@ impl PriorityQueue {
         is_running: bool,
         member: ThreadId,
     ) -> Result<(), SchedError> {
-        let new_priority = row(threads, member)?.priority;
+        let new_priority = threads.stored(member)?.priority;
         self.remove_at(threads, prev_priority, member)?;
         if is_running {
             self.push_front_at(threads, new_priority, member)
@@ -474,7 +471,7 @@ impl PriorityQueue {
         prev_affinity: AffinityMask,
         member: ThreadId,
     ) -> Result<(), SchedError> {
-        let priority = row(threads, member)?.priority;
+        let priority = threads.stored(member)?.priority;
         for core in prev_affinity.iter() {
             if Some(core) == prev_core {
                 self.scheduled.remove(threads, priority, core, member)?;
@@ -504,7 +501,7 @@ impl PriorityQueue {
         to_front: bool,
     ) -> Result<(), SchedError> {
         let (_, new_core) = placement(threads, member)?;
-        let priority = row(threads, member)?.priority;
+        let priority = threads.stored(member)?.priority;
         if prev_core == new_core {
             return Ok(());
         }
@@ -567,7 +564,7 @@ fn placement(
     threads: &Threads,
     member: ThreadId,
 ) -> Result<(AffinityMask, Option<CoreId>), SchedError> {
-    let thread = row(threads, member)?;
+    let thread = threads.stored(member)?;
     Ok((thread.affinity, thread.active_core))
 }
 

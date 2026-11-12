@@ -290,6 +290,51 @@ fn horizons_results_for_the_failures() {
 }
 
 #[test]
+fn every_failure_has_one_kernel_error_or_none_and_the_word_is_the_result_modules() {
+    let unreferenced = HandleError::Refs(RefError::NotReferenced { object: obj(0) });
+    for (error, expected) in [
+        (
+            HandleError::TableTooLarge { requested: 2000 },
+            Some(KernelError::OutOfMemory),
+        ),
+        (HandleError::OutOfHandles, Some(KernelError::OutOfHandles)),
+        (
+            HandleError::InvalidHandle { raw: 0 },
+            Some(KernelError::InvalidHandle),
+        ),
+        (HandleError::Corrupt, None),
+        (unreferenced, None),
+    ] {
+        assert_eq!(error.kernel_error(), expected, "{error}");
+        // One encoding: the raw word is whatever `crate::result` says the error's code is.
+        assert_eq!(error.result(), expected.map(|e| e.code().raw()), "{error}");
+        // And what a system call returns for it: the result, or an internal failure carrying
+        // the table's own message.
+        let call = SvcError::from(error);
+        match expected {
+            Some(result) => assert_eq!(call, SvcError::Kernel(result)),
+            None => assert_eq!(call, SvcError::Internal(error.to_string())),
+        }
+    }
+}
+
+#[test]
+fn a_handle_is_the_low_word_of_its_register() {
+    // Distinct halves: keeping the wrong one, or any of the upper bits, shows.
+    let register = 0xAABB_CCDD_1122_3344;
+    assert_eq!(
+        Handle::from_register(register),
+        Handle::from_raw(0x1122_3344)
+    );
+    assert_eq!(Handle::from_register(u64::MAX), Handle::from_raw(u32::MAX));
+    assert_eq!(
+        Handle::from_register(u64::from(Handle::CURRENT_THREAD.raw())),
+        Handle::CURRENT_THREAD
+    );
+    assert_eq!(Handle::from_register(1 << 32), Handle::INVALID);
+}
+
+#[test]
 fn table_size_comes_from_configuration() {
     assert_eq!(table(1).capacity(), 1);
     assert_eq!(table(7).capacity(), 7);
@@ -306,7 +351,7 @@ fn a_table_above_the_maximum_is_refused_with_out_of_memory() {
     for requested in [i32::from(MAX_TABLE_SIZE) + 1, 0x7FFF, 0x1_0000, i32::MAX] {
         let err = HandleTable::new(requested).unwrap_err();
         assert_eq!(err, HandleError::TableTooLarge { requested });
-        assert_eq!(err.result(), Some(RESULT_OUT_OF_MEMORY));
+        assert_eq!(err.kernel_error(), Some(KernelError::OutOfMemory));
     }
 }
 

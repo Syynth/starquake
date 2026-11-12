@@ -36,11 +36,19 @@ pub struct ServiceId(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ResultCode(pub u32);
 
-/// A point in guest time. The unit is whatever the producing clock uses (guess: the recorder does
-/// not interpret it); it is carried for the flight recorder and removed from the golden-trace
-/// view.
+/// A point in guest time: ticks of the guest's counter, at the rate of the process the reading
+/// was made for. Only the kernel makes one, from a [`HostNanos`] reading and the process's
+/// counter rate (`docs/specs/kernel.md`, "Guest time"; `starquake-kernel`'s `time` module is the
+/// one conversion). The recorder does not interpret it; it is carried for the flight recorder
+/// and removed from the golden-trace view.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct GuestTicks(pub u64);
+
+/// A reading of the environment's clock: host nanoseconds since that clock's zero
+/// ([`Env::now`](crate::Env::now)). Not guest time: the kernel converts it to [`GuestTicks`],
+/// and nothing else does (`docs/specs/kernel.md`, "Guest time").
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct HostNanos(pub u64);
 
 /// How the service framework disposed of an IPC request (spec: "stubbed / deferred / done").
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
