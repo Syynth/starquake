@@ -24,6 +24,15 @@
 //!   needs to be HW tested" there). Here a write past the end is [`Fault::BufferOverrun`] and
 //!   writes nothing; a method that means to fill what fits says so with [`OutBuffer::len`].
 //!
+//! # Buffers written later
+//!
+//! A method that defers its reply cannot write an out buffer itself: the work that fills it runs
+//! after the method has returned, somewhere with no access to guest memory. It takes the buffer's
+//! place instead ([`Request::deferred_out_buffer`], a [`DeferredBuffer`]), and the reply its token
+//! is completed with carries the bytes ([`Reply::write_buffer`](super::Reply::write_buffer)). The
+//! framework writes them into the caller's memory when it writes the reply, through the kernel
+//! that speaks for the caller then.
+//!
 //! Not reachable through a request: W (exchange) descriptors, which Eden parses and never reads,
 //! and the inline receive list (flag 1), where there are no C descriptors and Eden's
 //! `WriteBuffer` finds none either.
@@ -181,6 +190,29 @@ impl OutBuffer<'_> {
     }
 }
 
+/// An out buffer's place in the caller's memory, kept to be written when a deferred reply is
+/// delivered (see the [module docs](self)). Only a request hands one out
+/// ([`Request::deferred_out_buffer`]), so its range is always one the caller described.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeferredBuffer {
+    pub(super) address: u64,
+    pub(super) len: u64,
+}
+
+impl DeferredBuffer {
+    /// The buffer's size in bytes: the most a reply may write into it.
+    #[must_use]
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// Whether the buffer has no room at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
 /// Eden's choice between two descriptor lists: the first if it has a non-empty entry, otherwise
 /// the second; and, where Eden logs a failed assertion because there is no second, the first's
 /// empty entry.
@@ -308,6 +340,16 @@ impl<'a> Request<'a> {
         })
     }
 
+    /// The `index`th out buffer (as [`Request::out_buffer`]), to be written by a deferred reply
+    /// ([`Reply::write_buffer`](super::Reply::write_buffer)).
+    pub fn deferred_out_buffer(&self, index: usize) -> Result<DeferredBuffer, Fault> {
+        let span = self.span(Direction::Out, index)?;
+        Ok(DeferredBuffer {
+            address: span.address,
+            len: span.len,
+        })
+    }
+
     /// The `index`th input object of a domain request, as the interface type the command takes.
     ///
     /// [`Fault::NoObject`] if the request has no such input object or the id there names nothing
@@ -385,6 +427,8 @@ mod tests {
                 next_token: &mut next_token,
                 taken: None,
             },
+            env: None,
+            executor: None,
         };
 
         assert_eq!(

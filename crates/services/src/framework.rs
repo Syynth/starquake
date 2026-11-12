@@ -64,8 +64,10 @@
 //!   `reply.deferred()` after taking a reply token, or fails with a [`Fault`]: `?` on any
 //!   framework call, or `Err(code.into())` with the service's own result code.
 //! - [`Context`] is the rest of what a method may touch: guest memory by copy, events, the
-//!   state its family shares ([`Context::family`]), and a reply token for a request it cannot
-//!   answer yet ([`Context::defer`], see [`defer`]).
+//!   state its family shares ([`Context::family`]), a reply token for a request it cannot
+//!   answer yet ([`Context::defer`], see [`defer`]), and the host: the injectable environment
+//!   ([`Context::env`]) and a worker for work that takes time ([`Context::executor`], see
+//!   [`work`]).
 //!
 //! # Running one
 //!
@@ -174,12 +176,6 @@
 //!
 //! # Not here yet
 //!
-//! - Somewhere for a method to send a reply token. A session and its family are plain data, so
-//!   neither can hold a worker or a channel; the service spec's answer is the injectable
-//!   environment (`docs/specs/observability.md`, rule 1), which [`Context`] does not carry
-//!   yet. The first service that defers (`fsp-srv`, slice 6) brings it. The tests here park
-//!   their tokens in a thread-local.
-//! - A deferred reply that writes into the caller's buffers: see [`defer`].
 //! - Servers with more than one worker. [`RequestQueue`] counts workers, but [`Server::handle`]
 //!   takes the server exclusively, so a `Server` always has [`DEFAULT_WORKERS`]. Opting in
 //!   (service spec, "Opting in to parallelism") needs handlers that can run side by side,
@@ -213,6 +209,7 @@ mod server;
 pub mod snapshot;
 mod targets;
 pub mod trace;
+pub mod work;
 
 #[cfg(test)]
 mod tests;
@@ -224,7 +221,7 @@ pub use kernel::Kernel;
 pub use payload::{Reader, Writer};
 pub use queue::{Admission, DEFAULT_WORKERS, QueueError, RequestQueue};
 pub use reply::Reply;
-pub use request::{InBuffer, OutBuffer, Request};
+pub use request::{DeferredBuffer, InBuffer, OutBuffer, Request};
 pub use result::{
     Completion, DEFERRED_REPLY_DROPPED, Direction, Fault, HandleKind, NOT_SUPPORTED,
     OUT_OF_DOMAIN_ENTRIES, Outcome, TARGET_NOT_FOUND, UNKNOWN_COMMAND_ID,
@@ -236,3 +233,4 @@ pub use server::{
 pub use snapshot::{Family, Interfaces, SNAPSHOT_MAGIC, SNAPSHOT_VERSION, SnapshotError};
 pub use targets::{MAX_DOMAIN_OBJECTS, TargetError};
 pub use trace::NO_COMMAND_ID;
+pub use work::{Executor, Job};

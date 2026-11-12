@@ -4,6 +4,7 @@ use core::any::Any;
 use std::sync::Arc;
 
 use starquake_kernel::id::ObjectId;
+use starquake_trace::Env;
 
 use super::defer::{Deferral, ReplyToken, TokenId};
 use super::kernel::Kernel;
@@ -11,10 +12,12 @@ use super::result::{Fault, NOT_SUPPORTED};
 use super::server::UnknownPolicy;
 use super::snapshot::Family;
 use super::targets::Targets;
+use super::work::Executor;
 
 /// What a service method may touch while it handles a request: the caller's memory, by copying in
-/// and out, a narrow part of the kernel, its family's state, and a reply token if it cannot
-/// answer yet.
+/// and out, a narrow part of the kernel, its family's state, a reply token if it cannot answer
+/// yet, and the host, through the injectable environment and a worker
+/// ([`work`](super::work)).
 ///
 /// Buffers a request describes are reached through the request
 /// ([`Request::in_buffer`](super::Request::in_buffer),
@@ -27,6 +30,8 @@ pub struct Context<'a> {
     pub(super) family: Option<&'a mut dyn Family>,
     pub(super) policy: UnknownPolicy,
     pub(super) deferral: Deferral<'a>,
+    pub(super) env: Option<&'a Arc<dyn Env>>,
+    pub(super) executor: Option<&'a Arc<dyn Executor>>,
 }
 
 impl Context<'_> {
@@ -78,6 +83,32 @@ impl Context<'_> {
             );
         }
         family.ok_or(Fault::Result(NOT_SUPPORTED))
+    }
+
+    /// The injectable environment the server was given
+    /// ([`Server::with_env`](super::Server::with_env)): the only way a method reaches host files,
+    /// the clock or random numbers (`docs/specs/observability.md`, rule 1). A copy of the handle,
+    /// so a [`Job`](super::work::Job) can take it along.
+    ///
+    /// A server with no environment is a mistake in how it was put together: it is logged as an
+    /// error and the request fails with [`NOT_SUPPORTED`], as for [`Context::family`].
+    pub fn env(&self) -> Result<Arc<dyn Env>, Fault> {
+        let env = self.env.map(Arc::clone);
+        if env.is_none() {
+            tracing::error!("the server has no environment, and a method asked for it");
+        }
+        env.ok_or(Fault::Result(NOT_SUPPORTED))
+    }
+
+    /// The executor the server was given ([`Server::with_executor`](super::Server::with_executor)),
+    /// for work that takes time ([`work`](super::work)). A server with none fails the request as
+    /// [`Context::env`] does.
+    pub fn executor(&self) -> Result<Arc<dyn Executor>, Fault> {
+        let executor = self.executor.map(Arc::clone);
+        if executor.is_none() {
+            tracing::error!("the server has no executor, and a method asked for one");
+        }
+        executor.ok_or(Fault::Result(NOT_SUPPORTED))
     }
 
     /// Takes the reply token for the request being handled: the method cannot answer yet. It

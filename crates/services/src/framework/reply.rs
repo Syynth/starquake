@@ -5,7 +5,8 @@ use starquake_trace::ServiceId;
 
 use super::commands::Session;
 use super::payload::Writer;
-use super::result::{Completion, Outcome};
+use super::request::DeferredBuffer;
+use super::result::{Completion, Fault, Outcome};
 
 /// Something a reply moves to the caller, in the order the method added it.
 pub(super) enum Moved {
@@ -17,7 +18,8 @@ pub(super) enum Moved {
     Service(ServiceId),
 }
 
-/// The reply to a request: a raw payload, handles, and new interfaces.
+/// The reply to a request: a raw payload, handles, new interfaces, and bytes for the caller's
+/// out buffers.
 ///
 /// A method fills this in and returns [`Reply::ok`]. If it returns a
 /// [`Fault`](super::Fault) instead, the caller gets the fault's result code and nothing that was
@@ -29,6 +31,7 @@ pub struct Reply {
     payload: Writer,
     copies: Vec<ObjectId>,
     moves: Vec<Moved>,
+    writes: Vec<(DeferredBuffer, Vec<u8>)>,
 }
 
 impl Reply {
@@ -67,6 +70,31 @@ impl Reply {
         self
     }
 
+    /// Writes `data` at the start of `buffer` when the reply is sent: how a deferred reply fills
+    /// an out buffer ([`request`](super::request), "Buffers written later"). More than the
+    /// buffer holds is [`Fault::BufferOverrun`], and nothing is kept.
+    ///
+    /// The bytes are written into the caller's memory just before the reply's handles and new
+    /// interfaces are made, after the reply is known to fit a message buffer. Memory the caller
+    /// no longer has mapped then makes the reply the kernel's error and nothing else; buffers
+    /// written before the one that failed stay written.
+    pub fn write_buffer(
+        &mut self,
+        buffer: DeferredBuffer,
+        data: Vec<u8>,
+    ) -> Result<&mut Self, Fault> {
+        let fits = u64::try_from(data.len()).is_ok_and(|len| len <= buffer.len);
+        if !fits {
+            return Err(Fault::BufferOverrun {
+                offset: 0,
+                needed: data.len(),
+                len: buffer.len,
+            });
+        }
+        self.writes.push((buffer, data));
+        Ok(self)
+    }
+
     /// The value a method returns once the reply is complete: success.
     pub fn ok(&self) -> Outcome {
         Ok(Completion::Done)
@@ -81,5 +109,10 @@ impl Reply {
 
     pub(super) fn into_parts(self) -> (Writer, Vec<ObjectId>, Vec<Moved>) {
         (self.payload, self.copies, self.moves)
+    }
+
+    /// The buffer writes, taken out of the reply.
+    pub(super) fn take_writes(&mut self) -> Vec<(DeferredBuffer, Vec<u8>)> {
+        core::mem::take(&mut self.writes)
     }
 }
