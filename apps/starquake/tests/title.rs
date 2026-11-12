@@ -14,7 +14,9 @@ use starquake_core::loader::nso::Nso;
 // The builder is behind the loader's `test-support` feature, which this crate's dev-dependency on
 // the loader turns on; it is the same crate `starquake_core::loader` re-exports.
 use starquake_core::loader::nup::{Nup, PackageKind};
+use starquake_loader::nso::FLAG_ZBIC;
 use starquake_loader::nup::build::{self, Built, Content, PackageSpec, Tree};
+use starquake_loader::zbic;
 
 const BASE_ID: u64 = 0x0100_0000_0000_3000;
 const UPDATE_ID: u64 = 0x0100_0000_0000_3800;
@@ -98,6 +100,21 @@ mod support {
         path.to_str().unwrap()
     }
 
+    /// The `modules:` line `inspect` prints for a main module that parses as `nso`.
+    pub(crate) fn module_line(nso: &Nso) -> String {
+        let build_id = nso.build_id.iter().fold(String::new(), |mut hex, byte| {
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        });
+        format!(
+            "  main             build id {build_id}, text {:#x}, rodata {:#x}, data {:#x}, bss {:#x}",
+            nso.text.data.len(),
+            nso.rodata.data.len(),
+            nso.data.data.len(),
+            nso.bss_size
+        )
+    }
+
     /// The `main.npdm` lines that follow its name and program id, derived from the parsed fixture:
     /// the address space, the main thread, the system resource size, the cores and priorities, and
     /// every allowed system call and service name (issue #95 names them all).
@@ -172,7 +189,7 @@ mod support {
     }
 }
 
-use support::{fixture, npdm_lines, scratch, starquake, text, title, write};
+use support::{fixture, module_line, npdm_lines, scratch, starquake, text, title, write};
 
 #[test]
 fn inspect_prints_the_packages_the_newest_exefs_and_the_npdm() {
@@ -186,10 +203,6 @@ fn inspect_prints_the_packages_the_newest_exefs_and_the_npdm() {
     let nup = Nup::open(std::io::Cursor::new(&built.bytes)).unwrap();
     let npdm = Npdm::parse(&fixture("main.npdm")).unwrap();
     let nso = Nso::parse(&fixture("hello.nso")).unwrap();
-    let build_id = nso.build_id.iter().fold(String::new(), |mut hex, byte| {
-        let _ = write!(hex, "{byte:02x}");
-        hex
-    });
     let nso_size = fixture("hello.nso").len();
     let npdm_size = fixture("main.npdm").len();
     let stored = |path: &str| built.layout.extents[built.file_index(1, path).unwrap()].1;
@@ -225,13 +238,7 @@ fn inspect_prints_the_packages_the_newest_exefs_and_the_npdm() {
         format!("  program id (ACI0): {:016x}", npdm.aci.title_id),
         "  ACID layout: Switch 1 (magic at 0x200)".to_owned(),
         "modules:".to_owned(),
-        format!(
-            "  main             build id {build_id}, text {:#x}, rodata {:#x}, data {:#x}, bss {:#x}",
-            nso.text.data.len(),
-            nso.rodata.data.len(),
-            nso.data.data.len(),
-            nso.bss_size
-        ),
+        module_line(&nso),
     ];
     for line in expected_lines.into_iter().chain(npdm_lines(&npdm)) {
         assert!(
@@ -240,6 +247,34 @@ fn inspect_prints_the_packages_the_newest_exefs_and_the_npdm() {
             ran.stdout
         );
     }
+}
+
+#[test]
+fn inspect_prints_the_build_id_and_segment_sizes_of_a_zbic_compressed_main_module() {
+    // Issue #100: a Switch 2 title's modules store their segments as ZBIC frames. The expected
+    // line is read from the plain fixture, so it is what the decompressed module must parse to.
+    let folder = scratch("inspect-zbic");
+    let plain = fixture("hello.nso");
+    let stored = zbic::build::recompress_nso(&plain).unwrap();
+    assert_ne!(Nso::parse(&stored).unwrap().flags & FLAG_ZBIC, 0);
+    let base = Tree::new()
+        .with_file("exefs/main", Content::raw(stored))
+        .unwrap()
+        .with_file("exefs/main.npdm", Content::raw(fixture("main.npdm")))
+        .unwrap();
+    let built = build::build(&[PackageSpec::new(PackageKind::Base, BASE_ID, 0, base)]).unwrap();
+    let path = write(&folder, "zbic.nup", &built.bytes);
+    let ran = starquake(&["inspect", text(&path)]);
+    assert_eq!(ran.stderr, "");
+    assert_eq!(ran.code, exit::OK);
+
+    let line = module_line(&Nso::parse(&plain).unwrap());
+    assert_eq!(
+        ran.stdout.lines().skip_while(|l| *l != "modules:").nth(1),
+        Some(line.as_str()),
+        "in:\n{}",
+        ran.stdout
+    );
 }
 
 #[test]
