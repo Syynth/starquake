@@ -21,4 +21,13 @@ starquake-shader.workspace = true
 starquake-render.workspace = true
 starquake-gpu.workspace = true
 starquake-gsv.workspace = true
+starquake-trace.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+starquake-cpu = { workspace = true, features = ["test-support"] }
+starquake-testkit.workspace = true
+insta.workspace = true

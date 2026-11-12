@@ -1,0 +1,6 @@
+---
+source: crates/core/tests/skeleton.rs
+expression: report.trace
+---
+thread 1
+  lifecycle ProcessStart 1

@@ -1,0 +1,12 @@
+---
+source: crates/core/tests/skeleton.rs
+expression: report.trace
+---
+thread 1
+  lifecycle ProcessStart 1
+  log len=20 hash=0x856f8b64edc4c61e
+  svc 0x27(0x80001000, 0x14) -> 0x0
+  log len=26 hash=0x4a0865ad2d0a26a4
+  svc 0x27(0x80001014, 0x1a) -> 0x0
+  svc 0x7(0x0, 0x1a) -> 0x0
+  lifecycle ProcessExit 1
