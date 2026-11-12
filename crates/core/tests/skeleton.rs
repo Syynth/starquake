@@ -17,8 +17,12 @@
 use std::time::Duration;
 
 use starquake_core::crash::{Exception, Location};
-use starquake_core::{Error, ExitReason, LoadError, RunOptions, RunReport, System, exit_code};
+use starquake_core::{Error, ExitReason, LoadError, RunReport, exit_code};
+use starquake_kernel::memory::layout::{LayoutRequest, RegionOffsets, Regions};
+use starquake_kernel::memory::{CreateError, MemoryArrangement};
+use starquake_kernel::result::{KernelError, SvcError};
 use starquake_kernel::svc::SvcId;
+use starquake_memory::PAGE_SIZE;
 use starquake_testkit::a64::SysReg;
 use starquake_testkit::nro::{CODE_OFFSET, NroBuilder};
 use starquake_testkit::programs::COUNTER_HZ;
@@ -40,25 +44,13 @@ const HELLO_SNAPSHOT: &str = include_str!("snapshots/skeleton__hello_trace.snap"
 /// exact value (`crates/core/src/clock.rs`), so one tick.
 const ROUNDING: u64 = 1;
 
-/// Long enough for any of these programs on a loaded machine; they finish in milliseconds.
-const GENEROUS: Duration = Duration::from_secs(30);
+#[cfg(test)]
+mod common;
 
 /// Shared setup. In a `cfg(test)` module so it may unwrap like the tests do.
 #[cfg(test)]
 mod support {
     use super::*;
-
-    /// Runs an NRO to completion, or returns `None` on hosted CI.
-    pub(crate) fn run(file: &[u8], timeout: Duration) -> Option<RunReport> {
-        if std::env::var_os("CI").is_some() {
-            return None;
-        }
-        let options = RunOptions {
-            timeout: Some(timeout),
-            command_line: Vec::new(),
-        };
-        Some(System::new(file).expect("load the program").run(&options))
-    }
 
     /// The guest's output as text.
     pub(crate) fn output(report: &RunReport) -> Vec<String> {
@@ -112,7 +104,8 @@ mod support {
     }
 }
 
-use support::{events, golden_trace, image_base, output, output_is_expected, run, trace_is_golden};
+use common::{GENEROUS, run};
+use support::{events, golden_trace, image_base, output, output_is_expected, trace_is_golden};
 
 #[test]
 fn hello_prints_the_expected_lines_and_its_trace_matches_the_snapshot() {
@@ -716,35 +709,441 @@ fn an_endless_loop_is_ended_by_the_timeout() {
 }
 
 #[test]
-fn a_program_too_large_for_guest_memory_is_an_emulator_error() {
-    /// More `.bss` than the backend's guest RAM holds; a whole number of pages.
-    const BSS: u32 = 64 << 20;
+fn a_program_larger_than_an_application_may_be_is_an_emulator_error() {
+    // As much `.bss` as the application pool of the console holds (with the page of text, one
+    // page too much): the kernel cannot reserve the program's code.
+    let pool = MemoryArrangement::FourGb.application_pool_size();
     let file = NroBuilder::new(&[a64::nop()])
-        .bss_size(BSS)
+        .bss_size(u32::try_from(pool).unwrap())
         .build()
         .unwrap();
-    // What the layout costs is read off a run that fits, not restated: the TLS block and the
-    // stack are in its memory map, and guest RAM runs from the image to the end of the stack.
-    let Some(fits) = run(&programs::hello().unwrap(), GENEROUS) else {
+    let Some(report) = run(&file, GENEROUS) else {
         return;
     };
-    let mapping = |name: &str| {
-        fits.memory_map
-            .iter()
-            .find(|mapping| mapping.name == name)
-            .expect("the mapping is in the memory map")
-    };
-    let size = |name: &str| mapping(name).end - mapping(name).start;
-    let available = mapping("stack").end - image_base(&fits);
-    // The image is already whole pages, as the builder writes it.
-    let needed = file.len() as u64 + u64::from(BSS) + size("tls") + size("stack");
-    assert!(needed > available);
-
-    let report = run(&file, GENEROUS).unwrap();
-    let error = Error::Load(LoadError::DoesNotFit { needed, available });
+    let error = Error::Load(LoadError::AddressSpace(CreateError::Code(
+        SvcError::Kernel(KernelError::LimitReached),
+    )));
     assert_eq!(report.exit, ExitReason::EmulatorError(error.to_string()));
     assert_eq!(report.exit_code(), exit_code::EMULATOR_ERROR);
     assert_eq!(report.trace, "");
+    assert_eq!(
+        error.to_string(),
+        "the program's address space could not be created: the program's code could not be \
+         mapped: limit reached"
+    );
+}
+
+/// Programs that make the kernel's memory calls and then use, or misuse, the memory: what a
+/// call did must be what the vCPU's translation does.
+#[cfg(test)]
+mod memory_calls {
+    use starquake_testkit::a64::Assembler;
+
+    use super::permissions::{Offsets, build, code_offset, distance};
+    use super::*;
+
+    /// The value the programs store and compare.
+    const VALUE: u32 = 0x1234;
+    /// The size of the heap the heap programs ask for: one alignment unit of `SetHeapSize`.
+    pub(crate) const HEAP_SIZE: u64 = starquake_kernel::svc::memory::HEAP_SIZE_ALIGNMENT;
+    /// `Svc::MemoryPermission::Read` and `ReadWrite`, as a guest passes them.
+    pub(crate) const PERM_READ: u32 = 1;
+    pub(crate) const PERM_READ_WRITE: u32 = 3;
+
+    fn svc(id: SvcId) -> u32 {
+        a64::svc(u32::from(id.number())).unwrap()
+    }
+
+    /// A program that stores to the first page of its data, asks `SetMemoryPermission` to give
+    /// that page `permission`, checks that the call succeeded and that a load still reads what
+    /// was stored, stores again and exits. Returns the NRO, where its parts are, and the index
+    /// of the second store.
+    ///
+    /// ```text
+    ///       adr  x9, data
+    ///       movz x1, #VALUE
+    ///       str  x1, [x9]          ; backs the page; the vCPU now caches a writable entry
+    ///       mov  x0, x9
+    ///       movz x1, #0x1000
+    ///       movz x2, #permission
+    ///       svc  #0x2
+    ///       cbnz x0, fail
+    ///       ldr  x3, [x9]
+    ///       movz x5, #VALUE
+    ///       sub  x4, x3, x5
+    ///       cbnz x4, fail
+    ///       str  x5, [x9]          ; the second store
+    ///       svc  #0x7
+    /// fail: brk  #1
+    /// ```
+    pub(crate) fn reprotects_its_data(permission: u32) -> (Vec<u8>, Offsets, usize) {
+        let mut second_store = 0;
+        let (file, offsets) = build(|at| {
+            let mut asm = Assembler::new();
+            let fail = asm.label();
+            asm.emit(a64::adr(9, distance(at.data, asm.len())).unwrap());
+            asm.emit(a64::movz(1, VALUE, 0).unwrap());
+            asm.emit(a64::str(1, 9, 0).unwrap());
+            asm.emit(a64::mov(0, 9).unwrap());
+            asm.emit(a64::movz(1, u32::try_from(PAGE_SIZE).unwrap(), 0).unwrap());
+            asm.emit(a64::movz(2, permission, 0).unwrap());
+            asm.emit(svc(SvcId::SetMemoryPermission));
+            asm.cbnz(0, fail).unwrap();
+            asm.emit(a64::ldr(3, 9, 0).unwrap());
+            asm.emit(a64::movz(5, VALUE, 0).unwrap());
+            asm.emit(a64::sub(4, 3, 5).unwrap());
+            asm.cbnz(4, fail).unwrap();
+            asm.emit(a64::str(5, 9, 0).unwrap());
+            asm.emit(svc(SvcId::ExitProcess));
+            asm.bind(fail).unwrap();
+            asm.emit(a64::brk(1).unwrap());
+            asm.finish().unwrap()
+        });
+        // The layout does not depend on the instructions, so the index is the same in the
+        // placeholder pass and the real one.
+        let words = usize::try_from(code_offset(0)).unwrap();
+        let store = a64::str(5, 9, 0).unwrap().to_le_bytes();
+        for (index, word) in file[words..].chunks_exact(4).enumerate() {
+            if word == store {
+                second_store = index;
+                break;
+            }
+        }
+        (file, offsets, second_store)
+    }
+
+    /// What a heap program does once its heap works.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Then {
+        /// Exits.
+        Exit,
+        /// Stores to the first word after the heap.
+        StorePastTheEnd,
+        /// Sets the heap's size to zero and loads from where the heap was.
+        LoadAfterFreeing,
+    }
+
+    /// A program that sets its heap to [`HEAP_SIZE`] bytes, stores [`VALUE`] to the heap's
+    /// first and last words and reads it back from each, and then does `then`. Any call that
+    /// fails, and any value that does not read back, ends at `brk #1`.
+    ///
+    /// ```text
+    ///       movz x1, #HEAP_SIZE >> 16, lsl #16
+    ///       svc  #0x1
+    ///       cbnz x0, fail
+    ///       mov  x9, x1            ; the heap's address
+    ///       movz x2, #VALUE
+    ///       str  x2, [x9]
+    ///       ldr  x3, [x9]
+    ///       sub  x4, x2, x3
+    ///       cbnz x4, fail
+    ///       movz/movk x11, #-(HEAP_SIZE - 0x1000)
+    ///       sub  x10, x9, x11      ; the heap's last page
+    ///       str  x2, [x10, #0xff8]
+    ///       ldr  x3, [x10, #0xff8]
+    ///       sub  x4, x2, x3
+    ///       cbnz x4, fail
+    ///       ...                    ; then
+    ///       svc  #0x7
+    /// fail: brk  #1
+    /// ```
+    pub(crate) fn uses_a_heap(then: Then) -> Vec<u8> {
+        let page = u32::try_from(PAGE_SIZE).unwrap();
+        let last_word = page - a64::MEM_OFFSET_ALIGN;
+        let halfword = |value: u64, shift: u32| {
+            u32::try_from((value >> shift) & u64::from(a64::MAX_IMM16)).unwrap()
+        };
+        let mut asm = Assembler::new();
+        let fail = asm.label();
+        asm.emit(a64::movz(1, halfword(HEAP_SIZE, 16), 16).unwrap());
+        asm.emit(svc(SvcId::SetHeapSize));
+        asm.cbnz(0, fail).unwrap();
+        asm.emit(a64::mov(9, 1).unwrap());
+        asm.emit(a64::movz(2, VALUE, 0).unwrap());
+        asm.emit(a64::str(2, 9, 0).unwrap());
+        asm.emit(a64::ldr(3, 9, 0).unwrap());
+        asm.emit(a64::sub(4, 2, 3).unwrap());
+        asm.cbnz(4, fail).unwrap();
+        // x10 = x9 + (HEAP_SIZE - one page), as a subtraction of its negative.
+        let back = (HEAP_SIZE - PAGE_SIZE).wrapping_neg();
+        asm.emit(a64::movz(11, halfword(back, 0), 0).unwrap());
+        for shift in [16, 32, 48] {
+            asm.emit(a64::movk(11, halfword(back, shift), shift).unwrap());
+        }
+        asm.emit(a64::sub(10, 9, 11).unwrap());
+        asm.emit(a64::str(2, 10, last_word).unwrap());
+        asm.emit(a64::ldr(3, 10, last_word).unwrap());
+        asm.emit(a64::sub(4, 2, 3).unwrap());
+        asm.cbnz(4, fail).unwrap();
+        match then {
+            Then::Exit => {}
+            Then::StorePastTheEnd => asm.emit(a64::str(2, 10, page).unwrap()),
+            Then::LoadAfterFreeing => {
+                asm.emit(a64::movz(1, 0, 0).unwrap());
+                asm.emit(svc(SvcId::SetHeapSize));
+                asm.cbnz(0, fail).unwrap();
+                asm.emit(a64::ldr(3, 9, 0).unwrap());
+            }
+        }
+        asm.emit(svc(SvcId::ExitProcess));
+        asm.bind(fail).unwrap();
+        asm.emit(a64::brk(1).unwrap());
+        NroBuilder::new(&asm.finish().unwrap()).build().unwrap()
+    }
+
+    /// A program with `bss` bytes of `.bss` that stores to the first word of each of the
+    /// first `pages` pages of it, and exits.
+    ///
+    /// ```text
+    ///       adr  x0, bss
+    ///       movz/movk x1, #pages
+    ///       movz/movk x2, #-0x1000
+    /// loop: str  x1, [x0]
+    ///       sub  x0, x0, x2        ; the next page
+    ///       sub  x1, x1, #1
+    ///       cbnz x1, loop
+    ///       svc  #0x7
+    /// ```
+    pub(crate) fn touches_bss(bss: u32, pages: u32) -> Vec<u8> {
+        let halfword = |value: u64, shift: u32| {
+            u32::try_from((value >> shift) & u64::from(a64::MAX_IMM16)).unwrap()
+        };
+        let code = |bss_offset: u64| {
+            let mut asm = Assembler::new();
+            asm.emit(a64::adr(0, distance(bss_offset, asm.len())).unwrap());
+            asm.emit(a64::movz(1, halfword(u64::from(pages), 0), 0).unwrap());
+            asm.emit(a64::movk(1, halfword(u64::from(pages), 16), 16).unwrap());
+            let step = PAGE_SIZE.wrapping_neg();
+            asm.emit(a64::movz(2, halfword(step, 0), 0).unwrap());
+            for shift in [16, 32, 48] {
+                asm.emit(a64::movk(2, halfword(step, shift), shift).unwrap());
+            }
+            let again = asm.label();
+            asm.bind(again).unwrap();
+            asm.emit(a64::str(1, 0, 0).unwrap());
+            asm.emit(a64::sub(0, 0, 2).unwrap());
+            asm.emit(a64::sub_imm(1, 1, 1).unwrap());
+            asm.cbnz(1, again).unwrap();
+            asm.emit(svc(SvcId::ExitProcess));
+            asm.finish().unwrap()
+        };
+        // `.bss` follows the image, which is one page of text here whatever the code says.
+        let image = NroBuilder::new(&code(0))
+            .bss_size(bss)
+            .build()
+            .unwrap()
+            .len() as u64;
+        NroBuilder::new(&code(image)).bss_size(bss).build().unwrap()
+    }
+}
+
+/// Where the kernel put the heap region of a run: the layout for the module in the run's
+/// memory map, on the console every program gets.
+#[cfg(test)]
+fn heap_region_start(report: &RunReport) -> u64 {
+    let module: Vec<_> = report
+        .memory_map
+        .iter()
+        .filter(|mapping| mapping.name.starts_with("main."))
+        .collect();
+    let base = image_base(report);
+    let end = module.iter().map(|mapping| mapping.end).max().unwrap();
+    Regions::new(&LayoutRequest {
+        code_address: base,
+        code_size: end.next_multiple_of(PAGE_SIZE) - base,
+        physical_memory_size: MemoryArrangement::FourGb.physical_memory_size(),
+        alias_region_extra: false,
+        offsets: RegionOffsets::default(),
+    })
+    .unwrap()
+    .heap
+    .start
+}
+
+#[test]
+fn a_store_to_a_page_made_read_only_faults_at_that_page_and_a_load_still_works() {
+    let (file, at, second_store) = memory_calls::reprotects_its_data(memory_calls::PERM_READ);
+    let Some(report) = run(&file, GENEROUS) else {
+        return;
+    };
+    // The first store, the call and the load after it all worked (anything else ends at the
+    // program's `brk`, an undefined-instruction crash); the second store is the crash.
+    let crash = report.crash().expect("a crash report");
+    let data = image_base(&report) + at.data;
+    assert_eq!(
+        crash.exception,
+        Exception::DataAbort {
+            address: data,
+            write: true
+        },
+        "{}",
+        crash.to_text()
+    );
+    assert_eq!(
+        crash.pc,
+        image_base(&report) + permissions::code_offset(second_store)
+    );
+    assert_eq!(crash.fault_mapping.as_deref(), Some("main.data"));
+    // The one call the program made, with the page it named, succeeded.
+    assert_eq!(
+        events(&report)
+            .into_iter()
+            .filter(|kind| matches!(kind, EventKind::Svc { .. }))
+            .collect::<Vec<_>>(),
+        [EventKind::Svc {
+            id: u32::from(SvcId::SetMemoryPermission.number()),
+            args: [
+                data,
+                PAGE_SIZE,
+                u64::from(memory_calls::PERM_READ),
+                0,
+                0,
+                0,
+                0,
+                0
+            ],
+            result: starquake_trace::ResultCode(0),
+        }]
+    );
+    assert!(report.stubbed.is_empty(), "{:?}", report.stubbed);
+}
+
+#[test]
+fn the_same_program_with_the_page_left_writable_exits_normally() {
+    // The control for the test above: the only difference is the permission the program asks
+    // for, so the crash there is the call's doing.
+    let (file, _, _) = memory_calls::reprotects_its_data(memory_calls::PERM_READ_WRITE);
+    let Some(report) = run(&file, GENEROUS) else {
+        return;
+    };
+    assert_eq!(
+        report.exit,
+        ExitReason::ProcessExited,
+        "{:?}",
+        report
+            .crash()
+            .map(starquake_core::crash::CrashReport::to_text)
+    );
+    assert_eq!(
+        report.system_calls.iter().collect::<Vec<_>>(),
+        [
+            (&"ExitProcess".to_owned(), &1),
+            (&"SetMemoryPermission".to_owned(), &1)
+        ]
+    );
+}
+
+#[test]
+fn a_heap_can_be_read_and_written_from_its_first_word_to_its_last() {
+    let file = memory_calls::uses_a_heap(memory_calls::Then::Exit);
+    let Some(report) = run(&file, GENEROUS) else {
+        return;
+    };
+    assert_eq!(
+        report.exit,
+        ExitReason::ProcessExited,
+        "{:?}",
+        report
+            .crash()
+            .map(starquake_core::crash::CrashReport::to_text)
+    );
+    assert_eq!(
+        report.system_calls.iter().collect::<Vec<_>>(),
+        [
+            (&"ExitProcess".to_owned(), &1),
+            (&"SetHeapSize".to_owned(), &1)
+        ]
+    );
+}
+
+#[test]
+fn the_first_word_after_a_heap_and_a_heap_that_was_freed_are_not_there() {
+    use memory_calls::{HEAP_SIZE, Then};
+    for (then, offset, write) in [
+        (Then::StorePastTheEnd, HEAP_SIZE, true),
+        (Then::LoadAfterFreeing, 0, false),
+    ] {
+        let Some(report) = run(&memory_calls::uses_a_heap(then), GENEROUS) else {
+            return;
+        };
+        let crash = report.crash().expect("a crash report");
+        // The heap worked up to here, at the address the kernel answered: the fault is where
+        // the layout puts the heap region, plus the offset.
+        let address = heap_region_start(&report) + offset;
+        assert_eq!(
+            crash.exception,
+            Exception::DataAbort { address, write },
+            "{then:?}: {}",
+            crash.to_text()
+        );
+        assert_eq!(crash.fault_mapping, None, "{then:?}");
+        // Freeing took a second call; both succeeded.
+        let calls = if then == Then::LoadAfterFreeing { 2 } else { 1 };
+        assert_eq!(
+            report.system_calls.get("SetHeapSize"),
+            Some(&calls),
+            "{then:?}"
+        );
+        let results: Vec<u32> = events(&report)
+            .into_iter()
+            .filter_map(|kind| match kind {
+                EventKind::Svc { result, .. } => Some(result.0),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            results,
+            vec![0; usize::try_from(calls).unwrap()],
+            "{then:?}"
+        );
+    }
+}
+
+#[test]
+fn memory_a_program_never_touches_needs_no_guest_ram() {
+    /// More `.bss` than the backend's guest RAM holds (16 MiB); a whole number of pages.
+    const BSS: u32 = 64 << 20;
+    // Touching a few pages of it is fine.
+    let Some(report) = run(&memory_calls::touches_bss(BSS, 8), GENEROUS) else {
+        return;
+    };
+    assert_eq!(
+        report.exit,
+        ExitReason::ProcessExited,
+        "{:?}",
+        report
+            .crash()
+            .map(starquake_core::crash::CrashReport::to_text)
+    );
+
+    // Touching all of it runs out of guest RAM, which is the emulator's failure (PROVISIONAL:
+    // the kernel's accounting lets an application use far more than the backend backs). The
+    // run names the page that could not be backed: one of `.bss`, on a page boundary.
+    let pages = BSS / u32::try_from(PAGE_SIZE).unwrap();
+    let report = run(&memory_calls::touches_bss(BSS, pages), GENEROUS).unwrap();
+    assert_eq!(report.exit_code(), exit_code::EMULATOR_ERROR);
+    let ExitReason::EmulatorError(message) = &report.exit else {
+        unreachable!("{:?}", report.exit);
+    };
+    let address = message
+        .strip_prefix("guest memory at 0x")
+        .and_then(|rest| {
+            rest.strip_suffix(
+                " could not be backed: mapping 0x1000 bytes needs more guest RAM than the 0x0 \
+                 bytes left",
+            )
+        })
+        .and_then(|digits| u64::from_str_radix(digits, 16).ok())
+        .unwrap_or_else(|| unreachable!("{message}"));
+    let bss = report
+        .memory_map
+        .iter()
+        .find(|mapping| mapping.name == "main.bss")
+        .expect("a .bss mapping");
+    assert!(bss.contains(address), "{address:#x}");
+    assert!(address.is_multiple_of(PAGE_SIZE), "{address:#x}");
+    // Not the first page: RAM held what came before it.
+    assert!(address > bss.start);
 }
 
 #[test]

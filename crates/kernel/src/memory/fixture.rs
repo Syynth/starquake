@@ -1,6 +1,6 @@
-//! An address space laid out like the homebrew fixture's, for this crate's tests: seven pages
-//! of code (four of text, one of read-only data, two of data), a main thread's stack, and a
-//! recording [`Mapper`](super::Mapper) behind it.
+//! An address space laid out like the homebrew fixture's (`tests/homebrew/hello/hello.nro`), for
+//! this crate's tests: seven pages of code (three of text, one of read-only data, three of data
+//! and `.bss`), a main thread's stack, and a recording [`Mapper`](super::Mapper) behind it.
 
 use starquake_memory::PAGE_SIZE;
 
@@ -10,10 +10,10 @@ use super::{AddressSpace, MemoryArrangement, ProcessMemory, RegionOffsets, SvcPe
 /// Where the code goes: Eden's address for 39-bit code without randomisation
 /// (`KProcess::LoadFromMetadata`).
 pub(crate) const CODE: u64 = 0x8000_0000;
-/// Pages of text, read-only data and data.
-pub(crate) const TEXT_PAGES: u64 = 4;
+/// Pages of text, of read-only data, and of data with `.bss`.
+pub(crate) const TEXT_PAGES: u64 = 3;
 pub(crate) const RODATA_PAGES: u64 = 1;
-pub(crate) const DATA_PAGES: u64 = 2;
+pub(crate) const DATA_PAGES: u64 = 3;
 /// Pages of code in all.
 pub(crate) const CODE_PAGES: u64 = TEXT_PAGES + RODATA_PAGES + DATA_PAGES;
 /// The size of the code in bytes.

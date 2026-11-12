@@ -1,0 +1,43 @@
+# The hello fixture's system calls, IPC requests and log lines from start to exit, as the
+# reference emulator ran it: Eden-NX2 @ 50fa86bbbc40 (`eden-nx2` in docs/references.md).
+# Normalised by normalise.py in this folder: no timestamps or thread ids, arguments decoded,
+# addresses as `anchor+offset`. README.md in this folder has the provenance and the format.
+# Do not edit by hand; `crates/core/tests/homebrew.rs` compares starquake's run with it.
+svc 0x02 SetMemoryPermission(address=main+0x4000, size=0x1000, perm=0x1) -> 0x0
+svc 0x03 SetMemoryAttribute(address=main+0x4000, size=0x1000, mask=0x10, attr=0x10) -> 0x0
+svc 0x29 GetInfo(info_type=0x2, handle=0xffff8001, info_subtype=0x0) -> 0x0 out=alias_region+0x0
+svc 0x29 GetInfo(info_type=0x3, handle=0xffff8001, info_subtype=0x0) -> 0x0 out=0x1000000000
+svc 0x29 GetInfo(info_type=0x1c, handle=0xffff8001, info_subtype=0x0) -> 0x0 out=0x0
+svc 0x29 GetInfo(info_type=0x4, handle=0xffff8001, info_subtype=0x0) -> 0x0 out=heap_region+0x0
+svc 0x29 GetInfo(info_type=0x5, handle=0xffff8001, info_subtype=0x0) -> 0x0 out=0x200000000
+svc 0x29 GetInfo(info_type=0xc, handle=0xffff8001, info_subtype=0x0) -> 0x0 out=aslr_region+0x0
+svc 0x29 GetInfo(info_type=0xd, handle=0xffff8001, info_subtype=0x0) -> 0x0 out=0x7ff8000000
+svc 0x29 GetInfo(info_type=0xe, handle=0xffff8001, info_subtype=0x0) -> 0x0 out=stack_region+0x0
+svc 0x29 GetInfo(info_type=0xf, handle=0xffff8001, info_subtype=0x0) -> 0x0 out=0x80000000
+svc 0x29 GetInfo(info_type=0x6, handle=0xffff8001, info_subtype=0x0) -> 0x0 out=0xcd500000
+svc 0x29 GetInfo(info_type=0x7, handle=0xffff8001, info_subtype=0x0) -> 0x0 out=0x107000
+svc 0x01 SetHeapSize(size=0xcd000000) -> 0x0 out_address=heap_region+0x0
+svc 0x06 QueryMemory(out_memory_info=stack_region+0x103fc8, address=stack_region+0x103fc8) -> 0x0 out_page_info=0x0
+svc 0x06 QueryMemory(out_memory_info=stack_region+0x103fc8, address=main+0x6000) -> 0x0 out_page_info=0x0
+svc 0x1f ConnectToNamedPort(name=main+0x3148) -> 0x0 out_handle=0x103fe
+ipc IpcController::3 (QueryPointerBufferSize)
+svc 0x21 SendSyncRequest(session_handle=0x103fe) -> 0x0
+ipc sm:::0 (Initialize)
+svc 0x21 SendSyncRequest(session_handle=0x103fe) -> 0x0
+log starquake hello: line one
+svc 0x27 OutputDebugString(debug_str=main+0x30a0, len=0x19) -> 0x0
+log starquake hello: line two
+svc 0x27 OutputDebugString(debug_str=main+0x30c0, len=0x19) -> 0x0
+ipc sm:::1 (GetService)
+svc 0x21 SendSyncRequest(session_handle=0x103fe) -> 0x0
+ipc IpcController::3 (QueryPointerBufferSize)
+svc 0x21 SendSyncRequest(session_handle=0x183fd) -> 0x0
+ipc set:sys::3 (GetFirmwareVersion)
+svc 0x21 SendSyncRequest(session_handle=0x183fd) -> 0x0
+svc 0x21 SendSyncRequest(session_handle=0x183fd) -> 0xf601
+svc 0x16 CloseHandle(handle=0x183fd) -> 0x0
+log starquake hello: set:sys firmware version ok
+svc 0x27 OutputDebugString(debug_str=main+0x30e0, len=0x2c) -> 0x0
+svc 0x21 SendSyncRequest(session_handle=0x103fe) -> 0xf601
+svc 0x16 CloseHandle(handle=0x103fe) -> 0x0
+svc 0x07 ExitProcess()

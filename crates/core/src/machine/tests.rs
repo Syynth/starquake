@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 
 use starquake_cpu::testing::ScriptedVcpu;
 use starquake_cpu::{Exit, FaultStatus, Interrupter, Syndrome, Vcpu};
+use starquake_kernel::handle::{MAX_TABLE_SIZE, MIN_LINEAR_ID};
+use starquake_kernel::memory::testing::RecordingMapper;
 use starquake_kernel::result::KernelError;
 use starquake_kernel::svc::SvcId;
 use starquake_memory::{Fault, FlatMemory};
@@ -19,12 +21,13 @@ use starquake_trace::{
 use super::*;
 use crate::clock::PROCESS_COUNTER_RATE;
 use crate::crash::Location;
-use crate::image::{Program, place};
+use crate::image::{Loaded, Program, load};
 use crate::report::{empty_dump, exit_code};
 
-/// Where a real run puts the program.
+/// Where a real run puts the program, and where the tests' flat memory starts.
 const RAM_BASE: u64 = crate::image::IMAGE_BASE;
-/// Room for a small image, its TLS block and the stack.
+/// Room for a small image and the strings the tests have the guest print. The stack and the
+/// TLS block are elsewhere in the address space, where no scripted guest reaches.
 const RAM_SIZE: usize = 2 << 20;
 
 /// The time a scripted run counts with: the rate every process has for now, and the host's
@@ -36,27 +39,62 @@ fn timebase() -> Timebase<SystemClock> {
     }
 }
 
-/// A program placed in flat memory.
+/// Flat memory as a guest's address space: it backs nothing lazily (every byte it has is
+/// there from the start) and owes its vCPUs nothing.
+impl<V> GuestSpace<V> for FlatMemory {
+    fn touch(&self, _: u64, _: Access) -> Touch {
+        Touch::Refused
+    }
+
+    fn settle(&self, _: &mut V) -> Result<(), starquake_cpu::Error> {
+        Ok(())
+    }
+}
+
+/// A program loaded into flat memory, with the kernel's address space behind a mapper that
+/// changes nothing.
 struct Guest {
     memory: FlatMemory,
     placed: Placement,
+    /// The kernel's address space, until a run takes it.
+    address_space: Cell<Option<AddressSpace>>,
 }
 
 impl Guest {
     fn new(file: &[u8]) -> Self {
         let program = Program::parse(file).unwrap();
-        let placed = place(&program, RAM_BASE, RAM_SIZE as u64, None).unwrap();
         let memory = FlatMemory::new(RAM_BASE, RAM_SIZE);
-        placed.write_into(&memory).unwrap();
-        Self { memory, placed }
+        let (mapper, _log) = RecordingMapper::new();
+        let Loaded {
+            placed,
+            address_space,
+        } = load(&program, None, Box::new(mapper), &memory).unwrap();
+        Self {
+            memory,
+            placed,
+            address_space: Cell::new(Some(address_space)),
+        }
+    }
+
+    /// The kernel's address space. A guest runs once.
+    fn address_space(&self) -> AddressSpace {
+        self.address_space.take().expect("one run per guest")
+    }
+
+    /// What the loop takes, with `space` as the guest's address space.
+    fn program<'a, V>(&'a self, space: &'a dyn GuestSpace<V>) -> GuestProgram<'a, V> {
+        GuestProgram {
+            space,
+            placed: &self.placed,
+            address_space: self.address_space(),
+        }
     }
 
     /// Runs `vcpu` as this guest.
     fn run(&self, mut vcpu: ScriptedVcpu, options: &RunOptions) -> RunReport {
         run(
             &mut vcpu,
-            &self.memory,
-            &self.placed,
+            self.program(&self.memory),
             options,
             Instant::now(),
             timebase(),
@@ -78,8 +116,7 @@ impl Guest {
 /// first level of the walk.
 const UNMAPPED_STORE: Syndrome = Syndrome::data_abort(FaultStatus::Translation { level: 1 }, true);
 
-/// Where the tests put strings for the guest to print: free memory between the image and the
-/// stack.
+/// Where the tests put strings for the guest to print: flat memory above the image.
 const SCRATCH: u64 = RAM_BASE + 0x8_0000;
 
 /// Guest memory whose every read takes a while, so two clock readings on either side of one
@@ -94,6 +131,16 @@ impl GuestMemory for SlowMemory<'_> {
 
     fn write(&self, va: u64, data: &[u8]) -> Result<(), Fault> {
         self.0.write(va, data)
+    }
+}
+
+impl<V> GuestSpace<V> for SlowMemory<'_> {
+    fn touch(&self, _: u64, _: Access) -> Touch {
+        Touch::Refused
+    }
+
+    fn settle(&self, _: &mut V) -> Result<(), starquake_cpu::Error> {
+        Ok(())
     }
 }
 
@@ -164,13 +211,20 @@ fn a_guest_that_prints_two_lines_and_exits_is_reported_in_full() {
     let second_at = first_at + first.len() as u64;
     let (first_len, second_len) = (first.len() as u64, second.len() as u64);
     let (entry, stack_top, tls) = (guest.placed.entry, guest.placed.stack_top, guest.placed.tls);
+    let main_thread = Handle::from_parts(MAX_TABLE_SIZE - 1, MIN_LINEAR_ID).unwrap();
+    assert_eq!(main_thread.raw(), 0x83ff);
 
     let vcpu = ScriptedVcpu::new()
         .then(
             move |regs| {
-                // What the loop starts the thread with.
+                // What the loop starts the thread with: `x1` is a handle to the main thread,
+                // the first handle of a full-size table (its last index, the first linear
+                // id), and everything else is zero. The reference emulator's trace of the
+                // homebrew fixture shows the same value, 0x83ff, left in `x2`.
                 assert_eq!((regs.pc, regs.sp, regs.tpidrro), (entry, stack_top, tls));
-                assert_eq!((regs.x, regs.tpidr, regs.pstate), ([0; 31], 0, 0));
+                let mut x = [0; 31];
+                x[1] = u64::from(main_thread.raw());
+                assert_eq!((regs.x, regs.tpidr, regs.pstate), (x, 0, 0));
                 regs.x[0] = first_at;
                 regs.x[1] = first_len;
             },
@@ -487,8 +541,7 @@ fn a_log_line_and_the_call_that_wrote_it_carry_one_time() {
     // reading for the log line would be later than the call's.
     let report = run(
         &mut vcpu,
-        &SlowMemory(&guest.memory),
-        &guest.placed,
+        guest.program(&SlowMemory(&guest.memory)),
         &RunOptions::default(),
         Instant::now(),
         timebase(),
@@ -527,8 +580,7 @@ fn get_system_tick_is_the_clock_at_the_rate_the_run_was_given() {
             .then(move |regs| seen.set(regs.x[0]), svc(SvcId::ExitProcess));
         let report = run(
             &mut vcpu,
-            &guest.memory,
-            &guest.placed,
+            guest.program(&guest.memory),
             &RunOptions::default(),
             Instant::now(),
             Timebase {
@@ -583,7 +635,11 @@ fn the_environments_recording_is_dropped_as_it_is_made() {
     }
     let mut vcpu = vcpu.then(|_| {}, svc(SvcId::ExitProcess));
 
-    let ending = drive(&mut vcpu, &session, &env, &mut log, &mut tally);
+    let process = Process {
+        space: &guest.memory,
+        address_space: guest.address_space(),
+    };
+    let ending = drive(&mut vcpu, process, &session, &env, &mut log, &mut tally);
     assert!(matches!(ending, Ending::Exited));
     // The calls were made, through this environment...
     assert_eq!(
@@ -655,8 +711,7 @@ fn the_trace_and_the_guest_log_stop_growing_at_their_limits() {
     let mut vcpu = printing(&guest.memory, &lines);
     let report = run_within(
         &mut vcpu,
-        &guest.memory,
-        &guest.placed,
+        guest.program(&guest.memory),
         &RunOptions::default(),
         Instant::now(),
         timebase(),
@@ -702,8 +757,7 @@ fn a_run_within_its_limits_is_not_truncated() {
     let mut vcpu = printing(&guest.memory, &lines);
     let report = run_within(
         &mut vcpu,
-        &guest.memory,
-        &guest.placed,
+        guest.program(&guest.memory),
         &RunOptions::default(),
         Instant::now(),
         timebase(),

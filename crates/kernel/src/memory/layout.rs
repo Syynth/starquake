@@ -383,13 +383,13 @@ mod tests {
     }
 
     /// What Eden-NX2 @ 50fa86bb told the homebrew fixture, in the run whose code was at
-    /// 0x80c00000 (seven pages): `GetInfo` 2/3 (alias), 4/5 (heap), 12/13 (ASLR) and 14/15
+    /// `0x80c01000` (seven pages): `GetInfo` 2/3 (alias), 4/5 (heap), 12/13 (ASLR) and 14/15
     /// (stack), from `tests/homebrew/hello/reference/startup.trace` before its addresses were
     /// masked. That emulator placed the four regions without randomisation, as the default
     /// here does.
     #[test]
     fn the_default_layout_is_the_one_the_reference_reported() {
-        let regions = Regions::new(&request(0x80c0_0000, 7 * PAGE_SIZE)).unwrap();
+        let regions = Regions::new(&request(0x80c0_1000, 7 * PAGE_SIZE)).unwrap();
         let reported = |start: u64, size: u64| Region {
             start,
             end: start + size,
@@ -402,9 +402,9 @@ mod tests {
         // stack region.
         assert_eq!(regions.kernel_map, reported(0x80e0_0000, 0x10_0000_0000));
         assert_eq!(regions.alias_region_extra_size, 0);
-        // Its two other runs, with the code at 0x80681000 and 0x80759000, round to the same
+        // Its two other runs, with the code at 0x80682000 and 0x8075a000, round to the same
         // 2 MiB boundary and so reported one layout.
-        for code in [0x8068_1000, 0x8075_9000] {
+        for code in [0x8068_2000, 0x8075_a000] {
             let regions = Regions::new(&request(code, 7 * PAGE_SIZE)).unwrap();
             assert_eq!(regions.stack.start, 0x10_8080_0000, "{code:#x}");
             assert_eq!(regions.alias.start, 0x11_0080_0000, "{code:#x}");

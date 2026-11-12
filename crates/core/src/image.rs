@@ -1,33 +1,48 @@
-//! Placing a program in a guest address space: where an NRO's segments, its `.bss`, the
-//! counter trampolines, a TLS block and a stack go, what guest code may do with each, and what
-//! bytes to write there.
+//! Loading a program into a guest address space: where an NRO's segments, its `.bss` and the
+//! counter trampolines go ([`place`]), and creating the process's memory around them with the
+//! kernel ([`load`]): the code, the main thread's stack and its TLS page.
 //!
-//! PROVISIONAL (walking skeleton, #74). This lays one program out in a window of guest virtual
-//! addresses as large as guest RAM, starting at [`IMAGE_BASE`]. There is no address-space
-//! bookkeeping and no relocation: the layout is whatever fits, lowest address first.
+//! [`load`] follows Eden's process start for a program (paths relative to the reference folder,
+//! all @ cf654052):
+//!
+//! 1. `KProcess::Initialize` (`eden/src/core/hle/kernel/k_process.cpp`): the kernel lays out
+//!    the address space around the code, reserves the code's memory and maps it with no guest
+//!    access (`starquake_kernel::memory::AddressSpace::new`).
+//! 2. `KProcess::LoadModule`: the image is written, then each segment is reprotected
+//!    (`set_process_memory_permission`).
+//! 3. `KProcess::Run`: the main thread's stack is reserved and mapped in the stack region
+//!    (`create_main_thread_stack`).
+//! 4. `KThread::InitializeUserThread` to `KThreadLocalPage::Initialize`
+//!    (`eden/src/core/hle/kernel/k_thread_local_page.cpp`): one thread-local page, read-write,
+//!    in the kernel-map region (`map_pages_in_region`).
 //!
 //! ```text
-//! window start  the image (text, rodata, data), then .bss            "main"
-//!               counter trampolines (only when a read was patched)
-//!               TLS block (one page; `TPIDRRO_EL0` points at it)
-//!               ... not mapped ...
-//! window end    stack (the last [`STACK_SIZE`] bytes; `SP` starts at the end of the window)
+//! IMAGE_BASE - n pages   counter trampolines (only when a read was patched)
+//! IMAGE_BASE             the image (text, rodata, data), then .bss            "main"
+//! above the code, each 2 MiB aligned (starquake_kernel::memory::layout):
+//!   kernel-map region    TLS page, four pages in (`TPIDRRO_EL0` points at it)
+//!   stack region         the stack, four pages in
+//!   alias region, heap region
 //! ```
 //!
-//! What replaces it: the kernel's address space (kernel slice 6) owns regions, memory states
-//! and where things go; process creation (kernel slice 8) owns the stack, the TLS page and the
-//! registers a thread starts with.
+//! PROVISIONAL, and what replaces each part: kernel slice 8 (process creation) owns the
+//! process, its main thread and the registers it starts with; until then this module does the
+//! steps above itself, with these fixed choices:
+//!
+//! - **The code goes at [`IMAGE_BASE`]**, Eden's address for 39-bit code with no randomisation
+//!   (`KProcess::LoadFromMetadata`: `code_address = 0x8000'0000 + aslr_space_offset`), and the
+//!   regions are not randomised either (kernel spec: deterministic by default).
+//! - **The stack is [`STACK_SIZE`]**, what Eden gives a program with no NPDM, and there is one
+//!   thread.
+//! - **Every program gets the 4 GiB memory arrangement** ([`MEMORY_ARRANGEMENT`]), as every
+//!   program counts time at the Switch 1 rate (`crate::clock`). Process creation picks both by
+//!   what the program was built for.
 //!
 //! # Permissions
 //!
-//! [`Placement::regions`] says what to map: whole pages, each with the permissions guest code
-//! has there. Everything between them is not mapped. When the program needs less than its whole
-//! window (`needed < ram_size` in [`place`]; both are whole pages), at least one page between
-//! the TLS block and the stack is not mapped, so the page after the TLS block and the page
-//! below the stack fault. A program that fills its window exactly (`needed == ram_size`) is
-//! accepted too, and then the TLS block ends where the stack begins, with no unmapped page
-//! between them (`a_program_that_exactly_fits_is_placed_and_one_page_less_is_an_error`). The
-//! permissions are Eden's (`eden/src/core/hle/kernel/k_process.cpp` @ cf654052):
+//! [`Layout::module`] says what the module's pages are: whole pages, each with the permissions
+//! guest code has there. The permissions are Eden's (`eden/src/core/hle/kernel/k_process.cpp`
+//! @ cf654052):
 //!
 //! | What | Guest code may | Eden |
 //! |---|---|---|
@@ -36,12 +51,21 @@
 //! | `.data`, `.bss` | read, write | `ReprotectSegment(DataSegment, ReadWrite)`; `LoadNroImpl` (`eden/src/core/loader/nro.cpp`) adds `.bss` to the data segment |
 //! | pages of the module in no segment | nothing (mapped, so the loader can write the image) | `KProcess::Initialize`, "Map the code region": `KernelRead \| NotMapped` |
 //! | stack | read, write | `KProcess::Run`, `KMemoryState::Stack`, `UserReadWrite` |
-//! | TLS block | read, write | `eden/src/core/hle/kernel/k_thread_local_page.cpp`, `KThreadLocalPage::Initialize`, `UserReadWrite` |
-//! | counter trampolines | read, execute | starquake's own: Eden has no such page under a hypervisor |
+//! | TLS page | read, write | `KThreadLocalPage::Initialize`, `KMemoryState::ThreadLocal`, `UserReadWrite` |
+//! | counter trampolines | read, execute | starquake's own: see below |
 //!
 //! A segment covers whole pages: its size is rounded up to a page, as `LoadNroImpl` does
 //! (`PageAlignSize`). Divergences from Eden, each pinned by a test here:
 //!
+//! - **The counter trampolines** are pages a console does not have. They are mapped as code,
+//!   read-execute, in the pages right below the image, where no region is placed and nothing a
+//!   program asks about lies: the pages after the module, where a console's loader would put
+//!   a program's arguments, are free as on a console
+//!   (`the_trampolines_lie_below_the_image_and_the_page_after_the_module_is_free`). They are
+//!   not counted as the process's memory, so `GetInfo` reports what a console would
+//!   (`the_trampolines_are_not_counted_as_the_processs_memory`). `QueryMemory` does show them.
+//!   Under NCE, Eden appends its patch section to the module's image instead
+//!   (`eden/src/core/loader/nro.cpp`, `LoadNroImpl`, `HAS_NCE`), where it is counted.
 //! - A segment that does not start on a page boundary is [`LoadError::MisalignedSegment`]
 //!   (`a_segment_that_starts_inside_a_page_is_an_error`). Eden does not refuse it.
 //!   `ReprotectSegment` in `KProcess::LoadModule` discards the result of
@@ -70,6 +94,8 @@
 //!   Eden's range stops short of the end of `.bss` and takes in the image pages after the data
 //!   segment; here those pages keep what their own segment gives them, or no guest access
 //!   (`bss_is_read_write_where_it_lies_even_when_the_data_segment_ends_before_the_image`).
+//! - A reprotection the kernel refuses is [`LoadError::Map`], not ignored as Eden's
+//!   `ReprotectSegment` ignores it. [`place`] has refused the layouts that would make it fail.
 //!
 //! The module's size follows Eden's NRO loader (`eden/src/core/loader/nro.cpp` @ cf654052,
 //! `LoadNroImpl`): the image rounded up to a page, plus `.bss` rounded up to a page, with the
@@ -77,9 +103,14 @@
 //! a `MOD0` whose `.bss` end precedes its start is [`LoadError::BadBss`] here; Eden subtracts
 //! the two unchecked.
 //!
-//! It relies on guest RAM starting out zeroed (a fresh VM per run), so `.bss`, the TLS block
-//! and the stack need no writes.
+//! Memory the kernel maps reads as zero until it is written (`crate::space`), so `.bss`, the
+//! TLS page and the stack need no writes.
 
+use starquake_kernel::memory::{
+    AddressSpace as KernelSpace, CreateError, Mapper, MemoryArrangement, MemoryPermission,
+    MemoryState, ProcessMemory, RegionOffsets, SvcPermission,
+};
+use starquake_kernel::result::SvcError;
 use starquake_loader::nro::{Nro, NroError};
 use starquake_loader::patch::{CounterRescale, PatchConfig, PatchError, patch_text};
 use starquake_memory::{Fault, GuestMemory, PAGE_SIZE, Perms};
@@ -89,19 +120,22 @@ use crate::report::Mapping;
 
 /// The guest's page size (`docs/specs/execution-model.md`: a 4 KiB granule).
 pub(crate) const PAGE: u64 = PAGE_SIZE;
-/// Guest virtual address the program's window starts at, and so where its image goes.
-/// PROVISIONAL: the address the walking skeleton has always used (it was the base of the
-/// identity-mapped bring-up RAM). Kernel slice 6 places a program in Horizon's code region.
+/// Guest virtual address the program's image goes at: Eden's address for 39-bit code without
+/// randomisation (see the module docs).
 pub(crate) const IMAGE_BASE: u64 = 0x8000_0000;
-/// Size of the one guest thread's stack. PROVISIONAL: Horizon takes the main thread's stack size
-/// from the NPDM, which an NRO does not have.
+/// Size of the main thread's stack: what Eden gives a program with no NPDM
+/// (`Core::Memory::DEFAULT_STACK_SIZE` in `eden/src/core/memory.h` @ cf654052, used by
+/// `eden/src/core/loader/nro.cpp`). PROVISIONAL: Horizon takes it from the NPDM.
 pub(crate) const STACK_SIZE: u64 = 0x10_0000;
 /// Size of the TLS block: one page, as Horizon allocates thread-local regions out of pages.
 pub(crate) const TLS_SIZE: u64 = PAGE;
+/// The console's memory arrangement every program runs with. PROVISIONAL (see the module
+/// docs).
+pub(crate) const MEMORY_ARRANGEMENT: MemoryArrangement = MemoryArrangement::FourGb;
 /// The name the program's module goes by in the memory map and crash reports.
 pub(crate) const MODULE_NAME: &str = "main";
 
-/// Why a program could not be placed in guest memory.
+/// Why a program could not be loaded into guest memory.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum LoadError {
     /// The file is not a well-formed NRO.
@@ -113,14 +147,6 @@ pub enum LoadError {
     /// The counter patcher rejected the text segment.
     #[error("the program's text could not be patched: {0}")]
     Patch(#[from] PatchError),
-    /// The program, its TLS block and its stack need more guest memory than there is.
-    #[error("the program needs {needed:#x} bytes of guest memory and there are {available:#x}")]
-    DoesNotFit {
-        /// Bytes needed, stack included.
-        needed: u64,
-        /// Bytes of guest RAM.
-        available: u64,
-    },
     /// A segment does not start on a page boundary.
     #[error("the NRO's segment at offset {offset:#x} does not start on a page boundary")]
     MisalignedSegment {
@@ -133,21 +159,24 @@ pub enum LoadError {
         /// Offset in the image of the first shared page.
         offset: u64,
     },
-    /// Guest RAM does not start and end on a page boundary, or runs past the end of the
-    /// address space.
-    #[error(
-        "guest RAM at {base:#x}, {size:#x} bytes long, is not page-aligned or does not fit the \
-         address space"
-    )]
-    BadRam {
-        /// RAM base.
-        base: u64,
-        /// RAM size.
-        size: u64,
-    },
     /// A size in the NRO, or an address derived from one, does not fit 64 bits.
     #[error("the program's sizes overflow the address space")]
     Overflow,
+    /// The kernel could not create the program's address space: its code does not fit the
+    /// code region or the memory an application may use.
+    #[error("the program's address space could not be created: {0}")]
+    AddressSpace(#[from] CreateError),
+    /// The kernel refused one of the mappings a program starts with.
+    #[error("the program's {what} could not be mapped: {error}")]
+    Map {
+        /// What was being mapped or reprotected.
+        what: &'static str,
+        /// Why the kernel refused.
+        error: SvcError,
+    },
+    /// The program could not be copied into guest memory.
+    #[error("the program could not be written into guest memory: {0}")]
+    Write(Fault),
 }
 
 /// A parsed program: the NRO's header fields and its image bytes.
@@ -180,7 +209,7 @@ impl Program {
     }
 }
 
-/// A run of whole pages to map, and what guest code may do there.
+/// A run of whole pages, and what guest code may do there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Region {
     /// Guest virtual address of the first page.
@@ -191,7 +220,28 @@ pub(crate) struct Region {
     pub(crate) perms: Perms,
 }
 
-/// Where everything goes, and the bytes to put there.
+/// Where a program's module and its trampolines go, and the bytes to put there: what [`place`]
+/// works out from the file alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Layout {
+    /// Address the guest starts executing at: the first byte of the image.
+    pub(crate) entry: u64,
+    /// `(address, bytes)` to copy into guest memory, in address order.
+    pub(crate) writes: Vec<(u64, Vec<u8>)>,
+    /// Everything that was laid out, in address order.
+    pub(crate) mappings: Vec<Mapping>,
+    /// The module's pages, in address order, none overlapping: every page from the module's
+    /// base to its end (see "Permissions" in the module docs).
+    pub(crate) module_regions: Vec<Region>,
+    /// The counter trampolines' pages, right below the module, if a read was patched.
+    pub(crate) trampolines: Option<Region>,
+    /// The program's module.
+    pub(crate) module: Module,
+    /// Addresses of the counter reads that were patched, in address order.
+    pub(crate) counter_reads: Vec<u64>,
+}
+
+/// A loaded program, as the core loop and the run's report need it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Placement {
     /// Address the guest starts executing at: the first byte of the image.
@@ -200,26 +250,21 @@ pub(crate) struct Placement {
     pub(crate) stack_top: u64,
     /// Address of the TLS block, for `TPIDRRO_EL0`.
     pub(crate) tls: u64,
-    /// `(address, bytes)` to copy into guest memory, in address order.
-    pub(crate) writes: Vec<(u64, Vec<u8>)>,
-    /// Everything that was laid out, in address order.
+    /// Everything that was mapped, in address order.
     pub(crate) mappings: Vec<Mapping>,
-    /// The pages to map, in address order, none overlapping (see "Permissions" in the module
-    /// docs). Every byte of `writes` and of `mappings` is inside one.
-    pub(crate) regions: Vec<Region>,
     /// The program's module.
     pub(crate) module: Module,
     /// Addresses of the counter reads that were patched, in address order.
     pub(crate) counter_reads: Vec<u64>,
 }
 
-impl Placement {
-    /// Copies the program into `memory`.
-    pub(crate) fn write_into(&self, memory: &dyn GuestMemory) -> Result<(), Fault> {
-        self.writes
-            .iter()
-            .try_for_each(|(address, bytes)| memory.write(*address, bytes))
-    }
+/// What [`load`] hands back: where things are, and the kernel's address space that holds them.
+#[derive(Debug)]
+pub(crate) struct Loaded {
+    /// Where the program, its stack and its TLS block are.
+    pub(crate) placed: Placement,
+    /// The process's address space, for the kernel's tables.
+    pub(crate) address_space: KernelSpace,
 }
 
 /// `value` rounded up to a page.
@@ -287,31 +332,15 @@ fn module_regions(
     Ok(regions)
 }
 
-/// Lays `program` out in a window of `ram_size` bytes of guest virtual addresses at `ram_base`
-/// (see the module docs), rewriting its counter reads for `counter` if one is given. The window
-/// is as large as guest RAM, so a program that fits the window fits RAM.
-pub(crate) fn place(
+/// The program's image with its counter reads rewritten for `counter` to branch to
+/// trampolines at `trampolines_at`, and what the patcher did.
+fn patch(
     program: &Program,
-    ram_base: u64,
-    ram_size: u64,
+    base: u64,
+    trampolines_at: u64,
     counter: Option<CounterRescale>,
-) -> Result<Placement, LoadError> {
-    let bad_ram = LoadError::BadRam {
-        base: ram_base,
-        size: ram_size,
-    };
-    if !ram_base.is_multiple_of(PAGE) || !ram_size.is_multiple_of(PAGE) {
-        return Err(bad_ram);
-    }
-    let ram_end = ram_base.checked_add(ram_size).ok_or(bad_ram)?;
+) -> Result<(Vec<u8>, starquake_loader::patch::Patched), LoadError> {
     let nro = &program.nro;
-    let base = ram_base;
-
-    let image_end = add(base, page_up(u64::from(nro.size))?)?;
-    let bss_end = add(image_end, page_up(u64::from(program.bss_size()?))?)?;
-
-    // Patch a copy of the image's text; the trampolines go right after the module.
-    let trampolines_at = bss_end;
     let mut image = program.image.clone();
     let text_address = add(base, u64::from(nro.text.offset))?;
     let text = usize::try_from(nro.text.offset)
@@ -321,20 +350,37 @@ pub(crate) fn place(
         .and_then(|range| image.get_mut(range))
         .ok_or(LoadError::Overflow)?;
     let patched = patch_text(text, text_address, trampolines_at, &PatchConfig { counter })?;
+    Ok((image, patched))
+}
+
+/// Lays `program`'s module out at `base` (see the module docs), rewriting its counter reads
+/// for `counter` if one is given, with the trampolines in the pages right below `base`.
+pub(crate) fn place(
+    program: &Program,
+    base: u64,
+    counter: Option<CounterRescale>,
+) -> Result<Layout, LoadError> {
+    let nro = &program.nro;
+    let image_end = add(base, page_up(u64::from(nro.size))?)?;
+    let bss_end = add(image_end, page_up(u64::from(program.bss_size()?))?)?;
+
+    // The trampolines end where the image starts, so where they start depends on how many
+    // there are: patch once to count them (how many there are does not depend on where they
+    // go; the page after the module is as good a place as any), then again with their address.
+    let (mut image, mut patched) = patch(program, base, bss_end, counter)?;
     let trampolines_len = u64::try_from(patched.trampolines.len())
         .map_err(|_| LoadError::Overflow)
         .and_then(page_up)?;
-
-    let tls = add(trampolines_at, trampolines_len)?;
-    let tls_end = add(tls, TLS_SIZE)?;
-    let needed = add(tls_end - base, STACK_SIZE)?;
-    if needed > ram_size {
-        return Err(LoadError::DoesNotFit {
-            needed,
-            available: ram_size,
-        });
+    let trampolines_at = base
+        .checked_sub(trampolines_len)
+        .ok_or(LoadError::Overflow)?;
+    if trampolines_len != 0 {
+        let counted = patched.trampolines.len();
+        (image, patched) = patch(program, base, trampolines_at, counter)?;
+        if patched.trampolines.len() != counted {
+            return Err(LoadError::Overflow);
+        }
     }
-    let stack_bottom = ram_end - STACK_SIZE;
 
     let mut mappings = Vec::new();
     let mut map = |name: &str, start: u64, end: u64| {
@@ -346,6 +392,7 @@ pub(crate) fn place(
             });
         }
     };
+    map("trampolines", trampolines_at, base);
     for (name, segment) in [".text", ".rodata", ".data"]
         .into_iter()
         .zip(nro.segments())
@@ -355,37 +402,23 @@ pub(crate) fn place(
         map(&format!("{MODULE_NAME}{name}"), start, end);
     }
     map(&format!("{MODULE_NAME}.bss"), image_end, bss_end);
-    map("trampolines", trampolines_at, tls);
-    map("tls", tls, tls_end);
-    map("stack", stack_bottom, ram_end);
     mappings.sort_by_key(|mapping| mapping.start);
 
-    let mut regions = module_regions(program, base, image_end, bss_end)?;
-    for (start, end, perms) in [
-        (trampolines_at, tls, Perms::ReadExecute),
-        (tls, tls_end, Perms::ReadWrite),
-        (stack_bottom, ram_end, Perms::ReadWrite),
-    ] {
-        if start < end {
-            regions.push(Region {
-                start,
-                size: end - start,
-                perms,
-            });
-        }
-    }
-
-    let mut writes = vec![(base, image)];
+    let mut writes = Vec::new();
     if !patched.trampolines.is_empty() {
         writes.push((trampolines_at, patched.trampolines));
     }
-    Ok(Placement {
+    writes.push((base, image));
+    Ok(Layout {
         entry: base,
-        stack_top: ram_end,
-        tls,
         writes,
         mappings,
-        regions,
+        module_regions: module_regions(program, base, image_end, bss_end)?,
+        trampolines: (trampolines_len != 0).then_some(Region {
+            start: trampolines_at,
+            size: trampolines_len,
+            perms: Perms::ReadExecute,
+        }),
         module: Module {
             name: MODULE_NAME.to_owned(),
             base,
@@ -396,8 +429,101 @@ pub(crate) fn place(
     })
 }
 
+/// What the kernel is asked for a module region's permissions: `None` for pages with no guest
+/// access, which stay as the kernel mapped them.
+fn reprotection(perms: Perms) -> Option<SvcPermission> {
+    match perms {
+        Perms::ReadExecute => Some(SvcPermission::ReadExecute),
+        Perms::Read => Some(SvcPermission::Read),
+        Perms::ReadWrite => Some(SvcPermission::ReadWrite),
+        // `module_regions` gives a region one of the three above or none.
+        Perms::None | Perms::Execute | Perms::ReadWriteExecute => None,
+    }
+}
+
+/// Loads `program` at [`IMAGE_BASE`]: creates its address space with the kernel, with `mapper`
+/// making the kernel's mappings real, copies the image into `memory` (that same address space,
+/// as host code sees it) and gives the process a main thread's stack and TLS page. Counter
+/// reads are rewritten for `counter` if one is given. See the module docs for the steps.
+pub(crate) fn load(
+    program: &Program,
+    counter: Option<CounterRescale>,
+    mapper: Box<dyn Mapper>,
+    memory: &dyn GuestMemory,
+) -> Result<Loaded, LoadError> {
+    let layout = place(program, IMAGE_BASE, counter)?;
+    let refused = |what: &'static str| move |error: SvcError| LoadError::Map { what, error };
+    let mut space = KernelSpace::new(
+        &ProcessMemory {
+            code_address: layout.module.base,
+            code_size: layout.module.size,
+            arrangement: MEMORY_ARRANGEMENT,
+            alias_region_extra: false,
+            offsets: RegionOffsets::default(),
+        },
+        mapper,
+    )?;
+    if let Some(trampolines) = layout.trampolines {
+        space
+            .map_pages(
+                trampolines.start,
+                trampolines.size / PAGE,
+                MemoryState::Code,
+                MemoryPermission::USER_READ_EXECUTE,
+            )
+            .map_err(refused("counter trampolines"))?;
+    }
+    for (address, bytes) in &layout.writes {
+        memory.write(*address, bytes).map_err(LoadError::Write)?;
+    }
+    for region in &layout.module_regions {
+        if let Some(permission) = reprotection(region.perms) {
+            space
+                .set_process_memory_permission(region.start, region.size, permission)
+                .map_err(refused("segments"))?;
+        }
+    }
+    let stack_top = space
+        .create_main_thread_stack(STACK_SIZE)
+        .map_err(refused("stack"))?;
+    let tls = space
+        .map_pages_in_region(
+            TLS_SIZE / PAGE,
+            MemoryState::ThreadLocal,
+            MemoryPermission::USER_READ_WRITE,
+        )
+        .map_err(refused("TLS page"))?;
+
+    let mut mappings = layout.mappings;
+    for (name, start, size) in [
+        ("tls", tls, TLS_SIZE),
+        ("stack", stack_top - STACK_SIZE, STACK_SIZE),
+    ] {
+        mappings.push(Mapping {
+            name: name.to_owned(),
+            start,
+            end: start + size,
+        });
+    }
+    mappings.sort_by_key(|mapping| mapping.start);
+    Ok(Loaded {
+        placed: Placement {
+            entry: layout.entry,
+            stack_top,
+            tls,
+            mappings,
+            module: layout.module,
+            counter_reads: layout.counter_reads,
+        },
+        address_space: space,
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    use starquake_kernel::memory::GUARD_PAGES;
+    use starquake_kernel::memory::testing::{MapperCall, RecordingMapper};
+    use starquake_kernel::result::KernelError;
     use starquake_memory::FlatMemory;
     use starquake_testkit::nro::{BUILD_ID_SIZE, CODE_OFFSET, NroBuilder};
     use starquake_testkit::{a64, programs};
@@ -405,13 +531,16 @@ mod tests {
     use super::*;
 
     /// Where a real run puts the program.
-    const RAM_BASE: u64 = IMAGE_BASE;
-    const RAM_SIZE: u64 = 16 << 20;
+    const BASE: u64 = IMAGE_BASE;
     /// The counter rates of a real run: Apple Silicon's and the kernel's.
     const RESCALE: CounterRescale = CounterRescale {
         host_hz: 24_000_000,
         guest_hz: crate::clock::PROCESS_COUNTER_RATE.hz(),
     };
+    /// How much flat guest memory the loading tests have around [`IMAGE_BASE`]: a megabyte
+    /// below it (for trampolines) and one from it (for the image).
+    const FLAT_BELOW: u64 = 1 << 20;
+    const FLAT_SIZE: usize = 2 << 20;
 
     fn mapping(name: &str, start: u64, end: u64) -> Mapping {
         Mapping {
@@ -443,58 +572,55 @@ mod tests {
         u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
     }
 
+    impl Layout {
+        /// Every run of pages the layout maps, in address order.
+        fn regions(&self) -> Vec<Region> {
+            self.trampolines
+                .iter()
+                .chain(&self.module_regions)
+                .copied()
+                .collect()
+        }
+    }
+
+    /// Flat guest memory around [`IMAGE_BASE`].
+    fn flat() -> FlatMemory {
+        FlatMemory::new(BASE - FLAT_BELOW, FLAT_SIZE)
+    }
+
+    // ----- place: the module and its trampolines ------------------------------------------------
+
     #[test]
-    fn a_program_is_laid_out_from_the_start_of_ram_with_its_stack_at_the_end() {
+    fn a_program_is_laid_out_from_its_base() {
         let file = programs::hello().unwrap();
-        let placed = place(
-            &Program::parse(&file).unwrap(),
-            RAM_BASE,
-            RAM_SIZE,
-            Some(RESCALE),
-        )
-        .unwrap();
+        let placed = place(&Program::parse(&file).unwrap(), BASE, Some(RESCALE)).unwrap();
         // hello is one page of text and one of rodata, with no data, .bss or counter reads.
         assert_eq!(file.len(), 2 * 0x1000);
         assert_eq!(
             placed.mappings,
             [
-                mapping("main.text", RAM_BASE, RAM_BASE + PAGE),
-                mapping("main.rodata", RAM_BASE + PAGE, RAM_BASE + 2 * PAGE),
-                mapping("tls", RAM_BASE + 2 * PAGE, RAM_BASE + 2 * PAGE + TLS_SIZE),
-                mapping(
-                    "stack",
-                    RAM_BASE + RAM_SIZE - STACK_SIZE,
-                    RAM_BASE + RAM_SIZE
-                ),
+                mapping("main.text", BASE, BASE + PAGE),
+                mapping("main.rodata", BASE + PAGE, BASE + 2 * PAGE),
             ]
         );
-        // Text may be read and executed, rodata read, the TLS block and the stack read and
-        // written; nothing lies between the TLS block and the stack.
+        // Text may be read and executed, rodata read.
         assert_eq!(
-            placed.regions,
+            placed.regions(),
             [
-                region(RAM_BASE, 1, Perms::ReadExecute),
-                region(RAM_BASE + PAGE, 1, Perms::Read),
-                region(RAM_BASE + 2 * PAGE, TLS_SIZE / PAGE, Perms::ReadWrite),
-                region(
-                    RAM_BASE + RAM_SIZE - STACK_SIZE,
-                    STACK_SIZE / PAGE,
-                    Perms::ReadWrite
-                ),
+                region(BASE, 1, Perms::ReadExecute),
+                region(BASE + PAGE, 1, Perms::Read),
             ]
         );
-        assert_eq!(placed.entry, RAM_BASE);
-        assert_eq!(placed.tls, RAM_BASE + 2 * PAGE);
-        assert_eq!(placed.stack_top, RAM_BASE + RAM_SIZE);
-        assert_eq!(placed.stack_top % 16, 0, "SP must be 16-byte aligned");
+        assert_eq!(placed.entry, BASE);
         // Nothing was patched: the image is written as it is in the file, and nothing else.
-        assert_eq!(placed.writes, [(RAM_BASE, file)]);
+        assert_eq!(placed.writes, [(BASE, file)]);
         assert_eq!(placed.counter_reads, Vec::<u64>::new());
+        assert_eq!(placed.trampolines, None);
         assert_eq!(
             placed.module,
             Module {
                 name: "main".into(),
-                base: RAM_BASE,
+                base: BASE,
                 size: 2 * PAGE,
                 build_id: vec![0; BUILD_ID_SIZE],
             }
@@ -502,36 +628,38 @@ mod tests {
     }
 
     #[test]
-    fn counter_reads_become_branches_to_trampolines_placed_after_the_module() {
+    fn counter_reads_become_branches_to_trampolines_placed_below_the_module() {
         let counter = programs::counter(RESCALE.guest_hz).unwrap();
         let program = Program::parse(&counter.nro).unwrap();
-        let placed = place(&program, RAM_BASE, RAM_SIZE, Some(RESCALE)).unwrap();
+        let placed = place(&program, BASE, Some(RESCALE)).unwrap();
 
         assert_eq!(
             placed.counter_reads,
-            counter.read_offsets.map(|offset| RAM_BASE + offset)
+            counter.read_offsets.map(|offset| BASE + offset)
         );
         let trampolines = placed
             .mappings
             .iter()
             .find(|mapping| mapping.name == "trampolines")
             .expect("a trampoline mapping");
-        // One page of text, so the trampolines start on the next page, before the TLS block.
-        assert_eq!(trampolines.start, RAM_BASE + PAGE);
-        assert_eq!(trampolines.end, placed.tls);
+        // They fit one page, which ends exactly where the image starts.
+        assert_eq!((trampolines.start, trampolines.end), (BASE - PAGE, BASE));
         // The trampolines are code: readable and executable, not writable.
         assert_eq!(
-            placed.regions[..3],
+            placed.trampolines,
+            Some(region(BASE - PAGE, 1, Perms::ReadExecute))
+        );
+        assert_eq!(
+            placed.regions()[..2],
             [
-                region(RAM_BASE, 1, Perms::ReadExecute),
-                region(trampolines.start, 1, Perms::ReadExecute),
-                region(placed.tls, 1, Perms::ReadWrite),
+                region(BASE - PAGE, 1, Perms::ReadExecute),
+                region(BASE, 1, Perms::ReadExecute),
             ]
         );
-        assert_eq!(placed.writes.len(), 2, "an image and its trampolines");
-        let (image_at, image) = &placed.writes[0];
-        let (trampolines_at, code) = &placed.writes[1];
-        assert_eq!((*image_at, *trampolines_at), (RAM_BASE, trampolines.start));
+        assert_eq!(placed.writes.len(), 2, "trampolines and an image");
+        let (trampolines_at, code) = &placed.writes[0];
+        let (image_at, image) = &placed.writes[1];
+        assert_eq!((*image_at, *trampolines_at), (BASE, trampolines.start));
         assert!(!code.is_empty() && code.len() <= usize::try_from(PAGE).unwrap());
         // Each read is now `b <trampoline>` (imm26 in words, sign-extended), and each lands in
         // the trampoline area at a different place.
@@ -540,7 +668,8 @@ mod tests {
             let word = word_at(image, offset);
             assert_eq!(word & 0xFC00_0000, 0x1400_0000, "not a b: {word:#x}");
             let distance = (i64::from(word & 0x03FF_FFFF) << 38) >> 36;
-            let target = (RAM_BASE + offset).checked_add_signed(distance).unwrap();
+            assert!(distance < 0, "the trampolines are below the text");
+            let target = (BASE + offset).checked_add_signed(distance).unwrap();
             assert!(trampolines.contains(target), "{target:#x}");
             targets.push(target);
         }
@@ -556,20 +685,24 @@ mod tests {
     }
 
     #[test]
+    fn trampolines_need_room_below_the_base() {
+        let counter = programs::counter(RESCALE.guest_hz).unwrap();
+        let program = Program::parse(&counter.nro).unwrap();
+        // One page below the base is exactly enough; none is not.
+        assert!(place(&program, PAGE, Some(RESCALE)).is_ok());
+        assert_eq!(place(&program, 0, Some(RESCALE)), Err(LoadError::Overflow));
+        // Without trampolines a base of zero is fine.
+        assert!(place(&program, 0, None).is_ok());
+    }
+
+    #[test]
     fn without_a_counter_rescale_nothing_is_patched() {
         let counter = programs::counter(RESCALE.guest_hz).unwrap();
-        let placed = place(
-            &Program::parse(&counter.nro).unwrap(),
-            RAM_BASE,
-            RAM_SIZE,
-            None,
-        )
-        .unwrap();
-        assert_eq!(placed.writes, [(RAM_BASE, counter.nro)]);
+        let placed = place(&Program::parse(&counter.nro).unwrap(), BASE, None).unwrap();
+        assert_eq!(placed.writes, [(BASE, counter.nro)]);
         assert_eq!(placed.counter_reads, Vec::<u64>::new());
         assert!(placed.mappings.iter().all(|m| m.name != "trampolines"));
-        // With no trampolines the TLS block follows the module directly.
-        assert_eq!(placed.tls, RAM_BASE + PAGE);
+        assert_eq!(placed.trampolines, None);
     }
 
     #[test]
@@ -579,27 +712,25 @@ mod tests {
             .bss_size(0x1234)
             .build()
             .unwrap();
-        let placed = place(&Program::parse(&file).unwrap(), RAM_BASE, RAM_SIZE, None).unwrap();
+        let placed = place(&Program::parse(&file).unwrap(), BASE, None).unwrap();
         // One page of text, none of rodata, one of data, then two pages of .bss.
         assert_eq!(
-            placed.mappings[..4],
+            placed.mappings,
             [
-                mapping("main.text", RAM_BASE, RAM_BASE + PAGE),
-                mapping("main.data", RAM_BASE + PAGE, RAM_BASE + 2 * PAGE),
-                mapping("main.bss", RAM_BASE + 2 * PAGE, RAM_BASE + 4 * PAGE),
-                mapping("tls", RAM_BASE + 4 * PAGE, RAM_BASE + 5 * PAGE),
+                mapping("main.text", BASE, BASE + PAGE),
+                mapping("main.data", BASE + PAGE, BASE + 2 * PAGE),
+                mapping("main.bss", BASE + 2 * PAGE, BASE + 4 * PAGE),
             ]
         );
         assert_eq!(placed.module.size, 4 * PAGE);
         assert!(CODE_OFFSET < usize::try_from(PAGE).unwrap());
         // Data and .bss are both read-write, each its own run of pages.
         assert_eq!(
-            placed.regions[..4],
+            placed.regions(),
             [
-                region(RAM_BASE, 1, Perms::ReadExecute),
-                region(RAM_BASE + PAGE, 1, Perms::ReadWrite),
-                region(RAM_BASE + 2 * PAGE, 2, Perms::ReadWrite),
-                region(RAM_BASE + 4 * PAGE, 1, Perms::ReadWrite),
+                region(BASE, 1, Perms::ReadExecute),
+                region(BASE + PAGE, 1, Perms::ReadWrite),
+                region(BASE + 2 * PAGE, 2, Perms::ReadWrite),
             ]
         );
     }
@@ -620,17 +751,17 @@ mod tests {
         let counter = programs::counter(RESCALE.guest_hz).unwrap();
         for file in [three_segments(), programs::hello().unwrap(), counter.nro] {
             let program = Program::parse(&file).unwrap();
-            let placed = place(&program, RAM_BASE, RAM_SIZE, Some(RESCALE)).unwrap();
+            let placed = place(&program, BASE, Some(RESCALE)).unwrap();
+            let regions = placed.regions();
             let inside = |start: u64, end: u64| {
-                placed
-                    .regions
+                regions
                     .iter()
                     .any(|r| r.start <= start && end <= r.start + r.size)
             };
-            for pair in placed.regions.windows(2) {
+            for pair in regions.windows(2) {
                 assert!(pair[0].start + pair[0].size <= pair[1].start, "{pair:?}");
             }
-            for r in &placed.regions {
+            for r in &regions {
                 assert!(
                     r.size > 0 && r.start % PAGE == 0 && r.size % PAGE == 0,
                     "{r:?}"
@@ -648,6 +779,14 @@ mod tests {
                     page += PAGE;
                 }
             }
+            // The module's regions are exactly the module, with no hole.
+            let module_end = placed.module.base + placed.module.size;
+            let mut at = placed.module.base;
+            for r in &placed.module_regions {
+                assert_eq!(r.start, at);
+                at += r.size;
+            }
+            assert_eq!(at, module_end);
         }
     }
 
@@ -656,17 +795,17 @@ mod tests {
         // Drop rodata from the header: its page stays part of the image, between text and data.
         let mut file = three_segments();
         set_segment(&mut file, 1, 0, 0);
-        let placed = place(&Program::parse(&file).unwrap(), RAM_BASE, RAM_SIZE, None).unwrap();
+        let placed = place(&Program::parse(&file).unwrap(), BASE, None).unwrap();
         assert_eq!(
-            placed.regions[..3],
+            placed.regions(),
             [
-                region(RAM_BASE, 1, Perms::ReadExecute),
-                region(RAM_BASE + PAGE, 1, Perms::None),
-                region(RAM_BASE + 2 * PAGE, 1, Perms::ReadWrite),
+                region(BASE, 1, Perms::ReadExecute),
+                region(BASE + PAGE, 1, Perms::None),
+                region(BASE + 2 * PAGE, 1, Perms::ReadWrite),
             ]
         );
         // The image is still written whole, across the page no guest code can touch.
-        assert_eq!(placed.writes, [(RAM_BASE, file)]);
+        assert_eq!(placed.writes, [(BASE, file)]);
     }
 
     #[test]
@@ -675,32 +814,18 @@ mod tests {
         // no .bss after it.
         let mut file = three_segments();
         set_segment(&mut file, 2, 0, 0);
-        let placed = place(&Program::parse(&file).unwrap(), RAM_BASE, RAM_SIZE, None).unwrap();
+        let placed = place(&Program::parse(&file).unwrap(), BASE, None).unwrap();
         assert_eq!(
-            placed.regions[..3],
+            placed.regions(),
             [
-                region(RAM_BASE, 1, Perms::ReadExecute),
-                region(RAM_BASE + PAGE, 1, Perms::Read),
-                region(RAM_BASE + 2 * PAGE, 1, Perms::None),
+                region(BASE, 1, Perms::ReadExecute),
+                region(BASE + PAGE, 1, Perms::Read),
+                region(BASE + 2 * PAGE, 1, Perms::None),
             ]
         );
-        // The module ends with that page, and the TLS block follows it.
+        // The module ends with that page, and the image is written whole.
         assert_eq!(placed.module.size, 3 * PAGE);
-        assert_eq!(placed.regions[3].start, RAM_BASE + 3 * PAGE);
-        // The image is written whole, so every page of the write must be mapped.
-        assert_eq!(placed.writes, [(RAM_BASE, file)]);
-        let (address, bytes) = &placed.writes[0];
-        let end = address + bytes.len() as u64;
-        assert_eq!(end, RAM_BASE + 3 * PAGE);
-        for page in (*address..end).step_by(usize::try_from(PAGE).unwrap()) {
-            assert!(
-                placed
-                    .regions
-                    .iter()
-                    .any(|r| r.start <= page && page + PAGE <= r.start + r.size),
-                "{page:#x}"
-            );
-        }
+        assert_eq!(placed.writes, [(BASE, file)]);
     }
 
     #[test]
@@ -708,12 +833,12 @@ mod tests {
         // A rodata of one byte still gets its whole page, read-only.
         let mut file = three_segments();
         set_segment(&mut file, 1, u32::try_from(PAGE).unwrap(), 1);
-        let placed = place(&Program::parse(&file).unwrap(), RAM_BASE, RAM_SIZE, None).unwrap();
-        assert_eq!(placed.regions[1], region(RAM_BASE + PAGE, 1, Perms::Read));
+        let placed = place(&Program::parse(&file).unwrap(), BASE, None).unwrap();
+        assert_eq!(placed.regions()[1], region(BASE + PAGE, 1, Perms::Read));
         // The mapping in the report keeps the segment's own size.
         assert_eq!(
             placed.mappings[1],
-            mapping("main.rodata", RAM_BASE + PAGE, RAM_BASE + PAGE + 1)
+            mapping("main.rodata", BASE + PAGE, BASE + PAGE + 1)
         );
     }
 
@@ -727,7 +852,7 @@ mod tests {
             let mut file = three_segments();
             set_segment(&mut file, 1, offset, 1);
             assert_eq!(
-                place(&Program::parse(&file).unwrap(), RAM_BASE, RAM_SIZE, None),
+                place(&Program::parse(&file).unwrap(), BASE, None),
                 Err(LoadError::MisalignedSegment { offset }),
                 "{offset:#x}"
             );
@@ -754,7 +879,7 @@ mod tests {
             let mut file = three_segments();
             set_segment(&mut file, index, offset, size);
             assert_eq!(
-                place(&Program::parse(&file).unwrap(), RAM_BASE, RAM_SIZE, None),
+                place(&Program::parse(&file).unwrap(), BASE, None),
                 Err(LoadError::OverlappingSegments { offset: shared }),
                 "segment {index} at {offset:#x}, {size:#x} bytes"
             );
@@ -762,7 +887,7 @@ mod tests {
         // Text ending exactly where rodata starts shares nothing.
         let mut file = three_segments();
         set_segment(&mut file, 0, 0, page);
-        assert!(place(&Program::parse(&file).unwrap(), RAM_BASE, RAM_SIZE, None).is_ok());
+        assert!(place(&Program::parse(&file).unwrap(), BASE, None).is_ok());
         assert_eq!(
             LoadError::OverlappingSegments { offset: 0x2000 }.to_string(),
             "two of the NRO's segments share the page at image offset 0x2000"
@@ -779,16 +904,16 @@ mod tests {
             .build()
             .unwrap();
         let program = Program::parse(&file).unwrap();
-        let placed = place(&program, RAM_BASE, RAM_SIZE, None).unwrap();
-        let image_end = RAM_BASE + (file.len() as u64).next_multiple_of(PAGE);
-        let bss = placed
-            .regions
+        let placed = place(&program, BASE, None).unwrap();
+        let image_end = BASE + (file.len() as u64).next_multiple_of(PAGE);
+        let regions = placed.regions();
+        let bss = regions
             .iter()
             .find(|r| r.start == image_end)
             .expect("a .bss region");
         assert_eq!(*bss, region(image_end, 1, Perms::ReadWrite));
         for segment in program.nro.segments() {
-            let end = RAM_BASE + u64::from(segment.offset) + u64::from(segment.size);
+            let end = BASE + u64::from(segment.offset) + u64::from(segment.size);
             assert!(end.next_multiple_of(PAGE) <= image_end);
         }
     }
@@ -808,65 +933,23 @@ mod tests {
         assert_eq!(file.len() as u64, 3 * PAGE);
         set_segment(&mut file, 1, 0, 0);
         set_segment(&mut file, 2, page, page);
-        let placed = place(&Program::parse(&file).unwrap(), RAM_BASE, RAM_SIZE, None).unwrap();
+        let placed = place(&Program::parse(&file).unwrap(), BASE, None).unwrap();
         // Eden's read-write range would be the second and third pages, leaving .bss (the
         // fourth) without guest access. Here the third page has none and .bss is read-write.
         assert_eq!(
-            placed.regions[..4],
+            placed.regions(),
             [
-                region(RAM_BASE, 1, Perms::ReadExecute),
-                region(RAM_BASE + PAGE, 1, Perms::ReadWrite),
-                region(RAM_BASE + 2 * PAGE, 1, Perms::None),
-                region(RAM_BASE + 3 * PAGE, 1, Perms::ReadWrite),
+                region(BASE, 1, Perms::ReadExecute),
+                region(BASE + PAGE, 1, Perms::ReadWrite),
+                region(BASE + 2 * PAGE, 1, Perms::None),
+                region(BASE + 3 * PAGE, 1, Perms::ReadWrite),
             ]
         );
-        assert!(placed.mappings.contains(&mapping(
-            "main.bss",
-            RAM_BASE + 3 * PAGE,
-            RAM_BASE + 4 * PAGE
-        )));
-    }
-
-    #[test]
-    fn a_program_that_exactly_fits_is_placed_and_one_page_less_is_an_error() {
-        let file = programs::hello().unwrap();
-        let program = Program::parse(&file).unwrap();
-        // Two pages of image, the TLS block and the stack.
-        let needed = 2 * PAGE + TLS_SIZE + STACK_SIZE;
-        let placed = place(&program, RAM_BASE, needed, None).unwrap();
-        // The TLS block ends exactly where the stack begins.
-        assert_eq!(placed.tls + TLS_SIZE, RAM_BASE + needed - STACK_SIZE);
-        assert_eq!(
-            place(&program, RAM_BASE, needed - PAGE, None),
-            Err(LoadError::DoesNotFit {
-                needed,
-                available: needed - PAGE
-            })
+        assert!(
+            placed
+                .mappings
+                .contains(&mapping("main.bss", BASE + 3 * PAGE, BASE + 4 * PAGE))
         );
-        // RAM smaller than the stack alone.
-        assert_eq!(
-            place(&program, RAM_BASE, PAGE, None),
-            Err(LoadError::DoesNotFit {
-                needed,
-                available: PAGE
-            })
-        );
-    }
-
-    #[test]
-    fn ram_must_be_page_aligned_and_inside_the_address_space() {
-        let program = Program::parse(&programs::hello().unwrap()).unwrap();
-        for (base, size) in [
-            (RAM_BASE + 1, RAM_SIZE),
-            (RAM_BASE, RAM_SIZE + 8),
-            (u64::MAX - PAGE + 1, 2 * PAGE),
-        ] {
-            assert_eq!(
-                place(&program, base, size, None),
-                Err(LoadError::BadRam { base, size }),
-                "{base:#x} {size:#x}"
-            );
-        }
     }
 
     #[test]
@@ -896,25 +979,386 @@ mod tests {
         let end = word_at(&file, u64::try_from(start_at + MOD0_FIELD_SIZE).unwrap());
         file[start_at..start_at + 4].copy_from_slice(&(end + 1).to_le_bytes());
         let program = Program::parse(&file).unwrap();
+        assert_eq!(place(&program, BASE, None), Err(LoadError::BadBss));
+    }
+
+    // ----- load: the process's memory around the module -------------------------------------------
+
+    /// Loads `file` into flat memory with a recording mapper behind the kernel's address
+    /// space.
+    fn loaded(
+        file: &[u8],
+        counter: Option<CounterRescale>,
+    ) -> (Loaded, FlatMemory, Vec<MapperCall>) {
+        let (mapper, log) = RecordingMapper::new();
+        let memory = flat();
+        let loaded = load(
+            &Program::parse(file).unwrap(),
+            counter,
+            Box::new(mapper),
+            &memory,
+        )
+        .unwrap();
+        (loaded, memory, log.take())
+    }
+
+    /// What the kernel's address space holds at `address`: where the block starts, its size,
+    /// its state and what the guest may do with it.
+    fn block(space: &KernelSpace, address: u64) -> (u64, u64, MemoryState, MemoryPermission) {
+        let block = space.query_info(address).unwrap();
+        (
+            block.address(),
+            block.size(),
+            block.state(),
+            block.permission(),
+        )
+    }
+
+    #[test]
+    fn a_loaded_program_has_its_stack_and_tls_page_where_the_kernel_places_them() {
+        let file = three_segments();
+        let (
+            Loaded {
+                placed,
+                address_space,
+            },
+            memory,
+            calls,
+        ) = loaded(&file, None);
+        let regions = *address_space.regions();
+        // Four free pages, then the mapping (`KPageTableBase::GetNumGuardPages`).
+        let guard = GUARD_PAGES * PAGE;
+        let stack_bottom = regions.stack.start + guard;
+        let tls = regions.kernel_map.start + guard;
+        assert_eq!(placed.entry, IMAGE_BASE);
+        assert_eq!(placed.stack_top, stack_bottom + STACK_SIZE);
+        assert_eq!(placed.stack_top % 16, 0, "SP must be 16-byte aligned");
+        assert_eq!(placed.tls, tls);
         assert_eq!(
-            place(&program, RAM_BASE, RAM_SIZE, None),
-            Err(LoadError::BadBss)
+            placed.mappings,
+            [
+                mapping("main.text", BASE, BASE + PAGE),
+                mapping("main.rodata", BASE + PAGE, BASE + 2 * PAGE),
+                mapping("main.data", BASE + 2 * PAGE, BASE + 3 * PAGE),
+                mapping("tls", tls, tls + TLS_SIZE),
+                mapping("stack", stack_bottom, placed.stack_top),
+            ]
+        );
+        assert_eq!(placed.module.size, 3 * PAGE);
+
+        // The kernel's blocks: each segment with Eden's state and permission, the stack and
+        // the thread-local page.
+        let at = |address| block(&address_space, address);
+        assert_eq!(
+            at(BASE),
+            (
+                BASE,
+                PAGE,
+                MemoryState::Code,
+                MemoryPermission::USER_READ_EXECUTE
+            )
+        );
+        assert_eq!(
+            at(BASE + PAGE),
+            (
+                BASE + PAGE,
+                PAGE,
+                MemoryState::Code,
+                MemoryPermission::USER_READ
+            )
+        );
+        assert_eq!(
+            at(BASE + 2 * PAGE),
+            (
+                BASE + 2 * PAGE,
+                PAGE,
+                MemoryState::CodeData,
+                MemoryPermission::USER_READ_WRITE
+            )
+        );
+        assert_eq!(
+            at(placed.stack_top - 1),
+            (
+                stack_bottom,
+                STACK_SIZE,
+                MemoryState::Stack,
+                MemoryPermission::USER_READ_WRITE
+            )
+        );
+        assert_eq!(
+            at(tls),
+            (
+                tls,
+                TLS_SIZE,
+                MemoryState::ThreadLocal,
+                MemoryPermission::USER_READ_WRITE
+            )
+        );
+        // The code and the stack are the process's memory; the thread-local page is not
+        // (`KProcess::GetUsedUserPhysicalMemorySize`).
+        assert_eq!(
+            address_space.used_user_physical_memory_size(),
+            3 * PAGE + STACK_SIZE
+        );
+        assert_eq!(
+            address_space.limit().limit(),
+            MEMORY_ARRANGEMENT.application_pool_size()
+        );
+
+        // What the translation was asked, in Eden's order: the code with no guest access, the
+        // three segments reprotected, the stack, the thread-local page.
+        let map = |address, size, perms| MapperCall::Map {
+            address,
+            size,
+            perms,
+        };
+        let protect = |address, perms| MapperCall::Protect {
+            address,
+            size: PAGE,
+            perms,
+        };
+        assert_eq!(
+            calls,
+            [
+                map(BASE, 3 * PAGE, Perms::None),
+                protect(BASE, Perms::ReadExecute),
+                protect(BASE + PAGE, Perms::Read),
+                protect(BASE + 2 * PAGE, Perms::ReadWrite),
+                map(stack_bottom, STACK_SIZE, Perms::ReadWrite),
+                map(tls, TLS_SIZE, Perms::ReadWrite),
+            ]
+        );
+        // The image is in guest memory.
+        let mut read = vec![0; file.len()];
+        memory.read(BASE, &mut read).unwrap();
+        assert_eq!(read, file);
+    }
+
+    #[test]
+    fn pages_in_no_segment_stay_as_the_kernel_mapped_the_code() {
+        let mut file = three_segments();
+        set_segment(&mut file, 1, 0, 0);
+        let (Loaded { address_space, .. }, _, calls) = loaded(&file, None);
+        // `KProcess::Initialize`, "Map the code region": `KernelRead | NotMapped`.
+        assert_eq!(
+            block(&address_space, BASE + PAGE),
+            (
+                BASE + PAGE,
+                PAGE,
+                MemoryState::Code,
+                MemoryPermission::KERNEL_READ | MemoryPermission::NOT_MAPPED
+            )
+        );
+        // Two reprotections, not three.
+        let protects = calls
+            .iter()
+            .filter(|call| matches!(call, MapperCall::Protect { .. }))
+            .count();
+        assert_eq!(protects, 2);
+    }
+
+    #[test]
+    fn the_trampolines_lie_below_the_image_and_the_page_after_the_module_is_free() {
+        let counter = programs::counter(RESCALE.guest_hz).unwrap();
+        let (
+            Loaded {
+                placed,
+                address_space,
+            },
+            memory,
+            calls,
+        ) = loaded(&counter.nro, Some(RESCALE));
+        assert_eq!(
+            placed.mappings[0],
+            mapping("trampolines", BASE - PAGE, BASE)
+        );
+        // Code, read-execute, a block of its own (it is no part of the module).
+        assert_eq!(
+            block(&address_space, BASE - 1),
+            (
+                BASE - PAGE,
+                PAGE,
+                MemoryState::Code,
+                MemoryPermission::USER_READ_EXECUTE
+            )
+        );
+        assert_eq!(block(&address_space, BASE).0, BASE);
+        // The pages after the module are free, up to the thread-local page, as they are on
+        // a console (whose loader maps a program's arguments there, when it has any).
+        let module_end = BASE + placed.module.size;
+        let (start, size, state, _) = block(&address_space, module_end);
+        assert_eq!((start, state), (module_end, MemoryState::Free));
+        assert_eq!(start + size, placed.tls);
+        // Mapped before anything is written, and the trampolines' bytes are in guest memory.
+        assert_eq!(
+            calls[1],
+            MapperCall::Map {
+                address: BASE - PAGE,
+                size: PAGE,
+                perms: Perms::ReadExecute
+            }
+        );
+        let mut first = [0; 4];
+        memory.read(BASE - PAGE, &mut first).unwrap();
+        assert_ne!(first, [0; 4]);
+    }
+
+    #[test]
+    fn the_trampolines_are_not_counted_as_the_processs_memory() {
+        let counter = programs::counter(RESCALE.guest_hz).unwrap();
+        let (with, _, _) = loaded(&counter.nro, Some(RESCALE));
+        let (without, _, _) = loaded(&counter.nro, None);
+        assert!(with.placed.mappings.iter().any(|m| m.name == "trampolines"));
+        // `GetInfo` reports what a console would: the module and the stack.
+        let expected = with.placed.module.size + STACK_SIZE;
+        for loaded in [&with, &without] {
+            let space = &loaded.address_space;
+            assert_eq!(space.used_user_physical_memory_size(), expected);
+            assert_eq!(space.limit().reserved(), expected);
+        }
+        // And everything else is where it is without them.
+        assert_eq!(with.placed.stack_top, without.placed.stack_top);
+        assert_eq!(with.placed.tls, without.placed.tls);
+    }
+
+    /// A [`Mapper`] that refuses its `n`th call (from zero) and accepts the rest.
+    struct RefuseCall(usize);
+
+    impl RefuseCall {
+        fn next(&mut self) -> Result<(), starquake_kernel::memory::MapperError> {
+            let refused = self.0 == 0;
+            self.0 = self.0.wrapping_sub(1);
+            if refused {
+                Err(starquake_kernel::memory::MapperError("refused".into()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl Mapper for RefuseCall {
+        fn map(
+            &mut self,
+            _: u64,
+            _: u64,
+            _: Perms,
+        ) -> Result<(), starquake_kernel::memory::MapperError> {
+            self.next()
+        }
+
+        fn unmap(&mut self, _: u64, _: u64) -> Result<(), starquake_kernel::memory::MapperError> {
+            self.next()
+        }
+
+        fn protect(
+            &mut self,
+            _: u64,
+            _: u64,
+            _: Perms,
+        ) -> Result<(), starquake_kernel::memory::MapperError> {
+            self.next()
+        }
+    }
+
+    #[test]
+    fn a_mapping_the_translation_refuses_fails_the_load_and_says_which() {
+        // The counter program's calls, in order: the code, the trampolines, one segment (its
+        // text), the stack, the thread-local page.
+        let counter = programs::counter(RESCALE.guest_hz).unwrap();
+        let program = Program::parse(&counter.nro).unwrap();
+        let attempt = |call: usize| {
+            load(&program, Some(RESCALE), Box::new(RefuseCall(call)), &flat()).map(|_| ())
+        };
+        assert!(matches!(
+            attempt(0),
+            Err(LoadError::AddressSpace(CreateError::Code(
+                SvcError::Internal(_)
+            )))
+        ));
+        for (call, what) in [
+            (1, "counter trampolines"),
+            (2, "segments"),
+            (3, "stack"),
+            (4, "TLS page"),
+        ] {
+            match attempt(call) {
+                Err(LoadError::Map {
+                    what: failed,
+                    error,
+                }) => {
+                    assert_eq!(failed, what, "call {call}");
+                    assert!(matches!(error, SvcError::Internal(_)), "{error:?}");
+                }
+                other => assert_eq!(other.map_err(|e| e.to_string()), Err(what.to_owned())),
+            }
+        }
+        // With no call refused the load succeeds, after exactly those five.
+        assert_eq!(attempt(5), Ok(()));
+        assert_eq!(
+            LoadError::Map {
+                what: "stack",
+                error: SvcError::Kernel(KernelError::LimitReached)
+            }
+            .to_string(),
+            "the program's stack could not be mapped: limit reached"
         );
     }
 
     #[test]
-    fn writing_copies_the_image_into_guest_memory_and_reports_a_fault() {
-        let file = programs::hello().unwrap();
-        let placed = place(&Program::parse(&file).unwrap(), RAM_BASE, RAM_SIZE, None).unwrap();
-        let memory = FlatMemory::new(RAM_BASE, file.len());
-        placed.write_into(&memory).unwrap();
-        let mut read = vec![0; file.len()];
-        memory.read(RAM_BASE, &mut read).unwrap();
-        assert_eq!(read, file);
-        let too_small = FlatMemory::new(RAM_BASE, file.len() - 1);
+    fn a_program_larger_than_the_application_pool_is_refused() {
+        // More `.bss` than an application may use: the kernel cannot reserve the code.
+        let pool = u32::try_from(MEMORY_ARRANGEMENT.application_pool_size()).unwrap();
+        let build = |bss: u32| {
+            let file = NroBuilder::new(&[a64::nop()])
+                .bss_size(bss)
+                .build()
+                .unwrap();
+            let (mapper, _log) = RecordingMapper::new();
+            load(
+                &Program::parse(&file).unwrap(),
+                None,
+                Box::new(mapper),
+                &flat(),
+            )
+            .map(|_| ())
+        };
+        // One page of image: with a page less than the pool of `.bss` the code is exactly the
+        // pool, which fits, and the stack then does not; with the whole pool it is one page
+        // too much.
+        let page = u32::try_from(PAGE).unwrap();
         assert_eq!(
-            placed.write_into(&too_small),
-            Err(Fault { address: RAM_BASE })
+            build(pool - page),
+            Err(LoadError::Map {
+                what: "stack",
+                error: SvcError::Kernel(KernelError::LimitReached)
+            })
         );
+        let error = LoadError::AddressSpace(CreateError::Code(SvcError::Kernel(
+            KernelError::LimitReached,
+        )));
+        assert_eq!(build(pool), Err(error.clone()));
+        assert_eq!(
+            error.to_string(),
+            "the program's address space could not be created: the program's code could not be \
+             mapped: limit reached"
+        );
+    }
+
+    #[test]
+    fn an_image_guest_memory_cannot_hold_is_a_write_fault() {
+        let file = programs::hello().unwrap();
+        let program = Program::parse(&file).unwrap();
+        let (mapper, _log) = RecordingMapper::new();
+        let too_small = FlatMemory::new(BASE, file.len() - 1);
+        let error = load(&program, None, Box::new(mapper), &too_small).unwrap_err();
+        assert_eq!(error, LoadError::Write(Fault { address: BASE }));
+        assert_eq!(
+            error.to_string(),
+            "the program could not be written into guest memory: guest memory fault at \
+             0x80000000"
+        );
+        let (mapper, _log) = RecordingMapper::new();
+        let exact = FlatMemory::new(BASE, file.len());
+        assert!(load(&program, None, Box::new(mapper), &exact).is_ok());
     }
 }

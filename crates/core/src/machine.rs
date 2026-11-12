@@ -4,9 +4,10 @@
 //! ```text
 //! loop
 //!   match vcpu.run()
-//!     Svc(n)            -> kernel dispatcher, with the vCPU's registers; ExitProcess ends the run
-//!     DataAbort         -> the guest crashed
-//!     InstructionAbort  -> the guest crashed
+//!     Svc(n)            -> kernel dispatcher, with the vCPU's registers; ExitProcess ends the run;
+//!                          then the address space is settled (its pending TLB flushes run)
+//!     DataAbort         -> the address space backs the page and the guest resumes, or it crashed
+//!     InstructionAbort  -> the same, for a fetch
 //!     Undefined         -> the guest crashed
 //!     Interrupted       -> the timeout passed, or resume
 //! ```
@@ -22,13 +23,21 @@
 //!   replaces this loop with six core threads driven by the scheduler.
 //! - **Whole register file per system call.** Each `svc` reads and writes all of [`GuestRegs`].
 //!   The execution model's single-register accessors on `Vcpu` replace that.
-//! - **Start state.** The thread starts with its program counter, stack pointer and
-//!   `TPIDRRO_EL0` set and every other register zero, and the vCPU's pointer-authentication keys
-//!   are left as the backend creates them. Kernel slice 8 sets what Horizon hands a main thread
-//!   and generates the process's keys.
-//! - **Every abort is fatal.** Nothing is lazily backed or write-tracked yet, so a data abort
-//!   or an instruction abort always ends the run, whatever its syndrome says. Kernel slice 6
-//!   (memory blocks) decides between lazy backing, write tracking and a crash.
+//! - **Start state.** The thread starts as `KProcess::Run` starts a program's main thread
+//!   (`eden/src/core/hle/kernel/k_process.cpp` @ cf654052): its program counter, stack pointer
+//!   and `TPIDRRO_EL0` set, `x0` zero and `x1` a handle to itself, which libnx will not start
+//!   without (`envGetMainThreadHandle` aborts on the invalid handle), and every other register
+//!   zero. The thread behind the handle is a row in the scheduler with Eden's default priority
+//!   ([`MAIN_THREAD_PRIORITY`]) that the scheduler is never asked to run; kernel slice 8 creates
+//!   the real main thread, with the NPDM's priority and core. The vCPU's pointer-authentication
+//!   keys are left as the backend creates them; slice 8 generates the process's.
+//! - **An abort is lazy backing or a crash.** The guest's address space ([`GuestSpace`]) is
+//!   asked what a faulting access comes to: a page the kernel mapped that has no backing yet
+//!   gets it and the guest resumes (execution model, "Sparse and lazy memory"); anything else
+//!   ends the run as a crash. The decision uses the permissions the kernel's block map gave
+//!   the translation, not the syndrome. Nothing is write-tracked yet (the GPU caches' slice).
+//!   A page that is backed this way is not an event: a console has no fault there, and a trace
+//!   must not depend on which pages the host happens to have backed.
 //! - **Lifecycle, fault and guest-log events are recorded here**, not by the kernel. Lifecycle
 //!   and fault events are recorded outside the kernel lock, which is harmless with one thread.
 //!   A guest-log event is recorded by this loop's [`DebugSink`] while the dispatcher runs
@@ -58,11 +67,13 @@ use std::time::{Duration, Instant};
 
 use starquake_cpu::{Exit, GuestRegs, Interrupter, Vcpu};
 use starquake_kernel::dispatch::{Caller, Dispatcher, Outcome, Record, Tables};
-use starquake_kernel::handle::{HandleError, HandleTable};
+use starquake_kernel::handle::{Handle, HandleError, HandleTable, ObjectRefs};
+use starquake_kernel::object::Object;
+use starquake_kernel::sched::{CoreId, Priority};
 use starquake_kernel::svc::DebugSink;
 use starquake_kernel::tables::{AddressSpace, Processes, Scheduler};
 use starquake_kernel::time::CounterRate;
-use starquake_memory::GuestMemory;
+use starquake_memory::{Access, GuestMemory};
 use starquake_trace::{
     DumpError, EventKind, FaultAction, FlightRecorder, GuestTicks, HostClock, LifecyclePhase,
     LiveEnv, Recorder, TextSink, ThreadId,
@@ -72,6 +83,7 @@ use crate::clock::Timebase;
 use crate::crash::{CrashReport, Exception};
 use crate::image::Placement;
 use crate::report::{ExitReason, RunOptions, RunReport, empty_dump};
+use crate::space::Touch;
 
 /// The core the one vCPU stands for.
 pub(crate) const CORE: u8 = 0;
@@ -79,12 +91,29 @@ pub(crate) const CORE: u8 = 0;
 pub(crate) const MAIN_THREAD: ThreadId = ThreadId(1);
 /// The one process, as lifecycle events name it.
 pub(crate) const PROCESS_ID: u64 = 1;
+/// The priority of the one guest thread: what Eden gives the main thread of a program with no
+/// NPDM (`KThread::DefaultThreadPriority` in `eden/src/core/hle/kernel/k_thread.h` @ cf654052,
+/// used by `eden/src/core/loader/nro.cpp`). PROVISIONAL: Horizon takes it from the NPDM.
+pub(crate) const MAIN_THREAD_PRIORITY: u8 = 44;
 /// Events the flight recorder keeps for the core (observability spec: "a few thousand each").
 const FLIGHT_CAPACITY: usize = 4096;
 /// How many of the newest events a crash report quotes.
 const LAST_EVENTS: usize = 32;
 /// Seed of the environment's random numbers (the `--seed` flag is not built).
 const RANDOM_SEED: u64 = 0;
+
+/// The guest's address space as the loop uses it: its memory, as the kernel reads and writes
+/// it, and the two things the loop itself asks of it. `V` is the vCPU the loop runs.
+pub(crate) trait GuestSpace<V>: GuestMemory {
+    /// What a guest access that faulted at `address` comes to: whether the page only lacked
+    /// backing, which it then has (see [`Touch`]).
+    fn touch(&self, address: u64, access: Access) -> Touch;
+
+    /// Runs on `vcpu` whatever the address space owes its vCPUs since the last call: the TLB
+    /// invalidations for what was unmapped or reprotected. The loop calls it after every
+    /// system call, before the guest runs again, whatever the call returned.
+    fn settle(&self, vcpu: &mut V) -> Result<(), starquake_cpu::Error>;
+}
 
 /// How much of a run is kept in memory for its report. A guest can make system calls and write
 /// log lines for as long as it runs, and a run has no timeout unless it is given one, so without
@@ -286,54 +315,82 @@ enum Ending {
     Failed(String),
 }
 
-/// The kernel's tables for one process, whose counter runs at `rate`. PROVISIONAL: the address
-/// space is still a placeholder in the kernel, and the handle table has Horizon's maximum size
-/// because an NRO carries no NPDM to say otherwise.
-fn tables(rate: CounterRate) -> Result<Tables, HandleError> {
+/// The kernel's tables for one process, whose counter runs at `rate` and whose memory is
+/// `address_space`. PROVISIONAL: the handle table has Horizon's maximum size because an NRO
+/// carries no NPDM to say otherwise.
+fn tables(rate: CounterRate, address_space: AddressSpace) -> Result<Tables, HandleError> {
     Ok(Tables {
         handles: HandleTable::new(0)?,
-        address_space: AddressSpace::default(),
+        address_space,
         scheduler: Scheduler::default(),
         processes: Processes::new(rate),
     })
 }
 
-/// Runs the placed program on `vcpu` until it exits, crashes or times out, and reports what
-/// happened. `memory` must already hold the program ([`Placement::write_into`]); `started` is
-/// when the run began, for the report's duration. `time` is the process's counter rate, which
-/// must be the rate the program's counter reads were patched for, and the host clock guest
-/// time is counted from.
+/// Creates the main thread's row in the scheduler and a handle to it, which holds the thread's
+/// only reference, as `KProcess::Run` leaves it (see "Start state" in the module docs).
+fn main_thread_handle(dispatcher: &Dispatcher) -> Result<Handle, String> {
+    let failed = |error: &dyn std::error::Error| format!("no main thread: {error}");
+    let priority = Priority::new(MAIN_THREAD_PRIORITY).ok_or("no main thread priority")?;
+    let core = CoreId::new(CORE).ok_or("no main thread core")?;
+    dispatcher.with::<(&mut HandleTable, &mut Scheduler), _>(|(handles, scheduler)| {
+        let thread = scheduler
+            .create_thread(priority, core)
+            .map_err(|error| failed(&error))?;
+        let objects = scheduler.objects_mut();
+        let object = objects
+            .create(Object::Thread(thread))
+            .map_err(|error| failed(&error))?;
+        let handle = handles
+            .add(objects, object)
+            .map_err(|error| failed(&error))?;
+        objects.close(object).map_err(|error| failed(&error))?;
+        Ok(handle)
+    })
+}
+
+/// A loaded program, as the loop takes it: the guest's address space as host code and the
+/// loop see it (which must already hold the program), where the program is, and the kernel's
+/// address space for it (`crate::image::load` makes the last two).
+pub(crate) struct GuestProgram<'a, V> {
+    /// The guest's address space.
+    pub(crate) space: &'a dyn GuestSpace<V>,
+    /// Where the program, its stack and its TLS block are.
+    pub(crate) placed: &'a Placement,
+    /// The process's memory, for the kernel's tables.
+    pub(crate) address_space: AddressSpace,
+}
+
+/// Runs the loaded program `guest` on `vcpu` until it exits, crashes or times out, and reports
+/// what happened. `started` is when the run began, for the report's duration. `time` is the
+/// process's counter rate, which must be the rate the program's counter reads were patched
+/// for, and the host clock guest time is counted from.
 pub(crate) fn run<V: Vcpu, C: HostClock + Clone + 'static>(
     vcpu: &mut V,
-    memory: &dyn GuestMemory,
-    placed: &Placement,
+    guest: GuestProgram<'_, V>,
     options: &RunOptions,
     started: Instant,
     time: Timebase<C>,
 ) -> RunReport {
-    run_within(
-        vcpu,
-        memory,
-        placed,
-        options,
-        started,
-        time,
-        Limits::DEFAULT,
-    )
+    run_within(vcpu, guest, options, started, time, Limits::DEFAULT)
 }
 
 /// [`run`], keeping no more of the run in memory than `limits` allows.
 pub(crate) fn run_within<V: Vcpu, C: HostClock + Clone + 'static>(
     vcpu: &mut V,
-    memory: &dyn GuestMemory,
-    placed: &Placement,
+    guest: GuestProgram<'_, V>,
     options: &RunOptions,
     started: Instant,
     time: Timebase<C>,
     limits: Limits,
 ) -> RunReport {
+    let GuestProgram {
+        space,
+        placed,
+        address_space,
+    } = guest;
     let session = Session {
-        memory,
+        memory: space,
         placed,
         options,
         clock: RunClock::new(time),
@@ -353,7 +410,11 @@ pub(crate) fn run_within<V: Vcpu, C: HostClock + Clone + 'static>(
     };
     let mut tally = Tally::default();
     let env = session.environment();
-    let exit = match drive(vcpu, &session, &env, &mut log, &mut tally) {
+    let process = Process {
+        space,
+        address_space,
+    };
+    let exit = match drive(vcpu, process, &session, &env, &mut log, &mut tally) {
         Ending::Exited => ExitReason::ProcessExited,
         Ending::TimedOut => ExitReason::Timeout,
         Ending::Failed(message) => {
@@ -417,29 +478,47 @@ fn settle_dump(
     }
 }
 
+/// The process the loop runs, as far as its memory goes: the guest's address space, and the
+/// kernel's bookkeeping of it, which the loop hands to the kernel's tables.
+struct Process<'a, V> {
+    space: &'a dyn GuestSpace<V>,
+    address_space: AddressSpace,
+}
+
 /// The loop itself (see the module docs). `env` is the environment the kernel reads
 /// ([`Session::environment`]); the caller owns it so that a test can see what the loop leaves
 /// in its recording.
 fn drive<V: Vcpu, C: HostClock + Clone + 'static>(
     vcpu: &mut V,
+    process: Process<'_, V>,
     session: &Session<'_, C>,
     env: &LiveEnv,
     log: &mut GuestLog<'_, C>,
     tally: &mut Tally,
 ) -> Ending {
-    let dispatcher = match tables(session.clock.rate) {
+    let Process {
+        space,
+        address_space,
+    } = process;
+    let dispatcher = match tables(session.clock.rate, address_space) {
         Ok(tables) => Dispatcher::new(tables),
         Err(error) => return Ending::Failed(format!("the kernel could not be set up: {error}")),
     };
     let vcpu_failed = |error| Ending::Failed(format!("the vCPU failed: {error}"));
+    let main_thread = match main_thread_handle(&dispatcher) {
+        Ok(handle) => handle,
+        Err(error) => return Ending::Failed(format!("the kernel could not be set up: {error}")),
+    };
 
-    // PROVISIONAL: everything else starts at zero (see "Start state" in the module docs).
-    let start = GuestRegs {
+    // PROVISIONAL: see "Start state" in the module docs. `x0` is zero and `x1` the main
+    // thread's handle; everything else starts at zero.
+    let mut start = GuestRegs {
         pc: session.placed.entry,
         sp: session.placed.stack_top,
         tpidrro: session.placed.tls,
         ..GuestRegs::default()
     };
+    start.x[1] = u64::from(main_thread.raw());
     if let Err(error) = vcpu.set_regs(&start) {
         return vcpu_failed(error);
     }
@@ -479,6 +558,12 @@ fn drive<V: Vcpu, C: HostClock + Clone + 'static>(
                 // and every dispatch adds a clock reading to it.
                 drop(env.take_recording());
                 tally.count(&record);
+                // The call may have unmapped or reprotected memory. What the vCPUs have cached
+                // about it must go before the guest runs again, also when the call failed
+                // part-way.
+                if let Err(error) = space.settle(vcpu) {
+                    return vcpu_failed(error);
+                }
                 match record.outcome {
                     Outcome::Completed | Outcome::NotImplemented => {
                         if let Err(error) = vcpu.set_regs(&regs) {
@@ -500,15 +585,27 @@ fn drive<V: Vcpu, C: HostClock + Clone + 'static>(
                 }
             }
             Exit::DataAbort { address, write, .. } => {
-                let exception = Exception::DataAbort { address, write };
-                return fatal_fault(vcpu, session, address, write, exception);
+                let access = if write { Access::Write } else { Access::Read };
+                match space.touch(address, access) {
+                    // The page only lacked backing: the guest retries the access.
+                    Touch::Backed => {}
+                    Touch::Refused => {
+                        let exception = Exception::DataAbort { address, write };
+                        return fatal_fault(vcpu, session, address, write, exception);
+                    }
+                    Touch::Failed(error) => return unbacked(address, &error),
+                }
             }
-            Exit::InstructionAbort { address, .. } => {
-                // The event stream has one kind of fault; a fetch is recorded as a read, as it
-                // was when the backend reported fetch faults as data aborts.
-                let exception = Exception::InstructionAbort { address };
-                return fatal_fault(vcpu, session, address, false, exception);
-            }
+            Exit::InstructionAbort { address, .. } => match space.touch(address, Access::Execute) {
+                Touch::Backed => {}
+                Touch::Refused => {
+                    // The event stream has one kind of fault; a fetch is recorded as a read,
+                    // as it was when the backend reported fetch faults as data aborts.
+                    let exception = Exception::InstructionAbort { address };
+                    return fatal_fault(vcpu, session, address, false, exception);
+                }
+                Touch::Failed(error) => return unbacked(address, &error),
+            },
             Exit::Undefined { .. } => return crashed(vcpu, Exception::UndefinedInstruction),
             Exit::Interrupted => {
                 if watchdog.fired() {
@@ -518,6 +615,14 @@ fn drive<V: Vcpu, C: HostClock + Clone + 'static>(
             }
         }
     }
+}
+
+/// Ends the run because a page the guest may use could not be given backing: the emulator's
+/// failure, not the guest's.
+fn unbacked(address: u64, error: &crate::space::SpaceError) -> Ending {
+    Ending::Failed(format!(
+        "guest memory at {address:#x} could not be backed: {error}"
+    ))
 }
 
 /// Ends the run as a crash with `exception`, with the guest's registers as they are now.

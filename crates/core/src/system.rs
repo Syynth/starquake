@@ -1,8 +1,9 @@
 //! [`System`]: one program, loaded and run from start to finish.
 //!
 //! PROVISIONAL (walking skeleton, #74). A `System` is one NRO run once as one guest thread on
-//! one vCPU of the hypervisor backend, in an address space of its own (the `image`, `space`
-//! and `machine` modules say what is provisional about each and what replaces it). It is the
+//! one vCPU of the hypervisor backend, in an address space of its own that the kernel keeps
+//! the books of (the `image`, `space` and `machine` modules say what is provisional about each
+//! and what replaces it). It is the
 //! thinnest thing that joins the loader, the code patcher, the CPU backend, the kernel
 //! dispatcher and the event stream, so that later work widens something that runs.
 //!
@@ -11,8 +12,6 @@
 //! as an emulator error.
 
 use std::time::Instant;
-
-use starquake_memory::Fault;
 
 use crate::image::{LoadError, Program};
 use crate::report::{RunOptions, RunReport};
@@ -33,9 +32,6 @@ pub enum Error {
     /// The CPU backend could not create its VM or vCPU.
     #[error("the CPU backend failed: {0}")]
     Cpu(#[from] starquake_cpu::Error),
-    /// The program could not be copied into guest memory.
-    #[error("the program could not be written into guest memory: {0}")]
-    Memory(Fault),
     /// The program's address space could not be built.
     #[error("the program could not be mapped into guest memory: {0}")]
     AddressSpace(#[from] SpaceError),
@@ -75,19 +71,20 @@ impl System {
 /// The hypervisor backend: a fresh VM for every run.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod host {
-    use std::sync::{Mutex, PoisonError};
+    use std::sync::{Arc, Mutex, PoisonError};
     use std::time::Instant;
 
-    use starquake_cpu::hvf::{HvfBackend, RamConfig};
+    use starquake_cpu::hvf::{HvfBackend, HvfVcpu, PhysicalMemory, RamConfig};
     use starquake_cpu::{Backend, Vcpu};
     use starquake_loader::patch::CounterRescale;
+    use starquake_memory::Access;
 
     use super::Error;
     use crate::clock::{CounterClock, PROCESS_COUNTER_RATE, Timebase};
-    use crate::image::{IMAGE_BASE, Program, place};
-    use crate::machine;
+    use crate::image::{Loaded, Program, load};
+    use crate::machine::{self, GuestProgram, GuestSpace};
     use crate::report::{RunOptions, RunReport};
-    use crate::space::AddressSpace;
+    use crate::space::{AddressSpace, SpaceMapper, Touch};
 
     /// Held for the whole of a run: Hypervisor.framework allows one VM per process.
     static ONE_VM: Mutex<()> = Mutex::new(());
@@ -95,6 +92,17 @@ mod host {
     /// The address-space id of the one process. PROVISIONAL: kernel slice 8 (process creation)
     /// hands ids out, within the width the backend reports (`HvfVcpu::asid_bits`).
     const PROCESS_ASID: u16 = 1;
+
+    /// The one address space of a run, as the loop drives it on the vCPU.
+    impl GuestSpace<HvfVcpu> for AddressSpace<PhysicalMemory> {
+        fn touch(&self, address: u64, access: Access) -> Touch {
+            AddressSpace::touch(self, address, access)
+        }
+
+        fn settle(&self, vcpu: &mut HvfVcpu) -> Result<(), starquake_cpu::Error> {
+            vcpu.flush_pending(self.tables(), PROCESS_ASID)
+        }
+    }
 
     pub(super) fn run(
         program: &Program,
@@ -120,21 +128,27 @@ mod host {
             host_hz,
             guest_hz: time.rate.hz(),
         };
-        // The program's window of virtual addresses is as large as RAM, so what fits one fits
-        // the other. Guest code sees each region with its own permissions; the loader writes
-        // through the address space's host view, which has none.
-        let placed = place(program, IMAGE_BASE, ram.size(), Some(counter))?;
-        let mut space = AddressSpace::new(backend.physical(), ram, backend.table_pool())?;
-        for region in &placed.regions {
-            space.map(region)?;
-        }
-        placed.write_into(&space).map_err(Error::Memory)?;
+        // The kernel's address space decides what is mapped; this one makes it real, and is
+        // what the loader and the kernel read and write guest memory through.
+        let space = Arc::new(AddressSpace::new(
+            backend.physical(),
+            ram,
+            backend.table_pool(),
+        )?);
+        let mapper = SpaceMapper(Arc::clone(&space));
+        let Loaded {
+            placed,
+            address_space,
+        } = load(program, Some(counter), Box::new(mapper), &*space)?;
         // Declared after the backend, so it is dropped first, as the VM requires.
         let mut vcpu = backend.create_vcpu()?;
         vcpu.set_address_space(space.root(), PROCESS_ASID)?;
-        Ok(machine::run(
-            &mut vcpu, &space, &placed, options, started, time,
-        ))
+        let guest = GuestProgram {
+            space: &*space,
+            placed: &placed,
+            address_space,
+        };
+        Ok(machine::run(&mut vcpu, guest, options, started, time))
     }
 }
 

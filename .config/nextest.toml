@@ -1,0 +1,12 @@
+# How `cargo nextest` runs the gate's tests (`cargo xtask ci`).
+#
+# A test that hangs must fail the gate, not stall it: nextest's default is to wait for ever. A
+# test is reported as slow after 30 seconds and ended, as a failure, after 120. The slowest
+# tests of the workspace take a few seconds, the hypervisor tests included, so the limit only
+# ever stops a test that is stuck. `xtask/tests/nextest_config.rs` checks that this file keeps
+# saying so.
+#
+# No retries: a flaky test is a bug to find, not to hide (`CLAUDE.md`, "Tests").
+[profile.default]
+slow-timeout = { period = "30s", terminate-after = 4 }
+retries = 0
