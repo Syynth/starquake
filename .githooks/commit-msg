@@ -54,8 +54,11 @@ fi
 # The one exception to "a PR title is written by a person" is the title GitHub writes for a revert
 # PR: `Revert "<title of the reverted PR>"`, nested once more for each revert of a revert. It is
 # accepted exactly in that form, i.e. when stripping the `Revert "` ... `"` wrappers leaves a
-# conventional subject; anything else (an unclosed quote, text after the closing quote, a wrapped
-# subject that is not conventional) is judged like any hand-written title.
+# conventional subject; anything else (an unclosed quote, a wrapped subject that is not
+# conventional) is judged like any hand-written title. Text after the closing quote is rejected
+# only when the title does not end in a quote: quotes inside a title are allowed, so
+# `Revert "feat: a" and "b"` is accepted (the wrapper strip cannot tell it from a title that
+# quotes something).
 if [ "$title" -eq 1 ]; then
     inner="$subject"
     while :; do

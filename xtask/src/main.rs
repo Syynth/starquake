@@ -8,7 +8,7 @@
 
 mod unused_deps;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::time::Instant;
 
@@ -62,6 +62,59 @@ fn parse_args<I: IntoIterator<Item = String>>(
         }
     }
     Ok(Task::Ci { offline })
+}
+
+/// Why the gate refuses to start.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+enum Refusal {
+    /// `--offline` (or the variable) under CI, where the advisory check is mandatory.
+    #[error(
+        "==> offline FAILED: the advisory check is mandatory under CI (CI is set), so \
+         --offline and {OFFLINE_VARIABLE} are refused"
+    )]
+    OfflineInCi,
+    /// The folder above `xtask/` is not a cargo workspace root.
+    #[error("==> workspace FAILED: the folder above {0} has no [workspace] manifest")]
+    NotAWorkspaceRoot(String),
+    /// The workspace root exists but the process cannot change into it.
+    #[error("==> workspace FAILED: cannot enter {0}")]
+    CannotEnter(String),
+}
+
+/// Decides whether the gate may run with this offline setting: the advisory check can be skipped
+/// locally, never under CI.
+fn check_offline(offline: bool, in_ci: bool) -> Result<(), Refusal> {
+    if offline && in_ci {
+        Err(Refusal::OfflineInCi)
+    } else {
+        Ok(())
+    }
+}
+
+/// Checks the offline setting, then moves to the workspace root so that the gate behaves the same
+/// from any folder of the checkout.
+fn start(offline: bool, in_ci: bool) -> Result<(), Refusal> {
+    check_offline(offline, in_ci)?;
+    let root = workspace_root(Path::new(env!("CARGO_MANIFEST_DIR")))?;
+    std::env::set_current_dir(&root).map_err(|_| Refusal::CannotEnter(root.display().to_string()))
+}
+
+/// The workspace root of the checkout this binary belongs to: the folder above `xtask/`, given
+/// the compile-time `xtask` folder `manifest_dir`. The binary is built per checkout (see
+/// `.cargo/config.toml`), so this is the checkout it runs in, however deep the shell's current
+/// directory is. The folder must really hold a `[workspace]` manifest.
+fn workspace_root(manifest_dir: &Path) -> Result<PathBuf, Refusal> {
+    let not_a_root = || Refusal::NotAWorkspaceRoot(manifest_dir.display().to_string());
+    let root = manifest_dir.parent().ok_or_else(not_a_root)?;
+    let manifest = std::fs::read_to_string(root.join("Cargo.toml")).map_err(|_| not_a_root())?;
+    let is_workspace = manifest
+        .parse::<toml::Table>()
+        .is_ok_and(|table| table.contains_key("workspace"));
+    if is_workspace {
+        Ok(root.to_owned())
+    } else {
+        Err(not_a_root())
+    }
 }
 
 fn main() -> ExitCode {
@@ -278,25 +331,39 @@ fn has_cargo_plugin(subcommand: &str) -> bool {
         .is_ok_and(|output| output.status.success())
 }
 
-/// Decides one optional tool's place in the plan, saying why on stderr when it is skipped.
-/// `None` means the gate must fail.
-fn tool_runs(subcommand: &str, install: &str, in_ci: bool) -> Option<bool> {
-    match availability(has_cargo_plugin(subcommand), in_ci) {
-        Availability::Run => Some(true),
-        Availability::SkipNotInstalled => {
-            eprintln!(
-                "==> {subcommand}: SKIPPED, cargo-{subcommand} is not installed (CI always runs \
-                 it; `{install}` to run it here)"
-            );
-            Some(false)
-        }
-        Availability::MissingInCi => {
-            eprintln!(
-                "==> {subcommand} FAILED: cargo-{subcommand} must be installed when CI is set"
-            );
-            None
-        }
-    }
+/// Which optional cargo plugins are installed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Installed {
+    nextest: bool,
+    deny: bool,
+    machete: bool,
+}
+
+/// A tool the gate cannot go without under CI is not installed.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+#[error("==> {0} FAILED: cargo-{0} must be installed when CI is set")]
+struct MissingInCi(&'static str);
+
+/// Builds the plan from what is installed, whether this is CI and whether the run is offline.
+/// `deny` and `machete` are in the plan whenever they are installed; under CI one that is missing
+/// fails (deny is checked first), so CI can never silently lose a check.
+fn plan_for(installed: Installed, in_ci: bool, offline: bool) -> Result<Plan, MissingInCi> {
+    let runs = |present, tool| match availability(present, in_ci) {
+        Availability::Run => Ok(true),
+        Availability::SkipNotInstalled => Ok(false),
+        Availability::MissingInCi => Err(MissingInCi(tool)),
+    };
+    let deny = runs(installed.deny, "deny")?;
+    let machete = runs(installed.machete, "machete")?;
+    Ok(Plan {
+        nextest: installed.nextest,
+        deny: deny.then_some(if offline {
+            DenyChecks::WithoutAdvisories
+        } else {
+            DenyChecks::All
+        }),
+        machete,
+    })
 }
 
 /// Runs `cargo machete` and judges its findings against the allow-list. Returns whether the
@@ -320,18 +387,13 @@ fn run_machete() -> bool {
             return false;
         }
     };
-    // Exit status: 0 = nothing unused, 1 = findings, 2 (or a signal) = machete itself failed.
-    let found = match output.status.code() {
-        Some(0) => Vec::new(),
-        Some(1) => match unused_deps::parse_machete(&String::from_utf8_lossy(&output.stdout)) {
-            Ok(found) => found,
-            Err(error) => {
-                eprintln!("{error}");
-                return false;
-            }
-        },
-        status => {
-            eprintln!("cargo machete failed (exit status {status:?})");
+    let found = match unused_deps::machete_findings(
+        output.status.code(),
+        &String::from_utf8_lossy(&output.stdout),
+    ) {
+        Ok(found) => found,
+        Err(error) => {
+            eprintln!("{error}");
             return false;
         }
     };
@@ -392,39 +454,40 @@ fn workspace_dependencies() -> bool {
 
 fn ci(offline: bool) -> ExitCode {
     let in_ci = std::env::var_os("CI").is_some();
-    if offline && in_ci {
-        eprintln!(
-            "==> offline FAILED: the advisory check is mandatory under CI (CI is set), so \
-             --offline and {OFFLINE_VARIABLE} are refused"
-        );
+    if let Err(refusal) = start(offline, in_ci) {
+        eprintln!("{refusal}");
         return ExitCode::FAILURE;
     }
     if !disk_ok() {
         return ExitCode::FAILURE;
     }
-    let Some(deny) = tool_runs("deny", "cargo install cargo-deny --locked", in_ci) else {
-        return ExitCode::FAILURE;
+    let installed = Installed {
+        nextest: has_cargo_plugin("nextest"),
+        deny: has_cargo_plugin("deny"),
+        machete: has_cargo_plugin("machete"),
     };
-    let Some(machete) = tool_runs("machete", "cargo install cargo-machete --locked", in_ci) else {
-        return ExitCode::FAILURE;
+    let plan = match plan_for(installed, in_ci, offline) {
+        Ok(plan) => plan,
+        Err(missing) => {
+            eprintln!("{missing}");
+            return ExitCode::FAILURE;
+        }
     };
-    let deny = deny.then_some(if offline {
-        DenyChecks::WithoutAdvisories
-    } else {
-        DenyChecks::All
-    });
-    if offline && deny.is_some() {
+    for (present, tool) in [(installed.deny, "deny"), (installed.machete, "machete")] {
+        if !present {
+            eprintln!(
+                "==> {tool}: SKIPPED, cargo-{tool} is not installed (CI always runs it; \
+                 `cargo install cargo-{tool} --locked` to run it here)"
+            );
+        }
+    }
+    if offline && plan.deny.is_some() {
         eprintln!(
             "==> offline: deny runs WITHOUT the advisory check (needs the network); CI always \
              runs it"
         );
     }
     let total = Instant::now();
-    let plan = Plan {
-        nextest: has_cargo_plugin("nextest"),
-        deny,
-        machete,
-    };
     for Step { name, action } in steps(plan) {
         let start = Instant::now();
         let ok = match action {
@@ -503,6 +566,140 @@ mod tests {
     fn tools_are_skipped_locally_but_mandatory_in_ci() {
         assert_eq!(availability(false, false), Availability::SkipNotInstalled);
         assert_eq!(availability(false, true), Availability::MissingInCi);
+    }
+
+    const ALL_INSTALLED: Installed = Installed {
+        nextest: true,
+        deny: true,
+        machete: true,
+    };
+
+    #[test]
+    fn offline_is_refused_under_ci_and_only_then() {
+        assert_eq!(check_offline(true, true), Err(Refusal::OfflineInCi));
+        assert_eq!(check_offline(true, false), Ok(()));
+        assert_eq!(check_offline(false, true), Ok(()));
+        assert_eq!(check_offline(false, false), Ok(()));
+    }
+
+    #[test]
+    fn the_offline_refusal_message_names_the_flag_and_the_variable() {
+        assert_eq!(
+            Refusal::OfflineInCi.to_string(),
+            "==> offline FAILED: the advisory check is mandatory under CI (CI is set), so \
+             --offline and STARQUAKE_OFFLINE are refused"
+        );
+    }
+
+    #[test]
+    fn the_workspace_root_is_the_folder_above_xtask() {
+        let xtask = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = workspace_root(xtask).unwrap();
+        assert_eq!(root, xtask.parent().unwrap());
+        // The gate reads `Cargo.toml`, `xtask/unused-deps.toml` and so on relative to the root.
+        assert!(root.join("Cargo.toml").is_file());
+        assert!(root.join("xtask").join("Cargo.toml").is_file());
+    }
+
+    #[test]
+    fn a_folder_that_is_not_below_a_workspace_root_is_refused() {
+        // `xtask/src` has `xtask/` above it, whose manifest is a package, not a workspace.
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let error = workspace_root(&src).unwrap_err();
+        assert_eq!(error, Refusal::NotAWorkspaceRoot(src.display().to_string()));
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "==> workspace FAILED: the folder above {} has no [workspace] manifest",
+                src.display()
+            )
+        );
+        assert!(matches!(
+            workspace_root(Path::new("/")),
+            Err(Refusal::NotAWorkspaceRoot(_))
+        ));
+    }
+
+    #[test]
+    fn installed_tools_end_up_in_the_plan() {
+        assert_eq!(
+            plan_for(ALL_INSTALLED, false, false),
+            Ok(Plan {
+                nextest: true,
+                deny: Some(DenyChecks::All),
+                machete: true
+            })
+        );
+        // The same under CI.
+        assert_eq!(plan_for(ALL_INSTALLED, true, false), Ok(FULL));
+        let no_nextest = Installed {
+            nextest: false,
+            ..ALL_INSTALLED
+        };
+        assert_eq!(
+            plan_for(no_nextest, false, false),
+            Ok(Plan {
+                nextest: false,
+                ..FULL
+            })
+        );
+    }
+
+    #[test]
+    fn a_missing_tool_is_skipped_locally_and_fails_under_ci() {
+        let no_machete = Installed {
+            machete: false,
+            ..ALL_INSTALLED
+        };
+        let no_deny = Installed {
+            deny: false,
+            ..ALL_INSTALLED
+        };
+        assert_eq!(
+            plan_for(no_machete, false, false),
+            Ok(Plan {
+                machete: false,
+                ..FULL
+            })
+        );
+        assert_eq!(
+            plan_for(no_deny, false, false),
+            Ok(Plan { deny: None, ..FULL })
+        );
+        assert_eq!(
+            plan_for(no_machete, true, false),
+            Err(MissingInCi("machete"))
+        );
+        assert_eq!(plan_for(no_deny, true, false), Err(MissingInCi("deny")));
+        let neither = Installed {
+            deny: false,
+            machete: false,
+            ..ALL_INSTALLED
+        };
+        assert_eq!(plan_for(neither, true, false), Err(MissingInCi("deny")));
+        assert_eq!(
+            MissingInCi("machete").to_string(),
+            "==> machete FAILED: cargo-machete must be installed when CI is set"
+        );
+    }
+
+    #[test]
+    fn offline_drops_only_the_advisory_check() {
+        assert_eq!(
+            plan_for(ALL_INSTALLED, false, true),
+            Ok(Plan {
+                deny: Some(DenyChecks::WithoutAdvisories),
+                ..FULL
+            })
+        );
+        let no_deny = Installed {
+            deny: false,
+            ..ALL_INSTALLED
+        };
+        assert_eq!(
+            plan_for(no_deny, false, true),
+            Ok(Plan { deny: None, ..FULL })
+        );
     }
 
     #[test]

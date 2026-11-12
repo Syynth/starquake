@@ -23,6 +23,12 @@ check (the root `[workspace.dependencies]`, then `cargo machete` per crate), `ca
 (licences, sources, advisories; `deny.toml`), clippy with `-D warnings` and the workspace lint
 set, nextest, doctests. CI runs exactly this.
 
+- The unused-dependency check covers each crate's top-level `[dependencies]` table only: `cargo
+  machete` 0.9.2 does not look at `[dev-dependencies]`, `[build-dependencies]` or
+  `[target.*]` tables, and neither does our workspace check (an inheritance from any of them
+  counts as a use). Keep those tables tidy by hand. `ignored = [...]` under
+  `[package.metadata.cargo-machete]` or `[workspace.metadata.cargo-machete]` fails the gate:
+  the reasoned list is `xtask/unused-deps.toml`.
 - `cargo-deny` and `cargo-machete` are skipped locally, with a notice, when not installed
   (`cargo install cargo-deny cargo-machete --locked`); under CI a missing one fails the gate.
 - A dependency that is declared ahead of the task that uses it goes in `xtask/unused-deps.toml`
@@ -31,6 +37,8 @@ set, nextest, doctests. CI runs exactly this.
 - `cargo deny` fetches the advisory database, so the gate needs network access. Offline, run
   `cargo xtask ci --offline` (or set `STARQUAKE_OFFLINE=1`): only the advisory check is skipped,
   and the output says so. CI refuses the switch.
+- `cargo xtask ci` moves to the workspace root itself, so it also works from a subfolder (the
+  alias then builds its binary in that folder's own `target/`, which is git-ignored).
 - `cargo xtask` builds its own binary in `target/xtask` inside the checkout, so worktrees that
   share one `CARGO_TARGET_DIR` each run their own `xtask` (see `docs/roadmap.md`).
 

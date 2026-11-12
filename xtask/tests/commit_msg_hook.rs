@@ -234,6 +234,19 @@ fn revert_titles_must_wrap_a_conventional_title_exactly() {
     }
 }
 
+/// A known looseness, listed so it stays deliberate: the revert wrapper is stripped by its first
+/// `Revert "` and its last `"`, so text after an inner closing quote is accepted when the title
+/// still ends in a quote. Quotes inside a title are allowed, so the hook cannot tell these from a
+/// reverted title that quotes something.
+#[test]
+fn a_title_that_ends_in_a_quote_may_have_quoted_text_inside() {
+    for title in ["Revert \"feat: a\" and \"b\"\n", "Revert \"feat: a\" \"\n"] {
+        assert_eq!(run(title, true).0, EXIT_ACCEPTED, "{title:?}");
+    }
+    // Text after the last quote is still rejected.
+    assert_rejected("Revert \"feat: a\" and \"b\" more\n", true);
+}
+
 #[test]
 fn hand_written_merge_subjects_are_rejected() {
     for message in [

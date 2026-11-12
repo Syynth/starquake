@@ -65,8 +65,9 @@ reviewed adversarially, and landed one at a time through a merge queue behind `c
   passes `--target-dir target/xtask`, so the binary is built and run from a folder inside the
   checkout, while the cargo commands it spawns inherit `CARGO_TARGET_DIR` and keep building in the
   shared folder. Without this, worktrees sharing a build folder overwrite each other's
-  `debug/xtask` and one runs another's gate. Run `cargo xtask` (or `just ci`) from the repository
-  root: the path is relative to the directory cargo is started in.
+  `debug/xtask` and one runs another's gate. The path is relative to the directory cargo is started
+  in, so from a subfolder the binary lands in that folder's own (git-ignored) `target/`; `ci`
+  itself changes to the workspace root, so the gate runs the same from anywhere in the checkout.
   `xtask/tests/per_checkout_binary.rs` runs two checkouts with different `xtask` sources against
   one shared folder and checks that each runs its own.
 - Worktrees are removed when their PR lands; reference sources are one shared checkout.

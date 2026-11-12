@@ -2,7 +2,8 @@
 # CARGO_TARGET_DIR: worktrees of a wave share that variable's folder, and a shared
 # `debug/xtask` would run whichever checkout built it last. The cargo commands xtask spawns do
 # not see the flag, so they keep using CARGO_TARGET_DIR (or `target/`). The path is relative to
-# the directory cargo is invoked in, so run `cargo xtask` (or `just ci`) from the repository root.
+# the directory cargo is invoked in: from a subfolder the binary is built in that folder's own
+# `target/` (git-ignored). `cargo xtask ci` changes to the workspace root before it does anything.
 [alias]
 xtask = "run --package xtask --quiet --target-dir target/xtask --"
 
