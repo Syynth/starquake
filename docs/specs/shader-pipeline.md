@@ -1,14 +1,19 @@
 # Shader pipeline
 
 Status: draft for the owner's review (issue #13). Not approved; nothing is built on it yet.
+Amended on 2026-11-12 to follow the owner's six graphics decisions (`docs/decision-log.md`) and
+the seam resolutions of the graphics review guide (`docs/specs/graphics-review-guide.md`); the
+decided items are marked in "Decisions for the owner".
 
 `crates/shader` turns the guest's GPU programs into host shaders. A Switch 2 game ships its
 shaders as compiled NVIDIA machine code (SASS for the SM86 shader model, 128-bit instructions;
 `switch2-eden-diff-scoping.md`, "Shaders"). The host GPU cannot run that code, so starquake
 decodes it, rebuilds its control flow, translates it into an intermediate representation (IR),
-applies the passes correctness needs, and emits SPIR-V for Vulkan and MSL for Metal through
-`naga`. The GPU crate asks for shaders on its back thread; the render backend builds pipelines
-from the result.
+applies the passes correctness needs, and lowers it to a validated `naga` module. The render
+backend's first host layer is wgpu, which takes that module directly (owner's decisions of
+2026-11-12). Final SPIR-V or MSL is emitted here, with naga's writers, only for a later direct
+backend that asks for it. The GPU crate asks for shaders on its back thread and carries the
+result to the render backend, which builds pipelines from it.
 
 ## Summary
 
@@ -19,12 +24,16 @@ from the result.
 - **Our own IR, Eden's semantics.** A new arena-based Rust IR whose operations and passes follow
   Eden's `shader_recompiler` IR (SSA, structured control flow). Not a line-by-line port of the
   C++ data structures, and not a direct lowering to naga's IR.
-- **naga is the only backend at first.** It writes both SPIR-V and MSL, validates every module,
-  is pure Rust, and in version 30 already has mesh and task stages. It cannot express several
-  things the guest does (geometry and tessellation stages, transform feedback, texture LOD
-  queries, sparse residency, raw pointers, among others: the gap table below). Each gap has a
-  stated plan, and the IR does not depend on naga, so a direct SPIR-V or MSL writer can be added
-  for a gap without touching the rest.
+- **naga is the only shader backend at first, and the output is a naga module** (decided by the
+  owner, decisions 2 and 3). The crate hands out a validated naga module plus tables of its
+  resources, inputs and outputs. The wgpu render backend takes the module directly; a later
+  direct backend asks for final SPIR-V or MSL, which this crate writes with naga's writers. naga
+  validates every module, is pure Rust, and in version 30 already has mesh and task stages. It
+  cannot express several things the guest does (geometry and tessellation stages, transform
+  feedback, texture LOD queries, sparse residency, raw pointers, among others: the gap table
+  below), but wgpu cannot run the missing stages either. Each gap has a stated plan, and the IR
+  does not depend on naga, so a direct SPIR-V or MSL writer can be added for a gap without
+  touching the rest. naga is pinned to the version wgpu uses.
 - **Translation is a pure function of explicit inputs.** The program bytes, a short list of
   answers about engine state (constant-buffer words, texture kinds) and a variant key are the
   whole input. Nothing reads live GPU state while translating, so translation runs on worker
@@ -32,7 +41,9 @@ from the result.
   to workers for exactly this reason (row 121).
 - **Everything is tested offline.** Per-instruction fixtures with expected disassembly ported
   from NAK's `nvdisasm` tests, an IR interpreter as the semantic oracle, naga validation of every
-  emitted module, and golden IR text. No game, no GPU and no `nvdisasm` needed in CI.
+  module handed out, and golden IR text. No game, no GPU and no `nvdisasm` needed in CI. That
+  wgpu accepts the modules is checked locally on a Mac (and in Linux CI if the render backend's
+  decision 9 adds lavapipe).
 
 Facts below cite a scoping-doc row (the row numbers are Eden-NX2's `NX2_NOTES.md` rows), a
 reference path relative to the reference folder with its commit (`docs/references.md`), or are
@@ -52,7 +63,7 @@ experiments in "What to verify before building" confirm them.
 | TIC, TSC | Texture header and sampler descriptor tables in guest memory; a texture handle indexes them |
 | GPR, UR, P, UP | Per-thread registers R0–R254 (R255 reads zero), uniform registers UR0–UR62, predicates P0–P6 (P7 is true), uniform predicates UP0–UP6 |
 | Variant key | The part of the 3D engine's state a translated shader depends on |
-| naga | The shader translator from the `wgpu` project; we use its IR and its SPIR-V and MSL writers |
+| naga | The shader translator from the `wgpu` project; we hand out its IR (a `naga::Module`), and use its SPIR-V and MSL writers only for a later direct backend |
 
 ## Where programs come from
 
@@ -115,16 +126,21 @@ Three layers, cheapest first:
    captured instruction byte, so a program moved to another address, or rewritten with the same
    bytes, is found again.
 3. **Shader entries:** `(content hash, answers, variant key, host target, translator version)` →
-   the host shader. The translator version is a constant bumped on any change to translation
-   output, as PR #4588 does with `NATIVE_TRANSLATOR_SALT` (`frontend/ampere/native.h`).
+   the host shader. The host target says which form the backend wants (a naga module for wgpu;
+   SPIR-V or MSL for a later direct backend) and what the device supports. The translator
+   version is a constant bumped on any change to translation output, as PR #4588 does with
+   `NATIVE_TRANSLATOR_SALT` (`frontend/ampere/native.h`).
 
-**Invalidation.** The cache offers `invalidate(range)`. It is called for CPU writes caught by
-write tracking (`specs/execution-model.md`, "Write tracking for the GPU caches"), for GPU-side
-writes (DMA, inline-to-memory, shader stores) by the GPU crate, and for unmaps and frees of GPU
-memory, which games reuse as heap (row 68). Invalidation only drops address-map entries; program
-and shader entries are content-addressed and stay until evicted, so the same bytes written back
-cost a hash, not a translation. Registering ranges for write tracking is the GPU crate's job; the
-cache reports which ranges it depends on.
+**Invalidation.** The cache offers `invalidate(range)`, and the GPU crate's back thread is its
+only caller (review guide, M7). The back thread calls it for CPU writes it drains from write
+tracking (the `WriteWatch` dirty log in `starquake-memory`, gpu-protocol "Learning of CPU
+writes"; an implied change to `specs/execution-model.md`, "Write tracking for the GPU caches",
+listed for the owner), for GPU-side writes (DMA, inline-to-memory, shader stores), and for
+unmaps and frees of GPU memory, which games reuse as heap (row 68). Unmaps reach the GPU crate as
+ordered updates of its address table, which carry the range (`GpuFront::update_vm`). Invalidation
+only drops address-map entries; program and shader entries are content-addressed and stay until
+evicted, so the same bytes written back cost a hash, not a translation. Registering ranges for
+write tracking is the GPU crate's job; the cache reports which ranges it depends on.
 
 **Negative cache.** A rejected program is remembered with its reason and not translated or
 logged again until its memory is written (rows 90, 112). The reason names the first unsupported
@@ -175,7 +191,8 @@ flowchart LR
     ssa --> passes["Correctness passes<br/>cbufs, textures, I/O, globals"]
     passes --> lower["Lower to naga::Module"]
     lower --> valid["naga validation"]
-    valid --> out["SPIR-V (Vulkan)<br/>MSL (Metal)"]
+    valid --> out["naga module + resource,<br/>input and output tables<br/>(wgpu takes the module)"]
+    valid -.->|"only for a direct backend<br/>that asks (later)"| emit["SPIR-V or MSL<br/>via naga's writers"]
 ```
 
 ### The SM86 decoder
@@ -342,15 +359,30 @@ workarounds, and everything in PR #4588's `lower_to_maxwell.h`.
 
 ### The backend through naga
 
-The structured, specialised IR is lowered to a `naga::Module`, validated with
-`naga::valid::Validator`, and written with naga's SPIR-V or MSL writer. The lowering module is
-the only code that touches naga's API, because naga's major version changes about every three
-months (28.0.0 in 2025-12, 29.0.0 in 2026-03, 30.0.0 in 2026-07, from crates.io) and each upgrade
-should touch one place. The version is pinned exactly.
+The structured, specialised IR is lowered to a `naga::Module` and validated with
+`naga::valid::Validator`. The module and its `ModuleInfo` are what the crate hands out (owner's
+decision of 2026-11-12): the GPU crate carries them to the render backend, whose wgpu backend
+gives the module to wgpu, which writes the final code for its own host API on its safe, checked
+path. Only when a later direct backend asks for final code (it says so in the `HostTarget` it
+gives the cache) does this crate also write the module with naga's SPIR-V or MSL writer, with
+that backend's binding map and bounds-check policy. That writer step is not built until such a
+backend is scheduled (slice 22).
+
+The lowering module (and later the writer module) is the only code that builds or writes naga
+IR, because naga's major version changes about every three months (28.0.0 in 2025-12, 29.0.0 in
+2026-03, 30.0.0 in 2026-07, from crates.io) and each upgrade should touch one place. The GPU and
+render crates only move the finished module. The version is pinned exactly, to the naga version
+wgpu itself depends on, so that the shader, gpu and render crates share one naga (owner's
+decision of 2026-11-12); upgrading naga therefore means upgrading wgpu with it. The gate could
+check that the lock file has a single naga (a proposal, not yet a gate step).
 
 Validation runs with the uniformity check off: the guest computes derivatives inside divergent
 control flow, which NVIDIA hardware allows (`naga::valid::ValidationFlags::CONTROL_FLOW_UNIFORMITY`
-exists so it can be turned off).
+exists so it can be turned off). **Open:** wgpu validates a module it is given again, with its
+own flags. If it runs the uniformity check, it would reject such shaders. Whether it does, and
+whether a diagnostic filter carried in the module can turn that check off, is to be settled by
+experiment E1 before slice 1; if neither holds, guest shaders that take derivatives in divergent
+control flow need another route (an upstream change, or a different wgpu entry point).
 
 **What naga 30.0.1 can express**, from its IR source (`naga/src/ir/mod.rs`,
 `naga/src/valid/mod.rs`, `naga-types/src/lib.rs`), to be confirmed by experiment E1:
@@ -358,12 +390,12 @@ exists so it can be turned off).
 | Feature | naga 30.0.1 | Plan |
 |---|---|---|
 | Vertex, pixel, compute stages | Yes | Use |
-| Task and mesh stages | Yes: IR, MSL `[[object]]`/`[[mesh]]`, SPIR-V `MeshShadingEXT` | Use when mesh work starts (deferred) |
+| Task and mesh stages | Yes: IR, MSL `[[object]]`/`[[mesh]]`, SPIR-V `MeshShadingEXT`. The render draft's wgpu table says naga cannot emit them for Metal; E1 settles which is right (review guide, M12). wgpu's mesh support is experimental | Use when mesh work starts (deferred) |
 | f16, i64, f64, 64-bit atomics, image atomics | Yes, behind capabilities | Use; Metal lacks f64 (lowering pass) |
 | Subgroup ballot, vote, shuffle, quad operations | Yes | Use for `VOTE`, `SHFL`, `MATCH`, `REDUX`, `FSWZADD`; needs a subgroup size of 32 |
 | Binding arrays with non-uniform indexing | Yes | Use for bindless (decision 8) |
 | Barycentrics, dual-source blending, early depth test, clip and cull distances | Yes | Use |
-| Geometry and tessellation stages | **No** (`ShaderStage` has no such variants) | Deferred; decision 13 |
+| Geometry and tessellation stages | **No** (`ShaderStage` has no such variants); wgpu has no such stages either | Deferred until a direct Vulkan backend; decision 13 |
 | Transform feedback | **No** | Deferred |
 | Layer and viewport index written by a vertex stage | **No** (`BuiltIn` has `ViewIndex` only) | Upstream to naga, or direct writer |
 | Stencil reference export | **No** | Upstream or direct writer |
@@ -385,15 +417,30 @@ gaps are closed.
 The **variant key** is the part of 3D engine state that changes the translated code. It is
 built by the GPU crate and kept as small as possible, because every distinct key is another
 compilation (a stutter on first use). From Eden's `runtime_info.h` (`RuntimeInfo`), what a
-shader on a Vulkan or Metal host has to be specialised on:
+shader on a wgpu, Vulkan or Metal host has to be specialised on:
 
 - Vertex stage: the component type of each vertex attribute (float, signed, unsigned, scaled).
 - Pixel stage: the component type of each colour target; whether dual-source blending is on.
 - Every stage that feeds another: which outputs the next stage reads (interface matching).
-- Alpha test function (Maxwell-class engines have alpha test; Vulkan and Metal do not, so it
-  becomes code). The reference value is not in the key.
-- Depth range convention and viewport origin, where the host cannot express them as state.
 - Compute: workgroup size (naga needs it as a constant in the entry point) and shared-memory size.
+
+Two groups of fields come from the render backend, through the GPU crate, because only the
+render backend knows what the host lacks (review guide, M13):
+
+- **The render backend's `EmulationFlags`**, decided by its pure `emulation(&Caps, &state)` and
+  copied field by field into the key by the GPU crate: alpha test function (Maxwell-class engines
+  have alpha test; wgpu, Vulkan and Metal do not, so it becomes code; the reference value is not
+  in the key), the depth-range rewrite and viewport origin where the host cannot express them as
+  state, fetching vertex attributes beyond the host's limit from a storage buffer, typed colour
+  outputs, and primitive-restart index handling where it is done in the shader. The render crate
+  decides this list; the shader crate cannot see its types (no dependency), so the key mirrors
+  them and a GPU-crate test checks every flag is copied.
+- **Texture component swizzles.** The guest's texture headers carry a per-texture swizzle. wgpu
+  has no per-view swizzle, so the render backend reports `Caps::view_swizzle = false`, and the
+  GPU crate then puts the swizzle of each texture binding into the key; the lowering applies it
+  to sampled and loaded results. With a direct backend that swizzles in the view, the field
+  stays empty. This is an exception to decision 16's "types and structure only", required by
+  the owner's decision 1 (wgpu first), whose reasoning names it.
 
 **Values go in driver constants, not in the key.** Anything that is a number rather than a
 structural choice (the alpha reference, the viewport flip, the render-area size behind bank 24
@@ -406,21 +453,28 @@ crate fills. Each new specialisation needs a reason in its PR.
 - **Lookups are on the GPU back thread** and never translate: a lookup returns the shader, a
   rejection, or a pending ticket.
 - **Translation runs on compile workers** (the "shader compile workers" of
-  `docs/architecture.md`). The shader crate does not own threads; it is given an executor by the
-  caller, so translation and the render backend's pipeline compilation can share one pool.
+  `docs/architecture.md`). The shader crate does not own threads. `core` creates one compile
+  pool and hands it to both this crate and the render backend, so translation and pipeline
+  compilation share one set of threads, sized in one place (review guide, M16). The crate takes
+  the pool through its own small executor trait, which `core` implements.
 - **Duplicate requests coalesce:** a second request for a shader already being translated waits
   on the same ticket.
-- **What a draw does on a miss** is a policy chosen by the GPU crate: wait for the ticket (exact,
-  deterministic, stutters) or skip the draw (smooth, wrong frames, nondeterministic). Decision 6
-  recommends waiting by default.
+- **What a draw does on a miss** follows one wait-while-compiling setting owned by the GPU crate,
+  which covers translation and pipeline builds alike (review guide, M10): wait for the ticket
+  (exact, deterministic, stutters) or skip the draw (smooth, wrong frames, nondeterministic).
+  Decision 6 recommends waiting by default.
 - **The persistent cache** stores, per shader entry, the program bytes, the answers, the variant
   key, and the translated output, under a header with a magic, a format version and the
-  translator version. At start-up, entries for the running title are translated (or loaded) on
+  translator version. Under the owner's decision 2 the translated output is a naga module;
+  whether an entry stores it (naga's own serialisation, whose format moves with each naga
+  version) or only the inputs, retranslated at start-up, is part of decision 7. At start-up,
+  entries for the running title are translated (or loaded) on
   workers before the first draw needs them. The shader crate serialises and deserialises
   entries; it does no file I/O itself (the core crate owns the folder). The file is derived from
   a game and lives in the user's data folder, never in the repository (`specs/observability.md`,
-  "Storage and what may be committed"). Host pipeline binaries (Vulkan pipeline caches, Metal
-  binary archives) are the render backend's and sit next to it.
+  "Storage and what may be committed"). Host pipeline binaries (wgpu's pipeline cache where it
+  exists, Vulkan pipeline caches, Metal binary archives) are the render backend's and sit next
+  to it.
 - **Translation time is a budget, not an afterthought:** every stage is linear or close to it in
   the program size, and a test translates a large synthetic program (tens of thousands of
   instructions) within a fixed time on CI (row 121's shader took 3.4 s with a quadratic search,
@@ -453,8 +507,9 @@ the guest. The rules of `CLAUDE.md` apply in full:
 - Branch targets, jump-table entries and `CALL` targets are validated against the captured
   program, not just against a range.
 - Register numbers, bank numbers, attribute offsets and memory offsets are checked against their
-  limits; indexed accesses in the emitted shader are bounds-checked so a guest index cannot read
-  outside a host binding.
+  limits; indexed accesses in the module handed out are bounds-checked so a guest index cannot
+  read outside a host binding. wgpu adds its own checks when it writes the final code (owner's
+  decision of 2026-11-12); a direct backend states its bounds-check policy in its `HostTarget`.
 - Every limit (instruction cap, question rounds, inlining depth, structuring work) has a test at
   the edge on both sides.
 
@@ -472,9 +527,10 @@ Everything here runs in CI with no game, no GPU and no `nvdisasm`.
 | Translator semantics | An IR interpreter executes the translated IR for one instruction (or a short sequence) on given register, predicate and constant-buffer values; results are compared with values derived from the instruction's documented behaviour. PR #4588's tests do the same against Eden's IR (`tests/video_core/native_shader.cpp`, 271 test cases, its `EvaluateVertex`) and are ported as cases | Every gate |
 | Flow and structuring | Synthetic programs from the test assembler (nested barriers, early exits, calls, jump tables, loops with breaks), checked against golden IR text and by running them in the interpreter | Every gate |
 | Passes | Hand-written IR in, golden IR out (insta snapshots, each change explained in its PR as `specs/testing.md` requires) | Every gate |
-| Backend validity | Every module the lowering produces in any test passes `naga` validation; the emitted SPIR-V is read back with naga's SPIR-V frontend and validated again; MSL output of a small set of end-to-end fixtures is a golden text | Every gate |
-| End to end | Synthetic vertex/pixel pairs and compute programs, assembled in tests, go from bytes to SPIR-V and MSL | Every gate |
-| Host compilers | MSL compiled with Apple's `metal` compiler on a Mac; SPIR-V checked with `spirv-val` where installed | Locally, like the hypervisor tier |
+| Module validity | Every module the lowering produces in any test passes `naga` validation, with the flags this crate uses and, once E1 says what they are, the flags wgpu uses | Every gate |
+| End to end | Synthetic vertex/pixel pairs and compute programs, assembled in tests, go from bytes to a validated naga module and its tables (golden tables) | Every gate |
+| wgpu acceptance | The end-to-end modules are created as shader modules and pipelines on a wgpu device | Locally on a Mac (wgpu on Metal), like the hypervisor tier; in Linux CI if the render backend's decision 9 adds lavapipe |
+| Final code (later, slice 22) | For a direct backend: emitted SPIR-V read back with naga's SPIR-V frontend and checked with `spirv-val` where installed; MSL compiled with Apple's `metal` compiler on a Mac; MSL goldens | When a direct backend is scheduled |
 | Title coverage | `cargo xtask shader-replay <folder>` re-translates local shader captures (program bytes plus answers, recorded from a title run) and prints a histogram of rejections by instruction, like Eden-NX2's offline lowering test (row 54) | Locally only; captures never committed |
 | Speed | A large synthetic program translates within a fixed bound | Every gate |
 
@@ -485,21 +541,22 @@ The shader capture format (local only) has a golden-bytes test of its own and a 
 
 ## Interfaces to neighbouring designs
 
-The three sibling specs are being drafted at the same time; everything here is what this spec
-assumes or offers, for the lead to reconcile. Types are sketches; names may change, the split
-should not.
+The four graphics drafts were amended together on 2026-11-12 so that every shared type and call
+below has the same name in each. Types are sketches; field names may change, the split should
+not.
 
 ### The crate's place
 
 `gpu` depends on `shader` and on `render`; `shader` depends on neither (`CLAUDE.md`,
-"Architecture rules": `gpu` → `shader`, `render`). The shader crate's output is plain data
-(words, text, tables of integers), and the GPU crate passes it to the render backend. The shader
-crate depends on `naga` and on nothing of ours except possibly `trace` for its events.
+"Architecture rules": `gpu` → `shader`, `render`). The shader crate's output is a naga module
+plus plain-data tables, and the GPU crate carries it to the render backend (owner's decision of
+2026-11-12). The shader crate depends on `naga`, at the version wgpu uses, and on nothing of ours
+except possibly `trace` for its events. Game memory addresses stop at the GPU crate.
 
 ### What the GPU front/back protocol and engine state (#12) gets
 
 ```rust
-/// Created once by the core crate with the host's target and an executor.
+/// Created once by the core crate with the host target and the shared compile pool.
 pub struct ShaderCache { /* ... */ }
 
 pub enum GuestStage { VertexCullBeforeFetch, Vertex, TessellationInit, Tessellation, Geometry, Pixel, Compute }
@@ -508,9 +565,10 @@ pub enum GuestStage { VertexCullBeforeFetch, Vertex, TessellationInit, Tessellat
 pub struct ProgramRequest { pub stage: GuestStage, pub address: u64 }
 
 /// Read access to guest memory at GPU addresses (equal to CPU addresses on Switch 2).
+/// Implemented by the GPU crate over its address table.
 pub trait ProgramMemory { fn read(&self, address: u64, out: &mut [u8]) -> Result<(), Unmapped>; }
 
-/// Answers questions from current engine state, on the back thread.
+/// Answers questions from current engine state, on the back thread. Implemented by the GPU crate.
 pub trait EngineState {
     fn cbuf_word(&self, stage: GuestStage, bank: u8, offset: u32) -> Option<u32>;
     fn texture_kind(&self, stage: GuestStage, handle: u32) -> Option<TextureKind>;
@@ -520,7 +578,7 @@ impl ShaderCache {
     /// Never blocks and never translates. Reads program bytes on a miss of the address map.
     pub fn lookup(&self, req: &[ProgramRequest], variant: &VariantKey,
                   mem: &dyn ProgramMemory, state: &dyn EngineState) -> Lookup;
-    /// Callable from any thread (fault handlers included); cheap.
+    /// Called by the GPU back thread only; cheap.
     pub fn invalidate(&self, range: core::ops::Range<u64>);
     /// Ranges the cache depends on, for the caller to write-track.
     pub fn tracked_ranges(&self) -> Vec<core::ops::Range<u64>>;
@@ -529,21 +587,26 @@ impl ShaderCache {
 pub enum Lookup { Ready(Arc<ShaderSet>), Pending(Ticket), Rejected(Arc<Rejection>) }
 ```
 
-Assumed of #12:
+Assumed of #12 (gpu-protocol now assumes the same; review guide, M9):
 
 - The back thread calls `lookup` when a stage's program address or the variant key changes, and
-  decides what a draw does while a ticket is pending (decision 6).
-- It builds the `VariantKey` from 3D engine state and fills the driver constants each draw.
-- It calls `invalidate` for GPU-side writes and unmaps, and registers `tracked_ranges` with CPU
-  write tracking.
+  decides what a draw does while a ticket is pending, through its one wait-while-compiling
+  setting (decision 6).
+- It builds the `VariantKey` from 3D engine state, copies in the render backend's
+  `EmulationFlags`, and, when the render backend's `Caps::view_swizzle` is false, each texture
+  binding's swizzle. It fills the driver constants each draw.
+- It implements `ProgramMemory` (over its address table, `GpuVm`) and `EngineState`.
+- It calls `invalidate` from the back thread: for CPU writes drained from `WriteWatch`, for
+  GPU-side writes, and for unmaps and frees, which reach it as ordered address-table updates
+  carrying the range. It registers `tracked_ranges` with `WriteWatch`.
 - It binds constant buffers (including bank 24, row 65), textures, samplers and storage buffers
   as the shader's resource table says, reading handles and pointers from the places the table
   names.
 - It completes rejected compute dispatches and fires their releases (row 61).
-- Its GPU capture (observability spec, "Later") records shader requests with their answers, so a
-  replay can retranslate offline.
+- Its GPU capture (`SQGC`, gpu-protocol "Capture and replay") records shader lookups with the
+  answers given, so `cargo xtask shader-replay` can retranslate offline (review guide, M15).
 
-### What the render backend (#14) gets
+### What the render backend (#14) gets, through the GPU crate
 
 ```rust
 pub struct ShaderSet { pub stages: Vec<HostShader> }   // one per host stage, linked
@@ -552,7 +615,7 @@ pub struct HostShader {
     pub stage: HostStage,                 // Vertex, Fragment, Compute (Task, Mesh later)
     pub code: HostCode,
     pub entry: String,
-    pub resources: Vec<ResourceSlot>,     // kind, host set and binding, guest source
+    pub resources: Vec<ResourceSlot>,     // kind, group and binding (assigned in the module), guest source
     pub inputs: Vec<InterfaceSlot>,       // location, type, interpolation
     pub outputs: Vec<InterfaceSlot>,
     pub driver_constants: DriverConstantsLayout,
@@ -560,31 +623,49 @@ pub struct HostShader {
     pub requirements: Requirements,       // f16, i64, f64, subgroup size 32, mesh, ...
 }
 
-pub enum HostCode { SpirV(Vec<u32>), Msl(String) }
+pub enum HostCode {
+    /// What the wgpu backend takes (owner's decision of 2026-11-12).
+    Naga { module: naga::Module, info: naga::valid::ModuleInfo },
+    /// Only for a later direct backend that asks for final code.
+    SpirV(Vec<u32>),
+    Msl(String),
+}
 
-/// Given by the render backend when the cache is created.
-pub struct HostTarget { pub language: Language, pub caps: HostCaps }  // SPIR-V version or MSL version, features
+/// From the render backend's `Caps`, given by `core` when the cache is created.
+pub struct HostTarget { pub form: CodeForm, pub caps: HostCaps }  // features the device supports
+pub enum CodeForm {
+    NagaModule,                                   // the wgpu backend
+    SpirV { version: SpirVVersion, bindings: BindingMap, bounds: BoundsChecks },  // later
+    Msl { version: MslVersion, bindings: BindingMap, bounds: BoundsChecks },      // later
+}
 ```
+
+The GPU crate converts a `HostShader` into the render crate's `ShaderDesc`: `HostCode::Naga`
+becomes `ShaderSource::Naga`, and `resources`, `inputs` and `outputs` become its
+`ShaderInterface`.
 
 Assumed of #14:
 
-- It states one `HostTarget` per device (SPIR-V for Vulkan, and for Metal through MoltenVK during
-  bring-up; MSL for native Metal), with the features it supports. The cache never emits code that
-  needs a feature the target lacks: such a shader is rejected with that reason.
-- It builds pipeline layouts and descriptor layouts from `resources`, and pipelines from a
-  `ShaderSet` plus fixed-function state; host pipeline compilation and its own caches are its
-  job, on the shared executor.
+- It states one `HostTarget` per device. The wgpu backend asks for `CodeForm::NagaModule`, with
+  the features the wgpu adapter offers. A later direct backend asks for SPIR-V or MSL and states
+  its binding map and bounds-check policy. The cache never hands out a module that needs a
+  feature the target lacks: such a shader is rejected with that reason.
+- It builds bind group layouts and pipeline layouts from the resource table, and pipelines from
+  a `ShaderSet` plus fixed-function state; host pipeline compilation and its own caches are its
+  job, on the shared compile pool.
 - It honours `requirements` (for example, a subgroup size of 32) or refuses the pipeline.
-- The binding convention (which host set and binding each guest resource kind gets) is defined
-  once, in the shader crate, as data in `ResourceSlot`; the render backend does not guess it.
+- The binding convention (which group and binding each guest resource kind gets) is defined
+  once, in the shader crate: it is written into the module and listed in `ResourceSlot`; the
+  render backend does not guess it.
 
 ### What the graphics server (#11) gets
 
 Nothing directly: `gsv` reaches the shader cache only through the GPU crate. Assumed: the
 graphics server tells the GPU crate when GPU memory is unmapped or destroyed (gpu sub-session
-102, 213 and 215; scoping doc, "GPU sub-sessions"), and the GPU crate turns that into
-`invalidate`. The persistent cache needs the running title's id, which comes from the loader
-through the core crate, not from `gsv`.
+102, 213 and 215; scoping doc, "GPU sub-sessions") through ordered address-table updates
+(`GpuFront::update_vm`, which carry the range), and the GPU crate's back thread turns each into
+`invalidate` when it applies it. The persistent cache needs the running title's id, which comes
+from the loader through the core crate, not from `gsv`.
 
 ## Port slices
 
@@ -593,7 +674,7 @@ One pull request each. "Offline" means testable with no game and no GPU. Slices 
 
 | # | Builds | Depends on | Ports from | Offline test | Wave |
 |---|---|---|---|---|---|
-| 1 | **Walking skeleton.** `Instruction`, bit reader, a decoder for six forms (`MOV`, `FFMA`, `ALD`, `AST`, `EXIT`, `S2R`), linear flow only, a minimal IR, lowering to naga, SPIR-V and MSL output for a synthetic vertex/pixel pair. Proves the pieces fit before anything is widened | naga experiment E1 | NAK `sm70_encode.rs`, PR `ops_attr.cpp`, `ops_float.cpp` | Expected text for the six forms; naga validation; MSL golden | A (alone, one agent) |
+| 1 | **Walking skeleton.** `Instruction`, bit reader, a decoder for six forms (`MOV`, `FFMA`, `ALD`, `AST`, `EXIT`, `S2R`), linear flow only, a minimal IR, lowering to a validated naga module with its tables for a synthetic vertex/pixel pair. Proves the pieces fit before anything is widened | naga experiment E1 | NAK `sm70_encode.rs`, PR `ops_attr.cpp`, `ops_float.cpp` | Expected text for the six forms; naga validation; golden tables; the pair accepted by wgpu (locally on a Mac) | A (alone, one agent) |
 | 2 | SPH v4 header parser | 1 | `clc797sph.h`, NAK `sph.rs`, Eden `program_header.h` | Golden bytes covering every field with distinct values | B |
 | 3 | Program capture: extent rules, cap, content hash | 1 | PR `program_capture.h` | Synthetic programs at and past each rule; proptest no-panic; the cap at its edge | B |
 | 4 | Decoder framework: form table with known-bit masks, operand types (GPR, UR, P, UP, cbuf, immediates), the full `Op` enum shell, printer, test assembler framework | 1 | NAK `ir.rs` (op shapes), `sm70_encode.rs` (helpers), PR `isa.h` | Round trip and strictness on the framework's own forms | B |
@@ -616,12 +697,13 @@ One pull request each. "Offline" means testable with no game and no GPU. Slices 
 | 13 | Constant-buffer and texture pass | 8, 9, 12e, 12f | Eden `ir_opt/texture_pass.cpp`, PR's version of it | Golden resource tables; untraceable handle rejected with the exact reason | E |
 | 14 | Global memory to storage buffers | 8, 12e | Eden `global_memory_to_storage_buffer_pass.cpp` | Golden IR; linear-time test | E |
 | 15 | Inputs and outputs, collect info | 2, 8, 12g | Eden `attribute.h`, `collect_shader_info_pass.cpp`, `exit_program.cpp` | Golden interface tables per stage | E |
-| 16 | Lowering to naga: arithmetic, control flow, compute entry points | 1, 11, 8 | New | naga validation on every test module; SPIR-V read back | E |
-| 17 | Lowering to naga: graphics entry points, interface, resources, textures, driver constants | 13, 15, 16 | New | Same, plus MSL golden for end-to-end fixtures | F |
+| 16 | Lowering to naga: arithmetic, control flow, compute entry points | 1, 11, 8 | New | naga validation on every test module | E |
+| 17 | Lowering to naga: graphics entry points, interface, resources (group and binding assignment), textures and swizzles from the variant key, driver constants | 13, 15, 16 | New | Same, plus golden resource and interface tables for end-to-end fixtures; wgpu acceptance locally | F |
 | 18 | Host lowering passes: f64 and f16 to f32, subgroup-size requirement | 8, 16 | Eden `lower_fp64_to_fp32.cpp`, `lower_fp16_to_fp32.cpp` | Interpreter equivalence within stated precision | F |
 | 19 | Shader cache: three layers, invalidation, negative cache, tickets on an executor | 3, 9 (a fake translator before 17) | New; Eden-NX2 rows 90, 112 | Deterministic tests with a scripted executor; invalidation edges | D |
 | 20 | Shader capture format and `cargo xtask shader-replay` | 3, 9 | New | Golden bytes; replay of a synthetic capture | E |
 | 21 | Persistent cache entries (serialise, version, load) | 19, 20 | New | Golden bytes; a stale translator version is refused | after M3 |
+| 22 | Final-code emission for a direct backend: naga's SPIR-V or MSL writer with the `HostTarget`'s binding map and bounds-check policy | 17; a direct backend scheduled (render-backend, "Deferred") | New | SPIR-V read back and `spirv-val` where installed; MSL goldens and Apple's compiler on a Mac | when a direct backend is scheduled |
 
 The critical path to a first present is 1 → 4 → 6a/6b/6g/6h → 10 → 11 → 12 (the same groups) →
 13, 15 → 16 → 17. Waves C and D are where agents fan out: up to nine decoder slices and eight
@@ -630,13 +712,18 @@ translator slices, limited by the three or four build agents a machine can run
 
 ## What to verify before building
 
-1. **E1, naga coverage (before slice 1).** Build small naga modules by hand for: `Kill` inside
-   nested loops; f16 and i64 arithmetic; 64-bit atomics; subgroup ballot and shuffle in a pixel
-   shader; binding arrays with non-uniform indexing written as MSL; a vertex shader writing the
-   layer (expected to fail); derivatives in divergent control flow with the uniformity check
-   off; a mesh entry point written as MSL. Run each through validation and both writers, compile
-   the MSL with Apple's compiler on a Mac. Changes decisions 2 and 3 if naga is weaker than its
-   source suggests.
+1. **E1, naga and wgpu coverage (before slice 1).** Build small naga modules by hand for: `Kill`
+   inside nested loops; f16 and i64 arithmetic; 64-bit atomics; subgroup ballot and shuffle in a
+   pixel shader; binding arrays with non-uniform indexing; a vertex shader writing the layer
+   (expected to fail); derivatives in divergent control flow with the uniformity check off; a
+   mesh entry point written as MSL (settles the disputed fact in review guide M12). Run each
+   through naga validation, then create it on a wgpu device on a Mac (`ShaderSource::Naga`).
+   The second step answers what the owner's decisions now rest on: which flags wgpu validates a
+   given module with, whether it rejects derivatives in divergent control flow (and whether a
+   diagnostic filter in the module avoids that), and which features wgpu on Metal accepts.
+   Writing MSL with naga and compiling it with Apple's compiler stays useful for the mesh
+   question. If naga or wgpu is weaker than the sources suggest, the owner's decisions 2 and 3
+   still stand, but the gap table and the first milestone's scope change.
 2. **E2, encodings.** For each instruction group, check that NAK's SM 7.0 encodings are the ones
    SM86 uses (NAK's `nvdisasm` tests run on SM86, which covers what they test), and list the
    forms that come only from PR #4588's table. A developer with `nvdisasm` (Linux or Windows; the
@@ -652,18 +739,23 @@ translator slices, limited by the three or four build agents a machine can run
    non-default rounding modes, f64, sparse texture results, tensor instructions. Rows 86 and 88
    give one title's counts for the old lowering. Settles decisions 8, 9, 10, 11 and 13 with
    numbers.
-5. **E5, MoltenVK bring-up.** Run naga's SPIR-V through MoltenVK on a Mac for the walking
-   skeleton's shaders. If it works, the first present on a Mac needs no MSL path (render
-   backend's decision, #14).
+5. **E5, MoltenVK bring-up. No longer needed:** wgpu drives Metal directly and takes the naga
+   module (owner's decisions 1 and 2), so the first present on a Mac goes through neither
+   MoltenVK nor an MSL path of ours. It returns only if a direct Vulkan backend is ever run on a
+   Mac (render-backend, "Deferred"). Original text: run naga's SPIR-V through MoltenVK on a Mac
+   for the walking skeleton's shaders. If it works, the first present on a Mac needs no MSL path
+   (render backend's decision, #14).
 6. **E6, question rounds.** Count, over local captures, how many question rounds programs need.
    Sets the round cap.
 
 ## Decisions for the owner
 
 Each decision stands alone. The recommendation is the drafter's; nothing is decided until the
-owner says so.
+owner says so. Decided items keep their original text below the ruling, for the record.
 
-1. **Which intermediate representation.**
+1. **Which intermediate representation.** Still open, but narrowed: the owner's decision of
+   2026-11-12 says the project's own intermediate form stays independent of naga, which rules
+   out (b). The choice left is (a) or (c).
    - (a) Port Eden's IR as it is: its C++ data structures translated into Rust.
    - (b) Lower decoded instructions straight to naga's IR, with no IR of our own.
    - (c) A new Rust IR with Eden's operation set and pass semantics, stored in arenas.
@@ -678,7 +770,13 @@ owner says so.
    is the part that does not suit Rust. Agents can still port each pass by behaviour, and the IR
    stays independent of the backend.
 
-2. **Which backend.**
+2. **Decided by the owner, 2026-11-12:** naga is the only shader backend at first; the crate's
+   output is a validated naga module plus its resource, input and output tables, which the wgpu
+   backend takes directly; final SPIR-V or MSL is emitted here only for a later direct backend
+   that asks for it. This is option (a), with the hand-off point moved from final code to the
+   module.
+
+   **Which backend.**
    - (a) naga for both SPIR-V and MSL.
    - (b) Our own SPIR-V writer (with the pure-Rust `rspirv` crate, porting Eden's SPIR-V backend)
      and our own MSL text writer.
@@ -692,7 +790,12 @@ owner says so.
    **Recommended: (a) now,** with the IR independent of naga so that (b) can be added for one
    target or one feature later without touching the rest.
 
-3. **How to close naga's gaps when they matter.**
+3. **Decided by the owner, 2026-11-12:** naga only at first, with the IR kept independent of
+   naga so that a direct code writer can be added later. Which route closes each gap (upstream,
+   emulation in the IR, or that writer) is taken gap by gap when the gap matters; the
+   recommendation below stands as guidance.
+
+   **How to close naga's gaps when they matter.**
    - (a) Contribute the missing pieces upstream to naga.
    - (b) Keep a fork of naga in the workspace.
    - (c) Write a direct SPIR-V (and later MSL) writer from our IR, used for shaders that need a
@@ -723,9 +826,13 @@ owner says so.
    (a) forces translation onto the GPU thread and makes the result depend on timing (row 121).
    (b) is simple but copies up to a megabyte per stage per miss and makes cache keys either huge
    or unsafe. (c) is a little more machinery, keeps translation pure and keys small, and gives the
-   disk cache and offline replay exactly what they need. **Recommended: (c).**
+   disk cache and offline replay exactly what they need. **Recommended: (c).** The gpu-protocol
+   draft now assumes (c) as well (the non-blocking `lookup`; review guide, M9), so choosing (a)
+   would change both drafts.
 
-6. **What a draw does while its shader is still compiling.**
+6. **What a draw does while its shader is still compiling.** Still open. The same question is
+   gpu-protocol decision 9 and render-backend decision 5; the review guide makes it one setting
+   owned by the GPU crate, covering translation and pipelines (M10).
    - (a) Wait: the frame is exact and replays identically, but the game stutters on first use of
      each shader.
    - (b) Skip the draw (Eden's "asynchronous shaders"): smooth, but frames are missing objects
@@ -740,7 +847,11 @@ owner says so.
    first present. Its format (versioned, golden-tested) only needs the cache's inputs and outputs
    to be settled. **Recommended: define the key and the capture format now (slices 9 and 20), build
    the disk cache after milestone 3.** It is not needed for correctness, and the capture format it
-   reuses is needed earlier for offline replay.
+   reuses is needed earlier for offline replay. New since the owner's decision 2: the translated
+   output is a naga module, so an entry either stores it with naga's own serialisation (fast to
+   load, but its format changes with each naga version, so every naga upgrade empties the cache)
+   or stores only the inputs and retranslates on workers at start-up (2–4 ms per shader, row
+   121's numbers). This draft leans to inputs only; it is decided with the cache.
 
 8. **Bindless textures.**
    - (a) Trace each texture handle back to the constant-buffer word it was loaded from and bind
@@ -764,7 +875,9 @@ owner says so.
    direct writer or an upstream change, and it constrains how the render backend maps guest
    memory. (c) works in naga but is limited by maximum buffer sizes. **Recommended: (a) first,
    then decide between (b) and (c) from the census (E4)** together with the render backend's
-   memory design (#14).
+   memory design (#14). Under the owner's decisions 1 and 2, (b) also needs a direct backend,
+   since wgpu's safe API cannot alias guest memory (render-backend decision 7), so (a) first is
+   the only route until one is scheduled.
 
 10. **Floating-point rounding modes and flush-to-zero.** NVIDIA instructions can select rounding
     (to nearest, toward zero, up, down) and denormal flushing per instruction; host shading
@@ -786,7 +899,12 @@ owner says so.
     code (never in the repository). **Recommended: yes, after milestone 3,** as a generic
     mechanism with no game-specific content in the repository.
 
-13. **Geometry and tessellation stages.** naga has neither; Metal has no geometry shaders and a
+13. **Settled in effect by the owner's decisions 1 and 2, 2026-11-12; not separately confirmed:**
+    deferred. wgpu cannot run these stages and naga cannot express them, so nothing is lost by
+    deferring (the reasoning of decision 2); they arrive with a direct Vulkan backend (decision
+    1's trigger), which would then need a direct SPIR-V writer (decision 3, option c).
+
+    **Geometry and tessellation stages.** naga has neither; Metal has no geometry shaders and a
     different tessellation model. Options: defer until the census shows titles use them; or plan
     now for a direct SPIR-V writer (Vulkan) and a compute or mesh emulation (Metal).
     **Recommended: defer,** keeping `GuestStage` and the IR able to represent them. PR #4588
@@ -809,13 +927,17 @@ owner says so.
     (faster shader, more compilations, more stutter) or read it from the per-draw driver
     constants (one compilation, a uniform read). **Recommended: driver constants for every
     numeric value; the variant key only for types and structure,** with each new key field
-    justified in its PR.
+    justified in its PR. **Exception required by the owner's decision 1 (2026-11-12):** under the
+    wgpu backend, texture component swizzles go into the variant key, because wgpu has no view
+    swizzle ("Pipeline-state specialisation"). The fields copied from the render backend's
+    `EmulationFlags` are structural and fit the rule.
 
 ## Deferred, not ruled out
 
 | Deferred | How it is added later |
 |---|---|
-| Geometry and tessellation stages | `GuestStage` already has them; the SPH parser reads their fields. Vulkan: a direct SPIR-V writer for these stages or an upstream naga change. Metal: emulation through compute or mesh stages, as an IR transform |
+| Geometry and tessellation stages | `GuestStage` already has them; the SPH parser reads their fields. They arrive with a direct Vulkan backend (render-backend decision 1's trigger): a direct SPIR-V writer for these stages or an upstream naga change. Metal: emulation through compute or mesh stages, as an IR transform |
+| Final SPIR-V or MSL for a direct backend | Slice 22: naga's writers over the same validated module, with the backend's binding map and bounds-check policy from `HostTarget` |
 | Mesh and task programs | Decoded now; translators for `ISBEWR`/`ISBERD` and naga's mesh and task entry points |
 | Transform feedback | Variant key gains the stream layout; output through a direct writer or emulated as storage-buffer writes in the vertex stage |
 | Tensor-core instructions | Decoded now; translated to subgroup or cooperative-matrix operations (naga has `CooperativeMultiplyAdd`), or replaced through an override |
