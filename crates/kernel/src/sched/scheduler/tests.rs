@@ -231,6 +231,20 @@ fn suspend_types_are_independent() {
 }
 
 #[test]
+fn a_suspended_thread_is_not_a_runnable_one() {
+    // `has_runnable_thread` counts the queued threads: a runnable thread that is suspended is
+    // not queued, so a scheduler whose only runnable thread is suspended has none to run.
+    let mut s = Scheduler::new(1).unwrap();
+    let a = spawn(&mut s, 10, 0, &[0]);
+    assert!(s.has_runnable_thread());
+    s.request_suspend(a, SuspendType::Process).unwrap();
+    assert_eq!(s.thread(a).unwrap().state(), ThreadState::Runnable);
+    assert!(!s.has_runnable_thread());
+    s.resume(a, SuspendType::Process).unwrap();
+    assert!(s.has_runnable_thread());
+}
+
+#[test]
 fn suspend_bits_are_distinct() {
     let all = SuspendType::ALL.iter().fold(0_u8, |bits, kind| {
         assert_eq!(bits & kind.bit(), 0);
@@ -918,6 +932,100 @@ fn rotation_leaves_a_suggestion_whose_core_top_is_too_urgent() {
     settle_at(&mut s, 1);
     assert_eq!(s.thread(c).unwrap().active_core(), Some(core(1)));
     assert_eq!(highest(&s, 0), Some(a));
+}
+
+#[test]
+fn rotation_takes_a_suggestion_whose_core_top_is_exactly_at_the_migration_limit() {
+    // `top_on_suggested_core->GetPriority() >= HighestCoreMigrationAllowedPriority`: a top
+    // thread exactly at the limit lets the suggestion go (the side below the limit is
+    // `rotation_leaves_a_suggestion_whose_core_top_is_too_urgent`).
+    let level = preempt_level(0);
+    let mut s = Scheduler::new(2).unwrap();
+    let _a = spawn(&mut s, level, 0, &[0]);
+    let _top = spawn(
+        &mut s,
+        HIGHEST_CORE_MIGRATION_ALLOWED_PRIORITY.get(),
+        1,
+        &[1],
+    );
+    let c = spawn(&mut s, level, 1, &[0, 1]);
+    settle(&mut s);
+    assert_eq!(s.thread(c).unwrap().active_core(), Some(core(1)));
+    let count = s.scheduled_count;
+    s.rotate_scheduled_queue(None, core(0), prio(level))
+        .unwrap();
+    // The lone `_a` rotates onto itself (no count); the migration counts once.
+    assert_eq!(s.scheduled_count, count.wrapping_add(1));
+    settle_at(&mut s, 1);
+    assert_eq!(s.thread(c).unwrap().active_core(), Some(core(0)));
+    assert_eq!(highest(&s, 0), Some(c));
+}
+
+#[test]
+fn rotation_takes_a_suggestion_that_waited_exactly_as_long_as_the_thread_it_brought_forward() {
+    // Lines 606-612: only a strictly longer wait (`<`) keeps the suggestion out; at equal
+    // ticks it migrates.
+    let level = preempt_level(0);
+    let mut s = Scheduler::new(2).unwrap();
+    let a = spawn(&mut s, level, 0, &[0]);
+    let b = spawn(&mut s, level, 0, &[0]);
+    let top = spawn(&mut s, level - 1, 1, &[1]);
+    let c = spawn(&mut s, level, 1, &[0, 1]);
+    settle(&mut s);
+    assert_eq!(highest(&s, 0), Some(a));
+    assert_eq!(highest(&s, 1), Some(top));
+    // Neither `b` nor `c` has been a core's choice: their ticks are equal.
+    assert_eq!(
+        s.thread(b).unwrap().last_scheduled_tick(),
+        s.thread(c).unwrap().last_scheduled_tick()
+    );
+    s.rotate_scheduled_queue(None, core(0), prio(level))
+        .unwrap();
+    settle_at(&mut s, 1);
+    assert_eq!(s.thread(c).unwrap().active_core(), Some(core(0)));
+    assert_eq!(highest(&s, 0), Some(c));
+}
+
+#[test]
+fn a_rotations_migration_is_counted_so_a_fruitless_yield_does_work_again() {
+    // `IncrementScheduledCount(suggested)` after the same-level migration: a thread whose last
+    // yield was fruitless (it recorded the count) may yield again once the rotation has moved
+    // a thread, because the count it recorded is stale.
+    let level = preempt_level(0);
+    let mut s = Scheduler::new(2).unwrap();
+    let a = spawn(&mut s, level, 0, &[0]);
+    let _top = spawn(&mut s, level - 1, 1, &[1]);
+    let c = spawn(&mut s, level, 1, &[0, 1]);
+    settle(&mut s);
+    assert_eq!(s.current(core(0)).unwrap(), Some(a));
+    // Alone at its level on core 0, `a`'s yield is fruitless and remembered.
+    s.yield_without_core_migration(core(0)).unwrap();
+    assert!(s.yield_is_redundant(a).unwrap());
+    s.rotate_scheduled_queue(None, core(0), prio(level))
+        .unwrap();
+    assert_eq!(s.thread(c).unwrap().active_core(), Some(core(0)));
+    assert!(!s.yield_is_redundant(a).unwrap());
+}
+
+#[test]
+fn rotation_looks_past_a_more_urgent_suggestion_that_tops_its_own_core() {
+    // Lines 631-670: the walk of core 0's suggestions skips `first`, the top of core 1, and
+    // takes the next one, `second`, which does not top core 2.
+    let level = preempt_level(0);
+    let mut s = Scheduler::new(3).unwrap();
+    let a = spawn(&mut s, level, 0, &[0]);
+    let first = spawn(&mut s, level - 3, 1, &[0, 1]);
+    let _top = spawn(&mut s, level - 5, 2, &[2]);
+    let second = spawn(&mut s, level - 2, 2, &[0, 2]);
+    settle(&mut s);
+    assert_eq!(highest(&s, 0), Some(a));
+    assert_eq!(highest(&s, 1), Some(first));
+    s.rotate_scheduled_queue(None, core(0), prio(level))
+        .unwrap();
+    settle_at(&mut s, 1);
+    assert_eq!(s.thread(first).unwrap().active_core(), Some(core(1)));
+    assert_eq!(s.thread(second).unwrap().active_core(), Some(core(0)));
+    assert_eq!(highest(&s, 0), Some(second));
 }
 
 #[test]
