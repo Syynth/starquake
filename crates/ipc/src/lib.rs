@@ -20,7 +20,11 @@
 //! Ported from `eden/src/core/hle/ipc.h`, `eden/src/core/hle/service/hle_ipc.cpp` and
 //! `eden/src/core/hle/service/ipc_helpers.h` (GPL-3.0-or-later), with the TIPC reply layout taken
 //! from `eden-nx2/src/core/hle/service/nx2_gsv.h` (`TipcReplyWords`).
+//! The request layouts are also checked against libnx, the client side
+//! (`libnx/nx/include/switch/sf/`, ISC); [`request`] lists where the builder follows it and where
+//! it differs.
 
+mod builder;
 pub mod cmif;
 pub mod error;
 pub mod hipc;

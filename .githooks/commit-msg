@@ -5,7 +5,8 @@
 #   commit-msg FILE            git's commit-msg hook: FILE is the commit message. Install the
 #                              hooks with `just setup`.
 #   commit-msg --title FILE    the same rule for a pull-request title (CI: .github/workflows/
-#                              pr-title.yml). Subjects git writes itself are not accepted there.
+#                              pr-title.yml). Subjects git writes itself are not accepted there,
+#                              except GitHub's generated `Revert "..."` titles (see below).
 #
 # Only the first line that is neither blank nor a `#` comment is judged:
 #
@@ -48,6 +49,30 @@ pattern="^($types)(\\([[:alnum:]._/,-]+\\))?!?: [^[:space:]]"
 
 if printf '%s\n' "$subject" | grep -Eq "$pattern"; then
     exit 0
+fi
+
+# The one exception to "a PR title is written by a person" is the title GitHub writes for a revert
+# PR: `Revert "<title of the reverted PR>"`, nested once more for each revert of a revert. It is
+# accepted exactly in that form, i.e. when stripping the `Revert "` ... `"` wrappers leaves a
+# conventional subject; anything else (an unclosed quote, a wrapped subject that is not
+# conventional) is judged like any hand-written title. Text after the closing quote is rejected
+# only when the title does not end in a quote: quotes inside a title are allowed, so
+# `Revert "feat: a" and "b"` is accepted (the wrapper strip cannot tell it from a title that
+# quotes something).
+if [ "$title" -eq 1 ]; then
+    inner="$subject"
+    while :; do
+        case "$inner" in
+        'Revert "'*'"')
+            inner="${inner#'Revert "'}"
+            inner="${inner%'"'}"
+            ;;
+        *) break ;;
+        esac
+    done
+    if [ "$inner" != "$subject" ] && printf '%s\n' "$inner" | grep -Eq "$pattern"; then
+        exit 0
+    fi
 fi
 
 # Subjects git and GitHub generate themselves (merges, reverts, autosquash markers) are fine as

@@ -18,6 +18,7 @@ fetch_commit() { # dir url commit
 fetch_commit eden https://git.eden-emu.dev/eden-emu/eden.git cf654052c416f9e7c80cef0a7d321476b1c52f99
 fetch_commit eden-nx2 https://git.eden-emu.dev/Takoroka/eden-nx2.git 50fa86bbbc403ad565eb44fcc281f16f77c69e15
 fetch_commit eden-pr4588 https://git.eden-emu.dev/ponting/eden.git e5fb3b97c94bab1e4fd19dc576aa96195d417182
+fetch_commit libnx https://github.com/switchbrew/libnx.git b156b4774fb2df7b93402169509266da7547fc4c
 
 if [ ! -d mesa-nouveau/.git ]; then
     git clone -q --depth 1 --filter=blob:none --sparse https://gitlab.freedesktop.org/mesa/mesa.git mesa-nouveau

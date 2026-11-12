@@ -18,11 +18,29 @@ get the thinnest end-to-end run working, then widen it, so the pieces are proven
 
 ## Before you say a change is done
 
-Run `cargo xtask ci` (or `just ci`): fmt check, `cargo deny check` (licences, sources, advisories;
-`deny.toml`), clippy with `-D warnings` and the workspace lint set, nextest, doctests. CI runs
-exactly this. The deny step is skipped locally, with a notice, when `cargo-deny` isn't installed
-(`cargo install cargo-deny --locked`); under CI a missing `cargo-deny` fails the gate. It fetches
-the advisory database, so it needs network access.
+Run `cargo xtask ci` (or `just ci`) from the repository root: fmt check, an unused-dependency
+check (the root `[workspace.dependencies]`, then `cargo machete` per crate), `cargo deny check`
+(licences, sources, advisories; `deny.toml`), clippy with `-D warnings` and the workspace lint
+set, nextest, doctests. CI runs exactly this.
+
+- The unused-dependency check covers each crate's top-level `[dependencies]` table only: `cargo
+  machete` 0.9.2 does not look at `[dev-dependencies]`, `[build-dependencies]` or
+  `[target.*]` tables, and neither does our workspace check (an inheritance from any of them
+  counts as a use). Keep those tables tidy by hand. `ignored = [...]` under
+  `[package.metadata.cargo-machete]` or `[workspace.metadata.cargo-machete]` fails the gate:
+  the reasoned list is `xtask/unused-deps.toml`.
+- `cargo-deny` and `cargo-machete` are skipped locally, with a notice, when not installed
+  (`cargo install cargo-deny cargo-machete --locked`); under CI a missing one fails the gate.
+- A dependency that is declared ahead of the task that uses it goes in `xtask/unused-deps.toml`
+  with a reason. The list is exact: an entry that is no longer needed fails the gate too, so
+  delete it in the same change that starts using the dependency.
+- `cargo deny` fetches the advisory database, so the gate needs network access. Offline, run
+  `cargo xtask ci --offline` (or set `STARQUAKE_OFFLINE=1`): only the advisory check is skipped,
+  and the output says so. CI refuses the switch.
+- `cargo xtask ci` moves to the workspace root itself, so it also works from a subfolder (the
+  alias then builds its binary in that folder's own `target/`, which is git-ignored).
+- `cargo xtask` builds its own binary in `target/xtask` inside the checkout, so worktrees that
+  share one `CARGO_TARGET_DIR` each run their own `xtask` (see `docs/roadmap.md`).
 
 Platform-specific code must still compile (or be `cfg`-gated) on Linux; check with
 `cargo clippy --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings`.
@@ -117,8 +135,10 @@ Platform-specific code must still compile (or be `cfg`-gated) on Linux; check wi
 
 - Conventional Commits (`feat(ipc): ...`, `fix(loader): ...`, `docs: ...`, `chore: ...`).
   Commit at every green checkpoint; one logical change per commit. Run `just setup` once per clone:
-  it points `core.hooksPath` at `.githooks`, whose `commit-msg` hook rejects non-conventional subjects. CI
-  applies the same check to PR titles.
+  it points `core.hooksPath` at `.githooks`, whose `commit-msg` hook rejects non-conventional
+  subjects. CI applies the same check to PR titles (git's own subjects are fine as commit
+  messages; as a PR title only GitHub's generated `Revert "<conventional title>"` is accepted
+  besides a conventional one).
 - One issue → one branch → one PR, with an honest `Closes #N`.
 - **Don't file GitHub issues for work you propose.** Follow-ups, findings and ideas go into
   `docs/proposals.md`; the owner promotes the ones worth doing to issues. Work that belongs to

@@ -25,13 +25,13 @@ starquake-shader = { path = "crates/shader" }
 starquake-testkit = { path = "crates/testkit" }
 starquake-trace = { path = "crates/trace" }
 
-bitflags = "2.13.2"
 lz4_flex = "0.14.0"
 sha2 = "0.11.1"
 postcard = { version = "1.1.3", default-features = false, features = ["alloc"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 thiserror = "2.0.21"
+toml = { version = "1.2.1", default-features = false, features = ["std", "parse", "serde"] }
 tracing = "0.1.44"
 
 # Dev-only
