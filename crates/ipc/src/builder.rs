@@ -29,6 +29,14 @@ pub(crate) fn to_u32(field: &'static str, value: usize) -> Result<u32> {
     u32::try_from(value).map_err(|_| out_of_range(field, value))
 }
 
+/// Appends `words` to `out` as little-endian bytes: how both builders lay words into a byte
+/// section (the object ids of a reply, the headers and ids of a request).
+pub(crate) fn extend_words(out: &mut Vec<u8>, words: &[u32]) {
+    for word in words {
+        out.extend_from_slice(&word.to_le_bytes());
+    }
+}
+
 /// Appends the special header, the process id words (if `pid` is set) and the handle lists, when
 /// there is anything to put there. Returns whether a special header was written, which the
 /// command header must announce.
@@ -85,6 +93,14 @@ mod tests {
                 value: word_limit + 1,
             })
         );
+    }
+
+    #[test]
+    fn words_are_appended_as_little_endian_bytes_in_order() {
+        let mut out = vec![0xEE];
+        extend_words(&mut out, &[0x0403_0201, 0x0807_0605]);
+        extend_words(&mut out, &[]);
+        assert_eq!(out, [0xEE, 1, 2, 3, 4, 5, 6, 7, 8]);
     }
 
     #[test]

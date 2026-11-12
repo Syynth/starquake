@@ -19,24 +19,44 @@ get the thinnest end-to-end run working, then widen it, so the pieces are proven
 ## Before you say a change is done
 
 Run `cargo xtask ci` (or `just ci`) from the repository root: fmt check, an unused-dependency
-check (the root `[workspace.dependencies]`, then `cargo machete` per crate), `cargo deny check`
+check (the root `[workspace.dependencies]`, the dev, build and target tables, then `cargo machete`
+per crate), the host-access check (below), `cargo deny check`
 (licences, sources, advisories; `deny.toml`), clippy with `-D warnings` and the workspace lint
 set, nextest, doctests. CI runs exactly this.
 
-- The unused-dependency check covers each crate's top-level `[dependencies]` table only: `cargo
-  machete` 0.9.2 does not look at `[dev-dependencies]`, `[build-dependencies]` or
-  `[target.*]` tables, and neither does our workspace check (an inheritance from any of them
-  counts as a use). Keep those tables tidy by hand. `ignored = [...]` under
+- The unused-dependency check covers every dependency table. `cargo machete` reads only each
+  crate's top-level `[dependencies]` (0.9.2 does not look at `[dev-dependencies]`,
+  `[build-dependencies]` or `[target.*]` tables); the gate's `table-deps` step covers those with
+  a text search: a dependency counts as used when its crate name (`-` written as `_`) appears as
+  a word in the crate's `.rs` files, or, for a build dependency, in its build script. Both
+  are checked against `xtask/unused-deps.toml`. `ignored = [...]` under
   `[package.metadata.cargo-machete]` or `[workspace.metadata.cargo-machete]` fails the gate:
   the reasoned list is `xtask/unused-deps.toml`.
 - `cargo-deny` and `cargo-machete` are skipped locally, with a notice, when not installed
-  (`cargo install cargo-deny cargo-machete --locked`); under CI a missing one fails the gate.
-- A dependency that is declared ahead of the task that uses it goes in `xtask/unused-deps.toml`
-  with a reason. The list is exact: an entry that is no longer needed fails the gate too, so
-  delete it in the same change that starts using the dependency.
+  (`cargo install cargo-deny@0.19.8 cargo-machete@0.9.2 --locked`); under CI a missing one fails
+  the gate.
+- The gate's plugins (`cargo-nextest`, `cargo-deny`, `cargo-machete`) are pinned in
+  `xtask/tool-versions.toml`, so a tool release cannot turn `main` red. CI installs exactly those
+  versions (`.github/workflows/ci.yml`; a test fails when the workflow or the install command
+  above differs from the file). The gate compares what is installed with the pins: a different
+  version is a notice locally and a failure under CI. To move a pin, change the file, the
+  workflow and this command in one commit.
+- A dependency that is declared ahead of the task that uses it, or that the text search cannot
+  see used (a library name that differs from the package name), goes in
+  `xtask/unused-deps.toml` with a reason (`[[allow]]` for `[dependencies]`, `[[allow_tables]]`
+  for the other tables). The list is exact: an entry that is no longer needed fails the gate too,
+  so delete it in the same change that starts using the dependency.
 - `cargo deny` fetches the advisory database, so the gate needs network access. Offline, run
   `cargo xtask ci --offline` (or set `STARQUAKE_OFFLINE=1`): only the advisory check is skipped,
   and the output says so. CI refuses the switch.
+- The `host-access` step reads the non-test code of `crates/kernel`, `crates/services` and
+  `crates/gsv` and fails on a direct use of the host clock (`Instant::now`, `SystemTime::now`),
+  `std::fs`, `std::net`, thread sleeping or a random-number source (`rand`, `getrandom`,
+  `fastrand`, a `RandomState`). Read these through the injectable `Env` instead, or replay breaks
+  silently (`docs/specs/observability.md`). Test code is exempt, and only that: `#[cfg(test)]`,
+  `#[cfg(all(test, ..))]`, `#[test]`-style functions and `#![cfg(test)]` (not `any(test, ..)`);
+  there is no escape comment. The step is a text search, not a sandbox: the module docs of
+  `xtask/src/host_access.rs` list what it cannot see.
 - `cargo xtask ci` moves to the workspace root itself, so it also works from a subfolder (the
   alias then builds its binary in that folder's own `target/`, which is git-ignored).
 - `cargo xtask` builds its own binary in `target/xtask` inside the checkout, so worktrees that
@@ -69,6 +89,11 @@ Platform-specific code must still compile (or be `cfg`-gated) on Linux; check wi
   `shader`, `render`. `ipc` and `trace` are leaves (no workspace dependencies) that the layers
   above depend on; `testkit` is a dev-dependency only and depends on none of our crates. `core` wires everything; frontends depend only on `core`. No cycles, and no
   reaching around a layer.
+- Kernel and service code (`kernel`, `services`, `gsv`) is replayable: the clock, random numbers
+  and host file and network I/O come only through the injectable `Env`, never from `std`
+  directly. The gate's `host-access` step catches the direct calls it lists (`xtask/src/host_access.rs`)
+  and nothing else: method calls such as `.elapsed()` and `Path::exists`, aliases and other
+  clock or random crates are for review to catch.
 - Guest-controlled values are untrusted: checked arithmetic and bounds on anything derived from
   guest memory, file contents or IPC words. A malformed input is an `Err`, never a panic.
   Check arithmetic for the whole extent written or read (start, end, trailing data), not just
@@ -165,3 +190,11 @@ Platform-specific code must still compile (or be `cfg`-gated) on Linux; check wi
 
 Code may be ported from GPL projects (Eden, oboromi, rapid-arm-emu) with attribution in the file
 header; MIT sources (Mesa) likewise. Don't use leaked or NDA material.
+
+- **libnx is ISC** (permissive): code may be ported, and the notice in the reference folder's
+  `libnx/LICENSE.md` (its copyright line and permission text) goes in the header of the file that
+  holds the port. The source files themselves carry only `@copyright libnx Authors`.
+- **Atmosphère is GPL-2.0-only, so it is a reference for facts only.** Its licence can't be
+  combined with this project's GPL-3.0-or-later: never port, translate or closely paraphrase its
+  code. Read it to settle a fact (a result code, a command id, a layout), write the code from the
+  fact, and cite the file in a comment marked "fact only" (`docs/references.md`).
