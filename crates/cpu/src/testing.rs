@@ -120,6 +120,8 @@ impl Vcpu for ScriptedVcpu {
             None => Err(Error::Host("the scripted vCPU has no more exits".into())),
             Some(Step::Exit { guest, exit }) => {
                 guest(&mut self.regs);
+                // The guest cannot set bits outside its own, whatever the script writes.
+                self.regs.pstate &= GUEST_PSTATE_MASK;
                 Ok(exit)
             }
             Some(Step::Spin) => {
@@ -228,6 +230,10 @@ mod tests {
             vcpu.set_regs(&regs).unwrap();
             assert_eq!(vcpu.regs().unwrap().pstate, bit);
         }
+        // A scripted guest that sets every bit leaves only the guest's.
+        let mut vcpu = ScriptedVcpu::new().then(|regs| regs.pstate = u64::MAX, Exit::Svc(1));
+        assert_eq!(vcpu.run(), Ok(Exit::Svc(1)));
+        assert_eq!(vcpu.regs().unwrap().pstate, GUEST_PSTATE_MASK);
     }
 
     #[test]

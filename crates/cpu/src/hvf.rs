@@ -17,10 +17,20 @@
 //! Apple M2 with every bit written, the guest reads back `FPCR` `0x07ff_9f00` and `FPSR`
 //! `0x0800_009f` (`tests/hvf.rs`, `after_a_run_the_host_reads_the_fpcr_and_fpsr_the_guest_reads`
 //! checks that the host reads the same). Before the guest has run, the host reads back the low
-//! 32 bits of what it wrote. Among the kept `FPCR` bits are the floating-point trap enables
-//! (bits 15 and 12:8), so a guest that sets one takes a floating-point exception on this host;
-//! it comes back as an [`Exit::Undefined`] of class 0x2c. That a Cortex-A78C ignores those bits
-//! instead is a guess, unchecked against any pinned reference.
+//! 32 bits of what it wrote. The kept `FPCR` bits are the ones Eden's recompiler keeps too
+//! (`eden/src/dynarmic/src/dynarmic/common/fp/fpcr.h`, `FPCR::mask = 0x07FF9F00`), and among
+//! them are the floating-point trap enables (bits 15 and 12:8).
+//!
+//! Divergence from Eden: Eden never delivers a trapped floating-point exception. Its
+//! `FPProcessException` (`eden/src/dynarmic/src/dynarmic/common/fp/process_exception.cpp`)
+//! asserts that the enable of the exception raised (`IOE`, `DZE`, `OFE`, `UFE`, `IXE`, `IDE`) is
+//! clear ("Raising floating point exceptions unimplemented") and only sets the cumulative flag,
+//! so under Eden a set trap enable has no effect on the guest. Here the host's FP unit honours
+//! it: the guest takes a floating-point exception, it comes back as an [`Exit::Undefined`] of
+//! class 0x2c, and the run crashes (`tests/hvf.rs`,
+//! `a_guest_that_enables_a_floating_point_trap_takes_it_on_this_host`). Whether the Switch 2's
+//! Cortex-A78C itself implements the trap enables is a guess either way: no pinned reference
+//! records its behaviour.
 //!
 //! # Wait hints
 //!
@@ -946,6 +956,30 @@ fn is_trapped_wait(syndrome: u64) -> bool {
     Syndrome::from_esr(syndrome).class() == ExceptionClass::TrappedWait
 }
 
+/// What [`Vcpu::run`] does with one exit from the hypervisor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExitAction {
+    /// A wait hint the hypervisor trapped: step over it and enter the guest again (see "Wait
+    /// hints" in the module docs).
+    StepOverWait,
+    /// Any other exception: decode it and report it.
+    Exception,
+    /// The run was canceled: report an interrupt.
+    Interrupted,
+}
+
+/// What the run loop does with an exit of `reason` whose `ESR_EL2` value is `syndrome` (read
+/// only for an exception). The vtimer is masked at creation, so its reason and unknown ones are
+/// both errors.
+fn exit_action(reason: u32, syndrome: u64) -> Result<ExitAction, Error> {
+    match reason {
+        ffi::EXIT_REASON_EXCEPTION if is_trapped_wait(syndrome) => Ok(ExitAction::StepOverWait),
+        ffi::EXIT_REASON_EXCEPTION => Ok(ExitAction::Exception),
+        ffi::EXIT_REASON_CANCELED => Ok(ExitAction::Interrupted),
+        reason => Err(Error::Host(format!("unexpected exit reason {reason}"))),
+    }
+}
+
 /// Where the guest resumes after a wait with `ESR_EL2` value `syndrome` was trapped with the
 /// vCPU's `cpsr` and `pc`: the next instruction. A wait trapped outside EL0 guest code, or at
 /// the very end of the address space, is an error.
@@ -998,17 +1032,11 @@ impl Vcpu for HvfVcpu {
         }
         loop {
             let exit = self.enter()?;
-            match exit.reason {
-                // A wait hint the hypervisor trapped: step over it and go on (see "Wait hints"
-                // in the module docs). An interrupt requested meanwhile ends the next entry.
-                ffi::EXIT_REASON_EXCEPTION if is_trapped_wait(exit.exception.syndrome) => {
-                    self.step_over_wait(&exit.exception)?;
-                }
-                ffi::EXIT_REASON_EXCEPTION => return self.exception(&exit.exception),
-                ffi::EXIT_REASON_CANCELED => return self.interrupted(),
-                // The vtimer is masked at creation, so this and unknown reasons are both
-                // unexpected.
-                reason => return Err(Error::Host(format!("unexpected exit reason {reason}"))),
+            match exit_action(exit.reason, exit.exception.syndrome)? {
+                // An interrupt requested meanwhile ends the next entry.
+                ExitAction::StepOverWait => self.step_over_wait(&exit.exception)?,
+                ExitAction::Exception => return self.exception(&exit.exception),
+                ExitAction::Interrupted => return self.interrupted(),
             }
         }
     }
@@ -1251,25 +1279,66 @@ mod tests {
         assert_eq!(ttbr0(root, 0xbeef), 0xbeef_000f_1000_3000);
     }
 
+    /// `ESR_EL2` of the trapped `wfi` measured on an Apple M2 (`tests/hvf.rs`,
+    /// `wait_hints_resume_past_themselves_without_an_exit`): EC 0x01, IL, CV with condition AL
+    /// (ISS bits 24:20), TI = 0b00. A `wfe` differs only in TI = 0b01, and the `WFIT` and `WFET`
+    /// forms in TI = 0b10 and 0b11 (Arm ARM, `ESR_ELx`, "ISS encoding for an exception from a
+    /// WF* instruction").
+    const WFI: u64 = 0x07e0_0000;
+
+    /// `ESR_EL2` values that are not waits: an `hvc` from the shim, an `svc`, an undefined
+    /// instruction and a data abort.
+    const NOT_WAITS: [u64; 4] = [0x5a00_0002, 0x5600_0002, 0x0200_0000, 0x9200_004f];
+
     #[test]
     fn only_class_0x01_is_a_trapped_wait() {
-        // ESR_EL2 of the trapped `wfi` measured on an Apple M2 (`tests/hvf.rs`,
-        // `wait_hints_resume_past_themselves_without_an_exit`): EC 0x01, IL, CV with condition
-        // AL (ISS bits 24:20), TI = 0b00. A `wfe` differs only in TI = 0b01, and the `WFIT` and
-        // `WFET` forms in TI = 0b10 and 0b11 (Arm ARM, `ESR_ELx`, "ISS encoding for an exception
-        // from a WF* instruction").
         for ti in 0..=0b11 {
-            assert!(is_trapped_wait(0x07e0_0000 | ti), "TI {ti:#b}");
+            assert!(is_trapped_wait(WFI | ti), "TI {ti:#b}");
         }
-        // An `hvc` from the shim, an `svc`, an undefined instruction and a data abort are not.
-        for other in [0x5a00_0002, 0x5600_0002, 0x0200_0000, 0x9200_004f] {
+        for other in NOT_WAITS {
             assert!(!is_trapped_wait(other), "{other:#x}");
         }
     }
 
     #[test]
+    fn the_run_loop_steps_over_every_trapped_wait_and_reports_the_rest() {
+        // A trapped wait of every `TI` value (wfi, wfe, WFIT, WFET) is stepped over.
+        for ti in 0..=0b11 {
+            assert_eq!(
+                exit_action(ffi::EXIT_REASON_EXCEPTION, WFI | ti),
+                Ok(ExitAction::StepOverWait),
+                "TI {ti:#b}"
+            );
+        }
+        // Every other exception is reported.
+        for other in NOT_WAITS {
+            assert_eq!(
+                exit_action(ffi::EXIT_REASON_EXCEPTION, other),
+                Ok(ExitAction::Exception),
+                "{other:#x}"
+            );
+        }
+        // A canceled run is an interrupt, whatever stale syndrome the exit still holds.
+        for syndrome in [0, WFI, NOT_WAITS[0]] {
+            assert_eq!(
+                exit_action(ffi::EXIT_REASON_CANCELED, syndrome),
+                Ok(ExitAction::Interrupted),
+                "{syndrome:#x}"
+            );
+        }
+        // Any other reason is an error, even with a wait's syndrome: the vtimer's
+        // (`HV_EXIT_REASON_VTIMER_ACTIVATED`, 2 in the framework's header; the backend does not
+        // use it, as the vtimer is masked at creation) and an unknown one.
+        for reason in [2, u32::MAX] {
+            assert_eq!(
+                exit_action(reason, WFI),
+                Err(Error::Host(format!("unexpected exit reason {reason}")))
+            );
+        }
+    }
+
+    #[test]
     fn a_wait_is_stepped_over_only_in_guest_code_with_an_instruction_after_it() {
-        const WFI: u64 = 0x07e0_0000;
         // At EL0t (with the guest's flags and masks in the other bits), the next instruction.
         let el0 = shim::SPSR_EL0T_MASKED | crate::PSTATE_NZCV;
         assert_eq!(after_wait(WFI, el0, 0x8000_0000), Ok(0x8000_0004));
@@ -1288,11 +1357,11 @@ mod tests {
         // In the shim (EL1h) it is an error, whatever the pc.
         assert_eq!(
             after_wait(WFI, shim::CPSR_EL1H_MASKED, 0x8000_0000),
-            Err(Error::Host(
-                "a wait was trapped outside guest code: ESR_EL2 0x7e00000 at pc 0x80000000, \
-                 cpsr 0x3c5"
-                    .into()
-            ))
+            Err(Error::Host(format!(
+                "a wait was trapped outside guest code: ESR_EL2 {WFI:#x} at pc 0x80000000, cpsr \
+                 {:#x}",
+                shim::CPSR_EL1H_MASKED
+            )))
         );
     }
 

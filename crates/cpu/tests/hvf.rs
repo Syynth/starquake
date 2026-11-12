@@ -1749,6 +1749,8 @@ const FPCR_DN_FZ_RZ: u64 = (1 << 25) | (1 << 24) | (0b11 << 22);
 /// `FPSR` with the saturation flag `QC` (bit 27), inexact `IXC` (4) and divide-by-zero `DZC`
 /// (1) set: Arm ARM, `FPSR`.
 const FPSR_QC_IXC_DZC: u64 = (1 << 27) | (1 << 4) | (1 << 1);
+/// `FPSR` with only the overflow flag `OFC` (bit 2) set: Arm ARM, `FPSR`.
+const FPSR_OFC: u64 = 1 << 2;
 
 #[test]
 fn fp_state_set_by_the_host_is_what_the_guest_reads() {
@@ -1838,14 +1840,20 @@ fn a_thread_moved_to_another_vcpu_keeps_its_rounding_mode_and_flags() {
     // The second vCPU is on another host thread (a vCPU belongs to the thread that made it,
     // and each thread may have one), and last ran another guest thread, with the default
     // rounding mode (to nearest) and other vector registers.
+    // The moved context also carries flags the code it resumes cannot raise (`QC`, `DZC`), and
+    // the other thread leaves a different flag (`OFC`) behind, so only a restored `FPSR` reads
+    // back as the moved one.
     let backend = Arc::clone(&guest.backend);
     let (root, pc) = (guest.root(), guest.base());
-    let resumed = saved.clone();
+    let mut resumed = saved.clone();
+    resumed.fpsr = FPSR_QC_IXC_DZC;
+    let moved_fpsr = resumed.fpsr;
     let after = std::thread::spawn(move || {
         let mut second = support::new_vcpu(&backend, root);
         let mut other = GuestRegs {
             pc,
             v: [u128::MAX; VECTOR_REGS],
+            fpsr: FPSR_OFC,
             ..GuestRegs::default()
         };
         other.x[0] = 2.75f64.to_bits();
@@ -1858,9 +1866,9 @@ fn a_thread_moved_to_another_vcpu_keeps_its_rounding_mode_and_flags() {
     })
     .join()
     .unwrap();
-    // Still rounding toward zero, from the d0 the thread left, with its flag still set.
+    // Still rounding toward zero, from the d0 the thread left, with exactly its flags.
     assert_eq!(after.x[0], 2.0f64.to_bits());
-    assert_eq!(after.x[2], 1 << 4);
+    assert_eq!(after.x[2], moved_fpsr);
     assert_eq!(after.v[0], saved.v[0]);
     assert_eq!(after.v[3..], saved.v[3..]);
 }
@@ -1901,7 +1909,10 @@ fn after_a_run_the_host_reads_the_fpcr_and_fpsr_the_guest_reads() {
 fn a_guest_that_enables_a_floating_point_trap_takes_it_on_this_host() {
     let Some(guest) = Guest::new() else { return };
     // `FPCR.DZE` (bit 9) enables the divide-by-zero trap (Arm ARM, `FPCR`). The Apple M2 keeps
-    // it, so the division traps: a listed divergence from a core that ignores the bit.
+    // it, so the division traps and the run would crash. A listed divergence from Eden, whose
+    // `FPProcessException` (`eden/src/dynarmic/src/dynarmic/common/fp/process_exception.cpp`)
+    // asserts the enable is clear and never delivers the exception: under Eden the bit has no
+    // effect (see "Registers" in the backend's docs).
     let program = [
         0x1e6e_1000, // 0x00  fmov d0, #1.0
         0x9e67_03e1, // 0x04  fmov d1, xzr
@@ -2009,6 +2020,43 @@ fn wait_hints_resume_past_themselves_without_an_exit() {
     let regs = vcpu.regs().unwrap();
     assert_eq!(regs.x[0], 0x77);
     assert_eq!(regs.x[1], 0x1111);
+    assert_eq!(regs.pc, guest.base() + 4 * program.len() as u64);
+}
+
+#[test]
+fn each_trapped_wait_is_stepped_over_once() {
+    const ITERATIONS: u64 = 100_000;
+    const BOUND: Duration = Duration::from_secs(10);
+    let Some(guest) = Guest::new() else { return };
+    // A counted loop of trapped `wfi`s. Stepped over, each costs one exit: the whole loop takes
+    // under 0.1 s on an Apple M2. Resumed on the `wfi` itself, each traps again and again
+    // before the host lets it through, and the loop had not ended when the bound passed
+    // (measured on the same M2 with the step's new pc replaced by the old one), so the run is
+    // interrupted instead.
+    let program = [
+        WFI,         // 0x00
+        0xf100_0400, // 0x04  subs x0, x0, #1
+        0x54ff_ffc1, // 0x08  b.ne 0x00
+        SVC_0,       // 0x0c
+    ];
+    let mut vcpu = guest.vcpu(&program, |regs| regs.x[0] = ITERATIONS);
+    let interrupter = vcpu.interrupter();
+    let (done, finished) = mpsc::channel::<()>();
+    // The waker interrupts the run once the bound has passed, so a backend that does not step
+    // fails this test instead of hanging it. Dropping `done` tells it the run has ended.
+    let waker = std::thread::spawn(move || {
+        if finished.recv_timeout(BOUND) == Err(mpsc::RecvTimeoutError::Timeout) {
+            interrupter.interrupt().unwrap();
+        }
+    });
+    let started = Instant::now();
+    let exit = vcpu.run();
+    let took = started.elapsed();
+    drop(done);
+    waker.join().unwrap();
+    assert_eq!(exit, Ok(Exit::Svc(0)), "after {took:?}");
+    let regs = vcpu.regs().unwrap();
+    assert_eq!(regs.x[0], 0);
     assert_eq!(regs.pc, guest.base() + 4 * program.len() as u64);
 }
 

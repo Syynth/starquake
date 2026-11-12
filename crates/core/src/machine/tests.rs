@@ -437,6 +437,56 @@ fn an_instruction_abort_is_a_crash_that_names_the_address_fetched_from() {
 }
 
 #[test]
+fn each_abort_crash_carries_its_own_exits_syndrome() {
+    // Two different syndromes per abort kind, so a report that carried a fixed syndrome in place
+    // of the exit's would get one of each pair wrong.
+    let crash = programs::crash().unwrap();
+    for syndrome in [
+        UNMAPPED_STORE,
+        Syndrome::data_abort(FaultStatus::Permission { level: 3 }, true),
+    ] {
+        let guest = Guest::new(&crash.nro);
+        let instruction = guest.placed.entry + crash.store_offset;
+        let address = crash.fault_address;
+        let vcpu = ScriptedVcpu::new().then(
+            move |regs| regs.pc = instruction,
+            Exit::DataAbort {
+                address,
+                write: true,
+                syndrome,
+            },
+        );
+        let report = guest.run(vcpu, &RunOptions::default());
+        let report_crash = report.crash().expect("a crash report");
+        assert_eq!(
+            report_crash.syndrome,
+            Some(SyndromeReport::new(syndrome)),
+            "{:#x}",
+            syndrome.esr()
+        );
+    }
+    for syndrome in [
+        Syndrome::instruction_abort(FaultStatus::Translation { level: 2 }),
+        Syndrome::instruction_abort(FaultStatus::Permission { level: 3 }),
+    ] {
+        let guest = Guest::new(&programs::hello().unwrap());
+        let address = guest.start_of("stack") + 0x40;
+        let vcpu = ScriptedVcpu::new().then(
+            move |regs| regs.pc = address,
+            Exit::InstructionAbort { address, syndrome },
+        );
+        let report = guest.run(vcpu, &RunOptions::default());
+        let crash = report.crash().expect("a crash report");
+        assert_eq!(
+            crash.syndrome,
+            Some(SyndromeReport::new(syndrome)),
+            "{:#x}",
+            syndrome.esr()
+        );
+    }
+}
+
+#[test]
 fn an_undefined_instruction_is_a_crash_at_its_address() {
     let guest = Guest::new(&programs::hello().unwrap());
     let pc = guest.placed.entry + 0x40;

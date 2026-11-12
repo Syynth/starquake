@@ -16,10 +16,9 @@
 //!
 //! The JSON layout is this crate's own (the spec gives none), versioned by [`CRASH_VERSION`] and
 //! pinned by a test. Addresses and register values are hex strings, so no reader loses bits to a
-//! floating-point number. The `instruction_abort` kind and the `syndrome` field were each added
-//! without a new version: nothing was renamed or removed, and every field that was there before
-//! keeps its meaning. (Before the first, a fetch from an address nothing maps was reported as a
-//! `data_abort` read.)
+//! floating-point number. Version 2 added the `syndrome` field. (The `instruction_abort` kind
+//! came earlier, inside version 1; before it, a fetch from an address nothing maps was reported
+//! as a `data_abort` read.)
 
 use std::fmt::Write as _;
 
@@ -28,9 +27,9 @@ use starquake_cpu::{ExceptionClass, FaultStatus, GuestRegs, Syndrome};
 
 use crate::report::Mapping;
 
-/// Version of the `crash.json` layout. Bump it when a field is renamed, removed or changes
-/// meaning.
-pub const CRASH_VERSION: u32 = 1;
+/// Version of the `crash.json` layout. Any change to the layout bumps it: a field or exception
+/// kind added, renamed or removed, or a field's meaning changed.
+pub const CRASH_VERSION: u32 = 2;
 
 /// Serialises a `u64` as a hex string (`"0x80000000"`).
 #[expect(
@@ -606,6 +605,16 @@ mod tests {
             "{}",
             brk.to_text()
         );
+        // The ESR is always eight digits, so a class 0x00 syndrome keeps its leading zero.
+        let undefined =
+            report(Exception::UndefinedInstruction).with_syndrome(Syndrome::undefined());
+        assert!(
+            undefined
+                .to_text()
+                .contains("syndrome: 0x02000000 (undefined instruction)\n"),
+            "{}",
+            undefined.to_text()
+        );
     }
 
     #[test]
@@ -624,7 +633,7 @@ mod tests {
         assert_eq!(
             json,
             r##"{
-  "version": 1,
+  "version": VERSION,
   "emulator": "starquake 9.9.9",
   "command_line": [
     "starquake",
@@ -681,6 +690,7 @@ mod tests {
     "#0 core 0 thread 1: lifecycle ProcessStart 1"
   ]
 }"##
+            .replace("VERSION", &CRASH_VERSION.to_string())
         );
         let undefined = serde_json::to_value(Exception::UndefinedInstruction).unwrap();
         assert_eq!(
