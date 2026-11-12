@@ -69,17 +69,53 @@
 //! header, and the block size. The bit streams are not touched.
 //!
 //! A zstd description can be longer than the ZBIC one it replaces, and zstd's layout has three
-//! limits a longer one can cross ([`Overflow`]): FSE-compressed Huffman weights are at most 127
-//! bytes, single-stream literals at most 1023, a block at most 128 KiB. (Four-stream literals
-//! move to a header with wider sizes instead.) zstd's encoder stays clear of all three by more
-//! than a description can grow, and an encoder derived from it does too; should a title ever
-//! cross one, the way to read it is to decode that block's entropy tables here instead of
-//! rewriting them, which this design leaves open.
+//! limits a longer one can cross ([`Overflow`]). (Four-stream literals move to a header with
+//! wider sizes instead.) What the reference's encoder (the same `zstd.inc`, fact only) does near
+//! each, with what a block can grow by: the rewritten Huffman weights are at most 127 bytes
+//! (else [`Overflow::HuffmanDescription`]), the three sequence tables at most 44, 35 and 63
+//! bytes (zstd's own bound, `FSE_NCountWriteBound` with `MaxLL` 35 and `LLFSELog` 9, `MaxOff` 31
+//! and `OffFSELog` 8, `MaxML` 52 and `MLFSELog` 9), and a four-stream literals header 2 bytes:
 //!
-//! Memory: the output grows as blocks are decoded and is never allocated from the declared
-//! size. The decoder holds back one window of output, and a window is refused when it is over
-//! both [`MAX_WINDOW_SIZE`] and the declared size, so a frame cannot make this hold more than
-//! that window, one block and the declared size.
+//! - FSE-compressed Huffman weights, at most 127 bytes: not kept clear of. `HUF_writeCTable_wksp`
+//!   compresses the weights whenever `(hSize>1) & (hSize < maxSymbolValue/2)`, where `hSize` is
+//!   the length of the ZBIC weights and `maxSymbolValue` the literals' largest byte, at most 255
+//!   (`HUF_SYMBOLVALUE_MAX`). So the encoder can write 126 bytes of weights, and a rewrite that
+//!   grows them by two bytes crosses the limit. That a real title does not is a guess, which
+//!   the titles read so far have not contradicted.
+//! - Single-stream literals, a compressed size of at most 1023: kept clear of when there are
+//!   fewer than 256 literals (`singleStream = srcSize < 256` in `ZSTD_compressLiterals`), as
+//!   Huffman coding is kept only when the compressed size is below
+//!   `srcSize - ZSTD_minGain(srcSize, strategy)`, so it is below 253, and a rewritten tree
+//!   description of at most 127 bytes keeps it below 380. Not kept clear of when fewer than
+//!   1 KiB of literals may reuse the previous block's tree
+//!   (`if (repeat == HUF_repeat_valid && lhSize == 3) singleStream = 1;`) but the encoder writes
+//!   a new one: the same condition then leaves a margin below 1023 of more than
+//!   `ZSTD_minGain`, which is at least 2 bytes. That a real title does not cross it is a guess.
+//! - A block, at most 128 KiB: kept clear of. `ZSTD_entropyCompressSeqStore_wExtLitBuffer` keeps
+//!   a compressed block only when it is below `blockSize - ZSTD_minGain(blockSize, strategy)`,
+//!   and `ZSTD_minGain` is `(blockSize >> minlog) + 2` with `minlog` at most 8 (`ZSTD_btultra2`
+//!   less one), so a block ends at least 514 bytes below 128 KiB, more than the 271 bytes (127,
+//!   44, 35, 63 and 2) a block can grow by.
+//!
+//! Should a title ever cross one, the way to read it is to decode that block's entropy tables
+//! here instead of rewriting them, which this design leaves open.
+//!
+//! Memory: `ruzstd` reserves the frame's window when it reads the frame header, before any
+//! block: `FrameDecoder::init` resets its buffer to the window (`DecodeBuffer::reset`, which
+//! calls `RingBuffer::reserve`). A window is refused when it is over both [`MAX_WINDOW_SIZE`]
+//! and the declared size, but a single-segment frame's window is its content size, which must
+//! be the declared size, and a windowed frame may ask for up to the declared size. So a frame
+//! of 12 bytes that states a content size of `u32::MAX`, the most an NSO header's 32-bit
+//! segment size can declare, makes `ruzstd` reserve about 4 GiB
+//! (`a_single_segment_frame_of_the_largest_size_is_refused_after_reserving_it`). Where the
+//! host maps that lazily, as macOS and Linux do by default, it costs address space and no
+//! memory; where the host refuses the allocation, `ruzstd` panics (`RingBuffer` `expect`s
+//! the allocation), which this module cannot catch. The reference allocates the declared size
+//! too, as its destination buffer. After that reservation the output grows as blocks are
+//! decoded: until the frame ends the decoder holds back one window and at most one block
+//! beyond it, as what it offers beyond the window is collected after every block
+//! (`output_is_collected_while_a_long_frame_decodes`), and the output collected so far is
+//! never over the declared size.
 //!
 //! # Divergences from the reference
 //!
@@ -125,7 +161,12 @@
 //! The same as the reference: a frame that names a dictionary is refused (`dictionary_wrong`
 //! there, [`ZbicError::Dictionary`] here), and so are the frame header's reserved bit and the
 //! reserved bits of a sequences section's modes byte, both of which `ruzstd` alone would let
-//! through ([`ZbicError::ReservedBit`], [`ZbicError::ReservedModes`]).
+//! through ([`ZbicError::ReservedBit`], [`ZbicError::ReservedModes`]). So are a compressed
+//! block's literals when they are more than the frame's largest block, the smaller of its
+//! window and 128 KiB (`litSize > blockSizeMax` in `ZSTD_decodeLiteralsBlock`, for raw, RLE
+//! and Huffman literals, before anything after their header is read): `ruzstd` alone decodes
+//! them when the block has no sequences ([`ZbicError::LiteralsTooLong`],
+//! `literals_over_the_largest_block_are_refused`).
 //!
 //! The list comes from reading both sides and from running this module and a local build of
 //! the reference (not part of this repository) over the same inputs: frames from the
@@ -156,6 +197,13 @@ pub const MAGIC: [u8; 4] = *b"ZBIC";
 /// limit the NUP reader's decoder has (`ruzstd::decoding::DEFAULT_MAX_WINDOW_SIZE`). A
 /// starquake limit; see "Divergences" in the module docs.
 pub const MAX_WINDOW_SIZE: u64 = DEFAULT_MAX_WINDOW_SIZE;
+
+#[cfg(test)]
+thread_local! {
+    /// The most output the decoder offered at once before the frame ended, in the last
+    /// [`decompress`] on this thread: what it held beyond its window, for the tests.
+    static MOST_OFFERED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// Whether `bytes` starts with the ZBIC magic (`IsZBIC` in
 /// `eden-nx2/src/common/zbic_compression.cpp`: at least four bytes, the first four the magic).
@@ -248,6 +296,20 @@ pub enum ZbicError {
         /// The block's index in the frame.
         block: usize,
     },
+    /// A compressed block's literals are more than its largest block: the frame's window or
+    /// 128 KiB, whichever is smaller.
+    #[error(
+        "ZBIC block {block} regenerates {size:#x} bytes of literals, more than its largest block \
+         of {limit:#x}"
+    )]
+    LiteralsTooLong {
+        /// The block's index in the frame.
+        block: usize,
+        /// The literals header's `Regenerated_Size`.
+        size: u64,
+        /// The largest block.
+        limit: u64,
+    },
     /// A compressed block's sequences section sets a reserved bit of its modes byte.
     #[error("ZBIC block {block} sets a reserved bit of its sequence table modes")]
     ReservedModes {
@@ -336,11 +398,25 @@ fn zstd_error(block: usize, error: &dyn std::fmt::Display) -> ZbicError {
 
 /// Appends compressed block `index` to `out` as zstd stores it: its block header with the
 /// rewritten size, then its body with every table description rewritten.
+///
+/// Literals of more than `largest_block` are refused first, before anything after their
+/// header is read, as `ZSTD_decodeLiteralsBlock` does (`litSize > blockSizeMax` is
+/// `corruption_detected` for raw, RLE and Huffman literals).
 fn rewrite_compressed(
     block: &frame::Block<'_>,
     index: usize,
+    largest_block: u64,
     out: &mut Vec<u8>,
 ) -> Result<(), ZbicError> {
+    if let Some(literals) = frame::Literals::parse(block.body)
+        && literals.regenerated > largest_block
+    {
+        return Err(ZbicError::LiteralsTooLong {
+            block: index,
+            size: literals.regenerated,
+            limit: largest_block,
+        });
+    }
     let start = out.len();
     out.extend_from_slice(&[0; frame::BLOCK_HEADER_SIZE]);
     frame::rewrite_block(block.body, &mut bic_to_zstd, out).map_err(|error| match error {
@@ -400,6 +476,8 @@ pub fn decompress(stored: &[u8], size: usize) -> Result<Vec<u8>, ZbicError> {
         });
     }
 
+    #[cfg(test)]
+    MOST_OFFERED.set(0);
     let mut decoder = FrameDecoder::new();
     decoder.set_max_window_size(limit);
     let mut scratch = frame::ZSTD_MAGIC.to_vec();
@@ -412,6 +490,10 @@ pub fn decompress(stored: &[u8], size: usize) -> Result<Vec<u8>, ZbicError> {
         .init(scratch.as_slice())
         .map_err(|error| zstd_error(0, &error))?;
 
+    // `blockSizeMax` (`ZSTD_getFrameHeader_advanced`): the smaller of the window and 128 KiB.
+    let largest_block = header
+        .window
+        .min(u64::try_from(frame::BLOCK_SIZE_MAX).unwrap_or(u64::MAX));
     let mut out = Vec::new();
     let mut rest = stored.get(header.len..).unwrap_or_default();
     let mut index = 0usize;
@@ -431,7 +513,7 @@ pub fn decompress(stored: &[u8], size: usize) -> Result<Vec<u8>, ZbicError> {
 
         scratch.clear();
         if block.kind == frame::BLOCK_COMPRESSED {
-            rewrite_compressed(&block, index, &mut scratch)?;
+            rewrite_compressed(&block, index, largest_block, &mut scratch)?;
         } else {
             scratch.extend_from_slice(block.stored);
         }
@@ -446,6 +528,8 @@ pub fn decompress(stored: &[u8], size: usize) -> Result<Vec<u8>, ZbicError> {
         // Until the frame ends the decoder holds back one window, so once it offers anything
         // the output so far is what was collected, the window and what it offers.
         let ready = decoder.can_collect();
+        #[cfg(test)]
+        MOST_OFFERED.set(MOST_OFFERED.get().max(ready));
         if ready > 0 {
             let total = u64::try_from(out.len().saturating_add(ready))
                 .unwrap_or(u64::MAX)

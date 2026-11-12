@@ -323,7 +323,7 @@ fn a_description_must_end_before_the_data_it_is_read_from() {
 }
 
 /// A table of 32 whose first symbol has every slot and whose largest symbol is `max_symbol`
-/// (33 to 52, so the totals are a list of 64).
+/// (32 to 52, so the totals are a list of 64).
 fn one_symbol_up_to(max_symbol: u64) -> Vec<u8> {
     // The middle total and five more down the lower half are 32 between 0 and 32; every
     // other total lies between 32 and 32. Then the digit that is thrown away.
@@ -1470,6 +1470,14 @@ fn windowed(blocks: &[u8]) -> Vec<u8> {
     out
 }
 
+/// A frame with a window descriptor of 1 MiB and no content size: its largest block is then
+/// 128 KiB, not the window.
+fn wide(blocks: &[u8]) -> Vec<u8> {
+    let mut out = header_bytes(MAGIC, 0, Some(10 << WINDOW_MANTISSA_BITS), &[], &[]);
+    out.extend_from_slice(blocks);
+    out
+}
+
 /// A single-segment frame that states `size` in one byte.
 fn single_segment(size: u8, blocks: &[u8]) -> Vec<u8> {
     let mut out = header_bytes(MAGIC, SINGLE_SEGMENT_FLAG, None, &[], &[size]);
@@ -1861,16 +1869,46 @@ fn output_longer_than_declared_is_refused() {
 
 #[test]
 fn output_is_collected_while_a_long_frame_decodes() {
-    // Six blocks of 1 KiB through a window of 1 KiB: all but the last window is collected
-    // before the frame ends.
+    // Sixteen blocks of 1 KiB through a window of 1 KiB: what the decoder offers beyond its
+    // window is collected after each block, so it never holds more than the window and one
+    // block. Uncollected, it would offer 14 KiB before the last block.
     let kib = 1usize << WINDOW_LOG_MIN;
+    let count = 16u8;
     let mut blocks = Vec::new();
     let mut expected = Vec::new();
-    for index in 0..6u8 {
-        blocks.extend(rle_block(index == 5, index, kib));
+    for index in 0..count {
+        blocks.extend(rle_block(index + 1 == count, index, kib));
         expected.extend(std::iter::repeat_n(index, kib));
     }
     assert_eq!(decompress(&windowed(&blocks), expected.len()), Ok(expected));
+    assert_eq!(MOST_OFFERED.get(), kib);
+}
+
+#[test]
+fn a_single_segment_frame_of_the_largest_size_is_refused_after_reserving_it() {
+    // Twelve bytes: the magic, a descriptor for a single segment with a four-byte content
+    // size, `u32::MAX` (the most an NSO header's 32-bit size can declare), and an empty last
+    // raw block. `ruzstd` reserves the window, which is the content size, when it reads the
+    // header; the frame is then refused for being short. (The reservation is lazy on macOS and
+    // Linux; see "Memory" in the module docs.)
+    let declared = u32::MAX;
+    let mut frame = header_bytes(
+        MAGIC,
+        SINGLE_SEGMENT_FLAG | 2 << FCS_FLAG_SHIFT,
+        None,
+        &[],
+        &declared.to_le_bytes(),
+    );
+    frame.extend(raw_block(true, &[]));
+    assert_eq!(frame.len(), 12);
+    let size = usize::try_from(declared).unwrap();
+    assert_eq!(
+        decompress(&frame, size),
+        Err(ZbicError::TooShort {
+            expected: size,
+            actual: 0
+        })
+    );
 }
 
 #[test]
@@ -2045,6 +2083,106 @@ fn a_table_description_that_is_not_valid_is_refused_with_its_block_and_table() {
 }
 
 #[test]
+fn each_tables_limits_are_the_references() {
+    // Golden facts, restated on purpose: the tests at the limits take both sides of each edge
+    // from these functions, so a wrong value here would move both sides with it. Values from
+    // atmosphere/libraries/libstratosphere/source/util/zstd.inc @ 4e3f3703 (fact only):
+    // `#define MaxLL 35`, `MaxOff 31`, `MaxML 52`, `LLFSELog 9`, `OffFSELog 8`, `MLFSELog 9`,
+    // `FSE_MAX_SYMBOL_VALUE 255`, and the `6` that `HUF_readStats_body` passes to
+    // `FSE_decompress_wksp_bmi2` as the weights' largest accuracy log.
+    for (kind, max_symbol, max_accuracy_log) in [
+        (TableKind::HuffmanWeights, 255, 6),
+        (TableKind::LiteralLengths, 35, 9),
+        (TableKind::Offsets, 31, 8),
+        (TableKind::MatchLengths, 52, 9),
+    ] {
+        assert_eq!(kind.max_symbol(), max_symbol, "{kind}");
+        assert_eq!(kind.max_accuracy_log(), max_accuracy_log, "{kind}");
+    }
+}
+
+/// A frame of one compressed block whose sequences section describes `table` with
+/// `description`, the other two tables predefined, and one byte of bit stream after it.
+fn frame_with_sequence_table(table: TableKind, description: &[u8]) -> Vec<u8> {
+    let mut after = description.to_vec();
+    after.push(0x01);
+    let mut modes_byte = 0;
+    for (kind, shift) in TableKind::SEQUENCE_TABLES {
+        if kind == table {
+            modes_byte |= MODE_FSE << shift;
+        }
+    }
+    let body = sequences_block(&[1], modes_byte, &after);
+    windowed(&compressed_block(true, &body))
+}
+
+#[test]
+fn each_sequence_tables_limits_are_met_in_a_whole_frame() {
+    // The reference's limits, written out (`each_tables_limits_are_the_references`), so that a
+    // wrong limit fails here too: an offset table at log 9 is over `OffFSELog` 8, and the
+    // others at log 10 over 9.
+    for (table, log, limit) in [
+        (TableKind::LiteralLengths, 10, 9),
+        (TableKind::Offsets, 9, 8),
+        (TableKind::MatchLengths, 10, 9),
+    ] {
+        assert_eq!(
+            decompress(
+                &frame_with_sequence_table(table, &one_symbol_at_log(log)),
+                1
+            ),
+            Err(ZbicError::Table {
+                block: 0,
+                table,
+                source: TableError::AccuracyLog { log, limit }
+            }),
+            "{table}"
+        );
+        // At the limit the description is read; what follows is the decoder's business.
+        assert!(
+            !matches!(
+                decompress(
+                    &frame_with_sequence_table(table, &one_symbol_at_log(limit)),
+                    1
+                ),
+                Err(ZbicError::Table { .. })
+            ),
+            "{table}"
+        );
+    }
+    // Largest symbols: 36 is over `MaxLL` 35 and 32 over `MaxOff` 31. `MaxML` 52 is the most
+    // the digit's radix can say, so a match-length table cannot name a symbol over it.
+    for (table, max, limit) in [
+        (TableKind::LiteralLengths, 36, 35),
+        (TableKind::Offsets, 32, 31),
+    ] {
+        assert_eq!(
+            decompress(&frame_with_sequence_table(table, &one_symbol_up_to(max)), 1),
+            Err(ZbicError::Table {
+                block: 0,
+                table,
+                source: TableError::SymbolOutOfRange { max, limit }
+            }),
+            "{table}"
+        );
+    }
+    // At the limit the description is read. `one_symbol_up_to` writes largest symbols of 32 to
+    // 52 only, so the offset table is checked here just over its limit.
+    for (table, max) in [
+        (TableKind::LiteralLengths, 35),
+        (TableKind::MatchLengths, 52),
+    ] {
+        assert!(
+            !matches!(
+                decompress(&frame_with_sequence_table(table, &one_symbol_up_to(max)), 1),
+                Err(ZbicError::Table { .. })
+            ),
+            "{table}"
+        );
+    }
+}
+
+#[test]
 fn a_block_whose_contents_run_past_its_end_is_refused() {
     // Raw literals that claim more bytes than the block has.
     let body = plain_literals_header(LITERALS_RAW, 0, 9);
@@ -2104,11 +2242,7 @@ fn a_block_over_the_window_or_over_128_kib_is_refused() {
         ));
     }
     // A window of 1 MiB: the limit is then the largest block.
-    let frame = |blocks: &[u8]| {
-        let mut out = header_bytes(MAGIC, 0, Some(10 << WINDOW_MANTISSA_BITS), &[], &[]);
-        out.extend_from_slice(blocks);
-        out
-    };
+    let frame = wide;
     let most = vec![7; BLOCK_SIZE_MAX];
     assert_eq!(
         decompress(&frame(&raw_block(true, &most)), BLOCK_SIZE_MAX),
@@ -2135,6 +2269,102 @@ fn a_block_over_the_window_or_over_128_kib_is_refused() {
         decompress(&frame(&rle), BLOCK_SIZE_MAX + 1),
         Err(ZbicError::Zstd { block: 0, .. })
     ));
+}
+
+#[test]
+fn literals_over_the_largest_block_are_refused() {
+    // As the reference: `ZSTD_decodeLiteralsBlock` refuses raw, RLE and Huffman literals of
+    // more than `blockSizeMax`, the smaller of the window and 128 KiB, before it reads what
+    // follows their header. `ruzstd` alone decodes them when the block has no sequences.
+    let rle_literals = |size: usize| {
+        let mut body = plain_literals_header(LITERALS_RLE, 3, size);
+        body.push(7);
+        body.extend_from_slice(&NO_SEQUENCES);
+        body
+    };
+    let raw_literals = |size: usize| {
+        let mut body = plain_literals_header(LITERALS_RAW, 3, size);
+        body.extend(std::iter::repeat_n(7, size));
+        body.extend_from_slice(&NO_SEQUENCES);
+        body
+    };
+    let too_long = |size: usize, limit: usize| ZbicError::LiteralsTooLong {
+        block: 0,
+        size: u64::try_from(size).unwrap(),
+        limit: u64::try_from(limit).unwrap(),
+    };
+
+    // A window of 1 KiB: the limit is the window.
+    let kib = 1usize << WINDOW_LOG_MIN;
+    for literals in [rle_literals, raw_literals] {
+        assert_eq!(
+            decompress(&windowed(&compressed_block(true, &literals(kib))), kib),
+            Ok(vec![7; kib])
+        );
+        assert_eq!(
+            decompress(
+                &windowed(&compressed_block(true, &literals(kib + 1))),
+                kib + 1
+            ),
+            Err(too_long(kib + 1, kib))
+        );
+    }
+    // Huffman-coded literals are refused for their size before their tree is read: here the
+    // tree is not even there.
+    let huffman = huffman_block(
+        LITERALS_COMPRESSED,
+        2,
+        u64::try_from(kib + 1).unwrap(),
+        &[],
+        0,
+    );
+    assert_eq!(
+        decompress(&windowed(&compressed_block(true, &huffman)), kib + 1),
+        Err(too_long(kib + 1, kib))
+    );
+    // Both faults at once: raw literals over the limit that also run past the end of their
+    // block are refused for their size, as the reference checks it first.
+    let mut short = plain_literals_header(LITERALS_RAW, 3, kib + 1);
+    short.extend_from_slice(&NO_SEQUENCES);
+    let error = decompress(&windowed(&compressed_block(true, &short)), kib + 1).unwrap_err();
+    assert_eq!(error, too_long(kib + 1, kib));
+    assert_eq!(
+        error.to_string(),
+        "ZBIC block 0 regenerates 0x401 bytes of literals, more than its largest block of 0x400"
+    );
+
+    // A window of 1 MiB: the limit is 128 KiB.
+    let frame = wide;
+    assert_eq!(
+        decompress(
+            &frame(&compressed_block(true, &rle_literals(BLOCK_SIZE_MAX))),
+            BLOCK_SIZE_MAX
+        ),
+        Ok(vec![7; BLOCK_SIZE_MAX])
+    );
+    assert_eq!(
+        decompress(
+            &frame(&compressed_block(true, &rle_literals(BLOCK_SIZE_MAX + 1))),
+            BLOCK_SIZE_MAX + 1
+        ),
+        Err(too_long(BLOCK_SIZE_MAX + 1, BLOCK_SIZE_MAX))
+    );
+    // A single-segment frame's window is its content size.
+    let single = |size: usize| {
+        let mut out = header_bytes(
+            MAGIC,
+            SINGLE_SEGMENT_FLAG,
+            None,
+            &[],
+            &[u8::try_from(size).unwrap()],
+        );
+        out.extend(compressed_block(true, &rle_literals(size + 1)));
+        out
+    };
+    assert_eq!(
+        decompress(&single(HELLO.len()), HELLO.len()),
+        Err(too_long(HELLO.len() + 1, HELLO.len()))
+    );
 }
 
 #[test]
@@ -2226,7 +2456,8 @@ fn a_rewritten_block_over_a_zstd_limit_is_refused() {
         Err(ZbicError::Zstd { block: 0, .. })
     ));
 
-    // A block of at most 128 KiB: raw literals, then a literal-length table.
+    // A block of at most 128 KiB: raw literals, then a literal-length table, in a window wide
+    // enough that the literals are not over the largest block.
     let (bic, zstd) = mostly_less_than_one(
         TableKind::LiteralLengths.max_accuracy_log(),
         usize::try_from(TableKind::LiteralLengths.max_symbol()).unwrap() + 1,
@@ -2243,7 +2474,7 @@ fn a_rewritten_block_over_a_zstd_limit_is_refused() {
         body.resize(header_len + literals, 0x61);
         body.extend_from_slice(&tail);
         assert_eq!(body.len(), len);
-        decompress(&windowed(&compressed_block(true, &body)), literals)
+        decompress(&wide(&compressed_block(true, &body)), literals)
     };
     let error = block_of(BLOCK_SIZE_MAX - growth + 1).unwrap_err();
     assert_eq!(
