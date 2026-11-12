@@ -586,26 +586,15 @@ fn drive<V: Vcpu, C: HostClock + Clone + 'static>(
             }
             Exit::DataAbort { address, write, .. } => {
                 let access = if write { Access::Write } else { Access::Read };
-                match space.touch(address, access) {
-                    // The page only lacked backing: the guest retries the access.
-                    Touch::Backed => {}
-                    Touch::Refused => {
-                        let exception = Exception::DataAbort { address, write };
-                        return fatal_fault(vcpu, session, address, write, exception);
-                    }
-                    Touch::Failed(error) => return unbacked(address, &error),
+                if let Some(ending) = aborted(vcpu, space, session, address, access) {
+                    return ending;
                 }
             }
-            Exit::InstructionAbort { address, .. } => match space.touch(address, Access::Execute) {
-                Touch::Backed => {}
-                Touch::Refused => {
-                    // The event stream has one kind of fault; a fetch is recorded as a read,
-                    // as it was when the backend reported fetch faults as data aborts.
-                    let exception = Exception::InstructionAbort { address };
-                    return fatal_fault(vcpu, session, address, false, exception);
+            Exit::InstructionAbort { address, .. } => {
+                if let Some(ending) = aborted(vcpu, space, session, address, Access::Execute) {
+                    return ending;
                 }
-                Touch::Failed(error) => return unbacked(address, &error),
-            },
+            }
             Exit::Undefined { .. } => return crashed(vcpu, Exception::UndefinedInstruction),
             Exit::Interrupted => {
                 if watchdog.fired() {
@@ -614,6 +603,43 @@ fn drive<V: Vcpu, C: HostClock + Clone + 'static>(
                 // Nothing else interrupts the vCPU yet; resume.
             }
         }
+    }
+}
+
+/// What an abort on an `access` to `address` comes to: `None` when the page only lacked backing
+/// and now has it, so the guest retries the access; otherwise how the run ends.
+fn aborted<V: Vcpu, C: HostClock + Clone>(
+    vcpu: &V,
+    space: &dyn GuestSpace<V>,
+    session: &Session<'_, C>,
+    address: u64,
+    access: Access,
+) -> Option<Ending> {
+    match space.touch(address, access) {
+        Touch::Backed => None,
+        Touch::Refused => {
+            // The event stream has one kind of fault; a fetch is recorded as a read, as it
+            // was when the backend reported fetch faults as data aborts.
+            let (exception, write) = match access {
+                Access::Execute => (Exception::InstructionAbort { address }, false),
+                Access::Write => (
+                    Exception::DataAbort {
+                        address,
+                        write: true,
+                    },
+                    true,
+                ),
+                Access::Read => (
+                    Exception::DataAbort {
+                        address,
+                        write: false,
+                    },
+                    false,
+                ),
+            };
+            Some(fatal_fault(vcpu, session, address, write, exception))
+        }
+        Touch::Failed(error) => Some(unbacked(address, &error)),
     }
 }
 

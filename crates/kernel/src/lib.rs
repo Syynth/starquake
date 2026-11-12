@@ -1,8 +1,9 @@
 //! HLE Horizon kernel.
 //!
 //! Guest threads and their scheduling onto vCPUs, SVC dispatch, handles and kernel objects,
-//! synchronisation (`WaitForAddress`/`SignalToAddress` are hot: ~1,400 per frame), memory
-//! regions, and `svcGetInfo` including the Switch 2 ids 29-33.
+//! synchronisation (`WaitForAddress`/`SignalToAddress` are hot: ~1,400 per frame), a process's
+//! address space ([`memory`]), and `svcGetInfo` (its memory ids so far; the Switch 2 ids 29-33
+//! are to come).
 //!
 //! Structure (`docs/specs/kernel.md`): kernel state lives in a few tables, objects refer to each
 //! other by typed ids, system calls declare the tables they touch, and only the dispatcher locks.

@@ -358,12 +358,11 @@ impl<M: GuestMemory> AddressSpace<M> {
     fn resolve(shadow: &Shadow, va: u64) -> Option<(Piece, u64)> {
         let page = page_of(va);
         let offset = va - page;
-        let piece = match shadow.backed.get(&page) {
-            Some(pa) => Piece::Backed(pa + offset),
-            None => {
-                shadow.mapping(page)?;
-                Piece::Unbacked
-            }
+        let piece = if let Some(pa) = shadow.backed.get(&page) {
+            Piece::Backed(pa + offset)
+        } else {
+            shadow.mapping(page)?;
+            Piece::Unbacked
         };
         Some((piece, PAGE_SIZE - offset))
     }

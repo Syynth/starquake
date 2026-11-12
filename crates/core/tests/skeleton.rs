@@ -739,7 +739,7 @@ fn a_program_larger_than_an_application_may_be_is_an_emulator_error() {
 mod memory_calls {
     use starquake_testkit::a64::Assembler;
 
-    use super::permissions::{Offsets, build, code_offset, distance};
+    use super::permissions::{Offsets, build, distance};
     use super::*;
 
     /// The value the programs store and compare.
@@ -777,7 +777,7 @@ mod memory_calls {
     /// fail: brk  #1
     /// ```
     pub(crate) fn reprotects_its_data(permission: u32) -> (Vec<u8>, Offsets, usize) {
-        let mut second_store = 0;
+        let second_store = std::cell::Cell::new(0);
         let (file, offsets) = build(|at| {
             let mut asm = Assembler::new();
             let fail = asm.label();
@@ -793,23 +793,14 @@ mod memory_calls {
             asm.emit(a64::movz(5, VALUE, 0).unwrap());
             asm.emit(a64::sub(4, 3, 5).unwrap());
             asm.cbnz(4, fail).unwrap();
+            second_store.set(asm.len());
             asm.emit(a64::str(5, 9, 0).unwrap());
             asm.emit(svc(SvcId::ExitProcess));
             asm.bind(fail).unwrap();
             asm.emit(a64::brk(1).unwrap());
             asm.finish().unwrap()
         });
-        // The layout does not depend on the instructions, so the index is the same in the
-        // placeholder pass and the real one.
-        let words = usize::try_from(code_offset(0)).unwrap();
-        let store = a64::str(5, 9, 0).unwrap().to_le_bytes();
-        for (index, word) in file[words..].chunks_exact(4).enumerate() {
-            if word == store {
-                second_store = index;
-                break;
-            }
-        }
-        (file, offsets, second_store)
+        (file, offsets, second_store.get())
     }
 
     /// What a heap program does once its heap works.

@@ -3,6 +3,8 @@
 
 use std::cell::Cell;
 use std::rc::Rc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use starquake_cpu::testing::ScriptedVcpu;
@@ -23,6 +25,7 @@ use crate::clock::PROCESS_COUNTER_RATE;
 use crate::crash::Location;
 use crate::image::{Loaded, Program, load};
 use crate::report::{empty_dump, exit_code};
+use crate::space::SpaceError;
 
 /// Where a real run puts the program, and where the tests' flat memory starts.
 const RAM_BASE: u64 = crate::image::IMAGE_BASE;
@@ -822,4 +825,305 @@ fn a_flight_recorder_that_cannot_be_written_out_is_reported_however_the_run_ende
     );
     // The file is still a readable dump, with nothing in it.
     assert_eq!(Dump::from_bytes(&empty_dump()), Ok(Dump::new(Vec::new())));
+}
+
+// ----- The guest's address space: lazy backing and settling ----------------------------------------
+
+/// A guest address space for the loop's own tests: flat memory, a script of what each touch
+/// comes to, and a record of what the loop asked of it.
+struct ScriptedSpace<'a> {
+    memory: &'a FlatMemory,
+    /// What the touches come to, in order; when the script runs out, a touch is refused.
+    script: Mutex<std::vec::IntoIter<Touch>>,
+    /// Every touch the loop made.
+    touched: Mutex<Vec<(u64, Access)>>,
+    /// How many times the loop settled the address space.
+    settled: Arc<AtomicUsize>,
+    /// The settle (from zero) that fails, if any.
+    failing_settle: Option<usize>,
+}
+
+impl<'a> ScriptedSpace<'a> {
+    fn new(memory: &'a FlatMemory, script: Vec<Touch>) -> Self {
+        Self {
+            memory,
+            script: Mutex::new(script.into_iter()),
+            touched: Mutex::new(Vec::new()),
+            settled: Arc::new(AtomicUsize::new(0)),
+            failing_settle: None,
+        }
+    }
+
+    fn touched(&self) -> Vec<(u64, Access)> {
+        self.touched
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl GuestMemory for ScriptedSpace<'_> {
+    fn read(&self, va: u64, buf: &mut [u8]) -> Result<(), Fault> {
+        self.memory.read(va, buf)
+    }
+
+    fn write(&self, va: u64, data: &[u8]) -> Result<(), Fault> {
+        self.memory.write(va, data)
+    }
+}
+
+impl<V> GuestSpace<V> for ScriptedSpace<'_> {
+    fn touch(&self, address: u64, access: Access) -> Touch {
+        self.touched
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((address, access));
+        self.script
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .next()
+            .unwrap_or(Touch::Refused)
+    }
+
+    fn settle(&self, _: &mut V) -> Result<(), starquake_cpu::Error> {
+        let call = self.settled.fetch_add(1, Ordering::SeqCst);
+        if self.failing_settle == Some(call) {
+            return Err(starquake_cpu::Error::Host("the flush did not run".into()));
+        }
+        Ok(())
+    }
+}
+
+/// The syndrome a real vCPU reports for a fetch from an address nothing maps yet.
+const UNMAPPED_FETCH: Syndrome = Syndrome::instruction_abort(FaultStatus::Translation { level: 3 });
+
+#[test]
+fn a_fault_on_a_page_that_only_lacked_backing_resumes_the_guest_and_is_not_an_event() {
+    let guest = Guest::new(&programs::hello().unwrap());
+    let stack = guest.start_of("stack");
+    let text = guest.start_of("main.text");
+    let space = ScriptedSpace::new(
+        &guest.memory,
+        vec![Touch::Backed, Touch::Backed, Touch::Backed],
+    );
+    // A store, a load and a fetch that each fault once; the guest then goes on to exit.
+    let vcpu = ScriptedVcpu::new()
+        .then(
+            |_| {},
+            Exit::DataAbort {
+                address: stack + 0x18,
+                write: true,
+                syndrome: UNMAPPED_STORE,
+            },
+        )
+        .then(
+            |_| {},
+            Exit::DataAbort {
+                address: stack + 0x1000,
+                write: false,
+                syndrome: Syndrome::data_abort(FaultStatus::Translation { level: 3 }, false),
+            },
+        )
+        .then(
+            |_| {},
+            Exit::InstructionAbort {
+                address: text + 0x40,
+                syndrome: UNMAPPED_FETCH,
+            },
+        )
+        .then(|_| {}, svc(SvcId::ExitProcess));
+    let mut vcpu = vcpu;
+    let report = run(
+        &mut vcpu,
+        guest.program(&space),
+        &RunOptions::default(),
+        Instant::now(),
+        timebase(),
+    );
+    assert_eq!(report.exit, ExitReason::ProcessExited);
+    // The loop asked about each access as it was: the address that faulted, and its kind.
+    assert_eq!(
+        space.touched(),
+        [
+            (stack + 0x18, Access::Write),
+            (stack + 0x1000, Access::Read),
+            (text + 0x40, Access::Execute),
+        ]
+    );
+    // Backing a page is not an event: the stream holds the start, the exit call and the exit.
+    assert_eq!(
+        recorded(&report),
+        [
+            lifecycle(LifecyclePhase::ProcessStart),
+            EventKind::Svc {
+                id: u32::from(SvcId::ExitProcess.number()),
+                args: [0; starquake_trace::SVC_ARG_COUNT],
+                result: starquake_trace::ResultCode(0),
+            },
+            lifecycle(LifecyclePhase::ProcessExit),
+        ]
+    );
+}
+
+#[test]
+fn a_fault_the_address_space_refuses_after_one_it_backed_is_still_a_crash() {
+    let guest = Guest::new(&programs::hello().unwrap());
+    let stack = guest.start_of("stack");
+    // The first touch is backed, the second (the script has run out) refused.
+    let space = ScriptedSpace::new(&guest.memory, vec![Touch::Backed]);
+    let abort = |address| Exit::DataAbort {
+        address,
+        write: true,
+        syndrome: UNMAPPED_STORE,
+    };
+    let mut vcpu = ScriptedVcpu::new()
+        .then(|_| {}, abort(stack))
+        .then(|_| {}, abort(stack - 8));
+    let report = run(
+        &mut vcpu,
+        guest.program(&space),
+        &RunOptions::default(),
+        Instant::now(),
+        timebase(),
+    );
+    assert_eq!(report.exit_code(), exit_code::GUEST_CRASHED);
+    assert_eq!(
+        report.crash().unwrap().exception,
+        Exception::DataAbort {
+            address: stack - 8,
+            write: true
+        }
+    );
+    // Only the fault that ended the run is an event.
+    let faults: Vec<EventKind> = recorded(&report)
+        .into_iter()
+        .filter(|kind| matches!(kind, EventKind::Fault { .. }))
+        .collect();
+    assert_eq!(
+        faults,
+        [EventKind::Fault {
+            address: stack - 8,
+            write: true,
+            action: FaultAction::Fatal,
+        }]
+    );
+}
+
+#[test]
+fn a_page_that_cannot_be_backed_is_an_emulator_error_not_a_crash() {
+    let out_of_ram = SpaceError::OutOfRam {
+        size: 0x1000,
+        available: 0,
+    };
+    for fetch in [false, true] {
+        let guest = Guest::new(&programs::hello().unwrap());
+        let address = guest.start_of("stack") + 0x2000;
+        let space = ScriptedSpace::new(&guest.memory, vec![Touch::Failed(out_of_ram)]);
+        let exit = if fetch {
+            Exit::InstructionAbort {
+                address,
+                syndrome: UNMAPPED_FETCH,
+            }
+        } else {
+            Exit::DataAbort {
+                address,
+                write: true,
+                syndrome: UNMAPPED_STORE,
+            }
+        };
+        let mut vcpu = ScriptedVcpu::new().then(|_| {}, exit);
+        let report = run(
+            &mut vcpu,
+            guest.program(&space),
+            &RunOptions::default(),
+            Instant::now(),
+            timebase(),
+        );
+        assert_eq!(
+            report.exit,
+            ExitReason::EmulatorError(format!(
+                "guest memory at {address:#x} could not be backed: mapping 0x1000 bytes needs \
+                 more guest RAM than the 0x0 bytes left"
+            )),
+            "fetch: {fetch}"
+        );
+        assert_eq!(report.exit_code(), exit_code::EMULATOR_ERROR);
+        assert!(report.crash().is_none());
+    }
+}
+
+#[test]
+fn the_address_space_is_settled_after_every_system_call_before_the_guest_runs_again() {
+    let guest = Guest::new(&programs::hello().unwrap());
+    let space = ScriptedSpace::new(&guest.memory, Vec::new());
+    let settled = Arc::clone(&space.settled);
+    // Each closure is the guest running again: by then the call before it has been settled,
+    // whatever it returned (a result, "not implemented", an error result).
+    let expect = move |calls: usize| {
+        let settled = Arc::clone(&settled);
+        move |_: &mut GuestRegs| assert_eq!(settled.load(Ordering::SeqCst), calls)
+    };
+    let mut vcpu = ScriptedVcpu::new()
+        .then(expect(0), svc(SvcId::GetSystemTick))
+        .then(expect(1), svc(SvcId::Break))
+        .then(expect(2), svc(SvcId::CloseHandle))
+        .then(expect(3), svc(SvcId::ExitProcess));
+    let report = run(
+        &mut vcpu,
+        guest.program(&space),
+        &RunOptions::default(),
+        Instant::now(),
+        timebase(),
+    );
+    assert_eq!(report.exit, ExitReason::ProcessExited);
+    assert_eq!(space.settled.load(Ordering::SeqCst), 4);
+    // A fault settles nothing: only a system call changes mappings.
+    assert_eq!(space.touched(), []);
+}
+
+#[test]
+fn a_settle_that_fails_ends_the_run_as_an_emulator_error() {
+    let guest = Guest::new(&programs::hello().unwrap());
+    let mut space = ScriptedSpace::new(&guest.memory, Vec::new());
+    space.failing_settle = Some(1);
+    let reached = Rc::new(Cell::new(0));
+    let count = |reached: &Rc<Cell<u32>>| {
+        let reached = Rc::clone(reached);
+        move |_: &mut GuestRegs| reached.set(reached.get() + 1)
+    };
+    let mut vcpu = ScriptedVcpu::new()
+        .then(count(&reached), svc(SvcId::GetSystemTick))
+        .then(count(&reached), svc(SvcId::GetSystemTick))
+        .then(count(&reached), svc(SvcId::ExitProcess));
+    let report = run(
+        &mut vcpu,
+        guest.program(&space),
+        &RunOptions::default(),
+        Instant::now(),
+        timebase(),
+    );
+    assert_eq!(
+        report.exit,
+        ExitReason::EmulatorError("the vCPU failed: host API error: the flush did not run".into())
+    );
+    // The guest did not run again after the call whose flush failed.
+    assert_eq!(reached.get(), 2);
+}
+
+#[test]
+fn the_main_threads_handle_names_a_thread_with_the_default_priority() {
+    let guest = Guest::new(&programs::hello().unwrap());
+    // `GetThreadPriority` takes its handle in x1, which is where the loop put the main
+    // thread's: the guest passes it back untouched.
+    let vcpu = ScriptedVcpu::new()
+        .then(|_| {}, svc(SvcId::GetThreadPriority))
+        .then(
+            |regs| {
+                assert_eq!((regs.x[0], regs.x[1]), (0, u64::from(MAIN_THREAD_PRIORITY)));
+            },
+            svc(SvcId::ExitProcess),
+        );
+    let report = guest.run(vcpu, &RunOptions::default());
+    assert_eq!(report.exit, ExitReason::ProcessExited);
+    assert!(report.stubbed.is_empty(), "{:?}", report.stubbed);
 }

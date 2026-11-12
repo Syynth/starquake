@@ -1,6 +1,4 @@
 //! Shared by this crate's guest-program tests: running an NRO on the hypervisor backend.
-//!
-//! Included with `#[cfg(test)] mod common;`, so that it may unwrap like the tests do.
 
 use std::time::Duration;
 
@@ -20,5 +18,8 @@ pub fn run(file: &[u8], timeout: Duration) -> Option<RunReport> {
         timeout: Some(timeout),
         command_line: Vec::new(),
     };
-    Some(System::new(file).expect("load the program").run(&options))
+    match System::new(file) {
+        Ok(system) => Some(system.run(&options)),
+        Err(error) => unreachable!("the test program does not load: {error}"),
+    }
 }

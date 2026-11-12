@@ -375,9 +375,9 @@ pub(crate) fn place(
         .checked_sub(trampolines_len)
         .ok_or(LoadError::Overflow)?;
     if trampolines_len != 0 {
-        let counted = patched.trampolines.len();
+        let first_len = patched.trampolines.len();
         (image, patched) = patch(program, base, trampolines_at, counter)?;
-        if patched.trampolines.len() != counted {
+        if patched.trampolines.len() != first_len {
             return Err(LoadError::Overflow);
         }
     }
@@ -1023,7 +1023,7 @@ mod tests {
                 address_space,
             },
             memory,
-            calls,
+            _,
         ) = loaded(&file, None);
         let regions = *address_space.regions();
         // Four free pages, then the mapping (`KPageTableBase::GetNumGuardPages`).
@@ -1105,8 +1105,19 @@ mod tests {
             MEMORY_ARRANGEMENT.application_pool_size()
         );
 
-        // What the translation was asked, in Eden's order: the code with no guest access, the
-        // three segments reprotected, the stack, the thread-local page.
+        // The image is in guest memory.
+        let mut read = vec![0; file.len()];
+        memory.read(BASE, &mut read).unwrap();
+        assert_eq!(read, file);
+    }
+
+    #[test]
+    fn loading_asks_the_translation_for_each_mapping_in_edens_order() {
+        let (Loaded { placed, .. }, _, calls) = loaded(&three_segments(), None);
+        let stack_bottom = placed.stack_top - STACK_SIZE;
+        let tls = placed.tls;
+        // The code with no guest access, the three segments reprotected, the stack, the
+        // thread-local page.
         let map = |address, size, perms| MapperCall::Map {
             address,
             size,
@@ -1128,10 +1139,6 @@ mod tests {
                 map(tls, TLS_SIZE, Perms::ReadWrite),
             ]
         );
-        // The image is in guest memory.
-        let mut read = vec![0; file.len()];
-        memory.read(BASE, &mut read).unwrap();
-        assert_eq!(read, file);
     }
 
     #[test]

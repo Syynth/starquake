@@ -36,21 +36,26 @@ fn ram_bytes<const N: usize>(space: &AddressSpace<FlatMemory>, n: u64, offset: u
     bytes
 }
 
-/// What the table walker (and so guest code) finds at `va`: RAM page `n` with `perms`.
-fn page(n: u64, perms: Perms) -> Result<Resolved, WalkError> {
-    Ok(Resolved {
+/// What the table walker (and so guest code) finds at a backed page: RAM page `n` with
+/// `perms`.
+fn page(n: u64, perms: Perms) -> Resolved {
+    Resolved {
         pa: RAM_BASE + n * PAGE_SIZE,
         perms,
         level: 3,
-    })
+    }
 }
 
 fn unmapped_at(space: &AddressSpace<FlatMemory>, va: u64) -> bool {
     matches!(space.tables.walk(va), Err(WalkError::Unmapped { .. }))
 }
 
+/// What [`snapshot`] takes: the next page of RAM, the mappings, the backed pages, and how
+/// many table pages are in use.
+type Snapshot = (u64, Vec<(u64, Mapped)>, Vec<(u64, u64)>, u64);
+
 /// Everything the tests can see of an address space, for "nothing changed".
-fn snapshot(space: &AddressSpace<FlatMemory>) -> (u64, Vec<(u64, Mapped)>, Vec<(u64, u64)>, u64) {
+fn snapshot(space: &AddressSpace<FlatMemory>) -> Snapshot {
     let shadow = space.shadow();
     (
         shadow.next,
@@ -150,9 +155,9 @@ fn a_mapping_has_no_table_entry_and_no_ram_until_it_is_touched() {
     assert_eq!(space.touch(FAR + 0xfff, Access::Read), Touch::Backed);
     assert_eq!(space.touch(LOW, Access::Read), Touch::Backed);
     let walked = |va: u64| space.tables.walk(va);
-    assert_eq!(walked(LOW + PAGE_SIZE), page(0, Perms::ReadWrite));
-    assert_eq!(walked(FAR), page(1, Perms::Read));
-    assert_eq!(walked(LOW), page(2, Perms::ReadWrite));
+    assert_eq!(walked(LOW + PAGE_SIZE), Ok(page(0, Perms::ReadWrite)));
+    assert_eq!(walked(FAR), Ok(page(1, Perms::Read)));
+    assert_eq!(walked(LOW), Ok(page(2, Perms::ReadWrite)));
     assert!(space.tables.table_pages_in_use() > tables_before);
     // The page between the neighbours and the far region is not mapped.
     assert_eq!(
@@ -361,8 +366,8 @@ fn protect_changes_backed_pages_at_once_and_unbacked_ones_when_they_are_touched(
         Ok(())
     );
     let walked = |va: u64| space.tables.walk(va);
-    assert_eq!(walked(LOW), page(0, Perms::ReadWrite));
-    assert_eq!(walked(LOW + 2 * PAGE_SIZE), page(1, Perms::Read));
+    assert_eq!(walked(LOW), Ok(page(0, Perms::ReadWrite)));
+    assert_eq!(walked(LOW + 2 * PAGE_SIZE), Ok(page(1, Perms::Read)));
     // Only the backed page had a table entry to change, so only it is owed a flush.
     assert_eq!(
         space.tables().take_pending_flushes(),
@@ -380,7 +385,7 @@ fn protect_changes_backed_pages_at_once_and_unbacked_ones_when_they_are_touched(
         Touch::Refused
     );
     assert_eq!(space.touch(LOW + PAGE_SIZE, Access::Read), Touch::Backed);
-    assert_eq!(walked(LOW + PAGE_SIZE), page(2, Perms::Read));
+    assert_eq!(walked(LOW + PAGE_SIZE), Ok(page(2, Perms::Read)));
     // The first page kept its permission: a store there is still not for want of backing.
     assert_eq!(
         space.shadow().mapping(LOW).unwrap().1.perms,
@@ -391,7 +396,7 @@ fn protect_changes_backed_pages_at_once_and_unbacked_ones_when_they_are_touched(
     // run): what the pages hold is kept.
     space.write(LOW + PAGE_SIZE, b"kept").unwrap();
     assert_eq!(space.protect(LOW, 4 * PAGE_SIZE, Perms::ReadWrite), Ok(()));
-    assert_eq!(walked(LOW + PAGE_SIZE), page(2, Perms::ReadWrite));
+    assert_eq!(walked(LOW + PAGE_SIZE), Ok(page(2, Perms::ReadWrite)));
     assert_eq!(&ram_bytes::<4>(&space, 2, 0), b"kept");
     assert_eq!(
         space.touch(LOW + 3 * PAGE_SIZE, Access::Write),
@@ -407,7 +412,7 @@ fn unmap_removes_table_entries_and_a_new_mapping_there_reads_as_zero() {
     space.write(LOW + 3 * PAGE_SIZE, b"stay").unwrap();
     assert_eq!(
         space.tables.walk(LOW + PAGE_SIZE),
-        page(0, Perms::ReadWrite)
+        Ok(page(0, Perms::ReadWrite))
     );
     // The middle two pages go: one backed, one not.
     assert_eq!(space.unmap(LOW + PAGE_SIZE, 2 * PAGE_SIZE), Ok(()));
@@ -502,8 +507,8 @@ fn host_access_goes_through_the_shadow_whatever_the_guest_may_do() {
     space.read(across, &mut back).unwrap();
     assert_eq!(&back, b"abcdefgh");
     // The pages the host wrote are backed with their mappings' permissions, for the guest.
-    assert_eq!(space.tables.walk(LOW), page(1, Perms::ReadExecute));
-    assert_eq!(space.tables.walk(LOW + PAGE_SIZE), page(0, Perms::None));
+    assert_eq!(space.tables.walk(LOW), Ok(page(1, Perms::ReadExecute)));
+    assert_eq!(space.tables.walk(LOW + PAGE_SIZE), Ok(page(0, Perms::None)));
     // A virtual address is not a physical one: the same bytes are not at the virtual address
     // in the physical memory (which does not even reach that far).
     assert!(space.tables.memory().read(across, &mut back).is_err());
@@ -591,7 +596,7 @@ fn the_kernels_mapper_drives_the_address_space_and_reports_refusals_in_words() {
     assert_eq!(mapper.map(LOW, 2 * PAGE_SIZE, Perms::ReadWrite), Ok(()));
     assert_eq!(space.touch(LOW, Access::Write), Touch::Backed);
     assert_eq!(mapper.protect(LOW, PAGE_SIZE, Perms::Read), Ok(()));
-    assert_eq!(space.tables.walk(LOW), page(0, Perms::Read));
+    assert_eq!(space.tables.walk(LOW), Ok(page(0, Perms::Read)));
     assert_eq!(mapper.unmap(LOW, 2 * PAGE_SIZE), Ok(()));
     assert!(unmapped_at(&space, LOW));
     assert!(space.shadow().mapped.is_empty());
