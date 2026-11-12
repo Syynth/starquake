@@ -57,7 +57,11 @@ impl SetSys {
   service's.
 - **`Context`** gives the service what it may touch: guest memory (copy in and out only), a
   narrow kernel interface (create and signal events, shared memory), the clock, and `defer()`,
-  which returns a reply token.
+  which returns a reply token. For the graphics server the kernel interface also offers: a hook
+  on events the service created, run after the kernel lock is released; the address-space
+  queries (whether a range has the GPU-accessible attribute that `svc 0x80` sets); the
+  device-share lock and unlock over a range; and transfer memory (kernel spec, "Waiting and
+  waking" and "Address space"). (Approved by the owner, 2026-11-12.)
 - Payload layouts are read and written field by field with explicit alignment, citing the
   reference. No transmuting structs: guest data is untrusted, and `unsafe` is denied here.
 
@@ -115,6 +119,10 @@ difference:
   command, so a title's service list can be discovered in one run; under strict it is an error.
 - Access control from the NPDM (which names the title may open) is logged at first, like
   kernel capabilities.
+- **Entries reachable only from other services.** A service can register a private name that
+  `sm:` never hands to a title; another service opens it through the same registry. The first is
+  the graphics server's root, which `am`'s `ISelfController` 2000 returns to the title as a
+  session (`graphics-server.md`, "The root"). (Approved by the owner, 2026-11-12.)
 
 ## Real system modules and guest-hosted services
 

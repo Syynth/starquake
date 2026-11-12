@@ -136,6 +136,13 @@ runnable; if that thread should now run on a core that is executing guest code, 
 interrupts that core. Timeouts are entries in the timer heap carrying the thread's generation, so
 a late timer for a thread that was already woken is ignored.
 
+**A hook on service-created events.** A service may attach a hook to an event it created. When
+the guest signals that event, the kernel runs the hook after it has released the kernel lock,
+never under it. The hook may only queue work for the service (the graphics server queues a
+refresh of the shared syncpoint page); it never calls back into the kernel synchronously. Until
+the hook exists, the graphics server answers on its 1 ms bound alone (`graphics-server.md`, "The
+shared syncpoint page"). (Approved by the owner, 2026-11-12.)
+
 ### Scheduler
 
 Ported decision for decision from Eden's `k_priority_queue.h` and `k_scheduler.cpp`:
@@ -160,7 +167,21 @@ hardware part:
   the execution model's `Translation` trait to make the change real.
 - Pool accounting (application, applet, system, non-secure system) for the 12 GB layout. What
   `GetInfo` reports must match what was actually reserved, including memory the graphics server
-  takes (rows 37, 75–80).
+  takes (rows 37, 75–80). GPU-only memory (the graphics server's sparse regions) is never charged
+  to a title's pools: the GPU crate backs it on the host, outside the guest's memory
+  (`graphics-server.md`, "GPU-only memory"). This is revisited if a trace shows the console
+  charges it to the title's remote memory. (Approved by the owner, 2026-11-12.)
+- **Two calls for the graphics server** (`graphics-server.md`, "The model"), reached through
+  the service framework's `Context` and locked by the dispatcher like a system call:
+  - a range query of the GPU-accessible attribute that `svc 0x80` (`SetGpuMemoryAttribute`)
+    sets: whether every page of a range has it, so gsv can refuse a registration of memory the
+    title has not marked;
+  - a **device-share lock** and unlock over a range: the lock raises the device share count of
+    every memory block in the range (rule 4), which Horizon's memory operations check, so the
+    CPU mapping under memory the GPU may use cannot change. gsv releases the lock only once the
+    GPU is past the work that could still use it.
+
+  (Approved by the owner, 2026-11-12.)
 
 Region placement is **deterministic by default** (no randomisation) so traces and crash addresses
 reproduce; a seed can turn randomisation on.
@@ -225,7 +246,7 @@ deferred and not planned.
 
 `GetInfo` ids 29–33, `svc 0x80`, six application cores, the larger heap and alias regions, and
 the 12 GB layout (scoping doc, "Process, memory, kernel"). Each lands with the port slice it
-belongs to, citing its row.
+belongs to, citing its row. `svc 0x80` comes with the GPU-accessible attribute query above.
 
 ### Recording and replay
 
@@ -261,6 +282,16 @@ design is revisited before slices 4–10 depend on it.
 Later slices: shared and transfer memory, `MapPhysicalMemory`, resource limits, thread activity
 and context, code memory. Deferred until something needs them: the server-side calls, guest
 process creation, and IPC buffer mapping.
+
+Later slices the graphics specs need (approved by the owner, 2026-11-12):
+
+- `svc 0x80` and the range query of the GPU-accessible attribute, and the device-share lock and
+  unlock (after slices 6 and 7; needed by graphics-server slice 7);
+- the hook on service-created events (after slice 4; graphics-server slice 5 works without it,
+  on its 1 ms bound);
+- the kernel half of `WriteWatch`: applying protection requests from the GPU's back thread at
+  the next kernel entry, recording write faults on watched pages as dirty, and restoring access
+  (`execution-model.md`, "Write tracking for the GPU caches"; after slice 6).
 
 ## Decisions
 

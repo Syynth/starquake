@@ -233,3 +233,107 @@ Entry format:
 - **WHAT:** The owner's direction after the Fable allowance ran out: where a PR was to get a Fable fidelity review, it gets two Opus reviews instead (the fidelity review and the test-breaking review, both on Opus). Builds and fixes stay on Opus. This amends "Fable is used sparingly", which kept Fable for the fidelity review of foundation PRs.
 - **WHY:** The week's Fable allowance is spent. Two independent Opus reviews keep the second, differently-aimed read of every change, which is what the review process relies on.
 
+## The render backend starts on wgpu, behind our own trait
+- **WHEN:** 2026-11-12
+- **PROJECT:** starquake
+- **SYSTEM:** render
+- **SCOPE:** architectural
+- **WHAT:** The first host graphics backend is wgpu, behind starquake's own backend trait and plain-data command lists; no wgpu type crosses into the GPU crate. A direct Vulkan backend is added when Linux work or a title needs a stage wgpu lacks (geometry, tessellation, transform feedback). A native Metal backend is written only if measurements at the performance milestone call for it. The draft's recommendation (Vulkan through ash, with MoltenVK on the Mac) was not taken.
+- **WHY:** The owner knows wgpu and will read and debug this code. It runs natively on Metal on the development Mac with nothing to install and no translation layer, it is safe pure Rust, and it takes the translated shaders directly, so first frames come sooner. Its gaps (checked against wgpu 30.0.1) bite after first frames, except texture channel remapping, which becomes shader variants. Keeping the trait ours means the choice can be revisited.
+
+## Translated shaders reach the backend as a naga module; naga is the only shader backend for now
+- **WHEN:** 2026-11-12
+- **PROJECT:** starquake
+- **SYSTEM:** shader, render
+- **SCOPE:** architectural
+- **WHAT:** The shader crate's output is a validated naga module plus tables describing its resources, inputs and outputs. The wgpu backend takes the module directly. A later direct backend asks the shader crate for final Vulkan or Metal code instead, which the shader crate emits; the backend says which form it wants. The shader and render crates do not depend on each other: the GPU crate carries the module across, and all three use the naga version wgpu uses. naga is the only shader backend at first; the project's own intermediate form stays independent of naga so a direct code writer can be added later. Game memory addresses stop at the GPU crate, and wgpu types stop at the wgpu backend crate.
+- **WHY:** wgpu is built on naga and accepts a module on its safe, supported path, so emitting final code now would add plumbing for a route wgpu does not need and would bypass its checks. naga cannot express geometry or tessellation stages, but wgpu cannot run them either, so nothing is lost by starting naga-only. Keeping emission in the shader crate for direct backends keeps naga's breaking changes in one place.
+
+## The game sees GPU work as done only when the host GPU has finished it
+- **WHEN:** 2026-11-12
+- **PROJECT:** starquake
+- **SYSTEM:** gpu
+- **SCOPE:** architectural
+- **WHAT:** A semaphore release or syncpoint increment becomes visible to the game once the host GPU has actually finished the work before it, not when the work is recorded. Signals with no host work behind them are written at once, and several are batched into one completion check. Signalling at record time is kept only as a debugging switch. The graphics server draft's assumption that increments happen at record time is dropped.
+- **WHY:** An early signal lets the game read back an image or a query result that does not exist yet, which shows up as occasional wrong pixels or stale data and is very hard to trace. A late one only costs latency, which is easy to measure. The project aims for correct frames before fast ones, and wgpu reports when submitted work has completed.
+
+## Presents pace the game through a buffer queue
+- **WHEN:** 2026-11-12
+- **PROJECT:** starquake
+- **SYSTEM:** gsv
+- **SCOPE:** architectural
+- **WHAT:** A present returns at once with the list of buffers still in use. The graphics server's emulated 60 Hz clock shows one ready frame per tick and frees the buffer it replaces; the game waits only when it has no free buffer. The fence wait the other reference used (hold the reply until the previous frame is done and the next tick has passed) is kept as a per-run fallback setting, implemented as a deferred reply so it never blocks a core. The GPU and render drafts' assumption that a present waits on the frame's fence is dropped.
+- **WHY:** It never blocks the emulator and lets drawing overlap GPU work. The fence-wait approach lost up to half of each frame to waiting, needed a 4-second safety timeout and deadlocked when tuned. The risk, that a game does not wait for free buffers properly, is unconfirmed either way and is covered by the fallback.
+
+## Syncpoints and the GPU address table live in the GPU crate; the graphics server decides, the GPU applies
+- **WHEN:** 2026-11-12
+- **PROJECT:** starquake
+- **SYSTEM:** gsv, gpu
+- **SCOPE:** architectural
+- **WHAT:** The syncpoint counters and the GPU address table are plain data types in the GPU crate. The graphics server allocates counters, computes each submission's fence, and writes mappings; the GPU performs increments after host completion and reads the table on every access. Counter changes go into a queue that the graphics server's timer thread drains, so game threads are woken in a recorded order. Unmaps, kind changes and destroys reach the GPU as ordered updates with a barrier, and the game is told only when no earlier GPU work, including the thread that reads command buffers, can still use the old mapping. The GPU draft's memory-access interface is kept, with its production implementation in the GPU crate over the table. The GPU draft's interface for the graphics server to own syncpoints is dropped.
+- **WHY:** The graphics server already depends on the GPU crate, so no new crate is needed, and the GPU reads the table on its hottest path, where a call through an interface would cost on every access. Waking game threads from one recorded place keeps replay deterministic, as the observability spec requires. Ordered unmaps stop the GPU reading memory the game has already been told is free.
+
+## Draw commands cross to the backend as plain data; caches are split by what they are keyed on
+- **WHEN:** 2026-11-12
+- **PROJECT:** starquake
+- **SYSTEM:** gpu, render
+- **SCOPE:** architectural
+- **WHAT:** The GPU crate's back thread writes draw and dispatch commands as plain data (handles and numbers); the render backend's own thread turns them into host API calls, submits and presents. Caches keyed by game memory or register state (textures, buffers, pipeline keys, write tracking, eviction, detiling) live in the GPU crate; host objects live in the backend and are referred to by handle. Each backend implements the same trait and never sees a game memory address.
+- **WHY:** Eden-NX2 measured the thread that issues host calls as its bottleneck, so the back thread should not wait on the graphics driver. Plain-data lists give a recording backend for GPU-free tests and host-level captures without extra work, and keep wgpu types out of the GPU crate so a direct backend can be added. Writing cache policy once, in the GPU crate, means it is tested without a GPU and not repeated per backend.
+
+## Twenty-one graphics decisions accepted as recommended
+- **WHEN:** 2026-11-12
+- **PROJECT:** starquake
+- **SYSTEM:** gsv, gpu, shader, render
+- **SCOPE:** moderate
+- **WHAT:** The owner accepted, as the drafts recommend: (1) a draw whose shader or pipeline is not ready waits, one setting owned by the GPU crate, with skipping as an opt-in setting after the persistent caches exist (gpu 9, shader 6, render 5); (2) one house rule when references disagree: Nvidia's headers and module-cited readings for layouts and meanings; where one answer contains the other, the larger; otherwise the one a title ran on; each case marked in code and pinned by a test (gsv 8, gpu 10); (3) new crates: a leaf `starquake-layout` crate for tiling, no separate shader-decoder crate for now, and `starquake-render` plus `starquake-render-wgpu` (gpu 5, shader 14, render 10); and eighteen local items: gsv 5, 6, 7, 11; gpu 6, 7, 11, 12, 13; shader 4, 10, 12, 15, 16; render 6, 11, 12, 13, each as its draft recommends. Item numbers refer to each draft's "Decisions for the owner".
+- **WHY:** Each is the conservative or conventional choice, follows from the six foundational rulings, or keeps an option open for later; none sets direction beyond its own area. Accepting them together lets the drafts settle and the review focus on the coupled groups and the four contested items.
+
+## Ten coupled graphics decisions accepted as recommended
+- **WHEN:** 2026-11-12
+- **PROJECT:** starquake
+- **SYSTEM:** gsv, gpu, shader, render, observability
+- **SCOPE:** moderate
+- **WHAT:** (1) GPU submission queues are bounded at 65,536 entries; a full queue makes the submit wait as a deferred reply (gsv 12). (2) GPU-only memory is backed lazily on the host and not charged to the title's pools, revisited if a trace shows the console charges it to remote memory (gsv 4). (3) GPU-written data is copied back only when something reads it as plain memory, and shader memory accesses through untraceable addresses are rejected at first; both are revisited when a direct backend can share memory (gpu 4, shader 9). (4) The GPU notices a CPU semaphore release by polling with back-off, measured, before any write-trapping (gpu 3). (5) The shared syncpoint page is refreshed on demand, at most 1 ms stale (gsv 9). (6) GPU captures record every byte each GPU thread read, in order; the three replay commands (`starquake gpu-replay`, `starquake render-replay`, `cargo xtask shader-replay`) are approved as an addition to the observability spec's headless contract (gpu 8). (7) The persistent shader cache: key and format defined now, built after milestone 3, storing inputs not translated modules (shader 7). (8) Translation sees GPU state only through the non-blocking question-and-answer lookup (shader 5). (9) Texture handles are traced first; true bindless only after a survey of titles shows it is needed (shader 8). (10) Mesh and task shaders after milestone 3, with the decoder reading their instructions from the start (shader 11).
+- **WHY:** Each follows from the six foundational rulings. They save host memory on unified machines, keep replays exact, avoid kernel work nobody owns yet, and defer what wgpu cannot do until a survey or a direct backend shows it is needed, without designing it out.
+
+## The GPU front thread owns the register file
+- **WHEN:** 2026-11-12
+- **PROJECT:** starquake
+- **SYSTEM:** gpu
+- **SCOPE:** architectural
+- **WHAT:** The GPU front thread keeps the only copy of every engine's register values, runs macros, and sends the back thread only the changes. Register writes with side effects (one register changing another, or triggering an action) are computed on the front thread, each rule covered by a per-engine fixture, and captures replayed against recorded frames catch rules that were missed. The back thread keeps a mirror with dirty flags and never changes a register itself (gpu 1).
+- **WHY:** Macros are a large share of the GPU's work, so running them on the front thread keeps most of the gain from splitting work across two threads; Eden-NX2 found this arrangement fastest. Keeping one copy avoids two copies drifting apart, which forced Eden-NX2 to build and maintain a checker. The risk, a missed side-effect rule, is a correctness bug that offline fixtures and replay can find.
+
+## The shader translator uses a new arena-based Rust IR
+- **WHEN:** 2026-11-12
+- **PROJECT:** starquake
+- **SYSTEM:** shader
+- **SCOPE:** architectural
+- **WHAT:** The shader crate's intermediate representation is a new Rust design that keeps Eden's operation set and pass behaviour but stores instructions in arenas referred to by typed ids, not pointer-linked objects. It has its own register class for Switch 2's uniform registers, a text form that can be printed and parsed for tests, and a verifier run after every pass in tests and debug builds. Eden's passes are ported by behaviour, not line by line (shader 1).
+- **WHY:** Eden's operations and passes are the proven part; its pointer-linked data layout fights Rust's ownership rules and tends toward `unsafe`, which the project bans outside host-facing crates. The kernel's move to tables and ids ported Eden's logic cleanly, and the same approach gives deterministic, testable IR. A native design also avoids Eden's Switch 1-era trick of packing uniform registers into the top of the regular register file.
+
+## The wgpu backend's GPU tests run in Linux CI on lavapipe, if it runs cleanly
+- **WHEN:** 2026-11-12
+- **PROJECT:** starquake
+- **SYSTEM:** render, testing
+- **SCOPE:** moderate
+- **WHAT:** If an experiment shows wgpu runs cleanly and deterministically on Mesa's software Vulkan driver (lavapipe) on GitHub's hosted Linux runners, the render backend's GPU tests are required in Linux CI and skipped locally, with a notice, where no GPU adapter exists. Golden images are compared exactly only for scenes whose pixels can be computed; others use a stated tolerance. If the experiment fails, the GPU tests are local-only, like the hypervisor tests (render 9).
+- **WHY:** Most changes are made by agents, and an agent that breaks the render backend should learn it from the PR's checks, not from the owner noticing a broken frame later. The recording backend already tests most logic without a GPU, so these tests only need to cover what is specific to wgpu, and the cost is a package install and somewhat slower CI.
+
+## No video decoding at first, then FFmpeg behind an off-by-default feature
+- **WHEN:** 2026-11-12
+- **PROJECT:** starquake
+- **SYSTEM:** gsv
+- **SCOPE:** moderate
+- **WHAT:** The first graphics-server slices answer video codec sessions without decoding, so movies show a frozen picture and the game carries on. Later, FFmpeg is added behind a Cargo feature that is off by default, covering VP9, AV1 and H.264; each format moves to a pure-Rust decoder when a good enough one exists. The decoder sits behind the video session protocol, so it can be swapped without changing the sessions (gsv 10).
+- **WHY:** Movies matter for the experience but not for getting frames on screen. FFmpeg covers every relevant format but is a C library, which the project keeps out of the default build, so it stays opt-in. A game that waits for a movie to finish may sit on a frozen frame; that is found when a real title hits it.
+
+## Approved specs amended for the graphics designs
+- **WHEN:** 2026-11-12
+- **PROJECT:** starquake
+- **SYSTEM:** cross-system
+- **SCOPE:** architectural
+- **WHAT:** The owner approved the changes the graphics drafts imply to already-approved specs: (1) execution model: write tracking for the GPU caches goes through a `WriteWatch` in the memory crate, requested by the GPU back thread, applied by the kernel at its next entry on any core, and drained as a list of dirtied pages, so the kernel never calls into the GPU; (2) kernel and services: a device-share lock over a memory range, a range query of the GPU-accessible attribute set by `svc 0x80`, a hook run after the kernel lock is released when a service-created event fires, and registry entries reachable only from other services; the services `Context` exposes these and transfer memory; GPU-only memory is never charged to a title's pools; (3) observability: a `gpu.txt` artifact, GPU, shader and render counters in `summary.json`, the replay commands and a `--window` flag in the headless contract; (4) architecture and `CLAUDE.md`: presents flow graphics server to GPU to render; new crates `starquake-layout`, `starquake-render` and `starquake-render-wgpu`; every platform starts on wgpu, with copies until a direct backend; the timer thread also drains the graphics server's completion queue; one compile pool shared by shader translation and pipeline builds; and the GPU-test rule for Linux CI.
+- **WHY:** Each follows from the graphics rulings or is what the graphics server needs from the kernel, and keeping the approved specs in step with the designs stops agents building against stale text. The write-tracking change keeps the dependency rule that the kernel never reaches up into the GPU crate.
+
