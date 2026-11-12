@@ -217,3 +217,11 @@ Entry format:
 - **WHAT:** Recorded by the lead. A real libnx homebrew program now runs from file to exit on `main`: 30 system calls and 5 service requests in the same order as the reference emulator, its three lines printed, exit code 0, nothing stubbed, checked by a test and re-run by the lead (#98, PR #106; issue #20 closed). "Autonomous mode until something runs" set this as its end, so from here the lead no longer decides design questions, amends specs or promotes proposals on its own: design and spec PRs wait for the owner, and proposals wait to be vetted. Implementation PRs for filed issues still merge on a green gate and two reviews, as before. Three house rules adopted while the last wave was in flight are marked as such in `docs/proposals.md`.
 - **WHY:** The owner granted the delegation to get past the point where nothing ran end to end, and tied it to this milestone. Whether to extend it toward milestone 2 is the owner's call.
 
+## Delegation extended toward milestone 2, for implementation only
+- **WHEN:** 2026-11-12
+- **PROJECT:** starquake
+- **SYSTEM:** process
+- **SCOPE:** moderate
+- **WHAT:** After milestone 1 the owner extended the lead's delegation toward milestone 2, for implementation work only. The lead files implementation issues that follow approved specs (kernel slices, CPU, loader, services, test fixtures), runs them in parallel lanes on Opus, and merges their PRs on a green gate and two reviews. It does not decide design questions, amend specs or merge design PRs: those wait for the owner, including the four graphics drafts.
+- **WHY:** Progress can continue in parallel while the owner reviews designs at their own pace. Implementation against an approved spec is checked by the gate, two reviewers and the reference traces; designs set direction, so they stay with the owner.
+
