@@ -84,7 +84,8 @@
 //! - **Deferred replies.** A run's services are installed by a function the run is given
 //!   ([`Install`]; a real run's is [`crate::hle::install`]), which may keep a [`Ready`] to say
 //!   when a server's deferred replies are ready; the timer thread then delivers them
-//!   ([`Dispatcher::deliver_replies`]). None of the services a real run has defers yet:
+//!   ([`Dispatcher::deliver_replies`]), or, when a core has the server's handler out, that core
+//!   does when it puts the handler back. None of the services a real run has defers yet:
 //!   `fsp-srv`'s read would, and is given no executor until then.
 //! - **The environment** is live, with a fixed random seed and nothing recorded to disk; the
 //!   `--clock`, `--seed` and `--record` flags of the headless contract are not built. Its

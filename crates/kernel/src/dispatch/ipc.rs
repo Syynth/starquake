@@ -29,8 +29,12 @@
 //! `take_reply` gets an [`IpcContext`]; a request the queue starts meanwhile (it has a free
 //! worker) finds the slot empty. It stays in flight, holding its worker, and is parked: its
 //! sender waits ([`Outcome::Waiting`]) and the core that puts the handler back runs it and
-//! reports the sender woken ([`Dispatcher::take_woken`]). Whenever a handler goes back in its
-//! slot it is first given the notices that arrived while it was out.
+//! reports the sender woken ([`Dispatcher::take_woken`]). The other way round, a delivery that
+//! finds the handler out of its slot (a core runs a request through it) is owed
+//! (`State::owed`): the thread that puts the handler back makes it before its own call
+//! returns, so replies said to be ready are delivered once the handler is free. Test:
+//! `replies_said_to_be_ready_while_another_core_runs_the_handler_are_delivered`. Whenever a
+//! handler goes back in its slot it is first given the notices that arrived while it was out.
 //!
 //! `ConnectToNamedPort` is ported from Eden `eden/src/core/hle/kernel/svc/svc_port.cpp` @
 //! cf654052 (GPL-3.0-or-later), `ConnectToNamedPort`, with the name read as
@@ -460,6 +464,11 @@ impl Dispatcher {
     /// the server's next requests. `caller` is the core doing it: its memory is the process's,
     /// and its clock reading stamps the events. The senders are reported by
     /// [`Dispatcher::take_woken`].
+    ///
+    /// The delivery is owed until a thread with the handler in hand makes it: this one, or,
+    /// when the handler is out of its slot (a core is running a request through it), the one
+    /// that puts it back, which delivers before its own call returns (`deliver_owed`). Either
+    /// way the replies are delivered once the handler is free; this call does not wait for it.
     pub fn deliver_replies(
         &self,
         server: ServerId,
@@ -468,31 +477,85 @@ impl Dispatcher {
         let mut locked = self.lock::<(&mut Scheduler,)>();
         let time = locked.guest_time(caller.env)?;
         let process_id = locked.state.tables.processes.process_id();
-        // Bounded by the requests deferred now: each turn answers one of them.
-        let deferred = locked
-            .state
-            .tables
-            .scheduler
-            .ipc()
-            .queue(server)
-            .map_or(0, |queue| queue.deferred().count());
-        let Some(mut handler) = locked
-            .state
-            .handlers
-            .get_mut(&server)
-            .and_then(Option::take)
-        else {
-            tracing::warn!(
-                ?server,
-                "deferred replies wait for a server whose handler is busy"
-            );
-            return Ok(());
-        };
+        locked.state.owed.insert(server);
         drop(locked);
 
+        let finished = self.deliver_owed(server, caller.memory, process_id);
+        let woken = self.settle(finished, caller.memory, caller.recorder, time);
+        let mut locked = self.lock::<()>();
+        locked.state.woken.extend(woken);
+        // Waits the handler's signals ended (`dispatch/sync.rs`).
+        drain_wakes(&mut locked.state, caller.recorder, time);
+        drop(locked);
+        self.settle_notices();
+        Ok(())
+    }
+
+    /// Makes the deliveries `server` owes ([`Dispatcher::deliver_replies`]) while one is owed
+    /// and its handler is in its slot: takes the handler out, writes the replies it has ready,
+    /// puts it back and runs the requests that may start then. Returns what is over, for the
+    /// caller to settle. A handler out of its slot leaves the delivery owed: the thread that
+    /// has it calls this after putting it back.
+    fn deliver_owed(
+        &self,
+        server: ServerId,
+        memory: &dyn GuestMemory,
+        process_id: u64,
+    ) -> Vec<Finished> {
+        let mut finished = Vec::new();
+        // Bounded by the deliveries owed: each turn takes one owed mark, and only
+        // `deliver_replies` makes one.
+        loop {
+            let mut locked = self.lock::<(&mut Scheduler,)>();
+            let state = &mut *locked.state;
+            if !state.owed.contains(&server) {
+                return finished;
+            }
+            let Some(slot) = state.handlers.get_mut(&server) else {
+                tracing::error!(
+                    ?server,
+                    "deferred replies are owed by a server with no handler"
+                );
+                state.owed.remove(&server);
+                return finished;
+            };
+            let Some(mut handler) = slot.take() else {
+                // Whoever has the handler delivers when it puts it back.
+                tracing::debug!(
+                    ?server,
+                    "deferred replies wait for their handler to come back"
+                );
+                return finished;
+            };
+            state.owed.remove(&server);
+            // Bounded by the requests deferred now: each turn answers one of them.
+            let deferred = state
+                .tables
+                .scheduler
+                .ipc()
+                .queue(server)
+                .map_or(0, |queue| queue.deferred().count());
+            drop(locked);
+
+            finished.extend(self.take_replies(server, &mut *handler, memory, process_id, deferred));
+            let parked = self.put_back(server, handler);
+            finished.extend(self.run_ready(server, memory, process_id, parked));
+        }
+    }
+
+    /// Asks `handler`, out of its slot, for at most `deferred` ready replies, and ends the
+    /// requests they answer. Returns what is over.
+    fn take_replies(
+        &self,
+        server: ServerId,
+        handler: &mut dyn SessionHandler,
+        memory: &dyn GuestMemory,
+        process_id: u64,
+        deferred: usize,
+    ) -> Vec<Finished> {
         let mut finished = Vec::new();
         for _ in 0..deferred {
-            let mut cx = self.context(caller.memory, server, process_id, Translated::default());
+            let mut cx = self.context(memory, server, process_id, Translated::default());
             let mut message = [0; BUFFER_SIZE];
             let Some((session, written)) = handler.take_reply(&mut cx, &mut message) else {
                 break;
@@ -517,16 +580,7 @@ impl Dispatcher {
                 }
             }
         }
-        let parked = self.put_back(server, handler);
-        finished.extend(self.run_ready(server, caller.memory, process_id, parked));
-        let woken = self.settle(finished, caller.memory, caller.recorder, time);
-        let mut locked = self.lock::<()>();
-        locked.state.woken.extend(woken);
-        // Waits the handler's signals ended (`dispatch/sync.rs`).
-        drain_wakes(&mut locked.state, caller.recorder, time);
-        drop(locked);
-        self.settle_notices();
-        Ok(())
+        finished
     }
 
     /// An [`IpcContext`] for a request on `server`.
@@ -661,6 +715,9 @@ impl Dispatcher {
         let (mut finished, parked) =
             self.run_request(server, session, call.caller.memory, process_id);
         finished.extend(self.run_ready(server, call.caller.memory, process_id, parked));
+        // Replies said to be ready while this core had the handler out are this core's to
+        // deliver now that it is back.
+        finished.extend(self.deliver_owed(server, call.caller.memory, process_id));
         let own = call.caller.thread;
         let mut woken = self.settle(finished, call.caller.memory, call.caller.recorder, time);
         let outcome = match woken.iter().position(|woken| woken.thread == own) {
@@ -947,11 +1004,17 @@ fn calling_waiter(scheduler: &Scheduler, core: u8) -> Option<crate::id::ThreadId
 /// Makes the scheduler's thread behind `sender` wait for the reply to its request on
 /// `session`, unless it waits for that reply already (a queued request that was started and
 /// then deferred). Returns whether the sender now waits; one with no scheduler thread does
-/// not, and is only reported woken. A failure is the kernel's own bookkeeping, and is logged.
+/// not, and is only reported woken. A sender that ended while its handler ran (its request is
+/// in flight, `Scheduler::forget_waits`) does not wait either: it stays ended, and its reply
+/// finds it so (`Dispatcher::settle`). A failure is the kernel's own bookkeeping, and is
+/// logged.
 fn await_reply(scheduler: &mut Scheduler, sender: Sender, session: ObjectId) -> bool {
     let Some(waiter) = sender.waiter else {
         return false;
     };
+    if !is_alive(scheduler, sender) {
+        return false;
+    }
     if matches!(
         scheduler.sync().wait(waiter),
         Some(crate::sync::Wait::Reply { session: on, .. }) if *on == session

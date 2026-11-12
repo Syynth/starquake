@@ -22,12 +22,19 @@
 //! at its next turn anyway, at the latest one [`PREEMPTION_INTERVAL_NS`] later. (So no test
 //! can tell a missing ring from a late timeout without timing the host.)
 //!
-//! A delivery runs a server's `take_reply` here, on a thread with no vCPU. That is safe for the
-//! address space because none of the calls `IpcContext` offers today changes a stage-1
+//! A delivery ([`Dispatcher::deliver_replies`]) runs two kinds of handler call here, on a thread
+//! with no vCPU: the server's `take_reply`, for the replies that are ready, and its `handle`,
+//! for the requests that were queued behind the deferred ones and may start once those are
+//! answered (and for requests parked while the delivery had the handler out). Both are safe
+//! for the address space because none of the calls `IpcContext` offers today changes a stage-1
 //! mapping: they read and write guest memory and handle tables, and make objects (a shared
 //! memory's backing included), which the guest maps with its own system calls, after which its
 //! core settles the address space as after any call. A context call that maps would need a
 //! settle here.
+//!
+//! A delivery that finds the server's handler out of its slot (a core is running a request
+//! through it) is not dropped: the kernel keeps it owed, and the core delivers it when it puts
+//! the handler back, before its own call returns.
 //!
 //! Not here yet: vsync, and draining the graphics server's completion queue (both come with
 //! the graphics server).

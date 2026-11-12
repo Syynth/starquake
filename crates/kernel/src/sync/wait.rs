@@ -379,6 +379,14 @@ impl SyncTable {
         self.waits.get(&thread)
     }
 
+    /// Whether any thread waits for the reply to a request ([`Wait::Reply`]).
+    #[must_use]
+    pub fn has_reply_wait(&self) -> bool {
+        self.waits
+            .values()
+            .any(|wait| matches!(wait, Wait::Reply { .. }))
+    }
+
     /// Whether a cancel is pending for `thread`: its next `WaitSynchronization` that would wait
     /// returns [`KernelError::Cancelled`] instead.
     #[must_use]

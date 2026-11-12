@@ -321,3 +321,28 @@ fn a_process_is_stalled_only_when_nothing_can_run_or_end_a_wait() {
     );
     assert!(world.dispatcher.is_stalled());
 }
+
+#[test]
+fn a_process_whose_only_runnable_thread_is_suspended_is_stalled() {
+    // A suspended thread is runnable but not queued: no core can run it, so with no timer and
+    // no request deferred, nothing could ever run again.
+    let world = World::new();
+    let main = world.main.thread;
+    assert!(!world.dispatcher.is_stalled());
+    world.scheduler(|scheduler| {
+        scheduler
+            .request_suspend(main, crate::sched::SuspendType::Process)
+            .unwrap();
+        assert_eq!(
+            scheduler.thread(main).unwrap().state(),
+            ThreadState::Runnable
+        );
+    });
+    assert!(world.dispatcher.is_stalled());
+    world.scheduler(|scheduler| {
+        scheduler
+            .resume(main, crate::sched::SuspendType::Process)
+            .unwrap();
+    });
+    assert!(!world.dispatcher.is_stalled());
+}

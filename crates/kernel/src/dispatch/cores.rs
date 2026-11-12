@@ -128,22 +128,38 @@ impl Dispatcher {
         scheduler.update(latest, None, signals)
     }
 
-    /// Whether no thread could ever run again by what the kernel knows: no thread is runnable,
-    /// no wait has a timer, and no server holds a deferred request. Every wait left can then
-    /// end only by another thread's call (there is none to make one) or by a host thread
-    /// signalling an event through [`Dispatcher::signal_event`], which no service of a run does
-    /// yet. A core loop whose cores have all parked asks this to tell a deadlocked guest from
-    /// one that is waiting for time to pass.
+    /// Whether no thread could ever run again by what the kernel knows: no thread is runnable
+    /// (queued: a suspended thread is not), no wait has a timer, no server holds a deferred
+    /// request, no thread waits for a reply ([`crate::sync::Wait::Reply`]), and every server's
+    /// handler is in its slot.
+    ///
+    /// The last two cover the host threads that end replies without a core: a delivery
+    /// ([`Dispatcher::deliver_replies`], the timer thread's) has completed a deferred request,
+    /// so it is deferred no more, before it wakes the request's sender, and it runs the handler
+    /// for requests queued behind it, whose senders wait for replies but whose requests are not
+    /// deferred. While a thread waits for a reply or a handler is out of its slot, some host
+    /// thread may still end that wait, so the run is not stalled.
+    ///
+    /// Every wait left when this is true can end only by another thread's call (there is none
+    /// to make one) or by a host thread signalling an event through
+    /// [`Dispatcher::signal_event`], which no service of a run does yet. A core loop whose cores
+    /// have all parked asks this to tell a deadlocked guest from one that is waiting for time
+    /// to pass.
     #[must_use]
     pub fn is_stalled(&self) -> bool {
         let mut locked = self.lock::<(&Scheduler,)>();
+        let handler_out = locked.state.handlers.values().any(Option::is_none);
         let (scheduler,) = locked.tables();
         let ipc = scheduler.ipc();
         let deferred = ipc.servers().any(|server| {
             ipc.queue(server)
                 .is_ok_and(|queue| queue.deferred().next().is_some())
         });
-        !scheduler.has_runnable_thread() && scheduler.sync().next_deadline().is_none() && !deferred
+        !scheduler.has_runnable_thread()
+            && scheduler.sync().next_deadline().is_none()
+            && !deferred
+            && !scheduler.sync().has_reply_wait()
+            && !handler_out
     }
 }
 

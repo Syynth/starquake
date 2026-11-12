@@ -199,7 +199,7 @@
 //! Each failing example differs from the compiling one only in the lines the text above it
 //! names.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::marker::PhantomData;
 use std::sync::{Mutex, MutexGuard, PoisonError, TryLockError};
@@ -531,6 +531,10 @@ struct State {
     /// worker (delivering deferred replies), oldest first: whoever puts the handler back runs
     /// them (`dispatch::ipc`).
     parked: BTreeMap<ServerId, Vec<ObjectId>>,
+    /// Servers whose deferred replies were said to be ready ([`Dispatcher::deliver_replies`])
+    /// and are not delivered yet: while a server's handler is out of its slot, whoever puts it
+    /// back delivers them (`dispatch::ipc`, `Dispatcher::deliver_owed`).
+    owed: BTreeSet<ServerId>,
     /// The latest guest time any clock reading under the lock gave: what the core loop's
     /// rescheduling stamps threads with (`dispatch/cores.rs`). It never runs backwards.
     latest: GuestTicks,
@@ -627,6 +631,7 @@ impl Dispatcher {
                 handlers: BTreeMap::new(),
                 woken: Vec::new(),
                 parked: BTreeMap::new(),
+                owed: BTreeSet::new(),
                 latest: GuestTicks(0),
             }),
             timer: None,
