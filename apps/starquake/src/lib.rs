@@ -20,7 +20,7 @@
 
 use std::ffi::OsString;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use starquake_core::{ExitReason, RunOptions, RunReport, System, artifacts, exit_code};
@@ -91,6 +91,9 @@ pub enum UsageError {
     /// A flag was given twice.
     #[error("`{0}` was given twice")]
     Repeated(&'static str),
+    /// `--artifacts` with an empty path.
+    #[error("`--artifacts` needs a folder; it was given an empty path")]
+    EmptyArtifacts,
     /// `--until` with a condition that is not built yet.
     #[error("`--until {0}` is not supported yet; only `timeout=<n>s` is")]
     UnsupportedCondition(String),
@@ -151,10 +154,12 @@ pub fn parse(args: &[OsString]) -> Result<Command, UsageError> {
                 }
             }
             "--artifacts" => {
-                if artifacts
-                    .replace(PathBuf::from(value("--artifacts")?))
-                    .is_some()
-                {
+                let folder = value("--artifacts")?;
+                // An empty path would write the artifacts into the current directory.
+                if folder.is_empty() {
+                    return Err(UsageError::EmptyArtifacts);
+                }
+                if artifacts.replace(PathBuf::from(folder)).is_some() {
                     return Err(UsageError::Repeated("--artifacts"));
                 }
             }
@@ -227,33 +232,62 @@ fn run(
         },
     };
 
-    // A stream that can't be written to (a closed pipe) must not change the exit code.
-    for line in &report.guest_log {
-        let _ = writeln!(stdout, "[guest] {}", line.escape_ascii());
-    }
     let folder = args
         .artifacts
         .clone()
         .unwrap_or_else(default_artifacts_folder);
-    let (code, artifacts) = match artifacts::write(&folder, &report) {
-        Ok(()) => (
-            report.exit_code(),
-            format!("artifacts in {}", folder.display()),
-        ),
-        Err(error) => {
-            let _ = writeln!(stderr, "starquake: {error}");
-            (
-                exit_code::EMULATOR_ERROR,
-                "the artifacts could not be written".to_owned(),
-            )
+    conclude(&report, &folder, stdout, stderr)
+}
+
+/// Finishes a run: prints what the guest wrote, writes `report`'s artifacts into `folder`, and
+/// prints one line saying how the run ended. Returns the process exit code, which is the run's
+/// own unless the artifacts could not be written: that is an emulator error whatever the run
+/// did.
+pub fn conclude(
+    report: &RunReport,
+    folder: &Path,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> u8 {
+    // A stream that can't be written to (a closed pipe) must not change the exit code.
+    for line in &report.guest_log {
+        let _ = writeln!(stdout, "[guest] {}", line.escape_ascii());
+    }
+    if report.guest_log_dropped > 0 {
+        let _ = writeln!(
+            stdout,
+            "starquake: the guest log was cut short: {} later lines were not kept",
+            report.guest_log_dropped
+        );
+    }
+    if report.trace_events_dropped > 0 {
+        let _ = writeln!(
+            stdout,
+            "starquake: the trace was cut short: {} later events are not in it",
+            report.trace_events_dropped
+        );
+    }
+    let ended = describe(report);
+    match artifacts::write(folder, report) {
+        Ok(()) => {
+            let code = report.exit_code();
+            let _ = writeln!(
+                stdout,
+                "starquake: {ended} (exit code {code}); artifacts in {}",
+                folder.display()
+            );
+            code
         }
-    };
-    let _ = writeln!(
-        stdout,
-        "starquake: {} (exit code {code}); {artifacts}",
-        describe(&report)
-    );
-    code
+        Err(error) => {
+            let code = exit_code::EMULATOR_ERROR;
+            let _ = writeln!(stderr, "starquake: {error}");
+            let _ = writeln!(
+                stdout,
+                "starquake: {ended}, but the artifacts could not be written (exit code {code})"
+            );
+            code
+        }
+    }
 }
 
 /// Runs the command line `args` (the program's own name first, as `std::env::args_os` gives it)
@@ -391,6 +425,15 @@ mod tests {
             (
                 &["run", "a.nro", "--until", "frames=600"],
                 UsageError::UnsupportedCondition("frames=600".into()),
+            ),
+            // An empty folder would put the artifacts in the current directory.
+            (
+                &["run", "a.nro", "--artifacts", ""],
+                UsageError::EmptyArtifacts,
+            ),
+            (
+                &["run", "a.nro", "--artifacts="],
+                UsageError::EmptyArtifacts,
             ),
             (
                 &["run", "a.nro", "--until", "60s"],

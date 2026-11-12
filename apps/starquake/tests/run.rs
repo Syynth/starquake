@@ -10,11 +10,12 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use starquake_core::artifacts::{
     CRASH_JSON_FILE, CRASH_TEXT_FILE, EVENTS_FILE, GUEST_LOG_FILE, SUMMARY_FILE, TRACE_FILE,
 };
-use starquake_core::exit_code;
+use starquake_core::{ExitReason, RunReport, exit_code};
 use starquake_testkit::programs;
 
 /// Helpers, in a `cfg(test)` module so they may unwrap like the tests do.
@@ -93,13 +94,22 @@ mod support {
         names
     }
 
+    /// The report of a run that printed one line and exited cleanly.
+    pub(crate) fn clean_report() -> RunReport {
+        RunReport {
+            exit: ExitReason::ProcessExited,
+            guest_log: vec![b"a line".to_vec()],
+            ..RunReport::emulator_error(String::new(), Duration::from_millis(5))
+        }
+    }
+
     /// Whether this host can run guest code in a test: a Mac with Apple Silicon, off hosted CI.
     pub(crate) fn can_run_guests() -> bool {
         cfg!(all(target_os = "macos", target_arch = "aarch64")) && std::env::var_os("CI").is_none()
     }
 }
 
-use support::{can_run_guests, files, json, program, run, scratch, text};
+use support::{can_run_guests, clean_report, files, json, program, run, scratch, starquake, text};
 
 /// The files every run leaves, crashed or not.
 const ALWAYS: [&str; 4] = [EVENTS_FILE, GUEST_LOG_FILE, SUMMARY_FILE, TRACE_FILE];
@@ -176,10 +186,121 @@ fn an_artifacts_folder_that_cannot_be_written_is_an_emulator_error() {
     );
     assert!(
         ran.stdout
-            .ends_with("(exit code 2); the artifacts could not be written\n"),
+            .ends_with(", but the artifacts could not be written (exit code 2)\n"),
         "{}",
         ran.stdout
     );
+    assert!(
+        ran.stdout
+            .starts_with("starquake: emulator error: could not read "),
+        "{}",
+        ran.stdout
+    );
+}
+
+#[test]
+fn a_clean_run_whose_artifacts_cannot_be_written_exits_with_code_2_and_says_which_failed() {
+    let folder = scratch("clean-blocked");
+    // A file is in the way of the artifacts folder.
+    let blocked = program(&folder, "artifacts", b"");
+    let report = clean_report();
+    assert_eq!(report.exit_code(), exit_code::STOP_CONDITION);
+    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+    let code = starquake::conclude(&report, &blocked, &mut stdout, &mut stderr);
+    // The run was clean, and the command still fails.
+    assert_eq!(code, exit_code::EMULATOR_ERROR);
+    assert_eq!(
+        String::from_utf8(stdout).unwrap(),
+        "[guest] a line\n\
+         starquake: the program exited, but the artifacts could not be written (exit code 2)\n"
+    );
+    assert!(String::from_utf8(stderr).unwrap().starts_with(&format!(
+        "starquake: could not write {}: ",
+        blocked.display()
+    )));
+    // Into a folder that can be written, the same report is a clean exit.
+    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+    let written = folder.join("written");
+    let code = starquake::conclude(&report, &written, &mut stdout, &mut stderr);
+    assert_eq!(code, exit_code::STOP_CONDITION);
+    assert_eq!(
+        String::from_utf8(stdout).unwrap(),
+        format!(
+            "[guest] a line\nstarquake: the program exited (exit code 0); artifacts in {}\n",
+            written.display()
+        )
+    );
+    assert_eq!(stderr, b"");
+}
+
+#[test]
+fn hello_into_a_folder_that_cannot_be_written_exits_with_code_2() {
+    if !can_run_guests() {
+        return;
+    }
+    let folder = scratch("hello-blocked");
+    program(&folder, "artifacts", b"");
+    let hello = program(&folder, "hello.nro", &programs::hello().unwrap());
+    let (ran, _) = run(&hello, &["--until", "timeout=30s"]);
+    assert_eq!(ran.code, exit_code::EMULATOR_ERROR, "{}", ran.stdout);
+    assert!(
+        ran.stdout.ends_with(
+            "starquake: the program exited, but the artifacts could not be written (exit code 2)\n"
+        ),
+        "{}",
+        ran.stdout
+    );
+}
+
+#[test]
+fn a_run_that_reached_its_limits_says_what_is_missing() {
+    let folder = scratch("truncated");
+    let report = RunReport {
+        guest_log_dropped: 3,
+        trace_events_dropped: 40,
+        ..clean_report()
+    };
+    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+    let artifacts = folder.join("artifacts");
+    let code = starquake::conclude(&report, &artifacts, &mut stdout, &mut stderr);
+    assert_eq!(code, exit_code::STOP_CONDITION);
+    assert_eq!(
+        String::from_utf8(stdout).unwrap(),
+        format!(
+            "[guest] a line\n\
+             starquake: the guest log was cut short: 3 later lines were not kept\n\
+             starquake: the trace was cut short: 40 later events are not in it\n\
+             starquake: the program exited (exit code 0); artifacts in {}\n",
+            artifacts.display()
+        )
+    );
+    assert_eq!(
+        text(&artifacts, GUEST_LOG_FILE),
+        "a line\n[truncated: 3 later lines were not kept]\n"
+    );
+}
+
+#[test]
+fn an_empty_artifacts_folder_is_refused_and_nothing_is_written() {
+    let folder = scratch("empty-artifacts");
+    let missing = folder.join("nothing.nro");
+    for flag in [&["--artifacts", ""][..], &["--artifacts="]] {
+        let mut args = vec![OsString::from("run"), missing.clone().into()];
+        args.extend(flag.iter().map(OsString::from));
+        let ran = starquake(&args.iter().collect::<Vec<_>>());
+        assert_eq!(ran.code, exit_code::EMULATOR_ERROR, "{flag:?}");
+        assert_eq!(ran.stdout, "", "{flag:?}");
+        assert!(
+            ran.stderr.starts_with(
+                "starquake: `--artifacts` needs a folder; it was given an empty path\n"
+            ),
+            "{}",
+            ran.stderr
+        );
+    }
+    // Nothing was run, so nothing was written anywhere: not here, and not where the test runs.
+    assert_eq!(files(&folder), Vec::<String>::new());
+    assert!(!Path::new("summary.json").exists());
 }
 
 #[test]
