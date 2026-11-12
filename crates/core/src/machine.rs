@@ -24,10 +24,11 @@
 //!   ends the run. The event stream still names the thread [`MAIN_THREAD`] and the process
 //!   [`PROCESS_ID`], both fixed. Kernel slice 10 (core loop and timers) replaces this loop with
 //!   six core threads driven by the scheduler.
-//! - **The process is described by Eden's defaults for a program with no NPDM**
-//!   (`ProcessDescription::homebrew`: cores 0-3, priorities 16-63, the main thread at priority
-//!   44 on core 0), built for the console the run's [`Timebase`] names. Wiring the loader's
-//!   NPDM into process creation (#33) replaces it.
+//! - **The process is created from the program's description** ([`Placement::description`]:
+//!   its metadata's, or Eden's defaults for an NRO, `crate::image`). The run's [`Timebase`]
+//!   must name the description's console, whose rate the program's counter reads were patched
+//!   for; a run whose two consoles differ ends as an emulator error before the guest runs
+//!   ([`CONSOLE_MISMATCH`]).
 //! - **Whole register file per system call.** Each `svc` reads and writes all of [`GuestRegs`].
 //!   The execution model's single-register accessors on `Vcpu` replace that.
 //! - **Start state.** The vCPU is given the context the kernel's `process::run` gave the main
@@ -79,7 +80,7 @@ use std::time::{Duration, Instant};
 
 use starquake_cpu::{Exit, GuestRegs, Interrupter, Syndrome, Vcpu};
 use starquake_kernel::dispatch::{Caller, Dispatcher, Outcome, Record};
-use starquake_kernel::process::{self, Console, ProcessDescription};
+use starquake_kernel::process;
 use starquake_kernel::sched::{CoreId, CoreSignals};
 use starquake_kernel::svc::DebugSink;
 use starquake_kernel::tables::AddressSpace;
@@ -109,6 +110,10 @@ const FLIGHT_CAPACITY: usize = 4096;
 const LAST_EVENTS: usize = 32;
 /// Seed of the environment's random numbers (the `--seed` flag is not built).
 const RANDOM_SEED: u64 = 0;
+/// How a run ends when its clock counts at a different console's rate than its process's
+/// description names (see the module docs).
+pub(crate) const CONSOLE_MISMATCH: &str = "the run's clock and the process's description name \
+                                           different consoles, so the counter rates would differ";
 /// How a run ends when its one guest thread waits (see the module docs).
 pub(crate) const WAITING: &str = "the guest thread waits for an IPC reply or on an object, and this \
                                   loop has no other thread to run until the wait ends";
@@ -406,7 +411,12 @@ pub(crate) fn run_within<V: Vcpu, C: HostClock + Clone + 'static>(
     let mut tally = Tally::default();
     let env = session.environment();
     let mut mappings = placed.mappings.clone();
-    let ending = match boot(space, address_space, placed, console) {
+    let booted = if console == placed.description.console {
+        boot(space, address_space, placed)
+    } else {
+        Err(CONSOLE_MISMATCH.to_owned())
+    };
+    let ending = match booted {
         Ok((process, tls)) => {
             mappings.push(tls);
             mappings.sort_by_key(|mapping| mapping.start);
@@ -430,7 +440,7 @@ pub(crate) fn run_within<V: Vcpu, C: HostClock + Clone + 'static>(
                 exception,
                 &regs,
                 &mappings,
-                std::slice::from_ref(&placed.module),
+                &placed.modules,
                 last_events(&flight),
                 &options.command_line,
             )
@@ -483,19 +493,17 @@ fn settle_dump(
 
 /// Creates the process with the kernel and starts its main thread on [`CORE`]
 /// (`starquake_kernel::process::create` and `run`, see "Start state" in the module docs): the
-/// process described by Eden's defaults for a program with no NPDM, built for `console`, whose
-/// memory is `address_space`, entering at the program's entry with the stack `placed` has. The
+/// process `placed` describes, whose memory is `address_space`, entering at the program's
+/// entry with the stack `placed` has. The
 /// scheduler is told the core runs the main thread. Returns the process, and the memory-map
 /// entry of the main thread's thread-local page.
 fn boot<'a, V>(
     space: &'a dyn GuestSpace<V>,
     address_space: AddressSpace,
     placed: &Placement,
-    console: Console,
 ) -> Result<(Process<'a, V>, Mapping), String> {
     let failed = |error: &dyn std::fmt::Display| format!("the kernel could not be set up: {error}");
-    let description = ProcessDescription::homebrew(console);
-    let mut tables = process::create(&description, address_space).map_err(|e| failed(&e))?;
+    let mut tables = process::create(&placed.description, address_space).map_err(|e| failed(&e))?;
     let main =
         process::run(&mut tables, space, placed.entry, placed.stack_top).map_err(|e| failed(&e))?;
     let core = CoreId::new(CORE).ok_or("no core for the main thread")?;

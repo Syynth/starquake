@@ -36,8 +36,19 @@ pub const MAIN_MODULE: &str = "main";
 
 /// The modules an ExeFS may hold, in the order they are placed (Eden's `static_modules`).
 pub const MODULE_NAMES: [&str; 13] = [
-    "rtld", MAIN_MODULE, "subsdk0", "subsdk1", "subsdk2", "subsdk3", "subsdk4", "subsdk5",
-    "subsdk6", "subsdk7", "subsdk8", "subsdk9", "sdk",
+    "rtld",
+    MAIN_MODULE,
+    "subsdk0",
+    "subsdk1",
+    "subsdk2",
+    "subsdk3",
+    "subsdk4",
+    "subsdk5",
+    "subsdk6",
+    "subsdk7",
+    "subsdk8",
+    "subsdk9",
+    "sdk",
 ];
 
 /// One module of the set.
@@ -208,8 +219,8 @@ mod tests {
 
     #[test]
     fn a_malformed_module_is_named() {
-        let error = ExeFs::parse(&[(NPDM_FILE, NPDM), (MAIN_MODULE, NSO), ("sdk", b"nope")])
-            .unwrap_err();
+        let error =
+            ExeFs::parse(&[(NPDM_FILE, NPDM), (MAIN_MODULE, NSO), ("sdk", b"nope")]).unwrap_err();
         let expected = NsoError::Truncated {
             len: 4,
             needed: crate::nso::HEADER_SIZE,
@@ -235,8 +246,7 @@ mod tests {
         let at = crate::nso::SEGMENT_HEADERS_OFFSET + crate::nso::SEGMENT_HEADER_SIZE + 4;
         let offset = u32::from_le_bytes(moved[at..at + 4].try_into().unwrap());
         moved[at..at + 4].copy_from_slice(&(offset + 1).to_le_bytes());
-        let error =
-            ExeFs::parse(&[(NPDM_FILE, NPDM), (MAIN_MODULE, &moved)]).unwrap_err();
+        let error = ExeFs::parse(&[(NPDM_FILE, NPDM), (MAIN_MODULE, &moved)]).unwrap_err();
         assert!(matches!(
             error,
             ExeFsError::Module {

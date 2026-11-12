@@ -451,9 +451,7 @@ mod tests {
         moved.data.memory_offset = 5 * page_u32();
         assert_eq!(
             CodeSet::from_nso(moved),
-            Err(CodeSetError::TextNotAtStart {
-                offset: page_u32()
-            })
+            Err(CodeSetError::TextNotAtStart { offset: page_u32() })
         );
         assert_eq!(
             CodeSetError::TextNotAtStart { offset: 0x1000 }.to_string(),
@@ -554,7 +552,10 @@ mod tests {
         let code = CodeSet::parse_nro(&file).unwrap();
         let protections = code.protections();
         assert_eq!(protections.last(), Some(&(code.bss, Perms::ReadWrite)));
-        assert_eq!(protections[protections.len() - 2], (code.data, Perms::ReadWrite));
+        assert_eq!(
+            protections[protections.len() - 2],
+            (code.data, Perms::ReadWrite)
+        );
         assert_eq!(code.bss.offset % PAGE, 0);
     }
 
