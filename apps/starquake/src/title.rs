@@ -22,7 +22,7 @@ use std::path::Path;
 
 use starquake_core::loader::npdm::service_access::ServiceAccess;
 use starquake_core::loader::npdm::{AcidLayout, AddressSpaceType, Npdm};
-use starquake_core::loader::nso::{Nso, NsoError};
+use starquake_core::loader::nso::Nso;
 use starquake_core::loader::nup::{Codec, FileId, Node, Nup, NupError, Package, Title};
 
 /// The exit codes of `inspect` and `verify`.
@@ -251,15 +251,6 @@ fn describe_title(nup: &mut Opened, title: &Title, out: &mut String, problems: &
             Err(error) => problems.push(format!("{name}: {error}")),
             Ok(bytes) => match Nso::parse(&bytes) {
                 Ok(nso) => describe_nso(&name, &nso, out),
-                // A known gap of the loader, not damage: the module is an NSO whose segments
-                // it cannot decompress yet.
-                Err(NsoError::UnsupportedCompression) => {
-                    let _ = writeln!(
-                        out,
-                        "  {name:<16} NSO with ZBIC-compressed segments, which the loader does \
-                         not decompress yet"
-                    );
-                }
                 Err(error) => {
                     problems.push(format!("{name}: not an NSO this loader reads: {error}"));
                 }

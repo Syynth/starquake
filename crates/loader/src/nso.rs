@@ -1,4 +1,4 @@
-//! NSO executables: header, LZ4-compressed segments, SHA-256 checks.
+//! NSO executables: header, LZ4- or ZBIC-compressed segments, SHA-256 checks.
 //!
 //! Parsing only: [`Nso::parse`] takes the file bytes and returns the three decompressed segments
 //! with their memory offsets, the bss size and the build id. Mapping them into guest memory is the
@@ -17,8 +17,14 @@
 //!   `eden/src/core/loader/nso.h` @ cf654052. Eden names the extents `api_info_extent`,
 //!   `dynstr_extent` and `dynsyn_extent` (sic) and the struct `RODataRelativeExtent`, which is
 //!   the source for "relative to the start of rodata". Eden never reads them.
-//! - Compression flag bits 0 to 2 and the ZBIC bit 7: `NSOHeader::IsSegmentCompressed` and
-//!   `IsZBICCompressed`.
+//! - Compression flag bits 0 to 2: `NSOHeader::IsSegmentCompressed`.
+//! - Flag bit 7, ZBIC instead of LZ4 for the compressed segments: `NSOHeader::IsZBICCompressed`
+//!   in `eden-nx2/src/core/loader/nso.h` @ 50fa86bb, and the branch of the segment loop in
+//!   `eden-nx2/src/core/loader/nso.cpp` that calls `DecompressDataZBIC` only for a segment whose
+//!   compression bit is set. A segment whose bit is clear is copied as it is, whatever bit 7
+//!   says (pinned by `the_zbic_flag_leaves_an_uncompressed_segment_alone`). The decompressor is
+//!   [`crate::zbic`], whose module docs list how it differs from the reference; the checks after
+//!   it (the exact declared size, the hash) are the same as for LZ4.
 //! - Hash-check flag bits 3 to 5, with the hash taken over the decompressed segment: Eden never
 //!   checks hashes, but Atmosphère's loader does (`NsoHeader::Flag_CheckHashText` = bit 3, shifted
 //!   by the segment index, in `atmosphere/libraries/libstratosphere/include/stratosphere/ldr/ldr_types.hpp`;
@@ -48,6 +54,8 @@
 use lz4_flex::block::DecompressError;
 use sha2::{Digest, Sha256};
 
+use crate::zbic::ZbicError;
+
 /// `NSO0` file magic at offset 0 (`eden/src/core/loader/nso.cpp`, `IdentifyType`).
 pub const MAGIC: [u8; 4] = *b"NSO0";
 /// Size of the NSO header (`eden/src/core/loader/nso.h`, `static_assert(sizeof(NSOHeader) == 0x100)`).
@@ -56,22 +64,22 @@ pub const HEADER_SIZE: usize = 0x100;
 pub const SEGMENT_COUNT: usize = 3;
 
 /// Offset of the flags word (`NSOHeader::flags`).
-const FLAGS_OFFSET: usize = 0xC;
+pub(crate) const FLAGS_OFFSET: usize = 0xC;
 /// Offset of the first segment header; each is 0x10 bytes (`NSOSegmentHeader`).
-const SEGMENT_HEADERS_OFFSET: usize = 0x10;
+pub(crate) const SEGMENT_HEADERS_OFFSET: usize = 0x10;
 /// Size of one segment header.
-const SEGMENT_HEADER_SIZE: usize = 0x10;
+pub(crate) const SEGMENT_HEADER_SIZE: usize = 0x10;
 /// Offset of the 0x20-byte build id (`NSOHeader::build_id`).
 const BUILD_ID_OFFSET: usize = 0x40;
 /// Offset of the three compressed sizes (`NSOHeader::segments_compressed_size`).
-const COMPRESSED_SIZES_OFFSET: usize = 0x60;
+pub(crate) const COMPRESSED_SIZES_OFFSET: usize = 0x60;
 /// Offset of the three SHA-256 hashes (`NSOHeader::segment_hashes`).
 const HASHES_OFFSET: usize = 0xA0;
 /// Size of a SHA-256 digest.
 const HASH_SIZE: usize = 0x20;
 
-/// Flag bit `FLAG_COMPRESSED_SHIFT + n` set: segment `n` is LZ4 compressed
-/// (`NSOHeader::IsSegmentCompressed`).
+/// Flag bit `FLAG_COMPRESSED_SHIFT + n` set: segment `n` is compressed, with LZ4 or, when
+/// [`FLAG_ZBIC`] is set, with ZBIC (`NSOHeader::IsSegmentCompressed`).
 pub const FLAG_COMPRESSED_SHIFT: u32 = 0;
 /// Offset of the `.api_info` extent (`NSOHeader::api_info_extent`).
 const API_INFO_EXTENT_OFFSET: usize = 0x88;
@@ -86,9 +94,9 @@ const EXTRA_WORD: usize = 0xC;
 /// must be checked (`NsoHeader::Flag_CheckHashText` in Atmosphère's `ldr_types.hpp`, fact only;
 /// confirmed by the homebrew fixture; see the module docs).
 pub const FLAG_HASH_CHECK_SHIFT: u32 = 3;
-/// Flag bit 7: the segments use ZBIC rather than LZ4 (`NSOHeader::IsZBICCompressed`, an Eden-only
-/// extension that this crate does not implement).
-const FLAG_ZBIC: u32 = 1 << 7;
+/// Flag bit 7: the compressed segments use ZBIC rather than LZ4 (`NSOHeader::IsZBICCompressed` in
+/// `eden-nx2/src/core/loader/nso.h` @ 50fa86bb). Switch 2 titles ship their modules this way.
+pub const FLAG_ZBIC: u32 = 1 << 7;
 
 /// Offset, in rodata, of the module path's length word; the zero word before it is at 0
 /// (`ModulePath::path_length` in `atmosphere/stratosphere/creport/source/creport_modules.cpp`
@@ -221,9 +229,7 @@ impl Nso {
             return Err(NsoError::BadMagic);
         }
         let flags = u32_at(bytes, FLAGS_OFFSET)?;
-        if flags & FLAG_ZBIC != 0 {
-            return Err(NsoError::UnsupportedCompression);
-        }
+        let zbic = flags & FLAG_ZBIC != 0;
 
         let mut segments = Vec::with_capacity(SEGMENT_COUNT);
         let mut extra = [0u32; SEGMENT_COUNT];
@@ -253,7 +259,9 @@ impl Nso {
                 .checked_add(size)
                 .ok_or(NsoError::MemoryRangeOverflow { segment: index })?;
 
-            let data = if compressed {
+            let data = if compressed && zbic {
+                decompress_zbic(index, stored, size)?
+            } else if compressed {
                 decompress(index, stored, size)?
             } else {
                 stored.to_vec()
@@ -330,9 +338,6 @@ pub enum NsoError {
     /// The first four bytes are not `NSO0`.
     #[error("NSO magic is not NSO0")]
     BadMagic,
-    /// The header selects ZBIC compression, which is not implemented.
-    #[error("NSO uses ZBIC compression, which is not supported")]
-    UnsupportedCompression,
     /// A segment's stored bytes extend past the end of the file.
     #[error(
         "NSO segment {segment}: {size:#x} bytes at file offset {offset:#x} exceed the {file_len:#x}-byte file"
@@ -384,6 +389,15 @@ pub enum NsoError {
         /// Actual decoded size.
         actual: usize,
     },
+    /// The ZBIC frame of a segment did not decompress to the declared size.
+    #[error("NSO segment {segment}: {source}")]
+    Zbic {
+        /// Segment index.
+        segment: usize,
+        /// What is wrong with the frame.
+        #[source]
+        source: ZbicError,
+    },
     /// The segment's SHA-256 does not match the header, and its check flag is set.
     #[error("NSO segment {segment}: SHA-256 does not match the header")]
     HashMismatch {
@@ -429,6 +443,12 @@ fn decompress(segment: usize, stored: &[u8], size: u32) -> Result<Vec<u8>, NsoEr
     Ok(out)
 }
 
+/// Decompresses one ZBIC frame into exactly `size` bytes ([`crate::zbic::decompress`]).
+fn decompress_zbic(segment: usize, stored: &[u8], size: u32) -> Result<Vec<u8>, NsoError> {
+    let expected = usize::try_from(size).unwrap_or(usize::MAX);
+    crate::zbic::decompress(stored, expected).map_err(|source| NsoError::Zbic { segment, source })
+}
+
 /// `index` as a bit shift (index is always below [`SEGMENT_COUNT`]).
 fn shift(index: usize) -> u32 {
     u32::try_from(index).unwrap_or(u32::MAX)
@@ -459,6 +479,9 @@ fn u32_at(bytes: &[u8], offset: usize) -> Result<u32, NsoError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::zbic;
+    use crate::zbic::build::recompress_nso;
+    use crate::zbic::frame::{BLOCK_RAW, block_header};
     use proptest::prelude::*;
 
     /// Fixed seed so property runs are reproducible.
@@ -810,14 +833,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_zbic_and_wrong_decompressed_sizes() {
-        let mut file = build([plain(TEXT), plain(RODATA), plain(DATA)], 0);
-        file[FLAGS_OFFSET] |= u8::try_from(FLAG_ZBIC).unwrap();
-        assert!(matches!(
-            Nso::parse(&file),
-            Err(NsoError::UnsupportedCompression)
-        ));
-
+    fn rejects_wrong_decompressed_sizes() {
         let compressed = Spec {
             data: TEXT,
             compress: true,
@@ -833,6 +849,238 @@ mod tests {
             Nso::parse(&file),
             Err(NsoError::ImplausibleSize { segment: 0, .. })
         ));
+    }
+
+    /// Data long and repetitive enough that a ZBIC frame of it has a compressed block with
+    /// table descriptions.
+    fn wordy(seed: u32, len: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut state = seed;
+        while out.len() < len {
+            state = state.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            out.extend_from_slice(format!("word{} ", (state >> 16) % 23).as_bytes());
+        }
+        out.truncate(len);
+        out
+    }
+
+    /// The file offset and stored size of segment `index`, as the header says.
+    fn stored_range(file: &[u8], index: usize) -> std::ops::Range<usize> {
+        let word = |at: usize| {
+            usize::try_from(u32::from_le_bytes(file[at..at + 4].try_into().unwrap())).unwrap()
+        };
+        let offset = word(SEGMENT_HEADERS_OFFSET + index * SEGMENT_HEADER_SIZE);
+        offset..offset + word(COMPRESSED_SIZES_OFFSET + index * 4)
+    }
+
+    /// A ZBIC frame of one raw block that holds `data` and states no content size: the magic,
+    /// a descriptor of zero, a window descriptor of zero (1 KiB), the block.
+    fn raw_zbic_frame(data: &[u8]) -> Vec<u8> {
+        let mut frame = zbic::MAGIC.to_vec();
+        frame.extend_from_slice(&[0, 0]);
+        frame.extend_from_slice(&block_header(true, BLOCK_RAW, data.len()).unwrap());
+        frame.extend_from_slice(data);
+        frame
+    }
+
+    /// An NSO whose rodata is stored as the ZBIC frame `frame`, declared to decompress to
+    /// `size` bytes.
+    fn with_zbic_rodata(frame: &[u8], size: usize, check_hash: bool) -> Vec<u8> {
+        let rodata = Spec {
+            data: frame,
+            compress: false,
+            check_hash,
+        };
+        let mut file = build([plain(TEXT), rodata, plain(DATA)], 0);
+        let flags = FLAG_ZBIC | 1 << (FLAG_COMPRESSED_SHIFT + 1);
+        file[FLAGS_OFFSET] |= u8::try_from(flags).unwrap();
+        let size_at = SEGMENT_HEADERS_OFFSET + SEGMENT_HEADER_SIZE + 8;
+        file[size_at..size_at + 4].copy_from_slice(&le(size));
+        file
+    }
+
+    #[test]
+    fn parses_zbic_compressed_segments() {
+        let (text, rodata, data) = (wordy(1, 6000), wordy(2, 3000), wordy(3, 900));
+        let checked = |data| Spec {
+            data,
+            compress: false,
+            check_hash: true,
+        };
+        let plain_file = build([checked(&text), plain(&rodata), checked(&data)], 0x40);
+        let file = recompress_nso(&plain_file).unwrap();
+        for index in 0..SEGMENT_COUNT {
+            assert!(
+                zbic::is_zbic(&file[stored_range(&file, index)]),
+                "segment {index}"
+            );
+        }
+        let nso = Nso::parse(&file).unwrap();
+        assert_eq!(nso.flags & FLAG_ZBIC, FLAG_ZBIC);
+        assert_eq!((nso.flags >> FLAG_COMPRESSED_SHIFT) & 0b111, 0b111);
+        // The hash-check bits are the plain file's: text and data.
+        assert_eq!((nso.flags >> FLAG_HASH_CHECK_SHIFT) & 0b111, 0b101);
+        assert_eq!(
+            (&nso.text.data, &nso.rodata.data, &nso.data.data),
+            (&text, &rodata, &data)
+        );
+        // Everything else is what the plain file parses to.
+        let plain_nso = Nso::parse(&plain_file).unwrap();
+        assert_eq!(
+            Nso {
+                flags: plain_nso.flags,
+                ..nso
+            },
+            plain_nso
+        );
+    }
+
+    #[test]
+    fn the_zbic_flag_leaves_an_uncompressed_segment_alone() {
+        let mut file = build([plain(TEXT), plain(RODATA), plain(DATA)], 0);
+        file[FLAGS_OFFSET] |= u8::try_from(FLAG_ZBIC).unwrap();
+        let nso = Nso::parse(&file).unwrap();
+        assert_eq!(nso.flags, FLAG_ZBIC);
+        assert_eq!((&nso.text.data[..], &nso.rodata.data[..]), (TEXT, RODATA));
+
+        // With the flag, a compressed segment is ZBIC, so an LZ4 block is not a frame.
+        let compressed = Spec {
+            data: RODATA,
+            compress: true,
+            check_hash: false,
+        };
+        let mut file = build([plain(TEXT), compressed, plain(DATA)], 0);
+        assert!(Nso::parse(&file).is_ok());
+        file[FLAGS_OFFSET] |= u8::try_from(FLAG_ZBIC).unwrap();
+        let error = Nso::parse(&file).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                NsoError::Zbic {
+                    segment: 1,
+                    source: ZbicError::BadMagic
+                }
+            ),
+            "{error}"
+        );
+        assert_eq!(
+            error.to_string(),
+            "NSO segment 1: not a ZBIC frame: it does not start with the bytes \"ZBIC\""
+        );
+    }
+
+    #[test]
+    fn a_zbic_segment_must_decompress_to_exactly_the_declared_size() {
+        let frame = raw_zbic_frame(RODATA);
+        let parse = |size: usize| Nso::parse(&with_zbic_rodata(&frame, size, false));
+        assert_eq!(parse(RODATA.len()).unwrap().rodata.data, RODATA);
+        let zbic_error = |size: usize| {
+            match parse(size) {
+                Err(NsoError::Zbic { segment: 1, source }) => Ok(source),
+                other => Err(format!("not a ZBIC error in segment 1: {other:?}")),
+            }
+            .unwrap()
+        };
+        assert_eq!(
+            zbic_error(RODATA.len() - 1),
+            ZbicError::TooLong {
+                expected: RODATA.len() - 1
+            }
+        );
+        assert_eq!(
+            zbic_error(RODATA.len() + 1),
+            ZbicError::TooShort {
+                expected: RODATA.len() + 1,
+                actual: RODATA.len()
+            }
+        );
+        // The largest size this segment can declare (the builder loads it at 0x1000, and the
+        // range must fit 32 bits): nothing is allocated for it.
+        let largest = usize::try_from(u32::MAX - 0x1000).unwrap();
+        assert_eq!(
+            zbic_error(largest),
+            ZbicError::TooShort {
+                expected: largest,
+                actual: RODATA.len()
+            }
+        );
+
+        // A frame that states its content size is refused before it is decoded.
+        let file = recompress_nso(&build([plain(TEXT), plain(RODATA), plain(DATA)], 0)).unwrap();
+        let mut longer = file.clone();
+        longer[0x18..0x1C].copy_from_slice(&le(TEXT.len() + 1));
+        let error = Nso::parse(&longer).unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                NsoError::Zbic {
+                    segment: 0,
+                    source: ZbicError::ContentSizeMismatch { frame, expected }
+                } if *frame == u64::try_from(TEXT.len()).unwrap() && *expected == TEXT.len() + 1
+            ),
+            "{error}"
+        );
+
+        // A frame cut short, by the header's compressed size and by the end of the file.
+        let mut cut = file.clone();
+        let stored = stored_range(&file, 2);
+        cut[COMPRESSED_SIZES_OFFSET + 8..COMPRESSED_SIZES_OFFSET + 12]
+            .copy_from_slice(&le(stored.len() - 1));
+        let error = Nso::parse(&cut).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                NsoError::Zbic {
+                    segment: 2,
+                    source: ZbicError::Truncated
+                }
+            ),
+            "{error}"
+        );
+        assert_eq!(
+            error.to_string(),
+            "NSO segment 2: the ZBIC frame is cut short"
+        );
+        assert!(matches!(
+            Nso::parse(&file[..file.len() - 1]),
+            Err(NsoError::SegmentOutOfBounds { segment: 2, .. })
+        ));
+        // A wrong magic.
+        let mut wrong = file.clone();
+        wrong[stored_range(&file, 0).start] ^= 1;
+        assert!(matches!(
+            Nso::parse(&wrong),
+            Err(NsoError::Zbic {
+                segment: 0,
+                source: ZbicError::BadMagic
+            })
+        ));
+    }
+
+    #[test]
+    fn a_zbic_segment_is_hashed_after_it_is_decompressed() {
+        // The stored hash is the SHA-256 of the frame (the builder hashes what it is given),
+        // which is not what the frame decompresses to.
+        let frame = raw_zbic_frame(RODATA);
+        let mut file = with_zbic_rodata(&frame, RODATA.len(), true);
+        assert!(matches!(
+            Nso::parse(&file),
+            Err(NsoError::HashMismatch { segment: 1 })
+        ));
+        // With the hash of the decompressed bytes it parses.
+        let hash_at = HASHES_OFFSET + HASH_SIZE;
+        file[hash_at..hash_at + HASH_SIZE].copy_from_slice(&Sha256::digest(RODATA));
+        assert_eq!(Nso::parse(&file).unwrap().rodata.data, RODATA);
+        // One byte of the content changed: the frame still decodes, to other bytes.
+        let last = stored_range(&file, 1).end - 1;
+        file[last] ^= 1;
+        assert!(matches!(
+            Nso::parse(&file),
+            Err(NsoError::HashMismatch { segment: 1 })
+        ));
+        // Without the check flag the same file parses.
+        file[FLAGS_OFFSET] &= !u8::try_from(1u32 << (FLAG_HASH_CHECK_SHIFT + 1)).unwrap();
+        assert!(Nso::parse(&file).is_ok());
     }
 
     #[test]
@@ -944,9 +1192,13 @@ mod tests {
             index in 0usize..400,
             value in any::<u8>(),
             compress in any::<bool>(),
+            as_zbic in any::<bool>(),
         ) {
             let spec = |data| Spec { data, compress, check_hash: compress };
             let mut file = build([spec(TEXT), spec(RODATA), spec(DATA)], 0x10);
+            if as_zbic {
+                file = recompress_nso(&file).unwrap();
+            }
             let at = index % file.len();
             file[at] = value;
             let _ = Nso::parse(&file);
