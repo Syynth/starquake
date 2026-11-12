@@ -137,11 +137,12 @@ Rebuild with `make -C tests/homebrew/startup` (same set-up as above).
 
 ### How far `startup.nro` runs
 
-Not far yet, and that is the point of it: starquake's run matches the reference trace
-(`startup/reference/startup.trace`) for its first 31 lines, as of #113: start-up, `set:sys`, and
-`sm:`'s `GetService` for `apm`. `crates/core/tests/homebrew.rs` fails if a change makes it match
-fewer (`STARTUP_MATCHED`, raised by the change that makes it match more). The first difference
-is the next request: starquake has no `apm`, so `sm:`'s auto-stub hands out a session whose
-requests are logged under `sm:`'s number, where the reference has `apm`'s. `startup/reference/README.md` lists every system call and request in the
-trace that starquake does not implement yet, in order of first use, written from the trace by
-the same test file.
+Not far yet, and that is the point of it: starquake's run matches the start of the reference
+trace (`startup/reference/startup.trace`), and `crates/core/tests/homebrew.rs` fails if a change
+makes it match fewer lines than its `STARTUP_MATCHED` records (the change that makes it match
+more raises that constant). When the fixture was added (#113), the run matched start-up,
+`set:sys`, and `sm:`'s `GetService` for `apm`, and differed at the next request: starquake has
+no `apm`, so `sm:`'s auto-stub hands out a session whose requests are logged under `sm:`'s
+number, where the reference has `apm`'s. `startup/reference/README.md` lists every system call
+and request in the trace that starquake does not implement yet, in order of first use, written
+from the trace by the same test file.

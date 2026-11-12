@@ -33,21 +33,34 @@ libnx/nx/source/kernel/shmem.c, `shmemMap`). The generator is seeded from `GetIn
 entropy, so the page differs from run to run. Each range a call in `PLACEMENTS` maps is a
 placement, named `placement1`, `placement2`, ... in the order the trace maps them, and anchored
 at the range's start less the guard (the address libnx's probe asks about). A placement must lie
-in the ASLR region outside every other region and the module, or the trace is refused.
+where libnx may put one, or the trace is refused: in the ASLR region, outside the module, the
+alias region and the heap region. `_memregionFindRandom` skips the alias and heap regions and
+anything mapped, and the kernel lets a shared memory lie anywhere else in the ASLR region
+(eden/src/core/hle/kernel/k_page_table_base.cpp, `KPageTableBase::CanContain`:
+`is_in_region && !is_in_heap && !is_in_alias` for `MemoryState::Shared`), so a placement in the
+stack region is accepted. `crates/core/tests/homebrew.rs` pairs placements by the same rule.
 
 Usage, from the repository root:
 
     tools/oracle/normalise.py --nro <fixture.nro> <raw startup.txt>
 
-The module's base is not in the trace, so it is worked out from the fixture: at start-up libnx
-asks `QueryMemory` about `__argdata__`, the first page after its image and its `.bss`
-(libnx/nx/source/runtime/argv.c), so the highest module address the trace names is the module's
-base plus the module's extent: the NRO's image size (the word at 0x18 of the file) and its
-`.bss` size (the word at 0x38), each rounded up to a page, as Eden loads them
-(eden/src/core/loader/nro.cpp, `LoadNroImpl`: `PageAlignSize(nro_header.file_size)` plus
-`PageAlignSize(nro_header.bss_size)`). Eden prefers the `.bss` size of the module's `MOD0`
-header when it has one; this script reads only the NRO header's, which for both fixtures ends
-exactly at `__argdata__` (checked against each ELF's symbol table when the fixture was added).
+The module's base is not in the trace, so it is worked out from the fixture. At start-up libnx
+asks `QueryMemory` about `__argdata__` (libnx/nx/source/runtime/argv.c), which libnx's linker
+script puts at the first page boundary after `.bss` (`. = ALIGN(0x1000)` before `__argdata__`
+in libnx/nx/switch.ld), so the highest module address the trace names is `__argdata__`. The
+script takes the module's extent, from its base to `__argdata__`, to be the NRO header's image
+size (the word at 0x18 of the file) plus its `.bss` size (the word at 0x38), each rounded up to
+a page. For both fixtures that ends exactly at `__argdata__` (checked against each ELF's symbol
+table when the startup fixture was added); that it does for every libnx NRO is a guess.
+
+This is not the extent Eden maps. Every libnx NRO has a `MOD0` header, and for those Eden's
+`LoadNroImpl` (eden/src/core/loader/nro.cpp, the `has_mod_header` branch) takes the `.bss`
+size from `MOD0` (`bss_end_offset - bss_start_offset`, rounded up to a page) and maps it after
+the page-aligned image. That is one page more than this script's extent for both fixtures:
+hello's `MOD0` `.bss` is 0xce0 bytes, which fit in the image's last page (its NRO header's
+`.bss` size is 0), and Eden maps a page for them (0x7000 against 0x6000); startup's is 0x47b0
+bytes, which Eden rounds to 0x5000 where the NRO header has 0x4000 (0x27000 against 0x26000).
+
 The script checks that the base is then page aligned and that every other module address lies
 inside the module.
 """
@@ -243,9 +256,13 @@ def main():
         sys.exit(f"the image {module[0]:#x}..{module[1]:#x} does not hold every code address")
 
     inner = ["stack_region", "alias_region", "heap_region"]
+    # The regions libnx keeps placements out of (see the module docs).
+    avoided = ["alias_region", "heap_region"]
     for start, end in placements:
         outside = all(
-            end <= anchors[name][0] or anchors[name][1] <= start for name in inner if name in anchors
+            end <= anchors[name][0] or anchors[name][1] <= start
+            for name in avoided
+            if name in anchors
         )
         aslr = anchors.get("aslr_region")
         if (
