@@ -651,7 +651,7 @@ fn drive<V: Vcpu, C: HostClock + Clone + 'static>(
 ) -> (Ending, GuestLog, Tally) {
     let machine = match Machine::start(dispatcher, space, session, env, limits, install) {
         Ok(machine) => machine,
-        Err(failed) => return failed,
+        Err(failed) => return *failed,
     };
     let count = machine.cores.count();
     let Vcpus { first, make } = vcpus;
@@ -702,11 +702,10 @@ impl<'a, V: Vcpu, C: HostClock + Clone> Machine<'a, V, C> {
         env: &'a Arc<LiveEnv>,
         limits: Limits,
         install: &Install,
-    ) -> Result<Self, (Ending, GuestLog, Tally)> {
-        let count = dispatcher
-            .with::<(&starquake_kernel::tables::Scheduler,), _>(|(scheduler,)| {
-                scheduler.core_count()
-            });
+    ) -> Result<Self, Box<(Ending, GuestLog, Tally)>> {
+        let count = dispatcher.with::<(&starquake_kernel::tables::Scheduler,), _>(|(scheduler,)| {
+            scheduler.core_count()
+        });
         let bell = Arc::new(timer::Bell::default());
         let machine = Self {
             session,
@@ -727,11 +726,11 @@ impl<'a, V: Vcpu, C: HostClock + Clone> Machine<'a, V, C> {
         let services_env: Arc<dyn Env> = Arc::<LiveEnv>::clone(env);
         if let Err(error) = install(&machine.dispatcher, services_env, machine.ready.clone()) {
             let ending = Ending::Failed(format!("the services could not be set up: {error}"));
-            return Err((
+            return Err(Box::new((
                 ending,
                 machine.log.into_inner_or_poisoned(),
                 Tally::default(),
-            ));
+            )));
         }
         session.record(EventKind::Lifecycle {
             phase: LifecyclePhase::ProcessStart,

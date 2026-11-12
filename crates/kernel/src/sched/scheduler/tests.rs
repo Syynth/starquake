@@ -837,7 +837,8 @@ fn rotation_takes_turns_between_threads_of_one_level() {
     settle(&mut s);
     assert_eq!(s.current(core(0)).unwrap(), Some(a));
     for (now, expected) in [(1, b), (2, a), (3, b)] {
-        s.rotate_scheduled_queue(None, core(0), prio(level)).unwrap();
+        s.rotate_scheduled_queue(None, core(0), prio(level))
+            .unwrap();
         let mut fake = Fake::default();
         s.update(GuestTicks(now), None, &mut fake).unwrap();
         // The core runs guest code, so it is interrupted, even when it asked (no caller here).
@@ -891,7 +892,8 @@ fn rotation_pulls_a_suggestion_of_the_same_level_to_the_front() {
     let c = spawn(&mut s, level, 1, &[0, 1]);
     settle(&mut s);
     assert_eq!(highest(&s, 0), Some(a));
-    s.rotate_scheduled_queue(None, core(0), prio(level)).unwrap();
+    s.rotate_scheduled_queue(None, core(0), prio(level))
+        .unwrap();
     settle_at(&mut s, 1);
     assert_eq!(s.thread(c).unwrap().active_core(), Some(core(0)));
     assert_eq!(highest(&s, 0), Some(c));
@@ -906,7 +908,8 @@ fn rotation_leaves_a_suggestion_whose_core_top_is_too_urgent() {
     let _top = spawn(&mut s, urgent, 1, &[1]);
     let c = spawn(&mut s, level, 1, &[0, 1]);
     settle(&mut s);
-    s.rotate_scheduled_queue(None, core(0), prio(level)).unwrap();
+    s.rotate_scheduled_queue(None, core(0), prio(level))
+        .unwrap();
     settle_at(&mut s, 1);
     assert_eq!(s.thread(c).unwrap().active_core(), Some(core(1)));
     assert_eq!(highest(&s, 0), Some(a));
@@ -931,7 +934,8 @@ fn rotation_prefers_the_thread_it_brought_forward_when_that_one_waited_longer() 
     assert_eq!(s.thread(c).unwrap().last_scheduled_tick(), GuestTicks(100));
     assert_eq!(s.thread(b).unwrap().last_scheduled_tick(), GuestTicks(0));
     assert_eq!(highest(&s, 0), Some(a));
-    s.rotate_scheduled_queue(None, core(0), prio(level)).unwrap();
+    s.rotate_scheduled_queue(None, core(0), prio(level))
+        .unwrap();
     settle_at(&mut s, 102);
     assert_eq!(s.thread(c).unwrap().active_core(), Some(core(1)));
     assert_eq!(highest(&s, 0), Some(b));
@@ -948,7 +952,8 @@ fn rotation_pulls_a_more_urgent_suggestion_when_the_best_thread_is_no_better() {
     let d = spawn(&mut s, level - 2, 1, &[0, 1]);
     settle(&mut s);
     assert_eq!(highest(&s, 0), Some(a));
-    s.rotate_scheduled_queue(None, core(0), prio(level)).unwrap();
+    s.rotate_scheduled_queue(None, core(0), prio(level))
+        .unwrap();
     settle_at(&mut s, 1);
     assert_eq!(s.thread(d).unwrap().active_core(), Some(core(0)));
     assert_eq!(highest(&s, 0), Some(d));

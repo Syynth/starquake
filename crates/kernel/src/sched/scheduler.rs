@@ -1113,9 +1113,7 @@ impl Scheduler {
                         self.count_scheduled(candidate)?;
                         break;
                     }
-                    suggested = self
-                        .queue
-                        .suggested_next(&self.threads, core, candidate)?;
+                    suggested = self.queue.suggested_next(&self.threads, core, candidate)?;
                 }
             }
         }

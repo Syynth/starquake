@@ -285,9 +285,7 @@ impl Wait {
         match self {
             Self::Address { key, .. } => Some((Tree::Arbiter, *key)),
             Self::CondVar { key, .. } => Some((Tree::CondVar, *key)),
-            Self::Sync { .. } | Self::Lock { .. } | Self::Reply { .. } | Self::Sleep { .. } => {
-                None
-            }
+            Self::Sync { .. } | Self::Lock { .. } | Self::Reply { .. } | Self::Sleep { .. } => None,
         }
     }
 }
@@ -900,7 +898,9 @@ impl Scheduler {
         result: ResultCode,
     ) -> CallResult<bool> {
         match self.sync_table().waits.get(&thread) {
-            Some(Wait::Reply { session: waited, .. }) if *waited == session => {}
+            Some(Wait::Reply {
+                session: waited, ..
+            }) if *waited == session => {}
             _ => return Ok(false),
         }
         let (_, unlinked) = self.unlink_wait(thread, None);

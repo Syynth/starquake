@@ -239,7 +239,10 @@ fn a_positive_sleep_waits_and_its_event_is_recorded_when_its_timer_ends_it() {
         assert_eq!(main.context(), &before);
     });
     // The clock steps 1,000 ns a reading, far past the 5 ns sleep: the next firing ends it.
-    world.dispatcher.fire_timers(&world.env, &world.recorder).unwrap();
+    world
+        .dispatcher
+        .fire_timers(&world.env, &world.recorder)
+        .unwrap();
     let events: Vec<_> = sink.events().into_iter().map(|event| event.kind).collect();
     let mut args = [0; starquake_trace::SVC_ARG_COUNT];
     args[0] = 5;

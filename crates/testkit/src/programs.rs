@@ -363,7 +363,13 @@ pub fn threads() -> Result<Threads, ProgramError> {
 
     let mut asm = Assembler::new();
     let main = asm.label();
-    let failures = [asm.label(), asm.label(), asm.label(), asm.label(), asm.label()];
+    let failures = [
+        asm.label(),
+        asm.label(),
+        asm.label(),
+        asm.label(),
+        asm.label(),
+    ];
     asm.b(main)?;
     let thread = asm.len();
     asm.emit(a64::mov(19, 0)?);

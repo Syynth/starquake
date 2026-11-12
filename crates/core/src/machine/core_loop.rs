@@ -50,9 +50,7 @@ pub(super) fn run<V: Vcpu, C: HostClock + Clone>(
         match this.step(vcpu) {
             Ok(Stepped::Running) => {}
             Ok(Stepped::Parked) => {
-                let parked = machine
-                    .cores
-                    .park(core, || machine.dispatcher.is_stalled());
+                let parked = machine.cores.park(core, || machine.dispatcher.is_stalled());
                 match parked {
                     Parked::Woken | Parked::Stopped => {}
                     Parked::Stalled => machine.stop(Ending::Failed(WAITING.to_owned())),
@@ -67,7 +65,7 @@ pub(super) fn run<V: Vcpu, C: HostClock + Clone>(
 /// owned form of [`Held`].
 enum Holds {
     Same,
-    Newer(GuestRegs),
+    Newer(Box<GuestRegs>),
     Older,
 }
 
@@ -84,7 +82,7 @@ impl Holds {
 /// A core's state between steps.
 pub(super) struct Core<'m, 'a, V: Vcpu, C> {
     machine: &'m Machine<'a, V, C>,
-    core: CoreId,
+    id: CoreId,
     running: Option<Running>,
     /// What the vCPU holds of the running thread, against its saved context.
     holds: Holds,
@@ -97,7 +95,7 @@ impl<'m, 'a, V: Vcpu, C: HostClock + Clone> Core<'m, 'a, V, C> {
     pub(super) fn new(machine: &'m Machine<'a, V, C>, core: CoreId) -> Self {
         Self {
             machine,
-            core,
+            id: core,
             running: None,
             holds: Holds::Same,
             must_switch: true,
@@ -139,7 +137,8 @@ impl<'m, 'a, V: Vcpu, C: HostClock + Clone> Core<'m, 'a, V, C> {
                     return Ok(Stepped::Running);
                 }
                 // Something changed elsewhere (a wake, a rotation): the scheduler says what.
-                self.holds = Holds::Newer(vcpu.regs().map_err(|error| Self::failed(&error))?);
+                self.holds =
+                    Holds::Newer(Box::new(vcpu.regs().map_err(|error| Self::failed(&error))?));
                 self.must_switch = true;
                 Ok(())
             }
@@ -153,7 +152,7 @@ impl<'m, 'a, V: Vcpu, C: HostClock + Clone> Core<'m, 'a, V, C> {
         let mut signals = machine.signals();
         let switch = machine
             .dispatcher
-            .switch(self.core, self.holds.held(), &mut signals)
+            .switch(self.id, self.holds.held(), &mut signals)
             .map_err(|error| Ending::Failed(format!("the scheduler failed: {error}")))?;
         match switch {
             Switch::Stay if self.running.is_none() => Err(Ending::Failed(
@@ -189,14 +188,14 @@ impl<'m, 'a, V: Vcpu, C: HostClock + Clone> Core<'m, 'a, V, C> {
         let mut debug = LogSink {
             session: machine.session,
             log: &machine.log,
-            core: self.core.index(),
+            core: self.id.index(),
             thread: running.guest_id,
         };
         let record = machine.dispatcher.dispatch(
             number,
             &mut regs,
             &mut Caller {
-                core: self.core.index(),
+                core: self.id.index(),
                 thread: running.guest_id,
                 env: &**machine.env,
                 memory: machine.session.memory,
@@ -218,7 +217,7 @@ impl<'m, 'a, V: Vcpu, C: HostClock + Clone> Core<'m, 'a, V, C> {
         match record.outcome {
             Outcome::Completed | Outcome::NotImplemented => {
                 vcpu.set_regs(&regs).map_err(|error| Self::failed(&error))?;
-                self.holds = Holds::Newer(regs);
+                self.holds = Holds::Newer(Box::new(regs));
                 Ok(())
             }
             Outcome::Waiting => {
@@ -234,7 +233,7 @@ impl<'m, 'a, V: Vcpu, C: HostClock + Clone> Core<'m, 'a, V, C> {
             }
             Outcome::ProcessExited => {
                 machine.session.record_on(
-                    self.core.index(),
+                    self.id.index(),
                     running.guest_id,
                     EventKind::Lifecycle {
                         phase: LifecyclePhase::ProcessExit,
@@ -283,7 +282,7 @@ impl<'m, 'a, V: Vcpu, C: HostClock + Clone> Core<'m, 'a, V, C> {
                     ),
                 };
                 self.machine.session.record_on(
-                    self.core.index(),
+                    self.id.index(),
                     running.guest_id,
                     EventKind::Fault {
                         address,

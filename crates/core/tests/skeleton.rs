@@ -710,7 +710,9 @@ fn a_second_thread_runs_natively_on_its_own_core_and_is_joined() {
         report.exit,
         ExitReason::ProcessExited,
         "{:?}\n{}",
-        report.crash().map(|crash| crash.to_text()),
+        report
+            .crash()
+            .map(starquake_core::crash::CrashReport::to_text),
         report.trace
     );
     let made: Vec<_> = report

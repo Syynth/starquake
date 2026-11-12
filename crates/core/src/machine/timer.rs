@@ -88,8 +88,7 @@ fn turns<V: Vcpu, C: HostClock + Clone>(machine: &Machine<'_, V, C>) -> Result<(
             return Err(Ending::TimedOut);
         }
         let now = clock.host_now();
-        if next_deadline(&machine.dispatcher).is_some_and(|deadline| deadline <= now)
-        {
+        if next_deadline(&machine.dispatcher).is_some_and(|deadline| deadline <= now) {
             machine
                 .dispatcher
                 .fire_timers(&**machine.env, &machine.session.recorder)
@@ -129,7 +128,9 @@ fn turns<V: Vcpu, C: HostClock + Clone>(machine: &Machine<'_, V, C>) -> Result<(
 
 /// Delivers the deferred replies of every server a [`Ready`](super::Ready) named since the last
 /// turn ([`Dispatcher::deliver_replies`]), then tells the cores whose thread changed.
-pub(super) fn deliver<V: Vcpu, C: HostClock + Clone>(machine: &Machine<'_, V, C>) -> Result<(), Ending> {
+pub(super) fn deliver<V: Vcpu, C: HostClock + Clone>(
+    machine: &Machine<'_, V, C>,
+) -> Result<(), Ending> {
     let servers = machine.ready.take();
     if servers.is_empty() {
         return Ok(());

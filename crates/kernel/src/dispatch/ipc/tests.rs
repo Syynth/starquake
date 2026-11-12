@@ -1279,19 +1279,16 @@ impl crate::sched::CoreSignals for Quiet {
 /// loop does, and returns it.
 fn run_thread_for(world: &World, thread: ThreadId) -> KernelThreadId {
     let core = crate::sched::CoreId::new(core_of(thread)).unwrap();
-    world.dispatcher.with::<(&mut Scheduler,), _>(|(scheduler,)| {
-        let priority = crate::sched::Priority::new(44).unwrap();
-        let id = scheduler.create_thread(priority, core).unwrap();
-        scheduler.start(id).unwrap();
-        scheduler
-            .update(GuestTicks(0), None, &mut Quiet)
-            .unwrap();
-        assert_eq!(
-            scheduler.schedule(core, &mut Quiet),
-            Ok(Some(id))
-        );
-        id
-    })
+    world
+        .dispatcher
+        .with::<(&mut Scheduler,), _>(|(scheduler,)| {
+            let priority = crate::sched::Priority::new(44).unwrap();
+            let id = scheduler.create_thread(priority, core).unwrap();
+            scheduler.start(id).unwrap();
+            scheduler.update(GuestTicks(0), None, &mut Quiet).unwrap();
+            assert_eq!(scheduler.schedule(core, &mut Quiet), Ok(Some(id)));
+            id
+        })
 }
 
 /// The run state of a scheduler thread, and whether it waits for a reply on `session`.
@@ -1320,9 +1317,15 @@ fn senders_that_wait_are_blocked_threads_and_the_reply_makes_them_runnable() {
         .first
         .script(Box::new(|_, _, _| Ok(Handled::Deferred)));
     // A's request is deferred, B's waits behind it: both wait for their replies.
-    assert_eq!(world.send(A, handle, &request()).0.outcome, Outcome::Waiting);
+    assert_eq!(
+        world.send(A, handle, &request()).0.outcome,
+        Outcome::Waiting
+    );
     world.first.script(reply_with(0xB0));
-    assert_eq!(world.send(B, handle, &request()).0.outcome, Outcome::Waiting);
+    assert_eq!(
+        world.send(B, handle, &request()).0.outcome,
+        Outcome::Waiting
+    );
     for thread in [a, b] {
         assert_eq!(
             reply_state(&world, thread, session),
@@ -1344,7 +1347,10 @@ fn senders_that_wait_are_blocked_threads_and_the_reply_makes_them_runnable() {
             (ThreadState::Runnable, false)
         );
         // The result is in the saved `x0`, where a switch loads it from.
-        assert_eq!(saved_x0(&world, thread), u64::from(ResultCode::SUCCESS.raw()));
+        assert_eq!(
+            saved_x0(&world, thread),
+            u64::from(ResultCode::SUCCESS.raw())
+        );
     }
     assert_eq!(world.tls(A), [0xA0; BUFFER_SIZE]);
     assert_eq!(world.tls(B), [0xB0; BUFFER_SIZE]);

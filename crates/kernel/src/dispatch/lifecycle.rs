@@ -81,9 +81,10 @@ impl Dispatcher {
                     })
                 },
             ),
-            SvcId::SleepThread => self.call_at::<(&mut Scheduler,)>(call, |(scheduler,), call, now| {
-                sleep_thread(scheduler, id, convention, call, now)
-            }),
+            SvcId::SleepThread => self
+                .call_at::<(&mut Scheduler,)>(call, |(scheduler,), call, now| {
+                    sleep_thread(scheduler, id, convention, call, now)
+                }),
             SvcId::SetThreadPriority => self.call_in_process::<(&HandleTable, &mut Scheduler)>(
                 call,
                 |(handles, scheduler), call, _, processes| {

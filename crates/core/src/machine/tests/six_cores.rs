@@ -17,7 +17,7 @@ use std::sync::mpsc;
 
 use starquake_cpu::GuestRegs;
 use starquake_kernel::id::ObjectId;
-use starquake_kernel::ipc::{HandlerError, Handled, IpcContext, PortName, SessionHandler};
+use starquake_kernel::ipc::{Handled, HandlerError, IpcContext, PortName, SessionHandler};
 use starquake_kernel::sched::PREEMPTION_PRIORITIES;
 use starquake_trace::{ServiceId, VecSink};
 
@@ -69,13 +69,14 @@ fn succeeded(regs: &mut GuestRegs) {
 
 /// A thread's first instruction: it is the thread started with `argument`, which it keeps in
 /// `x19` from here on. Logs it in `order`.
-fn begins(
-    argument: u64,
-    order: &Rc<RefCell<Vec<u64>>>,
-) -> impl FnOnce(&mut GuestRegs) + 'static {
+fn begins(argument: u64, order: &Rc<RefCell<Vec<u64>>>) -> impl FnOnce(&mut GuestRegs) + 'static {
     let order = Rc::clone(order);
     move |regs| {
-        assert_eq!((regs.x[0], regs.pc), (argument, ENTRY), "thread {argument:#x}");
+        assert_eq!(
+            (regs.x[0], regs.pc),
+            (argument, ENTRY),
+            "thread {argument:#x}"
+        );
         regs.x[19] = argument;
         order.borrow_mut().push(argument);
     }
@@ -90,7 +91,11 @@ fn still(mark: u64) -> impl FnOnce(&mut GuestRegs) + 'static {
 fn on_core(mark: u64, core: u8) -> impl FnOnce(&mut GuestRegs) + 'static {
     move |regs| {
         assert_eq!(regs.x[19], mark, "the thread that runs is not {mark:#x}");
-        assert_eq!(regs.x[0], u64::from(core), "thread {mark:#x} is on another core");
+        assert_eq!(
+            regs.x[0],
+            u64::from(core),
+            "thread {mark:#x} is on another core"
+        );
     }
 }
 
@@ -128,7 +133,11 @@ impl<'m, 'a> Stepper<'m, 'a> {
     /// Rounds of one step per core that is not parked, core 0 first, with `between` run
     /// before each round, until the run stops; at most `rounds` of them. A parked core steps
     /// again once it was woken. Returns how many rounds ran.
-    fn run(&mut self, rounds: usize, mut between: impl FnMut(usize, &Machine<'a, ScriptedVcpu, FixedClock>)) -> usize {
+    fn run(
+        &mut self,
+        rounds: usize,
+        mut between: impl FnMut(usize, &Machine<'a, ScriptedVcpu, FixedClock>),
+    ) -> usize {
         let machine = self.machine;
         for round in 0..rounds {
             between(round, machine);
@@ -171,7 +180,10 @@ fn fire_timers(machine: &Machine<'_, ScriptedVcpu, FixedClock>) {
         .dispatcher
         .fire_timers(&**machine.env, &machine.session.recorder)
         .unwrap();
-    machine.dispatcher.reschedule(&mut machine.signals()).unwrap();
+    machine
+        .dispatcher
+        .reschedule(&mut machine.signals())
+        .unwrap();
 }
 
 /// What a stepped run left: how it ended, its events, and the scripts' leftovers.
@@ -265,7 +277,8 @@ fn the_most_urgent_thread_of_a_core_runs_first_and_only_on_the_cores_it_may_use(
         .then(succeeded, svc(SvcId::ExitThread));
     // Core 1: the first thread runs while the others are started, and asks which core it is
     // on; then the more urgent of the other two, then the last.
-    let mut core1 = ScriptedVcpu::new().then(begins(1, &order), svc(SvcId::GetCurrentProcessorNumber));
+    let mut core1 =
+        ScriptedVcpu::new().then(begins(1, &order), svc(SvcId::GetCurrentProcessorNumber));
     for _ in 0..8 {
         core1 = core1.then(on_core(1, 1), svc(SvcId::GetCurrentProcessorNumber));
     }
@@ -280,7 +293,7 @@ fn the_most_urgent_thread_of_a_core_runs_first_and_only_on_the_cores_it_may_use(
     // core 1, and every call of the main thread on core 0.
     for event in &outcome.events {
         if let EventKind::Svc { .. } = event.kind {
-            let expected = if event.thread == MAIN_THREAD { 0 } else { 1 };
+            let expected = u8::from(event.thread != MAIN_THREAD);
             assert_eq!(event.core, expected, "{event:?}");
         }
     }
@@ -318,13 +331,19 @@ fn a_thread_woken_by_its_timer_preempts_a_less_urgent_one_on_its_core() {
         .then(still(0xA), svc(SvcId::ExitThread))
         .then(still(0x1), svc(SvcId::ExitProcess));
     let mut fired = 0;
-    let outcome = stepped(&guest, &guest.memory, vec![core0], &real_services, |round, machine| {
-        // The timer thread's turn, once the main thread has run twice since the sleep began.
-        if round == 5 {
-            fire_timers(machine);
-            fired += 1;
-        }
-    });
+    let outcome = stepped(
+        &guest,
+        &guest.memory,
+        vec![core0],
+        &real_services,
+        |round, machine| {
+            // The timer thread's turn, once the main thread has run twice since the sleep began.
+            if round == 5 {
+                fire_timers(machine);
+                fired += 1;
+            }
+        },
+    );
     assert_exited(&outcome);
     assert_eq!(fired, 1);
     // One sleep, recorded once, with success.
@@ -338,7 +357,10 @@ fn a_thread_woken_by_its_timer_preempts_a_less_urgent_one_on_its_core() {
     assert_eq!(sleeps.len(), 1);
     assert!(matches!(
         sleeps[0].kind,
-        EventKind::Svc { result: starquake_trace::ResultCode(0), .. }
+        EventKind::Svc {
+            result: starquake_trace::ResultCode(0),
+            ..
+        }
     ));
 }
 
@@ -347,7 +369,10 @@ fn time_slicing_takes_turns_between_threads_of_one_level_and_keeps_their_registe
     let guest = Guest::new(&programs::hello().unwrap());
     let order = Rc::new(RefCell::new(Vec::new()));
     let level = i32::from(PREEMPTION_PRIORITIES[1].get());
-    assert!(level > main_priority(), "the main thread must not be sliced away");
+    assert!(
+        level > main_priority(),
+        "the main thread must not be sliced away"
+    );
     let main = ScriptedVcpu::new()
         .then(create(0xA, level, 1), svc(SvcId::CreateThread))
         .then(start_created, svc(SvcId::StartThread))
@@ -370,11 +395,17 @@ fn time_slicing_takes_turns_between_threads_of_one_level_and_keeps_their_registe
         .then(on_core(0xB, 1), svc(SvcId::GetCurrentProcessorNumber))
         .then(on_core(0xA, 1), svc(SvcId::ExitThread))
         .then(on_core(0xB, 1), svc(SvcId::ExitThread));
-    let outcome = stepped(&guest, &guest.memory, vec![main, core1], &real_services, |round, machine| {
-        if round == 5 || round == 8 {
-            machine.dispatcher.preempt(&mut machine.signals()).unwrap();
-        }
-    });
+    let outcome = stepped(
+        &guest,
+        &guest.memory,
+        vec![main, core1],
+        &real_services,
+        |round, machine| {
+            if round == 5 || round == 8 {
+                machine.dispatcher.preempt(&mut machine.signals()).unwrap();
+            }
+        },
+    );
     assert_exited(&outcome);
     assert_eq!(*order.borrow(), [0xA, 0xB]);
 }
@@ -454,7 +485,9 @@ impl GuestMemory for WithTls<'_> {
     }
 
     fn write(&self, va: u64, data: &[u8]) -> Result<(), Fault> {
-        self.image.write(va, data).or_else(|_| self.tls.write(va, data))
+        self.image
+            .write(va, data)
+            .or_else(|_| self.tls.write(va, data))
     }
 }
 
@@ -495,17 +528,23 @@ fn a_deferred_reply_is_delivered_by_the_timers_turn_and_wakes_its_sender() {
         )
         .then(succeeded, svc(SvcId::ExitProcess));
     let mut delivered_at = None;
-    let outcome = stepped(&guest, &space, vec![main], &install_deferring, |round, machine| {
-        // Every round is a timer turn: nothing is ready until the request was deferred.
-        let before = lock(&machine.ready.servers).len();
-        assert!(
-            crate::machine::timer::deliver(machine).is_ok(),
-            "a delivery failed"
-        );
-        if before > 0 && delivered_at.is_none() {
-            delivered_at = Some(round);
-        }
-    });
+    let outcome = stepped(
+        &guest,
+        &space,
+        vec![main],
+        &install_deferring,
+        |round, machine| {
+            // Every round is a timer turn: nothing is ready until the request was deferred.
+            let before = lock(&machine.ready.servers).len();
+            assert!(
+                crate::machine::timer::deliver(machine).is_ok(),
+                "a delivery failed"
+            );
+            if before > 0 && delivered_at.is_none() {
+                delivered_at = Some(round);
+            }
+        },
+    );
     assert_exited(&outcome);
     assert!(delivered_at.is_some(), "the reply was never ready");
     let mut reply = vec![0; starquake_ipc::BUFFER_SIZE];

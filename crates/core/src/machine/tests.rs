@@ -45,15 +45,13 @@ fn timebase() -> Timebase<SystemClock> {
     }
 }
 
-/// The vCPU of every core but core 0 in a scripted run: a script with no steps, so a thread
+/// Makes the vCPU of every core but core 0 in a scripted run: a script with no steps, so a thread
 /// the scheduler gives one of those cores fails the run ("no more exits").
-fn idle(_: CoreId) -> Result<ScriptedVcpu, starquake_cpu::Error> {
-    Ok(ScriptedVcpu::new())
-}
+static IDLE: fn(CoreId) -> Result<ScriptedVcpu, starquake_cpu::Error> = |_| Ok(ScriptedVcpu::new());
 
-/// A scripted run's vCPUs: `first` for core 0, and [`idle`] ones for the others.
+/// A scripted run's vCPUs: `first` for core 0, and [`IDLE`] ones for the others.
 fn vcpus(first: &mut ScriptedVcpu) -> Vcpus<'_, ScriptedVcpu> {
-    Vcpus { first, make: &idle }
+    Vcpus { first, make: &IDLE }
 }
 
 /// Flat memory as a guest's address space: it backs nothing lazily (every byte it has is
@@ -245,7 +243,10 @@ fn the_guest_programs_use_the_kernels_system_call_numbers() {
             programs::SVC_GET_CURRENT_PROCESSOR_NUMBER,
             SvcId::GetCurrentProcessorNumber,
         ),
-        (programs::SVC_WAIT_SYNCHRONIZATION, SvcId::WaitSynchronization),
+        (
+            programs::SVC_WAIT_SYNCHRONIZATION,
+            SvcId::WaitSynchronization,
+        ),
     ] {
         assert_eq!(restated, u32::from(id.number()), "{}", id.name());
     }
