@@ -11,7 +11,7 @@
 //!
 //! Every entry is cross-checked in the tests against Mesa's NVIDIA format table
 //! (`mesa-nouveau/src/nouveau/nil/nil_formats.csv` @ 52238762, MIT, Copyright 2024 Collabora
-//! Ltd., copied unchanged into this folder as the test's data): block size, bits per block, numeric
+//! Ltd., copied into this folder as the test's data with only its line endings changed to LF): block size, bits per block, numeric
 //! type, sRGB and depth/stencil aspect. One entry has no Mesa row (`G4R4_UNORM`; the test lists
 //! it, with the reason).
 //!

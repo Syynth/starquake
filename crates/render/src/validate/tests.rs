@@ -473,6 +473,21 @@ fn view_format_must_match_block_and_aspect() {
             "a view's format must have the same block size as its texture's"
         ))
     );
+    // Same bits and block height, different block width.
+    let astc = TextureDesc {
+        format: PixelFormat::Astc2d8x8Unorm,
+        ..t
+    };
+    assert_eq!(
+        validate_view(
+            &c,
+            &astc,
+            &view(PixelFormat::Astc2d10x8Unorm, ViewDimension::D2, (0, 1))
+        ),
+        Err(RenderError::Invalid(
+            "a view's format must have the same block size as its texture's"
+        ))
+    );
     // Same block size, different aspect.
     assert_eq!(
         validate_view(
@@ -2089,12 +2104,24 @@ fn copy_texture(format: PixelFormat, usage: TextureUsage) -> TextureDesc {
 #[test]
 fn copy_usages() {
     let readable = buffer(1024);
+    // Each lacks exactly one of the two copy usages, so a check of the wrong one shows.
     let unreadable = BufferDesc {
-        usage: BufferUsage::VERTEX,
+        usage: BufferUsage::VERTEX | BufferUsage::COPY_DST,
+        ..readable
+    };
+    let unwritable = BufferDesc {
+        usage: BufferUsage::VERTEX | BufferUsage::COPY_SRC,
         ..readable
     };
     let s = slice(16);
-    let sampled = copy_texture(PixelFormat::A8B8G8R8Unorm, TextureUsage::SAMPLED);
+    let sampled = copy_texture(
+        PixelFormat::A8B8G8R8Unorm,
+        TextureUsage::SAMPLED | TextureUsage::COPY_DST,
+    );
+    let read_only = copy_texture(
+        PixelFormat::A8B8G8R8Unorm,
+        TextureUsage::SAMPLED | TextureUsage::COPY_SRC,
+    );
     let copyable = copy_texture(
         PixelFormat::A8B8G8R8Unorm,
         TextureUsage::COPY_SRC | TextureUsage::COPY_DST,
@@ -2113,7 +2140,7 @@ fn copy_usages() {
         ),
         (
             buf(&readable),
-            buf(&unreadable),
+            buf(&unwritable),
             "copy destination buffer",
             "copy destination",
         ),
@@ -2125,7 +2152,7 @@ fn copy_usages() {
         ),
         (
             tex(&copyable),
-            tex(&sampled),
+            tex(&read_only),
             "copy destination texture",
             "copy destination",
         ),

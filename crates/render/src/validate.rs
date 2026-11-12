@@ -4,7 +4,9 @@
 //! counts, sample counts, format support, binding counts, and copy extents (start, end and the
 //! whole region, in 64-bit arithmetic that cannot overflow for `u32` inputs, or checked where it
 //! can) (docs/specs/render-backend.md, "Errors and untrusted input"). Each function returns the
-//! first problem it finds as a [`RenderError`]; none panics on any input.
+//! first problem it finds as a [`RenderError`]. None of them unwraps or does arithmetic that can
+//! overflow unchecked; `validate::tests::region_checks_never_panic` feeds the texture,
+//! view, region, copy, upload and rectangle checks arbitrary values.
 //!
 //! Where both the device and the guest GPU bound a count (colour targets, vertex attributes and
 //! buffers, viewports), the limit is the smaller of [`crate::caps::Limits`] and the guest
@@ -373,6 +375,12 @@ fn stage_supported(caps: &Caps, stage: ShaderStage) -> Result<(), RenderError> {
     }
 }
 
+/// Whether any value occurs twice.
+fn has_duplicates<T: Ord>(mut values: Vec<T>) -> bool {
+    values.sort_unstable();
+    values.windows(2).any(|w| w[0] == w[1])
+}
+
 /// Group and binding numbers below the device's limits, each pair used once.
 fn check_bind_slots(
     caps: &Caps,
@@ -393,8 +401,7 @@ fn check_bind_slots(
         )?;
         seen.push((group, binding));
     }
-    seen.sort_unstable();
-    if seen.windows(2).any(|w| w[0] == w[1]) {
+    if has_duplicates(seen) {
         return Err(RenderError::Invalid(duplicate));
     }
     Ok(())
@@ -418,8 +425,7 @@ fn check_interface(
         }
         locations.push(v.location);
     }
-    locations.sort_unstable();
-    if locations.windows(2).any(|w| w[0] == w[1]) {
+    if has_duplicates(locations) {
         return Err(RenderError::Invalid(duplicate));
     }
     Ok(())
@@ -545,8 +551,7 @@ fn check_vertex_input(caps: &Caps, input: &VertexLayout) -> Result<(), RenderErr
         )?;
         locations.push(a.location);
     }
-    locations.sort_unstable();
-    if locations.windows(2).any(|w| w[0] == w[1]) {
+    if has_duplicates(locations) {
         return Err(RenderError::Invalid(
             "a pipeline uses one vertex attribute location twice",
         ));
