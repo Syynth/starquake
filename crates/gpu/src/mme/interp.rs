@@ -99,6 +99,26 @@ impl Default for DataRam {
     }
 }
 
+/// How a run reaches its data RAM: `DREAD` and `DWRITE` go through this, so that the memo
+/// (`memo.rs`) can see which words a call read and wrote without a second interpreter.
+pub(super) trait RamAccess {
+    /// The word at `index`, or `None` past the end.
+    fn read(&mut self, index: u32) -> Option<u32>;
+    /// Writes the word at `index`; `None` past the end, and nothing is written.
+    fn write(&mut self, index: u32, value: u32) -> Option<()>;
+}
+
+impl RamAccess for DataRam {
+    fn read(&mut self, index: u32) -> Option<u32> {
+        self.get(index)
+    }
+
+    fn write(&mut self, index: u32, value: u32) -> Option<()> {
+        *self.get_mut(index)? = value;
+        Some(())
+    }
+}
+
 /// What a running macro needs from the rest of the GPU front: Mesa's `mme_sim_state_ops`
 /// (`load`, `state`, `mthd`, `barrier`; `map_dram` is the [`DataRam`] argument of [`run`]).
 ///
@@ -281,9 +301,9 @@ fn compare(op: AluOp, x: u32, y: u32) -> bool {
     }
 }
 
-struct Machine<'a, H> {
+struct Machine<'a, R, H> {
     program: &'a [Instruction],
-    ram: &'a mut DataRam,
+    ram: &'a mut R,
     host: &'a mut H,
     /// Index of the executing instruction.
     ip: usize,
@@ -304,7 +324,7 @@ struct Machine<'a, H> {
     loop_end: usize,
 }
 
-impl<H: MacroHost> Machine<'_, H> {
+impl<R: RamAccess, H: MacroHost> Machine<'_, R, H> {
     fn read_reg(
         &self,
         inst: &Instruction,
@@ -469,14 +489,13 @@ impl<H: MacroHost> Machine<'_, H> {
             AluOp::Dread => {
                 res = self
                     .ram
-                    .get(x)
+                    .read(x)
                     .ok_or(MacroError::DataRamOutOfBounds { pc, index: x })?;
             }
             AluOp::Dwrite => {
-                *self
-                    .ram
-                    .get_mut(x)
-                    .ok_or(MacroError::DataRamOutOfBounds { pc, index: x })? = y;
+                self.ram
+                    .write(x, y)
+                    .ok_or(MacroError::DataRamOutOfBounds { pc, index: x })?;
             }
         }
 
@@ -572,6 +591,16 @@ impl<H: MacroHost> Machine<'_, H> {
 pub fn run(
     program: &[Instruction],
     data_ram: &mut DataRam,
+    host: &mut impl MacroHost,
+    limit: StepLimit,
+) -> Result<(), MacroError> {
+    run_with(program, data_ram, host, limit)
+}
+
+/// [`run`] over any [`RamAccess`]: the memo runs calls through one that records the accesses.
+pub(super) fn run_with(
+    program: &[Instruction],
+    data_ram: &mut impl RamAccess,
     host: &mut impl MacroHost,
     limit: StepLimit,
 ) -> Result<(), MacroError> {

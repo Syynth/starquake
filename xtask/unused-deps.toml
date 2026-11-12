@@ -39,8 +39,8 @@ reason = "core wires the whole stack (docs/architecture.md, 'Crates and dependen
 
 [[allow]]
 package = "starquake-gpu"
-dependencies = ["starquake-memory", "starquake-render", "starquake-shader"]
-reason = "gpu depends on memory, shader and render (docs/architecture.md, 'Crates and dependency direction'); the front reads pushbuffers from guest memory and the back records into the render backend, neither of which is written yet (only the macro interpreter is)"
+dependencies = ["starquake-memory", "starquake-shader"]
+reason = "gpu depends on memory and shader (docs/architecture.md, 'Crates and dependency direction'); the front reads pushbuffers from guest memory and the back asks the shader cache for programs, neither of which is written yet"
 
 [[allow]]
 package = "starquake-gpu"
