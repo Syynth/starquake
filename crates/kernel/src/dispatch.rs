@@ -1,19 +1,35 @@
 //! The system-call dispatcher: the only code that takes kernel locks. It acquires the tables a call
-//! declares, in one fixed order, and records the event before releasing them.
+//! declares, in one fixed order, hands the call exactly those, and records the event before
+//! releasing them.
 //!
-//! Kernel spec, "Tables behind a dispatcher, one lock to start" and "System calls":
+//! Kernel spec, "Tables behind a dispatcher, one lock to start", "System calls" and "Guest time":
 //!
-//! - **One lock.** To start, a single mutex guards every table ([`Tables`]). Acquiring the tables a
-//!   call declares is taking that lock. When the lock is split (the spec's steps 1-3), the
-//!   dispatcher takes the per-table locks in the fixed order handle table, address space,
-//!   scheduler, and nothing outside this module changes.
+//! - **Declared tables.** A system call is a function whose parameters are the tables it touches
+//!   (`fn close_handle(handles: &mut HandleTable, scheduler: &mut Scheduler, ..)`). Its dispatch
+//!   arm names the same set as a type, a tuple of `&Table` and `&mut Table` in lock order
+//!   ([`TableSet`]), and receives those borrows and nothing else. See "A call can't reach a
+//!   table it didn't declare" below.
+//! - **One lock.** To start, a single mutex guards every table ([`Tables`]). Acquiring the tables
+//!   a call declares is taking that lock and splitting the borrow. When the lock is split (the
+//!   spec's steps 1-3), the dispatcher takes the per-table locks in the fixed order handle
+//!   table, address space, scheduler, shared or exclusive as [`TableSet::DECLARED`] says, and
+//!   nothing outside this module changes.
+//! - **Lock waits are measured** ([`Dispatcher::lock_waits`]), per table, so the decision to
+//!   split is made from numbers. See [`LockWaits`] for what is charged to a table.
+//! - **One clock reading per dispatch.** After taking the lock, the dispatcher reads the
+//!   environment's clock once and converts it to guest ticks with the process's counter rate
+//!   ([`crate::time`]). That one reading is the event's `time` and what `GetSystemTick`
+//!   returns, and is handed to any call that needs the time. System calls never read the clock
+//!   themselves, so they stay pure functions of their tables and arguments, and a replay feeds
+//!   back exactly one reading per dispatch, in the kernel's order.
 //! - **One `match`** from system-call number to a typed function. Arguments are decoded with the
 //!   call's [`Convention`], and outputs written back with it.
 //! - **Unknown and unimplemented calls** (an unlisted number, or a call whose [`Status`] isn't
-//!   [`Status::Implemented`]) are logged and return [`KernelError::NotImplemented`] in `x0`. Any
-//!   system call number and any register values dispatch without a panic, given an [`Env`],
-//!   [`GuestMemory`] and [`DebugSink`] that don't panic themselves (tests: every unlisted number
-//!   in `0..=u16::MAX`, and a property test over any number, core and `x0`-`x7`).
+//!   [`Status::Implemented`]) are logged with their status and return
+//!   [`KernelError::NotImplemented`] in `x0`. Any system call number and any register values
+//!   dispatch without a panic, given an [`Env`], [`GuestMemory`] and [`DebugSink`] that don't
+//!   panic themselves (tests: every unlisted number in `0..=u16::MAX`, and a property test over
+//!   any number, core and `x0`-`x7`).
 //! - **One recording point** (observability spec, "One recording point per boundary"): every
 //!   dispatch that returns to the guest ends in one `EventKind::Svc` event, recorded with the
 //!   caller's [`Recorder`] while the lock is still held. The recorder assigns the event's `seq`
@@ -39,69 +55,144 @@
 //!   `ExitProcess`).
 //!
 //! Intentional divergences from Eden (`eden/src/core/hle/kernel/svc.cpp` @ cf654052, `Call64`),
-//! pinned by tests in `dispatch/tests.rs`:
+//! pinned by the named tests in `dispatch/tests.rs`:
 //! - Eden's `Call64` reaches `UNREACHABLE_MSG` for a number it doesn't list. Here an unlisted
-//!   number returns [`KernelError::NotImplemented`] (kernel spec, "System calls").
+//!   number returns [`KernelError::NotImplemented`] (kernel spec, "System calls"). Test:
+//!   `unknown_numbers_return_not_implemented_and_touch_only_x0`.
 //! - Eden's generated wrapper for a call writes every output its convention lists (a void call
 //!   writes none). Here a call that isn't implemented writes [`KernelError::NotImplemented`] to
 //!   `x0` and leaves `x1`-`x7` as they were, whatever its convention lists, void calls included.
-//! - When the environment fails (a replay that doesn't match its recording), the call writes
-//!   nothing and the dispatch ends in [`Outcome::EnvFailed`]: there is no honest value to give the
-//!   guest, and the run has already diverged. Eden reads its clock directly and can't fail here.
+//!   Test: `a_planned_call_returns_not_implemented_and_leaves_its_outputs_alone`. (An
+//!   implemented call that fails with a result the guest sees does write them, as zeros. That
+//!   matches Eden's wrapper only for a call whose body assigns no output before it fails: the
+//!   wrapper value-initialises the outputs and writes whatever the body left in them.
+//!   `GetThreadPriority`, the one arm with a second output today, is such a call. The docs of
+//!   `returning`, the function that writes them, name a call that is not. Test:
+//!   `a_failing_call_writes_its_result_and_zeroes_its_other_outputs`.)
+//! - When the environment's clock fails (a replay that doesn't match its recording), the call
+//!   does not run and writes nothing, and the dispatch ends in [`Outcome::EnvFailed`]: there is
+//!   no honest value to give the guest, and the run has already diverged. Eden reads its clock
+//!   directly and can't fail here. Test: `a_failing_environment_ends_the_call_without_writing_registers`.
+//! - When a table operation fails in a way no guest input explains ([`SvcError::Internal`]: the
+//!   kernel's own bookkeeping is inconsistent, or the core loop has not told the scheduler what
+//!   it runs), the failure is logged as an error and the guest sees
+//!   [`KernelError::NotImplemented`], with `x1`-`x7` untouched, as for a call that isn't
+//!   implemented. Eden asserts. The run goes on, and its summary lists the call as stubbed. Test:
+//!   `an_internal_failure_is_not_implemented_to_the_guest`.
 //!
 //! # A call can't reach a table it didn't declare
 //!
-//! A system call is a function whose parameters are what it touches. The tables live inside the
-//! [`Dispatcher`], behind its lock, and nothing public hands them out while it can still dispatch.
-//! A call that declares only the environment compiles, even when it is also handed the dispatcher:
+//! The tables live inside the [`Dispatcher`], behind its lock. The only way to them is to name a
+//! [`TableSet`]: [`Dispatcher::with`] (and every dispatch arm, which goes through the same
+//! private step) locks, splits the borrow, and passes exactly the declared tables. A system call
+//! that closes a handle declares the handle table and the scheduler, and gets them:
 //!
 //! ```
 //! use starquake_kernel::dispatch::Dispatcher;
-//! use starquake_trace::{Env, EnvError, GuestTicks};
+//! use starquake_kernel::handle::{Handle, HandleTable};
+//! use starquake_kernel::result::CallResult;
+//! use starquake_kernel::tables::Scheduler;
 //!
-//! fn get_system_tick(env: &dyn Env, _dispatcher: &Dispatcher) -> Result<u64, EnvError> {
-//!     env.now().map(|GuestTicks(ticks)| ticks)
+//! fn close_handle(handles: &mut HandleTable, scheduler: &mut Scheduler, handle: Handle) -> CallResult<()> {
+//!     handles.remove(scheduler.objects_mut(), handle)?;
+//!     Ok(())
+//! }
+//!
+//! fn run(dispatcher: &Dispatcher, handle: Handle) -> CallResult<()> {
+//!     dispatcher.with::<(&mut HandleTable, &mut Scheduler), _>(|(handles, scheduler)| {
+//!         close_handle(handles, scheduler, handle)
+//!     })
 //! }
 //! ```
 //!
-//! The same call can't reach the scheduler through the dispatcher's lock, which is private
-//! (`E0616`, a private field):
+//! Declaring only the handle table and still asking for the scheduler does not compile: the
+//! call is handed a one-table tuple, and there is no second table in it (`E0308`, mismatched
+//! types):
+//!
+//! ```compile_fail,E0308
+//! use starquake_kernel::dispatch::Dispatcher;
+//! use starquake_kernel::handle::{Handle, HandleTable};
+//! use starquake_kernel::result::CallResult;
+//! use starquake_kernel::tables::Scheduler;
+//!
+//! fn close_handle(handles: &mut HandleTable, scheduler: &mut Scheduler, handle: Handle) -> CallResult<()> {
+//!     handles.remove(scheduler.objects_mut(), handle)?;
+//!     Ok(())
+//! }
+//!
+//! fn run(dispatcher: &Dispatcher, handle: Handle) -> CallResult<()> {
+//!     dispatcher.with::<(&mut HandleTable,), _>(|(handles, scheduler)| {
+//!         close_handle(handles, scheduler, handle)
+//!     })
+//! }
+//! ```
+//!
+//! A table declared shared can't be changed (`E0596`, a mutable borrow of a `&` reference):
+//!
+//! ```compile_fail,E0596
+//! use starquake_kernel::dispatch::Dispatcher;
+//! use starquake_kernel::handle::{Handle, HandleTable};
+//! use starquake_kernel::result::CallResult;
+//! use starquake_kernel::tables::Scheduler;
+//!
+//! fn run(dispatcher: &Dispatcher, handle: Handle) -> CallResult<()> {
+//!     dispatcher.with::<(&HandleTable, &Scheduler), _>(|(handles, scheduler)| {
+//!         handles.remove(scheduler.objects_mut(), handle)?;
+//!         Ok(())
+//!     })
+//! }
+//! ```
+//!
+//! The tables are taken in the fixed order, so a set that names them out of order, or one table
+//! twice, is not a [`TableSet`] (`E0277`, an unsatisfied trait bound):
+//!
+//! ```compile_fail,E0277
+//! use starquake_kernel::dispatch::Dispatcher;
+//! use starquake_kernel::handle::HandleTable;
+//! use starquake_kernel::tables::Scheduler;
+//!
+//! fn run(dispatcher: &Dispatcher) {
+//!     dispatcher.with::<(&mut Scheduler, &mut HandleTable), _>(|(_scheduler, _handles)| ());
+//! }
+//! ```
+//!
+//! ```compile_fail,E0277
+//! use starquake_kernel::dispatch::Dispatcher;
+//! use starquake_kernel::tables::Scheduler;
+//!
+//! fn run(dispatcher: &Dispatcher) {
+//!     dispatcher.with::<(&mut Scheduler, &Scheduler), _>(|(_first, _second)| ());
+//! }
+//! ```
+//!
+//! And nothing reaches around the declaration: the lock is private (`E0616`, a private field).
 //!
 //! ```compile_fail,E0616
 //! use starquake_kernel::dispatch::Dispatcher;
-//! use starquake_trace::{Env, EnvError, GuestTicks};
 //!
-//! fn get_system_tick(env: &dyn Env, _dispatcher: &Dispatcher) -> Result<u64, EnvError> {
-//!     let _scheduler = &_dispatcher.tables;
-//!     env.now().map(|GuestTicks(ticks)| ticks)
+//! fn run(dispatcher: &Dispatcher) {
+//!     let _everything = &dispatcher.state;
 //! }
 //! ```
 //!
-//! nor by taking the tables out, which consumes the dispatcher, and a call never owns it (`E0507`,
-//! a move out of a borrow):
-//!
-//! ```compile_fail,E0507
-//! use starquake_kernel::dispatch::Dispatcher;
-//! use starquake_trace::{Env, EnvError, GuestTicks};
-//!
-//! fn get_system_tick(env: &dyn Env, _dispatcher: &Dispatcher) -> Result<u64, EnvError> {
-//!     let _scheduler = _dispatcher.into_tables().scheduler;
-//!     env.now().map(|GuestTicks(ticks)| ticks)
-//! }
-//! ```
-//!
-//! Each failing example differs from the compiling one by its `let _scheduler` line.
+//! Each failing example differs from the compiling one only in the lines the text above it
+//! names.
 
-use std::sync::{Mutex, PoisonError};
+use std::fmt;
+use std::marker::PhantomData;
+use std::sync::{Mutex, MutexGuard, PoisonError, TryLockError};
+use std::time::Duration;
 
 use starquake_cpu::GuestRegs;
 use starquake_memory::GuestMemory;
 use starquake_trace::{Env, EnvError, EventKind, GuestTicks, Recorder, SVC_ARG_COUNT, ThreadId};
 
-use crate::handle::HandleTable;
-use crate::result::{KernelError, ResultCode, result_code};
+use crate::handle::{Handle, HandleTable};
+use crate::result::{CallResult, KernelError, ResultCode, SvcError};
+use crate::sched::CoreId;
 use crate::svc::{
-    Convention, ConventionError, DebugSink, Kind, Status, SvcId, debug, processor, tick,
+    Convention, ConventionError, DebugSink, Kind, Status, SvcId, debug, handle, processor, thread,
+    tick,
 };
 use crate::tables::{AddressSpace, Processes, Scheduler};
 
@@ -121,15 +212,207 @@ pub struct Tables {
     pub handles: HandleTable,
     /// The process's address space; second in lock order.
     pub address_space: AddressSpace,
-    /// Threads, run queues and wait lists; third in lock order.
+    /// Threads, run queues, wait lists and the object table; third in lock order.
     pub scheduler: Scheduler,
-    /// Per-process facts fixed at creation. Needs no lock of its own.
+    /// Per-process facts fixed at creation. Needs no lock of its own, so no call declares it:
+    /// the dispatcher reads the counter rate from it to keep guest time.
     pub processes: Processes,
 }
 
+/// How a call uses a table it declares: `&Table` or `&mut Table`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Access {
+    /// `&Table`: the call only reads it.
+    Shared,
+    /// `&mut Table`: the call may change it.
+    Exclusive,
+}
+
+/// The tables a [`TableSet`] declares, and how. One field per lockable table, named as in
+/// [`Tables`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Declared {
+    /// The handle table.
+    pub handles: Option<Access>,
+    /// The address space.
+    pub address_space: Option<Access>,
+    /// The scheduler.
+    pub scheduler: Option<Access>,
+}
+
+impl Declared {
+    /// No table at all: what a call such as `GetSystemTick` declares.
+    pub const NONE: Self = Self {
+        handles: None,
+        address_space: None,
+        scheduler: None,
+    };
+}
+
+mod sealed {
+    /// Keeps [`TableSet`](super::TableSet) closed: the sets are exactly the ones this module
+    /// lists.
+    pub trait Sealed {}
+}
+
+/// The tables a system call declares: `()`, or a tuple of `&Table` and `&mut Table` naming each
+/// table at most once, in lock order (handle table, address space, scheduler). For example
+/// `(&mut HandleTable, &Scheduler)`; a one-table set is a one-element tuple, `(&Scheduler,)`.
+///
+/// Implemented for exactly those tuples, so declaring the tables out of order or twice does not
+/// compile (see the module docs).
+pub trait TableSet: sealed::Sealed {
+    /// The borrows the call receives: the same tuple, borrowed for as long as the dispatcher
+    /// holds the tables.
+    type Borrowed<'a>;
+
+    /// Which tables the set names, and how.
+    const DECLARED: Declared;
+
+    /// Splits the locked tables into this set's borrows. Called by the dispatcher; code outside
+    /// it has no locked [`Tables`] to pass.
+    fn split(tables: &mut Tables) -> Self::Borrowed<'_>;
+}
+
+impl sealed::Sealed for () {}
+
+impl TableSet for () {
+    type Borrowed<'a> = ();
+
+    const DECLARED: Declared = Declared::NONE;
+
+    fn split(_: &mut Tables) -> Self::Borrowed<'_> {}
+}
+
+/// Implements [`TableSet`] for every tuple over the listed tables, shared and exclusive. Each
+/// row is one set of tables in lock order; the `@place` rules walk the row, placing each table
+/// once as `&Table` and once as `&mut Table`.
+macro_rules! table_sets {
+    ($([$($field:ident: $table:ident),+])*) => {
+        $( table_sets!(@place [] $($field: $table,)+); )*
+    };
+    (@place [$(($field:ident, $table:ident, $access:ident $(, $mutable:tt)?))*]) => {
+        impl sealed::Sealed for ($(&$($mutable)? $table,)*) {}
+
+        impl TableSet for ($(&$($mutable)? $table,)*) {
+            type Borrowed<'a> = ($(&'a $($mutable)? $table,)*);
+
+            const DECLARED: Declared = {
+                let mut declared = Declared::NONE;
+                $(declared.$field = Some(Access::$access);)*
+                declared
+            };
+
+            fn split(tables: &mut Tables) -> Self::Borrowed<'_> {
+                ($(&$($mutable)? tables.$field,)*)
+            }
+        }
+    };
+    (@place [$($placed:tt)*] $field:ident: $table:ident, $($rest:tt)*) => {
+        table_sets!(@place [$($placed)* ($field, $table, Shared)] $($rest)*);
+        table_sets!(@place [$($placed)* ($field, $table, Exclusive, mut)] $($rest)*);
+    };
+}
+
+table_sets! {
+    [handles: HandleTable]
+    [address_space: AddressSpace]
+    [scheduler: Scheduler]
+    [handles: HandleTable, address_space: AddressSpace]
+    [handles: HandleTable, scheduler: Scheduler]
+    [address_space: AddressSpace, scheduler: Scheduler]
+    [handles: HandleTable, address_space: AddressSpace, scheduler: Scheduler]
+}
+
+/// How the dispatcher times a wait for its lock: a monotonic host clock.
+///
+/// Not the [`Env`]: these readings measure the host, never reach kernel state or a guest, and
+/// are not recorded for replay. The kernel does not read the host's clock itself (observability
+/// spec, rule 1), so whoever builds the dispatcher supplies one
+/// ([`Dispatcher::with_lock_timer`]). It is read only when the lock was found held, twice per
+/// such acquisition; an acquisition that did not have to wait reads nothing.
+pub trait LockTimer: Send + Sync {
+    /// The time since some fixed point. Successive readings must not decrease.
+    fn now(&self) -> Duration;
+}
+
+/// Counts for one lock, or for the calls that declared one table.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Waits {
+    /// How many times the lock was taken.
+    pub acquisitions: u64,
+    /// How many of those declared the table exclusively (`&mut`). For [`LockWaits::lock`]: how
+    /// many declared any table exclusively.
+    pub exclusive: u64,
+    /// How many of them found the lock held and had to wait.
+    pub contended: u64,
+    /// The total time those spent waiting. Zero unless the dispatcher has a [`LockTimer`].
+    pub waited: Duration,
+}
+
+impl Waits {
+    fn note(&mut self, access: Access, contended: Option<Duration>) {
+        self.acquisitions = self.acquisitions.saturating_add(1);
+        if access == Access::Exclusive {
+            self.exclusive = self.exclusive.saturating_add(1);
+        }
+        if let Some(waited) = contended {
+            self.contended = self.contended.saturating_add(1);
+            self.waited = self.waited.saturating_add(waited);
+        }
+    }
+}
+
+/// How long calls waited for the dispatcher's lock, per table (kernel spec: "The dispatcher
+/// reports how long calls wait for each lock in the run's summary, so the decision to split is
+/// made from measurements").
+///
+/// While one mutex guards every table, a call waits for that mutex whatever it declared. Its
+/// wait is counted once in [`LockWaits::lock`] and once more under each table it declared, so a
+/// table's numbers are what the calls that need that table lost to the single lock: the most
+/// that giving the table a lock of its own could save them. A call that declares no table is
+/// counted in [`LockWaits::lock`] only. The `exclusive` counts say how many acquisitions a
+/// reader-writer lock could not have shared.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LockWaits {
+    /// Whether waits were timed: the dispatcher has a [`LockTimer`]. When `false`, contended
+    /// acquisitions are still counted and every `waited` is zero.
+    pub timed: bool,
+    /// Every acquisition of the one lock: each dispatch, and each [`Dispatcher::with`].
+    pub lock: Waits,
+    /// Acquisitions that declared the handle table.
+    pub handles: Waits,
+    /// Acquisitions that declared the address space.
+    pub address_space: Waits,
+    /// Acquisitions that declared the scheduler.
+    pub scheduler: Waits,
+}
+
+impl LockWaits {
+    /// Counts one acquisition by a call that declared `declared`, which waited `contended` if
+    /// the lock was held.
+    fn note(&mut self, declared: Declared, contended: Option<Duration>) {
+        let tables = [
+            (&mut self.handles, declared.handles),
+            (&mut self.address_space, declared.address_space),
+            (&mut self.scheduler, declared.scheduler),
+        ];
+        let mut any = Access::Shared;
+        for (waits, access) in tables {
+            if let Some(access) = access {
+                waits.note(access, contended);
+                if access == Access::Exclusive {
+                    any = Access::Exclusive;
+                }
+            }
+        }
+        self.lock.note(any, contended);
+    }
+}
+
 /// What a dispatch needs from the calling core besides the tables: which core and guest thread
-/// it is, when the call was made, the environment, the caller's memory, where debug strings go,
-/// and the event stream's recorder.
+/// it is, the environment, the caller's memory, where debug strings go, and the event stream's
+/// recorder.
 pub struct Caller<'a> {
     /// The index of the core making the call.
     pub core: u8,
@@ -139,15 +422,8 @@ pub struct Caller<'a> {
     /// tracks which thread each core is running (kernel slice 10), the dispatcher reads it from
     /// there and this field goes away.
     pub thread: ThreadId,
-    /// When the call was made, for the event's `time`. The dispatcher does not read
-    /// [`Env::now`] for it, so recording an event never adds a clock reading to the replay log.
-    ///
-    /// PROVISIONAL (walking skeleton, #74): the core loop supplies the stamp, in a unit of its
-    /// own choosing that the recorder does not interpret. The kernel owns guest ticks (kernel
-    /// spec, "Guest time"); once it keeps guest time itself the dispatcher stamps events from
-    /// that and this field goes away.
-    pub time: GuestTicks,
-    /// The injectable environment (observability spec, rule 1).
+    /// The injectable environment (observability spec, rule 1). The dispatcher reads its clock
+    /// once per dispatch.
     pub env: &'a dyn Env,
     /// The calling process's memory.
     pub memory: &'a dyn GuestMemory,
@@ -162,11 +438,12 @@ pub struct Caller<'a> {
 pub enum Outcome {
     /// An implemented call ran and wrote its outputs (which may include an error result).
     Completed,
-    /// The number is unlisted or the call isn't implemented: `x0` holds
-    /// [`KernelError::NotImplemented`].
+    /// `x0` holds [`KernelError::NotImplemented`]: the number is unlisted, the call isn't
+    /// implemented, or it failed inside the kernel (see the module docs).
     NotImplemented,
-    /// The environment failed, so the call wrote nothing. Only a replay that has diverged from its
-    /// recording does this; the caller should stop the run and report it.
+    /// The environment's clock failed, so the call did not run and wrote nothing. Only a replay
+    /// that has diverged from its recording does this; the caller should stop the run and
+    /// report it.
     EnvFailed(EnvError),
     /// `ExitProcess` ran: the calling process is over, and the caller must not resume the guest
     /// thread. No register was written.
@@ -190,74 +467,263 @@ pub struct Record {
     pub outcome: Outcome,
 }
 
+/// What the dispatcher's lock guards.
+struct State {
+    tables: Tables,
+    waits: LockWaits,
+}
+
+/// The locked tables, as a call that declared `B` may see them.
+struct Locked<'d, B> {
+    state: MutexGuard<'d, State>,
+    declared: PhantomData<fn() -> B>,
+}
+
+impl<B: TableSet> Locked<'_, B> {
+    /// The declared tables, and nothing else.
+    fn tables(&mut self) -> B::Borrowed<'_> {
+        B::split(&mut self.state.tables)
+    }
+
+    /// Guest time at a reading of the environment's clock, at the process's counter rate.
+    fn guest_time(&self, env: &dyn Env) -> Result<GuestTicks, EnvError> {
+        let now = env.now()?;
+        Ok(self.state.tables.processes.counter_rate().ticks_at(now))
+    }
+}
+
+/// One dispatch in progress: the call, the registers as passed, and where its outputs go.
+struct Call<'c, 'k> {
+    number: u16,
+    id: Option<SvcId>,
+    passed: [u64; SVC_ARG_COUNT],
+    regs: &'c mut GuestRegs,
+    caller: &'c mut Caller<'k>,
+}
+
 /// Runs system calls against the kernel's tables, one at a time.
-#[derive(Debug)]
 pub struct Dispatcher {
-    tables: Mutex<Tables>,
+    state: Mutex<State>,
+    timer: Option<Box<dyn LockTimer>>,
+}
+
+impl fmt::Debug for Dispatcher {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Dispatcher")
+            .field("timed", &self.timer.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Dispatcher {
-    /// A dispatcher over these tables.
+    /// A dispatcher over these tables. Its lock waits are counted but not timed until it is
+    /// given a timer ([`Dispatcher::with_lock_timer`]).
     #[must_use]
     pub fn new(tables: Tables) -> Self {
         Self {
-            tables: Mutex::new(tables),
+            state: Mutex::new(State {
+                tables,
+                waits: LockWaits::default(),
+            }),
+            timer: None,
+        }
+    }
+
+    /// Times this dispatcher's lock waits with `timer`.
+    #[must_use]
+    pub fn with_lock_timer(mut self, timer: impl LockTimer + 'static) -> Self {
+        self.timer = Some(Box::new(timer));
+        self
+    }
+
+    /// A reading of the lock timer, or zero when there is none, so that an untimed wait
+    /// measures as zero.
+    fn timer_now(&self) -> Duration {
+        self.timer
+            .as_ref()
+            .map_or(Duration::ZERO, |timer| timer.now())
+    }
+
+    /// Takes the lock for a call that declares `B`, counting the acquisition and timing the
+    /// wait if there was one.
+    fn lock<B: TableSet>(&self) -> Locked<'_, B> {
+        // A poisoned lock means a panic elsewhere; the tables are still plain data, so carry on.
+        let (mut state, contended) = match self.state.try_lock() {
+            Ok(state) => (state, None),
+            Err(TryLockError::Poisoned(poisoned)) => (poisoned.into_inner(), None),
+            Err(TryLockError::WouldBlock) => {
+                let started = self.timer_now();
+                let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+                (state, Some(self.timer_now().saturating_sub(started)))
+            }
+        };
+        state.waits.note(B::DECLARED, contended);
+        Locked {
+            state,
+            declared: PhantomData,
+        }
+    }
+
+    /// Runs `f` with exactly the tables `B` declares, under the lock: the step every dispatch
+    /// arm goes through, offered so that the tables can be set up and inspected between
+    /// dispatches (a test creating a thread, the core loop creating its process). Counted in
+    /// [`Dispatcher::lock_waits`] like a dispatch. Records no event and reads no clock.
+    ///
+    /// The lock is held while `f` runs, and it is not re-entrant: `f` must not dispatch, call
+    /// `with` again or read [`Dispatcher::lock_waits`] on this dispatcher.
+    pub fn with<B: TableSet, R>(&self, f: impl for<'a> FnOnce(B::Borrowed<'a>) -> R) -> R {
+        let mut locked = self.lock::<B>();
+        f(locked.tables())
+    }
+
+    /// How long calls have waited for the lock so far, per table. Reading this takes the lock
+    /// briefly and is not itself counted.
+    #[must_use]
+    pub fn lock_waits(&self) -> LockWaits {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        LockWaits {
+            timed: self.timer.is_some(),
+            ..state.waits
         }
     }
 
     /// Handles `svc #number` from `caller`: decodes the arguments from `regs`, runs the call, and
     /// writes its outputs back to `regs`.
     pub fn dispatch(&self, number: u16, regs: &mut GuestRegs, caller: &mut Caller<'_>) -> Record {
-        // A poisoned lock means a panic elsewhere; the tables are still plain data, so carry on.
-        let guard = self.tables.lock().unwrap_or_else(PoisonError::into_inner);
-
-        let mut args = [0; SVC_ARG_COUNT];
-        for (arg, register) in args.iter_mut().zip(&regs.x) {
+        let mut passed = [0; SVC_ARG_COUNT];
+        for (arg, register) in passed.iter_mut().zip(&regs.x) {
             *arg = *register;
         }
         let id = SvcId::from_number(number);
-        let outcome = if let Some(id) = id {
-            run(id, regs, caller)
-        } else {
-            tracing::warn!(number, "unknown system call");
-            not_implemented(regs)
-        };
-        let record = Record {
-            core: caller.core,
+        let core = caller.core;
+        let outcome = self.run(&mut Call {
             number,
             id,
-            args,
+            passed,
+            regs,
+            caller,
+        });
+        Record {
+            core,
+            number,
+            id,
+            args: passed,
             outcome,
-        };
-        record_point(&record, regs, caller);
-        drop(guard);
-        record
+        }
     }
 
     /// Takes the tables back, for a snapshot or a test's inspection.
     #[must_use]
     pub fn into_tables(self) -> Tables {
-        self.tables
+        self.state
             .into_inner()
             .unwrap_or_else(PoisonError::into_inner)
+            .tables
+    }
+
+    /// One dispatch, start to finish: take the tables `B` declares, read the clock, run `body`
+    /// with those tables and the guest time, record the event, release.
+    fn call<B: TableSet>(
+        &self,
+        call: &mut Call<'_, '_>,
+        body: impl for<'a> FnOnce(B::Borrowed<'a>, &mut Call<'_, '_>, GuestTicks) -> Outcome,
+    ) -> Outcome {
+        let mut locked = self.lock::<B>();
+        // Read under the lock, so the environment's recording is in the kernel's order.
+        let time = match locked.guest_time(call.caller.env) {
+            Ok(time) => time,
+            Err(error) => {
+                tracing::error!(number = call.number, %error, "environment failed");
+                return Outcome::EnvFailed(error);
+            }
+        };
+        let outcome = body(locked.tables(), call, time);
+        record_point(call, time, &outcome);
+        drop(locked);
+        outcome
+    }
+
+    /// The one `match` from call to typed function. Each arm names the tables its function
+    /// declares.
+    fn run(&self, call: &mut Call<'_, '_>) -> Outcome {
+        let Some(id) = call.id else {
+            return self.call::<()>(call, |(), call, _| {
+                tracing::warn!(number = call.number, "unknown system call");
+                not_implemented(call.regs)
+            });
+        };
+        let Some(convention) = id.convention() else {
+            return self.call::<()>(call, |(), call, _| unimplemented(id, call.regs));
+        };
+        match id {
+            SvcId::ExitProcess => self.call::<()>(call, |(), _, _| {
+                // PROVISIONAL (walking skeleton, #74): see the module docs.
+                tracing::info!("the process called ExitProcess");
+                Outcome::ProcessExited
+            }),
+            SvcId::GetThreadPriority => {
+                self.call::<(&HandleTable, &Scheduler)>(call, |(handles, scheduler), call, _| {
+                    let core = call.caller.core;
+                    returning(id, convention, call.regs, |[thread_handle]| {
+                        let priority = thread::get_thread_priority(
+                            scheduler,
+                            handles,
+                            calling_core(core)?,
+                            Handle::from_register(thread_handle),
+                        )?;
+                        Ok([u64::from(priority.cast_unsigned())])
+                    })
+                })
+            }
+            SvcId::GetCurrentProcessorNumber => self.call::<()>(call, |(), call, _| {
+                let core = processor::get_current_processor_number(call.caller.core);
+                complete(
+                    id,
+                    convention,
+                    call.regs,
+                    &[u64::from(core.cast_unsigned())],
+                )
+            }),
+            SvcId::CloseHandle => self.call::<(&mut HandleTable, &mut Scheduler)>(
+                call,
+                |(handles, scheduler), call, _| {
+                    returning(id, convention, call.regs, |[closing]| {
+                        handle::close_handle(handles, scheduler, Handle::from_register(closing))?;
+                        Ok([])
+                    })
+                },
+            ),
+            SvcId::GetSystemTick => self.call::<()>(call, |(), call, time| {
+                complete(id, convention, call.regs, &[tick::get_system_tick(time)])
+            }),
+            SvcId::OutputDebugString => self.call::<()>(call, |(), call, time| {
+                let memory = call.caller.memory;
+                let sink = &mut *call.caller.debug;
+                returning(id, convention, call.regs, |[address, len]| {
+                    debug::output_debug_string(memory, sink, time, address, len)?;
+                    Ok([])
+                })
+            }),
+            _ => self.call::<()>(call, |(), call, _| unimplemented(id, call.regs)),
+        }
     }
 }
 
 /// RECORDING POINT for the event stream: the dispatcher's one call into the recorder
 /// (observability spec, "The event stream"). It runs after the call with the kernel lock still
-/// held, so the recorder's `seq` follows the kernel's order. See the module docs for what the
-/// event's `result` holds and why a failed environment records nothing.
-fn record_point(record: &Record, regs: &GuestRegs, caller: &Caller<'_>) {
-    let Some(result) = recorded_result(record, regs) else {
+/// held, so the recorder's `seq` follows the kernel's order. `time` is the dispatch's one clock
+/// reading, as guest ticks. See the module docs for what the event's `result` holds.
+fn record_point(call: &Call<'_, '_>, time: GuestTicks, outcome: &Outcome) {
+    let Some(result) = recorded_result(call.id, outcome, call.regs) else {
         return;
     };
-    caller.recorder.record(
-        caller.time,
-        caller.core,
-        caller.thread,
+    call.caller.recorder.record(
+        time,
+        call.caller.core,
+        call.caller.thread,
         EventKind::Svc {
-            id: u32::from(record.number),
-            args: recorded_args(record),
+            id: u32::from(call.number),
+            args: recorded_args(call.id, &call.passed),
             // The one place a kernel result becomes the event stream's result word.
             result: starquake_trace::ResultCode(result.raw()),
         },
@@ -266,14 +732,14 @@ fn record_point(record: &Record, regs: &GuestRegs, caller: &Caller<'_>) {
 
 /// The arguments a dispatch is recorded with: the call's inputs, decoded with its convention,
 /// or every register as passed when the number has no convention (see the module docs).
-fn recorded_args(record: &Record) -> [u64; SVC_ARG_COUNT] {
-    let Some(convention) = record.id.and_then(SvcId::convention) else {
-        return record.args;
+fn recorded_args(id: Option<SvcId>, passed: &[u64; SVC_ARG_COUNT]) -> [u64; SVC_ARG_COUNT] {
+    let Some(convention) = id.and_then(SvcId::convention) else {
+        return *passed;
     };
     let mut args = [0; SVC_ARG_COUNT];
     for input in convention.inputs {
         let index = usize::from(input.reg);
-        if let (Some(slot), Some(passed)) = (args.get_mut(index), record.args.get(index)) {
+        if let (Some(slot), Some(passed)) = (args.get_mut(index), passed.get(index)) {
             *slot = input.kind.truncate(*passed);
         }
     }
@@ -282,14 +748,13 @@ fn recorded_args(record: &Record) -> [u64; SVC_ARG_COUNT] {
 
 /// The result word a finished dispatch is recorded with, or `None` if the call never returned to
 /// the guest.
-fn recorded_result(record: &Record, regs: &GuestRegs) -> Option<ResultCode> {
-    match &record.outcome {
+fn recorded_result(id: Option<SvcId>, outcome: &Outcome, regs: &GuestRegs) -> Option<ResultCode> {
+    match outcome {
         Outcome::EnvFailed(_) => None,
         Outcome::NotImplemented => Some(KernelError::NotImplemented.code()),
         Outcome::ProcessExited => Some(ResultCode::SUCCESS),
         Outcome::Completed => {
-            let result = record
-                .id
+            let result = id
                 .and_then(SvcId::convention)
                 .and_then(|convention| convention.outputs.first())
                 .filter(|output| output.kind == Kind::Result)
@@ -302,39 +767,67 @@ fn recorded_result(record: &Record, regs: &GuestRegs) -> Option<ResultCode> {
     }
 }
 
-/// Runs one listed call. Calls that touch tables will get them here, borrowed from the locked
-/// [`Tables`] in lock order; the calls implemented so far touch none.
-fn run(id: SvcId, regs: &mut GuestRegs, caller: &mut Caller<'_>) -> Outcome {
-    let Some(convention) = id.convention() else {
-        return unimplemented(id, regs);
+/// The calling core as the scheduler names it. A core index a [`CoreId`] can't hold is the core
+/// loop's bug, not a guest's.
+fn calling_core(core: u8) -> CallResult<CoreId> {
+    CoreId::try_from(core).map_err(|error| SvcError::internal(&error))
+}
+
+/// Runs an implemented call that returns a `Result` first: decodes its `I` inputs, runs `body`,
+/// and writes the result and its `O` other outputs.
+///
+/// A call that fails with a result the guest sees ([`SvcError::Kernel`]) writes that result and
+/// zeroes its other outputs. Eden's wrapper value-initialises its outputs
+/// (`int32_t out_priority{};`), runs the call, and writes whatever the call left in them
+/// (`SvcWrap_GetThreadPriority64` in `eden/src/core/hle/kernel/svc.cpp` @ cf654052). The two
+/// agree only for a call whose body assigns no output before it fails. That holds for
+/// `GetThreadPriority`, the only arm with a second output today: its one failure,
+/// `ResultInvalidHandle`, comes before `*out_priority` is assigned
+/// (`eden/src/core/hle/kernel/svc/svc_thread.cpp` @ cf654052, `GetThreadPriority`).
+///
+/// It does not hold for every call, and this function cannot express the ones it fails for: a
+/// `body` returns either its outputs or an error, never both. The counter-example is
+/// `KSynchronizationObject::Wait` (`eden/src/core/hle/kernel/k_synchronization_object.cpp` @
+/// cf654052). When the thread did begin to wait (`thread->BeginWait`), it clears the thread's
+/// synced index to `-1` first, and afterwards sets `*out_index = thread->GetSyncedIndex()` and
+/// returns the wait's result. A wait ended by its timer or by a cancel, not by an object, so
+/// returns `ResultTimedOut` or `ResultCancelled` with `*out_index` at `-1`, and
+/// `SvcWrap_WaitSynchronization64` (`svc.cpp`) writes that index to `x1`. (Its earlier exits, a
+/// zero timeout and a cancel already pending, return the same two results without assigning
+/// `*out_index`, which the wrapper then writes as zero.) A call like that (kernel slice 4,
+/// events and `WaitSynchronization`) needs a way to return outputs together with an error
+/// before it gets an arm; routing it through here as it stands would zero `x1` where Eden
+/// writes `-1`.
+fn returning<const I: usize, const O: usize>(
+    id: SvcId,
+    convention: &Convention,
+    regs: &mut GuestRegs,
+    body: impl FnOnce([u64; I]) -> CallResult<[u64; O]>,
+) -> Outcome {
+    let inputs = match convention.read::<I>(regs) {
+        Ok(inputs) => inputs,
+        Err(error) => return mismatch(id, error, regs),
     };
-    match id {
-        SvcId::ExitProcess => {
-            // PROVISIONAL (walking skeleton, #74): see the module docs.
-            tracing::info!("the process called ExitProcess");
-            Outcome::ProcessExited
-        }
-        SvcId::GetCurrentProcessorNumber => {
-            let core = processor::get_current_processor_number(caller.core);
-            complete(id, convention, regs, &[u64::from(core.cast_unsigned())])
-        }
-        SvcId::GetSystemTick => match tick::get_system_tick(caller.env) {
-            Ok(tick) => complete(id, convention, regs, &[tick]),
-            Err(error) => {
-                tracing::error!(name = id.name(), %error, "environment failed");
-                Outcome::EnvFailed(error)
-            }
-        },
-        SvcId::OutputDebugString => match convention.read(regs) {
-            Ok([address, len]) => {
-                let result =
-                    debug::output_debug_string(caller.memory, &mut *caller.debug, address, len);
-                complete(id, convention, regs, &[result_word(result_code(&result))])
-            }
-            Err(error) => mismatch(id, error, regs),
-        },
-        _ => unimplemented(id, regs),
+    let (code, outputs) = match body(inputs) {
+        Ok(outputs) => (ResultCode::SUCCESS, outputs),
+        Err(SvcError::Kernel(error)) => (error.code(), [0; O]),
+        Err(SvcError::Internal(what)) => return fault(id, &what, regs),
+    };
+    // The result, then the other outputs. A convention has at most SVC_ARG_COUNT registers, so
+    // a call with more outputs than fit disagrees with any convention.
+    let mut values = [0; SVC_ARG_COUNT];
+    values[RESULT_REGISTER] = result_word(code);
+    for (slot, output) in values.iter_mut().skip(1).zip(outputs) {
+        *slot = output;
     }
+    let Some(values) = values.get(..=O) else {
+        let error = ConventionError::Arity {
+            expected: convention.outputs.len(),
+            actual: O.saturating_add(1),
+        };
+        return mismatch(id, error, regs);
+    };
+    complete(id, convention, regs, values)
 }
 
 /// Writes an implemented call's outputs.
@@ -349,6 +842,19 @@ fn complete(id: SvcId, convention: &Convention, regs: &mut GuestRegs, outputs: &
 /// implemented" rather than garbage.
 fn mismatch(id: SvcId, error: ConventionError, regs: &mut GuestRegs) -> Outcome {
     tracing::error!(name = id.name(), %error, "system call does not match its convention");
+    not_implemented(regs)
+}
+
+/// An implemented call failed inside the kernel ([`SvcError::Internal`]). The one place that
+/// decides what that means (see the module docs): it is logged, and the guest sees "not
+/// implemented".
+fn fault(id: SvcId, what: &str, regs: &mut GuestRegs) -> Outcome {
+    tracing::error!(
+        name = id.name(),
+        number = id.number(),
+        what,
+        "system call failed inside the kernel"
+    );
     not_implemented(regs)
 }
 

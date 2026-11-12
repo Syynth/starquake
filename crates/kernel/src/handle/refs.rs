@@ -59,8 +59,9 @@ pub enum RefError {
 
 /// Where the handle table opens and closes references.
 ///
-/// [`RefCounts`] is the standalone implementation. The object table can implement this instead
-/// once objects carry their own count.
+/// The kernel's object table implements this ([`Objects`](crate::object::Objects)): its rows
+/// carry their own count. [`RefCounts`] is the standalone implementation, for a caller with no
+/// object table.
 pub trait ObjectRefs {
     /// Takes one more reference to `object`.
     fn open(&mut self, object: ObjectId) -> Result<(), RefError>;

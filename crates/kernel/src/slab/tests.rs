@@ -207,6 +207,44 @@ fn get_mut_edits_the_row() {
 }
 
 #[test]
+fn a_stored_lookup_finds_a_live_row_and_edits_it() {
+    let mut slab = TestSlab::new();
+    let a = slab.insert(10).unwrap();
+    let b = slab.insert(20).unwrap();
+    assert_eq!(slab.stored(a), Ok(&10));
+    *slab.stored_mut(b).unwrap() += 5;
+    assert_eq!(slab.stored(b), Ok(&25));
+    assert_eq!(slab.get(a), Ok(&10));
+}
+
+#[test]
+fn a_stale_stored_id_is_the_one_fixed_error_whatever_made_it_stale() {
+    let mut slab = TestSlab::new();
+    let freed = slab.insert(1).unwrap();
+    let live = slab.insert(2).unwrap();
+    slab.remove(freed).unwrap();
+    // Freed; freed and reused under a new generation; never issued; an index past the end.
+    let reused = slab.insert(3).unwrap();
+    assert_eq!(reused.index(), freed.index());
+    let never_issued = ObjectId::from_parts(live.index(), live.generation() + 1);
+    let past_the_end = ObjectId::from_parts(99, FIRST_GENERATION);
+    for id in [freed, never_issued, past_the_end] {
+        // `get` says which id; the stored lookup has one answer for all of them.
+        assert_eq!(slab.get(id), Err(stale(id)));
+        assert_eq!(slab.stored(id), Err(StoredIdStale));
+        assert_eq!(slab.stored_mut(id), Err(StoredIdStale));
+    }
+    // A failed lookup changes nothing.
+    assert_eq!(slab.stored(live), Ok(&2));
+    assert_eq!(slab.stored(reused), Ok(&3));
+    assert_eq!(slab.len(), 2);
+    assert_eq!(
+        StoredIdStale.to_string(),
+        "an id the kernel stored names no live row"
+    );
+}
+
+#[test]
 fn different_id_types_work_on_the_same_storage() {
     let mut threads: Slab<ThreadId, &str> = Slab::new();
     let t = threads.insert("main").unwrap();

@@ -1,8 +1,21 @@
 //! Horizon kernel result codes.
 //!
 //! A Horizon result is a 32-bit word: the module that produced it in bits 0-8 and a description in
-//! bits 9-21; zero is success. Every kernel error has module [`KERNEL_MODULE`]. System calls return
-//! [`SvcResult`]; the dispatcher turns it into the word the guest sees in `x0`.
+//! bits 9-21; zero is success. Every kernel error has module [`KERNEL_MODULE`]. This module is
+//! the kernel's one encoding of them: every other module names a result as a [`KernelError`] and
+//! gets its word from [`KernelError::code`].
+//!
+//! # What a system call returns
+//!
+//! - [`SvcResult`] when the only way it fails is with a result the guest sees.
+//! - [`CallResult`] when it works through the tables. Its error, [`SvcError`], is either a
+//!   result for the guest or [`SvcError::Internal`]: the kernel's own bookkeeping failed. Each
+//!   table's error type converts into it in one place (`From<HandleError>`, `From<SchedError>`,
+//!   `From<ObjectError>`), so a system call propagates a table's failure with `?` and never
+//!   decides for itself what a broken table looks like to a guest.
+//!
+//! The dispatcher turns either into the word in `x0`, and is the one place that decides what
+//! happens on an internal failure (see its module docs).
 //!
 //! Ported from Eden (GPL-3.0-or-later), paths relative to the reference folder
 //! (`docs/references.md`):
@@ -173,6 +186,30 @@ impl KernelError {
 /// What a system call returns: a value, or the kernel error the guest sees in `x0`.
 pub type SvcResult<T> = Result<T, KernelError>;
 
+/// Why a system call that works through the kernel's tables produced no value.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SvcError {
+    /// A Horizon result: the guest sees its code in `x0`.
+    #[error(transparent)]
+    Kernel(#[from] KernelError),
+    /// The kernel's own bookkeeping is inconsistent: a table operation failed in a way no guest
+    /// input explains (an id the kernel stored is stale, a handle names an object with no
+    /// references). Horizon has no result for this; it asserts. The text is the table's own
+    /// error message.
+    #[error("the kernel's bookkeeping is inconsistent: {0}")]
+    Internal(String),
+}
+
+impl SvcError {
+    /// An internal failure, described by the error a table operation returned.
+    pub fn internal(error: &dyn core::error::Error) -> Self {
+        Self::Internal(error.to_string())
+    }
+}
+
+/// What a system call that works through the tables returns: a value, or an [`SvcError`].
+pub type CallResult<T> = Result<T, SvcError>;
+
 /// The result word for a system call's outcome: [`ResultCode::SUCCESS`] or the error's code.
 #[must_use]
 pub fn result_code<T>(result: &SvcResult<T>) -> ResultCode {
@@ -288,6 +325,31 @@ mod tests {
         assert_eq!(
             result_code::<()>(&Err(KernelError::InvalidCurrentMemory)),
             KernelError::InvalidCurrentMemory.code()
+        );
+    }
+
+    #[test]
+    fn a_kernel_error_becomes_the_guests_result_and_keeps_its_message() {
+        fn call() -> CallResult<u32> {
+            Err(KernelError::InvalidHandle)?
+        }
+        let error = SvcError::from(KernelError::InvalidHandle);
+        assert_eq!(error, SvcError::Kernel(KernelError::InvalidHandle));
+        assert_eq!(error.to_string(), KernelError::InvalidHandle.to_string());
+        // `?` converts in a function that returns a `CallResult`.
+        assert_eq!(call(), Err(SvcError::Kernel(KernelError::InvalidHandle)));
+    }
+
+    #[test]
+    fn an_internal_failure_carries_the_tables_message() {
+        let error = SvcError::internal(&KernelError::InvalidState);
+        assert_eq!(
+            error,
+            SvcError::Internal(KernelError::InvalidState.to_string())
+        );
+        assert_eq!(
+            error.to_string(),
+            "the kernel's bookkeeping is inconsistent: invalid state"
         );
     }
 

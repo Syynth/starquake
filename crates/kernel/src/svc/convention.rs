@@ -14,10 +14,16 @@
 //! Only the calls retail titles may make have an entry ([`is_retail`]): milestones 1 and 2 need
 //! no others. Later slices add rows from the same reference file.
 //!
+//! `convention/table.rs` and both reference files are written by `tools/gen-svc-conventions.py`
+//! from Eden's `svc.cpp`; run it with `--check` to see that they are current.
+//!
 //! Widths follow Eden's `Convert`, a `memcpy` of the smaller of the two sizes into a zeroed value
-//! (`svc.cpp`): a 4-byte argument is the low half of its register, and a 4-byte output is written
-//! zero-extended, signed or not ([`Kind::truncate`]). The 4-byte types are those `svc.cpp`
-//! `static_assert`s to be 4 bytes.
+//! (`svc.cpp`): an argument narrower than its register is the register's low bytes, and a
+//! narrower output is written zero-extended, signed or not ([`Kind::truncate`]). A kind's width
+//! is the size `svc.cpp` `static_assert`s for its type (`reference/svc_type_sizes.txt`): 8 bytes
+//! for the 64-bit integers, 1 for `bool`, 4 for everything else. [`Kind::Word`] takes any type
+//! name and is always 4 bytes, so the tests check every `Word` in the table, and every type the
+//! reference wrappers name, against that file.
 
 use starquake_cpu::GuestRegs;
 use starquake_trace::SVC_ARG_COUNT;
@@ -43,17 +49,22 @@ pub enum Kind {
     Handle,
     /// A 32-bit result word (`Result`).
     Result,
+    /// `bool`: one byte. No retail call takes one; `CreateSession` and `CreatePort` do
+    /// (`is_light`).
+    Bool,
     /// Another 4-byte type (an enum such as `InfoType`, or `PageInfo`), named as Eden names it.
     Word(&'static str),
 }
 
 impl Kind {
-    /// The value's size in bytes: 8 for the 64-bit integers, 4 for everything else.
+    /// The value's size in bytes: 8 for the 64-bit integers, 1 for `bool`, 4 for everything
+    /// else.
     #[must_use]
     pub const fn bytes(self) -> u8 {
         match self {
             Self::U64 | Self::I64 => 8,
             Self::U32 | Self::I32 | Self::Handle | Self::Result | Self::Word(_) => 4,
+            Self::Bool => 1,
         }
     }
 
@@ -67,19 +78,21 @@ impl Kind {
             Self::I32 => "int32_t",
             Self::Handle => "Handle",
             Self::Result => "Result",
+            Self::Bool => "bool",
             Self::Word(name) => name,
         }
     }
 
-    /// The part of a 64-bit register this kind occupies: the whole register for 8-byte kinds, the
-    /// low half (zero-extended) for 4-byte ones. Used both to decode an argument and to write an
-    /// output, as Eden's `Convert` does.
+    /// The part of a 64-bit register this kind occupies: its low [`Kind::bytes`] bytes,
+    /// zero-extended (the whole register for an 8-byte kind). Used both to decode an argument
+    /// and to write an output, as Eden's `Convert` does.
     #[must_use]
     pub fn truncate(self, register: u64) -> u64 {
-        if self.bytes() == 8 {
-            register
-        } else {
-            register & u64::from(u32::MAX)
+        let bits = u32::from(self.bytes()) * u8::BITS;
+        match 1_u64.checked_shl(bits) {
+            Some(above) => register & (above - 1),
+            // Eight bytes: the whole register.
+            None => register,
         }
     }
 }
@@ -209,6 +222,29 @@ mod tests {
     /// Eden's wrappers, reduced to their register use (see the file's header).
     const REFERENCE: &str = include_str!("reference/svc_wrappers64.txt");
 
+    /// The size Eden asserts for each type the wrappers use (see the file's header).
+    const TYPE_SIZES: &str = include_str!("reference/svc_type_sizes.txt");
+
+    /// `(type, bytes)` for every line of the size file.
+    fn type_sizes() -> Vec<(&'static str, u8)> {
+        TYPE_SIZES
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+            .map(|l| {
+                let (name, size) = l.split_once(" = ").unwrap();
+                (name.trim(), size.trim().parse().unwrap())
+            })
+            .collect()
+    }
+
+    /// Eden's size for a type, from the size file.
+    fn eden_size(ty: &str) -> Option<u8> {
+        type_sizes()
+            .into_iter()
+            .find(|(name, _)| *name == ty)
+            .map(|(_, size)| size)
+    }
+
     type Entry = (String, String, String);
 
     fn parse_args(list: &str) -> Vec<Entry> {
@@ -328,6 +364,15 @@ mod tests {
         }
     }
 
+    /// The low `bytes` bytes of a register, zero-extended, worked out bytewise so it does not
+    /// repeat [`Kind::truncate`]'s arithmetic.
+    fn low_bytes(register: u64, bytes: u8) -> u64 {
+        let mut kept = [0; 8];
+        let count = usize::from(bytes);
+        kept[..count].copy_from_slice(&register.to_le_bytes()[..count]);
+        u64::from_le_bytes(kept)
+    }
+
     /// A register file whose registers are all different, in both halves, so decoding from the
     /// wrong register or keeping the wrong half shows up.
     fn distinct_registers() -> GuestRegs {
@@ -346,12 +391,13 @@ mod tests {
             convention.read_into(&regs, &mut values).unwrap();
             for (value, arg) in values.iter().zip(convention.inputs) {
                 let register = regs.x[usize::from(arg.reg)];
-                let expected = if arg.kind.bytes() == 8 {
-                    register
-                } else {
-                    register & u64::from(u32::MAX)
-                };
-                assert_eq!(*value, expected, "{} {}", id.name(), arg.name);
+                assert_eq!(
+                    *value,
+                    low_bytes(register, arg.kind.bytes()),
+                    "{} {}",
+                    id.name(),
+                    arg.name
+                );
             }
         }
     }
@@ -367,14 +413,9 @@ mod tests {
                 .collect();
             convention.write(&mut regs, &values).unwrap();
             for (value, arg) in values.iter().zip(convention.outputs) {
-                let expected = if arg.kind.bytes() == 8 {
-                    *value
-                } else {
-                    *value & u64::from(u32::MAX)
-                };
                 assert_eq!(
                     regs.x[usize::from(arg.reg)],
-                    expected,
+                    low_bytes(*value, arg.kind.bytes()),
                     "{} {}",
                     id.name(),
                     arg.name
@@ -474,9 +515,143 @@ mod tests {
             (Kind::I32, "int32_t", 4),
             (Kind::Handle, "Handle", 4),
             (Kind::Result, "Result", 4),
+            (Kind::Bool, "bool", 1),
             (Kind::Word("InfoType"), "InfoType", 4),
         ] {
             assert_eq!((kind.eden_type(), kind.bytes()), (ty, bytes));
         }
+    }
+
+    #[test]
+    fn every_kind_in_the_table_is_as_wide_as_eden_asserts_its_type_to_be() {
+        // `Kind::Word` takes any type name and is 4 bytes: a row naming a type of another size
+        // would convert wrongly, and fails here.
+        for (id, convention) in CONVENTIONS {
+            for arg in convention.inputs.iter().chain(convention.outputs) {
+                assert_eq!(
+                    eden_size(arg.kind.eden_type()),
+                    Some(arg.kind.bytes()),
+                    "{} {} ({})",
+                    id.name(),
+                    arg.name,
+                    arg.kind.eden_type()
+                );
+            }
+        }
+        // The kinds with a type of their own, whether or not a row uses them yet.
+        for kind in [
+            Kind::U64,
+            Kind::I64,
+            Kind::U32,
+            Kind::I32,
+            Kind::Handle,
+            Kind::Result,
+            Kind::Bool,
+        ] {
+            assert_eq!(eden_size(kind.eden_type()), Some(kind.bytes()), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn every_type_the_reference_wrappers_name_has_a_kind_of_its_width() {
+        // Rows beyond the retail calls come from the same reference file. Each type in it must
+        // have a size on record, and that size must be one a `Kind` can carry: its own kind for
+        // the types that have one, otherwise the 4 bytes of a `Word`.
+        let own: Vec<(&str, u8)> = [
+            Kind::U64,
+            Kind::I64,
+            Kind::U32,
+            Kind::I32,
+            Kind::Handle,
+            Kind::Result,
+            Kind::Bool,
+        ]
+        .iter()
+        .map(|kind| (kind.eden_type(), kind.bytes()))
+        .collect();
+        let mut seen_bool = false;
+        for (call, inputs, outputs) in reference() {
+            for (name, ty, _) in inputs.iter().chain(&outputs) {
+                let carried = own
+                    .iter()
+                    .find(|(eden, _)| eden == ty)
+                    .map_or(Kind::Word("").bytes(), |(_, bytes)| *bytes);
+                assert_eq!(eden_size(ty), Some(carried), "{call} {name} ({ty})");
+                seen_bool |= ty == Kind::Bool.eden_type();
+            }
+        }
+        // `CreateSession` and `CreatePort` take `bool is_light`: the reason `Bool` exists.
+        assert!(seen_bool);
+        // The size file lists exactly the types the wrappers name.
+        let mut named: Vec<String> = reference()
+            .into_iter()
+            .flat_map(|(_, inputs, outputs)| inputs.into_iter().chain(outputs))
+            .map(|(_, ty, _)| ty)
+            .collect();
+        named.sort();
+        named.dedup();
+        let listed: Vec<String> = type_sizes()
+            .into_iter()
+            .map(|(name, _)| name.to_owned())
+            .collect();
+        assert_eq!(listed, named);
+    }
+
+    #[test]
+    fn a_bool_is_the_low_byte_of_its_register_both_ways() {
+        // The reference row: `CreateSession | is_light:bool:x2 ...`.
+        static INPUTS: &[Arg] = &[
+            Arg {
+                name: "is_light",
+                reg: 2,
+                kind: Kind::Bool,
+            },
+            Arg {
+                name: "name",
+                reg: 3,
+                kind: Kind::U64,
+            },
+        ];
+        static OUTPUTS: &[Arg] = &[Arg {
+            name: "flag",
+            reg: 1,
+            kind: Kind::Bool,
+        }];
+        let convention = Convention {
+            inputs: INPUTS,
+            outputs: OUTPUTS,
+        };
+        let (_, reference_inputs, _) = reference()
+            .into_iter()
+            .find(|(name, _, _)| name == SvcId::CreateSession.name())
+            .unwrap();
+        assert_eq!(ours(INPUTS), reference_inputs);
+
+        let regs = distinct_registers();
+        let [is_light, name] = convention.read(&regs).unwrap();
+        assert_eq!(is_light, low_bytes(regs.x[2], 1));
+        assert_eq!(is_light, 0xD2);
+        assert_eq!(name, regs.x[3]);
+
+        let mut regs = distinct_registers();
+        convention
+            .write(&mut regs, &[0xFFFF_FFFF_FFFF_FF01])
+            .unwrap();
+        assert_eq!(regs.x[1], 1);
+    }
+
+    #[test]
+    fn truncation_keeps_exactly_the_kinds_bytes() {
+        let register = 0x8877_6655_4433_2211;
+        assert_eq!(Kind::Bool.truncate(register), 0x11);
+        assert_eq!(Kind::U32.truncate(register), 0x4433_2211);
+        assert_eq!(Kind::Word("InfoType").truncate(register), 0x4433_2211);
+        assert_eq!(Kind::U64.truncate(register), register);
+        assert_eq!(Kind::I64.truncate(u64::MAX), u64::MAX);
+        // The bit just above each width is dropped, the one just inside is kept.
+        assert_eq!(Kind::Bool.truncate(0x100), 0);
+        assert_eq!(Kind::Bool.truncate(0x80), 0x80);
+        assert_eq!(Kind::I32.truncate(1 << 32), 0);
+        assert_eq!(Kind::I32.truncate(1 << 31), 1 << 31);
     }
 }
