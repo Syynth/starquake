@@ -360,6 +360,12 @@ impl Targets {
         }
     }
 
+    /// Overwrites a row's reference count, to build a damaged table.
+    #[cfg(test)]
+    pub(super) fn set_refs(&mut self, id: TargetId, refs: u32) {
+        self.rows.get_mut(id).unwrap().refs = refs;
+    }
+
     /// The rows, for a snapshot.
     pub(super) fn rows(&self) -> &Slab<TargetId, Row> {
         &self.rows
@@ -387,7 +393,8 @@ impl Targets {
     ///
     /// The rows come from a file, so nothing in them is believed: a target a session or a
     /// domain names has to exist, a domain's objects have to be interfaces, and every row's
-    /// reference count has to equal the number of sessions and domain entries that name it.
+    /// reference count has to be at least one and equal the number of sessions and domain
+    /// entries that name it.
     pub(super) fn thaw<'a>(
         mut rows: Slab<TargetId, Row>,
         interfaces: &Interfaces,
@@ -437,6 +444,12 @@ impl Targets {
             }
         }
         for (id, row) in rows.iter() {
+            // A row goes with its last reference, so a count of zero is no row's, even one
+            // that nothing refers to.
+            if row.refs == 0 {
+                let unreferenced = "a target has a reference count of zero";
+                return Err(SnapshotError::Inconsistent(unreferenced));
+            }
             if references.get(&id).copied().unwrap_or(0) != row.refs {
                 let miscounted = "a reference count is not the number of references";
                 return Err(SnapshotError::Inconsistent(miscounted));
@@ -672,6 +685,24 @@ mod tests {
         });
         assert_eq!(orphan.err(), Some(miscounted.clone()));
         // The same table with its two sessions and nothing else is consistent.
+        assert!(thawed(|_, _| {}).is_ok());
+    }
+
+    #[test]
+    fn a_row_with_no_references_is_refused() {
+        // A row nothing refers to, whose count says so: the count is right, and the row is
+        // still one no table holds, since a row goes with its last reference.
+        let unreferenced = thawed(|targets, sessions| {
+            let lone = sessions.remove(0);
+            targets.set_refs(lone, 0);
+        });
+        assert_eq!(
+            unreferenced.err(),
+            Some(inconsistent("a target has a reference count of zero"))
+        );
+        // One reference, the fewest a row has, is accepted when one session leads to it.
+        let (targets, sessions) = table();
+        assert_eq!(targets.rows.get(sessions[0]).unwrap().refs, 1);
         assert!(thawed(|_, _| {}).is_ok());
     }
 

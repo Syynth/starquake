@@ -18,8 +18,17 @@
 //! - its family state ([`Family`]), once.
 //!
 //! Not saved: the record of auto-stubbed commands ([`Server::stubbed`]), which is a log of the
-//! run and not state a guest can observe; and a completion that was posted but not yet
-//! delivered, whose request is saved as still deferred.
+//! run and not state a guest can observe; and a completion that was posted and that
+//! [`Server::take_completed`] has not taken yet, whose request is saved as still deferred (a
+//! server restored from the snapshot has nothing to deliver for it, and the work is resumed
+//! with [`Server::reissue`]).
+//!
+//! Between [`Server::take_completed`] and the [`Server::deliver`] of what it returned, the
+//! request is neither pending nor answered, and the completion is in the caller's hands. No
+//! snapshot holds that state: [`Server::save`] fails with [`SnapshotError::Inconsistent`]
+//! until the completion is delivered
+//! (`a_server_is_not_saved_between_taking_a_completion_and_delivering_it` in
+//! `framework/tests/snapshot.rs`).
 //!
 //! # Format
 //!
@@ -40,11 +49,33 @@
 //!
 //! # A snapshot is untrusted
 //!
-//! A snapshot is a file, so [`Server::restore`] checks everything in it against everything else
-//! before it changes the server: every id names a row that exists and is of the right kind,
-//! every reference count equals the number of references found, and the queue, the deferred
-//! requests and the sessions agree. A snapshot that fails any check is an error and the server
-//! is left as it was.
+//! A snapshot is a file, so [`Server::restore`] believes nothing in it. Before it changes the
+//! server it checks these, and a snapshot that fails one is an error that leaves the server
+//! as it was:
+//!
+//! - The header, then that the body decodes with no bytes left over and names this server.
+//!   Decoding the queue and the table's slab checks each one's own invariants
+//!   (`QueueLayoutError` in `framework/queue.rs`, `SlabLayoutError` in the kernel crate's
+//!   `slab.rs`).
+//! - The table of interfaces and domains (`Targets::thaw` in `framework/targets.rs`): every
+//!   session leads to a row that exists; every interface is of a type the server's
+//!   [`Interfaces`] list once, and its state decodes as that type; every domain's table of
+//!   object ids is one a domain can have built, and its objects are interfaces; every row's
+//!   reference count is at least one and is the number of sessions and domain entries that
+//!   name it.
+//! - The requests: the queue has as many workers as the server; every session the queue names
+//!   is open; every pending token is below the next token id, and is for a session whose
+//!   request the queue marks deferred; every deferred session has exactly one pending token; a
+//!   deferred request's reply has a domain header exactly when its session leads to a domain.
+//! - The family state: present exactly when the server has some, and decodes as its type.
+//!
+//! Not checked, because the snapshot holds nothing to check them against: the values inside a
+//! session's or a family's state (see "Format"), a deferred request's command id and argument
+//! size (they only go into its trace event), and whether a deferred request on a session that
+//! is not a domain was CMIF or TIPC.
+//!
+//! [`Server::save`] runs the same checks of the requests, the worker count aside, so a
+//! server in a state that could not be restored is not saved.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -57,7 +88,7 @@ use starquake_kernel::id::ObjectId;
 use starquake_kernel::slab::Slab;
 
 use super::commands::Session;
-use super::defer::{Mailbox, Pending, TokenId};
+use super::defer::{Framing, Mailbox, Pending, TokenId};
 use super::queue::RequestQueue;
 use super::server::Server;
 use super::targets::{Row, TargetId, Targets};
@@ -295,9 +326,27 @@ impl Server {
     ///
     /// Fails with [`SnapshotError::UnknownInterface`] if a session is of an interface the
     /// server's [`Interfaces`] do not list (or [`SnapshotError::DuplicateInterface`] if they
-    /// list it twice), so that no snapshot is written that could not be restored.
+    /// list it twice), and with [`SnapshotError::Inconsistent`] if an interface is out of its
+    /// row or the queue, the deferred requests and the sessions disagree, which they do
+    /// between [`Server::take_completed`] and [`Server::deliver`]. These are the checks
+    /// [`Server::restore`] makes of the same things, so that a snapshot it would refuse for
+    /// one of them is not written.
     pub fn save(&self) -> Result<Vec<u8>, SnapshotError> {
         self.targets.check_restorable(&self.interfaces)?;
+        let requests = Requests {
+            sessions: &self.sessions,
+            targets: &self.targets,
+            queue: &self.queue,
+            pending: &self.pending,
+            next_token: self.next_token,
+        };
+        requests.check()?;
+        self.encode_state()
+    }
+
+    /// The server's state as bytes, unchecked: what [`Server::save`] writes once its checks
+    /// have passed.
+    pub(super) fn encode_state(&self) -> Result<Vec<u8>, SnapshotError> {
         let family = self.family.as_deref().map(Family::save_state).transpose()?;
         let header = Header {
             magic: SNAPSHOT_MAGIC,
@@ -345,7 +394,19 @@ impl Server {
             });
         }
         let targets = Targets::thaw(body.targets, &self.interfaces, body.sessions.values())?;
-        check_requests(&body.sessions, &body.queue, &body.pending, body.next_token)?;
+        if body.queue.workers() != self.queue.workers() {
+            return Err(SnapshotError::Inconsistent(
+                "the queue's count of workers is not the server's",
+            ));
+        }
+        let requests = Requests {
+            sessions: &body.sessions,
+            targets: &targets,
+            queue: &body.queue,
+            pending: &body.pending,
+            next_token: body.next_token,
+        };
+        requests.check()?;
         // The family is loaded last: it is the one step that changes the server and can fail.
         match (self.family.as_deref_mut(), body.family) {
             (Some(family), Some(saved)) => family.load_state(&saved)?,
@@ -364,43 +425,83 @@ impl Server {
     }
 }
 
-/// Checks that the queue and the deferred requests name sessions that exist and agree with each
-/// other: a session's request is deferred in the queue exactly when one token is pending for it.
-fn check_requests(
-    sessions: &BTreeMap<ObjectId, TargetId>,
-    queue: &RequestQueue,
-    pending: &BTreeMap<TokenId, Pending>,
+/// A server's requests in flight and what they are checked against, as [`Server::save`] finds
+/// them in the server and [`Server::restore`] in a snapshot.
+struct Requests<'a> {
+    sessions: &'a BTreeMap<ObjectId, TargetId>,
+    targets: &'a Targets,
+    queue: &'a RequestQueue,
+    pending: &'a BTreeMap<TokenId, Pending>,
     next_token: u64,
-) -> Result<(), SnapshotError> {
-    if queue.sessions().any(|s| !sessions.contains_key(&s)) {
-        return Err(SnapshotError::Inconsistent(
+}
+
+impl Requests<'_> {
+    /// Checks that the queue and the deferred requests name sessions that exist and agree with
+    /// each other: a session's request is deferred in the queue exactly when one token is
+    /// pending for it, and its reply is framed as the session is.
+    fn check(&self) -> Result<(), SnapshotError> {
+        let Self {
+            sessions, queue, ..
+        } = *self;
+        if queue.sessions().any(|s| !sessions.contains_key(&s)) {
+            return Err(SnapshotError::Inconsistent(
+                "the queue names a session that is not open",
+            ));
+        }
+        let mut deferred = BTreeSet::new();
+        for (token, request) in self.pending {
+            if token.raw() >= self.next_token {
+                return Err(SnapshotError::Inconsistent(
+                    "a pending token was never handed out",
+                ));
+            }
+            if !queue.is_deferred(request.session) {
+                return Err(SnapshotError::Inconsistent(
+                    "a token is pending for a session with no deferred request",
+                ));
+            }
+            if !deferred.insert(request.session) {
+                return Err(SnapshotError::Inconsistent(
+                    "two tokens are pending for one session",
+                ));
+            }
+            self.check_framing(request)?;
+        }
+        if queue.deferred().any(|s| !deferred.contains(&s)) {
+            return Err(SnapshotError::Inconsistent(
+                "a deferred request has no pending token",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Checks a deferred request's framing against its session: a reply has a domain header
+    /// exactly when the session leads to a domain. This is what [`Server::handle`] keeps: a
+    /// request to a domain's object has a domain header and so does its reply, TIPC is not
+    /// served on a domain, and a session with a request in flight is not converted.
+    fn check_framing(&self, request: &Pending) -> Result<(), SnapshotError> {
+        // The queue marks the session's request deferred, and the queue's sessions are open.
+        let target = self.sessions.get(&request.session);
+        let target = target.ok_or(SnapshotError::Inconsistent(
             "the queue names a session that is not open",
-        ));
+        ))?;
+        // `Targets::thaw` and a live server both hold a row for every session's target.
+        let is_domain = self.targets.is_domain(*target);
+        let is_domain = is_domain.map_err(|_| {
+            SnapshotError::Inconsistent("a session leads to a target that does not exist")
+        })?;
+        let mismatch = match (request.framing, is_domain) {
+            (Framing::Domain, true) | (Framing::Cmif | Framing::Tipc(_), false) => return Ok(()),
+            (Framing::Domain, false) => {
+                "a deferred request has a domain reply on a session that is not a domain"
+            }
+            (Framing::Cmif, true) => {
+                "a deferred request on a domain session has a reply that is not a domain's"
+            }
+            (Framing::Tipc(_), true) => "a deferred TIPC request is on a domain session",
+        };
+        Err(SnapshotError::Inconsistent(mismatch))
     }
-    let mut deferred = BTreeSet::new();
-    for (token, request) in pending {
-        if token.raw() >= next_token {
-            return Err(SnapshotError::Inconsistent(
-                "a pending token was never handed out",
-            ));
-        }
-        if !queue.is_deferred(request.session) {
-            return Err(SnapshotError::Inconsistent(
-                "a token is pending for a session with no deferred request",
-            ));
-        }
-        if !deferred.insert(request.session) {
-            return Err(SnapshotError::Inconsistent(
-                "two tokens are pending for one session",
-            ));
-        }
-    }
-    if queue.deferred().any(|s| !deferred.contains(&s)) {
-        return Err(SnapshotError::Inconsistent(
-            "a deferred request has no pending token",
-        ));
-    }
-    Ok(())
 }
 
 #[cfg(test)]

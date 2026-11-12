@@ -7,19 +7,19 @@ use proptest::prelude::*;
 use proptest::sample::Index;
 use proptest::test_runner::{Config, RngAlgorithm, RngSeed};
 use serde::{Deserialize, Serialize};
-use starquake_ipc::RequestBuilder;
+use starquake_ipc::{BUFFER_SIZE, RequestBuilder};
 use starquake_kernel::id::ObjectId;
 use starquake_kernel::result::ResultCode;
 
 use super::super::defer::{Framing, Pending, TokenId};
 use super::super::targets::Domain;
 use super::super::{
-    Admission, Interfaces, Reply, ReplyToken, SNAPSHOT_MAGIC, SNAPSHOT_VERSION, Server,
-    SnapshotError, UnknownPolicy,
+    Admission, DEFAULT_WORKERS, Interfaces, Reply, ReplyToken, RequestQueue, SNAPSHOT_MAGIC,
+    SNAPSHOT_VERSION, Server, SnapshotError, UnknownPolicy,
 };
 use super::{
-    Mute, Rig, Tally, Toy, Wakes, child, domain_request, parked, request, toy, toy_interfaces,
-    toy_server,
+    Mute, Rig, Tally, Toy, Wakes, child, domain_request, parked, parked_one, request, toy,
+    toy_interfaces, toy_server,
 };
 
 /// The object id of a domain's first added object.
@@ -285,7 +285,7 @@ fn restore_and_use(bytes: &[u8]) -> Result<(), TestCaseError> {
         }
     }
     while let Some(completed) = server.take_completed() {
-        let mut buffer = vec![0; starquake_ipc::BUFFER_SIZE];
+        let mut buffer = vec![0; BUFFER_SIZE];
         let _ = server.deliver(&mut kernel, completed, &mut buffer);
     }
     while server.start_next().is_some() {}
@@ -554,8 +554,12 @@ fn a_snapshot_whose_requests_disagree_is_refused() {
     for (damage, message) in cases {
         let (mut rig, token) = deferred_rig();
         damage(&mut rig, token);
-        let saved = rig.server.save().unwrap();
-        assert_eq!(refused(&saved), SnapshotError::Inconsistent(message));
+        // A server in that state is not saved,
+        let inconsistent = SnapshotError::Inconsistent(message);
+        assert_eq!(rig.server.save(), Err(inconsistent.clone()));
+        // and the bytes it would have written are not restored.
+        let saved = rig.server.encode_state().unwrap();
+        assert_eq!(refused(&saved), inconsistent);
         drop(parked());
     }
     // The token id just below the next one is the newest that can be pending.
@@ -563,4 +567,125 @@ fn a_snapshot_whose_requests_disagree_is_refused() {
     assert_eq!(rig.server.next_token, token.raw() + 1);
     assert!(restores(&rig.server.save().unwrap()));
     drop(parked());
+}
+
+#[test]
+fn a_server_is_not_saved_between_taking_a_completion_and_delivering_it() {
+    let (mut rig, token) = deferred_rig();
+    let session = rig.session;
+    parked_one().fail(ResultCode::SUCCESS);
+
+    // Posted and not taken: the server is saved, with the request as still deferred. The
+    // completion is not in the snapshot, so a server restored from it has nothing to deliver
+    // and the work is resumed with a new token.
+    let posted = rig.server.save().unwrap();
+    let wakes = Arc::new(Wakes::default());
+    let mut restored = toy_server(UnknownPolicy::Strict, &wakes);
+    assert_eq!(restored.restore(&posted), Ok(()));
+    assert_eq!(restored.pending().collect::<Vec<_>>(), [(token, session)]);
+    assert!(restored.queue().is_deferred(session));
+    assert!(restored.take_completed().is_none());
+    assert!(restored.reissue(token).is_some());
+    drop(parked());
+
+    // Taken and not delivered: the request is neither pending nor answered, which no snapshot
+    // holds. Saving is refused, and the bytes the server would have written are not restored.
+    let completed = rig.server.take_completed().unwrap();
+    let in_between = SnapshotError::Inconsistent("a deferred request has no pending token");
+    assert_eq!(rig.server.save(), Err(in_between.clone()));
+    assert_eq!(refused(&rig.server.encode_state().unwrap()), in_between);
+
+    // Delivered: the server is saved again, and the snapshot restores.
+    let mut buffer = vec![0; BUFFER_SIZE];
+    let delivered = rig.server.deliver(&mut rig.kernel, completed, &mut buffer);
+    assert_eq!(delivered, Ok(()));
+    assert!(restores(&rig.server.save().unwrap()));
+}
+
+/// The scene with the framing of one of its deferred requests changed, as bytes.
+fn reframed(request: usize, framing: Framing) -> Vec<u8> {
+    let mut scene = scene();
+    let token = scene.tokens[request];
+    scene.rig.server.pending.get_mut(&token).unwrap().framing = framing;
+    drop(parked());
+    scene.rig.server.encode_state().unwrap()
+}
+
+#[test]
+fn a_deferred_request_is_framed_as_its_session_is() {
+    // The scene's requests, by index: 0 on a plain session (CMIF), 1 on a domain, 2 on a plain
+    // session (TIPC).
+    let not_a_domain = "a deferred request has a domain reply on a session that is not a domain";
+    let no_domain_header =
+        "a deferred request on a domain session has a reply that is not a domain's";
+    let tipc_on_domain = "a deferred TIPC request is on a domain session";
+    let cases = [
+        (0, Framing::Domain, not_a_domain),
+        (2, Framing::Domain, not_a_domain),
+        (1, Framing::Cmif, no_domain_header),
+        (1, Framing::Tipc(toy::TIPC_WAIT), tipc_on_domain),
+    ];
+    for (request, framing, message) in cases {
+        let error = refused(&reframed(request, framing));
+        assert_eq!(error, SnapshotError::Inconsistent(message), "{request}");
+    }
+    // Each request in a framing its session can have is accepted: its own, and on a plain
+    // session the other of CMIF and TIPC, which a snapshot cannot tell apart from its own.
+    for (request, framing) in [
+        (0, Framing::Cmif),
+        (0, Framing::Tipc(toy::TIPC_WAIT)),
+        (1, Framing::Domain),
+        (2, Framing::Tipc(toy::TIPC_WAIT)),
+        (2, Framing::Cmif),
+    ] {
+        assert!(restores(&reframed(request, framing)), "{request}");
+    }
+
+    // A server holding such a request is not saved either.
+    let mut scene = scene();
+    let token = scene.tokens[0];
+    scene.rig.server.pending.get_mut(&token).unwrap().framing = Framing::Domain;
+    assert_eq!(
+        scene.rig.server.save(),
+        Err(SnapshotError::Inconsistent(not_a_domain))
+    );
+    drop(parked());
+}
+
+#[test]
+fn a_snapshot_is_restored_only_into_a_server_with_as_many_workers() {
+    let (mut rig, _) = deferred_rig();
+    let session = rig.session;
+    // The same queue on one worker more than a server has.
+    let mut wider = RequestQueue::with_workers(DEFAULT_WORKERS + 1).unwrap();
+    assert_eq!(wider.submit(session), Ok(Admission::Start));
+    wider.defer(session).unwrap();
+    assert_eq!(rig.server.queue().workers(), DEFAULT_WORKERS);
+    assert!(restores(&rig.server.encode_state().unwrap()));
+    rig.server.queue = wider;
+    assert_eq!(
+        refused(&rig.server.encode_state().unwrap()),
+        SnapshotError::Inconsistent("the queue's count of workers is not the server's")
+    );
+    drop(parked());
+}
+
+#[test]
+fn a_row_nothing_refers_to_is_refused_whatever_its_count() {
+    let mut rig = Rig::strict();
+    let child = rig.open_child(0xC1);
+    assert!(restores(&rig.server.encode_state().unwrap()));
+    // The child's session goes and its row stays.
+    let orphan = rig.server.sessions.remove(&child).unwrap();
+    assert_eq!(
+        refused(&rig.server.encode_state().unwrap()),
+        SnapshotError::Inconsistent("a reference count is not the number of references")
+    );
+    // With its count set to the number of references it has, none, it is still not a row a
+    // server can hold: nothing could ever release it.
+    rig.server.targets.set_refs(orphan, 0);
+    assert_eq!(
+        refused(&rig.server.encode_state().unwrap()),
+        SnapshotError::Inconsistent("a target has a reference count of zero")
+    );
 }
