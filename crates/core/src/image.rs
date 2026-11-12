@@ -121,6 +121,11 @@
 //!   addresses. Guess, not checked against any source here: a title's `rtld` finds modules by
 //!   walking the address space for code; it walks upwards from its own module, so it does not
 //!   meet pages below the first module. Running a retail title would confirm it.
+//!   While guest code is inside a trampoline its program counter is the trampoline's address,
+//!   not the patched read's: an exit there (a fault on the two stack words a trampoline saves,
+//!   or the timeout's interrupt) is reported at that address, which the memory map names
+//!   `trampolines`, and a resumed guest carries on in the trampoline. Nothing maps it back to
+//!   the read it stands for.
 //! - A segment that does not start on a page boundary is [`LoadError::MisalignedSegment`]
 //!   (`a_segment_that_starts_inside_a_page_is_an_error`). Eden does not refuse it.
 //!   `ReprotectSegment` in `KProcess::LoadModule` discards the result of
