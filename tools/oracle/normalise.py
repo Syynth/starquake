@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Normalises a reference emulator's trace of the hello fixture into `startup.trace`.
+"""Normalises a reference emulator's trace of a homebrew fixture into its `startup.trace`.
 
-The reference emulator (Eden-NX2, see README.md in this folder) logs every system call twice,
+The reference emulator (Eden-NX2, see docs/reference-emulator.md) logs every system call twice,
 with the raw registers:
 
     [   0.681243] Kernel.SVC <Info> svc 0x02 in  t84 [0]=0x80c05000 [1]=0x1000 [2]=0x1 [3]=0x3
@@ -17,22 +17,39 @@ them. This script keeps what a second emulator can be compared with:
   registers that are not arguments are gone;
 - no timestamps and no thread ids (a trace with more than one thread is refused);
 - every address replaced by `anchor+offset`, where the anchor is the start of the region the
-  address lies in: the module (`main`) or one of the regions `GetInfo` reported in the same
-  trace (`aslr_region`, `stack_region`, `alias_region`, `heap_region`).
+  address lies in: the module (`main`), a placement (below), or one of the regions `GetInfo`
+  reported in the same trace (`aslr_region`, `stack_region`, `alias_region`, `heap_region`);
+- the answers of `GetInfo` ids whose value is random by design (`RANDOM_INFO`) written as
+  `random`.
 
 Which arguments and outputs are addresses is listed in `ADDRESSES` below; a call that is not
 listed there is refused, so nothing is passed through unmasked by oversight.
 
+**Placements.** libnx picks where to map a shared memory at random: `virtmemFindAslr` draws a
+page of the ASLR region from its random generator, asks `QueryMemory` about the page a guard
+before it, and maps there if the range is free (libnx/nx/source/kernel/virtmem.c,
+`_memregionFindRandom` and `_memregionIsMapped`; the guard is 0x1000 in
+libnx/nx/source/kernel/shmem.c, `shmemMap`). The generator is seeded from `GetInfo`'s random
+entropy, so the page differs from run to run. Each range a call in `PLACEMENTS` maps is a
+placement, named `placement1`, `placement2`, ... in the order the trace maps them, and anchored
+at the range's start less the guard (the address libnx's probe asks about). A placement must lie
+in the ASLR region outside every other region and the module, or the trace is refused.
+
 Usage, from the repository root:
 
-    tests/homebrew/hello/reference/normalise.py <raw startup.txt>
+    tools/oracle/normalise.py --nro <fixture.nro> <raw startup.txt>
 
-The module's base is not in the trace, so it is worked out from the fixture
-(`tests/homebrew/hello/hello.nro`, or `--nro`): at start-up libnx asks `QueryMemory` about
-`__argdata__`, the first address after its image (libnx/nx/source/runtime/argv.c), so the
-highest module address the trace names is the module's base plus the NRO's image size (the
-word at 0x18 of the file). The script checks that the base is then page aligned and that
-every other module address lies inside the image.
+The module's base is not in the trace, so it is worked out from the fixture: at start-up libnx
+asks `QueryMemory` about `__argdata__`, the first page after its image and its `.bss`
+(libnx/nx/source/runtime/argv.c), so the highest module address the trace names is the module's
+base plus the module's extent: the NRO's image size (the word at 0x18 of the file) and its
+`.bss` size (the word at 0x38), each rounded up to a page, as Eden loads them
+(eden/src/core/loader/nro.cpp, `LoadNroImpl`: `PageAlignSize(nro_header.file_size)` plus
+`PageAlignSize(nro_header.bss_size)`). Eden prefers the `.bss` size of the module's `MOD0`
+header when it has one; this script reads only the NRO header's, which for both fixtures ends
+exactly at `__argdata__` (checked against each ELF's symbol table when the fixture was added).
+The script checks that the base is then page aligned and that every other module address lies
+inside the module.
 """
 
 import argparse
@@ -41,11 +58,13 @@ import re
 import struct
 import sys
 
-REPO = pathlib.Path(__file__).resolve().parents[4]
+REPO = pathlib.Path(__file__).resolve().parents[2]
 REFERENCE = REPO / "crates/kernel/src/svc/reference"
-FIXTURE = REPO / "tests/homebrew/hello/hello.nro"
-# Where an NRO's header keeps the size of its image (`NroHeader::size`).
+# Where an NRO's header keeps the size of its image and of its `.bss` (`NroHeader::file_size`
+# and `NroHeader::bss_size` in eden/src/core/loader/nro.cpp).
 NRO_IMAGE_SIZE_OFFSET = 0x18
+NRO_BSS_SIZE_OFFSET = 0x38
+PAGE = 0x1000
 
 # The arguments and outputs of each call that are addresses. Every call a trace contains must
 # be listed, with an empty list if it has none.
@@ -55,12 +74,25 @@ ADDRESSES = {
     "SetMemoryAttribute": ["address"],
     "QueryMemory": ["out_memory_info", "address"],
     "ExitProcess": [],
+    "MapSharedMemory": ["address"],
+    "UnmapSharedMemory": ["address"],
+    "CreateTransferMemory": ["address"],
     "CloseHandle": [],
+    "WaitSynchronization": ["handles"],
     "ConnectToNamedPort": ["name"],
     "SendSyncRequest": [],
     "OutputDebugString": ["debug_str"],
     "GetInfo": [],  # Its output is an address for some ids: see INFO_REGIONS.
 }
+
+# The calls that map a range libnx placed at random, with the arguments holding the range's
+# start and size (see the module docs).
+PLACEMENTS = {
+    "MapSharedMemory": ("address", "size"),
+}
+# The guard libnx keeps free on each side of a placement (libnx/nx/source/kernel/shmem.c,
+# `virtmemFindAslr(s->size, 0x1000)`).
+PLACEMENT_GUARD = 0x1000
 
 # `GetInfo` ids whose answer is where a region starts (`InfoType` in
 # eden/src/core/hle/kernel/svc_types.h), and the id that reports the same region's size.
@@ -70,6 +102,9 @@ INFO_REGIONS = {
     12: ("aslr_region", 13),
     14: ("stack_region", 15),
 }
+# `GetInfo` ids whose answer is random by design: `RandomEntropy` (eden/src/core/hle/kernel/
+# svc_types.h, `InfoType::RandomEntropy = 11`), which libnx seeds its generator from.
+RANDOM_INFO = {11}
 
 SVC = re.compile(r"Kernel\.SVC <Info> svc (0x[0-9a-f]+) (in|out) +t(\d+) (.*)$")
 IPC = re.compile(r"Service <Info> ipc (.*)$")
@@ -118,9 +153,12 @@ def decode(args, registers):
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("raw", type=pathlib.Path)
-    parser.add_argument("--nro", type=pathlib.Path, default=FIXTURE)
+    parser.add_argument("--nro", type=pathlib.Path, required=True)
     options = parser.parse_args()
-    (image_size,) = struct.unpack_from("<I", options.nro.read_bytes(), NRO_IMAGE_SIZE_OFFSET)
+    nro = options.nro.read_bytes()
+    (image_size,) = struct.unpack_from("<I", nro, NRO_IMAGE_SIZE_OFFSET)
+    (bss_size,) = struct.unpack_from("<I", nro, NRO_BSS_SIZE_OFFSET)
+    extent = -(-image_size // PAGE) * PAGE + -(-bss_size // PAGE) * PAGE
     table = conventions()
 
     # First pass: pair each call's two lines, in the order the calls returned, with the lines
@@ -154,47 +192,80 @@ def main():
     if len(threads) != 1:
         sys.exit(f"expected one thread, found {sorted(threads)}")
 
-    # Second pass: the anchors. Regions come from `GetInfo`'s answers.
+    def svc_calls():
+        """Each system call as (name, decoded inputs, decoded outputs)."""
+        for call in calls:
+            if call[0] == "svc":
+                _, number, registers, returned = call
+                name, inputs, outputs = table[number]
+                if name not in ADDRESSES:
+                    sys.exit(f"no address rule for {name}: add it to ADDRESSES")
+                yield name, decode(inputs, registers), decode(outputs, returned)
+
+    # Second pass: the anchors. Regions come from `GetInfo`'s answers, placements from the
+    # calls that map them.
     anchors = {}
     info = {}
-    for call in calls:
-        if call[0] == "svc" and table[call[1]][0] == "GetInfo":
-            _, number, registers, returned = call
-            name, inputs, outputs = table[number]
-            info_type = decode(inputs, registers)[0][1]
-            info[info_type] = decode(outputs, returned)[1][1]
+    for name, inputs, outputs in svc_calls():
+        if name == "GetInfo":
+            info[inputs[0][1]] = outputs[1][1]
     for start_id, (anchor, size_id) in INFO_REGIONS.items():
         if start_id in info and size_id in info:
             anchors[anchor] = (info[start_id], info[start_id] + info[size_id])
+    placements = []
+    for name, inputs, _ in svc_calls():
+        if name in PLACEMENTS:
+            values = {arg: value for arg, value, _ in inputs}
+            start_arg, size_arg = PLACEMENTS[name]
+            start, size = values[start_arg], values[size_arg]
+            placement = (start - PLACEMENT_GUARD, start + size + PLACEMENT_GUARD)
+            if placement not in placements:
+                placements.append(placement)
+
+    def in_placement(value):
+        return any(start <= value < end for start, end in placements)
 
     def address_values():
-        for call in calls:
-            if call[0] != "svc":
-                continue
-            _, number, registers, returned = call
-            name, inputs, outputs = table[number]
-            if name not in ADDRESSES:
-                sys.exit(f"no address rule for {name}: add it to ADDRESSES")
-            values = decode(inputs, registers) + decode(outputs, returned)
-            for arg, value, _ in values:
+        for name, inputs, outputs in svc_calls():
+            for arg, value, _ in inputs + outputs:
                 if arg in ADDRESSES[name]:
                     yield value
 
     # The module lies in the ASLR region, below every other region; the end of its image is
     # the highest address there that the trace names (see the module docs).
     others = [start for name, (start, _) in anchors.items() if name != "aslr_region"]
-    module_addresses = [value for value in address_values() if value < min(others)]
+    module_addresses = [
+        value for value in address_values() if value < min(others) and not in_placement(value)
+    ]
     image_end = max(module_addresses)
-    module = (image_end - image_size, image_end)
-    if module[0] % 0x1000 or min(module_addresses) < module[0]:
+    module = (image_end - extent, image_end)
+    if module[0] % PAGE or min(module_addresses) < module[0]:
         sys.exit(f"the image {module[0]:#x}..{module[1]:#x} does not hold every code address")
 
+    inner = ["stack_region", "alias_region", "heap_region"]
+    for start, end in placements:
+        outside = all(
+            end <= anchors[name][0] or anchors[name][1] <= start for name in inner if name in anchors
+        )
+        aslr = anchors.get("aslr_region")
+        if (
+            not outside
+            or aslr is None
+            or not (aslr[0] <= start and end <= aslr[1])
+            or not (end <= module[0] or module[1] < start)
+        ):
+            sys.exit(f"the placement {start:#x}..{end:#x} is not in the ASLR region alone")
+
     def symbol(value):
-        # The module first (its image's end included: libnx asks about it), then the regions,
-        # innermost first; the ASLR region contains all the others, so it goes last.
+        # The module first (its end included: libnx asks about it), then the
+        # placements, then the regions, innermost first; the ASLR region contains all the
+        # others, so it goes last.
         if module[0] <= value <= module[1]:
             return f"main+{value - module[0]:#x}"
-        for name in ["stack_region", "alias_region", "heap_region", "aslr_region"]:
+        for index, (start, end) in enumerate(placements, start=1):
+            if start <= value < end:
+                return f"placement{index}+{value - start:#x}"
+        for name in inner + ["aslr_region"]:
             if name in anchors and anchors[name][0] <= value < anchors[name][1]:
                 return f"{name}+{value - anchors[name][0]:#x}"
         sys.exit(f"address {value:#x} lies in no known region")
@@ -207,7 +278,13 @@ def main():
             is_address = arg in ADDRESSES[name] or (
                 name == "GetInfo" and arg == "out" and info_type in INFO_REGIONS
             )
-            parts.append(f"{arg}={symbol(value) if is_address else hex(value)}")
+            if name == "GetInfo" and arg == "out" and info_type in RANDOM_INFO:
+                text = "random"
+            elif is_address:
+                text = symbol(value)
+            else:
+                text = hex(value)
+            parts.append(f"{arg}={text}")
         return parts
 
     for call in calls:

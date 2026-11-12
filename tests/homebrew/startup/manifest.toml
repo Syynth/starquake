@@ -1,0 +1,18 @@
+# Written by `make` in this folder; do not edit by hand.
+# crates/loader/tests/homebrew_fixture.rs fails when a file no longer matches.
+
+[toolchain]
+gcc = "16.1.0"
+devkitA64 = "r30-1"
+libnx = "4.12.0-1"
+switch-tools = "1.13.1-1"
+
+[elf]
+build-id = "e0fd8841b39546d6cd9bb732572bcb3c847782e6"
+
+[sources]
+"startup.c" = "10b02ec49f36e724587edfc7e839865da281f46abe791c3d54a7b59aa8f4a329"
+"Makefile" = "6a6aa10592034e97ad710522c6fcd63a8f5d1a26df78dec23dedbaadf2a63ac0"
+
+[binaries]
+"startup.nro" = "57b4200993a45b59156a447a0fe6c23aedf7a684ca1c48b74f4f698520ba80d2"
