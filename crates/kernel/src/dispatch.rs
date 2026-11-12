@@ -57,12 +57,14 @@
 //!   [`Outcome::Waiting`] the way `SendSyncRequest` does, and its event is recorded when the
 //!   wait ends, by whichever dispatch (or [`Dispatcher::signal_event`],
 //!   [`Dispatcher::fire_timers`]) records the wake. `dispatch/sync.rs` says how.
-//! - **`ExitProcess`** ends the dispatch in [`Outcome::ProcessExited`] and the caller stops
-//!   running the guest. PROVISIONAL (walking skeleton, #74): there is no process or thread
-//!   table to update yet, so the call changes no kernel state. Kernel slice 8 (process creation,
-//!   thread lifecycle) replaces the dispatch arm with a call that terminates the process's
-//!   threads, as Eden's does (`eden/src/core/hle/kernel/svc/svc_process.cpp` @ cf654052,
-//!   `ExitProcess`).
+//! - **`ExitProcess`** ends the process ([`crate::svc::process::exit_process`]: its threads end
+//!   and its handles close, so the servers of its sessions are told) and the dispatch in
+//!   [`Outcome::ProcessExited`]; the caller stops running the guest. **`ExitThread`** ends the
+//!   calling thread, in [`Outcome::ThreadExited`], or in [`Outcome::ProcessExited`] when it was
+//!   its process's last running thread. Neither writes a register.
+//! - **The calling process's facts** ([`Processes`]) are not a declared table: they never
+//!   change, so the calls that check a process's capabilities get a copy taken under the lock
+//!   ([`Dispatcher`]'s private `call_in_process`).
 //!
 //! Intentional divergences from Eden (`eden/src/core/hle/kernel/svc.cpp` @ cf654052, `Call64`),
 //! pinned by the named tests in `dispatch/tests.rs`:
@@ -213,6 +215,7 @@ use crate::svc::{
 use crate::tables::{AddressSpace, Processes, Scheduler};
 
 mod ipc;
+mod lifecycle;
 mod sync;
 #[cfg(test)]
 mod tests;
@@ -466,9 +469,14 @@ pub enum Outcome {
     /// that has diverged from its recording does this; the caller should stop the run and
     /// report it.
     EnvFailed(EnvError),
-    /// `ExitProcess` ran: the calling process is over, and the caller must not resume the guest
-    /// thread. No register was written.
+    /// `ExitProcess` ran, or the process's last running thread called `ExitThread`: the calling
+    /// process is over, and the caller must not resume the guest thread. No register was
+    /// written.
     ProcessExited,
+    /// `ExitThread` ended the calling thread and its process has other running threads: the
+    /// caller must not resume the thread, and should run another
+    /// ([`Scheduler::needs_scheduling`]). No register was written.
+    ThreadExited,
     /// The calling thread waits: a `SendSyncRequest` whose request waits behind another or was
     /// deferred, or a `WaitSynchronization` that nothing has ended yet. No register was written
     /// and no event recorded; both happen when the wait ends, and the thread is then reported
@@ -684,7 +692,19 @@ impl Dispatcher {
         call: &mut Call<'_, '_>,
         body: impl for<'a> FnOnce(B::Borrowed<'a>, &mut Call<'_, '_>, GuestTicks) -> Outcome,
     ) -> Outcome {
-        self.call_at::<B>(call, |tables, call, now| body(tables, call, now.guest))
+        self.call_in_process::<B>(call, |tables, call, time, _| body(tables, call, time))
+    }
+
+    /// [`Dispatcher::call`], also handing `body` the process facts ([`Processes`]): a copy taken
+    /// under the lock, which is cheap because the table's rows are shared.
+    fn call_in_process<B: TableSet>(
+        &self,
+        call: &mut Call<'_, '_>,
+        body: impl for<'a> FnOnce(B::Borrowed<'a>, &mut Call<'_, '_>, GuestTicks, &Processes) -> Outcome,
+    ) -> Outcome {
+        self.call_at_in_process::<B>(call, |tables, call, now, processes| {
+            body(tables, call, now.guest, processes)
+        })
     }
 
     /// [`Dispatcher::call`], handing `body` the clock reading in both units. Waits that ended
@@ -695,6 +715,16 @@ impl Dispatcher {
         call: &mut Call<'_, '_>,
         body: impl for<'a> FnOnce(B::Borrowed<'a>, &mut Call<'_, '_>, Now) -> Outcome,
     ) -> Outcome {
+        self.call_at_in_process::<B>(call, |tables, call, now, _| body(tables, call, now))
+    }
+
+    /// The dispatch the others wrap: [`Dispatcher::call_at`] that also hands `body` the process
+    /// facts, as [`Dispatcher::call_in_process`] does.
+    fn call_at_in_process<B: TableSet>(
+        &self,
+        call: &mut Call<'_, '_>,
+        body: impl for<'a> FnOnce(B::Borrowed<'a>, &mut Call<'_, '_>, Now, &Processes) -> Outcome,
+    ) -> Outcome {
         let mut locked = self.lock::<B>();
         // Read under the lock, so the environment's recording is in the kernel's order.
         let now = match locked.clock(call.caller.env) {
@@ -704,11 +734,33 @@ impl Dispatcher {
                 return Outcome::EnvFailed(error);
             }
         };
+        let processes = locked.state.tables.processes.clone();
         sync::drain_wakes(&mut locked.state, call.caller.recorder, now.guest);
-        let outcome = body(locked.tables(), call, now);
+        let outcome = body(locked.tables(), call, now, &processes);
         record_point(call, now.guest, &outcome);
         sync::drain_wakes(&mut locked.state, call.caller.recorder, now.guest);
         drop(locked);
+        outcome
+    }
+
+    /// [`Dispatcher::call_in_process`] for a call that may close a session's last reference:
+    /// `body` also says whether any server has notices waiting, and if one has, the servers are
+    /// given them once the call is over.
+    fn call_then_settle<B: TableSet>(
+        &self,
+        call: &mut Call<'_, '_>,
+        body: impl for<'a> FnOnce(B::Borrowed<'a>, &mut Call<'_, '_>, &Processes) -> (Outcome, bool),
+    ) -> Outcome {
+        let mut notices = false;
+        let outcome = self.call_in_process::<B>(call, |tables, call, _, processes| {
+            let (outcome, waiting) = body(tables, call, processes);
+            notices = waiting;
+            outcome
+        });
+        // A session whose last handle closed: its server forgets it now, if it is free.
+        if notices {
+            self.settle_notices();
+        }
         outcome
     }
 
@@ -745,11 +797,16 @@ impl Dispatcher {
                     get_info((handles, space, scheduler), id, convention, call.regs)
                 },
             ),
-            SvcId::ExitProcess => self.call::<()>(call, |(), _, _| {
-                // PROVISIONAL (walking skeleton, #74): see the module docs.
-                tracing::info!("the process called ExitProcess");
-                Outcome::ProcessExited
-            }),
+            SvcId::ExitProcess
+            | SvcId::ExitThread
+            | SvcId::CreateThread
+            | SvcId::StartThread
+            | SvcId::SleepThread
+            | SvcId::SetThreadPriority
+            | SvcId::GetThreadCoreMask
+            | SvcId::SetThreadCoreMask
+            | SvcId::GetThreadId
+            | SvcId::GetProcessId => self.lifecycle(call, id, convention),
             SvcId::GetThreadPriority => {
                 self.call::<(&HandleTable, &Scheduler)>(call, |(handles, scheduler), call, _| {
                     let core = call.caller.core;
@@ -773,26 +830,17 @@ impl Dispatcher {
                     &[u64::from(core.cast_unsigned())],
                 )
             }),
-            SvcId::CloseHandle => {
-                let mut notices = false;
-                let outcome = self.call::<(&mut HandleTable, &mut Scheduler)>(
-                    call,
-                    |(handles, scheduler), call, _| {
-                        let outcome = returning(id, convention, call.regs, |[closing]| {
-                            let closing = Handle::from_register(closing);
-                            handle::close_handle(handles, scheduler, closing)?;
-                            Ok([])
-                        });
-                        notices = scheduler.ipc().has_any_notices();
-                        outcome
-                    },
-                );
-                // A session whose last handle closed: its server forgets it now, if it is free.
-                if notices {
-                    self.settle_notices();
-                }
-                outcome
-            }
+            SvcId::CloseHandle => self.call_then_settle::<(&mut HandleTable, &mut Scheduler)>(
+                call,
+                |(handles, scheduler), call, _| {
+                    let outcome = returning(id, convention, call.regs, |[closing]| {
+                        let closing = Handle::from_register(closing);
+                        handle::close_handle(handles, scheduler, closing)?;
+                        Ok([])
+                    });
+                    (outcome, scheduler.ipc().has_any_notices())
+                },
+            ),
             SvcId::SignalEvent
             | SvcId::ClearEvent
             | SvcId::ResetSignal
@@ -928,7 +976,7 @@ fn recorded_result(id: Option<SvcId>, outcome: &Outcome, regs: &GuestRegs) -> Op
     match outcome {
         Outcome::EnvFailed(_) | Outcome::Waiting => None,
         Outcome::NotImplemented => Some(KernelError::NotImplemented.code()),
-        Outcome::ProcessExited => Some(ResultCode::SUCCESS),
+        Outcome::ProcessExited | Outcome::ThreadExited => Some(ResultCode::SUCCESS),
         Outcome::Completed => {
             let result = id
                 .and_then(SvcId::convention)
@@ -954,6 +1002,30 @@ fn calling_core(core: u8) -> CallResult<CoreId> {
 /// dispatcher bug, not a guest's.
 fn word(argument: u64) -> CallResult<u32> {
     u32::try_from(argument).map_err(|error| SvcError::internal(&error))
+}
+
+/// A decoded 4-byte signed argument (`int32_t`) as the `i32` it is: [`word`], reinterpreted.
+fn signed(argument: u64) -> CallResult<i32> {
+    Ok(word(argument)?.cast_signed())
+}
+
+/// Runs an implemented call with no outputs at all (`SleepThread`): decodes its `I` inputs and
+/// runs `body`. Eden's wrapper writes nothing, and a call like this has no result to fail with,
+/// so any failure of `body` is a fault ([`SvcError::Internal`] or not).
+fn void<const I: usize>(
+    id: SvcId,
+    convention: &Convention,
+    regs: &mut GuestRegs,
+    body: impl FnOnce([u64; I]) -> CallResult<()>,
+) -> Outcome {
+    let inputs = match convention.read::<I>(regs) {
+        Ok(inputs) => inputs,
+        Err(error) => return mismatch(id, error, regs),
+    };
+    match body(inputs) {
+        Ok(()) => complete(id, convention, regs, &[]),
+        Err(error) => fault(id, &error.to_string(), regs),
+    }
 }
 
 /// Runs an implemented call that returns a `Result` first: decodes its `I` inputs, runs `body`,

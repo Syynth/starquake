@@ -122,6 +122,22 @@ fn the_first_handles_follow_horizons_free_list() {
 }
 
 #[test]
+fn the_handles_are_listed_lowest_index_first_as_finalize_closes_them() {
+    // Adds take indices 3, 2, 1: listed, they come back 1, 2, 3, whatever order they were added
+    // in, and a removed one is not listed.
+    let mut t = table(4);
+    let mut refs = RefCounts::new();
+    let added: Vec<Handle> = (0..3).map(|n| t.add(&mut refs, obj(n)).unwrap()).collect();
+    let mut by_index = added.clone();
+    by_index.sort_by_key(|handle| handle.index());
+    assert_eq!(t.handles(), by_index);
+    assert_ne!(by_index, added);
+    t.remove(&mut refs, added[1]).unwrap();
+    assert_eq!(t.handles(), [added[2], added[0]]);
+    assert_eq!(table(4).handles(), Vec::<Handle>::new());
+}
+
+#[test]
 fn a_full_size_table_starts_at_its_last_index() {
     let mut t = table(i32::from(MAX_TABLE_SIZE));
     let mut refs = RefCounts::new();

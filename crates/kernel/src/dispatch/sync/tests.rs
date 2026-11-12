@@ -20,6 +20,7 @@ use crate::id::{ProcessId, SlabId, ThreadId as KernelThreadId};
 use crate::ipc::{Handled, HandlerError, IpcContext, SessionHandler};
 use crate::memory::fixture::{self, CODE, CODE_SIZE, DATA, DATA_PAGES};
 use crate::object::Object;
+use crate::process::{Console, ProcessDescription};
 use crate::result::{KernelError, ResultCode};
 use crate::sched::{CoreId, CoreSignals, Priority};
 use crate::svc::DebugSink;
@@ -91,7 +92,7 @@ impl World {
             handles: HandleTable::new(i32::from(MAX_TABLE_SIZE)).unwrap(),
             address_space: fixture::loaded().0,
             scheduler: Scheduler::default(),
-            processes: Processes::new(CounterRate::SWITCH_2),
+            processes: Processes::new(&ProcessDescription::homebrew(Console::Switch2)).unwrap(),
         };
         let mut start = |on: u8| {
             let scheduler = &mut tables.scheduler;

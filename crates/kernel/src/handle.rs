@@ -23,9 +23,10 @@
 //!
 //! What this port does not carry over, so a later slice can add it where a system call needs it:
 //! `Reserve`/`Unreserve`/`Register` (two-step insertion used when a call must fail atomically),
-//! `GetObjectByIndex`, `GetMultipleObjects`, `GetObjectForIpc`, and `Finalize` (close every
-//! entry when a process dies). Objects are held as [`ObjectId`]s and reference counting goes
-//! through [`ObjectRefs`], see [`refs`].
+//! `GetObjectByIndex`, `GetMultipleObjects` and `GetObjectForIpc`. `Finalize` (close every
+//! entry when a process dies) is [`HandleTable::handles`], in `Finalize`'s order, with each
+//! handle removed by the process-exit path (`crate::svc::process`). Objects are held as
+//! [`ObjectId`]s and reference counting goes through [`ObjectRefs`], see [`refs`].
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -324,6 +325,21 @@ impl TryFrom<HandleTableData> for HandleTable {
 }
 
 impl HandleTable {
+    /// Every handle the table holds, lowest index first: the order in which
+    /// `KHandleTable::Finalize` closes them (`eden/src/core/hle/kernel/k_handle_table.cpp` @
+    /// cf654052, its loop over `m_table_size`).
+    #[must_use]
+    pub fn handles(&self) -> Vec<Handle> {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                let entry = entry.as_ref()?;
+                Handle::from_parts(u16::try_from(index).ok()?, entry.linear_id)
+            })
+            .collect()
+    }
+
     /// A table for `size` handles (`KHandleTable::Initialize`).
     ///
     /// A `size` of zero or less means the maximum, [`MAX_TABLE_SIZE`], as in Horizon; a larger

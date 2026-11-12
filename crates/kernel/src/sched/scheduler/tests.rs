@@ -567,9 +567,9 @@ fn a_fruitless_yield_is_remembered_until_something_is_scheduled() {
 }
 
 #[test]
-fn yield_count_is_one_for_the_table() {
-    // A change to any thread (here one that will never share a level with `a`) makes the next
-    // yield do work again. In Eden only a thread of the same process would.
+fn threads_of_no_process_share_the_tables_yield_count() {
+    // A change to any thread of no process (here one that will never share a level with `a`)
+    // makes the next yield of another do work again: they share the table's own count.
     let mut s = Scheduler::new(2).unwrap();
     let _a = spawn(&mut s, 10, 0, &[0]);
     settle(&mut s);
@@ -581,6 +581,69 @@ fn yield_count_is_one_for_the_table() {
     let before = s.scheduled_count;
     s.yield_without_core_migration(core(0)).unwrap();
     assert_eq!(s.scheduled_count, before + 1, "the yield ran");
+}
+
+/// A started thread of `process` at `priority` on core `on`, in the fixture's address space.
+fn spawn_in(
+    s: &mut Scheduler,
+    space: &mut crate::memory::AddressSpace,
+    process: crate::id::ProcessId,
+    priority: u8,
+    on: u8,
+) -> ThreadId {
+    let spec = super::UserThread {
+        entry: 0,
+        argument: 0,
+        stack_top: 0,
+        priority: prio(priority),
+        virtual_core: on,
+    };
+    let (id, _) = s.create_user_thread(space, process, &spec).unwrap();
+    s.start(id).unwrap();
+    id
+}
+
+#[test]
+fn yield_count_is_per_process() {
+    // Eden compares a thread's yield count with its own process's scheduled count
+    // (`GetCurrentProcess(kernel).GetScheduledCount()`), which only that process's threads
+    // move. A change to another process's thread leaves a fruitless yield remembered; a change
+    // to one of its own process's threads makes the next yield do work again.
+    use crate::id::{ProcessId, SlabId};
+    let mut space = crate::memory::fixture::loaded().0;
+    let (mine, theirs) = (ProcessId::from_parts(0, 1), ProcessId::from_parts(1, 1));
+    let mut s = Scheduler::new(2).unwrap();
+    s.add_process(mine).unwrap();
+    s.add_process(theirs).unwrap();
+    let a = spawn_in(&mut s, &mut space, mine, 10, 0);
+    settle(&mut s);
+    assert_eq!(s.current(core(0)).unwrap(), Some(a));
+    s.yield_without_core_migration(core(0)).unwrap();
+    let own = s.process(mine).unwrap().scheduled_count();
+    assert_eq!(s.thread(a).unwrap().yield_schedule_count, Some(own));
+
+    // Another process's thread starts: its count moves, not mine.
+    let theirs_before = s.process(theirs).unwrap().scheduled_count();
+    spawn_in(&mut s, &mut space, theirs, 50, 1);
+    assert_ne!(s.process(theirs).unwrap().scheduled_count(), theirs_before);
+    assert_eq!(s.process(mine).unwrap().scheduled_count(), own);
+    s.yield_without_core_migration(core(0)).unwrap();
+    assert_eq!(
+        s.process(mine).unwrap().scheduled_count(),
+        own,
+        "the redundant yield did no work"
+    );
+
+    // A thread of my own process starts: the next yield runs.
+    spawn_in(&mut s, &mut space, mine, 50, 1);
+    let before = s.process(mine).unwrap().scheduled_count();
+    assert_ne!(before, own);
+    s.yield_without_core_migration(core(0)).unwrap();
+    assert_eq!(
+        s.process(mine).unwrap().scheduled_count(),
+        before + 1,
+        "the yield ran"
+    );
 }
 
 #[test]

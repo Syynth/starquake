@@ -108,14 +108,14 @@ svc_ids! {
     UnmapMemory = 0x05, Planned;
     QueryMemory = 0x06, Implemented;
     ExitProcess = 0x07, Implemented;
-    CreateThread = 0x08, Planned;
-    StartThread = 0x09, Planned;
-    ExitThread = 0x0a, Planned;
-    SleepThread = 0x0b, Planned;
+    CreateThread = 0x08, Implemented;
+    StartThread = 0x09, Implemented;
+    ExitThread = 0x0a, Implemented;
+    SleepThread = 0x0b, Implemented;
     GetThreadPriority = 0x0c, Implemented;
-    SetThreadPriority = 0x0d, Planned;
-    GetThreadCoreMask = 0x0e, Planned;
-    SetThreadCoreMask = 0x0f, Planned;
+    SetThreadPriority = 0x0d, Implemented;
+    GetThreadCoreMask = 0x0e, Implemented;
+    SetThreadCoreMask = 0x0f, Implemented;
     GetCurrentProcessorNumber = 0x10, Implemented;
     SignalEvent = 0x11, Implemented;
     ClearEvent = 0x12, Implemented;
@@ -136,8 +136,8 @@ svc_ids! {
     SendSyncRequest = 0x21, Implemented;
     SendSyncRequestWithUserBuffer = 0x22, Planned;
     SendAsyncRequestWithUserBuffer = 0x23, Planned;
-    GetProcessId = 0x24, Planned;
-    GetThreadId = 0x25, Planned;
+    GetProcessId = 0x24, Implemented;
+    GetThreadId = 0x25, Implemented;
     Break = 0x26, Planned;
     OutputDebugString = 0x27, Implemented;
     ReturnFromException = 0x28, Planned;
@@ -308,7 +308,14 @@ mod tests {
                 | SvcId::SetMemoryAttribute
                 | SvcId::QueryMemory
                 | SvcId::ExitProcess
+                | SvcId::CreateThread
+                | SvcId::StartThread
+                | SvcId::ExitThread
+                | SvcId::SleepThread
                 | SvcId::GetThreadPriority
+                | SvcId::SetThreadPriority
+                | SvcId::GetThreadCoreMask
+                | SvcId::SetThreadCoreMask
                 | SvcId::GetCurrentProcessorNumber
                 | SvcId::SignalEvent
                 | SvcId::ClearEvent
@@ -319,6 +326,8 @@ mod tests {
                 | SvcId::GetSystemTick
                 | SvcId::ConnectToNamedPort
                 | SvcId::SendSyncRequest
+                | SvcId::GetProcessId
+                | SvcId::GetThreadId
                 | SvcId::OutputDebugString
                 | SvcId::GetInfo
                 // Not a retail call, but the kernel spec builds events (kernel slice 4).

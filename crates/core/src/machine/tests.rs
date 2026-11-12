@@ -9,7 +9,8 @@ use std::time::{Duration, Instant};
 
 use starquake_cpu::testing::ScriptedVcpu;
 use starquake_cpu::{Exit, FaultStatus, Interrupter, Syndrome, Vcpu};
-use starquake_kernel::handle::{MAX_TABLE_SIZE, MIN_LINEAR_ID};
+use starquake_kernel::handle::{Handle, MAX_TABLE_SIZE, MIN_LINEAR_ID};
+use starquake_kernel::memory::GUARD_PAGES;
 use starquake_kernel::memory::testing::RecordingMapper;
 use starquake_kernel::result::KernelError;
 use starquake_kernel::svc::SvcId;
@@ -21,7 +22,7 @@ use starquake_trace::{
 };
 
 use super::*;
-use crate::clock::PROCESS_COUNTER_RATE;
+use crate::clock::PROCESS_CONSOLE;
 use crate::crash::{Location, SyndromeReport};
 use crate::image::{Loaded, Program, load};
 use crate::report::{empty_dump, exit_code};
@@ -37,7 +38,7 @@ const RAM_SIZE: usize = 2 << 20;
 /// monotonic clock. Nothing here reads a counter in the guest, so the clock's zero is free.
 fn timebase() -> Timebase<SystemClock> {
     Timebase {
-        rate: PROCESS_COUNTER_RATE,
+        console: PROCESS_CONSOLE,
         clock: SystemClock::new(),
     }
 }
@@ -61,6 +62,9 @@ struct Guest {
     placed: Placement,
     /// The kernel's address space, until a run takes it.
     address_space: Cell<Option<AddressSpace>>,
+    /// Where the kernel will put the main thread's thread-local region: the first page of the
+    /// kernel-map region past its guard pages.
+    tls: u64,
 }
 
 impl Guest {
@@ -72,10 +76,12 @@ impl Guest {
             placed,
             address_space,
         } = load(&program, None, Box::new(mapper), &memory).unwrap();
+        let tls = address_space.regions().kernel_map.start + GUARD_PAGES * crate::image::PAGE;
         Self {
             memory,
             placed,
             address_space: Cell::new(Some(address_space)),
+            tls,
         }
     }
 
@@ -102,6 +108,19 @@ impl Guest {
             Instant::now(),
             timebase(),
         )
+    }
+
+    /// What a run's memory map holds: the loader's mappings, and the page of the main thread's
+    /// thread-local region, in address order.
+    fn memory_map(&self) -> Vec<crate::report::Mapping> {
+        let mut map = self.placed.mappings.clone();
+        map.push(crate::report::Mapping {
+            name: "tls".to_owned(),
+            start: self.tls,
+            end: self.tls + crate::image::PAGE,
+        });
+        map.sort_by_key(|mapping| mapping.start);
+        map
     }
 
     /// Where the mapping called `name` starts.
@@ -203,7 +222,7 @@ fn the_guest_programs_use_the_kernels_system_call_numbers() {
         u32::from(SvcId::OutputDebugString.number())
     );
     // And the rate the example's counter program expects is the one the kernel gives a process.
-    assert_eq!(programs::COUNTER_HZ, PROCESS_COUNTER_RATE.hz());
+    assert_eq!(programs::COUNTER_HZ, PROCESS_CONSOLE.counter_rate().hz());
 }
 
 #[test]
@@ -213,7 +232,7 @@ fn a_guest_that_prints_two_lines_and_exits_is_reported_in_full() {
     let first_at = guest.start_of("main.rodata");
     let second_at = first_at + first.len() as u64;
     let (first_len, second_len) = (first.len() as u64, second.len() as u64);
-    let (entry, stack_top, tls) = (guest.placed.entry, guest.placed.stack_top, guest.placed.tls);
+    let (entry, stack_top, tls) = (guest.placed.entry, guest.placed.stack_top, guest.tls);
     let main_thread = Handle::from_parts(MAX_TABLE_SIZE - 1, MIN_LINEAR_ID).unwrap();
     assert_eq!(main_thread.raw(), 0x83ff);
 
@@ -283,7 +302,8 @@ fn a_guest_that_prints_two_lines_and_exits_is_reported_in_full() {
         ])
     );
     assert_eq!(report.stubbed, BTreeSet::new());
-    assert_eq!(report.memory_map, guest.placed.mappings);
+    // The loader's mappings, and the main thread's thread-local page the kernel placed.
+    assert_eq!(report.memory_map, guest.memory_map());
     assert_eq!(report.patched_counter_reads, Vec::<u64>::new());
 }
 
@@ -374,7 +394,7 @@ fn a_data_abort_is_a_crash_that_names_the_address_and_the_instruction() {
     assert_eq!(report_crash.registers.x[..2], [address - 8, 0x1234]);
     assert_eq!(report_crash.registers.sp, guest.placed.stack_top);
     assert_eq!(report_crash.command_line, options.command_line);
-    assert_eq!(report_crash.memory_map, guest.placed.mappings);
+    assert_eq!(report_crash.memory_map, guest.memory_map());
     assert_eq!(
         report_crash.modules,
         std::slice::from_ref(&guest.placed.module)
@@ -642,7 +662,8 @@ fn get_system_tick_is_the_clock_at_the_rate_the_run_was_given() {
     // guest.
     const SECONDS: u64 = 1_000_003;
     let start = SECONDS * starquake_kernel::time::NANOS_PER_SECOND;
-    for rate in [CounterRate::SWITCH_1, CounterRate::SWITCH_2] {
+    for console in [Console::Switch1, Console::Switch2] {
+        let rate = console.counter_rate();
         let guest = Guest::new(&programs::hello().unwrap());
         let tick = Rc::new(Cell::new(0));
         let seen = Rc::clone(&tick);
@@ -656,7 +677,7 @@ fn get_system_tick_is_the_clock_at_the_rate_the_run_was_given() {
             &RunOptions::default(),
             Instant::now(),
             Timebase {
-                rate,
+                console,
                 clock: FixedClock::new(start, 1),
             },
         );
@@ -687,7 +708,6 @@ fn the_environments_recording_is_dropped_as_it_is_made() {
     let options = RunOptions::default();
     let session = Session {
         memory: &guest.memory,
-        placed: &guest.placed,
         options: &options,
         clock: RunClock::new(timebase()),
         recorder: Recorder::new(),
@@ -707,10 +727,13 @@ fn the_environments_recording_is_dropped_as_it_is_made() {
     }
     let mut vcpu = vcpu.then(|_| {}, svc(SvcId::ExitProcess));
 
-    let process = Process {
-        space: &guest.memory,
-        address_space: guest.address_space(),
-    };
+    let (process, _) = boot(
+        &guest.memory,
+        guest.address_space(),
+        &guest.placed,
+        PROCESS_CONSOLE,
+    )
+    .unwrap();
     let ending = drive(&mut vcpu, process, &session, &env, &mut log, &mut tally);
     assert!(matches!(ending, Ending::Exited));
     // The calls were made, through this environment...
@@ -1193,7 +1216,8 @@ fn the_main_threads_handle_names_a_thread_with_the_default_priority() {
         .then(|_| {}, svc(SvcId::GetThreadPriority))
         .then(
             |regs| {
-                assert_eq!((regs.x[0], regs.x[1]), (0, u64::from(MAIN_THREAD_PRIORITY)));
+                let priority = ProcessDescription::homebrew(PROCESS_CONSOLE).main_thread_priority;
+                assert_eq!((regs.x[0], regs.x[1]), (0, u64::from(priority)));
             },
             svc(SvcId::ExitProcess),
         );

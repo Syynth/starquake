@@ -1,6 +1,8 @@
 //! Loading a program into a guest address space: where an NRO's segments, its `.bss` and the
 //! counter trampolines go ([`place`]), and creating the process's memory around them with the
-//! kernel ([`load`]): the code, the main thread's stack and its TLS page.
+//! kernel ([`load`]): the code and the main thread's stack. The main thread itself, and its
+//! thread-local page, are the kernel's process creation's (`starquake_kernel::process::run`,
+//! called by the core loop).
 //!
 //! [`load`] follows Eden's process start for a program (paths relative to the reference folder,
 //! all @ cf654052):
@@ -11,23 +13,21 @@
 //! 2. `KProcess::LoadModule`: the image is written, then each segment is reprotected
 //!    (`set_process_memory_permission`).
 //! 3. `KProcess::Run`: the main thread's stack is reserved and mapped in the stack region
-//!    (`create_main_thread_stack`).
-//! 4. `KThread::InitializeUserThread` to `KThreadLocalPage::Initialize`
-//!    (`eden/src/core/hle/kernel/k_thread_local_page.cpp`): one thread-local page, read-write,
-//!    in the kernel-map region (`map_pages_in_region`).
+//!    (`create_main_thread_stack`). The rest of `KProcess::Run` (the main thread and its
+//!    thread-local page, in the kernel-map region) is the kernel's `process::run`.
 //!
 //! ```text
 //! IMAGE_BASE - n pages   counter trampolines (only when a read was patched)
 //! IMAGE_BASE             the image (text, rodata, data), then .bss            "main"
 //! above the code, each 2 MiB aligned (starquake_kernel::memory::layout):
-//!   kernel-map region    TLS page, four pages in (`TPIDRRO_EL0` points at it)
+//!   kernel-map region    the kernel's thread-local pages (not this module's)
 //!   stack region         the stack, four pages in
 //!   alias region, heap region
 //! ```
 //!
-//! PROVISIONAL, and what replaces each part: kernel slice 8 (process creation) owns the
-//! process, its main thread and the registers it starts with; until then this module does the
-//! steps above itself, with these fixed choices:
+//! PROVISIONAL, and what replaces each part: wiring the loader's NPDM into process creation
+//! (#33) places the code and sizes the stack from the program's metadata; until then this module
+//! does the steps above itself, with these fixed choices:
 //!
 //! - **The code goes at [`IMAGE_BASE`]**, Eden's address for 39-bit code with no randomisation
 //!   (`KProcess::LoadFromMetadata`: `code_address = 0x8000'0000 + aslr_space_offset`), and the
@@ -51,7 +51,6 @@
 //! | `.data`, `.bss` | read, write | `ReprotectSegment(DataSegment, ReadWrite)`; `LoadNroImpl` (`eden/src/core/loader/nro.cpp`) adds `.bss` to the data segment |
 //! | pages of the module in no segment | nothing (mapped, so the loader can write the image) | `KProcess::Initialize`, "Map the code region": `KernelRead \| NotMapped` |
 //! | stack | read, write | `KProcess::Run`, `KMemoryState::Stack`, `UserReadWrite` |
-//! | TLS page | read, write | `KThreadLocalPage::Initialize`, `KMemoryState::ThreadLocal`, `UserReadWrite` |
 //! | counter trampolines | read, execute | starquake's own: see below |
 //!
 //! A segment covers whole pages: its size is rounded up to a page, as `LoadNroImpl` does
@@ -103,8 +102,8 @@
 //! a `MOD0` whose `.bss` end precedes its start is [`LoadError::BadBss`] here; Eden subtracts
 //! the two unchecked.
 //!
-//! Memory the kernel maps reads as zero until it is written (`crate::space`), so `.bss`, the
-//! TLS page and the stack need no writes.
+//! Memory the kernel maps reads as zero until it is written (`crate::space`), so `.bss` and the
+//! stack need no writes.
 
 use starquake_kernel::memory::{
     AddressSpace as KernelSpace, CreateError, Mapper, MemoryArrangement, MemoryPermission,
@@ -127,8 +126,6 @@ pub(crate) const IMAGE_BASE: u64 = 0x8000_0000;
 /// (`Core::Memory::DEFAULT_STACK_SIZE` in `eden/src/core/memory.h` @ cf654052, used by
 /// `eden/src/core/loader/nro.cpp`). PROVISIONAL: Horizon takes it from the NPDM.
 pub(crate) const STACK_SIZE: u64 = 0x10_0000;
-/// Size of the TLS block: one page, as Horizon allocates thread-local regions out of pages.
-pub(crate) const TLS_SIZE: u64 = PAGE;
 /// The console's memory arrangement every program runs with. PROVISIONAL (see the module
 /// docs).
 pub(crate) const MEMORY_ARRANGEMENT: MemoryArrangement = MemoryArrangement::FourGb;
@@ -248,8 +245,6 @@ pub(crate) struct Placement {
     pub(crate) entry: u64,
     /// Initial stack pointer: the end of the stack.
     pub(crate) stack_top: u64,
-    /// Address of the TLS block, for `TPIDRRO_EL0`.
-    pub(crate) tls: u64,
     /// Everything that was mapped, in address order.
     pub(crate) mappings: Vec<Mapping>,
     /// The program's module.
@@ -261,7 +256,7 @@ pub(crate) struct Placement {
 /// What [`load`] hands back: where things are, and the kernel's address space that holds them.
 #[derive(Debug)]
 pub(crate) struct Loaded {
-    /// Where the program, its stack and its TLS block are.
+    /// Where the program and its stack are.
     pub(crate) placed: Placement,
     /// The process's address space, for the kernel's tables.
     pub(crate) address_space: KernelSpace,
@@ -443,7 +438,7 @@ fn reprotection(perms: Perms) -> Option<SvcPermission> {
 
 /// Loads `program` at [`IMAGE_BASE`]: creates its address space with the kernel, with `mapper`
 /// making the kernel's mappings real, copies the image into `memory` (that same address space,
-/// as host code sees it) and gives the process a main thread's stack and TLS page. Counter
+/// as host code sees it) and gives the process a main thread's stack. Counter
 /// reads are rewritten for `counter` if one is given. See the module docs for the steps.
 pub(crate) fn load(
     program: &Program,
@@ -486,31 +481,18 @@ pub(crate) fn load(
     let stack_top = space
         .create_main_thread_stack(STACK_SIZE)
         .map_err(refused("stack"))?;
-    let tls = space
-        .map_pages_in_region(
-            TLS_SIZE / PAGE,
-            MemoryState::ThreadLocal,
-            MemoryPermission::USER_READ_WRITE,
-        )
-        .map_err(refused("TLS page"))?;
 
     let mut mappings = layout.mappings;
-    for (name, start, size) in [
-        ("tls", tls, TLS_SIZE),
-        ("stack", stack_top - STACK_SIZE, STACK_SIZE),
-    ] {
-        mappings.push(Mapping {
-            name: name.to_owned(),
-            start,
-            end: start + size,
-        });
-    }
+    mappings.push(Mapping {
+        name: "stack".to_owned(),
+        start: stack_top - STACK_SIZE,
+        end: stack_top,
+    });
     mappings.sort_by_key(|mapping| mapping.start);
     Ok(Loaded {
         placed: Placement {
             entry: layout.entry,
             stack_top,
-            tls,
             mappings,
             module: layout.module,
             counter_reads: layout.counter_reads,
@@ -535,7 +517,7 @@ mod tests {
     /// The counter rates of a real run: Apple Silicon's and the kernel's.
     const RESCALE: CounterRescale = CounterRescale {
         host_hz: 24_000_000,
-        guest_hz: crate::clock::PROCESS_COUNTER_RATE.hz(),
+        guest_hz: crate::clock::PROCESS_CONSOLE.counter_rate().hz(),
     };
     /// How much flat guest memory the loading tests have around [`IMAGE_BASE`]: a megabyte
     /// below it (for trampolines) and one from it (for the image).
@@ -1015,7 +997,7 @@ mod tests {
     }
 
     #[test]
-    fn a_loaded_program_has_its_stack_and_tls_page_where_the_kernel_places_them() {
+    fn a_loaded_program_has_its_stack_where_the_kernel_places_it() {
         let file = three_segments();
         let (
             Loaded {
@@ -1029,25 +1011,23 @@ mod tests {
         // Four free pages, then the mapping (`KPageTableBase::GetNumGuardPages`).
         let guard = GUARD_PAGES * PAGE;
         let stack_bottom = regions.stack.start + guard;
-        let tls = regions.kernel_map.start + guard;
+        let first_tls_page = regions.kernel_map.start + guard;
         assert_eq!(placed.entry, IMAGE_BASE);
         assert_eq!(placed.stack_top, stack_bottom + STACK_SIZE);
         assert_eq!(placed.stack_top % 16, 0, "SP must be 16-byte aligned");
-        assert_eq!(placed.tls, tls);
         assert_eq!(
             placed.mappings,
             [
                 mapping("main.text", BASE, BASE + PAGE),
                 mapping("main.rodata", BASE + PAGE, BASE + 2 * PAGE),
                 mapping("main.data", BASE + 2 * PAGE, BASE + 3 * PAGE),
-                mapping("tls", tls, tls + TLS_SIZE),
                 mapping("stack", stack_bottom, placed.stack_top),
             ]
         );
         assert_eq!(placed.module.size, 3 * PAGE);
 
-        // The kernel's blocks: each segment with Eden's state and permission, the stack and
-        // the thread-local page.
+        // The kernel's blocks: each segment with Eden's state and permission, and the stack. The
+        // thread-local pages are the kernel's process creation's: none is mapped here.
         let at = |address| block(&address_space, address);
         assert_eq!(
             at(BASE),
@@ -1085,16 +1065,8 @@ mod tests {
                 MemoryPermission::USER_READ_WRITE
             )
         );
-        assert_eq!(
-            at(tls),
-            (
-                tls,
-                TLS_SIZE,
-                MemoryState::ThreadLocal,
-                MemoryPermission::USER_READ_WRITE
-            )
-        );
-        // The code and the stack are the process's memory; the thread-local page is not
+        assert_eq!(at(first_tls_page).2, MemoryState::Free);
+        // The code and the stack are the process's memory
         // (`KProcess::GetUsedUserPhysicalMemorySize`).
         assert_eq!(
             address_space.used_user_physical_memory_size(),
@@ -1115,9 +1087,7 @@ mod tests {
     fn loading_asks_the_translation_for_each_mapping_in_edens_order() {
         let (Loaded { placed, .. }, _, calls) = loaded(&three_segments(), None);
         let stack_bottom = placed.stack_top - STACK_SIZE;
-        let tls = placed.tls;
-        // The code with no guest access, the three segments reprotected, the stack, the
-        // thread-local page.
+        // The code with no guest access, the three segments reprotected, the stack.
         let map = |address, size, perms| MapperCall::Map {
             address,
             size,
@@ -1136,7 +1106,6 @@ mod tests {
                 protect(BASE + PAGE, Perms::Read),
                 protect(BASE + 2 * PAGE, Perms::ReadWrite),
                 map(stack_bottom, STACK_SIZE, Perms::ReadWrite),
-                map(tls, TLS_SIZE, Perms::ReadWrite),
             ]
         );
     }
@@ -1190,12 +1159,13 @@ mod tests {
             )
         );
         assert_eq!(block(&address_space, BASE).0, BASE);
-        // The pages after the module are free, up to the thread-local page, as they are on
-        // a console (whose loader maps a program's arguments there, when it has any).
+        // The pages after the module are free, up to the kernel-map region (where the kernel
+        // puts thread-local pages), as they are on a console (whose loader maps a program's
+        // arguments there, when it has any).
         let module_end = BASE + placed.module.size;
         let (start, size, state, _) = block(&address_space, module_end);
         assert_eq!((start, state), (module_end, MemoryState::Free));
-        assert_eq!(start + size, placed.tls);
+        assert!(start + size >= address_space.regions().kernel_map.start);
         // Mapped before anything is written, and the trampolines' bytes are in guest memory.
         assert_eq!(
             calls[1],
@@ -1225,7 +1195,6 @@ mod tests {
         }
         // And everything else is where it is without them.
         assert_eq!(with.placed.stack_top, without.placed.stack_top);
-        assert_eq!(with.placed.tls, without.placed.tls);
     }
 
     /// A [`Mapper`] that refuses its `n`th call (from zero) and accepts the rest.
@@ -1270,7 +1239,7 @@ mod tests {
     #[test]
     fn a_mapping_the_translation_refuses_fails_the_load_and_says_which() {
         // The counter program's calls, in order: the code, the trampolines, one segment (its
-        // text), the stack, the thread-local page.
+        // text), the stack.
         let counter = programs::counter(RESCALE.guest_hz).unwrap();
         let program = Program::parse(&counter.nro).unwrap();
         let attempt = |call: usize| {
@@ -1282,12 +1251,7 @@ mod tests {
                 SvcError::Internal(_)
             )))
         ));
-        for (call, what) in [
-            (1, "counter trampolines"),
-            (2, "segments"),
-            (3, "stack"),
-            (4, "TLS page"),
-        ] {
+        for (call, what) in [(1, "counter trampolines"), (2, "segments"), (3, "stack")] {
             match attempt(call) {
                 Err(LoadError::Map {
                     what: failed,
@@ -1299,8 +1263,8 @@ mod tests {
                 other => assert_eq!(other.map_err(|e| e.to_string()), Err(what.to_owned())),
             }
         }
-        // With no call refused the load succeeds, after exactly those five.
-        assert_eq!(attempt(5), Ok(()));
+        // With no call refused the load succeeds, after exactly those four.
+        assert_eq!(attempt(4), Ok(()));
         assert_eq!(
             LoadError::Map {
                 what: "stack",

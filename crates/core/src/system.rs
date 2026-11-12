@@ -80,7 +80,7 @@ mod host {
     use starquake_memory::Access;
 
     use super::Error;
-    use crate::clock::{CounterClock, PROCESS_COUNTER_RATE, Timebase};
+    use crate::clock::{CounterClock, PROCESS_CONSOLE, Timebase};
     use crate::image::{Loaded, Program, load};
     use crate::machine::{self, GuestProgram, GuestSpace};
     use crate::report::{RunOptions, RunReport};
@@ -89,9 +89,12 @@ mod host {
     /// Held for the whole of a run: Hypervisor.framework allows one VM per process.
     static ONE_VM: Mutex<()> = Mutex::new(());
 
-    /// The address-space id of the one process. PROVISIONAL: kernel slice 8 (process creation)
-    /// hands ids out, within the width the backend reports (`HvfVcpu::asid_bits`).
-    const PROCESS_ASID: u16 = 1;
+    /// The address-space id of the one process: the first id the kernel's pool hands out
+    /// (`starquake_kernel::process::AsidPool`). PROVISIONAL: with one process per run nothing
+    /// is given back, so the loop does not keep a pool; the core loop of kernel slice 10 takes
+    /// ids from one, sized by the width the backend reports (`HvfVcpu::asid_bits`), and reports
+    /// each flush to it.
+    const PROCESS_ASID: u16 = starquake_kernel::process::asid::FIRST_ASID;
 
     /// The one address space of a run, as the loop drives it on the vCPU.
     impl GuestSpace<HvfVcpu> for AddressSpace<PhysicalMemory> {
@@ -119,14 +122,14 @@ mod host {
         // with the same rate, and that clock is the backend's counter.
         let host_hz = backend.counter_frequency();
         let time = Timebase {
-            rate: PROCESS_COUNTER_RATE,
+            console: PROCESS_CONSOLE,
             clock: CounterClock::new(host_hz).ok_or_else(|| {
                 starquake_cpu::Error::Host("the host counter reports a rate of zero".into())
             })?,
         };
         let counter = CounterRescale {
             host_hz,
-            guest_hz: time.rate.hz(),
+            guest_hz: time.rate().hz(),
         };
         // The kernel's address space decides what is mapped; this one makes it real, and is
         // what the loader and the kernel read and write guest memory through.
