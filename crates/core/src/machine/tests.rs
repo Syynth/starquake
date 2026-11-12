@@ -1222,6 +1222,36 @@ fn the_main_threads_handle_names_a_thread_with_the_default_priority() {
 }
 
 #[test]
+fn the_process_is_created_from_the_placements_description() {
+    // A description whose main thread priority differs from the default: the main thread runs
+    // at that priority.
+    let mut guest = Guest::new(&programs::hello().unwrap());
+    let default = ProcessDescription::homebrew(NRO_CONSOLE);
+    let priority = default.main_thread_priority + 1;
+    guest.placed.description.main_thread_priority = priority;
+    let vcpu = ScriptedVcpu::new()
+        .then(|_| {}, svc(SvcId::GetThreadPriority))
+        .then(
+            move |regs| assert_eq!((regs.x[0], regs.x[1]), (0, u64::from(priority))),
+            svc(SvcId::ExitProcess),
+        );
+    let report = guest.run(vcpu, &RunOptions::default());
+    assert_eq!(report.exit, ExitReason::ProcessExited);
+    // A description the kernel refuses ends the run before the guest runs.
+    let mut refused = Guest::new(&programs::hello().unwrap());
+    refused.placed.description.main_thread_priority = default.priorities.first - 1;
+    let report = refused.run(ScriptedVcpu::new(), &RunOptions::default());
+    assert_eq!(
+        report.exit,
+        ExitReason::EmulatorError(format!(
+            "the kernel could not be set up: the main thread's priority {} is outside the \
+             process's priorities",
+            default.priorities.first - 1
+        ))
+    );
+}
+
+#[test]
 fn a_clock_for_another_console_than_the_descriptions_ends_the_run_before_the_guest_runs() {
     // The program's reads were patched for its description's console; a clock counting at the
     // other console's rate would give `GetSystemTick` a different rate.

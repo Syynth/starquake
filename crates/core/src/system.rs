@@ -213,6 +213,21 @@ mod tests {
     }
 
     #[test]
+    fn an_exefs_loads_on_every_host_and_its_metadata_is_checked() {
+        use starquake_loader::exefs::{ExeFs, MAIN_MODULE, NPDM_FILE};
+        let nso: &[u8] = include_bytes!("../../../tests/homebrew/hello/hello.nso");
+        let npdm: &[u8] = include_bytes!("../../../tests/homebrew/hello/main.npdm");
+        let exefs = || ExeFs::parse(&[(NPDM_FILE, npdm), (MAIN_MODULE, nso)]).unwrap();
+        assert!(System::from_exefs(exefs()).is_ok());
+        let mut no_threads = exefs();
+        no_threads.npdm.aci.kernel_capabilities.thread_info = None;
+        assert_eq!(
+            System::from_exefs(no_threads),
+            Err(Error::Load(LoadError::NoThreadInfo))
+        );
+    }
+
+    #[test]
     fn the_missing_backend_error_says_what_is_needed() {
         assert_eq!(
             Error::NoCpuBackend.to_string(),
