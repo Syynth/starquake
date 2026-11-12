@@ -11,6 +11,10 @@ use crate::sync::testing::{NoSignals, World, core, word};
 /// The lock the tests use, and a second one.
 const LOCK: u64 = 0x8000_1000;
 const OTHER_LOCK: u64 = 0x8000_1004;
+/// A condition variable for each lock: a condition-variable waiter holds no reference to the
+/// owner a signal hands it to, so that owner can still be destroyed while it waits.
+const CV: u64 = 0x8000_1010;
+const OTHER_CV: u64 = 0x8000_1014;
 
 fn refs(w: &World, index: usize) -> u32 {
     w.scheduler.objects().refs(w.objects[index])
@@ -371,4 +375,129 @@ fn a_user_waiter_is_no_kernel_waiter() {
         w.scheduler.thread(w.threads[0]).unwrap().suspend_flags(),
         SuspendType::Thread.bit()
     );
+}
+
+/// Ends thread `index` and closes its object's last two references (its creator's and the
+/// handle's), which destroys it (`KThread::Finalize`).
+fn destroy(w: &mut World, index: usize) {
+    w.scheduler.terminate_thread(w.threads[index]).unwrap();
+    let object = w.objects[index];
+    w.scheduler.close_object(object).unwrap();
+    w.scheduler.close_object(object).unwrap();
+}
+
+#[test]
+fn a_destroyed_owner_ends_the_waiters_of_its_most_recently_added_lock_first() {
+    // 0 (10) and 1 (20) wait on condition variables; 2 (40) holds both locks; 3 signals.
+    let mut w = World::new(&[10, 20, 40, 30]);
+    w.cv_wait(0, LOCK, CV, crate::sync::Timeout::Never).unwrap();
+    w.cv_wait(1, OTHER_LOCK, OTHER_CV, crate::sync::Timeout::Never)
+        .unwrap();
+    w.words.set(LOCK, w.tag(2));
+    w.words.set(OTHER_LOCK, w.tag(2));
+    // 0 reaches 2's LOCK first, then 1 its OTHER_LOCK.
+    w.cv_signal(3, CV, 1).unwrap();
+    w.cv_signal(3, OTHER_CV, 1).unwrap();
+    let keys: Vec<_> = w
+        .scheduler
+        .sync()
+        .locks()
+        .held(w.threads[2])
+        .iter()
+        .map(HeldLock::key)
+        .collect();
+    assert_eq!(
+        keys,
+        [AddressKey::user(OTHER_LOCK), AddressKey::user(LOCK)],
+        "most recently added first (`AddHeldLock`'s `push_front`)"
+    );
+    destroy(&mut w, 2);
+    // The held list in order: 1 (OTHER_LOCK) before 0 (LOCK), though 0 is more urgent.
+    let ended = KernelError::InvalidState.code();
+    assert_eq!(
+        w.scheduler.take_wakes(),
+        [
+            w.wake(1, SvcId::WaitProcessWideKeyAtomic, ended),
+            w.wake(0, SvcId::WaitProcessWideKeyAtomic, ended),
+        ]
+    );
+    assert_eq!(w.scheduler.sync().locks(), &LockTable::default());
+}
+
+#[test]
+fn a_lock_handed_on_goes_to_the_front_of_the_new_owners_list() {
+    // 0 (10) holds OTHER_LOCK, which 3 (20) waits on through a condition variable. 1 (40)
+    // holds LOCK, which 0 and then 2 (30) wait on; 4 signals.
+    let mut w = World::new(&[10, 40, 30, 20, 30]);
+    w.cv_wait(3, OTHER_LOCK, OTHER_CV, crate::sync::Timeout::Never)
+        .unwrap();
+    w.words.set(OTHER_LOCK, w.tag(0));
+    w.cv_signal(4, OTHER_CV, 1).unwrap();
+    w.lock(0, 1, LOCK).unwrap();
+    w.lock(2, 1, LOCK).unwrap();
+    // 1 lets go: 0 gets LOCK, and 2 still waits on it, now on 0.
+    w.unlock(1, LOCK).unwrap();
+    assert_eq!(
+        w.scheduler.take_wakes(),
+        [w.wake(0, SvcId::ArbitrateLock, ResultCode::SUCCESS)]
+    );
+    let keys: Vec<_> = w
+        .scheduler
+        .sync()
+        .locks()
+        .held(w.threads[0])
+        .iter()
+        .map(HeldLock::key)
+        .collect();
+    assert_eq!(
+        keys,
+        [AddressKey::user(LOCK), AddressKey::user(OTHER_LOCK)],
+        "the lock handed on is added at the front (`RemoveWaiterByKey`'s `AddHeldLock`)"
+    );
+    destroy(&mut w, 0);
+    let ended = KernelError::InvalidState.code();
+    assert_eq!(
+        w.scheduler.take_wakes(),
+        [
+            w.wake(2, SvcId::ArbitrateLock, ended),
+            w.wake(3, SvcId::WaitProcessWideKeyAtomic, ended),
+        ]
+    );
+    assert_eq!(w.scheduler.sync().locks(), &LockTable::default());
+}
+
+#[test]
+fn a_destroyed_owner_keeps_no_count_of_kernel_waiters() {
+    // 1 waits on an address, and is made a kernel waiter on 0's lock by hand: nothing in
+    // starquake takes a kernel light lock yet (the module docs), so only a test reaches this.
+    // Eden asserts it never happens (`Finalize`'s `ASSERT(m_num_kernel_waiters == 0)`); the
+    // count's row must not outlive the thread either way.
+    let mut w = World::new(&[30, 20]);
+    w.words.set(OTHER_LOCK, 0);
+    w.wait_address(
+        1,
+        OTHER_LOCK,
+        crate::sync::ArbitrationType::WaitIfEqual,
+        0,
+        crate::sync::Timeout::Never,
+    )
+    .unwrap();
+    let (owner, waiter) = (w.threads[0], w.threads[1]);
+    let key = AddressKey {
+        address: LOCK,
+        kernel: true,
+    };
+    w.scheduler
+        .sync_table_mut()
+        .locks
+        .set_address_key(waiter, key, 0);
+    w.scheduler.add_waiter(None, owner, waiter).unwrap();
+    assert_eq!(w.scheduler.sync().locks().kernel_waiters(owner), 1);
+    destroy(&mut w, 0);
+    assert_eq!(
+        w.scheduler.take_wakes(),
+        [w.wake(1, SvcId::WaitForAddress, KernelError::InvalidState.code())]
+    );
+    assert_eq!(w.scheduler.sync().locks().kernel_waiters(owner), 0);
+    assert_eq!(w.scheduler.sync().locks(), &LockTable::default());
 }

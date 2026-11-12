@@ -195,6 +195,25 @@ fn signal_wakes_the_first_count_waiters_most_urgent_first_and_all_for_count_up_t
 }
 
 #[test]
+fn waiters_of_one_priority_are_woken_in_the_order_they_came() {
+    // 0 signals; 1, 2 and 3 wait at one priority, in that order (`ConditionVariableComparator`
+    // returns 1 for a tie, so a new waiter goes after its equals).
+    let mut w = World::new(&[40, 30, 30, 30]);
+    set(&w, 0);
+    for waiter in [1, 2, 3] {
+        w.wait_address(waiter, AT, ArbitrationType::WaitIfEqual, 0, NEVER)
+            .unwrap();
+    }
+    assert_eq!(waiting_on(&w), [w.threads[1], w.threads[2], w.threads[3]]);
+    assert_eq!(w.signal_address(0, AT, SignalType::Signal, 0, 1), Ok(()));
+    assert_eq!(
+        w.scheduler.take_wakes(),
+        [w.wake(1, SvcId::WaitForAddress, ResultCode::SUCCESS)]
+    );
+    assert_eq!(waiting_on(&w), [w.threads[2], w.threads[3]]);
+}
+
+#[test]
 fn a_signal_before_the_wait_wakes_nothing_and_the_wait_still_waits() {
     let mut w = World::new(&[30, 30]);
     set(&w, VALUE);
@@ -276,13 +295,20 @@ fn eden_new_value(value: i32, waiting: usize, count: i32) -> i32 {
 }
 
 #[test]
-fn the_modified_value_is_edens_for_every_waiter_count_and_signal_count() {
+fn the_modified_value_is_edens_except_minus_one_when_count_up_to_zero_wakes_waiters() {
     for waiting in 0..8 {
         for count in -2..10 {
             for value in [VALUE, i32::MIN, i32::MAX] {
+                // The one divergence (`modified_value`'s docs): Atmosphère's `value - 1`
+                // where Eden writes `value - 2`.
+                let expected = if count <= 0 && waiting > 0 {
+                    value.wrapping_sub(1)
+                } else {
+                    eden_new_value(value, waiting, count)
+                };
                 assert_eq!(
                     modified_value(value, waiting, count),
-                    eden_new_value(value, waiting, count),
+                    expected,
                     "{waiting} waiting, count {count}, value {value}"
                 );
             }
@@ -291,6 +317,11 @@ fn the_modified_value_is_edens_for_every_waiter_count_and_signal_count() {
     // The edges: all woken at exactly `count` waiters, one left at `count + 1`.
     assert_eq!(modified_value(VALUE, 3, 3), VALUE - 1);
     assert_eq!(modified_value(VALUE, 4, 3), VALUE);
+    // The divergence, at both edges of `count <= 0`, and its wrap at the bottom of the range.
+    assert_eq!(modified_value(VALUE, 1, 0), VALUE - 1);
+    assert_eq!(modified_value(VALUE, 1, -1), VALUE - 1);
+    assert_eq!(modified_value(VALUE, 1, 1), VALUE - 1);
+    assert_eq!(modified_value(i32::MIN, 1, i32::MIN), i32::MAX);
 }
 
 #[test]
@@ -298,8 +329,8 @@ fn signal_and_modify_by_waiting_count_writes_the_new_value_and_wakes() {
     // (waiters, count, word afterwards, woken)
     let cases = [
         (0, 1, VALUE + 1, 0),
-        (2, 0, VALUE - 2, 2),
-        (2, -1, VALUE - 2, 2),
+        (2, 0, VALUE - 1, 2),
+        (2, -1, VALUE - 1, 2),
         (2, 2, VALUE - 1, 2),
         (2, 3, VALUE - 1, 2),
         (3, 2, VALUE, 2),

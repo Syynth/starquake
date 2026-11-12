@@ -11,12 +11,24 @@
 //!
 //! The kernel spec ("Tables behind a dispatcher", step 3) wants the arbiter's wait lists
 //! sharded by address later, so the hot `WaitForAddress`/`SignalToAddress` pair holds the
-//! scheduler lock only for the final wake-up. Callers reach the arbiter through two methods
-//! only, [`Scheduler::wait_for_address`] and [`Scheduler::signal_to_address`], and its state is
-//! one [`WaitTree`](super::WaitTree) keyed by process and address
-//! ([`SyncTable::arbiter`](super::SyncTable::arbiter)), read and changed nowhere else but the
-//! one place a wait ends. Sharding moves that tree behind per-bucket locks and changes these two
-//! methods' bodies, not their callers (`crate::svc::arbitration`).
+//! scheduler lock only for the final wake-up. Callers outside `crate::sync` reach the arbiter
+//! through two methods only, [`Scheduler::wait_for_address`] and
+//! [`Scheduler::signal_to_address`], and its state is one [`WaitTree`](super::WaitTree) keyed by
+//! process and address ([`SyncTable::arbiter`](super::SyncTable::arbiter)). That tree is read
+//! and changed in exactly these places:
+//! - [`Scheduler::wait_for_address`] inserts the waiter, through `Scheduler::block` and
+//!   `try_block` (`sync/wait.rs`), which read the tree for the waiter's place (`tree_place`).
+//! - [`Scheduler::signal_to_address`] reads how many threads wait under the key
+//!   (`SignalAndModifyByWaitingCountIfEqual`) and takes the woken ones out (`wake_tree`).
+//! - The one place a wait ends (a signal, a timer, a terminating waiter) takes the thread out:
+//!   `Scheduler::unlink_wait` through `SyncTable::detach` (`sync/wait.rs`).
+//! - A priority change of a waiting thread (`Scheduler::restore_priority_chain`,
+//!   `sync/lock.rs`) takes the waiter out and puts it back at its new place.
+//!
+//! Sharding moves that tree behind per-bucket locks and changes the first two methods' bodies,
+//! not their callers (`crate::svc::arbitration`). The other two paths are part of the seam as
+//! well: after sharding, the end of a wait and a priority change of an address waiter have to
+//! take the waiter's bucket lock too.
 
 use super::lock::Arbitrated;
 use super::tree::ProcessKey;
@@ -97,24 +109,35 @@ impl SignalType {
 }
 
 /// The new word `SignalAndModifyByWaitingCountIfEqual` writes for `value` when `waiting`
-/// threads wait on the address and `count` are to be woken (`count <= 0`: all of them), as
-/// Eden computes it: with no waiter, `value + 1`; when every waiter is woken, `value - 2` for
-/// `count <= 0` and `value - 1` otherwise; when some stay, `value`. The arithmetic wraps, as
-/// the reference's `s32` arithmetic does on a two's-complement machine.
+/// threads wait on the address and `count` are to be woken (`count <= 0`: all of them): with
+/// no waiter, `value + 1`; when every waiter is woken, `value - 1`; when some stay, `value`.
+/// The arithmetic wraps, as the references' `s32` arithmetic does on a two's-complement
+/// machine.
 ///
-/// Eden counts the waiters after the first with `if (tmp_num_waiters++ >= count) break;`,
-/// which stops at `count + 1` of them, and wakes them all only when that count is below
-/// `count`: that is, when `waiting <= count`.
+/// **Divergence from Eden:** for `count <= 0` with threads waiting, Eden (and its Switch 2
+/// forks, `eden-nx2` and `eden-pr4588`) writes `value - 2`. Atmosphère writes `value - 1`
+/// (`atmosphere/libraries/libmesosphere/source/kern_k_address_arbiter.cpp` @ 4e3f3703,
+/// `KAddressArbiter::SignalAndModifyByWaitingCountIfEqual`, the `count <= 0` branch; fact only),
+/// the same value the `count > 0` case writes when it wakes every waiter. starquake follows
+/// Atmosphère: the guest sees this value (it is the semaphore word), and Atmosphère is the
+/// closer reading of the real kernel elsewhere in this slice too (its user-memory checks). A
+/// hardware trace of a `count <= 0` signal with waiters would settle it.
+///
+/// For `count > 0` both references count the waiters after the first and stop early. Eden's
+/// loop post-increments (`if (tmp_num_waiters++ >= count) break;`) and Atmosphère's
+/// pre-increments, so the loops stop at different counts, but both counts are below `count`
+/// exactly when `waiting <= count`, so every waiter is woken (and `value - 1` written) in the
+/// same cases.
 #[must_use]
 pub fn modified_value(value: i32, waiting: usize, count: i32) -> i32 {
     if waiting == 0 {
         return value.wrapping_add(1);
     }
     let Ok(count) = usize::try_from(count) else {
-        return value.wrapping_sub(2);
+        return value.wrapping_sub(1);
     };
     if count == 0 {
-        return value.wrapping_sub(2);
+        return value.wrapping_sub(1);
     }
     if waiting <= count {
         value.wrapping_sub(1)

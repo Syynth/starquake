@@ -55,16 +55,31 @@
 //!   Eden asks the core that handles the timer, whose current thread may be the owner, which
 //!   then keeps the front of its level. Test: `sync/condvar/tests.rs`,
 //!   `a_timer_restoring_an_owners_priority_puts_it_behind_its_equals`.
+//! - **`SignalAndModifyByWaitingCountIfEqual` with `count <= 0` and threads waiting writes
+//!   `value - 1`,** as Atmosphère does (`libmesosphere/source/kern_k_address_arbiter.cpp`
+//!   @ 4e3f3703, fact only), not Eden's `value - 2` (Eden, `eden-nx2` and `eden-pr4588` agree
+//!   on `- 2`). The guest sees the word: it is the semaphore's count. Atmosphère is followed as
+//!   it is for the user-memory checks above; a hardware trace would settle it
+//!   ([`arbiter::modified_value`]). Tests: `sync/arbiter/tests.rs`,
+//!   `the_modified_value_is_edens_except_minus_one_when_count_up_to_zero_wakes_waiters` and
+//!   `signal_and_modify_by_waiting_count_writes_the_new_value_and_wakes`.
 //!
 //! # Slice 5: matching Eden where it is easy to miss
 //!
 //! - Threads of one priority wait in the order they came, in the trees and on a lock (the
 //!   comparators return 1 for a tie). Tests: `sync/lock/tests.rs`,
 //!   `waiters_of_one_priority_get_the_lock_in_the_order_they_came`; `sync/arbiter/tests.rs`,
-//!   `signal_wakes_the_first_count_waiters_most_urgent_first_and_all_for_count_up_to_zero`.
-//! - `SignalAndModifyByWaitingCountIfEqual` counts waiters with Eden's loop, which wakes all of
-//!   them only when no more than `count` wait. Test: `sync/arbiter/tests.rs`,
-//!   `the_modified_value_is_edens_for_every_waiter_count_and_signal_count`.
+//!   `waiters_of_one_priority_are_woken_in_the_order_they_came`.
+//! - A thread's held locks are listed most recently added first (`AddHeldLock`'s
+//!   `push_front`), whether it began holding the lock when a thread first waited on it or got
+//!   it handed on by an unlock, and a destroyed owner ends its waiters in that order. Tests:
+//!   `sync/lock/tests.rs`, `a_destroyed_owner_ends_the_waiters_of_its_most_recently_added_lock_first`
+//!   and `a_lock_handed_on_goes_to_the_front_of_the_new_owners_list`.
+//! - `SignalAndModifyByWaitingCountIfEqual` with `count > 0` counts waiters as Eden's loop does,
+//!   which writes `value - 1` (all of them woken) only when no more than `count` wait.
+//!   Atmosphère's loop pre-increments where Eden's post-increments; they stop at different
+//!   counts but agree on that condition. Test: `sync/arbiter/tests.rs`,
+//!   `the_modified_value_is_edens_except_minus_one_when_count_up_to_zero_wakes_waiters`.
 //! - `DecrementAndWaitIfLessThan` decrements before the zero-timeout check, and a
 //!   `WaitProcessWideKeyAtomic` with a zero timeout lets go of the lock first. Tests:
 //!   `sync/arbiter/tests.rs`, `a_zero_timeout_times_out_after_the_comparison_and_keeps_the_decrement`;

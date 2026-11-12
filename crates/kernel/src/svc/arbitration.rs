@@ -10,7 +10,7 @@
 //! | Call | Checks |
 //! |---|---|
 //! | `ArbitrateLock`, `ArbitrateUnlock` | `address` not a kernel address ([`KernelError::InvalidCurrentMemory`]); `address` word-aligned ([`KernelError::InvalidAddress`]) |
-//! | `WaitProcessWideKeyAtomic` | the same two of `address`; `cv_key` is not checked, only aligned down to a word (`Common::AlignDown(cv_key, sizeof(u32))`) |
+//! | `WaitProcessWideKeyAtomic` | `address` not a kernel address ([`KernelError::InvalidPointer`], Atmosphère's error: see below); `address` word-aligned ([`KernelError::InvalidAddress`]); `cv_key` is not checked, only aligned down to a word (`Common::AlignDown(cv_key, sizeof(u32))`) |
 //! | `SignalProcessWideKey` | none; `cv_key` is aligned down to a word |
 //! | `WaitForAddress` | the same two of `address`; then the arbitration type ([`KernelError::InvalidEnumValue`]) |
 //! | `SignalToAddress` | the same two of `address`; then the signal type ([`KernelError::InvalidEnumValue`]) |
@@ -19,6 +19,18 @@
 //! (`IsKernelAddress` in `eden/src/core/hle/kernel/k_memory_layout.h`): the top 2^39 bytes of
 //! the 64-bit space, less the last `KernelAslrAlignment` (2 MiB). The timeouts are converted as
 //! `WaitSynchronization`'s are ([`Timeout::from_nanos`]).
+//!
+//! # Where the references disagree
+//!
+//! - **`WaitProcessWideKeyAtomic` on a kernel address** fails with `ResultInvalidCurrentMemory`
+//!   in Eden (`svc_condition_variable.cpp`, `R_UNLESS(!IsKernelAddress(address),
+//!   ResultInvalidCurrentMemory)`) but with `svc::ResultInvalidPointer` in Atmosphère
+//!   (`atmosphere/libraries/libmesosphere/source/svc/kern_svc_condition_variable.cpp`
+//!   @ 4e3f3703, `WaitProcessWideKeyAtomic`'s first check; fact only), while both references
+//!   give `InvalidCurrentMemory` for the same check in the other five calls. starquake follows
+//!   Atmosphère, as `crate::sync` does for its user-memory checks: the odd one out is more
+//!   likely copied from the real kernel than invented. A guest test on hardware that passes a
+//!   kernel address would confirm it. Test: `every_call_checks_its_address_kernel_range_first_then_alignment`.
 
 use starquake_memory::GuestMemory;
 
@@ -56,15 +68,23 @@ pub const fn is_kernel_address(address: u64) -> bool {
     KERNEL_VIRTUAL_ADDRESS_SPACE_BASE <= address && address < KERNEL_VIRTUAL_ADDRESS_SPACE_END
 }
 
-/// The checks every call here makes of its lock or arbiter `address`, in Eden's order.
-fn check_address(address: u64) -> CallResult<()> {
+/// The checks every call here makes of its lock or arbiter `address`, in Eden's order:
+/// `kernel_error` for a kernel address, then [`KernelError::InvalidAddress`] for one that is
+/// not word-aligned.
+fn check_address_with(address: u64, kernel_error: KernelError) -> CallResult<()> {
     if is_kernel_address(address) {
-        return Err(KernelError::InvalidCurrentMemory.into());
+        return Err(kernel_error.into());
     }
     if !address.is_multiple_of(WORD_SIZE) {
         return Err(KernelError::InvalidAddress.into());
     }
     Ok(())
+}
+
+/// [`check_address_with`] for every call but `WaitProcessWideKeyAtomic`: a kernel address is
+/// [`KernelError::InvalidCurrentMemory`].
+fn check_address(address: u64) -> CallResult<()> {
+    check_address_with(address, KernelError::InvalidCurrentMemory)
 }
 
 /// `cv_key` aligned down to a word (`Common::AlignDown(cv_key, sizeof(u32))`).
@@ -126,7 +146,7 @@ pub fn wait_process_wide_key_atomic(
     waiter: Waiter<'_>,
     (address, cv_key, tag, timeout_ns): (u64, u64, u32, i64),
 ) -> CallResult<Arbitrated> {
-    check_address(address)?;
+    check_address_with(address, KernelError::InvalidPointer)?;
     let timeout = Timeout::from_nanos(waiter.now, timeout_ns);
     scheduler.wait_condition_variable(
         &GuestWords { space, memory },

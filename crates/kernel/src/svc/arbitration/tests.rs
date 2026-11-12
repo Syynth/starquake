@@ -192,9 +192,15 @@ fn every_call_checks_its_address_kernel_range_first_then_alignment() {
             expected,
             "ArbitrateUnlock {address:#x}"
         );
+        // The one call whose kernel-address error differs: Atmosphère's `InvalidPointer`
+        // (the module docs' table), where the others fail with `InvalidCurrentMemory`.
+        let cv_expected = match error {
+            KernelError::InvalidCurrentMemory => KernelError::InvalidPointer,
+            other => other,
+        };
         assert_eq!(
             s.cv_wait(0, address, CV).err(),
-            expected,
+            Some(cv_expected.into()),
             "WaitProcessWideKeyAtomic {address:#x}"
         );
         // A type that is also bad comes after the address.
@@ -258,6 +264,25 @@ fn condition_variable_keys_are_aligned_down_and_never_checked() {
     );
     assert_eq!(align_cv_key(CV + 3), CV);
     assert_eq!(align_cv_key(CV), CV);
+    // The second word, at both of its edges: aligned to a word (`sizeof(u32)`), not to more.
+    assert_eq!(align_cv_key(CV + WORD_SIZE), CV + WORD_SIZE);
+    assert_eq!(align_cv_key(CV + 2 * WORD_SIZE - 1), CV + WORD_SIZE);
+    assert_eq!(
+        s.cv_wait(0, AT, CV + 2 * WORD_SIZE - 1),
+        Ok(Arbitrated::Waiting(s.world.threads[0]))
+    );
+    let second = ProcessKey {
+        process: None,
+        address: CV + WORD_SIZE,
+    };
+    assert_eq!(
+        s.world
+            .scheduler
+            .sync()
+            .condition_variables()
+            .waiters(second),
+        [s.world.threads[0]]
+    );
 }
 
 #[test]
