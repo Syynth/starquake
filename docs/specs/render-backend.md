@@ -1,0 +1,728 @@
+# Render backend: the seam between the emulated GPU and the host GPU
+
+Status: draft for the owner's review (issue #14). Not approved; nothing is built on it yet.
+
+This spec decides what `crates/render` is: the one interface through which the emulated GPU
+(`crates/gpu`) gets work done on the host GPU, the backends behind it, the thread that submits
+and presents, and how a run with no GPU and no window still produces checkable output. It also
+lays out the choice of host API layer, which is the largest decision in the graphics half.
+
+Three sibling specs are drafted at the same time: the graphics server (#11), the GPU front/back
+protocol and engine state model (#12) and the shader pipeline (#13). Where this spec depends on
+them it says exactly what it assumes, in "Interfaces to neighbouring designs".
+
+## Summary
+
+- **The backend sees host-level work, never guest state.** The GPU back thread turns engine
+  state into backend-neutral *command lists*: plain data naming textures, buffers, pipelines and
+  draws by handle. A backend turns a list into Vulkan or Metal calls. Guest addresses, register
+  layouts, block-linear tiling and syncpoints stay on the `gpu` side of the seam.
+- **Command lists are data, encoded on the render thread.** The back thread only fills a list and
+  hands it over. Encoding into the host API, submitting and presenting happen on the render
+  submit/present thread (architecture, "Threads"). Eden-NX2 found the GPU thread, not the host
+  GPU, to be the bottleneck (rows 98, 133), and this moves the host API's CPU cost off it.
+- **Guest caches live in `gpu`; host objects live in the backend.** The texture, buffer and
+  pipeline caches (keyed by guest address and guest state, invalidated by write tracking) are
+  `gpu`'s. The backend owns the host objects they point to, by handle.
+- **One recording backend from the first slice.** It implements the same trait, keeps every
+  command list as data, and models uploads, copies, clears and presents on the CPU. Tests of the
+  GPU path run on any host, and it is the oracle the real backends are checked against.
+- **Host API: Vulkan first, through `ash`, on every platform, with macOS running it through
+  MoltenVK for bring-up; a native Metal backend second, behind the same trait** (recommended in
+  decision 1). The trait is shaped by neither API, so Metal stays additive.
+- **The guest is paced by the emulated 60 Hz clock, not by the host display.** Presenting never
+  blocks the graphics server; a headless run has no swapchain at all and dumps frames as PNG.
+
+## Where the backend sits
+
+```mermaid
+flowchart LR
+    back["GPU back thread<br/>(starquake-gpu)"] -->|"CommandList (data)"| q[["bounded queue"]]
+    back -->|"create_* (handles)"| be
+    q --> rt["Render thread<br/>encode · submit · present"]
+    rt --> be["Backend<br/>Vulkan · Metal · Recording"]
+    be --> workers["Compile workers<br/>pipelines"]
+    rt -->|"fence values, readbacks,<br/>present feedback"| back
+    rt --> target["Present target<br/>window · offscreen"]
+```
+
+| Thread | Owned by | Touches the host API? | Does |
+|---|---|---|---|
+| GPU back | `gpu` (#12) | No | Applies engine state, fills command lists, allocates handles, writes staging memory |
+| Render submit/present | backend | Yes | Encodes lists into host command buffers, submits, presents, owns the swapchain |
+| Compile workers (N) | backend | Yes (pipeline creation only) | Build pipelines from shaders and fixed-function state |
+| Frontend main thread | the app | Window only | Creates the window and hands its handles to the backend |
+
+Crates (decision 10):
+
+| Crate | Contains | `unsafe` |
+|---|---|---|
+| `starquake-render` | The trait, every type in it, the recording backend, format tables, the choice of format fallbacks and shader emulation (pure functions), the host shaders' WGSL sources | Denied |
+| `starquake-render-vulkan` | The Vulkan backend (`ash`) | Crate-level opt-in |
+| `starquake-render-metal` | Later: the native Metal backend (`objc2-metal`) | Crate-level opt-in |
+
+`gpu` depends on `starquake-render` only. `core` picks a backend by `cfg` and Cargo features and
+hands `gpu` an `Arc<dyn Backend>`. Frontends still see only `core`. `starquake-render` depends
+on no workspace crate; in particular it never reads guest memory (the one exception, aliasing
+guest memory on unified-memory hosts, is deferred: decision 7).
+
+## The backend trait
+
+### Command lists are data
+
+A `CommandList` is a `Vec<Command>` plus the fence value it signals when the host GPU has
+finished it. It holds handles and owned bytes, no references and no host objects. That gives
+three things at once:
+
+- the back thread never waits on a driver call, and never touches the host API;
+- the recording backend is trivial: it keeps the lists;
+- a list is serialisable (`serde`, `postcard`), so a host-level capture of a frame can be
+  replayed later on any backend, without the emulator (slice R11).
+
+Eden does the same within its Vulkan renderer: the rasterizer records closures into chunks that
+a worker thread executes (`eden/src/video_core/renderer_vulkan/vk_scheduler.h` @ cf654052,
+`CommandChunk`, `WorkerThread`). Ours records data instead of closures, so it crosses a crate
+boundary and can be stored.
+
+The queue between the threads is bounded (a few lists; the number is a setting). When it is full
+the back thread waits. That is the back-pressure that slows the guest when the host GPU falls
+behind: the guest's fences pass later, and the graphics server's present reply (which waits on
+them, row 55) holds the game.
+
+### The trait
+
+```rust
+/// The seam to the host GPU. One implementation per host API, plus the recording backend.
+/// Send + Sync: the GPU back thread and the compile workers share it.
+pub trait Backend: Send + Sync {
+    fn caps(&self) -> &Caps;                  // fixed for the backend's lifetime
+    fn budget(&self) -> MemoryBudget;         // host memory allowed and in use, for eviction
+
+    // Handles are allocated at once, on the calling thread. The host object is created on the
+    // render thread, in order, before the first command list that uses it.
+    fn create_buffer(&self, desc: &BufferDesc) -> Result<BufferId, RenderError>;
+    fn create_texture(&self, desc: &TextureDesc) -> Result<TextureId, RenderError>;
+    fn create_view(&self, texture: TextureId, desc: &ViewDesc) -> Result<ViewId, RenderError>;
+    fn create_sampler(&self, desc: &SamplerDesc) -> Result<SamplerId, RenderError>;
+    fn create_shader(&self, desc: ShaderDesc) -> Result<ShaderId, RenderError>;
+    /// Destroyed once the host GPU has passed `after`; until then the id stays reserved.
+    fn destroy(&self, resource: ResourceId, after: FenceValue);
+
+    /// Queues compilation on the compile workers and returns at once.
+    fn create_graphics_pipeline(&self, desc: GraphicsPipelineDesc) -> Result<PipelineId, RenderError>;
+    fn create_compute_pipeline(&self, desc: ComputePipelineDesc) -> Result<PipelineId, RenderError>;
+    fn pipeline_status(&self, id: PipelineId) -> PipelineStatus;   // Compiling | Ready | Failed
+
+    /// Staging memory the caller fills and then names in an `Upload` command.
+    fn staging(&self, size: u64) -> Result<StagingSlice, RenderError>;
+
+    /// Hands a finished list to the render thread. Blocks only while the queue is full.
+    fn submit(&self, list: CommandList) -> Result<FenceValue, RenderError>;
+    fn completed(&self) -> FenceValue;        // highest value the host GPU has finished
+    fn wait(&self, value: FenceValue, timeout: Duration) -> Result<WaitOutcome, RenderError>;
+    /// Bytes a `Readback` command copied out, once its list's fence has passed.
+    fn take_readback(&self, id: ReadbackId) -> Option<Readback>;
+
+    fn set_present_target(&self, target: PresentTarget) -> Result<(), RenderError>;
+    fn take_present_feedback(&self) -> Vec<PresentFeedback>;
+}
+```
+
+`dyn Backend` costs one indirect call per resource creation and per submitted list, not per
+draw, so the back thread is not generic over the backend.
+
+### Commands
+
+```rust
+pub enum Command {
+    Upload { from: StagingSlice, to: CopyDst },          // buffer range or texture region
+    Copy(CopyDesc),                                      // buffer/texture to buffer/texture
+    Blit(BlitDesc),                                      // scaled and filtered (2D engine, present)
+    Clear(ClearDesc),                                    // colour, depth, stencil; whole or rect
+    SetRenderTargets(RenderTargets),                     // up to 8 colour views + depth/stencil
+    Draw(DrawDesc),                                      // pipeline, bindings, vertex/index buffers,
+                                                         // dynamic state, direct or indirect params
+    Dispatch(DispatchDesc),                              // pipeline, bindings, group counts or indirect
+    Readback { from: CopySrc, id: ReadbackId },
+    Present(PresentDesc),
+    Marker(Marker),                                      // guest submit/draw ids for captures and logs
+}
+```
+
+- **Render passes are the backend's business.** The guest has no render passes; it changes
+  render targets through state. The backend opens a host pass at the first draw after
+  `SetRenderTargets` and closes it when the targets change, a copy or readback touches an
+  attachment, or the list ends. Load and store actions start conservative (load, store); hints
+  from the guest's own invalidate methods can make them cheaper later, which matters on Apple's
+  tile-based GPUs.
+- **Barriers and image layouts are the backend's business.** Every command says which resources
+  it reads and writes, so the backend can insert what its API needs. Metal needs few; Vulkan
+  needs layout transitions and pipeline barriers.
+- **Draw state that is dynamic on the host is in `DrawDesc`**: viewports, scissors, blend
+  constants, stencil reference and masks, depth bias, line width. Everything else is in the
+  pipeline. `Caps` says which extra states the device can set dynamically (Vulkan's extended
+  dynamic state), and the gpu side keys pipelines only on what is not dynamic.
+
+### Handles, lifetimes and fences
+
+- Ids are plain integers with a generation, allocated by the backend's common layer. A stale or
+  foreign id in a command is an `Err` when the list is encoded, not undefined behaviour.
+- `FenceValue` is one counter per backend (a Vulkan timeline semaphore, a Metal shared event).
+  `destroy(id, after)` defers destruction until the host GPU is done with the object, the way
+  Eden's `DelayedDestructionRing` does (`eden/src/video_core/delayed_destruction_ring.h` @
+  cf654052), but by fence value instead of by frame count.
+- The gpu side uses fences for three things: reusing or evicting resources, reading back data
+  the guest CPU needs (rows 115, 131 say this is rare), and guest semaphore releases that carry
+  host results (queries, later).
+
+### Errors and untrusted input
+
+Every description is derived from guest state, so every one is checked against `Caps` limits
+before a host object exists: sizes, mip and layer counts, sample counts, format support,
+binding counts, copy extents (start, end and the whole region, in checked arithmetic). A bad
+description is a `RenderError`, logged and counted; the gpu side skips the draw or copy. A lost
+host device is the one error that ends the run (emulator error, exit code 2).
+
+Guest shaders are untrusted input to the host driver. Shaders are emitted with naga's bounds-check
+policies (`naga::proc::BoundsCheckPolicy`, naga 30.0.1) set to read zero and skip writes for
+out-of-bounds accesses, unless `Caps` reports that the device guarantees robust access for that
+resource kind.
+
+## Resources and who owns the caches
+
+| | `gpu` (#12) owns | The backend owns |
+|---|---|---|
+| Textures | The texture cache: guest address and layout → `TextureId`, overlap and aliasing rules, write tracking, detiling, eviction policy | Host images, views, memory, format fallbacks, upload and readback paths |
+| Buffers | The buffer cache: guest ranges → `BufferId` + offset, write tracking, what is GPU-written | Host buffers and their memory, staging rings |
+| Samplers | Sampler pool decoding → `SamplerDesc`, dedup by value | Host sampler objects |
+| Pipelines | Pipeline key from guest state → `PipelineId`; the list of keys to precompile on the next boot | Compilation, compile workers, the host pipeline cache blob on disk |
+| Render targets | Which guest surfaces are bound | Host passes, attachments, barriers |
+
+The rule: anything keyed by a guest address or guest register value is `gpu`'s; anything that is
+a host object is the backend's. This is a narrower seam than Eden's: its `RasterizerInterface`
+(`eden/src/video_core/rasterizer_interface.h` @ cf654052) mixes guest-memory flushing and
+invalidation with host draws, and its texture and buffer caches are templates over the Vulkan
+runtime. Starquake ports their *policies* (and Eden-NX2's collector lessons, rows 99, 103, 139)
+into `gpu`, where they can be tested against the recording backend.
+
+### Buffers and uploads
+
+The back thread asks for a `StagingSlice` (host-visible memory the backend owns), copies guest
+memory into it through `GuestMemory`, and names it in an `Upload`. That is one copy from guest
+memory into memory the GPU can read, and on unified-memory hosts the GPU reads the staging slice
+directly. Readbacks go the other way: the backend copies into host-visible memory and returns
+owned bytes once the fence passes; `gpu` writes them into guest memory.
+
+### Textures, views, samplers, render targets
+
+- `TextureDesc`: dimension (1D, 2D, 3D, cube, arrays), `PixelFormat`, size, mip count, layer
+  count, sample count, usage (sampled, storage, render target, copy). Render targets are
+  textures with that usage; there is no separate type.
+- `ViewDesc`: format (for reinterpreting views), mip and layer range, component swizzle. The
+  guest's texture headers carry a per-texture swizzle; Vulkan expresses it in the view and Metal
+  in its texture swizzle, so it costs no shader variants.
+- `SamplerDesc`: filters, address modes (including clamp-to-border with a border colour), LOD
+  bias and clamps, anisotropy, compare function, reduction mode.
+
+### Formats
+
+`PixelFormat` is the host-neutral list of what the guest can name: Eden's 116 entries
+(`eden/src/video_core/surface.h` @ cf654052, `PIXEL_FORMAT_LIST`) are the starting set, with
+Mesa's format table (`mesa-nouveau/src/nouveau/nil/nil_formats.csv` @ 52238762, MIT) as the
+cross-check for block sizes and component types. Decoding the guest's format and component
+fields into a `PixelFormat` is `gpu`'s (Eden's `texture_cache/format_lookup_table.cpp`).
+
+Each backend reports, per `PixelFormat`, what the device can do with it natively (sample, filter,
+render, blend, storage, copy). A pure function in `starquake-render` chooses the host format and
+the conversion for each guest format from that report, so the choice is tested once, with
+synthetic capability tables, for every backend. Known conversions:
+
+| Guest format | When | Host form |
+|---|---|---|
+| ASTC (all block sizes) | No native ASTC | RGBA8 decoded on the GPU (below) |
+| D24 + S8 | Device lacks it (Apple GPUs, guess: confirmed by the device query) | D32 float + S8; converted on upload and readback |
+| Formats the host can't render to or blend | Per report | A wider format, converted where it crosses guest memory |
+
+### Block-linear data
+
+Guest textures and render targets are stored block-linear (64×8-byte GOBs in blocks of GOBs).
+Switch 2 uses its own variant: Eden-NX2 applies a bit swap inside each GOB for "native tiling"
+(`eden-nx2/src/video_core/textures/decoders.cpp` @ 50fa86bb, `NativeGobOffset`; row 69, also
+for ASTC). This spec assumes detiling happens on the `gpu` side before upload (#12), so a
+backend receives linear rows of pixels or compressed blocks. Two notes for #12:
+
+- Mesa describes several GOB variants (`mesa-nouveau/src/nouveau/nil/tiling.rs` @ 52238762,
+  `GOBType`: Fermi, Tegra, Turing 2D, Blackwell). Whether Eden-NX2's bit swap equals one of them
+  is a guess that a pure test can settle (verification 5).
+- Detiling on the GPU with a compute shader is a later optimisation the backend can offer through
+  `Caps` (Eden does it: `eden/src/video_core/host_shaders/block_linear_unswizzle_2d.comp`). The
+  CPU detiler stays as the oracle for it.
+
+A render target that only the host GPU ever writes and reads (render targets in GPU-only sparse
+regions, row 57) is never detiled or retiled; it exists only as a host texture.
+
+### ASTC
+
+Switch 2 titles use ASTC heavily, mostly 8×8, and its handling dominated Eden-NX2's memory and
+performance work (rows 94, 99, 100, 103, 107).
+
+- **Native where the device has it.** Apple GPUs sample ASTC in hardware (scoping doc, "Problems
+  that go away"); so do most Arm Linux GPUs. The texture is uploaded as compressed blocks.
+  Whether MoltenVK exposes ASTC to Vulkan on Apple GPUs is to be checked (verification 1).
+- **Decoded on the GPU elsewhere** (AMD, desktop NVIDIA; the platform matrix's "transcode"): a
+  compute shader decodes blocks into an RGBA8 texture at upload, ported from
+  `eden/src/video_core/host_shaders/astc_decoder.comp`. A CPU decoder (ported from
+  `eden/src/video_core/textures/astc.cpp`) is the test oracle and the fallback.
+- **Recompressing to BC1/BC3** to cut memory by 4–8× (rows 99, 103, 107) is deferred: decision 6.
+- **Huge ASTC arrays** (8192×8192×68, row 94) need sparse textures or level trimming; deferred.
+
+### Unified memory
+
+On Apple Silicon (and the Steam Deck's APU) the GPU reads the same RAM as the CPU. Aliasing guest
+memory as host GPU buffers would remove the upload copy and make GPU writes visible to the guest
+at once (scoping doc: "`MTLStorageModeShared` buffers can alias guest memory directly"). Metal can
+wrap existing memory (`newBufferWithBytesNoCopy_length_options_deallocator` in objc2-metal 0.3.2,
+`MTLDevice`), and Vulkan has `VK_EXT_external_memory_host`. Both need host-page alignment (16 KiB
+on Apple hosts), so the natural unit is a whole backing pool, not a guest page.
+
+It is not the first design (decision 7): it makes the GPU write guest memory behind the
+write-tracking scheme of the execution model, and the copy path is needed anyway on discrete
+GPUs. The staging API above is shaped so that aliasing can replace it later without changing the
+gpu side: a "staging slice" that is the guest's own memory needs no copy.
+
+### Memory budget and eviction
+
+`budget()` reports the memory the device allows and what the backend uses (Vulkan
+`VK_EXT_memory_budget`; Metal's recommended working set). The caches in `gpu` decide what to
+evict. Eden-NX2's lesson is to size collection by each cache's own use, not by the whole device's
+(row 139), and to keep GPU-written buffers out of routine eviction.
+
+## Pipelines
+
+### What a pipeline is made of
+
+```rust
+pub struct GraphicsPipelineDesc {
+    pub stages: Stages,                     // vertex, tess control/eval, geometry, fragment: ShaderIds
+    pub vertex_input: VertexLayout,         // up to 32 attributes and bindings (guest limit)
+    pub topology: Topology,                 // incl. quads and line loops (converted, below)
+    pub raster: RasterState,                // cull, front face, polygon mode, depth clamp/clip, ...
+    pub depth_stencil: DepthStencilState,
+    pub blend: [BlendState; 8],             // per target; logic op as a separate field
+    pub logic_op: Option<LogicOp>,
+    pub targets: TargetFormats,             // colour and depth formats, sample count
+    pub emulation: EmulationFlags,          // what the shaders were specialised for (below)
+}
+```
+
+A shader is created once (`create_shader`) from what #13 hands over and is shared by every
+pipeline that uses it.
+
+### Fixed-function state the host lacks
+
+A console GPU has fixed-function features some hosts do not. For each, `Caps` says whether it is
+native, and a pure function `emulation(&Caps, &state) -> EmulationFlags` decides what must be
+emulated, so that the shader pipeline (#13) can specialise the shaders and the pipeline key
+includes the flags. Known items:
+
+| Guest feature | Host gap | Emulation |
+|---|---|---|
+| Alpha test | Not in Vulkan or Metal | Fragment shader discard (Eden: pipeline key `alpha_test_func`, `vk_pipeline_cache.cpp`) |
+| Depth range −1..1 | Vulkan needs `VK_EXT_depth_clip_control`; Metal has no switch | Vertex shader rewrites z (Eden: `convert_depth_mode`) |
+| Quads, line loops | Not in either API | Index rewrite by a compute pass (Eden: `host_shaders/vulkan_quad_indexed.comp`) |
+| Primitive restart off | MoltenVK and Metal always restart (Eden: `vk_graphics_pipeline.cpp`, "MoltenVK/Metal always has primitive restart enabled") | Rewrite indices that equal the restart value |
+| Logic ops | Not in Metal; not in MoltenVK (Eden: `vulkan_device.cpp`, MoltenVK fallback list) | None exact; draw without it and count it (later: framebuffer fetch on Apple GPUs) |
+| Geometry shaders | Not in Metal or MoltenVK (same list) | Later: compute emulation; until then the draw is skipped and counted |
+| More than 16 vertex attributes | MoltenVK caps at 16 (Eden: `vulkan_device.cpp`, "MVK driver breaks ...") | Fetch extra attributes in the vertex shader from a storage buffer |
+| Integer render target outputs | MoltenVK needs the shader's output type to match (Eden: `vk_pipeline_cache.cpp`, `color_output_types`) | Typed outputs in the fragment shader |
+| Transform feedback | Not in Metal; unverified for MoltenVK | Deferred |
+
+All Eden paths cited are under `eden/src/video_core/renderer_vulkan/` or
+`eden/src/video_core/vulkan_common/` @ cf654052.
+
+### Shader emission
+
+#13 hands over a validated `naga::Module` with its `ModuleInfo` and a description of the
+resources it uses (assumptions below). The backend does the last step, because only it knows its
+binding model:
+
+- Vulkan: naga's SPIR-V writer, with the module's resource slots mapped to descriptor sets and
+  bindings.
+- Metal: naga's MSL writer, with slots mapped to buffer, texture and sampler indices.
+- Both with the bounds-check policy above.
+
+The backend's own helper shaders (present blit, clears, quad index rewrite, ASTC decode, later
+detile and BC encode) are written in WGSL and translated by naga at startup (decision 12). Naga
+is pure Rust, so this needs no build step, and the same source serves both backends.
+
+### Compiling without stalling a frame
+
+- `create_*_pipeline` returns an id at once and queues the work on the compile workers.
+- The render thread meets a draw whose pipeline is still compiling. What it does is a setting
+  (decision 5): **wait** for it (correct frames, deterministic frame dumps; the back thread keeps
+  running until the queue fills) or **skip** the draw and count it (smooth, with visible gaps,
+  what Eden calls asynchronous shaders: `vk_pipeline_cache.cpp`, `use_asynchronous_shaders`).
+- A pipeline that fails to build is cached as failed and its draws are skipped and counted once
+  per pipeline, not logged per draw (row 90 and 112: cache rejections negatively).
+- Two disk caches, both outside the repository, both versioned and refused on mismatch: the gpu
+  side's list of pipeline keys seen (to precompile at the next boot, the way Eden's
+  `LoadDiskResources` does), and the backend's own driver cache blob (`VkPipelineCache`; Metal's
+  binary archives later).
+
+Eden-NX2 saw compile stalls push the game far ahead of the GPU when the present wait timed out
+(row 59). Waiting on the render thread rather than the back thread keeps that bounded: the
+present reply still waits on the guest's fence (#11).
+
+## The render thread, presentation and pacing
+
+### Submit
+
+The render thread takes lists in order, creates any host objects they introduce, encodes them,
+submits, and signals the list's fence value when the host GPU finishes. One host queue to start.
+The back thread never calls into the host API, so Eden-NX2's crashes from two threads recording
+into one scheduler (row 143) have no counterpart here.
+
+### Present targets
+
+```rust
+pub enum PresentTarget {
+    /// A window the frontend created; `raw-window-handle` 0.6.2 display and window handles.
+    Window(WindowHandles),
+    /// No window: presents are counted and dumped on request. Headless runs and tests.
+    Offscreen,
+    // Exported(..): later, shared images for an embedding frontend (GPUI). See "Deferred".
+}
+```
+
+The frontend owns the window and its event loop; the backend owns the surface and swapchain made
+from the window's handles. On macOS the window's Metal layer is set up on the main thread by the
+frontend (AppKit requires view changes there), and the render thread presents into it.
+
+The swapchain uses a mode that never makes the render thread wait for the host's vblank when a
+newer frame is ready (mailbox, or immediate where mailbox is missing; FIFO as the last resort).
+When the guest presents faster than the display, the newest frame wins and the others are counted
+as dropped.
+
+### Presenting a guest framebuffer
+
+A vi2 present (gsv 229) names an image; Eden-NX2 found it to be a block-linear RGBA8 surface in
+the native GOB layout at GPU address equal to CPU address
+(`eden-nx2/src/core/hle/service/nx2_gsv.h` @ 50fa86bb, `Composite`; row 48). The path:
+
+1. gsv (#11) resolves the image to an address, size and layout and the frame's fence, and passes
+   a present request to `gpu`.
+2. `gpu` (#12) orders it after the work that renders the frame, finds the image in the texture
+   cache (it is normally a render target the host just drew), or uploads it from guest memory
+   if the CPU wrote it, and records `Command::Present` with that view, the source rectangle, the
+   transform and a frame number.
+3. The render thread blits the view to the swapchain image (scaled to the window, filtered,
+   converted from the guest format) and presents. With `Offscreen` there is no blit and no
+   swapchain.
+
+### Pacing at 60 Hz
+
+The guest is paced by the emulated vsync: gsv's 60 Hz events (vi2 31 and 32, row 82) and its
+present reply (row 55, 71), driven by the timer thread through `Env`. The render backend does not
+pace the guest and never blocks a present request (decision 8). That keeps guest-visible timing
+independent of the host display (60, 120 Hz or none), makes headless runs and `--clock fixed`
+behave like windowed ones, and leaves replay intact. The backend reports `PresentFeedback` (frame
+number, shown or dropped, host time) for statistics and the frontend's frame counter; gsv must not
+let it change guest-visible behaviour.
+
+### Frame dumps and headless runs
+
+The observability spec's `frames/` folder and `--until frames=N` need pixels without a window.
+`PresentDesc` has a `dump` flag; for a dumped frame the render thread reads back the presented
+view at the guest's own resolution (not the window's, so dumps don't depend on window size) and
+hands an RGBA8 image to a `FrameSink` the app installs. The app writes the PNG (the `png` crate,
+0.18.1, pure Rust); the render crate does no file I/O.
+
+## The recording backend
+
+`RecordingBackend` implements the trait with no GPU:
+
+- It keeps every submitted list and every resource description, and renders them as a text
+  snapshot (`insta`) for tests on the gpu side: "this method stream produced these draws with
+  this state".
+- It models on the CPU the commands that have exact answers: uploads, copies, clears, unscaled
+  blits, readbacks and presents, for uncompressed colour formats. Draws and dispatches are
+  recorded, not executed; a texture a draw has written is marked *unknown*, and a readback of an
+  unknown region returns `Unknown`, not wrong pixels.
+- Fences complete when a list is submitted; pipelines are ready at once, or follow a script, so a
+  test can exercise the wait and skip policies.
+
+It serves three purposes: tests of `gpu` and of the present path on any host and in CI; the
+`null` backend for runs that need no pixels (Eden has one, `renderer_null`); and a differential
+oracle: the same list run on the Vulkan backend must give bit-identical readbacks wherever the
+recording backend has an answer.
+
+## Platform matrix
+
+| | macOS arm64 | Linux arm64 | Linux x86-64 (Steam Deck class) |
+|---|---|---|---|
+| Backend at bring-up | Vulkan through MoltenVK | Vulkan | Vulkan |
+| Backend later | Native Metal (decision 1) | Vulkan | Vulkan |
+| ASTC | Native on Apple GPUs (through MoltenVK: to verify) | Native on most Arm GPUs; else GPU decode | GPU decode (AMD has none) |
+| Memory | Unified: copy first, alias later (decision 7) | Unified or discrete | Unified APU: copy first |
+| Window | Frontend's window; `CAMetalLayer` | X11 or Wayland surface | X11 or Wayland surface |
+| CI with no GPU | Recording backend | Recording backend | Recording backend and Vulkan on lavapipe (decision 9) |
+
+The Vulkan backend loads the system's Vulkan loader at run time (`ash`'s `loaded` mode), so
+building it needs no C or C++ toolchain. Running it on macOS needs MoltenVK installed: a C++
+library, but a run-time dependency, not a build step.
+
+## Interfaces to neighbouring designs
+
+### Graphics server (#11)
+
+Assumed of #11:
+
+- It owns vsync emulation (vi2 31/32 events at 60 Hz from the timer thread, through `Env`) and
+  the present reply's pacing (rows 55, 59, 71, 82, 108).
+- It resolves a present's image id to `{ address, width, height, pitch or block layout, format }`
+  and the frame's fence `(syncpoint, value)`, and hands that to `gpu`, not to `render` directly.
+  This differs from the arrow "gsv → render" in `architecture.md`: going through `gpu` is what
+  orders the present after the draws that make the frame, and keeps the dependency direction
+  `gsv → gpu → render`.
+- It never blocks on the host display.
+
+Offered to #11: `PresentFeedback` (through `gpu`), for statistics only.
+
+### GPU front/back protocol and engine state (#12)
+
+Assumed of #12:
+
+- The back thread builds `CommandList`s from engine state and submits them; it is the only thread
+  that calls `submit`. It allocates handles through the trait and never touches the host API.
+- `gpu` owns the guest caches (texture, buffer, sampler, pipeline keys), write tracking and
+  invalidation, eviction policy (using `budget()`), detiling into linear data before upload, guest
+  format decoding into `PixelFormat`, and turning guest fences, semaphores and syncpoints into
+  ordering of lists and waits on `FenceValue`s.
+- It copies guest memory into `StagingSlice`s itself and writes readback bytes into guest memory
+  itself; `render` never sees a guest address.
+- It orders a present after the frame's fence and emits `Command::Present`.
+- It keys pipelines on everything in `GraphicsPipelineDesc` that `Caps` says is not dynamic.
+
+Offered to #12: the trait, every description type, `Caps` and per-format capabilities, the format
+fallback choice, `emulation()`, the recording backend with its snapshot format, and fences.
+
+Threads and memory: the back thread owns the command list it is filling and the staging slices it
+has taken; once submitted, both belong to the backend. The render thread and the compile workers
+belong to the backend.
+
+### Shader pipeline (#13)
+
+Assumed of #13:
+
+- It hands over, per guest shader and specialisation: a validated `naga::Module` with its
+  `naga::valid::ModuleInfo`, its stage, and a list of the resources it uses in guest terms
+  (constant buffer slots and sizes, storage buffers, textures and samplers, images), plus vertex
+  inputs and fragment outputs with their types. `gpu` converts that list into the
+  backend-neutral `ShaderInterface` in `ShaderDesc`, so `shader` and `render` don't depend on
+  each other; both use the workspace's single `naga` version (30.0.1 today).
+- It accepts `EmulationFlags` (and `Caps` facts such as robust access) as inputs to translation,
+  and produces the specialised variant (alpha test, depth-range rewrite, attribute fetch from a
+  buffer, typed outputs, primitive-restart index handling where it is in the shader).
+- It produces modules naga's SPIR-V and MSL writers accept. Features the writers lack (mesh
+  shaders on Metal, physical pointers for global memory) are flagged by #13, not worked around
+  here.
+
+Offered to #13: emission (naga → SPIR-V or MSL with the backend's binding map and bounds-check
+policy), the `EmulationFlags` table, and, for testing, the recording backend and a Vulkan backend
+that can run a translated shader on lavapipe.
+
+`ShaderDesc` also accepts SPIR-V or MSL directly (`ShaderSource::{Naga, SpirV, Msl}`), for host
+shaders, captures and experiments; guest shaders come through naga.
+
+## Port slices
+
+One pull request each. "Offline" means no game; "no GPU" means it runs in the gate on any host.
+Slices in the same parallel group can be built at once once their dependencies have landed.
+
+| # | Slice | Depends on | References | Test, offline? | Parallel group |
+|---|---|---|---|---|---|
+| R0 | `starquake-render` types: ids, descriptions, `PixelFormat` with block sizes and properties, `Caps`, `Command`, `CommandList`, the trait, `RenderError`, description validation against `Caps` | none | `eden/src/video_core/surface.h`, `mesa-nouveau/src/nouveau/nil/nil_formats.csv` | No GPU: format table checked against the Mesa table; golden bytes for a serialised list covering every command; every limit tested at the edge on both sides | A (alone) |
+| R1 | Recording backend: lists, snapshots, the CPU model of uploads, copies, clears, blits, readbacks, presents; `Unknown` regions | R0 | `eden/src/video_core/renderer_null/` (shape only) | No GPU: hand-computed pixel results; a draw marks its target unknown | B |
+| R2 | Format fallback choice and `emulation()` as pure functions | R0 | Eden's MoltenVK paths cited above; `vulkan_device.cpp` format checks | No GPU: synthetic capability tables, every combination | B |
+| R3 | CPU ASTC decoder | R0 | `eden/src/video_core/textures/astc.cpp` | No GPU: blocks encoded by hand from the ASTC specification, checked against an independent decoder as a dev-dependency (`astc-decode` 0.3.1, guess: suitability to check) | B |
+| R4 | Host shaders infrastructure: WGSL sources, naga translation to SPIR-V and MSL at startup, validation; the present blit and clear shaders | R0 | `eden/src/video_core/host_shaders/vulkan_present.*`, `full_screen_triangle.vert` | No GPU: every host shader validates and emits for both targets | B |
+| R5 | Vulkan backend core: instance and device choice, `Caps` from the device, memory (`gpu-allocator`), resources, staging, uploads, copies, clears, readbacks, fences, the render thread, `Offscreen` target | R0, R1 | `eden/src/video_core/vulkan_common/vulkan_device.cpp`, `renderer_vulkan/vk_scheduler.*`, `vk_staging_buffer_pool.*`, `vk_master_semaphore.*` | Needs Vulkan: the same lists run on the recording backend and on Vulkan (lavapipe in CI, MoltenVK on a Mac) give bit-identical readbacks | C |
+| R6 | Pipelines: shaders from naga with binding maps, graphics and compute pipeline creation, compile workers, wait and skip policies, failed-pipeline cache, driver cache blob | R4, R5 | `renderer_vulkan/vk_pipeline_cache.*`, `vk_graphics_pipeline.*`, `fixed_pipeline_state.*` | Needs Vulkan: WGSL test shaders; scripted compile delays exercise both policies | D |
+| R7 | Draws and dispatches: render targets and lazy passes, bindings, vertex and index buffers, dynamic state, direct and indirect draws, barrier tracking, quad and line-loop index rewrite | R6 | `renderer_vulkan/vk_rasterizer.*`, `vk_render_pass_cache.*`, `vk_update_descriptor.*` | Needs Vulkan: synthetic scenes with exactly computable pixels (axis-aligned rectangles covering whole pixels, flat colours) | E |
+| R8 | Window presentation: surfaces from window handles, swapchain, present modes, resize, newest-frame-wins queue, `PresentFeedback` | R4, R5 | `renderer_vulkan/vk_swapchain.*`, `vk_present_manager.*`, `vk_blit_screen.*` | Mode choice and the frame queue are pure functions, tested with no GPU; the window path is checked by hand on a Mac and a Linux desktop | D (with R6) |
+| R9 | Frame dumps: `dump` flag, `FrameSink`, PNG writing and `frames/` in the app, `--until frames=N` | R1 (pixels from R5) | observability spec, "Headless runs" | No GPU: a present of an uploaded image through the recording backend gives a known PNG | C (with R5) |
+| R10 | GPU ASTC decode for devices without native ASTC | R3, R4, R5 | `eden/src/video_core/host_shaders/astc_decoder.comp` | Needs Vulkan (lavapipe): bit-identical to the CPU decoder on the same blocks | D |
+| R11 | Host-level capture and replay: write submitted lists and their staging bytes to a file; `starquake gpu-replay <capture> --png <dir>` on any backend | R1, R5 | none (new) | No GPU for the format (golden bytes, version refused on mismatch); replay on lavapipe | D |
+| R12 | `starquake-core` wiring: backend choice by `cfg` and features, the CLI's `--window` (decision 11) | R5, R8, R9 | none | Runs the recording backend end to end in the gate | F |
+
+Group A lands first. Group B is four slices in parallel. R5 and R9 can run together (C); R6, R8,
+R10 and R11 can run together after R5 (D). R7 follows R6. Up to four build agents fit the
+machine limits in `roadmap.md`.
+
+Later slices, in order of expected need: native Metal backend (device and resources; pipelines
+through naga's MSL writer; `CAMetalLayer` presentation), BC recompression of ASTC, unified-memory
+aliasing, GPU detiling, queries and conditional rendering, sparse textures, mesh and task
+shaders. Each is listed under "Deferred" with how it fits.
+
+## What to verify before building
+
+In order of how much each could change the design:
+
+1. **What Vulkan through MoltenVK can do on this Mac**, and how it compares with KosmicKrisp
+   (Mesa's Vulkan driver on top of Metal, reported to be conformant; not verified here). Install
+   one, run `vulkaninfo`, and record: ASTC LDR formats, `VK_EXT_external_memory_host`, timeline
+   semaphores, logic ops, geometry shaders, transform feedback, sparse binding, mesh shaders,
+   maximum vertex attributes, D24S8, depth clip control, extended dynamic state. This decides how
+   long the bring-up path can carry the Mac. Needs the owner to install MoltenVK (Homebrew or the
+   Vulkan SDK).
+2. **naga's SPIR-V through MoltenVK's own SPIR-V-to-MSL translation:** do naga's modules survive
+   the second translation? A handful of WGSL test shaders run through both is enough. Shared with
+   #13, which should also check naga's coverage of what guest shaders need (subgroups, 64-bit
+   atomics, physical pointers for global memory, mesh stages).
+3. **lavapipe on the CI runner:** that Ubuntu's Mesa package installs it, which version, whether
+   it runs the backend's tests, whether its output is bit-identical between runs, and whether it
+   offers ASTC. Decides decision 9.
+4. **Aliasing a guest backing pool as a GPU buffer on Apple Silicon:** largest buffer the device
+   accepts, 16 KiB alignment, cost, and how GPU writes interact with the execution model's write
+   tracking (a GPU write does not fault, so the caches must learn of it another way). Decides
+   when decision 7 is revisited.
+5. **The Switch 2 GOB layout:** compare Eden-NX2's `NativeGobOffset` with Mesa's GOB variants over
+   one 512-byte GOB in a pure test. If it is Mesa's Turing 2D layout, the detiler can follow
+   Mesa's MIT code and documentation. For #12.
+6. **Cost of encoding on the render thread:** a synthetic stream of 5,000 draws a frame through
+   the recording backend, then through Vulkan, to check the back thread's share is small and the
+   render thread keeps up. Decides whether the command list format needs to be denser.
+7. **Whether hosted macOS CI runners can create a Metal device at all** (guess: they cannot use
+   the GPU). Decides whether Metal backend tests can ever run in CI or only locally, like the
+   hypervisor tests.
+
+## Decisions for the owner
+
+1. **The host API layer.** The emulator needs one way to drive the host GPU on macOS and Linux.
+   The options:
+
+   | | (a) `wgpu` 30.0.1, one portable layer | (b) Vulkan everywhere (`ash`), MoltenVK on macOS for bring-up, native Metal later | (c) Vulkan and native Metal from the start | (d) Metal first, Vulkan later |
+   |---|---|---|---|---|
+   | Console features | Missing: logic ops, geometry and tessellation shaders, transform feedback, sparse resources, per-view component swizzle, explicit primitive-restart control; mesh shaders experimental, and on Metal only with hand-written shaders (wgpu-types 30.0.1, `Features`) | Full on Linux. MoltenVK lacks geometry shaders, logic ops, cull distance and wide lines, and caps vertex attributes at 16 (Eden's workarounds) | Full where each API allows | Full on Mac; Linux waits |
+   | Memory control on unified memory | None through the safe API; wrapping a native buffer needs `unsafe` escapes into wgpu-hal | Vulkan: host-memory import where the driver offers it; through MoltenVK: to verify | Full | Full on Mac |
+   | CPU cost on the hot path | Validation and resource tracking on every call, on the thread that is already the bottleneck | Thin | Thin | Thin |
+   | Backends to maintain | One (but each missing feature means an escape hatch per API) | One until the Metal backend starts | Two from day one | Two, Linux late |
+   | Pure-Rust build | Yes | Yes (Vulkan loaded at run time); MoltenVK is a run-time library on Mac | Yes | Yes |
+   | Reference to port from | None for an emulator | Eden's Vulkan renderer, including its MoltenVK workarounds | Eden for Vulkan, nothing for Metal | Nothing |
+   | Testing without a GPU | Recording backend; wgpu can also run on lavapipe | Recording backend; real backend on lavapipe in Linux CI | Same, Metal untestable in CI | Metal untestable in CI |
+   | Stability | Breaking major releases several times a year (29.x and 30.x both in 2026) | `ash` is stable (0.38, 2024) | Same | Same |
+
+   **Recommended: (b).** One backend reaches first present on all three platforms, Eden's renderer
+   is a direct reference for it, its full path can be tested in Linux CI with no GPU, and the
+   trait is designed so that a native Metal backend is additive. The cost is honest: the Mac runs
+   through a translation layer at first, with the gaps listed, and every gap that matters
+   (mesh shaders, sparse textures, unified-memory aliasing, logic ops through framebuffer fetch,
+   MoltenVK bugs) is a reason to start the Metal backend. The trigger is a measurement or a
+   title's need, decided at milestone 4. (a) is the easiest start, but an emulator needs exactly
+   the features and the control a portable web-shaped API leaves out, and pays its checks on the
+   hottest thread. (c) doubles the work before anything is on screen. (d) leaves Linux, a
+   first-class target (decision log, 2026-11-11), behind.
+
+2. **Vulkan bindings: `ash` (0.38.0, Vulkan headers 1.3.281, released 2024) or `vulkanalia`
+   (0.35.0, 2026).** `ash` is what `wgpu-hal` 30 and `gpu-allocator` 0.28 use, and is the most
+   used; its headers are older, so an extension newer than 1.3.281 is loaded by hand.
+   `vulkanalia` is more recent but less used. **Recommended: `ash`**, for the ecosystem
+   (`gpu-allocator` plugs straight in) and stability; revisit if a needed extension is missing.
+
+3. **Command lists as data, encoded on a render thread** (this spec's design) or **the back
+   thread calling the host API directly** (the back thread would then hold the backend's host
+   objects and record into host command buffers itself). Data
+   costs one extra pass over each draw; direct calls cost the back thread the driver's time and
+   tie `gpu` to the backend's threading rules. **Recommended: data**, because the back thread is
+   the measured bottleneck (rows 98, 133) and data lists give the recording backend and
+   host-level captures for free.
+
+4. **Where the caches live:** guest-keyed caches in `gpu`, host objects in the backend (this
+   spec), or whole caches inside each backend (Eden's layout). **Recommended: split as here**, so
+   cache policy is written once, tested without a GPU, and not repeated in the Metal backend.
+
+5. **A draw whose pipeline is still compiling: wait or skip by default.** Waiting gives correct
+   frames and reproducible dumps but stutters the first time each effect appears; skipping keeps
+   frames smooth but draws them incomplete for a moment. **Recommended: wait by default until
+   milestone 4 (correctness first, and tests need determinism), skip as a setting**, revisited
+   with the disk cache at milestone 5.
+
+6. **ASTC on GPUs without it: decode to RGBA8 first, or decode and recompress to BC.**
+   Recompressing cuts memory four to eight times (rows 99, 103) but adds an encoder and some
+   quality loss. **Recommended: RGBA8 first**, BC later when a Linux machine runs out of memory;
+   it does not matter on Apple GPUs, which decode ASTC natively.
+
+7. **Unified memory: copy guest data into GPU memory, or alias guest memory as GPU buffers.**
+   Aliasing saves the copy and makes GPU writes visible to the guest at once, but bypasses write
+   tracking and needs 16 KiB alignment; copying works everywhere and is needed on discrete GPUs.
+   **Recommended: copy first**, design the staging API so aliasing can replace it, and decide
+   after verification 4.
+
+8. **What paces the guest: the emulated 60 Hz clock or the host display's vblank.** **Recommended:
+   the emulated clock** (gsv's vsync events and present reply): it works with no display, at any
+   refresh rate, with `--clock fixed`, and under replay. The host display only decides which
+   finished frame is shown.
+
+9. **Testing the Vulkan backend in CI with Mesa's software driver (lavapipe).** It runs the real
+   backend with no GPU, at the cost of a package install in CI and images from a software
+   rasterizer. Locally, the GPU tests need a Vulkan driver (MoltenVK on a Mac). **Recommended:
+   install lavapipe in Linux CI and require it there; locally, skip GPU tests with a notice when
+   no Vulkan driver is present**, the way the gate skips `cargo-deny` when it is not installed,
+   so agents without MoltenVK can still run the gate. Golden images are compared exactly only
+   for scenes whose pixels are computable.
+
+10. **Crates: one `starquake-render` crate with backends behind features, or the trait crate plus
+    one crate per backend.** **Recommended: one crate per backend**: `unsafe` stays in the
+    backend crates, `gpu` compiles without Vulkan, and a backend's build time is paid only where
+    it is used.
+
+11. **A window before the GPUI frontend.** The command-line app can stay headless (frames only as
+    PNG dumps) or open a plain window with `winit` (0.30.13, pure Rust) behind `--window`.
+    **Recommended: a `--window` flag in the command-line app**, because bring-up is much faster
+    when frames can be watched live; it is throwaway once GPUI arrives and touches only `apps/`.
+
+12. **Language for the backend's own helper shaders: WGSL through naga, GLSL, or hand-written
+    SPIR-V and MSL.** GLSL needs a C++ compiler (glslang) or naga's less complete GLSL reader;
+    hand-written pairs double the work. **Recommended: WGSL through naga**, one source for both
+    backends, no build step.
+
+13. **How the GPUI frontend will get frames.** GPUI renders with Metal on macOS and `wgpu` on
+    Linux (gpui-pre 0.3.3, a published snapshot of Zed's gpui: `gpui-pre-wgpu` uses wgpu 29.0.4),
+    and its `surface` element accepts only a macOS `CVPixelBuffer`. Options: present into a native
+    child view or layer the frontend reserves; export each frame as a shared image (IOSurface on
+    macOS, dma-buf on Linux); or copy pixels into a GPUI image. **Recommended: decide when the
+    frontend starts**; this design keeps a slot for an `Exported` present target and does not
+    depend on the answer.
+
+## Deferred, not ruled out
+
+- **Native Metal backend.** A second implementation of the same trait, consuming the same command
+  lists; naga's MSL writer emits its shaders. Its oracle is the recording backend and, on a Mac,
+  the Vulkan backend through MoltenVK running the same captured lists. Started when decision 1's
+  trigger is met.
+- **Unified-memory aliasing.** A staging slice that is guest memory itself; needs the memory
+  crate to hand out a raw view of a backing pool and the GPU caches to learn of GPU writes without
+  faults (verification 4).
+- **Sparse textures** for huge virtual textures (row 87, 94): a `sparse` flag on `TextureDesc`
+  and a `BindPages` command; Vulkan sparse residency, Metal sparse textures. Until then, the
+  texture cache trims levels as Eden-NX2 did.
+- **Mesh and task shaders** (row 89): pipeline stages in `GraphicsPipelineDesc`;
+  `VK_EXT_mesh_shader` on Linux, Metal mesh shaders on Apple GPUs (Metal 3, scoping doc). Until
+  then the draws are skipped and counted.
+- **BC recompression of ASTC** (rows 99, 103, 107): a compute pass after the decode, ported from
+  Eden-NX2's `bc_encoder.comp` approach.
+- **GPU detiling**, behind a `Caps` bit, with the CPU detiler as oracle.
+- **Transform feedback, queries and conditional rendering:** new commands; Metal has no transform
+  feedback, so it is emulated with vertex-stage buffer writes there.
+- **Bindless textures and global-memory pointers:** descriptor indexing and buffer device
+  addresses on Vulkan, argument buffers and GPU addresses on Metal. Depends on what #13 needs and
+  naga can express.
+- **Resolution scaling** of render targets (Eden's resolution scaler), a texture-cache policy with
+  a scale factor in `TextureDesc`.
+- **The tensor-core upscaler** (row 64): the shader side is #13's; this backend offers the
+  bilinear blit Eden-NX2 uses as a stand-in.
+- **Present timing and HDR:** presenting at a target time (Metal's timed presents, Vulkan's
+  present-timing extensions) and wide-gamut output.
+- **Several host queues** (async compute, a transfer queue) once a measurement says one queue is
+  the limit.
+- **Exported frames for GPUI** (decision 13).
