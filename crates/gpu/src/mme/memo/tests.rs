@@ -634,3 +634,53 @@ proptest! {
         }
     }
 }
+
+#[test]
+fn a_record_of_another_start_never_matches_even_under_the_same_hash() {
+    // Two keys with one hash cannot be built by hand; check the comparison itself.
+    let program = pure_program();
+    let mut memo = MacroMemo::new();
+    let mut ram = DataRam::new();
+    checked_call(&mut memo, &program, 7, &[5], &mut ram).unwrap();
+    let offset = memo.entries.get(&key_hash(7, &[5])).copied().unwrap();
+    assert!(memo.matches(offset, 7, &[5], &ram).is_some());
+    assert!(memo.matches(offset, 8, &[5], &ram).is_none());
+    assert!(memo.matches(offset, 7, &[6], &ram).is_none());
+    assert!(memo.matches(offset, 7, &[5, 0], &ram).is_none());
+}
+
+/// `R2 = ram[0]; if R2 == 0 write R2, else ram[1] = R2`: one read, then either one method write
+/// or one data RAM write, two shapes of the same length.
+fn two_shapes_program() -> Vec<Instruction> {
+    finish(vec![
+        dread(2, 0),
+        branch(AluOp::Beq, r(2), Reg::Zero, false, 3),
+        emit(METHOD, 2),
+        branch(AluOp::Beq, Reg::Zero, Reg::Zero, true, 2),
+        store(1, 2),
+    ])
+}
+
+#[test]
+fn live_records_filling_exactly_three_quarters_clear_the_memo() {
+    let program = two_shapes_program();
+    let record = HEADER_WORDS + 2 * (1 + 1);
+    let mut memo = MacroMemo::with_limits(4 * record, StepLimit::DEFAULT);
+    let mut ram = DataRam::new();
+    for start in 1..=3 {
+        checked_call(&mut memo, &program, start, &[], &mut ram).unwrap();
+    }
+    // Start 1 again with another shape: its first record goes stale, three stay live.
+    *ram.get_mut(0).unwrap() = 1;
+    assert_eq!(
+        checked_call(&mut memo, &program, 1, &[], &mut ram),
+        Ok(CallOutcome::Stored)
+    );
+    assert_eq!(memo.statistics().overwrites, 0);
+    assert_eq!((memo.arena_words(), memo.len()), (4 * record, 3));
+    // The next store compacts to exactly three quarters, which clears.
+    checked_call(&mut memo, &program, 4, &[], &mut ram).unwrap();
+    let stats = memo.statistics();
+    assert_eq!((stats.compactions, stats.clears), (1, 1));
+    assert_eq!((memo.arena_words(), memo.len()), (record, 1));
+}
