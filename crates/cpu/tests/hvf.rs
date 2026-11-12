@@ -2029,19 +2029,24 @@ fn a_guest_waiting_in_a_loop_can_still_be_interrupted() {
         );
         let interrupter = vcpu.interrupter();
         let memory = guest.memory();
+        // The waker interrupts once the guest is provably in its loop, or after 60 s at the
+        // latest, so a broken backend fails this test instead of hanging it.
         let waker = std::thread::spawn(move || {
             let started = Instant::now();
-            while read_u64(&memory, flag) == 0 {
-                assert!(
-                    started.elapsed() < Duration::from_secs(60),
-                    "the guest never ran"
-                );
+            let mut ran = read_u64(&memory, flag) != 0;
+            while !ran && started.elapsed() < Duration::from_secs(60) {
                 std::thread::yield_now();
+                ran = read_u64(&memory, flag) != 0;
             }
             interrupter.interrupt().unwrap();
+            ran
         });
-        assert_eq!(vcpu.run().unwrap(), Exit::Interrupted, "{wait:#x}");
-        waker.join().unwrap();
+        let exit = vcpu.run();
+        assert!(
+            waker.join().unwrap(),
+            "{wait:#x}: the guest never reached its loop"
+        );
+        assert_eq!(exit, Ok(Exit::Interrupted), "{wait:#x}");
         let pc = vcpu.regs().unwrap().pc;
         let base = guest.base();
         assert!(
