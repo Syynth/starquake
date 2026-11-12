@@ -2,22 +2,16 @@
 //! ring", "Entries").
 //!
 //! The entry kinds are the spec's sketch. Where a payload type is shared with a neighbouring
-//! design its fields follow that design: [`PresentRequest`] is graphics-server's ("Interfaces to
-//! neighbouring designs"), with the image fields its section "What vi2 needs from the image"
-//! lists (row 48 of Eden-NX2's notes), and [`Invalidation`] is a host `MEM_OP_D` operation from
-//! `classes/clc76f.h` (`mesa-nouveau/src/nouveau/headers/nvidia/classes/` @ 52238762, MIT).
+//! design it comes from [`crate::interface`] ([`ChannelId`], [`SyncpointId`], [`PresentRequest`]),
+//! and [`Invalidation`] is a host `MEM_OP_D` operation from `classes/clc76f.h`
+//! (`mesa-nouveau/src/nouveau/headers/nvidia/classes/` @ 52238762, MIT).
 
 use std::borrow::Cow;
 
-use starquake_render::command::Rect;
-
 use crate::field::Field;
 use crate::fifo::METHOD_SUBCHANNEL;
+use crate::interface::{ChannelId, PresentRequest, SyncpointId};
 use crate::sema::{Reduction, ReleaseForm};
-
-/// A GPU channel, as gsv created it (`GpuFront::create_channel`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ChannelId(pub u32);
 
 /// An engine class number, as bound with the host's bind-object method (`0xC797` for the 3D
 /// class, `0` to unbind).
@@ -44,38 +38,9 @@ impl Subchannel {
     }
 }
 
-/// The number of syncpoints: the size of Eden's host1x syncpoint table, which graphics-server
-/// keeps ("Syncpoints"; its verification item 10 checks the console's count).
-pub const SYNCPOINT_COUNT: u32 = 192;
-
-/// A syncpoint, below [`SYNCPOINT_COUNT`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SyncpointId(u8);
-
-impl SyncpointId {
-    /// The syncpoint `value`, or `None` from [`SYNCPOINT_COUNT`] up.
-    pub fn new(value: u8) -> Option<Self> {
-        (u32::from(value) < SYNCPOINT_COUNT).then_some(Self(value))
-    }
-
-    /// The number.
-    pub const fn get(self) -> u8 {
-        self.0
-    }
-}
-
 /// What the back reports when it has performed everything before a [`RingEntry::Marker`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MarkerToken(pub u64);
-
-/// A vi2 layer. A **guess** at the width: `nn::vi` layer ids are 64-bit; graphics-server names
-/// the type only.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct LayerId(pub u64);
-
-/// A vi2 display. A **guess** at the width, as for [`LayerId`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct DisplayId(pub u64);
 
 /// What a release does at its address.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -91,7 +56,7 @@ pub enum ReleaseOp {
 pub struct Release {
     /// The GPU address of the semaphore.
     pub address: u64,
-    /// The payload (only the low 32 bits for a [`PayloadSize::Four`] form).
+    /// The payload (only the low 32 bits for a [`crate::sema::PayloadSize::Four`] form).
     pub payload: u64,
     /// The payload's width and whether a timestamp follows it.
     pub form: ReleaseForm,
@@ -164,38 +129,6 @@ impl Invalidation {
     pub fn from_mem_op_d(word: u32) -> Option<Self> {
         Self::from_operation(MEM_OP_D_OPERATION.get(word))
     }
-}
-
-/// The guest image a present shows, as vi2 learns it from a native image's preference words
-/// (graphics-server, "What vi2 needs from the image": word 2 the size, word 4 the block height,
-/// word 5 the pitch, word 6 the format).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct ImageDesc {
-    /// The image's GPU address.
-    pub address: u64,
-    /// Width in pixels.
-    pub width: u32,
-    /// Height in pixels.
-    pub height: u32,
-    /// Row pitch in 64-byte GOBs.
-    pub pitch: u32,
-    /// Block height, as log2 of GOB rows.
-    pub block_height_log2: u32,
-    /// The format word as the guest gave it (1 RGBA8, 4 RGB10A2).
-    pub format: u32,
-}
-
-/// A frame gsv latched after its fence was reached (graphics-server's `PresentRequest`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct PresentRequest {
-    /// The image.
-    pub image: ImageDesc,
-    /// The area of it shown (word 7 of vi2 request 229).
-    pub shown: Rect,
-    /// The layer.
-    pub layer: LayerId,
-    /// The display.
-    pub display: DisplayId,
 }
 
 /// Starts or stops a GPU capture at this point in the stream. **Guess** at the commands: the

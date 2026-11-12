@@ -34,10 +34,10 @@ use std::fmt;
 use thiserror::Error;
 
 use super::entry::{
-    CaptureCommand, ChannelId, ClassId, DisplayId, ImageDesc, Invalidation, LayerId, MarkerToken,
-    PresentRequest, Release, ReleaseOp, RingEntry, Subchannel, SyncpointId,
+    CaptureCommand, ClassId, Invalidation, MarkerToken, Release, ReleaseOp, RingEntry, Subchannel,
 };
 use crate::field::Field;
+use crate::interface::{ChannelId, DisplayId, ImageDesc, LayerId, PresentRequest, SyncpointId};
 use crate::sema::{self, PayloadSize, ReleaseForm, red_reduction, red_reduction_fields};
 use starquake_render::command::Rect;
 

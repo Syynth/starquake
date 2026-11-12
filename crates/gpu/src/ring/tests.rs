@@ -11,6 +11,9 @@ use starquake_render::command::Rect;
 
 use super::encode::{BIND_SUBCHANNEL, KINDS};
 use super::*;
+use crate::interface::{
+    ChannelId, DisplayId, ImageDesc, LayerId, PresentRequest, SYNCPOINT_COUNT, SyncpointId,
+};
 use crate::sema::{PayloadSize, Reduction, ReductionFormat, ReductionOp, ReleaseForm};
 
 fn config() -> Config {
@@ -431,15 +434,11 @@ fn the_subchannel_field_is_wider_than_the_subchannels() {
 }
 
 #[test]
-fn ids_are_checked_at_their_bounds() {
+fn subchannels_are_checked_at_their_bound() {
     // Eight subchannels: the 3-bit field of `NVC76F_DMA_METHOD_SUBCHANNEL 15:13`.
     assert_eq!(SUBCHANNEL_COUNT, 8);
     assert_eq!(Subchannel::new(7).map(Subchannel::get), Some(7));
     assert_eq!(Subchannel::new(8), None);
-    assert_eq!(SyncpointId::new(191).map(SyncpointId::get), Some(191));
-    assert_eq!(SyncpointId::new(192), None);
-    let last = u8::try_from(SYNCPOINT_COUNT - 1).unwrap();
-    assert!(SyncpointId::new(last).is_some());
 }
 
 #[test]

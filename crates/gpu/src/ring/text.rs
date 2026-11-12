@@ -29,9 +29,9 @@ use thiserror::Error;
 
 use super::encode::Kind;
 use super::entry::{
-    CaptureCommand, ChannelId, ClassId, DisplayId, ImageDesc, Invalidation, LayerId, MarkerToken,
-    PresentRequest, Release, ReleaseOp, RingEntry, Subchannel, SyncpointId,
+    CaptureCommand, ClassId, Invalidation, MarkerToken, Release, ReleaseOp, RingEntry, Subchannel,
 };
+use crate::interface::{ChannelId, DisplayId, ImageDesc, LayerId, PresentRequest, SyncpointId};
 use crate::sema::{PayloadSize, Reduction, ReductionFormat, ReductionOp, ReleaseForm};
 
 /// Every invalidation with its name in the text form.

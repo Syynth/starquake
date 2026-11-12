@@ -8,9 +8,9 @@ use std::thread;
 use std::time::Duration;
 
 use super::*;
+use crate::interface::{ChannelId, DisplayId, ImageDesc, LayerId, PresentRequest, SyncpointId};
 use crate::ring::{
-    ChannelId, ClassId, DecodeError, Kind, MarkerToken, PresentRequest, Release, ReleaseOp,
-    RingEntry, SyncpointId, encoded_words,
+    ClassId, DecodeError, Kind, MarkerToken, Release, ReleaseOp, RingEntry, encoded_words,
 };
 use crate::sema::{PayloadSize, ReleaseForm};
 
@@ -61,7 +61,7 @@ fn run(channel: u32, words: usize) -> RingEntry<'static> {
 
 fn present() -> RingEntry<'static> {
     RingEntry::Present(PresentRequest {
-        image: crate::ring::ImageDesc {
+        image: ImageDesc {
             address: 0x4000,
             width: 1,
             height: 2,
@@ -75,8 +75,8 @@ fn present() -> RingEntry<'static> {
             width: 8,
             height: 9,
         },
-        layer: crate::ring::LayerId(10),
-        display: crate::ring::DisplayId(11),
+        layer: LayerId(10),
+        display: DisplayId(11),
     })
 }
 

@@ -6,7 +6,8 @@
 //! memory operations, markers, presents and capture control. Entries are plain data, so a stream
 //! of them can be printed, captured and replayed.
 //!
-//! - `entry` owns [`RingEntry`] and the data it carries.
+//! - `entry` owns [`RingEntry`] and the ring-only data it carries; the types it shares with gsv
+//!   ([`crate::interface`]: channels, syncpoints, presents) are imported, not defined, here.
 //! - `encode` owns the word encoding: [`encode`], [`decode`], [`encoded_words`] and
 //!   [`entry_words`] (a header's kind and length), with the layout table in its docs.
 //! - `text` owns the text form: `Display` on [`RingEntry`], [`parse_entry`], [`parse_text`] and
@@ -29,9 +30,8 @@ pub use encode::{
     DecodeError, EncodeError, Kind, MAX_RUN_WORDS, decode, encode, encoded_words, entry_words,
 };
 pub use entry::{
-    CaptureCommand, ChannelId, ClassId, DisplayId, ImageDesc, Invalidation, LayerId,
-    MEM_OP_D_OPERATION, MarkerToken, PresentRequest, Release, ReleaseOp, RingEntry,
-    SUBCHANNEL_COUNT, SYNCPOINT_COUNT, Subchannel, SyncpointId,
+    CaptureCommand, ClassId, Invalidation, MEM_OP_D_OPERATION, MarkerToken, Release, ReleaseOp,
+    RingEntry, SUBCHANNEL_COUNT, Subchannel,
 };
 pub use spsc::{
     CapacityError, Consumer, PUBLISH_EVERY, PopError, Producer, PushError, RING_WORDS,
