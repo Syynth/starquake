@@ -455,6 +455,15 @@ fn unknown_opcodes_name_the_opcode() {
             Err(format!("unknown opcode {opcode:#05x}"))
         );
     }
+    // The opcode is checked before the stray bits: an unknown opcode with stray bits too is
+    // reported as the opcode.
+    let both = Instruction::default()
+        .with_field(OPCODE, 0xa23)
+        .with_flag(Field::bit(100), true);
+    assert_eq!(
+        decode(both),
+        Err(DecodeError::UnknownOpcode { opcode: 0xa23 })
+    );
     let stray = Instruction::default()
         .with_field(OPCODE, EXIT_OPCODE)
         .with_flag(Field::bit(16), true);

@@ -341,7 +341,7 @@ impl Display for Inst {
 }
 
 impl Display for Function {
-    /// The text form: one line per block label and per instruction, `%n = op.type args` for
+    /// The text form: one line per block label and per instruction, `%n: type = op args` for
     /// instructions with a result.
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         for (index, block) in self.blocks.iter().enumerate() {

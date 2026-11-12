@@ -3,8 +3,9 @@
 //! Ported by behaviour from PR #4588's native frontend
 //! (`eden-pr4588/src/shader_recompiler/frontend/ampere/` @ e5fb3b97, GPL-3.0-or-later):
 //! `ops_move.cpp` (`MOV`), `ops_alu.cpp` (`FFMA`), `ops_misc.cpp` (`ALD`, `AST`, `S2R`) and
-//! `ops_attr.cpp` (`EXIT`). Each of the PR's `Require` checks that applies to these forms is
-//! kept with its constant and turns into an [`Unsupported`] rejection naming the same thing.
+//! `ops_attr.cpp` (`EXIT`). Each of the PR's `Require` checks on these forms is kept with its
+//! constant and turns into an [`Unsupported`] rejection naming the same thing, except the
+//! colour-register bound of `EXIT`, which cannot fail here (see `Translator::exit`).
 //!
 //! Slice 1 handles linear flow only (spec, port slice 1). Where starquake is stricter than the
 //! PR, because the PR resolves the case in a part not built yet:
@@ -20,7 +21,9 @@
 //! - `S2R` reads only `SR_LANEID` (the PR also reads the thread and block ids, the W scale
 //!   factors and the lane masks).
 //!
-//! Each is pinned by a test in `tests` named after it.
+//! Pinned by `tests::guarded_instructions_are_rejected`,
+//! `exit_modes_and_predicates_are_rejected`, `the_program_ends_at_its_only_exit`,
+//! `attribute_access_checks` and `s2r_lane_id`.
 
 #[cfg(test)]
 mod tests;

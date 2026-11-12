@@ -390,6 +390,8 @@ own flags. If it runs the uniformity check, it would reject such shaders. Whethe
 whether a diagnostic filter carried in the module can turn that check off, is to be settled by
 experiment E1 before slice 1; if neither holds, guest shaders that take derivatives in divergent
 control flow need another route (an upstream change, or a different wgpu entry point).
+(Settled by E1, 2026-11-12: wgpu validates with every flag, but naga 30.0.1 gives derivatives
+no uniformity requirement, so wgpu accepts them; see "What to verify before building".)
 
 **What naga 30.0.1 can express**, from its IR source (`naga/src/ir/mod.rs`,
 `naga/src/valid/mod.rs`, `naga-types/src/lib.rs`), to be confirmed by experiment E1:
@@ -731,6 +733,48 @@ translator slices, limited by the three or four build agents a machine can run
    Writing MSL with naga and compiling it with Apple's compiler stays useful for the mesh
    question. If naga or wgpu is weaker than the sources suggest, the owner's decisions 2 and 3
    still stand, but the gap table and the first milestone's scope change.
+
+   **Amendment, 2026-11-12: E1 results** (issue #135). naga 30.0.1 and wgpu 30.0.1, wgpu's
+   Metal backend on an Apple M2 Mac. Each module was built by hand as naga IR, validated by
+   naga with this crate's flags (every flag but the uniformity analysis) and with wgpu's, then
+   created through `ShaderSource::Naga` and built into a pipeline, because wgpu's Metal backend
+   writes and compiles the MSL only when a pipeline is created. The experiment is kept as tests
+   that assert these results (`crates/shader/src/lower/e1.rs`; `cargo test -p starquake-shader
+   e1_`); their GPU half skips itself where the host has no adapter.
+
+   | Case | naga, this crate's flags | naga, wgpu's flags | wgpu on Metal | Notes |
+   |---|---|---|---|---|
+   | `Kill` inside two nested loops (pixel) | valid | valid | accepted | naga has `Kill` only, no demote: the gap table's divergence stands |
+   | f16 and i64 arithmetic (pixel) | valid with `SHADER_FLOAT16`, `SHADER_INT64` | valid | accepted with `SHADER_F16`, `SHADER_INT64` | |
+   | 64-bit atomic maximum on a storage buffer (compute) | valid with `SHADER_INT64_ATOMIC_MIN_MAX` | valid | accepted | Metal offers min and max only (`wgpu-hal` Metal adapter: `SHADER_INT64_ATOMIC_MIN_MAX`, not `ALL_OPS`) |
+   | Subgroup ballot and shuffle (pixel) | valid with `SUBGROUP` | valid | accepted with `SUBGROUP` | |
+   | Binding array of textures, non-uniform index (pixel) | valid with the binding-array capabilities | valid | accepted with an explicit pipeline layout (`count: 4`) | A layout derived from the shader fails: "mapping of ResourceBinding { group: 0, binding: 0 } is missing". The render backend must give binding arrays an explicit layout |
+   | Vertex shader writing the layer | cannot be built | | | naga's `BuiltIn` has no layer or viewport index, as the gap table says; a test lists every variant and stops compiling when a naga upgrade adds one |
+   | Derivative in divergent control flow (pixel) | valid | valid | accepted | Settles the open question below |
+   | Workgroup barrier in divergent control flow (compute) | valid | valid | accepted | Added: guest compute shaders may have barriers where naga cannot prove the condition uniform |
+   | Mesh entry point | valid with `MESH_SHADER` | valid | not tried | naga's MSL writer emits `[[mesh]]` at MSL 3.0 and refuses below it (`UnsupportedMeshShader`), so the render draft's statement that naga cannot write mesh shaders for Metal does not hold (review guide, M12). Not compiled: Apple's offline compiler needs the Metal toolchain, not installed on the test Mac, and wgpu's mesh path needs `ExperimentalFeatures::enabled()`, an `unsafe` opt-in that the shader crate's ban on `unsafe` excludes. Left to the render backend's experiments |
+
+   What the owner's decisions rest on:
+
+   - **The flags wgpu validates a given module with:** every flag, `ValidationFlags::all()`, with
+     capabilities derived from the device's features (`wgpu-core` 30.0.1,
+     `device/resource.rs`, `create_shader_module`; `wgpu-naga-bridge`,
+     `features_to_naga_capabilities`). There is no device flag that changes them.
+   - **Whether wgpu rejects derivatives in divergent control flow: no.** naga 30.0.1 sets
+     `DISABLE_UNIFORMITY_REQ_FOR_FRAGMENT_STAGE = true` (`naga/src/valid/analyzer.rs`), which
+     makes the `DERIVATIVE` and `IMPLICIT_LEVEL` uniformity requirements empty, and it reports
+     `NonUniformControlFlow` only for an expression in an `Emit` that has a requirement, which
+     leaves cooperative-matrix operations as the only thing the check rejects (a barrier's
+     requirement is recorded but not reported). No diagnostic filter and no device flag is
+     needed. Should a later naga turn that constant off, the derivative test fails; the place to
+     turn the rule off is then a `derivative_uniformity` filter on each entry function, since the
+     analysis searches `Function::diagnostic_filter_leaf` (read from the source, not exercised,
+     as nothing triggers the rule in 30.0.1).
+   - **Which features wgpu on Metal accepts:** every case above except the mesh entry point,
+     which was not tried.
+
+   No blocker for the owner's decisions 2 and 3: the gap table and the first milestone's scope
+   are unchanged, and slice 1 was built on these results.
 2. **E2, encodings.** For each instruction group, check that NAK's SM 7.0 encodings are the ones
    SM86 uses (NAK's `nvdisasm` tests run on SM86, which covers what they test), and list the
    forms that come only from PR #4588's table. A developer with `nvdisasm` (Linux or Windows; the

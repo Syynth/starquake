@@ -329,6 +329,75 @@ fn attribute_access_checks() {
     }
 }
 
+/// Instructions with two faults at once report the one the PR checks first (offset register,
+/// patch or physical, output, address, registers), then starquake's vertex register check.
+#[test]
+fn attribute_checks_report_in_the_prs_order() {
+    for (op, what) in [
+        // Offset register and patch bit: the offset is reported, first in the PR's order.
+        (
+            OpASt {
+                offset: r(1),
+                patch: true,
+                ..ast(r(0), 0x80, 1)
+            },
+            Unsupported::IndexedAttribute,
+        ),
+        // Bad address and registers past RZ: the address is reported first.
+        (
+            ast(r(254), 0x81, 2),
+            Unsupported::AttributeAddress {
+                addr: 0x81,
+                comps: 2,
+            },
+        ),
+        // Bad registers and a vertex register: the registers are reported first.
+        (
+            OpASt {
+                vtx: r(2),
+                ..ast(r(254), 0x80, 2)
+            },
+            Unsupported::AttributeRegisters {
+                first: r(254),
+                comps: 2,
+            },
+        ),
+    ] {
+        let instr = Instr::new(Op::ASt(op));
+        assert_eq!(one(instr), unsupported(instr, what));
+    }
+    let ald_order = [
+        (
+            ald(r(254), 0x81, 2),
+            Unsupported::AttributeAddress {
+                addr: 0x81,
+                comps: 2,
+            },
+        ),
+        (
+            OpALd {
+                output: true,
+                ..ald(r(0), 0x81, 1)
+            },
+            Unsupported::OutputRead,
+        ),
+        (
+            OpALd {
+                vtx: r(2),
+                ..ald(r(254), 0x80, 2)
+            },
+            Unsupported::AttributeRegisters {
+                first: r(254),
+                comps: 2,
+            },
+        ),
+    ];
+    for (op, what) in ald_order {
+        let instr = Instr::new(Op::ALd(op));
+        assert_eq!(one(instr), unsupported(instr, what));
+    }
+}
+
 /// `addr % 4 == 0 && addr + comps * 4 <= 0x400`, at the edge on both sides.
 #[test]
 fn attribute_addresses_end_at_the_attribute_space() {
