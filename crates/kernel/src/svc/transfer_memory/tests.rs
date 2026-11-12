@@ -418,3 +418,27 @@ fn unlocking_goes_on_past_a_failure_and_reports_the_first() {
     assert_eq!(world.block(heap).1, HEAP_SIZE_ALIGNMENT / PAGE_SIZE);
     assert!(!world.scheduler.objects().has_unlocks());
 }
+
+/// Eden's limit on a process's transfer memories (`TransferMemoryCountMax`, set to 200 in
+/// `CreateResourceLimitForProcess`, `eden/src/core/hle/kernel/k_resource_limit.cpp` @
+/// cf654052). Starquake has no such limit yet.
+const EDEN_TRANSFER_MEMORY_COUNT_MAX: u64 = 200;
+
+#[test]
+fn more_transfer_memories_than_edens_limit_are_all_lent() {
+    let mut world = World::new();
+    world.handles = HandleTable::new(0).unwrap();
+    let heap = world.heap;
+    let count = EDEN_TRANSFER_MEMORY_COUNT_MAX + 1;
+    assert!(count * PAGE_SIZE <= HEAP_SIZE_ALIGNMENT);
+    for page in 0..count {
+        let address = heap + page * PAGE_SIZE;
+        assert!(
+            world
+                .create(address, PAGE_SIZE, raw(SvcPermission::Read))
+                .is_ok(),
+            "{page}"
+        );
+    }
+    assert_eq!(world.handles.len(), usize::try_from(count).unwrap());
+}

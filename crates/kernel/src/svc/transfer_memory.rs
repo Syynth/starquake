@@ -29,18 +29,24 @@
 //! # Divergences from Eden
 //!
 //! - **No resource limit.** Eden reserves one `TransferMemoryCountMax` from the process's
-//!   resource limit first (`ResultLimitReached`). Starquake's resource limits are a later slice,
-//!   so this call never fails that way. PROVISIONAL.
+//!   resource limit first (`ResultLimitReached`; Eden's limit is 200,
+//!   `CreateResourceLimitForProcess` in `eden/src/core/hle/kernel/k_resource_limit.cpp`).
+//!   Starquake's resource limits are a later slice, so this call never fails that way.
+//!   PROVISIONAL. Test: `more_transfer_memories_than_edens_limit_are_all_lent`.
 //! - **The receiver never maps the pages.** `MapTransferMemory` (0x51) and
 //!   `UnmapTransferMemory` (0x52) are server-side calls, deferred with the rest (kernel spec);
 //!   an HLE server reads and writes the owner's pages where they are, through
 //!   [`IpcContext::read_transfer_memory`](crate::dispatch::IpcContext::read_transfer_memory)
 //!   and [`IpcContext::write_transfer_memory`](crate::dispatch::IpcContext::write_transfer_memory),
 //!   as Eden's HLE services read `GetSourceAddress`. So `Finalize`'s "unless mapped" never
-//!   applies: a locked transfer memory always unlocks its pages when it goes.
-//! - **A failed unlock is logged and the run goes on** when it happens as the kernel lock is let
-//!   go ([`unlock_released`]); Eden asserts it succeeds. Both mean the kernel's own
-//!   bookkeeping is broken.
+//!   applies: a locked transfer memory always unlocks its pages when it goes. Tests:
+//!   `a_server_reads_and_writes_a_transfer_memory_it_is_sent_within_its_bounds` (in
+//!   `dispatch/memory_objects/tests.rs`),
+//!   `while_lent_the_owner_cannot_change_the_pages_and_closing_the_handle_gives_them_back`.
+//! - **A failed unlock is an internal failure, and the other unlocks still run**
+//!   ([`unlock_released`]); as the kernel lock is let go it is logged and the run goes on. Eden
+//!   asserts it succeeds. Both mean the kernel's own bookkeeping is broken. Test:
+//!   `unlocking_goes_on_past_a_failure_and_reports_the_first`.
 
 use super::memory::check_range;
 use crate::handle::{Handle, HandleTable};

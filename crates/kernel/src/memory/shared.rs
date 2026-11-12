@@ -39,9 +39,13 @@
 //! - **The user permission is read or read-write.** Eden accepts `DontCare` too, and then
 //!   asserts that the mapping asks for read or write; no HLE service uses it. Test:
 //!   `a_shared_memory_permission_is_read_or_read_write`.
+//!
+//! # Not built
+//!
 //! - **No resource limit is charged.** Eden reserves the size from the system's resource limit
 //!   (`ResultLimitReached` when it has no room). Starquake has no system resource limit yet
-//!   (the later resource-limits slice), so making shared memory never fails that way.
+//!   (the later resource-limits slice), so making shared memory never fails that way. There is
+//!   no limit for a test to exceed until that slice lands.
 //! - **Pages are not given back** when the last reference to a shared memory goes: the
 //!   [`Mapper`](super::Mapper) has no call for it, and its only implementation
 //!   (`starquake-core`) never reuses backing anyway (PROVISIONAL there).
