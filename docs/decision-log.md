@@ -225,3 +225,11 @@ Entry format:
 - **WHAT:** After milestone 1 the owner extended the lead's delegation toward milestone 2, for implementation work only. The lead files implementation issues that follow approved specs (kernel slices, CPU, loader, services, test fixtures), runs them in parallel lanes on Opus, and merges their PRs on a green gate and two reviews. It does not decide design questions, amend specs or merge design PRs: those wait for the owner, including the four graphics drafts.
 - **WHY:** Progress can continue in parallel while the owner reviews designs at their own pace. Implementation against an approved spec is checked by the gate, two reviewers and the reference traces; designs set direction, so they stay with the owner.
 
+## Two Opus reviews where a Fable review was planned
+- **WHEN:** 2026-11-12
+- **PROJECT:** starquake
+- **SYSTEM:** process
+- **SCOPE:** minor/local
+- **WHAT:** The owner's direction after the Fable allowance ran out: where a PR was to get a Fable fidelity review, it gets two Opus reviews instead (the fidelity review and the test-breaking review, both on Opus). Builds and fixes stay on Opus. This amends "Fable is used sparingly", which kept Fable for the fidelity review of foundation PRs.
+- **WHY:** The week's Fable allowance is spent. Two independent Opus reviews keep the second, differently-aimed read of every change, which is what the review process relies on.
+
