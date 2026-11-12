@@ -1055,25 +1055,41 @@ mod tests {
     }
 
     /// Divergence from Atmosphère's `ValidateAcid`/`ValidateAci` (module docs): a list that
-    /// starts inside its block's header is still read, as long as it lies inside the block.
+    /// starts inside its block's header is still read, as long as it lies inside the block. Both
+    /// cases use a non-empty list, so the bytes of the header are actually decoded.
     #[test]
     fn lists_overlapping_their_block_header_parse() {
         let good = Fixture::new(AcidLayout::Switch1).build();
         let body = acid_body_at(&good);
-        // The ACID SAC moved to offset 0 (the signature area), empty. Atmosphère needs the
-        // offset to be at least 0x240.
+        // The ACID SAC moved to offset 0, inside the signature area (Atmosphère needs the offset
+        // to be at least 0x240), holding one entry written over the signature bytes.
+        let entry = sac_bytes(&[("pl:u", false)]);
+        let block_start = body - ACID_MAGIC_OFFSET_SWITCH1;
         let mut file = good.clone();
+        file[block_start..block_start + entry.len()].copy_from_slice(&entry);
         put_word(&mut file, body + ACID_BODY_SAC_FIELD, 0);
-        put_word(&mut file, body + ACID_BODY_SAC_FIELD + 4, 0);
+        put_word(
+            &mut file,
+            body + ACID_BODY_SAC_FIELD + 4,
+            u32::try_from(entry.len()).unwrap(),
+        );
         let npdm = Npdm::parse(&file).unwrap();
-        assert_eq!(npdm.acid.services, vec![]);
-        // The ACI0 KAC moved onto its own header (offset 0, empty): Atmosphère needs 0x40.
+        assert_eq!(npdm.acid.services, service_access::parse(&entry).unwrap());
+        assert_eq!(npdm.acid.services.len(), 1);
+        // The ACI0 KAC moved onto its own header (offset 0, one word; Atmosphère needs 0x40).
+        // The word is the block magic, which decodes as one descriptor of an unknown type.
         let aci_at = u32::from_le_bytes(good[0x70..0x74].try_into().unwrap()) as usize;
         let mut file = good;
         put_word(&mut file, aci_at + 0x30, 0);
-        put_word(&mut file, aci_at + 0x34, 0);
+        put_word(&mut file, aci_at + 0x34, 4);
         let npdm = Npdm::parse(&file).unwrap();
-        assert_eq!(npdm.aci.kernel_capabilities, KernelCapabilities::default());
+        assert_eq!(
+            npdm.aci.kernel_capabilities,
+            KernelCapabilities {
+                unknown: vec![u32::from_le_bytes(ACI0_MAGIC)],
+                ..KernelCapabilities::default()
+            }
+        );
     }
 
     #[test]

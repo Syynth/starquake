@@ -18,7 +18,7 @@
 //! with the bytes before the `*`. A `*` anywhere else in a name is an ordinary byte there and
 //! here. `tests/homebrew/hello/main.npdm`, written by switch-tools' `npdmtool` from a description
 //! listing `set:*`, stores the `*` as the name's last byte (`crates/loader/tests/homebrew_fixture.rs`).
-//! How a grant covers a request, and the one place this is stricter than sm, is in
+//! How a grant covers a request, and the two places this differs from sm, is in
 //! [`ServiceAccess::covers`].
 
 /// One service access entry.
@@ -42,10 +42,19 @@ impl ServiceAccess {
     /// is, the names must be equal; when only the grant is a wildcard, the request's name must
     /// start with the grant's prefix (`memcmp` over `GetServiceNameSize() - 1` bytes).
     ///
-    /// One divergence, pinned by `a_wildcard_request_is_not_covered_by_an_exact_grant`: when only
-    /// the request is a wildcard, sm's check leaves `is_valid` true and accepts it against any
-    /// exact grant of the same role. That would let an `ACI0` widen an exact grant to every
-    /// name, so this refuses it.
+    /// Two divergences from sm:
+    ///
+    /// 1. Pinned by `a_wildcard_request_is_not_covered_by_an_exact_grant`: when only the request
+    ///    is a wildcard, sm's check leaves `is_valid` true and accepts it against any exact grant
+    ///    of the same role. That would let an `ACI0` widen an exact grant to every name, so this
+    ///    refuses it.
+    /// 2. Pinned by `divergence_names_are_not_compared_zero_padded`: sm compares names as 8-byte
+    ///    values padded with zero bytes (`ServiceName::Encode` in
+    ///    `atmosphere/libraries/libstratosphere/include/stratosphere/sm/sm_types.hpp`), so an
+    ///    entry whose name ends in NUL bytes equals the same name without them (an `ACI0` entry
+    ///    `ab\0` of length 3 equals an `ACID` entry `ab`, and a wildcard grant `a\0*` covers the
+    ///    name `a`). Here the names are compared as the strings stored, with their NUL bytes, and
+    ///    differ. Every pair this accepts, sm accepts too: the divergence is never looser.
     pub fn covers(&self, request: &Self) -> bool {
         if self.server != request.server {
             return false;
@@ -222,6 +231,23 @@ mod tests {
         ] {
             assert!(!grant.covers(&request), "{request:?}");
         }
+    }
+
+    /// Divergence (see [`ServiceAccess::covers`]): sm compares zero-padded 8-byte names, so
+    /// trailing NUL bytes do not matter to it; here they do.
+    #[test]
+    fn divergence_names_are_not_compared_zero_padded() {
+        // An `ACI0` entry `ab\0` against an `ACID` entry `ab`, both exact.
+        let grant = service("ab", false, false);
+        let request = service("ab\0", false, false);
+        assert!(!grant.covers(&request));
+        assert!(!request.covers(&grant));
+        // A wildcard grant whose prefix ends in NUL against the name without it.
+        let grant = service("a\0", false, true);
+        assert!(!grant.covers(&service("a", false, false)));
+        // The same names parse as distinct entries, NUL kept.
+        let parsed = parse(&[0x02, b'a', b'b', 0]).unwrap();
+        assert_eq!(parsed, [service("ab\0", false, false)]);
     }
 
     #[test]

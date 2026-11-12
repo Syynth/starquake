@@ -70,9 +70,11 @@ Rules:
 
 - Code that depends on a fact from these pages says so next to the fact, and says what would
   confirm it.
-- A rule that appears in no source at all (for example which file permissions an `ACI0` may
-  request against its `ACID`) is a guess, stated as one in the module docs, not a
-  documentation-sourced fact.
+- A rule that appears in no source at all (for example how a Switch 2 NPDM is checked against
+  its `ACID`: no Switch 2 source does) is a guess, stated as one in the module docs, not a
+  documentation-sourced fact. A rule Atmosphère implements differently is a listed divergence
+  instead (for example file permissions: fs intersects the `ACI0` and `ACID` bits and never
+  refuses; see the table in `crates/loader/src/npdm/validate.rs`).
 
 ## Homebrew toolchain
 

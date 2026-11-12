@@ -227,6 +227,26 @@ mod homebrew {
         assert_eq!(check_manifest(&scratch.0), Ok(()));
     }
 
+    /// Deleting the key outright, not only emptying its value (the test below).
+    #[test]
+    fn a_manifest_with_a_toolchain_key_deleted_fails_the_check() {
+        let text = String::from_utf8(read(MANIFEST)).unwrap();
+        for key in TOOLCHAIN_KEYS {
+            let scratch = Scratch::new(&format!("toolchain-deleted-{key}"));
+            let prefix = format!("{key} = ");
+            let kept: Vec<&str> = text
+                .lines()
+                .filter(|line| !line.starts_with(&prefix))
+                .collect();
+            assert_eq!(kept.len() + 1, text.lines().count(), "no `{key}` line");
+            fs::write(scratch.path(MANIFEST), kept.join("\n")).unwrap();
+            assert_eq!(
+                check_manifest(&scratch.0),
+                Err(ManifestError::Malformed(format!("toolchain.{key}")))
+            );
+        }
+    }
+
     #[test]
     fn a_manifest_without_a_toolchain_version_fails_the_check() {
         let text = String::from_utf8(read(MANIFEST)).unwrap();
@@ -460,6 +480,7 @@ mod homebrew {
             ),
             debug_flags: Some(DebugFlags {
                 allow_debug: debug["allow_debug"].as_bool().unwrap(),
+                force_debug_prod: debug["force_debug_prod"].as_bool().unwrap(),
                 force_debug: debug["force_debug"].as_bool().unwrap(),
             }),
             ..KernelCapabilities::default()

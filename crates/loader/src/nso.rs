@@ -171,7 +171,9 @@ impl Nso {
     /// `atmosphere/stratosphere/creport/source/creport_modules.cpp` @ 4e3f3703 (fact only):
     /// rodata starts with a zero word, a signed length and the path. There is no path when the
     /// zero word is not zero or the length is not positive (`zero != 0 || path_length <= 0`).
-    /// The length is capped at [`MODULE_PATH_MAX`].
+    /// The length is capped at [`MODULE_PATH_MAX`]. The path ends at its first NUL byte, as
+    /// creport's C string does, and is `None` when that leaves nothing (pinned by
+    /// `module_path_divergences_from_creport`, though it is not a divergence).
     ///
     /// creport first rejects an older layout, where the first 8 bytes are an offset from text to
     /// the writable data. That check is left out because it cannot change the result here: a
@@ -191,7 +193,12 @@ impl Nso {
             return None;
         }
         let length = usize::try_from(length).ok()?.min(MODULE_PATH_MAX);
-        rodata.get(MODULE_PATH_OFFSET..MODULE_PATH_OFFSET.checked_add(length)?)
+        let path = rodata.get(MODULE_PATH_OFFSET..MODULE_PATH_OFFSET.checked_add(length)?)?;
+        // creport copies the path into a C string, which ends at the first NUL byte; a path that
+        // starts with one is empty (`strcmp(name, "") == 0`), and creport names the module after
+        // its build id instead.
+        let path = path.split(|&byte| byte == 0).next().unwrap_or_default();
+        (!path.is_empty()).then_some(path)
     }
 
     /// The segments in header order: text, rodata, data.
@@ -655,6 +662,26 @@ mod tests {
         assert_eq!(
             with_module_path(0, signed(MODULE_PATH_MAX), &short).module_path(),
             None
+        );
+        // Not a divergence, pinned here because the stored length bounds the bytes read: creport
+        // copies the path into a C string and tests `strcmp(name, "")`, so the path ends at its
+        // first NUL byte and one that starts with a NUL is no path (creport then names the module
+        // after its build id).
+        // Only NUL bytes: nothing is left, so there is no path.
+        assert_eq!(with_module_path(0, 3, b"\0\0\0").module_path(), None);
+        // Text before a NUL is the path; what follows the NUL, inside the length, is not.
+        assert_eq!(
+            with_module_path(0, 5, b"he\0lo").module_path(),
+            Some(&b"he"[..])
+        );
+        // A NUL after the length does not matter.
+        assert_eq!(
+            with_module_path(0, 2, b"he\0lo").module_path(),
+            Some(&b"he"[..])
+        );
+        assert_eq!(
+            with_module_path(0, 5, b"hello\0").module_path(),
+            Some(&b"hello"[..])
         );
     }
 
