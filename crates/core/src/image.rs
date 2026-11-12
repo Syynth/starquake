@@ -21,9 +21,13 @@
 //! # Permissions
 //!
 //! [`Placement::regions`] says what to map: whole pages, each with the permissions guest code
-//! has there. Everything between them is not mapped, so the page after the TLS block and the
-//! page below the stack fault. The permissions are Eden's (`eden/src/core/hle/kernel/k_process.cpp`
-//! @ cf654052):
+//! has there. Everything between them is not mapped. When the program needs less than its whole
+//! window (`needed < ram_size` in [`place`]; both are whole pages), at least one page between
+//! the TLS block and the stack is not mapped, so the page after the TLS block and the page
+//! below the stack fault. A program that fills its window exactly (`needed == ram_size`) is
+//! accepted too, and then the TLS block ends where the stack begins, with no unmapped page
+//! between them (`a_program_that_exactly_fits_is_placed_and_one_page_less_is_an_error`). The
+//! permissions are Eden's (`eden/src/core/hle/kernel/k_process.cpp` @ cf654052):
 //!
 //! | What | Guest code may | Eden |
 //! |---|---|---|
@@ -38,11 +42,34 @@
 //! A segment covers whole pages: its size is rounded up to a page, as `LoadNroImpl` does
 //! (`PageAlignSize`). Divergences from Eden, each pinned by a test here:
 //!
-//! - A segment that does not start on a page boundary is [`LoadError::MisalignedSegment`]. Eden
-//!   passes it to `SetProcessMemoryPermission`, ignores the failure, and runs the program with
-//!   that segment inaccessible.
-//! - Two segments that share a page (after rounding) are [`LoadError::OverlappingSegments`].
-//!   Eden reprotects in order, so the later segment's permissions win for the shared pages.
+//! - A segment that does not start on a page boundary is [`LoadError::MisalignedSegment`]
+//!   (`a_segment_that_starts_inside_a_page_is_an_error`). Eden does not refuse it.
+//!   `ReprotectSegment` in `KProcess::LoadModule` discards the result of
+//!   `KPageTableBase::SetProcessMemoryPermission`
+//!   (`eden/src/core/hle/kernel/k_page_table_base.cpp` @ cf654052), and that function has no
+//!   alignment check that returns an error: `CheckMemoryState` passes for a range inside one
+//!   block of the code region, and `Operate` only soft-asserts
+//!   `Common::IsAligned(GetInteger(virt_addr), PageSize)` (`ASSERT` is `AssertFailSoftImpl` in
+//!   `eden/src/common/assert.cpp`, which carries on unless debug asserts are switched on)
+//!   before it calls `ProtectRegion` on the unaligned range and succeeds. Guess: what guest
+//!   code can then do with the pages that range touches was not traced past `ProtectRegion`;
+//!   running Eden on such a file would confirm it.
+//! - Two segments that share a page (after rounding) are [`LoadError::OverlappingSegments`]
+//!   (`segments_that_share_a_page_are_an_error`). Eden reprotects in the order text, rodata,
+//!   data. When every page of the later segment has one memory state and one permission at
+//!   that moment (true of the three layouts the test uses), the later segment's permissions
+//!   win for the shared pages. Otherwise `CheckMemoryState` fails
+//!   (`R_UNLESS(info.m_permission == first_perm, ResultInvalidCurrentMemory)`, and the same
+//!   check on `m_state`), the result is discarded, the shared page keeps the earlier segment's
+//!   permissions and the rest of the later segment stays `KernelRead | NotMapped`.
+//! - `.bss` is the pages `[image_end, bss_end)`: it starts where the image, rounded up to a
+//!   page, ends. `LoadNroImpl` does `codeset.DataSegment().size += bss_size` instead, so Eden's
+//!   read-write range is the data segment's pages plus `bss_size` bytes directly after them.
+//!   The two are the same pages only when the data segment ends at the page-rounded end of the
+//!   image (`bss_starts_on_the_page_after_the_image_and_is_read_write`). When it ends earlier,
+//!   Eden's range stops short of the end of `.bss` and takes in the image pages after the data
+//!   segment; here those pages keep what their own segment gives them, or no guest access
+//!   (`bss_is_read_write_where_it_lies_even_when_the_data_segment_ends_before_the_image`).
 //!
 //! The module's size follows Eden's NRO loader (`eden/src/core/loader/nro.cpp` @ cf654052,
 //! `LoadNroImpl`): the image rounded up to a page, plus `.bss` rounded up to a page, with the
@@ -643,6 +670,40 @@ mod tests {
     }
 
     #[test]
+    fn pages_at_the_end_of_the_image_in_no_segment_are_mapped_without_guest_access() {
+        // Drop data from the header: its page is still the last page of the image, and there is
+        // no .bss after it.
+        let mut file = three_segments();
+        set_segment(&mut file, 2, 0, 0);
+        let placed = place(&Program::parse(&file).unwrap(), RAM_BASE, RAM_SIZE, None).unwrap();
+        assert_eq!(
+            placed.regions[..3],
+            [
+                region(RAM_BASE, 1, Perms::ReadExecute),
+                region(RAM_BASE + PAGE, 1, Perms::Read),
+                region(RAM_BASE + 2 * PAGE, 1, Perms::None),
+            ]
+        );
+        // The module ends with that page, and the TLS block follows it.
+        assert_eq!(placed.module.size, 3 * PAGE);
+        assert_eq!(placed.regions[3].start, RAM_BASE + 3 * PAGE);
+        // The image is written whole, so every page of the write must be mapped.
+        assert_eq!(placed.writes, [(RAM_BASE, file)]);
+        let (address, bytes) = &placed.writes[0];
+        let end = address + bytes.len() as u64;
+        assert_eq!(end, RAM_BASE + 3 * PAGE);
+        for page in (*address..end).step_by(usize::try_from(PAGE).unwrap()) {
+            assert!(
+                placed
+                    .regions
+                    .iter()
+                    .any(|r| r.start <= page && page + PAGE <= r.start + r.size),
+                "{page:#x}"
+            );
+        }
+    }
+
+    #[test]
     fn a_segment_is_rounded_up_to_whole_pages() {
         // A rodata of one byte still gets its whole page, read-only.
         let mut file = three_segments();
@@ -658,7 +719,9 @@ mod tests {
 
     #[test]
     fn a_segment_that_starts_inside_a_page_is_an_error() {
-        // Divergence from Eden, which runs the program with the segment inaccessible.
+        // Divergence from Eden, which has no check that refuses this: it discards the result of
+        // `SetProcessMemoryPermission`, whose only alignment check is a soft assert before it
+        // reprotects the unaligned range (see "Permissions" in the module docs).
         let page = u32::try_from(PAGE).unwrap();
         for offset in [page + 1, 2 * page - 1] {
             let mut file = three_segments();
@@ -677,7 +740,9 @@ mod tests {
 
     #[test]
     fn segments_that_share_a_page_are_an_error() {
-        // Divergence from Eden, where the later segment's permissions win.
+        // Divergence from Eden. In each of these three layouts every page of the later segment
+        // has one state and one permission when Eden reprotects it, so there the later segment's
+        // permissions win for the shared page (the module docs say what Eden does otherwise).
         let page = u32::try_from(PAGE).unwrap();
         // Text one instruction into rodata's page (text is whole instructions, or the patcher
         // refuses it first); rodata on top of text; rodata on top of data.
@@ -726,6 +791,40 @@ mod tests {
             let end = RAM_BASE + u64::from(segment.offset) + u64::from(segment.size);
             assert!(end.next_multiple_of(PAGE) <= image_end);
         }
+    }
+
+    #[test]
+    fn bss_is_read_write_where_it_lies_even_when_the_data_segment_ends_before_the_image() {
+        // Divergence from Eden, which grows the data segment by the size of .bss. Data is moved
+        // to the image's second page and rodata dropped, so the third page is in no segment and
+        // data ends a page before the image does.
+        let page = u32::try_from(PAGE).unwrap();
+        let mut file = NroBuilder::new(&[a64::nop()])
+            .rodata(b"rodata")
+            .data(b"data")
+            .bss_size(1)
+            .build()
+            .unwrap();
+        assert_eq!(file.len() as u64, 3 * PAGE);
+        set_segment(&mut file, 1, 0, 0);
+        set_segment(&mut file, 2, page, page);
+        let placed = place(&Program::parse(&file).unwrap(), RAM_BASE, RAM_SIZE, None).unwrap();
+        // Eden's read-write range would be the second and third pages, leaving .bss (the
+        // fourth) without guest access. Here the third page has none and .bss is read-write.
+        assert_eq!(
+            placed.regions[..4],
+            [
+                region(RAM_BASE, 1, Perms::ReadExecute),
+                region(RAM_BASE + PAGE, 1, Perms::ReadWrite),
+                region(RAM_BASE + 2 * PAGE, 1, Perms::None),
+                region(RAM_BASE + 3 * PAGE, 1, Perms::ReadWrite),
+            ]
+        );
+        assert!(placed.mappings.contains(&mapping(
+            "main.bss",
+            RAM_BASE + 3 * PAGE,
+            RAM_BASE + 4 * PAGE
+        )));
     }
 
     #[test]
