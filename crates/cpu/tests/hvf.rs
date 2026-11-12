@@ -22,7 +22,8 @@ use starquake_cpu::hvf::{
     HvfBackend, HvfVcpu, MAX_PAGE_FLUSHES, PacKeys, PhysicalMemory, RamConfig,
 };
 use starquake_cpu::{
-    Backend, Error, ExceptionClass, Exit, FaultStatus, GuestRegs, Interrupter, Syndrome, Vcpu,
+    Backend, Error, ExceptionClass, Exit, FaultStatus, GUEST_PSTATE_MASK, GuestRegs, Interrupter,
+    PSTATE_DIT, PSTATE_NZCV, PSTATE_SSBS, Syndrome, VECTOR_REGS, Vcpu,
 };
 use starquake_memory::stage1::{
     FlushRange, Stage1Tables, TableRoot, VA_SPACE_END, WalkError, translate,
@@ -1290,12 +1291,14 @@ fn registers_round_trip_and_survive_an_exit() {
 }
 
 #[test]
-fn pstate_keeps_only_the_condition_flags() {
+fn pstate_keeps_only_the_guests_bits() {
     let Some(guest) = Guest::new() else { return };
-    let mut vcpu = guest.vcpu(&[SVC_0], |regs| regs.pstate = 0xf000_03c5);
-    assert_eq!(vcpu.regs().unwrap().pstate, 0xf000_0000);
-    // Even with EL1h requested, the guest still runs at EL0: its svc reaches the host.
+    // Every bit asked for, EL1h and the interrupt masks among them.
+    let mut vcpu = guest.vcpu(&[SVC_0], |regs| regs.pstate = u64::MAX);
+    assert_eq!(vcpu.regs().unwrap().pstate, GUEST_PSTATE_MASK);
+    // Still the guest runs at EL0: its svc reaches the host.
     assert_eq!(vcpu.run().unwrap(), Exit::Svc(0));
+    assert_eq!(vcpu.regs().unwrap().pstate, GUEST_PSTATE_MASK);
 }
 
 #[test]
@@ -1638,6 +1641,44 @@ fn code_written_in_pieces_is_seen_whole() {
 }
 
 #[test]
+fn code_the_guest_rewrites_runs_after_its_own_cache_maintenance() {
+    let Some(guest) = Guest::new() else { return };
+    // The guest stores the word in w1 at the address in x2, makes it visible to instruction
+    // fetches the way the architecture asks of EL0 code (Arm ARM, "Concurrent modification and
+    // execution of instructions": `dc cvau`, `dsb ish`, `ic ivau`, `dsb ish`, `isb`; assembled
+    // with LLVM), and jumps to it. What it jumps to is `movz x0, #i; svc #7`, the `movz` being
+    // the word it stored. The host writes only the svc, once, so no host-side maintenance
+    // touches the rewritten line in the loop.
+    let target = guest.data();
+    guest
+        .memory()
+        .write(target + 4, &svc(7).to_le_bytes())
+        .unwrap();
+    let mut vcpu = guest.vcpu(
+        &[
+            0xb900_0041, // 0x00  str w1, [x2]
+            0xd50b_7b22, // 0x04  dc  cvau, x2
+            0xd503_3b9f, // 0x08  dsb ish
+            0xd50b_7522, // 0x0c  ic  ivau, x2
+            0xd503_3b9f, // 0x10  dsb ish
+            0xd503_3fdf, // 0x14  isb
+            0xd61f_0040, // 0x18  br  x2
+        ],
+        |_| {},
+    );
+    let base = guest.base();
+    for i in 1..=200u16 {
+        let mut regs = vcpu.regs().unwrap();
+        regs.pc = base;
+        regs.x[1] = u64::from(movz_x0(i));
+        regs.x[2] = target;
+        vcpu.set_regs(&regs).unwrap();
+        assert_eq!(vcpu.run().unwrap(), Exit::Svc(7), "rewrite {i}");
+        assert_eq!(vcpu.regs().unwrap().x[0], u64::from(i), "rewrite {i}");
+    }
+}
+
+#[test]
 fn a_new_vm_never_runs_the_previous_vms_code() {
     // Each VM's RAM is fresh host memory, which the allocator and the kernel hand out again from
     // pages an earlier VM's guest executed. Alternate two programs at the same address, with the
@@ -1653,6 +1694,413 @@ fn a_new_vm_never_runs_the_previous_vms_code() {
         })
         .join()
         .unwrap();
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// FP/SIMD state and PSTATE: what a context switch saves and restores.
+// ---------------------------------------------------------------------------------------------
+
+/// Vector register helpers. In a `cfg(test)` module so they may unwrap like the tests do.
+#[cfg(test)]
+mod vectors {
+    use super::VECTOR_REGS;
+
+    /// `stp qT, qT+1, [x0], #32`: stores a pair of vector registers and steps x0 past them
+    /// (Arm ARM, "STP (SIMD&FP)", post-index, opc = 0b10; `Rt` bits 4:0, `Rn` 9:5, `Rt2`
+    /// 14:10).
+    pub(crate) fn stp_q_pair(t: u32) -> u32 {
+        0xac81_0000 | ((t + 1) << 10) | t
+    }
+
+    /// `ldp qT, qT+1, [x0], #32`: the load of the same pair ("LDP (SIMD&FP)").
+    pub(crate) fn ldp_q_pair(t: u32) -> u32 {
+        0xacc1_0000 | ((t + 1) << 10) | t
+    }
+
+    /// The sixteen pair stores (or loads) that cover V0-V31, in register order.
+    pub(crate) fn every_vector_pair(pair: fn(u32) -> u32) -> Vec<u32> {
+        (0..u32::try_from(VECTOR_REGS).unwrap())
+            .step_by(2)
+            .map(pair)
+            .collect()
+    }
+
+    /// A value for `Vn` that differs from every other register's, and whose sixteen bytes all
+    /// differ (`n`, then `0x90`-`0x96`; `0x40 + n`, then `0xe0`-`0xe6`), so a swapped register,
+    /// half or byte order shows.
+    pub(crate) fn vector_value(n: usize) -> u128 {
+        let n = u128::try_from(n).unwrap();
+        (0xe6e5_e4e3_e2e1_e040_u128 + n) << 64 | (0x9695_9493_9291_9000_u128 + n)
+    }
+}
+
+use vectors::{every_vector_pair, ldp_q_pair, stp_q_pair, vector_value};
+
+/// `mrs x1, fpcr`, `mrs x2, fpsr`, `msr fpcr, x1`, `msr fpsr, x2` (assembled with LLVM).
+const MRS_X1_FPCR: u32 = 0xd53b_4401;
+const MRS_X2_FPSR: u32 = 0xd53b_4422;
+const MSR_FPCR_X1: u32 = 0xd51b_4401;
+const MSR_FPSR_X2: u32 = 0xd51b_4422;
+
+/// `FPCR` with default NaN (bit 25), flush-to-zero (24) and round toward zero (`RMode` =
+/// 0b11, bits 23:22) set: Arm ARM, `FPCR`.
+const FPCR_DN_FZ_RZ: u64 = (1 << 25) | (1 << 24) | (0b11 << 22);
+/// `FPSR` with the saturation flag `QC` (bit 27), inexact `IXC` (4) and divide-by-zero `DZC`
+/// (1) set: Arm ARM, `FPSR`.
+const FPSR_QC_IXC_DZC: u64 = (1 << 27) | (1 << 4) | (1 << 1);
+/// `FPSR` with only the overflow flag `OFC` (bit 2) set: Arm ARM, `FPSR`.
+const FPSR_OFC: u64 = 1 << 2;
+
+#[test]
+fn fp_state_set_by_the_host_is_what_the_guest_reads() {
+    let Some(guest) = Guest::new() else { return };
+    let dump = guest.data();
+    let mut program = every_vector_pair(stp_q_pair);
+    program.extend([MRS_X1_FPCR, MRS_X2_FPSR, SVC_0]);
+    let mut vcpu = guest.vcpu(&program, |regs| {
+        regs.x[0] = dump;
+        for (n, v) in regs.v.iter_mut().enumerate() {
+            *v = vector_value(n);
+        }
+        regs.fpcr = FPCR_DN_FZ_RZ;
+        regs.fpsr = FPSR_QC_IXC_DZC;
+    });
+    assert_eq!(vcpu.run().unwrap(), Exit::Svc(0));
+    let mut stored = vec![0; VECTOR_REGS * 16];
+    guest.memory().read(dump, &mut stored).unwrap();
+    let (registers, rest) = stored.as_chunks::<16>();
+    assert_eq!(rest, []);
+    for (n, bytes) in registers.iter().enumerate() {
+        assert_eq!(*bytes, vector_value(n).to_le_bytes(), "v{n}");
+    }
+    let x = vcpu.regs().unwrap().x;
+    assert_eq!((x[1], x[2]), (FPCR_DN_FZ_RZ, FPSR_QC_IXC_DZC));
+}
+
+#[test]
+fn fp_state_written_by_the_guest_is_what_the_host_reads() {
+    let Some(guest) = Guest::new() else { return };
+    let source = guest.data();
+    let bytes: Vec<u8> = (0..VECTOR_REGS)
+        .flat_map(|n| vector_value(n).to_le_bytes())
+        .collect();
+    guest.memory().write(source, &bytes).unwrap();
+    let mut program = every_vector_pair(ldp_q_pair);
+    program.extend([MSR_FPCR_X1, MSR_FPSR_X2, SVC_0]);
+    let mut vcpu = guest.vcpu(&program, |regs| {
+        regs.x[0] = source;
+        regs.x[1] = FPCR_DN_FZ_RZ;
+        regs.x[2] = FPSR_QC_IXC_DZC;
+    });
+    // Before it runs, the host sees the zeroes it set.
+    let before = vcpu.regs().unwrap();
+    assert_eq!(
+        (before.v, before.fpcr, before.fpsr),
+        ([0; VECTOR_REGS], 0, 0)
+    );
+    assert_eq!(vcpu.run().unwrap(), Exit::Svc(0));
+    let after = vcpu.regs().unwrap();
+    for (n, &v) in after.v.iter().enumerate() {
+        assert_eq!(v, vector_value(n), "v{n}");
+    }
+    assert_eq!((after.fpcr, after.fpsr), (FPCR_DN_FZ_RZ, FPSR_QC_IXC_DZC));
+    // The guest's state survives a host round trip unchanged.
+    vcpu.set_regs(&after).unwrap();
+    assert_eq!(vcpu.regs().unwrap(), after);
+}
+
+#[test]
+fn a_thread_moved_to_another_vcpu_keeps_its_rounding_mode_and_flags() {
+    let Some(guest) = Guest::new() else { return };
+    // The thread rounds x0 as a double to an integer with the rounding mode in FPCR
+    // (`frintx`, which also raises inexact), twice: once on each vCPU, with a context switch at
+    // the svc between.
+    let program = [
+        0x9e67_0000, // 0x00  fmov   d0, x0
+        0x1e67_4001, // 0x04  frintx d1, d0
+        0x9e66_0020, // 0x08  fmov   x0, d1
+        svc(1),      // 0x0c
+        0x1e67_4002, // 0x10  frintx d2, d0
+        0x9e66_0040, // 0x14  fmov   x0, d2
+        MRS_X2_FPSR, // 0x18
+        svc(2),      // 0x1c
+    ];
+    let mut first = guest.vcpu(&program, |regs| {
+        regs.x[0] = 2.75f64.to_bits();
+        regs.fpcr = FPCR_DN_FZ_RZ;
+    });
+    assert_eq!(first.run().unwrap(), Exit::Svc(1));
+    let saved = first.regs().unwrap();
+    // Rounded toward zero, and inexact: FPSR.IXC (bit 4) is set.
+    assert_eq!(saved.x[0], 2.0f64.to_bits());
+    assert_eq!(saved.fpsr, 1 << 4);
+    assert_eq!(saved.v[0], u128::from(2.75f64.to_bits()));
+
+    // The second vCPU is on another host thread (a vCPU belongs to the thread that made it,
+    // and each thread may have one), and last ran another guest thread, with the default
+    // rounding mode (to nearest) and other vector registers.
+    // The moved context also carries flags the code it resumes cannot raise (`QC`, `DZC`), and
+    // the other thread leaves a different flag (`OFC`) behind, so only a restored `FPSR` reads
+    // back as the moved one.
+    let backend = Arc::clone(&guest.backend);
+    let (root, pc) = (guest.root(), guest.base());
+    let mut resumed = saved.clone();
+    resumed.fpsr = FPSR_QC_IXC_DZC;
+    let moved_fpsr = resumed.fpsr;
+    let after = std::thread::spawn(move || {
+        let mut second = support::new_vcpu(&backend, root);
+        let mut other = GuestRegs {
+            pc,
+            v: [u128::MAX; VECTOR_REGS],
+            fpsr: FPSR_OFC,
+            ..GuestRegs::default()
+        };
+        other.x[0] = 2.75f64.to_bits();
+        second.set_regs(&other).unwrap();
+        assert_eq!(second.run().unwrap(), Exit::Svc(1));
+        assert_eq!(second.regs().unwrap().x[0], 3.0f64.to_bits());
+        second.set_regs(&resumed).unwrap();
+        assert_eq!(second.run().unwrap(), Exit::Svc(2));
+        second.regs().unwrap()
+    })
+    .join()
+    .unwrap();
+    // Still rounding toward zero, from the d0 the thread left, with exactly its flags.
+    assert_eq!(after.x[0], 2.0f64.to_bits());
+    assert_eq!(after.x[2], moved_fpsr);
+    assert_eq!(after.v[0], saved.v[0]);
+    assert_eq!(after.v[3..], saved.v[3..]);
+}
+
+/// The `FPCR` fields every AArch64 FP unit has and the test needs kept: `AHP` (bit 26), `DN`
+/// (25), `FZ` (24), `RMode` (23:22). Arm ARM, `FPCR`.
+const FPCR_CORE_FIELDS: u64 = (1 << 26) | (1 << 25) | (1 << 24) | (0b11 << 22);
+/// The `FPSR` flags: `QC` (bit 27), `IDC` (7), `IXC`, `UFC`, `OFC`, `DZC`, `IOC` (4:0). Arm ARM,
+/// `FPSR`.
+const FPSR_FLAGS: u64 = (1 << 27) | (1 << 7) | 0b1_1111;
+
+#[test]
+fn after_a_run_the_host_reads_the_fpcr_and_fpsr_the_guest_reads() {
+    let Some(guest) = Guest::new() else { return };
+    // Every bit asked for: the FP unit keeps the ones it implements.
+    let mut vcpu = guest.vcpu(&[MRS_X1_FPCR, MRS_X2_FPSR, SVC_0], |regs| {
+        regs.fpcr = u64::MAX;
+        regs.fpsr = u64::MAX;
+    });
+    assert_eq!(vcpu.run().unwrap(), Exit::Svc(0));
+    let after = vcpu.regs().unwrap();
+    assert_eq!((after.fpcr, after.fpsr), (after.x[1], after.x[2]));
+    assert_eq!(after.fpcr & FPCR_CORE_FIELDS, FPCR_CORE_FIELDS);
+    assert_eq!(after.fpsr & FPSR_FLAGS, FPSR_FLAGS);
+    // Both are 32-bit registers held in 64 bits.
+    assert_eq!((after.fpcr >> 32, after.fpsr >> 32), (0, 0));
+    // A context with those values loads back unchanged.
+    vcpu.set_regs(&after).unwrap();
+    assert_eq!(vcpu.regs().unwrap(), after);
+    // Before a run, the host reads back the low 32 bits of what it wrote: the FP unit has not
+    // seen them yet (measured; see "Registers" in the backend's docs).
+    drop(vcpu);
+    let unrun = guest.vcpu(&[SVC_0], |regs| regs.fpcr = u64::MAX);
+    assert_eq!(unrun.regs().unwrap().fpcr, u64::from(u32::MAX));
+}
+
+#[test]
+fn a_guest_that_enables_a_floating_point_trap_takes_it_on_this_host() {
+    let Some(guest) = Guest::new() else { return };
+    // `FPCR.DZE` (bit 9) enables the divide-by-zero trap (Arm ARM, `FPCR`). The Apple M2 keeps
+    // it, so the division traps and the run would crash. A listed divergence from Eden, whose
+    // `FPProcessException` (`eden/src/dynarmic/src/dynarmic/common/fp/process_exception.cpp`)
+    // asserts the enable is clear and never delivers the exception: under Eden the bit has no
+    // effect (see "Registers" in the backend's docs).
+    let program = [
+        0x1e6e_1000, // 0x00  fmov d0, #1.0
+        0x9e67_03e1, // 0x04  fmov d1, xzr
+        0x1e61_1802, // 0x08  fdiv d2, d0, d1
+        SVC_0,       // 0x0c
+    ];
+    let mut vcpu = guest.vcpu(&program, |regs| regs.fpcr = 1 << 9);
+    let pc = guest.base() + 8;
+    let exit = vcpu.run().unwrap();
+    let trapped = match exit {
+        Exit::Undefined { pc: at, syndrome } => Some((at, syndrome.class())),
+        _ => None,
+    };
+    assert_eq!(trapped, Some((pc, ExceptionClass::Other(0x2c))), "{exit:?}");
+    drop(vcpu);
+    // Without the enable the same division only sets the flag (`FPSR.DZC`, bit 1).
+    let mut vcpu = guest.vcpu(&program, |_| {});
+    assert_eq!(vcpu.run().unwrap(), Exit::Svc(0));
+    assert_eq!(vcpu.regs().unwrap().fpsr, 1 << 1);
+}
+
+/// `msr dit, #1`, `msr ssbs, #1`, `mrs x0, dit`, `mrs x1, ssbs`, `mrs x2, nzcv` (assembled with
+/// LLVM, `-march=armv8.6-a+ssbs`).
+const MSR_DIT_1: u32 = 0xd503_415f;
+const MSR_SSBS_1: u32 = 0xd503_413f;
+const MRS_X0_DIT: u32 = 0xd53b_42a0;
+const MRS_X1_SSBS: u32 = 0xd53b_42c1;
+const MRS_X2_NZCV: u32 = 0xd53b_4202;
+/// `cmp x0, x0`: sets Z and C.
+const CMP_X0_X0: u32 = 0xeb00_001f;
+
+#[test]
+fn pstate_bits_the_guest_sets_reach_the_host() {
+    let Some(guest) = Guest::new() else { return };
+    // Each bit alone, then all of them.
+    let cases: [(&[u32], u64); 3] = [
+        (&[MSR_DIT_1], PSTATE_DIT),
+        (&[MSR_SSBS_1], PSTATE_SSBS),
+        (
+            &[MSR_DIT_1, MSR_SSBS_1, CMP_X0_X0],
+            PSTATE_DIT | PSTATE_SSBS | 0x6000_0000,
+        ),
+    ];
+    for (code, expected) in cases {
+        let mut program = code.to_vec();
+        program.push(SVC_0);
+        let mut vcpu = guest.vcpu(&program, |_| {});
+        assert_eq!(vcpu.run().unwrap(), Exit::Svc(0));
+        assert_eq!(vcpu.regs().unwrap().pstate, expected, "{code:x?}");
+    }
+}
+
+#[test]
+fn pstate_bits_the_host_sets_reach_the_guest() {
+    let Some(guest) = Guest::new() else { return };
+    let program = [MRS_X0_DIT, MRS_X1_SSBS, MRS_X2_NZCV, SVC_0];
+    for pstate in [
+        PSTATE_DIT,
+        PSTATE_SSBS,
+        PSTATE_NZCV,
+        0x9000_0000, // N and V
+        0,
+    ] {
+        let mut vcpu = guest.vcpu(&program, |regs| regs.pstate = pstate);
+        assert_eq!(vcpu.regs().unwrap().pstate, pstate, "{pstate:#x}");
+        assert_eq!(vcpu.run().unwrap(), Exit::Svc(0));
+        let x = vcpu.regs().unwrap().x;
+        assert_eq!(x[0], pstate & PSTATE_DIT, "{pstate:#x}");
+        assert_eq!(x[1], pstate & PSTATE_SSBS, "{pstate:#x}");
+        assert_eq!(x[2], pstate & PSTATE_NZCV, "{pstate:#x}");
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Wait hints: `wfi`, `wfe` and their friends at EL0.
+// ---------------------------------------------------------------------------------------------
+
+/// `wfe`, `wfi`, `sevl`, `sev`, `yield` (Arm ARM, "Hint instructions"; assembled with LLVM).
+const WFE: u32 = 0xd503_205f;
+const WFI: u32 = 0xd503_207f;
+const SEVL: u32 = 0xd503_20bf;
+const SEV: u32 = 0xd503_209f;
+const YIELD: u32 = 0xd503_203f;
+
+#[test]
+fn wait_hints_resume_past_themselves_without_an_exit() {
+    let Some(guest) = Guest::new() else { return };
+    // `sevl; wfe` is how a spinlock primes its first wait: the local event is set, so the wfe
+    // returns at once on hardware. The bare `wfe` and `wfi` would wait for an event or an
+    // interrupt that never comes; here they must come back too.
+    let program = [
+        SEVL,
+        WFE,
+        WFE,
+        WFI,
+        SEVL,
+        WFE,
+        SEV,
+        YIELD,
+        movz_x0(0x77),
+        svc(4),
+    ];
+    let mut vcpu = guest.vcpu(&program, |regs| regs.x[1] = 0x1111);
+    assert_eq!(vcpu.run().unwrap(), Exit::Svc(4));
+    let regs = vcpu.regs().unwrap();
+    assert_eq!(regs.x[0], 0x77);
+    assert_eq!(regs.x[1], 0x1111);
+    assert_eq!(regs.pc, guest.base() + 4 * program.len() as u64);
+}
+
+#[test]
+fn each_trapped_wait_is_stepped_over_once() {
+    const ITERATIONS: u64 = 100_000;
+    const BOUND: Duration = Duration::from_secs(10);
+    let Some(guest) = Guest::new() else { return };
+    // A counted loop of trapped `wfi`s. Stepped over, each costs one exit: the whole loop takes
+    // under 0.1 s on an Apple M2. Resumed on the `wfi` itself, each traps again and again
+    // before the host lets it through, and the loop had not ended when the bound passed
+    // (measured on the same M2 with the step's new pc replaced by the old one), so the run is
+    // interrupted instead.
+    let program = [
+        WFI,         // 0x00
+        0xf100_0400, // 0x04  subs x0, x0, #1
+        0x54ff_ffc1, // 0x08  b.ne 0x00
+        SVC_0,       // 0x0c
+    ];
+    let mut vcpu = guest.vcpu(&program, |regs| regs.x[0] = ITERATIONS);
+    let interrupter = vcpu.interrupter();
+    let (done, finished) = mpsc::channel::<()>();
+    // The waker interrupts the run once the bound has passed, so a backend that does not step
+    // fails this test instead of hanging it. Dropping `done` tells it the run has ended.
+    let waker = std::thread::spawn(move || {
+        if finished.recv_timeout(BOUND) == Err(mpsc::RecvTimeoutError::Timeout) {
+            interrupter.interrupt().unwrap();
+        }
+    });
+    let started = Instant::now();
+    let exit = vcpu.run();
+    let took = started.elapsed();
+    drop(done);
+    waker.join().unwrap();
+    assert_eq!(exit, Ok(Exit::Svc(0)), "after {took:?}");
+    let regs = vcpu.regs().unwrap();
+    assert_eq!(regs.x[0], 0);
+    assert_eq!(regs.pc, guest.base() + 4 * program.len() as u64);
+}
+
+#[test]
+fn a_guest_waiting_in_a_loop_can_still_be_interrupted() {
+    let Some(guest) = Guest::new() else { return };
+    let flag = guest.data();
+    for wait in [WFI, WFE] {
+        write_u64(&guest.memory(), flag, 0);
+        let mut vcpu = guest.vcpu(
+            &[
+                0x5280_0021, // 0x00  mov w1, #1
+                0xb900_0001, // 0x04  str w1, [x0]
+                wait,        // 0x08  wfi or wfe
+                0x17ff_ffff, // 0x0c  b 0x08
+            ],
+            |regs| regs.x[0] = flag,
+        );
+        let interrupter = vcpu.interrupter();
+        let memory = guest.memory();
+        // The waker interrupts once the guest is provably in its loop, or after 60 s at the
+        // latest, so a broken backend fails this test instead of hanging it.
+        let waker = std::thread::spawn(move || {
+            let started = Instant::now();
+            let mut ran = read_u64(&memory, flag) != 0;
+            while !ran && started.elapsed() < Duration::from_secs(60) {
+                std::thread::yield_now();
+                ran = read_u64(&memory, flag) != 0;
+            }
+            interrupter.interrupt().unwrap();
+            ran
+        });
+        let exit = vcpu.run();
+        assert!(
+            waker.join().unwrap(),
+            "{wait:#x}: the guest never reached its loop"
+        );
+        assert_eq!(exit, Ok(Exit::Interrupted), "{wait:#x}");
+        let pc = vcpu.regs().unwrap().pc;
+        let base = guest.base();
+        assert!(
+            (base + 0x08..=base + 0x0c).contains(&pc),
+            "{wait:#x}: {pc:#x}"
+        );
     }
 }
 

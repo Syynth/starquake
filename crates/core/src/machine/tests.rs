@@ -22,7 +22,7 @@ use starquake_trace::{
 
 use super::*;
 use crate::clock::PROCESS_COUNTER_RATE;
-use crate::crash::Location;
+use crate::crash::{Location, SyndromeReport};
 use crate::image::{Loaded, Program, load};
 use crate::report::{empty_dump, exit_code};
 use crate::space::SpaceError;
@@ -359,6 +359,11 @@ fn a_data_abort_is_a_crash_that_names_the_address_and_the_instruction() {
     );
     assert_eq!(report_crash.pc, instruction);
     assert_eq!(
+        report_crash.syndrome,
+        Some(SyndromeReport::new(UNMAPPED_STORE)),
+        "the report carries the exit's syndrome"
+    );
+    assert_eq!(
         report_crash.pc_location,
         Some(Location {
             module: "main".into(),
@@ -411,6 +416,12 @@ fn an_instruction_abort_is_a_crash_that_names_the_address_fetched_from() {
     assert_eq!(report.exit_code(), exit_code::GUEST_CRASHED);
     let crash = report.crash().expect("a crash report");
     assert_eq!(crash.exception, Exception::InstructionAbort { address });
+    assert_eq!(
+        crash.syndrome,
+        Some(SyndromeReport::new(Syndrome::instruction_abort(
+            FaultStatus::Permission { level: 3 }
+        )))
+    );
     assert_eq!(crash.pc, address);
     assert_eq!(crash.pc_location, None);
     assert_eq!(crash.fault_mapping.as_deref(), Some("stack"));
@@ -426,21 +437,79 @@ fn an_instruction_abort_is_a_crash_that_names_the_address_fetched_from() {
 }
 
 #[test]
+fn each_abort_crash_carries_its_own_exits_syndrome() {
+    // Two different syndromes per abort kind, so a report that carried a fixed syndrome in place
+    // of the exit's would get one of each pair wrong.
+    let crash = programs::crash().unwrap();
+    for syndrome in [
+        UNMAPPED_STORE,
+        Syndrome::data_abort(FaultStatus::Permission { level: 3 }, true),
+    ] {
+        let guest = Guest::new(&crash.nro);
+        let instruction = guest.placed.entry + crash.store_offset;
+        let address = crash.fault_address;
+        let vcpu = ScriptedVcpu::new().then(
+            move |regs| regs.pc = instruction,
+            Exit::DataAbort {
+                address,
+                write: true,
+                syndrome,
+            },
+        );
+        let report = guest.run(vcpu, &RunOptions::default());
+        let report_crash = report.crash().expect("a crash report");
+        assert_eq!(
+            report_crash.syndrome,
+            Some(SyndromeReport::new(syndrome)),
+            "{:#x}",
+            syndrome.esr()
+        );
+    }
+    for syndrome in [
+        Syndrome::instruction_abort(FaultStatus::Translation { level: 2 }),
+        Syndrome::instruction_abort(FaultStatus::Permission { level: 3 }),
+    ] {
+        let guest = Guest::new(&programs::hello().unwrap());
+        let address = guest.start_of("stack") + 0x40;
+        let vcpu = ScriptedVcpu::new().then(
+            move |regs| regs.pc = address,
+            Exit::InstructionAbort { address, syndrome },
+        );
+        let report = guest.run(vcpu, &RunOptions::default());
+        let crash = report.crash().expect("a crash report");
+        assert_eq!(
+            crash.syndrome,
+            Some(SyndromeReport::new(syndrome)),
+            "{:#x}",
+            syndrome.esr()
+        );
+    }
+}
+
+#[test]
 fn an_undefined_instruction_is_a_crash_at_its_address() {
     let guest = Guest::new(&programs::hello().unwrap());
     let pc = guest.placed.entry + 0x40;
+    // A `brk #0x123` (class 0x3c, `IL`, the immediate in `ISS`), not the plain undefined
+    // syndrome, so the report shows the one the exit carried.
+    let brk = Syndrome::from_esr(0xf200_0123);
     let vcpu = ScriptedVcpu::new().then(
         move |regs| regs.pc = pc,
-        Exit::Undefined {
-            pc,
-            syndrome: Syndrome::undefined(),
-        },
+        Exit::Undefined { pc, syndrome: brk },
     );
     let report = guest.run(vcpu, &RunOptions::default());
     assert_eq!(report.exit_code(), exit_code::GUEST_CRASHED);
     let crash = report.crash().expect("a crash report");
     assert_eq!(crash.exception, Exception::UndefinedInstruction);
     assert_eq!(crash.pc, pc);
+    assert_eq!(crash.syndrome, Some(SyndromeReport::new(brk)));
+    assert!(
+        crash
+            .to_text()
+            .contains("syndrome: 0xf2000123 (brk #0x123)\n"),
+        "{}",
+        crash.to_text()
+    );
     assert_eq!(
         crash.pc_location.as_ref().map(|location| location.offset),
         Some(0x40)

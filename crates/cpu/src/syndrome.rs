@@ -15,7 +15,9 @@
 //! What a real vCPU has reported (the hardware tests in `tests/hvf.rs` and
 //! `src/hvf/hardware.rs`, and `tools/hvprobe/README.md`): classes 0x00 (an undefined
 //! instruction), 0x15 (`svc`), 0x18 (a trapped system register access), 0x1c (a failed pointer
-//! authentication), 0x20, 0x24 and 0x3c (`brk`); translation faults at levels 0 to 3 and
+//! authentication), 0x20, 0x24, 0x2c (a trapped floating-point exception, which has no name
+//! here) and 0x3c (`brk`), and, in `ESR_EL2` from the hypervisor rather than from EL0, 0x01 (a
+//! trapped `wfi`, `0x07e0_0000`); translation faults at levels 0 to 3 and
 //! permission faults at level 3. For those aborts the whole syndrome was exactly what
 //! [`Syndrome::data_abort`] and [`Syndrome::instruction_abort`] build: no other `ISS` bit was
 //! set. The other encodings below are taken from the manual and have not been seen on
@@ -42,6 +44,10 @@ const FSC_ALIGNMENT: u8 = 0b10_0001;
 pub enum ExceptionClass {
     /// 0x00, "unknown reason": an instruction that is undefined at EL0.
     Unknown,
+    /// 0x01: a trapped `wfi` or `wfe` (`ISS.TI` says which). EL0 never takes it with the
+    /// configuration the backends use; it is what the hypervisor reports when it traps a
+    /// guest's `wfi` to the host.
+    TrappedWait,
     /// 0x15: `svc` in AArch64 state.
     Svc,
     /// 0x18: a trapped `msr`, `mrs` or system instruction.
@@ -70,6 +76,7 @@ impl ExceptionClass {
     pub const fn from_ec(ec: u8) -> Self {
         match ec & 0x3f {
             0x00 => Self::Unknown,
+            0x01 => Self::TrappedWait,
             0x15 => Self::Svc,
             0x18 => Self::TrappedSystemAccess,
             0x1c => Self::PointerAuthentication,
@@ -87,6 +94,7 @@ impl ExceptionClass {
     pub const fn ec(self) -> u8 {
         match self {
             Self::Unknown => 0x00,
+            Self::TrappedWait => 0x01,
             Self::Svc => 0x15,
             Self::TrappedSystemAccess => 0x18,
             Self::PointerAuthentication => 0x1c,
@@ -269,6 +277,7 @@ mod tests {
     fn named_classes_have_the_architecture_values() {
         let named = [
             (ExceptionClass::Unknown, 0x00),
+            (ExceptionClass::TrappedWait, 0x01),
             (ExceptionClass::Svc, 0x15),
             (ExceptionClass::TrappedSystemAccess, 0x18),
             (ExceptionClass::PointerAuthentication, 0x1c),

@@ -11,7 +11,7 @@ each kind of line is compared.
 | | |
 |---|---|
 | Emulator | Eden-NX2 at commit `50fa86bbbc40` (`eden-nx2` in `docs/references.md`), built and run as `docs/reference-emulator.md` says, with the one patch it names (`tools/oracle/eden-nx2-oracle.patch`: a window-title fix, nothing the guest can see) |
-| Run | `tools/oracle/run-nro.sh` (null renderer, one core, the emulator's own system-call and IPC trace switches, default settings otherwise: a 4 GiB console), then `tools/oracle/summarize.py`, whose `startup.txt` is what `normalise.py` reads |
+| Run | `tools/oracle/run-nro.sh` (null renderer, one core, the emulator's own system-call and IPC trace switches, default settings otherwise: a 4 GiB console), then `tools/oracle/summarize.py`, whose `startup.txt` is what `tools/oracle/normalise.py` reads |
 | Program | `../hello.nro`, SHA-256 `d21c81c6e795ab9981e0757bf2b4b23184e974c30ded266e3098a468e7fb20df` (the hash `../manifest.toml` records) |
 | Recorded | 2026-11-11, three runs |
 
@@ -28,7 +28,7 @@ and its `ExitProcess` returned to the guest, which this format does not show.
 
 ## Format
 
-`normalise.py` (in this folder) wrote the file; its header says how. One line per event, in the
+`tools/oracle/normalise.py` wrote the file; its module docs say how. One line per event, in the
 order the emulator logged them, all on the program's one thread:
 
 ```text
@@ -60,7 +60,7 @@ log starquake hello: line one
 With the `startup.txt` of a run (`docs/reference-emulator.md`, "Running it"):
 
 ```sh
-tests/homebrew/hello/reference/normalise.py <run-folder>/startup.txt > normalised.txt
+tools/oracle/normalise.py --nro tests/homebrew/hello/hello.nro <run-folder>/startup.txt > normalised.txt
 ```
 
 and put the file's five header lines back in front. The script refuses a trace it does not
