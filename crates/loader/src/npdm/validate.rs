@@ -2,16 +2,41 @@
 //! it ([`Acid::permits`], [`Npdm::validate_against_acid`]), and the main thread against the
 //! capabilities and core count ([`Npdm::check_main_thread`]).
 //!
-//! # Every rule here is a guess
+//! # Sources, rule by rule
 //!
-//! None of the pinned references checks `ACI0` against `ACID` (Eden and Eden-NX2 read both blocks
-//! and trust them), and the SwitchBrew NPDM page, which names the fields, does not state the
-//! subset rules. The rules below are the least permissive reading of "`ACID` is the signed bound
-//! on what `ACI0` asks for": a request must be covered field by field, and where a capability has
-//! no ordering (program type, kernel version) it must be equal. Each is pinned by a test and none
-//! is checked against a console or a retail file. A title that fails a rule here may still be
-//! accepted by the console; use [`Npdm::validate_against_acid`] as a diagnostic or a strict mode,
-//! not as the reason a title is refused, until the rules are confirmed.
+//! Eden and Eden-NX2 read both blocks and trust them. Atmosphère checks an `ACI0` against its
+//! `ACID` in three places, all @ 4e3f3703 and read as facts only: its loader's `ValidateMeta`
+//! (`atmosphere/stratosphere/loader/source/ldr_process_creation.cpp`: the program id range) and
+//! `TestCapability` (`atmosphere/stratosphere/loader/source/ldr_capabilities.cpp`: the kernel
+//! capabilities, one `IsValid` per descriptor type), and its sm's `ValidateAccessControl`
+//! (the service lists; see
+//! [`ServiceAccess::covers`](super::service_access::ServiceAccess::covers)). Rule by rule:
+//!
+//! | Rule | Atmosphère | Here |
+//! |---|---|---|
+//! | Title id | `program_id_min <= program_id <= program_id_max` | Same |
+//! | File permissions | Never refused. pm passes the `ACI0` and `ACID` file access headers to `fsprRegisterProgram` (`atmosphere/stratosphere/pm/source/impl/pm_process_manager.cpp`), and fs's `AccessControl::AccessControl` (`atmosphere/libraries/libstratosphere/source/fssrv/fssrv_access_control.cpp`) sets `m_flag_bits = data.flag_bits & desc.flag_bits` after masking the descriptor, and to none when the two versions differ or are below 1 | **Divergence**: stricter. A request for bits outside the `ACID`'s is `FilePermissionsNotAllowed` here, where Atmosphère intersects the two and the title runs with fewer permissions |
+//! | Services | sm `ValidateAccessControl` | Same, except a wildcard request against an exact grant (see [`ServiceAccess::covers`](super::service_access::ServiceAccess::covers)) |
+//! | Cores and priorities | `KernelFlags::IsValid`: inside the `ACID`'s ranges, which must exist | Same |
+//! | SVCs | `SyscallMask::IsValid`: an `ACID` word with the same index and the same mask | **Divergence**: each SVC must be in the `ACID`'s set |
+//! | Memory ranges | `MapRange::IsValid`: inside an `ACID` range whose read-only and "normal" flags are equal | Same (`kind` is the normal flag) |
+//! | IO pages | `MapPage::IsValid`: an `ACID` word equal to the request's | Same: a page of the same kind at the same address |
+//! | Regions | `MapRegion::IsValid`: an `ACID` entry for the region, read-only only if the request is | Same |
+//! | Interrupts | `InterruptPair::IsValid`: each id is in an `ACID` pair, or an `ACID` pair is two padding ids (0x3FF) | **Divergence**: padding ids are dropped when decoding, so neither form of padding counts |
+//! | Program type, kernel version | `ApplicationType`/`KernelVersion::IsValid`: equal to the `ACID`'s | Same |
+//! | Handle table | `HandleTable::IsValid`: no larger than the `ACID`'s | Same |
+//! | Debug flags | `DebugFlags::IsValid`: at most one flag set, each also set in the `ACID`, whose descriptor must exist | **Divergence**: no at-most-one rule, a request with no flag set needs no `ACID` descriptor, and the word is compared as the three flags (`AllowDebug`, `ForceDebugProd`, `ForceDebug`, bits 17 to 19) rather than whole: bits 20 to 31 are neither decoded nor compared |
+//! | Unknown types | `ResultUnknownCapability` | **Divergence**: permitted when the `ACID` has the same word, because Switch 2 may add types |
+//!
+//! Each divergence is pinned by a `divergence_*` test in this module. Atmosphère reports the
+//! first failing descriptor in `ACI0` order; [`Acid::permits`] checks rule by rule in the order
+//! of the table above, so with several violations the one reported can differ. All of this is
+//! Atmosphère's Switch 1 behaviour; no Switch 2 source checks these rules. Use
+//! [`Npdm::validate_against_acid`] as a diagnostic or a strict mode, not as the reason a title
+//! is refused.
+//!
+//! `tests/homebrew/hello/main.npdm`, written by switch-tools' `npdmtool`, passes
+//! (`crates/loader/tests/homebrew_fixture.rs`).
 //!
 //! The main-thread rules are the `CreateThread` checks in
 //! `eden/src/core/hle/kernel/svc/svc_thread.cpp` @ cf654052 applied to the main thread's core and
@@ -25,7 +50,8 @@ use super::capabilities::{
 };
 use super::{Aci0, Acid, Npdm};
 
-/// The first rule an `ACI0` breaks against its `ACID`. See the module docs: all rules are guesses.
+/// The first rule an `ACI0` breaks against its `ACID`. See the module docs for where each rule
+/// comes from.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AcidViolation {
     /// The `ACI0` title id is outside the `ACID` title id range.
@@ -172,7 +198,7 @@ pub enum MainThreadViolation {
 
 impl Acid {
     /// Checks that `aci` asks for nothing this `ACID` does not grant, and returns the first rule
-    /// it breaks. The rules are guesses; see the module docs.
+    /// it breaks. The module docs compare each rule with Atmosphère's.
     pub fn permits(&self, aci: &Aci0) -> Result<(), AcidViolation> {
         if !(self.title_id_min..=self.title_id_max).contains(&aci.title_id) {
             return Err(AcidViolation::TitleIdOutOfRange {
@@ -246,7 +272,9 @@ fn permits_capabilities(
                 }
                 _ => false,
             };
-            grant.kind == map.kind && inside && permission_fits(grant.read_only, map.read_only)
+            // `MapRange::IsValid`: both flags equal (`GetFlag() == restriction.GetFlag()` for
+            // read-only, and for the size word's "normal" bit, which is `kind`).
+            grant.kind == map.kind && inside && grant.read_only == map.read_only
         })
     }) {
         return Err(AcidViolation::MemoryMapNotAllowed {
@@ -297,8 +325,12 @@ fn permits_capabilities(
     if let Some(wanted) = request.debug_flags {
         let allowed = bound.debug_flags;
         let allow = allowed.is_some_and(|a| a.allow_debug);
+        let force_prod = allowed.is_some_and(|a| a.force_debug_prod);
         let force = allowed.is_some_and(|a| a.force_debug);
-        if (wanted.allow_debug && !allow) || (wanted.force_debug && !force) {
+        if (wanted.allow_debug && !allow)
+            || (wanted.force_debug_prod && !force_prod)
+            || (wanted.force_debug && !force)
+        {
             return Err(AcidViolation::DebugFlagsNotAllowed);
         }
     }
@@ -314,7 +346,8 @@ fn permits_capabilities(
 
 impl Npdm {
     /// Checks the `ACI0` against the `ACID` (see [`Acid::permits`]). Parsing does not call this:
-    /// whether a violation refuses the title is the caller's policy, and the rules are guesses.
+    /// whether a violation refuses the title is the caller's policy (see the module docs for the
+    /// rules' sources and divergences).
     pub fn validate_against_acid(&self) -> Result<(), AcidViolation> {
         self.acid.permits(&self.aci)
     }
@@ -351,10 +384,10 @@ impl Npdm {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::npdm::capabilities::encode::syscall_mask_words;
+    use crate::npdm::capabilities::encode::{debug_flags, interrupt_pair, syscall_mask_words};
     use crate::npdm::capabilities::{
-        DebugFlags, KernelCapabilities, KernelVersion, MemoryMap, MemoryMapKind, RegionMap,
-        RegionType, ThreadInfo,
+        DebugFlags, KernelCapabilities, KernelVersion, MemoryMap, MemoryMapKind,
+        PADDING_INTERRUPT_ID, RegionMap, RegionType, ThreadInfo,
     };
     use crate::npdm::service_access::ServiceAccess;
     use crate::npdm::{
@@ -428,6 +461,7 @@ mod tests {
                 handle_table_size: Some(0x200),
                 debug_flags: Some(DebugFlags {
                     allow_debug: true,
+                    force_debug_prod: false,
                     force_debug: false,
                 }),
                 unknown: vec![0x1F | (0x55 << 6)],
@@ -459,7 +493,7 @@ mod tests {
                 }),
                 svc_mask: svc_mask(&[1, 3, 0x80]),
                 memory_maps: vec![
-                    map(0x10_1000, 0x2000, true, MemoryMapKind::Static),
+                    map(0x10_1000, 0x2000, false, MemoryMapKind::Static),
                     map(0x40_0000, 0x1000, true, MemoryMapKind::Io),
                 ],
                 region_maps: vec![RegionMap {
@@ -472,6 +506,7 @@ mod tests {
                 handle_table_size: Some(0x100),
                 debug_flags: Some(DebugFlags {
                     allow_debug: true,
+                    force_debug_prod: false,
                     force_debug: false,
                 }),
                 unknown: vec![0x1F | (0x55 << 6)],
@@ -653,6 +688,10 @@ mod tests {
         assert_eq!(one(wrong_kind), denied(wrong_kind));
         let writable = map(0x40_0000, 0x1000, false, MemoryMapKind::Io);
         assert_eq!(one(writable), denied(writable));
+        // Read-only inside a writable grant: Atmosphère's `MapRange::IsValid` needs the flags to
+        // be equal, so a less permissive request is refused too.
+        let read_only = map(0x10_0000, 0x1000, true, MemoryMapKind::Static);
+        assert_eq!(one(read_only), denied(read_only));
         // Sums that overflow 64 bits are never inside a grant.
         let wrap = map(u64::MAX - 0xFFF, 0x2000, false, MemoryMapKind::Static);
         assert_eq!(one(wrap), denied(wrap));
@@ -757,18 +796,50 @@ mod tests {
 
     #[test]
     fn debug_flags_cannot_exceed_the_bound() {
-        let flags = |allow_debug, force_debug| {
+        // The bound allows only `allow_debug`; each of the other two flags alone exceeds it.
+        let flags = |allow_debug, force_debug_prod, force_debug| {
             verdict(|aci| {
                 aci.kernel_capabilities.debug_flags = Some(DebugFlags {
                     allow_debug,
+                    force_debug_prod,
                     force_debug,
                 });
             })
         };
-        assert_eq!(flags(false, false), Ok(()));
-        assert_eq!(flags(true, false), Ok(()));
-        assert_eq!(flags(true, true), Err(AcidViolation::DebugFlagsNotAllowed));
-        assert_eq!(flags(false, true), Err(AcidViolation::DebugFlagsNotAllowed));
+        assert_eq!(flags(false, false, false), Ok(()));
+        assert_eq!(flags(true, false, false), Ok(()));
+        assert_eq!(
+            flags(false, true, false),
+            Err(AcidViolation::DebugFlagsNotAllowed)
+        );
+        assert_eq!(
+            flags(false, false, true),
+            Err(AcidViolation::DebugFlagsNotAllowed)
+        );
+        assert_eq!(
+            flags(true, true, true),
+            Err(AcidViolation::DebugFlagsNotAllowed)
+        );
+        // A bound that grants only one of the force flags does not grant the other.
+        let mut acid = bound();
+        acid.kernel_capabilities.debug_flags = Some(DebugFlags {
+            allow_debug: false,
+            force_debug_prod: true,
+            force_debug: false,
+        });
+        let mut aci = request();
+        aci.kernel_capabilities.debug_flags = Some(DebugFlags {
+            allow_debug: false,
+            force_debug_prod: true,
+            force_debug: false,
+        });
+        assert_eq!(acid.permits(&aci), Ok(()));
+        aci.kernel_capabilities.debug_flags = Some(DebugFlags {
+            allow_debug: false,
+            force_debug_prod: false,
+            force_debug: true,
+        });
+        assert_eq!(acid.permits(&aci), Err(AcidViolation::DebugFlagsNotAllowed));
         // A bound without debug flags permits only an all-clear request.
         let mut acid = bound();
         acid.kernel_capabilities.debug_flags = None;
@@ -779,6 +850,7 @@ mod tests {
         let mut aci = request();
         aci.kernel_capabilities.debug_flags = Some(DebugFlags {
             allow_debug: false,
+            force_debug_prod: false,
             force_debug: false,
         });
         assert_eq!(acid.permits(&aci), Ok(()));
@@ -790,6 +862,115 @@ mod tests {
         assert_eq!(
             verdict(|aci| aci.kernel_capabilities.unknown = vec![other]),
             Err(AcidViolation::UnknownCapabilityNotAllowed { raw: other })
+        );
+    }
+
+    // The divergences from Atmosphère's `TestCapability` listed in the module docs, one test
+    // each. Each asserts what this crate does, which is the opposite of what Atmosphère does.
+
+    /// Atmosphère never refuses on file permissions: fs's `AccessControl` keeps
+    /// `data.flag_bits & desc.flag_bits`, so a request beyond the `ACID` runs with the
+    /// intersection. Here a request with any bit outside the `ACID`'s is refused, and the
+    /// error carries both sets.
+    #[test]
+    fn divergence_file_permissions_beyond_the_acid_are_refused_not_intersected() {
+        let allowed = bound().file_access.permissions;
+        let outside = !allowed & (allowed + 1).next_power_of_two();
+        assert_ne!(outside, 0);
+        let requested = allowed | outside;
+        assert_eq!(
+            verdict(|aci| aci.file_access.permissions = requested),
+            Err(AcidViolation::FilePermissionsNotAllowed { requested, allowed })
+        );
+    }
+
+    /// Atmosphère needs an `ACID` syscall-mask word with the same index and the same mask; here
+    /// a request for a subset of the `ACID`'s SVCs is enough.
+    #[test]
+    fn divergence_svc_masks_are_compared_as_sets_not_words() {
+        assert_eq!(
+            verdict(|aci| aci.kernel_capabilities.svc_mask = svc_mask(&[1])),
+            Ok(())
+        );
+    }
+
+    /// Atmosphère grants every interrupt to an `ACID` with a pair of two padding ids, and needs
+    /// an `ACID` padding id for an `ACI0` padding id. Padding ids are dropped when decoding, so
+    /// here the first grants nothing and the second is never checked.
+    #[test]
+    fn divergence_padding_interrupt_ids_are_not_grants_or_requests() {
+        let interrupts = |words: &[u32]| KernelCapabilities::parse(words).unwrap().interrupts;
+        let mut aci = request();
+        aci.kernel_capabilities.interrupts =
+            interrupts(&[interrupt_pair(0x41, PADDING_INTERRUPT_ID)]);
+
+        let mut acid = bound();
+        acid.kernel_capabilities.interrupts =
+            interrupts(&[interrupt_pair(PADDING_INTERRUPT_ID, PADDING_INTERRUPT_ID)]);
+        assert_eq!(
+            acid.permits(&aci),
+            Err(AcidViolation::InterruptNotAllowed { id: 0x41 })
+        );
+
+        acid.kernel_capabilities.interrupts = interrupts(&[interrupt_pair(0x41, 0x42)]);
+        assert_eq!(acid.permits(&aci), Ok(()));
+    }
+
+    /// Atmosphère refuses an `ACI0` that sets more than one debug flag; here each flag only has
+    /// to be set in the `ACID` too.
+    #[test]
+    fn divergence_more_than_one_debug_flag_is_permitted() {
+        let both = DebugFlags {
+            allow_debug: true,
+            force_debug_prod: true,
+            force_debug: true,
+        };
+        let mut acid = bound();
+        acid.kernel_capabilities.debug_flags = Some(both);
+        let mut aci = request();
+        aci.kernel_capabilities.debug_flags = Some(both);
+        assert_eq!(acid.permits(&aci), Ok(()));
+    }
+
+    /// Atmosphère refuses an `ACI0` debug-flags descriptor, even one with no flag set, when the
+    /// `ACID` has none; here a request with no flag set needs nothing from the `ACID`.
+    #[test]
+    fn divergence_clear_debug_flags_need_no_acid_descriptor() {
+        let mut acid = bound();
+        acid.kernel_capabilities.debug_flags = None;
+        let mut aci = request();
+        aci.kernel_capabilities.debug_flags = Some(DebugFlags {
+            allow_debug: false,
+            force_debug_prod: false,
+            force_debug: false,
+        });
+        assert_eq!(acid.permits(&aci), Ok(()));
+    }
+
+    /// Atmosphère compares the whole `DebugFlags` word, reserved bits included; here bits 20 to
+    /// 31 are not decoded, so an `ACI0` word with one set is still covered by an `ACID` word
+    /// without it.
+    #[test]
+    fn divergence_reserved_debug_bits_are_not_compared() {
+        let reserved_bit = 1 << 20;
+        let decode = |word| KernelCapabilities::parse(&[word]).unwrap();
+        let mut acid = bound();
+        acid.kernel_capabilities.debug_flags = decode(debug_flags(true, false, false)).debug_flags;
+        let mut aci = request();
+        aci.kernel_capabilities.debug_flags =
+            decode(debug_flags(true, false, false) | reserved_bit).debug_flags;
+        assert_eq!(acid.permits(&aci), Ok(()));
+    }
+
+    /// Atmosphère refuses any descriptor type it does not know (`ResultUnknownCapability`);
+    /// here one is permitted when the `ACID` has the same word.
+    #[test]
+    fn divergence_unknown_descriptors_listed_by_the_acid_are_permitted() {
+        let unknown = bound().kernel_capabilities.unknown;
+        assert_ne!(unknown, Vec::<u32>::new());
+        assert_eq!(
+            verdict(|aci| aci.kernel_capabilities.unknown.clone_from(&unknown)),
+            Ok(())
         );
     }
 

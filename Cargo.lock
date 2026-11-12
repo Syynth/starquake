@@ -600,10 +600,12 @@ version = "0.0.0"
 dependencies = [
  "lz4_flex",
  "proptest",
+ "serde_json",
  "sha2",
  "starquake-memory",
  "starquake-testkit",
  "thiserror",
+ "toml",
 ]
 
 [[package]]

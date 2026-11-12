@@ -22,7 +22,7 @@ use std::ops::RangeInclusive;
 /// Padding word, skipped (`CapabilityType::Padding`).
 const PADDING: u32 = u32::MAX;
 /// Interrupt id meaning "no interrupt" (`KCapabilities::PaddingInterruptId`).
-const PADDING_INTERRUPT_ID: u32 = 0x3FF;
+pub(crate) const PADDING_INTERRUPT_ID: u32 = 0x3FF;
 /// Size of a physical page for address and size fields (`PageSize` in `k_capabilities.cpp`).
 const PAGE_SIZE: u64 = 0x1000;
 
@@ -51,6 +51,21 @@ const SVC_INDEX_COUNT: u32 = 1 << SVC_INDEX_WIDTH;
 /// Number of SVC ids the mask can express: [`SVC_INDEX_COUNT`] indices of [`SVC_BITS_PER_INDEX`]
 /// bits.
 pub const SVC_ID_LIMIT: u32 = SVC_INDEX_COUNT * SVC_BITS_PER_INDEX;
+
+/// Bit position of the interrupt id in the first slot of an `InterruptPair`.
+const INTERRUPT_FIRST_SHIFT: u32 = 12;
+/// Bit position of the interrupt id in the second slot of an `InterruptPair`.
+const INTERRUPT_SECOND_SHIFT: u32 = 22;
+/// Width of one interrupt id in an `InterruptPair`.
+const INTERRUPT_ID_WIDTH: u32 = 10;
+
+/// Bit position of `AllowDebug` in a `DebugFlags` descriptor
+/// (`CapabilityDebugFlags` in `atmosphere/stratosphere/loader/source/ldr_capabilities.cpp`).
+const DEBUG_ALLOW_SHIFT: u32 = 17;
+/// Bit position of `ForceDebugProd` (same Atmosphère union; Eden calls this bit `force_debug`).
+const DEBUG_FORCE_PROD_SHIFT: u32 = 18;
+/// Bit position of `ForceDebug` (same Atmosphère union; Eden treats this bit as reserved).
+const DEBUG_FORCE_SHIFT: u32 = 19;
 
 /// Width of each priority field in `CorePriority`.
 const PRIORITY_WIDTH: u32 = 6;
@@ -253,7 +268,9 @@ pub struct KernelVersion {
 pub struct DebugFlags {
     /// The process may be debugged.
     pub allow_debug: bool,
-    /// The process may force other processes to be debugged.
+    /// `ForceDebugProd`: debugging may be forced for production (retail) processes.
+    pub force_debug_prod: bool,
+    /// `ForceDebug`: the process may force other processes to be debugged.
     pub force_debug: bool,
 }
 
@@ -422,8 +439,8 @@ impl KernelCapabilities {
                 TYPE_MAP_REGION => caps.add_regions(raw),
                 TYPE_INTERRUPT_PAIR => {
                     // InterruptPair: ids at bits 12..22 and 22..32.
-                    for shift in [12, 22] {
-                        let id = field(raw, shift, 10);
+                    for shift in [INTERRUPT_FIRST_SHIFT, INTERRUPT_SECOND_SHIFT] {
+                        let id = field(raw, shift, INTERRUPT_ID_WIDTH);
                         if id != PADDING_INTERRUPT_ID {
                             caps.interrupts.push(narrow(id));
                         }
@@ -464,14 +481,19 @@ impl KernelCapabilities {
                     caps.handle_table_size = Some(narrow(field(raw, 16, 10)));
                 }
                 TYPE_DEBUG_FLAGS => {
-                    // DebugFlags: allow bit 17, force bit 18. Eden ignores the reserved bits
-                    // (19..32) because enforcing them breaks homebrew loaders; so does this.
+                    // DebugFlags: allow bit 17, force-prod bit 18, force bit 19, as in
+                    // Atmosphère's `CapabilityDebugFlags` and as written by switch-tools'
+                    // `npdmtool` 1.13.1 (checked by building one NPDM per flag; see
+                    // `tests/homebrew`). Divergence from Eden, which names bit 18 `force_debug`
+                    // and treats 19..32 as reserved. Bits 20..32 are ignored here, as Eden
+                    // ignores its reserved bits (enforcing them breaks homebrew loaders).
                     if caps.debug_flags.is_some() {
                         return Err(CapabilityError::Duplicate { index: at });
                     }
                     caps.debug_flags = Some(DebugFlags {
-                        allow_debug: field(raw, 17, 1) != 0,
-                        force_debug: field(raw, 18, 1) != 0,
+                        allow_debug: field(raw, DEBUG_ALLOW_SHIFT, 1) != 0,
+                        force_debug_prod: field(raw, DEBUG_FORCE_PROD_SHIFT, 1) != 0,
+                        force_debug: field(raw, DEBUG_FORCE_SHIFT, 1) != 0,
                     });
                 }
                 _ => caps.unknown.push(raw),
@@ -624,6 +646,21 @@ pub(crate) mod encode {
             | (minor << KERNEL_MINOR_SHIFT)
             | (major << KERNEL_MAJOR_SHIFT)
     }
+
+    /// `InterruptPair` descriptor: ids at bits 12..22 and 22..32.
+    pub(crate) fn interrupt_pair(first: u32, second: u32) -> u32 {
+        type_prefix(TYPE_INTERRUPT_PAIR)
+            | (first << INTERRUPT_FIRST_SHIFT)
+            | (second << INTERRUPT_SECOND_SHIFT)
+    }
+
+    /// `DebugFlags` descriptor with the given flags.
+    pub(crate) fn debug_flags(allow_debug: bool, force_debug_prod: bool, force_debug: bool) -> u32 {
+        type_prefix(TYPE_DEBUG_FLAGS)
+            | (u32::from(allow_debug) << DEBUG_ALLOW_SHIFT)
+            | (u32::from(force_debug_prod) << DEBUG_FORCE_PROD_SHIFT)
+            | (u32::from(force_debug) << DEBUG_FORCE_SHIFT)
+    }
 }
 
 #[cfg(test)]
@@ -634,7 +671,7 @@ mod tests {
     /// Fixed seed so property runs are reproducible.
     const PROPTEST_SEED: u64 = 0x5EED_0000_5143;
 
-    use encode::{kernel_version, syscall_mask, thread_info};
+    use encode::{debug_flags, interrupt_pair, kernel_version, syscall_mask, thread_info};
 
     #[test]
     fn core_range_0_to_5_and_priorities_28_to_59() {
@@ -704,14 +741,14 @@ mod tests {
             // MapRegion: DTB read-only in slot 0, OnMemoryBootImage read-write in slot 1.
             0x3FF | (3 << 11) | (1 << 17) | (2 << 18),
             // Interrupt pair: 0x41 and padding.
-            0x7FF | (0x41 << 12) | (PADDING_INTERRUPT_ID << 22),
+            interrupt_pair(0x41, PADDING_INTERRUPT_ID),
             // ProgramType 1.
             0x1FFF | (1 << 14),
             kernel_version(9, 1),
             // HandleTable 0x200.
             0x7FFF | (0x200 << 16),
-            // DebugFlags: allow + force.
-            0xFFFF | (1 << 17) | (1 << 18),
+            // DebugFlags: allow + force-prod + force.
+            debug_flags(true, true, true),
             PADDING,
         ];
         let caps = KernelCapabilities::parse(&words).unwrap();
@@ -762,10 +799,45 @@ mod tests {
             caps.debug_flags,
             Some(DebugFlags {
                 allow_debug: true,
+                force_debug_prod: true,
                 force_debug: true
             })
         );
         assert_eq!(caps.unknown, Vec::<u32>::new());
+    }
+
+    /// Decodes a lone `DebugFlags` word.
+    fn decode_debug(word: u32) -> DebugFlags {
+        KernelCapabilities::parse(&[word])
+            .unwrap()
+            .debug_flags
+            .unwrap()
+    }
+
+    #[test]
+    fn debug_flags_decode_each_bit_into_its_own_field() {
+        // Raw words from building NPDMs with npdmtool 1.13.1, one flag at a time: allow_debug is
+        // 0x2ffff, force_debug_prod 0x4ffff and force_debug 0x8ffff. Distinct values per bit, so
+        // a swap of any two fields fails.
+        let flags = |allow_debug, force_debug_prod, force_debug| DebugFlags {
+            allow_debug,
+            force_debug_prod,
+            force_debug,
+        };
+        assert_eq!(decode_debug(0x0002_FFFF), flags(true, false, false));
+        assert_eq!(decode_debug(0x0004_FFFF), flags(false, true, false));
+        assert_eq!(decode_debug(0x0008_FFFF), flags(false, false, true));
+        assert_eq!(decode_debug(0x000E_FFFF), flags(true, true, true));
+        assert_eq!(decode_debug(0x0000_FFFF), flags(false, false, false));
+        // The encoder agrees with the npdmtool words.
+        assert_eq!(debug_flags(true, false, false), 0x0002_FFFF);
+        assert_eq!(debug_flags(false, true, false), 0x0004_FFFF);
+        assert_eq!(debug_flags(false, false, true), 0x0008_FFFF);
+        // Bits 20..32 are ignored, as Eden ignores its reserved bits.
+        assert_eq!(
+            decode_debug(0xFFF0_FFFF | 0x0002_0000),
+            flags(true, false, false)
+        );
     }
 
     #[test]
