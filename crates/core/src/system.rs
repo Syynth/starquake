@@ -1,7 +1,7 @@
 //! [`System`]: one program, loaded and run from start to finish.
 //!
-//! PROVISIONAL (walking skeleton, #74). A `System` is one NRO run once as one guest thread on
-//! one vCPU of the hypervisor backend, in an address space of its own that the kernel keeps
+//! PROVISIONAL (walking skeleton, #74). A `System` is one program (an NRO, or an ExeFS's
+//! modules and metadata) run once as one guest thread on one vCPU of the hypervisor backend, in an address space of its own that the kernel keeps
 //! the books of (the `image`, `space` and `machine` modules say what is provisional about each
 //! and what replaces it). It is the
 //! thinnest thing that joins the loader, the code patcher, the CPU backend, the kernel
@@ -51,6 +51,15 @@ impl System {
         })
     }
 
+    /// Loads the program an ExeFS holds: its modules, placed one after the other, and the
+    /// process its `main.npdm` describes (`starquake_loader::exefs::ExeFs::parse` reads the
+    /// files). Works on every host.
+    pub fn from_exefs(exefs: starquake_loader::exefs::ExeFs) -> Result<Self, Error> {
+        Ok(Self {
+            program: Program::from_exefs(exefs)?,
+        })
+    }
+
     /// Runs the program until it calls `ExitProcess`, crashes, or `options.timeout` passes, and
     /// reports what happened. A failure to start (no CPU backend, no VM, a program too large
     /// for guest memory) is reported the same way, as an emulator error with nothing else in
@@ -80,7 +89,7 @@ mod host {
     use starquake_memory::Access;
 
     use super::Error;
-    use crate::clock::{CounterClock, PROCESS_CONSOLE, Timebase};
+    use crate::clock::{CounterClock, Timebase};
     use crate::image::{Loaded, Program, load};
     use crate::machine::{self, GuestProgram, GuestSpace};
     use crate::report::{RunOptions, RunReport};
@@ -118,11 +127,12 @@ mod host {
         let backend = HvfBackend::new(RamConfig::default())?;
         let ram = backend.ram();
         // One rate and one zero point for guest time (kernel spec, "Guest time"): the patcher
-        // rescales the backend's counter to the process's rate, the kernel converts its clock
-        // with the same rate, and that clock is the backend's counter.
+        // rescales the backend's counter to the rate of the console the program's description
+        // names, the kernel converts its clock with the same rate, and that clock is the
+        // backend's counter.
         let host_hz = backend.counter_frequency();
         let time = Timebase {
-            console: PROCESS_CONSOLE,
+            console: program.description().console,
             clock: CounterClock::new(host_hz).ok_or_else(|| {
                 starquake_cpu::Error::Host("the host counter reports a rate of zero".into())
             })?,
@@ -199,6 +209,21 @@ mod tests {
             error.to_string(),
             "the program could not be mapped into guest memory: mapping 0x2000 bytes needs more \
              guest RAM than the 0x1000 bytes left"
+        );
+    }
+
+    #[test]
+    fn an_exefs_loads_on_every_host_and_its_metadata_is_checked() {
+        use starquake_loader::exefs::{ExeFs, MAIN_MODULE, NPDM_FILE};
+        let nso: &[u8] = include_bytes!("../../../tests/homebrew/hello/hello.nso");
+        let npdm: &[u8] = include_bytes!("../../../tests/homebrew/hello/main.npdm");
+        let exefs = || ExeFs::parse(&[(NPDM_FILE, npdm), (MAIN_MODULE, nso)]).unwrap();
+        assert!(System::from_exefs(exefs()).is_ok());
+        let mut no_threads = exefs();
+        no_threads.npdm.aci.kernel_capabilities.thread_info = None;
+        assert_eq!(
+            System::from_exefs(no_threads),
+            Err(Error::Load(LoadError::NoThreadInfo))
         );
     }
 
