@@ -1,5 +1,6 @@
 //! The service framework: what every HLE service is written against
-//! (`docs/specs/services.md`, port plan slices 1 and 2).
+//! (`docs/specs/services.md`, port plan slices 1 to 3, and the snapshot hook of
+//! `docs/specs/observability.md`).
 //!
 //! # Writing a service
 //!
@@ -9,6 +10,7 @@
 //! use starquake_services::commands;
 //! use starquake_services::framework::{Context, Outcome, Reply, Request};
 //!
+//! #[derive(serde::Serialize, serde::Deserialize)]
 //! pub struct Mixer {
 //!     volume: u32,
 //! }
@@ -48,28 +50,52 @@
 //! holds its id. A session holds no host handle, closure or lock, because none of those can be
 //! saved. This is the standing rule of the observability spec (`docs/specs/observability.md`,
 //! "Snapshots", decision 3): it is cheap only if it exists before the first service is written.
-//! Nothing here enforces it yet (see "Not here yet").
+//! [`commands!`](crate::commands) enforces it: it implements [`Session::save`] with `serde`, so a
+//! struct that holds something that cannot be saved does not compile as a service. See
+//! [`snapshot`].
 //!
 //! - [`commands!`](crate::commands) implements [`Session`] for the struct: the dispatch `match`
 //!   and the table of ids and names.
 //! - [`Request`] gives the command id, the raw payload through a [`Reader`], buffers by index
 //!   ([`InBuffer`], [`OutBuffer`]), the caller's process id when it was sent, handles resolved to
 //!   kernel objects, and a domain request's input objects.
-//! - [`Reply`] takes a raw payload through a [`Writer`], handles to copy or move, and new
-//!   interfaces. A method ends with `reply.ok()`, or fails with a [`Fault`]: `?` on any framework
-//!   call, or `Err(code.into())` with the service's own result code.
-//! - [`Context`] is the rest of what a method may touch: guest memory by copy, and events.
+//! - [`Reply`] takes a raw payload through a [`Writer`], handles to copy or move, new
+//!   interfaces, and sessions on other services. A method ends with `reply.ok()`, or with
+//!   `reply.deferred()` after taking a reply token, or fails with a [`Fault`]: `?` on any
+//!   framework call, or `Err(code.into())` with the service's own result code.
+//! - [`Context`] is the rest of what a method may touch: guest memory by copy, events, the
+//!   state its family shares ([`Context::family`]), and a reply token for a request it cannot
+//!   answer yet ([`Context::defer`], see [`defer`]).
 //!
 //! # Running one
 //!
-//! A [`Server`] holds one service family's sessions. The kernel's session code (kernel spec, port
-//! plan slice 9) owns queueing and calls [`Server::handle`] with the caller's message buffer, one
-//! request at a time per server; the reply is written over the request. The kernel is reached
-//! through the small [`Kernel`] trait, defined here until that slice implements it;
-//! `fake::FakeKernel` (behind the `fakes` feature) stands in for tests.
+//! A [`Server`] holds one service family's sessions, the state they share ([`Family`]) and its
+//! request queue. The kernel's session code (kernel spec, port plan slice 9) drives it:
+//!
+//! - A session a client made by connecting to the service is opened with [`Server::accept`],
+//!   which gives it the service's root interface.
+//! - A request is submitted ([`Server::submit`]). One that may start is given to
+//!   [`Server::handle`] with the caller's message buffer, and the reply is written over the
+//!   request. One that may not waits, as a guest thread the kernel keeps, until
+//!   [`Server::start_next`] names its session. The rules are the service spec's: one request in
+//!   flight per session, one worker per server, and a deferred request gives its worker up
+//!   ([`queue`]).
+//! - A method that deferred makes [`Server::handle`] return [`Handled::Deferred`]. When its
+//!   token completes, on whatever thread, the server's [`Notify`] is told, and the kernel has
+//!   the reply written with [`Server::take_completed`] and [`Server::deliver`].
+//! - [`Server::save`] and [`Server::restore`] write and read the server's state ([`snapshot`]).
+//!
+//! The kernel is reached through the small [`Kernel`] trait, defined here until that slice
+//! implements it; `fake::FakeKernel` (behind the `test-support` feature) stands in for tests.
 //!
 //! The message is parsed here and not by the kernel, because how a request is framed depends on
 //! whether its session is a domain, which only the server knows.
+//!
+//! The kernel spec's sketch of a server row keeps the list of ready sessions, the running count
+//! and the worker count in the kernel. Here they are in the server's [`RequestQueue`], which is
+//! plain data and is saved with the server; the kernel keeps what only it has, the waiting
+//! threads and their message buffers. Which of the two holds the queue once slice 9 exists is
+//! that slice's to settle: the type is public so that it can be either.
 //!
 //! # What the framework answers itself
 //!
@@ -86,6 +112,8 @@
 //!   that kept the request's words made a title abort). [`Server::stubbed`] lists what was
 //!   stubbed.
 //! - **Close** messages: the session is dropped from the server and nothing is written.
+//! - **Tracing.** Every request the framework answers is one event in the run's event stream,
+//!   marked when it was stubbed or deferred: see [`trace`].
 //!
 //! A method's [`Fault`], and the cases in the table below, are answered with a reply that holds
 //! only a result code. The codes are in [`result`]; most are guesses, and say so there.
@@ -117,6 +145,15 @@
 //! | A reply too large for the message buffer | `ResponseBuilder` pushes words into its 64-word buffer without a bounds check | reply [`NOT_SUPPORTED`], and nothing the method returned is kept |
 //! | A full domain | the handler vector grows without limit | reply [`OUT_OF_DOMAIN_ENTRIES`] at [`MAX_DOMAIN_OBJECTS`] |
 //!
+//! Eden has no reply tokens and no family state, so three more answers are starquake's own and
+//! not divergences. Each is pinned by the test named, in `framework/tests/`:
+//!
+//! | Case | Here |
+//! |---|---|
+//! | A reply token is dropped without being completed, or a method returns "deferred" without taking one | reply [`DEFERRED_REPLY_DROPPED`] (`deferred.rs`: `a_dropped_token_replies_with_an_error`, `deferring_without_a_token_is_answered_at_once_with_an_error`) |
+//! | A method asks for a second reply token | reply [`NOT_SUPPORTED`] (`deferred.rs`: `a_request_has_one_token`) |
+//! | A method asks for family state its server was not given | reply [`NOT_SUPPORTED`] (`server.rs`: `a_method_that_needs_family_state_fails_on_a_server_without_it`) |
+//!
 //! More are listed where they belong: payload layout in [`payload`], buffers in [`request`],
 //! control requests in [`control`], and the reuse of domain object ids on `Domain` in
 //! `framework/targets.rs`.
@@ -134,16 +171,19 @@
 //!
 //! # Not here yet
 //!
-//! - Snapshots (`docs/specs/observability.md`, "Snapshots"). A [`Server`] already refers to its
-//!   interfaces by `TargetId` and its sessions by [`ObjectId`](starquake_kernel::id::ObjectId),
-//!   so its tables can be saved and re-linked by id. What is missing is a save and restore pair
-//!   for the `Box<dyn Session>` behind each table row: [`Session`] gives a snapshot no way to
-//!   reach a session's state. [`commands!`](crate::commands) is the natural place to require
-//!   that pair, since every session goes through it; that is a guess about where it fits, to be
-//!   confirmed when the snapshot format is designed.
-//! - Deferred replies and the per-request trace line are slice 3. Until then a method cannot
-//!   return "deferred", and requests are logged through `tracing` only where something went
-//!   wrong.
+//! - Somewhere for a method to send a reply token. A session and its family are plain data, so
+//!   neither can hold a worker or a channel; the service spec's answer is the injectable
+//!   environment (`docs/specs/observability.md`, rule 1), which [`Context`] does not carry
+//!   yet. The first service that defers (`fsp-srv`, slice 6) brings it. The tests here park
+//!   their tokens in a thread-local.
+//! - A deferred reply that writes into the caller's buffers: see [`defer`].
+//! - Servers with more than one worker. [`RequestQueue`] counts workers, but [`Server::handle`]
+//!   takes the server exclusively, so a `Server` always has [`DEFAULT_WORKERS`]. Opting in
+//!   (service spec, "Opting in to parallelism") needs handlers that can run side by side,
+//!   which is a design of its own.
+//! - State shared between servers (the service spec's `Arc<Settings>`). A family's state
+//!   belongs to one server and is saved with it; nothing yet saves one piece of state once for
+//!   two servers and re-links it.
 //! - Moved handles a caller sends are resolved but not removed from its table, as in Eden's HLE;
 //!   removing them is handle transfer, which the kernel spec gives to the kernel.
 //! - A domain reply that returns objects after a payload that is not a whole number of words.
@@ -156,31 +196,39 @@
 mod commands;
 mod context;
 pub mod control;
-#[cfg(any(test, feature = "fakes"))]
+pub mod defer;
+#[cfg(any(test, feature = "test-support"))]
 pub mod fake;
 mod kernel;
 pub mod payload;
+pub mod queue;
 mod reply;
 pub mod request;
 pub mod result;
 mod server;
+pub mod snapshot;
 mod targets;
+pub mod trace;
 
 #[cfg(test)]
 mod tests;
 
 pub use commands::{Command, CommandTable, Protocol, Session};
 pub use context::Context;
+pub use defer::{Completed, Notify, ReplyToken, TokenId};
 pub use kernel::Kernel;
 pub use payload::{Reader, Writer};
+pub use queue::{Admission, DEFAULT_WORKERS, QueueError, RequestQueue};
 pub use reply::Reply;
 pub use request::{InBuffer, OutBuffer, Request};
 pub use result::{
-    Completion, Direction, Fault, HandleKind, NOT_SUPPORTED, OUT_OF_DOMAIN_ENTRIES, Outcome,
-    TARGET_NOT_FOUND, UNKNOWN_COMMAND_ID,
+    Completion, DEFERRED_REPLY_DROPPED, Direction, Fault, HandleKind, NOT_SUPPORTED,
+    OUT_OF_DOMAIN_ENTRIES, Outcome, TARGET_NOT_FOUND, UNKNOWN_COMMAND_ID,
 };
 pub use server::{
     DEFAULT_POINTER_BUFFER_SIZE, Handled, MAX_STUBBED_COMMANDS, Server, ServerError,
     StubbedCommand, UnknownPolicy,
 };
+pub use snapshot::{Family, Interfaces, SNAPSHOT_MAGIC, SNAPSHOT_VERSION, SnapshotError};
 pub use targets::{MAX_DOMAIN_OBJECTS, TargetError};
+pub use trace::NO_COMMAND_ID;

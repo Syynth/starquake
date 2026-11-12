@@ -1,8 +1,8 @@
 //! What a service method returns, and the result codes the framework itself replies with.
 //!
-//! A method returns an [`Outcome`]: `Ok` once it has filled in its [`Reply`](super::Reply), or a
-//! [`Fault`]. A fault becomes the reply's result code ([`Fault::result`]) and nothing else of the
-//! reply is sent.
+//! A method returns an [`Outcome`]: `Ok` once it has filled in its [`Reply`](super::Reply) or
+//! kept a reply token for later ([`Completion::Deferred`]), or a [`Fault`]. A fault becomes the
+//! reply's result code ([`Fault::result`]) and nothing else of the reply is sent.
 //!
 //! # Result codes
 //!
@@ -27,8 +27,9 @@ pub const CMIF_MODULE: u32 = 10;
 pub const HIPC_MODULE: u32 = 11;
 
 /// Packs a module and a description (the bit layout is the kernel crate's, from Eden's
-/// `result.h`). Every description below fits its field, which a test checks.
-const fn code(module: u32, description: u32) -> ResultCode {
+/// `result.h`). Every description below fits its field, which a test checks. The one place a
+/// service's result code is put together: services define theirs with it too.
+pub(crate) const fn code(module: u32, description: u32) -> ResultCode {
     ResultCode::from_raw(module | (description << MODULE_BITS))
 }
 
@@ -36,6 +37,12 @@ const fn code(module: u32, description: u32) -> ResultCode {
 /// (`ErrorModule::HIPC`, 1; `eden/src/core/hle/service/ipc_helpers.h`). Where the framework
 /// replies with it is starquake's own choice, listed in the [module docs](super).
 pub const NOT_SUPPORTED: ResultCode = code(HIPC_MODULE, 1);
+/// A deferred request whose reply token was dropped without being completed, or whose method
+/// returned "deferred" without taking a token. The word is Eden's `IPC::ResultSessionClosed`
+/// (`ErrorModule::HIPC`, 301; `eden/src/core/hle/service/ipc_helpers.h`). Using it here is
+/// starquake's own choice: no reference has reply tokens, and the session stays open. A caller
+/// sees what it would see if the server had given up on the request.
+pub const DEFERRED_REPLY_DROPPED: ResultCode = code(HIPC_MODULE, 301);
 /// The interface has no command with the request's id (strict policy). Guess: CMIF 221.
 pub const UNKNOWN_COMMAND_ID: ResultCode = code(CMIF_MODULE, 221);
 /// A domain request names an object id that is not in the domain. Guess: CMIF 261.
@@ -55,10 +62,15 @@ pub const DOMAIN_OBJECT_NOT_FOUND: ResultCode = code(HIPC_MODULE, 492);
 pub enum Completion {
     /// The reply is complete and is sent now.
     Done,
+    /// The method kept a reply token ([`Context::defer`](super::Context::defer)); the reply is
+    /// sent when the token is completed. What the method put in its [`Reply`](super::Reply) is
+    /// thrown away.
+    Deferred,
 }
 
-/// What a service method returns. `reply.ok()` builds the success value; `?` on any framework
-/// call, or `Err(code.into())` with the service's own result code, builds the failure.
+/// What a service method returns. `reply.ok()` builds the success value and
+/// `reply.deferred()` the deferred one; `?` on any framework call, or `Err(code.into())` with the
+/// service's own result code, builds the failure.
 pub type Outcome = Result<Completion, Fault>;
 
 /// Which way a buffer carries data.
@@ -179,8 +191,9 @@ impl From<ResultCode> for Fault {
 mod tests {
     use super::*;
 
-    const FRAMEWORK_CODES: [(ResultCode, u32); 7] = [
+    const FRAMEWORK_CODES: [(ResultCode, u32); 8] = [
         (NOT_SUPPORTED, HIPC_MODULE),
+        (DEFERRED_REPLY_DROPPED, HIPC_MODULE),
         (UNKNOWN_COMMAND_ID, CMIF_MODULE),
         (TARGET_NOT_FOUND, CMIF_MODULE),
         (OUT_OF_DOMAIN_ENTRIES, CMIF_MODULE),
@@ -214,6 +227,13 @@ mod tests {
         // Golden word: ipc_helpers.h `ResultNotSupported{ErrorModule::HIPC, 1}` with result.h's
         // `HIPC = 11`, module in bits 0..9 and description from bit 9. Horizon prints it 2011-0001.
         assert_eq!(NOT_SUPPORTED.raw(), 0x20B);
+    }
+
+    #[test]
+    fn deferred_reply_dropped_is_edens_session_closed_word() {
+        // Golden word: ipc_helpers.h `ResultSessionClosed{ErrorModule::HIPC, 301}`: module 11 in
+        // bits 0..9, description 301 (0x12D) from bit 9. Horizon prints it 2011-0301.
+        assert_eq!(DEFERRED_REPLY_DROPPED.raw(), 0x2_5A0B);
     }
 
     #[test]
