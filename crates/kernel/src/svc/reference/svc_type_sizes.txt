@@ -1,0 +1,32 @@
+# The size in bytes Eden asserts for each type its system-call wrappers pass in a register:
+# the `static_assert(sizeof(T) == n)` lines of eden/src/core/hle/kernel/svc.cpp @ cf654052
+# (GPL-3.0-or-later), for the types `svc_wrappers64.txt` names. Extracted by
+# `tools/gen-svc-conventions.py`.
+# Checked against `Kind::bytes` by the tests in `svc/convention.rs`.
+ArbitrationType = 4
+BreakReason = 4
+CodeMemoryOperation = 4
+DebugThreadParam = 4
+DeviceName = 4
+Handle = 4
+HardwareBreakPointRegisterName = 4
+InfoType = 4
+InterruptType = 4
+IoPoolType = 4
+KernelDebugType = 4
+KernelTraceState = 4
+LimitableResource = 4
+MemoryMapping = 4
+MemoryPermission = 4
+PageInfo = 4
+ProcessActivity = 4
+ProcessInfoType = 4
+Result = 4
+SignalType = 4
+SystemInfoType = 4
+ThreadActivity = 4
+bool = 1
+int32_t = 4
+int64_t = 8
+uint32_t = 4
+uint64_t = 8

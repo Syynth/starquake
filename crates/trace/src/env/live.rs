@@ -4,22 +4,22 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use crate::env::{Env, EnvError, EnvRecord, HostIoReply, HostIoRequest};
-use crate::event::GuestTicks;
+use crate::event::HostNanos;
 use crate::recorder::lock;
 
 /// Where a [`LiveEnv`] gets the time from.
 pub trait HostClock: Send {
-    /// The current time, in this clock's own unit. The [`GuestTicks`] type only carries the
-    /// number: it does not mean the unit is guest ticks (see [`Env::now`]). Successive readings
-    /// from one clock should not decrease.
-    fn now(&mut self) -> GuestTicks;
+    /// The current time: host nanoseconds since this clock's zero (see [`Env::now`]). Successive
+    /// readings from one clock should not decrease.
+    fn now(&mut self) -> HostNanos;
 }
 
 /// The real monotonic host clock: nanoseconds since the clock was created, saturating at
-/// `u64::MAX`. The unit is host nanoseconds, not the guest counter's frequency, although the
-/// reading is carried in a [`GuestTicks`]; converting to guest ticks is the consumer's job
-/// (guess: see [`Env::now`]).
-#[derive(Debug)]
+/// `u64::MAX`. Its zero is its own creation, which is not the zero of any counter a CPU backend
+/// shows the guest; a run whose guest reads a counter directly needs a clock built on that
+/// counter instead (`starquake-core` has one for the hypervisor backend). A copy reads the
+/// same time: it shares the zero.
+#[derive(Clone, Copy, Debug)]
 pub struct SystemClock {
     start: Instant,
 }
@@ -41,13 +41,14 @@ impl Default for SystemClock {
 }
 
 impl HostClock for SystemClock {
-    fn now(&mut self) -> GuestTicks {
-        GuestTicks(u64::try_from(self.start.elapsed().as_nanos()).unwrap_or(u64::MAX))
+    fn now(&mut self) -> HostNanos {
+        HostNanos(u64::try_from(self.start.elapsed().as_nanos()).unwrap_or(u64::MAX))
     }
 }
 
 /// A deterministic clock for `--clock fixed` runs (spec, "Headless runs"): the first reading is
-/// `start`, and every later reading is `step` more than the one before (saturating).
+/// `start` nanoseconds, and every later reading is `step` nanoseconds more than the one before
+/// (saturating).
 #[derive(Clone, Copy, Debug)]
 pub struct FixedClock {
     next: u64,
@@ -55,7 +56,7 @@ pub struct FixedClock {
 }
 
 impl FixedClock {
-    /// A clock that reads `start`, `start + step`, `start + 2 * step`, and so on.
+    /// A clock that reads `start`, `start + step`, `start + 2 * step` nanoseconds, and so on.
     #[must_use]
     pub fn new(start: u64, step: u64) -> Self {
         Self { next: start, step }
@@ -63,10 +64,10 @@ impl FixedClock {
 }
 
 impl HostClock for FixedClock {
-    fn now(&mut self) -> GuestTicks {
+    fn now(&mut self) -> HostNanos {
         let reading = self.next;
         self.next = reading.saturating_add(self.step);
-        GuestTicks(reading)
+        HostNanos(reading)
     }
 }
 
@@ -148,7 +149,7 @@ impl LiveEnv {
 }
 
 impl Env for LiveEnv {
-    fn now(&self) -> Result<GuestTicks, EnvError> {
+    fn now(&self) -> Result<HostNanos, EnvError> {
         let mut state = lock(&self.state);
         let reading = state.clock.now();
         state.recording.push(EnvRecord::Clock(reading));
@@ -193,9 +194,9 @@ mod tests {
     #[test]
     fn fixed_clock_steps_and_saturates() {
         let mut clock = FixedClock::new(u64::MAX - 1, 5);
-        assert_eq!(clock.now(), GuestTicks(u64::MAX - 1));
-        assert_eq!(clock.now(), GuestTicks(u64::MAX));
-        assert_eq!(clock.now(), GuestTicks(u64::MAX));
+        assert_eq!(clock.now(), HostNanos(u64::MAX - 1));
+        assert_eq!(clock.now(), HostNanos(u64::MAX));
+        assert_eq!(clock.now(), HostNanos(u64::MAX));
         let mut clock = FixedClock::new(10, 3);
         let readings: Vec<u64> = (0..3).map(|_| clock.now().0).collect();
         assert_eq!(readings, [10, 13, 16]);
@@ -207,6 +208,16 @@ mod tests {
         let a = clock.now();
         let b = clock.now();
         assert!(b >= a);
+    }
+
+    #[test]
+    fn a_copy_of_the_system_clock_shares_its_zero() {
+        let mut clock = SystemClock::default();
+        let mut copy = clock;
+        let a = clock.now();
+        let b = copy.now();
+        let c = clock.now();
+        assert!(a <= b && b <= c, "{a:?} {b:?} {c:?}");
     }
 
     #[test]

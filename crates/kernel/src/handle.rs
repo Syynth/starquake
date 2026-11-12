@@ -2,8 +2,8 @@
 //!
 //! Ported from Eden `eden/src/core/hle/kernel/k_handle_table.h` and `k_handle_table.cpp`, and
 //! `eden/src/core/hle/kernel/svc_common.h` (pseudo-handles), at the commit pinned in
-//! `docs/references.md` (GPL-3.0-or-later). Result values come from `svc_results.h` and the
-//! `Result` bit layout in `eden/src/core/hle/result.h`.
+//! `docs/references.md` (GPL-3.0-or-later). The results an operation can fail with are named as
+//! [`KernelError`]s; their words are encoded in [`crate::result`] and nowhere else.
 //!
 //! A [`Handle`] is a 32-bit value: bits 0-14 the table index, bits 15-29 a "linear id" (what the
 //! task calls the generation), bits 30-31 reserved and zero. The linear id is **not** a
@@ -31,6 +31,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::id::ObjectId;
+use crate::result::{KernelError, SvcError};
 use crate::slab::{FreeStackError, check_free_stack};
 
 mod refs;
@@ -54,25 +55,6 @@ pub const MIN_LINEAR_ID: u16 = 1;
 /// The last linear id issued before the counter wraps back to [`MIN_LINEAR_ID`] (`MaxLinearId`).
 pub const MAX_LINEAR_ID: u16 = (1_u16 << LINEAR_ID_BITS) - 1;
 
-/// Where a result's module sits in the raw value: `Result::Module` is `BitField<0, 9>`, and
-/// `Result::Description` is `BitField<9, 13>` (`result.h`).
-const RESULT_DESCRIPTION_SHIFT: u32 = 9;
-/// `ErrorModule::Kernel` (`result.h`).
-const KERNEL_MODULE: u32 = 1;
-
-/// Builds the raw value of a kernel-module result from its description number.
-const fn kernel_result(description: u32) -> u32 {
-    KERNEL_MODULE | (description << RESULT_DESCRIPTION_SHIFT)
-}
-
-/// `ResultOutOfMemory{ErrorModule::Kernel, 104}` (`svc_results.h`): a table size above
-/// [`MAX_TABLE_SIZE`].
-pub const RESULT_OUT_OF_MEMORY: u32 = kernel_result(104);
-/// `ResultOutOfHandles{ErrorModule::Kernel, 105}` (`svc_results.h`): the table is full.
-pub const RESULT_OUT_OF_HANDLES: u32 = kernel_result(105);
-/// `ResultInvalidHandle{ErrorModule::Kernel, 114}` (`svc_results.h`).
-pub const RESULT_INVALID_HANDLE: u32 = kernel_result(114);
-
 /// A guest-visible handle: a table index and a linear id packed in 32 bits. See the module docs.
 ///
 /// Any `u32` is a `Handle`; whether it names anything is decided by the table.
@@ -91,6 +73,15 @@ impl Handle {
     #[must_use]
     pub const fn from_raw(raw: u32) -> Self {
         Self(raw)
+    }
+
+    /// The handle a system-call register carries: its low 32 bits, the rest ignored, as Eden's
+    /// wrappers take a `Handle` argument (`Convert<Handle>(GetArg64(args, n))` in
+    /// `eden/src/core/hle/kernel/svc.cpp` copies four bytes of the register).
+    #[must_use]
+    pub const fn from_register(register: u64) -> Self {
+        let [b0, b1, b2, b3, ..] = register.to_le_bytes();
+        Self(u32::from_le_bytes([b0, b1, b2, b3]))
     }
 
     /// The raw handle value.
@@ -163,17 +154,37 @@ pub enum HandleError {
 }
 
 impl HandleError {
-    /// The raw Horizon result this error corresponds to, if it has one: `OutOfMemory`,
-    /// `OutOfHandles` or `InvalidHandle`. Reference-count and corruption errors are starquake's
-    /// own and have no guest-visible result. (A later slice joins this to the kernel's result
-    /// type; until then the raw values are the contract.)
+    /// The Horizon result this error is to a guest, if it has one: `ResultOutOfMemory`,
+    /// `ResultOutOfHandles` or `ResultInvalidHandle` (`k_handle_table.cpp`, `svc_results.h`).
+    /// Reference-count and corruption errors are the kernel's own bookkeeping failing and have
+    /// no guest-visible result.
+    #[must_use]
+    pub const fn kernel_error(&self) -> Option<KernelError> {
+        match self {
+            Self::TableTooLarge { .. } => Some(KernelError::OutOfMemory),
+            Self::OutOfHandles => Some(KernelError::OutOfHandles),
+            Self::InvalidHandle { .. } => Some(KernelError::InvalidHandle),
+            Self::Refs(_) | Self::Corrupt => None,
+        }
+    }
+
+    /// The raw word of [`HandleError::kernel_error`], for a caller that wants the number.
     #[must_use]
     pub const fn result(&self) -> Option<u32> {
-        match self {
-            Self::TableTooLarge { .. } => Some(RESULT_OUT_OF_MEMORY),
-            Self::OutOfHandles => Some(RESULT_OUT_OF_HANDLES),
-            Self::InvalidHandle { .. } => Some(RESULT_INVALID_HANDLE),
-            Self::Refs(_) | Self::Corrupt => None,
+        match self.kernel_error() {
+            Some(error) => Some(error.code().raw()),
+            None => None,
+        }
+    }
+}
+
+impl From<HandleError> for SvcError {
+    /// The one place a handle table failure becomes what a system call returns: its Horizon
+    /// result where it has one ([`HandleError::kernel_error`]), an internal failure otherwise.
+    fn from(error: HandleError) -> Self {
+        match error.kernel_error() {
+            Some(result) => Self::Kernel(result),
+            None => Self::internal(&error),
         }
     }
 }

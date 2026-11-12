@@ -21,7 +21,8 @@
 //!
 //! # Built here, and not yet
 //!
-//! Built: thread state (run state, suspend requests, priority, affinity, ideal core, saved
+//! Built: the object table ([`Scheduler::objects`], see [`crate::object`]); thread state (run
+//! state, suspend requests, priority, affinity, ideal core, saved
 //! context as a [`GuestRegs`](starquake_cpu::GuestRegs) placeholder), the scheduled and
 //! suggested queues over 64 priorities, choosing each core's thread and migrating suggested
 //! threads to idle cores, the three yields, base-priority and core-mask changes, thread
@@ -82,8 +83,8 @@ pub use thread::{
     ThreadState,
 };
 
-use crate::result::KernelError;
-use crate::slab::SlabError;
+use crate::result::{KernelError, SvcError};
+use crate::slab::{SlabError, StoredIdStale};
 
 /// Threads more urgent than this are never migrated off the core they top: Eden
 /// `global_scheduler_context.h`, `HighestCoreMigrationAllowedPriority = 2`.
@@ -151,4 +152,91 @@ pub enum SchedError {
     /// damaged bookkeeping fails instead of panicking.
     #[error("scheduler bookkeeping is inconsistent")]
     Corrupt,
+}
+
+impl SchedError {
+    /// The Horizon result this error is to a guest, if it has one: only
+    /// [`SchedError::Kernel`] does. Every other case is the kernel or the core loop misusing the
+    /// table (a stale thread id, a core that does not exist, damaged links), which no guest
+    /// input reaches.
+    #[must_use]
+    pub const fn kernel_error(&self) -> Option<KernelError> {
+        match self {
+            Self::Kernel(error) => Some(*error),
+            Self::Slab(_)
+            | Self::NoSuchCore { .. }
+            | Self::CoreCount { .. }
+            | Self::NoCurrentThread { .. }
+            | Self::Corrupt => None,
+        }
+    }
+}
+
+impl From<SchedError> for SvcError {
+    /// The one place a scheduler failure becomes what a system call returns: its Horizon result
+    /// where it has one ([`SchedError::kernel_error`]), an internal failure otherwise.
+    fn from(error: SchedError) -> Self {
+        match error.kernel_error() {
+            Some(result) => Self::Kernel(result),
+            None => Self::internal(&error),
+        }
+    }
+}
+
+impl From<StoredIdStale> for SchedError {
+    /// A stale id in a queue link or a core's state is damaged bookkeeping.
+    fn from(_: StoredIdStale) -> Self {
+        Self::Corrupt
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every variant, with what a guest sees for it.
+    fn cases() -> Vec<(SchedError, Option<KernelError>)> {
+        vec![
+            (
+                SchedError::Kernel(KernelError::InvalidState),
+                Some(KernelError::InvalidState),
+            ),
+            (
+                SchedError::Kernel(KernelError::InvalidCoreId),
+                Some(KernelError::InvalidCoreId),
+            ),
+            (
+                SchedError::Slab(SlabError::Stale {
+                    index: 3,
+                    generation: 2,
+                }),
+                None,
+            ),
+            (SchedError::NoSuchCore { core: 9, count: 6 }, None),
+            (SchedError::CoreCount { count: 0 }, None),
+            (SchedError::NoCurrentThread { core: 1 }, None),
+            (SchedError::Corrupt, None),
+        ]
+    }
+
+    #[test]
+    fn only_a_kernel_result_reaches_the_guest_and_the_rest_are_internal() {
+        for (error, expected) in cases() {
+            assert_eq!(error.kernel_error(), expected, "{error}");
+            let call = SvcError::from(error);
+            match expected {
+                Some(result) => assert_eq!(call, SvcError::Kernel(result)),
+                None => assert_eq!(call, SvcError::Internal(error.to_string())),
+            }
+        }
+    }
+
+    #[test]
+    fn a_stale_stored_id_is_damaged_bookkeeping() {
+        assert_eq!(SchedError::from(StoredIdStale), SchedError::Corrupt);
+        assert_eq!(
+            SvcError::from(SchedError::from(StoredIdStale)),
+            SvcError::Internal("scheduler bookkeeping is inconsistent".to_owned())
+        );
+    }
 }

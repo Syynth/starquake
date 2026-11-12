@@ -19,10 +19,19 @@
 //! - `image`: the program's place in bring-up memory, with no page tables, permissions or
 //!   address-space bookkeeping (replaced by stage-1 tables and kernel slice 6).
 //! - `machine`: one guest thread on one core with no scheduler (kernel slices 8 and 10).
+//! - `clock`: every process counts time at the Switch 1 rate (kernel slice 8).
 //! - [`system`]: one VM per run, hypervisor backend only.
 //! - [`crash`]: the part of the crash report that needs no backtrace or symbols.
 
 pub mod artifacts;
+#[cfg_attr(
+    not(any(test, all(target_os = "macos", target_arch = "aarch64"))),
+    expect(
+        dead_code,
+        reason = "only a CPU backend gives a run its clock; hosts without one build this for its tests"
+    )
+)]
+mod clock;
 pub mod crash;
 #[cfg_attr(
     not(any(test, all(target_os = "macos", target_arch = "aarch64"))),

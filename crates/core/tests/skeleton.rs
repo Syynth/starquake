@@ -18,8 +18,10 @@ use std::time::Duration;
 
 use starquake_core::crash::{Exception, Location};
 use starquake_core::{Error, ExitReason, LoadError, RunOptions, RunReport, System, exit_code};
-use starquake_kernel::svc::tick::CNTFREQ;
-use starquake_testkit::nro::NroBuilder;
+use starquake_kernel::svc::SvcId;
+use starquake_testkit::a64::SysReg;
+use starquake_testkit::nro::{CODE_OFFSET, NroBuilder};
+use starquake_testkit::programs::COUNTER_HZ;
 use starquake_testkit::{a64, programs};
 use starquake_trace::{Dump, EventKind};
 
@@ -32,6 +34,11 @@ const CONTROL_OUTPUT: [&str; 2] = ["hello from the guest", "starquake walking sk
 /// The committed snapshot of the hello program's trace, as `insta` stores it: a header between
 /// two `---` lines, then the text.
 const HELLO_SNAPSHOT: &str = include_str!("snapshots/skeleton__hello_trace.snap");
+
+/// How far apart two readings of the counter at one instant can be, one through a patched
+/// instruction and one through `GetSystemTick`: each rounds down and may be one tick below the
+/// exact value (`crates/core/src/clock.rs`), so one tick.
+const ROUNDING: u64 = 1;
 
 /// Long enough for any of these programs on a loaded machine; they finish in milliseconds.
 const GENEROUS: Duration = Duration::from_secs(30);
@@ -177,7 +184,7 @@ fn a_program_that_prints_something_else_fails_the_same_comparisons() {
 
 #[test]
 fn the_counter_advances_through_patched_reads_and_reads_the_guest_rate() {
-    let counter = programs::counter(CNTFREQ).unwrap();
+    let counter = programs::counter(COUNTER_HZ).unwrap();
     let Some(report) = run(&counter.nro, GENEROUS) else {
         return;
     };
@@ -209,7 +216,7 @@ fn the_counter_advances_through_patched_reads_and_reads_the_guest_rate() {
 fn a_counter_program_expecting_another_rate_stops_at_its_rate_check() {
     // The control for the counter test: the rate the program compares against is off by one, so
     // the same run must end at the program's `brk #3`, and the crash report says so.
-    let counter = programs::counter(CNTFREQ + 1).unwrap();
+    let counter = programs::counter(COUNTER_HZ + 1).unwrap();
     let Some(report) = run(&counter.nro, GENEROUS) else {
         return;
     };
@@ -218,13 +225,66 @@ fn a_counter_program_expecting_another_rate_stops_at_its_rate_check() {
     assert_eq!(crash.exception, Exception::UndefinedInstruction);
     assert_eq!(crash.pc, image_base(&report) + counter.wrong_rate_offset);
     // x23 is what `cntfrq_el0` read through the patched site, x24 what the program expected.
-    assert_eq!(crash.registers.x[23], CNTFREQ);
-    assert_eq!(crash.registers.x[24], CNTFREQ + 1);
+    assert_eq!(crash.registers.x[23], COUNTER_HZ);
+    assert_eq!(crash.registers.x[24], COUNTER_HZ + 1);
     // The two counter reads before it passed their checks: the second is above the first.
     assert!(
         crash.registers.x[20] > crash.registers.x[19],
         "{:#x?}",
         crash.registers.x
+    );
+}
+
+#[test]
+fn a_tick_read_by_system_call_lies_between_the_patched_counter_reads_around_it() {
+    // Guest time has one zero point (kernel spec, "Guest time"): `GetSystemTick` and a counter
+    // read through a patched instruction are readings of one counter. The program reads the
+    // counter, asks the kernel for the tick, reads the counter again, and stops where the
+    // crash report shows all three:
+    //
+    //   mrs x19, cntpct_el0     (patched)
+    //   svc #0x1e               GetSystemTick: the tick in x0
+    //   mov x20, x0
+    //   mrs x21, cntpct_el0     (patched)
+    //   brk #0
+    let words = [
+        a64::mrs(19, SysReg::CntPctEl0).unwrap(),
+        a64::svc(u32::from(SvcId::GetSystemTick.number())).unwrap(),
+        a64::mov(20, 0).unwrap(),
+        a64::mrs(21, SysReg::CntPctEl0).unwrap(),
+        a64::brk(0).unwrap(),
+    ];
+    let stop_offset = CODE_OFFSET as u64 + 4 * u64::from(a64::INSN_SIZE);
+    let file = NroBuilder::new(&words).build().unwrap();
+    let Some(report) = run(&file, GENEROUS) else {
+        return;
+    };
+    assert_eq!(report.exit_code(), exit_code::GUEST_CRASHED);
+    let crash = report.crash().expect("the program stops at its brk");
+    assert_eq!(crash.exception, Exception::UndefinedInstruction);
+    assert_eq!(crash.pc, image_base(&report) + stop_offset);
+    // Both counter reads went through the patcher, and the kernel answered the system call.
+    assert_eq!(report.patched_counter_reads.len(), 2);
+    assert_eq!(
+        report.system_calls.iter().collect::<Vec<_>>(),
+        [(&SvcId::GetSystemTick.name().to_owned(), &1)]
+    );
+    assert!(report.stubbed.is_empty(), "{:?}", report.stubbed);
+
+    // Apart from rounding, the system call's tick is bracketed by the reads around it.
+    let [before, tick, after] = [19, 20, 21].map(|register| crash.registers.x[register]);
+    assert!(before > ROUNDING, "the counter read as {before}");
+    assert!(
+        before - ROUNDING <= tick && tick <= after + ROUNDING,
+        "patched read {before}, GetSystemTick {tick}, patched read {after}"
+    );
+    // The bracket is one system call wide, far under a second of ticks, while the two zero
+    // points this replaces (the host's boot and the start of the run) are further apart than
+    // that on any machine that has been up for a second. So this fails if they differ.
+    assert!(
+        after - before < COUNTER_HZ,
+        "the reads are {} ticks apart",
+        after - before
     );
 }
 
