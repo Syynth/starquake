@@ -1,12 +1,13 @@
 # Graphics server: sessions, syncpoints, GPU memory and display
 
-Status: draft for the owner's review (issue #11). Not approved; nothing is built on it yet.
-Amended on 2026-11-12 to follow the owner's six graphics decisions (`docs/decision-log.md`) and
-the seam resolutions of the graphics review guide (`docs/specs/graphics-review-guide.md`); the
-decided items are marked in "Decisions for the owner".
+Status: approved by the owner, 2026-11-12 (issue #11).
+
+Every item in "Decisions for the owner" carries the owner's ruling (`docs/decision-log.md`,
+2026-11-12), and the text follows them and the seam resolutions of the graphics review guide
+(`docs/specs/graphics-review-guide.md`).
 
 Builds on the execution model, the kernel spec, the service framework and the observability spec.
-Three sibling specs are drafted at the same time: the GPU front/back protocol (#12), the shader
+Three sibling specs were drafted at the same time: the GPU front/back protocol (#12), the shader
 pipeline (#13) and the render backend (#14). "Interfaces to neighbouring designs" lists what this
 spec assumes of them.
 
@@ -41,9 +42,10 @@ counters, the GPU's view of memory, GPU channels, the display (vi2) and the vide
   earlier work and passes it to the render backend, and frees the buffer it replaces. That is
   what paces the title. The fence wait of the other reference is kept as a per-run fallback, as
   a deferred reply.
-- **Video sessions exist from the start; decoding comes later.** Sessions, image pools and
-  syncpoint-backed frame handles are built so titles get past movie playback; the decoder itself
-  is deferred.
+- **Video sessions exist from the start; decoding comes later** (decided by the owner, decision
+  10). Sessions, image pools and syncpoint-backed frame handles are built so titles get past movie
+  playback, with no decoding: movies show a frozen picture. FFmpeg comes later behind a Cargo
+  feature that is off by default.
 
 ## How the protocol is known
 
@@ -65,8 +67,11 @@ Each fact below carries one of four marks:
 - **read:** a reference read it from the SDK or the system module, without a row showing a title
   depending on it.
 - **guess:** a reference marks it guessed, or neither says where it came from.
-- **conflict:** the references disagree. The design picks one reading, says which, and lists the
-  check that settles it ("What to verify before building").
+- **conflict:** the references disagree. The design picks one reading by the house rule of
+  decision 8 (Nvidia's headers and readings that cite the system module for layouts and
+  meanings; where one answer contains the other, the larger; otherwise the one a title ran on),
+  says which, and lists the check that settles it ("What to verify before building"). The code
+  marks each case and a test pins it.
 
 Where a fact has a slice that ports it, the code repeats the citation next to the constant.
 
@@ -325,10 +330,10 @@ syncpoint by 2 at the end, bit 4 skip the wait-for-idle, bit 8 increment by the 
    work before them,
 4. replies at once. The GPU runs later; the title learns it finished through the fence.
 
-If the front's queue is full (`Submitted::Full`), the request takes a deferred reply that gsv
-completes on `GpuCompletion::GpuQueueRoom`. A handler never waits. Whether the queue is bounded
-at all is decision 12, still open and coupled with gpu-protocol's "Back-pressure", which keeps
-queues unbounded.
+Each channel's submission queue is bounded at 65,536 GPFIFO entries (decided by the owner,
+decision 12; the same figure as gpu-protocol's "Back-pressure"). If the front's queue is full
+(`Submitted::Full`), the request takes a deferred reply that gsv completes on
+`GpuCompletion::GpuQueueRoom`. A handler never waits.
 
 Channel creation (AllocGPFIFOEx2) allocates a syncpoint and asks the front to create a channel
 in the right address space; binding an object class goes to the front unchanged. The engine work
@@ -391,20 +396,20 @@ This design builds the buffer queue (decided by the owner, decision 1). The hand
 
 1. 229 validates the client, slot and image, records `Queued { slot, image, fence }` in FIFO
    order, clears the slot's bit, and replies.
-2. Each vsync tick (timer thread, 60 Hz): take the oldest queued frame whose fence is reached.
-   Under the owner's decision 3, "reached" means the host GPU has finished the work that made
-   the frame. If there is one, it becomes the shown frame and is handed to the GPU as a
-   `PresentRequest` (`GpuFront::present`; no fence, nothing waits). The frame it replaces is
-   freed on the same tick: its slot's bit is set again, the client's "buffer available" bit is
-   raised in the notification bitmap, and the notification event is signalled.
+2. Each vsync tick (timer thread, 60 Hz): take the oldest queued frame whose fence is reached. Under
+   the owner's ruling on GPU completion, "reached" means the host GPU has finished the work that
+   made the frame. If there is one, it becomes the shown frame and is handed to the GPU as a
+   `PresentRequest` (`GpuFront::present`; no fence, nothing waits). The frame it replaces is freed
+   on the same tick: its slot's bit is set again, the client's "buffer available" bit is raised in
+   the notification bitmap, and the notification event is signalled.
 3. 228 (cancel) gives a slot back with no image.
 
-Freeing on the tick, not on a report from the render backend, makes buffer return a pure
-function of the 60 Hz clock (review guide, M3, option b; the owner's decision 4: the tick "frees
-the buffer it replaces"). It is safe only because the present and any later draw into the same
-image reach the render backend in order and run in order on its one host queue (render-backend,
-"Submit"). That ordering is an inference the review guide flagged, so it is a **guess** until
-render-backend slice R8's test pins it; if it fails, the release moves back to a render report.
+Freeing on the tick, not on a report from the render backend, makes buffer return a pure function of
+the 60 Hz clock (review guide, M3, option b; the owner's buffer-queue ruling: the tick "frees the
+buffer it replaces"). It is safe only because the present and any later draw into the same image
+reach the render backend in order and run in order on its one host queue (render-backend, "Submit").
+That ordering is an inference the review guide flagged, so it is a **guess** until render-backend
+slice R8's test pins it; if it fails, the release moves back to a render report.
 
 **Fallback: the fence wait** (owner's decision of 2026-11-12). A per-run setting makes 229 hold
 its reply until the previous frame's fence is reached and the next tick has passed, and report
@@ -468,7 +473,11 @@ frame with no picture (the image keeps its contents), incrementing the decoder's
 order, so a title gets through its movies with a frozen picture. That is NX2's state before
 row 148, which was enough to get past the aborts. Real decoding runs on a worker thread per
 decoder service, writes into guest memory through `GuestMemory`, and reports each finished frame
-through the completion queue. How it decodes is decision 10.
+through the completion queue. It comes later: FFmpeg behind a Cargo feature that is off by
+default, covering VP9, AV1 and H.264, with each format moving to a pure-Rust decoder when a good
+enough one exists (decided by the owner, decision 10). The decoder sits behind the session
+protocol, so it can be swapped without changing the sessions. A title that waits for a movie to
+finish may sit on a frozen frame; that is found when a real title hits it.
 
 ## Waiting without blocking a core
 
@@ -482,7 +491,7 @@ Every wait in this design is one of two kinds:
 | vi2 vsync request groups | Kernel event | Vsync tick |
 | vi2 buffer available | Notification bit + event | The vsync tick that latches the frame replacing it |
 | vi2 229 in the fence-wait fallback | Deferred reply | Vsync tick, once the previous frame's fence is reached |
-| SubmitGPFIFO with a full GPU queue (if bounded, decision 12) | Deferred reply | GPU front, when it has room |
+| SubmitGPFIFO with a full GPU queue (65,536 entries, decision 12) | Deferred reply | GPU front, when it has room |
 | Video ready-for-input, frame done | Kernel event; syncpoint fence | Video worker |
 
 ### Who signals what: the completion queue
@@ -526,7 +535,7 @@ lock for longer than a copy.
 ## Interfaces to neighbouring designs
 
 The four graphics drafts were amended together on 2026-11-12 so that every shared type and call
-below has the same name in each. Field names are still proposals.
+below has the same name in each. Field names may still change in implementation.
 
 ### What this spec offers and assumes of the GPU front/back (#12)
 
@@ -550,7 +559,7 @@ pub enum VmUpdate { /* unmap, kind change, memory destroy, sparse-region destroy
 
 pub struct ChannelConfig { pub space: AsId, pub syncpoint: SyncpointId }
 pub struct Submission { pub entries: Vec<GpfifoEntry>, pub wait: Option<Fence>, pub increments: u32, pub wfi: bool }
-pub enum Submitted { Queued, Full }         // Full only if queues are bounded (graphics-server decision 12)
+pub enum Submitted { Queued, Full }         // Full: the channel's queue holds 65,536 entries
 pub struct PresentRequest {
     pub image: ImageDesc,        // GPU address, width, height, pitch, block height, format
     pub shown: Rect,             // the area word 7 of 229 names
@@ -573,7 +582,7 @@ pub trait GpuFront: Send + Sync {                       // implemented by `Gpu` 
 pub enum GpuCompletion {
     SyncpointChanged { id: SyncpointId, value: u32 },   // back thread (after host completion), video worker
     GpuOrdered { ticket: Ticket },                       // an ordered update or barrier is done
-    GpuQueueRoom { channel: ChannelId },                 // a full queue drained (bounded queues only)
+    GpuQueueRoom { channel: ChannelId },                 // a full queue has room again
 }
 pub trait Completions: Send + Sync { fn push(&self, completion: GpuCompletion); } // implemented by gsv
 ```
@@ -718,7 +727,7 @@ are in `eden-pr4588/src/core/hle/service/nvdrv/devices/`. "NX2" names classes in
 | 8 | Native memory and images | 111, 112, 114, 115, 423, 429, 430, 435, 1510, 314, 315; layout sizes | 1, 7 (423); gpu-protocol G5 for the cross-check | PR `native_image_layout.h`, root native-memory handlers; NX2 `Nx2CalculateImageLayout` | Sizes against hand-computed values at block and pitch limits; invalid preferences are errors; the size formula agrees with `starquake-layout` for the same description |
 | 9 | nvsrv framing and nvmap | The nvdrv protocol (Open, Ioctl variants, Close, events), ioctl number decoding, nvmap | 1 | Eden `nvdrv/nvdrv_interface.cpp`, `devices/nvmap.cpp`, `ioctl_serialization.h` | Ioctl byte fixtures; unknown ioctl under both policies |
 | 10 | nvsrv GPU devices | ctrl-gpu characteristics, as-gpu (shared with slice 7's address spaces), tsg-gpu | 6, 7, 9 | Eden `devices/nvhost_ctrl_gpu.cpp`, `nvhost_as_gpu.cpp`; PR `native_gpu_characteristics.h`, `gpu_address_space_layout.h`, `nvhost_as_gpu.cpp`, `nvhost_tsg_gpu.cpp` | Golden bytes of the 0xD0 block, every listed bit; AllocAsEx ranges |
-| 11 | Channels and submission | nvhost-gpu: AllocGPFIFOEx2, AllocObjCtx, SubmitGPFIFO, channel events; deferred reply on a full queue (if decision 12 bounds it) | 2, 3, 10; #12's `GpuFront` (a fake here) | Eden `devices/nvhost_gpu.cpp`; NX2 `nvhost_gpu.cpp` | Fence arithmetic for every flag combination; entries reach the fake in order; a full queue defers and completes |
+| 11 | Channels and submission | nvhost-gpu: AllocGPFIFOEx2, AllocObjCtx, SubmitGPFIFO, channel events; deferred reply on a full queue (decision 12) | 2, 3, 10; #12's `GpuFront` (a fake here) | Eden `devices/nvhost_gpu.cpp`; NX2 `nvhost_gpu.cpp` | Fence arithmetic for every flag combination; entries reach the fake in order; a queue at exactly 65,536 entries defers the next submit, one below does not, and the deferred reply completes on room |
 | 12 | Vsync clock | The 60 Hz deadline from `Env`, no banking of lost time, request-group ticks | 3 | NX2 `PaceToVblank`; PR `StartGroupTick` | Fixed clock: ticks at exact multiples; a late tick does not double up |
 | 13 | vi2 session | Displays, clients, layers, request groups and monitors, notifications, display state | 1, 3, 12 | PR `IVi2Session`; NX2 `INx2Vi2Session` | Each command's reply bytes; monitor kind 0 ticks; the fallback ticks an unregistered group and logs |
 | 14 | Present and pacing | 228, 229, the FIFO latch, release on the latching tick, availability, the fence-wait fallback as a deferred reply | 2, 8, 13; #12's `GpuFront` (a fake here) | PR `QueueNativeImage`, `RefreshReleasedBuffers`; NX2 `PaceToVblank` for the fallback | Scripted presents and ticks: one latch per tick, an unreached fence skips a tick, a slot returns exactly on the tick that latches the frame replacing it and not before; the fallback's reply completes on the first tick after the previous frame's fence |
@@ -730,8 +739,8 @@ gpu-protocol's slice G22 builds the production memory access on them) and can st
 this spec is approved, with slice 1. After slices 1–3: slices 4, 7, 9 and 12 in parallel. Then 5
 (after 4), 8 and 10 (after 7), 13 (after 12). Then 11 (after 10), 14 (after 8 and 13) and 15
 (after 8), in parallel. Slice 16 is last and is single-agent work. Slices 2, 6, 11 and 14 touch
-the seam with #12 and #14 and should wait for those specs' approval, or code against the
-proposed traits and accept a rename.
+the seam with #12 and #14; those specs were approved with this one, so they code against the
+shared interface above.
 
 ## What to verify before building
 
@@ -739,8 +748,9 @@ Traces from a title (local only, never committed) and reading the SDK settle the
 change a decision.
 
 1. **Which reference wins where they disagree:** gpu 201–203, gpu 11's range, syncpt 1's value,
-   211 and 213 reply shapes, 1001–1003, copy or move handles. A trace of the replies the title
-   reads (its next request shows what it took from the last reply) settles each.
+   211 and 213 reply shapes, 1001–1003, copy or move handles. Until a trace, each follows the
+   house rule of decision 8. A trace of the replies the title reads (its next request shows what
+   it took from the last reply) settles each.
 2. **vi2 31/32:** does the title register request groups with 261 before waiting on them? (vsync
    fallback, slice 13)
 3. **Does the title wait for the "buffer available" notification before reusing a buffer?** If
@@ -765,12 +775,11 @@ change a decision.
 
 ## Decisions for the owner
 
-Decided items keep their original text below the ruling, for the record.
+Every item carries its outcome; the original text stays below it, for the record. The rulings
+are in `docs/decision-log.md` (2026-11-12).
 
-1. **Decided by the owner, 2026-11-12:** the buffer queue. A present returns at once with the
-   buffers still in use; the 60 Hz tick shows one ready frame and frees the buffer it replaces;
-   the game waits only when it has no free buffer. The fence wait is a per-run fallback written
-   as a deferred reply.
+1. **Decided by the owner, 2026-11-12:** the buffer queue, with the fence wait as a per-run
+   fallback written as a deferred reply.
 
    **How presents pace the title.**
    - *Buffer queue:* the present reply comes back at once and says which buffers are still busy;
@@ -783,9 +792,8 @@ Decided items keep their original text below the ruling, for the record.
      The fence wait is kept as a per-run fallback in case a title turns out not to wait for free
      buffers (verification 3), written as a deferred reply so that it does not block a core
      either.
-2. **Implied by the owner's decision of 2026-11-12 (presents paced by a buffer queue), whose text
-   names "the graphics server's emulated 60 Hz clock"; not separately confirmed.** The same
-   question is render-backend decision 8.
+2. **Implied by decision 1, 2026-11-12:** our own timer; the buffer-queue ruling names "the
+   graphics server's emulated 60 Hz clock". The same question is render-backend decision 8.
 
    **Where the 60 Hz vsync comes from.**
    - *Our own timer,* from the injectable clock: deterministic, replayable, works headless.
@@ -793,13 +801,9 @@ Decided items keep their original text below the ruling, for the record.
      window, and can't be replayed.
    - Recommendation: **our own timer**. The host display can drive it later without changing the
      design.
-3. **Decided by the owner, 2026-11-12:** in `crates/gpu`, as plain data types. gsv allocates
-   counters, computes each submission's fence and writes mappings; the GPU performs increments
-   after host completion and reads the table on every access; counter changes go into a queue
-   the timer thread drains; unmaps, kind changes and destroys reach the GPU as ordered updates
-   with a barrier, reported only when no earlier GPU work, including the thread that reads
-   command buffers, can still use the old mapping. gpu-protocol's `GpuMemory` stays, with its
-   production implementation in `crates/gpu`; its `SyncpointSink` is dropped.
+3. **Decided by the owner, 2026-11-12:** in `crates/gpu`, as plain data types; gsv decides and
+   the GPU applies, with ordered unmaps reported only when no earlier GPU work can still use the
+   old mapping.
 
    **Where the syncpoint counters and the GPU's translation table live.**
    - *In `crates/gpu`,* as plain types gsv creates and fills. The dependency direction
@@ -808,7 +812,11 @@ Decided items keep their original text below the ruling, for the record.
    - *In gsv, behind traits the GPU calls:* the GPU would pay a virtual call per translation and
      per increment.
    - Recommendation: **in `crates/gpu`**. It needs no new crate and keeps the hot path direct.
-4. **How GPU-only memory is backed.**
+4. **Decided by the owner, 2026-11-12:** lazily on the host, not charged to the title's pools,
+   revisited if a trace shows the console charges it to remote memory. The GPU crate builds the
+   store (gpu-protocol slice G22); gsv keeps extents and accounting.
+
+   **How GPU-only memory is backed.**
    - *Lazily on the host:* storage is created when the GPU first writes a part of a region, and
      the title's memory pools are not charged. Huge reservations cost nothing until used.
    - *Up front from the title's pools* (one reference's first attempt): simple, but titles ran out
@@ -816,37 +824,54 @@ Decided items keep their original text below the ruling, for the record.
    - *Not backed at all:* render targets there would be lost; frames went black this way.
    - Recommendation: **lazily on the host**, revisited if the console turns out to charge these
      regions to the title's remote memory (verification 5).
-   - Still open. Who builds the store is settled by the review guide's M6, applied on
-     2026-11-12: the GPU crate (gpu-protocol slice G22), with gsv keeping extents and accounting.
-5. **Whether registering memory for the GPU also maps it at its own address.**
+5. **Decided by the owner, 2026-11-12:** yes, as recommended.
+
+   **Whether registering memory for the GPU also maps it at its own address.**
    - *Yes* (one reference): it observed nothing running without it, though its explicit map
      command was a stub at the time.
    - *Only when the title asks* (the other): closer to a literal reading of the commands.
    - Recommendation: **yes**, because GPU address == CPU address makes the extra mapping harmless
      and a missing one fatal; a trace can remove it later (verification 4).
-6. **One server for everything, or one per session family.**
+6. **Decided by the owner, 2026-11-12:** one server per family, as recommended.
+
+   **One server for everything, or one per session family.**
    - *One server:* a present waits behind a submission on another core, and so on.
    - *One per family* (root, syncpt, gpu, vi2, nvsrv, video), sharing a state object behind a
      lock: they run in parallel. Probably closer to the console, where vi2 is a separate module.
    - Recommendation: **one per family**.
-7. **Whether the bootstrap order is enforced.**
+7. **Decided by the owner, 2026-11-12:** log first, enforce once a trace confirms the order, as
+   recommended.
+
+   **Whether the bootstrap order is enforced.**
    - *Enforced:* one reference refuses commands out of order. Its error codes are its own guesses.
    - *Logged:* accept and log, as the kernel does with capabilities at first.
    - Recommendation: **log first, enforce once a trace confirms the order**.
-8. **Which reference wins when they disagree, until a trace settles it.**
+8. **Decided by the owner, 2026-11-12:** one house rule for this spec and gpu-protocol: Nvidia's
+   headers and readings that cite the system module for layouts and meanings; where one answer
+   contains the other, the larger; otherwise the one a title ran on. Each case is marked in the
+   code and pinned by a test.
+
+   **Which reference wins when they disagree, until a trace settles it.**
    - Recommendation: **where one answer contains the other (a wider range, extra reply words a
      client can ignore), the larger one; otherwise the one a title ran on; when both ran or
      neither did, the one that cites the system module**. Each choice is marked "conflict" in the
      code and listed in verification 1. The alternative, deciding case by case without a rule,
      makes reviews argue each one again.
-9. **How the shared syncpoint page is answered.**
+9. **Decided by the owner, 2026-11-12:** on demand, at most 1 ms stale; the 1 ms bound alone until
+   the kernel has the event hook.
+
+   **How the shared syncpoint page is answered.**
    - *Polled* every 0.5–1 ms, as both references do: simple, adds up to a millisecond to waits,
      and costs a timer wake-up 1,000–2,000 times a second.
    - *On demand:* when the title signals, when a watched counter changes, and at the latest after
      1 ms. Faster, and idle when nothing is asked.
    - Recommendation: **on demand with the 1 ms bound**; until the kernel offers the event hook it
      is the 1 ms bound alone.
-10. **How video is decoded, when it is.**
+10. **Decided by the owner, 2026-11-12:** no decoding in the first slices, then FFmpeg behind an
+    off-by-default Cargo feature, each format moving to a pure-Rust decoder when a good enough one
+    exists.
+
+    **How video is decoded, when it is.**
     - *FFmpeg,* behind a Cargo feature that is off by default: covers VP9, AV1 and H.264 today, but
       is a C library, which the project keeps out of the default build.
     - *Pure-Rust decoders:* fit the project's rules; AV1 has a Rust port of a mature decoder, VP9
@@ -854,28 +879,29 @@ Decided items keep their original text below the ruling, for the record.
     - *No decoding:* movies play with a frozen picture; titles carry on.
     - Recommendation: **no decoding in the first slices, then FFmpeg behind an off-by-default
       feature**, replaced by Rust decoders where one is good enough.
-11. **Which Switch 1 paths to build.**
+11. **Decided by the owner, 2026-11-12:** only the ioctl subset, as recommended.
+
+    **Which Switch 1 paths to build.**
     - *Only the nvdrv ioctls Switch 2's driver uses, behind gsv:* what the evidence shows titles
       need.
     - *Also the `nvdrv` and old `vi` named services:* useful only for Switch 1 titles.
     - Recommendation: **only the ioctl subset**; the named services are deferred (section
       "Switch 1 paths").
-12. **What happens when the GPU's queue is full.**
+12. **Decided by the owner, 2026-11-12:** bounded at 65,536 entries; a full queue makes the submit
+    wait as a deferred reply.
+
+    **What happens when the GPU's queue is full.**
     - *A bounded queue; the submission waits as a deferred reply* until there is room, like a
       console channel whose ring is full.
     - *An unbounded queue:* simpler, but a title that runs far ahead grows host memory without
       limit.
     - Recommendation: **bounded, with a deferred reply**.
-   - Still open, and coupled: gpu-protocol keeps its submission queues unbounded ("Back-pressure").
-     Choosing bounded means `GpuFront::submit` returns `Submitted::Full` and the GPU pushes
-     `GpuCompletion::GpuQueueRoom`; both are already in the shared interface. The review guide
-     recommends bounded, at gpu-protocol's 65,536-entry figure.
 
 ## Deferred, not ruled out
 
 | Deferred | How it could be added |
 |---|---|
-| Real video decoding (decision 10) and the encoder | A worker per decoder service, reporting through the completion queue; the session protocol is already in place |
+| Real video decoding (decision 10: FFmpeg behind an off-by-default feature, then pure-Rust decoders per format) and the encoder | A worker per decoder service, reporting through the completion queue; the session protocol is already in place |
 | Several displays and layers, overlay and player displays, HDR, output encodings beyond the default | vi2 keeps displays and layers as tables from the start; composition is a render-backend change |
 | Docked and handheld output sizes | Display state replies (106 and others) read from a display description instead of constants; `am` reports the mode |
 | Remote-memory bootstrap and charging GPU-only memory to it | The bootstrap already records the mode; accounting moves from "host only" to the kernel's pools |
