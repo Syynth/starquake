@@ -7,8 +7,7 @@
 //! ```
 //!
 //! `counter-hz` is the rate the counter program expects `cntfrq_el0` to read. It defaults to
-//! 19.2 MHz, the rate the kernel gives a process today (`CNTFREQ` in
-//! `eden/src/core/hardware_properties.h`).
+//! [`programs::COUNTER_HZ`], the rate the kernel gives a process today.
 
 #![expect(
     clippy::print_stdout,
@@ -20,9 +19,6 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use starquake_testkit::programs;
-
-/// The counter rate used when none is given (see the module docs).
-const DEFAULT_COUNTER_HZ: u64 = 19_200_000;
 
 fn write_all(folder: &Path, counter_hz: u64) -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(folder)?;
@@ -47,7 +43,7 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     };
     let counter_hz = match counter_hz.map(|text| text.to_str().and_then(|text| text.parse().ok())) {
-        None => DEFAULT_COUNTER_HZ,
+        None => programs::COUNTER_HZ,
         Some(Some(hz)) => hz,
         Some(None) => {
             eprintln!("guest_programs: counter-hz must be a whole number of hertz");

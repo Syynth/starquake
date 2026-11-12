@@ -23,6 +23,11 @@ pub const SVC_EXIT_PROCESS: u32 = 0x07;
 /// (`SvcWrap_OutputDebugString64` in `eden/src/core/hle/kernel/svc.cpp`).
 pub const SVC_OUTPUT_DEBUG_STRING: u32 = 0x27;
 
+/// The rate, in hertz, a Switch 1 process's counter runs at, and so what its `cntfrq_el0`
+/// reads: 19.2 MHz (`CNTFREQ` in `eden/src/core/hardware_properties.h`, "`CNTPCT_EL0` Frequency =
+/// 19.2 MHz"). The rate to build [`counter`] with for a run under the kernel as it is today.
+pub const COUNTER_HZ: u64 = 19_200_000;
+
 /// The two lines [`hello`] prints, in order.
 pub const HELLO_LINES: [&[u8]; 2] = [b"hello from the guest", b"starquake walking skeleton"];
 
