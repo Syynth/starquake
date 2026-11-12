@@ -184,9 +184,11 @@ enum ServerKind { Hle(Box<dyn SessionHandler>), /* later: Guest { .. } */ }
 - A request starts when its session has nothing in flight **and** its server has a free worker.
   Servers have one worker by default, so one handler per server runs at a time (`services.md`,
   "Concurrency"); a deferred request is in flight on its session but doesn't hold the worker.
-- Starting a request on an HLE server: parse the message with `starquake-ipc`, resolve copy and
-  move handles against the caller's handle table, and call the handler **without holding the
-  kernel lock**. Reply handles are inserted into the caller's table on the way back, the caller
+- Starting a request on an HLE server: the kernel handles the **HIPC layer** with `starquake-ipc`
+  (the process id, copy and move handles resolved against the caller's handle table, and the
+  buffer descriptors), then calls the handler **without holding the kernel lock**. The handler,
+  in the service framework, parses the CMIF or TIPC payload, because only the server knows
+  whether a session is a domain. (Boundary settled by the lead under delegation, 2026-11-12.) Reply handles are inserted into the caller's table on the way back, the caller
   is woken, and the core that finished starts the server's next ready request.
 - Closing either end follows Horizon: waiting and in-flight requests complete with the
   session-closed result.

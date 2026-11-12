@@ -129,6 +129,9 @@ trait Translation {
   matching what titles expect (`svcGetInfo` 33 reports 0x1000). The tables live in their own
   backing region and are written directly by the host. `tools/hvprobe` verified that 4 KiB pages
   inside one 16 KiB host page map independently.
+- **The EL1 shim is mapped separately, in the upper address half (TTBR1),** with small static
+  tables the backend owns. Guest tables only ever describe EL0 pages, so nothing a guest's
+  address space contains can affect the shim. (Decided by the lead under delegation, 2026-11-12.)
 - `Stage1Tables` is a plain data structure: given `map`/`unmap`/`protect` calls it writes table
   entries into a byte region. A software walker reads them back. Both are safe Rust, testable on
   any host, and shared by the Hypervisor.framework and KVM backends. A hardware test on a Mac
