@@ -97,6 +97,29 @@ slices 4 and 5.
 | proposed | **feat(kernel): pinned threads** (the pinned-thread lookup, core-migration disables, suspend-allowed flags) | No port slice owns it, and Eden's scheduler depends on it. Needs a row in the spec's port plan. | area:kernel, M1 |
 | accepted (lead, under delegation): carried into those issues when they are filed | **Additions to the briefs for kernel slices 4–10** when they are filed: slice 5 splits requested and in-state suspend flags and adds kernel-waiter checks; slice 8 makes the yield count per process and adds virtual-to-physical core translation and the core-mask call's checks and waits; slice 10 takes queue rotation (time slicing) | Found while porting the scheduler; each belongs to a later slice. | area:kernel |
 
+### From the walking skeleton (#74) and wave 5 (ledger: #22)
+
+All vetted by the lead under delegation; open to the owner's review.
+
+| Status | Proposal | Why |
+|---|---|---|
+| promoted #85 (lead, under delegation) | **The hypervisor backend runs guests on stage-1 tables**, with a hardware cross-check of the walker, atomic descriptor writes and an instruction-abort exit | The skeleton's memory is identity-mapped and read-write-execute. Nothing owned adopting the tables. |
+| ruled (lead, under delegation): the shim lives in the upper address half (TTBR1) with its own static tables; in #85 | **Mapping the EL1 shim** | Every page the stage-1 builder writes is EL0-only and never privileged-executable, so the shim can't be mapped through it. |
+| ruled (lead, under delegation): the kernel handles the HIPC layer (handles, process id, descriptors), the framework parses CMIF and TIPC; specs amended | **Which side parses messages** | Both specs said the kernel parses, but only the server knows whether a session is a domain. |
+| promoted #86 (lead, under delegation) | **Byte-exact libnx message layouts** | The reply builder pads before domain object ids, and parsers need the expected size as libnx does. Milestone 1's program is built with libnx. |
+| promoted #88 (lead, under delegation) | **Pin gate tools; list the Arm reference manual; add Atmosphère as a facts-only reference** | A tool release can turn `main` red; six result codes in the service framework are guesses Atmosphère would settle. Atmosphère is GPL-2.0-only, so it is a reference for facts, never for code. |
+| ruled (lead, under delegation): the feature is `test-support`, as the owner decided; the workspace allows the lint that rejected the name; services renames its `fakes` feature in #87 | **Name of the per-crate fakes feature** | The skeleton and the service framework chose differently. |
+| promoted #87 (lead, under delegation) | **Service slices 3–5 with a snapshot hook** (deferred replies, per-server queue, trace sink, `sm:`, `set:sys`) | The observability spec's snapshot rule needs a hook before the first real services are written. |
+| promoted (lead, under delegation): filed when #75 lands | **Kernel slices 4–10** | Unchanged from wave 3. |
+| folded into #75 (lead, under delegation) | **Align the zero point of patched counter reads and `GetSystemTick`; per-process counter rate; name the environment's clock type for what it returns (host nanoseconds)** | The skeleton shares a rate between the two clocks but not a starting point. |
+| folded into #85 (lead, under delegation) | **Unpatched counter reads answered at the host rate by the shim** | A read the patcher misses would disagree with patched ones. |
+| proposed | **Crash report: a frame-pointer backtrace; a program counter for timed-out runs** | Reviewer follow-up; useful once real programs run. |
+| proposed | **A stop handle for runs (Ctrl-C leaves no artifacts); print guest log lines as they happen; a default timeout** | Reviewer and builder follow-ups on the command-line app. |
+| proposed | **Stage-1 tables: a failed write during `map` can leave a table page registered but unlinked; a table descriptor with other ignored bits set is accepted** | Found by #76's fix pass; neither affects correct guests. |
+| proposed | **Pinned threads** | No kernel slice owns them (from wave 4). |
+| accepted (lead, under delegation) as provisional | **Run limits: the trace keeps a run's first 100,000 events and the guest log its first 4 MiB**, with truncation recorded in the summary | The observability spec asks for a per-run cap without numbers. The newest events are always in the flight recorder. |
+| accepted (lead, under delegation) | **`guest_log.txt` in the artifacts folder; usage and file errors exit with code 2; `summary.json` and `crash.json` layouts as the skeleton defines them** | Gaps in the observability spec that the skeleton filled; spec amended. |
+
 ## House-rule candidates
 
 Rules distilled from review findings. A vetted rule moves into `CLAUDE.md`; until then it is
@@ -135,3 +158,16 @@ passed to build agents as a provisional rule for the next wave.
 | dropped (lead, under delegation): covered by the cite-the-exact-check rule | When a doc or PR states an error for every argument, probe each argument against the reference, including the reference's order of checks, and pin each case with a test. |
 | adopted (lead, under delegation) | A test invariant mirrors the reference's exact condition; no broad escape clause that switches the assertion off in common generated cases. |
 | dropped (lead, under delegation): too specific | Property tests that drive a clock keep time monotonic, including in their final step. |
+
+### From wave 5
+
+| Status | Rule |
+|---|---|
+| adopted (lead, under delegation) | Every boundary check gets a test at the exact edge on both sides. |
+| adopted (lead, under delegation) | A docs or PR claim that something is "pinned by a test" names the test. |
+| adopted (lead, under delegation) | Decisions in command-line or gate code are pure functions with every input combination tested. |
+| adopted (lead, under delegation) | Tests that touch the file system use a per-test unique folder and clean up; new tests are run many times under both plain `cargo test` and nextest. |
+| adopted (lead, under delegation) | When an operation can fail after it has begun changing shared state, the required side effect (flush, cleanup, rollback) happens on the error path too, pinned by a test double that fails mid-operation. |
+| adopted (lead, under delegation) | A freed resource is not reusable until every pending follow-up on it has run. |
+| adopted (lead, under delegation) | An id or pointer read from guest-writable or possibly corrupt data is validated against what was actually allocated, not just a range. |
+| dropped (lead, under delegation): covered by "report spec conflicts, don't resolve them" | When a spec prescribes a mechanism, follow it or report the conflict. |

@@ -152,3 +152,11 @@ Entry format:
 - **SCOPE:** moderate
 - **WHAT:** While autonomous mode lasts, the lead writes decision-log entries without asking for approval of each one: entries for decisions the owner states, and entries for decisions the lead makes under delegation, marked "Decided by the lead under delegation". The lead also vets `docs/proposals.md` itself: it promotes what the milestone 1 path needs, rules on spec deviations, and records each choice in the file. Anything off that path stays proposed. The owner reviews both afterwards and can overturn any of them.
 - **WHY:** Stopping for approval of every entry and every proposal was most of the ceremony in the process, and it blocked all remaining kernel and service work. The owner chose both options when asked.
+
+## Design rulings made by the lead under delegation, 2026-11-12
+- **WHEN:** 2026-11-12
+- **PROJECT:** starquake
+- **SYSTEM:** cross-system
+- **SCOPE:** moderate
+- **WHAT:** Decided by the lead under delegation, after the walking skeleton and wave 5: (1) the EL1 shim is mapped in the upper address half (TTBR1) with its own static tables, separate from guest tables; (2) the kernel handles the HIPC layer of a message (handles, process id, descriptors) and the service framework parses the CMIF or TIPC payload; (3) per-crate fakes live behind a feature named `test-support`, and the workspace allows the clippy lint that rejects that name; (4) Atmosphère is a pinned reference for facts only, because its GPL-2.0-only licence can't be combined with this project's; (5) a run's text trace and guest log are capped (100,000 events, 4 MiB), provisionally; (6) the kernel owns guest time, with a per-process counter rate and one zero point shared with patched counter reads.
+- **WHY:** Each was a gap or conflict that building exposed: the stage-1 builder can't map privileged code; only a server knows whether its session is a domain; two tasks chose different feature names; six service result codes were guesses a facts-only reference settles; an uncapped run could exhaust host memory; and three crates each assumed another converted the clock. The owner delegated design decisions until milestone 1 and reviews them afterwards.

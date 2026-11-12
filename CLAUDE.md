@@ -75,6 +75,12 @@ Platform-specific code must still compile (or be `cfg`-gated) on Linux; check wi
   the start, and bound loops over untrusted structures by the structure actually walked.
 - Compatibility comes first. A design may defer a feature (server-side IPC, real system modules,
   homebrew services), but must not rule it out, and must say how it could be added later.
+- An id or pointer read from guest-writable or possibly corrupt data is validated against what
+  was actually allocated, not just against a range.
+- When an operation can fail after it has begun changing shared state, its required side effect
+  (flush, cleanup, rollback) happens on the error path too. A freed resource is not reusable
+  until every pending follow-up on it (a TLB flush, a notification) has run.
+- Decisions in command-line and gate code are pure functions, tested for every input combination.
 - Protocol facts (command ids, struct layouts) need a source in a comment: a scoping-doc row, a
   reference path and commit, or a trace. Mark guesses as guesses, and say what would confirm them.
 - When mirroring reference behaviour, cite the exact check and its constant. Where starquake is
@@ -120,6 +126,10 @@ Platform-specific code must still compile (or be `cfg`-gated) on Linux; check wi
   header's magic and version before the body.
 - A test invariant mirrors the reference's exact condition; no escape clause that switches the
   assertion off in common generated cases.
+- Every boundary check gets a test at the exact edge on both sides. A claim that something is
+  "pinned by a test" names the test.
+- Tests that touch the file system use a per-test unique folder and clean up; run a new test many
+  times under both plain `cargo test` and nextest before trusting it.
 - Negative tests assert the exact error (variant, exit code, message), so a missing or broken
   implementation can't pass them.
 - Never hide a flaky test behind retries: reproduce it under plain `cargo test` as well as

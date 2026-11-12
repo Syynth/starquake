@@ -121,7 +121,12 @@ starquake run <program>
 ```
 
 Exit codes: 0 reached the stop condition, 1 the guest crashed, 2 emulator error, 3 timeout,
-4 an unimplemented feature was hit under the strict policy.
+4 an unimplemented feature was hit under the strict policy. Usage errors and unreadable or malformed
+program files are emulator errors (2).
+
+A run is bounded: the text trace keeps its first 100,000 events and the guest log its first
+4 MiB, and `summary.json` records what was cut. The newest events are always in the flight
+recorder. These numbers are provisional. (Added by the lead under delegation, 2026-11-12.)
 
 The artifacts folder always contains:
 
@@ -132,6 +137,7 @@ The artifacts folder always contains:
 | `events.bin` | Flight recorder dump, or the full log when recording |
 | `crash.json`, `crash.txt` | When the guest crashed (below) |
 | `frames/` | PNG frame dumps on request or at the end |
+| `guest_log.txt` | The text the guest wrote with debug output calls |
 | `snapshots/` | When requested |
 
 No window is needed for any of this. Configuration comes from flags and one file, not from
