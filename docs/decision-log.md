@@ -305,3 +305,11 @@ Entry format:
 - **WHAT:** The shader crate's intermediate representation is a new Rust design that keeps Eden's operation set and pass behaviour but stores instructions in arenas referred to by typed ids, not pointer-linked objects. It has its own register class for Switch 2's uniform registers, a text form that can be printed and parsed for tests, and a verifier run after every pass in tests and debug builds. Eden's passes are ported by behaviour, not line by line (shader 1).
 - **WHY:** Eden's operations and passes are the proven part; its pointer-linked data layout fights Rust's ownership rules and tends toward `unsafe`, which the project bans outside host-facing crates. The kernel's move to tables and ids ported Eden's logic cleanly, and the same approach gives deterministic, testable IR. A native design also avoids Eden's Switch 1-era trick of packing uniform registers into the top of the regular register file.
 
+## The wgpu backend's GPU tests run in Linux CI on lavapipe, if it runs cleanly
+- **WHEN:** 2026-11-12
+- **PROJECT:** starquake
+- **SYSTEM:** render, testing
+- **SCOPE:** moderate
+- **WHAT:** If an experiment shows wgpu runs cleanly and deterministically on Mesa's software Vulkan driver (lavapipe) on GitHub's hosted Linux runners, the render backend's GPU tests are required in Linux CI and skipped locally, with a notice, where no GPU adapter exists. Golden images are compared exactly only for scenes whose pixels can be computed; others use a stated tolerance. If the experiment fails, the GPU tests are local-only, like the hypervisor tests (render 9).
+- **WHY:** Most changes are made by agents, and an agent that breaks the render backend should learn it from the PR's checks, not from the owner noticing a broken frame later. The recording backend already tests most logic without a GPU, so these tests only need to cover what is specific to wgpu, and the cost is a package install and somewhat slower CI.
+
