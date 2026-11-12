@@ -9,4 +9,5 @@
 pub mod field;
 pub mod fifo;
 pub mod mme;
+pub mod ring;
 pub mod sema;
