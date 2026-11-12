@@ -9,17 +9,13 @@
 //! messages here name a title by its position in the sorted folder listing ("title 0"), never by
 //! its file name, and print loader errors (offsets, sizes, record indices) but no file names
 //! from inside the title.
-//!
-//! An NSO whose header selects ZBIC compression is accepted with
-//! [`NsoError::UnsupportedCompression`]: the NSO parser checks the magic and reads the flags
-//! before it refuses, and decompressing ZBIC is not part of this issue.
 
 use std::fs::File;
 use std::io::BufReader;
 use std::path::PathBuf;
 
 use starquake_loader::npdm::Npdm;
-use starquake_loader::nso::{Nso, NsoError};
+use starquake_loader::nso::Nso;
 use starquake_loader::nup::{Node, Nup};
 
 /// The variable naming the folder of dumps.
@@ -96,11 +92,9 @@ fn every_local_title_verifies_and_its_exefs_parses() {
                 .read_to_vec(file, EXEFS_READ_LIMIT)
                 .map_err(|error| format!("title {index}: ExeFS module {modules}: {error}"))
                 .unwrap();
-            let parsed = match Nso::parse(&bytes) {
-                Ok(_) | Err(NsoError::UnsupportedCompression) => Ok(()),
-                Err(error) => Err(format!("title {index}: ExeFS module {modules}: {error}")),
-            };
-            parsed.unwrap();
+            Nso::parse(&bytes)
+                .map_err(|error| format!("title {index}: ExeFS module {modules}: {error}"))
+                .unwrap();
         }
         assert!(modules > 0, "title {index}: its ExeFS has no modules");
         eprintln!(
