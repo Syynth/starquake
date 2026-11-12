@@ -83,6 +83,28 @@ the guest's own value (an `svc` argument) there. The shim uses `hvc #2` (`HVC_EL
 `hvc #1` marks a vector the shim doesn't use. Real guests hit this on any `svc` whose first
 argument has top byte `0xc1` in its low word.
 
+### Stage-1 tables under a running guest (added 2026-11-11)
+
+Measured by the hypervisor backend's hardware tests (`crates/cpu/tests/hvf.rs`,
+`crates/cpu/src/hvf/hardware.rs`), not by the probe, on the same Apple M2 with macOS 27.0.1.
+The guest runs at EL0 on tables built by `starquake_memory::stage1::Stage1Tables` through
+`TTBR0_EL1`; the EL1 shim is in the upper half through `TTBR1_EL1` (`T0SZ` = `T1SZ` = 25).
+
+| Question | Result | Consequence |
+|---|---|---|
+| Address-space id width a guest gets | **8 bits**: `ID_AA64MMFR0_EL1` reads `0x10000f100001` in the guest (`ASIDBits` = 0). Two address spaces whose ids differed only above bit 7 (`0x0100`, `0x0200`) shared cached translations on the first switch | At most 256 ids. The spec's interface takes 16 bits; the backend reports the width and refuses a wider id. The kernel must hand out ids within it and flush before reusing one. |
+| Do cached translations survive an exit to the host and a change of `TTBR0_EL1`? | **Yes.** A vCPU switched to an empty table under the same id kept running the old address space's code | An id must not be given to other tables without a flush. Switching between ids with no flush works: 200 switches between two address spaces mapping one address to different pages, each read its own. |
+| Non-global pages (`nG`), execute-only pages (`AP` = 0b00 without `UXN`), `PXN` on every guest page | All behave as the Arm manual says; the software walker and the vCPU agree for all six permissions and three kinds of access, and for addresses missing at walk levels 1, 2 and 3 | The parts of `Stage1Tables` that hvprobe never wrote are now run on hardware. |
+| Syndrome of a stage-1 fault from EL0 | Exactly class, `IL`, `WnR` and the fault status code; every other `ISS` bit zero | A backend can build the same value for a software MMU. |
+| An address between the two halves (`0x80_0000_0000` to `0xffff_ff7f_ffff_ffff`) | Translation fault reported at **level 0**, for load, store and fetch | What the software walker calls out of range. |
+| `tlbi vae1is` / `vale1is` / `aside1is` executed at EL1 by one vCPU | A second vCPU spinning in the guest on the unmapped page faulted within the test's bound (2,000,000 loop iterations after the flush returned) in 40 of 40 rounds. With the flush taken out it ran on for 270 million iterations | By-address broadcast invalidation works across vCPUs, as `vmalle1is` did above. |
+| The same with the local form, `tlbi vae1` | The second vCPU was stopped just the same (40 of 40) | Hypervisor.framework appears to make a guest's local invalidations broadcast, so this test cannot tell the two forms apart. The backend uses the broadcast forms regardless. |
+| Does a vCPU that stays in the guest keep its cached translation until the flush? | **Not on a busy host.** In the broadcast test above, with every core busy with other work, the spinning vCPU often faulted before the flush had run, at level 2 or 3 where the finished unmap says level 1 (32 of 40 runs had at least one such round: 17 at level 2, 15 at level 3). Why it walks again is not measured (a guess: the host descheduled its thread) | An unmap is visible to other vCPUs from its first descriptor write, in whatever state the walk finds, not only once the flush has run. Nothing may assume an old translation stays usable until the flush. |
+| Leaf-only invalidation (`vale1is`) after a page's level-3 and level-2 tables were unlinked | The next access faulted at **level 3** where the tables say level 1, on the vCPU that flushed and on another: both still reached the unlinked level-3 table | Cached walk entries are real. Unlinked table pages need the every-level form (`vae1is`), and must not be reused before it has run. |
+| Stage-2 write protection of the translation tables and the shim | A guest store to a page stage 2 maps read-only exits to the host (`ESR_EL2` class 0x24) with the exact guest-physical address; a guest load works, and so do the MMU's own table walks | Tables and shim are mapped without write permission; a mapping that wrongly pointed at them could not change them. |
+| A 64-bit descriptor written by the host as two halves (2,000 spin-loop iterations apart) while a vCPU walks to it | The vCPU stopped with a stage-2 fault at once: the half-written descriptor named `0x1000a000`, the low half of a page at `0x1_1000_a000` | Descriptors are written with one atomic 64-bit store. Guest RAM sits above 4 GiB so that a torn write cannot go unnoticed. |
+| The shim's page made accessible to EL0 (`AP` = 0b01) | The vCPU never comes back: a page EL0 can write is not executable at EL1, so the shim faults into itself forever | The shim's mapping must stay EL1-only; the golden test of the static tables guards it. |
+
 What this doesn't cover yet: VM-exit cost with six vCPUs running at once, full context-switch cost,
 `hv_vcpus_exit` for preempting a vCPU, stage-2 remapping cost (lazy backing of sparse regions),
 and exception-level details of a real HLE kernel (TPIDRRO_EL0, FP/SIMD state, EL0 data aborts

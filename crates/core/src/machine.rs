@@ -4,10 +4,11 @@
 //! ```text
 //! loop
 //!   match vcpu.run()
-//!     Svc(n)        -> kernel dispatcher, with the vCPU's registers; ExitProcess ends the run
-//!     DataAbort     -> the guest crashed
-//!     Undefined     -> the guest crashed
-//!     Interrupted   -> the timeout passed, or resume
+//!     Svc(n)            -> kernel dispatcher, with the vCPU's registers; ExitProcess ends the run
+//!     DataAbort         -> the guest crashed
+//!     InstructionAbort  -> the guest crashed
+//!     Undefined         -> the guest crashed
+//!     Interrupted       -> the timeout passed, or resume
 //! ```
 //!
 //! It is generic over [`Vcpu`], so everything here runs on any host against a scripted vCPU; the
@@ -25,9 +26,9 @@
 //!   `TPIDRRO_EL0` set and every other register zero, and the vCPU's pointer-authentication keys
 //!   are left as the backend creates them. Kernel slice 8 sets what Horizon hands a main thread
 //!   and generates the process's keys.
-//! - **Every abort is fatal.** There is no address space to consult, so a data abort always ends
-//!   the run. Kernel slice 6 (memory blocks) decides between lazy backing, write tracking and a
-//!   crash.
+//! - **Every abort is fatal.** Nothing is lazily backed or write-tracked yet, so a data abort
+//!   or an instruction abort always ends the run, whatever its syndrome says. Kernel slice 6
+//!   (memory blocks) decides between lazy backing, write tracking and a crash.
 //! - **Lifecycle, fault and guest-log events are recorded here**, not by the kernel. Lifecycle
 //!   and fault events are recorded outside the kernel lock, which is harmless with one thread.
 //!   A guest-log event is recorded by this loop's [`DebugSink`] while the dispatcher runs
@@ -498,25 +499,17 @@ fn drive<V: Vcpu, C: HostClock + Clone + 'static>(
                     }
                 }
             }
-            Exit::DataAbort { address, write } => {
-                session.record(EventKind::Fault {
-                    address,
-                    write,
-                    action: FaultAction::Fatal,
-                });
-                return match vcpu.regs() {
-                    Ok(regs) => {
-                        Ending::Crashed(Exception::DataAbort { address, write }, Box::new(regs))
-                    }
-                    Err(error) => vcpu_failed(error),
-                };
+            Exit::DataAbort { address, write, .. } => {
+                let exception = Exception::DataAbort { address, write };
+                return fatal_fault(vcpu, session, address, write, exception);
             }
-            Exit::Undefined { .. } => {
-                return match vcpu.regs() {
-                    Ok(regs) => Ending::Crashed(Exception::UndefinedInstruction, Box::new(regs)),
-                    Err(error) => vcpu_failed(error),
-                };
+            Exit::InstructionAbort { address, .. } => {
+                // The event stream has one kind of fault; a fetch is recorded as a read, as it
+                // was when the backend reported fetch faults as data aborts.
+                let exception = Exception::InstructionAbort { address };
+                return fatal_fault(vcpu, session, address, false, exception);
             }
+            Exit::Undefined { .. } => return crashed(vcpu, Exception::UndefinedInstruction),
             Exit::Interrupted => {
                 if watchdog.fired() {
                     return Ending::TimedOut;
@@ -525,6 +518,30 @@ fn drive<V: Vcpu, C: HostClock + Clone + 'static>(
             }
         }
     }
+}
+
+/// Ends the run as a crash with `exception`, with the guest's registers as they are now.
+fn crashed<V: Vcpu>(vcpu: &V, exception: Exception) -> Ending {
+    match vcpu.regs() {
+        Ok(regs) => Ending::Crashed(exception, Box::new(regs)),
+        Err(error) => Ending::Failed(format!("the vCPU failed: {error}")),
+    }
+}
+
+/// Records an abort at `address` as a fatal fault and ends the run as a crash with `exception`.
+fn fatal_fault<V: Vcpu, C: HostClock + Clone>(
+    vcpu: &V,
+    session: &Session<'_, C>,
+    address: u64,
+    write: bool,
+    exception: Exception,
+) -> Ending {
+    session.record(EventKind::Fault {
+        address,
+        write,
+        action: FaultAction::Fatal,
+    });
+    crashed(vcpu, exception)
 }
 
 /// The newest events the flight recorder holds, oldest first, one line each.

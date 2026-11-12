@@ -13,6 +13,8 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
+use starquake_memory::stage1::TableRoot;
+
 use crate::{Error, Exit, GuestRegs, Interrupter, Vcpu};
 
 /// What the scripted guest does to its registers before an exit.
@@ -58,6 +60,7 @@ pub struct ScriptedVcpu {
     regs: GuestRegs,
     steps: VecDeque<Step>,
     signal: Arc<Signal>,
+    address_space: Option<(TableRoot, u16)>,
 }
 
 impl ScriptedVcpu {
@@ -90,6 +93,13 @@ impl ScriptedVcpu {
     #[must_use]
     pub fn remaining(&self) -> usize {
         self.steps.len()
+    }
+
+    /// The table root and address-space id last given to [`Vcpu::set_address_space`], or `None`
+    /// if it was never called. The scripted guest has no memory, so nothing else uses them.
+    #[must_use]
+    pub fn address_space(&self) -> Option<(TableRoot, u16)> {
+        self.address_space
     }
 }
 
@@ -142,11 +152,17 @@ impl Vcpu for ScriptedVcpu {
         self.regs = regs.clone();
         Ok(())
     }
+
+    fn set_address_space(&mut self, root: TableRoot, asid: u16) -> Result<(), Error> {
+        self.address_space = Some((root, asid));
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Syndrome;
 
     #[test]
     fn steps_play_in_order_and_see_what_the_host_wrote() {
@@ -158,7 +174,10 @@ mod tests {
                     assert_eq!(regs.x[0], 0xAA);
                     regs.pc = 0x1000;
                 },
-                Exit::Undefined { pc: 0x1000 },
+                Exit::Undefined {
+                    pc: 0x1000,
+                    syndrome: Syndrome::undefined(),
+                },
             );
         assert_eq!(vcpu.remaining(), 2);
         assert_eq!(vcpu.run(), Ok(Exit::Svc(0x27)));
@@ -166,7 +185,13 @@ mod tests {
         assert_eq!(regs.x[0], 1);
         regs.x[0] = 0xAA;
         vcpu.set_regs(&regs).unwrap();
-        assert_eq!(vcpu.run(), Ok(Exit::Undefined { pc: 0x1000 }));
+        assert_eq!(
+            vcpu.run(),
+            Ok(Exit::Undefined {
+                pc: 0x1000,
+                syndrome: Syndrome::undefined()
+            })
+        );
         assert_eq!(vcpu.regs().unwrap().pc, 0x1000);
         assert_eq!(vcpu.remaining(), 0);
     }
@@ -203,6 +228,18 @@ mod tests {
         }
         // The step after the spin is never reached.
         assert_eq!(vcpu.remaining(), 2);
+    }
+
+    #[test]
+    fn the_last_address_space_given_is_remembered() {
+        let mut vcpu = ScriptedVcpu::new();
+        assert_eq!(vcpu.address_space(), None);
+        let first = TableRoot::new(0x1000).unwrap();
+        let second = TableRoot::new(0x2000).unwrap();
+        vcpu.set_address_space(first, 1).unwrap();
+        assert_eq!(vcpu.address_space(), Some((first, 1)));
+        vcpu.set_address_space(second, 0xbeef).unwrap();
+        assert_eq!(vcpu.address_space(), Some((second, 0xbeef)));
     }
 
     #[test]

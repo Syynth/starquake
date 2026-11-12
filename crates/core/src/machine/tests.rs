@@ -6,7 +6,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use starquake_cpu::testing::ScriptedVcpu;
-use starquake_cpu::{Exit, Interrupter, Vcpu};
+use starquake_cpu::{Exit, FaultStatus, Interrupter, Syndrome, Vcpu};
 use starquake_kernel::result::KernelError;
 use starquake_kernel::svc::SvcId;
 use starquake_memory::{Fault, FlatMemory};
@@ -22,7 +22,8 @@ use crate::crash::Location;
 use crate::image::{Program, place};
 use crate::report::{empty_dump, exit_code};
 
-const RAM_BASE: u64 = 0x8000_0000;
+/// Where a real run puts the program.
+const RAM_BASE: u64 = crate::image::IMAGE_BASE;
 /// Room for a small image, its TLS block and the stack.
 const RAM_SIZE: usize = 2 << 20;
 
@@ -72,6 +73,10 @@ impl Guest {
             .start
     }
 }
+
+/// The syndrome a real vCPU reports for a store to an address nothing maps, missing at the
+/// first level of the walk.
+const UNMAPPED_STORE: Syndrome = Syndrome::data_abort(FaultStatus::Translation { level: 1 }, true);
 
 /// Where the tests put strings for the guest to print: free memory between the image and the
 /// stack.
@@ -277,6 +282,7 @@ fn a_data_abort_is_a_crash_that_names_the_address_and_the_instruction() {
         Exit::DataAbort {
             address,
             write: true,
+            syndrome: UNMAPPED_STORE,
         },
     );
     let options = RunOptions {
@@ -333,10 +339,46 @@ fn a_data_abort_is_a_crash_that_names_the_address_and_the_instruction() {
 }
 
 #[test]
+fn an_instruction_abort_is_a_crash_that_names_the_address_fetched_from() {
+    // A jump into the stack, which is mapped but not executable.
+    let guest = Guest::new(&programs::hello().unwrap());
+    let address = guest.start_of("stack") + 0x40;
+    let vcpu = ScriptedVcpu::new().then(
+        move |regs| regs.pc = address,
+        Exit::InstructionAbort {
+            address,
+            syndrome: Syndrome::instruction_abort(FaultStatus::Permission { level: 3 }),
+        },
+    );
+    let report = guest.run(vcpu, &RunOptions::default());
+    assert_eq!(report.exit_code(), exit_code::GUEST_CRASHED);
+    let crash = report.crash().expect("a crash report");
+    assert_eq!(crash.exception, Exception::InstructionAbort { address });
+    assert_eq!(crash.pc, address);
+    assert_eq!(crash.pc_location, None);
+    assert_eq!(crash.fault_mapping.as_deref(), Some("stack"));
+    // The fault is in the event stream, as a read.
+    assert_eq!(
+        recorded(&report).last().copied(),
+        Some(EventKind::Fault {
+            address,
+            write: false,
+            action: FaultAction::Fatal,
+        })
+    );
+}
+
+#[test]
 fn an_undefined_instruction_is_a_crash_at_its_address() {
     let guest = Guest::new(&programs::hello().unwrap());
     let pc = guest.placed.entry + 0x40;
-    let vcpu = ScriptedVcpu::new().then(move |regs| regs.pc = pc, Exit::Undefined { pc });
+    let vcpu = ScriptedVcpu::new().then(
+        move |regs| regs.pc = pc,
+        Exit::Undefined {
+            pc,
+            syndrome: Syndrome::undefined(),
+        },
+    );
     let report = guest.run(vcpu, &RunOptions::default());
     assert_eq!(report.exit_code(), exit_code::GUEST_CRASHED);
     let crash = report.crash().expect("a crash report");
@@ -574,6 +616,7 @@ fn a_crash_report_quotes_the_newest_events_and_no_more_than_its_window() {
         Exit::DataAbort {
             address,
             write: true,
+            syndrome: UNMAPPED_STORE,
         },
     );
     let report = guest.run(vcpu, &RunOptions::default());

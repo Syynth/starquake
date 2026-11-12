@@ -9,12 +9,17 @@
 
 use starquake_cpu::hvf::{HvfBackend, RamConfig};
 use starquake_cpu::{Backend, Exit, GuestRegs, Vcpu, host_counter};
-use starquake_memory::GuestMemory;
+use starquake_memory::stage1::Stage1Tables;
+use starquake_memory::{BackingRange, GuestMemory, PAGE_SIZE, Perms, Translation};
 
 /// `mrs x0, cntvct_el0`.
 const MRS_X0_CNTVCT: u32 = 0xd53b_e040;
 /// `svc #0`.
 const SVC_0: u32 = 0xd400_0001;
+/// Guest virtual address the test maps its code page at: not that page's guest-physical address.
+const CODE: u64 = 0x8000_0000;
+/// The id of the test's address space.
+const ASID: u16 = 1;
 
 #[test]
 fn host_readings_do_not_go_backwards() {
@@ -30,15 +35,24 @@ fn a_guest_read_lies_between_the_host_reads_around_it() {
         return;
     }
     let backend = HvfBackend::new(RamConfig::default()).expect("create the VM");
-    let ram = backend.memory();
+    // An address space of one page of code, read-execute, on the first page of guest RAM.
+    let physical = backend.physical();
+    let tables =
+        Stage1Tables::new(backend.physical(), backend.table_pool()).expect("create the tables");
+    let page = BackingRange::new(backend.ram().base(), PAGE_SIZE).expect("one page of RAM");
+    tables
+        .map(CODE, page, Perms::ReadExecute)
+        .expect("map the code");
     let code: Vec<u8> = [MRS_X0_CNTVCT, SVC_0]
         .iter()
         .flat_map(|word| word.to_le_bytes())
         .collect();
-    ram.write(ram.base(), &code).expect("load code");
+    physical.write(page.base(), &code).expect("load code");
     let mut vcpu = backend.create_vcpu().expect("create a vCPU");
+    vcpu.set_address_space(tables.root(), ASID)
+        .expect("set the address space");
     vcpu.set_regs(&GuestRegs {
-        pc: ram.base(),
+        pc: CODE,
         ..GuestRegs::default()
     })
     .expect("set registers");
