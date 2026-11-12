@@ -14,6 +14,8 @@ use starquake_trace::{
 use super::*;
 use crate::handle::{MAX_TABLE_SIZE, ObjectRefs};
 use crate::id::{ProcessId, SlabId};
+use crate::memory::fixture::{self, CODE, CODE_SIZE, DATA, STACK_SIZE};
+use crate::memory::{MemoryAttribute, MemoryState, SvcMemoryInfo};
 use crate::object::Object;
 use crate::sched::{CoreSignals, Priority, SchedError};
 use crate::svc::{Arg, Kind};
@@ -64,7 +66,7 @@ fn time_of(n: u64) -> GuestTicks {
 fn tables_at(rate: CounterRate) -> Tables {
     Tables {
         handles: HandleTable::new(i32::from(MAX_TABLE_SIZE)).expect("a maximum-size handle table"),
-        address_space: AddressSpace::default(),
+        address_space: fixture::loaded().0,
         scheduler: Scheduler::default(),
         processes: Processes::new(rate),
     }
@@ -333,7 +335,7 @@ fn every_dispatch_reads_the_clock_once_and_stamps_its_event_with_that_reading() 
     let numbers = [
         SvcId::GetSystemTick.number(),
         u16::MAX,
-        SvcId::SetHeapSize.number(),
+        SvcId::ConnectToNamedPort.number(),
         SvcId::CloseHandle.number(),
         SvcId::GetSystemTick.number(),
     ];
@@ -517,7 +519,7 @@ fn a_failing_environment_ends_the_call_without_writing_registers() {
     for number in [
         SvcId::GetSystemTick.number(),
         SvcId::OutputDebugString.number(),
-        SvcId::SetHeapSize.number(),
+        SvcId::ConnectToNamedPort.number(),
         u16::MAX,
     ] {
         let memory = FlatMemory::new(BASE, 0x100);
@@ -829,6 +831,241 @@ fn an_internal_failure_is_not_implemented_to_the_guest() {
     );
     assert_eq!(regs.x[0], not_implemented_word());
     assert_untouched_from(&regs, &before, 1);
+}
+
+// --- The memory calls -------------------------------------------------------------------------
+
+/// The fresh tables' address space is the loaded fixture's (see `tables_at`): seven pages of
+/// code at [`CODE`], its data at [`DATA`], and a stack.
+#[test]
+fn set_heap_size_decodes_x1_and_writes_the_result_and_the_heap_address() {
+    let dispatcher = Dispatcher::new(tables());
+    let heap = dispatcher.with::<(&AddressSpace,), _>(|(space,)| space.regions().heap.start);
+    let id = SvcId::SetHeapSize;
+    let size = 2 * crate::svc::memory::HEAP_SIZE_ALIGNMENT;
+    let mut regs = regs();
+    regs.x[1] = size;
+    let before = regs.clone();
+    let (record, events) = dispatch_on(&dispatcher, id.number(), &mut regs, 0);
+    assert_eq!(record.outcome, Outcome::Completed);
+    assert_eq!((regs.x[0], regs.x[1]), (0, heap));
+    assert_untouched_from(&regs, &before, 2);
+    assert_eq!(kinds(&events), [svc_kind(id, 1, size, ResultCode::SUCCESS)]);
+    dispatcher.with::<(&AddressSpace,), _>(|(space,)| assert_eq!(space.heap_size(), size));
+
+    // A size that is refused: the result in x0, and the address output zeroed, as Eden's
+    // wrapper leaves it (`uint64_t out_address{}`, assigned only on success).
+    let mut regs = before.clone();
+    regs.x[1] = size + 1;
+    let (record, events) = dispatch_on(&dispatcher, id.number(), &mut regs, 0);
+    assert_eq!(record.outcome, Outcome::Completed);
+    assert_eq!((regs.x[0], regs.x[1]), (word(KernelError::InvalidSize), 0));
+    assert_eq!(
+        kinds(&events),
+        [svc_kind(id, 1, size + 1, KernelError::InvalidSize.code())]
+    );
+    dispatcher.with::<(&AddressSpace,), _>(|(space,)| assert_eq!(space.heap_size(), size));
+}
+
+#[test]
+fn set_memory_permission_and_attribute_decode_their_registers() {
+    let dispatcher = Dispatcher::new(tables());
+    // The permission and the two attribute words are 32 bits: the upper halves of their
+    // registers are not part of the argument.
+    let junk = 0xdead_beef_0000_0000;
+    let lock = u64::from(MemoryAttribute::PERMISSION_LOCKED.svc());
+    let read = 1;
+    // (the call, x0-x3, the arguments its event must carry)
+    let calls = [
+        (
+            SvcId::SetMemoryPermission,
+            [DATA, starquake_memory::PAGE_SIZE, junk | read, 0x77],
+            [DATA, starquake_memory::PAGE_SIZE, read, 0],
+        ),
+        (
+            SvcId::SetMemoryAttribute,
+            [DATA, starquake_memory::PAGE_SIZE, junk | lock, junk | lock],
+            [DATA, starquake_memory::PAGE_SIZE, lock, lock],
+        ),
+    ];
+    for (id, x, args) in calls {
+        let mut regs = regs();
+        regs.x[..4].copy_from_slice(&x);
+        let before = regs.clone();
+        let (record, events) = dispatch_on(&dispatcher, id.number(), &mut regs, 0);
+        assert_eq!(record.outcome, Outcome::Completed, "{}", id.name());
+        assert_eq!(regs.x[0], 0, "{}", id.name());
+        assert_untouched_from(&regs, &before, 1);
+        let mut expected = [0; SVC_ARG_COUNT];
+        expected[..4].copy_from_slice(&args);
+        assert_eq!(
+            kinds(&events),
+            [EventKind::Svc {
+                id: u32::from(id.number()),
+                args: expected,
+                result: starquake_trace::ResultCode(0),
+            }]
+        );
+    }
+    // Both took effect: the page is read-only and its permission locked.
+    dispatcher.with::<(&AddressSpace,), _>(|(space,)| {
+        let info = space.query_info(DATA).unwrap().svc_info();
+        assert_eq!(
+            (u64::from(info.permission), u64::from(info.attribute)),
+            (read, lock)
+        );
+    });
+    // An error is the result in x0, and nothing else.
+    let mut regs = regs();
+    regs.x[..4].copy_from_slice(&[DATA + 1, starquake_memory::PAGE_SIZE, read, 0]);
+    let before = regs.clone();
+    let id = SvcId::SetMemoryPermission;
+    let (record, _) = dispatch_on(&dispatcher, id.number(), &mut regs, 0);
+    assert_eq!(record.outcome, Outcome::Completed);
+    assert_eq!(regs.x[0], word(KernelError::InvalidAddress));
+    assert_untouched_from(&regs, &before, 1);
+}
+
+#[test]
+fn query_memory_decodes_x0_and_x2_writes_the_callers_memory_and_zeroes_x1() {
+    let dispatcher = Dispatcher::new(tables());
+    // The fixture's code: the host may write all of it, as core's guest memory may.
+    let memory = FlatMemory::new(CODE, usize::try_from(CODE_SIZE).unwrap());
+    let mut sink = Collect::default();
+    let env = env();
+    let (recorder, events) = recorder();
+    let mut caller = Caller {
+        core: 0,
+        thread: THREAD,
+        env: &env,
+        memory: &memory,
+        debug: &mut sink,
+        recorder: &recorder,
+    };
+    let id = SvcId::QueryMemory;
+    let out = DATA + 0x40;
+    let mut regs = regs();
+    regs.x[0] = out;
+    regs.x[2] = CODE + 1;
+    let before = regs.clone();
+    let record = dispatcher.dispatch(id.number(), &mut regs, &mut caller);
+    assert_eq!(record.outcome, Outcome::Completed);
+    // The result, and the page info word (always zero), which x1 held garbage before.
+    assert_eq!((regs.x[0], regs.x[1]), (0, 0));
+    assert_ne!(before.x[1], 0);
+    assert_untouched_from(&regs, &before, 2);
+    let mut written = [0; SvcMemoryInfo::SIZE];
+    memory.read(out, &mut written).unwrap();
+    let text = dispatcher
+        .with::<(&AddressSpace,), _>(|(space,)| space.query_info(CODE).unwrap().svc_info());
+    assert_eq!(text.state, MemoryState::Code.svc());
+    assert_eq!(written, text.to_bytes());
+
+    // A pointer into the caller's text, which the guest may not write though the host could:
+    // the result, x1 still zero, and the text unchanged.
+    let mut text_bytes = [0; SvcMemoryInfo::SIZE];
+    memory.read(CODE, &mut text_bytes).unwrap();
+    let mut regs = before.clone();
+    regs.x[0] = CODE;
+    let record = dispatcher.dispatch(id.number(), &mut regs, &mut caller);
+    assert_eq!(record.outcome, Outcome::Completed);
+    assert_eq!(
+        (regs.x[0], regs.x[1]),
+        (word(KernelError::InvalidPointer), 0)
+    );
+    let mut after = [0; SvcMemoryInfo::SIZE];
+    memory.read(CODE, &mut after).unwrap();
+    assert_eq!(after, text_bytes);
+    // x1 is not an argument of the call, so it is not in the events.
+    let mut first = [0; SVC_ARG_COUNT];
+    (first[0], first[2]) = (out, CODE + 1);
+    let mut second = first;
+    second[0] = CODE;
+    let svc = |args, result: ResultCode| EventKind::Svc {
+        id: u32::from(id.number()),
+        args,
+        result: starquake_trace::ResultCode(result.raw()),
+    };
+    assert_eq!(
+        kinds(&events.events()),
+        [
+            svc(first, ResultCode::SUCCESS),
+            svc(second, KernelError::InvalidPointer.code())
+        ]
+    );
+}
+
+#[test]
+fn get_info_decodes_x1_to_x3_and_writes_the_value_to_x1() {
+    let dispatcher = Dispatcher::new(tables());
+    let id = SvcId::GetInfo;
+    // `InfoType::UsedMemorySize`, with the upper half of its register and the handle's set:
+    // both are 32 bits.
+    let used_memory = u64::from(crate::svc::info::InfoType::UsedMemorySize.number());
+    let junk = 0xdead_beef_0000_0000;
+    let process = u64::from(Handle::CURRENT_PROCESS.raw());
+    let mut regs = regs();
+    regs.x[1] = junk | used_memory;
+    regs.x[2] = junk | process;
+    regs.x[3] = 0;
+    let before = regs.clone();
+    let (record, events) = dispatch_on(&dispatcher, id.number(), &mut regs, 0);
+    assert_eq!(record.outcome, Outcome::Completed);
+    assert_eq!((regs.x[0], regs.x[1]), (0, CODE_SIZE + STACK_SIZE));
+    // x0 is not an argument: libnx's wrapper keeps its output pointer there.
+    assert_untouched_from(&regs, &before, 2);
+    let mut args = [0; SVC_ARG_COUNT];
+    (args[1], args[2]) = (used_memory, process);
+    assert_eq!(
+        kinds(&events),
+        [EventKind::Svc {
+            id: u32::from(id.number()),
+            args,
+            result: starquake_trace::ResultCode(0),
+        }]
+    );
+
+    // A sub id (64 bits, taken whole) that is not zero: the result, and x1 zeroed.
+    let mut regs = before.clone();
+    regs.x[3] = 1 << 32;
+    let (record, _) = dispatch_on(&dispatcher, id.number(), &mut regs, 0);
+    assert_eq!(record.outcome, Outcome::Completed);
+    assert_eq!(
+        (regs.x[0], regs.x[1]),
+        (word(KernelError::InvalidEnumValue), 0)
+    );
+    // An id this slice does not answer is a result like any other, not a call that is
+    // missing: the outputs are written.
+    let mut regs = before.clone();
+    regs.x[1] = u64::from(crate::svc::info::InfoType::CoreMask.number());
+    let (record, _) = dispatch_on(&dispatcher, id.number(), &mut regs, 0);
+    assert_eq!(record.outcome, Outcome::Completed);
+    assert_eq!((regs.x[0], regs.x[1]), (not_implemented_word(), 0));
+}
+
+#[test]
+fn the_memory_calls_declare_the_address_space_and_get_info_all_three_tables_shared() {
+    let dispatcher = Dispatcher::new(tables());
+    for id in [
+        SvcId::SetHeapSize,
+        SvcId::SetMemoryPermission,
+        SvcId::SetMemoryAttribute,
+        SvcId::QueryMemory,
+        SvcId::GetInfo,
+    ] {
+        dispatch_on(&dispatcher, id.number(), &mut GuestRegs::default(), 0);
+    }
+    assert_eq!(
+        dispatcher.lock_waits(),
+        LockWaits {
+            timed: false,
+            // Five acquisitions; the three that change memory declared it exclusively.
+            lock: waits(5, 3, 0, Duration::ZERO),
+            handles: waits(1, 0, 0, Duration::ZERO),
+            address_space: waits(5, 3, 0, Duration::ZERO),
+            scheduler: waits(1, 0, 0, Duration::ZERO),
+        }
+    );
 }
 
 // --- Declared tables ------------------------------------------------------------------------
@@ -1188,13 +1425,13 @@ proptest! {
 
 #[test]
 fn a_planned_call_returns_not_implemented_and_leaves_its_outputs_alone() {
-    // SetHeapSize's convention outputs x0 (result) and x1 (address). Divergence from Eden's
+    // ConnectToNamedPort's convention outputs x0 (result) and x1 (a handle). Divergence from Eden's
     // wrapper, which would write x1 too: only x0 changes. A deferred call with a convention
     // (light IPC, which outputs x0-x7) behaves the same.
     let memory = FlatMemory::new(BASE, 0x10);
     let mut sink = Collect::default();
     for (id, status) in [
-        (SvcId::SetHeapSize, Status::Planned),
+        (SvcId::ConnectToNamedPort, Status::Planned),
         (SvcId::SetGpuMemoryAttribute, Status::Planned),
         (SvcId::ExitThread, Status::Planned),
         (SvcId::SendSyncRequestLight, Status::Deferred),
@@ -1309,9 +1546,9 @@ fn every_call_that_returns_is_recorded_once_with_its_decoded_arguments_and_resul
             [0; SVC_ARG_COUNT],
             ResultCode::SUCCESS,
         ),
-        // Planned calls are decoded too. SetHeapSize's one argument is in x1, not x0.
+        // Planned calls are decoded too. ConnectToNamedPort's one argument is in x1, not x0.
         (
-            SvcId::SetHeapSize.number(),
+            SvcId::ConnectToNamedPort.number(),
             7,
             8,
             [0, 8, 0, 0, 0, 0, 0, 0],

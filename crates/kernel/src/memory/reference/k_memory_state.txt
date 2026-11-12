@@ -1,0 +1,27 @@
+# Memory state words: every `static_assert(static_cast<u32>(KMemoryState::<Name>) == <value>)` of
+# eden/src/core/hle/kernel/k_memory_block.h @ cf654052 (GPL-3.0-or-later), as `Name = value`.
+# Checked against `MemoryState::word` by the tests in `memory/state.rs`.
+Free = 0x00000000
+IoMemory = 0x00182001
+IoRegister = 0x00180001
+Static = 0x00042002
+Code = 0x04DC7E03
+CodeData = 0x0FFEBD04
+Normal = 0x077EBD05
+Shared = 0x04402006
+AliasCode = 0x04DD7E08
+AliasCodeData = 0x0FFFBD09
+Ipc = 0x045C3C0A
+Stack = 0x045C3C0B
+ThreadLocal = 0x0400000C
+Transferred = 0x055C3C0D
+SharedTransferred = 0x045C380E
+SharedCode = 0x0440380F
+Inaccessible = 0x00000010
+NonSecureIpc = 0x045C3811
+NonDeviceIpc = 0x044C2812
+Kernel = 0x00000013
+GeneratedCode = 0x04402214
+CodeOut = 0x04402015
+Coverage = 0x00002016
+Insecure = 0x055C3817

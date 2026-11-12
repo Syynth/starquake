@@ -29,5 +29,6 @@ tracing.workspace = true
 
 [dev-dependencies]
 starquake-cpu = { workspace = true, features = ["test-support"] }
+starquake-kernel = { workspace = true, features = ["test-support"] }
 starquake-testkit.workspace = true
 insta.workspace = true

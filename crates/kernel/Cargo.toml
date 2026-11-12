@@ -10,6 +10,10 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Exports the kernel's test fakes (`memory::testing`) to other crates' tests.
+test-support = []
+
 [dependencies]
 starquake-memory.workspace = true
 starquake-cpu.workspace = true

@@ -101,12 +101,12 @@ macro_rules! svc_ids {
 }
 
 svc_ids! {
-    SetHeapSize = 0x01, Planned;
-    SetMemoryPermission = 0x02, Planned;
-    SetMemoryAttribute = 0x03, Planned;
+    SetHeapSize = 0x01, Implemented;
+    SetMemoryPermission = 0x02, Implemented;
+    SetMemoryAttribute = 0x03, Implemented;
     MapMemory = 0x04, Planned;
     UnmapMemory = 0x05, Planned;
-    QueryMemory = 0x06, Planned;
+    QueryMemory = 0x06, Implemented;
     ExitProcess = 0x07, Implemented;
     CreateThread = 0x08, Planned;
     StartThread = 0x09, Planned;
@@ -141,7 +141,7 @@ svc_ids! {
     Break = 0x26, Planned;
     OutputDebugString = 0x27, Implemented;
     ReturnFromException = 0x28, Planned;
-    GetInfo = 0x29, Planned;
+    GetInfo = 0x29, Implemented;
     FlushEntireDataCache = 0x2a, Planned;
     FlushDataCache = 0x2b, Planned;
     MapPhysicalMemory = 0x2c, Planned;
@@ -303,12 +303,17 @@ mod tests {
     fn every_status_follows_the_spec() {
         for &id in SvcId::ALL {
             let expected = match id {
-                SvcId::ExitProcess
+                SvcId::SetHeapSize
+                | SvcId::SetMemoryPermission
+                | SvcId::SetMemoryAttribute
+                | SvcId::QueryMemory
+                | SvcId::ExitProcess
                 | SvcId::GetThreadPriority
                 | SvcId::GetCurrentProcessorNumber
                 | SvcId::CloseHandle
                 | SvcId::GetSystemTick
-                | SvcId::OutputDebugString => Status::Implemented,
+                | SvcId::OutputDebugString
+                | SvcId::GetInfo => Status::Implemented,
                 _ if hardware_facing(id.name()) => Status::NotPlanned,
                 // Light sessions are in the spec's deferred column.
                 SvcId::SendSyncRequestLight => Status::Deferred,

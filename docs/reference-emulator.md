@@ -53,6 +53,8 @@ Three runs of the fixture were identical apart from addresses and timestamps.
 ## What may be committed
 
 - A **normalised** trace of a homebrew program (addresses and timestamps masked), with a note
-  saying which reference commit and which program produced it.
+  saying which reference commit and which program produced it. The fixture's is
+  `tests/homebrew/hello/reference/startup.trace`, made from a run's `startup.txt` by
+  `normalise.py` in that folder, whose README has the format.
 - Never a raw run folder, and never anything from a run of a commercial title
   (`docs/specs/observability.md`, "Storage and what may be committed").

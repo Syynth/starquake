@@ -47,27 +47,48 @@ expected.
 
 ## How far `hello.nro` runs
 
-Recorded with `starquake run tests/homebrew/hello/hello.nro` on the walking skeleton (#74), as of
-the commit that added this fixture. It stops at the first system call the skeleton lacks; nothing
-was added to the kernel or services to get further.
+`starquake run tests/homebrew/hello/hello.nro`, as of the kernel's address space (#97). The run
+now does everything the reference emulator's does before IPC, call for call
+(`hello/reference/`, and `crates/core/tests/homebrew.rs`), and stops at the first call that
+needs a session:
 
 ```text
 thread 1
   lifecycle ProcessStart 1
-  svc 0x2(0x80004000, 0x1000, 0x1) -> 0x4201
-  svc 0x26(0x0, 0x80ffffdc, 0x4) -> 0x4201
+  svc 0x2(0x80004000, 0x1000, 0x1) -> 0x0
+  svc 0x3(0x80004000, 0x1000, 0x10, 0x10) -> 0x0
+  svc 0x29(0x0, 0x2, 0xffff8001) -> 0x0
+  ... ten more svc 0x29, for ids 0x3, 0x1c, 0x4, 0x5, 0xc, 0xd, 0xe, 0xf, 0x6, 0x7
+  svc 0x1(0x0, 0xcd000000) -> 0x0
+  svc 0x6(0x1080303fc8, 0x0, 0x1080303fc8) -> 0x0
+  svc 0x6(0x1080303fc8, 0x0, 0x80006000) -> 0x0
+  svc 0x1f(0x0, 0x80003148) -> 0x4201
+  svc 0x26(0x0, 0x1080303fdc, 0x4) -> 0x4201
 ```
 
 1. libnx's start-up applies the module's relocations, then makes the RELRO range read-only with
-   `svcSetMemoryPermission` (0x02) on `.data`'s first page (`libnx/nx/source/runtime/dynamic.c`
-   @ b156b477, after the `LNY0`/`LNY1` check). The skeleton has no handler for it and returns
-   0x4201.
-2. libnx treats the failure as fatal: `diagAbortWithResult` calls `svcBreak` (0x26), which is
-   not implemented either and also returns 0x4201.
-3. `diagAbortWithResult` does not expect `svcBreak` to return (`__builtin_unreachable()` in
+   `svcSetMemoryPermission` (0x02) on `.data`'s first page and locks that permission with
+   `svcSetMemoryAttribute` (0x03) (`libnx/nx/source/runtime/dynamic.c` @ b156b477, after the
+   `LNY0`/`LNY1` check).
+2. `virtmemSetup` asks `svcGetInfo` (0x29) for the alias, heap, ASLR and stack regions and the
+   alias region's extra size (`libnx/nx/source/kernel/virtmem.c`), and `__libnx_initheap` for
+   the total and used memory, from which it sizes its heap: `svcSetHeapSize` (0x01) with
+   0xcd000000 (`libnx/nx/source/runtime/init.c`).
+3. `svcQueryMemory` (0x06) twice: once about an address on its own stack, for the main
+   thread's stack bounds (`libnx/nx/source/kernel/thread.c`), and once about the first address
+   after its image, for arguments (`libnx/nx/source/runtime/argv.c`).
+4. The fixture's `__appInit` calls `smInitialize`, whose `svcConnectToNamedPort` (0x1f) on
+   `"sm:"` is not implemented and returns 0x4201. The fixture treats that as fatal:
+   `diagAbortWithResult` calls `svcBreak` (0x26), which is not implemented either.
+5. `diagAbortWithResult` does not expect `svcBreak` to return (`__builtin_unreachable()` in
    `libnx/nx/source/runtime/diag.c`), and the compiler put `udf #0` after the call. The run
    ends as a guest crash (exit code 1, undefined instruction) at `main+0xb5c`.
 
-So the first missing piece is `svcSetMemoryPermission`; the next one start-up reaches is
-`svcSetMemoryAttribute` (0x03), which libnx calls right after it and whose result it ignores.
-Nothing reached `sm:` or `set:sys`, and the guest log is empty.
+`crates/core/tests/homebrew.rs` runs the fixture and compares its calls with the reference's
+only in its `on_hardware` module, which is compiled for macOS on Apple Silicon and returns early
+when the `CI` environment variable is set: so on a gate run on a Mac. On the hosted CI gate only
+its `comparison` module runs, which checks the comparison itself against made-up runs.
+
+So the next missing piece is the session side of the kernel: `svcConnectToNamedPort` and
+`svcSendSyncRequest`, and behind them `sm:` and `set:sys`. The guest log is still empty: the
+fixture's first line comes after `smInitialize`.

@@ -191,8 +191,8 @@ use crate::handle::{Handle, HandleTable};
 use crate::result::{CallResult, KernelError, ResultCode, SvcError};
 use crate::sched::CoreId;
 use crate::svc::{
-    Convention, ConventionError, DebugSink, Kind, Status, SvcId, debug, handle, processor, thread,
-    tick,
+    Convention, ConventionError, DebugSink, Kind, Status, SvcId, debug, handle, info, memory,
+    processor, thread, tick,
 };
 use crate::tables::{AddressSpace, Processes, Scheduler};
 
@@ -656,6 +656,26 @@ impl Dispatcher {
             return self.call::<()>(call, |(), call, _| unimplemented(id, call.regs));
         };
         match id {
+            SvcId::SetHeapSize => self.call::<(&mut AddressSpace,)>(call, |(space,), call, _| {
+                set_heap_size(space, id, convention, call.regs)
+            }),
+            SvcId::SetMemoryPermission => self
+                .call::<(&mut AddressSpace,)>(call, |(space,), call, _| {
+                    set_memory_permission(space, id, convention, call.regs)
+                }),
+            SvcId::SetMemoryAttribute => self
+                .call::<(&mut AddressSpace,)>(call, |(space,), call, _| {
+                    set_memory_attribute(space, id, convention, call.regs)
+                }),
+            SvcId::QueryMemory => self.call::<(&AddressSpace,)>(call, |(space,), call, _| {
+                query_memory(space, call.caller.memory, id, convention, call.regs)
+            }),
+            SvcId::GetInfo => self.call::<(&HandleTable, &AddressSpace, &Scheduler)>(
+                call,
+                |(handles, space, scheduler), call, _| {
+                    get_info((handles, space, scheduler), id, convention, call.regs)
+                },
+            ),
             SvcId::ExitProcess => self.call::<()>(call, |(), _, _| {
                 // PROVISIONAL (walking skeleton, #74): see the module docs.
                 tracing::info!("the process called ExitProcess");
@@ -707,6 +727,74 @@ impl Dispatcher {
             _ => self.call::<()>(call, |(), call, _| unimplemented(id, call.regs)),
         }
     }
+}
+
+// The bodies of the dispatch arms for the calls that work on the address space (kernel slices 6
+// and 7), kept out of `Dispatcher::run` only for its length. Each decodes its call's arguments
+// and writes its outputs, as every arm does.
+
+fn set_heap_size(
+    space: &mut AddressSpace,
+    id: SvcId,
+    convention: &Convention,
+    regs: &mut GuestRegs,
+) -> Outcome {
+    returning(id, convention, regs, |[size]| {
+        Ok([memory::set_heap_size(space, size)?])
+    })
+}
+
+fn set_memory_permission(
+    space: &mut AddressSpace,
+    id: SvcId,
+    convention: &Convention,
+    regs: &mut GuestRegs,
+) -> Outcome {
+    returning(id, convention, regs, |[address, size, permission]| {
+        memory::set_memory_permission(space, address, size, word(permission)?)?;
+        Ok([])
+    })
+}
+
+fn set_memory_attribute(
+    space: &mut AddressSpace,
+    id: SvcId,
+    convention: &Convention,
+    regs: &mut GuestRegs,
+) -> Outcome {
+    returning(id, convention, regs, |[address, size, mask, attribute]| {
+        let (mask, attribute) = (word(mask)?, word(attribute)?);
+        memory::set_memory_attribute(space, address, size, mask, attribute)?;
+        Ok([])
+    })
+}
+
+fn query_memory(
+    space: &AddressSpace,
+    guest: &dyn GuestMemory,
+    id: SvcId,
+    convention: &Convention,
+    regs: &mut GuestRegs,
+) -> Outcome {
+    returning(id, convention, regs, |[out_memory_info, address]| {
+        let page_info = memory::query_memory(space, guest, out_memory_info, address)?;
+        Ok([u64::from(page_info)])
+    })
+}
+
+fn get_info(
+    (handles, space, scheduler): (&HandleTable, &AddressSpace, &Scheduler),
+    id: SvcId,
+    convention: &Convention,
+    regs: &mut GuestRegs,
+) -> Outcome {
+    returning(id, convention, regs, |[info_type, process, sub_id]| {
+        let process = Handle::from_register(process);
+        let info_type = word(info_type)?;
+        Ok([info::get_info(
+            handles, space, scheduler, info_type, process, sub_id,
+        )?])
+    })
 }
 
 /// RECORDING POINT for the event stream: the dispatcher's one call into the recorder
@@ -771,6 +859,13 @@ fn recorded_result(id: Option<SvcId>, outcome: &Outcome, regs: &GuestRegs) -> Op
 /// loop's bug, not a guest's.
 fn calling_core(core: u8) -> CallResult<CoreId> {
     CoreId::try_from(core).map_err(|error| SvcError::internal(&error))
+}
+
+/// A decoded 4-byte argument as the `u32` it is. The convention truncated it to four bytes, so
+/// a value that does not fit is a disagreement between a dispatch arm and its convention: a
+/// dispatcher bug, not a guest's.
+fn word(argument: u64) -> CallResult<u32> {
+    u32::try_from(argument).map_err(|error| SvcError::internal(&error))
 }
 
 /// Runs an implemented call that returns a `Result` first: decodes its `I` inputs, runs `body`,

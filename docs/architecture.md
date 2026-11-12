@@ -140,11 +140,14 @@ cargo run -p starquake-testkit --example guest_programs -- <folder>   # writes f
 cargo run -p starquake -- run <folder>/hello.nro --until timeout=10s --artifacts <folder>/out
 ```
 
-`starquake-core`'s `System` parses the NRO with the loader, maps its segments, a TLS block and
-a stack into a guest address space of their own on stage-1 tables (text read-execute, rodata
-read-only, the rest read-write, nothing else mapped), rewrites its counter reads with the
-loader's patcher, and runs it as one guest thread on one vCPU. Every `svc` goes through the
-kernel's dispatcher and is recorded in the event stream. The run ends when the guest calls
+`starquake-core`'s `System` parses the NRO with the loader, creates the process's memory with
+the kernel (the code at Horizon's address for it, a stack in the stack region, a TLS page; text
+read-execute, rodata read-only, the rest read-write, nothing else mapped), rewrites its counter
+reads with the loader's patcher, and runs it as one guest thread on one vCPU. What the kernel's
+address space maps reaches guest code through stage-1 tables, a page at a time as the guest
+first touches it. Every `svc` goes through the kernel's dispatcher and is recorded in the event
+stream; the memory calls (`SetHeapSize`, `SetMemoryPermission`, `SetMemoryAttribute`,
+`QueryMemory`, and `GetInfo`'s memory ids) are real. The run ends when the guest calls
 `ExitProcess`, crashes, or reaches the timeout, and the artifacts folder gets `summary.json`,
 `trace.txt`, `events.bin`, `guest_log.txt`, and `crash.json` and `crash.txt` after a crash
 (`guest_log.txt` is an addition to the spec's table: an event keeps a log line's length and
@@ -160,12 +163,13 @@ it lives, with what replaces it:
 
 | Provisional part | Where | Replaced by |
 |---|---|---|
-| The program's address space has real permissions but nothing else: a fixed layout with no relocation, backing handed out from the start of one RAM region and never returned, a host-side shadow that knows addresses but not permissions, and no unmapping or re-protecting (so no TLB flush is ever owed) | `crates/core/src/image.rs`, `crates/core/src/space.rs`, `crates/cpu/src/hvf.rs` | Kernel slice 6 (memory blocks, regions) and the backing pools of the execution model |
-| One guest thread on one core, with a fixed thread and process id; no scheduler; the whole register file is read and written on every `svc`; every abort is fatal | `crates/core/src/machine.rs` | Kernel slice 8 (process creation, thread lifecycle) and slice 10 (core loop and timers); single-register accessors on `Vcpu` |
-| The stack size, the TLS page and the registers the thread starts with are fixed by the loop; pointer-authentication keys are left as the backend creates them | `crates/core/src/image.rs`, `machine.rs` | Kernel slice 8, with the NPDM's values |
+| The process's memory is created by the loader, not by process creation: the code at a fixed address with no relocation, one stack of a fixed size, one TLS page, the 4 GiB memory arrangement for every program | `crates/core/src/image.rs` | Kernel slice 8 (process creation), with the NPDM's values |
+| Backing is handed out a page at a time from the start of one small RAM region (16 MiB) and never returned, far less than the kernel lets a process reserve; host access to guest memory ignores permissions | `crates/core/src/space.rs`, `crates/cpu/src/hvf.rs` | The backing pools of the execution model, sized as the kernel's accounting says; permission checks on system-call buffers |
+| One guest thread on one core, with a fixed thread and process id; no scheduler; the whole register file is read and written on every `svc`; an abort is lazy backing or the end of the run (nothing is delivered to the guest or write-tracked) | `crates/core/src/machine.rs` | Kernel slice 8 (process creation, thread lifecycle) and slice 10 (core loop and timers); single-register accessors on `Vcpu` |
+| The registers the thread starts with are set by the loop (`x1` is a handle to a main thread the scheduler never runs); pointer-authentication keys are left as the backend creates them | `crates/core/src/machine.rs` | Kernel slice 8, with the NPDM's values |
 | `ExitProcess` changes no kernel state: the dispatcher reports it and the loop stops | `crates/kernel/src/dispatch.rs` | Kernel slice 8 |
 | The dispatcher is told the calling thread by its caller | `crates/kernel/src/dispatch.rs` (`Caller`) | Kernel slice 10 (the scheduler knows each core's thread) |
-| Lifecycle, fault and guest-log events are recorded by the loop, not the kernel (lifecycle and fault events outside the kernel lock; a guest-log event under it, from the loop's debug sink, with the same time as the call that wrote it) | `crates/core/src/machine.rs` | The kernel's own recording points (slices 6 and 8) |
+| Lifecycle, fault and guest-log events are recorded by the loop, not the kernel (lifecycle and fault events outside the kernel lock; a guest-log event under it, from the loop's debug sink, with the same time as the call that wrote it). The kernel's address space records nothing: no `Map` event is produced, and its table is not serialisable | `crates/core/src/machine.rs`, `crates/kernel/src/memory.rs` | The kernel's own recording points: lifecycle events with process creation (slice 8); a `Map` event from each of the address space's mutators, a follow-up to slice 6 not yet scheduled; a serialisable address space with the observability spec's snapshots (its step 6) |
 | What a run keeps in memory is capped by fixed numbers: the trace's first 100,000 events and the first 4 MiB of guest log text, each with a marker and a count in `summary.json` when it was cut short | `crates/core/src/machine.rs` (`Limits`) | The observability spec's size cap per run, with its flags |
 | Every process counts guest time at the Switch 1 rate (19.2 MHz), whatever console the program was built for | `crates/core/src/clock.rs` | Kernel slice 8 (process creation takes the rate from the program's metadata) |
 | The scheduler is not told what the one core runs, so a call that asks about "the calling thread" (`GetThreadPriority` with the current-thread pseudo-handle) fails inside the kernel and the guest sees "not implemented" | `crates/core/src/machine.rs`, `crates/kernel/src/svc/thread.rs` | Kernel slices 8 and 10 |
