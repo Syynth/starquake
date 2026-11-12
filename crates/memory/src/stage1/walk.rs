@@ -43,11 +43,13 @@ pub struct Resolved {
 /// Why a walk did not produce a translation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum WalkError {
-    /// The address is at or above [`VA_SPACE_END`]. Hardware would select `TTBR1_EL1` only for
+    /// The address is at or above [`VA_SPACE_END`]. Hardware selects `TTBR1_EL1` only for
     /// addresses whose top bits are all ones (as many as `TCR_EL1.T1SZ` says); an address
-    /// between 2^39 and that range faults instead. Assumption, not backed by a reference: the
-    /// walker translates only the `TTBR0_EL1` half, because no backend exists yet that needs
-    /// the other (the EL1 shim might).
+    /// between 2^39 and that range faults instead: measured on a real vCPU as a translation
+    /// fault reported at level 0, at both ends of the gap (`crates/cpu/src/hvf/hardware.rs`).
+    /// The walker translates only the `TTBR0_EL1` half: the other holds the Hypervisor.framework
+    /// backend's EL1 shim, mapped by tables of the backend's own that no guest address space
+    /// describes.
     #[error("{va:#x} is outside the 39-bit address space")]
     OutOfRange {
         /// The address.

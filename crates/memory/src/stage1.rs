@@ -10,10 +10,13 @@
 //! `Stage1Tables` is plain data over a [`GuestMemory`] whose addresses are guest-physical: it
 //! takes its table pages from a pool inside that memory and writes descriptors there. The
 //! backing that pages map onto may lie anywhere below [`OUTPUT_ADDRESS_END`] except inside the
-//! pool. It is shared by the Hypervisor.framework and KVM backends; neither uses it yet.
-//! Each descriptor is written with one eight-byte [`GuestMemory::write`], and a new table is
-//! linked only after it is zeroed; a backend whose tables are live under a running vCPU must
-//! make that write single-copy atomic so the hardware walker never sees half a descriptor.
+//! pool. It is shared by the Hypervisor.framework and KVM backends; the Hypervisor.framework
+//! backend runs guests on it (`starquake_cpu::hvf`), the KVM backend does not exist yet.
+//! Each descriptor is written with one eight-byte [`GuestMemory::write`] at an eight-byte
+//! aligned address, and a new table is linked only after it is zeroed; a backend whose tables
+//! are live under a running vCPU must make that write single-copy atomic so the hardware walker
+//! never sees half a descriptor. The Hypervisor.framework backend's memory does
+//! (`PhysicalMemory`), and its hardware tests run a vCPU against tables that change under it.
 //!
 //! # What the builder writes
 //!
@@ -22,12 +25,16 @@
 //! - Every page descriptor has the access flag set, is inner shareable with `AttrIndx` 0, is
 //!   never executable at EL1 (`PXN`), and is non-global (`nG`), so its TLB entries are tagged
 //!   with the process's ASID. hvprobe wrote global entries and EL1-executable code pages; `nG`
-//!   and `PXN` on code pages are therefore not yet verified on hardware, only taken from the
-//!   manual.
+//!   and `PXN` on code pages were first run on hardware by the Hypervisor.framework backend,
+//!   whose every guest page is one (`crates/cpu/tests/hvf.rs`; two address spaces with
+//!   different ids keep their own translations in
+//!   `address_spaces_keep_their_own_translations_without_a_flush_between_them`).
 //! - EL0 permissions map to `AP[2:1]` and `UXN` as [`descriptor::page`] shows. An EL0-
 //!   inaccessible page ([`Perms::None`], [`Perms::Execute`]) gets `AP[2:1]` = 0b00, read-write
-//!   at EL1, as hvprobe's marker pages did. Execute-only ([`Perms::Execute`]) is from the
-//!   manual and not verified on hardware.
+//!   at EL1, as hvprobe's marker pages did. All six [`Perms`], execute-only among them, behave
+//!   on a real vCPU as [`translate`] says
+//!   (`the_software_walker_and_a_real_vcpu_agree_for_every_permission` in
+//!   `crates/cpu/tests/hvf.rs`).
 //!
 //! # Rules this builder adds
 //!
@@ -70,6 +77,8 @@
 //! The contract on the caller: flushes returned by `take_pending_flushes` must be executed
 //! (`TLBI` and the barriers, on every vCPU that may use the tables) before the next `map`,
 //! `unmap` or `protect`. Taking a flush is what lets the builder reuse the pages it freed.
+//! [`Stage1Tables::flush_pending_with`] keeps that contract for the caller: it runs the flush
+//! with the tables locked and releases the pages only if the flush succeeded.
 
 pub(crate) mod descriptor;
 mod walk;
@@ -224,6 +233,36 @@ impl<M: GuestMemory> Stage1Tables<M> {
         let pool = &mut *pool;
         pool.free.append(&mut pool.quarantine);
         std::mem::take(&mut pool.pending)
+    }
+
+    /// Offers the ranges recorded since the last flush to `execute`, oldest first, and, only if
+    /// it succeeds, forgets them and releases the table pages `unmap` unlinked for reuse.
+    ///
+    /// This is how a backend whose tables are live runs a flush: `execute` performs the
+    /// invalidations (on Hypervisor.framework, the EL1 shim's flush entry point). The tables
+    /// stay locked while it runs, so no `map`, `unmap` or `protect` from any thread comes
+    /// between handing out the ranges and executing them, and a freed table page is never
+    /// reused before the flush that covers it has run. If `execute` fails, its error is
+    /// returned and nothing is forgotten or released: the next call offers the same ranges
+    /// again.
+    ///
+    /// `execute` is not called when nothing is pending. It must not call back into these
+    /// tables: they are locked, and it would wait for itself.
+    pub fn flush_pending_with<E>(
+        &self,
+        execute: impl FnOnce(&[FlushRange]) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let mut pool = self.lock();
+        // Table pages are only unlinked by an `unmap`, which always records a range, so nothing
+        // pending means nothing quarantined either.
+        if pool.pending.is_empty() {
+            return Ok(());
+        }
+        execute(&pool.pending)?;
+        let pool = &mut *pool;
+        pool.pending.clear();
+        pool.free.append(&mut pool.quarantine);
+        Ok(())
     }
 
     /// Resolves `va` through these tables with [`walk`].
