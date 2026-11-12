@@ -50,6 +50,7 @@ mod common;
 #[cfg(test)]
 mod trace {
     use std::collections::BTreeMap;
+    use std::fmt::Write as _;
 
     use starquake_core::hle::{SET_SYS, SM, service_name};
     use starquake_kernel::handle::Handle;
@@ -285,7 +286,9 @@ mod trace {
                 return Ok(symbol);
             };
             let placeable = symbol.starts_with(&format!("{ASLR_REGION}+"))
-                && anchors.symbol(base)?.starts_with(&format!("{ASLR_REGION}+"));
+                && anchors
+                    .symbol(base)?
+                    .starts_with(&format!("{ASLR_REGION}+"));
             match self.placements.ours_for(name) {
                 Some(paired) => Ok(match ours.checked_sub(paired) {
                     Some(offset) => format!("{name}+{offset:#x}"),
@@ -621,10 +624,27 @@ mod trace {
     fn implements_request(service: &str, command: u32, name: &str) -> bool {
         if service == CONTROL_INTERFACE {
             // Any service will do: the control table is the framework's.
-            return check_name(&Line::Ipc { service: SM, command }, name, true).is_ok();
+            return check_name(
+                &Line::Ipc {
+                    service: SM,
+                    command,
+                },
+                name,
+                true,
+            )
+            .is_ok();
         }
-        service_id(service)
-            .is_some_and(|id| check_name(&Line::Ipc { service: id, command }, name, false).is_ok())
+        service_id(service).is_some_and(|id| {
+            check_name(
+                &Line::Ipc {
+                    service: id,
+                    command,
+                },
+                name,
+                false,
+            )
+            .is_ok()
+        })
     }
 
     /// The result on a reference `svc` line: `0x0` in `... -> 0x0 out=...`, or `none`.
@@ -685,14 +705,15 @@ mod trace {
 
     /// The gap list as a README carries it, between [`GAPS_BEGIN`] and [`GAPS_END`].
     fn gap_table(gaps: &[Gap]) -> String {
-        let mut table = String::from(
-            "| Line | Call or request | Reference's result |\n|---:|---|---|\n",
-        );
+        let mut table =
+            String::from("| Line | Call or request | Reference's result |\n|---:|---|---|\n");
         for gap in gaps {
-            table.push_str(&format!(
-                "| {} | `{}` | `{}` |\n",
+            writeln!(
+                table,
+                "| {} | `{}` | `{}` |",
                 gap.line, gap.what, gap.result
-            ));
+            )
+            .expect("writing to a string");
         }
         table
     }
@@ -721,7 +742,11 @@ mod trace {
         const SET_HANDLE: u64 = 0x4_0012;
 
         fn anchors() -> Anchors {
-            Anchors::new(BASE, module_extent(&HELLO), module_extent(&HELLO) + PAGE_SIZE)
+            Anchors::new(
+                BASE,
+                module_extent(&HELLO),
+                module_extent(&HELLO) + PAGE_SIZE,
+            )
         }
 
         fn call(id: SvcId, registers: &[(usize, u64)], result: u32) -> Line {
@@ -1255,11 +1280,13 @@ mod trace {
             args[1] += PAGE_SIZE;
             assert_eq!(
                 compare(&PLACED, &lines, &anchors()),
-                Err("line 3: expected `svc 0x14 UnmapSharedMemory(shmem_handle=0x583f6, \
+                Err(
+                    "line 3: expected `svc 0x14 UnmapSharedMemory(shmem_handle=0x583f6, \
                      address=placement1+0x1000, size=0x40000) -> 0x0`, found `svc 0x14 \
                      UnmapSharedMemory(shmem_handle=0x583f6, address=placement1+0x2000, \
                      size=0x40000) -> 0x0`"
-                    .to_owned())
+                        .to_owned()
+                )
             );
             // The map below the probe that paired it.
             let mut lines = placed(first, second);
@@ -1307,10 +1334,7 @@ mod trace {
                  QueryMemory(out_memory_info=stack_region+0x0, address=heap_region+0x0) -> 0x0`"
             );
             let found = compare(&PLACED, &placed(BASE, second), &anchors()).unwrap_err();
-            assert!(
-                found.ends_with("address=main+0x0) -> 0x0`"),
-                "{found}"
-            );
+            assert!(found.ends_with("address=main+0x0) -> 0x0`"), "{found}");
             // The second placement's map just past the module, in the ASLR region, so that its
             // anchor (a page lower) would be inside the module.
             let (first, _) = free_pages();
@@ -1408,7 +1432,11 @@ mod trace {
             assert!(implements_call(SvcId::GetInfo.number()));
             assert!(!implements_call(SvcId::WaitSynchronization.number()));
             assert!(!implements_call(0x7777));
-            assert!(implements_request(CONTROL_INTERFACE, 3, "QueryPointerBufferSize"));
+            assert!(implements_request(
+                CONTROL_INTERFACE,
+                3,
+                "QueryPointerBufferSize"
+            ));
             assert!(!implements_request(CONTROL_INTERFACE, 3, "GetService"));
             assert!(implements_request("sm:", 1, "GetService"));
             assert!(!implements_request("sm:", 1, "Initialize"));
