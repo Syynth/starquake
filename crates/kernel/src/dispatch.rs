@@ -488,12 +488,14 @@ pub enum Outcome {
     /// ([`Scheduler::needs_scheduling`]). No register was written.
     ThreadExited,
     /// The calling thread waits: a `SendSyncRequest` whose request waits behind another or was
-    /// deferred, or a `WaitSynchronization` that nothing has ended yet. No register was written
-    /// and no event recorded; both happen when the wait ends, and the thread is then reported
-    /// by [`Dispatcher::take_woken`]. The caller must not resume the thread until then. After a
-    /// `WaitSynchronization` the caller's registers are already saved as its thread's context,
-    /// where the wake writes its result: the core loop must not save over them
-    /// (`dispatch/sync.rs`).
+    /// deferred, a `WaitSynchronization` or arbitration call that nothing has ended yet, or a
+    /// `SleepThread` with a positive time. No register was written and no event recorded; both
+    /// happen when the wait ends, and the thread is then reported by
+    /// [`Dispatcher::take_woken`]. The caller must not resume the thread until then. When the
+    /// calling core runs a scheduler thread, the caller's registers are already saved as that
+    /// thread's context, where the wake writes its result: the core loop must not save over
+    /// them (`dispatch/sync.rs`, `dispatch/ipc.rs`), and reschedules
+    /// ([`Dispatcher::switch`]).
     Waiting,
 }
 

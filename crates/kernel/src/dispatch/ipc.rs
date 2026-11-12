@@ -59,9 +59,32 @@
 //!   can happen here. PROVISIONAL: resource limits are a later kernel slice (kernel spec, "Port
 //!   plan"). Test: `connecting_many_times_never_runs_out_of_sessions`.
 //!
-//! PROVISIONAL (walking skeleton, #74): the dispatcher is told its caller (`Caller`), there is
-//! one process, and a woken sender is reported, not made runnable: the scheduler does not know
-//! which guest thread is which yet. Kernel slice 10 (the core loop) makes waking real.
+//! # Senders wait as scheduler threads (kernel slice 10)
+//!
+//! When the calling core runs a scheduler thread ([`Sender::waiter`]), its registers are saved
+//! as its context when the request is queued or started (step 1), and it waits for its reply
+//! ([`crate::sync::Wait::Reply`]) when the request waits behind another (step 1) or is deferred
+//! (step 2, before the lock goes, so that a reply delivered at once finds it waiting). Settling
+//! a request writes the reply into the sender's message buffer and then, under the same lock,
+//! writes the result into its saved `x0` and makes it runnable
+//! ([`Scheduler::end_reply_wait`]); the core that schedules it next loads that context. A
+//! sender is still reported woken too ([`Dispatcher::take_woken`]).
+//!
+//! A sender that ends while it waits leaves its session's queue if its request has not
+//! started (`Scheduler::forget_waits`); a request already in flight stays with its handler,
+//! and when it ends nothing is written to the sender's message buffer and no event is recorded
+//! for its call, though the IPC events its handler made are. This diverges from Eden, which
+//! keeps a terminating thread's request in the session's list, so the server still receives
+//! it, and in `KServerSession::SendReply` (`eden/src/core/hle/kernel/k_server_session.cpp` @
+//! cf654052) writes the reply but skips `EndWait` for a client whose termination was requested.
+//! Here a thread ends at once (`sched/scheduler/lifecycle.rs`, "Termination is immediate") and
+//! its thread-local page goes back to its process, so there is nowhere safe to write a reply.
+//! Tests: `a_thread_that_ends_while_its_request_waits_leaves_the_queue` and
+//! `a_thread_that_ends_while_its_request_is_in_flight_gets_no_reply_and_no_event`.
+//!
+//! PROVISIONAL (walking skeleton, #74): the dispatcher is told its caller (`Caller`), and
+//! there is one process. A caller the scheduler runs no thread for (the tests that drive the
+//! dispatcher without a core loop) is only reported woken, as before slice 10.
 
 use std::collections::VecDeque;
 
@@ -92,6 +115,7 @@ use crate::object::Object;
 use crate::result::{CallResult, KernelError, ResultCode, SvcError, SvcResult};
 use crate::svc::sync::read_user_memory;
 use crate::svc::{Convention, SvcId};
+use crate::sync::WaitOrigin;
 use crate::tables::Scheduler;
 
 #[cfg(test)]
@@ -602,14 +626,21 @@ impl Dispatcher {
         };
         let handle = Handle::from_register(handle);
         let process_id = locked.state.tables.processes.process_id();
+        let (handles, scheduler) = locked.tables();
         let sender = Sender {
             thread: call.caller.thread,
+            waiter: calling_waiter(scheduler, call.caller.core),
             core: call.caller.core,
             message_address: call.regs.tpidrro,
             session_handle: handle,
         };
-        let (handles, scheduler) = locked.tables();
-        let begun = begin(handles, scheduler, call.caller.memory, process_id, sender);
+        let begun = begin(
+            handles,
+            scheduler,
+            call.caller.memory,
+            process_id,
+            (sender, call.regs),
+        );
         let (server, session) = match begun {
             Ok(Begun::Start { server, session }) => (server, session),
             Ok(Begun::Queued) => return Outcome::Waiting,
@@ -687,12 +718,18 @@ impl Dispatcher {
         give_notices(&mut state.tables, server, &mut *handler);
         drop(locked);
 
+        let sender = request.sender;
         let mut cx = self.context(memory, server, process_id, request.translated);
         let mut message: MessageBuffer = *request.message;
         let answered = handler.handle(&mut cx, session, &mut message);
 
         let mut locked = self.lock::<(&mut Scheduler,)>();
         let (scheduler,) = locked.tables();
+        if matches!(answered, Ok(Handled::Deferred)) {
+            // The sender waits for the reply now, before the lock goes, so that a reply
+            // delivered as soon as it goes finds it waiting.
+            await_reply(scheduler, sender, session);
+        }
         let ipc = scheduler.ipc_mut().1;
         let finished = match answered {
             Ok(Handled::Replied) => {
@@ -765,7 +802,14 @@ impl Dispatcher {
         {
             let Done { request, result } = done;
             let sender = request.sender;
-            if result.is_ok()
+            let code = result.err().map_or(ResultCode::SUCCESS, KernelError::code);
+            let mut locked = self.lock::<(&mut Scheduler,)>();
+            let (scheduler,) = locked.tables();
+            // A sender that ended while it waited gets no reply: its message buffer may be
+            // another thread's by now.
+            let alive = is_alive(scheduler, sender);
+            if alive
+                && result.is_ok()
                 && let Err(error) = memory.write(sender.message_address, &request.message[..])
             {
                 tracing::error!(
@@ -773,9 +817,14 @@ impl Dispatcher {
                     "a reply could not be written to its sender's TLS block"
                 );
             }
-            let code = result.err().map_or(ResultCode::SUCCESS, KernelError::code);
-            let mut locked = self.lock::<(&mut Scheduler,)>();
-            let (scheduler,) = locked.tables();
+            // The reply is in place before the sender can run again: both happen under the
+            // lock.
+            if alive
+                && let Some(waiter) = sender.waiter
+                && let Err(error) = scheduler.end_reply_wait(waiter, session, code)
+            {
+                tracing::error!(%error, ?session, "a sender could not be woken");
+            }
             let (objects, ipc) = scheduler.ipc_mut();
             if let Err(error) = ipc.release_request(objects, session, &request) {
                 tracing::error!(%error, ?session, "a finished request could not let go");
@@ -783,13 +832,17 @@ impl Dispatcher {
             for kind in events {
                 recorder.record(time, sender.core, sender.thread, kind);
             }
-            record_send(recorder, time, sender, code);
+            if alive {
+                record_send(recorder, time, sender, code);
+            }
             drop(locked);
-            woken.push(Woken {
-                thread: sender.thread,
-                core: sender.core,
-                result: code,
-            });
+            if alive {
+                woken.push(Woken {
+                    thread: sender.thread,
+                    core: sender.core,
+                    result: code,
+                });
+            }
         }
         woken
     }
@@ -802,7 +855,7 @@ fn begin(
     scheduler: &mut Scheduler,
     memory: &dyn GuestMemory,
     process_id: u64,
-    sender: Sender,
+    (sender, regs): (Sender, &GuestRegs),
 ) -> CallResult<Begun> {
     let session = handles
         .get(sender.session_handle)
@@ -845,17 +898,88 @@ fn begin(
         message: Box::new(message),
         translated,
     };
-    match ipc.send(objects, session, request) {
-        Ok(Admission::Start) => Ok(Begun::Start {
-            server: ipc.server_of(session)?,
-            session,
-        }),
-        Ok(Admission::Queued) => Ok(Begun::Queued),
+    let admission = match ipc.send(objects, session, request) {
+        Ok(admission) => admission,
         Err(refused) => {
             ipc.release_translated(objects, &refused.request.translated)?;
-            Err(refused.error.into())
+            return Err(refused.error.into());
+        }
+    };
+    let server = ipc.server_of(session)?;
+    if let Some(waiter) = sender.waiter {
+        // The sender's registers are its context from here on, before the lock goes: if it
+        // waits, the reply's result is written there and a switch loads it (kernel slice 10).
+        *scheduler.context_mut(waiter)? = regs.clone();
+    }
+    match admission {
+        Admission::Start => Ok(Begun::Start { server, session }),
+        Admission::Queued => {
+            if sender.waiter.is_some() && !await_reply(scheduler, sender, session) {
+                // A sender that cannot wait must not leave a request nobody waits for.
+                let (objects, ipc) = scheduler.ipc_mut();
+                if let Some(waiter) = sender.waiter
+                    && let Some(request) = ipc.withdraw(session, waiter)?
+                {
+                    ipc.release_request(objects, session, &request)?;
+                }
+                return Err(SvcError::Internal(
+                    "a sender whose request waits could not wait for it".to_owned(),
+                ));
+            }
+            Ok(Begun::Queued)
         }
     }
+}
+
+/// The scheduler's thread on `core`, if it runs one that may begin a wait: what a request's
+/// sender waits as ([`Sender::waiter`]). A core the scheduler does not name, or whose thread is
+/// not runnable or is in a wait already (only a caller that names its thread by hand can be),
+/// has none, and its sender is only reported woken.
+fn calling_waiter(scheduler: &Scheduler, core: u8) -> Option<crate::id::ThreadId> {
+    let core = crate::sched::CoreId::new(core)?;
+    let thread = scheduler.current(core).ok().flatten()?;
+    let runnable = scheduler
+        .thread(thread)
+        .is_ok_and(|row| row.state() == crate::sched::ThreadState::Runnable);
+    (runnable && scheduler.sync().wait(thread).is_none()).then_some(thread)
+}
+
+/// Makes the scheduler's thread behind `sender` wait for the reply to its request on
+/// `session`, unless it waits for that reply already (a queued request that was started and
+/// then deferred). Returns whether the sender now waits; one with no scheduler thread does
+/// not, and is only reported woken. A failure is the kernel's own bookkeeping, and is logged.
+fn await_reply(scheduler: &mut Scheduler, sender: Sender, session: ObjectId) -> bool {
+    let Some(waiter) = sender.waiter else {
+        return false;
+    };
+    if matches!(
+        scheduler.sync().wait(waiter),
+        Some(crate::sync::Wait::Reply { session: waited, .. }) if *waited == session
+    ) {
+        return true;
+    }
+    let origin = WaitOrigin {
+        thread: sender.thread,
+        core: sender.core,
+        args: send_args(sender),
+    };
+    match scheduler.wait_for_reply(waiter, session, origin) {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::error!(%error, ?session, "a sender could not wait for its reply");
+            false
+        }
+    }
+}
+
+/// Whether a request's sender can still be answered: one the scheduler does not know is (it
+/// is only reported), and one it knows must not have ended.
+fn is_alive(scheduler: &Scheduler, sender: Sender) -> bool {
+    sender.waiter.is_none_or(|waiter| {
+        scheduler
+            .thread(waiter)
+            .is_ok_and(|row| row.state() != crate::sched::ThreadState::Terminated)
+    })
 }
 
 /// Ends a started request and returns what is over, each with `events` for the first.
@@ -936,17 +1060,22 @@ fn answer(id: SvcId, convention: &Convention, regs: &mut GuestRegs, result: Resu
     complete(id, convention, regs, &[result_word(result)])
 }
 
-/// Records the `SendSyncRequest` event of a sender woken by someone else's dispatch.
-fn record_send(recorder: &Recorder, time: GuestTicks, sender: Sender, result: ResultCode) {
+/// The decoded arguments a sender's `SendSyncRequest` event carries: its session handle.
+fn send_args(sender: Sender) -> [u64; SVC_ARG_COUNT] {
     let mut passed = [0; SVC_ARG_COUNT];
     passed[0] = u64::from(sender.session_handle.raw());
+    recorded_args(Some(SvcId::SendSyncRequest), &passed)
+}
+
+/// Records the `SendSyncRequest` event of a sender woken by someone else's dispatch.
+fn record_send(recorder: &Recorder, time: GuestTicks, sender: Sender, result: ResultCode) {
     recorder.record(
         time,
         sender.core,
         sender.thread,
         EventKind::Svc {
             id: u32::from(SvcId::SendSyncRequest.number()),
-            args: recorded_args(Some(SvcId::SendSyncRequest), &passed),
+            args: send_args(sender),
             result: starquake_trace::ResultCode(result.raw()),
         },
     );

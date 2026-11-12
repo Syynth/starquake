@@ -1261,3 +1261,184 @@ fn a_request_on_a_second_session_waits_while_another_core_runs_the_handler() {
     );
     assert_eq!(world.tls(B), [0xEE; BUFFER_SIZE]);
 }
+
+// ----- Senders the scheduler runs (kernel slice 10) -------------------------------------------
+
+use crate::sched::ThreadState;
+
+/// Signals nobody listens to: these tests switch cores by hand.
+struct Quiet;
+
+impl crate::sched::CoreSignals for Quiet {
+    fn interrupt(&mut self, _: crate::sched::CoreId) {}
+
+    fn wake(&mut self, _: crate::sched::CoreId) {}
+}
+
+/// Makes `thread`'s core run a scheduler thread of its own (one of no process), as the core
+/// loop does, and returns it.
+fn run_thread_for(world: &World, thread: ThreadId) -> KernelThreadId {
+    let core = crate::sched::CoreId::new(core_of(thread)).unwrap();
+    world.dispatcher.with::<(&mut Scheduler,), _>(|(scheduler,)| {
+        let priority = crate::sched::Priority::new(44).unwrap();
+        let id = scheduler.create_thread(priority, core).unwrap();
+        scheduler.start(id).unwrap();
+        scheduler
+            .update(GuestTicks(0), None, &mut Quiet)
+            .unwrap();
+        assert_eq!(
+            scheduler.schedule(core, &mut Quiet),
+            Ok(Some(id))
+        );
+        id
+    })
+}
+
+/// The run state of a scheduler thread, and whether it waits for a reply on `session`.
+fn reply_state(world: &World, thread: KernelThreadId, session: ObjectId) -> (ThreadState, bool) {
+    world.with_tables(|_, scheduler| {
+        let waits = matches!(
+            scheduler.sync().wait(thread),
+            Some(crate::sync::Wait::Reply { session: waited, .. }) if *waited == session
+        );
+        (scheduler.thread(thread).unwrap().state(), waits)
+    })
+}
+
+/// A thread's saved `x0`.
+fn saved_x0(world: &World, thread: KernelThreadId) -> u64 {
+    world.with_tables(|_, scheduler| scheduler.thread(thread).unwrap().context().x[0])
+}
+
+#[test]
+fn senders_that_wait_are_blocked_threads_and_the_reply_makes_them_runnable() {
+    let world = World::new();
+    let handle = world.session();
+    let session = world.object(handle);
+    let (a, b) = (run_thread_for(&world, A), run_thread_for(&world, B));
+    world
+        .first
+        .script(Box::new(|_, _, _| Ok(Handled::Deferred)));
+    // A's request is deferred, B's waits behind it: both wait for their replies.
+    assert_eq!(world.send(A, handle, &request()).0.outcome, Outcome::Waiting);
+    world.first.script(reply_with(0xB0));
+    assert_eq!(world.send(B, handle, &request()).0.outcome, Outcome::Waiting);
+    for thread in [a, b] {
+        assert_eq!(
+            reply_state(&world, thread, session),
+            (ThreadState::Waiting, true)
+        );
+        // The context saved when the request was sent still has the handle in `x0`.
+        assert_eq!(saved_x0(&world, thread), u64::from(handle.raw()));
+    }
+    // The context is the registers of the call: its message buffer is where the reply goes.
+    world.with_tables(|_, scheduler| {
+        assert_eq!(scheduler.thread(b).unwrap().context().tpidrro, TLS_B);
+    });
+
+    lock(&world.first.ready).push_back((session, Ok(0xA0)));
+    world.deliver(&world.first);
+    for thread in [a, b] {
+        assert_eq!(
+            reply_state(&world, thread, session),
+            (ThreadState::Runnable, false)
+        );
+        // The result is in the saved `x0`, where a switch loads it from.
+        assert_eq!(saved_x0(&world, thread), u64::from(ResultCode::SUCCESS.raw()));
+    }
+    assert_eq!(world.tls(A), [0xA0; BUFFER_SIZE]);
+    assert_eq!(world.tls(B), [0xB0; BUFFER_SIZE]);
+    // They are still reported, as before.
+    assert_eq!(world.dispatcher.take_woken().len(), 2);
+}
+
+#[test]
+fn a_sender_answered_at_once_never_waits() {
+    let world = World::new();
+    let handle = world.session();
+    let session = world.object(handle);
+    let a = run_thread_for(&world, A);
+    world.first.script(reply_with(0xA1));
+    let (record, regs) = world.send(A, handle, &request());
+    assert_eq!(record.outcome, Outcome::Completed);
+    assert_eq!(result(&regs), ResultCode::SUCCESS);
+    assert_eq!(
+        reply_state(&world, a, session),
+        (ThreadState::Runnable, false)
+    );
+    assert_eq!(world.tls(A), [0xA1; BUFFER_SIZE]);
+}
+
+#[test]
+fn a_thread_that_ends_while_its_request_waits_leaves_the_queue() {
+    let world = World::new();
+    let handle = world.session();
+    let session = world.object(handle);
+    let (_, b) = (run_thread_for(&world, A), run_thread_for(&world, B));
+    world
+        .first
+        .script(Box::new(|_, _, _| Ok(Handled::Deferred)));
+    world.send(A, handle, &request());
+    world.first.script(reply_with(0xB0));
+    world.send(B, handle, &request());
+    world.with_tables(|_, scheduler| {
+        assert_eq!(scheduler.ipc().waiting(session), Ok(1));
+        // The handle's reference and each request's.
+        assert_eq!(scheduler.objects().refs(session), 3);
+    });
+
+    world
+        .dispatcher
+        .with::<(&mut Scheduler,), _>(|(scheduler,)| scheduler.terminate_thread(b))
+        .unwrap();
+    world.with_tables(|_, scheduler| {
+        assert_eq!(scheduler.ipc().waiting(session), Ok(0));
+        assert_eq!(scheduler.objects().refs(session), 2);
+        assert_eq!(scheduler.sync().wait(b), None);
+    });
+
+    // A's reply comes; B's request is gone, so the server never sees it.
+    let b_buffer = world.tls(B);
+    lock(&world.first.ready).push_back((session, Ok(0xA0)));
+    world.deliver(&world.first);
+    assert_eq!(world.first.log().handled.len(), 1);
+    assert_eq!(world.tls(B), b_buffer);
+    world.with_tables(|_, scheduler| {
+        assert_eq!(scheduler.objects().refs(session), 1);
+        assert_eq!(scheduler.ipc().queue(world.first.id).unwrap().running(), 0);
+    });
+}
+
+#[test]
+fn a_thread_that_ends_while_its_request_is_in_flight_gets_no_reply_and_no_event() {
+    let world = World::new();
+    let handle = world.session();
+    let session = world.object(handle);
+    let a = run_thread_for(&world, A);
+    world
+        .first
+        .script(Box::new(|_, _, _| Ok(Handled::Deferred)));
+    world.send(A, handle, &request());
+    world
+        .dispatcher
+        .with::<(&mut Scheduler,), _>(|(scheduler,)| scheduler.terminate_thread(a))
+        .unwrap();
+    // The request is with its handler, so it stays until the handler answers.
+    world.with_tables(|_, scheduler| {
+        assert_eq!(scheduler.objects().refs(session), 2);
+    });
+    let before = world.events().len();
+    let a_buffer = world.tls(A);
+    lock(&world.first.ready).push_back((session, Ok(0xA0)));
+    world.deliver(&world.first);
+    assert_eq!(world.tls(A), a_buffer, "no reply for an ended thread");
+    assert_eq!(world.events().len(), before, "no event for an ended thread");
+    assert_eq!(world.dispatcher.take_woken(), Vec::<Woken>::new());
+    world.with_tables(|_, scheduler| {
+        assert_eq!(scheduler.objects().refs(session), 1);
+        assert_eq!(
+            scheduler.thread(a).unwrap().state(),
+            ThreadState::Terminated
+        );
+    });
+}
