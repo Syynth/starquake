@@ -9,7 +9,8 @@
 //!
 //! PROVISIONAL (walking skeleton, #74). Not here yet, and owned by the crash-report step of the
 //! observability spec's order of work: a backtrace by frame pointer, symbol names, and the events
-//! split per thread (there is one guest thread). The exception is one of three kinds: a data
+//! split per thread (the report quotes the newest events of every thread, merged in order). The
+//! exception is one of three kinds: a data
 //! abort, an instruction abort, and everything else as an undefined instruction. The CPU
 //! backend's syndrome for it ([`CrashReport::with_syndrome`]) says the rest: whether an abort was
 //! a missing page or a refused access, and what an "undefined instruction" really was.

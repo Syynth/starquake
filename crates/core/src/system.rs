@@ -1,9 +1,10 @@
 //! [`System`]: one program, loaded and run from start to finish.
 //!
 //! PROVISIONAL (walking skeleton, #74). A `System` is one program (an NRO, or an ExeFS's
-//! modules and metadata) run once as one guest thread on one vCPU of the hypervisor backend, in an address space of its own that the kernel keeps
-//! the books of (the `image`, `space` and `machine` modules say what is provisional about each
-//! and what replaces it). It is the
+//! modules and metadata) run once as one process on the hypervisor backend, one vCPU per core
+//! of the kernel's scheduler, in an address space of its own that the kernel keeps the books
+//! of (the `image`, `space` and `machine` modules say what is provisional about each and what
+//! replaces it). It is the
 //! thinnest thing that joins the loader, the code patcher, the CPU backend, the kernel
 //! dispatcher and the event stream, so that later work widens something that runs.
 //!
@@ -83,15 +84,17 @@ mod host {
     use std::sync::{Arc, Mutex, PoisonError};
     use std::time::Instant;
 
-    use starquake_cpu::hvf::{HvfBackend, HvfVcpu, PhysicalMemory, RamConfig};
+    use starquake_cpu::hvf::{HvfBackend, HvfVcpu, PacKeys, PhysicalMemory, RamConfig};
     use starquake_cpu::{Backend, Vcpu};
+    use starquake_kernel::sched::CoreId;
     use starquake_loader::patch::CounterRescale;
     use starquake_memory::Access;
 
     use super::Error;
     use crate::clock::{CounterClock, Timebase};
     use crate::image::{Loaded, Program, load};
-    use crate::machine::{self, GuestProgram, GuestSpace};
+    use crate::machine::{self, GuestProgram, GuestSpace, Vcpus};
+
     use crate::report::{RunOptions, RunReport};
     use crate::space::{AddressSpace, SpaceMapper, Touch};
 
@@ -100,9 +103,9 @@ mod host {
 
     /// The address-space id of the one process: the first id the kernel's pool hands out
     /// (`starquake_kernel::process::AsidPool`). PROVISIONAL: with one process per run nothing
-    /// is given back, so the loop does not keep a pool; the core loop of kernel slice 10 takes
-    /// ids from one, sized by the width the backend reports (`HvfVcpu::asid_bits`), and reports
-    /// each flush to it.
+    /// is given back, so the loop does not keep a pool; a run with more processes takes ids
+    /// from one, sized by the width the backend reports (`HvfVcpu::asid_bits`), and reports
+    /// each flush to it. Every core's vCPU uses this id.
     const PROCESS_ASID: u16 = starquake_kernel::process::asid::FIRST_ASID;
 
     /// The one address space of a run, as the loop drives it on the vCPU.
@@ -153,15 +156,30 @@ mod host {
             placed,
             address_space,
         } = load(program, Some(counter), Box::new(mapper), &*space)?;
-        // Declared after the backend, so it is dropped first, as the VM requires.
-        let mut vcpu = backend.create_vcpu()?;
-        vcpu.set_address_space(space.root(), PROCESS_ASID)?;
+        // Every core's vCPU runs in the one address space, with the same pointer-authentication
+        // keys, so that a thread can move from core to core. PROVISIONAL: the keys are fixed
+        // (zero), not the process's own (`crate::machine`, "Start state").
+        let new_vcpu = || -> Result<HvfVcpu, starquake_cpu::Error> {
+            let mut vcpu = backend.create_vcpu()?;
+            vcpu.set_address_space(space.root(), PROCESS_ASID)?;
+            vcpu.set_pac_keys(&PacKeys::default())?;
+            Ok(vcpu)
+        };
+        let make = |_: CoreId| new_vcpu();
+        // Core 0's vCPU, made on this thread, which runs core 0. Declared after the backend, so
+        // it is dropped first, as the VM requires; the other cores' vCPUs are dropped on their
+        // own threads before `machine::run` returns.
+        let mut vcpu = new_vcpu()?;
         let guest = GuestProgram {
             space: &*space,
             placed: &placed,
             address_space,
         };
-        Ok(machine::run(&mut vcpu, guest, options, started, time))
+        let vcpus = Vcpus {
+            first: &mut vcpu,
+            make: &make,
+        };
+        Ok(machine::run(vcpus, guest, options, started, time))
     }
 }
 

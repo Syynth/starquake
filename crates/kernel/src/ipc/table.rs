@@ -88,12 +88,14 @@ impl From<IpcError> for SvcError {
 /// Who sent a request, and where its reply goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Sender {
-    /// The sending guest thread, as the event stream names it.
-    ///
-    /// PROVISIONAL (walking skeleton, #74): the event stream's id, which is what the dispatcher
-    /// is told of its caller. Kernel slice 10 names the scheduler's thread here, so that a
-    /// woken sender can be made runnable.
+    /// The sending guest thread, as the event stream names it: what its events are recorded
+    /// with.
     pub thread: ThreadId,
+    /// The sending thread as the scheduler names it, when the calling core runs one (kernel
+    /// slice 10): it waits for the reply as a scheduler thread and the request's end makes it
+    /// runnable (`dispatch/ipc.rs`). `None` for a caller the scheduler does not know, which is
+    /// only reported woken ([`crate::dispatch::Dispatcher::take_woken`]).
+    pub waiter: Option<crate::id::ThreadId>,
     /// The core it called from.
     pub core: u8,
     /// Where its message buffer is (its TLS block): the reply is written there.
@@ -417,6 +419,29 @@ impl Ipc {
                 request: Box::new(request),
             }),
         }
+    }
+
+    /// Takes back the request `waiter` sent on `session` that is still waiting behind another
+    /// (not in flight), if there is one: what ending a thread that waits for a reply does to
+    /// its request (`crate::sync::wait`). The caller releases what it held
+    /// ([`Ipc::release_request`]). A request in flight stays: its handler has it.
+    pub fn withdraw(
+        &mut self,
+        session: ObjectId,
+        waiter: crate::id::ThreadId,
+    ) -> Result<Option<Request>, IpcError> {
+        let row = self.session_mut(session)?;
+        let Some(index) = row
+            .waiting
+            .iter()
+            .position(|request| request.sender.waiter == Some(waiter))
+        else {
+            return Ok(None);
+        };
+        let server = row.server;
+        let request = row.waiting.remove(index);
+        self.server_mut(server)?.queue.withdraw(session)?;
+        Ok(request)
     }
 
     /// Adds a notice for `server`: what the dispatcher does when a handler failed and still has

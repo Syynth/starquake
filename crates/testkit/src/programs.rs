@@ -276,6 +276,159 @@ pub fn counter(guest_hz: u64) -> Result<Counter, ProgramError> {
     })
 }
 
+/// `svc 0x08`, `CreateThread` (`SvcId::CreateThread` in `eden/src/core/hle/kernel/svc.h`):
+/// `x1` entry, `x2` argument, `x3` stack, `w4` priority, `w5` core; `w0` result and `w1` the
+/// handle out (`SvcWrap_CreateThread64` in `eden/src/core/hle/kernel/svc.cpp`).
+pub const SVC_CREATE_THREAD: u32 = 0x08;
+/// `svc 0x09`, `StartThread`: `w0` the handle; `w0` the result.
+pub const SVC_START_THREAD: u32 = 0x09;
+/// `svc 0x0a`, `ExitThread`. No arguments.
+pub const SVC_EXIT_THREAD: u32 = 0x0a;
+/// `svc 0x10`, `GetCurrentProcessorNumber`: `w0` the core out.
+pub const SVC_GET_CURRENT_PROCESSOR_NUMBER: u32 = 0x10;
+/// `svc 0x18`, `WaitSynchronization`: `x1` the handles, `w2` their count, `x3` the timeout;
+/// `w0` result and `w1` the index out (`SvcWrap_WaitSynchronization64`).
+pub const SVC_WAIT_SYNCHRONIZATION: u32 = 0x18;
+
+/// The priority [`threads`] gives its second thread: Eden's default for a homebrew main thread
+/// (`0x2c`, the main thread priority of a program with no metadata), so the two are equals.
+pub const THREAD_PRIORITY: u32 = 0x2c;
+/// The core [`threads`] starts its second thread on: not the main thread's (core 0).
+pub const SECOND_THREAD_CORE: u32 = 1;
+/// What [`threads`]'s second thread stores for the main thread to find: proof it ran.
+pub const THREAD_MARKER: u32 = 0x7EAD;
+
+/// The threads program and the places in it a test wants to name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Threads {
+    /// The NRO file.
+    pub nro: Vec<u8>,
+    /// Image offsets of the `brk`s each failed check stops at, in program order: `CreateThread`
+    /// failed, `StartThread` failed, the join failed, the second thread ran on another core
+    /// than [`SECOND_THREAD_CORE`], and it did not leave [`THREAD_MARKER`].
+    pub failure_offsets: [u64; 5],
+}
+
+/// A program that starts a second thread on core [`SECOND_THREAD_CORE`] and joins it: the
+/// second thread reports the core it runs on and [`THREAD_MARKER`] in a slot on the main
+/// thread's stack, and ends; the main thread waits on the thread's handle with no timeout,
+/// checks both, and calls `ExitProcess`. Each failed check stops at its own `brk`.
+///
+/// ```text
+///         b    main
+/// thread: mov  x19, x0              ; where to report
+///         svc  #0x10                ; GetCurrentProcessorNumber
+///         str  x0, [x19]
+///         movz x9, #MARKER
+///         str  x9, [x19, #8]
+///         svc  #0xa                 ; ExitThread
+/// main:   add  x20, sp, #0
+///         sub  x20, x20, #32        ; a slot: the handle, then the core, then the marker
+///         adr  x1, thread
+///         add  x2, x20, #8
+///         sub  x3, x20, #0x800      ; its stack, below the slot
+///         movz x4, #0x2c
+///         movz x5, #1
+///         svc  #0x8                 ; CreateThread
+///         cbnz x0, create_failed
+///         str  x1, [x20]
+///         mov  x0, x1
+///         svc  #0x9                 ; StartThread
+///         cbnz x0, start_failed
+///         add  x1, x20, #0          ; the handle list
+///         movz x2, #1
+///         movz x3, #0
+///         sub  x3, x3, #1           ; no timeout
+///         svc  #0x18                ; WaitSynchronization: the join
+///         cbnz x0, wait_failed
+///         ldr  x9, [x20, #8]
+///         sub  x9, x9, #1
+///         cbnz x9, wrong_core
+///         ldr  x9, [x20, #16]
+///         movz x10, #MARKER
+///         sub  x9, x9, x10
+///         cbnz x9, no_marker
+///         svc  #0x7
+/// create_failed: brk #1 ... no_marker: brk #5
+/// ```
+pub fn threads() -> Result<Threads, ProgramError> {
+    /// The slot's size below the stack pointer, and where the second thread's stack starts
+    /// below the slot.
+    const SLOT: u32 = 32;
+    const STACK_BELOW: u32 = 0x800;
+    /// Offsets in the slot.
+    const CORE_AT: u32 = 8;
+    const MARKER_AT: u32 = 16;
+    const SP: u8 = 31;
+
+    let mut asm = Assembler::new();
+    let main = asm.label();
+    let failures = [
+        asm.label(),
+        asm.label(),
+        asm.label(),
+        asm.label(),
+        asm.label(),
+    ];
+    asm.b(main)?;
+    let thread = asm.len();
+    asm.emit(a64::mov(19, 0)?);
+    asm.emit(a64::svc(SVC_GET_CURRENT_PROCESSOR_NUMBER)?);
+    asm.emit(a64::str(0, 19, 0)?);
+    asm.emit(a64::movz(9, THREAD_MARKER, 0)?);
+    asm.emit(a64::str(9, 19, MARKER_AT - CORE_AT)?);
+    asm.emit(a64::svc(SVC_EXIT_THREAD)?);
+
+    asm.bind(main)?;
+    asm.emit(a64::add_imm(20, SP, 0)?);
+    asm.emit(a64::sub_imm(20, 20, SLOT)?);
+    let back = |here: usize| -> Result<i64, ProgramError> {
+        let words = i64::try_from(thread)
+            .ok()
+            .zip(i64::try_from(here).ok())
+            .and_then(|(to, from)| to.checked_sub(from))
+            .ok_or(ProgramError::TooLarge)?;
+        words
+            .checked_mul(i64::from(a64::INSN_SIZE))
+            .ok_or(ProgramError::TooLarge)
+    };
+    asm.emit(a64::adr(1, back(asm.len())?)?);
+    asm.emit(a64::add_imm(2, 20, CORE_AT)?);
+    asm.emit(a64::sub_imm(3, 20, STACK_BELOW)?);
+    asm.emit(a64::movz(4, THREAD_PRIORITY, 0)?);
+    asm.emit(a64::movz(5, SECOND_THREAD_CORE, 0)?);
+    asm.emit(a64::svc(SVC_CREATE_THREAD)?);
+    asm.cbnz(0, failures[0])?;
+    asm.emit(a64::str(1, 20, 0)?);
+    asm.emit(a64::mov(0, 1)?);
+    asm.emit(a64::svc(SVC_START_THREAD)?);
+    asm.cbnz(0, failures[1])?;
+    asm.emit(a64::add_imm(1, 20, 0)?);
+    asm.emit(a64::movz(2, 1, 0)?);
+    asm.emit(a64::movz(3, 0, 0)?);
+    asm.emit(a64::sub_imm(3, 3, 1)?);
+    asm.emit(a64::svc(SVC_WAIT_SYNCHRONIZATION)?);
+    asm.cbnz(0, failures[2])?;
+    asm.emit(a64::ldr(9, 20, CORE_AT)?);
+    asm.emit(a64::sub_imm(9, 9, SECOND_THREAD_CORE)?);
+    asm.cbnz(9, failures[3])?;
+    asm.emit(a64::ldr(9, 20, MARKER_AT)?);
+    asm.emit(a64::movz(10, THREAD_MARKER, 0)?);
+    asm.emit(a64::sub(9, 9, 10)?);
+    asm.cbnz(9, failures[4])?;
+    asm.emit(a64::svc(SVC_EXIT_PROCESS)?);
+    let mut failure_offsets = [0; 5];
+    for ((label, offset), code) in failures.into_iter().zip(&mut failure_offsets).zip(1..) {
+        *offset = code_offset(asm.len())?;
+        asm.bind(label)?;
+        asm.emit(a64::brk(code)?);
+    }
+    Ok(Threads {
+        nro: NroBuilder::new(&asm.finish()?).build()?,
+        failure_offsets,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -420,5 +573,44 @@ mod tests {
             target(counter.read_offsets[0] + 12),
             counter.read_offsets[0] + 8
         );
+    }
+
+    #[test]
+    fn threads_starts_its_second_thread_at_its_own_code_and_stops_at_numbered_traps() {
+        let program = threads().unwrap();
+        let file = &program.nro;
+        let entry = code_offset(0).unwrap();
+        // The second thread's code follows the first instruction, a branch over it.
+        let thread = entry + u64::from(a64::INSN_SIZE);
+        assert_eq!(word_at(file, thread), a64::mov(19, 0).unwrap());
+        // Find the `adr x1` and check it points at the thread.
+        let adr_at = (0..64)
+            .map(|word| code_offset(word).unwrap())
+            .find(|offset| {
+                let word = word_at(file, *offset);
+                word & 0x9F00_001F == 0x1000_0001
+            })
+            .unwrap();
+        assert_eq!(adr_target(word_at(file, adr_at), adr_at), thread);
+        // The calls, in program order.
+        let svcs: Vec<u32> = (0..64)
+            .map(|word| word_at(file, code_offset(word).unwrap()))
+            .filter(|word| word & 0xFFE0_001F == 0xD400_0001)
+            .map(|word| (word >> 5) & 0xFFFF)
+            .collect();
+        assert_eq!(
+            svcs,
+            [
+                SVC_GET_CURRENT_PROCESSOR_NUMBER,
+                SVC_EXIT_THREAD,
+                SVC_CREATE_THREAD,
+                SVC_START_THREAD,
+                SVC_WAIT_SYNCHRONIZATION,
+                SVC_EXIT_PROCESS,
+            ]
+        );
+        for (offset, code) in program.failure_offsets.iter().zip(1..) {
+            assert_eq!(word_at(file, *offset), a64::brk(code).unwrap());
+        }
     }
 }

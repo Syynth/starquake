@@ -697,6 +697,56 @@ fn a_program_whose_segments_cannot_be_mapped_is_an_emulator_error() {
 }
 
 #[test]
+fn a_second_thread_runs_natively_on_its_own_core_and_is_joined() {
+    // The program starts a thread on core 1, waits for it to end (a `WaitSynchronization` on
+    // its handle, with no timeout), and exits only if the thread reported core 1 and left its
+    // marker; any failed check is a `brk` with its own number. Core 1 is another host thread
+    // with its own vCPU.
+    let program = programs::threads().unwrap();
+    let Some(report) = run(&program.nro, GENEROUS) else {
+        return;
+    };
+    assert_eq!(
+        report.exit,
+        ExitReason::ProcessExited,
+        "{:?}\n{}",
+        report
+            .crash()
+            .map(starquake_core::crash::CrashReport::to_text),
+        report.trace
+    );
+    let made: Vec<_> = report
+        .system_calls
+        .iter()
+        .map(|(name, count)| (name.as_str(), *count))
+        .collect();
+    assert_eq!(
+        made,
+        [
+            ("CreateThread", 1),
+            ("ExitProcess", 1),
+            ("ExitThread", 1),
+            ("GetCurrentProcessorNumber", 1),
+            ("StartThread", 1),
+            ("WaitSynchronization", 1),
+        ]
+    );
+    // Each thread's calls were made on its own core.
+    let dump = Dump::from_bytes(&report.events).expect("a readable dump");
+    let second = u32::from(SvcId::GetCurrentProcessorNumber.number());
+    for event in dump.merged() {
+        if let EventKind::Svc { id, .. } = event.kind {
+            let core = if id == second || id == u32::from(SvcId::ExitThread.number()) {
+                u8::try_from(programs::SECOND_THREAD_CORE).unwrap()
+            } else {
+                0
+            };
+            assert_eq!(event.core, core, "{event:?}");
+        }
+    }
+}
+
+#[test]
 fn an_endless_loop_is_ended_by_the_timeout() {
     let timeout = Duration::from_millis(300);
     let Some(report) = run(&programs::endless_loop().unwrap(), timeout) else {

@@ -29,8 +29,12 @@
 //! `take_reply` gets an [`IpcContext`]; a request the queue starts meanwhile (it has a free
 //! worker) finds the slot empty. It stays in flight, holding its worker, and is parked: its
 //! sender waits ([`Outcome::Waiting`]) and the core that puts the handler back runs it and
-//! reports the sender woken ([`Dispatcher::take_woken`]). Whenever a handler goes back in its
-//! slot it is first given the notices that arrived while it was out.
+//! reports the sender woken ([`Dispatcher::take_woken`]). The other way round, a delivery that
+//! finds the handler out of its slot (a core runs a request through it) is owed
+//! (`State::owed`): the thread that puts the handler back makes it before its own call
+//! returns, so replies said to be ready are delivered once the handler is free. Test:
+//! `replies_said_to_be_ready_while_another_core_runs_the_handler_are_delivered`. Whenever a
+//! handler goes back in its slot it is first given the notices that arrived while it was out.
 //!
 //! `ConnectToNamedPort` is ported from Eden `eden/src/core/hle/kernel/svc/svc_port.cpp` @
 //! cf654052 (GPL-3.0-or-later), `ConnectToNamedPort`, with the name read as
@@ -59,9 +63,32 @@
 //!   can happen here. PROVISIONAL: resource limits are a later kernel slice (kernel spec, "Port
 //!   plan"). Test: `connecting_many_times_never_runs_out_of_sessions`.
 //!
-//! PROVISIONAL (walking skeleton, #74): the dispatcher is told its caller (`Caller`), there is
-//! one process, and a woken sender is reported, not made runnable: the scheduler does not know
-//! which guest thread is which yet. Kernel slice 10 (the core loop) makes waking real.
+//! # Senders wait as scheduler threads (kernel slice 10)
+//!
+//! When the calling core runs a scheduler thread ([`Sender::waiter`]), its registers are saved
+//! as its context when the request is queued or started (step 1), and it waits for its reply
+//! ([`crate::sync::Wait::Reply`]) when the request waits behind another (step 1) or is deferred
+//! (step 2, before the lock goes, so that a reply delivered at once finds it waiting). Settling
+//! a request writes the reply into the sender's message buffer and then, under the same lock,
+//! writes the result into its saved `x0` and makes it runnable
+//! ([`Scheduler::end_reply_wait`]); the core that schedules it next loads that context. A
+//! sender is still reported woken too ([`Dispatcher::take_woken`]).
+//!
+//! A sender that ends while it waits leaves its session's queue if its request has not
+//! started (`Scheduler::forget_waits`); a request already in flight stays with its handler,
+//! and when it ends nothing is written to the sender's message buffer and no event is recorded
+//! for its call, though the IPC events its handler made are. This diverges from Eden, which
+//! keeps a terminating thread's request in the session's list, so the server still receives
+//! it, and in `KServerSession::SendReply` (`eden/src/core/hle/kernel/k_server_session.cpp` @
+//! cf654052) writes the reply but skips `EndWait` for a client whose termination was requested.
+//! Here a thread ends at once (`sched/scheduler/lifecycle.rs`, "Termination is immediate") and
+//! its thread-local page goes back to its process, so there is nowhere safe to write a reply.
+//! Tests: `a_thread_that_ends_while_its_request_waits_leaves_the_queue` and
+//! `a_thread_that_ends_while_its_request_is_in_flight_gets_no_reply_and_no_event`.
+//!
+//! PROVISIONAL (walking skeleton, #74): the dispatcher is told its caller (`Caller`), and
+//! there is one process. A caller the scheduler runs no thread for (the tests that drive the
+//! dispatcher without a core loop) is only reported woken, as before slice 10.
 
 use std::collections::VecDeque;
 
@@ -92,6 +119,7 @@ use crate::object::Object;
 use crate::result::{CallResult, KernelError, ResultCode, SvcError, SvcResult};
 use crate::svc::sync::read_user_memory;
 use crate::svc::{Convention, SvcId};
+use crate::sync::WaitOrigin;
 use crate::tables::Scheduler;
 
 #[cfg(test)]
@@ -436,6 +464,11 @@ impl Dispatcher {
     /// the server's next requests. `caller` is the core doing it: its memory is the process's,
     /// and its clock reading stamps the events. The senders are reported by
     /// [`Dispatcher::take_woken`].
+    ///
+    /// The delivery is owed until a thread with the handler in hand makes it: this one, or,
+    /// when the handler is out of its slot (a core is running a request through it), the one
+    /// that puts it back, which delivers before its own call returns (`deliver_owed`). Either
+    /// way the replies are delivered once the handler is free; this call does not wait for it.
     pub fn deliver_replies(
         &self,
         server: ServerId,
@@ -444,31 +477,85 @@ impl Dispatcher {
         let mut locked = self.lock::<(&mut Scheduler,)>();
         let time = locked.guest_time(caller.env)?;
         let process_id = locked.state.tables.processes.process_id();
-        // Bounded by the requests deferred now: each turn answers one of them.
-        let deferred = locked
-            .state
-            .tables
-            .scheduler
-            .ipc()
-            .queue(server)
-            .map_or(0, |queue| queue.deferred().count());
-        let Some(mut handler) = locked
-            .state
-            .handlers
-            .get_mut(&server)
-            .and_then(Option::take)
-        else {
-            tracing::warn!(
-                ?server,
-                "deferred replies wait for a server whose handler is busy"
-            );
-            return Ok(());
-        };
+        locked.state.owed.insert(server);
         drop(locked);
 
+        let finished = self.deliver_owed(server, caller.memory, process_id);
+        let woken = self.settle(finished, caller.memory, caller.recorder, time);
+        let mut locked = self.lock::<()>();
+        locked.state.woken.extend(woken);
+        // Waits the handler's signals ended (`dispatch/sync.rs`).
+        drain_wakes(&mut locked.state, caller.recorder, time);
+        drop(locked);
+        self.settle_notices();
+        Ok(())
+    }
+
+    /// Makes the deliveries `server` owes ([`Dispatcher::deliver_replies`]) while one is owed
+    /// and its handler is in its slot: takes the handler out, writes the replies it has ready,
+    /// puts it back and runs the requests that may start then. Returns what is over, for the
+    /// caller to settle. A handler out of its slot leaves the delivery owed: the thread that
+    /// has it calls this after putting it back.
+    fn deliver_owed(
+        &self,
+        server: ServerId,
+        memory: &dyn GuestMemory,
+        process_id: u64,
+    ) -> Vec<Finished> {
+        let mut finished = Vec::new();
+        // Bounded by the deliveries owed: each turn takes one owed mark, and only
+        // `deliver_replies` makes one.
+        loop {
+            let mut locked = self.lock::<(&mut Scheduler,)>();
+            let state = &mut *locked.state;
+            if !state.owed.contains(&server) {
+                return finished;
+            }
+            let Some(slot) = state.handlers.get_mut(&server) else {
+                tracing::error!(
+                    ?server,
+                    "deferred replies are owed by a server with no handler"
+                );
+                state.owed.remove(&server);
+                return finished;
+            };
+            let Some(mut handler) = slot.take() else {
+                // Whoever has the handler delivers when it puts it back.
+                tracing::debug!(
+                    ?server,
+                    "deferred replies wait for their handler to come back"
+                );
+                return finished;
+            };
+            state.owed.remove(&server);
+            // Bounded by the requests deferred now: each turn answers one of them.
+            let deferred = state
+                .tables
+                .scheduler
+                .ipc()
+                .queue(server)
+                .map_or(0, |queue| queue.deferred().count());
+            drop(locked);
+
+            finished.extend(self.take_replies(server, &mut *handler, memory, process_id, deferred));
+            let parked = self.put_back(server, handler);
+            finished.extend(self.run_ready(server, memory, process_id, parked));
+        }
+    }
+
+    /// Asks `handler`, out of its slot, for at most `deferred` ready replies, and ends the
+    /// requests they answer. Returns what is over.
+    fn take_replies(
+        &self,
+        server: ServerId,
+        handler: &mut dyn SessionHandler,
+        memory: &dyn GuestMemory,
+        process_id: u64,
+        deferred: usize,
+    ) -> Vec<Finished> {
         let mut finished = Vec::new();
         for _ in 0..deferred {
-            let mut cx = self.context(caller.memory, server, process_id, Translated::default());
+            let mut cx = self.context(memory, server, process_id, Translated::default());
             let mut message = [0; BUFFER_SIZE];
             let Some((session, written)) = handler.take_reply(&mut cx, &mut message) else {
                 break;
@@ -493,16 +580,7 @@ impl Dispatcher {
                 }
             }
         }
-        let parked = self.put_back(server, handler);
-        finished.extend(self.run_ready(server, caller.memory, process_id, parked));
-        let woken = self.settle(finished, caller.memory, caller.recorder, time);
-        let mut locked = self.lock::<()>();
-        locked.state.woken.extend(woken);
-        // Waits the handler's signals ended (`dispatch/sync.rs`).
-        drain_wakes(&mut locked.state, caller.recorder, time);
-        drop(locked);
-        self.settle_notices();
-        Ok(())
+        finished
     }
 
     /// An [`IpcContext`] for a request on `server`.
@@ -602,14 +680,21 @@ impl Dispatcher {
         };
         let handle = Handle::from_register(handle);
         let process_id = locked.state.tables.processes.process_id();
+        let (handles, scheduler) = locked.tables();
         let sender = Sender {
             thread: call.caller.thread,
+            waiter: calling_waiter(scheduler, call.caller.core),
             core: call.caller.core,
             message_address: call.regs.tpidrro,
             session_handle: handle,
         };
-        let (handles, scheduler) = locked.tables();
-        let begun = begin(handles, scheduler, call.caller.memory, process_id, sender);
+        let begun = begin(
+            handles,
+            scheduler,
+            call.caller.memory,
+            process_id,
+            (sender, call.regs),
+        );
         let (server, session) = match begun {
             Ok(Begun::Start { server, session }) => (server, session),
             Ok(Begun::Queued) => return Outcome::Waiting,
@@ -630,6 +715,9 @@ impl Dispatcher {
         let (mut finished, parked) =
             self.run_request(server, session, call.caller.memory, process_id);
         finished.extend(self.run_ready(server, call.caller.memory, process_id, parked));
+        // Replies said to be ready while this core had the handler out are this core's to
+        // deliver now that it is back.
+        finished.extend(self.deliver_owed(server, call.caller.memory, process_id));
         let own = call.caller.thread;
         let mut woken = self.settle(finished, call.caller.memory, call.caller.recorder, time);
         let outcome = match woken.iter().position(|woken| woken.thread == own) {
@@ -687,12 +775,18 @@ impl Dispatcher {
         give_notices(&mut state.tables, server, &mut *handler);
         drop(locked);
 
+        let sender = request.sender;
         let mut cx = self.context(memory, server, process_id, request.translated);
         let mut message: MessageBuffer = *request.message;
         let answered = handler.handle(&mut cx, session, &mut message);
 
         let mut locked = self.lock::<(&mut Scheduler,)>();
         let (scheduler,) = locked.tables();
+        if matches!(answered, Ok(Handled::Deferred)) {
+            // The sender waits for the reply now, before the lock goes, so that a reply
+            // delivered as soon as it goes finds it waiting.
+            await_reply(scheduler, sender, session);
+        }
         let ipc = scheduler.ipc_mut().1;
         let finished = match answered {
             Ok(Handled::Replied) => {
@@ -765,7 +859,14 @@ impl Dispatcher {
         {
             let Done { request, result } = done;
             let sender = request.sender;
-            if result.is_ok()
+            let code = result.err().map_or(ResultCode::SUCCESS, KernelError::code);
+            let mut locked = self.lock::<(&mut Scheduler,)>();
+            let (scheduler,) = locked.tables();
+            // A sender that ended while it waited gets no reply: its message buffer may be
+            // another thread's by now.
+            let alive = is_alive(scheduler, sender);
+            if alive
+                && result.is_ok()
                 && let Err(error) = memory.write(sender.message_address, &request.message[..])
             {
                 tracing::error!(
@@ -773,9 +874,14 @@ impl Dispatcher {
                     "a reply could not be written to its sender's TLS block"
                 );
             }
-            let code = result.err().map_or(ResultCode::SUCCESS, KernelError::code);
-            let mut locked = self.lock::<(&mut Scheduler,)>();
-            let (scheduler,) = locked.tables();
+            // The reply is in place before the sender can run again: both happen under the
+            // lock.
+            if alive
+                && let Some(waiter) = sender.waiter
+                && let Err(error) = scheduler.end_reply_wait(waiter, session, code)
+            {
+                tracing::error!(%error, ?session, "a sender could not be woken");
+            }
             let (objects, ipc) = scheduler.ipc_mut();
             if let Err(error) = ipc.release_request(objects, session, &request) {
                 tracing::error!(%error, ?session, "a finished request could not let go");
@@ -783,13 +889,17 @@ impl Dispatcher {
             for kind in events {
                 recorder.record(time, sender.core, sender.thread, kind);
             }
-            record_send(recorder, time, sender, code);
+            if alive {
+                record_send(recorder, time, sender, code);
+            }
             drop(locked);
-            woken.push(Woken {
-                thread: sender.thread,
-                core: sender.core,
-                result: code,
-            });
+            if alive {
+                woken.push(Woken {
+                    thread: sender.thread,
+                    core: sender.core,
+                    result: code,
+                });
+            }
         }
         woken
     }
@@ -802,7 +912,7 @@ fn begin(
     scheduler: &mut Scheduler,
     memory: &dyn GuestMemory,
     process_id: u64,
-    sender: Sender,
+    (sender, regs): (Sender, &GuestRegs),
 ) -> CallResult<Begun> {
     let session = handles
         .get(sender.session_handle)
@@ -845,17 +955,94 @@ fn begin(
         message: Box::new(message),
         translated,
     };
-    match ipc.send(objects, session, request) {
-        Ok(Admission::Start) => Ok(Begun::Start {
-            server: ipc.server_of(session)?,
-            session,
-        }),
-        Ok(Admission::Queued) => Ok(Begun::Queued),
+    let admission = match ipc.send(objects, session, request) {
+        Ok(admission) => admission,
         Err(refused) => {
             ipc.release_translated(objects, &refused.request.translated)?;
-            Err(refused.error.into())
+            return Err(refused.error.into());
+        }
+    };
+    let server = ipc.server_of(session)?;
+    if let Some(waiter) = sender.waiter {
+        // The sender's registers are its context from here on, before the lock goes: if it
+        // waits, the reply's result is written there and a switch loads it (kernel slice 10).
+        *scheduler.context_mut(waiter)? = regs.clone();
+    }
+    match admission {
+        Admission::Start => Ok(Begun::Start { server, session }),
+        Admission::Queued => {
+            if sender.waiter.is_some() && !await_reply(scheduler, sender, session) {
+                // A sender that cannot wait must not leave a request nobody waits for.
+                let (objects, ipc) = scheduler.ipc_mut();
+                if let Some(waiter) = sender.waiter
+                    && let Some(request) = ipc.withdraw(session, waiter)?
+                {
+                    ipc.release_request(objects, session, &request)?;
+                }
+                return Err(SvcError::Internal(
+                    "a sender whose request waits could not wait for it".to_owned(),
+                ));
+            }
+            Ok(Begun::Queued)
         }
     }
+}
+
+/// The scheduler's thread on `core`, if it runs one that may begin a wait: what a request's
+/// sender waits as ([`Sender::waiter`]). A core the scheduler does not name, or whose thread is
+/// not runnable or is in a wait already (only a caller that names its thread by hand can be),
+/// has none, and its sender is only reported woken.
+fn calling_waiter(scheduler: &Scheduler, core: u8) -> Option<crate::id::ThreadId> {
+    let core = crate::sched::CoreId::new(core)?;
+    let thread = scheduler.current(core).ok().flatten()?;
+    let runnable = scheduler
+        .thread(thread)
+        .is_ok_and(|row| row.state() == crate::sched::ThreadState::Runnable);
+    (runnable && scheduler.sync().wait(thread).is_none()).then_some(thread)
+}
+
+/// Makes the scheduler's thread behind `sender` wait for the reply to its request on
+/// `session`, unless it waits for that reply already (a queued request that was started and
+/// then deferred). Returns whether the sender now waits; one with no scheduler thread does
+/// not, and is only reported woken. A sender that ended while its handler ran (its request is
+/// in flight, `Scheduler::forget_waits`) does not wait either: it stays ended, and its reply
+/// finds it so (`Dispatcher::settle`). A failure is the kernel's own bookkeeping, and is
+/// logged.
+fn await_reply(scheduler: &mut Scheduler, sender: Sender, session: ObjectId) -> bool {
+    let Some(waiter) = sender.waiter else {
+        return false;
+    };
+    if !is_alive(scheduler, sender) {
+        return false;
+    }
+    if matches!(
+        scheduler.sync().wait(waiter),
+        Some(crate::sync::Wait::Reply { session: on, .. }) if *on == session
+    ) {
+        return true;
+    }
+    let origin = WaitOrigin {
+        thread: sender.thread,
+        core: sender.core,
+        args: send_args(sender),
+    };
+    match scheduler.wait_for_reply(waiter, session, origin) {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::error!(%error, ?session, "a sender could not wait for its reply");
+            false
+        }
+    }
+}
+
+/// Whether a request's sender can still be answered: one the scheduler does not know is (it
+/// is only reported), and one it knows must not have ended.
+fn is_alive(scheduler: &Scheduler, sender: Sender) -> bool {
+    sender.waiter.is_none_or(|waiter| {
+        scheduler
+            .thread(waiter)
+            .is_ok_and(|row| row.state() != crate::sched::ThreadState::Terminated)
+    })
 }
 
 /// Ends a started request and returns what is over, each with `events` for the first.
@@ -936,17 +1123,22 @@ fn answer(id: SvcId, convention: &Convention, regs: &mut GuestRegs, result: Resu
     complete(id, convention, regs, &[result_word(result)])
 }
 
-/// Records the `SendSyncRequest` event of a sender woken by someone else's dispatch.
-fn record_send(recorder: &Recorder, time: GuestTicks, sender: Sender, result: ResultCode) {
+/// The decoded arguments a sender's `SendSyncRequest` event carries: its session handle.
+fn send_args(sender: Sender) -> [u64; SVC_ARG_COUNT] {
     let mut passed = [0; SVC_ARG_COUNT];
     passed[0] = u64::from(sender.session_handle.raw());
+    recorded_args(Some(SvcId::SendSyncRequest), &passed)
+}
+
+/// Records the `SendSyncRequest` event of a sender woken by someone else's dispatch.
+fn record_send(recorder: &Recorder, time: GuestTicks, sender: Sender, result: ResultCode) {
     recorder.record(
         time,
         sender.core,
         sender.thread,
         EventKind::Svc {
             id: u32::from(SvcId::SendSyncRequest.number()),
-            args: recorded_args(Some(SvcId::SendSyncRequest), &passed),
+            args: send_args(sender),
             result: starquake_trace::ResultCode(result.raw()),
         },
     );

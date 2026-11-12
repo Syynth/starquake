@@ -34,7 +34,7 @@ pub(super) const ARMS: [SvcId; 6] = [
 ];
 
 /// Who a call that may wait is recorded for when its wait ends.
-fn origin(call: &Call<'_, '_>) -> WaitOrigin {
+pub(super) fn origin(call: &Call<'_, '_>) -> WaitOrigin {
     WaitOrigin {
         thread: call.caller.thread,
         core: call.caller.core,

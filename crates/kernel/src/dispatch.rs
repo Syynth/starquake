@@ -199,7 +199,7 @@
 //! Each failing example differs from the compiling one only in the lines the text above it
 //! names.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::marker::PhantomData;
 use std::sync::{Mutex, MutexGuard, PoisonError, TryLockError};
@@ -223,6 +223,7 @@ use crate::svc::{
 use crate::tables::{AddressSpace, Processes, Scheduler};
 
 mod arbitration;
+mod cores;
 mod ipc;
 mod lifecycle;
 mod memory_objects;
@@ -230,6 +231,7 @@ mod sync;
 #[cfg(test)]
 mod tests;
 
+pub use cores::{Held, Loaded, Switch};
 pub use ipc::{IpcContext, Woken};
 pub use sync::WakeError;
 
@@ -452,9 +454,10 @@ pub struct Caller<'a> {
     pub core: u8,
     /// The guest thread making the call, as the event stream names it.
     ///
-    /// PROVISIONAL (walking skeleton, #74): the core loop names the thread. Once the scheduler
-    /// tracks which thread each core is running (kernel slice 10), the dispatcher reads it from
-    /// there and this field goes away.
+    /// PROVISIONAL (walking skeleton, #74): the core loop names the thread, as the scheduler
+    /// chose it for the core ([`Dispatcher::switch`]'s [`Loaded::guest_id`]). Reading it from
+    /// the scheduler's current thread of [`Caller::core`] instead removes this field; the
+    /// dispatcher's tests that drive calls with no scheduler thread are what keeps it.
     pub thread: ThreadId,
     /// The injectable environment (observability spec, rule 1). The dispatcher reads its clock
     /// once per dispatch.
@@ -488,12 +491,14 @@ pub enum Outcome {
     /// ([`Scheduler::needs_scheduling`]). No register was written.
     ThreadExited,
     /// The calling thread waits: a `SendSyncRequest` whose request waits behind another or was
-    /// deferred, or a `WaitSynchronization` that nothing has ended yet. No register was written
-    /// and no event recorded; both happen when the wait ends, and the thread is then reported
-    /// by [`Dispatcher::take_woken`]. The caller must not resume the thread until then. After a
-    /// `WaitSynchronization` the caller's registers are already saved as its thread's context,
-    /// where the wake writes its result: the core loop must not save over them
-    /// (`dispatch/sync.rs`).
+    /// deferred, a `WaitSynchronization` or arbitration call that nothing has ended yet, or a
+    /// `SleepThread` with a positive time. No register was written and no event recorded; both
+    /// happen when the wait ends, and the thread is then reported by
+    /// [`Dispatcher::take_woken`]. The caller must not resume the thread until then. When the
+    /// calling core runs a scheduler thread, the caller's registers are already saved as that
+    /// thread's context, where the wake writes its result: the core loop must not save over
+    /// them (`dispatch/sync.rs`, `dispatch/ipc.rs`), and reschedules
+    /// ([`Dispatcher::switch`]).
     Waiting,
 }
 
@@ -526,6 +531,13 @@ struct State {
     /// worker (delivering deferred replies), oldest first: whoever puts the handler back runs
     /// them (`dispatch::ipc`).
     parked: BTreeMap<ServerId, Vec<ObjectId>>,
+    /// Servers whose deferred replies were said to be ready ([`Dispatcher::deliver_replies`])
+    /// and are not delivered yet: while a server's handler is out of its slot, whoever puts it
+    /// back delivers them (`dispatch::ipc`, `Dispatcher::deliver_owed`).
+    owed: BTreeSet<ServerId>,
+    /// The latest guest time any clock reading under the lock gave: what the core loop's
+    /// rescheduling stamps threads with (`dispatch/cores.rs`). It never runs backwards.
+    latest: GuestTicks,
 }
 
 /// One reading of the environment's clock, as host nanoseconds and as the process's guest ticks.
@@ -570,15 +582,16 @@ impl<B: TableSet> Locked<'_, B> {
     }
 
     /// One reading of the environment's clock, and the guest time it is at the process's
-    /// counter rate.
-    fn clock(&self, env: &dyn Env) -> Result<Now, EnvError> {
+    /// counter rate. The latest guest time read under the lock is kept ([`State::latest`]).
+    fn clock(&mut self, env: &dyn Env) -> Result<Now, EnvError> {
         let host = env.now()?;
         let guest = self.state.tables.processes.counter_rate().ticks_at(host);
+        self.state.latest = self.state.latest.max(guest);
         Ok(Now { host, guest })
     }
 
     /// Guest time at a reading of the environment's clock, at the process's counter rate.
-    fn guest_time(&self, env: &dyn Env) -> Result<GuestTicks, EnvError> {
+    fn guest_time(&mut self, env: &dyn Env) -> Result<GuestTicks, EnvError> {
         self.clock(env).map(|now| now.guest)
     }
 }
@@ -618,6 +631,8 @@ impl Dispatcher {
                 handlers: BTreeMap::new(),
                 woken: Vec::new(),
                 parked: BTreeMap::new(),
+                owed: BTreeSet::new(),
+                latest: GuestTicks(0),
             }),
             timer: None,
         }

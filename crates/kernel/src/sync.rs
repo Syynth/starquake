@@ -190,8 +190,9 @@
 //! - **`IsTerminationRequested`** is not checked before a thread waits: kernel slice 8 ends a
 //!   thread in the call that asks for its termination (`sched/scheduler/lifecycle.rs`), so no
 //!   thread that was asked to terminate runs again to wait. The check (and
-//!   `ResultTerminationRequested`) comes with termination that waits for other cores (kernel
-//!   slice 10). PROVISIONAL.
+//!   `ResultTerminationRequested`) comes with termination that waits for other cores, which
+//!   kernel slice 10's core loop did not need: the only call that ends a thread another core
+//!   runs is `ExitProcess`, and that ends the run. PROVISIONAL.
 //! - **`ResultSessionClosed` is not mapped to success** (`R_SUCCEED_IF(res ==
 //!   ResultSessionClosed)` in `svc_synchronization.cpp`): no object here ends a wait with it.
 //!   Only server sessions do (`KServerSession`), and they are deferred (kernel spec, "IPC");

@@ -2,12 +2,16 @@
 //! `ExitThread`, `CreateThread`, `StartThread`, `SleepThread`, `SetThreadPriority`,
 //! `GetThreadCoreMask`, `SetThreadCoreMask`, `GetThreadId` and `GetProcessId`. Kept out of
 //! `Dispatcher::run` for its length; each arm decodes its call's arguments and writes its
-//! outputs, as every arm does.
+//! outputs, as every arm does. A `SleepThread` with a positive time waits through the wait path
+//! of `dispatch/sync.rs` (kernel slice 10): its event is recorded when its timer ends it.
 
-use super::{Call, Dispatcher, Outcome, calling_core, fault, returning, signed, void};
+use super::arbitration::origin;
+use super::{Call, Dispatcher, Now, Outcome, calling_core, fault, returning, signed, void};
 use crate::handle::{Handle, HandleTable};
 use crate::sched::ThreadExit;
+use crate::svc::sync::Waiter;
 use crate::svc::{Convention, SvcId, process, thread};
+use crate::sync::Arbitrated;
 use crate::tables::{AddressSpace, Processes, Scheduler};
 
 impl Dispatcher {
@@ -77,12 +81,10 @@ impl Dispatcher {
                     })
                 },
             ),
-            SvcId::SleepThread => self.call::<(&mut Scheduler,)>(call, |(scheduler,), call, _| {
-                let core = call.caller.core;
-                void(id, convention, call.regs, |[ns]| {
-                    thread::sleep_thread(scheduler, calling_core(core)?, ns.cast_signed())
-                })
-            }),
+            SvcId::SleepThread => self
+                .call_at::<(&mut Scheduler,)>(call, |(scheduler,), call, now| {
+                    sleep_thread(scheduler, id, convention, call, now)
+                }),
             SvcId::SetThreadPriority => self.call_in_process::<(&HandleTable, &mut Scheduler)>(
                 call,
                 |(handles, scheduler), call, _, processes| {
@@ -156,6 +158,37 @@ impl Dispatcher {
             ),
             _ => self.call::<()>(call, |(), call, _| super::unimplemented(id, call.regs)),
         }
+    }
+}
+
+/// The body of `SleepThread`'s arm: a yield or nothing completes at once; a sleep that began
+/// writes nothing and records nothing now, because its timer ends it (`dispatch/sync.rs`, "The
+/// wait path").
+fn sleep_thread(
+    scheduler: &mut Scheduler,
+    id: SvcId,
+    convention: &Convention,
+    call: &mut Call<'_, '_>,
+    now: Now,
+) -> Outcome {
+    let (core, origin) = (call.caller.core, origin(call));
+    let regs = call.regs.clone();
+    let mut sleeps = false;
+    let outcome = void(id, convention, call.regs, |[ns]| {
+        let waiter = Waiter {
+            core: calling_core(core)?,
+            now: now.host,
+            regs: &regs,
+            origin,
+        };
+        let slept = thread::sleep_thread(scheduler, waiter, ns.cast_signed())?;
+        sleeps = matches!(slept, Arbitrated::Waiting(_));
+        Ok(())
+    });
+    if sleeps && outcome == Outcome::Completed {
+        Outcome::Waiting
+    } else {
+        outcome
     }
 }
 

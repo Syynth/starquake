@@ -18,9 +18,9 @@
 //! `fsp-srv` reads the host through the environment it is given ([`install`]'s `env`): the SD
 //! card is the folder the run's configuration names, which [`HostFolder`] serves on the
 //! environment's host I/O channel; a run that names none has no SD card. PROVISIONAL: the server
-//! has no executor, so `Read` answers the framework's `NOT_SUPPORTED`. A read defers its reply,
-//! and the core loop cannot wait for a deferred reply yet (kernel slice 10); the executor comes
-//! with the loop that delivers what it completes.
+//! has no executor, so `Read` answers the framework's `NOT_SUPPORTED`. A read defers its reply;
+//! the core loop delivers deferred replies a service says are ready (`crate::machine`,
+//! "Deferred replies"), and an executor that says so when its job is done is not built yet.
 
 use std::sync::Arc;
 

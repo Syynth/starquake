@@ -245,16 +245,24 @@ fn gate() -> (Gate, GateKeeper) {
     )
 }
 
+/// How long either side of a [`Gate`] waits for the other before the test fails, so that a
+/// broken kernel cannot hang the gate.
+const GATE_LIMIT: Duration = Duration::from_secs(30);
+
 impl Gate {
     fn pass(&self) {
         self.arrived.send(()).unwrap();
-        self.through.recv().unwrap();
+        self.through
+            .recv_timeout(GATE_LIMIT)
+            .expect("the test opens the gate");
     }
 }
 
 impl GateKeeper {
     fn wait(&self) {
-        self.arrived.recv().unwrap();
+        self.arrived
+            .recv_timeout(GATE_LIMIT)
+            .expect("the handler arrives at the gate");
     }
 
     fn open(&self) {
@@ -1260,4 +1268,430 @@ fn a_request_on_a_second_session_waits_while_another_core_runs_the_handler() {
         }]
     );
     assert_eq!(world.tls(B), [0xEE; BUFFER_SIZE]);
+}
+
+// ----- Senders the scheduler runs (kernel slice 10) -------------------------------------------
+
+use crate::sched::ThreadState;
+
+/// Signals nobody listens to: these tests switch cores by hand.
+struct Quiet;
+
+impl crate::sched::CoreSignals for Quiet {
+    fn interrupt(&mut self, _: crate::sched::CoreId) {}
+
+    fn wake(&mut self, _: crate::sched::CoreId) {}
+}
+
+/// Makes `thread`'s core run a scheduler thread of its own (one of no process), as the core
+/// loop does, and returns it.
+fn run_thread_for(world: &World, thread: ThreadId) -> KernelThreadId {
+    let core = crate::sched::CoreId::new(core_of(thread)).unwrap();
+    world
+        .dispatcher
+        .with::<(&mut Scheduler,), _>(|(scheduler,)| {
+            let priority = crate::sched::Priority::new(44).unwrap();
+            let id = scheduler.create_thread(priority, core).unwrap();
+            scheduler.start(id).unwrap();
+            scheduler.update(GuestTicks(0), None, &mut Quiet).unwrap();
+            assert_eq!(scheduler.schedule(core, &mut Quiet), Ok(Some(id)));
+            id
+        })
+}
+
+/// The run state of a scheduler thread, and whether it waits for a reply on `session`.
+fn reply_state(world: &World, thread: KernelThreadId, session: ObjectId) -> (ThreadState, bool) {
+    world.with_tables(|_, scheduler| {
+        let waits = matches!(
+            scheduler.sync().wait(thread),
+            Some(crate::sync::Wait::Reply { session: waited, .. }) if *waited == session
+        );
+        (scheduler.thread(thread).unwrap().state(), waits)
+    })
+}
+
+/// A thread's saved `x0`.
+fn saved_x0(world: &World, thread: KernelThreadId) -> u64 {
+    world.with_tables(|_, scheduler| scheduler.thread(thread).unwrap().context().x[0])
+}
+
+#[test]
+fn senders_that_wait_are_blocked_threads_and_the_reply_makes_them_runnable() {
+    let world = World::new();
+    let handle = world.session();
+    let session = world.object(handle);
+    let (a, b) = (run_thread_for(&world, A), run_thread_for(&world, B));
+    world
+        .first
+        .script(Box::new(|_, _, _| Ok(Handled::Deferred)));
+    // A's request is deferred, B's waits behind it: both wait for their replies.
+    assert_eq!(
+        world.send(A, handle, &request()).0.outcome,
+        Outcome::Waiting
+    );
+    world.first.script(reply_with(0xB0));
+    assert_eq!(
+        world.send(B, handle, &request()).0.outcome,
+        Outcome::Waiting
+    );
+    for thread in [a, b] {
+        assert_eq!(
+            reply_state(&world, thread, session),
+            (ThreadState::Waiting, true)
+        );
+        // The context saved when the request was sent still has the handle in `x0`.
+        assert_eq!(saved_x0(&world, thread), u64::from(handle.raw()));
+    }
+    // The context is the registers of the call: its message buffer is where the reply goes.
+    world.with_tables(|_, scheduler| {
+        assert_eq!(scheduler.thread(b).unwrap().context().tpidrro, TLS_B);
+    });
+
+    lock(&world.first.ready).push_back((session, Ok(0xA0)));
+    world.deliver(&world.first);
+    for thread in [a, b] {
+        assert_eq!(
+            reply_state(&world, thread, session),
+            (ThreadState::Runnable, false)
+        );
+        // The result is in the saved `x0`, where a switch loads it from.
+        assert_eq!(
+            saved_x0(&world, thread),
+            u64::from(ResultCode::SUCCESS.raw())
+        );
+    }
+    assert_eq!(world.tls(A), [0xA0; BUFFER_SIZE]);
+    assert_eq!(world.tls(B), [0xB0; BUFFER_SIZE]);
+    // They are still reported, as before.
+    assert_eq!(world.dispatcher.take_woken().len(), 2);
+}
+
+#[test]
+fn a_sender_answered_at_once_never_waits() {
+    let world = World::new();
+    let handle = world.session();
+    let session = world.object(handle);
+    let a = run_thread_for(&world, A);
+    world.first.script(reply_with(0xA1));
+    let (record, regs) = world.send(A, handle, &request());
+    assert_eq!(record.outcome, Outcome::Completed);
+    assert_eq!(result(&regs), ResultCode::SUCCESS);
+    assert_eq!(
+        reply_state(&world, a, session),
+        (ThreadState::Runnable, false)
+    );
+    assert_eq!(world.tls(A), [0xA1; BUFFER_SIZE]);
+}
+
+#[test]
+fn a_thread_that_ends_while_its_request_waits_leaves_the_queue() {
+    let world = World::new();
+    let handle = world.session();
+    let session = world.object(handle);
+    let (_, b) = (run_thread_for(&world, A), run_thread_for(&world, B));
+    world
+        .first
+        .script(Box::new(|_, _, _| Ok(Handled::Deferred)));
+    world.send(A, handle, &request());
+    world.first.script(reply_with(0xB0));
+    world.send(B, handle, &request());
+    world.with_tables(|_, scheduler| {
+        assert_eq!(scheduler.ipc().waiting(session), Ok(1));
+        // The handle's reference and each request's.
+        assert_eq!(scheduler.objects().refs(session), 3);
+    });
+
+    world
+        .dispatcher
+        .with::<(&mut Scheduler,), _>(|(scheduler,)| scheduler.terminate_thread(b))
+        .unwrap();
+    world.with_tables(|_, scheduler| {
+        assert_eq!(scheduler.ipc().waiting(session), Ok(0));
+        assert_eq!(scheduler.objects().refs(session), 2);
+        assert_eq!(scheduler.sync().wait(b), None);
+    });
+
+    // A's reply comes; B's request is gone, so the server never sees it.
+    let b_buffer = world.tls(B);
+    lock(&world.first.ready).push_back((session, Ok(0xA0)));
+    world.deliver(&world.first);
+    assert_eq!(world.first.log().handled.len(), 1);
+    assert_eq!(world.tls(B), b_buffer);
+    world.with_tables(|_, scheduler| {
+        assert_eq!(scheduler.objects().refs(session), 1);
+        assert_eq!(scheduler.ipc().queue(world.first.id).unwrap().running(), 0);
+    });
+}
+
+#[test]
+fn a_thread_that_ends_while_its_request_is_in_flight_gets_no_reply_and_no_event() {
+    let world = World::new();
+    let handle = world.session();
+    let session = world.object(handle);
+    let a = run_thread_for(&world, A);
+    world
+        .first
+        .script(Box::new(|_, _, _| Ok(Handled::Deferred)));
+    world.send(A, handle, &request());
+    world
+        .dispatcher
+        .with::<(&mut Scheduler,), _>(|(scheduler,)| scheduler.terminate_thread(a))
+        .unwrap();
+    // The request is with its handler, so it stays until the handler answers.
+    world.with_tables(|_, scheduler| {
+        assert_eq!(scheduler.objects().refs(session), 2);
+    });
+    let before = world.events().len();
+    let a_buffer = world.tls(A);
+    lock(&world.first.ready).push_back((session, Ok(0xA0)));
+    world.deliver(&world.first);
+    assert_eq!(world.tls(A), a_buffer, "no reply for an ended thread");
+    assert_eq!(world.events().len(), before, "no event for an ended thread");
+    assert_eq!(world.dispatcher.take_woken(), Vec::<Woken>::new());
+    world.with_tables(|_, scheduler| {
+        assert_eq!(scheduler.objects().refs(session), 1);
+        assert_eq!(
+            scheduler.thread(a).unwrap().state(),
+            ThreadState::Terminated
+        );
+    });
+}
+
+#[test]
+fn a_sender_that_ends_while_its_handler_runs_stays_ended_when_the_request_is_deferred() {
+    let world = World::new();
+    let handle = world.session();
+    let session = world.object(handle);
+    let a = run_thread_for(&world, A);
+    let (gate, keeper) = gate();
+    world.first.script(Box::new(move |_, _, _| {
+        gate.pass();
+        Ok(Handled::Deferred)
+    }));
+    std::thread::scope(|scope| {
+        let sending = scope.spawn(|| world.send(A, handle, &request()));
+        keeper.wait();
+        // A ends while its handler runs without the lock; the handler then defers.
+        world
+            .dispatcher
+            .with::<(&mut Scheduler,), _>(|(scheduler,)| scheduler.terminate_thread(a))
+            .unwrap();
+        keeper.open();
+        assert_eq!(sending.join().unwrap().0.outcome, Outcome::Waiting);
+    });
+    assert_eq!(
+        reply_state(&world, a, session),
+        (ThreadState::Terminated, false)
+    );
+    // The reply comes: nothing is written, recorded or woken, and A stays ended.
+    let a_buffer = world.tls(A);
+    let before = world.events().len();
+    lock(&world.first.ready).push_back((session, Ok(0xA0)));
+    world.deliver(&world.first);
+    assert_eq!(
+        reply_state(&world, a, session),
+        (ThreadState::Terminated, false)
+    );
+    assert_eq!(world.tls(A), a_buffer);
+    assert_eq!(world.events().len(), before);
+    assert_eq!(world.dispatcher.take_woken(), Vec::<Woken>::new());
+    world.with_tables(|_, scheduler| {
+        assert_eq!(scheduler.ipc().queue(world.first.id).unwrap().running(), 0);
+    });
+}
+
+#[test]
+fn replies_said_to_be_ready_while_another_core_runs_the_handler_are_delivered() {
+    let world = World::new();
+    let (deferred, other) = (world.session(), world.session());
+    let deferred_object = world.object(deferred);
+    let a = run_thread_for(&world, A);
+    world
+        .first
+        .script(Box::new(|_, _, _| Ok(Handled::Deferred)));
+    assert_eq!(
+        world.send(A, deferred, &request()).0.outcome,
+        Outcome::Waiting
+    );
+    let (gate, keeper) = gate();
+    world.first.script(Box::new(move |_, _, message| {
+        gate.pass();
+        message.fill(0xB0);
+        Ok(Handled::Replied)
+    }));
+    std::thread::scope(|scope| {
+        // B's core runs its request through the handler, which stops in the middle of it.
+        let sending = scope.spawn(|| world.send(B, other, &request()));
+        keeper.wait();
+        // A's reply is said to be ready meanwhile: the handler is out, so the delivery is
+        // owed, and A still waits.
+        lock(&world.first.ready).push_back((deferred_object, Ok(0xA0)));
+        world.deliver(&world.first);
+        assert_eq!(
+            reply_state(&world, a, deferred_object),
+            (ThreadState::Waiting, true)
+        );
+        keeper.open();
+        let (record, regs) = sending.join().unwrap();
+        assert_eq!(record.outcome, Outcome::Completed);
+        assert_eq!(result(&regs), ResultCode::SUCCESS);
+    });
+    // B's core delivered A's reply when it put the handler back.
+    assert_eq!(
+        reply_state(&world, a, deferred_object),
+        (ThreadState::Runnable, false)
+    );
+    assert_eq!(world.tls(A), [0xA0; BUFFER_SIZE]);
+    assert_eq!(world.tls(B), [0xB0; BUFFER_SIZE]);
+    assert_eq!(
+        world.dispatcher.take_woken(),
+        [Woken {
+            thread: A,
+            core: core_of(A),
+            result: ResultCode::SUCCESS
+        }]
+    );
+    assert!(lock(&world.first.ready).is_empty());
+}
+
+// ----- Whether a run is stalled (`Dispatcher::is_stalled`) ------------------------------------
+
+#[test]
+fn a_run_whose_only_thread_waits_for_a_deferred_reply_is_not_stalled() {
+    // The sender is a scheduler thread: it waits for its reply, and the request is deferred.
+    let world = World::new();
+    let handle = world.session();
+    let session = world.object(handle);
+    let a = run_thread_for(&world, A);
+    world
+        .first
+        .script(Box::new(|_, _, _| Ok(Handled::Deferred)));
+    world.send(A, handle, &request());
+    assert_eq!(
+        reply_state(&world, a, session),
+        (ThreadState::Waiting, true)
+    );
+    world.with_tables(|_, scheduler| {
+        assert!(!scheduler.has_runnable_thread());
+        assert_eq!(scheduler.sync().next_deadline(), None);
+    });
+    assert!(!world.dispatcher.is_stalled());
+
+    // The sender is no scheduler thread, so nothing waits for a reply: the deferred request
+    // alone keeps the run from being stalled.
+    let world = World::new();
+    assert!(world.dispatcher.is_stalled());
+    let handle = world.session();
+    world
+        .first
+        .script(Box::new(|_, _, _| Ok(Handled::Deferred)));
+    world.send(A, handle, &request());
+    world.with_tables(|_, scheduler| assert!(!scheduler.sync().has_reply_wait()));
+    assert!(!world.dispatcher.is_stalled());
+}
+
+#[test]
+fn a_run_is_not_stalled_while_a_handler_is_out_of_its_slot() {
+    // The sender is no scheduler thread: nothing is runnable or waits, and nothing is
+    // deferred, but the handler running on another thread may still end something.
+    let world = World::new();
+    let handle = world.session();
+    let (gate, keeper) = gate();
+    world.first.script(Box::new(move |_, _, message| {
+        gate.pass();
+        message.fill(0xA0);
+        Ok(Handled::Replied)
+    }));
+    assert!(world.dispatcher.is_stalled());
+    std::thread::scope(|scope| {
+        let sending = scope.spawn(|| world.send(A, handle, &request()));
+        keeper.wait();
+        assert!(!world.dispatcher.is_stalled());
+        keeper.open();
+        assert_eq!(sending.join().unwrap().0.outcome, Outcome::Completed);
+    });
+    assert!(world.dispatcher.is_stalled());
+}
+
+#[test]
+fn a_run_is_not_stalled_while_a_thread_waits_for_a_reply_nothing_defers() {
+    // The window between a delivery completing a deferred request (it is deferred no more,
+    // and the handler is back in its slot) and settling it, which wakes the sender.
+    let world = World::new();
+    let handle = world.session();
+    let session = world.object(handle);
+    let a = run_thread_for(&world, A);
+    world
+        .dispatcher
+        .with::<(&mut Scheduler,), _>(|(scheduler,)| {
+            let origin = WaitOrigin {
+                thread: A,
+                core: core_of(A),
+                args: [0; SVC_ARG_COUNT],
+            };
+            scheduler.wait_for_reply(a, session, origin)
+        })
+        .unwrap();
+    world.with_tables(|_, scheduler| {
+        assert!(!scheduler.has_runnable_thread());
+        assert_eq!(scheduler.sync().next_deadline(), None);
+        assert!(
+            scheduler
+                .ipc()
+                .queue(world.first.id)
+                .unwrap()
+                .deferred()
+                .next()
+                .is_none()
+        );
+    });
+    assert!(!world.dispatcher.is_stalled());
+}
+
+#[test]
+fn a_run_is_not_stalled_while_a_delivery_runs_a_request_queued_behind_the_deferred_one() {
+    let world = World::new();
+    let handle = world.session();
+    let session = world.object(handle);
+    let (a, b) = (run_thread_for(&world, A), run_thread_for(&world, B));
+    world
+        .first
+        .script(Box::new(|_, _, _| Ok(Handled::Deferred)));
+    world.send(A, handle, &request());
+    let (gate, keeper) = gate();
+    world.first.script(Box::new(move |_, _, message| {
+        gate.pass();
+        message.fill(0xB0);
+        Ok(Handled::Replied)
+    }));
+    assert_eq!(
+        world.send(B, handle, &request()).0.outcome,
+        Outcome::Waiting
+    );
+    lock(&world.first.ready).push_back((session, Ok(0xA0)));
+    std::thread::scope(|scope| {
+        // A thread that is no core delivers A's reply, then runs B's request through the
+        // handler, which stops in it.
+        let delivering = scope.spawn(|| world.deliver(&world.first));
+        keeper.wait();
+        world.with_tables(|_, scheduler| {
+            // A's request is over and B's is running: nothing is deferred, nothing is
+            // runnable and no wait has a timer, but both still wait for their replies.
+            let queue = scheduler.ipc().queue(world.first.id).unwrap();
+            assert!(queue.deferred().next().is_none());
+            assert!(!scheduler.has_runnable_thread());
+            assert_eq!(scheduler.sync().next_deadline(), None);
+        });
+        assert!(!world.dispatcher.is_stalled());
+        keeper.open();
+        delivering.join().unwrap();
+    });
+    for thread in [a, b] {
+        assert_eq!(
+            reply_state(&world, thread, session),
+            (ThreadState::Runnable, false)
+        );
+    }
+    assert_eq!(world.tls(A), [0xA0; BUFFER_SIZE]);
+    assert_eq!(world.tls(B), [0xB0; BUFFER_SIZE]);
 }

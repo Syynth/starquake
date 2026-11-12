@@ -130,8 +130,7 @@ pub struct WaitCall<'a> {
     pub origin: WaitOrigin,
 }
 
-/// What a blocked thread waits on (kernel spec, "Waiting and waking"). Sleep and reply waits
-/// are added by the slices that build them.
+/// What a blocked thread waits on (kernel spec, "Waiting and waking").
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Wait {
     /// A `WaitSynchronization`: any of `objects` being signalled ends it.
@@ -188,6 +187,31 @@ pub enum Wait {
         /// Who to record the call's event for when it ends.
         origin: WaitOrigin,
     },
+    /// A `SendSyncRequest` whose request could not be answered at once: it waits behind another
+    /// on its session, or its server deferred it (kernel slice 10). Only the request's end ends
+    /// it ([`Scheduler::end_reply_wait`]), which the dispatcher records itself
+    /// (`dispatch/ipc.rs`), so it queues no [`Wake`]. It has no timer and holds no reference:
+    /// the request holds the session.
+    Reply {
+        /// The session the request was sent on.
+        session: ObjectId,
+        /// This wait's token.
+        token: WaitToken,
+        /// Who the call is for.
+        origin: WaitOrigin,
+    },
+    /// A `SleepThread` with a positive time (`KThread::Sleep`): only its timer ends it, and the
+    /// call returns nothing (`svcSleepThread` is void, and Eden notes that Nintendo does not
+    /// check the sleep's result), so its event records success.
+    Sleep {
+        /// This wait's token.
+        token: WaitToken,
+        /// When it ends: `None` for a time so long that the deadline does not fit, which Eden
+        /// turns into `i64::MAX`, a deadline no clock reaches.
+        deadline: Option<HostNanos>,
+        /// Who to record the call's event for when it ends.
+        origin: WaitOrigin,
+    },
 }
 
 impl Wait {
@@ -198,7 +222,9 @@ impl Wait {
             Self::Sync { token, .. }
             | Self::Address { token, .. }
             | Self::CondVar { token, .. }
-            | Self::Lock { token, .. } => *token,
+            | Self::Lock { token, .. }
+            | Self::Reply { token, .. }
+            | Self::Sleep { token, .. } => *token,
         }
     }
 
@@ -208,8 +234,9 @@ impl Wait {
         match self {
             Self::Sync { deadline, .. }
             | Self::Address { deadline, .. }
-            | Self::CondVar { deadline, .. } => *deadline,
-            Self::Lock { .. } => None,
+            | Self::CondVar { deadline, .. }
+            | Self::Sleep { deadline, .. } => *deadline,
+            Self::Lock { .. } | Self::Reply { .. } => None,
         }
     }
 
@@ -220,7 +247,9 @@ impl Wait {
             Self::Sync { origin, .. }
             | Self::Address { origin, .. }
             | Self::CondVar { origin, .. }
-            | Self::Lock { origin, .. } => *origin,
+            | Self::Lock { origin, .. }
+            | Self::Reply { origin, .. }
+            | Self::Sleep { origin, .. } => *origin,
         }
     }
 
@@ -233,6 +262,8 @@ impl Wait {
             Self::Address { .. } => SvcId::WaitForAddress,
             Self::CondVar { .. } => SvcId::WaitProcessWideKeyAtomic,
             Self::Lock { .. } => SvcId::ArbitrateLock,
+            Self::Reply { .. } => SvcId::SendSyncRequest,
+            Self::Sleep { .. } => SvcId::SleepThread,
         }
     }
 
@@ -241,7 +272,10 @@ impl Wait {
         match self {
             Self::Sync { objects, .. } => objects,
             Self::Lock { owner, .. } => std::slice::from_ref(owner),
-            Self::Address { .. } | Self::CondVar { .. } => &[],
+            Self::Address { .. }
+            | Self::CondVar { .. }
+            | Self::Reply { .. }
+            | Self::Sleep { .. } => &[],
         }
     }
 
@@ -251,7 +285,7 @@ impl Wait {
         match self {
             Self::Address { key, .. } => Some((Tree::Arbiter, *key)),
             Self::CondVar { key, .. } => Some((Tree::CondVar, *key)),
-            Self::Sync { .. } | Self::Lock { .. } => None,
+            Self::Sync { .. } | Self::Lock { .. } | Self::Reply { .. } | Self::Sleep { .. } => None,
         }
     }
 }
@@ -343,6 +377,14 @@ impl SyncTable {
     #[must_use]
     pub fn wait(&self, thread: ThreadId) -> Option<&Wait> {
         self.waits.get(&thread)
+    }
+
+    /// Whether any thread waits for the reply to a request ([`Wait::Reply`]).
+    #[must_use]
+    pub fn has_reply_wait(&self) -> bool {
+        self.waits
+            .values()
+            .any(|wait| matches!(wait, Wait::Reply { .. }))
     }
 
     /// Whether a cancel is pending for `thread`: its next `WaitSynchronization` that would wait
@@ -593,6 +635,19 @@ impl Scheduler {
         caller: Option<CoreId>,
         make: impl FnOnce(WaitToken) -> Wait,
     ) -> CallResult<()> {
+        self.block_with(thread, Some(regs), caller, make)
+    }
+
+    /// [`Scheduler::block`], saving `regs` as the thread's context only when given: a thread
+    /// whose context was saved before it began to wait (an IPC sender, `dispatch/ipc.rs`) keeps
+    /// that one.
+    fn block_with(
+        &mut self,
+        thread: ThreadId,
+        regs: Option<&GuestRegs>,
+        caller: Option<CoreId>,
+        make: impl FnOnce(WaitToken) -> Wait,
+    ) -> CallResult<()> {
         self.ensure_not_waiting(thread)?;
         let blocked = self.try_block(thread, regs, make);
         if let Err(error) = blocked {
@@ -609,7 +664,7 @@ impl Scheduler {
     fn try_block(
         &mut self,
         thread: ThreadId,
-        regs: &GuestRegs,
+        regs: Option<&GuestRegs>,
         make: impl FnOnce(WaitToken) -> Wait,
     ) -> CallResult<()> {
         // Everything that can fail before the table changes.
@@ -622,7 +677,11 @@ impl Scheduler {
             Some((which, key)) => Some((which, key, self.tree_place(which, key, thread)?)),
             None => None,
         };
-        *self.context_mut(thread)? = regs.clone();
+        if let Some(regs) = regs {
+            *self.context_mut(thread)? = regs.clone();
+        } else {
+            self.thread(thread)?;
+        }
 
         let table = self.sync_table_mut();
         table.next_token = next_token;
@@ -738,6 +797,10 @@ impl Scheduler {
         let convention = call.convention().ok_or_else(|| {
             SvcError::Internal(format!("{} has no register convention", call.name()))
         })?;
+        if convention.outputs.is_empty() {
+            // `SleepThread` returns nothing: its saved registers stay as they were.
+            return Ok(());
+        }
         let result = u64::from(result.raw());
         let with_index = [result, u64::from(index.cast_unsigned())];
         let outputs: &[u64] = if call == SvcId::WaitSynchronization {
@@ -795,11 +858,66 @@ impl Scheduler {
         self.sync_table_mut().cancelled.remove(&thread);
         let (wait, unlinked) = self.unlink_wait(thread, None);
         let released = match wait {
+            Some(Wait::Reply { session, .. }) => self.withdraw_request(session, thread),
             Some(wait) => self.release_objects(wait.references()),
             None => Ok(()),
         };
         unlinked?;
         released
+    }
+
+    /// A thread that waited for a reply on `session` has ended: its request leaves the
+    /// session's queue if it is still waiting there, and what it held is released. A request
+    /// in flight stays with its handler; when it ends, no reply is written and the thread is
+    /// not woken (`dispatch/ipc.rs`).
+    fn withdraw_request(&mut self, session: ObjectId, thread: ThreadId) -> CallResult<()> {
+        let (objects, ipc) = self.ipc_mut();
+        if let Some(request) = ipc.withdraw(session, thread)? {
+            ipc.release_request(objects, session, &request)?;
+        }
+        Ok(())
+    }
+
+    /// Makes `thread`, the sender of a request on `session` that could not be answered at once,
+    /// wait for its reply ([`Wait::Reply`]). Its context is not saved here: the dispatcher saved
+    /// it when the request was sent, before the lock was let go (`dispatch/ipc.rs`). A thread in
+    /// a wait already is an internal failure, before anything changes.
+    pub fn wait_for_reply(
+        &mut self,
+        thread: ThreadId,
+        session: ObjectId,
+        origin: WaitOrigin,
+    ) -> CallResult<()> {
+        self.block_with(thread, None, None, |token| Wait::Reply {
+            session,
+            token,
+            origin,
+        })
+    }
+
+    /// Ends `thread`'s wait for the reply to its request on `session` with `result`, if it is in
+    /// that wait: the result goes into its saved `x0` with `SendSyncRequest`'s convention and it
+    /// becomes runnable, with no [`Wake`] queued. Returns whether it was in that wait; a thread
+    /// that is not (it never waited, or it has ended) is left alone.
+    pub fn end_reply_wait(
+        &mut self,
+        thread: ThreadId,
+        session: ObjectId,
+        result: ResultCode,
+    ) -> CallResult<bool> {
+        match self.sync_table().waits.get(&thread) {
+            Some(Wait::Reply {
+                session: waited, ..
+            }) if *waited == session => {}
+            _ => return Ok(false),
+        }
+        let (_, unlinked) = self.unlink_wait(thread, None);
+        let written = self.write_wait_result(thread, SvcId::SendSyncRequest, result, NO_INDEX);
+        let state = self.set_state(thread, ThreadState::Runnable);
+        unlinked?;
+        written?;
+        state?;
+        Ok(true)
     }
 
     /// Cancels `thread`'s wait (`KThread::WaitCancel`): a thread in a synchronisation wait
@@ -837,17 +955,34 @@ impl Scheduler {
     }
 
     /// Expires a timer entry (`KThread::OnTimer`): if its thread is still in the wait the
-    /// entry was made for, the wait ends with [`KernelError::TimedOut`] (and index -1), and the
-    /// result is `true`. A late entry (the wait already ended, or the thread is in a later
-    /// wait) is ignored: `false`.
+    /// entry was made for, the wait ends with [`KernelError::TimedOut`] (and index -1), or for
+    /// a sleep with success (see [`Wait::Sleep`]), and the result is `true`. A late entry (the
+    /// wait already ended, or the thread is in a later wait) is ignored: `false`.
     pub fn expire(&mut self, entry: TimerEntry) -> CallResult<bool> {
-        match self.sync_table().waits.get(&entry.thread) {
-            Some(wait) if wait.token() == entry.token => {
-                self.end_wait(entry.thread, KernelError::TimedOut.code(), NO_INDEX)?;
-                Ok(true)
-            }
-            _ => Ok(false),
-        }
+        let result = match self.sync_table().waits.get(&entry.thread) {
+            Some(Wait::Sleep { token, .. }) if *token == entry.token => ResultCode::SUCCESS,
+            Some(wait) if wait.token() == entry.token => KernelError::TimedOut.code(),
+            _ => return Ok(false),
+        };
+        self.end_wait(entry.thread, result, NO_INDEX)?;
+        Ok(true)
+    }
+
+    /// `KThread::Sleep` for the thread `core` runs, which makes the call with `regs` and is
+    /// recorded as `origin`: the thread waits until `timeout` ([`Wait::Sleep`]). A
+    /// [`Timeout::Poll`], which no positive time converts to, does not wait (`None`); a
+    /// [`Timeout::Never`] waits with no timer, as Eden's `i64::MAX` deadline does.
+    pub fn sleep(&mut self, call: WaitCall<'_>, timeout: Timeout) -> CallResult<Option<ThreadId>> {
+        let Ok(deadline) = timeout.deadline() else {
+            return Ok(None);
+        };
+        let thread = self.calling_thread(call.core)?;
+        self.block(thread, call.regs, Some(call.core), |token| Wait::Sleep {
+            token,
+            deadline,
+            origin: call.origin,
+        })?;
+        Ok(Some(thread))
     }
 
     /// Takes and expires every entry due at `now` ([`Scheduler::take_due_timers`], then
