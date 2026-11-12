@@ -140,12 +140,15 @@ cargo run -p starquake-testkit --example guest_programs -- <folder>   # writes f
 cargo run -p starquake -- run <folder>/hello.nro --until timeout=10s --artifacts <folder>/out
 ```
 
-`starquake-core`'s `System` parses the NRO with the loader, creates the process's memory with
-the kernel (the code at Horizon's address for it and a stack in the stack region; text
-read-execute, rodata read-only, the rest read-write), rewrites its counter reads with the
-loader's patcher, creates the process with the kernel's process creation (which starts its main
-thread, with a thread-local page, and tells the scheduler the one core runs it), and runs that
-thread on one vCPU. What the kernel's
+`starquake-core`'s `System` parses the program with the loader (an NRO, or an ExeFS: its
+`main.npdm` and its NSO modules), describes its process (from the NPDM: cores, priorities, the
+main thread, the handle table and the console, which decides the counter rate and the memory
+arrangement; an NRO gets Eden's defaults for a program with no NPDM), creates the process's
+memory with the kernel (the modules one after the other at Horizon's address for code and a
+stack of the described size in the stack region; text read-execute, rodata read-only, the rest
+read-write), rewrites its counter reads with the loader's patcher, creates the process with the
+kernel's process creation (which starts its main thread, with a thread-local page, and tells the
+scheduler the one core runs it), and runs that thread on one vCPU. What the kernel's
 address space maps reaches guest code through stage-1 tables, a page at a time as the guest
 first touches it. Every `svc` goes through the kernel's dispatcher and is recorded in the event
 stream; the memory calls (`SetHeapSize`, `SetMemoryPermission`, `SetMemoryAttribute`,
@@ -169,7 +172,6 @@ it lives, with what replaces it:
 
 | Provisional part | Where | Replaced by |
 |---|---|---|
-| The process's code and stack are placed by the loader: the code at a fixed address with no relocation, one stack of a fixed size, the 4 GiB memory arrangement for every program. The process is described by Eden's defaults for a program with no NPDM (`ProcessDescription::homebrew`), built for Switch 1 | `crates/core/src/image.rs`, `crates/core/src/machine.rs`, `crates/core/src/clock.rs` | Wiring the loader's NPDM into process creation (#33) |
 | Backing is handed out a page at a time from the start of one small RAM region (16 MiB) and never returned, far less than the kernel lets a process reserve; host access to guest memory ignores permissions | `crates/core/src/space.rs`, `crates/cpu/src/hvf.rs` | The backing pools of the execution model, sized as the kernel's accounting says; permission checks on system-call buffers |
 | One guest thread on one core: the loop runs only the main thread, and a call that leaves it waiting or ends it while its process has other threads ends the run; the event stream names the thread and the process by fixed numbers; the whole register file is read and written on every `svc`; an abort is lazy backing or the end of the run (nothing is delivered to the guest or write-tracked) | `crates/core/src/machine.rs` | Kernel slice 10 (core loop and timers); single-register accessors on `Vcpu` |
 | Pointer-authentication keys are left as the backend creates them, and `x18` starts at zero where Eden seeds it with a random odd number | `crates/core/src/machine.rs`, `crates/kernel/src/sched/scheduler/lifecycle.rs` | The process's keys and seed from the environment's random numbers (not yet scheduled) |
@@ -185,6 +187,7 @@ it lives, with what replaces it:
 | What a run keeps in memory is capped by fixed numbers: the trace's first 100,000 events and the first 4 MiB of guest log text, each with a marker and a count in `summary.json` when it was cut short | `crates/core/src/machine.rs` (`Limits`) | The observability spec's size cap per run, with its flags |
 | A failure inside the kernel (its own bookkeeping is inconsistent) is logged and the guest sees "not implemented"; the run goes on | `crates/kernel/src/dispatch.rs` (`fault`) | An outcome that stops the run, once the core loop handles one |
 | Lock waits are counted per table but not timed, and not written to `summary.json` | `crates/kernel/src/dispatch.rs` (`LockWaits`), `crates/core/src/machine.rs` | The core loop giving the dispatcher a timer and writing its report into the summary (with one core nothing waits yet) |
+| Shared memory has no backing in a run: `SpaceMapper` keeps the kernel's default `Mapper::allocate_shared` and `Mapper::map_shared`, which refuse, so a server's `IpcContext::create_shared_memory` fails inside the kernel. No service makes shared memory yet | `crates/kernel/src/memory/mapper.rs`, `crates/core/src/space.rs` | `SpaceMapper` handing out a run of guest RAM for each shared memory and mapping those pages wherever the guest maps it |
 | One VM per run; the hypervisor backend only | `crates/core/src/system.rs` | KVM and JIT backends; a `System` that outlives one program |
 | Crash reports have no backtrace or symbols, and name an exception only as a data abort, an instruction abort or (everything else) an undefined instruction: the backend's exits carry the exception's syndrome, but the report does not print it | `crates/core/src/crash.rs` | The crash-report step of the observability spec |
 | Of the headless flags only `--until timeout=<n>s` and `--artifacts` exist | `apps/starquake/src/lib.rs` | The observability spec's order of work |

@@ -160,9 +160,14 @@ impl Scheduler {
         match self.objects().get(object) {
             Ok(Object::Event(event)) => self.signal_event(event),
             Ok(Object::ReadableEvent(_)) => self.signal_readable(object),
-            Ok(Object::Thread(_) | Object::Process(_) | Object::Session) | Err(_) => {
-                Err(KernelError::InvalidHandle.into())
-            }
+            Ok(
+                Object::Thread(_)
+                | Object::Process(_)
+                | Object::Session
+                | Object::SharedMemory(_)
+                | Object::TransferMemory(_),
+            )
+            | Err(_) => Err(KernelError::InvalidHandle.into()),
         }
     }
 }

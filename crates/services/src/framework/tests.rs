@@ -32,6 +32,7 @@ mod later;
 mod plain;
 mod queue;
 mod server;
+mod shared_memory;
 mod snapshot;
 mod trace;
 mod unknown;

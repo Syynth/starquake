@@ -81,7 +81,11 @@ pub fn get_process_id(
                 .thread(thread)?
                 .process()
                 .ok_or(KernelError::InvalidHandle)?,
-            Object::Session | Object::Event(_) | Object::ReadableEvent(_) => {
+            Object::Session
+            | Object::Event(_)
+            | Object::ReadableEvent(_)
+            | Object::SharedMemory(_)
+            | Object::TransferMemory(_) => {
                 return Err(KernelError::InvalidHandle.into());
             }
         },
