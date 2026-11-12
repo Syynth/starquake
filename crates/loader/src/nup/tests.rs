@@ -1071,8 +1071,8 @@ fn a_meta_block_lies_between_the_table_of_contents_and_the_end_of_the_file() {
     );
 
     // A meta block may also sit in the padding between the table of contents and the blob
-    // region (as a real container made by a later version of the packer has it), starting
-    // exactly at the end of the table of contents.
+    // region, starting exactly at the end of the table of contents (the spec only gives its
+    // offset; see "Meta blocks" in the module docs).
     let sample = sample();
     let toc_end = to_u64(sample.layout.toc_offset + sample.layout.toc_size);
     let gap = to_u64(sample.layout.blob_offset) - toc_end;

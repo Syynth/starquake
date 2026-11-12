@@ -86,11 +86,15 @@
 //!
 //! # Meta blocks
 //!
-//! A package's meta block (SPEC §5) is only bounds-checked. The reference tool at the pinned
-//! commit numbers its TLV types from 0 (`format.py`, `class TVL`: `NPDM = 0`), while the spec
-//! numbers them from 1 (`0x0001` is the NPDM); the owner's dump follows the spec. Nothing here
-//! reads them yet: `main.npdm` is read from the `ExeFS` tree, which the spec makes
-//! authoritative for content (§5, "the tree wins for content").
+//! A package's meta block (SPEC §5) is only located and bounds-checked. The spec gives its
+//! position as an absolute offset and says nothing more about where it goes, so it may lie
+//! anywhere after the table of contents that no extent or other meta block uses: the reference
+//! packer at the pinned commit writes it after the extents (`_write_meta_blocks`), and the gap
+//! between the table of contents and the blob region is accepted too. Its TLV records are not
+//! read: the reference tool at the pinned commit numbers their types from 0 (`format.py`,
+//! `class TVL`: `NPDM = 0`) while the spec numbers them from 1 (`0x0001` is the NPDM), and
+//! `main.npdm` is read from the `ExeFS` tree, which the spec makes authoritative for content
+//! (§5, "the tree wins for content").
 
 mod check;
 mod error;
@@ -118,7 +122,7 @@ pub use read::FileReader;
 pub use title::{ExeFs, Title};
 
 /// The largest table of contents [`Nup::open`] reads: 256 MiB. A starquake limit, not the
-/// spec's. A title with 370,000 files has a table of contents of about 37 MB.
+/// spec's: at 0x50 bytes per file record it leaves room for over three million files.
 pub const DEFAULT_MAX_TOC_SIZE: u64 = 256 << 20;
 
 /// How much [`Nup::open_with_limits`] is willing to read into memory.
