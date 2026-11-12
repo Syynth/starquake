@@ -406,6 +406,7 @@ fn a_wake_writes_the_result_and_index_into_the_saved_registers() {
         [Wake {
             thread,
             origin: origin(4),
+            call: crate::svc::SvcId::WaitSynchronization,
             result: ResultCode::SUCCESS,
             index: 1,
         }]

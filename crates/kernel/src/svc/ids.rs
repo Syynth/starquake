@@ -126,10 +126,10 @@ svc_ids! {
     ResetSignal = 0x17, Implemented;
     WaitSynchronization = 0x18, Implemented;
     CancelSynchronization = 0x19, Implemented;
-    ArbitrateLock = 0x1a, Planned;
-    ArbitrateUnlock = 0x1b, Planned;
-    WaitProcessWideKeyAtomic = 0x1c, Planned;
-    SignalProcessWideKey = 0x1d, Planned;
+    ArbitrateLock = 0x1a, Implemented;
+    ArbitrateUnlock = 0x1b, Implemented;
+    WaitProcessWideKeyAtomic = 0x1c, Implemented;
+    SignalProcessWideKey = 0x1d, Implemented;
     GetSystemTick = 0x1e, Implemented;
     ConnectToNamedPort = 0x1f, Implemented;
     SendSyncRequestLight = 0x20, Deferred;
@@ -152,8 +152,8 @@ svc_ids! {
     GetResourceLimitCurrentValue = 0x31, Planned;
     SetThreadActivity = 0x32, Planned;
     GetThreadContext3 = 0x33, Planned;
-    WaitForAddress = 0x34, Planned;
-    SignalToAddress = 0x35, Planned;
+    WaitForAddress = 0x34, Implemented;
+    SignalToAddress = 0x35, Implemented;
     SynchronizePreemptionState = 0x36, Planned;
     GetResourceLimitPeakValue = 0x37, Deferred;
     CreateIoPool = 0x39, NotPlanned;
@@ -326,6 +326,12 @@ mod tests {
                 | SvcId::ResetSignal
                 | SvcId::WaitSynchronization
                 | SvcId::CancelSynchronization
+                | SvcId::ArbitrateLock
+                | SvcId::ArbitrateUnlock
+                | SvcId::WaitProcessWideKeyAtomic
+                | SvcId::SignalProcessWideKey
+                | SvcId::WaitForAddress
+                | SvcId::SignalToAddress
                 | SvcId::GetSystemTick
                 | SvcId::ConnectToNamedPort
                 | SvcId::SendSyncRequest

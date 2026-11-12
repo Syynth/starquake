@@ -29,11 +29,17 @@
 //! | `ResetSignal` (0x17) | [`event::reset_signal`] | the handle table, shared, and the scheduler |
 //! | `WaitSynchronization` (0x18) | [`sync::wait_synchronization`] | the handle table and the address space, shared, the scheduler, guest memory, and the dispatch's clock reading |
 //! | `CancelSynchronization` (0x19) | [`sync::cancel_synchronization`] | the handle table, shared, the scheduler and the calling core |
+//! | `ArbitrateLock` (0x1a) | [`arbitration::arbitrate_lock`] | the handle table and the address space, shared, the scheduler, guest memory and the calling thread |
+//! | `ArbitrateUnlock` (0x1b) | [`arbitration::arbitrate_unlock`] | the address space, shared, the scheduler, guest memory and the calling core |
+//! | `WaitProcessWideKeyAtomic` (0x1c) | [`arbitration::wait_process_wide_key_atomic`] | the address space, shared, the scheduler, guest memory, the calling thread and the dispatch's clock reading |
+//! | `SignalProcessWideKey` (0x1d) | [`arbitration::signal_process_wide_key`] | the handle table and the address space, shared, the scheduler, guest memory and the calling core |
 //! | `GetSystemTick` (0x1e) | [`tick::get_system_tick`] | the dispatch's guest time |
 //! | `GetProcessId` (0x24) | [`process::get_process_id`] | the handle table and the scheduler, both shared, and the process facts |
 //! | `GetThreadId` (0x25) | [`thread::get_thread_id`] | the scheduler and the handle table, both shared, and the calling core |
 //! | `OutputDebugString` (0x27) | [`debug::output_debug_string`] | guest memory, a [`DebugSink`] and the dispatch's guest time |
 //! | `GetInfo` (0x29) | [`info::get_info`] | the handle table, the address space and the scheduler, all shared |
+//! | `WaitForAddress` (0x34) | [`arbitration::wait_for_address`] | the address space, shared, the scheduler, guest memory, the calling thread and the dispatch's clock reading |
+//! | `SignalToAddress` (0x35) | [`arbitration::signal_to_address`] | the address space, shared, the scheduler, guest memory and the calling core |
 //! | `CreateEvent` (0x45) | [`event::create_event`] | the handle table and the scheduler, both exclusive |
 //!
 //! Only the [dispatcher](crate::dispatch) calls them, decoding their arguments with the call's
@@ -45,6 +51,7 @@
 //! arms over the IPC table ([`crate::ipc`]), because `SendSyncRequest` releases the kernel lock
 //! while a server's handler runs (`dispatch::ipc` says how).
 
+pub mod arbitration;
 mod convention;
 pub mod debug;
 pub mod event;

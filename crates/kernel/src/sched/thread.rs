@@ -8,7 +8,13 @@
 //! `m_core_id`, `m_current_core_id`, `m_last_scheduled_tick`, `m_schedule_count`, and the
 //! per-core `QueueEntry` array), and the lifecycle fields of kernel slice 8 (`m_parent`,
 //! `m_thread_id`, `m_tls_address`, `m_virtual_ideal_core_id`, `m_virtual_affinity_mask`).
-//! Fields for later slices (wait queue, held locks) are added by those slices.
+//! The wait queue, held locks and address keys are rows of the scheduler's
+//! [`SyncTable`](crate::sync::SyncTable), keyed by thread (kernel slices 4 and 5).
+//!
+//! Eden keeps a thread's requested suspends (`m_suspend_request_flags`) apart from those in its
+//! state (the bits of `m_thread_state` above `SuspendShift`), which `UpdateState` copies from the
+//! requests (masked by `m_suspend_allowed_flags`, all ones until pinned threads exist). They
+//! differ while `TrySuspend` declines to suspend a thread with kernel waiters.
 
 use starquake_cpu::GuestRegs;
 use starquake_trace::GuestTicks;
@@ -126,7 +132,10 @@ pub(super) struct QueueLink {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Thread {
     pub(super) state: ThreadState,
+    /// The suspends in the state: what decides whether the thread is queued.
     pub(super) suspend_flags: u8,
+    /// The suspends requested (`m_suspend_request_flags`).
+    pub(super) suspend_requested: u8,
     pub(super) priority: Priority,
     pub(super) base_priority: Priority,
     pub(super) affinity: AffinityMask,
@@ -163,16 +172,25 @@ impl Thread {
         self.state
     }
 
-    /// The outstanding suspend requests, one [`SuspendType::bit`] each.
+    /// The suspends in effect, one [`SuspendType::bit`] each: the requests as of the last time
+    /// they were put into the state (`UpdateState`). A thread is suspended while any is set.
     #[must_use]
     pub fn suspend_flags(&self) -> u8 {
         self.suspend_flags
     }
 
+    /// The outstanding suspend requests, one [`SuspendType::bit`] each
+    /// (`m_suspend_request_flags`). They are in effect ([`Thread::suspend_flags`]) unless a
+    /// suspend was declined because kernel waiters wait on the thread.
+    #[must_use]
+    pub fn suspend_requested(&self) -> u8 {
+        self.suspend_requested
+    }
+
     /// Whether a suspend of this type is requested (`KThread::IsSuspendRequested(type)`).
     #[must_use]
     pub fn is_suspend_requested(&self, kind: SuspendType) -> bool {
-        self.suspend_flags & kind.bit() != 0
+        self.suspend_requested & kind.bit() != 0
     }
 
     /// The effective priority (`GetPriority`).

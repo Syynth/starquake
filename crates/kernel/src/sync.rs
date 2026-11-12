@@ -1,5 +1,6 @@
-//! Synchronisation objects: events, and threads waiting on objects (kernel spec, "Waiting and
-//! waking"; port slice 4).
+//! Synchronisation: events and threads waiting on objects (kernel spec, "Waiting and waking";
+//! port slice 4), and the address arbiter, condition variables and lock arbitration with
+//! priority inheritance (port slice 5).
 //!
 //! Ported from Eden @ cf654052 (GPL-3.0-or-later), paths relative to the reference folder:
 //! - `eden/src/core/hle/kernel/k_synchronization_object.{h,cpp}`: `Wait` (the checks before a
@@ -10,6 +11,95 @@
 //! - `eden/src/core/hle/kernel/k_thread.cpp` @ cf654052: `WaitCancel`, `BeginWait`, `OnTimer`;
 //!   `k_thread_queue.cpp`: `EndWait` and `CancelWait`; `k_hardware_timer_base.h`: a task fires
 //!   once the time reaches its deadline (`task_time > cur_time` waits).
+//! - `eden/src/core/hle/kernel/k_address_arbiter.{h,cpp}` ([`arbiter`]),
+//!   `k_condition_variable.{h,cpp}` ([`condvar`], and `WaitForAddress`/`SignalToAddress` in
+//!   [`lock`]), and the waiter lists and `RestorePriority` of `k_thread.{h,cpp}` ([`lock`]);
+//!   `k_thread.h`'s `ConditionVariableComparator` ([`tree`]). User memory is reached as
+//!   [`words`] says, with the guest's access checked as Atmosphère checks it (facts only).
+//!
+//! # Every kind of wait goes one way
+//!
+//! A `WaitForAddress`, a `WaitProcessWideKeyAtomic` and an `ArbitrateLock` wait the way a
+//! `WaitSynchronization` does: a [`Wait`] record ([`Wait::Address`], [`Wait::CondVar`],
+//! [`Wait::Lock`]) in the [`SyncTable`], the registers saved as the thread's context, a timer in
+//! the same queue (a lock wait has none), and one place a wait ends, which leaves every list,
+//! tree and lock the thread is in, writes the result with the call's own register convention
+//! and queues a [`Wake`] naming the call. The address-arbiter and condition-variable trees and
+//! the locks are scheduler rows too ([`SyncTable::arbiter`], [`SyncTable::condition_variables`],
+//! [`SyncTable::locks`]), under the scheduler's lock like everything else here.
+//!
+//! # Slice 5: intentional divergences from Eden
+//!
+//! Each is pinned by the named test.
+//! - **User memory is checked** (Atmosphère's `ReadFromUser`, `WriteToUser` and
+//!   `CanAccessAtomic`; Eden checks nothing and reads unmapped memory as zero): a word the guest
+//!   may not read is [`KernelError::InvalidCurrentMemory`](crate::result::KernelError) where
+//!   each call reads it, and the atomic updates need a word it may read and write. Tests:
+//!   `sync/arbiter/tests.rs`,
+//!   `a_word_the_guest_may_not_access_is_invalid_current_memory_before_the_comparison`;
+//!   `sync/condvar/tests.rs`,
+//!   `a_lock_word_the_guest_may_not_access_atomically_ends_the_wait_with_invalid_current_memory`;
+//!   `sync/lock/tests.rs`,
+//!   `unlock_of_an_unwritable_word_fails_and_ends_the_next_owners_wait_with_that_result`;
+//!   `svc/arbitration/tests.rs`, `a_read_only_word_reads_but_takes_no_write_or_atomic_update`
+//!   and `memory_past_the_data_takes_nothing_from_its_first_word`.
+//! - **A waiter that terminates leaves at once,** as slice 4's do (below): it leaves the tree
+//!   or the lock it waits on, and an owner it lent its priority to gives it back, with no result
+//!   written and nothing reported. Eden cancels the wait with `ResultTerminationRequested`.
+//!   Tests: `sync/lock/tests.rs`, `a_terminated_lock_waiter_leaves_the_lock_and_releases_the_owner`;
+//!   `sync/arbiter/tests.rs`, `a_terminated_address_waiter_leaves_the_tree`.
+//! - **A priority change that no core's call makes puts the thread at the back of its new
+//!   level.** A timer that ends a condition-variable waiter's wait on a lock owner, and a
+//!   terminating waiter, change the owner's priority with no calling core, so no thread counts
+//!   as running (`KScheduler::OnThreadPriorityChanged`'s `thread == GetCurrentThreadPointer()`).
+//!   Eden asks the core that handles the timer, whose current thread may be the owner, which
+//!   then keeps the front of its level. Test: `sync/condvar/tests.rs`,
+//!   `a_timer_restoring_an_owners_priority_puts_it_behind_its_equals`.
+//! - **`SignalAndModifyByWaitingCountIfEqual` with `count <= 0` and threads waiting writes
+//!   `value - 1`,** as Atmosphère does (`libmesosphere/source/kern_k_address_arbiter.cpp`
+//!   @ 4e3f3703, fact only), not Eden's `value - 2` (Eden, `eden-nx2` and `eden-pr4588` agree
+//!   on `- 2`). The guest sees the word: it is the semaphore's count. Atmosphère is followed as
+//!   it is for the user-memory checks above; a hardware trace would settle it
+//!   ([`arbiter::modified_value`]). Tests: `sync/arbiter/tests.rs`,
+//!   `the_modified_value_is_edens_except_minus_one_when_count_up_to_zero_wakes_waiters` and
+//!   `signal_and_modify_by_waiting_count_writes_the_new_value_and_wakes`.
+//!
+//! # Slice 5: matching Eden where it is easy to miss
+//!
+//! - Threads of one priority wait in the order they came, in the trees and on a lock (the
+//!   comparators return 1 for a tie). Tests: `sync/lock/tests.rs`,
+//!   `waiters_of_one_priority_get_the_lock_in_the_order_they_came`; `sync/arbiter/tests.rs`,
+//!   `waiters_of_one_priority_are_woken_in_the_order_they_came`.
+//! - A thread's held locks are listed most recently added first (`AddHeldLock`'s
+//!   `push_front`), whether it began holding the lock when a thread first waited on it or got
+//!   it handed on by an unlock, and a destroyed owner ends its waiters in that order. Tests:
+//!   `sync/lock/tests.rs`, `a_destroyed_owner_ends_the_waiters_of_its_most_recently_added_lock_first`
+//!   and `a_lock_handed_on_goes_to_the_front_of_the_new_owners_list`.
+//! - `SignalAndModifyByWaitingCountIfEqual` with `count > 0` counts waiters as Eden's loop does,
+//!   which writes `value - 1` (all of them woken) only when no more than `count` wait.
+//!   Atmosphère's loop pre-increments where Eden's post-increments; they stop at different
+//!   counts but agree on that condition. Test: `sync/arbiter/tests.rs`,
+//!   `the_modified_value_is_edens_except_minus_one_when_count_up_to_zero_wakes_waiters`.
+//! - `DecrementAndWaitIfLessThan` decrements before the zero-timeout check, and a
+//!   `WaitProcessWideKeyAtomic` with a zero timeout lets go of the lock first. Tests:
+//!   `sync/arbiter/tests.rs`, `a_zero_timeout_times_out_after_the_comparison_and_keeps_the_decrement`;
+//!   `sync/condvar/tests.rs`,
+//!   `a_zero_timeout_lets_go_of_the_lock_and_flags_the_key_before_it_times_out`.
+//! - A condition-variable waiter that a signal hands to a lock owner keeps its timer, and is
+//!   still in `WaitProcessWideKeyAtomic` when it gets the lock. Test: `sync/condvar/tests.rs`,
+//!   `a_timer_ends_the_wait_in_the_tree_and_while_it_waits_on_the_owner`.
+//! - Only a `WaitSynchronization` can be cancelled; `CancelSynchronization` on a thread in any
+//!   other wait leaves a pending cancel (Eden's `m_cancellable`). Tests:
+//!   `cancelling_a_lock_waiter_only_leaves_a_pending_cancel` and its arbiter and
+//!   condition-variable twins.
+//!
+//! # Slice 5: not ported, and guesses
+//!
+//! - `IsTerminationRequested` is not checked before these waits either (below).
+//! - The read-modify-write of user words is not atomic against guest code on another core
+//!   ([`words`] says why and where that would change).
+//! - Kernel light locks (`KLightLock`, `KLightConditionVariable`) are not ported, so nothing
+//!   makes a kernel waiter outside this module's tests; [`lock`] counts them already.
 //!
 //! # Where synchronisation objects sit in the lock order
 //!
@@ -107,14 +197,26 @@
 //!   Only server sessions do (`KServerSession`), and they are deferred (kernel spec, "IPC");
 //!   they bring the mapping with them.
 
+pub mod arbiter;
+pub mod condvar;
 pub mod event;
+pub mod lock;
+pub mod tree;
 pub mod wait;
+pub mod words;
 
+#[cfg(test)]
+pub(crate) mod testing;
 #[cfg(test)]
 mod tests;
 
+pub use arbiter::{ArbitrationType, SignalType, modified_value};
+pub use condvar::{HAS_NO_WAITER_FLAG, HAS_WAITER_FLAG};
 pub use event::{Event, ReadableEvent};
+pub use lock::{AddressKey, Arbitrated, HANDLE_WAIT_MASK, HeldLock, LockTable, NO_OWNER};
+pub use tree::{ProcessKey, WaitTree};
 pub use wait::{
     ARGUMENT_HANDLE_COUNT_MAX, SyncTable, TIMEOUT_SLACK_NS, Timeout, TimerEntry, Wait, WaitBegun,
-    WaitOrigin, WaitToken, Wake, is_synchronization_object,
+    WaitCall, WaitOrigin, WaitToken, Wake, is_synchronization_object,
 };
+pub use words::{GuestWords, UserWords, WORD_SIZE};

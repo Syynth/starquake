@@ -29,6 +29,7 @@ fn add(threads: &mut Threads, priority: u8, active: Option<u8>, allowed: &[u8]) 
         .insert(Thread {
             state: ThreadState::Runnable,
             suspend_flags: 0,
+            suspend_requested: 0,
             priority: prio(priority),
             base_priority: prio(priority),
             affinity: mask(allowed),

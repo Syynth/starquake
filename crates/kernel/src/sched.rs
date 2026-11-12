@@ -28,12 +28,20 @@
 //! threads to idle cores, the three yields, base-priority and core-mask changes, thread
 //! activity (pause and resume), and the switch bookkeeping a core does when it changes threads.
 //!
+//! Kernel slice 5 added priority inheritance (`RestorePriority` over held locks, in
+//! `crate::sync::lock`), the split of a thread's requested suspends
+//! ([`Thread::suspend_requested`], `m_suspend_request_flags`) from those in its state
+//! ([`Thread::suspend_flags`]), and `TrySuspend`'s check for kernel waiters, which leaves a
+//! thread that kernel waiters wait on running with its request noted.
+//!
 //! Left for later slices, each with the Eden code that needs it:
-//! - Priority inheritance (`RestorePriority` over held locks, `m_num_kernel_waiters` in
-//!   `TrySuspend` and `UpdateHighestPriorityThreadsImpl`): slice 5. Here a thread's priority is
-//!   always its base priority, and `TrySuspend` always suspends.
 //! - Pinned threads (`GetPinnedThread`, `m_num_core_migration_disables`, the original affinity
-//!   saved while migration is disabled, `m_suspend_allowed_flags`): not in the spec's slices yet.
+//!   saved while migration is disabled, `m_suspend_allowed_flags`, and the kernel-waiter check
+//!   in `UpdateHighestPriorityThreadsImpl`, which only matters with a pinned thread): not in the
+//!   spec's slices yet. Until then every suspend is allowed (`m_suspend_allowed_flags` is all
+//!   ones, as `KThread::Initialize` sets it).
+//! - `KThread::Continue` (`ContinueIfHasKernelWaiters`), which only kernel light locks call:
+//!   with the light locks that make kernel waiters.
 //! - The waits in `SetCoreMask` and `SetActivity` after the scheduler lock is released (until
 //!   the thread is no longer running on a core it may not use, or stops running): the system
 //!   call layer, using [`Scheduler::running_on`], once the core loop (slice 10) and the wait

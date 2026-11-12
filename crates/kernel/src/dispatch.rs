@@ -57,6 +57,9 @@
 //!   [`Outcome::Waiting`] the way `SendSyncRequest` does, and its event is recorded when the
 //!   wait ends, by whichever dispatch (or [`Dispatcher::signal_event`],
 //!   [`Dispatcher::fire_timers`]) records the wake. `dispatch/sync.rs` says how.
+//! - **Arbitration** (`ArbitrateLock`, `ArbitrateUnlock`, `WaitProcessWideKeyAtomic`,
+//!   `SignalProcessWideKey`, `WaitForAddress`, `SignalToAddress`) has arms of its own, in
+//!   `dispatch/arbitration.rs`; the three that can wait use the same wait path.
 //! - **Shared and transfer memory** (`MapSharedMemory`, `UnmapSharedMemory`,
 //!   `CreateTransferMemory`) have arms of their own, in `dispatch/memory_objects.rs`. A
 //!   transfer memory's last reference can go in any call that drops references; the pages it
@@ -219,6 +222,7 @@ use crate::svc::{
 };
 use crate::tables::{AddressSpace, Processes, Scheduler};
 
+mod arbitration;
 mod ipc;
 mod lifecycle;
 mod memory_objects;
@@ -873,6 +877,7 @@ impl Dispatcher {
             | SvcId::WaitSynchronization
             | SvcId::CancelSynchronization
             | SvcId::CreateEvent => self.synchronization(call, id, convention),
+            _ if arbitration::ARMS.contains(&id) => self.arbitration(call, id, convention),
             SvcId::MapSharedMemory | SvcId::UnmapSharedMemory | SvcId::CreateTransferMemory => {
                 self.memory_object(call, id, convention)
             }
