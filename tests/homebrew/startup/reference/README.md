@@ -116,7 +116,6 @@ the two markers below differs; its failure message holds the text to put there.
 | 177 | `ipc nvdrv::8 (SetAruid)` | `0x0` |
 | 179 | `ipc nvdrv::0 (Open)` | `0x0` |
 | 183 | `ipc nvdrv::1 (Ioctl)` | `0x0` |
-| 193 | `svc 0x18 WaitSynchronization` | `0x0` |
 | 204 | `ipc nvdrv::2 (Close)` | `0x0` |
 | 218 | `ipc IApplicationDisplayService::2021 (CloseLayer)` | `0x0` |
 | 220 | `ipc IApplicationDisplayService::1020 (CloseDisplay)` | `0x0` |
