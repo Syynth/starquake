@@ -57,17 +57,33 @@ as a guess until a vCPU run (`tools/hvprobe`) or the manual confirms it.
 A few layout facts are in none of the pinned sources above. They come from the SwitchBrew wiki,
 which is not a git repository, so it cannot be pinned to a commit. The pages were read on
 2026-11-11; no revision id is recorded because the ids the wiki reported on two lookups did not
-agree. Treat these as third-party documentation, weaker than the pinned sources: nothing here has
-been cross-checked against a file built from homebrew.
+agree. Treat these as third-party documentation, weaker than the pinned sources. Where a claim
+has since been checked against Atmosphère (facts only) or the homebrew fixture
+(`tests/homebrew/hello`, below), the status says so.
 
 | Page | Used for | Status |
 |---|---|---|
-| NSO (`switchbrew.org/wiki/NSO`) | Hash-check flag bits 3 to 5 (hash over the decompressed segment); the last words of the first two segment headers are the module name offset and size | Documented, unverified: no fixture exercises either (`crates/loader/src/nso.rs`) |
-| NPDM (`switchbrew.org/wiki/NPDM`) | META words 0x10 (Switch 2 remote memory size), 0x14 (system resource size), 0x18 (version); that service names support a `*` wildcard | Offsets agree with Eden. The trailing-only, prefix-match reading of `*` is a **guess**: the page does not say it (`crates/loader/src/npdm/service_access.rs`) |
+| NSO (`switchbrew.org/wiki/NSO`) | Hash-check flag bits 3 to 5 (hash over the decompressed segment); the last words of the first two segment headers are the module name offset and size | Hash bits **confirmed** by Atmosphère's loader and the fixture. The module-name reading is **not used**: `elf2nso` writes 1 to both words, and the name is read from the start of rodata instead (`crates/loader/src/nso.rs`) |
+| NPDM (`switchbrew.org/wiki/NPDM`) | META words 0x10 (Switch 2 remote memory size), 0x14 (system resource size), 0x18 (version); that service names support a `*` wildcard | Offsets agree with Eden. The trailing-`*`, prefix-match reading is **confirmed** by Atmosphère's sm and the fixture (`crates/loader/src/npdm/service_access.rs`) |
 
 Rules:
 
 - Code that depends on a fact from these pages says so next to the fact, and says what would
   confirm it.
-- A rule that appears in no source at all (for example how an `ACI0` is checked against its
-  `ACID`) is a guess, stated as one in the module docs, not a documentation-sourced fact.
+- A rule that appears in no source at all (for example how a Switch 2 NPDM is checked against
+  its `ACID`: no Switch 2 source does) is a guess, stated as one in the module docs, not a
+  documentation-sourced fact. A rule Atmosphère implements differently is a listed divergence
+  instead (for example file permissions: fs intersects the `ACI0` and `ACID` bits and never
+  refuses; see the table in `crates/loader/src/npdm/validate.rs`).
+
+## Homebrew toolchain
+
+The fixtures in `tests/homebrew/` are built with devkitPro's devkitA64 and libnx, and
+switch-tools' `elf2nro`, `elf2nso` and `npdmtool`; `tests/homebrew/README.md` says how. The gate
+does not need them. On macOS, `tools/setup-devkitpro.sh` installs them into `/opt/devkitpro`: it
+downloads devkitPro's installer package from its GitHub release (pinned in the script), asks
+for your password once, installs the `switch-dev` package group and adds `DEVKITPRO` and
+`DEVKITA64` to `~/.zshrc`. The versions a fixture was built with are in its `manifest.toml`.
+
+These tools are not reference sources: a fact settled only by a fixture is settled for what
+switch-tools writes, and is cited that way.

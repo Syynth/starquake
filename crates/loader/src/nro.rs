@@ -11,7 +11,10 @@
 //!
 //! The build id at header offset 0x40 is `NroHeader::m_module_id` (0x20 bytes) in
 //! `eden/src/core/hle/service/ro/ro_types.h` @ cf654052, which `ro.cpp` compares to detect an
-//! already-loaded module. `nro.cpp`'s own `NroHeader` skips those bytes as padding.
+//! already-loaded module. `nro.cpp`'s own `NroHeader` skips those bytes as padding. Confirmed
+//! against `tests/homebrew/hello/hello.nro`: switch-tools' `elf2nro` writes the ELF's GNU build
+//! id there, zero-padded, and `elf2nso` writes the same bytes at the NSO's build id offset
+//! (`crates/loader/tests/homebrew_fixture.rs`).
 
 use std::ops::Range;
 
