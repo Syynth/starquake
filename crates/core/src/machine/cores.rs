@@ -188,23 +188,46 @@ mod tests {
         CoreId::new(index).unwrap()
     }
 
+    /// Runs `body`, stopping `cores` if it has not finished within ten seconds, so that a park
+    /// that is never woken fails its test (it then ends [`Parked::Stopped`]) instead of hanging
+    /// the gate.
+    fn bounded<R>(cores: &Cores<Counting>, body: impl FnOnce() -> R) -> R {
+        let (done, finished) = std::sync::mpsc::channel::<()>();
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                if finished.recv_timeout(Duration::from_secs(10)).is_err() {
+                    cores.stop();
+                }
+            });
+            let result = body();
+            drop(done.send(()));
+            result
+        })
+    }
+
     #[test]
     fn a_wake_before_the_park_is_not_lost() {
         let cores: Cores<Counting> = Cores::new(2);
         cores.wake(core(1));
-        assert_eq!(cores.park(core(1), || false), Parked::Woken);
+        assert_eq!(
+            bounded(&cores, || cores.park(core(1), || false)),
+            Parked::Woken
+        );
     }
 
     #[test]
     fn a_park_waits_for_its_wake_from_another_thread() {
         let cores: Cores<Counting> = Cores::new(2);
-        std::thread::scope(|scope| {
-            let parked = scope.spawn(|| cores.park(core(0), || false));
-            // Bounded: the parked thread is woken whatever this sleep finds.
-            std::thread::sleep(Duration::from_millis(20));
-            cores.wake(core(0));
-            assert_eq!(parked.join().unwrap(), Parked::Woken);
+        let parked = bounded(&cores, || {
+            std::thread::scope(|scope| {
+                let parked = scope.spawn(|| cores.park(core(0), || false));
+                // The parked thread is woken whatever this sleep finds.
+                std::thread::sleep(Duration::from_millis(20));
+                cores.wake(core(0));
+                parked.join().unwrap()
+            })
         });
+        assert_eq!(parked, Parked::Woken);
     }
 
     #[test]
@@ -225,29 +248,31 @@ mod tests {
     #[test]
     fn only_the_last_core_to_park_asks_whether_the_run_is_stalled() {
         let cores: Cores<Counting> = Cores::new(2);
-        std::thread::scope(|scope| {
-            let first = scope.spawn(|| cores.park(core(0), || unreachable!()));
-            // The second core is the last: it asks, and is told the run is stalled.
-            let mut asked = false;
-            // Bounded: the first core parks within this wait or the assertion below fails.
-            for _ in 0..200 {
-                if *lock(&cores.idle) == 1 {
-                    break;
+        bounded(&cores, || {
+            std::thread::scope(|scope| {
+                let first = scope.spawn(|| cores.park(core(0), || unreachable!()));
+                // The second core is the last: it asks, and is told the run is stalled.
+                let mut asked = false;
+                // Bounded: the first core parks within this wait or the assertion below fails.
+                for _ in 0..200 {
+                    if *lock(&cores.idle) == 1 {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
                 }
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            assert_eq!(*lock(&cores.idle), 1);
-            let parked = cores.park(core(1), || {
-                asked = true;
-                true
-            });
-            assert_eq!(parked, Parked::Stalled);
-            assert!(asked);
-            // Not stalled: the last core parks like any other.
-            cores.wake(core(1));
-            assert_eq!(cores.park(core(1), || false), Parked::Woken);
-            cores.stop();
-            assert_eq!(first.join().unwrap(), Parked::Stopped);
+                assert_eq!(*lock(&cores.idle), 1);
+                let parked = cores.park(core(1), || {
+                    asked = true;
+                    true
+                });
+                assert_eq!(parked, Parked::Stalled);
+                assert!(asked);
+                // Not stalled: the last core parks like any other.
+                cores.wake(core(1));
+                assert_eq!(cores.park(core(1), || false), Parked::Woken);
+                cores.stop();
+                assert_eq!(first.join().unwrap(), Parked::Stopped);
+            })
         });
     }
 }

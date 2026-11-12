@@ -600,19 +600,23 @@ fn ending_the_process_stops_every_core_that_runs_guest_code() {
     // stopped, so returning is the test.
     let (arrived, arrivals) = mpsc::channel::<u8>();
     let arrived = Mutex::new(arrived);
+    let interrupters = Interrupters::default();
+    let made = Arc::clone(&interrupters);
     let make = move |core: CoreId| -> Result<ScriptedVcpu, starquake_cpu::Error> {
         let index = core.index();
-        if index == 1 || index == 2 {
+        let vcpu = if index == 1 || index == 2 {
             let arrived = lock(&arrived).clone();
-            Ok(ScriptedVcpu::new()
+            ScriptedVcpu::new()
                 .then(
                     move |_| arrived.send(index).unwrap(),
                     svc(SvcId::GetCurrentProcessorNumber),
                 )
-                .then_spin())
+                .then_spin()
         } else {
-            Ok(ScriptedVcpu::new())
-        }
+            ScriptedVcpu::new()
+        };
+        lock(&made).push(vcpu.interrupter());
+        Ok(vcpu)
     };
     let mut main = ScriptedVcpu::new()
         .then(create(1, 30, 1), svc(SvcId::CreateThread))
@@ -637,56 +641,62 @@ fn ending_the_process_stops_every_core_that_runs_guest_code() {
             },
             svc(SvcId::ExitProcess),
         );
+    lock(&interrupters).push(main.interrupter());
     let started = Instant::now();
-    let report = run(
-        Vcpus {
-            first: &mut main,
-            make: &make,
-        },
-        guest.program(&guest.memory),
-        &RunOptions {
-            // Only a broken stop reaches this; the run ends long before.
-            timeout: Some(Duration::from_secs(60)),
-            command_line: Vec::new(),
-            sd_card: None,
-        },
-        started,
-        timebase(),
-    );
+    let report = bounded(&interrupters, || {
+        run(
+            Vcpus {
+                first: &mut main,
+                make: &make,
+            },
+            guest.program(&guest.memory),
+            &RunOptions::default(),
+            started,
+            timebase(),
+        )
+    });
     assert_eq!(report.exit, ExitReason::ProcessExited, "{}", report.trace);
-    assert!(started.elapsed() < Duration::from_secs(30));
+    assert!(started.elapsed() < Duration::from_secs(20));
 }
 
 #[test]
 fn the_runs_timeout_stops_every_core() {
     let guest = Guest::new(&programs::hello().unwrap());
-    let make = |core: CoreId| -> Result<ScriptedVcpu, starquake_cpu::Error> {
-        Ok(if core.index() == 1 {
+    let interrupters = Interrupters::default();
+    let made = Arc::clone(&interrupters);
+    let make = move |core: CoreId| -> Result<ScriptedVcpu, starquake_cpu::Error> {
+        let vcpu = if core.index() == 1 {
             ScriptedVcpu::new().then_spin()
         } else {
             ScriptedVcpu::new()
-        })
+        };
+        lock(&made).push(vcpu.interrupter());
+        Ok(vcpu)
     };
     // The main thread starts a thread on core 1, then both spin until the timeout.
     let mut main = ScriptedVcpu::new()
         .then(create(1, 30, 1), svc(SvcId::CreateThread))
         .then(start_created, svc(SvcId::StartThread))
         .then_spin();
+    lock(&interrupters).push(main.interrupter());
     let timeout = Duration::from_millis(50);
-    let report = run(
-        Vcpus {
-            first: &mut main,
-            make: &make,
-        },
-        guest.program(&guest.memory),
-        &RunOptions {
-            timeout: Some(timeout),
-            command_line: Vec::new(),
-            sd_card: None,
-        },
-        Instant::now(),
-        timebase(),
-    );
+    let report = bounded(&interrupters, || {
+        run(
+            Vcpus {
+                first: &mut main,
+                make: &make,
+            },
+            guest.program(&guest.memory),
+            &RunOptions {
+                timeout: Some(timeout),
+                command_line: Vec::new(),
+                sd_card: None,
+            },
+            Instant::now(),
+            timebase(),
+        )
+    });
     assert_eq!(report.exit, ExitReason::Timeout);
     assert!(report.duration >= timeout);
+    assert!(report.duration < Duration::from_secs(20));
 }

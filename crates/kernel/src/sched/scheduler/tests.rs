@@ -824,7 +824,12 @@ fn the_preemption_table_has_a_priority_per_application_core() {
         PREEMPTION_PRIORITIES.len(),
         usize::from(APPLICATION_CORE_COUNT)
     );
-    // Eden PR #4588's table: the system core (3) rotates at the lowest priority.
+    // Eden PR #4588's table (`global_scheduler_context.cpp`, `per_core`), as the reference
+    // gives it: the system core (3) rotates at the lowest priority.
+    assert_eq!(
+        PREEMPTION_PRIORITIES.map(Priority::get),
+        [59, 59, 59, 63, 59, 59]
+    );
     assert_eq!(PREEMPTION_PRIORITIES[3], Priority::LOWEST);
 }
 

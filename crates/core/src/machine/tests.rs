@@ -565,6 +565,29 @@ fn an_undefined_instruction_is_a_crash_at_its_address() {
     );
 }
 
+/// The vCPUs of a threaded run, to interrupt if the run does not stop them.
+type Interrupters = Arc<Mutex<Vec<starquake_cpu::testing::ScriptedInterrupter>>>;
+
+/// Runs `body`, interrupting every vCPU in `interrupters` if it has not finished within twenty
+/// seconds: a run whose stop fails to interrupt its spinning cores then ends late (its cores
+/// see the run is stopping when this interrupt arrives) and the test fails on its time instead
+/// of hanging the gate.
+fn bounded<R>(interrupters: &Interrupters, body: impl FnOnce() -> R) -> R {
+    let (done, finished) = std::sync::mpsc::channel::<()>();
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            if finished.recv_timeout(Duration::from_secs(20)).is_err() {
+                for interrupter in lock(interrupters).iter() {
+                    interrupter.interrupt().unwrap();
+                }
+            }
+        });
+        let result = body();
+        drop(done.send(()));
+        result
+    })
+}
+
 #[test]
 fn a_guest_that_never_stops_is_ended_by_the_timeout() {
     let guest = Guest::new(&programs::endless_loop().unwrap());
@@ -574,7 +597,10 @@ fn a_guest_that_never_stops_is_ended_by_the_timeout() {
         command_line: Vec::new(),
         sd_card: None,
     };
-    let report = guest.run(ScriptedVcpu::new().then_spin(), &options);
+    let vcpu = ScriptedVcpu::new().then_spin();
+    let interrupters = Interrupters::default();
+    lock(&interrupters).push(vcpu.interrupter());
+    let report = bounded(&interrupters, || guest.run(vcpu, &options));
     assert_eq!(report.exit, ExitReason::Timeout);
     assert_eq!(report.exit_code(), exit_code::TIMEOUT);
     assert!(report.duration >= timeout, "{:?}", report.duration);
