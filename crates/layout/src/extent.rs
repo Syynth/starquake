@@ -308,3 +308,80 @@ impl Offset4D<Elements> {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn div_ceil_edges() {
+        assert_eq!(checked_div_ceil(0, 8), Some(0));
+        assert_eq!(checked_div_ceil(8, 8), Some(1));
+        assert_eq!(checked_div_ceil(9, 8), Some(2));
+        assert_eq!(checked_div_ceil(u32::MAX, 1), Some(u32::MAX));
+        assert_eq!(checked_div_ceil(u32::MAX, 2), Some(1 << 31));
+        assert_eq!(checked_div_ceil(1, 0), None);
+    }
+
+    #[test]
+    fn minify_halves_down_to_one() {
+        assert_eq!(minify(100, 0), 100);
+        assert_eq!(minify(100, 1), 50);
+        assert_eq!(minify(100, 6), 1);
+        assert_eq!(minify(100, 7), 1);
+        assert_eq!(minify(u32::MAX, 31), 1);
+        assert_eq!(minify(u32::MAX, 32), 1);
+        assert_eq!(minify(1, u32::MAX), 1);
+    }
+
+    #[test]
+    fn ilog2_ceil_matches_mesa() {
+        let cases = [
+            (0, 0),
+            (1, 0),
+            (2, 1),
+            (3, 2),
+            (4, 2),
+            (5, 3),
+            (8, 3),
+            (9, 4),
+        ];
+        for (value, expected) in cases {
+            assert_eq!(ilog2_ceil(value), expected, "{value}");
+        }
+        assert_eq!(ilog2_ceil(1 << 31), 31);
+        assert_eq!(ilog2_ceil((1 << 31) + 1), 32);
+        assert_eq!(ilog2_ceil(u32::MAX), 32);
+    }
+
+    #[test]
+    fn align_and_size() {
+        let extent: Extent4D<Bytes> = Extent4D::new(65, 9, 3, 1);
+        let aligned = extent.align(&Extent4D::new(64, 8, 2, 1));
+        assert_eq!(aligned, Ok(Extent4D::new(128, 16, 4, 1)));
+        assert_eq!(aligned.and_then(|e| e.size_b()), Ok(128 * 16 * 4));
+        let huge: Extent4D<Bytes> = Extent4D::new(u32::MAX, 1, 1, 1);
+        assert_eq!(
+            huge.align(&Extent4D::new(64, 1, 1, 1)),
+            Err(LayoutError::Overflow)
+        );
+        let cube: Extent4D<Bytes> = Extent4D::new(u32::MAX, u32::MAX, u32::MAX, 1);
+        assert_eq!(cube.size_b(), Err(LayoutError::Overflow));
+        assert!(Extent4D::<Bytes>::new(0, 1, 1, 1).is_empty());
+        assert!(Extent4D::<Bytes>::new(1, 1, 1, 0).is_empty());
+        assert!(!Extent4D::<Bytes>::new(1, 1, 1, 1).is_empty());
+    }
+
+    #[test]
+    fn offset_end_overflow() {
+        let start: Offset4D<Bytes> = Offset4D::new(u32::MAX, 0, 0, 0);
+        assert_eq!(
+            start.checked_add(Extent4D::new(0, 1, 1, 1)),
+            Ok(Offset4D::new(u32::MAX, 1, 1, 1))
+        );
+        assert_eq!(
+            start.checked_add(Extent4D::new(1, 1, 1, 1)),
+            Err(LayoutError::Overflow)
+        );
+    }
+}

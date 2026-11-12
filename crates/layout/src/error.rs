@@ -117,8 +117,8 @@ pub enum LayoutError {
     /// The image has no mip tail.
     #[error("the image has no mip tail")]
     NoMipTail,
-    /// A copy region or offset with a layer other than layer 0 of one layer.
-    #[error("a copy region must be one layer starting at layer 0")]
+    /// A copy region or a position that is not in layer 0 of one layer.
+    #[error("a region or position must be in layer 0 of one layer")]
     RegionHasLayers,
     /// A copy region or offset that reaches past the level.
     #[error("the region does not fit in the level")]
