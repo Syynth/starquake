@@ -29,11 +29,13 @@ starquake-testkit = { path = "crates/testkit" }
 starquake-trace = { path = "crates/trace" }
 
 lz4_flex = "0.14.0"
-# Shader IR the render crate's `ShaderSource::Naga` carries (docs/specs/render-backend.md, "Where
-# the backend sits"): the major version wgpu 30.0.1 depends on (`naga = "30.0.0"` in its manifest),
-# so the shader, gpu and render crates share one naga with wgpu. No features: the render crate only
-# names the module types.
-naga = "30.0.1"
+# Shader IR: the shader crate hands out a validated naga module (docs/specs/shader-pipeline.md,
+# "The backend through naga") and the render crate's `ShaderSource::Naga` carries it
+# (docs/specs/render-backend.md, "Where the backend sits"). Pinned exactly to the naga wgpu 30.0.1
+# uses, so the shader, gpu and render crates share one naga with wgpu (owner's decision of
+# 2026-11-12); upgrade it together with wgpu. No features here: the render crate only names the
+# module types.
+naga = "=30.0.1"
 sha2 = "0.11.1"
 # Pure-Rust zstd decoder for NUP containers (crates/loader/src/nup.rs): the format stores each
 # compressed file as one zstd frame (docs/references.md, `nup`). Without default features: the
@@ -49,6 +51,10 @@ tracing = "0.1.44"
 # Dev-only
 insta = "1.49.0"
 proptest = "1.12.0"
+# Creates the shader crate's naga modules on a real device: experiment E1 and the wgpu acceptance
+# tests (docs/specs/shader-pipeline.md, "What to verify before building"). Takes a naga module
+# directly (`naga-ir`); Metal on macOS, Vulkan elsewhere. Pinned with naga.
+wgpu = { version = "=30.0.1", default-features = false, features = ["std", "metal", "vulkan", "naga-ir"] }
 
 [workspace.lints.rust]
 # Denied everywhere; the few crates that must talk to the host or run guest code (cpu, later
