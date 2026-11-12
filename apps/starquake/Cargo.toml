@@ -19,3 +19,5 @@ starquake-testkit.workspace = true
 # Reads back the flight-recorder dump the command wrote.
 starquake-trace.workspace = true
 serde_json.workspace = true
+# Builds the synthetic NUP files that the `inspect` and `verify` tests read.
+starquake-loader = { workspace = true, features = ["test-support"] }

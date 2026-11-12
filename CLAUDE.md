@@ -78,6 +78,8 @@ Platform-specific code must still compile (or be `cfg`-gated) on Linux; check wi
   redesign. Check it before porting anything.
 - `docs/references.md`: the pinned reference sources and how to fetch them
   (`tools/refs-path.sh` prints their folder).
+- `docs/reference-emulator.md`: the locally built reference emulator whose traces starquake is
+  compared with, what it is trusted for, and how to run it (`tools/oracle/`).
 - `docs/switch2-eden-diff-scoping.md`: what Switch 2 support actually requires, from Eden-NX2's
   149-row blocker log and PR #4588. Cite its rows when implementing protocol behaviour.
 - `docs/oboromi-evaluation.md`: why this is a fresh repo.
@@ -106,6 +108,11 @@ Platform-specific code must still compile (or be `cfg`-gated) on Linux; check wi
   (flush, cleanup, rollback) happens on the error path too. A freed resource is not reusable
   until every pending follow-up on it (a TLB flush, a notification) has run.
 - Decisions in command-line and gate code are pure functions, tested for every input combination.
+- User-facing errors and command output are plain words, not `Debug` forms.
+- Whatever saves state passes the same validity checks that restoring enforces, and restoring
+  validates every relation between fields.
+- Bound memory and time by what a hostile input can force, not only by loop counts. A failed
+  streaming read is sticky: every later read returns the same error, never a clean end of file.
 - Protocol facts (command ids, struct layouts) need a source in a comment: a scoping-doc row, a
   reference path and commit, or a trace. Mark guesses as guesses, and say what would confirm them.
 - When mirroring reference behaviour, cite the exact check and its constant. Where starquake is
@@ -133,6 +140,8 @@ Platform-specific code must still compile (or be `cfg`-gated) on Linux; check wi
   a distinct newtype or name the conversion's owner in one place.
 - Never derive deserialisation on a validated newtype; deserialise through the validating
   constructor and test that an out-of-range value is an error.
+- Name a decoded bit position, shift or width once, as a constant shared by the decoder and the
+  encoder.
 - Don't duplicate logic across sibling modules; extract one `pub(crate)` helper and call it from
   both.
 
@@ -157,6 +166,12 @@ Platform-specific code must still compile (or be `cfg`-gated) on Linux; check wi
   times under both plain `cargo test` and nextest before trusting it.
 - Negative tests assert the exact error (variant, exit code, message), so a missing or broken
   implementation can't pass them.
+- When docs promise an order of checks, a test has both faults present at once. Decode tests
+  give each field a distinct value.
+- A parser gets one hand-built accepting case per format feature, not only inputs made by the
+  project's own builder or encoder.
+- Mutation-check new tests: for each new branch, break it in a scratch copy and confirm a test
+  fails. Never claim a test pins a property it cannot observe.
 - Never hide a flaky test behind retries: reproduce it under plain `cargo test` as well as
   nextest, find the root cause, and document a platform quirk where it is one.
 - Unit tests in `#[cfg(test)] mod tests`; cross-module tests in `tests/`. `proptest` for parsers

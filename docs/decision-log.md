@@ -160,3 +160,36 @@ Entry format:
 - **SCOPE:** moderate
 - **WHAT:** Decided by the lead under delegation, after the walking skeleton and wave 5: (1) the EL1 shim is mapped in the upper address half (TTBR1) with its own static tables, separate from guest tables; (2) the kernel handles the HIPC layer of a message (handles, process id, descriptors) and the service framework parses the CMIF or TIPC payload; (3) per-crate fakes live behind a feature named `test-support`, and the workspace allows the clippy lint that rejects that name; (4) Atmosphère is a pinned reference for facts only, because its GPL-2.0-only licence can't be combined with this project's; (5) a run's text trace and guest log are capped (100,000 events, 4 MiB), provisionally; (6) the kernel owns guest time, with a per-process counter rate and one zero point shared with patched counter reads.
 - **WHY:** Each was a gap or conflict that building exposed: the stage-1 builder can't map privileged code; only a server knows whether its session is a domain; two tasks chose different feature names; six service result codes were guesses a facts-only reference settles; an uncapped run could exhaust host memory; and three crates each assumed another converted the clock. The owner delegated design decisions until milestone 1 and reviews them afterwards.
+
+## The first real title is one the owner dumped; its files stay local and read-only
+- **WHEN:** 2026-11-12
+- **PROJECT:** starquake
+- **SYSTEM:** titles
+- **SCOPE:** moderate
+- **WHAT:** The target title for milestone 2 is a Switch 2 game the owner dumped themselves, in the NUP container format (an open format for decrypted dumps, so no keys are involved). The dump lives outside the repository and is locked read-only. It is never copied, moved or modified, and never loaded whole into memory. Its path, its name, its title id and anything read from it stay out of code, tests, snapshots, commits, PRs and CI logs; reports about it say only what worked and what failed. Starquake reads it with `starquake inspect` and `starquake verify`, and later runs it.
+- **WHY:** The owner would rather work towards a game they want to play than a smaller test title. A dump they made themselves is the only kind of game file this project works with, and keeping every trace of it local is what makes the repository safe to share later.
+
+## The reference emulator is the trace oracle for homebrew
+- **WHEN:** 2026-11-12
+- **PROJECT:** starquake
+- **SYSTEM:** testing
+- **SCOPE:** moderate
+- **WHAT:** Decided by the lead under delegation, after the owner asked whether another emulator could run the same fixture. A locally built Eden-NX2 runs the homebrew fixture headlessly with system-call and service-request logging, and its trace is the target for milestone 1: the address-space task (#97) and the sessions task (#98) are done when starquake's trace of the same file matches it call for call. The reference is trusted for the order of calls and their arguments; a result code it returns is checked against the other sources before it is copied, and known reference bugs are listed and not copied (`docs/reference-emulator.md`). Only normalised traces of homebrew programs are committed.
+- **WHY:** "The program ran" was not checkable without something to compare against. An independent emulator running the identical file turns the distance to milestone 1 into an ordered list of calls, and it found starquake's first departure at the first system call.
+
+## Each agent builds in its own checkout's build folder
+- **WHEN:** 2026-11-12
+- **PROJECT:** starquake
+- **SYSTEM:** process
+- **SCOPE:** minor/local
+- **WHAT:** Decided by the lead under delegation. Agents in a wave no longer share one `CARGO_TARGET_DIR`. Each builds in the default `target/` of its own worktree, with incremental compilation off, and the worktree is removed when its PR lands.
+- **WHY:** The shared folder served a sibling checkout's stale build several times: a stale `xtask` in wave 2, and in wave 8 a review that saw every test fail, a compile error from another checkout's sources, and a red gate on `main` that was only the cache. A wrong test result costs more than the disk: each worktree's folder is one to two gigabytes, and the machine now has about 98 GiB free.
+
+## House rules adopted from waves 8 and 9
+- **WHEN:** 2026-11-12
+- **PROJECT:** starquake
+- **SYSTEM:** process
+- **SCOPE:** minor/local
+- **WHAT:** Decided by the lead under delegation. Eight rules from review findings moved into `CLAUDE.md`: saving passes the checks restoring enforces; one named constant per decoded bit field; mutation-check new tests; a test with both faults present when an order of checks is promised; sticky streaming-read failures; bounds by what a hostile input can force; a hand-built accepting case per format feature; plain-word errors asserted exactly. The candidates that existing rules already cover were dropped (`docs/proposals.md`). Also ruled: adding a crash-report kind bumps the report's version.
+- **WHY:** Each came from a defect a reviewer found in agent-written code in these waves, and the owner wants recurring mistakes turned into standing rules.
+

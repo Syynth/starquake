@@ -1,6 +1,6 @@
 [package]
 name = "starquake-loader"
-description = "NSO/NRO/NPDM/RomFS loading and load-time code patching"
+description = "NSO/NRO/NPDM/RomFS loading, NUP containers, and load-time code patching"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,13 +10,22 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# The NUP builder (`nup::build`) for this crate's tests and downstream crates' dev builds: the
+# name every crate gives the feature that exports its test helpers (`docs/specs/testing.md`,
+# "Shared test support").
+test-support = []
+
 [dependencies]
 starquake-memory.workspace = true
 lz4_flex.workspace = true
+ruzstd.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+# Turns `test-support` on for this crate's unit tests, integration tests and doctests.
+starquake-loader = { workspace = true, features = ["test-support"] }
 starquake-testkit.workspace = true
 proptest.workspace = true
 serde_json.workspace = true

@@ -58,13 +58,14 @@ reviewed adversarially, and landed one at a time through a merge queue behind `c
 ## Disk and machine limits
 
 - At most 3–4 build agents at once on an 8-core machine.
-- One shared build folder for a wave (`CARGO_TARGET_DIR`), warmed before the wave starts, with
-  incremental compilation off. Dev builds carry no debug info.
+- Each agent builds in its own worktree's `target/`, with incremental compilation off (decision
+  log, 2026-11-12: a shared `CARGO_TARGET_DIR` served stale builds from sibling checkouts). Dev
+  builds carry no debug info, so a worktree's folder is one to two gigabytes.
 - `cargo xtask ci` refuses to build with less than 15 GiB free.
 - The `xtask` binary is per checkout, not shared. The `cargo xtask` alias (`.cargo/config.toml`)
   passes `--target-dir target/xtask`, so the binary is built and run from a folder inside the
-  checkout, while the cargo commands it spawns inherit `CARGO_TARGET_DIR` and keep building in the
-  shared folder. Without this, worktrees sharing a build folder overwrite each other's
+  checkout, while the cargo commands it spawns inherit `CARGO_TARGET_DIR` when one is set. Without
+  this, worktrees sharing a build folder overwrite each other's
   `debug/xtask` and one runs another's gate. The path is relative to the directory cargo is started
   in, so from a subfolder the binary lands in that folder's own (git-ignored) `target/`; `ci`
   itself changes to the workspace root, so the gate runs the same from anywhere in the checkout.

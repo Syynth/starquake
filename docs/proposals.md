@@ -29,7 +29,7 @@ Statuses: `proposed`, `promoted #N`, `folded into ...`, `accepted`/`ruled` (spec
 | promoted #68 (blocked on the owner installing devkitPro) | **test: a homebrew-built NSO/NPDM fixture** | Several loader facts stay unconfirmed without a real file: NSO hash flags, module-name words, the wildcard form, the ACID access-control base, and the ACI0-against-ACID rules. Overlaps the test strategy's homebrew fixture decision (#8). | area:loader, M1 |
 | dropped: the merge queue now waits for PR checks; the self-hosted runner question is recorded in the test strategy spec | **decision: required-checks policy** | Branch protection is unavailable on this private repo (HTTP 403). The macOS PR job is path-filtered and may be absent, the merge queue must check the checks itself (wave 2 merged two PRs before their CI finished), and a move to squash merges would leave the PR-title check as the only subject enforcement. | owner, infra |
 | folded into the `fsp-srv` trial slice (service framework spec, slice 6) | **feat(fs): port the path normaliser** (`fs_path_utility`) | RomFS `find_dir`/`find_file` reject non-normalised paths, so the file-system service needs normalisation that matches Eden's. #16 cited the source but did not port it. | area:loader, M2 |
-| proposed | **feat(loader): ExeFS title loading and RomFS mount**, including the NCA container and the `path_hash` signedness question | The PFS0 and RomFS parsers are reachable only from tests. Titles need a seekable source from an NCA container, and hashing of bytes 0x80 and above is unsettled. | area:loader, M2 |
+| partly delivered by #95 (the NUP container reader); the rest is proposed again under "From waves 8 and 9" | **feat(loader): ExeFS title loading and RomFS mount**, including the NCA container and the `path_hash` signedness question | The PFS0 and RomFS parsers are reachable only from tests. Titles need a seekable source from an NCA container, and hashing of bytes 0x80 and above is unsettled. | area:loader, M2 |
 | folded into #33 | **feat(loader): expose the Switch 2 `RemoteMemorySize` word** (META 0x10) | Not exposed by NPDM parsing; Switch 2 process setup will probably need it. | area:loader, M2 |
 
 ### Folded into existing issues (wave 2)
@@ -110,15 +110,48 @@ All vetted by the lead under delegation; open to the owner's review.
 | promoted #88 (lead, under delegation) | **Pin gate tools; list the Arm reference manual; add Atmosphère as a facts-only reference** | A tool release can turn `main` red; six result codes in the service framework are guesses Atmosphère would settle. Atmosphère is GPL-2.0-only, so it is a reference for facts, never for code. |
 | ruled (lead, under delegation): the feature is `test-support`, as the owner decided; the workspace allows the lint that rejected the name; services renames its `fakes` feature in #87 | **Name of the per-crate fakes feature** | The skeleton and the service framework chose differently. |
 | promoted #87 (lead, under delegation) | **Service slices 3–5 with a snapshot hook** (deferred replies, per-server queue, trace sink, `sm:`, `set:sys`) | The observability spec's snapshot rule needs a hook before the first real services are written. |
-| promoted (lead, under delegation): filed when #75 lands | **Kernel slices 4–10** | Unchanged from wave 3. |
+| promoted (lead, under delegation): split by what the homebrew fixture needs. Slice 6 is #97 and slice 9 is #98; slices 4, 5, 8 and 10 are filed after milestone 1 | **Kernel slices 4–10** | Unchanged from wave 3. |
 | folded into #75 (lead, under delegation) | **Align the zero point of patched counter reads and `GetSystemTick`; per-process counter rate; name the environment's clock type for what it returns (host nanoseconds)** | The skeleton shares a rate between the two clocks but not a starting point. |
-| folded into #85 (lead, under delegation) | **Unpatched counter reads answered at the host rate by the shim** | A read the patcher misses would disagree with patched ones. |
+| not delivered: #85 closed without it; proposed again under "From waves 8 and 9" | **Unpatched counter reads answered at the host rate by the shim** | A read the patcher misses would disagree with patched ones. |
 | proposed | **Crash report: a frame-pointer backtrace; a program counter for timed-out runs** | Reviewer follow-up; useful once real programs run. |
 | proposed | **A stop handle for runs (Ctrl-C leaves no artifacts); print guest log lines as they happen; a default timeout** | Reviewer and builder follow-ups on the command-line app. |
 | proposed | **Stage-1 tables: a failed write during `map` can leave a table page registered but unlinked; a table descriptor with other ignored bits set is accepted** | Found by #76's fix pass; neither affects correct guests. |
 | proposed | **Pinned threads** | No kernel slice owns them (from wave 4). |
 | accepted (lead, under delegation) as provisional | **Run limits: the trace keeps a run's first 100,000 events and the guest log its first 4 MiB**, with truncation recorded in the summary | The observability spec asks for a per-run cap without numbers. The newest events are always in the flight recorder. |
 | accepted (lead, under delegation) | **`guest_log.txt` in the artifacts folder; usage and file errors exit with code 2; `summary.json` and `crash.json` layouts as the skeleton defines them** | Gaps in the observability spec that the skeleton filled; spec amended. |
+
+### From waves 8 and 9 (ledger: #22)
+
+Wave 8 landed the dispatcher's table borrows and guest time (#75), stage-1 tables on hardware
+(#85), `sm:` and `set:sys` (#87) and the libnx fixture (#68). Wave 9 landed the NUP reader (#95).
+All vetted by the lead under delegation; open to the owner's review.
+
+| Status | Proposal | Why |
+|---|---|---|
+| promoted #97, #98 (lead, under delegation) | **The address space, then sessions and services, driven by the reference trace of the homebrew fixture** | The fixture stops at its first system call. The reference emulator's trace of the same file gives the ordered list of calls to implement (`docs/reference-emulator.md`). |
+| promoted #100 (lead, under delegation) | **Decompress ZBIC-compressed NSO segments** | A Switch 2 title's main module is compressed this way and `Nso::parse` refuses it, so nothing of a real title can be mapped. Loader only, so it runs beside the kernel work. |
+| folded into #97 | **`AddressSpace::pieces` loops forever on a zero-length piece; nextest has no slow-test timeout** | Found by a wave 8 reviewer; a hang in a test would stall the gate. |
+| folded into #98 | **A golden-trace test for the homebrew fixture** | Milestone 1's "done when" needs one; the expected trace lived only in a README. |
+| adopted (lead, under delegation) | **Each agent builds in its own checkout's build folder** | A shared `CARGO_TARGET_DIR` served a sibling's stale build several times across waves 2 and 8 (decision log). |
+| proposed | **The shim answers unpatched `cntpct_el0` reads at the guest's rate** | A read the patcher misses returns the raw host counter while patched reads are rescaled. Needs the interrupt-recovery cases and a hardware test. |
+| proposed | **Something owns which counter rate a program gets** | The kernel has a per-process rate (#75) but every process is given the Switch 1 rate. Belongs with process creation (slice 8). |
+| proposed | **A backend-neutral TLB flush on the `Vcpu` trait** | The flush is a method of the hypervisor backend only, and `run` does not refuse while a flush is owed. The kernel is generic over `Vcpu`, and KVM will share the tables. |
+| proposed | **The loader reads libnx's `LNY0`/`LNY1` extension to MOD0** (GOT and RELRO ranges) | libnx protects its own RELRO page at start-up (the fixture's first system call), so nothing on the milestone 1 path needs it yet. |
+| proposed | **A second homebrew fixture built with a firmware version set** | The first leaves it at zero, so the TIPC form of `sm:` and `set:sys` command 4 are never exercised. |
+| proposed | **Service-framework hardening**: check interface registration at construction; unique service ids in the wiring; command ids from constants; per-service stub names; a build identity in the whole-run snapshot header; trace events for the command name, the protocol and a deferred reply that never completes (with a dump version bump) | Review findings on #87. None is on the milestone 1 path. |
+| proposed | **Kernel follow-ups from #75**: an "error with outputs" return form (needed by `WaitSynchronization`, slice 4); where kernel objects sit in the lock order (before slices 6 and 9 share them); `serde` on the object and scheduler tables; a check that a dispatch arm's table set matches its call's signature; lock waits written to `summary.json`; the stubbed list in the summary carrying each call's status | Fix-pass notes. The first two are carried into the slices named. |
+| proposed | **The host counter read moves to the CPU backend** | The kernel's clock reads it through `core` today; only the backend knows the host's rate. |
+| proposed | **Loader conformance pass against the facts-only reference** (NSO segment size check, NPDM and ACID structure checks, raw capability words) | Review of #68 found checks the reference makes and starquake does not. Off the milestone 1 path. |
+| proposed | **Test hygiene**: a per-process scratch folder in `crates/core/tests/artifacts.rs`; macOS CI runs clippy on `starquake-core --all-targets`; `clippy.toml` allows panics in tests; enforce `compile_fail` error codes | Small findings from reviews; hosted CI never compiles the macOS-only code in `core`. |
+| folded into #36 | **Narrow #36** to `wfi`/`wfe`, the instruction-cache policy and printing the syndrome in crash reports | #85 delivered the syndrome in exits and the TLB flush entry point. |
+| folded into #25 | **Measure** the ASID width (8 bits on this host), whether an unmap is visible to other vCPUs before the flush, and a bound for the number of flush ranges (512 is a guess) | #85's hardware tests and `tools/hvprobe` disagree on how long a stale translation survives; the spec's sentence stays until measured. |
+| ruled (lead, under delegation): yes | **Does a new crash-report kind bump `CRASH_VERSION`?** | An older reader would meet a kind it does not know. Any change to a serialised layout bumps its version (`CLAUDE.md`); the constant's doc comment is corrected with the next crash-report change. |
+| proposed | **Should `RamConfig` refuse a RAM base below 4 GiB?** | Raised in review of #85; no guest needs it either way yet. |
+| proposed | **Run a title: map a title's ExeFS into a process, `starquake run <title.nup>`** | Nothing turns an opened title into a running process. Fold with #33 (wiring the parsers into process creation). After milestone 1. |
+| proposed | **Design: RomFS from a NUP file for the file-system service** (positional reads; seeking inside a compressed file) | The reader borrows its source mutably, and a compressed file is one zstd frame with no random access. Settle before `fsp-srv` builds on it. |
+| proposed | **A narrow title API in `core`** in place of re-exporting the loader crate | `core` re-exports the whole loader and the app's tests depend on the loader directly; "frontends only see `core`" covers neither. |
+| proposed | **NUP follow-ups**: read the meta block's TLVs (and raise the 0-based against 1-based numbering upstream); parse only the NSO header for `inspect`; cap the total path bytes of a directory walk (names that are prefixes of one pooled string make it quadratic); `verify` says "damaged" for an I/O error; the tree depth limit of 128 is a guess | Review findings on #99. |
+| proposed, for the title-loading design | **Three rules for combining a title's packages**: an update replaces the whole ExeFS or overlays it; the highest version wins; how a base and its update are related by title id | The reader reports packages and leaves the choice to its caller. The first needs a ruling against the reference before a title is mapped. |
 
 ## House-rule candidates
 
@@ -171,3 +204,25 @@ passed to build agents as a provisional rule for the next wave.
 | adopted (lead, under delegation) | A freed resource is not reusable until every pending follow-up on it has run. |
 | adopted (lead, under delegation) | An id or pointer read from guest-writable or possibly corrupt data is validated against what was actually allocated, not just a range. |
 | dropped (lead, under delegation): covered by "report spec conflicts, don't resolve them" | When a spec prescribes a mechanism, follow it or report the conflict. |
+
+### From wave 8
+
+| Status | Rule |
+|---|---|
+| adopted (lead, under delegation) | Whatever saves state passes the same validity checks that restoring enforces, and restoring validates every relation between fields; each check is tested at its exact edge with the exact error. |
+| adopted (lead, under delegation) | Name a decoded bit position, shift or width once, as a constant shared by the decoder and the encoder; decode tests give each field a distinct value. |
+| adopted (lead, under delegation) | Mutation-check new tests: for each new branch, break it in a scratch copy and confirm a test fails. Never claim a test pins a property it cannot observe. |
+| dropped (lead, under delegation): covered by the cite-the-exact-check and mark-guesses rules | Trace the reference's actual code path (discarded results and soft asserts included) before stating what it does; state the exact condition under which a doc claim holds; keep the divergence list complete. |
+| dropped (lead, under delegation): covered by the error-path rule | Every early return releases what it holds, with a test that the resource is reusable afterwards. |
+| dropped (lead, under delegation): already a rule | Types with invariants deserialise through a validating constructor. |
+
+### From wave 9
+
+| Status | Rule |
+|---|---|
+| adopted (lead, under delegation) | When docs promise an order of checks, a test has both faults present at once. |
+| adopted (lead, under delegation) | A failed streaming read is sticky: every later read returns the same error, never a clean end of file. |
+| adopted (lead, under delegation) | Bound memory and time by what a hostile input can force, not only by loop counts. |
+| adopted (lead, under delegation) | A parser gets one hand-built accepting case per format feature, not only inputs made by the project's own builder or encoder. |
+| adopted (lead, under delegation) | User-facing errors and command output are plain words, not `Debug` forms, asserted as exact strings. |
+| dropped (lead, under delegation): covered by the both-sides-of-the-edge and name-the-test rules | Edge tests use the real alignment step; each "looser than the reference" item names its test. |
