@@ -1,8 +1,8 @@
 //! [`System`]: one program, loaded and run from start to finish.
 //!
 //! PROVISIONAL (walking skeleton, #74). A `System` is one NRO run once as one guest thread on
-//! one vCPU of the hypervisor backend, in its bring-up memory (the `image` and `machine`
-//! modules say what is provisional about each and what replaces it). It is the
+//! one vCPU of the hypervisor backend, in an address space of its own (the `image`, `space`
+//! and `machine` modules say what is provisional about each and what replaces it). It is the
 //! thinnest thing that joins the loader, the code patcher, the CPU backend, the kernel
 //! dispatcher and the event stream, so that later work widens something that runs.
 //!
@@ -16,6 +16,7 @@ use starquake_memory::Fault;
 
 use crate::image::{LoadError, Program};
 use crate::report::{RunOptions, RunReport};
+use crate::space::SpaceError;
 
 /// Why a program could not be loaded or started.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -35,6 +36,9 @@ pub enum Error {
     /// The program could not be copied into guest memory.
     #[error("the program could not be written into guest memory: {0}")]
     Memory(Fault),
+    /// The program's address space could not be built.
+    #[error("the program could not be mapped into guest memory: {0}")]
+    AddressSpace(#[from] SpaceError),
 }
 
 /// A loaded program, ready to run.
@@ -74,18 +78,23 @@ mod host {
     use std::sync::{Mutex, PoisonError};
     use std::time::Instant;
 
-    use starquake_cpu::Backend;
     use starquake_cpu::hvf::{HvfBackend, RamConfig};
+    use starquake_cpu::{Backend, Vcpu};
     use starquake_kernel::svc::tick::CNTFREQ;
     use starquake_loader::patch::CounterRescale;
 
     use super::Error;
-    use crate::image::{LoadError, Program, place};
+    use crate::image::{IMAGE_BASE, Program, place};
     use crate::machine;
     use crate::report::{RunOptions, RunReport};
+    use crate::space::AddressSpace;
 
     /// Held for the whole of a run: Hypervisor.framework allows one VM per process.
     static ONE_VM: Mutex<()> = Mutex::new(());
+
+    /// The address-space id of the one process. PROVISIONAL: kernel slice 8 (process creation)
+    /// hands ids out, within the width the backend reports (`HvfVcpu::asid_bits`).
+    const PROCESS_ASID: u16 = 1;
 
     pub(super) fn run(
         program: &Program,
@@ -93,9 +102,10 @@ mod host {
         started: Instant,
     ) -> Result<RunReport, Error> {
         let _one_vm = ONE_VM.lock().unwrap_or_else(PoisonError::into_inner);
-        // PROVISIONAL: the backend's default bring-up RAM (16 MiB), identity-mapped.
+        // PROVISIONAL: the backend's default guest RAM (16 MiB), and all of its table pool for
+        // the one address space.
         let backend = HvfBackend::new(RamConfig::default())?;
-        let ram = backend.memory();
+        let ram = backend.ram();
         // The guest rate is the one the kernel converts `GetSystemTick` with, so a patched
         // counter read and the system call tick at the same rate. (Their zero points still
         // differ; see the kernel spec, "Guest time".)
@@ -103,12 +113,19 @@ mod host {
             host_hz: backend.counter_frequency(),
             guest_hz: CNTFREQ,
         };
-        let ram_size = u64::try_from(ram.size()).map_err(|_| LoadError::Overflow)?;
-        let placed = place(program, ram.base(), ram_size, Some(counter))?;
-        placed.write_into(ram).map_err(Error::Memory)?;
+        // The program's window of virtual addresses is as large as RAM, so what fits one fits
+        // the other. Guest code sees each region with its own permissions; the loader writes
+        // through the address space's host view, which has none.
+        let placed = place(program, IMAGE_BASE, ram.size(), Some(counter))?;
+        let mut space = AddressSpace::new(backend.physical(), ram, backend.table_pool())?;
+        for region in &placed.regions {
+            space.map(region)?;
+        }
+        placed.write_into(&space).map_err(Error::Memory)?;
         // Declared after the backend, so it is dropped first, as the VM requires.
         let mut vcpu = backend.create_vcpu()?;
-        Ok(machine::run(&mut vcpu, ram, &placed, options, started))
+        vcpu.set_address_space(space.root(), PROCESS_ASID)?;
+        Ok(machine::run(&mut vcpu, &space, &placed, options, started))
     }
 }
 

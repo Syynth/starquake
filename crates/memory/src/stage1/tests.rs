@@ -592,6 +592,79 @@ fn freed_table_pages_are_not_reused_before_their_flush_is_taken() {
     assert_eq!(t.table_pages_in_use(), 3);
 }
 
+#[test]
+fn a_flush_that_runs_releases_the_freed_table_pages_and_one_that_fails_does_not() {
+    // As above: the pool is full until the level-3 and level-2 tables of the unmapped page can
+    // be reused.
+    let t = tables(3);
+    t.map(0, backing(0x10_0000, 1), Perms::ReadWrite).unwrap();
+    t.unmap(0, PAGE_SIZE).unwrap();
+    let elsewhere = va_of(1, 0, 0);
+    let owed = [FlushRange {
+        va: 0,
+        size: PAGE_SIZE,
+        leaf_only: false,
+    }];
+
+    // A flush that fails: it was offered the range, its error comes back, and nothing is
+    // forgotten or released.
+    let mut offered = Vec::new();
+    let failed = t.flush_pending_with(|ranges| {
+        offered.extend_from_slice(ranges);
+        Err("the vCPU failed")
+    });
+    assert_eq!(failed, Err("the vCPU failed"));
+    assert_eq!(offered, owed);
+    assert_eq!(
+        t.map(elsewhere, backing(0x20_0000, 1), Perms::Read),
+        Err(MapError::OutOfTablePages)
+    );
+
+    // The next flush is offered the same range again; once it has run, the pages are reusable
+    // and nothing is pending.
+    let mut offered = Vec::new();
+    let ran: Result<(), &str> = t.flush_pending_with(|ranges| {
+        offered.extend_from_slice(ranges);
+        Ok(())
+    });
+    assert_eq!(ran, Ok(()));
+    assert_eq!(offered, owed);
+    t.map(elsewhere, backing(0x20_0000, 1), Perms::Read)
+        .unwrap();
+    assert_eq!(t.table_pages_in_use(), 3);
+    assert_eq!(t.take_pending_flushes(), []);
+}
+
+#[test]
+fn a_flush_with_nothing_pending_does_not_run() {
+    let t = tables(3);
+    // `map` records nothing.
+    t.map(0, backing(0x10_0000, 1), Perms::ReadWrite).unwrap();
+    let mut calls = 0;
+    let ran: Result<(), &str> = t.flush_pending_with(|_| {
+        calls += 1;
+        Ok(())
+    });
+    assert_eq!((ran, calls), (Ok(()), 0));
+    // A range recorded by `protect` is offered once, then nothing is pending again.
+    t.protect(0, PAGE_SIZE, Perms::Read).unwrap();
+    for expected_calls in [1, 1] {
+        let ran: Result<(), &str> = t.flush_pending_with(|ranges| {
+            calls += 1;
+            assert_eq!(
+                ranges,
+                [FlushRange {
+                    va: 0,
+                    size: PAGE_SIZE,
+                    leaf_only: true
+                }]
+            );
+            Ok(())
+        });
+        assert_eq!((ran, calls), (Ok(()), expected_calls));
+    }
+}
+
 /// Memory that accepts a set number of writes and then faults, to hit the write phase's error
 /// path.
 #[derive(Debug)]

@@ -1,18 +1,28 @@
-//! Stage-1 translation tables for the bring-up address space.
+//! The static stage-1 translation tables for the backend's own pages: the EL1 shim and its
+//! scratch area, in the upper half of the address space (`TTBR1_EL1`).
 //!
-//! 4 KiB granule, 39-bit virtual addresses (`TCR_EL1.T0SZ` = 25), so the walk starts at level 1
-//! and every mapping is a level-3 page. Ported from `build_page_tables` in
-//! `tools/hvprobe/src/probe.rs`; descriptor fields are from the Arm Architecture Reference Manual
-//! (DDI 0487), "VMSAv8-64 translation table format descriptors".
+//! Guest address spaces are not built here: they are
+//! [`starquake_memory::stage1::Stage1Tables`], walked through `TTBR0_EL1`. These tables are
+//! separate so that nothing a guest's tables contain can affect the shim
+//! (`docs/specs/execution-model.md`, "Native backends"), and because the guest builder only
+//! writes pages that EL1 may not execute.
+//!
+//! 4 KiB granule, 39 bits of address per half (`TCR_EL1.T1SZ` = 25), so the walk starts at
+//! level 1 and every mapping is a level-3 page. Addresses here are offsets into the half: the
+//! table indices of an upper-half address are those of its low 39 bits. Ported from
+//! `build_page_tables` in `tools/hvprobe/src/probe.rs`; descriptor fields are from the Arm
+//! Architecture Reference Manual (DDI 0487), "VMSAv8-64 translation table format descriptors".
+//! The entries are global (`nG` clear): they do not belong to any guest address-space id.
 
 use super::LayoutError;
 
-/// Translation granule and page size.
-pub(super) const PAGE: u64 = 0x1000;
+/// Translation granule and page size: the guest's.
+pub(super) const PAGE: u64 = starquake_memory::PAGE_SIZE;
 /// Entries in one table.
 const ENTRIES: usize = 512;
-/// Highest virtual address the tables can map, plus one (`T0SZ` = 25).
-pub(super) const VA_LIMIT: u64 = 1 << 39;
+/// Size of one translated half of the address space (`T0SZ` = `T1SZ` = 25): the highest offset
+/// the tables can map, plus one. The same width guest tables translate.
+pub(super) const VA_LIMIT: u64 = starquake_memory::stage1::VA_SPACE_END;
 
 /// One 4 KiB translation table.
 pub(super) type Table = [u64; ENTRIES];
@@ -25,7 +35,8 @@ const AF: u64 = 1 << 10;
 const SH_INNER: u64 = 3 << 8;
 /// `AP[2:1]` = 0b00: read/write at EL1, no access at EL0.
 pub(super) const AP_EL1_RW: u64 = 0;
-/// `AP[2:1]` = 0b01: read/write at EL1 and EL0.
+/// `AP[2:1]` = 0b01: read/write at EL1 and EL0. Only tests map anything this way.
+#[cfg(test)]
 pub(super) const AP_ALL_RW: u64 = 1 << 6;
 /// `AP[2:1]` = 0b10: read-only at EL1, no access at EL0.
 pub(super) const AP_EL1_RO: u64 = 2 << 6;
@@ -36,9 +47,11 @@ pub(super) const UXN: u64 = 1 << 54;
 /// Output address bits 47:12.
 const ADDR_MASK: u64 = 0x0000_ffff_ffff_f000;
 
-/// A run of pages to map: `len` bytes of virtual addresses from `va` onto physical `pa`.
+/// A run of pages to map: `len` bytes from offset `va` of the translated half onto physical
+/// `pa`.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Region {
+    /// Offset into the half (the address's low 39 bits).
     pub va: u64,
     pub pa: u64,
     pub len: u64,
@@ -47,7 +60,7 @@ pub(super) struct Region {
 }
 
 /// Builds tables mapping `regions`. Table `i` of the result must be placed at physical address
-/// `tables_pa + i * PAGE`; table 0 is the root (`TTBR0_EL1`).
+/// `tables_pa + i * PAGE`; table 0 is the root (for `TTBR1_EL1`).
 pub(super) fn build(regions: &[Region], tables_pa: u64) -> Result<Vec<Table>, LayoutError> {
     let mut tables = vec![[0; ENTRIES]];
     for region in regions {

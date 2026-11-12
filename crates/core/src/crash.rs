@@ -9,13 +9,18 @@
 //!
 //! PROVISIONAL (walking skeleton, #74). Not here yet, and owned by the crash-report step of the
 //! observability spec's order of work: a backtrace by frame pointer, symbol names, and the events
-//! split per thread (there is one guest thread). The exception is only as detailed as the CPU
-//! backend's exits: an instruction abort arrives as a data-abort read, and every other exception
-//! as an undefined instruction, until the richer exit information of issue #36.
+//! split per thread (there is one guest thread). The exception is one of three kinds: a data
+//! abort, an instruction abort, and everything else as an undefined instruction. The CPU
+//! backend's exits now carry the exception's syndrome (which says whether an abort was a missing
+//! page or a refused access, and what an "undefined instruction" really was); putting it in the
+//! report is the crash-report step's.
 //!
 //! The JSON layout is this crate's own (the spec gives none), versioned by [`CRASH_VERSION`] and
 //! pinned by a test. Addresses and register values are hex strings, so no reader loses bits to a
-//! floating-point number.
+//! floating-point number. The `instruction_abort` kind was added without a new version: nothing
+//! was renamed or removed, and the reports of data aborts and undefined instructions are
+//! unchanged. (Before it, a fetch from an address nothing maps was reported as a `data_abort`
+//! read.)
 
 use std::fmt::Write as _;
 
@@ -59,14 +64,19 @@ impl std::fmt::Display for HexBytes<'_> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Exception {
-    /// A memory access that nothing maps (or, until issue #36, an instruction fetch that
-    /// nothing maps, reported as a read).
+    /// A load or store that nothing maps, or that the page's permissions refuse.
     DataAbort {
         /// The address the guest tried to access.
         #[serde(serialize_with = "hex")]
         address: u64,
         /// Whether the access was a write.
         write: bool,
+    },
+    /// An instruction fetch from an address that nothing maps, or that is not executable.
+    InstructionAbort {
+        /// The address the guest tried to execute.
+        #[serde(serialize_with = "hex")]
+        address: u64,
     },
     /// An instruction the guest may not execute: undefined, a breakpoint, a failed pointer
     /// authentication, a misaligned PC or SP.
@@ -138,8 +148,8 @@ pub struct CrashReport {
     pub pc: u64,
     /// That address as module plus offset, when it is inside a module.
     pub pc_location: Option<Location>,
-    /// For a data abort, the name of the mapping the faulting address is in; `null` when the
-    /// address is not mapped, and for other exceptions.
+    /// For a data abort or an instruction abort, the name of the mapping the faulting address
+    /// is in; `null` when the address is not mapped, and for other exceptions.
     pub fault_mapping: Option<String>,
     /// The registers at the exception.
     pub registers: Registers,
@@ -170,10 +180,12 @@ impl CrashReport {
             })
         });
         let fault_mapping = match exception {
-            Exception::DataAbort { address, .. } => memory_map
-                .iter()
-                .find(|mapping| mapping.contains(address))
-                .map(|mapping| mapping.name.clone()),
+            Exception::DataAbort { address, .. } | Exception::InstructionAbort { address } => {
+                memory_map
+                    .iter()
+                    .find(|mapping| mapping.contains(address))
+                    .map(|mapping| mapping.name.clone())
+            }
             Exception::UndefinedInstruction => None,
         };
         Self {
@@ -210,14 +222,24 @@ impl CrashReport {
     /// What happened, in a few words: `data abort, a write at address 0xdea8 (not mapped)`.
     #[must_use]
     pub fn exception_text(&self) -> String {
+        let block = || {
+            self.fault_mapping
+                .as_deref()
+                .map_or_else(|| "not mapped".to_owned(), |name| format!("in {name}"))
+        };
         match self.exception {
             Exception::DataAbort { address, write } => {
                 let access = if write { "write" } else { "read" };
-                let block = self
-                    .fault_mapping
-                    .as_deref()
-                    .map_or_else(|| "not mapped".to_owned(), |name| format!("in {name}"));
-                format!("data abort, a {access} at address {address:#x} ({block})")
+                format!(
+                    "data abort, a {access} at address {address:#x} ({})",
+                    block()
+                )
+            }
+            Exception::InstructionAbort { address } => {
+                format!(
+                    "instruction abort, a fetch at address {address:#x} ({})",
+                    block()
+                )
             }
             Exception::UndefinedInstruction => "undefined instruction".to_owned(),
         }
@@ -390,6 +412,28 @@ mod tests {
     }
 
     #[test]
+    fn an_instruction_abort_names_the_address_fetched_from_and_its_mapping() {
+        // A jump into the stack: mapped, not executable.
+        let report = report(Exception::InstructionAbort {
+            address: 0x80f0_0010,
+        });
+        assert_eq!(report.fault_mapping.as_deref(), Some("stack"));
+        assert!(
+            report
+                .to_text()
+                .contains("exception: instruction abort, a fetch at address 0x80f00010 (in stack)")
+        );
+        // A jump to an address nothing maps.
+        let report = super::tests::report(Exception::InstructionAbort { address: 0xdea8 });
+        assert_eq!(report.fault_mapping, None);
+        assert!(
+            report
+                .to_text()
+                .contains("exception: instruction abort, a fetch at address 0xdea8 (not mapped)")
+        );
+    }
+
+    #[test]
     fn a_pc_outside_every_module_has_no_location() {
         let mut regs = regs();
         // One past the module's last byte, and one below its first.
@@ -495,6 +539,14 @@ mod tests {
         assert_eq!(
             undefined,
             serde_json::json!({ "kind": "undefined_instruction" })
+        );
+        let fetch = serde_json::to_value(Exception::InstructionAbort {
+            address: 0x80f0_0010,
+        })
+        .unwrap();
+        assert_eq!(
+            fetch,
+            serde_json::json!({ "kind": "instruction_abort", "address": "0x80f00010" })
         );
         assert_eq!(report.version, CRASH_VERSION);
     }

@@ -45,9 +45,11 @@ pub(super) const REG_PC: u32 = 31;
 pub(super) const REG_CPSR: u32 = 34;
 
 // hv_sys_reg_t: (op0 << 14) | (op1 << 11) | (CRn << 7) | (CRm << 3) | op2
+pub(super) const ID_AA64MMFR0_EL1: u16 = 0xc038;
 pub(super) const SCTLR_EL1: u16 = 0xc080;
 pub(super) const CPACR_EL1: u16 = 0xc082;
 pub(super) const TTBR0_EL1: u16 = 0xc100;
+pub(super) const TTBR1_EL1: u16 = 0xc101;
 pub(super) const TCR_EL1: u16 = 0xc102;
 pub(super) const APIAKEYLO_EL1: u16 = 0xc108;
 pub(super) const APIAKEYHI_EL1: u16 = 0xc109;

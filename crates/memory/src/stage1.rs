@@ -226,6 +226,36 @@ impl<M: GuestMemory> Stage1Tables<M> {
         std::mem::take(&mut pool.pending)
     }
 
+    /// Offers the ranges recorded since the last flush to `execute`, oldest first, and, only if
+    /// it succeeds, forgets them and releases the table pages `unmap` unlinked for reuse.
+    ///
+    /// This is how a backend whose tables are live runs a flush: `execute` performs the
+    /// invalidations (on Hypervisor.framework, the EL1 shim's flush entry point). The tables
+    /// stay locked while it runs, so no `map`, `unmap` or `protect` from any thread comes
+    /// between handing out the ranges and executing them, and a freed table page is never
+    /// reused before the flush that covers it has run. If `execute` fails, its error is
+    /// returned and nothing is forgotten or released: the next call offers the same ranges
+    /// again.
+    ///
+    /// `execute` is not called when nothing is pending. It must not call back into these
+    /// tables: they are locked, and it would wait for itself.
+    pub fn flush_pending_with<E>(
+        &self,
+        execute: impl FnOnce(&[FlushRange]) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let mut pool = self.lock();
+        // Table pages are only unlinked by an `unmap`, which always records a range, so nothing
+        // pending means nothing quarantined either.
+        if pool.pending.is_empty() {
+            return Ok(());
+        }
+        execute(&pool.pending)?;
+        let pool = &mut *pool;
+        pool.pending.clear();
+        pool.free.append(&mut pool.quarantine);
+        Ok(())
+    }
+
     /// Resolves `va` through these tables with [`walk`].
     pub fn walk(&self, va: u64) -> Result<Resolved, WalkError> {
         walk(&self.memory, self.root, va)
