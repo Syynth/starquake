@@ -317,6 +317,9 @@ impl Drop for Watchdog {
     }
 }
 
+/// The exception an [`Exit::Undefined`] is reported as; its syndrome says what it really was.
+const UNDEFINED: Exception = Exception::UndefinedInstruction;
+
 /// How the loop ended.
 enum Ending {
     Exited,
@@ -630,9 +633,7 @@ fn drive<V: Vcpu, C: HostClock + Clone + 'static>(
                     return ending;
                 }
             }
-            Exit::Undefined { syndrome, .. } => {
-                return crashed(vcpu, Exception::UndefinedInstruction, syndrome);
-            }
+            Exit::Undefined { syndrome, .. } => return crashed(vcpu, UNDEFINED, syndrome),
             Exit::Interrupted => {
                 if watchdog.fired() {
                     return Ending::TimedOut;

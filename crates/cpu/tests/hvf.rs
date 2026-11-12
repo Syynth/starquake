@@ -1701,31 +1701,41 @@ fn a_new_vm_never_runs_the_previous_vms_code() {
 // FP/SIMD state and PSTATE: what a context switch saves and restores.
 // ---------------------------------------------------------------------------------------------
 
-/// `stp qT, qT+1, [x0], #32`: stores a pair of vector registers and steps x0 past them (Arm
-/// ARM, "STP (SIMD&FP)", post-index, opc = 0b10; `Rt` bits 4:0, `Rn` 9:5, `Rt2` 14:10).
-fn stp_q_pair(t: u32) -> u32 {
-    0xac81_0000 | ((t + 1) << 10) | t
+/// Vector register helpers. In a `cfg(test)` module so they may unwrap like the tests do.
+#[cfg(test)]
+mod vectors {
+    use super::VECTOR_REGS;
+
+    /// `stp qT, qT+1, [x0], #32`: stores a pair of vector registers and steps x0 past them
+    /// (Arm ARM, "STP (SIMD&FP)", post-index, opc = 0b10; `Rt` bits 4:0, `Rn` 9:5, `Rt2`
+    /// 14:10).
+    pub(crate) fn stp_q_pair(t: u32) -> u32 {
+        0xac81_0000 | ((t + 1) << 10) | t
+    }
+
+    /// `ldp qT, qT+1, [x0], #32`: the load of the same pair ("LDP (SIMD&FP)").
+    pub(crate) fn ldp_q_pair(t: u32) -> u32 {
+        0xacc1_0000 | ((t + 1) << 10) | t
+    }
+
+    /// The sixteen pair stores (or loads) that cover V0-V31, in register order.
+    pub(crate) fn every_vector_pair(pair: fn(u32) -> u32) -> Vec<u32> {
+        (0..u32::try_from(VECTOR_REGS).unwrap())
+            .step_by(2)
+            .map(pair)
+            .collect()
+    }
+
+    /// A value for `Vn` that differs from every other register's, and whose sixteen bytes all
+    /// differ (`n`, then `0x90`-`0x96`; `0x40 + n`, then `0xe0`-`0xe6`), so a swapped register,
+    /// half or byte order shows.
+    pub(crate) fn vector_value(n: usize) -> u128 {
+        let n = u128::try_from(n).unwrap();
+        (0xe6e5_e4e3_e2e1_e040_u128 + n) << 64 | (0x9695_9493_9291_9000_u128 + n)
+    }
 }
 
-/// `ldp qT, qT+1, [x0], #32`: the load of the same pair ("LDP (SIMD&FP)").
-fn ldp_q_pair(t: u32) -> u32 {
-    0xacc1_0000 | ((t + 1) << 10) | t
-}
-
-/// The sixteen pair stores (or loads) that cover V0-V31, in register order.
-fn every_vector_pair(pair: fn(u32) -> u32) -> Vec<u32> {
-    (0..u32::try_from(VECTOR_REGS).unwrap())
-        .step_by(2)
-        .map(pair)
-        .collect()
-}
-
-/// A value for `Vn` that differs from every other register's, and whose two halves and every
-/// byte position differ, so a swapped register, half or byte order shows.
-fn vector_value(n: usize) -> u128 {
-    let n = u128::try_from(n).unwrap();
-    (0x8f00_0000_0000_00a0_u128 + n) << 64 | (0x0123_4567_89ab_0000_u128 + (n << 8) + n)
-}
+use vectors::{every_vector_pair, ldp_q_pair, stp_q_pair, vector_value};
 
 /// `mrs x1, fpcr`, `mrs x2, fpsr`, `msr fpcr, x1`, `msr fpsr, x2` (assembled with LLVM).
 const MRS_X1_FPCR: u32 = 0xd53b_4401;
@@ -1757,8 +1767,10 @@ fn fp_state_set_by_the_host_is_what_the_guest_reads() {
     assert_eq!(vcpu.run().unwrap(), Exit::Svc(0));
     let mut stored = vec![0; VECTOR_REGS * 16];
     guest.memory().read(dump, &mut stored).unwrap();
-    for (n, bytes) in stored.chunks_exact(16).enumerate() {
-        assert_eq!(bytes, vector_value(n).to_le_bytes(), "v{n}");
+    let (registers, rest) = stored.as_chunks::<16>();
+    assert_eq!(rest, []);
+    for (n, bytes) in registers.iter().enumerate() {
+        assert_eq!(*bytes, vector_value(n).to_le_bytes(), "v{n}");
     }
     let x = vcpu.regs().unwrap().x;
     assert_eq!((x[1], x[2]), (FPCR_DN_FZ_RZ, FPSR_QC_IXC_DZC));
@@ -1898,17 +1910,12 @@ fn a_guest_that_enables_a_floating_point_trap_takes_it_on_this_host() {
     ];
     let mut vcpu = guest.vcpu(&program, |regs| regs.fpcr = 1 << 9);
     let pc = guest.base() + 8;
-    match vcpu.run().unwrap() {
-        Exit::Undefined { pc: at, syndrome } => {
-            assert_eq!(at, pc);
-            assert_eq!(
-                syndrome.class(),
-                ExceptionClass::Other(0x2c),
-                "{syndrome:x?}"
-            );
-        }
-        other => panic!("expected a trapped division, got {other:?}"),
-    }
+    let exit = vcpu.run().unwrap();
+    let trapped = match exit {
+        Exit::Undefined { pc: at, syndrome } => Some((at, syndrome.class())),
+        _ => None,
+    };
+    assert_eq!(trapped, Some((pc, ExceptionClass::Other(0x2c))), "{exit:?}");
     drop(vcpu);
     // Without the enable the same division only sets the flag (`FPSR.DZC`, bit 1).
     let mut vcpu = guest.vcpu(&program, |_| {});
