@@ -20,7 +20,7 @@ get the thinnest end-to-end run working, then widen it, so the pieces are proven
 
 Run `cargo xtask ci` (or `just ci`) from the repository root: fmt check, an unused-dependency
 check (the root `[workspace.dependencies]`, the dev, build and target tables, then `cargo machete`
-per crate), `cargo deny check`
+per crate), the host-access check (below), `cargo deny check`
 (licences, sources, advisories; `deny.toml`), clippy with `-D warnings` and the workspace lint
 set, nextest, doctests. CI runs exactly this.
 
@@ -49,6 +49,13 @@ set, nextest, doctests. CI runs exactly this.
 - `cargo deny` fetches the advisory database, so the gate needs network access. Offline, run
   `cargo xtask ci --offline` (or set `STARQUAKE_OFFLINE=1`): only the advisory check is skipped,
   and the output says so. CI refuses the switch.
+- The `host-access` step reads the non-test code of `crates/kernel`, `crates/services` and
+  `crates/gsv` and fails on a direct use of the host clock (`Instant::now`, `SystemTime::now`),
+  `std::fs`, `std::net`, thread sleeping or a random-number source (`rand`, `getrandom`,
+  `fastrand`, a `RandomState`). Read these through the injectable `Env` instead, or replay breaks
+  silently (`docs/specs/observability.md`). Test code is exempt, nothing else is; there is no
+  escape comment. The step is a text search, not a sandbox: `xtask/src/host_access.rs` lists
+  what it cannot see.
 - `cargo xtask ci` moves to the workspace root itself, so it also works from a subfolder (the
   alias then builds its binary in that folder's own `target/`, which is git-ignored).
 - `cargo xtask` builds its own binary in `target/xtask` inside the checkout, so worktrees that
@@ -81,6 +88,9 @@ Platform-specific code must still compile (or be `cfg`-gated) on Linux; check wi
   `shader`, `render`. `ipc` and `trace` are leaves (no workspace dependencies) that the layers
   above depend on; `testkit` is a dev-dependency only and depends on none of our crates. `core` wires everything; frontends depend only on `core`. No cycles, and no
   reaching around a layer.
+- Kernel and service code (`kernel`, `services`, `gsv`) is replayable: the clock, random numbers
+  and host file and network I/O come only through the injectable `Env`, never from `std`
+  directly. The gate's `host-access` step enforces it.
 - Guest-controlled values are untrusted: checked arithmetic and bounds on anything derived from
   guest memory, file contents or IPC words. A malformed input is an `Err`, never a panic.
   Check arithmetic for the whole extent written or read (start, end, trailing data), not just

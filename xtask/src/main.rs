@@ -6,6 +6,7 @@
     reason = "a command-line tool: progress and errors go to stderr"
 )]
 
+mod host_access;
 mod table_deps;
 mod tools;
 mod unused_deps;
@@ -196,6 +197,9 @@ enum Action {
     WorkspaceDependencies,
     /// Fail if a dev, build or target-specific dependency of a member is named by no source.
     TableDependencies,
+    /// Fail if kernel or service code reaches the host clock, randomness, file system or
+    /// network directly (`host_access`).
+    HostAccess,
     /// Run `cargo machete` and compare its findings with `xtask/unused-deps.toml`.
     Machete,
 }
@@ -292,6 +296,10 @@ fn steps(plan: Plan) -> Vec<Step> {
         Step {
             name: "table-deps",
             action: Action::TableDependencies,
+        },
+        Step {
+            name: "host-access",
+            action: Action::HostAccess,
         },
     ];
     if plan.machete {
@@ -545,6 +553,27 @@ fn table_dependencies() -> bool {
     verdict.is_clean()
 }
 
+/// Checks that kernel and service code does not reach the host directly. Returns whether the
+/// step passes.
+fn host_access() -> bool {
+    let violations = match host_access::check(Path::new(".")) {
+        Ok(violations) => violations,
+        Err(error) => {
+            eprintln!("{error}");
+            return false;
+        }
+    };
+    for violation in &violations {
+        eprintln!(
+            "{}:{}: {} reaches {}; kernel and service code reads the clock, randomness and host \
+             I/O only through the injectable Env (docs/specs/observability.md, \"Replaying the \
+             kernel and services\"). Test code is exempt.",
+            violation.file, violation.finding.line, violation.finding.path, violation.finding.what
+        );
+    }
+    violations.is_empty()
+}
+
 fn ci(offline: bool) -> ExitCode {
     let in_ci = std::env::var_os("CI").is_some();
     if let Err(refusal) = start(offline, in_ci) {
@@ -612,6 +641,13 @@ fn ci(offline: bool) -> ExitCode {
             Action::TableDependencies => {
                 eprintln!("==> {name}: dev, build and target dependencies against the sources");
                 table_dependencies()
+            }
+            Action::HostAccess => {
+                eprintln!(
+                    "==> {name}: no host clock, randomness, file or network access in {}",
+                    host_access::CRATES.join(", ")
+                );
+                host_access()
             }
             Action::Machete => {
                 eprintln!("==> {name}: cargo machete against xtask/unused-deps.toml");
@@ -821,6 +857,7 @@ mod tests {
                 "fmt",
                 "workspace-deps",
                 "table-deps",
+                "host-access",
                 "machete",
                 "deny",
                 "clippy",
@@ -843,6 +880,7 @@ mod tests {
                 "fmt",
                 "workspace-deps",
                 "table-deps",
+                "host-access",
                 "clippy",
                 "test",
                 "doctest"
@@ -866,6 +904,7 @@ mod tests {
             Some(&Action::WorkspaceDependencies)
         );
         assert_eq!(action_of("table-deps"), Some(&Action::TableDependencies));
+        assert_eq!(action_of("host-access"), Some(&Action::HostAccess));
         assert_eq!(action_of("machete"), Some(&Action::Machete));
     }
 
