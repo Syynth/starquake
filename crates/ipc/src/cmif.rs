@@ -12,7 +12,7 @@
 //!
 //! The domain request `size` field is the `SFCI` header plus the arguments. Eden never reads it;
 //! libnx writes the exact argument length and places the object ids straight after it, and
-//! [`DomainRequestHeader::size`] documents how [`crate::RequestBuilder`] differs.
+//! [`DomainRequestHeader::size`] documents what each [`crate::RequestLayout`] writes.
 
 use crate::error::{IpcError, Result};
 
@@ -83,7 +83,9 @@ pub struct DomainRequestHeader {
     /// How many object ids follow the arguments.
     pub input_object_count: u32,
     /// Bytes of `SFCI` header plus arguments that follow this header. libnx writes the exact
-    /// argument length; [`crate::RequestBuilder`] rounds it up to a whole word.
+    /// argument length (`libnx/nx/include/switch/sf/cmif.h:131`), as [`crate::RequestBuilder`]
+    /// does in [`crate::RequestLayout::Libnx`]; in [`crate::RequestLayout::Exact`] it rounds the
+    /// arguments up to a whole word.
     pub size: u32,
     /// The target object.
     pub object_id: u32,
