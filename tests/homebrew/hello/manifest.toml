@@ -7,10 +7,13 @@ devkitA64 = "r30-1"
 libnx = "4.12.0-1"
 switch-tools = "1.13.1-1"
 
+[elf]
+build-id = "3c0384181c86ca1ce86287208cdfa6e6100e8b4b"
+
 [sources]
 "hello.c" = "88e69311b1e3d182df46fcadf1d20636227692098293022f71f52eee40dc7705"
 "hello.json" = "49086cbd2327d921b6d29f7475bac310f3c6383e6af8b88a0c8ab6f9d6c142ae"
-"Makefile" = "50cedc45189e898a5b950fc6d650237203407b99a57110539f685e95cf1cfb69"
+"Makefile" = "6e1a2245765f2c9f3f4729b4b19c148a8c82be2e1f6d828ef780bf859ba4d406"
 
 [binaries]
 "hello.nro" = "d21c81c6e795ab9981e0757bf2b4b23184e974c30ded266e3098a468e7fb20df"

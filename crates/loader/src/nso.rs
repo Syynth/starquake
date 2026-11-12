@@ -19,12 +19,23 @@
 //!   the source for "relative to the start of rodata". Eden never reads them.
 //! - Compression flag bits 0 to 2 and the ZBIC bit 7: `NSOHeader::IsSegmentCompressed` and
 //!   `IsZBICCompressed`.
-//! - Hash-check flag bits 3 to 5 (hash over the decompressed segment), and the last words of the
-//!   first two segment headers being the module name offset and size: **SwitchBrew NSO page
-//!   only** (see "Documentation sources" in `docs/references.md`). Neither is in the pinned git
-//!   references and no fixture built from homebrew exercises them. Eden never checks hashes and
-//!   calls that word an `alignment`. `eden-nx2/tools/nx2/nso_syms.py` reads the third segment
-//!   header's last word as the bss size, which agrees with this parser.
+//! - Hash-check flag bits 3 to 5, with the hash taken over the decompressed segment: from the
+//!   SwitchBrew NSO page (see "Documentation sources" in `docs/references.md`), not in the pinned
+//!   git references (Eden never checks hashes). **Confirmed** against `tests/homebrew/hello/hello.nso`,
+//!   written by switch-tools' `elf2nso` (`crates/loader/tests/homebrew_fixture.rs`): it sets all
+//!   three bits, and each stored digest is the SHA-256 of the decompressed segment.
+//! - The third segment header's last word is the bss size: `eden-nx2/tools/nx2/nso_syms.py`
+//!   reads it that way, and in the fixture the data segment plus that size ends exactly where
+//!   its NRO twin's `MOD0` says `.bss` ends.
+//!
+//! # Module name
+//!
+//! SwitchBrew calls the last words of the first two segment headers the module name offset and
+//! size; Eden calls the word an `alignment`. The fixture **corrects** the old reading that the name
+//! is found through them: `elf2nso` writes 1 to both, and the name (`--nx-module-name` in
+//! libnx's `switch.specs`) is at the start of rodata, in the layout creport reads
+//! ([`Nso::module_path`]). The words stay exposed raw. Whether Nintendo's own tools put
+//! something else there is not known from any source here.
 //!
 //! The extents are exposed raw; [`Nso::extent_bytes`] resolves one against the decompressed
 //! rodata and returns `None` when it does not fit.
@@ -54,8 +65,9 @@ const HASHES_OFFSET: usize = 0xA0;
 /// Size of a SHA-256 digest.
 const HASH_SIZE: usize = 0x20;
 
-/// Flag bit `n` set: segment `n` is LZ4 compressed (`NSOHeader::IsSegmentCompressed`).
-const FLAG_COMPRESSED_SHIFT: u32 = 0;
+/// Flag bit `FLAG_COMPRESSED_SHIFT + n` set: segment `n` is LZ4 compressed
+/// (`NSOHeader::IsSegmentCompressed`).
+pub const FLAG_COMPRESSED_SHIFT: u32 = 0;
 /// Offset of the `.api_info` extent (`NSOHeader::api_info_extent`).
 const API_INFO_EXTENT_OFFSET: usize = 0x88;
 /// Offset of the `.dynstr` extent (`NSOHeader::dynstr_extent`).
@@ -65,12 +77,22 @@ const DYNSYM_EXTENT_OFFSET: usize = 0x98;
 /// Offset of the last word of a segment header (`NSOSegmentHeader`: alignment / bss size).
 const EXTRA_WORD: usize = 0xC;
 
-/// Flag bit `3 + n` set: segment `n`'s hash must be checked (SwitchBrew NSO page only; not in the
-/// pinned references).
-const FLAG_HASH_CHECK_SHIFT: u32 = 3;
+/// Flag bit `FLAG_HASH_CHECK_SHIFT + n` set: segment `n`'s SHA-256, over its decompressed bytes,
+/// must be checked. From the SwitchBrew NSO page; not in the pinned references, but confirmed
+/// by the homebrew fixture (see the module docs).
+pub const FLAG_HASH_CHECK_SHIFT: u32 = 3;
 /// Flag bit 7: the segments use ZBIC rather than LZ4 (`NSOHeader::IsZBICCompressed`, an Eden-only
 /// extension that this crate does not implement).
 const FLAG_ZBIC: u32 = 1 << 7;
+
+/// Offset, in rodata, of the module path's length word; the zero word before it is at 0
+/// (`ModulePath::path_length` in `atmosphere/stratosphere/creport/source/creport_modules.cpp`
+/// @ 4e3f3703, fact only).
+const MODULE_PATH_LENGTH_OFFSET: usize = 4;
+/// Offset, in rodata, of the module path's bytes (`ModulePath::path`, same source).
+const MODULE_PATH_OFFSET: usize = 8;
+/// Longest module path read (`ModulePathLengthMax = 0x200`, same source).
+pub const MODULE_PATH_MAX: usize = 0x200;
 
 /// LZ4 cannot expand data by more than about 255 times. A declared decompressed size past
 /// `compressed_len * 255 + 255` is rejected before allocating, so a tiny file cannot request a
@@ -111,13 +133,12 @@ pub struct Nso {
     pub build_id: [u8; 0x20],
     /// The raw header flags word (compression and hash-check bits).
     pub flags: u32,
-    /// Module name offset: the first segment header's last word. Eden calls this word an
-    /// alignment; SwitchBrew calls it the module name offset (see the module docs for the
-    /// sourcing). Exposed raw and not resolved: SwitchBrew does not say what the offset is
-    /// relative to.
+    /// The first segment header's last word, raw. SwitchBrew calls it the module name offset;
+    /// Eden calls it an alignment, and `elf2nso` writes 1 there (see "Module name" in the module
+    /// docs). The name itself is read by [`Nso::module_path`], not through this word.
     pub module_name_offset: u32,
-    /// Module name size: the second segment header's last word (same sourcing as
-    /// [`Nso::module_name_offset`]).
+    /// The second segment header's last word, raw. SwitchBrew calls it the module name size;
+    /// same caveats as [`Nso::module_name_offset`].
     pub module_name_size: u32,
     /// The `.api_info` extent (header offset 0x88), raw.
     pub api_info: RodataExtent,
@@ -137,6 +158,35 @@ impl Nso {
             u64::from(extent.offset),
             u64::from(extent.size),
         )
+    }
+
+    /// The module path stored at the start of rodata, or `None` when the module has none.
+    ///
+    /// Mirrors `ModuleList::GetModuleName` in
+    /// `atmosphere/stratosphere/creport/source/creport_modules.cpp` @ 4e3f3703 (fact only):
+    /// rodata starts with a zero word, a signed length and the path. There is no path when the
+    /// zero word is not zero or the length is not positive (`zero != 0 || path_length <= 0`).
+    /// The length is capped at [`MODULE_PATH_MAX`].
+    ///
+    /// creport first rejects an older layout, where the first 8 bytes are an offset from text to
+    /// the writable data. That check is left out because it cannot change the result here: a
+    /// path needs a zero low word and a positive length word, so those 8 bytes read as at least
+    /// 2^32, past any 32-bit NSO memory offset.
+    ///
+    /// Divergences from creport, each pinned by `module_path_divergences_from_creport`:
+    ///
+    /// - creport keeps only the part after the last `/` or `\`; this returns the whole path.
+    /// - creport reads a fixed 0x208 bytes from process memory; this reads only what the
+    ///   decompressed rodata holds, and a path that runs past its end is `None`.
+    pub fn module_path(&self) -> Option<&[u8]> {
+        let rodata = &self.rodata.data;
+        let zero =u32::from_le_bytes(read_array::<4>(rodata, 0)?);
+        let length = i32::from_le_bytes(read_array::<4>(rodata, MODULE_PATH_LENGTH_OFFSET)?);
+        if zero != 0 || length <= 0 {
+            return None;
+        }
+        let length = usize::try_from(length).ok()?.min(MODULE_PATH_MAX);
+        rodata.get(MODULE_PATH_OFFSET..MODULE_PATH_OFFSET.checked_add(length)?)
     }
 
     /// The segments in header order: text, rodata, data.
@@ -534,6 +584,73 @@ mod tests {
         // Build id at 0x40, rodata compressed size at 0x64.
         assert_eq!(file[0x41], 1);
         assert_eq!(&file[0x64..0x68], &le(RODATA.len()));
+    }
+
+    /// An NSO whose rodata is a module path header (zero word, `length`) followed by `tail`.
+    fn with_module_path(zero: u32, length: i32, tail: &[u8]) -> Nso {
+        let mut rodata = zero.to_le_bytes().to_vec();
+        rodata.extend_from_slice(&length.to_le_bytes());
+        rodata.extend_from_slice(tail);
+        Nso::parse(&build([plain(TEXT), plain(&rodata), plain(DATA)], 0)).unwrap()
+    }
+
+    fn signed(n: usize) -> i32 {
+        i32::try_from(n).unwrap()
+    }
+
+    #[test]
+    fn module_path_reads_the_creport_layout() {
+        let name = b"hello";
+        assert_eq!(
+            with_module_path(0, signed(name.len()), b"hello\0pad").module_path(),
+            Some(&name[..])
+        );
+        // Too short for the 8-byte header, a non-zero first word, a length that is not positive.
+        let short = Nso::parse(&build([plain(TEXT), plain(&[0; 7]), plain(DATA)], 0)).unwrap();
+        assert_eq!(short.module_path(), None);
+        assert_eq!(with_module_path(1, 5, b"hello").module_path(), None);
+        assert_eq!(with_module_path(0, 0, b"hello").module_path(), None);
+        assert_eq!(with_module_path(0, -1, b"hello").module_path(), None);
+        assert_eq!(with_module_path(0, i32::MIN, b"hello").module_path(), None);
+    }
+
+    #[test]
+    fn module_path_is_capped_at_the_creport_maximum() {
+        let long = vec![b'a'; MODULE_PATH_MAX + 1];
+        for length in [MODULE_PATH_MAX, MODULE_PATH_MAX + 1] {
+            let nso = with_module_path(0, signed(length), &long);
+            assert_eq!(nso.module_path(), Some(&long[..MODULE_PATH_MAX]));
+        }
+        assert_eq!(
+            with_module_path(0, signed(MODULE_PATH_MAX - 1), &long).module_path(),
+            Some(&long[..MODULE_PATH_MAX - 1])
+        );
+        // The largest length is capped before it is added to anything.
+        assert_eq!(
+            with_module_path(0, i32::MAX, &long).module_path(),
+            Some(&long[..MODULE_PATH_MAX])
+        );
+    }
+
+    #[test]
+    fn module_path_divergences_from_creport() {
+        // The whole path, not only the part after the last slash.
+        let path = b"sdmc:/switch/hello.nro";
+        assert_eq!(
+            with_module_path(0, signed(path.len()), path).module_path(),
+            Some(&path[..])
+        );
+        // A length that runs one byte past the end of rodata is no path at all; exactly to the
+        // end is fine.
+        assert_eq!(
+            with_module_path(0, signed(path.len() + 1), path).module_path(),
+            None
+        );
+        let short = vec![b'a'; MODULE_PATH_MAX - 1];
+        assert_eq!(
+            with_module_path(0, signed(MODULE_PATH_MAX), &short).module_path(),
+            None
+        );
     }
 
     #[test]

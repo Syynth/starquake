@@ -15,6 +15,7 @@ endif
 
 TOOLS := $(DEVKITPRO)/tools/bin
 CC := $(DEVKITPRO)/devkitA64/bin/aarch64-none-elf-gcc
+READELF := $(DEVKITPRO)/devkitA64/bin/aarch64-none-elf-readelf
 LIBNX := $(DEVKITPRO)/libnx
 
 # The flags of libnx's application template (examples/switch/templates/application/Makefile),
@@ -53,7 +54,8 @@ main.npdm: hello.json Makefile
 PACMAN := $(shell command -v dkp-pacman 2>/dev/null || command -v pacman 2>/dev/null)
 version = $(shell $(PACMAN) -Q $(1) 2>/dev/null | cut -d' ' -f2)
 
-manifest.toml: $(SOURCES) $(BINARIES)
+# The ELF's GNU build id is recorded so the tests can check where each format puts it.
+manifest.toml: $(SOURCES) $(BINARIES) build/hello.elf
 	@{ \
 	echo '# Written by `make` in this folder; do not edit by hand.'; \
 	echo '# crates/loader/tests/homebrew_fixture.rs fails when a file no longer matches.'; \
@@ -63,6 +65,9 @@ manifest.toml: $(SOURCES) $(BINARIES)
 	echo 'devkitA64 = "$(call version,devkitA64)"'; \
 	echo 'libnx = "$(call version,libnx)"'; \
 	echo 'switch-tools = "$(call version,switch-tools)"'; \
+	echo; \
+	echo '[elf]'; \
+	echo "build-id = \"$$($(READELF) -n build/hello.elf | sed -n 's/.*Build ID: //p')\""; \
 	echo; \
 	echo '[sources]'; \
 	for f in $(SOURCES); do echo "\"$$f\" = \"$$(shasum -a 256 $$f | cut -d' ' -f1)\""; done; \
