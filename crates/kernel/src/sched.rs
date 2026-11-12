@@ -36,10 +36,16 @@
 //!   saved while migration is disabled, `m_suspend_allowed_flags`): not in the spec's slices yet.
 //! - The waits in `SetCoreMask` and `SetActivity` after the scheduler lock is released (until
 //!   the thread is no longer running on a core it may not use, or stops running): the system
-//!   call layer, using [`Scheduler::running_on`].
-//! - Virtual-to-physical core translation (`VirtualToPhysicalCoreMap`) and the process core
-//!   mask checks of `svcSetThreadCoreMask`: the system call layer. Cores here are physical.
-//! - `RotateScheduledQueue` (time slicing), `Exit`, `Terminate`: slices 8 and 10.
+//!   call layer, using [`Scheduler::running_on`], once the core loop (slice 10) and the wait
+//!   path (slice 4) exist; `SetThreadCoreMask` leaves a marked seam (`crate::svc::thread`).
+//! - `RotateScheduledQueue` (time slicing): slice 10.
+//!
+//! Kernel slice 8 added the thread and process lifecycle (`scheduler/lifecycle.rs`): user
+//! threads with an owner process, a guest thread id and a thread-local region; starting,
+//! ending and destroying them; the processes' rows ([`crate::process::ProcessRecord`]); and the
+//! virtual half of `SetCoreMask` ([`Scheduler::set_virtual_core_mask`]), which translates the
+//! cores a program names to the physical cores here (`VirtualToPhysicalCoreMap`). The process
+//! core-mask checks of `svcSetThreadCoreMask` are in the system call layer.
 //! - Serialising the table for snapshots (observability spec): a follow-up, because a
 //!   deserialised queue must be validated link by link.
 //!
@@ -47,8 +53,10 @@
 //!
 //! Each is pinned by the named test in `sched/scheduler/tests.rs`.
 //! - Eden counts `IncrementScheduledCount` per process (`KProcess::m_schedule_count`) and
-//!   compares it with a thread's yield count. There is one count for the whole table here; with
-//!   one process the two are the same. Test: `yield_count_is_one_for_the_table`.
+//!   compares it with a thread's yield count, and so does this table
+//!   (test: `yield_count_is_per_process`). A thread made outside any process, which Eden's user
+//!   threads never are, uses one count the table keeps for all such threads. Test:
+//!   `threads_of_no_process_share_the_tables_yield_count`.
 //! - A yield by a thread that has no active core (possible only between `YieldToAnyThread` and
 //!   the core's next [`Scheduler::schedule`]) does nothing. Eden indexes the queues with core
 //!   `-1` there, which its `ASSERT(IsValidCore(core))` rejects. Test: `yield_without_active_core_is_a_no_op`.

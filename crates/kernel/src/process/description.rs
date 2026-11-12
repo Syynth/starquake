@@ -25,6 +25,10 @@
 //!   refused when the process is created ([`ProcessError::MainThreadCore`],
 //!   [`ProcessError::MainThreadPriority`]). Test:
 //!   `a_main_thread_outside_the_process_ranges_is_refused`.
+//! - A priority range ending past [`LOWEST_THREAD_PRIORITY`] is
+//!   [`KernelError::InvalidArgument`]. Eden's capability word has six bits for it, so it cannot
+//!   arise there, and Eden asserts it (`ASSERT(max_prio < Common::BitSize<u64>())`). Test:
+//!   `a_kernel_priority_or_one_past_the_lowest_is_an_invalid_argument`.
 //! - Only the 39-bit address space is built (`crate::memory::layout`); a description that asks
 //!   for another is [`ProcessError::AddressSpace`]. Eden lays the others out. Test:
 //!   `only_the_39_bit_address_space_is_accepted`.

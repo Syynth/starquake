@@ -10,18 +10,29 @@
 //! | `SetMemoryPermission` (0x02) | [`memory::set_memory_permission`] | the address space, exclusive |
 //! | `SetMemoryAttribute` (0x03) | [`memory::set_memory_attribute`] | the address space, exclusive |
 //! | `QueryMemory` (0x06) | [`memory::query_memory`] | the address space, shared, and guest memory |
+//! | `ExitProcess` (0x07) | [`process::exit_process`] | the handle table and the scheduler, both exclusive, and the process facts |
+//! | `CreateThread` (0x08) | [`thread::create_thread`] | the handle table, the address space and the scheduler, all exclusive, the process facts, guest memory and the calling core |
+//! | `StartThread` (0x09) | [`thread::start_thread`] | the handle table, shared, the scheduler, exclusive, and the calling core |
+//! | `ExitThread` (0x0a) | [`thread::exit_thread`] | the handle table and the scheduler, both exclusive, and the calling core |
+//! | `SleepThread` (0x0b) | [`thread::sleep_thread`] | the scheduler, exclusive, and the calling core |
 //! | `GetThreadPriority` (0x0c) | [`thread::get_thread_priority`] | the scheduler and the handle table, both shared |
+//! | `SetThreadPriority` (0x0d) | [`thread::set_thread_priority`] | the handle table, shared, the scheduler, exclusive, the process facts and the calling core |
+//! | `GetThreadCoreMask` (0x0e) | [`thread::get_thread_core_mask`] | the scheduler and the handle table, both shared, and the calling core |
+//! | `SetThreadCoreMask` (0x0f) | [`thread::set_thread_core_mask`] | the handle table, shared, the scheduler, exclusive, the process facts and the calling core |
 //! | `GetCurrentProcessorNumber` (0x10) | [`processor::get_current_processor_number`] | the calling core |
 //! | `CloseHandle` (0x16) | [`handle::close_handle`] | the handle table and the scheduler, both exclusive |
 //! | `GetSystemTick` (0x1e) | [`tick::get_system_tick`] | the dispatch's guest time |
+//! | `GetProcessId` (0x24) | [`process::get_process_id`] | the handle table and the scheduler, both shared, and the process facts |
+//! | `GetThreadId` (0x25) | [`thread::get_thread_id`] | the scheduler and the handle table, both shared, and the calling core |
 //! | `OutputDebugString` (0x27) | [`debug::output_debug_string`] | guest memory, a [`DebugSink`] and the dispatch's guest time |
 //! | `GetInfo` (0x29) | [`info::get_info`] | the handle table, the address space and the scheduler, all shared |
 //!
 //! Only the [dispatcher](crate::dispatch) calls them, decoding their arguments with the call's
 //! [`Convention`]. No system call reads the clock: the dispatcher reads it once per dispatch and
-//! passes the guest time to the calls that need it. `ExitProcess` (0x07) is implemented too,
-//! provisionally as a dispatcher arm with no function behind it (see the dispatcher's module
-//! docs). So are `ConnectToNamedPort` (0x1f) and `SendSyncRequest` (0x21): they are dispatcher
+//! passes the guest time to the calls that need it. The process facts
+//! ([`crate::tables::Processes`]) are no declared table: they never change, and the dispatcher
+//! hands the calls that check them a copy. `ConnectToNamedPort` (0x1f) and `SendSyncRequest`
+//! (0x21) are implemented too: they are dispatcher
 //! arms over the IPC table ([`crate::ipc`]), because `SendSyncRequest` releases the kernel lock
 //! while a server's handler runs (`dispatch::ipc` says how).
 

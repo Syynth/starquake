@@ -35,8 +35,8 @@
 //!   exist here, so that is [`RefError::NotReferenced`]. Test:
 //!   `a_closed_object_is_gone_and_its_id_is_stale`.
 //! - Destroying what the row named (a thread's row when its last reference closes) is not done
-//!   here: `Destroy` belongs to each kind's lifecycle, which the slice that builds the kind
-//!   ports. Closing the last reference frees the object's row and nothing else. Test:
+//!   here: closing the last reference frees the object's row and returns what it named, and
+//!   [`crate::sched::Scheduler::tear_down`] destroys that (a session, a thread). Test:
 //!   `closing_the_last_reference_frees_the_row_and_reports_what_it_named`.
 
 use std::num::NonZeroU32;

@@ -89,9 +89,12 @@ mod host {
     /// Held for the whole of a run: Hypervisor.framework allows one VM per process.
     static ONE_VM: Mutex<()> = Mutex::new(());
 
-    /// The address-space id of the one process. PROVISIONAL: kernel slice 8 (process creation)
-    /// hands ids out, within the width the backend reports (`HvfVcpu::asid_bits`).
-    const PROCESS_ASID: u16 = 1;
+    /// The address-space id of the one process: the first id the kernel's pool hands out
+    /// (`starquake_kernel::process::AsidPool`). PROVISIONAL: with one process per run nothing
+    /// is given back, so the loop does not keep a pool; the core loop of kernel slice 10 takes
+    /// ids from one, sized by the width the backend reports (`HvfVcpu::asid_bits`), and reports
+    /// each flush to it.
+    const PROCESS_ASID: u16 = starquake_kernel::process::asid::FIRST_ASID;
 
     /// The one address space of a run, as the loop drives it on the vCPU.
     impl GuestSpace<HvfVcpu> for AddressSpace<PhysicalMemory> {

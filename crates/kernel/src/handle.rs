@@ -23,9 +23,10 @@
 //!
 //! What this port does not carry over, so a later slice can add it where a system call needs it:
 //! `Reserve`/`Unreserve`/`Register` (two-step insertion used when a call must fail atomically),
-//! `GetObjectByIndex`, `GetMultipleObjects`, `GetObjectForIpc`, and `Finalize` (close every
-//! entry when a process dies). Objects are held as [`ObjectId`]s and reference counting goes
-//! through [`ObjectRefs`], see [`refs`].
+//! `GetObjectByIndex`, `GetMultipleObjects` and `GetObjectForIpc`. `Finalize` (close every
+//! entry when a process dies) is [`HandleTable::handles`], in `Finalize`'s order, with each
+//! handle removed by the process-exit path (`crate::svc::process`). Objects are held as
+//! [`ObjectId`]s and reference counting goes through [`ObjectRefs`], see [`refs`].
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
