@@ -64,6 +64,23 @@ pub struct Limits {
     pub max_bindings_per_bind_group: u32,
     /// Most workgroups of a dispatch in each dimension.
     pub max_compute_workgroups_per_dimension: u32,
+    /// Most uniform buffers one shader uses (wgpu-types 30.0.1 `limits.rs`,
+    /// `max_uniform_buffers_per_shader_stage`, 12 by default). The guest has 18 constant
+    /// buffers per stage (`MaxConstBuffers`, `maxwell_3d.h` @ cf654052), more than wgpu's
+    /// default, so the shader crate's mapping of them meets this limit.
+    pub max_uniform_buffers_per_stage: u32,
+    /// Most storage buffers one shader uses, read-only or writable
+    /// (`max_storage_buffers_per_shader_stage`, 8 by default in wgpu).
+    pub max_storage_buffers_per_stage: u32,
+    /// Most sampled textures one shader uses (`max_sampled_textures_per_shader_stage`, 16 by
+    /// default in wgpu).
+    pub max_sampled_textures_per_stage: u32,
+    /// Most storage textures one shader uses (`max_storage_textures_per_shader_stage`, 4 by
+    /// default in wgpu).
+    pub max_storage_textures_per_stage: u32,
+    /// Most samplers one shader uses, comparison samplers included
+    /// (`max_samplers_per_shader_stage`, 16 by default in wgpu).
+    pub max_samplers_per_stage: u32,
 }
 
 flag_set! {
@@ -109,6 +126,10 @@ flag_set! {
         ROBUST_IMAGE_ACCESS = 8,
         /// The mirror-once, clamp-to-edge sampler address mode.
         MIRROR_CLAMP_TO_EDGE = 9,
+        /// Samplers that return the minimum or maximum of the texels a filter reads instead of
+        /// their weighted average (Vulkan's `samplerFilterMinmax`). wgpu 30 has no sampler
+        /// reduction mode, so a wgpu device leaves this out.
+        SAMPLER_MIN_MAX_REDUCTION = 10,
     }
 }
 

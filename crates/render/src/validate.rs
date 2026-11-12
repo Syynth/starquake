@@ -16,10 +16,21 @@
 //! names and passes them to [`validate_copy`], [`validate_upload`], [`validate_readback`] and
 //! [`validate_rect`] as [`Resolved`] values.
 //!
-//! Rules that are this crate's own choice rather than a device limit, marked as such: a sampled
-//! texture's view format must keep the texture's block size and aspect (guess: Vulkan's
-//! "size-compatible" view rule, which wgpu narrows further; the wgpu backend may refuse more);
-//! texture data outside a texture is tightly packed ([`packed_size`]).
+//! Compatibility rules beyond the device's limits, with where each comes from:
+//!
+//! - Every view's format, whatever the view is used for, must have its texture's format's block
+//!   width, block height and bits per block, and the same aspect (this crate's choice; guess:
+//!   Vulkan's "size-compatible" view rule, which wgpu narrows further, so the wgpu backend may
+//!   refuse more). The view's format must also support the texture's sampled, storage and
+//!   render-target usages in [`Caps::formats`]; copy usages are checked on the texture's own
+//!   format only.
+//! - A texture-to-texture copy needs the same block size, the same aspect, the identical format
+//!   when the aspect is depth, stencil or both, equal sample counts and equal extents (Vulkan's
+//!   `vkCmdCopyImage` rules). Two colour formats of one block size may differ; wgpu allows only
+//!   formats that differ in sRGB, so the wgpu backend may refuse more.
+//! - The texture side of a buffer copy, an upload or a readback must have one sample, as both
+//!   Vulkan and wgpu require.
+//! - Texture data outside a texture is tightly packed ([`packed_size`]; this crate's choice).
 
 use crate::caps::{
     Caps, Features, FormatFeatures, GUEST_COLOR_TARGETS, GUEST_VERTEX_ATTRIBUTES,
@@ -33,8 +44,8 @@ use crate::error::RenderError;
 use crate::format::{FormatAspect, PixelFormat};
 use crate::pipeline::{GraphicsPipelineDesc, PolygonMode, RasterState, Topology, VertexLayout};
 use crate::resource::{
-    AddressMode, BorderColor, BufferDesc, Extent3d, SamplerDesc, TextureDesc, TextureDimension,
-    TextureUsage, ViewDesc, ViewDimension,
+    AddressMode, BorderColor, BufferDesc, Extent3d, ReductionMode, SamplerDesc, TextureDesc,
+    TextureDimension, TextureUsage, ViewDesc, ViewDimension,
 };
 use crate::shader::{InterfaceVariable, ResourceKind, ShaderDesc, ShaderStage};
 use crate::{BufferUsage, ResourceBinding};
@@ -218,7 +229,20 @@ pub fn validate_texture(caps: &Caps, desc: &TextureDesc) -> Result<(), RenderErr
             ));
         }
     }
-    for (usage, feature, name) in [
+    format_supports_usage(caps, desc.format, desc.usage)
+}
+
+/// Texture usages a view's format does not serve: copies go through the texture's own format.
+const COPY_USAGES: TextureUsage = TextureUsage::COPY_SRC.union(TextureUsage::COPY_DST);
+
+/// Checks that the device supports `format` for every usage in `usage`, in the order sampling,
+/// storage, render target, copy.
+fn format_supports_usage(
+    caps: &Caps,
+    format: PixelFormat,
+    usage: TextureUsage,
+) -> Result<(), RenderError> {
+    for (flag, feature, name) in [
         (TextureUsage::SAMPLED, FormatFeatures::SAMPLE, "sampling"),
         (
             TextureUsage::STORAGE,
@@ -233,8 +257,8 @@ pub fn validate_texture(caps: &Caps, desc: &TextureDesc) -> Result<(), RenderErr
         (TextureUsage::COPY_SRC, FormatFeatures::COPY, "copies"),
         (TextureUsage::COPY_DST, FormatFeatures::COPY, "copies"),
     ] {
-        if desc.usage.contains(usage) {
-            format_supports(caps, desc.format, feature, name)?;
+        if usage.contains(flag) {
+            format_supports(caps, format, feature, name)?;
         }
     }
     Ok(())
@@ -266,6 +290,7 @@ pub fn validate_view(
             "a view's format must store the same aspect as its texture's",
         ));
     }
+    format_supports_usage(caps, view.format, texture.usage.difference(COPY_USAGES))?;
     let mips = u64::from(texture.mip_levels);
     in_range("view mip count", view.mip_count.into(), 1, mips)?;
     within(
@@ -354,6 +379,14 @@ pub fn validate_sampler(caps: &Caps, desc: &SamplerDesc) -> Result<(), RenderErr
             AddressMode::Repeat | AddressMode::MirrorRepeat | AddressMode::ClampToEdge => {}
         }
     }
+    match desc.reduction {
+        ReductionMode::Average => {}
+        ReductionMode::Min | ReductionMode::Max => require(
+            caps,
+            Features::SAMPLER_MIN_MAX_REDUCTION,
+            "the minimum and maximum sampler reductions",
+        )?,
+    }
     if let BorderColor::Custom(c) = desc.border_color
         && !c.iter().all(|v| v.is_finite())
     {
@@ -431,7 +464,47 @@ fn check_interface(
     Ok(())
 }
 
-/// Checks a shader description: its stage against the device, and its interface tables.
+/// Resources of each kind in one shader against the device's per-stage limits, in the order
+/// uniform buffers, storage buffers, sampled textures, storage textures, samplers.
+fn check_resource_counts(caps: &Caps, resources: &[ResourceBinding]) -> Result<(), RenderError> {
+    // The position of each kind's limit in `limits` below; exhaustive, so a new kind must be
+    // given a limit.
+    let slot = |kind: &ResourceKind| match kind {
+        ResourceKind::UniformBuffer => 0,
+        ResourceKind::StorageBuffer { .. } => 1,
+        ResourceKind::SampledTexture { .. } => 2,
+        ResourceKind::StorageTexture { .. } => 3,
+        ResourceKind::Sampler { .. } => 4,
+    };
+    let l = &caps.limits;
+    let limits = [
+        (
+            l.max_uniform_buffers_per_stage,
+            "uniform buffers in one shader",
+        ),
+        (
+            l.max_storage_buffers_per_stage,
+            "storage buffers in one shader",
+        ),
+        (
+            l.max_sampled_textures_per_stage,
+            "sampled textures in one shader",
+        ),
+        (
+            l.max_storage_textures_per_stage,
+            "storage textures in one shader",
+        ),
+        (l.max_samplers_per_stage, "samplers in one shader"),
+    ];
+    for (i, (limit, what)) in limits.into_iter().enumerate() {
+        let used = resources.iter().filter(|r| slot(&r.kind) == i).count();
+        in_range(what, count(used), 0, limit.into())?;
+    }
+    Ok(())
+}
+
+/// Checks a shader description: its stage against the device, its resource counts per kind,
+/// and its interface tables.
 pub fn validate_shader(caps: &Caps, desc: &ShaderDesc) -> Result<(), RenderError> {
     stage_supported(caps, desc.stage)?;
     if desc.entry.is_empty() {
@@ -448,6 +521,7 @@ pub fn validate_shader(caps: &Caps, desc: &ShaderDesc) -> Result<(), RenderError
             format_supports(caps, format, FormatFeatures::STORAGE, "storage images")?;
         }
     }
+    check_resource_counts(caps, resources)?;
     let input_limit = (desc.stage == ShaderStage::Vertex)
         .then(|| ("vertex input location", vertex_attribute_limit(caps)));
     check_interface(
@@ -894,12 +968,28 @@ pub fn validate_copy(src: Resolved<'_>, dst: Resolved<'_>) -> Result<(), RenderE
                     "a texture copy needs formats with the same block size",
                 ));
             }
+            if s.format.aspect() != d.format.aspect() {
+                return Err(RenderError::Invalid(
+                    "a texture copy needs formats with the same aspect",
+                ));
+            }
+            if s.format.aspect() != FormatAspect::Color && s.format != d.format {
+                return Err(RenderError::Invalid(
+                    "a depth or stencil texture copy needs identical formats",
+                ));
+            }
+            if s.sample_count != d.sample_count {
+                return Err(RenderError::Invalid(
+                    "a texture copy needs equal sample counts",
+                ));
+            }
             if sr.extent != dr.extent {
                 return Err(RenderError::Invalid("a texture copy needs equal extents"));
             }
             Ok(())
         }
         (Resolved::Buffer { .. }, Resolved::Texture { .. }) => {
+            buffer_copyable(dst)?;
             if src_bytes == dst_bytes {
                 Ok(())
             } else {
@@ -911,6 +1001,7 @@ pub fn validate_copy(src: Resolved<'_>, dst: Resolved<'_>) -> Result<(), RenderE
             }
         }
         (Resolved::Texture { .. } | Resolved::Buffer { .. }, Resolved::Buffer { .. }) => {
+            buffer_copyable(src)?;
             if src_bytes == dst_bytes {
                 Ok(())
             } else {
@@ -928,6 +1019,7 @@ pub fn validate_copy(src: Resolved<'_>, dst: Resolved<'_>) -> Result<(), RenderE
 /// a copy destination, and the slice exactly the bytes it needs.
 pub fn validate_upload(staging_len: u64, dst: Resolved<'_>) -> Result<(), RenderError> {
     let needed = check_side(Side::Destination, dst)?;
+    buffer_copyable(dst)?;
     if staging_len == needed {
         Ok(())
     } else {
@@ -939,9 +1031,23 @@ pub fn validate_upload(staging_len: u64, dst: Resolved<'_>) -> Result<(), Render
     }
 }
 
-/// Checks a readback source: in bounds and created as a copy source.
+/// Checks a readback source: in bounds, created as a copy source, and, for a texture,
+/// single-sampled.
 pub fn validate_readback(src: Resolved<'_>) -> Result<(), RenderError> {
-    check_side(Side::Source, src).map(|_| ())
+    check_side(Side::Source, src)?;
+    buffer_copyable(src)
+}
+
+/// Checks one side of a copy whose other side is a buffer (a buffer copy, an upload or a
+/// readback): a texture must have one sample, because Vulkan's `vkCmdCopyBufferToImage` and
+/// `vkCmdCopyImageToBuffer` and wgpu's buffer copies refuse multisampled images.
+fn buffer_copyable(side: Resolved<'_>) -> Result<(), RenderError> {
+    match side {
+        Resolved::Texture { desc, .. } if desc.sample_count != 1 => Err(RenderError::Invalid(
+            "a texture copied to or from a buffer must have one sample",
+        )),
+        Resolved::Texture { .. } | Resolved::Buffer { .. } => Ok(()),
+    }
 }
 
 /// Checks that `rect` lies inside a `width` by `height` image (a blit, clear or present

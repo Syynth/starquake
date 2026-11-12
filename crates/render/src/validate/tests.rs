@@ -42,6 +42,11 @@ fn caps() -> Caps {
             max_bind_groups: 4,
             max_bindings_per_bind_group: 9,
             max_compute_workgroups_per_dimension: 65_535,
+            max_uniform_buffers_per_stage: 8,
+            max_storage_buffers_per_stage: 7,
+            max_sampled_textures_per_stage: 6,
+            max_storage_textures_per_stage: 5,
+            max_samplers_per_stage: 3,
         },
         features: Features::ALL,
         stages: StageSupport::ALL,
@@ -488,6 +493,17 @@ fn view_format_must_match_block_and_aspect() {
             "a view's format must have the same block size as its texture's"
         ))
     );
+    // Same bits and block width, different block height.
+    assert_eq!(
+        validate_view(
+            &c,
+            &astc,
+            &view(PixelFormat::Astc2d8x5Unorm, ViewDimension::D2, (0, 1))
+        ),
+        Err(RenderError::Invalid(
+            "a view's format must have the same block size as its texture's"
+        ))
+    );
     // Same block size, different aspect.
     assert_eq!(
         validate_view(
@@ -498,6 +514,68 @@ fn view_format_must_match_block_and_aspect() {
         Err(RenderError::Invalid(
             "a view's format must store the same aspect as its texture's"
         ))
+    );
+}
+
+#[test]
+fn view_format_needs_format_support() {
+    let shared = PixelFormat::E5B9G9R9Float;
+    let t = TextureDesc {
+        usage: TextureUsage::SAMPLED | TextureUsage::RENDER_TARGET,
+        ..texture(TextureDimension::D2, 8, 8, 1)
+    };
+    let v = view(shared, ViewDimension::D2, (0, 1));
+    let with = |features| {
+        let mut c = caps();
+        c.formats.set(shared, features);
+        c
+    };
+    assert_eq!(validate_view(&with(FormatFeatures::ALL), &t, &v), Ok(()));
+    assert_eq!(
+        validate_view(&with(FormatFeatures::EMPTY), &t, &v),
+        Err(RenderError::FormatUnsupported {
+            format: shared,
+            usage: "sampling"
+        })
+    );
+    assert_eq!(
+        validate_view(&with(FormatFeatures::SAMPLE), &t, &v),
+        Err(RenderError::FormatUnsupported {
+            format: shared,
+            usage: "render targets"
+        })
+    );
+    assert_eq!(
+        validate_view(
+            &with(FormatFeatures::SAMPLE | FormatFeatures::RENDER),
+            &t,
+            &v
+        ),
+        Ok(())
+    );
+    let storage = TextureDesc {
+        usage: TextureUsage::STORAGE,
+        ..t
+    };
+    assert_eq!(
+        validate_view(&with(FormatFeatures::EMPTY), &storage, &v),
+        Err(RenderError::FormatUnsupported {
+            format: shared,
+            usage: "storage images"
+        })
+    );
+    assert_eq!(
+        validate_view(&with(FormatFeatures::STORAGE), &storage, &v),
+        Ok(())
+    );
+    // Copies go through the texture's own format, so a view format needs no copy support.
+    let copied = TextureDesc {
+        usage: TextureUsage::SAMPLED | TextureUsage::COPY_SRC | TextureUsage::COPY_DST,
+        ..t
+    };
+    assert_eq!(
+        validate_view(&with(FormatFeatures::SAMPLE), &copied, &v),
+        Ok(())
     );
 }
 
@@ -769,6 +847,33 @@ fn sampler_address_modes_need_features() {
 }
 
 #[test]
+fn sampler_reduction_needs_the_feature() {
+    for mode in [ReductionMode::Min, ReductionMode::Max] {
+        let s = SamplerDesc {
+            reduction: mode,
+            ..sampler()
+        };
+        let mut c = caps();
+        assert_eq!(validate_sampler(&c, &s), Ok(()), "{mode:?}");
+        c.features = Features::ALL.difference(Features::SAMPLER_MIN_MAX_REDUCTION);
+        assert_eq!(
+            validate_sampler(&c, &s),
+            Err(RenderError::MissingFeature(
+                "the minimum and maximum sampler reductions"
+            )),
+            "{mode:?}"
+        );
+    }
+    let mut c = caps();
+    c.features = Features::EMPTY;
+    assert_eq!(
+        validate_sampler(&c, &sampler()),
+        Ok(()),
+        "the average needs no feature"
+    );
+}
+
+#[test]
 fn custom_border_colour_is_finite() {
     let c = caps();
     let s = |color| SamplerDesc {
@@ -913,6 +1018,105 @@ fn shader_binding_edges() {
     assert_eq!(
         not_below("binding", 9, 9).to_string(),
         "binding 9 is not below 9"
+    );
+}
+
+/// Each resource kind with its per-stage limit and the name its error uses.
+fn per_stage_kinds(c: &Caps) -> [(ResourceKind, ResourceKind, u32, &'static str); 5] {
+    let l = &c.limits;
+    let sampled = |multisampled| ResourceKind::SampledTexture {
+        dimension: ViewDimension::D2,
+        sample: SampleKind::Float { filterable: true },
+        multisampled,
+    };
+    let storage_texture = |writable| ResourceKind::StorageTexture {
+        dimension: ViewDimension::D2,
+        format: PixelFormat::R32Float,
+        writable,
+    };
+    [
+        (
+            ResourceKind::UniformBuffer,
+            ResourceKind::UniformBuffer,
+            l.max_uniform_buffers_per_stage,
+            "uniform buffers in one shader",
+        ),
+        (
+            ResourceKind::StorageBuffer { writable: false },
+            ResourceKind::StorageBuffer { writable: true },
+            l.max_storage_buffers_per_stage,
+            "storage buffers in one shader",
+        ),
+        (
+            sampled(false),
+            sampled(true),
+            l.max_sampled_textures_per_stage,
+            "sampled textures in one shader",
+        ),
+        (
+            storage_texture(false),
+            storage_texture(true),
+            l.max_storage_textures_per_stage,
+            "storage textures in one shader",
+        ),
+        (
+            ResourceKind::Sampler { comparison: false },
+            ResourceKind::Sampler { comparison: true },
+            l.max_samplers_per_stage,
+            "samplers in one shader",
+        ),
+    ]
+}
+
+/// `count` resources at distinct slots, starting after `skip` slots, alternating `a` and `b`.
+fn resources_of(
+    c: &Caps,
+    skip: u32,
+    count: u32,
+    (a, b): (ResourceKind, ResourceKind),
+) -> Vec<ResourceBinding> {
+    let per_group = c.limits.max_bindings_per_bind_group;
+    (skip..skip + count)
+        .map(|i| {
+            let kind = if i % 2 == 0 { a } else { b };
+            resource(i / per_group, i % per_group, kind)
+        })
+        .collect()
+}
+
+#[test]
+fn shader_resource_count_edges() {
+    let c = caps();
+    let compute = |resources| {
+        shader(
+            ShaderStage::Compute,
+            ShaderInterface {
+                resources,
+                ..ShaderInterface::default()
+            },
+        )
+    };
+    for (a, b, limit, what) in per_stage_kinds(&c) {
+        assert_eq!(
+            validate_shader(&c, &compute(resources_of(&c, 0, limit, (a, b)))),
+            Ok(()),
+            "{what} at the limit"
+        );
+        assert_eq!(
+            validate_shader(&c, &compute(resources_of(&c, 0, limit + 1, (a, b)))),
+            Err(out_of_range(what, n(limit + 1), 0, n(limit))),
+        );
+    }
+    // Every kind at its limit at once: each kind is counted on its own.
+    let mut all = Vec::new();
+    for (a, b, limit, _) in per_stage_kinds(&c) {
+        let skip = u32::try_from(all.len()).expect("small");
+        all.extend(resources_of(&c, skip, limit, (a, b)));
+    }
+    assert_eq!(validate_shader(&c, &compute(all)), Ok(()));
+    assert_eq!(
+        out_of_range("samplers in one shader", 4, 0, 3).to_string(),
+        "samplers in one shader 4 is outside 0..=3"
     );
 }
 
@@ -2336,6 +2540,8 @@ fn texture_copies_need_matching_blocks_and_extents() {
     let r = region(1, 0, (0, 0, 0), (4, 4, 1));
     let r2 = region(2, 0, (4, 4, 1), (4, 4, 1));
     let taller = region(2, 0, (0, 0, 0), (4, 5, 1));
+    // Same width and height, one more layer (the texture has two).
+    let deeper = region(2, 0, (0, 0, 0), (4, 4, 2));
     let res = |desc, region| Resolved::Texture { desc, region };
     assert_eq!(validate_copy(res(&a, &r), res(&same_size, &r2)), Ok(()));
     assert_eq!(
@@ -2348,6 +2554,109 @@ fn texture_copies_need_matching_blocks_and_extents() {
         validate_copy(res(&a, &r), res(&a, &taller)),
         Err(RenderError::Invalid("a texture copy needs equal extents"))
     );
+    assert_eq!(
+        validate_copy(res(&a, &r), res(&a, &deeper)),
+        Err(RenderError::Invalid("a texture copy needs equal extents"))
+    );
+    assert_eq!(validate_copy(res(&a, &deeper), res(&a, &deeper)), Ok(()));
+    // Same block width and bits per block, different block height.
+    let astc_8x8 = copy_texture(PixelFormat::Astc2d8x8Unorm, usage);
+    let astc_8x5 = copy_texture(PixelFormat::Astc2d8x5Unorm, usage);
+    let whole = region(1, 0, (0, 0, 0), (16, 16, 1));
+    assert_eq!(astc_8x8.format.block_width(), astc_8x5.format.block_width());
+    assert_eq!(
+        astc_8x8.format.bits_per_block(),
+        astc_8x5.format.bits_per_block()
+    );
+    assert_eq!(
+        validate_copy(res(&astc_8x5, &whole), res(&astc_8x5, &whole)),
+        Ok(())
+    );
+    assert_eq!(
+        validate_copy(res(&astc_8x8, &whole), res(&astc_8x5, &whole)),
+        Err(RenderError::Invalid(
+            "a texture copy needs formats with the same block size"
+        ))
+    );
+}
+
+#[test]
+fn texture_copies_need_matching_aspects_and_samples() {
+    let usage = TextureUsage::COPY_SRC | TextureUsage::COPY_DST;
+    let r = region(1, 0, (0, 0, 0), (4, 4, 1));
+    let res = |desc, region| Resolved::Texture { desc, region };
+    let depth = copy_texture(PixelFormat::D32Float, usage);
+    let colour = copy_texture(PixelFormat::R32Float, usage);
+    let other_depth = copy_texture(PixelFormat::X8D24Unorm, usage);
+    let colour_uint = copy_texture(PixelFormat::R32Uint, usage);
+    // Each pair has the same block size, so only the aspect or the format differs.
+    assert_eq!(validate_copy(res(&depth, &r), res(&depth, &r)), Ok(()));
+    assert_eq!(
+        validate_copy(res(&colour, &r), res(&colour_uint, &r)),
+        Ok(()),
+        "colour formats of one block size may differ"
+    );
+    for (src, dst) in [(&depth, &colour), (&colour, &depth)] {
+        assert_eq!(
+            validate_copy(res(src, &r), res(dst, &r)),
+            Err(RenderError::Invalid(
+                "a texture copy needs formats with the same aspect"
+            ))
+        );
+    }
+    for (src, dst) in [(&depth, &other_depth), (&other_depth, &depth)] {
+        assert_eq!(
+            validate_copy(res(src, &r), res(dst, &r)),
+            Err(RenderError::Invalid(
+                "a depth or stencil texture copy needs identical formats"
+            ))
+        );
+    }
+    let single = copy_texture(PixelFormat::A8B8G8R8Unorm, usage);
+    let multi = TextureDesc {
+        sample_count: 4,
+        ..single
+    };
+    assert_eq!(validate_copy(res(&multi, &r), res(&multi, &r)), Ok(()));
+    assert_eq!(validate_copy(res(&single, &r), res(&single, &r)), Ok(()));
+    for (src, dst) in [(&multi, &single), (&single, &multi)] {
+        assert_eq!(
+            validate_copy(res(src, &r), res(dst, &r)),
+            Err(RenderError::Invalid(
+                "a texture copy needs equal sample counts"
+            ))
+        );
+    }
+}
+
+#[test]
+fn buffer_copies_need_single_sampled_textures() {
+    let format = PixelFormat::A8B8G8R8Unorm;
+    let single = copy_texture(format, TextureUsage::COPY_SRC | TextureUsage::COPY_DST);
+    let multi = TextureDesc {
+        sample_count: 4,
+        ..single
+    };
+    let b = buffer(1024);
+    let r = region(1, 0, (0, 0, 0), (2, 3, 1));
+    let needed = packed_size(format, r.extent).expect("fits");
+    let s = slice(needed);
+    let buf = Resolved::Buffer {
+        desc: &b,
+        slice: &s,
+    };
+    let tex = |desc| Resolved::Texture { desc, region: &r };
+    let refused = Err(RenderError::Invalid(
+        "a texture copied to or from a buffer must have one sample",
+    ));
+    assert_eq!(validate_copy(buf, tex(&single)), Ok(()));
+    assert_eq!(validate_copy(tex(&single), buf), Ok(()));
+    assert_eq!(validate_upload(needed, tex(&single)), Ok(()));
+    assert_eq!(validate_readback(tex(&single)), Ok(()));
+    assert_eq!(validate_copy(buf, tex(&multi)), refused);
+    assert_eq!(validate_copy(tex(&multi), buf), refused);
+    assert_eq!(validate_upload(needed, tex(&multi)), refused);
+    assert_eq!(validate_readback(tex(&multi)), refused);
 }
 
 #[test]
@@ -2499,13 +2808,14 @@ proptest! {
         let _ = validate_view(&caps(), &t, &v);
     }
 
-    /// A region that validates lies inside its mip level, so `packed_size` of it is the bytes
-    /// a tightly packed copy of it holds.
+    /// A region built inside its mip level (block-aligned origin; whole blocks, or up to the
+    /// edge) validates, and `packed_size` of it is the bytes a tightly packed copy of it holds.
+    /// One texel more than reaches the edge is refused.
     #[test]
     fn valid_regions_fit_their_mip(
-        w in 1..64_u32, h in 1..64_u32, layers in 1..8_u32, mip in 0..7_u32,
-        ox in 0..64_u32, oy in 0..64_u32, oz in 0..8_u32,
-        ew in 1..64_u32, eh in 1..64_u32, ed in 1..8_u32,
+        w in 1..64_u32, h in 1..64_u32, layers in 1..8_u32, mip_pick in any::<u32>(),
+        ox_pick in any::<u32>(), oy_pick in any::<u32>(), oz_pick in any::<u32>(),
+        ew_pick in any::<u32>(), eh_pick in any::<u32>(), ed_pick in any::<u32>(),
         format in 0..PixelFormat::ALL.len(),
     ) {
         let t = TextureDesc {
@@ -2516,15 +2826,31 @@ proptest! {
             sample_count: 1,
             usage: TextureUsage::ALL,
         };
+        let mip = mip_pick % t.mip_levels;
+        let m = t.mip_extent(mip).expect("mip below the chain");
+        // An origin on a block boundary inside the level, and a length of whole blocks or
+        // up to the edge (picked when the length pick is 0).
+        let place = |size: u32, block: u32, origin_pick: u32, len_pick: u32| {
+            let origin = origin_pick % size.div_ceil(block) * block;
+            let rest = size - origin;
+            let blocks = len_pick % (rest / block + 1);
+            (origin, if blocks == 0 { rest } else { blocks * block })
+        };
+        let (ox, ew) = place(m.width, t.format.block_width(), ox_pick, ew_pick);
+        let (oy, eh) = place(m.height, t.format.block_height(), oy_pick, eh_pick);
+        let (oz, ed) = place(m.depth_or_layers, 1, oz_pick, ed_pick);
         let r = region(1, mip, (ox, oy, oz), (ew, eh, ed));
-        if validate_texture_region(&t, &r).is_ok() {
-            let m = t.mip_extent(mip).expect("validated mip");
-            prop_assert!(ox + ew <= m.width && oy + eh <= m.height && oz + ed <= m.depth_or_layers);
-            let bytes = packed_size(t.format, r.extent).expect("small");
-            let blocks = u64::from(ew.div_ceil(t.format.block_width()))
-                * u64::from(eh.div_ceil(t.format.block_height()))
-                * u64::from(ed);
-            prop_assert_eq!(bytes, blocks * u64::from(t.format.bytes_per_block()));
-        }
+        prop_assert_eq!(validate_texture_region(&t, &r), Ok(()));
+        prop_assert!(ox + ew <= m.width && oy + eh <= m.height && oz + ed <= m.depth_or_layers);
+        let bytes = packed_size(t.format, r.extent).expect("small");
+        let blocks = u64::from(ew.div_ceil(t.format.block_width()))
+            * u64::from(eh.div_ceil(t.format.block_height()))
+            * u64::from(ed);
+        prop_assert_eq!(bytes, blocks * u64::from(t.format.bytes_per_block()));
+        let past = region(1, mip, (ox, oy, oz), (m.width - ox + 1, eh, ed));
+        prop_assert_eq!(
+            validate_texture_region(&t, &past),
+            Err(past_end("texture region width", n(m.width) + 1, n(m.width)))
+        );
     }
 }
