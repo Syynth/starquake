@@ -319,6 +319,9 @@ mod tests {
                 | SvcId::GetCurrentProcessorNumber
                 | SvcId::SignalEvent
                 | SvcId::ClearEvent
+                | SvcId::MapSharedMemory
+                | SvcId::UnmapSharedMemory
+                | SvcId::CreateTransferMemory
                 | SvcId::CloseHandle
                 | SvcId::ResetSignal
                 | SvcId::WaitSynchronization

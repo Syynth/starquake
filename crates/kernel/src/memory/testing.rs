@@ -123,6 +123,16 @@ impl MapperLog {
     }
 }
 
+/// Shared memory pages of `size` bytes in host memory of their own, with no address space
+/// behind them: what a fake kernel that has no [`Mapper`] hands a service. `None` unless `size`
+/// is whole pages and not zero. The pages are allocated at once, so a test asks for few.
+#[must_use]
+pub fn standalone_shared_pages(size: u64) -> Option<SharedPages> {
+    let backing = BackingRange::new(0, size).ok()?;
+    let memory = FlatMemory::new(0, usize::try_from(size).ok()?);
+    Some(SharedPages::new(backing, Arc::new(memory)))
+}
+
 /// See [`MapperLog::shared_view`].
 #[derive(Debug, Clone)]
 pub struct SharedView(MapperLog);

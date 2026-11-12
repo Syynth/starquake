@@ -141,17 +141,32 @@ impl SharedPages {
         // `offset < size` here unless `len` is zero, and `base + size` does not overflow.
         self.backing.base().checked_add(offset).ok_or(outside)
     }
+
+    /// Copies `buf.len()` bytes at `offset` into `buf`: [`GuestMemory::read`], callable without
+    /// the trait (a service crate need not depend on the memory crate for it).
+    pub fn read(&self, offset: u64, buf: &mut [u8]) -> Result<(), Fault> {
+        let at = self.physical(offset, buf.len())?;
+        self.memory
+            .read(at, buf)
+            .map_err(|_| Fault { address: offset })
+    }
+
+    /// Copies `data` to `offset`: [`GuestMemory::write`], callable without the trait.
+    pub fn write(&self, offset: u64, data: &[u8]) -> Result<(), Fault> {
+        let at = self.physical(offset, data.len())?;
+        self.memory
+            .write(at, data)
+            .map_err(|_| Fault { address: offset })
+    }
 }
 
 impl GuestMemory for SharedPages {
     fn read(&self, va: u64, buf: &mut [u8]) -> Result<(), Fault> {
-        let at = self.physical(va, buf.len())?;
-        self.memory.read(at, buf).map_err(|_| Fault { address: va })
+        Self::read(self, va, buf)
     }
 
     fn write(&self, va: u64, data: &[u8]) -> Result<(), Fault> {
-        let at = self.physical(va, data.len())?;
-        self.memory.write(at, data).map_err(|_| Fault { address: va })
+        Self::write(self, va, data)
     }
 }
 
