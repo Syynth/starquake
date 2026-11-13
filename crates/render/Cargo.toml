@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 naga.workspace = true
+png.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 

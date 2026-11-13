@@ -22,6 +22,10 @@
 //! Slice R1 adds the [`RecordingBackend`], in [`recording`]: the trait with no GPU, recording
 //! every list and modelling on the CPU the commands with exact answers.
 //!
+//! Slice R9 (its first part) adds frame dumps, in [`frame`]: a present with `dump` set hands a
+//! [`Frame`] to the [`FrameSink`] installed on the backend, and a frame encodes itself as a
+//! PNG. This crate still does no file I/O.
+//!
 //! Later slices add format fallbacks and `emulation()` (R2), the CPU ASTC decoder (R3) and the
 //! host shaders (R4).
 
@@ -31,6 +35,7 @@ pub mod command;
 pub mod error;
 mod flags;
 pub mod format;
+pub mod frame;
 pub mod id;
 pub mod pipeline;
 pub mod recording;
@@ -46,6 +51,7 @@ pub use caps::{Caps, Features, FormatFeatures, FormatTable, Limits, SampleCounts
 pub use command::{Command, CommandList, StagingSlice};
 pub use error::{RenderError, UnknownFlags};
 pub use format::PixelFormat;
+pub use frame::{Frame, FramePixels, FrameSink};
 pub use id::{
     BufferId, FenceValue, PipelineId, ReadbackId, ResourceId, SamplerId, ShaderId, TextureId,
     ViewId,

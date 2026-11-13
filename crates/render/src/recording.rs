@@ -36,6 +36,19 @@
 //!   compressed format;
 //! - multisampled textures hold one copy of each texel: known bytes mean every sample holds them.
 //!
+//! **Frame dumps.** With no sink installed, the dumped frames wait in the backend
+//! ([`RecordingBackend::take_frame_dumps`]) in the view's own format. With a sink
+//! ([`RecordingBackend::set_frame_sink`]), each list's dumped frames go to the sink that was
+//! installed when the list was submitted, as [`Frame`]s, and do not also wait to be taken. A
+//! frame's pixels are known when the dump's are and the view's format has an exact RGBA8 form
+//! ([`crate::frame`]). The sink is called on a submitting thread, after the list has completed
+//! and with no lock held, so it may call the backend, and may submit. Frames are delivered one
+//! at a time in the order they were presented, whichever thread submitted them: when one
+//! thread's submit finds another thread delivering, it leaves its frames to that thread and
+//! returns; otherwise every frame of a list has been delivered when its `submit` returns. If a
+//! sink panics, the panic leaves through the `submit` that called it (the list has completed
+//! all the same), and the frames behind the failed one are delivered by the next submit.
+//!
 //! **Lists.** `submit` checks the whole list before it changes anything (`plan::check`): every id
 //! names a live resource, every description passes [`crate::validate`] (which refuses a copy
 //! whose sides overlap), and a blit does not read and write overlapping texels of one texture
@@ -68,6 +81,7 @@ use crate::caps::Caps;
 use crate::command::{CommandList, PresentTransform, StagingSlice};
 use crate::error::RenderError;
 use crate::format::PixelFormat;
+use crate::frame::{Frame, FramePixels, FrameSink, rgba8};
 use crate::id::{
     BufferId, FenceValue, PipelineId, ReadbackId, ResourceId, SamplerId, ShaderId, TextureId,
     ViewId,
@@ -79,7 +93,7 @@ use crate::validate;
 use plan::{Op, Place};
 use slots::Slots;
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 use store::{LevelShape, Packed, Rows, Store};
 
@@ -102,6 +116,23 @@ pub struct FrameDump {
     /// The rectangle's bytes, or [`Readback::Unknown`] when any of them is unknown, the format
     /// is compressed, or the view has a non-identity swizzle.
     pub pixels: Readback,
+}
+
+impl From<FrameDump> for Frame {
+    fn from(dump: FrameDump) -> Self {
+        Self {
+            frame: dump.frame,
+            width: dump.width,
+            height: dump.height,
+            transform: dump.transform,
+            pixels: match dump.pixels {
+                Readback::Bytes(bytes) => {
+                    rgba8(dump.format, bytes).map_or(FramePixels::Unknown, FramePixels::Rgba8)
+                }
+                Readback::Unknown => FramePixels::Unknown,
+            },
+        }
+    }
 }
 
 /// The backend with no GPU: records everything and models what has exact answers (module docs).
@@ -183,6 +214,13 @@ struct State {
     readbacks: BTreeMap<ReadbackId, Readback>,
     feedback: Vec<PresentFeedback>,
     dumps: Vec<FrameDump>,
+    /// Where dumped frames go, when the app installed a sink.
+    sink: Option<Arc<dyn FrameSink>>,
+    /// Frames on their way to the sink that was installed when they were presented, oldest
+    /// first.
+    outbox: VecDeque<(Arc<dyn FrameSink>, FrameDump)>,
+    /// Whether a thread is emptying `outbox` (`RecordingBackend::deliver`).
+    delivering: bool,
     refused_destroys: u64,
     log: Vec<Event>,
 }
@@ -486,9 +524,57 @@ impl RecordingBackend {
         std::mem::take(&mut self.state().dumps)
     }
 
+    /// Installs the sink that receives the frames presented with `dump` set, or removes it
+    /// with `None` (module docs, "Frame dumps"). It applies to lists submitted from now on.
+    pub fn set_frame_sink(&self, sink: Option<Arc<dyn FrameSink>>) {
+        self.state().sink = sink;
+    }
+
+    /// Hands the frames in the outbox to their sinks, oldest first, unless a thread is already
+    /// doing so (that thread hands these over too). No lock is held while a sink runs.
+    fn deliver(&self) {
+        let mut state = self.state();
+        if state.delivering {
+            return;
+        }
+        state.delivering = true;
+        let mut delivering = Delivering {
+            backend: self,
+            finished: false,
+        };
+        loop {
+            let Some((sink, dump)) = state.outbox.pop_front() else {
+                // Under the lock that saw the outbox empty, so no frame is left behind.
+                state.delivering = false;
+                delivering.finished = true;
+                return;
+            };
+            drop(state);
+            sink.frame(dump.into());
+            state = self.state();
+        }
+    }
+
     /// How many `destroy` calls named no live resource or one already waiting to be destroyed.
     pub fn refused_destroys(&self) -> u64 {
         self.state().refused_destroys
+    }
+}
+
+/// Marks delivery as over when [`RecordingBackend::deliver`] ends by a sink's panic, so that
+/// the next submit delivers again.
+struct Delivering<'a> {
+    backend: &'a RecordingBackend,
+    /// Set when `deliver` ended itself, under the state lock: there is nothing left to do,
+    /// and taking the lock again here would deadlock.
+    finished: bool,
+}
+
+impl Drop for Delivering<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.backend.state().delivering = false;
+        }
     }
 }
 
@@ -701,19 +787,33 @@ impl Backend for RecordingBackend {
     }
 
     fn submit(&self, list: CommandList) -> Result<FenceValue, RenderError> {
-        let mut state = self.state();
+        let mut guard = self.state();
+        // A plain borrow of the state, so that its fields can be borrowed apart below.
+        let state = &mut *guard;
         let fence = state.completed.next().ok_or(RenderError::Overflow {
             what: "fence value",
         })?;
-        let ops = plan::check(&state, &self.caps, &list)?;
+        let ops = plan::check(state, &self.caps, &list)?;
+        let dumped = state.dumps.len();
         for op in ops {
             state.apply(op)?;
         }
         state.completed = fence;
         state.log.push(Event::Submitted(fence, list));
         state.free_passed();
-        drop(state);
+        if let Some(sink) = &state.sink {
+            // This list's frames go to the sink instead of waiting to be taken.
+            let frames = state.dumps.drain(dumped..);
+            state
+                .outbox
+                .extend(frames.map(|dump| (Arc::clone(sink), dump)));
+        }
+        let waiting = !state.outbox.is_empty();
+        drop(guard);
         self.completed_moved.notify_all();
+        if waiting {
+            self.deliver();
+        }
         Ok(fence)
     }
 
