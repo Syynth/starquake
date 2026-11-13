@@ -43,6 +43,8 @@ prompt and options did not change return their saved results.
 
 ## Limits and rules
 
+- **Human contributors:** never put an issue labelled `help wanted` in a batch; those are
+  reserved for people (`CONTRIBUTING.md`).
 - **Three to four builds at once** on an eight-core machine (`docs/roadmap.md`). Give each entry
   a different crate where possible.
 - **Models:** builds, fixes and both reviews on Opus (decision log, 2026-11-12). Routine steps
