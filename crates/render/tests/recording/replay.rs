@@ -210,7 +210,8 @@ fn a_replayed_capture_gives_the_results_of_the_original_run() {
 
 /// A replay needs the resources the lists name. On a backend without them the list that
 /// names a missing one is refused, the error says which list, and the lists before it stay
-/// submitted.
+/// submitted: the error carries the fence values they signalled there, which is what a caller
+/// needs to wait for them.
 #[test]
 fn a_replay_stops_at_the_list_a_backend_refuses() {
     let original = backend();
@@ -227,6 +228,7 @@ fn a_replay_stops_at_the_list_a_backend_refuses() {
         refused,
         Err(CaptureError::Replay {
             list: 0,
+            submitted: Vec::new(),
             source: RenderError::Invalid("no live buffer has this id"),
         })
     );
@@ -234,14 +236,18 @@ fn a_replay_stops_at_the_list_a_backend_refuses() {
     assert_eq!(empty.capture(), Capture::default());
 
     // Only the buffer and the first texture exist: the first list runs, the second is refused.
+    // The backend has done other work, so its fence values are not the captured ones.
     let partial = backend();
     assert_eq!(data_buffer(&partial), s.data);
     assert_eq!(texture(&partial, RGBA, (2, 2), 1, 1), s.source);
+    submit(&partial, Vec::new());
+    submit(&partial, Vec::new());
     let refused = capture.replay(&partial).expect_err("the target is missing");
     assert_eq!(
         refused,
         CaptureError::Replay {
             list: 1,
+            submitted: fences(&[3]),
             source: RenderError::Invalid("no live texture has this id"),
         }
     );
@@ -251,13 +257,52 @@ fn a_replay_stops_at_the_list_a_backend_refuses() {
     );
     let source = std::error::Error::source(&refused).expect("the backend's error");
     assert_eq!(source.to_string(), "no live texture has this id");
-    assert_eq!(partial.completed(), FenceValue::new(1));
+    assert_eq!(partial.completed(), FenceValue::new(3));
     assert_eq!(
         partial.take_readback(rb(1)),
         Some(Readback::Bytes(counting(1, 8)))
     );
     assert_eq!(partial.take_readback(rb(2)), None);
-    assert_eq!(partial.capture().lists, capture.lists[..1]);
+    let lists: Vec<CommandList> = partial.lists().into_iter().map(|(_, list)| list).collect();
+    assert_eq!(
+        lists,
+        vec![
+            CommandList::new(),
+            CommandList::new(),
+            capture.lists[0].list.clone()
+        ]
+    );
+}
+
+/// A refusal further on carries every fence value before it, in order.
+#[test]
+fn a_refused_replay_says_what_it_submitted() {
+    let marker = |n| CommandList {
+        commands: vec![Command::Marker(Marker { submit: n, draw: n })],
+    };
+    let missing = CommandList {
+        commands: vec![Command::Readback {
+            from: slice(BufferId::new(9, 0), 0, 1),
+            id: rb(1),
+        }],
+    };
+    let capture = Capture::new([
+        (FenceValue::new(10), marker(1)),
+        (FenceValue::new(20), marker(2)),
+        (FenceValue::new(30), missing),
+        (FenceValue::new(40), marker(3)),
+    ]);
+    let b = backend();
+    assert_eq!(
+        capture.replay(&b),
+        Err(CaptureError::Replay {
+            list: 2,
+            submitted: fences(&[1, 2]),
+            source: RenderError::Invalid("no live buffer has this id"),
+        })
+    );
+    // The list after the refused one was not submitted.
+    assert_eq!(b.completed(), FenceValue::new(2));
 }
 
 /// The fence values a replay returns are the ones the backend signals, not the captured ones:
