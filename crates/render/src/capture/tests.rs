@@ -209,9 +209,97 @@ fn another_kind_of_file_is_refused() {
         Capture::from_bytes(b"\x89PNG\r\n\x1a\n"),
         Err(CaptureError::BadMagic)
     );
+    // A file too short to hold the magic is another kind of file too, unless it is the start
+    // of the magic (`every_truncated_file_is_refused` has those).
+    let short: [&[u8]; 9] = [
+        b"P", b"\0", b"s", b"PN", b"SX", b"XQ", b"abc", b"SQX", b"SXR",
+    ];
+    for file in short {
+        assert_eq!(
+            Capture::from_bytes(file),
+            Err(CaptureError::BadMagic),
+            "{file:?}"
+        );
+    }
     assert_eq!(
         CaptureError::BadMagic.to_string(),
         "not a render capture (bad magic)"
+    );
+}
+
+/// What reading accepts beyond what writing produces: `postcard` reads a number written with
+/// more bytes than it needs, so more than one file holds the same capture, and reading such a
+/// file and writing it again gives the shortest (module docs, "What reading checks").
+#[test]
+fn longer_numbers_are_read_and_written_short() {
+    // The version, 1, in two bytes and in five (the most a 32-bit number takes).
+    for file in [&b"SQRC\x81\x00\x00"[..], b"SQRC\x81\x80\x80\x80\x00\x00"] {
+        let capture = Capture::from_bytes(file).expect("a capture with no list");
+        assert_eq!(capture, Capture::default());
+        assert_eq!(capture.to_bytes().as_deref(), Ok(&b"SQRC\x01\x00"[..]));
+    }
+    // A fence value, 5, and a command count, 0, in two bytes each.
+    let capture = Capture::from_bytes(b"SQRC\x01\x01\x85\x00\x80\x00\x00").expect("one list");
+    assert_eq!(
+        capture,
+        Capture {
+            lists: vec![captured(5, CommandList::new())]
+        }
+    );
+    assert_eq!(
+        capture.to_bytes().as_deref(),
+        Ok(&b"SQRC\x01\x01\x05\x00\x00"[..])
+    );
+    // A longer version is still the version it says: 2 in two bytes is refused as 2.
+    assert_eq!(
+        Capture::from_bytes(b"SQRC\x82\x00\x00"),
+        Err(CaptureError::UnsupportedVersion { found: 2 })
+    );
+    // More bytes than a 32-bit number takes is not a version at all.
+    assert_eq!(
+        Capture::from_bytes(b"SQRC\x81\x80\x80\x80\x80\x00\x00"),
+        Err(CaptureError::Decode(postcard::Error::DeserializeBadVarint))
+    );
+}
+
+/// The capture's version and the command layout go together. A capture holds lists as
+/// `postcard` writes them, and `command::tests::golden_bytes` pins those bytes; this pins which
+/// version of the capture they belong to. A change to the command layout changes [`GOLDEN`],
+/// and this test then fails until [`VERSION`] is bumped and the three numbers below are
+/// updated with it, so the golden tests above cannot stay green across such a change.
+#[test]
+fn the_version_goes_with_the_command_layout() {
+    // FNV-1a, 64 bits, over the golden list's hex text.
+    let hash = GOLDEN
+        .bytes()
+        .fold(0xCBF2_9CE4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01B3)
+        });
+    assert_eq!(
+        (VERSION, GOLDEN.len(), hash),
+        (1, 2276, 0xDB5A_415C_D700_176F)
+    );
+}
+
+/// The memory a capture takes when read is bounded by the file's size, and the module docs
+/// say by how much: a decoded command takes `size_of::<Command>()` bytes however few bytes
+/// encode it. The shortest command is a marker of two small numbers, three bytes, and the
+/// docs' "about seventy times" holds while a command is between 180 and 240 bytes.
+#[test]
+fn a_decoded_command_is_a_bounded_multiple_of_its_bytes() {
+    let shortest = Command::Marker(Marker { submit: 0, draw: 0 });
+    assert_eq!(
+        postcard::to_allocvec(&shortest).as_deref(),
+        Ok(&[0x09, 0x00, 0x00][..])
+    );
+    let decoded = size_of::<Command>();
+    assert!(
+        decoded <= 240,
+        "{decoded} bytes: the docs' multiple is stale"
+    );
+    assert!(
+        decoded >= 180,
+        "{decoded} bytes: the docs' multiple is stale"
     );
 }
 

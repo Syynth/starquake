@@ -52,8 +52,23 @@
 //! themselves are not checked here: a list is checked against the device when it is submitted
 //! ([`crate::validate`]).
 //!
-//! Reading keeps the whole capture in memory, which is a bounded multiple of the file's size
-//! (a command takes more room decoded than its shortest encoding).
+//! A file too short to hold the magic is truncated when it is the start of the magic, and
+//! otherwise not a capture.
+//!
+//! Reading accepts what `postcard` accepts, which is more than writing produces: a number may
+//! be written with more bytes than it needs, so more than one file holds the same capture.
+//! [`Capture::to_bytes`] always writes the shortest, and nothing here compares files byte for
+//! byte.
+//!
+//! # Memory
+//!
+//! Reading keeps the whole capture in memory, and that is more than the file. A decoded
+//! command takes `size_of::<Command>()` bytes however few bytes encode it, and the shortest
+//! command is three bytes, so a file of nothing but those costs about seventy times its size,
+//! and up to twice that while a list grows. Nothing here caps it: a caller that reads captures
+//! it does not trust bounds the file's size first. Declared counts are not believed (a count
+//! larger than the bytes behind it is [`CaptureError::Truncated`] without the room being
+//! taken), and an upload's bytes are read as they are, one for one.
 
 use crate::backend::Backend;
 use crate::command::CommandList;
@@ -72,7 +87,12 @@ pub const VERSION: u32 = 1;
 /// Why a capture could not be written, read or replayed.
 #[derive(Debug, Error, PartialEq)]
 pub enum CaptureError {
-    /// Encoding failed.
+    /// Encoding failed. No capture reaches this today: `postcard` refuses to write only a
+    /// sequence whose length is not known when it starts, which nothing in a [`Command`] is,
+    /// and a buffer that is full, which a `Vec` never is. The variant is here so that this
+    /// module does not unwrap.
+    ///
+    /// [`Command`]: crate::Command
     #[error("could not encode the capture: {0}")]
     Encode(postcard::Error),
     /// The bytes end before the capture does.
@@ -109,6 +129,9 @@ pub enum CaptureError {
     Replay {
         /// The list's place in the capture, from zero.
         list: usize,
+        /// The fence values the lists before it signalled on the backend, in order. Those
+        /// lists stay submitted, and the last of these is what to wait for.
+        submitted: Vec<FenceValue>,
         /// Why the backend refused it.
         source: RenderError,
     },
@@ -156,8 +179,15 @@ impl Capture {
     /// Reads a capture from a file's bytes. Malformed, truncated, foreign, other-version or
     /// over-long input is an `Err` (module docs, "What reading checks").
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, CaptureError> {
-        let (magic, rest) = take::<[u8; 4]>(bytes)?;
-        if magic != MAGIC {
+        let Some((magic, rest)) = bytes.split_first_chunk() else {
+            // Too short to hold the magic: a capture cut short if it starts as one does.
+            return Err(if MAGIC.starts_with(bytes) {
+                CaptureError::Truncated
+            } else {
+                CaptureError::BadMagic
+            });
+        };
+        if *magic != MAGIC {
             return Err(CaptureError::BadMagic);
         }
         let (version, mut rest) = take::<u32>(rest)?;
@@ -187,18 +217,24 @@ impl Capture {
     ///
     /// The backend must already hold the resources the lists name, under the same ids (module
     /// docs). A list the backend refuses ends the replay with [`CaptureError::Replay`], which
-    /// says which list; the lists before it stay submitted. The capture's own fence values are
-    /// not used. The call does not wait for the lists to complete.
+    /// says which list and carries the fence values of the lists before it: those stay
+    /// submitted. The capture's own fence values are not used. The call does not wait for the
+    /// lists to complete.
     pub fn replay(&self, backend: &dyn Backend) -> Result<Vec<FenceValue>, CaptureError> {
-        self.lists
-            .iter()
-            .enumerate()
-            .map(|(list, captured)| {
-                backend
-                    .submit(captured.list.clone())
-                    .map_err(|source| CaptureError::Replay { list, source })
-            })
-            .collect()
+        let mut submitted = Vec::with_capacity(self.lists.len());
+        for (list, captured) in self.lists.iter().enumerate() {
+            match backend.submit(captured.list.clone()) {
+                Ok(fence) => submitted.push(fence),
+                Err(source) => {
+                    return Err(CaptureError::Replay {
+                        list,
+                        submitted,
+                        source,
+                    });
+                }
+            }
+        }
+        Ok(submitted)
     }
 }
 
