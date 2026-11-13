@@ -65,6 +65,7 @@ use crate::backend::{
     Readback, WaitOutcome,
 };
 use crate::caps::Caps;
+use crate::capture::Capture;
 use crate::command::{CommandList, PresentTransform, StagingSlice};
 use crate::error::RenderError;
 use crate::format::PixelFormat;
@@ -458,6 +459,12 @@ impl RecordingBackend {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Every list submitted so far, as a [`Capture`] ready to be written out: what
+    /// [`RecordingBackend::lists`] returns. Refused lists are not in it.
+    pub fn capture(&self) -> Capture {
+        Capture::new(self.lists())
     }
 
     /// Makes [`Backend::pipeline_status`] for `id` report `steps` in turn, one per call, then
