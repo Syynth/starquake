@@ -44,34 +44,38 @@
 //!
 //! # Where this differs from Eden
 //!
-//! Each is pinned by a test in `fallback::tests` (`where_this_differs_from_eden`,
-//! `astc_is_decided_per_format`, `every_combination`), and `a_stand_in_can_hold_its_guest`
-//! checks the second for every stand-in.
+//! Each names the test in `fallback::tests` that pins it.
 //!
 //! - **Stricter: nothing fits.** Eden logs an error and uses the wanted format anyway; here it
-//!   is an error the GPU crate counts.
+//!   is an error the GPU crate counts. `the_error_names_the_first_missing_feature`,
+//!   `every_combination`.
 //! - **Stricter: no narrower or lossy stand-in.** Eden's lists end with `D16_UNORM` for
 //!   `X8_D24_UNORM` (16 bits of depth for 24) and `A8B8G8R8_SRGB` for `B10G11R11_FLOAT` (8-bit
 //!   sRGB for unsigned floats), and offer `R8_UNORM` for `G4R4_UNORM` (one channel for two).
-//!   None can hold the guest's values, so none is offered: the spec's row asks for a wider
-//!   format.
+//!   None can hold the guest's values, so none is offered. The spec's row says "a wider
+//!   format"; the rule here is that a stand-in can hold the guest's values, which one of the
+//!   same width can (`R5G6B5_UNORM` for `B5G6R5_UNORM`). `where_this_differs_from_eden`,
+//!   and `a_stand_in_can_hold_its_guest` for every stand-in.
 //! - **Not expressible.** Eden's alternatives that [`PixelFormat`] has no entry for are left
 //!   out (`D16_UNORM_S8_UINT`; `R4G4B4A4_UNORM` for `A4B4G4R4_UNORM`), as is the Vulkan format
 //!   its `SurfaceFormat` gives `A5B5G5R1_UNORM` on every device (`R5G5B5A1_UNORM_PACK16`,
 //!   "specially swizzled"), and its entries for vertex formats, which are not texture formats.
+//!   `where_this_differs_from_eden`.
 //! - **Per report, not on every device.** Eden's `SurfaceFormat` gives `S8_UINT_D24_UNORM`,
 //!   `A1B5G5R5_UNORM` and `R16G16B16X16_FLOAT` another format whatever the device has. Here
 //!   that format is a stand-in, used only when the device's report lacks the guest format.
+//!   `every_combination` (a device that has the guest format uses it).
 //! - **Per format, not per device.** Eden decodes every ASTC format unless the device has all
 //!   of them (`ComputeIsOptimalAstcSupported`). Here each format is decided on its own report.
+//!   `astc_is_decided_per_format`.
 //! - **Not ported: recompression, BC, ETC2 and EAC.** Eden can recompress decoded ASTC to BC1
 //!   or BC3 (the spec defers that, decision 6), and decodes BC formats and ETC2 and EAC
 //!   formats on devices without them (`IsOptimalBcnSupported`, `IsOptimalEtc2Supported`); the
 //!   spec's table has no row for either and no decoder for them is planned, so a BC, ETC2 or
-//!   EAC format the device lacks is an error.
+//!   EAC format the device lacks is an error. `where_this_differs_from_eden`.
 //! - **Conversion instead of a view swizzle.** Eden fixes the channel order of `B5G6R5_UNORM`
 //!   and `A1B5G5R5_UNORM` with the view's swizzle; a device without view swizzles cannot, so
-//!   the data is converted.
+//!   the data is converted. `every_combination` (the conversion of each stand-in).
 
 use crate::caps::{FormatFeatures, FormatTable};
 use crate::error::RenderError;
@@ -86,7 +90,8 @@ pub enum Conversion {
     /// The host format is the guest's: the bytes cross as they are.
     None,
     /// ASTC blocks are decoded into RGBA8 texels on upload: on the GPU where it can (slice
-    /// R10), with the CPU decoder (slice R3) as the fallback and the oracle.
+    /// R10), with the CPU decoder (slice R3) as the fallback and the oracle. One way only:
+    /// there is no encoder, so reading such a texture back into guest memory is not supported.
     AstcDecode,
     /// Texels are converted one by one on upload, and back on readback.
     Texel,
@@ -97,7 +102,8 @@ pub enum Conversion {
 pub struct HostFormat {
     /// The format the host texture is created with.
     pub format: PixelFormat,
-    /// What its data needs where it crosses guest memory.
+    /// What its data needs where it crosses guest memory. With [`Conversion::AstcDecode`]
+    /// that is uploads only: such a texture cannot be read back.
     pub conversion: Conversion,
 }
 

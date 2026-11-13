@@ -28,13 +28,17 @@
 //!
 //! # Where this differs from Eden
 //!
+//! Each names the test in `emulation::tests` that pins it.
+//!
 //! - Eden does not rewrite indices for primitive restart: at the line cited it turns restart on
 //!   for MoltenVK whatever the guest asks, and its Vulkan renderer has no rewrite. The flag
-//!   follows the spec's row instead.
+//!   follows the spec's row instead. `each_flag_follows_its_rows` (the restart rows).
 //! - Eden has no attribute fetch from a buffer: it only lowers MoltenVK's attribute limit to 16.
-//!   The flag follows the spec's row.
+//!   The flag follows the spec's row. `each_flag_follows_its_rows` (the attribute rows, at each
+//!   limit and one past it).
 //! - Eden types every colour output on MoltenVK, float included. A float output is what a
 //!   shader has without the flag, so only an integer target sets it.
+//!   `each_flag_follows_its_rows` (the output rows), `an_integer_target_in_any_slot_is_seen`.
 //!
 //! # What the primitive restart flag does not look at
 //!

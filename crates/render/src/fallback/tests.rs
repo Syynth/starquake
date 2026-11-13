@@ -600,10 +600,9 @@ fn where_this_differs_from_eden() {
         }
     }
     assert_eq!(decoded_by_eden, 14 + 10);
-    // Stand-ins are one step: D24_UNORM_S8_UINT is S8_UINT's first stand-in, and a device
-    // lacking both does not go on to D24's own stand-ins beyond S8_UINT's list. (Here the two
-    // lists agree on D32_FLOAT_S8_UINT; R5G6B5_UNORM has no stand-in of its own, so a device
-    // lacking it and B5G6R5_UNORM has nothing.)
+    // B5G6R5_UNORM's one stand-in is R5G6B5_UNORM, which has none of its own: a device
+    // lacking both has nothing. (No stand-in in the table has a stand-in its guest's list
+    // lacks, so "one step" and "as many as it takes" cannot be told apart today.)
     let mut table = lacking(F::B5G6R5Unorm);
     table.set(F::R5G6B5Unorm, FormatFeatures::EMPTY);
     assert_eq!(
