@@ -87,7 +87,12 @@ pub const VERSION: u32 = 1;
 /// Why a capture could not be written, read or replayed.
 #[derive(Debug, Error, PartialEq)]
 pub enum CaptureError {
-    /// Encoding failed.
+    /// Encoding failed. No capture reaches this today: `postcard` refuses to write only a
+    /// sequence whose length is not known when it starts, which nothing in a [`Command`] is,
+    /// and a buffer that is full, which a `Vec` never is. The variant is here so that this
+    /// module does not unwrap.
+    ///
+    /// [`Command`]: crate::Command
     #[error("could not encode the capture: {0}")]
     Encode(postcard::Error),
     /// The bytes end before the capture does.

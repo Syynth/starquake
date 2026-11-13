@@ -262,6 +262,25 @@ fn longer_numbers_are_read_and_written_short() {
     );
 }
 
+/// The capture's version and the command layout go together. A capture holds lists as
+/// `postcard` writes them, and `command::tests::golden_bytes` pins those bytes; this pins which
+/// version of the capture they belong to. A change to the command layout changes [`GOLDEN`],
+/// and this test then fails until [`VERSION`] is bumped and the three numbers below are
+/// updated with it, so the golden tests above cannot stay green across such a change.
+#[test]
+fn the_version_goes_with_the_command_layout() {
+    // FNV-1a, 64 bits, over the golden list's hex text.
+    let hash = GOLDEN
+        .bytes()
+        .fold(0xCBF2_9CE4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01B3)
+        });
+    assert_eq!(
+        (VERSION, GOLDEN.len(), hash),
+        (1, 2276, 0xDB5A_415C_D700_176F)
+    );
+}
+
 /// The memory a capture takes when read is bounded by the file's size, and the module docs
 /// say by how much: a decoded command takes `size_of::<Command>()` bytes however few bytes
 /// encode it. The shortest command is a marker of two small numbers, three bytes, and the
