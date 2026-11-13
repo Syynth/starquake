@@ -22,8 +22,11 @@
 //! Slice R1 adds the [`RecordingBackend`], in [`recording`]: the trait with no GPU, recording
 //! every list and modelling on the CPU the commands with exact answers.
 //!
-//! Later slices add format fallbacks and `emulation()` (R2), the CPU ASTC decoder (R3) and the
-//! host shaders (R4).
+//! Slice R4 adds the backend's own helper shaders, in [`host_shaders`]: the WGSL sources of the
+//! present blit and the clears, with the entry points, bindings and parameter layouts a backend
+//! uses them by.
+//!
+//! Later slices add format fallbacks and `emulation()` (R2) and the CPU ASTC decoder (R3).
 
 pub mod backend;
 pub mod caps;
@@ -31,6 +34,7 @@ pub mod command;
 pub mod error;
 mod flags;
 pub mod format;
+pub mod host_shaders;
 pub mod id;
 pub mod pipeline;
 pub mod recording;
@@ -46,6 +50,7 @@ pub use caps::{Caps, Features, FormatFeatures, FormatTable, Limits, SampleCounts
 pub use command::{Command, CommandList, StagingSlice};
 pub use error::{RenderError, UnknownFlags};
 pub use format::PixelFormat;
+pub use host_shaders::HostShader;
 pub use id::{
     BufferId, FenceValue, PipelineId, ReadbackId, ResourceId, SamplerId, ShaderId, TextureId,
     ViewId,
