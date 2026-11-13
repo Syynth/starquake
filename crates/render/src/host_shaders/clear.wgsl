@@ -15,7 +15,10 @@
 //   type, and reinterpreting the bits rather than converting the numbers keeps an integer
 //   value exact.
 // - As in Eden, nothing here is specific to stencil: a stencil clear is the pipeline's stencil
-//   operation writing the reference value.
+//   operation writing the reference value. On a target with depth it is drawn with `fs_depth`
+//   and depth writes off. A stencil-only target has no fragment stage it can use (wgpu refuses
+//   one that writes the fragment's depth when the target has no depth), and needs none: the
+//   pipeline is made with the vertex stage alone.
 //
 // The interface (entry points, the binding, the block's layout) is named in
 // `crates/render/src/host_shaders.rs`, and the tests beside it compare this file with those

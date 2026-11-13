@@ -3,7 +3,7 @@
 //!
 //! Nothing here runs a shader (parent module docs, "What the tests check, and what they cannot").
 
-use super::{EntryPoint, HostShader, clear, present};
+use super::{EntryPoint, HostShader, OUTPUT_LOCATION, clear, present};
 use crate::resource::ViewDimension;
 use crate::shader::{ResourceBinding, ResourceKind, SampleKind, ShaderStage};
 use naga::front::wgsl::ParseError;
@@ -61,7 +61,11 @@ fn every_host_shader_parses_and_validates() {
 #[test]
 fn a_source_that_does_not_parse_is_refused() {
     let refused = check("@vertex fn vs_main( -> @builtin(position) vec4<f32> {").unwrap_err();
-    assert!(matches!(refused, Refused::Parse(_)), "{refused:?}");
+    let Refused::Parse(error) = &refused else {
+        unreachable!("{refused:?}");
+    };
+    // The argument list is open where the arrow stands.
+    assert_eq!(error.message(), "expected identifier, found \"->\"");
 }
 
 /// The validator is on, not only the parser: this source parses, and only the validator's
@@ -123,7 +127,10 @@ fn wgsl_files(root: &Path, dir: &Path, found: &mut Vec<String>) {
         let path = entry.expect("directory entry").path();
         if path.is_dir() {
             wgsl_files(root, &path, found);
-        } else if path.extension().is_some_and(|e| e == "wgsl") {
+        } else if path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("wgsl"))
+        {
             let relative = path.strip_prefix(root).expect("a path under the root");
             let parts: Vec<_> = relative
                 .components()
@@ -412,7 +419,10 @@ fn fragment_output(module: &Module, name: &str) -> FragmentOutput {
 
 #[test]
 fn fragment_entry_points_write_their_stated_types() {
-    let color = |kind| FragmentOutput::Color { location: 0, kind };
+    let color = |kind| FragmentOutput::Color {
+        location: OUTPUT_LOCATION,
+        kind,
+    };
     let stated = [
         (
             HostShader::Present,
@@ -482,12 +492,25 @@ fn the_present_blit_samples_the_base_mip_level() {
 }
 
 /// The vertex stages take their positions from the vertex index alone, so the draws need no
-/// vertex buffer.
+/// vertex buffer. A shader has one vertex entry point or none (a compute helper has none), as
+/// its table says.
 #[test]
 fn vertex_entry_points_read_only_the_vertex_index() {
     let mut vertex_entries = 0;
     for &shader in HostShader::ALL {
         let (module, _) = checked(shader);
+        let stated = shader
+            .entry_points()
+            .iter()
+            .filter(|e| e.stage == ShaderStage::Vertex)
+            .count();
+        assert!(stated <= 1, "{}", shader.file_name());
+        let in_source = module
+            .entry_points
+            .iter()
+            .filter(|e| e.stage == naga::ShaderStage::Vertex)
+            .count();
+        assert_eq!(in_source, stated, "{}", shader.file_name());
         for entry in &module.entry_points {
             if entry.stage != naga::ShaderStage::Vertex {
                 continue;
@@ -508,5 +531,158 @@ fn vertex_entry_points_read_only_the_vertex_index() {
             );
         }
     }
-    assert_eq!(vertex_entries, HostShader::ALL.len());
+    // The present blit's and the clear's: the loop above was not empty.
+    assert_eq!(vertex_entries, 2);
+}
+
+/// A name the source gave, or a failure: every variable the helper shaders use has one.
+fn named(name: Option<&String>) -> String {
+    name.cloned().expect("a named variable")
+}
+
+/// What an expression computes, written out: variables and arguments by name, a member or
+/// element taken as `.n` or `[..]` (loads are looked through), a literal as naga prints it and
+/// each operation by naga's name for it. It covers what the helper shaders' bodies use;
+/// anything else fails the test that met it.
+fn written_out(
+    module: &Module,
+    function: &naga::Function,
+    at: naga::Handle<naga::Expression>,
+) -> String {
+    use naga::Expression as E;
+    let go = |at| written_out(module, function, at);
+    match &function.expressions[at] {
+        E::GlobalVariable(global) => named(module.global_variables[*global].name.as_ref()),
+        E::LocalVariable(local) => named(function.local_variables[*local].name.as_ref()),
+        E::FunctionArgument(index) => {
+            let index = usize::try_from(*index).expect("an argument index");
+            named(function.arguments[index].name.as_ref())
+        }
+        E::Load { pointer } => go(*pointer),
+        E::AccessIndex { base, index } => format!("{}.{index}", go(*base)),
+        E::Access { base, index } => format!("{}[{}]", go(*base), go(*index)),
+        E::Literal(literal) => format!("{literal:?}"),
+        E::As {
+            expr,
+            kind,
+            convert,
+        } => {
+            let how = if convert.is_some() {
+                "convert"
+            } else {
+                "bitcast"
+            };
+            format!("{how}<{kind:?}>({})", go(*expr))
+        }
+        E::Binary { op, left, right } => format!("({} {op:?} {})", go(*left), go(*right)),
+        E::Compose { components, .. } => {
+            let components: Vec<_> = components.iter().map(|c| go(*c)).collect();
+            format!("compose({})", components.join(", "))
+        }
+        E::ImageSample {
+            image,
+            sampler,
+            coordinate,
+            level: naga::SampleLevel::Exact(level),
+            ..
+        } => format!(
+            "sample({}, {}, {}, level {})",
+            go(*image),
+            go(*sampler),
+            go(*coordinate),
+            go(*level)
+        ),
+        other => unreachable!("{other:?}"),
+    }
+}
+
+/// The statements of an entry point's body, written out: what it stores where, and what it
+/// returns.
+fn body(shader: HostShader, name: &str) -> Vec<String> {
+    let (module, _) = checked(shader);
+    let function = &module
+        .entry_points
+        .iter()
+        .find(|e| e.name == name)
+        .expect("the entry point")
+        .function;
+    function
+        .body
+        .iter()
+        .filter_map(|statement| match statement {
+            naga::Statement::Emit(_) => None,
+            naga::Statement::Store { pointer, value } => Some(format!(
+                "{} = {}",
+                written_out(&module, function, *pointer),
+                written_out(&module, function, *value)
+            )),
+            naga::Statement::Return { value: Some(value) } => {
+                Some(format!("return {}", written_out(&module, function, *value)))
+            }
+            other => unreachable!("{other:?}"),
+        })
+        .collect()
+}
+
+/// Each clear entry point reinterprets the block's bit patterns as its own type and does not
+/// convert the numbers: a float clear of 0.5 arrives as the pattern 0x3F00_0000 and must be
+/// written as 0.5, not as 1056964608.0. The depth entry point reads the first pattern.
+///
+/// `params.0` is the block's one member, `value`; `params.0.0` is its `x`.
+#[test]
+fn the_clear_fragment_stages_reinterpret_the_value() {
+    let returns = |name| body(HostShader::Clear, name);
+    assert_eq!(
+        returns(clear::FRAGMENT_COLOR_FLOAT),
+        ["return bitcast<Float>(params.0)"]
+    );
+    assert_eq!(
+        returns(clear::FRAGMENT_COLOR_SINT),
+        ["return bitcast<Sint>(params.0)"]
+    );
+    assert_eq!(returns(clear::FRAGMENT_COLOR_UINT), ["return params.0"]);
+    assert_eq!(
+        returns(clear::FRAGMENT_DEPTH),
+        ["return bitcast<Float>(params.0.0)"]
+    );
+}
+
+/// The clear triangle's vertices come from the vertex index by Eden's arithmetic:
+/// `x = (index & 1) << 2` and `y = (index & 2) << 1`, each minus one. For indices 0, 1 and 2
+/// that is (-1, -1), (3, -1) and (-1, 3), a triangle that contains the whole of clip space's
+/// -1..1 square, at depth 0 with w = 1.
+#[test]
+fn the_clear_vertex_stage_covers_clip_space() {
+    assert_eq!(
+        body(HostShader::Clear, clear::VERTEX),
+        [concat!(
+            "return compose(",
+            "(convert<Float>(((vertex_index And U32(1)) ShiftLeft U32(2))) Subtract F32(1.0)), ",
+            "(convert<Float>(((vertex_index And U32(2)) ShiftLeft U32(1))) Subtract F32(1.0)), ",
+            "F32(0.0), F32(1.0))"
+        )]
+    );
+}
+
+/// The present blit's vertex stage puts vertex `i` at the block's matrix times
+/// `(vertices[i].position, 0, 1)` and hands on `vertices[i].tex_coord`; its fragment stage
+/// samples the presented view with the sampler at that coordinate.
+///
+/// `params.0` is the matrix and `params.1` the vertices; a vertex's `.0` is its position and
+/// `.1` its texture coordinate; `out.0` is the clip position and `out.1` the coordinate handed
+/// to the fragment stage, which is `in.1` there.
+#[test]
+fn the_present_blit_draws_the_blocks_vertices() {
+    assert_eq!(
+        body(HostShader::Present, present::VERTEX),
+        [
+            "out.0 = (params.0 Multiply compose(params.1[vertex_index].0, F32(0.0), F32(1.0)))",
+            "out.1 = params.1[vertex_index].1",
+            "return out",
+        ]
+    );
+    assert_eq!(
+        body(HostShader::Present, present::FRAGMENT),
+        ["return sample(color_texture, color_sampler, in.1, level F32(0.0))"]
+    );
 }

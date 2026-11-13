@@ -22,12 +22,19 @@
 //! validates it with every validation flag on and no optional capability, at the naga version
 //! the workspace pins (the one wgpu uses), then compares the parsed module with this module's
 //! tables: entry point names and stages, bindings and their kinds, the parameter blocks' sizes
-//! and member offsets, and each fragment entry point's output type. A `.wgsl` file under `src/`
-//! that is not listed in [`HostShader::ALL`] fails `every_wgsl_file_is_a_listed_host_shader`, so
-//! a shader cannot be added without being validated.
+//! and member offsets, and each fragment entry point's output type. Each entry point's body is
+//! compared too, as naga's expression tree written out: what the clear stages do with the
+//! value's bits, where the clear triangle's vertices are, and what the present blit multiplies
+//! and samples. A `.wgsl` file under this crate's `src/` that is not listed in
+//! [`HostShader::ALL`] fails `every_wgsl_file_is_a_listed_host_shader`, so a shader file cannot
+//! be added here without being validated. That test sees files in this crate only: WGSL in
+//! another crate, or in a string in Rust code, is that code's to check.
 //!
 //! No test here runs a shader: what the shaders draw is checked on a GPU, by the wgpu backend's
-//! slices (R5 for clears, R8 for the present blit).
+//! slices (R5 for clears, R8 for the present blit). Those slices must also pin what no test
+//! here refers to: [`clear::VERTEX_COUNT`] and [`present::VERTEX_COUNT`] (that a draw of that
+//! many vertices, with that topology, covers what it should), and which way up the present
+//! blit's image is ([`present`]).
 //!
 //! # Sources
 //!
@@ -40,6 +47,10 @@
 
 use crate::resource::ViewDimension;
 use crate::shader::{ResourceBinding, ResourceKind, SampleKind, ShaderStage};
+
+/// The location every colour-writing fragment entry point of a helper shader writes its one
+/// output to.
+pub const OUTPUT_LOCATION: u32 = 0;
 
 /// One entry point of a helper shader.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -114,6 +125,12 @@ impl HostShader {
 /// buffer: vertex `i` is `vertices[i]` of the parameter block, its position multiplied by the
 /// block's matrix. The fragment stage samples the presented view's base mip level at the
 /// interpolated texture coordinate.
+///
+/// The product is a WGSL clip-space position: y = -1 is the bottom of the target, where in
+/// Vulkan it is the top. The shader does not flip anything, so the matrix must: Eden's
+/// orthographic matrix, used unchanged, presents the image upside down (the source's header
+/// has the detail). No test here can see which way up the image is; that is slice R8's, on a
+/// GPU.
 pub mod present {
     use super::{
         EntryPoint, ResourceBinding, ResourceKind, SampleKind, ShaderStage, ViewDimension,
@@ -122,7 +139,8 @@ pub mod present {
     /// The vertex entry point.
     pub const VERTEX: &str = "vs_main";
 
-    /// The fragment entry point. Its one output, at location 0, is four floats.
+    /// The fragment entry point. Its one output, at [`OUTPUT_LOCATION`](super::OUTPUT_LOCATION),
+    /// is four floats.
     pub const FRAGMENT: &str = "fs_main";
 
     /// The entry points, in source order.
@@ -144,6 +162,13 @@ pub mod present {
     pub const PARAMS_BINDING: u32 = 0;
 
     /// Binding of the presented view, a two-dimensional float texture.
+    ///
+    /// [`RESOURCES`] says the texture is filterable, which is this crate's choice and not
+    /// something the source fixes: WGSL takes any float texture here. A view whose format the
+    /// device cannot filter (under wgpu, the 32-bit float formats without its
+    /// `FLOAT32_FILTERABLE` feature) cannot be bound to a layout made from that row; a present
+    /// of such a view needs a row that says it is not, and a sampler that does not filter.
+    /// Which presents get which is slice R8's.
     pub const TEXTURE_BINDING: u32 = 1;
 
     /// Binding of the sampler the view is read with.
@@ -208,20 +233,27 @@ pub mod clear {
     pub const VERTEX: &str = "vs_main";
 
     /// The fragment entry point for a float or normalised colour target: writes the four
-    /// patterns as `f32`s to location 0.
+    /// patterns as `f32`s to [`OUTPUT_LOCATION`](super::OUTPUT_LOCATION).
     pub const FRAGMENT_COLOR_FLOAT: &str = "fs_color_float";
 
     /// The fragment entry point for a signed integer colour target: writes the four patterns as
-    /// `i32`s to location 0.
+    /// `i32`s to [`OUTPUT_LOCATION`](super::OUTPUT_LOCATION).
     pub const FRAGMENT_COLOR_SINT: &str = "fs_color_sint";
 
     /// The fragment entry point for an unsigned integer colour target: writes the four patterns
-    /// as `u32`s to location 0.
+    /// as `u32`s to [`OUTPUT_LOCATION`](super::OUTPUT_LOCATION).
     pub const FRAGMENT_COLOR_UINT: &str = "fs_color_uint";
 
     /// The fragment entry point for a depth target: writes the first pattern as an `f32` to the
     /// fragment's depth. Nothing in the shader is specific to stencil: as in Eden, a stencil
     /// clear is the pipeline's stencil operation writing the reference value.
+    ///
+    /// It needs a target with depth: wgpu refuses a fragment stage that writes the fragment's
+    /// depth in a pipeline whose depth-stencil format has none (`wgpu-core` 30.0.2,
+    /// `MissingFragDepthAttachment`). So a stencil clear of a depth and stencil target uses
+    /// this entry point with depth writes off, and a clear of a stencil-only target uses no
+    /// fragment stage at all, which wgpu allows: the vertex stage and the stencil operation
+    /// are enough.
     pub const FRAGMENT_DEPTH: &str = "fs_depth";
 
     /// The entry points, in source order.

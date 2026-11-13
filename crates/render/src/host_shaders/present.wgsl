@@ -11,6 +11,12 @@
 //   push-constant array only dynamically uniform indices. A uniform buffer's array has no such
 //   rule, so the vertex index is used directly.
 // - Eden's combined `sampler2D` is a texture and a sampler: WGSL has no combined samplers.
+// - Clip space is the other way up. In WGSL y = -1 is the bottom of the target; in Vulkan it
+//   is the top. The shader applies the block's matrix as it is given, as Eden's does, so the
+//   matrix carries the difference: Eden's `MakeOrthographicMatrix`
+//   (`renderer_vulkan/present/present_push_constants.h`) maps pixel (0, 0) to clip (-1, -1),
+//   its top-left corner, and the same matrix here would put that pixel at the bottom-left and
+//   present the image upside down. Whoever fills the block negates the matrix's y row.
 // - The fragment stage samples mip level 0 explicitly, where Eden's `texture()` picks a level
 //   from the coordinate's derivatives: a present reads the view's base mip level whatever the
 //   scale (`crates/render/src/validate/view_ops.rs`), and Eden's presented images have one
