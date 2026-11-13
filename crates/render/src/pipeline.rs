@@ -438,9 +438,9 @@ pub struct TargetFormats {
 
 flag_set! {
     /// What the pipeline's shaders were specialised to emulate because the host lacks it
-    /// (render-backend, "Fixed-function state the host lacks"). Decided by the render crate's
-    /// `emulation()` (slice R2) and copied by the GPU crate into the shader variant key; here it
-    /// is part of the pipeline key.
+    /// (render-backend, "Fixed-function state the host lacks"). Decided by
+    /// [`crate::emulation::emulation`] and copied by the GPU crate into the shader variant key;
+    /// here it is part of the pipeline key.
     EmulationFlags {
         /// Alpha test as a fragment-shader discard.
         ALPHA_TEST = 0,

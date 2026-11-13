@@ -22,13 +22,18 @@
 //! Slice R1 adds the [`RecordingBackend`], in [`recording`]: the trait with no GPU, recording
 //! every list and modelling on the CPU the commands with exact answers.
 //!
-//! Later slices add format fallbacks and `emulation()` (R2), the CPU ASTC decoder (R3) and the
-//! host shaders (R4).
+//! Slice R2 adds the two choices every backend shares, as pure functions over [`Caps`]: the host
+//! format a guest format gets when the device lacks it, in [`fallback`], and what the shaders
+//! must emulate because the host lacks it, in [`mod@emulation`].
+//!
+//! Later slices add the CPU ASTC decoder (R3) and the host shaders (R4).
 
 pub mod backend;
 pub mod caps;
 pub mod command;
+pub mod emulation;
 pub mod error;
+pub mod fallback;
 mod flags;
 pub mod format;
 pub mod id;
@@ -44,13 +49,15 @@ pub use backend::{
 };
 pub use caps::{Caps, Features, FormatFeatures, FormatTable, Limits, SampleCounts};
 pub use command::{Command, CommandList, StagingSlice};
+pub use emulation::{DepthRange, EmulationState, emulation};
 pub use error::{RenderError, UnknownFlags};
+pub use fallback::{Conversion, HostFormat, features_for_usage, host_format};
 pub use format::PixelFormat;
 pub use id::{
     BufferId, FenceValue, PipelineId, ReadbackId, ResourceId, SamplerId, ShaderId, TextureId,
     ViewId,
 };
-pub use pipeline::{ComputePipelineDesc, GraphicsPipelineDesc};
+pub use pipeline::{ComputePipelineDesc, EmulationFlags, GraphicsPipelineDesc};
 pub use recording::{FrameDump, RecordingBackend};
 pub use resource::{BufferDesc, BufferUsage, SamplerDesc, TextureDesc, TextureUsage, ViewDesc};
 pub use shader::{ResourceBinding, ShaderDesc, ShaderInterface, ShaderSource, ShaderStage};
