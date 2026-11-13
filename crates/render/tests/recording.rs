@@ -14,3 +14,5 @@ mod fixtures;
 mod frames;
 #[path = "recording/lifecycle.rs"]
 mod lifecycle;
+#[path = "recording/replay.rs"]
+mod replay;
