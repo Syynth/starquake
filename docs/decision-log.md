@@ -345,3 +345,11 @@ Entry format:
 - **WHAT:** After the handler-style trial on `sm:`, `set:sys` and the first `fsp-srv` subset, services keep the explicit style: a `commands!` table and explicit reads and writes in each method. Two additions close what a glance cannot check: a declared buffer kind per buffer index, and constant command ids accepted by `commands!`. The trial's departure is accepted: `fsp-srv`'s `OpenSdCardFileSystem`, `OpenFile` and `GetSize` wait on host metadata calls on the calling thread; only `Read` is deferred. The services spec is amended to say so.
 - **WHY:** Across the three services no method spends more than about a third of its lines unpacking or packing, and review found no layout mistakes in the handlers; every finding was in the framework. Switching to typed signatures would rewrite three services to fix a problem the trial did not show. The blocking calls are fast metadata lookups, and deferring them would add complexity for little gain.
 
+## The repository is public and `main` is protected
+- **WHEN:** 2026-11-12
+- **PROJECT:** starquake
+- **SYSTEM:** process
+- **SCOPE:** moderate
+- **WHAT:** The owner made the repository public so that `main` could be protected, after inviting a human contributor. `main` now accepts changes only through pull requests whose `linux` and `title` checks have passed, with no force-pushes or deletion, and the rules apply to admins too. No approving review is required, because the agents merge under the owner's account and GitHub does not let an account approve its own pull request; the macOS check is not required because it is skipped on most pull requests. Before the change the history, issues and pull requests were audited: no local paths, dump details, keys or tokens. Commit metadata carries the owner's name and email, as it already does in the owner's other public repositories.
+- **WHY:** Branch protection is not available for private repositories on the owner's plan, and with a second person able to push, "never push to main" needed to be enforced rather than trusted. Public repositories also get free Actions minutes, including macOS.
+

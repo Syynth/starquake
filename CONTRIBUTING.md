@@ -36,8 +36,8 @@ natively, and the tests that do, needs an Apple Silicon Mac.
 - **Rules:** `CLAUDE.md` is the project's rulebook, for people as much as agents: lint settings,
   error handling, testing, licensing and attribution, and what may never be committed.
 - **Branches and pull requests:** one issue, one branch, one pull request, whose description
-  says `Closes #N` only if it closes the issue completely. Never push to `main` directly: the
-  repository can't enforce branch protection on its current plan, so this is on trust.
+  says `Closes #N` only if it closes the issue completely. `main` is protected: every change
+  reaches it through a pull request whose `linux` and `title` checks have passed.
 - **Tests first:** write the test, watch it fail, then make it pass. A bug fix comes with a test
   that failed before the fix.
 - **Merging:** your pull request merges once its CI has passed and it has been reviewed. The
