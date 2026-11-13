@@ -22,9 +22,12 @@
 //! Slice R1 adds the [`RecordingBackend`], in [`recording`]: the trait with no GPU, recording
 //! every list and modelling on the CPU the commands with exact answers.
 //!
-//! Later slices add format fallbacks and `emulation()` (R2), the CPU ASTC decoder (R3) and the
-//! host shaders (R4).
+//! Slice R3 adds the CPU ASTC decoder, in [`astc`]: ASTC blocks to RGBA8, for hosts whose GPU
+//! has no native ASTC and as the oracle for the GPU decoder.
+//!
+//! Later slices add format fallbacks and `emulation()` (R2) and the host shaders (R4).
 
+pub mod astc;
 pub mod backend;
 pub mod caps;
 pub mod command;
