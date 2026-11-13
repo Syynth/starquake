@@ -1,8 +1,9 @@
 [workspace]
 resolver = "3"
 members = ["apps/*", "crates/*", "tools/*", "xtask"]
-# Scripts and a patch for the reference emulator, not a crate (docs/reference-emulator.md).
-exclude = ["tools/oracle"]
+# Folders under tools/ that hold scripts, not crates: the reference emulator's patch and scripts
+# (docs/reference-emulator.md) and the agent workflow script (tools/pump/README.md).
+exclude = ["tools/oracle", "tools/pump"]
 
 [workspace.package]
 version = "0.0.0"
