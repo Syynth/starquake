@@ -201,8 +201,25 @@ fn quint_block(reader: &mut BitReader, bits: u32) -> [Value; 3] {
 }
 
 /// Fills `values` with the next `values.len()` values of a sequence stored with `encoding`.
-/// A last packed block that is only partly wanted is read whole; its missing bits are zero.
+///
+/// Only the sequence's own bits are read, `encoding.bit_length(values.len())` of them: a last
+/// packed block that is partly wanted takes its missing higher bits as zero (C.2.12),
+/// whatever the stream holds after the sequence. Eden's `DecodeIntegerSequence` reads the
+/// whole block from the stream (the parent module lists the difference). The reader is left
+/// after the last packed block.
 pub(super) fn decode_sequence(reader: &mut BitReader, encoding: Encoding, values: &mut [Value]) {
+    // A 128-bit stream holds at most 128 values, so a longer sequence is cut where its length
+    // has passed the end of any stream.
+    let count = u32::try_from(values.len()).map_or(u128::BITS, |count| count.min(u128::BITS));
+    let end = reader.position.saturating_add(encoding.bit_length(count));
+    let stream = reader.data;
+    reader.data &= mask(end);
+    read_sequence(reader, encoding, values);
+    reader.data = stream;
+}
+
+/// [`decode_sequence`] over a stream that ends where the sequence does.
+fn read_sequence(reader: &mut BitReader, encoding: Encoding, values: &mut [Value]) {
     match encoding.digit {
         Digit::None => {
             for value in values {
@@ -524,6 +541,129 @@ mod tests {
         let mut reader = BitReader::new(u128::MAX);
         decode_sequence(&mut reader, encoding(Digit::Trit, 6), &mut []);
         assert_eq!(reader.position(), 0);
+    }
+
+    /// Only a sequence's own bits are read. A last packed block that is partly wanted takes
+    /// its missing higher bits as zero (C.2.12), whatever follows the sequence in the stream:
+    /// in a block that is the unused colour bits, which need not be zero.
+    #[test]
+    fn bits_after_a_sequence_are_not_read() {
+        let decode = |stream: u128, encoding: Encoding, count: usize| {
+            let mut values = [Value::default(); 8];
+            decode_sequence(&mut BitReader::new(stream), encoding, &mut values[..count]);
+            values.map(|value| (value.bits, value.digit))
+        };
+
+        // Eight values of a trit and one bit: 8 + ceil(8 * 8 / 5) = 21 bits. The second
+        // packed block starts at bit 13 and holds values 5 to 7: m0 at 13, T1 T0 at 15..14,
+        // m1 at 16, T3 T2 at 18..17, m2 at 19 and T4 at 20. A whole block would go on with
+        // m3 at 21, T6 T5 at 23..22, m4 at 24 and T7 at 25.
+        //
+        // The first block is zero. The second has m0 = 1, m2 = 1 and T[4:0] = 11100. With
+        // T[7:5] = 000, T[4:2] = 111 gives C = { T[7:5], T[1:0] } = 00000, so
+        // t0 = t1 = t2 = 0. Were T5 read as 1, C would be 00100 and t1 = 1; were T[7:5]
+        // read as 111, C would be 11100 and t1 = t2 = 2.
+        let trits = encoding(Digit::Trit, 1);
+        assert_eq!(trits.bit_length(8), 21);
+        let sequence: u128 = (1 << 13) | (0b11 << 17) | (1 << 19) | (1 << 20);
+        let expected = [
+            (0, 0),
+            (0, 0),
+            (0, 0),
+            (0, 0),
+            (0, 0),
+            (1, 0),
+            (0, 0),
+            (1, 0),
+        ];
+        for after in [0, 1 << 22, 0b111 << 22, 1 << 25, u128::MAX << 21] {
+            assert_eq!(decode(sequence | after, trits, 8), expected, "{after:#x}");
+        }
+        // The same block wanted whole reads its own bits: ten values take 26 bits.
+        let mut whole = [Value::default(); 10];
+        decode_sequence(
+            &mut BitReader::new(sequence | (0b111 << 22)),
+            trits,
+            &mut whole,
+        );
+        // C = { T[7:5] = 011, T[1:0] = 00 } = 01100: C[3:2] = 11, so t0 = 0, t1 = t2 = 2;
+        // T[4:2] = 111, so t3 = t4 = 2.
+        assert_eq!(
+            whole[5..].iter().map(|v| v.digit).collect::<Vec<_>>(),
+            [0, 2, 2, 2, 2]
+        );
+
+        // Two values of a quint and one bit: 2 + ceil(7 * 2 / 3) = 7 bits: m0 at 0,
+        // Q2 Q1 Q0 at 3..1, m1 at 4 and Q4 Q3 at 6..5. A whole block would go on with m2 at
+        // 7 and Q6 Q5 at 9..8.
+        //
+        // m0 = 1, Q[2:0] = 110 and Q[4:3] = 01. With Q[6:5] = 00, Q[2:1] = 11 gives
+        // q0 = q1 = 4. Were Q5 read as 1: q2 = 4 and C = { Q[4:3], ~Q[6:5], Q0 } = 01100,
+        // so q1 = 1.
+        let quints = encoding(Digit::Quint, 1);
+        assert_eq!(quints.bit_length(2), 7);
+        let sequence: u128 = 1 | (0b110 << 1) | (0b01 << 5);
+        let mut expected = [(0, 0); 8];
+        expected[0] = (1, 4);
+        expected[1] = (0, 4);
+        for after in [0, 1 << 8, 0b11 << 8, u128::MAX << 7] {
+            assert_eq!(decode(sequence | after, quints, 2), expected, "{after:#x}");
+        }
+
+        // The exact edge, where the first bit after the sequence is a digit bit. Two trits
+        // with no plain bits take ceil(8 * 2 / 5) = 4 bits, T[3:0], and bit 4 would be T4.
+        // T[3:0] = 1100 with T4 = 0: C = 01100, C[3:2] = 11, so t0 = C[1:0] = 0 and t1 = 2.
+        // Were T4 read as 1, T[4:2] = 111 would give C = 00000 and t1 = 0; were T3 not read,
+        // C = 00100 and t1 = 1.
+        let bare_trits = encoding(Digit::Trit, 0);
+        assert_eq!(bare_trits.bit_length(2), 4);
+        let mut expected = [(0, 0); 8];
+        expected[1] = (0, 2);
+        for after in [0, 1 << 4, u128::MAX << 4] {
+            assert_eq!(
+                decode(0b1100 | after, bare_trits, 2),
+                expected,
+                "{after:#x}"
+            );
+        }
+        // One quint with no plain bits takes ceil(7 / 3) = 3 bits, Q[2:0], and bit 3 would
+        // be Q3. Q[2:0] = 101 with Q[4:3] = 00: C[2:0] = 101, so q0 = C[4:3] = 0. Were Q3
+        // read as 1, q0 = 1; were Q2 not read, C = 00001 and q0 = 1.
+        let bare_quints = encoding(Digit::Quint, 0);
+        assert_eq!(bare_quints.bit_length(1), 3);
+        for after in [0, 1 << 3, u128::MAX << 3] {
+            assert_eq!(
+                decode(0b101 | after, bare_quints, 1),
+                [(0, 0); 8],
+                "{after:#x}"
+            );
+        }
+
+        // A sequence that does not start at bit 0 ends its own length after its start: the
+        // two trits again, from bit 9, with ones before and after them.
+        let mut reader = BitReader::at((0b1100 << 9) | (u128::MAX << 13) | 0x1FF, 9);
+        let mut values = [Value::default(); 2];
+        decode_sequence(&mut reader, bare_trits, &mut values);
+        assert_eq!(values.map(|value| value.digit), [0, 2]);
+
+        // Plain bits: three values of five bits, and ones after them.
+        let mut expected = [(0, 0); 8];
+        expected[..3].copy_from_slice(&[(31, 0), (2, 0), (21, 0)]);
+        assert_eq!(
+            decode(
+                0b10101_00010_11111 | (u128::MAX << 15),
+                encoding(Digit::None, 5),
+                3
+            ),
+            expected
+        );
+
+        // The reader itself goes on from after the last packed block, in the stream as it
+        // is: two whole trit blocks of 13 bits.
+        let mut reader = BitReader::new(u128::MAX << 21);
+        decode_sequence(&mut reader, trits, &mut [Value::default(); 8]);
+        assert_eq!(reader.position(), 26);
+        assert_eq!(reader.take(4), 0b1111);
     }
 
     #[test]

@@ -293,6 +293,8 @@ pub(super) fn decode(
 
     let mut raw = [Value::default(); MAX_COLOR_VALUES];
     let raw = raw.get_mut(..value_count)?;
+    // The colour values take the low bits of the colour data; the rest of it is unused and
+    // is not read (`decode_sequence`).
     let color_data = (block >> color_start) & mask(color_bits);
     decode_sequence(&mut BitReader::new(color_data), color_encoding, raw);
     let mut values = [0; MAX_COLOR_VALUES];

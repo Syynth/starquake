@@ -19,9 +19,17 @@
 //!   `C = 32768` (127.5) down to 127 and this decoder, like Eden, rounds it up to 128.
 //! - **sRGB.** It has one interpolation for both encodings. In an sRGB format this decoder
 //!   uses the specification's sRGB one for red, green and blue, which lands within 1.
+//! - **Unused colour bits.** Like Eden, it reads the colour bits past the end of the colour
+//!   values into the last trit or quint block; here they are not read (module docs). It is
+//!   asked about the block with those bits cleared, which is the same block to a decoder that
+//!   does not read them. Where they are is read from this decoder's own layout step: a wrong
+//!   place would clear bits that matter and show as a disagreement, but a sequence length
+//!   that is too short would not show here. `integer::tests::bit_lengths` pins the length,
+//!   and `vectors::unused_colour_bits_are_not_read` a block with the bits set.
 
 use super::{ERROR_COLOR, astc_formats, decode_one, encoding, footprint, texel_count};
 use crate::astc::block::{Parsed, parse};
+use crate::astc::integer::mask;
 use crate::astc::{BLOCK_BYTES, MAX_TEXELS, decode_block};
 use crate::format::{ColorEncoding, PixelFormat};
 use proptest::prelude::*;
@@ -68,6 +76,18 @@ fn has_hdr_partition(block: u128, format: PixelFormat) -> bool {
     }
 }
 
+/// `block` with its unused colour bits cleared: those between the end of the colour values
+/// and the field above the colour data (module docs).
+fn without_unused_color_bits(block: u128, format: PixelFormat) -> u128 {
+    let Some(Parsed::Weights(layout)) = parse(block, footprint(format)) else {
+        return block;
+    };
+    let values = u32::try_from(layout.value_count).expect("at most 18");
+    let used = layout.color_encoding.bit_length(values);
+    let unused = mask(layout.color_bits - used) << (layout.color_start + used);
+    block & !unused
+}
+
 /// How far a comparison went.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Compared {
@@ -87,7 +107,7 @@ pub(super) fn check(block: u128, format: PixelFormat, legal: bool, texels: &[[u8
     if is_hdr_void_extent(block) {
         return Compared::Nothing;
     }
-    let (their_legal, theirs) = second_opinion(block, format);
+    let (their_legal, theirs) = second_opinion(without_unused_color_bits(block, format), format);
     assert_eq!(
         legal, their_legal,
         "{format}: {block:#034x} is legal to one decoder only"

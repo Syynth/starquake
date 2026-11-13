@@ -45,6 +45,13 @@
 //! - **An HDR void-extent block in a linear format is decoded** like every other HDR value,
 //!   where Eden gives its error colour although it decodes HDR endpoints.
 //!   `hdr_void_extent_in_a_linear_format`.
+//! - **Colour bits past the end of the colour values are not read.** A last trit or quint
+//!   block that is partly wanted takes its missing higher bits as zero (C.2.12), and the
+//!   colour bits left over after the values are unused. Eden's `DecodeIntegerSequence` reads
+//!   the whole block from the stream, so unused bits that are set change the values it
+//!   decodes. ARM's reference decoder reads only the bits of the wanted values (`decode_ise`
+//!   in `astcenc_integer_sequence.cpp`, astc-encoder, read on 2026-11-13; fact only).
+//!   `unused_colour_bits_are_not_read`, `integer::tests::bits_after_a_sequence_are_not_read`.
 //! - **HDR mode 11's `d0` and `d1` are as wide as table C.2.23 says** (5, 6 or 7 bits by the
 //!   mode). Eden's `SignExtend` keeps the bits of `v4` and `v5` above the field, which in the
 //!   narrower modes are the extra bits X2 to X5 and belong to other fields: a block with one
@@ -60,7 +67,9 @@
 //!   times 255, rounded half up, computed in integers.
 //! - **A void-extent block's coordinates are not checked** (C.2.23 makes a low coordinate at
 //!   or above its high one illegal; the LDR profile, C.2.25, lets a decoder skip the check, and
-//!   Eden skips it). `void_extent_coordinates_are_not_checked`.
+//!   Eden skips it). That allowance is the LDR profile's: for the HDR void-extent blocks this
+//!   decoder decodes in a linear format, skipping the check is Eden's behaviour and looser
+//!   than the specification. `void_extent_coordinates_are_not_checked`.
 //! - **An LDR void-extent colour is the top 8 bits** of each 16-bit component.
 //!
 //! # How it is checked

@@ -585,8 +585,63 @@ fn hdr_void_extent_in_an_srgb_format() {
     assert_eq!(legal(block, F::Astc2d6x6Srgb), vec![ERROR_COLOR; 36]);
 }
 
-/// C.2.23 makes a low coordinate at or above its high one illegal; the LDR profile lets a
-/// decoder skip the check, and this one does, as Eden does (module docs).
+/// Colour bits past the end of the colour values are not read (C.2.12; module docs, "Where
+/// this differs from Eden"), and the colour values of a block can be trits.
+///
+/// One partition with mode 12 (RGBA, direct: `e0 = (v0, v2, v4, v6)` and
+/// `e1 = (v1, v3, v5, v7)` when `v1 + v3 + v5 >= v0 + v2 + v4`), on the 12 by 12 footprint
+/// with a weight grid 4 wide and 11 high of two-bit weights. Table C.2.8's third row (bits
+/// 3..2 = 10) is a grid A+2 wide and B+8 high: A = 2 in bits 6..5, B = 3 in bits 8..7. The 44
+/// weights take 88 bits, which leaves 128 - 17 - 88 = 23 bits of colour data. Eight values
+/// fit them in the range 0..5 at most (a trit and a bit each, 8 + ceil(8 * 8 / 5) = 21 bits;
+/// the next range, 0..7, takes 24), so colour bits 21 and 22, block bits 38 and 39, are
+/// unused.
+///
+/// Range 0..5 unquantizes to 0, 51, 102 for bit 0 with trit 0, 1, 2, and to 255, 204, 153
+/// for bit 1 (C.2.13: A is the bit nine times, C = 204, `T = trit * C`, `T ^= A`,
+/// `(A & 0x80) | (T >> 2)`).
+///
+/// The first trit block holds v0 to v4 with every trit 0 and the bits 0, 1, 1, 1, 1 (m0 at
+/// colour bit 0, m1 at 3, m2 at 6, m3 at 8, m4 at 11): 0, 255, 255, 255, 255. The second
+/// starts at colour bit 13 and holds v5 to v7: m0 = 1 at 13, T[4:0] = 11100 (T2 at 17, T3 at
+/// 18, T4 at 20), m1 = 0 at 16 and m2 = 1 at 19. Its T[7:5] are past the end of the values,
+/// so they are 0: T[4:2] = 111 gives C = { T[7:5], T[1:0] } = 00000 and trits 0, 0, 0, which
+/// makes v5 = 255, v6 = 0 and v7 = 255. So `e0 = (0, 255, 255, 0)` and
+/// `e1 = (255, 255, 255, 255)`.
+///
+/// T5 would be colour bit 22, an unused bit. A decoder that read it as set would get
+/// C = 00100, the trits 0, 1, 0, v6 = 51 and `e0 = (0, 255, 255, 51)`.
+#[test]
+fn unused_colour_bits_are_not_read() {
+    const GRID_4X11: u128 = (3 << 7) | (2 << 5) | (0b10 << 2);
+    const RGBA_DIRECT: u128 = 12;
+    let first = (1 << 3) | (1 << 6) | (1 << 8) | (1 << 11);
+    let second = (1 << 13) | (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20);
+    let colors: u128 = (first | second) << COLOR_AT;
+    let block = GRID_4X11 | WEIGHTS_0_TO_3 | (RGBA_DIRECT << CEM_AT) | colors;
+    let unused: [u128; 2] = [1 << (COLOR_AT + 21), 1 << (COLOR_AT + 22)];
+    for extra in [0, unused[0], unused[1], unused[0] | unused[1]] {
+        // Every weight 0: the first endpoint throughout.
+        assert_eq!(
+            legal(block | extra, F::Astc2d12x12Unorm),
+            vec![[0, 255, 255, 0]; 144],
+            "{extra:#x}"
+        );
+        // Every weight 3, which is 64 after unquantization and infill: the second.
+        assert_eq!(
+            legal(
+                block | extra | plain_weights(&[3; 44], 2),
+                F::Astc2d12x12Unorm
+            ),
+            vec![[255; 4]; 144],
+            "{extra:#x}"
+        );
+    }
+}
+
+/// C.2.23 makes a low coordinate at or above its high one illegal. The LDR profile lets a
+/// decoder skip the check, and this one does, as Eden does; for the HDR block below that is
+/// Eden's behaviour only (module docs).
 #[test]
 fn void_extent_coordinates_are_not_checked() {
     // Minimum S = 5, maximum S = 3, minimum T = 7, maximum T = 7.
