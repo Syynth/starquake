@@ -11,6 +11,9 @@ use super::integer::{Digit, Encoding, Value, replicate};
 const HDR_ONE: i32 = 0x780;
 /// The largest 12-bit HDR value.
 const HDR_MAX: i32 = 0xFFF;
+/// Bits 10..7 of HDR mode 15's first alpha, which come from `v7` (C.2.15:
+/// "v6 |= (v7 << (mode+1)) & 0x780"). The same number as [`HDR_ONE`], by coincidence.
+const HDR_ALPHA_TOP_BITS: i32 = 0x780;
 
 /// The two colours of a partition, as red, green, blue, alpha.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -260,7 +263,7 @@ fn hdr_alpha(v6: i32, v7: i32) -> [i32; 2] {
     if mode == 3 {
         return [a << 5, b << 5];
     }
-    a |= (b << (mode + 1)) & HDR_ONE;
+    a |= (b << (mode + 1)) & HDR_ALPHA_TOP_BITS;
     b &= 0x3F >> mode;
     b ^= 0x20 >> mode;
     b -= 0x20 >> mode;

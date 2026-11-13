@@ -1,11 +1,10 @@
 //! A CPU decoder for ASTC-compressed textures (docs/specs/render-backend.md, "ASTC"; slice R3).
 //!
 //! Hosts whose GPU has no native ASTC get RGBA8 instead (the format fallback choice, slice
-//! R2). The decode
-//! normally runs on the GPU (slice R10); this decoder is the fallback for it and the oracle it
-//! is checked against. It decodes the 2D blocks of the console's fourteen footprints into
-//! RGBA8 texels: bytes in the order red, green, blue, alpha, which is the memory layout of
-//! [`PixelFormat::A8B8G8R8Unorm`] and [`PixelFormat::A8B8G8R8Srgb`].
+//! R2). The decode normally runs on the GPU (slice R10); this decoder is the fallback for it
+//! and the oracle it is checked against. It decodes the 2D blocks of the console's fourteen
+//! footprints into RGBA8 texels: bytes in the order red, green, blue, alpha, which is the
+//! memory layout of [`PixelFormat::A8B8G8R8Unorm`] and [`PixelFormat::A8B8G8R8Srgb`].
 //!
 //! # Sources
 //!
@@ -56,6 +55,11 @@
 //!   mode). Eden's `SignExtend` keeps the bits of `v4` and `v5` above the field, which in the
 //!   narrower modes are the extra bits X2 to X5 and belong to other fields: a block with one
 //!   of them set decodes to other colours there. `endpoints::tests::hdr_direct_by_hand`.
+//!
+//! One more is a difference in the text only. **A "small block" for partitioning has fewer
+//! than 31 texels**, as C.2.21 writes it, where Eden writes `< 32`. No footprint has 31 texels,
+//! so the two agree on every block; `partition_patterns` has a footprint on each side (6 by 5
+//! with 30 texels, 6 by 6 with 36).
 //!
 //! # Where this follows Eden
 //!
