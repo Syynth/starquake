@@ -210,6 +210,9 @@ Platform-specific code must still compile (or be `cfg`-gated) on Linux; check wi
   messages; as a PR title only GitHub's generated `Revert "<conventional title>"` is accepted
   besides a conventional one).
 - One issue → one branch → one PR, with an honest `Closes #N`.
+- Issues labelled `help wanted` are reserved for human contributors (`CONTRIBUTING.md`): don't
+  put them in a wave or build them, and leave pull requests from human contributors for the
+  owner to merge.
 - **Don't file GitHub issues for work you propose.** Follow-ups, findings and ideas go into
   `docs/proposals.md`; the owner promotes the ones worth doing to issues. Work that belongs to
   an existing issue goes there as a comment.
