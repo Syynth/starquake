@@ -215,18 +215,34 @@ fn the_pixels_must_be_exactly_the_image() {
 /// A size whose byte count does not fit in 64 bits is refused, not wrapped.
 #[test]
 fn a_size_that_overflows_is_refused() {
-    assert_eq!(
-        encode_png(u32::MAX, u32::MAX, &[]),
-        Err(RenderError::Overflow { what: "frame size" })
-    );
-    // The largest that fits is a size mismatch, as any other.
-    assert_eq!(
-        encode_png(u32::MAX, 1, &[]),
+    let overflow = Err(RenderError::Overflow { what: "frame size" });
+    let mismatch = |expected| {
         Err(RenderError::SizeMismatch {
             what: "frame pixels",
-            expected: u64::from(u32::MAX) * 4,
-            actual: 0
+            expected,
+            actual: 0,
         })
+    };
+    assert_eq!(encode_png(u32::MAX, u32::MAX, &[]), overflow);
+    // A size that fits is a size mismatch, as any other.
+    assert_eq!(
+        encode_png(u32::MAX, 1, &[]),
+        mismatch(u64::from(u32::MAX) * 4)
+    );
+    // The edge, with either side the long one. Four bytes for each of (2^32 - 1) x 2^30
+    // pixels is 2^64 - 2^32 bytes, the most two sides can ask for and still fit; one more
+    // row or column does not fit.
+    let edge = 1 << 30;
+    let most = u64::MAX - u64::from(u32::MAX);
+    assert_eq!(encode_png(u32::MAX, edge, &[]), mismatch(most));
+    assert_eq!(encode_png(edge, u32::MAX, &[]), mismatch(most));
+    assert_eq!(encode_png(u32::MAX, edge + 1, &[]), overflow);
+    assert_eq!(encode_png(edge + 1, u32::MAX, &[]), overflow);
+    // The pixel count alone fits where its bytes do not: 2^62 pixels are 2^64 bytes.
+    assert_eq!(encode_png(1 << 31, 1 << 31, &[]), overflow);
+    assert_eq!(
+        encode_png((1 << 31) - 1, 1 << 31, &[]),
+        mismatch(u64::MAX - (1 << 33) + 1)
     );
 }
 

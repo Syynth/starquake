@@ -15,6 +15,7 @@ use starquake_render::{
 };
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 const RGBA: PixelFormat = PixelFormat::A8B8G8R8Unorm;
@@ -772,4 +773,87 @@ fn a_failing_sink_does_not_stop_later_frames() {
     assert_eq!(sink.0.numbers(), Vec::<u64>::new());
     submit(&b, vec![present(v, one, 3)]);
     assert_eq!(sink.0.numbers(), vec![2, 3]);
+}
+
+/// A sink that asks the backend a question when it is dropped, which takes the backend's
+/// lock, and that removes itself from the backend when it is given a frame, if told to.
+#[derive(Debug)]
+struct AskingOnDrop {
+    backend: Weak<RecordingBackend>,
+    removes_itself: bool,
+    /// Where the answer goes: the fence value completed when the sink was dropped.
+    dropped: Mutex<Sender<FenceValue>>,
+}
+
+impl FrameSink for AskingOnDrop {
+    fn frame(&self, _: Frame) {
+        if self.removes_itself
+            && let Some(b) = self.backend.upgrade()
+        {
+            b.set_frame_sink(None);
+        }
+    }
+}
+
+impl Drop for AskingOnDrop {
+    fn drop(&mut self) {
+        if let Some(b) = self.backend.upgrade() {
+            let dropped = self.dropped.lock().unwrap_or_else(PoisonError::into_inner);
+            // A closed channel means the test has already failed.
+            let _ = dropped.send(b.completed());
+        }
+    }
+}
+
+/// Installs an [`AskingOnDrop`] of which the backend holds the only handle, then runs `then`
+/// on another thread, so that a deadlock fails the test instead of hanging it. Returns where
+/// the sink's answer arrives, and the thread.
+fn drop_the_only_handle(
+    removes_itself: bool,
+    then: fn(&RecordingBackend, ViewId),
+) -> (Receiver<FenceValue>, JoinHandle<()>) {
+    let b = Arc::new(backend());
+    let v = uploaded(&b, RGBA, (1, 1), &[1, 2, 3, 4]);
+    let (dropped_tx, dropped_rx) = channel();
+    let sink: Arc<dyn FrameSink> = Arc::new(AskingOnDrop {
+        backend: Arc::downgrade(&b),
+        removes_itself,
+        dropped: Mutex::new(dropped_tx),
+    });
+    b.set_frame_sink(Some(sink));
+    let worker = std::thread::spawn(move || then(&b, v));
+    (dropped_rx, worker)
+}
+
+/// The backend may hold the last handle to a sink, so removing the sink runs the sink's own
+/// `Drop`. That happens with no lock held, as `frame` does: a `Drop` that calls the backend
+/// gets its answer.
+#[test]
+fn a_removed_sink_is_dropped_with_no_lock_held() {
+    let (dropped, worker) = drop_the_only_handle(false, |b, _| b.set_frame_sink(None));
+    // One list was submitted, the upload.
+    assert_eq!(dropped.recv_timeout(WAIT), Ok(FenceValue::new(1)));
+    worker.join().expect("the worker finished");
+}
+
+/// As above, for a sink that another one replaces.
+#[test]
+fn a_replaced_sink_is_dropped_with_no_lock_held() {
+    let (dropped, worker) = drop_the_only_handle(false, |b, _| {
+        collecting(b);
+    });
+    assert_eq!(dropped.recv_timeout(WAIT), Ok(FenceValue::new(1)));
+    worker.join().expect("the worker finished");
+}
+
+/// As above, for a sink that was removed while its frame was being delivered: the handle that
+/// travelled with the frame is then the last, and is dropped once the frame is delivered.
+#[test]
+fn the_sink_of_the_last_waiting_frame_is_dropped_with_no_lock_held() {
+    let (dropped, worker) = drop_the_only_handle(true, |b, v| {
+        submit(b, vec![present(v, rect(0, 0, 1, 1), 1)]);
+    });
+    // The upload and the present were submitted.
+    assert_eq!(dropped.recv_timeout(WAIT), Ok(FenceValue::new(2)));
+    worker.join().expect("the worker finished");
 }

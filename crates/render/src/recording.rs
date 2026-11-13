@@ -41,13 +41,18 @@
 //! ([`RecordingBackend::set_frame_sink`]), each list's dumped frames go to the sink that was
 //! installed when the list was submitted, as [`Frame`]s, and do not also wait to be taken. A
 //! frame's pixels are known when the dump's are and the view's format has an exact RGBA8 form
-//! ([`crate::frame`]). The sink is called on a submitting thread, after the list has completed
-//! and with no lock held, so it may call the backend, and may submit. Frames are delivered one
-//! at a time in the order they were presented, whichever thread submitted them: when one
-//! thread's submit finds another thread delivering, it leaves its frames to that thread and
-//! returns; otherwise every frame of a list has been delivered when its `submit` returns. If a
-//! sink panics, the panic leaves through the `submit` that called it (the list has completed
-//! all the same), and the frames behind the failed one are delivered by the next submit.
+//! ([`crate::frame`]). The sink is called on a submitting thread, inside `submit`, after the
+//! list has completed and with no lock held, so it may call the backend, and may submit. A sink
+//! the backend holds the last handle to is dropped with no lock held as well, so its `Drop`
+//! may call the backend too. Frames are delivered one at a time in the order they were
+//! presented, whichever thread submitted them: when one thread's submit finds another thread
+//! delivering, it leaves its frames to that thread and returns; otherwise every frame of a
+//! list has been delivered when its `submit` returns. So a `submit` takes as long as the sink
+//! takes with its frames, and with the frames other threads leave it while it delivers. If a
+//! sink panics, the panic leaves through the `submit` that called it, which is another
+//! thread's than the frame's when that thread was delivering (the list has completed all the
+//! same). The frames behind the failed one, of whichever thread, are delivered by the next
+//! submit, and wait in the backend until there is one.
 //!
 //! **Lists.** `submit` checks the whole list before it changes anything (`plan::check`): every id
 //! names a live resource, every description passes [`crate::validate`] (which refuses a copy
@@ -527,7 +532,10 @@ impl RecordingBackend {
     /// Installs the sink that receives the frames presented with `dump` set, or removes it
     /// with `None` (module docs, "Frame dumps"). It applies to lists submitted from now on.
     pub fn set_frame_sink(&self, sink: Option<Arc<dyn FrameSink>>) {
-        self.state().sink = sink;
+        // The lock is released at the end of this statement, before the sink that was
+        // installed is dropped: this may be its last handle, and its `Drop` is not ours.
+        let replaced = std::mem::replace(&mut self.state().sink, sink);
+        drop(replaced);
     }
 
     /// Hands the frames in the outbox to their sinks, oldest first, unless a thread is already
@@ -551,6 +559,8 @@ impl RecordingBackend {
             };
             drop(state);
             sink.frame(dump.into());
+            // Before the lock is taken again: this may be the sink's last handle.
+            drop(sink);
             state = self.state();
         }
     }
