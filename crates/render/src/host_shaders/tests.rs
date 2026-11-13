@@ -625,7 +625,7 @@ fn body(shader: HostShader, name: &str) -> Vec<String> {
 }
 
 /// Each clear entry point reinterprets the block's bit patterns as its own type and does not
-/// convert the numbers: a float clear of 0.5 arrives as the pattern 0x3F00_0000 and must be
+/// convert the numbers: a float clear of 0.5 arrives as the pattern `0x3F00_0000` and must be
 /// written as 0.5, not as 1056964608.0. The depth entry point reads the first pattern.
 ///
 /// `params.0` is the block's one member, `value`; `params.0.0` is its `x`.
