@@ -10,6 +10,8 @@ mod commands;
 mod contents;
 #[path = "recording/fixtures.rs"]
 mod fixtures;
+#[path = "recording/frames.rs"]
+mod frames;
 #[path = "recording/lifecycle.rs"]
 mod lifecycle;
 #[path = "recording/replay.rs"]
