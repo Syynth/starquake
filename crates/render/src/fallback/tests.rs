@@ -8,12 +8,12 @@
 use super::{Conversion, HostFormat, features_for_usage, host_format};
 use crate::caps::{FormatFeatures, FormatTable};
 use crate::error::RenderError;
-use crate::format::PixelFormat;
+use crate::format::{Compression, FormatAspect, PixelFormat};
 use crate::resource::TextureUsage;
 use PixelFormat as F;
 
 /// Every guest format that has stand-ins, with them in order and their conversion.
-const STAND_INS: [(PixelFormat, &[PixelFormat], Conversion); 35] = [
+const STAND_INS: [(PixelFormat, &[PixelFormat], Conversion); 37] = [
     // The spec's first row: ASTC, all block sizes, to RGBA8 of the same encoding.
     (
         F::Astc2d4x4Unorm,
@@ -148,6 +148,13 @@ const STAND_INS: [(PixelFormat, &[PixelFormat], Conversion); 35] = [
         &[F::R16G16B16A16Float],
         Conversion::Texel,
     ),
+    // The two formats Eden's `SurfaceFormat` gives another format on every device.
+    (F::A1B5G5R5Unorm, &[F::A1R5G5B5Unorm], Conversion::Texel),
+    (
+        F::R16G16B16X16Float,
+        &[F::R16G16B16A16Float],
+        Conversion::Texel,
+    ),
 ];
 
 /// Each format feature with what an error calls it, in the order errors pick the first.
@@ -183,7 +190,7 @@ fn unsupported(format: PixelFormat, usage: &'static str) -> RenderError {
 }
 
 /// The table above is the module docs' table: 28 ASTC formats (every one Eden lists, and every
-/// ASTC entry of `PixelFormat`) and 7 others, each once, and no stand-in is its own guest.
+/// ASTC entry of `PixelFormat`) and 9 others, each once, and no stand-in is its own guest.
 #[test]
 fn the_expected_table_is_well_formed() {
     let astc: Vec<_> = STAND_INS
@@ -191,7 +198,7 @@ fn the_expected_table_is_well_formed() {
         .filter(|row| row.2 == Conversion::AstcDecode)
         .collect();
     assert_eq!(astc.len(), 28);
-    assert_eq!(STAND_INS.len() - astc.len(), 7);
+    assert_eq!(STAND_INS.len() - astc.len(), 9);
     for (index, (guest, alternatives, conversion)) in STAND_INS.iter().enumerate() {
         assert!(
             STAND_INS[..index].iter().all(|row| row.0 != *guest),
@@ -291,8 +298,42 @@ fn every_combination() {
         }
     }
     // 63 needed sets hold 6 x 32 (set, member) pairs; a chain of n formats has 2^n devices,
-    // each in two passes. 77 formats have a chain of 1, 33 of 2 and 2 of 3.
-    assert_eq!(checked, 6 * 32 * 2 * (77 * 2 + 33 * 4 + 2 * 8));
+    // each in two passes. 75 formats have a chain of 1, 35 of 2 and 2 of 3.
+    assert_eq!(checked, 6 * 32 * 2 * (75 * 2 + 35 * 4 + 2 * 8));
+}
+
+/// What the module docs promise of every stand-in ("no narrower or lossy stand-in"), checked
+/// on the shipping lists, for every format. A stand-in is uncompressed, keeps the guest's sRGB
+/// encoding, has every aspect the guest has and is colour exactly when the guest is, and has
+/// at least the guest's bits per texel. A colour stand-in keeps the channels' numeric type; a
+/// depth stand-in may hold normalised depth as float (the spec's "D32 float + S8" row).
+#[test]
+fn a_stand_in_can_hold_its_guest() {
+    let mut pairs = 0_u32;
+    for guest in PixelFormat::ALL {
+        let (alternatives, _) = super::stand_ins(guest);
+        for stand_in in alternatives {
+            let pair = format!("{stand_in} for {guest}");
+            assert!(!stand_in.is_compressed(), "{pair}");
+            assert_eq!(stand_in.is_srgb(), guest.is_srgb(), "{pair}");
+            assert!(stand_in.has_depth() || !guest.has_depth(), "{pair}");
+            assert!(stand_in.has_stencil() || !guest.has_stencil(), "{pair}");
+            let colour = guest.aspect() == FormatAspect::Color;
+            assert_eq!(stand_in.aspect() == FormatAspect::Color, colour, "{pair}");
+            if colour {
+                assert_eq!(stand_in.numeric(), guest.numeric(), "{pair}");
+            }
+            if !guest.is_compressed() {
+                assert!(
+                    stand_in.bits_per_block() >= guest.bits_per_block(),
+                    "{pair}"
+                );
+            }
+            pairs += 1;
+        }
+    }
+    // 28 ASTC formats and 7 others with one stand-in each, and 2 with two.
+    assert_eq!(pairs, 28 + 7 + 2 * 2);
 }
 
 /// The error names the first needed feature the device lacks for the guest format, in the
@@ -370,9 +411,14 @@ fn a_stand_in_needs_every_needed_feature() {
     );
 }
 
-/// A device shaped like wgpu's on an Apple Silicon Mac, from the spec's decision 1 table and
-/// its "Formats" table: ASTC is native (sampled, filtered and copied, as compressed formats
-/// are), D24 + S8 is missing (the spec's guess for Apple GPUs) and D32 float + S8 is there.
+/// A device shaped like wgpu's on an Apple Silicon Mac.
+///
+/// From the spec's decision 1 table and its "Formats" table: ASTC is native (sampled, filtered
+/// and copied, as compressed formats are), D24 + S8 is missing (the spec's guess for Apple
+/// GPUs) and D32 float + S8 is there. From the `TextureFormat` list of wgpu-types 30.0.2: it
+/// has no three-channel float, no RGBX float and no packed format of 16 bits or fewer, so the
+/// nine such guest formats below report nothing. How the wgpu backend reports them is slice
+/// R5's to decide; nothing is the plain reading of that list.
 #[test]
 fn a_device_shaped_like_wgpu_on_a_mac() {
     let compressed = FormatFeatures::SAMPLE | FormatFeatures::FILTER | FormatFeatures::COPY;
@@ -384,6 +430,45 @@ fn a_device_shaped_like_wgpu_on_a_mac() {
     }
     mac.set(F::D24UnormS8Uint, FormatFeatures::EMPTY);
     mac.set(F::S8UintD24Unorm, FormatFeatures::EMPTY);
+    for format in [
+        F::R32G32B32Float,
+        F::R16G16B16X16Float,
+        F::R5G6B5Unorm,
+        F::B5G6R5Unorm,
+        F::A1R5G5B5Unorm,
+        F::A1B5G5R5Unorm,
+        F::A5B5G5R1Unorm,
+        F::A4B4G4R4Unorm,
+        F::G4R4Unorm,
+    ] {
+        mac.set(format, FormatFeatures::EMPTY);
+    }
+
+    // The two float formats get their four-channel form, converted.
+    let target = features_for_usage(TextureUsage::RENDER_TARGET | TextureUsage::SAMPLED);
+    assert_eq!(
+        host_format(&mac, F::R32G32B32Float, target),
+        Ok(stood_in(F::R32G32B32A32Float, Conversion::Texel))
+    );
+    assert_eq!(
+        host_format(&mac, F::R16G16B16X16Float, target),
+        Ok(stood_in(F::R16G16B16A16Float, Conversion::Texel))
+    );
+    // The packed formats have nothing: where one has a stand-in, it is another packed format.
+    for guest in [
+        F::R5G6B5Unorm,
+        F::B5G6R5Unorm,
+        F::A1R5G5B5Unorm,
+        F::A1B5G5R5Unorm,
+        F::A5B5G5R1Unorm,
+        F::A4B4G4R4Unorm,
+        F::G4R4Unorm,
+    ] {
+        assert_eq!(
+            host_format(&mac, guest, FormatFeatures::SAMPLE),
+            Err(unsupported(guest, "sampling"))
+        );
+    }
 
     // ASTC, the console's most used format, is uploaded as it is.
     for guest in [F::Astc2d8x8Unorm, F::Astc2d8x8Srgb, F::Astc2d4x4Unorm] {
@@ -495,13 +580,26 @@ fn where_this_differs_from_eden() {
         Err(unsupported(F::B10G11R11Float, "render targets"))
     );
     // Eden offers R8_UNORM for G4R4_UNORM, and R4G4B4A4 (which `PixelFormat` lacks) for
-    // A4B4G4R4_UNORM; a BC format the device lacks is decoded by Eden and is an error here.
-    for guest in [F::G4R4Unorm, F::A4B4G4R4Unorm, F::Bc1RgbaUnorm, F::Bc7Srgb] {
+    // A4B4G4R4_UNORM, and gives A5B5G5R1_UNORM Vulkan's R5G5B5A1 (which it lacks too).
+    for guest in [F::G4R4Unorm, F::A4B4G4R4Unorm, F::A5B5G5R1Unorm] {
         assert_eq!(
             host_format(&lacking(guest), guest, FormatFeatures::SAMPLE),
             Err(unsupported(guest, "sampling"))
         );
     }
+    // A BC, ETC2 or EAC format the device lacks is decoded by Eden and is an error here: all
+    // 14 BC and 10 ETC2 and EAC entries of `PixelFormat`.
+    let mut decoded_by_eden = 0;
+    for guest in PixelFormat::ALL {
+        if matches!(guest.compression(), Compression::Bc | Compression::Etc2) {
+            assert_eq!(
+                host_format(&lacking(guest), guest, FormatFeatures::SAMPLE),
+                Err(unsupported(guest, "sampling"))
+            );
+            decoded_by_eden += 1;
+        }
+    }
+    assert_eq!(decoded_by_eden, 14 + 10);
     // Stand-ins are one step: D24_UNORM_S8_UINT is S8_UINT's first stand-in, and a device
     // lacking both does not go on to D24's own stand-ins beyond S8_UINT's list. (Here the two
     // lists agree on D32_FLOAT_S8_UINT; R5G6B5_UNORM has no stand-in of its own, so a device

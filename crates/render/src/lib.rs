@@ -22,9 +22,10 @@
 //! Slice R1 adds the [`RecordingBackend`], in [`recording`]: the trait with no GPU, recording
 //! every list and modelling on the CPU the commands with exact answers.
 //!
-//! Slice R2 adds the two choices every backend shares, as pure functions over [`Caps`]: the host
-//! format a guest format gets when the device lacks it, in [`fallback`], and what the shaders
-//! must emulate because the host lacks it, in [`mod@emulation`].
+//! Slice R2 adds the two choices every backend shares, as pure functions over what the device
+//! reports: the host format a guest format gets when the device's [`FormatTable`] lacks it, in
+//! [`fallback`], and what the shaders must emulate because its [`Caps`] lack it, in
+//! [`mod@emulation`].
 //!
 //! Later slices add the CPU ASTC decoder (R3) and the host shaders (R4).
 

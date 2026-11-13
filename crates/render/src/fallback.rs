@@ -22,9 +22,10 @@
 //!
 //! The spec's table of known conversions, with its third row ("formats the host can't render
 //! to or blend: a wider format") made concrete by Eden's list of alternatives:
-//! `GetFormatAlternatives` in `eden/src/video_core/vulkan_common/vulkan_device.cpp` and the
-//! ASTC rule of `SurfaceFormat` in `eden/src/video_core/renderer_vulkan/maxwell_to_vk.cpp`,
-//! both @ cf654052 (GPL-3.0-or-later), from which the lists below are ported.
+//! `GetFormatAlternatives` in `eden/src/video_core/vulkan_common/vulkan_device.cpp` and
+//! `SurfaceFormat` in `eden/src/video_core/renderer_vulkan/maxwell_to_vk.cpp` (its ASTC rule,
+//! and the rows of its table that give a guest format another format on every device), both
+//! @ cf654052 (GPL-3.0-or-later), from which the lists below are ported.
 //!
 //! | Guest format | Stand-ins, in order | Conversion | Source |
 //! |---|---|---|---|
@@ -36,13 +37,16 @@
 //! | `B5G6R5_UNORM` | `R5G6B5_UNORM` | [`Conversion::Texel`] | Eden's `B5G6R5_UNORM_PACK16` |
 //! | `R32G32B32_FLOAT` | `R32G32B32A32_FLOAT` | [`Conversion::Texel`] | Eden's `VK_FORMAT_R32G32B32_SFLOAT` |
 //! | `B10G11R11_FLOAT` | `R16G16B16A16_FLOAT` | [`Conversion::Texel`] | Eden's `B10G11R11_UFLOAT_PACK32` |
+//! | `A1B5G5R5_UNORM` | `A1R5G5B5_UNORM` | [`Conversion::Texel`] | Eden's `SurfaceFormat` maps it to Vulkan's `A1R5G5B5_UNORM_PACK16` ("flipped with swizzle") |
+//! | `R16G16B16X16_FLOAT` | `R16G16B16A16_FLOAT` | [`Conversion::Texel`] | Eden's `SurfaceFormat` maps it to Vulkan's `R16G16B16A16_SFLOAT` |
 //!
 //! Every other format has no stand-in: the device has it, or the texture cannot be made.
 //!
 //! # Where this differs from Eden
 //!
 //! Each is pinned by a test in `fallback::tests` (`where_this_differs_from_eden`,
-//! `astc_is_decided_per_format`).
+//! `astc_is_decided_per_format`, `every_combination`), and `a_stand_in_can_hold_its_guest`
+//! checks the second for every stand-in.
 //!
 //! - **Stricter: nothing fits.** Eden logs an error and uses the wanted format anyway; here it
 //!   is an error the GPU crate counts.
@@ -52,16 +56,22 @@
 //!   None can hold the guest's values, so none is offered: the spec's row asks for a wider
 //!   format.
 //! - **Not expressible.** Eden's alternatives that [`PixelFormat`] has no entry for are left
-//!   out (`D16_UNORM_S8_UINT`; `R4G4B4A4_UNORM` for `A4B4G4R4_UNORM`), as are its entries for
-//!   vertex formats, which are not texture formats.
+//!   out (`D16_UNORM_S8_UINT`; `R4G4B4A4_UNORM` for `A4B4G4R4_UNORM`), as is the Vulkan format
+//!   its `SurfaceFormat` gives `A5B5G5R1_UNORM` on every device (`R5G5B5A1_UNORM_PACK16`,
+//!   "specially swizzled"), and its entries for vertex formats, which are not texture formats.
+//! - **Per report, not on every device.** Eden's `SurfaceFormat` gives `S8_UINT_D24_UNORM`,
+//!   `A1B5G5R5_UNORM` and `R16G16B16X16_FLOAT` another format whatever the device has. Here
+//!   that format is a stand-in, used only when the device's report lacks the guest format.
 //! - **Per format, not per device.** Eden decodes every ASTC format unless the device has all
 //!   of them (`ComputeIsOptimalAstcSupported`). Here each format is decided on its own report.
-//! - **Not ported: recompression and BC.** Eden can recompress decoded ASTC to BC1 or BC3 (the
-//!   spec defers that, decision 6), and decodes BC formats on devices without them
-//!   (`IsOptimalBcnSupported`); the spec's table has no BC row and no BC decoder is planned, so
-//!   a BC format the device lacks is an error.
-//! - **Conversion instead of a view swizzle.** Eden fixes `B5G6R5_UNORM`'s channel order with
-//!   the view's swizzle; a device without view swizzles cannot, so the data is converted.
+//! - **Not ported: recompression, BC, ETC2 and EAC.** Eden can recompress decoded ASTC to BC1
+//!   or BC3 (the spec defers that, decision 6), and decodes BC formats and ETC2 and EAC
+//!   formats on devices without them (`IsOptimalBcnSupported`, `IsOptimalEtc2Supported`); the
+//!   spec's table has no row for either and no decoder for them is planned, so a BC, ETC2 or
+//!   EAC format the device lacks is an error.
+//! - **Conversion instead of a view swizzle.** Eden fixes the channel order of `B5G6R5_UNORM`
+//!   and `A1B5G5R5_UNORM` with the view's swizzle; a device without view swizzles cannot, so
+//!   the data is converted.
 
 use crate::caps::{FormatFeatures, FormatTable};
 use crate::error::RenderError;
@@ -122,7 +132,8 @@ fn stand_ins(guest: PixelFormat) -> (&'static [PixelFormat], Conversion) {
         F::X8D24Unorm => &[F::D32Float],
         F::B5G6R5Unorm => &[F::R5G6B5Unorm],
         F::R32G32B32Float => &[F::R32G32B32A32Float],
-        F::B10G11R11Float => &[F::R16G16B16A16Float],
+        F::B10G11R11Float | F::R16G16B16X16Float => &[F::R16G16B16A16Float],
+        F::A1B5G5R5Unorm => &[F::A1R5G5B5Unorm],
         _ => &[],
     };
     (formats, Conversion::Texel)
