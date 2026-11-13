@@ -27,10 +27,14 @@
 //! [`fallback`], and what the shaders must emulate because its [`Caps`] lack it, in
 //! [`mod@emulation`].
 //!
+//! Slice R11 (its first part) adds host-level captures, in [`capture`]: the submitted lists
+//! and their staging bytes as a versioned file's bytes, and their replay on a backend.
+//!
 //! Later slices add the CPU ASTC decoder (R3) and the host shaders (R4).
 
 pub mod backend;
 pub mod caps;
+pub mod capture;
 pub mod command;
 pub mod emulation;
 pub mod error;
@@ -49,6 +53,7 @@ pub use backend::{
     Readback, WaitOutcome,
 };
 pub use caps::{Caps, Features, FormatFeatures, FormatTable, Limits, SampleCounts};
+pub use capture::{Capture, CaptureError, CapturedList};
 pub use command::{Command, CommandList, StagingSlice};
 pub use emulation::{DepthRange, EmulationState, emulation};
 pub use error::{RenderError, UnknownFlags};

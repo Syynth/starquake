@@ -115,8 +115,14 @@ impl Gen {
 }
 
 /// A list with every command, and every variant of every enum inside one.
-fn every_command() -> CommandList {
-    let mut g = Gen(0);
+pub(crate) fn every_command() -> CommandList {
+    every_command_from(0)
+}
+
+/// [`every_command`] with its values counted up from `start` (below 10 000, so that they stay
+/// in the ranges the fields need), for tests that want several different lists.
+pub(crate) fn every_command_from(start: u32) -> CommandList {
+    let mut g = Gen(start);
     let mut list = CommandList::new();
     push_transfers(&mut g, &mut list);
     push_drawing(&mut g, &mut list);
@@ -433,7 +439,7 @@ fn golden_list_covers_every_variant() {
 
 /// The postcard encoding of [`every_command`], in hex. Changing it changes the capture layout:
 /// slice R11's capture header then needs a new version.
-const GOLDEN: &str = concat!(
+pub(crate) const GOLDEN: &str = concat!(
     "1c0003a1b2c3000102848080803086808080500003a1b2c3010708090a0b0c0d0e0f0100101193808080a002",
     "95808080c00201161718191a1b1c1d1e01011f2021222324252627002829ab808080a005ad808080c005022e",
     "2f3031323334353637383901023a3b3c3d3e3f404142434445000356570000008d4200008f42000091420000",
@@ -462,7 +468,7 @@ const GOLDEN: &str = concat!(
     "80e0360108b803b903ba03bb03bc03bd0305bf838080e0370109c18380808038c3838080a038",
 );
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write;
     bytes.iter().fold(String::new(), |mut s, b| {
         write!(s, "{b:02x}").expect("writing to a string");
