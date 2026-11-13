@@ -26,10 +26,14 @@
 //! present blit and the clears, with the entry points, bindings and parameter layouts a backend
 //! uses them by.
 //!
+//! Slice R11 (its first part) adds host-level captures, in [`capture`]: the submitted lists
+//! and their staging bytes as a versioned file's bytes, and their replay on a backend.
+//!
 //! Later slices add format fallbacks and `emulation()` (R2) and the CPU ASTC decoder (R3).
 
 pub mod backend;
 pub mod caps;
+pub mod capture;
 pub mod command;
 pub mod error;
 mod flags;
@@ -47,6 +51,7 @@ pub use backend::{
     Readback, WaitOutcome,
 };
 pub use caps::{Caps, Features, FormatFeatures, FormatTable, Limits, SampleCounts};
+pub use capture::{Capture, CaptureError, CapturedList};
 pub use command::{Command, CommandList, StagingSlice};
 pub use error::{RenderError, UnknownFlags};
 pub use format::PixelFormat;
