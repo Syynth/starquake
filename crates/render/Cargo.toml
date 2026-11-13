@@ -12,11 +12,11 @@ workspace = true
 
 [dependencies]
 naga.workspace = true
+postcard.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
 astc-decode.workspace = true
 insta.workspace = true
-postcard.workspace = true
 proptest.workspace = true

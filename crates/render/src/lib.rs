@@ -25,11 +25,15 @@
 //! Slice R3 adds the CPU ASTC decoder, in [`astc`]: ASTC blocks to RGBA8, for hosts whose GPU
 //! has no native ASTC and as the oracle for the GPU decoder.
 //!
+//! Slice R11 (its first part) adds host-level captures, in [`capture`]: the submitted lists
+//! and their staging bytes as a versioned file's bytes, and their replay on a backend.
+//!
 //! Later slices add format fallbacks and `emulation()` (R2) and the host shaders (R4).
 
 pub mod astc;
 pub mod backend;
 pub mod caps;
+pub mod capture;
 pub mod command;
 pub mod error;
 mod flags;
@@ -46,6 +50,7 @@ pub use backend::{
     Readback, WaitOutcome,
 };
 pub use caps::{Caps, Features, FormatFeatures, FormatTable, Limits, SampleCounts};
+pub use capture::{Capture, CaptureError, CapturedList};
 pub use command::{Command, CommandList, StagingSlice};
 pub use error::{RenderError, UnknownFlags};
 pub use format::PixelFormat;
