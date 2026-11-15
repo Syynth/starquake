@@ -384,6 +384,38 @@ fn texture_usage_needs_format_support() {
     );
 }
 
+/// With several usages unsupported at once, the one reported is the first in the documented
+/// order: sampling, storage, render target, copy.
+#[test]
+fn texture_usage_checks_report_in_order() {
+    let format = PixelFormat::R16G16Float;
+    let desc = TextureDesc {
+        format,
+        usage: TextureUsage::ALL,
+        ..texture(TextureDimension::D2, 8, 8, 1)
+    };
+    let mut c = caps();
+    let mut has = FormatFeatures::EMPTY;
+    for (feature, name) in [
+        (FormatFeatures::SAMPLE, "sampling"),
+        (FormatFeatures::STORAGE, "storage images"),
+        (FormatFeatures::RENDER, "render targets"),
+        (FormatFeatures::COPY, "copies"),
+    ] {
+        c.formats.set(format, has);
+        assert_eq!(
+            validate_texture(&c, &desc),
+            Err(RenderError::FormatUnsupported {
+                format,
+                usage: name
+            })
+        );
+        has = has | feature;
+    }
+    c.formats.set(format, has);
+    assert_eq!(validate_texture(&c, &desc), Ok(()));
+}
+
 #[test]
 fn texture_needs_a_usage() {
     let desc = TextureDesc {

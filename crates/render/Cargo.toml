@@ -12,11 +12,13 @@ workspace = true
 
 [dependencies]
 naga.workspace = true
+png.workspace = true
 postcard.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+astc-decode.workspace = true
 insta.workspace = true
 # naga's WGSL front end, for the tests that parse and validate the host shaders
 # (src/host_shaders.rs): the library only holds their sources.
