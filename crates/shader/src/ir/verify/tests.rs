@@ -297,6 +297,26 @@ fn branch_conditions_are_defined_u1_values() {
     );
 }
 
+/// A branch condition defined in a block that does not dominate the branch is undefined there.
+#[test]
+fn branch_conditions_need_a_dominating_definition() {
+    let text = |cond: &str| {
+        format!(
+            "block0:\n    %0: u1 = GetPred p0\n    branch %0, block1, block2\n\
+             block1:\n    %1: u1 = GetPred p1\n    jump block2\n\
+             block2:\n    branch {cond}, block3, block3\nblock3:\n    return\n"
+        )
+    };
+    assert_eq!(verify(&text("%0")), Ok(()));
+    assert_eq!(
+        verify(&text("%1")),
+        Err(VerifyError::Undefined {
+            at: Site::Terminator(b(2)),
+            operand: v(1)
+        })
+    );
+}
+
 #[test]
 fn operations_are_checked_against_the_table() {
     assert_eq!(
@@ -463,6 +483,16 @@ fn structured_phis_need_listed_values() {
         Err(VerifyError::Undefined {
             at: Site::Inst(v(1)),
             operand: v(5)
+        })
+    );
+    // An instruction in the arena that no block lists is not a value a phi can take.
+    let mut unlisted = ir(&text("u32 = Phi [block0: %0]"));
+    unlisted.blocks[0].insts.clear();
+    assert_eq!(
+        unlisted.verify(),
+        Err(VerifyError::Undefined {
+            at: Site::Inst(v(1)),
+            operand: v(0)
         })
     );
     assert_eq!(

@@ -7,7 +7,8 @@
 //! `Flags{control}` and `Flags{info}`); in Eden the flags are an untyped 32-bit word, here they
 //! are a typed [`Flags`](super::Flags) that the verifier checks against this column.
 //!
-//! Differences from Eden's table, each pinned by `tests::opcode_table_differs_from_eden_as_listed`:
+//! Differences from Eden's table, pinned by the IR's `tests::opcode_table_differs_from_eden_as_listed`
+//! (and the rows by `tests::opcode_rows_match_eden`):
 //!
 //! - `Phi` is not an opcode here but its own kind of instruction ([`Inst::Phi`](super::Inst)),
 //!   because its arguments pair a block with a value; the text form still calls it `Phi`.

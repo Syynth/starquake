@@ -18,7 +18,15 @@
 //!   (`naga/src/valid/interface.rs`: `SubgroupInvocationId` is an input of compute, fragment,
 //!   task, mesh and ray stages, not vertex).
 //! - Rounding modes and flush-to-zero are not expressed (decision 10, a listed divergence):
-//!   `FFma` becomes naga's fused `fma` whatever its `FpControl`.
+//!   `FPFma32` becomes naga's fused `fma` whatever its `FpControl`.
+//! - The function must be a control-flow graph of one block that returns
+//!   ([`LowerError::ControlFlow`]), with only the operations the skeleton's translators emit
+//!   (`GetRegister`, `SetRegister`, `BitCastF32U32`, `BitCastU32F32`, `FPAbs32`, `FPNeg32`,
+//!   `FPFma32`, `FPSaturate32`, `GetAttribute` and `SetAttribute` with vertex index zero,
+//!   `LaneId`, `SetFragColor` with immediate target and component); any other operation or a
+//!   phi is refused until slice 16. A 32-bit immediate operand becomes a literal at its use,
+//!   where slice 1's IR had an `Imm32` instruction, so the expressions keep their order
+//!   (`tests::skeleton_modules_are_unchanged`).
 //!
 //! Generic attributes are attribute words 32 to 159, `n = (word - 32) / 4`, as Eden numbers
 //! them (`eden/src/shader_recompiler/frontend/ir/attribute.h` @ cf654052: `Generic0X = 32`,

@@ -285,6 +285,48 @@ fn ffma_multiply_zero_mode_is_rejected() {
     assert!(one(Instr::new(Op::FFma(OpFFma { dnz: false, ..op }))).is_ok());
 }
 
+/// `FFMA`'s controls follow PR #4588 (`ops_alu.cpp`, `FFMA`): no contraction, each rounding
+/// field through `RoundingOf`, and `FTZ` or no flushing.
+#[test]
+fn ffma_controls_follow_the_reference() {
+    use crate::ir::{Flags, FmzMode, FpControl, FpRounding, Inst, Opcode};
+    let rounding = [
+        (RoundMode::NearestEven, FpRounding::Rn),
+        (RoundMode::NegInf, FpRounding::Rm),
+        (RoundMode::PosInf, FpRounding::Rp),
+        (RoundMode::Zero, FpRounding::Rz),
+    ];
+    for (rnd, wanted) in rounding {
+        for (ftz, fmz_mode) in [(false, FmzMode::None), (true, FmzMode::Ftz)] {
+            let op = OpFFma {
+                dst: r(0),
+                srcs: [FloatSrc::reg(r(1)); 3],
+                saturate: false,
+                rnd,
+                ftz,
+                dnz: false,
+            };
+            let ir = one(Instr::new(Op::FFma(op))).expect("translates");
+            let flags: Vec<Flags> = ir
+                .listed()
+                .filter_map(|(_, inst)| match inst {
+                    Inst::Op(op) if op.opcode == Opcode::FPFma32 => Some(op.flags),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                flags,
+                [Flags::Fp(FpControl {
+                    no_contraction: true,
+                    rounding: wanted,
+                    fmz_mode,
+                })],
+                "{rnd:?} {ftz}"
+            );
+        }
+    }
+}
+
 #[test]
 fn attribute_access_checks() {
     let cases = [
