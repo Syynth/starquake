@@ -280,26 +280,45 @@ fn describe(report: &RunReport) -> String {
     }
 }
 
-/// Loads the program file at `path`: a NUP title when its first bytes are a NUP container's
-/// (`starquake_core::title::is_nup`), opened through `starquake_core` so that only its table of
-/// contents and its ExeFS's `main.npdm` and modules are read, and an NRO, read whole, otherwise.
-/// The error is the line the run's summary carries.
+/// Loads the program file at `path` ([`load_program`]). The error is the line the run's summary
+/// carries.
 fn load(path: &Path) -> Result<System, String> {
     let unreadable = |error: std::io::Error| format!("could not read {}: {error}", path.display());
-    let mut file = BufReader::new(File::open(path).map_err(unreadable)?);
+    let file = BufReader::new(File::open(path).map_err(unreadable)?);
+    load_program(file).map_err(|failure| match failure {
+        LoadFailure::Unreadable(error) => unreadable(error),
+        LoadFailure::Refused(message) => format!("{}: {message}", path.display()),
+    })
+}
+
+/// Why [`load_program`] could not load a program.
+#[derive(Debug)]
+enum LoadFailure {
+    /// The source could not be read.
+    Unreadable(std::io::Error),
+    /// The source was read, but is not a program that loads: what the loader said.
+    Refused(String),
+}
+
+/// Loads the program in `source`: a NUP title when its first bytes are a NUP container's
+/// (`starquake_core::title::is_nup`), opened through `starquake_core` so that only its table of
+/// contents and its ExeFS's `main.npdm` and modules are read, and an NRO, read whole, otherwise.
+fn load_program<S: Read + Seek>(mut source: S) -> Result<System, LoadFailure> {
     let mut prefix = Vec::with_capacity(title_api::PREFIX_LEN);
     let prefix_len = u64::try_from(title_api::PREFIX_LEN).unwrap_or(u64::MAX);
-    (&mut file)
+    (&mut source)
         .take(prefix_len)
         .read_to_end(&mut prefix)
-        .map_err(unreadable)?;
-    file.rewind().map_err(unreadable)?;
+        .map_err(LoadFailure::Unreadable)?;
+    source.rewind().map_err(LoadFailure::Unreadable)?;
     if title_api::is_nup(&prefix) {
-        return System::from_nup(file).map_err(|error| format!("{}: {error}", path.display()));
+        return System::from_nup(source).map_err(|error| LoadFailure::Refused(error.to_string()));
     }
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).map_err(unreadable)?;
-    System::new(&bytes).map_err(|error| format!("{}: {error}", path.display()))
+    source
+        .read_to_end(&mut bytes)
+        .map_err(LoadFailure::Unreadable)?;
+    System::new(&bytes).map_err(|error| LoadFailure::Refused(error.to_string()))
 }
 
 /// Runs the program `args` names and writes its artifacts. Returns the process exit code.
@@ -654,5 +673,74 @@ mod tests {
             String::from_utf8(err).unwrap(),
             format!("starquake: `verify` needs a NUP file\n\n{USAGE}")
         );
+    }
+
+    /// A title in memory whose reads fail at and past `end`, as a disk that gives out after the
+    /// title's ExeFS: a read that starts before `end` returns at most the bytes before it.
+    struct FailingTail {
+        inner: std::io::Cursor<Vec<u8>>,
+        end: u64,
+    }
+
+    impl Read for FailingTail {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let at = self.inner.position();
+            if at >= self.end {
+                return Err(std::io::Error::other("read past the ExeFS"));
+            }
+            let room = usize::try_from(self.end - at).unwrap_or(usize::MAX);
+            let len = buf.len().min(room);
+            self.inner.read(&mut buf[..len])
+        }
+    }
+
+    impl Seek for FailingTail {
+        fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(to)
+        }
+    }
+
+    #[test]
+    fn a_title_is_streamed_and_never_read_past_its_exefs() {
+        use starquake_loader::exefs::{MAIN_MODULE, NPDM_FILE};
+        use starquake_loader::nup::PackageKind;
+        use starquake_loader::nup::build::{
+            self, Content, EXEFS_DIR_NAME, PackageSpec, ROMFS_DIR_NAME, Tree,
+        };
+
+        const NSO: &[u8] = include_bytes!("../../../tests/homebrew/hello/hello.nso");
+        const NPDM: &[u8] = include_bytes!("../../../tests/homebrew/hello/main.npdm");
+        let romfs_file = format!("{ROMFS_DIR_NAME}/data");
+        let tree = [(NPDM_FILE, NPDM), (MAIN_MODULE, NSO)]
+            .into_iter()
+            .fold(Tree::new(), |tree, (name, bytes)| {
+                tree.with_file(&format!("{EXEFS_DIR_NAME}/{name}"), Content::raw(bytes))
+                    .unwrap()
+            })
+            .with_file(&romfs_file, Content::raw(vec![0x5a; 0x1000]))
+            .unwrap();
+        let base = PackageSpec::new(PackageKind::Base, 0x0100_0000_0000_5000, 0, tree);
+        let built = build::build(&[base]).unwrap();
+
+        // The end of the ExeFS's last extent, and the RomFS file placed after it.
+        let extent = |index: usize| built.layout.extents[index];
+        let exefs_end = built
+            .layout
+            .files
+            .iter()
+            .filter(|((_, path), _)| path.starts_with(&format!("{EXEFS_DIR_NAME}/")))
+            .map(|(_, &index)| extent(index).0 + extent(index).1)
+            .max()
+            .unwrap();
+        let (romfs_at, romfs_len) = extent(built.layout.files[&(0, romfs_file)]);
+        assert!(romfs_at >= exefs_end && romfs_len > 0);
+        assert_eq!(built.bytes.len(), romfs_at + romfs_len);
+
+        let whole = System::from_nup(std::io::Cursor::new(built.bytes.clone())).unwrap();
+        let source = FailingTail {
+            inner: std::io::Cursor::new(built.bytes),
+            end: u64::try_from(exefs_end).unwrap(),
+        };
+        assert_eq!(load_program(source).unwrap(), whole);
     }
 }
