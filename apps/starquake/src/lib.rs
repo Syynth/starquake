@@ -286,7 +286,7 @@ fn describe(report: &RunReport) -> String {
 /// The error is the line the run's summary carries.
 fn load(path: &Path) -> Result<System, String> {
     let unreadable = |error: std::io::Error| format!("could not read {}: {error}", path.display());
-    let mut file = File::open(path).map_err(unreadable)?;
+    let mut file = BufReader::new(File::open(path).map_err(unreadable)?);
     let mut prefix = Vec::with_capacity(title_api::PREFIX_LEN);
     let prefix_len = u64::try_from(title_api::PREFIX_LEN).unwrap_or(u64::MAX);
     (&mut file)
@@ -295,8 +295,7 @@ fn load(path: &Path) -> Result<System, String> {
         .map_err(unreadable)?;
     file.rewind().map_err(unreadable)?;
     if title_api::is_nup(&prefix) {
-        return System::from_nup(BufReader::new(file))
-            .map_err(|error| format!("{}: {error}", path.display()));
+        return System::from_nup(file).map_err(|error| format!("{}: {error}", path.display()));
     }
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes).map_err(unreadable)?;

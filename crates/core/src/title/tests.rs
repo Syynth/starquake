@@ -327,7 +327,7 @@ fn the_shipping_limits_are_the_ones_used() {
             exefs: EXEFS_READ_LIMIT,
         }
     );
-    assert!(NPDM_READ_LIMIT <= EXEFS_READ_LIMIT);
+    const { assert!(NPDM_READ_LIMIT <= EXEFS_READ_LIMIT) };
 }
 
 /// A container in memory whose reads fail from `fail_from` on, as a disk that goes away after
