@@ -2,6 +2,11 @@
 //! `docs/specs/observability.md` as far as the walking skeleton goes, and `starquake inspect`
 //! and `starquake verify`, which read a NUP title ([`title`]).
 //!
+//! The program `run` takes is an NRO, or a NUP title: a file whose first bytes are a NUP
+//! container's is run as the title's ExeFS (that of its newest update, or of its base, the one
+//! `inspect` shows), loaded by `starquake_core::System::from_nup`; any other file is read as an
+//! NRO. A title that cannot be loaded is an emulator error, like an NRO that cannot.
+//!
 //! ```text
 //! starquake run <program> [--until timeout=<n>s] [--artifacts <folder>]
 //! starquake inspect <title.nup>
@@ -26,10 +31,12 @@
 //! process; `main.rs` passes the real stdout and stderr.
 
 use std::ffi::OsString;
-use std::io::Write;
+use std::fs::File;
+use std::io::{BufReader, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use starquake_core::title as title_api;
 use starquake_core::{ExitReason, RunOptions, RunReport, System, artifacts, exit_code};
 
 pub mod title;
@@ -40,7 +47,8 @@ usage: starquake run <program> [--until timeout=<n>s] [--artifacts <folder>]
        starquake inspect <title.nup>
        starquake verify <title.nup>
 
-run: runs an NRO program and writes what it did to an artifacts folder:
+run: runs a program, an NRO or a NUP title (the ExeFS of its newest update,
+or of its base), and writes what it did to an artifacts folder:
 summary.json, trace.txt, events.bin and guest_log.txt, plus crash.json and
 crash.txt when the guest crashed. Without --artifacts the folder is made under
 the system's temporary folder and its path is printed. Without --until the
@@ -67,7 +75,7 @@ const UNSUPPORTED_FLAGS: [&str; 5] = [
 /// What a `run` command asks for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunArgs {
-    /// The program file.
+    /// The program file: an NRO, or a NUP title.
     pub program: PathBuf,
     /// `--until timeout=<n>s`.
     pub timeout: Option<Duration>,
@@ -272,6 +280,29 @@ fn describe(report: &RunReport) -> String {
     }
 }
 
+/// Loads the program file at `path`: a NUP title when its first bytes are a NUP container's
+/// (`starquake_core::title::is_nup`), opened through `starquake_core` so that only its table of
+/// contents and its ExeFS's `main.npdm` and modules are read, and an NRO, read whole, otherwise.
+/// The error is the line the run's summary carries.
+fn load(path: &Path) -> Result<System, String> {
+    let unreadable = |error: std::io::Error| format!("could not read {}: {error}", path.display());
+    let mut file = File::open(path).map_err(unreadable)?;
+    let mut prefix = Vec::with_capacity(title_api::PREFIX_LEN);
+    let prefix_len = u64::try_from(title_api::PREFIX_LEN).unwrap_or(u64::MAX);
+    (&mut file)
+        .take(prefix_len)
+        .read_to_end(&mut prefix)
+        .map_err(unreadable)?;
+    file.rewind().map_err(unreadable)?;
+    if title_api::is_nup(&prefix) {
+        return System::from_nup(BufReader::new(file))
+            .map_err(|error| format!("{}: {error}", path.display()));
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(unreadable)?;
+    System::new(&bytes).map_err(|error| format!("{}: {error}", path.display()))
+}
+
 /// Runs the program `args` names and writes its artifacts. Returns the process exit code.
 fn run(
     args: &RunArgs,
@@ -285,16 +316,9 @@ fn run(
         command_line,
         sd_card: None,
     };
-    let failed = |message: String| RunReport::emulator_error(message, started.elapsed());
-    let report = match std::fs::read(&args.program) {
-        Err(error) => failed(format!(
-            "could not read {}: {error}",
-            args.program.display()
-        )),
-        Ok(bytes) => match System::new(&bytes) {
-            Err(error) => failed(format!("{}: {error}", args.program.display())),
-            Ok(system) => system.run(&options),
-        },
+    let report = match load(&args.program) {
+        Err(message) => RunReport::emulator_error(message, started.elapsed()),
+        Ok(system) => system.run(&options),
     };
 
     let folder = args
