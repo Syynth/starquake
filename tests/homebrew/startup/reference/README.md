@@ -52,11 +52,18 @@ Every system call and service request in the trace that starquake does not imple
 each, in the order of first use. "Line" is the line of `startup.trace`, counting its comment
 lines from 1. A call is listed when its status in `starquake_kernel::svc::SvcId` is not
 `Implemented`; a request when it is not a control command the service framework answers
-(`IpcController`) and not a command of a service starquake has (`sm:`, `set:sys`, `fsp-srv`) under the same
-name. The result is the reference's: a call's own result, or for a request the result of the
-`SendSyncRequest` that carried it (the trace does not record a reply's own result code).
-Requests to a sub-interface (`IApplicationProxy`, `ISelfController`, ...) are named by the
-interface, as the reference logs them.
+(`IpcController`) and not a command of a service starquake has (`sm:`, `set:sys`, `fsp-srv`,
+`apm`, `appletOE`), or of a sub-interface one of them hands out, under the same name. The result
+is the reference's: a call's own result, or for a request the result of the `SendSyncRequest`
+that carried it (the trace does not record a reply's own result code). Requests to a
+sub-interface (`IApplicationProxy`, `ISelfController`, ...) are named by the interface, as the
+reference logs them.
+
+The list is of what starquake's tables lack, not of where its run stops. The run first differs
+earlier, at line 47: libnx copies the current-process pseudo-handle with `appletOE`'s
+`OpenApplicationProxy`, and starquake's kernel does not yet resolve a pseudo-handle copied in a
+request (`starquake_kernel::ipc::message`, its divergences), so the `SendSyncRequest` carrying
+it fails with the kernel's invalid-handle result (`0xe401`) before `appletOE` sees it.
 
 `crates/core/tests/homebrew.rs` writes this list from the trace and starquake's tables, and
 fails (`the_startup_gap_list_in_its_readme_is_the_one_the_trace_gives`) when the text between
@@ -65,28 +72,6 @@ the two markers below differs; its failure message holds the text to put there.
 <!-- gap list: written by crates/core/tests/homebrew.rs -->
 | Line | Call or request | Reference's result |
 |---:|---|---|
-| 39 | `ipc apm::0 (OpenSession)` | `0x0` |
-| 47 | `ipc appletOE::0 (OpenApplicationProxy)` | `0x0` |
-| 49 | `ipc IApplicationProxy::20 (GetApplicationFunctions)` | `0x0` |
-| 51 | `ipc IApplicationProxy::11 (GetLibraryAppletCreator)` | `0x0` |
-| 53 | `ipc IApplicationProxy::0 (GetCommonStateGetter)` | `0x0` |
-| 55 | `ipc IApplicationProxy::1 (GetSelfController)` | `0x0` |
-| 57 | `ipc IApplicationProxy::2 (GetWindowController)` | `0x0` |
-| 59 | `ipc IWindowController::1 (GetAppletResourceUserId)` | `0x0` |
-| 61 | `ipc IApplicationProxy::3 (GetAudioController)` | `0x0` |
-| 63 | `ipc IApplicationProxy::4 (GetDisplayController)` | `0x0` |
-| 65 | `ipc IApplicationProxy::1000 (GetDebugFunctions)` | `0x0` |
-| 67 | `ipc ISelfController::91 (GetAccumulatedSuspendedTickChangedEvent)` | `0x0` |
-| 69 | `ipc ICommonStateGetter::0 (GetEventHandle)` | `0x0` |
-| 71 | `ipc ICommonStateGetter::9 (GetCurrentFocusState)` | `0x0` |
-| 73 | `ipc IWindowController::10 (AcquireForegroundRights)` | `0x0` |
-| 75 | `ipc ISelfController::13 (SetFocusHandlingMode)` | `0x0` |
-| 77 | `ipc ISelfController::16 (SetOutOfFocusSuspendingEnabled)` | `0x0` |
-| 79 | `ipc IApplicationFunctions::40 (NotifyRunning)` | `0x0` |
-| 81 | `ipc ICommonStateGetter::5 (GetOperationMode)` | `0x0` |
-| 83 | `ipc ICommonStateGetter::6 (GetPerformanceMode)` | `0x0` |
-| 85 | `ipc ISelfController::11 (SetOperationModeChangedNotification)` | `0x0` |
-| 87 | `ipc ISelfController::12 (SetPerformanceModeChangedNotification)` | `0x0` |
 | 93 | `ipc hid::0 (CreateAppletResource)` | `0x0` |
 | 95 | `ipc IAppletResource::0 (GetSharedMemoryHandle)` | `0x0` |
 | 107 | `ipc time:u::0 (GetStandardUserSystemClock)` | `0x0` |

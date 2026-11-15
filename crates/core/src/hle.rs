@@ -1,19 +1,21 @@
 //! The HLE services a run has, and how they are put in front of the kernel: `sm:` on its named
-//! port, and `set:sys` and `fsp-srv` behind it (`docs/specs/services.md`, "Milestone 1
-//! services", and port plan slice 6).
+//! port, and `set:sys`, `fsp-srv`, `apm` and `appletOE` behind it (`docs/specs/services.md`,
+//! "Milestone 1 services", and port plan slice 6; `apm` and `appletOE` as far as a default
+//! libnx start-up asks).
 //!
 //! Each service's server is a [`starquake_services::framework::Server`], given to the kernel's
 //! dispatcher as the handler of a server of its own ([`Dispatcher::add_server`]). `sm:`'s
-//! registry names `set:sys` and `fsp-srv` by the numbers the kernel knows their servers by
-//! ([`SET_SYS`], [`FSP_SRV`]), so a `GetService("set:sys")` hands out a session on it.
+//! registry names the others by the numbers the kernel knows their servers by ([`SET_SYS`],
+//! [`FSP_SRV`], [`APM`], [`APPLET_OE`]), so a `GetService("set:sys")` hands out a session on it.
 //!
-//! The numbers ([`SM`], [`SET_SYS`], [`FSP_SRV`]) are starquake's own: Horizon names a service by its name
-//! only. They appear in the trace, as the `service` of an IPC event; [`service_name`] says
-//! which is which.
+//! The numbers ([`SM`], [`SET_SYS`], [`FSP_SRV`], [`APM`], [`APPLET_OE`]) are starquake's own:
+//! Horizon names a service by its name only. They appear in the trace, as the `service` of an IPC
+//! event; [`service_name`] says which is which.
 //!
 //! Unknown commands and names are auto-stubbed ([`UnknownPolicy::AutoStub`]), the policy for
 //! bringing up a title (`docs/specs/services.md`, decision 3). The firmware version `set:sys`
-//! reports is Eden's ([`FirmwareVersion::eden_default`]).
+//! reports is Eden's ([`FirmwareVersion::eden_default`]), and so is what `appletOE` reports
+//! ([`AppletSettings::eden_default`]).
 //!
 //! `fsp-srv` reads the host through the environment it is given ([`install`]'s `env`): the SD
 //! card is the folder the run's configuration names, which [`HostFolder`] serves on the
@@ -26,6 +28,8 @@ use std::sync::Arc;
 
 use starquake_kernel::dispatch::Dispatcher;
 use starquake_kernel::ipc::{IpcError, PortName, PortNameError};
+use starquake_services::am::{self, AppletSettings};
+use starquake_services::apm;
 use starquake_services::framework::UnknownPolicy;
 use starquake_services::fsp;
 use starquake_services::set::{self, FirmwareVersion, Settings};
@@ -42,12 +46,18 @@ pub const SM: ServiceId = ServiceId(1);
 pub const SET_SYS: ServiceId = ServiceId(2);
 /// The number the kernel knows `fsp-srv`'s server by.
 pub const FSP_SRV: ServiceId = ServiceId(3);
+/// The number the kernel knows `apm`'s server by.
+pub const APM: ServiceId = ServiceId(4);
+/// The number the kernel knows `appletOE`'s server by.
+pub const APPLET_OE: ServiceId = ServiceId(5);
 
 /// The services a run has, with the names they are known by.
-const SERVICES: [(ServiceId, &str); 3] = [
+const SERVICES: [(ServiceId, &str); 5] = [
     (SM, sm::PORT_NAME),
     (SET_SYS, set::SYS_NAME),
     (FSP_SRV, fsp::NAME),
+    (APM, apm::NAME),
+    (APPLET_OE, am::OE_NAME),
 ];
 
 /// The name of the service a number stands for, if a run has it.
@@ -83,6 +93,8 @@ pub fn install(dispatcher: &Dispatcher, env: Arc<dyn Env>) -> Result<(), Service
     let mut registry = Registry::new();
     registry.register(ServiceName::new(set::SYS_NAME)?, SET_SYS)?;
     registry.register(ServiceName::new(fsp::NAME)?, FSP_SRV)?;
+    registry.register(ServiceName::new(apm::NAME)?, APM)?;
+    registry.register(ServiceName::new(am::OE_NAME)?, APPLET_OE)?;
 
     let manager = sm::server(registry, policy).with_service_id(SM);
     let port = PortName::new(sm::PORT_NAME)?;
@@ -96,6 +108,12 @@ pub fn install(dispatcher: &Dispatcher, env: Arc<dyn Env>) -> Result<(), Service
 
     let files = fsp::server(policy, env).with_service_id(FSP_SRV);
     dispatcher.add_server(fsp::NAME, FSP_SRV, None, Box::new(files))?;
+
+    let performance = apm::server(policy).with_service_id(APM);
+    dispatcher.add_server(apm::NAME, APM, None, Box::new(performance))?;
+
+    let applets = am::oe_server(AppletSettings::eden_default(), policy).with_service_id(APPLET_OE);
+    dispatcher.add_server(am::OE_NAME, APPLET_OE, None, Box::new(applets))?;
     Ok(())
 }
 

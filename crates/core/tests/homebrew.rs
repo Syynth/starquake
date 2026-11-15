@@ -74,6 +74,11 @@
 //!   with that id on the session of the service the reference's next non-control request goes
 //!   to: starquake's IPC event does not say whether a request was a control request
 //!   (`starquake_services::framework::trace`), so this is the most the comparison can check.
+//!   A request to a sub-interface the reference names by the interface
+//!   (`IApplicationProxy::20`): it matches a request with that id on the service that hands
+//!   the interface out (`appletOE`), and its name is checked against that interface's table.
+//!   The event names the service and not the object a request went to, so this, too, is the
+//!   most the comparison can check.
 //! - **`log`**: the run logged a line of the same length and hash (an event keeps no text).
 //!   The text itself is checked against the fixture's source by the run's guest log.
 //!
@@ -91,7 +96,7 @@ mod trace {
     use std::collections::BTreeMap;
     use std::fmt::Write as _;
 
-    use starquake_core::hle::{FSP_SRV, SET_SYS, SM, service_name};
+    use starquake_core::hle::{APM, APPLET_OE, FSP_SRV, SET_SYS, SM, service_name};
     use starquake_kernel::handle::Handle;
     use starquake_kernel::memory::MemoryArrangement;
     use starquake_kernel::memory::layout::{LayoutRequest, Region, RegionOffsets, Regions};
@@ -99,8 +104,14 @@ mod trace {
     use starquake_loader::nro::Nro;
     use starquake_memory::PAGE_SIZE;
     use starquake_services::framework::control::{CONTROL_COMMANDS, CONTROL_INTERFACE};
+    use starquake_services::am::{
+        IApplicationFunctions, IApplicationProxy, IApplicationProxyService, IAudioController,
+        ICommonStateGetter, IDebugFunctions, IDisplayController, ILibraryAppletCreator,
+        ISelfController, IWindowController,
+    };
+    use starquake_services::apm::{Apm, ISession};
     use starquake_services::framework::{Protocol, Session};
-    use starquake_services::fsp::FspSrv;
+    use starquake_services::fsp::{FspSrv, IFile, IFileSystem};
     use starquake_services::set::SetSys;
     use starquake_services::sm::Sm;
     use starquake_trace::{EventKind, SVC_ARG_COUNT, ServiceId};
@@ -134,7 +145,7 @@ mod trace {
     /// How many lines of the startup fixture's reference a run in starquake matches, at least:
     /// the ratchet (see the module docs). Raise it when a change makes the run match more; the
     /// on-hardware test prints the new count when it does.
-    const STARTUP_MATCHED: usize = 31;
+    const STARTUP_MATCHED: usize = 41;
 
     /// The arguments that are addresses, for each call the fixtures make: the same list as
     /// `ADDRESSES` in `tools/oracle/normalise.py`. A call that is not listed is refused, so no
@@ -489,7 +500,7 @@ mod trace {
     }
 
     /// The services whose command tables starquake has, in the order of their numbers.
-    const SERVICES: [ServiceId; 3] = [SM, SET_SYS, FSP_SRV];
+    const SERVICES: [ServiceId; 5] = [SM, SET_SYS, FSP_SRV, APM, APPLET_OE];
 
     /// The interface whose command table names a service's commands.
     fn interface(service: ServiceId) -> Option<Box<dyn Session>> {
@@ -497,8 +508,58 @@ mod trace {
             SM => Some(Box::new(Sm::default())),
             SET_SYS => Some(Box::new(SetSys)),
             FSP_SRV => Some(Box::new(FspSrv)),
+            APM => Some(Box::new(Apm)),
+            APPLET_OE => Some(Box::new(IApplicationProxyService)),
             _ => None,
         }
+    }
+
+    /// The other interfaces a service's sessions can be, which its commands hand out.
+    fn sub_interfaces(service: ServiceId) -> Vec<Box<dyn Session>> {
+        match service {
+            FSP_SRV => vec![Box::new(IFileSystem::default()), Box::new(IFile::default())],
+            APM => vec![Box::new(ISession)],
+            APPLET_OE => vec![
+                Box::new(IApplicationProxy::default()),
+                Box::new(ICommonStateGetter),
+                Box::new(ISelfController),
+                Box::new(IWindowController::default()),
+                Box::new(IApplicationFunctions),
+                Box::new(IAudioController),
+                Box::new(IDisplayController),
+                Box::new(ILibraryAppletCreator),
+                Box::new(IDebugFunctions),
+            ],
+            _ => Vec::new(),
+        }
+    }
+
+    /// The service that hands out the interface the reference calls `name`
+    /// (`IApplicationProxy`), and that interface, if starquake has it.
+    fn sub_interface(name: &str) -> Option<(ServiceId, Box<dyn Session>)> {
+        SERVICES.into_iter().find_map(|service| {
+            let found = sub_interfaces(service).into_iter().find(|i| i.name() == name);
+            found.map(|interface| (service, interface))
+        })
+    }
+
+    /// The interface whose command table names a request the reference writes as
+    /// `<target>::<command>`, sent on a session of `service`: the service's own when `target` is
+    /// not one of starquake's sub-interfaces, the sub-interface when `service` hands it out, and
+    /// none when another service does.
+    fn interface_for(service: ServiceId, target: &str) -> Option<Box<dyn Session>> {
+        match sub_interface(target) {
+            Some((owner, interface)) if owner == service => Some(interface),
+            Some(_) => None,
+            None => interface(service),
+        }
+    }
+
+    /// What a reference request line names before its command: `IApplicationProxy` in
+    /// `ipc IApplicationProxy::20`.
+    fn target(expected: &str) -> Option<&str> {
+        let request = expected.strip_prefix("ipc ")?;
+        request.rsplit_once("::").map(|(target, _)| target)
     }
 
     /// The number of the service starquake registered under `name`, if it has it.
@@ -614,6 +675,17 @@ mod trace {
             Line::Ipc { service, command } => {
                 let name = service_name(service)
                     .ok_or_else(|| format!("service {service:?} has no name"))?;
+                // The reference names a request to a sub-interface by the interface; the event
+                // names the service. Where the service hands that interface out, the line is
+                // written the reference's way.
+                let name = match target(expected) {
+                    Some(target)
+                        if sub_interface(target).is_some_and(|(owner, _)| owner == service) =>
+                    {
+                        target
+                    }
+                    _ => name,
+                };
                 Ok(format!("ipc {name}::{command}"))
             }
             Line::Log { len, hash } => {
@@ -629,9 +701,10 @@ mod trace {
         }
     }
 
-    /// The reference's name for a request, checked against starquake's command tables: the
-    /// control commands' for a control request, the service's otherwise.
-    fn check_name(line: &Line, name: &str, control: bool) -> Result<(), String> {
+    /// The reference's name for a request it writes as `<target>::<command>`, checked against
+    /// starquake's command tables: the control commands' for a control request, otherwise the
+    /// table of the interface `target` names on the line's service ([`interface_for`]).
+    fn check_name(line: &Line, target: &str, name: &str, control: bool) -> Result<(), String> {
         let Line::Ipc { service, command } = *line else {
             return Ok(());
         };
@@ -640,7 +713,7 @@ mod trace {
                 .name(Protocol::Cmif, command)
                 .map(str::to_owned)
         } else {
-            interface(service)
+            interface_for(service, target)
                 .and_then(|interface| interface.commands().name(Protocol::Cmif, command))
                 .map(camel)
         };
@@ -695,7 +768,8 @@ mod trace {
             }
             if let Some(name) = name {
                 let control = raw[index].starts_with(&format!("ipc {CONTROL_INTERFACE}::"));
-                if let Err(error) = check_name(line, name, control) {
+                let target = target(expected).unwrap_or_default();
+                if let Err(error) = check_name(line, target, name, control) {
                     return stop(index, format!("line {index}: {error}"));
                 }
             }
@@ -757,7 +831,7 @@ mod trace {
         /// first used.
         line: usize,
         /// The call (`svc 0x18 WaitSynchronization`) or the request
-        /// (`ipc apm::0 (OpenSession)`).
+        /// (`ipc hid::0 (CreateAppletResource)`).
         what: String,
         /// What the reference returned there: the call's result (`none` for a call without
         /// one), or, for a request, the result of the `SendSyncRequest` that carried it.
@@ -771,7 +845,8 @@ mod trace {
     }
 
     /// Whether starquake implements a request: a control command the framework's table names
-    /// the same, or a command of a service starquake has, whose table names it the same.
+    /// the same, or a command of a service starquake has, or of one of the sub-interfaces its
+    /// services hand out, whose table names it the same.
     fn implements_request(service: &str, command: u32, name: &str) -> bool {
         if service == CONTROL_INTERFACE {
             // Any service will do: the control table is the framework's.
@@ -780,17 +855,20 @@ mod trace {
                     service: SM,
                     command,
                 },
+                service,
                 name,
                 true,
             )
             .is_ok();
         }
-        service_id(service).is_some_and(|id| {
+        let owner = service_id(service).or_else(|| sub_interface(service).map(|(owner, _)| owner));
+        owner.is_some_and(|id| {
             check_name(
                 &Line::Ipc {
                     service: id,
                     command,
                 },
+                service,
                 name,
                 false,
             )
@@ -1193,18 +1271,18 @@ mod trace {
             // A control request with the id of `Initialize`: the reference calls command 0
             // `Initialize`, and no control command has that name.
             assert_eq!(
-                check_name(&ipc(SM, 0), "Initialize", true),
+                check_name(&ipc(SM, 0), "sm:", "Initialize", true),
                 Err("the reference calls command 0 Initialize, starquake \
                      Some(\"ConvertCurrentObjectToDomain\")"
                     .to_owned())
             );
-            assert_eq!(check_name(&ipc(SM, 0), "Initialize", false), Ok(()));
+            assert_eq!(check_name(&ipc(SM, 0), "sm:", "Initialize", false), Ok(()));
             assert_eq!(
-                check_name(&ipc(SET_SYS, 3), "GetFirmwareVersion", false),
+                check_name(&ipc(SET_SYS, 3), "set:sys", "GetFirmwareVersion", false),
                 Ok(())
             );
-            assert!(check_name(&ipc(SET_SYS, 4), "GetFirmwareVersion", false).is_err());
-            assert!(check_name(&ipc(ServiceId(0x99), 0), "Initialize", false).is_err());
+            assert!(check_name(&ipc(SET_SYS, 4), "set:sys", "GetFirmwareVersion", false).is_err());
+            assert!(check_name(&ipc(ServiceId(0x99), 0), "sm:", "Initialize", false).is_err());
             assert_eq!(camel("get_service"), "GetService");
         }
 
@@ -1419,6 +1497,53 @@ mod trace {
                     }
                 );
             }
+        }
+
+        #[test]
+        fn a_request_to_a_sub_interface_matches_on_the_service_that_hands_it_out() {
+            let fixture = Fixture {
+                nro: HELLO.nro,
+                reference: "ipc appletOE::0 (OpenApplicationProxy)\n\
+                            ipc IApplicationProxy::20 (GetApplicationFunctions)\n\
+                            ipc ISession::0 (SetPerformanceConfiguration)\n",
+            };
+            let run = |lines: &[Line]| progress(&fixture, lines, &anchors());
+            // `ISession` is `apm`'s, so the third line is a request on an `apm` session, which
+            // starquake has but whose command 0 it does not: the name check fails there.
+            let ours = [ipc(APPLET_OE, 0), ipc(APPLET_OE, 20), ipc(APM, 0)];
+            assert_eq!(
+                run(&ours),
+                Progress {
+                    matched: 2,
+                    difference: Some(
+                        "line 2: the reference calls command 0 SetPerformanceConfiguration, \
+                         starquake None"
+                            .to_owned()
+                    ),
+                }
+            );
+            // The interface's command on another service is not the request.
+            let other = [ipc(APPLET_OE, 0), ipc(APM, 20)];
+            assert_eq!(
+                run(&other).difference,
+                Some("line 1: expected `ipc IApplicationProxy::20`, found `ipc apm::20`".to_owned())
+            );
+            // Nor is the service's own command with the same id: the name is the interface's.
+            let named = Fixture {
+                nro: HELLO.nro,
+                reference: "ipc IApplicationProxy::0 (OpenApplicationProxy)\n",
+            };
+            assert_eq!(
+                progress(&named, &[ipc(APPLET_OE, 0)], &anchors()).difference,
+                Some(
+                    "line 0: the reference calls command 0 OpenApplicationProxy, starquake \
+                     Some(\"GetCommonStateGetter\")"
+                        .to_owned()
+                )
+            );
+            assert_eq!(target("ipc IApplicationProxy::20"), Some("IApplicationProxy"));
+            assert_eq!(target("ipc sm:::1"), Some("sm:"));
+            assert_eq!(target("svc 0x21 SendSyncRequest"), None);
         }
 
         #[test]
@@ -2042,7 +2167,7 @@ mod trace {
             svc 0x29 GetInfo(info_type=0xb, handle=0x0, info_subtype=0x0) -> 0x0 out=random\n\
             ipc IpcController::3 (QueryPointerBufferSize)\n\
             svc 0x21 SendSyncRequest(session_handle=0x203fd) -> 0x0\n\
-            ipc apm::0 (OpenSession)\n\
+            ipc hid::0 (CreateAppletResource)\n\
             svc 0x21 SendSyncRequest(session_handle=0x203fd) -> 0x0\n\
             ipc sm:::1 (GetService)\n\
             svc 0x21 SendSyncRequest(session_handle=0x103fe) -> 0x0\n\
@@ -2050,7 +2175,7 @@ mod trace {
             svc 0x2c MapPhysicalMemory(address=alias_region+0x1000, size=0x200000) -> 0xd401\n\
             svc 0x21 SendSyncRequest(session_handle=0x183fd) -> 0xf601\n\
             svc 0x2c MapPhysicalMemory(address=alias_region+0x1000, size=0x200000) -> 0x0\n\
-            ipc apm::0 (OpenSession)\n\
+            ipc hid::0 (CreateAppletResource)\n\
             svc 0x21 SendSyncRequest(session_handle=0x203fd) -> 0x0\n\
             ipc IpcController::7 (Unheard)\n\
             ipc nvdrv::3 (Initialize)\n";
@@ -2077,7 +2202,7 @@ mod trace {
                 [
                     // An implemented call (GetInfo), a control command the framework answers
                     // and a command `sm:` has are not gaps.
-                    gap(5, "ipc apm::0 (OpenSession)", "0x0"),
+                    gap(5, "ipc hid::0 (CreateAppletResource)", "0x0"),
                     // A command id a service has under another name is one; a request's result
                     // is its `SendSyncRequest`'s, past the calls in between.
                     gap(9, "ipc set:sys::3 (GetSettingsItemValue)", "0xf601"),
@@ -2105,9 +2230,24 @@ mod trace {
             assert!(implements_request("sm:", 1, "GetService"));
             assert!(!implements_request("sm:", 1, "Initialize"));
             assert!(implements_request("set:sys", 3, "GetFirmwareVersion"));
-            assert!(!implements_request("apm", 0, "OpenSession"));
+            assert!(implements_request("apm", 0, "OpenSession"));
+            assert!(!implements_request("hid", 0, "CreateAppletResource"));
             assert_eq!(service_id("set:sys"), Some(SET_SYS));
-            assert_eq!(service_id("apm"), None);
+            assert_eq!(service_id("apm"), Some(APM));
+            assert_eq!(service_id("hid"), None);
+            // A sub-interface's command is its own table's, under its own name; the name of the
+            // service that hands it out is not a sub-interface's.
+            assert!(implements_request(
+                "IApplicationProxy",
+                20,
+                "GetApplicationFunctions"
+            ));
+            assert!(!implements_request("IApplicationProxy", 20, "GetSelfController"));
+            assert!(!implements_request("IApplicationProxy", 10, "GetProcessWindingController"));
+            assert!(!implements_request("ISelfController", 0, "Exit"));
+            assert!(!implements_request("appletOE", 20, "GetApplicationFunctions"));
+            assert!(!implements_request("IAppletResource", 0, "GetSharedMemoryHandle"));
+            assert_eq!(service_id("IApplicationProxy"), None);
         }
 
         #[test]
@@ -2116,7 +2256,7 @@ mod trace {
                 gap_table(&made_up()[..2]),
                 "| Line | Call or request | Reference's result |\n\
                  |---:|---|---|\n\
-                 | 5 | `ipc apm::0 (OpenSession)` | `0x0` |\n\
+                 | 5 | `ipc hid::0 (CreateAppletResource)` | `0x0` |\n\
                  | 9 | `ipc set:sys::3 (GetSettingsItemValue)` | `0xf601` |\n"
             );
             let readme = format!("before\n{GAPS_BEGIN}\nthe block\n{GAPS_END}\nafter\n");
