@@ -193,7 +193,10 @@ fn write_method(out: &mut Out, prefix: &str, method: &Method) {
         method.name,
         hex(method.byte_address, 4)
     ));
-    out.line(&format!("pub const {}: Method = Method {{", ident(&method.name)));
+    out.line(&format!(
+        "pub const {}: Method = Method {{",
+        ident(&method.name)
+    ));
     out.line(&format!("    name: \"{}\",", method.name));
     out.line(&format!(
         "    byte_address: {},",
@@ -202,7 +205,12 @@ fn write_method(out: &mut Out, prefix: &str, method: &Method) {
     out.line(&format!("    strides: &[{}],", strides.join(", ")));
     out.line("    fields: &[");
     for field in &method.fields {
-        write_named_field(out, &format!("{}_{}", method.name, field.name), field, "        ");
+        write_named_field(
+            out,
+            &format!("{}_{}", method.name, field.name),
+            field,
+            "        ",
+        );
     }
     out.line("    ],");
     out.line("};");

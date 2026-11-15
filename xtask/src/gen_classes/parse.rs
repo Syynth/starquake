@@ -353,10 +353,10 @@ fn strip_comments(text: &str) -> Result<Stripped, usize> {
                 if let Some(end) = rest.find("*/") {
                     comment.push_str(&rest[..end]);
                     rest = &rest[end + 2..];
-                    if let Some((_, finished)) = in_comment.take() {
-                        if first_comment.is_none() {
-                            first_comment = Some(finished.lines().map(str::to_owned).collect());
-                        }
+                    if let Some((_, finished)) = in_comment.take()
+                        && first_comment.is_none()
+                    {
+                        first_comment = Some(finished.lines().map(str::to_owned).collect());
                     }
                     kept.push(' ');
                     continue;
@@ -392,13 +392,16 @@ fn strip_comments(text: &str) -> Result<Stripped, usize> {
     if let Some((line, _)) = in_comment {
         return Err(line);
     }
-    let notice = first_comment.map(clean_notice).unwrap_or_default();
+    let notice = first_comment
+        .as_deref()
+        .map(clean_notice)
+        .unwrap_or_default();
     Ok(Stripped { lines, notice })
 }
 
 /// Removes the decoration of a block comment: leading space and `*`s on each line, trailing
 /// space, and empty lines at either end.
-fn clean_notice(lines: Vec<String>) -> Vec<String> {
+fn clean_notice(lines: &[String]) -> Vec<String> {
     let cleaned: Vec<String> = lines
         .iter()
         .map(|line| {
@@ -452,7 +455,10 @@ fn directive(line: &str) -> Result<Option<Define<'_>>, ErrorKind> {
 enum Kind {
     Number(u32),
     Bits(Bits),
-    Array { base: u32, strides: [Option<u32>; 2] },
+    Array {
+        base: u32,
+        strides: [Option<u32>; 2],
+    },
 }
 
 /// A number held back until the next define says whether it is a method or a constant.
@@ -544,7 +550,7 @@ impl Reader {
             };
         }
         self.seen.insert(key, (line, written));
-        Ok(Some((base, read_value(name, params, value)?)))
+        Ok(Some((base, read_value(name, &params, value)?)))
     }
 
     /// A define outside the class prefix: an include guard or the class id.
@@ -584,7 +590,9 @@ impl Reader {
             Kind::Number(value) => {
                 self.flush_pending();
                 if let Some(field) = self.field
-                    && let Some(part) = name.strip_prefix(&self.full_name(field)).and_then(after_underscore)
+                    && let Some(part) = name
+                        .strip_prefix(&self.full_name(field))
+                        .and_then(after_underscore)
                 {
                     self.field_mut(field).values.push(Value {
                         name: part.to_owned(),
@@ -610,7 +618,10 @@ impl Reader {
             Kind::Bits(bits) => {
                 if let Some(pending) = self.pending.take() {
                     if matches!(bits, Bits::Word { .. })
-                        && name.strip_prefix(&pending.name).and_then(after_underscore).is_some()
+                        && name
+                            .strip_prefix(&pending.name)
+                            .and_then(after_underscore)
+                            .is_some()
                     {
                         check_aligned(&pending.name, pending.value)
                             .map_err(|kind| (pending.line, kind))?;
@@ -699,7 +710,9 @@ impl Reader {
             .enumerate()
             .filter_map(|(index, field)| {
                 let full = format!("{}_{}", method.name, field.name);
-                let part = name.strip_prefix(full.as_str()).and_then(after_underscore)?;
+                let part = name
+                    .strip_prefix(full.as_str())
+                    .and_then(after_underscore)?;
                 Some((full.len(), index, part.to_owned()))
             })
             .max_by_key(|(length, _, _)| *length)
@@ -723,7 +736,7 @@ fn after_underscore(rest: &str) -> Option<&str> {
 }
 
 fn check_aligned(name: &str, value: u32) -> Result<(), ErrorKind> {
-    if value % 4 == 0 {
+    if value.is_multiple_of(4) {
         Ok(())
     } else {
         Err(ErrorKind::Unaligned {
@@ -775,10 +788,7 @@ fn strip_parens(mut text: &str) -> &str {
 /// Reads a hex (`0x`) or decimal number: `None` if `text` is not one, `Some(Err)` if it is one
 /// that does not fit in 32 bits.
 fn parse_number(text: &str) -> Option<Result<u32, ErrorKind>> {
-    let (digits, radix) = match text
-        .strip_prefix("0x")
-        .or_else(|| text.strip_prefix("0X"))
-    {
+    let (digits, radix) = match text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
         Some(hex) => (hex, 16),
         None => (text, 10),
     };
@@ -797,7 +807,7 @@ fn parse_bit(text: &str) -> Option<Result<u32, ErrorKind>> {
 }
 
 /// Reads the value of the define `name` (with its parameters `params`).
-fn read_value(name: &str, params: Vec<char>, value: &str) -> Result<Kind, ErrorKind> {
+fn read_value(name: &str, params: &[char], value: &str) -> Result<Kind, ErrorKind> {
     let unknown = || ErrorKind::UnknownValue(value.to_owned());
     let index_error = || ErrorKind::Index {
         name: name.to_owned(),
@@ -820,7 +830,7 @@ fn read_value(name: &str, params: Vec<char>, value: &str) -> Result<Kind, ErrorK
         else {
             return Err(index_error());
         };
-        if params.as_slice() != [*high_var] || high_var != low_var {
+        if params != [*high_var] || high_var != low_var {
             return Err(index_error());
         }
         if high_stride != low_stride {
@@ -843,14 +853,14 @@ fn read_value(name: &str, params: Vec<char>, value: &str) -> Result<Kind, ErrorK
         check_range(high, low, 0)?;
         return Ok(Kind::Bits(Bits::Word { high, low }));
     }
-    let bare = strip_parens(value);
-    if let Some(number) = parse_number(bare) {
+    let unwrapped = strip_parens(value);
+    if let Some(number) = parse_number(unwrapped) {
         if !params.is_empty() {
             return Err(index_error());
         }
         return Ok(Kind::Number(number?));
     }
-    let (base, terms) = read_sum(bare).ok_or_else(unknown)??;
+    let (base, terms) = read_sum(unwrapped).ok_or_else(unknown)??;
     let vars: Vec<char> = terms.iter().map(|(var, _)| *var).collect();
     if terms.is_empty() || vars != params {
         return Err(index_error());

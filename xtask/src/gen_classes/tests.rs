@@ -24,7 +24,10 @@ fn committed_map(list: &[(&str, &str)]) -> BTreeMap<String, String> {
 fn matching_files_have_no_differences() {
     let generated = files(&[("a.rs", "one"), ("b.rs", "two")]);
     assert_eq!(
-        compare(&generated, &committed_map(&[("a.rs", "one"), ("b.rs", "two")])),
+        compare(
+            &generated,
+            &committed_map(&[("a.rs", "one"), ("b.rs", "two")])
+        ),
         []
     );
 }
@@ -233,6 +236,9 @@ fn written_modules_read_back_as_committed_and_other_files_are_ignored() {
 fn a_missing_output_folder_is_an_error_naming_it() {
     let scratch = walk::scratch_checkout("gen-classes", "missing", &[]);
     let error = committed(&scratch).unwrap_err();
-    assert_eq!(error.path, scratch.join(OUTPUT_FOLDER).display().to_string());
+    assert_eq!(
+        error.path,
+        scratch.join(OUTPUT_FOLDER).display().to_string()
+    );
     fs::remove_dir_all(&scratch).unwrap();
 }

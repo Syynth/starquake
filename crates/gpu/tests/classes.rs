@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 
 use starquake_gpu::classes::{
     Bits, ClassHeader, ClassId, HEADERS, Method, MwArray, MwField, NamedField, Value, cl902d,
-    cla140, clc76f, clc797, clc797tex, clc7b5, clc7c0, clc7c0qmd,
+    cla140, clc7b5, clc7c0, clc7c0qmd, clc76f, clc797, clc797tex,
 };
 use starquake_gpu::field::Field;
 use starquake_gpu::{fifo, sema};
@@ -18,9 +18,27 @@ fn value(name: &'static str, value: u32) -> Value {
     Value { name, value }
 }
 
-fn field_named(fields: &'static [NamedField], name: &str) -> NamedField {
-    *fields.iter().find(|field| field.name == name).unwrap()
+/// Helpers, in a `cfg(test)` module so they may unwrap like the tests do.
+#[cfg(test)]
+mod support {
+    use super::{Bits, NamedField};
+
+    /// The field called `name` among `fields`.
+    pub fn field_named(fields: &'static [NamedField], name: &str) -> NamedField {
+        *fields.iter().find(|field| field.name == name).unwrap()
+    }
+
+    /// The width of a field, from its bit range.
+    pub fn width(bits: Bits) -> u32 {
+        match bits {
+            Bits::Word(field) => field.width(),
+            Bits::Multi(field) => field.width().unwrap(),
+            Bits::MultiArray(array) => array.element(0).unwrap().width().unwrap(),
+        }
+    }
 }
+
+use support::{field_named, width};
 
 // --- Golden entries, per class. ---
 
@@ -167,11 +185,20 @@ fn the_hand_typed_fifo_and_semaphore_fields_agree_with_the_generated_ones() {
         (fifo::METHOD_ADDRESS_OLD, clc76f::DMA_METHOD_ADDRESS_OLD),
         (fifo::METHOD_COUNT_OLD, clc76f::DMA_METHOD_COUNT_OLD),
         (fifo::SUBDEVICE_MASK, clc76f::DMA_SUBDEVICE_MASK),
-        (fifo::SUBDEVICE_OPCODE, clc76f::DMA_SET_SUBDEVICE_MASK_OPCODE),
+        (
+            fifo::SUBDEVICE_OPCODE,
+            clc76f::DMA_SET_SUBDEVICE_MASK_OPCODE,
+        ),
         (sema::SEMAPHORED_OPERATION, clc76f::SEMAPHORED_OPERATION),
-        (sema::SEMAPHORED_ACQUIRE_SWITCH, clc76f::SEMAPHORED_ACQUIRE_SWITCH),
+        (
+            sema::SEMAPHORED_ACQUIRE_SWITCH,
+            clc76f::SEMAPHORED_ACQUIRE_SWITCH,
+        ),
         (sema::SEMAPHORED_RELEASE_WFI, clc76f::SEMAPHORED_RELEASE_WFI),
-        (sema::SEMAPHORED_RELEASE_SIZE, clc76f::SEMAPHORED_RELEASE_SIZE),
+        (
+            sema::SEMAPHORED_RELEASE_SIZE,
+            clc76f::SEMAPHORED_RELEASE_SIZE,
+        ),
         (sema::SEMAPHORED_REDUCTION, clc76f::SEMAPHORED_REDUCTION),
         (sema::SEMAPHORED_FORMAT, clc76f::SEMAPHORED_FORMAT),
         (sema::SEM_EXECUTE_OPERATION, clc76f::SEM_EXECUTE_OPERATION),
@@ -179,8 +206,14 @@ fn the_hand_typed_fifo_and_semaphore_fields_agree_with_the_generated_ones() {
             sema::SEM_EXECUTE_ACQUIRE_SWITCH_TSG,
             clc76f::SEM_EXECUTE_ACQUIRE_SWITCH_TSG,
         ),
-        (sema::SEM_EXECUTE_RELEASE_WFI, clc76f::SEM_EXECUTE_RELEASE_WFI),
-        (sema::SEM_EXECUTE_PAYLOAD_SIZE, clc76f::SEM_EXECUTE_PAYLOAD_SIZE),
+        (
+            sema::SEM_EXECUTE_RELEASE_WFI,
+            clc76f::SEM_EXECUTE_RELEASE_WFI,
+        ),
+        (
+            sema::SEM_EXECUTE_PAYLOAD_SIZE,
+            clc76f::SEM_EXECUTE_PAYLOAD_SIZE,
+        ),
         (
             sema::SEM_EXECUTE_RELEASE_TIMESTAMP,
             clc76f::SEM_EXECUTE_RELEASE_TIMESTAMP,
@@ -194,12 +227,25 @@ fn the_hand_typed_fifo_and_semaphore_fields_agree_with_the_generated_ones() {
     for (index, (typed, generated)) in pairs.iter().enumerate() {
         assert_eq!(typed, generated, "pair {index}");
     }
+}
+
+#[test]
+fn the_hand_typed_fifo_and_semaphore_values_agree_with_the_generated_ones() {
     let values = [
         (fifo::SEC_OP_INC_METHOD, clc76f::DMA_SEC_OP_INC_METHOD),
-        (fifo::SEC_OP_NON_INC_METHOD, clc76f::DMA_SEC_OP_NON_INC_METHOD),
-        (fifo::SEC_OP_IMMD_DATA_METHOD, clc76f::DMA_SEC_OP_IMMD_DATA_METHOD),
+        (
+            fifo::SEC_OP_NON_INC_METHOD,
+            clc76f::DMA_SEC_OP_NON_INC_METHOD,
+        ),
+        (
+            fifo::SEC_OP_IMMD_DATA_METHOD,
+            clc76f::DMA_SEC_OP_IMMD_DATA_METHOD,
+        ),
         (fifo::SEC_OP_ONE_INC, clc76f::DMA_SEC_OP_ONE_INC),
-        (fifo::SEC_OP_END_PB_SEGMENT, clc76f::DMA_SEC_OP_END_PB_SEGMENT),
+        (
+            fifo::SEC_OP_END_PB_SEGMENT,
+            clc76f::DMA_SEC_OP_END_PB_SEGMENT,
+        ),
         (
             fifo::SUBDEVICE_OPCODE_SET,
             clc76f::DMA_SET_SUBDEVICE_MASK_OPCODE_VALUE,
@@ -212,15 +258,30 @@ fn the_hand_typed_fifo_and_semaphore_fields_agree_with_the_generated_ones() {
             fifo::SUBDEVICE_OPCODE_USE,
             clc76f::DMA_USE_SUBDEVICE_MASK_OPCODE_VALUE,
         ),
-        (sema::SEMAPHORED_OPERATION_ACQUIRE, clc76f::SEMAPHORED_OPERATION_ACQUIRE),
-        (sema::SEMAPHORED_OPERATION_RELEASE, clc76f::SEMAPHORED_OPERATION_RELEASE),
-        (sema::SEMAPHORED_OPERATION_ACQ_GEQ, clc76f::SEMAPHORED_OPERATION_ACQ_GEQ),
-        (sema::SEMAPHORED_OPERATION_ACQ_AND, clc76f::SEMAPHORED_OPERATION_ACQ_AND),
+        (
+            sema::SEMAPHORED_OPERATION_ACQUIRE,
+            clc76f::SEMAPHORED_OPERATION_ACQUIRE,
+        ),
+        (
+            sema::SEMAPHORED_OPERATION_RELEASE,
+            clc76f::SEMAPHORED_OPERATION_RELEASE,
+        ),
+        (
+            sema::SEMAPHORED_OPERATION_ACQ_GEQ,
+            clc76f::SEMAPHORED_OPERATION_ACQ_GEQ,
+        ),
+        (
+            sema::SEMAPHORED_OPERATION_ACQ_AND,
+            clc76f::SEMAPHORED_OPERATION_ACQ_AND,
+        ),
         (
             sema::SEMAPHORED_OPERATION_REDUCTION,
             clc76f::SEMAPHORED_OPERATION_REDUCTION,
         ),
-        (sema::SEMAPHORED_RELEASE_WFI_DIS, clc76f::SEMAPHORED_RELEASE_WFI_DIS),
+        (
+            sema::SEMAPHORED_RELEASE_WFI_DIS,
+            clc76f::SEMAPHORED_RELEASE_WFI_DIS,
+        ),
         (
             sema::SEM_EXECUTE_OPERATION_ACQUIRE,
             clc76f::SEM_EXECUTE_OPERATION_ACQUIRE,
@@ -249,7 +310,10 @@ fn the_hand_typed_fifo_and_semaphore_fields_agree_with_the_generated_ones() {
             sema::SEM_EXECUTE_OPERATION_REDUCTION,
             clc76f::SEM_EXECUTE_OPERATION_REDUCTION,
         ),
-        (sema::SEM_EXECUTE_RELEASE_WFI_EN, clc76f::SEM_EXECUTE_RELEASE_WFI_EN),
+        (
+            sema::SEM_EXECUTE_RELEASE_WFI_EN,
+            clc76f::SEM_EXECUTE_RELEASE_WFI_EN,
+        ),
         (
             sema::SEM_EXECUTE_RELEASE_TIMESTAMP_EN,
             clc76f::SEM_EXECUTE_RELEASE_TIMESTAMP_EN,
@@ -308,11 +372,17 @@ fn c797_methods_and_arrays_match_the_header() {
     // clc797.h:1120-1121 SET_VIEWPORT_SCALE_X(j) (0x0a00+(j)*32), V 31:0.
     assert_eq!(clc797::SET_VIEWPORT_SCALE_X.byte_address, 0x0a00);
     assert_eq!(clc797::SET_VIEWPORT_SCALE_X.strides, [32]);
-    assert_eq!(clc797::SET_VIEWPORT_SCALE_X.byte_address_at(&[3]), Some(0x0a60));
+    assert_eq!(
+        clc797::SET_VIEWPORT_SCALE_X.byte_address_at(&[3]),
+        Some(0x0a60)
+    );
     assert_eq!(clc797::SET_VIEWPORT_SCALE_X_V, Field::new(31, 0));
     // clc797.h:4535-4539 SET_STREAM_OUT_LAYOUT_SELECT(i,j) (0x2800+(i)*128+(j)*4).
     let select = clc797::SET_STREAM_OUT_LAYOUT_SELECT;
-    assert_eq!((select.byte_address, select.strides), (0x2800, &[128, 4][..]));
+    assert_eq!(
+        (select.byte_address, select.strides),
+        (0x2800, &[128, 4][..])
+    );
     assert_eq!(select.byte_address_at(&[1, 2]), Some(0x2800 + 128 + 8));
     assert_eq!(select.method_at(&[1, 2]), Some((0x2800 + 128 + 8) / 4));
     assert_eq!(
@@ -324,10 +394,7 @@ fn c797_methods_and_arrays_match_the_header() {
     assert_eq!(clc797::ASSIGN_ZCULL_SUBREGIONS_ALGORITHM_STATIC, 0);
     assert_eq!(clc797::ASSIGN_ZCULL_SUBREGIONS_ALGORITHM_ADAPTIVE, 1);
     let algorithm = field_named(clc797::ASSIGN_ZCULL_SUBREGIONS.fields, "ALGORITHM");
-    assert_eq!(
-        algorithm.values,
-        [value("Static", 0), value("Adaptive", 1)]
-    );
+    assert_eq!(algorithm.values, [value("Static", 0), value("Adaptive", 1)]);
 }
 
 #[test]
@@ -403,12 +470,18 @@ fn twod_methods_match_the_header() {
 #[test]
 fn qmd_03_00_fields_match_the_header_and_only_that_version_is_kept() {
     // clc7c0qmd.h:508 DEPENDENCE_COUNTER MW(157:142).
-    assert_eq!(clc7c0qmd::QMDV03_00_DEPENDENCE_COUNTER, MwField::new(157, 142));
+    assert_eq!(
+        clc7c0qmd::QMDV03_00_DEPENDENCE_COUNTER,
+        MwField::new(157, 142)
+    );
     // clc7c0qmd.h:557-559 API_VISIBLE_CALL_LIMIT MW(378:378), _32 0, NO_CHECK 1.
     assert_eq!(clc7c0qmd::QMDV03_00_API_VISIBLE_CALL_LIMIT__32, 0);
     assert_eq!(clc7c0qmd::QMDV03_00_API_VISIBLE_CALL_LIMIT_NO_CHECK, 1);
     // clc7c0qmd.h:567 CTA_RASTER_WIDTH MW(415:384); 706 PROGRAM_ADDRESS_LOWER MW(1567:1536).
-    assert_eq!(clc7c0qmd::QMDV03_00_CTA_RASTER_WIDTH, MwField::new(415, 384));
+    assert_eq!(
+        clc7c0qmd::QMDV03_00_CTA_RASTER_WIDTH,
+        MwField::new(415, 384)
+    );
     assert_eq!(
         clc7c0qmd::QMDV03_00_PROGRAM_ADDRESS_LOWER,
         MwField::new(1567, 1536)
@@ -425,7 +498,7 @@ fn qmd_03_00_fields_match_the_header_and_only_that_version_is_kept() {
     assert_eq!(lower.element(2), Some(MwField::new(1055 + 128, 1024 + 128)));
     // The header also holds QMD 02_03 and 02_04; only 03_00 is generated.
     assert!(clc7c0qmd::HEADER.class.is_none());
-    assert!(clc7c0qmd::HEADER.methods.is_empty());
+    assert_eq!(clc7c0qmd::HEADER.methods, []);
     assert!(
         clc7c0qmd::HEADER
             .fields
@@ -440,10 +513,19 @@ fn texture_header_and_sampler_fields_match_the_header() {
     assert_eq!(clc797tex::TEXHEAD_BL_COMPONENTS, MwField::new(6, 0));
     assert_eq!(clc797tex::TEXHEAD_BL_COMPONENTS_SIZES_A8B8G8R8, 8);
     // clc797tex.h:180 ADDRESS_BITS31TO9 MW(63:41); 250 WIDTH_MINUS_ONE MW(144:128).
-    assert_eq!(clc797tex::TEXHEAD_BL_ADDRESS_BITS31TO9, MwField::new(63, 41));
-    assert_eq!(clc797tex::TEXHEAD_BL_WIDTH_MINUS_ONE, MwField::new(144, 128));
+    assert_eq!(
+        clc797tex::TEXHEAD_BL_ADDRESS_BITS31TO9,
+        MwField::new(63, 41)
+    );
+    assert_eq!(
+        clc797tex::TEXHEAD_BL_WIDTH_MINUS_ONE,
+        MwField::new(144, 128)
+    );
     // clc797tex.h:1001 TEXHEAD_PITCH_PITCH_BITS20TO5 MW(111:96).
-    assert_eq!(clc797tex::TEXHEAD_PITCH_PITCH_BITS20TO5, MwField::new(111, 96));
+    assert_eq!(
+        clc797tex::TEXHEAD_PITCH_PITCH_BITS20TO5,
+        MwField::new(111, 96)
+    );
     // clc797tex.h:1361-1369: the sampler's fields are per word, numbered in the name.
     assert_eq!(clc797tex::TEXSAMP0_ADDRESS_U, Field::new(2, 0));
     assert_eq!(clc797tex::TEXSAMP0_ADDRESS_U_WRAP, 0);
@@ -459,15 +541,6 @@ fn all_fields(header: &ClassHeader) -> impl Iterator<Item = &NamedField> {
         .iter()
         .flat_map(|method| method.fields)
         .chain(header.fields)
-}
-
-/// The width of a field, from its bit range.
-fn width(bits: Bits) -> u32 {
-    match bits {
-        Bits::Word(field) => field.width(),
-        Bits::Multi(field) => field.width().unwrap(),
-        Bits::MultiArray(array) => array.element(0).unwrap().width().unwrap(),
-    }
 }
 
 #[test]
@@ -493,7 +566,12 @@ fn every_method_is_word_aligned_and_every_field_is_valid() {
     for header in HEADERS {
         for method in header.methods {
             assert_eq!(method.byte_address % 4, 0, "{}", method.name);
-            assert!(method.strides.iter().all(|stride| stride % 4 == 0 && *stride > 0));
+            assert!(
+                method
+                    .strides
+                    .iter()
+                    .all(|stride| stride % 4 == 0 && *stride > 0)
+            );
             assert!(method.strides.len() <= 2);
             assert!(!method.fields.is_empty(), "{}", method.name);
             assert!(
@@ -505,7 +583,12 @@ fn every_method_is_word_aligned_and_every_field_is_valid() {
         }
         for field in all_fields(header) {
             let width = width(field.bits);
-            assert!((1..=32).contains(&width), "{} {}", header.header, field.name);
+            assert!(
+                (1..=32).contains(&width),
+                "{} {}",
+                header.header,
+                field.name
+            );
         }
     }
 }
@@ -561,17 +644,21 @@ fn the_tables_hold_every_kind_of_item_where_the_headers_have_one() {
             header.methods.len(),
             header.fields.len(),
             header.constants.len(),
-            header.methods.iter().filter(|m| !m.strides.is_empty()).count(),
+            header
+                .methods
+                .iter()
+                .filter(|m| !m.strides.is_empty())
+                .count(),
         )
     };
     // Methods, fields of no method, constants, array methods; counted from the generated
     // tables, which hold one entry per define of each header.
-    let c76f = count(&clc76f::HEADER);
-    assert!(c76f.0 > 0 && c76f.1 > 0 && c76f.2 == 4 && c76f.3 == 0);
-    let c797 = count(&clc797::HEADER);
-    assert!(c797.0 > 0 && c797.1 == 0 && c797.2 == 0 && c797.3 > 0);
-    let tex = count(&clc797tex::HEADER);
-    assert!(tex.0 == 0 && tex.1 > 0 && tex.2 == 0);
+    let host = count(&clc76f::HEADER);
+    assert!(host.0 > 0 && host.1 > 0 && host.2 == 4 && host.3 == 0);
+    let three_d = count(&clc797::HEADER);
+    assert!(three_d.0 > 0 && three_d.1 == 0 && three_d.2 == 0 && three_d.3 > 0);
+    let texture = count(&clc797tex::HEADER);
+    assert!(texture.0 == 0 && texture.1 > 0 && texture.2 == 0);
     assert!(
         clc7c0qmd::HEADER
             .fields
@@ -746,7 +833,10 @@ fn array_elements_step_by_the_stride_until_the_positions_overflow() {
     // The stride times the index overflowing is caught even where the wrapped product would
     // land back on a small position.
     let wide = MwArray::new(0, 0, 0x8000_0000);
-    assert_eq!(wide.element(1), Some(MwField::new(0x8000_0000, 0x8000_0000)));
+    assert_eq!(
+        wide.element(1),
+        Some(MwField::new(0x8000_0000, 0x8000_0000))
+    );
     assert_eq!(wide.element(2), None);
 }
 
@@ -757,7 +847,9 @@ fn a_qmd_built_through_the_tables_reads_back() {
     let lower = clc7c0qmd::QMDV03_00_CONSTANT_BUFFER_ADDR_LOWER
         .element(1)
         .unwrap();
-    let valid = clc7c0qmd::QMDV03_00_CONSTANT_BUFFER_VALID.element(1).unwrap();
+    let valid = clc7c0qmd::QMDV03_00_CONSTANT_BUFFER_VALID
+        .element(1)
+        .unwrap();
     lower.insert(&mut qmd, 0x8000_1000).unwrap();
     valid
         .insert(&mut qmd, clc7c0qmd::QMDV03_00_CONSTANT_BUFFER_VALID_TRUE)

@@ -191,7 +191,12 @@ fn array_methods_with_one_or_two_indices_keep_their_strides_in_parameter_order()
     assert_eq!(
         parsed.methods,
         [
-            method("SET_SCALE_X", 0xa00, vec![32], vec![word("V", 31, 0, vec![])]),
+            method(
+                "SET_SCALE_X",
+                0xa00,
+                vec![32],
+                vec![word("V", 31, 0, vec![])]
+            ),
             method("LOAD_DATA", 0x320, vec![4], vec![word("V", 31, 0, vec![])]),
             method(
                 "SET_LAYOUT_SELECT",
@@ -233,7 +238,7 @@ fn a_held_back_number_before_a_multi_word_field_is_a_constant() {
          #define NVC797_QMD_GROUP MW(5:0)\n",
     );
     assert_eq!(parsed.constants, [value("QMD", 0x100)]);
-    assert!(parsed.methods.is_empty());
+    assert_eq!(parsed.methods, []);
     assert_eq!(
         parsed.fields,
         [Field {
@@ -257,7 +262,12 @@ fn fields_of_no_method_take_values_and_end_the_method() {
     // The last define extends WFI_SCOPE's name, but the free field ended WFI: a constant.
     assert_eq!(
         parsed.methods,
-        [method("WFI", 0x78, vec![], vec![word("SCOPE", 0, 0, vec![])])]
+        [method(
+            "WFI",
+            0x78,
+            vec![],
+            vec![word("SCOPE", 0, 0, vec![])]
+        )]
     );
     assert_eq!(
         parsed.fields,
@@ -592,7 +602,13 @@ fn a_define_without_a_name_is_refused() {
 
 #[test]
 fn a_name_the_reader_does_not_understand_is_refused() {
-    for name in ["set_object", "_SET_OBJECT", "SET_OBJECT(k)", "SET_OBJECT(i", "SET-OBJECT"] {
+    for name in [
+        "set_object",
+        "_SET_OBJECT",
+        "SET_OBJECT(k)",
+        "SET_OBJECT(i",
+        "SET-OBJECT",
+    ] {
         assert_eq!(
             error(&format!("#define NVC797_{name} 0x0\n")),
             format!(
@@ -678,19 +694,31 @@ fn a_number_past_32_bits_is_refused() {
     // A class id too.
     assert_eq!(
         error("#define AMPERE (0x100000000)\n"),
-        format!("clc797.h:{}: 0x100000000 does not fit in 32 bits", body_line(1))
+        format!(
+            "clc797.h:{}: 0x100000000 does not fit in 32 bits",
+            body_line(1)
+        )
     );
     assert_eq!(
         error("#define NVC797_BIG_BIT 4294967296:0\n"),
-        format!("clc797.h:{}: 4294967296 does not fit in 32 bits", body_line(1))
+        format!(
+            "clc797.h:{}: 4294967296 does not fit in 32 bits",
+            body_line(1)
+        )
     );
     assert_eq!(
         error("#define NVC797_BIG_ARRAY(i) (0x100000000+(i)*4)\n"),
-        format!("clc797.h:{}: 0x100000000 does not fit in 32 bits", body_line(1))
+        format!(
+            "clc797.h:{}: 0x100000000 does not fit in 32 bits",
+            body_line(1)
+        )
     );
     assert_eq!(
         error("#define NVC797_BIG_STRIDE(i) (0x10+(i)*4294967296)\n"),
-        format!("clc797.h:{}: 4294967296 does not fit in 32 bits", body_line(1))
+        format!(
+            "clc797.h:{}: 4294967296 does not fit in 32 bits",
+            body_line(1)
+        )
     );
 }
 
@@ -753,7 +781,10 @@ fn a_method_address_or_stride_that_is_not_a_whole_word_is_refused() {
         )
     );
     // A number no field follows is a constant, and need not be aligned.
-    assert_eq!(read_ok("#define NVC797_ODD 0x0102\n").constants, [value("ODD", 0x102)]);
+    assert_eq!(
+        read_ok("#define NVC797_ODD 0x0102\n").constants,
+        [value("ODD", 0x102)]
+    );
 }
 
 #[test]
@@ -822,7 +853,9 @@ fn a_name_defined_again_differently_is_refused() {
 #[test]
 fn an_array_method_without_fields_is_refused() {
     assert_eq!(
-        error("#define NVC797_A(i) (0x0100+(i)*4)\n#define NVC797_B 0x0200\n#define NVC797_B_V 31:0\n"),
+        error(
+            "#define NVC797_A(i) (0x0100+(i)*4)\n#define NVC797_B 0x0200\n#define NVC797_B_V 31:0\n"
+        ),
         format!("clc797.h:{}: array method A has no fields", body_line(1))
     );
 }
@@ -840,37 +873,45 @@ enum FreeShape {
 /// Writes `header` as class header text, the way NVIDIA lays the headers out. Numbers are
 /// written in hex or decimal by `decimal` (indexed by a running count).
 fn render(header: &Header, decimal: &[bool], j_index: &[bool]) -> String {
-    let mut text = String::from(NOTICE);
+    let mut lines = vec![NOTICE.to_owned()];
     let mut count = 0usize;
     let mut number = |value: u32| {
         count += 1;
-        if decimal.get(count % decimal.len().max(1)).copied().unwrap_or(false) {
+        if decimal
+            .get(count % decimal.len().max(1))
+            .copied()
+            .unwrap_or(false)
+        {
             format!("({value})")
         } else {
             format!("0x{value:08x}")
         }
     };
-    text.push_str("#ifndef _cl_round_trip_h_\n#define _cl_round_trip_h_\n");
+    lines.push("#ifndef _cl_round_trip_h_\n#define _cl_round_trip_h_\n".to_owned());
     if let Some(class) = &header.class {
-        text.push_str(&format!("#define {} {}\n", class.name, number(class.id)));
+        lines.push(format!("#define {} {}\n", class.name, number(class.id)));
     }
     let p = &header.prefix;
     for (index, method) in header.methods.iter().enumerate() {
-        text.push('\n');
+        lines.push("\n".to_owned());
         match method.strides.as_slice() {
-            [] => text.push_str(&format!(
+            [] => lines.push(format!(
                 "#define {p}{} {}\n",
                 method.name,
                 number(method.byte_address)
             )),
             [stride] => {
-                let var = if j_index.get(index).copied().unwrap_or(false) { 'j' } else { 'i' };
-                text.push_str(&format!(
+                let var = if j_index.get(index).copied().unwrap_or(false) {
+                    'j'
+                } else {
+                    'i'
+                };
+                lines.push(format!(
                     "#define {p}{}({var}) (0x{:04x}+({var})*{stride})\n",
                     method.name, method.byte_address
                 ));
             }
-            [first, second] => text.push_str(&format!(
+            [first, second] => lines.push(format!(
                 "#define {p}{}(i,j) (0x{:04x}+(i)*{first}+(j)*{second})\n",
                 method.name, method.byte_address
             )),
@@ -880,9 +921,12 @@ fn render(header: &Header, decimal: &[bool], j_index: &[bool]) -> String {
             let Bits::Word { high, low } = field.bits else {
                 unreachable!("method fields are single-word")
             };
-            text.push_str(&format!("#define {p}{}_{} {high}:{low}\n", method.name, field.name));
+            lines.push(format!(
+                "#define {p}{}_{} {high}:{low}\n",
+                method.name, field.name
+            ));
             for value in &field.values {
-                text.push_str(&format!(
+                lines.push(format!(
                     "#define {p}{}_{}_{} {}\n",
                     method.name,
                     field.name,
@@ -892,9 +936,13 @@ fn render(header: &Header, decimal: &[bool], j_index: &[bool]) -> String {
             }
         }
     }
-    text.push('\n');
+    lines.push("\n".to_owned());
     for constant in &header.constants {
-        text.push_str(&format!("#define {p}{} {}\n", constant.name, number(constant.value)));
+        lines.push(format!(
+            "#define {p}{} {}\n",
+            constant.name,
+            number(constant.value)
+        ));
     }
     for field in &header.fields {
         let (suffix, bits) = match field.bits {
@@ -905,9 +953,9 @@ fn render(header: &Header, decimal: &[bool], j_index: &[bool]) -> String {
                 format!("MW(({high}+(i)*{stride}):({low}+(i)*{stride}))"),
             ),
         };
-        text.push_str(&format!("#define {p}{}{suffix} {bits}\n", field.name));
+        lines.push(format!("#define {p}{}{suffix} {bits}\n", field.name));
         for value in &field.values {
-            text.push_str(&format!(
+            lines.push(format!(
                 "#define {p}{}_{} {}\n",
                 field.name,
                 value.name,
@@ -915,8 +963,8 @@ fn render(header: &Header, decimal: &[bool], j_index: &[bool]) -> String {
             ));
         }
     }
-    text.push_str("#endif\n");
-    text
+    lines.push("#endif\n".to_owned());
+    lines.concat()
 }
 
 fn config() -> Config {
@@ -966,10 +1014,7 @@ fn method_fields(method: usize) -> impl Strategy<Value = Vec<Field>> {
 
 fn methods() -> impl Strategy<Value = Vec<Method>> {
     prop::collection::vec(
-        (
-            0u32..0x4000,
-            prop::collection::vec(1u32..0x400, 0..3),
-        ),
+        (0u32..0x4000, prop::collection::vec(1u32..0x400, 0..3)),
         0..6,
     )
     .prop_flat_map(|shapes| {

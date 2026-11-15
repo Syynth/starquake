@@ -629,18 +629,18 @@ fn classes() -> bool {
     let root = Path::new(".");
     let headers = gen_classes::header_folder(root);
     let present = headers.as_deref().is_some_and(Path::is_dir);
-    match (gen_classes::gate_check(present), headers) {
-        (gen_classes::GateCheck::Compare, Some(headers)) => compare_classes(root, &headers),
-        _ => {
-            eprintln!(
-                "==> classes: SKIPPED, the reference folder has no class headers ({}; \
-                 tools/fetch-refs.sh fetches them), so the committed tables are not compared \
-                 with a fresh generation",
-                gen_classes::emit::HEADER_FOLDER
-            );
-            true
-        }
+    if let (gen_classes::GateCheck::Compare, Some(headers)) =
+        (gen_classes::gate_check(present), headers)
+    {
+        return compare_classes(root, &headers);
     }
+    eprintln!(
+        "==> classes: SKIPPED, the reference folder has no class headers ({}; \
+         tools/fetch-refs.sh fetches them), so the committed tables are not compared with a \
+         fresh generation",
+        gen_classes::emit::HEADER_FOLDER
+    );
+    true
 }
 
 /// `cargo xtask gen-classes [--check]`: needs the class headers, unlike the gate step.
