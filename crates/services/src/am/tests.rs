@@ -432,6 +432,7 @@ fn the_reported_modes_and_focus_state_are_the_settings() {
     ];
     for (settings, operation, performance, focus) in cases {
         let mut rig = Rig::with(settings);
+        assert_eq!(rig.applet().settings(), &settings);
         let proxy = rig.proxy();
         let getter = rig.open(proxy, GET_COMMON_STATE_GETTER);
         let asked = [
