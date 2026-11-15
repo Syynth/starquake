@@ -25,8 +25,11 @@
 
 //! The texture header (block-linear, pitch and 1D forms) and the texture sampler of the 3D class.
 //!
-//! Every define of `clc797tex.h` as a constant named like the header's define without the `NVC797_`
-//! prefix, and all of them as one [`HEADER`] table. Bit ranges are the header's own.
+//! One constant per define of `clc797tex.h` under the `NVC797_` prefix, named like the define
+//! without the prefix and upper-cased, except that a define whose name ends in `TYPEDEF` and whose
+//! value is a type name is skipped and a define repeated with the same value gives one constant.
+//! Include guards are skipped. All of them are in one [`HEADER`] table. Bit ranges are the header's
+//! own.
 
 use super::{Bits, ClassHeader, MwField, NamedField, Value};
 use crate::field::Field;

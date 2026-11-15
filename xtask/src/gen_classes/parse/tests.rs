@@ -1,5 +1,7 @@
 use super::*;
 
+use crate::gen_classes::emit::RESERVED;
+
 use proptest::prelude::*;
 use proptest::test_runner::{Config, RngSeed};
 
@@ -206,6 +208,44 @@ fn array_methods_with_one_or_two_indices_keep_their_strides_in_parameter_order()
             ),
         ]
     );
+}
+
+#[test]
+fn a_plain_method_whose_name_extends_the_previous_method_starts_a_new_method() {
+    // `clc7b5.h:51-54`: `SET_SEMAPHORE_PAYLOAD_UPPER` comes right after `SET_SEMAPHORE_PAYLOAD`'s
+    // field with no blank line between. Grouping is by name, so it is a method of its own; Mesa,
+    // which resets only on blank lines, folds it into `SET_SEMAPHORE_PAYLOAD` as a field.
+    let parsed = read_ok(
+        "#define NVC797_SET_SEMAPHORE_PAYLOAD (0x00000248)\n\
+         #define NVC797_SET_SEMAPHORE_PAYLOAD_PAYLOAD 31:0\n\
+         #define NVC797_SET_SEMAPHORE_PAYLOAD_UPPER (0x0000024C)\n\
+         #define NVC797_SET_SEMAPHORE_PAYLOAD_UPPER_PAYLOAD 31:0\n",
+    );
+    assert_eq!(
+        parsed.methods,
+        [
+            method(
+                "SET_SEMAPHORE_PAYLOAD",
+                0x248,
+                vec![],
+                vec![word("PAYLOAD", 31, 0, vec![])]
+            ),
+            method(
+                "SET_SEMAPHORE_PAYLOAD_UPPER",
+                0x24c,
+                vec![],
+                vec![word("PAYLOAD", 31, 0, vec![])]
+            ),
+        ]
+    );
+    assert!(parsed.fields.is_empty() && parsed.constants.is_empty());
+}
+
+#[test]
+fn a_typedef_define_with_a_number_is_a_constant() {
+    // Only a `TYPEDEF` define naming a type is skipped.
+    let parsed = read_ok("#define NVC797_X_TYPEDEF 0x5\n");
+    assert_eq!(parsed.constants, [value("X_TYPEDEF", 5)]);
 }
 
 #[test]
@@ -453,6 +493,18 @@ fn a_repeated_identical_define_is_read_once() {
 }
 
 #[test]
+fn a_repeated_define_with_the_same_value_spelled_differently_is_read_once() {
+    // The values are compared as read, not as text.
+    let parsed = read_ok(
+        "#define NVC797_A 0x0100\n\
+         #define NVC797_A (0x00000100)\n\
+         #define NVC797_B 256\n\
+         #define NVC797_B 0x100\n",
+    );
+    assert_eq!(parsed.constants, [value("A", 0x100), value("B", 0x100)]);
+}
+
+#[test]
 fn lower_case_letters_after_the_first_are_accepted() {
     let parsed = read_ok(
         "#define NVC797_SET_PATTERN_SELECT 0x08e8\n\
@@ -472,7 +524,8 @@ fn only_keeps_the_defines_with_the_given_prefix() {
          #define NVC797_QMDV03_00_OUTER_PUT MW(30:0)\n\
          #define NVC797_QMDV03_00_IS_QUEUE MW(136:136)\n\
          #define NVC797_QMDV03_00_IS_QUEUE_TRUE 0x00000001\n\
-         #define NVC797_QMDV02_03_IS_QUEUE_TRUE 0x00000001\n"
+         #define NVC797_QMDV02_03_IS_QUEUE_TRUE 0x00000001\n\
+         #define NVC797_X_QMDV03_00_Y MW(40:40)\n"
     );
     let parsed = parse(FILE, &text, Some("QMDV03_00_")).unwrap();
     assert_eq!(
@@ -493,8 +546,9 @@ fn only_keeps_the_defines_with_the_given_prefix() {
             },
         ]
     );
-    // Without the filter, the 02_03 defines are read too.
-    assert_eq!(parse(FILE, &text, None).unwrap().fields.len(), 3);
+    // Without the filter, the 02_03 defines and the one that only contains the filter are read
+    // too.
+    assert_eq!(parse(FILE, &text, None).unwrap().fields.len(), 4);
 }
 
 #[test]
@@ -566,6 +620,18 @@ fn a_file_without_the_mit_grant_is_refused() {
             .unwrap_err()
             .to_string(),
         message
+    );
+    // The notice must come first: after a define it does not count.
+    assert_eq!(
+        parse(FILE, &format!("#define NVC797_NOP 0x0100\n{NOTICE}"), None)
+            .unwrap_err()
+            .to_string(),
+        message
+    );
+    // Blank space before it is fine.
+    assert_eq!(
+        parse(FILE, &format!("\n  \n{NOTICE}"), None).unwrap(),
+        header()
     );
 }
 
@@ -643,6 +709,7 @@ fn a_value_of_an_unknown_form_is_refused() {
     for text in [
         "1+2",
         "0x10:0",
+        "0X1F:0",
         "MW(6-0)",
         "MW(abc:0)",
         "(0x10+(i)*4",
@@ -669,6 +736,53 @@ fn an_unprefixed_define_with_a_word_value_is_refused() {
             "clc797.h:{}: OTHER_THING is outside the class prefix and is not a class id",
             body_line(1)
         )
+    );
+}
+
+#[test]
+fn a_class_id_name_that_is_not_a_c_identifier_is_refused() {
+    assert_eq!(
+        error("#define AMPERE\"B 0xC797\n"),
+        format!(
+            "clc797.h:{}: AMPERE\"B is not a C identifier, so it cannot name the class id",
+            body_line(1)
+        )
+    );
+}
+
+#[test]
+fn a_name_the_generated_module_uses_for_its_own_items_is_refused() {
+    for item in RESERVED {
+        let message = format!(
+            "clc797.h:{}: NVC797_{item} would be written as {item}, which the generated module \
+             defines itself",
+            body_line(1)
+        );
+        assert_eq!(error(&format!("#define NVC797_{item} 0x1\n")), message);
+        // With a class id before it as well.
+        let body = format!("#define AMPERE_B 0xC797\n#define NVC797_{item} 0x1\n");
+        assert_eq!(
+            error(&body),
+            format!(
+                "clc797.h:{}: NVC797_{item} would be written as {item}, which the generated \
+                 module defines itself",
+                body_line(2)
+            )
+        );
+    }
+    // In any case, since the emitter upper-cases names.
+    assert_eq!(
+        error("#define NVC797_Header 0x1\n"),
+        format!(
+            "clc797.h:{}: NVC797_Header would be written as HEADER, which the generated module \
+             defines itself",
+            body_line(1)
+        )
+    );
+    // A longer name that starts with one is fine.
+    assert_eq!(
+        read_ok("#define NVC797_HEADER_SIZE 0x1\n").constants,
+        [value("HEADER_SIZE", 1)]
     );
 }
 

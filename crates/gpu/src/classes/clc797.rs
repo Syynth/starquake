@@ -24,9 +24,12 @@
 
 //! The 3D class, `AMPERE_B` (`0xC797`).
 //!
-//! Every define of `clc797.h` as a constant named like the header's define without the `NVC797_`
-//! prefix, and all of them as one [`HEADER`] table. Byte addresses and bit ranges are the header's
-//! own; method numbers (byte address / 4) come from [`Method::method`](super::Method::method).
+//! One constant per define of `clc797.h` under the `NVC797_` prefix, named like the define without
+//! the prefix and upper-cased, except that a define whose name ends in `TYPEDEF` and whose value is
+//! a type name is skipped and a define repeated with the same value gives one constant. The class
+//! id define, `AMPERE_B`, is [`CLASS`]. Include guards are skipped. All of them are in one
+//! [`HEADER`] table. Byte addresses and bit ranges are the header's own; method numbers (byte
+//! address / 4) come from [`Method::method`](super::Method::method).
 
 use super::{Bits, ClassHeader, ClassId, Method, NamedField, Value};
 use crate::field::Field;

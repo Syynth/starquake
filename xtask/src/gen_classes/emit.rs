@@ -1,9 +1,11 @@
 //! Writing a read [`Header`] as a Rust module of `crates/gpu/src/classes/`.
 //!
-//! The module holds one constant per define, named as the header names it without the class
-//! prefix (`NVC797_SET_OBJECT_CLASS_ID` becomes `SET_OBJECT_CLASS_ID`), so an entry can be
-//! checked against the header by eye, and a `HEADER` table that lists every method, field,
-//! value and constant by name. The types are the hand-written ones of `crates/gpu/src/classes.rs`.
+//! The module holds one constant for each define the reader keeps: each define under the class
+//! prefix (that the [`Source`] filter keeps), named as the header names it without the prefix and
+//! upper-cased (`NVC797_SET_OBJECT_CLASS_ID` becomes `SET_OBJECT_CLASS_ID`), so an entry can be
+//! checked against the header by eye; a define the reader skips (an include guard, a `TYPEDEF`
+//! alias, the second copy of a repeated identical define) gives none, and the class id define
+//! gives `CLASS`. A `HEADER` table lists every method, field, value and constant by name. The types are the hand-written ones of `crates/gpu/src/classes.rs`.
 //!
 //! The output is a pure function of the header text and the [`Source`] entry: no dates, paths
 //! or versions, so regenerating from the same header gives the same bytes.
@@ -15,6 +17,16 @@ use super::parse::{Bits, Field, Header, Method, Value};
 
 #[cfg(test)]
 mod tests;
+
+/// The name of the class id constant every module with a class id defines.
+pub const CLASS_ITEM: &str = "CLASS";
+
+/// The name of the table every module defines.
+pub const HEADER_ITEM: &str = "HEADER";
+
+/// The constant names the emitter writes for its own items, which no define may take (the reader
+/// refuses them).
+pub const RESERVED: [&str; 2] = [CLASS_ITEM, HEADER_ITEM];
 
 /// The folder, relative to the reference folder, that holds the class headers. Written into
 /// each generated file's header comment.
@@ -41,12 +53,23 @@ pub fn emit(source: &Source, header: &Header) -> String {
     out.wrapped(
         "//! ",
         &format!(
-            "Every define of `{}`{} as a constant named like the header's define without the \
-             `{prefix}` prefix, and all of them as one [`HEADER`] table. {}",
+            "One constant per define of `{}` under the `{prefix}` prefix{}, named like the \
+             define without the prefix and upper-cased, except that a define whose name ends in \
+             `TYPEDEF` and whose value is a type name is skipped and a define repeated with the \
+             same value gives one constant.{} Include guards are skipped. All of them are in one \
+             [`{HEADER_ITEM}`] table. {}",
             source.header,
             source
                 .only
                 .map(|only| format!(" whose name starts with `{prefix}{only}`"))
+                .unwrap_or_default(),
+            header
+                .class
+                .as_ref()
+                .map(|class| format!(
+                    " The class id define, `{}`, is [`{CLASS_ITEM}`].",
+                    class.name
+                ))
                 .unwrap_or_default(),
             if header.methods.is_empty() {
                 "Bit ranges are the header's own."
@@ -61,7 +84,10 @@ pub fn emit(source: &Source, header: &Header) -> String {
     out.line("");
     if let Some(class) = &header.class {
         out.line(&format!("/// The class id, `{}`.", class.name));
-        out.line(&format!("pub const CLASS: u32 = {};", hex(class.id, 4)));
+        out.line(&format!(
+            "pub const {CLASS_ITEM}: u32 = {};",
+            hex(class.id, 4)
+        ));
         out.line("");
     }
     for method in &header.methods {
@@ -306,11 +332,13 @@ fn write_table(out: &mut Out, source: &Source, header: &Header) {
         "/// Every method, field of no method and constant of `{}`, in the header's order.",
         source.header
     ));
-    out.line("pub const HEADER: ClassHeader = ClassHeader {");
+    out.line(&format!(
+        "pub const {HEADER_ITEM}: ClassHeader = ClassHeader {{"
+    ));
     out.line(&format!("    header: \"{}\",", source.header));
     match &header.class {
         Some(class) => out.line(&format!(
-            "    class: Some(ClassId {{ name: \"{}\", id: CLASS }}),",
+            "    class: Some(ClassId {{ name: \"{}\", id: {CLASS_ITEM} }}),",
             class.name
         )),
         None => out.line("    class: None,"),

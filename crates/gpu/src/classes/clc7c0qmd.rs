@@ -24,9 +24,11 @@
 
 //! The compute class's queue metadata (QMD), version `03_00`.
 //!
-//! Every define of `clc7c0qmd.h` whose name starts with `NVC7C0_QMDV03_00_` as a constant named
-//! like the header's define without the `NVC7C0_` prefix, and all of them as one [`HEADER`] table.
-//! Bit ranges are the header's own.
+//! One constant per define of `clc7c0qmd.h` under the `NVC7C0_` prefix whose name starts with
+//! `NVC7C0_QMDV03_00_`, named like the define without the prefix and upper-cased, except that a
+//! define whose name ends in `TYPEDEF` and whose value is a type name is skipped and a define
+//! repeated with the same value gives one constant. Include guards are skipped. All of them are in
+//! one [`HEADER`] table. Bit ranges are the header's own.
 
 use super::{Bits, ClassHeader, MwArray, MwField, NamedField, Value};
 

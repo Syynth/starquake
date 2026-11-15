@@ -39,9 +39,12 @@ const EXPECTED: &str = r#"// Copyright (c) 2020, Test Holder.
 
 //! A test class.
 //!
-//! Every define of `clc797.h` as a constant named like the header's define without the `NVC797_`
-//! prefix, and all of them as one [`HEADER`] table. Byte addresses and bit ranges are the header's
-//! own; method numbers (byte address / 4) come from [`Method::method`](super::Method::method).
+//! One constant per define of `clc797.h` under the `NVC797_` prefix, named like the define without
+//! the prefix and upper-cased, except that a define whose name ends in `TYPEDEF` and whose value is
+//! a type name is skipped and a define repeated with the same value gives one constant. The class
+//! id define, `TEST_CLASS`, is [`CLASS`]. Include guards are skipped. All of them are in one
+//! [`HEADER`] table. Byte addresses and bit ranges are the header's own; method numbers (byte
+//! address / 4) come from [`Method::method`](super::Method::method).
 
 use super::{Bits, ClassHeader, ClassId, Method, MwArray, MwField, NamedField, Value};
 use crate::field::Field;
@@ -153,10 +156,15 @@ fn a_structure_header_has_no_class_methods_or_constants_and_imports_only_what_it
     assert!(text.contains("    class: None,\n    methods: &[],\n"));
     assert!(text.contains("    constants: &[],\n};\n"));
     assert!(text.contains(
-        "//! Every define of `clc7c0qmd.h` whose name starts with `NVC7C0_QMDV03_00_` as a \
-         constant named\n//! like the header's define without the `NVC7C0_` prefix, and all of \
-         them as one [`HEADER`] table.\n//! Bit ranges are the header's own.\n"
+        "//! One constant per define of `clc7c0qmd.h` under the `NVC7C0_` prefix whose name starts \
+         with\n//! `NVC7C0_QMDV03_00_`, named like the define without the prefix and upper-cased, \
+         except that a\n//! define whose name ends in `TYPEDEF` and whose value is a type name is \
+         skipped and a define\n//! repeated with the same value gives one constant. Include \
+         guards are skipped. All of them are in\n//! one [`HEADER`] table. Bit ranges are the \
+         header's own.\n"
     ));
+    // No class id, so no sentence about one.
+    assert!(!text.contains("The class id define"));
 }
 
 #[test]

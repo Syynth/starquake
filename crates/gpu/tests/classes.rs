@@ -432,6 +432,32 @@ fn c7b5_copy_methods_match_the_header() {
 }
 
 #[test]
+fn c7b5_semaphore_payload_upper_is_a_method_of_its_own() {
+    // clc7b5.h:51-54: SET_SEMAPHORE_PAYLOAD (0x00000248), PAYLOAD 31:0, then
+    // SET_SEMAPHORE_PAYLOAD_UPPER (0x0000024C), PAYLOAD 31:0, with no blank line between. The
+    // generator groups by name, so UPPER is its own method; Mesa folds it into
+    // SET_SEMAPHORE_PAYLOAD as a field UPPER_PAYLOAD (a listed divergence).
+    assert_eq!(
+        clc7b5::SET_SEMAPHORE_PAYLOAD.fields,
+        [NamedField {
+            name: "PAYLOAD",
+            bits: Bits::Word(Field::new(31, 0)),
+            values: &[],
+        }]
+    );
+    assert_eq!(clc7b5::SET_SEMAPHORE_PAYLOAD.byte_address, 0x0248);
+    assert_eq!(clc7b5::SET_SEMAPHORE_PAYLOAD_UPPER.byte_address, 0x024C);
+    assert_eq!(
+        clc7b5::SET_SEMAPHORE_PAYLOAD_UPPER.fields,
+        [NamedField {
+            name: "PAYLOAD",
+            bits: Bits::Word(Field::new(31, 0)),
+            values: &[],
+        }]
+    );
+}
+
+#[test]
 fn a140_inline_to_memory_methods_match_the_header() {
     // cla140.h:34 KEPLER_INLINE_TO_MEMORY_B 0xA140
     assert_eq!(cla140::CLASS, 0xA140);

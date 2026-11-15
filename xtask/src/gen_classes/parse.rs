@@ -9,6 +9,10 @@
 //!
 //! # The format
 //!
+//! The file must start, after blank space, with a `/*` comment holding the MIT permission grant
+//! (`Permission is hereby granted, free of charge`); the generated module copies it. A file
+//! whose first comment comes after other text, or lacks the grant, is refused.
+//!
 //! Comments (`/* */`, which may span lines, and `//`) are removed first. Every remaining line
 //! that starts with `#` is a directive: `#ifndef`, `#ifdef`, `#endif` and `#include` are
 //! skipped, `#define` is read, and any other directive is an error. Lines that are not
@@ -16,8 +20,8 @@
 //!
 //! A `#define` whose name does not start with the class prefix (`NV` and the four hex digits of
 //! the file name: `NVC797_` for `clc797.h` and `clc797tex.h`) is either an include guard (no
-//! value), skipped, or the class id (`AMPERE_B 0xC797`), of which there is at most one. Under the
-//! prefix, the value is one of:
+//! value), skipped, or the class id (`AMPERE_B 0xC797`), of which there is at most one and whose
+//! name must be a C identifier. Under the prefix, the value is one of:
 //!
 //! - a number, hex or decimal, in any number of parentheses (`0x0100`, `(0x00000100)`, `(8)`);
 //! - a single-word bit range `high:low`;
@@ -43,12 +47,21 @@
 //!
 //! A name (after the class prefix) is letters, digits and underscores starting with an
 //! upper-case letter; a few value names have lower-case letters (`MONOCHROME_8x8` in
-//! `cl902d.h`), which the generated constant names upper-case. A define repeated with the same
-//! name and value is read once (`clc76f.h` defines `DMA_IMMD_DATA` twice); a name that comes
-//! back with another value, or spelled in another case, is an error.
+//! `cl902d.h`), which the generated constant names upper-case. A name that upper-cases to one
+//! of the emitter's own items (`CLASS`, `HEADER`) is an error, whether or not the header has a
+//! class id. A define repeated with the same name, spelled the same, and the same value is read
+//! once (`clc76f.h` defines `DMA_IMMD_DATA` twice); the values are compared as read, so `0x0100`
+//! and `(0x00000100)` are the same. A name that comes back with another value, or spelled in
+//! another case, is an error.
 //!
 //! # Divergences from Mesa's `class_parser.py`
 //!
+//! - Defines are grouped by name, where Mesa's state machine also resets on blank lines (and
+//!   only there). In `clc7b5.h:51-54`, `SET_SEMAPHORE_PAYLOAD_UPPER (0x0000024C)` and its
+//!   `PAYLOAD 31:0` come right after `SET_SEMAPHORE_PAYLOAD`'s field with no blank line between:
+//!   this reader makes it a method of its own at `0x024C`, as the header means, where Mesa folds
+//!   it into `SET_SEMAPHORE_PAYLOAD` as a field `UPPER_PAYLOAD 31:0` and has no method at
+//!   `0x24C`.
 //! - A number that no field follows is kept as a constant; Mesa drops it.
 //! - A define that belongs to no field in the middle of a method (in `clc76f.h`,
 //!   `MEM_OP_B_OPERATION_L2_INVALIDATE_CLEAN_LINES` among `MEM_OP_D`'s values) becomes a
@@ -65,6 +78,8 @@
 //!   not in the headers.
 
 use std::collections::BTreeMap;
+
+use super::emit::RESERVED;
 
 #[cfg(test)]
 mod tests;
@@ -177,7 +192,8 @@ pub enum ErrorKind {
     /// The file name is not `cl` and four hex digits, so it gives no class prefix.
     #[error("the file name does not start with cl and four hex digits")]
     FileName,
-    /// The file does not start with a comment holding the MIT permission notice.
+    /// The file does not start (after blank space) with a comment holding the MIT permission
+    /// notice.
     #[error("the file does not start with a licence notice granting the MIT permissions")]
     NoNotice,
     /// A `/*` comment that is never closed.
@@ -210,6 +226,18 @@ pub enum ErrorKind {
     /// A define outside the class prefix whose value is not a number.
     #[error("{0} is outside the class prefix and is not a class id")]
     Unprefixed(String),
+    /// A class id define whose name is not a C identifier.
+    #[error("{0} is not a C identifier, so it cannot name the class id")]
+    ClassName(String),
+    /// A define under the class prefix whose generated constant would take the name of one of
+    /// the emitter's own items ([`RESERVED`]).
+    #[error("{name} would be written as {item}, which the generated module defines itself")]
+    Reserved {
+        /// The define's name.
+        name: String,
+        /// The emitter's item it would collide with.
+        item: &'static str,
+    },
     /// A second class id define.
     #[error("{name} is a second class id (the first is {first})")]
     SecondClass {
@@ -303,7 +331,9 @@ pub fn parse(file: &str, text: &str, only: Option<&str>) -> Result<Header, Parse
     };
     let prefix = class_prefix(file).ok_or_else(|| error(1, ErrorKind::FileName))?;
     let stripped = strip_comments(text).map_err(|line| error(line, ErrorKind::UnclosedComment))?;
-    if !stripped.notice.iter().any(|line| line.contains(MIT_GRANT)) {
+    if !text.trim_start().starts_with("/*")
+        || !stripped.notice.iter().any(|line| line.contains(MIT_GRANT))
+    {
         return Err(error(1, ErrorKind::NoNotice));
     }
     let mut reader = Reader {
@@ -481,9 +511,9 @@ enum FieldAt {
 struct Reader {
     header: Header,
     method_lines: Vec<usize>,
-    /// Every name read so far (without index parameters, upper-cased), with its line and its
-    /// define as written (name and value).
-    seen: BTreeMap<String, (usize, String)>,
+    /// Every name read so far (without index parameters, upper-cased), with its line, its name
+    /// as written (with parameters) and its value as read.
+    seen: BTreeMap<String, (usize, String, Kind)>,
     method: Option<usize>,
     field: Option<FieldAt>,
     pending: Option<Pending>,
@@ -538,9 +568,15 @@ impl Reader {
         }
         let (base, params) = split_name(name).ok_or_else(|| ErrorKind::Name(name.to_owned()))?;
         let key = base.to_ascii_uppercase();
-        let written = format!("{} {value}", define.name);
-        if let Some((first, raw)) = self.seen.get(&key) {
-            return if *raw == written {
+        if let Some(item) = RESERVED.into_iter().find(|item| *item == key) {
+            return Err(ErrorKind::Reserved {
+                name: define.name.to_owned(),
+                item,
+            });
+        }
+        let kind = read_value(name, &params, value)?;
+        if let Some((first, written, first_kind)) = self.seen.get(&key) {
+            return if written == define.name && *first_kind == kind {
                 Ok(None)
             } else {
                 Err(ErrorKind::Redefined {
@@ -549,8 +585,8 @@ impl Reader {
                 })
             };
         }
-        self.seen.insert(key, (line, written));
-        Ok(Some((base, read_value(name, &params, value)?)))
+        self.seen.insert(key, (line, define.name.to_owned(), kind));
+        Ok(Some((base, kind)))
     }
 
     /// A define outside the class prefix: an include guard or the class id.
@@ -560,6 +596,9 @@ impl Reader {
         };
         let id = parse_number(strip_parens(value))
             .ok_or_else(|| ErrorKind::Unprefixed(define.name.to_owned()))??;
+        if !is_identifier(define.name) {
+            return Err(ErrorKind::ClassName(define.name.to_owned()));
+        }
         if let Some(first) = &self.header.class {
             return Err(ErrorKind::SecondClass {
                 name: define.name.to_owned(),
