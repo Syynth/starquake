@@ -7,7 +7,8 @@
 //!
 //! What exists today is the thinnest end-to-end run (`docs/roadmap.md`, "Route to milestone 1"):
 //! [`System`] takes the bytes of an NRO ([`System::new`]) or an ExeFS's modules and metadata
-//! ([`System::from_exefs`]), parses them with the loader, creates the process the program's
+//! ([`System::from_exefs`]), or a NUP title's ExeFS ([`System::from_nup`], [`title`]), parses
+//! them with the loader, creates the process the program's
 //! description names (its metadata's, or Eden's defaults for an NRO) with its memory in the
 //! kernel's address space (each module, a stack and a TLS page; text read-execute, rodata
 //! read-only, the rest read-write), patches its counter reads, and runs its threads on six
@@ -70,11 +71,13 @@ pub mod report;
 )]
 mod space;
 pub mod system;
+pub mod title;
 
 pub use image::LoadError;
 pub use report::{ExitReason, Mapping, RunOptions, RunReport, Summary, exit_code};
 pub use space::SpaceError;
 pub use system::{Error, System};
+pub use title::TitleError;
 
 /// The loader's formats (NUP containers, NPDM, NSO), for frontends, which see only this crate
 /// (`docs/architecture.md`, "Crates and dependency direction"): `starquake inspect` and
