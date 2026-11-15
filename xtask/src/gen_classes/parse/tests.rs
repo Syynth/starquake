@@ -145,7 +145,7 @@ fn a_method_its_fields_and_their_values_are_grouped() {
          #define NVC797_SET_OBJECT_ENGINE_ID 20:16\n\
          #define NVC797_SET_OBJECT_ENGINE_ID_SW 0x0000001f\n\
          \n\
-         #define NVC797_NOTIFY (0x0000010c) // a trailing comment\n\
+         #define NVC797_NOTIFY (0x0000010c) // a trailing comment, not /* a block one\n\
          #define NVC797_NOTIFY_TYPE 31:0 /* a block comment */\n\
          #define NVC797_NOTIFY_TYPE_WRITE_ONLY 0\n\
          #define NVC797_NOTIFY_TYPE_WRITE_THEN_AWAKEN (0x00000001)\n",
@@ -269,6 +269,43 @@ fn fields_of_no_method_take_values_and_end_the_method() {
         )]
     );
     assert_eq!(parsed.constants, [value("WFI_SCOPE_ALL", 1)]);
+}
+
+#[test]
+fn a_multi_word_range_extending_a_method_name_is_a_field_of_no_method() {
+    let parsed = read_ok(
+        "#define NVC797_QMD 0x0100\n\
+         #define NVC797_QMD_V 31:0\n\
+         #define NVC797_QMD_GROUP MW(40:33)\n\
+         #define NVC797_QMD_GROUP_ONE 0x00000001\n",
+    );
+    assert_eq!(
+        parsed.methods,
+        [method("QMD", 0x100, vec![], vec![word("V", 31, 0, vec![])])]
+    );
+    assert_eq!(
+        parsed.fields,
+        [Field {
+            name: "QMD_GROUP".to_owned(),
+            bits: Bits::Multi { high: 40, low: 33 },
+            values: vec![value("ONE", 1)],
+        }]
+    );
+}
+
+#[test]
+fn a_name_that_only_adds_an_underscore_is_not_a_value() {
+    // A_B_ extends A_B by "_" and nothing else: no value name, so it is a constant.
+    let parsed = read_ok(
+        "#define NVC797_A 0x0100\n\
+         #define NVC797_A_B 3:0\n\
+         #define NVC797_A_B_ 0x00000005\n",
+    );
+    assert_eq!(
+        parsed.methods,
+        [method("A", 0x100, vec![], vec![word("B", 3, 0, vec![])])]
+    );
+    assert_eq!(parsed.constants, [value("A_B_", 5)]);
 }
 
 #[test]
@@ -587,8 +624,16 @@ fn a_define_with_two_values_is_refused() {
 
 #[test]
 fn a_value_of_an_unknown_form_is_refused() {
-    for text in ["1+2", "0x10:0", "MW(6-0)", "MW(abc:0)", "(0x10+(i)*4", "0x0g", "(0x10+(k)*4)"]
-    {
+    for text in [
+        "1+2",
+        "0x10:0",
+        "MW(6-0)",
+        "MW(abc:0)",
+        "(0x10+(i)*4",
+        "0x0g",
+        "(0x10+(k)*4)",
+        "(0x10+(i)*4+(j)*4+(i)*4)",
+    ] {
         assert_eq!(
             error(&format!("#define NVC797_ODD {text}\n")),
             format!(
