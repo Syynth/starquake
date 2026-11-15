@@ -824,3 +824,60 @@ fn lower_errors_read_as_words() {
         assert_eq!(error.to_string(), text);
     }
 }
+
+/// The modules the skeleton's programs lower to, in naga's pretty `Debug` form, one golden file
+/// per program. The files were written from slice 1's IR before slice 5 replaced it, so this
+/// test shows that the IR core still produces the same naga modules (issue #151).
+#[test]
+fn skeleton_modules_are_unchanged() {
+    let modified = |reg, abs, neg| FloatSrc::Reg { reg, abs, neg };
+    let modifiers = assemble_program(&[
+        ald(r(0), GENERIC_0_X * 4, 3),
+        Instr::new(Op::FFma(OpFFma {
+            dst: r(3),
+            srcs: [
+                modified(r(0), false, true),
+                modified(r(1), true, false),
+                modified(r(2), true, true),
+            ],
+            saturate: true,
+            rnd: RoundMode::Zero,
+            ftz: true,
+            dnz: false,
+        })),
+        ast(r(0), (GENERIC_0_X + COMPONENTS) * 4, 4),
+        exit(),
+    ])
+    .expect("encodable");
+    let cases = [
+        (
+            "vertex",
+            VERTEX,
+            vertex_program(),
+            include_str!("golden/vertex.txt"),
+        ),
+        (
+            "pixel",
+            pixel_stage(),
+            pixel_program(),
+            include_str!("golden/pixel.txt"),
+        ),
+        (
+            "modifiers",
+            VERTEX,
+            modifiers,
+            include_str!("golden/modifiers.txt"),
+        ),
+        (
+            "last_location",
+            VERTEX,
+            last_location_program(),
+            include_str!("golden/last_location.txt"),
+        ),
+    ];
+    for (name, stage, program, golden) in cases {
+        let shader = translate_program(stage, &program).expect("lowers");
+        let text = format!("{:#?}\n", naga_module(&shader));
+        assert!(text == golden, "{name}: the module changed");
+    }
+}
