@@ -328,7 +328,7 @@ pub fn parse(file: &str, text: &str, only: Option<&str>) -> Result<Header, Parse
         };
         reader
             .define(&prefix, only, number, &define)
-            .map_err(|kind| error(number, kind))?;
+            .map_err(|(line, kind)| error(line, kind))?;
     }
     reader.finish().map_err(|(line, kind)| error(line, kind))
 }
@@ -483,19 +483,40 @@ struct Reader {
     pending: Option<Pending>,
 }
 
+/// An error and the line it belongs to.
+type Located = (usize, ErrorKind);
+
 impl Reader {
+    /// Reads the define on line `line` and files it (see the module docs).
     fn define(
         &mut self,
         prefix: &str,
         only: Option<&str>,
         line: usize,
         define: &Define<'_>,
-    ) -> Result<(), ErrorKind> {
+    ) -> Result<(), Located> {
+        match self.check(prefix, only, line, define) {
+            Ok(Some((base, kind))) => self.place(base, kind, line),
+            Ok(None) => Ok(()),
+            Err(kind) => Err((line, kind)),
+        }
+    }
+
+    /// Checks a define and reads its value: `None` for one that is skipped (an include guard,
+    /// the class id, a typedef, a repeat, or one the filter leaves out), its name without the
+    /// class prefix or parameters and its value otherwise.
+    fn check<'a>(
+        &mut self,
+        prefix: &str,
+        only: Option<&str>,
+        line: usize,
+        define: &Define<'a>,
+    ) -> Result<Option<(&'a str, Kind)>, ErrorKind> {
         let Some(name) = define.name.strip_prefix(prefix) else {
-            return self.unprefixed(define);
+            return self.unprefixed(define).map(|()| None);
         };
         if only.is_some_and(|only| !name.starts_with(only)) {
-            return Ok(());
+            return Ok(None);
         }
         let Some(value) = define.value else {
             return Err(ErrorKind::NoValue(define.name.to_owned()));
@@ -507,13 +528,14 @@ impl Reader {
             });
         }
         if name.ends_with("TYPEDEF") && is_identifier(value) {
-            return Ok(());
+            return Ok(None);
         }
         let (base, params) = split_name(name).ok_or_else(|| ErrorKind::Name(name.to_owned()))?;
         let key = base.to_ascii_uppercase();
+        let written = format!("{} {value}", define.name);
         if let Some((first, raw)) = self.seen.get(&key) {
-            return if *raw == define.name.to_owned() + " " + value {
-                Ok(())
+            return if *raw == written {
+                Ok(None)
             } else {
                 Err(ErrorKind::Redefined {
                     name: base.to_owned(),
@@ -521,10 +543,8 @@ impl Reader {
                 })
             };
         }
-        self.seen
-            .insert(key, (line, define.name.to_owned() + " " + value));
-        let kind = read_value(name, params, value)?;
-        self.place(base, kind, line)
+        self.seen.insert(key, (line, written));
+        Ok(Some((base, read_value(name, params, value)?)))
     }
 
     /// A define outside the class prefix: an include guard or the class id.
@@ -547,14 +567,16 @@ impl Reader {
         Ok(())
     }
 
-    /// Files a define under the current method and field (see the module docs).
-    fn place(&mut self, name: &str, kind: Kind, line: usize) -> Result<(), ErrorKind> {
+    /// Files a define under the current method and field (see the module docs). A misaligned
+    /// method address is reported on the method's own line, which for a plain method is the
+    /// line before its first field.
+    fn place(&mut self, name: &str, kind: Kind, line: usize) -> Result<(), Located> {
         match kind {
             Kind::Array { base, strides } => {
                 self.flush_pending();
                 let strides: Vec<u32> = strides.into_iter().flatten().collect();
                 for value in std::iter::once(base).chain(strides.iter().copied()) {
-                    check_aligned(name, value)?;
+                    check_aligned(name, value).map_err(|kind| (line, kind))?;
                 }
                 self.start_method(name, base, strides, line);
                 Ok(())
@@ -590,7 +612,8 @@ impl Reader {
                     if matches!(bits, Bits::Word { .. })
                         && name.strip_prefix(&pending.name).and_then(after_underscore).is_some()
                     {
-                        check_aligned(&pending.name, pending.value)?;
+                        check_aligned(&pending.name, pending.value)
+                            .map_err(|kind| (pending.line, kind))?;
                         self.start_method(&pending.name, pending.value, Vec::new(), pending.line);
                     } else {
                         self.header.constants.push(Value {
