@@ -215,6 +215,18 @@ fn wrapped_lines_stay_within_the_width_unless_one_word_is_longer() {
     let first = out.text.lines().next().unwrap();
     assert!(first.len() + " word".len() > WIDTH);
 
+    // A line exactly at the width is kept whole; one character more breaks it.
+    let lead = "//! ";
+    let first = "x".repeat(47);
+    let second = "y".repeat(WIDTH - lead.len() - first.len() - 1);
+    let mut exact = Out::default();
+    exact.wrapped(lead, &format!("{first} {second}"));
+    assert_eq!(exact.text, format!("{lead}{first} {second}\n"));
+    assert_eq!(exact.text.trim_end().len(), WIDTH);
+    let mut over = Out::default();
+    over.wrapped(lead, &format!("{first} {second}y"));
+    assert_eq!(over.text, format!("{lead}{first}\n{lead}{second}y\n"));
+
     let mut long = Out::default();
     let word = "x".repeat(WIDTH + 10);
     long.wrapped("//! ", &format!("a {word} b"));

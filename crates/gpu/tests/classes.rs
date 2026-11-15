@@ -743,6 +743,11 @@ fn array_elements_step_by_the_stride_until_the_positions_overflow() {
     assert!(array.element(last).is_some());
     assert_eq!(array.element(last + 1), None);
     assert_eq!(array.element(u32::MAX), None);
+    // The stride times the index overflowing is caught even where the wrapped product would
+    // land back on a small position.
+    let wide = MwArray::new(0, 0, 0x8000_0000);
+    assert_eq!(wide.element(1), Some(MwField::new(0x8000_0000, 0x8000_0000)));
+    assert_eq!(wide.element(2), None);
 }
 
 #[test]
