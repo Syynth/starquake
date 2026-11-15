@@ -166,7 +166,9 @@ fn commands_that_are_left_out_go_to_the_unknown_command_policy() {
 
 #[test]
 fn the_tables_name_the_commands_as_eden_does() {
-    let open = Apm.commands().name(crate::framework::Protocol::Cmif, OPEN_SESSION);
+    let open = Apm
+        .commands()
+        .name(crate::framework::Protocol::Cmif, OPEN_SESSION);
     assert_eq!(open, Some("open_session"));
     assert_eq!(Apm::interface(), "Apm");
     assert_eq!(ISession::interface(), "ISession");

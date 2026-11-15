@@ -492,10 +492,14 @@ fn apm_hands_out_a_session() {
 
 /// `OpenApplicationProxy` as libnx sends it (`_appletGetSessionProxy`), with `process` copied.
 fn open_proxy(root: u32, process: Handle) -> RequestBuilder {
-    domain(root, &am::IApplicationProxyService, "open_application_proxy")
-        .send_pid(0)
-        .copy_handle(process.raw())
-        .data(&0_u64.to_le_bytes())
+    domain(
+        root,
+        &am::IApplicationProxyService,
+        "open_application_proxy",
+    )
+    .send_pid(0)
+    .copy_handle(process.raw())
+    .data(&0_u64.to_le_bytes())
 }
 
 /// Waits on `handle` with a zero timeout: the result says whether it was signalled.
@@ -547,7 +551,11 @@ fn applet_oe_serves_the_start_up_with_real_events() {
     let open = |name: &str| {
         let (code, buffer) = rig.send(oe, &domain(objects[0], &proxy_interface, name));
         let (word, _, opened) = domain_reply(&buffer, 0);
-        assert_eq!((code, word, opened.len()), (ResultCode::SUCCESS, 0, 1), "{name}");
+        assert_eq!(
+            (code, word, opened.len()),
+            (ResultCode::SUCCESS, 0, 1),
+            "{name}"
+        );
         opened[0]
     };
     let getter = open("get_common_state_getter");
@@ -575,6 +583,10 @@ fn applet_oe_serves_the_start_up_with_real_events() {
     for (name, value) in asked {
         let (code, buffer) = rig.send(oe, &domain(getter, &am::ICommonStateGetter, name));
         let (word, data, _) = domain_reply(&buffer, size_of::<u8>());
-        assert_eq!((code, word, data), (ResultCode::SUCCESS, 0, vec![value]), "{name}");
+        assert_eq!(
+            (code, word, data),
+            (ResultCode::SUCCESS, 0, vec![value]),
+            "{name}"
+        );
     }
 }

@@ -103,13 +103,13 @@ mod trace {
     use starquake_kernel::svc::{Kind, Status, SvcId};
     use starquake_loader::nro::Nro;
     use starquake_memory::PAGE_SIZE;
-    use starquake_services::framework::control::{CONTROL_COMMANDS, CONTROL_INTERFACE};
     use starquake_services::am::{
         IApplicationFunctions, IApplicationProxy, IApplicationProxyService, IAudioController,
         ICommonStateGetter, IDebugFunctions, IDisplayController, ILibraryAppletCreator,
         ISelfController, IWindowController,
     };
     use starquake_services::apm::{Apm, ISession};
+    use starquake_services::framework::control::{CONTROL_COMMANDS, CONTROL_INTERFACE};
     use starquake_services::framework::{Protocol, Session};
     use starquake_services::fsp::{FspSrv, IFile, IFileSystem};
     use starquake_services::set::SetSys;
@@ -538,7 +538,9 @@ mod trace {
     /// (`IApplicationProxy`), and that interface, if starquake has it.
     fn sub_interface(name: &str) -> Option<(ServiceId, Box<dyn Session>)> {
         SERVICES.into_iter().find_map(|service| {
-            let found = sub_interfaces(service).into_iter().find(|i| i.name() == name);
+            let found = sub_interfaces(service)
+                .into_iter()
+                .find(|i| i.name() == name);
             found.map(|interface| (service, interface))
         })
     }
@@ -1526,7 +1528,9 @@ mod trace {
             let other = [ipc(APPLET_OE, 0), ipc(APM, 20)];
             assert_eq!(
                 run(&other).difference,
-                Some("line 1: expected `ipc IApplicationProxy::20`, found `ipc apm::20`".to_owned())
+                Some(
+                    "line 1: expected `ipc IApplicationProxy::20`, found `ipc apm::20`".to_owned()
+                )
             );
             // Nor is the service's own command with the same id: the name is the interface's.
             let named = Fixture {
@@ -1541,9 +1545,27 @@ mod trace {
                         .to_owned()
                 )
             );
-            assert_eq!(target("ipc IApplicationProxy::20"), Some("IApplicationProxy"));
+            assert_eq!(
+                target("ipc IApplicationProxy::20"),
+                Some("IApplicationProxy")
+            );
             assert_eq!(target("ipc sm:::1"), Some("sm:"));
             assert_eq!(target("svc 0x21 SendSyncRequest"), None);
+            // A sub-interface of another service names no command on this one: neither the
+            // interface's command (20 on `apm`) nor the service's own (0, `OpenSession`).
+            let on_apm =
+                |command, name| check_name(&ipc(APM, command), "IApplicationProxy", name, false);
+            assert_eq!(
+                on_apm(20, "GetApplicationFunctions"),
+                Err(
+                    "the reference calls command 20 GetApplicationFunctions, starquake None"
+                        .to_owned()
+                )
+            );
+            assert_eq!(
+                on_apm(0, "OpenSession"),
+                Err("the reference calls command 0 OpenSession, starquake None".to_owned())
+            );
         }
 
         #[test]
@@ -2242,11 +2264,27 @@ mod trace {
                 20,
                 "GetApplicationFunctions"
             ));
-            assert!(!implements_request("IApplicationProxy", 20, "GetSelfController"));
-            assert!(!implements_request("IApplicationProxy", 10, "GetProcessWindingController"));
+            assert!(!implements_request(
+                "IApplicationProxy",
+                20,
+                "GetSelfController"
+            ));
+            assert!(!implements_request(
+                "IApplicationProxy",
+                10,
+                "GetProcessWindingController"
+            ));
             assert!(!implements_request("ISelfController", 0, "Exit"));
-            assert!(!implements_request("appletOE", 20, "GetApplicationFunctions"));
-            assert!(!implements_request("IAppletResource", 0, "GetSharedMemoryHandle"));
+            assert!(!implements_request(
+                "appletOE",
+                20,
+                "GetApplicationFunctions"
+            ));
+            assert!(!implements_request(
+                "IAppletResource",
+                0,
+                "GetSharedMemoryHandle"
+            ));
             assert_eq!(service_id("IApplicationProxy"), None);
         }
 

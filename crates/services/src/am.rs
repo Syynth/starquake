@@ -389,7 +389,11 @@ impl Applet {
     /// became available: Eden's `SignalSystemEventIfNeeded` after the change (module docs, "The
     /// message event"). Where a message stops being available Eden clears the event; that is
     /// the listed divergence, and only the state records it.
-    fn update(&mut self, cx: &mut Context<'_>, change: impl FnOnce(&mut Lifecycle)) -> Result<(), Fault> {
+    fn update(
+        &mut self,
+        cx: &mut Context<'_>,
+        change: impl FnOnce(&mut Lifecycle),
+    ) -> Result<(), Fault> {
         let before = self.lifecycle.message_available();
         change(&mut self.lifecycle);
         let after = self.lifecycle.message_available();
@@ -400,7 +404,9 @@ impl Applet {
             cx.signal_event(event)?;
         }
         if before && !after {
-            tracing::debug!("appletOE: the message event would be cleared here; it stays signalled");
+            tracing::debug!(
+                "appletOE: the message event would be cleared here; it stays signalled"
+            );
         }
         Ok(())
     }

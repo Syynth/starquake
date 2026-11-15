@@ -22,9 +22,8 @@ use super::command::common_state_getter::{
     GET_CURRENT_FOCUS_STATE, GET_EVENT_HANDLE, GET_OPERATION_MODE, GET_PERFORMANCE_MODE,
 };
 use super::command::proxy::{
-    GET_APPLICATION_FUNCTIONS, GET_AUDIO_CONTROLLER, GET_COMMON_STATE_GETTER,
-    GET_DEBUG_FUNCTIONS, GET_DISPLAY_CONTROLLER, GET_LIBRARY_APPLET_CREATOR, GET_SELF_CONTROLLER,
-    GET_WINDOW_CONTROLLER,
+    GET_APPLICATION_FUNCTIONS, GET_AUDIO_CONTROLLER, GET_COMMON_STATE_GETTER, GET_DEBUG_FUNCTIONS,
+    GET_DISPLAY_CONTROLLER, GET_LIBRARY_APPLET_CREATOR, GET_SELF_CONTROLLER, GET_WINDOW_CONTROLLER,
 };
 use super::command::proxy_service::OPEN_APPLICATION_PROXY;
 use super::command::self_controller::{
@@ -179,10 +178,7 @@ impl Rig {
     }
 
     fn object(&mut self, object: u32, command: u32, data: &[u8]) -> Answered {
-        parse(
-            &self.object_raw(object, command, data),
-            SessionKind::Domain,
-        )
+        parse(&self.object_raw(object, command, data), SessionKind::Domain)
     }
 
     /// Converts the rig's session to a domain, as libnx does; the root's object id.
@@ -251,10 +247,7 @@ fn open_application_proxy_returns_an_object_and_the_reply_is_these_bytes() {
     let root = rig.convert();
     let reply = rig.open_proxy_raw(root, PROCESS_ID);
     let proxy = root + 1;
-    assert_eq!(
-        reply,
-        domain_reply(ResultCode::SUCCESS, &[], &[proxy])
-    );
+    assert_eq!(reply, domain_reply(ResultCode::SUCCESS, &[], &[proxy]));
     assert!(rig.holds("IApplicationProxy"));
     assert_eq!(rig.server.interface_count(), 2);
     // No kernel session and no handle beyond the test's own: the proxy lives in the domain.
@@ -549,12 +542,24 @@ fn a_flag_is_any_byte_that_is_not_zero() {
     let proxy = rig.proxy();
     let controller = rig.open(proxy, GET_SELF_CONTROLLER);
     rig.object(controller, SET_OPERATION_MODE_CHANGED_NOTIFICATION, &[0]);
-    assert!(!rig.applet().lifecycle().operation_mode_changed_notification_enabled);
+    assert!(
+        !rig.applet()
+            .lifecycle()
+            .operation_mode_changed_notification_enabled
+    );
     rig.object(controller, SET_OPERATION_MODE_CHANGED_NOTIFICATION, &[2]);
-    assert!(rig.applet().lifecycle().operation_mode_changed_notification_enabled);
+    assert!(
+        rig.applet()
+            .lifecycle()
+            .operation_mode_changed_notification_enabled
+    );
     rig.object(controller, SET_OPERATION_MODE_CHANGED_NOTIFICATION, &[0]);
     rig.object(controller, SET_OPERATION_MODE_CHANGED_NOTIFICATION, &[0xFF]);
-    assert!(rig.applet().lifecycle().operation_mode_changed_notification_enabled);
+    assert!(
+        rig.applet()
+            .lifecycle()
+            .operation_mode_changed_notification_enabled
+    );
 }
 
 #[test]
@@ -572,7 +577,11 @@ fn a_payload_too_short_for_the_flags_is_refused_and_changes_nothing() {
         SET_PERFORMANCE_MODE_CHANGED_NOTIFICATION,
         SET_OUT_OF_FOCUS_SUSPENDING_ENABLED,
     ] {
-        assert_eq!(rig.object_raw(controller, command, &[]), refused, "{command}");
+        assert_eq!(
+            rig.object_raw(controller, command, &[]),
+            refused,
+            "{command}"
+        );
     }
     assert_eq!(rig.applet(), before);
     // Exactly the three bytes libnx sends are enough.
@@ -699,14 +708,22 @@ fn the_suspended_tick_event_is_one_event_never_signalled() {
     let proxy = rig.proxy();
     let getter = rig.open(proxy, GET_COMMON_STATE_GETTER);
     let controller = rig.open(proxy, GET_SELF_CONTROLLER);
-    let raw = rig.object_raw(controller, GET_ACCUMULATED_SUSPENDED_TICK_CHANGED_EVENT, &[]);
+    let raw = rig.object_raw(
+        controller,
+        GET_ACCUMULATED_SUSPENDED_TICK_CHANGED_EVENT,
+        &[],
+    );
     let first = parse(&raw, SessionKind::Domain).copies[0];
     assert_eq!(raw, copied_handle_reply(first));
     let event = rig.object_of(first);
     assert_eq!(rig.applet().suspended_tick_event(), Some(event));
     assert_eq!(rig.kernel.signals(event), Some(0));
 
-    let again = rig.object(controller, GET_ACCUMULATED_SUSPENDED_TICK_CHANGED_EVENT, &[]);
+    let again = rig.object(
+        controller,
+        GET_ACCUMULATED_SUSPENDED_TICK_CHANGED_EVENT,
+        &[],
+    );
     assert_eq!(rig.object_of(again.copies[0]), event);
     assert_eq!(rig.kernel.signals(event), Some(0));
     // It is not the message event.
@@ -829,7 +846,11 @@ fn libnx_start_up_runs_through_in_the_traces_order() {
     let getter = objects["ICommonStateGetter"];
     let functions = objects["IApplicationFunctions"];
     let steps: [(u32, u32, &[u8]); 11] = [
-        (controller, GET_ACCUMULATED_SUSPENDED_TICK_CHANGED_EVENT, &[]),
+        (
+            controller,
+            GET_ACCUMULATED_SUSPENDED_TICK_CHANGED_EVENT,
+            &[],
+        ),
         (getter, GET_EVENT_HANDLE, &[]),
         (getter, GET_CURRENT_FOCUS_STATE, &[]),
         (window, ACQUIRE_FOREGROUND_RIGHTS, &[]),
@@ -868,7 +889,11 @@ fn a_server_in_mid_start_up_saves_and_restores() {
     let getter = rig.open(proxy, GET_COMMON_STATE_GETTER);
     let controller = rig.open(proxy, GET_SELF_CONTROLLER);
     rig.object(getter, GET_EVENT_HANDLE, &[]);
-    rig.object(controller, GET_ACCUMULATED_SUSPENDED_TICK_CHANGED_EVENT, &[]);
+    rig.object(
+        controller,
+        GET_ACCUMULATED_SUSPENDED_TICK_CHANGED_EVENT,
+        &[],
+    );
     rig.object(controller, SET_FOCUS_HANDLING_MODE, &[0, 0, 0]);
     let saved = rig.server.save().unwrap();
 
