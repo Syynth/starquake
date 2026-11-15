@@ -172,7 +172,7 @@ fn the_tables_name_the_commands_as_eden_does() {
     assert_eq!(open, Some("open_session"));
     assert_eq!(Apm::interface(), "Apm");
     assert_eq!(ISession::interface(), "ISession");
-    assert!(ISession.commands().cmif.is_empty());
+    assert_eq!(ISession.commands().cmif, []);
 }
 
 #[test]

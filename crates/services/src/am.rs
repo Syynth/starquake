@@ -47,8 +47,8 @@
 //! [`IAudioController`], [`IDisplayController`], [`ILibraryAppletCreator`] and
 //! [`IDebugFunctions`] have no command here: libnx opens them at start-up and sends them nothing.
 //! `ISelfController::Exit` (0), which libnx sends when the program ends, is not ported: the
-//! fixture's run stops at `hid` well before it, and ending the process needs a kernel interface
-//! the services spec does not give a service.
+//! fixture's run in starquake stops long before it (the fixture's README says where), and
+//! ending the process needs a kernel interface the services spec does not give a service.
 //!
 //! Layouts, each the client's and the reference's:
 //!
@@ -100,12 +100,13 @@
 //!
 //! `GetEventHandle` returns the applet's message event (Eden: the lifecycle manager's system
 //! event), which is signalled while the applet has a message to receive. Of Eden's
-//! `ShouldSignalSystemEvent`, this port keeps the one term a running application can reach:
-//! focus-state-change notifications are enabled and the focus state has changed since the
-//! applet last received a message. Its other terms (unordered messages, resume, exit,
+//! `ShouldSignalSystemEvent`, this port keeps the one term that can hold in a run: for an
+//! application, focus-state-change notifications are enabled and the focus state has changed
+//! since the applet last received a message. Its other terms (unordered messages, resume, exit,
 //! sleep, display requests, operation- and performance-mode changes, SD card removal,
 //! temperature, battery, auto power-down, album events, and the library-applet focus terms) are
-//! all false in a run: nothing here raises them. So the event is signalled from launch (Eden's
+//! all false in a run: nothing here raises them, and the settings never change while it runs.
+//! A port that raises one adds its term. So the event is signalled from launch (Eden's
 //! `SetFocusState(InFocus)` at launch finds a focus change pending, with notifications on), and
 //! libnx's `SetFocusHandlingMode(0, 0, 1)` turns the notifications off.
 //!
@@ -270,16 +271,34 @@ impl AppletSettings {
     }
 }
 
+/// Which changes the applet asked to be told of: three of Eden's `LifecycleManager` flags, each
+/// initially true (`lifecycle_manager.h`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Notifications {
+    /// `m_focus_state_changed_notification_enabled`.
+    pub focus_state_changed: bool,
+    /// `m_operation_mode_changed_notification_enabled`.
+    pub operation_mode_changed: bool,
+    /// `m_performance_mode_changed_notification_enabled`.
+    pub performance_mode_changed: bool,
+}
+
+impl Default for Notifications {
+    fn default() -> Self {
+        Self {
+            focus_state_changed: true,
+            operation_mode_changed: true,
+            performance_mode_changed: true,
+        }
+    }
+}
+
 /// The part of Eden's `LifecycleManager` that the ported commands read and change, with Eden's
 /// initial values (`lifecycle_manager.h`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Lifecycle {
-    /// `m_focus_state_changed_notification_enabled`, initially true.
-    pub focus_state_changed_notification_enabled: bool,
-    /// `m_operation_mode_changed_notification_enabled`, initially true.
-    pub operation_mode_changed_notification_enabled: bool,
-    /// `m_performance_mode_changed_notification_enabled`, initially true.
-    pub performance_mode_changed_notification_enabled: bool,
+    /// The notifications the applet asked for.
+    pub notifications: Notifications,
     /// `m_has_focus_state_changed`, initially true; only `ReceiveMessage` (not ported) clears it.
     pub has_focus_state_changed: bool,
     /// `m_focus_handling_mode`.
@@ -289,9 +308,7 @@ pub struct Lifecycle {
 impl Default for Lifecycle {
     fn default() -> Self {
         Self {
-            focus_state_changed_notification_enabled: true,
-            operation_mode_changed_notification_enabled: true,
-            performance_mode_changed_notification_enabled: true,
+            notifications: Notifications::default(),
             has_focus_state_changed: true,
             focus_handling_mode: FocusHandlingMode::SuspendHomeSleep,
         }
@@ -300,11 +317,11 @@ impl Default for Lifecycle {
 
 impl Lifecycle {
     /// Whether the applet has a message to receive, so its message event is signalled: the one
-    /// term of `LifecycleManager::ShouldSignalSystemEvent` a running application can reach (module
-    /// docs, "The message event").
+    /// term of `LifecycleManager::ShouldSignalSystemEvent` that can hold in a run (module docs,
+    /// "The message event").
     #[must_use]
     pub const fn message_available(&self) -> bool {
-        self.focus_state_changed_notification_enabled && self.has_focus_state_changed
+        self.notifications.focus_state_changed && self.has_focus_state_changed
     }
 
     /// `LifecycleManager::SetFocusHandlingMode(suspend)`.
@@ -818,7 +835,7 @@ impl ISelfController {
     ) -> Outcome {
         let enabled = read_flag(&mut req.payload())?;
         Self::update(cx, |lifecycle| {
-            lifecycle.operation_mode_changed_notification_enabled = enabled;
+            lifecycle.notifications.operation_mode_changed = enabled;
         })?;
         reply.ok()
     }
@@ -832,7 +849,7 @@ impl ISelfController {
     ) -> Outcome {
         let enabled = read_flag(&mut req.payload())?;
         Self::update(cx, |lifecycle| {
-            lifecycle.performance_mode_changed_notification_enabled = enabled;
+            lifecycle.notifications.performance_mode_changed = enabled;
         })?;
         reply.ok()
     }
@@ -855,7 +872,7 @@ impl ISelfController {
         let _background = read_flag(&mut payload)?;
         let suspend = read_flag(&mut payload)?;
         Self::update(cx, |lifecycle| {
-            lifecycle.focus_state_changed_notification_enabled = notify;
+            lifecycle.notifications.focus_state_changed = notify;
             lifecycle.set_focus_handling_mode(suspend);
         })?;
         reply.ok()

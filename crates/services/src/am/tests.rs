@@ -527,7 +527,7 @@ fn set_focus_handling_mode_reads_its_three_flags_at_their_offsets() {
         let lifecycle = *rig.applet().lifecycle();
         assert_eq!(
             (
-                lifecycle.focus_state_changed_notification_enabled,
+                lifecycle.notifications.focus_state_changed,
                 lifecycle.focus_handling_mode
             ),
             (notify, mode),
@@ -541,25 +541,19 @@ fn a_flag_is_any_byte_that_is_not_zero() {
     let mut rig = Rig::new();
     let proxy = rig.proxy();
     let controller = rig.open(proxy, GET_SELF_CONTROLLER);
-    rig.object(controller, SET_OPERATION_MODE_CHANGED_NOTIFICATION, &[0]);
-    assert!(
-        !rig.applet()
-            .lifecycle()
-            .operation_mode_changed_notification_enabled
-    );
-    rig.object(controller, SET_OPERATION_MODE_CHANGED_NOTIFICATION, &[2]);
-    assert!(
+    let enabled = |rig: &Rig| {
         rig.applet()
             .lifecycle()
-            .operation_mode_changed_notification_enabled
-    );
+            .notifications
+            .operation_mode_changed
+    };
+    rig.object(controller, SET_OPERATION_MODE_CHANGED_NOTIFICATION, &[0]);
+    assert!(!enabled(&rig));
+    rig.object(controller, SET_OPERATION_MODE_CHANGED_NOTIFICATION, &[2]);
+    assert!(enabled(&rig));
     rig.object(controller, SET_OPERATION_MODE_CHANGED_NOTIFICATION, &[0]);
     rig.object(controller, SET_OPERATION_MODE_CHANGED_NOTIFICATION, &[0xFF]);
-    assert!(
-        rig.applet()
-            .lifecycle()
-            .operation_mode_changed_notification_enabled
-    );
+    assert!(enabled(&rig));
 }
 
 #[test]
@@ -600,8 +594,8 @@ fn the_mode_change_notifications_are_set_and_cleared_without_a_signal() {
     let flags = |applet: &Applet| {
         let lifecycle = applet.lifecycle();
         (
-            lifecycle.operation_mode_changed_notification_enabled,
-            lifecycle.performance_mode_changed_notification_enabled,
+            lifecycle.notifications.operation_mode_changed,
+            lifecycle.notifications.performance_mode_changed,
         )
     };
     assert_eq!(flags(&rig.applet()), (true, true));
@@ -683,7 +677,10 @@ fn the_focus_handling_mode_moves_as_edens_does_for_every_mode_and_flag() {
 fn a_message_is_available_only_with_notifications_on_and_a_focus_change_pending() {
     for (notify, changed) in [(false, false), (false, true), (true, false), (true, true)] {
         let lifecycle = Lifecycle {
-            focus_state_changed_notification_enabled: notify,
+            notifications: Notifications {
+                focus_state_changed: notify,
+                ..Notifications::default()
+            },
             has_focus_state_changed: changed,
             ..Lifecycle::default()
         };
@@ -693,9 +690,11 @@ fn a_message_is_available_only_with_notifications_on_and_a_focus_change_pending(
     assert_eq!(
         Lifecycle::default(),
         Lifecycle {
-            focus_state_changed_notification_enabled: true,
-            operation_mode_changed_notification_enabled: true,
-            performance_mode_changed_notification_enabled: true,
+            notifications: Notifications {
+                focus_state_changed: true,
+                operation_mode_changed: true,
+                performance_mode_changed: true,
+            },
             has_focus_state_changed: true,
             focus_handling_mode: FocusHandlingMode::SuspendHomeSleep,
         }
