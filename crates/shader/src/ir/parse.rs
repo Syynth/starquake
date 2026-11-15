@@ -19,6 +19,9 @@
 //! Ids the text does not define become detached `Void` slots, as the printer skips detached
 //! instructions, so printing a parsed function gives back the text in canonical form.
 
+#[cfg(test)]
+mod tests;
+
 use thiserror::Error;
 
 use super::print::texture_keys as k;

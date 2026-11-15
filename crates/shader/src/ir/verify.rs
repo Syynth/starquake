@@ -32,6 +32,9 @@
 //! function, defined earlier in the tree and not inside an `if` or loop body that has already
 //! ended.
 
+#[cfg(test)]
+mod tests;
+
 use thiserror::Error;
 
 use super::{

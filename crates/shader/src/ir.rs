@@ -40,12 +40,13 @@
 //! - Values must be defined in a block that dominates the use, not only earlier in the block
 //!   list (Eden's `ValidateForwardDeclarations`); a phi's incoming values are checked against
 //!   its type, which Eden skips, and in a control-flow graph against the block's predecessors.
-//!   Pinned by `tests::dominance_is_checked_not_block_order` and `tests::phi_checks`.
+//!   Pinned by `verify::tests::dominance_is_checked_not_block_order` and
+//!   `verify::tests::phi_checks`.
 //! - Eden's use-count check (`ValidateUses`) has no counterpart: this IR keeps no use counts.
 //! - A structured tree may nest at most [`MAX_NESTING`] levels; Eden has no bound. The bound
 //!   is a starquake choice (a guess at what real shaders need, to be checked against the
 //!   structurizer's output, slice 11) that keeps the verifier's recursion bounded. Pinned by
-//!   `tests::nesting_is_bounded`.
+//!   `verify::tests::nesting_is_bounded` and `parse::tests::nesting_is_bounded`.
 //!
 //! Slice 1's minimal IR is replaced: its instructions are the Eden opcodes of the same names
 //! (`Imm32` is now an immediate operand), and the skeleton lowers to the same naga modules
