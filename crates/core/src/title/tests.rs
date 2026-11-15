@@ -9,6 +9,7 @@ use starquake_loader::nso::{HEADER_SIZE, NsoError};
 use starquake_loader::nup::build::{
     self, Content, EXEFS_DIR_NAME, PackageSpec, ROMFS_DIR_NAME, Tree,
 };
+use starquake_loader::nup::layout::SUPERBLOCK_SIZE;
 use starquake_loader::nup::{NupError, PackageKind};
 
 use super::*;
@@ -315,6 +316,87 @@ fn the_exefs_budget_covers_main_npdm_and_the_modules_together() {
             } if *limit == size(NPDM) - 1
         ),
         "{error:?}"
+    );
+}
+
+#[test]
+fn the_exefs_budget_is_shared_by_every_module_in_order() {
+    // Three files: the budget is what is left after each earlier read, so `sdk`, read last
+    // (after `main` in `MODULE_NAMES` order), is the one a budget one byte short refuses.
+    let files = [(NPDM_FILE, NPDM), (MAIN_MODULE, NSO), ("sdk", NSO)];
+    let at = ReadLimits {
+        npdm: NPDM_READ_LIMIT,
+        exefs: size(NPDM) + 2 * size(NSO),
+    };
+    assert_eq!(load(base_only(&files), at).unwrap(), expected(&files));
+
+    let short = ReadLimits {
+        exefs: at.exefs - 1,
+        ..at
+    };
+    let error = load(base_only(&files), short).unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            TitleError::Read {
+                name: "sdk",
+                error: NupError::FileTooLarge { size: s, limit, .. },
+            } if *s == size(NSO) && *limit == size(NSO) - 1
+        ),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn of_two_damaged_modules_the_first_in_module_order_is_named() {
+    let mut damaged = NSO.to_vec();
+    if let Some(byte) = damaged.last_mut() {
+        *byte ^= 1;
+    }
+    // `rtld` comes before `main` in `MODULE_NAMES`; both fail their hash check.
+    let tree =
+        ["rtld", MAIN_MODULE]
+            .into_iter()
+            .fold(exefs_tree(&[(NPDM_FILE, NPDM)]), |tree, name| {
+                let content = Content::raw(NSO).with_stored(damaged.clone());
+                tree.with_file(&format!("{EXEFS_DIR_NAME}/{name}"), content)
+                    .unwrap()
+            });
+    let error = System::from_nup(container(&[base(tree)])).unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            TitleError::Read {
+                name: "rtld",
+                error: NupError::HashMismatch { .. },
+            }
+        ),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn a_container_of_another_major_version_says_which_version_it_is() {
+    // A whole superblock whose signature is NUP but whose major version is the next one.
+    let [n, u, p, major] = MAGIC;
+    let next = major.wrapping_add(1);
+    let mut superblock = vec![0; SUPERBLOCK_SIZE];
+    superblock[..MAGIC.len()].copy_from_slice(&[n, u, p, next]);
+    assert!(is_nup(&superblock));
+    let error = System::from_nup(Cursor::new(superblock)).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            TitleError::Container(NupError::UnsupportedVersion(version)) if version == next
+        ),
+        "{error:?}"
+    );
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "the title could not be opened: NUP format version {next} is not supported; only \
+             version {major} is"
+        )
     );
 }
 

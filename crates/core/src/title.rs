@@ -26,7 +26,9 @@
 //! size cannot make a run allocate more: at most [`NPDM_READ_LIMIT`] bytes of `main.npdm`, and
 //! at most [`EXEFS_READ_LIMIT`] bytes for `main.npdm` and the modules together. Both are
 //! starquake limits, not the format's. A file past its limit is [`TitleError::Read`] with the
-//! loader's `NupError::FileTooLarge`, whose limit is what was left of the budget.
+//! loader's `NupError::FileTooLarge`. For a module, that limit is what was left of the
+//! [`EXEFS_READ_LIMIT`] budget after the files read before it; `main.npdm` is the exception,
+//! read first with the smaller of [`NPDM_READ_LIMIT`] and the whole budget as its limit.
 //!
 //! The RomFS is not served yet: a title that opens its RomFS gets the file-system service's
 //! current answer.
