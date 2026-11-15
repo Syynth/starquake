@@ -130,6 +130,20 @@ flag_set! {
         /// their weighted average (Vulkan's `samplerFilterMinmax`). wgpu 30 has no sampler
         /// reduction mode, so a wgpu device leaves this out.
         SAMPLER_MIN_MAX_REDUCTION = 10,
+        /// A clip-space depth range of -1..1 as pipeline state (Vulkan's
+        /// `VK_EXT_depth_clip_control`). wgpu and Metal have no such switch, so a wgpu device
+        /// leaves this out, and [`crate::emulation::emulation`] then asks for the vertex
+        /// shader's rewrite.
+        DEPTH_RANGE_MINUS_ONE_TO_ONE = 11,
+        /// Primitive restart can be turned off: an index equal to the restart value is drawn
+        /// as a vertex. wgpu restarts every indexed strip, and Metal and MoltenVK always
+        /// restart, so those devices leave this out.
+        PRIMITIVE_RESTART_OFF = 12,
+        /// A fragment output's type need not match its colour target's: a float output may
+        /// feed an integer target. MoltenVK needs them to match; that wgpu's pipeline
+        /// validation does too is a guess, settled in slice R7, so until then a wgpu device
+        /// leaves this out.
+        UNTYPED_FRAGMENT_OUTPUTS = 13,
     }
 }
 
@@ -178,6 +192,22 @@ flag_set! {
         X8 = 3,
         /// Sixteen samples.
         X16 = 4,
+    }
+}
+
+impl FormatFeatures {
+    /// What an error calls the feature ([`crate::RenderError::FormatUnsupported`]'s `usage`).
+    /// A set that is not exactly one feature has no name of its own.
+    pub(crate) const fn in_words(self) -> &'static str {
+        match self {
+            Self::SAMPLE => "sampling",
+            Self::FILTER => "filtering",
+            Self::RENDER => "render targets",
+            Self::BLEND => "blending",
+            Self::STORAGE => "storage images",
+            Self::COPY => "copies",
+            _ => "several uses",
+        }
     }
 }
 

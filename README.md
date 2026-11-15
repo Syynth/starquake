@@ -13,4 +13,5 @@ first pieces are being built. Starquake is not affiliated with Nintendo and ship
 - After cloning, once: `just setup` (installs the Conventional Commits `commit-msg` hook)
 - Contributing: [CONTRIBUTING.md](CONTRIBUTING.md)
 
-Licensed under GPL-3.0-or-later.
+Licensed under GPL-3.0-or-later (`LICENSE`). Ported code keeps its own compatible licence and
+notices; their texts are in `LICENSES/`.
