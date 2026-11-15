@@ -903,3 +903,154 @@ fn a_server_in_mid_start_up_saves_and_restores() {
     assert_eq!(restored.interface_count(), rig.server.interface_count());
     assert_eq!(restored.save().unwrap(), saved);
 }
+
+#[test]
+fn a_restored_server_answers_with_the_saved_applet_resource_user_id() {
+    let mut rig = Rig::new();
+    let proxy = rig.proxy();
+    let window = rig.open(proxy, GET_WINDOW_CONTROLLER);
+    let saved = rig.server.save().unwrap();
+
+    // The restored server takes the rig's place, on the same kernel and session.
+    let mut restored = oe_server(AppletSettings::eden_default(), UnknownPolicy::Strict);
+    restored.restore(&saved).unwrap();
+    rig.server = restored;
+
+    // The window controller opened before the save.
+    let reply = rig.object(window, GET_APPLET_RESOURCE_USER_ID, &[]);
+    assert_eq!(reply.result, ResultCode::SUCCESS);
+    assert_eq!(reply.data, PROCESS_ID.to_le_bytes());
+    // One opened after the restore, from the proxy opened before it.
+    let fresh = rig.open(proxy, GET_WINDOW_CONTROLLER);
+    let reply = rig.object(fresh, GET_APPLET_RESOURCE_USER_ID, &[]);
+    assert_eq!(reply.result, ResultCode::SUCCESS);
+    assert_eq!(reply.data, PROCESS_ID.to_le_bytes());
+}
+
+/// `ISelfController` writes the applet back before it reports a failed signal (`Applet`'s
+/// docs). A server restored onto a kernel where its saved message event is not an event fails
+/// the signal, and the flag the command set is still kept.
+#[test]
+fn a_failed_signal_still_keeps_the_lifecycle_change() {
+    let mut rig = Rig::new();
+    let proxy = rig.proxy();
+    let getter = rig.open(proxy, GET_COMMON_STATE_GETTER);
+    let controller = rig.open(proxy, GET_SELF_CONTROLLER);
+    rig.object(getter, GET_EVENT_HANDLE, &[]);
+    let off = rig.object(controller, SET_FOCUS_HANDLING_MODE, &[0, 0, 1]);
+    assert_eq!(off.result, ResultCode::SUCCESS);
+    let event = rig.applet().message_event().unwrap();
+    let saved = rig.server.save().unwrap();
+
+    // A fresh kernel mints the same session id, but nothing has made the event there.
+    let mut fresh = Rig::new();
+    assert_eq!(fresh.session, rig.session);
+    assert_eq!(fresh.kernel.signals(event), None);
+    fresh.server.restore(&saved).unwrap();
+    assert!(!fresh.applet().lifecycle().notifications.focus_state_changed);
+
+    // Notify on, with a focus change pending: a message becomes available, and the signal fails.
+    let on = fresh.object(controller, SET_FOCUS_HANDLING_MODE, &[1, 0, 1]);
+    assert_eq!(on.result, KernelError::InvalidHandle.code());
+    let lifecycle = *fresh.applet().lifecycle();
+    assert!(lifecycle.notifications.focus_state_changed);
+    assert!(lifecycle.message_available());
+    assert_eq!(fresh.applet().message_event(), Some(event));
+}
+
+/// The error every signal of a [`RefusesSignals`] kernel reports: one no command of the port
+/// reports otherwise.
+const REFUSED: KernelError = KernelError::OutOfResource;
+
+/// A [`FakeKernel`] whose `signal_event` always fails with [`REFUSED`], even for an event it just
+/// made: how a test reaches the failure path of signalling a new event, which the fake alone
+/// never takes.
+struct RefusesSignals(FakeKernel);
+
+impl Kernel for RefusesSignals {
+    fn process_id(&self) -> u64 {
+        self.0.process_id()
+    }
+
+    fn resolve_handle(&self, handle: Handle) -> starquake_kernel::result::SvcResult<ObjectId> {
+        self.0.resolve_handle(handle)
+    }
+
+    fn insert_handle(&mut self, object: ObjectId) -> starquake_kernel::result::SvcResult<Handle> {
+        self.0.insert_handle(object)
+    }
+
+    fn create_event(&mut self) -> starquake_kernel::result::SvcResult<ObjectId> {
+        self.0.create_event()
+    }
+
+    fn signal_event(&mut self, _: ObjectId) -> starquake_kernel::result::SvcResult<()> {
+        Err(REFUSED)
+    }
+
+    fn create_shared_memory(
+        &mut self,
+        size: u64,
+        permission: starquake_kernel::memory::SvcPermission,
+    ) -> starquake_kernel::result::SvcResult<(ObjectId, starquake_kernel::memory::SharedPages)>
+    {
+        self.0.create_shared_memory(size, permission)
+    }
+
+    fn create_session(&mut self) -> starquake_kernel::result::SvcResult<(ObjectId, Handle)> {
+        self.0.create_session()
+    }
+
+    fn connect(
+        &mut self,
+        service: starquake_trace::ServiceId,
+    ) -> starquake_kernel::result::SvcResult<(ObjectId, Handle)> {
+        self.0.connect(service)
+    }
+
+    fn read_memory(&self, address: u64, out: &mut [u8]) -> starquake_kernel::result::SvcResult<()> {
+        self.0.read_memory(address, out)
+    }
+
+    fn write_memory(
+        &mut self,
+        address: u64,
+        data: &[u8],
+    ) -> starquake_kernel::result::SvcResult<()> {
+        self.0.write_memory(address, data)
+    }
+
+    fn record(&mut self, kind: starquake_trace::EventKind) {
+        self.0.record(kind);
+    }
+}
+
+/// `Applet::message_event_or_create` keeps a new event before it signals it, so a failed signal
+/// does not lose the kernel object: the applet names it, and the next `GetEventHandle` returns
+/// it rather than making another.
+#[test]
+fn a_new_message_event_whose_signal_fails_is_still_kept() {
+    let mut rig = Rig::new();
+    let proxy = rig.proxy();
+    let getter = rig.open(proxy, GET_COMMON_STATE_GETTER);
+    // A focus change is pending from launch, with notifications on: the new event is signalled.
+    assert!(rig.applet().lifecycle().message_available());
+
+    let placeholder = FakeKernel::new(0).unwrap();
+    let mut kernel = RefusesSignals(std::mem::replace(&mut rig.kernel, placeholder));
+    let request = RequestBuilder::domain(CommandType::Request, getter, GET_EVENT_HANDLE);
+    let mut buffer = vec![STALE; BUFFER_SIZE];
+    request.build(&mut buffer).unwrap();
+    let handled = rig.server.handle(&mut kernel, rig.session, &mut buffer);
+    assert_eq!(handled, Ok(Handled::Replied));
+    rig.kernel = kernel.0;
+    let refused = parse(&buffer, SessionKind::Domain);
+    assert_eq!(refused.result, REFUSED.code());
+    assert_eq!(refused.copies, Vec::<u32>::new());
+
+    let event = rig.applet().message_event().unwrap();
+    assert_eq!(rig.kernel.signals(event), Some(0));
+    let copied = rig.object(getter, GET_EVENT_HANDLE, &[]).copies[0];
+    assert_eq!(rig.object_of(copied), event);
+    assert_eq!(rig.kernel.signals(event), Some(0));
+}
