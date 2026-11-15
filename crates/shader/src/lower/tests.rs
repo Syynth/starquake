@@ -10,7 +10,7 @@ use crate::decode::{
     RoundMode, SpecialReg,
 };
 use crate::gpu_harness::TestDevice;
-use crate::ir::FpControl;
+use crate::ir::ATTRIBUTE_WORD_BYTES;
 use crate::program::{Rejection, translate_program};
 use crate::translate::{ColorOutputs, Stage};
 
@@ -522,46 +522,40 @@ fn a_pixel_program_with_no_outputs_returns_nothing() {
     );
 }
 
+/// Hand-written IR in the text form.
+fn ir(text: &str) -> Function {
+    Function::parse(text).expect("parses")
+}
+
+/// A pixel function that writes colour output `target`.`component` from a constant.
+fn colour_from_imm(target: u32, component: u32) -> Function {
+    ir(&format!(
+        "block0:\n\
+         \x20   %0: f32 = BitCastF32U32 u32 0\n\
+         \x20   %1 = SetFragColor u32 {target}, u32 {component}, %0\n\
+         \x20   return\n"
+    ))
+}
+
 /// Errors only hand-built IR can reach.
 #[test]
 fn malformed_or_misplaced_ir_is_refused() {
-    let colour = |target, component| {
-        let mut f = Function::new();
-        let b = f.entry();
-        let value = f
-            .push(b, Inst::GetAttribute(Attribute(GENERIC_0_X)))
-            .expect("room");
-        f.push(
-            b,
-            Inst::SetFragColor {
-                target,
-                component,
-                value,
-            },
+    let generic_0 = u32::from(GENERIC_0_X) * ATTRIBUTE_WORD_BYTES;
+    let colour_from_attribute = ir(&format!(
+        "block0:\n\
+         \x20   %0: f32 = GetAttribute a{generic_0:#x}, u32 0\n\
+         \x20   %1 = SetFragColor u32 0, u32 0, %0\n\
+         \x20   return\n"
+    ));
+    let last_target = u32::try_from(COLOR_TARGETS - 1).expect("small");
+    let last_component = u32::from(COMPONENTS) - 1;
+    assert!(
+        lower(
+            GuestStage::Pixel,
+            &colour_from_imm(last_target, last_component)
         )
-        .expect("room");
-        f
-    };
-    // `GetAttribute` is refused in a pixel program before the colour output is looked at, so
-    // build the colour cases from an immediate.
-    let colour_from_imm = |target, component| {
-        let mut f = Function::new();
-        let b = f.entry();
-        let bits = f.push(b, Inst::Imm32(0)).expect("room");
-        let value = f.push(b, Inst::BitCastF32(bits)).expect("room");
-        f.push(
-            b,
-            Inst::SetFragColor {
-                target,
-                component,
-                value,
-            },
-        )
-        .expect("room");
-        f
-    };
-    let last_target = u8::try_from(COLOR_TARGETS - 1).expect("small");
-    assert!(lower(GuestStage::Pixel, &colour_from_imm(last_target, 3)).is_ok());
+        .is_ok()
+    );
     assert_eq!(
         lower(GuestStage::Pixel, &colour_from_imm(last_target + 1, 0)).err(),
         Some(LowerError::ColorOutput {
@@ -570,41 +564,113 @@ fn malformed_or_misplaced_ir_is_refused() {
         })
     );
     assert_eq!(
-        lower(GuestStage::Pixel, &colour_from_imm(0, 4)).err(),
+        lower(GuestStage::Pixel, &colour_from_imm(0, last_component + 1)).err(),
         Some(LowerError::ColorOutput {
             target: 0,
-            component: 4
+            component: last_component + 1
         })
     );
     assert_eq!(
-        lower(GuestStage::Vertex, &colour(0, 0)).err(),
+        lower(GuestStage::Vertex, &colour_from_attribute).err(),
         Some(LowerError::ColorInStage(GuestStage::Vertex))
     );
     assert_eq!(
-        lower(GuestStage::Geometry, &Function::new()).err(),
+        lower(GuestStage::Geometry, &ir("block0:\n    return\n")).err(),
         Some(LowerError::Stage(GuestStage::Geometry))
     );
-    let mut f = Function::new();
-    let b = f.entry();
-    let lane = f.push(b, Inst::LaneId).expect("room");
-    f.push(
-        b,
-        Inst::FFma(
-            lane,
-            lane,
-            lane,
-            FpControl {
-                rounding: RoundMode::NearestEven,
-                ftz: false,
-                fmz: false,
-            },
+    let mistyped = ir("block0:\n\
+         \x20   %0: u32 = LaneId\n\
+         \x20   %1: f32 = FPFma32 %0, %0, %0\n\
+         \x20   return\n");
+    assert_eq!(
+        lower(GuestStage::Pixel, &mistyped)
+            .err()
+            .map(|error| error.to_string()),
+        Some("the IR is malformed: %1 needs argument 0 to be f32, not u32".to_owned())
+    );
+}
+
+/// The lowering takes one block that returns: a second block, a structured function or a
+/// return-less block is refused, and so is any operation, phi or argument form it does not
+/// handle yet.
+#[test]
+fn unlowered_forms_are_refused() {
+    let refused = |stage, text: &str| lower(stage, &ir(text)).err().map(|error| error.to_string());
+    let pixel = GuestStage::Pixel;
+    // The same straight-line body is accepted when it is one block that returns.
+    assert!(lower(pixel, &ir("block0:\n    return\n")).is_ok());
+    let control = Some("control flow other than one block that returns is not lowered yet".into());
+    assert_eq!(
+        refused(pixel, "block0:\n    jump block1\nblock1:\n    return\n"),
+        control
+    );
+    assert_eq!(refused(pixel, "block0:\n    unreachable\n"), control);
+    assert_eq!(
+        refused(pixel, "block0:\nstructure:\n    block0\n    return\n"),
+        control
+    );
+    assert_eq!(
+        refused(
+            pixel,
+            "block0:\n    %0: f32 = FPAdd32 f32 1.0, f32 2.0\n    return\n"
         ),
-    )
-    .expect("room");
-    assert!(matches!(
-        lower(GuestStage::Pixel, &f),
-        Err(LowerError::Verify(VerifyError::Type { .. }))
-    ));
+        Some("%0: FPAdd32 is not lowered yet".into())
+    );
+    assert_eq!(
+        refused(
+            pixel,
+            "block0:\n    jump block1\nblock1:\n    %0: u32 = Phi [block0: u32 0]\n    return\n"
+        ),
+        control,
+        "control flow is checked before the instructions"
+    );
+    // The entry has no predecessors, so a phi there has no incoming values.
+    assert_eq!(
+        refused(pixel, "block0:\n    %0: u32 = Phi\n    return\n"),
+        Some("%0: phis are not lowered yet".into())
+    );
+    let generic_0 = u32::from(GENERIC_0_X) * ATTRIBUTE_WORD_BYTES;
+    assert_eq!(
+        refused(
+            GuestStage::Vertex,
+            &format!("block0:\n    %0: f32 = GetAttribute a{generic_0:#x}, u32 1\n    return\n")
+        ),
+        Some("%0: argument 1 is not an immediate the lowering handles".into())
+    );
+    assert_eq!(
+        refused(
+            GuestStage::Vertex,
+            &format!(
+                "block0:\n    %0: f32 = BitCastF32U32 u32 0\n    \
+                 %1 = SetAttribute a{generic_0:#x}, %0, u32 2\n    return\n"
+            )
+        ),
+        Some("%1: argument 2 is not an immediate the lowering handles".into())
+    );
+    // `Identity` is not lowered, and no other operation has a register name as its result, so a
+    // register access always names its register with an immediate.
+    assert_eq!(
+        refused(
+            GuestStage::Vertex,
+            "block0:\n    %0: opaque = Identity r1\n    %1: u32 = GetRegister %0\n    return\n"
+        ),
+        Some("%0: Identity is not lowered yet".into())
+    );
+    let lane_target = "block0:\n    %0: u32 = LaneId\n    %1: f32 = BitCastF32U32 %0\n";
+    assert_eq!(
+        refused(
+            pixel,
+            &format!("{lane_target}    %2 = SetFragColor %0, u32 0, %1\n    return\n")
+        ),
+        Some("%2: argument 0 is not an immediate the lowering handles".into())
+    );
+    assert_eq!(
+        refused(
+            pixel,
+            &format!("{lane_target}    %2 = SetFragColor u32 0, %0, %1\n    return\n")
+        ),
+        Some("%2: argument 1 is not an immediate the lowering handles".into())
+    );
 }
 
 /// Prints expression `handle` of `function` as a compact tree: locals and arguments by name, a
@@ -762,16 +828,14 @@ fn modifiers_and_saturation_lower_to_their_naga_forms() {
 /// Every lowering error reads as plain words.
 #[test]
 fn lower_errors_read_as_words() {
-    let mut malformed = Function::new();
-    let b = malformed.entry();
-    let zero = malformed.push(b, Inst::Imm32(0)).expect("room");
-    malformed
-        .push(b, Inst::SetReg(Gpr::RZ, zero))
-        .expect("room");
+    let malformed = ir("block0:\n    %0 = SetRegister rz, u32 0\n    return\n");
     let verify = lower(GuestStage::Vertex, &malformed).expect_err("a write to rz is malformed");
     let attribute = Attribute(GENERIC_0_X);
     let cases = [
-        (verify, "the IR is malformed: %1 reads or writes rz"),
+        (
+            verify,
+            "the IR is malformed: %0: SetRegister cannot access rz",
+        ),
         (
             LowerError::Stage(GuestStage::Geometry),
             "geometry programs are not lowered yet",
@@ -810,6 +874,10 @@ fn lower_errors_read_as_words() {
         (
             LowerError::ColorInStage(GuestStage::Vertex),
             "a vertex program cannot write colour outputs",
+        ),
+        (
+            LowerError::ControlFlow,
+            "control flow other than one block that returns is not lowered yet",
         ),
         (
             LowerError::Validation("why".into()),

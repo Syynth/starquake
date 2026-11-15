@@ -53,7 +53,9 @@ use crate::host::{
     GuestSlot, HostBuiltIn, HostCode, HostShader, HostStage, InterfaceSlot, Requirements,
     SlotBinding, SlotType,
 };
-use crate::ir::{Attribute, Function, Inst, Value, VerifyError};
+use crate::ir::{
+    Attribute, Function, Imm, Inst, Opcode, Operand, Operation, Terminator, Value, VerifyError,
+};
 use crate::translate::{COLOR_TARGETS, GuestStage};
 use builder::{FunctionBuilder, named_ty, push, ty};
 
@@ -109,6 +111,28 @@ pub enum LowerError {
     /// The stage is not handled yet.
     #[error("{0} programs are not lowered yet")]
     Stage(GuestStage),
+    /// Control flow other than one block that returns, which is not lowered yet (slice 16).
+    #[error("control flow other than one block that returns is not lowered yet")]
+    ControlFlow,
+    /// An operation the lowering does not handle yet.
+    #[error("{at}: {opcode} is not lowered yet")]
+    Operation {
+        /// The instruction.
+        at: Value,
+        /// Its opcode.
+        opcode: Opcode,
+    },
+    /// A phi, which the lowering does not handle yet.
+    #[error("{0}: phis are not lowered yet")]
+    Phi(Value),
+    /// An argument the lowering needs as an immediate of a particular kind is something else.
+    #[error("{at}: argument {index} is not an immediate the lowering handles")]
+    Operand {
+        /// The instruction.
+        at: Value,
+        /// The argument's index.
+        index: usize,
+    },
     /// An attribute the stage cannot read.
     #[error("a {stage} program cannot read attribute {attribute}")]
     Input {
@@ -138,9 +162,9 @@ pub enum LowerError {
     #[error("colour output {target}.{component} does not exist")]
     ColorOutput {
         /// The target.
-        target: u8,
+        target: u32,
         /// The component.
-        component: u8,
+        component: u32,
     },
     /// A colour output in a stage that has none.
     #[error("a {0} program cannot write colour outputs")]
@@ -188,44 +212,67 @@ impl Interface {
     fn collect(stage: GuestStage, function: &Function) -> Result<Self, LowerError> {
         let vertex = stage == GuestStage::Vertex;
         let mut found = Self::default();
-        for (_, inst) in function.insts() {
-            match *inst {
-                Inst::GetReg(reg) | Inst::SetReg(reg, _) => {
+        for (at, inst) in function.listed() {
+            let Inst::Op(op) = inst else {
+                return Err(LowerError::Phi(at));
+            };
+            match op.opcode {
+                Opcode::GetRegister | Opcode::SetRegister => {
+                    let Some(Imm::Reg(reg)) = imm_arg(op, 0) else {
+                        return Err(LowerError::Operand { at, index: 0 });
+                    };
                     found.registers.insert(reg.index());
                 }
-                Inst::GetAttribute(attribute) => match classify(attribute) {
+                Opcode::GetAttribute => match classify(attribute_arg(at, op, 1)?) {
                     Some(AttributeKind::Generic { index, .. }) if vertex => {
                         found.inputs.insert(host_location(index)?);
                     }
-                    _ => return Err(LowerError::Input { stage, attribute }),
+                    _ => {
+                        let attribute = attribute_arg(at, op, 1)?;
+                        return Err(LowerError::Input { stage, attribute });
+                    }
                 },
-                Inst::SetAttribute(attribute, _) => match classify(attribute) {
+                Opcode::SetAttribute => match classify(attribute_arg(at, op, 2)?) {
                     Some(AttributeKind::Generic { index, .. }) if vertex => {
                         found.generic_outputs.insert(host_location(index)?);
                     }
                     Some(AttributeKind::Position { .. }) if vertex => {}
-                    _ => return Err(LowerError::Output { stage, attribute }),
+                    _ => {
+                        let attribute = attribute_arg(at, op, 2)?;
+                        return Err(LowerError::Output { stage, attribute });
+                    }
                 },
-                Inst::LaneId if vertex => return Err(LowerError::LaneIdInVertex),
-                Inst::LaneId => found.lane_id = true,
-                Inst::SetFragColor {
-                    target, component, ..
-                } => {
+                Opcode::LaneId if vertex => return Err(LowerError::LaneIdInVertex),
+                Opcode::LaneId => found.lane_id = true,
+                Opcode::SetFragColor => {
+                    let Some(Imm::U32(target)) = imm_arg(op, 0) else {
+                        return Err(LowerError::Operand { at, index: 0 });
+                    };
+                    let Some(Imm::U32(component)) = imm_arg(op, 1) else {
+                        return Err(LowerError::Operand { at, index: 1 });
+                    };
                     if vertex {
                         return Err(LowerError::ColorInStage(stage));
                     }
-                    if usize::from(target) >= COLOR_TARGETS || u16::from(component) >= COMPONENTS {
-                        return Err(LowerError::ColorOutput { target, component });
+                    let target = u8::try_from(target)
+                        .ok()
+                        .filter(|&t| usize::from(t) < COLOR_TARGETS)
+                        .ok_or(LowerError::ColorOutput { target, component })?;
+                    if component >= u32::from(COMPONENTS) {
+                        return Err(LowerError::ColorOutput {
+                            target: u32::from(target),
+                            component,
+                        });
                     }
                     found.targets.insert(target);
                 }
-                Inst::Imm32(_)
-                | Inst::BitCastF32(_)
-                | Inst::BitCastU32(_)
-                | Inst::FAbs(_)
-                | Inst::FNeg(_)
-                | Inst::FFma(..)
-                | Inst::FSaturate(_) => {}
+                Opcode::BitCastF32U32
+                | Opcode::BitCastU32F32
+                | Opcode::FPAbs32
+                | Opcode::FPNeg32
+                | Opcode::FPFma32
+                | Opcode::FPSaturate32 => {}
+                opcode => return Err(LowerError::Operation { at, opcode }),
             }
         }
         Ok(found)
@@ -249,7 +296,8 @@ struct OutputMember {
     index: u32,
 }
 
-/// Lowers a straight-line function of `stage` to a validated naga module.
+/// Lowers a straight-line function of `stage` (a control-flow graph of one block that returns)
+/// to a validated naga module.
 pub fn lower(stage: GuestStage, function: &Function) -> Result<HostShader, LowerError> {
     function.verify()?;
     let (host_stage, shader_stage) = match stage {
@@ -257,6 +305,14 @@ pub fn lower(stage: GuestStage, function: &Function) -> Result<HostShader, Lower
         GuestStage::Pixel => (HostStage::Fragment, ShaderStage::Fragment),
         other => return Err(LowerError::Stage(other)),
     };
+    let straight = function.structure().is_none()
+        && function.block_count() == 1
+        && function
+            .block(function.entry())
+            .is_some_and(|entry| entry.terminator == Terminator::Return);
+    if !straight {
+        return Err(LowerError::ControlFlow);
+    }
     let interface = Interface::collect(stage, function)?;
     let requirements = Requirements {
         subgroup: interface.lane_id,
@@ -282,11 +338,9 @@ pub fn lower(stage: GuestStage, function: &Function) -> Result<HostShader, Lower
     }
 
     let mut body = Block::new();
-    for block in function.blocks() {
-        for &value in &block.insts {
-            if let Some(inst) = function.inst(value) {
-                lowering.inst(&mut body, value, *inst)?;
-            }
+    for (at, inst) in function.listed() {
+        if let Inst::Op(op) = inst {
+            lowering.inst(&mut body, at, op)?;
         }
     }
     let result = match lowering.output {
@@ -472,6 +526,28 @@ impl Lowering {
             .ok_or(LowerError::Verify(VerifyError::Missing(value)))
     }
 
+    /// The expression of an operand of instruction `at`: a value's, or a literal made here for
+    /// a 32-bit immediate (where slice 1's IR had an `Imm32` instruction, so the module's
+    /// expressions keep their order).
+    fn operand(
+        &mut self,
+        body: &mut Block,
+        at: Value,
+        operand: Operand,
+    ) -> Result<Handle<Expression>, LowerError> {
+        let literal = match operand {
+            Operand::Value(value) => return self.value(value),
+            Operand::Imm(Imm::U32(bits)) => Literal::U32(bits),
+            Operand::Imm(Imm::F32(bits)) => Literal::F32(f32::from_bits(bits)),
+            Operand::Imm(_) => {
+                return Err(LowerError::Internal(format!(
+                    "an immediate operand of {at}"
+                )));
+            }
+        };
+        Ok(self.fb.expr(body, Expression::Literal(literal)))
+    }
+
     fn register(&mut self, body: &mut Block, reg: u8) -> Result<Handle<Expression>, LowerError> {
         let local = *self
             .registers
@@ -484,11 +560,12 @@ impl Lowering {
     fn store_output(
         &mut self,
         body: &mut Block,
+        at: Value,
         member: Option<OutputMember>,
         component: u32,
-        value: Value,
+        value: Operand,
     ) -> Result<(), LowerError> {
-        let value = self.value(value)?;
+        let value = self.operand(body, at, value)?;
         let (Some(output), Some(member)) = (self.output, member) else {
             return Err(LowerError::Internal("no output member".into()));
         };
@@ -515,10 +592,11 @@ impl Lowering {
     fn bitcast(
         &mut self,
         body: &mut Block,
-        value: Value,
+        at: Value,
+        value: Operand,
         kind: ScalarKind,
     ) -> Result<Handle<Expression>, LowerError> {
-        let expr = self.value(value)?;
+        let expr = self.operand(body, at, value)?;
         Ok(self.fb.expr(
             body,
             Expression::As {
@@ -549,27 +627,41 @@ impl Lowering {
         )
     }
 
-    fn inst(&mut self, body: &mut Block, value: Value, inst: Inst) -> Result<(), LowerError> {
-        let expr = match inst {
-            Inst::Imm32(bits) => Some(self.fb.expr(body, Expression::Literal(Literal::U32(bits)))),
-            Inst::GetReg(reg) => {
+    /// Argument `index` of `op`.
+    fn arg(at: Value, op: &Operation, index: usize) -> Result<Operand, LowerError> {
+        op.args
+            .get(index)
+            .copied()
+            .ok_or(LowerError::Operand { at, index })
+    }
+
+    fn inst(&mut self, body: &mut Block, at: Value, op: &Operation) -> Result<(), LowerError> {
+        let arg = |index| Self::arg(at, op, index);
+        let expr = match op.opcode {
+            Opcode::GetRegister => {
+                let Some(Imm::Reg(reg)) = imm_arg(op, 0) else {
+                    return Err(LowerError::Operand { at, index: 0 });
+                };
                 let pointer = self.register(body, reg.index())?;
                 Some(self.fb.expr(body, Expression::Load { pointer }))
             }
-            Inst::SetReg(reg, v) => {
-                let value = self.value(v)?;
+            Opcode::SetRegister => {
+                let Some(Imm::Reg(reg)) = imm_arg(op, 0) else {
+                    return Err(LowerError::Operand { at, index: 0 });
+                };
+                let value = self.operand(body, at, arg(1)?)?;
                 let pointer = self.register(body, reg.index())?;
                 push(body, Statement::Store { pointer, value });
                 None
             }
-            Inst::BitCastF32(v) => Some(self.bitcast(body, v, ScalarKind::Float)?),
-            Inst::BitCastU32(v) => Some(self.bitcast(body, v, ScalarKind::Uint)?),
-            Inst::FAbs(v) => {
-                let arg = self.value(v)?;
-                Some(self.math(body, MathFunction::Abs, [None; 3], arg))
+            Opcode::BitCastF32U32 => Some(self.bitcast(body, at, arg(0)?, ScalarKind::Float)?),
+            Opcode::BitCastU32F32 => Some(self.bitcast(body, at, arg(0)?, ScalarKind::Uint)?),
+            Opcode::FPAbs32 => {
+                let value = self.operand(body, at, arg(0)?)?;
+                Some(self.math(body, MathFunction::Abs, [None; 3], value))
             }
-            Inst::FNeg(v) => {
-                let expr = self.value(v)?;
+            Opcode::FPNeg32 => {
+                let expr = self.operand(body, at, arg(0)?)?;
                 Some(self.fb.expr(
                     body,
                     Expression::Unary {
@@ -578,26 +670,28 @@ impl Lowering {
                     },
                 ))
             }
-            Inst::FFma(factor, multiplier, addend, _control) => {
-                let factor = self.value(factor)?;
-                let multiplier = self.value(multiplier)?;
-                let addend = self.value(addend)?;
+            // The controls are not expressed (decision 10, in the module docs).
+            Opcode::FPFma32 => {
+                let factor = self.operand(body, at, arg(0)?)?;
+                let multiplier = self.operand(body, at, arg(1)?)?;
+                let addend = self.operand(body, at, arg(2)?)?;
                 let args = [Some(multiplier), Some(addend), None];
                 Some(self.math(body, MathFunction::Fma, args, factor))
             }
-            Inst::FSaturate(v) => {
-                let arg = self.value(v)?;
-                Some(self.math(body, MathFunction::Saturate, [None; 3], arg))
+            Opcode::FPSaturate32 => {
+                let value = self.operand(body, at, arg(0)?)?;
+                Some(self.math(body, MathFunction::Saturate, [None; 3], value))
             }
-            Inst::GetAttribute(attribute) => {
+            Opcode::GetAttribute => {
+                let attribute = attribute_arg(at, op, 1)?;
                 let Some(AttributeKind::Generic { index, component }) = classify(attribute) else {
                     return Err(LowerError::Internal(format!("input {attribute}")));
                 };
-                let arg = *self
+                let input = *self
                     .input_args
                     .get(&index)
                     .ok_or(LowerError::Internal(format!("input {attribute}")))?;
-                let base = self.fb.expr(body, Expression::FunctionArgument(arg));
+                let base = self.fb.expr(body, Expression::FunctionArgument(input));
                 Some(self.fb.expr(
                     body,
                     Expression::AccessIndex {
@@ -606,7 +700,8 @@ impl Lowering {
                     },
                 ))
             }
-            Inst::SetAttribute(attribute, v) => {
+            Opcode::SetAttribute => {
+                let attribute = attribute_arg(at, op, 2)?;
                 let (member, component) = match classify(attribute) {
                     Some(AttributeKind::Position { component }) => (self.position, component),
                     Some(AttributeKind::Generic { index, component }) => {
@@ -614,28 +709,49 @@ impl Lowering {
                     }
                     None => (None, 0),
                 };
-                self.store_output(body, member, component, v)?;
+                self.store_output(body, at, member, component, arg(1)?)?;
                 None
             }
-            Inst::LaneId => {
-                let arg = self
+            Opcode::LaneId => {
+                let lane = self
                     .lane_arg
                     .ok_or(LowerError::Internal("no lane id argument".into()))?;
-                Some(self.fb.expr(body, Expression::FunctionArgument(arg)))
+                Some(self.fb.expr(body, Expression::FunctionArgument(lane)))
             }
-            Inst::SetFragColor {
-                target,
-                component,
-                value: v,
-            } => {
-                let member = self.target_members.get(&target).copied();
-                self.store_output(body, member, u32::from(component), v)?;
+            Opcode::SetFragColor => {
+                let (Some(Imm::U32(target)), Some(Imm::U32(component))) =
+                    (imm_arg(op, 0), imm_arg(op, 1))
+                else {
+                    return Err(LowerError::Internal(format!("colour output at {at}")));
+                };
+                let member = u8::try_from(target)
+                    .ok()
+                    .and_then(|target| self.target_members.get(&target).copied());
+                self.store_output(body, at, member, component, arg(2)?)?;
                 None
             }
+            opcode => return Err(LowerError::Operation { at, opcode }),
         };
         if let Some(expr) = expr {
-            self.values.insert(value, expr);
+            self.values.insert(at, expr);
         }
         Ok(())
+    }
+}
+
+/// Immediate argument `index` of `op`, if it is one.
+fn imm_arg(op: &Operation, index: usize) -> Option<Imm> {
+    op.args.get(index)?.imm()
+}
+
+/// The attribute an attribute access names (argument 0), after checking that its vertex index
+/// (argument `vertex`) is the immediate zero: the stages lowered here have one vertex.
+fn attribute_arg(at: Value, op: &Operation, vertex: usize) -> Result<Attribute, LowerError> {
+    if imm_arg(op, vertex) != Some(Imm::U32(0)) {
+        return Err(LowerError::Operand { at, index: vertex });
+    }
+    match imm_arg(op, 0) {
+        Some(Imm::Attribute(attribute)) => Ok(attribute),
+        _ => Err(LowerError::Operand { at, index: 0 }),
     }
 }

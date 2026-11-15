@@ -107,7 +107,7 @@ mod tests {
             Some(Rejection::Translate(TranslateError::NoExit))
         );
         let ir = program_ir(VERTEX, &exit_bytes()).expect("translates");
-        assert_eq!(ir.to_string(), "block0:\n");
+        assert_eq!(ir.to_string(), "block0:\n    return\n");
         assert!(translate_program(VERTEX, &exit_bytes()).is_ok());
     }
 }

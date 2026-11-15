@@ -38,9 +38,13 @@ use std::fmt::{self, Display, Formatter};
 use thiserror::Error;
 
 use crate::decode::{
-    FloatSrc, Gpr, Instr, MovSrc, Op, OpALd, OpASt, OpExit, OpFFma, OpMov, OpS2R, SpecialReg,
+    FloatSrc, Gpr, Instr, MovSrc, Op, OpALd, OpASt, OpExit, OpFFma, OpMov, OpS2R, RoundMode,
+    SpecialReg,
 };
-use crate::ir::{ArenaFull, Attribute, BlockId, FpControl, Function, Inst, Value};
+use crate::ir::{
+    Attribute, BuildError, Builder, Flags, FmzMode, FpControl, FpRounding, Function, Imm, Opcode,
+    Operand, Terminator, Value,
+};
 
 /// The guest's pipeline stage of a program (spec, "What the GPU front/back protocol and engine
 /// state (#12) gets": `GuestStage`; slot types from `SET_PIPELINE_SHADER`).
@@ -192,9 +196,10 @@ pub enum TranslateError {
     /// The stage is not handled.
     #[error("{0}")]
     Stage(Unsupported),
-    /// The IR's arena is full.
+    /// The IR could not be built: an arena is full, or a translator built a malformed
+    /// instruction (a bug in this module).
     #[error(transparent)]
-    Arena(#[from] ArenaFull),
+    Build(#[from] BuildError),
 }
 
 /// The bound PR #4588 puts on attribute addresses: an access must end at or before `0x400`
@@ -204,16 +209,18 @@ pub const ATTRIBUTE_SPACE_END: u32 = 0x400;
 /// `dest + components <= 255`).
 pub const REGISTER_LIMIT: u32 = 255;
 
-/// Translates a straight-line program that ends with its first `EXIT`.
+/// Translates a straight-line program that ends with its first `EXIT`, into one block that ends
+/// in a return.
 pub fn translate(stage: Stage, program: &[Instr]) -> Result<Function, TranslateError> {
     if !matches!(stage.stage, GuestStage::Vertex | GuestStage::Pixel) {
         return Err(TranslateError::Stage(Unsupported::Stage(stage.stage)));
     }
+    let mut function = Function::new();
+    let entry = function.entry();
     let mut t = Translator {
-        function: Function::new(),
+        b: Builder::new(&mut function, entry),
         stage,
     };
-    let block = t.function.entry();
     for (index, instr) in program.iter().enumerate() {
         let fail = |what| TranslateError::Unsupported {
             index,
@@ -224,26 +231,29 @@ pub fn translate(stage: Stage, program: &[Instr]) -> Result<Function, TranslateE
             return Err(fail(Unsupported::Guard));
         }
         let done = match instr.op {
-            Op::Mov(op) => t.mov(block, op).map(|()| false),
-            Op::FFma(op) => t.ffma(block, op).map(|()| false),
-            Op::ALd(op) => t.ald(block, op).map(|()| false),
-            Op::ASt(op) => t.ast(block, op).map(|()| false),
-            Op::S2R(op) => t.s2r(block, op).map(|()| false),
-            Op::Exit(op) => t.exit(block, op).map(|()| true),
+            Op::Mov(op) => t.mov(op).map(|()| false),
+            Op::FFma(op) => t.ffma(op).map(|()| false),
+            Op::ALd(op) => t.ald(op).map(|()| false),
+            Op::ASt(op) => t.ast(op).map(|()| false),
+            Op::S2R(op) => t.s2r(op).map(|()| false),
+            Op::Exit(op) => t.exit(op).map(|()| true),
         };
         match done {
             Ok(false) => {}
             Ok(true) => {
-                return match index.checked_add(1) {
-                    Some(next) if next < program.len() => Err(TranslateError::AfterExit {
+                if let Some(next) = index.checked_add(1)
+                    && next < program.len()
+                {
+                    return Err(TranslateError::AfterExit {
                         index: next,
                         exit: index,
-                    }),
-                    _ => Ok(t.function),
-                };
+                    });
+                }
+                t.b.terminate(Terminator::Return)?;
+                return Ok(function);
             }
             Err(Failure::Unsupported(what)) => return Err(fail(what)),
-            Err(Failure::Arena(full)) => return Err(full.into()),
+            Err(Failure::Build(error)) => return Err(error.into()),
         }
     }
     Err(TranslateError::NoExit)
@@ -252,12 +262,12 @@ pub fn translate(stage: Stage, program: &[Instr]) -> Result<Function, TranslateE
 /// An instruction translator's failure, before the instruction is attached.
 enum Failure {
     Unsupported(Unsupported),
-    Arena(ArenaFull),
+    Build(BuildError),
 }
 
-impl From<ArenaFull> for Failure {
-    fn from(full: ArenaFull) -> Self {
-        Self::Arena(full)
+impl From<BuildError> for Failure {
+    fn from(error: BuildError) -> Self {
+        Self::Build(error)
     }
 }
 
@@ -277,87 +287,112 @@ fn register_run(first: Gpr, count: u32) -> Option<u32> {
     (end <= REGISTER_LIMIT).then_some(end)
 }
 
-struct Translator {
-    function: Function,
+/// PR #4588's `RoundingOf` (`ops_alu.cpp`): the 2-bit rounding field as an IR rounding mode.
+const fn rounding_of(mode: RoundMode) -> FpRounding {
+    match mode {
+        RoundMode::NearestEven => FpRounding::Rn,
+        RoundMode::NegInf => FpRounding::Rm,
+        RoundMode::PosInf => FpRounding::Rp,
+        RoundMode::Zero => FpRounding::Rz,
+    }
+}
+
+/// A 32-bit immediate operand.
+const fn imm32(bits: u32) -> Operand {
+    Operand::Imm(Imm::U32(bits))
+}
+
+/// The vertex index of an attribute access: always zero here (`ALD` and `AST` take only `RZ` as
+/// the vertex register), as Eden's emitter passes `Imm32(0)` for a stage with one vertex
+/// (`ir_emitter.cpp`, `GetAttribute(attribute)`).
+const VERTEX_ZERO: Operand = imm32(0);
+
+struct Translator<'f> {
+    b: Builder<'f>,
     stage: Stage,
 }
 
-impl Translator {
-    fn push(&mut self, block: BlockId, inst: Inst) -> Result<Value, Failure> {
-        Ok(self.function.push(block, inst)?)
+impl Translator<'_> {
+    fn op(&mut self, opcode: Opcode, args: &[Operand]) -> Result<Value, Failure> {
+        Ok(self.b.op(opcode, args)?)
     }
 
     /// Reads a register's raw bits; `RZ` reads zero.
-    fn get(&mut self, block: BlockId, reg: Gpr) -> Result<Value, Failure> {
+    fn get(&mut self, reg: Gpr) -> Result<Operand, Failure> {
         if reg.is_zero() {
-            self.push(block, Inst::Imm32(0))
+            Ok(imm32(0))
         } else {
-            self.push(block, Inst::GetReg(reg))
+            Ok(self
+                .op(Opcode::GetRegister, &[Operand::Imm(Imm::Reg(reg))])?
+                .into())
         }
     }
 
     /// Writes a register's raw bits; writes to `RZ` are dropped.
-    fn set(&mut self, block: BlockId, reg: Gpr, value: Value) -> Result<(), Failure> {
+    fn set(&mut self, reg: Gpr, value: Operand) -> Result<(), Failure> {
         if !reg.is_zero() {
-            self.push(block, Inst::SetReg(reg, value))?;
+            self.op(Opcode::SetRegister, &[Operand::Imm(Imm::Reg(reg)), value])?;
         }
         Ok(())
     }
 
-    fn get_f32(&mut self, block: BlockId, reg: Gpr) -> Result<Value, Failure> {
-        let bits = self.get(block, reg)?;
-        self.push(block, Inst::BitCastF32(bits))
+    fn get_f32(&mut self, reg: Gpr) -> Result<Value, Failure> {
+        let bits = self.get(reg)?;
+        self.op(Opcode::BitCastF32U32, &[bits])
     }
 
-    fn set_f32(&mut self, block: BlockId, reg: Gpr, value: Value) -> Result<(), Failure> {
-        let bits = self.push(block, Inst::BitCastU32(value))?;
-        self.set(block, reg, bits)
+    fn set_f32(&mut self, reg: Gpr, value: Value) -> Result<(), Failure> {
+        let bits = self.op(Opcode::BitCastU32F32, &[value.into()])?;
+        self.set(reg, bits.into())
     }
 
-    fn float_src(&mut self, block: BlockId, src: FloatSrc) -> Result<Value, Failure> {
+    fn float_src(&mut self, src: FloatSrc) -> Result<Value, Failure> {
         match src {
-            FloatSrc::Imm(bits) => {
-                let bits = self.push(block, Inst::Imm32(bits))?;
-                self.push(block, Inst::BitCastF32(bits))
-            }
+            FloatSrc::Imm(bits) => self.op(Opcode::BitCastF32U32, &[imm32(bits)]),
             FloatSrc::Reg { reg, abs, neg } => {
-                let mut value = self.get_f32(block, reg)?;
+                let mut value = self.get_f32(reg)?;
                 if abs {
-                    value = self.push(block, Inst::FAbs(value))?;
+                    value = self.op(Opcode::FPAbs32, &[value.into()])?;
                 }
                 if neg {
-                    value = self.push(block, Inst::FNeg(value))?;
+                    value = self.op(Opcode::FPNeg32, &[value.into()])?;
                 }
                 Ok(value)
             }
         }
     }
 
-    fn mov(&mut self, block: BlockId, op: OpMov) -> Result<(), Failure> {
+    fn mov(&mut self, op: OpMov) -> Result<(), Failure> {
         require(op.quad_lanes == OpMov::ALL_LANES, Unsupported::MovLaneMask)?;
         let value = match op.src {
-            MovSrc::Reg(reg) => self.get(block, reg)?,
-            MovSrc::Imm(bits) => self.push(block, Inst::Imm32(bits))?,
+            MovSrc::Reg(reg) => self.get(reg)?,
+            MovSrc::Imm(bits) => imm32(bits),
         };
-        self.set(block, op.dst, value)
+        self.set(op.dst, value)
     }
 
-    fn ffma(&mut self, block: BlockId, op: OpFFma) -> Result<(), Failure> {
+    /// `FFMA` with PR #4588's controls (`ops_alu.cpp`, `FFMA`): no contraction, the rounding
+    /// field through `RoundingOf`, and `FTZ` or no flushing.
+    fn ffma(&mut self, op: OpFFma) -> Result<(), Failure> {
         require(!op.dnz, Unsupported::FfmaMultiplyZero)?;
         let [a, b, c] = op.srcs;
-        let a = self.float_src(block, a)?;
-        let b = self.float_src(block, b)?;
-        let c = self.float_src(block, c)?;
+        let a = self.float_src(a)?;
+        let b = self.float_src(b)?;
+        let c = self.float_src(c)?;
         let control = FpControl {
-            rounding: op.rnd,
-            ftz: op.ftz,
-            fmz: op.dnz,
+            no_contraction: true,
+            rounding: rounding_of(op.rnd),
+            fmz_mode: if op.ftz { FmzMode::Ftz } else { FmzMode::None },
         };
-        let mut value = self.push(block, Inst::FFma(a, b, c, control))?;
+        let mut value = self.b.op_with(
+            Opcode::FPFma32,
+            &[a.into(), b.into(), c.into()],
+            Flags::Fp(control),
+        )?;
         if op.saturate {
-            value = self.push(block, Inst::FSaturate(value))?;
+            value = self.op(Opcode::FPSaturate32, &[value.into()])?;
         }
-        self.set_f32(block, op.dst, value)
+        self.set_f32(op.dst, value)
     }
 
     /// The address check `ALD` and `AST` share; returns the first attribute.
@@ -374,7 +409,7 @@ impl Translator {
 
     /// `ALD`, with the PR's checks in its order: offset register, patch or physical, output,
     /// address, registers; then starquake's vertex register check.
-    fn ald(&mut self, block: BlockId, op: OpALd) -> Result<(), Failure> {
+    fn ald(&mut self, op: OpALd) -> Result<(), Failure> {
         require(op.offset.is_zero(), Unsupported::IndexedAttribute)?;
         require(!op.patch && !op.phys, Unsupported::PatchOrPhysical)?;
         require(!op.output, Unsupported::OutputRead)?;
@@ -389,16 +424,19 @@ impl Translator {
         require(op.vtx.is_zero(), Unsupported::AttributeVertex)?;
         for element in 0..op.comps {
             let attribute = Attribute(first.saturating_add(u16::from(element)));
-            let value = self.push(block, Inst::GetAttribute(attribute))?;
+            let value = self.op(
+                Opcode::GetAttribute,
+                &[Operand::Imm(Imm::Attribute(attribute)), VERTEX_ZERO],
+            )?;
             let reg = Gpr::new(op.dst.index().saturating_add(element));
-            self.set_f32(block, reg, value)?;
+            self.set_f32(reg, value)?;
         }
         Ok(())
     }
 
     /// `AST`, with the PR's checks in its order: offset register, patch or physical, address,
     /// registers; then starquake's vertex register check.
-    fn ast(&mut self, block: BlockId, op: OpASt) -> Result<(), Failure> {
+    fn ast(&mut self, op: OpASt) -> Result<(), Failure> {
         require(op.offset.is_zero(), Unsupported::IndexedAttribute)?;
         require(!op.patch && !op.phys, Unsupported::PatchOrPhysical)?;
         let first = Self::attribute(op.addr, op.comps)?;
@@ -417,14 +455,21 @@ impl Translator {
             } else {
                 Gpr::new(op.data.index().saturating_add(element))
             };
-            let value = self.get_f32(block, reg)?;
+            let value = self.get_f32(reg)?;
             let attribute = Attribute(first.saturating_add(u16::from(element)));
-            self.push(block, Inst::SetAttribute(attribute, value))?;
+            self.op(
+                Opcode::SetAttribute,
+                &[
+                    Operand::Imm(Imm::Attribute(attribute)),
+                    value.into(),
+                    VERTEX_ZERO,
+                ],
+            )?;
         }
         Ok(())
     }
 
-    fn s2r(&mut self, block: BlockId, op: OpS2R) -> Result<(), Failure> {
+    fn s2r(&mut self, op: OpS2R) -> Result<(), Failure> {
         require(
             op.sr == SpecialReg::LANE_ID,
             Unsupported::SpecialRegister(op.sr),
@@ -433,8 +478,8 @@ impl Translator {
         if op.dst.is_zero() {
             return Ok(());
         }
-        let value = self.push(block, Inst::LaneId)?;
-        self.set(block, op.dst, value)
+        let value = self.op(Opcode::LaneId, &[])?;
+        self.set(op.dst, value.into())
     }
 
     /// `EXIT`: for a pixel program, the registers hold the colour outputs, four per target in
@@ -443,7 +488,7 @@ impl Translator {
     /// `COLOR_TARGETS * 4` = 32 registers are read, so the PR's `src_reg < 255` check cannot
     /// fail here and is not repeated. Sample mask and depth outputs come with the SPH parser
     /// (slice 2).
-    fn exit(&mut self, block: BlockId, op: OpExit) -> Result<(), Failure> {
+    fn exit(&mut self, op: OpExit) -> Result<(), Failure> {
         require(!op.keep_ref_count && !op.no_at_exit, Unsupported::ExitMode)?;
         require(op.pred.is_true(), Unsupported::ConditionalExit)?;
         if self.stage.stage != GuestStage::Pixel {
@@ -457,14 +502,14 @@ impl Translator {
             }
             for component in 0_u8..4 {
                 if mask & (1 << component) != 0 {
-                    let value = self.get_f32(block, Gpr::new(reg))?;
-                    self.push(
-                        block,
-                        Inst::SetFragColor {
-                            target,
-                            component,
-                            value,
-                        },
+                    let value = self.get_f32(Gpr::new(reg))?;
+                    self.op(
+                        Opcode::SetFragColor,
+                        &[
+                            imm32(u32::from(target)),
+                            imm32(u32::from(component)),
+                            value.into(),
+                        ],
                     )?;
                 }
                 reg = reg.saturating_add(1);
