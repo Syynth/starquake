@@ -27,11 +27,15 @@
 //! [`fallback`], and what the shaders must emulate because its [`Caps`] lack it, in
 //! [`mod@emulation`].
 //!
+//! Slice R3 adds the CPU ASTC decoder, in [`astc`]: ASTC blocks to RGBA8, for hosts whose GPU
+//! has no native ASTC and as the oracle for the GPU decoder.
+//!
 //! Slice R11 (its first part) adds host-level captures, in [`capture`]: the submitted lists
 //! and their staging bytes as a versioned file's bytes, and their replay on a backend.
 //!
-//! Later slices add the CPU ASTC decoder (R3) and the host shaders (R4).
+//! A later slice adds the host shaders (R4).
 
+pub mod astc;
 pub mod backend;
 pub mod caps;
 pub mod capture;

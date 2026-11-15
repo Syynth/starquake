@@ -17,5 +17,6 @@ serde.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+astc-decode.workspace = true
 insta.workspace = true
 proptest.workspace = true
