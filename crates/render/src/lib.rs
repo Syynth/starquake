@@ -22,6 +22,14 @@
 //! Slice R1 adds the [`RecordingBackend`], in [`recording`]: the trait with no GPU, recording
 //! every list and modelling on the CPU the commands with exact answers.
 //!
+//! Slice R2 adds the two choices every backend shares, as pure functions over what the device
+//! reports: the host format a guest format gets when the device's [`FormatTable`] lacks it, in
+//! [`fallback`], and what the shaders must emulate because its [`Caps`] lack it, in
+//! [`mod@emulation`].
+//!
+//! Slice R3 adds the CPU ASTC decoder, in [`astc`]: ASTC blocks to RGBA8, for hosts whose GPU
+//! has no native ASTC and as the oracle for the GPU decoder.
+//!
 //! Slice R9 (its first part) adds frame dumps, in [`frame`]: a present with `dump` set hands a
 //! [`Frame`] to the [`FrameSink`] installed on the backend, and a frame encodes itself as a
 //! PNG. This crate still does no file I/O.
@@ -29,14 +37,16 @@
 //! Slice R11 (its first part) adds host-level captures, in [`capture`]: the submitted lists
 //! and their staging bytes as a versioned file's bytes, and their replay on a backend.
 //!
-//! Later slices add format fallbacks and `emulation()` (R2), the CPU ASTC decoder (R3) and the
-//! host shaders (R4).
+//! A later slice adds the host shaders (R4).
 
+pub mod astc;
 pub mod backend;
 pub mod caps;
 pub mod capture;
 pub mod command;
+pub mod emulation;
 pub mod error;
+pub mod fallback;
 mod flags;
 pub mod format;
 pub mod frame;
@@ -54,14 +64,16 @@ pub use backend::{
 pub use caps::{Caps, Features, FormatFeatures, FormatTable, Limits, SampleCounts};
 pub use capture::{Capture, CaptureError, CapturedList};
 pub use command::{Command, CommandList, StagingSlice};
+pub use emulation::{DepthRange, EmulationState, emulation};
 pub use error::{RenderError, UnknownFlags};
+pub use fallback::{Conversion, HostFormat, features_for_usage, host_format};
 pub use format::PixelFormat;
 pub use frame::{Frame, FramePixels, FrameSink};
 pub use id::{
     BufferId, FenceValue, PipelineId, ReadbackId, ResourceId, SamplerId, ShaderId, TextureId,
     ViewId,
 };
-pub use pipeline::{ComputePipelineDesc, GraphicsPipelineDesc};
+pub use pipeline::{ComputePipelineDesc, EmulationFlags, GraphicsPipelineDesc};
 pub use recording::{FrameDump, RecordingBackend};
 pub use resource::{BufferDesc, BufferUsage, SamplerDesc, TextureDesc, TextureUsage, ViewDesc};
 pub use shader::{ResourceBinding, ShaderDesc, ShaderInterface, ShaderSource, ShaderStage};

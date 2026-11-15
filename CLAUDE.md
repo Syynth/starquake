@@ -229,6 +229,10 @@ Platform-specific code must still compile (or be `cfg`-gated) on Linux; check wi
 Code may be ported from GPL projects (Eden, oboromi, rapid-arm-emu) with attribution in the file
 header; MIT sources (Mesa) likewise. Don't use leaked or NDA material.
 
+The project's licence text is `LICENSE` (GPL-3.0). Every other licence that ported code carries
+has its text in `LICENSES/`, listed in `LICENSES/README.md`; a port under a licence not yet there
+adds its text in the same change.
+
 - **libnx is ISC** (permissive): code may be ported, and the notice in the reference folder's
   `libnx/LICENSE.md` (its copyright line and permission text) goes in the header of the file that
   holds the port. The source files themselves carry only `@copyright libnx Authors`.
