@@ -1,11 +1,13 @@
 //! Repository automation. `cargo xtask ci` is the gate: CI runs exactly this, and so should
-//! every agent before saying a change is done.
+//! every agent before saying a change is done. `cargo xtask gen-classes` regenerates the GPU
+//! register tables from the reference folder's class headers ([`gen_classes`]).
 
 #![expect(
     clippy::print_stderr,
     reason = "a command-line tool: progress and errors go to stderr"
 )]
 
+mod gen_classes;
 mod host_access;
 mod table_deps;
 mod tools;
@@ -21,13 +23,19 @@ const OFFLINE_VARIABLE: &str = "STARQUAKE_OFFLINE";
 
 const USAGE: &str = "usage: cargo xtask ci [--offline]\n\
     \x20 --offline  skip the one network-dependent check (cargo-deny's advisory database); the same \
-    as setting STARQUAKE_OFFLINE to anything but empty or 0. CI refuses it.";
+    as setting STARQUAKE_OFFLINE to anything but empty or 0. CI refuses it.\n\
+    usage: cargo xtask gen-classes [--check]\n\
+    \x20 regenerate crates/gpu/src/classes/ from the reference folder's class headers; --check \
+    only compares the committed files with a fresh generation.";
 
 /// A command line the tool understands.
 #[derive(Debug, PartialEq, Eq)]
 enum Task {
     /// Run the gate; `offline` skips the advisory check.
     Ci { offline: bool },
+    /// Regenerate the GPU class tables, or with `check` only compare them with the committed
+    /// files.
+    GenClasses { check: bool },
 }
 
 /// Why a command line was not understood.
@@ -54,8 +62,20 @@ fn parse_args<I: IntoIterator<Item = String>>(
     offline_env: bool,
 ) -> Result<Task, UsageError> {
     let mut args = args.into_iter();
-    if args.next().as_deref() != Some("ci") {
-        return Err(UsageError::Command);
+    match args.next().as_deref() {
+        Some("ci") => {}
+        Some("gen-classes") => {
+            let mut check = false;
+            for arg in args {
+                if arg == "--check" {
+                    check = true;
+                } else {
+                    return Err(UsageError::Argument(arg));
+                }
+            }
+            return Ok(Task::GenClasses { check });
+        }
+        _ => return Err(UsageError::Command),
     }
     let mut offline = offline_env;
     for arg in args {
@@ -125,6 +145,7 @@ fn main() -> ExitCode {
     let offline_env = offline_from_env(std::env::var(OFFLINE_VARIABLE).ok().as_deref());
     match parse_args(std::env::args().skip(1), offline_env) {
         Ok(Task::Ci { offline }) => ci(offline),
+        Ok(Task::GenClasses { check }) => gen_classes_command(check),
         Err(error) => {
             eprintln!("{error}\n{USAGE}");
             ExitCode::FAILURE
@@ -203,6 +224,9 @@ enum Action {
     HostAccess,
     /// Run `cargo machete` and compare its findings with `xtask/unused-deps.toml`.
     Machete,
+    /// Fail if the committed GPU class tables differ from a fresh generation; skipped when the
+    /// reference folder has no class headers (`gen_classes`).
+    Classes,
 }
 
 /// One gate step: a display name and what it does.
@@ -301,6 +325,10 @@ fn steps(plan: Plan) -> Vec<Step> {
         Step {
             name: "host-access",
             action: Action::HostAccess,
+        },
+        Step {
+            name: "classes",
+            action: Action::Classes,
         },
     ];
     if plan.machete {
@@ -571,6 +599,97 @@ fn host_access() -> bool {
     violations.is_empty()
 }
 
+/// Regenerates the class tables in memory from `headers` and compares them with the committed
+/// files below `root`. Returns whether they match.
+fn compare_classes(root: &Path, headers: &Path) -> bool {
+    let generated = match gen_classes::generate_from(headers) {
+        Ok(generated) => generated,
+        Err(error) => {
+            eprintln!("{error}");
+            return false;
+        }
+    };
+    let committed = match gen_classes::committed(root) {
+        Ok(committed) => committed,
+        Err(error) => {
+            eprintln!("{error}");
+            return false;
+        }
+    };
+    let differences = gen_classes::compare(&generated, &committed);
+    for difference in &differences {
+        eprintln!("{difference}");
+    }
+    differences.is_empty()
+}
+
+/// The gate's `classes` step: compare when the reference folder has the class headers, skip
+/// with a notice when it does not. Returns whether the step passes.
+fn classes() -> bool {
+    let root = Path::new(".");
+    let headers = gen_classes::header_folder(root);
+    let present = headers.as_deref().is_some_and(Path::is_dir);
+    match (gen_classes::gate_check(present), headers) {
+        (gen_classes::GateCheck::Compare, Some(headers)) => compare_classes(root, &headers),
+        _ => {
+            eprintln!(
+                "==> classes: SKIPPED, the reference folder has no class headers ({}; \
+                 tools/fetch-refs.sh fetches them), so the committed tables are not compared \
+                 with a fresh generation",
+                gen_classes::emit::HEADER_FOLDER
+            );
+            true
+        }
+    }
+}
+
+/// `cargo xtask gen-classes [--check]`: needs the class headers, unlike the gate step.
+fn gen_classes_command(check: bool) -> ExitCode {
+    let root = match workspace_root(Path::new(env!("CARGO_MANIFEST_DIR"))) {
+        Ok(root) => root,
+        Err(refusal) => {
+            eprintln!("{refusal}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(headers) = gen_classes::header_folder(&root).filter(|folder| folder.is_dir()) else {
+        eprintln!(
+            "gen-classes: the reference folder has no class headers ({}): run \
+             tools/fetch-refs.sh first",
+            gen_classes::emit::HEADER_FOLDER
+        );
+        return ExitCode::FAILURE;
+    };
+    if check {
+        return if compare_classes(&root, &headers) {
+            eprintln!("gen-classes: the committed tables match a fresh generation");
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
+    let written = gen_classes::generate_from(&headers)
+        .map_err(|error| error.to_string())
+        .and_then(|generated| {
+            gen_classes::write(&root, &generated)
+                .map(|()| generated.len())
+                .map_err(|error| error.to_string())
+        });
+    match written {
+        Ok(count) => {
+            eprintln!(
+                "gen-classes: wrote {count} modules to {}",
+                gen_classes::OUTPUT_FOLDER
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn ci(offline: bool) -> ExitCode {
     let in_ci = std::env::var_os("CI").is_some();
     if let Err(refusal) = start(offline, in_ci) {
@@ -649,6 +768,13 @@ fn ci(offline: bool) -> ExitCode {
             Action::Machete => {
                 eprintln!("==> {name}: cargo machete against xtask/unused-deps.toml");
                 run_machete()
+            }
+            Action::Classes => {
+                eprintln!(
+                    "==> {name}: {} against a fresh generation from the class headers",
+                    gen_classes::OUTPUT_FOLDER
+                );
+                classes()
             }
         };
         if !ok {
@@ -855,6 +981,7 @@ mod tests {
                 "workspace-deps",
                 "table-deps",
                 "host-access",
+                "classes",
                 "machete",
                 "deny",
                 "clippy",
@@ -878,6 +1005,7 @@ mod tests {
                 "workspace-deps",
                 "table-deps",
                 "host-access",
+                "classes",
                 "clippy",
                 "test",
                 "doctest"
@@ -903,6 +1031,7 @@ mod tests {
         assert_eq!(action_of("table-deps"), Some(&Action::TableDependencies));
         assert_eq!(action_of("host-access"), Some(&Action::HostAccess));
         assert_eq!(action_of("machete"), Some(&Action::Machete));
+        assert_eq!(action_of("classes"), Some(&Action::Classes));
     }
 
     #[test]
@@ -980,6 +1109,39 @@ mod tests {
         assert!(!offline_from_env(Some("0")));
         assert!(offline_from_env(Some("1")));
         assert!(offline_from_env(Some("true")));
+    }
+
+    #[test]
+    fn gen_classes_takes_an_optional_check_flag() {
+        assert_eq!(
+            parse(&["gen-classes"], false),
+            Ok(Task::GenClasses { check: false })
+        );
+        assert_eq!(
+            parse(&["gen-classes", "--check"], false),
+            Ok(Task::GenClasses { check: true })
+        );
+        assert_eq!(
+            parse(&["gen-classes", "--check", "--check"], false),
+            Ok(Task::GenClasses { check: true })
+        );
+        // The offline switch belongs to the gate only.
+        assert_eq!(
+            parse(&["gen-classes"], true),
+            Ok(Task::GenClasses { check: false })
+        );
+        assert_eq!(
+            parse(&["gen-classes", "--offline"], false),
+            Err(UsageError::Argument("--offline".to_owned()))
+        );
+        assert_eq!(
+            parse(&["gen-classes", "--check", "extra"], false),
+            Err(UsageError::Argument("extra".to_owned()))
+        );
+        assert_eq!(
+            parse(&["ci", "--check"], false),
+            Err(UsageError::Argument("--check".to_owned()))
+        );
     }
 
     #[test]
