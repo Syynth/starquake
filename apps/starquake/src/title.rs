@@ -35,9 +35,9 @@ pub mod exit {
     pub const UNREADABLE: u8 = 2;
 }
 
-/// The largest `main.npdm` `inspect` reads: 1 MiB. A starquake limit; an NPDM is a few
-/// kilobytes.
-pub const NPDM_READ_LIMIT: u64 = 1 << 20;
+/// The largest `main.npdm` `inspect` reads: the same limit as a run's
+/// (`starquake_core::title::NPDM_READ_LIMIT`, 1 MiB).
+pub const NPDM_READ_LIMIT: u64 = starquake_core::title::NPDM_READ_LIMIT;
 /// The largest `ExeFS` module `inspect` reads whole to parse its header and segments: 1 GiB.
 /// A starquake limit, so a corrupt size cannot make it allocate more.
 pub const NSO_READ_LIMIT: u64 = 1 << 30;

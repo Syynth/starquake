@@ -32,3 +32,5 @@ starquake-cpu = { workspace = true, features = ["test-support"] }
 starquake-kernel = { workspace = true, features = ["test-support"] }
 starquake-testkit.workspace = true
 insta.workspace = true
+# Builds the synthetic NUP titles that the `title` module's tests load.
+starquake-loader = { workspace = true, features = ["test-support"] }
