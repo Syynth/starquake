@@ -6,9 +6,11 @@
 //!
 //! This is slice 1 of the spec's port slices, the walking skeleton: [`decode`] reads six forms
 //! (`MOV`, `FFMA`, `ALD`, `AST`, `EXIT`, `S2R`), [`translate`] turns straight-line programs of
-//! them into the minimal [`ir`], and [`lower`] builds and validates the naga module and its
-//! [`host`] tables. [`program::translate_program`] runs the whole chain on program bytes. The
-//! `asm` module (feature `test-support`) is the test assembler that builds instruction words.
+//! them into the [`ir`], and [`lower`] builds and validates the naga module and its [`host`]
+//! tables. [`program::translate_program`] runs the whole chain on program bytes. The `asm`
+//! module (feature `test-support`) is the test assembler that builds instruction words. The
+//! [`ir`] is slice 5's IR core: Eden's operation set in arenas, with a builder, a text form that
+//! prints and parses, and a verifier.
 //!
 //! Experiment E1, run before this slice, lives in `lower`'s tests and its results in the spec.
 

@@ -1,0 +1,270 @@
+Module {
+    types: {
+        [0]: Type {
+            name: None,
+            inner: Scalar(
+                Scalar {
+                    kind: Uint,
+                    width: 4,
+                },
+            ),
+        },
+        [1]: Type {
+            name: None,
+            inner: Vector {
+                size: Quad,
+                scalar: Scalar {
+                    kind: Float,
+                    width: 4,
+                },
+            },
+        },
+        [2]: Type {
+            name: Some(
+                "Output",
+            ),
+            inner: Struct {
+                members: [
+                    StructMember {
+                        name: Some(
+                            "position",
+                        ),
+                        ty: [1],
+                        binding: Some(
+                            BuiltIn(
+                                Position {
+                                    invariant: false,
+                                },
+                            ),
+                        ),
+                        offset: 0,
+                    },
+                    StructMember {
+                        name: Some(
+                            "out30",
+                        ),
+                        ty: [1],
+                        binding: Some(
+                            Location {
+                                location: 30,
+                                interpolation: Some(
+                                    Perspective,
+                                ),
+                                sampling: Some(
+                                    Center,
+                                ),
+                                blend_src: None,
+                                per_primitive: false,
+                            },
+                        ),
+                        offset: 16,
+                    },
+                ],
+                span: 32,
+            },
+        },
+    },
+    special_types: SpecialTypes {
+        ray_desc: None,
+        ray_intersection: None,
+        ray_vertex_return: None,
+        external_texture_params: None,
+        external_texture_transfer_function: None,
+        predeclared_types: {},
+    },
+    constants: {},
+    overrides: {},
+    global_variables: {},
+    global_expressions: {},
+    functions: {},
+    entry_points: [
+        EntryPoint {
+            name: "main",
+            stage: Vertex,
+            early_depth_test: None,
+            workgroup_size: [
+                0,
+                0,
+                0,
+            ],
+            workgroup_size_overrides: None,
+            function: Function {
+                name: Some(
+                    "main",
+                ),
+                arguments: [
+                    FunctionArgument {
+                        name: Some(
+                            "in30",
+                        ),
+                        ty: [1],
+                        binding: Some(
+                            Location {
+                                location: 30,
+                                interpolation: None,
+                                sampling: None,
+                                blend_src: None,
+                                per_primitive: false,
+                            },
+                        ),
+                    },
+                ],
+                result: Some(
+                    FunctionResult {
+                        ty: [2],
+                        binding: None,
+                    },
+                ),
+                local_variables: {
+                    [0]: LocalVariable {
+                        name: Some(
+                            "out",
+                        ),
+                        ty: [2],
+                        init: None,
+                    },
+                    [1]: LocalVariable {
+                        name: Some(
+                            "r0",
+                        ),
+                        ty: [0],
+                        init: None,
+                    },
+                },
+                expressions: {
+                    [0]: FunctionArgument(
+                        0,
+                    ),
+                    [1]: AccessIndex {
+                        base: [0],
+                        index: 3,
+                    },
+                    [2]: As {
+                        expr: [1],
+                        kind: Uint,
+                        convert: None,
+                    },
+                    [3]: LocalVariable(
+                        [1],
+                    ),
+                    [4]: LocalVariable(
+                        [1],
+                    ),
+                    [5]: Load {
+                        pointer: [4],
+                    },
+                    [6]: As {
+                        expr: [5],
+                        kind: Float,
+                        convert: None,
+                    },
+                    [7]: LocalVariable(
+                        [0],
+                    ),
+                    [8]: AccessIndex {
+                        base: [7],
+                        index: 1,
+                    },
+                    [9]: AccessIndex {
+                        base: [8],
+                        index: 3,
+                    },
+                    [10]: LocalVariable(
+                        [0],
+                    ),
+                    [11]: Load {
+                        pointer: [10],
+                    },
+                },
+                named_expressions: {},
+                body: Block {
+                    body: [
+                        Emit(
+                            [1..2],
+                        ),
+                        Emit(
+                            [2..3],
+                        ),
+                        Store {
+                            pointer: [3],
+                            value: [2],
+                        },
+                        Emit(
+                            [5..6],
+                        ),
+                        Emit(
+                            [6..7],
+                        ),
+                        Emit(
+                            [8..9],
+                        ),
+                        Emit(
+                            [9..10],
+                        ),
+                        Store {
+                            pointer: [9],
+                            value: [6],
+                        },
+                        Emit(
+                            [11..12],
+                        ),
+                        Return {
+                            value: Some(
+                                [11],
+                            ),
+                        },
+                    ],
+                    span_info: [
+                        Span {
+                            start: 0,
+                            end: 0,
+                        },
+                        Span {
+                            start: 0,
+                            end: 0,
+                        },
+                        Span {
+                            start: 0,
+                            end: 0,
+                        },
+                        Span {
+                            start: 0,
+                            end: 0,
+                        },
+                        Span {
+                            start: 0,
+                            end: 0,
+                        },
+                        Span {
+                            start: 0,
+                            end: 0,
+                        },
+                        Span {
+                            start: 0,
+                            end: 0,
+                        },
+                        Span {
+                            start: 0,
+                            end: 0,
+                        },
+                        Span {
+                            start: 0,
+                            end: 0,
+                        },
+                        Span {
+                            start: 0,
+                            end: 0,
+                        },
+                    ],
+                },
+                diagnostic_filter_leaf: None,
+            },
+            mesh_info: None,
+            task_payload: None,
+            incoming_ray_payload: None,
+        },
+    ],
+    diagnostic_filters: {},
+    diagnostic_filter_leaf: None,
+    doc_comments: None,
+}

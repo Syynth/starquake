@@ -111,36 +111,33 @@ fn vertex_program_golden_ir() {
     assert_eq!(
         ir.to_string(),
         "block0:\n\
-         \x20   %0: f32 = get_attribute a0x80\n\
-         \x20   %1: u32 = bitcast_u32 %0\n\
-         \x20   set_reg r0, %1\n\
-         \x20   %3: f32 = get_attribute a0x84\n\
-         \x20   %4: u32 = bitcast_u32 %3\n\
-         \x20   set_reg r1, %4\n\
-         \x20   %6: u32 = get_reg r0\n\
-         \x20   %7: f32 = bitcast_f32 %6\n\
-         \x20   %8: u32 = imm32 0x3f000000\n\
-         \x20   %9: f32 = bitcast_f32 %8\n\
-         \x20   %10: u32 = get_reg r1\n\
-         \x20   %11: f32 = bitcast_f32 %10\n\
-         \x20   %12: f32 = fabs %11\n\
-         \x20   %13: f32 = fneg %12\n\
-         \x20   %14: f32 = ffma.rz.ftz %7, %9, %13\n\
-         \x20   %15: f32 = fsaturate %14\n\
-         \x20   %16: u32 = bitcast_u32 %15\n\
-         \x20   set_reg r2, %16\n\
-         \x20   %18: u32 = imm32 0x0\n\
-         \x20   set_reg r3, %18\n\
-         \x20   %20: u32 = imm32 0x7\n\
-         \x20   %21: u32 = get_reg r2\n\
-         \x20   %22: f32 = bitcast_f32 %21\n\
-         \x20   set_attribute a0x70, %22\n\
-         \x20   %24: u32 = get_reg r3\n\
-         \x20   %25: f32 = bitcast_f32 %24\n\
-         \x20   set_attribute a0x74, %25\n\
-         \x20   %27: u32 = imm32 0x0\n\
-         \x20   %28: f32 = bitcast_f32 %27\n\
-         \x20   set_attribute a0x78, %28\n"
+         \x20   %0: f32 = GetAttribute a0x80, u32 0x0\n\
+         \x20   %1: u32 = BitCastU32F32 %0\n\
+         \x20   %2 = SetRegister r0, %1\n\
+         \x20   %3: f32 = GetAttribute a0x84, u32 0x0\n\
+         \x20   %4: u32 = BitCastU32F32 %3\n\
+         \x20   %5 = SetRegister r1, %4\n\
+         \x20   %6: u32 = GetRegister r0\n\
+         \x20   %7: f32 = BitCastF32U32 %6\n\
+         \x20   %8: f32 = BitCastF32U32 u32 0x3f000000\n\
+         \x20   %9: u32 = GetRegister r1\n\
+         \x20   %10: f32 = BitCastF32U32 %9\n\
+         \x20   %11: f32 = FPAbs32 %10\n\
+         \x20   %12: f32 = FPNeg32 %11\n\
+         \x20   %13: f32 = FPFma32 %7, %8, %12 {no_contraction, rz, ftz}\n\
+         \x20   %14: f32 = FPSaturate32 %13\n\
+         \x20   %15: u32 = BitCastU32F32 %14\n\
+         \x20   %16 = SetRegister r2, %15\n\
+         \x20   %17 = SetRegister r3, u32 0x0\n\
+         \x20   %18: u32 = GetRegister r2\n\
+         \x20   %19: f32 = BitCastF32U32 %18\n\
+         \x20   %20 = SetAttribute a0x70, %19, u32 0x0\n\
+         \x20   %21: u32 = GetRegister r3\n\
+         \x20   %22: f32 = BitCastF32U32 %21\n\
+         \x20   %23 = SetAttribute a0x74, %22, u32 0x0\n\
+         \x20   %24: f32 = BitCastF32U32 u32 0x0\n\
+         \x20   %25 = SetAttribute a0x78, %24, u32 0x0\n\
+         \x20   return\n"
     );
 }
 
@@ -156,27 +153,31 @@ fn pixel_exit_reads_colour_registers_in_target_order() {
     assert_eq!(
         ir.to_string(),
         "block0:\n\
-         \x20   %0: u32 = get_reg r1\n\
-         \x20   %1: f32 = bitcast_f32 %0\n\
-         \x20   set_frag_color 0.1, %1\n\
-         \x20   %3: u32 = get_reg r3\n\
-         \x20   %4: f32 = bitcast_f32 %3\n\
-         \x20   set_frag_color 0.3, %4\n\
-         \x20   %6: u32 = get_reg r4\n\
-         \x20   %7: f32 = bitcast_f32 %6\n\
-         \x20   set_frag_color 2.0, %7\n"
+         \x20   %0: u32 = GetRegister r1\n\
+         \x20   %1: f32 = BitCastF32U32 %0\n\
+         \x20   %2 = SetFragColor u32 0x0, u32 0x1, %1\n\
+         \x20   %3: u32 = GetRegister r3\n\
+         \x20   %4: f32 = BitCastF32U32 %3\n\
+         \x20   %5 = SetFragColor u32 0x0, u32 0x3, %4\n\
+         \x20   %6: u32 = GetRegister r4\n\
+         \x20   %7: f32 = BitCastF32U32 %6\n\
+         \x20   %8 = SetFragColor u32 0x2, u32 0x0, %7\n\
+         \x20   return\n"
     );
     // Every component of every target reads r0 to r31.
     let all = translate(pixel([0xf; COLOR_TARGETS]), &[exit()]).expect("translates");
     let last = all.to_string();
-    assert!(last.contains("get_reg r31\n"), "{last}");
-    assert!(last.ends_with("set_frag_color 7.3, %94\n"), "{last}");
+    assert!(last.contains("GetRegister r31\n"), "{last}");
+    assert!(
+        last.ends_with("%95 = SetFragColor u32 0x7, u32 0x3, %94\n    return\n"),
+        "{last}"
+    );
 }
 
 #[test]
 fn a_vertex_exit_writes_nothing() {
     let ir = translate(VERTEX, &[exit()]).expect("translates");
-    assert_eq!(ir.to_string(), "block0:\n");
+    assert_eq!(ir.to_string(), "block0:\n    return\n");
 }
 
 #[test]
@@ -189,7 +190,7 @@ fn s2r_lane_id() {
     .expect("translates");
     assert_eq!(
         ir.to_string(),
-        "block0:\n    %0: u32 = lane_id\n    set_reg r5, %0\n"
+        "block0:\n    %0: u32 = LaneId\n    %1 = SetRegister r5, %0\n    return\n"
     );
     let tid = s2r(SpecialReg::TID_X);
     assert_eq!(
@@ -205,7 +206,7 @@ fn s2r_to_rz_reads_nothing() {
     let s2r = |sr| Instr::new(Op::S2R(OpS2R { dst: Gpr::RZ, sr }));
     for stage in [VERTEX, pixel([0; COLOR_TARGETS])] {
         let ir = translate(stage, &[s2r(SpecialReg::LANE_ID), exit()]).expect("translates");
-        assert_eq!(ir.to_string(), "block0:\n");
+        assert_eq!(ir.to_string(), "block0:\n    return\n");
     }
     let tid = s2r(SpecialReg::TID_X);
     assert_eq!(
@@ -282,6 +283,48 @@ fn ffma_multiply_zero_mode_is_rejected() {
         unsupported(instr, Unsupported::FfmaMultiplyZero)
     );
     assert!(one(Instr::new(Op::FFma(OpFFma { dnz: false, ..op }))).is_ok());
+}
+
+/// `FFMA`'s controls follow PR #4588 (`ops_alu.cpp`, `FFMA`): no contraction, each rounding
+/// field through `RoundingOf`, and `FTZ` or no flushing.
+#[test]
+fn ffma_controls_follow_the_reference() {
+    use crate::ir::{Flags, FmzMode, FpControl, FpRounding, Inst, Opcode};
+    let rounding = [
+        (RoundMode::NearestEven, FpRounding::Rn),
+        (RoundMode::NegInf, FpRounding::Rm),
+        (RoundMode::PosInf, FpRounding::Rp),
+        (RoundMode::Zero, FpRounding::Rz),
+    ];
+    for (rnd, wanted) in rounding {
+        for (ftz, fmz_mode) in [(false, FmzMode::None), (true, FmzMode::Ftz)] {
+            let op = OpFFma {
+                dst: r(0),
+                srcs: [FloatSrc::reg(r(1)); 3],
+                saturate: false,
+                rnd,
+                ftz,
+                dnz: false,
+            };
+            let ir = one(Instr::new(Op::FFma(op))).expect("translates");
+            let flags: Vec<Flags> = ir
+                .listed()
+                .filter_map(|(_, inst)| match inst {
+                    Inst::Op(op) if op.opcode == Opcode::FPFma32 => Some(op.flags),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                flags,
+                [Flags::Fp(FpControl {
+                    no_contraction: true,
+                    rounding: wanted,
+                    fmz_mode,
+                })],
+                "{rnd:?} {ftz}"
+            );
+        }
+    }
 }
 
 #[test]
