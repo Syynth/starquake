@@ -104,16 +104,20 @@ fn require(caps: &Caps, feature: Features, name: &'static str) -> Result<(), Ren
     }
 }
 
+/// Checks that the device has `feature` (one feature) for `format`; the error names it in
+/// [`FormatFeatures::in_words`]' words.
 fn format_supports(
     caps: &Caps,
     format: PixelFormat,
-    needed: FormatFeatures,
-    usage: &'static str,
+    feature: FormatFeatures,
 ) -> Result<(), RenderError> {
-    if caps.formats.get(format).contains(needed) {
+    if caps.formats.get(format).contains(feature) {
         Ok(())
     } else {
-        Err(RenderError::FormatUnsupported { format, usage })
+        Err(RenderError::FormatUnsupported {
+            format,
+            usage: feature.in_words(),
+        })
     }
 }
 
@@ -243,6 +247,16 @@ pub fn validate_texture(caps: &Caps, desc: &TextureDesc) -> Result<(), RenderErr
 /// Texture usages a view's format does not serve: copies go through the texture's own format.
 const COPY_USAGES: TextureUsage = TextureUsage::COPY_SRC.union(TextureUsage::COPY_DST);
 
+/// The format feature each texture usage needs, in the order the checks report them: sampling,
+/// storage, render target, copy. Shared with [`crate::fallback::features_for_usage`].
+pub(crate) const USAGE_FEATURES: [(TextureUsage, FormatFeatures); 5] = [
+    (TextureUsage::SAMPLED, FormatFeatures::SAMPLE),
+    (TextureUsage::STORAGE, FormatFeatures::STORAGE),
+    (TextureUsage::RENDER_TARGET, FormatFeatures::RENDER),
+    (TextureUsage::COPY_SRC, FormatFeatures::COPY),
+    (TextureUsage::COPY_DST, FormatFeatures::COPY),
+];
+
 /// Checks that the device supports `format` for every usage in `usage`, in the order sampling,
 /// storage, render target, copy.
 fn format_supports_usage(
@@ -250,23 +264,9 @@ fn format_supports_usage(
     format: PixelFormat,
     usage: TextureUsage,
 ) -> Result<(), RenderError> {
-    for (flag, feature, name) in [
-        (TextureUsage::SAMPLED, FormatFeatures::SAMPLE, "sampling"),
-        (
-            TextureUsage::STORAGE,
-            FormatFeatures::STORAGE,
-            "storage images",
-        ),
-        (
-            TextureUsage::RENDER_TARGET,
-            FormatFeatures::RENDER,
-            "render targets",
-        ),
-        (TextureUsage::COPY_SRC, FormatFeatures::COPY, "copies"),
-        (TextureUsage::COPY_DST, FormatFeatures::COPY, "copies"),
-    ] {
+    for (flag, feature) in USAGE_FEATURES {
         if usage.contains(flag) {
-            format_supports(caps, format, feature, name)?;
+            format_supports(caps, format, feature)?;
         }
     }
     Ok(())
@@ -526,7 +526,7 @@ pub fn validate_shader(caps: &Caps, desc: &ShaderDesc) -> Result<(), RenderError
     )?;
     for ResourceBinding { kind, .. } in resources {
         if let ResourceKind::StorageTexture { format, .. } = *kind {
-            format_supports(caps, format, FormatFeatures::STORAGE, "storage images")?;
+            format_supports(caps, format, FormatFeatures::STORAGE)?;
         }
     }
     check_resource_counts(caps, resources)?;
@@ -686,9 +686,9 @@ fn check_targets(caps: &Caps, desc: &GraphicsPipelineDesc) -> Result<(), RenderE
                 "a colour target needs a colour format",
             ));
         }
-        format_supports(caps, format, FormatFeatures::RENDER, "render targets")?;
+        format_supports(caps, format, FormatFeatures::RENDER)?;
         if blend.enabled {
-            format_supports(caps, format, FormatFeatures::BLEND, "blending")?;
+            format_supports(caps, format, FormatFeatures::BLEND)?;
             let factors = [
                 blend.color.src,
                 blend.color.dst,
@@ -706,7 +706,7 @@ fn check_targets(caps: &Caps, desc: &GraphicsPipelineDesc) -> Result<(), RenderE
                 "a depth/stencil target needs a depth or stencil format",
             ));
         }
-        format_supports(caps, format, FormatFeatures::RENDER, "render targets")?;
+        format_supports(caps, format, FormatFeatures::RENDER)?;
     }
     Ok(())
 }
