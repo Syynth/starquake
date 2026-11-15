@@ -1074,6 +1074,38 @@ proptest! {
     }
 }
 
+/// Every opcode, with operands and flags from a fixed seed, survives printing and parsing; the
+/// proptest draws opcodes at random and is not guaranteed to reach them all.
+#[test]
+fn every_opcode_round_trips() {
+    let mut generator = Gen(0x5eed_0f0c_0de5_0001);
+    let mut f = Function::new();
+    for (index, &opcode) in Opcode::ALL.iter().enumerate() {
+        let args = opcode
+            .args()
+            .iter()
+            .map(|&ty| generator.operand(ty, index))
+            .collect();
+        let flags = generator.flags(opcode.flags_kind());
+        let id = Value(u32::try_from(index).expect("small"));
+        f.insts.push(Inst::Op(Operation {
+            opcode,
+            args,
+            flags,
+        }));
+        f.blocks[0].insts.push(id);
+    }
+    f.blocks[0].terminator = Terminator::Return;
+    let text = f.to_string();
+    for &opcode in Opcode::ALL {
+        assert!(
+            text.contains(&format!(" = {opcode}")),
+            "{opcode} is printed"
+        );
+    }
+    assert_eq!(Function::parse(&text), Ok(f));
+}
+
 /// The skeleton's translated programs survive the round trip and verify.
 #[test]
 fn translated_programs_round_trip() {
@@ -1185,6 +1217,23 @@ fn instruction_errors_read_as_words() {
                 found: Type::U32,
             },
             "%4 needs argument 1 to be f32, not u32",
+        ),
+        (
+            VerifyError::NameNotImmediate {
+                at: Site::Inst(at),
+                index: 0,
+                wanted: Type::Reg,
+                operand: Value(1),
+            },
+            "%4 needs argument 0 to be an immediate reg, not the value %1",
+        ),
+        (
+            VerifyError::UnresolvedIdentity {
+                at: Site::Terminator(block),
+                operand: Value(1),
+            },
+            "the terminator of block2 uses %1, a chain of Identity operations that loops or ends \
+             without a typed value",
         ),
         (
             VerifyError::ReservedName {

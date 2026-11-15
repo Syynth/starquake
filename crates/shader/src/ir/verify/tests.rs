@@ -230,6 +230,35 @@ fn dominance_is_checked_not_block_order() {
     );
 }
 
+/// An irreducible graph, where one round of the dominator fixpoint is not enough: block2
+/// defines %0 and block1 uses it, but block1 is also reached through block3 (from the entry),
+/// so block2 does not dominate it.
+#[test]
+fn irreducible_dominance() {
+    let text = "block0:\n    branch u1 true, block2, block3\n\
+                block1:\n    %1: u32 = IAdd32 %0, u32 1\n    branch u1 true, block3, block0\n\
+                block2:\n    %0: u32 = LaneId\n    branch u1 true, block1, block4\n\
+                block3:\n    branch u1 true, block3, block1\n\
+                block4:\n    branch u1 true, block4, block3\n";
+    assert_eq!(
+        verify(text),
+        Err(VerifyError::Undefined {
+            at: Site::Inst(v(1)),
+            operand: v(0)
+        })
+    );
+    // Without the path through block3, block2 does dominate block1.
+    let reducible = text.replace(
+        "block0:\n    branch u1 true, block2, block3\n",
+        "block0:\n    jump block2\n",
+    );
+    let reducible = reducible.replace(
+        "block3:\n    branch u1 true, block3, block1\n",
+        "block3:\n    return\n",
+    );
+    assert_eq!(verify(&reducible), Ok(()));
+}
+
 /// A use in a block the entry cannot reach is accepted when its value is listed somewhere; a
 /// value defined only in such a block cannot be used in a reachable one.
 #[test]
@@ -424,6 +453,11 @@ fn phi_checks() {
     assert_eq!(
         verify(&merge("u32 = Phi [block1: %1]")),
         Err(VerifyError::PhiMissingPredecessor { at, block: b(2) })
+    );
+    // Only the lowest-numbered predecessor missing.
+    assert_eq!(
+        verify(&merge("u32 = Phi [block2: u32 0x0]")),
+        Err(VerifyError::PhiMissingPredecessor { at, block: b(1) })
     );
     assert_eq!(
         verify(&merge("u32 = Phi [block1: %1], [block2: %2]")),
@@ -777,5 +811,107 @@ fn phi_checks_run_in_the_documented_order() {
             wanted: Type::U32,
             found: Type::F32
         })
+    );
+}
+
+/// An `Identity` chain that loops (possible only through blocks the entry cannot reach) or ends
+/// without a typed value is its own error, not a type mismatch.
+#[test]
+fn unresolved_identity_chains() {
+    // block1 and block2 are unreachable, so each use is accepted as defined and the cycle
+    // between %0 and %1 is found when %0's argument is typed.
+    let cycle = "block0:\n    return\nblock1:\n    %0: opaque = Identity %1\n    return\n\
+                 block2:\n    %1: opaque = Identity %0\n    return\n";
+    let error = verify(cycle).expect_err("a cycle");
+    assert_eq!(
+        error,
+        VerifyError::UnresolvedIdentity {
+            at: Site::Inst(v(0)),
+            operand: v(1)
+        }
+    );
+    assert_eq!(
+        error.to_string(),
+        "%0 uses %1, a chain of Identity operations that loops or ends without a typed value"
+    );
+    // A chain that ends at a missing instruction: %1 in block1 is typed before %0's own
+    // argument is checked in block2.
+    assert_eq!(
+        verify(
+            "block0:\n    return\nblock1:\n    %1: u32 = IAdd32 %0, u32 1\n    return\n\
+             block2:\n    %0: opaque = Identity %9\n    return\n"
+        ),
+        Err(VerifyError::UnresolvedIdentity {
+            at: Site::Inst(v(1)),
+            operand: v(0)
+        })
+    );
+    // A chain that ends at a typed value is fine.
+    assert_eq!(
+        verify(
+            "block0:\n    return\nblock1:\n    %1: u32 = IAdd32 %0, u32 1\n    return\n\
+             block2:\n    %0: opaque = Identity u32 9\n    return\n"
+        ),
+        Ok(())
+    );
+}
+
+/// A name slot (register, predicate, attribute, patch) takes an immediate name only: a value,
+/// even an `Identity` of a name, would reach past the reserved-name check.
+#[test]
+fn name_slots_take_immediates() {
+    let error = |at, index, wanted, operand| VerifyError::NameNotImmediate {
+        at,
+        index,
+        wanted,
+        operand: v(operand),
+    };
+    let rz = "block0:\n    %0: opaque = Identity rz\n    %1: u32 = GetRegister %0\n    return\n";
+    assert_eq!(verify(rz), Err(error(Site::Inst(v(1)), 0, Type::Reg, 0)));
+    let pt = "block0:\n    %0: opaque = Identity pt\n    %1 = SetPred %0, u1 true\n    return\n";
+    assert_eq!(verify(pt), Err(error(Site::Inst(v(1)), 0, Type::Pred, 0)));
+    // A name that is not reserved is refused too: the rule is about the slot.
+    let r4 = "block0:\n    %0: opaque = Identity r4\n    %1: u32 = GetRegister %0\n    return\n";
+    assert_eq!(verify(r4), Err(error(Site::Inst(v(1)), 0, Type::Reg, 0)));
+    assert_eq!(
+        verify("block0:\n    %1: u32 = GetRegister r4\n    return\n"),
+        Ok(())
+    );
+    // The builder refuses both forms as well.
+    for (name, opcode, data) in [
+        (Imm::Reg(crate::decode::Gpr::RZ), Opcode::GetRegister, None),
+        (
+            Imm::Pred(crate::decode::Pred::PT),
+            Opcode::SetPred,
+            Some(Operand::Imm(Imm::U1(true))),
+        ),
+    ] {
+        let mut f = Function::new();
+        let entry = f.entry();
+        let mut builder = Builder::new(&mut f, entry);
+        let identity = builder
+            .op(Opcode::Identity, &[Operand::Imm(name)])
+            .expect("an opaque slot takes a name");
+        let mut args = vec![Operand::Value(identity)];
+        args.extend(data);
+        assert_eq!(
+            builder.op(opcode, &args),
+            Err(BuildError::Invalid(error(
+                Site::Inst(v(1)),
+                0,
+                name.ty(),
+                identity.index()
+            )))
+        );
+    }
+    assert_eq!(
+        VerifyError::NameNotImmediate {
+            at: Site::Inst(v(4)),
+            index: 1,
+            wanted: Type::Attribute,
+            operand: v(2)
+        }
+        .to_string(),
+        "%4 needs argument 1 to be an immediate attribute, not the value %2"
     );
 }

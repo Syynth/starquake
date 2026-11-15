@@ -647,12 +647,22 @@ fn unlowered_forms_are_refused() {
         ),
         Some("%1: argument 2 is not an immediate the lowering handles".into())
     );
-    // `Identity` is not lowered, and no other operation has a register name as its result, so a
-    // register access always names its register with an immediate.
+    // The verifier refuses a value in a name slot, so a register access always names its
+    // register with an immediate; `Identity` itself is not lowered.
     assert_eq!(
         refused(
             GuestStage::Vertex,
             "block0:\n    %0: opaque = Identity r1\n    %1: u32 = GetRegister %0\n    return\n"
+        ),
+        Some(
+            "the IR is malformed: %1 needs argument 0 to be an immediate reg, not the value %0"
+                .into()
+        )
+    );
+    assert_eq!(
+        refused(
+            GuestStage::Vertex,
+            "block0:\n    %0: opaque = Identity r1\n    return\n"
         ),
         Some("%0: Identity is not lowered yet".into())
     );

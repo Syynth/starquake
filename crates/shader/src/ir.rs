@@ -34,19 +34,50 @@
 //! Where this IR is stricter than Eden, each pinned by a test in `tests`:
 //!
 //! - Reading or writing `RZ`, `URZ`, `PT` or `UPT` through the get and set opcodes is an
-//!   error (`ReservedName`); Eden's emitter never emits a predicate access to `PT`
-//!   (`ir_emitter.cpp`, `GetPred`, `SetPred`) and folds `RZ` in its SSA pass. Pinned by
-//!   `tests::reserved_names_are_refused`.
-//! - Values must be defined in a block that dominates the use, not only earlier in the block
-//!   list (Eden's `ValidateForwardDeclarations`); a phi's incoming values are checked against
-//!   its type, which Eden skips, and in a control-flow graph against the block's predecessors.
-//!   Pinned by `verify::tests::dominance_is_checked_not_block_order` and
-//!   `verify::tests::phi_checks`.
-//! - Eden's use-count check (`ValidateUses`) has no counterpart: this IR keeps no use counts.
+//!   error (`ReservedName`). Eden's emitter never emits a predicate access to `PT`
+//!   (`ir_emitter.cpp`, `GetPred`, `SetPred`), but its Maxwell translators do emit
+//!   `GetRegister RZ` and `SetRegister RZ` (`frontend/maxwell/translate/impl/impl.cpp`,
+//!   `TranslatorVisitor::X`): its SSA pass skips `RZ` accesses (`ir_opt/ssa_rewrite_pass.cpp`,
+//!   `VisitInst`) and its constant propagation replaces `GetRegister RZ` with 0
+//!   (`ir_opt/constant_propagation_pass.cpp`, `FoldGetRegister`). Eden's Maxwell output would
+//!   fail this check. The source this rule follows is PR #4588's `Visitor::X`
+//!   (`eden-pr4588/src/shader_recompiler/frontend/ampere/visitor.cpp`), where a read of `RZ` is
+//!   `Imm32(0)` and a write to `RZ` is dropped. Pinned by `tests::reserved_names_are_refused`.
+//! - A name slot (register, predicate, attribute, patch) takes an immediate name, never a
+//!   value (`NameNotImmediate`); Eden's type check resolves `Identity` (`Value::Type`) and so
+//!   accepts an `Identity` of a name there. Without this, `Identity rz` fed to `GetRegister`
+//!   would pass the reserved-name check. Pinned by `verify::tests::name_slots_take_immediates`.
+//! - In a control-flow graph, values must be defined in a block that dominates the use, not
+//!   only earlier in the block list (Eden's `ValidateForwardDeclarations`); a phi's incoming
+//!   values are checked against its type, which Eden skips, and in a control-flow graph
+//!   against the block's predecessors. Pinned by
+//!   `verify::tests::dominance_is_checked_not_block_order`, `verify::tests::irreducible_dominance`
+//!   and `verify::tests::phi_checks`.
+//! - In a structured function, a value is in scope from its definition to the end of the `if`
+//!   or loop body that holds it, which is stricter than both dominance and Eden's block order:
+//!   in `loop { block1 } repeat %c; block2` the body runs at least once, so block1 dominates
+//!   block2, and Eden's `ValidateForwardDeclarations` accepts a use of a block1 value in block2
+//!   (Eden's SSA pass, which runs after structuring, emits such uses). This verifier reports
+//!   `Undefined`. The reason is naga's block-scoped expressions: a value used outside the body
+//!   that defines it has to be carried out through a local variable, and this rule makes that
+//!   the structurizer's job. Whether real shaders' output needs the looser rule is a guess to
+//!   check against the output of slices 8 (passes) and 11 (structurizer). Pinned by
+//!   `verify::tests::structured_scopes`.
 //! - A structured tree may nest at most [`MAX_NESTING`] levels; Eden has no bound. The bound
 //!   is a starquake choice (a guess at what real shaders need, to be checked against the
 //!   structurizer's output, slice 11) that keeps the verifier's recursion bounded. Pinned by
 //!   `verify::tests::nesting_is_bounded` and `parse::tests::nesting_is_bounded`.
+//!
+//! Where this IR is looser than Eden:
+//!
+//! - In a control-flow graph, a use in a block the entry cannot reach is accepted when its
+//!   value is listed in some block, even later in the block list (as LLVM's verifier does);
+//!   Eden's `ValidateForwardDeclarations` walks blocks in list order and rejects a value listed
+//!   later. Pinned by `verify::tests::unreachable_blocks`.
+//!
+//! Elsewhere:
+//!
+//! - Eden's use-count check (`ValidateUses`) has no counterpart: this IR keeps no use counts.
 //!
 //! Slice 1's minimal IR is replaced: its instructions are the Eden opcodes of the same names
 //! (`Imm32` is now an immediate operand), and the skeleton lowers to the same naga modules

@@ -17,8 +17,10 @@
 //!    function's tree in order, an `if`'s condition before its body and a loop's repeat
 //!    condition after its body. For an operation: (a) every value argument is defined where it
 //!    is used, in argument order; (b) the argument count; (c) the flags' kind, then their
-//!    ranges; (d) each argument, in order, has a result of the type its slot needs; (e) a
-//!    register or predicate name is not one the operation cannot access. For a phi: (a) no
+//!    ranges; (d) each argument, in order: a value has a result, is not in a name slot
+//!    (register, predicate, attribute, patch: those take immediates), and its `Identity` chain
+//!    resolves to a type; then the type is the one its slot needs; (e) a register or predicate
+//!    name is not one the operation cannot access. For a phi: (a) no
 //!    operation comes before it in its block; (b) its type is a value type; (c) each incoming
 //!    pair, in order: the block exists and is not repeated, in a control-flow graph the block is
 //!    a predecessor, and the value is defined (dominating the predecessor in a control-flow
@@ -151,6 +153,29 @@ pub enum VerifyError {
         wanted: Type,
         /// The type it has.
         found: Type,
+    },
+    /// A name slot (register, predicate, attribute or patch) holds a value, not an immediate.
+    #[error("{at} needs argument {index} to be an immediate {wanted}, not the value {operand}")]
+    NameNotImmediate {
+        /// Where.
+        at: Site,
+        /// The argument's index.
+        index: usize,
+        /// The name type the slot needs.
+        wanted: Type,
+        /// The value.
+        operand: Value,
+    },
+    /// A value's chain of `Identity` operations loops, or ends at an `Identity` with no
+    /// argument or at an id with no instruction, so it has no type.
+    #[error(
+        "{at} uses {operand}, a chain of Identity operations that loops or ends without a typed value"
+    )]
+    UnresolvedIdentity {
+        /// Where.
+        at: Site,
+        /// The value.
+        operand: Value,
     },
     /// A get or set operation names `RZ`, `URZ`, `PT` or `UPT`.
     #[error("{at}: {opcode} cannot access {name}")]
@@ -318,8 +343,9 @@ fn place_nodes(
     Ok(())
 }
 
-/// Checks an operand against the type its slot needs: the value exists, has a result, and its
-/// type fits (steps 4d and the condition checks; definedness is checked by the caller).
+/// Checks an operand against the type its slot needs: the value exists, has a result, is not
+/// in a name slot, and its type resolves and fits (steps 4d and the condition checks;
+/// definedness is checked by the caller).
 fn check_operand(
     function: &Function,
     at: Site,
@@ -335,13 +361,21 @@ fn check_operand(
             }
             Some(_) => {}
         }
+        if wanted.is_name() {
+            return Err(VerifyError::NameNotImmediate {
+                at,
+                index,
+                wanted,
+                operand: value,
+            });
+        }
     }
-    let found = function.type_of(operand).ok_or(VerifyError::Type {
-        at,
-        index,
-        wanted,
-        found: Type::Opaque,
-    })?;
+    let found = match operand {
+        Operand::Imm(imm) => imm.ty(),
+        Operand::Value(value) => function
+            .type_of(operand)
+            .ok_or(VerifyError::UnresolvedIdentity { at, operand: value })?,
+    };
     if wanted.accepts(found) {
         Ok(())
     } else {
@@ -395,7 +429,13 @@ pub(super) fn check_operation(
 }
 
 /// The name a get or set operation must not access: `RZ` and `URZ` read zero and `PT` and `UPT`
-/// read true, which the translators fold into immediates instead.
+/// read true, which starquake's translators fold into immediates instead, as PR #4588's
+/// `Visitor::X` does for `RZ` (`eden-pr4588/src/shader_recompiler/frontend/ampere/visitor.cpp`:
+/// a read of register 255 or above is `Imm32(0)` and a write to it is dropped). Eden's Maxwell
+/// translators do emit `GetRegister RZ` and `SetRegister RZ`
+/// (`frontend/maxwell/translate/impl/impl.cpp`, `TranslatorVisitor::X`), so Eden's Maxwell
+/// output would fail this check. Only an immediate first argument is inspected: step 4d has
+/// already refused a value in a name slot, so no other form reaches an accessor.
 fn reserved_name(op: &Operation) -> Option<Imm> {
     let accessor = matches!(
         op.opcode,

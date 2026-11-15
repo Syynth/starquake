@@ -154,11 +154,15 @@ impl Type {
     /// the name types (registers, predicates, attributes, patches), which only immediates have.
     /// A phi's type must be one of these.
     pub const fn is_value(self) -> bool {
-        !matches!(
+        !matches!(self, Self::Void | Self::Opaque) && !self.is_name()
+    }
+
+    /// Whether this is a name type (registers, predicates, attributes, patches): a slot of
+    /// this type takes an immediate name, never a value.
+    pub const fn is_name(self) -> bool {
+        matches!(
             self,
-            Self::Void
-                | Self::Opaque
-                | Self::Reg
+            Self::Reg
                 | Self::Pred
                 | Self::UniformReg
                 | Self::UniformPred
