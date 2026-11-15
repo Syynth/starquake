@@ -30,14 +30,16 @@
 //! Slice R3 adds the CPU ASTC decoder, in [`astc`]: ASTC blocks to RGBA8, for hosts whose GPU
 //! has no native ASTC and as the oracle for the GPU decoder.
 //!
+//! Slice R4 adds the backend's own helper shaders, in [`host_shaders`]: the WGSL sources of the
+//! present blit and the clears, with the entry points, bindings and parameter layouts a backend
+//! uses them by.
+//!
 //! Slice R9 (its first part) adds frame dumps, in [`frame`]: a present with `dump` set hands a
 //! [`Frame`] to the [`FrameSink`] installed on the backend, and a frame encodes itself as a
 //! PNG. This crate still does no file I/O.
 //!
 //! Slice R11 (its first part) adds host-level captures, in [`capture`]: the submitted lists
 //! and their staging bytes as a versioned file's bytes, and their replay on a backend.
-//!
-//! A later slice adds the host shaders (R4).
 
 pub mod astc;
 pub mod backend;
@@ -50,6 +52,7 @@ pub mod fallback;
 mod flags;
 pub mod format;
 pub mod frame;
+pub mod host_shaders;
 pub mod id;
 pub mod pipeline;
 pub mod recording;
@@ -69,6 +72,7 @@ pub use error::{RenderError, UnknownFlags};
 pub use fallback::{Conversion, HostFormat, features_for_usage, host_format};
 pub use format::PixelFormat;
 pub use frame::{Frame, FramePixels, FrameSink};
+pub use host_shaders::HostShader;
 pub use id::{
     BufferId, FenceValue, PipelineId, ReadbackId, ResourceId, SamplerId, ShaderId, TextureId,
     ViewId,
