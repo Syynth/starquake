@@ -217,8 +217,10 @@ fn every_service_has_its_name_and_no_other_number_has_one() {
     assert_eq!(service_name(SM), Some("sm:"));
     assert_eq!(service_name(SET_SYS), Some("set:sys"));
     assert_eq!(service_name(FSP_SRV), Some("fsp-srv"));
+    assert_eq!(service_name(APM), Some("apm"));
+    assert_eq!(service_name(APPLET_OE), Some("appletOE"));
     assert_eq!(service_name(ServiceId(0)), None);
-    assert_eq!(service_name(ServiceId(4)), None);
+    assert_eq!(service_name(ServiceId(6)), None);
 }
 
 #[test]
@@ -474,4 +476,117 @@ fn a_run_without_an_sd_card_folder_has_no_sd_card() {
     let (word, _, objects) = domain_reply(&buffer, 0);
     let no_device = fsp::result::PORT_SD_CARD_NO_DEVICE.raw();
     assert_eq!((word, objects.len()), (no_device, 0));
+}
+
+/// `apm` as libnx starts it (`_apmInitialize`): `OpenSession` hands out a session handle.
+#[test]
+fn apm_hands_out_a_session() {
+    let rig = Rig::new();
+    let apm_session = rig.service(apm::NAME);
+    let open_session = command(&apm::Apm, "open_session");
+    let (code, buffer) = rig.send(apm_session, &libnx(open_session));
+    let (word, _, moved) = reply(&buffer, 0);
+    assert_eq!((code, word, moved.len()), (ResultCode::SUCCESS, 0, 1));
+    assert_eq!(rig.ipc().last(), Some(&(APM, open_session)));
+}
+
+/// `OpenApplicationProxy` as libnx sends it (`_appletGetSessionProxy`), with `process` copied.
+fn open_proxy(root: u32, process: Handle) -> RequestBuilder {
+    domain(
+        root,
+        &am::IApplicationProxyService,
+        "open_application_proxy",
+    )
+    .send_pid(0)
+    .copy_handle(process.raw())
+    .data(&0_u64.to_le_bytes())
+}
+
+/// Waits on `handle` with a zero timeout: the result says whether it was signalled.
+fn poll(rig: &Rig, handle: Handle) -> ResultCode {
+    rig.memory.write(PATH, &handle.raw().to_le_bytes()).unwrap();
+    let mut regs = GuestRegs {
+        tpidrro: TLS,
+        ..GuestRegs::default()
+    };
+    // `svcWaitSynchronization(&index, handles, count, timeout)`.
+    regs.x[1] = PATH;
+    regs.x[2] = 1;
+    regs.x[3] = 0;
+    let mut debug = NoDebug;
+    let mut caller = Caller {
+        core: 0,
+        thread: THREAD,
+        env: &*rig.env,
+        memory: &rig.memory,
+        debug: &mut debug,
+        recorder: &rig.recorder,
+    };
+    let number = SvcId::WaitSynchronization.number();
+    let record = rig.dispatcher.dispatch(number, &mut regs, &mut caller);
+    assert_eq!(record.outcome, Outcome::Completed);
+    result(&regs)
+}
+
+/// `appletOE` as libnx starts it (`_appletInitialize`) through the real dispatcher: the proxy,
+/// the two events it returns, which are real kernel events (the message event signalled, the
+/// suspended-tick event not), and values the console reports.
+#[test]
+fn applet_oe_serves_the_start_up_with_real_events() {
+    let rig = Rig::new();
+    let oe = rig.service(am::OE_NAME);
+    let root = rig.convert(oe);
+
+    // libnx copies the current-process pseudo-handle, which the kernel does not resolve for IPC
+    // yet (`starquake_kernel::ipc::message`, divergences): the request never reaches the
+    // service.
+    let (code, _) = rig.send(oe, &open_proxy(root, Handle::CURRENT_PROCESS));
+    assert_eq!(code, KernelError::InvalidHandle.code());
+
+    // Any handle the caller holds stands in for the process: the service does not use it.
+    let (code, buffer) = rig.send(oe, &open_proxy(root, oe));
+    let (word, _, objects) = domain_reply(&buffer, 0);
+    assert_eq!((code, word, objects.len()), (ResultCode::SUCCESS, 0, 1));
+    let proxy_interface = am::IApplicationProxy::default();
+    let open = |name: &str| {
+        let (code, buffer) = rig.send(oe, &domain(objects[0], &proxy_interface, name));
+        let (word, _, opened) = domain_reply(&buffer, 0);
+        assert_eq!(
+            (code, word, opened.len()),
+            (ResultCode::SUCCESS, 0, 1),
+            "{name}"
+        );
+        opened[0]
+    };
+    let getter = open("get_common_state_getter");
+    let controller = open("get_self_controller");
+
+    let copied = |object: u32, interface: &dyn Session, name: &str| {
+        let (code, buffer) = rig.send(oe, &domain(object, interface, name));
+        let message = Message::parse_reply_sized(&buffer, SessionKind::Domain, 0).unwrap();
+        assert_eq!(code, ResultCode::SUCCESS, "{name}");
+        Handle::from_raw(message.copy_handles[0])
+    };
+    let tick = copied(
+        controller,
+        &am::ISelfController,
+        "get_accumulated_suspended_tick_changed_event",
+    );
+    let message = copied(getter, &am::ICommonStateGetter, "get_event_handle");
+    assert_eq!(poll(&rig, message), ResultCode::SUCCESS);
+    assert_eq!(poll(&rig, tick), KernelError::TimedOut.code());
+
+    let asked = [
+        ("get_current_focus_state", am::FocusState::InFocus.raw()),
+        ("get_operation_mode", am::OperationMode::Docked.raw()),
+    ];
+    for (name, value) in asked {
+        let (code, buffer) = rig.send(oe, &domain(getter, &am::ICommonStateGetter, name));
+        let (word, data, _) = domain_reply(&buffer, size_of::<u8>());
+        assert_eq!(
+            (code, word, data),
+            (ResultCode::SUCCESS, 0, vec![value]),
+            "{name}"
+        );
+    }
 }
