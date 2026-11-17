@@ -609,3 +609,44 @@ fn a_restore_leaves_a_pending_unmap_a_hole_until_it_is_done() {
         ]
     );
 }
+
+/// Save and restore agree that a destroyed address space is gone: after the golden space (2)
+/// is destroyed while its job waits, the save succeeds without it, the restore has only the
+/// other space, the job still completes, and the next space takes a new id. A snapshot whose
+/// job still names the destroyed space is refused.
+#[test]
+fn a_destroyed_space_is_not_saved_and_not_restored() {
+    let front = Front::default();
+    let mut memory = GpuMemory::restore(&encode(&golden()), &kernel(2), &front).unwrap();
+    let destroyed = AsId(2);
+    let other = memory.create_address_space(&front).unwrap();
+    assert_eq!(other, AsId(3));
+    memory.destroy_address_space(&front, destroyed).unwrap();
+
+    let bytes = memory.save().unwrap();
+    let front = Front::default();
+    let mut restored = GpuMemory::restore(&bytes, &kernel(2), &front).unwrap();
+    assert_eq!(restored.address_spaces().collect::<Vec<_>>(), [other]);
+    assert!(restored.table(destroyed).is_none());
+    assert_eq!(
+        front.0.lock().unwrap().as_slice(),
+        ["create 3".to_owned(), "barrier 9".to_owned()]
+    );
+    let finished = restored.ordered_done(Ticket(9)).unwrap();
+    assert_eq!(finished.event, object(0x11, 0x12));
+    assert_eq!(
+        finished.releases,
+        [device_share_token(process(), 4 * PAGE, 3 * PAGE)]
+    );
+    assert_eq!(restored.create_address_space(&front), Ok(AsId(4)));
+
+    // The same snapshot with the job's range naming the destroyed space again.
+    let (_, body) = postcard::take_from_bytes::<Header>(&bytes).unwrap();
+    let mut state: State = postcard::from_bytes(body).unwrap();
+    assert_eq!(state.pending[0].reveal, []);
+    state.pending[0].reveal.push((destroyed.0, W, PAGE));
+    assert_eq!(
+        GpuMemory::restore(&encode(&state), &kernel(2), &Front::default()),
+        Err(dangling(Part::Job))
+    );
+}

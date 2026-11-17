@@ -77,6 +77,27 @@
 //!   the PROVISIONAL list below. Test:
 //!   `pages_that_are_not_one_shared_memory_are_refused_and_change_nothing`.
 //!
+//! # Aliases
+//!
+//! The kernel's [`Mapper::map_alias`], for `MapMemory` (`starquake_kernel::memory::space`'s
+//! `alias` module): [`AddressSpace::map_alias`] maps a range a second time over the same RAM.
+//!
+//! - **Every page of the source gets backing first**, then the alias gets every table entry at
+//!   once, to the source's RAM, with the permission the kernel asks for. A source page with no
+//!   backing yet has none to share, and backing it later would give the two addresses
+//!   different RAM, so it is backed now: a page of RAM handed out as a touch would hand it out
+//!   (zeroed, never handed out twice), with the source's permission. A fault on an alias page
+//!   is then always [`Touch::Refused`], as for shared memory.
+//! - **The alias is read-write, never executable** (the kernel maps it `UserReadWrite`), so a
+//!   host write through it needs no instruction-cache maintenance.
+//! - **Unmapping the alias** is [`Mapper::unmap`], as for any mapping: its table entries go and
+//!   a flush is owed; the RAM stays the source's, with what it holds.
+//! - **A refused alias** changes no mapping and no table entry, and owes no flush. Source
+//!   pages it backed before the refusal keep their backing: a backed page reads zero until it
+//!   is written, as an unbacked one does, so no access can tell. Tests (in
+//!   `space/tests/alias.rs`): `an_alias_is_refused_with_its_checks_in_order_and_maps_nothing`
+//!   and `an_alias_the_tables_refuse_part_way_unmaps_what_it_mapped`.
+//!
 //! PROVISIONAL, and what replaces each part:
 //!
 //! - **Backing is handed out from the start of guest RAM, a page at a time (a run at a time
@@ -91,6 +112,11 @@
 //!   space's RAM. System-wide guest RAM and one record of the shared runs (the execution
 //!   model's backing pools), instead of per-`AddressSpace` ones, replace it, so that any
 //!   process's address space can map any shared memory.
+//! - **An alias backs its whole source at once**, however large: the RAM a guest can force is
+//!   bounded by the source, which the kernel has already counted against the pool, and guest
+//!   RAM refuses what it cannot hold ([`SpaceError::OutOfRam`], checked before anything is
+//!   backed). The backing pools, which can name the RAM a page will get before it is touched,
+//!   replace it with backing on first touch.
 //! - **One page per fault.** A guest that touches a large mapping takes one exit per page.
 //!   Backing a run of pages at once is a measurement away.
 //! - **Host access ignores permissions**, which is what lets the loader write a code page that
@@ -468,6 +494,86 @@ impl<M: GuestMemory> AddressSpace<M> {
         Ok(())
     }
 
+    /// Records that guest code may use `size` bytes at `va` as `perms` allows, and that they
+    /// are the RAM of the `size` bytes at `source` (module docs, "Aliases"): every source page
+    /// is backed, and every alias page gets its table entry to the same RAM at once. Nothing
+    /// may be mapped at `va`.
+    ///
+    /// Checked in this order, and refused with nothing mapped: both ranges ([`MapError`], as
+    /// for [`Self::map`]); then what is mapped: all of the source
+    /// ([`MapError::NotMapped`] at its first address that is not), nothing at `va`
+    /// ([`MapError::AlreadyMapped`]); then the RAM the source's unbacked pages need
+    /// ([`SpaceError::OutOfRam`]); then the tables. A refusal by the tables part-way unmaps the
+    /// alias pages it mapped (the unmap owes a flush, as any does).
+    pub(crate) fn map_alias(
+        &self,
+        va: u64,
+        source: u64,
+        size: u64,
+        perms: Perms,
+    ) -> Result<(), SpaceError> {
+        let end = Self::range_end(va, size)?;
+        let source_end = Self::range_end(source, size)?;
+        let mut shadow = self.shadow();
+        if let Some(unmapped) = shadow.first_unmapped(source, source_end) {
+            return Err(MapError::NotMapped { va: unmapped }.into());
+        }
+        if let Some(taken) = shadow.first_mapped(va, end) {
+            return Err(MapError::AlreadyMapped { va: taken }.into());
+        }
+        // Back every source page, after checking guest RAM has room for all of them.
+        let unbacked: Vec<u64> = (source..source_end)
+            .step_by(PAGE_STEP)
+            .filter(|page| !shadow.backed.contains_key(page))
+            .collect();
+        let needed = u64::try_from(unbacked.len())
+            .ok()
+            .and_then(|pages| pages.checked_mul(PAGE_SIZE))
+            .unwrap_or(u64::MAX);
+        let available = self.ram.end().saturating_sub(shadow.next);
+        if available < needed {
+            return Err(SpaceError::OutOfRam {
+                size: needed,
+                available,
+            });
+        }
+        for page in unbacked {
+            let page_perms = shadow
+                .mapping(page)
+                .map(|(_, mapped)| mapped.perms)
+                .ok_or(MapError::NotMapped { va: page })?;
+            self.back(&mut shadow, page, page_perms)?;
+        }
+        // Map each alias page to its source page's RAM.
+        let mut aliased: Vec<(u64, u64)> = Vec::new();
+        for (alias, from) in (va..end)
+            .step_by(PAGE_STEP)
+            .zip((source..source_end).step_by(PAGE_STEP))
+        {
+            let pa = *shadow
+                .backed
+                .get(&from)
+                .ok_or(MapError::NotMapped { va: from })?;
+            let mapped = BackingRange::new(pa, PAGE_SIZE)
+                .map_err(SpaceError::from)
+                .and_then(|ram| Ok(self.tables.map(alias, ram, perms)?));
+            if let Err(error) = mapped {
+                for (done, _) in &aliased {
+                    // The page was mapped a moment ago; an unmap that fails leaves it to the
+                    // error already being returned.
+                    if let Err(undo) = self.tables.unmap(*done, PAGE_SIZE) {
+                        tracing::error!(%undo, page = done, "an alias page could not be unmapped");
+                    }
+                }
+                return Err(error);
+            }
+            aliased.push((alias, pa));
+        }
+        shadow.mapped.insert(va, Mapped { end, perms });
+        shadow.backed.extend(aliased);
+        Ok(())
+    }
+
     /// Decides what a guest access that faulted at `address` comes to (see [`Touch`]), and
     /// backs the page when that is all the access was missing.
     pub(crate) fn touch(&self, address: u64, access: Access) -> Touch {
@@ -617,6 +723,18 @@ impl<M: GuestMemory + 'static> Mapper for SpaceMapper<M> {
         perms: Perms,
     ) -> Result<(), MapperError> {
         self.0.map_shared(address, backing, perms).map_err(refused)
+    }
+
+    fn map_alias(
+        &mut self,
+        address: u64,
+        source: u64,
+        size: u64,
+        perms: Perms,
+    ) -> Result<(), MapperError> {
+        self.0
+            .map_alias(address, source, size, perms)
+            .map_err(refused)
     }
 }
 

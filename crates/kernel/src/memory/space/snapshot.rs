@@ -158,6 +158,19 @@
 //!   is saved, and other memory may have the `Stack` state), where the `Normal` and
 //!   `Locked` merge barriers sit, and which merge barrier bits a block has beyond the IPC and
 //!   device ones it checks (an unknown barrier bit restores as it is).
+//! - **`MapMemory` aliases are not saved, and an address space with one is not saved at all.**
+//!   The format has no place for which source page each alias page maps again (the
+//!   `MapMemory` record `memory::space::alias` keeps), and a restore maps every block as fresh
+//!   memory (check 9), which would give an alias pages of its own. So [`AddressSpace::save`]
+//!   refuses an address space with a live alias ([`SnapshotError::Aliased`]) rather than write
+//!   one that restores wrong. A restored address space has no alias, and so no snapshot restores
+//!   an aliased pair. The shapes an alias leaves in the blocks are not checked: a snapshot whose
+//!   blocks look like one (`Normal` memory that is `Locked` with no user access, and `Stack`
+//!   memory beside it) restores as those blocks with no alias between them, and `UnmapMemory`
+//!   of them is refused with `InvalidMemoryRegion`, as Eden's page group check refuses pages
+//!   that are not the source's. Saving aliases changes the format, and bumps
+//!   [`ADDRESS_SPACE_VERSION`]. Tests: `an_address_space_with_an_alias_is_not_saved` and
+//!   `a_restored_alias_shape_is_not_an_alias` (in `memory/space/alias_tests.rs`).
 //! - **Not checked here: which permission and attributes each state may carry**, beyond the two
 //!   permission rules of check 4 and the attribute rules above (no unknown bit, no IPC lock,
 //!   `DeviceShared` exactly with a use count). So a restore accepts, for example, `Normal` or
@@ -458,6 +471,17 @@ pub enum SnapshotError {
     /// The checked blocks did not make a block map: a bug in the checks.
     #[error("the address space snapshot's blocks do not make a block map: {0}")]
     BlockMap(BlockMapError),
+    /// The address space has a `MapMemory` alias, which a snapshot does not save yet (module
+    /// docs, "Divergences and what is not checked").
+    #[error(
+        "the address space has {size:#x} bytes at {address:#x} aliased by MapMemory, which a snapshot cannot save yet"
+    )]
+    Aliased {
+        /// Where the first alias starts.
+        address: u64,
+        /// Its size.
+        size: u64,
+    },
 }
 
 /// The creation request as saved.
@@ -1063,8 +1087,14 @@ fn block_ending_at(blocks: &[MemoryBlock], end: u64) -> Option<usize> {
 
 impl AddressSpace {
     /// The address space as a snapshot (module docs, "Format"), after checks 2 to 7 of the
-    /// module docs on what it is about to write: a failure is a bug in the kernel.
+    /// module docs on what it is about to write: a failure is a bug in the kernel. Before them,
+    /// an address space with a live `MapMemory` alias is refused with
+    /// [`SnapshotError::Aliased`], naming the alias with the lowest address: the format has no
+    /// place for one yet (module docs, "Divergences and what is not checked").
     pub fn save(&self) -> Result<Vec<u8>, SnapshotError> {
+        if let Some((address, size)) = self.aliases.first() {
+            return Err(SnapshotError::Aliased { address, size });
+        }
         let body = Body::of(self);
         body.check()?;
         Ok(encode(FORMAT, &body)?)
@@ -1150,6 +1180,7 @@ impl AddressSpace {
                 .map(|lock| ((lock.address, lock.size), lock.count))
                 .collect(),
             mapped_physical_memory_size: body.mapped_physical_memory_size,
+            aliases: super::alias::Aliases::default(),
             mapper,
         })
     }

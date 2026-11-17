@@ -1287,6 +1287,12 @@ impl Translated {
                     address,
                     size,
                     perms,
+                }
+                | MapperCall::MapAlias {
+                    address,
+                    size,
+                    perms,
+                    ..
                 } => self.map(address, size, perms),
                 MapperCall::MapShared {
                     address,

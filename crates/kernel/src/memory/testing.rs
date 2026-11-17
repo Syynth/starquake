@@ -67,6 +67,17 @@ pub enum MapperCall {
         /// What guest code may do there.
         perms: Perms,
     },
+    /// [`Mapper::map_alias`].
+    MapAlias {
+        /// The first address of the alias.
+        address: u64,
+        /// The first address of the pages it maps again.
+        source: u64,
+        /// The size in bytes.
+        size: u64,
+        /// What guest code may do through the alias.
+        perms: Perms,
+    },
 }
 
 #[derive(Debug)]
@@ -282,5 +293,20 @@ impl Mapper for RecordingMapper {
         })?;
         self.0.with(|state| state.shared.insert(address, backing));
         Ok(())
+    }
+
+    fn map_alias(
+        &mut self,
+        address: u64,
+        source: u64,
+        size: u64,
+        perms: Perms,
+    ) -> Result<(), MapperError> {
+        self.record(MapperCall::MapAlias {
+            address,
+            source,
+            size,
+            perms,
+        })
     }
 }

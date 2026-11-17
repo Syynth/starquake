@@ -69,6 +69,48 @@
 //! `a_registration_over_a_pending_unmap_waits_for_the_drain`). That is a **guess** that no GPU
 //! work queued after the request and before the job's event reads those pages. No reference has
 //! the window (NX2 and PR change their tables at once).
+//!
+//! # Destroying an address space
+//!
+//! [`GpuMemory::destroy_address_space`] is what nvhost-as-gpu calls when the last fd holding a
+//! space it made closes (`crate::nvsrv::as_gpu`, "Closing"; PR frees the space's GMMU then:
+//! `eden-pr4588/src/core/hle/service/nvdrv/nvdrv.cpp` @ e5fb3b97, `Module::Close`'s
+//! `open_files.erase(itr)` drops the device, whose `std::shared_ptr<Tegra::MemoryManager> gmmu`
+//! goes with the last reference, `nvhost_as_gpu.h`). gpu 33 has no destroy: its spaces live as
+//! long as the gpu session's state.
+//!
+//! The space goes from the bookkeeping at once, with its 211 mappings, sparse regions and shim,
+//! so its slot of [`MAX_ADDRESS_SPACES`] is free at once. The GPU is sent, through
+//! [`GpuVmFront::update_vm`] with no ticket and in address order, a `DestroySparseRegion` over
+//! each sparse region (the GPU frees the region's backing then, gpu-protocol G22) and an `Unmap`
+//! over each run the table maps outside them (registrations' own mappings, 211 mappings, the
+//! shim, and pieces whose removal a waiting job has sent already), which together empty the
+//! table (`destroying_an_address_space_empties_its_table_in_order`, in `gpu/tests.rs`).
+//!
+//! **What waits for the GPU, and why nothing else does.** The slot can be taken again before the
+//! GPU applies those removals because nothing is handed out again: an address space id is never
+//! reused (the next id only counts up, and a restore refuses an id at or past it), so a new space
+//! gets a new id and a new table, and no request can reach the old one (211 to 215 and the shim's
+//! placing answer `NotFound` for it: `a_destroyed_space_is_gone_and_its_id_is_never_reused`; an
+//! `AllocAsEx` naming it as its parent is `BadParameter`:
+//! `a_view_of_a_destroyed_space_is_a_bad_parameter`, in `nvsrv/as_gpu/tests.rs`).
+//! What the ordering must protect is the guest memory under the old
+//! table, and gsv releases none at the destroy: the registrations, and their device-share
+//! locks, stay. A later 102's removals and barrier are sent after the destroy's removals, so the
+//! GPU has stopped reading through the destroyed table before that lock is released
+//! (`a_later_102_is_ordered_after_the_destroy_s_removals`). The jobs still waiting keep their
+//! events and locks, but no longer hold or publish pages of the destroyed space (its entry in
+//! `waiting` and its ranges in their `reveal` go:
+//! `a_destroy_drops_a_waiting_job_s_pages_of_the_space_and_keeps_its_event`), so a snapshot
+//! saves none of it (`a_destroyed_space_is_not_saved_and_not_restored`, in
+//! `gpu/saved/tests.rs`).
+//!
+//! **Where this differs from PR.** PR's GMMU goes at once, with no ordering against the GPU's
+//! queued work; here the removals are ordered, as every removal is (graphics-server, "How
+//! mappings reach the GPU"). PR's worker cannot place anything in a space an as-gpu fd made
+//! (`gpu_session.cpp`: `OwnsAddressSpace` needs a gpu 33 slot); here it can, so the destroy takes
+//! out whatever the worker placed there too. The GPU front keeps its record of the destroyed
+//! id's (now empty) table: the spec's `GpuFront` has no call that forgets an address space.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -670,6 +712,54 @@ impl GpuMemory {
         self.next.space = next;
         self.publish_all(id);
         Ok(id)
+    }
+
+    /// Destroys address space `space` (module docs, "Destroying an address space"): takes it,
+    /// its 211 mappings, sparse regions and shim out of the bookkeeping, which frees its slot
+    /// of [`MAX_ADDRESS_SPACES`] at once, and sends the GPU the removals that empty its table,
+    /// in address order and with no ticket. `NotFound`, with nothing changed, if gsv holds no
+    /// such space. Registrations stay: they belong to every address space.
+    pub fn destroy_address_space(
+        &mut self,
+        front: &dyn GpuVmFront,
+        space: AsId,
+    ) -> Result<(), KernelError> {
+        let held = self.spaces.remove(&space).ok_or(KernelError::NotFound)?;
+        let mut updates: Vec<VmUpdate> = held
+            .regions
+            .iter()
+            .filter_map(|(&start, region)| {
+                page_range(start, region.end).map(|range| VmUpdate::DestroySparseRegion {
+                    range,
+                    region: region.id,
+                })
+            })
+            .collect();
+        let regions = union(held.regions.iter().map(|(&s, r)| (s, r.end)).collect());
+        let shown = union(
+            held.vm
+                .mappings()
+                .iter()
+                .map(|mapping| (mapping.range.start(), mapping.range.end()))
+                .collect(),
+        );
+        for (start, end) in shown {
+            for (low, high) in subtract(start, end, &regions) {
+                if let Some(range) = page_range(low, high) {
+                    updates.push(VmUpdate::Unmap { range });
+                }
+            }
+        }
+        // The regions and the runs outside them do not overlap, so their starts differ.
+        updates.sort_unstable_by_key(|update| update.range().start());
+        for update in updates {
+            front.update_vm(space, update, None);
+        }
+        self.waiting.remove(&space);
+        for job in self.pending.values_mut() {
+            job.reveal.retain(|&(id, _)| id != space);
+        }
+        Ok(())
     }
 
     /// The address spaces, in id order.
