@@ -36,13 +36,13 @@
 //!
 //! # Where this differs from Eden
 //!
-//! Each is pinned by the test named, in `nvmap/tests.rs`:
+//! Each is pinned by the test named, in `nvmap/tests.rs` unless another file is given:
 //!
 //! | Case | Eden | Here |
 //! |---|---|---|
-//! | `IocAlloc` and `IocFree`'s device-share lock | `IocAlloc` locks the range for the device (`LockForMapDeviceAddressSpace`, its failure only asserted) and `IocFree` unlocks it once the last reference goes | neither touches the kernel: no device reads an nvmap handle yet (nvhost-as-gpu maps them, slice 10), and the lock's interface is changing to return a release token (owner's ruling of 2026-11-17). Taking it is the follow-up of whichever lands second (`alloc_and_free_take_no_device_lock`) |
+//! | `IocAlloc` and `IocFree`'s device-share lock | `IocAlloc` locks the range for the device (`LockForMapDeviceAddressSpace`, its failure only asserted) and `IocFree` unlocks it once the last reference goes | neither touches the kernel: no device reads an nvmap handle yet (nvhost-as-gpu maps them, slice 10), and the lock's interface is changing to return a release token (owner's ruling of 2026-11-17). Taking it is the follow-up of whichever lands second (`nvsrv/tests.rs`: `alloc_and_free_take_no_device_lock`) |
 //! | `IocAlloc` whose address plus page-rounded size is past 2^64 | stored; the lock fails and Eden asserts, then succeeds | `BadValue` (a guess), nothing stored (`an_allocation_past_the_address_space_is_refused`) |
-//! | The table full, or handle ids used up | neither is bounded (the next id wraps after 2^30 handles) | at most [`MAX_HANDLES`] handles, ids up to `0xFFFF_FFFC`, then `InsufficientMemory` (a guess); the table is checked before the ids (`create_refuses_a_full_table_then_spent_ids`) |
+//! | The table full, or handle ids used up | neither is bounded (the next id wraps after 2^30 handles) | at most [`MAX_HANDLES`] handles, ids up to `0xFFFF_FFFC`, then `InsufficientMemory` (a guess), nothing made (`create_refuses_a_full_table_and_spent_ids`) |
 //! | A handle duplicated [`MAX_DUPES`] times | the `s32` count overflows | `BadValue` (a guess), the count unchanged (`from_id_stops_at_the_duplicate_limit`) |
 //! | Flags kept for an allocation | the whole word, bit 2 cleared when an address is given | only bit 0 ([`MAP_UNCACHED`]), the one bit anything reads back (`IocFree`) |
 //!

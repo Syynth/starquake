@@ -521,8 +521,8 @@ fn a_path_is_read_up_to_one_byte_past_the_longest() {
         flags: 0,
     });
     assert_eq!(answer(&rig.send(&request), 2), ok(&[1, 0]));
-    // A longest path with no zero byte in the bytes read: found, it is the whole of what is read
-    // except the last byte, which is not zero.
+    // A longest path and one more byte that is not zero: what is read has no zero byte, so the
+    // path is all 21 bytes, which no device has.
     let mut long = Device::NvhostCtrlGpu.path().as_bytes().to_vec();
     long.push(b'X');
     let answer = rig.open(&long);

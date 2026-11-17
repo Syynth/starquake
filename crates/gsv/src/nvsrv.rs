@@ -122,7 +122,7 @@
 //! | An out buffer, written when `is_out` is set | written whole, past what the device gave back too, with whatever the server's scratch buffer held; also on an fd error | written only as far as the device's answer (or the auto-stub's zeros); nothing on an fd error or a strict unknown ioctl (`an_out_buffer_gets_only_the_answer`, `fd_checks_come_before_the_policy`) |
 //! | `Ioctl2`'s inline input, `Ioctl3`'s inline output | read; written when `is_out` is set | not read, not written: no device of this slice takes or gives one (`inline_buffers_are_left_alone`) |
 //! | A path no device has, under auto-stub | NX2 opens any `/dev/nvhost-*` path as a stub device | refused under both policies, as Eden refuses it (`an_unknown_path_is_refused_under_both_policies`) |
-//! | [`MAX_OPEN_FILES`] files open, or fds used up | no limit; the next fd overflows its `s32` | fd -1 and `FileOperationFailed` (a guess); the count is checked before the fds (`open_refuses_a_full_table_then_spent_fds`) |
+//! | [`MAX_OPEN_FILES`] files open, or fds used up | no limit; the next fd overflows its `s32` | fd -1 and `FileOperationFailed` (a guess), nothing opened and no fd used (`open_refuses_a_full_table_and_spent_fds`) |
 //! | A TIPC request | NX2 and PR: auto-stubbed or refused, as for any command they lack | the server's unknown-command policy (`a_tipc_request_goes_to_the_policy`) |
 //!
 //! A change an ioctl made stands if writing its out buffer then fails (the caller's memory is not
