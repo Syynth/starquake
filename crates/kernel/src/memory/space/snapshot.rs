@@ -58,9 +58,10 @@
 //!    counts agree with its attribute and barriers, that its permission has a translation, and
 //!    that it lies in the region of its state. Then that the blocks reach the address space's
 //!    end ([`SnapshotError::Short`]).
-//! 5. The code's pages are code ([`SnapshotError::CodeRange`]), the heap's are `Normal` and
-//!    the heap region holds no other `Normal` memory ([`SnapshotError::HeapRange`]), and the mapped physical memory size is what the alias
-//!    region's `Normal` blocks add up to ([`SnapshotError::Physical`]).
+//! 5. The code's pages are `Code` or `CodeData` ([`SnapshotError::CodeRange`]); the heap's
+//!    pages are `Normal` and the heap region holds no other `Normal` memory
+//!    ([`SnapshotError::HeapRange`]); the mapped physical memory size is the bytes of `Normal`
+//!    memory inside the alias region ([`SnapshotError::Physical`]).
 //! 6. Each shared memory mapping in turn ([`SnapshotError::Shared`]): after the one before, and
 //!    exactly one `Shared` block. Then that every `Shared` block is a mapping
 //!    ([`SnapshotError::Unmapped`]).
@@ -86,6 +87,12 @@
 //!   reserved when it is made, heap growth reserves what it grows and a shrink releases it, and
 //!   `MapPhysicalMemory` reserves what it maps (and keeps what an undo could not unmap, counted
 //!   as mapped physical memory); nothing else reserves.
+//! - **The code and the heap.** The code is mapped as `Code` when the address space is made,
+//!   and only `SetProcessMemoryPermission` changes its state, to `CodeData` when it becomes
+//!   writable.
+//!   Only heap growth maps `Normal` memory inside the heap region (nothing in the kernel calls
+//!   [`AddressSpace::map_pages`] with `Normal`; a caller that did would make a space that fails
+//!   this check), and only a heap shrink frees it.
 //! - **The mapped physical memory.** Only `MapPhysicalMemory` makes `Normal` memory in the
 //!   alias region (`CanContain` keeps `MapPages` of `Normal` out of it), and only
 //!   `UnmapPhysicalMemory` frees it. The count is of the `Normal` bytes inside the alias
@@ -105,8 +112,11 @@
 //!   locks over it.
 //!
 //! The generated test `a_space_built_by_random_operations_saves_and_restores_as_it_was` runs
-//! random sequences of the operations above on a live address space and restores each
-//! snapshot, so a relation the live operations can break fails it.
+//! random sequences of heap size changes, physical memory maps and unmaps, device-share locks and
+//! unlocks, attribute and permission changes, and transfer memory lends and returns on a live
+//! address space, and saves and restores after each, so a relation those operations can break
+//! fails it. Shared memory, the stack, thread-local pages and generated code are in the fixed
+//! round trip `a_rich_space_saves_and_restores_as_it_was`.
 //!
 //! # Divergences and what is not checked
 //!
@@ -118,7 +128,7 @@
 //! - **Not checked here:** which transfer memory holds a `Locked` range (the transfer memory
 //!   objects are the object table's), that a shared mapping's object is the one the guest mapped
 //!   beyond its size (the caller resolves it), where the main thread's stack is (only its size
-//!   is saved; other mappings can have the `Stack` state's region), and where the `Normal` and
+//!   is saved, and other memory may have the `Stack` state), and where the `Normal` and
 //!   `Locked` merge barriers sit.
 
 use std::collections::{BTreeMap, BTreeSet};
