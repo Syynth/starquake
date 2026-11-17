@@ -172,12 +172,13 @@ impl Break {
         self.reason.raw() | flag
     }
 
-    /// Whether Eden reads this break's buffer: the reason or the break asks for it
-    /// (`handle_debug_buffer` is called), and the buffer has an address and a size.
-    const fn reads_buffer(&self) -> bool {
+    /// Whether Eden reads this break's buffer as a code: the reason or the break asks for it
+    /// (`handle_debug_buffer` is called), the buffer has an address (`addr == 0` returns), and
+    /// it is [`RESULT_ARGUMENT_SIZE`] bytes (which also covers Eden's `sz == 0`).
+    const fn reads_code(&self) -> bool {
         (self.reason.reads_buffer() || !self.notification_only)
             && self.address != 0
-            && self.size != 0
+            && self.size == RESULT_ARGUMENT_SIZE
     }
 }
 
@@ -192,10 +193,7 @@ pub fn break_execution(
 ) -> Break {
     let mut call = Break::decode(raw_reason, address, size);
     // The whole extent must fit the address space before anything is read.
-    if call.reads_buffer()
-        && size == RESULT_ARGUMENT_SIZE
-        && address.checked_add(RESULT_ARGUMENT_SIZE).is_some()
-    {
+    if call.reads_code() && address.checked_add(RESULT_ARGUMENT_SIZE).is_some() {
         let mut word = [0; size_of::<u32>()];
         call.code = memory
             .read(address, &mut word)
