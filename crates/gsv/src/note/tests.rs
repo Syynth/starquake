@@ -27,6 +27,14 @@ fn every_note_s_code_and_value_are_pinned() {
             0x15_0102_0304,
         ),
         (
+            Note::SyncptPageAnswered {
+                id: id(0x2A),
+                value: 0x1112_1314,
+            },
+            2,
+            0x2A_1112_1314,
+        ),
+        (
             Note::GpuOrderedDone {
                 ticket: Ticket(0x0506_0708_090A_0B0C),
             },
@@ -54,30 +62,42 @@ fn every_note_s_code_and_value_are_pinned() {
         assert_eq!(Note::decode(code, value), Ok(note));
     }
     assert_eq!(
-        [SYNCPOINT_OBSERVED, GPU_ORDERED_DONE, QUEUE_ROOM],
-        [1, 3, 8]
+        [
+            SYNCPOINT_OBSERVED,
+            SYNCPT_PAGE_ANSWERED,
+            GPU_ORDERED_DONE,
+            QUEUE_ROOM
+        ],
+        [1, 2, 3, 8]
     );
+}
+
+/// A constructor of a note that packs a syncpoint id and a counter value.
+type MakeNote = fn(SyncpointId, u32) -> Note;
+
+/// The two notes that pack a syncpoint id and a counter value, each with its constructor.
+fn syncpoint_notes() -> [(u32, MakeNote); 2] {
+    [
+        (SYNCPOINT_OBSERVED, |id, value| Note::SyncpointObserved {
+            id,
+            value,
+        }),
+        (SYNCPT_PAGE_ANSWERED, |id, value| Note::SyncptPageAnswered {
+            id,
+            value,
+        }),
+    ]
 }
 
 #[test]
 fn a_syncpoint_note_reads_back_at_its_edges() {
     // Hand-built values: the lowest id with the lowest value, the last id with the highest.
-    assert_eq!(
-        Note::decode(SYNCPOINT_OBSERVED, 0),
-        Ok(Note::SyncpointObserved {
-            id: id(0),
-            value: 0
-        })
-    );
     let top = (u64::from(last_id().get()) << SYNCPOINT_ID_SHIFT) | u64::from(u32::MAX);
     assert_eq!(top, 0xBF_FFFF_FFFF);
-    assert_eq!(
-        Note::decode(SYNCPOINT_OBSERVED, top),
-        Ok(Note::SyncpointObserved {
-            id: last_id(),
-            value: u32::MAX
-        })
-    );
+    for (code, make) in syncpoint_notes() {
+        assert_eq!(Note::decode(code, 0), Ok(make(id(0), 0)));
+        assert_eq!(Note::decode(code, top), Ok(make(last_id(), u32::MAX)));
+    }
 }
 
 #[test]
@@ -85,13 +105,15 @@ fn a_syncpoint_note_naming_no_syncpoint_is_an_error() {
     // The first id past the count, and a bit above the id's byte.
     let past = u64::from(SYNCPOINT_COUNT) << SYNCPOINT_ID_SHIFT;
     let high = 1 << (SYNCPOINT_ID_SHIFT + u8::BITS);
-    for value in [past, high, high | 1, u64::MAX] {
-        let error = Note::decode(SYNCPOINT_OBSERVED, value).unwrap_err();
-        assert_eq!(error, NoteError::NoSuchSyncpoint { value });
-        assert_eq!(
-            error.to_string(),
-            format!("syncpoint note value {value:#x} names no syncpoint (there are 192)")
-        );
+    for (code, _) in syncpoint_notes() {
+        for value in [past, high, high | 1, u64::MAX] {
+            let error = Note::decode(code, value).unwrap_err();
+            assert_eq!(error, NoteError::NoSuchSyncpoint { value });
+            assert_eq!(
+                error.to_string(),
+                format!("syncpoint note value {value:#x} names no syncpoint (there are 192)")
+            );
+        }
     }
 }
 
@@ -115,7 +137,7 @@ fn a_queue_room_note_wider_than_a_channel_is_an_error() {
 #[test]
 fn a_code_gsv_does_not_write_is_an_error() {
     // Zero, each reserved code, and one past the last.
-    for code in [0, 2, 4, 5, 6, 7, 9, u32::MAX] {
+    for code in [0, 4, 5, 6, 7, 9, u32::MAX] {
         let error = Note::decode(code, 1).unwrap_err();
         assert_eq!(error, NoteError::UnknownCode { code });
         assert_eq!(
@@ -128,7 +150,9 @@ fn a_code_gsv_does_not_write_is_an_error() {
 fn note() -> impl Strategy<Value = Note> {
     let ids = 0..u8::try_from(SYNCPOINT_COUNT).unwrap();
     prop_oneof![
-        (ids, any::<u32>()).prop_map(|(sp, value)| Note::SyncpointObserved { id: id(sp), value }),
+        (ids.clone(), any::<u32>())
+            .prop_map(|(sp, value)| Note::SyncpointObserved { id: id(sp), value }),
+        (ids, any::<u32>()).prop_map(|(sp, value)| Note::SyncptPageAnswered { id: id(sp), value }),
         any::<u64>().prop_map(|ticket| Note::GpuOrderedDone {
             ticket: Ticket(ticket)
         }),
