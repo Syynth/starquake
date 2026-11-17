@@ -85,12 +85,24 @@
 //!   ([`Install`]; a real run's is [`crate::hle::install`]), which may keep a [`Ready`] to say
 //!   when a server's deferred replies are ready; the timer thread then delivers them
 //!   ([`Dispatcher::deliver_replies`]), or, when a core has the server's handler out, that core
-//!   does when it puts the handler back. None of the services a real run has defers yet:
-//!   `fsp-srv`'s read would, and is given no executor until then.
+//!   does when it puts the handler back. In a real run `fsp-srv`'s reads defer: they run on
+//!   `fsp-srv`'s workers (`starquake_services::fsp::worker`), whose finished jobs tell the
+//!   [`Ready`] through the server's notification ([`crate::hle`], "Reads"). The workers belong
+//!   to the `fsp-srv` server, which the dispatcher owns, so they stop, and their threads end,
+//!   when the run's dispatcher is dropped.
 //! - **The environment** is live, with a fixed random seed and nothing recorded to disk; the
 //!   `--clock`, `--seed` and `--record` flags of the headless contract are not built. Its
 //!   recording, which grows by a clock reading per system call, is dropped as it is made (test:
-//!   `the_environments_recording_is_dropped_as_it_is_made`).
+//!   `the_environments_recording_is_dropped_as_it_is_made`). Each of `fsp-srv`'s workers reads
+//!   through a live environment of its own over the same host ([`Session::reads_environments`]),
+//!   so that reads on their threads stay out of the first one's recording, where their place
+//!   would be host timing, and off its lock, which the kernel takes for every system call. One
+//!   each, because a live environment holds its lock for the whole of a host request: two
+//!   workers sharing one would wait for each other's reads (test:
+//!   `a_read_held_at_the_title_does_not_hold_up_a_card_read`). Their recordings are dropped as
+//!   they are made too, and the workers keep no record of their own (`Recording::Off`, test:
+//!   `a_real_runs_workers_keep_no_record`): the order the reads became visible in is in the
+//!   event stream, as each delivery's request event.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -108,6 +120,7 @@ use starquake_kernel::svc::DebugSink;
 use starquake_kernel::tables::{AddressSpace, Scheduler};
 use starquake_kernel::time::CounterRate;
 use starquake_memory::{Access, GuestMemory};
+use starquake_services::fsp::worker::{self, Recording, StartError, Workers};
 use starquake_trace::{
     DumpError, Env, EventKind, FlightRecorder, GuestTicks, HostClock, HostNanos, LifecyclePhase,
     LiveEnv, Recorder, TextSink, ThreadId,
@@ -115,7 +128,7 @@ use starquake_trace::{
 
 use crate::clock::Timebase;
 use crate::crash::{Backtrace, CrashReport, Exception};
-use crate::hle::{FspHost, HostFolder};
+use crate::hle::{FspHost, HostFolder, Reads};
 use crate::image::{PAGE, Placement};
 use crate::report::{ExitReason, Mapping, RunOptions, RunReport, ThreadPc, empty_dump};
 use crate::space::Touch;
@@ -184,14 +197,6 @@ pub(crate) struct Ready {
 
 impl Ready {
     /// The replies of `server` that its handler has ready are to be delivered.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "no service of a real run defers yet (`fsp-srv` has no executor); the core \
-                      loop's tests install services that do"
-        )
-    )]
     pub(crate) fn push(&self, server: ServerId) {
         lock(&self.servers).push(server);
         self.bell.ring();
@@ -206,15 +211,46 @@ impl Ready {
     }
 }
 
-/// Puts a run's services in front of its dispatcher, with the environment they read the host
-/// through and a [`Ready`] to say when deferred replies are ready. A failure ends the run
-/// before the guest runs, with the message given.
-pub(crate) type Install = dyn Fn(&Dispatcher, Arc<dyn Env>, Ready) -> Result<(), String> + Sync;
+impl crate::hle::Deliveries for Ready {
+    fn ready(&self, server: ServerId) {
+        self.push(server);
+    }
+}
 
-/// The services of a real run ([`crate::hle::install`]). None of them defers yet, so the
-/// [`Ready`] is not kept.
-fn real_services(dispatcher: &Dispatcher, env: Arc<dyn Env>, _: Ready) -> Result<(), String> {
-    crate::hle::install(dispatcher, env).map_err(|error| error.to_string())
+/// What a run gives the services it installs ([`Install`]).
+pub(crate) struct Given {
+    /// The environment the services' methods read the host through.
+    pub(crate) env: Arc<dyn Env>,
+    /// The environments the services' workers read the host through, one per worker
+    /// ([`Session::reads_environments`]).
+    pub(crate) reads: Vec<Arc<LiveEnv>>,
+    /// How a service says its deferred replies are ready.
+    pub(crate) ready: Ready,
+}
+
+/// Puts a run's services in front of its dispatcher, with what the run gives them ([`Given`]).
+/// A failure ends the run before the guest runs, with the message given.
+pub(crate) type Install = dyn Fn(&Dispatcher, Given) -> Result<(), String> + Sync;
+
+/// The services of a real run ([`crate::hle::install`]), with `fsp-srv`'s reads on its workers,
+/// which keep no record (module docs, "The environment").
+fn real_services(dispatcher: &Dispatcher, given: Given) -> Result<(), String> {
+    let workers = reads_workers(&given.reads).map_err(|error| error.to_string())?;
+    let reads = Reads {
+        executor: Arc::new(workers),
+        ready: Arc::new(given.ready),
+    };
+    crate::hle::install(dispatcher, given.env, reads).map_err(|error| error.to_string())
+}
+
+/// A real run's `fsp-srv` workers: one thread on each of `envs`, keeping no record (module docs,
+/// "The environment").
+fn reads_workers(envs: &[Arc<LiveEnv>]) -> Result<Workers, StartError> {
+    let envs = envs
+        .iter()
+        .map(|env| -> Arc<dyn Env> { Arc::<LiveEnv>::clone(env) })
+        .collect();
+    Workers::new(envs, Recording::Off)
 }
 
 /// How much of a run is kept in memory for its report. A guest can make system calls and write
@@ -314,6 +350,19 @@ impl<C: HostClock + Clone> Session<'_, C> {
         } else {
             env.with_host_io(host)
         })
+    }
+
+    /// The environments `fsp-srv`'s workers read through during this run, one per worker
+    /// ([`worker::COUNT`]): each made as [`Session::environment`] makes the first, over the same
+    /// SD card folder and the same RomFS (whose source and cache a clone shares). See the module
+    /// docs, "The environment".
+    fn reads_environments(&self) -> Vec<Arc<LiveEnv>>
+    where
+        C: 'static,
+    {
+        (0..worker::COUNT.get())
+            .map(|_| self.environment())
+            .collect()
     }
 }
 
@@ -448,6 +497,9 @@ struct Machine<'a, V: Vcpu, C> {
     /// run is stopping.
     bell: Arc<timer::Bell>,
     ready: Ready,
+    /// The environments `fsp-srv`'s workers read through, one each
+    /// ([`Session::reads_environments`]).
+    reads: Vec<Arc<LiveEnv>>,
     /// The program counter of each thread a core's vCPU held when the core stopped, with the
     /// core, by the thread's id as the guest knows it (`core_loop`'s `Core::leave`).
     held: Mutex<BTreeMap<u64, (u8, u64)>>,
@@ -763,7 +815,10 @@ impl<'a, V: Vcpu, C: HostClock + Clone> Machine<'a, V, C> {
         env: &'a Arc<LiveEnv>,
         limits: Limits,
         install: &Install,
-    ) -> Result<Self, Box<(Ending, GuestLog, Tally)>> {
+    ) -> Result<Self, Box<(Ending, GuestLog, Tally)>>
+    where
+        C: 'static,
+    {
         let count = dispatcher.with::<(&starquake_kernel::tables::Scheduler,), _>(|(scheduler,)| {
             scheduler.core_count()
         });
@@ -783,10 +838,15 @@ impl<'a, V: Vcpu, C: HostClock + Clone> Machine<'a, V, C> {
                 bell: Arc::clone(&bell),
             },
             bell,
+            reads: session.reads_environments(),
             held: Mutex::new(BTreeMap::new()),
         };
-        let services_env: Arc<dyn Env> = Arc::<LiveEnv>::clone(env);
-        if let Err(error) = install(&machine.dispatcher, services_env, machine.ready.clone()) {
+        let given = Given {
+            env: Arc::<LiveEnv>::clone(env),
+            reads: machine.reads.clone(),
+            ready: machine.ready.clone(),
+        };
+        if let Err(error) = install(&machine.dispatcher, given) {
             let ending = Ending::Failed(format!("the services could not be set up: {error}"));
             return Err(Box::new((
                 ending,
@@ -805,8 +865,11 @@ impl<'a, V: Vcpu, C: HostClock + Clone> Machine<'a, V, C> {
     /// about the guest ([`Aftermath`]: the stack block of a crash, the threads of a timeout),
     /// once every core and the timer thread have stopped.
     fn finish(self) -> (Ending, GuestLog, Tally, Aftermath) {
-        // PROVISIONAL: nothing keeps the environment's recording (see the module docs).
+        // PROVISIONAL: nothing keeps the environments' recordings (see the module docs).
         drop(self.env.take_recording());
+        for reads in &self.reads {
+            drop(reads.take_recording());
+        }
         let ending = lock(&self.ending)
             .take()
             .unwrap_or_else(|| Ending::Failed("the run stopped without saying why".to_owned()));

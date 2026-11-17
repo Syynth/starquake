@@ -3,7 +3,8 @@
 
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use starquake_cpu::GuestRegs;
 use starquake_ipc::{
@@ -12,6 +13,7 @@ use starquake_ipc::{
 };
 use starquake_kernel::dispatch::{Caller, Outcome};
 use starquake_kernel::handle::Handle;
+use starquake_kernel::id::ServerId;
 use starquake_kernel::memory::testing::RecordingMapper;
 use starquake_kernel::memory::{
     AddressSpace, MemoryArrangement, ProcessMemory, RegionOffsets, SvcPermission,
@@ -23,9 +25,8 @@ use starquake_memory::{FlatMemory, GuestMemory, PAGE_SIZE};
 use starquake_services::framework::control::{
     CONVERT_CURRENT_OBJECT_TO_DOMAIN, QUERY_POINTER_BUFFER_SIZE,
 };
-use starquake_services::framework::{
-    DEFAULT_POINTER_BUFFER_SIZE, NOT_SUPPORTED, Protocol, Session,
-};
+use starquake_services::framework::{DEFAULT_POINTER_BUFFER_SIZE, Protocol, Session};
+use starquake_services::fsp::worker::{self, Recording, Workers};
 use starquake_services::fsp::{FspSrv, IFile, IFileSystem};
 use starquake_services::set::{self, FIRMWARE_VERSION_SIZE, FirmwareVersion, SetSys, layout};
 use starquake_services::sm::{MAX_NAME_LEN, ServiceName, Sm};
@@ -58,6 +59,53 @@ struct Rig {
     env: Arc<LiveEnv>,
     recorder: Recorder,
     events: Arc<VecSink>,
+    ready: Arc<ReadyServers>,
+}
+
+/// The longest a test waits for a read to finish.
+const WAIT: Duration = Duration::from_secs(10);
+
+/// The servers whose deferred replies are ready, as the core loop's `Ready` keeps them.
+#[derive(Default)]
+struct ReadyServers {
+    servers: Mutex<Vec<ServerId>>,
+    rung: Condvar,
+}
+
+impl Deliveries for ReadyServers {
+    fn ready(&self, server: ServerId) {
+        self.servers.lock().unwrap().push(server);
+        self.rung.notify_all();
+    }
+}
+
+impl ReadyServers {
+    /// Waits until a server is named, and takes the oldest.
+    fn next(&self) -> ServerId {
+        let servers = self.servers.lock().unwrap();
+        let (mut servers, timeout) = self
+            .rung
+            .wait_timeout_while(servers, WAIT, |servers| servers.is_empty())
+            .unwrap();
+        assert!(!timeout.timed_out(), "no reply became ready");
+        servers.remove(0)
+    }
+}
+
+/// `fsp-srv`'s reads on its workers, over `env`, telling `ready`.
+fn reads_on(env: Arc<dyn Env>, ready: &Arc<ReadyServers>) -> Reads {
+    let workers = Workers::new(vec![env; worker::COUNT.get()], Recording::Off).unwrap();
+    let ready: Arc<dyn Deliveries> = Arc::<ReadyServers>::clone(ready);
+    Reads {
+        executor: Arc::new(workers),
+        ready,
+    }
+}
+
+/// [`install`] with reads that nothing waits for.
+fn install_with(dispatcher: &Dispatcher, env: Arc<dyn Env>) -> Result<(), ServicesError> {
+    let reads = reads_on(Arc::clone(&env), &Arc::default());
+    install(dispatcher, env, reads)
 }
 
 /// A dispatcher over a process with nothing but its code mapped, read-write.
@@ -88,7 +136,9 @@ impl Rig {
         let dispatcher = dispatcher();
         let env = Arc::new(env);
         let services: Arc<dyn Env> = Arc::<LiveEnv>::clone(&env);
-        install(&dispatcher, services).unwrap();
+        let ready = Arc::new(ReadyServers::default());
+        let fsp_reads = reads_on(Arc::clone(&services), &ready);
+        install(&dispatcher, services, fsp_reads).unwrap();
         let recorder = Recorder::new();
         let events = Arc::new(VecSink::new());
         recorder.add_sink(Arc::clone(&events));
@@ -98,10 +148,18 @@ impl Rig {
             env,
             recorder,
             events,
+            ready,
         }
     }
 
     fn call(&self, id: SvcId, x0: u64, x1: u64) -> GuestRegs {
+        let (regs, outcome) = self.call_for(id, x0, x1);
+        assert_eq!(outcome, Outcome::Completed, "{}", id.name());
+        regs
+    }
+
+    /// Makes the call and returns its registers and outcome.
+    fn call_for(&self, id: SvcId, x0: u64, x1: u64) -> (GuestRegs, Outcome) {
         let mut regs = GuestRegs {
             tpidrro: TLS,
             ..GuestRegs::default()
@@ -120,8 +178,35 @@ impl Rig {
         let record = self
             .dispatcher
             .dispatch(id.number(), &mut regs, &mut caller);
-        assert_eq!(record.outcome, Outcome::Completed, "{}", id.name());
-        regs
+        (regs, record.outcome)
+    }
+
+    /// Sends `request` on `session`, which defers it: waits for the reply to be ready, has the
+    /// dispatcher deliver it, as the core loop's timer thread does, and returns the result the
+    /// sender wakes with and its message buffer.
+    fn send_deferred(&self, session: Handle, request: &RequestBuilder) -> (ResultCode, Vec<u8>) {
+        let mut buffer = [0; BUFFER_SIZE];
+        request.build(&mut buffer).unwrap();
+        self.memory.write(TLS, &buffer).unwrap();
+        let (_, outcome) = self.call_for(SvcId::SendSyncRequest, u64::from(session.raw()), 0);
+        assert_eq!(outcome, Outcome::Waiting);
+        let server = self.ready.next();
+        let mut debug = NoDebug;
+        let mut caller = Caller {
+            core: 0,
+            thread: THREAD,
+            env: &*self.env,
+            memory: &self.memory,
+            debug: &mut debug,
+            recorder: &self.recorder,
+        };
+        self.dispatcher
+            .deliver_replies(server, &mut caller)
+            .unwrap();
+        let woken = self.dispatcher.take_woken();
+        assert_eq!(woken.len(), 1);
+        self.memory.read(TLS, &mut buffer).unwrap();
+        (woken[0].result, buffer.to_vec())
     }
 
     /// Sends `request` on `session`; returns the result and the message buffer afterwards.
@@ -231,7 +316,7 @@ fn every_service_has_its_name_and_no_other_number_has_one() {
 #[test]
 fn the_service_manager_is_on_its_port_and_set_sys_on_none() {
     let dispatcher = dispatcher();
-    install(&dispatcher, no_host()).unwrap();
+    install_with(&dispatcher, no_host()).unwrap();
     let tables = dispatcher.into_tables();
     let ipc = tables.scheduler.ipc();
     let sm = ipc.port(&PortName::new(sm::PORT_NAME).unwrap()).unwrap();
@@ -248,10 +333,10 @@ fn the_service_manager_is_on_its_port_and_set_sys_on_none() {
 #[test]
 fn installing_twice_is_refused_by_the_kernel() {
     let dispatcher = dispatcher();
-    install(&dispatcher, no_host()).unwrap();
+    install_with(&dispatcher, no_host()).unwrap();
     let port = PortName::new(sm::PORT_NAME).unwrap();
     assert_eq!(
-        install(&dispatcher, no_host()),
+        install_with(&dispatcher, no_host()),
         Err(ServicesError::Kernel(IpcError::PortTaken(port)))
     );
 }
@@ -448,7 +533,7 @@ fn fsp_srv_serves_the_run_s_sd_card_folder() {
     assert_eq!((code, word), (ResultCode::SUCCESS, 0));
     assert_eq!(data, u64::try_from(TEXT.len()).unwrap().to_le_bytes());
 
-    // PROVISIONAL (module docs): a run gives `fsp-srv` no executor, so a read is refused.
+    // A read is deferred to `fsp-srv`'s workers, and the bytes arrive with the reply.
     let buffer_room = BufferDescriptor {
         address: FIRMWARE,
         size: 4,
@@ -457,16 +542,20 @@ fn fsp_srv_serves_the_run_s_sd_card_folder() {
     let payload = [
         &0_u32.to_le_bytes()[..],
         &[0; 4],
-        &0_i64.to_le_bytes(),
+        &2_i64.to_le_bytes(),
         &4_i64.to_le_bytes(),
     ]
     .concat();
     let read = domain(file, &IFile::default(), "read")
         .data(&payload)
         .receive_buffer(buffer_room);
-    let (code, buffer) = rig.send(fsp, &read);
-    assert_eq!(code, ResultCode::SUCCESS);
-    assert_eq!(domain_reply(&buffer, 0).0, NOT_SUPPORTED.raw());
+    let (code, buffer) = rig.send_deferred(fsp, &read);
+    let (word, data, _) = domain_reply(&buffer, size_of::<i64>());
+    assert_eq!((code, word), (ResultCode::SUCCESS, 0));
+    assert_eq!(data, 4_i64.to_le_bytes());
+    let mut read_bytes = [0; 4];
+    rig.memory.read(FIRMWARE, &mut read_bytes).unwrap();
+    assert_eq!(read_bytes, TEXT[2..6]);
 
     // One event for each request to `fsp-srv`: the conversion and the five commands.
     let fsp_events = rig

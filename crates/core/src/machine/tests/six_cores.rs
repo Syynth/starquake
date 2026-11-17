@@ -456,10 +456,10 @@ const DEFER: ServiceId = ServiceId(0x77);
 /// What its replies are made of.
 const REPLY_FILL: u8 = 0x5D;
 
-fn install_deferring(dispatcher: &Dispatcher, _: Arc<dyn Env>, ready: Ready) -> Result<(), String> {
+fn install_deferring(dispatcher: &Dispatcher, given: Given) -> Result<(), String> {
     let server = Arc::new(Mutex::new(None));
     let handler = Deferring {
-        ready,
+        ready: given.ready,
         server: Arc::clone(&server),
         waiting: VecDeque::new(),
         fill: REPLY_FILL,
@@ -560,6 +560,52 @@ fn a_deferred_reply_is_delivered_by_the_timers_turn_and_wakes_its_sender() {
         .collect();
     assert_eq!(sends.len(), 1);
     assert_eq!(sends[0].thread, MAIN_THREAD);
+}
+
+#[test]
+fn a_delivery_turn_drops_what_the_workers_environment_recorded() {
+    // `fsp-srv`'s workers read through environments of their own, one each, which record every
+    // answer, bytes and all; every read they finish makes a delivery turn, which drops them.
+    let guest = Guest::new(&programs::hello().unwrap());
+    let main = ScriptedVcpu::new().then(|_| {}, svc(SvcId::ExitProcess));
+    let mut turns = Vec::new();
+    let outcome = stepped(
+        &guest,
+        &guest.memory,
+        vec![main],
+        &real_services,
+        |round, machine| {
+            if round > 0 {
+                return;
+            }
+            let request = starquake_trace::HostIoRequest {
+                channel: 0,
+                payload: vec![0x7E; 3],
+            };
+            for reads in &machine.reads {
+                reads.host_io(&request).unwrap();
+            }
+            let held = |machine: &Machine<'_, _, _>| -> Vec<usize> {
+                machine
+                    .reads
+                    .iter()
+                    .map(|reads| reads.recording().len())
+                    .collect()
+            };
+            // A turn with nothing ready keeps them; a turn that delivers drops them.
+            assert!(crate::machine::timer::deliver(machine).is_ok());
+            turns.push(held(machine));
+            let fsp = machine.dispatcher.with::<(&Scheduler,), _>(|(scheduler,)| {
+                scheduler.ipc().service(crate::hle::FSP_SRV)
+            });
+            machine.ready.push(fsp.unwrap());
+            assert!(crate::machine::timer::deliver(machine).is_ok());
+            turns.push(held(machine));
+        },
+    );
+    assert_exited(&outcome);
+    let count = worker::COUNT.get();
+    assert_eq!(turns, [vec![1; count], vec![0; count]]);
 }
 
 #[test]

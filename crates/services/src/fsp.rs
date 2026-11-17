@@ -74,11 +74,13 @@
 //! is there, opening a file and `GetSize` ask the file's size, and each waits for the answer on
 //! the core thread: they read metadata, never the file's contents, but they are blocking host I/O
 //! all the same (see "Where this departs from the service spec"). `Read` is the one command whose
-//! cost grows with what
-//! the guest asks for, so it never blocks the handler: it takes a reply token and hands the read
-//! to the server's executor ([`work`](crate::framework::work)), whose job asks the host for the
-//! bytes and completes the token with them. The bytes go into the caller's buffer when the reply
-//! is delivered ([`Reply::write_buffer`]).
+//! cost grows with what the guest asks for, so it never blocks the handler: it takes a reply
+//! token and hands the read to the server's executor ([`work`](crate::framework::work)), whose
+//! job asks the host for the bytes, on the same channel but through the environment the executor
+//! gives it, and whose finish completes the token with them. The bytes go into the caller's
+//! buffer when the reply is delivered ([`Reply::write_buffer`]). In a run the executor is
+//! `fsp-srv`'s workers ([`worker`]), which also say what is recorded of each read and how a
+//! replay delivers the reads in the recorded order.
 //!
 //! The host memory one read needs is the bytes it returns: at most the size the guest asked for,
 //! which is at most its buffer's size, and never more than the file holds from the offset on.
@@ -221,11 +223,13 @@ use starquake_trace::Env;
 
 use crate::commands;
 use crate::framework::{
-    Context, DeferredBuffer, Interfaces, Outcome, Reply, ReplyToken, Request, Server, UnknownPolicy,
+    Context, DeferredBuffer, Finish, Interfaces, Outcome, Reply, ReplyToken, Request, Server,
+    UnknownPolicy,
 };
 
 pub mod host;
 pub mod path;
+pub mod worker;
 
 #[cfg(test)]
 mod tests;
@@ -552,12 +556,14 @@ struct ReadJob {
 }
 
 impl ReadJob {
-    /// Asks the host and completes the token with the answer.
-    fn run(self, env: &dyn Env, token: ReplyToken) {
-        match self.fetch(env) {
+    /// Asks the host through `env`, the environment the executor gives the job, and returns the
+    /// step that completes the token with the answer ([`Finish`]).
+    fn run(self, env: &dyn Env, token: ReplyToken) -> Finish {
+        let answer = self.fetch(env);
+        Box::new(move || match answer {
             Ok(reply) => token.complete(reply),
             Err(code) => token.fail(code),
-        }
+        })
     }
 
     /// The reply: the bytes read as an `s64` (when the job says so), and the bytes for out
@@ -624,7 +630,6 @@ fn deferred_read(
     if offset.checked_add(size).is_none() {
         return Err(result::OUT_OF_RANGE.into());
     }
-    let env = cx.env()?;
     let executor = cx.executor()?;
     let token = cx.defer()?;
     let (mount, path) = target;
@@ -636,7 +641,7 @@ fn deferred_read(
         buffer,
         count,
     };
-    executor.submit(Box::new(move || job.run(&*env, token)));
+    executor.submit(Box::new(move |env: &dyn Env| job.run(env, token)));
     reply.deferred()
 }
 
@@ -732,8 +737,9 @@ pub fn interfaces() -> Interfaces {
 }
 
 /// An `fsp-srv` server whose host file systems are `env`'s ([`host`]). Its reads run on the
-/// executor it is given with [`Server::with_executor`]; a server given none answers `Read` with
-/// the framework's `NOT_SUPPORTED` ([`Context::executor`]).
+/// executor it is given with [`Server::with_executor`] (in a run, [`worker::Workers`]), through
+/// the environment that executor gives them; a server given none answers `Read` with the
+/// framework's `NOT_SUPPORTED` ([`Context::executor`]).
 #[must_use]
 pub fn server(policy: UnknownPolicy, env: Arc<dyn Env>) -> Server {
     Server::new(NAME, policy)
