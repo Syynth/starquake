@@ -68,6 +68,12 @@ consumes must come from the log. That makes three design rules:
    host file and network I/O, and input state are read through an `Env` trait. Live runs record
    what it returned; replays feed the recording back. Kernel and service code never reads the
    host clock or the file system directly. A lint rule bans the obvious calls in those crates.
+   The wall clock is one reading taken at boot and recorded, so a replay reproduces it; it is
+   the RTC at boot unless a setting pins a date (tests always pin one). `time:u` owns turning
+   the RTC and the uptime into calendar time; the kernel keeps owning ticks. (Approved by the owner, 2026-11-17.)
+   When an `Env` call fails: a replay that runs out or disagrees stops the run as an emulator
+   error, never a guest-visible result; a host I/O failure (a missing or unreadable file)
+   becomes the Horizon result code the reference returns for that condition. (Approved by the owner, 2026-11-17.)
 2. **Guest memory the host reads is part of the log** in full-recording mode: IPC messages and
    the buffers a service reads. The flight recorder keeps only sizes and hashes.
 3. **The order in which deferred replies complete is recorded**, since it comes from other
