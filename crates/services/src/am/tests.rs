@@ -4,8 +4,9 @@
 //! most tests talk to domain objects, as the fixture does.
 
 use starquake_ipc::{
-    BUFFER_SIZE, Body, CommandHeader, CommandType, Message, ReceiveList, RequestBuilder,
-    RequestLayout, SFCO_MAGIC, SessionKind, SpecialHeader,
+    BUFFER_SIZE, Body, CMIF_HEADER_BYTES, CommandHeader, CommandType, DomainCommand,
+    DomainRequestHeader, Message, ReceiveList, RequestBuilder, RequestLayout, SFCI_MAGIC,
+    SFCO_MAGIC, SessionKind, SpecialHeader,
 };
 use starquake_kernel::handle::Handle;
 use starquake_kernel::id::ObjectId;
@@ -18,15 +19,21 @@ use crate::framework::fake::FakeKernel;
 use crate::framework::result::{INVALID_CMIF_REQUEST, UNKNOWN_COMMAND_ID};
 use crate::framework::{Handled, Kernel, Protocol, Session, SnapshotError};
 
-use super::command::application_functions::NOTIFY_RUNNING;
+use super::command::application_functions::{
+    GET_SCREEN_SHOT_AND_CONTINUOUS_RECORDING_INITIALLY_ENABLED, NOTIFY_RUNNING, UNKNOWN_321,
+};
 use super::command::common_state_getter::{
     GET_CURRENT_FOCUS_STATE, GET_EVENT_HANDLE, GET_OPERATION_MODE, GET_PERFORMANCE_MODE,
 };
+use super::command::graphics_scaling_parameters_functions::{
+    GET_GRAPHICS_SCALING_PARAMETERS, SET_GRAPHICS_SCALE_CHANGED_NOTIFICATION_ENABLED,
+};
 use super::command::proxy::{
     GET_APPLICATION_FUNCTIONS, GET_AUDIO_CONTROLLER, GET_COMMON_STATE_GETTER, GET_DEBUG_FUNCTIONS,
-    GET_DISPLAY_CONTROLLER, GET_LIBRARY_APPLET_CREATOR, GET_SELF_CONTROLLER, GET_WINDOW_CONTROLLER,
+    GET_DISPLAY_CONTROLLER, GET_GRAPHICS_SCALING_PARAMETERS_FUNCTIONS, GET_LIBRARY_APPLET_CREATOR,
+    GET_PERFORMANCE_FUNCTIONS, GET_SELF_CONTROLLER, GET_WINDOW_CONTROLLER,
 };
-use super::command::proxy_service::OPEN_APPLICATION_PROXY;
+use super::command::proxy_service::{OPEN_APPLICATION_PROXY, OPEN_APPLICATION_PROXY_WITH_FLAGS};
 use super::command::self_controller::{
     EXIT, GET_ACCUMULATED_SUSPENDED_TICK_CHANGED_EVENT, GET_GRAPHICS_SUPERVISOR,
     SET_FOCUS_HANDLING_MODE, SET_OPERATION_MODE_CHANGED_NOTIFICATION,
@@ -871,7 +878,13 @@ fn the_tables_name_the_commands_as_eden_does() {
     };
     assert_eq!(
         names(&IApplicationProxyService),
-        [(OPEN_APPLICATION_PROXY, "open_application_proxy")]
+        [
+            (OPEN_APPLICATION_PROXY, "open_application_proxy"),
+            (
+                OPEN_APPLICATION_PROXY_WITH_FLAGS,
+                "open_application_proxy_with_flags"
+            ),
+        ]
     );
     assert_eq!(
         names(&IApplicationProxy::default()),
@@ -883,7 +896,36 @@ fn the_tables_name_the_commands_as_eden_does() {
             (GET_DISPLAY_CONTROLLER, "get_display_controller"),
             (GET_LIBRARY_APPLET_CREATOR, "get_library_applet_creator"),
             (GET_APPLICATION_FUNCTIONS, "get_application_functions"),
+            (GET_PERFORMANCE_FUNCTIONS, "get_performance_functions"),
+            (
+                GET_GRAPHICS_SCALING_PARAMETERS_FUNCTIONS,
+                "get_graphics_scaling_parameters_functions"
+            ),
             (GET_DEBUG_FUNCTIONS, "get_debug_functions"),
+        ]
+    );
+    assert_eq!(
+        names(&IApplicationFunctions),
+        [
+            (NOTIFY_RUNNING, "notify_running"),
+            (
+                GET_SCREEN_SHOT_AND_CONTINUOUS_RECORDING_INITIALLY_ENABLED,
+                "get_screen_shot_and_continuous_recording_initially_enabled"
+            ),
+            (UNKNOWN_321, "unknown_321"),
+        ]
+    );
+    assert_eq!(
+        names(&IGraphicsScalingParametersFunctions),
+        [
+            (
+                GET_GRAPHICS_SCALING_PARAMETERS,
+                "get_graphics_scaling_parameters"
+            ),
+            (
+                SET_GRAPHICS_SCALE_CHANGED_NOTIFICATION_ENABLED,
+                "set_graphics_scale_changed_notification_enabled"
+            ),
         ]
     );
     assert_eq!(
@@ -897,6 +939,7 @@ fn the_tables_name_the_commands_as_eden_does() {
         names(&IDisplayController),
         names(&ILibraryAppletCreator),
         names(&IDebugFunctions),
+        names(&IPerformanceFunctions),
     ] {
         assert_eq!(empty, []);
     }
@@ -1314,4 +1357,551 @@ fn a_snapshot_with_another_graphics_server_is_refused() {
         restored.restore(&saved).unwrap();
         assert_eq!(restored.session_count(), 1, "{graphics:?}");
     }
+}
+
+// ----- The Switch 2 additions (Eden PR #4588) ------------------------------------------------
+
+/// `IPerformanceFunctions`' rows in PR #4588, both `nullptr`, so they have no shipping constant
+/// (`eden-pr4588/src/core/hle/service/am/service/performance_functions.cpp` @ e5fb3b97: `{0,
+/// nullptr, "IsCpuOverclockEnabled"}, {1, nullptr, "SetCpuOverclockEnabled"}`).
+const PERFORMANCE_FUNCTIONS_ROWS: [u32; 2] = [0, 1];
+/// `IGraphicsScalingParametersFunctions`' `nullptr` rows in PR #4588, so they have no shipping
+/// constant (`graphics_scaling_parameters_functions.cpp` @ e5fb3b97: 1000
+/// `SetSupportingGraphicsScalingParametersForDebug`, 1010 `SetGpuQuotaForDebug`, 1020
+/// `ClearGpuQuotaForDebug`, 1030 `SetScreenRatioForDebug`, 1040 `ClearScreenRatioForDebug`).
+const GRAPHICS_SCALING_DEBUG_ROWS: [u32; 5] = [1000, 1010, 1020, 1030, 1040];
+/// `IApplicationFunctions::Unknown330`, which PR #4588 has and this port leaves out, so it has
+/// no shipping constant (`application_functions.cpp` @ e5fb3b97: `{330,
+/// D<&IApplicationFunctions::Unknown330>, "Unknown330"}`).
+const UNKNOWN_330: u32 = 330;
+
+/// The interfaces the Switch 2 proxy commands open, each with the proxy's command.
+const SWITCH2_OPENED: [(u32, &str); 2] = [
+    (GET_PERFORMANCE_FUNCTIONS, "IPerformanceFunctions"),
+    (
+        GET_GRAPHICS_SCALING_PARAMETERS_FUNCTIONS,
+        "IGraphicsScalingParametersFunctions",
+    ),
+];
+
+/// The 16-byte payload of `OpenApplicationProxyWithFlags` in PR #4588's layout (module docs,
+/// "Layouts"): `flags` at offset 0, padding, the process id's `u64` slot at offset 8.
+fn with_flags_payload(flags: u32, pid_slot: u64) -> Vec<u8> {
+    let mut payload = flags.to_le_bytes().to_vec();
+    payload.extend([0; 4]);
+    payload.extend(pid_slot.to_le_bytes());
+    payload
+}
+
+/// The buffer of `OpenApplicationProxyWithFlags` sent to domain object `root`, laid out word by
+/// word: the header announcing a special header and 16 raw words (libnx counts 16 bytes of
+/// alignment slack into the raw size, `cmifMakeRequest`), the special header asking for the
+/// process id and one copied handle, the id's two words (the kernel fills them; here zero), the
+/// handle, padding to the 16-byte boundary, the domain header (`SendMessage`, no input objects,
+/// the `SFCI` header plus 16 payload bytes), `SFCI`, version 0, the command id, token 0, then
+/// [`with_flags_payload`].
+fn with_flags_by_hand(root: u32, process: u32, flags: u32) -> Vec<u8> {
+    let payload = with_flags_payload(flags, 0);
+    let header = CommandHeader {
+        command_type: CommandType::Request,
+        num_x: 0,
+        num_a: 0,
+        num_b: 0,
+        num_w: 0,
+        raw_data_words: 16,
+        receive_list: ReceiveList::Disabled,
+        has_special_header: true,
+    };
+    let special = SpecialHeader {
+        send_pid: true,
+        num_copy_handles: 1,
+        num_move_handles: 0,
+    };
+    let domain = DomainRequestHeader {
+        command: DomainCommand::SendMessage,
+        input_object_count: 0,
+        size: u32::try_from(CMIF_HEADER_BYTES + payload.len()).unwrap(),
+        object_id: root,
+        token: 0,
+    };
+    let [w0, w1] = header.encode().unwrap();
+    // Six words to here: two of padding reach the 16-byte boundary.
+    let mut words = vec![w0, w1, special.encode().unwrap(), 0, 0, process, 0, 0];
+    words.extend(domain.encode().unwrap());
+    words.extend([SFCI_MAGIC, 0, OPEN_APPLICATION_PROXY_WITH_FLAGS, 0]);
+    words.extend(
+        payload
+            .chunks(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap())),
+    );
+    buffer_of(&words)
+}
+
+impl Rig {
+    /// `OpenApplicationProxyWithFlags` with `flags` and PR's 16-byte payload, to the domain's
+    /// root `root`, with process id `pid`; the raw reply.
+    fn open_proxy_with_flags_raw(&mut self, root: u32, flags: u32, pid: u64) -> Vec<u8> {
+        let request = RequestBuilder::domain(
+            CommandType::Request,
+            root,
+            OPEN_APPLICATION_PROXY_WITH_FLAGS,
+        )
+        .send_pid(pid)
+        .copy_handle(self.process.raw())
+        .data(&with_flags_payload(flags, 0));
+        self.send_raw(self.session, &request)
+    }
+
+    /// Sends a whole message buffer laid out by hand; the raw reply.
+    fn send_buffer(&mut self, mut buffer: Vec<u8>) -> Vec<u8> {
+        let handled = self
+            .server
+            .handle(&mut self.kernel, self.session, &mut buffer);
+        assert_eq!(handled, Ok(Handled::Replied));
+        buffer
+    }
+}
+
+#[test]
+fn open_application_proxy_with_flags_laid_out_by_hand_opens_the_proxy_on_a_domain() {
+    for flags in PROXY_FLAGS_ACCEPTED {
+        let mut rig = Rig::new();
+        let root = rig.convert();
+        let request = with_flags_by_hand(root, rig.process.raw(), flags);
+        let reply = rig.send_buffer(request);
+        assert_eq!(
+            reply,
+            domain_reply(ResultCode::SUCCESS, &[], &[root + 1]),
+            "flags {flags}"
+        );
+        assert!(rig.holds("IApplicationProxy"), "flags {flags}");
+        assert_eq!(rig.server.interface_count(), 2, "flags {flags}");
+    }
+}
+
+/// PR #4588's check, `R_UNLESS(flags == 0 || flags == 2, ResultUnknown)`: 0 and 2 open the
+/// proxy; 1 and 3, the neighbours of 2, the largest value, and values whose low byte or low
+/// half is 0 or 2 but whose higher bytes are not zero are refused with `ResultUnknown`, and open
+/// nothing. The last set shows the whole `u32` is read, not only its low byte or half.
+#[test]
+fn open_application_proxy_with_flags_accepts_only_0_and_2() {
+    assert_eq!(PROXY_FLAGS_ACCEPTED, [0, 2]);
+    let cases = [
+        (0, true),
+        (1, false),
+        (2, true),
+        (3, false),
+        (u32::MAX, false),
+        // Low byte accepted, the second byte set.
+        (0x0000_0100, false),
+        (0x0000_0102, false),
+        // Low half accepted, the third byte set.
+        (0x0001_0000, false),
+        (0x0001_0002, false),
+        // Low three bytes accepted, the top byte set.
+        (0x0200_0000, false),
+    ];
+    for (flags, accepted) in cases {
+        let mut rig = Rig::new();
+        let root = rig.convert();
+        let reply = rig.open_proxy_with_flags_raw(root, flags, PROCESS_ID);
+        let (expected, interfaces) = if accepted {
+            (domain_reply(ResultCode::SUCCESS, &[], &[root + 1]), 2)
+        } else {
+            (domain_reply(UNKNOWN, &[], &[]), 1)
+        };
+        assert_eq!(reply, expected, "flags {flags}");
+        assert_eq!(rig.server.interface_count(), interfaces, "flags {flags}");
+    }
+    // Every value up to 64 other than the two is refused too.
+    let mut rig = Rig::new();
+    let root = rig.convert();
+    for flags in (0..=64).filter(|flags| !PROXY_FLAGS_ACCEPTED.contains(flags)) {
+        let reply = rig.open_proxy_with_flags_raw(root, flags, PROCESS_ID);
+        assert_eq!(reply, domain_reply(UNKNOWN, &[], &[]), "flags {flags}");
+    }
+    assert_eq!(rig.server.interface_count(), 1);
+}
+
+/// The checks in order (module docs, "The Switch 2 additions"): the payload must hold the flags
+/// (starquake's divergence), then the flags (PR's `R_UNLESS`), then command 0's checks, the
+/// process id before the handle. Each case with two faults shows which comes first.
+#[test]
+fn open_application_proxy_with_flags_checks_its_flags_first() {
+    const REFUSED_FLAGS: u32 = 1;
+    let mut rig = Rig::new();
+    let root = rig.convert();
+    let process = rig.process.raw();
+    let accepted = PROXY_FLAGS_ACCEPTED[0];
+    // (payload, pid, handle, result)
+    let cases: [(Vec<u8>, bool, bool, ResultCode); 9] = [
+        // No payload at all, with or without the id and handle: the flags cannot be read.
+        (Vec::new(), true, true, INVALID_CMIF_REQUEST),
+        (Vec::new(), false, false, INVALID_CMIF_REQUEST),
+        // Refused flags win over a missing id or a missing handle.
+        (with_flags_payload(REFUSED_FLAGS, 0), false, true, UNKNOWN),
+        (with_flags_payload(REFUSED_FLAGS, 0), true, false, UNKNOWN),
+        (with_flags_payload(REFUSED_FLAGS, 0), false, false, UNKNOWN),
+        // Accepted flags: command 0's checks, the id first.
+        (with_flags_payload(accepted, 0), false, true, UNKNOWN),
+        (
+            with_flags_payload(accepted, 0),
+            true,
+            false,
+            INVALID_CMIF_REQUEST,
+        ),
+        (with_flags_payload(accepted, 0), false, false, UNKNOWN),
+        // Exactly the flags' four bytes are enough: the id's slot is not read.
+        (
+            accepted.to_le_bytes().to_vec(),
+            true,
+            true,
+            ResultCode::SUCCESS,
+        ),
+    ];
+    for (payload, pid, handle, result) in cases {
+        let mut request = RequestBuilder::domain(
+            CommandType::Request,
+            root,
+            OPEN_APPLICATION_PROXY_WITH_FLAGS,
+        )
+        .data(&payload);
+        if pid {
+            request = request.send_pid(PROCESS_ID);
+        }
+        if handle {
+            request = request.copy_handle(process);
+        }
+        let reply = parse(&rig.send_raw(rig.session, &request), SessionKind::Domain);
+        assert_eq!(
+            reply.result, result,
+            "payload {payload:?}, pid {pid}, handle {handle}"
+        );
+    }
+    // Only the last case opened anything.
+    assert_eq!(rig.server.interface_count(), 2);
+
+    // The exact edge, with libnx's layout, whose domain `size` counts the exact argument bytes
+    // (the default layout rounds them up to a whole word, so a short payload would arrive as
+    // four bytes): every length short of the flags is refused, the flags' own length opens the
+    // proxy.
+    let mut rig = Rig::new();
+    let root = rig.convert();
+    let process = rig.process.raw();
+    let flags = accepted.to_le_bytes();
+    for len in 0..=flags.len() {
+        let request = RequestBuilder::domain(
+            CommandType::Request,
+            root,
+            OPEN_APPLICATION_PROXY_WITH_FLAGS,
+        )
+        .layout(RequestLayout::Libnx)
+        .send_pid(PROCESS_ID)
+        .copy_handle(process)
+        .data(&flags[..len]);
+        let reply = parse(&rig.send_raw(rig.session, &request), SessionKind::Domain);
+        let (result, interfaces) = if len == flags.len() {
+            (ResultCode::SUCCESS, 2)
+        } else {
+            (INVALID_CMIF_REQUEST, 1)
+        };
+        assert_eq!(reply.result, result, "{len} bytes");
+        assert_eq!(rig.server.interface_count(), interfaces, "{len} bytes");
+    }
+}
+
+#[test]
+fn open_application_proxy_with_flags_on_a_plain_session_moves_a_session_handle() {
+    let mut rig = Rig::new();
+    let request = RequestBuilder::cmif(CommandType::Request, OPEN_APPLICATION_PROXY_WITH_FLAGS)
+        .layout(RequestLayout::Libnx)
+        .send_pid(PROCESS_ID)
+        .copy_handle(rig.process.raw())
+        .data(&with_flags_payload(PROXY_FLAGS_ACCEPTED[1], 0));
+    let reply = parse(&rig.send_raw(rig.session, &request), SessionKind::Session);
+    assert_eq!(reply.result, ResultCode::SUCCESS);
+    assert_eq!(reply.moves.len(), 1);
+    let proxy = rig.object_of(reply.moves[0]);
+    let window = parse(
+        &rig.send_raw(
+            proxy,
+            &RequestBuilder::cmif(CommandType::Request, GET_WINDOW_CONTROLLER),
+        ),
+        SessionKind::Session,
+    );
+    assert_eq!(window.result, ResultCode::SUCCESS);
+    assert_eq!(window.moves.len(), 1);
+}
+
+/// The proxy command 10 returns is the one command 0 returns: two rigs, one opened each way,
+/// answer every proxy command with the same bytes, and save the same snapshot.
+#[test]
+fn the_proxy_opened_with_flags_answers_as_the_one_opened_without() {
+    let mut plain = Rig::new();
+    let root = plain.convert();
+    let reply = parse(&plain.open_proxy_raw(root, PROCESS_ID), SessionKind::Domain);
+    let plain_proxy = reply.objects[0];
+
+    let mut flagged = Rig::new();
+    let root = flagged.convert();
+    let raw = flagged.open_proxy_with_flags_raw(root, PROXY_FLAGS_ACCEPTED[1], PROCESS_ID);
+    let flagged_proxy = parse(&raw, SessionKind::Domain).objects[0];
+    assert_eq!(flagged_proxy, plain_proxy);
+    assert_eq!(flagged.server.save().unwrap(), plain.server.save().unwrap());
+
+    for (command, interface) in OPENED.iter().chain(SWITCH2_OPENED.iter()) {
+        let plain_reply = plain.object_raw(plain_proxy, *command, &[]);
+        let flagged_reply = flagged.object_raw(flagged_proxy, *command, &[]);
+        assert_eq!(flagged_reply, plain_reply, "{interface}");
+        assert_eq!(
+            parse(&flagged_reply, SessionKind::Domain).result,
+            ResultCode::SUCCESS,
+            "{interface}"
+        );
+    }
+    // The window controller opened from the flagged proxy reports the caller's process id.
+    let window = flagged.open(flagged_proxy, GET_WINDOW_CONTROLLER);
+    assert_eq!(
+        flagged.object_raw(window, GET_APPLET_RESOURCE_USER_ID, &[]),
+        domain_reply(ResultCode::SUCCESS, &PROCESS_ID.to_le_bytes(), &[])
+    );
+    plain.open(plain_proxy, GET_WINDOW_CONTROLLER);
+    assert_eq!(flagged.server.save().unwrap(), plain.server.save().unwrap());
+}
+
+#[test]
+fn each_switch_2_proxy_command_returns_its_interface() {
+    for (command, interface) in SWITCH2_OPENED {
+        let mut rig = Rig::new();
+        let proxy = rig.proxy();
+        assert!(!rig.holds(interface), "{interface} before it is opened");
+        let reply = rig.object_raw(proxy, command, &[]);
+        assert_eq!(
+            reply,
+            domain_reply(ResultCode::SUCCESS, &[], &[proxy + 1]),
+            "{interface}"
+        );
+        assert!(rig.holds(interface), "{interface}");
+        assert_eq!(rig.server.interface_count(), 3, "{interface}");
+    }
+}
+
+/// `GraphicsScalingParameters` as the reply carries it: each field a little-endian `u32`, in
+/// declaration order. Distinct values, so a swap of any two fails.
+#[test]
+fn graphics_scaling_parameters_are_written_in_declaration_order() {
+    let parameters = GraphicsScalingParameters {
+        graphics_scale: 0x0403_0201,
+        screen_ratio_numerator: 0x1413_1211,
+        screen_ratio_denominator: 0x2423_2221,
+    };
+    let mut writer = Writer::new();
+    parameters.write(&mut writer);
+    assert_eq!(
+        writer.as_bytes(),
+        [
+            0x01, 0x02, 0x03, 0x04, 0x11, 0x12, 0x13, 0x14, 0x21, 0x22, 0x23, 0x24
+        ]
+    );
+}
+
+/// The values the Switch 2 commands answer are PR #4588's (module docs, "The Switch 2
+/// additions"), checked against the reference here once; the other tests derive from the
+/// constants.
+#[test]
+fn the_switch_2_answers_are_pr_4588_s() {
+    // `graphics_scaling_parameters_functions.cpp`: `*out_parameters = {10, 1, 1}`.
+    assert_eq!(
+        GraphicsScalingParameters::PR_4588,
+        GraphicsScalingParameters {
+            graphics_scale: 10,
+            screen_ratio_numerator: 1,
+            screen_ratio_denominator: 1,
+        }
+    );
+    // `application_functions.cpp`: 320 over `applet.h`'s initial values (`Inherit !=
+    // Disable`, and `false && ..`), then 321's `*out_enabled = false`.
+    assert_eq!(
+        [
+            SCREENSHOT_INITIALLY_ENABLED,
+            CONTINUOUS_RECORDING_INITIALLY_ENABLED,
+            UNKNOWN_321_ENABLED,
+        ],
+        [true, false, false]
+    );
+}
+
+#[test]
+fn get_graphics_scaling_parameters_answers_pr_4588_s_parameters() {
+    let mut rig = Rig::new();
+    let proxy = rig.proxy();
+    let scaling = rig.open(proxy, GET_GRAPHICS_SCALING_PARAMETERS_FUNCTIONS);
+    let mut expected = Writer::new();
+    GraphicsScalingParameters::PR_4588.write(&mut expected);
+    assert_eq!(
+        rig.object_raw(scaling, GET_GRAPHICS_SCALING_PARAMETERS, &[]),
+        domain_reply(ResultCode::SUCCESS, expected.as_bytes(), &[])
+    );
+    // The notification flag changes no answer (PR reads it nowhere else).
+    rig.object(
+        scaling,
+        SET_GRAPHICS_SCALE_CHANGED_NOTIFICATION_ENABLED,
+        &[1],
+    );
+    assert!(rig.applet().graphics_scale_changed_notification_enabled());
+    assert_eq!(
+        rig.object_raw(scaling, GET_GRAPHICS_SCALING_PARAMETERS, &[]),
+        domain_reply(ResultCode::SUCCESS, expected.as_bytes(), &[])
+    );
+}
+
+/// The flag is kept in the applet, initially false; each step changes it or leaves it, and a
+/// payload with no byte is refused and changes nothing, whichever value it holds. Only the first
+/// byte is the `bool`: a zero byte followed by a non-zero one clears the flag.
+#[test]
+fn set_graphics_scale_changed_notification_enabled_keeps_its_flag() {
+    let mut rig = Rig::new();
+    let proxy = rig.proxy();
+    let scaling = rig.open(proxy, GET_GRAPHICS_SCALING_PARAMETERS_FUNCTIONS);
+    assert!(!rig.applet().graphics_scale_changed_notification_enabled());
+    let refused = domain_reply(INVALID_CMIF_REQUEST, &[], &[]);
+    let steps: [(&[u8], bool); 8] = [
+        (&[], false),
+        (&[0], false),
+        (&[1], true),
+        (&[], true),
+        (&[0xFF], true),
+        (&[0], false),
+        (&[2], true),
+        (&[0, 1], false),
+    ];
+    for (data, expected) in steps {
+        let before = rig.applet();
+        let reply = rig.object_raw(
+            scaling,
+            SET_GRAPHICS_SCALE_CHANGED_NOTIFICATION_ENABLED,
+            data,
+        );
+        if data.is_empty() {
+            assert_eq!(reply, refused, "{data:?}");
+            assert_eq!(rig.applet(), before, "{data:?}");
+        } else {
+            assert_eq!(
+                reply,
+                domain_reply(ResultCode::SUCCESS, &[], &[]),
+                "{data:?}"
+            );
+        }
+        assert_eq!(
+            rig.applet().graphics_scale_changed_notification_enabled(),
+            expected,
+            "{data:?}"
+        );
+    }
+}
+
+#[test]
+fn get_screen_shot_and_continuous_recording_initially_enabled_answers_two_bytes() {
+    let mut rig = Rig::new();
+    let proxy = rig.proxy();
+    let functions = rig.open(proxy, GET_APPLICATION_FUNCTIONS);
+    let expected = [
+        u8::from(SCREENSHOT_INITIALLY_ENABLED),
+        u8::from(CONTINUOUS_RECORDING_INITIALLY_ENABLED),
+    ];
+    assert_eq!(
+        rig.object_raw(
+            functions,
+            GET_SCREEN_SHOT_AND_CONTINUOUS_RECORDING_INITIALLY_ENABLED,
+            &[]
+        ),
+        domain_reply(ResultCode::SUCCESS, &expected, &[])
+    );
+}
+
+#[test]
+fn unknown_321_answers_pr_4588_s_guess() {
+    let mut rig = Rig::new();
+    let proxy = rig.proxy();
+    let functions = rig.open(proxy, GET_APPLICATION_FUNCTIONS);
+    assert_eq!(
+        rig.object_raw(functions, UNKNOWN_321, &[]),
+        domain_reply(ResultCode::SUCCESS, &[u8::from(UNKNOWN_321_ENABLED)], &[])
+    );
+}
+
+/// PR #4588's `nullptr` rows, and 330, which the scoping doc does not name, go to the
+/// unknown-command policy.
+#[test]
+fn the_switch_2_commands_pr_4588_leaves_unimplemented_go_to_the_unknown_command_policy() {
+    let mut rig = Rig::new();
+    let proxy = rig.proxy();
+    let performance = rig.open(proxy, GET_PERFORMANCE_FUNCTIONS);
+    let scaling = rig.open(proxy, GET_GRAPHICS_SCALING_PARAMETERS_FUNCTIONS);
+    let functions = rig.open(proxy, GET_APPLICATION_FUNCTIONS);
+    let refused = domain_reply(UNKNOWN_COMMAND_ID, &[], &[]);
+    for command in PERFORMANCE_FUNCTIONS_ROWS {
+        assert_eq!(
+            rig.object_raw(performance, command, &[]),
+            refused,
+            "{command}"
+        );
+    }
+    for command in GRAPHICS_SCALING_DEBUG_ROWS {
+        assert_eq!(rig.object_raw(scaling, command, &[]), refused, "{command}");
+    }
+    assert_eq!(rig.object_raw(functions, UNKNOWN_330, &[]), refused);
+}
+
+/// A server saved with the Switch 2 interfaces open and the notification flag set restores, and
+/// the objects opened before the save answer after it.
+#[test]
+fn a_server_with_the_switch_2_interfaces_saves_and_restores() {
+    let mut rig = Rig::new();
+    let root = rig.convert();
+    let raw = rig.open_proxy_with_flags_raw(root, PROXY_FLAGS_ACCEPTED[1], PROCESS_ID);
+    let proxy = parse(&raw, SessionKind::Domain).objects[0];
+    let performance = rig.open(proxy, GET_PERFORMANCE_FUNCTIONS);
+    let scaling = rig.open(proxy, GET_GRAPHICS_SCALING_PARAMETERS_FUNCTIONS);
+    let functions = rig.open(proxy, GET_APPLICATION_FUNCTIONS);
+    rig.object(
+        scaling,
+        SET_GRAPHICS_SCALE_CHANGED_NOTIFICATION_ENABLED,
+        &[1],
+    );
+    let saved = rig.server.save().unwrap();
+
+    let mut restored = oe_server(AppletSettings::eden_default(), UnknownPolicy::Strict);
+    restored.restore(&saved).unwrap();
+    assert_eq!(restored.family::<Applet>(), Some(&rig.applet()));
+    assert_eq!(restored.save().unwrap(), saved);
+    rig.server = restored;
+    assert!(rig.applet().graphics_scale_changed_notification_enabled());
+
+    let mut parameters = Writer::new();
+    GraphicsScalingParameters::PR_4588.write(&mut parameters);
+    assert_eq!(
+        rig.object_raw(scaling, GET_GRAPHICS_SCALING_PARAMETERS, &[]),
+        domain_reply(ResultCode::SUCCESS, parameters.as_bytes(), &[])
+    );
+    rig.object(
+        scaling,
+        SET_GRAPHICS_SCALE_CHANGED_NOTIFICATION_ENABLED,
+        &[0],
+    );
+    assert!(!rig.applet().graphics_scale_changed_notification_enabled());
+    assert_eq!(
+        rig.object_raw(functions, UNKNOWN_321, &[]),
+        domain_reply(ResultCode::SUCCESS, &[u8::from(UNKNOWN_321_ENABLED)], &[])
+    );
+    assert_eq!(
+        rig.object_raw(performance, PERFORMANCE_FUNCTIONS_ROWS[0], &[]),
+        domain_reply(UNKNOWN_COMMAND_ID, &[], &[])
+    );
+    // The proxy opened with flags still opens interfaces.
+    let window = rig.open(proxy, GET_WINDOW_CONTROLLER);
+    assert_eq!(
+        rig.object_raw(window, GET_APPLET_RESOURCE_USER_ID, &[]),
+        domain_reply(ResultCode::SUCCESS, &PROCESS_ID.to_le_bytes(), &[])
+    );
 }
