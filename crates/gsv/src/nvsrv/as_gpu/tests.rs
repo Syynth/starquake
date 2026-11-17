@@ -1061,3 +1061,145 @@ fn a_saved_view_must_fit_the_files() {
     both.files.insert(tsg, Device::Nvmap);
     assert_eq!(check(&both), Err(NvsrvStateError::NotAnAddressSpace { fd }));
 }
+
+/// What a restore accepts as a view of a parent: each of [`Layout::is_view_of`]'s conditions
+/// failing alone is refused, and the edges are accepted.
+#[test]
+fn a_view_of_a_parent_is_checked_condition_by_condition() {
+    let parent = MADE;
+    let view = child_of(&parent);
+    assert!(view.is_view_of(&parent));
+    let page = SMALL_PAGE_SIZE;
+    let accepted = [
+        Layout {
+            end: parent.split,
+            split: parent.split,
+            ..view
+        },
+        Layout {
+            start: parent.split - page,
+            ..view
+        },
+    ];
+    for layout in accepted {
+        assert!(layout.is_view_of(&parent), "{layout:?}");
+    }
+    let refused = [
+        Layout {
+            split: view.end - page,
+            ..view
+        },
+        Layout {
+            big_page_size: 0x2_0000,
+            ..view
+        },
+        Layout {
+            start: parent.start - page,
+            ..view
+        },
+        Layout {
+            start: view.end,
+            ..view
+        },
+        Layout {
+            end: parent.split + page,
+            split: parent.split + page,
+            ..view
+        },
+        Layout {
+            start: parent.start + 0x800,
+            ..view
+        },
+        Layout {
+            end: parent.split - 0x800,
+            split: parent.split - 0x800,
+            ..view
+        },
+    ];
+    for layout in refused {
+        assert!(!layout.is_view_of(&parent), "{layout:?}");
+    }
+}
+
+/// A server saved with a view and a timeslice group restores, over the same gsv state, and
+/// carries on: the view answers its regions and shim, the group unbinds its channel, and the
+/// next `AllocAsEx` makes the next address space.
+#[test]
+fn a_restored_server_carries_on_with_views_and_groups() {
+    use super::super::tests::{as_front, cmif};
+    use super::super::{CLOSE, nvsrv_server};
+
+    let mut rig = Rig::new();
+    let fd = rig.open_device(Device::NvhostAsGpu);
+    let tsg = rig.open_device(Device::NvhostTsgGpu);
+    let channel = rig.open_device(Device::NvhostGpu);
+    let request = plain(0x1_0000, 0x10_0000, 0x100_0000, 0x40_0000);
+    rig.ioctl(fd, AS_ALLOC_AS_EX, &request, request.len());
+    let bind = le(&[channel.cast_unsigned()]);
+    let (reply, _) = rig.ioctl(tsg, crate::nvsrv::tsg_gpu::BIND_CHANNEL, &bind, 4);
+    assert_eq!(reply, ok(&[0]));
+    let saved = rig.server.save().unwrap();
+    let state = rig.state().clone();
+
+    let restored = nvsrv_server(
+        Arc::clone(&rig.shared),
+        as_front(&rig.front),
+        UnknownPolicy::Strict,
+    );
+    rig.server = restored.with_service_id(rig.server.service_id());
+    rig.server.restore(&saved).unwrap();
+    assert_eq!(rig.state(), &state);
+    let (reply, out) = rig.ioctl(fd, AS_GET_VA_REGIONS, &va_request(), 0x40);
+    assert_eq!(reply, ok(&[0]));
+    let regions = [
+        region(0x10_0000, 0x1000, 0x300),
+        region(0x40_0000, 0x1_0000, 0xC0),
+    ];
+    assert_eq!(out, va_reply(0x30, &regions));
+    let (reply, out) = rig.ioctl(fd, AS_SHIM_INFO, &shim_request(), 16);
+    assert_eq!(
+        (reply, out),
+        (ok(&[0]), shim_reply(0x3F_F000, 4, SYNCPOINT_COUNT))
+    );
+    let unbind = crate::nvsrv::tsg_gpu::UNBIND_CHANNEL;
+    let (reply, _) = rig.ioctl(tsg, unbind, &bind, 4);
+    assert_eq!(reply, ok(&[0]));
+    let other = rig.open_device(Device::NvhostAsGpu);
+    assert_eq!(other, channel + 1);
+    let (reply, _) = rig.ioctl(other, AS_ALLOC_AS_EX, &request, request.len());
+    assert_eq!(reply, ok(&[0]));
+    assert_eq!(
+        rig.state()
+            .as_gpu()
+            .view(other.cast_unsigned())
+            .unwrap()
+            .space,
+        AsId(2)
+    );
+    rig.send(&cmif(CLOSE, &fd.to_le_bytes()));
+    assert_eq!(rig.state().as_gpu().view(fd.cast_unsigned()), None);
+}
+
+/// A view whose address space gsv does not hold (a restore whose nvsrv and gsv states disagree,
+/// module docs of `crate::nvsrv`) answers its shim with `BadValue` and zero fields, and nothing
+/// is placed; its regions still answer from its layout.
+#[test]
+fn a_view_of_a_space_gsv_does_not_hold_answers_bad_value() {
+    let (mut direct, fd) = opened();
+    let request = plain(0, 0x10_0000, 0x100_0000, 0x40_0000);
+    assert_eq!(
+        direct.ioctl(fd, AS_ALLOC_AS_EX, &request).result,
+        NvResult::Success
+    );
+    // The same nvsrv state over a GPU memory that holds nothing.
+    let mut other = Direct::new();
+    other.state = direct.state.clone();
+    let answer = other.ioctl(fd, AS_SHIM_INFO, &shim_request());
+    assert_eq!(
+        (answer.result, answer.output),
+        (NvResult::BadValue, shim_reply(0, 0, 0))
+    );
+    assert_eq!(other.memory.address_spaces().count(), 0);
+    let answer = other.ioctl(fd, AS_GET_VA_REGIONS, &va_request());
+    assert_eq!(answer.result, NvResult::Success);
+}

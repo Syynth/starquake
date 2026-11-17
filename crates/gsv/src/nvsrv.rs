@@ -1,10 +1,13 @@
 //! nvsrv: the NVIDIA driver session gsv 1402 returns, which speaks the old nvdrv
 //! `INvDrvServices` protocol (`Open`, the three `Ioctl` variants, `Close`, `QueryEvent`) over the devices
 //! Switch 2's NvRm opens (`docs/specs/graphics-server.md`, "Channels and submission: nvsrv";
-//! port slice 9).
+//! port slices 9 and 10).
 //!
 //! * [`ioctl`]: ioctl numbers, and the fixed-size argument structs devices read.
 //! * [`nvmap`]: `/dev/nvmap` and its handle table.
+//! * [`ctrl_gpu`]: `/dev/nvhost-ctrl-gpu`, the GPU's characteristics block (slice 10).
+//! * [`as_gpu`]: `/dev/nvhost-as-gpu`, address-space views over gsv's GPU memory (slice 10).
+//! * [`tsg_gpu`]: `/dev/nvhost-tsg-gpu`, timeslice groups (slice 10).
 //!
 //! Ported from Eden (GPL-3.0-or-later) @ cf654052: `eden/src/core/hle/service/nvdrv/`
 //! `nvdrv_interface.cpp` (`NVDRV`: the commands and their framing), `nvdrv.cpp` (`Module`: the
@@ -84,20 +87,33 @@
 //! An fd a command names is checked as Eden's `Module` checks it: negative → `InvalidState`, not
 //! open → `NotImplemented`, before the device is asked anything.
 //!
-//! **What each device does in this slice.** `/dev/nvmap` has its ioctls ([`nvmap`]). The others
-//! open, but have no ioctls yet: ctrl-gpu, as-gpu and tsg-gpu come with port slice 10,
-//! nvhost-gpu with slice 11, and the rest are Switch 1 devices (decision 11 builds only what
-//! Switch 2's driver uses). No device has events yet, so `QueryEvent` on an open fd answers
-//! `BadParameter`, Eden's answer for a device with none (`nvdevice::QueryEvent` returns
-//! `nullptr`); ctrl-gpu's and nvhost-gpu's events come with their slices.
+//! **What each device does.** `/dev/nvmap` has its ioctls ([`nvmap`]); `/dev/nvhost-ctrl-gpu`
+//! answers `GetCharacteristics` ([`ctrl_gpu`]); `/dev/nvhost-as-gpu` makes views of gsv's GPU
+//! address spaces and reports their regions and syncpoint shim ([`as_gpu`]); and
+//! `/dev/nvhost-tsg-gpu` keeps timeslice groups ([`tsg_gpu`]). Each lists the ioctls it does not
+//! serve yet. The others open, but have no ioctls yet: nvhost-gpu comes with port slice 11, and
+//! the rest are Switch 1 devices (decision 11 builds only what Switch 2's driver uses). No device
+//! has events yet, so `QueryEvent` on an open fd answers `BadParameter`, Eden's answer for a
+//! device with none (`nvdevice::QueryEvent` returns `nullptr`); nvhost-gpu's events come with
+//! slice 11, and ctrl-gpu's two are not built ([`ctrl_gpu`], "Not built").
+//!
+//! **The server's wiring.** nvhost-as-gpu acts on gsv's GPU memory, the bookkeeping the gpu
+//! session's 33 and its worker use, so [`nvsrv_server`] takes gsv's shared state and the GPU's
+//! front as [`crate::gpu::gpu_server`] does, and its family ([`NvsrvFamily`]) holds them beside
+//! the state. Every ioctl runs with gsv's shared lock held ([`NvsrvFamily::ioctl`]); nothing
+//! under it calls the kernel, and the front never calls back into gsv.
 //!
 //! # Ioctls
 //!
 //! `Ioctl`, `Ioctl2` and `Ioctl3` read the fd and the ioctl number, read the in buffer, check
-//! the fd, and hand the device the ioctl ([`ioctl::Ioctl`]) and the argument. If the ioctl's
-//! [`is_out`](ioctl::Ioctl::is_out) bit is set, what the device gives back is written to out
-//! buffer 0, clipped to the buffer (`WrapGeneric`: `std::min(output.size(), sizeof(FixedArg))`),
-//! whatever the result.
+//! the fd, and hand the device an [`IoctlCall`]: the ioctl ([`ioctl::Ioctl`]), the argument, and
+//! the sizes of out buffer 0 and, for `Ioctl3`, out buffer 1 (which ctrl-gpu and tsg-gpu check).
+//! If the ioctl's [`is_out`](ioctl::Ioctl::is_out) bit is set, what the device gives back is
+//! written to out buffer 0, clipped to the buffer (`WrapGeneric`: `std::min(output.size(),
+//! sizeof(FixedArg))`), whatever the result; and for `Ioctl3`, what it gives back inline is
+//! written to out buffer 1, clipped likewise. A device gives back a fixed struct whatever the
+//! result, as Eden's `WrapGeneric` does (nvmap, as-gpu), and nothing on a refusal where PR
+//! returns before filling its buffers (ctrl-gpu's characteristics, tsg-gpu).
 //!
 //! **An ioctl the device does not know** (`docs/specs/graphics-server.md`: "not implemented" under
 //! the strict policy and a zeroed success under auto-stub), by the server's [`UnknownPolicy`]:
@@ -115,9 +131,19 @@
 //! # What is recorded and what is saved
 //!
 //! Every request is one IPC event in the run's stream, recorded by the service framework with
-//! its payload; nvsrv has no input from the host, so it writes no notes. The open files and the
-//! nvmap handles are the family state, plain data saved with the server, and restoring checks
-//! every relation between their fields ([`NvsrvStateError`], [`nvmap::NvMapStateError`]).
+//! its payload; nvsrv has no input from the host, so it writes no notes. The open files, the
+//! nvmap handles, nvhost-as-gpu's views and the layouts of the address spaces it made, and
+//! nvhost-tsg-gpu's groups are the family state, plain data saved with the server (the wiring is
+//! not saved), and restoring checks every relation between their fields ([`NvsrvStateError`],
+//! [`nvmap::NvMapStateError`], [`as_gpu::AsGpuStateError`], [`tsg_gpu::TsgStateError`]): each
+//! view on an open as-gpu fd, each group on an open tsg-gpu fd, each bound channel's fd one that
+//! was handed out.
+//!
+//! The address spaces themselves are gsv's shared state's, saved with it
+//! ([`crate::gpu::saved`]). That a view's address space is one the shared state holds is a
+//! relation between the two snapshots, which neither restore can check alone: composing them is
+//! the wiring slice's (16), as for the gpu session's. Until then a view whose address space is
+//! missing answers its shim with `BadValue` ([`as_gpu`], `shim_page`) and nothing panics.
 //!
 //! # Where this differs from the references
 //!
@@ -127,7 +153,8 @@
 //! |---|---|---|
 //! | An in buffer larger than [`ioctl::MAX_ARGUMENT_BYTES`] | read whole | its first [`ioctl::MAX_ARGUMENT_BYTES`] bytes are read, the rest never touched: no device of this slice reads past its fixed struct, and a title cannot make the server copy more (`an_in_buffer_is_read_up_to_the_largest_argument`) |
 //! | An out buffer, written when `is_out` is set | written whole, past what the device gave back too, with whatever the server's scratch buffer held; also on an fd error | written only as far as the device's answer (or the auto-stub's zeros); nothing on an fd error or a strict unknown ioctl (`an_out_buffer_gets_only_the_answer`, `fd_checks_come_before_the_policy`) |
-//! | `Ioctl2`'s inline input, `Ioctl3`'s inline output | read; written when `is_out` is set | not read, not written: no device of this slice takes or gives one (`inline_buffers_are_left_alone`) |
+//! | `Ioctl2`'s inline input | read | not read: no device takes one (`inline_buffers_are_left_alone`) |
+//! | `Ioctl3`'s inline output, written when `is_out` is set | written whole, with whatever the server's scratch buffer held past the device's answer | written only as far as the device's answer, nothing when it gives none (`inline_buffers_are_left_alone`; `ctrl_gpu/tests.rs`: `only_the_packet_and_the_block_are_written`) |
 //! | A path no device has, under auto-stub | NX2 opens any `/dev/nvhost-*` path as a stub device | refused under both policies, as Eden refuses it (`an_unknown_path_is_refused_under_both_policies`) |
 //! | [`MAX_OPEN_FILES`] files open, or fds used up | no limit; the next fd overflows its `s32` | fd -1 and `FileOperationFailed` (a guess), nothing opened and no fd used (`open_refuses_a_full_table_and_spent_fds`) |
 //! | A TIPC request | NX2 and PR: auto-stubbed or refused, as for any command they lack | the server's unknown-command policy (`a_tipc_request_goes_to_the_policy`) |
@@ -390,7 +417,7 @@ impl IoctlAnswer {
 
 /// One ioctl as a device sees it: the command that carried it, the fd, the number, the argument
 /// read from in buffer 0, and the sizes of out buffer 0 and (for `Ioctl3`) out buffer 1, which
-/// some devices check (a missing buffer is size 0, as Eden's `GetWriteBufferSize` reads it).
+/// some devices check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IoctlCall<'a> {
     /// `Ioctl`, `Ioctl2` or `Ioctl3`.
@@ -874,13 +901,11 @@ fn run_ioctl(
     reply.ok()
 }
 
-/// Out buffer `index`'s size; 0 when the request has none (Eden `GetWriteBufferSize`).
+/// Out buffer `index`'s size (Eden `GetWriteBufferSize`). The framework refuses a request that
+/// lacks a declared buffer before the handler runs, so the buffer is there.
 fn out_buffer_len(cx: &mut Context<'_>, req: &Request<'_>, index: usize) -> Result<usize, Fault> {
-    match req.out_buffer(cx, index) {
-        Ok(buffer) => Ok(usize::try_from(buffer.len()).unwrap_or(usize::MAX)),
-        Err(Fault::NoBuffer { .. }) => Ok(0),
-        Err(fault) => Err(fault),
-    }
+    let len = req.out_buffer(cx, index)?.len();
+    Ok(usize::try_from(len).unwrap_or(usize::MAX))
 }
 
 /// Writes `bytes` to the start of out buffer `index`, clipped to the buffer.

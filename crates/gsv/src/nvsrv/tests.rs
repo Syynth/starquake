@@ -58,7 +58,7 @@ const NVMAP_FREE: u32 = 0xC018_0105;
 /// nvmap's `IocParam`: `_NV_IOWR(0x01, 0x09, data)`, 12 bytes.
 const NVMAP_PARAM: u32 = 0xC00C_0109;
 /// nvhost-ctrl-gpu's `GetCharacteristics` (`nvhost_ctrl_gpu.cpp`: group 0x47, command 0x5),
-/// both directions, 0xB0 bytes: a device with no ioctls in this slice.
+/// both directions, 0xB0 bytes, on `Ioctl`: the Switch 1 form, which ctrl-gpu does not serve.
 const CTRL_GPU_CHARACTERISTICS: u32 = 0xC0B0_4705;
 
 // ----- The wiring ------------------------------------------------------------------------------
@@ -1026,7 +1026,8 @@ fn an_unknown_ioctl_under_each_policy() {
     assert_eq!(output, vec![STALE; 0x100]);
 }
 
-/// Every device but nvmap has no ioctl yet; nvmap has none on `Ioctl2` or `Ioctl3`.
+/// nvmap's `IocCreate` number is known to nvmap's `Ioctl` alone: no other device has an ioctl in
+/// nvmap's group, and nvmap has none on `Ioctl2` or `Ioctl3`.
 #[test]
 fn only_nvmap_s_ioctl_1_commands_are_known() {
     let mut state = NvsrvState::new();
