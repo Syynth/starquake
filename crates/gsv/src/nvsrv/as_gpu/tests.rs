@@ -466,13 +466,13 @@ fn a_view_of_a_made_space_uses_its_layout() {
     assert_eq!(direct.memory.address_spaces().count(), 1);
 }
 
-/// `as_fd` that names nothing gsv holds, or is negative, is `BadParameter`, before the big page
-/// size (both faults at once answer it), and nothing is made.
+/// `as_fd` that names nothing gsv holds, or is negative, is `BadParameter` for a request that
+/// is otherwise a view PR supports, and nothing is made.
 #[test]
 fn a_parent_gsv_does_not_hold_is_a_bad_parameter() {
     for as_fd in [-1, i32::MIN, 1, 2, i32::MAX] {
         let (mut direct, fd) = opened();
-        let request = alloc(5, as_fd, 0x3_0000, 0, [WINDOW_START, 0xA0_0000_0000, 0]);
+        let request = alloc(5, as_fd, 0x1000, 0, [WINDOW_START, 0xA0_0000_0000, 0]);
         let answer = direct.ioctl(fd, AS_ALLOC_AS_EX, &request);
         assert_eq!(answer.result, NvResult::BadParameter, "{as_fd}");
         assert_eq!(direct.state.as_gpu().view(1), None);

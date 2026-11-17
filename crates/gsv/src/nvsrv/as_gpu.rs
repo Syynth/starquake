@@ -55,7 +55,8 @@
 //! 3. the big page size after PR's mapping of 0x1000 to 0x10000 ([`big_page_size`]) not 0, not
 //!    a power of two or not one of [`SUPPORTED_BIG_PAGE_SIZES`]: `BadValue`;
 //! 4. (starquake's, see "Where this differs") the layout not page aligned, its ranges out of
-//!    order, or its end past [`VA_LIMIT`]: `BadValue`;
+//!    order, or its end past [`VA_LIMIT`]: `BadValue` (so 3 and 4 answer alike, and their order
+//!    cannot be seen);
 //! 5. no parent, and gsv holds [`MAX_ADDRESS_SPACES`] already: `InsufficientMemory` (a guess:
 //!    PR opens a new GMMU and has no limit).
 //!
@@ -587,9 +588,10 @@ impl AsGpu {
                 big_page_size: big,
             }
         };
-        // With a parent: PR's `vm.va_range_split = params.va_range_end`. Without one and with
-        // split 0: conflict (module docs), the split is the end too.
-        if parent.is_some() || (requested.start != 0 && requested.split == 0) {
+        // A split of 0 becomes the end. With a parent this is PR's `vm.va_range_split =
+        // params.va_range_end`: the view check let through only a split of 0 or one equal to the
+        // end. Without one it is the conflict of the module docs.
+        if requested.start != 0 && requested.split == 0 {
             layout.split = layout.end;
         }
         if !layout.is_valid() {
@@ -641,14 +643,10 @@ impl AsGpu {
         arg.set_u32::<{ VA_REGION_1 + REGION_PAGE_SIZE }>(second.page_size);
         arg.set_u32::<{ VA_REGION_1 + REGION_PAGE_SIZE + 4 }>(0);
         arg.set_u64::<{ VA_REGION_1 + REGION_PAGES }>(second.pages);
+        // A region past `count` is zero already ([`regions`]).
         let mut written = Vec::new();
         if inline {
-            for (index, region) in found.into_iter().enumerate().take(room) {
-                let region = if index < count {
-                    region
-                } else {
-                    Region::default()
-                };
+            for region in found.into_iter().take(room) {
                 written.extend(region.to_bytes());
             }
         }
