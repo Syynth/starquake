@@ -32,7 +32,7 @@ use std::sync::Arc;
 use starquake_kernel::handle::Handle;
 use starquake_kernel::id::ObjectId;
 use starquake_kernel::ipc::EventHook;
-use starquake_kernel::memory::{SharedPages, SvcPermission};
+use starquake_kernel::memory::{DeviceShareToken, SharedPages, SvcPermission};
 use starquake_kernel::result::{KernelError, SvcResult};
 use starquake_trace::{EventKind, ServiceId};
 
@@ -128,19 +128,25 @@ pub trait Kernel {
     }
 
     /// Takes a device-share lock on the caller's `size` bytes at `address`: while it is held,
-    /// the CPU mapping under the range cannot change. Locks nest; each is released by one
-    /// [`Kernel::unlock_device_share`] of the same range. The kernel's errors are its address
-    /// space's (`AddressSpace::lock_device_share`).
+    /// the CPU mapping under the range cannot change. Returns the token naming the process and
+    /// the exact range (graphics-server spec, "The model"). Locks nest; each is released by one
+    /// unlock of its token: on the timer thread through gsv's completion queue
+    /// (`Dispatcher::unlock_device_share`), or during a request with
+    /// [`Kernel::unlock_device_share`]. The kernel's errors are its address space's
+    /// (`AddressSpace::lock_device_share`).
     ///
     /// The default answers [`KernelError::NotImplemented`].
-    fn lock_device_share(&mut self, _address: u64, _size: u64) -> SvcResult<()> {
+    fn lock_device_share(&mut self, _address: u64, _size: u64) -> SvcResult<DeviceShareToken> {
         Err(KernelError::NotImplemented)
     }
 
-    /// Releases a device-share lock [`Kernel::lock_device_share`] took on the same range.
+    /// Releases the device-share lock `token` names, during a request: what a service does when
+    /// a request that took a lock fails after taking it. A token the kernel refuses (another
+    /// process's, or one whose lock is gone) is [`KernelError::InvalidCurrentMemory`]
+    /// (`DeviceShareError`'s mapping).
     ///
     /// The default answers [`KernelError::NotImplemented`].
-    fn unlock_device_share(&mut self, _address: u64, _size: u64) -> SvcResult<()> {
+    fn unlock_device_share(&mut self, _token: DeviceShareToken) -> SvcResult<()> {
         Err(KernelError::NotImplemented)
     }
 

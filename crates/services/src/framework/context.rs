@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use starquake_kernel::id::ObjectId;
 use starquake_kernel::ipc::EventHook;
-use starquake_kernel::memory::{SharedPages, SvcPermission};
+use starquake_kernel::memory::{DeviceShareToken, SharedPages, SvcPermission};
 use starquake_trace::Env;
 
 use super::defer::{Deferral, ReplyToken, TokenId};
@@ -119,15 +119,20 @@ impl Context<'_> {
     }
 
     /// Takes a device-share lock on the caller's `size` bytes at `address`, so that the CPU
-    /// mapping under memory the GPU may use cannot change. See [`Kernel::lock_device_share`].
-    pub fn lock_device_share(&mut self, address: u64, size: u64) -> Result<(), Fault> {
+    /// mapping under memory the GPU may use cannot change, and returns the lock's token. See
+    /// [`Kernel::lock_device_share`].
+    pub fn lock_device_share(
+        &mut self,
+        address: u64,
+        size: u64,
+    ) -> Result<DeviceShareToken, Fault> {
         Ok(self.kernel.lock_device_share(address, size)?)
     }
 
-    /// Releases a device-share lock taken on the same range with
-    /// [`Context::lock_device_share`]. See [`Kernel::unlock_device_share`].
-    pub fn unlock_device_share(&mut self, address: u64, size: u64) -> Result<(), Fault> {
-        Ok(self.kernel.unlock_device_share(address, size)?)
+    /// Releases the device-share lock `token` names, which [`Context::lock_device_share`]
+    /// returned. See [`Kernel::unlock_device_share`].
+    pub fn unlock_device_share(&mut self, token: DeviceShareToken) -> Result<(), Fault> {
+        Ok(self.kernel.unlock_device_share(token)?)
     }
 
     /// Copies `out.len()` bytes of the caller's memory at `address` into `out`.
