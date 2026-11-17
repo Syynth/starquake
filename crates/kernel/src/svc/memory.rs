@@ -1,6 +1,6 @@
 //! The memory system calls of the calling process: `SetHeapSize` (0x01), `SetMemoryPermission`
-//! (0x02), `SetMemoryAttribute` (0x03), `QueryMemory` (0x06), and Switch 2's
-//! `SetGpuMemoryAttribute` (0x80).
+//! (0x02), `SetMemoryAttribute` (0x03), `MapMemory` (0x04), `UnmapMemory` (0x05),
+//! `QueryMemory` (0x06), and Switch 2's `SetGpuMemoryAttribute` (0x80).
 //!
 //! Each validates its arguments as Horizon does, in Horizon's order, and then calls the
 //! [`AddressSpace`] operation of the same name. Ported from Eden (GPL-3.0-or-later), paths
@@ -8,7 +8,11 @@
 //!
 //! - `eden/src/core/hle/kernel/svc/svc_physical_memory.cpp` @ cf654052, `SetHeapSize`.
 //! - `eden/src/core/hle/kernel/svc/svc_memory.cpp` @ cf654052, `SetMemoryPermission`
-//!   (with `IsValidSetMemoryPermission`) and `SetMemoryAttribute`.
+//!   (with `IsValidSetMemoryPermission`), `SetMemoryAttribute`, and `MapMemory` and
+//!   `UnmapMemory` with `MapUnmapMemorySanityChecks` and `IsValidAddressRange`. Eden-NX2's and
+//!   PR #4588's copies of the last four are Eden's, line for line
+//!   (`eden-nx2/src/core/hle/kernel/svc/svc_memory.cpp` @ 50fa86bb,
+//!   `eden-pr4588/src/core/hle/kernel/svc/svc_memory.cpp` @ e5fb3b97).
 //! - `eden/src/core/hle/kernel/svc/svc_query_memory.cpp` @ cf654052, `QueryMemory` and
 //!   `QueryProcessMemory`.
 //! - The constants: `HeapSizeAlignment` (`eden/src/core/hle/kernel/svc_common.h`) and
@@ -42,6 +46,14 @@
 //! | | `PermissionLocked` is set if it is masked | `InvalidCombination` |
 //! | | the range lies inside the address space | `InvalidCurrentMemory` |
 //! | | the range's state allows the change | `InvalidCurrentMemory` |
+//! | `MapMemory`, `UnmapMemory` | the destination is page aligned | `InvalidAddress` |
+//! | | the source is page aligned | `InvalidAddress` (Eden: `InvalidSize`) |
+//! | | size is not zero | `InvalidSize` |
+//! | | size is page aligned | `InvalidSize` |
+//! | | `dst + size` does not wrap, then `src + size` | `InvalidCurrentMemory` |
+//! | | the source lies inside the address space | `InvalidCurrentMemory` |
+//! | | the destination may hold stack memory (not in Eden) | `InvalidMemoryRegion` |
+//! | | then the page table's checks (`memory::space::alias`) | |
 //! | `QueryMemory` | the guest may write every byte of the result: each block the 0x28 bytes touch has user write permission | `InvalidPointer` |
 //! | | the result can be written to the caller's memory | `InvalidPointer` |
 //! | `SetGpuMemoryAttribute` | the process was built for Switch 2 (PR: `UsesPAuthReturns`) | `NotImplemented` |
@@ -78,6 +90,23 @@
 //! - **`QueryMemory` takes no handle**: Eden resolves the current-process pseudo-handle and
 //!   queries that process, which is the caller.
 //!
+//! - **`MapMemory` and `UnmapMemory` with a source that is not page aligned** return
+//!   [`KernelError::InvalidAddress`]; Eden returns `ResultInvalidSize`
+//!   (`MapUnmapMemorySanityChecks`: "Source address is not aligned to 4KB" then
+//!   `R_THROW(ResultInvalidSize)`). The result is Horizon's: it checks both addresses for
+//!   alignment with `svc::ResultInvalidAddress`
+//!   (`atmosphere/libraries/libmesosphere/source/svc/kern_svc_memory.cpp` @ 4e3f3703,
+//!   `MapMemory` and `UnmapMemory`, fact only). Test:
+//!   `a_source_that_is_not_page_aligned_is_invalid_address_not_eden_s_invalid_size`.
+//! - **`MapMemory` and `UnmapMemory` check that the stack region can hold the destination**
+//!   (`CanContain(dst_address, size, KMemoryState::Stack)`), last of the argument checks, with
+//!   [`KernelError::InvalidMemoryRegion`]. Eden's `MapUnmapMemorySanityChecks` has no such
+//!   check, so in Eden a free destination anywhere in the address space is mapped as stack
+//!   memory. The check and its result are Horizon's (the same Atmosphère file, fact only).
+//!   Test: `the_destination_must_be_one_the_stack_region_can_hold`.
+//! - **The order of the two wrap checks** is Eden's (destination, then source); Horizon checks
+//!   the source first. Both give `InvalidCurrentMemory`, so no guest can tell them apart.
+//!
 //! # Where the two Switch 2 references differ on `SetGpuMemoryAttribute`
 //!
 //! PR #4588 is followed, and Eden-NX2 differs in two places, each pinned by a test:
@@ -96,7 +125,7 @@
 
 use starquake_memory::{GuestMemory, PAGE_SIZE};
 
-use crate::memory::{AddressSpace, MemoryAttribute, SvcMemoryInfo, SvcPermission};
+use crate::memory::{AddressSpace, MemoryAttribute, MemoryState, SvcMemoryInfo, SvcPermission};
 use crate::result::{CallResult, KernelError, SvcResult};
 
 /// What a heap's size must be a multiple of (`HeapSizeAlignment`): 2 MiB.
@@ -245,6 +274,61 @@ pub fn set_gpu_memory_attribute(
     space.set_memory_attribute(address, size, narrow(mask)?, narrow(attribute)?)
 }
 
+/// `MapUnmapMemorySanityChecks`, with Horizon's result for an unaligned source and its stack
+/// region check (module docs, "Divergences"): the checks `MapMemory` and `UnmapMemory` make of
+/// their arguments, in the module docs' order, before the page table's.
+fn map_unmap_memory_sanity_checks(
+    space: &AddressSpace,
+    dst: u64,
+    src: u64,
+    size: u64,
+) -> SvcResult<()> {
+    if !dst.is_multiple_of(PAGE_SIZE) {
+        return Err(KernelError::InvalidAddress);
+    }
+    if !src.is_multiple_of(PAGE_SIZE) {
+        return Err(KernelError::InvalidAddress);
+    }
+    if size == 0 {
+        return Err(KernelError::InvalidSize);
+    }
+    if !size.is_multiple_of(PAGE_SIZE) {
+        return Err(KernelError::InvalidSize);
+    }
+    // `IsValidAddressRange`: `address + size > address`, false when the sum wraps (to exactly
+    // zero too).
+    if dst.checked_add(size).is_none() {
+        return Err(KernelError::InvalidCurrentMemory);
+    }
+    if src.checked_add(size).is_none() {
+        return Err(KernelError::InvalidCurrentMemory);
+    }
+    if !space.regions().contains(src, size) {
+        return Err(KernelError::InvalidCurrentMemory);
+    }
+    if !space.can_contain(dst, size, MemoryState::Stack) {
+        return Err(KernelError::InvalidMemoryRegion);
+    }
+    Ok(())
+}
+
+/// Maps the `size` bytes of the calling process's memory at `src` a second time at `dst`, in
+/// its stack region, and takes them from the guest at `src` until [`unmap_memory`]
+/// (`MapMemory`). See the module docs for the checks and their order, and
+/// [`AddressSpace::map_memory`] for the page table's.
+pub fn map_memory(space: &mut AddressSpace, dst: u64, src: u64, size: u64) -> CallResult<()> {
+    map_unmap_memory_sanity_checks(space, dst, src, size)?;
+    space.map_memory(dst, src, size)
+}
+
+/// Unmaps the alias of `size` bytes at `dst` that [`map_memory`] made of `src`, and gives the
+/// source back to the guest (`UnmapMemory`). See the module docs for the checks and their
+/// order, and [`AddressSpace::unmap_memory`] for the page table's.
+pub fn unmap_memory(space: &mut AddressSpace, dst: u64, src: u64, size: u64) -> CallResult<()> {
+    map_unmap_memory_sanity_checks(space, dst, src, size)?;
+    space.unmap_memory(dst, src, size)
+}
+
 /// Writes what the calling process's address space holds at `address` to `out_memory_info` in
 /// `memory`, the caller's memory, and returns the page info word. Any address can be queried:
 /// one above the address space is in a block of inaccessible memory.
@@ -267,3 +351,6 @@ pub fn query_memory(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod alias_tests;

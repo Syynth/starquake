@@ -1481,7 +1481,7 @@ fn a_planned_call_returns_not_implemented_and_leaves_its_outputs_alone() {
     let mut sink = Collect::default();
     for (id, status) in [
         (SvcId::GetResourceLimitLimitValue, Status::Planned),
-        (SvcId::MapMemory, Status::Planned),
+        (SvcId::SetThreadActivity, Status::Planned),
         (SvcId::SynchronizePreemptionState, Status::Planned),
         (SvcId::SendSyncRequestLight, Status::Deferred),
     ] {

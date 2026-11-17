@@ -676,5 +676,6 @@ fn the_kernels_mapper_drives_the_address_space_and_reports_refusals_in_words() {
 mod hvf;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod hvf_snapshot;
+mod alias;
 mod kernel;
 mod shared;

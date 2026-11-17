@@ -848,6 +848,10 @@ impl Dispatcher {
                 .call::<(&mut AddressSpace,)>(call, |(space,), call, _| {
                     set_memory_attribute(space, id, convention, call.regs)
                 }),
+            SvcId::MapMemory | SvcId::UnmapMemory => self
+                .call::<(&mut AddressSpace,)>(call, |(space,), call, _| {
+                    map_unmap_memory(space, id, convention, call.regs)
+                }),
             SvcId::QueryMemory => self.call::<(&AddressSpace,)>(call, |(space,), call, _| {
                 query_memory(space, call.caller.memory, id, convention, call.regs)
             }),
@@ -965,6 +969,22 @@ fn set_memory_attribute(
     returning(id, convention, regs, |[address, size, mask, attribute]| {
         let (mask, attribute) = (word(mask)?, word(attribute)?);
         memory::set_memory_attribute(space, address, size, mask, attribute)?;
+        Ok([])
+    })
+}
+
+fn map_unmap_memory(
+    space: &mut AddressSpace,
+    id: SvcId,
+    convention: &Convention,
+    regs: &mut GuestRegs,
+) -> Outcome {
+    returning(id, convention, regs, |[dst, src, size]| {
+        if id == SvcId::MapMemory {
+            memory::map_memory(space, dst, src, size)?;
+        } else {
+            memory::unmap_memory(space, dst, src, size)?;
+        }
         Ok([])
     })
 }
