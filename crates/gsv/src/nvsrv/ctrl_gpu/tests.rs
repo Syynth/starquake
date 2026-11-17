@@ -15,27 +15,68 @@ use crate::nvsrv::Device;
 /// The 0xD0 block as 52 little-endian words.
 const GOLDEN: [u32; 52] = [
     // 0x00: architecture 0x170, implementation 0xE (chip 0x17E, row 24).
-    0x170, 0xE, //
+    0x170,
+    0xE, //
     // 0x08: revision 0xA1, one GPC; 0x10: L2 0x40000 (u64); 0x18: no video memory (u64).
-    0xA1, 0x1, 0x4_0000, 0, 0, 0, //
+    0xA1,
+    0x1,
+    0x4_0000,
+    0,
+    0,
+    0, //
     // 0x20: two TPCs per GPC, bus type 0x20; 0x28: PR's big page size 0x1000.
-    0x2, 0x20, 0x1000, //
+    0x2,
+    0x20,
+    0x1000, //
     // 0x2C: compression page 0x20000; 0x30: PDE coverage 0x1B; 0x34: big page sizes 0x11000.
-    0x2_0000, 0x1B, 0x1_1000, //
+    0x2_0000,
+    0x1B,
+    0x1_1000, //
     // 0x38: GPC mask 1; 0x3C, 0x40: SM and SPA versions 0x807.
-    0x1, 0x807, 0x807, //
+    0x1,
+    0x807,
+    0x807, //
     // 0x44: warp count 0x80; 0x48: 40 VA bits; 0x4C: reserved.
-    0x80, 0x28, 0, //
+    0x80,
+    0x28,
+    0, //
     // 0x50: flags, Eden's 0x55 and bits 8, 22, 26 (low word); 34, 35, 40-43 (high word).
-    0x0440_0155, 0x0000_0F0C, //
+    0x0440_0155,
+    0x0000_0F0C, //
     // 0x58: 2D, 3D, compute, GPFIFO, inline-to-memory, DMA copy classes (Eden's).
-    0x902D, 0xB197, 0xB1C0, 0xB06F, 0xA140, 0xB0B5, //
+    0x902D,
+    0xB197,
+    0xB1C0,
+    0xB06F,
+    0xA140,
+    0xB0B5, //
     // 0x70: levels 0x1C, 0xB | -1, 0x1D | 0x14, 0 | 0, 0 | 0, 0 (two s16 per word).
-    0x000B_001C, 0x001D_FFFF, 0x0000_0014, 0, 0, //
+    0x000B_001C,
+    0x001D_FFFF,
+    0x0000_0014,
+    0,
+    0, //
     // 0x84 to 0xB4: zero.
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, //
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0, //
     // 0xB4: 64 subcontexts; 0xB8 to 0xD0: zero.
-    64, 0, 0, 0, 0, 0, 0,
+    64,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
 ];
 
 /// The block for the 0xD0 request is the golden bytes, every one.
@@ -122,7 +163,10 @@ fn the_ioctl_numbers_are_pr_s() {
         let declared = usize::try_from(ioctl.size()).unwrap();
         assert_eq!(declared, HEADER_BYTES + size.bytes());
     }
-    assert_eq!([CHARACTERISTICS, CHARACTERISTICS_EXTENDED], [0xC0E0_4705, 0xC0E8_4705]);
+    assert_eq!(
+        [CHARACTERISTICS, CHARACTERISTICS_EXTENDED],
+        [0xC0E0_4705, 0xC0E8_4705]
+    );
     // Group 'G' command 5 with another size (the Switch 1 form) is not one of them.
     assert_eq!(BlockSize::of(Ioctl::from_raw(0xC0B0_4705)), None);
 }
@@ -184,8 +228,7 @@ fn a_short_buffer_is_a_bad_parameter() {
         let fd = rig.open_device(Device::NvhostCtrlGpu);
         let mut input = request(size, 0);
         input.truncate(input_len);
-        let (reply, out, inline) =
-            rig.ioctl3(fd, CHARACTERISTICS, &input, (out_len, inline_len));
+        let (reply, out, inline) = rig.ioctl3(fd, CHARACTERISTICS, &input, (out_len, inline_len));
         let refused = ok(&[NvResult::BadParameter.raw()]);
         assert_eq!(reply, refused, "{input_len} {out_len} {inline_len}");
         assert_eq!(out, vec![STALE; out_len]);

@@ -19,7 +19,7 @@ use super::super::tests::{
     AS_ALLOC_AS_EX, AS_GET_VA_REGIONS, AS_SHIM_INFO, Direct, FrontCall, Rig, STALE, le, ok,
 };
 use super::*;
-use crate::nvsrv::{Device, IoctlVariant, NvsrvStateError};
+use crate::nvsrv::{Device, IoctlVariant, NvsrvState, NvsrvStateError};
 use crate::testing::halves;
 
 /// `AllocAsEx`'s 40 bytes: flags, `as_fd`, big page size, reserved, start, end, split.
@@ -94,7 +94,7 @@ const NATIVE_END: u64 = 1 << 40;
 
 // ----- AllocAsEx ranges --------------------------------------------------------------------------
 
-/// The spec's offline test, "AllocAsEx ranges": each kind of request, and the regions and shim
+/// The spec's offline test, "`AllocAsEx` ranges": each kind of request, and the regions and shim
 /// the fd then reports, written out by hand.
 #[test]
 fn alloc_as_ex_ranges() {
@@ -161,13 +161,23 @@ fn alloc_as_ex_ranges() {
         assert_eq!(answer.output, case.request, "{}", case.what);
         let answer = direct.ioctl(fd, AS_GET_VA_REGIONS, &va_request());
         assert_eq!(answer.result, NvResult::Success, "{}", case.what);
-        assert_eq!(answer.output, va_reply(case.size, &case.regions), "{}", case.what);
+        assert_eq!(
+            answer.output,
+            va_reply(case.size, &case.regions),
+            "{}",
+            case.what
+        );
         let answer = direct.ioctl(fd, AS_SHIM_INFO, &shim_request());
         assert_eq!(answer.result, NvResult::Success, "{}", case.what);
         let expected = shim_reply(case.shim, 4, SYNCPOINT_COUNT);
         assert_eq!(answer.output, expected, "{}", case.what);
         // A new address space, the first, given to the GPU's front.
-        assert_eq!(direct.front.calls(), [FrontCall::Create(AsId(1))], "{}", case.what);
+        assert_eq!(
+            direct.front.calls(),
+            [FrontCall::Create(AsId(1))],
+            "{}",
+            case.what
+        );
     }
 }
 
@@ -177,7 +187,10 @@ fn alloc_as_ex_ranges() {
 fn split_0_without_a_parent_takes_small_pages_to_the_end() {
     let (mut direct, fd) = opened();
     let request = plain(0x2_0000, 0x10_0000, 0x200_0000, 0);
-    assert_eq!(direct.ioctl(fd, AS_ALLOC_AS_EX, &request).result, NvResult::Success);
+    assert_eq!(
+        direct.ioctl(fd, AS_ALLOC_AS_EX, &request).result,
+        NvResult::Success
+    );
     let view = direct.state.as_gpu().view(1).unwrap();
     let expected = Layout {
         start: 0x10_0000,
@@ -189,7 +202,10 @@ fn split_0_without_a_parent_takes_small_pages_to_the_end() {
     // The same request with a split keeps it.
     let fd = direct.open(Device::NvhostAsGpu);
     let request = plain(0x2_0000, 0x10_0000, 0x200_0000, 0x100_0000);
-    assert_eq!(direct.ioctl(fd, AS_ALLOC_AS_EX, &request).result, NvResult::Success);
+    assert_eq!(
+        direct.ioctl(fd, AS_ALLOC_AS_EX, &request).result,
+        NvResult::Success
+    );
     let view = direct.state.as_gpu().view(2).unwrap();
     assert_eq!(view.layout.split, 0x100_0000);
 }
@@ -214,16 +230,13 @@ fn big_page_sizes_are_pr_s() {
         let request = plain(requested, 0x10_0000, 0x100_0000, 0x40_0000);
         let answer = direct.ioctl(fd, AS_ALLOC_AS_EX, &request);
         let view = direct.state.as_gpu().view(1);
-        match kept {
-            Some(size) => {
-                assert_eq!(answer.result, NvResult::Success, "{requested:#x}");
-                assert_eq!(view.unwrap().layout.big_page_size, size, "{requested:#x}");
-            }
-            None => {
-                assert_eq!(answer.result, NvResult::BadValue, "{requested:#x}");
-                assert_eq!(view, None, "{requested:#x}");
-                assert_eq!(direct.front.calls(), [], "{requested:#x}");
-            }
+        if let Some(size) = kept {
+            assert_eq!(answer.result, NvResult::Success, "{requested:#x}");
+            assert_eq!(view.unwrap().layout.big_page_size, size, "{requested:#x}");
+        } else {
+            assert_eq!(answer.result, NvResult::BadValue, "{requested:#x}");
+            assert_eq!(view, None, "{requested:#x}");
+            assert_eq!(direct.front.calls(), [], "{requested:#x}");
         }
     }
 }
@@ -252,7 +265,10 @@ fn a_layout_out_of_order_is_a_bad_value() {
         };
         assert_eq!(answer.result, expected, "{start:#x} {end:#x} {split:#x}");
         assert_eq!(direct.state.as_gpu().view(1).is_some(), accepted);
-        assert_eq!(direct.memory.address_spaces().count(), usize::from(accepted));
+        assert_eq!(
+            direct.memory.address_spaces().count(),
+            usize::from(accepted)
+        );
     }
 }
 
@@ -277,7 +293,10 @@ fn a_layout_past_the_va_limit_is_a_bad_value() {
 fn a_second_alloc_as_ex_is_an_invalid_state() {
     let (mut direct, fd) = opened();
     let first = plain(0, 0x10_0000, 0x100_0000, 0x40_0000);
-    assert_eq!(direct.ioctl(fd, AS_ALLOC_AS_EX, &first).result, NvResult::Success);
+    assert_eq!(
+        direct.ioctl(fd, AS_ALLOC_AS_EX, &first).result,
+        NvResult::Success
+    );
     let view = direct.state.as_gpu().view(1);
     let both = alloc(1, -1, 0x3_0000, 0, [0x10_0000, 0x100_0000, 0x40_0000]);
     for request in [first, both] {
@@ -298,8 +317,20 @@ fn supported_views_are_pr_s() {
     let end = 0xA0_0000_0000;
     let request = |start, split, end| Requested { start, split, end };
     let start = parent.start;
-    assert!(is_supported_view(5, 0x1000, 0, request(start, 0, end), &parent));
-    assert!(is_supported_view(0, 0x1000, 0, request(start, end, end), &parent));
+    assert!(is_supported_view(
+        5,
+        0x1000,
+        0,
+        request(start, 0, end),
+        &parent
+    ));
+    assert!(is_supported_view(
+        0,
+        0x1000,
+        0,
+        request(start, end, end),
+        &parent
+    ));
     let refused = [
         (1, 0x1000, 0, request(start, end, end)),
         (0, 0x1_0000, 0, request(start, end, end)),
@@ -320,10 +351,28 @@ fn supported_views_are_pr_s() {
     }
     // The edges this port adds: the start exactly at the parent's, the end exactly at its split
     // (accepted), a page past the split (refused).
-    assert!(is_supported_view(0, 0x1000, 0, request(start, parent.split, parent.split), &parent));
+    assert!(is_supported_view(
+        0,
+        0x1000,
+        0,
+        request(start, parent.split, parent.split),
+        &parent
+    ));
     let past = parent.split + 0x1000;
-    assert!(!is_supported_view(0, 0x1000, 0, request(start, past, past), &parent));
-    assert!(!is_supported_view(0, 0x1000, 0, request(start - 0x1000, end, end), &parent));
+    assert!(!is_supported_view(
+        0,
+        0x1000,
+        0,
+        request(start, past, past),
+        &parent
+    ));
+    assert!(!is_supported_view(
+        0,
+        0x1000,
+        0,
+        request(start - 0x1000, end, end),
+        &parent
+    ));
 }
 
 /// A request naming a gpu-33 address space (one gsv holds that no `AllocAsEx` made) is a view of
@@ -336,7 +385,10 @@ fn a_view_shares_its_parent_s_address_space() {
     let as_fd = i32::try_from(parent.0).unwrap();
     let end = 0xA0_0000_0000;
     let request = alloc(5, as_fd, 0x1000, 0, [WINDOW_START, end, 0]);
-    assert_eq!(direct.ioctl(fd, AS_ALLOC_AS_EX, &request).result, NvResult::Success);
+    assert_eq!(
+        direct.ioctl(fd, AS_ALLOC_AS_EX, &request).result,
+        NvResult::Success
+    );
     let view = direct.state.as_gpu().view(1).unwrap();
     let expected = Layout {
         start: WINDOW_START,
@@ -344,7 +396,13 @@ fn a_view_shares_its_parent_s_address_space() {
         end,
         big_page_size: 0x1_0000,
     };
-    assert_eq!(view, View { space: parent, layout: expected });
+    assert_eq!(
+        view,
+        View {
+            space: parent,
+            layout: expected
+        }
+    );
     assert_eq!(direct.state.as_gpu().made(parent), None);
     assert_eq!(direct.front.calls(), [FrontCall::Create(parent)]);
     let answer = direct.ioctl(fd, AS_GET_VA_REGIONS, &va_request());
@@ -354,7 +412,9 @@ fn a_view_shares_its_parent_s_address_space() {
     assert_eq!(answer.output, shim_reply(end - 0x1000, 4, SYNCPOINT_COUNT));
     let shown = direct.memory.mappings(parent);
     assert!(
-        shown.iter().any(|m| m.target == Target::SyncpointShim && m.range.start() == end - 0x1000),
+        shown
+            .iter()
+            .any(|m| m.target == Target::SyncpointShim && m.range.start() == end - 0x1000),
         "{shown:?}"
     );
 }
@@ -385,7 +445,10 @@ fn a_view_of_a_gpu_session_space_uses_the_native_layout() {
 fn a_view_of_a_made_space_uses_its_layout() {
     let (mut direct, first) = opened();
     let made = plain(0, 0x10_0000, 0x100_0000, 0x80_0000);
-    assert_eq!(direct.ioctl(first, AS_ALLOC_AS_EX, &made).result, NvResult::Success);
+    assert_eq!(
+        direct.ioctl(first, AS_ALLOC_AS_EX, &made).result,
+        NvResult::Success
+    );
     let space = direct.state.as_gpu().view(1).unwrap().space;
     let as_fd = i32::try_from(space.0).unwrap();
     let second = direct.open(Device::NvhostAsGpu);
@@ -395,7 +458,10 @@ fn a_view_of_a_made_space_uses_its_layout() {
     let refused = direct.ioctl(second, AS_ALLOC_AS_EX, &past);
     assert_eq!(refused.result, NvResult::BadParameter);
     let edge = alloc(5, as_fd, 0x1000, 0, [0x10_0000, 0x80_0000, 0]);
-    assert_eq!(direct.ioctl(second, AS_ALLOC_AS_EX, &edge).result, NvResult::Success);
+    assert_eq!(
+        direct.ioctl(second, AS_ALLOC_AS_EX, &edge).result,
+        NvResult::Success
+    );
     assert_eq!(direct.state.as_gpu().view(2).unwrap().space, space);
     assert_eq!(direct.memory.address_spaces().count(), 1);
 }
@@ -416,7 +482,10 @@ fn a_parent_gsv_does_not_hold_is_a_bad_parameter() {
     let (mut direct, fd) = opened();
     direct.memory.create_address_space(&direct.front).unwrap();
     let request = alloc(5, 1, 0x1000, 0, [WINDOW_START, 0xA0_0000_0000, 0]);
-    assert_eq!(direct.ioctl(fd, AS_ALLOC_AS_EX, &request).result, NvResult::Success);
+    assert_eq!(
+        direct.ioctl(fd, AS_ALLOC_AS_EX, &request).result,
+        NvResult::Success
+    );
 }
 
 /// A bad layout is reported before a full table of address spaces (both at once). (A bad big
@@ -445,7 +514,10 @@ fn address_spaces_are_bounded_with_gpu_33_s() {
         direct.memory.create_address_space(&direct.front).unwrap();
     }
     let request = plain(0, 0x10_0000, 0x100_0000, 0x40_0000);
-    assert_eq!(direct.ioctl(fd, AS_ALLOC_AS_EX, &request).result, NvResult::Success);
+    assert_eq!(
+        direct.ioctl(fd, AS_ALLOC_AS_EX, &request).result,
+        NvResult::Success
+    );
     let made = AsId(u32::try_from(MAX_ADDRESS_SPACES).unwrap());
     assert_eq!(direct.state.as_gpu().view(1).unwrap().space, made);
     let fd = direct.open(Device::NvhostAsGpu);
@@ -454,7 +526,10 @@ fn address_spaces_are_bounded_with_gpu_33_s() {
     assert_eq!(direct.state.as_gpu().view(2), None);
     assert_eq!(direct.memory.address_spaces().count(), MAX_ADDRESS_SPACES);
     let view = alloc(5, 1, 0x1000, 0, [WINDOW_START, 0xA0_0000_0000, 0]);
-    assert_eq!(direct.ioctl(fd, AS_ALLOC_AS_EX, &view).result, NvResult::Success);
+    assert_eq!(
+        direct.ioctl(fd, AS_ALLOC_AS_EX, &view).result,
+        NvResult::Success
+    );
 }
 
 /// Closing an fd drops its view, not its address space; a new fd starts with no view.
@@ -462,10 +537,16 @@ fn address_spaces_are_bounded_with_gpu_33_s() {
 fn closing_keeps_the_address_space() {
     let (mut direct, fd) = opened();
     let request = plain(0, 0x10_0000, 0x100_0000, 0x40_0000);
-    assert_eq!(direct.ioctl(fd, AS_ALLOC_AS_EX, &request).result, NvResult::Success);
+    assert_eq!(
+        direct.ioctl(fd, AS_ALLOC_AS_EX, &request).result,
+        NvResult::Success
+    );
     assert_eq!(direct.state.close(fd), NvResult::Success);
     assert_eq!(direct.state.as_gpu().view(1), None);
-    assert_eq!(direct.memory.address_spaces().collect::<Vec<_>>(), [AsId(1)]);
+    assert_eq!(
+        direct.memory.address_spaces().collect::<Vec<_>>(),
+        [AsId(1)]
+    );
     assert!(direct.state.as_gpu().made(AsId(1)).is_some());
     let fd = direct.open(Device::NvhostAsGpu);
     let answer = direct.ioctl(fd, AS_GET_VA_REGIONS, &va_request());
@@ -480,7 +561,10 @@ fn closing_keeps_the_address_space() {
 fn without_a_view_regions_and_shim_are_refused() {
     let (mut direct, fd) = opened();
     let answer = direct.ioctl(fd, AS_GET_VA_REGIONS, &va_request());
-    assert_eq!((answer.result, answer.output), (NvResult::BadValue, va_request()));
+    assert_eq!(
+        (answer.result, answer.output),
+        (NvResult::BadValue, va_request())
+    );
     let answer = direct.ioctl(fd, AS_SHIM_INFO, &shim_request());
     assert_eq!(answer.result, NvResult::NotSupported);
     assert_eq!(answer.output, shim_reply(0, 0, 0));
@@ -492,7 +576,10 @@ fn without_a_view_regions_and_shim_are_refused() {
 fn the_shim_is_on_the_page_below_the_split() {
     let (mut direct, fd) = opened();
     let request = plain(0, 0x10_0000, 0x100_0000, 0x40_0000);
-    assert_eq!(direct.ioctl(fd, AS_ALLOC_AS_EX, &request).result, NvResult::Success);
+    assert_eq!(
+        direct.ioctl(fd, AS_ALLOC_AS_EX, &request).result,
+        NvResult::Success
+    );
     let first = direct.ioctl(fd, AS_SHIM_INFO, &shim_request());
     assert_eq!(first.output, shim_reply(0x3F_F000, 4, SYNCPOINT_COUNT));
     assert_eq!(direct.memory.shim(AsId(1)), Some(0x3F_F000));
@@ -500,7 +587,10 @@ fn the_shim_is_on_the_page_below_the_split() {
     let second = direct.ioctl(fd, AS_SHIM_INFO, &shim_request());
     assert_eq!(second, first);
     assert_eq!(direct.memory.mappings(AsId(1)), shown);
-    let shims = shown.iter().filter(|m| m.target == Target::SyncpointShim).count();
+    let shims = shown
+        .iter()
+        .filter(|m| m.target == Target::SyncpointShim)
+        .count();
     assert_eq!(shims, 1);
 }
 
@@ -515,11 +605,23 @@ fn a_second_view_reports_the_same_shim() {
     let b = direct.open(Device::NvhostAsGpu);
     let first = alloc(5, as_fd, 0x1000, 0, [WINDOW_START, 0xA0_0000_0000, 0]);
     let second = alloc(5, as_fd, 0x1000, 0, [WINDOW_START, 0x90_0000_0000, 0]);
-    assert_eq!(direct.ioctl(a, AS_ALLOC_AS_EX, &first).result, NvResult::Success);
-    assert_eq!(direct.ioctl(b, AS_ALLOC_AS_EX, &second).result, NvResult::Success);
+    assert_eq!(
+        direct.ioctl(a, AS_ALLOC_AS_EX, &first).result,
+        NvResult::Success
+    );
+    assert_eq!(
+        direct.ioctl(b, AS_ALLOC_AS_EX, &second).result,
+        NvResult::Success
+    );
     let placed = shim_reply(0x9F_FFFF_F000, 4, SYNCPOINT_COUNT);
-    assert_eq!(direct.ioctl(a, AS_SHIM_INFO, &shim_request()).output, placed);
-    assert_eq!(direct.ioctl(b, AS_SHIM_INFO, &shim_request()).output, placed);
+    assert_eq!(
+        direct.ioctl(a, AS_SHIM_INFO, &shim_request()).output,
+        placed
+    );
+    assert_eq!(
+        direct.ioctl(b, AS_SHIM_INFO, &shim_request()).output,
+        placed
+    );
     // The other way round: b first.
     let mut direct = Direct::new();
     direct.memory.create_address_space(&direct.front).unwrap();
@@ -528,8 +630,14 @@ fn a_second_view_reports_the_same_shim() {
     direct.ioctl(a, AS_ALLOC_AS_EX, &first);
     direct.ioctl(b, AS_ALLOC_AS_EX, &second);
     let placed = shim_reply(0x8F_FFFF_F000, 4, SYNCPOINT_COUNT);
-    assert_eq!(direct.ioctl(b, AS_SHIM_INFO, &shim_request()).output, placed);
-    assert_eq!(direct.ioctl(a, AS_SHIM_INFO, &shim_request()).output, placed);
+    assert_eq!(
+        direct.ioctl(b, AS_SHIM_INFO, &shim_request()).output,
+        placed
+    );
+    assert_eq!(
+        direct.ioctl(a, AS_SHIM_INFO, &shim_request()).output,
+        placed
+    );
 }
 
 /// `GetVARegions` through `Ioctl3`: out buffer 1 gets as many regions as the buffer size says
@@ -604,8 +712,19 @@ fn other_ioctls_go_to_the_policy() {
     ];
     for (variant, raw) in unknown {
         let input = plain(0, 0x10_0000, 0x100_0000, 0x40_0000);
-        let answer = direct.call(UnknownPolicy::Strict, variant, fd, raw, &input, (0x40, 0x40));
-        assert_eq!(answer.result, NvResult::NotImplemented, "{variant:?} {raw:#x}");
+        let answer = direct.call(
+            UnknownPolicy::Strict,
+            variant,
+            fd,
+            raw,
+            &input,
+            (0x40, 0x40),
+        );
+        assert_eq!(
+            answer.result,
+            NvResult::NotImplemented,
+            "{variant:?} {raw:#x}"
+        );
     }
     assert_eq!(direct.state.as_gpu().view(1), None);
 }
@@ -663,8 +782,14 @@ fn gpu_33_and_nvsrv_share_address_spaces() {
     // gpu 33 as PR checks it: header word 0x31 (16 + 33), one raw word, the word 0.
     let mut buffer = vec![STALE; BUFFER_SIZE];
     buffer[..12].copy_from_slice(&le(&[0x31, 1, 0]));
-    assert_eq!(gpu.handle(&mut rig.kernel, session, &mut buffer), Ok(Handled::Replied));
-    assert_eq!(buffer[..16], le(&[tipc_type(CREATE_ADDRESS_SPACE), 2, 0, 1]));
+    assert_eq!(
+        gpu.handle(&mut rig.kernel, session, &mut buffer),
+        Ok(Handled::Replied)
+    );
+    assert_eq!(
+        buffer[..16],
+        le(&[tipc_type(CREATE_ADDRESS_SPACE), 2, 0, 1])
+    );
 
     let view = rig.open_device(Device::NvhostAsGpu);
     let request = alloc(5, 1, 0x1000, 0, [WINDOW_START, 0xA0_0000_0000, 0]);
@@ -683,12 +808,18 @@ fn gpu_33_and_nvsrv_share_address_spaces() {
     assert_eq!(rig.state().as_gpu().view(2).unwrap().space, AsId(2));
     let spaces: Vec<AsId> = rig.shared.lock().gpu().address_spaces().collect();
     assert_eq!(spaces, [AsId(1), AsId(2)]);
-    assert_eq!(rig.front.calls(), [FrontCall::Create(AsId(1)), FrontCall::Create(AsId(2))]);
+    assert_eq!(
+        rig.front.calls(),
+        [FrontCall::Create(AsId(1)), FrontCall::Create(AsId(2))]
+    );
     // gpu 33 again: the next id after nvsrv's.
     let mut buffer = vec![STALE; BUFFER_SIZE];
     buffer[..12].copy_from_slice(&le(&[0x31, 1, 0]));
     gpu.handle(&mut rig.kernel, session, &mut buffer).unwrap();
-    assert_eq!(buffer[..16], le(&[tipc_type(CREATE_ADDRESS_SPACE), 2, 0, 3]));
+    assert_eq!(
+        buffer[..16],
+        le(&[tipc_type(CREATE_ADDRESS_SPACE), 2, 0, 3])
+    );
 }
 
 /// `Ioctl3` `GetVARegions` through the server: the regions in out buffer 1, its tail left as it
@@ -701,7 +832,10 @@ fn va_regions_through_the_server() {
     rig.ioctl(fd, AS_ALLOC_AS_EX, &request, request.len());
     let (reply, out, inline) = rig.ioctl3(fd, AS_GET_VA_REGIONS, &va_request(), (0x40, 0x40));
     assert_eq!(reply, ok(&[0]));
-    let regions = [region(0x10_0000, 0x1000, 0x300), region(0x40_0000, 0x1_0000, 0xC0)];
+    let regions = [
+        region(0x10_0000, 0x1000, 0x300),
+        region(0x40_0000, 0x1_0000, 0xC0),
+    ];
     assert_eq!(out, va_reply(0x30, &regions));
     let mut expected = regions.concat();
     expected.resize(0x40, STALE);
@@ -744,18 +878,56 @@ fn a_saved_state_alloc_as_ex_cannot_reach_is_refused() {
         .map(|id| (space(id), MADE))
         .collect();
     let bad = Layout { start: 0, ..MADE };
-    let view = |id, layout| View { space: space(id), layout };
+    let view = |id, layout| View {
+        space: space(id),
+        layout,
+    };
     let cases = [
-        (saved(&[], &too_many), AsGpuStateError::TooManySpaces { count: MAX_ADDRESS_SPACES + 1 }),
-        (saved(&[], &[(space(3), bad)]), AsGpuStateError::MadeLayout { space: 3 }),
         (
-            saved(&[], &[(space(3), Layout { big_page_size: 0x3_0000, ..MADE })]),
+            saved(&[], &too_many),
+            AsGpuStateError::TooManySpaces {
+                count: MAX_ADDRESS_SPACES + 1,
+            },
+        ),
+        (
+            saved(&[], &[(space(3), bad)]),
+            AsGpuStateError::MadeLayout { space: 3 },
+        ),
+        (
+            saved(
+                &[],
+                &[(
+                    space(3),
+                    Layout {
+                        big_page_size: 0x3_0000,
+                        ..MADE
+                    },
+                )],
+            ),
             AsGpuStateError::MadeLayout { space: 3 },
         ),
         // A view of a made space with neither its layout nor a view of it.
-        (saved(&[(7, view(3, Layout { end: 0x200_0000, ..MADE }))], &[(space(3), MADE)]), AsGpuStateError::ViewLayout { fd: 7 }),
+        (
+            saved(
+                &[(
+                    7,
+                    view(
+                        3,
+                        Layout {
+                            end: 0x200_0000,
+                            ..MADE
+                        },
+                    ),
+                )],
+                &[(space(3), MADE)],
+            ),
+            AsGpuStateError::ViewLayout { fd: 7 },
+        ),
         // A view of a gpu-33 space that is not a view of the native layout.
-        (saved(&[(7, view(4, MADE))], &[]), AsGpuStateError::ViewLayout { fd: 7 }),
+        (
+            saved(&[(7, view(4, MADE))], &[]),
+            AsGpuStateError::ViewLayout { fd: 7 },
+        ),
         // Two faults: the count before a layout, a made layout before a view.
         (
             {
@@ -763,9 +935,14 @@ fn a_saved_state_alloc_as_ex_cannot_reach_is_refused() {
                 both[0].1 = bad;
                 saved(&[], &both)
             },
-            AsGpuStateError::TooManySpaces { count: MAX_ADDRESS_SPACES + 1 },
+            AsGpuStateError::TooManySpaces {
+                count: MAX_ADDRESS_SPACES + 1,
+            },
         ),
-        (saved(&[(7, view(4, MADE))], &[(space(3), bad)]), AsGpuStateError::MadeLayout { space: 3 }),
+        (
+            saved(&[(7, view(4, MADE))], &[(space(3), bad)]),
+            AsGpuStateError::MadeLayout { space: 3 },
+        ),
     ];
     for (state, error) in cases {
         assert_eq!(AsGpu::try_from(state), Err(error), "{error}");
@@ -780,16 +957,40 @@ fn a_saved_state_at_each_edge_is_accepted() {
         .map(|id| (AsId(id), MADE))
         .collect();
     let views = [
-        (3, View { space: AsId(1), layout: MADE }),
-        (5, View { space: AsId(1), layout: child_of(&MADE) }),
-        (6, View { space: AsId(20), layout: child_of(&NATIVE_LAYOUT) }),
+        (
+            3,
+            View {
+                space: AsId(1),
+                layout: MADE,
+            },
+        ),
+        (
+            5,
+            View {
+                space: AsId(1),
+                layout: child_of(&MADE),
+            },
+        ),
+        (
+            6,
+            View {
+                space: AsId(20),
+                layout: child_of(&NATIVE_LAYOUT),
+            },
+        ),
     ];
     let state = AsGpu::try_from(saved(&views, &all)).unwrap();
     let bytes = postcard::to_allocvec(&state).unwrap();
     assert_eq!(postcard::from_bytes::<AsGpu>(&bytes).unwrap(), state);
     // Through postcard, a refused state is refused.
     let refused = AsGpu {
-        views: BTreeMap::from([(6, View { space: AsId(20), layout: MADE })]),
+        views: BTreeMap::from([(
+            6,
+            View {
+                space: AsId(20),
+                layout: MADE,
+            },
+        )]),
         made: BTreeMap::new(),
     };
     let bytes = postcard::to_allocvec(&refused).unwrap();
@@ -819,4 +1020,44 @@ fn a_refused_state_is_said_in_plain_words() {
         NvsrvStateError::NotAnAddressSpace { fd: 3 }.to_string(),
         "fd 3 has an address-space view but is not an open nvhost-as-gpu"
     );
+}
+
+/// The nvsrv state checks a view's fd against its files: a view on an fd that is not an open
+/// as-gpu is refused, before the groups.
+#[test]
+fn a_saved_view_must_fit_the_files() {
+    let (mut direct, fd) = opened();
+    let tsg = direct.open(Device::NvhostTsgGpu);
+    let request = plain(0, 0x10_0000, 0x100_0000, 0x40_0000);
+    assert_eq!(
+        direct.ioctl(fd, AS_ALLOC_AS_EX, &request).result,
+        NvResult::Success
+    );
+    let timeslice = le(&[100]);
+    let set = direct.ioctl(tsg, crate::nvsrv::tsg_gpu::SET_TIMESLICE, &timeslice);
+    assert_eq!(set.result, NvResult::Success);
+    let state = direct.state;
+    let check = |state: &NvsrvState| NvsrvState::try_from(super::super::tests::saved(state));
+    assert_eq!(check(&state).as_ref(), Ok(&state));
+    let fd = u32::try_from(fd).unwrap();
+    let tsg = u32::try_from(tsg).unwrap();
+    for device in [Device::Nvmap, Device::NvhostGpu, Device::NvhostTsgGpu] {
+        let mut changed = state.clone();
+        changed.files.insert(fd, device);
+        assert_eq!(
+            check(&changed),
+            Err(NvsrvStateError::NotAnAddressSpace { fd })
+        );
+    }
+    let mut closed = state.clone();
+    closed.files.remove(&fd);
+    assert_eq!(
+        check(&closed),
+        Err(NvsrvStateError::NotAnAddressSpace { fd })
+    );
+    // Both a view and a group on the wrong files: the view is reported.
+    let mut both = state;
+    both.files.insert(fd, Device::Nvmap);
+    both.files.insert(tsg, Device::Nvmap);
+    assert_eq!(check(&both), Err(NvsrvStateError::NotAnAddressSpace { fd }));
 }

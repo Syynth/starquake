@@ -181,7 +181,14 @@ impl Direct {
     /// `raw` on `fd` through `Ioctl`, strict, out buffer 0 the input's size.
     pub(super) fn ioctl(&mut self, fd: i32, raw: u32, input: &[u8]) -> IoctlAnswer {
         let sizes = (input.len(), 0);
-        self.call(UnknownPolicy::Strict, IoctlVariant::Ioctl, fd, raw, input, sizes)
+        self.call(
+            UnknownPolicy::Strict,
+            IoctlVariant::Ioctl,
+            fd,
+            raw,
+            input,
+            sizes,
+        )
     }
 }
 
@@ -1343,7 +1350,10 @@ fn the_saved_state_s_layout_is_pinned() {
     direct.memory.create_address_space(&direct.front).unwrap();
     // fd 3 is nvhost-as-gpu: start 0x2000, end 0x9000, split 0x5000, big pages 0x10000.
     let alloc = le(&[0, 0, 0x1_0000, 0, 0x2000, 0, 0x9000, 0, 0x5000, 0]);
-    assert_eq!(direct.ioctl(3, AS_ALLOC_AS_EX, &alloc).result, NvResult::Success);
+    assert_eq!(
+        direct.ioctl(3, AS_ALLOC_AS_EX, &alloc).result,
+        NvResult::Success
+    );
     // fd 4 is nvhost-tsg-gpu: a timeslice of 0x77, channel fd 5 (nvhost-gpu) at subcontext 0x21.
     let timeslice = le(&[0x77]);
     let set = direct.ioctl(4, tsg_gpu::SET_TIMESLICE, &timeslice);
@@ -1360,7 +1370,9 @@ fn the_saved_state_s_layout_is_pinned() {
     // The next fd; then the nvmap table: no handles, next id 4.
     expected.extend([0x0B, 0, 4]);
     // A layout: start 0x2000, split 0x5000, end 0x9000, big page size 0x10000, as varints.
-    let layout = [0x80, 0x40, 0x80, 0xA0, 0x01, 0x80, 0xA0, 0x02, 0x80, 0x80, 0x04];
+    let layout = [
+        0x80, 0x40, 0x80, 0xA0, 0x01, 0x80, 0xA0, 0x02, 0x80, 0x80, 0x04,
+    ];
     // One view: fd 3, address space 2, its layout.
     expected.extend([1, 3, 2]);
     expected.extend(layout);
@@ -1434,7 +1446,7 @@ fn unreachable_states() -> Vec<(NvsrvState, NvsrvStateError)> {
 }
 
 /// The saved form of `state`, field for field.
-fn saved(state: &NvsrvState) -> SavedNvsrvState {
+pub(super) fn saved(state: &NvsrvState) -> SavedNvsrvState {
     SavedNvsrvState {
         files: state.files.clone(),
         next_fd: state.next_fd,

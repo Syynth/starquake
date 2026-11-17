@@ -171,7 +171,10 @@ impl TryFrom<SavedTsgGpu> for TsgGpu {
             });
         }
         let mut seen = std::collections::BTreeSet::new();
-        if let Some((&channel, _)) = bindings.clone().find(|(channel, _)| !seen.insert(**channel)) {
+        if let Some((&channel, _)) = bindings
+            .clone()
+            .find(|(channel, _)| !seen.insert(**channel))
+        {
             return Err(TsgStateError::TwoGroups { channel });
         }
         Ok(Self { groups })
@@ -238,7 +241,9 @@ impl TsgGpu {
 
     /// Every bound channel's fd, in group order.
     pub fn channels(&self) -> impl Iterator<Item = u32> + '_ {
-        self.groups.values().flat_map(|group| group.channels.keys().copied())
+        self.groups
+            .values()
+            .flat_map(|group| group.channels.keys().copied())
     }
 
     /// Group fd `fd` was closed: its channels are unbound (PR `OnClose`).

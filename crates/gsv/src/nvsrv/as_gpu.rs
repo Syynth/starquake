@@ -519,8 +519,12 @@ impl AsGpu {
                 let result = self.alloc_as_ex(fd, &arg, &mut gpu);
                 Some(IoctlAnswer::with(result, arg.into_output()))
             }
-            (IoctlVariant::Ioctl, command::GET_VA_REGIONS) => Some(self.va_regions(fd, call, false)),
-            (IoctlVariant::Ioctl3, command::GET_VA_REGIONS) => Some(self.va_regions(fd, call, true)),
+            (IoctlVariant::Ioctl, command::GET_VA_REGIONS) => {
+                Some(self.va_regions(fd, call, false))
+            }
+            (IoctlVariant::Ioctl3, command::GET_VA_REGIONS) => {
+                Some(self.va_regions(fd, call, true))
+            }
             (IoctlVariant::Ioctl, command::GET_SYNCPOINT_SHIM_INFO) => {
                 let mut arg = Fixed::<SHIM_BYTES>::from_input(call.input);
                 let result = self.shim(fd, &mut arg, &mut gpu);
