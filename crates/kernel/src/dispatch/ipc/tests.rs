@@ -697,6 +697,75 @@ fn a_copied_current_thread_reaches_the_server_as_the_calling_thread() {
 }
 
 #[test]
+fn a_copied_current_thread_names_the_thread_on_the_senders_own_core() {
+    // A user thread runs on A's core; B sends from its own core, which runs nothing.
+    let (world, thread) = world_running_a_user_thread(A);
+    assert_ne!(core_of(A), core_of(B));
+    let handle = world.session();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    world
+        .first
+        .script(resolving(vec![Handle::CURRENT_THREAD], Arc::clone(&seen)));
+    let (record, regs) = world.send(
+        B,
+        handle,
+        &request().copy_handle(Handle::CURRENT_THREAD.raw()),
+    );
+    assert_eq!(record.outcome, Outcome::Completed);
+    assert_eq!(result(&regs), KernelError::InvalidHandle.code());
+    assert_eq!(
+        world.first.log().handled,
+        Vec::<(ObjectId, MessageBuffer)>::new()
+    );
+    // The same request from A's core reaches the server as A's core's thread.
+    let (record, regs) = world.send(
+        A,
+        handle,
+        &request().copy_handle(Handle::CURRENT_THREAD.raw()),
+    );
+    assert_eq!(record.outcome, Outcome::Completed);
+    assert_eq!(result(&regs), ResultCode::SUCCESS);
+    assert_eq!(*lock(&seen), [Ok(thread)]);
+}
+
+#[test]
+fn a_request_holding_current_process_that_fails_on_a_later_bad_handle_lets_the_process_go() {
+    let tables = crate::process::create(
+        &ProcessDescription::homebrew(Console::Switch2),
+        fixture::loaded().0,
+    )
+    .unwrap();
+    let own = tables.processes.own();
+    let process = tables.scheduler.process(own).unwrap().object();
+    let world = World::with_process(tables);
+    let handle = world.session();
+    world.first.script(reply_with(0));
+    assert_eq!(
+        world.with_tables(|_, scheduler| scheduler.objects().refs(process)),
+        1
+    );
+    let stale = Handle::from_raw(0x7_0123);
+    let (record, regs) = world.send(
+        A,
+        handle,
+        &request()
+            .copy_handle(Handle::CURRENT_PROCESS.raw())
+            .copy_handle(stale.raw()),
+    );
+    assert_eq!(record.outcome, Outcome::Completed);
+    assert_eq!(result(&regs), KernelError::InvalidHandle.code());
+    assert_eq!(
+        world.first.log().handled,
+        Vec::<(ObjectId, MessageBuffer)>::new()
+    );
+    // The reference the request held went with it; the process's own stays.
+    world.with_tables(|handles, scheduler| {
+        assert_eq!(scheduler.objects().refs(process), 1);
+        assert_eq!(handles.len(), 1);
+    });
+}
+
+#[test]
 fn a_copied_current_thread_from_a_core_whose_thread_has_no_object_is_an_invalid_handle() {
     let world = World::new();
     let handle = world.session();
