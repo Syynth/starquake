@@ -254,12 +254,6 @@ impl GsvShared {
     pub fn gpu_memory(&self) -> &GpuMemory {
         &self.gpu
     }
-
-    /// The shared syncpoint page.
-    #[must_use]
-    pub fn syncpoint_page(&self) -> &Page {
-        &self.page
-    }
 }
 
 /// Why a syncpoint could not be watched or unwatched.

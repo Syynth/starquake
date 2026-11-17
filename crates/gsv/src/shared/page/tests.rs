@@ -1156,13 +1156,61 @@ fn each_written_value_is_recorded_after_its_write() {
 }
 
 #[test]
-fn a_closed_transfer_memory_is_refused_by_the_kernel_and_logged() {
+fn a_closed_transfer_memory_is_refused_by_the_kernel() {
     let mut rig = shown();
     assert!(rig.kernel.end_transfer_memory(rig.read_only));
     rig.ask(&[SP]);
     rig.signal();
     assert_eq!(rig.turn(T0), []);
     assert_eq!(rig.page().held(), None);
+}
+
+/// A [`TimerHost`] offering only what every host must: the transfer-memory calls take their
+/// defaults.
+struct Bare<'a>(PageHost<'a>);
+
+impl TimerHost for Bare<'_> {
+    fn record(&mut self, kind: EventKind) {
+        self.0.record(kind);
+    }
+
+    fn unlock_device_share(&mut self, token: DeviceShareToken) -> Result<(), DeviceShareError> {
+        self.0.unlock_device_share(token)
+    }
+
+    fn signal_event(&mut self, event: ObjectId) -> SvcResult<()> {
+        self.0.signal_event(event)
+    }
+}
+
+#[test]
+fn a_host_without_transfer_memory_answers_nothing() {
+    let mut rig = Rig::bound();
+    rig.increment(SP);
+    rig.ask(&[SP]);
+    rig.signal();
+    let mut host = Bare(PageHost {
+        kernel: &mut rig.kernel,
+        acts: Vec::new(),
+        refuse_reads: false,
+        writes_left: None,
+    });
+    rig.shared.drain(&mut host);
+    rig.shared.tick_page(&mut host, T0);
+    assert_eq!(host.0.acts, []);
+    let mut out = [0; 8];
+    assert_eq!(
+        host.read_transfer_memory(rig.read_only, 0, &mut out),
+        Err(KernelError::NotImplemented)
+    );
+    assert_eq!(
+        host.write_transfer_memory(rig.read_only, 0, &out),
+        Err(KernelError::NotImplemented)
+    );
+    drop(host);
+    assert_eq!(rig.answers(), 0);
+    assert_eq!(rig.page().held(), None);
+    assert_eq!(rig.value(SP), UNALLOCATED);
 }
 
 #[test]
@@ -1197,6 +1245,31 @@ fn only_the_bound_page_s_request_event_marks_it_signalled() {
     rig.turn(T0);
     assert!(!rig.page().is_signalled());
     assert_eq!(rig.answers(), 1);
+}
+
+#[test]
+fn an_unbound_page_with_its_events_is_not_marked_signalled() {
+    // A page whose events were made but which is not bound (a 204 that failed after making
+    // them): the title's signal of the request event is not a request yet.
+    let mut rig = Rig::new();
+    let request = RequestEvent {
+        writable: object(0x51, 2),
+        readable: object(0x52, 2),
+    };
+    let page = Page {
+        request: Some(request),
+        answer: Some(object(0x53, 2)),
+        ..Page::default()
+    };
+    rig.shared
+        .restore_page(&snapshot_of(&page), &Accepting::default(), ROOT)
+        .unwrap();
+    rig.shared.queue().push(Completion::GuestSignalled {
+        event: request.writable,
+    });
+    assert_eq!(rig.turn(T0), []);
+    assert!(!rig.page().is_signalled());
+    assert_eq!(rig.shared.save_page().map(|_| ()), Ok(()));
 }
 
 // ----- Snapshots ------------------------------------------------------------------------------------

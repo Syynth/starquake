@@ -74,7 +74,10 @@
 //! The spec answers a request "when the guest signals the request event, when a requested
 //! counter changes, and at the latest 1 ms after the request", and says the bound "keeps a
 //! request for a counter nobody increments from hanging" (decision 9). So a signal alone does not
-//! answer a request whose counters have not moved; this module reads the three triggers so:
+//! answer a request whose counters have not moved; this module reads the three triggers so (a
+//! reading of the spec's words, not a reference's behaviour: both references answer every
+//! request on their poll). Whether the bound matters at all is the spec's "What to verify before
+//! building", item 7 (the request rate, and how long requests wait without it).
 //!
 //! - The guest's signal of the request event reaches gsv through the kernel's hook (the
 //!   completion queue is the hook: [`Completion::GuestSignalled`](crate::completion::Completion)),
@@ -91,7 +94,8 @@
 //!   (`crate::shared`, "The watched-id fast path"); that wakes the timer thread, whose next page
 //!   turn finds the newer value and answers (**on change**:
 //!   `a_held_request_is_answered_when_its_counter_changes`).
-//! - A hold is due [`ANSWER_BOUND`] after the page turn that first held it: a turn at exactly
+//! - A hold is due [`ANSWER_BOUND`] after the page turn that first held it (so a request is
+//!   answered at most [`ANSWER_BOUND`] after the first turn that reads it): a turn at exactly
 //!   that time answers, one a nanosecond before does not (**at the bound**:
 //!   `a_held_request_is_answered_at_exactly_the_bound_and_not_before`). [`super::Shared::page_deadline`]
 //!   says when that is, for the timer thread's next wake-up.
@@ -105,11 +109,13 @@
 //! The page's memories are read and written through the [`TimerHost`]
 //! ([`TimerHost::read_transfer_memory`], [`TimerHost::write_transfer_memory`]), which checks
 //! each access against the transfer memory as it is now. A refused read drops the hold; a
-//! refused write stops the answer where it is, leaving what was written, and drops the hold;
-//! each is logged as a warning, and the next signal tries again
-//! (`a_refused_access_drops_the_hold_and_the_next_signal_tries_again`). A refusal means the
-//! title has closed its transfer memory: PR keeps a reference to both (`Open(kernel)`), so it
-//! never meets this case.
+//! refused write stops the answer where it is, leaving what was written, signals nothing, and
+//! drops the hold; the next signal tries again
+//! (`a_refused_access_drops_the_hold_and_the_next_signal_tries_again`). The kernel refuses once
+//! the title has closed a transfer memory (`a_closed_transfer_memory_is_refused_by_the_kernel`):
+//! PR keeps a reference to both (`Open(kernel)`), so it never meets this case. A host that does
+//! not offer the two calls (their default) refuses every read, so a page bound in a run whose
+//! timer host lacks them answers nothing (`a_host_without_transfer_memory_answers_nothing`).
 //!
 //! # Binding (204)
 //!
@@ -728,7 +734,7 @@ impl Locked<'_> {
     }
 
     /// Gives back the hold's watch of `id`. The hold always has one, so a refusal means gsv's
-    /// own bookkeeping is wrong: it is logged as an error.
+    /// own bookkeeping is wrong, and is logged.
     fn give_back(&mut self, id: SyncpointId) {
         if let Err(error) = self.unwatch(id) {
             tracing::error!(%error, "gsv: the syncpoint page's hold had no watch to give back");
