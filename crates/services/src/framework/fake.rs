@@ -29,6 +29,15 @@
 //! attribute is whatever ranges a test marks ([`FakeKernel::mark_gpu_accessible`]); and a
 //! device-share lock is a count per exact range ([`FakeKernel::device_locks`]), taken only on
 //! mapped memory and released only for a range that holds one.
+//!
+//! Clearing and ending are modelled as plainly. An event the fake made is signalled from a
+//! signal until a clear ([`FakeKernel::is_signalled`]). Either end of a hooked event clears it,
+//! as on the kernel: the writable end clears its readable end. Clearing any other id is the
+//! kernel's [`KernelError::InvalidHandle`]. The fake makes no difference between servers, so it takes
+//! every event it made as the caller's own, where the kernel lets only the server that made an
+//! event clear it. Ending the process only counts the asks ([`FakeKernel::ends`]): the fake has
+//! no process to end, and the reply comes before the end on the real kernel
+//! (`starquake_kernel::dispatch`, the IPC arms' module docs).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -86,6 +95,10 @@ pub struct FakeKernel {
     refs: RefCounts,
     minted: u32,
     events: BTreeMap<ObjectId, u32>,
+    /// The events made that are signalled now: a signal adds one, a clear takes it out.
+    signalled: BTreeSet<ObjectId>,
+    /// How often the caller asked to end its process.
+    ends: u32,
     /// The hooked events made: each writable end's readable end and hook.
     hooked: BTreeMap<ObjectId, (ObjectId, Arc<dyn EventHook>)>,
     /// The ranges a test marked GPU-accessible, as `(address, size)`.
@@ -128,6 +141,8 @@ impl FakeKernel {
             refs: RefCounts::new(),
             minted: 0,
             events: BTreeMap::new(),
+            signalled: BTreeSet::new(),
+            ends: 0,
             hooked: BTreeMap::new(),
             gpu_accessible: Vec::new(),
             device_locks: BTreeMap::new(),
@@ -224,6 +239,21 @@ impl FakeKernel {
     #[must_use]
     pub fn signals(&self, event: ObjectId) -> Option<u32> {
         self.events.get(&event).copied()
+    }
+
+    /// Whether `event` is signalled now: signalled since its last clear. `None` if it is not an
+    /// event this fake created.
+    #[must_use]
+    pub fn is_signalled(&self, event: ObjectId) -> Option<bool> {
+        self.events
+            .contains_key(&event)
+            .then(|| self.signalled.contains(&event))
+    }
+
+    /// How often [`Kernel::end_process`] was called.
+    #[must_use]
+    pub fn ends(&self) -> u32 {
+        self.ends
     }
 
     /// Plays the guest's `SignalEvent` on `writable`, the writable end of an event
@@ -327,6 +357,29 @@ impl Kernel for FakeKernel {
         let signals = self.events.get_mut(&event);
         let signals = signals.ok_or(KernelError::InvalidHandle)?;
         *signals = signals.saturating_add(1);
+        self.signalled.insert(event);
+        Ok(())
+    }
+
+    /// Clears an event this fake made: an id [`Kernel::create_event`] made, or either end of
+    /// one [`Kernel::create_hooked_event`] made (the writable end clears its readable end, as
+    /// the kernel's `IpcContext::clear_event` does). [`KernelError::InvalidHandle`] for any
+    /// other id, and nothing changes.
+    fn clear_event(&mut self, event: ObjectId) -> SvcResult<()> {
+        let readable = match self.hooked.get(&event) {
+            Some((readable, _)) => *readable,
+            None => event,
+        };
+        if !self.events.contains_key(&readable) {
+            return Err(KernelError::InvalidHandle);
+        }
+        self.signalled.remove(&readable);
+        Ok(())
+    }
+
+    /// Counts the ask ([`FakeKernel::ends`]).
+    fn end_process(&mut self) -> SvcResult<()> {
+        self.ends = self.ends.saturating_add(1);
         Ok(())
     }
 
@@ -590,6 +643,30 @@ mod tests {
         assert_eq!(kernel.signals(event), Some(2));
         assert_eq!(kernel.signals(object), None);
         assert_eq!(kernel.signal_event(object), Err(KernelError::InvalidHandle));
+    }
+
+    /// A hook that does nothing.
+    struct Deaf;
+
+    impl EventHook for Deaf {
+        fn signalled(&self, _: ObjectId) {}
+    }
+
+    #[test]
+    fn either_end_of_a_hooked_event_clears_it_and_any_other_id_is_an_invalid_handle() {
+        let mut kernel = FakeKernel::new(0).unwrap();
+        let (writable, readable) = kernel.create_hooked_event(Arc::new(Deaf)).unwrap();
+        for end in [writable, readable] {
+            kernel.guest_signal(writable).unwrap();
+            assert_eq!(kernel.is_signalled(readable), Some(true), "{end:?}");
+            assert_eq!(kernel.clear_event(end), Ok(()), "{end:?}");
+            assert_eq!(kernel.is_signalled(readable), Some(false), "{end:?}");
+        }
+        // An id that is no event stays refused, and the event is not touched.
+        kernel.guest_signal(writable).unwrap();
+        let object = kernel.new_object();
+        assert_eq!(kernel.clear_event(object), Err(KernelError::InvalidHandle));
+        assert_eq!(kernel.is_signalled(readable), Some(true));
     }
 
     #[test]

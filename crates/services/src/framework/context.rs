@@ -34,6 +34,8 @@ pub struct Context<'a> {
     pub(super) deferral: Deferral<'a>,
     pub(super) env: Option<&'a Arc<dyn Env>>,
     pub(super) executor: Option<&'a Arc<dyn Executor>>,
+    /// Whether the method asked to end the caller's process ([`Context::end_process`]).
+    pub(super) ending: bool,
 }
 
 impl Context<'_> {
@@ -54,6 +56,35 @@ impl Context<'_> {
     /// Signals an event.
     pub fn signal_event(&mut self, event: ObjectId) -> Result<(), Fault> {
         Ok(self.kernel.signal_event(event)?)
+    }
+
+    /// Clears an event this server made with [`Context::create_event`] (or either end of one
+    /// [`Context::create_hooked_event`] made): a signalled event stops being signalled, and one
+    /// that is not stays as it is. Any other id is the kernel's
+    /// [`KernelError::InvalidHandle`](starquake_kernel::result::KernelError::InvalidHandle). See
+    /// [`Kernel::clear_event`].
+    pub fn clear_event(&mut self, event: ObjectId) -> Result<(), Fault> {
+        Ok(self.kernel.clear_event(event)?)
+    }
+
+    /// Ends the caller's process once this request is answered (`ISelfController::Exit`): the
+    /// method writes its reply as usual, the reply reaches the caller and the request is
+    /// recorded, and then the kernel ends the process through its normal termination path. See
+    /// [`Kernel::end_process`].
+    ///
+    /// The end follows the reply, so a request whose reply is deferred cannot end the process.
+    /// Asking after [`Context::defer`] handed out the token is a mistake in the service: it is
+    /// logged as an error, fails with [`NOT_SUPPORTED`], and the kernel is not asked. Deferring
+    /// after asking is refused the same way ([`Context::defer`]), so the request is answered
+    /// now, and the process ends after that answer. Asking twice is asking once.
+    pub fn end_process(&mut self) -> Result<(), Fault> {
+        if self.deferral.taken.is_some() {
+            tracing::error!("a method asked to end the process after deferring its reply");
+            return Err(Fault::Result(NOT_SUPPORTED));
+        }
+        self.kernel.end_process()?;
+        self.ending = true;
+        Ok(())
     }
 
     /// Creates a shared memory of `size` bytes (rounded up to whole pages) that the caller
@@ -162,8 +193,13 @@ impl Context<'_> {
     ///
     /// A request has one token. Asking for a second is a mistake in the service: it is logged
     /// as an error and fails with [`NOT_SUPPORTED`]. So is running out of token ids, which
-    /// takes 2^64 deferred requests on one server.
+    /// takes 2^64 deferred requests on one server, and asking after
+    /// [`Context::end_process`].
     pub fn defer(&mut self) -> Result<ReplyToken, Fault> {
+        if self.ending {
+            tracing::error!("a method asked to defer its reply after asking to end the process");
+            return Err(Fault::Result(NOT_SUPPORTED));
+        }
         let next = self.deferral.next_token.checked_add(1);
         let (None, Some(next)) = (self.deferral.taken, next) else {
             tracing::error!("a method asked for a second reply token, or token ids ran out");

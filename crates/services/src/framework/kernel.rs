@@ -18,6 +18,14 @@
 //! [`Kernel::lock_device_share`] and [`Kernel::unlock_device_share`]. Each has a default that
 //! answers [`KernelError::NotImplemented`], so a kernel double written for another service need
 //! not offer them; the kernel's `IpcContext` and `FakeKernel` both do.
+//!
+//! # Clearing an event, and ending the caller's process
+//!
+//! Two more calls the services spec adds (approved 2026-11-16), with the same kind of default:
+//! [`Kernel::clear_event`], for an event the service made (Eden clears the applet message event
+//! at `SetFocusHandlingMode(0, 0, 1)`), and [`Kernel::end_process`], for
+//! `ISelfController::Exit`: the request is recorded, the reply is sent, and then the kernel
+//! ends the process through its normal termination path.
 
 use std::sync::Arc;
 
@@ -48,6 +56,26 @@ pub trait Kernel {
 
     /// Signals an event, waking the guest threads that wait on it.
     fn signal_event(&mut self, event: ObjectId) -> SvcResult<()>;
+
+    /// Clears an event this server made ([`Kernel::create_event`], either end of one
+    /// [`Kernel::create_hooked_event`] made): a signalled event stops being signalled, and one
+    /// that is not stays as it is. Any other id, an event another server or the guest made
+    /// included, is [`KernelError::InvalidHandle`], and nothing changes.
+    ///
+    /// The default answers [`KernelError::NotImplemented`].
+    fn clear_event(&mut self, _event: ObjectId) -> SvcResult<()> {
+        Err(KernelError::NotImplemented)
+    }
+
+    /// Ends the caller's process once the request being handled is answered: its reply is
+    /// written and the request recorded first, and then the kernel ends the process as
+    /// `ExitProcess` does (every thread ends, every handle closes). Asking twice is asking once.
+    /// The request must be answered now: the kernel does not honour the ask for a deferred one.
+    ///
+    /// The default answers [`KernelError::NotImplemented`].
+    fn end_process(&mut self) -> SvcResult<()> {
+        Err(KernelError::NotImplemented)
+    }
 
     /// Creates a shared memory of `size` bytes, rounded up to whole pages, that the caller maps
     /// with `permission` (read, or read and write), and returns it with its pages. The service

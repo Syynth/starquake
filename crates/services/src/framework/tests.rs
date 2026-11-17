@@ -24,6 +24,7 @@ use super::{
 use crate::commands;
 
 mod buffers;
+mod clear_and_end;
 mod control;
 mod copied;
 mod deferred;

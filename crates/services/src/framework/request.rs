@@ -471,6 +471,7 @@ mod tests {
             },
             env: None,
             executor: None,
+            ending: false,
         };
 
         assert_eq!(
