@@ -101,8 +101,9 @@ pub struct RegionId(pub u32);
 /// byte of word 12) or a kind change (gsv 212, word 7). A byte in both references: PR's
 /// `NormalMapGpuMemory4K` keeps the low byte of each of words 10 to 16
 /// (`eden-pr4588/src/core/hle/service/am/service/gpu_session.cpp` @ e5fb3b97), and its
-/// `SelectNativeMemoryKind` returns `u8` kinds (`eden-pr4588/src/core/hle/service/nvdrv/devices/
-/// native_gpu_kind.h` @ e5fb3b97); NX2's 212 handler takes `w[7] & 0xff`
+/// `SelectNativeMemoryKind` returns `u8` kinds
+/// (`eden-pr4588/src/core/hle/service/nvdrv/devices/native_gpu_kind.h` @ e5fb3b97); NX2's 212
+/// handler takes `w[7] & 0xff`
 /// (`eden-nx2/src/core/hle/service/nx2_gsv.h` @ 50fa86bb, `SubModifyKind`). The address table only
 /// stores it; what each value means is the GPU's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]

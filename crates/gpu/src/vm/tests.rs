@@ -34,11 +34,11 @@ fn gpu_only(region: u32, offset: u64) -> Target {
     }
 }
 
-fn at(target: Target, kind: u8) -> Option<Translation> {
-    Some(Translation {
+fn at(target: Target, kind: u8) -> Translation {
+    Translation {
         target,
         kind: Kind(kind),
-    })
+    }
 }
 
 fn translate(vm: &GpuVm, n: u64) -> Option<Translation> {
@@ -53,7 +53,7 @@ fn an_empty_table_translates_nothing() {
     assert_eq!(vm.generation(), 0);
     assert_eq!(translate(&vm, 0), None);
     assert_eq!(vm.translate_page(0), None);
-    assert!(vm.mappings().is_empty());
+    assert_eq!(vm.mappings(), []);
 }
 
 #[test]
@@ -67,23 +67,26 @@ fn each_page_of_a_mapping_leads_as_far_into_its_target() {
 
     // Guest: CPU address plus the page's offset into the mapping.
     assert_eq!(translate(&vm, 1), None, "the page below the start");
-    assert_eq!(translate(&vm, 2), at(guest(0x8000_0000), 0x11));
-    assert_eq!(translate(&vm, 3), at(guest(0x8000_0000 + PAGE_SIZE), 0x11));
+    assert_eq!(translate(&vm, 2), Some(at(guest(0x8000_0000), 0x11)));
+    assert_eq!(
+        translate(&vm, 3),
+        Some(at(guest(0x8000_0000 + PAGE_SIZE), 0x11))
+    );
     assert_eq!(
         translate(&vm, 4),
-        at(guest(0x8000_0000 + 2 * PAGE_SIZE), 0x11)
+        Some(at(guest(0x8000_0000 + 2 * PAGE_SIZE), 0x11))
     );
     assert_eq!(translate(&vm, 5), None, "the page at the end bound");
     // GpuOnly: offset plus the page's offset.
-    assert_eq!(translate(&vm, 10), at(gpu_only(4, 0x3000), 0x22));
+    assert_eq!(translate(&vm, 10), Some(at(gpu_only(4, 0x3000), 0x22)));
     assert_eq!(
         translate(&vm, 11),
-        at(gpu_only(4, 0x3000 + PAGE_SIZE), 0x22)
+        Some(at(gpu_only(4, 0x3000 + PAGE_SIZE), 0x22))
     );
     assert_eq!(translate(&vm, 12), None);
     // The shim stays the shim.
     assert_eq!(translate(&vm, 19), None);
-    assert_eq!(translate(&vm, 20), at(Target::SyncpointShim, 0x33));
+    assert_eq!(translate(&vm, 20), Some(at(Target::SyncpointShim, 0x33)));
     assert_eq!(translate(&vm, 21), None);
 
     assert_eq!(vm.generation(), 3);
@@ -116,10 +119,16 @@ fn a_map_ending_at_a_neighbours_start_leaves_it_alone() {
     // Ends exactly where the neighbour starts, and starts exactly where it ends.
     vm.map(pages(3, 2), guest(0x7000_0000), Kind(2)).unwrap();
     vm.map(pages(7, 1), gpu_only(1, 0), Kind(3)).unwrap();
-    assert_eq!(translate(&vm, 5), at(guest(0x9000_0000), 1));
-    assert_eq!(translate(&vm, 6), at(guest(0x9000_0000 + PAGE_SIZE), 1));
-    assert_eq!(translate(&vm, 4), at(guest(0x7000_0000 + PAGE_SIZE), 2));
-    assert_eq!(translate(&vm, 7), at(gpu_only(1, 0), 3));
+    assert_eq!(translate(&vm, 5), Some(at(guest(0x9000_0000), 1)));
+    assert_eq!(
+        translate(&vm, 6),
+        Some(at(guest(0x9000_0000 + PAGE_SIZE), 1))
+    );
+    assert_eq!(
+        translate(&vm, 4),
+        Some(at(guest(0x7000_0000 + PAGE_SIZE), 2))
+    );
+    assert_eq!(translate(&vm, 7), Some(at(gpu_only(1, 0), 3)));
     assert_eq!(vm.mappings().len(), 3);
 }
 
@@ -128,22 +137,32 @@ fn a_map_replaces_what_it_overlaps() {
     // NX2 `MapAt`: `TrimMappings` keeps the parts of older mappings outside the new range, the
     // upper part leading as far into its old target as it starts into the old mapping.
     let vm = GpuVm::new();
-    vm.map(pages(0, 4), gpu_only(9, 0x10_0000), Kind(1)).unwrap();
+    vm.map(pages(0, 4), gpu_only(9, 0x10_0000), Kind(1))
+        .unwrap();
     vm.map(pages(6, 4), guest(0x4000_0000), Kind(2)).unwrap();
     vm.map(pages(12, 1), guest(0x5000_0000), Kind(4)).unwrap();
     // From inside the first to inside the second, over the hole at 4 and 5.
     vm.map(pages(2, 6), guest(0x6000_0000), Kind(3)).unwrap();
 
-    assert_eq!(translate(&vm, 1), at(gpu_only(9, 0x10_0000 + PAGE_SIZE), 1));
+    assert_eq!(
+        translate(&vm, 1),
+        Some(at(gpu_only(9, 0x10_0000 + PAGE_SIZE), 1))
+    );
     for n in 2..8 {
         assert_eq!(
             translate(&vm, n),
-            at(guest(0x6000_0000 + (n - 2) * PAGE_SIZE), 3)
+            Some(at(guest(0x6000_0000 + (n - 2) * PAGE_SIZE), 3))
         );
     }
-    assert_eq!(translate(&vm, 8), at(guest(0x4000_0000 + 2 * PAGE_SIZE), 2));
-    assert_eq!(translate(&vm, 9), at(guest(0x4000_0000 + 3 * PAGE_SIZE), 2));
-    assert_eq!(translate(&vm, 12), at(guest(0x5000_0000), 4));
+    assert_eq!(
+        translate(&vm, 8),
+        Some(at(guest(0x4000_0000 + 2 * PAGE_SIZE), 2))
+    );
+    assert_eq!(
+        translate(&vm, 9),
+        Some(at(guest(0x4000_0000 + 3 * PAGE_SIZE), 2))
+    );
+    assert_eq!(translate(&vm, 12), Some(at(guest(0x5000_0000), 4)));
     assert_eq!(
         vm.mappings(),
         [
@@ -172,9 +191,12 @@ fn a_map_replaces_what_it_overlaps() {
 
     // A map strictly inside one mapping leaves both of its ends.
     vm.map(pages(3, 1), Target::SyncpointShim, Kind(5)).unwrap();
-    assert_eq!(translate(&vm, 2), at(guest(0x6000_0000), 3));
-    assert_eq!(translate(&vm, 3), at(Target::SyncpointShim, 5));
-    assert_eq!(translate(&vm, 4), at(guest(0x6000_0000 + 2 * PAGE_SIZE), 3));
+    assert_eq!(translate(&vm, 2), Some(at(guest(0x6000_0000), 3)));
+    assert_eq!(translate(&vm, 3), Some(at(Target::SyncpointShim, 5)));
+    assert_eq!(
+        translate(&vm, 4),
+        Some(at(guest(0x6000_0000 + 2 * PAGE_SIZE), 3))
+    );
 }
 
 #[test]
@@ -187,8 +209,12 @@ fn the_shim_is_exactly_one_page() {
             size: (SHIM_PAGES + 1) * PAGE_SIZE
         })
     );
-    assert_eq!(vm.generation(), 0, "a refused map does not move the version");
-    assert!(vm.mappings().is_empty(), "nor change the table");
+    assert_eq!(
+        vm.generation(),
+        0,
+        "a refused map does not move the version"
+    );
+    assert_eq!(vm.mappings(), [], "nor change the table");
     let one = PageRange::new(page(0), SHIM_PAGES * PAGE_SIZE).unwrap();
     assert_eq!(vm.map(one, Target::SyncpointShim, Kind(0)), Ok(()));
     assert_eq!(vm.generation(), 1);
@@ -232,7 +258,10 @@ fn a_target_must_be_aligned_and_end_in_range() {
         assert_eq!(vm.generation(), 0);
         // One page further down ends exactly at the last representable page boundary.
         assert_eq!(vm.map(one, make(last_page - PAGE_SIZE), Kind(0)), Ok(()));
-        assert_eq!(vm.map(two, make(last_page - 2 * PAGE_SIZE), Kind(0)), Ok(()));
+        assert_eq!(
+            vm.map(two, make(last_page - 2 * PAGE_SIZE), Kind(0)),
+            Ok(())
+        );
         assert_eq!(
             translate(&vm, 5),
             Some(Translation {
@@ -250,7 +279,7 @@ fn a_gpu_range_at_the_top_of_the_space_translates() {
     let top = u64::MAX - (PAGE_SIZE - 1) - PAGE_SIZE;
     let range = PageRange::new(top, PAGE_SIZE).unwrap();
     vm.map(range, guest(0), Kind(7)).unwrap();
-    assert_eq!(vm.translate_page(top), at(guest(0), 7));
+    assert_eq!(vm.translate_page(top), Some(at(guest(0), 7)));
     assert_eq!(vm.translate_page(top - PAGE_SIZE), None);
     assert_eq!(vm.translate_page(top + PAGE_SIZE), None);
 }
@@ -265,18 +294,27 @@ fn an_unmap_splits_a_mapping_and_skips_holes() {
     vm.map(pages(10, 1), guest(0x2000_0000), Kind(3)).unwrap();
     // Pages 2 and 3 of the first: it splits in two.
     assert_eq!(vm.apply(&VmUpdate::Unmap { range: pages(2, 2) }), 2);
-    assert_eq!(translate(&vm, 1), at(guest(0x1000_0000 + PAGE_SIZE), 1));
+    assert_eq!(
+        translate(&vm, 1),
+        Some(at(guest(0x1000_0000 + PAGE_SIZE), 1))
+    );
     assert_eq!(translate(&vm, 2), None);
     assert_eq!(translate(&vm, 3), None);
-    assert_eq!(translate(&vm, 4), at(guest(0x1000_0000 + 4 * PAGE_SIZE), 1));
+    assert_eq!(
+        translate(&vm, 4),
+        Some(at(guest(0x1000_0000 + 4 * PAGE_SIZE), 1))
+    );
     // From the second half's last page over the hole at 6 and 7 into the GpuOnly mapping, ending
     // exactly where the next one starts: 1 + 2 pages mapped.
     assert_eq!(vm.apply(&VmUpdate::Unmap { range: pages(5, 5) }), 3);
-    assert_eq!(translate(&vm, 4), at(guest(0x1000_0000 + 4 * PAGE_SIZE), 1));
+    assert_eq!(
+        translate(&vm, 4),
+        Some(at(guest(0x1000_0000 + 4 * PAGE_SIZE), 1))
+    );
     for n in 5..10 {
         assert_eq!(translate(&vm, n), None);
     }
-    assert_eq!(translate(&vm, 10), at(guest(0x2000_0000), 3));
+    assert_eq!(translate(&vm, 10), Some(at(guest(0x2000_0000), 3)));
     assert_eq!(
         vm.mappings(),
         [
@@ -302,12 +340,8 @@ fn an_unmap_splits_a_mapping_and_skips_holes() {
 #[test]
 fn every_removal_takes_out_the_same_pages() {
     let removals = [
-        VmUpdate::Unmap {
-            range: pages(1, 2),
-        },
-        VmUpdate::DestroyMemory {
-            range: pages(1, 2),
-        },
+        VmUpdate::Unmap { range: pages(1, 2) },
+        VmUpdate::DestroyMemory { range: pages(1, 2) },
         VmUpdate::DestroySparseRegion {
             range: pages(1, 2),
             region: RegionId(6),
@@ -317,10 +351,10 @@ fn every_removal_takes_out_the_same_pages() {
         let vm = GpuVm::new();
         vm.map(pages(0, 4), gpu_only(6, 0), Kind(1)).unwrap();
         assert_eq!(vm.apply(&removal), 2, "{removal:?}");
-        assert_eq!(translate(&vm, 0), at(gpu_only(6, 0), 1));
+        assert_eq!(translate(&vm, 0), Some(at(gpu_only(6, 0), 1)));
         assert_eq!(translate(&vm, 1), None);
         assert_eq!(translate(&vm, 2), None);
-        assert_eq!(translate(&vm, 3), at(gpu_only(6, 3 * PAGE_SIZE), 1));
+        assert_eq!(translate(&vm, 3), Some(at(gpu_only(6, 3 * PAGE_SIZE), 1)));
         assert_eq!(vm.generation(), 2);
     }
 }
@@ -338,14 +372,23 @@ fn a_kind_change_spans_mappings_and_skips_holes() {
         kind: Kind(9),
     };
     assert_eq!(vm.apply(&change), 5);
-    assert_eq!(translate(&vm, 0), at(guest(0x3000_0000), 1));
-    assert_eq!(translate(&vm, 1), at(guest(0x3000_0000 + PAGE_SIZE), 9));
-    assert_eq!(translate(&vm, 2), at(guest(0x3000_0000 + 2 * PAGE_SIZE), 9));
+    assert_eq!(translate(&vm, 0), Some(at(guest(0x3000_0000), 1)));
+    assert_eq!(
+        translate(&vm, 1),
+        Some(at(guest(0x3000_0000 + PAGE_SIZE), 9))
+    );
+    assert_eq!(
+        translate(&vm, 2),
+        Some(at(guest(0x3000_0000 + 2 * PAGE_SIZE), 9))
+    );
     assert_eq!(translate(&vm, 3), None, "a hole stays a hole");
     assert_eq!(translate(&vm, 4), None);
-    assert_eq!(translate(&vm, 5), at(gpu_only(1, 0x8000), 9));
-    assert_eq!(translate(&vm, 7), at(gpu_only(1, 0x8000 + 2 * PAGE_SIZE), 9));
-    assert_eq!(translate(&vm, 8), at(guest(0x4000_0000), 4));
+    assert_eq!(translate(&vm, 5), Some(at(gpu_only(1, 0x8000), 9)));
+    assert_eq!(
+        translate(&vm, 7),
+        Some(at(gpu_only(1, 0x8000 + 2 * PAGE_SIZE), 9))
+    );
+    assert_eq!(translate(&vm, 8), Some(at(guest(0x4000_0000), 4)));
     assert_eq!(vm.mappings().len(), 4, "only the first split");
 
     // Strictly inside one mapping: both ends keep the old kind.
@@ -354,9 +397,15 @@ fn a_kind_change_spans_mappings_and_skips_holes() {
         kind: Kind(3),
     };
     assert_eq!(vm.apply(&inner), 1);
-    assert_eq!(translate(&vm, 5), at(gpu_only(1, 0x8000), 9));
-    assert_eq!(translate(&vm, 6), at(gpu_only(1, 0x8000 + PAGE_SIZE), 3));
-    assert_eq!(translate(&vm, 7), at(gpu_only(1, 0x8000 + 2 * PAGE_SIZE), 9));
+    assert_eq!(translate(&vm, 5), Some(at(gpu_only(1, 0x8000), 9)));
+    assert_eq!(
+        translate(&vm, 6),
+        Some(at(gpu_only(1, 0x8000 + PAGE_SIZE), 3))
+    );
+    assert_eq!(
+        translate(&vm, 7),
+        Some(at(gpu_only(1, 0x8000 + 2 * PAGE_SIZE), 9))
+    );
 }
 
 #[test]
@@ -366,9 +415,7 @@ fn an_update_of_a_hole_changes_nothing_but_the_version() {
     vm.map(pages(2, 1), guest(0x2000), Kind(1)).unwrap();
     let before = vm.mappings();
     for update in [
-        VmUpdate::Unmap {
-            range: pages(1, 1),
-        },
+        VmUpdate::Unmap { range: pages(1, 1) },
         VmUpdate::ModifyKind {
             range: pages(1, 1),
             kind: Kind(5),
@@ -411,44 +458,61 @@ fn a_cache_over_the_table_drops_what_an_update_changed() {
     let vm = Arc::new(GpuVm::new());
     vm.map(pages(0, 2), guest(0x7000_0000), Kind(1)).unwrap();
     let mut cache = TranslationCache::new(Arc::clone(&vm));
-    assert_eq!(cache.translate(page(1) + 0x10), at(guest(0x7000_1000), 1));
+    assert_eq!(
+        cache.translate(page(1) + 0x10),
+        Some(at(guest(0x7000_1000), 1))
+    );
     vm.apply(&VmUpdate::ModifyKind {
         range: pages(1, 1),
         kind: Kind(2),
     });
-    assert_eq!(cache.translate(page(1) + 0x10), at(guest(0x7000_1000), 2));
+    assert_eq!(
+        cache.translate(page(1) + 0x10),
+        Some(at(guest(0x7000_1000), 2))
+    );
     vm.apply(&VmUpdate::Unmap { range: pages(1, 1) });
     assert_eq!(cache.translate(page(1)), None);
-    assert_eq!(cache.translate(page(0)), at(guest(0x7000_0000), 1));
+    assert_eq!(cache.translate(page(0)), Some(at(guest(0x7000_0000), 1)));
 }
 
 #[test]
 fn a_reader_that_sees_a_version_sees_its_maps() {
     // The writer maps page k as its (k+1)th change; a reader that reads version v and then
-    // translates must find pages 0..v mapped. This catches a version moved before the change only
-    // when a reader lands between the two, so it is a check, not a proof.
-    const COUNT: u64 = 256;
+    // translates must find page v - 1 mapped (and every page below it, checked at the end). This
+    // catches a version moved before the change only when a reader lands between the two, so it
+    // is a check, not a proof.
+    const COUNT: u64 = 20_000;
+    const READERS: usize = 3;
     let vm = GpuVm::new();
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(30);
     std::thread::scope(|scope| {
         scope.spawn(|| {
             for k in 0..COUNT {
                 vm.map(pages(k, 1), guest(k * PAGE_SIZE), Kind(0)).unwrap();
             }
         });
-        scope.spawn(|| {
-            loop {
-                let seen = vm.generation();
-                for k in 0..seen {
-                    assert_eq!(translate(&vm, k), at(guest(k * PAGE_SIZE), 0));
+        for _ in 0..READERS {
+            scope.spawn(|| {
+                loop {
+                    let seen = vm.generation();
+                    if let Some(newest) = seen.checked_sub(1) {
+                        assert_eq!(
+                            translate(&vm, newest),
+                            Some(at(guest(newest * PAGE_SIZE), 0)),
+                            "version {seen}"
+                        );
+                    }
+                    if seen == COUNT {
+                        break;
+                    }
+                    assert!(Instant::now() < deadline, "the writer did not finish");
                 }
-                if seen == COUNT {
-                    break;
-                }
-                assert!(Instant::now() < deadline, "the writer did not finish");
-            }
-        });
+            });
+        }
     });
+    for k in 0..COUNT {
+        assert_eq!(translate(&vm, k), Some(at(guest(k * PAGE_SIZE), 0)));
+    }
 }
 
 // --- snapshots ---
@@ -510,13 +574,19 @@ fn the_snapshot_layout_is_pinned() {
 fn a_hand_built_snapshot_restores_and_works() {
     let vm = Arc::new(GpuVm::restore(&golden()).unwrap());
     assert_eq!(vm.generation(), 4);
-    assert_eq!(vm.translate_page(0x2000), at(guest(0x6000), 0x11));
-    assert_eq!(vm.translate_page(0x6000), at(gpu_only(5, 0x8000), 0x22));
-    assert_eq!(vm.translate_page(0x9000), at(Target::SyncpointShim, 0x33));
+    assert_eq!(vm.translate_page(0x2000), Some(at(guest(0x6000), 0x11)));
+    assert_eq!(
+        vm.translate_page(0x6000),
+        Some(at(gpu_only(5, 0x8000), 0x22))
+    );
+    assert_eq!(
+        vm.translate_page(0x9000),
+        Some(at(Target::SyncpointShim, 0x33))
+    );
     assert_eq!(vm.translate_page(0x3000), None);
     // The restored table takes changes and moves on from the restored version.
     let mut cache = TranslationCache::new(Arc::clone(&vm));
-    assert_eq!(cache.translate(0x1000), at(guest(0x5000), 0x11));
+    assert_eq!(cache.translate(0x1000), Some(at(guest(0x5000), 0x11)));
     vm.map(
         PageRange::new(0x1000, PAGE_SIZE).unwrap(),
         guest(0xA000),
@@ -524,8 +594,8 @@ fn a_hand_built_snapshot_restores_and_works() {
     )
     .unwrap();
     assert_eq!(vm.generation(), 5);
-    assert_eq!(cache.translate(0x1000), at(guest(0xA000), 0x44));
-    assert_eq!(cache.translate(0x2000), at(guest(0x6000), 0x11));
+    assert_eq!(cache.translate(0x1000), Some(at(guest(0xA000), 0x44)));
+    assert_eq!(cache.translate(0x2000), Some(at(guest(0x6000), 0x11)));
     assert_eq!(
         vm.apply(&VmUpdate::Unmap {
             range: PageRange::new(0x1000, 0x8000).unwrap()
@@ -688,20 +758,19 @@ fn every_mapping_check_is_enforced() {
         assert_eq!(GpuVm::restore(&bytes).unwrap_err(), error, "{bad:?}");
     }
     // Exactly at the first one's end is accepted.
-    let touching = raw(&state(vec![first, saved(2 * PAGE_SIZE, PAGE_SIZE, GUEST_0)]));
+    let touching = raw(&state(vec![
+        first,
+        saved(2 * PAGE_SIZE, PAGE_SIZE, GUEST_0),
+    ]));
     let vm = GpuVm::restore(&touching).unwrap();
-    assert_eq!(vm.translate_page(PAGE_SIZE), at(guest(PAGE_SIZE), 0));
-    assert_eq!(vm.translate_page(2 * PAGE_SIZE), at(guest(0), 0));
+    assert_eq!(vm.translate_page(PAGE_SIZE), Some(at(guest(PAGE_SIZE), 0)));
+    assert_eq!(vm.translate_page(2 * PAGE_SIZE), Some(at(guest(0), 0)));
 }
 
 #[test]
 fn mapping_faults_are_reported_in_the_documented_order() {
     // One mapping with a bad range, a bad target and an overlap: the range wins.
-    let all = saved(
-        PAGE_SIZE + 1,
-        PAGE_SIZE,
-        SavedTarget::Guest { cpu_va: 1 },
-    );
+    let all = saved(PAGE_SIZE + 1, PAGE_SIZE, SavedTarget::Guest { cpu_va: 1 });
     let first = saved(0, 4 * PAGE_SIZE, GUEST_0);
     assert!(matches!(
         GpuVm::restore(&raw(&state(vec![first, all]))),
@@ -772,7 +841,9 @@ fn errors_read_as_plain_words() {
     );
     assert_eq!(
         SnapshotError::UnsupportedVersion { found: 9 }.to_string(),
-        format!("GPU VM snapshot layout version 9 is not supported (this build reads {SNAPSHOT_VERSION})")
+        format!(
+            "GPU VM snapshot layout version 9 is not supported (this build reads {SNAPSHOT_VERSION})"
+        )
     );
     assert_eq!(
         SnapshotError::TrailingBytes { count: 2 }.to_string(),
@@ -907,7 +978,8 @@ fn model_target(target: Target, i: u64) -> Target {
 /// Checks `vm` and `cache` against `model` on every model page and the page on each side.
 fn check(vm: &GpuVm, cache: &mut TranslationCache<GpuVm>, model: &Model, version: u64) {
     assert_eq!(vm.generation(), version);
-    for va in (page(0) - PAGE_SIZE..=page(MODEL_PAGES)).step_by(PAGE_SIZE as usize) {
+    for va in (page(0) - PAGE_SIZE..=page(MODEL_PAGES)).step_by(usize::try_from(PAGE_SIZE).unwrap())
+    {
         let want = model.get(&va).copied();
         assert_eq!(vm.translate_page(va), want, "page {va:#x}");
         assert_eq!(cache.translate(va + 0x123), want, "cached page {va:#x}");

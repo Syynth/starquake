@@ -44,8 +44,11 @@
 //!   [`GpuVm::map`] and every [`GpuVm::apply`], including one whose range holds no mapping: the
 //!   spec's "moved by every map, ordered update or kind change". A refused map does not move it.
 //!   It moves while the table is still locked for the change, after the change, with a release
-//!   store, so a thread that reads the new version and then translates sees the new table
-//!   (`tests::a_reader_that_sees_a_version_sees_its_maps`).
+//!   store, so a thread that reads the new version and then translates sees the new table. The
+//!   threaded test `tests::a_reader_that_sees_a_version_sees_its_maps` checks this; it catches a
+//!   version moved before the change only when a reader lands between the two (in review it
+//!   caught that mutation in three runs of three), and it cannot show that a weaker memory
+//!   ordering is wrong, so the order and the orderings are for review to keep.
 //!
 //! # Divergences from the references
 //!
@@ -113,7 +116,8 @@
 //! ([`SnapshotError::Range`]), that its target fits it (the checks of [`GpuVm::map`],
 //! [`SnapshotError::Target`]), and that it starts at or after the end of the one before
 //! ([`SnapshotError::Overlap`]). [`GpuVm::save`] runs the same checks on what it is about to
-//! write.
+//! write. No test makes that check fail: [`GpuVm::map`] and [`GpuVm::apply`] keep the table
+//! within the same rules, so the save-side check is a guard against a future change to them.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
