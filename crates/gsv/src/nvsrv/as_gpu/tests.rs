@@ -727,8 +727,26 @@ fn closing_a_view_of_a_gpu_33_space_keeps_it() {
     assert_eq!(updates(&direct), []);
 }
 
+/// An `AllocAsEx` naming as its parent the id of a space its last close destroyed is
+/// `BadParameter`, with no view and no space made, and nothing sent to the GPU.
+#[test]
+fn a_view_of_a_destroyed_space_is_a_bad_parameter() {
+    let mut direct = Direct::new();
+    let (creator, space) = own_space(&mut direct);
+    assert_eq!(direct.close(creator), NvResult::Success);
+    assert_eq!(spaces(&direct), []);
+    let sent = updates(&direct);
+    let (fd, result) = view_of(&mut direct, space, false);
+    assert_eq!(result, NvResult::BadParameter);
+    assert_eq!(direct.state.as_gpu().view(fd.cast_unsigned()), None);
+    assert_eq!(spaces(&direct), []);
+    assert_eq!(updates(&direct), sent);
+}
+
 /// After its creator closes, a space a child view still holds can be named as a parent (here
-/// `as_fd` names the space, not the closed fd; module docs, "Where this differs").
+/// `as_fd` names the space, not the closed fd; module docs, "Where this differs"). The state
+/// the close leaves, the space held by the child alone, survives `postcard` and is accepted
+/// against gsv's memory.
 #[test]
 fn a_child_keeps_the_space_nameable_after_its_creator_closes() {
     let mut direct = Direct::new();
@@ -736,6 +754,11 @@ fn a_child_keeps_the_space_nameable_after_its_creator_closes() {
     let (_child, result) = view_of(&mut direct, space, false);
     assert_eq!(result, NvResult::Success);
     assert_eq!(direct.close(creator), NvResult::Success);
+    let state = direct.state.as_gpu().clone();
+    let bytes = postcard::to_allocvec(&state).unwrap();
+    let restored = postcard::from_bytes::<AsGpu>(&bytes).unwrap();
+    assert_eq!(restored, state);
+    assert_eq!(restored.check_spaces(&direct.memory), Ok(()));
     let (second, result) = view_of(&mut direct, space, false);
     assert_eq!(result, NvResult::Success);
     assert_eq!(
@@ -784,6 +807,40 @@ fn a_state_saved_before_a_destroy_is_refused_against_the_memory_after_it() {
     assert_eq!(
         before.check_spaces(&empty),
         Err(AsGpuStateError::MadeSpaceNotHeld { space: space.0 })
+    );
+}
+
+/// `check_spaces` walks the made spaces in id order: of two that gsv does not hold, the lower
+/// is reported.
+#[test]
+fn check_spaces_reports_the_lowest_unheld_made_space() {
+    let creator = |id| View {
+        space: AsId(id),
+        layout: MADE,
+    };
+    let state = AsGpu::try_from(saved(
+        &[(1, creator(4)), (2, creator(3))],
+        &[(AsId(3), MADE), (AsId(4), MADE)],
+    ))
+    .unwrap();
+    assert_eq!(
+        state.check_spaces(&GpuMemory::new()),
+        Err(AsGpuStateError::MadeSpaceNotHeld { space: 3 })
+    );
+}
+
+/// `check_spaces` walks the views in fd order: of two views of spaces gsv does not hold, the
+/// lower fd's is reported, though its space has the higher id.
+#[test]
+fn check_spaces_reports_the_lowest_fd_whose_space_is_unheld() {
+    let native = |id| View {
+        space: AsId(id),
+        layout: child_of(&NATIVE_LAYOUT),
+    };
+    let state = AsGpu::try_from(saved(&[(1, native(6)), (2, native(5))], &[])).unwrap();
+    assert_eq!(
+        state.check_spaces(&GpuMemory::new()),
+        Err(AsGpuStateError::ViewSpaceNotHeld { fd: 1, space: 6 })
     );
 }
 
@@ -1320,6 +1377,11 @@ fn unheld() -> Vec<(SavedAsGpu, AsGpuStateError)> {
             saved(&[], &[(space(3), MADE)]),
             AsGpuStateError::MadeSpaceUnheld { space: 3 },
         ),
+        // Two unheld: the lower id is reported.
+        (
+            saved(&[], &[(space(3), MADE), (space(4), MADE)]),
+            AsGpuStateError::MadeSpaceUnheld { space: 3 },
+        ),
         (
             saved(
                 &[(1, view(4, MADE)), (2, view(5, child_of(&MADE)))],
@@ -1358,43 +1420,28 @@ fn unheld() -> Vec<(SavedAsGpu, AsGpuStateError)> {
 }
 
 /// Each relation's reachable side is accepted: the most made spaces, a creator's view, a view of
-/// a made space, a view of a gpu-33 space; and the state survives `postcard`.
+/// a made space, a made space held by a child view alone, a view of a gpu-33 space; and the
+/// state survives `postcard`.
 #[test]
 fn a_saved_state_at_each_edge_is_accepted() {
     let all: Vec<(AsId, Layout)> = (1..=u32::try_from(MAX_ADDRESS_SPACES).unwrap())
         .map(|id| (AsId(id), MADE))
         .collect();
+    let view = |space, layout| View {
+        space: AsId(space),
+        layout,
+    };
     let views = [
-        (
-            3,
-            View {
-                space: AsId(1),
-                layout: MADE,
-            },
-        ),
-        (
-            5,
-            View {
-                space: AsId(1),
-                layout: child_of(&MADE),
-            },
-        ),
-        (
-            6,
-            View {
-                space: AsId(20),
-                layout: child_of(&NATIVE_LAYOUT),
-            },
-        ),
+        (3, view(1, MADE)),
+        (5, view(1, child_of(&MADE))),
+        (6, view(20, child_of(&NATIVE_LAYOUT))),
+        // A made space held only by a child view, as its creator's close leaves it
+        // (`a_child_keeps_the_space_nameable_after_its_creator_closes`).
+        (7, view(2, child_of(&MADE))),
     ];
     // Every other made space held by its creator's fd.
-    let creators = (2..=u32::try_from(MAX_ADDRESS_SPACES).unwrap()).map(|id| {
-        let view = View {
-            space: AsId(id),
-            layout: MADE,
-        };
-        (10 + id, view)
-    });
+    let creators =
+        (3..=u32::try_from(MAX_ADDRESS_SPACES).unwrap()).map(|id| (10 + id, view(id, MADE)));
     let views: Vec<(u32, View)> = views.into_iter().chain(creators).collect();
     let state = AsGpu::try_from(saved(&views, &all)).unwrap();
     let bytes = postcard::to_allocvec(&state).unwrap();

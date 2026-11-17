@@ -91,7 +91,9 @@
 //! GPU applies those removals because nothing is handed out again: an address space id is never
 //! reused (the next id only counts up, and a restore refuses an id at or past it), so a new space
 //! gets a new id and a new table, and no request can reach the old one (211 to 215 and the shim's
-//! placing answer `NotFound` for it, and an `AllocAsEx` naming it as its parent `BadParameter`).
+//! placing answer `NotFound` for it: `a_destroyed_space_is_gone_and_its_id_is_never_reused`; an
+//! `AllocAsEx` naming it as its parent is `BadParameter`:
+//! `a_view_of_a_destroyed_space_is_a_bad_parameter`, in `nvsrv/as_gpu/tests.rs`).
 //! What the ordering must protect is the guest memory under the old
 //! table, and gsv releases none at the destroy: the registrations, and their device-share
 //! locks, stay. A later 102's removals and barrier are sent after the destroy's removals, so the

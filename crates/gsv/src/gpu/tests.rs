@@ -2320,8 +2320,9 @@ fn destroying_an_address_space_empties_its_table_in_order() {
     assert!(gpu.registration(handle).is_some());
 }
 
-/// After a destroy every request naming the space is `NotFound` and sends nothing, a second
-/// destroy included; the slot is free at once, and the next space takes a new id.
+/// After a destroy every request naming the space (211 to 215 over what the space held, the
+/// shim's placing, and a second destroy) is `NotFound` and sends nothing; the slot is free at
+/// once, and the next space takes a new id.
 #[test]
 fn a_destroyed_space_is_gone_and_its_id_is_never_reused() {
     let (mut gpu, front) = bare();
@@ -2335,6 +2336,7 @@ fn a_destroyed_space_is_gone_and_its_id_is_never_reused() {
     let handle = register_bare(&mut gpu, page_range(MEMORY, MEMORY_SIZE));
     let space = spaces[1];
     map_bare(&mut gpu, space, GPU_VA, handle, 1);
+    gpu.create_sparse_region(&sparse_at(space, 0, 1)).unwrap();
     gpu.destroy_address_space(&front, space).unwrap();
     let calls = front.calls().len();
     let event = ObjectId::from_parts(4, 5);
@@ -2362,9 +2364,31 @@ fn a_destroyed_space_is_gone_and_its_id_is_never_reused() {
         sync: 0,
     };
     assert_eq!(gpu.map(&map), Err(KernelError::NotFound));
+    // 212 over the mapping the space had.
+    let modify = ModifyRequest {
+        space,
+        first: GPU_VA,
+        last: GPU_VA + PAGE_SIZE - 1,
+        kind: 6,
+        fallback: 6,
+    };
+    assert_eq!(
+        gpu.modify_kind(&front, &modify, event),
+        Err(KernelError::NotFound)
+    );
     assert_eq!(gpu.unmap(&front, &range, event), Err(KernelError::NotFound));
     assert_eq!(
-        gpu.create_sparse_region(&sparse_at(space, 0, 1)),
+        gpu.create_sparse_region(&sparse_at(space, 1, 1)),
+        Err(KernelError::NotFound)
+    );
+    // 215 over the sparse region the space had.
+    let region = RangeRequest {
+        space,
+        first: REGION,
+        last: REGION + PAGE_SIZE - 1,
+    };
+    assert_eq!(
+        gpu.destroy_sparse_region(&front, &region, event),
         Err(KernelError::NotFound)
     );
     assert_eq!(
