@@ -713,6 +713,18 @@ fn insert_lock(body: &mut Body, address: u64, size: u64) -> usize {
         .unwrap()
 }
 
+/// Makes the block at `address` device shared with the counts and barriers of one lock taken
+/// exactly over it, so that it passes the block checks alone.
+fn device_share_alone(body: &mut Body, address: u64) {
+    let index = at(body, address);
+    let block = &mut body.blocks[index];
+    block.attribute |= MemoryAttribute::DEVICE_SHARED.bits();
+    block.device_use_count = 1;
+    block.device_disable_merge_left_count = 1;
+    block.device_disable_merge_right_count = 1;
+    block.disable_merge |= (DisableMerge::DEVICE_LEFT | DisableMerge::DEVICE_RIGHT).bits();
+}
+
 /// The pool the rich space draws from.
 const fn pool() -> u64 {
     MemoryArrangement::FourGb.application_pool_size()
@@ -860,6 +872,17 @@ fn faults() -> Vec<(&'static str, Fault)> {
                 fault: LockFault::NotShared,
             }
         }),
+        ("lock state", |case, rich| {
+            // The thread-local page, device shared with the counts of one lock exactly over it,
+            // and that lock: its state cannot be device mapped.
+            let tls = thread_local(rich);
+            device_share_alone(&mut case.body, tls);
+            let index = insert_lock(&mut case.body, tls, PAGE_SIZE);
+            SnapshotError::Lock {
+                index,
+                fault: LockFault::State,
+            }
+        }),
         ("device counts", |case, _| {
             case.body.locks[0].count += 1;
             let first = case.body.locks[0].address;
@@ -880,6 +903,16 @@ fn faults() -> Vec<(&'static str, Fault)> {
             SnapshotError::Shared {
                 index: 1,
                 fault: SharedFault::Size,
+            }
+        }),
+        ("shared permission", |case, _| {
+            // The read-only shared memory's block made read-write.
+            let second = case.body.shared[1].address;
+            let index = at(&case.body, second);
+            case.body.blocks[index].permission = MemoryPermission::USER_READ_WRITE.bits();
+            SnapshotError::Shared {
+                index: 1,
+                fault: SharedFault::Permission,
             }
         }),
         ("translation", |case, _| {
@@ -946,13 +979,14 @@ fn a_refusal_before_the_translation_asks_the_new_mapper_nothing() {
     // The last check before the translation, with the translation's fault present too.
     let mut case = Case::new(&rich);
     case.refuse = vec![0];
-    case.objects.remove(&rich.shared[0]);
+    let index = at(&case.body, case.body.shared[1].address);
+    case.body.blocks[index].permission = MemoryPermission::USER_READ_WRITE.bits();
     let (restored, calls) = case.restore();
     assert_eq!(
         restored.unwrap_err(),
         SnapshotError::Shared {
-            index: 0,
-            fault: SharedFault::Missing
+            index: 1,
+            fault: SharedFault::Permission
         }
     );
     assert_eq!(calls, []);
@@ -1023,6 +1057,11 @@ fn thread_local(rich: &Rich) -> u64 {
 /// A change to one saved block.
 type BlockChange = Box<dyn Fn(&mut SavedBlock)>;
 
+/// The user's read, write and execute with the kernel's read and write: every user bit, with
+/// the kernel bits a conversion would give it, but no system call permission is all three.
+const READ_WRITE_EXECUTE: u8 =
+    MemoryPermission::USER_READ_WRITE.bits() | MemoryPermission::USER_EXECUTE.bits();
+
 /// The user's write bit alone: a permission with no translation.
 const WRITE_ONLY: u8 = MemoryPermission::USER_WRITE.bits() & MemoryPermission::USER_MASK.bits();
 
@@ -1060,6 +1099,16 @@ fn each_check_of_one_block_has_its_own_fault() {
             "an unknown state",
             Box::new(|b| b.state = 0xdead_beef),
             BlockFault::State { word: 0xdead_beef },
+        ),
+        (
+            "every unknown attribute bit",
+            Box::new(|b| b.attribute |= !KNOWN_ATTRIBUTE_BITS),
+            BlockFault::Bits,
+        ),
+        (
+            "every unknown permission bit",
+            Box::new(|b| b.permission |= !KNOWN_PERMISSION_BITS),
+            BlockFault::Bits,
         ),
         (
             "an IPC lock count",
@@ -1138,6 +1187,19 @@ fn each_check_of_one_block_has_its_own_fault() {
             "write without read",
             Box::new(|b| b.permission = WRITE_ONLY),
             BlockFault::Translation,
+        ),
+        (
+            "read, write and execute, which no system call permission converts to",
+            Box::new(|b| b.permission = READ_WRITE_EXECUTE),
+            BlockFault::Permission,
+        ),
+        (
+            "read and write without the kernel's write",
+            Box::new(|b| {
+                b.permission =
+                    (MemoryPermission::USER_READ_WRITE & !MemoryPermission::KERNEL_WRITE).bits();
+            }),
+            BlockFault::Permission,
         ),
         (
             "thread-local memory as a stack",
@@ -1301,6 +1363,22 @@ fn of_two_faults_in_one_block_the_earlier_check_is_reported() {
             BlockFault::State { word: 0xdead_beef },
         ),
         (
+            "an unknown state and an unknown attribute bit",
+            Box::new(|b| {
+                b.state = 0xdead_beef;
+                b.attribute |= !KNOWN_ATTRIBUTE_BITS;
+            }),
+            BlockFault::State { word: 0xdead_beef },
+        ),
+        (
+            "an unknown permission bit and an IPC lock",
+            Box::new(|b| {
+                b.permission |= !KNOWN_PERMISSION_BITS;
+                b.ipc_lock_count = 1;
+            }),
+            BlockFault::Bits,
+        ),
+        (
             "an IPC lock and a use count without device shared",
             Box::new(|b| {
                 b.ipc_lock_count = 1;
@@ -1324,6 +1402,14 @@ fn of_two_faults_in_one_block_the_earlier_check_is_reported() {
             }),
             BlockFault::Translation,
         ),
+        (
+            "a permission the state never has and the wrong region",
+            Box::new(|b| {
+                b.permission = READ_WRITE_EXECUTE;
+                b.state = MemoryState::Stack.word();
+            }),
+            BlockFault::Permission,
+        ),
     ];
     for (name, change, fault) in pairs {
         let mut case = Case::new(&rich);
@@ -1341,6 +1427,16 @@ fn of_two_faults_in_one_block_the_earlier_check_is_reported() {
 fn of_two_faults_on_the_first_last_or_two_blocks_the_earlier_check_is_reported() {
     let rich = rich();
     let tls = thread_local(&rich);
+    // Unknown bits before free, on the first block (free).
+    let mut case = Case::new(&rich);
+    case.body.blocks[0].attribute = !KNOWN_ATTRIBUTE_BITS;
+    assert_eq!(
+        case.error(),
+        SnapshotError::Block {
+            index: 0,
+            fault: BlockFault::Bits
+        }
+    );
     // Free before IPC, on the first block (free).
     let mut case = Case::new(&rich);
     case.body.blocks[0].permission = MemoryPermission::KERNEL_READ.bits();
@@ -1968,4 +2064,340 @@ fn each_device_count_is_checked_against_the_locks_on_its_own() {
             "{name}"
         );
     }
+}
+
+// ----- Review fixes: bits, permissions, lock states and the edges mutations found ---------------
+
+#[test]
+fn unknown_permission_and_attribute_bits_are_refused_each_alone() {
+    // The heap's first block, with each bit starquake does not name, one at a time.
+    let rich = rich();
+    let unknown: Vec<(&str, u8, u8)> = (0..u8::BITS)
+        .map(|bit| 1_u8 << bit)
+        .flat_map(|bit| {
+            let permission = (bit & !KNOWN_PERMISSION_BITS != 0).then_some(("permission", bit, 0));
+            let attribute = (bit & !KNOWN_ATTRIBUTE_BITS != 0).then_some(("attribute", 0, bit));
+            permission.into_iter().chain(attribute)
+        })
+        .collect();
+    // Bits 5 (Eden's `KernelExecute`) and 7 of the permission; bits 6 and 7 of the attributes.
+    assert_eq!(unknown.len(), 4);
+    for (what, permission, attribute) in unknown {
+        let mut case = Case::new(&rich);
+        let index = at(&case.body, rich.heap);
+        case.body.blocks[index].permission |= permission;
+        case.body.blocks[index].attribute |= attribute;
+        assert_eq!(
+            case.error(),
+            SnapshotError::Block {
+                index,
+                fault: BlockFault::Bits
+            },
+            "{what} bit {:#x}",
+            permission | attribute
+        );
+    }
+}
+
+#[test]
+fn a_block_has_only_a_permission_the_kernel_gives_its_state() {
+    let rich = rich();
+    let tls = thread_local(&rich);
+    let read_write = MemoryPermission::from_svc(SvcPermission::ReadWrite).bits();
+    let cases: [(&str, u64, u8); 4] = [
+        (
+            "heap memory read, write and execute",
+            rich.heap,
+            READ_WRITE_EXECUTE,
+        ),
+        ("code read, write and execute", CODE, READ_WRITE_EXECUTE),
+        // `SetProcessMemoryPermission` would have made it `CodeData`.
+        ("code read and write", CODE, read_write),
+        (
+            "thread-local memory read, write and execute",
+            tls,
+            READ_WRITE_EXECUTE,
+        ),
+    ];
+    for (name, address, permission) in cases {
+        let mut case = Case::new(&rich);
+        let index = at(&case.body, address);
+        case.body.blocks[index].permission = permission;
+        assert_eq!(
+            case.error(),
+            SnapshotError::Block {
+                index,
+                fault: BlockFault::Permission
+            },
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn every_converted_permission_is_accepted_where_the_state_is_not_code() {
+    // The heap's first block (`Normal`) with each of the four conversions, read and execute
+    // included: module docs, "Not checked here" (only the system call refuses execute on heap
+    // memory). Each restores, and keeps its permission.
+    let rich = rich();
+    for svc in SvcPermission::ALL {
+        let permission = MemoryPermission::from_svc(svc);
+        let mut case = Case::new(&rich);
+        let index = at(&case.body, rich.heap);
+        case.body.blocks[index].permission = permission.bits();
+        let restored = case.restore().0.unwrap();
+        assert_eq!(
+            restored.query_info(rich.heap).unwrap().permission(),
+            permission,
+            "{svc:?}"
+        );
+    }
+    // Code takes every conversion that is not writable. (Read-only text would merge with the
+    // read-only data above it, so only the permission check's own verdict is compared.)
+    for svc in SvcPermission::ALL {
+        let permission = MemoryPermission::from_svc(svc);
+        let mut case = Case::new(&rich);
+        let index = at(&case.body, CODE);
+        case.body.blocks[index].permission = permission.bits();
+        let writable = permission.contains(MemoryPermission::USER_WRITE);
+        let refused = case.restore().0.err()
+            == Some(SnapshotError::Block {
+                index,
+                fault: BlockFault::Permission,
+            });
+        assert_eq!(refused, writable, "{svc:?}");
+    }
+}
+
+#[test]
+fn a_lock_over_a_block_whose_state_cannot_be_device_mapped_is_refused() {
+    // The thread-local page device shared as one lock over it leaves it, and that lock: live,
+    // `lock_device_share` refuses the page, and `unlock_device_share` could never release it.
+    let rich = rich();
+    let tls = thread_local(&rich);
+    let mut case = Case::new(&rich);
+    device_share_alone(&mut case.body, tls);
+    let index = insert_lock(&mut case.body, tls, PAGE_SIZE);
+    assert_eq!(
+        case.error(),
+        SnapshotError::Lock {
+            index,
+            fault: LockFault::State
+        }
+    );
+    // What the restore refuses: the live space refuses to lock the page at all.
+    let mut space = rich.space;
+    assert_eq!(
+        space.lock_device_share(tls, PAGE_SIZE),
+        Err(SvcError::Kernel(KernelError::InvalidCurrentMemory))
+    );
+}
+
+#[test]
+fn a_lock_over_a_block_neither_shared_nor_lockable_is_reported_as_not_shared() {
+    // The thread-local page as it is (not device shared, a state with no device mapping), and a
+    // lock over it: both faults, and the earlier check's is reported.
+    let rich = rich();
+    let tls = thread_local(&rich);
+    let mut case = Case::new(&rich);
+    let index = insert_lock(&mut case.body, tls, PAGE_SIZE);
+    assert_eq!(
+        case.error(),
+        SnapshotError::Lock {
+            index,
+            fault: LockFault::NotShared
+        }
+    );
+}
+
+#[test]
+fn the_lock_state_check_takes_every_block_of_the_range() {
+    // The generated code's two pages split into a page of transfer memory (whose state can be
+    // device mapped) and a page of generated code (whose state cannot), in either order, both
+    // device shared as one lock over the two leaves them, and that lock: the block that cannot
+    // be device mapped is refused whether it is the range's first or its last.
+    let rich = rich();
+    let lockable = MemoryState::Transferred;
+    let not_lockable = MemoryState::GeneratedCode;
+    let flags = DEVICE_SHARE_LOCK_STATE | DEVICE_SHARE_UNLOCK_STATE;
+    assert_eq!(lockable.word() & flags, flags);
+    assert_ne!(not_lockable.word() & flags, flags);
+    for (states, expected) in [
+        ([lockable, lockable], None),
+        ([lockable, not_lockable], Some(LockFault::State)),
+        ([not_lockable, lockable], Some(LockFault::State)),
+    ] {
+        let mut case = Case::new(&rich);
+        let index = at(&case.body, GENERATED);
+        let mut upper = case.body.blocks[index];
+        assert_eq!(upper.pages, 2);
+        upper.address += PAGE_SIZE;
+        upper.pages = 1;
+        case.body.blocks[index].pages = 1;
+        case.body.blocks.insert(index + 1, upper);
+        let barriers = [DisableMerge::DEVICE_LEFT, DisableMerge::DEVICE_RIGHT];
+        for (at, (state, barrier)) in [index, index + 1]
+            .into_iter()
+            .zip(states.into_iter().zip(barriers))
+        {
+            let block = &mut case.body.blocks[at];
+            block.state = state.word();
+            block.attribute |= MemoryAttribute::DEVICE_SHARED.bits();
+            block.device_use_count = 1;
+            block.disable_merge |= barrier.bits();
+            if at == index {
+                block.device_disable_merge_left_count = 1;
+            } else {
+                block.device_disable_merge_right_count = 1;
+            }
+        }
+        let lock = insert_lock(&mut case.body, GENERATED, 2 * PAGE_SIZE);
+        let expected = expected.map(|fault| SnapshotError::Lock { index: lock, fault });
+        assert_eq!(case.restore().0.err(), expected, "{states:?}");
+    }
+}
+
+#[test]
+fn a_shared_mapping_must_have_its_shared_memorys_permission() {
+    // The read-only shared memory's block saved read-write: live, `MapSharedMemory` refuses
+    // any permission but the user permission.
+    let rich = rich();
+    let mut case = Case::new(&rich);
+    let index = at(&case.body, case.body.shared[1].address);
+    assert_eq!(
+        case.body.blocks[index].permission,
+        MemoryPermission::from_svc(SvcPermission::Read).bits()
+    );
+    case.body.blocks[index].permission = MemoryPermission::USER_READ_WRITE.bits();
+    assert_eq!(
+        case.error(),
+        SnapshotError::Shared {
+            index: 1,
+            fault: SharedFault::Permission
+        }
+    );
+}
+
+#[test]
+fn a_shared_memory_smaller_than_its_mapping_is_the_wrong_size() {
+    // The first mapping (two pages) resolved to the one-page object, which is also read-only
+    // where the mapping is read-write: the size is checked first.
+    let rich = rich();
+    let mut case = Case::new(&rich);
+    let small = case.objects[&rich.shared[1]];
+    assert!(small.size() < case.body.shared[0].size);
+    case.objects.insert(rich.shared[0], small);
+    assert_eq!(
+        case.error(),
+        SnapshotError::Shared {
+            index: 0,
+            fault: SharedFault::Size
+        }
+    );
+}
+
+#[test]
+fn a_shared_mapping_saved_twice_is_out_of_order() {
+    let rich = rich();
+    let mut case = Case::new(&rich);
+    let first = case.body.shared[0];
+    case.body.shared.insert(1, first);
+    assert_eq!(
+        case.error(),
+        SnapshotError::Shared {
+            index: 1,
+            fault: SharedFault::Order
+        }
+    );
+}
+
+#[test]
+fn normal_memory_partly_outside_the_alias_region_is_out_of_its_region() {
+    // The first alias block's start moved one page down into the free block below it: every
+    // page but its first is in the alias region.
+    let rich = rich();
+    let mut case = Case::new(&rich);
+    let index = at(&case.body, rich.alias);
+    let below = index - 1;
+    assert_eq!(case.body.blocks[below].state, MemoryState::Free.word());
+    assert!(case.body.blocks[below].pages > 1);
+    case.body.blocks[below].pages -= 1;
+    case.body.blocks[index].address -= PAGE_SIZE;
+    case.body.blocks[index].pages += 1;
+    assert_eq!(
+        case.error(),
+        SnapshotError::Block {
+            index,
+            fault: BlockFault::Region
+        }
+    );
+}
+
+#[test]
+fn a_lock_whose_size_is_not_whole_pages_is_out_of_range() {
+    // A page-aligned address, a size one byte over a page.
+    let rich = rich();
+    let mut case = Case::new(&rich);
+    let index = insert_lock(&mut case.body, RODATA, PAGE_SIZE + 1);
+    assert_eq!(
+        case.error(),
+        SnapshotError::Lock {
+            index,
+            fault: LockFault::Range
+        }
+    );
+}
+
+#[test]
+fn the_codes_last_block_must_be_code_too() {
+    // The block that ends where the code ends, made alias code data: in the code region, but
+    // not the code.
+    let rich = rich();
+    let mut case = Case::new(&rich);
+    let code_end = case.body.request.code_address + case.body.request.code_size;
+    let last = case
+        .body
+        .blocks
+        .iter()
+        .position(|block| block.address + block.pages * PAGE_SIZE == code_end)
+        .unwrap();
+    assert_ne!(case.body.blocks[last].address, CODE);
+    case.body.blocks[last].state = MemoryState::AliasCodeData.word();
+    assert_eq!(case.error(), SnapshotError::CodeRange);
+}
+
+#[test]
+fn the_new_errors_read_as_plain_words() {
+    assert_eq!(
+        SnapshotError::Block {
+            index: 2,
+            fault: BlockFault::Bits
+        }
+        .to_string(),
+        "block 2 of the address space snapshot has a permission or attribute bit no memory block has"
+    );
+    assert_eq!(
+        SnapshotError::Block {
+            index: 2,
+            fault: BlockFault::Permission
+        }
+        .to_string(),
+        "block 2 of the address space snapshot has a permission the kernel never gives its state"
+    );
+    assert_eq!(
+        SnapshotError::Shared {
+            index: 1,
+            fault: SharedFault::Permission
+        }
+        .to_string(),
+        "shared memory mapping 1 of the address space snapshot is mapped with a permission other than its shared memory's"
+    );
+    assert_eq!(
+        SnapshotError::Lock {
+            index: 0,
+            fault: LockFault::State
+        }
+        .to_string(),
+        "device-share lock 0 of the address space snapshot covers a block whose memory state cannot be shared with a device"
+    );
 }

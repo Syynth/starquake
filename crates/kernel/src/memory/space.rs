@@ -174,6 +174,16 @@ use super::state::{
 use crate::id::{ObjectId, ProcessId};
 use crate::result::{CallResult, KernelError, SvcError, SvcResult};
 
+/// The state flags every block of a device-share lock's range has: what
+/// [`AddressSpace::lock_device_share`] tests (`CanAlignedDeviceMap | ReferenceCounted`), and
+/// what [`AddressSpace::unlock_device_share`] tests (`CanDeviceMap`). A restore refuses a lock
+/// over a block without them (`snapshot`, check 7).
+pub(super) const DEVICE_SHARE_LOCK_STATE: u32 =
+    flag::CAN_ALIGNED_DEVICE_MAP | flag::REFERENCE_COUNTED;
+
+/// The state flag [`AddressSpace::unlock_device_share`] tests (`CanDeviceMap`).
+pub(super) const DEVICE_SHARE_UNLOCK_STATE: u32 = flag::CAN_DEVICE_MAP;
+
 /// Free pages kept on each side of a mapping the kernel places for a process
 /// (`KPageTableBase::GetNumGuardPages`, for a page table that is not the kernel's).
 pub const GUARD_PAGES: u64 = 4;
@@ -1599,7 +1609,7 @@ impl AddressSpace {
     pub(crate) fn lock_device_share(&mut self, address: u64, size: u64) -> CallResult<()> {
         let pages = self.pages_of(address, size)?;
         // Check the memory state.
-        let test_state = flag::CAN_ALIGNED_DEVICE_MAP | flag::REFERENCE_COUNTED;
+        let test_state = DEVICE_SHARE_LOCK_STATE;
         let check = Check {
             state_mask: test_state,
             state: test_state,
@@ -1654,8 +1664,8 @@ impl AddressSpace {
         let pages = self.pages_of(address, size)?;
         // Check the memory state.
         let check = Check {
-            state_mask: flag::CAN_DEVICE_MAP,
-            state: flag::CAN_DEVICE_MAP,
+            state_mask: DEVICE_SHARE_UNLOCK_STATE,
+            state: DEVICE_SHARE_UNLOCK_STATE,
             permission_mask: MemoryPermission::NONE,
             permission: MemoryPermission::NONE,
             attribute_mask: MemoryAttribute::DEVICE_SHARED | MemoryAttribute::LOCKED,

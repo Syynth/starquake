@@ -53,11 +53,14 @@
 //! 4. Each block in turn ([`SnapshotError::Block`], first failing check of the first failing
 //!    block): its shape, that it starts where the one before ended (the first at the address
 //!    space's start: [`BlockFault::Overlap`] below that, [`BlockFault::Gap`] above), that it
-//!    ends inside the address space, its state word, that it could not be merged with the one
-//!    before, that a free block has nothing, that it has no IPC lock state, that its device
-//!    counts agree with its attribute and barriers, that its permission has a translation, and
-//!    that it lies in the region of its state. Then that the blocks reach the address space's
-//!    end ([`SnapshotError::Short`]).
+//!    ends inside the address space, its state word, that its permission and attributes have
+//!    no bit starquake does not name ([`BlockFault::Bits`]), that it could not be merged with
+//!    the one before, that a free block has nothing, that it has no IPC lock state, that its
+//!    device counts agree with its attribute and barriers, that its permission has a
+//!    translation, that a block that is not free has a permission the kernel gives its state
+//!    ([`BlockFault::Permission`]: one of the four converted system call permissions, and not
+//!    writable if its state is code), and that it lies in the region of its state. Then that
+//!    the blocks reach the address space's end ([`SnapshotError::Short`]).
 //! 5. The code's pages are `Code` or `CodeData` ([`SnapshotError::CodeRange`]); the heap's
 //!    pages are `Normal` and the heap region holds no other `Normal` memory
 //!    ([`SnapshotError::HeapRange`]); the mapped physical memory size is the bytes of `Normal`
@@ -67,16 +70,24 @@
 //!    ([`SnapshotError::Unmapped`]).
 //! 7. Each device-share lock in turn ([`SnapshotError::Lock`]): a count that is not zero, after
 //!    the one before by address then size, whole pages inside the address space, starting and
-//!    ending where blocks start and end, and only over device-shared blocks. Then that each
+//!    ending where blocks start and end, only over device-shared blocks
+//!    ([`LockFault::NotShared`]), and only over blocks whose state a lock can be taken on and
+//!    released from ([`LockFault::State`]: `CanAlignedDeviceMap`, `ReferenceCounted` and
+//!    `CanDeviceMap`). Then that each
 //!    block's device use count and its left and right merge counts are what the locks over,
 //!    starting at and ending at it add up to ([`SnapshotError::DeviceCounts`]).
-//! 8. Each shared memory mapping's object, from the caller: it exists and is the mapping's size
-//!    ([`SharedFault::Missing`], [`SharedFault::Size`]).
+//! 8. Each shared memory mapping's object, from the caller: it exists, is the mapping's size,
+//!    and its user permission is the permission of the mapping's block ([`SharedFault::Missing`],
+//!    [`SharedFault::Size`], [`SharedFault::Permission`]).
 //! 9. The translation: every block that is not free is mapped through the new [`Mapper`], in
 //!    address order, a `Shared` one with its shared memory's pages ([`Mapper::map_shared`]),
 //!    any other as fresh memory ([`Mapper::map`]), with the guest permission of its
 //!    permission. A refusal unmaps what was mapped, in address order, and is
-//!    [`SnapshotError::Translation`], which counts the bytes whose unmap was refused too.
+//!    [`SnapshotError::Translation`], which counts the bytes whose unmap was refused too. The
+//!    pool's count and the block map are built before it (their own errors,
+//!    [`SnapshotError::OverLimit`] and [`SnapshotError::BlockMap`], would be bugs in checks 3
+//!    and 4), so this is the last step that can fail: whatever a restore returns as an error,
+//!    nothing it mapped is left mapped, except the bytes `stuck` counts.
 //!
 //! [`AddressSpace::save`] runs checks 2 to 7 on what it is about to write: a live address space
 //! that fails one is a bug in the kernel, which it reports rather than writes.
@@ -100,6 +111,21 @@
 //! - **Shared memory.** Each mapping is one block: `MapPageGroup` sets the `Normal` barrier at
 //!   its start, and no operation here can change part of a `Shared` block (its state has none of
 //!   the flags the reprotecting, attribute, transfer and device calls test for).
+//! - **The permissions.** Every call that maps or reprotects memory gives it
+//!   `ConvertToKMemoryPermission` of one of the four system call permissions
+//!   ([`MemoryPermission::from_svc`]), or a constant equal to one (`KernelRead | NotMapped` for
+//!   the code as it is created, `UserReadWrite` for heap, physical memory, stacks and
+//!   thread-local pages); [`AddressSpace::map_pages`] takes any permission, and a caller that
+//!   passed another would make a space that fails this check. `SetProcessMemoryPermission` makes
+//!   writable code code data, and code cannot be reprotected otherwise (its state has no
+//!   `CanReprotect`). A `Shared` block keeps the permission it was mapped with, which
+//!   `MapSharedMemory` requires to be the shared memory's user permission
+//!   (`svc::shared_memory`), since no `Shared` state can be reprotected.
+//! - **The device-share locks' states.** [`AddressSpace::lock_device_share`] takes a lock only
+//!   on blocks with `CanAlignedDeviceMap | ReferenceCounted`, every state with those has
+//!   `CanDeviceMap` too (what [`AddressSpace::unlock_device_share`] tests), and the only state
+//!   change a device-shared block can go through here, `SetProcessMemoryPermission`'s `Code` to
+//!   `CodeData` (or `AliasCode` to `AliasCodeData`), keeps all three.
 //! - **The device counts.** A lock raises the use count of every block of its range and the
 //!   left and right merge counts of the blocks it starts and ends at (`ShareToDevice`); an
 //!   unlock of the same exact range lowers the same counts (`UnshareToDevice`), a split gives the
@@ -127,8 +153,19 @@
 //! - **Not checked here:** which transfer memory holds a `Locked` range (the transfer memory
 //!   objects are the object table's), that a shared mapping's object is the one the guest mapped
 //!   beyond its size (the caller resolves it), where the main thread's stack is (only its size
-//!   is saved, and other memory may have the `Stack` state), and where the `Normal` and
-//!   `Locked` merge barriers sit.
+//!   is saved, and other memory may have the `Stack` state), where the `Normal` and
+//!   `Locked` merge barriers sit, and which merge barrier bits a block has beyond the IPC and
+//!   device ones it checks (an unknown barrier bit restores as it is).
+//! - **Not checked here: which permission and attributes each state may carry**, beyond the two
+//!   permission rules of check 4 and the attribute rules above (no unknown bit, no IPC lock,
+//!   `DeviceShared` exactly with a use count). So a restore accepts, for example, `Normal` or
+//!   `CodeData` memory that is read and execute (the kernel's
+//!   [`AddressSpace::set_memory_permission`] allows it; only the system call refuses it:
+//!   `IsValidSetMemoryPermission` in `eden/src/core/hle/kernel/svc/svc_memory.cpp`), memory
+//!   whose state has no `CanChangeAttribute` that is `Uncached` or `GpuAccessible`, memory whose
+//!   state has no `CanPermissionLock` that is `PermissionLocked`, and `Locked` memory outside a
+//!   transfer memory lend. A live address space has none of these; a snapshot that has one
+//!   restores it as it is.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -136,8 +173,8 @@ use serde::{Deserialize, Serialize};
 use starquake_memory::PAGE_SIZE;
 
 use super::{
-    AddressSpace, MemoryLimit, ProcessMemory, SharedMapping, can_contain, layout,
-    max_process_memory,
+    AddressSpace, DEVICE_SHARE_LOCK_STATE, DEVICE_SHARE_UNLOCK_STATE, MemoryLimit, ProcessMemory,
+    SharedMapping, can_contain, layout, max_process_memory,
 };
 use crate::id::ObjectId;
 use crate::memory::block::{BlockCounts, MemoryBlock};
@@ -146,7 +183,9 @@ use crate::memory::layout::{LayoutError, Region, RegionOffsets, Regions};
 use crate::memory::mapper::{Mapper, MapperError};
 use crate::memory::pool::MemoryArrangement;
 use crate::memory::shared::SharedMemory;
-use crate::memory::state::{DisableMerge, MemoryAttribute, MemoryPermission, MemoryState};
+use crate::memory::state::{
+    DisableMerge, MemoryAttribute, MemoryPermission, MemoryState, SvcPermission, flag,
+};
 use crate::snapshot::{Format, FormatError, decode, encode};
 
 #[cfg(test)]
@@ -172,6 +211,24 @@ pub const ARRANGEMENT_TAGS: [(MemoryArrangement, u8); 2] = [
     (MemoryArrangement::TwelveGb, 2),
 ];
 
+/// Every permission bit starquake names ([`MemoryPermission`]): the user's read, write and
+/// execute, the kernel's read and write, and `NotMapped`. Eden's `KernelExecute` (bit 5) is not
+/// among them: nothing in starquake or in `ConvertToKMemoryPermission` sets it, so a block that
+/// has it is refused with the other unknown bits ([`BlockFault::Bits`]).
+const KNOWN_PERMISSION_BITS: u8 = MemoryPermission::USER_MASK.bits()
+    | MemoryPermission::KERNEL_READ.bits()
+    | MemoryPermission::KERNEL_WRITE.bits()
+    | MemoryPermission::NOT_MAPPED.bits();
+
+/// Every attribute bit starquake names ([`MemoryAttribute`]): Eden's five (`KMemoryAttribute`)
+/// and the Switch 2's `GpuAccessible`.
+const KNOWN_ATTRIBUTE_BITS: u8 = MemoryAttribute::LOCKED.bits()
+    | MemoryAttribute::IPC_LOCKED.bits()
+    | MemoryAttribute::DEVICE_SHARED.bits()
+    | MemoryAttribute::UNCACHED.bits()
+    | MemoryAttribute::PERMISSION_LOCKED.bits()
+    | MemoryAttribute::GPU_ACCESSIBLE.bits();
+
 /// What went wrong with one block ([`SnapshotError::Block`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum BlockFault {
@@ -193,6 +250,10 @@ pub enum BlockFault {
         /// The word.
         word: u32,
     },
+    /// Its permission or attributes have a bit starquake does not name
+    /// ([`KNOWN_PERMISSION_BITS`], [`KNOWN_ATTRIBUTE_BITS`]).
+    #[error("has a permission or attribute bit no memory block has")]
+    Bits,
     /// It could be merged with the one before, which the block map never leaves.
     #[error("could be merged with the one before it")]
     Mergeable,
@@ -208,6 +269,11 @@ pub enum BlockFault {
     /// Its permission has no translation (write without read).
     #[error("has a permission with no translation")]
     Translation,
+    /// It is not free and its permission is not one the kernel gives its state: not what
+    /// `ConvertToKMemoryPermission` makes of one of the four [`SvcPermission`]s, or writable
+    /// code (a state with [`flag::CODE`]).
+    #[error("has a permission the kernel never gives its state")]
+    Permission,
     /// It is not in the region its state belongs in.
     #[error("is outside the region of its state")]
     Region,
@@ -228,6 +294,9 @@ pub enum SharedFault {
     /// Its object's shared memory is not its size.
     #[error("names a shared memory of another size")]
     Size,
+    /// Its block's permission is not its object's user permission.
+    #[error("is mapped with a permission other than its shared memory's")]
+    Permission,
 }
 
 /// What went wrong with one device-share lock ([`SnapshotError::Lock`]).
@@ -248,6 +317,10 @@ pub enum LockFault {
     /// A block of its range is not device shared.
     #[error("covers a block that is not device shared")]
     NotShared,
+    /// A block of its range has a state that cannot be device-share locked and unlocked
+    /// ([`DEVICE_SHARE_LOCK_STATE`], [`DEVICE_SHARE_UNLOCK_STATE`]).
+    #[error("covers a block whose memory state cannot be shared with a device")]
+    State,
 }
 
 /// Why an address space could not be saved or restored.
@@ -727,10 +800,18 @@ impl Body {
         // checked in two lookups, whatever its length.
         let mut unshared = Vec::with_capacity(len.saturating_add(1));
         unshared.push(0_usize);
+        // Likewise, how many blocks below each index have a state a lock cannot be taken on or
+        // released from.
+        let mut unlockable = Vec::with_capacity(len.saturating_add(1));
+        unlockable.push(0_usize);
+        let lockable_state = DEVICE_SHARE_LOCK_STATE | DEVICE_SHARE_UNLOCK_STATE;
         for block in blocks {
             let below = unshared.last().copied().unwrap_or(0);
             let shared = block.attribute().contains(MemoryAttribute::DEVICE_SHARED);
             unshared.push(below + usize::from(!shared));
+            let below = unlockable.last().copied().unwrap_or(0);
+            let lockable = block.state().word() & lockable_state == lockable_state;
+            unlockable.push(below + usize::from(!lockable));
         }
         // What the locks add up to at each block: those starting there, ending there, and (as a
         // running sum of starts minus ends) over it.
@@ -765,6 +846,11 @@ impl Body {
                 > unshared.get(first).copied().unwrap_or(0);
             if not_shared {
                 return Err(fault(LockFault::NotShared));
+            }
+            let not_lockable = unlockable.get(after).copied().unwrap_or(0)
+                > unlockable.get(first).copied().unwrap_or(0);
+            if not_lockable {
+                return Err(fault(LockFault::State));
             }
             let count = u64::from(lock.count);
             if let Some(at) = starting.get_mut(first) {
@@ -841,6 +927,11 @@ fn check_block(
         .copied()
         .find(|state| state.word() == saved.state)
         .ok_or(BlockFault::State { word: saved.state })?;
+    let unknown_bits = saved.permission & !KNOWN_PERMISSION_BITS != 0
+        || saved.attribute & !KNOWN_ATTRIBUTE_BITS != 0;
+    if unknown_bits {
+        return Err(BlockFault::Bits);
+    }
     let permission = MemoryPermission::from_bits(saved.permission);
     let original_permission = MemoryPermission::from_bits(saved.original_permission);
     let attribute = MemoryAttribute::from_bits(saved.attribute);
@@ -893,7 +984,25 @@ fn check_block(
     if permission.guest().is_none() {
         return Err(BlockFault::Translation);
     }
+    if state != MemoryState::Free && !is_live_permission(state, permission) {
+        return Err(BlockFault::Permission);
+    }
     Ok(block)
+}
+
+/// Whether the kernel gives memory in `state`, which is not free, `permission`: every mapping
+/// call converts one of the four [`SvcPermission`]s (`ConvertToKMemoryPermission`, in
+/// `eden/src/core/hle/kernel/k_memory_block.h`), and code memory never stays writable
+/// (`SetProcessMemoryPermission` makes writable `Code` `CodeData` and writable `AliasCode`
+/// `AliasCodeData`: `is_w` in `KPageTableBase::SetProcessMemoryPermission`,
+/// `eden/src/core/hle/kernel/k_page_table_base.cpp`; and no state with [`flag::CODE`] can be
+/// reprotected). See "Not checked here" in the module docs for what this leaves out.
+fn is_live_permission(state: MemoryState, permission: MemoryPermission) -> bool {
+    let converted = SvcPermission::ALL
+        .into_iter()
+        .any(|svc| MemoryPermission::from_svc(svc) == permission);
+    let code = state.word() & flag::CODE != 0;
+    converted && !(code && permission.contains(MemoryPermission::USER_WRITE))
 }
 
 /// Whether a block that is not free lies in the region of its state: [`can_contain`]'s rule,
@@ -984,11 +1093,17 @@ impl AddressSpace {
             if found.size() != mapping.size {
                 return Err(fault(SharedFault::Size));
             }
+            // Check 6 found the mapping's one `Shared` block. `KSharedMemory::Map` maps it with
+            // exactly the user permission, and nothing reprotects a `Shared` block.
+            let block = block_starting_at(&blocks, mapping.address).and_then(|at| blocks.get(at));
+            let permission = MemoryPermission::from_svc(found.user_permission());
+            if block.is_none_or(|block| block.permission() != permission) {
+                return Err(fault(SharedFault::Permission));
+            }
             objects.insert(mapping.address, found);
         }
-        // Check 9: the translation.
-        let mut mapper = mapper;
-        rebuild(mapper.as_mut(), &blocks, &objects)?;
+        // What the address space keeps, built before the translation so that the translation
+        // is the last step that can fail, and a refusal of any step leaves nothing mapped.
         let mut limit = MemoryLimit::new(memory.arrangement.application_pool_size());
         // Check 3 held the reservation within the pool.
         limit
@@ -1003,6 +1118,9 @@ impl AddressSpace {
             blocks,
         )
         .map_err(SnapshotError::BlockMap)?;
+        // Check 9: the translation.
+        let mut mapper = mapper;
+        rebuild(mapper.as_mut(), blocks.blocks(), &objects)?;
         Ok(Self {
             created_from: memory,
             regions,
@@ -1038,9 +1156,9 @@ impl AddressSpace {
 /// Check 9: maps every block that is not free through `mapper`, in address order, a `Shared`
 /// one with the pages of the shared memory `objects` holds for its address. A refusal unmaps
 /// what was mapped, in address order.
-fn rebuild(
+fn rebuild<'a>(
     mapper: &mut dyn Mapper,
-    blocks: &[MemoryBlock],
+    blocks: impl IntoIterator<Item = &'a MemoryBlock>,
     objects: &BTreeMap<u64, SharedMemory>,
 ) -> Result<(), SnapshotError> {
     let mut made: Vec<(u64, u64)> = Vec::new();
