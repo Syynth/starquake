@@ -600,6 +600,15 @@ fn resolving(handles: Vec<Handle>, seen: Arc<Mutex<Vec<SvcResult<ObjectId>>>>) -
     })
 }
 
+/// The process `object` is the object of, or `None` for any other kind of object.
+fn process_named(scheduler: &Scheduler, object: ObjectId) -> Option<crate::id::ProcessId> {
+    if let Ok(Object::Process(process)) = scheduler.objects().get(object) {
+        Some(process)
+    } else {
+        None
+    }
+}
+
 /// A world whose process runs a user thread of its own on `thread`'s core, as the core loop
 /// runs its main thread, and that thread's object.
 fn world_running_a_user_thread(thread: ThreadId) -> (World, ObjectId) {
@@ -648,11 +657,9 @@ fn a_copied_current_process_reaches_the_server_as_the_senders_process_and_is_let
     );
     assert_eq!(record.outcome, Outcome::Completed);
     assert_eq!(result(&regs), ResultCode::SUCCESS);
-    let object = lock(&seen)[0].clone().unwrap();
+    let object = lock(&seen)[0].unwrap();
     world.with_tables(|handles, scheduler| {
-        let Ok(Object::Process(process)) = scheduler.objects().get(object) else {
-            panic!("{object:?} is not a process");
-        };
+        let process = process_named(scheduler, object).unwrap();
         assert_eq!(scheduler.process(process).unwrap().object(), object);
         // The request's reference went when it ended; the process's own stays.
         assert_eq!(scheduler.objects().refs(object), 1);
@@ -670,7 +677,7 @@ fn a_copied_current_thread_reaches_the_server_as_the_calling_thread() {
         vec![Handle::CURRENT_THREAD, Handle::CURRENT_PROCESS],
         Arc::clone(&seen),
     ));
-    let refs = world.with_tables(|_, scheduler| scheduler.objects().refs(thread));
+    let thread_refs = world.with_tables(|_, scheduler| scheduler.objects().refs(thread));
     let (record, regs) = world.send(
         A,
         handle,
@@ -683,11 +690,9 @@ fn a_copied_current_thread_reaches_the_server_as_the_calling_thread() {
     let seen = lock(&seen).clone();
     assert_eq!(seen[0], Ok(thread));
     world.with_tables(|_, scheduler| {
-        let Ok(Object::Process(process)) = scheduler.objects().get(seen[1].clone().unwrap()) else {
-            panic!("{:?} is not a process", seen[1]);
-        };
+        let process = process_named(scheduler, seen[1].unwrap()).unwrap();
         assert_eq!(seen[1], Ok(scheduler.process(process).unwrap().object()));
-        assert_eq!(scheduler.objects().refs(thread), refs);
+        assert_eq!(scheduler.objects().refs(thread), thread_refs);
     });
 }
 
