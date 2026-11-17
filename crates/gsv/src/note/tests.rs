@@ -48,6 +48,7 @@ fn every_note_s_code_and_value_are_pinned() {
             8,
             0x0D0E_0F10,
         ),
+        (Note::SyncptPageAcknowledged { groups: 0b101 }, 9, 0b101),
     ];
     for (note, code, value) in cases {
         assert_eq!((note.code(), note.value()), (code, value), "{note:?}");
@@ -66,9 +67,10 @@ fn every_note_s_code_and_value_are_pinned() {
             SYNCPOINT_OBSERVED,
             SYNCPT_PAGE_ANSWERED,
             GPU_ORDERED_DONE,
-            QUEUE_ROOM
+            QUEUE_ROOM,
+            SYNCPT_PAGE_ACKNOWLEDGED
         ],
-        [1, 2, 3, 8]
+        [1, 2, 3, 8, 9]
     );
 }
 
@@ -137,12 +139,38 @@ fn a_queue_room_note_wider_than_a_channel_is_an_error() {
 #[test]
 fn a_code_gsv_does_not_write_is_an_error() {
     // Zero, each reserved code, and one past the last.
-    for code in [0, 4, 5, 6, 7, 9, u32::MAX] {
+    for code in [0, 4, 5, 6, 7, 10, u32::MAX] {
         let error = Note::decode(code, 1).unwrap_err();
         assert_eq!(error, NoteError::UnknownCode { code });
         assert_eq!(
             error.to_string(),
             format!("gsv writes no note with code {code}")
+        );
+    }
+}
+
+#[test]
+fn a_page_acknowledge_note_names_a_non_empty_set_of_the_page_s_groups() {
+    // Each group alone and all of them; the mask is exactly the page's groups.
+    let all = (1 << GROUP_COUNT) - 1;
+    assert_eq!(GROUP_MASK, all);
+    for groups in (0..GROUP_COUNT).map(|group| 1 << group).chain([all]) {
+        assert_eq!(
+            Note::decode(SYNCPT_PAGE_ACKNOWLEDGED, groups),
+            Ok(Note::SyncptPageAcknowledged { groups })
+        );
+    }
+    // No group, the first bit past the last group (alone and with a real one), and every bit.
+    let past = 1 << GROUP_COUNT;
+    for value in [0, past, past | 1, u64::MAX] {
+        let error = Note::decode(SYNCPT_PAGE_ACKNOWLEDGED, value).unwrap_err();
+        assert_eq!(error, NoteError::NoSuchGroups { value });
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "page acknowledge note value {value:#x} is not a non-empty set of the page's \
+                 {GROUP_COUNT} groups"
+            )
         );
     }
 }
@@ -159,6 +187,7 @@ fn note() -> impl Strategy<Value = Note> {
         any::<u32>().prop_map(|channel| Note::QueueRoom {
             channel: ChannelId(channel)
         }),
+        (1..=GROUP_MASK).prop_map(|groups| Note::SyncptPageAcknowledged { groups }),
     ]
 }
 

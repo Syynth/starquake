@@ -110,8 +110,12 @@
 //! ([`TimerHost::read_transfer_memory`], [`TimerHost::write_transfer_memory`]), which checks
 //! each access against the transfer memory as it is now. A refused read drops the hold; a
 //! refused write stops the answer where it is, leaving what was written, signals nothing, and
-//! drops the hold; the next signal tries again
-//! (`a_refused_access_drops_the_hold_and_the_next_signal_tries_again`). The kernel refuses once
+//! drops the hold. Nothing is retried until the next signal, which reads the request again
+//! (`a_refused_access_drops_the_hold_and_the_next_signal_tries_again`) and treats it as any
+//! other: a value the stopped answer wrote counts as shown, so unless a counter asked about has
+//! moved since, the request is held, and answered at the latest at the bound
+//! (`a_stopped_answer_s_values_count_as_shown_and_the_next_signal_holds_to_the_bound`). The
+//! kernel refuses once
 //! the title has closed a transfer memory (`a_closed_transfer_memory_is_refused_by_the_kernel`):
 //! PR keeps a reference to both (`Open(kernel)`), so it never meets this case. A host that does
 //! not offer the two calls (their default) refuses every read, so a page bound in a run whose
@@ -132,11 +136,13 @@
 //! bound already (`InvalidState`, PR `m_syncpoint_rw`); each handle names a transfer memory, and
 //! not the same one (`InvalidHandle`, PR); their sizes are exactly [`WRITABLE_SIZE`] and
 //! [`READ_ONLY_SIZE`] (`InvalidSize`, PR). The data words are read and, where they differ from
-//! PR's, logged, not refused (they say nothing the transfer memories do not). Then it clears both
-//! memories, writes the header and [`UNALLOCATED`] for every value (PR: zeros, `Header`,
-//! `Unallocated`), makes the two events (the request event with the completion queue as its hook),
-//! binds the page, and replies. An event made before a later failure is kept and handed out by
-//! the next 204, so a failing 204 leaks nothing.
+//! PR's, logged, not refused (they say nothing the transfer memories do not). Then it makes the
+//! two events (the request event with the completion queue as its hook), or takes those an
+//! earlier 204 made; only then clears both memories and writes the header and [`UNALLOCATED`] for
+//! every value (PR: its event first, then zeros, `Header`, `Unallocated`), so a refused event
+//! leaves the memories as they were (`a_refused_event_binds_nothing_and_the_next_bind_succeeds`);
+//! then binds the page and replies. An event made before a later failure is kept and handed out
+//! by the next 204, so a failing 204 leaks nothing.
 //!
 //! # Where this differs from the references
 //!
@@ -159,11 +165,16 @@
 //!
 //! # What is recorded
 //!
-//! Each value an answer writes is recorded as a `SyncptPageAnswered` note ([`crate::note`]): the
-//! syncpoint and the counter value read for it, in the order written, each after its write
+//! Each value an answer writes is recorded as a `SyncptPageAnswered` note ([`crate::note`], code
+//! 2): the syncpoint and the counter value read for it, in the order written, each after its
+//! write (`each_written_value_is_recorded_after_its_write`). Each answer whose acknowledge
+//! summary write lands is recorded as a `SyncptPageAcknowledged` note (code 9): the groups whose
+//! acknowledge words it wrote, after the summary's write and before the answer event's signal,
+//! whether or not it wrote a value (`a_summary_bit_flipped_alone_is_answered_at_once`). An answer
+//! a refused write stops records the values it wrote and no acknowledge note
 //! (`each_written_value_is_recorded_after_its_write`). The 64-bit value written follows from the
 //! counter and the page's saved state, and the acknowledge words are copies of what the title
-//! wrote, so replay can rebuild them. Nothing else a page turn reads comes from outside the
+//! wrote, so with these two notes replay can rebuild every write of an answer. Nothing else a page turn reads comes from outside the
 //! guest: a turn that holds rather than answers found every counter equal to what the page
 //! shows. The turn's time is the timer thread's, from the `Env` clock.
 //!
@@ -274,7 +285,7 @@ const WORD: usize = 4;
 const DOUBLE: u32 = 8;
 
 /// The summary bits that name a group.
-const GROUP_MASK: u64 = (1 << GROUP_COUNT) - 1;
+pub(crate) const GROUP_MASK: u64 = (1 << GROUP_COUNT) - 1;
 
 // PR's `static_assert`s, and the header and summary words besides: each area fits its memory and
 // no two overlap.
@@ -648,6 +659,16 @@ impl Asked {
     fn is_pending(&self) -> bool {
         self.groups.iter().any(Option::is_some)
     }
+
+    /// The groups whose summary bit differs, bit `g` for group `g`: those an answer
+    /// acknowledges.
+    fn answered_groups(&self) -> u64 {
+        self.groups
+            .iter()
+            .enumerate()
+            .filter(|(_, requested)| requested.is_some())
+            .fold(0, |groups, (group, _)| groups | 1 << group)
+    }
 }
 
 /// A `u64` read from `memory` at `offset` through `host`.
@@ -760,7 +781,8 @@ impl Locked<'_> {
         }
     }
 
-    /// Writes the values, each group's acknowledge word and the acknowledge summary.
+    /// Writes the values, each group's acknowledge word and the acknowledge summary, recording
+    /// each value after its write and, once the summary is written, the groups answered.
     fn write_answer(
         &mut self,
         host: &mut dyn TimerHost,
@@ -795,7 +817,14 @@ impl Locked<'_> {
             binding.read_only,
             u64::from(GROUP_ACK_OFFSET),
             asked.summary,
-        )
+        )?;
+        host.record(
+            Note::SyncptPageAcknowledged {
+                groups: asked.answered_groups(),
+            }
+            .event(service),
+        );
+        Ok(())
     }
 
     /// The checks a page snapshot passes against this state, in the documented order (module
@@ -974,13 +1003,8 @@ pub(crate) fn bind(
         );
         return Err(KernelError::InvalidSize.into());
     }
-    cx.write_transfer_memory(writable, 0, &[0; WRITABLE_SIZE as usize])?;
-    cx.write_transfer_memory(read_only, 0, &[0; READ_ONLY_SIZE as usize])?;
-    cx.write_transfer_memory(read_only, 0, &header())?;
-    let unallocated: Vec<u8> = (0..COUNT).flat_map(|_| UNALLOCATED.to_le_bytes()).collect();
-    cx.write_transfer_memory(read_only, u64::from(VALUES_OFFSET), &unallocated)?;
     // Each event is made once and kept, so a 204 that fails after making one hands that one
-    // out next time (module docs, "Binding (204)").
+    // out next time (module docs, "Binding (204)"), before either memory is written.
     let request = if let Some(request) = state.state.page.request {
         request
     } else {
@@ -998,6 +1022,13 @@ pub(crate) fn bind(
         state.state.page.answer = Some(answer);
         answer
     };
+    // The memories are written only once both events are there, as PR makes its event before
+    // it writes: a refused event leaves them as they were.
+    cx.write_transfer_memory(writable, 0, &[0; WRITABLE_SIZE as usize])?;
+    cx.write_transfer_memory(read_only, 0, &[0; READ_ONLY_SIZE as usize])?;
+    cx.write_transfer_memory(read_only, 0, &header())?;
+    let unallocated: Vec<u8> = (0..COUNT).flat_map(|_| UNALLOCATED.to_le_bytes()).collect();
+    cx.write_transfer_memory(read_only, u64::from(VALUES_OFFSET), &unallocated)?;
     state.state.page.binding = Some(Binding {
         writable,
         read_only,

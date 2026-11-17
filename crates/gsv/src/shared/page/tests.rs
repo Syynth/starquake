@@ -369,6 +369,11 @@ fn group_ack_write(rig: &Rig, group: usize) -> Act {
     }
 }
 
+/// The note an answer records once its acknowledge summary is written: the groups it answered.
+fn acknowledged(groups: u64) -> Act {
+    Act::Record(Note::SyncptPageAcknowledged { groups }.event(GSV))
+}
+
 fn summary_write(rig: &Rig) -> Act {
     Act::Write {
         memory: rig.read_only,
@@ -701,7 +706,9 @@ fn a_refused_event_binds_nothing_and_the_next_bind_succeeds() {
         rig.bind(),
         result_only(BIND_SYNCPOINT_MEMORY, KernelError::OutOfResource.code())
     );
-    assert_eq!(rig.page().binding(), None);
+    // The events are made before the memories are touched, as PR makes its event first: a
+    // refused event leaves the memories as they were.
+    assert!(untouched(&rig));
     rig.kernel.refuse_objects(None);
     let reply = rig.bind();
     assert_eq!(reply, success(BIND_SYNCPOINT_MEMORY, &copied(&reply), &[]));
@@ -777,6 +784,7 @@ fn a_request_for_a_counter_that_moved_is_answered_on_signal() {
             answered(SP, 2),
             group_ack_write(&rig, 0),
             summary_write(&rig),
+            acknowledged(1 << 0),
             Act::Signal(rig.answer_event()),
         ]
     );
@@ -836,6 +844,7 @@ fn a_held_request_is_answered_when_its_counter_changes() {
             answered(SP, 1),
             group_ack_write(&rig, 0),
             summary_write(&rig),
+            acknowledged(1 << 0),
             Act::Signal(rig.answer_event()),
         ]
     );
@@ -865,6 +874,7 @@ fn a_held_request_is_answered_at_exactly_the_bound_and_not_before() {
             answered(SP, 0),
             group_ack_write(&rig, 0),
             summary_write(&rig),
+            acknowledged(1 << 0),
             Act::Signal(rig.answer_event()),
         ]
     );
@@ -913,6 +923,7 @@ fn an_answer_writes_values_then_each_group_s_acknowledge_then_the_summary_then_s
             answered(130, 4),
             group_ack_write(&rig, 2),
             summary_write(&rig),
+            acknowledged(GROUP_MASK),
             Act::Signal(rig.answer_event()),
         ]
     );
@@ -944,6 +955,7 @@ fn slot_bits_of_a_group_whose_summary_bit_matches_are_not_answered() {
 #[test]
 fn a_summary_bit_flipped_alone_is_answered_at_once() {
     // Group 2's summary bit flips with no slot bit: no counter could change, so it is not held.
+    // It writes no value, and is recorded all the same: the acknowledge words it wrote.
     let mut rig = shown();
     let summary = rig.read_only_word(u64::from(GROUP_ACK_OFFSET));
     rig.write_writable(u64::from(GROUP_REQUEST_OFFSET), summary ^ (1 << 2));
@@ -954,6 +966,7 @@ fn a_summary_bit_flipped_alone_is_answered_at_once() {
         [
             group_ack_write(&rig, 2),
             summary_write(&rig),
+            acknowledged(1 << 2),
             Act::Signal(rig.answer_event()),
         ]
     );
@@ -1140,13 +1153,74 @@ fn a_refused_access_drops_the_hold_and_the_next_signal_tries_again() {
 }
 
 #[test]
+fn a_stopped_answer_s_values_count_as_shown_and_the_next_signal_holds_to_the_bound() {
+    // The value is written and the group's acknowledge write refused: the page shows the
+    // counter, so the next signal finds nothing newer and holds the request, to the bound.
+    let mut rig = Rig::bound();
+    rig.increment(SP);
+    rig.ask(&[SP]);
+    rig.signal();
+    rig.writes_left = Some(1);
+    assert_eq!(rig.turn(T0), [value_write(&rig, SP), answered(SP, 1)]);
+    assert_eq!(rig.answers(), 0);
+    assert_eq!(rig.page().held(), None);
+    rig.writes_left = None;
+    rig.signal();
+    let since = HostNanos(T0.0 + 1);
+    assert_eq!(rig.turn(since), []);
+    assert_eq!(
+        rig.page().held(),
+        Some(Hold {
+            ids: Ids::of([id(SP)]),
+            since,
+        })
+    );
+    let due = HostNanos(since.0 + ANSWER_BOUND);
+    assert_eq!(rig.turn(HostNanos(due.0 - 1)), []);
+    assert_eq!(
+        rig.turn(due),
+        [
+            value_write(&rig, SP),
+            answered(SP, 1),
+            group_ack_write(&rig, 0),
+            summary_write(&rig),
+            acknowledged(1 << 0),
+            Act::Signal(rig.answer_event()),
+        ]
+    );
+    assert_eq!(rig.answers(), 1);
+    assert!(all_acknowledged(&rig));
+}
+
+#[test]
+fn the_acknowledge_summary_is_the_request_summary_as_read() {
+    // The title sets a summary bit that names no group with a real request: the acknowledge
+    // summary is the whole word it wrote (PR writes `requests` back as read), so the title sees
+    // its request acknowledged; only the real group is answered and recorded.
+    const OUTSIDE: u64 = 1 << (u64::BITS - 1);
+    assert_eq!(OUTSIDE & GROUP_MASK, 0);
+    let mut rig = Rig::bound();
+    rig.increment(SP);
+    rig.ask(&[SP]);
+    let request = rig.writable_word(u64::from(GROUP_REQUEST_OFFSET)) | OUTSIDE;
+    rig.write_writable(u64::from(GROUP_REQUEST_OFFSET), request);
+    rig.signal();
+    let acts = rig.turn(T0);
+    assert_eq!(rig.read_only_word(u64::from(GROUP_ACK_OFFSET)), request);
+    assert!(acts.contains(&acknowledged(1 << 0)));
+    assert!(all_acknowledged(&rig));
+    assert_eq!(rig.answers(), 1);
+}
+
+#[test]
 fn each_written_value_is_recorded_after_its_write() {
     let mut rig = Rig::bound();
     rig.increment(SP);
     rig.increment(SP2);
     rig.ask(&[SP, SP2]);
     rig.signal();
-    // The second value's write is refused: only the first is recorded, after its write.
+    // The second value's write is refused: only the first is recorded, after its write, and the
+    // stopped answer records no acknowledge note (it wrote no acknowledge word).
     rig.writes_left = Some(1);
     let acts = rig.turn(T0);
     assert_eq!(acts, [value_write(&rig, SP), answered(SP, 1)]);
