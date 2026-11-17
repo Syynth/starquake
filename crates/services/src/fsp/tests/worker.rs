@@ -46,7 +46,10 @@ impl Gate {
         *self.waiting.lock().unwrap() += 1;
         self.arrived.notify_all();
         let open = self.open.lock().unwrap();
-        let (open, timeout) = self.opened.wait_timeout_while(open, WAIT, |open| !*open).unwrap();
+        let (open, timeout) = self
+            .opened
+            .wait_timeout_while(open, WAIT, |open| !*open)
+            .unwrap();
         assert!(*open && !timeout.timed_out(), "the gate was never opened");
     }
 
@@ -338,7 +341,13 @@ fn a_replay_delivers_the_reads_in_the_recorded_order() {
     again.defer(To::Session(first), READ, read(GATED, 4, 16));
     // The first read waits for the one recorded before it.
     assert!(again.server.take_completed().is_none());
-    assert_eq!(replay.check(), Err(ReplayError::Unfinished { job: 1, remaining: 2 }));
+    assert_eq!(
+        replay.check(),
+        Err(ReplayError::Unfinished {
+            job: 1,
+            remaining: 2
+        })
+    );
     again.defer(To::Session(second), READ, read(0, 4, 16));
     await_posts(&posted, 2);
     let replayed = [delivered(&mut again, 4), delivered(&mut again, 4)];
@@ -513,7 +522,11 @@ fn a_live_failure_ends_the_jobs_use_of_the_environment() {
         finish
     }));
     assert!(finished.await_count(1, WAIT));
-    let expected = [Ok(HostNanos(5)), Err(ENV_FAILURE.clone()), Err(ENV_FAILURE.clone())];
+    let expected = [
+        Ok(HostNanos(5)),
+        Err(ENV_FAILURE.clone()),
+        Err(ENV_FAILURE.clone()),
+    ];
     assert_eq!(*seen.lock().unwrap(), expected);
     // The third call got the failure without reaching the environment.
     assert_eq!(env.0.load(Ordering::SeqCst), 2);
@@ -532,7 +545,10 @@ fn a_replay_that_has_not_reached_a_recorded_job_is_unfinished() {
     let finished = Arc::new(Finished::default());
     assert_eq!(
         replay.check(),
-        Err(ReplayError::Unfinished { job: 1, remaining: 2 })
+        Err(ReplayError::Unfinished {
+            job: 1,
+            remaining: 2
+        })
     );
     replay.submit(job_reading(8, 0, false, &finished));
     assert!(finished.order().is_empty());
@@ -599,7 +615,9 @@ fn dropping_the_workers_with_reads_in_flight_leaves_no_thread_behind() {
     assert_eq!(dropped.recv_timeout(WAIT), Ok(count));
     assert!(stopped.try_recv().is_err(), "the drop did not wait");
     gate.open();
-    stopped.recv_timeout(WAIT).expect("the workers did not stop");
+    stopped
+        .recv_timeout(WAIT)
+        .expect("the workers did not stop");
     dropping.join().unwrap();
     // The jobs in flight ran to their end and were finished, and nothing else ran.
     let mut order = finished.order().clone();

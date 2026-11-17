@@ -106,10 +106,16 @@ fn a_read_the_title_file_fails_fails_the_same_way_every_time() {
     let failed = fsp::result::HOST_IO_FAILED.raw();
     // The file's data needs the title file, which fails; a sticky failure, once it is back.
     let (code, buffer) = rig.send_deferred(fsp, &storage_read(storage, 0x200, 4));
-    assert_eq!((code, domain_reply(&buffer, 0).0), (ResultCode::SUCCESS, failed));
+    assert_eq!(
+        (code, domain_reply(&buffer, 0).0),
+        (ResultCode::SUCCESS, failed)
+    );
     source.failing.store(false, Ordering::SeqCst);
     let (code, buffer) = rig.send_deferred(fsp, &storage_read(storage, 0x200, 4));
-    assert_eq!((code, domain_reply(&buffer, 0).0), (ResultCode::SUCCESS, failed));
+    assert_eq!(
+        (code, domain_reply(&buffer, 0).0),
+        (ResultCode::SUCCESS, failed)
+    );
     // The image's header needs no read of the title file, so it still reads.
     let (code, buffer) = rig.send_deferred(fsp, &storage_read(storage, 0, 4));
     assert_eq!((code, domain_reply(&buffer, 0).0), (ResultCode::SUCCESS, 0));

@@ -84,9 +84,7 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 
-use starquake_trace::{
-    Env, EnvError, EnvRecord, HostIoReply, HostIoRequest, HostNanos, ReplayEnv,
-};
+use starquake_trace::{Env, EnvError, EnvRecord, HostIoReply, HostIoRequest, HostNanos, ReplayEnv};
 
 use crate::framework::{Executor, Job};
 
@@ -347,7 +345,9 @@ impl<'a> Recorded<'a> {
     }
 
     fn into_record(self) -> (Vec<EnvRecord>, Option<EnvError>) {
-        self.kept.into_inner().unwrap_or_else(PoisonError::into_inner)
+        self.kept
+            .into_inner()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 }
 

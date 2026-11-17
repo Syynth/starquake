@@ -12,8 +12,8 @@ use starquake_ipc::{
     RequestLayout, SessionKind, StaticDescriptor,
 };
 use starquake_kernel::dispatch::{Caller, Outcome};
-use starquake_kernel::id::ServerId;
 use starquake_kernel::handle::Handle;
+use starquake_kernel::id::ServerId;
 use starquake_kernel::memory::testing::RecordingMapper;
 use starquake_kernel::memory::{
     AddressSpace, MemoryArrangement, ProcessMemory, RegionOffsets, SvcPermission,
@@ -25,9 +25,7 @@ use starquake_memory::{FlatMemory, GuestMemory, PAGE_SIZE};
 use starquake_services::framework::control::{
     CONVERT_CURRENT_OBJECT_TO_DOMAIN, QUERY_POINTER_BUFFER_SIZE,
 };
-use starquake_services::framework::{
-    DEFAULT_POINTER_BUFFER_SIZE, Protocol, Session,
-};
+use starquake_services::framework::{DEFAULT_POINTER_BUFFER_SIZE, Protocol, Session};
 use starquake_services::fsp::worker::{self, Recording, Workers};
 use starquake_services::fsp::{FspSrv, IFile, IFileSystem};
 use starquake_services::set::{self, FIRMWARE_VERSION_SIZE, FirmwareVersion, SetSys, layout};

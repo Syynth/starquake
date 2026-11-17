@@ -399,7 +399,10 @@ fn run_reading(test: &str, romfs: RomFs, timeout: Duration) -> (RunReport, Seen)
 fn a_guest_reads_the_titles_romfs_and_a_card_file_in_a_real_run() {
     let (romfs, _) = romfs();
     let mut expected = vec![0; usize::try_from(IMAGE_LEN).unwrap()];
-    assert_eq!(romfs.read_at(IMAGE_OFFSET, &mut expected).unwrap(), expected.len());
+    assert_eq!(
+        romfs.read_at(IMAGE_OFFSET, &mut expected).unwrap(),
+        expected.len()
+    );
     let (report, seen) = run_reading("machine-reads-romfs-and-card", romfs, RUN_LIMIT);
     assert_eq!(report.exit, ExitReason::ProcessExited, "{}", report.trace);
     // Every reply was a success.
@@ -430,7 +433,10 @@ fn a_run_that_ends_with_a_read_in_flight_waits_for_it_and_leaves_no_thread() {
     let (report, seen) = run_reading("machine-reads-in-flight", romfs, timeout);
     assert_eq!(report.exit, ExitReason::Timeout, "{}", report.trace);
     // The run did not return before the worker's read did, so no worker thread outlived it.
-    assert!(*lock(&source.released), "the run returned with a read in flight");
+    assert!(
+        *lock(&source.released),
+        "the run returned with a read in flight"
+    );
     assert!(started.elapsed() < RUN_LIMIT);
     // The guest never saw the read's reply.
     assert!(seen.reads.is_empty());
