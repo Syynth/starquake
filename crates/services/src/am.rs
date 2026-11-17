@@ -152,10 +152,24 @@
 //!   frontend, so it is foreground"), and nothing in a run changes it.
 //!
 //! A restore checks only the graphics server's number against the run (see "The graphics
-//! server"). Not checked here: the event ids the applet saves (the message, suspended-tick and
-//! GPU-error events). A restore believes them, and a command that then uses one the kernel did
-//! not make answers the kernel's error (`a_failed_signal_still_keeps_the_lifecycle_change`
-//! shows it for the message event).
+//! server"); it has no kernel to check the applet's event ids against, so it believes them, and
+//! the commands check them when they use them:
+//!
+//! - **The suspended-tick and GPU-error events** are checked each time
+//!   `GetAccumulatedSuspendedTickChangedEvent` or `GetGpuErrorDetectedSystemEvent` returns a
+//!   kept one, before its handle is copied: the kernel's `clear_event` answers `InvalidHandle`
+//!   for an id that is not an event this server made (another kind of object, another server's
+//!   or the guest's event, or nothing), and the command answers that error, copies nothing and
+//!   leaves the applet as it was (`a_restored_event_the_kernel_did_not_make_is_refused`). On
+//!   the server's own event the clear changes nothing, as neither event is ever signalled
+//!   (`a_restored_event_the_kernel_made_is_copied_unchanged`).
+//! - **Not checked here: the message event** when `GetEventHandle` copies it. The kernel calls
+//!   that check an event id (`clear_event`, `signal_event`) change its state, and the guest may
+//!   have cleared the event itself, so no call checks it without changing what the guest sees;
+//!   a restored message-event id that names another object is copied as it is. The lifecycle
+//!   commands that signal or clear it answer the kernel's error for an id that is not an event
+//!   (`a_failed_signal_still_keeps_the_lifecycle_change`,
+//!   `a_failed_clear_still_keeps_the_lifecycle_change`).
 //!
 //! # The message event
 //!
@@ -889,11 +903,19 @@ impl Applet {
 
 /// The event `slot` names, or a new one the kernel makes, kept in `slot`: how the applet makes
 /// each of its events that nothing signals.
+///
+/// An event already in `slot` is checked first with [`Context::clear_event`], which the kernel
+/// answers `InvalidHandle` for any id that is not an event this server made (the kernel's
+/// `IpcContext::clear_event`), so a restored id that names another object, or nothing, is
+/// refused before a handle to it is copied (module docs, "The applet"). On an event the server
+/// made the clear changes nothing: nothing signals these events, and the guest is given only
+/// their readable end, which it cannot signal.
 fn unsignalled_event_or_create(
     slot: &mut Option<ObjectId>,
     cx: &mut Context<'_>,
 ) -> Result<ObjectId, Fault> {
     if let Some(event) = *slot {
+        cx.clear_event(event)?;
         return Ok(event);
     }
     let event = cx.create_event()?;

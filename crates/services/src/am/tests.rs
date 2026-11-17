@@ -1783,6 +1783,17 @@ fn the_switch_2_answers_are_pr_4588_s() {
             .screenshot_and_continuous_recording_initially_enabled(),
         (true, false)
     );
+    // `applet.h`'s initial fields: `ScreenshotPermission screenshot_permission{}` (`Inherit`),
+    // and `GamePlayRecordingState game_play_recording_state{GamePlayRecordingState::Disabled}`.
+    let applet = Applet::new(AppletSettings::eden_default());
+    assert_eq!(
+        applet.screenshot_permission(),
+        ScreenshotPermission::INHERIT
+    );
+    assert_eq!(
+        applet.game_play_recording_state(),
+        GamePlayRecordingState::DISABLED
+    );
     // 321's `false`, `applet.h`'s `bool game_play_recording_supported{}`, and 330's `*out = 0`.
     assert_eq!(
         (
@@ -2315,4 +2326,89 @@ fn a_server_after_the_titles_start_up_commands_saves_and_restores() {
     let again = rig.object(functions, GET_GPU_ERROR_DETECTED_SYSTEM_EVENT, &[]);
     assert_eq!(again.result, ResultCode::SUCCESS);
     assert_eq!(rig.object_of(again.copies[0]), event);
+}
+
+/// How a test reads the id the applet keeps for one of its events.
+type KeptEvent = fn(&Applet) -> Option<ObjectId>;
+
+/// The two never-signalled events, each with the interface that returns it, the command, and
+/// how to read the id the applet keeps for it.
+fn never_signalled_events() -> [(u32, u32, KeptEvent); 2] {
+    [
+        (
+            GET_SELF_CONTROLLER,
+            GET_ACCUMULATED_SUSPENDED_TICK_CHANGED_EVENT,
+            Applet::suspended_tick_event,
+        ),
+        (
+            GET_APPLICATION_FUNCTIONS,
+            GET_GPU_ERROR_DETECTED_SYSTEM_EVENT,
+            Applet::gpu_error_detected_event,
+        ),
+    ]
+}
+
+/// A restored suspended-tick or GPU-error event is checked against the kernel before its handle
+/// is copied (module docs, "The applet"): restored onto a kernel where the saved id
+/// names another kind of object, or nothing the kernel made, the command answers the kernel's
+/// `InvalidHandle`, copies no handle and leaves the applet as it was, on every call.
+#[test]
+fn a_restored_event_the_kernel_did_not_make_is_refused() {
+    for (interface, command, kept) in never_signalled_events() {
+        let mut rig = Rig::new();
+        let proxy = rig.proxy();
+        let object = rig.open(proxy, interface);
+        let reply = rig.object(object, command, &[]);
+        assert_eq!(reply.result, ResultCode::SUCCESS, "{command}");
+        let event = kept(&rig.applet()).unwrap();
+        let saved = rig.server.save().unwrap();
+
+        for names_an_object in [true, false] {
+            // A fresh kernel mints the same session id; the event's id is the next it mints,
+            // made here as an object that is not an event, or never made.
+            let mut fresh = Rig::new();
+            assert_eq!(fresh.session, rig.session);
+            if names_an_object {
+                assert_eq!(fresh.kernel.new_object(), event);
+            }
+            assert_eq!(fresh.kernel.signals(event), None);
+            fresh.server.restore(&saved).unwrap();
+            let before = fresh.applet();
+            let handles = fresh.kernel.handle_count();
+            for _ in 0..2 {
+                assert_eq!(
+                    fresh.object_raw(object, command, &[]),
+                    domain_reply(KernelError::InvalidHandle.code(), &[], &[]),
+                    "{command} {names_an_object}"
+                );
+                assert_eq!(fresh.kernel.handle_count(), handles);
+                assert_eq!(fresh.applet(), before);
+                assert_eq!(kept(&fresh.applet()), Some(event));
+            }
+        }
+    }
+}
+
+/// The check of a kept event does not signal or clear it: restored onto the kernel that made
+/// it, the command copies the same event, still never signalled.
+#[test]
+fn a_restored_event_the_kernel_made_is_copied_unchanged() {
+    for (interface, command, kept) in never_signalled_events() {
+        let mut rig = Rig::new();
+        let proxy = rig.proxy();
+        let object = rig.open(proxy, interface);
+        rig.object(object, command, &[]);
+        let event = kept(&rig.applet()).unwrap();
+        let saved = rig.server.save().unwrap();
+        let mut restored = oe_server(AppletSettings::eden_default(), UnknownPolicy::Strict);
+        restored.restore(&saved).unwrap();
+        rig.server = restored;
+
+        let raw = rig.object_raw(object, command, &[]);
+        let copied = parse(&raw, SessionKind::Domain).copies[0];
+        assert_eq!(raw, copied_handle_reply(copied), "{command}");
+        assert_eq!(rig.object_of(copied), event);
+        assert_eq!(rig.kernel.signals(event), Some(0));
+        assert_eq!(rig.kernel.is_signalled(event), Some(false));
+    }
 }
