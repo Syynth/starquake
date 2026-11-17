@@ -1147,6 +1147,7 @@ dependencies = [
  "starquake-gpu",
  "starquake-ipc",
  "starquake-kernel",
+ "starquake-memory",
  "starquake-services",
  "starquake-trace",
  "thiserror",
