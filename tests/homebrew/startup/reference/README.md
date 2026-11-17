@@ -61,15 +61,14 @@ sub-interface (`IApplicationProxy`, `ISelfController`, ...) are named by the int
 reference logs them.
 
 The list is of what starquake's tables lack, not of where its run stops. The run first differs
-earlier, at line 95, the reference's `GetSharedMemoryHandle`. `hid`'s `CreateAppletResource` at
-line 93 makes the applet's input shared memory, and in a run the kernel cannot make one yet:
-starquake's guest address space has no backing to share (`SpaceMapper` in
-`crates/core/src/space.rs` keeps the kernel's default `Mapper::allocate_shared`, which refuses;
-`docs/architecture.md` lists it as provisional). So the request is answered with the kernel's
-`InvalidState` (`0xfa01`), libnx closes its `hid` session and aborts, and the run's next request
-is that close where the reference sends `GetSharedMemoryHandle`. `time:u` makes its shared
-memory the same way, at line 117, and will stop there for the same reason once the run gets that
-far.
+earlier, at line 97, the first of the reference's four `GetInfo` calls for the random entropy
+(info type `0xb`). `GetInfo` is implemented, so the list, which goes by call, does not name it,
+but starquake's kernel does not answer that info type yet: the call returns `0x4201`, the
+kernel's `NotImplemented`, where the reference returns the entropy, and libnx breaks
+(`svc 0x26`, `Break`). The two requests before it match: `hid`'s `CreateAppletResource` (line
+93) makes the applet's input shared memory, and `GetSharedMemoryHandle` (line 95) hands it out,
+because starquake's guest address space backs shared memory with guest RAM (`SpaceMapper` in
+`crates/core/src/space.rs`). `time:u` makes its shared memory the same way, at line 117.
 
 `crates/core/tests/homebrew.rs` writes this list from the trace and starquake's tables, and
 fails (`the_startup_gap_list_in_its_readme_is_the_one_the_trace_gives`) when the text between

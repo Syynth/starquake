@@ -24,10 +24,52 @@
 //!   before the guest runs again. The tables hand it out through [`AddressSpace::tables`]; the
 //!   core loop runs it after every system call (`crate::machine`).
 //!
+//! # Shared memory
+//!
+//! The kernel's [`Mapper::allocate_shared`] and [`Mapper::map_shared`] (its
+//! `starquake_kernel::memory::shared` module docs, "Where the pages come from"):
+//!
+//! - **The pages are one run of guest RAM** ([`AddressSpace::allocate_shared`]), taken from
+//!   the same place as touched pages, so they read as zero (RAM starts zeroed and is never
+//!   handed out twice). Eden takes them as one run too
+//!   (`MemoryManager().AllocateAndOpenContinuous` in `KSharedMemory::Initialize`,
+//!   `eden/src/core/hle/kernel/k_shared_memory.cpp` @ cf654052). The service reaches them
+//!   through the returned [`SharedPages`], by guest-physical address.
+//! - **A shared mapping gets every table entry at once** ([`AddressSpace::map_shared`]), with
+//!   the permission the kernel asks for (read, or read and write: the kernel refuses any other,
+//!   `is_shared_memory_permission`), and every page is backed in the shadow. The pages exist
+//!   before the mapping, so there is nothing for a touch to add; a fault on a shared page is
+//!   always [`Touch::Refused`]. A shared page is never executable through a mapping (the kernel
+//!   allows no execute permission for shared memory, and its `Shared` state has none of the
+//!   flags its reprotecting calls require: `CODE`, `CAN_REPROTECT`, `CAN_TRANSFER`), so a host
+//!   write to it needs no instruction-cache maintenance.
+//! - **Unmapping a shared mapping** is [`Mapper::unmap`], as for any mapping: the table
+//!   entries go and a flush is owed. The pages keep what they hold, for the service and for
+//!   any other mapping of them.
+//! - **The pages are never given back**, like every page this address space hands out (below):
+//!   the kernel has no call that says when the last reference to a shared memory is gone
+//!   (`starquake_kernel::memory::shared`, "Not built"). So no page of a shared memory is
+//!   reused while a mapping of it exists or a flush for one is pending. Test:
+//!   `unmapping_a_shared_mapping_keeps_its_pages_and_their_bytes_and_never_hands_them_out_again`.
+//!
+//! Divergences from Eden:
+//!
+//! - **Running out is the kernel's internal failure, not `ResultOutOfMemory`.** Eden answers
+//!   `ResultOutOfMemory` when its page heap has no run of the size
+//!   (`R_UNLESS(m_physical_address != 0, ResultOutOfMemory)` in `KSharedMemory::Initialize`).
+//!   Here guest RAM is [`SpaceError::OutOfRam`], which the kernel's address space turns into its
+//!   own failure (`SvcError::Internal`), and a server's `IpcContext::create_shared_memory` into
+//!   `InvalidState`. Test:
+//!   `running_out_of_ram_by_exactly_one_page_is_the_kernels_own_failure_and_not_a_panic`.
+//! - **Stricter: a shared mapping must name exactly a run [`AddressSpace::allocate_shared`]
+//!   handed out**, or it is [`SpaceError::NotShared`]. The kernel always names a shared
+//!   memory's whole run (`SharedMemory::backing`), so no guest reaches this. Test:
+//!   `pages_that_are_not_one_shared_memory_are_refused_and_change_nothing`.
+//!
 //! PROVISIONAL, and what replaces each part:
 //!
-//! - **Backing is handed out from the start of guest RAM, a page at a time, and never
-//!   returned**: an unmapped page's RAM is not reused. The backing pools of the execution model
+//! - **Backing is handed out from the start of guest RAM, a page at a time (a run at a time
+//!   for shared memory), and never returned**: an unmapped page's RAM is not reused. The backing pools of the execution model
 //!   replace it, sized as the kernel's pool accounting says. Until then guest RAM is sized
 //!   from the program a run loads, plus a working allowance (`crate::system`'s `ram` module),
 //!   which is usually far smaller than what the kernel lets a process reserve, and a guest that
