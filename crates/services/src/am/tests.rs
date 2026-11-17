@@ -9,6 +9,7 @@ use starquake_ipc::{
 };
 use starquake_kernel::handle::Handle;
 use starquake_kernel::id::ObjectId;
+use starquake_kernel::ipc::message::Current;
 use starquake_kernel::result::{KernelError, ResultCode};
 
 use super::*;
@@ -304,9 +305,8 @@ fn open_application_proxy_needs_the_process_id_and_the_process_handle() {
         (false, Some(process), UNKNOWN),
         (true, None, INVALID_CMIF_REQUEST),
         (false, None, UNKNOWN),
-        // A handle that names nothing is the kernel's error. The fake kernel does not translate
-        // a request's handles, so the current-process pseudo-handle libnx sends names nothing
-        // here; the kernel crate resolves it (`starquake_kernel::ipc::message`).
+        // A handle that names nothing is the kernel's error: here the current-process
+        // pseudo-handle, before the rig says which process it names.
         (
             true,
             Some(Handle::CURRENT_PROCESS.raw()),
@@ -322,6 +322,29 @@ fn open_application_proxy_needs_the_process_id_and_the_process_handle() {
         );
     }
     assert_eq!(rig.server.interface_count(), 1);
+}
+
+/// libnx's exact request: `_appletGetSessionProxy` copies `CUR_PROCESS_HANDLE`, which the kernel
+/// translates to the sending process (`starquake_kernel::ipc::message`), as the fake does once it
+/// knows the process (`framework::fake`, "Handle translation").
+#[test]
+fn libnx_s_request_with_the_current_process_pseudo_handle_opens_the_proxy() {
+    let mut rig = Rig::new();
+    let root = rig.convert();
+    let process = rig.kernel.new_object();
+    rig.kernel.set_current(Current {
+        thread: None,
+        process: Some(process),
+    });
+    let request = RequestBuilder::domain(CommandType::Request, root, OPEN_APPLICATION_PROXY)
+        .send_pid(PROCESS_ID)
+        .copy_handle(Handle::CURRENT_PROCESS.raw())
+        .data(&0_u64.to_le_bytes());
+    let reply = rig.send_raw(rig.session, &request);
+    assert_eq!(reply, domain_reply(ResultCode::SUCCESS, &[], &[root + 1]));
+    assert!(rig.holds("IApplicationProxy"));
+    // The pseudo-handle took no handle in the caller's table: only the rig's own is there.
+    assert_eq!(rig.kernel.handle_count(), 1);
 }
 
 /// Divergence from Eden, which answers `ResultUnknown` for a process it did not launch: here
