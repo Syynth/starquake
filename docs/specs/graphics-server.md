@@ -234,7 +234,11 @@ gsv keeps, per process:
   (read, PR `RegisterMemory`). Registering takes the kernel's device-share lock on the range
   (the kernel spec keeps the device share count in every memory block from its first slice), so
   the CPU mapping under it cannot change while the GPU may use it. Destroying releases the lock
-  only after the GPU is past the work queued before the destroy.
+  only after the GPU is past the work queued before the destroy. Taking the lock returns a
+  token naming the process and the exact range. The release is posted to the completion queue
+  with that token, and the timer thread, draining the queue in its recorded order, unlocks
+  through the kernel, which validates the token: the thread that learns the GPU is done is not
+  a guest thread and cannot name the current process. (Approved by the owner, 2026-11-17.)
 - **Address spaces** (gpu 33, and nvsrv's nvhost-as-gpu opens): one object reachable from both
   paths by id. NVN reserves 4 KiB pages from `0x8000000` to `0xC0_0000_0000` (row 25, observed).
 - **Mappings** in each address space: GPU range → target, kind. The target is one of:
@@ -748,7 +752,8 @@ Traces from a title (local only, never committed) and reading the SDK settle the
 change a decision.
 
 1. **Which reference wins where they disagree:** gpu 201–203, gpu 11's range, syncpt 1's value,
-   211 and 213 reply shapes, 1001–1003, copy or move handles. Until a trace, each follows the
+   211 and 213 reply shapes, 1001–1003, copy or move handles, and syncpt 201's mode 1 (PR
+   compares as 64 bits, NX2 does not; built as PR's reading, pinned in `crates/gpu/src/syncpoint.rs`). Until a trace, each follows the
    house rule of decision 8. A trace of the replies the title reads (its next request shows what
    it took from the last reply) settles each.
 2. **vi2 31/32:** does the title register request groups with 261 before waiting on them? (vsync
