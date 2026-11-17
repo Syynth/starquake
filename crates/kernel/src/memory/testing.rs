@@ -17,6 +17,8 @@ use starquake_memory::{BackingRange, Fault, FlatMemory, GuestMemory, PAGE_SIZE, 
 
 use super::mapper::{Mapper, MapperError};
 use super::shared::{SharedPages, span_within};
+use super::space::DeviceShareToken;
+use crate::id::ProcessId;
 
 /// Where the guest-physical memory that backs shared memory starts.
 pub const SHARED_BASE: u64 = 0x10_0000_0000;
@@ -135,6 +137,19 @@ pub fn standalone_shared_pages(size: u64) -> Option<SharedPages> {
     let backing = BackingRange::new(0, size).ok()?;
     let memory = FlatMemory::new(0, usize::try_from(size).ok()?);
     Some(SharedPages::new(backing, Arc::new(memory)))
+}
+
+/// A device-share token naming `process` and `size` bytes at `address`, with no lock behind
+/// it: what a fake kernel that keeps its own locks hands a service, and what a test plays a
+/// saved token with. It exists only for tests (the `test-support` feature), and it is the only
+/// way to make a token with no check at all. Outside tests, the one way to get a token from
+/// raw numbers is `crate::dispatch::Dispatcher::reclaim_device_share`, which is meant only for
+/// a snapshot restore and makes one only for a range the kernel holds a live lock on. The
+/// kernel's own unlock refuses a token whose lock it did not take
+/// (`crate::dispatch::Dispatcher::unlock_device_share`).
+#[must_use]
+pub const fn device_share_token(process: ProcessId, address: u64, size: u64) -> DeviceShareToken {
+    DeviceShareToken::new(process, address, size)
 }
 
 /// See [`MapperLog::shared_view`].

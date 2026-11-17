@@ -42,14 +42,24 @@
 //! acts, so a completion pushed meanwhile (by the kernel's hook, say) waits for the next drain
 //! (`a_push_during_the_drain_waits_for_the_next_one`).
 //!
-//! What the drain does with each completion, so far, is record it:
+//! What the drain does with each completion, so far, is record it, except a device-share
+//! release, which it unlocks:
 //!
-//! | Completion | Recorded ([`crate::note`]) |
+//! | Completion | What the drain does |
 //! |---|---|
-//! | `GpuCompletion::SyncpointChanged` | `SyncpointObserved` |
-//! | `GpuCompletion::GpuOrdered` | `GpuOrderedDone` |
-//! | `GpuCompletion::GpuQueueRoom` | `QueueRoom` |
+//! | `GpuCompletion::SyncpointChanged` | records `SyncpointObserved` ([`crate::note`]) |
+//! | `GpuCompletion::GpuOrdered` | records `GpuOrderedDone` |
+//! | `GpuCompletion::GpuQueueRoom` | records `QueueRoom` |
 //! | [`Completion::GuestSignalled`] | nothing: the guest's `SignalEvent` is recorded as its system call, and what gsv does about it (the shared page's answer, slice 5) records its own note |
+//! | [`Completion::DeviceShareReleased`] | unlocks through the kernel with the token ([`TimerHost::unlock_device_share`]), which checks it; records nothing (the spec's "What is recorded" has no note for it) |
+//!
+//! The kernel's refusal of a release is logged, and the drain goes on: a token whose process
+//! has ended is refused as a matter of course (the process ended while the GPU still had work
+//! that used its memory), and is logged at debug level; any other refusal means gsv's own
+//! bookkeeping is wrong, and is logged as an error. Either way the lock stays as the kernel
+//! keeps it, and the next completions are acted on
+//! (`a_refused_release_is_logged_and_the_drain_goes_on`; the levels are pinned by
+//! `tests/release_log_levels.rs`, a test binary of its own).
 //!
 //! Later slices act on them as well: the syncpt waiter table (slice 4), the shared page (5), the
 //! ordered completion of unmaps and destroys (7), deferred submissions (11).
@@ -59,7 +69,8 @@
 //! The core loop's timer thread (kernel slice 10, `starquake-core`) does not call
 //! [`Shared::drain`] yet; the wiring slice (16) makes it do so each turn and when the queue's
 //! [`Wake`](crate::completion::Wake) rings it, with a [`TimerHost`] that records through the
-//! kernel. Until then tests play the timer thread with a fake host.
+//! kernel and unlocks through `Dispatcher::unlock_device_share`. Until then tests play the
+//! timer thread with a fake host.
 //!
 //! # Snapshot format
 //!
@@ -83,6 +94,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use serde::{Deserialize, Serialize};
 use starquake_gpu::interface::{GpuCompletion, SYNCPOINT_COUNT, SyncpointId};
 use starquake_gpu::syncpoint::Syncpoints;
+use starquake_kernel::dispatch::DeviceShareError;
+use starquake_kernel::memory::DeviceShareToken;
 use starquake_trace::{EventKind, ServiceId};
 use thiserror::Error;
 
@@ -111,6 +124,10 @@ pub trait TimerHost {
     /// Records one event in the run's event stream, stamped and ordered by the kernel under its
     /// lock, as happening on no guest thread.
     fn record(&mut self, kind: EventKind);
+
+    /// Releases the device-share lock `token` names, through the kernel, which checks the token
+    /// (`Dispatcher::unlock_device_share`, whose refusals these are).
+    fn unlock_device_share(&mut self, token: DeviceShareToken) -> Result<(), DeviceShareError>;
 }
 
 /// What gsv's request handlers and its timer thread share (module docs, "The pieces").
@@ -266,10 +283,12 @@ impl Shared {
         let state = self.lock();
         let taken = self.queue.take_all();
         for completion in &taken {
-            if let Some(note) = note(*completion) {
-                host.record(note.event(self.service));
-            } else {
-                tracing::trace!(?completion, "gsv drained a guest signal");
+            match *completion {
+                Completion::DeviceShareReleased { token } => release(host, token),
+                Completion::GuestSignalled { .. } => {
+                    tracing::trace!(?completion, "gsv drained a guest signal");
+                }
+                Completion::Gpu(gpu) => host.record(note(gpu).event(self.service)),
             }
         }
         drop(state);
@@ -324,19 +343,30 @@ impl Shared {
     }
 }
 
-/// The note the drain records for `completion` (module docs, "Lock order and the drain").
-fn note(completion: Completion) -> Option<Note> {
+/// The note the drain records for a GPU's `completion` (module docs, "Lock order and the
+/// drain").
+fn note(completion: GpuCompletion) -> Note {
     match completion {
-        Completion::Gpu(GpuCompletion::SyncpointChanged { id, value }) => {
-            Some(Note::SyncpointObserved { id, value })
+        GpuCompletion::SyncpointChanged { id, value } => Note::SyncpointObserved { id, value },
+        GpuCompletion::GpuOrdered { ticket } => Note::GpuOrderedDone { ticket },
+        GpuCompletion::GpuQueueRoom { channel } => Note::QueueRoom { channel },
+    }
+}
+
+/// Unlocks the device-share lock `token` names through `host`, logging a refusal (module docs,
+/// "Lock order and the drain").
+fn release(host: &mut dyn TimerHost, token: DeviceShareToken) {
+    match host.unlock_device_share(token) {
+        Ok(()) => {}
+        Err(DeviceShareError::ProcessEnded) => {
+            tracing::debug!(
+                ?token,
+                "a device-share release came after its process ended"
+            );
         }
-        Completion::Gpu(GpuCompletion::GpuOrdered { ticket }) => {
-            Some(Note::GpuOrderedDone { ticket })
+        Err(error) => {
+            tracing::error!(%error, ?token, "the kernel refused gsv's device-share release");
         }
-        Completion::Gpu(GpuCompletion::GpuQueueRoom { channel }) => {
-            Some(Note::QueueRoom { channel })
-        }
-        Completion::GuestSignalled { .. } => None,
     }
 }
 

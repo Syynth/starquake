@@ -8,8 +8,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use serde::{Deserialize, Serialize};
 use starquake_ipc::RequestBuilder;
 use starquake_kernel::handle::Handle;
-use starquake_kernel::id::ObjectId;
+use starquake_kernel::id::{ObjectId, ProcessId, SlabId};
 use starquake_kernel::ipc::EventHook;
+use starquake_kernel::memory::testing::device_share_token;
 use starquake_kernel::memory::{SharedPages, SvcPermission};
 use starquake_kernel::result::{KernelError, ResultCode, SvcResult};
 use starquake_trace::{EventKind, ServiceId};
@@ -52,11 +53,14 @@ impl EventHook for Heard {
     }
 }
 
-/// A service that uses the four calls. Its hook is not part of a snapshot.
+/// A service that uses the four calls. Its hook is not part of a snapshot, and nor is the
+/// process its last lock's token named, which its unlock names with the request's range.
 #[derive(Default, Serialize, Deserialize)]
 struct Gpu {
     #[serde(skip)]
     heard: Heard,
+    #[serde(skip)]
+    process: Option<ProcessId>,
 }
 
 commands! {
@@ -89,15 +93,22 @@ impl Gpu {
         reply.ok()
     }
 
-    fn lock(_: &mut Self, cx: &mut Context<'_>, req: &Request<'_>, reply: &mut Reply) -> Outcome {
+    fn lock(&mut self, cx: &mut Context<'_>, req: &Request<'_>, reply: &mut Reply) -> Outcome {
         let (address, size) = range(req)?;
-        cx.lock_device_share(address, size)?;
+        let token = cx.lock_device_share(address, size)?;
+        assert_eq!((token.address(), token.size()), (address, size));
+        self.process = Some(token.process());
         reply.ok()
     }
 
-    fn unlock(_: &mut Self, cx: &mut Context<'_>, req: &Request<'_>, reply: &mut Reply) -> Outcome {
+    /// Unlocks with a token for the request's range, naming the process the last lock's token
+    /// named (or a made-up one before any lock), so a test can present any range.
+    fn unlock(&mut self, cx: &mut Context<'_>, req: &Request<'_>, reply: &mut Reply) -> Outcome {
         let (address, size) = range(req)?;
-        cx.unlock_device_share(address, size)?;
+        let process = self
+            .process
+            .unwrap_or_else(|| ProcessId::from_parts(u32::MAX, u32::MAX));
+        cx.unlock_device_share(device_share_token(process, address, size))?;
         reply.ok()
     }
 }
@@ -118,6 +129,7 @@ fn rig(heard: &Heard) -> (Server, ObjectId) {
             session,
             Box::new(Gpu {
                 heard: heard.clone(),
+                process: None,
             }),
         )
         .unwrap();
@@ -165,6 +177,7 @@ fn the_caller_gets_the_writable_end_and_the_hook_hears_its_signals() {
             other_session,
             Box::new(Gpu {
                 heard: second.clone(),
+                process: None,
             }),
         )
         .unwrap();
@@ -283,8 +296,44 @@ fn the_fake_refuses_to_lock_an_empty_range() {
     );
     assert_eq!(kernel.device_locks(MEMORY, 0), 0);
     // The same address with a size is lockable: the refusal is the size's.
-    assert_eq!(kernel.lock_device_share(MEMORY, 0x1000), Ok(()));
+    assert_eq!(
+        kernel.lock_device_share(MEMORY, 0x1000),
+        Ok(device_share_token(kernel.process(), MEMORY, 0x1000))
+    );
     assert_eq!(kernel.device_locks(MEMORY, 0x1000), 1);
+}
+
+#[test]
+fn the_fakes_token_names_its_process_and_the_exact_range_and_another_process_s_is_refused() {
+    let mut kernel = kernel();
+    let token = kernel.lock_device_share(MEMORY, 0x1000).unwrap();
+    assert_eq!(
+        (token.process(), token.address(), token.size()),
+        (kernel.process(), MEMORY, 0x1000)
+    );
+    // Another slot, and the fake's own slot in another generation.
+    let other = ProcessId::from_parts(token.process().index().wrapping_add(1), 1);
+    let stale = ProcessId::from_parts(
+        token.process().index(),
+        token.process().generation().wrapping_add(1),
+    );
+    for refused in [
+        device_share_token(other, MEMORY, 0x1000),
+        device_share_token(stale, MEMORY, 0x1000),
+        device_share_token(kernel.process(), MEMORY, 0x2000),
+        device_share_token(kernel.process(), MEMORY + 0x1000, 0x1000),
+    ] {
+        assert_eq!(
+            kernel.unlock_device_share(refused),
+            Err(KernelError::InvalidCurrentMemory)
+        );
+    }
+    assert_eq!(kernel.device_locks(MEMORY, 0x1000), 1);
+    assert_eq!(kernel.unlock_device_share(token), Ok(()));
+    assert_eq!(
+        kernel.unlock_device_share(token),
+        Err(KernelError::InvalidCurrentMemory)
+    );
 }
 
 /// A kernel that offers only what every kernel must: the graphics server's calls take their

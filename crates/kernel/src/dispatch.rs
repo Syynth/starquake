@@ -226,6 +226,7 @@ use crate::tables::{AddressSpace, Processes, Scheduler};
 
 mod arbitration;
 mod cores;
+mod device;
 mod exception;
 mod hooks;
 mod info;
@@ -237,6 +238,7 @@ mod sync;
 mod tests;
 
 pub use cores::{Held, Loaded, Switch};
+pub use device::DeviceShareError;
 pub use ipc::{IpcContext, Woken};
 pub use sync::WakeError;
 

@@ -10,6 +10,7 @@ use starquake_kernel::slab::SlabId;
 use starquake_services::framework::Kernel;
 use starquake_services::framework::fake::FakeKernel;
 
+use super::testing::{LOCKS, Locks, locks, process, released, token};
 use super::*;
 
 fn id(value: u8) -> SyncpointId {
@@ -76,6 +77,9 @@ fn script() -> Vec<Completion> {
         room(1),
         signalled(4),
         changed(4, 9),
+        released(1),
+        room(3),
+        released(2),
     ]
 }
 
@@ -400,6 +404,7 @@ fn completion() -> impl Strategy<Value = Completion> {
         (0u64..4).prop_map(ordered),
         (0u32..3).prop_map(room),
         (0u32..3).prop_map(signalled),
+        (0..LOCKS).prop_map(released),
     ]
 }
 
@@ -425,7 +430,8 @@ fn model_push(model: &mut Vec<Completion>, completion: Completion) {
                     }) if *other == id => {
                         target = Some(held);
                     }
-                    Completion::Gpu(GpuCompletion::GpuOrdered { .. }) => target = None,
+                    Completion::Gpu(GpuCompletion::GpuOrdered { .. })
+                    | Completion::DeviceShareReleased { .. } => target = None,
                     _ => {}
                 }
             }
@@ -438,7 +444,8 @@ fn model_push(model: &mut Vec<Completion>, completion: Completion) {
                 None => model.push(completion),
             }
         }
-        Completion::Gpu(GpuCompletion::GpuOrdered { .. }) => model.push(completion),
+        Completion::Gpu(GpuCompletion::GpuOrdered { .. })
+        | Completion::DeviceShareReleased { .. } => model.push(completion),
         Completion::Gpu(GpuCompletion::GpuQueueRoom { .. }) | Completion::GuestSignalled { .. } => {
             if !model.contains(&completion) {
                 model.push(completion);
@@ -480,8 +487,25 @@ proptest! {
         for completion in &pushes {
             queue.push(*completion);
         }
-        let restored = CompletionQueue::restore(&queue.save().unwrap()).unwrap();
+        // The kernel holds a lock for each release queued: a queue cannot hold more.
+        let kernel = locks_for(&pushes);
+        let restored = CompletionQueue::restore(&queue.save().unwrap(), &kernel).unwrap();
         prop_assert_eq!(restored.take_all(), queue.take_all());
+    }
+}
+
+/// A kernel holding one lock of [`process`] for each release in `completions`: as many on a
+/// range as `completions` releases it.
+fn locks_for(completions: &[Completion]) -> Locks {
+    let mut live = BTreeMap::new();
+    for completion in completions {
+        if let Completion::DeviceShareReleased { token } = completion {
+            *live.entry((token.address(), token.size())).or_insert(0) += 1;
+        }
+    }
+    Locks {
+        process: process(),
+        live,
     }
 }
 
@@ -511,19 +535,30 @@ fn the_snapshot_layout_is_pinned() {
     queue.push(Completion::GuestSignalled {
         event: ObjectId::from_parts(0x07, 0x08),
     });
+    let kernel = Locks {
+        process: ProcessId::from_parts(0x09, 0x0A),
+        live: [((0x0B, 0x0C), 1)].into(),
+    };
+    let lock = kernel.reclaim(kernel.process, 0x0B, 0x0C, 0).unwrap();
+    queue.push(Completion::DeviceShareReleased { token: lock });
     let bytes = queue.save().unwrap();
     assert_eq!(
         bytes,
         [
             b'S', b'Q', b'C', b'Q', // magic
-            0x01, // version 1
-            0x04, // four entries
+            0x02, // version 2
+            0x05, // five entries
             0x00, 0x05, 0x82, 0x02, // SyncpointChanged: id 5, value 0x102
             0x01, 0x84, 0x06, // GpuOrdered: ticket 0x304
             0x02, 0x06, // GpuQueueRoom: channel 6
             0x03, 0x07, 0x08, // GuestSignalled: event index 7, generation 8
+            0x04, 0x09, 0x0A, 0x0B,
+            0x0C, // DeviceShareReleased: process (9, 10), 0xC bytes at 0xB
         ]
     );
+    // It restores to the same queue, with the kernel's token.
+    let restored = CompletionQueue::restore(&bytes, &kernel).unwrap();
+    assert_eq!(restored.save().unwrap(), bytes);
     assert_eq!(&bytes[..SNAPSHOT_MAGIC.len()], SNAPSHOT_MAGIC);
 }
 
@@ -538,7 +573,7 @@ fn a_restored_queue_keeps_coalescing_and_order() {
     let (restored, counter) = {
         let counter = Arc::new(Counter::default());
         let wake: Arc<dyn Wake> = Arc::<Counter>::clone(&counter);
-        let restored = CompletionQueue::restore(&queue.save().unwrap()).unwrap();
+        let restored = CompletionQueue::restore(&queue.save().unwrap(), &locks()).unwrap();
         (restored.with_wake(wake), counter)
     };
     // Used after the restore: repeats fold into the restored entries, except a change of
@@ -570,14 +605,19 @@ fn a_restored_queue_keeps_coalescing_and_order() {
 fn an_empty_queue_saves_and_restores() {
     let bytes = CompletionQueue::new().save().unwrap();
     assert_eq!(bytes, snapshot(&[0x00]));
-    assert_eq!(CompletionQueue::restore(&bytes).unwrap().take_all(), []);
+    assert_eq!(
+        CompletionQueue::restore(&bytes, &locks())
+            .unwrap()
+            .take_all(),
+        []
+    );
 }
 
 #[test]
 fn a_snapshot_with_the_wrong_magic_is_refused() {
     let mut bytes = CompletionQueue::new().save().unwrap();
     bytes[0] ^= 0xFF;
-    let error = CompletionQueue::restore(&bytes).err().unwrap();
+    let error = CompletionQueue::restore(&bytes, &locks()).err().unwrap();
     assert_eq!(error, SnapshotError::BadMagic);
     assert_eq!(
         error.to_string(),
@@ -591,7 +631,7 @@ fn a_snapshot_of_another_version_is_refused() {
     for found in [SNAPSHOT_VERSION - 1, SNAPSHOT_VERSION + 1] {
         let mut bytes = CompletionQueue::new().save().unwrap();
         bytes[SNAPSHOT_MAGIC.len()] = u8::try_from(found).unwrap();
-        let error = CompletionQueue::restore(&bytes).err().unwrap();
+        let error = CompletionQueue::restore(&bytes, &locks()).err().unwrap();
         assert_eq!(error, SnapshotError::UnsupportedVersion { found });
         assert_eq!(
             error.to_string(),
@@ -608,7 +648,9 @@ fn a_cut_snapshot_is_refused() {
     queue.push(ordered(0x0304));
     let bytes = queue.save().unwrap();
     for len in 0..bytes.len() {
-        let error = CompletionQueue::restore(&bytes[..len]).err().unwrap();
+        let error = CompletionQueue::restore(&bytes[..len], &locks())
+            .err()
+            .unwrap();
         assert!(
             matches!(error, SnapshotError::Decode(_)),
             "cut to {len}: {error:?}"
@@ -620,7 +662,7 @@ fn a_cut_snapshot_is_refused() {
 fn bytes_after_the_body_are_refused() {
     let mut bytes = CompletionQueue::new().save().unwrap();
     bytes.extend([0xAA, 0xBB]);
-    let error = CompletionQueue::restore(&bytes).err().unwrap();
+    let error = CompletionQueue::restore(&bytes, &locks()).err().unwrap();
     assert_eq!(error, SnapshotError::TrailingBytes { count: 2 });
     assert_eq!(
         error.to_string(),
@@ -635,12 +677,14 @@ fn an_entry_naming_no_syncpoint_is_refused_at_the_count() {
     // The last syncpoint is accepted.
     let good = snapshot(&[0x02, 0x01, 0x05, 0x00, last, 0x01]);
     assert_eq!(
-        CompletionQueue::restore(&good).unwrap().take_all(),
+        CompletionQueue::restore(&good, &locks())
+            .unwrap()
+            .take_all(),
         [ordered(5), changed(last, 1)]
     );
     // One past it is refused, at its index.
     let bad = snapshot(&[0x02, 0x01, 0x05, 0x00, first_out, 0x01]);
-    let error = CompletionQueue::restore(&bad).err().unwrap();
+    let error = CompletionQueue::restore(&bad, &locks()).err().unwrap();
     assert_eq!(
         error,
         SnapshotError::NoSuchSyncpoint {
@@ -666,7 +710,9 @@ fn a_repeated_coalesced_entry_is_refused() {
         &[0x03, 0x03, 0x04, 0x05, 0x01, 0x09, 0x03, 0x04, 0x05], // event (4, 5) twice
     ];
     for body in repeats {
-        let error = CompletionQueue::restore(&snapshot(body)).err().unwrap();
+        let error = CompletionQueue::restore(&snapshot(body), &locks())
+            .err()
+            .unwrap();
         assert_eq!(error, SnapshotError::Repeated { index: 2 }, "{body:x?}");
         assert_eq!(
             error.to_string(),
@@ -677,12 +723,16 @@ fn a_repeated_coalesced_entry_is_refused() {
     // accepted; so is a repeated ticket, which is not coalesced.
     let across = snapshot(&[0x03, 0x00, 0x05, 0x01, 0x01, 0x09, 0x00, 0x05, 0x02]);
     assert_eq!(
-        CompletionQueue::restore(&across).unwrap().take_all(),
+        CompletionQueue::restore(&across, &locks())
+            .unwrap()
+            .take_all(),
         [changed(5, 1), ordered(9), changed(5, 2)]
     );
     let tickets = snapshot(&[0x02, 0x01, 0x09, 0x01, 0x09]);
     assert_eq!(
-        CompletionQueue::restore(&tickets).unwrap().take_all(),
+        CompletionQueue::restore(&tickets, &locks())
+            .unwrap()
+            .take_all(),
         [ordered(9), ordered(9)]
     );
 }
@@ -693,13 +743,17 @@ fn entries_are_checked_in_order() {
     let first_out = u8::try_from(SYNCPOINT_COUNT).unwrap();
     let body = [0x03, 0x02, 0x04, 0x02, 0x04, 0x00, first_out, 0x01];
     assert_eq!(
-        CompletionQueue::restore(&snapshot(&body)).err().unwrap(),
+        CompletionQueue::restore(&snapshot(&body), &locks())
+            .err()
+            .unwrap(),
         SnapshotError::Repeated { index: 1 }
     );
     // The other way round.
     let body = [0x03, 0x02, 0x04, 0x00, first_out, 0x01, 0x02, 0x04];
     assert_eq!(
-        CompletionQueue::restore(&snapshot(&body)).err().unwrap(),
+        CompletionQueue::restore(&snapshot(&body), &locks())
+            .err()
+            .unwrap(),
         SnapshotError::NoSuchSyncpoint {
             index: 1,
             id: first_out
@@ -715,7 +769,7 @@ fn the_header_is_checked_before_the_body() {
     bytes.push(u8::try_from(SNAPSHOT_VERSION + 1).unwrap());
     bytes.extend([0x01, 0x00, first_out, 0x01, 0xEE]);
     assert_eq!(
-        CompletionQueue::restore(&bytes).err().unwrap(),
+        CompletionQueue::restore(&bytes, &locks()).err().unwrap(),
         SnapshotError::UnsupportedVersion {
             found: SNAPSHOT_VERSION + 1
         }
@@ -724,7 +778,294 @@ fn the_header_is_checked_before_the_body() {
     let mut bytes = snapshot(&[0x01, 0x00, first_out, 0x01]);
     bytes.push(0xEE);
     assert_eq!(
-        CompletionQueue::restore(&bytes).err().unwrap(),
+        CompletionQueue::restore(&bytes, &locks()).err().unwrap(),
         SnapshotError::TrailingBytes { count: 1 }
+    );
+}
+
+#[test]
+fn device_share_releases_are_each_kept() {
+    // Two locks on one range give equal tokens, and each must be unlocked.
+    let queue = CompletionQueue::new();
+    queue.push(released(1));
+    queue.push(released(1));
+    queue.push(released(2));
+    assert_eq!(queue.take_all(), [released(1), released(1), released(2)]);
+}
+
+#[test]
+fn a_syncpoint_change_is_not_folded_across_a_device_share_release() {
+    // A release is an ordered entry: a change pushed after it drains after it, and a change
+    // pushed before it is not moved behind it. Room reports and guest signals fold across it,
+    // as across a `GpuOrdered`.
+    let queue = CompletionQueue::new();
+    queue.push(changed(5, 10));
+    queue.push(room(1));
+    queue.push(signalled(2));
+    queue.push(released(3));
+    queue.push(changed(5, 12));
+    queue.push(changed(5, 13));
+    queue.push(room(1));
+    queue.push(signalled(2));
+    assert_eq!(
+        queue.take_all(),
+        [
+            changed(5, 10),
+            room(1),
+            signalled(2),
+            released(3),
+            changed(5, 13),
+        ]
+    );
+}
+
+#[test]
+fn a_release_s_token_is_the_kernel_s_answer_on_restore() {
+    // Restoring asks the kernel for each release's token; the restored queue drains exactly
+    // the tokens the kernel gave.
+    let queue = CompletionQueue::new();
+    queue.push(released(0));
+    queue.push(ordered(4));
+    queue.push(released(LOCKS - 1));
+    let restored = CompletionQueue::restore(&queue.save().unwrap(), &locks()).unwrap();
+    assert_eq!(
+        restored.take_all(),
+        [released(0), ordered(4), released(LOCKS - 1)]
+    );
+}
+
+/// The body of a snapshot whose one entry releases `size` bytes at `address` of `process`.
+fn one_release(process: ProcessId, address: u64, size: u64) -> Vec<u8> {
+    let entries = [Saved::DeviceShareReleased {
+        process,
+        address,
+        size,
+    }];
+    let mut bytes = header();
+    bytes.extend(postcard::to_allocvec(&entries[..]).unwrap());
+    bytes
+}
+
+#[test]
+fn a_release_the_kernel_refuses_is_refused_at_its_index() {
+    let other = ProcessId::from_parts(process().index() + 1, process().generation());
+    let held = token(1);
+    for (process, address, size, error) in [
+        (
+            other,
+            held.address(),
+            held.size(),
+            DeviceShareError::WrongProcess,
+        ),
+        // One range short, and one long, of a held lock.
+        (
+            process(),
+            held.address(),
+            held.size() / 2,
+            DeviceShareError::NotLocked {
+                address: held.address(),
+                size: held.size() / 2,
+            },
+        ),
+        (
+            process(),
+            held.address(),
+            held.size() * 2,
+            DeviceShareError::NotLocked {
+                address: held.address(),
+                size: held.size() * 2,
+            },
+        ),
+        // A lock the kernel does not hold.
+        (
+            process(),
+            token(LOCKS).address(),
+            token(LOCKS).size(),
+            DeviceShareError::NotLocked {
+                address: token(LOCKS).address(),
+                size: token(LOCKS).size(),
+            },
+        ),
+    ] {
+        let bytes = one_release(process, address, size);
+        let refusal = CompletionQueue::restore(&bytes, &locks()).err().unwrap();
+        assert_eq!(
+            refusal,
+            SnapshotError::Release {
+                index: 0,
+                error: error.clone(),
+            }
+        );
+        assert_eq!(
+            refusal.to_string(),
+            format!(
+                "entry 0 of the completion queue snapshot releases a device-share lock the kernel refused: {error}"
+            )
+        );
+    }
+    // The held lock itself is taken back.
+    let bytes = one_release(process(), held.address(), held.size());
+    assert_eq!(
+        CompletionQueue::restore(&bytes, &locks())
+            .unwrap()
+            .take_all(),
+        [released(1)]
+    );
+}
+
+#[test]
+fn a_refused_release_and_a_repeat_are_answered_in_entry_order() {
+    let refused = Saved::DeviceShareReleased {
+        process: process(),
+        address: token(LOCKS).address(),
+        size: token(LOCKS).size(),
+    };
+    let room = Saved::GpuQueueRoom { channel: 4 };
+    let not_locked = DeviceShareError::NotLocked {
+        address: token(LOCKS).address(),
+        size: token(LOCKS).size(),
+    };
+    let restore = |entries: &[Saved]| {
+        let mut bytes = header();
+        bytes.extend(postcard::to_allocvec(entries).unwrap());
+        CompletionQueue::restore(&bytes, &locks()).err().unwrap()
+    };
+    // The refused release first, then a repeat: the release is answered.
+    assert_eq!(
+        restore(&[room, refused, room]),
+        SnapshotError::Release {
+            index: 1,
+            error: not_locked,
+        }
+    );
+    // The repeat first: it is answered.
+    assert_eq!(
+        restore(&[room, room, refused]),
+        SnapshotError::Repeated { index: 1 }
+    );
+}
+
+/// A dispatcher over a fresh process, which holds no device-share lock, and that process.
+fn real_kernel() -> (starquake_kernel::dispatch::Dispatcher, ProcessId) {
+    use starquake_kernel::memory::testing::RecordingMapper;
+    use starquake_kernel::memory::{AddressSpace, MemoryArrangement, ProcessMemory, RegionOffsets};
+    use starquake_kernel::process::{self, Console, ProcessDescription};
+
+    let (mapper, _log) = RecordingMapper::new();
+    let memory = ProcessMemory {
+        code_address: 0x8000_0000,
+        code_size: 0x1000,
+        arrangement: MemoryArrangement::FourGb,
+        alias_region_extra: false,
+        offsets: RegionOffsets::default(),
+    };
+    let space = AddressSpace::new(&memory, Box::new(mapper)).unwrap();
+    let tables = process::create(&ProcessDescription::homebrew(Console::Switch2), space).unwrap();
+    let own = tables.processes.own();
+    (starquake_kernel::dispatch::Dispatcher::new(tables), own)
+}
+
+#[test]
+fn the_fake_kernel_reclaims_as_the_real_one_refuses() {
+    // The same saved releases, restored against the kernel's dispatcher (which holds no lock)
+    // and against the fake holding none for the same process: the same answer for each.
+    let (dispatcher, own) = real_kernel();
+    let fake = Locks {
+        process: own,
+        live: BTreeMap::new(),
+    };
+    let other = ProcessId::from_parts(own.index() + 1, own.generation());
+    for (process, address, size) in [(own, 0x8000_0000, 0x1000), (other, 0x8000_0000, 0x1000)] {
+        let bytes = one_release(process, address, size);
+        let real = CompletionQueue::restore(&bytes, &dispatcher).err().unwrap();
+        let faked = CompletionQueue::restore(&bytes, &fake).err().unwrap();
+        assert_eq!(real, faked);
+    }
+    assert_eq!(
+        CompletionQueue::restore(&one_release(other, 0x8000_0000, 0x1000), &dispatcher)
+            .err()
+            .unwrap(),
+        SnapshotError::Release {
+            index: 0,
+            error: DeviceShareError::WrongProcess,
+        }
+    );
+}
+
+/// A snapshot holding `entries`.
+fn snapshot_of(entries: &[Saved]) -> Vec<u8> {
+    let mut bytes = header();
+    bytes.extend(postcard::to_allocvec(entries).unwrap());
+    bytes
+}
+
+/// The saved release of lock `n` of [`process`].
+fn saved_release(n: u64) -> Saved {
+    Saved::DeviceShareReleased {
+        process: process(),
+        address: token(n).address(),
+        size: token(n).size(),
+    }
+}
+
+#[test]
+fn releases_beyond_the_kernel_s_locks_are_refused_at_the_first_extra_one() {
+    // The kernel holds `held` locks on range 1 and one on range 2. The snapshot interleaves the
+    // two ranges (with an unordered entry between) so the count must be kept per range: as many
+    // releases of range 1 as locks are taken back, and one more is refused at its own index.
+    let other = saved_release(2);
+    let saved_room = Saved::GpuQueueRoom { channel: 4 };
+    for held in [1, 2, 3] {
+        let kernel = Locks {
+            process: process(),
+            live: [
+                ((token(1).address(), token(1).size()), held),
+                ((token(2).address(), token(2).size()), 1),
+            ]
+            .into(),
+        };
+        let mut entries = vec![other, saved_room];
+        entries.extend((0..held).map(|_| saved_release(1)));
+        let bytes = snapshot_of(&entries);
+        let mut expected = vec![released(2), room(4)];
+        expected.extend((0..held).map(|_| released(1)));
+        assert_eq!(
+            CompletionQueue::restore(&bytes, &kernel)
+                .unwrap()
+                .take_all(),
+            expected,
+            "{held} locks"
+        );
+        // One more release of range 1: refused at its index, the first past the kernel's count.
+        entries.push(saved_release(1));
+        assert_eq!(
+            CompletionQueue::restore(&snapshot_of(&entries), &kernel)
+                .err()
+                .unwrap(),
+            SnapshotError::Release {
+                index: entries.len() - 1,
+                error: DeviceShareError::NotLocked {
+                    address: token(1).address(),
+                    size: token(1).size(),
+                },
+            },
+            "{held} locks"
+        );
+    }
+}
+
+#[test]
+fn one_lock_and_two_saved_releases_of_it_are_refused_at_the_second() {
+    // The reviewer's case, against the shared fake: `locks` holds token(1)'s range once.
+    let bytes = snapshot_of(&[saved_release(1), saved_release(1)]);
+    assert_eq!(
+        CompletionQueue::restore(&bytes, &locks()).err().unwrap(),
+        SnapshotError::Release {
+            index: 1,
+            error: DeviceShareError::NotLocked {
+                address: token(1).address(),
+                size: token(1).size(),
+            },
+        }
     );
 }
