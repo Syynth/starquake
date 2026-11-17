@@ -172,6 +172,19 @@ impl<const N: usize> Fixed<N> {
         ])
     }
 
+    /// Writes `value` as a little-endian `u16` at `AT`.
+    pub(crate) fn set_u16<const AT: usize>(&mut self, value: u16) {
+        const { assert!(AT + 2 <= N, "a field past the end of its argument") };
+        let [a, b] = value.to_le_bytes();
+        self.0[AT] = a;
+        self.0[AT + 1] = b;
+    }
+
+    /// The whole argument, as bytes.
+    pub(crate) const fn bytes(&self) -> &[u8; N] {
+        &self.0
+    }
+
     /// Writes `value` as a little-endian `u32` at `AT`.
     pub(crate) fn set_u32<const AT: usize>(&mut self, value: u32) {
         const { assert!(AT + 4 <= N, "a field past the end of its argument") };

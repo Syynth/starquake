@@ -1164,6 +1164,13 @@ impl GpuMemory {
         Ok(())
     }
 
+    /// Where address space `space`'s syncpoint shim is, if one is placed
+    /// ([`map_syncpoint_shim`](Self::map_syncpoint_shim)).
+    #[must_use]
+    pub fn shim(&self, space: AsId) -> Option<u64> {
+        self.spaces.get(&space).and_then(|held| held.shim)
+    }
+
     /// The GPU reported `ticket` done: the job's ranges are no longer held, and are published
     /// again, once per address space (module docs, "What the table shows"); the drain is told
     /// what to release and signal. `None` for a ticket no job waits on.

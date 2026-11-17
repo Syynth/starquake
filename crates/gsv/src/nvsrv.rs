@@ -137,19 +137,28 @@
 //! mapped): the caller gets the kernel's error, as for any service whose reply writes a buffer.
 //! In Eden the write is dropped and the change stands too.
 
+pub mod as_gpu;
+pub mod ctrl_gpu;
 pub mod ioctl;
 pub mod nvmap;
+pub mod tsg_gpu;
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use starquake_services::commands;
 use starquake_services::framework::{
-    Context, Fault, Interfaces, Outcome, Reply, Request, Server, UnknownPolicy,
+    Context, Family, Fault, Interfaces, Outcome, Reply, Request, Server, SnapshotError,
+    UnknownPolicy,
 };
 
+use self::as_gpu::AsGpu;
 use self::ioctl::{Ioctl, MAX_ARGUMENT_BYTES};
 use self::nvmap::NvMap;
+use self::tsg_gpu::TsgGpu;
+use crate::gpu::{GpuMemory, GpuVmFront};
+use crate::shared::Shared;
 
 #[cfg(test)]
 mod tests;
@@ -213,6 +222,8 @@ pub enum NvResult {
     InvalidState,
     /// `BadValue = 0xB`.
     BadValue,
+    /// `Busy = 0xE`: a channel already bound to a timeslice group.
+    Busy,
     /// `FileOperationFailed = 0x30003`: a path no device has.
     FileOperationFailed,
     /// `AccessDenied = 0x30010`.
@@ -231,6 +242,7 @@ impl NvResult {
             Self::InsufficientMemory => 0x6,
             Self::InvalidState => 0x8,
             Self::BadValue => 0xB,
+            Self::Busy => 0xE,
             Self::FileOperationFailed => 0x3_0003,
             Self::AccessDenied => 0x3_0010,
         }
@@ -346,24 +358,62 @@ impl IoctlVariant {
     }
 }
 
-/// What an ioctl answers: its result, and the bytes for out buffer 0 if the ioctl's `is_out` bit
-/// is set (clipped to the buffer when written).
+/// What an ioctl answers: its result, the bytes for out buffer 0, and, for `Ioctl3`, the bytes
+/// for out buffer 1 (the inline output), each written if the ioctl's `is_out` bit is set and
+/// clipped to its buffer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IoctlAnswer {
     /// The result word.
     pub result: NvResult,
     /// The argument the device gives back.
     pub output: Vec<u8>,
+    /// What the device gives back inline (`Ioctl3`'s out buffer 1); empty for every other
+    /// variant.
+    pub inline: Vec<u8>,
 }
 
 impl IoctlAnswer {
     /// A result with nothing to give back.
     const fn only(result: NvResult) -> Self {
+        Self::with(result, Vec::new())
+    }
+
+    /// A result and an argument, nothing inline.
+    const fn with(result: NvResult, output: Vec<u8>) -> Self {
         Self {
             result,
-            output: Vec::new(),
+            output,
+            inline: Vec::new(),
         }
     }
+}
+
+/// One ioctl as a device sees it: the command that carried it, the fd, the number, the argument
+/// read from in buffer 0, and the sizes of out buffer 0 and (for `Ioctl3`) out buffer 1, which
+/// some devices check (a missing buffer is size 0, as Eden's `GetWriteBufferSize` reads it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IoctlCall<'a> {
+    /// `Ioctl`, `Ioctl2` or `Ioctl3`.
+    pub variant: IoctlVariant,
+    /// The fd.
+    pub fd: i32,
+    /// The ioctl number.
+    pub ioctl: Ioctl,
+    /// In buffer 0, up to [`MAX_ARGUMENT_BYTES`].
+    pub input: &'a [u8],
+    /// Out buffer 0's size.
+    pub out_len: usize,
+    /// Out buffer 1's size for `Ioctl3`, 0 otherwise.
+    pub inline_out_len: usize,
+}
+
+/// gsv's GPU memory, under gsv's shared lock, and the GPU's front: what nvhost-as-gpu acts on
+/// ([`as_gpu`]).
+pub struct GpuAccess<'a> {
+    /// The bookkeeping gpu 33 and the gpu worker share.
+    pub memory: &'a mut GpuMemory,
+    /// The GPU's front, which a new address space is given to.
+    pub front: &'a dyn GpuVmFront,
 }
 
 /// The fd `Open` answers when no device has the path (`nvdata.h`: `INVALID_NVDRV_FD = -1`).
@@ -388,6 +438,8 @@ pub struct NvsrvState {
     files: BTreeMap<u32, Device>,
     next_fd: u32,
     nvmap: NvMap,
+    as_gpu: AsGpu,
+    tsg_gpu: TsgGpu,
 }
 
 /// The serialised form of [`NvsrvState`], field for field, and what deserialising validates.
@@ -396,6 +448,8 @@ struct SavedNvsrvState {
     files: BTreeMap<u32, Device>,
     next_fd: u32,
     nvmap: NvMap,
+    as_gpu: AsGpu,
+    tsg_gpu: TsgGpu,
 }
 
 /// Why a saved [`NvsrvState`] could not be read back: its open files are not ones `Open` and
@@ -421,6 +475,24 @@ pub enum NvsrvStateError {
         /// The fd.
         fd: u32,
     },
+    /// An address-space view on an fd that is not an open `/dev/nvhost-as-gpu`.
+    #[error("fd {fd} has an address-space view but is not an open nvhost-as-gpu")]
+    NotAnAddressSpace {
+        /// The fd.
+        fd: u32,
+    },
+    /// A timeslice group on an fd that is not an open `/dev/nvhost-tsg-gpu`.
+    #[error("fd {fd} has a timeslice group but is not an open nvhost-tsg-gpu")]
+    NotATimesliceGroup {
+        /// The fd.
+        fd: u32,
+    },
+    /// A bound channel whose fd was never handed out.
+    #[error("channel fd {fd} is bound to a timeslice group but was never handed out")]
+    ChannelNotIssued {
+        /// The channel's fd.
+        fd: u32,
+    },
 }
 
 impl TryFrom<SavedNvsrvState> for NvsrvState {
@@ -431,6 +503,8 @@ impl TryFrom<SavedNvsrvState> for NvsrvState {
             files,
             next_fd,
             nvmap,
+            as_gpu,
+            tsg_gpu,
         } = saved;
         if !(FIRST_FD..=FD_END).contains(&next_fd) {
             return Err(NvsrvStateError::NextFd { next: next_fd });
@@ -441,10 +515,25 @@ impl TryFrom<SavedNvsrvState> for NvsrvState {
         if let Some(&fd) = files.keys().find(|&&fd| fd < FIRST_FD || fd >= next_fd) {
             return Err(NvsrvStateError::NotIssued { fd });
         }
+        let open_as = |fd: &u32, device: Device| files.get(fd) == Some(&device);
+        if let Some(fd) = as_gpu.fds().find(|fd| !open_as(fd, Device::NvhostAsGpu)) {
+            return Err(NvsrvStateError::NotAnAddressSpace { fd });
+        }
+        if let Some(fd) = tsg_gpu.fds().find(|fd| !open_as(fd, Device::NvhostTsgGpu)) {
+            return Err(NvsrvStateError::NotATimesliceGroup { fd });
+        }
+        if let Some(fd) = tsg_gpu
+            .channels()
+            .find(|&fd| fd < FIRST_FD || fd >= next_fd)
+        {
+            return Err(NvsrvStateError::ChannelNotIssued { fd });
+        }
         Ok(Self {
             files,
             next_fd,
             nvmap,
+            as_gpu,
+            tsg_gpu,
         })
     }
 }
@@ -469,6 +558,8 @@ impl NvsrvState {
             files: BTreeMap::new(),
             next_fd: FIRST_FD,
             nvmap: NvMap::new(),
+            as_gpu: AsGpu::new(),
+            tsg_gpu: TsgGpu::new(),
         }
     }
 
@@ -476,6 +567,18 @@ impl NvsrvState {
     #[must_use]
     pub const fn nvmap(&self) -> &NvMap {
         &self.nvmap
+    }
+
+    /// The nvhost-as-gpu fds' views.
+    #[must_use]
+    pub const fn as_gpu(&self) -> &AsGpu {
+        &self.as_gpu
+    }
+
+    /// The nvhost-tsg-gpu fds' groups.
+    #[must_use]
+    pub const fn tsg_gpu(&self) -> &TsgGpu {
+        &self.tsg_gpu
     }
 
     /// How many files are open.
@@ -522,13 +625,18 @@ impl NvsrvState {
         (fd, NvResult::Success)
     }
 
-    /// `Close` (`Module::Close`).
+    /// `Close` (`Module::Close`): an as-gpu fd's view and a tsg-gpu fd's group go with it.
     pub fn close(&mut self, fd: i32) -> NvResult {
-        match key(fd).map(|key| self.files.remove(&key)) {
-            Err(result) => result,
-            Ok(None) => NvResult::NotImplemented,
-            Ok(Some(_)) => NvResult::Success,
+        let key = match key(fd) {
+            Ok(key) => key,
+            Err(result) => return result,
+        };
+        if self.files.remove(&key).is_none() {
+            return NvResult::NotImplemented;
         }
+        self.as_gpu.close(key);
+        self.tsg_gpu.close(key);
+        NvResult::Success
     }
 
     /// `QueryEvent` (`Module::QueryEvent`): no device has events in this slice (module docs).
@@ -546,26 +654,35 @@ impl NvsrvState {
         }
     }
 
-    /// An ioctl on `fd` with argument `input`: the fd checks, then the device, then the policy for
-    /// an ioctl the device does not know (module docs, "Ioctls").
+    /// `call`: the fd checks, then the device, then the policy for an ioctl the device does not
+    /// know (module docs, "Ioctls"). nvhost-as-gpu acts on `gpu`.
     pub fn ioctl(
         &mut self,
         policy: UnknownPolicy,
-        variant: IoctlVariant,
-        fd: i32,
-        ioctl: Ioctl,
-        input: &[u8],
+        call: &IoctlCall<'_>,
+        gpu: GpuAccess<'_>,
     ) -> IoctlAnswer {
+        let IoctlCall {
+            variant, fd, ioctl, ..
+        } = *call;
         let device = match self.file(fd) {
             Ok(device) => device,
             Err(result) => return IoctlAnswer::only(result),
         };
+        // `file` checked the fd, so it is not negative.
+        let key = key(fd).unwrap_or_default();
         let known = match (device, variant) {
-            (Device::Nvmap, IoctlVariant::Ioctl) => self.nvmap.ioctl(ioctl, input),
+            (Device::Nvmap, IoctlVariant::Ioctl) => self
+                .nvmap
+                .ioctl(ioctl, call.input)
+                .map(|(result, output)| IoctlAnswer::with(result, output)),
+            (Device::NvhostCtrlGpu, IoctlVariant::Ioctl3) => ctrl_gpu::ioctl3(call),
+            (Device::NvhostAsGpu, _) => self.as_gpu.ioctl(key, call, gpu),
+            (Device::NvhostTsgGpu, _) => self.tsg_gpu.ioctl(key, call, &self.files),
             _ => None,
         };
-        if let Some((result, output)) = known {
-            return IoctlAnswer { result, output };
+        if let Some(answer) = known {
+            return answer;
         }
         tracing::warn!(
             device = device.path(),
@@ -577,10 +694,10 @@ impl NvsrvState {
         );
         match policy {
             UnknownPolicy::Strict => IoctlAnswer::only(NvResult::NotImplemented),
-            UnknownPolicy::AutoStub => IoctlAnswer {
-                result: NvResult::Success,
-                output: vec![0; usize::try_from(ioctl.size()).unwrap_or_default()],
-            },
+            UnknownPolicy::AutoStub => IoctlAnswer::with(
+                NvResult::Success,
+                vec![0; usize::try_from(ioctl.size()).unwrap_or_default()],
+            ),
         }
     }
 }
@@ -626,7 +743,7 @@ impl Nvsrv {
         // One byte past the longest path: a path that long has no zero byte where any device's
         // would end, so it names none, and nothing further need be read.
         let path = read_in(cx, req, 0, LONGEST_PATH + 1)?;
-        let (fd, result) = cx.family::<NvsrvState>()?.open(&path);
+        let (fd, result) = cx.family::<NvsrvFamily>()?.state.open(&path);
         reply.payload().write_i32(fd).write_u32(result.raw());
         reply.ok()
     }
@@ -649,7 +766,7 @@ impl Nvsrv {
     /// `Close` (2). in: `s32` fd. out: the result.
     fn close(_: &mut Self, cx: &mut Context<'_>, req: &Request<'_>, reply: &mut Reply) -> Outcome {
         let fd = req.payload().read_i32()?;
-        let result = cx.family::<NvsrvState>()?.close(fd);
+        let result = cx.family::<NvsrvFamily>()?.state.close(fd);
         reply.payload().write_u32(result.raw());
         reply.ok()
     }
@@ -675,7 +792,7 @@ impl Nvsrv {
         let mut payload = req.payload();
         let fd = payload.read_i32()?;
         let event = payload.read_u32()?;
-        let result = cx.family::<NvsrvState>()?.query_event(fd, event);
+        let result = cx.family::<NvsrvFamily>()?.state.query_event(fd, event);
         reply.payload().write_u32(result.raw());
         reply.ok()
     }
@@ -731,18 +848,51 @@ fn run_ioctl(
     let ioctl = Ioctl::from_raw(payload.read_u32()?);
     let limit = usize::try_from(MAX_ARGUMENT_BYTES).unwrap_or_default();
     let input = read_in(cx, req, 0, limit)?;
+    let out_len = out_buffer_len(cx, req, 0)?;
+    let inline_out_len = if variant == IoctlVariant::Ioctl3 {
+        out_buffer_len(cx, req, 1)?
+    } else {
+        0
+    };
+    let call = IoctlCall {
+        variant,
+        fd,
+        ioctl,
+        input: &input,
+        out_len,
+        inline_out_len,
+    };
     let policy = cx.policy();
-    let answer = cx
-        .family::<NvsrvState>()?
-        .ioctl(policy, variant, fd, ioctl, &input);
+    let answer = cx.family::<NvsrvFamily>()?.ioctl(policy, &call);
     if ioctl.is_out() {
-        let mut out = req.out_buffer(cx, 0)?;
-        let len = usize::try_from(out.len())
-            .map_or(answer.output.len(), |len| len.min(answer.output.len()));
-        out.write(answer.output.get(..len).unwrap_or_default())?;
+        write_out(cx, req, 0, &answer.output)?;
+        if variant == IoctlVariant::Ioctl3 && !answer.inline.is_empty() {
+            write_out(cx, req, 1, &answer.inline)?;
+        }
     }
     reply.payload().write_u32(answer.result.raw());
     reply.ok()
+}
+
+/// Out buffer `index`'s size; 0 when the request has none (Eden `GetWriteBufferSize`).
+fn out_buffer_len(cx: &mut Context<'_>, req: &Request<'_>, index: usize) -> Result<usize, Fault> {
+    match req.out_buffer(cx, index) {
+        Ok(buffer) => Ok(usize::try_from(buffer.len()).unwrap_or(usize::MAX)),
+        Err(Fault::NoBuffer { .. }) => Ok(0),
+        Err(fault) => Err(fault),
+    }
+}
+
+/// Writes `bytes` to the start of out buffer `index`, clipped to the buffer.
+fn write_out(
+    cx: &mut Context<'_>,
+    req: &Request<'_>,
+    index: usize,
+    bytes: &[u8],
+) -> Result<(), Fault> {
+    let mut out = req.out_buffer(cx, index)?;
+    let len = usize::try_from(out.len()).map_or(bytes.len(), |len| len.min(bytes.len()));
+    out.write(bytes.get(..len).unwrap_or_default())
 }
 
 /// The interfaces an nvsrv server's sessions can be.
@@ -751,12 +901,76 @@ pub fn nvsrv_interfaces() -> Interfaces {
     Interfaces::new().with::<Nvsrv>()
 }
 
-/// The nvsrv server: every session an [`Nvsrv`], sharing one [`NvsrvState`]. `policy` answers
-/// unknown commands and, inside `Ioctl`, unknown ioctls (module docs).
+/// The nvsrv server's family: the state every session shares ([`NvsrvState`]), and the wiring
+/// nvhost-as-gpu reaches gsv's GPU memory through: gsv's shared state and the GPU's front.
+/// Only the state is saved; the wiring is the run's.
+pub struct NvsrvFamily {
+    state: NvsrvState,
+    shared: Arc<Shared>,
+    front: Arc<dyn GpuVmFront>,
+}
+
+impl NvsrvFamily {
+    /// A new state over `shared`'s GPU memory and `front`.
+    #[must_use]
+    pub fn new(shared: Arc<Shared>, front: Arc<dyn GpuVmFront>) -> Self {
+        Self {
+            state: NvsrvState::new(),
+            shared,
+            front,
+        }
+    }
+
+    /// The same wiring with `state` in place of the state.
+    #[must_use]
+    pub fn with_state(self, state: NvsrvState) -> Self {
+        Self { state, ..self }
+    }
+
+    /// The state.
+    #[must_use]
+    pub const fn state(&self) -> &NvsrvState {
+        &self.state
+    }
+
+    /// [`NvsrvState::ioctl`] with gsv's shared lock held, taken for every ioctl. No device calls
+    /// the kernel, so nothing is called under it but the GPU's front, which never calls back into
+    /// gsv (`crate::gpu`, "The server").
+    pub fn ioctl(&mut self, policy: UnknownPolicy, call: &IoctlCall<'_>) -> IoctlAnswer {
+        let shared = Arc::clone(&self.shared);
+        let mut locked = shared.lock();
+        let gpu = GpuAccess {
+            memory: locked.gpu(),
+            front: &*self.front,
+        };
+        self.state.ioctl(policy, call, gpu)
+    }
+}
+
+impl Family for NvsrvFamily {
+    /// The state, as [`NvsrvState`] saves itself.
+    fn save_state(&self) -> Result<Vec<u8>, SnapshotError> {
+        self.state.save_state()
+    }
+
+    /// Replaces the state with what `bytes` hold, validated ([`NvsrvStateError`]); on an error
+    /// the state is unchanged. The wiring stays.
+    fn load_state(&mut self, bytes: &[u8]) -> Result<(), SnapshotError> {
+        self.state.load_state(bytes)
+    }
+}
+
+/// The nvsrv server: every session an [`Nvsrv`], sharing one [`NvsrvState`], whose
+/// nvhost-as-gpu fds act on `shared`'s GPU memory and `front`. `policy` answers unknown commands
+/// and, inside `Ioctl`, unknown ioctls (module docs).
 #[must_use]
-pub fn nvsrv_server(policy: UnknownPolicy) -> Server {
+pub fn nvsrv_server(
+    shared: Arc<Shared>,
+    front: Arc<dyn GpuVmFront>,
+    policy: UnknownPolicy,
+) -> Server {
     Server::new(NVSRV_NAME, policy)
         .with_root(|| Box::new(Nvsrv))
         .with_interfaces(nvsrv_interfaces())
-        .with_family(NvsrvState::new())
+        .with_family(NvsrvFamily::new(shared, front))
 }
