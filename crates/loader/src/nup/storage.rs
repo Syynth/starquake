@@ -35,7 +35,8 @@
 //!
 //! The cache and the record of failures each sit behind a mutex; neither is held while the
 //! other is taken. The cache's lock is held while a file decompresses, so a second read of a file
-//! that is being decompressed waits for it rather than decompressing it again.
+//! that is being decompressed waits for it rather than decompressing it again. Pinned by
+//! `two_threads_reading_one_compressed_file_decompress_it_once`.
 
 use std::collections::BTreeMap;
 use std::io;

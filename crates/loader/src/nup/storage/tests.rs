@@ -3,7 +3,7 @@
 //! sizes.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Condvar, mpsc};
 use std::time::Duration;
 
 use super::*;
@@ -233,6 +233,77 @@ fn two_threads_read_two_files_at_once() {
         let matched = results.recv_timeout(Duration::from_secs(30)).unwrap();
         assert!(matched);
     }
+}
+
+/// How long [`Gate`] holds the first read of its watched offset for a second one to arrive.
+const GATE_HOLD: Duration = Duration::from_millis(300);
+
+/// A source that counts the reads starting at `watched` (each decompression of the file whose
+/// extent starts there begins with one) and holds the first such read until a second one
+/// arrives or [`GATE_HOLD`] passes, telling `entered` when it starts holding.
+struct Gate {
+    bytes: Vec<u8>,
+    watched: u64,
+    starts: Mutex<usize>,
+    changed: Condvar,
+    entered: Mutex<mpsc::Sender<()>>,
+}
+
+impl ReadAt for Gate {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+        if offset == self.watched {
+            let mut starts = self.starts.lock().unwrap();
+            *starts += 1;
+            if *starts == 1 {
+                self.entered.lock().unwrap().send(()).unwrap();
+                drop(
+                    self.changed
+                        .wait_timeout_while(starts, GATE_HOLD, |starts| *starts < 2)
+                        .unwrap(),
+                );
+            } else {
+                self.changed.notify_all();
+            }
+        }
+        self.bytes.read_at(offset, buf)
+    }
+
+    fn size(&self) -> io::Result<u64> {
+        self.bytes.size()
+    }
+}
+
+#[test]
+fn two_threads_reading_one_compressed_file_decompress_it_once() {
+    let built = container(&files());
+    let path = "data/deep/also.zst";
+    let (entered, entries) = mpsc::channel();
+    let gate = Arc::new(Gate {
+        bytes: built.bytes.clone(),
+        watched: u64::try_from(built.layout.extents[index(&built, path)].0).unwrap(),
+        starts: Mutex::new(0),
+        changed: Condvar::new(),
+        entered: Mutex::new(entered),
+    });
+    let nup = Nup::open(Positional::new(Arc::clone(&gate))).unwrap();
+    let dir = DirId(u32::try_from(built.dir_index(0, ROMFS_DIR_NAME).unwrap()).unwrap());
+    let storage = Arc::new(RomFsStorage::new(nup, dir, CACHE_CAP).unwrap());
+    let (done, results) = mpsc::channel();
+    let reader = || {
+        let storage = Arc::clone(&storage);
+        let done = done.clone();
+        std::thread::spawn(move || done.send(read_file(&*storage, path)).unwrap())
+    };
+    // The first reader is inside the decompression, holding at the source, when the second
+    // starts: the second must wait for the first's bytes rather than start its own.
+    reader();
+    entries.recv_timeout(Duration::from_secs(30)).unwrap();
+    reader();
+    for _ in 0..2 {
+        let read = results.recv_timeout(Duration::from_secs(30)).unwrap();
+        assert_eq!(read.unwrap(), pattern(1000, 5));
+    }
+    assert_eq!(*gate.starts.lock().unwrap(), 1);
 }
 
 /// The index of `path` (from the `RomFS` root) in `built`'s base package.
