@@ -178,6 +178,15 @@ impl Direct {
         self.state.ioctl(policy, &call, gpu)
     }
 
+    /// Closes `fd` over this memory and front.
+    pub(super) fn close(&mut self, fd: i32) -> NvResult {
+        let gpu = GpuAccess {
+            memory: &mut self.memory,
+            front: &self.front,
+        };
+        self.state.close(fd, gpu)
+    }
+
     /// `raw` on `fd` through `Ioctl`, strict, out buffer 0 the input's size.
     pub(super) fn ioctl(&mut self, fd: i32, raw: u32, input: &[u8]) -> IoctlAnswer {
         let sizes = (input.len(), 0);
