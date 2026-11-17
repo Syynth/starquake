@@ -26,6 +26,15 @@
 //!   `KSharedMemory::Map` and `Unmap` call with `KMemoryState::Shared`;
 //!   `LockForTransferMemory` and `UnlockForTransferMemory`, through `LockMemoryAndOpen` and
 //!   `UnlockMemory`.
+//! - `eden/src/core/hle/kernel/k_page_table_base.cpp` and `.h` @ cf654052, for the alias
+//!   region's own memory: `MapPhysicalMemory`, `UnmapPhysicalMemory`, `IsInAliasRegion` and
+//!   `m_mapped_physical_memory_size`, which `GetNormalMemorySize` adds. Eden-NX2's and PR
+//!   #4588's copies of the three functions are Eden's, line for line
+//!   (`eden-nx2/src/core/hle/kernel/k_page_table_base.cpp` @ 50fa86bb,
+//!   `eden-pr4588/src/core/hle/kernel/k_page_table_base.cpp` @ e5fb3b97). What Switch 2 changes
+//!   is the alias region's size, which the layout already scales (`memory::layout`; scoping
+//!   doc, "Process, memory, kernel": the alias region is "up to 8x" the heap region, and a
+//!   title "puts a 6.33 GiB VAMM-backed root heap in the alias region", row 80).
 //!
 //! Each operation checks the block map, makes the change real through the [`Mapper`], and
 //! then updates the block map, in Eden's order (`Operate`, then `m_memory_block_manager.Update`).
@@ -45,8 +54,9 @@
 //!   ([`crate::svc::memory`] does the same), and the page table then asserts it. Test:
 //!   `a_range_that_is_not_whole_pages_inside_the_address_space_is_invalid_current_memory`.
 //! - **No physical pages.** Eden takes pages from the pool's page heap and can fail with
-//!   `ResultOutOfMemory` when the heap has none. Here the pool is a count ([`MemoryLimit`]):
-//!   a reservation that fits always gets its memory, lazily backed by the execution model.
+//!   `ResultOutOfMemory` when the heap has none (`MapPhysicalMemory` among others, through
+//!   `AllocateForProcess`). Here the pool is a count ([`MemoryLimit`]): a reservation that fits
+//!   always gets its memory, lazily backed by the execution model.
 //! - **`SetMemoryAttribute` with `Uncached` does not call the [`Mapper`].** Eden re-applies
 //!   the block's unchanged permission with a cache flag (`Operate` with
 //!   `ChangePermissionsAndRefreshAndFlush`), which its emulated page table ignores. Test:
@@ -57,11 +67,26 @@
 //!   address space. Eden-NX2 adds the alias region's size for a Switch 2 program
 //!   (`eden-nx2/src/core/hle/kernel/k_process.cpp` @ 50fa86bb, `LoadFromMetadata`); that
 //!   lands with process creation (kernel slice 8), which knows what a program was built for.
-//! - **`MapPhysicalMemory` is not built**, so [`AddressSpace::normal_memory_size`] is the
-//!   heap alone; Eden adds `m_mapped_physical_memory_size`.
 //! - **A failed [`Mapper`]** ends the operation as an internal failure with nothing changed.
 //!   Eden's `Operate` cannot fail on the paths ported here. Test:
-//!   `a_refusing_translation_fails_the_call_and_changes_nothing`.
+//!   `a_refusing_translation_fails_the_call_and_changes_nothing`. The two physical memory
+//!   calls make one [`Mapper`] call per run of pages they change, so one can fail after
+//!   others succeeded; they leave the bookkeeping saying what the translation then holds.
+//!   [`AddressSpace::map_physical_memory`] unmaps what it mapped and releases the memory, as
+//!   Eden's `ON_RESULT_FAILURE` does, and keeps as mapped physical memory any piece whose
+//!   unmap fails too (Eden asserts that unmap, `R_ASSERT`). Tests (in
+//!   `memory/space/physical_tests.rs`):
+//!   `a_map_refused_partway_unmaps_what_it_mapped_and_releases_the_memory` and
+//!   `a_piece_whose_undo_fails_too_stays_mapped_and_counted`.
+//!   [`AddressSpace::unmap_physical_memory`] frees and releases the pieces it unmapped before
+//!   the refusal (Eden asserts every unmap). Test:
+//!   `an_unmap_refused_partway_frees_what_it_unmapped`.
+//! - **The physical memory calls' page-table half checks the range itself.** Eden's
+//!   `KPageTableBase::MapPhysicalMemory` and `UnmapPhysicalMemory` trust the system call to
+//!   have checked that the range lies inside the alias region. Here they check it again, with
+//!   the system call's result (`ResultInvalidMemoryRegion`), after the whole-pages check above,
+//!   so a range outside the alias region cannot reach the block map from any caller. Test:
+//!   `the_page_table_half_checks_pages_then_the_alias_region`.
 //! - **No page groups.** `UnmapPageGroup` checks that the range holds the shared memory's own
 //!   pages (`IsValidPageGroup`, `ResultInvalidCurrentMemory` otherwise). With no physical pages
 //!   to compare, the address space records which shared memory each mapping it made holds and
@@ -138,7 +163,7 @@ use std::collections::BTreeMap;
 use starquake_memory::{BackingRange, PAGE_SIZE};
 
 use super::block::MemoryBlock;
-use super::block_map::{BlockMap, BlockMapError, DeviceLock};
+use super::block_map::{BlockMap, BlockMapError, DeviceLock, Properties};
 use super::layout::{LayoutError, LayoutRequest, Region, RegionOffsets, Regions, pages_to_bytes};
 use super::mapper::{Mapper, MapperError};
 use super::pool::{MemoryArrangement, MemoryLimit};
@@ -346,8 +371,47 @@ pub struct AddressSpace {
     /// The live device-share locks by exact range, `(address, size)`: how many were taken on
     /// the range and not yet released. A count is never zero; a range with none is absent.
     device_locks: BTreeMap<(u64, u64), u32>,
+    /// Bytes `MapPhysicalMemory` has mapped and `UnmapPhysicalMemory` has not unmapped
+    /// (`m_mapped_physical_memory_size`).
+    mapped_physical_memory_size: u64,
     mapper: Box<dyn Mapper>,
 }
+
+/// The part of one block that lies inside a range: what Eden's physical memory calls look at
+/// as they walk the blocks of their range.
+#[derive(Debug, Clone, Copy)]
+struct Piece {
+    /// The first address of the piece: the range's start or the block's, whichever is higher.
+    address: u64,
+    /// The bytes of the piece.
+    size: u64,
+    /// The block it lies in.
+    block: MemoryBlock,
+}
+
+impl Piece {
+    const fn pages(&self) -> u64 {
+        self.size / PAGE_SIZE
+    }
+
+    fn is_free(&self) -> bool {
+        self.block.state() == MemoryState::Free
+    }
+}
+
+/// Free memory: what `MapPhysicalMemory` maps, and what `UnmapPhysicalMemory` leaves.
+const FREE: Properties = Properties {
+    state: MemoryState::Free,
+    permission: MemoryPermission::NONE,
+    attribute: MemoryAttribute::NONE,
+};
+
+/// What `MapPhysicalMemory` maps: `Normal`, read-write for the user, no attributes.
+const PHYSICAL: Properties = Properties {
+    state: MemoryState::Normal,
+    permission: MemoryPermission::USER_READ_WRITE,
+    attribute: MemoryAttribute::NONE,
+};
 
 impl fmt::Debug for AddressSpace {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -362,6 +426,10 @@ impl fmt::Debug for AddressSpace {
             .field("main_thread_stack_size", &self.main_thread_stack_size)
             .field("shared", &self.shared)
             .field("device_locks", &self.device_locks)
+            .field(
+                "mapped_physical_memory_size",
+                &self.mapped_physical_memory_size,
+            )
             .finish_non_exhaustive()
     }
 }
@@ -411,6 +479,7 @@ impl AddressSpace {
             main_thread_stack_size: 0,
             shared: BTreeMap::new(),
             device_locks: BTreeMap::new(),
+            mapped_physical_memory_size: 0,
             mapper,
         };
         // Reserve memory for our code resource.
@@ -459,14 +528,24 @@ impl AddressSpace {
         self.max_heap_size
     }
 
-    /// Bytes of heap (`GetNormalMemorySize`; see "Divergences" in the module docs).
+    /// Bytes of heap and of memory [`Self::map_physical_memory`] mapped (`GetNormalMemorySize`:
+    /// `(m_current_heap_end - m_heap_region_start) + m_mapped_physical_memory_size`).
     #[must_use]
     pub const fn normal_memory_size(&self) -> u64 {
         self.heap_size()
+            .saturating_add(self.mapped_physical_memory_size)
+    }
+
+    /// Bytes [`Self::map_physical_memory`] has mapped and [`Self::unmap_physical_memory`] has
+    /// not unmapped (`m_mapped_physical_memory_size`).
+    #[must_use]
+    pub const fn mapped_physical_memory_size(&self) -> u64 {
+        self.mapped_physical_memory_size
     }
 
     /// The memory the process uses (`KProcess::GetUsedUserPhysicalMemorySize`, with no secure
-    /// system resource): its heap, its code and its main thread's stack.
+    /// system resource): its normal memory ([`Self::normal_memory_size`]: the heap and the
+    /// memory `MapPhysicalMemory` mapped), its code and its main thread's stack.
     #[must_use]
     pub const fn used_user_physical_memory_size(&self) -> u64 {
         self.normal_memory_size()
@@ -1167,6 +1246,273 @@ impl AddressSpace {
         self.apply(address, pages, change, effect)
     }
 
+    /// Whether the `size` bytes at `address` lie inside the alias region (`IsInAliasRegion`:
+    /// inside the address space, `Contains`, and from the alias region's start to its last
+    /// byte). False for an empty range and for one that wraps.
+    #[must_use]
+    pub fn is_in_alias_region(&self, address: u64, size: u64) -> bool {
+        self.regions.contains(address, size) && self.regions.alias.holds(address, size)
+    }
+
+    /// The pieces of the `size` bytes at `address`, in address order: one for each block the
+    /// range touches, cut to the range. The range is not empty and lies inside the address
+    /// space (the callers check [`Self::pages_of`] first), so the walk ends at the block that
+    /// holds its last byte; the block map running out before that is an internal failure.
+    fn pieces(&self, address: u64, size: u64) -> CallResult<Vec<Piece>> {
+        let last = size
+            .checked_sub(1)
+            .and_then(|offset| address.checked_add(offset))
+            .ok_or(KernelError::InvalidCurrentMemory)?;
+        let mut pieces = Vec::new();
+        let mut cursor = address;
+        for block in self.blocks.blocks_from(address) {
+            // `block` holds `cursor`: the first holds `address`, each next one starts where
+            // the one before ended.
+            let piece_last = block.last().min(last);
+            pieces.push(Piece {
+                address: cursor,
+                size: piece_last - cursor + 1,
+                block: *block,
+            });
+            // Check if we're done.
+            if last <= block.last() {
+                return Ok(pieces);
+            }
+            // Advance. (`block.last() < last`, so this does not overflow.)
+            cursor = block.last() + 1;
+        }
+        Err(broken(BlockMapError::Broken { address: cursor }))
+    }
+
+    /// Maps fresh read-write memory over every free page of the `size` bytes at `address`
+    /// (`KPageTableBase::MapPhysicalMemory`): what the guest uses as memory of its own in the
+    /// alias region. Pages that are not free, whatever their state, are left as they are and
+    /// count as mapped already. The new pages are [`MemoryState::Normal`], read-write for the
+    /// user, and count in [`Self::normal_memory_size`].
+    ///
+    /// In this order: [`KernelError::InvalidCurrentMemory`] unless the range is whole pages
+    /// inside the address space (see "Divergences" in the module docs), then
+    /// [`KernelError::InvalidMemoryRegion`] unless it lies inside the alias region
+    /// ([`Self::is_in_alias_region`]; the system call checks both first, with
+    /// `ResultInvalidMemoryRegion`), then [`KernelError::LimitReached`] when the pool has no
+    /// room for the free pages. Nothing changes on any of these, nor when every page is mapped
+    /// already, which succeeds.
+    ///
+    /// A failed [`Mapper`] is an internal failure. The pages mapped before it are unmapped and
+    /// their memory released, as Eden's `ON_RESULT_FAILURE` does; a page whose unmap fails as
+    /// well stays mapped, and is recorded and counted as mapped physical memory, so the
+    /// bookkeeping says what the translation holds (module docs, "Divergences").
+    pub fn map_physical_memory(&mut self, address: u64, size: u64) -> CallResult<()> {
+        let pages = self.pages_of(address, size)?;
+        if !self.is_in_alias_region(address, size) {
+            return Err(KernelError::InvalidMemoryRegion.into());
+        }
+        // Check if the memory is already mapped: every piece that is not free counts.
+        let pieces = self.pieces(address, size)?;
+        let mapped_size: u64 = pieces
+            .iter()
+            .filter(|piece| !piece.is_free())
+            .map(|piece| piece.size)
+            .sum();
+        // If the size mapped is the size requested, we've nothing to do.
+        if size == mapped_size {
+            return Ok(());
+        }
+        // Reserve the memory from the process resource limit. (The pieces are the range, so
+        // `mapped_size < size`.)
+        let unmapped = size - mapped_size;
+        self.limit.reserve(unmapped)?;
+        // Map the free pieces.
+        let free: Vec<Piece> = pieces.into_iter().filter(Piece::is_free).collect();
+        let perms = PHYSICAL.permission.guest().ok_or_else(|| {
+            SvcError::Internal("read-write memory has no translation".into())
+        })?;
+        for (index, piece) in free.iter().enumerate() {
+            if let Err(error) = self.mapper.map(piece.address, piece.size, perms) {
+                let mapped = free.get(..index).unwrap_or_default();
+                return Err(self.undo_physical_map(mapped, unmapped, piece, &error));
+            }
+        }
+        // We succeeded, so commit the memory reservation, and increase our tracked mapped size.
+        self.add_physical(unmapped)?;
+        // Update the relevant memory blocks. (Eden passes a barrier to set when the range
+        // starts at the alias region's start, which `UpdateIfMatch` never sets; see
+        // `BlockMap::update_if_match`.)
+        self.blocks
+            .update_if_match(address, pages, FREE, PHYSICAL, DisableMerge::NONE)
+            .map_err(broken)
+    }
+
+    /// Counts `bytes` more of mapped physical memory.
+    fn add_physical(&mut self, bytes: u64) -> CallResult<()> {
+        self.mapped_physical_memory_size = self
+            .mapped_physical_memory_size
+            .checked_add(bytes)
+            .ok_or_else(|| SvcError::Internal("the mapped physical memory overflowed".into()))?;
+        Ok(())
+    }
+
+    /// Counts `bytes` less of mapped physical memory. More than is counted is the kernel's own
+    /// miscount.
+    fn remove_physical(&mut self, bytes: u64) -> CallResult<()> {
+        self.mapped_physical_memory_size = self
+            .mapped_physical_memory_size
+            .checked_sub(bytes)
+            .ok_or_else(|| {
+                SvcError::Internal(format!(
+                    "unmapping {bytes:#x} bytes of physical memory of which only {:#x} are mapped",
+                    self.mapped_physical_memory_size
+                ))
+            })?;
+        Ok(())
+    }
+
+    /// What [`Self::map_physical_memory`] does when the [`Mapper`] refuses to map `failed`
+    /// after it mapped the pieces `mapped` (Eden's `ON_RESULT_FAILURE`): unmaps them and
+    /// releases the `reserved` bytes. A piece whose unmap fails too is still mapped: it becomes
+    /// mapped physical memory in the blocks and the count, and keeps its part of the
+    /// reservation. Returns the error the call fails with.
+    fn undo_physical_map(
+        &mut self,
+        mapped: &[Piece],
+        reserved: u64,
+        failed: &Piece,
+        error: &MapperError,
+    ) -> SvcError {
+        let mut messages = vec![format!(
+            "the translation refused to map {:#x} bytes at {:#x}: {error}",
+            failed.size, failed.address
+        )];
+        let mut kept = 0_u64;
+        for piece in mapped {
+            if let Err(error) = self.mapper.unmap(piece.address, piece.size) {
+                messages.push(format!(
+                    "undoing the map of {:#x} bytes at {:#x} failed too, so they stay mapped: \
+                     {error}",
+                    piece.size, piece.address
+                ));
+                kept = kept.saturating_add(piece.size);
+                if let Err(error) = self.blocks.update_if_match(
+                    piece.address,
+                    piece.pages(),
+                    FREE,
+                    PHYSICAL,
+                    DisableMerge::NONE,
+                ) {
+                    return broken(error);
+                }
+            }
+        }
+        let recorded = self
+            .add_physical(kept)
+            .and_then(|()| self.release(reserved.saturating_sub(kept)));
+        match recorded {
+            Ok(()) => SvcError::Internal(messages.join("; ")),
+            Err(error) => error,
+        }
+    }
+
+    /// Unmaps every page of the `size` bytes at `address` that [`Self::map_physical_memory`]
+    /// mapped and gives its memory back (`KPageTableBase::UnmapPhysicalMemory`). Free pages in
+    /// the range are left free.
+    ///
+    /// In this order: [`KernelError::InvalidCurrentMemory`] unless the range is whole pages
+    /// inside the address space (module docs, "Divergences"), then
+    /// [`KernelError::InvalidMemoryRegion`] unless it lies inside the alias region (the system
+    /// call checks both first), then [`KernelError::InvalidCurrentMemory`] unless every block
+    /// the range touches is free, or is [`MemoryState::Normal`] with no attributes at all.
+    /// Nothing changes on any of these, nor when nothing in the range is mapped, which
+    /// succeeds.
+    ///
+    /// A failed [`Mapper`] is an internal failure. The pieces it unmapped before the one it
+    /// refused are freed and their memory released, so the bookkeeping says what the
+    /// translation holds (module docs, "Divergences"); Eden asserts the unmap succeeds.
+    pub fn unmap_physical_memory(&mut self, address: u64, size: u64) -> CallResult<()> {
+        let pages = self.pages_of(address, size)?;
+        if !self.is_in_alias_region(address, size) {
+            return Err(KernelError::InvalidMemoryRegion.into());
+        }
+        // Check if the memory is mapped, and verify the memory's state.
+        let pieces = self.pieces(address, size)?;
+        let mut mapped_size = 0_u64;
+        for piece in &pieces {
+            let is_normal = piece.block.state() == MemoryState::Normal
+                && piece.block.attribute() == MemoryAttribute::NONE;
+            if is_normal {
+                // The pieces are the range, so the sum is at most `size`.
+                mapped_size += piece.size;
+            } else if !piece.is_free() {
+                return Err(KernelError::InvalidCurrentMemory.into());
+            }
+        }
+        // If there's nothing mapped, we've nothing to do.
+        if mapped_size == 0 {
+            return Ok(());
+        }
+        // The first block's barrier goes if it is mapped physical memory that starts both the
+        // range and the alias region.
+        let clear = match pieces.first() {
+            Some(first)
+                if first.block.state() == MemoryState::Normal
+                    && first.block.address() == self.regions.alias.start
+                    && first.block.address() == address =>
+            {
+                DisableMerge::NORMAL
+            }
+            _ => DisableMerge::NONE,
+        };
+        // Unmap the mapped pieces.
+        let normal: Vec<Piece> = pieces.into_iter().filter(|piece| !piece.is_free()).collect();
+        for (index, piece) in normal.iter().enumerate() {
+            if let Err(error) = self.mapper.unmap(piece.address, piece.size) {
+                let unmapped = normal.get(..index).unwrap_or_default();
+                let message = format!(
+                    "the translation refused to unmap {:#x} bytes at {:#x}: {error}",
+                    piece.size, piece.address
+                );
+                self.free_physical(unmapped, clear)?;
+                return Err(SvcError::Internal(message));
+            }
+        }
+        // Release the memory resource.
+        self.remove_physical(mapped_size)?;
+        self.release(mapped_size)?;
+        // Update memory blocks.
+        self.blocks
+            .update(
+                address,
+                pages,
+                FREE.state,
+                FREE.permission,
+                FREE.attribute,
+                DisableMerge::NONE,
+                clear,
+            )
+            .map_err(broken)
+    }
+
+    /// Records the `unmapped` pieces of mapped physical memory as free, removing `clear` from
+    /// their barriers, and releases their memory: what [`Self::unmap_physical_memory`] keeps of
+    /// an unmap the [`Mapper`] refused partway.
+    fn free_physical(&mut self, unmapped: &[Piece], clear: DisableMerge) -> CallResult<()> {
+        for piece in unmapped {
+            self.blocks
+                .update(
+                    piece.address,
+                    piece.pages(),
+                    FREE.state,
+                    FREE.permission,
+                    FREE.attribute,
+                    DisableMerge::NONE,
+                    clear,
+                )
+                .map_err(broken)?;
+            self.remove_physical(piece.size)?;
+            self.release(piece.size)?;
+        }
+        Ok(())
+    }
+
     /// Whether every page the `size` bytes at `address` touch has
     /// [`MemoryAttribute::GPU_ACCESSIBLE`], the attribute `svc 0x80` sets: the graphics
     /// server's range query (kernel spec, "Address space"), PR #4588's walk of `QueryInfo`
@@ -1372,3 +1718,6 @@ mod tests;
 
 #[cfg(test)]
 mod device_tests;
+
+#[cfg(test)]
+mod physical_tests;

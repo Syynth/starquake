@@ -219,8 +219,8 @@ use crate::result::{CallResult, KernelError, ResultCode, SvcError};
 use crate::sched::CoreId;
 use crate::svc::exception::Break;
 use crate::svc::{
-    Convention, ConventionError, DebugSink, Kind, Status, SvcId, debug, handle, memory, processor,
-    thread, tick, transfer_memory,
+    Convention, ConventionError, DebugSink, Kind, Status, SvcId, debug, handle, memory,
+    physical_memory, processor, thread, tick, transfer_memory,
 };
 use crate::tables::{AddressSpace, Processes, Scheduler};
 
@@ -852,6 +852,9 @@ impl Dispatcher {
                 query_memory(space, call.caller.memory, id, convention, call.regs)
             }),
             SvcId::SetGpuMemoryAttribute => self.set_gpu_memory_attribute(call, id, convention),
+            SvcId::MapPhysicalMemory | SvcId::UnmapPhysicalMemory => {
+                self.physical_memory(call, id, convention)
+            }
             SvcId::GetInfo => self.get_info(call, id, convention),
             SvcId::Break => self.break_call(call, id, convention),
             SvcId::ExitProcess
@@ -993,6 +996,38 @@ impl Dispatcher {
                     Ok([])
                 },
             )
+        })
+    }
+}
+
+impl Dispatcher {
+    /// `MapPhysicalMemory`'s and `UnmapPhysicalMemory`'s arm: they declare the address space,
+    /// and read the process's system resource size from the process facts.
+    fn physical_memory(&self, call: &mut Call<'_, '_>, id: SvcId, convention: &Convention) -> Outcome {
+        self.call_in_process::<(&mut AddressSpace,)>(call, |(space,), call, _, processes| {
+            returning(id, convention, call.regs, |[address, size]| {
+                let system_resource_size = crate::svc::info::secure_resource_size(
+                    processes
+                        .own_info()
+                        .map_err(|error| SvcError::internal(&error))?,
+                );
+                if id == SvcId::MapPhysicalMemory {
+                    physical_memory::map_physical_memory(
+                        space,
+                        system_resource_size,
+                        address,
+                        size,
+                    )?;
+                } else {
+                    physical_memory::unmap_physical_memory(
+                        space,
+                        system_resource_size,
+                        address,
+                        size,
+                    )?;
+                }
+                Ok([])
+            })
         })
     }
 }
