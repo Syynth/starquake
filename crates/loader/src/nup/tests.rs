@@ -473,6 +473,14 @@ fn a_base_and_an_update_open_with_their_packages_and_trees() {
         nup.lookup(base.root, b"exefs"),
         Some(Node::Dir(dir_of(0, "exefs")))
     );
+    // `file_in` finds files only: a directory's name, or a name that is not there, is `None`.
+    let exefs = dir_of(0, "exefs");
+    assert_eq!(
+        nup.file_in(exefs, b"main"),
+        Some(file_id(&built, 0, "exefs/main"))
+    );
+    assert_eq!(nup.file_in(base.root, b"exefs"), None);
+    assert_eq!(nup.file_in(exefs, b"rtld"), None);
     assert_eq!(nup.dir_count(), built.layout.dir_records.len());
     assert_eq!(nup.file_count(), built.layout.file_records.len());
 }

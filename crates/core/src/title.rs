@@ -69,7 +69,7 @@ use std::sync::Arc;
 use starquake_loader::exefs::{ExeFs, ExeFsError, MODULE_NAMES, NPDM_FILE};
 use starquake_loader::nup::layout::MAGIC;
 use starquake_loader::nup::storage::{CACHE_CAP, RomFsStorage, StorageError};
-use starquake_loader::nup::{DirId, FileId, Node, Nup, NupError, Whole};
+use starquake_loader::nup::{DirId, FileId, Nup, NupError, Whole};
 use starquake_loader::read_at::{Positional, ReadAt};
 
 use crate::system::{Error, System};
@@ -250,14 +250,6 @@ fn container<S: Read + Seek>(source: S) -> Result<(Nup<S>, Whole), TitleError> {
     Ok((nup, whole))
 }
 
-/// The file of the ExeFS `exefs` called `name`.
-fn exefs_file<S>(nup: &Nup<S>, exefs: DirId, name: &str) -> Option<FileId> {
-    match nup.lookup(exefs, name.as_bytes())? {
-        Node::File(file) => Some(file),
-        Node::Dir(_) => None,
-    }
-}
-
 /// Loads the program in the ExeFS `exefs` of `nup` (module docs, checks 2 to 6).
 fn load_program<S: Read + Seek>(
     nup: &mut Nup<S>,
@@ -265,14 +257,14 @@ fn load_program<S: Read + Seek>(
     limits: ReadLimits,
 ) -> Result<System, TitleError> {
     let exefs = exefs.ok_or(TitleError::NoExeFs)?;
-    let Some(npdm) = exefs_file(nup, exefs, NPDM_FILE) else {
+    let Some(npdm) = nup.file_in(exefs, NPDM_FILE.as_bytes()) else {
         return Err(ExeFsError::MissingNpdm.into());
     };
     let mut wanted: Vec<(&'static str, FileId)> = vec![(NPDM_FILE, npdm)];
     wanted.extend(
         MODULE_NAMES
             .into_iter()
-            .filter_map(|name| Some((name, exefs_file(nup, exefs, name)?))),
+            .filter_map(|name| Some((name, nup.file_in(exefs, name.as_bytes())?))),
     );
 
     let mut budget = limits.exefs;

@@ -416,6 +416,14 @@ impl<S> Nup<S> {
             .and_then(|at| children.get(at).copied())
     }
 
+    /// The file of `dir` called `name`; `None` when there is none or `name` is a directory.
+    pub fn file_in(&self, dir: DirId, name: &[u8]) -> Option<FileId> {
+        match self.lookup(dir, name)? {
+            Node::File(file) => Some(file),
+            Node::Dir(_) => None,
+        }
+    }
+
     /// The node at `path` below `dir`, `/`-separated; empty segments are skipped.
     pub fn resolve(&self, dir: DirId, path: &str) -> Option<Node> {
         let mut at = Node::Dir(dir);

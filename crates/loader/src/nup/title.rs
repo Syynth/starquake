@@ -103,10 +103,7 @@ pub struct Title {
 impl Title {
     /// The `ExeFS` file called `name` (`main`, `main.npdm`, `rtld`, `sdk`, `subsdk0`, ...).
     pub fn exefs_file<S>(&self, nup: &Nup<S>, name: &str) -> Option<FileId> {
-        match nup.lookup(self.exefs?.dir, name.as_bytes())? {
-            Node::File(file) => Some(file),
-            Node::Dir(_) => None,
-        }
+        nup.file_in(self.exefs?.dir, name.as_bytes())
     }
 
     /// The `ExeFS` files in name order (subdirectories, which an `ExeFS` does not have, are
