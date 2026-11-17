@@ -141,7 +141,10 @@ the guest signals that event, the kernel runs the hook after it has released the
 never under it. The hook may only queue work for the service (the graphics server queues a
 refresh of the shared syncpoint page); it never calls back into the kernel synchronously. Until
 the hook exists, the graphics server answers on its 1 ms bound alone (`graphics-server.md`, "The
-shared syncpoint page"). (Approved by the owner, 2026-11-12.)
+shared syncpoint page"). (Approved by the owner, 2026-11-12.) A hook is code and is not
+snapshotted: a snapshot saves which events are hooked and by which service, and the owning
+service re-attaches its hooks in its restore step, checked against the restored events, before
+the guest runs again. (Approved by the owner, 2026-11-17.)
 
 ### Scheduler
 
