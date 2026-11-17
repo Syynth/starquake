@@ -32,6 +32,13 @@ fn device_count(dispatcher: &Dispatcher, address: u64) -> u16 {
     })
 }
 
+impl Dispatcher {
+    /// [`AddressSpace::device_locks`] of the tables' address space.
+    fn device_locks_on(&self, address: u64, size: u64) -> u32 {
+        self.with::<(&AddressSpace,), _>(|(space,)| space.device_locks(address, size))
+    }
+}
+
 /// Ends `process`, as `ExitProcess` does.
 fn end(dispatcher: &Dispatcher, process: ProcessId) {
     dispatcher
@@ -84,7 +91,7 @@ fn a_token_naming_another_process_is_refused_and_changes_nothing() {
             Err(DeviceShareError::WrongProcess)
         );
         assert_eq!(
-            dispatcher.reclaim_device_share(other, token.address(), token.size()),
+            dispatcher.reclaim_device_share(other, token.address(), token.size(), 0),
             Err(DeviceShareError::WrongProcess)
         );
     }
@@ -103,7 +110,7 @@ fn a_range_one_page_short_is_refused_and_changes_nothing() {
         let refusal = DeviceShareError::NotLocked { address, size };
         assert_eq!(dispatcher.unlock_device_share(short), Err(refusal.clone()));
         assert_eq!(
-            dispatcher.reclaim_device_share(own, address, size),
+            dispatcher.reclaim_device_share(own, address, size, 0),
             Err(refusal)
         );
     }
@@ -121,7 +128,7 @@ fn a_range_one_page_long_is_refused_and_changes_nothing() {
         let refusal = DeviceShareError::NotLocked { address, size };
         assert_eq!(dispatcher.unlock_device_share(long), Err(refusal.clone()));
         assert_eq!(
-            dispatcher.reclaim_device_share(own, address, size),
+            dispatcher.reclaim_device_share(own, address, size, 0),
             Err(refusal)
         );
     }
@@ -134,7 +141,7 @@ fn an_unlock_after_the_process_ended_is_refused_and_changes_nothing() {
     let (dispatcher, own, token) = locked();
     // The process is live: the token checks out.
     assert_eq!(
-        dispatcher.reclaim_device_share(own, token.address(), token.size()),
+        dispatcher.reclaim_device_share(own, token.address(), token.size(), 0),
         Ok(token)
     );
     end(&dispatcher, own);
@@ -144,7 +151,7 @@ fn an_unlock_after_the_process_ended_is_refused_and_changes_nothing() {
         Err(DeviceShareError::ProcessEnded)
     );
     assert_eq!(
-        dispatcher.reclaim_device_share(own, token.address(), token.size()),
+        dispatcher.reclaim_device_share(own, token.address(), token.size(), 0),
         Err(DeviceShareError::ProcessEnded)
     );
     assert_eq!(blocks(&dispatcher), before);
@@ -176,7 +183,7 @@ fn nested_locks_give_equal_tokens_and_each_unlocks_once() {
     // One lock is left: the range is still locked, and its token still checks out.
     assert_eq!(device_count(&dispatcher, DATA), 1);
     assert_eq!(
-        dispatcher.reclaim_device_share(own, DATA, 2 * PAGE_SIZE),
+        dispatcher.reclaim_device_share(own, DATA, 2 * PAGE_SIZE, 0),
         Ok(second)
     );
     assert_eq!(dispatcher.unlock_device_share(second), Ok(()));
@@ -214,12 +221,70 @@ fn the_process_is_checked_before_the_range() {
 fn a_reclaimed_token_is_the_lock_s_and_unlocks_it_and_reclaiming_releases_nothing() {
     let (dispatcher, own, token) = locked();
     let reclaimed = dispatcher
-        .reclaim_device_share(own, DATA, 2 * PAGE_SIZE)
+        .reclaim_device_share(own, DATA, 2 * PAGE_SIZE, 0)
         .unwrap();
     assert_eq!(reclaimed, token);
     assert_eq!(device_count(&dispatcher, DATA), 1);
     assert_eq!(dispatcher.unlock_device_share(reclaimed), Ok(()));
     assert_eq!(device_count(&dispatcher, DATA), 0);
+}
+
+#[test]
+fn as_many_reclaims_as_locks_are_taken_back_and_one_more_is_refused() {
+    // One lock and then three on the same range: with N live locks, reclaims with `earlier`
+    // from 0 to N - 1 are taken back, and the one with `earlier` = N (a snapshot releasing the
+    // range once more than the kernel locked it) is refused.
+    let (dispatcher, own) = world();
+    let size = 2 * PAGE_SIZE;
+    let refusal = DeviceShareError::NotLocked {
+        address: DATA,
+        size,
+    };
+    let mut held = 0;
+    for locks in [1, 3] {
+        while held < locks {
+            dispatcher.lock_device_share(DATA, size).unwrap();
+            held += 1;
+        }
+        let token = DeviceShareToken::new(own, DATA, size);
+        for earlier in 0..locks {
+            assert_eq!(
+                dispatcher.reclaim_device_share(own, DATA, size, earlier),
+                Ok(token),
+                "{locks} locks, {earlier} earlier"
+            );
+        }
+        assert_eq!(
+            dispatcher.reclaim_device_share(own, DATA, size, locks),
+            Err(refusal.clone()),
+            "{locks} locks"
+        );
+        assert_eq!(
+            dispatcher.reclaim_device_share(own, DATA, size, u32::MAX),
+            Err(refusal.clone())
+        );
+        // Reclaiming released nothing.
+        assert_eq!(dispatcher.device_locks_on(DATA, size), locks);
+    }
+    // The count is per exact range: the neighbour that starts at the lock's end holds none.
+    assert_eq!(
+        dispatcher.reclaim_device_share(own, DATA + size, PAGE_SIZE, 0),
+        Err(DeviceShareError::NotLocked {
+            address: DATA + size,
+            size: PAGE_SIZE,
+        })
+    );
+}
+
+#[test]
+fn a_reclaim_checks_the_process_before_the_count() {
+    // An ended process, and more earlier releases than locks: the process is answered.
+    let (dispatcher, own, token) = locked();
+    end(&dispatcher, own);
+    assert_eq!(
+        dispatcher.reclaim_device_share(own, token.address(), token.size(), 1),
+        Err(DeviceShareError::ProcessEnded)
+    );
 }
 
 #[test]

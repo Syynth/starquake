@@ -160,7 +160,12 @@ pub const GUARD_PAGES: u64 = 4;
 /// ([`IpcContext::lock_device_share`](crate::dispatch::IpcContext::lock_device_share)), or by
 /// checking what a snapshot saved
 /// ([`Dispatcher::reclaim_device_share`](crate::dispatch::Dispatcher::reclaim_device_share)).
-/// Its fields can be read and never set. Releasing it
+/// The reclaim is `pub` and takes raw numbers (a process, a range and how many releases of it
+/// were reclaimed before), so it is the one way outside tests to get a token without taking a
+/// lock: it is meant only for a snapshot restore, and it makes a token only for a range on
+/// which the kernel holds a live lock (its module docs, "Making a token", say what it does
+/// not prevent). The `test-support` feature adds an unchecked constructor for fakes
+/// (`memory::testing::device_share_token`). Its fields can be read and never set. Releasing it
 /// ([`Dispatcher::unlock_device_share`](crate::dispatch::Dispatcher::unlock_device_share))
 /// checks it again, whichever way it was made.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

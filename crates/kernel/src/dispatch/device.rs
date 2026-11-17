@@ -13,7 +13,18 @@
 //! range ([`AddressSpace::lock_device_share`]) and returns a [`DeviceShareToken`] naming the
 //! process and that exact range. [`Dispatcher::reclaim_device_share`] makes one from what a
 //! snapshot saved, only after the checks below pass for it: a restored token is checked as a
-//! live one is.
+//! live one is, and the snapshot's releases of one range are counted against the locks the
+//! kernel holds on it.
+//!
+//! Reclaiming is the one way outside tests to get a token from raw numbers (a process and a
+//! range), and it is meant only for a snapshot restore (`starquake_gsv::completion`, "A token
+//! held across a snapshot"). It is `pub` because gsv's restore calls it; the kernel cannot tell
+//! a restore from any other caller holding a [`Dispatcher`]. What it does guarantee: it makes a
+//! token only for a range on which the kernel holds more live locks than the caller says it
+//! has already reclaimed (`earlier`), so a restore that counts as gsv's does never gets more
+//! tokens for a range than the kernel has locks on it. A caller that passes a wrong count can
+//! get a token for a lock that another token already names; unlocking it then releases that
+//! lock, as unlocking the other token would.
 //!
 //! # Checking a token
 //!
@@ -29,7 +40,10 @@
 //!    ([`ProcessState::Terminated`]) or its scheduler row is gone.
 //! 3. [`DeviceShareError::NotLocked`] unless a live lock was taken on exactly the token's range
 //!    ([`AddressSpace::device_locks`]): one page short or one page long is refused, and so is
-//!    a second unlock of a token whose one lock the first released.
+//!    a second unlock of a token whose one lock the first released. A reclaim is refused unless
+//!    more live locks are held on the range than the `earlier` releases of it the snapshot
+//!    already reclaimed: with N locks, N releases of the range are taken back and the next one
+//!    is refused (`as_many_reclaims_as_locks_are_taken_back_and_one_more_is_refused`).
 //!
 //! An unlock then releases the lock ([`AddressSpace::unlock_device_share`]), and its state
 //! checks' refusal is [`DeviceShareError::Refused`]. Nothing changes on any refusal. Tests:
@@ -95,13 +109,15 @@ impl DeviceShareError {
     }
 }
 
-/// Checks `token` against the process the tables belong to, `own` (module docs, "Checking a
-/// token").
+/// Checks `token` against the process the tables belong to, `own`, and the live locks on its
+/// range, of which `earlier` are already spoken for (module docs, "Checking a token"): zero for
+/// an unlock, and the count of the snapshot's earlier releases of the range for a reclaim.
 fn check(
     own: ProcessId,
     space: &AddressSpace,
     scheduler: &Scheduler,
     token: DeviceShareToken,
+    earlier: u32,
 ) -> Result<(), DeviceShareError> {
     if token.process() != own {
         return Err(DeviceShareError::WrongProcess);
@@ -112,7 +128,7 @@ fn check(
     if !live {
         return Err(DeviceShareError::ProcessEnded);
     }
-    if space.device_locks(token.address(), token.size()) == 0 {
+    if space.device_locks(token.address(), token.size()) <= earlier {
         return Err(DeviceShareError::NotLocked {
             address: token.address(),
             size: token.size(),
@@ -143,26 +159,29 @@ impl Dispatcher {
         let mut locked = self.lock::<(&mut AddressSpace, &Scheduler)>();
         let own = locked.state.tables.processes.own();
         let (space, scheduler) = locked.tables();
-        check(own, space, scheduler, token)?;
+        check(own, space, scheduler, token, 0)?;
         space
             .unlock_device_share(token.address(), token.size())
             .map_err(DeviceShareError::Refused)
     }
 
-    /// The token for the lock on `size` bytes at `address` of `process`, as a snapshot saved
-    /// it, if the checks a live token passes pass for it (module docs, "Checking a token"). It
-    /// releases nothing; unlocking it checks it again.
+    /// The token for a lock on `size` bytes at `address` of `process`, as a snapshot saved it,
+    /// if the checks a live token passes pass for it and the kernel holds more live locks on
+    /// that range than `earlier`, the number of the snapshot's releases of the same range that
+    /// were reclaimed before this one (module docs, "Checking a token"). For a snapshot restore
+    /// only (module docs, "Making a token"). It releases nothing; unlocking it checks it again.
     pub fn reclaim_device_share(
         &self,
         process: ProcessId,
         address: u64,
         size: u64,
+        earlier: u32,
     ) -> Result<DeviceShareToken, DeviceShareError> {
         let token = DeviceShareToken::new(process, address, size);
         let mut locked = self.lock::<(&AddressSpace, &Scheduler)>();
         let own = locked.state.tables.processes.own();
         let (space, scheduler) = locked.tables();
-        check(own, space, scheduler, token)?;
+        check(own, space, scheduler, token, earlier)?;
         Ok(token)
     }
 }

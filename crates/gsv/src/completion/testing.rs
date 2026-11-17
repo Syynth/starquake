@@ -1,7 +1,7 @@
 //! Test helpers shared by the queue's tests and the drain's: device-share tokens and a kernel
 //! that takes them back.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 
 use starquake_kernel::dispatch::DeviceShareError;
 use starquake_kernel::id::{ProcessId, SlabId};
@@ -32,17 +32,17 @@ pub(crate) fn released(n: u64) -> Completion {
 /// How many locks [`locks`] holds: `token(0)` to `token(LOCKS - 1)`.
 pub(crate) const LOCKS: u64 = 8;
 
-/// A [`Reclaim`] standing in for the kernel's `Dispatcher::reclaim_device_share`: it holds live
-/// locks on exact ranges of one process and answers as the kernel does for a live process,
-/// another process being [`DeviceShareError::WrongProcess`] and a range it holds no lock on
-/// [`DeviceShareError::NotLocked`]. It has no process that ends, so it never answers
-/// [`DeviceShareError::ProcessEnded`]. Parity with the kernel:
+/// A [`Reclaim`] standing in for the kernel's `Dispatcher::reclaim_device_share`: it holds a
+/// count of live locks on exact ranges of one process and answers as the kernel does for a live
+/// process, another process being [`DeviceShareError::WrongProcess`] and a range on which it
+/// holds no more locks than `earlier` being [`DeviceShareError::NotLocked`]. It has no process
+/// that ends, so it never answers [`DeviceShareError::ProcessEnded`]. Parity with the kernel:
 /// `the_fake_kernel_reclaims_as_the_real_one_refuses`.
 pub(crate) struct Locks {
     /// The process whose memory it holds.
     pub(crate) process: ProcessId,
-    /// The live locks, by `(address, size)`.
-    pub(crate) live: BTreeSet<(u64, u64)>,
+    /// How many live locks it holds, by `(address, size)`.
+    pub(crate) live: BTreeMap<(u64, u64), u32>,
 }
 
 impl Reclaim for Locks {
@@ -51,23 +51,24 @@ impl Reclaim for Locks {
         process: ProcessId,
         address: u64,
         size: u64,
+        earlier: u32,
     ) -> Result<DeviceShareToken, DeviceShareError> {
         if process != self.process {
             return Err(DeviceShareError::WrongProcess);
         }
-        if !self.live.contains(&(address, size)) {
+        if self.live.get(&(address, size)).copied().unwrap_or(0) <= earlier {
             return Err(DeviceShareError::NotLocked { address, size });
         }
         Ok(device_share_token(process, address, size))
     }
 }
 
-/// A kernel holding locks `0..LOCKS` of [`process`].
+/// A kernel holding one lock on each of `0..LOCKS` of [`process`].
 pub(crate) fn locks() -> Locks {
     Locks {
         process: process(),
         live: (0..LOCKS)
-            .map(|n| (token(n).address(), token(n).size()))
+            .map(|n| ((token(n).address(), token(n).size()), 1))
             .collect(),
     }
 }

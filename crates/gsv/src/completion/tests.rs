@@ -520,9 +520,9 @@ fn the_snapshot_layout_is_pinned() {
     });
     let kernel = Locks {
         process: ProcessId::from_parts(0x09, 0x0A),
-        live: [(0x0B, 0x0C)].into(),
+        live: [((0x0B, 0x0C), 1)].into(),
     };
-    let lock = kernel.reclaim(kernel.process, 0x0B, 0x0C).unwrap();
+    let lock = kernel.reclaim(kernel.process, 0x0B, 0x0C, 0).unwrap();
     queue.push(Completion::DeviceShareReleased { token: lock });
     let bytes = queue.save().unwrap();
     assert_eq!(
@@ -955,7 +955,7 @@ fn the_fake_kernel_reclaims_as_the_real_one_refuses() {
     let (dispatcher, own) = real_kernel();
     let fake = Locks {
         process: own,
-        live: std::collections::BTreeSet::new(),
+        live: BTreeMap::new(),
     };
     let other = ProcessId::from_parts(own.index() + 1, own.generation());
     for (process, address, size) in [(own, 0x8000_0000, 0x1000), (other, 0x8000_0000, 0x1000)] {
@@ -971,6 +971,84 @@ fn the_fake_kernel_reclaims_as_the_real_one_refuses() {
         SnapshotError::Release {
             index: 0,
             error: DeviceShareError::WrongProcess,
+        }
+    );
+}
+
+/// A snapshot holding `entries`.
+fn snapshot_of(entries: &[Saved]) -> Vec<u8> {
+    let mut bytes = header();
+    bytes.extend(postcard::to_allocvec(entries).unwrap());
+    bytes
+}
+
+/// The saved release of lock `n` of [`process`].
+fn saved_release(n: u64) -> Saved {
+    Saved::DeviceShareReleased {
+        process: process(),
+        address: token(n).address(),
+        size: token(n).size(),
+    }
+}
+
+#[test]
+fn releases_beyond_the_kernel_s_locks_are_refused_at_the_first_extra_one() {
+    // The kernel holds `held` locks on range 1 and one on range 2. The snapshot interleaves the
+    // two ranges (with an unordered entry between) so the count must be kept per range: as many
+    // releases of range 1 as locks are taken back, and one more is refused at its own index.
+    let other = saved_release(2);
+    let saved_room = Saved::GpuQueueRoom { channel: 4 };
+    for held in [1, 2, 3] {
+        let kernel = Locks {
+            process: process(),
+            live: [
+                ((token(1).address(), token(1).size()), held),
+                ((token(2).address(), token(2).size()), 1),
+            ]
+            .into(),
+        };
+        let mut entries = vec![other, saved_room];
+        entries.extend((0..held).map(|_| saved_release(1)));
+        let bytes = snapshot_of(&entries);
+        let mut expected = vec![released(2), room(4)];
+        expected.extend((0..held).map(|_| released(1)));
+        assert_eq!(
+            CompletionQueue::restore(&bytes, &kernel)
+                .unwrap()
+                .take_all(),
+            expected,
+            "{held} locks"
+        );
+        // One more release of range 1: refused at its index, the first past the kernel's count.
+        entries.push(saved_release(1));
+        assert_eq!(
+            CompletionQueue::restore(&snapshot_of(&entries), &kernel)
+                .err()
+                .unwrap(),
+            SnapshotError::Release {
+                index: entries.len() - 1,
+                error: DeviceShareError::NotLocked {
+                    address: token(1).address(),
+                    size: token(1).size(),
+                },
+            },
+            "{held} locks"
+        );
+    }
+}
+
+#[test]
+fn one_lock_and_two_saved_releases_of_it_are_refused_at_the_second() {
+    // The reviewer's case, against the shared fake: `locks` holds token(1)'s range once.
+    let bytes = snapshot_of(&[saved_release(1), saved_release(1)]);
+    assert_eq!(
+        CompletionQueue::restore(&bytes, &locks()).err().unwrap(),
+        SnapshotError::Release {
+            index: 1,
+            error: DeviceShareError::NotLocked {
+                address: token(1).address(),
+                size: token(1).size(),
+            },
         }
     );
 }

@@ -141,9 +141,12 @@ pub fn standalone_shared_pages(size: u64) -> Option<SharedPages> {
 
 /// A device-share token naming `process` and `size` bytes at `address`, with no lock behind
 /// it: what a fake kernel that keeps its own locks hands a service, and what a test plays a
-/// saved token with. Outside the kernel this is the only way to make a token, and it exists
-/// only for tests (the `test-support` feature); the kernel's own unlock refuses one whose lock
-/// it did not take (`crate::dispatch::Dispatcher::unlock_device_share`).
+/// saved token with. It exists only for tests (the `test-support` feature), and it is the only
+/// way to make a token with no check at all. Outside tests, the one way to get a token from
+/// raw numbers is `crate::dispatch::Dispatcher::reclaim_device_share`, which is meant only for
+/// a snapshot restore and makes one only for a range the kernel holds a live lock on. The
+/// kernel's own unlock refuses a token whose lock it did not take
+/// (`crate::dispatch::Dispatcher::unlock_device_share`).
 #[must_use]
 pub const fn device_share_token(process: ProcessId, address: u64, size: u64) -> DeviceShareToken {
     DeviceShareToken::new(process, address, size)

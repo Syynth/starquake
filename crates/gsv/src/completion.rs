@@ -121,7 +121,8 @@
 //! A snapshot is a file and is not trusted. Restoring checks, in this order, and returns the
 //! first failure: the magic, the version, that the body decodes, that no bytes follow it, and
 //! then each entry in order: that a syncpoint id is below `SYNCPOINT_COUNT`, that the kernel
-//! takes a device-share release's token back ([`Reclaim`]), and that the entry is not one the
+//! takes a device-share release's token back ([`Reclaim`], counting the snapshot's earlier
+//! releases of the same range), and that the entry is not one the
 //! queue would have folded into an earlier entry (a syncpoint change whose id has an entry with
 //! no ordered entry after it, or a room report or guest signal naming what an earlier entry
 //! names). Saving runs the same entry checks on what it is about to write, all but the
@@ -135,7 +136,18 @@
 //! holds and has not ended, and a live lock was taken on exactly that range. The drain's unlock
 //! then checks the token again. So a restored token passes through the same checks as a live
 //! one, and a snapshot naming a lock the kernel does not hold is refused
-//! ([`SnapshotError::Release`]). The kernel's own state has no snapshot yet (`memory` module
+//! ([`SnapshotError::Release`]).
+//!
+//! **Releases are counted against locks.** The kernel can hold several locks on one range (each
+//! lock returns an equal token), and the queue can hold a release for each. The restore counts
+//! the releases of each exact range (process, address and size) in entry order and tells the
+//! kernel how many came before ([`Reclaim::reclaim`]'s `earlier`), and the kernel refuses a
+//! release once that count reaches the live locks it holds on the range: with N locks, N
+//! releases are taken back and the next is refused as
+//! [`DeviceShareError::NotLocked`] at its own index
+//! (`releases_beyond_the_kernel_s_locks_are_refused_at_the_first_extra_one`, and
+//! `Dispatcher::reclaim_device_share`'s own tests). So a snapshot cannot make the drain unlock a
+//! lock that GPU work still needs. The kernel's own state has no snapshot yet (`memory` module
 //! docs, the observability spec's "Order of work", step 6); a whole-machine restore restores it
 //! first, then this queue against it.
 
@@ -187,13 +199,17 @@ pub enum Completion {
 /// snapshot"): the kernel checks it as it checks a live token, and makes the token only if
 /// every check passes. The kernel's [`Dispatcher`] implements it.
 pub trait Reclaim {
-    /// The token for the lock on `size` bytes at `address` of `process`, or why the kernel
-    /// refuses it.
+    /// The token for a lock on `size` bytes at `address` of `process`, or why the kernel
+    /// refuses it. `earlier` is how many of the snapshot's releases of exactly that range were
+    /// taken back before this one; the kernel refuses
+    /// ([`DeviceShareError::NotLocked`]) unless it holds more live locks on the range than that
+    /// (module docs, "Releases are counted against locks").
     fn reclaim(
         &self,
         process: ProcessId,
         address: u64,
         size: u64,
+        earlier: u32,
     ) -> Result<DeviceShareToken, DeviceShareError>;
 }
 
@@ -204,8 +220,9 @@ impl Reclaim for Dispatcher {
         process: ProcessId,
         address: u64,
         size: u64,
+        earlier: u32,
     ) -> Result<DeviceShareToken, DeviceShareError> {
-        self.reclaim_device_share(process, address, size)
+        self.reclaim_device_share(process, address, size, earlier)
     }
 }
 
@@ -415,10 +432,11 @@ impl CompletionQueue {
         if !rest.is_empty() {
             return Err(SnapshotError::TrailingBytes { count: rest.len() });
         }
+        let mut reclaimed = Reclaimed::new();
         let completions = entries
             .iter()
             .enumerate()
-            .map(|(index, entry)| entry.completion(index, kernel));
+            .map(|(index, entry)| entry.completion(index, kernel, &mut reclaimed));
         Ok(Self {
             pending: Mutex::new(rebuild(completions)?),
             wake: None,
@@ -582,10 +600,21 @@ impl From<Completion> for Saved {
     }
 }
 
+/// How many releases of each exact range (process, address and size) a restore has taken back
+/// so far (module docs, "Releases are counted against locks"). It holds at most one key per
+/// release entry of the snapshot, which is already decoded in full.
+type Reclaimed = BTreeMap<(ProcessId, u64, u64), u32>;
+
 impl Saved {
     /// The completion this entry, at `index`, stands for, or why it names nothing; `kernel`
-    /// takes a release's token back.
-    fn completion(self, index: usize, kernel: &dyn Reclaim) -> Result<Completion, SnapshotError> {
+    /// takes a release's token back, told how many releases of its range `reclaimed` counts,
+    /// and the count goes up by one when it does.
+    fn completion(
+        self,
+        index: usize,
+        kernel: &dyn Reclaim,
+        reclaimed: &mut Reclaimed,
+    ) -> Result<Completion, SnapshotError> {
         Ok(match self {
             Self::SyncpointChanged { id, value } => {
                 let id =
@@ -603,11 +632,16 @@ impl Saved {
                 process,
                 address,
                 size,
-            } => Completion::DeviceShareReleased {
-                token: kernel
-                    .reclaim(process, address, size)
-                    .map_err(|error| SnapshotError::Release { index, error })?,
-            },
+            } => {
+                let earlier = reclaimed.entry((process, address, size)).or_insert(0);
+                let token = kernel
+                    .reclaim(process, address, size, *earlier)
+                    .map_err(|error| SnapshotError::Release { index, error })?;
+                // The kernel holds more than `earlier` locks, a `u32` count, so this does not
+                // saturate; if it did, the next reclaim would be refused.
+                *earlier = earlier.saturating_add(1);
+                Completion::DeviceShareReleased { token }
+            }
         })
     }
 }
