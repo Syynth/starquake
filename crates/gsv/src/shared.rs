@@ -12,9 +12,10 @@
 //! first, then `Syncpoints::new` with the queue as its `Completions`, then [`Shared::new`].
 //!
 //! [`GsvShared`] holds, so far, the waiter count of each syncpoint ([`Locked::watch`],
-//! [`Locked::unwatch`]) and the syncpt sessions' waiter table ([`Waiters`]: [`Locked::arm`],
-//! [`Locked::disarm`]; slice 4); later slices add the shared page, the GPU memory bookkeeping,
-//! vi2's queues and the native object tables (spec, "Concurrency inside gsv").
+//! [`Locked::unwatch`]), the syncpt sessions' waiter table ([`Waiters`]: [`Locked::arm`],
+//! [`Locked::disarm`]; slice 4) and the GPU memory bookkeeping ([`Locked::gpu`], slice 7); later
+//! slices add the shared page, vi2's queues and the native object tables (spec, "Concurrency
+//! inside gsv").
 //!
 //! Each armed wait holds one watch of its syncpoint: [`Locked::arm`] takes it, and gives back
 //! the watch of the wait it replaces; [`Locked::disarm`] and the drain's firing give it back
@@ -51,13 +52,13 @@
 //! acts, so a completion pushed meanwhile (by the kernel's hook, say) waits for the next drain
 //! (`a_push_during_the_drain_waits_for_the_next_one`).
 //!
-//! What the drain does with each completion, so far, is record it, fire the waits a syncpoint's
-//! change reaches, and unlock a device-share release:
+//! What the drain does with each completion, so far, is record it, then act on it as the table
+//! says:
 //!
 //! | Completion | What the drain does |
 //! |---|---|
 //! | `GpuCompletion::SyncpointChanged` | records `SyncpointObserved` ([`crate::note`]), then fires every armed wait on the id that the drained value satisfies: takes it out of the table, unwatches its id, and signals its event through the kernel ([`TimerHost::signal_event`]), in ascending event order (`a_change_fires_its_waits_after_its_note_in_event_order`) |
-//! | `GpuCompletion::GpuOrdered` | records `GpuOrderedDone` |
+//! | `GpuCompletion::GpuOrdered` | records `GpuOrderedDone`; then, if a gpu worker job waits on the ticket ([`crate::gpu::GpuMemory::ordered_done`]), publishes the ranges it removed again, releases its device-share locks as a `DeviceShareReleased` is released (below), and only then signals its event ([`TimerHost::signal_event`]) |
 //! | `GpuCompletion::GpuQueueRoom` | records `QueueRoom` |
 //! | [`Completion::GuestSignalled`] | nothing: the guest's `SignalEvent` is recorded as its system call, and what gsv does about it (the shared page's answer, slice 5) records its own note |
 //! | [`Completion::DeviceShareReleased`] | unlocks through the kernel with the token ([`TimerHost::unlock_device_share`]), which checks it; records nothing (the spec's "What is recorded" has no note for it) |
@@ -70,6 +71,8 @@
 //! (`a_refused_release_is_logged_and_the_drain_goes_on`; the levels are pinned by
 //! `tests/release_log_levels.rs`, a test binary of its own).
 //!
+//! A job's event that the kernel refuses to signal is logged as an error, and the drain goes on.
+//!
 //! **Waits fire on the drained value, not the counter.** A wait is compared with the value the
 //! drain took from the queue, the one it records as `SyncpointObserved`, so that what gsv acts
 //! on is what replay feeds back. Drained values are not monotone (the completion module's
@@ -80,8 +83,7 @@
 //! is gone either way (`a_refused_signal_is_logged_and_the_drain_goes_on`; the level is pinned
 //! by `tests/signal_log_level.rs`, a test binary of its own).
 //!
-//! Later slices act on them as well: the shared page (5), the ordered completion of unmaps and
-//! destroys (7), deferred submissions (11).
+//! Later slices act on them as well: the shared page (5), deferred submissions (11).
 //!
 //! # The timer thread, until the wiring
 //!
@@ -100,8 +102,10 @@
 //! count of each syncpoint, by id, then the armed waits in ascending event order, each its
 //! event, syncpoint id, threshold and mode byte (`crate::syncpt::waiters`, "Snapshot form").
 //! The golden-bytes test `the_snapshot_layout_is_pinned` pins it; changing it means bumping
-//! [`SNAPSHOT_VERSION`]. Version 2 added the waits. The queue has its own snapshot ([`CompletionQueue::save`]), because it
-//! must exist before the `Syncpoints` that pushes to it.
+//! [`SNAPSHOT_VERSION`]. Version 2 added the waits. The queue has its own snapshot
+//! ([`CompletionQueue::save`]), because it must exist before the `Syncpoints` that pushes to it.
+//! The GPU memory bookkeeping has its own too ([`crate::gpu::saved`]); composing it into this one
+//! is the wiring slice's (16).
 //!
 //! A snapshot is a file and is not trusted. [`Shared::restore`] checks, in this order, and
 //! returns the first failure: the magic, the version, that the body decodes, that no bytes
@@ -129,6 +133,7 @@ use starquake_trace::{EventKind, ServiceId};
 use thiserror::Error;
 
 use crate::completion::{Completion, CompletionQueue};
+use crate::gpu::GpuMemory;
 use crate::note::Note;
 use crate::syncpt::waiters::{SavedWait, SavedWaitError, Wait, Waiters};
 
@@ -160,7 +165,7 @@ pub trait TimerHost {
     fn unlock_device_share(&mut self, token: DeviceShareToken) -> Result<(), DeviceShareError>;
 
     /// Signals `event`, an event a gsv server made, through the kernel: how the drain fires an
-    /// armed wait (module docs, "Lock order and the drain").
+    /// armed wait and completes a gpu worker job (module docs, "Lock order and the drain").
     fn signal_event(&mut self, event: ObjectId) -> SvcResult<()>;
 }
 
@@ -173,6 +178,8 @@ pub trait TimerHost {
 pub struct GsvShared {
     /// The number of waiters on each syncpoint, by id.
     watchers: Vec<u32>,
+    /// The GPU memory bookkeeping (slice 7).
+    gpu: GpuMemory,
     /// The syncpt sessions' armed waits.
     waiters: Waiters,
 }
@@ -182,6 +189,7 @@ impl GsvShared {
     fn fresh() -> Self {
         Self {
             watchers: vec![0; COUNT],
+            gpu: GpuMemory::new(),
             waiters: Waiters::default(),
         }
     }
@@ -199,6 +207,12 @@ impl GsvShared {
             .get(usize::from(id.get()))
             .copied()
             .unwrap_or(0)
+    }
+
+    /// The GPU memory bookkeeping.
+    #[must_use]
+    pub fn gpu_memory(&self) -> &GpuMemory {
+        &self.gpu
     }
 }
 
@@ -278,6 +292,11 @@ impl Locked<'_> {
             self.syncpoints.unwatch(id);
         }
         Ok(())
+    }
+
+    /// The GPU memory bookkeeping, to change (the gpu server's handlers, slice 7).
+    pub fn gpu(&mut self) -> &mut GpuMemory {
+        &mut self.state.gpu
     }
 
     /// Arms `wait` on `event`, replacing the wait armed on it before, and returns the wait's
@@ -399,6 +418,16 @@ impl Shared {
                 }
                 Completion::Gpu(gpu) => {
                     host.record(note(gpu).event(self.service));
+                    if let GpuCompletion::GpuOrdered { ticket } = gpu
+                        && let Some(finished) = state.gpu().ordered_done(ticket)
+                    {
+                        for token in finished.releases {
+                            release(host, token);
+                        }
+                        if let Err(error) = host.signal_event(finished.event) {
+                            tracing::error!(%error, ?ticket, "gsv: a gpu job's event was not signalled");
+                        }
+                    }
                     if let GpuCompletion::SyncpointChanged { id, value } = gpu {
                         for event in state.fire(id, value) {
                             signal(host, event);
@@ -476,6 +505,7 @@ impl Shared {
         let waiters = saved.check(&syncpoints)?;
         let state = GsvShared {
             watchers: saved.watchers,
+            gpu: GpuMemory::new(),
             waiters,
         };
         Ok(Self::with_state(state, syncpoints, queue, service))
