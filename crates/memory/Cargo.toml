@@ -10,6 +10,11 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Exports `FakeWatchKernel`, the kernel's half of a `WriteWatch`, for other crates' tests
+# (`docs/specs/testing.md`, "Shared test support").
+test-support = []
+
 [dependencies]
 thiserror.workspace = true
 

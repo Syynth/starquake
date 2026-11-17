@@ -154,7 +154,7 @@ fn a_full_handle_table_leaves_no_main_thread() {
     assert_eq!(record.threads().count(), 0);
     assert_eq!(record.tls().used(), 0);
     assert_eq!(record.state(), ProcessState::Created);
-    assert_eq!(tables.scheduler.objects().len(), 1);
+    assert_eq!(tables.scheduler.objects_besides_processes(), 1);
 }
 
 #[test]
@@ -229,7 +229,11 @@ fn a_main_thread_that_fails_to_start_is_undone() {
             tables.scheduler.thread(thread).is_err(),
             "started: {started}"
         );
-        assert_eq!(tables.scheduler.objects().len(), 0, "started: {started}");
+        assert_eq!(
+            tables.scheduler.objects_besides_processes(),
+            0,
+            "started: {started}"
+        );
         let record = tables.scheduler.process(own).unwrap();
         assert_eq!(record.state(), ProcessState::Created, "started: {started}");
         assert_eq!(record.threads().count(), 0, "started: {started}");

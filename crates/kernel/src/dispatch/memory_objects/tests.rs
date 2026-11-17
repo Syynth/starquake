@@ -391,10 +391,10 @@ fn a_translation_with_no_backing_to_share_is_the_kernels_failure() {
     );
     world.log.refuse(false);
     assert_eq!(*results.lock().unwrap(), [Err(KernelError::InvalidState)]);
-    // Nothing was made: the object table holds the session alone.
+    // Nothing was made: the object table holds the session alone, besides the process.
     let objects = world
         .dispatcher
-        .with::<(&Scheduler,), _>(|(scheduler,)| scheduler.objects().len());
+        .with::<(&Scheduler,), _>(|(scheduler,)| scheduler.objects_besides_processes());
     assert_eq!(objects, 1);
 }
 

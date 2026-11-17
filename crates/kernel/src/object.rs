@@ -60,7 +60,7 @@ use thiserror::Error;
 use crate::handle::{Closed, ObjectRefs, RefError};
 use crate::id::{ObjectId, ProcessId, ThreadId};
 use crate::memory::{SharedMemory, TransferMemory};
-use crate::result::SvcError;
+use crate::result::{KernelError, SvcError};
 use crate::slab::{Slab, SlabError};
 use crate::sync::{Event, ReadableEvent};
 
@@ -108,20 +108,29 @@ pub enum ObjectError {
     Corrupt,
 }
 
-impl From<ObjectError> for SvcError {
-    /// The one place an object table failure becomes what a system call returns. A full table
-    /// is Horizon's `ResultOutOfResource` (what `KSlabAllocated::Create` returning null becomes
-    /// in the calls that allocate an object, for example `CreateThread` in
-    /// `eden/src/core/hle/kernel/svc/svc_thread.cpp`). Every other failure is internal: a system
+impl ObjectError {
+    /// The one place an object table failure is given its Horizon result, if it has one. A
+    /// full table is Horizon's `ResultOutOfResource` (what `KSlabAllocated::Create` returning
+    /// null becomes in the calls that allocate an object, for example `CreateThread` in
+    /// `eden/src/core/hle/kernel/svc/svc_thread.cpp`). Every other failure has none: a system
     /// call reaches an object through a handle, and the handle's reference keeps the object
     /// alive, so a stale id or a broken count is the kernel's own bookkeeping.
-    fn from(error: ObjectError) -> Self {
-        match error {
-            ObjectError::Full { .. } => Self::Kernel(crate::result::KernelError::OutOfResource),
-            ObjectError::Stale { .. } | ObjectError::Refs(_) | ObjectError::Corrupt => {
-                Self::internal(&error)
-            }
+    #[must_use]
+    pub const fn kernel_error(&self) -> Option<KernelError> {
+        match self {
+            Self::Full { .. } => Some(KernelError::OutOfResource),
+            Self::Stale { .. } | Self::Refs(_) | Self::Corrupt => None,
         }
+    }
+}
+
+impl From<ObjectError> for SvcError {
+    /// What a system call returns for an object table failure: its
+    /// [`ObjectError::kernel_error`], or an internal error when it has none.
+    fn from(error: ObjectError) -> Self {
+        error
+            .kernel_error()
+            .map_or_else(|| Self::internal(&error), Self::Kernel)
     }
 }
 
@@ -277,7 +286,6 @@ mod tests {
     use super::*;
     use crate::handle::{Handle, HandleError, HandleTable};
     use crate::id::SlabId;
-    use crate::result::KernelError;
 
     fn thread(n: u32) -> Object {
         Object::Thread(ThreadId::from_parts(n, 1))
@@ -459,8 +467,10 @@ mod tests {
     #[test]
     fn a_full_table_is_out_of_resource_and_every_other_failure_is_internal() {
         let id = ObjectId::from_parts(4, 2);
+        let full = ObjectError::Full { max_slots: 2 };
+        assert_eq!(full.kernel_error(), Some(KernelError::OutOfResource));
         assert_eq!(
-            SvcError::from(ObjectError::Full { max_slots: 2 }),
+            SvcError::from(full),
             SvcError::Kernel(KernelError::OutOfResource)
         );
         for error in [
@@ -468,6 +478,7 @@ mod tests {
             ObjectError::Refs(RefError::NotReferenced { object: id }),
             ObjectError::Corrupt,
         ] {
+            assert_eq!(error.kernel_error(), None, "{error}");
             assert_eq!(SvcError::from(error), SvcError::Internal(error.to_string()));
         }
         assert_eq!(

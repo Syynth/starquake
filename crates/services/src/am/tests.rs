@@ -304,8 +304,9 @@ fn open_application_proxy_needs_the_process_id_and_the_process_handle() {
         (false, Some(process), UNKNOWN),
         (true, None, INVALID_CMIF_REQUEST),
         (false, None, UNKNOWN),
-        // A handle that names nothing is the kernel's error. The current-process pseudo-handle
-        // libnx sends is one, in a kernel that does not resolve it.
+        // A handle that names nothing is the kernel's error. The fake kernel does not translate
+        // a request's handles, so the current-process pseudo-handle libnx sends names nothing
+        // here; the kernel crate resolves it (`starquake_kernel::ipc::message`).
         (
             true,
             Some(Handle::CURRENT_PROCESS.raw()),
