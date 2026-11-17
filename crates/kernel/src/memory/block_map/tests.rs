@@ -1242,3 +1242,61 @@ proptest! {
         prop_assert_eq!(found, expected.map(page));
     }
 }
+
+// ----- A map from saved blocks ---------------------------------------------------------------
+
+#[test]
+fn a_map_from_saved_blocks_is_whole_or_refused() {
+    use super::super::block::BlockCounts;
+
+    // A map with a few changes, rebuilt from its own blocks, is the same map.
+    let mut original = map();
+    original
+        .update(
+            page(4),
+            3,
+            MemoryState::Normal,
+            MemoryPermission::USER_READ_WRITE,
+            MemoryAttribute::NONE,
+            DisableMerge::NORMAL,
+            DisableMerge::NONE,
+        )
+        .unwrap();
+    original.update_lock(page(5), 1, DeviceLock::Share).unwrap();
+    let blocks: Vec<MemoryBlock> = original.blocks().copied().collect();
+    assert_eq!(blocks.len(), 5);
+    assert_eq!(
+        BlockMap::restored(BASE, page(PAGES), blocks.iter().copied()),
+        Ok(original)
+    );
+    // A block missing leaves a hole; the map's start is the error's address.
+    let broken = BlockMapError::Broken { address: BASE };
+    let mut holed = blocks.clone();
+    holed.remove(2);
+    assert_eq!(BlockMap::restored(BASE, page(PAGES), holed), Err(broken));
+    // Blocks that do not reach the map's end.
+    assert_eq!(
+        BlockMap::restored(BASE, page(PAGES + 1), blocks.iter().copied()),
+        Err(broken)
+    );
+    // A device-shared block with no count behind it.
+    let mut uncounted = blocks;
+    let at = uncounted
+        .iter()
+        .position(|block| block.attribute().contains(MemoryAttribute::DEVICE_SHARED))
+        .unwrap();
+    let shared = uncounted[at];
+    uncounted[at] = MemoryBlock::restored(
+        shared.address(),
+        shared.pages(),
+        (shared.state(), shared.permission(), shared.attribute()),
+        shared.original_permission(),
+        BlockCounts::default(),
+        shared.disable_merge(),
+    )
+    .unwrap();
+    assert_eq!(
+        BlockMap::restored(BASE, page(PAGES), uncounted),
+        Err(broken)
+    );
+}

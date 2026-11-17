@@ -143,6 +143,31 @@ impl BlockMap {
         })
     }
 
+    /// A map of `start..end` holding `blocks`, as a snapshot saved them
+    /// (`memory::space::snapshot`): refused with [`BlockMapError::Broken`] unless they pass
+    /// [`Self::check_state`] (they tile the map in order, no two neighbours could be merged, and
+    /// a lock or share attribute has its count), with `start` as the error's address. The
+    /// restore checks each block before this, with its own errors; this is the map's own guard.
+    pub(super) fn restored(
+        start: u64,
+        end: u64,
+        blocks: impl IntoIterator<Item = MemoryBlock>,
+    ) -> Result<Self, BlockMapError> {
+        let map = Self {
+            start,
+            end,
+            blocks: blocks
+                .into_iter()
+                .map(|block| (block.address(), block))
+                .collect(),
+        };
+        if map.check_state() {
+            Ok(map)
+        } else {
+            Err(BlockMapError::Broken { address: start })
+        }
+    }
+
     /// The first address the map covers.
     #[must_use]
     pub const fn start(&self) -> u64 {

@@ -21,7 +21,7 @@ use crate::system::host::ONE_VM;
 
 /// The test program: loads the doubleword at `x1` into `x0`, stores `x2` eight bytes past
 /// it, and makes a system call: three instructions, well inside one page.
-fn program() -> Vec<u8> {
+pub(super) fn program() -> Vec<u8> {
     a64::to_bytes(&[
         a64::ldr(0, 1, 0).unwrap(),
         a64::str(2, 1, 8).unwrap(),
@@ -30,7 +30,7 @@ fn program() -> Vec<u8> {
 }
 
 /// Runs the test program from its first instruction with `x1` = `address` and `x2` = `value`.
-fn run(vcpu: &mut HvfVcpu, address: u64, value: u64) -> Exit {
+pub(super) fn run(vcpu: &mut HvfVcpu, address: u64, value: u64) -> Exit {
     let mut regs = GuestRegs {
         pc: CODE,
         ..GuestRegs::default()

@@ -174,6 +174,16 @@ use super::state::{
 use crate::id::{ObjectId, ProcessId};
 use crate::result::{CallResult, KernelError, SvcError, SvcResult};
 
+/// The state flags every block of a device-share lock's range has: what
+/// [`AddressSpace::lock_device_share`] tests (`CanAlignedDeviceMap | ReferenceCounted`), and
+/// what [`AddressSpace::unlock_device_share`] tests (`CanDeviceMap`). A restore refuses a lock
+/// over a block without them (`snapshot`, check 7).
+pub(super) const DEVICE_SHARE_LOCK_STATE: u32 =
+    flag::CAN_ALIGNED_DEVICE_MAP | flag::REFERENCE_COUNTED;
+
+/// The state flag [`AddressSpace::unlock_device_share`] tests (`CanDeviceMap`).
+pub(super) const DEVICE_SHARE_UNLOCK_STATE: u32 = flag::CAN_DEVICE_MAP;
+
 /// Free pages kept on each side of a mapping the kernel places for a process
 /// (`KPageTableBase::GetNumGuardPages`, for a page table that is not the kernel's).
 pub const GUARD_PAGES: u64 = 4;
@@ -351,6 +361,9 @@ struct SharedMapping {
 /// One process's memory blocks, regions, heap and memory accounting (kernel spec, "Tables
 /// behind a dispatcher": the `AddressSpace` table).
 pub struct AddressSpace {
+    /// What the address space was created from: the program's code and the layout's inputs,
+    /// which a snapshot saves so that a restore can lay the regions out again and compare.
+    created_from: ProcessMemory,
     regions: Regions,
     blocks: BlockMap,
     /// One past the last byte of the heap (`m_current_heap_end`).
@@ -430,6 +443,7 @@ impl fmt::Debug for AddressSpace {
                 "mapped_physical_memory_size",
                 &self.mapped_physical_memory_size,
             )
+            .field("created_from", &self.created_from)
             .finish_non_exhaustive()
     }
 }
@@ -437,6 +451,83 @@ impl fmt::Debug for AddressSpace {
 /// A failure of the block map, which no guest input explains.
 fn broken(error: BlockMapError) -> SvcError {
     SvcError::internal(&error)
+}
+
+/// Where the regions of an address space created from `memory` go: the code checked for whole
+/// pages ([`LayoutError::BadCode`]), then laid out ([`Regions::new`]). What
+/// [`AddressSpace::new`] does first, and what a snapshot's restore compares the saved regions
+/// with.
+fn layout(memory: &ProcessMemory) -> Result<Regions, LayoutError> {
+    if !memory.code_address.is_multiple_of(PAGE_SIZE) || !memory.code_size.is_multiple_of(PAGE_SIZE)
+    {
+        return Err(LayoutError::BadCode {
+            address: memory.code_address,
+            size: memory.code_size,
+        });
+    }
+    Regions::new(&LayoutRequest {
+        code_address: memory.code_address,
+        code_size: memory.code_size,
+        physical_memory_size: memory.arrangement.physical_memory_size(),
+        alias_region_extra: memory.alias_region_extra,
+        offsets: memory.offsets,
+    })
+}
+
+/// The most memory a process with these regions may use: the heap region's size (see "The
+/// largest process memory" in the module docs' divergences).
+const fn max_process_memory(regions: &Regions) -> u64 {
+    regions.heap.size()
+}
+
+/// The region memory of `state` goes in (`GetRegionAddress` and `GetRegionSize`), or `None`
+/// for [`MemoryState::Inaccessible`], which has none (Eden: `UNREACHABLE`).
+const fn region_for(regions: &Regions, state: MemoryState) -> Option<Region> {
+    use MemoryState as S;
+    Some(match state {
+        S::Free | S::Kernel => regions.address_space,
+        S::Normal => regions.heap,
+        S::Ipc | S::NonSecureIpc | S::NonDeviceIpc => regions.alias,
+        S::Stack => regions.stack,
+        S::Static | S::ThreadLocal => regions.kernel_map,
+        // The alias-code region, which for a 39-bit space is the code region.
+        S::IoMemory
+        | S::IoRegister
+        | S::Shared
+        | S::AliasCode
+        | S::AliasCodeData
+        | S::Transferred
+        | S::SharedTransferred
+        | S::SharedCode
+        | S::GeneratedCode
+        | S::CodeOut
+        | S::Coverage
+        | S::Insecure
+        | S::Code
+        | S::CodeData => regions.code,
+        S::Inaccessible => return None,
+    })
+}
+
+/// [`AddressSpace::can_contain`] for an address space with these regions (`CanContain`).
+fn can_contain(regions: &Regions, address: u64, size: u64, state: MemoryState) -> bool {
+    use MemoryState as S;
+    let Some(region) = region_for(regions, state) else {
+        return false;
+    };
+    let range = Region {
+        start: address,
+        end: address.saturating_add(size),
+    };
+    let in_region = region.holds(address, size);
+    let in_heap = regions.heap.overlaps(range);
+    let in_alias = regions.alias.overlaps(range);
+    match state {
+        S::Free | S::Kernel => in_region,
+        S::Normal => in_region && !in_alias,
+        S::Ipc | S::NonSecureIpc | S::NonDeviceIpc => in_region && !in_heap,
+        _ => in_region && !in_heap && !in_alias,
+    }
 }
 
 impl AddressSpace {
@@ -450,30 +541,16 @@ impl AddressSpace {
     /// code the pool has no room for [`KernelError::LimitReached`] inside
     /// [`CreateError::Code`].
     pub fn new(memory: &ProcessMemory, mapper: Box<dyn Mapper>) -> Result<Self, CreateError> {
-        if !memory.code_address.is_multiple_of(PAGE_SIZE)
-            || !memory.code_size.is_multiple_of(PAGE_SIZE)
-        {
-            return Err(LayoutError::BadCode {
-                address: memory.code_address,
-                size: memory.code_size,
-            }
-            .into());
-        }
-        let regions = Regions::new(&LayoutRequest {
-            code_address: memory.code_address,
-            code_size: memory.code_size,
-            physical_memory_size: memory.arrangement.physical_memory_size(),
-            alias_region_extra: memory.alias_region_extra,
-            offsets: memory.offsets,
-        })?;
+        let regions = layout(memory)?;
         let blocks = BlockMap::new(regions.address_space.start, regions.address_space.end)
             .map_err(broken)?;
         let mut space = Self {
+            created_from: *memory,
             regions,
             blocks,
             heap_end: regions.heap.start,
             max_heap_size: 0,
-            max_process_memory: regions.heap.size(),
+            max_process_memory: max_process_memory(&regions),
             limit: MemoryLimit::new(memory.arrangement.application_pool_size()),
             code_size: memory.code_size,
             main_thread_stack_size: 0,
@@ -576,31 +653,8 @@ impl AddressSpace {
 
     /// The region memory of `state` goes in (`GetRegionAddress` and `GetRegionSize`), or
     /// `None` for [`MemoryState::Inaccessible`], which has none (Eden: `UNREACHABLE`).
-    fn region_for(&self, state: MemoryState) -> Option<Region> {
-        use MemoryState as S;
-        Some(match state {
-            S::Free | S::Kernel => self.regions.address_space,
-            S::Normal => self.regions.heap,
-            S::Ipc | S::NonSecureIpc | S::NonDeviceIpc => self.regions.alias,
-            S::Stack => self.regions.stack,
-            S::Static | S::ThreadLocal => self.regions.kernel_map,
-            // The alias-code region, which for a 39-bit space is the code region.
-            S::IoMemory
-            | S::IoRegister
-            | S::Shared
-            | S::AliasCode
-            | S::AliasCodeData
-            | S::Transferred
-            | S::SharedTransferred
-            | S::SharedCode
-            | S::GeneratedCode
-            | S::CodeOut
-            | S::Coverage
-            | S::Insecure
-            | S::Code
-            | S::CodeData => self.regions.code,
-            S::Inaccessible => return None,
-        })
+    const fn region_for(&self, state: MemoryState) -> Option<Region> {
+        region_for(&self.regions, state)
     }
 
     /// Whether the `size` bytes at `address` may hold memory of `state` (`CanContain`): inside
@@ -608,23 +662,7 @@ impl AddressSpace {
     /// there.
     #[must_use]
     pub fn can_contain(&self, address: u64, size: u64, state: MemoryState) -> bool {
-        use MemoryState as S;
-        let Some(region) = self.region_for(state) else {
-            return false;
-        };
-        let range = Region {
-            start: address,
-            end: address.saturating_add(size),
-        };
-        let in_region = region.holds(address, size);
-        let in_heap = self.regions.heap.overlaps(range);
-        let in_alias = self.regions.alias.overlaps(range);
-        match state {
-            S::Free | S::Kernel => in_region,
-            S::Normal => in_region && !in_alias,
-            S::Ipc | S::NonSecureIpc | S::NonDeviceIpc => in_region && !in_heap,
-            _ => in_region && !in_heap && !in_alias,
-        }
+        can_contain(&self.regions, address, size, state)
     }
 
     /// The page count of a range that is whole pages inside the address space, or
@@ -1571,7 +1609,7 @@ impl AddressSpace {
     pub(crate) fn lock_device_share(&mut self, address: u64, size: u64) -> CallResult<()> {
         let pages = self.pages_of(address, size)?;
         // Check the memory state.
-        let test_state = flag::CAN_ALIGNED_DEVICE_MAP | flag::REFERENCE_COUNTED;
+        let test_state = DEVICE_SHARE_LOCK_STATE;
         let check = Check {
             state_mask: test_state,
             state: test_state,
@@ -1626,8 +1664,8 @@ impl AddressSpace {
         let pages = self.pages_of(address, size)?;
         // Check the memory state.
         let check = Check {
-            state_mask: flag::CAN_DEVICE_MAP,
-            state: flag::CAN_DEVICE_MAP,
+            state_mask: DEVICE_SHARE_UNLOCK_STATE,
+            state: DEVICE_SHARE_UNLOCK_STATE,
             permission_mask: MemoryPermission::NONE,
             permission: MemoryPermission::NONE,
             attribute_mask: MemoryAttribute::DEVICE_SHARED | MemoryAttribute::LOCKED,
@@ -1719,6 +1757,8 @@ impl AddressSpace {
         false
     }
 }
+
+pub mod snapshot;
 
 #[cfg(test)]
 mod tests;
