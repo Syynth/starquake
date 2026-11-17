@@ -43,11 +43,6 @@ dependencies = ["starquake-shader"]
 reason = "gpu depends on shader (docs/architecture.md, 'Crates and dependency direction'); the back asks the shader cache for programs, which is not written yet"
 
 [[allow]]
-package = "starquake-gpu"
-dependencies = ["tracing"]
-reason = "engine and front/back logging arrives with the command processor; only the macro interpreter exists"
-
-[[allow]]
 package = "starquake-gsv"
 dependencies = ["starquake-gpu", "starquake-ipc", "starquake-kernel", "starquake-services"]
 reason = "the graphics service layer sits on services and gpu (docs/architecture.md); the crate is a scaffold with no code yet"

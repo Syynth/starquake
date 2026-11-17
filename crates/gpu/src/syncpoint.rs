@@ -29,7 +29,10 @@
 //! same pattern (gsv: set the watched bit, then read the counter; the incrementer: add to the
 //! counter, then read the watched bit), so for every increment either gsv's read sees its value
 //! or the incrementer sees the bit and pushes. The threaded test
-//! `an_increment_after_a_watch_is_either_seen_or_pushed` pins it.
+//! `an_increment_after_a_watch_is_either_seen_or_pushed` checks the outcome (no value above the
+//! one gsv read goes unpushed) and fails if `increment` skips the push; it cannot show that a
+//! weaker ordering is wrong, since a weakly ordered race is not reliably reproduced on the host,
+//! so the orderings are for review to keep.
 //!
 //! # What is recorded and what is snapshotted
 //!
@@ -46,7 +49,8 @@
 //!
 //! # Divergences from Eden
 //!
-//! Each is pinned by a test in `syncpoint/tests.rs`:
+//! Each but the fourth, which changes no result, is pinned by the test of `syncpoint/tests.rs`
+//! it names:
 //!
 //! - **[`Syncpoints::reached`] uses the 32-bit wrapping comparison for every id.** Eden's
 //!   `HasSyncpointExpired` uses it only for client-managed ids (26 and 27); for the others it
@@ -55,11 +59,14 @@
 //!   names the wrapping comparison (`reached`, "32-bit wrapping comparison"), so a fence beyond
 //!   the maximum is not reached here (`a_fence_beyond_the_maximum_is_not_reached`). The
 //!   client-managed flag Eden keeps only for that choice is not kept.
-//! - **Errors instead of assertions.** Where Eden asserts and returns 0 or an empty fence, this
-//!   returns [`SyncpointError`]: allocating with every id taken ([`SyncpointError::Exhausted`];
-//!   `allocation_exhausts_at_exactly_the_allocatable_count`), and freeing, raising the maximum
-//!   of, or taking the fence of an id that is not allocated ([`SyncpointError::NotAllocated`];
-//!   `operations_on_an_unallocated_id_are_errors`).
+//! - **Errors instead of assertions.** Eden asserts in these four cases and, past the
+//!   assertion, carries on: `FindFreeSyncpoint` returns 0 with every id taken, so
+//!   `AllocateSyncpoint` reserves and returns id 0; `FreeSyncpoint` of an id that is not
+//!   allocated clears the flag anyway; `IncrementSyncpointMaxExt` returns 0; and
+//!   `GetSyncpointFence` returns an empty fence. Here allocation with every id taken is
+//!   [`SyncpointError::Exhausted`] (`allocation_exhausts_at_exactly_the_allocatable_count`),
+//!   and the other three on an id that is not allocated are [`SyncpointError::NotAllocated`],
+//!   changing nothing (`operations_on_an_unallocated_id_are_errors`).
 //! - **[`Syncpoints::read`] reads any id.** Eden's `ReadSyncpointMinValue` asserts on an id
 //!   that is not allocated; the GPU reads through the syncpoint shim and increments without
 //!   asking gsv, so here reads and increments work on any id
@@ -73,7 +80,7 @@
 //!
 //! Kept as Eden does it: an id's counter and maximum are not reset when it is freed or
 //! allocated again (`a_reallocated_id_keeps_its_values`), and a reserved id can be freed like
-//! any other.
+//! any other and is then allocated in its turn (`a_reserved_id_can_be_freed_and_allocated`).
 //!
 //! # Guesses
 //!
