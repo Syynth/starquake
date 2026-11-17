@@ -263,16 +263,13 @@ fn closing_a_group_frees_its_channels_and_closing_a_channel_does_not() {
     let other = direct.open(Device::NvhostTsgGpu);
     direct.ioctl(tsg, BIND_CHANNEL, &binding(a));
     direct.ioctl(tsg, BIND_CHANNEL, &binding(b));
-    assert_eq!(
-        direct.state.close(i32::try_from(b).unwrap()),
-        NvResult::Success
-    );
+    assert_eq!(direct.close(i32::try_from(b).unwrap()), NvResult::Success);
     assert_eq!(bound(&direct, tsg), [(a, 0), (b, 0)]);
     assert_eq!(
         direct.ioctl(tsg, UNBIND_CHANNEL, &binding(b)).result,
         NvResult::Success
     );
-    assert_eq!(direct.state.close(tsg), NvResult::Success);
+    assert_eq!(direct.close(tsg), NvResult::Success);
     assert_eq!(direct.state.tsg_gpu().group(1), None);
     assert_eq!(
         direct.ioctl(other, BIND_CHANNEL, &binding(a)).result,

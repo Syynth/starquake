@@ -13,6 +13,7 @@ use std::sync::Arc;
 use proptest::prelude::*;
 use proptest::test_runner::{Config, RngAlgorithm, RngSeed};
 use starquake_gpu::interface::{SYNCPOINT_COUNT, Target};
+use starquake_kernel::result::KernelError;
 use starquake_services::framework::UnknownPolicy;
 
 use super::super::tests::{
@@ -532,25 +533,315 @@ fn address_spaces_are_bounded_with_gpu_33_s() {
     );
 }
 
-/// Closing an fd drops its view, not its address space; a new fd starts with no view.
-#[test]
-fn closing_keeps_the_address_space() {
-    let (mut direct, fd) = opened();
-    let request = plain(0, 0x10_0000, 0x100_0000, 0x40_0000);
+// ----- Closing -----------------------------------------------------------------------------------
+
+/// The layout [`own_space`] asks for: small pages from 1 MiB to 4 MiB, big pages to 16 MiB.
+const OWN: [u64; 3] = [0x10_0000, 0x100_0000, 0x40_0000];
+
+/// A parentless `AllocAsEx` on a new fd, which must succeed: the fd and its new space.
+fn own_space(direct: &mut Direct) -> (i32, AsId) {
+    let fd = direct.open(Device::NvhostAsGpu);
+    let [start, end, split] = OWN;
+    let request = plain(0, start, end, split);
     assert_eq!(
         direct.ioctl(fd, AS_ALLOC_AS_EX, &request).result,
         NvResult::Success
     );
-    assert_eq!(direct.state.close(fd), NvResult::Success);
-    assert_eq!(direct.state.as_gpu().view(1), None);
-    assert_eq!(
-        direct.memory.address_spaces().collect::<Vec<_>>(),
-        [AsId(1)]
-    );
-    assert!(direct.state.as_gpu().made(AsId(1)).is_some());
+    (
+        fd,
+        direct
+            .state
+            .as_gpu()
+            .view(fd.cast_unsigned())
+            .unwrap()
+            .space,
+    )
+}
+
+/// A flags-5 view of `space` on a new fd, inside [`OWN`]'s small pages, or, for a space gpu 33
+/// made, inside the native layout's: the fd, and the result.
+fn view_of(direct: &mut Direct, space: AsId, native: bool) -> (i32, NvResult) {
     let fd = direct.open(Device::NvhostAsGpu);
-    let answer = direct.ioctl(fd, AS_GET_VA_REGIONS, &va_request());
-    assert_eq!(answer.result, NvResult::BadValue);
+    let range = if native {
+        [WINDOW_START, 0xA0_0000_0000, 0]
+    } else {
+        [OWN[0], OWN[2], 0]
+    };
+    let as_fd = i32::try_from(space.0).unwrap();
+    let request = alloc(5, as_fd, 0x1000, 0, range);
+    (fd, direct.ioctl(fd, AS_ALLOC_AS_EX, &request).result)
+}
+
+/// The address spaces gsv holds.
+fn spaces(direct: &Direct) -> Vec<AsId> {
+    direct.memory.address_spaces().collect()
+}
+
+/// Every update the front was sent.
+fn updates(direct: &Direct) -> Vec<FrontCall> {
+    let calls = direct.front.calls();
+    calls
+        .into_iter()
+        .filter(|call| matches!(call, FrontCall::Update(..)))
+        .collect()
+}
+
+/// A space held by a creator and a child view: closing either first keeps it (the view that is
+/// left still answers its shim, and nothing is sent to the GPU); closing the other destroys it,
+/// its layout is forgotten and its shim's page unmapped. A new fd starts with no view.
+#[test]
+fn the_last_close_destroys_the_space_and_the_one_before_keeps_it() {
+    for creator_first in [true, false] {
+        let mut direct = Direct::new();
+        let (creator, space) = own_space(&mut direct);
+        let (child, result) = view_of(&mut direct, space, false);
+        assert_eq!(result, NvResult::Success);
+        let shim = OWN[2] - SMALL_PAGE_SIZE;
+        let answer = direct.ioctl(child, AS_SHIM_INFO, &shim_request());
+        assert_eq!(answer.output, shim_reply(shim, 4, SYNCPOINT_COUNT));
+        let (first, last) = if creator_first {
+            (creator, child)
+        } else {
+            (child, creator)
+        };
+
+        assert_eq!(direct.close(first), NvResult::Success);
+        assert_eq!(spaces(&direct), [space], "creator first: {creator_first}");
+        assert!(direct.state.as_gpu().made(space).is_some());
+        assert_eq!(updates(&direct), []);
+        let answer = direct.ioctl(last, AS_SHIM_INFO, &shim_request());
+        assert_eq!(
+            (answer.result, answer.output),
+            (NvResult::Success, shim_reply(shim, 4, SYNCPOINT_COUNT))
+        );
+
+        assert_eq!(direct.close(last), NvResult::Success);
+        assert_eq!(spaces(&direct), []);
+        assert_eq!(direct.state.as_gpu().made(space), None);
+        assert_eq!(direct.state.as_gpu().fds().count(), 0);
+        let range = starquake_memory::PageRange::new(shim, SMALL_PAGE_SIZE).unwrap();
+        assert_eq!(
+            updates(&direct),
+            [FrontCall::Update(
+                space,
+                starquake_gpu::interface::VmUpdate::Unmap { range },
+                None
+            )]
+        );
+        let fd = direct.open(Device::NvhostAsGpu);
+        let answer = direct.ioctl(fd, AS_GET_VA_REGIONS, &va_request());
+        assert_eq!(answer.result, NvResult::BadValue);
+    }
+}
+
+/// Opening, allocating and closing more times than there are address spaces never runs out,
+/// with no other space held and with every other slot held by gpu 33; each space takes a new
+/// id.
+#[test]
+fn opening_allocating_and_closing_never_runs_out() {
+    for held in [0, MAX_ADDRESS_SPACES - 1] {
+        let mut direct = Direct::new();
+        for _ in 0..held {
+            direct.memory.create_address_space(&direct.front).unwrap();
+        }
+        let rounds = 2 * MAX_ADDRESS_SPACES + 1;
+        for round in 0..rounds {
+            let (fd, space) = own_space(&mut direct);
+            let id = u32::try_from(held + round).unwrap() + FIRST_ADDRESS_SPACE.0;
+            assert_eq!(space, AsId(id), "held {held}, round {round}");
+            assert_eq!(spaces(&direct).len(), held + 1);
+            assert_eq!(direct.close(fd), NvResult::Success);
+            assert_eq!(spaces(&direct).len(), held);
+        }
+    }
+}
+
+/// gpu 33 and nvhost-as-gpu share [`MAX_ADDRESS_SPACES`], whichever path made the spaces below
+/// it: one below the limit, either path makes the last; at the limit both refuse; the last
+/// close of an as-gpu space frees a slot that either path then takes.
+#[test]
+fn gpu_33_and_as_gpu_share_the_slots_at_the_limit() {
+    for as_gpu_below in [false, true] {
+        let mut direct = Direct::new();
+        let mut fds = Vec::new();
+        for _ in 0..MAX_ADDRESS_SPACES - 1 {
+            if as_gpu_below {
+                fds.push(own_space(&mut direct).0);
+            } else {
+                direct.memory.create_address_space(&direct.front).unwrap();
+            }
+        }
+        // One below the limit: the last slot, by the other path than the ones below.
+        let last = if as_gpu_below {
+            direct
+                .memory
+                .create_address_space(&direct.front)
+                .map(|_| ())
+        } else {
+            fds.push(own_space(&mut direct).0);
+            Ok(())
+        };
+        assert_eq!(last, Ok(()));
+        assert_eq!(spaces(&direct).len(), MAX_ADDRESS_SPACES);
+        // At the limit: both refuse.
+        assert_eq!(
+            direct.memory.create_address_space(&direct.front),
+            Err(KernelError::OutOfResource)
+        );
+        let refused = direct.open(Device::NvhostAsGpu);
+        let [start, end, split] = OWN;
+        let request = plain(0, start, end, split);
+        let answer = direct.ioctl(refused, AS_ALLOC_AS_EX, &request);
+        assert_eq!(answer.result, NvResult::InsufficientMemory);
+        // An as-gpu space's last close frees one slot: gpu 33 takes it, and then both refuse.
+        let fd = fds.pop().unwrap();
+        assert_eq!(direct.close(fd), NvResult::Success);
+        assert_eq!(spaces(&direct).len(), MAX_ADDRESS_SPACES - 1);
+        direct.memory.create_address_space(&direct.front).unwrap();
+        let answer = direct.ioctl(refused, AS_ALLOC_AS_EX, &request);
+        assert_eq!(answer.result, NvResult::InsufficientMemory);
+        assert_eq!(
+            direct.memory.create_address_space(&direct.front),
+            Err(KernelError::OutOfResource)
+        );
+        // When another frees one, as-gpu takes it.
+        if let Some(fd) = fds.pop() {
+            assert_eq!(direct.close(fd), NvResult::Success);
+            let answer = direct.ioctl(refused, AS_ALLOC_AS_EX, &request);
+            assert_eq!(answer.result, NvResult::Success);
+            assert_eq!(spaces(&direct).len(), MAX_ADDRESS_SPACES);
+        }
+    }
+}
+
+/// A view of a space gpu 33 made does not hold it alone: gpu 33 does, so closing the view keeps
+/// it, and sends nothing.
+#[test]
+fn closing_a_view_of_a_gpu_33_space_keeps_it() {
+    let mut direct = Direct::new();
+    let space = direct.memory.create_address_space(&direct.front).unwrap();
+    let (fd, result) = view_of(&mut direct, space, true);
+    assert_eq!(result, NvResult::Success);
+    assert_eq!(direct.close(fd), NvResult::Success);
+    assert_eq!(spaces(&direct), [space]);
+    assert_eq!(updates(&direct), []);
+}
+
+/// An `AllocAsEx` naming as its parent the id of a space its last close destroyed is
+/// `BadParameter`, with no view and no space made, and nothing sent to the GPU.
+#[test]
+fn a_view_of_a_destroyed_space_is_a_bad_parameter() {
+    let mut direct = Direct::new();
+    let (creator, space) = own_space(&mut direct);
+    assert_eq!(direct.close(creator), NvResult::Success);
+    assert_eq!(spaces(&direct), []);
+    let sent = updates(&direct);
+    let (fd, result) = view_of(&mut direct, space, false);
+    assert_eq!(result, NvResult::BadParameter);
+    assert_eq!(direct.state.as_gpu().view(fd.cast_unsigned()), None);
+    assert_eq!(spaces(&direct), []);
+    assert_eq!(updates(&direct), sent);
+}
+
+/// After its creator closes, a space a child view still holds can be named as a parent (here
+/// `as_fd` names the space, not the closed fd; module docs, "Where this differs"). The state
+/// the close leaves, the space held by the child alone, survives `postcard` and is accepted
+/// against gsv's memory.
+#[test]
+fn a_child_keeps_the_space_nameable_after_its_creator_closes() {
+    let mut direct = Direct::new();
+    let (creator, space) = own_space(&mut direct);
+    let (_child, result) = view_of(&mut direct, space, false);
+    assert_eq!(result, NvResult::Success);
+    assert_eq!(direct.close(creator), NvResult::Success);
+    let state = direct.state.as_gpu().clone();
+    let bytes = postcard::to_allocvec(&state).unwrap();
+    let restored = postcard::from_bytes::<AsGpu>(&bytes).unwrap();
+    assert_eq!(restored, state);
+    assert_eq!(restored.check_spaces(&direct.memory), Ok(()));
+    let (second, result) = view_of(&mut direct, space, false);
+    assert_eq!(result, NvResult::Success);
+    assert_eq!(
+        direct
+            .state
+            .as_gpu()
+            .view(second.cast_unsigned())
+            .unwrap()
+            .space,
+        space
+    );
+}
+
+/// An nvsrv state saved before a destroy names a space gsv no longer holds: checked against the
+/// memory after the destroy it is refused, and the state after the destroy is accepted. The
+/// made spaces are checked before the views, so a state with both faults reports the made
+/// space.
+#[test]
+fn a_state_saved_before_a_destroy_is_refused_against_the_memory_after_it() {
+    let mut direct = Direct::new();
+    let native = direct.memory.create_address_space(&direct.front).unwrap();
+    let (on_native, result) = view_of(&mut direct, native, true);
+    assert_eq!(result, NvResult::Success);
+    let (creator, space) = own_space(&mut direct);
+    let before = direct.state.as_gpu().clone();
+    assert_eq!(before.check_spaces(&direct.memory), Ok(()));
+
+    assert_eq!(direct.close(creator), NvResult::Success);
+    assert_eq!(direct.state.as_gpu().check_spaces(&direct.memory), Ok(()));
+    assert_eq!(
+        before.check_spaces(&direct.memory),
+        Err(AsGpuStateError::MadeSpaceNotHeld { space: space.0 })
+    );
+    // A view of a space gsv does not hold, alone and beside the made space's fault.
+    let fd = on_native.cast_unsigned();
+    let empty = GpuMemory::new();
+    let views_only =
+        AsGpu::try_from(saved(&[(fd, direct.state.as_gpu().view(fd).unwrap())], &[])).unwrap();
+    assert_eq!(
+        views_only.check_spaces(&empty),
+        Err(AsGpuStateError::ViewSpaceNotHeld {
+            fd,
+            space: native.0
+        })
+    );
+    assert_eq!(
+        before.check_spaces(&empty),
+        Err(AsGpuStateError::MadeSpaceNotHeld { space: space.0 })
+    );
+}
+
+/// `check_spaces` walks the made spaces in id order: of two that gsv does not hold, the lower
+/// is reported.
+#[test]
+fn check_spaces_reports_the_lowest_unheld_made_space() {
+    let creator = |id| View {
+        space: AsId(id),
+        layout: MADE,
+    };
+    let state = AsGpu::try_from(saved(
+        &[(1, creator(4)), (2, creator(3))],
+        &[(AsId(3), MADE), (AsId(4), MADE)],
+    ))
+    .unwrap();
+    assert_eq!(
+        state.check_spaces(&GpuMemory::new()),
+        Err(AsGpuStateError::MadeSpaceNotHeld { space: 3 })
+    );
+}
+
+/// `check_spaces` walks the views in fd order: of two views of spaces gsv does not hold, the
+/// lower fd's is reported, though its space has the higher id.
+#[test]
+fn check_spaces_reports_the_lowest_fd_whose_space_is_unheld() {
+    let native = |id| View {
+        space: AsId(id),
+        layout: child_of(&NATIVE_LAYOUT),
+    };
+    let state = AsGpu::try_from(saved(&[(1, native(6)), (2, native(5))], &[])).unwrap();
+    assert_eq!(
+        state.check_spaces(&GpuMemory::new()),
+        Err(AsGpuStateError::ViewSpaceNotHeld { fd: 1, space: 6 })
+    );
 }
 
 // ----- GetVARegions and the shim -----------------------------------------------------------------
@@ -982,7 +1273,8 @@ fn a_saved_state_alloc_as_ex_cannot_reach_is_refused() {
             AsGpuStateError::MadeLayout { space: 3 },
         ),
     ];
-    for (state, error) in cases.into_iter().chain(unissued_and_creators()) {
+    let more = unissued_and_creators().into_iter().chain(unheld());
+    for (state, error) in cases.into_iter().chain(more) {
         assert_eq!(AsGpu::try_from(state), Err(error), "{error}");
     }
 }
@@ -1071,36 +1363,86 @@ fn unissued_and_creators() -> Vec<(SavedAsGpu, AsGpuStateError)> {
     ]
 }
 
+/// The unheld-space cases of `a_saved_state_alloc_as_ex_cannot_reach_is_refused`: a made space
+/// no view holds (only a destroy leaves one), alone, beside a held one, and after the faults
+/// checked before it.
+fn unheld() -> Vec<(SavedAsGpu, AsGpuStateError)> {
+    let space = |id: u32| AsId(id);
+    let view = |id, layout| View {
+        space: space(id),
+        layout,
+    };
+    vec![
+        (
+            saved(&[], &[(space(3), MADE)]),
+            AsGpuStateError::MadeSpaceUnheld { space: 3 },
+        ),
+        // Two unheld: the lower id is reported.
+        (
+            saved(&[], &[(space(3), MADE), (space(4), MADE)]),
+            AsGpuStateError::MadeSpaceUnheld { space: 3 },
+        ),
+        (
+            saved(
+                &[(1, view(4, MADE)), (2, view(5, child_of(&MADE)))],
+                &[(space(3), MADE), (space(4), MADE), (space(5), MADE)],
+            ),
+            AsGpuStateError::MadeSpaceUnheld { space: 3 },
+        ),
+        (
+            saved(
+                &[(1, view(3, MADE)), (2, view(3, MADE))],
+                &[(space(3), MADE), (space(5), MADE)],
+            ),
+            AsGpuStateError::TwoCreators {
+                space: 3,
+                first: 1,
+                second: 2,
+            },
+        ),
+        (
+            saved(
+                &[(
+                    9,
+                    view(
+                        4,
+                        Layout {
+                            end: 0x200_0000,
+                            ..MADE
+                        },
+                    ),
+                )],
+                &[(space(3), MADE), (space(4), MADE)],
+            ),
+            AsGpuStateError::ViewLayout { fd: 9 },
+        ),
+    ]
+}
+
 /// Each relation's reachable side is accepted: the most made spaces, a creator's view, a view of
-/// a made space, a view of a gpu-33 space; and the state survives `postcard`.
+/// a made space, a made space held by a child view alone, a view of a gpu-33 space; and the
+/// state survives `postcard`.
 #[test]
 fn a_saved_state_at_each_edge_is_accepted() {
     let all: Vec<(AsId, Layout)> = (1..=u32::try_from(MAX_ADDRESS_SPACES).unwrap())
         .map(|id| (AsId(id), MADE))
         .collect();
+    let view = |space, layout| View {
+        space: AsId(space),
+        layout,
+    };
     let views = [
-        (
-            3,
-            View {
-                space: AsId(1),
-                layout: MADE,
-            },
-        ),
-        (
-            5,
-            View {
-                space: AsId(1),
-                layout: child_of(&MADE),
-            },
-        ),
-        (
-            6,
-            View {
-                space: AsId(20),
-                layout: child_of(&NATIVE_LAYOUT),
-            },
-        ),
+        (3, view(1, MADE)),
+        (5, view(1, child_of(&MADE))),
+        (6, view(20, child_of(&NATIVE_LAYOUT))),
+        // A made space held only by a child view, as its creator's close leaves it
+        // (`a_child_keeps_the_space_nameable_after_its_creator_closes`).
+        (7, view(2, child_of(&MADE))),
     ];
+    // Every other made space held by its creator's fd.
+    let creators =
+        (3..=u32::try_from(MAX_ADDRESS_SPACES).unwrap()).map(|id| (10 + id, view(id, MADE)));
+    let views: Vec<(u32, View)> = views.into_iter().chain(creators).collect();
     let state = AsGpu::try_from(saved(&views, &all)).unwrap();
     let bytes = postcard::to_allocvec(&state).unwrap();
     assert_eq!(postcard::from_bytes::<AsGpu>(&bytes).unwrap(), state);
@@ -1195,6 +1537,18 @@ fn a_refused_state_is_said_in_plain_words() {
                 second: 2,
             },
             "fds 1 and 2 both hold the layout address space 3 was made with",
+        ),
+        (
+            AsGpuStateError::MadeSpaceUnheld { space: 3 },
+            "address space 3 was made through nvhost-as-gpu but no fd holds it",
+        ),
+        (
+            AsGpuStateError::MadeSpaceNotHeld { space: 4 },
+            "address space 4 was made through nvhost-as-gpu but gsv does not hold it",
+        ),
+        (
+            AsGpuStateError::ViewSpaceNotHeld { fd: 6, space: 5 },
+            "fd 6 has a view of address space 5, which gsv does not hold",
         ),
     ];
     for (error, words) in said {
@@ -1360,8 +1714,13 @@ fn a_restored_server_carries_on_with_views_and_groups() {
             .space,
         AsId(2)
     );
+    // `Close` through the server destroys the restored view's space in gsv's shared state, its
+    // last fd, and keeps the other.
     rig.send(&cmif(CLOSE, &fd.to_le_bytes()));
     assert_eq!(rig.state().as_gpu().view(fd.cast_unsigned()), None);
+    let spaces: Vec<AsId> = rig.shared.lock().gpu().address_spaces().collect();
+    assert_eq!(spaces, [AsId(2)]);
+    assert_eq!(rig.state().as_gpu().made(AsId(1)), None);
 }
 
 /// A view whose address space gsv does not hold (a restore whose nvsrv and gsv states disagree,

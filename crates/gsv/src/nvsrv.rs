@@ -100,8 +100,10 @@
 //! **The server's wiring.** nvhost-as-gpu acts on gsv's GPU memory, the bookkeeping the gpu
 //! session's 33 and its worker use, so [`nvsrv_server`] takes gsv's shared state and the GPU's
 //! front as [`crate::gpu::gpu_server`] does, and its family ([`NvsrvFamily`]) holds them beside
-//! the state. Every ioctl runs with gsv's shared lock held ([`NvsrvFamily::ioctl`]); nothing
-//! under it calls the kernel, and the front never calls back into gsv.
+//! the state. Every ioctl and every `Close` runs with gsv's shared lock held
+//! ([`NvsrvFamily::ioctl`], [`NvsrvFamily::close`]: closing an as-gpu fd can destroy an address
+//! space, [`as_gpu`], "Closing"); nothing under it calls the kernel, and the front never calls
+//! back into gsv.
 //!
 //! # Ioctls
 //!
@@ -142,7 +144,8 @@
 //! The address spaces themselves are gsv's shared state's, saved with it
 //! ([`crate::gpu::saved`]). That a view's address space is one the shared state holds is a
 //! relation between the two snapshots, which neither restore can check alone: composing them is
-//! the wiring slice's (16), as for the gpu session's. Until then a view whose address space is
+//! the wiring slice's (16), as for the gpu session's, which checks it with
+//! [`as_gpu::AsGpu::check_spaces`]. Until then a view whose address space is
 //! missing answers its shim with `BadValue` ([`as_gpu`], `shim_page`) and nothing panics.
 //!
 //! # Where this differs from the references
@@ -668,8 +671,9 @@ impl NvsrvState {
         (fd, NvResult::Success)
     }
 
-    /// `Close` (`Module::Close`): an as-gpu fd's view and a tsg-gpu fd's group go with it.
-    pub fn close(&mut self, fd: i32) -> NvResult {
+    /// `Close` (`Module::Close`): an as-gpu fd's view and a tsg-gpu fd's group go with it, and
+    /// an address space whose last view that was is destroyed in `gpu` ([`as_gpu`], "Closing").
+    pub fn close(&mut self, fd: i32, mut gpu: GpuAccess<'_>) -> NvResult {
         let key = match key(fd) {
             Ok(key) => key,
             Err(result) => return result,
@@ -677,7 +681,7 @@ impl NvsrvState {
         if self.files.remove(&key).is_none() {
             return NvResult::NotImplemented;
         }
-        self.as_gpu.close(key);
+        self.as_gpu.close(key, &mut gpu);
         self.tsg_gpu.close(key);
         NvResult::Success
     }
@@ -809,7 +813,7 @@ impl Nvsrv {
     /// `Close` (2). in: `s32` fd. out: the result.
     fn close(_: &mut Self, cx: &mut Context<'_>, req: &Request<'_>, reply: &mut Reply) -> Outcome {
         let fd = req.payload().read_i32()?;
-        let result = cx.family::<NvsrvFamily>()?.state.close(fd);
+        let result = cx.family::<NvsrvFamily>()?.close(fd);
         reply.payload().write_u32(result.raw());
         reply.ok()
     }
@@ -985,6 +989,18 @@ impl NvsrvFamily {
             front: &*self.front,
         };
         self.state.ioctl(policy, call, gpu)
+    }
+
+    /// [`NvsrvState::close`] with gsv's shared lock held, as for [`ioctl`](Self::ioctl): the
+    /// close may destroy an address space in gsv's GPU memory.
+    pub fn close(&mut self, fd: i32) -> NvResult {
+        let shared = Arc::clone(&self.shared);
+        let mut locked = shared.lock();
+        let gpu = GpuAccess {
+            memory: locked.gpu(),
+            front: &*self.front,
+        };
+        self.state.close(fd, gpu)
     }
 }
 

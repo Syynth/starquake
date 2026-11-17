@@ -2228,3 +2228,266 @@ fn a_destroy_keeps_the_shim_inside_its_mappings() {
     s.rig.drain();
     assert_eq!(s.rig.mappings(s.space), [shim_mapping]);
 }
+
+// ----- Destroying an address space -----------------------------------------------------------
+
+/// A 211 of `pages` pages of registration `handle` at `va` in `space`, device 1, generic kind.
+fn map_bare(gpu: &mut GpuMemory, space: AsId, va: u64, handle: u32, pages: u64) {
+    let request = MapRequest {
+        space,
+        first: va,
+        last: va + pages * PAGE_SIZE - 1,
+        handle,
+        offset: 0,
+        permission: 0,
+        cache: 0,
+        kind: 6,
+        fallback: 6,
+        mode: 0,
+        device: 1,
+        sync: 0,
+    };
+    gpu.map(&request).unwrap();
+}
+
+/// What a destroy of `space` sends: `update`, with no ticket.
+fn destroy_call(space: AsId, update: VmUpdate) -> FrontCall {
+    FrontCall::Update(space, update, None)
+}
+
+/// A destroy sends, in address order and with no ticket, a `DestroySparseRegion` over each
+/// sparse region and an `Unmap` over each run the table maps outside them (touching runs merged;
+/// a 211 inside a region covered by the region's destroy; the shim on the page right after the
+/// region an `Unmap` of its own), which empty the GPU's table; the other address space, which has
+/// pieces at the same addresses, is untouched.
+#[test]
+fn destroying_an_address_space_empties_its_table_in_order() {
+    let (mut gpu, front) = bare();
+    let space = gpu.create_address_space(&front).unwrap();
+    let other = gpu.create_address_space(&front).unwrap();
+    let handle = register_bare(&mut gpu, page_range(MEMORY, MEMORY_SIZE));
+    // A 211 that starts exactly where the registration's own mapping ends.
+    map_bare(&mut gpu, space, MEMORY + MEMORY_SIZE, handle, 2);
+    gpu.create_sparse_region(&SparseRequest {
+        last: REGION + 4 * PAGE_SIZE - 1,
+        ..sparse_at(space, 0, 1)
+    })
+    .unwrap();
+    map_bare(&mut gpu, space, REGION + PAGE_SIZE, handle, 1);
+    let shim = REGION + 4 * PAGE_SIZE;
+    gpu.map_syncpoint_shim(space, shim).unwrap();
+    map_bare(&mut gpu, other, MEMORY + MEMORY_SIZE, handle, 2);
+    let other_before = gpu.mappings(other);
+    let before = front.calls().len();
+
+    assert_eq!(gpu.destroy_address_space(&front, space), Ok(()));
+
+    assert_eq!(
+        front.calls()[before..],
+        [
+            destroy_call(
+                space,
+                VmUpdate::Unmap {
+                    range: page_range(MEMORY, MEMORY_SIZE + 2 * PAGE_SIZE)
+                }
+            ),
+            destroy_call(
+                space,
+                VmUpdate::DestroySparseRegion {
+                    range: page_range(REGION, 4 * PAGE_SIZE),
+                    region: RegionId(1),
+                }
+            ),
+            destroy_call(
+                space,
+                VmUpdate::Unmap {
+                    range: page_range(shim, PAGE_SIZE)
+                }
+            ),
+        ]
+    );
+    assert_eq!(gpu.address_spaces().collect::<Vec<_>>(), [other]);
+    assert!(gpu.table(space).is_none());
+    assert_eq!(gpu.pieces(space), 0);
+    assert_eq!(gpu.mappings(other), other_before);
+    // The GPU applies the removals: its table of the destroyed space is empty.
+    let queue = CompletionQueue::new();
+    front.finish(&queue);
+    let table = Arc::clone(&front.tables.lock().unwrap()[&space]);
+    assert_eq!(table.mappings(), []);
+    assert_eq!(gpu.mappings(other), other_before);
+    // The registration stays.
+    assert!(gpu.registration(handle).is_some());
+}
+
+/// After a destroy every request naming the space (211 to 215 over what the space held, the
+/// shim's placing, and a second destroy) is `NotFound` and sends nothing; the slot is free at
+/// once, and the next space takes a new id.
+#[test]
+fn a_destroyed_space_is_gone_and_its_id_is_never_reused() {
+    let (mut gpu, front) = bare();
+    let spaces: Vec<AsId> = (0..MAX_ADDRESS_SPACES)
+        .map(|_| gpu.create_address_space(&front).unwrap())
+        .collect();
+    assert_eq!(
+        gpu.create_address_space(&front),
+        Err(KernelError::OutOfResource)
+    );
+    let handle = register_bare(&mut gpu, page_range(MEMORY, MEMORY_SIZE));
+    let space = spaces[1];
+    map_bare(&mut gpu, space, GPU_VA, handle, 1);
+    gpu.create_sparse_region(&sparse_at(space, 0, 1)).unwrap();
+    gpu.destroy_address_space(&front, space).unwrap();
+    let calls = front.calls().len();
+    let event = ObjectId::from_parts(4, 5);
+    let range = RangeRequest {
+        space,
+        first: GPU_VA,
+        last: GPU_VA + PAGE_SIZE - 1,
+    };
+    assert_eq!(
+        gpu.destroy_address_space(&front, space),
+        Err(KernelError::NotFound)
+    );
+    let map = MapRequest {
+        space,
+        first: GPU_VA,
+        last: GPU_VA + PAGE_SIZE - 1,
+        handle,
+        offset: 0,
+        permission: 0,
+        cache: 0,
+        kind: 6,
+        fallback: 6,
+        mode: 0,
+        device: 1,
+        sync: 0,
+    };
+    assert_eq!(gpu.map(&map), Err(KernelError::NotFound));
+    // 212 over the mapping the space had.
+    let modify = ModifyRequest {
+        space,
+        first: GPU_VA,
+        last: GPU_VA + PAGE_SIZE - 1,
+        kind: 6,
+        fallback: 6,
+    };
+    assert_eq!(
+        gpu.modify_kind(&front, &modify, event),
+        Err(KernelError::NotFound)
+    );
+    assert_eq!(gpu.unmap(&front, &range, event), Err(KernelError::NotFound));
+    assert_eq!(
+        gpu.create_sparse_region(&sparse_at(space, 1, 1)),
+        Err(KernelError::NotFound)
+    );
+    // 215 over the sparse region the space had.
+    let region = RangeRequest {
+        space,
+        first: REGION,
+        last: REGION + PAGE_SIZE - 1,
+    };
+    assert_eq!(
+        gpu.destroy_sparse_region(&front, &region, event),
+        Err(KernelError::NotFound)
+    );
+    assert_eq!(
+        gpu.map_syncpoint_shim(space, VA_WINDOW_END),
+        Err(KernelError::NotFound)
+    );
+    assert_eq!(front.calls().len(), calls, "a refusal sends nothing");
+    assert_eq!(gpu.pending_jobs(), 0);
+    // One slot free: the next space is made, with the id after the last one handed out.
+    let last = spaces[MAX_ADDRESS_SPACES - 1];
+    assert_eq!(gpu.create_address_space(&front), Ok(AsId(last.0 + 1)));
+    assert_eq!(
+        gpu.create_address_space(&front),
+        Err(KernelError::OutOfResource)
+    );
+    // An id gsv never handed out is not found either.
+    assert_eq!(
+        gpu.destroy_address_space(&front, AsId(last.0 + 2)),
+        Err(KernelError::NotFound)
+    );
+}
+
+/// A destroy while ordered jobs wait: each keeps its lock and event and still completes, but no
+/// longer holds or publishes the destroyed space's pages; the other space's pages they hold are
+/// published when they are done.
+#[test]
+fn a_destroy_drops_a_waiting_job_s_pages_of_the_space_and_keeps_its_event() {
+    let (mut gpu, front) = bare();
+    let space = gpu.create_address_space(&front).unwrap();
+    let other = gpu.create_address_space(&front).unwrap();
+    let handle = register_bare(&mut gpu, page_range(MEMORY, MEMORY_SIZE));
+    let kept = register_bare(&mut gpu, page_range(GPU_VA, PAGE_SIZE));
+    map_bare(&mut gpu, space, GPU_VA + PAGE_SIZE, kept, 1);
+    map_bare(&mut gpu, other, GPU_VA + PAGE_SIZE, kept, 1);
+    let event = ObjectId::from_parts(4, 5);
+    // A 213 in each space, then a 102: three jobs, each holding pages.
+    let unmap = |space| RangeRequest {
+        space,
+        first: GPU_VA + PAGE_SIZE,
+        last: GPU_VA + 2 * PAGE_SIZE - 1,
+    };
+    gpu.unmap(&front, &unmap(space), event).unwrap();
+    gpu.unmap(&front, &unmap(other), event).unwrap();
+    let ticket = gpu.destroy_memory(&front, handle, event).unwrap();
+    assert!(gpu.waiting.contains_key(&space));
+    assert!(
+        gpu.pending
+            .values()
+            .any(|job| job.reveal.iter().any(|&(id, _)| id == space))
+    );
+
+    gpu.destroy_address_space(&front, space).unwrap();
+
+    assert!(!gpu.waiting.contains_key(&space));
+    assert!(gpu.waiting.contains_key(&other));
+    for job in gpu.pending.values() {
+        assert!(job.reveal.iter().all(|&(id, _)| id == other), "{job:?}");
+    }
+    assert_eq!(gpu.pending_jobs(), 3);
+    // The GPU applies everything queued, then each job is done.
+    front.finish(&CompletionQueue::new());
+    let finished = gpu.ordered_done(ticket).unwrap();
+    assert_eq!(finished.event, event);
+    assert_eq!(
+        finished.releases,
+        [token_for(page_range(MEMORY, MEMORY_SIZE))]
+    );
+    gpu.ordered_done(Ticket(ticket.0 - 1)).unwrap();
+    gpu.ordered_done(Ticket(ticket.0 - 2)).unwrap();
+    assert!(gpu.waiting.is_empty());
+    assert!(gpu.table(space).is_none());
+    // Every job done, the other space shows what its bookkeeping holds: the kept registration's
+    // own mapping.
+    assert_eq!(
+        gpu.mappings(other),
+        [guest(page_range(GPU_VA, PAGE_SIZE), GPU_VA, SELF_MAP_KIND)]
+    );
+}
+
+/// The ordering that protects guest memory: a 102 after a destroy sends its removals and its
+/// barrier after the destroy's removals, and none for the destroyed space, so the GPU has
+/// stopped reading through the destroyed table before the drain releases the lock.
+#[test]
+fn a_later_102_is_ordered_after_the_destroy_s_removals() {
+    let (mut gpu, front) = bare();
+    let space = gpu.create_address_space(&front).unwrap();
+    let other = gpu.create_address_space(&front).unwrap();
+    let handle = register_bare(&mut gpu, page_range(MEMORY, MEMORY_SIZE));
+    let before = front.calls().len();
+    gpu.destroy_address_space(&front, space).unwrap();
+    let event = ObjectId::from_parts(4, 5);
+    let ticket = gpu.destroy_memory(&front, handle, event).unwrap();
+    let own = page_range(MEMORY, MEMORY_SIZE);
+    assert_eq!(
+        front.calls()[before..],
+        [
+            destroy_call(space, VmUpdate::Unmap { range: own }),
+            FrontCall::Update(other, VmUpdate::DestroyMemory { range: own }, None),
+            FrontCall::Barrier(ticket),
+        ]
+    );
+}
