@@ -28,9 +28,10 @@
 //!
 //! - **Backing is handed out from the start of guest RAM, a page at a time, and never
 //!   returned**: an unmapped page's RAM is not reused. The backing pools of the execution model
-//!   replace it, sized as the kernel's pool accounting says. Until then guest RAM (16 MiB) is
-//!   far smaller than what the kernel lets a process reserve, and a guest that touches more
-//!   ends its run as an emulator error.
+//!   replace it, sized as the kernel's pool accounting says. Until then guest RAM is sized
+//!   from the program a run loads, plus a working allowance (`crate::system`'s `ram` module),
+//!   which is usually far smaller than what the kernel lets a process reserve, and a guest that
+//!   touches more ends its run as an emulator error.
 //! - **One page per fault.** A guest that touches a large mapping takes one exit per page.
 //!   Backing a run of pages at once is a measurement away.
 //! - **Host access ignores permissions**, which is what lets the loader write a code page that
