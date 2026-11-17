@@ -705,10 +705,22 @@ fn every_mapped_class_is_taken_and_others_refused() {
     }
 }
 
-/// Class 0 fills 3D, compute, copy, 2D and inline-to-memory, in that order, then is refused; the
-/// GPU, once the channel is made, is given the classes in the order bound.
+/// Class 0 fills 3D, compute, copy, 2D and inline-to-memory, in that order, then is refused; with
+/// one slot taken it skips that one; the GPU, once the channel is made, is given the classes in
+/// the order bound.
 #[test]
 fn class_0_fills_the_free_slots_in_nx2_s_order() {
+    let mut bench = Bench::new();
+    let fd = bench.open(Device::NvhostGpu);
+    for expected in class::ZERO_CANDIDATES {
+        let answer = bench.ioctl(fd, ALLOC_OBJ_CTX, &obj_request(0, 0));
+        assert_eq!(answer.output, obj_request(expected, 0));
+    }
+    assert_eq!(
+        [class::CTX_3D, class::CTX_COMPUTE, class::CTX_DMA, class::CTX_2D, class::CTX_KEPLER],
+        class::ZERO_CANDIDATES
+    );
+
     let mut bench = Bench::new();
     let fd = bench.open(Device::NvhostGpu);
     // Compute taken first, so class 0 skips it.

@@ -280,6 +280,8 @@ impl Submits {
                 return Err(SnapshotError::DuplicateToken { index, token });
             }
             let key = (entry.channel, entry.token);
+            // An equal key has a token an earlier entry has, refused just above, so `>=` and
+            // `>` refuse the same snapshots here.
             if previous.is_some_and(|previous| previous >= key) {
                 return Err(SnapshotError::Misordered { index });
             }

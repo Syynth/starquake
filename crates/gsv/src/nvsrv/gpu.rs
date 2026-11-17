@@ -794,7 +794,7 @@ impl NvhostGpu {
     }
 
     /// Fd `fd` was closed: its waiting submissions are answered, its GPU channel destroyed and
-    /// its syncpoint freed, in that order (module docs, "Where this differs"). Without `channels`
+    /// its syncpoint freed (module docs, "Where this differs"). Without `channels`
     /// (a server with no channel front) a channel holds only events.
     pub(super) fn close(&mut self, fd: u32, channels: Option<&mut ChannelAccess<'_>>) {
         let Some(channel) = self.channels.remove(&fd) else {
