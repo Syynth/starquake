@@ -222,7 +222,7 @@ fn stepped(
     assert!(rounds < 200, "the run did not end");
     let left = stepper.vcpus.iter().map(ScriptedVcpu::remaining).collect();
     drop(stepper);
-    let (ending, _, _) = machine.finish();
+    let (ending, _, _, _) = machine.finish();
     Ran {
         ending,
         events: sink.events(),
@@ -699,4 +699,163 @@ fn the_runs_timeout_stops_every_core() {
     assert_eq!(report.exit, ExitReason::Timeout);
     assert!(report.duration >= timeout);
     assert!(report.duration < Duration::from_secs(20));
+}
+
+/// Where the timed-out run's threads are left (see the test below): each a distinct address.
+const MAIN_PC: u64 = RAM_BASE + 0x2a0;
+const RUNNING_PC: u64 = RAM_BASE + 0x2b4;
+const SLEEPING_PC: u64 = RAM_BASE + 0x2c8;
+/// Where the thread that is created and never started would begin.
+const UNSTARTED_ENTRY: u64 = RAM_BASE + 0x2dc;
+
+#[test]
+fn a_timed_out_run_says_where_each_thread_is_and_which_core_held_it() {
+    let guest = Guest::new(&programs::hello().unwrap());
+    // Core 0's main thread starts a thread on core 1 and one on core 2, creates one on core 3
+    // that it never starts, and is last seen at `MAIN_PC`. Core 1's thread is interrupted at
+    // `RUNNING_PC`; core 2's sleeps at `SLEEPING_PC` with a deadline no clock reaches here.
+    let main = ScriptedVcpu::new()
+        .then(create(1, 30, 1), svc(SvcId::CreateThread))
+        .then(start_created, svc(SvcId::StartThread))
+        .then(create(2, 30, 2), svc(SvcId::CreateThread))
+        .then(start_created, svc(SvcId::StartThread))
+        .then(
+            |regs: &mut GuestRegs| {
+                succeeded(regs);
+                create(3, 30, 3)(regs);
+                regs.x[1] = UNSTARTED_ENTRY;
+            },
+            svc(SvcId::CreateThread),
+        )
+        .then(
+            |regs: &mut GuestRegs| {
+                succeeded(regs);
+                regs.pc = MAIN_PC;
+            },
+            svc(SvcId::GetCurrentProcessorNumber),
+        );
+    let running = ScriptedVcpu::new().then(|regs| regs.pc = RUNNING_PC, Exit::Interrupted);
+    let sleeping = ScriptedVcpu::new().then(
+        |regs| {
+            regs.pc = SLEEPING_PC;
+            regs.x[0] = i64::MAX.cast_unsigned();
+        },
+        svc(SvcId::SleepThread),
+    );
+
+    let options = RunOptions::default();
+    let session = Session {
+        memory: &guest.memory,
+        options: &options,
+        clock: RunClock::new(fixed_timebase()),
+        recorder: Recorder::new(),
+    };
+    let env = session.environment();
+    let (dispatcher, _) = boot(guest.address_space(), &guest.placed, &guest.memory).unwrap();
+    let Ok(machine) = Machine::start(
+        dispatcher,
+        &guest.memory,
+        &session,
+        &env,
+        Limits::DEFAULT,
+        &real_services,
+    ) else {
+        unreachable!("the services could not be installed");
+    };
+    let mut stepper = Stepper::new(&machine, vec![main, running, sleeping]);
+    let step = |stepper: &mut Stepper<'_, '_>, core: usize| {
+        let (cores, vcpus) = (&mut stepper.cores, &mut stepper.vcpus);
+        assert!(
+            matches!(cores[core].step(&mut vcpus[core]), Ok(Stepped::Running)),
+            "core {core}"
+        );
+    };
+    // The main thread creates and starts the two threads, and creates the third.
+    for _ in 0..5 {
+        step(&mut stepper, 0);
+    }
+    // Core 1 loads its thread, which is interrupted; core 2 loads its thread, which sleeps.
+    step(&mut stepper, 1);
+    step(&mut stepper, 2);
+    // The main thread's last step.
+    step(&mut stepper, 0);
+    assert!(
+        stepper.vcpus.iter().all(|vcpu| vcpu.remaining() == 0),
+        "unplayed steps"
+    );
+
+    // The timeout: the run stops, and each core says what it holds, as `core_loop::run` does.
+    machine.stop(Ending::TimedOut);
+    for (core, vcpu) in stepper.cores.iter().zip(&stepper.vcpus) {
+        core.leave(vcpu);
+    }
+    drop(stepper);
+    let (ending, _, _, aftermath) = machine.finish();
+    assert!(matches!(ending, Ending::TimedOut));
+    assert_eq!(aftermath.stack, None);
+    let first = starquake_kernel::sched::FIRST_THREAD_ID;
+    let threads: Vec<_> = aftermath
+        .threads
+        .iter()
+        .map(|thread| (thread.id, thread.state, thread.core, thread.pc))
+        .collect();
+    assert_eq!(
+        threads,
+        [
+            // Held by core 0's vCPU, which has its newest registers.
+            (first, ThreadState::Runnable, Some(0), MAIN_PC),
+            (first + 1, ThreadState::Runnable, Some(1), RUNNING_PC),
+            // Its wait saved its registers: they are its saved context's, and no core holds it.
+            (first + 2, ThreadState::Waiting, None, SLEEPING_PC),
+            // Never started: its saved context is where it would begin.
+            (first + 3, ThreadState::Initialized, None, UNSTARTED_ENTRY),
+        ]
+    );
+}
+
+#[test]
+fn a_run_that_did_not_time_out_reads_no_threads() {
+    // The same kind of stepped run, ended by the process: no threads are read, whatever the
+    // cores hold.
+    let guest = Guest::new(&programs::hello().unwrap());
+    let main = ScriptedVcpu::new()
+        .then(
+            |regs| regs.pc = MAIN_PC,
+            svc(SvcId::GetCurrentProcessorNumber),
+        )
+        .then(|_| {}, svc(SvcId::ExitProcess));
+    let options = RunOptions::default();
+    let session = Session {
+        memory: &guest.memory,
+        options: &options,
+        clock: RunClock::new(fixed_timebase()),
+        recorder: Recorder::new(),
+    };
+    let env = session.environment();
+    let (dispatcher, _) = boot(guest.address_space(), &guest.placed, &guest.memory).unwrap();
+    let Ok(machine) = Machine::start(
+        dispatcher,
+        &guest.memory,
+        &session,
+        &env,
+        Limits::DEFAULT,
+        &real_services,
+    ) else {
+        unreachable!("the services could not be installed");
+    };
+    let mut stepper = Stepper::new(&machine, vec![main]);
+    assert!(stepper.run(10, |_, _| {}) < 10, "the run did not end");
+    for (core, vcpu) in stepper.cores.iter().zip(&stepper.vcpus) {
+        core.leave(vcpu);
+    }
+    drop(stepper);
+    // The core held the main thread when it stopped.
+    assert_eq!(
+        lock(&machine.held).get(&starquake_kernel::sched::FIRST_THREAD_ID),
+        Some(&(0, MAIN_PC))
+    );
+    let (ending, _, _, aftermath) = machine.finish();
+    assert!(matches!(ending, Ending::Exited));
+    assert!(aftermath.threads.is_empty());
+    assert_eq!(aftermath.stack, None);
 }

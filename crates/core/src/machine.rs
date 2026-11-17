@@ -100,10 +100,12 @@ use std::time::Instant;
 use starquake_cpu::{GuestRegs, Syndrome, Vcpu};
 use starquake_kernel::dispatch::{Dispatcher, Outcome, Record};
 use starquake_kernel::id::ServerId;
+use starquake_kernel::memory::MemoryPermission;
 use starquake_kernel::process;
+use starquake_kernel::sched::ThreadState;
 use starquake_kernel::sched::{APPLICATION_CORE_COUNT, CoreId};
 use starquake_kernel::svc::DebugSink;
-use starquake_kernel::tables::AddressSpace;
+use starquake_kernel::tables::{AddressSpace, Scheduler};
 use starquake_kernel::time::CounterRate;
 use starquake_memory::{Access, GuestMemory};
 use starquake_trace::{
@@ -112,10 +114,10 @@ use starquake_trace::{
 };
 
 use crate::clock::Timebase;
-use crate::crash::{CrashReport, Exception};
+use crate::crash::{Backtrace, CrashReport, Exception};
 use crate::hle::HostFolder;
 use crate::image::{PAGE, Placement};
-use crate::report::{ExitReason, Mapping, RunOptions, RunReport, empty_dump};
+use crate::report::{ExitReason, Mapping, RunOptions, RunReport, ThreadPc, empty_dump};
 use crate::space::Touch;
 
 mod core_loop;
@@ -405,6 +407,27 @@ enum Ending {
     Failed(String),
 }
 
+/// What the kernel's tables said about the guest once every core had stopped, read before the
+/// tables go, for the report. Another thread may have changed memory or the memory map in the
+/// moments between a crash and the stop of every core; this is what they held at the stop.
+#[derive(Default)]
+struct Aftermath {
+    /// For a crash: the block its backtrace walks in ([`stack_block`]).
+    stack: Option<Mapping>,
+    /// For a timeout: where each guest thread was, by thread id.
+    threads: Vec<StoppedThread>,
+}
+
+/// One guest thread when the run stopped (see [`ThreadPc`], which this becomes).
+struct StoppedThread {
+    /// The thread's id as the guest knows it.
+    id: u64,
+    state: ThreadState,
+    /// The core whose vCPU held its registers, if one did.
+    core: Option<u8>,
+    pc: u64,
+}
+
 /// What every core and the timer thread share during a run.
 struct Machine<'a, V: Vcpu, C> {
     session: &'a Session<'a, C>,
@@ -421,6 +444,9 @@ struct Machine<'a, V: Vcpu, C> {
     /// run is stopping.
     bell: Arc<timer::Bell>,
     ready: Ready,
+    /// The program counter of each thread a core's vCPU held when the core stopped, with the
+    /// core, by the thread's id as the guest knows it (`core_loop`'s `Core::leave`).
+    held: Mutex<BTreeMap<u64, (u8, u64)>>,
 }
 
 impl<V: Vcpu, C: HostClock + Clone> Machine<'_, V, C> {
@@ -530,7 +556,7 @@ pub(crate) fn run_serving<V: Vcpu, C: HostClock + Clone + 'static>(
     } else {
         Err(CONSOLE_MISMATCH.to_owned())
     };
-    let (ending, log, tally) = match booted {
+    let (ending, log, tally, aftermath) = match booted {
         Ok((dispatcher, tls)) => {
             mappings.push(tls);
             mappings.sort_by_key(|mapping| mapping.start);
@@ -540,8 +566,10 @@ pub(crate) fn run_serving<V: Vcpu, C: HostClock + Clone + 'static>(
             Ending::Failed(message),
             GuestLog::new(limits.guest_log_bytes),
             Tally::default(),
+            Aftermath::default(),
         ),
     };
+    let Aftermath { stack, threads } = aftermath;
     let exit = match ending {
         Ending::Exited => ExitReason::ProcessExited,
         Ending::TimedOut => ExitReason::Timeout,
@@ -561,7 +589,13 @@ pub(crate) fn run_serving<V: Vcpu, C: HostClock + Clone + 'static>(
                 &placed.modules,
                 last_events(&flight),
                 &options.command_line,
-            );
+            )
+            .with_backtrace(Backtrace::walk(
+                &regs,
+                stack,
+                session.memory,
+                &placed.modules,
+            ));
             ExitReason::GuestCrashed(Box::new(match syndrome {
                 Some(syndrome) => report.with_syndrome(syndrome),
                 None => report,
@@ -582,6 +616,18 @@ pub(crate) fn run_serving<V: Vcpu, C: HostClock + Clone + 'static>(
         stubbed: tally.stubbed,
         patched_counter_reads: placed.counter_reads.clone(),
         memory_map: mappings,
+        threads: threads
+            .into_iter()
+            .map(|thread| {
+                ThreadPc::new(
+                    thread.id,
+                    thread.state,
+                    thread.core,
+                    thread.pc,
+                    &placed.modules,
+                )
+            })
+            .collect(),
     }
 }
 
@@ -646,7 +692,8 @@ fn boot(
 /// The loop itself (see the module docs): installs the services, then runs every core and the
 /// timer thread until the run ends. `env` is the environment the kernel reads
 /// ([`Session::environment`]); the caller owns it so that a test can see what the loop leaves
-/// in its recording. Returns how the run ended, the guest log and the call counts.
+/// in its recording. Returns how the run ended, the guest log, the call counts and what the
+/// kernel said about the guest at the end ([`Aftermath`]).
 fn drive<V: Vcpu, C: HostClock + Clone + 'static>(
     vcpus: Vcpus<'_, V>,
     dispatcher: Dispatcher,
@@ -655,10 +702,13 @@ fn drive<V: Vcpu, C: HostClock + Clone + 'static>(
     env: &Arc<LiveEnv>,
     limits: Limits,
     install: &Install,
-) -> (Ending, GuestLog, Tally) {
+) -> (Ending, GuestLog, Tally, Aftermath) {
     let machine = match Machine::start(dispatcher, space, session, env, limits, install) {
         Ok(machine) => machine,
-        Err(failed) => return *failed,
+        Err(failed) => {
+            let (ending, log, tally) = *failed;
+            return (ending, log, tally, Aftermath::default());
+        }
     };
     let count = machine.cores.count();
     let Vcpus { first, make } = vcpus;
@@ -729,6 +779,7 @@ impl<'a, V: Vcpu, C: HostClock + Clone> Machine<'a, V, C> {
                 bell: Arc::clone(&bell),
             },
             bell,
+            held: Mutex::new(BTreeMap::new()),
         };
         let services_env: Arc<dyn Env> = Arc::<LiveEnv>::clone(env);
         if let Err(error) = install(&machine.dispatcher, services_env, machine.ready.clone()) {
@@ -746,20 +797,90 @@ impl<'a, V: Vcpu, C: HostClock + Clone> Machine<'a, V, C> {
         Ok(machine)
     }
 
-    /// How the run ended, the guest log and the call counts, once every core and the timer
-    /// thread have stopped.
-    fn finish(self) -> (Ending, GuestLog, Tally) {
+    /// How the run ended, the guest log, the call counts and what the kernel's tables said
+    /// about the guest ([`Aftermath`]: the stack block of a crash, the threads of a timeout),
+    /// once every core and the timer thread have stopped.
+    fn finish(self) -> (Ending, GuestLog, Tally, Aftermath) {
         // PROVISIONAL: nothing keeps the environment's recording (see the module docs).
         drop(self.env.take_recording());
         let ending = lock(&self.ending)
             .take()
             .unwrap_or_else(|| Ending::Failed("the run stopped without saying why".to_owned()));
+        let aftermath = match &ending {
+            Ending::Crashed(_, _, regs) => Aftermath {
+                stack: stack_block(&self.dispatcher, regs),
+                threads: Vec::new(),
+            },
+            Ending::TimedOut => Aftermath {
+                stack: None,
+                threads: self.stopped_threads(),
+            },
+            Ending::Exited | Ending::Failed(_) => Aftermath::default(),
+        };
         (
             ending,
             self.log.into_inner_or_poisoned(),
             self.tally.into_inner_or_poisoned(),
+            aftermath,
         )
     }
+
+    /// Every guest thread the scheduler holds, by id, with its program counter: the one its
+    /// core's vCPU held when the core stopped ([`Machine::held`]), or else its saved context's.
+    fn stopped_threads(&self) -> Vec<StoppedThread> {
+        let held = lock(&self.held);
+        let mut threads = self.dispatcher.with::<(&Scheduler,), _>(|(scheduler,)| {
+            scheduler
+                .threads()
+                .map(|(_, thread)| {
+                    let id = thread.thread_id();
+                    let (core, pc) = match held.get(&id) {
+                        Some(&(core, pc)) => (Some(core), pc),
+                        None => (None, thread.context().pc),
+                    };
+                    StoppedThread {
+                        id,
+                        state: thread.state(),
+                        core,
+                        pc,
+                    }
+                })
+                .collect::<Vec<_>>()
+        });
+        threads.sort_by_key(|thread| thread.id);
+        threads
+    }
+}
+
+/// Where a crash's backtrace looks for frame records (`crate::crash`, "The backtrace"): the
+/// block of the kernel's memory map that holds the stack pointer in `regs`, when the guest may
+/// read and write it, or else the block that holds the frame pointer (`x29`), when the guest
+/// may read and write that one. The second covers a stack overflow, whose stack pointer is in
+/// the free guard pages below the stack, and a stack pointer exactly at the stack's top, which
+/// is the end of its block. `None` when neither is in such a block.
+fn stack_block(dispatcher: &Dispatcher, regs: &GuestRegs) -> Option<Mapping> {
+    user_read_write_block(dispatcher, regs.sp)
+        .or_else(|| user_read_write_block(dispatcher, regs.x[crate::crash::FRAME_POINTER_REGISTER]))
+}
+
+/// The block of the kernel's memory map that holds `address`, named by its memory state, when
+/// the guest may read and write it; `None` otherwise.
+fn user_read_write_block(dispatcher: &Dispatcher, address: u64) -> Option<Mapping> {
+    let block = dispatcher
+        .with::<(&AddressSpace,), _>(|(space,)| space.query_info(address))
+        .ok()?;
+    if !block
+        .permission()
+        .contains(MemoryPermission::USER_READ_WRITE)
+    {
+        return None;
+    }
+    Some(Mapping {
+        name: block.state().name().to_owned(),
+        start: block.address(),
+        // A block the guest may write ends inside the address space, below 2^64.
+        end: block.end()?,
+    })
 }
 
 /// A mutex's value, whatever a panicking holder left.

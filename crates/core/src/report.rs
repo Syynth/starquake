@@ -10,9 +10,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::Serialize;
+use starquake_kernel::sched::ThreadState;
 use starquake_trace::Dump;
 
-use crate::crash::CrashReport;
+use crate::crash::{CrashReport, Location, Module, address_text};
 
 /// The process exit codes of `starquake run` (`docs/specs/observability.md`, "Headless runs").
 pub mod exit_code {
@@ -106,6 +107,99 @@ impl Mapping {
     }
 }
 
+/// Where one guest thread was when the run stopped at its timeout, so a hang shows where it is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ThreadPc {
+    /// The thread's id, as the guest and the event stream know it.
+    pub thread: u64,
+    /// What the kernel's scheduler had it doing.
+    pub state: ThreadPcState,
+    /// The core whose vCPU held the thread's registers when the run stopped; `null` when they
+    /// were in the thread's saved context instead (no core ran it, or its last system call
+    /// began a wait, which saved them), or the vCPU's registers could not be read.
+    pub core: Option<u8>,
+    /// Its program counter: the vCPU's when [`ThreadPc::core`] names one, its saved context's
+    /// otherwise.
+    #[serde(serialize_with = "crate::crash::hex")]
+    pub pc: u64,
+    /// That address as module plus offset, when it is inside a module.
+    pub pc_location: Option<Location>,
+}
+
+/// What the kernel's scheduler had a thread doing when the run stopped ([`ThreadPc::state`]),
+/// written in `summary.json` as its [`ThreadPcState::name`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadPcState {
+    /// Created, not started.
+    Initialized,
+    /// Waiting for something (a synchronisation object, a sleep, a reply).
+    Waiting,
+    /// Ready to run, or running.
+    Runnable,
+    /// Ended.
+    Terminated,
+}
+
+impl ThreadPcState {
+    /// The state in words, as `summary.json` and the timeout's text write it: `initialized`,
+    /// `waiting`, `runnable` or `terminated`.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Initialized => "initialized",
+            Self::Waiting => "waiting",
+            Self::Runnable => "runnable",
+            Self::Terminated => "terminated",
+        }
+    }
+}
+
+impl From<ThreadState> for ThreadPcState {
+    fn from(state: ThreadState) -> Self {
+        match state {
+            ThreadState::Initialized => Self::Initialized,
+            ThreadState::Waiting => Self::Waiting,
+            ThreadState::Runnable => Self::Runnable,
+            ThreadState::Terminated => Self::Terminated,
+        }
+    }
+}
+
+impl ThreadPc {
+    /// Thread `thread` in `state`, held by `core`, at `pc`, which is placed in `modules`.
+    #[must_use]
+    pub fn new(
+        thread: u64,
+        state: ThreadState,
+        core: Option<u8>,
+        pc: u64,
+        modules: &[Module],
+    ) -> Self {
+        Self {
+            thread,
+            state: ThreadPcState::from(state),
+            core,
+            pc,
+            pc_location: Location::of(pc, modules),
+        }
+    }
+
+    /// The thread in words: `thread 1, runnable on core 0, pc 0x800000b8 (main+0xb8)`.
+    #[must_use]
+    pub fn text(&self) -> String {
+        let core = self
+            .core
+            .map_or_else(String::new, |core| format!(" on core {core}"));
+        format!(
+            "thread {}, {}{core}, pc {}",
+            self.thread,
+            self.state.name(),
+            address_text(self.pc, self.pc_location.as_ref())
+        )
+    }
+}
+
 /// Everything a run left behind. The artifacts folder is written from this
 /// ([`crate::artifacts::write`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,6 +236,9 @@ pub struct RunReport {
     /// The guest memory the run set up, in address order. Empty if the run failed before the
     /// program was placed.
     pub memory_map: Vec<Mapping>,
+    /// Where each guest thread was when the run stopped, by thread id, for a run that ended at
+    /// its timeout ([`ExitReason::Timeout`]); empty for every other ending.
+    pub threads: Vec<ThreadPc>,
 }
 
 impl RunReport {
@@ -162,6 +259,7 @@ impl RunReport {
             stubbed: BTreeSet::new(),
             patched_counter_reads: Vec::new(),
             memory_map: Vec::new(),
+            threads: Vec::new(),
         }
     }
 
@@ -203,6 +301,7 @@ impl RunReport {
             trace_events_dropped: self.trace_events_dropped,
             events_error: self.events_error.as_ref(),
             patched_counter_reads: self.patched_counter_reads.len(),
+            threads: &self.threads,
         }
     }
 }
@@ -250,12 +349,15 @@ pub struct Summary<'a> {
     pub events_error: Option<&'a String>,
     /// How many counter reads the loader patched.
     pub patched_counter_reads: usize,
+    /// For a run that ended at its timeout, where each guest thread was ([`ThreadPc`]); empty
+    /// otherwise.
+    pub threads: &'a [ThreadPc],
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crash::{CrashReport, Exception};
+    use crate::crash::{CrashReport, Exception, Module};
 
     fn crash() -> Box<CrashReport> {
         Box::new(CrashReport::new(
@@ -313,6 +415,7 @@ mod tests {
             stubbed: BTreeSet::from(["Break (0x26)".to_owned(), "0x99".to_owned()]),
             patched_counter_reads: vec![0x8000_00b0, 0x8000_00c0],
             memory_map: Vec::new(),
+            threads: Vec::new(),
         };
         let json = serde_json::to_string_pretty(&report.summary()).unwrap();
         assert_eq!(
@@ -337,10 +440,122 @@ mod tests {
   "guest_log_lines_dropped": 5,
   "trace_events_dropped": 9,
   "events_error": "the dump could not be encoded",
-  "patched_counter_reads": 2
+  "patched_counter_reads": 2,
+  "threads": []
 }"#
         );
         assert_eq!(report.summary().version, SUMMARY_VERSION);
+    }
+
+    fn modules() -> Vec<Module> {
+        vec![
+            Module {
+                name: "rtld".into(),
+                base: 0x8000_0000,
+                size: 0x4000,
+                build_id: vec![0x01],
+            },
+            Module {
+                name: "main".into(),
+                base: 0x8000_4000,
+                size: 0x2000,
+                build_id: vec![0x02],
+            },
+        ]
+    }
+
+    /// A timed-out run's threads: every field distinct and non-zero, one thread a core held and
+    /// one whose saved context was used, one inside a module and one in none.
+    fn timed_out() -> RunReport {
+        RunReport {
+            exit: ExitReason::Timeout,
+            threads: vec![
+                ThreadPc::new(
+                    0x51,
+                    ThreadState::Runnable,
+                    Some(3),
+                    0x8000_40b8,
+                    &modules(),
+                ),
+                ThreadPc::new(0x52, ThreadState::Waiting, None, 0x7000_1234, &modules()),
+            ],
+            ..RunReport::emulator_error(String::new(), Duration::from_millis(77))
+        }
+    }
+
+    #[test]
+    fn a_timed_out_runs_threads_in_the_summary_are_pinned() {
+        let report = timed_out();
+        let json = serde_json::to_value(report.summary()).unwrap();
+        assert_eq!(json["exit_reason"], "timeout");
+        assert_eq!(
+            json["threads"],
+            serde_json::to_value(&report.threads).unwrap()
+        );
+        // In key order, as `summary.json` writes them.
+        assert_eq!(
+            serde_json::to_string_pretty(report.summary().threads).unwrap(),
+            r#"[
+  {
+    "thread": 81,
+    "state": "runnable",
+    "core": 3,
+    "pc": "0x800040b8",
+    "pc_location": {
+      "module": "main",
+      "offset": "0xb8"
+    }
+  },
+  {
+    "thread": 82,
+    "state": "waiting",
+    "core": null,
+    "pc": "0x70001234",
+    "pc_location": null
+  }
+]"#
+        );
+    }
+
+    #[test]
+    fn a_thread_says_its_state_its_core_and_where_it_is_in_words() {
+        let cases = [
+            (
+                ThreadState::Initialized,
+                ThreadPcState::Initialized,
+                "initialized",
+            ),
+            (ThreadState::Waiting, ThreadPcState::Waiting, "waiting"),
+            (ThreadState::Runnable, ThreadPcState::Runnable, "runnable"),
+            (
+                ThreadState::Terminated,
+                ThreadPcState::Terminated,
+                "terminated",
+            ),
+        ];
+        for (state, reported, name) in cases {
+            let thread = ThreadPc::new(7, state, None, 0x8000_0000, &modules());
+            assert_eq!(thread.state, reported);
+            assert_eq!(reported.name(), name);
+            // The JSON writes the name the text does.
+            assert_eq!(serde_json::to_value(reported).unwrap(), name);
+            assert_eq!(
+                thread.text(),
+                format!("thread 7, {name}, pc 0x80000000 (rtld+0x0)")
+            );
+        }
+        let held = ThreadPc::new(9, ThreadState::Runnable, Some(5), 0x8000_5fff, &modules());
+        assert_eq!(
+            held.text(),
+            "thread 9, runnable on core 5, pc 0x80005fff (main+0x1fff)"
+        );
+        // One past the last module's end is in no module.
+        let outside = ThreadPc::new(9, ThreadState::Runnable, Some(0), 0x8000_6000, &modules());
+        assert_eq!(outside.pc_location, None);
+        assert_eq!(
+            outside.text(),
+            "thread 9, runnable on core 0, pc 0x80006000 (in no module)"
+        );
     }
 
     #[test]

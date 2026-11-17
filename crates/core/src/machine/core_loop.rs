@@ -59,6 +59,7 @@ pub(super) fn run<V: Vcpu, C: HostClock + Clone>(
             Err(ending) => machine.stop(ending),
         }
     }
+    this.leave(vcpu);
 }
 
 /// What a core's vCPU holds of the thread it runs, against the thread's saved context: the
@@ -99,6 +100,23 @@ impl<'m, 'a, V: Vcpu, C: HostClock + Clone> Core<'m, 'a, V, C> {
             running: None,
             holds: Holds::Same,
             must_switch: true,
+        }
+    }
+
+    /// Once the run has stopped: says where the thread this core runs is, for the report of a
+    /// run that timed out ([`Machine::held`](super::Machine)). Its program counter is the
+    /// vCPU's, unless the thread's saved context is the newer (its last call began a wait) or
+    /// the vCPU's registers cannot be read; then nothing is said, and the report takes the
+    /// saved context's.
+    pub(super) fn leave(&self, vcpu: &V) {
+        let Some(running) = self.running else {
+            return;
+        };
+        if matches!(self.holds, Holds::Older) {
+            return;
+        }
+        if let Ok(regs) = vcpu.regs() {
+            lock(&self.machine.held).insert(running.guest_id.0, (self.id.index(), regs.pc));
         }
     }
 

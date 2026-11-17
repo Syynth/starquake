@@ -16,9 +16,14 @@
 
 use std::time::Duration;
 
-use starquake_core::crash::{Exception, Location};
+use starquake_core::crash::{
+    BacktraceEnd, Exception, FRAME_POINTER_REGISTER, FRAME_RECORD_RETURN, FRAME_RECORD_SIZE,
+    LINK_REGISTER, Location,
+};
 use starquake_core::system::{THREAD_LOCAL_RAM, WORKING_RAM};
-use starquake_core::{Error, ExitReason, LoadError, RunReport, exit_code};
+use starquake_core::{
+    Error, ExitReason, LoadError, Mapping, RunReport, ThreadPc, ThreadPcState, exit_code,
+};
 use starquake_kernel::memory::MemoryArrangement;
 use starquake_kernel::memory::layout::{LayoutRequest, RegionOffsets, Regions};
 use starquake_kernel::process::{Console, ProcessDescription};
@@ -757,6 +762,103 @@ fn an_endless_loop_is_ended_by_the_timeout() {
     assert_eq!(report.exit_code(), exit_code::TIMEOUT);
     assert!(report.duration >= timeout, "{:?}", report.duration);
     assert!(report.system_calls.is_empty());
+    // The one thread is where it spins, on the core that runs it: the program's `b .`.
+    let spin = image_base(&report) + CODE_OFFSET as u64;
+    assert_eq!(
+        report.threads,
+        [ThreadPc {
+            thread: starquake_kernel::sched::FIRST_THREAD_ID,
+            state: ThreadPcState::Runnable,
+            core: Some(0),
+            pc: spin,
+            pc_location: Some(Location {
+                module: "main".into(),
+                offset: CODE_OFFSET as u64,
+            }),
+        }]
+    );
+}
+
+#[test]
+fn a_crash_in_a_call_chain_reports_its_frame_records() {
+    // Two calls, each saving a frame record the way a compiler's prologue does, then a leaf
+    // that stops at a `brk`:
+    //
+    //   entry: sub sp, sp, #16; str x29, [sp]; str x30, [sp, #8]; add x29, sp, #0; bl f; brk #1
+    //   f:     sub sp, sp, #16; str x29, [sp]; str x30, [sp, #8]; add x29, sp, #0; bl g; brk #2
+    //   g:     brk #0
+    //
+    // The main thread starts with `x29` and `x30` zero, so the outermost record ends the chain.
+    const SP: u8 = 31;
+    let fp = u8::try_from(FRAME_POINTER_REGISTER).unwrap();
+    let lr = u8::try_from(LINK_REGISTER).unwrap();
+    let record = u32::try_from(FRAME_RECORD_SIZE).unwrap();
+    let ret = u32::try_from(FRAME_RECORD_RETURN).unwrap();
+    let prologue = || {
+        [
+            a64::sub_imm(SP, SP, record).unwrap(),
+            a64::str(fp, SP, 0).unwrap(),
+            a64::str(lr, SP, ret).unwrap(),
+            a64::add_imm(fp, SP, 0).unwrap(),
+        ]
+    };
+    let insn = i64::from(a64::INSN_SIZE);
+    let mut words = Vec::new();
+    words.extend(prologue());
+    words.push(a64::bl(2 * insn).unwrap());
+    words.push(a64::brk(1).unwrap());
+    words.extend(prologue());
+    words.push(a64::bl(2 * insn).unwrap());
+    words.push(a64::brk(2).unwrap());
+    words.push(a64::brk(0).unwrap());
+    let file = NroBuilder::new(&words).build().unwrap();
+    let Some(report) = run(&file, GENEROUS) else {
+        return;
+    };
+    assert_eq!(report.exit_code(), exit_code::GUEST_CRASHED);
+    let crash = report.crash().expect("the program stops at its brk");
+    let at = |index: u64| CODE_OFFSET as u64 + index * u64::from(a64::INSN_SIZE);
+    let base = image_base(&report);
+    let main = |offset: u64| Location {
+        module: "main".into(),
+        offset,
+    };
+    let stack = report
+        .memory_map
+        .iter()
+        .find(|mapping| mapping.name == "stack")
+        .expect("a stack mapping");
+    // Each prologue pushes one record below the last: the entry's at the top of the stack.
+    let record = u64::from(record);
+    let (outer, inner) = (stack.end - record, stack.end - 2 * record);
+    let backtrace = crash.backtrace.as_ref().expect("a backtrace");
+    assert_eq!(
+        backtrace.stack,
+        Some(Mapping {
+            name: "Stack".into(),
+            start: stack.start,
+            end: stack.end,
+        })
+    );
+    let frames: Vec<_> = backtrace
+        .frames
+        .iter()
+        .map(|frame| (frame.address, frame.location.clone(), frame.record))
+        .collect();
+    assert_eq!(
+        frames,
+        [
+            // The `brk #0` in g.
+            (base + at(12), Some(main(at(12))), None),
+            // g returns to the `brk #2` after f's call.
+            (base + at(11), Some(main(at(11))), None),
+            // f's record: f returns to the `brk #1` after the entry's call.
+            (base + at(5), Some(main(at(5))), Some(inner)),
+            // The entry's record: the zero `x30` the thread started with.
+            (0, None, Some(outer)),
+        ]
+    );
+    assert_eq!(backtrace.end, BacktraceEnd::NullFramePointer);
 }
 
 #[test]
