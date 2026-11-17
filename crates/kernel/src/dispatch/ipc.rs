@@ -105,8 +105,8 @@ use super::{
     recorded_args, result_word,
 };
 use crate::handle::{Handle, HandleError, HandleTable};
-use crate::id::{ObjectId, ServerId};
-use crate::ipc::message::{MessageBuffer, Translated, Translation, translate};
+use crate::id::{ObjectId, ProcessId, ServerId};
+use crate::ipc::message::{Current, MessageBuffer, Translated, Translation, translate};
 use crate::ipc::{
     Admission, Done, Finish, Handled, IpcError, Notice, PortName, Request, Sender, SessionHandler,
 };
@@ -680,6 +680,7 @@ impl Dispatcher {
         };
         let handle = Handle::from_register(handle);
         let process_id = locked.state.tables.processes.process_id();
+        let process = locked.state.tables.processes.own();
         let (handles, scheduler) = locked.tables();
         let sender = Sender {
             thread: call.caller.thread,
@@ -692,7 +693,7 @@ impl Dispatcher {
             handles,
             scheduler,
             call.caller.memory,
-            process_id,
+            (process, process_id),
             (sender, call.regs),
         );
         let (server, session) = match begun {
@@ -906,12 +907,13 @@ impl Dispatcher {
 }
 
 /// The first step of `SendSyncRequest`, under the lock: the session, the message, its special
-/// header, and the queue.
+/// header, and the queue. `process` is the sender's process, whose guest-visible id is
+/// `process_id`.
 fn begin(
     handles: &mut HandleTable,
     scheduler: &mut Scheduler,
     memory: &dyn GuestMemory,
-    process_id: u64,
+    (process, process_id): (ProcessId, u64),
     (sender, regs): (Sender, &GuestRegs),
 ) -> CallResult<Begun> {
     let session = handles
@@ -920,9 +922,8 @@ fn begin(
     if scheduler.objects().get(session)? != Object::Session {
         return Err(KernelError::InvalidHandle.into());
     }
-    let (objects, ipc) = scheduler.ipc_mut();
     // A closed server end refuses before anything of the message is taken.
-    if !ipc.is_server_open(session)? {
+    if !scheduler.ipc().is_server_open(session)? {
         return Err(KernelError::SessionClosed.into());
     }
     let mut message: MessageBuffer = [0; BUFFER_SIZE];
@@ -934,11 +935,23 @@ fn begin(
                 sender.message_address
             ))
         })?;
+    // What the two pseudo-handles name for this sender (`GetObjectForIpc`'s `cur_thread` and
+    // its owner process). A process the scheduler has no row for (only tables built by hand,
+    // not by `process::create`) has no object, and a copied `CURRENT_PROCESS` is then an
+    // invalid handle; the rest of the request is unaffected.
+    let current = Current {
+        thread: calling_thread_object(scheduler, sender.core),
+        process: scheduler
+            .process(process)
+            .ok()
+            .map(crate::process::ProcessRecord::object),
+    };
+    let (objects, ipc) = scheduler.ipc_mut();
     let Translation {
         translated,
         result,
         destroyed,
-    } = translate(&mut message, process_id, handles, objects);
+    } = translate(&mut message, process_id, current, handles, objects);
     // What a moved handle's removal destroyed (only once the request has failed) is torn down
     // as closing its last handle tears it down (`svc::handle::close_handle`).
     let forgotten = destroyed
@@ -999,6 +1012,15 @@ fn calling_waiter(scheduler: &Scheduler, core: u8) -> Option<crate::id::ThreadId
         .thread(thread)
         .is_ok_and(|row| row.state() == crate::sched::ThreadState::Runnable);
     (runnable && scheduler.sync().wait(thread).is_none()).then_some(thread)
+}
+
+/// The object of the thread the scheduler says `core` runs: what a copied
+/// [`Handle::CURRENT_THREAD`] names. `None` when the core runs no scheduler thread, or one with
+/// no object (only a thread of no process, which the core loop never runs for a guest).
+fn calling_thread_object(scheduler: &Scheduler, core: u8) -> Option<ObjectId> {
+    let core = crate::sched::CoreId::new(core)?;
+    let thread = scheduler.current(core).ok().flatten()?;
+    scheduler.thread(thread).ok()?.object()
 }
 
 /// Makes the scheduler's thread behind `sender` wait for the reply to its request on

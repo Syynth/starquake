@@ -143,6 +143,46 @@ fn a_thread_of_an_unknown_process_is_not_made() {
 }
 
 #[test]
+fn a_new_process_gets_an_object_its_row_holds_and_a_second_add_makes_none() {
+    let mut scheduler = Scheduler::default();
+    scheduler.add_process(process()).unwrap();
+    let object = scheduler.process(process()).unwrap().object();
+    assert_eq!(
+        scheduler.objects().get(object),
+        Ok(Object::Process(process()))
+    );
+    assert_eq!(scheduler.objects().refs(object), 1);
+    assert_eq!(scheduler.objects().len(), 1);
+    // A process added twice is refused before a second object is made.
+    assert_eq!(scheduler.add_process(process()), Err(SchedError::Corrupt));
+    assert_eq!(scheduler.objects().len(), 1);
+    assert_eq!(scheduler.process(process()).unwrap().object(), object);
+}
+
+#[test]
+fn a_process_whose_object_does_not_fit_gets_no_row() {
+    // Room for exactly one object: the process's fits.
+    let mut room = Scheduler::default();
+    *room.objects_mut() = crate::object::Objects::with_max_slots(1);
+    room.add_process(process()).unwrap();
+    assert_eq!(room.objects().len(), 1);
+    // Room for none: the table refuses, which a guest sees as out of resource, and no row is
+    // added.
+    let mut full = Scheduler::default();
+    *full.objects_mut() = crate::object::Objects::with_max_slots(0);
+    let refused = SchedError::Object(crate::object::ObjectError::Full { max_slots: 0 });
+    assert_eq!(full.add_process(process()), Err(refused));
+    assert_eq!(
+        full.process(process()),
+        Err(SchedError::UnknownProcess(process()))
+    );
+    assert_eq!(
+        SvcError::from(refused),
+        SvcError::Kernel(KernelError::OutOfResource)
+    );
+}
+
+#[test]
 fn starting_counts_the_thread_and_it_holds_itself_until_it_ends() {
     let (mut scheduler, mut space) = world();
     let (thread, object) = create(&mut scheduler, &mut space, 0);
