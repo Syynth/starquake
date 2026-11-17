@@ -225,10 +225,16 @@
 //! (`lifecycle_manager.cpp` @ cf654052) for an application, over the terms this port keeps, in
 //! Eden's order ([`Lifecycle::pop_message_in_order_of_priority`]): the focus change (while its
 //! notifications are on), the operation-mode change, the performance-mode change, then the
-//! unordered messages, oldest first. Then, as Eden's `PopMessage` does, the message event is
-//! cleared if no message is left. `lifecycle_manager.cpp`, `.h`, `am_results.h`, the
-//! `AppletMessage` values and `ReceiveMessage` are the same in Eden-NX2 @ 50fa86bb and Eden PR
-//! #4588 @ e5fb3b97, and the scoping doc has no row for them: the Switch 2 changes nothing here.
+//! unordered messages, oldest first. As Eden's `PopMessage` does after the pop, the message
+//! event is cleared if no message is left; here the clear comes just before the pop (see "Where
+//! this differs from Eden"), and only when a message was available, as Eden clears only when
+//! its cached "a message is available" was true
+//! (`with_no_message_pending_nothing_clears_the_message_event`). Each `ReceiveMessage` reads at
+//! most the first two queued messages, however long the queue a snapshot restored
+//! (`per_call_work_does_not_grow_with_the_queue`). `lifecycle_manager.cpp`, `.h`,
+//! `am_results.h`, the `AppletMessage` values and `ReceiveMessage` are the same in Eden-NX2 @
+//! 50fa86bb and Eden PR #4588 @ e5fb3b97, and the scoping doc has no row for them: the Switch 2
+//! changes nothing here.
 //!
 //! So a freshly launched application's first `ReceiveMessage` answers
 //! [`AppletMessage::FocusStateChanged`] (Eden's `m_has_focus_state_changed{true}`), and the next
@@ -253,8 +259,9 @@
 //!
 //! - **A failed clear in `ReceiveMessage` leaves the message pending.** Eden's event cannot fail
 //!   to clear. Here the kernel refuses to clear a restored message-event id that is not an
-//!   event; `ReceiveMessage` then answers the kernel's error and writes nothing back, so the
-//!   message is not lost undelivered and the next `ReceiveMessage` takes it again
+//!   event; `ReceiveMessage`, which clears the event before it takes the last message, then
+//!   answers the kernel's error and takes nothing, so the message is not lost undelivered and
+//!   the next `ReceiveMessage` takes it again
 //!   (`a_failed_clear_leaves_the_message_to_be_received_again`). The `ISelfController` commands
 //!   instead keep their change on a failed clear ("The applet").
 //!
@@ -943,6 +950,29 @@ impl Lifecycle {
             || self.has_performance_mode_changed
     }
 
+    /// Whether a message would still be available after
+    /// [`Lifecycle::pop_message_in_order_of_priority`]: what `ReceiveMessage` decides on before
+    /// it takes anything (module docs, "The messages").
+    ///
+    /// It takes the message from a copy of the flags and of at most the first two queued
+    /// messages, not of the whole queue: a pop removes at most one queued message, and
+    /// [`Lifecycle::message_available`] reads only whether the queue is empty, so the first two
+    /// decide the answer. Its cost does not grow with the queue
+    /// (`per_call_work_does_not_grow_with_the_queue`), and it agrees with a pop on a full copy
+    /// (`message_available_after_pop_agrees_with_a_pop`).
+    fn message_available_after_pop(&self) -> bool {
+        let mut next = Self {
+            notifications: self.notifications,
+            has_focus_state_changed: self.has_focus_state_changed,
+            focus_handling_mode: self.focus_handling_mode,
+            has_operation_mode_changed: self.has_operation_mode_changed,
+            has_performance_mode_changed: self.has_performance_mode_changed,
+            unordered_messages: self.unordered_messages.iter().take(2).copied().collect(),
+        };
+        next.pop_message_in_order_of_priority();
+        next.message_available()
+    }
+
     /// `LifecycleManager::PopMessageInOrderOfPriority` for an application (Eden's
     /// `m_is_application`), over the terms this port keeps: the first of these that holds is
     /// taken and returned, or `None` when none does (Eden's `AppletMessage::None`):
@@ -1002,10 +1032,13 @@ impl Lifecycle {
 /// The application's applet: the `appletOE` server's family state (see the module docs, "The
 /// applet").
 ///
-/// A method that changes it while it calls the kernel works on a copy and writes the copy back
-/// before it reports any error, so a kernel object it created is never forgotten. The one
-/// exception is `ReceiveMessage`, which writes its copy back only once the message event agrees
-/// with it (module docs, "The messages").
+/// A command changes it in place, never on a copy: a copy would cost as much as the applet's
+/// message queue, which a restored snapshot may make long
+/// (`per_call_work_does_not_grow_with_the_queue`). A command that changes it and calls the
+/// kernel keeps its change before it calls, so a kernel object it created is never forgotten
+/// and an error the kernel reports leaves the change kept. The one exception is
+/// `ReceiveMessage`, which clears the message event before it takes the message, and takes
+/// nothing if the clear fails (module docs, "The messages").
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Applet {
     settings: AppletSettings,
@@ -1139,77 +1172,92 @@ impl Applet {
         )
     }
 
-    /// Changes the lifecycle state with `change`, then signals the message event if a message
-    /// became available, or clears it if one stopped being available: Eden's
-    /// `SignalSystemEventIfNeeded` after the change (module docs, "The message event"). Before
-    /// the event exists there is nothing to signal or clear: it is made in the state the
-    /// condition says.
-    fn update(
-        &mut self,
-        cx: &mut Context<'_>,
-        change: impl FnOnce(&mut Lifecycle),
-    ) -> Result<(), Fault> {
-        let before = self.lifecycle.message_available();
-        change(&mut self.lifecycle);
-        let after = self.lifecycle.message_available();
+    /// Changes the server's applet's lifecycle state with `change`, in place, then signals the
+    /// message event if a message became available, or clears it if one stopped being
+    /// available: Eden's `SignalSystemEventIfNeeded` after the change (module docs, "The message
+    /// event"). Before the event exists there is nothing to signal or clear: it is made in the
+    /// state the condition says. The change is kept when the signal or clear fails.
+    fn update(cx: &mut Context<'_>, change: impl FnOnce(&mut Lifecycle)) -> Result<(), Fault> {
+        let applet = cx.family::<Self>()?;
+        let before = applet.lifecycle.message_available();
+        change(&mut applet.lifecycle);
+        let after = applet.lifecycle.message_available();
+        let message_event = applet.message_event;
         if after
             && !before
-            && let Some(event) = self.message_event
+            && let Some(event) = message_event
         {
             cx.signal_event(event)?;
         }
         if before
             && !after
-            && let Some(event) = self.message_event
+            && let Some(event) = message_event
         {
             cx.clear_event(event)?;
         }
         Ok(())
     }
 
-    /// Takes the applet's next message ([`Lifecycle::pop_message_in_order_of_priority`]), then
-    /// clears the message event if no message is left: Eden's `LifecycleManager::PopMessage`,
-    /// which calls `SignalSystemEventIfNeeded` after the pop. Taking a message never makes one
-    /// available, so the event is only ever cleared here, never signalled.
-    fn pop_message(&mut self, cx: &mut Context<'_>) -> Result<Option<AppletMessage>, Fault> {
-        let mut message = None;
-        self.update(cx, |lifecycle| {
-            message = lifecycle.pop_message_in_order_of_priority();
-        })?;
-        Ok(message)
+    /// Takes the server's applet's next message
+    /// ([`Lifecycle::pop_message_in_order_of_priority`]), clearing the message event first if
+    /// no message will be left: Eden's `LifecycleManager::PopMessage`, which calls
+    /// `SignalSystemEventIfNeeded` after the pop. Taking a message never makes one available,
+    /// so the event is only ever cleared here, never signalled; with no message available
+    /// before, nothing is cleared, as Eden clears only when its cached "a message is available"
+    /// was true.
+    ///
+    /// The clear is decided on the applet as it is ([`Lifecycle::message_available_after_pop`])
+    /// and done before the pop, so a clear that fails (a restored event id that is not an
+    /// event) reports the kernel's error and takes nothing (module docs, "Where this differs
+    /// from Eden").
+    fn pop_message(cx: &mut Context<'_>) -> Result<Option<AppletMessage>, Fault> {
+        let applet = cx.family::<Self>()?;
+        let before = applet.lifecycle.message_available();
+        let after = applet.lifecycle.message_available_after_pop();
+        let message_event = applet.message_event;
+        if before
+            && !after
+            && let Some(event) = message_event
+        {
+            cx.clear_event(event)?;
+        }
+        Ok(cx
+            .family::<Self>()?
+            .lifecycle
+            .pop_message_in_order_of_priority())
     }
 
-    /// The message event, created (and signalled if a message is available) the first time.
-    fn message_event_or_create(&mut self, cx: &mut Context<'_>) -> Result<ObjectId, Fault> {
-        if let Some(event) = self.message_event {
+    /// The server's applet's message event, created (and signalled if a message is available)
+    /// the first time.
+    fn message_event_or_create(cx: &mut Context<'_>) -> Result<ObjectId, Fault> {
+        if let Some(event) = cx.family::<Self>()?.message_event {
             return Ok(event);
         }
         let event = cx.create_event()?;
         // Kept before it is signalled, so the event the server holds a reference to is never
         // lost; signalling an event just created fails only if the kernel lost it.
-        self.message_event = Some(event);
-        if self.lifecycle.message_available() {
+        let applet = cx.family::<Self>()?;
+        applet.message_event = Some(event);
+        if applet.lifecycle.message_available() {
             cx.signal_event(event)?;
         }
         Ok(event)
     }
 
-    /// The suspended-tick event, created the first time. It is never signalled.
-    fn suspended_tick_event_or_create(&mut self, cx: &mut Context<'_>) -> Result<ObjectId, Fault> {
-        unsignalled_event_or_create(&mut self.suspended_tick_event, cx)
+    /// The server's applet's suspended-tick event, created the first time. It is never
+    /// signalled.
+    fn suspended_tick_event_or_create(cx: &mut Context<'_>) -> Result<ObjectId, Fault> {
+        unsignalled_event_or_create(cx, |applet| &mut applet.suspended_tick_event)
     }
 
-    /// The GPU-error event, created the first time. It is never signalled.
-    fn gpu_error_detected_event_or_create(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Result<ObjectId, Fault> {
-        unsignalled_event_or_create(&mut self.gpu_error_detected_event, cx)
+    /// The server's applet's GPU-error event, created the first time. It is never signalled.
+    fn gpu_error_detected_event_or_create(cx: &mut Context<'_>) -> Result<ObjectId, Fault> {
+        unsignalled_event_or_create(cx, |applet| &mut applet.gpu_error_detected_event)
     }
 }
 
-/// The event `slot` names, or a new one the kernel makes, kept in `slot`: how the applet makes
-/// each of its events that nothing signals.
+/// The event the server's applet keeps in `slot`, or a new one the kernel makes, kept there: how
+/// the applet makes each of its events that nothing signals.
 ///
 /// An event already in `slot` is checked first with [`Context::clear_event`], which the kernel
 /// answers `InvalidHandle` for any id that is not an event this server made (the kernel's
@@ -1218,29 +1266,26 @@ impl Applet {
 /// made the clear changes nothing: nothing signals these events, and the guest is given only
 /// their readable end, which it cannot signal.
 fn unsignalled_event_or_create(
-    slot: &mut Option<ObjectId>,
     cx: &mut Context<'_>,
+    slot: fn(&mut Applet) -> &mut Option<ObjectId>,
 ) -> Result<ObjectId, Fault> {
-    if let Some(event) = *slot {
+    if let Some(event) = *slot(cx.family::<Applet>()?) {
         cx.clear_event(event)?;
         return Ok(event);
     }
     let event = cx.create_event()?;
-    *slot = Some(event);
+    *slot(cx.family::<Applet>()?) = Some(event);
     Ok(event)
 }
 
-/// Runs `get` on a copy of the applet, writes the copy back before any error `get` reports (so
-/// an event it made is never forgotten), and copies the event it returns into the reply.
+/// Copies the event `get` returns (one of the applet's, which `get` keeps in the applet before
+/// any error it reports, so an event it made is never forgotten) into the reply.
 fn reply_with_applet_event(
     cx: &mut Context<'_>,
     reply: &mut Reply,
-    get: impl FnOnce(&mut Applet, &mut Context<'_>) -> Result<ObjectId, Fault>,
+    get: impl FnOnce(&mut Context<'_>) -> Result<ObjectId, Fault>,
 ) -> Outcome {
-    let mut applet = cx.family::<Applet>()?.clone();
-    let event = get(&mut applet, cx);
-    *cx.family::<Applet>()? = applet;
-    reply.copy_handle(event?);
+    reply.copy_handle(get(cx)?);
     reply.ok()
 }
 
@@ -1736,19 +1781,17 @@ impl ICommonStateGetter {
     /// [`NO_MESSAGES`] with nothing when there is none (Eden: `if
     /// (!lifecycle_manager.PopMessage(..)) R_THROW(AM::ResultNoMessages)`).
     ///
-    /// The message is taken on a copy of the applet, which is written back only once the
-    /// message event is cleared (if no message is left): a clear that fails (a restored event id
-    /// that is not an event) answers the kernel's error and leaves the message to be received
-    /// again (module docs, "The messages").
+    /// The message event is cleared (if no message will be left) before the message is taken:
+    /// a clear that fails (a restored event id that is not an event) answers the kernel's error
+    /// and leaves the message to be received again ([`Applet::pop_message`]; module docs, "Where
+    /// this differs from Eden").
     fn receive_message(
         _: &mut Self,
         cx: &mut Context<'_>,
         _req: &Request<'_>,
         reply: &mut Reply,
     ) -> Outcome {
-        let mut applet = cx.family::<Applet>()?.clone();
-        let message = applet.pop_message(cx)?;
-        *cx.family::<Applet>()? = applet;
+        let message = Applet::pop_message(cx)?;
         let Some(message) = message else {
             tracing::debug!("appletOE: ReceiveMessage with no message");
             return Err(NO_MESSAGES.into());
@@ -1818,10 +1861,7 @@ impl ISelfController {
     /// Runs `change` on the applet's lifecycle state, signalling the message event as
     /// [`Applet::update`] says.
     fn update(cx: &mut Context<'_>, change: impl FnOnce(&mut Lifecycle)) -> Result<(), Fault> {
-        let mut applet = cx.family::<Applet>()?.clone();
-        let updated = applet.update(cx, change);
-        *cx.family::<Applet>()? = applet;
-        updated
+        Applet::update(cx, change)
     }
 
     /// `Exit`: the caller's process ends once this success reply reaches it (module docs,

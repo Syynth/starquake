@@ -2939,3 +2939,113 @@ fn with_a_message_still_pending_nothing_signals_the_message_event() {
     assert_eq!(on.result, ResultCode::SUCCESS);
     assert!(fresh.applet().lifecycle().message_available());
 }
+
+/// The unordered messages queued in [`per_call_work_does_not_grow_with_the_queue`]: a queue a
+/// restored snapshot may hold, long enough that touching every message on each call costs far
+/// more than [`QUEUE_PATIENCE`] over [`QUEUE_ROUNDS`].
+const LONG_QUEUE: usize = 1 << 25;
+
+/// How many times [`per_call_work_does_not_grow_with_the_queue`] sends each command. Each round
+/// copies three event handles, so the rounds stay well inside the fake kernel's handle table.
+const QUEUE_ROUNDS: usize = 200;
+
+/// The wall-clock bound on [`per_call_work_does_not_grow_with_the_queue`]'s rounds.
+const QUEUE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Every command that reads or changes the applet works on it in place, not on a copy: with a
+/// queue of [`LONG_QUEUE`] messages, [`QUEUE_ROUNDS`] rounds of `ReceiveMessage`, the three
+/// event getters and `SetFocusHandlingMode` finish inside [`QUEUE_PATIENCE`].
+///
+/// Measured in the gate's debug build, all the rounds take about a fifth of a second alone and
+/// up to two and a half seconds under the full parallel gate. A command that copies the applet, queue and all,
+/// on each call (as `ReceiveMessage`, the `ISelfController` lifecycle commands and the event
+/// getters once did, which made draining a restored queue quadratic) spends a quarter to half a
+/// second per call on it: adding the copy back to one of them at a time crossed the bound in
+/// round 78 (`SetFocusHandlingMode`), 46 (`ReceiveMessage`) and 13 (the event getters, three
+/// per round). The bound is checked after every command, so a regression fails at the bound
+/// instead of running on. A wall-clock bound with this margin (about eight times the gate's
+/// time, under half a regression's) is the only observation of the cost short of counting
+/// allocations.
+#[test]
+fn per_call_work_does_not_grow_with_the_queue() {
+    let mut applet = Applet::new(AppletSettings::eden_default());
+    applet.lifecycle.unordered_messages =
+        std::iter::repeat_n(AppletMessage::AlbumRecordingSaved, LONG_QUEUE).collect();
+    let mut rig = Rig::with_applet(applet);
+    let (proxy, getter, _) = rig.getter_with_event();
+    let controller = rig.open(proxy, GET_SELF_CONTROLLER);
+    let functions = rig.open(proxy, GET_APPLICATION_FUNCTIONS);
+    // The focus change comes first.
+    let first = rig.object_raw(getter, RECEIVE_MESSAGE, &[]);
+    assert_eq!(first, message_reply(AppletMessage::FocusStateChanged));
+
+    let deadline = std::time::Instant::now() + QUEUE_PATIENCE;
+    let in_time = |what: &str, round: usize| {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what} in round {round} ran past the bound"
+        );
+    };
+    for round in 0..QUEUE_ROUNDS {
+        let reply = rig.object_raw(getter, RECEIVE_MESSAGE, &[]);
+        assert_eq!(reply, message_reply(AppletMessage::AlbumRecordingSaved));
+        in_time("ReceiveMessage", round);
+        let mode = rig.object(controller, SET_FOCUS_HANDLING_MODE, &[1, 0, 1]);
+        assert_eq!(mode.result, ResultCode::SUCCESS);
+        in_time("SetFocusHandlingMode", round);
+        for (object, command) in [
+            (getter, GET_EVENT_HANDLE),
+            (controller, GET_ACCUMULATED_SUSPENDED_TICK_CHANGED_EVENT),
+            (functions, GET_GPU_ERROR_DETECTED_SYSTEM_EVENT),
+        ] {
+            let reply = rig.object(object, command, &[]);
+            assert_eq!(reply.result, ResultCode::SUCCESS);
+            assert_eq!(reply.copies.len(), 1);
+            in_time("an event getter", round);
+        }
+    }
+    let applet = rig.server.family::<Applet>().unwrap();
+    assert_eq!(
+        applet.lifecycle().unordered_messages.len(),
+        LONG_QUEUE - QUEUE_ROUNDS
+    );
+    assert!(applet.lifecycle().message_available());
+}
+
+/// [`Lifecycle::message_available_after_pop`], which reads at most the first two queued
+/// messages, agrees with a pop on a full copy for every set of pending flags, with notifications
+/// on and off, and every queue length up to two past where it stops reading, at every step of a
+/// drain.
+#[test]
+fn message_available_after_pop_agrees_with_a_pop() {
+    for flags in 0_u32..8 {
+        for notify in [false, true] {
+            for queued in 0..5 {
+                let mut lifecycle = Lifecycle {
+                    notifications: Notifications {
+                        focus_state_changed: notify,
+                        ..Notifications::default()
+                    },
+                    has_focus_state_changed: flags & 1 != 0,
+                    has_operation_mode_changed: flags & 2 != 0,
+                    has_performance_mode_changed: flags & 4 != 0,
+                    unordered_messages: AppletMessage::ALL.into_iter().take(queued).collect(),
+                    ..Lifecycle::default()
+                };
+                loop {
+                    let mut popped = lifecycle.clone();
+                    let message = popped.pop_message_in_order_of_priority();
+                    assert_eq!(
+                        lifecycle.message_available_after_pop(),
+                        popped.message_available(),
+                        "flags {flags:#05b}, notify {notify}, {queued} queued, at {lifecycle:?}"
+                    );
+                    lifecycle = popped;
+                    if message.is_none() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
