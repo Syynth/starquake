@@ -71,8 +71,14 @@ fn the_ioctl_numbers_decode_to_the_device_s_commands() {
         );
     }
     let bind = Ioctl::from_raw(AS_BIND_CHANNEL);
-    assert!(crate::nvsrv::as_gpu::is_bind_channel(IoctlVariant::Ioctl, bind));
-    assert!(!crate::nvsrv::as_gpu::is_bind_channel(IoctlVariant::Ioctl2, bind));
+    assert!(crate::nvsrv::as_gpu::is_bind_channel(
+        IoctlVariant::Ioctl,
+        bind
+    ));
+    assert!(!crate::nvsrv::as_gpu::is_bind_channel(
+        IoctlVariant::Ioctl2,
+        bind
+    ));
 }
 
 // ----- The fake front --------------------------------------------------------------------------
@@ -223,7 +229,10 @@ fn submit_struct(count: u32, flags: u32, id: u32, value: u32) -> Vec<u8> {
 
 /// `entries` as GP entries' bytes.
 fn entry_bytes(entries: &[u64]) -> Vec<u8> {
-    entries.iter().flat_map(|entry| entry.to_le_bytes()).collect()
+    entries
+        .iter()
+        .flat_map(|entry| entry.to_le_bytes())
+        .collect()
 }
 
 /// Distinct entries, from `first`: each differs in both its words.
@@ -351,7 +360,10 @@ impl Bench {
         let answer = self.ioctl(fd, ALLOC_GPFIFO_EX2, &alloc_request());
         assert_eq!(answer.result, NvResult::Success);
         let word = |at: usize| u32::from_le_bytes(answer.output[at..at + 4].try_into().unwrap());
-        (word(layout::ALLOC_FENCE_ID), word(layout::ALLOC_FENCE_VALUE))
+        (
+            word(layout::ALLOC_FENCE_ID),
+            word(layout::ALLOC_FENCE_VALUE),
+        )
     }
 
     /// A channel bound to a new address space, with a syncpoint and a GPU channel: its fd, the
@@ -398,7 +410,10 @@ impl Bench {
 /// The fence a submission's answer gives back.
 fn fence_of(answer: &IoctlAnswer) -> (u32, u32) {
     let word = |at: usize| u32::from_le_bytes(answer.output[at..at + 4].try_into().unwrap());
-    (word(layout::SUBMIT_FENCE_ID), word(layout::SUBMIT_FENCE_VALUE))
+    (
+        word(layout::SUBMIT_FENCE_ID),
+        word(layout::SUBMIT_FENCE_VALUE),
+    )
 }
 
 // ----- AllocGPFIFOEx2 --------------------------------------------------------------------------
@@ -621,8 +636,22 @@ fn a_binding_s_space_is_checked_against_the_memory() {
     let space = gpu33.memory.create_address_space(&gpu33.vm).unwrap();
     let parent = i32::try_from(space.0).unwrap();
     let as_fd = gpu33.open(Device::NvhostAsGpu);
-    let view = le(&[5, parent.cast_unsigned(), 0x1000, 0, 0x800_0000, 0, 0x900_0000, 0, 0, 0]);
-    assert_eq!(gpu33.ioctl(as_fd, AS_ALLOC_AS_EX, &view).result, NvResult::Success);
+    let view = le(&[
+        5,
+        parent.cast_unsigned(),
+        0x1000,
+        0,
+        0x800_0000,
+        0,
+        0x900_0000,
+        0,
+        0,
+        0,
+    ]);
+    assert_eq!(
+        gpu33.ioctl(as_fd, AS_ALLOC_AS_EX, &view).result,
+        NvResult::Success
+    );
     let channel = gpu33.open(Device::NvhostGpu);
     assert_eq!(gpu33.bind(as_fd, channel), NvResult::Success);
     gpu33.close(as_fd);
@@ -688,7 +717,12 @@ fn every_mapped_class_is_taken_and_others_refused() {
             "{requested:#x}"
         );
         assert_eq!(
-            bench.state.gpu().channel(fd.cast_unsigned()).unwrap().classes,
+            bench
+                .state
+                .gpu()
+                .channel(fd.cast_unsigned())
+                .unwrap()
+                .classes,
             [requested]
         );
     }
@@ -717,7 +751,13 @@ fn class_0_fills_the_free_slots_in_nx2_s_order() {
         assert_eq!(answer.output, obj_request(expected, 0));
     }
     assert_eq!(
-        [class::CTX_3D, class::CTX_COMPUTE, class::CTX_DMA, class::CTX_2D, class::CTX_KEPLER],
+        [
+            class::CTX_3D,
+            class::CTX_COMPUTE,
+            class::CTX_DMA,
+            class::CTX_2D,
+            class::CTX_KEPLER
+        ],
         class::ZERO_CANDIDATES
     );
 
@@ -726,7 +766,12 @@ fn class_0_fills_the_free_slots_in_nx2_s_order() {
     // Compute taken first, so class 0 skips it.
     bench.ioctl(fd, ALLOC_OBJ_CTX, &obj_request(clc7c0::CLASS, 0));
     let mut given = vec![clc7c0::CLASS];
-    for expected in [class::CTX_3D, class::CTX_DMA, class::CTX_2D, class::CTX_KEPLER] {
+    for expected in [
+        class::CTX_3D,
+        class::CTX_DMA,
+        class::CTX_2D,
+        class::CTX_KEPLER,
+    ] {
         let answer = bench.ioctl(fd, ALLOC_OBJ_CTX, &obj_request(0, 0));
         assert_eq!(
             (answer.result, answer.output),
@@ -743,7 +788,15 @@ fn class_0_fills_the_free_slots_in_nx2_s_order() {
     let answer = bench.ioctl(fd, ALLOC_OBJ_CTX, &obj_request(clc76f::CLASS, 0));
     assert_eq!(answer.result, NvResult::Success);
     given.push(clc76f::CLASS);
-    assert_eq!(bench.state.gpu().channel(fd.cast_unsigned()).unwrap().classes, given);
+    assert_eq!(
+        bench
+            .state
+            .gpu()
+            .channel(fd.cast_unsigned())
+            .unwrap()
+            .classes,
+        given
+    );
     // Making the channel binds them all, in that order.
     let (as_fd, space) = bench.space();
     bench.bind(as_fd, fd);
@@ -770,7 +823,12 @@ fn a_refused_class_is_not_recorded() {
         (NvResult::BadParameter, obj_request(class::CTX_DMA, 0))
     );
     assert_eq!(
-        bench.state.gpu().channel(fd.cast_unsigned()).unwrap().classes,
+        bench
+            .state
+            .gpu()
+            .channel(fd.cast_unsigned())
+            .unwrap()
+            .classes,
         Vec::<u32>::new()
     );
     bench.fake.refuse_classes(false);
@@ -923,7 +981,9 @@ fn a_submission_needs_a_syncpoint_and_a_space() {
     let (answer, _) = bench.submit(fd, &entries_from(1, 1), 0, (0, 0));
     assert_eq!(answer.result, NvResult::InvalidState);
     // A channel with only an event: the same.
-    bench.state.set_event(fd, event::SM_EXCEPTION_INT, ObjectId::from_parts(4, 5));
+    bench
+        .state
+        .set_event(fd, event::SM_EXCEPTION_INT, ObjectId::from_parts(4, 5));
     let (answer, _) = bench.submit(fd, &entries_from(1, 1), 0, (0, 0));
     assert_eq!(answer.result, NvResult::InvalidState);
     let (id, _) = bench.alloc(fd);
@@ -989,7 +1049,11 @@ fn the_count_is_checked_against_the_entries_sent() {
     let queued = bench.fake.queued();
     let sent: Vec<GpfifoEntry> = entries.iter().copied().map(GpfifoEntry).collect();
     assert_eq!(queued.len(), 2);
-    assert!(queued.iter().all(|(_, submission)| submission.entries == sent));
+    assert!(
+        queued
+            .iter()
+            .all(|(_, submission)| submission.entries == sent)
+    );
 }
 
 /// One submission of exactly a queue's entries is taken; one more entry is refused, nothing
@@ -1096,7 +1160,11 @@ fn submissions_from_memory_go_to_the_policy() {
         (IoctlVariant::Ioctl2, ALLOC_GPFIFO_EX2),
     ] {
         let (answer, _) = bench.call(variant, fd, raw, &input, &inline);
-        assert_eq!(answer.result, NvResult::NotImplemented, "{variant:?} {raw:#x}");
+        assert_eq!(
+            answer.result,
+            NvResult::NotImplemented,
+            "{variant:?} {raw:#x}"
+        );
     }
     assert_eq!(bench.fake.queued(), []);
 }
@@ -1288,7 +1356,10 @@ fn a_waiting_submission_writes_its_fence_at_once() {
     assert!(matches!(handled, Handled::Deferred(_)));
     let syncpoint = u32::from(FIRST_ALLOCATABLE);
     // Bit 8 with a fence value of 0 (the request's): no increment, the fence at 0.
-    assert_eq!(live.rig.memory(out_at, 24), submit_struct(1, 0, syncpoint, 0));
+    assert_eq!(
+        live.rig.memory(out_at, 24),
+        submit_struct(1, 0, syncpoint, 0)
+    );
 }
 
 /// A submission behind a waiting one waits too, though the front has room, and the two reach
@@ -1313,7 +1384,12 @@ fn a_submission_behind_a_waiting_one_waits_too() {
     let (handled, _, _) = live.submit_on(second_session, fd, &second, 0);
     assert!(matches!(handled, Handled::Deferred(_)));
     // The push tried the queue once more: both went, in order, and both replies complete.
-    let queued: Vec<_> = live.fake.queued().into_iter().map(|(_, s)| s.entries).collect();
+    let queued: Vec<_> = live
+        .fake
+        .queued()
+        .into_iter()
+        .map(|(_, s)| s.entries)
+        .collect();
     let tail = queued[queued.len() - 2..].to_vec();
     let as_entries = |entries: &[u64]| -> Vec<GpfifoEntry> {
         entries.iter().copied().map(GpfifoEntry).collect()
@@ -1322,10 +1398,7 @@ fn a_submission_behind_a_waiting_one_waits_too() {
     let delivered = live.deliver();
     assert_eq!(
         delivered,
-        [
-            (first_session, ok(&[0])),
-            (second_session, ok(&[0]))
-        ]
+        [(first_session, ok(&[0])), (second_session, ok(&[0]))]
     );
     // Now with the queue full for both: room for the other channel changes nothing.
     live.fake.hold(channel, CHANNEL_QUEUE_ENTRIES);
@@ -1359,7 +1432,10 @@ fn closing_a_channel_answers_its_waiting_submissions() {
     live.fake.clear();
     // Both sessions wait; a third closes the fd.
     let closer = live.session();
-    let reply = answer(&live.rig.send_on(closer, &cmif(CLOSE, &fd.to_le_bytes())), 1);
+    let reply = answer(
+        &live.rig.send_on(closer, &cmif(CLOSE, &fd.to_le_bytes())),
+        1,
+    );
     assert_eq!(reply, ok(&[0]));
     let not_implemented = ok(&[NvResult::NotImplemented.raw()]);
     assert_eq!(
@@ -1397,7 +1473,11 @@ fn events_1_2_3_and_7_are_answered() {
     };
     let success = ok(&[NvResult::Success.raw()]);
     let mut handles = Vec::new();
-    for id in [event::SM_EXCEPTION_INT, event::SM_EXCEPTION_PAUSE, event::ERROR_NOTIFIER] {
+    for id in [
+        event::SM_EXCEPTION_INT,
+        event::SM_EXCEPTION_PAUSE,
+        event::ERROR_NOTIFIER,
+    ] {
         let (reply, copied) = query(&mut live, id);
         assert_eq!(reply, success);
         assert_eq!(copied.len(), 1);
@@ -1431,7 +1511,10 @@ fn events_1_2_3_and_7_are_answered() {
         .map(|event| event.unwrap())
         .collect();
     assert_eq!(after, events);
-    assert_eq!(event_slot(event::NATIVE_ERROR), event_slot(event::ERROR_NOTIFIER));
+    assert_eq!(
+        event_slot(event::NATIVE_ERROR),
+        event_slot(event::ERROR_NOTIFIER)
+    );
     for id in [0, 4, 5, 6, 8, u32::MAX] {
         let (reply, copied) = query(&mut live, id);
         assert_eq!(reply, ok(&[NvResult::BadParameter.raw()]), "{id}");
@@ -1505,23 +1588,35 @@ fn a_saved_channel_table_no_ioctl_reaches_is_refused() {
     let reserved = RESERVED_SYNCPOINTS[0];
     let count = u8::try_from(SYNCPOINT_COUNT).unwrap();
     let refused = [
-        (with(Some(0), None, vec![]), GpuStateError::Syncpoint { fd: 7, id: 0 }),
+        (
+            with(Some(0), None, vec![]),
+            GpuStateError::Syncpoint { fd: 7, id: 0 },
+        ),
         (
             with(Some(count), None, vec![]),
             GpuStateError::Syncpoint { fd: 7, id: count },
         ),
         (
             with(Some(reserved), None, vec![]),
-            GpuStateError::Syncpoint { fd: 7, id: reserved },
+            GpuStateError::Syncpoint {
+                fd: 7,
+                id: reserved,
+            },
         ),
-        (with(None, made, vec![]), GpuStateError::MadeWithoutSyncpoint { fd: 7 }),
+        (
+            with(None, made, vec![]),
+            GpuStateError::MadeWithoutSyncpoint { fd: 7 },
+        ),
         (
             with(Some(1), None, vec![0]),
             GpuStateError::Class { fd: 7, class: 0 },
         ),
         (
             with(Some(1), None, vec![0x1234]),
-            GpuStateError::Class { fd: 7, class: 0x1234 },
+            GpuStateError::Class {
+                fd: 7,
+                class: 0x1234,
+            },
         ),
         (
             with(Some(1), None, vec![clc797::CLASS, class::CTX_3D]),
@@ -1535,10 +1630,17 @@ fn a_saved_channel_table_no_ioctl_reaches_is_refused() {
             with(Some(0), None, vec![0]),
             GpuStateError::Syncpoint { fd: 7, id: 0 },
         ),
-        (with(None, made, vec![0]), GpuStateError::MadeWithoutSyncpoint { fd: 7 }),
+        (
+            with(None, made, vec![0]),
+            GpuStateError::MadeWithoutSyncpoint { fd: 7 },
+        ),
     ];
     for (channel, error) in refused {
-        assert_eq!(NvhostGpu::try_from(saved_channel(channel)), Err(error), "{error}");
+        assert_eq!(
+            NvhostGpu::try_from(saved_channel(channel)),
+            Err(error),
+            "{error}"
+        );
     }
     // The edges: the first and last allocatable syncpoints; every slot filled.
     let last = (FIRST_ALLOCATABLE..count)
@@ -1559,12 +1661,31 @@ fn a_saved_channel_table_no_ioctl_reaches_is_refused() {
     ] {
         assert!(NvhostGpu::try_from(saved_channel(channel)).is_ok());
     }
+}
+
+/// Two saved channels sharing a syncpoint, then a GPU channel, are refused; both shared, the
+/// syncpoint is reported.
+#[test]
+fn two_saved_channels_share_neither_a_syncpoint_nor_a_gpu_channel() {
+    let made = Some(Made {
+        channel: 3,
+        space: AsId(1),
+    });
+    let with = |syncpoint: Option<u8>, made: Option<Made>, classes: Vec<u32>| Channel {
+        syncpoint,
+        made,
+        classes,
+        events: [None; EVENT_SLOTS],
+    };
     // Two channels sharing a syncpoint, then a GPU channel.
     let pair = |a: Channel, b: Channel| SavedNvhostGpu {
         channels: BTreeMap::from([(4, a), (9, b)]),
     };
     assert_eq!(
-        NvhostGpu::try_from(pair(with(Some(5), None, vec![]), with(Some(5), None, vec![]))),
+        NvhostGpu::try_from(pair(
+            with(Some(5), None, vec![]),
+            with(Some(5), None, vec![])
+        )),
         Err(GpuStateError::SharedSyncpoint {
             first: 4,
             second: 9,
@@ -1572,7 +1693,10 @@ fn a_saved_channel_table_no_ioctl_reaches_is_refused() {
         })
     );
     assert_eq!(
-        NvhostGpu::try_from(pair(with(Some(5), made, vec![]), with(Some(6), made, vec![]))),
+        NvhostGpu::try_from(pair(
+            with(Some(5), made, vec![]),
+            with(Some(6), made, vec![])
+        )),
         Err(GpuStateError::SharedChannel {
             first: 4,
             second: 9,
@@ -1581,7 +1705,10 @@ fn a_saved_channel_table_no_ioctl_reaches_is_refused() {
     );
     // Both shared: the syncpoint is reported.
     assert_eq!(
-        NvhostGpu::try_from(pair(with(Some(5), made, vec![]), with(Some(5), made, vec![]))),
+        NvhostGpu::try_from(pair(
+            with(Some(5), made, vec![]),
+            with(Some(5), made, vec![])
+        )),
         Err(GpuStateError::SharedSyncpoint {
             first: 4,
             second: 9,
@@ -1589,8 +1716,8 @@ fn a_saved_channel_table_no_ioctl_reaches_is_refused() {
         })
     );
     // Through postcard, a refused table is refused (the struct's one field is the map).
-    let bytes = postcard::to_allocvec(&BTreeMap::from([(7_u32, with(Some(0), None, vec![]))]))
-        .unwrap();
+    let bytes =
+        postcard::to_allocvec(&BTreeMap::from([(7_u32, with(Some(0), None, vec![]))])).unwrap();
     assert!(postcard::from_bytes::<NvhostGpu>(&bytes).is_err());
 }
 
@@ -1606,7 +1733,10 @@ fn a_refused_channel_table_is_said_in_plain_words() {
             "channel fd 7 has a GPU channel but no syncpoint",
         ),
         (
-            GpuStateError::Class { fd: 7, class: 0x1234 },
+            GpuStateError::Class {
+                fd: 7,
+                class: 0x1234,
+            },
             "channel fd 7 has class 0x1234, which it cannot have",
         ),
         (
@@ -1645,9 +1775,11 @@ fn the_channels_relations_to_the_files_are_checked() {
     let mut bench = Bench::new();
     let (fd, as_fd, _, _) = bench.channel();
     let events_only = bench.open(Device::NvhostGpu);
-    bench
-        .state
-        .set_event(events_only, event::SM_EXCEPTION_INT, ObjectId::from_parts(8, 9));
+    bench.state.set_event(
+        events_only,
+        event::SM_EXCEPTION_INT,
+        ObjectId::from_parts(8, 9),
+    );
     bench.close(as_fd);
     // The real state: a channel whose space's last view closed, and one with only events.
     let state = bench.state.clone();

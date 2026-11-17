@@ -817,7 +817,10 @@ impl NvsrvState {
                 let channels = &self.gpu;
                 let made_in = |fd: u32| channels.made_in(fd);
                 let files = &self.files;
-                Some(self.as_gpu.bind_channel(key, call, files, &made_in, &mut gpu))
+                Some(
+                    self.as_gpu
+                        .bind_channel(key, call, files, &made_in, &mut gpu),
+                )
             }
             (Device::NvhostAsGpu, _) => self.as_gpu.ioctl(key, call, gpu),
             (Device::NvhostTsgGpu, _) => self.tsg_gpu.ioctl(key, call, &self.files),
@@ -953,9 +956,7 @@ impl Nvsrv {
             Ok(Queried::Event(made)) => made,
             Ok(Queried::Make) => {
                 let made = cx.create_event()?;
-                cx.family::<NvsrvFamily>()?
-                    .state
-                    .set_event(fd, event, made);
+                cx.family::<NvsrvFamily>()?.state.set_event(fd, event, made);
                 made
             }
         };

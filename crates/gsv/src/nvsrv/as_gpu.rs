@@ -279,9 +279,9 @@ pub mod layout {
 
 use layout::{
     ALLOC_AS_EX_BYTES, ALLOC_AS_FD, ALLOC_BIG_PAGE_SIZE, ALLOC_END, ALLOC_FLAGS, ALLOC_RESERVED,
-    ALLOC_SPLIT, ALLOC_START, BIND_CHANNEL_BYTES, BIND_FD, REGION_BYTES, REGION_OFFSET, REGION_PAGE_SIZE, REGION_PAGES,
-    SHIM_ADDRESS, SHIM_BYTES, SHIM_COUNT, SHIM_STRIDE, VA_BUF_SIZE, VA_REGION_0, VA_REGION_1,
-    VA_REGIONS_BYTES,
+    ALLOC_SPLIT, ALLOC_START, BIND_CHANNEL_BYTES, BIND_FD, REGION_BYTES, REGION_OFFSET,
+    REGION_PAGE_SIZE, REGION_PAGES, SHIM_ADDRESS, SHIM_BYTES, SHIM_COUNT, SHIM_STRIDE, VA_BUF_SIZE,
+    VA_REGION_0, VA_REGION_1, VA_REGIONS_BYTES,
 };
 
 /// The small page: PR's `VM::YUZU_PAGESIZE` (0x1000), the memory crate's page.
@@ -808,7 +808,6 @@ pub fn is_bind_channel(variant: IoctlVariant, ioctl: Ioctl) -> bool {
 }
 
 impl AsGpu {
-
     /// An ioctl on as-gpu fd `fd`, or `None` for one the device does not know (module docs,
     /// "The ioctls").
     pub(super) fn ioctl(

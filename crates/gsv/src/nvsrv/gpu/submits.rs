@@ -214,7 +214,12 @@ impl Submits {
                 queue.iter().map(move |waiting| SavedSubmit {
                     channel: channel.0,
                     token: waiting.token.id(),
-                    entries: waiting.submission.entries.iter().map(|entry| entry.0).collect(),
+                    entries: waiting
+                        .submission
+                        .entries
+                        .iter()
+                        .map(|entry| entry.0)
+                        .collect(),
                     wait: waiting
                         .submission
                         .wait
@@ -304,11 +309,15 @@ impl Submits {
             let Some(token) = server.reissue(id) else {
                 continue;
             };
-            submits.waiting.entry(channel).or_default().push_back(Waiting {
-                token,
-                submission,
-                front: Arc::clone(front),
-            });
+            submits
+                .waiting
+                .entry(channel)
+                .or_default()
+                .push_back(Waiting {
+                    token,
+                    submission,
+                    front: Arc::clone(front),
+                });
         }
         Ok(submits)
     }

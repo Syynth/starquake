@@ -196,7 +196,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use starquake_gpu::classes::{cl902d, cla140, clc76f, clc797, clc7b5, clc7c0};
+use starquake_gpu::classes::{cl902d, cla140, clc7b5, clc7c0, clc76f, clc797};
 use starquake_gpu::fifo::GP_ENTRY_BYTES;
 use starquake_gpu::interface::{ChannelId, Fence, SyncpointId};
 use starquake_gpu::syncpoint::{FIRST_ALLOCATABLE, RESERVED_SYNCPOINTS, Syncpoints};
@@ -975,7 +975,10 @@ impl NvhostGpu {
         if count > source.len() / GP_ENTRY_BYTES || count > CHANNEL_QUEUE_ENTRIES {
             return Err(NvResult::InvalidSize);
         }
-        let plan = plan(arg.u32_at::<SUBMIT_FLAGS>(), arg.u32_at::<SUBMIT_FENCE_VALUE>())?;
+        let plan = plan(
+            arg.u32_at::<SUBMIT_FLAGS>(),
+            arg.u32_at::<SUBMIT_FENCE_VALUE>(),
+        )?;
         let wait = if plan.wait {
             let id = u8::try_from(arg.u32_at::<SUBMIT_FENCE_ID>().cast_signed())
                 .ok()
