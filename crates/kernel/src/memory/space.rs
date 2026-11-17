@@ -89,11 +89,18 @@
 //!   `ASSERT(new_count > 0)`). The result is starquake's own: a guess, which no reference
 //!   settles because Horizon aborts. Test:
 //!   `a_device_lock_past_the_largest_count_is_out_of_resource`.
-//! - **A device-share unlock whose range ends where no lock ends** (it ends inside a locked
-//!   block, or at a block no lock ends at) is [`KernelError::InvalidCurrentMemory`] with
-//!   nothing changed; Eden asserts (`UnshareToDevice`:
-//!   `ASSERT(old_device_disable_merge_right_count > 0)`). Test:
-//!   `an_unlock_that_ends_where_no_lock_ends_is_refused_and_changes_nothing`.
+//! - **A device-share unlock needs a lock taken on exactly its range.** The address space keeps
+//!   a count of the live locks of each exact range it locked (the token's range; see "The
+//!   device-share token" below), and an unlock of a range no live lock was taken on exactly is
+//!   [`KernelError::InvalidCurrentMemory`] with nothing changed. Eden keeps no such record: it
+//!   unlocks any range whose blocks are device shared, and asserts when the range ends where
+//!   no lock ends (`UnshareToDevice`: `ASSERT(old_device_disable_merge_right_count > 0)`). So
+//!   starquake refuses two kinds of range Eden does not unlock as asked: one that ends inside
+//!   a locked block (Eden asserts), and one that starts inside a lock and ends where it ends
+//!   (Eden unlocks that part). The result is the one Eden's state check gives a range that is
+//!   not device shared, a guess for these cases, which Horizon either aborts on or takes.
+//!   Tests: `an_unlock_that_ends_where_no_lock_ends_is_refused_and_changes_nothing` and
+//!   `an_unlock_that_starts_inside_a_lock_is_refused_though_it_ends_where_the_lock_ends`.
 //! - **The device-share lock does not report I/O memory.** Eden's `LockForMapDeviceAddressSpace`
 //!   says whether the locked memory was `Io`; no application process here can have I/O memory
 //!   (`MapIoRegion` is not planned, `crate::svc::ids`), so there is nothing to report.
@@ -112,6 +119,18 @@
 //! another device-share lock, which counts. Tests (in `memory/space/device_tests.rs`):
 //! `a_device_locked_range_refuses_what_would_change_its_mapping_until_unlocked` and
 //! `locked_code_cannot_be_reprotected`.
+//!
+//! # The device-share token
+//!
+//! Taking a device-share lock gives a [`DeviceShareToken`] naming the process and the exact
+//! range, and releasing one takes the token back (`docs/specs/graphics-server.md`, "The model":
+//! the owner's ruling of 2026-11-17). The address space does not know which process it belongs
+//! to, so it neither makes nor checks tokens: it locks and unlocks exact ranges
+//! ([`AddressSpace::lock_device_share`] and [`AddressSpace::unlock_device_share`], both
+//! crate-private, so code outside the kernel reaches them only with a token), and the
+//! dispatcher makes each token and checks its process (`dispatch/device.rs`). A token's fields
+//! are private and only the kernel builds one. It is `Copy`, so a holder can present it twice;
+//! the second unlock is refused, because the lock it names is gone.
 
 use core::fmt;
 use std::collections::BTreeMap;
@@ -127,12 +146,59 @@ use super::shared::{SharedMemory, SharedPages};
 use super::state::{
     DisableMerge, MemoryAttribute, MemoryPermission, MemoryState, STATE_ALL, SvcPermission, flag,
 };
-use crate::id::ObjectId;
+use crate::id::{ObjectId, ProcessId};
 use crate::result::{CallResult, KernelError, SvcError, SvcResult};
 
 /// Free pages kept on each side of a mapping the kernel places for a process
 /// (`KPageTableBase::GetNumGuardPages`, for a page table that is not the kernel's).
 pub const GUARD_PAGES: u64 = 4;
+
+/// A device-share lock as the kernel hands it out and takes it back: the process whose memory
+/// is locked and the exact range (module docs, "The device-share token").
+///
+/// Only the kernel makes one: by taking a lock
+/// ([`IpcContext::lock_device_share`](crate::dispatch::IpcContext::lock_device_share)), or by
+/// checking what a snapshot saved
+/// ([`Dispatcher::reclaim_device_share`](crate::dispatch::Dispatcher::reclaim_device_share)).
+/// Its fields can be read and never set. Releasing it
+/// ([`Dispatcher::unlock_device_share`](crate::dispatch::Dispatcher::unlock_device_share))
+/// checks it again, whichever way it was made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DeviceShareToken {
+    process: ProcessId,
+    address: u64,
+    size: u64,
+}
+
+impl DeviceShareToken {
+    /// The token for a lock on `size` bytes at `address` of `process`. Kernel-only (and the
+    /// `test-support` fakes', `memory::testing::device_share_token`).
+    pub(crate) const fn new(process: ProcessId, address: u64, size: u64) -> Self {
+        Self {
+            process,
+            address,
+            size,
+        }
+    }
+
+    /// The process whose memory is locked.
+    #[must_use]
+    pub const fn process(self) -> ProcessId {
+        self.process
+    }
+
+    /// Where the locked range starts.
+    #[must_use]
+    pub const fn address(self) -> u64 {
+        self.address
+    }
+
+    /// How many bytes are locked.
+    #[must_use]
+    pub const fn size(self) -> u64 {
+        self.size
+    }
+}
 
 /// What a process's address space is created from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -272,6 +338,9 @@ pub struct AddressSpace {
     /// The shared memory mapped here, by where each mapping starts (see "No page groups" in
     /// the module docs).
     shared: BTreeMap<u64, SharedMapping>,
+    /// The live device-share locks by exact range, `(address, size)`: how many were taken on
+    /// the range and not yet released. A count is never zero; a range with none is absent.
+    device_locks: BTreeMap<(u64, u64), u32>,
     mapper: Box<dyn Mapper>,
 }
 
@@ -287,6 +356,7 @@ impl fmt::Debug for AddressSpace {
             .field("code_size", &self.code_size)
             .field("main_thread_stack_size", &self.main_thread_stack_size)
             .field("shared", &self.shared)
+            .field("device_locks", &self.device_locks)
             .finish_non_exhaustive()
     }
 }
@@ -335,6 +405,7 @@ impl AddressSpace {
             code_size: memory.code_size,
             main_thread_stack_size: 0,
             shared: BTreeMap::new(),
+            device_locks: BTreeMap::new(),
             mapper,
         };
         // Reserve memory for our code resource.
@@ -1128,7 +1199,11 @@ impl AddressSpace {
     /// ([`flag::CAN_ALIGNED_DEVICE_MAP`], [`flag::REFERENCE_COUNTED`]), and it is neither
     /// [`MemoryAttribute::LOCKED`] nor [`MemoryAttribute::IPC_LOCKED`]; then
     /// [`KernelError::OutOfResource`] when a block's device count is at its largest.
-    pub fn lock_device_share(&mut self, address: u64, size: u64) -> CallResult<()> {
+    ///
+    /// A lock taken is counted for its exact range ([`Self::device_locks`]); crate-private, so
+    /// that outside the kernel a lock comes with its token (module docs, "The device-share
+    /// token").
+    pub(crate) fn lock_device_share(&mut self, address: u64, size: u64) -> CallResult<()> {
         let pages = self.pages_of(address, size)?;
         // Check the memory state.
         let test_state = flag::CAN_ALIGNED_DEVICE_MAP | flag::REFERENCE_COUNTED;
@@ -1142,13 +1217,32 @@ impl AddressSpace {
             ignore: MemoryAttribute::DEVICE_SHARED,
         };
         self.check_memory_state(address, size, &check)?;
+        // A range's count never passes a block's (each lock of the range counts in every
+        // block of it), so this cannot overflow while the block map is sound.
+        let count = self
+            .device_locks(address, size)
+            .checked_add(1)
+            .ok_or_else(|| SvcError::Internal("a device-share lock count overflowed".into()))?;
         // Update the memory blocks.
         self.blocks
             .update_lock(address, pages, DeviceLock::Share)
             .map_err(|error| match error {
-                BlockMapError::DeviceCount { .. } => KernelError::OutOfResource.into(),
+                BlockMapError::DeviceCount { .. } => SvcError::from(KernelError::OutOfResource),
                 error => broken(error),
-            })
+            })?;
+        self.device_locks.insert((address, size), count);
+        Ok(())
+    }
+
+    /// How many live device-share locks were taken on exactly `size` bytes at `address`: taken
+    /// by [`Self::lock_device_share`] and not yet released. Zero for any other range, a range
+    /// inside or around a locked one included.
+    #[must_use]
+    pub fn device_locks(&self, address: u64, size: u64) -> u32 {
+        self.device_locks
+            .get(&(address, size))
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Releases a device-share lock on `size` bytes at `address` that
@@ -1158,9 +1252,12 @@ impl AddressSpace {
     /// [`KernelError::InvalidCurrentMemory`] unless the range is whole pages inside the address
     /// space; then unless each of its blocks can be device mapped ([`flag::CAN_DEVICE_MAP`]),
     /// is [`MemoryAttribute::DEVICE_SHARED`] and is not [`MemoryAttribute::LOCKED`]
-    /// (`CheckMemoryStateContiguous`: the blocks need not be alike); then unless the range ends
-    /// where a lock ends (see "Divergences").
-    pub fn unlock_device_share(&mut self, address: u64, size: u64) -> CallResult<()> {
+    /// (`CheckMemoryStateContiguous`: the blocks need not be alike); then unless a live lock
+    /// was taken on exactly this range ([`Self::device_locks`]; see "Divergences"). Nothing
+    /// changes on a refusal.
+    ///
+    /// Crate-private, like the lock: outside the kernel, a lock is released with its token.
+    pub(crate) fn unlock_device_share(&mut self, address: u64, size: u64) -> CallResult<()> {
         let pages = self.pages_of(address, size)?;
         // Check the memory state.
         let check = Check {
@@ -1173,13 +1270,26 @@ impl AddressSpace {
             ignore: MemoryAttribute::NONE,
         };
         self.check_memory_state_contiguous(address, size, &check)?;
-        // Update the memory blocks.
+        // Only a range a live lock was taken on exactly (module docs, "Divergences").
+        let Some(left) = self.device_locks(address, size).checked_sub(1) else {
+            return Err(KernelError::InvalidCurrentMemory.into());
+        };
+        // Update the memory blocks. A range a lock was taken on ends where that lock ends, so
+        // the block map's own refusal is left only to unsound bookkeeping.
         self.blocks
             .update_lock(address, pages, DeviceLock::Unshare)
             .map_err(|error| match error {
-                BlockMapError::DeviceCount { .. } => KernelError::InvalidCurrentMemory.into(),
+                BlockMapError::DeviceCount { .. } => {
+                    SvcError::from(KernelError::InvalidCurrentMemory)
+                }
                 error => broken(error),
-            })
+            })?;
+        if left == 0 {
+            self.device_locks.remove(&(address, size));
+        } else {
+            self.device_locks.insert((address, size), left);
+        }
+        Ok(())
     }
 
     /// The block that holds `address` (`QueryInfo`). Above the address space it is one
