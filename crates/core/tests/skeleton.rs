@@ -16,9 +16,14 @@
 
 use std::time::Duration;
 
-use starquake_core::crash::{BacktraceEnd, Exception, Location};
+use starquake_core::crash::{
+    BacktraceEnd, Exception, FRAME_POINTER_REGISTER, FRAME_RECORD_RETURN, FRAME_RECORD_SIZE,
+    LINK_REGISTER, Location,
+};
 use starquake_core::system::{THREAD_LOCAL_RAM, WORKING_RAM};
-use starquake_core::{Error, ExitReason, LoadError, Mapping, RunReport, ThreadPc, exit_code};
+use starquake_core::{
+    Error, ExitReason, LoadError, Mapping, RunReport, ThreadPc, ThreadPcState, exit_code,
+};
 use starquake_kernel::memory::MemoryArrangement;
 use starquake_kernel::memory::layout::{LayoutRequest, RegionOffsets, Regions};
 use starquake_kernel::process::{Console, ProcessDescription};
@@ -763,7 +768,7 @@ fn an_endless_loop_is_ended_by_the_timeout() {
         report.threads,
         [ThreadPc {
             thread: starquake_kernel::sched::FIRST_THREAD_ID,
-            state: "runnable",
+            state: ThreadPcState::Runnable,
             core: Some(0),
             pc: spin,
             pc_location: Some(Location {
@@ -785,12 +790,16 @@ fn a_crash_in_a_call_chain_reports_its_frame_records() {
     //
     // The main thread starts with `x29` and `x30` zero, so the outermost record ends the chain.
     const SP: u8 = 31;
+    let fp = u8::try_from(FRAME_POINTER_REGISTER).unwrap();
+    let lr = u8::try_from(LINK_REGISTER).unwrap();
+    let record = u32::try_from(FRAME_RECORD_SIZE).unwrap();
+    let ret = u32::try_from(FRAME_RECORD_RETURN).unwrap();
     let prologue = || {
         [
-            a64::sub_imm(SP, SP, 16).unwrap(),
-            a64::str(29, SP, 0).unwrap(),
-            a64::str(30, SP, 8).unwrap(),
-            a64::add_imm(29, SP, 0).unwrap(),
+            a64::sub_imm(SP, SP, record).unwrap(),
+            a64::str(fp, SP, 0).unwrap(),
+            a64::str(lr, SP, ret).unwrap(),
+            a64::add_imm(fp, SP, 0).unwrap(),
         ]
     };
     let insn = i64::from(a64::INSN_SIZE);
@@ -819,7 +828,9 @@ fn a_crash_in_a_call_chain_reports_its_frame_records() {
         .iter()
         .find(|mapping| mapping.name == "stack")
         .expect("a stack mapping");
-    let (outer, inner) = (stack.end - 16, stack.end - 32);
+    // Each prologue pushes one record below the last: the entry's at the top of the stack.
+    let record = u64::from(record);
+    let (outer, inner) = (stack.end - record, stack.end - 2 * record);
     let backtrace = crash.backtrace.as_ref().expect("a backtrace");
     assert_eq!(
         backtrace.stack,

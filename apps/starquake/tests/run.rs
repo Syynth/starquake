@@ -16,7 +16,7 @@ use starquake_core::artifacts::{
     CRASH_JSON_FILE, CRASH_TEXT_FILE, EVENTS_FILE, GUEST_LOG_FILE, SUMMARY_FILE, TRACE_FILE,
 };
 use starquake_core::crash::Location;
-use starquake_core::report::ThreadPc;
+use starquake_core::report::{ThreadPc, ThreadPcState};
 use starquake_core::{ExitReason, RunReport, exit_code};
 use starquake_testkit::programs;
 
@@ -434,7 +434,7 @@ fn a_timed_out_run_prints_where_each_thread_was_before_how_it_ended() {
         threads: vec![
             ThreadPc {
                 thread: 0x51,
-                state: "runnable",
+                state: ThreadPcState::Runnable,
                 core: Some(2),
                 pc: 0x8000_40b8,
                 pc_location: Some(Location {
@@ -444,7 +444,7 @@ fn a_timed_out_run_prints_where_each_thread_was_before_how_it_ended() {
             },
             ThreadPc {
                 thread: 0x52,
-                state: "waiting",
+                state: ThreadPcState::Waiting,
                 core: None,
                 pc: 0x7000_1234,
                 pc_location: None,

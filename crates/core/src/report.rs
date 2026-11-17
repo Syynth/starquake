@@ -112,9 +112,8 @@ impl Mapping {
 pub struct ThreadPc {
     /// The thread's id, as the guest and the event stream know it.
     pub thread: u64,
-    /// What the kernel's scheduler had it doing: `initialized` (created, not started),
-    /// `waiting`, `runnable` or `terminated`.
-    pub state: &'static str,
+    /// What the kernel's scheduler had it doing.
+    pub state: ThreadPcState,
     /// The core whose vCPU held the thread's registers when the run stopped; `null` when they
     /// were in the thread's saved context instead (no core ran it, or its last system call
     /// began a wait, which saved them), or the vCPU's registers could not be read.
@@ -127,6 +126,46 @@ pub struct ThreadPc {
     pub pc_location: Option<Location>,
 }
 
+/// What the kernel's scheduler had a thread doing when the run stopped ([`ThreadPc::state`]),
+/// written in `summary.json` as its [`ThreadPcState::name`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadPcState {
+    /// Created, not started.
+    Initialized,
+    /// Waiting for something (a synchronisation object, a sleep, a reply).
+    Waiting,
+    /// Ready to run, or running.
+    Runnable,
+    /// Ended.
+    Terminated,
+}
+
+impl ThreadPcState {
+    /// The state in words, as `summary.json` and the timeout's text write it: `initialized`,
+    /// `waiting`, `runnable` or `terminated`.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Initialized => "initialized",
+            Self::Waiting => "waiting",
+            Self::Runnable => "runnable",
+            Self::Terminated => "terminated",
+        }
+    }
+}
+
+impl From<ThreadState> for ThreadPcState {
+    fn from(state: ThreadState) -> Self {
+        match state {
+            ThreadState::Initialized => Self::Initialized,
+            ThreadState::Waiting => Self::Waiting,
+            ThreadState::Runnable => Self::Runnable,
+            ThreadState::Terminated => Self::Terminated,
+        }
+    }
+}
+
 impl ThreadPc {
     /// Thread `thread` in `state`, held by `core`, at `pc`, which is placed in `modules`.
     #[must_use]
@@ -137,15 +176,9 @@ impl ThreadPc {
         pc: u64,
         modules: &[Module],
     ) -> Self {
-        let state = match state {
-            ThreadState::Initialized => "initialized",
-            ThreadState::Waiting => "waiting",
-            ThreadState::Runnable => "runnable",
-            ThreadState::Terminated => "terminated",
-        };
         Self {
             thread,
-            state,
+            state: ThreadPcState::from(state),
             core,
             pc,
             pc_location: Location::of(pc, modules),
@@ -161,7 +194,7 @@ impl ThreadPc {
         format!(
             "thread {}, {}{core}, pc {}",
             self.thread,
-            self.state,
+            self.state.name(),
             address_text(self.pc, self.pc_location.as_ref())
         )
     }
@@ -487,14 +520,25 @@ mod tests {
     #[test]
     fn a_thread_says_its_state_its_core_and_where_it_is_in_words() {
         let cases = [
-            (ThreadState::Initialized, "initialized"),
-            (ThreadState::Waiting, "waiting"),
-            (ThreadState::Runnable, "runnable"),
-            (ThreadState::Terminated, "terminated"),
+            (
+                ThreadState::Initialized,
+                ThreadPcState::Initialized,
+                "initialized",
+            ),
+            (ThreadState::Waiting, ThreadPcState::Waiting, "waiting"),
+            (ThreadState::Runnable, ThreadPcState::Runnable, "runnable"),
+            (
+                ThreadState::Terminated,
+                ThreadPcState::Terminated,
+                "terminated",
+            ),
         ];
-        for (state, name) in cases {
+        for (state, reported, name) in cases {
             let thread = ThreadPc::new(7, state, None, 0x8000_0000, &modules());
-            assert_eq!(thread.state, name);
+            assert_eq!(thread.state, reported);
+            assert_eq!(reported.name(), name);
+            // The JSON writes the name the text does.
+            assert_eq!(serde_json::to_value(reported).unwrap(), name);
             assert_eq!(
                 thread.text(),
                 format!("thread 7, {name}, pc 0x80000000 (rtld+0x0)")
