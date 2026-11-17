@@ -730,6 +730,143 @@ fn a_free_area_search_that_overflows_finds_nothing() {
     );
 }
 
+// ----- UpdateIfMatch --------------------------------------------------------------------------
+
+const FREE: Properties = Properties {
+    state: MemoryState::Free,
+    permission: MemoryPermission::NONE,
+    attribute: MemoryAttribute::NONE,
+};
+
+const HEAP: Properties = Properties {
+    state: MemoryState::Normal,
+    permission: MemoryPermission::USER_READ_WRITE,
+    attribute: MemoryAttribute::NONE,
+};
+
+#[test]
+fn update_if_match_changes_only_the_blocks_that_match_and_sets_no_barrier() {
+    let mut map = map();
+    // Pages 4-5 are heap with a barrier at their head; pages 2-7 are then updated from free to
+    // heap, as `MapPhysicalMemory` does.
+    map_heap(&mut map, 4, 2);
+    map.update_if_match(page(2), 6, FREE, HEAP, DisableMerge::NONE)
+        .unwrap();
+    // Pages 2-3 are changed and get no barrier although they are the range's head (Eden updates
+    // every block as no head). Pages 4-5 did not match and keep theirs, which keeps 2-3 apart
+    // from them; 6-7 merge into 4-5, which has no barrier on its upper side.
+    assert_eq!(
+        rows(&map),
+        [
+            free(0, 2),
+            heap(2, 2, DisableMerge::NONE),
+            heap(4, 4, DisableMerge::NORMAL),
+            free(8, PAGES - 8)
+        ]
+    );
+    assert!(map.check_state());
+}
+
+#[test]
+fn update_if_match_leaves_a_range_with_no_match_alone() {
+    let mut map = map();
+    map_heap(&mut map, 4, 2);
+    let before = map.clone();
+    // Nothing in pages 4-5 is free.
+    map.update_if_match(page(4), 2, FREE, HEAP, DisableMerge::NORMAL)
+        .unwrap();
+    assert_eq!(map, before);
+    // Nothing in pages 0-3 is heap, so a heap-to-free update changes nothing there, and the
+    // heap that starts exactly at the range's end keeps its barrier.
+    map.update_if_match(page(0), 4, HEAP, FREE, DisableMerge::NORMAL)
+        .unwrap();
+    assert_eq!(map, before);
+}
+
+#[test]
+fn update_if_match_clears_the_barrier_of_the_blocks_it_changes() {
+    let mut map = map();
+    map_heap(&mut map, 4, 2);
+    // Heap to free with the barrier cleared: the three blocks are one again.
+    map.update_if_match(page(4), 2, HEAP, FREE, DisableMerge::NORMAL)
+        .unwrap();
+    assert_eq!(rows(&map), [free(0, PAGES)]);
+    // Without the clear, the freed block keeps its barrier and stays apart.
+    let mut map = self::map();
+    map_heap(&mut map, 4, 2);
+    map.update_if_match(page(4), 2, HEAP, FREE, DisableMerge::NONE)
+        .unwrap();
+    assert_eq!(
+        rows(&map),
+        [
+            free(0, 4),
+            (
+                page(4),
+                PAGES - 4,
+                MemoryState::Free,
+                MemoryPermission::NONE,
+                MemoryAttribute::NONE,
+                DisableMerge::NORMAL
+            )
+        ]
+    );
+}
+
+#[test]
+fn update_if_match_is_refused_for_a_bad_range_a_counted_attribute_or_an_ipc_lock() {
+    let mut map = map();
+    let before = map.clone();
+    for (address, pages) in [
+        (BASE - PAGE_SIZE, 1),
+        (BASE + 1, 1),
+        (BASE, 0),
+        (BASE, PAGES + 1),
+    ] {
+        assert_eq!(
+            map.update_if_match(address, pages, FREE, HEAP, DisableMerge::NONE),
+            Err(BlockMapError::BadRange { address, pages })
+        );
+    }
+    // The whole map is one range, exactly to its end.
+    let mut whole = map.clone();
+    assert_eq!(
+        whole.update_if_match(BASE, PAGES, FREE, HEAP, DisableMerge::NONE),
+        Ok(())
+    );
+    for attribute in [MemoryAttribute::IPC_LOCKED, MemoryAttribute::DEVICE_SHARED] {
+        let new = Properties { attribute, ..HEAP };
+        assert_eq!(
+            map.update_if_match(BASE, 1, FREE, new, DisableMerge::NONE),
+            Err(BlockMapError::CountedAttribute)
+        );
+    }
+    assert_eq!(map, before);
+
+    // A block locked for IPC that would change refuses the update; one that would not change
+    // (it does not match) lets it through.
+    map_heap(&mut map, 0, 4);
+    let mut locked = *map.find(page(2)).unwrap();
+    let lower = locked.split(page(2)).unwrap();
+    locked.update_attribute(MemoryAttribute::IPC_LOCKED, MemoryAttribute::IPC_LOCKED);
+    map.blocks.insert(lower.address(), lower);
+    map.blocks.insert(locked.address(), locked);
+    let before = map.clone();
+    let read_only = Properties {
+        permission: MemoryPermission::USER_READ,
+        ..HEAP
+    };
+    assert_eq!(
+        map.update_if_match(page(0), 3, HEAP, read_only, DisableMerge::NONE),
+        Err(BlockMapError::Locked { address: page(2) })
+    );
+    assert_eq!(map, before);
+    assert_eq!(
+        map.update_if_match(page(0), 6, FREE, HEAP, DisableMerge::NONE),
+        Ok(())
+    );
+    assert_eq!(map.find(page(2)).copied(), Some(locked));
+}
+
 // ----- The model -----------------------------------------------------------------------------
 
 /// What the naive model knows about one page: its properties, and whether a block that must
@@ -796,6 +933,27 @@ impl Model {
         }
     }
 
+    /// `KMemoryBlockManager::UpdateIfMatch`, page by page: a page with the properties `test`
+    /// and not already `new` gets `new`, never a barrier, and loses its barrier if `clear`.
+    fn update_if_match(
+        &mut self,
+        first: usize,
+        count: usize,
+        test: (MemoryState, MemoryPermission, MemoryAttribute),
+        new: (MemoryState, MemoryPermission, MemoryAttribute),
+        clear: bool,
+    ) {
+        for page in &mut self.0[first..first + count] {
+            if page.properties() != test || page.properties() == new {
+                continue;
+            }
+            (page.state, page.permission, page.attribute) = new;
+            if clear {
+                page.barrier = false;
+            }
+        }
+    }
+
     /// `KMemoryBlockManager::UpdateAttribute`, page by page.
     fn update_attribute(
         &mut self,
@@ -855,6 +1013,27 @@ enum Op {
         mask: usize,
         attribute: usize,
     },
+    /// `UpdateIfMatch`: from the state, permission and attribute `test` indexes pick, to the
+    /// ones `new` picks.
+    IfMatch {
+        first: u64,
+        count: u64,
+        test: (usize, usize, usize),
+        new: (usize, usize, usize),
+        clear: bool,
+    },
+}
+
+/// The properties three indexes pick from [`STATES`], [`PERMISSIONS`] and [`ATTRIBUTES`].
+fn picked(
+    (state, permission, attribute): (usize, usize, usize),
+) -> (MemoryState, MemoryPermission, MemoryAttribute) {
+    (STATES[state], PERMISSIONS[permission], ATTRIBUTES[attribute])
+}
+
+/// Indexes into [`STATES`], [`PERMISSIONS`] and [`ATTRIBUTES`].
+fn properties() -> impl Strategy<Value = (usize, usize, usize)> {
+    (0..STATES.len(), 0..PERMISSIONS.len(), 0..ATTRIBUTES.len())
 }
 
 const STATES: [MemoryState; 4] = [
@@ -910,6 +1089,15 @@ fn op() -> impl Strategy<Value = Op> {
                 attribute,
             }
         ),
+        (range(), properties(), properties(), any::<bool>()).prop_map(
+            |((first, count), test, new, clear)| Op::IfMatch {
+                first,
+                count,
+                test,
+                new,
+                clear,
+            }
+        ),
     ]
 }
 
@@ -957,6 +1145,30 @@ proptest! {
                         usize::try_from(count).unwrap(),
                         mask,
                         attribute,
+                    );
+                }
+                Op::IfMatch { first, count, test, new, clear } => {
+                    let (test, new) = (picked(test), picked(new));
+                    let as_properties = |(state, permission, attribute)| Properties {
+                        state,
+                        permission,
+                        attribute,
+                    };
+                    let barrier = if clear { DisableMerge::NORMAL } else { DisableMerge::NONE };
+                    map.update_if_match(
+                        page(first),
+                        count,
+                        as_properties(test),
+                        as_properties(new),
+                        barrier,
+                    )
+                    .unwrap();
+                    model.update_if_match(
+                        usize::try_from(first).unwrap(),
+                        usize::try_from(count).unwrap(),
+                        test,
+                        new,
+                        clear,
                     );
                 }
             }
