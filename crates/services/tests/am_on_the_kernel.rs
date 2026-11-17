@@ -1,6 +1,11 @@
 //! `appletOE` on the real kernel: libnx's `SetFocusHandlingMode(0, 0, 1)` clears the message
 //! event the guest holds a handle to, and `ISelfController::Exit` answers the guest and then
 //! ends its process, releasing everything the process held.
+//!
+//! The caller is a thread the scheduler runs (`run_a_user_thread`), so the kernel writes a reply
+//! only while that thread has not ended: a kernel that ended the process before writing the
+//! reply would leave the request in the message buffer, and
+//! `exit_replies_and_then_the_kernel_ends_the_process` would fail.
 
 /// Everything in a `cfg(test)` module, so that the helpers may unwrap as the tests do.
 #[cfg(test)]
@@ -9,7 +14,7 @@ mod on_the_kernel {
 
     use starquake_cpu::GuestRegs;
     use starquake_ipc::{BUFFER_SIZE, Body, CommandType, Message, RequestBuilder, SessionKind};
-    use starquake_kernel::dispatch::{Caller, Dispatcher, Outcome};
+    use starquake_kernel::dispatch::{Caller, Dispatcher, Outcome, Tables};
     use starquake_kernel::handle::{Handle, HandleTable};
     use starquake_kernel::id::ProcessId;
     use starquake_kernel::ipc::PortName;
@@ -17,8 +22,11 @@ mod on_the_kernel {
     use starquake_kernel::memory::{
         AddressSpace, MemoryArrangement, ProcessMemory, RegionOffsets, SvcPermission,
     };
-    use starquake_kernel::process::{self, Console, ProcessDescription, ProcessState};
+    use starquake_kernel::process::{
+        self, Console, ProcessDescription, ProcessState, VIRTUAL_TO_PHYSICAL_CORE,
+    };
     use starquake_kernel::result::{KernelError, ResultCode};
+    use starquake_kernel::sched::{CoreId, CoreSignals, Priority, UserThread};
     use starquake_kernel::svc::{DebugSink, SvcId};
     use starquake_kernel::tables::Scheduler;
     use starquake_memory::{FlatMemory, GuestMemory, PAGE_SIZE};
@@ -40,8 +48,9 @@ mod on_the_kernel {
     const NAME: u64 = BASE + PAGE_SIZE;
     /// The number the test registers `appletOE`'s server under.
     const OE: ServiceId = ServiceId(0x64);
-    /// The calling guest thread.
+    /// The calling guest thread, and the core it runs on.
     const THREAD: ThreadId = ThreadId(1);
+    const CORE: u8 = 0;
 
     struct NoDebug;
 
@@ -82,8 +91,9 @@ mod on_the_kernel {
                 .set_process_memory_permission(BASE, PAGES * PAGE_SIZE, SvcPermission::ReadWrite)
                 .unwrap();
             let description = ProcessDescription::homebrew(Console::Switch2);
-            let tables = process::create(&description, space).unwrap();
+            let mut tables = process::create(&description, space).unwrap();
             let process = tables.processes.own();
+            run_a_user_thread(&mut tables, process, &description);
             let dispatcher = Dispatcher::new(tables);
             let server = oe_server(AppletSettings::eden_default(), UnknownPolicy::Strict);
             dispatcher
@@ -117,7 +127,7 @@ mod on_the_kernel {
             regs.x[..4].copy_from_slice(&x);
             let mut debug = NoDebug;
             let mut caller = Caller {
-                core: 0,
+                core: CORE,
                 thread: THREAD,
                 env: &self.env,
                 memory: &self.memory,
@@ -223,6 +233,47 @@ mod on_the_kernel {
         }
     }
 
+    /// Signals nobody listens to: the rig switches its one core by hand.
+    struct Quiet;
+
+    impl CoreSignals for Quiet {
+        fn interrupt(&mut self, _: CoreId) {}
+
+        fn wake(&mut self, _: CoreId) {}
+    }
+
+    /// Makes [`CORE`] run a main thread of `process` as `description` describes it, as the core
+    /// loop runs it, so
+    /// the caller is a thread the scheduler knows: one whose reply the kernel writes only while
+    /// it has not ended. Without it the kernel only reports the caller, and writes its reply
+    /// whether or not the process has ended, so the order of reply and end would not show.
+    /// The thread's object keeps its creator's reference, which the test never lets go.
+    fn run_a_user_thread(
+        tables: &mut Tables,
+        process: ProcessId,
+        description: &ProcessDescription,
+    ) {
+        // The main thread's virtual core is the physical core the rig calls from.
+        let virtual_core = description.main_thread_core;
+        let physical = VIRTUAL_TO_PHYSICAL_CORE[usize::from(virtual_core)];
+        assert_eq!(physical, CORE);
+        let core = CoreId::new(CORE).unwrap();
+        let spec = UserThread {
+            entry: BASE,
+            argument: 0,
+            stack_top: BASE + PAGES * PAGE_SIZE,
+            priority: Priority::new(description.main_thread_priority).unwrap(),
+            virtual_core,
+        };
+        let scheduler = &mut tables.scheduler;
+        let (id, _) = scheduler
+            .create_user_thread(&mut tables.address_space, process, &spec)
+            .unwrap();
+        scheduler.start(id).unwrap();
+        scheduler.update(GuestTicks(0), None, &mut Quiet).unwrap();
+        assert_eq!(scheduler.schedule(core, &mut Quiet), Ok(Some(id)));
+    }
+
     fn invalid_state() -> u64 {
         u64::from(KernelError::InvalidState.code().raw())
     }
@@ -253,10 +304,11 @@ mod on_the_kernel {
         rig.message_event();
         let controller = rig.open(GET_SELF_CONTROLLER);
         // Six sessions (the port's twice, the two proxies, the getter and the controller), each
-        // held by one handle, and the copied event; besides them the table holds the process
-        // and the event the service keeps the creator's reference to.
+        // held by one handle, and the copied event; besides them the table holds the process,
+        // the event the service keeps the creator's reference to, and the calling thread,
+        // held by its creator's reference (`run_a_user_thread`).
         let sessions = 6;
-        assert_eq!(rig.holdings(), (sessions + 1, sessions + 2, false));
+        assert_eq!(rig.holdings(), (sessions + 1, sessions + 3, false));
         let before = rig.events.events().len();
 
         let (outcome, x0, answer) = rig.exchange(
@@ -285,8 +337,8 @@ mod on_the_kernel {
             ),
             "{recorded:?}"
         );
-        // Then the process ended: no handle is left, and of the objects only the process and
-        // the service's event remain.
-        assert_eq!(rig.holdings(), (0, 2, true));
+        // Then the process ended: no handle is left, and of the objects only the process, the
+        // service's event and the ended thread's creator's reference remain.
+        assert_eq!(rig.holdings(), (0, 3, true));
     }
 }

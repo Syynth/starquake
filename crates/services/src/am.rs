@@ -142,7 +142,11 @@
 //!   the services spec says (approved 2026-11-16). libnx reads that reply: on success it sleeps
 //!   until it is ended (`libnx/nx/source/services/applet.c`, `_appletExitProcess`). The order is
 //!   pinned on the real kernel by `exit_replies_and_then_the_kernel_ends_the_process`
-//!   (`tests/am_on_the_kernel.rs`); over the fake, `exit_answers_success_and_asks_once_to_end_the_process`.
+//!   (`tests/am_on_the_kernel.rs`), whose caller is a thread the scheduler runs, so a reply
+//!   written after the end would not reach it; and in the kernel by
+//!   `a_handler_that_ends_the_process_replies_first_and_then_releases_everything`. The fake has
+//!   no process to end, so `exit_answers_success_and_asks_once_to_end_the_process` pins only
+//!   that `Exit` answers success and asks the kernel once, not the order.
 //!   Eden ends the applet's process, which is the caller's here (the next item).
 //! - **Any process is the application.** Eden finds the applet by the caller's process id and
 //!   answers `ResultUnknown` when no applet was launched for it
