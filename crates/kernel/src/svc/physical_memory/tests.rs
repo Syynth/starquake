@@ -162,6 +162,14 @@ fn with_two_faults_the_one_checked_first_is_reported() {
         ),
         // No system resource and a range outside the alias region: the resource first.
         (heap, PAGE_SIZE, 0, KernelError::InvalidState),
+        // No system resource and a range outside the address space (`Contains`): the resource
+        // first.
+        (
+            space.regions().address_space.end,
+            PAGE_SIZE,
+            0,
+            KernelError::InvalidState,
+        ),
     ];
     for (name, call) in CALLS {
         for (address, size, resource, first) in cases {

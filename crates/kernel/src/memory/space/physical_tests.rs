@@ -598,3 +598,51 @@ fn an_unmap_refused_partway_frees_what_it_unmapped() {
     assert_eq!(space.limit().reserved(), reserved - 2 * PAGE_SIZE);
     assert!(space.blocks.check_state());
 }
+
+#[test]
+fn an_unmap_refused_partway_from_the_alias_regions_start_clears_the_head_barrier() {
+    // Pages 0-1 and 3-4 mapped, and pages 0-1 remade in the blocks alone with the barrier at
+    // their head, as in `unmapping_from_the_alias_regions_start_clears_a_head_barrier`.
+    let (mut space, log, page) = alias_space();
+    for first in [0, 3] {
+        space
+            .map_physical_memory(page(first), 2 * PAGE_SIZE)
+            .unwrap();
+    }
+    for (properties, set) in [(FREE, DisableMerge::NONE), (PHYSICAL, DisableMerge::NORMAL)] {
+        space
+            .blocks
+            .update(
+                page(0),
+                2,
+                properties.state,
+                properties.permission,
+                properties.attribute,
+                set,
+                DisableMerge::NONE,
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        space.query_info(page(0)).unwrap().disable_merge(),
+        DisableMerge::NORMAL
+    );
+    drop(log.take());
+    // The second unmap is refused: pages 0-1, which the translation did unmap, are freed with
+    // the head barrier cleared, as a whole unmap would have cleared it.
+    log.refuse_calls(&[1]);
+    assert_eq!(
+        space.unmap_physical_memory(page(0), 8 * PAGE_SIZE),
+        Err(SvcError::Internal(format!(
+            "the translation refused to unmap 0x2000 bytes at {:#x}: the test told the mapper \
+             to refuse",
+            page(3)
+        )))
+    );
+    assert_eq!(log.take(), [unmap_call(page(0), 2)]);
+    assert_eq!(
+        rows(&space, page(0), page(8)),
+        [free(page(0), 3), physical(page(3), 2), free(page(5), 3)]
+    );
+    assert!(space.blocks.check_state());
+}

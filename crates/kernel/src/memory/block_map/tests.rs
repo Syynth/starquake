@@ -784,6 +784,23 @@ fn update_if_match_leaves_a_range_with_no_match_alone() {
 }
 
 #[test]
+fn update_if_match_leaves_a_block_that_already_has_the_new_properties_alone() {
+    let mut map = map();
+    map_heap(&mut map, 4, 2);
+    let before = map.clone();
+    // Pages 4-5 match `test`, but they already have `new` too (Eden's
+    // `!it->HasProperties(state, perm, attr)`), so they are not changed, and the barrier to
+    // clear stays.
+    map.update_if_match(page(4), 2, HEAP, HEAP, DisableMerge::NORMAL)
+        .unwrap();
+    assert_eq!(map, before);
+    assert_eq!(
+        map.find(page(4)).unwrap().disable_merge(),
+        DisableMerge::NORMAL
+    );
+}
+
+#[test]
 fn update_if_match_clears_the_barrier_of_the_blocks_it_changes() {
     let mut map = map();
     map_heap(&mut map, 4, 2);
