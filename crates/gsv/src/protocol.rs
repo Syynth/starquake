@@ -14,7 +14,11 @@
 //! # Marks
 //!
 //! Each fact carries one of the spec's four [`Mark`]s. The marks of the table rows are the
-//! spec's ("The root", the table of commands by group), row for row.
+//! spec's ("The root", the table of commands by group), row for row. Where the spec marks a
+//! group, each command in it carries the group's mark, including commands no row of NX2's log
+//! names (903, 912). The spec lists 115 in two groups (the memory modes, read, and native
+//! memory, observed); NX2's row 47 does not name it and NX2 has no 115, so it carries the
+//! memory modes' mark, read.
 //!
 //! # Where the references disagree
 //!
