@@ -208,8 +208,7 @@ fn send(
 }
 
 /// The scripted conversation: `sm:`'s `Initialize` and `GetService("fsp-srv")`, then
-/// `OpenDataStorageByCurrentProcess` and an `IStorage::Read`, then `OpenSdCardFileSystem`,
-/// `OpenFile` and an `IFile::Read`, then `ExitProcess`.
+/// `OpenDataStorageByCurrentProcess` and an `IStorage::Read`, then [`reading_the_card`].
 fn reading_guest(guest: &Script) -> ScriptedVcpu {
     let name = guest.base + NAME_AT;
     guest.tls.write(name, b"sm:\0").unwrap();
@@ -219,7 +218,7 @@ fn reading_guest(guest: &Script) -> ScriptedVcpu {
     let sm_handle = Rc::new(RefCell::new(0u64));
     let keep = Rc::clone(&sm_handle);
     let take = Rc::clone(&sm_handle);
-    ScriptedVcpu::new()
+    let vcpu = ScriptedVcpu::new()
         .then(move |regs| regs.x[1] = name, svc(SvcId::ConnectToNamedPort))
         .then(
             {
@@ -281,78 +280,84 @@ fn reading_guest(guest: &Script) -> ScriptedVcpu {
                 },
             ),
             svc(SvcId::SendSyncRequest),
-        )
-        .then(
-            send(
-                guest,
-                |guest| {
-                    guest.read_reply(0);
-                    guest.read_buffer(IMAGE_LEN);
-                    // The `fsp-srv` session: the first handle `GetService` moved.
-                    u64::from(guest.seen.borrow().handles[0])
-                },
-                |guest| guest.write(&libnx(command::fsp_srv::OPEN_SD_CARD_FILE_SYSTEM)),
-            ),
-            svc(SvcId::SendSyncRequest),
-        )
-        .then(
-            send(
-                guest,
-                |guest| {
-                    guest.read_reply(0);
-                    guest.last_handle()
-                },
-                |guest| {
-                    let descriptor = StaticDescriptor {
-                        counter: 0,
-                        address: guest.base + PATH_AT,
-                        size: u16::try_from(fsp::PATH_BUFFER_SIZE).unwrap(),
-                    };
-                    let open = libnx(command::file_system::OPEN_FILE)
-                        .data(&fsp::open_mode::READ.to_le_bytes())
-                        .static_descriptor(descriptor);
-                    guest.write(&open);
-                },
-            ),
-            svc(SvcId::SendSyncRequest),
-        )
-        .then(
-            send(
-                guest,
-                |guest| {
-                    guest.read_reply(0);
-                    guest.last_handle()
-                },
-                |guest| {
-                    let offset = i64::try_from(CARD_OFFSET).unwrap();
-                    let size = i64::try_from(CARD_LEN).unwrap();
-                    let payload = [
-                        &0_u32.to_le_bytes()[..],
-                        &[0; 4],
-                        &offset.to_le_bytes(),
-                        &size.to_le_bytes(),
-                    ]
-                    .concat();
-                    let read = libnx(command::file::READ)
-                        .data(&payload)
-                        .receive_buffer(room(guest, DATA_LEN));
-                    guest.write(&read);
-                },
-            ),
-            svc(SvcId::SendSyncRequest),
-        )
-        .then(
-            {
-                let guest = guest.clone();
-                move |regs| {
-                    assert_eq!(regs.x[0], 0, "the file read failed");
-                    let count = guest.read_reply(size_of::<i64>());
-                    guest.seen.borrow_mut().reads.push(count);
-                    guest.read_buffer(CARD_LEN);
-                }
+        );
+    reading_the_card(guest, vcpu)
+}
+
+/// The conversation's second half, after the storage read: `OpenSdCardFileSystem`, `OpenFile`
+/// and an `IFile::Read`, then `ExitProcess`.
+fn reading_the_card(guest: &Script, vcpu: ScriptedVcpu) -> ScriptedVcpu {
+    vcpu.then(
+        send(
+            guest,
+            |guest| {
+                guest.read_reply(0);
+                guest.read_buffer(IMAGE_LEN);
+                // The `fsp-srv` session: the first handle `GetService` moved.
+                u64::from(guest.seen.borrow().handles[0])
             },
-            svc(SvcId::ExitProcess),
-        )
+            |guest| guest.write(&libnx(command::fsp_srv::OPEN_SD_CARD_FILE_SYSTEM)),
+        ),
+        svc(SvcId::SendSyncRequest),
+    )
+    .then(
+        send(
+            guest,
+            |guest| {
+                guest.read_reply(0);
+                guest.last_handle()
+            },
+            |guest| {
+                let descriptor = StaticDescriptor {
+                    counter: 0,
+                    address: guest.base + PATH_AT,
+                    size: u16::try_from(fsp::PATH_BUFFER_SIZE).unwrap(),
+                };
+                let open = libnx(command::file_system::OPEN_FILE)
+                    .data(&fsp::open_mode::READ.to_le_bytes())
+                    .static_descriptor(descriptor);
+                guest.write(&open);
+            },
+        ),
+        svc(SvcId::SendSyncRequest),
+    )
+    .then(
+        send(
+            guest,
+            |guest| {
+                guest.read_reply(0);
+                guest.last_handle()
+            },
+            |guest| {
+                let offset = i64::try_from(CARD_OFFSET).unwrap();
+                let size = i64::try_from(CARD_LEN).unwrap();
+                let payload = [
+                    &0_u32.to_le_bytes()[..],
+                    &[0; 4],
+                    &offset.to_le_bytes(),
+                    &size.to_le_bytes(),
+                ]
+                .concat();
+                let read = libnx(command::file::READ)
+                    .data(&payload)
+                    .receive_buffer(room(guest, DATA_LEN));
+                guest.write(&read);
+            },
+        ),
+        svc(SvcId::SendSyncRequest),
+    )
+    .then(
+        {
+            let guest = guest.clone();
+            move |regs| {
+                assert_eq!(regs.x[0], 0, "the file read failed");
+                let count = guest.read_reply(size_of::<i64>());
+                guest.seen.borrow_mut().reads.push(count);
+                guest.read_buffer(CARD_LEN);
+            }
+        },
+        svc(SvcId::ExitProcess),
+    )
 }
 
 /// Runs the scripted conversation with `romfs` as the data storage and a card holding
@@ -439,5 +444,5 @@ fn a_run_that_ends_with_a_read_in_flight_waits_for_it_and_leaves_no_thread() {
     );
     assert!(started.elapsed() < RUN_LIMIT);
     // The guest never saw the read's reply.
-    assert!(seen.reads.is_empty());
+    assert_eq!(seen.reads, Vec::<Vec<u8>>::new());
 }

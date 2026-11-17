@@ -66,8 +66,10 @@
 //! # Replaying
 //!
 //! [`Replay`] is an executor made from a record. It runs no threads and never reaches the host:
-//! a job submitted to it runs, on the submitting thread, when every job recorded as finished
-//! before it has finished, with an environment that hands back its own recorded answers
+//! a job submitted to it runs when every job recorded as finished before it has finished, on the
+//! thread whose submission made that so (the job's own, or a later one's), with its state's lock
+//! held, so a server's notification must not submit to it; with an environment that hands back
+//! its own recorded answers
 //! (`ReplayEnv`, `starquake-trace`), and is finished at once. So the completions reach the
 //! server's mailbox in the recorded order, whatever order the replay submits them in, and the
 //! replies are delivered in the recorded order with the recorded bytes

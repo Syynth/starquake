@@ -147,11 +147,12 @@ struct Delivering {
 
 impl Notify for Delivering {
     fn completion_posted(&self) {
-        match self.server.get() {
-            Some(server) => self.ready.ready(*server),
+        if let Some(server) = self.server.get() {
+            self.ready.ready(*server);
+        } else {
             // `install` names the server before it returns, and no request reaches a server
             // before then.
-            None => tracing::error!("a reply is ready on a server the kernel has not numbered"),
+            tracing::error!("a reply is ready on a server the kernel has not numbered");
         }
     }
 }

@@ -137,8 +137,8 @@ impl Rig {
         let env = Arc::new(env);
         let services: Arc<dyn Env> = Arc::<LiveEnv>::clone(&env);
         let ready = Arc::new(ReadyServers::default());
-        let reads = reads_on(Arc::clone(&services), &ready);
-        install(&dispatcher, services, reads).unwrap();
+        let fsp_reads = reads_on(Arc::clone(&services), &ready);
+        install(&dispatcher, services, fsp_reads).unwrap();
         let recorder = Recorder::new();
         let events = Arc::new(VecSink::new());
         recorder.add_sink(Arc::clone(&events));

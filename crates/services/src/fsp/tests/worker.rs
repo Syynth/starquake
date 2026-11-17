@@ -233,7 +233,7 @@ fn with_recording_off_nothing_is_kept() {
     rig.defer(To::Session(file), READ, read(0, 4, 16));
     await_posts(&posted, 1);
     assert_eq!(delivered(&mut rig, 4), (s64(4), four_at(0)));
-    assert!(workers.take_record().is_empty());
+    assert_eq!(workers.take_record(), []);
 }
 
 /// What a test's finishes did, in order: each pushes its job's number.
@@ -409,8 +409,8 @@ fn a_failure_the_environment_gave_is_recorded_and_replayed() {
     let file = live.hello();
     live.defer(To::Session(file), READ, read(ENV_FAILING, 4, 16));
     await_posts(&posted, 1);
-    let reply = delivered(&mut live, 4);
-    assert_eq!(reply.0, only(result::HOST_IO_FAILED));
+    let answered = delivered(&mut live, 4);
+    assert_eq!(answered.0, only(result::HOST_IO_FAILED));
     let record = workers.take_record();
     let expected = Completed {
         job: JobIndex::new(0),
@@ -426,7 +426,7 @@ fn a_failure_the_environment_gave_is_recorded_and_replayed() {
     let file = again.hello();
     again.defer(To::Session(file), READ, read(ENV_FAILING, 4, 16));
     await_posts(&posted, 1);
-    assert_eq!(delivered(&mut again, 4), reply);
+    assert_eq!(delivered(&mut again, 4), answered);
     assert_eq!(replay.check(), Ok(()));
 }
 
