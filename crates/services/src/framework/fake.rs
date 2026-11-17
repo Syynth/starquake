@@ -7,14 +7,29 @@
 //! capacity and its errors are Horizon's. Trace events go through a real
 //! [`Recorder`](starquake_trace::Recorder), stamped with whatever caller the test set.
 //!
+//! # Handle translation
+//!
+//! The kernel translates a request's copied handles before a server sees them
+//! (`starquake_kernel::ipc::message`, `translate`): a copied [`Handle::CURRENT_THREAD`] or
+//! [`Handle::CURRENT_PROCESS`] names the sending thread or process (Eden's
+//! `KHandleTable::GetObjectForIpc`), and [`Kernel::resolve_handle`] answers it with that object.
+//! The fake does the same with the objects a test gives it ([`FakeKernel::set_current`], the
+//! kernel's own [`Current`]): a pseudo-handle names its object, and one whose object the test
+//! did not give is [`KernelError::InvalidHandle`], as in the kernel. So a test can send libnx's
+//! exact request, `CURRENT_PROCESS` included. The fake resolves a pseudo-handle wherever the
+//! request has it; the kernel refuses a moved one before the request reaches a server (Eden's
+//! move path takes no pseudo-handle), so a server never sees that case, and the fake does not
+//! model the refusal.
+//!
 //! [`FakeHost`] puts a [`FakeKernel`] and several servers together, so that a session one
 //! service hands out for another ([`Kernel::connect`]) can be sent requests.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use starquake_kernel::handle::{Handle, HandleError, HandleTable, RefCounts};
+use starquake_kernel::handle::{Handle, HandleError, HandleTable, RefCounts, Resolved};
 use starquake_kernel::id::{ObjectId, SlabId};
+use starquake_kernel::ipc::message::Current;
 use starquake_kernel::memory::testing::standalone_shared_pages;
 use starquake_kernel::memory::{
     SharedPages, SvcPermission, is_shared_memory_permission, shared_memory_size,
@@ -56,6 +71,10 @@ impl Region {
 /// A [`Kernel`] made of in-memory tables. See the [module docs](self).
 pub struct FakeKernel {
     process_id: u64,
+    /// The objects the two pseudo-handles name for the caller.
+    pseudo: Current,
+    /// What every call that makes a kernel object answers instead, if a test set it.
+    refusal: Option<KernelError>,
     handles: HandleTable,
     refs: RefCounts,
     minted: u32,
@@ -90,6 +109,8 @@ impl FakeKernel {
         recorder.add_sink(Arc::clone(&sink));
         Ok(Self {
             process_id: 0,
+            pseudo: Current::default(),
+            refusal: None,
             handles: HandleTable::new(handle_table_size)?,
             refs: RefCounts::new(),
             minted: 0,
@@ -156,6 +177,19 @@ impl FakeKernel {
         self.process_id = process_id;
     }
 
+    /// Sets the objects [`Handle::CURRENT_THREAD`] and [`Handle::CURRENT_PROCESS`] name for the
+    /// caller (module docs, "Handle translation"). Neither names anything until a test sets it.
+    pub fn set_current(&mut self, current: Current) {
+        self.pseudo = current;
+    }
+
+    /// Makes every call that creates a kernel object for a server ([`Kernel::create_event`],
+    /// [`Kernel::create_shared_memory`]) fail with `refusal`, as the kernel's do when its object
+    /// table is full ([`KernelError::OutOfResource`]); `None` lets them succeed again.
+    pub fn refuse_objects(&mut self, refusal: Option<KernelError>) {
+        self.refusal = refusal;
+    }
+
     /// Mints a kernel object that is nothing in particular: something for a test to hold a
     /// handle to. Ids count up from index zero, so a run always mints the same ones.
     pub fn new_object(&mut self) -> ObjectId {
@@ -217,8 +251,17 @@ impl Kernel for FakeKernel {
         self.process_id
     }
 
+    /// A pseudo-handle names the object [`FakeKernel::set_current`] gave it, or is
+    /// [`KernelError::InvalidHandle`] (module docs, "Handle translation"); any other handle is
+    /// looked up in the caller's table.
     fn resolve_handle(&self, handle: Handle) -> SvcResult<ObjectId> {
-        self.handles.get(handle).map_err(|e| kernel_error(&e))
+        let resolved = self.handles.resolve(handle).map_err(|e| kernel_error(&e))?;
+        let object = match resolved {
+            Resolved::CurrentThread => self.pseudo.thread,
+            Resolved::CurrentProcess => self.pseudo.process,
+            Resolved::Object(object) => Some(object),
+        };
+        object.ok_or(KernelError::InvalidHandle)
     }
 
     fn insert_handle(&mut self, object: ObjectId) -> SvcResult<Handle> {
@@ -227,6 +270,9 @@ impl Kernel for FakeKernel {
     }
 
     fn create_event(&mut self) -> SvcResult<ObjectId> {
+        if let Some(refusal) = self.refusal {
+            return Err(refusal);
+        }
         let event = self.new_object();
         self.events.insert(event, 0);
         Ok(event)
@@ -251,6 +297,9 @@ impl Kernel for FakeKernel {
         let size = shared_memory_size(size).ok_or(KernelError::InvalidSize)?;
         if !is_shared_memory_permission(permission) {
             return Err(KernelError::InvalidNewMemoryPermission);
+        }
+        if let Some(refusal) = self.refusal {
+            return Err(refusal);
         }
         let pages = standalone_shared_pages(size).ok_or(KernelError::OutOfMemory)?;
         let object = self.new_object();
@@ -522,6 +571,82 @@ mod tests {
         assert_eq!(kernel.process_id(), 0);
         kernel.set_process_id(0x1234_5678_9ABC);
         assert_eq!(kernel.process_id(), 0x1234_5678_9ABC);
+    }
+
+    #[test]
+    fn a_pseudo_handle_names_the_object_set_for_it_and_nothing_until_then() {
+        let mut kernel = FakeKernel::new(0).unwrap();
+        let (thread, process, other) = (
+            kernel.new_object(),
+            kernel.new_object(),
+            kernel.new_object(),
+        );
+        let held = kernel.insert_handle(other).unwrap();
+        let unset = Err(KernelError::InvalidHandle);
+        assert_eq!(kernel.resolve_handle(Handle::CURRENT_THREAD), unset);
+        assert_eq!(kernel.resolve_handle(Handle::CURRENT_PROCESS), unset);
+        // Each names its own object, so swapping the two shows.
+        kernel.set_current(Current {
+            thread: Some(thread),
+            process: Some(process),
+        });
+        assert_eq!(kernel.resolve_handle(Handle::CURRENT_THREAD), Ok(thread));
+        assert_eq!(kernel.resolve_handle(Handle::CURRENT_PROCESS), Ok(process));
+        // Only the one that was given: the other is the kernel's error.
+        kernel.set_current(Current {
+            thread: None,
+            process: Some(process),
+        });
+        assert_eq!(kernel.resolve_handle(Handle::CURRENT_THREAD), unset);
+        assert_eq!(kernel.resolve_handle(Handle::CURRENT_PROCESS), Ok(process));
+        kernel.set_current(Current {
+            thread: Some(thread),
+            process: None,
+        });
+        assert_eq!(kernel.resolve_handle(Handle::CURRENT_THREAD), Ok(thread));
+        assert_eq!(kernel.resolve_handle(Handle::CURRENT_PROCESS), unset);
+        // An ordinary handle is still the table's, and a pseudo-handle adds nothing to it.
+        assert_eq!(kernel.resolve_handle(held), Ok(other));
+        assert_eq!(kernel.handle_count(), 1);
+    }
+
+    #[test]
+    fn a_refusal_fails_every_object_a_server_makes_until_it_is_lifted() {
+        const SIZE: u64 = 0x1000;
+        let mut kernel = FakeKernel::new(0).unwrap();
+        kernel.refuse_objects(Some(KernelError::OutOfResource));
+        let refused = Err(KernelError::OutOfResource);
+        assert_eq!(kernel.create_event(), refused);
+        assert_eq!(
+            kernel
+                .create_shared_memory(SIZE, SvcPermission::Read)
+                .map(|(object, _)| object),
+            refused
+        );
+        // The kernel's own checks still come first: the size, then the permission.
+        assert_eq!(
+            kernel
+                .create_shared_memory(0, SvcPermission::Read)
+                .map(|(object, _)| object),
+            Err(KernelError::InvalidSize)
+        );
+        assert!(!is_shared_memory_permission(SvcPermission::ReadExecute));
+        assert_eq!(
+            kernel
+                .create_shared_memory(SIZE, SvcPermission::ReadExecute)
+                .map(|(object, _)| object),
+            Err(KernelError::InvalidNewMemoryPermission)
+        );
+        // Nothing was made, so the next object is the first.
+        kernel.refuse_objects(None);
+        assert_eq!(
+            kernel.create_event(),
+            Ok(ObjectId::from_parts(0, GENERATION))
+        );
+        let (memory, _) = kernel
+            .create_shared_memory(SIZE, SvcPermission::Read)
+            .unwrap();
+        assert_eq!(memory, ObjectId::from_parts(1, GENERATION));
     }
 
     #[test]
