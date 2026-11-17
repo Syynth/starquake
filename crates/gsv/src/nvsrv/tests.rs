@@ -9,7 +9,11 @@
 //! that test checks against the hand layout.
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
+use starquake_gpu::interface::{Completions, Ticket, VmUpdate};
+use starquake_gpu::syncpoint::Syncpoints;
+use starquake_gpu::vm::GpuVm;
 use starquake_ipc::{
     BUFFER_SIZE, Body, BufferDescriptor, CommandType, Message, ReceiveDescriptor, RequestBuilder,
     RequestLayout, SFCO_MAGIC, SessionKind, StaticDescriptor,
@@ -24,13 +28,15 @@ use starquake_services::framework::{
 use starquake_trace::{EventKind, IpcOutcome, ServiceId};
 
 use super::command::{INITIALIZE_DEVTOOLS, MAP_SHARED_MEM, SET_ARUID_FOR_TEST};
-use super::nvmap::{HANDLE_ID_INCREMENT, NvMap, NvMapStateError};
+use super::nvmap::{HANDLE_ID_INCREMENT, NvMapStateError};
 use super::*;
+use crate::completion::CompletionQueue;
+use crate::gpu::AsId;
 
 /// The number the tests' server is known by.
 const NVSRV: ServiceId = ServiceId(0x1402);
 /// What fills the message buffer and the caller's memory beforehand.
-const STALE: u8 = 0xA5;
+pub(super) const STALE: u8 = 0xA5;
 /// Where the hand-laid request keeps its argument and its out buffer: below 2^32, so a
 /// descriptor's third word holds no address bits.
 const IN_AT: u64 = 0x8000_0000;
@@ -52,11 +58,168 @@ const NVMAP_FREE: u32 = 0xC018_0105;
 /// nvmap's `IocParam`: `_NV_IOWR(0x01, 0x09, data)`, 12 bytes.
 const NVMAP_PARAM: u32 = 0xC00C_0109;
 /// nvhost-ctrl-gpu's `GetCharacteristics` (`nvhost_ctrl_gpu.cpp`: group 0x47, command 0x5),
-/// both directions, 0xB0 bytes: a device with no ioctls in this slice.
+/// both directions, 0xB0 bytes, on `Ioctl`: the Switch 1 form, which ctrl-gpu does not serve.
 const CTRL_GPU_CHARACTERISTICS: u32 = 0xC0B0_4705;
 
+// ----- The wiring ------------------------------------------------------------------------------
+
+/// One call the front was given.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum FrontCall {
+    Create(AsId),
+    Update(AsId, VmUpdate, Option<Ticket>),
+    Barrier(Ticket),
+}
+
+/// A GPU front that records its calls. nvsrv only ever makes address spaces through it.
+#[derive(Default)]
+pub(super) struct RecordingFront {
+    calls: Mutex<Vec<FrontCall>>,
+}
+
+impl GpuVmFront for RecordingFront {
+    fn create_address_space(&self, space: AsId, _vm: Arc<GpuVm>) {
+        self.calls.lock().unwrap().push(FrontCall::Create(space));
+    }
+
+    fn update_vm(&self, space: AsId, update: VmUpdate, done: Option<Ticket>) {
+        let call = FrontCall::Update(space, update, done);
+        self.calls.lock().unwrap().push(call);
+    }
+
+    fn barrier(&self, done: Ticket) {
+        self.calls.lock().unwrap().push(FrontCall::Barrier(done));
+    }
+}
+
+impl RecordingFront {
+    pub(super) fn calls(&self) -> Vec<FrontCall> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+/// gsv's shared state, over a fresh completion queue and syncpoints, as the gpu tests build it.
+pub(super) fn shared_state() -> Arc<Shared> {
+    let queue = Arc::new(CompletionQueue::new());
+    let completions: Arc<dyn Completions> = Arc::<CompletionQueue>::clone(&queue);
+    let syncpoints = Arc::new(Syncpoints::new(completions));
+    Arc::new(Shared::new(syncpoints, queue, NVSRV))
+}
+
+/// nvsrv's wiring: gsv's shared state and a recording front.
+pub(super) fn wiring() -> (Arc<Shared>, Arc<RecordingFront>) {
+    (shared_state(), Arc::new(RecordingFront::default()))
+}
+
+/// `front` as the trait object nvsrv takes.
+pub(super) fn as_front(front: &Arc<RecordingFront>) -> Arc<dyn GpuVmFront> {
+    Arc::<RecordingFront>::clone(front)
+}
+
+/// A server over fresh wiring, its state `state`.
+fn server_with(state: NvsrvState) -> Server {
+    let (shared, front) = wiring();
+    let family = NvsrvFamily::new(Arc::clone(&shared), as_front(&front)).with_state(state);
+    nvsrv_server(shared, as_front(&front), UnknownPolicy::Strict).with_family(family)
+}
+
+/// The state of `server`'s family.
+fn state_of(server: &Server) -> Option<&NvsrvState> {
+    server.family::<NvsrvFamily>().map(NvsrvFamily::state)
+}
+
+/// An nvsrv state driven directly, without the server, over a GPU memory and a recording front
+/// of its own.
+pub(super) struct Direct {
+    pub(super) state: NvsrvState,
+    pub(super) memory: GpuMemory,
+    pub(super) front: RecordingFront,
+}
+
+impl Direct {
+    pub(super) fn new() -> Self {
+        Self {
+            state: NvsrvState::new(),
+            memory: GpuMemory::new(),
+            front: RecordingFront::default(),
+        }
+    }
+
+    /// Opens `device`, which must succeed; its fd.
+    pub(super) fn open(&mut self, device: Device) -> i32 {
+        let (fd, result) = self.state.open(device.path().as_bytes());
+        assert_eq!(result, NvResult::Success);
+        fd
+    }
+
+    /// `raw` on `fd` through `variant` under `policy`, with `input` and out buffers of `out_len`
+    /// and `inline_out_len` bytes.
+    pub(super) fn call(
+        &mut self,
+        policy: UnknownPolicy,
+        variant: IoctlVariant,
+        fd: i32,
+        raw: u32,
+        input: &[u8],
+        (out_len, inline_out_len): (usize, usize),
+    ) -> IoctlAnswer {
+        let call = IoctlCall {
+            variant,
+            fd,
+            ioctl: Ioctl::from_raw(raw),
+            input,
+            out_len,
+            inline_out_len,
+        };
+        let gpu = GpuAccess {
+            memory: &mut self.memory,
+            front: &self.front,
+        };
+        self.state.ioctl(policy, &call, gpu)
+    }
+
+    /// `raw` on `fd` through `Ioctl`, strict, out buffer 0 the input's size.
+    pub(super) fn ioctl(&mut self, fd: i32, raw: u32, input: &[u8]) -> IoctlAnswer {
+        let sizes = (input.len(), 0);
+        self.call(
+            UnknownPolicy::Strict,
+            IoctlVariant::Ioctl,
+            fd,
+            raw,
+            input,
+            sizes,
+        )
+    }
+}
+
+/// [`NvsrvState::ioctl`] of `raw` on `fd` with `input`, out buffers of `input`'s size, over a
+/// fresh GPU memory.
+pub(super) fn direct_ioctl(
+    state: &mut NvsrvState,
+    policy: UnknownPolicy,
+    variant: IoctlVariant,
+    fd: i32,
+    raw: u32,
+    input: &[u8],
+) -> IoctlAnswer {
+    let mut direct = Direct::new();
+    std::mem::swap(&mut direct.state, state);
+    let sizes = (input.len(), input.len());
+    let answer = direct.call(policy, variant, fd, raw, input, sizes);
+    std::mem::swap(&mut direct.state, state);
+    answer
+}
+
+/// nvhost-as-gpu's `AllocAsEx` as NvRm sends it: `_NV_IOWR('A', 0x09, ..)`, a 40-byte struct
+/// (`nvhost_as_gpu.h`: `IoctlAllocAsEx`).
+pub(super) const AS_ALLOC_AS_EX: u32 = 0xC028_4109;
+/// `GetVARegions`: `_NV_IOWR('A', 0x08, ..)`, 0x40 bytes (PR's gpu session sends `0xc0404108`).
+pub(super) const AS_GET_VA_REGIONS: u32 = 0xC040_4108;
+/// `GetSyncpointShimInfo`: `_NV_IOWR('A', 0x0B, ..)`, 16 bytes (`IoctlSyncpointShimInfo`).
+pub(super) const AS_SHIM_INFO: u32 = 0xC010_410B;
+
 /// Little-endian words as bytes.
-fn le(words: &[u32]) -> Vec<u8> {
+pub(super) fn le(words: &[u32]) -> Vec<u8> {
     words.iter().flat_map(|word| word.to_le_bytes()).collect()
 }
 
@@ -70,21 +233,21 @@ fn buffer_of(words: &[u32]) -> Vec<u8> {
 /// Where an auto-select buffer goes: its map-alias (A or B) descriptor, or its pointer (X or C)
 /// descriptor, the other one empty (libnx `cmifRequestInAutoBuffer`, `cmifRequestOutAutoBuffer`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Via {
+pub(super) enum Via {
     MapAlias,
     Pointer,
 }
 
 /// An auto-select buffer: where, at what address, how long.
 #[derive(Debug, Clone, Copy)]
-struct Auto {
+pub(super) struct Auto {
     via: Via,
     address: u64,
     len: u16,
 }
 
 impl Auto {
-    fn alias(address: u64, len: u16) -> Self {
+    pub(super) fn alias(address: u64, len: u16) -> Self {
         Self {
             via: Via::MapAlias,
             address,
@@ -92,7 +255,7 @@ impl Auto {
         }
     }
 
-    fn pointer(address: u64, len: u16) -> Self {
+    pub(super) fn pointer(address: u64, len: u16) -> Self {
         Self {
             via: Via::Pointer,
             address,
@@ -101,7 +264,7 @@ impl Auto {
     }
 
     /// Adds it as an in buffer: an A and an X descriptor.
-    fn send(self, request: RequestBuilder, index: u32) -> RequestBuilder {
+    pub(super) fn send(self, request: RequestBuilder, index: u32) -> RequestBuilder {
         let (alias, pointer) = match self.via {
             Via::MapAlias => ((self.address, self.len), (0, 0)),
             Via::Pointer => ((0, 0), (self.address, self.len)),
@@ -120,7 +283,7 @@ impl Auto {
     }
 
     /// Adds it as an out buffer: a B and a C descriptor.
-    fn receive(self, request: RequestBuilder) -> RequestBuilder {
+    pub(super) fn receive(self, request: RequestBuilder) -> RequestBuilder {
         let (alias, pointer) = match self.via {
             Via::MapAlias => ((self.address, self.len), (0, 0)),
             Via::Pointer => ((0, 0), (self.address, self.len)),
@@ -139,14 +302,14 @@ impl Auto {
 }
 
 /// A CMIF request to `command` with `data`, in libnx's layout.
-fn cmif(command: u32, data: &[u8]) -> RequestBuilder {
+pub(super) fn cmif(command: u32, data: &[u8]) -> RequestBuilder {
     RequestBuilder::cmif(CommandType::Request, command)
         .layout(RequestLayout::Libnx)
         .data(data)
 }
 
 /// An ioctl command's arguments: the fd and the ioctl number.
-fn fd_and(fd: i32, raw: u32) -> Vec<u8> {
+pub(super) fn fd_and(fd: i32, raw: u32) -> Vec<u8> {
     let mut data = fd.to_le_bytes().to_vec();
     data.extend(raw.to_le_bytes());
     data
@@ -154,13 +317,13 @@ fn fd_and(fd: i32, raw: u32) -> Vec<u8> {
 
 /// What a reply said: its CMIF result and its data words.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Answer {
-    result: u32,
-    words: Vec<u32>,
+pub(super) struct Answer {
+    pub(super) result: u32,
+    pub(super) words: Vec<u32>,
 }
 
 /// Reads a reply, keeping `words` data words.
-fn answer(buffer: &[u8], words: usize) -> Answer {
+pub(super) fn answer(buffer: &[u8], words: usize) -> Answer {
     let message = Message::parse_reply(buffer, SessionKind::Session).unwrap();
     let Body::CmifReply(reply) = message.body else {
         unreachable!("not a CMIF reply: {message:?}");
@@ -180,48 +343,64 @@ fn answer(buffer: &[u8], words: usize) -> Answer {
 }
 
 /// A successful reply with these data words.
-fn ok(words: &[u32]) -> Answer {
+pub(super) fn ok(words: &[u32]) -> Answer {
     Answer {
         result: ResultCode::SUCCESS.raw(),
         words: words.to_vec(),
     }
 }
 
-/// A server, a kernel, and one session on it.
-struct Rig {
-    kernel: FakeKernel,
-    server: Server,
+/// A server over gsv's shared state and a recording front, a kernel, and one session on it.
+pub(super) struct Rig {
+    pub(super) kernel: FakeKernel,
+    pub(super) server: Server,
+    pub(super) shared: Arc<Shared>,
+    pub(super) front: Arc<RecordingFront>,
     session: ObjectId,
     next_at: u64,
 }
 
 impl Rig {
-    fn with_state(policy: UnknownPolicy, state: NvsrvState) -> Self {
+    /// A rig over `shared` and `front`, its state `state`.
+    pub(super) fn over(
+        policy: UnknownPolicy,
+        state: NvsrvState,
+        shared: Arc<Shared>,
+        front: Arc<RecordingFront>,
+    ) -> Self {
         let mut kernel = FakeKernel::new(0).unwrap();
         kernel.set_current_service(NVSRV);
         let session = kernel.new_object();
-        let mut server = nvsrv_server(policy)
-            .with_family(state)
+        let family = NvsrvFamily::new(Arc::clone(&shared), as_front(&front)).with_state(state);
+        let mut server = nvsrv_server(Arc::clone(&shared), as_front(&front), policy)
+            .with_family(family)
             .with_service_id(NVSRV);
         server.accept(session).unwrap();
         Self {
             kernel,
             server,
+            shared,
+            front,
             session,
             next_at: PLACE_FROM,
         }
     }
 
-    fn with(policy: UnknownPolicy) -> Self {
+    fn with_state(policy: UnknownPolicy, state: NvsrvState) -> Self {
+        let (shared, front) = wiring();
+        Self::over(policy, state, shared, front)
+    }
+
+    pub(super) fn with(policy: UnknownPolicy) -> Self {
         Self::with_state(policy, NvsrvState::new())
     }
 
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self::with(UnknownPolicy::Strict)
     }
 
-    fn state(&self) -> &NvsrvState {
-        self.server.family::<NvsrvState>().unwrap()
+    pub(super) fn state(&self) -> &NvsrvState {
+        state_of(&self.server).unwrap()
     }
 
     /// Sends `request` on `session`; the message buffer afterwards.
@@ -233,12 +412,12 @@ impl Rig {
         buffer
     }
 
-    fn send(&mut self, request: &RequestBuilder) -> Vec<u8> {
+    pub(super) fn send(&mut self, request: &RequestBuilder) -> Vec<u8> {
         self.send_on(self.session, request)
     }
 
     /// Maps `bytes` in fresh memory; where.
-    fn place(&mut self, bytes: &[u8]) -> u64 {
+    pub(super) fn place(&mut self, bytes: &[u8]) -> u64 {
         let at = self.next_at;
         assert!(u64::try_from(bytes.len()).unwrap() < PLACE_STRIDE);
         self.next_at += PLACE_STRIDE;
@@ -247,7 +426,7 @@ impl Rig {
     }
 
     /// The caller's `len` bytes at `address`.
-    fn memory(&self, address: u64, len: usize) -> Vec<u8> {
+    pub(super) fn memory(&self, address: u64, len: usize) -> Vec<u8> {
         self.kernel.memory(address, len).unwrap().to_vec()
     }
 
@@ -263,7 +442,7 @@ impl Rig {
     }
 
     /// Opens `device`, which must succeed; its fd.
-    fn open_device(&mut self, device: Device) -> i32 {
+    pub(super) fn open_device(&mut self, device: Device) -> i32 {
         let answer = self.open(device.path().as_bytes());
         assert_eq!(answer.result, 0);
         assert_eq!(answer.words[1], NvResult::Success.raw());
@@ -272,7 +451,13 @@ impl Rig {
 
     /// `Ioctl` (1) with `input` in a map-alias in buffer and an out buffer of `out_len` stale
     /// bytes: the result word and the out buffer afterwards.
-    fn ioctl(&mut self, fd: i32, raw: u32, input: &[u8], out_len: usize) -> (Answer, Vec<u8>) {
+    pub(super) fn ioctl(
+        &mut self,
+        fd: i32,
+        raw: u32,
+        input: &[u8],
+        out_len: usize,
+    ) -> (Answer, Vec<u8>) {
         let input_at = self.place(input);
         let out_at = self.place(&vec![STALE; out_len]);
         let request = cmif(IOCTL, &fd_and(fd, raw));
@@ -280,6 +465,27 @@ impl Rig {
         let request = Auto::alias(out_at, len16(out_len)).receive(request);
         let answer = answer(&self.send(&request), 1);
         (answer, self.memory(out_at, out_len))
+    }
+
+    /// `Ioctl3` (12) with `input` in a map-alias in buffer, and out buffers 0 and 1 of `out_len`
+    /// and `inline_len` stale bytes: the result word and both out buffers afterwards.
+    pub(super) fn ioctl3(
+        &mut self,
+        fd: i32,
+        raw: u32,
+        input: &[u8],
+        (out_len, inline_len): (usize, usize),
+    ) -> (Answer, Vec<u8>, Vec<u8>) {
+        let input_at = self.place(input);
+        let out_at = self.place(&vec![STALE; out_len]);
+        let inline_at = self.place(&vec![STALE; inline_len]);
+        let request = cmif(IOCTL3, &fd_and(fd, raw));
+        let request = Auto::alias(input_at, len16(input.len())).send(request, 0);
+        let request = Auto::alias(out_at, len16(out_len)).receive(request);
+        let request = Auto::alias(inline_at, len16(inline_len)).receive(request);
+        let answer = answer(&self.send(&request), 1);
+        let out = self.memory(out_at, out_len);
+        (answer, out, self.memory(inline_at, inline_len))
     }
 
     /// Runs an nvmap ioctl that must succeed; the struct it gives back.
@@ -290,7 +496,7 @@ impl Rig {
     }
 }
 
-fn len16(len: usize) -> u16 {
+pub(super) fn len16(len: usize) -> u16 {
     u16::try_from(len).unwrap()
 }
 
@@ -368,6 +574,7 @@ fn nv_results_are_eden_s() {
         (NvResult::InsufficientMemory, 0x6),
         (NvResult::InvalidState, 0x8),
         (NvResult::BadValue, 0xB),
+        (NvResult::Busy, 0xE),
         (NvResult::FileOperationFailed, 0x3_0003),
         (NvResult::AccessDenied, 0x3_0010),
     ];
@@ -566,7 +773,7 @@ fn full_table(count: usize) -> NvsrvState {
             .map(|fd| (fd, Device::Nvmap))
             .collect(),
         next_fd: FIRST_FD + count,
-        nvmap: NvMap::new(),
+        ..NvsrvState::new()
     }
 }
 
@@ -587,9 +794,8 @@ fn open_refuses_a_full_table_and_spent_fds() {
 
     // The last fd is handed out; after it, fds are spent.
     let state = NvsrvState {
-        files: BTreeMap::new(),
         next_fd: FD_END - 1,
-        nvmap: NvMap::new(),
+        ..NvsrvState::new()
     };
     let mut rig = Rig::with_state(UnknownPolicy::Strict, state);
     let last = i32::MAX.cast_unsigned();
@@ -820,7 +1026,8 @@ fn an_unknown_ioctl_under_each_policy() {
     assert_eq!(output, vec![STALE; 0x100]);
 }
 
-/// Every device but nvmap has no ioctl yet; nvmap has none on `Ioctl2` or `Ioctl3`.
+/// nvmap's `IocCreate` number is known to nvmap's `Ioctl` alone: no other device has an ioctl in
+/// nvmap's group, and nvmap has none on `Ioctl2` or `Ioctl3`.
 #[test]
 fn only_nvmap_s_ioctl_1_commands_are_known() {
     let mut state = NvsrvState::new();
@@ -834,11 +1041,12 @@ fn only_nvmap_s_ioctl_1_commands_are_known() {
             IoctlVariant::Ioctl2,
             IoctlVariant::Ioctl3,
         ] {
-            let answer = state.ioctl(
+            let answer = direct_ioctl(
+                &mut state,
                 UnknownPolicy::Strict,
                 variant,
                 fd,
-                Ioctl::from_raw(NVMAP_CREATE),
+                NVMAP_CREATE,
                 &le(&[0x1000, 0]),
             );
             let known = device == Device::Nvmap && variant == IoctlVariant::Ioctl;
@@ -1112,9 +1320,11 @@ fn a_saved_server_restores_and_carries_on() {
     let state = rig.state().clone();
     let saved = rig.server.save().unwrap();
 
-    let mut restored = nvsrv_server(UnknownPolicy::Strict).with_service_id(NVSRV);
+    let (shared, front) = wiring();
+    let mut restored =
+        nvsrv_server(shared, as_front(&front), UnknownPolicy::Strict).with_service_id(NVSRV);
     restored.restore(&saved).unwrap();
-    assert_eq!(restored.family::<NvsrvState>(), Some(&state));
+    assert_eq!(state_of(&restored), Some(&state));
     assert_eq!(restored.save().unwrap(), saved);
     rig.server = restored;
 
@@ -1127,21 +1337,51 @@ fn a_saved_server_restores_and_carries_on() {
 }
 
 /// The saved layout of the state, as `postcard` writes it: the file count, each fd and its
-/// device's index, the next fd, then the nvmap table (its own layout is pinned in
-/// `nvmap/tests.rs`). Every device appears, each fd distinct.
+/// device's index, the next fd, the nvmap table (its own layout is pinned in `nvmap/tests.rs`),
+/// then nvhost-as-gpu's views and the layouts of the address spaces it made, then
+/// nvhost-tsg-gpu's groups. Every device appears, each fd distinct; the state is reached by
+/// ioctls, each field of a view, a layout and a group a distinct non-zero value.
 #[test]
 fn the_saved_state_s_layout_is_pinned() {
-    let state = NvsrvState {
-        files: (FIRST_FD..).zip(DEVICES).collect(),
-        next_fd: 0x0B,
-        nvmap: NvMap::new(),
-    };
+    let mut direct = Direct::new();
+    for device in DEVICES {
+        direct.open(device);
+    }
+    // One address space first, so the view's is 2.
+    direct.memory.create_address_space(&direct.front).unwrap();
+    // fd 3 is nvhost-as-gpu: start 0x2000, end 0x9000, split 0x5000, big pages 0x10000.
+    let alloc = le(&[0, 0, 0x1_0000, 0, 0x2000, 0, 0x9000, 0, 0x5000, 0]);
+    assert_eq!(
+        direct.ioctl(3, AS_ALLOC_AS_EX, &alloc).result,
+        NvResult::Success
+    );
+    // fd 4 is nvhost-tsg-gpu: a timeslice of 0x77, channel fd 5 (nvhost-gpu) at subcontext 0x21.
+    let timeslice = le(&[0x77]);
+    let set = direct.ioctl(4, tsg_gpu::SET_TIMESLICE, &timeslice);
+    assert_eq!(set.result, NvResult::Success);
+    let bind = le(&[5, 0x21, 0, 0, 0, 0]);
+    let bound = direct.ioctl(4, tsg_gpu::BIND_CHANNEL_EX, &bind);
+    assert_eq!(bound.result, NvResult::Success);
+    let state = direct.state;
+
     let mut expected = vec![10];
     for (fd, index) in (1..=10).zip(0..10) {
         expected.extend([fd, index]);
     }
     // The next fd; then the nvmap table: no handles, next id 4.
     expected.extend([0x0B, 0, 4]);
+    // A layout: start 0x2000, split 0x5000, end 0x9000, big page size 0x10000, as varints.
+    let layout = [
+        0x80, 0x40, 0x80, 0xA0, 0x01, 0x80, 0xA0, 0x02, 0x80, 0x80, 0x04,
+    ];
+    // One view: fd 3, address space 2, its layout.
+    expected.extend([1, 3, 2]);
+    expected.extend(layout);
+    // One address space made: 2, its layout.
+    expected.extend([1, 2]);
+    expected.extend(layout);
+    // One group: fd 4, timeslice 0x77, one channel: fd 5, subcontext 0x21.
+    expected.extend([1, 4, 0x77, 1, 5, 0x21]);
     let bytes = state.save_state().unwrap();
     assert_eq!(bytes, expected);
     let mut loaded = NvsrvState::new();
@@ -1207,11 +1447,13 @@ fn unreachable_states() -> Vec<(NvsrvState, NvsrvStateError)> {
 }
 
 /// The saved form of `state`, field for field.
-fn saved(state: &NvsrvState) -> SavedNvsrvState {
+pub(super) fn saved(state: &NvsrvState) -> SavedNvsrvState {
     SavedNvsrvState {
         files: state.files.clone(),
         next_fd: state.next_fd,
         nvmap: state.nvmap.clone(),
+        as_gpu: state.as_gpu.clone(),
+        tsg_gpu: state.tsg_gpu.clone(),
     }
 }
 
@@ -1220,14 +1462,11 @@ fn a_saved_state_no_command_reaches_is_refused() {
     for (state, error) in unreachable_states() {
         assert_eq!(NvsrvState::try_from(saved(&state)), Err(error), "{error}");
         // Through a whole server snapshot: refused, and the server is left as it was.
-        let bytes = nvsrv_server(UnknownPolicy::Strict)
-            .with_family(state)
-            .save()
-            .unwrap();
-        let mut restored = nvsrv_server(UnknownPolicy::Strict);
+        let bytes = server_with(state).save().unwrap();
+        let mut restored = server_with(NvsrvState::new());
         let refused = SnapshotError::Decode(postcard::Error::SerdeDeCustom);
         assert_eq!(restored.restore(&bytes), Err(refused), "{error}");
-        assert_eq!(restored.family::<NvsrvState>(), Some(&NvsrvState::new()));
+        assert_eq!(state_of(&restored), Some(&NvsrvState::new()));
     }
 }
 
@@ -1237,17 +1476,20 @@ fn a_saved_state_no_command_reaches_is_refused() {
 fn a_saved_state_with_a_bad_table_is_refused() {
     let mut state = NvsrvState::new();
     state.open(b"/dev/nvmap");
-    state.ioctl(
+    direct_ioctl(
+        &mut state,
         UnknownPolicy::Strict,
         IoctlVariant::Ioctl,
         1,
-        Ioctl::from_raw(NVMAP_CREATE),
+        NVMAP_CREATE,
         &le(&[0x1000, 0]),
     );
     let mut bytes = state.save_state().unwrap();
-    // The table's last byte is its next id, 8: make it 2, which no table reaches.
-    assert_eq!(bytes.last(), Some(&8));
-    *bytes.last_mut().unwrap() = 2;
+    // The table's last byte is its next id, 8, before three empty maps (as-gpu's views and
+    // made spaces, tsg-gpu's groups): make it 2, which no table reaches.
+    let at = bytes.len() - 4;
+    assert_eq!(bytes[at..], [8, 0, 0, 0]);
+    bytes[at] = 2;
     let mut loaded = NvsrvState::new();
     assert_eq!(
         loaded.load_state(&bytes),
@@ -1274,18 +1516,15 @@ fn a_saved_state_at_each_edge_is_accepted() {
         NvsrvState {
             files: BTreeMap::from([(FD_END - 1, Device::NvhostVic)]),
             next_fd: FD_END,
-            nvmap: NvMap::new(),
+            ..NvsrvState::new()
         },
     ];
     for state in cases {
         assert_eq!(NvsrvState::try_from(saved(&state)).as_ref(), Ok(&state));
-        let bytes = nvsrv_server(UnknownPolicy::Strict)
-            .with_family(state.clone())
-            .save()
-            .unwrap();
-        let mut restored = nvsrv_server(UnknownPolicy::Strict);
+        let bytes = server_with(state.clone()).save().unwrap();
+        let mut restored = server_with(NvsrvState::new());
         restored.restore(&bytes).unwrap();
-        assert_eq!(restored.family::<NvsrvState>(), Some(&state));
+        assert_eq!(state_of(&restored), Some(&state));
     }
 }
 
