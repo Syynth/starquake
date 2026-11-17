@@ -109,7 +109,7 @@ impl System {
 
 /// The hypervisor backend: a fresh VM for every run.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-mod host {
+pub(crate) mod host {
     use std::sync::{Arc, Mutex, PoisonError};
     use std::time::Instant;
 
@@ -128,8 +128,9 @@ mod host {
     use crate::report::{RunOptions, RunReport};
     use crate::space::{AddressSpace, SpaceMapper, Touch};
 
-    /// Held for the whole of a run: Hypervisor.framework allows one VM per process.
-    static ONE_VM: Mutex<()> = Mutex::new(());
+    /// Held for the whole of a run, and by tests that make a VM of their own:
+    /// Hypervisor.framework allows one VM per process.
+    pub(crate) static ONE_VM: Mutex<()> = Mutex::new(());
 
     /// The address-space id of the one process: the first id the kernel's pool hands out
     /// (`starquake_kernel::process::AsidPool`). PROVISIONAL: with one process per run nothing
