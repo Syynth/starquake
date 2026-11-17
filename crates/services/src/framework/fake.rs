@@ -31,7 +31,10 @@
 //! mapped memory, whose token names [`FakeKernel::process`] (made with the kernel's
 //! `test-support` constructor), and released only by a token naming that process and a range
 //! that holds one. Ending the process does not make the fake refuse a token, as the kernel's
-//! unlock does once the process has ended.
+//! unlock does once the process has ended. A transfer memory is a range of the caller's memory
+//! a test lends ([`FakeKernel::lend`]); writes through it are bounded by the kernel's own check
+//! (`starquake_kernel::memory::shared::span_within`) and reach only mapped memory. The fake
+//! does not lock the lent pages or take the owner's permission away, as the kernel does.
 //!
 //! Clearing and ending are modelled as plainly. An event the fake made is signalled from a
 //! signal until a clear ([`FakeKernel::is_signalled`]). Either end of a hooked event clears it,
@@ -49,9 +52,11 @@ use starquake_kernel::handle::{Handle, HandleError, HandleTable, RefCounts, Reso
 use starquake_kernel::id::{ObjectId, ProcessId, SlabId};
 use starquake_kernel::ipc::EventHook;
 use starquake_kernel::ipc::message::Current;
+use starquake_kernel::memory::shared::span_within;
 use starquake_kernel::memory::testing::{device_share_token, standalone_shared_pages};
 use starquake_kernel::memory::{
-    DeviceShareToken, SharedPages, SvcPermission, is_shared_memory_permission, shared_memory_size,
+    DeviceShareToken, SharedPages, SvcPermission, TransferMemory, is_shared_memory_permission,
+    shared_memory_size,
 };
 use starquake_kernel::result::{KernelError, ResultCode, SvcResult};
 use starquake_trace::{
@@ -110,6 +115,8 @@ pub struct FakeKernel {
     device_locks: BTreeMap<(u64, u64), u16>,
     /// The shared memories made, with the permission the caller maps each with.
     shared: BTreeMap<ObjectId, (SharedPages, SvcPermission)>,
+    /// The transfer memories a test lent ([`FakeKernel::lend`]).
+    transfers: BTreeMap<ObjectId, TransferMemory>,
     sessions: Vec<ObjectId>,
     regions: Vec<Region>,
     /// The services [`Kernel::connect`] knows.
@@ -150,6 +157,7 @@ impl FakeKernel {
             gpu_accessible: Vec::new(),
             device_locks: BTreeMap::new(),
             shared: BTreeMap::new(),
+            transfers: BTreeMap::new(),
             sessions: Vec::new(),
             regions: Vec::new(),
             services: BTreeSet::new(),
@@ -302,6 +310,34 @@ impl FakeKernel {
         self.shared
             .get(&object)
             .map(|(pages, permission)| (pages, *permission))
+    }
+
+    /// Lends the `size` bytes at `address` of the caller's memory as a transfer memory, as the
+    /// guest's `CreateTransferMemory` does, keeping `owner_permission` of them: a new object,
+    /// for a test to give the caller a handle to and send in a request. The fake does not check
+    /// that the range is mapped or page-aligned; reads and writes through it reach only mapped
+    /// memory ([`FakeKernel::map`]).
+    pub fn lend(&mut self, address: u64, size: u64, owner_permission: SvcPermission) -> ObjectId {
+        let object = self.new_object();
+        let lent = TransferMemory::new(self.process(), address, size, owner_permission);
+        self.transfers.insert(object, lent.with_pages_locked());
+        object
+    }
+
+    /// Ends the transfer memory `object`, as closing its last handle does: later calls on it
+    /// are [`KernelError::InvalidHandle`]. False if it named no transfer memory.
+    pub fn end_transfer_memory(&mut self, object: ObjectId) -> bool {
+        self.transfers.remove(&object).is_some()
+    }
+
+    /// The caller's address of `len` bytes at `offset` into the transfer memory `object`, as
+    /// the kernel finds it: [`KernelError::InvalidHandle`] unless `object` is one
+    /// [`FakeKernel::lend`] made, and [`KernelError::InvalidCurrentMemory`] unless the whole
+    /// extent lies inside it.
+    pub fn lent_range(&self, object: ObjectId, offset: u64, len: usize) -> SvcResult<u64> {
+        let lent = self.transfer_memory(object)?;
+        span_within(lent.address(), lent.size(), offset, len)
+            .ok_or(KernelError::InvalidCurrentMemory)
     }
 
     /// The sessions [`Kernel::create_session`] has created, oldest first.
@@ -468,6 +504,28 @@ impl Kernel for FakeKernel {
             self.device_locks.remove(&range);
         }
         Ok(())
+    }
+
+    /// A transfer memory [`FakeKernel::lend`] made and [`FakeKernel::end_transfer_memory`] has
+    /// not ended; [`KernelError::InvalidHandle`] for any other id.
+    fn transfer_memory(&self, object: ObjectId) -> SvcResult<TransferMemory> {
+        self.transfers
+            .get(&object)
+            .copied()
+            .ok_or(KernelError::InvalidHandle)
+    }
+
+    /// Writes where [`FakeKernel::lent_range`] finds `data`'s extent, through
+    /// [`Kernel::write_memory`]: [`KernelError::InvalidCurrentMemory`] also when that memory is
+    /// not mapped. Nothing is written on an error.
+    fn write_transfer_memory(
+        &mut self,
+        object: ObjectId,
+        offset: u64,
+        data: &[u8],
+    ) -> SvcResult<()> {
+        let address = self.lent_range(object, offset, data.len())?;
+        self.write_memory(address, data)
     }
 
     fn create_session(&mut self) -> SvcResult<(ObjectId, Handle)> {
@@ -886,5 +944,63 @@ mod tests {
         );
         kernel.read_memory(0x1002, &mut out).unwrap();
         assert_eq!(out, [3, 4]);
+    }
+
+    #[test]
+    fn a_lent_transfer_memory_is_written_within_its_bounds_and_its_neighbour_is_untouched() {
+        const BASE: u64 = 0x4000;
+        const SIZE: u64 = 0x10;
+        let mut kernel = FakeKernel::new(0).unwrap();
+        // The lent range and the byte after it, which starts exactly at its end bound.
+        kernel.map(BASE, vec![0; 0x11]);
+        let lent = kernel.lend(BASE, SIZE, SvcPermission::Read);
+        let found = kernel.transfer_memory(lent).unwrap();
+        assert_eq!(
+            (found.owner(), found.address(), found.size()),
+            (kernel.process(), BASE, SIZE)
+        );
+        assert_eq!(found.owner_permission(), SvcPermission::Read);
+        assert!(found.is_locked());
+        // Up to exactly the end is written; one byte past it is refused and writes nothing.
+        kernel
+            .write_transfer_memory(lent, SIZE - 2, &[7, 8])
+            .unwrap();
+        assert_eq!(
+            kernel.write_transfer_memory(lent, SIZE - 1, &[9, 9]),
+            Err(KernelError::InvalidCurrentMemory)
+        );
+        assert_eq!(
+            kernel.write_transfer_memory(lent, u64::MAX, &[1]),
+            Err(KernelError::InvalidCurrentMemory)
+        );
+        assert_eq!(kernel.memory(BASE + SIZE - 2, 3), Some(&[7, 8, 0][..]));
+        assert_eq!(kernel.lent_range(lent, 3, 1), Ok(BASE + 3));
+    }
+
+    #[test]
+    fn only_a_live_transfer_memory_is_one() {
+        let mut kernel = FakeKernel::new(0).unwrap();
+        kernel.map(0x1000, vec![0; 4]);
+        let other = kernel.new_object();
+        let lent = kernel.lend(0x1000, 4, SvcPermission::None);
+        assert_eq!(
+            kernel.transfer_memory(other),
+            Err(KernelError::InvalidHandle)
+        );
+        assert_eq!(
+            kernel.write_transfer_memory(other, 0, &[1]),
+            Err(KernelError::InvalidHandle)
+        );
+        assert!(kernel.end_transfer_memory(lent));
+        assert!(!kernel.end_transfer_memory(lent));
+        assert_eq!(
+            kernel.transfer_memory(lent),
+            Err(KernelError::InvalidHandle)
+        );
+        assert_eq!(
+            kernel.write_transfer_memory(lent, 0, &[1]),
+            Err(KernelError::InvalidHandle)
+        );
+        assert_eq!(kernel.memory(0x1000, 4), Some(&[0; 4][..]));
     }
 }

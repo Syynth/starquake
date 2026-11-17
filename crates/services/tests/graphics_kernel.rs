@@ -1,7 +1,8 @@
 //! The graphics server's four kernel calls on the real kernel: a service's [`Context`] reaches
 //! the dispatcher's `IpcContext` through the framework's `Kernel` implementation, and a guest's
 //! system calls see what the service did (the hooked event's writable end, the GPU-accessible
-//! attribute `svc 0x80` sets, and the device-share lock).
+//! attribute `svc 0x80` sets, the device-share lock, and a write into a transfer memory the
+//! guest lent).
 
 /// Everything in a `cfg(test)` module, so that the helpers may unwrap as the tests do.
 #[cfg(test)]
@@ -44,6 +45,9 @@ mod on_the_kernel {
     const QUERY: u32 = 1;
     const LOCK: u32 = 2;
     const UNLOCK: u32 = 3;
+    /// `WRITE_LENT`: in copy handle 0, a transfer memory; `u64 offset`, `u32 word`. Writes the
+    /// word at the offset and replies the transfer memory's `u64 address`, `u64 size`.
+    const WRITE_LENT: u32 = 4;
 
     struct NoDebug;
 
@@ -102,6 +106,7 @@ mod on_the_kernel {
             QUERY => query,
             LOCK => lock,
             UNLOCK => unlock,
+            WRITE_LENT => write_lent,
         }
     }
 
@@ -158,6 +163,26 @@ mod on_the_kernel {
                 .find(|token| (token.address(), token.size()) == (address, size))
                 .expect("a lock of the range");
             cx.unlock_device_share(token)?;
+            reply.ok()
+        }
+    }
+
+    impl Gpu {
+        fn write_lent(
+            _: &mut Self,
+            cx: &mut Context<'_>,
+            req: &Request<'_>,
+            reply: &mut Reply,
+        ) -> Answer {
+            let lent = req.copy_handle(0)?;
+            let mut payload = req.payload();
+            let (offset, word) = (payload.read_u64()?, payload.read_u32()?);
+            let memory = cx.transfer_memory(lent)?;
+            cx.write_transfer_memory(lent, offset, &word.to_le_bytes())?;
+            reply
+                .payload()
+                .write_u64(memory.address())
+                .write_u64(memory.size());
             reply.ok()
         }
     }
@@ -361,5 +386,39 @@ mod on_the_kernel {
             rig.send(session, &with_range(UNLOCK, WORK, PAGE_SIZE)).0,
             code(KernelError::InvalidCurrentMemory)
         );
+    }
+
+    #[test]
+    fn a_service_writes_a_transfer_memory_the_guest_lent_within_its_bounds() {
+        let rig = Rig::new(&Heard::default(), &Tokens::default());
+        let session = rig.connect();
+        // The guest lends its work page, keeping only read access, as gsv 204's caller does.
+        let read = u64::from(SvcPermission::Read.bits());
+        let regs = rig.call(SvcId::CreateTransferMemory, [0, WORK, PAGE_SIZE, read]);
+        assert_eq!(regs.x[0], 0);
+        let lent = u32::try_from(regs.x[1]).unwrap();
+        let write = |offset: u64, word: u32| {
+            let mut writer = Writer::new();
+            writer.write_u64(offset).write_u32(word);
+            let request = RequestBuilder::cmif(CommandType::Request, WRITE_LENT)
+                .copy_handle(lent)
+                .data(writer.as_bytes());
+            rig.send(session, &request)
+        };
+        // The last word of the page: written where the guest reads it.
+        let (result, _, data) = write(PAGE_SIZE - 4, 0x0A0B_0C0D);
+        assert_eq!(result, ResultCode::SUCCESS.raw());
+        let mut expected = Writer::new();
+        expected.write_u64(WORK).write_u64(PAGE_SIZE);
+        assert_eq!(data, expected.as_bytes());
+        let mut word = [0; 4];
+        rig.memory.read(WORK + PAGE_SIZE - 4, &mut word).unwrap();
+        assert_eq!(u32::from_le_bytes(word), 0x0A0B_0C0D);
+        // One byte further reaches the next page: refused, and that page is untouched.
+        let (result, _, _) = write(PAGE_SIZE - 3, 0xFFFF_FFFF);
+        assert_eq!(result, code(KernelError::InvalidCurrentMemory));
+        let mut next = [0xEE; 4];
+        rig.memory.read(WORK + PAGE_SIZE, &mut next).unwrap();
+        assert_eq!(next, [0; 4]);
     }
 }

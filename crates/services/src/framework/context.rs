@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use starquake_kernel::id::ObjectId;
 use starquake_kernel::ipc::EventHook;
-use starquake_kernel::memory::{DeviceShareToken, SharedPages, SvcPermission};
+use starquake_kernel::memory::{DeviceShareToken, SharedPages, SvcPermission, TransferMemory};
 use starquake_trace::Env;
 
 use super::defer::{Deferral, ReplyToken, TokenId};
@@ -133,6 +133,24 @@ impl Context<'_> {
     /// returned. See [`Kernel::unlock_device_share`].
     pub fn unlock_device_share(&mut self, token: DeviceShareToken) -> Result<(), Fault> {
         Ok(self.kernel.unlock_device_share(token)?)
+    }
+
+    /// The transfer memory `object` names, one of the request's copied handles resolved
+    /// ([`Request::copy_handle`](super::Request::copy_handle)). See
+    /// [`Kernel::transfer_memory`].
+    pub fn transfer_memory(&self, object: ObjectId) -> Result<TransferMemory, Fault> {
+        Ok(self.kernel.transfer_memory(object)?)
+    }
+
+    /// Copies `data` into the transfer memory `object` names, at `offset` from its start. See
+    /// [`Kernel::write_transfer_memory`].
+    pub fn write_transfer_memory(
+        &mut self,
+        object: ObjectId,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<(), Fault> {
+        Ok(self.kernel.write_transfer_memory(object, offset, data)?)
     }
 
     /// Copies `out.len()` bytes of the caller's memory at `address` into `out`.

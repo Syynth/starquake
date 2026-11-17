@@ -95,8 +95,10 @@ pub const fn is_transfer_memory_permission(permission: SvcPermission) -> bool {
 /// if the whole extent `offset..offset + len` lies inside `0..size` and the sum does not wrap.
 /// `None` otherwise, which each caller turns into its own error. The one bounds check behind
 /// [`SharedPages`]' accesses, an HLE server's reach into a transfer memory
-/// (`IpcContext::lent_range`) and the test mapper's guest view (`testing::SharedView`).
-pub(crate) fn span_within(base: u64, size: u64, offset: u64, len: usize) -> Option<u64> {
+/// (`IpcContext::lent_range`) and the test mapper's guest view (`testing::SharedView`); public
+/// so that the services framework's fake kernel bounds its transfer memories with the same check.
+#[must_use]
+pub fn span_within(base: u64, size: u64, offset: u64, len: usize) -> Option<u64> {
     let end = offset.checked_add(u64::try_from(len).ok()?)?;
     if end > size {
         return None;
