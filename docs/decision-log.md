@@ -375,6 +375,7 @@ Entry format:
 - **PROJECT:** starquake
 - **SYSTEM:** loader / core
 - **SCOPE:** minor/local
+- **STATUS:** superseded the same day by "M2 runs a title's newest package, whole"
 - **WHAT:** For M2, a NUP with several packages runs its base package and logs that updates are ignored. How an update combines with its base is ruled on when a title needs one.
 - **WHY:** The update rules (replace or overlay the ExeFS, which version wins, how packages relate by title id) need checking against the reference, and nothing on the M2 path needs an update.
 
@@ -385,3 +386,11 @@ Entry format:
 - **SCOPE:** minor/local
 - **WHAT:** The self-contained capture format (v2: creation calls and a serialisable shader description, replayable on a fresh backend) is designed in M3, with the first real backend slices, before R5.
 - **WHY:** It is not on the M2 path, and it depends on the shader description, which is not settled yet.
+
+## M2 runs a title's newest package, whole
+- **WHEN:** 2026-11-16
+- **PROJECT:** starquake
+- **SYSTEM:** loader / core
+- **SCOPE:** minor/local
+- **WHAT:** For M2, a NUP title runs its newest package: that package's ExeFS, and the file-system service serves that same package's RomFS. Base and update are never mixed. A NUP whose newest update is not complete (a patch needing the base) is an error in plain words until overlay rules are decided. Supersedes "M2 runs a title's base package only" (2026-11-16), which was ruled on the wrong premise that nothing chose a package yet.
+- **WHY:** `starquake run` already runs the newest update, and the owner's dump shows a NUP update carrying a complete ExeFS and RomFS, so running it whole needs no overlay rules and plays the newest version.
