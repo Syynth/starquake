@@ -561,6 +561,14 @@ fn each_part_of_the_destination_check_refuses_on_its_own() {
             "a destination a page past the stack memory",
             Box::new(move |b| b.aliases[1].address = page(stack, 3)),
         ),
+        // Read-write memory with no attribute that is not `Stack`: kernel memory may lie in
+        // the stack region, and passes the block checks there.
+        (
+            "a destination of kernel memory",
+            Box::new(move |b| {
+                change_block(b, destination, |d| d.state = MemoryState::Kernel.word());
+            }),
+        ),
     ];
     for (what, change) in cases {
         let mut case = body.clone();
@@ -598,6 +606,32 @@ fn a_source_may_touch_an_earlier_aliass_source_on_either_side_and_not_overlap_it
         alias(1, AliasFault::SourceTaken),
         "over the start of one above"
     );
+}
+
+#[test]
+fn the_order_comes_before_the_region_and_the_region_before_the_overlap() {
+    // Pairs of faults in one alias that the rich space's fault list cannot hold at once: each
+    // case has both, and the earlier check's error is the one reported.
+    let (body, ..) = side_by_side();
+    let space = body.regions.address_space;
+    let stack_region = body.regions.stack;
+    // A page below the stack region, inside the address space: below the first alias's end,
+    // and not a place for stack memory.
+    let below = stack_region.0 - PAGE_SIZE;
+    assert!(below >= space.0);
+    let mut case = body.clone();
+    case.aliases[1].address = below;
+    assert_eq!(error_of(&case), alias(1, AliasFault::Order));
+    // Across the stack region's end, with a source at the same place.
+    let across = stack_region.1 - PAGE_SIZE;
+    let mut case = body;
+    case.aliases[1].address = across;
+    case.aliases[1].source = across;
+    assert_eq!(error_of(&case), alias(1, AliasFault::Region));
+    // Each alone is its own error: the order alone as above, the overlap alone here.
+    case.aliases[1].address = stack_region.1 - 8 * PAGE_SIZE;
+    case.aliases[1].source = case.aliases[1].address + PAGE_SIZE;
+    assert_eq!(error_of(&case), alias(1, AliasFault::Overlap));
 }
 
 #[test]

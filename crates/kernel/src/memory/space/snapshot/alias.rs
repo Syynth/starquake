@@ -193,7 +193,8 @@ fn every_block(blocks: &[MemoryBlock], range: Region, check: &Check) -> bool {
 pub(super) fn uncovered(block: &MemoryBlock, aliases: &[SavedAlias]) -> Vec<(u64, u64)> {
     let start = block.address();
     let end = block.end().unwrap_or(u64::MAX);
-    // The aliases that end past the block's start, from the first of them.
+    // The aliases that end past the block's start, from the first of them. (Taking one that
+    // ends exactly at the start too would change nothing: it covers none of the block.)
     let first = aliases.partition_point(|alias| alias.end() <= start);
     let mut parts = Vec::new();
     let mut cursor = start;

@@ -178,8 +178,9 @@
 //!   memory lock and `MapMemory` refuses the other's `Locked` range. Of the operations on a
 //!   destination's blocks, `Stack` has neither `CanReprotect` nor `CanChangeAttribute`, and a
 //!   device-share lock is the one change, adding `DeviceShared`. Pinned by
-//!   `a_locked_source_cannot_be_device_share_locked_and_a_free_destination_neither` and
-//!   `map_memory_refuses_a_source_a_device_holds_on_any_of_its_pages`
+//!   `a_locked_source_cannot_be_device_share_locked_and_a_free_destination_neither`,
+//!   `map_memory_refuses_a_source_a_device_holds_on_any_of_its_pages` and
+//!   `a_transfer_memory_lend_and_an_alias_refuse_each_others_source_but_the_take_back_does_not`
 //!   (`memory/space/alias_tests.rs`).
 //!
 //! The generated test `a_space_built_by_random_operations_saves_and_restores_as_it_was` runs

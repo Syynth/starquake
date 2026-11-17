@@ -745,6 +745,32 @@ fn a_locked_source_cannot_be_device_share_locked_and_a_free_destination_neither(
 }
 
 #[test]
+fn a_transfer_memory_lend_and_an_alias_refuse_each_others_source_but_the_take_back_does_not() {
+    // The `snapshot` module docs, "Why each relation holds live", the aliases: the transfer
+    // memory lock and `MapMemory` each refuse the other's `Locked` range; the take-back
+    // expects `Locked` and does not test the permission, so it would take an alias's source,
+    // and the kernel calls it only on a range a transfer memory locked.
+    let mut rig = Rig::new();
+    let (src, dst) = (rig.src(0), rig.dst(0));
+    rig.space.map_memory(dst, src, PAGE_SIZE).unwrap();
+    assert_eq!(
+        rig.space
+            .lock_for_transfer_memory(src, PAGE_SIZE, SvcPermission::None),
+        invalid(KernelError::InvalidCurrentMemory)
+    );
+    let lent = rig.src(4);
+    rig.space
+        .lock_for_transfer_memory(lent, PAGE_SIZE, SvcPermission::None)
+        .unwrap();
+    assert_eq!(
+        rig.space.map_memory(rig.dst(4), lent, PAGE_SIZE),
+        invalid(KernelError::InvalidCurrentMemory)
+    );
+    assert_eq!(rig.space.unlock_for_transfer_memory(src, PAGE_SIZE), Ok(()));
+    assert_eq!(rig.block(src).attribute(), MemoryAttribute::NONE);
+}
+
+#[test]
 fn unmapping_part_of_an_alias_a_device_holds_on_another_page_is_taken() {
     // The destination check is of the range unmapped: a held page below it, ending where it
     // starts, does not refuse it, and stays held.
