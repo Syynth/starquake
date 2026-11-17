@@ -30,6 +30,7 @@ use super::command::file::{GET_SIZE, READ};
 use super::command::file_system::OPEN_FILE;
 use super::command::fsp_srv::{OPEN_SD_CARD_FILE_SYSTEM, SET_CURRENT_PROCESS};
 
+mod data_files;
 mod storage;
 mod worker;
 
@@ -88,6 +89,8 @@ impl Asked {
 /// file protocol.
 struct FakeHost {
     card: Option<BTreeMap<Vec<u8>, Entry>>,
+    /// The data file system's files (`data_files.rs`); `None`: the run has no `RomFS`.
+    files: Option<BTreeMap<Vec<u8>, Entry>>,
     /// The data storage (`storage.rs`); `None`: the run has no `RomFS`.
     storage: Option<Vec<u8>>,
     mischief: Mischief,
@@ -109,6 +112,7 @@ impl FakeEnv {
         });
         Arc::new(Self(Mutex::new(FakeHost {
             card,
+            files: None,
             storage: None,
             mischief: Mischief::None,
             forced: None,
@@ -130,7 +134,11 @@ impl FakeHost {
         if storage::is_storage(request) {
             return self.answer_storage(request);
         }
-        let Some(card) = &self.card else {
+        let folder = match request.mount() {
+            Mount::DataFileSystem => &self.files,
+            _ => &self.card,
+        };
+        let Some(card) = folder else {
             return HostFailure::NoDevice.reply();
         };
         match request {
@@ -1465,7 +1473,7 @@ const SNAPSHOT: &[u8] = &[
 #[test]
 fn an_open_file_s_snapshot_bytes_are_pinned() {
     let mount = Mount::SdCard;
-    // `FspSrv` holds nothing; `Mount` has one variant, so its index is 0.
+    // `FspSrv` holds nothing; `SdCard` is `Mount`'s first variant, so its index is 0.
     assert_eq!(FspSrv.save().unwrap(), []);
     assert_eq!(IFileSystem { mount }.save().unwrap(), [0]);
     let file = IFile {

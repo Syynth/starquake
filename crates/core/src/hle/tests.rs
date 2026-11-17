@@ -35,6 +35,7 @@ use starquake_trace::{EventKind, FixedClock, GuestTicks, LiveEnv, Recorder, Thre
 
 use super::*;
 
+mod data_file_system;
 mod data_storage;
 
 /// Where the process's memory is: four pages the guest may read and write.
