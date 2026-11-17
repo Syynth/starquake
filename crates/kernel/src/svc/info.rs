@@ -68,7 +68,7 @@ use crate::memory::AddressSpace;
 use crate::object::Object;
 use crate::process::ENTROPY_COUNT;
 use crate::result::{CallResult, KernelError, SvcError};
-use crate::tables::Scheduler;
+use crate::tables::{Processes, Scheduler};
 
 /// Defines [`InfoType`] from `Name = number;` rows, so an id and its number are written once.
 macro_rules! info_types {
@@ -178,18 +178,20 @@ impl InfoType {
     }
 }
 
-/// Whether `handle` names a process (Eden's `GetObject<KProcess>`): the current-process
-/// pseudo-handle, or a handle to a process object. [`KernelError::InvalidHandle`] otherwise.
+/// The process `handle` names (Eden's `GetObject<KProcess>`): the calling process
+/// ([`Processes::own`]) for the current-process pseudo-handle, or the process a handle to a
+/// process object names. [`KernelError::InvalidHandle`] for any other handle.
 fn process_from_handle(
     handles: &HandleTable,
     scheduler: &Scheduler,
+    processes: &Processes,
     handle: Handle,
-) -> CallResult<()> {
+) -> CallResult<ProcessId> {
     match handles.resolve(handle)? {
-        Resolved::CurrentProcess => Ok(()),
+        Resolved::CurrentProcess => Ok(processes.own()),
         Resolved::CurrentThread => Err(KernelError::InvalidHandle.into()),
         Resolved::Object(object) => match scheduler.objects().get(object)? {
-            Object::Process(_) => Ok(()),
+            Object::Process(process) => Ok(process),
             Object::Thread(_)
             | Object::Session
             | Object::Event(_)
@@ -200,15 +202,15 @@ fn process_from_handle(
     }
 }
 
-/// Answers `GetInfo(info_type, handle, info_sub_id)` for the calling process, `process`, whose
-/// handle table is `handles` and whose address space is `space`. `info_type` is the raw value
-/// the guest passed. Each group of ids checks what Eden checks, in its order (see the module
-/// docs).
+/// Answers `GetInfo(info_type, handle, info_sub_id)` for the calling process
+/// ([`Processes::own`] of `processes`), whose handle table is `handles` and whose address space
+/// is `space`. `info_type` is the raw value the guest passed. Each group of ids checks what
+/// Eden checks, in its order (see the module docs).
 pub fn get_info(
     handles: &HandleTable,
     space: &AddressSpace,
     scheduler: &Scheduler,
-    process: ProcessId,
+    processes: &Processes,
     info_type: u32,
     handle: Handle,
     info_sub_id: u64,
@@ -217,8 +219,10 @@ pub fn get_info(
     match id {
         // `case InfoType::DebuggerAttached: *result = 0; R_SUCCEED();`
         InfoType::DebuggerAttached => Ok(0),
-        InfoType::RandomEntropy => random_entropy(scheduler, process, handle, info_sub_id),
-        _ => memory_info(handles, space, scheduler, id, handle, info_sub_id),
+        InfoType::RandomEntropy => {
+            random_entropy(scheduler, processes.own(), handle, info_sub_id)
+        }
+        _ => memory_info(handles, space, scheduler, processes, id, handle, info_sub_id),
     }
 }
 
@@ -254,6 +258,7 @@ fn memory_info(
     handles: &HandleTable,
     space: &AddressSpace,
     scheduler: &Scheduler,
+    processes: &Processes,
     id: InfoType,
     handle: Handle,
     info_sub_id: u64,
@@ -266,7 +271,7 @@ fn memory_info(
     if info_sub_id != 0 {
         return Err(KernelError::InvalidEnumValue.into());
     }
-    process_from_handle(handles, scheduler, handle)?;
+    process_from_handle(handles, scheduler, processes, handle)?;
     Ok(value)
 }
 

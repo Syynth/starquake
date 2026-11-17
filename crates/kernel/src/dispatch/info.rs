@@ -9,7 +9,7 @@ use crate::id::ProcessId;
 use crate::process::ENTROPY_COUNT;
 use crate::svc::info::{self, InfoType};
 use crate::svc::{Convention, SvcId};
-use crate::tables::{AddressSpace, Scheduler};
+use crate::tables::{AddressSpace, Processes, Scheduler};
 
 impl Dispatcher {
     /// `GetInfo`'s arm, for the calling process ([`crate::tables::Processes::own`]).
@@ -24,7 +24,7 @@ impl Dispatcher {
             |(handles, space, scheduler), call, _, processes| {
                 get_info(
                     (handles, space, scheduler),
-                    processes.own(),
+                    processes,
                     id,
                     convention,
                     call,
@@ -34,17 +34,17 @@ impl Dispatcher {
     }
 }
 
-/// `GetInfo`'s arm for the calling process, `process`. A `RandomEntropy` call first draws the
-/// process's entropy if it has none ([`draw_entropy`]); then the call runs with the scheduler
-/// shared.
+/// `GetInfo`'s arm for the calling process ([`Processes::own`]). A `RandomEntropy` call first
+/// draws the process's entropy if it has none ([`draw_entropy`]); then the call runs with the
+/// scheduler shared.
 fn get_info(
     (handles, space, scheduler): (&HandleTable, &AddressSpace, &mut Scheduler),
-    process: ProcessId,
+    processes: &Processes,
     id: SvcId,
     convention: &Convention,
     call: &mut Call<'_, '_>,
 ) -> Outcome {
-    if let Err(outcome) = draw_entropy(scheduler, process, id, convention, call) {
+    if let Err(outcome) = draw_entropy(scheduler, processes.own(), id, convention, call) {
         return outcome;
     }
     let scheduler = &*scheduler;
@@ -52,7 +52,7 @@ fn get_info(
         let handle = Handle::from_register(handle);
         let info_type = word(info_type)?;
         Ok([info::get_info(
-            handles, space, scheduler, process, info_type, handle, sub_id,
+            handles, space, scheduler, processes, info_type, handle, sub_id,
         )?])
     })
 }
