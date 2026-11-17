@@ -277,7 +277,10 @@ impl Interfaces {
 /// [`Context::family`](super::Context::family).
 ///
 /// Implemented for every type that is `serde` data, so a family's state is saved once in its
-/// server's snapshot and loaded back in place; nothing implements it by hand.
+/// server's snapshot and loaded back in place. A family that holds the run's wiring rather than
+/// guest state (a handle to state the server shares with other threads, which `serde` could not
+/// make from bytes) implements it by hand, saving nothing of the handle and keeping it on load:
+/// `starquake_gsv::syncpt::SyncptFamily` is the one that does.
 pub trait Family: Any + Send {
     /// The state as bytes, for a snapshot.
     fn save_state(&self) -> Result<Vec<u8>, SnapshotError>;
