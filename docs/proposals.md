@@ -289,6 +289,28 @@ Filed from this wave under the delegation:
 | awaiting the owner | **Which ctrl-gpu characteristics levels the SDK reads** | Review of #188. Three sources conflict: row 24 says every level at 0x70..0x80 is at least 6; PR has -1 at +0x74 and zeros from +0x7A; PR's channel level is 0x1D, but NX2's feature threshold is 0x1f. The module docs list all three | gsv |
 | proposed | **Move `Dispatcher::transfer_memory` next to `IpcContext::transfer_memory` in `dispatch/ipc.rs`** | #183 put it in `dispatch/hooks.rs` to stay inside its own files | area:kernel |
 
+### From wave 25 (ledger: #22)
+
+Filed from this wave under the delegation:
+- #268: `ICommonStateGetter` `ReceiveMessage` and the applet's message queue. The title now gets past `MapMemory` and starts its second thread. It then calls `ReceiveMessage` over and over, because the command is auto-stubbed with success and its event stays signalled, until the timeout.
+- #269: snapshot and restore of `MapMemory` aliases. Today a process with an alias can't be saved, and libnx maps thread stacks this way. The issue also covers how aliases and device-share locks interact.
+- #270: one service-framework path for `Env` failures, applied to `time:u` and every service.
+- #271: address-space restore checks attributes against state flags (the owner's ruling of 2026-11-17).
+
+Notes for #189 (a bound channel holds its address space) and #207 (name the interface of a stubbed command in the run summary) are comments on those issues.
+
+| Status | Proposal | Why | Suggested |
+|---|---|---|---|
+| awaiting the owner | **A `GpuFront` call that forgets an address space**, a spec amendment (for example `destroy_address_space`, ordered after the removals) | Scope review of #259. gsv now destroys a space on its last close, but the spec's GPU front has no call that forgets one. It keeps an empty table per destroyed id, and ids are never reused, so a looping title grows it without bound | graphics-server spec |
+| awaiting the owner | **Two `MapMemory` checks where starquake follows Horizon, not Eden** | Review of #257. An unaligned source answers `InvalidAddress` where Eden answers `InvalidSize`. The stack-region check (`InvalidMemoryRegion`) is one Eden lacks. Both are pinned by named tests | kernel |
+| awaiting the owner | **Whether reading the RomFS tables on the core thread fits services.md's "short host metadata lookups" exception** | Review of #251. The first `OpenDataFileSystemByCurrentProcess` reads the whole table set with the live environment's lock held | services |
+| awaiting the owner | **Whether emulator-bug host answers stop the run**: `HostFailure::BadRequest`, unnamed host failure codes and malformed size answers, which answer `HOST_IO_FAILED` today | Review of #251. Extends the wave 23 question on the unreadable-data-storage result code | services |
+| proposed | **Run rustdoc with warnings denied in the gate**, and fix the warnings already there (redundant or unresolved links in the services framework and fsp) | Scope review of #251. The gate doesn't run rustdoc today | area:xtask |
+| proposed | **Check the restored message event's id against the kernel without changing it** | Review of #258. `GetEventHandle` copies a restored message-event id unchecked: the kernel's only event checks (clear and signal) change what the guest sees. This needs a restore step that can see the kernel | area:services |
+| proposed | **`IApplicationFunctions::InitializeGamePlayRecording` (66)** | Review of #258. libnx sends it before setting the recording state; no title has needed it yet | area:services |
+| proposed | **Back a `MapMemory` alias lazily** | Review of #257. core's `map_alias` backs the whole source up front; the execution model's backing pools should make it lazy | area:core |
+| proposed | **Share one copy of the RomFS tables between fsp-srv's environments** (behind an `Arc`) | Review of #251. Each of the three environments keeps its own copy | area:services |
+
 ## House-rule candidates
 
 Rules distilled from review findings. A vetted rule moves into `CLAUDE.md`; until then it is
@@ -418,3 +440,16 @@ passed to build agents as a provisional rule for the next wave.
 | proposed | Every fallible step runs before the first write to guest memory or shared state. The failure test asserts nothing was touched and that the next attempt succeeds. |
 | proposed | A record, note or event the spec defines is emitted on every path that triggers it, including the case with no values, and a test expects it there. |
 | proposed | Every id read from a snapshot is checked against what the kernel actually made, including its kind and size, or listed as "not checked here". |
+
+### From wave 25 (ledger: #22)
+
+| Status | Candidate |
+|---|---|
+| proposed | Every documented check and claim gets its own mutation (operand, mask, walk order, width, initial value); a surviving mutation gets a new test or is listed as equivalent or unreachable. |
+| proposed | A boundary check is pinned by two cases that differ only at the edge, chosen so that the accepted side reaches the next check and both give different, exact outcomes. |
+| proposed | Every constructor default is asserted directly on a fresh object, citing the reference default. |
+| proposed | A first-fault walk order is tested with two or more faulty items, so a reversed walk fails. |
+| proposed | A claim that two behaviours agree with the reference, or that a state is unreachable, traces the reference's other callers first, and names the exact exception. |
+| proposed | Restore tests accept the real state that live operations leave, not only the refusal cases. |
+| proposed | A doc claim of an error set, "logged once" or "same in replay" names the exact paths, with a test that fails if one is dropped. |
+| proposed | A restored id or mount the current run may not support is validated against the live run, or its answer is a listed divergence pinned by a test. |
