@@ -1760,6 +1760,35 @@ fn set_gpu_memory_attribute_decodes_x0_to_x3_and_writes_the_result() {
 }
 
 #[test]
+fn set_gpu_memory_attribute_clears_the_attribute_with_the_mask_set_and_the_attribute_zero() {
+    // The SDK's destroy path: mask = GPU, attribute = 0. A swap of x2 and x3 in the decode would
+    // pass attribute = GPU with mask = 0, which the call refuses as an invalid combination.
+    let dispatcher = Dispatcher::new(tables());
+    let id = SvcId::SetGpuMemoryAttribute;
+    let gpu = u64::from(MemoryAttribute::GPU_ACCESSIBLE.svc());
+    let page = starquake_memory::PAGE_SIZE;
+    let mut set = regs();
+    set.x[..4].copy_from_slice(&[DATA, page, gpu, gpu]);
+    let (record, _) = dispatch_on(&dispatcher, id.number(), &mut set, 0);
+    assert_eq!(record.outcome, Outcome::Completed);
+    assert_eq!(set.x[0], 0);
+    dispatcher.with::<(&AddressSpace,), _>(|(space,)| {
+        assert!(space.is_gpu_accessible(DATA, page));
+    });
+    let mut clear = regs();
+    clear.x[..4].copy_from_slice(&[DATA, page, gpu, 0]);
+    let before = clear.clone();
+    let (record, _) = dispatch_on(&dispatcher, id.number(), &mut clear, 0);
+    assert_eq!(record.outcome, Outcome::Completed);
+    assert_eq!(clear.x[0], 0);
+    assert_untouched_from(&clear, &before, 1);
+    dispatcher.with::<(&AddressSpace,), _>(|(space,)| {
+        assert_eq!(space.query_info(DATA).unwrap().svc_info().attribute, 0);
+        assert!(!space.is_gpu_accessible(DATA, page));
+    });
+}
+
+#[test]
 fn set_gpu_memory_attribute_is_not_implemented_for_a_process_built_for_switch_1() {
     // PR #4588's `UsesPAuthReturns` check: the call's own result, not the dispatcher's "not
     // implemented" path (the call is implemented, and its event says so).

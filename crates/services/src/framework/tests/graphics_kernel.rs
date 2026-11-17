@@ -273,6 +273,20 @@ fn the_fake_refuses_a_lock_past_the_largest_count() {
     assert_eq!(kernel.device_locks(MEMORY, 0x1000), u16::MAX);
 }
 
+#[test]
+fn the_fake_refuses_to_lock_an_empty_range() {
+    // As the real kernel does: an empty range at mapped memory is not a range it can lock.
+    let mut kernel = kernel();
+    assert_eq!(
+        kernel.lock_device_share(MEMORY, 0),
+        Err(KernelError::InvalidCurrentMemory)
+    );
+    assert_eq!(kernel.device_locks(MEMORY, 0), 0);
+    // The same address with a size is lockable: the refusal is the size's.
+    assert_eq!(kernel.lock_device_share(MEMORY, 0x1000), Ok(()));
+    assert_eq!(kernel.device_locks(MEMORY, 0x1000), 1);
+}
+
 /// A kernel that offers only what every kernel must: the graphics server's calls take their
 /// defaults.
 struct Bare(FakeKernel);
