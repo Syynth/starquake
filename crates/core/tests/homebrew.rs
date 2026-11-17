@@ -96,7 +96,7 @@ mod trace {
     use std::collections::BTreeMap;
     use std::fmt::Write as _;
 
-    use starquake_core::hle::{APM, APPLET_OE, FSP_SRV, SET_SYS, SM, service_name};
+    use starquake_core::hle::{APM, APPLET_OE, FSP_SRV, HID, SET_SYS, SM, TIME_U, service_name};
     use starquake_kernel::handle::Handle;
     use starquake_kernel::memory::MemoryArrangement;
     use starquake_kernel::memory::layout::{LayoutRequest, Region, RegionOffsets, Regions};
@@ -112,8 +112,10 @@ mod trace {
     use starquake_services::framework::control::{CONTROL_COMMANDS, CONTROL_INTERFACE};
     use starquake_services::framework::{Protocol, Session};
     use starquake_services::fsp::{FspSrv, IFile, IFileSystem};
+    use starquake_services::hid::{IAppletResource, IHidServer};
     use starquake_services::set::SetSys;
     use starquake_services::sm::Sm;
+    use starquake_services::time::{IStaticService, ISteadyClock, ISystemClock, ITimeZoneService};
     use starquake_trace::{EventKind, SVC_ARG_COUNT, ServiceId};
 
     /// A homebrew fixture and the reference emulator's run of it, normalised.
@@ -145,7 +147,7 @@ mod trace {
     /// How many lines of the startup fixture's reference a run in starquake matches, at least:
     /// the ratchet (see the module docs). Raise it when a change makes the run match more; the
     /// on-hardware test prints the new count when it does.
-    const STARTUP_MATCHED: usize = 85;
+    const STARTUP_MATCHED: usize = 89;
 
     /// The arguments that are addresses, for each call the fixtures make: the same list as
     /// `ADDRESSES` in `tools/oracle/normalise.py`. A call that is not listed is refused, so no
@@ -500,7 +502,7 @@ mod trace {
     }
 
     /// The services whose command tables starquake has, in the order of their numbers.
-    const SERVICES: [ServiceId; 5] = [SM, SET_SYS, FSP_SRV, APM, APPLET_OE];
+    const SERVICES: [ServiceId; 7] = [SM, SET_SYS, FSP_SRV, APM, APPLET_OE, HID, TIME_U];
 
     /// The interface whose command table names a service's commands.
     fn interface(service: ServiceId) -> Option<Box<dyn Session>> {
@@ -510,6 +512,8 @@ mod trace {
             FSP_SRV => Some(Box::new(FspSrv)),
             APM => Some(Box::new(Apm)),
             APPLET_OE => Some(Box::new(IApplicationProxyService)),
+            HID => Some(Box::new(IHidServer)),
+            TIME_U => Some(Box::new(IStaticService)),
             _ => None,
         }
     }
@@ -529,6 +533,12 @@ mod trace {
                 Box::new(IDisplayController),
                 Box::new(ILibraryAppletCreator),
                 Box::new(IDebugFunctions),
+            ],
+            HID => vec![Box::new(IAppletResource::default())],
+            TIME_U => vec![
+                Box::new(ISystemClock::default()),
+                Box::new(ISteadyClock),
+                Box::new(ITimeZoneService),
             ],
             _ => Vec::new(),
         }
@@ -2189,7 +2199,7 @@ mod trace {
             svc 0x29 GetInfo(info_type=0xb, handle=0x0, info_subtype=0x0) -> 0x0 out=random\n\
             ipc IpcController::3 (QueryPointerBufferSize)\n\
             svc 0x21 SendSyncRequest(session_handle=0x203fd) -> 0x0\n\
-            ipc hid::0 (CreateAppletResource)\n\
+            ipc vi:m::2 (GetDisplayService)\n\
             svc 0x21 SendSyncRequest(session_handle=0x203fd) -> 0x0\n\
             ipc sm:::1 (GetService)\n\
             svc 0x21 SendSyncRequest(session_handle=0x103fe) -> 0x0\n\
@@ -2197,7 +2207,7 @@ mod trace {
             svc 0x2c MapPhysicalMemory(address=alias_region+0x1000, size=0x200000) -> 0xd401\n\
             svc 0x21 SendSyncRequest(session_handle=0x183fd) -> 0xf601\n\
             svc 0x2c MapPhysicalMemory(address=alias_region+0x1000, size=0x200000) -> 0x0\n\
-            ipc hid::0 (CreateAppletResource)\n\
+            ipc vi:m::2 (GetDisplayService)\n\
             svc 0x21 SendSyncRequest(session_handle=0x203fd) -> 0x0\n\
             ipc IpcController::7 (Unheard)\n\
             ipc nvdrv::3 (Initialize)\n";
@@ -2224,7 +2234,7 @@ mod trace {
                 [
                     // An implemented call (GetInfo), a control command the framework answers
                     // and a command `sm:` has are not gaps.
-                    gap(5, "ipc hid::0 (CreateAppletResource)", "0x0"),
+                    gap(5, "ipc vi:m::2 (GetDisplayService)", "0x0"),
                     // A command id a service has under another name is one; a request's result
                     // is its `SendSyncRequest`'s, past the calls in between.
                     gap(9, "ipc set:sys::3 (GetSettingsItemValue)", "0xf601"),
@@ -2253,10 +2263,18 @@ mod trace {
             assert!(!implements_request("sm:", 1, "Initialize"));
             assert!(implements_request("set:sys", 3, "GetFirmwareVersion"));
             assert!(implements_request("apm", 0, "OpenSession"));
-            assert!(!implements_request("hid", 0, "CreateAppletResource"));
+            assert!(implements_request("hid", 0, "CreateAppletResource"));
+            assert!(implements_request(
+                "time:u",
+                20,
+                "GetSharedMemoryNativeHandle"
+            ));
+            assert!(!implements_request("vi:m", 2, "GetDisplayService"));
             assert_eq!(service_id("set:sys"), Some(SET_SYS));
             assert_eq!(service_id("apm"), Some(APM));
-            assert_eq!(service_id("hid"), None);
+            assert_eq!(service_id("hid"), Some(HID));
+            assert_eq!(service_id("time:u"), Some(TIME_U));
+            assert_eq!(service_id("vi:m"), None);
             // A sub-interface's command is its own table's, under its own name; the name of the
             // service that hands it out is not a sub-interface's.
             assert!(implements_request(
@@ -2280,10 +2298,20 @@ mod trace {
                 20,
                 "GetApplicationFunctions"
             ));
-            assert!(!implements_request(
+            assert!(implements_request(
                 "IAppletResource",
                 0,
                 "GetSharedMemoryHandle"
+            ));
+            assert!(implements_request(
+                "ITimeZoneService",
+                101,
+                "ToCalendarTimeWithMyRule"
+            ));
+            assert!(!implements_request(
+                "ITimeZoneService",
+                100,
+                "ToCalendarTime"
             ));
             assert_eq!(service_id("IApplicationProxy"), None);
         }
@@ -2294,7 +2322,7 @@ mod trace {
                 gap_table(&made_up()[..2]),
                 "| Line | Call or request | Reference's result |\n\
                  |---:|---|---|\n\
-                 | 5 | `ipc hid::0 (CreateAppletResource)` | `0x0` |\n\
+                 | 5 | `ipc vi:m::2 (GetDisplayService)` | `0x0` |\n\
                  | 9 | `ipc set:sys::3 (GetSettingsItemValue)` | `0xf601` |\n"
             );
             let readme = format!("before\n{GAPS_BEGIN}\nthe block\n{GAPS_END}\nafter\n");

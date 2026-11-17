@@ -53,17 +53,23 @@ each, in the order of first use. "Line" is the line of `startup.trace`, counting
 lines from 1. A call is listed when its status in `starquake_kernel::svc::SvcId` is not
 `Implemented`; a request when it is not a control command the service framework answers
 (`IpcController`) and not a command of a service starquake has (`sm:`, `set:sys`, `fsp-srv`,
-`apm`, `appletOE`), or of a sub-interface one of them hands out, under the same name. The result
+`apm`, `appletOE`, `hid`, `time:u`), or of a sub-interface one of them hands out, under the same
+name. The result
 is the reference's: a call's own result, or for a request the result of the `SendSyncRequest`
 that carried it (the trace does not record a reply's own result code). Requests to a
 sub-interface (`IApplicationProxy`, `ISelfController`, ...) are named by the interface, as the
 reference logs them.
 
 The list is of what starquake's tables lack, not of where its run stops. The run first differs
-earlier, at line 91, the reference's first request to `hid` (`QueryPointerBufferSize`, a control
-request). starquake has no `hid`: `sm:`'s `GetService` at line 89 hands the run a stub session of
-the `sm:` server instead (`UnknownPolicy::AutoStub`, the policy `crates/core/src/hle.rs` sets),
-so the run's request at line 91 goes to `sm:`.
+earlier, at line 95, the reference's `GetSharedMemoryHandle`. `hid`'s `CreateAppletResource` at
+line 93 makes the applet's input shared memory, and in a run the kernel cannot make one yet:
+starquake's guest address space has no backing to share (`SpaceMapper` in
+`crates/core/src/space.rs` keeps the kernel's default `Mapper::allocate_shared`, which refuses;
+`docs/architecture.md` lists it as provisional). So the request is answered with the kernel's
+`InvalidState` (`0xfa01`), libnx closes its `hid` session and aborts, and the run's next request
+is that close where the reference sends `GetSharedMemoryHandle`. `time:u` makes its shared
+memory the same way, at line 117, and will stop there for the same reason once the run gets that
+far.
 
 `crates/core/tests/homebrew.rs` writes this list from the trace and starquake's tables, and
 fails (`the_startup_gap_list_in_its_readme_is_the_one_the_trace_gives`) when the text between
@@ -72,15 +78,6 @@ the two markers below differs; its failure message holds the text to put there.
 <!-- gap list: written by crates/core/tests/homebrew.rs -->
 | Line | Call or request | Reference's result |
 |---:|---|---|
-| 93 | `ipc hid::0 (CreateAppletResource)` | `0x0` |
-| 95 | `ipc IAppletResource::0 (GetSharedMemoryHandle)` | `0x0` |
-| 107 | `ipc time:u::0 (GetStandardUserSystemClock)` | `0x0` |
-| 109 | `ipc time:u::1 (GetStandardNetworkSystemClock)` | `0x0` |
-| 111 | `ipc time:u::2 (GetStandardSteadyClock)` | `0x0` |
-| 113 | `ipc time:u::3 (GetTimeZoneService)` | `0x0` |
-| 115 | `ipc time:u::4 (GetStandardLocalSystemClock)` | `0x0` |
-| 117 | `ipc time:u::20 (GetSharedMemoryNativeHandle)` | `0x0` |
-| 121 | `ipc ITimeZoneService::101 (ToCalendarTimeWithMyRule)` | `0x0` |
 | 141 | `ipc vi:m::2 (GetDisplayService)` | `0x0` |
 | 143 | `ipc IApplicationDisplayService::100 (GetRelayService)` | `0x0` |
 | 145 | `ipc IApplicationDisplayService::101 (GetSystemDisplayService)` | `0x0` |
