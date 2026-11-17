@@ -17,13 +17,15 @@ use crate::commands;
 /// `MAKE`: makes and signals an event, which the session keeps; out a copy handle to it. `CLEAR`: clears it. `CLEAR_FOREIGN`:
 /// clears an id the kernel made that is no event of this server's. `END`: asks to end the
 /// process. `DEFER_THEN_END`: takes a reply token, then asks; out `u32` the ask's result.
-/// `END_THEN_DEFER`: asks, then takes a reply token.
+/// `END_THEN_DEFER`: asks, then takes a reply token. `REFUSED_END_THEN_DEFER`: asks, checks
+/// that the kernel refused with "not implemented", then takes a reply token.
 const MAKE: u32 = 0;
 const CLEAR: u32 = 1;
 const CLEAR_FOREIGN: u32 = 2;
 const END: u32 = 3;
 const DEFER_THEN_END: u32 = 4;
 const END_THEN_DEFER: u32 = 5;
+const REFUSED_END_THEN_DEFER: u32 = 6;
 
 /// A session's worth of the two calls.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -40,6 +42,7 @@ commands! {
         END => end,
         DEFER_THEN_END => defer_then_end,
         END_THEN_DEFER => end_then_defer,
+        REFUSED_END_THEN_DEFER => refused_end_then_defer,
     }
 }
 
@@ -102,6 +105,21 @@ impl Ender {
         reply: &mut Reply,
     ) -> Outcome {
         cx.end_process()?;
+        let token = cx.defer()?;
+        PARKED.with_borrow_mut(|parked| parked.push(token));
+        reply.deferred()
+    }
+
+    fn refused_end_then_defer(
+        _: &mut Self,
+        cx: &mut Context<'_>,
+        _: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        assert_eq!(
+            cx.end_process(),
+            Err(Fault::from(KernelError::NotImplemented))
+        );
         let token = cx.defer()?;
         PARKED.with_borrow_mut(|parked| parked.push(token));
         reply.deferred()
@@ -269,5 +287,22 @@ fn a_kernel_that_does_not_offer_the_calls_answers_not_implemented() {
     );
     assert_eq!(send(&mut server, &mut bare, session, CLEAR), refused);
     assert_eq!(send(&mut server, &mut bare, session, END), refused);
+    assert_eq!(bare.0.ends(), 0);
+}
+
+#[test]
+fn an_end_the_kernel_refused_leaves_the_reply_free_to_be_deferred() {
+    let (kernel, mut server, session) = rig();
+    let mut bare = Bare(kernel);
+    let request = request(REFUSED_END_THEN_DEFER);
+    let mut buffer = built(&request);
+    let handled = server.handle(&mut bare, session, &mut buffer).unwrap();
+    assert!(
+        matches!(handled, super::super::Handled::Deferred(_)),
+        "{handled:?}"
+    );
+    // Nothing was written: the reply waits for its token.
+    assert_eq!(buffer, built(&request));
+    assert_eq!(super::parked().len(), 1);
     assert_eq!(bare.0.ends(), 0);
 }
