@@ -4,7 +4,8 @@
 //!
 //! The walker's rule is Atmosphère's (`stratosphere/dmnt.gen2/source/dmnt2_debug_process.cpp`,
 //! `DebugProcess::CollectModules` @ 4e3f3703, fact only): start at address 0, take every block
-//! whose state is `Code` and whose permission is read-execute for a module, move to the end of
+//! whose state is `Code` or `AliasCode` and whose permission is read-execute for a module, move
+//! to the end of
 //! each block, and stop at the inaccessible block above the address space. A module walker
 //! then reads the word at the module's offset 4 as the offset of its `MOD0` header; this one
 //! does too, and checks that the header is the program's own. That a title's `rtld` walks with
@@ -35,17 +36,24 @@ mod walk {
 
     /// `XZR` as an operand of `sub`, and `SP` as the base of `add` (`a64` module docs).
     const ZR_OR_SP: u8 = a64::MAX_REG;
-    /// Where in the program the walker stops when something is wrong, each at its own `brk`.
+    /// A 32-bit field is read as the top half of a 64-bit load from one field before it.
+    const HALF: u32 = u32::BITS / u8::BITS;
+    /// The size of a 64-bit load.
+    const WORD: usize = size_of::<u64>();
+    /// The stack pointer stays 16-byte aligned (the architecture's rule for `sp`).
+    const SP_ALIGN: u32 = 16;
+    /// Where in the program the walker stops when something is wrong, each at its own `brk`,
+    /// numbered from 1 in this order.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Failure {
         /// `QueryMemory` returned an error.
-        QueryFailed = 1,
+        QueryFailed,
         /// A block the walker takes for a module is not the program's own module.
-        ExtraModule = 2,
+        ExtraModule,
         /// The program's own module's `MOD0` is not where its offset 4 says.
-        NoMod0 = 3,
+        NoMod0,
         /// The walk found other than exactly one module.
-        WrongCount = 4,
+        WrongCount,
     }
 
     /// The walker program, and the image offset of each failure's `brk`.
@@ -74,12 +82,14 @@ mod walk {
 
     /// The image offset of the instruction at index `word`.
     fn code_offset(word: usize) -> u64 {
-        u64::try_from(CODE_OFFSET + word * a64::INSN_SIZE as usize).unwrap()
+        let insn = usize::try_from(a64::INSN_SIZE).unwrap();
+        u64::try_from(CODE_OFFSET + word * insn).unwrap()
     }
 
     /// Loads the 64-bit `value` into `rd` with `movz` and three `movk`s.
     fn load_constant(asm: &mut Assembler, rd: u8, value: u64) {
-        let half = |shift: u32| u32::try_from((value >> shift) & 0xFFFF).unwrap();
+        let half =
+            |shift: u32| u32::try_from((value >> shift) & u64::from(a64::MAX_IMM16)).unwrap();
         asm.emit(a64::movz(rd, half(0), 0).unwrap());
         for shift in [16, 32, 48] {
             asm.emit(a64::movk(rd, half(shift), shift).unwrap());
@@ -111,8 +121,10 @@ mod walk {
     ///       sub  x11, x10, #Inaccessible
     ///       cbz  x11, done
     ///       sub  x11, x10, #Code
+    ///       cbz  x11, code
+    ///       sub  x11, x10, #AliasCode
     ///       cbnz x11, loop
-    ///       ldr  x10, [x21, #permission]
+    /// code: ldr  x10, [x21, #permission]
     ///       lsr  x10, x10, #32             ; the permission
     ///       sub  x11, x10, #ReadExecute
     ///       cbnz x11, loop
@@ -139,18 +151,17 @@ mod walk {
         let state_at = field_offset(|info| info.state = 1);
         let permission_at = field_offset(|info| info.permission = 1);
         let info_size = u32::try_from(SvcMemoryInfo::SIZE).unwrap();
-        // The 32-bit fields are read as the top half of a 64-bit load from 4 bytes before.
-        const HALF: u32 = 4;
         let svc = |id: SvcId| u32::from(id.number());
 
         // The MOD0 the program's file holds, whose first 8 bytes the walker compares.
-        let file_mod0 =
-            |nro: &[u8]| u64::from_le_bytes(nro[MOD0_OFFSET..MOD0_OFFSET + 8].try_into().unwrap());
+        let file_mod0 = |nro: &[u8]| {
+            u64::from_le_bytes(nro[MOD0_OFFSET..MOD0_OFFSET + WORD].try_into().unwrap())
+        };
         // The file does not depend on the constant the program compares with, only on how
         // many instructions there are, so the constant is read from a first build.
         let build = |mod0: u64| {
             let mut asm = Assembler::new();
-            let (top, done) = (asm.label(), asm.label());
+            let (top, done, code) = (asm.label(), asm.label(), asm.label());
             let failures = [
                 Failure::QueryFailed,
                 Failure::ExtraModule,
@@ -164,7 +175,7 @@ mod walk {
             asm.emit(a64::adr(20, -here).unwrap());
             asm.emit(a64::mrs(9, SysReg::CntPctEl0).unwrap());
             asm.emit(a64::add_imm(19, ZR_OR_SP, 0).unwrap());
-            asm.emit(a64::sub_imm(19, 19, info_size.next_multiple_of(16)).unwrap());
+            asm.emit(a64::sub_imm(19, 19, info_size.next_multiple_of(SP_ALIGN)).unwrap());
             asm.emit(a64::sub_imm(21, 19, HALF).unwrap());
             asm.emit(a64::movz(22, 0, 0).unwrap());
             asm.emit(a64::movz(23, 0, 0).unwrap());
@@ -178,13 +189,16 @@ mod walk {
             asm.emit(a64::sub(14, ZR_OR_SP, 13).unwrap());
             asm.emit(a64::sub(22, 12, 14).unwrap());
             asm.emit(a64::ldr(10, 21, state_at).unwrap());
-            asm.emit(a64::lsr_imm(10, 10, 32).unwrap());
+            asm.emit(a64::lsr_imm(10, 10, u32::BITS).unwrap());
             asm.emit(a64::sub_imm(11, 10, MemoryState::Inaccessible.svc()).unwrap());
             asm.cbz(11, done).unwrap();
             asm.emit(a64::sub_imm(11, 10, MemoryState::Code.svc()).unwrap());
+            asm.cbz(11, code).unwrap();
+            asm.emit(a64::sub_imm(11, 10, MemoryState::AliasCode.svc()).unwrap());
             asm.cbnz(11, top).unwrap();
+            asm.bind(code).unwrap();
             asm.emit(a64::ldr(10, 21, permission_at).unwrap());
-            asm.emit(a64::lsr_imm(10, 10, 32).unwrap());
+            asm.emit(a64::lsr_imm(10, 10, u32::BITS).unwrap());
             let read_execute = u32::from(SvcPermission::ReadExecute.bits());
             asm.emit(a64::sub_imm(11, 10, read_execute).unwrap());
             asm.cbnz(11, top).unwrap();
@@ -194,7 +208,7 @@ mod walk {
             // The pointer is the top half of the module's first 8 bytes.
             assert_eq!(pointer_at, HALF);
             asm.emit(a64::ldr(10, 12, 0).unwrap());
-            asm.emit(a64::lsr_imm(10, 10, 32).unwrap());
+            asm.emit(a64::lsr_imm(10, 10, u32::BITS).unwrap());
             asm.emit(a64::sub(14, ZR_OR_SP, 10).unwrap());
             asm.emit(a64::sub(10, 12, 14).unwrap());
             asm.emit(a64::ldr(10, 10, 0).unwrap());

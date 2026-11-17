@@ -136,7 +136,8 @@
 //!   `QueryMemory` reports that state for them (`Svc::MemoryState::GeneratedCode`, 0x14,
 //!   `eden/src/core/hle/kernel/svc_types.h`). A program's start-up walks its address space for
 //!   modules: from address 0, `QueryMemory` about each block in turn, taking every block whose
-//!   state is `Code` and whose permission is read-execute for a module and reading the word at
+//!   state is `Code` (or `AliasCode`) and whose permission is read-execute for a module and
+//!   reading the word at
 //!   its offset 4 as the offset of its `MOD0` header. Mapped as `Code`, the trampolines were
 //!   taken for a module whose `MOD0` offset is an instruction. `GeneratedCode` is the state
 //!   Horizon gives a process's own executable code that no loader placed: JIT code, mapped
@@ -153,14 +154,21 @@
 //!   and stops at `svc::MemoryState_Inaccessible`; `libstratosphere`'s
 //!   `ro/impl/ro_ro_exception_info.os.horizon.cpp`, `QueryModule`, has the same two checks.
 //!   Guess, not checked against any source here: a title's `rtld` walks with that rule too,
-//!   so it skips a `GeneratedCode` block. A run of a title whose start-up walks for modules
-//!   getting past `rtld` is consistent with it; reading `rtld`'s walk would confirm it. Pinned
+//!   so it skips a `GeneratedCode` block. A retail title's `rtld` finishing its walk with
+//!   the trampolines mapped this way is consistent with it; reading `rtld`'s walk would
+//!   confirm it. Pinned
 //!   by `a_module_walk_over_query_memory_finds_the_programs_modules_and_no_trampolines` here
 //!   and, with a guest program that walks as above, by `crates/core/tests/module_walk.rs`.
 //!   Divergence from Horizon: a `GeneratedCode` block on a console is backed by a code memory
-//!   object the process created; the trampolines have none, so `ControlCodeMemory` on them
-//!   has no object to act on, and the kernel operations that `GeneratedCode`'s flags refuse
-//!   (reprotecting, aliasing, IPC buffers) are refused on them as on JIT code.
+//!   object the process created; the trampolines have none, so no `ControlCodeMemory` call
+//!   can name them. Their flags are `KMemoryState::GeneratedCode`'s
+//!   (`eden/src/core/hle/kernel/k_memory_block.h`): unlike `Code`, without `FlagCode`,
+//!   `FlagCanUseIpc`, `FlagCanUseNonSecureIpc`, `FlagCanUseNonDeviceIpc`,
+//!   `FlagCanQueryPhysical`, `FlagCanDeviceMap`, `FlagCanAlignedDeviceMap` and
+//!   `FlagCanMapProcess`, so a kernel call that requires one of those of its range refuses the
+//!   trampolines' pages, as it would refuse JIT code (`SetProcessMemoryPermission`, which
+//!   requires `FlagCode`, in
+//!   `the_trampolines_lie_below_the_image_and_the_page_after_the_module_is_free`).
 //!
 //!   A module's trampolines must be within a branch's reach (128 MiB) of every read the module
 //!   has: a set whose patched reads lie further above the trampolines is refused with the
@@ -758,6 +766,7 @@ pub(crate) fn load_placed(
 #[cfg(test)]
 mod tests {
     use starquake_kernel::memory::GUARD_PAGES;
+    use starquake_kernel::memory::state::{STATE_MASK, flag};
     use starquake_kernel::memory::testing::{MapperCall, RecordingMapper};
     use starquake_kernel::result::KernelError;
     use starquake_memory::FlatMemory;
@@ -1431,6 +1440,21 @@ mod tests {
             )
         );
         assert_ne!(TRAMPOLINE_STATE.svc(), MemoryState::Code.svc());
+        // The flags `Code` has and the trampolines' state lacks, as the module docs list them;
+        // it has none that `Code` lacks.
+        let flags = |state: MemoryState| state.word() & !STATE_MASK;
+        assert_eq!(
+            flags(MemoryState::Code) & !flags(TRAMPOLINE_STATE),
+            flag::CODE
+                | flag::CAN_USE_IPC
+                | flag::CAN_USE_NON_SECURE_IPC
+                | flag::CAN_USE_NON_DEVICE_IPC
+                | flag::CAN_QUERY_PHYSICAL
+                | flag::CAN_DEVICE_MAP
+                | flag::CAN_ALIGNED_DEVICE_MAP
+                | flag::CAN_MAP_PROCESS
+        );
+        assert_eq!(flags(TRAMPOLINE_STATE) & !flags(MemoryState::Code), 0);
         // Not code memory to `SetProcessMemoryPermission` (no `FlagCode`), as a module's
         // pages are: the call that made the module's text read-execute refuses them.
         assert_eq!(
@@ -1466,11 +1490,11 @@ mod tests {
     /// The bases of the blocks a module walker takes for modules: it asks `QueryMemory` about
     /// address 0, then about the end of each block it is told of, until it is told of the
     /// inaccessible block above the address space, and takes every block whose state is
-    /// `Code` and whose permission is read-execute (Atmosphère's
+    /// `Code` or `AliasCode` and whose permission is read-execute (Atmosphère's
     /// `stratosphere/dmnt.gen2/source/dmnt2_debug_process.cpp`, `CollectModules` @ 4e3f3703,
     /// fact only; that a title's `rtld` uses the same rule is a guess, see the module docs).
     fn modules_a_walker_finds(space: &KernelSpace) -> Vec<u64> {
-        let code = MemoryState::Code.svc();
+        let code = [MemoryState::Code.svc(), MemoryState::AliasCode.svc()];
         let read_execute = u32::from(SvcPermission::ReadExecute.bits());
         let mut found = Vec::new();
         let mut address = 0;
@@ -1480,7 +1504,7 @@ mod tests {
             if info.state == MemoryState::Inaccessible.svc() {
                 return found;
             }
-            if info.state == code && info.permission == read_execute {
+            if code.contains(&info.state) && info.permission == read_execute {
                 found.push(info.base_address);
             }
             address = info.base_address + info.size;
