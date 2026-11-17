@@ -11,9 +11,10 @@
 //!   `_NV_IOC_WRITE` 1, `_NV_IOC_READ` 2 in the direction field: "write" is the caller sending, so
 //!   Eden's `is_in`).
 //! - `eden/src/core/hle/service/nvdrv/devices/ioctl_serialization.h`: `WrapFixed`, through
-//!   `WrapGeneric` with only a fixed argument, which [`Fixed`] ports. The variable-sized and
-//!   inline forms (`WrapVariable`, `WrapFixedVariable`, `WrapFixedInlIn`, `WrapFixedInlOut`) come
-//!   with the devices that use them (port slices 10 and 11).
+//!   `WrapGeneric` with only a fixed argument, which [`Fixed`] ports. `WrapFixedInlOut`'s inline
+//!   output is laid out by the one device that uses it so far (nvhost-as-gpu's `GetVARegions`,
+//!   [`super::as_gpu`]); the variable-sized and inline-input forms (`WrapVariable`,
+//!   `WrapFixedVariable`, `WrapFixedInlIn`) come with the devices that use them (port slice 11).
 //!
 //! Row 23 of NX2's blocker log (`eden-nx2/NX2_NOTES.md` @ 50fa86bb, observed) is why this
 //! applies to Switch 2 at all: nvsrv is the nvdrv protocol, served by both references with
@@ -170,6 +171,19 @@ impl<const N: usize> Fixed<N> {
             self.0[AT + 6],
             self.0[AT + 7],
         ])
+    }
+
+    /// Writes `value` as a little-endian `u16` at `AT`.
+    pub(crate) fn set_u16<const AT: usize>(&mut self, value: u16) {
+        const { assert!(AT + 2 <= N, "a field past the end of its argument") };
+        let [a, b] = value.to_le_bytes();
+        self.0[AT] = a;
+        self.0[AT + 1] = b;
+    }
+
+    /// The whole argument, as bytes.
+    pub(crate) const fn bytes(&self) -> &[u8; N] {
+        &self.0
     }
 
     /// Writes `value` as a little-endian `u32` at `AT`.
