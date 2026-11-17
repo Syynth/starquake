@@ -29,13 +29,15 @@
 //! - **A map replaces whatever it overlaps** (NX2 `MapAt`: `TrimMappings`, then the new mapping):
 //!   the overlapped pages of older mappings lead to the new target, and their pages outside the
 //!   range keep theirs. This is how a 211 inside a sparse region takes over `GpuOnly` pages
-//!   (graphics-server, "The model"). Pinned by `tests::a_map_replaces_what_it_overlaps`.
+//!   (graphics-server, "The model"). A conflict with PR ("Conflicts between the references").
+//!   Pinned by `tests::a_map_replaces_what_it_overlaps`.
 //! - **A removal takes out every mapped page of its range and leaves the rest** (NX2 `Unmap`:
-//!   `TrimMappings`): it may split a mapping or cover holes. [`VmUpdate::Unmap`],
-//!   [`VmUpdate::DestroyMemory`] and [`VmUpdate::DestroySparseRegion`] all do this to the table.
+//!   `TrimMappings`): it may split a mapping or cover holes (a conflict with PR, below).
+//!   [`VmUpdate::Unmap`], [`VmUpdate::DestroyMemory`] and [`VmUpdate::DestroySparseRegion`] all
+//!   do this to the table.
 //!   Pinned by `tests::an_unmap_splits_a_mapping_and_skips_holes`.
 //! - **A kind change sets the kind of every mapped page of its range** and leaves holes as holes,
-//!   splitting mappings at the range's ends. Pinned by
+//!   splitting mappings at the range's ends (kinds and the range are conflicts, below). Pinned by
 //!   `tests::a_kind_change_spans_mappings_and_skips_holes`.
 //! - **A target must fit the range** ([`GpuVm::map`] lists the checks): a `Guest` CPU address or a
 //!   `GpuOnly` offset is page aligned and its end is representable, and a `SyncpointShim` mapping
@@ -50,29 +52,48 @@
 //!   caught that mutation in three runs of three), and it cannot show that a weaker memory
 //!   ordering is wrong, so the order and the orderings are for review to keep.
 //!
+//! # Conflicts between the references
+//!
+//! Where PR and NX2 disagree, the table picks one reading by the house rule of graphics-server
+//! decision 8 (Nvidia's headers and readings that cite the system module for layouts and
+//! meanings; where one answer contains the other, the larger; otherwise the one a title ran on).
+//! Each case below is marked **conflict** here and next to the code that makes the choice, names
+//! the leg of the rule that picked it and the open question, and is pinned by the test of
+//! `vm/tests.rs` it names. The spec's "What to verify before building", item 1, does not list
+//! these three yet; until it does, the open question stated with each is the check that settles
+//! it (a trace of the replies a title reads after such a request).
+//!
+//! - **conflict: a map over a live mapping.** PR's `nvhost_as_gpu::MapNative4K`
+//!   (`eden-pr4588/src/core/hle/service/nvdrv/devices/nvhost_as_gpu.cpp` @ e5fb3b97) refuses a
+//!   range that overlaps any allocation, sparse reservations included (the `allocation_map`
+//!   check, `BadParameter`). NX2's `MapAt` replaces what the range overlaps. Picked: NX2, by the
+//!   leg "otherwise the one a title ran on" (neither answer contains the other, and NX2 is the
+//!   reading a title ran on). Open question: does the system module refuse a 211 over a live
+//!   mapping, and with what result? `a_map_replaces_what_it_overlaps`.
+//! - **conflict: kinds.** PR's `nvhost_as_gpu::ModifyKind` remaps the range with the new kind and
+//!   keeps a kind per mapping; NX2's registry has no kinds and its 212 changes nothing
+//!   (`eden-nx2/src/core/hle/service/nx2_gsv.h` @ 50fa86bb, `SubModifyKind`: "Kinds do not matter
+//!   to the emulated GPU"). Picked: PR, kinds are kept, by the leg "where one answer contains the
+//!   other, the larger" (a table with kinds holds everything a table without them does). Open
+//!   question: does any GPU work a title runs depend on a page's kind?
+//!   `a_kind_change_spans_mappings_and_skips_holes`.
+//! - **conflict: the range checks of 212, 213 and 215.** PR answers `ResultNotFound` for a range
+//!   that is not inside one of its recorded maps (212; and `ModifyKind`'s `delta >= mapping.size
+//!   || size > mapping.size - delta` answers `BadParameter`) or not exactly one (213 and 215:
+//!   `mapping.address == begin && end - begin + 1 == mapping.size`). NX2's `Unmap` trims any
+//!   range. Picked for the table: NX2's, by the leg "where one answer contains the other, the
+//!   larger" (it applies every range PR applies, with the same result, and others too) and the
+//!   one a title ran on: a kind change sets the mapped pages of any range, and a removal trims
+//!   any range. An ordered update is applied after the guest has had its reply, so it cannot fail
+//!   here; whether gsv refuses such a range at request time is deferred to slice 7. Open
+//!   question: which ranges does the system module refuse for 212, 213 and 215, and with what
+//!   result? `a_kind_change_spans_mappings_and_skips_holes`,
+//!   `an_unmap_splits_a_mapping_and_skips_holes`.
+//!
 //! # Divergences from the references
 //!
 //! Each is pinned by the test of `vm/tests.rs` it names:
 //!
-//! - **Kinds are kept.** NX2's registry has no kinds and its 212 changes nothing
-//!   (`eden-nx2/src/core/hle/service/nx2_gsv.h` @ 50fa86bb, `SubModifyKind`: "Kinds do not matter
-//!   to the emulated GPU"). PR's `nvhost_as_gpu::ModifyKind`
-//!   (`eden-pr4588/src/core/hle/service/nvdrv/devices/nvhost_as_gpu.cpp` @ e5fb3b97) remaps the
-//!   range with the new kind, which this table does too.
-//! - **A kind change over holes or several mappings applies to the mapped pages.** PR's
-//!   `ModifyKind` refuses a range that is not inside one mapping (`delta >= mapping.size || size >
-//!   mapping.size - delta` returns `BadParameter`), and PR's 212 handler refuses one that is not
-//!   inside one of its recorded maps (`ResultNotFound`). An ordered update is applied after the
-//!   guest has had its reply, so it cannot fail here; refusing is gsv's check at request time
-//!   (slice 7). `a_kind_change_spans_mappings_and_skips_holes`.
-//! - **An unmap need not match a mapping.** PR's 213 and 215 handlers find a recorded map that
-//!   is exactly the range (`mapping.address == begin && end - begin + 1 == mapping.size`) and
-//!   answer `ResultNotFound` otherwise. This table follows NX2's `Unmap`, which trims any range;
-//!   the exact-match check, if gsv keeps it, is gsv's (slice 7).
-//!   `an_unmap_splits_a_mapping_and_skips_holes`.
-//! - **A map over an existing mapping replaces it.** PR's `nvhost_as_gpu::MapNative4K` refuses a
-//!   range that overlaps any allocation, sparse reservations included (the `allocation_map`
-//!   check, `BadParameter`). This table follows NX2's `MapAt`. `a_map_replaces_what_it_overlaps`.
 //! - **Targets are checked.** NX2's `MapAt` takes any CPU address and size, and its
 //!   `TrimMappings` adds them as unsigned 64-bit values, which wrap. Here a target that is not
 //!   page aligned, or whose end is not representable, is an error.
@@ -396,6 +417,8 @@ impl GpuVm {
     pub fn map(&self, range: PageRange, target: Target, kind: Kind) -> Result<(), VmError> {
         check_target(target, range.size())?;
         let mut table = self.write();
+        // conflict (decision 8, "the one a title ran on"): NX2's `MapAt` replaces what the range
+        // overlaps; PR's `MapNative4K` refuses it (module docs, "Conflicts between the references").
         let replaced = trim(&mut table, range);
         table.insert(
             range.start(),
@@ -426,6 +449,9 @@ impl GpuVm {
     pub fn apply(&self, update: &VmUpdate) -> u64 {
         let range = update.range();
         let mut table = self.write();
+        // conflict (decision 8, "the larger"): any range, as NX2 takes it, not only one inside or
+        // equal to a mapping, as PR checks; and kinds are kept, as PR keeps them (module docs,
+        // "Conflicts between the references").
         let pages = match *update {
             VmUpdate::ModifyKind { kind, .. } => set_kind(&mut table, range, kind),
             VmUpdate::Unmap { .. }

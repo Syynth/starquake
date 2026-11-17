@@ -97,15 +97,22 @@ pub trait Completions: Send + Sync {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RegionId(pub u32);
 
-/// A GPU page-table kind (the PTE kind): one byte, as gsv selected it for a map (gsv 211, the kind
-/// byte of word 12) or a kind change (gsv 212, word 7). A byte in both references: PR's
-/// `NormalMapGpuMemory4K` keeps the low byte of each of words 10 to 16
-/// (`eden-pr4588/src/core/hle/service/am/service/gpu_session.cpp` @ e5fb3b97), and its
-/// `SelectNativeMemoryKind` returns `u8` kinds
-/// (`eden-pr4588/src/core/hle/service/nvdrv/devices/native_gpu_kind.h` @ e5fb3b97); NX2's 212
-/// handler takes `w[7] & 0xff`
-/// (`eden-nx2/src/core/hle/service/nx2_gsv.h` @ 50fa86bb, `SubModifyKind`). The address table only
-/// stores it; what each value means is the GPU's.
+/// A GPU page-table kind (the PTE kind) as the GPU reads it: one byte, the kind a mapping's pages
+/// are translated with.
+///
+/// PR's `SelectNativeMemoryKind`
+/// (`eden-pr4588/src/core/hle/service/nvdrv/devices/native_gpu_kind.h` @ e5fb3b97) turns the
+/// guest's requested and fallback kinds (gsv 211, words 12 and 13; gsv 212, words 7 and 8) into
+/// two bytes, `NativeMemoryKind { backend, selected }`: `backend` is the translated PTE kind PR
+/// passes to `gmmu->Map` (`MapNative4K` and `ModifyKind` in
+/// `eden-pr4588/src/core/hle/service/nvdrv/devices/nvhost_as_gpu.cpp`, `NormalMapGpuMemory4K`
+/// in `eden-pr4588/src/core/hle/service/am/service/gpu_session.cpp`, both @ e5fb3b97), and
+/// `selected` is the requested byte sent back in the 211 and 212 reply. **A `Kind` is the
+/// `backend` byte**: it is what [`crate::vm::GpuVm`] stores and what a translation gives the GPU.
+/// The `selected` byte is the reply's, which gsv computes and sends (slice 7) and never reaches
+/// this crate. NX2's 212 handler takes `w[7] & 0xff`
+/// (`eden-nx2/src/core/hle/service/nx2_gsv.h` @ 50fa86bb, `SubModifyKind`) and keeps no kind.
+/// The address table only stores the byte; what each value means is the GPU's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Kind(pub u8);
 
