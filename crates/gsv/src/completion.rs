@@ -17,6 +17,14 @@
 //! | The GPU (back thread after host completion; the front for room) | [`Completions::push`] (the trait `starquake-gpu` defines and gsv implements here) | [`Completion::Gpu`] |
 //! | `Syncpoints::increment`, for a watched id only (the watched-id fast path, below) | the same | [`Completion::Gpu`] with [`GpuCompletion::SyncpointChanged`] |
 //! | The kernel's hook on an event gsv created ([`EventHook`]), after the kernel lock is released | [`EventHook::signalled`] | [`Completion::GuestSignalled`] |
+//! | The thread that learns the host GPU is past the work that could use a device-share lock | [`CompletionQueue::push`] | [`Completion::DeviceShareReleased`] |
+//!
+//! **A device-share release** (owner's ruling of 2026-11-17, graphics-server "The model"):
+//! taking a device-share lock returns a token naming the process and the exact range
+//! ([`DeviceShareToken`]); the release is posted here with that token, and the timer thread's
+//! drain unlocks through the kernel, which validates it ([`crate::shared::Shared::drain`],
+//! `TimerHost::unlock_device_share`). The thread that learns the GPU is done is not a guest
+//! thread, so it cannot unlock itself: it has no current process to name.
 //!
 //! A [`CompletionQueue`] is shared as an `Arc`: given to `Syncpoints::new` as its
 //! `Arc<dyn Completions>`, to the GPU the same way, and to the kernel's `create_hooked_event` as
@@ -32,26 +40,20 @@
 //!
 //! - **`VideoFrame { decoder, frame }`,** from the video worker, comes with that worker (decoding
 //!   is deferred: graphics-server decision 10) and with its `DecoderId` and `FrameInfo` types.
-//! - **A device-share release** (owner's ruling of 2026-11-17, graphics-server "The model"):
-//!   taking a device-share lock will return a token naming the process and the exact range, the
-//!   release is posted here with that token, and the drain unlocks through the kernel, which
-//!   validates it. The kernel's lock returns no token yet, so the variant comes with gpu-session
-//!   slice 7 and the kernel's token type. It is one more [`Completion`] variant, pushed by
-//!   [`CompletionQueue::push`] and kept in push order like [`GpuCompletion::GpuOrdered`], and,
-//!   like it, a syncpoint change is never folded across it (below, "Coalescing"): when it comes,
-//!   it sets the same fold barrier `Pending::push` sets for an ordered entry. Nothing here
-//!   assumes the set of variants is closed except the match in [`CompletionQueue::push`] and
-//!   the snapshot's [`Saved`], which gain an arm each (and a version bump).
 //!
 //! # Coalescing: what bounds the queue
 //!
 //! A hostile title can make a host thread push without limit: one submission's increment value
 //! (`SubmitGPFIFO` flag bit 8) is a `u32`, and each increment of a watched id is a push, and each
 //! guest `SignalEvent` on a hooked event is one. So three kinds, each a report of state that a
-//! later report of the same thing replaces, are kept once per thing while queued:
+//! later report of the same thing replaces, are kept once per thing while queued.
+//!
+//! Two kinds are **ordered entries**, never coalesced and never folded across by a syncpoint
+//! change: [`GpuCompletion::GpuOrdered`] and [`Completion::DeviceShareReleased`]. Below, "an
+//! ordered entry" is either.
 //!
 //! - [`GpuCompletion::SyncpointChanged`]: a change of an id folds into the id's latest queued
-//!   change if no [`GpuCompletion::GpuOrdered`] is queued after that entry; the entry keeps its
+//!   change if no ordered entry is queued after that entry; the entry keeps its
 //!   place and takes the value further ahead by the 32-bit wrapping comparison
 //!   (`starquake_gpu::syncpoint::wait_satisfied`, mode 0), so two incrementers that push out of
 //!   order into one entry still leave the newer value
@@ -60,7 +62,8 @@
 //!   changes of the id fold into that one: a change pushed after an ordered entry never drains
 //!   before it, which the spec's "Order" assumption (graphics-server, "What gsv assumes":
 //!   increments and ordered updates take effect in call order) needs
-//!   (`a_syncpoint_change_is_not_folded_across_an_ordered_entry`). So an id has at most one
+//!   (`a_syncpoint_change_is_not_folded_across_an_ordered_entry`, and
+//!   `a_syncpoint_change_is_not_folded_across_a_device_share_release`). So an id has at most one
 //!   entry more than the ordered entries queued
 //!   (`a_syncpoint_takes_at_most_one_entry_more_than_the_ordered_entries`), and with none queued
 //!   at most `SYNCPOINT_COUNT` entries in all.
@@ -72,8 +75,10 @@
 //!
 //! [`GpuCompletion::GpuOrdered`] is never coalesced: each ticket is one ordered update or
 //! barrier gsv asked for, so their number is bounded by gsv's own requests, and every one is
-//! drained (`ordered_reports_are_each_kept`). Once an entry is drained, the next report of the
-//! same thing is queued again.
+//! drained (`ordered_reports_are_each_kept`). Nor is [`Completion::DeviceShareReleased`]: each
+//! is one lock gsv took, and two locks on one range give equal tokens, each of which must be
+//! unlocked (`device_share_releases_are_each_kept`); their number is bounded by the locks gsv
+//! holds. Once an entry is drained, the next report of the same thing is queued again.
 //!
 //! **Drained syncpoint values are not monotone.** Folding keeps the value further ahead only
 //! within one entry. An incrementer that lost the race and pushes its older value after the
@@ -115,10 +120,24 @@
 //!
 //! A snapshot is a file and is not trusted. Restoring checks, in this order, and returns the
 //! first failure: the magic, the version, that the body decodes, that no bytes follow it, and
-//! then each entry in order: that a syncpoint id is below `SYNCPOINT_COUNT`, and that the entry
-//! is not one the queue would have folded into an earlier entry (a syncpoint change whose id
-//! has an entry with no ordered entry after it, or a room report or guest signal naming what an
-//! earlier entry names). Saving runs the same entry checks on what it is about to write.
+//! then each entry in order: that a syncpoint id is below `SYNCPOINT_COUNT`, that the kernel
+//! takes a device-share release's token back ([`Reclaim`]), and that the entry is not one the
+//! queue would have folded into an earlier entry (a syncpoint change whose id has an entry with
+//! no ordered entry after it, or a room report or guest signal naming what an earlier entry
+//! names). Saving runs the same entry checks on what it is about to write, all but the
+//! kernel's: a queued token is one the kernel made.
+//!
+//! **A token held across a snapshot.** A release can be queued when a snapshot is taken, so
+//! its token is saved: the process and the exact range ([`Saved::DeviceShareReleased`]).
+//! Restoring does not build a token from those bytes itself (only the kernel makes one): it
+//! asks the kernel ([`Reclaim`], which `Dispatcher::reclaim_device_share` implements), and the
+//! kernel answers only after the checks a live token's unlock makes: the process is the one it
+//! holds and has not ended, and a live lock was taken on exactly that range. The drain's unlock
+//! then checks the token again. So a restored token passes through the same checks as a live
+//! one, and a snapshot naming a lock the kernel does not hold is refused
+//! ([`SnapshotError::Release`]). The kernel's own state has no snapshot yet (`memory` module
+//! docs, the observability spec's "Order of work", step 6); a whole-machine restore restores it
+//! first, then this queue against it.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -126,10 +145,14 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use serde::{Deserialize, Serialize};
 use starquake_gpu::interface::{ChannelId, Completions, GpuCompletion, SyncpointId, Ticket};
 use starquake_gpu::syncpoint::{CompareMode, wait_satisfied};
-use starquake_kernel::id::ObjectId;
+use starquake_kernel::dispatch::{DeviceShareError, Dispatcher};
+use starquake_kernel::id::{ObjectId, ProcessId};
 use starquake_kernel::ipc::EventHook;
+use starquake_kernel::memory::DeviceShareToken;
 use thiserror::Error;
 
+#[cfg(test)]
+pub(crate) mod testing;
 #[cfg(test)]
 mod tests;
 
@@ -137,7 +160,8 @@ mod tests;
 pub const SNAPSHOT_MAGIC: [u8; 4] = *b"SQCQ";
 
 /// Layout version written into every completion-queue snapshot and required when reading one.
-pub const SNAPSHOT_VERSION: u32 = 1;
+/// Version 2 added [`Saved::DeviceShareReleased`].
+pub const SNAPSHOT_VERSION: u32 = 2;
 
 /// What a host thread reports to the graphics server (graphics-server, "Who signals what: the
 /// completion queue"). See the module docs for the variants the spec's enum holds that this one
@@ -151,6 +175,38 @@ pub enum Completion {
         /// The writable end the guest signalled.
         event: ObjectId,
     },
+    /// The device-share lock `token` names may go: the GPU is past the work that could use it.
+    /// An ordered entry (module docs, "Coalescing"); the drain unlocks it through the kernel.
+    DeviceShareReleased {
+        /// The token the lock returned.
+        token: DeviceShareToken,
+    },
+}
+
+/// How a restore takes a saved device-share release back (module docs, "A token held across a
+/// snapshot"): the kernel checks it as it checks a live token, and makes the token only if
+/// every check passes. The kernel's [`Dispatcher`] implements it.
+pub trait Reclaim {
+    /// The token for the lock on `size` bytes at `address` of `process`, or why the kernel
+    /// refuses it.
+    fn reclaim(
+        &self,
+        process: ProcessId,
+        address: u64,
+        size: u64,
+    ) -> Result<DeviceShareToken, DeviceShareError>;
+}
+
+impl Reclaim for Dispatcher {
+    /// [`Dispatcher::reclaim_device_share`].
+    fn reclaim(
+        &self,
+        process: ProcessId,
+        address: u64,
+        size: u64,
+    ) -> Result<DeviceShareToken, DeviceShareError> {
+        self.reclaim_device_share(process, address, size)
+    }
 }
 
 /// Told when the queue goes from empty to holding something: the timer thread should drain it.
@@ -180,6 +236,8 @@ enum Slot {
     Room(ChannelId),
     /// The guest signalled a hooked event.
     Signalled(ObjectId),
+    /// A device-share lock may be released.
+    Released(DeviceShareToken),
 }
 
 /// What the queue holds.
@@ -191,7 +249,8 @@ struct Pending {
     /// For each syncpoint with a queued change, the index in [`Pending::order`] of its latest
     /// change: the one a later change of the id folds into, unless an ordered entry follows it.
     syncpoints: BTreeMap<SyncpointId, usize>,
-    /// The index in [`Pending::order`] of the latest ordered entry, if one is queued.
+    /// The index in [`Pending::order`] of the latest ordered entry (a `GpuOrdered` or a
+    /// device-share release), if one is queued.
     last_ordered: Option<usize>,
     /// The channels with a queued room report.
     rooms: BTreeSet<ChannelId>,
@@ -230,6 +289,10 @@ impl Pending {
                 }
                 Slot::Signalled(event)
             }
+            Completion::DeviceShareReleased { token } => {
+                self.last_ordered = Some(self.order.len());
+                Slot::Released(token)
+            }
         };
         self.order.push_back(slot);
         true
@@ -257,6 +320,7 @@ impl Pending {
             Slot::Ordered(ticket) => Completion::Gpu(GpuCompletion::GpuOrdered { ticket }),
             Slot::Room(channel) => Completion::Gpu(GpuCompletion::GpuQueueRoom { channel }),
             Slot::Signalled(event) => Completion::GuestSignalled { event },
+            Slot::Released(token) => Completion::DeviceShareReleased { token },
         })
     }
 }
@@ -319,8 +383,9 @@ impl CompletionQueue {
     /// Writes what is queued, in order (module docs, "Snapshot format"). Take it while nothing
     /// pushes, or it is a moment of the queue that may already have changed.
     pub fn save(&self) -> Result<Vec<u8>, SnapshotError> {
-        let entries: Vec<Saved> = self.pending().completions().map(Saved::from).collect();
-        rebuild(&entries)?;
+        let queued: Vec<Completion> = self.pending().completions().collect();
+        rebuild(queued.iter().copied().map(Ok))?;
+        let entries: Vec<Saved> = queued.into_iter().map(Saved::from).collect();
         let mut bytes = postcard::to_allocvec(&Header {
             magic: SNAPSHOT_MAGIC,
             version: SNAPSHOT_VERSION,
@@ -331,10 +396,10 @@ impl CompletionQueue {
     }
 
     /// A queue holding what [`save`](Self::save) wrote, waking no one; the snapshot is checked
-    /// first (module docs, "Snapshot format"). Add a [`Wake`] with [`with_wake`](Self::with_wake);
-    /// a restored queue that holds something has not announced it, so the timer thread should
-    /// drain once after a restore.
-    pub fn restore(bytes: &[u8]) -> Result<Self, SnapshotError> {
+    /// first (module docs, "Snapshot format"), each device-share release by `kernel`. Add a
+    /// [`Wake`] with [`with_wake`](Self::with_wake); a restored queue that holds something has
+    /// not announced it, so the timer thread should drain once after a restore.
+    pub fn restore(bytes: &[u8], kernel: &dyn Reclaim) -> Result<Self, SnapshotError> {
         let (header, rest) =
             postcard::take_from_bytes::<Header>(bytes).map_err(SnapshotError::Decode)?;
         if header.magic != SNAPSHOT_MAGIC {
@@ -350,19 +415,27 @@ impl CompletionQueue {
         if !rest.is_empty() {
             return Err(SnapshotError::TrailingBytes { count: rest.len() });
         }
+        let completions = entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| entry.completion(index, kernel));
         Ok(Self {
-            pending: Mutex::new(rebuild(&entries)?),
+            pending: Mutex::new(rebuild(completions)?),
             wake: None,
         })
     }
 }
 
-/// Builds the queue `entries` describe, checking each entry in order (module docs, "Snapshot
-/// format"). [`CompletionQueue::save`] and [`CompletionQueue::restore`] share it.
-fn rebuild(entries: &[Saved]) -> Result<Pending, SnapshotError> {
+/// Builds the queue `entries` describe, checking each entry in order, and returning the first
+/// failure: an entry that could not be read back, or one the queue would have folded into an
+/// earlier one (module docs, "Snapshot format"). [`CompletionQueue::save`] and
+/// [`CompletionQueue::restore`] share it.
+fn rebuild(
+    entries: impl IntoIterator<Item = Result<Completion, SnapshotError>>,
+) -> Result<Pending, SnapshotError> {
     let mut pending = Pending::default();
-    for (index, entry) in entries.iter().enumerate() {
-        if !pending.push(entry.completion(index)?) {
+    for (index, entry) in entries.into_iter().enumerate() {
+        if !pending.push(entry?) {
             return Err(SnapshotError::Repeated { index });
         }
     }
@@ -425,6 +498,14 @@ pub enum SnapshotError {
         /// The entry's position.
         index: usize,
     },
+    /// The kernel refused a device-share release's token ([`Reclaim`]).
+    #[error("entry {index} of the completion queue snapshot releases a device-share lock the kernel refused: {error}")]
+    Release {
+        /// The entry's position.
+        index: usize,
+        /// The kernel's refusal.
+        error: DeviceShareError,
+    },
 }
 
 /// The snapshot header.
@@ -462,6 +543,16 @@ enum Saved {
         /// The event.
         event: ObjectId,
     },
+    /// [`Completion::DeviceShareReleased`]: the token's fields, which only the kernel turns
+    /// back into a token ([`Reclaim`]).
+    DeviceShareReleased {
+        /// The process whose memory is locked.
+        process: ProcessId,
+        /// Where the locked range starts.
+        address: u64,
+        /// How many bytes are locked.
+        size: u64,
+    },
 }
 
 impl From<Completion> for Saved {
@@ -480,13 +571,19 @@ impl From<Completion> for Saved {
                 Self::GpuQueueRoom { channel: channel.0 }
             }
             Completion::GuestSignalled { event } => Self::GuestSignalled { event },
+            Completion::DeviceShareReleased { token } => Self::DeviceShareReleased {
+                process: token.process(),
+                address: token.address(),
+                size: token.size(),
+            },
         }
     }
 }
 
 impl Saved {
-    /// The completion this entry, at `index`, stands for, or why it names nothing.
-    fn completion(self, index: usize) -> Result<Completion, SnapshotError> {
+    /// The completion this entry, at `index`, stands for, or why it names nothing; `kernel`
+    /// takes a release's token back.
+    fn completion(self, index: usize, kernel: &dyn Reclaim) -> Result<Completion, SnapshotError> {
         Ok(match self {
             Self::SyncpointChanged { id, value } => {
                 let id =
@@ -500,6 +597,15 @@ impl Saved {
                 channel: ChannelId(channel),
             }),
             Self::GuestSignalled { event } => Completion::GuestSignalled { event },
+            Self::DeviceShareReleased {
+                process,
+                address,
+                size,
+            } => Completion::DeviceShareReleased {
+                token: kernel
+                    .reclaim(process, address, size)
+                    .map_err(|error| SnapshotError::Release { index, error })?,
+            },
         })
     }
 }

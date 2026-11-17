@@ -11,14 +11,14 @@ mod on_the_kernel {
     use serde::{Deserialize, Serialize};
     use starquake_cpu::GuestRegs;
     use starquake_ipc::{BUFFER_SIZE, Body, CommandType, Message, RequestBuilder, SessionKind};
-    use starquake_kernel::dispatch::{Caller, Dispatcher, Outcome};
+    use starquake_kernel::dispatch::{Caller, DeviceShareError, Dispatcher, Outcome};
     use starquake_kernel::handle::Handle;
     use starquake_kernel::id::ObjectId;
     use starquake_kernel::ipc::{EventHook, PortName};
     use starquake_kernel::memory::testing::RecordingMapper;
     use starquake_kernel::memory::{
-        AddressSpace, MemoryArrangement, MemoryAttribute, ProcessMemory, RegionOffsets,
-        SvcPermission,
+        AddressSpace, DeviceShareToken, MemoryArrangement, MemoryAttribute, ProcessMemory,
+        RegionOffsets, SvcPermission,
     };
     use starquake_kernel::process::{self, Console, ProcessDescription};
     use starquake_kernel::result::{KernelError, ResultCode};
@@ -73,11 +73,27 @@ mod on_the_kernel {
         }
     }
 
-    /// The service: one session's worth of the four calls. Its hook is not part of a snapshot.
+    /// The tokens a service's locks returned, oldest first, shared with the test.
+    #[derive(Default, Clone)]
+    struct Tokens(Arc<Mutex<Vec<DeviceShareToken>>>);
+
+    impl Tokens {
+        fn all(&self) -> Vec<DeviceShareToken> {
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    /// The service: one session's worth of the four calls. Its hook and its tokens are not part
+    /// of a snapshot.
     #[derive(Default, Serialize, Deserialize)]
     struct Gpu {
         #[serde(skip)]
         heard: Heard,
+        #[serde(skip)]
+        tokens: Tokens,
     }
 
     commands! {
@@ -120,24 +136,38 @@ mod on_the_kernel {
         }
 
         fn lock(
-            _: &mut Self,
+            &mut self,
             cx: &mut Context<'_>,
             req: &Request<'_>,
             reply: &mut Reply,
         ) -> Answer {
             let (address, size) = range(req)?;
-            cx.lock_device_share(address, size)?;
+            let token = cx.lock_device_share(address, size)?;
+            self.tokens
+                .0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(token);
             reply.ok()
         }
 
+        /// Unlocks with the latest token a lock of the request's range returned, which stays
+        /// held, so a second unlock presents it again.
         fn unlock(
-            _: &mut Self,
+            &mut self,
             cx: &mut Context<'_>,
             req: &Request<'_>,
             reply: &mut Reply,
         ) -> Answer {
             let (address, size) = range(req)?;
-            cx.unlock_device_share(address, size)?;
+            let token = self
+                .tokens
+                .all()
+                .into_iter()
+                .rev()
+                .find(|token| (token.address(), token.size()) == (address, size))
+                .expect("a lock of the range");
+            cx.unlock_device_share(token)?;
             reply.ok()
         }
     }
@@ -152,7 +182,7 @@ mod on_the_kernel {
     }
 
     impl Rig {
-        fn new(heard: &Heard) -> Self {
+        fn new(heard: &Heard, tokens: &Tokens) -> Self {
             let (mapper, _log) = RecordingMapper::new();
             let memory = ProcessMemory {
                 code_address: BASE,
@@ -168,11 +198,13 @@ mod on_the_kernel {
             let description = ProcessDescription::homebrew(Console::Switch2);
             let dispatcher = Dispatcher::new(process::create(&description, space).unwrap());
             let heard = heard.clone();
+            let tokens = tokens.clone();
             let server = Server::new("gpu", UnknownPolicy::Strict)
                 .with_service_id(ServiceId(0x62))
                 .with_root(move || {
                     Box::new(Gpu {
                         heard: heard.clone(),
+                        tokens: tokens.clone(),
                     })
                 });
             dispatcher
@@ -254,7 +286,7 @@ mod on_the_kernel {
     #[test]
     fn the_guest_signals_the_writable_end_a_service_made_and_its_hook_hears() {
         let heard = Heard::default();
-        let rig = Rig::new(&heard);
+        let rig = Rig::new(&heard, &Tokens::default());
         let session = rig.connect();
         let (result, copies, _) = rig.send(
             session,
@@ -275,7 +307,7 @@ mod on_the_kernel {
     #[test]
     fn a_service_sees_the_attribute_the_guest_set_and_locks_its_memory() {
         let heard = Heard::default();
-        let rig = Rig::new(&heard);
+        let rig = Rig::new(&heard, &Tokens::default());
         let session = rig.connect();
         let query = |rig: &Rig| rig.send(session, &with_range(QUERY, WORK, PAGE_SIZE)).2[0];
         assert_eq!(query(&rig), 0);
@@ -302,6 +334,41 @@ mod on_the_kernel {
         // A second unlock is the kernel's refusal, as the reply's result.
         assert_eq!(
             rig.send(session, &with_range(UNLOCK, other, PAGE_SIZE)).0,
+            code(KernelError::InvalidCurrentMemory)
+        );
+    }
+
+    #[test]
+    fn a_lock_a_service_took_is_released_by_its_token_outside_any_request() {
+        // The timer thread's path: the token leaves the request, and the dispatcher unlocks it
+        // with no guest thread and no request (graphics-server spec, "The model").
+        let tokens = Tokens::default();
+        let rig = Rig::new(&Heard::default(), &tokens);
+        let session = rig.connect();
+        let read = u64::from(SvcPermission::Read.bits());
+        let reprotect =
+            |rig: &Rig| rig.call(SvcId::SetMemoryPermission, [WORK, PAGE_SIZE, read, 0]);
+        assert_eq!(rig.send(session, &with_range(LOCK, WORK, PAGE_SIZE)).0, 0);
+        let [token] = tokens.all()[..] else {
+            panic!("one token");
+        };
+        assert_eq!((token.address(), token.size()), (WORK, PAGE_SIZE));
+        assert_eq!(
+            reprotect(&rig).x[0],
+            u64::from(code(KernelError::InvalidCurrentMemory))
+        );
+        assert_eq!(rig.dispatcher.unlock_device_share(token), Ok(()));
+        assert_eq!(reprotect(&rig).x[0], 0);
+        // Its lock is gone: the token is refused, on the timer thread's path and in a request.
+        assert_eq!(
+            rig.dispatcher.unlock_device_share(token),
+            Err(DeviceShareError::NotLocked {
+                address: WORK,
+                size: PAGE_SIZE,
+            })
+        );
+        assert_eq!(
+            rig.send(session, &with_range(UNLOCK, WORK, PAGE_SIZE)).0,
             code(KernelError::InvalidCurrentMemory)
         );
     }

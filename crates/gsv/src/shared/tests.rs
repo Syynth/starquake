@@ -12,6 +12,7 @@ use starquake_kernel::ipc::EventHook;
 use starquake_kernel::slab::SlabId;
 
 use super::*;
+use crate::completion::testing::{locks, released, token};
 
 /// The number the tests' gsv records its notes under: not the default, so a hard-coded one
 /// fails.
@@ -53,13 +54,45 @@ fn fresh() -> Shared {
     Shared::new(syncpoints, queue, GSV)
 }
 
-/// A [`TimerHost`] that keeps what was recorded.
+/// A [`TimerHost`] that keeps what was recorded, and the tokens it was asked to unlock, each of
+/// which it unlocks.
 #[derive(Default)]
-struct Host(Vec<EventKind>);
+struct Host(Vec<EventKind>, Vec<DeviceShareToken>);
 
 impl TimerHost for Host {
     fn record(&mut self, kind: EventKind) {
         self.0.push(kind);
+    }
+
+    fn unlock_device_share(&mut self, token: DeviceShareToken) -> Result<(), DeviceShareError> {
+        self.1.push(token);
+        Ok(())
+    }
+}
+
+/// One call a [`Calls`] host received.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Call {
+    Record(EventKind),
+    Unlock(DeviceShareToken),
+}
+
+/// A [`TimerHost`] that keeps every call in one list, in order, and answers each unlock with
+/// the next of its answers (success once they run out).
+#[derive(Default)]
+struct Calls {
+    calls: Vec<Call>,
+    answers: std::collections::VecDeque<Result<(), DeviceShareError>>,
+}
+
+impl TimerHost for Calls {
+    fn record(&mut self, kind: EventKind) {
+        self.calls.push(Call::Record(kind));
+    }
+
+    fn unlock_device_share(&mut self, token: DeviceShareToken) -> Result<(), DeviceShareError> {
+        self.calls.push(Call::Unlock(token));
+        self.answers.pop_front().unwrap_or(Ok(()))
     }
 }
 
@@ -299,8 +332,8 @@ struct LockChecker<'a> {
     calls: usize,
 }
 
-impl TimerHost for LockChecker<'_> {
-    fn record(&mut self, _kind: EventKind) {
+impl LockChecker<'_> {
+    fn check(&mut self) {
         assert!(
             matches!(self.shared.state.try_lock(), Err(TryLockError::WouldBlock)),
             "the kernel was called without gsv's shared lock"
@@ -309,18 +342,30 @@ impl TimerHost for LockChecker<'_> {
     }
 }
 
+impl TimerHost for LockChecker<'_> {
+    fn record(&mut self, _kind: EventKind) {
+        self.check();
+    }
+
+    fn unlock_device_share(&mut self, _token: DeviceShareToken) -> Result<(), DeviceShareError> {
+        self.check();
+        Ok(())
+    }
+}
+
 #[test]
 fn the_drain_calls_the_kernel_with_the_shared_lock_held() {
     let shared = fresh();
     for ticket in 1..=3 {
         shared.queue().push(ordered(ticket));
+        shared.queue().push(released(ticket));
     }
     let mut checker = LockChecker {
         shared: &shared,
         calls: 0,
     };
-    assert_eq!(shared.drain(&mut checker).len(), 3);
-    assert_eq!(checker.calls, 3);
+    assert_eq!(shared.drain(&mut checker).len(), 6);
+    assert_eq!(checker.calls, 6);
     // And released after.
     assert!(shared.state.try_lock().is_ok());
 }
@@ -360,6 +405,12 @@ impl TimerHost for Pusher<'_> {
     fn record(&mut self, _kind: EventKind) {
         self.pushed += 1;
         self.queue.push(ordered(100 + self.pushed));
+    }
+
+    fn unlock_device_share(&mut self, _token: DeviceShareToken) -> Result<(), DeviceShareError> {
+        self.pushed += 1;
+        self.queue.push(ordered(100 + self.pushed));
+        Ok(())
     }
 }
 
@@ -416,7 +467,7 @@ fn a_push_does_not_wait_for_the_shared_lock() {
 /// Saves `syncpoints` and restores them over a new queue, and restores `shared`'s state over
 /// them: a run brought back from a snapshot.
 fn round_trip(shared: &Shared) -> Result<Shared, SnapshotError> {
-    let queue = Arc::new(CompletionQueue::restore(&shared.queue().save().unwrap()).unwrap());
+    let queue = Arc::new(CompletionQueue::restore(&shared.queue().save().unwrap(), &locks()).unwrap());
     let completions: Arc<dyn Completions> = Arc::<CompletionQueue>::clone(&queue);
     let syncpoints =
         Arc::new(Syncpoints::restore(&shared.syncpoints().save().unwrap(), completions).unwrap());
@@ -674,4 +725,89 @@ fn checks_run_in_the_documented_order() {
             watched: false
         }
     );
+}
+
+#[test]
+fn the_drain_unlocks_each_release_through_the_kernel_in_queue_order() {
+    // Three releases among recorded completions, two of one range (two locks): each is unlocked
+    // with its token, at its place in the queue's order.
+    let shared = fresh();
+    shared.queue().push(ordered(1));
+    shared.queue().push(released(4));
+    shared.queue().push(room(2));
+    shared.queue().push(released(4));
+    shared.queue().push(released(5));
+    shared.queue().push(ordered(3));
+    let mut host = Calls::default();
+    assert_eq!(
+        shared.drain(&mut host),
+        [
+            ordered(1),
+            released(4),
+            room(2),
+            released(4),
+            released(5),
+            ordered(3),
+        ]
+    );
+    let record = |note: Note| Call::Record(note_event(note));
+    assert_eq!(
+        host.calls,
+        [
+            record(Note::GpuOrderedDone { ticket: Ticket(1) }),
+            Call::Unlock(token(4)),
+            record(Note::QueueRoom {
+                channel: ChannelId(2)
+            }),
+            Call::Unlock(token(4)),
+            Call::Unlock(token(5)),
+            record(Note::GpuOrderedDone { ticket: Ticket(3) }),
+        ]
+    );
+}
+
+#[test]
+fn a_refused_release_is_logged_and_the_drain_goes_on() {
+    // The kernel refuses the first two releases (one as ended, one as not locked); the drain
+    // still asks for the third and records what follows each.
+    let shared = fresh();
+    for n in 1..=3 {
+        shared.queue().push(released(n));
+        shared.queue().push(ordered(n));
+    }
+    let mut host = Calls {
+        answers: [
+            Err(DeviceShareError::ProcessEnded),
+            Err(DeviceShareError::NotLocked {
+                address: token(2).address(),
+                size: token(2).size(),
+            }),
+        ]
+        .into(),
+        ..Calls::default()
+    };
+    assert_eq!(shared.drain(&mut host).len(), 6);
+    let record = |ticket| Call::Record(note_event(Note::GpuOrderedDone { ticket: Ticket(ticket) }));
+    assert_eq!(
+        host.calls,
+        [
+            Call::Unlock(token(1)),
+            record(1),
+            Call::Unlock(token(2)),
+            record(2),
+            Call::Unlock(token(3)),
+            record(3),
+        ]
+    );
+}
+
+#[test]
+fn a_release_restored_from_a_snapshot_is_unlocked_with_the_kernel_s_token() {
+    let shared = fresh();
+    shared.queue().push(released(6));
+    let restored = round_trip(&shared).unwrap();
+    let mut host = Host::default();
+    assert_eq!(restored.drain(&mut host), [released(6)]);
+    assert_eq!(host.1, [token(6)]);
+    assert_eq!(host.0, []);
 }
