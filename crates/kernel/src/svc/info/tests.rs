@@ -746,6 +746,8 @@ fn a_switch_2_id_is_answered_by_the_console_of_the_process_the_handle_names() {
         assert_eq!(ask(named[1]), Ok(value), "{id:?}");
     }
     // And the other way round: a Switch 1 program is refused even about a Switch 2 process.
+    // PR #4588 has no caller gate and answers the value here; the module docs list this
+    // divergence.
     let mut switch_1_caller = processes_of(Console::Switch1);
     let switch_2 = switch_1_caller
         .create(&ProcessDescription::homebrew(Console::Switch2))

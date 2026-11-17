@@ -75,10 +75,16 @@
 //!   (`eden/src/core/hle/kernel/svc/svc_info.cpp` @ cf654052, `GetInfo`'s `default`) and as
 //!   Horizon's Switch 1 kernel does (fact only,
 //!   `atmosphere/libraries/libmesosphere/source/svc/kern_svc_info.cpp` @ 4e3f3703, `GetInfo`'s
-//!   `default`). PR #4588 checks the sub id and the handle first for every program, so there a
-//!   Switch 1 program passing sub id 0 and a handle that names no process is told
-//!   `ResultInvalidHandle`; here it is `InvalidEnumValue`. Test:
-//!   `a_switch_1_program_is_told_the_switch_2_ids_are_an_invalid_enum_value_whatever_is_passed`.
+//!   `default`). PR #4588 has no caller gate: it checks the sub id, the handle and then only
+//!   the named process's `UsesPAuthReturns()`, for every program. So a Switch 1 program
+//!   passing sub id 0 is answered differently in exactly two cases (with any other sub id, or
+//!   a handle naming a Switch 1 process, both say `InvalidEnumValue`):
+//!   - the handle names no process: PR #4588 says `ResultInvalidHandle`, here it is
+//!     `InvalidEnumValue`. Test:
+//!     `a_switch_1_program_is_told_the_switch_2_ids_are_an_invalid_enum_value_whatever_is_passed`.
+//!   - the handle names a Switch 2 process: PR #4588 answers the value, here it is
+//!     `InvalidEnumValue`. Test (its last loop):
+//!     `a_switch_2_id_is_answered_by_the_console_of_the_process_the_handle_names`.
 //! - **The memory ids read the calling process's address space, whatever process the handle
 //!   names.** With one address space beside the tables, a handle to another process object
 //!   is answered as the pseudo-handle is. The Switch 2 ids do check the process the handle
