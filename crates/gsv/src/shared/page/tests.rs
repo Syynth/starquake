@@ -11,7 +11,7 @@
 //! written at the offsets PR's `graphics_syncpoint_cache.h` @ e5fb3b97 gives, which the header
 //! names.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use starquake_gpu::interface::{Completions, GpuCompletion, SYNCPOINT_COUNT};
@@ -31,6 +31,8 @@ use crate::protocol::command::BIND_SYNCPOINT_MEMORY;
 use crate::root::{RootState, root_server_with_page};
 use crate::shared::WatchError;
 use crate::testing::{SPECIAL, STALE, copied, halves, le, result_only, success, tipc_type};
+
+mod on_the_kernel;
 
 /// The number the tests' root server is known by.
 const ROOT: ServiceId = ServiceId(0x0657);
@@ -729,7 +731,7 @@ fn events_made_before_a_failed_bind_are_handed_out_by_the_next() {
         ..Page::default()
     };
     rig.shared
-        .restore_page(&snapshot_of(&page), &Accepting::default(), ROOT)
+        .restore_page(&snapshot_of(&page), &Holding::of(&page), ROOT)
         .unwrap();
     let reply = rig.bind();
     let handles = copied(&reply);
@@ -1022,7 +1024,7 @@ fn a_counter_that_wraps_is_shown_past_the_wrap() {
     let mut page = rig.page();
     page.shown.observe(id(SP), Some(u32::MAX));
     rig.shared
-        .restore_page(&snapshot_of(&page), &Accepting::default(), ROOT)
+        .restore_page(&snapshot_of(&page), &Holding::of(&page), ROOT)
         .unwrap();
     assert_eq!(rig.shared.syncpoints().read(id(SP)), 0);
     rig.ask(&[SP]);
@@ -1336,7 +1338,7 @@ fn an_unbound_page_with_its_events_is_not_marked_signalled() {
         ..Page::default()
     };
     rig.shared
-        .restore_page(&snapshot_of(&page), &Accepting::default(), ROOT)
+        .restore_page(&snapshot_of(&page), &Holding::of(&page), ROOT)
         .unwrap();
     rig.shared.queue().push(Completion::GuestSignalled {
         event: request.writable,
@@ -1348,30 +1350,69 @@ fn an_unbound_page_with_its_events_is_not_marked_signalled() {
 
 // ----- Snapshots ------------------------------------------------------------------------------------
 
-/// What [`Accepting`] attached: the service, the event and the hook.
+/// What [`Holding`] attached: the service, the event and the hook.
 type Attached = (ServiceId, ObjectId, Arc<dyn EventHook>);
 
-/// A [`Rehook`] standing in for the kernel's `Dispatcher::reattach_event_hook`: it holds the
-/// writable ends of hooked events each service made, takes a re-attach only for one of those
-/// (the kernel's [`KernelError::InvalidHandle`] otherwise, as it answers), and keeps what it
-/// attached. It does not tell a readable end from an unknown id, which the kernel does by the
-/// object's kind; both are refused alike. Parity with the kernel:
-/// `the_fake_kernel_refuses_a_rehook_as_the_real_one`.
+/// A [`RestoreKernel`] standing in for the kernel's dispatcher: it holds the events each service
+/// made (the writable ends of hooked events apart from every other end) and the live transfer
+/// memories with their sizes, answers each question as the dispatcher does from what it holds,
+/// and keeps what it attached. A re-attach is taken only for a hooked writable end the service
+/// made (the dispatcher's `InvalidHandle` otherwise); an event is the service's if it holds it
+/// either way; a memory it does not hold is `InvalidHandle`. It does not model objects ending:
+/// what it holds stays live. Parity with the dispatcher, on the same corrupt snapshots:
+/// `on_the_kernel::each_kernel_check_refuses_on_the_kernel_as_on_the_fake`.
 #[derive(Default)]
-struct Accepting {
-    /// The events it holds, by service; empty means it takes any.
-    made: BTreeSet<(ServiceId, ObjectId)>,
+struct Holding {
+    /// The writable ends of hooked events, by the service whose server made them.
+    hooked: BTreeSet<(ServiceId, ObjectId)>,
+    /// Every other end of an event, by the service whose server made it.
+    events: BTreeSet<(ServiceId, ObjectId)>,
+    /// The live transfer memories, with their sizes.
+    memories: BTreeMap<ObjectId, u64>,
     attached: Mutex<Vec<Attached>>,
 }
 
-impl Rehook for Accepting {
+impl Holding {
+    /// A kernel holding what `page` names, as the root's 204 made and was lent them: the request
+    /// event's writable end hooked, its readable end and the answer event, and the two memories
+    /// at their sizes.
+    fn of(page: &Page) -> Self {
+        let mut holding = Self::default();
+        if let Some(request) = page.request {
+            holding.hooked.insert((ROOT, request.writable));
+            holding.events.insert((ROOT, request.readable));
+        }
+        if let Some(answer) = page.answer {
+            holding.events.insert((ROOT, answer));
+        }
+        if let Some(binding) = page.binding {
+            holding
+                .memories
+                .insert(binding.writable, u64::from(WRITABLE_SIZE));
+            holding
+                .memories
+                .insert(binding.read_only, u64::from(READ_ONLY_SIZE));
+        }
+        holding
+    }
+
+    /// Whether it attached anything.
+    fn attached_nothing(&self) -> bool {
+        self.attached
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_empty()
+    }
+}
+
+impl RestoreKernel for Holding {
     fn reattach(
         &self,
         service: ServiceId,
         event: ObjectId,
         hook: Arc<dyn EventHook>,
     ) -> SvcResult<()> {
-        if !self.made.is_empty() && !self.made.contains(&(service, event)) {
+        if !self.hooked.contains(&(service, event)) {
             return Err(KernelError::InvalidHandle);
         }
         self.attached
@@ -1379,6 +1420,17 @@ impl Rehook for Accepting {
             .unwrap_or_else(PoisonError::into_inner)
             .push((service, event, hook));
         Ok(())
+    }
+
+    fn is_service_event(&self, service: ServiceId, event: ObjectId) -> bool {
+        self.hooked.contains(&(service, event)) || self.events.contains(&(service, event))
+    }
+
+    fn transfer_memory_size(&self, memory: ObjectId) -> SvcResult<u64> {
+        self.memories
+            .get(&memory)
+            .copied()
+            .ok_or(KernelError::InvalidHandle)
     }
 }
 
@@ -1433,7 +1485,7 @@ fn the_page_snapshot_layout_is_pinned() {
     let page = full_page();
     watch_hold(&shared, &page);
     shared
-        .restore_page(&snapshot_of(&page), &Accepting::default(), ROOT)
+        .restore_page(&snapshot_of(&page), &Holding::of(&page), ROOT)
         .unwrap();
     // The magic and version 1.
     let mut expected = vec![b'S', b'Q', b'P', b'G', 0x01];
@@ -1478,10 +1530,7 @@ fn a_restored_page_is_used_as_saved() {
     let syncpoints = Arc::new(Syncpoints::restore(&syncpoints, completions).unwrap());
     let restored = Arc::new(Shared::restore(&saved_shared, syncpoints, queue, GSV).unwrap());
     let request = rig.request_event();
-    let kernel = Accepting {
-        made: [(ROOT, request)].into(),
-        ..Accepting::default()
-    };
+    let kernel = Holding::of(&rig.page());
     restored.restore_page(&saved_page, &kernel, ROOT).unwrap();
     assert_eq!(restored.lock().page(), &rig.page());
     // The hook re-attached is the restored queue: the title's signal reaches it.
@@ -1505,7 +1554,7 @@ fn a_restored_page_is_used_as_saved() {
 /// Restores `bytes` into fresh state; the error.
 fn restore_error(bytes: &[u8]) -> PageSnapshotError {
     fresh_shared()
-        .restore_page(bytes, &Accepting::default(), ROOT)
+        .restore_page(bytes, &Holding::default(), ROOT)
         .unwrap_err()
 }
 
@@ -1636,7 +1685,7 @@ fn a_page_whose_fields_do_not_fit_together_is_refused() {
         watch_hold(&shared, &page);
         assert_eq!(
             shared
-                .restore_page(&snapshot_of(&page), &Accepting::default(), ROOT)
+                .restore_page(&snapshot_of(&page), &Holding::default(), ROOT)
                 .unwrap_err(),
             PageSnapshotError::State(error),
             "{error}"
@@ -1659,7 +1708,7 @@ fn a_page_whose_fields_do_not_fit_together_is_refused() {
         Page::default(),
     ] {
         fresh_shared()
-            .restore_page(&snapshot_of(&page), &Accepting::default(), ROOT)
+            .restore_page(&snapshot_of(&page), &Holding::of(&page), ROOT)
             .unwrap();
     }
     assert_eq!(
@@ -1687,7 +1736,7 @@ fn the_relations_are_checked_in_the_order_of_their_errors() {
     watch_hold(&shared, &page);
     assert_eq!(
         shared
-            .restore_page(&snapshot_of(&page), &Accepting::default(), ROOT)
+            .restore_page(&snapshot_of(&page), &Holding::default(), ROOT)
             .unwrap_err(),
         PageSnapshotError::State(PageStateError::RequestEnds)
     );
@@ -1700,14 +1749,10 @@ fn the_relations_are_checked_in_the_order_of_their_errors() {
         restore_error(&snapshot_of(&page)),
         PageSnapshotError::State(PageStateError::SharedEvent)
     );
-    // A wrong watcher count and a kernel that refuses the hook: the count first.
-    let refusing = Accepting {
-        made: [(ROOT, object(0x99, 9))].into(),
-        ..Accepting::default()
-    };
+    // A wrong watcher count and a kernel that holds none of the page's objects: the count first.
     assert!(matches!(
         fresh_shared()
-            .restore_page(&snapshot_of(&full_page()), &refusing, ROOT)
+            .restore_page(&snapshot_of(&full_page()), &Holding::default(), ROOT)
             .unwrap_err(),
         PageSnapshotError::Watchers { .. }
     ));
@@ -1722,7 +1767,7 @@ fn each_waiter_count_must_be_the_waits_plus_the_hold_s_watch() {
     shared.lock().watch(id(191)).unwrap();
     assert_eq!(
         shared
-            .restore_page(&snapshot_of(&page), &Accepting::default(), ROOT)
+            .restore_page(&snapshot_of(&page), &Holding::default(), ROOT)
             .unwrap_err(),
         PageSnapshotError::Watchers {
             id: 1,
@@ -1735,7 +1780,7 @@ fn each_waiter_count_must_be_the_waits_plus_the_hold_s_watch() {
     shared.lock().watch(id(2)).unwrap();
     assert_eq!(
         shared
-            .restore_page(&snapshot_of(&page), &Accepting::default(), ROOT)
+            .restore_page(&snapshot_of(&page), &Holding::default(), ROOT)
             .unwrap_err(),
         PageSnapshotError::Watchers {
             id: 2,
@@ -1754,7 +1799,7 @@ fn each_waiter_count_must_be_the_waits_plus_the_hold_s_watch() {
     .unwrap();
     shared.lock().arm(object(0x40, 1), wait).unwrap();
     shared
-        .restore_page(&snapshot_of(&page), &Accepting::default(), ROOT)
+        .restore_page(&snapshot_of(&page), &Holding::of(&page), ROOT)
         .unwrap();
     assert_eq!(
         PageSnapshotError::Watchers {
@@ -1774,38 +1819,255 @@ fn a_hook_the_kernel_refuses_fails_the_restore_and_leaves_the_page() {
         held: None,
         ..full_page()
     };
-    let refusing = Accepting {
-        made: [(ROOT, object(0x99, 9))].into(),
-        ..Accepting::default()
-    };
-    // The right event, named for another service; then another event for the right service.
-    for (service, kernel) in [
-        (
-            ServiceId(ROOT.0 + 1),
-            Accepting {
-                made: [(ROOT, object(0x11, 1))].into(),
-                ..Accepting::default()
-            },
-        ),
-        (ROOT, refusing),
-    ] {
+    let request = page.request.unwrap();
+    // The right event, held for another service; then another event held for the right one.
+    let mut other_service = Holding::of(&page);
+    other_service.hooked = [(ServiceId(ROOT.0 + 1), request.writable)].into();
+    let mut other_event = Holding::of(&page);
+    other_event.hooked = [(ROOT, object(0x99, 9))].into();
+    for kernel in [other_service, other_event] {
         assert_eq!(
             shared
-                .restore_page(&snapshot_of(&page), &kernel, service)
+                .restore_page(&snapshot_of(&page), &kernel, ROOT)
                 .unwrap_err(),
             PageSnapshotError::Rehook(KernelError::InvalidHandle)
         );
         assert_eq!(shared.lock().page(), &Page::default());
+        assert!(kernel.attached_nothing());
     }
     // A page with no request event asks the kernel nothing.
-    let kernel = Accepting {
-        made: [(ROOT, object(0x99, 9))].into(),
-        ..Accepting::default()
-    };
+    let kernel = Holding::default();
     shared
         .restore_page(&snapshot_of(&Page::default()), &kernel, ROOT)
         .unwrap();
-    assert!(kernel.attached.lock().unwrap().is_empty());
+    assert!(kernel.attached_nothing());
+}
+
+/// A bound page with no hold, and what makes [`Holding`] fail each of the restore's kernel
+/// checks (module docs, "What is saved"), alone, with the error.
+fn kernel_faults() -> (Page, Vec<(Holding, PageSnapshotError)>) {
+    let page = Page {
+        held: None,
+        ..full_page()
+    };
+    let request = page.request.unwrap();
+    let answer = page.answer.unwrap();
+    let binding = page.binding.unwrap();
+    let with = |change: &dyn Fn(&mut Holding)| {
+        let mut holding = Holding::of(&page);
+        change(&mut holding);
+        holding
+    };
+    let mut faults = vec![
+        (
+            with(&|holding| {
+                holding.events.remove(&(ROOT, answer));
+            }),
+            PageSnapshotError::AnswerEvent,
+        ),
+        (
+            with(&|holding| {
+                holding.events.remove(&(ROOT, answer));
+                holding.events.insert((ServiceId(ROOT.0 + 1), answer));
+            }),
+            PageSnapshotError::AnswerEvent,
+        ),
+        (
+            with(&|holding| {
+                holding.memories.remove(&binding.writable);
+            }),
+            PageSnapshotError::WritableMemory(KernelError::InvalidHandle),
+        ),
+        (
+            with(&|holding| {
+                holding.memories.remove(&binding.read_only);
+            }),
+            PageSnapshotError::ReadOnlyMemory(KernelError::InvalidHandle),
+        ),
+        (
+            with(&|holding| {
+                holding.hooked.remove(&(ROOT, request.writable));
+            }),
+            PageSnapshotError::Rehook(KernelError::InvalidHandle),
+        ),
+    ];
+    // Each size one byte either side of its edge.
+    for size in [WRITABLE_SIZE - 1, WRITABLE_SIZE + 1] {
+        let size = u64::from(size);
+        faults.push((
+            with(&|holding| {
+                holding.memories.insert(binding.writable, size);
+            }),
+            PageSnapshotError::WritableSize { size },
+        ));
+    }
+    for size in [READ_ONLY_SIZE - 1, READ_ONLY_SIZE + 1] {
+        let size = u64::from(size);
+        faults.push((
+            with(&|holding| {
+                holding.memories.insert(binding.read_only, size);
+            }),
+            PageSnapshotError::ReadOnlySize { size },
+        ));
+    }
+    (page, faults)
+}
+
+#[test]
+fn each_kernel_check_refuses_its_fault_and_leaves_the_page() {
+    let (page, faults) = kernel_faults();
+    for (kernel, error) in faults {
+        let shared = fresh_shared();
+        assert_eq!(
+            shared.restore_page(&snapshot_of(&page), &kernel, ROOT),
+            Err(error.clone()),
+            "{error}"
+        );
+        assert_eq!(shared.lock().page(), &Page::default(), "{error}");
+        assert!(kernel.attached_nothing(), "{error}");
+    }
+    // Exactly the sizes, the events the root's server made: taken, and the hook attached.
+    let kernel = Holding::of(&page);
+    let shared = fresh_shared();
+    shared
+        .restore_page(&snapshot_of(&page), &kernel, ROOT)
+        .unwrap();
+    assert_eq!(shared.lock().page(), &page);
+    assert!(!kernel.attached_nothing());
+}
+
+/// A change that makes [`Holding`] fail one of the restore's kernel checks.
+type KernelFault<'a> = &'a dyn Fn(&mut Holding);
+
+#[test]
+fn the_kernel_checks_come_in_their_documented_order() {
+    // Two faults at once each time: the earlier check's error is the answer, and nothing is
+    // attached. (A memory's size is checked after it is found live: a memory that is not there
+    // has no size, so those two cannot both fail.)
+    let page = Page {
+        held: None,
+        ..full_page()
+    };
+    let request = page.request.unwrap();
+    let answer = page.answer.unwrap();
+    let binding = page.binding.unwrap();
+    let no_answer = |holding: &mut Holding| {
+        holding.events.remove(&(ROOT, answer));
+    };
+    let no_writable = |holding: &mut Holding| {
+        holding.memories.remove(&binding.writable);
+    };
+    let small_writable = |holding: &mut Holding| {
+        holding
+            .memories
+            .insert(binding.writable, u64::from(WRITABLE_SIZE - 1));
+    };
+    let no_read_only = |holding: &mut Holding| {
+        holding.memories.remove(&binding.read_only);
+    };
+    let small_read_only = |holding: &mut Holding| {
+        holding
+            .memories
+            .insert(binding.read_only, u64::from(READ_ONLY_SIZE - 1));
+    };
+    let no_hook = |holding: &mut Holding| {
+        holding.hooked.remove(&(ROOT, request.writable));
+    };
+    let cases: [(KernelFault<'_>, KernelFault<'_>, PageSnapshotError); 7] = [
+        (&no_answer, &no_writable, PageSnapshotError::AnswerEvent),
+        (&no_answer, &no_hook, PageSnapshotError::AnswerEvent),
+        (
+            &no_writable,
+            &no_read_only,
+            PageSnapshotError::WritableMemory(KernelError::InvalidHandle),
+        ),
+        (
+            &small_writable,
+            &no_read_only,
+            PageSnapshotError::WritableSize {
+                size: u64::from(WRITABLE_SIZE - 1),
+            },
+        ),
+        (
+            &no_read_only,
+            &no_hook,
+            PageSnapshotError::ReadOnlyMemory(KernelError::InvalidHandle),
+        ),
+        (
+            &small_read_only,
+            &no_hook,
+            PageSnapshotError::ReadOnlySize {
+                size: u64::from(READ_ONLY_SIZE - 1),
+            },
+        ),
+        (
+            &small_writable,
+            &small_read_only,
+            PageSnapshotError::WritableSize {
+                size: u64::from(WRITABLE_SIZE - 1),
+            },
+        ),
+    ];
+    for (first, later, error) in cases {
+        let mut kernel = Holding::of(&page);
+        first(&mut kernel);
+        later(&mut kernel);
+        assert_eq!(
+            fresh_shared().restore_page(&snapshot_of(&page), &kernel, ROOT),
+            Err(error.clone()),
+            "{error}"
+        );
+        assert!(kernel.attached_nothing(), "{error}");
+    }
+    // A wrong watcher count and a kernel that holds none of the page's objects: the count first.
+    let shared = fresh_shared();
+    shared.lock().watch(id(5)).unwrap();
+    assert!(matches!(
+        shared.restore_page(&snapshot_of(&page), &Holding::default(), ROOT),
+        Err(PageSnapshotError::Watchers { id: 5, .. })
+    ));
+}
+
+#[test]
+fn the_kernel_checks_errors_are_plain_words() {
+    let cases = [
+        (
+            PageSnapshotError::AnswerEvent,
+            "the syncpoint page's answer event is not a live event the root's server made"
+                .to_owned(),
+        ),
+        (
+            PageSnapshotError::WritableMemory(KernelError::InvalidHandle),
+            "the syncpoint page's writable memory is not a live transfer memory: invalid handle"
+                .to_owned(),
+        ),
+        (
+            PageSnapshotError::WritableSize {
+                size: u64::from(WRITABLE_SIZE - 1),
+            },
+            format!(
+                "the syncpoint page's writable memory is {:#x} bytes, not {WRITABLE_SIZE:#x}",
+                WRITABLE_SIZE - 1
+            ),
+        ),
+        (
+            PageSnapshotError::ReadOnlyMemory(KernelError::InvalidHandle),
+            "the syncpoint page's read-only memory is not a live transfer memory: invalid handle"
+                .to_owned(),
+        ),
+        (
+            PageSnapshotError::ReadOnlySize {
+                size: u64::from(READ_ONLY_SIZE + 1),
+            },
+            format!(
+                "the syncpoint page's read-only memory is {:#x} bytes, not {READ_ONLY_SIZE:#x}",
+                READ_ONLY_SIZE + 1
+            ),
+        ),
+    ];
+    for (error, message) in cases {
+        assert_eq!(error.to_string(), message);
+    }
 }
 
 #[test]
@@ -1814,7 +2076,7 @@ fn saving_runs_the_restore_s_checks() {
     let page = full_page();
     watch_hold(&shared, &page);
     shared
-        .restore_page(&snapshot_of(&page), &Accepting::default(), ROOT)
+        .restore_page(&snapshot_of(&page), &Holding::of(&page), ROOT)
         .unwrap();
     // A watch taken behind the page's back breaks the count the snapshot would carry.
     shared.lock().watch(id(5)).unwrap();
@@ -1826,27 +2088,4 @@ fn saving_runs_the_restore_s_checks() {
             needed: 0,
         }
     );
-}
-
-#[test]
-fn the_fake_kernel_refuses_a_rehook_as_the_real_one() {
-    // The kernel's dispatcher has no server for the root and so made no event: it refuses, as
-    // the fake holding events for another service does.
-    let (dispatcher, _) = crate::completion::testing::real_kernel();
-    let fake = Accepting {
-        made: [(ServiceId(ROOT.0 + 1), object(0x11, 1))].into(),
-        ..Accepting::default()
-    };
-    let page = Page {
-        held: None,
-        ..full_page()
-    };
-    let real = fresh_shared()
-        .restore_page(&snapshot_of(&page), &dispatcher, ROOT)
-        .unwrap_err();
-    let faked = fresh_shared()
-        .restore_page(&snapshot_of(&page), &fake, ROOT)
-        .unwrap_err();
-    assert_eq!(real, faked);
-    assert_eq!(real, PageSnapshotError::Rehook(KernelError::InvalidHandle));
 }

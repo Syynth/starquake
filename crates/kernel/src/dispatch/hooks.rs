@@ -5,6 +5,12 @@
 //! snapshot can hold, and they run without the kernel lock. They have a lock of their own,
 //! which is only ever taken alone or inside the kernel lock (never the other way round), and
 //! is held only to read or change the map, never while a hook runs.
+//!
+//! A service's restore step re-attaches its hooks here
+//! ([`Dispatcher::reattach_event_hook`]), and checks the other kernel objects its snapshot names
+//! against what the kernel holds: the events its server made
+//! ([`Dispatcher::is_service_event`]) and the transfer memories it was lent
+//! ([`Dispatcher::transfer_memory`]).
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -14,6 +20,7 @@ use starquake_trace::ServiceId;
 use super::Dispatcher;
 use crate::id::ObjectId;
 use crate::ipc::EventHook;
+use crate::memory::TransferMemory;
 use crate::object::{Object, Objects};
 use crate::result::{KernelError, SvcResult};
 use crate::tables::Scheduler;
@@ -44,7 +51,7 @@ impl Hooks {
     }
 
     /// Forgets every hook, as a dispatcher restored from a snapshot holds none.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn clear(&self) {
         self.hooks
             .lock()
@@ -60,6 +67,13 @@ impl Hooks {
             .unwrap_or_else(PoisonError::into_inner)
             .len()
     }
+}
+
+/// Whether the server of `service` made the event `event` is an end of.
+fn made_by(scheduler: &Scheduler, service: ServiceId, event: ObjectId) -> bool {
+    let ipc = scheduler.ipc();
+    ipc.service(service)
+        .is_some_and(|server| ipc.is_server_event(server, event))
 }
 
 impl Dispatcher {
@@ -81,17 +95,52 @@ impl Dispatcher {
         hook: Arc<dyn EventHook>,
     ) -> SvcResult<()> {
         self.with::<(&Scheduler,), _>(|(scheduler,)| {
-            let ipc = scheduler.ipc();
-            let made = ipc
-                .service(service)
-                .is_some_and(|server| ipc.is_server_event(server, event));
             let writable = matches!(scheduler.objects().get(event), Ok(Object::Event(_)));
-            if !made || !writable {
+            if !made_by(scheduler, service, event) || !writable {
                 return Err(KernelError::InvalidHandle);
             }
             self.hooks.attach(scheduler.objects(), event, hook);
             Ok(())
         })
+    }
+
+    /// Whether `event` is a live end of an event (either end: [`Object::Event`] or
+    /// [`Object::ReadableEvent`]) that the server of `service` made, through
+    /// [`IpcContext::create_event`](super::IpcContext::create_event) or
+    /// [`IpcContext::create_hooked_event`](super::IpcContext::create_hooked_event): how a
+    /// service's restore step checks an event its snapshot names. False for any other id (an
+    /// event the guest or another server made, one that names nothing) and for a service with no
+    /// server. Run on the restoring thread, outside any request.
+    #[must_use]
+    pub fn is_service_event(&self, service: ServiceId, event: ObjectId) -> bool {
+        self.with::<(&Scheduler,), _>(|(scheduler,)| {
+            let live = matches!(
+                scheduler.objects().get(event),
+                Ok(Object::Event(_) | Object::ReadableEvent(_))
+            );
+            live && made_by(scheduler, service, event)
+        })
+    }
+
+    /// The transfer memory `object` names: [`KernelError::InvalidHandle`] when it names no live
+    /// transfer memory, or one whose pages are not locked (one being made, which no handle names
+    /// yet). What a server's request reaches through
+    /// [`IpcContext::transfer_memory`](super::IpcContext::transfer_memory), and what a service's
+    /// restore step checks a transfer memory its snapshot names against, outside any request.
+    pub fn transfer_memory(&self, object: ObjectId) -> SvcResult<TransferMemory> {
+        let found = self.with::<(&Scheduler,), _>(|(scheduler,)| scheduler.objects().get(object));
+        match found {
+            Ok(Object::TransferMemory(transfer)) if transfer.is_locked() => Ok(transfer),
+            _ => Err(KernelError::InvalidHandle),
+        }
+    }
+
+    /// Forgets every hook, as a dispatcher restored from a snapshot holds none (hooks are code,
+    /// not snapshotted): for a service's tests of its restore step. Only with the
+    /// `test-support` feature (or in this crate's tests), which any crate may turn on.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn forget_event_hooks(&self) {
+        self.hooks.clear();
     }
 
     /// Runs the hook attached to `event`, if it has one: called by the `SignalEvent` arm once

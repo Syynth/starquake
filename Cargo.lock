@@ -1144,6 +1144,7 @@ dependencies = [
  "postcard",
  "proptest",
  "serde",
+ "starquake-cpu",
  "starquake-gpu",
  "starquake-ipc",
  "starquake-kernel",

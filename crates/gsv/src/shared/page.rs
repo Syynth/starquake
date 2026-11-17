@@ -193,10 +193,25 @@
 //! decodes, that no bytes follow it, then the page's own relations ([`PageStateError`], in the
 //! order of its variants), then that each syncpoint's waiter count is its armed waits plus one
 //! if the hold watches it ([`PageSnapshotError::Watchers`]: the page and the armed waits are the
-//! only watchers), and last that the kernel takes the request event's hook back
-//! ([`Rehook`]; owner's ruling of 2026-11-17: hooks are re-attached by their owner in its
-//! restore step, checked against the restored events, before the guest runs again). Only then is
-//! the page replaced. Saving runs the relation and watcher checks on what it is about to write.
+//! only watchers), then the objects the page names against what the kernel holds
+//! ([`RestoreKernel`]): that the answer event is a live end of an event the root's server made
+//! ([`PageSnapshotError::AnswerEvent`]); that the writable memory is a live transfer memory
+//! ([`PageSnapshotError::WritableMemory`]) of exactly [`WRITABLE_SIZE`] bytes
+//! ([`PageSnapshotError::WritableSize`]); the same for the read-only memory and
+//! [`READ_ONLY_SIZE`] ([`PageSnapshotError::ReadOnlyMemory`], [`PageSnapshotError::ReadOnlySize`]);
+//! and last that the kernel takes the request event's hook back, which it does only for the
+//! live writable end of an event the root's server made ([`PageSnapshotError::Rehook`]; owner's
+//! ruling of 2026-11-17: hooks are re-attached by their owner in its restore step, checked
+//! against the restored events, before the guest runs again). Only then is the page replaced;
+//! the hook is the only thing a restore changes in the kernel, and only once every other check
+//! has passed. Saving runs the relation and watcher checks on what it is about to write.
+//!
+//! Not checked here: the request event's readable end, which gsv never signals, clears or hands
+//! out (only the relations check it); that the answer event is the one 204 made rather than
+//! another live end of an event the root's server made (signalling any of those reaches only the
+//! server's own events, never the guest's or another server's); and that the two memories are
+//! the bound process's (the kernel's `IpcContext` takes the sender as the owner, PROVISIONAL
+//! there).
 
 use std::sync::Arc;
 use std::sync::atomic::{Ordering, fence};
@@ -604,14 +619,36 @@ pub enum PageSnapshotError {
         /// Its armed waits, plus one if the hold watches it.
         needed: usize,
     },
+    /// The answer event is not a live end of an event the root's server made.
+    #[error("the syncpoint page's answer event is not a live event the root's server made")]
+    AnswerEvent,
+    /// The writable memory is not a live transfer memory.
+    #[error("the syncpoint page's writable memory is not a live transfer memory: {0}")]
+    WritableMemory(KernelError),
+    /// The writable memory is not [`WRITABLE_SIZE`] bytes.
+    #[error("the syncpoint page's writable memory is {size:#x} bytes, not {WRITABLE_SIZE:#x}")]
+    WritableSize {
+        /// Its size.
+        size: u64,
+    },
+    /// The read-only memory is not a live transfer memory.
+    #[error("the syncpoint page's read-only memory is not a live transfer memory: {0}")]
+    ReadOnlyMemory(KernelError),
+    /// The read-only memory is not [`READ_ONLY_SIZE`] bytes.
+    #[error("the syncpoint page's read-only memory is {size:#x} bytes, not {READ_ONLY_SIZE:#x}")]
+    ReadOnlySize {
+        /// Its size.
+        size: u64,
+    },
     /// The kernel refused to re-attach the request event's hook.
     #[error("the kernel refused to re-attach the syncpoint page's request hook: {0}")]
     Rehook(KernelError),
 }
 
-/// How a restore re-attaches the request event's hook (module docs, "What is saved"): the kernel
-/// checks the event against what it holds. The kernel's [`Dispatcher`] implements it.
-pub trait Rehook {
+/// What a restore asks the kernel (module docs, "What is saved"): it checks the objects the page
+/// names against what it holds, and re-attaches the request event's hook. The kernel's
+/// [`Dispatcher`] implements it.
+pub trait RestoreKernel {
     /// Attaches `hook` to `event`, the writable end of an event the server of `service` made, or
     /// says why the kernel refuses ([`Dispatcher::reattach_event_hook`]).
     fn reattach(
@@ -620,9 +657,17 @@ pub trait Rehook {
         event: ObjectId,
         hook: Arc<dyn EventHook>,
     ) -> SvcResult<()>;
+
+    /// Whether `event` is a live end of an event the server of `service` made
+    /// ([`Dispatcher::is_service_event`]).
+    fn is_service_event(&self, service: ServiceId, event: ObjectId) -> bool;
+
+    /// The size of the live transfer memory `memory` names, or why there is none
+    /// ([`Dispatcher::transfer_memory`]: `InvalidHandle`).
+    fn transfer_memory_size(&self, memory: ObjectId) -> SvcResult<u64>;
 }
 
-impl Rehook for Dispatcher {
+impl RestoreKernel for Dispatcher {
     /// [`Dispatcher::reattach_event_hook`].
     fn reattach(
         &self,
@@ -632,6 +677,45 @@ impl Rehook for Dispatcher {
     ) -> SvcResult<()> {
         self.reattach_event_hook(service, event, hook)
     }
+
+    /// [`Dispatcher::is_service_event`].
+    fn is_service_event(&self, service: ServiceId, event: ObjectId) -> bool {
+        Dispatcher::is_service_event(self, service, event)
+    }
+
+    /// [`Dispatcher::transfer_memory`]'s size.
+    fn transfer_memory_size(&self, memory: ObjectId) -> SvcResult<u64> {
+        Ok(self.transfer_memory(memory)?.size())
+    }
+}
+
+/// The checks of the objects `page` names against what `kernel` holds, for the root's server,
+/// numbered `root`, in the documented order (module docs, "What is saved"), the hook's excepted.
+fn check_kernel_objects(
+    page: &Page,
+    kernel: &dyn RestoreKernel,
+    root: ServiceId,
+) -> Result<(), PageSnapshotError> {
+    if let Some(answer) = page.answer
+        && !kernel.is_service_event(root, answer)
+    {
+        return Err(PageSnapshotError::AnswerEvent);
+    }
+    if let Some(binding) = page.binding {
+        let size = kernel
+            .transfer_memory_size(binding.writable)
+            .map_err(PageSnapshotError::WritableMemory)?;
+        if size != u64::from(WRITABLE_SIZE) {
+            return Err(PageSnapshotError::WritableSize { size });
+        }
+        let size = kernel
+            .transfer_memory_size(binding.read_only)
+            .map_err(PageSnapshotError::ReadOnlyMemory)?;
+        if size != u64::from(READ_ONLY_SIZE) {
+            return Err(PageSnapshotError::ReadOnlySize { size });
+        }
+    }
+    Ok(())
 }
 
 /// The snapshot header.
@@ -913,14 +997,15 @@ impl Shared {
     }
 
     /// Replaces the page with what [`Shared::save_page`] wrote, after the checks of the module
-    /// docs ("What is saved"), the last of which re-attaches the request event's hook (the
-    /// completion queue) through `kernel`, for the root's server, numbered `root`. Restore the
+    /// docs ("What is saved"): the objects the page names are checked against `kernel`, and the
+    /// last check re-attaches the request event's hook (the completion queue) through it, for
+    /// the root's server, numbered `root`. Restore the
     /// rest of gsv's shared state first ([`Shared::restore`]), and run this before the guest
     /// runs again. On an error the page is as it was.
     pub fn restore_page(
         &self,
         bytes: &[u8],
-        kernel: &dyn Rehook,
+        kernel: &dyn RestoreKernel,
         root: ServiceId,
     ) -> Result<(), PageSnapshotError> {
         let (header, rest) =
@@ -940,6 +1025,7 @@ impl Shared {
         }
         let mut state = self.lock();
         state.check_page(&page)?;
+        check_kernel_objects(&page, kernel, root)?;
         if let Some(request) = page.request {
             let queue: Arc<CompletionQueue> = Arc::clone(self.queue());
             let hook: Arc<dyn EventHook> = queue;

@@ -25,4 +25,6 @@ tracing.workspace = true
 # The services framework's fake kernel and host (`framework::fake`), which the root's tests drive.
 starquake-services = { workspace = true, features = ["test-support"] }
 starquake-ipc.workspace = true
+# The page's restore tests drive the kernel's own dispatcher: a guest's registers.
+starquake-cpu.workspace = true
 proptest.workspace = true
