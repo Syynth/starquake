@@ -11,6 +11,7 @@
 //! * [`note`]: the notes gsv records for replay.
 //! * [`nvsrv`]: the NVIDIA driver session (the nvdrv protocol) and `/dev/nvmap`.
 //! * [`gpu`]: the gpu session (497) and its worker: GPU memory, mappings and sparse regions.
+//! * [`syncpt`]: the syncpt session: slot events, armed waits and counter queries.
 
 pub mod completion;
 pub mod gpu;
@@ -19,3 +20,7 @@ pub mod nvsrv;
 pub mod protocol;
 pub mod root;
 pub mod shared;
+pub mod syncpt;
+
+#[cfg(test)]
+mod testing;

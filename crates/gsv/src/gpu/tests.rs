@@ -140,8 +140,8 @@ impl TimerHost for Timer<'_> {
     }
 }
 
-/// A timer host that unlocks and keeps the tokens, and signals nothing: [`TimerHost`]'s default
-/// refusal.
+/// A timer host that unlocks and keeps the tokens, and refuses every signal with
+/// [`KernelError::NotImplemented`].
 struct Refusing(Vec<DeviceShareToken>);
 
 impl TimerHost for Refusing {
@@ -150,6 +150,10 @@ impl TimerHost for Refusing {
     fn unlock_device_share(&mut self, token: DeviceShareToken) -> Result<(), DeviceShareError> {
         self.0.push(token);
         Ok(())
+    }
+
+    fn signal_event(&mut self, _: ObjectId) -> Result<(), KernelError> {
+        Err(KernelError::NotImplemented)
     }
 }
 
@@ -1606,7 +1610,7 @@ fn the_drain_skips_unknown_tickets_and_goes_on_after_a_refused_signal() {
         ticket: Ticket(77),
     }));
     s.rig.front.finish(&queue);
-    // A host that signals nothing: the trait's default refusal.
+    // A host that signals nothing: it refuses every signal.
     let mut host = Refusing(Vec::new());
     let taken = s.rig.shared.drain(&mut host);
     assert_eq!(taken.len(), 3);
