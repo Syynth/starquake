@@ -547,12 +547,12 @@ fn an_environment_failure_stops_the_run_and_keeps_nothing() {
     for index in 0..3 {
         for disagree in [false, true] {
             let case = format!("read {index}, disagreeing: {disagree}");
-            let (replay, error) = replay_failing_at(index, disagree);
-            let replay = Arc::new(replay);
+            let (recording, error) = replay_failing_at(index, disagree);
+            let replay = Arc::new(recording);
             let env: Arc<dyn Env> = Arc::<ReplayEnv>::clone(&replay);
             let mut rig = Rig::reading(env);
-            let reply = rig.send_raw(rig.session, &ask);
-            assert_eq!(reply, only(DEFERRED_REPLY_DROPPED), "{case}");
+            let answer = rig.send_raw(rig.session, &ask);
+            assert_eq!(answer, only(DEFERRED_REPLY_DROPPED), "{case}");
             let stop = Stop::Handler {
                 service: NAME.to_owned(),
                 error: error.clone(),

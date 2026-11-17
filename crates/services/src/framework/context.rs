@@ -190,6 +190,11 @@ impl Context<'_> {
     /// request. A [`Job`](super::work::Job) does not take it along: its executor gives it the
     /// environment it reads through ([`work`](super::work)).
     ///
+    /// It is the server's environment as [`Server::with_env`](super::Server::with_env) wrapped
+    /// it: a call that fails has told the run's [`Halt`](super::Halt) before the method gets the
+    /// error, and `?` on the error answers the request as one the server gave up on
+    /// ([`halt`](super::halt)).
+    ///
     /// A server with no environment is a mistake in how it was put together: it is logged as an
     /// error and the request fails with [`NOT_SUPPORTED`], as for [`Context::family`].
     pub fn env(&self) -> Result<Arc<dyn Env>, Fault> {
