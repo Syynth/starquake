@@ -47,9 +47,9 @@
 //!    one, it and the code fit the largest process memory ([`SnapshotError::Stack`]); the
 //!    largest heap is zero or what the stack left (`KProcess::Run`), and exactly that when
 //!    there is a stack ([`SnapshotError::MaxHeap`]); the heap is whole pages and at most the
-//!    largest heap and the heap region ([`SnapshotError::Heap`]); the reservation is at most the
-//!    pool ([`SnapshotError::OverLimit`]) and exactly the code, stack, heap and mapped physical
-//!    memory ([`SnapshotError::Reservation`]).
+//!    largest heap, which is at most the heap region ([`SnapshotError::Heap`]); the reservation
+//!    is at most the pool ([`SnapshotError::OverLimit`]) and exactly the code, stack, heap and
+//!    mapped physical memory ([`SnapshotError::Reservation`]).
 //! 4. Each block in turn ([`SnapshotError::Block`], first failing check of the first failing
 //!    block): its shape, that it starts where the one before ended (the first at the address
 //!    space's start: [`BlockFault::Overlap`] below that, [`BlockFault::Gap`] above), that it
@@ -89,8 +89,7 @@
 //!   as mapped physical memory); nothing else reserves.
 //! - **The code and the heap.** The code is mapped as `Code` when the address space is made,
 //!   and only `SetProcessMemoryPermission` changes its state, to `CodeData` when it becomes
-//!   writable.
-//!   Only heap growth maps `Normal` memory inside the heap region (nothing in the kernel calls
+//!   writable. Only heap growth maps `Normal` memory inside the heap region (nothing in the kernel calls
 //!   [`AddressSpace::map_pages`] with `Normal`; a caller that did would make a space that fails
 //!   this check), and only a heap shrink frees it.
 //! - **The mapped physical memory.** Only `MapPhysicalMemory` makes `Normal` memory in the
@@ -283,7 +282,7 @@ pub enum SnapshotError {
         /// The saved largest heap.
         size: u64,
     },
-    /// The heap is not whole pages, or is larger than the largest heap or the heap region.
+    /// The heap is not whole pages, or is larger than the largest heap.
     #[error("the address space snapshot's heap of {size:#x} bytes does not fit")]
     Heap {
         /// The saved heap size.
@@ -620,7 +619,7 @@ impl Body {
             return Err(SnapshotError::MaxHeap { size: max_heap });
         }
         let heap = self.heap_size;
-        if !heap.is_multiple_of(PAGE_SIZE) || heap > max_heap || heap > regions.heap.size() {
+        if !heap.is_multiple_of(PAGE_SIZE) || heap > max_heap {
             return Err(SnapshotError::Heap { size: heap });
         }
         let limit = memory.arrangement.application_pool_size();
@@ -915,13 +914,10 @@ fn overlap(block: &MemoryBlock, region: Region) -> u64 {
     end.saturating_sub(start)
 }
 
-/// Whether every block that `range` touches has a state `test` accepts. True for an empty
-/// range. The blocks tile the address space in order, so the walk starts at the block holding
-/// the range's start.
+/// Whether every block that `range` touches has a state `test` accepts. The range is not
+/// empty (the layout refuses code of no bytes: `the_code_must_have_pages`). The blocks tile the
+/// address space in order, so the walk starts at the block holding the range's start.
 fn every_block(blocks: &[MemoryBlock], range: Region, test: impl Fn(MemoryState) -> bool) -> bool {
-    if range.start >= range.end {
-        return true;
-    }
     let first = blocks.partition_point(|block| block.end().is_some_and(|end| end <= range.start));
     blocks
         .get(first..)

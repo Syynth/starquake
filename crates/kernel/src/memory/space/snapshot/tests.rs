@@ -1828,3 +1828,124 @@ fn the_random_operations_reach_nested_and_overlapping_locks() {
     assert!(restored.blocks().all(|block| block.device_use_count() == 0
         && !block.attribute().contains(MemoryAttribute::DEVICE_SHARED)));
 }
+
+// ----- Checks the mutation run asked for -------------------------------------------------------
+
+#[test]
+fn the_code_must_have_pages() {
+    let rich = rich();
+    let mut case = Case::new(&rich);
+    case.body.request.code_size = 0;
+    assert_eq!(
+        case.error(),
+        SnapshotError::Layout(LayoutError::BadCode {
+            address: CODE,
+            size: 0
+        })
+    );
+}
+
+#[test]
+fn normal_memory_outside_the_heap_and_alias_regions_is_out_of_its_region() {
+    // The thread-local page made `Normal`: in the kernel-map region, which is neither.
+    let rich = rich();
+    let mut case = Case::new(&rich);
+    let index = at(&case.body, thread_local(&rich));
+    case.body.blocks[index].state = MemoryState::Normal.word();
+    assert_eq!(
+        case.error(),
+        SnapshotError::Block {
+            index,
+            fault: BlockFault::Region
+        }
+    );
+}
+
+#[test]
+fn the_heap_must_start_at_the_heap_regions_start() {
+    // The heap's first two pages freed and the heap two pages shorter: the heap region holds as
+    // many `Normal` bytes as the heap is long, but not from its start.
+    let rich = rich();
+    let mut case = Case::new(&rich);
+    let first = at(&case.body, rich.heap);
+    let block = &mut case.body.blocks[first];
+    assert_eq!(block.pages, 2);
+    assert_eq!(block.attribute, 0);
+    block.state = MemoryState::Free.word();
+    block.permission = MemoryPermission::NONE.bits();
+    case.body.heap_size -= 2 * PAGE_SIZE;
+    case.body.reserved -= 2 * PAGE_SIZE;
+    assert_eq!(case.error(), SnapshotError::HeapRange);
+}
+
+#[test]
+fn a_mapping_over_a_block_of_another_state_is_not_a_shared_block() {
+    // The second mapping moved onto the generated code, which has two pages like the mapping
+    // is made to have: the right size, the wrong state.
+    let rich = rich();
+    let mut case = Case::new(&rich);
+    case.body.shared[1].address = GENERATED;
+    case.body.shared[1].size = 2 * PAGE_SIZE;
+    assert_eq!(
+        case.error(),
+        SnapshotError::Shared {
+            index: 1,
+            fault: SharedFault::NotABlock
+        }
+    );
+}
+
+#[test]
+fn a_lock_range_saved_twice_is_out_of_order() {
+    let rich = rich();
+    let mut case = Case::new(&rich);
+    let first = case.body.locks[0];
+    case.body.locks.insert(1, first);
+    assert_eq!(
+        case.error(),
+        SnapshotError::Lock {
+            index: 1,
+            fault: LockFault::Order
+        }
+    );
+}
+
+#[test]
+fn each_device_count_is_checked_against_the_locks_on_its_own() {
+    // Heap pages 3-5 are locked once, overlapping the twice-locked pages 2-3: page 3 is used by
+    // three locks, starts one and ends two; pages 4-5 are used by one and end it. Each change
+    // keeps the block's own checks passing, so only the sums can catch it.
+    let rich = rich();
+    let middle = page(rich.heap, 3);
+    let last = page(rich.heap, 4);
+    let body = Body::of(&rich.space);
+    let counts = |address| {
+        let block = body.blocks[at(&body, address)];
+        (
+            block.device_use_count,
+            block.device_disable_merge_left_count,
+            block.device_disable_merge_right_count,
+        )
+    };
+    assert_eq!(counts(middle), (3, 1, 2));
+    assert_eq!(counts(last), (1, 0, 1));
+    let changes: [(&str, u64, fn(&mut SavedBlock)); 3] = [
+        ("a use count", last, |b| b.device_use_count = 2),
+        ("a left count", middle, |b| {
+            b.device_disable_merge_left_count = 2
+        }),
+        ("a right count", middle, |b| {
+            b.device_disable_merge_right_count = 1
+        }),
+    ];
+    for (name, address, change) in changes {
+        let mut case = Case::new(&rich);
+        let block = at(&case.body, address);
+        change(&mut case.body.blocks[block]);
+        assert_eq!(
+            case.error(),
+            SnapshotError::DeviceCounts { block },
+            "{name}"
+        );
+    }
+}

@@ -10,6 +10,10 @@
 //!   default.
 //! - [`pool`]: the console's memory arrangement and a process's memory count.
 //! - [`space`]: [`AddressSpace`], the table a system call declares, and its operations.
+//! - [`space::snapshot`]: the address space saved and restored ([`AddressSpace::save`],
+//!   [`AddressSpace::restore`]): the blocks and the counts, with the [`Mapper`] rebuilt, since a
+//!   `Box<dyn Mapper>` cannot be serialised (observability spec, "Order of work", step 6,
+//!   "kernel and memory first").
 //! - [`mapper`]: [`Mapper`], through which a change becomes real for guest code.
 //! - [`shared`]: shared and transfer memory as kernel objects, and the pages of a shared
 //!   memory as host code reaches them.
@@ -19,18 +23,13 @@
 //!
 //! # Not built in this slice
 //!
-//! Two things the specs ask of the address space are not here:
+//! One thing the specs ask of the address space is not here:
 //!
 //! - **The `Map` recording point.** `docs/specs/observability.md` has each of the address
 //!   space's mutators call the recorder once, and `docs/specs/kernel.md` ("Recording and
 //!   replay") lists the address space as a recording point. [`AddressSpace`]'s mutators record
 //!   nothing, and no `EventKind::Map` is produced anywhere. Owner: a follow-up to slice 6 (not
 //!   yet scheduled), which gives the mutators the recorder.
-//! - **A serialisable table.** `docs/specs/kernel.md` ("Recording and replay") has the tables
-//!   serialisable, for snapshots. Nothing here derives serialisation, and [`AddressSpace`] owns
-//!   a `Box<dyn Mapper>`, which cannot be serialised: a snapshot has to save the blocks and the
-//!   counts and rebuild the mapper. Owner: the observability spec's snapshots (its "Order of
-//!   work", step 6, "kernel and memory first").
 
 pub mod block;
 pub mod block_map;
