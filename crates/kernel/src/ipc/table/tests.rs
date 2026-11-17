@@ -393,3 +393,24 @@ fn an_ipc_failure_is_a_kernel_result_only_when_it_is_one() {
         SvcError::Internal(stale.to_string())
     );
 }
+
+#[test]
+fn a_server_event_is_one_its_own_server_noted() {
+    let mut world = World::new();
+    let other = world.ipc.add_server("other", ServiceId(8)).unwrap();
+    let event = ObjectId::from_parts(3, 1);
+    // The same slot in another generation: another object.
+    let stale = ObjectId::from_parts(3, 2);
+    assert!(!world.ipc.is_server_event(world.server, event));
+    world.ipc.add_server_event(world.server, event).unwrap();
+    assert!(world.ipc.is_server_event(world.server, event));
+    assert!(!world.ipc.is_server_event(world.server, stale));
+    assert!(!world.ipc.is_server_event(other, event));
+
+    let nowhere = ServerId::from_parts(9, 9);
+    assert_eq!(
+        world.ipc.add_server_event(nowhere, event),
+        Err(IpcError::UnknownServer(nowhere))
+    );
+    assert!(!world.ipc.is_server_event(nowhere, event));
+}

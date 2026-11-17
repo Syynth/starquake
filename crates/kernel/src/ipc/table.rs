@@ -28,7 +28,7 @@
 //! it ([`Notice::Accept`]). A session a server makes on itself (a cloned session, a new
 //! sub-interface) needs no notice: the server records it when it makes it.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use starquake_trace::{ServiceId, ThreadId};
 
@@ -163,6 +163,9 @@ struct ServerRow {
     service: ServiceId,
     queue: RequestQueue,
     notices: VecDeque<Notice>,
+    /// The events the server made for itself while it handled requests (either end), which
+    /// it alone may clear ([`Ipc::is_server_event`]).
+    events: BTreeSet<ObjectId>,
 }
 
 /// One session.
@@ -206,6 +209,7 @@ impl Ipc {
             service,
             queue: RequestQueue::new(),
             notices: VecDeque::new(),
+            events: BTreeSet::new(),
         };
         let server = self.servers.insert(row).map_err(|_| IpcError::Full)?;
         self.services.insert(service, server);
@@ -258,6 +262,22 @@ impl Ipc {
         self.servers
             .get(server)
             .map_err(|_| IpcError::UnknownServer(server))
+    }
+
+    /// Notes that `server` made the event `event` is an end of: the server may clear it
+    /// ([`Ipc::is_server_event`]). The server keeps its creator's reference for as long as it
+    /// lives, so the id names that event for as long as the note is kept.
+    pub fn add_server_event(&mut self, server: ServerId, event: ObjectId) -> Result<(), IpcError> {
+        self.server_mut(server)?.events.insert(event);
+        Ok(())
+    }
+
+    /// Whether `server` made the event `event` is an end of ([`Ipc::add_server_event`]). False
+    /// for an id the server did not note, and for a server this table does not know.
+    #[must_use]
+    pub fn is_server_event(&self, server: ServerId, event: ObjectId) -> bool {
+        self.server(server)
+            .is_ok_and(|row| row.events.contains(&event))
     }
 
     fn server_mut(&mut self, server: ServerId) -> Result<&mut ServerRow, IpcError> {

@@ -2292,7 +2292,12 @@ mod trace {
                 10,
                 "GetProcessWindingController"
             ));
-            assert!(!implements_request("ISelfController", 0, "Exit"));
+            assert!(implements_request("ISelfController", 0, "Exit"));
+            assert!(!implements_request(
+                "ISelfController",
+                40,
+                "CreateManagedDisplayLayer"
+            ));
             assert!(!implements_request(
                 "appletOE",
                 20,

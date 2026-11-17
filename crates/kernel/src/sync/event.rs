@@ -170,4 +170,23 @@ impl Scheduler {
             | Err(_) => Err(KernelError::InvalidHandle.into()),
         }
     }
+
+    /// Clears the event `object` is an end of, whichever end (`ClearEvent`'s two cases): the
+    /// writable end's [`Scheduler::clear_event`], or the readable end's
+    /// [`Scheduler::clear_readable`]. An id that names no live object, or an object that is not
+    /// an event, is [`KernelError::InvalidHandle`], as [`Scheduler::signal_object`] answers.
+    pub fn clear_object(&mut self, object: ObjectId) -> CallResult<()> {
+        match self.objects().get(object) {
+            Ok(Object::Event(event)) => self.clear_event(event),
+            Ok(Object::ReadableEvent(_)) => self.clear_readable(object),
+            Ok(
+                Object::Thread(_)
+                | Object::Process(_)
+                | Object::Session
+                | Object::SharedMemory(_)
+                | Object::TransferMemory(_),
+            )
+            | Err(_) => Err(KernelError::InvalidHandle.into()),
+        }
+    }
 }

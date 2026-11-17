@@ -28,17 +28,18 @@ use super::command::proxy::{
 };
 use super::command::proxy_service::OPEN_APPLICATION_PROXY;
 use super::command::self_controller::{
-    GET_ACCUMULATED_SUSPENDED_TICK_CHANGED_EVENT, GET_GRAPHICS_SUPERVISOR, SET_FOCUS_HANDLING_MODE,
-    SET_OPERATION_MODE_CHANGED_NOTIFICATION, SET_OUT_OF_FOCUS_SUSPENDING_ENABLED,
-    SET_PERFORMANCE_MODE_CHANGED_NOTIFICATION,
+    EXIT, GET_ACCUMULATED_SUSPENDED_TICK_CHANGED_EVENT, GET_GRAPHICS_SUPERVISOR,
+    SET_FOCUS_HANDLING_MODE, SET_OPERATION_MODE_CHANGED_NOTIFICATION,
+    SET_OUT_OF_FOCUS_SUSPENDING_ENABLED, SET_PERFORMANCE_MODE_CHANGED_NOTIFICATION,
 };
 use super::command::window_controller::{ACQUIRE_FOREGROUND_RIGHTS, GET_APPLET_RESOURCE_USER_ID};
 
-/// `ISelfController::Exit`, which this port leaves out, so it has no shipping constant
-/// (`eden/src/core/hle/service/am/service/self_controller.cpp`: `{0, D<&ISelfController::Exit>,
-/// "Exit"}`).
-const EXIT: u32 = 0;
-/// `ICommonStateGetter::ReceiveMessage`, likewise left out (`common_state_getter.cpp`: `{1,
+/// `ISelfController::LockExit`, which this port leaves out, so it has no shipping constant
+/// (`eden/src/core/hle/service/am/service/self_controller.cpp`: `{1,
+/// D<&ISelfController::LockExit>, "LockExit"}`).
+const LOCK_EXIT: u32 = 1;
+/// `ICommonStateGetter::ReceiveMessage`, which this port leaves out, so it has no shipping
+/// constant (`common_state_getter.cpp`: `{1,
 /// D<&ICommonStateGetter::ReceiveMessage>, "ReceiveMessage"}`).
 const RECEIVE_MESSAGE: u32 = 1;
 
@@ -502,7 +503,7 @@ fn the_reply_values_are_edens_numbers() {
 
 /// Divergence from Eden, which clears the event where a message stops being available.
 #[test]
-fn turning_focus_notifications_off_does_not_clear_the_message_event() {
+fn turning_focus_notifications_off_clears_the_message_event() {
     let mut rig = Rig::new();
     let proxy = rig.proxy();
     let getter = rig.open(proxy, GET_COMMON_STATE_GETTER);
@@ -510,27 +511,80 @@ fn turning_focus_notifications_off_does_not_clear_the_message_event() {
     let copied = rig.object(getter, GET_EVENT_HANDLE, &[]).copies[0];
     let event = rig.object_of(copied);
     assert_eq!(rig.kernel.signals(event), Some(1));
+    assert_eq!(rig.kernel.is_signalled(event), Some(true));
 
     // notify stays on: nothing changes.
     let on = rig.object_raw(controller, SET_FOCUS_HANDLING_MODE, &[1, 0, 1]);
     assert_eq!(on, domain_reply(ResultCode::SUCCESS, &[], &[]));
     assert!(rig.applet().lifecycle().message_available());
     assert_eq!(rig.kernel.signals(event), Some(1));
+    assert_eq!(rig.kernel.is_signalled(event), Some(true));
 
-    // notify off: no message is available any more, and the event is left as it is.
+    // notify off, libnx's start-up: no message is available any more, and the event is cleared.
     let off = rig.object_raw(controller, SET_FOCUS_HANDLING_MODE, &[0, 0, 1]);
     assert_eq!(off, domain_reply(ResultCode::SUCCESS, &[], &[]));
     assert!(!rig.applet().lifecycle().message_available());
     assert_eq!(rig.kernel.signals(event), Some(1));
+    assert_eq!(rig.kernel.is_signalled(event), Some(false));
 
-    // notify off again: still nothing.
+    // notify off again: still nothing, and the event stays clear.
     rig.object(controller, SET_FOCUS_HANDLING_MODE, &[0, 0, 1]);
     assert_eq!(rig.kernel.signals(event), Some(1));
+    assert_eq!(rig.kernel.is_signalled(event), Some(false));
 
     // notify on again: the pending focus change is a message again, and the event is signalled.
     rig.object(controller, SET_FOCUS_HANDLING_MODE, &[1, 0, 1]);
     assert!(rig.applet().lifecycle().message_available());
     assert_eq!(rig.kernel.signals(event), Some(2));
+    assert_eq!(rig.kernel.is_signalled(event), Some(true));
+}
+
+#[test]
+fn notifications_turned_off_before_the_event_exists_clear_nothing() {
+    // No event yet: the change is only the applet's, and the event is made clear.
+    let mut rig = Rig::new();
+    let proxy = rig.proxy();
+    let controller = rig.open(proxy, GET_SELF_CONTROLLER);
+    let off = rig.object(controller, SET_FOCUS_HANDLING_MODE, &[0, 0, 1]);
+    assert_eq!(off.result, ResultCode::SUCCESS);
+    let getter = rig.open(proxy, GET_COMMON_STATE_GETTER);
+    let copied = rig.object(getter, GET_EVENT_HANDLE, &[]).copies[0];
+    let event = rig.object_of(copied);
+    assert_eq!(rig.kernel.is_signalled(event), Some(false));
+    assert_eq!(rig.kernel.signals(event), Some(0));
+}
+
+// ----- ISelfController: Exit -----------------------------------------------------------------
+
+#[test]
+fn exit_answers_success_and_asks_once_to_end_the_process() {
+    let mut rig = Rig::new();
+    let proxy = rig.proxy();
+    let controller = rig.open(proxy, GET_SELF_CONTROLLER);
+    assert_eq!(rig.kernel.ends(), 0);
+    // libnx's `_appletSelfExit`: no payload.
+    let reply = rig.object_raw(controller, EXIT, &[]);
+    assert_eq!(reply, domain_reply(ResultCode::SUCCESS, &[], &[]));
+    assert_eq!(rig.kernel.ends(), 1);
+}
+
+#[test]
+fn exit_on_a_kernel_that_cannot_end_the_process_answers_its_error() {
+    let mut rig = Rig::new();
+    let proxy = rig.proxy();
+    let controller = rig.open(proxy, GET_SELF_CONTROLLER);
+    let placeholder = FakeKernel::new(0).unwrap();
+    let mut kernel = RefusesSignals(std::mem::replace(&mut rig.kernel, placeholder));
+    let request = RequestBuilder::domain(CommandType::Request, controller, EXIT);
+    let mut buffer = vec![STALE; BUFFER_SIZE];
+    request.build(&mut buffer).unwrap();
+    let handled = rig.server.handle(&mut kernel, rig.session, &mut buffer);
+    assert_eq!(handled, Ok(Handled::Replied));
+    assert_eq!(
+        buffer,
+        domain_reply(KernelError::NotImplemented.code(), &[], &[])
+    );
+    assert_eq!(kernel.0.ends(), 0);
 }
 
 #[test]
@@ -792,8 +846,8 @@ fn commands_that_are_left_out_go_to_the_unknown_command_policy() {
     let controller = rig.open(proxy, GET_SELF_CONTROLLER);
     let getter = rig.open(proxy, GET_COMMON_STATE_GETTER);
     let refused = domain_reply(UNKNOWN_COMMAND_ID, &[], &[]);
-    assert_eq!(rig.object_raw(controller, EXIT, &[]), refused);
     assert_eq!(rig.object_raw(getter, RECEIVE_MESSAGE, &[]), refused);
+    assert_eq!(rig.object_raw(controller, LOCK_EXIT, &[]), refused);
     for command in [
         GET_AUDIO_CONTROLLER,
         GET_DISPLAY_CONTROLLER,
@@ -899,6 +953,9 @@ fn libnx_start_up_runs_through_in_the_traces_order() {
         lifecycle.focus_handling_mode,
         FocusHandlingMode::SuspendHomeSleep
     );
+    // So libnx's main loop finds the message event clear, and does not wake on every poll.
+    let event = rig.applet().message_event().unwrap();
+    assert_eq!(rig.kernel.is_signalled(event), Some(false));
     // The proxy, the root, and the eight interfaces it opened.
     assert_eq!(rig.server.interface_count(), 10);
 }
@@ -982,13 +1039,40 @@ fn a_failed_signal_still_keeps_the_lifecycle_change() {
     assert_eq!(fresh.applet().message_event(), Some(event));
 }
 
+/// `ISelfController` writes the applet back before it reports a failed clear, as it does a
+/// failed signal: a server restored onto a kernel where its saved message event is not an
+/// event fails the clear with the kernel's exact error, and the flag the command set is kept.
+#[test]
+fn a_failed_clear_still_keeps_the_lifecycle_change() {
+    let mut rig = Rig::new();
+    let proxy = rig.proxy();
+    let getter = rig.open(proxy, GET_COMMON_STATE_GETTER);
+    let controller = rig.open(proxy, GET_SELF_CONTROLLER);
+    rig.object(getter, GET_EVENT_HANDLE, &[]);
+    assert!(rig.applet().lifecycle().message_available());
+    let event = rig.applet().message_event().unwrap();
+    let saved = rig.server.save().unwrap();
+
+    // A fresh kernel did not make the event, so the server may not clear it.
+    let mut fresh = Rig::new();
+    assert_eq!(fresh.kernel.is_signalled(event), None);
+    fresh.server.restore(&saved).unwrap();
+    let off = fresh.object(controller, SET_FOCUS_HANDLING_MODE, &[0, 0, 1]);
+    assert_eq!(off.result, KernelError::InvalidHandle.code());
+    let lifecycle = *fresh.applet().lifecycle();
+    assert!(!lifecycle.notifications.focus_state_changed);
+    assert!(!lifecycle.message_available());
+    assert_eq!(fresh.applet().message_event(), Some(event));
+}
+
 /// The error every signal of a [`RefusesSignals`] kernel reports: one no command of the port
 /// reports otherwise.
 const REFUSED: KernelError = KernelError::OutOfResource;
 
 /// A [`FakeKernel`] whose `signal_event` always fails with [`REFUSED`], even for an event it just
 /// made: how a test reaches the failure path of signalling a new event, which the fake alone
-/// never takes.
+/// never takes. It does not offer `clear_event` or `end_process`, so they answer the trait's
+/// default, [`KernelError::NotImplemented`].
 struct RefusesSignals(FakeKernel);
 
 impl Kernel for RefusesSignals {

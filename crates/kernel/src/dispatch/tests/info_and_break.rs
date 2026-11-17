@@ -1,10 +1,11 @@
-//! The `GetInfo` arm's entropy, drawn from the environment at the first ask, and the `Break`
-//! arm: which registers each reads and writes, how each dispatch ends and what it records.
+//! The `GetInfo` arm's entropy, drawn from the environment at the first ask, its Switch 2 ids,
+//! and the `Break` arm: which registers each reads and writes, how each dispatch ends and what
+//! it records.
 
 use super::*;
 use crate::process::ENTROPY_COUNT;
 use crate::svc::exception::{Break, BreakReason, NOTIFICATION_ONLY_FLAG, RESULT_ARGUMENT_SIZE};
-use crate::svc::info::InfoType;
+use crate::svc::info::{InfoType, MEMORY_MAPPING_ALIGNMENT};
 use crate::tables::Processes;
 
 /// The entropy words the replays below hand out: all different, and none a clock reading.
@@ -226,6 +227,35 @@ fn an_environment_that_fails_while_drawing_ends_the_call_without_writing_registe
         [0, DRAWN[1]]
     );
     assert_eq!(env.finish(), Ok(()));
+}
+
+#[test]
+fn a_switch_2_id_is_answered_by_the_calling_process_s_console() {
+    // The arm hands the call the process table, so the console of the calling process decides
+    // the answer: a Switch 2 program is told the mapping alignment, a Switch 1 program that
+    // the id is not one (`svc::info`). Neither draws a random number.
+    let memory = FlatMemory::new(BASE, 0x10);
+    let id = InfoType::MemoryMappingAlignment;
+    for (console, expected) in [
+        (Console::Switch2, [0, MEMORY_MAPPING_ALIGNMENT]),
+        (Console::Switch1, [word(KernelError::InvalidEnumValue), 0]),
+    ] {
+        let dispatcher = Dispatcher::new(tables_at(console));
+        let env = ReplayEnv::new(vec![clock(0)]);
+        let mut regs = get_info_regs(id, Handle::CURRENT_PROCESS, 0);
+        let before = regs.clone();
+        let (record, _) = dispatch_with(
+            &dispatcher,
+            &env,
+            &memory,
+            SvcId::GetInfo.number(),
+            &mut regs,
+        );
+        assert_eq!(record.outcome, Outcome::Completed, "{console:?}");
+        assert_untouched_from(&regs, &before, 2);
+        assert_eq!([regs.x[0], regs.x[1]], expected, "{console:?}");
+        assert_eq!(env.finish(), Ok(()));
+    }
 }
 
 /// The registers for `Break(raw_reason, address, size)` over [`regs`].

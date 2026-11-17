@@ -6,6 +6,12 @@
 //!
 //! * [`protocol`]: the root's command table, with each fact's mark and source.
 //! * [`root`]: the root's server: the bootstrap, and every other root command as a logged stub.
+//! * [`completion`]: the completion queue host threads report through.
+//! * [`shared`]: the state handlers and the timer thread share, the lock order, and the drain.
+//! * [`note`]: the notes gsv records for replay.
 
+pub mod completion;
+pub mod note;
 pub mod protocol;
 pub mod root;
+pub mod shared;

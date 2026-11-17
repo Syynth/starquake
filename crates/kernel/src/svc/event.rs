@@ -100,11 +100,8 @@ pub fn clear_event(
     scheduler: &mut Scheduler,
     handle: Handle,
 ) -> CallResult<()> {
-    match object_of(handles, scheduler, handle)? {
-        (_, Object::Event(event)) => scheduler.clear_event(event),
-        (readable, Object::ReadableEvent(_)) => scheduler.clear_readable(readable),
-        _ => Err(KernelError::InvalidHandle.into()),
-    }
+    let (object, _) = object_of(handles, scheduler, handle)?;
+    scheduler.clear_object(object)
 }
 
 /// Resets the readable event, or the process, `handle` names.

@@ -41,7 +41,8 @@ so the `SendSyncRequest` carrying it returns `0x7601`, the kernel's `ResultTermi
 (`eden/src/core/hle/kernel/svc_results.h`, module 1, description 59), and nothing follows. That
 is the trace's last line. On a console the request would not return to the guest at all; the
 result is what the reference's thread saw while it was being terminated, and starquake need not
-match it.
+match it: its `appletOE` answers `Exit` with success and then ends the process, the order the
+services spec gives (`crates/services/src/am.rs`, "Where this differs from Eden").
 
 The other notes in `docs/reference-emulator.md` apply here too: every `SendSyncRequest` with
 result `0xf601` is the reference's answer to a session's close request, which is unverified.
@@ -96,7 +97,6 @@ the two markers below differs; its failure message holds the text to put there.
 | 204 | `ipc nvdrv::2 (Close)` | `0x0` |
 | 218 | `ipc IApplicationDisplayService::2021 (CloseLayer)` | `0x0` |
 | 220 | `ipc IApplicationDisplayService::1020 (CloseDisplay)` | `0x0` |
-| 267 | `ipc ISelfController::0 (Exit)` | `0x7601` |
 <!-- end of the gap list -->
 
 ## Regenerating
