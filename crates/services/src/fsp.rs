@@ -168,8 +168,15 @@
 //!   the buffer, so a request with both a negative offset and a negative size is
 //!   `INVALID_SIZE` there and `INVALID_OFFSET` here
 //!   (`a_storage_read_checks_the_offset_before_the_size_and_the_buffer`). A size of zero answers
-//!   at once, and an offset and size whose sum overflows an `s64` is [`result::OUT_OF_RANGE`],
-//!   as `IFile`'s `Read` (`a_storage_read_of_nothing_answers_at_once_and_one_that_overflows_is_out_of_range`).
+//!   at once with nothing read, as Eden's read of zero bytes ends.
+//! - **`IStorage::Read` is stricter than the reference about an end past `s64`.** An offset and
+//!   size whose sum overflows an `s64` is [`result::OUT_OF_RANGE`] here, the check `IFile`'s
+//!   `Read` makes. Neither Eden's `IStorage::Read`
+//!   (`eden/src/core/hle/service/filesystem/fsp/fs_i_storage.cpp`, which checks only
+//!   `length >= 0` and `offset >= 0`, then reads) nor the console's
+//!   `StorageInterfaceAdapter::Read` (Atmosphère, above; fact only) checks the sum, so there
+//!   such a read succeeds with whatever its storage holds at the offset. Pinned by
+//!   `a_storage_read_of_nothing_answers_at_once_and_one_that_overflows_is_out_of_range`.
 //!   Eden's `IStorage::Read` also sleeps to hold reads to 40 MB/s; nothing here sleeps (a
 //!   service never blocks), so reads take what the host takes.
 //! - **Data storage failures.** A read of the storage that the host fails is
