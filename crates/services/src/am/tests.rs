@@ -2893,3 +2893,49 @@ fn a_failed_clear_leaves_the_message_to_be_received_again() {
     let first = fresh.object_raw(getter, RECEIVE_MESSAGE, &[]);
     assert_eq!(first, message_reply(AppletMessage::FocusStateChanged));
 }
+
+/// Eden's `SignalSystemEventIfNeeded` clears the event only when its cached "a message is
+/// available" was true. Restored onto a kernel that did not make the message event, with no
+/// message pending, `ReceiveMessage` and a lifecycle command that leaves none pending touch no
+/// event: they answer `ResultNoMessages` and success, not the kernel's `InvalidHandle`.
+#[test]
+fn with_no_message_pending_nothing_clears_the_message_event() {
+    let mut rig = Rig::new();
+    let (proxy, getter, event) = rig.getter_with_event();
+    let controller = rig.open(proxy, GET_SELF_CONTROLLER);
+    let first = rig.object_raw(getter, RECEIVE_MESSAGE, &[]);
+    assert_eq!(first, message_reply(AppletMessage::FocusStateChanged));
+    let saved = rig.server.save().unwrap();
+
+    let mut fresh = Rig::new();
+    assert_eq!(fresh.kernel.is_signalled(event), None);
+    fresh.server.restore(&saved).unwrap();
+    assert!(!fresh.applet().lifecycle().message_available());
+    for _ in 0..2 {
+        let none = fresh.object_raw(getter, RECEIVE_MESSAGE, &[]);
+        assert_eq!(none, domain_reply(NO_MESSAGES, &[], &[]));
+    }
+    let on = fresh.object(controller, SET_FOCUS_HANDLING_MODE, &[1, 0, 1]);
+    assert_eq!(on.result, ResultCode::SUCCESS);
+    assert!(!fresh.applet().lifecycle().message_available());
+}
+
+/// The other side of [`with_no_message_pending_nothing_clears_the_message_event`]: Eden signals
+/// only when its cached "a message is available" was false. Restored onto a kernel that did not
+/// make the message event, with the focus change still pending, a lifecycle command that keeps
+/// it pending touches no event and succeeds.
+#[test]
+fn with_a_message_still_pending_nothing_signals_the_message_event() {
+    let mut rig = Rig::new();
+    let (proxy, _, event) = rig.getter_with_event();
+    let controller = rig.open(proxy, GET_SELF_CONTROLLER);
+    assert!(rig.applet().lifecycle().message_available());
+    let saved = rig.server.save().unwrap();
+
+    let mut fresh = Rig::new();
+    assert_eq!(fresh.kernel.is_signalled(event), None);
+    fresh.server.restore(&saved).unwrap();
+    let on = fresh.object(controller, SET_FOCUS_HANDLING_MODE, &[1, 0, 1]);
+    assert_eq!(on.result, ResultCode::SUCCESS);
+    assert!(fresh.applet().lifecycle().message_available());
+}
