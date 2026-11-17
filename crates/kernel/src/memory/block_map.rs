@@ -340,7 +340,9 @@ impl BlockMap {
             }
             if cut.last() >= end {
                 let mut above = cut;
-                cut = above.split(end).ok_or(BlockMapError::Broken { address: end })?;
+                cut = above
+                    .split(end)
+                    .ok_or(BlockMapError::Broken { address: end })?;
             }
             let left = cut.address() == address;
             let right = cut.end() == Some(end);

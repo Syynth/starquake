@@ -192,13 +192,14 @@ impl World {
         made.lock().unwrap().take().unwrap()
     }
 
-    /// Whether the readable end `readable` is signalled.
-    fn is_signalled(&self, readable: ObjectId) -> bool {
-        self.dispatcher
-            .with::<(&Scheduler,), _>(|(scheduler,)| match scheduler.objects().get(readable) {
-                Ok(Object::ReadableEvent(state)) => state.is_signalled(),
-                other => panic!("{other:?} is not a readable end"),
-            })
+    /// Whether the readable end `readable` is signalled: `None` if it is not a readable end.
+    fn is_signalled(&self, readable: ObjectId) -> Option<bool> {
+        self.dispatcher.with::<(&Scheduler,), _>(|(scheduler,)| {
+            match scheduler.objects().get(readable) {
+                Ok(Object::ReadableEvent(state)) => Some(state.is_signalled()),
+                _ => None,
+            }
+        })
     }
 }
 
@@ -211,12 +212,12 @@ fn a_hook_runs_after_the_guest_signals_its_event() {
     assert_eq!(hook.signalled(), []);
     // The guest signals: the event is signalled and the hook told, with the writable end.
     assert_eq!(world.call_with_handle(SvcId::SignalEvent, handle), 0);
-    assert!(world.is_signalled(readable));
+    assert_eq!(world.is_signalled(readable), Some(true));
     assert_eq!(hook.signalled(), [writable]);
     // Signalling an event that is already signalled changes nothing in the kernel, and still
     // runs the hook: the guest asked again.
     assert_eq!(world.call_with_handle(SvcId::SignalEvent, handle), 0);
-    assert!(world.is_signalled(readable));
+    assert_eq!(world.is_signalled(readable), Some(true));
     assert_eq!(hook.signalled(), [writable, writable]);
 }
 
@@ -225,12 +226,13 @@ fn each_hook_hears_only_its_own_event() {
     let world = World::new();
     let first = Arc::new(Counting::default());
     let second = Arc::new(Counting::default());
-    let (first_handle, first_event, _) =
-        world.hooked_event(Arc::<Counting>::clone(&first));
-    let (second_handle, second_event, _) =
-        world.hooked_event(Arc::<Counting>::clone(&second));
+    let (first_handle, first_event, _) = world.hooked_event(Arc::<Counting>::clone(&first));
+    let (second_handle, second_event, _) = world.hooked_event(Arc::<Counting>::clone(&second));
     assert_eq!(world.call_with_handle(SvcId::SignalEvent, second_handle), 0);
-    assert_eq!((first.signalled(), second.signalled()), (vec![], vec![second_event]));
+    assert_eq!(
+        (first.signalled(), second.signalled()),
+        (vec![], vec![second_event])
+    );
     assert_eq!(world.call_with_handle(SvcId::SignalEvent, first_handle), 0);
     assert_eq!(first.signalled(), [first_event]);
     assert_eq!(second.signalled(), [second_event]);
@@ -251,7 +253,7 @@ fn a_hook_runs_only_for_a_successful_guest_signal() {
     // The server's own signal, in a later request.
     let result = world.request(Box::new(move |cx, _| cx.signal_event(readable).unwrap()));
     assert_eq!(result, 0);
-    assert!(world.is_signalled(readable));
+    assert_eq!(world.is_signalled(readable), Some(true));
     // A host thread's signal.
     let env = LiveEnv::new(FixedClock::new(1_000, 1_000), 0);
     world
@@ -339,7 +341,7 @@ fn hooks_of_events_that_are_gone_are_dropped_when_another_is_attached() {
     hooks.attach(&objects, second, hook());
     assert_eq!(hooks.len(), 2);
     // The first goes; the next attach drops its hook and keeps the second's.
-    assert_eq!(objects.release(first).unwrap().is_some(), true);
+    assert!(objects.release(first).unwrap().is_some());
     hooks.attach(&objects, third, hook());
     assert_eq!(hooks.len(), 2);
     assert!(hooks.get(first).is_none());
@@ -349,16 +351,15 @@ fn hooks_of_events_that_are_gone_are_dropped_when_another_is_attached() {
 #[test]
 fn the_hooked_events_ends_are_a_writable_end_for_the_guest_and_its_readable_end() {
     let world = World::new();
-    let (handle, writable, readable) =
-        world.hooked_event(Arc::new(Counting::default()));
+    let (handle, writable, readable) = world.hooked_event(Arc::new(Counting::default()));
     world
         .dispatcher
         .with::<(&HandleTable, &Scheduler), _>(|(handles, scheduler)| {
             assert_eq!(handles.get(handle), Ok(writable));
-            match scheduler.objects().get(writable) {
-                Ok(Object::Event(event)) => assert_eq!(event.readable(), readable),
-                other => panic!("{other:?} is not an event's writable end"),
-            }
+            assert!(matches!(
+                scheduler.objects().get(writable),
+                Ok(Object::Event(event)) if event.readable() == readable
+            ));
             // The server's reference and the guest's handle.
             assert_eq!(scheduler.objects().refs(writable), 2);
             assert_eq!(scheduler.objects().refs(readable), 1);

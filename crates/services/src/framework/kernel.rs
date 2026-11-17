@@ -7,13 +7,25 @@
 //! That holds for a deferred request too: when its reply is delivered, the kernel given to
 //! [`Server::deliver`](super::Server::deliver) speaks for the thread that sent it.
 //!
-//! Failures are the kernel's own result codes ([`KernelError`](starquake_kernel::result::KernelError)).
+//! Failures are the kernel's own result codes ([`KernelError`]).
 //! When a service method lets one through with `?`, the caller sees that code.
+//!
+//! # The graphics server's calls
+//!
+//! Four calls are for the graphics server (`docs/specs/services.md`, "Writing a service": the
+//! kernel interface "also offers" them; kernel spec, "Waiting and waking" and "Address space"):
+//! [`Kernel::create_hooked_event`], [`Kernel::is_gpu_accessible`],
+//! [`Kernel::lock_device_share`] and [`Kernel::unlock_device_share`]. Each has a default that
+//! answers [`KernelError::NotImplemented`], so a kernel double written for another service need
+//! not offer them; the kernel's `IpcContext` and `FakeKernel` both do.
+
+use std::sync::Arc;
 
 use starquake_kernel::handle::Handle;
 use starquake_kernel::id::ObjectId;
+use starquake_kernel::ipc::EventHook;
 use starquake_kernel::memory::{SharedPages, SvcPermission};
-use starquake_kernel::result::SvcResult;
+use starquake_kernel::result::{KernelError, SvcResult};
 use starquake_trace::{EventKind, ServiceId};
 
 /// What the framework and its services ask of the kernel while a request is handled.
@@ -63,6 +75,46 @@ pub trait Kernel {
     /// under ([`Server::with_service_id`](super::Server::with_service_id)); one the kernel does
     /// not know is its "not found" error.
     fn connect(&mut self, service: ServiceId) -> SvcResult<(ObjectId, Handle)>;
+
+    /// Creates an event with both ends, whose writable end the service gives the caller (with
+    /// [`Reply::copy_handle`](super::Reply::copy_handle)) to signal, and attaches `hook` to it:
+    /// the kernel runs the hook, after releasing its lock, each time the caller signals that
+    /// end with `SignalEvent` (`starquake_kernel::ipc::hook` says exactly when). Returns the
+    /// writable end and the readable end, in that order.
+    ///
+    /// The default answers [`KernelError::NotImplemented`].
+    fn create_hooked_event(
+        &mut self,
+        _hook: Arc<dyn EventHook>,
+    ) -> SvcResult<(ObjectId, ObjectId)> {
+        Err(KernelError::NotImplemented)
+    }
+
+    /// Whether every page the caller's `size` bytes at `address` touch has the GPU-accessible
+    /// attribute that `svc 0x80` sets. False for an empty range and one that is not wholly
+    /// inside the caller's address space.
+    ///
+    /// The default answers [`KernelError::NotImplemented`].
+    fn is_gpu_accessible(&self, _address: u64, _size: u64) -> SvcResult<bool> {
+        Err(KernelError::NotImplemented)
+    }
+
+    /// Takes a device-share lock on the caller's `size` bytes at `address`: while it is held,
+    /// the CPU mapping under the range cannot change. Locks nest; each is released by one
+    /// [`Kernel::unlock_device_share`] of the same range. The kernel's errors are its address
+    /// space's (`AddressSpace::lock_device_share`).
+    ///
+    /// The default answers [`KernelError::NotImplemented`].
+    fn lock_device_share(&mut self, _address: u64, _size: u64) -> SvcResult<()> {
+        Err(KernelError::NotImplemented)
+    }
+
+    /// Releases a device-share lock [`Kernel::lock_device_share`] took on the same range.
+    ///
+    /// The default answers [`KernelError::NotImplemented`].
+    fn unlock_device_share(&mut self, _address: u64, _size: u64) -> SvcResult<()> {
+        Err(KernelError::NotImplemented)
+    }
 
     /// Copies `out.len()` bytes of the caller's memory at `address` into `out`. Fails without
     /// copying anything unless the whole range is readable.

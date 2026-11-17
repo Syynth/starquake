@@ -552,7 +552,12 @@ fn a_device_lock_that_one_block_cannot_take_changes_no_block() {
     );
     assert_eq!(map, before);
     // A range outside the map, or off a page.
-    for (address, pages) in [(page(PAGES), 1), (page(PAGES - 1), 2), (BASE + 1, 1), (BASE, 0)] {
+    for (address, pages) in [
+        (page(PAGES), 1),
+        (page(PAGES - 1), 2),
+        (BASE + 1, 1),
+        (BASE, 0),
+    ] {
         assert_eq!(
             map.update_lock(address, pages, DeviceLock::Share),
             Err(BlockMapError::BadRange { address, pages }),

@@ -18,9 +18,11 @@
 //! | `handle` | [`Server::handle`], with [`Handled`](super::Handled) mapped one for one |
 //! | `take_reply` | [`Server::take_completed`], then [`Server::deliver`] into the kernel's buffer |
 
+use std::sync::Arc;
+
 use starquake_kernel::handle::Handle;
 use starquake_kernel::id::ObjectId;
-use starquake_kernel::ipc::{Handled, HandlerError, IpcContext, SessionHandler};
+use starquake_kernel::ipc::{EventHook, Handled, HandlerError, IpcContext, SessionHandler};
 use starquake_kernel::memory::{SharedPages, SvcPermission};
 use starquake_kernel::result::SvcResult;
 use starquake_trace::{EventKind, ServiceId};
@@ -63,6 +65,22 @@ impl Kernel for IpcContext<'_> {
 
     fn connect(&mut self, service: ServiceId) -> SvcResult<(ObjectId, Handle)> {
         IpcContext::connect(self, service)
+    }
+
+    fn create_hooked_event(&mut self, hook: Arc<dyn EventHook>) -> SvcResult<(ObjectId, ObjectId)> {
+        IpcContext::create_hooked_event(self, hook)
+    }
+
+    fn is_gpu_accessible(&self, address: u64, size: u64) -> SvcResult<bool> {
+        Ok(IpcContext::is_gpu_accessible(self, address, size))
+    }
+
+    fn lock_device_share(&mut self, address: u64, size: u64) -> SvcResult<()> {
+        IpcContext::lock_device_share(self, address, size)
+    }
+
+    fn unlock_device_share(&mut self, address: u64, size: u64) -> SvcResult<()> {
+        IpcContext::unlock_device_share(self, address, size)
     }
 
     fn read_memory(&self, address: u64, out: &mut [u8]) -> SvcResult<()> {

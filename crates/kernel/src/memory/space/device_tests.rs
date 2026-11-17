@@ -116,16 +116,15 @@ fn the_gpu_accessible_attribute_changes_only_where_the_state_can_change_attribut
     }
     // A block with the attribute may have its other attributes changed: `SetMask` holds it,
     // so `AttributeTestMask` leaves it out.
-    space.set_memory_attribute(heap, PAGE_SIZE, GPU, GPU).unwrap();
+    space
+        .set_memory_attribute(heap, PAGE_SIZE, GPU, GPU)
+        .unwrap();
     let uncached = MemoryAttribute::UNCACHED;
     assert_eq!(
         space.set_memory_attribute(heap, PAGE_SIZE, uncached, uncached),
         Ok(())
     );
-    assert_eq!(
-        space.query_info(heap).unwrap().attribute(),
-        GPU | uncached
-    );
+    assert_eq!(space.query_info(heap).unwrap().attribute(), GPU | uncached);
 }
 
 // ----- The device-share lock ---------------------------------------------------------------
@@ -135,10 +134,18 @@ fn a_device_lock_marks_every_block_of_the_range_and_unlocking_restores_them() {
     let (mut space, heap) = with_heap(4);
     let before = blocks(&space);
     let shared = u32::from(MemoryAttribute::DEVICE_SHARED.bits());
-    assert_eq!(space.lock_device_share(heap + PAGE_SIZE, 2 * PAGE_SIZE), Ok(()));
+    assert_eq!(
+        space.lock_device_share(heap + PAGE_SIZE, 2 * PAGE_SIZE),
+        Ok(())
+    );
     let at = |space: &AddressSpace, address| {
         let info = space.query_info(address).unwrap().svc_info();
-        (info.base_address, info.size, info.attribute, info.device_count)
+        (
+            info.base_address,
+            info.size,
+            info.attribute,
+            info.device_count,
+        )
     };
     assert_eq!(at(&space, heap), (heap, PAGE_SIZE, 0, 0));
     assert_eq!(
@@ -151,11 +158,20 @@ fn a_device_lock_marks_every_block_of_the_range_and_unlocking_restores_them() {
         (heap + 3 * PAGE_SIZE, PAGE_SIZE, 0, 0)
     );
     // Locks nest.
-    assert_eq!(space.lock_device_share(heap + PAGE_SIZE, 2 * PAGE_SIZE), Ok(()));
+    assert_eq!(
+        space.lock_device_share(heap + PAGE_SIZE, 2 * PAGE_SIZE),
+        Ok(())
+    );
     assert_eq!(at(&space, heap + PAGE_SIZE).3, 2);
-    assert_eq!(space.unlock_device_share(heap + PAGE_SIZE, 2 * PAGE_SIZE), Ok(()));
+    assert_eq!(
+        space.unlock_device_share(heap + PAGE_SIZE, 2 * PAGE_SIZE),
+        Ok(())
+    );
     assert_eq!(at(&space, heap + PAGE_SIZE).3, 1);
-    assert_eq!(space.unlock_device_share(heap + PAGE_SIZE, 2 * PAGE_SIZE), Ok(()));
+    assert_eq!(
+        space.unlock_device_share(heap + PAGE_SIZE, 2 * PAGE_SIZE),
+        Ok(())
+    );
     assert_eq!(blocks(&space), before);
 }
 
@@ -237,7 +253,10 @@ fn a_device_locked_range_refuses_what_would_change_its_mapping_until_unlocked() 
     };
     refused(&mut space);
     // The attribute calls still work on it, and so does another lock.
-    assert_eq!(space.set_memory_attribute(page, PAGE_SIZE, GPU, GPU), Ok(()));
+    assert_eq!(
+        space.set_memory_attribute(page, PAGE_SIZE, GPU, GPU),
+        Ok(())
+    );
     assert_eq!(
         space.set_memory_attribute(page, PAGE_SIZE, GPU, MemoryAttribute::NONE),
         Ok(())
@@ -284,10 +303,7 @@ fn a_device_lock_past_the_largest_count_is_out_of_resource() {
     for _ in 0..u16::MAX {
         space.lock_device_share(heap, PAGE_SIZE).unwrap();
     }
-    assert_eq!(
-        space.query_info(heap).unwrap().device_use_count(),
-        u16::MAX
-    );
+    assert_eq!(space.query_info(heap).unwrap().device_use_count(), u16::MAX);
     let before = blocks(&space);
     assert_eq!(
         space.lock_device_share(heap, PAGE_SIZE),

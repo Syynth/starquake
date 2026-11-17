@@ -457,11 +457,18 @@ fn set_gpu_memory_attribute_marks_heap_for_the_gpu_and_query_memory_reports_it()
         set_gpu_memory_attribute(&mut space, true, heap, PAGE_SIZE, ATTR_GPU, ATTR_GPU),
         Ok(())
     );
-    assert_eq!(space.query_info(heap).unwrap().svc_info().attribute, ATTR_GPU);
+    assert_eq!(
+        space.query_info(heap).unwrap().svc_info().attribute,
+        ATTR_GPU
+    );
     assert!(space.is_gpu_accessible(heap, PAGE_SIZE));
     // The page after it is untouched.
     assert_eq!(
-        space.query_info(heap + PAGE_SIZE).unwrap().svc_info().attribute,
+        space
+            .query_info(heap + PAGE_SIZE)
+            .unwrap()
+            .svc_info()
+            .attribute,
         0
     );
     // Cleared again with the mask alone.

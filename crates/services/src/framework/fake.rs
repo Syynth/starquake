@@ -9,12 +9,19 @@
 //!
 //! [`FakeHost`] puts a [`FakeKernel`] and several servers together, so that a session one
 //! service hands out for another ([`Kernel::connect`]) can be sent requests.
+//!
+//! The graphics server's calls are modelled as simply: a hooked event is two ids whose hook runs
+//! when a test plays the guest's `SignalEvent` ([`FakeKernel::guest_signal`]); the GPU-accessible
+//! attribute is whatever ranges a test marks ([`FakeKernel::mark_gpu_accessible`]); and a
+//! device-share lock is a count per exact range ([`FakeKernel::device_locks`]), taken only on
+//! mapped memory and released only for a range that holds one.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use starquake_kernel::handle::{Handle, HandleError, HandleTable, RefCounts};
 use starquake_kernel::id::{ObjectId, SlabId};
+use starquake_kernel::ipc::EventHook;
 use starquake_kernel::memory::testing::standalone_shared_pages;
 use starquake_kernel::memory::{
     SharedPages, SvcPermission, is_shared_memory_permission, shared_memory_size,
@@ -60,6 +67,12 @@ pub struct FakeKernel {
     refs: RefCounts,
     minted: u32,
     events: BTreeMap<ObjectId, u32>,
+    /// The hooked events made: each writable end's readable end and hook.
+    hooked: BTreeMap<ObjectId, (ObjectId, Arc<dyn EventHook>)>,
+    /// The ranges a test marked GPU-accessible, as `(address, size)`.
+    gpu_accessible: Vec<(u64, u64)>,
+    /// The device-share locks held, per exact range `(address, size)`.
+    device_locks: BTreeMap<(u64, u64), u16>,
     /// The shared memories made, with the permission the caller maps each with.
     shared: BTreeMap<ObjectId, (SharedPages, SvcPermission)>,
     sessions: Vec<ObjectId>,
@@ -94,6 +107,9 @@ impl FakeKernel {
             refs: RefCounts::new(),
             minted: 0,
             events: BTreeMap::new(),
+            hooked: BTreeMap::new(),
+            gpu_accessible: Vec::new(),
+            device_locks: BTreeMap::new(),
             shared: BTreeMap::new(),
             sessions: Vec::new(),
             regions: Vec::new(),
@@ -176,6 +192,35 @@ impl FakeKernel {
         self.events.get(&event).copied()
     }
 
+    /// Plays the guest's `SignalEvent` on `writable`, the writable end of an event
+    /// [`Kernel::create_hooked_event`] made: its readable end counts a signal
+    /// ([`FakeKernel::signals`]), and then its hook runs, as the kernel runs it once its lock is
+    /// released. [`KernelError::InvalidHandle`] for any other id, and nothing runs.
+    pub fn guest_signal(&mut self, writable: ObjectId) -> SvcResult<()> {
+        let (readable, hook) = self
+            .hooked
+            .get(&writable)
+            .map(|(readable, hook)| (*readable, Arc::clone(hook)))
+            .ok_or(KernelError::InvalidHandle)?;
+        self.signal_event(readable)?;
+        hook.signalled(writable);
+        Ok(())
+    }
+
+    /// Marks the `size` bytes at `address` GPU-accessible, as the guest's `svc 0x80` would.
+    pub fn mark_gpu_accessible(&mut self, address: u64, size: u64) {
+        self.gpu_accessible.push((address, size));
+    }
+
+    /// How many device-share locks are held on exactly the `size` bytes at `address`.
+    #[must_use]
+    pub fn device_locks(&self, address: u64, size: u64) -> u16 {
+        self.device_locks
+            .get(&(address, size))
+            .copied()
+            .unwrap_or(0)
+    }
+
     /// The pages of a shared memory [`Kernel::create_shared_memory`] made, and the permission
     /// the caller maps it with; `None` for any other id.
     #[must_use]
@@ -256,6 +301,54 @@ impl Kernel for FakeKernel {
         let object = self.new_object();
         self.shared.insert(object, (pages.clone(), permission));
         Ok((object, pages))
+    }
+
+    /// Two fresh ids, the writable end and then the readable end; the readable end counts
+    /// signals as [`Kernel::create_event`]'s events do.
+    fn create_hooked_event(&mut self, hook: Arc<dyn EventHook>) -> SvcResult<(ObjectId, ObjectId)> {
+        let writable = self.new_object();
+        let readable = self.create_event()?;
+        self.hooked.insert(writable, (readable, hook));
+        Ok((writable, readable))
+    }
+
+    /// True when one range a test marked holds the whole of the `size` bytes at `address`
+    /// (ranges that touch are not joined); false for an empty range or one that wraps.
+    fn is_gpu_accessible(&self, address: u64, size: u64) -> SvcResult<bool> {
+        let Some(end) = address.checked_add(size).filter(|_| size > 0) else {
+            return Ok(false);
+        };
+        Ok(self.gpu_accessible.iter().any(|(start, len)| {
+            start
+                .checked_add(*len)
+                .is_some_and(|marked_end| *start <= address && end <= marked_end)
+        }))
+    }
+
+    /// [`KernelError::InvalidCurrentMemory`] unless one mapped range holds the whole of the
+    /// `size` bytes at `address`, and [`KernelError::OutOfResource`] when the range already
+    /// holds `u16::MAX` locks, as the kernel answers.
+    fn lock_device_share(&mut self, address: u64, size: u64) -> SvcResult<()> {
+        let len = usize::try_from(size).map_err(|_| KernelError::InvalidCurrentMemory)?;
+        if size == 0 || self.memory(address, len).is_none() {
+            return Err(KernelError::InvalidCurrentMemory);
+        }
+        let count = self.device_locks.entry((address, size)).or_insert(0);
+        *count = count.checked_add(1).ok_or(KernelError::OutOfResource)?;
+        Ok(())
+    }
+
+    /// [`KernelError::InvalidCurrentMemory`] unless a lock is held on exactly this range.
+    fn unlock_device_share(&mut self, address: u64, size: u64) -> SvcResult<()> {
+        let count = self
+            .device_locks
+            .get_mut(&(address, size))
+            .ok_or(KernelError::InvalidCurrentMemory)?;
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            self.device_locks.remove(&(address, size));
+        }
+        Ok(())
     }
 
     fn create_session(&mut self) -> SvcResult<(ObjectId, Handle)> {

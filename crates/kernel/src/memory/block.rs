@@ -245,8 +245,7 @@ impl MemoryBlock {
     /// `None`, with nothing changed, where Eden asserts (see the module docs).
     pub(super) fn share_to_device(&mut self, left: bool, right: bool) -> Option<()> {
         // We must either be shared or have a zero lock count.
-        if !self.attribute.contains(MemoryAttribute::DEVICE_SHARED) && self.device_use_count != 0
-        {
+        if !self.attribute.contains(MemoryAttribute::DEVICE_SHARED) && self.device_use_count != 0 {
             return None;
         }
         let count = self.device_use_count.checked_add(1)?;
@@ -284,7 +283,11 @@ impl MemoryBlock {
         let old_count = self.device_use_count;
         let count = old_count.checked_sub(1)?;
         let old_right = self.device_disable_merge_right_count;
-        let right_count = if right { old_right.checked_sub(1)? } else { old_right };
+        let right_count = if right {
+            old_right.checked_sub(1)?
+        } else {
+            old_right
+        };
         // Unshare.
         self.device_use_count = count;
         if old_count == 1 {
@@ -354,7 +357,11 @@ impl MemoryBlock {
 
 /// `count` raised by one when `raise` is set, or kept; `None` when it would pass `u16::MAX`.
 fn raised(count: u16, raise: bool) -> Option<u16> {
-    if raise { count.checked_add(1) } else { Some(count) }
+    if raise {
+        count.checked_add(1)
+    } else {
+        Some(count)
+    }
 }
 
 /// What `QueryMemory` reports about a block (`Svc::MemoryInfo`).
@@ -834,7 +841,10 @@ mod tests {
         subject.share_to_device(false, false).unwrap();
         subject.disable_merge = DisableMerge::DEVICE_LEFT;
         assert_eq!(subject.unshare_to_device(true, false), Some(()));
-        assert_eq!(device(&subject), (0, 0, 0, false, DisableMerge::DEVICE_LEFT));
+        assert_eq!(
+            device(&subject),
+            (0, 0, 0, false, DisableMerge::DEVICE_LEFT)
+        );
         // The same block unshared away from the left clears the barrier: the count is zero.
         let mut other = block(1);
         other.share_to_device(false, false).unwrap();
