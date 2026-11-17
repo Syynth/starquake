@@ -84,9 +84,12 @@
 //!   the GPU-accessible attribute (`svc 0x80`) or outside the address space,
 //!   `InvalidCurrentMemory`; then the kernel's device-share lock, whose error passes through.
 //!   (PR checks the attribute before its `nvmap.CreateHandle`; here the room check is first, so
-//!   both faults at once answer `OutOfResource`.)
+//!   both faults at once answer `OutOfResource` and take no lock:
+//!   `registration_room_is_checked_before_the_attribute`.) The lock is the last step that can
+//!   fail: once it is taken, the registration is recorded ([`memory::Admission`]).
 //! - 102: the slot (no event, `InvalidCombination`); no such handle, `NotFound`; no room for
-//!   another job ([`memory::MAX_PENDING_JOBS`]), `Busy`. No event is signalled on a refusal.
+//!   another job ([`memory::MAX_PENDING_JOBS`]), `Busy` (both at once answer `NotFound`:
+//!   `pending_jobs_are_bounded_at_the_limit`). No event is signalled on a refusal.
 //! - 211: the slot, `InvalidCombination`, nothing signalled; then, the event signalled whatever
 //!   the result: no such address space, handle or device, `NotFound` (in that order);
 //!   permission not 0, cache over 1, mode not 0 or sync over 1, `NotImplemented`; a kind pair
@@ -166,6 +169,7 @@
 //! | 102's completion | signals at once (`FinishRelease`) | after the GPU thread's queued work (`SignalAfterGpu`) | after the GPU's barrier, the lock released first (`a_destroy_releases_the_lock_only_when_the_gpu_is_done`) |
 //! | 212, 213 and 215's completion | at once | 213 and 215 after the GPU, 212 at once | all three after the GPU's barrier (`an_unmap_s_event_fires_only_after_the_barrier`) |
 //! | A 214 overlapping a registration's own mapping | no such mapping | replaces it | allowed: the region is under it (`a_sparse_region_lies_under_a_registration`) |
+//! | A 215 of a region with 211 mappings inside | none lie there: `MapNative4K` refuses a 211 over a region's allocation | trims them: `SubDestroySparseRegion` calls `Nx2GpuMemoryRegistry::Unmap(first, last - first + 1)`, whose `TrimMappings` drops every mapping in the range (`eden-nx2/src/core/hle/service/nvdrv/devices/nx2_stub_device.h`) | they stay in the bookkeeping, and show again once the destroy is done (`a_sparse_region_is_destroyed_in_order`) |
 //! | 216 | served | not served | not served yet (`sparse_map_requests_go_to_the_policy`) |
 //! | 201 to 203 | 202 and 203 check the address space (PR's numbering) | no checks | NX2's replies, no checks (`partition_replies_are_nx2_s`) |
 //!
@@ -177,6 +181,11 @@
 //! `pieces_are_bounded_at_the_limit`), [`memory::MAX_ADDRESS_SPACES`], [`memory::DEVICE_SLOTS`],
 //! [`NOTIFICATION_COUNT`] and [`memory::MAX_PENDING_JOBS`] (`Busy`). Each translation table holds
 //! at most three entries per piece (a map splits at most two older entries).
+//!
+//! The time a publish takes is one sweep of the pieces in the span it writes, not one per range:
+//! a drain publishes a job's ranges once per address space (`memory::GpuMemory`'s `publish`
+//! states the cost), so a 102 that took out many 211 mappings costs the drain about the address
+//! space's pieces, not their product with the mappings.
 //!
 //! # What is recorded and what is snapshotted
 //!
@@ -610,20 +619,14 @@ impl GpuWorker {
             device: low_byte(words.read_u32()?),
         };
         let handle = with_gpu(cx, |cx, gpu, _| {
-            let range = gpu.check_registration(&request)?;
+            let admitted = gpu.check_registration(&request)?;
+            let range = admitted.range();
             if !cx.is_gpu_accessible(range.start(), range.size())? {
                 return Err(KernelError::InvalidCurrentMemory.into());
             }
+            // The last fallible step: once the lock is taken, the registration is recorded.
             let token = cx.lock_device_share(range.start(), range.size())?;
-            match gpu.register(range, request.device, token) {
-                Ok(handle) => Ok(handle),
-                Err(error) => {
-                    // The lock was taken for a registration that is not kept: release it now,
-                    // during the request (`Kernel::unlock_device_share`).
-                    cx.unlock_device_share(token)?;
-                    Err(error.into())
-                }
-            }
+            Ok(admitted.register(token))
         })?;
         reply.payload().write_u32(handle);
         reply.ok()

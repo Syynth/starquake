@@ -18,7 +18,9 @@
 //! The translation tables are not in it: a restore builds each from the bookkeeping (every
 //! piece published again) and gives it to the front as a new address space, and sends the front
 //! a barrier for each job still waiting, in ticket order, since a restored GPU knows none of
-//! them. The pages a waiting job removed stay holes until it is done, as they were.
+//! them. The pages a waiting job holds are not published (`super::memory`, "Pages a waiting job
+//! holds"), so they stay holes in the new table until the last job holding them is done
+//! (`a_restore_leaves_a_pending_unmap_a_hole_until_it_is_done`).
 //!
 //! # Checks
 //!
@@ -57,6 +59,7 @@ use starquake_kernel::id::{ObjectId, ProcessId};
 use starquake_memory::{PAGE_SIZE, PageRange};
 use thiserror::Error;
 
+use super::memory::cover::Cover;
 use super::memory::{
     Counters, DEVICE_SLOTS, Device, GpuMemory, Job, MAX_ADDRESS_SPACES, MAX_PENDING_JOBS,
     MAX_PIECES, NOTIFICATION_COUNT, Record, Region, Registration, Space, in_window,
@@ -703,6 +706,19 @@ impl GpuMemory {
         state.check()?;
         let (registrations, pending) = state.reclaim(kernel)?;
         let (space, handle, region, ticket) = state.next;
+        let mut registered = Cover::default();
+        for registration in registrations.values() {
+            registered.add(registration.range.start(), registration.range.end());
+        }
+        let mut waiting: BTreeMap<AsId, Cover> = BTreeMap::new();
+        for job in pending.values() {
+            for &(space, range) in &job.reveal {
+                waiting
+                    .entry(space)
+                    .or_default()
+                    .add(range.start(), range.end());
+            }
+        }
         let memory = Self {
             events: state.events.iter().copied().collect(),
             worker: state.worker,
@@ -720,6 +736,8 @@ impl GpuMemory {
                 region,
                 ticket,
             },
+            registered,
+            waiting,
         };
         memory.rebuild(front);
         Ok(memory)

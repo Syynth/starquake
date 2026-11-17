@@ -3,10 +3,12 @@
 
 use std::sync::Mutex;
 
-use starquake_gpu::interface::VmUpdate;
+use starquake_gpu::interface::{Target, VmUpdate};
+use starquake_gpu::vm::Mapping;
 use starquake_kernel::id::SlabId;
 use starquake_kernel::memory::testing::device_share_token;
 
+use super::super::memory::SPARSE_KIND;
 use super::*;
 use crate::completion::testing::{Locks, process};
 
@@ -163,10 +165,12 @@ fn a_restored_job_completes() {
         ["create 2".to_owned(), "barrier 9".to_owned()]
     );
     // The table holds the registration's own mapping (not in the window: its CPU address), the
-    // 211 mapping, the region and the shim.
+    // region and the shim; the 211 mapping's pages are the waiting job's, held until it is done.
     let space = AsId(2);
-    assert_eq!(restored.mappings(space).len(), 5);
+    assert_eq!(restored.mappings(space).len(), 3);
     let finished = restored.ordered_done(Ticket(9)).unwrap();
+    // Then its two runs of one kind show.
+    assert_eq!(restored.mappings(space).len(), 5);
     assert_eq!(
         finished.releases,
         [device_share_token(process(), 4 * PAGE, 3 * PAGE)]
@@ -219,9 +223,32 @@ fn dangling(part: Part) -> SnapshotError {
     SnapshotError::Dangling { part, index: 0 }
 }
 
-/// Each fault, and the error it must be refused with.
-fn faults() -> [(Break, SnapshotError); 14] {
-    [
+/// An order refusal of the second `part`.
+fn order(part: Part) -> SnapshotError {
+    SnapshotError::Order { part, index: 1 }
+}
+
+/// An address space with nothing in it.
+fn empty_space(id: u32) -> SavedSpace {
+    SavedSpace {
+        id,
+        records: Vec::new(),
+        regions: Vec::new(),
+        shim: None,
+    }
+}
+
+/// Each fault, and the error it must be refused with: the groups' lists, joined.
+fn faults() -> Vec<(Break, SnapshotError)> {
+    let mut all = list_faults();
+    all.extend(space_faults());
+    all.extend(job_faults());
+    all
+}
+
+/// The faults of the counters, events, devices, address spaces and registrations.
+fn list_faults() -> Vec<(Break, SnapshotError)> {
+    vec![
         (|s| s.next.0 = 0, out(Part::Counters)),
         // An event index past the range, and a device 0: the event first.
         (
@@ -231,11 +258,87 @@ fn faults() -> [(Break, SnapshotError); 14] {
             },
             out(Part::Event),
         ),
+        // The same object at two indices.
+        (
+            |s| s.events.push((4, s.events[0].1)),
+            SnapshotError::OutOfRange {
+                part: Part::Event,
+                index: 1,
+            },
+        ),
+        (
+            |s| s.events.insert(0, (4, object(0x13, 0x14))),
+            order(Part::Event),
+        ),
         (|s| s.devices[0].0 = 0, out(Part::Device)),
         (|s| s.spaces[0].id = 3, out(Part::Space)),
+        (|s| s.spaces.push(empty_space(1)), order(Part::Space)),
         (|s| s.registrations[0].size = 1, out(Part::Registration)),
+        // The handle equal to the next one; the golden one, one below, is accepted.
+        (|s| s.next.1 = 7, out(Part::Registration)),
+        (
+            |s| {
+                s.registrations.push(SavedRegistration {
+                    handle: 5,
+                    start: 8 * PAGE,
+                    size: PAGE,
+                    device: 0x41,
+                    process: process(),
+                });
+            },
+            order(Part::Registration),
+        ),
+    ]
+}
+
+/// The faults of the address spaces' contents.
+fn space_faults() -> Vec<(Break, SnapshotError)> {
+    vec![
         (|s| s.spaces[0].regions[0].0 = W - PAGE, out(Part::Region)),
         (|s| s.spaces[0].regions[0].2 = 0x34, out(Part::Region)),
+        // A region id another address space's region has.
+        (
+            |s| {
+                let mut first = empty_space(1);
+                first.regions.push((W, PAGE, s.spaces[0].regions[0].2));
+                s.spaces.insert(0, first);
+            },
+            out(Part::Region),
+        ),
+        // A mapping that starts below NVN's window.
+        (
+            |s| s.spaces[0].records[0].start = W - PAGE,
+            out(Part::Mapping),
+        ),
+        (|s| s.spaces[0].records[0].offset = 1, out(Part::Mapping)),
+        (
+            |s| {
+                s.spaces[0].records.push(SavedRecord {
+                    start: W,
+                    size: PAGE,
+                    handle: 7,
+                    offset: 0,
+                    spans: vec![(W, PAGE, 0x31)],
+                });
+            },
+            order(Part::Mapping),
+        ),
+        (
+            |s| {
+                s.spaces[0].records.push(SavedRecord {
+                    start: W + PAGE,
+                    size: PAGE,
+                    handle: 7,
+                    offset: 0,
+                    spans: vec![(W + PAGE, PAGE, 0x31)],
+                });
+            },
+            SnapshotError::Overlap {
+                part: Part::Mapping,
+                index: 1,
+            },
+        ),
+        (|s| s.spaces[0].shim = Some(1), out(Part::Shim)),
         (
             |s| s.spaces[0].records[0].handle = 6,
             dangling(Part::Mapping),
@@ -256,9 +359,18 @@ fn faults() -> [(Break, SnapshotError); 14] {
             |s| s.spaces[0].records[0].spans.truncate(1),
             out(Part::Mapping),
         ),
+    ]
+}
+
+/// The faults of the jobs.
+fn job_faults() -> Vec<(Break, SnapshotError)> {
+    vec![
         (|s| s.pending[0].ticket = 0x0A, out(Part::Job)),
         (|s| s.pending[0].event = object(1, 1), dangling(Part::Job)),
         (|s| s.pending[0].reveal[0].0 = 1, dangling(Part::Job)),
+        (|s| s.pending[0].reveal[0].1 = 1, out(Part::Job)),
+        (|s| s.pending[0].releases[0].1 = 1, out(Part::Job)),
+        (|s| s.pending.push(s.pending[0].clone()), order(Part::Job)),
     ]
 }
 
@@ -344,5 +456,156 @@ fn a_refusal_is_said_in_plain_words() {
     assert_eq!(
         error.to_string(),
         "GPU mapping 2 of the GPU memory snapshot names something that does not exist"
+    );
+}
+
+/// A golden state with `regions` more one-page sparse regions after the golden one, their ids
+/// distinct and below the next region id.
+fn with_regions(regions: usize) -> State {
+    let mut state = golden();
+    let count = u32::try_from(regions).unwrap();
+    for n in 0..count {
+        let start = W + (5 + u64::from(n)) * PAGE;
+        state.spaces[0].regions.push((start, PAGE, 0x40 + n));
+    }
+    state.next.2 = 0x40 + count;
+    state
+}
+
+/// An address space at exactly [`MAX_PIECES`] pieces is accepted, one more is refused.
+#[test]
+fn the_pieces_of_an_address_space_are_bounded() {
+    let front = Front::default();
+    // The golden space holds four: the registration, a region and two runs of one kind.
+    let at_limit = with_regions(MAX_PIECES - 4);
+    assert!(GpuMemory::restore(&encode(&at_limit), &kernel(2), &front).is_ok());
+    let over = with_regions(MAX_PIECES - 3);
+    assert_eq!(
+        GpuMemory::restore(&encode(&over), &kernel(2), &front).err(),
+        Some(SnapshotError::TooMany {
+            part: Part::Mapping
+        })
+    );
+}
+
+/// [`MAX_ADDRESS_SPACES`] address spaces are accepted, one more is refused.
+#[test]
+fn address_spaces_are_bounded() {
+    let front = Front::default();
+    let spaces = |count: u32| {
+        let mut state = golden();
+        let golden_space = state.spaces.remove(0);
+        state.spaces = (1..=count)
+            .map(|id| {
+                if id == golden_space.id {
+                    golden_space.clone()
+                } else {
+                    empty_space(id)
+                }
+            })
+            .collect();
+        state.next.0 = count + 1;
+        state
+    };
+    let limit = u32::try_from(MAX_ADDRESS_SPACES).unwrap();
+    assert!(GpuMemory::restore(&encode(&spaces(limit)), &kernel(2), &front).is_ok());
+    assert_eq!(
+        GpuMemory::restore(&encode(&spaces(limit + 1)), &kernel(2), &front).err(),
+        Some(SnapshotError::TooMany { part: Part::Space })
+    );
+}
+
+/// [`MAX_PIECES`] registrations are accepted (in an address space holding nothing else), one
+/// more is refused.
+#[test]
+fn registrations_are_bounded() {
+    let front = Front::default();
+    let registrations = |count: usize| {
+        let mut state = golden();
+        state.spaces[0].records.clear();
+        state.spaces[0].regions.clear();
+        let template = state.registrations[0];
+        let count = u32::try_from(count).unwrap();
+        state.registrations = (1..=count)
+            .map(|handle| SavedRegistration { handle, ..template })
+            .collect();
+        state.next.1 = count + 1;
+        state
+    };
+    // Each registration's lock and the job's, all on the golden range.
+    let locks = kernel(u32::try_from(MAX_PIECES).unwrap() + 2);
+    assert!(GpuMemory::restore(&encode(&registrations(MAX_PIECES)), &locks, &front).is_ok());
+    assert_eq!(
+        GpuMemory::restore(&encode(&registrations(MAX_PIECES + 1)), &locks, &front).err(),
+        Some(SnapshotError::TooMany {
+            part: Part::Registration
+        })
+    );
+}
+
+/// [`MAX_PENDING_JOBS`] waiting jobs are accepted, one more is refused.
+#[test]
+fn waiting_jobs_are_bounded() {
+    let front = Front::default();
+    let jobs = |count: usize| {
+        let mut state = golden();
+        let template = state.pending[0].clone();
+        let count = u64::try_from(count).unwrap();
+        state.pending = (1..=count)
+            .map(|ticket| SavedJob {
+                ticket,
+                releases: Vec::new(),
+                ..template.clone()
+            })
+            .collect();
+        state.next.3 = count + 1;
+        state
+    };
+    assert!(GpuMemory::restore(&encode(&jobs(MAX_PENDING_JOBS)), &kernel(1), &front).is_ok());
+    assert_eq!(
+        GpuMemory::restore(&encode(&jobs(MAX_PENDING_JOBS + 1)), &kernel(1), &front).err(),
+        Some(SnapshotError::TooMany { part: Part::Job })
+    );
+}
+
+/// A restore does not publish the pages a waiting job holds: a 213 that was waiting inside a
+/// sparse region leaves a hole in the new table until it is done, then the region shows there.
+#[test]
+fn a_restore_leaves_a_pending_unmap_a_hole_until_it_is_done() {
+    let mut state = golden();
+    state.spaces[0].records.clear();
+    state.spaces[0].regions = vec![(W, 4 * PAGE, 0x33)];
+    state.pending[0].releases.clear();
+    state.pending[0].reveal = vec![(2, W + PAGE, PAGE)];
+    let front = Front::default();
+    let mut restored = GpuMemory::restore(&encode(&state), &kernel(1), &front).unwrap();
+    let space = AsId(2);
+    let region = |offset: u64, size: u64| Mapping {
+        range: PageRange::new(W + offset, size).unwrap(),
+        target: Target::GpuOnly {
+            region: RegionId(0x33),
+            offset,
+        },
+        kind: SPARSE_KIND,
+    };
+    let sparse = |memory: &GpuMemory| -> Vec<Mapping> {
+        memory
+            .mappings(space)
+            .into_iter()
+            .filter(|m| matches!(m.target, Target::GpuOnly { .. }))
+            .collect()
+    };
+    assert_eq!(
+        sparse(&restored),
+        [region(0, PAGE), region(2 * PAGE, 2 * PAGE)]
+    );
+    restored.ordered_done(Ticket(9)).unwrap();
+    assert_eq!(
+        sparse(&restored),
+        [
+            region(0, PAGE),
+            region(PAGE, PAGE),
+            region(2 * PAGE, 2 * PAGE)
+        ]
     );
 }

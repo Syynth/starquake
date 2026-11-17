@@ -27,16 +27,47 @@
 //!
 //! So a range always shows the top layer the bookkeeping holds there, and removing a layer
 //! (a 213 inside a sparse region, say) shows what is under it once the removal is published.
+//! Registrations all map at their own address with one kind, so the second layer is the union
+//! of their ranges ([`cover::Cover`]): where two overlap, either shows the same.
 //!
 //! **Maps are published at once, removals in order.** A registration, a 211 and a 214 are
-//! written into the table during the request. A 102, 212, 213 and 215 change the bookkeeping
-//! during the request, and send the GPU ordered updates and then one barrier
-//! ([`GpuVmFront`]); when the barrier's ticket comes back, the drain publishes every range the
-//! job removed again ([`GpuMemory::ordered_done`]), which shows the layers under it, and only
-//! then releases the job's device-share lock and signals its event. Between the GPU applying a
-//! removal and that publish, the removed range is a hole in the table even where a lower layer
-//! (or a map made after the removal was asked) belongs: that is a **guess** that no GPU work
-//! queued after the request and before the job's event reads those pages. No reference has
+//! written into the table during the request, except on the pages a waiting job holds (below).
+//! A 102, 212, 213 and 215 change the bookkeeping during the request, and send the GPU ordered
+//! updates and then one barrier ([`GpuVmFront`]); when the barrier's ticket comes back, the
+//! drain publishes the ranges the job's updates covered again ([`GpuMemory::ordered_done`]),
+//! which shows the layers under them, and only then releases the job's device-share lock and
+//! signals its event.
+//!
+//! **What a removal sends.** `VmUpdate::Unmap`, `DestroyMemory` and `DestroySparseRegion` each
+//! trim every mapping of their range (`starquake_gpu::vm`). So a 213 and a 102 send their
+//! removals only over the runs where the removed piece is the top layer: a 213's mapping where
+//! the shim is not; a 102's registration where no other registration, no 211 mapping and not
+//! the shim is, and each 211 mapping the 102 takes out where the shim is not. The pieces the
+//! bookkeeping keeps there stay in the table throughout: the shim inside an unmapped mapping
+//! (`an_unmap_keeps_the_shim`) or inside a mapping a 102 takes out
+//! (`a_destroy_keeps_the_shim_inside_its_mappings`), and other registrations' own mappings,
+//! other handles' 211 mappings and the shim on a destroyed registration's range
+//! (`a_destroy_keeps_what_shows_above_it`).
+//!
+//! A 215 sends one `DestroySparseRegion` over the region's whole range, because the GPU frees
+//! the region's backing when it applies it (gpu-protocol G22; graphics-server, 215). So from
+//! then until the drain, every mapping in the region's range is gone from the table, though
+//! the bookkeeping keeps it: the 211 mappings inside the region, the registrations' own
+//! mappings there, and the shim if it is there; the drain shows them again
+//! (`a_sparse_region_is_destroyed_in_order`). A 212 sends its `ModifyKind` over its whole range,
+//! which gives the kind to every page the table maps there, the shim's page included, until its
+//! drain publishes the range again.
+//!
+//! **Pages a waiting job holds.** The ranges a waiting job's updates cover are not written into
+//! the table by any publish (a request's, a restore's or another job's drain) until the last
+//! waiting job whose updates cover them is done ([`GpuMemory`]'s `waiting`). So until the GPU
+//! applies a removal, the table still shows the removed piece there, as the GPU work queued
+//! before the request expects (row 68's corruption class, had a new target been written at
+//! once), and from then until the drain, a hole, even where a lower layer, or a map made after
+//! the removal was asked (a 101, 211 or 214 over the same pages), belongs
+//! (`a_sparse_region_over_a_pending_unmap_waits_for_the_drain`,
+//! `a_registration_over_a_pending_unmap_waits_for_the_drain`). That is a **guess** that no GPU
+//! work queued after the request and before the job's event reads those pages. No reference has
 //! the window (NX2 and PR change their tables at once).
 
 use std::collections::BTreeMap;
@@ -52,6 +83,10 @@ use starquake_memory::{PAGE_SIZE, PageRange};
 
 use super::kind::{self, GENERIC_16BX2};
 use super::{AsId, GpuVmFront};
+
+pub(crate) mod cover;
+
+use cover::Cover;
 
 /// How many notification events a gpu session has: PR's `GpuDeviceRegistry::events`
 /// (`std::array<Kernel::KEvent*, 64>`). gpu 11 answers indices 0 to one less (graphics-server,
@@ -182,7 +217,8 @@ pub(crate) struct Job {
     pub(crate) event: ObjectId,
     /// The device-share locks to release once it is done (a 102's one).
     pub(crate) releases: Vec<DeviceShareToken>,
-    /// The ranges to publish again once it is done.
+    /// The ranges its updates cover, merged per address space: held while it waits, and
+    /// published again once it is done (module docs, "Pages a waiting job holds").
     pub(crate) reveal: Vec<(AsId, PageRange)>,
 }
 
@@ -231,6 +267,53 @@ pub struct RegisterRequest {
     pub flags: u8,
     /// The graphics device byte.
     pub device: u8,
+}
+
+/// A 101 that passed [`GpuMemory::check_registration`]. It holds the bookkeeping, so nothing
+/// changes it before [`register`](Self::register) records the registration, which therefore
+/// cannot fail; dropping it records nothing.
+#[derive(Debug)]
+pub struct Admission<'m> {
+    memory: &'m mut GpuMemory,
+    range: PageRange,
+    device: u8,
+    /// The handle after this one's, which the check found room for.
+    next: u32,
+}
+
+impl Admission<'_> {
+    /// The CPU range to register.
+    #[must_use]
+    pub fn range(&self) -> PageRange {
+        self.range
+    }
+
+    /// 101 after the kernel's checks: records the registration with its lock's token, maps it
+    /// at its own address in every address space, and returns its handle.
+    pub fn register(self, token: DeviceShareToken) -> u32 {
+        let Self {
+            memory,
+            range,
+            device,
+            next,
+        } = self;
+        let handle = memory.next.handle;
+        memory.registrations.insert(
+            handle,
+            Registration {
+                range,
+                device,
+                token,
+            },
+        );
+        memory.next.handle = next;
+        memory.registered.add(range.start(), range.end());
+        let spaces: Vec<AsId> = memory.spaces.keys().copied().collect();
+        for space in spaces {
+            memory.republish(space, range);
+        }
+        handle
+    }
 }
 
 /// 211 `NormalMapGpuMemory4K`, decoded (PR `MapMemory`), without its slot.
@@ -403,6 +486,70 @@ fn in_range<T>(
     before.into_iter().chain(map.range(low..high))
 }
 
+/// `ranges` sorted, with those that overlap or touch merged; empty ones dropped.
+fn union(mut ranges: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    ranges.retain(|&(start, end)| start < end);
+    ranges.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    merged
+}
+
+/// The runs of `start..end` outside `cut` (sorted, merged: [`union`]'s form).
+fn subtract(start: u64, end: u64, cut: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    let mut runs = Vec::new();
+    let mut at = start;
+    let first = cut.partition_point(|&(_, high)| high <= start);
+    for &(low, high) in cut.get(first..).unwrap_or_default() {
+        if low >= end {
+            break;
+        }
+        if low > at {
+            runs.push((at, low));
+        }
+        at = at.max(high);
+    }
+    if at < end {
+        runs.push((at, end));
+    }
+    runs
+}
+
+/// The parts of `start..end` inside `open` (sorted, merged), found by binary search: the cost is
+/// the logarithm of `open` plus the parts.
+fn parts(open: &[(u64, u64)], start: u64, end: u64) -> impl Iterator<Item = (u64, u64)> + '_ {
+    let first = open.partition_point(|&(_, high)| high <= start);
+    open.get(first..)
+        .unwrap_or_default()
+        .iter()
+        .take_while(move |&&(low, _)| low < end)
+        .map(move |&(low, high)| (low.max(start), high.min(end)))
+        .filter(|&(low, high)| low < high)
+}
+
+/// `start..end` as a page range; every range here is built from page ranges, so `None` is gsv's
+/// own mistake.
+fn page_range(start: u64, end: u64) -> Option<PageRange> {
+    end.checked_sub(start)
+        .and_then(|size| PageRange::new(start, size).ok())
+}
+
+/// The layer a removed piece is in, for what lies above it (module docs, "What a removal
+/// sends").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Layer {
+    /// A registration's own mapping: the other registrations' (which show the same), the 211
+    /// mappings and the shim lie above.
+    Registration,
+    /// A 211 mapping: the shim lies above.
+    Mapping,
+}
+
 /// One process's GPU memory bookkeeping (module docs). Lives in gsv's shared state, under its
 /// one lock ([`crate::shared::Locked::gpu`]).
 #[derive(Debug, PartialEq, Eq)]
@@ -414,6 +561,11 @@ pub struct GpuMemory {
     pub(crate) registrations: BTreeMap<u32, Registration>,
     pub(crate) pending: BTreeMap<Ticket, Job>,
     pub(crate) next: Counters,
+    /// The registrations' ranges, counted: the second layer is their union (module docs).
+    pub(crate) registered: Cover,
+    /// Per address space, the waiting jobs' `reveal` ranges, counted: the pages no publish
+    /// writes (module docs, "Pages a waiting job holds"). A space nothing holds has no entry.
+    pub(crate) waiting: BTreeMap<AsId, Cover>,
 }
 
 impl Default for GpuMemory {
@@ -434,6 +586,8 @@ impl GpuMemory {
             registrations: BTreeMap::new(),
             pending: BTreeMap::new(),
             next: Counters::FIRST,
+            registered: Cover::default(),
+            waiting: BTreeMap::new(),
         }
     }
 
@@ -564,9 +718,14 @@ impl GpuMemory {
     /// 101's checks, in PR's order (`RegisterMemory`), before the kernel is asked anything:
     /// the flags (`NotImplemented`), the device (`NotFound`), the range (`InvalidSize`), its
     /// start (`InvalidAddress`) and size (`InvalidSize`) alignment, and room for one more piece
-    /// in every address space (`OutOfResource`, where PR's `nvmap.CreateHandle` fails). Returns
-    /// the range.
-    pub fn check_registration(&self, request: &RegisterRequest) -> Result<PageRange, KernelError> {
+    /// in every address space and for a handle (`OutOfResource`, where PR's
+    /// `nvmap.CreateHandle` fails). Returns the admitted registration, which holds the
+    /// bookkeeping until [`Admission::register`] records it, so nothing can change in between
+    /// and that cannot fail.
+    pub fn check_registration(
+        &mut self,
+        request: &RegisterRequest,
+    ) -> Result<Admission<'_>, KernelError> {
         if request.flags != 0 {
             return Err(KernelError::NotImplemented);
         }
@@ -584,46 +743,18 @@ impl GpuMemory {
                 .spaces
                 .values()
                 .any(|space| self.pieces_of(space) >= MAX_PIECES);
-        if full || self.next.handle.checked_add(1).is_none() {
+        let Some(next) = self.next.handle.checked_add(1) else {
+            return Err(KernelError::OutOfResource);
+        };
+        if full {
             return Err(KernelError::OutOfResource);
         }
-        Ok(range)
-    }
-
-    /// 101 after the kernel checks: records the registration with its lock's token and maps it
-    /// at its own address in every address space. Returns its handle. Call
-    /// [`check_registration`](Self::check_registration) first; this repeats its room check, and
-    /// on that error records nothing (the caller then releases the lock).
-    pub fn register(
-        &mut self,
-        range: PageRange,
-        device: u8,
-        token: DeviceShareToken,
-    ) -> Result<u32, KernelError> {
-        let handle = self.next.handle;
-        let next = handle.checked_add(1).ok_or(KernelError::OutOfResource)?;
-        if self.registrations.len() >= MAX_PIECES
-            || self
-                .spaces
-                .values()
-                .any(|s| self.pieces_of(s) >= MAX_PIECES)
-        {
-            return Err(KernelError::OutOfResource);
-        }
-        self.registrations.insert(
-            handle,
-            Registration {
-                range,
-                device,
-                token,
-            },
-        );
-        self.next.handle = next;
-        let spaces: Vec<AsId> = self.spaces.keys().copied().collect();
-        for space in spaces {
-            self.republish(space, range);
-        }
-        Ok(handle)
+        Ok(Admission {
+            memory: self,
+            range,
+            device: request.device,
+            next,
+        })
     }
 
     /// The checks every ordered job makes before it changes anything: room for one more
@@ -639,22 +770,72 @@ impl GpuMemory {
             .ok_or(KernelError::OutOfResource)
     }
 
-    /// Sends `updates` to the GPU in order, then a barrier with the next ticket, and keeps
-    /// `job` until the ticket comes back. [`next_ticket`](Self::next_ticket) must have passed.
-    fn order(&mut self, front: &dyn GpuVmFront, updates: &[(AsId, VmUpdate)], job: Job) -> Ticket {
+    /// Sends `updates` to the GPU in order, then a barrier with the next ticket, and keeps the
+    /// job, with `event` and `releases`, until the ticket comes back. The ranges the updates
+    /// cover, merged per address space, are the job's `reveal`, held until then (module docs,
+    /// "Pages a waiting job holds"). [`next_ticket`](Self::next_ticket) must have passed.
+    fn order(
+        &mut self,
+        front: &dyn GpuVmFront,
+        updates: &[(AsId, VmUpdate)],
+        event: ObjectId,
+        releases: Vec<DeviceShareToken>,
+    ) -> Ticket {
         let ticket = Ticket(self.next.ticket);
         self.next.ticket = self.next.ticket.saturating_add(1);
+        let mut covered: BTreeMap<AsId, Vec<(u64, u64)>> = BTreeMap::new();
         for &(space, update) in updates {
             front.update_vm(space, update, None);
+            let range = update.range();
+            covered
+                .entry(space)
+                .or_default()
+                .push((range.start(), range.end()));
         }
         front.barrier(ticket);
-        self.pending.insert(ticket, job);
+        let mut reveal = Vec::new();
+        for (space, ranges) in covered {
+            let held = self.waiting.entry(space).or_default();
+            for (start, end) in union(ranges) {
+                held.add(start, end);
+                if let Some(range) = page_range(start, end) {
+                    reveal.push((space, range));
+                }
+            }
+        }
+        self.pending.insert(
+            ticket,
+            Job {
+                event,
+                releases,
+                reveal,
+            },
+        );
         ticket
     }
 
+    /// The runs of `start..end` of address space `held` where nothing the bookkeeping holds
+    /// above a piece of `layer` shows: where that piece is the top layer (module docs, "What a
+    /// removal sends").
+    fn shown(&self, held: &Space, layer: Layer, start: u64, end: u64) -> Vec<(u64, u64)> {
+        let mut above = Vec::new();
+        if layer == Layer::Registration {
+            above.extend(self.registered.runs(start, end, true));
+            above.extend(
+                in_range(&held.records, |r| r.end, start, end)
+                    .map(|(&low, record)| (low.max(start), record.end.min(end))),
+            );
+        }
+        if let Some(shim) = held.shim {
+            above.push((shim.max(start), shim.saturating_add(PAGE_SIZE).min(end)));
+        }
+        subtract(start, end, &union(above))
+    }
+
     /// 102 `DestroyGpuAccessibleMemory`: takes registration `handle` out, with every 211
-    /// mapping of it, and sends the GPU their removals (`NotFound` if no registration has the
-    /// handle). Its lock is released, and `event` signalled, once the GPU is done.
+    /// mapping of it, and sends the GPU their removals where they are the top layer (module
+    /// docs, "What a removal sends"); `NotFound` if no registration has the handle. Its lock is
+    /// released, and `event` signalled, once the GPU is done.
     pub fn destroy_memory(
         &mut self,
         front: &dyn GpuVmFront,
@@ -667,38 +848,43 @@ impl GpuMemory {
             .ok_or(KernelError::NotFound)?;
         self.next_ticket()?;
         self.registrations.remove(&handle);
-        let mut updates = Vec::new();
-        let mut reveal = Vec::new();
+        let own = registration.range;
+        self.registered.remove(own.start(), own.end());
+        let mut removed: Vec<(AsId, Vec<(u64, u64)>)> = Vec::new();
         for (&id, space) in &mut self.spaces {
-            updates.push((
-                id,
-                VmUpdate::DestroyMemory {
-                    range: registration.range,
-                },
-            ));
-            reveal.push((id, registration.range));
             let mapped: Vec<u64> = space
                 .records
                 .iter()
                 .filter(|(_, record)| record.handle == handle)
                 .map(|(&start, _)| start)
                 .collect();
+            let mut ranges = Vec::new();
             for start in mapped {
-                let Some(record) = space.records.remove(&start) else {
-                    continue;
-                };
-                if let Ok(range) = PageRange::new(start, record.end - start) {
-                    updates.push((id, VmUpdate::Unmap { range }));
-                    reveal.push((id, range));
+                if let Some(record) = space.records.remove(&start) {
+                    ranges.push((start, record.end));
+                }
+            }
+            removed.push((id, ranges));
+        }
+        let mut updates = Vec::new();
+        for (id, ranges) in removed {
+            let Some(space) = self.spaces.get(&id) else {
+                continue;
+            };
+            for (start, end) in self.shown(space, Layer::Registration, own.start(), own.end()) {
+                if let Some(range) = page_range(start, end) {
+                    updates.push((id, VmUpdate::DestroyMemory { range }));
+                }
+            }
+            for (low, high) in ranges {
+                for (start, end) in self.shown(space, Layer::Mapping, low, high) {
+                    if let Some(range) = page_range(start, end) {
+                        updates.push((id, VmUpdate::Unmap { range }));
+                    }
                 }
             }
         }
-        let job = Job {
-            event,
-            releases: vec![registration.token],
-            reveal,
-        };
-        Ok(self.order(front, &updates, job))
+        Ok(self.order(front, &updates, event, vec![registration.token]))
     }
 
     /// 211 `NormalMapGpuMemory4K`: maps part of a registration at a GPU address, at once, and
@@ -821,18 +1007,14 @@ impl GpuMemory {
             range,
             kind: selected.backend,
         };
-        let job = Job {
-            event,
-            releases: Vec::new(),
-            reveal: vec![(request.space, range)],
-        };
-        self.order(front, &[(request.space, update)], job);
+        self.order(front, &[(request.space, update)], event, Vec::new());
         Ok(selected.selected)
     }
 
     /// 213 `NormalUnmapGpuMemory4K`: takes out the 211 mapping whose range is exactly the
-    /// request's (`NotFound` otherwise, PR's exact match) and sends the GPU its removal.
-    /// Returns its size in bytes, PR's reply.
+    /// request's (`NotFound` otherwise, PR's exact match) and sends the GPU its removal where
+    /// it is the top layer (module docs, "What a removal sends"). Returns its size in bytes,
+    /// PR's reply.
     pub fn unmap(
         &mut self,
         front: &dyn GpuVmFront,
@@ -843,15 +1025,18 @@ impl GpuMemory {
             space.records.get(&start).map(|record| record.end)
         })?;
         self.next_ticket()?;
+        let mut updates = Vec::new();
         if let Some(space) = self.spaces.get_mut(&request.space) {
             space.records.remove(&range.start());
         }
-        let job = Job {
-            event,
-            releases: Vec::new(),
-            reveal: vec![(request.space, range)],
-        };
-        self.order(front, &[(request.space, VmUpdate::Unmap { range })], job);
+        if let Some(space) = self.spaces.get(&request.space) {
+            for (start, end) in self.shown(space, Layer::Mapping, range.start(), range.end()) {
+                if let Some(part) = page_range(start, end) {
+                    updates.push((request.space, VmUpdate::Unmap { range: part }));
+                }
+            }
+        }
+        self.order(front, &updates, event, Vec::new());
         Ok(range.size())
     }
 
@@ -935,8 +1120,9 @@ impl GpuMemory {
     }
 
     /// 215 `DestroySparseRegion`: takes out the sparse region whose range is exactly the
-    /// request's (`NotFound` otherwise) and sends the GPU its destroy. 211 mappings inside it
-    /// stay.
+    /// request's (`NotFound` otherwise) and sends the GPU its destroy over the whole range. 211
+    /// mappings inside it stay in the bookkeeping, and show again once the job is done (module
+    /// docs, "What a removal sends"; a divergence from NX2, module docs of [`crate::gpu`]).
     pub fn destroy_sparse_region(
         &mut self,
         front: &dyn GpuVmFront,
@@ -952,16 +1138,14 @@ impl GpuMemory {
             .get_mut(&request.space)
             .and_then(|space| space.regions.remove(&range.start()))
             .ok_or(KernelError::NotFound)?;
+        // The whole region, whatever lies above it: the GPU frees the region's backing when it
+        // applies this (gpu-protocol G22; graphics-server, 215), so it is sent even where no
+        // page of the region shows (module docs, "What a removal sends").
         let update = VmUpdate::DestroySparseRegion {
             range,
             region: region.id,
         };
-        let job = Job {
-            event,
-            releases: Vec::new(),
-            reveal: vec![(request.space, range)],
-        };
-        self.order(front, &[(request.space, update)], job);
+        self.order(front, &[(request.space, update)], event, Vec::new());
         Ok(region.id)
     }
 
@@ -980,13 +1164,26 @@ impl GpuMemory {
         Ok(())
     }
 
-    /// The GPU reported `ticket` done: the job's removed ranges are published again (module
-    /// docs, "What the table shows"), and the drain is told what to release and signal. `None`
-    /// for a ticket no job waits on.
+    /// The GPU reported `ticket` done: the job's ranges are no longer held, and are published
+    /// again, once per address space (module docs, "What the table shows"); the drain is told
+    /// what to release and signal. `None` for a ticket no job waits on.
     pub fn ordered_done(&mut self, ticket: Ticket) -> Option<Finished> {
         let job = self.pending.remove(&ticket)?;
+        let mut by_space: BTreeMap<AsId, Vec<(u64, u64)>> = BTreeMap::new();
         for &(space, range) in &job.reveal {
-            self.republish(space, range);
+            if let Some(held) = self.waiting.get_mut(&space) {
+                held.remove(range.start(), range.end());
+                if held.is_empty() {
+                    self.waiting.remove(&space);
+                }
+            }
+            by_space
+                .entry(space)
+                .or_default()
+                .push((range.start(), range.end()));
+        }
+        for (space, ranges) in by_space {
+            self.publish(space, &union(ranges));
         }
         Some(Finished {
             releases: job.releases,
@@ -997,50 +1194,60 @@ impl GpuMemory {
     // ----- Publishing ----------------------------------------------------------------------------
 
     /// Writes what the bookkeeping shows in `range` of address space `space` into its table, a
-    /// layer at a time (module docs, "What the table shows"). Pages nothing covers are left as
-    /// they are.
+    /// layer at a time (module docs, "What the table shows"), but for the pages a waiting job
+    /// holds. Pages nothing covers are left as they are.
     pub(crate) fn republish(&self, space: AsId, range: PageRange) {
-        self.publish(space, range.start(), range.end());
+        self.publish(space, &[(range.start(), range.end())]);
     }
 
     /// Writes everything the bookkeeping holds for address space `space` into its table, a layer
-    /// at a time: for a table that is new (gpu 33, a restore).
+    /// at a time, but for the pages a waiting job holds: for a table that is new (gpu 33, a
+    /// restore).
     pub(crate) fn publish_all(&self, space: AsId) {
-        self.publish(space, 0, u64::MAX);
+        self.publish(space, &[(0, u64::MAX)]);
     }
 
-    /// Writes what the bookkeeping shows in `low..high` of `space` into its table. Sparse
-    /// regions and 211 mappings are found by range in their maps (they do not overlap), so the
-    /// time is the pieces in the range and the registrations, which may overlap each other and
-    /// are walked whole (at most [`MAX_PIECES`]).
-    fn publish(&self, space: AsId, low: u64, high: u64) {
+    /// Writes what the bookkeeping shows in `ranges` (sorted, merged: [`union`]'s form) of
+    /// `space` into its table, but for the pages a waiting job holds there.
+    ///
+    /// The cost is one sweep: the held pages' steps inside `ranges` (their [`Cover`]); the
+    /// sparse regions and 211 mappings from the first range's start to the last range's end,
+    /// found by range in their maps (they do not overlap), each matched against the open runs
+    /// by binary search, and each mapping's runs of one kind likewise; the registrations'
+    /// union's steps in that span ([`Cover::runs`]); and one map per part written. So a drain
+    /// that publishes many ranges walks each piece at most once per address space, not once per
+    /// range.
+    fn publish(&self, space: AsId, ranges: &[(u64, u64)]) {
         let Some(held) = self.spaces.get(&space) else {
             return;
         };
-        let part_of = |start: u64, end: u64| {
-            let from = start.max(low);
-            let to = end.min(high);
-            (from < to)
-                .then(|| PageRange::new(from, to - from).ok())
-                .flatten()
+        let waiting = self.waiting.get(&space);
+        let open: Vec<(u64, u64)> = ranges
+            .iter()
+            .flat_map(|&(low, high)| {
+                waiting.map_or_else(|| vec![(low, high)], |held| held.runs(low, high, false))
+            })
+            .collect();
+        let (Some(&(low, _)), Some(&(_, high))) = (open.first(), open.last()) else {
+            return;
         };
         let mut maps: Vec<(PageRange, Target, Kind)> = Vec::new();
         for (&start, region) in in_range(&held.regions, |r| r.end, low, high) {
-            if let Some(part) = part_of(start, region.end) {
-                let target = Target::GpuOnly {
-                    region: region.id,
-                    offset: part.start() - start,
-                };
-                maps.push((part, target, SPARSE_KIND));
+            for (from, to) in parts(&open, start, region.end) {
+                if let Some(part) = page_range(from, to) {
+                    let target = Target::GpuOnly {
+                        region: region.id,
+                        offset: from - start,
+                    };
+                    maps.push((part, target, SPARSE_KIND));
+                }
             }
         }
-        for registration in self.registrations.values() {
-            let own = registration.range;
-            if let Some(part) = part_of(own.start(), own.end()) {
-                let target = Target::Guest {
-                    cpu_va: part.start(),
-                };
-                maps.push((part, target, SELF_MAP_KIND));
+        for (own_start, own_end) in self.registered.runs(low, high, true) {
+            for (from, to) in parts(&open, own_start, own_end) {
+                if let Some(part) = page_range(from, to) {
+                    maps.push((part, Target::Guest { cpu_va: from }, SELF_MAP_KIND));
+                }
             }
         }
         for (&start, record) in in_range(&held.records, |r| r.end, low, high) {
@@ -1048,17 +1255,23 @@ impl GpuMemory {
                 continue;
             };
             let base = registration.range.start().saturating_add(record.offset);
-            for &(span_start, span_end, kind) in &record.spans {
-                if let Some(part) = part_of(span_start, span_end) {
-                    let cpu_va = base.saturating_add(part.start() - start);
-                    maps.push((part, Target::Guest { cpu_va }, kind));
+            for (from, to) in parts(&open, start, record.end) {
+                let first = record.spans.partition_point(|&(_, end, _)| end <= from);
+                let spans = record.spans.get(first..).unwrap_or_default();
+                for &(span_start, span_end, kind) in spans.iter().take_while(|s| s.0 < to) {
+                    if let Some(part) = page_range(span_start.max(from), span_end.min(to)) {
+                        let cpu_va = base.saturating_add(part.start() - start);
+                        maps.push((part, Target::Guest { cpu_va }, kind));
+                    }
                 }
             }
         }
-        if let Some(shim) = held.shim
-            && let Some(part) = part_of(shim, shim.saturating_add(PAGE_SIZE))
-        {
-            maps.push((part, Target::SyncpointShim, SELF_MAP_KIND));
+        if let Some(shim) = held.shim {
+            for (from, to) in parts(&open, shim, shim.saturating_add(PAGE_SIZE)) {
+                if let Some(part) = page_range(from, to) {
+                    maps.push((part, Target::SyncpointShim, SELF_MAP_KIND));
+                }
+            }
         }
         for (part, target, kind) in maps {
             if let Err(error) = held.vm.map(part, target, kind) {

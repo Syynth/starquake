@@ -28,7 +28,8 @@ use starquake_trace::{EventKind, ServiceId};
 use super::command::*;
 use super::kind::{GENERIC_16BX2, S8Z24, Z16};
 use super::memory::{
-    DEVICE_SLOTS, MAX_ADDRESS_SPACES, MAX_PENDING_JOBS, MAX_PIECES, SELF_MAP_KIND, SPARSE_KIND,
+    DEVICE_SLOTS, MAX_ADDRESS_SPACES, MAX_PENDING_JOBS, MAX_PIECES, SELF_MAP_KIND,
+    SMALL_PAGE_SHIFT, SPARSE_KIND,
 };
 use super::*;
 use crate::completion::{Completion, CompletionQueue};
@@ -263,7 +264,18 @@ impl Rig {
 
     /// Plays the GPU catching up and the timer thread draining; the drain's calls.
     fn finish(&mut self) -> Vec<TimerCall> {
+        self.apply();
+        self.drain()
+    }
+
+    /// Plays the GPU catching up only: its updates applied, its barriers queued, nothing
+    /// drained yet.
+    fn apply(&self) {
         self.front.finish(self.shared.queue());
+    }
+
+    /// Plays the timer thread draining; the drain's calls.
+    fn drain(&mut self) -> Vec<TimerCall> {
         let mut timer = Timer {
             kernel: &mut self.kernel,
             calls: Vec::new(),
@@ -271,6 +283,39 @@ impl Rig {
         self.shared.drain(&mut timer);
         timer.calls
     }
+
+    /// What the table of `space` shows at the page at `va` ([`shown_at`]).
+    fn at(&self, space: u32, va: u64) -> Option<(Target, Kind)> {
+        shown_at(&self.mappings(space), va)
+    }
+}
+
+/// What `mappings` show at the page at `va`: the target moved to that page, and the kind; so
+/// a test reads what a page translates to, however the table split its entries.
+fn shown_at(mappings: &[Mapping], va: u64) -> Option<(Target, Kind)> {
+    let mapping = mappings
+        .iter()
+        .find(|m| m.range.start() <= va && va < m.range.end())?;
+    let delta = va - mapping.range.start();
+    let target = match mapping.target {
+        Target::Guest { cpu_va } => Target::Guest {
+            cpu_va: cpu_va + delta,
+        },
+        Target::GpuOnly { region, offset } => Target::GpuOnly {
+            region,
+            offset: offset + delta,
+        },
+        Target::SyncpointShim => Target::SyncpointShim,
+    };
+    Some((target, mapping.kind))
+}
+
+/// A guest page at `cpu_va` with `kind`, as [`shown_at`] reads it.
+fn page_at(cpu_va: u64, kind: Kind) -> Option<(Target, Kind)> {
+    shown_at(
+        &[guest(page_range(cpu_va, PAGE_SIZE), cpu_va, kind)],
+        cpu_va,
+    )
 }
 
 /// The usual set-up: a worker, a device, an address space, a four-page registration at
@@ -1383,7 +1428,10 @@ fn a_sparse_region_lies_under_a_registration() {
     assert_eq!(s.rig.mappings(s.space), [region]);
 }
 
-/// 215 matches a region exactly, completes in order, and leaves the 211 mappings inside.
+/// 215 matches a region exactly, completes in order, and leaves the 211 mappings inside in the
+/// bookkeeping (a divergence from NX2, which trims them). Its destroy covers the whole region,
+/// so between the GPU applying it and the drain the mapping inside is gone from the table too;
+/// the drain shows it again.
 #[test]
 fn a_sparse_region_is_destroyed_in_order() {
     let mut s = ready();
@@ -1431,10 +1479,29 @@ fn a_sparse_region_is_destroyed_in_order() {
         )
     );
     assert_eq!(s.rig.kernel.signals(s.event), Some(signals));
-    s.rig.finish();
-    assert_eq!(s.rig.kernel.signals(s.event), Some(signals + 1));
     let mapped = guest(page_range(REGION, MEMORY_SIZE), MEMORY, GENERIC_16BX2);
+    // Before the GPU applies it, the table is as it was.
+    let rest = Mapping {
+        range: page_range(REGION + MEMORY_SIZE, size - MEMORY_SIZE),
+        target: Target::GpuOnly {
+            region: RegionId(1),
+            offset: MEMORY_SIZE,
+        },
+        kind: SPARSE_KIND,
+    };
+    assert_eq!(s.rig.mappings(s.space), [own(), mapped, rest]);
+    // Applied, not drained: every mapping in the region's range is gone, the 211 one included.
+    s.rig.apply();
+    assert_eq!(s.rig.mappings(s.space), [own()]);
+    s.rig.drain();
+    assert_eq!(s.rig.kernel.signals(s.event), Some(signals + 1));
     assert_eq!(s.rig.mappings(s.space), [own(), mapped]);
+    assert!(
+        s.rig.gpu().gpu_memory().spaces[&AsId(s.space)]
+            .records
+            .contains_key(&REGION),
+        "the bookkeeping keeps the 211 mapping inside the destroyed region"
+    );
 }
 
 // ----- Bounds and the shim ---------------------------------------------------------------------
@@ -1454,6 +1521,19 @@ fn token_for(range: PageRange) -> DeviceShareToken {
     )
 }
 
+/// Registers `range` with device 1 straight on the bookkeeping, its token made up; the handle.
+fn register_bare(gpu: &mut GpuMemory, range: PageRange) -> u32 {
+    let request = RegisterRequest {
+        first: range.start(),
+        last: range.end() - 1,
+        flags: 0,
+        device: 1,
+    };
+    gpu.check_registration(&request)
+        .unwrap()
+        .register(token_for(range))
+}
+
 /// An address space at exactly [`MAX_PIECES`] pieces refuses one more piece, and one below
 /// takes it: registrations and sparse regions count together.
 #[test]
@@ -1461,7 +1541,7 @@ fn pieces_are_bounded_at_the_limit() {
     let (mut gpu, front) = bare();
     let space = gpu.create_address_space(&front).unwrap();
     let range = page_range(MEMORY, PAGE_SIZE);
-    gpu.register(range, 1, token_for(range)).unwrap();
+    register_bare(&mut gpu, range);
     let sparse = |n: u64| SparseRequest {
         space,
         first: REGION + n * PAGE_SIZE,
@@ -1489,13 +1569,8 @@ fn pieces_are_bounded_at_the_limit() {
         device: 1,
     };
     assert_eq!(
-        gpu.check_registration(&request),
-        Err(KernelError::OutOfResource)
-    );
-    let full = page_range(0x9_0000_0000, PAGE_SIZE);
-    assert_eq!(
-        gpu.register(full, 1, token_for(full)),
-        Err(KernelError::OutOfResource)
+        gpu.check_registration(&request).err(),
+        Some(KernelError::OutOfResource)
     );
     assert!(
         gpu.registration(2).is_none(),
@@ -1509,7 +1584,7 @@ fn pending_jobs_are_bounded_at_the_limit() {
     let (mut gpu, front) = bare();
     let space = gpu.create_address_space(&front).unwrap();
     let range = page_range(MEMORY, PAGE_SIZE);
-    let handle = gpu.register(range, 1, token_for(range)).unwrap();
+    let handle = register_bare(&mut gpu, range);
     let event = ObjectId::from_parts(4, 5);
     let map = MapRequest {
         space,
@@ -1555,6 +1630,11 @@ fn pending_jobs_are_bounded_at_the_limit() {
         Err(KernelError::Busy)
     );
     assert!(gpu.registration(handle).is_some());
+    // gpu.rs: 102's "no such handle" comes before "no room for another job".
+    assert_eq!(
+        gpu.destroy_memory(&front, handle + 1, event),
+        Err(KernelError::NotFound)
+    );
 }
 
 /// One syncpoint shim per address space.
@@ -1609,11 +1689,542 @@ fn the_drain_skips_unknown_tickets_and_goes_on_after_a_refused_signal() {
         ticket: Ticket(77),
     }));
     s.rig.front.finish(&queue);
-    // A host that signals nothing: the trait's default refusal.
+    // A host that refuses every signal.
     let mut host = Refusing(Vec::new());
     let taken = s.rig.shared.drain(&mut host);
     assert_eq!(taken.len(), 3);
     // The destroy after the refused unmap signal still released its lock.
     assert_eq!(host.0.len(), 1);
     assert_eq!(s.rig.gpu().gpu_memory().pending_jobs(), 0);
+}
+
+// ----- What the table shows while a job waits ----------------------------------------------------
+
+/// The sparse region request for the `n`th page from [`REGION`] in `space`, with `device`.
+fn sparse_at(space: AsId, n: u64, device: u8) -> SparseRequest {
+    SparseRequest {
+        space,
+        first: REGION + n * PAGE_SIZE,
+        last: REGION + (n + 1) * PAGE_SIZE - 1,
+        page_shift: SMALL_PAGE_SHIFT,
+        mode: 0,
+        device,
+        sync: 0,
+    }
+}
+
+/// The 213 of the tests' whole-registration mapping at `va`.
+fn unmap_words(space: u32, va: u64) -> Vec<u32> {
+    range_words(
+        NORMAL_UNMAP_GPU_MEMORY_4K,
+        space,
+        va,
+        va + MEMORY_SIZE - 1,
+        0,
+        0,
+    )
+}
+
+/// A 214 over the pages a waiting 213 removed is not written into the table until the job is
+/// done: until the GPU applies the unmap, the table still shows the mapping (as the work queued
+/// before the 213 expects), then a hole, then, once drained, the region.
+#[test]
+fn a_sparse_region_over_a_pending_unmap_waits_for_the_drain() {
+    let mut s = ready();
+    s.map_at(GPU_VA);
+    let mapped = guest(page_range(GPU_VA, MEMORY_SIZE), MEMORY, GENERIC_16BX2);
+    let unmap = unmap_words(s.space, GPU_VA);
+    assert_eq!(
+        result_of(&s.rig.send_on(s.worker, &unmap)),
+        ResultCode::SUCCESS
+    );
+    let words = sparse_words(
+        s.space,
+        GPU_VA,
+        GPU_VA + MEMORY_SIZE - 1,
+        u32::from(SMALL_PAGE_SHIFT),
+        0,
+        s.device,
+        0,
+        0,
+    );
+    assert_eq!(
+        result_of(&s.rig.send_on(s.worker, &words)),
+        ResultCode::SUCCESS
+    );
+    assert_eq!(s.rig.mappings(s.space), [own(), mapped]);
+    s.rig.apply();
+    assert_eq!(s.rig.mappings(s.space), [own()]);
+    s.rig.drain();
+    let region = Mapping {
+        range: page_range(GPU_VA, MEMORY_SIZE),
+        target: Target::GpuOnly {
+            region: RegionId(1),
+            offset: 0,
+        },
+        kind: SPARSE_KIND,
+    };
+    assert_eq!(s.rig.mappings(s.space), [own(), region]);
+}
+
+/// A 101 at the CPU address a waiting 213 removed at the GPU address is not mapped there until
+/// the job is done.
+#[test]
+fn a_registration_over_a_pending_unmap_waits_for_the_drain() {
+    let mut s = ready();
+    s.map_at(GPU_VA);
+    let mapped = guest(page_range(GPU_VA, MEMORY_SIZE), MEMORY, GENERIC_16BX2);
+    let unmap = unmap_words(s.space, GPU_VA);
+    assert_eq!(
+        result_of(&s.rig.send_on(s.worker, &unmap)),
+        ResultCode::SUCCESS
+    );
+    s.rig.register(s.worker, GPU_VA, MEMORY_SIZE, s.device);
+    assert_eq!(s.rig.mappings(s.space), [own(), mapped]);
+    s.rig.apply();
+    assert_eq!(s.rig.mappings(s.space), [own()]);
+    s.rig.drain();
+    let self_mapped = guest(page_range(GPU_VA, MEMORY_SIZE), GPU_VA, SELF_MAP_KIND);
+    assert_eq!(s.rig.mappings(s.space), [own(), self_mapped]);
+}
+
+/// A 213 sends its unmap only where its mapping shows: the shim inside it stays in the table
+/// while the GPU applies the unmap, and after the drain.
+#[test]
+fn an_unmap_keeps_the_shim() {
+    let mut s = ready();
+    s.map_at(GPU_VA);
+    let shim = GPU_VA + PAGE_SIZE;
+    s.rig
+        .gpu()
+        .gpu()
+        .map_syncpoint_shim(AsId(s.space), shim)
+        .unwrap();
+    let shim_mapping = Mapping {
+        range: page_range(shim, PAGE_SIZE),
+        target: Target::SyncpointShim,
+        kind: SELF_MAP_KIND,
+    };
+    assert_eq!(
+        s.rig.at(s.space, shim),
+        Some((Target::SyncpointShim, SELF_MAP_KIND))
+    );
+    let unmap = unmap_words(s.space, GPU_VA);
+    assert_eq!(
+        result_of(&s.rig.send_on(s.worker, &unmap)),
+        ResultCode::SUCCESS
+    );
+    let space = AsId(s.space);
+    let calls = s.rig.front.calls();
+    assert_eq!(
+        calls[calls.len() - 3..],
+        [
+            FrontCall::Update(
+                space,
+                VmUpdate::Unmap {
+                    range: page_range(GPU_VA, PAGE_SIZE)
+                },
+                None
+            ),
+            FrontCall::Update(
+                space,
+                VmUpdate::Unmap {
+                    range: page_range(GPU_VA + 2 * PAGE_SIZE, 2 * PAGE_SIZE)
+                },
+                None
+            ),
+            FrontCall::Barrier(Ticket(1)),
+        ]
+    );
+    s.rig.apply();
+    assert_eq!(s.rig.mappings(s.space), [own(), shim_mapping]);
+    s.rig.drain();
+    assert_eq!(s.rig.mappings(s.space), [own(), shim_mapping]);
+}
+
+/// A 102 sends its destroy only where its registration shows: another registration's own
+/// mapping, another handle's 211 mapping and the shim on its range stay in the table while the
+/// GPU applies it, and after the drain.
+#[test]
+fn a_destroy_keeps_what_shows_above_it() {
+    let mut s = ready();
+    // Another registration over the last page of the first's range, a 211 of it at the first's
+    // first page, and the shim at its second: only the third page shows the first registration.
+    let other = s
+        .rig
+        .register(s.worker, MEMORY + 3 * PAGE_SIZE, PAGE_SIZE, s.device);
+    let words = map_words(
+        s.space,
+        MEMORY,
+        MEMORY + PAGE_SIZE - 1,
+        other,
+        0,
+        MapBytes::of(s.device),
+        0,
+    );
+    assert_eq!(
+        result_of(&s.rig.send_on(s.worker, &words)),
+        ResultCode::SUCCESS
+    );
+    s.rig
+        .gpu()
+        .gpu()
+        .map_syncpoint_shim(AsId(s.space), MEMORY + PAGE_SIZE)
+        .unwrap();
+    let pages = |s: &Ready| -> Vec<Option<(Target, Kind)>> {
+        (0..4)
+            .map(|n| s.rig.at(s.space, MEMORY + n * PAGE_SIZE))
+            .collect()
+    };
+    let mapped = page_at(MEMORY + 3 * PAGE_SIZE, GENERIC_16BX2);
+    let shim = Some((Target::SyncpointShim, SELF_MAP_KIND));
+    let third = page_at(MEMORY + 2 * PAGE_SIZE, SELF_MAP_KIND);
+    let fourth = page_at(MEMORY + 3 * PAGE_SIZE, SELF_MAP_KIND);
+    assert_eq!(pages(&s), [mapped, shim, third, fourth]);
+    assert_eq!(
+        result_of(&s.rig.send_on(s.worker, &[0x76, 2, s.handle, 0])),
+        ResultCode::SUCCESS
+    );
+    let space = AsId(s.space);
+    assert_eq!(
+        s.rig.front.calls()[1..],
+        [
+            FrontCall::Update(
+                space,
+                VmUpdate::DestroyMemory {
+                    range: page_range(MEMORY + 2 * PAGE_SIZE, PAGE_SIZE)
+                },
+                None
+            ),
+            FrontCall::Barrier(Ticket(1)),
+        ]
+    );
+    assert_eq!(pages(&s), [mapped, shim, third, fourth]);
+    s.rig.apply();
+    assert_eq!(pages(&s), [mapped, shim, None, fourth]);
+    s.rig.drain();
+    assert_eq!(pages(&s), [mapped, shim, None, fourth]);
+}
+
+/// A 102 takes its 211 mappings out with it, and the drain publishes their ranges again: a
+/// sparse region under one shows there once more.
+#[test]
+fn a_destroy_shows_a_region_under_its_mappings_again() {
+    let mut s = ready();
+    let size = 8 * PAGE_SIZE;
+    let words = sparse_words(
+        s.space,
+        REGION,
+        REGION + size - 1,
+        u32::from(SMALL_PAGE_SHIFT),
+        0,
+        s.device,
+        0,
+        0,
+    );
+    assert_eq!(
+        result_of(&s.rig.send_on(s.worker, &words)),
+        ResultCode::SUCCESS
+    );
+    s.map_at(REGION + 2 * PAGE_SIZE);
+    assert_eq!(
+        s.rig.at(s.space, REGION + 2 * PAGE_SIZE),
+        page_at(MEMORY, GENERIC_16BX2)
+    );
+    assert_eq!(
+        result_of(&s.rig.send_on(s.worker, &[0x76, 2, s.handle, 0])),
+        ResultCode::SUCCESS
+    );
+    s.rig.finish();
+    for n in 0..8 {
+        let offset = n * PAGE_SIZE;
+        let region = Target::GpuOnly {
+            region: RegionId(1),
+            offset,
+        };
+        assert_eq!(
+            s.rig.at(s.space, REGION + offset),
+            Some((region, SPARSE_KIND)),
+            "page {n}"
+        );
+    }
+    assert_eq!(s.rig.at(s.space, MEMORY), None);
+}
+
+/// A 211 that cuts a mapping leaves its tail at its own place in the registration: published
+/// again from the bookkeeping (a 212 of the tail, drained), the tail's last page is the
+/// registration's last.
+#[test]
+fn a_cut_off_tail_keeps_its_place_in_the_registration() {
+    let mut s = ready();
+    s.map_at(GPU_VA);
+    let words = map_words(
+        s.space,
+        GPU_VA + PAGE_SIZE,
+        GPU_VA + 2 * PAGE_SIZE - 1,
+        s.handle,
+        0,
+        MapBytes::of(s.device),
+        0,
+    );
+    assert_eq!(
+        result_of(&s.rig.send_on(s.worker, &words)),
+        ResultCode::SUCCESS
+    );
+    let tail = GPU_VA + 2 * PAGE_SIZE;
+    // Compressible Z16 (0xb) with fallback 1: backend Z16.
+    let modify = modify_words(s.space, tail, tail + 2 * PAGE_SIZE - 1, 0xB, 1, 0, 0);
+    assert_eq!(
+        result_of(&s.rig.send_on(s.worker, &modify)),
+        ResultCode::SUCCESS
+    );
+    s.rig.finish();
+    assert_eq!(
+        s.rig.at(s.space, tail),
+        page_at(MEMORY + 2 * PAGE_SIZE, Z16)
+    );
+    assert_eq!(
+        s.rig.at(s.space, tail + PAGE_SIZE),
+        page_at(MEMORY + MEMORY_SIZE - PAGE_SIZE, Z16)
+    );
+}
+
+/// A 212 of a middle page keeps the runs before and after it, so the runs still cover the
+/// mapping and the bookkeeping saves.
+#[test]
+fn a_middle_kind_change_keeps_the_runs_after_it() {
+    let mut s = ready();
+    s.map_at(GPU_VA);
+    let page = GPU_VA + PAGE_SIZE;
+    let modify = modify_words(s.space, page, page + PAGE_SIZE - 1, 0xB, 1, 0, 0);
+    assert_eq!(
+        result_of(&s.rig.send_on(s.worker, &modify)),
+        ResultCode::SUCCESS
+    );
+    let locked = s.rig.gpu();
+    let memory = locked.gpu_memory();
+    assert_eq!(
+        memory.spaces[&AsId(s.space)].records[&GPU_VA].spans,
+        [
+            (GPU_VA, page, GENERIC_16BX2),
+            (page, page + PAGE_SIZE, Z16),
+            (page + PAGE_SIZE, GPU_VA + MEMORY_SIZE, GENERIC_16BX2),
+        ]
+    );
+    assert!(memory.save().is_ok());
+}
+
+/// A 214 may not overlap a 211 mapping, by one page; neighbours ending exactly at its start and
+/// starting exactly at its end are allowed.
+#[test]
+fn a_sparse_region_may_not_overlap_a_mapping() {
+    let mut s = ready();
+    s.map_at(GPU_VA);
+    let (space, device) = (s.space, s.device);
+    let mut ask = |first: u64| {
+        let words = sparse_words(
+            space,
+            first,
+            first + PAGE_SIZE - 1,
+            u32::from(SMALL_PAGE_SHIFT),
+            0,
+            device,
+            0,
+            0,
+        );
+        result_of(&s.rig.send_on(s.worker, &words))
+    };
+    assert_eq!(
+        ask(GPU_VA + MEMORY_SIZE - PAGE_SIZE),
+        code(KernelError::InvalidCurrentMemory)
+    );
+    assert_eq!(ask(GPU_VA), code(KernelError::InvalidCurrentMemory));
+    assert_eq!(ask(GPU_VA + MEMORY_SIZE), ResultCode::SUCCESS);
+    assert_eq!(ask(GPU_VA - PAGE_SIZE), ResultCode::SUCCESS);
+}
+
+/// `regions` one-page sparse regions from [`REGION`] on, made in `space` of `gpu`.
+fn fill_with_regions(gpu: &mut GpuMemory, space: AsId, regions: usize, device: u8) {
+    for n in 0..u64::try_from(regions).unwrap() {
+        gpu.create_sparse_region(&sparse_at(space, n, device))
+            .unwrap();
+    }
+}
+
+/// A fresh 211 at [`MAX_PIECES`] pieces is `OutOfResource`, one below it fits, and one that
+/// exactly replaces a mapping adds nothing and fits at the limit.
+#[test]
+fn a_map_is_bounded_at_the_limit() {
+    let (mut gpu, front) = bare();
+    let space = gpu.create_address_space(&front).unwrap();
+    let handle = register_bare(&mut gpu, page_range(MEMORY, MEMORY_SIZE));
+    let map = |first: u64| MapRequest {
+        space,
+        first,
+        last: first + PAGE_SIZE - 1,
+        handle,
+        offset: 0,
+        permission: 0,
+        cache: 0,
+        kind: 6,
+        fallback: 6,
+        mode: 0,
+        device: 1,
+        sync: 0,
+    };
+    gpu.map(&map(GPU_VA)).unwrap();
+    // The registration and the mapping, then regions up to one below the limit.
+    fill_with_regions(&mut gpu, space, MAX_PIECES - 3, 1);
+    assert_eq!(gpu.pieces(space), MAX_PIECES - 1);
+    gpu.map(&map(GPU_VA + PAGE_SIZE)).unwrap();
+    assert_eq!(gpu.pieces(space), MAX_PIECES);
+    assert_eq!(
+        gpu.map(&map(GPU_VA + 2 * PAGE_SIZE)),
+        Err(KernelError::OutOfResource)
+    );
+    assert!(gpu.map(&map(GPU_VA)).is_ok());
+    assert_eq!(gpu.pieces(space), MAX_PIECES);
+}
+
+/// A 212 of a middle page adds two runs: at [`MAX_PIECES`] - 1 pieces it is `OutOfResource`
+/// and queues nothing; at [`MAX_PIECES`] - 2 it fits exactly.
+#[test]
+fn a_kind_change_is_bounded_at_the_limit() {
+    let (mut gpu, front) = bare();
+    let space = gpu.create_address_space(&front).unwrap();
+    let handle = register_bare(&mut gpu, page_range(MEMORY, MEMORY_SIZE));
+    let map = MapRequest {
+        space,
+        first: GPU_VA,
+        last: GPU_VA + 3 * PAGE_SIZE - 1,
+        handle,
+        offset: 0,
+        permission: 0,
+        cache: 0,
+        kind: 6,
+        fallback: 6,
+        mode: 0,
+        device: 1,
+        sync: 0,
+    };
+    gpu.map(&map).unwrap();
+    fill_with_regions(&mut gpu, space, MAX_PIECES - 3, 1);
+    assert_eq!(gpu.pieces(space), MAX_PIECES - 1);
+    let middle = ModifyRequest {
+        space,
+        first: GPU_VA + PAGE_SIZE,
+        last: GPU_VA + 2 * PAGE_SIZE - 1,
+        kind: 0xB,
+        fallback: 1,
+    };
+    let event = ObjectId::from_parts(4, 5);
+    assert_eq!(
+        gpu.modify_kind(&front, &middle, event),
+        Err(KernelError::OutOfResource)
+    );
+    assert_eq!(gpu.pending_jobs(), 0);
+    let first_region = RangeRequest {
+        space,
+        first: REGION,
+        last: REGION + PAGE_SIZE - 1,
+    };
+    gpu.destroy_sparse_region(&front, &first_region, event)
+        .unwrap();
+    assert_eq!(gpu.pieces(space), MAX_PIECES - 2);
+    assert!(gpu.modify_kind(&front, &middle, event).is_ok());
+    assert_eq!(gpu.pieces(space), MAX_PIECES);
+}
+
+/// gpu.rs: 101's room check comes before the GPU-accessible attribute, so a full address space
+/// and a page without the attribute answer `OutOfResource`, and no lock is taken; with room,
+/// the same request answers the attribute.
+#[test]
+fn registration_room_is_checked_before_the_attribute() {
+    let mut s = ready();
+    let space = AsId(s.space);
+    let device = u8::try_from(s.device).unwrap();
+    {
+        let mut locked = s.rig.gpu();
+        // The tests' registration is one piece; the regions fill the rest.
+        fill_with_regions(locked.gpu(), space, MAX_PIECES - 1, device);
+        assert_eq!(locked.gpu_memory().pieces(space), MAX_PIECES);
+    }
+    let page = 0x9_0000_0000;
+    s.rig
+        .kernel
+        .map(page, vec![0; usize::try_from(PAGE_SIZE).unwrap()]);
+    let words = register_words(page, page + PAGE_SIZE - 1, 0, s.device);
+    assert_eq!(
+        result_of(&s.rig.send_on(s.worker, &words)),
+        code(KernelError::OutOfResource)
+    );
+    assert_eq!(s.rig.kernel.device_locks(page, PAGE_SIZE), 0);
+    let first_region = RangeRequest {
+        space,
+        first: REGION,
+        last: REGION + PAGE_SIZE - 1,
+    };
+    s.rig
+        .gpu()
+        .gpu()
+        .destroy_sparse_region(&*s.rig.front, &first_region, s.event)
+        .unwrap();
+    assert_eq!(
+        result_of(&s.rig.send_on(s.worker, &words)),
+        code(KernelError::InvalidCurrentMemory)
+    );
+    assert_eq!(s.rig.kernel.device_locks(page, PAGE_SIZE), 0);
+}
+
+/// A 102 unmaps the 211 mappings it takes out only where they show: the shim inside one stays
+/// in the table while the GPU applies the destroy, and after the drain.
+#[test]
+fn a_destroy_keeps_the_shim_inside_its_mappings() {
+    let mut s = ready();
+    s.map_at(GPU_VA);
+    let shim = GPU_VA + PAGE_SIZE;
+    s.rig
+        .gpu()
+        .gpu()
+        .map_syncpoint_shim(AsId(s.space), shim)
+        .unwrap();
+    assert_eq!(
+        result_of(&s.rig.send_on(s.worker, &[0x76, 2, s.handle, 0])),
+        ResultCode::SUCCESS
+    );
+    let space = AsId(s.space);
+    let unmap = |start: u64, size: u64| {
+        FrontCall::Update(
+            space,
+            VmUpdate::Unmap {
+                range: page_range(start, size),
+            },
+            None,
+        )
+    };
+    let destroy = FrontCall::Update(
+        space,
+        VmUpdate::DestroyMemory {
+            range: page_range(MEMORY, MEMORY_SIZE),
+        },
+        None,
+    );
+    assert_eq!(
+        s.rig.front.calls()[1..],
+        [
+            destroy,
+            unmap(GPU_VA, PAGE_SIZE),
+            unmap(GPU_VA + 2 * PAGE_SIZE, 2 * PAGE_SIZE),
+            FrontCall::Barrier(Ticket(1)),
+        ]
+    );
+    let shim_mapping = Mapping {
+        range: page_range(shim, PAGE_SIZE),
+        target: Target::SyncpointShim,
+        kind: SELF_MAP_KIND,
+    };
+    s.rig.apply();
+    assert_eq!(s.rig.mappings(s.space), [shim_mapping]);
+    s.rig.drain();
+    assert_eq!(s.rig.mappings(s.space), [shim_mapping]);
 }
