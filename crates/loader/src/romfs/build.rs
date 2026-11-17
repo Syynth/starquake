@@ -15,7 +15,10 @@
 //!   path empty (`VisitDirectory`). A path must be shorter than `FS_MAX_PATH` (0x301), which
 //!   Eden asserts (`ASSERT(child->path_len < FS_MAX_PATH)`); here a longer one is
 //!   [`BuildError::PathTooLong`], with the limit [`MAX_PATH_LEN`] (0x300).
-//! - Directories and files are each sorted by path, bytewise (`std::sort` on `std::string`).
+//! - Directories and files are each sorted by path, bytewise (`std::sort` on `std::string`),
+//!   which is not a depth-first walk of sibling names: `.` (0x2E) sorts below `/` (0x2F), so
+//!   `/a.b` comes between `/a` and `/a/c`. Pinned by
+//!   `entries_sort_by_whole_path_bytewise_not_depth_first`.
 //!   Entry offsets are given in that order, each entry 0x18 (a directory) or 0x20 (a file) bytes
 //!   and its name padded to 4 bytes ([`TABLE_ALIGNMENT`]); the root sorts first, at offset 0.
 //! - File data is laid out in the same order from [`FILE_PARTITION_OFFSET`], each file's start
@@ -65,7 +68,7 @@ pub const TABLE_ALIGNMENT: u64 = 4;
 /// millions of files, and it keeps every entry offset inside the `u32` the format stores.
 pub const MAX_METADATA_SIZE: u64 = 256 << 20;
 /// The size of a hash bucket.
-const BUCKET_SIZE: u64 = 4;
+pub(crate) const BUCKET_SIZE: u64 = 4;
 
 /// The number of hash buckets for `entries` entries (`romfs_get_hash_table_count`): at least 3,
 /// odd below 19, and otherwise the first count from `entries` on that no prime up to 17
@@ -261,6 +264,24 @@ impl<K> Image<K> {
     }
 }
 
+/// Which of the tree's two lists an entry is in: [`DirIn`]s or [`FileIn`]s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryKind {
+    /// A directory.
+    Directory,
+    /// A file.
+    File,
+}
+
+impl std::fmt::Display for EntryKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Directory => "directory",
+            Self::File => "file",
+        })
+    }
+}
+
 /// Why a tree could not be built into an image.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum BuildError {
@@ -271,8 +292,8 @@ pub enum BuildError {
     /// the tree.
     #[error("{kind} {index} of the RomFS tree names parent {parent}, which is not before it")]
     BadParent {
-        /// `directory` or `file`.
-        kind: &'static str,
+        /// Whether it is a directory or a file.
+        kind: EntryKind,
         /// Its index.
         index: usize,
         /// The parent it names.
@@ -459,7 +480,7 @@ fn check_tree<K>(dirs: &[DirIn<'_>], files: &[FileIn<'_, K>]) -> Result<(), Buil
             .copied()
             .filter(|_| dir.parent < index)
             .ok_or(BuildError::BadParent {
-                kind: "directory",
+                kind: EntryKind::Directory,
                 index,
                 parent: dir.parent,
             })?;
@@ -473,7 +494,7 @@ fn check_tree<K>(dirs: &[DirIn<'_>], files: &[FileIn<'_, K>]) -> Result<(), Buil
             .get(file.parent)
             .copied()
             .ok_or(BuildError::BadParent {
-                kind: "file",
+                kind: EntryKind::File,
                 index,
                 parent: file.parent,
             })?;

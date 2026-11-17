@@ -95,23 +95,40 @@ const GOLDEN_METADATA: [u8; 0xF8] = [
     0x01, 0x00, 0x00, 0x00, 0x79, 0x00, 0x00, 0x00,
 ];
 
-#[test]
-fn a_small_tree_builds_to_these_bytes() {
-    let image = build(&GOLDEN_DIRS, &golden_files()).unwrap();
-    let mut expected = vec![0u8; 0x32C];
+/// The bytes of an image of `size` bytes with `header`'s fields, each file's data at its offset,
+/// and `metadata` at the end; everything else zero.
+fn expected_image(
+    size: usize,
+    header: [u64; 10],
+    data: &[(usize, &[u8])],
+    metadata: &[u8],
+) -> Vec<u8> {
+    let mut expected = vec![0u8; size];
     for (field, value) in expected[..HEADER_SIZE]
         .as_chunks_mut::<8>()
         .0
         .iter_mut()
-        .zip(GOLDEN_HEADER)
+        .zip(header)
     {
         field.copy_from_slice(&value.to_le_bytes());
     }
+    for &(at, bytes) in data {
+        expected[at..at + bytes.len()].copy_from_slice(bytes);
+    }
+    expected[size - metadata.len()..].copy_from_slice(metadata);
+    expected
+}
+
+#[test]
+fn a_small_tree_builds_to_these_bytes() {
+    let image = build(&GOLDEN_DIRS, &golden_files()).unwrap();
     // `d/w` at the partition's start, `d/x` at the next 16-byte boundary, `y` after it.
-    expected[0x200..0x205].copy_from_slice(b"wwwww");
-    expected[0x210..0x221].copy_from_slice(b"@ABCDEFGHIJKLMNOP");
-    expected[0x230..0x233].copy_from_slice(b"YYY");
-    expected[0x234..].copy_from_slice(&GOLDEN_METADATA);
+    let data: [(usize, &[u8]); 3] = [
+        (0x200, b"wwwww"),
+        (0x210, b"@ABCDEFGHIJKLMNOP"),
+        (0x230, b"YYY"),
+    ];
+    let expected = expected_image(0x32C, GOLDEN_HEADER, &data, &GOLDEN_METADATA);
     assert_eq!(bytes_of(&image), expected);
     assert_eq!(image.size(), 0x32C);
     assert_eq!(image.metadata(), (0x234, &GOLDEN_METADATA[..]));
@@ -120,6 +137,86 @@ fn a_small_tree_builds_to_these_bytes() {
     // The shipping constants are the ones the bytes show.
     assert_eq!(GOLDEN_HEADER[9], FILE_PARTITION_OFFSET);
     assert_eq!(GOLDEN_HEADER[0], u64::try_from(HEADER_SIZE).unwrap());
+}
+
+/// A tree whose bytewise path order differs from a depth-first walk's: `.` (0x2E) sorts below
+/// `/` (0x2F), so Eden orders `/a`, `/a.b`, `/a/c` where a depth-first walk of sibling names
+/// gives `/a`, `/a/c`, `/a.b`. Listed here in the depth-first order, so the sort shows; each
+/// directory holds a file `f`, and the key is the file's content.
+const SIBLING_DIRS: [DirIn<'static>; 4] = [
+    DirIn {
+        parent: 0,
+        name: b"",
+    },
+    DirIn {
+        parent: 0,
+        name: b"a",
+    },
+    DirIn {
+        parent: 1,
+        name: b"c",
+    },
+    DirIn {
+        parent: 0,
+        name: b"a.b",
+    },
+];
+
+/// The sibling tree's files: `/a/f`, `/a/c/f` and `/a.b/f`, in depth-first order.
+fn sibling_files() -> Vec<FileIn<'static, &'static [u8]>> {
+    let file = |parent, key: &'static [u8]| FileIn {
+        parent,
+        name: b"f",
+        size: u64::try_from(key.len()).unwrap(),
+        key,
+    };
+    vec![
+        file(1, b"ff"),
+        file(2, b"cccc"),
+        file(3, b"bbbbbbbbbbbbbbbbbbb"),
+    ]
+}
+
+/// The sibling tree's header fields, in [`GOLDEN_HEADER`]'s order, from the same independent
+/// model of Eden's `RomFSBuildContext::Build`.
+const SIBLING_HEADER: [u64; 10] = [0x50, 0x234, 20, 0x248, 108, 0x2B4, 12, 0x2C0, 108, 0x200];
+
+/// The sibling tree's metadata, from the same model: directory entries in the order `""`, `a`,
+/// `a.b`, `a/c`, file entries `a.b/f`, `a/c/f`, `a/f`.
+const SIBLING_METADATA: [u8; 0xF8] = [
+    0x50, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x18, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF,
+    0x34, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x18, 0x00, 0x00, 0x00,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x34, 0x00, 0x00, 0x00, 0x50, 0x00, 0x00, 0x00, 0x48, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF,
+    0x01, 0x00, 0x00, 0x00, 0x61, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00,
+    0x61, 0x2E, 0x62, 0x00, 0x18, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0x24, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x01, 0x00, 0x00, 0x00, 0x63, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x48, 0x00, 0x00, 0x00, 0x34, 0x00, 0x00, 0x00,
+    0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x13, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x01, 0x00, 0x00, 0x00, 0x66, 0x00, 0x00, 0x00,
+    0x50, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x01, 0x00, 0x00, 0x00,
+    0x66, 0x00, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x30, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x24, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0x66, 0x00, 0x00, 0x00,
+];
+
+#[test]
+fn entries_sort_by_whole_path_bytewise_not_depth_first() {
+    let image = build(&SIBLING_DIRS, &sibling_files()).unwrap();
+    // `a.b/f` at the partition's start, `a/c/f` at the next 16-byte boundary past its 19
+    // bytes, `a/f` after it.
+    let data: [(usize, &[u8]); 3] = [
+        (0x200, b"bbbbbbbbbbbbbbbbbbb"),
+        (0x220, b"cccc"),
+        (0x230, b"ff"),
+    ];
+    let expected = expected_image(0x32C, SIBLING_HEADER, &data, &SIBLING_METADATA);
+    assert_eq!(bytes_of(&image), expected);
+    assert_eq!(image.metadata(), (0x234, &SIBLING_METADATA[..]));
+    let keys: Vec<&[u8]> = image.files().iter().map(|f| f.key).collect();
+    assert_eq!(keys, [&b"bbbbbbbbbbbbbbbbbbb"[..], b"cccc", b"ff"]);
 }
 
 #[test]
@@ -238,13 +335,18 @@ fn parents_must_come_first_and_exist() {
             name: b"a",
         },
     ];
+    let error = build::<()>(&own, &[]).unwrap_err();
     assert_eq!(
-        build::<()>(&own, &[]),
-        Err(BuildError::BadParent {
-            kind: "directory",
+        error,
+        BuildError::BadParent {
+            kind: EntryKind::Directory,
             index: 1,
             parent: 1
-        })
+        }
+    );
+    assert_eq!(
+        error.to_string(),
+        "directory 1 of the RomFS tree names parent 1, which is not before it"
     );
     let later = [
         root,
@@ -272,7 +374,7 @@ fn parents_must_come_first_and_exist() {
     assert_eq!(
         error,
         BuildError::BadParent {
-            kind: "file",
+            kind: EntryKind::File,
             index: 0,
             parent: 1
         }
@@ -358,7 +460,7 @@ fn a_name_with_high_bytes_hashes_as_the_console_reads_it() {
     let image = build(&[GOLDEN_DIRS[0]], &[file]).unwrap();
     let (_, metadata) = image.metadata();
     let buckets = hash_table_count(1);
-    let file_hash_at = usize::try_from(ONE_FILE_FILE_HASH_AT).unwrap();
+    let file_hash_at = one_file_file_hash_at();
     let bucket_of = |hash: u32| usize::try_from(u64::from(hash) % buckets).unwrap();
     // The console's hash: over unsigned bytes.
     let unsigned = path_hash(0, name);
@@ -368,7 +470,7 @@ fn a_name_with_high_bytes_hashes_as_the_console_reads_it() {
     });
     assert_ne!(bucket_of(unsigned), bucket_of(signed));
     let word = |bucket: usize| {
-        let at = file_hash_at + bucket * 4;
+        let at = file_hash_at + bucket * usize::try_from(BUCKET_SIZE).unwrap();
         u32::from_le_bytes(metadata[at..at + 4].try_into().unwrap())
     };
     assert_eq!(word(bucket_of(unsigned)), 0);
@@ -376,8 +478,11 @@ fn a_name_with_high_bytes_hashes_as_the_console_reads_it() {
 }
 
 /// Where the file buckets start in the metadata of a tree of the root and one file: after the
-/// root's three buckets and its 0x18-byte entry.
-const ONE_FILE_FILE_HASH_AT: u64 = 3 * 4 + 0x18;
+/// directory buckets of one directory and the root's entry, which has no name.
+fn one_file_file_hash_at() -> usize {
+    let buckets = usize::try_from(hash_table_count(1) * BUCKET_SIZE).unwrap();
+    buckets + DIR_ENTRY_SIZE
+}
 
 #[test]
 fn reads_at_any_offset_match_the_whole_image() {
