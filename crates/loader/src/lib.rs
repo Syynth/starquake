@@ -19,5 +19,6 @@ pub mod nso;
 pub mod nup;
 pub mod patch;
 pub mod pfs0;
+pub mod read_at;
 pub mod romfs;
 pub mod zbic;

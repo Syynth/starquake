@@ -28,11 +28,13 @@
 
 use std::io::{self, Read, Seek, SeekFrom, Take};
 
+use crate::read_at::{Positional, ReadAt, read_exact_at};
+
 use ruzstd::decoding::{FrameDecoder, StreamingDecoder};
 use sha2::{Digest, Sha256};
 
 use super::layout::SHA256_SIZE;
-use super::{Codec, FileId, Nup, NupError};
+use super::{Codec, FileEntry, FileId, Nup, NupError};
 
 /// A zstd decoding failure of `file` as a [`NupError`].
 fn zstd_error(file: usize, error: &dyn std::fmt::Display) -> NupError {
@@ -42,12 +44,12 @@ fn zstd_error(file: usize, error: &dyn std::fmt::Display) -> NupError {
     }
 }
 
-/// Where a reader gets its stored bytes.
-enum Body<'a, S: Read> {
+/// Where a reader gets its stored bytes: `R` is the container's source, placed at the extent.
+enum Body<R: Read> {
     /// The extent is the content.
-    Raw(Take<&'a mut S>),
+    Raw(Take<R>),
     /// The extent is one zstd frame.
-    Zstd(Box<StreamingDecoder<Take<&'a mut S>, FrameDecoder>>),
+    Zstd(Box<StreamingDecoder<Take<R>, FrameDecoder>>),
 }
 
 /// Why a reader stopped for good: a [`NupError`] that is kept so that every later read can
@@ -96,17 +98,19 @@ enum State {
     Failed(Failure),
 }
 
-/// The content of one file, read from the container on demand. See the module docs.
-pub struct FileReader<'a, S: Read> {
+/// The content of one file, read from the container on demand. See the module docs. `R` is how
+/// it reaches the container's source: a mutable borrow ([`Nup::reader`]) or a cursor of its own
+/// over a shared source ([`Nup::reader_at`]).
+pub struct FileReader<R: Read> {
     file: usize,
-    body: Body<'a, S>,
+    body: Body<R>,
     remaining: u64,
     hasher: Sha256,
     expected: [u8; SHA256_SIZE],
     state: State,
 }
 
-impl<S: Read> std::fmt::Debug for FileReader<'_, S> {
+impl<R: Read> std::fmt::Debug for FileReader<R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FileReader")
             .field("file", &self.file)
@@ -121,7 +125,7 @@ fn invalid(error: NupError) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error)
 }
 
-impl<S: Read + Seek> FileReader<'_, S> {
+impl<R: Read> FileReader<R> {
     /// The checks that run once the whole content has been delivered (module docs).
     fn finish(&mut self) -> Result<(), Failure> {
         let mut probe = [0u8; 1];
@@ -167,7 +171,7 @@ impl<S: Read + Seek> FileReader<'_, S> {
     }
 }
 
-impl<S: Read + Seek> Read for FileReader<'_, S> {
+impl<R: Read> Read for FileReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match &self.state {
             State::Failed(failure) => return Err(invalid(failure.error(self.file))),
@@ -203,62 +207,79 @@ impl<S: Read + Seek> Read for FileReader<'_, S> {
     }
 }
 
-impl<S: Read + Seek> Nup<S> {
-    /// A reader for `file`'s content. See the module docs for what it checks.
-    pub fn reader(&mut self, file: FileId) -> Result<FileReader<'_, S>, NupError> {
+/// A reader for the file at `index` with `entry`'s record, whose extent `source` is placed at
+/// the start of: the checks every reader makes before its first read.
+fn start<R: Read>(index: usize, entry: &FileEntry, source: R) -> Result<FileReader<R>, NupError> {
+    let take = source.take(entry.extent_size);
+    let body = match entry.codec {
+        Codec::Raw => Body::Raw(take),
+        Codec::Zstd => {
+            let decoder = StreamingDecoder::new(take).map_err(|error| zstd_error(index, &error))?;
+            let frame = decoder.decoder.content_size();
+            if frame != entry.size {
+                return Err(NupError::ZstdContentSize {
+                    file: index,
+                    size: entry.size,
+                    frame,
+                });
+            }
+            Body::Zstd(Box::new(decoder))
+        }
+    };
+    Ok(FileReader {
+        file: index,
+        body,
+        remaining: entry.size,
+        hasher: Sha256::new(),
+        expected: entry.sha256,
+        state: State::Reading,
+    })
+}
+
+/// `reader`'s whole content, `size` bytes, checked: the allocation is `size`, which the caller
+/// has bounded.
+fn collect<R: Read>(mut reader: FileReader<R>, size: u64) -> Result<Vec<u8>, NupError> {
+    let mut out = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
+    reader.read_to_end(&mut out).map_err(NupError::from_io)?;
+    Ok(out)
+}
+
+impl<S> Nup<S> {
+    /// `file`'s record and index, or [`NupError::NoSuchFile`].
+    fn entry(&self, file: FileId) -> Result<(usize, &FileEntry), NupError> {
         let index = file.index();
         let entry = self.files.get(index).ok_or(NupError::NoSuchFile(index))?;
-        let (size, codec, expected) = (entry.size, entry.codec, entry.sha256);
-        let (offset, extent_size) = (entry.extent_offset, entry.extent_size);
-        self.source.seek(SeekFrom::Start(offset))?;
-        let take = (&mut self.source).take(extent_size);
-        let body = match codec {
-            Codec::Raw => Body::Raw(take),
-            Codec::Zstd => {
-                let decoder =
-                    StreamingDecoder::new(take).map_err(|error| zstd_error(index, &error))?;
-                let frame = decoder.decoder.content_size();
-                if frame != size {
-                    return Err(NupError::ZstdContentSize {
-                        file: index,
-                        size,
-                        frame,
-                    });
-                }
-                Body::Zstd(Box::new(decoder))
-            }
-        };
-        Ok(FileReader {
-            file: index,
-            body,
-            remaining: size,
-            hasher: Sha256::new(),
-            expected,
-            state: State::Reading,
-        })
+        Ok((index, entry))
+    }
+
+    /// `file`'s size, if it is at most `limit` bytes ([`NupError::FileTooLarge`] otherwise).
+    fn size_within(&self, file: FileId, limit: u64) -> Result<u64, NupError> {
+        let (index, entry) = self.entry(file)?;
+        if entry.size > limit {
+            return Err(NupError::FileTooLarge {
+                file: index,
+                size: entry.size,
+                limit,
+            });
+        }
+        Ok(entry.size)
+    }
+}
+
+impl<S: Read + Seek> Nup<S> {
+    /// A reader for `file`'s content. See the module docs for what it checks.
+    pub fn reader(&mut self, file: FileId) -> Result<FileReader<&mut S>, NupError> {
+        let index = file.index();
+        let entry = self.files.get(index).ok_or(NupError::NoSuchFile(index))?;
+        self.source.seek(SeekFrom::Start(entry.extent_offset))?;
+        start(index, entry, &mut self.source)
     }
 
     /// `file`'s whole content, checked, if it is at most `limit` bytes.
     pub fn read_to_vec(&mut self, file: FileId, limit: u64) -> Result<Vec<u8>, NupError> {
-        let index = file.index();
-        let size = self
-            .files
-            .get(index)
-            .ok_or(NupError::NoSuchFile(index))?
-            .size;
-        if size > limit {
-            return Err(NupError::FileTooLarge {
-                file: index,
-                size,
-                limit,
-            });
-        }
+        let size = self.size_within(file, limit)?;
         // `size <= limit`, which the caller chose; the allocation is bounded by it.
-        let mut out = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
-        self.reader(file)?
-            .read_to_end(&mut out)
-            .map_err(NupError::from_io)?;
-        Ok(out)
+        collect(self.reader(file)?, size)
     }
 
     /// Reads `file` to its end, checking its size and SHA-256, and keeps nothing.
@@ -267,5 +288,58 @@ impl<S: Read + Seek> Nup<S> {
         // first returns 0 (for an empty file, on the first read).
         io::copy(&mut self.reader(file)?, &mut io::sink()).map_err(NupError::from_io)?;
         Ok(())
+    }
+}
+
+/// Positional reads, through `&self`: several of them may run at once on one container, each
+/// at its own offset (`crate::read_at`).
+impl<S: ReadAt> Nup<S> {
+    /// A reader for `file`'s content with a cursor of its own over the shared source; what it
+    /// checks is what [`Nup::reader`]'s does (module docs).
+    pub fn reader_at(&self, file: FileId) -> Result<FileReader<Positional<&S>>, NupError> {
+        let (index, entry) = self.entry(file)?;
+        let mut cursor = Positional::new(&self.source);
+        cursor.seek(SeekFrom::Start(entry.extent_offset))?;
+        start(index, entry, cursor)
+    }
+
+    /// `file`'s whole content, checked as [`Nup::read_to_vec`] checks it, if it is at most
+    /// `limit` bytes; read through [`Nup::reader_at`]. The size is compared with `limit` before
+    /// anything is allocated or read.
+    pub fn read_to_vec_at(&self, file: FileId, limit: u64) -> Result<Vec<u8>, NupError> {
+        let size = self.size_within(file, limit)?;
+        collect(self.reader_at(file)?, size)
+    }
+
+    /// Up to `buf.len()` bytes of the raw file `file`, from `offset` bytes into it, straight from
+    /// its extent: the count read, fewer than `buf.len()` only at the end of the file and zero
+    /// at or past it. A zstd file has no random access and is [`NupError::NotRaw`].
+    ///
+    /// The bytes are not checked against the file's SHA-256: a hash covers the whole content,
+    /// and a read of part of it cannot check it. `Nup::verify` (and `starquake verify`) does. A
+    /// source shorter than the extent [`Nup::open`] checked is [`NupError::Io`].
+    pub fn read_raw_at(
+        &self,
+        file: FileId,
+        offset: u64,
+        buf: &mut [u8],
+    ) -> Result<usize, NupError> {
+        let (index, entry) = self.entry(file)?;
+        if entry.codec != Codec::Raw {
+            return Err(NupError::NotRaw { file: index });
+        }
+        // A raw extent is exactly the file's size (`Nup::open` checks it).
+        let left = entry.size.saturating_sub(offset);
+        let count = usize::try_from(left).map_or(buf.len(), |left| left.min(buf.len()));
+        let Some(window) = buf.get_mut(..count).filter(|window| !window.is_empty()) else {
+            return Ok(0);
+        };
+        // `offset < size` here, and the extent lies inside the file (`Nup::open`), so this does
+        // not overflow; were it to, it is an error, not a read somewhere else.
+        let at = entry.extent_offset.checked_add(offset).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "the offset passes the extent")
+        })?;
+        read_exact_at(&self.source, at, window)?;
+        Ok(count)
     }
 }

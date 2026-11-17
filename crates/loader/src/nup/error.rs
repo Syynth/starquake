@@ -382,6 +382,26 @@ pub enum NupError {
         /// Their version.
         version: u32,
     },
+    /// A positional read of part of a file that is not stored raw: a zstd frame has no random
+    /// access (`Nup::read_raw_at`).
+    #[error("file {file} is compressed, so part of it cannot be read on its own")]
+    NotRaw {
+        /// The file's index.
+        file: usize,
+    },
+    /// The newest update lacks a part its base has, so it is a patch that needs the base, and
+    /// base and update are never mixed (`Nup::newest_package`).
+    #[error(
+        "the newest update (package {package}) has no {} of its own and would need the \
+         base's; an update that patches its base is not supported yet",
+        .part.name()
+    )]
+    IncompleteUpdate {
+        /// The update.
+        package: usize,
+        /// What it lacks.
+        part: super::title::Part,
+    },
 }
 
 impl NupError {

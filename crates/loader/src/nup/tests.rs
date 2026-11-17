@@ -671,6 +671,282 @@ fn an_update_without_an_exefs_keeps_the_bases() {
     assert_eq!(title.exefs.unwrap().package, 0);
 }
 
+/// The directory at `path` of package `package`, as an id.
+fn dir_id(built: &Built, package: usize, path: &str) -> DirId {
+    DirId(u32::try_from(built.dir_index(package, path).unwrap()).unwrap())
+}
+
+#[test]
+fn the_newest_package_is_run_whole_and_an_incomplete_update_is_refused() {
+    // A complete update: its own ExeFS and RomFS, none of the base's.
+    let built = sample();
+    let nup = open_built(&built).unwrap();
+    assert_eq!(
+        nup.newest_package().unwrap(),
+        Whole {
+            package: 1,
+            exefs: Some(dir_id(&built, 1, "exefs")),
+            romfs: Some(dir_id(&built, 1, "romfs")),
+        }
+    );
+    // No update: the base, whole.
+    let base_only =
+        build::build(&[PackageSpec::new(PackageKind::Base, BASE_ID, 0, base_tree())]).unwrap();
+    let nup = open_built(&base_only).unwrap();
+    assert_eq!(
+        nup.newest_package().unwrap(),
+        Whole {
+            package: 0,
+            exefs: Some(dir_id(&base_only, 0, "exefs")),
+            romfs: Some(dir_id(&base_only, 0, "romfs")),
+        }
+    );
+
+    let with_update = |tree: Tree| {
+        build::build(&[
+            PackageSpec::new(PackageKind::Base, BASE_ID, 0, base_tree()),
+            PackageSpec::new(PackageKind::Update, UPDATE_ID, 0x1_0000, tree),
+        ])
+        .unwrap()
+    };
+    // An update with no ExeFS would need the base's.
+    let romfs_only = Tree::new()
+        .with_file("romfs/patch.bin", Content::raw(b"patch".to_vec()))
+        .unwrap();
+    let error = open_built(&with_update(romfs_only))
+        .unwrap()
+        .newest_package()
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            NupError::IncompleteUpdate {
+                package: 1,
+                part: Part::ExeFs
+            }
+        ),
+        "{error}"
+    );
+    assert_eq!(
+        error.to_string(),
+        "the newest update (package 1) has no ExeFS of its own and would need the base's; an \
+         update that patches its base is not supported yet"
+    );
+    // An update with an ExeFS and no RomFS, when the base has one.
+    let exefs_only = Tree::new()
+        .with_file("exefs/main", Content::raw(b"update main".to_vec()))
+        .unwrap();
+    let error = open_built(&with_update(exefs_only.clone()))
+        .unwrap()
+        .newest_package()
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            NupError::IncompleteUpdate {
+                package: 1,
+                part: Part::RomFs
+            }
+        ),
+        "{error}"
+    );
+    assert_eq!(
+        error.to_string(),
+        "the newest update (package 1) has no RomFS of its own and would need the base's; an \
+         update that patches its base is not supported yet"
+    );
+}
+
+#[test]
+fn an_update_lacking_only_what_its_base_lacks_too_is_complete() {
+    let exefs_only = Tree::new()
+        .with_file("exefs/main", Content::raw(b"update main".to_vec()))
+        .unwrap();
+    // An update with no RomFS over a base with no RomFS either: the title has none.
+    let base_without_romfs = Tree::new()
+        .with_file("exefs/main", Content::raw(b"base main".to_vec()))
+        .unwrap();
+    let built = build::build(&[
+        PackageSpec::new(PackageKind::Base, BASE_ID, 0, base_without_romfs),
+        PackageSpec::new(PackageKind::Update, UPDATE_ID, 0x1_0000, exefs_only.clone()),
+    ])
+    .unwrap();
+    let whole = open_built(&built).unwrap().newest_package().unwrap();
+    assert_eq!(
+        whole,
+        Whole {
+            package: 1,
+            exefs: Some(dir_id(&built, 1, "exefs")),
+            romfs: None,
+        }
+    );
+    // A standalone update, with no base to need, is run as it is.
+    let mut standalone = PackageSpec::new(PackageKind::Update, UPDATE_ID, 0x1_0000, exefs_only);
+    standalone.flags = 1;
+    let built = build::build(&[standalone]).unwrap();
+    let whole = open_built(&built).unwrap().newest_package().unwrap();
+    assert_eq!((whole.package, whole.romfs), (0, None));
+    // The title's own errors come first.
+    let update = |version| {
+        let tree = Tree::new()
+            .with_file("romfs/x", Content::raw(vec![1]))
+            .unwrap();
+        PackageSpec::new(PackageKind::Update, UPDATE_ID, version, tree)
+    };
+    let base = PackageSpec::new(PackageKind::Base, BASE_ID, 0, base_tree());
+    let built = build::build(&[base, update(7), update(7)]).unwrap();
+    let error = open_built(&built).unwrap().newest_package().unwrap_err();
+    assert!(matches!(error, NupError::AmbiguousUpdate { .. }), "{error}");
+}
+
+#[test]
+fn a_missing_exefs_is_named_before_a_missing_romfs() {
+    // The update lacks both; the base has both.
+    let neither = Tree::new()
+        .with_file("data/notes", Content::raw(b"notes".to_vec()))
+        .unwrap();
+    let built = build::build(&[
+        PackageSpec::new(PackageKind::Base, BASE_ID, 0, base_tree()),
+        PackageSpec::new(PackageKind::Update, UPDATE_ID, 0x1_0000, neither),
+    ])
+    .unwrap();
+    let error = open_built(&built).unwrap().newest_package().unwrap_err();
+    assert!(
+        matches!(
+            error,
+            NupError::IncompleteUpdate {
+                package: 1,
+                part: Part::ExeFs
+            }
+        ),
+        "{error}"
+    );
+}
+
+/// The sample, opened over a shared in-memory source that reads positionally.
+fn positional(built: &Built) -> Nup<crate::read_at::Positional<Vec<u8>>> {
+    Nup::open(crate::read_at::Positional::new(built.bytes.clone())).unwrap()
+}
+
+#[test]
+fn a_raw_file_reads_at_any_offset_up_to_its_exact_end() {
+    let built = sample();
+    let nup = positional(&built);
+    let readme = file_id(&built, 0, "romfs/readme.txt");
+    let content = b"hello";
+    for offset in 0..=6u64 {
+        let mut buf = [0xEE; 3];
+        let read = nup.read_raw_at(readme, offset, &mut buf).unwrap();
+        let start = usize::try_from(offset).unwrap().min(content.len());
+        let end = (start + 3).min(content.len());
+        assert_eq!(&buf[..read], &content[start..end], "at {offset}");
+    }
+    // The last byte, the exact end, one past it, and far past it.
+    let mut one = [0];
+    assert_eq!(nup.read_raw_at(readme, 4, &mut one).unwrap(), 1);
+    assert_eq!(one, [b'o']);
+    assert_eq!(nup.read_raw_at(readme, 5, &mut one).unwrap(), 0);
+    assert_eq!(nup.read_raw_at(readme, 6, &mut one).unwrap(), 0);
+    assert_eq!(nup.read_raw_at(readme, u64::MAX, &mut one).unwrap(), 0);
+    // An empty file reads nothing.
+    let empty = file_id(&built, 0, "romfs/data/empty");
+    assert_eq!(nup.read_raw_at(empty, 0, &mut one).unwrap(), 0);
+    // A compressed file has no random access; an id from elsewhere is no file.
+    let level = file_id(&built, 0, "romfs/data/level.bin");
+    let error = nup.read_raw_at(level, 0, &mut one).unwrap_err();
+    let index = level.index();
+    assert!(
+        matches!(error, NupError::NotRaw { file } if file == index),
+        "{error}"
+    );
+    assert_eq!(
+        error.to_string(),
+        format!("file {index} is compressed, so part of it cannot be read on its own")
+    );
+    let foreign = FileId(u32::try_from(nup.file_count()).unwrap());
+    assert!(matches!(
+        nup.read_raw_at(foreign, 0, &mut one),
+        Err(NupError::NoSuchFile(_))
+    ));
+}
+
+#[test]
+fn positional_readers_on_one_container_read_interleaved() {
+    let built = sample();
+    let nup = positional(&built);
+    let level = file_id(&built, 0, "romfs/data/level.bin");
+    let main = file_id(&built, 1, "exefs/main");
+    // Two readers on the same container at once, through `&self`.
+    let mut first = nup.reader_at(level).unwrap();
+    let mut second = nup.reader_at(main).unwrap();
+    let (mut a, mut b) = (Vec::new(), Vec::new());
+    let mut chunk = [0u8; 7];
+    loop {
+        let read_a = first.read(&mut chunk).unwrap();
+        a.extend_from_slice(&chunk[..read_a]);
+        let read_b = second.read(&mut chunk).unwrap();
+        b.extend_from_slice(&chunk[..read_b]);
+        if read_a == 0 && read_b == 0 {
+            break;
+        }
+    }
+    assert_eq!(a, compressible(4000));
+    assert_eq!(b, b"update main");
+    // The whole-file read checks the limit before it reads, at its exact edge.
+    assert_eq!(nup.read_to_vec_at(level, 4000).unwrap(), compressible(4000));
+    assert!(matches!(
+        nup.read_to_vec_at(level, 3999),
+        Err(NupError::FileTooLarge {
+            size: 4000,
+            limit: 3999,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn a_failed_positional_read_is_sticky() {
+    let tree = Tree::new()
+        .with_file(
+            "romfs/bad",
+            Content::zstd(compressible(100)).with_stored(build::zstd_frame(b"other").unwrap()),
+        )
+        .unwrap();
+    let built = build::build(&[PackageSpec::new(PackageKind::Base, BASE_ID, 0, tree)]).unwrap();
+    let nup = positional(&built);
+    let bad = file_id(&built, 0, "romfs/bad");
+    // The frame says 5 bytes; the record says 100.
+    assert!(matches!(
+        nup.read_to_vec_at(bad, u64::MAX),
+        Err(NupError::ZstdContentSize {
+            size: 100,
+            frame: 5,
+            ..
+        })
+    ));
+    let tree = Tree::new()
+        .with_file(
+            "romfs/bad",
+            Content::zstd(compressible(100)).with_stored(build::zstd_frame(&[b'x'; 100]).unwrap()),
+        )
+        .unwrap();
+    let built = build::build(&[PackageSpec::new(PackageKind::Base, BASE_ID, 0, tree)]).unwrap();
+    let nup = positional(&built);
+    let bad = file_id(&built, 0, "romfs/bad");
+    let mut reader = nup.reader_at(bad).unwrap();
+    let mut sink = Vec::new();
+    let first = reader.read_to_end(&mut sink).unwrap_err();
+    let second = reader.read(&mut [0u8; 4]).unwrap_err();
+    assert!(matches!(
+        NupError::from_io(first),
+        NupError::HashMismatch { .. }
+    ));
+    assert!(matches!(
+        NupError::from_io(second),
+        NupError::HashMismatch { .. }
+    ));
+}
+
 #[test]
 fn the_newest_of_several_updates_wins() {
     let update = |version, main: &str| {
