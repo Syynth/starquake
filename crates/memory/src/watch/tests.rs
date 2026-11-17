@@ -399,19 +399,19 @@ fn concurrent_requests_and_kernel_entries_arm_everything() {
         std::thread::spawn(move || {
             let mut taken = Vec::new();
             let mut armed = 0u64;
-            // Ends once the requester is done and nothing is left, bounded by the requests.
+            // Runs while the requester does, then once more: a take that starts after `done` was
+            // seen finds every request. No flag of the watch decides when it stops, so a broken
+            // watch fails the counts below instead of hanging the test.
             loop {
                 let finished = done.load(Ordering::Acquire);
-                if watch.has_requests() {
-                    taken.clear();
-                    watch.take_requests(&mut taken);
-                    watch.arm(&taken).unwrap();
-                    armed += u64::try_from(taken.len()).unwrap();
-                } else if finished {
+                taken.clear();
+                watch.take_requests(&mut taken);
+                watch.arm(&taken).unwrap();
+                armed += u64::try_from(taken.len()).unwrap();
+                if finished {
                     break armed;
-                } else {
-                    std::thread::yield_now();
                 }
+                std::thread::yield_now();
             }
         })
     };

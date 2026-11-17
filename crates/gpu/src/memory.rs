@@ -17,7 +17,7 @@
 //!
 //! Translation works on pages of [`PAGE_SIZE`] (4 KiB): Eden-NX2's device memory manager uses
 //! `YUZU_PAGEBITS = 12` (`eden-nx2/src/core/memory.h`), and gsv maps GPU memory in 4 KiB units
-//! (`NormalMapGpuMemory4K`, graphics-server "Commands").
+//! (`NormalMapGpuMemory4K`, graphics-server "GPU memory: the gpu session and its worker").
 //!
 //! The spec's sketch of the trait also has `view(va, len) -> RawView`, a raw view for hot paths.
 //! The memory crate's raw view type (execution model, "Host access to guest memory") does not
@@ -128,7 +128,7 @@ pub(crate) fn page_pieces(
     len: usize,
 ) -> Result<impl Iterator<Item = (u64, std::ops::Range<usize>)>, GpuFault> {
     let len64 = u64::try_from(len).map_err(|_| GpuFault::OutOfRange { va, len: u64::MAX })?;
-    if len64 != 0 && va.checked_add(len64).is_none() {
+    if va.checked_add(len64).is_none() {
         return Err(GpuFault::OutOfRange { va, len: len64 });
     }
     let mut next_va = va;

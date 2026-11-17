@@ -288,9 +288,10 @@ impl WriteWatch {
             });
         }
         for request in applied {
-            if state.taken.remove(&request.ticket.0).is_some() {
-                state.watched.insert(request.range);
-            }
+            // A request listed twice is removed once and its range inserted twice, which is the
+            // same as once.
+            state.taken.remove(&request.ticket.0);
+            state.watched.insert(request.range);
         }
         self.armed_below
             .store(state.armed_below(), Ordering::Release);
