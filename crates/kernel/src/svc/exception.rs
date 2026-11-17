@@ -34,7 +34,8 @@
 //!   `sz` bytes, as many as the guest says. Here nothing else is read, so a guest cannot make
 //!   the host allocate any amount. Test: `only_a_four_byte_buffer_is_read`.
 //! - **A buffer whose extent wraps past the top of the address space gives no code**
-//!   (`address + 4` overflows), without a read. Eden does not check. Test:
+//!   (its last byte, `address + 3`, overflows), without a read. A word that ends exactly at
+//!   the top (exclusive end 2^64) does not wrap and is read. Eden does not check. Test:
 //!   `a_buffer_that_wraps_the_address_space_is_not_read`.
 //! - **An unreadable four-byte buffer gives no code.** Eden's `Read32` logs the fault and reads
 //!   zero (`eden/src/core/memory.cpp`). Here [`Break::code`] is `None`, so a crash report does
@@ -192,8 +193,9 @@ pub fn break_execution(
     size: u64,
 ) -> Break {
     let mut call = Break::decode(raw_reason, address, size);
-    // The whole extent must fit the address space before anything is read.
-    if call.reads_code() && address.checked_add(RESULT_ARGUMENT_SIZE).is_some() {
+    // The whole extent must fit the address space before anything is read: its last byte is
+    // at most `u64::MAX`, so a word whose exclusive end is exactly 2^64 is read.
+    if call.reads_code() && address.checked_add(RESULT_ARGUMENT_SIZE - 1).is_some() {
         let mut word = [0; size_of::<u32>()];
         call.code = memory
             .read(address, &mut word)

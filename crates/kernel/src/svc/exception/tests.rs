@@ -218,21 +218,30 @@ fn an_unreadable_buffer_gives_no_code_and_a_readable_one_at_the_edge_does() {
 #[test]
 fn a_buffer_that_wraps_the_address_space_is_not_read() {
     // Divergence: Eden does not check. The memory covers the top eight bytes of the address
-    // space, so only the extent check can refuse the word whose end overflows.
+    // space, so only the extent check can refuse a word whose last byte would wrap.
     let base = u64::MAX - 7;
     let memory = FlatMemory::new(base, 8);
     memory.write(base, &[0xaa; 8]).unwrap();
     let panic = BreakReason::Panic.raw();
-    // address + 4 == 2^64: overflows by exactly one.
-    let wraps = u64::MAX - RESULT_ARGUMENT_SIZE + 1;
-    assert_eq!(code_of(&memory, panic, wraps, RESULT_ARGUMENT_SIZE), None);
+    // The last word of the address space: its last byte is u64::MAX and its exclusive end is
+    // exactly 2^64, which does not wrap, so it is read.
+    let top_word = u64::MAX - (RESULT_ARGUMENT_SIZE - 1);
+    assert_eq!(
+        code_of(&memory, panic, top_word, RESULT_ARGUMENT_SIZE),
+        Some(0xaaaa_aaaa)
+    );
+    // One higher, the last byte would be at 2^64: wraps by exactly one.
+    assert_eq!(
+        code_of(&memory, panic, top_word + 1, RESULT_ARGUMENT_SIZE),
+        None
+    );
     assert_eq!(
         code_of(&memory, panic, u64::MAX, RESULT_ARGUMENT_SIZE),
         None
     );
-    // One lower, address + 4 is u64::MAX, which does not overflow.
+    // One lower is read too.
     assert_eq!(
-        code_of(&memory, panic, wraps - 1, RESULT_ARGUMENT_SIZE),
+        code_of(&memory, panic, top_word - 1, RESULT_ARGUMENT_SIZE),
         Some(0xaaaa_aaaa)
     );
 }
