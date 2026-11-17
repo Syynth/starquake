@@ -244,12 +244,16 @@
 //! - **The address-space ids (2 to 7, 21, 22 and 28) read the calling process's address
 //!   space, whatever process the handle names.** With one address space beside the tables, a
 //!   handle to another process object is answered as the pseudo-handle is; 21 also takes the
-//!   calling process's system resource, to match its address space (no test tells which
-//!   process's it takes: the resource changes 21 only once `U + S + F > M`, which the address
-//!   spaces the tests build never reach, their pool being below their maximum). The fact ids
-//!   (0, 1, 16, 17, 18 and 24) and the Switch 2 ids do read the process the handle names, from
-//!   the process table and the scheduler; one the tables have no row for is an internal
-//!   failure, after the guest's checks. Tests: `a_handle_must_name_a_process`,
+//!   calling process's system resource, to match its address space. The resource changes 21
+//!   only once `U + S + F > M`. In the tests' 4 GiB address space (39-bit, `M` 8 GiB) the
+//!   pool is below `M` by more than any `u32` resource, so the branch is out of reach there;
+//!   on the 12 GiB arrangement (Switch 2: `M` 12 GiB, pool 9809 MiB) an NPDM
+//!   `system_resource_size` above `M` less the pool (2479 MiB) reaches it. Test, the calling
+//!   process's `S` just past that edge and the second process's far below it:
+//!   `the_non_system_total_past_the_maximum_takes_the_calling_process_s_whole_page_resource`.
+//!   The fact ids (0, 1, 16, 17, 18 and 24) and the Switch 2 ids do read the process the
+//!   handle names, from the process table and the scheduler; one the tables have no row for
+//!   is an internal failure, after the guest's checks. Tests: `a_handle_must_name_a_process`,
 //!   `the_facts_are_the_named_process_s_and_the_sizes_the_caller_s`,
 //!   `a_fact_about_a_process_with_no_row_is_an_internal_failure_after_the_checks`.
 //! - **The entropy is drawn when it is first asked for**, not when the process is created

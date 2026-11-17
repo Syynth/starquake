@@ -94,7 +94,12 @@ impl Rig {
 
     /// The rig, its calling process made from `description`.
     fn with(description: &ProcessDescription) -> Self {
-        let mut tables = crate::process::create(description, loaded().0).unwrap();
+        Self::on(description, loaded().0)
+    }
+
+    /// The rig, its calling process made from `description` in `space`.
+    fn on(description: &ProcessDescription, space: AddressSpace) -> Self {
+        let mut tables = crate::process::create(description, space).unwrap();
         let first = tables.address_space.regions().kernel_map.start + GUARD_PAGES * PAGE_SIZE;
         let memory = FlatMemory::new(first, usize::try_from(TLS_PAGES * PAGE_SIZE).unwrap());
         let main = crate::process::run(&mut tables, &memory, ENTRY, STACK_TOP).unwrap();
@@ -505,6 +510,40 @@ fn the_non_system_total_is_s_higher_than_edens_while_the_resource_is_not_charged
         ),
         Ok(free + used)
     );
+}
+
+#[test]
+fn the_non_system_total_past_the_maximum_takes_the_calling_process_s_whole_page_resource() {
+    // A 12 GiB console's pool is below its maximum, so a system resource larger than the gap
+    // reaches `used + secure + free > max`, and 21 answers `max - secure`. The calling
+    // process's resource is just past that edge and a few bytes more than whole pages; the
+    // second process's is far below it: a total taken from the second process's resource,
+    // from none, or from the size not rounded to whole pages answers something else.
+    let (mapper, _log) = RecordingMapper::new();
+    let mut space =
+        AddressSpace::new(&memory(MemoryArrangement::TwelveGb), Box::new(mapper)).unwrap();
+    space.create_main_thread_stack(STACK_SIZE).unwrap();
+    let max = space.max_process_memory();
+    let reachable = space.used_user_physical_memory_size() + space.limit().free();
+    assert!(reachable < max);
+    let pages = (max - reachable) / PAGE_SIZE + 1;
+    let mut description = own_description(Console::Switch2);
+    description.system_resource_size =
+        u32::try_from(pages * PAGE_SIZE + OWN_RESOURCE_EXTRA).unwrap();
+    let mut rig = Rig::on(&description, space);
+    let secure = pages * PAGE_SIZE;
+    assert_ne!(secure, SECOND_RESOURCE_PAGES * PAGE_SIZE);
+    let space = &rig.tables.address_space;
+    let (used, free) = (space.used_user_physical_memory_size(), space.limit().free());
+    assert!(used + secure + free > max);
+    assert!(used + SECOND_RESOURCE_PAGES * PAGE_SIZE + free <= max);
+    for handle in [Handle::CURRENT_PROCESS, rig.second_handle] {
+        assert_eq!(
+            rig.ask(InfoType::TotalNonSystemMemorySize, handle, 0),
+            Ok(max - secure),
+            "{handle:?}"
+        );
+    }
 }
 
 #[test]
