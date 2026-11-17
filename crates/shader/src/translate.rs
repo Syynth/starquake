@@ -24,11 +24,17 @@
 //! - `ALD` and `AST` take only `RZ` as the vertex register (the PR passes the register to the
 //!   IR; the vertex and pixel stages handled here have one vertex);
 //! - `S2R` reads only `SR_LANEID` (the PR also reads the thread and block ids, the W scale
-//!   factors and the lane masks).
+//!   factors and the lane masks);
+//! - `MOV` and `FFMA` take only register and immediate sources: a uniform-register or
+//!   constant-buffer source, which the decoder reads since slice 4, is rejected (the PR reads
+//!   both, `visitor.cpp`, `Visitor::Value`; constant buffers and uniform registers come with
+//!   the passes of slices 12 and 13);
+//! - every other instruction is rejected by its mnemonic.
 //!
 //! Pinned by `tests::guarded_instructions_are_rejected`, `never_guarded_instructions_are_rejected`,
 //! `exit_modes_and_predicates_are_rejected`, `the_program_ends_at_its_only_exit`,
-//! `attribute_access_checks` and `s2r_lane_id`.
+//! `attribute_access_checks`, `s2r_lane_id`, `uniform_and_constant_buffer_sources_are_rejected`
+//! and `other_instructions_are_rejected_by_mnemonic`.
 
 #[cfg(test)]
 mod tests;
@@ -38,7 +44,7 @@ use std::fmt::{self, Display, Formatter};
 use thiserror::Error;
 
 use crate::decode::{
-    FloatSrc, Gpr, Instr, MovSrc, Op, OpALd, OpASt, OpExit, OpFFma, OpMov, OpS2R, RoundMode,
+    AluSrc, Gpr, Instr, MovSrc, Op, OpALd, OpASt, OpExit, OpFFma, OpMov, OpS2R, RoundMode,
     SpecialReg,
 };
 use crate::ir::{
@@ -118,6 +124,13 @@ pub enum Unsupported {
     /// The stage is not handled yet.
     #[error("{0} programs are not supported yet")]
     Stage(GuestStage),
+    /// An instruction the translator does not handle yet: every one but the six of slice 1.
+    #[error("{0}")]
+    Instruction(&'static str),
+    /// A uniform-register or constant-buffer source of `MOV` or `FFMA` (PR #4588 reads both:
+    /// `visitor.cpp`, `Visitor::Value`).
+    #[error("a uniform-register or constant-buffer source")]
+    Source,
     /// A guard other than `PT` needs flow analysis.
     #[error("a guarded instruction (flow analysis is not built yet)")]
     Guard,
@@ -237,6 +250,9 @@ pub fn translate(stage: Stage, program: &[Instr]) -> Result<Function, TranslateE
             Op::ASt(op) => t.ast(op).map(|()| false),
             Op::S2R(op) => t.s2r(op).map(|()| false),
             Op::Exit(op) => t.exit(op).map(|()| true),
+            other => Err(Failure::Unsupported(Unsupported::Instruction(
+                other.mnemonic(),
+            ))),
         };
         match done {
             Ok(false) => {}
@@ -346,10 +362,10 @@ impl Translator<'_> {
         self.set(reg, bits.into())
     }
 
-    fn float_src(&mut self, src: FloatSrc) -> Result<Value, Failure> {
+    fn float_src(&mut self, src: AluSrc) -> Result<Value, Failure> {
         match src {
-            FloatSrc::Imm(bits) => self.op(Opcode::BitCastF32U32, &[imm32(bits)]),
-            FloatSrc::Reg { reg, abs, neg } => {
+            AluSrc::Imm(bits) => self.op(Opcode::BitCastF32U32, &[imm32(bits)]),
+            AluSrc::Reg { reg, abs, neg } => {
                 let mut value = self.get_f32(reg)?;
                 if abs {
                     value = self.op(Opcode::FPAbs32, &[value.into()])?;
@@ -359,6 +375,7 @@ impl Translator<'_> {
                 }
                 Ok(value)
             }
+            AluSrc::UniformReg { .. } | AluSrc::CBuf { .. } => Err(Unsupported::Source.into()),
         }
     }
 
@@ -367,6 +384,7 @@ impl Translator<'_> {
         let value = match op.src {
             MovSrc::Reg(reg) => self.get(reg)?,
             MovSrc::Imm(bits) => imm32(bits),
+            MovSrc::UniformReg(_) | MovSrc::CBuf(_) => return Err(Unsupported::Source.into()),
         };
         self.set(op.dst, value)
     }

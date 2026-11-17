@@ -4,13 +4,15 @@
 //! interface, which the GPU crate carries to the render backend; wgpu takes the module directly
 //! (`docs/specs/shader-pipeline.md`). Instruction encodings come from Mesa NAK (MIT).
 //!
-//! This is slice 1 of the spec's port slices, the walking skeleton: [`decode`] reads six forms
-//! (`MOV`, `FFMA`, `ALD`, `AST`, `EXIT`, `S2R`), [`translate`] turns straight-line programs of
-//! them into the [`ir`], and [`lower`] builds and validates the naga module and its [`host`]
-//! tables. [`program::translate_program`] runs the whole chain on program bytes. The `asm`
-//! module (feature `test-support`) is the test assembler that builds instruction words. The
-//! [`ir`] is slice 5's IR core: Eden's operation set in arenas, with a builder, a text form that
-//! prints and parses, and a verifier.
+//! Slice 1 of the spec's port slices built the walking skeleton: [`translate`] turns
+//! straight-line programs of six instructions (`MOV`, `FFMA`, `ALD`, `AST`, `EXIT`, `S2R`) into
+//! the [`ir`], and [`lower`] builds and validates the naga module and its [`host`] tables.
+//! [`program::translate_program`] runs the whole chain on program bytes. [`decode`] is slice 4's
+//! decoder framework: the form table with known-bit masks, the operand types, the full `Op`
+//! enum (instructions not decoded yet are shells), the printer, and the test assembler (`asm`,
+//! feature `test-support`) that builds instruction words; it decodes the six instructions in
+//! every operand form NAK encodes for them. The [`ir`] is slice 5's IR core: Eden's operation
+//! set in arenas, with a builder, a text form that prints and parses, and a verifier.
 //!
 //! Experiment E1, run before this slice, lives in `lower`'s tests and its results in the spec.
 
