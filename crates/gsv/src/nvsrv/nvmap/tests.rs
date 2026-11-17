@@ -704,151 +704,125 @@ fn reload(map: &NvMap) -> Result<NvMap, NvMapStateError> {
     })
 }
 
+/// Handle `id` of `map`, to change.
+fn handle_of(map: &mut NvMap, id: u32) -> &mut NvMapHandle {
+    map.handles.get_mut(&id).unwrap()
+}
+
+/// The allocation of handle 4 of [`valid`]'s table, to change.
+fn allocation_of(map: &mut NvMap) -> &mut Allocation {
+    handle_of(map, 4).allocation.as_mut().unwrap()
+}
+
+/// [`valid`]'s table with `change` made.
+fn valid_with(change: impl Fn(&mut NvMap)) -> NvMap {
+    let mut map = valid();
+    change(&mut map);
+    map
+}
+
+/// [`valid`]'s table with a copy of handle 8 at `id`.
+fn valid_with_copy_at(id: u32) -> NvMap {
+    valid_with(|map| {
+        let handle = map.handles[&8];
+        map.handles.insert(id, handle);
+    })
+}
+
 /// Each saved table no sequence of ioctls reaches, and the error it is refused with.
 fn unreachable_tables() -> Vec<(NvMap, NvMapStateError)> {
-    let valid = valid();
-    let with = |change: &dyn Fn(&mut NvMap)| {
-        let mut map = valid.clone();
-        change(&mut map);
-        map
+    use NvMapStateError::{
+        Align, Dupes, NextId, NotAnId, NotIssued, PastTheEnd, Size, TooMany, UnallocatedDuplicated,
     };
+    let past = u64::MAX - 0x1FFF;
     vec![
+        (valid_with(|map| map.next_id = 0), NextId { next: 0 }),
+        (valid_with(|map| map.next_id = 13), NextId { next: 13 }),
         (
-            with(&|map| map.next_id = 0),
-            NvMapStateError::NextId { next: 0 },
-        ),
-        (
-            with(&|map| map.next_id = 13),
-            NvMapStateError::NextId { next: 13 },
-        ),
-        (
-            with(&|map| map.next_id = HANDLE_ID_END + 4),
-            NvMapStateError::NextId {
+            valid_with(|map| map.next_id = HANDLE_ID_END + 4),
+            NextId {
                 next: HANDLE_ID_END + 4,
             },
         ),
         (
             table_of(MAX_HANDLES + 1),
-            NvMapStateError::TooMany {
+            TooMany {
                 count: MAX_HANDLES + 1,
             },
         ),
+        (valid_with_copy_at(6), NotAnId { id: 6 }),
+        (valid_with_copy_at(0), NotAnId { id: 0 }),
+        (valid_with_copy_at(12), NotIssued { id: 12 }),
         (
-            with(&|map| {
-                let handle = map.handles[&8];
-                map.handles.insert(6, handle);
-            }),
-            NvMapStateError::NotAnId { id: 6 },
+            valid_with(|map| handle_of(map, 8).size = 0),
+            Size { id: 8, size: 0 },
         ),
         (
-            with(&|map| {
-                let handle = map.handles[&8];
-                map.handles.insert(0, handle);
-            }),
-            NvMapStateError::NotAnId { id: 0 },
-        ),
-        (
-            with(&|map| {
-                let handle = map.handles[&8];
-                map.handles.insert(12, handle);
-            }),
-            NvMapStateError::NotIssued { id: 12 },
-        ),
-        (
-            with(&|map| map.handles.get_mut(&8).unwrap().size = 0),
-            NvMapStateError::Size { id: 8, size: 0 },
-        ),
-        (
-            with(&|map| map.handles.get_mut(&8).unwrap().size = 0xFFFF_F001),
-            NvMapStateError::Size {
+            valid_with(|map| handle_of(map, 8).size = 0xFFFF_F001),
+            Size {
                 id: 8,
                 size: 0xFFFF_F001,
             },
         ),
         (
-            with(&|map| map.handles.get_mut(&4).unwrap().dupes = 0),
-            NvMapStateError::Dupes { id: 4, dupes: 0 },
+            valid_with(|map| handle_of(map, 4).dupes = 0),
+            Dupes { id: 4, dupes: 0 },
         ),
         (
-            with(&|map| map.handles.get_mut(&4).unwrap().dupes = MAX_DUPES + 1),
-            NvMapStateError::Dupes {
+            valid_with(|map| handle_of(map, 4).dupes = MAX_DUPES + 1),
+            Dupes {
                 id: 4,
                 dupes: MAX_DUPES + 1,
             },
         ),
         (
-            with(&|map| map.handles.get_mut(&8).unwrap().dupes = 2),
-            NvMapStateError::UnallocatedDuplicated { id: 8, dupes: 2 },
+            valid_with(|map| handle_of(map, 8).dupes = 2),
+            UnallocatedDuplicated { id: 8, dupes: 2 },
         ),
         (
-            with(&|map| {
-                map.handles
-                    .get_mut(&4)
-                    .unwrap()
-                    .allocation
-                    .as_mut()
-                    .unwrap()
-                    .align = 0x800
-            }),
-            NvMapStateError::Align {
+            valid_with(|map| allocation_of(map).align = 0x800),
+            Align {
                 id: 4,
                 align: 0x800,
             },
         ),
         (
-            with(&|map| {
-                map.handles
-                    .get_mut(&4)
-                    .unwrap()
-                    .allocation
-                    .as_mut()
-                    .unwrap()
-                    .align = 0x3000
-            }),
-            NvMapStateError::Align {
+            valid_with(|map| allocation_of(map).align = 0x3000),
+            Align {
                 id: 4,
                 align: 0x3000,
             },
         ),
         (
-            with(&|map| {
-                map.handles
-                    .get_mut(&4)
-                    .unwrap()
-                    .allocation
-                    .as_mut()
-                    .unwrap()
-                    .address = u64::MAX - 0x1FFF
-            }),
-            NvMapStateError::PastTheEnd {
+            valid_with(|map| allocation_of(map).address = past),
+            PastTheEnd {
                 id: 4,
-                address: u64::MAX - 0x1FFF,
+                address: past,
             },
         ),
+        // Two faults: a bad next id and a bad handle; the table's own check comes first.
         (
-            // Two faults: a bad next id and a bad handle; the table's own check comes first.
-            with(&|map| {
+            valid_with(|map| {
                 map.next_id = 2;
-                map.handles.get_mut(&8).unwrap().size = 0;
+                handle_of(map, 8).size = 0;
             }),
-            NvMapStateError::NextId { next: 2 },
+            NextId { next: 2 },
         ),
+        // Two faults in two handles: the lower id's comes first.
         (
-            // Two faults in two handles: the lower id's comes first.
-            with(&|map| {
-                map.handles.get_mut(&4).unwrap().dupes = 0;
-                map.handles.get_mut(&8).unwrap().size = 0;
+            valid_with(|map| {
+                handle_of(map, 4).dupes = 0;
+                handle_of(map, 8).size = 0;
             }),
-            NvMapStateError::Dupes { id: 4, dupes: 0 },
+            Dupes { id: 4, dupes: 0 },
         ),
+        // Two faults in one handle: its size is checked before its references.
         (
-            // Two faults in one handle: its size is checked before its references.
-            with(&|map| {
-                let handle = map.handles.get_mut(&8).unwrap();
-                handle.size = 0;
-                handle.dupes = 0;
+            valid_with(|map| {
+                handle_of(map, 8).size = 0;
+                handle_of(map, 8).dupes = 0;
             }),
-            NvMapStateError::Size { id: 8, size: 0 },
+            Size { id: 8, size: 0 },
         ),
     ]
 }
@@ -866,38 +840,17 @@ fn a_saved_table_no_ioctl_reaches_is_refused() {
 /// Each relation's edge, on the side that is reachable: accepted as it is.
 #[test]
 fn a_saved_table_at_each_edge_is_accepted() {
-    let valid = valid();
-    let with = |change: &dyn Fn(&mut NvMap)| {
-        let mut map = valid.clone();
-        change(&mut map);
-        map
-    };
     let cases = [
         NvMap::new(),
-        valid.clone(),
-        with(&|map| map.next_id = HANDLE_ID_END),
+        valid(),
+        valid_with(|map| map.next_id = HANDLE_ID_END),
         table_of(MAX_HANDLES),
-        with(&|map| map.handles.get_mut(&8).unwrap().size = 0xFFFF_F000),
-        with(&|map| map.handles.get_mut(&8).unwrap().size = 1),
-        with(&|map| map.handles.get_mut(&4).unwrap().dupes = MAX_DUPES),
-        with(&|map| {
-            map.handles
-                .get_mut(&4)
-                .unwrap()
-                .allocation
-                .as_mut()
-                .unwrap()
-                .align = 1 << 31
-        }),
-        with(&|map| {
-            map.handles
-                .get_mut(&4)
-                .unwrap()
-                .allocation
-                .as_mut()
-                .unwrap()
-                .address = u64::MAX - 0x2000
-        }),
+        valid_with(|map| handle_of(map, 8).size = 0xFFFF_F000),
+        valid_with(|map| handle_of(map, 8).size = 1),
+        valid_with(|map| handle_of(map, 4).dupes = MAX_DUPES),
+        valid_with(|map| allocation_of(map).align = 1 << 31),
+        valid_with(|map| allocation_of(map).align = PAGE),
+        valid_with(|map| allocation_of(map).address = u64::MAX - 0x2000),
     ];
     for map in cases {
         assert_eq!(reload(&map).as_ref(), Ok(&map));
