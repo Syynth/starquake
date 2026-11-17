@@ -1372,9 +1372,11 @@ fn a_saved_server_restores_and_carries_on() {
 /// device's index, the next fd, the nvmap table (its own layout is pinned in `nvmap/tests.rs`),
 /// then nvhost-as-gpu's views, the layouts of the address spaces it made and its bound channels,
 /// then nvhost-tsg-gpu's groups, then nvhost-gpu's channels. Every device appears, each fd
-/// distinct; the state is reached by ioctls, each field of a view, a layout, a binding, a group
-/// and a channel a distinct non-zero value. (A channel's GPU channel, classes and events are
-/// pinned with values by `gpu/tests.rs`: `a_channel_s_saved_layout_is_pinned`.)
+/// distinct; the state is reached by ioctls, each field of a view, a layout and a group a
+/// distinct non-zero value. The bindings and the channels are empty here (`Direct` has no channel
+/// front, so nothing binds or makes a channel): a binding and a channel with values are pinned by
+/// `gpu/tests.rs`, `a_bound_channel_s_saved_layout_is_pinned`, and a channel's classes and
+/// events by `a_channel_s_saved_layout_is_pinned`.
 #[test]
 fn the_saved_state_s_layout_is_pinned() {
     let mut direct = Direct::new();

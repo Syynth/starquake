@@ -9,7 +9,7 @@
 //! # The table
 //!
 //! [`Submits`] holds, per GPU channel, the submissions that wait, oldest first, each with the
-//! reply token of its request and the front it goes to. It lives in [`crate::shared::GsvShared`]
+//! reply token of its request, if it has one, and the front it goes to. It lives in [`crate::shared::GsvShared`]
 //! because both nvsrv's handlers (which add to it) and the timer thread's drain (which empties
 //! it) reach it, under gsv's shared lock.
 //!
@@ -22,9 +22,28 @@
 //! - [`Submits::cancel`] (the channel's fd closed) answers each waiting reply `NotImplemented`,
 //!   oldest first, without giving the front anything.
 //!
-//! How many wait is bounded by the requests in flight: a waiting submission keeps its request's
-//! session busy (the service framework handles one request at a time per session), so a title
-//! has at most one waiting per session it opened.
+//! **A submission without a token.** Once `SubmitGPFIFO` has raised the channel syncpoint's
+//! maximum and given the fence out, its submission is GPU work the fence counts on, so it is
+//! never dropped while its channel lives, even when nobody waits for its reply:
+//!
+//! - its out buffer could not be written, or no reply token could be taken: the request
+//!   answers that fault, and the submission waits with no token (`run_ioctl` in
+//!   [`crate::nvsrv`]; Eden writes nothing back but keeps the submission);
+//! - its request's session was closed ([`Server::close`] drops the pending request): the entry
+//!   keeps its token, whose completion then goes nowhere, and [`Submits::save`] saves it with
+//!   no token, as restoring could not reissue it.
+//!
+//! When such a submission is queued, no reply is completed.
+//!
+//! **What bounds the table: nothing yet.** A waiting submission with a token keeps its
+//! request's session busy (the service framework handles one request at a time per session),
+//! but one without a token holds nothing of the title's. So while a channel's queue stays full,
+//! a title can add one submission (with up to [`MAX_ENTRY_BYTES`](super::MAX_ENTRY_BYTES) of
+//! entries) per request it sends and then abandons, by closing the session or by giving an
+//! out buffer that cannot be written, without limit
+//! (`gpu/tests.rs`: `abandoned_submissions_are_not_bounded_yet`). A bound needs a guest-visible
+//! answer for a submission refused when the table is full, which neither reference has (neither
+//! waits); it is an open question for the owner.
 //!
 //! A completion posts the reply to the server's mailbox (`ReplyToken::complete`), which tells the
 //! kernel; it never blocks, and the kernel delivers the reply on a core thread. The drain calls
@@ -36,7 +55,8 @@
 //! [`Submits::save`] writes the table: `postcard`, after a header of [`SNAPSHOT_MAGIC`] and
 //! [`SNAPSHOT_VERSION`] that is decoded and checked before the body. The body is a list, in
 //! channel order and oldest first within a channel, of each waiting submission: its channel, its
-//! request's token id, its entries, its wait fence (syncpoint id and value) if any, its
+//! request's token id if it has one whose request `server` holds as pending (an option), its
+//! entries, its wait fence (syncpoint id and value) if any, its
 //! increments and its wait-for-idle flag. The golden-bytes test `the_snapshot_layout_is_pinned`
 //! (in `nvsrv/gpu/tests.rs`, with the other tests of this module, which need the server's reply
 //! tokens) pins it.
@@ -46,7 +66,10 @@
 //! it, then each entry in list order ([`SnapshotError`], in the order of its variants): its wait
 //! fence's syncpoint, its entry count, that its token id is not one an earlier entry has, that it
 //! comes after the entry before it (channel, then token id: a later request takes a later token),
-//! and that the server holds its request as pending ([`Server::pending`]). Only once every entry
+//! and that the server holds its request as pending ([`Server::pending`]); the last three only
+//! for an entry with a token. "After" means: a channel not below the one before it, and within a
+//! channel, a token id above the last token id of that channel (an entry without a token has
+//! none to compare). Only once every entry
 //! has passed are the requests given new tokens ([`Server::reissue`]) and the table built, so a
 //! refused snapshot leaves every pending request as it was. The restored table gives nothing to the
 //! front: [`Submits::retry_all`] does, once the front's channels exist again (the wiring slice,
@@ -78,7 +101,7 @@ pub const SNAPSHOT_VERSION: u32 = 1;
 
 /// One waiting submission.
 struct Waiting {
-    token: ReplyToken,
+    token: Option<ReplyToken>,
     submission: Submission,
     front: Arc<dyn ChannelFront>,
 }
@@ -91,7 +114,7 @@ pub struct Submits {
 
 impl fmt::Debug for Submits {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_list().entries(self.saved()).finish()
+        f.debug_list().entries(self.saved(|_| true)).finish()
     }
 }
 
@@ -99,7 +122,7 @@ impl fmt::Debug for Submits {
 /// order; the fronts are not compared.
 impl PartialEq for Submits {
     fn eq(&self, other: &Self) -> bool {
-        self.saved() == other.saved()
+        self.saved(|_| true) == other.saved(|_| true)
     }
 }
 
@@ -144,21 +167,22 @@ impl Submits {
         self.waiting.is_empty()
     }
 
-    /// The token ids of `channel`'s waiting requests, oldest first.
+    /// The token ids of `channel`'s waiting requests, oldest first; a submission without a token
+    /// has none.
     pub fn tokens(&self, channel: ChannelId) -> impl Iterator<Item = TokenId> + '_ {
         self.waiting
             .get(&channel)
             .into_iter()
             .flatten()
-            .map(|waiting| waiting.token.id())
+            .filter_map(|waiting| waiting.token.as_ref().map(ReplyToken::id))
     }
 
-    /// Adds `submission`, whose request `token` answers, behind `channel`'s waiting ones, then
-    /// tries the channel's queue (module docs, "The table").
+    /// Adds `submission`, whose request `token` answers if given, behind `channel`'s waiting
+    /// ones, then tries the channel's queue (module docs, "The table").
     pub fn push(
         &mut self,
         channel: ChannelId,
-        token: ReplyToken,
+        token: Option<ReplyToken>,
         submission: Submission,
         front: Arc<dyn ChannelFront>,
     ) {
@@ -180,8 +204,8 @@ impl Submits {
             if head.front.submit(channel, head.submission.clone()) == Submitted::Full {
                 break;
             }
-            if let Some(queued) = queue.pop_front() {
-                queued.token.complete(reply(NvResult::Success));
+            if let Some(token) = queue.pop_front().and_then(|queued| queued.token) {
+                token.complete(reply(NvResult::Success));
             }
         }
         if queue.is_empty() {
@@ -201,19 +225,25 @@ impl Submits {
     /// `channel` is going: each waiting reply answers `NotImplemented`, oldest first, and nothing
     /// goes to the front (module docs, "The table").
     pub fn cancel(&mut self, channel: ChannelId) {
-        for waiting in self.waiting.remove(&channel).into_iter().flatten() {
-            waiting.token.complete(reply(NvResult::NotImplemented));
+        let waiting = self.waiting.remove(&channel).into_iter().flatten();
+        for token in waiting.filter_map(|waiting| waiting.token) {
+            token.complete(reply(NvResult::NotImplemented));
         }
     }
 
-    /// The table as it is saved, in order.
-    fn saved(&self) -> Vec<SavedSubmit> {
+    /// The table as it is saved, in order, each token kept only if `pending` holds for its id.
+    fn saved(&self, pending: impl Fn(TokenId) -> bool) -> Vec<SavedSubmit> {
+        let pending = &pending;
         self.waiting
             .iter()
             .flat_map(|(&channel, queue)| {
                 queue.iter().map(move |waiting| SavedSubmit {
                     channel: channel.0,
-                    token: waiting.token.id(),
+                    token: waiting
+                        .token
+                        .as_ref()
+                        .map(ReplyToken::id)
+                        .filter(|&id| pending(id)),
                     entries: waiting
                         .submission
                         .entries
@@ -231,14 +261,17 @@ impl Submits {
             .collect()
     }
 
-    /// Writes the table (module docs, "Snapshot format"). Take it while nothing changes it.
-    pub fn save(&self) -> Result<Vec<u8>, SnapshotError> {
+    /// Writes the table (module docs, "Snapshot format"), with `server`, the nvsrv server saved
+    /// with it: a token whose request `server` no longer holds as pending is saved as none. Take
+    /// it while nothing changes either.
+    pub fn save(&self, server: &Server) -> Result<Vec<u8>, SnapshotError> {
+        let pending = |id: TokenId| server.pending().any(|(pending, _)| pending == id);
         let mut bytes = postcard::to_allocvec(&Header {
             magic: SNAPSHOT_MAGIC,
             version: SNAPSHOT_VERSION,
         })
         .map_err(SnapshotError::Encode)?;
-        bytes.extend(postcard::to_allocvec(&self.saved()).map_err(SnapshotError::Encode)?);
+        bytes.extend(postcard::to_allocvec(&self.saved(pending)).map_err(SnapshotError::Encode)?);
         Ok(bytes)
     }
 
@@ -266,7 +299,8 @@ impl Submits {
             return Err(SnapshotError::TrailingBytes { count: rest.len() });
         }
         let mut seen = BTreeSet::new();
-        let mut previous: Option<(u32, TokenId)> = None;
+        // The channel of the entry before, and the last token id seen in that channel.
+        let mut previous: Option<(u32, Option<TokenId>)> = None;
         let mut checked = Vec::with_capacity(saved.len());
         for (index, entry) in saved.into_iter().enumerate() {
             let wait = match entry.wait {
@@ -280,19 +314,31 @@ impl Submits {
                 let count = entry.entries.len();
                 return Err(SnapshotError::TooManyEntries { index, count });
             }
-            if !seen.insert(entry.token) {
-                let token = entry.token.raw();
+            if let Some(token) = entry.token
+                && !seen.insert(token)
+            {
+                let token = token.raw();
                 return Err(SnapshotError::DuplicateToken { index, token });
             }
-            let key = (entry.channel, entry.token);
-            // An equal key has a token an earlier entry has, refused just above, so `>=` and
-            // `>` refuse the same snapshots here.
-            if previous.is_some_and(|previous| previous >= key) {
+            let last = match previous {
+                Some((channel, _)) if channel > entry.channel => {
+                    return Err(SnapshotError::Misordered { index });
+                }
+                Some((channel, last)) if channel == entry.channel => last,
+                _ => None,
+            };
+            // An equal id is a token an earlier entry has, refused just above, so `>=` and `>`
+            // refuse the same snapshots here.
+            if let (Some(last), Some(token)) = (last, entry.token)
+                && last >= token
+            {
                 return Err(SnapshotError::Misordered { index });
             }
-            previous = Some(key);
-            if !server.pending().any(|(pending, _)| pending == entry.token) {
-                let token = entry.token.raw();
+            previous = Some((entry.channel, entry.token.or(last)));
+            if let Some(token) = entry.token
+                && !server.pending().any(|(pending, _)| pending == token)
+            {
+                let token = token.raw();
                 return Err(SnapshotError::NotPending { index, token });
             }
             let submission = Submission {
@@ -306,8 +352,12 @@ impl Submits {
         let mut submits = Self::new();
         for (channel, id, submission) in checked {
             // Every id was checked pending above, and nothing ran on the server since.
-            let Some(token) = server.reissue(id) else {
-                continue;
+            let token = match id {
+                None => None,
+                Some(id) => match server.reissue(id) {
+                    Some(token) => Some(token),
+                    None => continue,
+                },
             };
             submits
                 .waiting
@@ -337,8 +387,8 @@ struct Header {
 pub(super) struct SavedSubmit {
     /// The GPU channel.
     pub(super) channel: u32,
-    /// The request's token id.
-    pub(super) token: TokenId,
+    /// The request's token id, if it has a pending request.
+    pub(super) token: Option<TokenId>,
     /// The entries, raw.
     pub(super) entries: Vec<u64>,
     /// The wait fence: syncpoint id and value.

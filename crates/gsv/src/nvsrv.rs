@@ -1006,7 +1006,8 @@ impl Nvsrv {
 /// `Ioctl`, `Ioctl2` and `Ioctl3`. in: `s32` fd, `u32` ioctl; in buffer 0, the argument. out:
 /// out buffer 0, the argument back if the ioctl's `is_out` bit is set; the result. A submission
 /// that must wait for room ([`gpu`], "The ioctls") writes its out buffer at once and defers the
-/// result.
+/// result; if that write or the reply token fails, the request answers the fault and the
+/// submission waits all the same, with no token ([`gpu`], "A full queue").
 fn run_ioctl(
     variant: IoctlVariant,
     cx: &mut Context<'_>,
@@ -1042,19 +1043,36 @@ fn run_ioctl(
     };
     let policy = cx.policy();
     let (answer, deferral) = cx.family::<NvsrvFamily>()?.ioctl(policy, &call);
-    if ioctl.is_out() {
-        write_out(cx, req, 0, &answer.output)?;
-        if variant == IoctlVariant::Ioctl3 && !answer.inline.is_empty() {
-            write_out(cx, req, 1, &answer.inline)?;
+    let written = if ioctl.is_out() {
+        write_out(cx, req, 0, &answer.output).and_then(|()| {
+            if variant == IoctlVariant::Ioctl3 && !answer.inline.is_empty() {
+                write_out(cx, req, 1, &answer.inline)
+            } else {
+                Ok(())
+            }
+        })
+    } else {
+        Ok(())
+    };
+    let Some(deferral) = deferral else {
+        written?;
+        reply.payload().write_u32(answer.result.raw());
+        return reply.ok();
+    };
+    // The channel's syncpoint maximum is raised already, so the submission waits whatever
+    // happens to the reply: without a token if the out buffer or the token failed ([`gpu`],
+    // "A full queue").
+    match written.and_then(|()| cx.defer()) {
+        Ok(token) => {
+            cx.family::<NvsrvFamily>()?
+                .wait_for_room(deferral, Some(token));
+            reply.deferred()
+        }
+        Err(fault) => {
+            cx.family::<NvsrvFamily>()?.wait_for_room(deferral, None);
+            Err(fault)
         }
     }
-    if let Some(deferral) = deferral {
-        let token = cx.defer()?;
-        cx.family::<NvsrvFamily>()?.wait_for_room(deferral, token);
-        return reply.deferred();
-    }
-    reply.payload().write_u32(answer.result.raw());
-    reply.ok()
 }
 
 /// Out buffer `index`'s size (Eden `GetWriteBufferSize`). The framework refuses a request that
@@ -1163,13 +1181,17 @@ impl NvsrvFamily {
     }
 
     /// `deferral`'s submission waits for room in gsv's shared state, `token` answering its
-    /// request; the channel's queue is tried once more under gsv's lock, so a room report that
-    /// came since the front answered `Full` is not lost ([`gpu::submits`]).
-    pub fn wait_for_room(&mut self, deferral: Deferral, token: ReplyToken) {
+    /// request if it has one (none when its out buffer or its token failed: the submission's
+    /// fence was given out, so it waits all the same); the channel's queue is tried once more
+    /// under gsv's lock, so a room report that came since the front answered `Full` is not lost
+    /// ([`gpu::submits`]).
+    pub fn wait_for_room(&mut self, deferral: Deferral, token: Option<ReplyToken>) {
         let Some(front) = self.channels.as_ref() else {
             // Only a server with a channel front defers a submission.
             tracing::error!("nvsrv: a submission waits with no channel front");
-            token.fail(NOT_SUPPORTED);
+            if let Some(token) = token {
+                token.fail(NOT_SUPPORTED);
+            }
             return;
         };
         let front = Arc::clone(front);

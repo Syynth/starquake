@@ -16,8 +16,8 @@ use starquake_ipc::{BUFFER_SIZE, Message, SessionKind};
 use starquake_kernel::dispatch::DeviceShareError;
 use starquake_kernel::id::SlabId;
 use starquake_kernel::memory::DeviceShareToken;
-use starquake_kernel::result::SvcResult;
-use starquake_services::framework::{Handled, TokenId, UnknownPolicy};
+use starquake_kernel::result::{ResultCode, SvcResult};
+use starquake_services::framework::{Family, Handled, TokenId, UnknownPolicy};
 use starquake_trace::EventKind;
 
 use super::super::command::{CLOSE, IOCTL2, QUERY_EVENT};
@@ -580,7 +580,8 @@ fn a_bound_channel_keeps_its_space_after_the_last_view_closes() {
     assert_eq!(bench.close(fd), NvResult::Success);
     assert!(bench.memory.table(space).is_none());
     assert_eq!(bench.state.as_gpu().made(space), None);
-    // The channel was destroyed before the space went.
+    // The channel was destroyed (that it goes before the space is pinned by
+    // `closing_a_channel_destroys_it_before_the_space_it_held`).
     assert!(matches!(bench.fake.calls().last(), Some(Call::Destroy(_))));
 }
 
@@ -1257,12 +1258,25 @@ impl Live {
         flags: u32,
         (id, value): (u32, u32),
     ) -> (Handled, Vec<u8>, u64) {
+        let out_at = self.rig.place(&[STALE; 24]);
+        self.submit_out(session, fd, entries, flags, (id, value), out_at)
+    }
+
+    /// As [`Live::submit_with`], with the out buffer at `out_at`, which need not be mapped.
+    fn submit_out(
+        &mut self,
+        session: ObjectId,
+        fd: i32,
+        entries: &[u64],
+        flags: u32,
+        (id, value): (u32, u32),
+        out_at: u64,
+    ) -> (Handled, Vec<u8>, u64) {
         let count = u32::try_from(entries.len()).unwrap();
         let input = submit_struct(count, flags, id, value);
         let inline = entry_bytes(entries);
         let input_at = self.rig.place(&input);
         let inline_at = self.rig.place(&inline);
-        let out_at = self.rig.place(&[STALE; 24]);
         let request = cmif(IOCTL2, &fd_and(fd, KICKOFF));
         let request = Auto::alias(input_at, len16(input.len())).send(request, 0);
         let request = Auto::alias(inline_at, len16(inline.len())).send(request, 1);
@@ -1562,6 +1576,51 @@ fn a_channel_s_saved_layout_is_pinned() {
     assert_eq!(bytes, expected);
     let back: NvhostGpu = postcard::from_bytes(&bytes).unwrap();
     assert_eq!(back, gpu);
+}
+
+/// The saved layout of a bound channel, as `postcard` writes as-gpu's part and nvhost-gpu's part
+/// of the nvsrv state: the view (fd 3, space 6, its layout), the space made (6, its layout), the
+/// binding (fd 4 to space 6), then the channel (fd 4, syncpoint 1, GPU channel 0x30 made in space
+/// 6, no classes, no events). Five spaces are made first so the space's id is none of the fds;
+/// the space's id repeats because the binding and the GPU channel are of that one space. Each
+/// value is non-zero.
+#[test]
+fn a_bound_channel_s_saved_layout_is_pinned() {
+    let mut bench = Bench::new();
+    for _ in 0..5 {
+        bench.memory.create_address_space(&bench.vm).unwrap();
+    }
+    bench.open(Device::Nvmap);
+    bench.open(Device::NvhostCtrlGpu);
+    let (as_fd, space) = bench.space();
+    let fd = bench.open(Device::NvhostGpu);
+    assert_eq!((as_fd, space, fd), (3, AsId(6), 4));
+    assert_eq!(bench.bind(as_fd, fd), NvResult::Success);
+    assert_eq!(bench.alloc(fd), (u32::from(FIRST_ALLOCATABLE), 0));
+    // A layout: start 0x2000, split 0x5000, end 0x9000, big page size 0x10000, as varints.
+    let layout = [
+        0x80, 0x40, 0x80, 0xA0, 0x01, 0x80, 0xA0, 0x02, 0x80, 0x80, 0x04,
+    ];
+    // One view: fd 3, space 6, its layout; one space made: 6, its layout; one binding: fd 4,
+    // space 6.
+    let mut expected = vec![1, 3, 6];
+    expected.extend(layout);
+    expected.extend([1, 6]);
+    expected.extend(layout);
+    expected.extend([1, 4, 6]);
+    assert_eq!(
+        postcard::to_allocvec(bench.state.as_gpu()).unwrap(),
+        expected
+    );
+    // One channel: fd 4, syncpoint some 1, GPU channel some 0x30 in space 6, no classes, no
+    // events.
+    let expected = [1, 4, 1, FIRST_ALLOCATABLE, 1, 0x30, 6, 0, 0, 0, 0];
+    assert_eq!(postcard::to_allocvec(bench.state.gpu()).unwrap(), expected);
+    // The whole state reads back as it was.
+    let bytes = bench.state.save_state().unwrap();
+    let mut loaded = NvsrvState::new();
+    loaded.load_state(&bytes).unwrap();
+    assert_eq!(loaded, bench.state);
 }
 
 /// A channel with each of the fields set, from a bench, as saved.
@@ -1957,20 +2016,37 @@ fn three_waiting() -> (Live, ChannelId, ChannelId) {
 }
 
 /// The waiting table's saved layout: the header, the count, then each submission in channel
-/// order, oldest first: channel, token id, entries, wait fence, increments, wait-for-idle.
+/// order, oldest first: channel, token id (an option: none once its request's session closed),
+/// entries, wait fence, increments, wait-for-idle.
 #[test]
 fn the_snapshot_layout_is_pinned() {
-    let (live, first, second) = three_waiting();
+    let (mut live, first, second) = three_waiting();
     assert_eq!((first, second), (ChannelId(0x30), ChannelId(0x31)));
-    let bytes = live.rig.shared.lock().submits().save().unwrap();
+    // Token 3's session closes: its submission is saved without a token.
+    let (_, closed) = live
+        .rig
+        .server
+        .pending()
+        .find(|&(id, _)| id == token(3))
+        .unwrap();
+    live.rig.server.close(closed).unwrap();
+    let bytes = live
+        .rig
+        .shared
+        .lock()
+        .submits()
+        .save(&live.rig.server)
+        .unwrap();
     let mut expected = b"SQSB".to_vec();
     expected.extend([1, 3]);
-    // Channel 0x30, token 1, one entry 0x11, waits on (0x21, 0x22), 2 increments, wait for idle.
-    expected.extend([0x30, 1, 1, 0x11, 1, 0x21, 0x22, 2, 1]);
-    // Channel 0x30, token 3, one entry 0x14, no wait, no increments, wait for idle.
-    expected.extend([0x30, 3, 1, 0x14, 0, 0, 1]);
-    // Channel 0x31, token 2, entries 0x12 and 0x13, no wait, 0x23 increments, no wait for idle.
-    expected.extend([0x31, 2, 2, 0x12, 0x13, 0, 0x23, 0]);
+    // Channel 0x30, token some 1, one entry 0x11, waits on (0x21, 0x22), 2 increments, wait for
+    // idle.
+    expected.extend([0x30, 1, 1, 1, 0x11, 1, 0x21, 0x22, 2, 1]);
+    // Channel 0x30, no token, one entry 0x14, no wait, no increments, wait for idle.
+    expected.extend([0x30, 0, 1, 0x14, 0, 0, 1]);
+    // Channel 0x31, token some 2, entries 0x12 and 0x13, no wait, 0x23 increments, no wait for
+    // idle.
+    expected.extend([0x31, 1, 2, 2, 0x12, 0x13, 0, 0x23, 0]);
     assert_eq!(bytes, expected);
 }
 
@@ -1980,7 +2056,13 @@ fn the_snapshot_layout_is_pinned() {
 #[test]
 fn a_saved_waiting_table_restores_and_carries_on() {
     let (mut live, first, second) = three_waiting();
-    let table = live.rig.shared.lock().submits().save().unwrap();
+    let table = live
+        .rig
+        .shared
+        .lock()
+        .submits()
+        .save(&live.rig.server)
+        .unwrap();
     let server = live.rig.server.save().unwrap();
     let mut pending: Vec<(TokenId, ObjectId)> = live.rig.server.pending().collect();
     pending.sort();
@@ -2000,7 +2082,7 @@ fn a_saved_waiting_table_restores_and_carries_on() {
     let front = channel_front(&live.fake);
     let submits = Submits::restore(&table, &restored, &front).unwrap();
     assert_eq!(&submits, live.rig.shared.lock().submits());
-    assert_eq!(submits.save().unwrap(), table);
+    assert_eq!(submits.save(&restored).unwrap(), table);
     live.rig.server = restored;
     *live.rig.shared.lock().submits() = submits;
     // Nothing went to the front on the restore.
@@ -2035,7 +2117,7 @@ fn a_saved_waiting_table_restores_and_carries_on() {
 fn waiting_entry(channel: u32, id: u8) -> SavedSubmit {
     SavedSubmit {
         channel,
-        token: token(id),
+        token: Some(token(id)),
         entries: vec![1],
         wait: None,
         increments: 0,
@@ -2123,7 +2205,25 @@ fn refused_tables() -> Vec<(Vec<u8>, SnapshotError)> {
             snapshot_of(&[entry(0x31, 2), entry(0x30, 5)]),
             SnapshotError::Misordered { index: 1 },
         ),
+        // An entry without a token: its channel is still ordered, and it does not reset the
+        // last token id of its channel.
+        (
+            snapshot_of(&[entry(0x31, 2), tokenless(0x30)]),
+            SnapshotError::Misordered { index: 1 },
+        ),
+        (
+            snapshot_of(&[entry(0x30, 3), tokenless(0x30), entry(0x30, 1)]),
+            SnapshotError::Misordered { index: 2 },
+        ),
     ]
+}
+
+/// A waiting submission on `channel` without a token, one entry, no wait.
+fn tokenless(channel: u32) -> SavedSubmit {
+    SavedSubmit {
+        token: None,
+        ..waiting_entry(channel, 0)
+    }
 }
 
 /// Each snapshot `Submits::restore` refuses, with its error; a refused restore leaves the
@@ -2160,6 +2260,16 @@ fn a_waiting_table_no_run_reaches_is_refused() {
             entries: vec![1; CHANNEL_QUEUE_ENTRIES],
             ..waiting_entry(0x30, 1)
         }],
+        // Entries without a token before, between and after the others, several in a channel.
+        vec![
+            tokenless(0x30),
+            waiting_entry(0x30, 1),
+            tokenless(0x30),
+            waiting_entry(0x30, 3),
+            tokenless(0x30),
+            tokenless(0x31),
+            waiting_entry(0x31, 2),
+        ],
     ];
     for edge in edges {
         let restored = Submits::restore(&snapshot_of(&edge), &live.rig.server, &front);
@@ -2219,4 +2329,336 @@ fn room_is_recorded_whether_or_not_anything_waits() {
     let note = crate::note::Note::QueueRoom { channel };
     assert_eq!(recorded, [note.event(live.rig.server.service_id())]);
     assert_eq!(live.deliver(), []);
+}
+
+// ----- Submissions without a reply token ---------------------------------------------------------
+
+/// Where a test puts an out buffer that is not mapped: below the first address the rig places
+/// anything at.
+const UNMAPPED_OUT: u64 = 0x0F00_0000;
+
+/// The increments the fake front was given for `channel`, in all.
+fn increments_queued(live: &Live, channel: ChannelId) -> u32 {
+    live.fake
+        .queued()
+        .into_iter()
+        .filter(|&(queued, _)| queued == channel)
+        .map(|(_, submission)| submission.increments)
+        .sum()
+}
+
+/// A submission that must wait, whose out buffer cannot be written: the request answers the
+/// fault, but the syncpoint's maximum was raised, so the submission waits all the same, without
+/// a token. A later submission on the channel waits behind it, and once room comes the front is
+/// given both, so the later fence is reached.
+#[test]
+fn a_waiting_submission_with_an_unwritable_out_buffer_still_counts() {
+    let mut live = Live::new();
+    let fd = live.channel();
+    let channel = live.made(fd);
+    live.fake.hold(channel, CHANNEL_QUEUE_ENTRIES);
+    let first = live.rig.session();
+    let (handled, buffer, _) = live.submit_out(
+        first,
+        fd,
+        &entries_from(1, 1),
+        FENCE_INCREMENT,
+        (0, 0),
+        UNMAPPED_OUT,
+    );
+    assert_eq!(handled, Handled::Replied);
+    assert_ne!(answer(&buffer, 0).result, ResultCode::SUCCESS.raw());
+    assert_eq!(live.waiting(channel), 1);
+    assert_eq!(live.rig.server.pending().count(), 0);
+    // A later submission waits behind it, with the fence that counts both.
+    let second = live.session();
+    let (handled, _, out_at) =
+        live.submit_with(second, fd, &entries_from(2, 1), FENCE_INCREMENT, (0, 0));
+    assert!(matches!(handled, Handled::Deferred(_)));
+    let id = u32::from(FIRST_ALLOCATABLE);
+    let fence = 2 * FENCE_INCREMENT_AMOUNT;
+    assert_eq!(live.rig.memory(out_at, 24), submit_struct(1, 0, id, fence));
+    // Room: both are queued, the later one's reply alone completes, and the increments the front
+    // was given reach the later fence.
+    live.fake.hold(channel, 0);
+    live.room(channel);
+    assert_eq!(live.deliver(), [(second, ok(&[NvResult::Success.raw()]))]);
+    assert_eq!(live.waiting(channel), 0);
+    assert_eq!(increments_queued(&live, channel), fence);
+}
+
+/// A waiting submission whose session closes is saved without a token, and the table restores
+/// with the server: the save passes the checks the restore makes. The restored submission is
+/// still given to the front, and no reply is completed for it.
+#[test]
+fn a_closed_session_s_waiting_submission_saves_and_restores() {
+    let mut live = Live::new();
+    let fd = live.channel();
+    let channel = live.made(fd);
+    live.fake.hold(channel, CHANNEL_QUEUE_ENTRIES);
+    let session = live.session();
+    let (handled, _, _) = live.submit_on(session, fd, &entries_from(1, 1), FENCE_INCREMENT);
+    assert!(matches!(handled, Handled::Deferred(_)));
+    live.rig.server.close(session).unwrap();
+    assert_eq!(live.rig.server.pending().count(), 0);
+    let table = live
+        .rig
+        .shared
+        .lock()
+        .submits()
+        .save(&live.rig.server)
+        .unwrap();
+    let server = live.rig.server.save().unwrap();
+
+    let family = NvsrvFamily::new(Arc::clone(&live.rig.shared), as_front(&live.rig.front))
+        .with_channel_front(channel_front(&live.fake));
+    let mut restored = nvsrv_server(
+        Arc::clone(&live.rig.shared),
+        as_front(&live.rig.front),
+        UnknownPolicy::Strict,
+    )
+    .with_family(family)
+    .with_service_id(live.rig.server.service_id());
+    restored.restore(&server).unwrap();
+    let front = channel_front(&live.fake);
+    let submits = Submits::restore(&table, &restored, &front).unwrap();
+    assert_eq!(submits.waiting(channel), 1);
+    assert_eq!(submits.tokens(channel).count(), 0);
+    live.rig.server = restored;
+    *live.rig.shared.lock().submits() = submits;
+    live.fake.clear();
+    live.fake.hold(channel, 0);
+    live.rig.shared.lock().submits().retry_all();
+    assert_eq!(increments_queued(&live, channel), FENCE_INCREMENT_AMOUNT);
+    assert_eq!(live.deliver(), []);
+    assert!(live.rig.shared.lock().submits().is_empty());
+}
+
+/// The gap `submits`' module docs state ("What bounds the table: nothing yet"): while the queue
+/// stays full, each session that submits and closes leaves a submission waiting with no request
+/// pending.
+#[test]
+fn abandoned_submissions_are_not_bounded_yet() {
+    let mut live = Live::new();
+    let fd = live.channel();
+    let channel = live.made(fd);
+    live.fake.hold(channel, CHANNEL_QUEUE_ENTRIES);
+    let rounds = 3;
+    for round in 0..rounds {
+        let session = live.session();
+        let first = u64::try_from(round).unwrap();
+        live.submit_on(session, fd, &entries_from(first, 1), 0);
+        live.rig.server.close(session).unwrap();
+    }
+    assert_eq!(live.waiting(channel), rounds);
+    assert_eq!(live.rig.server.pending().count(), 0);
+}
+
+// ----- The order of a channel fd's close -------------------------------------------------------
+
+/// One call to either front, in one log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Logged {
+    DestroyChannel(ChannelId),
+    Update(AsId),
+}
+
+/// A VM front and a channel front that log into one list.
+#[derive(Clone, Default)]
+struct OneLog(Arc<Mutex<Vec<Logged>>>);
+
+impl crate::gpu::GpuVmFront for OneLog {
+    fn create_address_space(&self, _: AsId, _: Arc<starquake_gpu::vm::GpuVm>) {}
+
+    fn update_vm(
+        &self,
+        space: AsId,
+        _: starquake_gpu::interface::VmUpdate,
+        _: Option<starquake_gpu::interface::Ticket>,
+    ) {
+        self.0.lock().unwrap().push(Logged::Update(space));
+    }
+
+    fn barrier(&self, _: starquake_gpu::interface::Ticket) {}
+}
+
+impl ChannelFront for OneLog {
+    fn create_channel(&self, _: ChannelConfig) -> Result<ChannelId, GpuError> {
+        Err(GpuError)
+    }
+
+    fn bind_class(&self, _: ChannelId, _: u32) -> Result<(), GpuError> {
+        Err(GpuError)
+    }
+
+    fn submit(&self, _: ChannelId, _: Submission) -> Submitted {
+        Submitted::Full
+    }
+
+    fn destroy_channel(&self, channel: ChannelId) {
+        self.0.lock().unwrap().push(Logged::DestroyChannel(channel));
+    }
+}
+
+/// Closing a channel fd whose binding is the last holder of its space destroys the GPU channel
+/// before the space (`NvsrvState::close`): the space has a sparse region, so its destroy sends
+/// the VM front an update, and both fronts log into one list.
+#[test]
+fn closing_a_channel_destroys_it_before_the_space_it_held() {
+    let mut bench = Bench::new();
+    let (fd, as_fd, _, made) = bench.channel();
+    let space = bench.state.as_gpu().bound(fd.cast_unsigned()).unwrap();
+    let device = bench
+        .memory
+        .create_device(crate::gpu::memory::Device { name: 1, label: 2 })
+        .unwrap();
+    let start = crate::gpu::memory::VA_WINDOW_START;
+    let region = crate::gpu::memory::SparseRequest {
+        space,
+        first: start,
+        last: start + starquake_memory::PAGE_SIZE - 1,
+        page_shift: crate::gpu::memory::SMALL_PAGE_SHIFT,
+        mode: 0,
+        device,
+        sync: 0,
+    };
+    bench.memory.create_sparse_region(&region).unwrap();
+    assert_eq!(bench.close(as_fd), NvResult::Success);
+    assert!(bench.memory.table(space).is_some());
+
+    let log = OneLog::default();
+    let channels: Arc<dyn ChannelFront> = Arc::new(log.clone());
+    let mut deferred = None;
+    let gpu = GpuAccess {
+        memory: &mut bench.memory,
+        front: &log,
+        channels: Some(ChannelAccess {
+            submits: &mut bench.submits,
+            syncpoints: &bench.syncpoints,
+            front: &channels,
+            deferred: &mut deferred,
+        }),
+    };
+    assert_eq!(bench.state.close(fd, gpu), NvResult::Success);
+    assert!(bench.memory.table(space).is_none());
+    let logged = log.0.lock().unwrap().clone();
+    assert_eq!(logged.first(), Some(&Logged::DestroyChannel(made)));
+    assert!(logged.len() > 1, "{logged:?}");
+    assert!(
+        logged[1..]
+            .iter()
+            .all(|&call| call == Logged::Update(space)),
+        "{logged:?}"
+    );
+}
+
+// ----- What a whole queue's inline submission reads --------------------------------------------
+
+/// `SubmitGPFIFO` 0x1B with exactly [`CHANNEL_QUEUE_ENTRIES`] entries inline, through the
+/// server: the inline input is read up to [`MAX_ENTRY_BYTES`], so every entry reaches the front.
+/// The descriptors are written by hand, as the buffer is longer than a 16-bit length.
+#[test]
+fn an_inline_submission_of_a_whole_queue_is_read_whole() {
+    let mut live = Live::new();
+    let fd = live.channel();
+    let channel = live.made(fd);
+    let entries = entries_from(1, CHANNEL_QUEUE_ENTRIES);
+    let count = u32::try_from(CHANNEL_QUEUE_ENTRIES).unwrap();
+    let input = submit_struct(count, 0, 0, 0);
+    let inline = entry_bytes(&entries);
+    assert_eq!(inline.len(), MAX_ENTRY_BYTES);
+    let input_at = live.rig.place(&input);
+    let inline_at = live.rig.place(&inline);
+    let out_at = live.rig.place(&[STALE; 24]);
+    let request = cmif(IOCTL2, &fd_and(fd, KICKOFF));
+    let request = Auto::alias(input_at, len16(input.len())).send(request, 0);
+    let request = request
+        .send_buffer(starquake_ipc::BufferDescriptor {
+            address: inline_at,
+            size: u64::try_from(inline.len()).unwrap(),
+            flags: 0,
+        })
+        .static_descriptor(starquake_ipc::StaticDescriptor {
+            counter: 1,
+            address: 0,
+            size: 0,
+        });
+    let request = Auto::alias(out_at, 24).receive(request);
+    let reply = answer(&live.rig.send(&request), 1);
+    assert_eq!(reply, ok(&[NvResult::Success.raw()]));
+    let queued = live.fake.queued();
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].0, channel);
+    let sent: Vec<GpfifoEntry> = entries.into_iter().map(GpfifoEntry).collect();
+    assert_eq!(queued[0].1.entries, sent);
+}
+
+// ----- A binding alone holds its space through a restore ---------------------------------------
+
+/// A channel's binding is the only holder of its space once the space's last view closes; the
+/// saved server restores (as-gpu's restore counts a binding as a holder), and the space is still
+/// made.
+#[test]
+fn a_space_held_only_by_a_binding_restores() {
+    let mut live = Live::new();
+    let as_fd = live.rig.open_device(Device::NvhostAsGpu);
+    let (reply, _) = live.rig.ioctl(as_fd, AS_ALLOC_AS_EX, &as_request(), 40);
+    assert_eq!(reply, ok(&[0]));
+    let fd = live.rig.open_device(Device::NvhostGpu);
+    let (reply, _) = live.rig.ioctl(as_fd, AS_BIND_CHANNEL, &fd.to_le_bytes(), 4);
+    assert_eq!(reply, ok(&[0]));
+    let space = live.rig.state().as_gpu().bound(fd.cast_unsigned()).unwrap();
+    let reply = answer(&live.rig.send(&cmif(CLOSE, &as_fd.to_le_bytes())), 1);
+    assert_eq!(reply, ok(&[0]));
+    assert!(live.rig.state().as_gpu().made(space).is_some());
+    let state = live.rig.state().clone();
+    let saved = live.rig.server.save().unwrap();
+
+    let family = NvsrvFamily::new(Arc::clone(&live.rig.shared), as_front(&live.rig.front))
+        .with_channel_front(channel_front(&live.fake));
+    let mut restored = nvsrv_server(
+        Arc::clone(&live.rig.shared),
+        as_front(&live.rig.front),
+        UnknownPolicy::Strict,
+    )
+    .with_family(family)
+    .with_service_id(live.rig.server.service_id());
+    restored.restore(&saved).unwrap();
+    live.rig.server = restored;
+    assert_eq!(live.rig.state(), &state);
+    assert!(live.rig.state().as_gpu().made(space).is_some());
+}
+
+// ----- A channel's events across closes --------------------------------------------------------
+
+/// The divergence in the module docs: closing a channel fd drops its event ids but frees no
+/// kernel event, so two cycles of open, `QueryEvent` 1, 2 and 3, and close make six distinct
+/// events, each still held by the kernel.
+#[test]
+fn a_closed_channel_s_events_are_not_freed() {
+    let mut live = Live::new();
+    let mut made = Vec::new();
+    for _ in 0..2 {
+        let fd = live.rig.open_device(Device::NvhostGpu);
+        for id in [
+            event::SM_EXCEPTION_INT,
+            event::SM_EXCEPTION_PAUSE,
+            event::ERROR_NOTIFIER,
+        ] {
+            let mut data = fd.to_le_bytes().to_vec();
+            data.extend(id.to_le_bytes());
+            let reply = answer(&live.rig.send(&cmif(QUERY_EVENT, &data)), 1);
+            assert_eq!(reply, ok(&[NvResult::Success.raw()]));
+        }
+        let channel = live.rig.state().gpu().channel(fd.cast_unsigned()).unwrap();
+        made.extend(channel.events.iter().map(|event| event.unwrap()));
+        let reply = answer(&live.rig.send(&cmif(CLOSE, &fd.to_le_bytes())), 1);
+        assert_eq!(reply, ok(&[0]));
+        assert_eq!(live.rig.state().gpu().channel(fd.cast_unsigned()), None);
+    }
+    let distinct: std::collections::BTreeSet<_> = made.iter().collect();
+    assert_eq!(distinct.len(), 2 * EVENT_SLOTS);
+    for event in made {
+        assert_eq!(live.rig.kernel.signals(event), Some(0), "{event:?}");
+    }
 }

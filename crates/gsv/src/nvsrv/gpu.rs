@@ -40,7 +40,8 @@
 //!   address space is available"); destroyed when the fd closes;
 //! - its **object classes** (`AllocObjCtx`), one per engine slot, each given to the GPU channel
 //!   as it is bound, or in the order bound when the GPU channel is made;
-//! - its **events** for `QueryEvent`.
+//! - its **events** for `QueryEvent`: the ids go when the fd closes, but the kernel events they
+//!   name are not freed (see "Where this differs").
 //!
 //! # The ioctls
 //!
@@ -107,6 +108,12 @@
 //! each one queued, until the front answers `Full` again. Entries reach the front in the order
 //! the submissions came, whether they waited or not.
 //!
+//! The syncpoint's maximum is raised before the reply is written, so a submission that must wait
+//! waits even if its out buffer cannot be written or no reply token can be taken: the request
+//! answers that fault, and the submission waits with no token, its fence still reached once it
+//! is queued (`a_waiting_submission_with_an_unwritable_out_buffer_still_counts`;
+//! [`submits`], "A submission without a token").
+//!
 //! # Events
 //!
 //! `QueryEvent` on an nvhost-gpu fd answers ids 1 (SM exception breakpoint interrupt), 2 (SM
@@ -119,9 +126,9 @@
 //!
 //! # Conflicts
 //!
-//! Each is picked by the house rule of decision 8 and pinned by the test named, in
-//! `gpu/tests.rs`. The spec's verification item 1 does not list them yet; the open question
-//! with each settles it.
+//! Each is picked by the house rule of decision 8 ("where one answer contains the other, the
+//! larger"), except the event ids, and pinned by the test named, in `gpu/tests.rs`. The spec's
+//! verification item 1 does not list them yet; the open question with each settles it.
 //!
 //! - **The class `AllocObjCtx` gives back.** NX2 gives back the Maxwell class it mapped onto
 //!   (`params.class_num = mapped`); PR gives back the class as sent. NX2's is used, the one a
@@ -130,11 +137,18 @@
 //! - **Which classes `AllocObjCtx` takes.** PR takes C797, C7C0, C7B5 and C56F; NX2 also the
 //!   Turing and Volta classes, C76F and class 0. NX2's, the larger
 //!   (`every_mapped_class_is_taken_and_others_refused`).
-//! - **Event ids.** NX2 makes an event for every id it is asked; PR answers 1, 2, 3 and 7. PR's,
-//!   because NX2's grows without bound with the ids a title sends (a listed divergence too).
-//!   Open question: does NvRm ask for any id besides 7? (`events_1_2_3_and_7_are_answered`.)
-//! - **Increments past 64.** PR refuses a native submission whose bit-8 value is above 64; NX2
-//!   takes any. NX2's, the larger (`a_large_increment_value_is_taken`).
+//! - **Event ids.** NX2 makes an event for every id it is asked (`QueryEvent`'s `default:`
+//!   with `g_nx2_driver`); PR answers 1, 2, 3 and 7. NX2's answer contains PR's, so decision 8's
+//!   rule picks NX2's; this **departs from decision 8** and takes PR's, because NX2's makes a
+//!   new kernel event for each new id a title sends, without bound. A listed divergence too.
+//!   Open questions for the owner: is the departure accepted, and does NvRm ask for any id
+//!   besides 7? (`events_1_2_3_and_7_are_answered`.)
+//! - **Increments past 64.** PR refuses a submission (`BadParameter`) when its ABI is the native
+//!   one, flag bit 8 is set and bit 1 is clear, and the fence value is above 64
+//!   (`SubmitGPFIFOImpl`: `native_completion = UsesNativeAbi() && increment_value &&
+//!   !fence_increment ? value : 0; if (native_completion > 64)`); with bit 1 set, or bit 8
+//!   clear, it has no limit. NX2 takes any value. NX2's, the larger
+//!   (`a_large_increment_value_is_taken`).
 //!
 //! # Where this differs from the references
 //!
@@ -154,6 +168,7 @@
 //! | The out buffer of a submission that waits | written when the ioctl returns | written at once, before the reply (`a_waiting_submission_writes_its_fence_at_once`) |
 //! | Closing a channel whose submissions wait | not possible: Eden never waits | each waiting reply answers `NotImplemented`, as a request on a closed fd does; the out buffer keeps the fence (`closing_a_channel_answers_its_waiting_submissions`) |
 //! | `QueryEvent` with any other id | NX2: a new event | `BadParameter` (`events_1_2_3_and_7_are_answered`) |
+//! | The channel's kernel events when its fd closes | freed (`~nvhost_gpu`: `events_interface.FreeEvent` of each) | not freed: each open, `QueryEvent` 1, 2 and 3, close leaves three kernel events the server made, with no bound over the run (`a_closed_channel_s_events_are_not_freed`) |
 //! | `SubmitGPFIFO` 0x1B on `Ioctl` (entries read from the guest's memory at the struct's address) | served | not served: the unknown-ioctl policy (`submissions_from_memory_go_to_the_policy`) |
 //!
 //! # What is recorded and what is saved
@@ -161,8 +176,14 @@
 //! Every request is one IPC event, recorded by the service framework with its payload (the
 //! entries included: spec, "Submitted GPFIFO entries are part of the IPC payload"); a waiting
 //! reply is recorded when it is delivered. The front's `GpuQueueRoom` comes back as a
-//! `QueueRoom` note the drain records before it acts on it, so what waits and what is queued is
-//! a function of the recorded requests and notes in their order.
+//! `QueueRoom` note the drain records before it acts on it.
+//!
+//! What is **not** recorded: the front's [`Submitted::Full`]. Whether a submission waits is
+//! decided at ioctl time by the front's answer, which depends on how far the GPU got, host
+//! timing that no note records (the spec has a `QueueRoom` note, none for `Full`). So a replay
+//! that drives a real front can defer a different set of submissions than the run did: the
+//! recorded requests and notes alone do not fix what waits. Closing this gap needs a note for `Full` or a replay front that answers from
+//! the record: a question for the spec.
 //!
 //! The channels ([`NvhostGpu`]) are plain data saved with the nvsrv state: per fd the syncpoint,
 //! the GPU channel and the space it was made in, the classes and the events, checked on restore
