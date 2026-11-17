@@ -53,5 +53,9 @@ pub use shared::{
     SharedMemory, SharedPages, TransferMemory, is_shared_memory_permission,
     is_transfer_memory_permission, shared_memory_size,
 };
+pub use space::snapshot::{
+    ADDRESS_SPACE_MAGIC, ADDRESS_SPACE_VERSION, ARRANGEMENT_TAGS, BlockFault, LockFault,
+    SharedFault, SnapshotError,
+};
 pub use space::{AddressSpace, CreateError, DeviceShareToken, GUARD_PAGES, ProcessMemory};
 pub use state::{MemoryAttribute, MemoryPermission, MemoryState, SvcPermission};

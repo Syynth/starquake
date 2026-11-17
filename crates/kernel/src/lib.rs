@@ -21,6 +21,7 @@ pub mod process;
 pub mod result;
 pub mod sched;
 pub mod slab;
+pub mod snapshot;
 pub mod svc;
 pub mod sync;
 pub mod tables;
