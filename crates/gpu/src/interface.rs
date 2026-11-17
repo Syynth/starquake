@@ -7,11 +7,13 @@
 //!
 //! This module holds the ones that exist so far: [`ChannelId`], [`SyncpointId`] and
 //! [`SYNCPOINT_COUNT`], the present's [`PresentRequest`] with its [`ImageDesc`], [`LayerId`]
-//! and [`DisplayId`], and graphics-server slice 2's [`Fence`], [`Ticket`], [`GpuCompletion`] and
-//! [`Completions`]. The block's `Syncpoints` has behaviour, not only a shape, so it lives in
-//! [`crate::syncpoint`] with the comparisons and the allocation it ports. The rest of the block
-//! (`Submission`, `GpuFront`, ...) belongs here too when its slice lands.
+//! and [`DisplayId`], graphics-server slice 2's [`Fence`], [`Ticket`], [`GpuCompletion`] and
+//! [`Completions`], and slice 6's [`Target`], [`RegionId`], [`Kind`] and [`VmUpdate`]. The
+//! block's `Syncpoints` and `GpuVm` have behaviour, not only a shape, so they live in
+//! [`crate::syncpoint`] and [`crate::vm`]. The rest of the block (`Submission`, `GpuFront`, ...)
+//! belongs here too when its slice lands.
 
+use starquake_memory::PageRange;
 use starquake_render::command::Rect;
 
 /// A GPU channel, as gsv created it (`GpuFront::create_channel`).
@@ -87,6 +89,101 @@ pub enum GpuCompletion {
 pub trait Completions: Send + Sync {
     /// Queues `completion`.
     fn push(&self, completion: GpuCompletion);
+}
+
+/// A sparse region (gsv 214, `CreateSparseRegion`), as gsv names it. Not a protocol fact: the
+/// guest names a region by its range, and gsv hands these ids out and only compares them, so the
+/// width is this crate's choice (as for [`Ticket`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RegionId(pub u32);
+
+/// A GPU page-table kind (the PTE kind) as the GPU reads it: one byte, the kind a mapping's pages
+/// are translated with.
+///
+/// PR's `SelectNativeMemoryKind`
+/// (`eden-pr4588/src/core/hle/service/nvdrv/devices/native_gpu_kind.h` @ e5fb3b97) turns the
+/// guest's requested and fallback kinds (gsv 211, words 12 and 13; gsv 212, words 7 and 8) into
+/// two bytes, `NativeMemoryKind { backend, selected }`: `backend` is the translated PTE kind PR
+/// passes to `gmmu->Map` (`MapNative4K` and `ModifyKind` in
+/// `eden-pr4588/src/core/hle/service/nvdrv/devices/nvhost_as_gpu.cpp`, `NormalMapGpuMemory4K`
+/// in `eden-pr4588/src/core/hle/service/am/service/gpu_session.cpp`, both @ e5fb3b97), and
+/// `selected` is the requested byte sent back in the 211 and 212 reply. **A `Kind` is the
+/// `backend` byte**: it is what [`crate::vm::GpuVm`] stores and what a translation gives the GPU.
+/// The `selected` byte is the reply's, which gsv computes and sends (slice 7) and never reaches
+/// this crate. NX2's 212 handler takes `w[7] & 0xff`
+/// (`eden-nx2/src/core/hle/service/nx2_gsv.h` @ 50fa86bb, `SubModifyKind`) and keeps no kind.
+/// The address table only stores the byte; what each value means is the GPU's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Kind(pub u8);
+
+/// Where a mapped GPU range leads (graphics-server, "The model"). In a [`crate::vm::GpuVm`] each
+/// mapping has one target, which names its *first* page; a page further in leads as far further
+/// in (see [`crate::vm::Translation`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Target {
+    /// Memory the title owns, read through `GuestMemory` at this CPU address (a 101
+    /// registration at its own address, or a 211 map of part of one).
+    Guest {
+        /// The CPU address.
+        cpu_va: u64,
+    },
+    /// GPU-only memory: `offset` bytes into sparse region `region`, backed on the host by this
+    /// crate (graphics-server decision 4).
+    GpuOnly {
+        /// The sparse region.
+        region: RegionId,
+        /// The byte offset into it.
+        offset: u64,
+    },
+    /// The read-only page through which GPU reads return syncpoint values (row 46 of
+    /// `eden-nx2/NX2_NOTES.md`; nvhost-as-gpu ioctl 0xB reports where it is).
+    SyncpointShim,
+}
+
+/// A change to a [`crate::vm::GpuVm`] that the GPU applies only once no work queued before it can
+/// still use the old mapping (`GpuFront::update_vm`; graphics-server, "How mappings reach the
+/// GPU"). Each carries its GPU range.
+///
+/// The three removals do the same to the table; they are told apart because the GPU does more for
+/// some (a sparse-region destroy frees that region's host storage, gpu-protocol slice G22).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum VmUpdate {
+    /// gsv 213, `NormalUnmapGpuMemory4K`.
+    Unmap {
+        /// The GPU range.
+        range: PageRange,
+    },
+    /// gsv 212, `NormalModifyMemoryKind4K`: the mapped pages of `range` take `kind`.
+    ModifyKind {
+        /// The GPU range.
+        range: PageRange,
+        /// The kind applied.
+        kind: Kind,
+    },
+    /// gsv 102, `DestroyGpuAccessibleMemory`: the registration's range at its own address.
+    DestroyMemory {
+        /// The GPU range.
+        range: PageRange,
+    },
+    /// gsv 215, `DestroySparseRegion`.
+    DestroySparseRegion {
+        /// The GPU range.
+        range: PageRange,
+        /// The region destroyed.
+        region: RegionId,
+    },
+}
+
+impl VmUpdate {
+    /// The GPU range the update applies to.
+    pub const fn range(&self) -> PageRange {
+        match *self {
+            Self::Unmap { range }
+            | Self::ModifyKind { range, .. }
+            | Self::DestroyMemory { range }
+            | Self::DestroySparseRegion { range, .. } => range,
+        }
+    }
 }
 
 /// A vi2 layer. A **guess** at the width: `nn::vi` layer ids are 64-bit; graphics-server names
