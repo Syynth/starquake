@@ -456,10 +456,10 @@ const DEFER: ServiceId = ServiceId(0x77);
 /// What its replies are made of.
 const REPLY_FILL: u8 = 0x5D;
 
-fn install_deferring(dispatcher: &Dispatcher, _: Arc<dyn Env>, ready: Ready) -> Result<(), String> {
+fn install_deferring(dispatcher: &Dispatcher, given: Given) -> Result<(), String> {
     let server = Arc::new(Mutex::new(None));
     let handler = Deferring {
-        ready,
+        ready: given.ready,
         server: Arc::clone(&server),
         waiting: VecDeque::new(),
         fill: REPLY_FILL,

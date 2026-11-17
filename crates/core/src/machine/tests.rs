@@ -1420,5 +1420,6 @@ fn a_clock_for_another_console_than_the_descriptions_ends_the_run_before_the_gue
     );
 }
 
+mod reads;
 mod six_cores;
 mod stopped;

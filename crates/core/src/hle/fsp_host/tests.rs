@@ -15,9 +15,9 @@ use super::*;
 use crate::hle::tests::Scratch;
 
 /// A source over a container's bytes that can be made to fail every read.
-struct Source {
+pub(crate) struct Source {
     bytes: Vec<u8>,
-    failing: AtomicBool,
+    pub(crate) failing: AtomicBool,
 }
 
 impl ReadAt for Source {
@@ -34,7 +34,7 @@ impl ReadAt for Source {
 }
 
 /// A title RomFS holding one file, and the source it reads from.
-fn romfs() -> (RomFs, Arc<Source>) {
+pub(crate) fn romfs() -> (RomFs, Arc<Source>) {
     let tree = Tree::new()
         .with_file(
             &format!("{ROMFS_DIR_NAME}/data.bin"),

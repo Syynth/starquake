@@ -175,7 +175,10 @@ pub(super) fn deliver<V: Vcpu, C: HostClock + Clone>(
             .deliver_replies(server, &mut caller)
             .map_err(|error| Ending::Failed(format!("a reply could not be delivered: {error}")))?;
     }
+    // PROVISIONAL: nothing keeps the environments' recordings (`machine` module docs). Every
+    // read `fsp-srv`'s workers finish rings this turn, so what they read is dropped here.
     drop(machine.env.take_recording());
+    drop(machine.reads.take_recording());
     machine
         .dispatcher
         .reschedule(&mut machine.signals())

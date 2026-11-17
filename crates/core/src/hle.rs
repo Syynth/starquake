@@ -30,19 +30,29 @@
 //! card is the folder the run's configuration names, which [`HostFolder`] serves on the
 //! environment's host I/O channel, and the data storage is the run's title's RomFS; [`FspHost`]
 //! serves both. A run that names no folder has no SD card, and one with no title RomFS no data
-//! storage. PROVISIONAL: the server
-//! has no executor, so `Read` answers the framework's `NOT_SUPPORTED`. A read defers its reply;
-//! the core loop delivers deferred replies a service says are ready (`crate::machine`,
-//! "Deferred replies"), and an executor that says so when its job is done is not built yet.
+//! storage.
+//!
+//! # Reads
+//!
+//! `IFile::Read` and `IStorage::Read` defer their reply and hand the read to `fsp-srv`'s
+//! executor ([`Reads::executor`]): in a run, `fsp-srv`'s workers
+//! (`starquake_services::fsp::worker::Workers`), whose jobs read the title's RomFS through the
+//! loader's positional source behind [`FspHost`], on an environment of their own. When a job
+//! is finished, its completion reaches the `fsp-srv` server's mailbox, and the server's
+//! notification tells [`Reads::ready`] the server's number in the kernel; the core loop then
+//! delivers the reply (`crate::machine`, "Deferred replies"). What is recorded, and how a
+//! replay delivers the reads in the recorded order, is the worker module's
+//! (`starquake_services::fsp::worker`, "What is recorded").
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use starquake_gsv::root;
 use starquake_kernel::dispatch::Dispatcher;
+use starquake_kernel::id::ServerId;
 use starquake_kernel::ipc::{IpcError, PortName, PortNameError};
 use starquake_services::am::{self, Applet, AppletSettings};
 use starquake_services::apm;
-use starquake_services::framework::UnknownPolicy;
+use starquake_services::framework::{Executor, Notify, UnknownPolicy};
 use starquake_services::fsp;
 use starquake_services::hid;
 use starquake_services::set::{self, FirmwareVersion, Settings};
@@ -111,9 +121,49 @@ pub enum ServicesError {
     Registry(#[from] RegistryError),
 }
 
+/// Told when a server has deferred replies ready to deliver: the core loop's, in a run
+/// (`crate::machine`, "Deferred replies"). It is called on the thread that completed a reply
+/// token, with no lock of the services held, and must not block.
+pub trait Deliveries: Send + Sync {
+    /// The deferred replies of the server the kernel numbers `server` are ready.
+    fn ready(&self, server: ServerId);
+}
+
+/// What `fsp-srv`'s reads need from the run (module docs, "Reads").
+#[derive(Clone)]
+pub struct Reads {
+    /// Where the reads run: `fsp-srv`'s workers in a run.
+    pub executor: Arc<dyn Executor>,
+    /// Told when a read's reply is ready.
+    pub ready: Arc<dyn Deliveries>,
+}
+
+/// The notification of a server whose number the kernel gives it only once it has been added:
+/// it passes each completion on to [`Deliveries`] under that number.
+struct Delivering {
+    server: OnceLock<ServerId>,
+    ready: Arc<dyn Deliveries>,
+}
+
+impl Notify for Delivering {
+    fn completion_posted(&self) {
+        match self.server.get() {
+            Some(server) => self.ready.ready(*server),
+            // `install` names the server before it returns, and no request reaches a server
+            // before then.
+            None => tracing::error!("a reply is ready on a server the kernel has not numbered"),
+        }
+    }
+}
+
 /// Puts the run's services in front of `dispatcher`. `env` is the environment the services read
 /// the host through: the run's own, so that what they read is recorded with everything else.
-pub fn install(dispatcher: &Dispatcher, env: Arc<dyn Env>) -> Result<(), ServicesError> {
+/// `reads` is where `fsp-srv`'s reads run, and who is told when one is done.
+pub fn install(
+    dispatcher: &Dispatcher,
+    env: Arc<dyn Env>,
+    reads: Reads,
+) -> Result<(), ServicesError> {
     let policy = UnknownPolicy::AutoStub;
     let mut registry = Registry::new();
     registry.register(ServiceName::new(set::SYS_NAME)?, SET_SYS)?;
@@ -134,8 +184,19 @@ pub fn install(dispatcher: &Dispatcher, env: Arc<dyn Env>) -> Result<(), Service
     let settings = set::sys_server(settings, policy).with_service_id(SET_SYS);
     dispatcher.add_server(set::SYS_NAME, SET_SYS, None, Box::new(settings))?;
 
-    let files = fsp::server(policy, Arc::clone(&env)).with_service_id(FSP_SRV);
-    dispatcher.add_server(fsp::NAME, FSP_SRV, None, Box::new(files))?;
+    let delivering = Arc::new(Delivering {
+        server: OnceLock::new(),
+        ready: reads.ready,
+    });
+    let notify: Arc<dyn Notify> = Arc::<Delivering>::clone(&delivering);
+    let files = fsp::server(policy, Arc::clone(&env))
+        .with_service_id(FSP_SRV)
+        .with_executor(reads.executor)
+        .with_notify(notify);
+    let files = dispatcher.add_server(fsp::NAME, FSP_SRV, None, Box::new(files))?;
+    if delivering.server.set(files).is_err() {
+        tracing::error!("fsp-srv's server was numbered twice");
+    }
 
     let performance = apm::server(policy).with_service_id(APM);
     dispatcher.add_server(apm::NAME, APM, None, Box::new(performance))?;
@@ -157,4 +218,4 @@ pub fn install(dispatcher: &Dispatcher, env: Arc<dyn Env>) -> Result<(), Service
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
