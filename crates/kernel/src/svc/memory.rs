@@ -106,6 +106,11 @@
 //!   Test: `the_destination_must_be_one_the_stack_region_can_hold`.
 //! - **The order of the two wrap checks** is Eden's (destination, then source); Horizon checks
 //!   the source first. Both give `InvalidCurrentMemory`, so no guest can tell them apart.
+//!   The source's wrap check cannot be told apart from the check after it either: a source
+//!   that wraps never lies inside the address space, which is `InvalidCurrentMemory` too. It is
+//!   kept because Eden and Horizon make it; no test can fail without it. The destination's
+//!   is observable (a destination that does not wrap goes on to the stack region's check):
+//!   `neither_range_may_wrap`.
 //!
 //! # Where the two Switch 2 references differ on `SetGpuMemoryAttribute`
 //!
