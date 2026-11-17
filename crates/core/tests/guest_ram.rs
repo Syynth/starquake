@@ -3,7 +3,8 @@
 //! fits its console's application pool with no byte to spare loads and runs; one byte more is
 //! [`Error::OutOfRam`], found before the VM is made (`crates/core/src/system/ram.rs`).
 //!
-//! The programs are synthetic: an NRO of one instruction, which exits, and a container built
+//! The programs are synthetic: an NRO of one instruction, which exits, the same with a counter
+//! read before it (so that the program has counter trampolines), and a container built
 //! around the homebrew hello fixture (`tests/homebrew/hello/`) with its `.bss` made larger,
 //! whose libnx start-up stops at `Break` once the kernel refuses it a heap in the full pool.
 //!
@@ -29,7 +30,7 @@ use starquake_loader::nso::Nso;
 use starquake_loader::nup::PackageKind;
 use starquake_loader::nup::build::{self, Content, EXEFS_DIR_NAME, PackageSpec, Tree};
 use starquake_memory::PAGE_SIZE;
-use starquake_testkit::a64;
+use starquake_testkit::a64::{self, SysReg};
 use starquake_testkit::nro::NroBuilder;
 use starquake_trace::{Dump, EventKind};
 
@@ -159,6 +160,39 @@ fn an_nro_that_fits_its_pool_with_no_byte_to_spare_runs_and_one_byte_more_is_out
 }
 
 #[test]
+fn an_nro_with_a_counter_read_that_fits_its_pool_with_no_byte_to_spare_runs_and_one_byte_more_is_out_of_ram()
+ {
+    // One counter read, which the patcher rewrites to branch to a trampoline below the image,
+    // then `ExitProcess`.
+    let words = [
+        a64::mrs(0, SysReg::CntVctEl0).unwrap(),
+        a64::svc(u32::from(SvcId::ExitProcess.number())).unwrap(),
+    ];
+    let file = |bss: u32| NroBuilder::new(&words).bss_size(bss).build().unwrap();
+    let pool = MemoryArrangement::FourGb.application_pool_size();
+    let stack = ProcessDescription::homebrew(Console::Switch1).main_thread_stack_size;
+    let Some(small) = run(&file(0), GENEROUS) else {
+        return;
+    };
+    assert_exited(&small);
+    // The trampolines' pages are part of what the program needs; measured, since their code
+    // depends on the host's counter rate.
+    let trampolines = mapped(&small, "trampolines");
+    assert_ne!(trampolines, 0);
+    let image = u64::try_from(file(0).len()).unwrap();
+    let needed = trampolines + image.next_multiple_of(PAGE_SIZE) + stack + THREAD_LOCAL_RAM;
+    // `.bss` that leaves nothing to spare once the trampolines are counted.
+    let bss = u32::try_from(pool - needed).unwrap();
+    let fits = run(&file(bss), GENEROUS).unwrap();
+    assert_exited(&fits);
+    assert_eq!(mapped(&fits, "trampolines"), trampolines);
+    assert_eq!(mapped(&fits, "main.bss"), u64::from(bss));
+    // One byte more of `.bss` is one page more.
+    let over = run(&file(bss + 1), GENEROUS).unwrap();
+    assert_out_of_ram(&over, pool + PAGE_SIZE, pool);
+}
+
+#[test]
 fn a_nup_title_that_fits_its_pool_with_no_byte_to_spare_runs_and_one_byte_more_is_out_of_ram() {
     let exefs = ExeFs::parse(&[(NPDM_FILE, NPDM), (MAIN_MODULE, NSO)]).unwrap();
     // The fixture is a Switch 1 program.
@@ -168,8 +202,11 @@ fn a_nup_title_that_fits_its_pool_with_no_byte_to_spare_runs_and_one_byte_more_i
     let code = &exefs.modules[0].code;
     let data_end = code.data.offset + code.data.size;
 
-    // The title as it is, to see how many pages of trampolines its counter reads take on this
-    // host (their code depends on the host's counter rate).
+    // The title as it is, to measure its trampolines rather than assume them. The patcher
+    // makes trampolines only for the counter reads it patches, and the fixture may have none,
+    // in which case this is zero; this test then does not exercise trampolines, and
+    // `an_nro_with_a_counter_read_that_fits_its_pool_with_no_byte_to_spare_runs_and_one_byte_more_is_out_of_ram`
+    // is the one that checks they are counted.
     let Some(plain) = run_title(&title(NSO)) else {
         return;
     };

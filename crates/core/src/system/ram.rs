@@ -20,15 +20,14 @@
 //! | the main thread's thread-local page | [`THREAD_LOCAL_RAM`], one page | `starquake_kernel::process::run` takes the thread's region from a new page (`ThreadLocalPages::reserve`) and writes it |
 //! | working RAM | [`WORKING_RAM`], or what the maximum leaves of it | a guess: see the constant |
 //!
-//! Not counted: the process's system resource (`META` 0x14). Eden makes it a
-//! `KSecureSystemResource` of that size, reserved from the process's resource limit
-//! (`KProcess::Initialize`, `secure_resource->Initialize(kernel, system_resource_num_pages *
-//! PageSize, res_limit, m_memory_pool)`, `eden/src/core/hle/kernel/k_process.cpp` @ cf654052),
-//! for the kernel's own structures for the process. Here nothing is allocated from it: the
-//! translation tables live in the backend's own table pool, outside guest RAM
-//! (`starquake_cpu::hvf`, "Guest-physical memory"), and the kernel's pool accounting does not
-//! charge it either. GPU-only memory is never guest memory (execution model, "Sparse and lazy
-//! memory").
+//! Not counted: the process's system resource (`META` 0x14,
+//! `ProcessDescription::system_resource_size`). Eden makes it a `KSecureSystemResource` of that
+//! size for the kernel's own structures for the process, reserved from the same
+//! `PhysicalMemoryMax` limit as the code and the stack (see "Divergence from Eden" below). Here
+//! nothing is allocated from it: the translation tables live in the backend's own table pool,
+//! outside guest RAM (`starquake_cpu::hvf`, "Guest-physical memory"; the limit that pool sets is
+//! below), and the kernel's pool accounting does not charge it either. GPU-only memory is never
+//! guest memory (execution model, "Sparse and lazy memory").
 //!
 //! # The maximum and the fit check
 //!
@@ -37,7 +36,8 @@
 //! `crate::image::memory_arrangement`): 3285 MiB for a Switch 1 program, 9809 MiB for a
 //! Switch 2 one. A program whose `needed` is above it is [`Error::OutOfRam`], before a VM is
 //! made. A program that fits has RAM for every page loading writes (the trampolines and the
-//! modules' bytes, all inside the counted extent), so loading it does not run out of RAM; a
+//! modules' bytes, all inside the counted extent), so loading it does not run out of RAM (the
+//! tables that map them are another matter: "The table pool", below); a
 //! guest that touches more than its RAM once it runs still ends as an emulator error
 //! (`crate::space`).
 //!
@@ -47,14 +47,41 @@
 //! passes the maximum: both pool sizes are whole 16 KiB pages
 //! (`both_maximums_are_whole_host_pages`).
 //!
-//! Divergence from Eden (stricter): of what is counted here, Eden reserves against the pool the
-//! code (`KProcess::Initialize`, a `KScopedResourceReservation` of `code_size`) and the main
-//! thread's stack (`KProcess::Run`), both in `eden/src/core/hle/kernel/k_process.cpp` @
-//! cf654052. Its thread-local page comes from the kernel's page buffers
-//! (`KPageBuffer::Allocate` in `KThreadLocalPage::Initialize`, `k_thread_local_page.cpp`), and
-//! it has no counter trampolines. So a program whose code and stack fill the pool to within
-//! less than a page (and its trampolines) loads under Eden and is [`Error::OutOfRam`] here.
-//! Test: `code_and_stack_that_fill_the_pool_leave_no_room_for_the_thread_local_page`.
+//! # The table pool: a second limit, not counted
+//!
+//! Guest RAM is not the only memory a program's pages need. The backend maps guest RAM through
+//! translation tables taken from its own table pool (`starquake_cpu::hvf`, `TABLE_POOL_SIZE`),
+//! whose size is fixed (4 MiB, 1024 table pages; by its own doc, enough to map about 2 GiB of
+//! scattered 2 MiB windows) and is not sized with guest RAM, which can now be up to 3285 or
+//! 9809 MiB. The fit check does not count table pages. So a program that fits here, but whose
+//! loaded bytes or the pages it touches need more tables than the pool holds, fails when the
+//! tables run out, on the mapper's error rather than [`Error::OutOfRam`]: while loading, a
+//! module's bytes are written through the guest's mappings and that surfaces as a guest write
+//! fault (`LoadError::Write`), the failure this check exists to rule out; once running, as an
+//! emulator error. PROVISIONAL until the kernel sizes address spaces and the table pool with
+//! them.
+//!
+//! # Divergence from Eden
+//!
+//! Eden reserves against the process's `PhysicalMemoryMax` limit the code
+//! (`KProcess::Initialize`, the overload `LoadFromMetadata` calls: a
+//! `KScopedResourceReservation` of `code_size`), the system resource
+//! (`secure_resource->Initialize(kernel, system_resource_size, res_limit, m_memory_pool)` in
+//! the same function, which reserves `PhysicalMemoryMax`, `secure_size` in
+//! `KSecureSystemResource::Initialize`, `eden/src/core/hle/kernel/k_system_resource.cpp`), and
+//! the main thread's stack (`KProcess::Run`), all in `eden/src/core/hle/kernel/k_process.cpp` @
+//! cf654052. The check here differs both ways:
+//!
+//! - **Stricter.** It counts what Eden does not reserve: the thread-local page (Eden's comes
+//!   from the kernel's page buffers, `KPageBuffer::Allocate` in
+//!   `KThreadLocalPage::Initialize`, `k_thread_local_page.cpp`) and the counter trampolines
+//!   (Eden has none). So a program whose code and stack fill the pool to within less than a
+//!   page (and its trampolines) loads under Eden and is [`Error::OutOfRam`] here. Test:
+//!   `code_and_stack_that_fill_the_pool_leave_no_room_for_the_thread_local_page`.
+//! - **Looser.** It does not count the system resource. So a program with a non-zero system
+//!   resource whose code and stack fill the pool fits here and is refused by Eden
+//!   (`ResultLimitReached`). Test:
+//!   `a_system_resource_is_not_counted_so_a_title_that_eden_refuses_still_fits`.
 
 use starquake_kernel::process::ProcessDescription;
 use starquake_memory::PAGE_SIZE;
@@ -346,6 +373,36 @@ mod tests {
                 available: pool
             })
         );
+    }
+
+    #[test]
+    fn a_system_resource_is_not_counted_so_a_title_that_eden_refuses_still_fits() {
+        // A Switch 1 program that fits its pool with no byte to spare.
+        let pool = memory_arrangement(Console::Switch1).application_pool_size();
+        let no_stack = ram(&exefs(|e| e.npdm.main_thread_stack_size = 0))
+            .unwrap()
+            .needed;
+        let stack = u32::try_from(pool - no_stack).unwrap();
+        let program = exefs(|e| e.npdm.main_thread_stack_size = stack);
+        assert_eq!(program.description().system_resource_size, 0);
+        let layout = place(&program, IMAGE_BASE, Some(RESCALE)).unwrap();
+        let fits = GuestRam {
+            needed: pool,
+            size: pool,
+        };
+        assert_eq!(
+            GuestRam::for_program(&layout, program.description()),
+            Ok(fits)
+        );
+        // The same program with a system resource of 256 pages: more than the trampolines and
+        // the thread-local page that the code and the stack leave of the pool, so Eden, which
+        // reserves code, stack and system resource from one limit, refuses it (the divergence
+        // in the module docs). Here it fits, with the same `needed`.
+        let mut description = program.description().clone();
+        description.system_resource_size = u32::try_from(256 * PAGE_SIZE).unwrap();
+        let trampolines = layout.trampolines.map_or(0, |region| region.size);
+        assert!(u64::from(description.system_resource_size) > trampolines + THREAD_LOCAL_RAM);
+        assert_eq!(GuestRam::for_program(&layout, &description), Ok(fits));
     }
 
     #[test]

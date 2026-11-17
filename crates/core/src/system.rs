@@ -176,7 +176,9 @@ mod host {
         let ram_config = RamConfig::at_least(guest_ram.size)
             .map_err(|error| starquake_cpu::Error::Host(format!("guest RAM: {error}")))?;
         let _one_vm = ONE_VM.lock().unwrap_or_else(PoisonError::into_inner);
-        // PROVISIONAL: all of the backend's table pool for the one address space.
+        // PROVISIONAL: all of the backend's table pool for the one address space. The table pool
+        // is not sized with guest RAM: it is the backend's fixed size, a second limit the fit
+        // check above does not count (`ram`'s module docs, "The table pool").
         let backend = HvfBackend::new(ram_config)?;
         let ram = backend.ram();
         // The kernel's address space decides what is mapped; this one makes it real, and is
