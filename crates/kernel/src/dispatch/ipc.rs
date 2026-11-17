@@ -114,6 +114,16 @@
 //!   dispatch, so nothing would end in [`Outcome::ProcessExited`] and stop the guest's cores.
 //!   Test: `an_end_asked_by_a_request_a_delivery_runs_is_not_honoured`.
 //!
+//! A delivery that is owed because a guest's `SendSyncRequest` dispatch has the handler out of
+//! its slot is that dispatch's to make (`deliver_owed`, when it puts the handler back), and an
+//! end asked by a request it then runs is honoured: the dispatch ends in
+//! [`Outcome::ProcessExited`] after settling that request with the others. Test:
+//! `an_end_asked_by_a_request_the_dispatch_putting_the_handler_back_runs_is_honoured`. An end
+//! asked by a handler that then fails, or that closes the session ([`Handled::Closed`]), is
+//! honoured too, once the request has ended with [`KernelError::SessionClosed`]. Tests:
+//! `an_end_asked_by_a_handler_that_then_fails_is_honoured` and
+//! `an_end_asked_by_a_handler_that_closes_the_session_is_honoured`.
+//!
 //! Eden's `ISelfController::Exit` calls `KProcess::Terminate` inside the handler, before the
 //! reply is sent (`eden/src/core/hle/service/am/service/self_controller.cpp` @ cf654052); the
 //! order here is the services spec's.
@@ -902,7 +912,8 @@ impl Dispatcher {
     /// the path `ExitProcess` takes, so its threads end and its handles close. Returns
     /// [`Outcome::ProcessExited`], or, when ending fails (only the kernel's own bookkeeping
     /// can make it: a process that has ended already), logs the failure and returns
-    /// `outcome`, the call's own, whose result is already written.
+    /// `outcome`, the call's own, whose result is already written. Test:
+    /// `ending_a_process_that_has_ended_already_returns_the_calls_own_outcome`.
     fn end_process(
         &self,
         process: ProcessId,
@@ -914,7 +925,9 @@ impl Dispatcher {
         let (handles, scheduler) = locked.tables();
         tracing::info!("a service ended the process after its reply");
         let ended = terminate_process(handles, scheduler, process);
-        // Waits the ending threads ended (a thread's waiters wake as it terminates).
+        // Waits the ending threads ended (a thread's waiters wake as it terminates), recorded
+        // and reported now, as `ExitProcess` does. Test:
+        // `a_handler_ending_the_process_wakes_its_threads_waiters_as_exit_process_does`.
         drain_wakes(&mut locked.state, recorder, time);
         match ended {
             Ok(()) => Outcome::ProcessExited,
@@ -1287,16 +1300,19 @@ fn finish(
 }
 
 /// Marks the first of `finished`, the request a handler ran, as asking to end its sender's
-/// process when `end` says the handler asked ([`IpcContext::end_process`]). A request that is
-/// not over (its handler deferred it) has nothing to mark: the ask is not honoured, and logged,
-/// because the end follows the reply and there is none yet (module docs).
+/// process when `end` says the handler asked ([`IpcContext::end_process`]). When `finished` is
+/// empty there is nothing to mark, and the ask is not honoured, and logged. That happens in
+/// two cases: the handler deferred its reply (the end follows the reply, and there is none
+/// yet; module docs), or ending the request failed on the kernel's own bookkeeping
+/// ([`finish`] logs that failure and returns nothing).
 fn ending(mut finished: Vec<Finished>, end: bool) -> Vec<Finished> {
     if end {
         if let Some(first) = finished.first_mut() {
             first.end = true;
         } else {
             tracing::error!(
-                "a handler asked to end the process and deferred its reply; the process goes on"
+                "a handler asked to end the process, and its request is not over (its reply \
+                 is deferred, or ending the request failed); the process goes on"
             );
         }
     }

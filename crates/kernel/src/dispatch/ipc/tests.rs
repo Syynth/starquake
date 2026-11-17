@@ -2076,14 +2076,19 @@ fn reply_and_end(fill: u8) -> Script {
     })
 }
 
+/// The process `thread` (a thread object) belongs to.
+fn process_of(scheduler: &Scheduler, thread: ObjectId) -> ProcessId {
+    let Object::Thread(id) = scheduler.objects().get(thread).unwrap() else {
+        unreachable!("{thread:?} is not a thread");
+    };
+    scheduler.thread(id).unwrap().process().unwrap()
+}
+
 /// What the process `thread` (a thread object) belongs to holds: its handles, the objects
 /// besides each process's own, and its threads that have not ended; and whether it has ended.
 fn holdings(world: &World, thread: ObjectId) -> (usize, usize, usize, bool) {
     world.with_tables(|handles, scheduler| {
-        let Object::Thread(id) = scheduler.objects().get(thread).unwrap() else {
-            unreachable!("{thread:?} is not a thread");
-        };
-        let process = scheduler.thread(id).unwrap().process().unwrap();
+        let process = process_of(scheduler, thread);
         let record = scheduler.process(process).unwrap();
         let running = record
             .threads()
@@ -2204,4 +2209,204 @@ fn an_event_noted_for_no_server_is_let_go_again() {
             assert!(scheduler.ipc().is_server_event(noted, readable));
             assert_eq!(scheduler.objects().len(), before + 1);
         });
+}
+
+/// Runs `script` for one request from A, whose process runs a user thread, and checks that the
+/// end the script asked for was honoured although the request ended without a reply: the
+/// dispatch ends in [`Outcome::ProcessExited`], A's `x0` holds [`KernelError::SessionClosed`],
+/// the session is gone, and the process let everything go. `told` is whether the handler is
+/// told the session closed: a failed handler is, one that closed it itself is not.
+fn assert_an_end_is_honoured_on_a_closed_session(script: Script, told: bool) {
+    let (world, thread) = world_running_a_user_thread(A);
+    let handle = world.session();
+    let session = world.object(handle);
+    assert_eq!(holdings(&world, thread), (1, 2, 1, false));
+    world.first.script(script);
+    let (record, regs) = world.send(A, handle, &request());
+    assert_eq!(record.outcome, Outcome::ProcessExited);
+    assert_eq!(result(&regs), KernelError::SessionClosed.code());
+    let closed: &[ObjectId] = if told { &[session] } else { &[] };
+    assert_eq!(world.first.log().closed, closed);
+    assert_eq!(holdings(&world, thread), (0, 1, 0, true));
+    world.with_tables(|_, scheduler| assert!(!scheduler.ipc().is_session(session)));
+}
+
+#[test]
+fn an_end_asked_by_a_handler_that_then_fails_is_honoured() {
+    assert_an_end_is_honoured_on_a_closed_session(
+        Box::new(|cx, _, _| {
+            cx.end_process();
+            Err(HandlerError("broken".to_owned()))
+        }),
+        true,
+    );
+}
+
+#[test]
+fn an_end_asked_by_a_handler_that_closes_the_session_is_honoured() {
+    assert_an_end_is_honoured_on_a_closed_session(
+        Box::new(|cx, _, _| {
+            cx.end_process();
+            Ok(Handled::Closed)
+        }),
+        false,
+    );
+}
+
+#[test]
+fn an_end_asked_by_a_request_the_dispatch_putting_the_handler_back_runs_is_honoured() {
+    let world = World::new();
+    let deferred = world.session();
+    let other = world.session();
+    let (deferred_object, other_object) = (world.object(deferred), world.object(other));
+    world
+        .first
+        .script(Box::new(|_, _, _| Ok(Handled::Deferred)));
+    assert_eq!(
+        world.send(A, deferred, &request()).0.outcome,
+        Outcome::Waiting
+    );
+    // B's request waits behind A's deferred one and asks to end the process when it runs; C's,
+    // on another session, stops in its handler until the test lets it through.
+    let (gate, keeper) = gate();
+    world.first.script(Box::new(move |cx, session, message| {
+        if session == other_object {
+            gate.pass();
+            message.fill(0xC0);
+        } else {
+            message.fill(0xB0);
+            cx.end_process();
+        }
+        Ok(Handled::Replied)
+    }));
+    assert_eq!(
+        world.send(B, deferred, &request()).0.outcome,
+        Outcome::Waiting
+    );
+    std::thread::scope(|scope| {
+        let sending = scope.spawn(|| world.send(C, other, &request()));
+        keeper.wait();
+        // A's reply is ready while C's core has the handler out: the delivery is owed, and
+        // C's dispatch makes it when it puts the handler back, then runs B's request.
+        let a_buffer = world.tls(A);
+        lock(&world.first.ready).push_back((deferred_object, Ok(0xA0)));
+        world.deliver(&world.first);
+        assert_eq!(world.tls(A), a_buffer, "the delivery waits for the handler");
+        keeper.open();
+        let (record, regs) = sending.join().unwrap();
+        // That dispatch is a guest's, so the end B's handler asked for is honoured there.
+        assert_eq!(record.outcome, Outcome::ProcessExited);
+        assert_eq!(result(&regs), ResultCode::SUCCESS);
+    });
+    assert_eq!(world.tls(A), [0xA0; BUFFER_SIZE]);
+    assert_eq!(world.tls(B), [0xB0; BUFFER_SIZE]);
+    assert_eq!(world.tls(C), [0xC0; BUFFER_SIZE]);
+    world.with_tables(|handles, scheduler| {
+        assert!(handles.is_empty());
+        assert!(!scheduler.ipc().is_session(deferred_object));
+        assert!(!scheduler.ipc().is_session(other_object));
+    });
+}
+
+#[test]
+fn ending_a_process_that_has_ended_already_returns_the_calls_own_outcome() {
+    let (world, thread) = world_running_a_user_thread(A);
+    let process = world.with_tables(|_, scheduler| process_of(scheduler, thread));
+    let (record, _) = world.call(A, SvcId::ExitProcess, 0, 0);
+    assert_eq!(record.outcome, Outcome::ProcessExited);
+    for own in [Outcome::Completed, Outcome::Waiting] {
+        assert_eq!(
+            world
+                .dispatcher
+                .end_process(process, own.clone(), &world.recorder, GuestTicks(0)),
+            own
+        );
+    }
+}
+
+/// A world whose process runs a user thread on A's core, with a thread of no process on B's
+/// core (a host thread, which outlives the process) waiting for that user thread to end
+/// (`WaitSynchronization` on a handle to it, with no timeout).
+fn world_with_a_host_thread_waiting_for_the_process() -> World {
+    let (world, thread) = world_running_a_user_thread(A);
+    run_thread_for(&world, B);
+    let handle = world
+        .dispatcher
+        .with::<(&mut HandleTable, &mut Scheduler), _>(|(handles, scheduler)| {
+            handles.add(scheduler.objects_mut(), thread).unwrap()
+        });
+    world
+        .memory
+        .write(NAMES, &handle.raw().to_le_bytes())
+        .unwrap();
+    let mut regs = GuestRegs::default();
+    regs.x[1] = NAMES;
+    regs.x[2] = 1;
+    // No timeout: -1.
+    regs.x[3] = u64::MAX;
+    regs.tpidrro = TLS_B;
+    let record = world.dispatcher.dispatch(
+        SvcId::WaitSynchronization.number(),
+        &mut regs,
+        &mut world.caller(B),
+    );
+    assert_eq!(record.outcome, Outcome::Waiting);
+    world
+}
+
+/// What `end` (a dispatch that ends the process) leaves B, the host thread waiting for the
+/// process's user thread, as soon as it returns: B's events, and the threads reported woken.
+fn what_an_end_leaves_the_waiter(end: impl FnOnce(&World) -> Outcome) -> (Vec<Event>, Vec<Woken>) {
+    let world = world_with_a_host_thread_waiting_for_the_process();
+    let before = world.events().len();
+    assert_eq!(end(&world), Outcome::ProcessExited);
+    let events = world.events()[before..]
+        .iter()
+        .filter(|event| event.thread == B)
+        .copied()
+        .collect();
+    (events, world.dispatcher.take_woken())
+}
+
+#[test]
+fn a_handler_ending_the_process_wakes_its_threads_waiters_as_exit_process_does() {
+    let by_handler = what_an_end_leaves_the_waiter(|world| {
+        let handle = world.session();
+        world.first.script(reply_and_end(0xE0));
+        world.send(A, handle, &request()).0.outcome
+    });
+    let by_exit =
+        what_an_end_leaves_the_waiter(|world| world.call(A, SvcId::ExitProcess, 0, 0).0.outcome);
+    // The waiter's wait ended as the thread did, and is recorded and reported in the call that
+    // ended the process, not at some later call.
+    assert_eq!(
+        by_handler.1,
+        [Woken {
+            thread: B,
+            core: core_of(B),
+            result: ResultCode::SUCCESS
+        }]
+    );
+    assert!(
+        matches!(
+            by_handler.0.as_slice(),
+            [Event { kind: EventKind::Svc { id, result, .. }, .. }]
+                if *id == u32::from(SvcId::WaitSynchronization.number()) && result.0 == 0
+        ),
+        "{:?}",
+        by_handler.0
+    );
+    assert_eq!(
+        by_handler
+            .0
+            .iter()
+            .map(|event| (event.core, event.kind))
+            .collect::<Vec<_>>(),
+        by_exit
+            .0
+            .iter()
+            .map(|event| (event.core, event.kind))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(by_handler.1, by_exit.1);
 }
