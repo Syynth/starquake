@@ -138,7 +138,13 @@ mod tests {
 
     /// An NRO of one page of text and `bss` bytes of `.bss`.
     fn nro(bss: u32) -> Program {
-        Program::parse(&NroBuilder::new(&[a64::nop()]).bss_size(bss).build().unwrap()).unwrap()
+        Program::parse(
+            &NroBuilder::new(&[a64::nop()])
+                .bss_size(bss)
+                .build()
+                .unwrap(),
+        )
+        .unwrap()
     }
 
     /// The hello fixture's ExeFS (the program a NUP title holds), with its metadata changed by
@@ -173,7 +179,9 @@ mod tests {
         // A program with counter reads, so it has trampolines below its module.
         let counter = Program::parse(&programs::counter(RESCALE.guest_hz).unwrap().nro).unwrap();
         let layout = place(&counter, IMAGE_BASE, Some(RESCALE)).unwrap();
-        let trampolines = layout.trampolines.expect("the counter program has trampolines");
+        let trampolines = layout
+            .trampolines
+            .expect("the counter program has trampolines");
         assert_ne!(trampolines.size, 0);
         let needed = needed_by_parts(&counter);
         assert_eq!(
@@ -186,7 +194,9 @@ mod tests {
         // Without trampolines the program's pages start at its module.
         let plain = nro(0);
         assert_eq!(
-            place(&plain, IMAGE_BASE, Some(RESCALE)).unwrap().trampolines,
+            place(&plain, IMAGE_BASE, Some(RESCALE))
+                .unwrap()
+                .trampolines,
             None
         );
         assert_eq!(ram(&plain).unwrap().needed, needed_by_parts(&plain));

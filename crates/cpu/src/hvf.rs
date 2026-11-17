@@ -1214,10 +1214,7 @@ mod tests {
             Err(LayoutError::OutOfRange)
         );
         // A size that cannot be rounded up without overflowing.
-        assert_eq!(
-            RamConfig::at_least(u64::MAX),
-            Err(LayoutError::OutOfRange)
-        );
+        assert_eq!(RamConfig::at_least(u64::MAX), Err(LayoutError::OutOfRange));
     }
 
     #[test]

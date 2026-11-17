@@ -117,13 +117,15 @@ mod support {
 
     /// A NUP title whose base holds the fixture's metadata and `main`.
     pub(crate) fn title(main: &[u8]) -> System {
-        let tree = [(NPDM_FILE, NPDM), (MAIN_MODULE, main)]
-            .iter()
-            .fold(Tree::new(), |tree, (name, bytes)| {
+        let tree = [(NPDM_FILE, NPDM), (MAIN_MODULE, main)].iter().fold(
+            Tree::new(),
+            |tree, (name, bytes)| {
                 tree.with_file(&format!("{EXEFS_DIR_NAME}/{name}"), Content::raw(*bytes))
                     .unwrap()
-            });
-        let built = build::build(&[PackageSpec::new(PackageKind::Base, TITLE_ID, 0, tree)]).unwrap();
+            },
+        );
+        let built =
+            build::build(&[PackageSpec::new(PackageKind::Base, TITLE_ID, 0, tree)]).unwrap();
         System::from_nup(Cursor::new(built.bytes)).unwrap()
     }
 }
@@ -183,8 +185,15 @@ fn a_nup_title_that_fits_its_pool_with_no_byte_to_spare_runs_and_one_byte_more_i
     // It loads and runs. With its module and stack filling the pool, libnx's start-up then
     // asks for a heap and is told the limit is reached, as on a console whose pool is full,
     // and stops at `Break`: the guest's own end, not the emulator's.
-    let crash = fits.crash().expect("libnx stops at Break when it has no heap");
-    assert_eq!(crash.exception, Exception::UndefinedInstruction, "{}", crash.to_text());
+    let crash = fits
+        .crash()
+        .expect("libnx stops at Break when it has no heap");
+    assert_eq!(
+        crash.exception,
+        Exception::UndefinedInstruction,
+        "{}",
+        crash.to_text()
+    );
     assert_eq!(fits.system_calls.get("Break"), Some(&1));
     let set_heap = u32::from(SvcId::SetHeapSize.number());
     let heap_results: Vec<_> = Dump::from_bytes(&fits.events)

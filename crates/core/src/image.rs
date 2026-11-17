@@ -641,7 +641,12 @@ pub(crate) fn load(
     mapper: Box<dyn Mapper>,
     memory: &dyn GuestMemory,
 ) -> Result<Loaded, LoadError> {
-    load_placed(program, place(program, IMAGE_BASE, counter)?, mapper, memory)
+    load_placed(
+        program,
+        place(program, IMAGE_BASE, counter)?,
+        mapper,
+        memory,
+    )
 }
 
 /// Loads `program`, laid out as `layout` (what [`place`] made of it at [`IMAGE_BASE`]): creates
