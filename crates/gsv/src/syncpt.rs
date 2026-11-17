@@ -121,7 +121,7 @@
 //! | 201 whose wait is reached when armed | signalled in the handler | signalled in the handler | signalled by the timer thread's next drain, which records the value (`a_wait_reached_when_armed_fires_on_the_next_drain`) |
 //! | 202 on a slot with no event yet | nothing signalled (`if (m_events[...])`) | the event made and signalled | as NX2 (`cancel_makes_and_signals_an_event_no_command_made`) |
 //! | Header words other than the reference's (`packet[0]`, `packet[1]`) | `ResultInvalidCombination` | read as they come | read as they come; only a missing data word is refused (`a_short_request_is_refused_and_a_longer_one_is_read`) |
-//! | A closed session | its waits cancelled and its events closed (both destructors) | the same | its waits stay armed and its events stay made: the service framework tells a session nothing when it closes, so a closed session's waits fire into events no one waits on. Bounded by [`MAXIMUM_EVENT_COUNT`] per session |
+//! | A closed session | its waits cancelled and its events closed (both destructors) | the same | its waits stay armed and its events stay made: the service framework tells a session nothing when it closes, so a closed session's waits fire into events no one waits on. **Not bounded:** each closed session can leave up to [`MAXIMUM_EVENT_COUNT`] waits armed and as many events made, and nothing limits how many sessions a title opens and closes, so a title that keeps opening sessions, arming waits that are never reached and closing them grows the waiter table, its syncpoints' waiter counts and the drain's scan of the table without limit. A known gap, left for a follow-up: cancelling a session's waits and closing its events when it closes needs the framework to tell a session it is closing, or a cap on the table |
 //!
 //! # What is recorded and what is saved
 //!
@@ -241,8 +241,8 @@ impl Family for SyncptFamily {
         if bytes.is_empty() {
             Ok(())
         } else {
-            Err(SnapshotError::Decode(
-                postcard::Error::DeserializeBadEncoding,
+            Err(SnapshotError::Inconsistent(
+                "the syncpt family saves no state",
             ))
         }
     }

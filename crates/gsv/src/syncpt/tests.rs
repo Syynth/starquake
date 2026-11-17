@@ -55,6 +55,12 @@ fn counter(sp: u8) -> u32 {
 
 // ----- Requests, word by word -------------------------------------------------------------------
 
+/// A `SyncCounterId` whose NOT is 0x100 above syncpoint `sp`: its low byte names `sp`, the
+/// bits above do not, so it names no syncpoint.
+fn wide_counter(sp: u8) -> u32 {
+    !(0x100 + u32::from(sp))
+}
+
 /// `Handshake` (0): NX2 reads the token from words 2 and 3.
 fn handshake(token: u64) -> Vec<u32> {
     let [low, high] = halves(token);
@@ -422,7 +428,9 @@ fn a_counter_id_naming_no_syncpoint_reads_zero() {
         rig.send(&query_counter(counter(last))),
         success(QUERY_COUNTER, &[], &[4, 0, 0])
     );
-    for word in [!SYNCPOINT_COUNT, 0, u32::from(u8::MAX)] {
+    // A word whose NOT has a counted syncpoint's low byte reads 0 too, not that counter.
+    rig.increment(SP, 3);
+    for word in [!SYNCPOINT_COUNT, 0, u32::from(u8::MAX), wide_counter(SP)] {
         assert_eq!(
             rig.send(&query_counter(word)),
             success(QUERY_COUNTER, &[], &[0, 0, 0]),
@@ -547,6 +555,13 @@ fn a_wait_on_no_syncpoint_signals_at_once() {
     assert_eq!(rig.send(&arm_wait(7, nowhere, u64::MAX, 1)), ok(ARM_WAIT));
     let made = rig.event(7);
     assert!(rig.signalled(made));
+    // A word whose NOT has a syncpoint's low byte but bits above it names no syncpoint either:
+    // signalled at once, nothing armed on the syncpoint its low byte names.
+    let wide = rig.event(9);
+    assert_eq!(rig.send(&arm_wait(9, wide_counter(SP), 1, 0)), ok(ARM_WAIT));
+    assert!(rig.signalled(wide));
+    assert_eq!(rig.wait(wide), None);
+    assert_eq!(rig.watchers(SP), 0);
     // The last id is a syncpoint: armed, not signalled.
     let last = u8::try_from(SYNCPOINT_COUNT - 1).unwrap();
     let other = rig.event(8);
@@ -1147,11 +1162,14 @@ fn the_family_saves_nothing_and_keeps_its_handle() {
     assert_eq!(family.save_state(), Ok(Vec::new()));
     assert_eq!(family.load_state(&[]), Ok(()));
     assert!(Arc::ptr_eq(family.shared(), &shared));
+    let error = family.load_state(&[0]).unwrap_err();
     assert_eq!(
-        family.load_state(&[0]),
-        Err(SnapshotError::Decode(
-            postcard::Error::DeserializeBadEncoding
-        ))
+        error,
+        SnapshotError::Inconsistent("the syncpt family saves no state")
+    );
+    assert_eq!(
+        error.to_string(),
+        "inconsistent snapshot: the syncpt family saves no state"
     );
     assert!(Arc::ptr_eq(family.shared(), &shared));
 }
@@ -1172,6 +1190,9 @@ fn syncpoint_of_is_the_bitwise_not_below_the_count() {
     assert_eq!(syncpoint_of(!u32::from(last)), Some(id(last)));
     assert_eq!(syncpoint_of(!SYNCPOINT_COUNT), None);
     assert_eq!(syncpoint_of(u32::from(SP)), None);
+    // A word whose NOT has a syncpoint's low byte but bits above it names no syncpoint: the
+    // NOT is not truncated to a byte.
+    assert_eq!(syncpoint_of(wide_counter(SP)), None);
     assert_eq!(mode_byte(0xABCD_EF01), 0x01);
     assert_eq!(mode_byte(0xFF), u8::MAX);
 }
