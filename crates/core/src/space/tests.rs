@@ -46,7 +46,7 @@ fn page(n: u64, perms: Perms) -> Resolved {
     }
 }
 
-fn unmapped_at(space: &AddressSpace<FlatMemory>, va: u64) -> bool {
+fn unmapped_at<M: GuestMemory>(space: &AddressSpace<M>, va: u64) -> bool {
     matches!(space.tables.walk(va), Err(WalkError::Unmapped { .. }))
 }
 
@@ -61,7 +61,7 @@ type Snapshot = (
 );
 
 /// Everything the tests can see of an address space, for "nothing changed".
-fn snapshot(space: &AddressSpace<FlatMemory>) -> Snapshot {
+fn snapshot<M: GuestMemory>(space: &AddressSpace<M>) -> Snapshot {
     let shadow = space.shadow();
     (
         shadow.next,
@@ -672,4 +672,7 @@ fn the_kernels_mapper_drives_the_address_space_and_reports_refusals_in_words() {
     );
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod hvf;
+mod kernel;
 mod shared;

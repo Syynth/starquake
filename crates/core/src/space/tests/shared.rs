@@ -74,7 +74,9 @@ fn a_shared_memory_must_be_whole_pages_and_not_empty_and_that_is_checked_before_
     // Both faults at once, a misaligned size and more than RAM holds: the size is reported.
     assert_eq!(
         space.allocate_shared(ALL_RAM + 1),
-        Err(SpaceError::Map(MapError::MisalignedSize { size: ALL_RAM + 1 }))
+        Err(SpaceError::Map(MapError::MisalignedSize {
+            size: ALL_RAM + 1
+        }))
     );
     assert_eq!(snapshot(&space), before);
 }
@@ -283,7 +285,9 @@ fn a_shared_mapping_checks_the_range_then_the_pages_then_what_is_mapped() {
     // A misaligned address and pages that are not a shared memory: the address.
     assert_eq!(
         space.map_shared(LOW + 1, foreign, Perms::Read),
-        Err(SpaceError::Map(MapError::MisalignedAddress { address: LOW + 1 }))
+        Err(SpaceError::Map(MapError::MisalignedAddress {
+            address: LOW + 1
+        }))
     );
     // Pages that are not a shared memory, at a place that is taken: the pages.
     assert_eq!(
@@ -390,7 +394,9 @@ fn unmapping_a_shared_mapping_keeps_its_pages_and_their_bytes_and_never_hands_th
     // The pages keep what they hold, for the service and for a new mapping of them.
     shared.read(PAGE_SIZE + 4, &mut buf).unwrap();
     assert_eq!(&buf, b"kept");
-    mapper.map_shared(FAR, shared.backing(), Perms::Read).unwrap();
+    mapper
+        .map_shared(FAR, shared.backing(), Perms::Read)
+        .unwrap();
     space.read(FAR + PAGE_SIZE + 4, &mut buf).unwrap();
     assert_eq!(&buf, b"kept");
     // RAM handed out later is past them, also after every flush has run.
@@ -398,7 +404,9 @@ fn unmapping_a_shared_mapping_keeps_its_pages_and_their_bytes_and_never_hands_th
     assert_eq!(space.touch(LOW, Access::Write), Touch::Backed);
     assert_eq!(space.tables.walk(LOW), Ok(page(2, Perms::ReadWrite)));
     assert_eq!(
-        mapper.allocate_shared(PAGE_SIZE).map(|pages| pages.backing()),
+        mapper
+            .allocate_shared(PAGE_SIZE)
+            .map(|pages| pages.backing()),
         Ok(ram(3, 1))
     );
 }
@@ -427,7 +435,9 @@ fn the_kernels_mapper_reports_a_shared_memory_refusal_in_words() {
     let space = Arc::new(space());
     let mut mapper = SpaceMapper(Arc::clone(&space));
     assert_eq!(
-        mapper.allocate_shared(ALL_RAM + PAGE_SIZE).map(|pages| pages.backing()),
+        mapper
+            .allocate_shared(ALL_RAM + PAGE_SIZE)
+            .map(|pages| pages.backing()),
         Err(MapperError(format!(
             "mapping {:#x} bytes needs more guest RAM than the {ALL_RAM:#x} bytes left",
             ALL_RAM + PAGE_SIZE
