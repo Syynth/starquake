@@ -13,8 +13,7 @@ fn ir(text: &str) -> Function {
 fn refused(text: &str) -> String {
     Function::parse(text)
         .err()
-        .map(|error| error.to_string())
-        .unwrap_or_default()
+        .map_or_default(|error| error.to_string())
 }
 
 /// The first argument of the only instruction of `operand`'s one-line function.

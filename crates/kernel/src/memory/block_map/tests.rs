@@ -643,13 +643,12 @@ impl Model {
         set: bool,
         clear: bool,
     ) {
-        for index in first..first + count {
-            if self.0[index].properties() == properties {
+        for (offset, page) in self.0[first..first + count].iter_mut().enumerate() {
+            if page.properties() == properties {
                 continue;
             }
-            let page = &mut self.0[index];
             (page.state, page.permission, page.attribute) = properties;
-            if index == first && set {
+            if offset == 0 && set {
                 page.barrier = true;
             }
             if clear {

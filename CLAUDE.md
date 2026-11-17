@@ -50,6 +50,9 @@ set, nextest, doctests. CI runs exactly this.
   `xtask/unused-deps.toml` with a reason (`[[allow]]` for `[dependencies]`, `[[allow_tables]]`
   for the other tables). The list is exact: an entry that is no longer needed fails the gate too,
   so delete it in the same change that starts using the dependency.
+- Cargo's own `unused_dependencies` and `unused_workspace_dependencies` lints (Rust 1.100) are
+  set to `allow` in `[workspace.lints.cargo]`: they cannot carry a reason, and the gate's check
+  with `xtask/unused-deps.toml` is the authority.
 - `cargo deny` fetches the advisory database, so the gate needs network access. Offline, run
   `cargo xtask ci --offline` (or set `STARQUAKE_OFFLINE=1`): only the advisory check is skipped,
   and the output says so. CI refuses the switch.
