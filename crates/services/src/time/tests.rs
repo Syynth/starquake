@@ -15,7 +15,7 @@ use starquake_kernel::handle::Handle;
 use starquake_kernel::id::ObjectId;
 use starquake_kernel::memory::SvcPermission;
 use starquake_kernel::result::{KernelError, ResultCode};
-use starquake_trace::{EnvCall, FixedClock, LiveEnv, ReplayEnv};
+use starquake_trace::{EnvCall, EnvRecord, FixedClock, LiveEnv, ReplayEnv};
 
 use super::calendar::{REPLY_SIZE, SECONDS_PER_DAY, UTC_NAME, to_calendar_time_utc};
 use super::command::static_service::{
@@ -59,7 +59,7 @@ impl Rig {
         let env = Arc::new(LiveEnv::new(FixedClock::new(clock_start, 1), SEED));
         let mut kernel = FakeKernel::new(0).unwrap();
         let session = kernel.new_object();
-        let shared: Arc<dyn Env> = env.clone();
+        let shared: Arc<dyn Env> = Arc::<LiveEnv>::clone(&env);
         let mut server = server(settings, UnknownPolicy::Strict, shared);
         server.accept(session).unwrap();
         Self {
@@ -114,7 +114,7 @@ impl Rig {
 
     /// What the environment was asked, in order.
     fn env_calls(&self) -> Vec<EnvCall> {
-        self.env.recording().iter().map(|r| r.call()).collect()
+        self.env.recording().iter().map(EnvRecord::call).collect()
     }
 
     /// Whether the server's snapshot holds an interface named `interface` whose state is
@@ -550,7 +550,7 @@ fn a_restored_server_hands_out_the_saved_memory_without_reading_again() {
     let memory = rig.memory();
     let calls = rig.env_calls().len();
     let saved = rig.server.save().unwrap();
-    let env: Arc<dyn Env> = rig.env.clone();
+    let env: Arc<dyn Env> = Arc::<LiveEnv>::clone(&rig.env);
     let mut restored = server(TimeSettings::eden_default(), UnknownPolicy::Strict, env);
     restored.restore(&saved).unwrap();
     assert_eq!(restored.save().unwrap(), saved);
@@ -579,17 +579,18 @@ fn to_calendar_time_with_my_rule_answers_in_utc_and_the_reply_is_these_bytes() {
         0, 0, 0, 0,                           // no offset from UTC
     ];
     let mut words = vec![0, 6 + 8, 0, 0, SFCO_MAGIC, 0, ResultCode::SUCCESS.raw(), 0];
-    words.extend(
-        data.chunks_exact(4)
-            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap())),
-    );
+    let (chunks, _) = data.as_chunks::<4>();
+    words.extend(chunks.iter().map(|chunk| u32::from_le_bytes(*chunk)));
     assert_eq!(reply, buffer_of(&words));
     // Nothing about the clocks is read.
     assert_eq!(rig.env_calls(), []);
 }
 
-/// `(year, month, day, hour, minute, second, day of week, day of year)` of a time.
-fn fields(time: i64) -> Result<(i16, i8, i8, i8, i8, i8, i32, i32), Fault> {
+/// `(year, month, day, hour, minute, second, day of week, day of year)`.
+type Fields = (i16, i8, i8, i8, i8, i8, i32, i32);
+
+/// The [`Fields`] of a time.
+fn fields(time: i64) -> Result<Fields, Fault> {
     to_calendar_time_utc(time).map(|(c, i)| {
         assert_eq!((i.name, i.is_dst, i.ut_offset), (UTC_NAME, 0, 0));
         (

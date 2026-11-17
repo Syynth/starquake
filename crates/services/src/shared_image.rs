@@ -17,9 +17,10 @@ pub(crate) fn put(image: &mut [u8], offset: u64, bytes: &[u8], memory: &str) {
         let end = start.checked_add(bytes.len())?;
         image.get_mut(start..end)
     });
-    match target {
-        Some(target) => target.copy_from_slice(bytes),
-        None => tracing::error!(offset, memory, "a shared memory field lies past its end"),
+    if let Some(target) = target {
+        target.copy_from_slice(bytes);
+    } else {
+        tracing::error!(offset, memory, "a shared memory field lies past its end");
     }
 }
 

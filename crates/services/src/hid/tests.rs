@@ -399,6 +399,18 @@ fn the_tables_name_the_commands_as_eden_does() {
     assert_eq!(IAppletResource::interface(), "IAppletResource");
 }
 
+/// Divergence from Eden, whose `IAppletResource` destructor frees the id's row and memory.
+#[test]
+fn closing_a_resource_keeps_its_row_and_memory() {
+    let mut rig = Rig::new();
+    let resource = rig.resource();
+    let memory = rig.memory(resource);
+    rig.server.close(resource).unwrap();
+    assert_eq!(rig.resources().memory(PROCESS_ID), Some(memory));
+    let again = rig.resource();
+    assert_eq!(rig.memory(again), memory);
+}
+
 #[test]
 fn a_restored_server_hands_out_the_saved_memory() {
     let mut rig = Rig::new();

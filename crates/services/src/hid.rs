@@ -66,17 +66,21 @@
 //!   (`crate::am`). Which code the console gives is a guess; a console trace would settle it.
 //!   libnx always sends the id.
 //! - **A failure to make the memory is the reply's.** Eden ignores the resource manager's result.
-//!   Here an error from the kernel when the memory is made (a full object table) is the
-//!   reply's result, and no row is kept
-//!   (`a_kernel_failure_to_make_the_memory_is_the_reply_and_keeps_no_row`).
+//!   Here an error from the kernel when the memory is made is the reply's result, and no row is
+//!   kept (`a_kernel_failure_to_make_the_memory_is_the_reply_and_keeps_no_row`). The kernel
+//!   refuses with `OutOfResource` when its object table is full, and in a run today always with
+//!   `InvalidState`: a run's address space has no backing to share yet (`docs/architecture.md`,
+//!   the provisional list).
 //! - **Nothing is ever sampled, and no controller is connected** ([`shared_memory`], "What a fresh
 //!   one holds"). Eden connects a default controller and starts sampling the npad, six-axis,
 //!   touch screen and gesture resources when an applet resource is created; there is no host
 //!   input yet. A guest that reads the memory sees no controller and empty rings
 //!   (`the_memory_is_a_fresh_input_shared_memory`).
-//! - **Closing the last `IAppletResource` frees nothing.** Eden's destructor frees the id's row
-//!   (`ResourceManager::FreeAppletResourceId`); the framework does not tell a service that a
-//!   session closed, so the row and its memory stay for the server's life.
+//! - **Closing an `IAppletResource` frees nothing.** Eden's destructor, whichever of an id's
+//!   resources closes, unassigns the id and closes its memory
+//!   (`ResourceManager::FreeAppletResourceId`, `AppletResource::FreeAppletResourceId`); the
+//!   framework does not tell a service that a session closed, so the row and its memory stay for
+//!   the server's life (`closing_a_resource_keeps_its_row_and_memory`).
 //!
 //! [`INVALID_CMIF_REQUEST`]: crate::framework::result::INVALID_CMIF_REQUEST
 

@@ -450,13 +450,12 @@ impl IStaticService {
         reply: &mut Reply,
     ) -> Outcome {
         let clocks = *cx.family::<Clocks>()?;
-        let memory = match clocks.set_up {
-            Some(done) => done.memory,
-            None => {
-                let done = set_up_memory(cx, &clocks.settings)?;
-                cx.family::<Clocks>()?.set_up = Some(done);
-                done.memory
-            }
+        let memory = if let Some(done) = clocks.set_up {
+            done.memory
+        } else {
+            let done = set_up_memory(cx, &clocks.settings)?;
+            cx.family::<Clocks>()?.set_up = Some(done);
+            done.memory
         };
         reply.copy_handle(memory);
         reply.ok()

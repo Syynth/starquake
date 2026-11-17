@@ -147,8 +147,9 @@ impl ContinuousAdjustmentTimePoint {
             self.lower,
             self.upper,
         ];
-        for (chunk, word) in bytes.chunks_exact_mut(8).zip(words) {
-            chunk.copy_from_slice(&word.to_le_bytes());
+        let (chunks, _) = bytes.as_chunks_mut::<8>();
+        for (chunk, word) in chunks.iter_mut().zip(words) {
+            *chunk = word.to_le_bytes();
         }
         bytes[0x28..].copy_from_slice(&self.source_id.0);
         bytes

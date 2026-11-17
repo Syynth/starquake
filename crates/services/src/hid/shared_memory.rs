@@ -22,7 +22,7 @@
 //! - every `Lifo`'s `total_buffer_count`, `HidEntryCount` (17): the debug pad's, the touch
 //!   screen's, the mouse's, the keyboard's, the three system buttons', the gesture's and the
 //!   debug mouse's, and in each of the ten npad entries its seven controller lifos, six
-//!   six-axis-sensor lifos and its GameCube trigger lifo;
+//!   six-axis-sensor lifos and its `GameCube` trigger lifo;
 //! - in each npad entry, the full-key and the Joy-Con colour states' `attribute`,
 //!   `ColorAttribute::NoController` (2);
 //! - `npad_condition`: `is_initialized` 1, `hold_type` `NpadJoyHoldType::Horizontal` (1),
