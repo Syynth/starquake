@@ -239,7 +239,9 @@ fn a_record_that_would_end_past_the_top_of_the_address_space_is_outside_the_stac
     let fits = end - size;
     assert_eq!(
         walk(fits, Some(top.clone()), &memory).end,
-        BacktraceEnd::Unreadable { frame_pointer: fits }
+        BacktraceEnd::Unreadable {
+            frame_pointer: fits
+        }
     );
     let wrapping = fits + FRAME_POINTER_ALIGN;
     assert!(wrapping.checked_add(size).is_none());
@@ -356,10 +358,7 @@ fn block_of_twice() -> Mapping {
 fn the_checks_come_in_their_documented_order_when_two_faults_are_present() {
     let memory = stack_memory();
     // Null, with no stack: null.
-    assert_eq!(
-        walk(0, None, &memory).end,
-        BacktraceEnd::NullFramePointer
-    );
+    assert_eq!(walk(0, None, &memory).end, BacktraceEnd::NullFramePointer);
     // Misaligned and outside the stack: misaligned.
     let outside_and_misaligned = 0x10 + FRAME_POINTER_ALIGN / 2;
     assert_eq!(
@@ -486,6 +485,58 @@ fn a_stack_of_noise_ends_the_walk_within_its_limit_without_a_panic() {
             );
         }
     }
+}
+
+#[test]
+fn the_backtrace_json_layout_is_pinned() {
+    // Every field distinct and non-zero: a stack, the two register frames and one read from a
+    // record (one placed, one in no module), and an end that names a frame pointer.
+    let memory = stack_memory();
+    put_record(&memory, 0x80f0_ff00, 0x80f0_ff42, 0x7000_0010);
+    let backtrace = walk(0x80f0_ff00, Some(stack()), &memory);
+    assert_eq!(
+        serde_json::to_string_pretty(&backtrace).unwrap(),
+        r#"{
+  "stack": {
+    "name": "Stack",
+    "start": "0x80f00000",
+    "end": "0x80f10000"
+  },
+  "frames": [
+    {
+      "address": "0x800000b8",
+      "location": {
+        "module": "main",
+        "offset": "0xb8"
+      },
+      "record": null
+    },
+    {
+      "address": "0x80000124",
+      "location": {
+        "module": "main",
+        "offset": "0x124"
+      },
+      "record": null
+    },
+    {
+      "address": "0x70000010",
+      "location": null,
+      "record": "0x80f0ff00"
+    }
+  ],
+  "end": {
+    "reason": "misaligned",
+    "frame_pointer": "0x80f0ff42"
+  }
+}"#
+    );
+    // With no stack, the key is written as `null`.
+    let none = serde_json::to_value(walk(0, None, &memory)).unwrap();
+    assert_eq!(
+        none.as_object().unwrap().get("stack"),
+        Some(&serde_json::Value::Null)
+    );
 }
 
 #[test]

@@ -437,7 +437,13 @@ mod tests {
         RunReport {
             exit: ExitReason::Timeout,
             threads: vec![
-                ThreadPc::new(0x51, ThreadState::Runnable, Some(3), 0x8000_40b8, &modules()),
+                ThreadPc::new(
+                    0x51,
+                    ThreadState::Runnable,
+                    Some(3),
+                    0x8000_40b8,
+                    &modules(),
+                ),
                 ThreadPc::new(0x52, ThreadState::Waiting, None, 0x7000_1234, &modules()),
             ],
             ..RunReport::emulator_error(String::new(), Duration::from_millis(77))
@@ -449,7 +455,10 @@ mod tests {
         let report = timed_out();
         let json = serde_json::to_value(report.summary()).unwrap();
         assert_eq!(json["exit_reason"], "timeout");
-        assert_eq!(json["threads"], serde_json::to_value(&report.threads).unwrap());
+        assert_eq!(
+            json["threads"],
+            serde_json::to_value(&report.threads).unwrap()
+        );
         // In key order, as `summary.json` writes them.
         assert_eq!(
             serde_json::to_string_pretty(report.summary().threads).unwrap(),

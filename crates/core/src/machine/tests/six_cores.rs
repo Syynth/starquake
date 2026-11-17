@@ -765,7 +765,10 @@ fn a_timed_out_run_says_where_each_thread_is_and_which_core_held_it() {
     let mut stepper = Stepper::new(&machine, vec![main, running, sleeping]);
     let step = |stepper: &mut Stepper<'_, '_>, core: usize| {
         let (cores, vcpus) = (&mut stepper.cores, &mut stepper.vcpus);
-        assert!(matches!(cores[core].step(&mut vcpus[core]), Ok(Stepped::Running)), "core {core}");
+        assert!(
+            matches!(cores[core].step(&mut vcpus[core]), Ok(Stepped::Running)),
+            "core {core}"
+        );
     };
     // The main thread creates and starts the two threads, and creates the third.
     for _ in 0..5 {
@@ -816,7 +819,10 @@ fn a_run_that_did_not_time_out_reads_no_threads() {
     // cores hold.
     let guest = Guest::new(&programs::hello().unwrap());
     let main = ScriptedVcpu::new()
-        .then(|regs| regs.pc = MAIN_PC, svc(SvcId::GetCurrentProcessorNumber))
+        .then(
+            |regs| regs.pc = MAIN_PC,
+            svc(SvcId::GetCurrentProcessorNumber),
+        )
         .then(|_| {}, svc(SvcId::ExitProcess));
     let options = RunOptions::default();
     let session = Session {

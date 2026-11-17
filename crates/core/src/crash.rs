@@ -680,10 +680,7 @@ impl CrashReport {
     /// Where it happened: `pc 0x800000b8 (main+0xb8)`.
     #[must_use]
     pub fn instruction_text(&self) -> String {
-        format!(
-            "pc {}",
-            address_text(self.pc, self.pc_location.as_ref())
-        )
+        format!("pc {}", address_text(self.pc, self.pc_location.as_ref()))
     }
 
     fn write_text(&self, out: &mut String) -> std::fmt::Result {
@@ -995,37 +992,13 @@ mod tests {
             true,
         ))
         .with_backtrace(Backtrace {
-            stack: Some(Mapping {
-                name: "Stack".into(),
-                start: 0x80f0_0000,
-                end: 0x8100_0000,
-            }),
-            frames: vec![
-                Frame {
-                    address: 0x8000_00b8,
-                    location: Some(Location {
-                        module: "main".into(),
-                        offset: 0xb8,
-                    }),
-                    record: None,
-                },
-                Frame {
-                    address: 0x8000_0124,
-                    location: Some(Location {
-                        module: "main".into(),
-                        offset: 0x124,
-                    }),
-                    record: None,
-                },
-                Frame {
-                    address: 0x7000_0010,
-                    location: None,
-                    record: Some(0x80ff_ffd0),
-                },
-            ],
-            end: BacktraceEnd::Misaligned {
-                frame_pointer: 0x80ff_ffe2,
-            },
+            stack: None,
+            frames: vec![Frame {
+                address: 0x7000_0010,
+                location: None,
+                record: Some(0x80ff_ffd0),
+            }],
+            end: BacktraceEnd::DepthLimit,
         });
         report.emulator = "starquake 9.9.9".into();
         report.registers.x.truncate(2);
@@ -1055,28 +1028,8 @@ mod tests {
     "offset": "0xb8"
   },
   "backtrace": {
-    "stack": {
-      "name": "Stack",
-      "start": "0x80f00000",
-      "end": "0x81000000"
-    },
+    "stack": null,
     "frames": [
-      {
-        "address": "0x800000b8",
-        "location": {
-          "module": "main",
-          "offset": "0xb8"
-        },
-        "record": null
-      },
-      {
-        "address": "0x80000124",
-        "location": {
-          "module": "main",
-          "offset": "0x124"
-        },
-        "record": null
-      },
       {
         "address": "0x70000010",
         "location": null,
@@ -1084,8 +1037,7 @@ mod tests {
       }
     ],
     "end": {
-      "reason": "misaligned",
-      "frame_pointer": "0x80ffffe2"
+      "reason": "depth_limit"
     }
   },
   "fault_mapping": "stack",
@@ -1128,6 +1080,11 @@ mod tests {
         // The golden text pins the version as a literal, so a layout change that forgets to bump
         // `CRASH_VERSION` fails here.
         assert_eq!(CRASH_VERSION, 4);
+        assert_eq!(report.version, CRASH_VERSION);
+    }
+
+    #[test]
+    fn the_plain_kinds_and_the_parts_a_report_was_built_without_are_pinned() {
         let undefined = serde_json::to_value(Exception::UndefinedInstruction).unwrap();
         assert_eq!(
             undefined,
@@ -1141,7 +1098,6 @@ mod tests {
             fetch,
             serde_json::json!({ "kind": "instruction_abort", "address": "0x80f00010" })
         );
-        assert_eq!(report.version, CRASH_VERSION);
         // A report built without a syndrome says so.
         let without =
             serde_json::to_value(super::tests::report(Exception::UndefinedInstruction)).unwrap();

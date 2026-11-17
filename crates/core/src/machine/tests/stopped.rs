@@ -29,7 +29,9 @@ impl<'a> WithStack<'a> {
 
 impl GuestMemory for WithStack<'_> {
     fn read(&self, va: u64, buf: &mut [u8]) -> Result<(), Fault> {
-        self.image.read(va, buf).or_else(|_| self.stack.read(va, buf))
+        self.image
+            .read(va, buf)
+            .or_else(|_| self.stack.read(va, buf))
     }
 
     fn write(&self, va: u64, data: &[u8]) -> Result<(), Fault> {
@@ -126,10 +128,14 @@ fn a_crash_walks_the_frame_records_in_the_kernel_block_that_holds_its_stack() {
             end: BacktraceEnd::NullFramePointer,
         })
     );
-    assert!(crash.backtrace.as_ref().unwrap().frames[2].location.is_some());
+    assert!(
+        crash.backtrace.as_ref().unwrap().frames[2]
+            .location
+            .is_some()
+    );
     assert_eq!(crash.backtrace.as_ref().unwrap().frames[3].location, None);
     // A crash leaves no threads list: that is a timeout's.
-    assert!(report.threads.is_empty());
+    assert_eq!(report.threads, []);
 }
 
 #[test]
