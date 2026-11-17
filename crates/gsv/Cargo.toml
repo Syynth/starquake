@@ -15,5 +15,12 @@ starquake-kernel.workspace = true
 starquake-ipc.workspace = true
 starquake-services.workspace = true
 starquake-gpu.workspace = true
+serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+# The services framework's fake kernel and host (`framework::fake`), which the root's tests drive.
+starquake-services = { workspace = true, features = ["test-support"] }
+starquake-trace.workspace = true
+proptest.workspace = true
