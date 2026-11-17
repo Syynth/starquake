@@ -28,7 +28,10 @@ fn an_alias_backs_every_source_page_and_maps_the_same_ram_at_once() {
     space.map(SOURCE, TWO, Perms::ReadWrite).unwrap();
     // The second page is backed already (RAM page 0); the first is not.
     space.write(SOURCE + PAGE_SIZE, b"two").unwrap();
-    assert_eq!(space.map_alias(ALIAS, SOURCE, TWO, Perms::ReadWrite), Ok(()));
+    assert_eq!(
+        space.map_alias(ALIAS, SOURCE, TWO, Perms::ReadWrite),
+        Ok(())
+    );
     // The first source page got the next RAM page, with the source's permission.
     assert_eq!(space.tables.walk(SOURCE), Ok(page(1, Perms::ReadWrite)));
     assert_eq!(
@@ -67,7 +70,9 @@ fn bytes_written_through_one_are_read_through_the_other_and_outlive_the_alias() 
     let space = space();
     space.map(SOURCE, TWO, Perms::ReadWrite).unwrap();
     space.write(SOURCE + 3, b"src").unwrap();
-    space.map_alias(ALIAS, SOURCE, TWO, Perms::ReadWrite).unwrap();
+    space
+        .map_alias(ALIAS, SOURCE, TWO, Perms::ReadWrite)
+        .unwrap();
     let mut seen = [0; 3];
     space.read(ALIAS + 3, &mut seen).unwrap();
     assert_eq!(&seen, b"src");
@@ -111,7 +116,9 @@ fn an_alias_is_refused_with_its_checks_in_order_and_maps_nothing() {
     // The ranges: the alias's, then the source's.
     assert_eq!(
         space.map_alias(ALIAS + 1, SOURCE + 1, TWO, Perms::ReadWrite),
-        Err(SpaceError::Map(MapError::MisalignedAddress { address: ALIAS + 1 }))
+        Err(SpaceError::Map(MapError::MisalignedAddress {
+            address: ALIAS + 1
+        }))
     );
     assert_eq!(
         space.map_alias(ALIAS, SOURCE + 1, TWO, Perms::ReadWrite),
@@ -135,7 +142,10 @@ fn an_alias_is_refused_with_its_checks_in_order_and_maps_nothing() {
         Err(SpaceError::Map(MapError::AlreadyMapped { va: ALIAS + TWO }))
     );
     assert_eq!(snapshot(&space), before);
-    assert_eq!(space.map_alias(ALIAS, SOURCE, TWO, Perms::ReadWrite), Ok(()));
+    assert_eq!(
+        space.map_alias(ALIAS, SOURCE, TWO, Perms::ReadWrite),
+        Ok(())
+    );
     assert_eq!(
         space.shadow().mapping(ALIAS + TWO),
         Some((

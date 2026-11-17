@@ -546,7 +546,10 @@ impl<M: GuestMemory> AddressSpace<M> {
         }
         // Map each alias page to its source page's RAM.
         let mut aliased: Vec<(u64, u64)> = Vec::new();
-        for (alias, from) in (va..end).step_by(PAGE_STEP).zip((source..source_end).step_by(PAGE_STEP)) {
+        for (alias, from) in (va..end)
+            .step_by(PAGE_STEP)
+            .zip((source..source_end).step_by(PAGE_STEP))
+        {
             let pa = *shadow
                 .backed
                 .get(&from)
@@ -729,7 +732,9 @@ impl<M: GuestMemory + 'static> Mapper for SpaceMapper<M> {
         size: u64,
         perms: Perms,
     ) -> Result<(), MapperError> {
-        self.0.map_alias(address, source, size, perms).map_err(refused)
+        self.0
+            .map_alias(address, source, size, perms)
+            .map_err(refused)
     }
 }
 

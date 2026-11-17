@@ -117,7 +117,9 @@ pub(super) struct Aliases(BTreeMap<u64, Run>);
 impl Aliases {
     /// The run with the lowest address, as `(address, size)`.
     pub(super) fn first(&self) -> Option<(u64, u64)> {
-        self.0.first_key_value().map(|(address, run)| (*address, run.size))
+        self.0
+            .first_key_value()
+            .map(|(address, run)| (*address, run.size))
     }
 
     /// Every run, in address order, as `(address, source, size)`.
@@ -409,8 +411,7 @@ impl AddressSpace {
         if let Err(error) = self.update(dst, pages, free) {
             return error;
         }
-        self.aliases
-            .remove(dst, pages.saturating_mul(PAGE_SIZE));
+        self.aliases.remove(dst, pages.saturating_mul(PAGE_SIZE));
         SvcError::Internal(format!(
             "{failed}; mapping the alias again failed too, so it is gone: {undo}"
         ))
