@@ -310,6 +310,8 @@ fn a_device_lock_past_the_largest_count_is_out_of_resource() {
         Err(SvcError::Kernel(KernelError::OutOfResource))
     );
     assert_eq!(blocks(&space), before);
+    // The refused lock is not counted.
+    assert_eq!(space.device_locks(heap, PAGE_SIZE), u32::from(u16::MAX));
     // Unlocking is still possible.
     assert_eq!(space.unlock_device_share(heap, PAGE_SIZE), Ok(()));
     assert_eq!(
@@ -376,11 +378,56 @@ fn an_unlock_that_ends_where_no_lock_ends_is_refused_and_changes_nothing() {
     assert_eq!(space.unlock_device_share(heap, 2 * PAGE_SIZE), INVALID);
     assert_eq!(space.unlock_device_share(heap, PAGE_SIZE), INVALID);
     assert_eq!(blocks(&space), before);
-    // Its last page alone ends where the lock does, and so may be unlocked; the rest then
-    // ends where no lock ends either.
+    assert_eq!(space.device_locks(heap, 3 * PAGE_SIZE), 1);
+    // The lock, unlocked exactly, goes.
+    assert_eq!(space.unlock_device_share(heap, 3 * PAGE_SIZE), Ok(()));
+    assert_eq!(space.device_locks(heap, 3 * PAGE_SIZE), 0);
+}
+
+#[test]
+fn an_unlock_that_starts_inside_a_lock_is_refused_though_it_ends_where_the_lock_ends() {
+    // Eden unlocks such a range (its blocks are device shared and it ends where a lock ends);
+    // starquake needs a lock taken on exactly the range (module docs, "Divergences").
+    let (mut space, heap) = with_heap(4);
+    space.lock_device_share(heap, 3 * PAGE_SIZE).unwrap();
+    let before = blocks(&space);
     assert_eq!(
         space.unlock_device_share(heap + 2 * PAGE_SIZE, PAGE_SIZE),
+        INVALID
+    );
+    assert_eq!(
+        space.unlock_device_share(heap + PAGE_SIZE, 2 * PAGE_SIZE),
+        INVALID
+    );
+    assert_eq!(blocks(&space), before);
+}
+
+#[test]
+fn the_lock_count_is_kept_per_exact_range() {
+    let (mut space, heap) = with_heap(4);
+    space.lock_device_share(heap, 2 * PAGE_SIZE).unwrap();
+    space.lock_device_share(heap, 2 * PAGE_SIZE).unwrap();
+    space
+        .lock_device_share(heap + PAGE_SIZE, PAGE_SIZE)
+        .unwrap();
+    assert_eq!(space.device_locks(heap, 2 * PAGE_SIZE), 2);
+    assert_eq!(space.device_locks(heap + PAGE_SIZE, PAGE_SIZE), 1);
+    // A range inside or around a locked one has none of its own.
+    assert_eq!(space.device_locks(heap, PAGE_SIZE), 0);
+    assert_eq!(space.device_locks(heap, 3 * PAGE_SIZE), 0);
+    // A refused lock counts nothing: free memory past the heap.
+    assert_eq!(
+        space.lock_device_share(heap + 4 * PAGE_SIZE, PAGE_SIZE),
+        INVALID
+    );
+    assert_eq!(space.device_locks(heap + 4 * PAGE_SIZE, PAGE_SIZE), 0);
+    // The inner lock goes on its own, and the outer one's count is unchanged.
+    assert_eq!(
+        space.unlock_device_share(heap + PAGE_SIZE, PAGE_SIZE),
         Ok(())
     );
-    assert_eq!(space.unlock_device_share(heap, 2 * PAGE_SIZE), INVALID);
+    assert_eq!(space.device_locks(heap + PAGE_SIZE, PAGE_SIZE), 0);
+    assert_eq!(space.device_locks(heap, 2 * PAGE_SIZE), 2);
+    assert_eq!(space.unlock_device_share(heap, 2 * PAGE_SIZE), Ok(()));
+    assert_eq!(space.device_locks(heap, 2 * PAGE_SIZE), 1);
 }

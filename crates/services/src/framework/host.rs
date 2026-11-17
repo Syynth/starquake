@@ -23,7 +23,7 @@ use std::sync::Arc;
 use starquake_kernel::handle::Handle;
 use starquake_kernel::id::ObjectId;
 use starquake_kernel::ipc::{EventHook, Handled, HandlerError, IpcContext, SessionHandler};
-use starquake_kernel::memory::{SharedPages, SvcPermission};
+use starquake_kernel::memory::{DeviceShareToken, SharedPages, SvcPermission};
 use starquake_kernel::result::SvcResult;
 use starquake_trace::{EventKind, ServiceId};
 
@@ -84,12 +84,12 @@ impl Kernel for IpcContext<'_> {
         Ok(IpcContext::is_gpu_accessible(self, address, size))
     }
 
-    fn lock_device_share(&mut self, address: u64, size: u64) -> SvcResult<()> {
+    fn lock_device_share(&mut self, address: u64, size: u64) -> SvcResult<DeviceShareToken> {
         IpcContext::lock_device_share(self, address, size)
     }
 
-    fn unlock_device_share(&mut self, address: u64, size: u64) -> SvcResult<()> {
-        IpcContext::unlock_device_share(self, address, size)
+    fn unlock_device_share(&mut self, token: DeviceShareToken) -> SvcResult<()> {
+        IpcContext::unlock_device_share(self, token)
     }
 
     fn read_memory(&self, address: u64, out: &mut [u8]) -> SvcResult<()> {
