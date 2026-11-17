@@ -1228,6 +1228,12 @@ enum Op {
         pages: u64,
         set: bool,
     },
+    /// `MapPhysicalMemory` (`map`) or `UnmapPhysicalMemory`, in pages of the alias region.
+    Physical {
+        first: u64,
+        pages: u64,
+        map: bool,
+    },
 }
 
 /// The most heap pages a sequence asks for.
@@ -1249,11 +1255,12 @@ fn op() -> impl Strategy<Value = Op> {
                 permission,
             }
         }),
-        (range, any::<bool>()).prop_map(|((first, pages), set)| Op::Attribute {
+        (range.clone(), any::<bool>()).prop_map(|((first, pages), set)| Op::Attribute {
             first,
             pages,
             set
         }),
+        (range, any::<bool>()).prop_map(|((first, pages), map)| Op::Physical { first, pages, map }),
     ]
 }
 
@@ -1309,7 +1316,8 @@ impl Translated {
 proptest! {
     #![proptest_config(config())]
 
-    /// Random heap sizes, reprotections and attribute changes, each of which may be refused.
+    /// Random heap sizes, reprotections, attribute changes, and physical memory mapped and
+    /// unmapped in the alias region, each of which may be refused.
     /// After every step:
     ///
     /// - the block map is whole (`CheckState`);
@@ -1317,8 +1325,10 @@ proptest! {
     ///   pages the block map says are not free, each with the guest's part of its block's
     ///   permission, and every call it received was for pages in the state the call needs
     ///   (never mapped twice, never unmapped or reprotected while unmapped);
-    /// - the accounting adds up: what is reserved is the code, the stack and the heap; the
-    ///   heap is the sum of the heap blocks; used plus free is the pool.
+    /// - the accounting adds up: what is reserved is the code, the stack, the heap and the
+    ///   physical memory; the heap is the sum of the heap region's `Normal` blocks and the
+    ///   physical memory the sum of the alias region's; the normal memory is the two; used
+    ///   plus free is the pool.
     #[test]
     fn blocks_translation_and_accounting_stay_in_step(ops in proptest::collection::vec(op(), 1..40)) {
         let (mapper, log) = RecordingMapper::new();
@@ -1329,6 +1339,8 @@ proptest! {
         space.create_main_thread_stack(STACK_SIZE).unwrap();
         let heap = space.regions().heap.start;
         let page = |index: u64| heap + index * PAGE_SIZE;
+        let alias = space.regions().alias.start;
+        let alias_page = |index: u64| alias + index * PAGE_SIZE;
         let lock = MemoryAttribute::UNCACHED;
 
         for op in ops {
@@ -1342,6 +1354,12 @@ proptest! {
                     page(first), pages * PAGE_SIZE, lock,
                     if set { lock } else { MemoryAttribute::NONE },
                 ),
+                Op::Physical { first, pages, map: true } => {
+                    space.map_physical_memory(alias_page(first), pages * PAGE_SIZE)
+                }
+                Op::Physical { first, pages, map: false } => {
+                    space.unmap_physical_memory(alias_page(first), pages * PAGE_SIZE)
+                }
             };
             // A refusal is always the guest's result for a range in the wrong state, and
             // changes nothing.
@@ -1353,10 +1371,15 @@ proptest! {
 
             prop_assert!(space.blocks.check_state(), "after {:?}", op);
             let mut expected = BTreeMap::new();
-            let mut heap_bytes = 0;
+            let (mut heap_bytes, mut physical_bytes) = (0, 0);
             for block in space.blocks().filter(|block| block.state() != MemoryState::Free) {
                 if block.state() == MemoryState::Normal {
-                    heap_bytes += block.size();
+                    if space.regions().heap.holds(block.address(), block.size()) {
+                        heap_bytes += block.size();
+                    } else {
+                        prop_assert!(space.is_in_alias_region(block.address(), block.size()));
+                        physical_bytes += block.size();
+                    }
                 }
                 let perms = block.permission().guest().unwrap();
                 for index in 0..block.pages() {
@@ -1365,9 +1388,10 @@ proptest! {
             }
             prop_assert_eq!(&translated.0, &expected, "after {:?}", op);
             prop_assert_eq!(heap_bytes, space.heap_size());
-            prop_assert_eq!(space.normal_memory_size(), space.heap_size());
+            prop_assert_eq!(physical_bytes, space.mapped_physical_memory_size());
+            prop_assert_eq!(space.normal_memory_size(), heap_bytes + physical_bytes);
             let fixed = CODE_SIZE + STACK_SIZE;
-            prop_assert_eq!(space.limit().reserved(), fixed + space.heap_size());
+            prop_assert_eq!(space.limit().reserved(), fixed + space.normal_memory_size());
             prop_assert_eq!(space.used_user_physical_memory_size(), space.limit().reserved());
             prop_assert_eq!(
                 space.used_user_physical_memory_size() + space.limit().free(),

@@ -10,7 +10,7 @@
 //! [`Mapper::map_shared`] mapped, through the same pages, so a test can see a host write
 //! through a guest mapping and the reverse.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use starquake_memory::{BackingRange, Fault, FlatMemory, GuestMemory, PAGE_SIZE, Perms};
@@ -73,6 +73,11 @@ pub enum MapperCall {
 struct State {
     calls: Vec<MapperCall>,
     refuse: bool,
+    /// How many calls were made since [`MapperLog::refuse_calls`] was last told which to
+    /// refuse, accepted or refused.
+    counted: usize,
+    /// Which of the counted calls, from zero, are refused.
+    refuse_calls: BTreeSet<usize>,
     /// The guest-physical memory shared memory is backed from.
     physical: Arc<FlatMemory>,
     /// The first byte of it not handed out yet.
@@ -87,6 +92,8 @@ impl Default for State {
         Self {
             calls: Vec::new(),
             refuse: false,
+            counted: 0,
+            refuse_calls: BTreeSet::new(),
             physical: Arc::new(FlatMemory::new(SHARED_BASE, capacity)),
             next: SHARED_BASE,
             shared: BTreeMap::new(),
@@ -114,6 +121,16 @@ impl MapperLog {
     /// recorded.
     pub fn refuse(&self, refuse: bool) {
         self.with(|state| state.refuse = refuse);
+    }
+
+    /// Makes exactly the calls numbered `calls` fail, counting every call from now on from
+    /// zero, accepted or refused: a fault in the middle of an operation. The calls not named
+    /// are accepted unless [`Self::refuse`] says otherwise. A refused call is not recorded.
+    pub fn refuse_calls(&self, calls: &[usize]) {
+        self.with(|state| {
+            state.counted = 0;
+            state.refuse_calls = calls.iter().copied().collect();
+        });
     }
 
     /// Guest memory as guest code sees the shared memory mapped through this log's mapper: an
@@ -196,7 +213,9 @@ impl RecordingMapper {
 
     fn record(&self, call: MapperCall) -> Result<(), MapperError> {
         self.0.with(|state| {
-            if state.refuse {
+            let number = state.counted;
+            state.counted = state.counted.saturating_add(1);
+            if state.refuse || state.refuse_calls.contains(&number) {
                 return Err(MapperError("the test told the mapper to refuse".into()));
             }
             state.calls.push(call);

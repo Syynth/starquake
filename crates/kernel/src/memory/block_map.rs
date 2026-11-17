@@ -2,12 +2,12 @@
 //! merging.
 //!
 //! Ported from Eden `eden/src/core/hle/kernel/k_memory_block_manager.cpp` @ cf654052
-//! (GPL-3.0-or-later): `Initialize`, `FindFreeArea`, `Update`, `UpdateAttribute`, `UpdateLock`
-//! (with the device lock functions, [`DeviceLock`]), `CoalesceForUpdate` and `CheckState`, and
-//! `FindBlock` from `k_memory_block_manager.h`.
+//! (GPL-3.0-or-later): `Initialize`, `FindFreeArea`, `Update`, `UpdateIfMatch` (which
+//! `MapPhysicalMemory` calls), `UpdateAttribute`, `UpdateLock` (with the device lock functions,
+//! [`DeviceLock`]), `CoalesceForUpdate` and `CheckState`, and `FindBlock` from
+//! `k_memory_block_manager.h`.
 //!
-//! Not ported yet, because nothing calls them: `UpdateLock` with the IPC lock functions, and
-//! `UpdateIfMatch` (`UnmapPhysicalMemory`).
+//! Not ported yet, because nothing calls it: `UpdateLock` with the IPC lock functions.
 //!
 //! Divergences from Eden:
 //!
@@ -96,6 +96,18 @@ impl DeviceLock {
             Self::Unshare => block.unshare_to_device(left, right),
         }
     }
+}
+
+/// A state, a permission and attributes: what [`BlockMap::update_if_match`] tests a block for
+/// and what it gives the blocks that pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Properties {
+    /// The state.
+    pub state: MemoryState,
+    /// The permission.
+    pub permission: MemoryPermission,
+    /// The attributes.
+    pub attribute: MemoryAttribute,
 }
 
 /// The memory blocks of one address space (`KMemoryBlockManager`): they tile it from its first
@@ -272,6 +284,71 @@ impl BlockMap {
                 .get_mut(&at)
                 .ok_or(BlockMapError::Broken { address: at })?;
             block.update(state, permission, attribute, at == address, set, clear);
+            cursor = block.end().unwrap_or(end);
+        }
+        self.coalesce(address, end)
+    }
+
+    /// Gives `pages` pages at `address` the properties `new`, but only in the blocks that have
+    /// the properties `test` (`UpdateIfMatch`), splitting and merging as [`Self::update`] does.
+    /// A block that does not have `test`, or already has `new`, is left alone. `clear` is
+    /// removed from the merge barriers of every block that is changed.
+    ///
+    /// Eden's `UpdateIfMatch` also takes barriers to set, but it updates every block as one that
+    /// is not the head of its range (`it->Update(state, perm, attr, false, ...)`), and
+    /// `KMemoryBlock::Update` sets barriers only for a head, so none are ever set; there is no
+    /// such argument here.
+    ///
+    /// Refused, with nothing changed, for a range that is not whole pages inside the map, for
+    /// an attribute in `new` that only counts set, and when a block that would change is locked
+    /// for IPC (see the module docs).
+    pub fn update_if_match(
+        &mut self,
+        address: u64,
+        pages: u64,
+        test: Properties,
+        new: Properties,
+        clear: DisableMerge,
+    ) -> Result<(), BlockMapError> {
+        let end = self.range_end(address, pages)?;
+        if !new.attribute.excludes(MemoryAttribute::COUNTED) {
+            return Err(BlockMapError::CountedAttribute);
+        }
+        let changes = |block: &MemoryBlock| {
+            block.has_properties(test.state, test.permission, test.attribute)
+                && !block.has_properties(new.state, new.permission, new.attribute)
+        };
+        for block in self.blocks_from(address) {
+            if block.address() >= end {
+                break;
+            }
+            if changes(block) && !block.can_update() {
+                return Err(BlockMapError::Locked {
+                    address: block.address(),
+                });
+            }
+        }
+        let mut cursor = address;
+        while cursor < end {
+            let block = self.block_at(cursor)?;
+            if !changes(&block) {
+                // If we already have the right properties, just advance.
+                cursor = block.end().map_or(end, |block_end| block_end.min(end));
+                continue;
+            }
+            let at = self.isolate(cursor, end)?;
+            let block = self
+                .blocks
+                .get_mut(&at)
+                .ok_or(BlockMapError::Broken { address: at })?;
+            block.update(
+                new.state,
+                new.permission,
+                new.attribute,
+                false,
+                DisableMerge::NONE,
+                clear,
+            );
             cursor = block.end().unwrap_or(end);
         }
         self.coalesce(address, end)
