@@ -26,7 +26,7 @@ use super::command::application_functions::{
 };
 use super::command::common_state_getter::{
     GET_CURRENT_FOCUS_STATE, GET_EVENT_HANDLE, GET_OPERATION_MODE, GET_PERFORMANCE_MODE,
-    SET_REQUEST_EXIT_TO_LIBRARY_APPLET_AT_EXECUTE_NEXT_PROGRAM_ENABLED,
+    RECEIVE_MESSAGE, SET_REQUEST_EXIT_TO_LIBRARY_APPLET_AT_EXECUTE_NEXT_PROGRAM_ENABLED,
 };
 use super::command::graphics_scaling_parameters_functions::{
     GET_GRAPHICS_SCALING_PARAMETERS, SET_GRAPHICS_SCALE_CHANGED_NOTIFICATION_ENABLED,
@@ -49,10 +49,10 @@ use super::command::window_controller::{ACQUIRE_FOREGROUND_RIGHTS, GET_APPLET_RE
 /// (`eden/src/core/hle/service/am/service/self_controller.cpp`: `{1,
 /// D<&ISelfController::LockExit>, "LockExit"}`).
 const LOCK_EXIT: u32 = 1;
-/// `ICommonStateGetter::ReceiveMessage`, which this port leaves out, so it has no shipping
-/// constant (`common_state_getter.cpp`: `{1,
-/// D<&ICommonStateGetter::ReceiveMessage>, "ReceiveMessage"}`).
-const RECEIVE_MESSAGE: u32 = 1;
+/// `ICommonStateGetter::GetBootMode`, which this port leaves out, so it has no shipping
+/// constant (`common_state_getter.cpp`: `{8, D<&ICommonStateGetter::GetBootMode>,
+/// "GetBootMode"}`).
+const GET_BOOT_MODE: u32 = 8;
 
 /// The caller's process id: distinct from every other number the tests use.
 const PROCESS_ID: u64 = 0x0123_4567_89AB_CDEF;
@@ -229,7 +229,7 @@ impl Rig {
     }
 
     fn applet(&self) -> Applet {
-        *self.server.family::<Applet>().unwrap()
+        self.server.family::<Applet>().unwrap().clone()
     }
 
     /// The object behind a handle a reply copied.
@@ -614,7 +614,7 @@ fn set_focus_handling_mode_reads_its_three_flags_at_their_offsets() {
         let controller = rig.open(proxy, GET_SELF_CONTROLLER);
         let reply = rig.object(controller, SET_FOCUS_HANDLING_MODE, &flags);
         assert_eq!(reply.result, ResultCode::SUCCESS, "{flags:?}");
-        let lifecycle = *rig.applet().lifecycle();
+        let lifecycle = rig.applet().lifecycle().clone();
         assert_eq!(
             (
                 lifecycle.notifications.focus_state_changed,
@@ -776,6 +776,35 @@ fn a_message_is_available_only_with_notifications_on_and_a_focus_change_pending(
         };
         assert_eq!(lifecycle.message_available(), notify && changed);
     }
+    // Each other kept term alone makes a message available, focus notifications on or off.
+    for notify in [false, true] {
+        let quiet = Lifecycle {
+            notifications: Notifications {
+                focus_state_changed: notify,
+                ..Notifications::default()
+            },
+            has_focus_state_changed: false,
+            ..Lifecycle::default()
+        };
+        assert!(!quiet.message_available());
+        let terms = [
+            Lifecycle {
+                has_operation_mode_changed: true,
+                ..quiet.clone()
+            },
+            Lifecycle {
+                has_performance_mode_changed: true,
+                ..quiet.clone()
+            },
+            Lifecycle {
+                unordered_messages: [AppletMessage::Resume].into_iter().collect(),
+                ..quiet.clone()
+            },
+        ];
+        for term in terms {
+            assert!(term.message_available(), "{term:?}");
+        }
+    }
     // Eden's initial values.
     assert_eq!(
         Lifecycle::default(),
@@ -787,6 +816,9 @@ fn a_message_is_available_only_with_notifications_on_and_a_focus_change_pending(
             },
             has_focus_state_changed: true,
             focus_handling_mode: FocusHandlingMode::SuspendHomeSleep,
+            has_operation_mode_changed: false,
+            has_performance_mode_changed: false,
+            unordered_messages: VecDeque::new(),
         }
     );
 }
@@ -857,7 +889,7 @@ fn commands_that_are_left_out_go_to_the_unknown_command_policy() {
     let controller = rig.open(proxy, GET_SELF_CONTROLLER);
     let getter = rig.open(proxy, GET_COMMON_STATE_GETTER);
     let refused = domain_reply(UNKNOWN_COMMAND_ID, &[], &[]);
-    assert_eq!(rig.object_raw(getter, RECEIVE_MESSAGE, &[]), refused);
+    assert_eq!(rig.object_raw(getter, GET_BOOT_MODE, &[]), refused);
     assert_eq!(rig.object_raw(controller, LOCK_EXIT, &[]), refused);
     for command in [
         GET_AUDIO_CONTROLLER,
@@ -964,6 +996,7 @@ fn the_getter_and_controller_tables_name_the_commands_as_eden_does() {
         names(&ICommonStateGetter),
         [
             (GET_EVENT_HANDLE, "get_event_handle"),
+            (RECEIVE_MESSAGE, "receive_message"),
             (GET_OPERATION_MODE, "get_operation_mode"),
             (GET_PERFORMANCE_MODE, "get_performance_mode"),
             (GET_CURRENT_FOCUS_STATE, "get_current_focus_state"),
@@ -1051,7 +1084,7 @@ fn libnx_start_up_runs_through_in_the_traces_order() {
     // In focus, so libnx never waits on the message event.
     let focus = rig.object(getter, GET_CURRENT_FOCUS_STATE, &[]);
     assert_eq!(focus.data[0], FocusState::InFocus.raw());
-    let lifecycle = *rig.applet().lifecycle();
+    let lifecycle = rig.applet().lifecycle().clone();
     assert!(!lifecycle.message_available());
     assert_eq!(
         lifecycle.focus_handling_mode,
@@ -1137,7 +1170,7 @@ fn a_failed_signal_still_keeps_the_lifecycle_change() {
     // Notify on, with a focus change pending: a message becomes available, and the signal fails.
     let on = fresh.object(controller, SET_FOCUS_HANDLING_MODE, &[1, 0, 1]);
     assert_eq!(on.result, KernelError::InvalidHandle.code());
-    let lifecycle = *fresh.applet().lifecycle();
+    let lifecycle = fresh.applet().lifecycle().clone();
     assert!(lifecycle.notifications.focus_state_changed);
     assert!(lifecycle.message_available());
     assert_eq!(fresh.applet().message_event(), Some(event));
@@ -1163,7 +1196,7 @@ fn a_failed_clear_still_keeps_the_lifecycle_change() {
     fresh.server.restore(&saved).unwrap();
     let off = fresh.object(controller, SET_FOCUS_HANDLING_MODE, &[0, 0, 1]);
     assert_eq!(off.result, KernelError::InvalidHandle.code());
-    let lifecycle = *fresh.applet().lifecycle();
+    let lifecycle = fresh.applet().lifecycle().clone();
     assert!(!lifecycle.notifications.focus_state_changed);
     assert!(!lifecycle.message_available());
     assert_eq!(fresh.applet().message_event(), Some(event));
@@ -2410,5 +2443,609 @@ fn a_restored_event_the_kernel_made_is_copied_unchanged() {
         assert_eq!(rig.object_of(copied), event);
         assert_eq!(rig.kernel.signals(event), Some(0));
         assert_eq!(rig.kernel.is_signalled(event), Some(false));
+    }
+}
+
+// ----- ICommonStateGetter: ReceiveMessage and the messages -----------------------------------
+
+/// `am_types.h`'s `enum class AppletMessage : u32` @ cf654052, every value but `None = 0`, in
+/// declaration order: the reference's list, written out here to check [`AppletMessage::raw`].
+const EDEN_MESSAGE_WORDS: [u32; 31] = [
+    1, 2, 4, 6, 15, 16, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 50, 51, 55, 56, 57,
+    60, 90, 91, 92, 93, 95,
+];
+
+/// The reply to a `ReceiveMessage` that delivers `message`.
+fn message_reply(message: AppletMessage) -> Vec<u8> {
+    domain_reply(ResultCode::SUCCESS, &message.raw().to_le_bytes(), &[])
+}
+
+impl Rig {
+    /// A rig whose server starts from `applet` (made with [`oe_server_for`]).
+    fn with_applet(applet: Applet) -> Self {
+        let mut rig = Self::new();
+        rig.server = oe_server_for(applet, UnknownPolicy::Strict);
+        rig.server.accept(rig.session).unwrap();
+        rig
+    }
+
+    /// Opens the proxy and the common state getter, and takes the message event; the proxy's
+    /// and the getter's object ids, and the event.
+    fn getter_with_event(&mut self) -> (u32, u32, ObjectId) {
+        let proxy = self.proxy();
+        let getter = self.open(proxy, GET_COMMON_STATE_GETTER);
+        let copied = self.object(getter, GET_EVENT_HANDLE, &[]).copies[0];
+        (proxy, getter, self.object_of(copied))
+    }
+}
+
+/// An application's applet with every kept message term pending: the focus change (Eden's
+/// initial `m_has_focus_state_changed`), an operation-mode change, a performance-mode change,
+/// and `queued` in the unordered queue.
+fn applet_with_every_message(queued: &[AppletMessage]) -> Applet {
+    let mut applet = Applet::new(AppletSettings::eden_default());
+    applet.lifecycle.has_operation_mode_changed = true;
+    applet.lifecycle.has_performance_mode_changed = true;
+    applet.lifecycle.unordered_messages = queued.iter().copied().collect();
+    applet
+}
+
+/// The issue's acceptance: the first `ReceiveMessage` of a fresh application answers the focus
+/// change; the event, signalled at launch, is then clear; the next answers `ResultNoMessages`
+/// with nothing, and the event stays clear.
+#[test]
+fn receive_message_answers_the_focus_change_then_no_messages() {
+    let mut rig = Rig::new();
+    let (_, getter, event) = rig.getter_with_event();
+    assert_eq!(rig.kernel.is_signalled(event), Some(true));
+
+    let first = rig.object_raw(getter, RECEIVE_MESSAGE, &[]);
+    assert_eq!(first, message_reply(AppletMessage::FocusStateChanged));
+    // The exact words after the header and the domain header: `SFCO`, version, success, token,
+    // then the message, 15.
+    let words: Vec<u32> = first[32..52]
+        .chunks(4)
+        .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+        .collect();
+    assert_eq!(words, [SFCO_MAGIC, 0, 0, 0, 15]);
+    assert!(!rig.applet().lifecycle().has_focus_state_changed);
+    assert_eq!(rig.kernel.is_signalled(event), Some(false));
+    assert_eq!(rig.kernel.signals(event), Some(1));
+
+    for _ in 0..2 {
+        let none = rig.object_raw(getter, RECEIVE_MESSAGE, &[]);
+        assert_eq!(none, domain_reply(NO_MESSAGES, &[], &[]));
+        assert_eq!(rig.kernel.is_signalled(event), Some(false));
+        assert_eq!(rig.kernel.signals(event), Some(1));
+    }
+}
+
+#[test]
+fn no_messages_is_edens_result_and_libnx_s_word() {
+    assert_eq!(ResultCode::new(AM_MODULE, 3), Some(NO_MESSAGES));
+    // libnx's `appletMainLoop`: `if (R_VALUE(rc) == 0x680) continue;`.
+    assert_eq!(NO_MESSAGES.raw(), 0x680);
+    assert_eq!(NO_MESSAGES.module(), AM_MODULE);
+    assert_eq!(NO_MESSAGES.description(), 3);
+}
+
+/// Before the event exists, a `ReceiveMessage` only takes the message; the event made after is
+/// made clear.
+#[test]
+fn a_message_received_before_the_event_exists_leaves_it_clear() {
+    let mut rig = Rig::new();
+    let proxy = rig.proxy();
+    let getter = rig.open(proxy, GET_COMMON_STATE_GETTER);
+    let first = rig.object_raw(getter, RECEIVE_MESSAGE, &[]);
+    assert_eq!(first, message_reply(AppletMessage::FocusStateChanged));
+    assert_eq!(rig.applet().message_event(), None);
+    let copied = rig.object(getter, GET_EVENT_HANDLE, &[]).copies[0];
+    let event = rig.object_of(copied);
+    assert_eq!(rig.kernel.signals(event), Some(0));
+    assert_eq!(rig.kernel.is_signalled(event), Some(false));
+}
+
+/// libnx's start-up turns focus notifications off (`SetFocusHandlingMode(0, 0, 1)`): the focus
+/// change stays pending but is not a message, so `ReceiveMessage` answers `ResultNoMessages` and
+/// changes nothing. Turned on again, the pending change is delivered.
+#[test]
+fn a_focus_change_is_not_received_while_its_notifications_are_off() {
+    let mut rig = Rig::new();
+    let (proxy, getter, event) = rig.getter_with_event();
+    let controller = rig.open(proxy, GET_SELF_CONTROLLER);
+    rig.object(controller, SET_FOCUS_HANDLING_MODE, &[0, 0, 1]);
+    let before = rig.applet();
+    assert!(before.lifecycle().has_focus_state_changed);
+
+    let none = rig.object_raw(getter, RECEIVE_MESSAGE, &[]);
+    assert_eq!(none, domain_reply(NO_MESSAGES, &[], &[]));
+    assert_eq!(rig.applet(), before);
+    assert_eq!(rig.kernel.is_signalled(event), Some(false));
+
+    rig.object(controller, SET_FOCUS_HANDLING_MODE, &[1, 0, 1]);
+    assert_eq!(rig.kernel.is_signalled(event), Some(true));
+    let first = rig.object_raw(getter, RECEIVE_MESSAGE, &[]);
+    assert_eq!(first, message_reply(AppletMessage::FocusStateChanged));
+    assert_eq!(rig.kernel.is_signalled(event), Some(false));
+}
+
+/// The priority order, through the server: with every kept term pending and two messages
+/// queued, `ReceiveMessage` answers the focus change, the operation-mode change, the
+/// performance-mode change, then the queue oldest first, and only then `ResultNoMessages`. The
+/// event stays signalled until the last message is taken, and is cleared exactly then.
+#[test]
+fn receive_message_answers_in_edens_order_of_priority() {
+    let queued = [
+        AppletMessage::StartupLogoDisappeared,
+        AppletMessage::DetectShortPressingHomeButton,
+    ];
+    let mut rig = Rig::with_applet(applet_with_every_message(&queued));
+    let (_, getter, event) = rig.getter_with_event();
+    let expected = [
+        AppletMessage::FocusStateChanged,
+        AppletMessage::OperationModeChanged,
+        AppletMessage::PerformanceModeChanged,
+        queued[0],
+        queued[1],
+    ];
+    for (index, message) in expected.into_iter().enumerate() {
+        assert_eq!(rig.kernel.is_signalled(event), Some(true), "before {index}");
+        let reply = rig.object_raw(getter, RECEIVE_MESSAGE, &[]);
+        assert_eq!(reply, message_reply(message), "message {index}");
+    }
+    assert_eq!(rig.kernel.is_signalled(event), Some(false));
+    assert_eq!(rig.kernel.signals(event), Some(1));
+    let none = rig.object_raw(getter, RECEIVE_MESSAGE, &[]);
+    assert_eq!(none, domain_reply(NO_MESSAGES, &[], &[]));
+    assert_eq!(
+        rig.applet().lifecycle(),
+        &Lifecycle {
+            has_focus_state_changed: false,
+            ..Lifecycle::default()
+        }
+    );
+}
+
+/// Which message source is pending, in Eden's order of priority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Source {
+    Focus,
+    OperationMode,
+    PerformanceMode,
+    Queue,
+}
+
+/// The pop order checked against a model: for every set of pending sources, with focus
+/// notifications on and off, the messages come in [`Source`]'s order, the focus change only
+/// with its notifications on, the queue oldest first; then `None`, and again `None`. At every
+/// step `message_available` holds exactly when the next pop returns a message.
+#[test]
+fn the_pop_order_is_edens_for_every_set_of_pending_messages() {
+    const ORDER: [Source; 4] = [
+        Source::Focus,
+        Source::OperationMode,
+        Source::PerformanceMode,
+        Source::Queue,
+    ];
+    let queued = [
+        AppletMessage::DetectLongPressingCaptureButton,
+        AppletMessage::ChangeIntoForeground,
+    ];
+    for set in 0_u32..16 {
+        for notify in [false, true] {
+            let pending = |source: Source| {
+                let index = ORDER.iter().position(|s| *s == source).unwrap();
+                set & (1 << index) != 0
+            };
+            let mut lifecycle = Lifecycle {
+                notifications: Notifications {
+                    focus_state_changed: notify,
+                    ..Notifications::default()
+                },
+                has_focus_state_changed: pending(Source::Focus),
+                has_operation_mode_changed: pending(Source::OperationMode),
+                has_performance_mode_changed: pending(Source::PerformanceMode),
+                unordered_messages: if pending(Source::Queue) {
+                    queued.into_iter().collect()
+                } else {
+                    VecDeque::new()
+                },
+                ..Lifecycle::default()
+            };
+            let mut expected = Vec::new();
+            for source in ORDER.into_iter().filter(|s| pending(*s)) {
+                match source {
+                    Source::Focus if notify => expected.push(AppletMessage::FocusStateChanged),
+                    Source::Focus => {}
+                    Source::OperationMode => expected.push(AppletMessage::OperationModeChanged),
+                    Source::PerformanceMode => {
+                        expected.push(AppletMessage::PerformanceModeChanged);
+                    }
+                    Source::Queue => expected.extend(queued),
+                }
+            }
+            let mut popped = Vec::new();
+            loop {
+                let available = lifecycle.message_available();
+                let message = lifecycle.pop_message_in_order_of_priority();
+                assert_eq!(
+                    available,
+                    message.is_some(),
+                    "set {set:#06b}, notify {notify}"
+                );
+                let Some(message) = message else { break };
+                popped.push(message);
+            }
+            assert_eq!(popped, expected, "set {set:#06b}, notify {notify}");
+            assert_eq!(lifecycle.pop_message_in_order_of_priority(), None);
+            // A focus change pending with notifications off is kept for later.
+            assert_eq!(
+                lifecycle.has_focus_state_changed,
+                pending(Source::Focus) && !notify,
+                "set {set:#06b}, notify {notify}"
+            );
+        }
+    }
+}
+
+#[test]
+fn applet_messages_are_edens_words() {
+    let words: Vec<u32> = AppletMessage::ALL.iter().map(|m| m.raw()).collect();
+    assert_eq!(words, EDEN_MESSAGE_WORDS);
+    for message in AppletMessage::ALL {
+        assert_eq!(AppletMessage::from_raw(message.raw()), Ok(message));
+        assert_eq!(AppletMessage::try_from(message.raw()), Ok(message));
+        assert_eq!(u32::from(message), message.raw());
+    }
+    // Each word, and every neighbour that is not a word, both sides; `None` (0) is not a
+    // message; a word with bits set above its low byte is not one either.
+    for raw in (0..=0x1FF).chain([u32::MAX, 15 | 0x100, 15 | 0x1_0000, 15 | 0x100_0000]) {
+        let expected = if EDEN_MESSAGE_WORDS.contains(&raw) {
+            Ok(raw)
+        } else {
+            Err(NotAnAppletMessage(raw))
+        };
+        assert_eq!(
+            AppletMessage::from_raw(raw).map(AppletMessage::raw),
+            expected,
+            "{raw}"
+        );
+    }
+    assert_eq!(
+        NotAnAppletMessage(3).to_string(),
+        "3 is not an applet message"
+    );
+}
+
+/// A message is saved as its word: `postcard`'s `u32`, so each message's bytes are its word's.
+/// Read back, every word Eden declares is that message, and any other word is refused.
+#[test]
+fn a_message_is_saved_as_its_word_and_read_back_through_from_raw() {
+    for message in AppletMessage::ALL {
+        let bytes = postcard::to_allocvec(&message).unwrap();
+        assert_eq!(bytes, postcard::to_allocvec(&message.raw()).unwrap());
+    }
+    // One message's bytes, golden.
+    assert_eq!(
+        postcard::to_allocvec(&AppletMessage::StartupLogoDisappeared).unwrap(),
+        [95]
+    );
+    for raw in (0..=0x1FF).chain([u32::MAX, 15 | 0x100]) {
+        let bytes = postcard::to_allocvec(&raw).unwrap();
+        let read = postcard::from_bytes::<AppletMessage>(&bytes);
+        match AppletMessage::from_raw(raw) {
+            Ok(message) => assert_eq!(read, Ok(message), "{raw}"),
+            Err(_) => assert_eq!(read, Err(postcard::Error::SerdeDeCustom), "{raw}"),
+        }
+    }
+}
+
+/// The lifecycle's saved layout, golden: the fields in declaration order, each with a value
+/// that differs from its neighbours where the type allows.
+#[test]
+fn the_lifecycle_is_saved_in_this_layout() {
+    let lifecycle = Lifecycle {
+        notifications: Notifications {
+            focus_state_changed: true,
+            operation_mode_changed: false,
+            performance_mode_changed: true,
+        },
+        has_focus_state_changed: false,
+        focus_handling_mode: FocusHandlingMode::NoSuspend,
+        has_operation_mode_changed: true,
+        has_performance_mode_changed: false,
+        unordered_messages: [
+            AppletMessage::DetectShortPressingHomeButton,
+            AppletMessage::StartupLogoDisappeared,
+            AppletMessage::ApplicationExited,
+        ]
+        .into_iter()
+        .collect(),
+    };
+    let bytes = postcard::to_allocvec(&lifecycle).unwrap();
+    assert_eq!(bytes, [1, 0, 1, 0, 2, 1, 0, 3, 20, 95, 6]);
+    assert_eq!(postcard::from_bytes::<Lifecycle>(&bytes), Ok(lifecycle));
+}
+
+/// A server with messages pending saves, restores and saves again to the same bytes, and the
+/// restored server delivers them in the same order, the queue after the flags. The queue holds
+/// a message Eden raises only through its flags: it is delivered as pushed.
+#[test]
+fn a_restored_queue_is_delivered_in_order_after_the_flags() {
+    let queued = [
+        AppletMessage::FocusStateChanged,
+        AppletMessage::AlbumRecordingSaved,
+    ];
+    let mut rig = Rig::with_applet(applet_with_every_message(&queued));
+    let (_, getter, event) = rig.getter_with_event();
+    // Take the focus change first, so the restored state is part-way through.
+    let first = rig.object_raw(getter, RECEIVE_MESSAGE, &[]);
+    assert_eq!(first, message_reply(AppletMessage::FocusStateChanged));
+    let saved = rig.server.save().unwrap();
+
+    let mut restored = oe_server(AppletSettings::eden_default(), UnknownPolicy::Strict);
+    restored.restore(&saved).unwrap();
+    assert_eq!(restored.family::<Applet>(), Some(&rig.applet()));
+    assert_eq!(restored.save().unwrap(), saved);
+    rig.server = restored;
+
+    let expected = [
+        AppletMessage::OperationModeChanged,
+        AppletMessage::PerformanceModeChanged,
+        queued[0],
+        queued[1],
+    ];
+    for (index, message) in expected.into_iter().enumerate() {
+        assert_eq!(rig.kernel.is_signalled(event), Some(true), "before {index}");
+        let reply = rig.object_raw(getter, RECEIVE_MESSAGE, &[]);
+        assert_eq!(reply, message_reply(message), "message {index}");
+    }
+    assert_eq!(rig.kernel.is_signalled(event), Some(false));
+    let none = rig.object_raw(getter, RECEIVE_MESSAGE, &[]);
+    assert_eq!(none, domain_reply(NO_MESSAGES, &[], &[]));
+}
+
+/// A snapshot whose queue holds a word that is not a message is refused with the exact error,
+/// and the server is left as it was; the declared neighbours of each refused word restore.
+#[test]
+fn a_snapshot_with_an_invalid_queued_message_is_refused() {
+    // Two snapshots that differ only in the queued message's one byte, to find where it is.
+    let saved_with = |message: AppletMessage| {
+        let mut rig = Rig::with_applet(applet_with_every_message(&[message]));
+        rig.proxy();
+        rig.server.save().unwrap()
+    };
+    let saved = saved_with(AppletMessage::StartupLogoDisappeared);
+    let other = saved_with(AppletMessage::AlbumScreenShotTaken);
+    assert_eq!(saved.len(), other.len());
+    let differing: Vec<usize> = (0..saved.len()).filter(|&i| saved[i] != other[i]).collect();
+    assert_eq!(differing.len(), 1);
+    let at = differing[0];
+    assert_eq!(
+        u32::from(saved[at]),
+        AppletMessage::StartupLogoDisappeared.raw()
+    );
+
+    let restore = |word: u8| {
+        let mut bytes = saved.clone();
+        bytes[at] = word;
+        let mut server = oe_server(AppletSettings::eden_default(), UnknownPolicy::Strict);
+        let result = server.restore(&bytes);
+        (result, server)
+    };
+    let refused = SnapshotError::Decode(postcard::Error::SerdeDeCustom);
+    // `None`, and a word on each side of declared words; the last single-byte word.
+    for word in [0_u8, 3, 5, 7, 14, 17, 34, 49, 94, 96, 0x7F] {
+        let (result, server) = restore(word);
+        assert_eq!(result, Err(refused.clone()), "{word}");
+        assert_eq!(server.session_count(), 0, "{word}");
+        assert_eq!(
+            server.family::<Applet>(),
+            Some(&Applet::new(AppletSettings::eden_default())),
+            "{word}"
+        );
+    }
+    assert_eq!(
+        refused.to_string(),
+        "could not decode the snapshot: Serde Deserialization Error"
+    );
+    // Their declared neighbours restore, and are the queued message.
+    for word in [1_u8, 2, 4, 6, 15, 16, 33, 50, 93, 95] {
+        let (result, server) = restore(word);
+        assert_eq!(result, Ok(()), "{word}");
+        let queue = &server
+            .family::<Applet>()
+            .unwrap()
+            .lifecycle()
+            .unordered_messages;
+        let words: Vec<u32> = queue.iter().map(|m| m.raw()).collect();
+        assert_eq!(words, [u32::from(word)]);
+    }
+}
+
+/// Divergence from Eden, whose clear cannot fail: restored onto a kernel that did not make the
+/// message event, `ReceiveMessage` of the last message fails the clear with the kernel's exact
+/// error and writes nothing back, so the message is still there to be received.
+#[test]
+fn a_failed_clear_leaves_the_message_to_be_received_again() {
+    let mut rig = Rig::new();
+    let (_, getter, event) = rig.getter_with_event();
+    let saved = rig.server.save().unwrap();
+
+    let mut fresh = Rig::new();
+    assert_eq!(fresh.kernel.is_signalled(event), None);
+    fresh.server.restore(&saved).unwrap();
+    let before = fresh.applet();
+    assert!(before.lifecycle().has_focus_state_changed);
+    for _ in 0..2 {
+        let reply = fresh.object(getter, RECEIVE_MESSAGE, &[]);
+        assert_eq!(reply.result, KernelError::InvalidHandle.code());
+        assert_eq!(reply.data, Vec::<u8>::new());
+        assert_eq!(fresh.applet(), before);
+    }
+
+    // With a message left after it nothing is cleared, so the same restore delivers one.
+    let mut rig = Rig::with_applet(applet_with_every_message(&[]));
+    let (_, getter, _) = rig.getter_with_event();
+    let saved = rig.server.save().unwrap();
+    let mut fresh = Rig::new();
+    fresh.server.restore(&saved).unwrap();
+    let first = fresh.object_raw(getter, RECEIVE_MESSAGE, &[]);
+    assert_eq!(first, message_reply(AppletMessage::FocusStateChanged));
+}
+
+/// Eden's `SignalSystemEventIfNeeded` clears the event only when its cached "a message is
+/// available" was true. Restored onto a kernel that did not make the message event, with no
+/// message pending, `ReceiveMessage` and a lifecycle command that leaves none pending touch no
+/// event: they answer `ResultNoMessages` and success, not the kernel's `InvalidHandle`.
+#[test]
+fn with_no_message_pending_nothing_clears_the_message_event() {
+    let mut rig = Rig::new();
+    let (proxy, getter, event) = rig.getter_with_event();
+    let controller = rig.open(proxy, GET_SELF_CONTROLLER);
+    let first = rig.object_raw(getter, RECEIVE_MESSAGE, &[]);
+    assert_eq!(first, message_reply(AppletMessage::FocusStateChanged));
+    let saved = rig.server.save().unwrap();
+
+    let mut fresh = Rig::new();
+    assert_eq!(fresh.kernel.is_signalled(event), None);
+    fresh.server.restore(&saved).unwrap();
+    assert!(!fresh.applet().lifecycle().message_available());
+    for _ in 0..2 {
+        let none = fresh.object_raw(getter, RECEIVE_MESSAGE, &[]);
+        assert_eq!(none, domain_reply(NO_MESSAGES, &[], &[]));
+    }
+    let on = fresh.object(controller, SET_FOCUS_HANDLING_MODE, &[1, 0, 1]);
+    assert_eq!(on.result, ResultCode::SUCCESS);
+    assert!(!fresh.applet().lifecycle().message_available());
+}
+
+/// The other side of [`with_no_message_pending_nothing_clears_the_message_event`]: Eden signals
+/// only when its cached "a message is available" was false. Restored onto a kernel that did not
+/// make the message event, with the focus change still pending, a lifecycle command that keeps
+/// it pending touches no event and succeeds.
+#[test]
+fn with_a_message_still_pending_nothing_signals_the_message_event() {
+    let mut rig = Rig::new();
+    let (proxy, _, event) = rig.getter_with_event();
+    let controller = rig.open(proxy, GET_SELF_CONTROLLER);
+    assert!(rig.applet().lifecycle().message_available());
+    let saved = rig.server.save().unwrap();
+
+    let mut fresh = Rig::new();
+    assert_eq!(fresh.kernel.is_signalled(event), None);
+    fresh.server.restore(&saved).unwrap();
+    let on = fresh.object(controller, SET_FOCUS_HANDLING_MODE, &[1, 0, 1]);
+    assert_eq!(on.result, ResultCode::SUCCESS);
+    assert!(fresh.applet().lifecycle().message_available());
+}
+
+/// The unordered messages queued in [`per_call_work_does_not_grow_with_the_queue`]: a queue a
+/// restored snapshot may hold, long enough that touching every message on each call costs far
+/// more than [`QUEUE_PATIENCE`] over [`QUEUE_ROUNDS`].
+const LONG_QUEUE: usize = 1 << 25;
+
+/// How many times [`per_call_work_does_not_grow_with_the_queue`] sends each command. Each round
+/// copies three event handles, so the rounds stay well inside the fake kernel's handle table.
+const QUEUE_ROUNDS: usize = 200;
+
+/// The wall-clock bound on [`per_call_work_does_not_grow_with_the_queue`]'s rounds.
+const QUEUE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Every command that reads or changes the applet works on it in place, not on a copy: with a
+/// queue of [`LONG_QUEUE`] messages, [`QUEUE_ROUNDS`] rounds of `ReceiveMessage`, the three
+/// event getters and `SetFocusHandlingMode` finish inside [`QUEUE_PATIENCE`].
+///
+/// Measured in the gate's debug build, all the rounds take about a fifth of a second alone and
+/// up to two and a half seconds under the full parallel gate. A command that copies the applet, queue and all,
+/// on each call (as `ReceiveMessage`, the `ISelfController` lifecycle commands and the event
+/// getters once did, which made draining a restored queue quadratic) spends a quarter to half a
+/// second per call on it: adding the copy back to one of them at a time crossed the bound in
+/// round 78 (`SetFocusHandlingMode`), 46 (`ReceiveMessage`) and 13 (the event getters, three
+/// per round). The bound is checked after every command, so a regression fails at the bound
+/// instead of running on. A wall-clock bound with this margin (about eight times the gate's
+/// time, under half a regression's) is the only observation of the cost short of counting
+/// allocations.
+#[test]
+fn per_call_work_does_not_grow_with_the_queue() {
+    let mut applet = Applet::new(AppletSettings::eden_default());
+    applet.lifecycle.unordered_messages =
+        std::iter::repeat_n(AppletMessage::AlbumRecordingSaved, LONG_QUEUE).collect();
+    let mut rig = Rig::with_applet(applet);
+    let (proxy, getter, _) = rig.getter_with_event();
+    let controller = rig.open(proxy, GET_SELF_CONTROLLER);
+    let functions = rig.open(proxy, GET_APPLICATION_FUNCTIONS);
+    // The focus change comes first.
+    let first = rig.object_raw(getter, RECEIVE_MESSAGE, &[]);
+    assert_eq!(first, message_reply(AppletMessage::FocusStateChanged));
+
+    let deadline = std::time::Instant::now() + QUEUE_PATIENCE;
+    let in_time = |what: &str, round: usize| {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what} in round {round} ran past the bound"
+        );
+    };
+    for round in 0..QUEUE_ROUNDS {
+        let reply = rig.object_raw(getter, RECEIVE_MESSAGE, &[]);
+        assert_eq!(reply, message_reply(AppletMessage::AlbumRecordingSaved));
+        in_time("ReceiveMessage", round);
+        let mode = rig.object(controller, SET_FOCUS_HANDLING_MODE, &[1, 0, 1]);
+        assert_eq!(mode.result, ResultCode::SUCCESS);
+        in_time("SetFocusHandlingMode", round);
+        for (object, command) in [
+            (getter, GET_EVENT_HANDLE),
+            (controller, GET_ACCUMULATED_SUSPENDED_TICK_CHANGED_EVENT),
+            (functions, GET_GPU_ERROR_DETECTED_SYSTEM_EVENT),
+        ] {
+            let reply = rig.object(object, command, &[]);
+            assert_eq!(reply.result, ResultCode::SUCCESS);
+            assert_eq!(reply.copies.len(), 1);
+            in_time("an event getter", round);
+        }
+    }
+    let applet = rig.server.family::<Applet>().unwrap();
+    assert_eq!(
+        applet.lifecycle().unordered_messages.len(),
+        LONG_QUEUE - QUEUE_ROUNDS
+    );
+    assert!(applet.lifecycle().message_available());
+}
+
+/// [`Lifecycle::message_available_after_pop`], which reads at most the first two queued
+/// messages, agrees with a pop on a full copy for every set of pending flags, with notifications
+/// on and off, and every queue length up to two past where it stops reading, at every step of a
+/// drain.
+#[test]
+fn message_available_after_pop_agrees_with_a_pop() {
+    for flags in 0_u32..8 {
+        for notify in [false, true] {
+            for queued in 0..5 {
+                let mut lifecycle = Lifecycle {
+                    notifications: Notifications {
+                        focus_state_changed: notify,
+                        ..Notifications::default()
+                    },
+                    has_focus_state_changed: flags & 1 != 0,
+                    has_operation_mode_changed: flags & 2 != 0,
+                    has_performance_mode_changed: flags & 4 != 0,
+                    unordered_messages: AppletMessage::ALL.into_iter().take(queued).collect(),
+                    ..Lifecycle::default()
+                };
+                loop {
+                    let mut popped = lifecycle.clone();
+                    let message = popped.pop_message_in_order_of_priority();
+                    assert_eq!(
+                        lifecycle.message_available_after_pop(),
+                        popped.message_available(),
+                        "flags {flags:#05b}, notify {notify}, {queued} queued, at {lifecycle:?}"
+                    );
+                    lifecycle = popped;
+                    if message.is_none() {
+                        break;
+                    }
+                }
+            }
+        }
     }
 }
