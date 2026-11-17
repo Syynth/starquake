@@ -19,6 +19,10 @@
 //! answers [`KernelError::NotImplemented`], so a kernel double written for another service need
 //! not offer them; the kernel's `IpcContext` and `FakeKernel` both do.
 //!
+//! Two more, with the same kind of default, give a server the transfer memories a request
+//! carries (graphics-server spec, "What this spec needs from the kernel": "Transfer memory
+//! (204, video 200)"): [`Kernel::transfer_memory`] and [`Kernel::write_transfer_memory`].
+//!
 //! # Clearing an event, and ending the caller's process
 //!
 //! Two more calls the services spec adds (approved 2026-11-16), with the same kind of default:
@@ -32,7 +36,7 @@ use std::sync::Arc;
 use starquake_kernel::handle::Handle;
 use starquake_kernel::id::ObjectId;
 use starquake_kernel::ipc::EventHook;
-use starquake_kernel::memory::{DeviceShareToken, SharedPages, SvcPermission};
+use starquake_kernel::memory::{DeviceShareToken, SharedPages, SvcPermission, TransferMemory};
 use starquake_kernel::result::{KernelError, SvcResult};
 use starquake_trace::{EventKind, ServiceId};
 
@@ -147,6 +151,32 @@ pub trait Kernel {
     ///
     /// The default answers [`KernelError::NotImplemented`].
     fn unlock_device_share(&mut self, _token: DeviceShareToken) -> SvcResult<()> {
+        Err(KernelError::NotImplemented)
+    }
+
+    /// The transfer memory `object` names: one of the request's own copied handles, resolved
+    /// ([`Request::copy_handle`](super::Request::copy_handle)), as the graphics server is given
+    /// the two of its shared syncpoint page. [`KernelError::InvalidHandle`] when it names no
+    /// live transfer memory (the kernel's `IpcContext::transfer_memory`).
+    ///
+    /// The default answers [`KernelError::NotImplemented`].
+    fn transfer_memory(&self, _object: ObjectId) -> SvcResult<TransferMemory> {
+        Err(KernelError::NotImplemented)
+    }
+
+    /// Copies `data` into the transfer memory `object` names, at `offset` from its start:
+    /// what a server does instead of mapping it. [`KernelError::InvalidHandle`] as for
+    /// [`Kernel::transfer_memory`], and [`KernelError::InvalidCurrentMemory`] unless the whole
+    /// of `data` lies inside it; nothing is copied then (the kernel's
+    /// `IpcContext::write_transfer_memory`).
+    ///
+    /// The default answers [`KernelError::NotImplemented`].
+    fn write_transfer_memory(
+        &mut self,
+        _object: ObjectId,
+        _offset: u64,
+        _data: &[u8],
+    ) -> SvcResult<()> {
         Err(KernelError::NotImplemented)
     }
 

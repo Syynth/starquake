@@ -13,15 +13,15 @@
 //!
 //! [`GsvShared`] holds, so far, the waiter count of each syncpoint ([`Locked::watch`],
 //! [`Locked::unwatch`]), the syncpt sessions' waiter table ([`Waiters`]: [`Locked::arm`],
-//! [`Locked::disarm`]; slice 4) and the GPU memory bookkeeping ([`Locked::gpu`], slice 7); later
-//! slices add the shared page, vi2's queues and the native object tables (spec, "Concurrency
-//! inside gsv").
+//! [`Locked::disarm`]; slice 4), the GPU memory bookkeeping ([`Locked::gpu`], slice 7) and the
+//! shared syncpoint page ([`page`], slice 5); later slices add vi2's queues and the native object
+//! tables (spec, "Concurrency inside gsv").
 //!
 //! Each armed wait holds one watch of its syncpoint: [`Locked::arm`] takes it, and gives back
 //! the watch of the wait it replaces; [`Locked::disarm`] and the drain's firing give it back
-//! (`an_armed_wait_holds_one_watch_of_its_syncpoint`). Other watchers (the shared page, slice
-//! 5) may hold more watches, so a syncpoint's waiter count is at least its number of armed
-//! waits. [`Locked::unwatch`] keeps it so: it refuses to take a watch an armed wait holds
+//! (`an_armed_wait_holds_one_watch_of_its_syncpoint`). The shared page's hold
+//! holds one more watch of each syncpoint it asks about ([`page`], "When a request is
+//! answered"), so a syncpoint's waiter count is at least its number of armed waits. [`Locked::unwatch`] keeps it so: it refuses to take a watch an armed wait holds
 //! ([`WatchError::HeldByWaits`]), which would leave the wait's id unwatched and the wait never
 //! fired (`unwatch_cannot_take_an_armed_wait_s_watch`).
 //!
@@ -60,7 +60,7 @@
 //! | `GpuCompletion::SyncpointChanged` | records `SyncpointObserved` ([`crate::note`]), then fires every armed wait on the id that the drained value satisfies: takes it out of the table, unwatches its id, and signals its event through the kernel ([`TimerHost::signal_event`]), in ascending event order (`a_change_fires_its_waits_after_its_note_in_event_order`) |
 //! | `GpuCompletion::GpuOrdered` | records `GpuOrderedDone`; then, if a gpu worker job waits on the ticket ([`crate::gpu::GpuMemory::ordered_done`]), publishes the ranges it removed again, releases its device-share locks as a `DeviceShareReleased` is released (below), and only then signals its event ([`TimerHost::signal_event`]) |
 //! | `GpuCompletion::GpuQueueRoom` | records `QueueRoom` |
-//! | [`Completion::GuestSignalled`] | nothing: the guest's `SignalEvent` is recorded as its system call, and what gsv does about it (the shared page's answer, slice 5) records its own note |
+//! | [`Completion::GuestSignalled`] | records nothing (the guest's `SignalEvent` is recorded as its system call); if the event is the bound shared page's request event, marks the page signalled, and the next page turn ([`Shared::tick_page`]) reads the request and records what it answers ([`page`]) |
 //! | [`Completion::DeviceShareReleased`] | unlocks through the kernel with the token ([`TimerHost::unlock_device_share`]), which checks it; records nothing (the spec's "What is recorded" has no note for it) |
 //!
 //! The kernel's refusal of a release is logged, and the drain goes on: a token whose process
@@ -83,7 +83,11 @@
 //! is gone either way (`a_refused_signal_is_logged_and_the_drain_goes_on`; the level is pinned
 //! by `tests/signal_log_level.rs`, a test binary of its own).
 //!
-//! Later slices act on them as well: the shared page (5), deferred submissions (11).
+//! Later slices act on them as well: deferred submissions (11).
+//!
+//! **The page turn.** After each drain the timer thread runs [`Shared::tick_page`] with the
+//! turn's time, which answers the shared page's requests ([`page`], "When a request is
+//! answered"), and sleeps no later than [`Shared::page_deadline`].
 //!
 //! # The timer thread, until the wiring
 //!
@@ -104,8 +108,9 @@
 //! The golden-bytes test `the_snapshot_layout_is_pinned` pins it; changing it means bumping
 //! [`SNAPSHOT_VERSION`]. Version 2 added the waits. The queue has its own snapshot
 //! ([`CompletionQueue::save`]), because it must exist before the `Syncpoints` that pushes to it.
-//! The GPU memory bookkeeping has its own too ([`crate::gpu::saved`]); composing it into this one
-//! is the wiring slice's (16).
+//! The GPU memory bookkeeping has its own too ([`crate::gpu::saved`]), and so has the shared page
+//! ([`Shared::save_page`], restored after this one by [`Shared::restore_page`]); composing them
+//! into this one is the wiring slice's (16).
 //!
 //! A snapshot is a file and is not trusted. [`Shared::restore`] checks, in this order, and
 //! returns the first failure: the magic, the version, that the body decodes, that no bytes
@@ -128,7 +133,7 @@ use starquake_gpu::syncpoint::Syncpoints;
 use starquake_kernel::dispatch::DeviceShareError;
 use starquake_kernel::id::ObjectId;
 use starquake_kernel::memory::DeviceShareToken;
-use starquake_kernel::result::SvcResult;
+use starquake_kernel::result::{KernelError, SvcResult};
 use starquake_trace::{EventKind, ServiceId};
 use thiserror::Error;
 
@@ -137,8 +142,11 @@ use crate::gpu::GpuMemory;
 use crate::note::Note;
 use crate::syncpt::waiters::{SavedWait, SavedWaitError, Wait, Waiters};
 
+pub mod page;
 #[cfg(test)]
 mod tests;
+
+use page::Page;
 
 /// [`SYNCPOINT_COUNT`] as an index bound.
 const COUNT: usize = SYNCPOINT_COUNT as usize;
@@ -167,6 +175,35 @@ pub trait TimerHost {
     /// Signals `event`, an event a gsv server made, through the kernel: how the drain fires an
     /// armed wait and completes a gpu worker job (module docs, "Lock order and the drain").
     fn signal_event(&mut self, event: ObjectId) -> SvcResult<()>;
+
+    /// Copies `out.len()` bytes at `offset` into the transfer memory `memory` names into `out`,
+    /// through the kernel, which checks the transfer memory as it is now: how the page turn
+    /// reads the shared page ([`page`]). The kernel's errors are its
+    /// `IpcContext::read_transfer_memory`'s (`InvalidHandle` once the transfer memory is gone,
+    /// `InvalidCurrentMemory` unless the bytes lie wholly inside it).
+    ///
+    /// The default answers `NotImplemented`: a host for a run with no shared page need not offer
+    /// it.
+    fn read_transfer_memory(
+        &mut self,
+        _memory: ObjectId,
+        _offset: u64,
+        _out: &mut [u8],
+    ) -> SvcResult<()> {
+        Err(KernelError::NotImplemented)
+    }
+
+    /// Copies `data` into the transfer memory `memory` names, at `offset`, through the kernel:
+    /// how the page turn writes the shared page. The same rules and default as
+    /// [`TimerHost::read_transfer_memory`].
+    fn write_transfer_memory(
+        &mut self,
+        _memory: ObjectId,
+        _offset: u64,
+        _data: &[u8],
+    ) -> SvcResult<()> {
+        Err(KernelError::NotImplemented)
+    }
 }
 
 /// What gsv's request handlers and its timer thread share (module docs, "The pieces").
@@ -182,6 +219,8 @@ pub struct GsvShared {
     gpu: GpuMemory,
     /// The syncpt sessions' armed waits.
     waiters: Waiters,
+    /// The shared syncpoint page (slice 5).
+    page: Page,
 }
 
 impl GsvShared {
@@ -191,6 +230,7 @@ impl GsvShared {
             watchers: vec![0; COUNT],
             gpu: GpuMemory::new(),
             waiters: Waiters::default(),
+            page: Page::default(),
         }
     }
 
@@ -413,8 +453,9 @@ impl Shared {
         for completion in &taken {
             match *completion {
                 Completion::DeviceShareReleased { token } => release(host, token),
-                Completion::GuestSignalled { .. } => {
+                Completion::GuestSignalled { event } => {
                     tracing::trace!(?completion, "gsv drained a guest signal");
+                    state.state.page.guest_signalled(event);
                 }
                 Completion::Gpu(gpu) => {
                     host.record(note(gpu).event(self.service));
@@ -507,6 +548,7 @@ impl Shared {
             watchers: saved.watchers,
             gpu: GpuMemory::new(),
             waiters,
+            page: Page::default(),
         };
         Ok(Self::with_state(state, syncpoints, queue, service))
     }

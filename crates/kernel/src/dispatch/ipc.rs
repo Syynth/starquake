@@ -469,13 +469,7 @@ impl IpcContext<'_> {
     /// [`KernelError::InvalidHandle`] when it names no live transfer memory, or one whose pages
     /// are not locked (one being made, which no handle names yet).
     pub fn transfer_memory(&self, object: ObjectId) -> SvcResult<TransferMemory> {
-        let found = self
-            .dispatcher
-            .with::<(&Scheduler,), _>(|(scheduler,)| scheduler.objects().get(object));
-        match found {
-            Ok(Object::TransferMemory(transfer)) if transfer.is_locked() => Ok(transfer),
-            _ => Err(KernelError::InvalidHandle),
-        }
+        self.dispatcher.transfer_memory(object)
     }
 
     /// Copies `out.len()` bytes at `offset` into the transfer memory `object` names into

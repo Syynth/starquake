@@ -21,6 +21,15 @@
 //! Tests (in `dispatch/hooks/tests.rs`): `a_hook_runs_after_the_guest_signals_its_event`,
 //! `a_hook_runs_without_the_kernel_lock`, `a_hook_runs_only_for_a_successful_guest_signal`.
 //!
+//! # After a restore
+//!
+//! A hook is code, so a snapshot cannot hold it: the owning service re-attaches it in its
+//! restore step, before the guest runs again
+//! ([`Dispatcher::reattach_event_hook`](crate::dispatch::Dispatcher::reattach_event_hook), which
+//! takes only the writable end of an event that service's server made; owner's ruling of
+//! 2026-11-17). Tests: `a_hook_reattached_after_a_restore_runs_when_the_guest_signals`,
+//! `a_hook_is_reattached_only_to_a_writable_end_its_service_made`.
+//!
 //! Eden has no such hook: its services signal and wait on their `KEvent`s from their own host
 //! threads. This is starquake's, from the kernel spec.
 //!

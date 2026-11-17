@@ -70,8 +70,17 @@
 //!   and is logged"). The family's slice replaces it with a session on its own server.
 //! - **An event** (only 204's two) is a kernel event, unsignalled. They are made the first time
 //!   204 is asked and kept ([`RootState::syncpoint_events`]), so a repeated 204 hands out the
-//!   same two and a failure between the two keeps the first. Slice 5 replaces them with the
-//!   shared page's request and answer events.
+//!   same two and a failure between the two keeps the first. A root built with gsv's shared
+//!   state answers 204 with the shared page instead (below).
+//!
+//! # The shared syncpoint page (204)
+//!
+//! A root built for a run with gsv's shared state ([`root_server_with_page`]) answers 204 by
+//! binding the shared syncpoint page ([`crate::shared::page`], "Binding (204)"), whose state is
+//! in gsv's shared state, not the root's: the drain and the page turn act on it. The root's
+//! family ([`RootFamily`]) holds the handle to that state beside [`RootState`]; the handle is the
+//! run's wiring, so a snapshot holds only the [`RootState`] and loading keeps the handle. Before
+//! the bootstrap is complete 204 is logged and accepted, as the stubs are (decision 7).
 //!
 //! # The gpu session (497)
 //!
@@ -98,13 +107,16 @@
 //! | 115 with a mode other than 0 or 2 | `ResultInvalidCombination` | not in its table: auto-stubbed, success | success, the mode recorded, logged (`configure_native_memory_records_any_mode`) |
 //! | 126, 115 and the stubs before the bootstrap is complete | `ResultInvalidState` for most | success | success, the phase logged (`every_root_command_s_reply_bytes`, sent before any bootstrap) |
 //! | A TIPC command the table does not list | `ResultNotImplemented` | auto-stubbed | the server's unknown-command policy (`a_command_the_table_does_not_list_goes_to_the_policy`) |
-//! | A second root session (a second 2000) | the same session as the first: one state | a new session with its own `m_objects` and `m_syncpt_events` | a new session that shares the first one's [`RootState`]: its phase, its out-of-order count and 204's two events (`two_root_sessions_share_the_phase_and_the_syncpoint_events`) |
+//! | A second root session (a second 2000) | the same session as the first: one state | a new session with its own `m_objects` and `m_syncpt_events` | a new session that shares the first one's [`RootState`]: its phase, its out-of-order count and 204's two events (`two_root_sessions_share_the_phase_and_the_syncpoint_events`); with the shared page, the one page (`a_second_bind_is_refused_and_changes_nothing`, in `shared/page/tests.rs`) |
+
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use starquake_kernel::id::ObjectId;
 use starquake_services::commands;
 use starquake_services::framework::{
-    Context, Fault, Interfaces, NOT_SUPPORTED, Outcome, Reply, Request, Server, UnknownPolicy,
+    Context, Family, Fault, Interfaces, NOT_SUPPORTED, Outcome, Reply, Request, Server,
+    SnapshotError, UnknownPolicy,
 };
 use starquake_trace::ServiceId;
 
@@ -126,6 +138,8 @@ use crate::protocol::command::{
     SEQUENCE_COMMAND_1202, SEQUENCE_COMMAND_1203, SET_GRAPHICS_CLASS_1111, UNMAP_NATIVE_GPU_IMAGE,
 };
 use crate::protocol::{Handed, bootstrap, root_command};
+use crate::shared::Shared;
+use crate::shared::page;
 
 #[cfg(test)]
 mod tests;
@@ -440,7 +454,7 @@ commands! {
         CONFIGURE_NATIVE_MEMORY => configure_native_memory,
         INITIALIZE_SYNCPOINT_CONTEXT => stub,
         GET_SYNCPOINT_SESSION => stub,
-        BIND_SYNCPOINT_MEMORY => stub,
+        BIND_SYNCPOINT_MEMORY => bind_syncpoint_memory,
         INITIALIZE_DISPLAY_CONTEXT => stub,
         FINALIZE_DISPLAY_CONTEXT => stub,
         OPEN_DISPLAY_SESSION => stub,
@@ -524,7 +538,7 @@ impl GsvRoot {
                 "gsv: a remote-memory bootstrap; accepted as NX2 does, with no remote memory"
             );
         }
-        let state = cx.family::<RootState>()?;
+        let state = root_state(cx)?;
         state.step(INITIALIZE);
         state.bootstrap = Some(request);
         reply.ok()
@@ -538,7 +552,7 @@ impl GsvRoot {
         reply: &mut Reply,
     ) -> Outcome {
         req.copy_handle(0)?;
-        cx.family::<RootState>()?.step(BIND_PROCESS);
+        root_state(cx)?.step(BIND_PROCESS);
         reply.ok()
     }
 
@@ -549,7 +563,7 @@ impl GsvRoot {
         _req: &Request<'_>,
         reply: &mut Reply,
     ) -> Outcome {
-        cx.family::<RootState>()?.step(COMPLETE_BOOTSTRAP);
+        root_state(cx)?.step(COMPLETE_BOOTSTRAP);
         reply.ok()
     }
 
@@ -560,7 +574,7 @@ impl GsvRoot {
         _req: &Request<'_>,
         reply: &mut Reply,
     ) -> Outcome {
-        cx.family::<RootState>()?.note_unready(QUERY_MEMORY_MODE);
+        root_state(cx)?.note_unready(QUERY_MEMORY_MODE);
         reply.payload().write_u32(bootstrap::NO_REMOTE_MEMORY_MODE);
         reply.ok()
     }
@@ -573,7 +587,7 @@ impl GsvRoot {
         reply: &mut Reply,
     ) -> Outcome {
         let mode = req.payload().read_u64()?;
-        let state = cx.family::<RootState>()?;
+        let state = root_state(cx)?;
         state.note_unready(CONFIGURE_NATIVE_MEMORY);
         // PR `ConfigureNativeMemory`: `packet[2] == 0 || packet[2] == 2`, `packet[3] == 0`.
         if mode != 0 && mode != 2 {
@@ -592,11 +606,11 @@ impl GsvRoot {
         req: &Request<'_>,
         reply: &mut Reply,
     ) -> Outcome {
-        let Some(gpu) = cx.family::<RootState>()?.gpu_server else {
+        let Some(gpu) = root_state(cx)?.gpu_server else {
             return Self::stub(this, cx, req, reply);
         };
         let flags = req.payload().read_u64()?;
-        let state = cx.family::<RootState>()?;
+        let state = root_state(cx)?;
         state.note_unready(OPEN_GPU_SESSION);
         if flags != GPU_SESSION_FLAGS {
             tracing::warn!(
@@ -606,6 +620,21 @@ impl GsvRoot {
         }
         reply.copy_service(gpu);
         reply.ok()
+    }
+
+    /// `BindSyncpointMemory` (204): binds the shared syncpoint page (module docs, "The shared
+    /// syncpoint page (204)"); the stub's two events in a run without gsv's shared state.
+    fn bind_syncpoint_memory(
+        this: &mut Self,
+        cx: &mut Context<'_>,
+        req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        let Some(shared) = cx.family::<RootFamily>()?.shared.as_ref().map(Arc::clone) else {
+            return Self::stub(this, cx, req, reply);
+        };
+        root_state(cx)?.note_unready(BIND_SYNCPOINT_MEMORY);
+        page::bind(&shared, cx, req, reply)
     }
 
     /// Every other root command: logs it and replies success with its known reply shape (module
@@ -618,7 +647,7 @@ impl GsvRoot {
             tracing::error!(command = id, "gsv: a stub with no row in the command table");
             return Err(NOT_SUPPORTED.into());
         };
-        let phase = cx.family::<RootState>()?.phase;
+        let phase = root_state(cx)?.phase;
         tracing::info!(
             command = id,
             name = row.name,
@@ -651,19 +680,24 @@ impl GsvRoot {
     }
 }
 
+/// The root's state, from the server's family.
+fn root_state<'c>(cx: &'c mut Context<'_>) -> Result<&'c mut RootState, Fault> {
+    Ok(&mut cx.family::<RootFamily>()?.state)
+}
+
 /// The two events the 204 stub hands out, made the first time and kept (module docs, "Stubs").
 fn syncpoint_events(cx: &mut Context<'_>) -> Result<[ObjectId; 2], Fault> {
-    let first = match cx.family::<RootState>()?.syncpoint_events {
+    let first = match root_state(cx)?.syncpoint_events {
         SyncpointEvents::Both(first, second) => return Ok([first, second]),
         SyncpointEvents::One(first) => first,
         SyncpointEvents::None => {
             let first = cx.create_event()?;
-            cx.family::<RootState>()?.syncpoint_events = SyncpointEvents::One(first);
+            root_state(cx)?.syncpoint_events = SyncpointEvents::One(first);
             first
         }
     };
     let second = cx.create_event()?;
-    cx.family::<RootState>()?.syncpoint_events = SyncpointEvents::Both(first, second);
+    root_state(cx)?.syncpoint_events = SyncpointEvents::Both(first, second);
     Ok([first, second])
 }
 
@@ -686,20 +720,87 @@ pub fn root_server(policy: UnknownPolicy) -> Server {
 
 /// The root's server over `state`: [`RootState::new`], and in a run with a gpu server
 /// [`RootState::with_gpu_server`]. A snapshot whose gpu server number differs from `state`'s is
-/// refused (module docs, "The gpu session").
+/// refused (module docs, "The gpu session"). 204 answers with the stub's two events.
 #[must_use]
 pub fn root_server_for(state: RootState, policy: UnknownPolicy) -> Server {
+    root_server_over(
+        RootFamily {
+            state,
+            shared: None,
+        },
+        policy,
+    )
+}
+
+/// The root's server over `state`, as [`root_server_for`], whose 204 binds the shared syncpoint
+/// page in gsv's `shared` state (module docs, "The shared syncpoint page (204)").
+#[must_use]
+pub fn root_server_with_page(
+    state: RootState,
+    policy: UnknownPolicy,
+    shared: Arc<Shared>,
+) -> Server {
+    root_server_over(
+        RootFamily {
+            state,
+            shared: Some(shared),
+        },
+        policy,
+    )
+}
+
+/// The root's server with `family`.
+fn root_server_over(family: RootFamily, policy: UnknownPolicy) -> Server {
     Server::new(ROOT_NAME, policy)
         .with_root(|| Box::new(GsvRoot))
         .with_interfaces(root_interfaces())
-        .with_checked_family(state, same_gpu_server)
+        .with_family(family)
 }
 
-/// The restore check of the root's state: a snapshot's gpu server number is the run's.
-fn same_gpu_server(run: &RootState, saved: &RootState) -> Result<(), &'static str> {
-    if run.gpu_server == saved.gpu_server {
+/// What every root session shares (the root server's family): the [`RootState`], and in a run
+/// with the shared syncpoint page the handle to gsv's shared state (module docs, "The shared
+/// syncpoint page (204)").
+///
+/// It implements [`Family`] by hand: a snapshot holds the [`RootState`] alone, as the
+/// [`RootState`]'s own `serde` form, and loading one keeps the handle. Loading refuses a
+/// snapshot whose gpu server number is not the run's ([`SnapshotError::FamilyWiring`]), before it
+/// changes anything (module docs, "The gpu session").
+pub struct RootFamily {
+    state: RootState,
+    shared: Option<Arc<Shared>>,
+}
+
+impl RootFamily {
+    /// The root's state.
+    #[must_use]
+    pub const fn state(&self) -> &RootState {
+        &self.state
+    }
+
+    /// Whether 204 binds the shared syncpoint page: the root was built with gsv's shared state.
+    #[must_use]
+    pub const fn has_page(&self) -> bool {
+        self.shared.is_some()
+    }
+}
+
+impl Family for RootFamily {
+    /// The [`RootState`]'s own bytes.
+    fn save_state(&self) -> Result<Vec<u8>, SnapshotError> {
+        self.state.save_state()
+    }
+
+    /// Reads a [`RootState`] and, if its gpu server number is the run's, takes it; the handle to
+    /// gsv's shared state stays.
+    fn load_state(&mut self, bytes: &[u8]) -> Result<(), SnapshotError> {
+        let mut saved = RootState::new();
+        saved.load_state(bytes)?;
+        if saved.gpu_server != self.state.gpu_server {
+            return Err(SnapshotError::FamilyWiring(
+                "its root names another gpu server",
+            ));
+        }
+        self.state = saved;
         Ok(())
-    } else {
-        Err("its root names another gpu server")
     }
 }

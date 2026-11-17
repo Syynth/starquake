@@ -19,6 +19,7 @@ use crate::memory::fixture::{self, CODE, CODE_SIZE, DATA};
 use crate::object::Object;
 use crate::process::{Console, ProcessDescription};
 use crate::result::KernelError;
+use crate::slab::SlabId;
 use crate::svc::{DebugSink, SvcId};
 use crate::tables::Scheduler;
 
@@ -364,4 +365,145 @@ fn the_hooked_events_ends_are_a_writable_end_for_the_guest_and_its_readable_end(
             assert_eq!(scheduler.objects().refs(writable), 2);
             assert_eq!(scheduler.objects().refs(readable), 1);
         });
+}
+
+/// The object a handle in the guest's table names.
+fn object_of(world: &World, handle: Handle) -> ObjectId {
+    world
+        .dispatcher
+        .with::<(&HandleTable,), _>(|(handles,)| handles.get(handle).unwrap())
+}
+
+#[test]
+fn a_hook_reattached_after_a_restore_runs_when_the_guest_signals() {
+    let world = World::new();
+    let old = Arc::new(Counting::default());
+    let (handle, writable, _) = world.hooked_event(Arc::<Counting>::clone(&old));
+    // What a restored kernel holds: the event, and no hook (hooks are code, not snapshotted).
+    world.dispatcher.hooks.clear();
+    assert_eq!(world.call_with_handle(SvcId::SignalEvent, handle), 0);
+    assert_eq!(old.signalled(), []);
+    // The service re-attaches its hook, and the guest's next signal runs it.
+    let new = Arc::new(Counting::default());
+    let hook: Arc<dyn EventHook> = Arc::<Counting>::clone(&new);
+    assert_eq!(
+        world
+            .dispatcher
+            .reattach_event_hook(SERVICE, writable, hook),
+        Ok(())
+    );
+    assert_eq!(world.call_with_handle(SvcId::SignalEvent, handle), 0);
+    assert_eq!(new.signalled(), [writable]);
+    assert_eq!(old.signalled(), []);
+}
+
+#[test]
+fn a_hook_is_reattached_only_to_a_writable_end_its_service_made() {
+    let world = World::new();
+    let (handle, writable, readable) = world.hooked_event(Arc::new(Counting::default()));
+    world.dispatcher.hooks.clear();
+    // An event the guest made itself: its writable end.
+    let mut regs = GuestRegs::default();
+    world.call(SvcId::CreateEvent, &mut regs);
+    assert_eq!(regs.x[0], 0);
+    let guests = object_of(&world, Handle::from_register(regs.x[1]));
+    let hook = Arc::new(Counting::default());
+    let refused = Err(KernelError::InvalidHandle);
+    let other_service = ServiceId(SERVICE.0 + 1);
+    let never_made = ObjectId::from_parts(0x7FFF, 9);
+    for (service, event) in [
+        // The readable end, which the guest cannot signal.
+        (SERVICE, readable),
+        // The right end, named for another service.
+        (other_service, writable),
+        // The guest's own event.
+        (SERVICE, guests),
+        // An id that names nothing.
+        (SERVICE, never_made),
+    ] {
+        let attached: Arc<dyn EventHook> = Arc::<Counting>::clone(&hook);
+        assert_eq!(
+            world
+                .dispatcher
+                .reattach_event_hook(service, event, attached),
+            refused,
+            "{service:?} {event:?}"
+        );
+    }
+    // Nothing was attached: the guest's signal runs no hook.
+    assert_eq!(world.dispatcher.hooks.len(), 0);
+    assert_eq!(world.call_with_handle(SvcId::SignalEvent, handle), 0);
+    assert_eq!(hook.signalled(), []);
+}
+
+/// Has the server make a plain event ([`IpcContext::create_event`]); returns its readable end.
+fn plain_event(world: &World) -> ObjectId {
+    let made = Arc::new(Mutex::new(None));
+    let keep = Arc::clone(&made);
+    let result = world.request(Box::new(move |cx, _| {
+        *keep.lock().unwrap() = Some(cx.create_event().unwrap());
+    }));
+    assert_eq!(result, 0);
+    made.lock().unwrap().take().unwrap()
+}
+
+#[test]
+fn a_service_event_is_a_live_end_of_one_its_server_made_and_nothing_else() {
+    let world = World::new();
+    let (_, writable, readable) = world.hooked_event(Arc::new(Counting::default()));
+    let plain = plain_event(&world);
+    // Either end of the hooked event, and the plain event's readable end.
+    for event in [writable, readable, plain] {
+        assert!(
+            world.dispatcher.is_service_event(SERVICE, event),
+            "{event:?}"
+        );
+    }
+    let mut regs = GuestRegs::default();
+    world.call(SvcId::CreateEvent, &mut regs);
+    assert_eq!(regs.x[0], 0);
+    let guests = object_of(&world, Handle::from_register(regs.x[1]));
+    let other_service = ServiceId(SERVICE.0 + 1);
+    for (service, event) in [
+        // The right event, named for another service (which has no server).
+        (other_service, writable),
+        // The guest's own event, either end.
+        (SERVICE, guests),
+        // An id that names nothing.
+        (SERVICE, ObjectId::from_parts(0x7FFF, 9)),
+    ] {
+        assert!(
+            !world.dispatcher.is_service_event(service, event),
+            "{service:?} {event:?}"
+        );
+    }
+}
+
+#[test]
+fn the_dispatcher_finds_a_live_transfer_memory_outside_any_request() {
+    let world = World::new();
+    let mut regs = GuestRegs::default();
+    regs.x[1] = DATA;
+    regs.x[2] = PAGE_SIZE;
+    regs.x[3] = u64::from(crate::memory::SvcPermission::Read.bits());
+    world.call(SvcId::CreateTransferMemory, &mut regs);
+    assert_eq!(regs.x[0], 0);
+    let handle = Handle::from_register(regs.x[1]);
+    let lent = object_of(&world, handle);
+    let found = world.dispatcher.transfer_memory(lent).unwrap();
+    assert_eq!((found.address(), found.size()), (DATA, PAGE_SIZE));
+    // An event is not one, nor an id that names nothing.
+    let (_, writable, _) = world.hooked_event(Arc::new(Counting::default()));
+    for object in [writable, ObjectId::from_parts(0x7FFF, 9)] {
+        assert_eq!(
+            world.dispatcher.transfer_memory(object),
+            Err(KernelError::InvalidHandle)
+        );
+    }
+    // Closed, it is gone.
+    assert_eq!(world.call_with_handle(SvcId::CloseHandle, handle), 0);
+    assert_eq!(
+        world.dispatcher.transfer_memory(lent),
+        Err(KernelError::InvalidHandle)
+    );
 }

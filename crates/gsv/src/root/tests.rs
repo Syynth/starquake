@@ -81,7 +81,7 @@ impl Rig {
     }
 
     fn state(&self) -> RootState {
-        *self.server.family::<RootState>().unwrap()
+        *self.server.family::<RootFamily>().unwrap().state()
     }
 
     /// `Initialize` with a fresh process handle.
@@ -904,7 +904,10 @@ fn a_root_saved_mid_bootstrap_restores_and_carries_on() {
 
     let mut restored = root_server(UnknownPolicy::Strict).with_service_id(ROOT);
     restored.restore(&saved).unwrap();
-    assert_eq!(restored.family::<RootState>(), Some(&state));
+    assert_eq!(
+        restored.family::<RootFamily>().map(RootFamily::state),
+        Some(&state)
+    );
     assert_eq!(restored.save().unwrap(), saved);
     rig.server = restored;
 
@@ -1122,7 +1125,10 @@ fn a_saved_state_no_command_reaches_is_refused() {
         let mut restored = root_server(UnknownPolicy::Strict);
         let refused = SnapshotError::Decode(postcard::Error::SerdeDeCustom);
         assert_eq!(restored.restore(&bytes), Err(refused), "{state:?}");
-        assert_eq!(restored.family::<RootState>(), Some(&RootState::new()));
+        assert_eq!(
+            restored.family::<RootFamily>().map(RootFamily::state),
+            Some(&RootState::new())
+        );
     }
 }
 
@@ -1165,7 +1171,10 @@ fn a_saved_state_at_each_edge_is_accepted() {
             .unwrap();
         let mut restored = root_server(UnknownPolicy::Strict);
         restored.restore(&bytes).unwrap();
-        assert_eq!(restored.family::<RootState>(), Some(&state));
+        assert_eq!(
+            restored.family::<RootFamily>().map(RootFamily::state),
+            Some(&state)
+        );
     }
 }
 

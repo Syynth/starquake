@@ -7,7 +7,8 @@
 //! * [`protocol`]: the root's command table, with each fact's mark and source.
 //! * [`root`]: the root's server: the bootstrap, and every other root command as a logged stub.
 //! * [`completion`]: the completion queue host threads report through.
-//! * [`shared`]: the state handlers and the timer thread share, the lock order, and the drain.
+//! * [`shared`]: the state handlers and the timer thread share, the lock order, the drain, and
+//!   the shared syncpoint page gsv 204 binds ([`shared::page`]).
 //! * [`note`]: the notes gsv records for replay.
 //! * [`nvsrv`]: the NVIDIA driver session (the nvdrv protocol), `/dev/nvmap`, and the GPU devices
 //!   (ctrl-gpu characteristics, as-gpu address-space views, tsg-gpu timeslice groups).

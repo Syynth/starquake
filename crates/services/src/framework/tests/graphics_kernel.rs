@@ -1,7 +1,8 @@
-//! The graphics server's four calls on [`Context`], through the fake kernel: a hooked event whose
-//! writable end the caller gets, the GPU-accessible range query, and the device-share lock and
-//! unlock, each with the kernel's refusals reaching the caller as the reply's result. A kernel
-//! that does not offer them answers "not implemented".
+//! The graphics server's calls on [`Context`], through the fake kernel: a hooked event whose
+//! writable end the caller gets, the GPU-accessible range query, the device-share lock and
+//! unlock, and a write into a transfer memory the request carries, each with the kernel's
+//! refusals reaching the caller as the reply's result. A kernel that does not offer them answers
+//! "not implemented".
 
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -30,6 +31,9 @@ const MAKE_EVENT: u32 = 0;
 const QUERY: u32 = 1;
 const LOCK: u32 = 2;
 const UNLOCK: u32 = 3;
+/// `WRITE_LENT`: in copy handle 0, a transfer memory; `u64 offset`, `u32 word`. Writes the word
+/// at the offset and replies the transfer memory's `u64 address`, `u64 size`.
+const WRITE_LENT: u32 = 4;
 
 /// What a hook heard: the events signalled, in order.
 #[derive(Default, Clone)]
@@ -69,6 +73,7 @@ commands! {
         QUERY => query,
         LOCK => lock,
         UNLOCK => unlock,
+        WRITE_LENT => write_lent,
     }
 }
 
@@ -111,6 +116,33 @@ impl Gpu {
         cx.unlock_device_share(device_share_token(process, address, size))?;
         reply.ok()
     }
+}
+
+impl Gpu {
+    fn write_lent(
+        _: &mut Self,
+        cx: &mut Context<'_>,
+        req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        let lent = req.copy_handle(0)?;
+        let mut payload = req.payload();
+        let (offset, word) = (payload.read_u64()?, payload.read_u32()?);
+        let memory = cx.transfer_memory(lent)?;
+        cx.write_transfer_memory(lent, offset, &word.to_le_bytes())?;
+        reply
+            .payload()
+            .write_u64(memory.address())
+            .write_u64(memory.size());
+        reply.ok()
+    }
+}
+
+/// `WRITE_LENT` with the handle `lent`, writing `word` at `offset`.
+fn write_lent(lent: u32, offset: u64, word: u32) -> RequestBuilder {
+    request(WRITE_LENT).copy_handle(lent).data(&payload(|w| {
+        w.write_u64(offset).write_u32(word);
+    }))
 }
 
 fn with_range(command: u32, address: u64, size: u64) -> RequestBuilder {
@@ -395,17 +427,63 @@ fn a_kernel_that_does_not_offer_the_calls_answers_not_implemented() {
     let heard = Heard::default();
     let (mut server, session) = rig(&heard);
     let mut kernel = Bare(kernel());
+    let object = kernel.0.lend(MEMORY, 0x1000, SvcPermission::None);
+    let lent = kernel.0.insert_handle(object).unwrap().raw();
     let not_implemented = only(KernelError::NotImplemented.code());
     for message in [
         request(MAKE_EVENT),
         with_range(QUERY, MEMORY, 0x1000),
         with_range(LOCK, MEMORY, 0x1000),
         with_range(UNLOCK, MEMORY, 0x1000),
+        write_lent(lent, 0, 1),
     ] {
         assert_eq!(
             send(&mut server, &mut kernel, session, &message),
             not_implemented
         );
     }
-    assert_eq!(kernel.0.handle_count(), 0);
+    assert_eq!(kernel.0.handle_count(), 1);
+    assert_eq!(kernel.0.memory(MEMORY, 4), Some(&[0; 4][..]));
+}
+
+#[test]
+fn a_server_writes_a_transfer_memory_the_request_carries_within_its_bounds() {
+    const LENT: u64 = 0x10;
+    let heard = Heard::default();
+    let (mut server, session) = rig(&heard);
+    let mut kernel = kernel();
+    let object = kernel.lend(MEMORY + 0x100, LENT, SvcPermission::Read);
+    let lent = kernel.insert_handle(object).unwrap().raw();
+    // The last word inside is written, and the reply names the transfer memory.
+    let reply = send(
+        &mut server,
+        &mut kernel,
+        session,
+        &write_lent(lent, LENT - 4, 0x0102_0304),
+    );
+    assert_eq!(reply.result, ResultCode::SUCCESS.raw());
+    assert_eq!(
+        reply.data,
+        payload(|w| {
+            w.write_u64(MEMORY + 0x100).write_u64(LENT);
+        })
+    );
+    assert_eq!(
+        kernel.memory(MEMORY + 0x100 + LENT - 4, 5),
+        Some(&[4, 3, 2, 1, 0][..])
+    );
+    // One byte further reaches past the end: the kernel's error, nothing written.
+    let reply = send(
+        &mut server,
+        &mut kernel,
+        session,
+        &write_lent(lent, LENT - 3, 0xFFFF_FFFF),
+    );
+    assert_eq!(reply, only(KernelError::InvalidCurrentMemory.code()));
+    assert_eq!(kernel.memory(MEMORY + 0x100 + LENT, 1), Some(&[0][..]));
+    // A handle to something that is not a transfer memory.
+    let other = kernel.new_object();
+    let other = kernel.insert_handle(other).unwrap().raw();
+    let reply = send(&mut server, &mut kernel, session, &write_lent(other, 0, 1));
+    assert_eq!(reply, only(KernelError::InvalidHandle.code()));
 }
