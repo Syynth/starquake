@@ -328,10 +328,16 @@ fn the_fixtures_conversation_with_sm_and_set_sys() {
             (SET_SYS, get_firmware_id),
         ]
     );
-    // Every session and handle is gone.
+    // Every session and handle is gone: the one object left is the process's own.
     let tables = rig.dispatcher.into_tables();
     assert!(tables.handles.is_empty());
-    assert!(tables.scheduler.objects().is_empty());
+    let own = tables.processes.own();
+    let process = tables.scheduler.process(own).unwrap().object();
+    assert_eq!(tables.scheduler.objects().len(), 1);
+    assert_eq!(
+        tables.scheduler.objects().get(process),
+        Ok(starquake_kernel::object::Object::Process(own))
+    );
     let names = set_interface.commands();
     assert_eq!(
         names.name(Protocol::Cmif, get_firmware_id),
@@ -537,11 +543,11 @@ fn applet_oe_serves_the_start_up_with_real_events() {
     let oe = rig.service(am::OE_NAME);
     let root = rig.convert(oe);
 
-    // libnx copies the current-process pseudo-handle, which the kernel does not resolve for IPC
-    // yet (`starquake_kernel::ipc::message`, divergences): the request never reaches the
-    // service.
-    let (code, _) = rig.send(oe, &open_proxy(root, Handle::CURRENT_PROCESS));
-    assert_eq!(code, KernelError::InvalidHandle.code());
+    // libnx copies the current-process pseudo-handle, which the kernel resolves to the calling
+    // process (`starquake_kernel::ipc::message`): the service opens a proxy.
+    let (code, buffer) = rig.send(oe, &open_proxy(root, Handle::CURRENT_PROCESS));
+    let (word, _, objects) = domain_reply(&buffer, 0);
+    assert_eq!((code, word, objects.len()), (ResultCode::SUCCESS, 0, 1));
 
     // Any handle the caller holds stands in for the process: the service does not use it.
     let (code, buffer) = rig.send(oe, &open_proxy(root, oe));

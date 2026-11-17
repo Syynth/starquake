@@ -295,8 +295,12 @@ impl World {
     fn with_handle_table(size: i32) -> Self {
         let mut description = ProcessDescription::homebrew(Console::Switch2);
         description.handle_table_size = size;
-        let dispatcher =
-            Dispatcher::new(crate::process::create(&description, fixture::loaded().0).unwrap());
+        Self::with_process(crate::process::create(&description, fixture::loaded().0).unwrap())
+    }
+
+    /// A world around the tables of a process already made.
+    fn with_process(tables: Tables) -> Self {
+        let dispatcher = Dispatcher::new(tables);
         let first = add_server(
             &dispatcher,
             "first",
@@ -465,7 +469,7 @@ fn a_port_nothing_is_registered_under_is_not_found() {
     }
     world.with_tables(|handles, scheduler| {
         assert!(handles.is_empty());
-        assert!(scheduler.objects().is_empty());
+        assert_eq!(scheduler.objects_besides_processes(), 0);
     });
 }
 
@@ -507,7 +511,7 @@ fn a_full_handle_table_gets_no_session_and_the_server_hears_of_none() {
     world.with_tables(|handles, scheduler| {
         assert_eq!(handles.len(), 1);
         // The one session left is the first connection's.
-        assert_eq!(scheduler.objects().len(), 1);
+        assert_eq!(scheduler.objects_besides_processes(), 1);
         assert!(!scheduler.ipc().has_any_notices());
     });
     assert_eq!(world.first.log().accepted.len(), 1);
@@ -583,6 +587,233 @@ fn a_handle_that_names_no_session_is_an_invalid_handle_and_reaches_no_server() {
         last,
         Some(send_event(A, thread, KernelError::InvalidHandle.code()).1)
     );
+}
+
+/// What a handler resolves each of a request's handles to (`IpcContext::resolve_handle`), and
+/// the reply it gives: every byte zero.
+fn resolving(handles: Vec<Handle>, seen: Arc<Mutex<Vec<SvcResult<ObjectId>>>>) -> Script {
+    Box::new(move |cx, _, message| {
+        let resolved = handles.iter().map(|handle| cx.resolve_handle(*handle));
+        lock(&seen).extend(resolved);
+        message.fill(0);
+        Ok(Handled::Replied)
+    })
+}
+
+/// The process `object` is the object of, or `None` for any other kind of object.
+fn process_named(scheduler: &Scheduler, object: ObjectId) -> Option<crate::id::ProcessId> {
+    if let Ok(Object::Process(process)) = scheduler.objects().get(object) {
+        Some(process)
+    } else {
+        None
+    }
+}
+
+/// A world whose process runs a user thread of its own on `thread`'s core, as the core loop
+/// runs its main thread, and that thread's object.
+fn world_running_a_user_thread(thread: ThreadId) -> (World, ObjectId) {
+    let mut tables = crate::process::create(
+        &ProcessDescription::homebrew(Console::Switch2),
+        fixture::loaded().0,
+    )
+    .unwrap();
+    let own = tables.processes.own();
+    let core = crate::sched::CoreId::new(core_of(thread)).unwrap();
+    let spec = crate::sched::UserThread {
+        entry: CODE,
+        argument: 0,
+        stack_top: DATA_END,
+        priority: crate::sched::Priority::new(44).unwrap(),
+        // Virtual core n is physical core n for the cores these tests use
+        // (`VIRTUAL_TO_PHYSICAL_CORE`).
+        virtual_core: core.index(),
+    };
+    let scheduler = &mut tables.scheduler;
+    let (id, object) = scheduler
+        .create_user_thread(&mut tables.address_space, own, &spec)
+        .unwrap();
+    scheduler.start(id).unwrap();
+    scheduler.update(GuestTicks(0), None, &mut Quiet).unwrap();
+    assert_eq!(scheduler.schedule(core, &mut Quiet), Ok(Some(id)));
+    (World::with_process(tables), object)
+}
+
+#[test]
+fn a_copied_current_process_reaches_the_server_as_the_senders_process_and_is_let_go() {
+    let world = World::new();
+    let handle = world.session();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    world
+        .first
+        .script(resolving(vec![Handle::CURRENT_PROCESS], Arc::clone(&seen)));
+    // As libnx's `_appletGetSessionProxy` sends `OpenApplicationProxy`: the process id and
+    // the current-process pseudo-handle.
+    let (record, regs) = world.send(
+        A,
+        handle,
+        &request()
+            .send_pid(0)
+            .copy_handle(Handle::CURRENT_PROCESS.raw()),
+    );
+    assert_eq!(record.outcome, Outcome::Completed);
+    assert_eq!(result(&regs), ResultCode::SUCCESS);
+    let object = lock(&seen)[0].unwrap();
+    world.with_tables(|handles, scheduler| {
+        let process = process_named(scheduler, object).unwrap();
+        assert_eq!(scheduler.process(process).unwrap().object(), object);
+        // The request's reference went when it ended; the process's own stays.
+        assert_eq!(scheduler.objects().refs(object), 1);
+        // The pseudo-handle took no entry in the table.
+        assert_eq!(handles.len(), 1);
+    });
+}
+
+#[test]
+fn a_copied_current_thread_reaches_the_server_as_the_calling_thread() {
+    let (world, thread) = world_running_a_user_thread(A);
+    let handle = world.session();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    world.first.script(resolving(
+        vec![Handle::CURRENT_THREAD, Handle::CURRENT_PROCESS],
+        Arc::clone(&seen),
+    ));
+    let thread_refs = world.with_tables(|_, scheduler| scheduler.objects().refs(thread));
+    let (record, regs) = world.send(
+        A,
+        handle,
+        &request()
+            .copy_handle(Handle::CURRENT_THREAD.raw())
+            .copy_handle(Handle::CURRENT_PROCESS.raw()),
+    );
+    assert_eq!(record.outcome, Outcome::Completed);
+    assert_eq!(result(&regs), ResultCode::SUCCESS);
+    let seen = lock(&seen).clone();
+    assert_eq!(seen[0], Ok(thread));
+    world.with_tables(|_, scheduler| {
+        let process = process_named(scheduler, seen[1].unwrap()).unwrap();
+        assert_eq!(seen[1], Ok(scheduler.process(process).unwrap().object()));
+        assert_eq!(scheduler.objects().refs(thread), thread_refs);
+    });
+}
+
+#[test]
+fn a_copied_current_thread_names_the_thread_on_the_senders_own_core() {
+    // A user thread runs on A's core; B sends from its own core, which runs nothing.
+    let (world, thread) = world_running_a_user_thread(A);
+    assert_ne!(core_of(A), core_of(B));
+    let handle = world.session();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    world
+        .first
+        .script(resolving(vec![Handle::CURRENT_THREAD], Arc::clone(&seen)));
+    let (record, regs) = world.send(
+        B,
+        handle,
+        &request().copy_handle(Handle::CURRENT_THREAD.raw()),
+    );
+    assert_eq!(record.outcome, Outcome::Completed);
+    assert_eq!(result(&regs), KernelError::InvalidHandle.code());
+    assert_eq!(
+        world.first.log().handled,
+        Vec::<(ObjectId, MessageBuffer)>::new()
+    );
+    // The same request from A's core reaches the server as A's core's thread.
+    let (record, regs) = world.send(
+        A,
+        handle,
+        &request().copy_handle(Handle::CURRENT_THREAD.raw()),
+    );
+    assert_eq!(record.outcome, Outcome::Completed);
+    assert_eq!(result(&regs), ResultCode::SUCCESS);
+    assert_eq!(*lock(&seen), [Ok(thread)]);
+}
+
+#[test]
+fn a_request_holding_current_process_that_fails_on_a_later_bad_handle_lets_the_process_go() {
+    let tables = crate::process::create(
+        &ProcessDescription::homebrew(Console::Switch2),
+        fixture::loaded().0,
+    )
+    .unwrap();
+    let own = tables.processes.own();
+    let process = tables.scheduler.process(own).unwrap().object();
+    let world = World::with_process(tables);
+    let handle = world.session();
+    world.first.script(reply_with(0));
+    assert_eq!(
+        world.with_tables(|_, scheduler| scheduler.objects().refs(process)),
+        1
+    );
+    let stale = Handle::from_raw(0x7_0123);
+    let (record, regs) = world.send(
+        A,
+        handle,
+        &request()
+            .copy_handle(Handle::CURRENT_PROCESS.raw())
+            .copy_handle(stale.raw()),
+    );
+    assert_eq!(record.outcome, Outcome::Completed);
+    assert_eq!(result(&regs), KernelError::InvalidHandle.code());
+    assert_eq!(
+        world.first.log().handled,
+        Vec::<(ObjectId, MessageBuffer)>::new()
+    );
+    // The reference the request held went with it; the process's own stays.
+    world.with_tables(|handles, scheduler| {
+        assert_eq!(scheduler.objects().refs(process), 1);
+        assert_eq!(handles.len(), 1);
+    });
+}
+
+#[test]
+fn a_copied_current_thread_from_a_core_whose_thread_has_no_object_is_an_invalid_handle() {
+    let world = World::new();
+    let handle = world.session();
+    // A core with no scheduler thread, then one running a thread of no process.
+    for running in [false, true] {
+        if running {
+            run_thread_for(&world, A);
+        }
+        let (record, regs) = world.send(
+            A,
+            handle,
+            &request().copy_handle(Handle::CURRENT_THREAD.raw()),
+        );
+        assert_eq!(record.outcome, Outcome::Completed);
+        assert_eq!(
+            result(&regs),
+            KernelError::InvalidHandle.code(),
+            "running: {running}"
+        );
+    }
+    assert_eq!(
+        world.first.log().handled,
+        Vec::<(ObjectId, MessageBuffer)>::new()
+    );
+}
+
+#[test]
+fn a_moved_current_process_is_an_invalid_handle_and_reaches_no_server() {
+    let world = World::new();
+    let handle = world.session();
+    let before = world.with_tables(|_, scheduler| scheduler.objects().len());
+    let (record, regs) = world.send(
+        A,
+        handle,
+        &request().move_handle(Handle::CURRENT_PROCESS.raw()),
+    );
+    assert_eq!(record.outcome, Outcome::Completed);
+    assert_eq!(result(&regs), KernelError::InvalidHandle.code());
+    assert_eq!(
+        world.first.log().handled,
+        Vec::<(ObjectId, MessageBuffer)>::new()
+    );
+    // Nothing was taken or let go: the session's handle and the objects are as they were.
+    world.with_tables(|handles, scheduler| {
+        assert_eq!(handles.len(), 1);
+        assert_eq!(scheduler.objects().len(), before);
+        assert_eq!(scheduler.objects_besides_processes(), 1);
+    });
 }
 
 #[test]
@@ -675,7 +906,7 @@ fn a_request_that_moves_its_own_sessions_last_handle_after_a_bad_one_destroys_th
     assert_eq!(result(&regs), KernelError::InvalidHandle.code());
     world.with_tables(|handles, scheduler| {
         assert!(handles.is_empty());
-        assert!(scheduler.objects().is_empty());
+        assert_eq!(scheduler.objects_besides_processes(), 0);
         assert!(!scheduler.ipc().is_session(session));
         assert!(!scheduler.ipc().has_any_notices());
     });
@@ -756,7 +987,7 @@ fn closing_the_last_handle_tells_the_server_and_one_of_two_does_not() {
     assert_eq!(world.first.log().closed, [session]);
     world.with_tables(|handles, scheduler| {
         assert!(handles.is_empty());
-        assert!(scheduler.objects().is_empty());
+        assert_eq!(scheduler.objects_besides_processes(), 0);
         assert!(!scheduler.ipc().is_session(session));
     });
 }
@@ -772,7 +1003,7 @@ fn exiting_the_process_closes_its_sessions_and_the_server_is_told() {
     assert_eq!(world.first.log().closed, [session]);
     world.with_tables(|handles, scheduler| {
         assert!(handles.is_empty());
-        assert!(scheduler.objects().is_empty());
+        assert_eq!(scheduler.objects_besides_processes(), 0);
         assert!(!scheduler.ipc().is_session(session));
     });
 }

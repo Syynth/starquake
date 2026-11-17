@@ -11,10 +11,21 @@
 //! - Each copied handle that is not [`Handle::INVALID`] is looked up in the sender's table
 //!   (`GetObjectForIpc`) while no earlier handle has failed; one that names nothing makes the
 //!   request's result [`KernelError::InvalidHandle`], and the handles after it are skipped.
+//!   The two pseudo-handles are answered without the table: [`Handle::CURRENT_THREAD`] names
+//!   the sending thread and [`Handle::CURRENT_PROCESS`] its process ([`Current`]), and the
+//!   request holds a reference to that object as it does for any other copied handle
+//!   (`KHandleTable::GetObjectForIpc`, `eden/src/core/hle/kernel/k_handle_table.cpp` @
+//!   cf654052: `cur_thread->GetOwnerProcess()` for `PseudoHandle::CurrentProcess`, `cur_thread`
+//!   for `PseudoHandle::CurrentThread`).
 //! - Each moved handle that is not [`Handle::INVALID`] is removed from the sender's table
 //!   whether or not the request has failed (`src_handle_table.Remove`); while it has not, the
-//!   handle is looked up first without pseudo-handles (`GetObjectForIpcWithoutPseudoHandle`),
-//!   and one that names nothing is [`KernelError::InvalidHandle`].
+//!   handle is looked up first without pseudo-handles (`GetObjectForIpcWithoutPseudoHandle`,
+//!   `eden/src/core/hle/kernel/k_handle_table.h` @ cf654052, which reads only the table), and
+//!   one that names nothing is [`KernelError::InvalidHandle`]. A moved pseudo-handle is
+//!   therefore [`KernelError::InvalidHandle`], and removing it removes nothing (`Remove`
+//!   returns false for a pseudo-handle, `k_handle_table.cpp`); the moved handles after it are
+//!   still removed. Test:
+//!   `a_moved_pseudo_handle_is_an_invalid_handle_and_later_moves_still_leave_the_table`.
 //!
 //! Once the request has failed, a moved handle's object is not held, so removing the handle can
 //! drop the object's last reference. [`Translation::destroyed`] lists those objects, and the
@@ -29,17 +40,20 @@
 //! guest cannot tell the difference: the message the server sees is not visible to it.
 //!
 //! Divergences from Eden, each pinned by the named test below:
-//! - A pseudo-handle among the copied handles is [`KernelError::InvalidHandle`]. Horizon's
-//!   `GetObjectForIpc` gives the current thread or process, and the kernel here has no object
-//!   for either yet (kernel slice 8 creates them). Test:
-//!   `a_copied_pseudo_handle_is_an_invalid_handle_until_processes_are_objects`.
+//! - A copied pseudo-handle whose object the caller does not supply ([`Current`] holds `None`
+//!   for it) is [`KernelError::InvalidHandle`]. Eden asserts that the current thread and its
+//!   process exist (`ASSERT(cur_thread != nullptr)`, `ASSERT(cur_process != nullptr)` in
+//!   `GetObjectForIpc`). Here the dispatcher supplies `None` for the thread only when the
+//!   calling core runs no scheduler thread that has an object, which no guest thread is; every
+//!   process has an object from its creation. Test:
+//!   `a_copied_pseudo_handle_whose_object_is_missing_is_an_invalid_handle`.
 //! - When a reference cannot be opened (an object's count is at its maximum), the request is
 //!   [`KernelError::OutOfResource`]; Eden's `KScopedAutoObject` cannot fail. Unreachable from a
 //!   guest in practice (four billion references); not separately tested.
 
 use starquake_ipc::{BUFFER_SIZE, CommandHeader, SpecialHeader};
 
-use crate::handle::{Closed, Handle, HandleTable, ObjectRefs};
+use crate::handle::{Closed, Handle, HandleTable, ObjectRefs, Resolved};
 use crate::id::ObjectId;
 use crate::object::Objects;
 use crate::result::KernelError;
@@ -79,6 +93,17 @@ impl Translated {
     }
 }
 
+/// The objects the two pseudo-handles name for a request's sender: what Eden's
+/// `GetObjectForIpc` answers for [`Handle::CURRENT_THREAD`] (`cur_thread`) and
+/// [`Handle::CURRENT_PROCESS`] (`cur_thread->GetOwnerProcess()`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Current {
+    /// The sending thread's object, or `None` when the calling core runs no thread with one.
+    pub thread: Option<ObjectId>,
+    /// The sending process's object, or `None` when the process has none.
+    pub process: Option<ObjectId>,
+}
+
 /// What [`translate`] did to a request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Translation {
@@ -110,6 +135,7 @@ fn word(message: &MessageBuffer, offset: usize) -> Option<u32> {
 pub fn translate(
     message: &mut MessageBuffer,
     process_id: u64,
+    current: Current,
     handles: &mut HandleTable,
     objects: &mut Objects,
 ) -> Translation {
@@ -146,7 +172,14 @@ pub fn translate(
         if result.is_err() || handle == Handle::INVALID {
             continue;
         }
-        *result = hold(translated, objects, handle, handles.get(handle).ok());
+        // `GetObjectForIpc`: a pseudo-handle names the sender's thread or process.
+        let object = match handles.resolve(handle) {
+            Ok(Resolved::CurrentThread) => current.thread,
+            Ok(Resolved::CurrentProcess) => current.process,
+            Ok(Resolved::Object(object)) => Some(object),
+            Err(_) => None,
+        };
+        *result = hold(translated, objects, handle, object);
     }
     for _ in 0..special.num_move_handles {
         let handle = Handle::from_raw(word(message, offset).unwrap_or_default());
@@ -189,7 +222,7 @@ mod tests {
     use starquake_ipc::{CommandType, RequestBuilder};
 
     use super::*;
-    use crate::id::{SlabId, ThreadId};
+    use crate::id::{ProcessId, SlabId, ThreadId};
     use crate::object::Object;
 
     /// A handle table and an object table holding `count` thread objects, each with one handle.
@@ -231,7 +264,13 @@ mod tests {
             translated,
             result,
             destroyed,
-        } = translate(&mut message, 0x51, &mut handles, &mut objects);
+        } = translate(
+            &mut message,
+            0x51,
+            Current::default(),
+            &mut handles,
+            &mut objects,
+        );
         assert_eq!((translated, result), (Translated::default(), Ok(())));
         assert_eq!(destroyed, Vec::<ObjectId>::new());
         assert_eq!(message, before);
@@ -248,7 +287,13 @@ mod tests {
             translated,
             result,
             destroyed,
-        } = translate(&mut message, 0x51, &mut handles, &mut objects);
+        } = translate(
+            &mut message,
+            0x51,
+            Current::default(),
+            &mut handles,
+            &mut objects,
+        );
         assert_eq!((translated, result), (Translated::default(), Ok(())));
         assert_eq!(destroyed, Vec::<ObjectId>::new());
         assert_eq!(message, expected);
@@ -270,7 +315,13 @@ mod tests {
             translated,
             result,
             destroyed,
-        } = translate(&mut message, 0, &mut handles, &mut objects);
+        } = translate(
+            &mut message,
+            0,
+            Current::default(),
+            &mut handles,
+            &mut objects,
+        );
         assert_eq!(result, Ok(()));
         assert_eq!(destroyed, Vec::<ObjectId>::new());
         assert_eq!(translated.held, [object_a, object_b]);
@@ -294,7 +345,13 @@ mod tests {
             translated,
             result,
             destroyed,
-        } = translate(&mut message, 0, &mut handles, &mut objects);
+        } = translate(
+            &mut message,
+            0,
+            Current::default(),
+            &mut handles,
+            &mut objects,
+        );
         assert_eq!(result, Ok(()));
         // The request holds the moved object, so removing its handle destroys nothing.
         assert_eq!(destroyed, Vec::<ObjectId>::new());
@@ -318,7 +375,13 @@ mod tests {
             translated,
             result,
             destroyed,
-        } = translate(&mut message, 0, &mut handles, &mut objects);
+        } = translate(
+            &mut message,
+            0,
+            Current::default(),
+            &mut handles,
+            &mut objects,
+        );
         assert_eq!((translated, result), (Translated::default(), Ok(())));
         assert_eq!(destroyed, Vec::<ObjectId>::new());
         assert!(handles.get(made[0]).is_ok());
@@ -341,7 +404,13 @@ mod tests {
             translated,
             result,
             destroyed,
-        } = translate(&mut message, 0, &mut handles, &mut objects);
+        } = translate(
+            &mut message,
+            0,
+            Current::default(),
+            &mut handles,
+            &mut objects,
+        );
         assert_eq!(result, Err(KernelError::InvalidHandle));
         // The handle before the bad one is held (the caller releases it); none after.
         assert_eq!(translated.held, [object_a]);
@@ -370,7 +439,13 @@ mod tests {
             translated,
             result,
             destroyed,
-        } = translate(&mut message, 0, &mut handles, &mut objects);
+        } = translate(
+            &mut message,
+            0,
+            Current::default(),
+            &mut handles,
+            &mut objects,
+        );
         assert_eq!(result, Err(KernelError::InvalidHandle));
         assert_eq!(translated.held, Vec::<ObjectId>::new());
         // The good handle after it still left the table, and its session with it: the caller
@@ -380,21 +455,169 @@ mod tests {
         assert_eq!(destroyed, [session]);
     }
 
+    /// The sender's thread and process as objects, each holding one reference (its owner's:
+    /// the scheduler's thread row and process row hold them so), with ids no table entry has.
+    fn current(objects: &mut Objects) -> Current {
+        let thread = objects
+            .create(Object::Thread(ThreadId::from_parts(40, 2)))
+            .unwrap();
+        let process = objects
+            .create(Object::Process(ProcessId::from_parts(0, 1)))
+            .unwrap();
+        Current {
+            thread: Some(thread),
+            process: Some(process),
+        }
+    }
+
+    /// What `pseudo` names in `current`, and the object the other pseudo-handle names.
+    fn named(current: Current, pseudo: Handle) -> (ObjectId, ObjectId) {
+        let (thread, process) = (current.thread.unwrap(), current.process.unwrap());
+        if pseudo == Handle::CURRENT_THREAD {
+            (thread, process)
+        } else {
+            (process, thread)
+        }
+    }
+
     #[test]
-    fn a_copied_pseudo_handle_is_an_invalid_handle_until_processes_are_objects() {
+    fn a_copied_pseudo_handle_is_the_senders_thread_or_process_and_the_request_holds_it() {
         for pseudo in [Handle::CURRENT_THREAD, Handle::CURRENT_PROCESS] {
-            let (mut handles, mut objects, _) = table(0);
+            let (mut handles, mut objects, made) = table(1);
+            let current = current(&mut objects);
+            let (expected, other) = named(current, pseudo);
             let mut message = build(&request().copy_handle(pseudo.raw()));
+            let before = message;
             let Translation {
                 translated,
                 result,
                 destroyed,
-            } = translate(&mut message, 0, &mut handles, &mut objects);
-            assert_eq!(
-                (translated, result),
-                (Translated::default(), Err(KernelError::InvalidHandle))
-            );
+            } = translate(&mut message, 0, current, &mut handles, &mut objects);
+            assert_eq!(result, Ok(()), "{pseudo:?}");
             assert_eq!(destroyed, Vec::<ObjectId>::new());
+            assert_eq!(translated.held, [expected]);
+            assert_eq!(translated.object(pseudo), Some(expected));
+            // The request opened a reference, as for an ordinary copied handle; the other
+            // pseudo-handle's object and the table are untouched.
+            assert_eq!((objects.refs(expected), objects.refs(other)), (2, 1));
+            assert_eq!(handles.len(), 1);
+            assert!(handles.get(made[0]).is_ok());
+            // The handle word is the sender's.
+            assert_eq!(message, before);
+        }
+    }
+
+    #[test]
+    fn pseudo_handles_copied_with_an_ordinary_handle_each_name_their_own_object_in_order() {
+        let (mut handles, mut objects, made) = table(1);
+        let a = made[0];
+        let object_a = handles.get(a).unwrap();
+        let current = current(&mut objects);
+        let (thread, process) = (current.thread.unwrap(), current.process.unwrap());
+        let mut message = build(
+            &request()
+                .send_pid(0)
+                .copy_handle(Handle::CURRENT_PROCESS.raw())
+                .copy_handle(a.raw())
+                .copy_handle(Handle::CURRENT_THREAD.raw()),
+        );
+        let Translation {
+            translated,
+            result,
+            destroyed,
+        } = translate(&mut message, 0x51, current, &mut handles, &mut objects);
+        assert_eq!(result, Ok(()));
+        assert_eq!(destroyed, Vec::<ObjectId>::new());
+        assert_eq!(translated.held, [process, object_a, thread]);
+        assert_eq!(translated.object(Handle::CURRENT_PROCESS), Some(process));
+        assert_eq!(translated.object(Handle::CURRENT_THREAD), Some(thread));
+        assert_eq!(translated.object(a), Some(object_a));
+        for object in [process, object_a, thread] {
+            assert_eq!(objects.refs(object), 2);
+        }
+    }
+
+    #[test]
+    fn a_copied_pseudo_handle_whose_object_is_missing_is_an_invalid_handle() {
+        for pseudo in [Handle::CURRENT_THREAD, Handle::CURRENT_PROCESS] {
+            let (mut handles, mut objects, _) = table(0);
+            let full = current(&mut objects);
+            let (_, other) = named(full, pseudo);
+            // Only the other pseudo-handle has an object, so a swap of the two shows; and
+            // then neither has one.
+            let only_other = if pseudo == Handle::CURRENT_THREAD {
+                Current {
+                    thread: None,
+                    ..full
+                }
+            } else {
+                Current {
+                    process: None,
+                    ..full
+                }
+            };
+            for current in [only_other, Current::default()] {
+                let mut message = build(&request().copy_handle(pseudo.raw()));
+                let Translation {
+                    translated,
+                    result,
+                    destroyed,
+                } = translate(&mut message, 0, current, &mut handles, &mut objects);
+                assert_eq!(
+                    (translated, result),
+                    (Translated::default(), Err(KernelError::InvalidHandle)),
+                    "{pseudo:?} with {current:?}"
+                );
+                assert_eq!(destroyed, Vec::<ObjectId>::new());
+                assert_eq!(objects.refs(other), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn a_copied_pseudo_handle_after_a_failed_one_is_not_held() {
+        let (mut handles, mut objects, _) = table(0);
+        let current = current(&mut objects);
+        let process = current.process.unwrap();
+        let stale = Handle::from_parts(5, 9).unwrap();
+        let mut message = build(
+            &request()
+                .copy_handle(stale.raw())
+                .copy_handle(Handle::CURRENT_PROCESS.raw()),
+        );
+        let Translation {
+            translated, result, ..
+        } = translate(&mut message, 0, current, &mut handles, &mut objects);
+        assert_eq!(
+            (translated, result),
+            (Translated::default(), Err(KernelError::InvalidHandle))
+        );
+        assert_eq!(objects.refs(process), 1);
+    }
+
+    #[test]
+    fn a_moved_pseudo_handle_is_an_invalid_handle_and_later_moves_still_leave_the_table() {
+        for pseudo in [Handle::CURRENT_THREAD, Handle::CURRENT_PROCESS] {
+            let (mut handles, mut objects, made) = table(1);
+            let a = made[0];
+            let object_a = handles.get(a).unwrap();
+            let current = current(&mut objects);
+            let (named, other) = named(current, pseudo);
+            let mut message = build(&request().move_handle(pseudo.raw()).move_handle(a.raw()));
+            let Translation {
+                translated,
+                result,
+                destroyed,
+            } = translate(&mut message, 0, current, &mut handles, &mut objects);
+            // `GetObjectForIpcWithoutPseudoHandle` names nothing for a pseudo-handle.
+            assert_eq!(result, Err(KernelError::InvalidHandle), "{pseudo:?}");
+            assert_eq!(translated, Translated::default());
+            // Neither the thread nor the process gained or lost a reference.
+            assert_eq!((objects.refs(named), objects.refs(other)), (1, 1));
+            // The ordinary handle moved after it still left the table, with its object's last
+            // reference.
+            assert!(handles.is_empty());
+            assert_eq!(destroyed, [object_a]);
         }
     }
 
@@ -409,7 +632,13 @@ mod tests {
             translated,
             result,
             destroyed,
-        } = translate(&mut message, 0, &mut handles, &mut objects);
+        } = translate(
+            &mut message,
+            0,
+            Current::default(),
+            &mut handles,
+            &mut objects,
+        );
         assert_eq!(result, Ok(()));
         assert_eq!(destroyed, Vec::<ObjectId>::new());
         assert_eq!(translated.held.len(), 1);

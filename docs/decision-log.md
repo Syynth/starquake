@@ -353,3 +353,35 @@ Entry format:
 - **WHAT:** The owner made the repository public so that `main` could be protected, after inviting a human contributor. `main` now accepts changes only through pull requests whose `linux` and `title` checks have passed, with no force-pushes or deletion, and the rules apply to admins too. No approving review is required, because the agents merge under the owner's account and GitHub does not let an account approve its own pull request; the macOS check is not required because it is skipped on most pull requests. Before the change the history, issues and pull requests were audited: no local paths, dump details, keys or tokens. Commit metadata carries the owner's name and email, as it already does in the owner's other public repositories.
 - **WHY:** Branch protection is not available for private repositories on the owner's plan, and with a second person able to push, "never push to main" needed to be enforced rather than trusted. Public repositories also get free Actions minutes, including macOS.
 
+
+## Services Context gains clear_event and process termination
+- **WHEN:** 2026-11-16
+- **PROJECT:** starquake
+- **SYSTEM:** services
+- **SCOPE:** moderate (spec amendment)
+- **WHAT:** Amend docs/specs/services.md: the kernel interface (Context) gains clear_event, and a call by which a service ends the calling process (ISelfController::Exit); termination runs after the reply is sent, through the kernel's normal teardown path.
+- **WHY:** Eden clears the applet message event at SetFocusHandlingMode(0,0,1), and without clear_event libnx's main loop wakes on every poll; Exit needs a service-initiated termination the spec did not offer. Both are on the real-title path to M2.
+
+## RomFS from a NUP: positional reads and a capped decompression cache
+- **WHEN:** 2026-11-16
+- **PROJECT:** starquake
+- **SYSTEM:** loader / fsp-srv
+- **SCOPE:** moderate
+- **WHAT:** The file-system service reads a NUP's RomFS through positional reads (read_at on a shared source), so open files share one source. A compressed file (one zstd frame, no random access) is decompressed whole on first open into a size-capped in-memory cache, evicted least-recently-used and re-decompressed on a miss.
+- **WHY:** The reader's mutable borrow stops open files sharing the source, and guests read at arbitrary offsets; an in-memory cache keeps it simple and free of host file I/O (which would have to go through Env), with the cap bounding memory.
+
+## M2 runs a title's base package only
+- **WHEN:** 2026-11-16
+- **PROJECT:** starquake
+- **SYSTEM:** loader / core
+- **SCOPE:** minor/local
+- **WHAT:** For M2, a NUP with several packages runs its base package and logs that updates are ignored. How an update combines with its base is ruled on when a title needs one.
+- **WHY:** The update rules (replace or overlay the ExeFS, which version wins, how packages relate by title id) need checking against the reference, and nothing on the M2 path needs an update.
+
+## Render capture v2 is designed in M3
+- **WHEN:** 2026-11-16
+- **PROJECT:** starquake
+- **SYSTEM:** render-backend
+- **SCOPE:** minor/local
+- **WHAT:** The self-contained capture format (v2: creation calls and a serialisable shader description, replayable on a fresh backend) is designed in M3, with the first real backend slices, before R5.
+- **WHY:** It is not on the M2 path, and it depends on the shader description, which is not settled yet.

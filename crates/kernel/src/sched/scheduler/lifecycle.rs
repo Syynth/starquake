@@ -89,13 +89,21 @@ fn broken(what: impl core::fmt::Display) -> SvcError {
 }
 
 impl Scheduler {
-    /// Gives the scheduler a row for a new process, in [`ProcessState::Created`]. A process it
-    /// already has is damaged bookkeeping ([`SchedError::Corrupt`]).
+    /// Gives the scheduler a row for a new process, in [`ProcessState::Created`], and the
+    /// process its object ([`Object::Process`], [`ProcessRecord::object`]), whose one reference
+    /// the row holds: Horizon's `KProcess` is an auto object from its creation, and a copied
+    /// [`crate::handle::Handle::CURRENT_PROCESS`] in an IPC request names it
+    /// ([`crate::ipc::message`]). Rows are never removed, so that reference is never closed.
+    ///
+    /// A process it already has is damaged bookkeeping ([`SchedError::Corrupt`]), checked
+    /// before the object is made; a full object table is [`SchedError::Object`], with no row
+    /// added.
     pub fn add_process(&mut self, process: ProcessId) -> Result<(), SchedError> {
         if self.processes.contains_key(&process) {
             return Err(SchedError::Corrupt);
         }
-        self.processes.insert(process, ProcessRecord::new());
+        let object = self.objects.create(Object::Process(process))?;
+        self.processes.insert(process, ProcessRecord::new(object));
         Ok(())
     }
 

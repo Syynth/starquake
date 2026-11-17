@@ -60,10 +60,10 @@ sub-interface (`IApplicationProxy`, `ISelfController`, ...) are named by the int
 reference logs them.
 
 The list is of what starquake's tables lack, not of where its run stops. The run first differs
-earlier, at line 47: libnx copies the current-process pseudo-handle with `appletOE`'s
-`OpenApplicationProxy`, and starquake's kernel does not yet resolve a pseudo-handle copied in a
-request (`starquake_kernel::ipc::message`, its divergences), so the `SendSyncRequest` carrying
-it fails with the kernel's invalid-handle result (`0xe401`) before `appletOE` sees it.
+earlier, at line 91, the reference's first request to `hid` (`QueryPointerBufferSize`, a control
+request). starquake has no `hid`: `sm:`'s `GetService` at line 89 hands the run a stub session of
+the `sm:` server instead (`UnknownPolicy::AutoStub`, the policy `crates/core/src/hle.rs` sets),
+so the run's request at line 91 goes to `sm:`.
 
 `crates/core/tests/homebrew.rs` writes this list from the trace and starquake's tables, and
 fails (`the_startup_gap_list_in_its_readme_is_the_one_the_trace_gives`) when the text between
