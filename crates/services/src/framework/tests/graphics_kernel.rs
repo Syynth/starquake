@@ -82,20 +82,20 @@ impl Gpu {
         reply.ok()
     }
 
-    fn query(&mut self, cx: &mut Context<'_>, req: &Request<'_>, reply: &mut Reply) -> Outcome {
+    fn query(_: &mut Self, cx: &mut Context<'_>, req: &Request<'_>, reply: &mut Reply) -> Outcome {
         let (address, size) = range(req)?;
         let accessible = cx.is_gpu_accessible(address, size)?;
         reply.payload().write_u8(u8::from(accessible));
         reply.ok()
     }
 
-    fn lock(&mut self, cx: &mut Context<'_>, req: &Request<'_>, reply: &mut Reply) -> Outcome {
+    fn lock(_: &mut Self, cx: &mut Context<'_>, req: &Request<'_>, reply: &mut Reply) -> Outcome {
         let (address, size) = range(req)?;
         cx.lock_device_share(address, size)?;
         reply.ok()
     }
 
-    fn unlock(&mut self, cx: &mut Context<'_>, req: &Request<'_>, reply: &mut Reply) -> Outcome {
+    fn unlock(_: &mut Self, cx: &mut Context<'_>, req: &Request<'_>, reply: &mut Reply) -> Outcome {
         let (address, size) = range(req)?;
         cx.unlock_device_share(address, size)?;
         reply.ok()
