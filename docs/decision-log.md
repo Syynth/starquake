@@ -394,3 +394,43 @@ Entry format:
 - **SCOPE:** minor/local
 - **WHAT:** For M2, a NUP title runs its newest package: that package's ExeFS, and the file-system service serves that same package's RomFS. Base and update are never mixed. A NUP whose newest update is not complete (a patch needing the base) is an error in plain words until overlay rules are decided. Supersedes "M2 runs a title's base package only" (2026-11-16), which was ruled on the wrong premise that nothing chose a package yet.
 - **WHY:** `starquake run` already runs the newest update, and the owner's dump shows a NUP update carrying a complete ExeFS and RomFS, so running it whole needs no overlay rules and plays the newest version.
+
+## The run's date comes from the host, recorded
+- **WHEN:** 2026-11-17
+- **PROJECT:** starquake
+- **SYSTEM:** services / observability
+- **SCOPE:** moderate (spec amendment)
+- **WHAT:** Env gains a wall-clock reading, taken once at boot and recorded so a replay reproduces it; it is the RTC at boot unless a setting pins a date (tests always pin one). time:u owns turning the RTC and uptime into calendar time; the kernel keeps owning ticks.
+- **WHY:** Games use the date for save timestamps and daily events, so a fixed 2023 date is wrong for play; reading it once and recording it keeps runs replayable.
+
+## Event hooks are re-attached by their owner after a restore
+- **WHEN:** 2026-11-17
+- **PROJECT:** starquake
+- **SYSTEM:** kernel / gsv
+- **SCOPE:** moderate (spec amendment)
+- **WHAT:** A snapshot saves which events are hooked and by which service; the owning service re-attaches its callbacks in its restore step, checked against the restored events, before the guest runs again.
+- **WHY:** A hook is code and cannot be serialised; keeping re-attachment with the owner keeps service-specific callbacks out of the kernel, and doing it before the guest resumes means no signal is missed.
+
+## Device-share unlocks go through gsv's completion queue
+- **WHEN:** 2026-11-17
+- **PROJECT:** starquake
+- **SYSTEM:** gsv / kernel
+- **SCOPE:** moderate (spec amendment)
+- **WHAT:** Taking a device-share lock returns a token naming the process and the exact range. When the host GPU finishes, the GPU thread posts the token to gsv's completion queue, and the timer thread, draining it in its recorded order, unlocks through the kernel, which validates the token.
+- **WHY:** The unlocking host thread is not a guest thread, so it cannot name 'the current process'; routing it through the recorded queue keeps unlock timing deterministic for replay.
+
+## Env failures: replay failures stop the run, host I/O failures are guest results
+- **WHEN:** 2026-11-17
+- **PROJECT:** starquake
+- **SYSTEM:** observability / cross-system
+- **SCOPE:** moderate (spec amendment)
+- **WHAT:** An Env call whose replay runs out or disagrees always stops the run as an emulator error, never a guest-visible result. A host I/O failure (a missing or unreadable file) becomes the Horizon result code the reference returns for that condition.
+- **WHY:** A replay mismatch means the run is no longer the recorded one, so carrying on would hide it; I/O failures also happen on a real console, and games handle them.
+
+## The syncpoint mode-1 conflict is settled by a trace
+- **WHEN:** 2026-11-17
+- **PROJECT:** starquake
+- **SYSTEM:** gsv
+- **SCOPE:** minor/local (spec amendment)
+- **WHAT:** syncpt 201's mode 1, where PR #4588 compares as 64 bits and Eden-NX2 does not, joins the graphics-server spec's list of reference disagreements a title trace settles ("What to verify before building", item 1). The code keeps PR's reading, per decision 8, until then.
+- **WHY:** It is a real disagreement between the references with no trace yet; listing it with the others means it is checked when traces are taken.
