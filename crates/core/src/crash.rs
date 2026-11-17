@@ -41,10 +41,16 @@
 //!
 //! - **The stack** is starquake's own idea (a guess at what a frame record may be in, not a
 //!   reference fact): the block of the kernel's memory map that holds the crashing thread's stack
-//!   pointer, when the guest may both read and write it. Eden accepts a record anywhere its
-//!   `IsValidVirtualAddressRange` does (any mapped memory). A crash whose stack pointer is in no
-//!   such block has no stack, and its walk stops at the first record. Test:
-//!   `a_record_outside_the_stack_ends_the_walk`.
+//!   pointer, when the guest may both read and write it; or else, when the stack pointer is in no
+//!   such block, the block that holds its frame pointer (`x29`), when the guest may both read and
+//!   write that one. The fallback is for a stack overflow, which leaves the stack pointer in the
+//!   free guard pages the loader keeps below the stack, and for a stack pointer exactly at the
+//!   stack's top, which is the end of its block, not inside it. Eden accepts a record anywhere its
+//!   `IsValidVirtualAddressRange` does (any mapped memory). A crash whose stack pointer and frame
+//!   pointer are both in no such block has no stack, and its walk stops at the first record.
+//!   Tests: `a_record_outside_the_stack_ends_the_walk`, and in the core loop's tests
+//!   `a_crash_whose_stack_pointer_left_its_stack_walks_the_block_of_its_frame_pointer` and
+//!   `a_crash_whose_stack_and_frame_pointers_are_in_no_writable_block_has_no_stack`.
 //! - **Loops** end the walk at the first record read twice; Eden reads on until its loop bound.
 //!   Test: `a_chain_that_loops_ends_at_the_first_record_read_twice`.
 //! - **The depth limit** is Eden's loop bound, 256 records, but Eden adds the return address of
@@ -510,7 +516,7 @@ impl Backtrace {
             }
             None => writeln!(
                 out,
-                "  stack: none (the stack pointer is in no memory the guest can read and write)"
+                "  stack: none (neither the stack pointer nor the frame pointer is in memory the guest can read and write)"
             )?,
         }
         writeln!(out, "  {}", self.end.text())

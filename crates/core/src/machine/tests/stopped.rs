@@ -139,27 +139,69 @@ fn a_crash_walks_the_frame_records_in_the_kernel_block_that_holds_its_stack() {
 }
 
 #[test]
-fn a_crash_whose_stack_pointer_is_in_no_writable_block_has_no_stack() {
+fn a_crash_whose_stack_pointer_left_its_stack_walks_the_block_of_its_frame_pointer() {
+    let program = programs::hello().unwrap();
+    let probe = Guest::new(&program);
+    let (bottom, top) = (probe.start_of("stack"), probe.placed.stack_top);
+    // One page below the stack's start, in the free guard pages the loader keeps there (a stack
+    // overflow), and exactly at the stack's top, the end of its block (an empty stack).
+    for sp in [bottom - crate::image::PAGE, top] {
+        // A guest runs once.
+        let guest = Guest::new(&program);
+        let space = WithStack::new(&guest);
+        let entry = guest.placed.entry;
+        let (inner, outer) = (top - 0x40, top - 0x20);
+        put_record(&space, inner, outer, entry + 0xc4);
+        put_record(&space, outer, 0, 0x10);
+        let report = crash_with(&guest, &space, sp, inner);
+        let backtrace = report.crash().unwrap().backtrace.clone().unwrap();
+        assert_eq!(
+            backtrace.stack,
+            Some(Mapping {
+                name: "Stack".to_owned(),
+                start: bottom,
+                end: top,
+            }),
+            "{sp:#x}"
+        );
+        let records: Vec<_> = backtrace
+            .frames
+            .iter()
+            .map(|frame| (frame.address, frame.record))
+            .collect();
+        assert_eq!(
+            records,
+            [
+                (entry + 0x40, None),
+                (entry + 0x80, None),
+                (entry + 0xc4, Some(inner)),
+                (0x10, Some(outer)),
+            ],
+            "{sp:#x}"
+        );
+        assert_eq!(backtrace.end, BacktraceEnd::NullFramePointer, "{sp:#x}");
+    }
+}
+
+#[test]
+fn a_crash_whose_stack_and_frame_pointers_are_in_no_writable_block_has_no_stack() {
     let program = programs::hello().unwrap();
     let entry = Guest::new(&program).placed.entry;
     // In the program's text, which the guest may read and execute but not write; in nothing
     // the kernel maps; and above the address space.
-    for sp in [entry, 0x1000, u64::MAX - 0xf] {
+    let outside = [entry, 0x1000, u64::MAX - 0xf];
+    for (sp, fp) in outside.iter().flat_map(|&sp| outside.map(|fp| (sp, fp))) {
         // A guest runs once.
         let guest = Guest::new(&program);
         let space = WithStack::new(&guest);
-        let inner = guest.placed.stack_top - 0x40;
-        put_record(&space, inner, 0, entry + 0xc4);
-        let report = crash_with(&guest, &space, sp, inner);
+        let report = crash_with(&guest, &space, sp, fp);
         let backtrace = report.crash().unwrap().backtrace.clone().unwrap();
-        assert_eq!(backtrace.stack, None, "{sp:#x}");
-        assert_eq!(backtrace.frames.len(), 2, "{sp:#x}");
+        assert_eq!(backtrace.stack, None, "{sp:#x} {fp:#x}");
+        assert_eq!(backtrace.frames.len(), 2, "{sp:#x} {fp:#x}");
         assert_eq!(
             backtrace.end,
-            BacktraceEnd::OutsideStack {
-                frame_pointer: inner
-            },
-            "{sp:#x}"
+            BacktraceEnd::OutsideStack { frame_pointer: fp },
+            "{sp:#x} {fp:#x}"
         );
     }
 }

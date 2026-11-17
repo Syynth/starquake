@@ -385,6 +385,27 @@ fn the_checks_come_in_their_documented_order_when_two_faults_are_present() {
             frame_pointer: first
         }
     );
+    // A misaligned frame pointer at the limit: misaligned. The chain's last record names one
+    // inside the stack but off the alignment, after exactly the limit of records.
+    let misaligned = stack_memory();
+    let off_the_alignment = STACK_START + FRAME_POINTER_ALIGN / 2;
+    let first = straight_chain(&misaligned, MAX_FRAME_RECORDS, off_the_alignment);
+    assert_eq!(
+        walk(first, Some(stack()), &misaligned).end,
+        BacktraceEnd::Misaligned {
+            frame_pointer: off_the_alignment
+        }
+    );
+    // A record outside the stack at the limit: outside. The chain's last record names the
+    // stack's end, after exactly the limit of records.
+    let outside = stack_memory();
+    let first = straight_chain(&outside, MAX_FRAME_RECORDS, stack_end());
+    assert_eq!(
+        walk(first, Some(stack()), &outside).end,
+        BacktraceEnd::OutsideStack {
+            frame_pointer: stack_end()
+        }
+    );
     // The limit and an unreadable record: the limit. The last record names one in the half of
     // the block the memory does not hold.
     let limited = stack_memory();
@@ -666,7 +687,7 @@ fn the_crash_text_says_how_a_chain_was_cut_short_and_when_there_is_no_stack() {
     assert!(
         none.contains(
             "  #1 0x80000124 (main+0x124), lr\n\
-             \x20 stack: none (the stack pointer is in no memory the guest can read and write)\n\
+             \x20 stack: none (neither the stack pointer nor the frame pointer is in memory the guest can read and write)\n\
              \x20 cut short: the frame record at 0x80f0ff00 is outside the stack\n"
         ),
         "{none}"

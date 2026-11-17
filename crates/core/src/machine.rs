@@ -808,7 +808,7 @@ impl<'a, V: Vcpu, C: HostClock + Clone> Machine<'a, V, C> {
             .unwrap_or_else(|| Ending::Failed("the run stopped without saying why".to_owned()));
         let aftermath = match &ending {
             Ending::Crashed(_, _, regs) => Aftermath {
-                stack: stack_block(&self.dispatcher, regs.sp),
+                stack: stack_block(&self.dispatcher, regs),
                 threads: Vec::new(),
             },
             Ending::TimedOut => Aftermath {
@@ -852,12 +852,22 @@ impl<'a, V: Vcpu, C: HostClock + Clone> Machine<'a, V, C> {
     }
 }
 
-/// The block of the kernel's memory map that holds `sp`, when the guest may read and write it:
-/// where a crash's backtrace looks for frame records (`crate::crash`, "The backtrace"), named by
-/// its memory state. `None` when no such block holds `sp`.
-fn stack_block(dispatcher: &Dispatcher, sp: u64) -> Option<Mapping> {
+/// Where a crash's backtrace looks for frame records (`crate::crash`, "The backtrace"): the
+/// block of the kernel's memory map that holds the stack pointer in `regs`, when the guest may
+/// read and write it, or else the block that holds the frame pointer (`x29`), when the guest
+/// may read and write that one. The second covers a stack overflow, whose stack pointer is in
+/// the free guard pages below the stack, and a stack pointer exactly at the stack's top, which
+/// is the end of its block. `None` when neither is in such a block.
+fn stack_block(dispatcher: &Dispatcher, regs: &GuestRegs) -> Option<Mapping> {
+    user_read_write_block(dispatcher, regs.sp)
+        .or_else(|| user_read_write_block(dispatcher, regs.x[crate::crash::FRAME_POINTER_REGISTER]))
+}
+
+/// The block of the kernel's memory map that holds `address`, named by its memory state, when
+/// the guest may read and write it; `None` otherwise.
+fn user_read_write_block(dispatcher: &Dispatcher, address: u64) -> Option<Mapping> {
     let block = dispatcher
-        .with::<(&AddressSpace,), _>(|(space,)| space.query_info(sp))
+        .with::<(&AddressSpace,), _>(|(space,)| space.query_info(address))
         .ok()?;
     if !block
         .permission()
