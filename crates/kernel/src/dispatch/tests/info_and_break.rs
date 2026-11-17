@@ -3,9 +3,10 @@
 //! it records.
 
 use super::*;
+use crate::handle::Resolved;
 use crate::process::ENTROPY_COUNT;
 use crate::svc::exception::{Break, BreakReason, NOTIFICATION_ONLY_FLAG, RESULT_ARGUMENT_SIZE};
-use crate::svc::info::{InfoType, MEMORY_MAPPING_ALIGNMENT};
+use crate::svc::info::{IDLE_TICK_COUNT, InfoType, MEMORY_MAPPING_ALIGNMENT};
 use crate::tables::Processes;
 
 /// The entropy words the replays below hand out: all different, and none a clock reading.
@@ -35,10 +36,22 @@ fn dispatch_with(
     number: u16,
     regs: &mut GuestRegs,
 ) -> (Record, Vec<Event>) {
+    dispatch_from(0, dispatcher, env, memory, number, regs)
+}
+
+/// [`dispatch_with`], from core `core`.
+fn dispatch_from(
+    core: u8,
+    dispatcher: &Dispatcher,
+    env: &dyn Env,
+    memory: &FlatMemory,
+    number: u16,
+    regs: &mut GuestRegs,
+) -> (Record, Vec<Event>) {
     let mut sink = Collect::default();
     let (recorder, events) = recorder();
     let mut caller = Caller {
-        core: 0,
+        core,
         thread: THREAD,
         env,
         memory,
@@ -256,6 +269,58 @@ fn a_switch_2_id_is_answered_by_the_calling_process_s_console() {
         assert_eq!([regs.x[0], regs.x[1]], expected, "{console:?}");
         assert_eq!(env.finish(), Ok(()));
     }
+}
+
+#[test]
+fn the_arm_passes_the_calling_core() {
+    // `IdleTickCount` accepts the calling core's own index and no other: asked from core 3
+    // with sub id 3 it answers, from core 0 it is refused.
+    let memory = FlatMemory::new(BASE, 0x10);
+    let dispatcher = Dispatcher::new(tables());
+    let env = ReplayEnv::new(vec![clock(0), clock(1)]);
+    let core = 3;
+    for (from, expected) in [
+        (core, [0, IDLE_TICK_COUNT]),
+        (0, [word(KernelError::InvalidCombination), 0]),
+    ] {
+        let mut regs = get_info_regs(InfoType::IdleTickCount, Handle::INVALID, u64::from(core));
+        let (record, _) = dispatch_from(
+            from,
+            &dispatcher,
+            &env,
+            &memory,
+            SvcId::GetInfo.number(),
+            &mut regs,
+        );
+        assert_eq!(record.outcome, Outcome::Completed, "core {from}");
+        assert_eq!([regs.x[0], regs.x[1]], expected, "core {from}");
+    }
+    assert_eq!(env.finish(), Ok(()));
+}
+
+#[test]
+fn the_current_process_id_adds_its_handle_to_the_process_s_table() {
+    // The arm hands the call the handle table to write: the handle it returns names the
+    // process's own object.
+    let memory = FlatMemory::new(BASE, 0x10);
+    let dispatcher = Dispatcher::new(tables());
+    let env = ReplayEnv::new(vec![clock(0)]);
+    let mut regs = get_info_regs(InfoType::MesosphereCurrentProcess, Handle::INVALID, 0);
+    let (record, _) = dispatch_with(
+        &dispatcher,
+        &env,
+        &memory,
+        SvcId::GetInfo.number(),
+        &mut regs,
+    );
+    assert_eq!(record.outcome, Outcome::Completed);
+    assert_eq!(regs.x[0], 0);
+    let added = Handle::from_raw(u32::try_from(regs.x[1]).unwrap());
+    dispatcher.with::<(&HandleTable, &Scheduler), _>(|(handles, scheduler)| {
+        let own = scheduler.process(own_process(scheduler)).unwrap().object();
+        assert_eq!(handles.resolve(added), Ok(Resolved::Object(own)));
+    });
+    assert_eq!(env.finish(), Ok(()));
 }
 
 /// The registers for `Break(raw_reason, address, size)` over [`regs`].

@@ -1,6 +1,6 @@
 //! `GetInfo`: the values a libnx program is told at start-up, against what the reference
 //! emulator told the homebrew fixture, the Switch 2 ids for a Switch 2 and a Switch 1 program,
-//! and Horizon's result for each request it refuses.
+//! and Horizon's result for each request it refuses. The other ids are in `process_ids`.
 
 use super::*;
 use crate::handle::ObjectRefs;
@@ -36,10 +36,41 @@ fn tables() -> (HandleTable, Scheduler) {
     (HandleTable::new(8).unwrap(), Scheduler::default())
 }
 
+/// The core the calls in these tests are made on: not core 0, so a call that took core 0 for
+/// the caller's would show.
+const CALLER_CORE: u8 = 2;
+
+/// [`CALLER_CORE`] as the scheduler names it.
+fn caller_core() -> CoreId {
+    CoreId::new(CALLER_CORE).unwrap()
+}
+
+/// [`get_info`] from [`CALLER_CORE`], on copies of `handles` and `scheduler`: for the asks that
+/// do not look at what the call writes (only `MesosphereCurrentProcess` writes;
+/// `process_ids::only_the_current_process_id_changes_the_tables` checks that).
+fn get_info_shared(
+    handles: &HandleTable,
+    space: &AddressSpace,
+    scheduler: &Scheduler,
+    processes: &Processes,
+    id: u32,
+    handle: Handle,
+    sub_id: u64,
+) -> CallResult<u64> {
+    let (mut handles, mut scheduler) = (handles.clone(), scheduler.clone());
+    let tables = InfoTables {
+        handles: &mut handles,
+        space,
+        scheduler: &mut scheduler,
+        processes,
+    };
+    get_info(tables, caller_core(), id, handle, sub_id)
+}
+
 /// Asks the loaded fixture's address space for `id` with the current-process pseudo-handle.
 fn ask(space: &AddressSpace, id: u32) -> CallResult<u64> {
     let (handles, scheduler) = tables();
-    get_info(
+    get_info_shared(
         &handles,
         space,
         &scheduler,
@@ -65,8 +96,8 @@ const STACK_REGION_ADDRESS: u32 = 14;
 const STACK_REGION_SIZE: u32 = 15;
 const ALIAS_REGION_EXTRA_SIZE: u32 = 28;
 
-/// Every memory id this slice answers: the ids of Eden's first group, which take a process
-/// handle and sub id 0.
+/// The address-space ids of Eden's first group that read only the address space: they take a
+/// process handle and sub id 0. The rest of the group is in `process_ids`.
 const ANSWERED: [u32; 11] = [
     ALIAS_REGION_ADDRESS,
     ALIAS_REGION_SIZE,
@@ -175,7 +206,7 @@ fn a_sub_id_other_than_zero_is_an_invalid_enum_value() {
         for sub_id in [1, u64::MAX] {
             for handle in [Handle::CURRENT_PROCESS, Handle::INVALID] {
                 assert_eq!(
-                    get_info(
+                    get_info_shared(
                         &handles,
                         &space,
                         &scheduler,
@@ -210,7 +241,8 @@ fn a_handle_must_name_a_process() {
     let process_handle = add(Object::Process(ProcessId::from_parts(0, 1)));
 
     for id in ANSWERED {
-        let ask = |handle| get_info(&handles, &space, &scheduler, &processes(), id, handle, 0);
+        let ask =
+            |handle| get_info_shared(&handles, &space, &scheduler, &processes(), id, handle, 0);
         // `R_UNLESS(process.IsNotNull(), ResultInvalidHandle)`: the invalid handle, the
         // current-thread pseudo-handle, a handle no entry has, and a handle to a thread.
         for handle in [
@@ -229,53 +261,6 @@ fn a_handle_must_name_a_process() {
         // The pseudo-handle and a real handle to a process name the same, only, process.
         assert_eq!(ask(process_handle), ask(Handle::CURRENT_PROCESS));
         assert!(ask(process_handle).is_ok());
-    }
-}
-
-#[test]
-fn an_id_this_slice_does_not_answer_is_not_implemented_whatever_else_is_passed() {
-    let (space, _log, _) = loaded();
-    let (handles, scheduler) = tables();
-    let others = [DEBUGGER_ATTACHED, RANDOM_ENTROPY];
-    let switch_2: Vec<u32> = SWITCH_2.iter().map(|(id, _)| id.number()).collect();
-    let unanswered: Vec<u32> = InfoType::ALL
-        .iter()
-        .map(|id| id.number())
-        .filter(|number| {
-            !ANSWERED.contains(number) && !others.contains(number) && !switch_2.contains(number)
-        })
-        .collect();
-    // Every id Eden answers besides the thirteen and the five Switch 2 ids.
-    assert_eq!(
-        unanswered.len(),
-        InfoType::ALL.len() - ANSWERED.len() - others.len() - SWITCH_2.len()
-    );
-    assert_eq!(
-        unanswered,
-        [
-            0, 1, 9, 10, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 37, 38, 65000, 65001
-        ]
-    );
-    for id in unanswered {
-        for (handle, sub_id) in [
-            (Handle::CURRENT_PROCESS, 0),
-            (Handle::INVALID, 0),
-            (Handle::CURRENT_PROCESS, 7),
-        ] {
-            assert_eq!(
-                get_info(
-                    &handles,
-                    &space,
-                    &scheduler,
-                    &processes(),
-                    id,
-                    handle,
-                    sub_id
-                ),
-                kernel(KernelError::NotImplemented),
-                "id {id}"
-            );
-        }
     }
 }
 
@@ -347,7 +332,7 @@ fn a_debugger_is_never_attached_whatever_is_passed() {
     for handle in NOT_ZERO.into_iter().chain([Handle::INVALID]) {
         for sub_id in [0, 1, entropy_count(), u64::MAX] {
             assert_eq!(
-                get_info(
+                get_info_shared(
                     &handles,
                     &space,
                     &scheduler,
@@ -371,7 +356,7 @@ fn each_entropy_sub_id_reads_its_own_word() {
     let scheduler = scheduler_of(Some(ENTROPY));
     for (sub_id, word) in (0_u64..).zip(ENTROPY) {
         assert_eq!(
-            get_info(
+            get_info_shared(
                 &handles,
                 &space,
                 &scheduler,
@@ -395,7 +380,7 @@ fn an_entropy_sub_id_at_the_count_or_above_is_an_invalid_combination() {
     let scheduler = scheduler_of(Some(ENTROPY));
     let count = entropy_count();
     let ask = |sub_id| {
-        get_info(
+        get_info_shared(
             &handles,
             &space,
             &scheduler,
@@ -425,7 +410,7 @@ fn entropy_is_asked_for_with_the_invalid_handle_and_the_handle_is_checked_first(
     for handle in NOT_ZERO {
         for sub_id in [0, entropy_count()] {
             assert_eq!(
-                get_info(
+                get_info_shared(
                     &handles,
                     &space,
                     &scheduler,
@@ -447,7 +432,7 @@ fn entropy_that_was_never_drawn_is_an_internal_failure_after_the_checks() {
     let (space, _log, _) = loaded();
     let handles = HandleTable::new(8).unwrap();
     let ask = |scheduler: &Scheduler, handle, sub_id| {
-        get_info(
+        get_info_shared(
             &handles,
             &space,
             scheduler,
@@ -506,7 +491,7 @@ fn the_entropy_read_is_the_calling_process_s() {
         scheduler.add_process(process()).unwrap();
         scheduler.set_entropy(process(), own).unwrap();
         assert_eq!(
-            get_info(
+            get_info_shared(
                 &handles,
                 &space,
                 &scheduler,
@@ -585,7 +570,7 @@ fn each_switch_2_id_answers_a_switch_2_program() {
         // The pseudo-handle, and a handle to the calling process's own object.
         for handle in [Handle::CURRENT_PROCESS, named[0]] {
             assert_eq!(
-                get_info(
+                get_info_shared(
                     &handles,
                     &space,
                     &scheduler,
@@ -633,7 +618,7 @@ fn a_switch_1_program_is_told_the_switch_2_ids_are_an_invalid_enum_value_whateve
         ] {
             for sub_id in [0, 1, u64::MAX] {
                 assert_eq!(
-                    get_info(
+                    get_info_shared(
                         &handles,
                         &space,
                         &scheduler,
@@ -662,7 +647,7 @@ fn a_switch_2_id_with_a_sub_id_other_than_zero_is_an_invalid_enum_value_before_t
         for handle in [Handle::CURRENT_PROCESS, Handle::INVALID, thread_handle] {
             for sub_id in [1, u64::MAX] {
                 assert_eq!(
-                    get_info(
+                    get_info_shared(
                         &handles,
                         &space,
                         &scheduler,
@@ -695,7 +680,7 @@ fn a_switch_2_id_needs_a_handle_to_a_process() {
             thread_handle,
         ] {
             assert_eq!(
-                get_info(
+                get_info_shared(
                     &handles,
                     &space,
                     &scheduler,
@@ -728,7 +713,7 @@ fn a_switch_2_id_is_answered_by_the_console_of_the_process_the_handle_names() {
     let (handles, scheduler, _, named) = tables_naming(&[switch_1, switch_2]);
     for (id, value) in SWITCH_2 {
         let ask = |handle| {
-            get_info(
+            get_info_shared(
                 &handles,
                 &space,
                 &scheduler,
@@ -755,7 +740,7 @@ fn a_switch_2_id_is_answered_by_the_console_of_the_process_the_handle_names() {
     let (handles, scheduler, _, named) = tables_naming(&[switch_2]);
     for (id, _) in SWITCH_2 {
         assert_eq!(
-            get_info(
+            get_info_shared(
                 &handles,
                 &space,
                 &scheduler,
@@ -781,7 +766,7 @@ fn a_handle_to_a_process_the_table_has_no_row_for_is_an_internal_failure() {
     let (handles, scheduler, _, named) = tables_naming(&[ghost]);
     for (id, _) in SWITCH_2 {
         let ask = |sub_id| {
-            get_info(
+            get_info_shared(
                 &handles,
                 &space,
                 &scheduler,
@@ -795,3 +780,5 @@ fn a_handle_to_a_process_the_table_has_no_row_for_is_an_internal_failure() {
         assert_eq!(ask(1), kernel(KernelError::InvalidEnumValue), "{id:?}");
     }
 }
+
+mod process_ids;

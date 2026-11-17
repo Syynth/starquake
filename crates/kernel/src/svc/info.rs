@@ -1,21 +1,48 @@
-//! `GetInfo` (0x29): facts about a process. This slice answers the ids a libnx program asks at
-//! start-up (the alias, heap, ASLR and stack regions, the alias region's extra size, the total
-//! and used memory), the random entropy that rtld asks for after its module walk, whether a
-//! debugger is attached, and the Switch 2 ids 29 to 33 (the remote region's address and size,
-//! remote memory used and in all, and the mapping alignment; scoping doc, "Process, memory,
-//! kernel", "New `svcGetInfo` ids").
+//! `GetInfo` (0x29): facts about a process, a thread or the kernel. Every id Eden's `GetInfo`
+//! answers is answered here, and so are the Switch 2 ids 29 to 33 (the remote region's address
+//! and size, remote memory used and in all, and the mapping alignment; scoping doc, "Process,
+//! memory, kernel", "New `svcGetInfo` ids").
 //!
 //! Ported from Eden `eden/src/core/hle/kernel/svc/svc_info.cpp` @ cf654052 (GPL-3.0-or-later),
-//! `GetInfo`; the ids are `InfoType` in `eden/src/core/hle/kernel/svc_types.h` @ cf654052.
-//! Eden's checks, in its order, for each group of ids answered here:
+//! `GetInfo`; the ids are `InfoType` in `eden/src/core/hle/kernel/svc_types.h` @ cf654052, the
+//! process's facts are `KProcess`'s (`eden/src/core/hle/kernel/k_process.h` and
+//! `k_process.cpp` @ cf654052), and PR #4588's changes are from
+//! `eden-pr4588/src/core/hle/kernel/svc/svc_info.cpp` @ e5fb3b97. Eden's checks, in its order,
+//! for each group of ids:
 //!
-//! - **The memory ids** (2 to 7, 12 to 15 and 28, in the first `case` group of Eden's
+//! - **The process ids** (0 to 7, 12 to 18, 20 to 24 and 28: the first `case` group of Eden's
 //!   `switch`):
 //!   1. `info_sub_id == 0`, else `ResultInvalidEnumValue`.
 //!   2. The handle names a process (`GetObject<KProcess>`: the current-process pseudo-handle,
 //!      or a handle to a process), else `ResultInvalidHandle`.
 //!
-//!   Then the value is read from that process's page table, or (ids 6 and 7) from the process.
+//!   Then the value. The **address-space ids** (2 to 7, 21, 22 and 28) read the calling
+//!   process's address space (see the divergences); the **fact ids** (0, 1, 16, 17, 18 and 24)
+//!   read the process the handle names; 20 and 23 are constants (see the divergences):
+//!   - 0 `CoreMask` and 1 `PriorityMask`: `GetCoreMask` and `GetPriorityMask`, the masks of
+//!     the process's thread-info capability ([`ProcessInfo::core_mask`],
+//!     [`ProcessInfo::priority_mask`]).
+//!   - 2 to 5, 12 to 15: the alias, heap, alias-code (ASLR) and stack regions. 28: the alias
+//!     region's extra size, which Eden reads from the calling process
+//!     (`GetCurrentProcessPointer`) whatever the handle names, after a second
+//!     `R_UNLESS(info_sub_id == 0, ResultInvalidCombination)` that the first check makes
+//!     unreachable.
+//!   - 6 `TotalMemorySize` and 7 `UsedMemorySize`: `GetTotalUserPhysicalMemorySize` and
+//!     `GetUsedUserPhysicalMemorySize`, without the system resource (see the divergences).
+//!   - 16 `SystemResourceSizeTotal`: `GetTotalSystemResourceSize`, the size of the process's
+//!     secure system resource ([`secure_resource_size`]).
+//!   - 17 `SystemResourceSizeUsed`: `GetUsedSystemResourceSize`; [`SYSTEM_RESOURCE_SIZE_USED`]
+//!     here (see the divergences).
+//!   - 18 `ProgramId`: `GetProgramId` ([`ProcessInfo::program_id`]).
+//!   - 20 `UserExceptionContextAddress`: `GetProcessLocalRegionAddress`;
+//!     [`USER_EXCEPTION_CONTEXT_ADDRESS`] here (see the divergences).
+//!   - 21 `TotalNonSystemMemorySize` and 22 `UsedNonSystemMemorySize`:
+//!     `GetTotalNonSystemUserPhysicalMemorySize` and `GetUsedNonSystemUserPhysicalMemorySize`
+//!     ([`non_system_total`]; the used size is the heap, the code and the main thread's stack,
+//!     [`AddressSpace::used_user_physical_memory_size`]).
+//!   - 23 `IsApplication`: `IsApplication`; [`IS_APPLICATION`] here (see the divergences).
+//!   - 24 `FreeThreadCount`: the process's resource limit's `ThreadCountMax` limit less its
+//!     current value ([`free_threads`]).
 //! - **`DebuggerAttached`** (8): Eden checks neither the handle nor the sub id; the value is
 //!   zero (`*result = 0`). No debugger is ever attached here, so the value is the fact, not a
 //!   stub. Eden, and so starquake, is looser than Horizon here: Horizon checks
@@ -23,15 +50,75 @@
 //!   `ResultInvalidCombination` (fact only,
 //!   `atmosphere/libraries/libmesosphere/source/svc/kern_svc_info.cpp` @ 4e3f3703,
 //!   `InfoType_DebuggerAttached`). Test: `a_debugger_is_never_attached_whatever_is_passed`.
+//! - **`ResourceLimit`** (9):
+//!   1. `handle == 0`, else `ResultInvalidHandle`.
+//!   2. `info_sub_id == 0`, else `ResultInvalidCombination`.
+//!
+//!   Then a new handle to the calling process's resource limit, or, for a process with none,
+//!   `Svc::InvalidHandle` (Eden: "the kernel considers this a successful operation either
+//!   way"). Here no process has one (see the divergences). Test:
+//!   `the_resource_limit_is_the_invalid_handle_after_edens_two_checks`.
+//! - **`IdleTickCount`** (10):
+//!   1. `info_sub_id` is [`ALL_CORES`] or the calling core's index, else
+//!      `ResultInvalidCombination`.
+//!   2. `handle == InvalidHandle`, else `ResultInvalidHandle`.
+//!
+//!   Then the calling core's idle thread's CPU time; [`IDLE_TICK_COUNT`] here (see the
+//!   divergences). Test: `the_idle_tick_count_checks_the_core_then_the_handle`.
 //! - **`RandomEntropy`** (11):
 //!   1. `handle == 0` (the invalid handle, not a process), else `ResultInvalidHandle`.
 //!   2. `info_sub_id < 4` ([`ENTROPY_COUNT`]), else `ResultInvalidCombination`.
 //!
 //!   Then the value is word `info_sub_id` of the calling process's entropy
 //!   (`GetCurrentProcess(...).GetRandomEntropy(info_sub_id)`).
+//! - **`InitialProcessIdRange`** (19):
+//!   1. `handle == InvalidHandle`, else `ResultInvalidHandle`.
+//!   2. `info_sub_id` is `InitialProcessIdRangeInfo::Minimum` (0) or `Maximum` (1)
+//!      (`svc_types.h`), else `ResultInvalidCombination`.
 //!
-//! PR #4588 (`eden-pr4588/src/core/hle/kernel/svc/svc_info.cpp` @ e5fb3b97) changes none of
-//! these, so a Switch 2 program is answered the same.
+//!   Then Eden's values, which Eden itself marks as a stub ("(STUBBED) ... returned 0/64",
+//!   `//todo`): [`INITIAL_PROCESS_ID_MINIMUM`] and [`INITIAL_PROCESS_ID_MAXIMUM`]. Each is a
+//!   guess. Horizon's real range ends below the first user process id
+//!   ([`crate::tables::FIRST_USER_PROCESS_ID`] is Eden's `InitialProcessIdMax + 1`), which
+//!   Eden's stub does not match; a trace from a console would settle it. Test:
+//!   `the_initial_process_id_range_is_edens_stub_after_its_checks`.
+//! - **`ThreadTickCount`** (25):
+//!   1. `info_sub_id` is [`ALL_CORES`] or below the calling process's core count, else
+//!      `ResultInvalidCombination`. The count is PR #4588's: `NUM_CPU_CORES`
+//!      ([`APPLICATION_CORE_COUNT`]) for a process built for Switch 2 (`UsesPAuthReturns`),
+//!      `NUM_LEGACY_CPU_CORES` ([`LEGACY_VIRTUAL_CORE_COUNT`]) for any other; Eden mainline
+//!      has `num_cpus = 4` for every process, which PR #4588 keeps for a Switch 1 program.
+//!   2. The handle names a thread (`GetObject<KThread>`: the current-thread pseudo-handle, or a
+//!      handle to a thread; [`thread_from_handle`]), else `ResultInvalidHandle`.
+//!
+//!   Then the thread's CPU time: zero for any thread but the caller, and for the caller the
+//!   time since the core's last context switch (with the thread's CPU time added for
+//!   [`ALL_CORES`]); [`THREAD_TICK_COUNT`] here for every thread (see the divergences). Tests:
+//!   `the_thread_tick_count_checks_the_core_count_of_the_console_then_the_handle`,
+//!   `the_thread_tick_count_is_zero_for_every_thread`.
+//! - **`Unknown37` and `Unknown38`** (37, 38): no checks; the value is zero (Eden's
+//!   "(STUBBED)" case). Test: `ids_37_and_38_are_zero_whatever_is_passed`.
+//! - **`MesosphereMeta`** (65000):
+//!   1. `handle == InvalidHandle`, else `ResultInvalidHandle`.
+//!   2. `info_sub_id` is one of Eden's `MesosphereMetaInfo` values, else
+//!      `ResultInvalidCombination`: [`MESOSPHERE_META_KERNEL_VERSION`] (0) answers
+//!      [`SUPPORTED_KERNEL_VERSION`]; [`MESOSPHERE_META_IS_KTRACE_ENABLED`] (1) and
+//!      [`MESOSPHERE_META_IS_SINGLE_STEP_ENABLED`] (2) answer zero.
+//!
+//!   Test: `the_mesosphere_meta_id_checks_the_handle_then_the_sub_id`.
+//! - **`MesosphereCurrentProcess`** (65001):
+//!   1. `handle == InvalidHandle`, else `ResultInvalidHandle`.
+//!   2. `info_sub_id == 0`, else `ResultInvalidCombination`.
+//!   3. A new handle to the calling process is added to its handle table
+//!      (`handle_table.Add`), whose failure (`ResultOutOfHandles` for a full table) is the
+//!      call's result.
+//!
+//!   Then the value is the new handle. Tests:
+//!   `the_current_process_id_adds_a_handle_to_the_calling_process`,
+//!   `the_current_process_id_with_a_full_handle_table_is_out_of_handles`.
+//!
+//! PR #4588 changes `ThreadTickCount`'s core count (above) and none of the other checks or
+//! values, so a Switch 2 program is answered the same otherwise.
 //!
 //! - **The Switch 2 ids** (29 to 33), from PR #4588's `GetInfo`, which answers them in an `if`
 //!   before Eden's `switch`:
@@ -61,15 +148,84 @@
 //!   `a_switch_2_id_is_answered_by_the_console_of_the_process_the_handle_names`,
 //!   `a_handle_to_a_process_the_table_has_no_row_for_is_an_internal_failure`.
 //!
+//! No id returns [`KernelError::NotImplemented`]. Test: `no_id_eden_answers_is_not_implemented`.
+//!
+//! # The system resource
+//!
+//! A process's system resource (`META` 0x14, [`ProcessInfo::system_resource_size`]) is what
+//! ids 16, 17 and 21 report on. Eden's `KProcess::LoadFromMetadata` asks for
+//! `system_resource_num_pages = metadata.GetSystemResourceSize() / PageSize`; `Initialize`
+//! makes a `KSecureSystemResource` of that many pages when it is not zero, and otherwise gives
+//! an application the shared default resource (`m_is_default_application_system_resource`),
+//! which every one of Eden's `GetTotalSystemResourceSize`, `GetUsedSystemResourceSize`,
+//! `GetRequiredSecureMemorySize` and `GetRequiredSecureMemorySizeNonDefault` answers with
+//! zero. So all four read the recorded size rounded down to whole pages, zero below one page
+//! ([`secure_resource_size`]): for a secure resource `GetSize` is its size, and
+//! `CalculateRequiredSecureMemorySize` is the size too for any pool but the applet pool
+//! (`eden/src/core/hle/kernel/board/nintendo/nx/k_system_control.cpp` @ cf654052). The pool is
+//! the application pool here (see the divergences, `IsApplication`).
+//!
 //! # Divergences from Eden
 //!
-//! - **Ids Eden answers that this slice does not** return [`KernelError::NotImplemented`]
-//!   and are logged: the core and priority masks, the resource-limit and tick-count ids, the
-//!   system-resource sizes, the program id, the initial process id range, the exception
-//!   context address, the non-system memory sizes, `IsApplication`, the free thread count,
-//!   ids 37 and 38, and Atmosphère's two. Eden answers each. They belong to the slices that
-//!   build what they report (process creation, threads, resource limits). Test:
-//!   `an_id_this_slice_does_not_answer_is_not_implemented_whatever_else_is_passed`.
+//! - **The system resource is not charged to the pool** (#208 adds that). Eden reserves the
+//!   secure resource's size from the process's `PhysicalMemoryMax` limit
+//!   (`KSecureSystemResource::Initialize`, `eden/src/core/hle/kernel/k_system_resource.cpp`
+//!   @ cf654052); here the address space's free memory ([`crate::memory::MemoryLimit::free`])
+//!   still holds it. So, for a process whose [`secure_resource_size`] `S` is not zero, and
+//!   `U` the non-system used size, `F` the free memory here and `M` the process maximum
+//!   ([`AddressSpace::max_process_memory`]), where Eden's free memory is `F - S`:
+//!   - **21** applies Eden's formula to `F`: `M - S` when `U + S + F > M`, else `F + U`. Eden
+//!     answers `M - S` when `U + F > M`, else `F - S + U`. So the two agree when
+//!     `U + F > M`; when `U + S + F <= M` the answer here is `S` higher (`F + U` against
+//!     `F - S + U`); and when `U + F <= M < U + S + F` it is `M - S` where Eden has
+//!     `F - S + U`. Test:
+//!     `the_non_system_total_is_s_higher_than_edens_while_the_resource_is_not_charged`.
+//!   - **An `S` larger than `M`** cannot arise in Eden (the reservation fails with
+//!     `ResultLimitReached` and the process is not created); here 21 answers zero rather than
+//!     wrapping. Test: `a_system_resource_larger_than_the_maximum_leaves_no_non_system_total`.
+//!   - **6 and 7 leave the system resource out.** Eden adds
+//!     `GetRequiredSecureMemorySize` (`S`) to the used size it compares in 6 and
+//!     `GetRequiredSecureMemorySizeNonDefault` (`S`) to 7's value; here 7 is the non-system
+//!     used size (22's value), and 6 is capped at `M` when `U + F > M`
+//!     ([`AddressSpace::total_user_physical_memory_size`]). With the pool uncharged, 6 equals
+//!     Eden's; 7 is `S` lower. Test: `the_total_and_used_memory_leave_the_system_resource_out`.
+//! - **17 is [`SYSTEM_RESOURCE_SIZE_USED`] (zero) for every process.** Eden's is the pages the
+//!   secure resource's dynamic page manager has handed out for the kernel's own structures
+//!   (`m_dynamic_page_manager.GetUsed() * PageSize`), which nothing here keeps; for a process
+//!   whose `S` is zero Eden's is zero too. A guess; a trace from a console would show the real
+//!   value. Test: `the_system_resource_used_is_zero_whatever_its_size`.
+//! - **20 is [`USER_EXCEPTION_CONTEXT_ADDRESS`] (zero) for every process.** Eden's is the
+//!   process-local region, which no process here has (`crate::process`, "Divergences from
+//!   `KProcess::Initialize`"). A guess, until the region is reserved. Test:
+//!   `the_exception_context_address_is_zero`.
+//! - **23 is [`IS_APPLICATION`] (one) for every process.** Eden sets `m_is_application` when
+//!   the NPDM's `ACID` names the application pool (`LoadFromMetadata`; a homebrew program's
+//!   default metadata does too, its `ACID` being zero). The process description keeps no pool
+//!   (`crates/core/src/image.rs`, "The `ACID` pool partition is not read"), so a program whose
+//!   `ACID` names another pool is told it is an application, and its system resource is
+//!   counted as for the application pool. Test: `every_process_is_an_application`.
+//! - **No resource limit.** Eden gives every process it loads one
+//!   (`CreateResourceLimitForProcess`, `eden/src/core/hle/kernel/k_resource_limit.cpp` @
+//!   cf654052); here no process has one (`crate::process`, "Divergences from
+//!   `KProcess::Run`"). So:
+//!   - **9** answers `Svc::InvalidHandle`, Eden's answer for a process with no limit, where
+//!     Eden adds a handle to the limit. Test:
+//!     `the_resource_limit_is_the_invalid_handle_after_edens_two_checks`.
+//!   - **24** answers Eden's limit, [`THREAD_COUNT_LIMIT`], less the process's threads that
+//!     still have a row ([`crate::process::ProcessRecord::threads`]): Eden's current value
+//!     counts each thread from its reservation (`CreateThread`, `KProcess::Run`) to its
+//!     destruction (`KThread::PostDestroy`), the life of a row here. Nothing here refuses a
+//!     thread past the limit, as Eden does, so a process with more threads than the limit is
+//!     told zero rather than a wrapped count. Tests:
+//!     `the_free_thread_count_is_edens_limit_less_the_process_s_threads`,
+//!     `free_threads_stop_at_zero_past_the_limit`.
+//! - **No CPU time is kept**, so 10 is [`IDLE_TICK_COUNT`] and 25 [`THREAD_TICK_COUNT`], both
+//!   zero, after Eden's checks. Eden's are the idle thread's CPU time (10) and, for the calling
+//!   thread, the ticks since its core's last context switch (25, with its CPU time added for
+//!   [`ALL_CORES`]); 25 is zero in Eden too for any other thread, or for the caller with
+//!   another core's index. Each is a guess. Tests:
+//!   `the_idle_tick_count_checks_the_core_then_the_handle`,
+//!   `the_thread_tick_count_is_zero_for_every_thread`.
 //! - **A Switch 1 program asking a Switch 2 id** is told [`KernelError::InvalidEnumValue`]
 //!   before any check, whatever its handle and sub id, as Eden answers every program
 //!   (`eden/src/core/hle/kernel/svc/svc_info.cpp` @ cf654052, `GetInfo`'s `default`) and as
@@ -85,10 +241,21 @@
 //!   - the handle names a Switch 2 process: PR #4588 answers the value, here it is
 //!     `InvalidEnumValue`. Test (its last loop):
 //!     `a_switch_2_id_is_answered_by_the_console_of_the_process_the_handle_names`.
-//! - **The memory ids read the calling process's address space, whatever process the handle
-//!   names.** With one address space beside the tables, a handle to another process object
-//!   is answered as the pseudo-handle is. The Switch 2 ids do check the process the handle
-//!   names (its console, from the process table). Test: `a_handle_must_name_a_process`.
+//! - **The address-space ids (2 to 7, 21, 22 and 28) read the calling process's address
+//!   space, whatever process the handle names.** With one address space beside the tables, a
+//!   handle to another process object is answered as the pseudo-handle is; 21 also takes the
+//!   calling process's system resource, to match its address space. The resource changes 21
+//!   only once `U + S + F > M`. In the tests' 4 GiB address space (39-bit, `M` 8 GiB) the
+//!   pool is below `M` by more than any `u32` resource, so the branch is out of reach there;
+//!   on the 12 GiB arrangement (Switch 2: `M` 12 GiB, pool 9809 MiB) an NPDM
+//!   `system_resource_size` above `M` less the pool (2479 MiB) reaches it. Test, the calling
+//!   process's `S` just past that edge and the second process's far below it:
+//!   `the_non_system_total_past_the_maximum_takes_the_calling_process_s_whole_page_resource`.
+//!   The fact ids (0, 1, 16, 17, 18 and 24) and the Switch 2 ids do read the process the
+//!   handle names, from the process table and the scheduler; one the tables have no row for
+//!   is an internal failure, after the guest's checks. Tests: `a_handle_must_name_a_process`,
+//!   `the_facts_are_the_named_process_s_and_the_sizes_the_caller_s`,
+//!   `a_fact_about_a_process_with_no_row_is_an_internal_failure_after_the_checks`.
 //! - **The entropy is drawn when it is first asked for**, not when the process is created
 //!   (Eden's `KProcess::Initialize`, `GenerateRandom(m_entropy)`): the dispatcher draws the
 //!   [`ENTROPY_COUNT`] words from the environment's random numbers at the first
@@ -108,8 +275,10 @@ use crate::handle::{Handle, HandleTable, Resolved};
 use crate::id::ProcessId;
 use crate::memory::AddressSpace;
 use crate::object::Object;
-use crate::process::{Console, ENTROPY_COUNT, ProcessInfo};
+use crate::process::{Console, ENTROPY_COUNT, LEGACY_VIRTUAL_CORE_COUNT, ProcessInfo};
 use crate::result::{CallResult, KernelError, SvcError};
+use crate::sched::{APPLICATION_CORE_COUNT, CoreId};
+use crate::svc::thread::thread_from_handle;
 use crate::tables::{Processes, Scheduler};
 use starquake_memory::PAGE_SIZE;
 
@@ -238,12 +407,183 @@ pub const REMOTE_MEMORY_TOTAL: u64 = 0;
 /// would confirm it.
 pub const MEMORY_MAPPING_ALIGNMENT: u64 = PAGE_SIZE;
 
+/// What `SystemResourceSizeUsed` (17) tells every process: nothing used. A guess: Eden's is the
+/// pages the secure resource's dynamic page manager has handed out
+/// (`KSecureSystemResource::GetUsedSize`, `eden/src/core/hle/kernel/k_system_resource.h` @
+/// cf654052), which nothing here keeps. A trace from a console would show the real value.
+pub const SYSTEM_RESOURCE_SIZE_USED: u64 = 0;
+
+/// What `UserExceptionContextAddress` (20) tells every process. A guess: Eden's is the
+/// process-local region's address (`GetProcessLocalRegionAddress`), which no process here has
+/// (`crate::process`, "Divergences from `KProcess::Initialize`"). Reserving that region gives
+/// the real value.
+pub const USER_EXCEPTION_CONTEXT_ADDRESS: u64 = 0;
+
+/// What `IsApplication` (23) tells every process: one, for an application. Eden's
+/// `KProcess::LoadFromMetadata` sets it when the NPDM's `ACID` names the application pool
+/// (`pool == KMemoryManager::Pool::Application`), as it does for a homebrew program's default
+/// metadata; the description here keeps no pool, so this is a guess for any other program.
+pub const IS_APPLICATION: u64 = 1;
+
+/// The `ThreadCountMax` limit of the resource limit Eden gives each process it loads:
+/// `SetLimitValue(LimitableResource::ThreadCountMax, 800)` in `CreateResourceLimitForProcess`
+/// (`eden/src/core/hle/kernel/k_resource_limit.cpp` @ cf654052; the same in
+/// `eden-pr4588/src/core/hle/kernel/k_resource_limit.cpp` @ e5fb3b97). Eden's own comment calls
+/// the values there "the system defaults", so for an application this is a guess that Eden
+/// makes too.
+pub const THREAD_COUNT_LIMIT: u64 = 800;
+
+/// The sub id `IdleTickCount` (10) and `ThreadTickCount` (25) take for "every core" rather than
+/// one core's index: Eden compares with `0xFFFFFFFFFFFFFFFF`.
+pub const ALL_CORES: u64 = u64::MAX;
+
+/// What `IdleTickCount` (10) tells every process: no idle time. A guess: Eden's is the calling
+/// core's idle thread's CPU time (`GetIdleThread()->GetCpuTime()`), which nothing here keeps.
+pub const IDLE_TICK_COUNT: u64 = 0;
+
+/// What `ThreadTickCount` (25) tells every process, for every thread. Eden's is zero for any
+/// thread but the caller, and for the caller with another core's index; for the caller it is
+/// the ticks since its core's last context switch, with the thread's CPU time added for
+/// [`ALL_CORES`]. Nothing here keeps either, so for the caller this is a guess.
+pub const THREAD_TICK_COUNT: u64 = 0;
+
+/// `InitialProcessIdRangeInfo::Minimum` (`eden/src/core/hle/kernel/svc_types.h` @ cf654052):
+/// the `InitialProcessIdRange` (19) sub id for the range's lowest id.
+pub const INITIAL_PROCESS_ID_RANGE_MINIMUM: u64 = 0;
+
+/// `InitialProcessIdRangeInfo::Maximum`: the `InitialProcessIdRange` (19) sub id for the
+/// range's highest id.
+pub const INITIAL_PROCESS_ID_RANGE_MAXIMUM: u64 = 1;
+
+/// What `InitialProcessIdRange` (19) answers for [`INITIAL_PROCESS_ID_RANGE_MINIMUM`]: Eden's
+/// stub value (`*result = 0; //todo`, logged as "(STUBBED) ... returned 0/64"). A guess Eden
+/// marks as one; a trace from a console would settle it.
+pub const INITIAL_PROCESS_ID_MINIMUM: u64 = 0;
+
+/// What `InitialProcessIdRange` (19) answers for [`INITIAL_PROCESS_ID_RANGE_MAXIMUM`]: Eden's
+/// stub value (`*result = 64; //todo`). A guess, as [`INITIAL_PROCESS_ID_MINIMUM`] is.
+pub const INITIAL_PROCESS_ID_MAXIMUM: u64 = 64;
+
+/// `MesosphereMetaInfo::KernelVersion`: the `MesosphereMeta` (65000) sub id for the kernel
+/// version (Eden's `GetInfo`, `svc_info.cpp` @ cf654052).
+pub const MESOSPHERE_META_KERNEL_VERSION: u64 = 0;
+
+/// `MesosphereMetaInfo::IsKTraceEnabled`: the `MesosphereMeta` sub id for whether kernel
+/// tracing is on. Eden answers zero.
+pub const MESOSPHERE_META_IS_KTRACE_ENABLED: u64 = 1;
+
+/// `MesosphereMetaInfo::IsSingleStepEnabled`: the `MesosphereMeta` sub id for whether single
+/// stepping is on. Eden answers zero.
+pub const MESOSPHERE_META_IS_SINGLE_STEP_ENABLED: u64 = 2;
+
+/// Where a kernel version's minor number starts: `KernelVersion::minor_version`,
+/// `BitField<0, 4, u32>` (`eden/src/core/hle/kernel/svc_version.h` @ cf654052).
+pub const KERNEL_VERSION_MINOR_SHIFT: u32 = 0;
+
+/// How many bits a kernel version's minor number has (`BitField<0, 4, u32>`).
+pub const KERNEL_VERSION_MINOR_WIDTH: u32 = 4;
+
+/// Where a kernel version's major number starts: `KernelVersion::major_version`,
+/// `BitField<4, 13, u32>`.
+pub const KERNEL_VERSION_MAJOR_SHIFT: u32 = 4;
+
+/// How many bits a kernel version's major number has (`BitField<4, 13, u32>`).
+pub const KERNEL_VERSION_MAJOR_WIDTH: u32 = 13;
+
+/// How much an SDK major version is below the kernel's: `ConvertToSvcMajorVersion(sdk)` is
+/// `sdk + 4` (`svc_version.h`).
+pub const SVC_MAJOR_VERSION_OFFSET: u32 = 4;
+
+/// The SDK major version of the newest kernel Eden supports: `ConvertToSvcMajorVersion(22)`
+/// (`SupportedKernelMajorVersion`, `svc_version.h` @ cf654052; the same in Eden PR #4588 @
+/// e5fb3b97).
+pub const SUPPORTED_SDK_MAJOR_VERSION: u32 = 22;
+
+/// The minor version of the newest kernel Eden supports: `ConvertToSvcMinorVersion(2)`, which
+/// keeps the SDK's minor number (`SupportedKernelMinorVersion`).
+pub const SUPPORTED_KERNEL_MINOR_VERSION: u32 = 2;
+
+/// The kernel version `MesosphereMeta`'s [`MESOSPHERE_META_KERNEL_VERSION`] answers:
+/// `SupportedKernelVersion`, Eden's encoding ([`encode_kernel_version`]) of
+/// [`SUPPORTED_SDK_MAJOR_VERSION`] plus [`SVC_MAJOR_VERSION_OFFSET`] and
+/// [`SUPPORTED_KERNEL_MINOR_VERSION`].
+pub const SUPPORTED_KERNEL_VERSION: u32 = encode_kernel_version(
+    SUPPORTED_SDK_MAJOR_VERSION + SVC_MAJOR_VERSION_OFFSET,
+    SUPPORTED_KERNEL_MINOR_VERSION,
+);
+
+/// A mask of `width` low bits; `width` is below 32.
+const fn low_bits(width: u32) -> u32 {
+    (1 << width) - 1
+}
+
+/// Eden's `EncodeKernelVersion(major, minor)`: each number cut to its field's width
+/// ([`KERNEL_VERSION_MINOR_WIDTH`], [`KERNEL_VERSION_MAJOR_WIDTH`]) and put at its shift, as
+/// `BitField::FormatValue` does.
+#[must_use]
+pub const fn encode_kernel_version(major: u32, minor: u32) -> u32 {
+    ((minor & low_bits(KERNEL_VERSION_MINOR_WIDTH)) << KERNEL_VERSION_MINOR_SHIFT)
+        | ((major & low_bits(KERNEL_VERSION_MAJOR_WIDTH)) << KERNEL_VERSION_MAJOR_SHIFT)
+}
+
+/// The size of the secure system resource of `process`, and the secure memory it needs: its
+/// recorded size ([`ProcessInfo::system_resource_size`]) rounded down to whole pages, which is
+/// zero below one page (see "The system resource" in the module docs). Eden's
+/// `GetTotalSystemResourceSize`, `GetRequiredSecureMemorySize` and
+/// `GetRequiredSecureMemorySizeNonDefault` for a process of the application pool.
+#[must_use]
+pub const fn secure_resource_size(process: &ProcessInfo) -> u64 {
+    let size = process.system_resource_size() as u64;
+    size - size % PAGE_SIZE
+}
+
+/// `KProcess::GetTotalNonSystemUserPhysicalMemorySize` (`eden/src/core/hle/kernel/k_process.cpp`
+/// @ cf654052) of a process that uses `used_non_system` bytes (the heap, the code and the main
+/// thread's stack: `GetUsedNonSystemUserPhysicalMemorySize`), can still reserve `free`, may use
+/// at most `max` (`m_max_process_memory`) and whose secure system resource needs `secure`
+/// ([`secure_resource_size`]): `max - secure` when `used_non_system + secure + free > max`, else
+/// `free + used_non_system`. A `secure` above `max`, which Eden cannot reach, answers zero (see
+/// the module docs).
+#[must_use]
+pub const fn non_system_total(used_non_system: u64, free: u64, max: u64, secure: u64) -> u64 {
+    let used = used_non_system.saturating_add(secure);
+    if used.saturating_add(free) > max {
+        max.saturating_sub(secure)
+    } else {
+        free.saturating_add(used_non_system)
+    }
+}
+
+/// `FreeThreadCount` for a process with `threads` threads: [`THREAD_COUNT_LIMIT`] less
+/// `threads` (`limit_value - current_value`), or zero for a count at or past the limit, which
+/// Eden's reservation never lets a process pass (see the module docs).
+#[must_use]
+pub fn free_threads(threads: usize) -> u64 {
+    u64::try_from(threads).map_or(0, |threads| THREAD_COUNT_LIMIT.saturating_sub(threads))
+}
+
 impl InfoType {
     /// The id with this number, if it is listed.
     #[must_use]
     pub fn from_raw(raw: u32) -> Option<Self> {
         Self::ALL.iter().copied().find(|id| id.number() == raw)
     }
+}
+
+/// The tables `GetInfo` reads, for the calling process ([`Processes::own`] of `processes`),
+/// whose handle table is `handles` and whose address space is `space`. Only
+/// `MesosphereCurrentProcess` (65001) writes: it adds a handle, which takes a reference in the
+/// scheduler's object table.
+#[derive(Debug)]
+pub struct InfoTables<'t> {
+    /// The calling process's handle table.
+    pub handles: &'t mut HandleTable,
+    /// The calling process's address space.
+    pub space: &'t AddressSpace,
+    /// The scheduler, with its object table and the processes' rows.
+    pub scheduler: &'t mut Scheduler,
+    /// The process facts.
+    pub processes: &'t Processes,
 }
 
 /// The process `handle` names (Eden's `GetObject<KProcess>`): the calling process
@@ -270,59 +610,243 @@ fn process_from_handle(
     }
 }
 
-/// Answers `GetInfo(info_type, handle, info_sub_id)` for the calling process
-/// ([`Processes::own`] of `processes`), whose handle table is `handles` and whose address space
-/// is `space`. `info_type` is the raw value the guest passed. Each group of ids checks what
-/// Eden checks, in its order (see the module docs).
+/// Answers `GetInfo(info_type, handle, info_sub_id)` for the calling process, on `core`, the
+/// core the call was made on, from `tables`. `info_type` is the raw value the guest passed.
+/// Each group of ids checks what Eden checks, in its order (see the module docs).
 pub fn get_info(
-    handles: &HandleTable,
-    space: &AddressSpace,
-    scheduler: &Scheduler,
-    processes: &Processes,
+    tables: InfoTables<'_>,
+    core: CoreId,
     info_type: u32,
     handle: Handle,
     info_sub_id: u64,
 ) -> CallResult<u64> {
     let id = InfoType::from_raw(info_type).ok_or(KernelError::InvalidEnumValue)?;
-    // PR #4588 answers its ids in an `if` before Eden's `switch`.
-    if let Some(value) = switch_2_fact(id) {
-        return switch_2_info(handles, scheduler, processes, handle, info_sub_id, value);
-    }
+    let InfoTables {
+        handles,
+        space,
+        scheduler,
+        processes,
+    } = tables;
+    let shared = (&*handles, &*scheduler, processes);
+    // Eden's first group: its two checks, then the value for the process `named`.
+    let process = |value: &dyn Fn(ProcessId) -> CallResult<u64>| {
+        process_info(shared, handle, info_sub_id, value)
+    };
+    let regions = space.regions();
     match id {
+        InfoType::CoreMask => process(&|named| Ok(info_of(processes, named)?.core_mask())),
+        InfoType::PriorityMask => process(&|named| Ok(info_of(processes, named)?.priority_mask())),
+        InfoType::AliasRegionAddress => process(&|_| Ok(regions.alias.start)),
+        InfoType::AliasRegionSize => process(&|_| Ok(regions.alias.size())),
+        InfoType::HeapRegionAddress => process(&|_| Ok(regions.heap.start)),
+        InfoType::HeapRegionSize => process(&|_| Ok(regions.heap.size())),
+        InfoType::TotalMemorySize => process(&|_| Ok(space.total_user_physical_memory_size())),
+        InfoType::UsedMemorySize | InfoType::UsedNonSystemMemorySize => {
+            process(&|_| Ok(space.used_user_physical_memory_size()))
+        }
+        InfoType::AslrRegionAddress => process(&|_| Ok(regions.code.start)),
+        InfoType::AslrRegionSize => process(&|_| Ok(regions.code.size())),
+        InfoType::StackRegionAddress => process(&|_| Ok(regions.stack.start)),
+        InfoType::StackRegionSize => process(&|_| Ok(regions.stack.size())),
+        InfoType::SystemResourceSizeTotal => {
+            process(&|named| Ok(secure_resource_size(info_of(processes, named)?)))
+        }
+        // The named process must have a row, as Eden's `GetUsedSystemResourceSize` reads it.
+        InfoType::SystemResourceSizeUsed => {
+            process(&|named| info_of(processes, named).map(|_| SYSTEM_RESOURCE_SIZE_USED))
+        }
+        InfoType::ProgramId => process(&|named| Ok(info_of(processes, named)?.program_id())),
+        InfoType::UserExceptionContextAddress => process(&|_| Ok(USER_EXCEPTION_CONTEXT_ADDRESS)),
+        InfoType::TotalNonSystemMemorySize => process(&|_| {
+            Ok(non_system_total(
+                space.used_user_physical_memory_size(),
+                space.limit().free(),
+                space.max_process_memory(),
+                secure_resource_size(info_of(processes, processes.own())?),
+            ))
+        }),
+        InfoType::IsApplication => process(&|_| Ok(IS_APPLICATION)),
+        InfoType::FreeThreadCount => {
+            process(&|named| Ok(free_threads(scheduler_threads(shared, named)?)))
+        }
+        InfoType::AliasRegionExtraSize => process(&|_| Ok(regions.alias_region_extra_size)),
         // `case InfoType::DebuggerAttached: *result = 0; R_SUCCEED();`
         InfoType::DebuggerAttached => Ok(0),
+        InfoType::ResourceLimit => resource_limit(handle, info_sub_id),
+        InfoType::IdleTickCount => idle_tick_count(core, handle, info_sub_id),
         InfoType::RandomEntropy => random_entropy(scheduler, processes.own(), handle, info_sub_id),
-        _ => memory_info(
-            handles,
-            space,
-            scheduler,
-            processes,
-            id,
-            handle,
-            info_sub_id,
-        ),
+        InfoType::InitialProcessIdRange => initial_process_id_range(handle, info_sub_id),
+        InfoType::ThreadTickCount => thread_tick_count(shared, core, handle, info_sub_id),
+        // PR #4588 answers its ids in an `if` before Eden's `switch`.
+        InfoType::RemoteRegionAddress => {
+            switch_2_info(shared, handle, info_sub_id, REMOTE_REGION_ADDRESS)
+        }
+        InfoType::RemoteRegionSize => {
+            switch_2_info(shared, handle, info_sub_id, REMOTE_REGION_SIZE)
+        }
+        InfoType::RemoteMemoryUsed => {
+            switch_2_info(shared, handle, info_sub_id, REMOTE_MEMORY_USED)
+        }
+        InfoType::RemoteMemoryTotal => {
+            switch_2_info(shared, handle, info_sub_id, REMOTE_MEMORY_TOTAL)
+        }
+        InfoType::MemoryMappingAlignment => {
+            switch_2_info(shared, handle, info_sub_id, MEMORY_MAPPING_ALIGNMENT)
+        }
+        InfoType::Unknown37 | InfoType::Unknown38 => {
+            tracing::warn!(
+                number = id.number(),
+                info_sub_id,
+                handle = handle.raw(),
+                "GetInfo id answered with Eden's stubbed zero"
+            );
+            Ok(0)
+        }
+        InfoType::MesosphereMeta => mesosphere_meta(handle, info_sub_id),
+        InfoType::MesosphereCurrentProcess => {
+            mesosphere_current_process(handles, scheduler, processes, handle, info_sub_id)
+        }
     }
 }
 
-/// What a Switch 2 id answers ([`REMOTE_REGION_ADDRESS`] to [`MEMORY_MAPPING_ALIGNMENT`]), or
-/// `None` for any other id.
-const fn switch_2_fact(id: InfoType) -> Option<u64> {
-    Some(match id {
-        InfoType::RemoteRegionAddress => REMOTE_REGION_ADDRESS,
-        InfoType::RemoteRegionSize => REMOTE_REGION_SIZE,
-        InfoType::RemoteMemoryUsed => REMOTE_MEMORY_USED,
-        InfoType::RemoteMemoryTotal => REMOTE_MEMORY_TOTAL,
-        InfoType::MemoryMappingAlignment => MEMORY_MAPPING_ALIGNMENT,
-        _ => return None,
-    })
+/// The handle table, the scheduler and the process facts, shared.
+type Shared<'a> = (&'a HandleTable, &'a Scheduler, &'a Processes);
+
+/// Eden's first group, the process ids: its two checks, then `value` of the process the handle
+/// names (see the module docs).
+fn process_info(
+    (handles, scheduler, processes): Shared<'_>,
+    handle: Handle,
+    info_sub_id: u64,
+    value: &dyn Fn(ProcessId) -> CallResult<u64>,
+) -> CallResult<u64> {
+    // `R_UNLESS(info_sub_id == 0, ResultInvalidEnumValue)`.
+    if info_sub_id != 0 {
+        return Err(KernelError::InvalidEnumValue.into());
+    }
+    // `R_UNLESS(process.IsNotNull(), ResultInvalidHandle)`.
+    value(process_from_handle(handles, scheduler, processes, handle)?)
+}
+
+/// How many of `process`'s threads still have a row in the scheduler.
+fn scheduler_threads((_, scheduler, _): Shared<'_>, process: ProcessId) -> CallResult<usize> {
+    Ok(scheduler.process(process)?.threads().count())
+}
+
+/// `ResourceLimit` (9): Eden's two checks, then `Svc::InvalidHandle`, the answer for a process
+/// with no resource limit (see the module docs).
+fn resource_limit(handle: Handle, info_sub_id: u64) -> CallResult<u64> {
+    // `R_UNLESS(handle == 0, ResultInvalidHandle)`.
+    if handle != Handle::INVALID {
+        return Err(KernelError::InvalidHandle.into());
+    }
+    // `R_UNLESS(info_sub_id == 0, ResultInvalidCombination)`.
+    if info_sub_id != 0 {
+        return Err(KernelError::InvalidCombination.into());
+    }
+    // `*result = Svc::InvalidHandle;`
+    Ok(u64::from(Handle::INVALID.raw()))
+}
+
+/// `IdleTickCount` (10) for a call made on `core`: Eden's two checks, then
+/// [`IDLE_TICK_COUNT`].
+fn idle_tick_count(core: CoreId, handle: Handle, info_sub_id: u64) -> CallResult<u64> {
+    // `R_UNLESS(core_valid, ResultInvalidCombination)`, where `core_valid` is
+    // `info_sub_id == 0xFFFFFFFFFFFFFFFF || info_sub_id == CurrentPhysicalCoreIndex()`.
+    if info_sub_id != ALL_CORES && info_sub_id != u64::from(core.index()) {
+        return Err(KernelError::InvalidCombination.into());
+    }
+    // `R_UNLESS(handle == InvalidHandle, ResultInvalidHandle)`.
+    if handle != Handle::INVALID {
+        return Err(KernelError::InvalidHandle.into());
+    }
+    Ok(IDLE_TICK_COUNT)
+}
+
+/// `InitialProcessIdRange` (19): Eden's handle check, then its stub values by sub id.
+fn initial_process_id_range(handle: Handle, info_sub_id: u64) -> CallResult<u64> {
+    tracing::warn!("GetInfo InitialProcessIdRange answered with Eden's stubbed 0/64");
+    // `R_UNLESS(handle == InvalidHandle, ResultInvalidHandle)`.
+    if handle != Handle::INVALID {
+        return Err(KernelError::InvalidHandle.into());
+    }
+    match info_sub_id {
+        INITIAL_PROCESS_ID_RANGE_MINIMUM => Ok(INITIAL_PROCESS_ID_MINIMUM),
+        INITIAL_PROCESS_ID_RANGE_MAXIMUM => Ok(INITIAL_PROCESS_ID_MAXIMUM),
+        // `default: R_THROW(ResultInvalidCombination);`
+        _ => Err(KernelError::InvalidCombination.into()),
+    }
+}
+
+/// The cores `ThreadTickCount` (25) accepts an index below, for a process built for `console`:
+/// PR #4588's `UsesPAuthReturns() ? NUM_CPU_CORES : NUM_LEGACY_CPU_CORES`.
+const fn tick_count_cores(console: Console) -> u8 {
+    match console {
+        Console::Switch2 => APPLICATION_CORE_COUNT,
+        Console::Switch1 => LEGACY_VIRTUAL_CORE_COUNT,
+    }
+}
+
+/// `ThreadTickCount` (25) for a call made on `core`: PR #4588's two checks, then
+/// [`THREAD_TICK_COUNT`].
+fn thread_tick_count(
+    (handles, scheduler, processes): Shared<'_>,
+    core: CoreId,
+    handle: Handle,
+    info_sub_id: u64,
+) -> CallResult<u64> {
+    let cores = u64::from(tick_count_cores(console_of(processes, processes.own())?));
+    // `if (info_sub_id != 0xFFFFFFFFFFFFFFFF && info_sub_id >= num_cpus)
+    // R_THROW(ResultInvalidCombination)`.
+    if info_sub_id != ALL_CORES && info_sub_id >= cores {
+        return Err(KernelError::InvalidCombination.into());
+    }
+    // `if (thread.IsNull()) R_THROW(ResultInvalidHandle)`.
+    thread_from_handle(scheduler, handles, core, handle)?;
+    Ok(THREAD_TICK_COUNT)
+}
+
+/// `MesosphereMeta` (65000): Eden's handle check, then the value by sub id.
+fn mesosphere_meta(handle: Handle, info_sub_id: u64) -> CallResult<u64> {
+    // `R_UNLESS(handle == InvalidHandle, ResultInvalidHandle)`.
+    if handle != Handle::INVALID {
+        return Err(KernelError::InvalidHandle.into());
+    }
+    match info_sub_id {
+        MESOSPHERE_META_KERNEL_VERSION => Ok(u64::from(SUPPORTED_KERNEL_VERSION)),
+        MESOSPHERE_META_IS_KTRACE_ENABLED | MESOSPHERE_META_IS_SINGLE_STEP_ENABLED => Ok(0),
+        // `default: R_THROW(ResultInvalidCombination);`
+        _ => Err(KernelError::InvalidCombination.into()),
+    }
+}
+
+/// `MesosphereCurrentProcess` (65001): Eden's two checks, then a new handle to the calling
+/// process in its handle table.
+fn mesosphere_current_process(
+    handles: &mut HandleTable,
+    scheduler: &mut Scheduler,
+    processes: &Processes,
+    handle: Handle,
+    info_sub_id: u64,
+) -> CallResult<u64> {
+    // `R_UNLESS(handle == InvalidHandle, ResultInvalidHandle)`.
+    if handle != Handle::INVALID {
+        return Err(KernelError::InvalidHandle.into());
+    }
+    // `R_UNLESS(info_sub_id == 0, ResultInvalidCombination)`.
+    if info_sub_id != 0 {
+        return Err(KernelError::InvalidCombination.into());
+    }
+    // `R_TRY(handle_table.Add(system.Kernel(), std::addressof(tmp), current_process))`.
+    let object = scheduler.process(processes.own())?.object();
+    let added = handles.add(scheduler.objects_mut(), object)?;
+    Ok(u64::from(added.raw()))
 }
 
 /// A Switch 2 id, whose answer is `value`: for a Switch 1 program, Eden's `default`; for a
 /// Switch 2 program, PR #4588's three checks in its order (see the module docs).
 fn switch_2_info(
-    handles: &HandleTable,
-    scheduler: &Scheduler,
-    processes: &Processes,
+    (handles, scheduler, processes): Shared<'_>,
     handle: Handle,
     info_sub_id: u64,
     value: u64,
@@ -349,13 +873,17 @@ fn switch_2_info(
     Ok(value)
 }
 
-/// The console `process` was built for. A process the table has no row for is an internal
-/// failure: a process object or the calling process always names a created process.
-fn console_of(processes: &Processes, process: ProcessId) -> CallResult<Console> {
+/// The facts of `process`. A process the table has no row for is an internal failure: a
+/// process object or the calling process always names a created process.
+fn info_of(processes: &Processes, process: ProcessId) -> CallResult<&ProcessInfo> {
     processes
         .get(process)
-        .map(ProcessInfo::console)
         .map_err(|error| SvcError::internal(&error))
+}
+
+/// The console `process` was built for ([`info_of`]).
+fn console_of(processes: &Processes, process: ProcessId) -> CallResult<Console> {
+    info_of(processes, process).map(ProcessInfo::console)
 }
 
 /// `RandomEntropy`: word `info_sub_id` of `process`'s entropy, after Eden's two checks.
@@ -381,49 +909,6 @@ fn random_entropy(
         .get(index)
         .copied()
         .ok_or_else(|| KernelError::InvalidCombination.into())
-}
-
-/// The memory ids: Eden's checks for its first group, then the value. An id of that group, or
-/// of any other, that this slice does not answer is [`KernelError::NotImplemented`] before any
-/// check.
-fn memory_info(
-    handles: &HandleTable,
-    space: &AddressSpace,
-    scheduler: &Scheduler,
-    processes: &Processes,
-    id: InfoType,
-    handle: Handle,
-    info_sub_id: u64,
-) -> CallResult<u64> {
-    // The value is a plain read, so it is taken before the checks; what is not built has none.
-    let Some(value) = memory_fact(space, id) else {
-        tracing::warn!(?id, number = id.number(), "GetInfo id not implemented");
-        return Err(KernelError::NotImplemented.into());
-    };
-    if info_sub_id != 0 {
-        return Err(KernelError::InvalidEnumValue.into());
-    }
-    process_from_handle(handles, scheduler, processes, handle)?;
-    Ok(value)
-}
-
-/// The fact `id` asks for, if it is one this slice answers (see the module docs).
-fn memory_fact(space: &AddressSpace, id: InfoType) -> Option<u64> {
-    let regions = space.regions();
-    Some(match id {
-        InfoType::AliasRegionAddress => regions.alias.start,
-        InfoType::AliasRegionSize => regions.alias.size(),
-        InfoType::HeapRegionAddress => regions.heap.start,
-        InfoType::HeapRegionSize => regions.heap.size(),
-        InfoType::AslrRegionAddress => regions.code.start,
-        InfoType::AslrRegionSize => regions.code.size(),
-        InfoType::StackRegionAddress => regions.stack.start,
-        InfoType::StackRegionSize => regions.stack.size(),
-        InfoType::TotalMemorySize => space.total_user_physical_memory_size(),
-        InfoType::UsedMemorySize => space.used_user_physical_memory_size(),
-        InfoType::AliasRegionExtraSize => regions.alias_region_extra_size,
-        _ => return None,
-    })
 }
 
 #[cfg(test)]
