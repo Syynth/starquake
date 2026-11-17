@@ -1201,3 +1201,21 @@ fn a_job_that_panics_in_a_replay_does_not_unwind_into_its_submitter() {
     assert_eq!(delivered(&mut rig, 4), (s64(4), four_at(8)));
     assert_eq!(replay.check(), Ok(()));
 }
+
+#[test]
+fn a_replayed_job_that_panics_before_its_answers_has_diverged() {
+    // It asked for fewer answers than the record holds: the run is told when it returns.
+    let (replay, halts) = replay_halting(vec![hello_record(0, 0, 4)]);
+    replay.submit(Box::new(|_: &dyn Env| {
+        std::panic::resume_unwind(Box::new("a replayed job panicked before it read"))
+    }));
+    let diverged = ReplayError::Diverged {
+        job: 0,
+        error: EnvError::Unconsumed {
+            index: 0,
+            remaining: 1,
+        },
+    };
+    assert_eq!(replay.check(), Err(diverged.clone()));
+    assert_eq!(halts.stops(), [Stop::Replay(diverged)]);
+}
