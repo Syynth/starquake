@@ -17,10 +17,10 @@
 //!
 //! Ids and names are Eden's tables. These are exactly the commands the startup fixture's trace
 //! sends (`tests/homebrew/startup/reference/startup.trace`; its README's gap list named them),
-//! `ISelfController::Exit` (0), which libnx sends when the program ends (see "Exit" below), and
-//! `ISelfController` 2000, a Switch 2 command (see "The graphics server" below); every other
-//! command of these interfaces is left out and answered by the server's unknown-command
-//! policy.
+//! `ISelfController::Exit` (0), which libnx sends when the program ends (see "Where this
+//! differs from Eden"), and `ISelfController` 2000, a Switch 2 command (see "The graphics
+//! server" below); every other command of these interfaces is left out and answered by the
+//! server's unknown-command policy.
 //!
 //! | Interface | Id | Command | In | Out |
 //! |---|---|---|---|---|

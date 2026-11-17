@@ -1292,11 +1292,12 @@ fn finish(
 /// because the end follows the reply and there is none yet (module docs).
 fn ending(mut finished: Vec<Finished>, end: bool) -> Vec<Finished> {
     if end {
-        match finished.first_mut() {
-            Some(first) => first.end = true,
-            None => tracing::error!(
+        if let Some(first) = finished.first_mut() {
+            first.end = true;
+        } else {
+            tracing::error!(
                 "a handler asked to end the process and deferred its reply; the process goes on"
-            ),
+            );
         }
     }
     finished

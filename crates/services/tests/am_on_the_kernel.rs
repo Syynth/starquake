@@ -259,8 +259,10 @@ mod on_the_kernel {
         assert_eq!(rig.holdings(), (sessions + 1, sessions + 2, false));
         let before = rig.events.events().len();
 
-        let (outcome, x0, answer) =
-            rig.exchange(controller, &RequestBuilder::cmif(CommandType::Request, EXIT));
+        let (outcome, x0, answer) = rig.exchange(
+            controller,
+            &RequestBuilder::cmif(CommandType::Request, EXIT),
+        );
         assert_eq!(outcome, Outcome::ProcessExited);
         // The reply reached the guest's message buffer and its result its `x0`, and the
         // request was recorded: the service's event, then the system call's.

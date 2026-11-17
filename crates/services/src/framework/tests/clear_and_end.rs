@@ -48,7 +48,7 @@ fn result_of(asked: Result<(), Fault>) -> u32 {
     match asked {
         Ok(()) => ResultCode::SUCCESS.raw(),
         Err(Fault::Result(code)) => code.raw(),
-        Err(other) => panic!("not a result: {other:?}"),
+        Err(other) => unreachable!("not a result: {other:?}"),
     }
 }
 
@@ -144,7 +144,9 @@ fn clearing_an_event_it_made_leaves_it_clear_whether_or_not_it_was_signalled() {
     let ok = only(ResultCode::SUCCESS);
     let made = send(&mut server, &mut kernel, session, MAKE);
     assert_eq!(made.result, ResultCode::SUCCESS.raw());
-    let event = kernel.resolve_handle(Handle::from_raw(made.copies[0])).unwrap();
+    let event = kernel
+        .resolve_handle(Handle::from_raw(made.copies[0]))
+        .unwrap();
     assert_eq!(kernel.is_signalled(event), Some(true));
     assert_eq!(send(&mut server, &mut kernel, session, CLEAR), ok);
     assert_eq!(kernel.is_signalled(event), Some(false));
@@ -203,17 +205,11 @@ impl Kernel for Bare {
         self.0.process_id()
     }
 
-    fn resolve_handle(
-        &self,
-        handle: Handle,
-    ) -> starquake_kernel::result::SvcResult<ObjectId> {
+    fn resolve_handle(&self, handle: Handle) -> starquake_kernel::result::SvcResult<ObjectId> {
         self.0.resolve_handle(handle)
     }
 
-    fn insert_handle(
-        &mut self,
-        object: ObjectId,
-    ) -> starquake_kernel::result::SvcResult<Handle> {
+    fn insert_handle(&mut self, object: ObjectId) -> starquake_kernel::result::SvcResult<Handle> {
         self.0.insert_handle(object)
     }
 
@@ -234,9 +230,7 @@ impl Kernel for Bare {
         self.0.create_shared_memory(size, permission)
     }
 
-    fn create_session(
-        &mut self,
-    ) -> starquake_kernel::result::SvcResult<(ObjectId, Handle)> {
+    fn create_session(&mut self) -> starquake_kernel::result::SvcResult<(ObjectId, Handle)> {
         self.0.create_session()
     }
 

@@ -1935,11 +1935,11 @@ fn signalled(world: &World, event: ObjectId) -> bool {
         let readable = match scheduler.objects().get(event).unwrap() {
             Object::Event(event) => event.readable(),
             Object::ReadableEvent(_) => event,
-            other => panic!("{event:?} is {other:?}, not an event"),
+            other => unreachable!("{event:?} is {other:?}, not an event"),
         };
         match scheduler.objects().get(readable).unwrap() {
             Object::ReadableEvent(state) => state.is_signalled(),
-            other => panic!("{readable:?} is {other:?}"),
+            other => unreachable!("{readable:?} is {other:?}"),
         }
     })
 }
@@ -2081,7 +2081,7 @@ fn reply_and_end(fill: u8) -> Script {
 fn holdings(world: &World, thread: ObjectId) -> (usize, usize, usize, bool) {
     world.with_tables(|handles, scheduler| {
         let Object::Thread(id) = scheduler.objects().get(thread).unwrap() else {
-            panic!("{thread:?} is not a thread");
+            unreachable!("{thread:?} is not a thread");
         };
         let process = scheduler.thread(id).unwrap().process().unwrap();
         let record = scheduler.process(process).unwrap();
@@ -2168,7 +2168,10 @@ fn an_end_asked_by_a_request_a_delivery_runs_is_not_honoured() {
     world.send(A, handle, &request());
     // B's request waits behind A's, and asks to end the process when it runs.
     world.first.script(reply_and_end(0xB0));
-    assert_eq!(world.send(B, handle, &request()).0.outcome, Outcome::Waiting);
+    assert_eq!(
+        world.send(B, handle, &request()).0.outcome,
+        Outcome::Waiting
+    );
 
     lock(&world.first.ready).push_back((session, Ok(0xA0)));
     world.deliver(&world.first);
