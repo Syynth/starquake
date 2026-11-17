@@ -460,6 +460,27 @@ impl Rig {
         (answer, self.memory(out_at, out_len))
     }
 
+    /// `Ioctl3` (12) with `input` in a map-alias in buffer, and out buffers 0 and 1 of `out_len`
+    /// and `inline_len` stale bytes: the result word and both out buffers afterwards.
+    pub(super) fn ioctl3(
+        &mut self,
+        fd: i32,
+        raw: u32,
+        input: &[u8],
+        (out_len, inline_len): (usize, usize),
+    ) -> (Answer, Vec<u8>, Vec<u8>) {
+        let input_at = self.place(input);
+        let out_at = self.place(&vec![STALE; out_len]);
+        let inline_at = self.place(&vec![STALE; inline_len]);
+        let request = cmif(IOCTL3, &fd_and(fd, raw));
+        let request = Auto::alias(input_at, len16(input.len())).send(request, 0);
+        let request = Auto::alias(out_at, len16(out_len)).receive(request);
+        let request = Auto::alias(inline_at, len16(inline_len)).receive(request);
+        let answer = answer(&self.send(&request), 1);
+        let out = self.memory(out_at, out_len);
+        (answer, out, self.memory(inline_at, inline_len))
+    }
+
     /// Runs an nvmap ioctl that must succeed; the struct it gives back.
     fn nvmap(&mut self, fd: i32, raw: u32, input: &[u8]) -> Vec<u8> {
         let (answer, output) = self.ioctl(fd, raw, input, input.len());
