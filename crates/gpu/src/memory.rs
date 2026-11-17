@@ -8,7 +8,7 @@
 //!   GPU address space onto a [`starquake_memory::GuestMemory`].
 //! - [`Translate`] is what an address table offers a cache: a version ("generation") that every
 //!   map, ordered update or kind change moves, and the translation of one page. The production
-//!   table (`GpuVm`, graphics-server slice 6) will implement it.
+//!   table, [`crate::vm::GpuVm`] (graphics-server slice 6), implements it.
 //! - [`TranslationCache`] is one GPU thread's last few page translations, emptied whenever the
 //!   table's version has moved since they were made. Each thread owns its own: one cache shared by
 //!   Eden-NX2's threads was cleared by a map on a service thread between the GPU thread's check of

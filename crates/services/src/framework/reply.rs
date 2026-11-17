@@ -8,6 +8,17 @@ use super::payload::Writer;
 use super::request::DeferredBuffer;
 use super::result::{Completion, Fault, Outcome};
 
+/// Something a reply copies to the caller, in the order the method added it.
+pub(super) enum Copied {
+    /// A kernel object: the caller gets a handle.
+    Object(ObjectId),
+    /// A new interface: the caller gets a handle to a new session on this server, in a domain
+    /// too (a copied handle is never a domain object).
+    Session(Box<dyn Session>),
+    /// A new session on another service's server: the caller gets a handle to it.
+    Service(ServiceId),
+}
+
 /// Something a reply moves to the caller, in the order the method added it.
 pub(super) enum Moved {
     /// A kernel object: the caller gets a handle.
@@ -29,7 +40,7 @@ pub(super) enum Moved {
 #[derive(Default)]
 pub struct Reply {
     payload: Writer,
-    copies: Vec<ObjectId>,
+    copies: Vec<Copied>,
     moves: Vec<Moved>,
     writes: Vec<(DeferredBuffer, Vec<u8>)>,
 }
@@ -42,7 +53,26 @@ impl Reply {
 
     /// Gives the caller a handle to `object` in the reply's copy list.
     pub fn copy_handle(&mut self, object: ObjectId) -> &mut Self {
-        self.copies.push(object);
+        self.copies.push(Copied::Object(object));
+        self
+    }
+
+    /// Returns a new interface to the caller as a copied session handle, placed among the
+    /// copied handles in the order of the calls: a new session on this server, opened with
+    /// `session`, in a domain too (a copied handle is never a domain object). For a protocol
+    /// whose reference hands a raw session out in the copy list where [`Reply::push_session`]
+    /// would put it in the move list (`eden-nx2/src/core/hle/service/nx2_gsv.h` @ 50fa86bb,
+    /// `ReturnRawSession`: `PushCopyObjects`).
+    pub fn copy_session(&mut self, session: Box<dyn Session>) -> &mut Self {
+        self.copies.push(Copied::Session(session));
+        self
+    }
+
+    /// Returns a new session on another service to the caller as a copied session handle,
+    /// placed among the copied handles in the order of the calls. As [`Reply::push_service`],
+    /// except for the list the handle is in.
+    pub fn copy_service(&mut self, service: ServiceId) -> &mut Self {
+        self.copies.push(Copied::Service(service));
         self
     }
 
@@ -107,7 +137,7 @@ impl Reply {
         Ok(Completion::Deferred)
     }
 
-    pub(super) fn into_parts(self) -> (Writer, Vec<ObjectId>, Vec<Moved>) {
+    pub(super) fn into_parts(self) -> (Writer, Vec<Copied>, Vec<Moved>) {
         (self.payload, self.copies, self.moves)
     }
 

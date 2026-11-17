@@ -1141,10 +1141,14 @@ dependencies = [
 name = "starquake-gsv"
 version = "0.0.0"
 dependencies = [
+ "postcard",
+ "proptest",
+ "serde",
  "starquake-gpu",
  "starquake-ipc",
  "starquake-kernel",
  "starquake-services",
+ "starquake-trace",
  "thiserror",
  "tracing",
 ]

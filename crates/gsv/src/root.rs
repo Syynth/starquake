@@ -1,0 +1,627 @@
+//! The graphics server's root: the session `am`'s `ISelfController` 2000 hands a title, its
+//! bootstrap, and every other root command as a logged stub with its known reply shape
+//! (`docs/specs/graphics-server.md`, "The root"; port slice 1).
+//!
+//! Ported from Eden PR #4588,
+//! `eden-pr4588/src/core/hle/service/am/service/graphics_supervisor.cpp` (`IGraphicsSupervisor`)
+//! and `graphics_supervisor_protocol.h` @ e5fb3b97, and Eden-NX2,
+//! `eden-nx2/src/core/hle/service/nx2_gsv.h` @ 50fa86bb (`INx2GraphicsSystemSession`), both
+//! GPL-3.0-or-later; "PR" and "NX2" below, as in [`protocol`](crate::protocol), which holds the
+//! command table, its marks and sources.
+//!
+//! # The server
+//!
+//! [`root_server`] is the root's server, one of the graphics server's per-family servers
+//! (decision 6). It is a private entry of the service registry under [`ROOT_NAME`], which no
+//! title can open through `sm:`; whoever puts the services together gives its number to `am`
+//! (`starquake_services::am`, "The graphics server"). Every session on it is a [`GsvRoot`], and
+//! all of them share one [`RootState`], the server's family state. This matches PR, where `am`'s
+//! `ISelfController` keeps the root session it made on the first 2000
+//! (`m_graphics_supervisor_session`) and hands that same session out on every later one, so
+//! there is one root state. It does not match NX2: `am` makes a new
+//! `INx2GraphicsSystemSession` on every 2000
+//! (`eden-nx2/src/core/hle/service/am/service/self_controller.cpp` @ 50fa86bb,
+//! `GetNx2GraphicsSystemSession`), and each session owns its own `m_objects` and
+//! `m_syncpt_events` (`eden-nx2/src/core/hle/service/nx2_gsv.h`), so a second NX2 session
+//! starts fresh. Here a second root session sees the first one's phase, out-of-order count and
+//! 204 events (listed under "Where this differs from the references").
+//!
+//! Every command is TIPC, as in both references (PR `RegisterHandlersTipc`; NX2
+//! `RegisterHandlersTipc`): a CMIF request (`a_cmif_request_to_the_root_goes_to_the_policy`),
+//! and a TIPC command the table does not list, is answered by the server's unknown-command
+//! policy.
+//!
+//! # The bootstrap
+//!
+//! | Id | Command | In | Out |
+//! |---|---|---|---|
+//! | 4 | `Initialize` | copy handle 0: the process; `u64` applet resource user id, `u64` flags, four `u64` parameters | nothing |
+//! | 11 | `BindProcess` | copy handle 0: the process | nothing |
+//! | 101 | `CompleteBootstrap` | nothing | nothing |
+//! | 126 | `QueryMemoryMode` | nothing | `u32` 0: no remote memory |
+//! | 115 | `ConfigureNativeMemory` | `u64` mode (guess: PR checks two words, the first 0 or 2 and the second 0, read here as one `u64`) | `u64` 0 |
+//!
+//! The layouts are PR's: `DecodeBootstrap` (words 3, 4–5, 6–7 and 8–15 after a header of
+//! `0x14, 0x8000000c, 2`: one copied handle and twelve data words), `BindProcess` (`0x1b,
+//! 0x80000000, 2`: one copied handle, no data), `CompleteBootstrap` (`0x75, 0`), and
+//! `QueryMemoryMode` and `ConfigureNativeMemory` (`rb.Push<u32>(0)`, `rb.Push<u64>(0)`). A
+//! bootstrap is local when its flags are one of [`bootstrap::LOCAL_FLAGS`] and every parameter
+//! is zero (PR `IsLocalBootstrap`); its GPU profile is [`bootstrap::gpu_profile`] (PR
+//! `NativeGpuProfileForBootstrap`). Both are recorded with the request ([`BootstrapRequest`]),
+//! and handed to the GPU by a later slice.
+//!
+//! **Order (decision 7: log first, enforce once a trace confirms it).** PR keeps a phase machine
+//! (`Created` → 4 → `Initialized` → 11 → `ProcessBound` → 101 → `Ready`) and answers a
+//! bootstrap command in any other phase with `Kernel::ResultInvalidState`; NX2 accepts every
+//! command. Here the phase is kept as PR keeps it ([`Phase`]), and a bootstrap command found in
+//! a phase other than the one PR requires is logged, counted ([`RootState::out_of_order`]) and
+//! answered with success. The phase it moves to is reached either way, so later commands are
+//! judged against the order that actually happened.
+//!
+//! # Stubs
+//!
+//! Every other command of the table ([`crate::protocol::ROOT_COMMANDS`]) is a logged stub that
+//! replies success with its known reply shape ([`crate::protocol::ReplyShape`]): its handles,
+//! then its data words, all zero. Each handle is copied ([`crate::protocol::HANDLE_KIND`]):
+//!
+//! - **A session** is a new session on this server, a [`Placeholder`] that has no commands, so
+//!   every request to it is answered by the server's unknown-command policy, logged. NX2 began
+//!   the same way (`INx2NvsrvSession`, "a placeholder ... every command gets an empty success
+//!   and is logged"). The family's slice replaces it with a session on its own server.
+//! - **An event** (only 204's two) is a kernel event, unsignalled. They are made the first time
+//!   204 is asked and kept ([`RootState::syncpoint_events`]), so a repeated 204 hands out the
+//!   same two and a failure between the two keeps the first. Slice 5 replaces them with the
+//!   shared page's request and answer events.
+//!
+//! # Where this differs from the references
+//!
+//! Each row is pinned by the test named, in `root/tests.rs`:
+//!
+//! | Case | PR | NX2 | Here |
+//! |---|---|---|---|
+//! | A bootstrap command out of PR's order | `ResultInvalidState` | success | success, logged and counted (`bootstrap_out_of_order_is_logged_not_refused`) |
+//! | A bootstrap that asks for remote memory (flags not local, or a parameter not zero) | `ResultNotImplemented` | success | **conflict**: success, the request recorded with its mode, logged; verification 5 (`a_remote_memory_bootstrap_is_accepted_and_recorded`) |
+//! | 4's or 11's copied handle names an object that is not the process the root was made for, or 4's applet resource user id is not the caller's | `ResultInvalidHandle`, `ResultInvalidArgument` | success | success: the root knows neither the process nor the applet resource user id; only a handle that names nothing is refused, with the kernel's error (`the_bootstrap_takes_any_object_and_any_user_id`) |
+//! | A request whose header is not PR's exact one | `ResultInvalidCombination` | read as it comes | a request that lacks the handle or data a command reads is `INVALID_CMIF_REQUEST`, the handle checked first; one with more data words is read (`a_short_bootstrap_request_is_refused_and_a_longer_one_is_read`, `the_handle_is_checked_before_the_data`) |
+//! | 115 with a mode other than 0 or 2 | `ResultInvalidCombination` | not in its table: auto-stubbed, success | success, the mode recorded, logged (`configure_native_memory_records_any_mode`) |
+//! | 126, 115 and the stubs before the bootstrap is complete | `ResultInvalidState` for most | success | success, the phase logged (`every_root_command_s_reply_bytes`, sent before any bootstrap) |
+//! | A TIPC command the table does not list | `ResultNotImplemented` | auto-stubbed | the server's unknown-command policy (`a_command_the_table_does_not_list_goes_to_the_policy`) |
+//! | A second root session (a second 2000) | the same session as the first: one state | a new session with its own `m_objects` and `m_syncpt_events` | a new session that shares the first one's [`RootState`]: its phase, its out-of-order count and 204's two events (`two_root_sessions_share_the_phase_and_the_syncpoint_events`) |
+
+use serde::{Deserialize, Serialize};
+use starquake_kernel::id::ObjectId;
+use starquake_services::commands;
+use starquake_services::framework::{
+    Context, Fault, Interfaces, NOT_SUPPORTED, Outcome, Reply, Request, Server, UnknownPolicy,
+};
+
+use crate::protocol::command::{
+    ACTIVATE_FRAME_CONTEXT, ACTIVATE_GPU_CONTEXT, BIND_NATIVE_GPU_MEMORY, BIND_NATIVE_MEMORY,
+    BIND_PROCESS, BIND_SYNCPOINT_MEMORY, CALCULATE_IMAGE_REQUIREMENTS, CALCULATE_NATIVE_IMAGE_SIZE,
+    CALCULATE_REQUIRED_BUFFER_MEMORY, CALCULATE_VIDEO_IMAGE_REQUIREMENTS, COMPLETE_BOOTSTRAP,
+    CONFIGURE_NATIVE_MEMORY, CREATE_CAMERA_CONTEXT, CREATE_CHAT_IMAGE_POOL, CREATE_NATIVE_IMAGE,
+    CREATE_NATIVE_MEMORY, CREATE_NATIVE_WINDOW_ALIAS_IMAGE_POOL, CREATE_VIDEO_IMAGE_POOL,
+    DESTROY_NATIVE_IMAGE, DESTROY_NATIVE_MEMORY, DESTROY_NATIVE_WINDOW_ALIAS_IMAGE_POOL,
+    DESTROY_VIDEO_IMAGE_POOL, FINALIZE_DISPLAY_CONTEXT, FINALIZE_VIDEO_DECODER,
+    FINALIZE_VIDEO_ENCODER, GET_NATIVE_EVENT_1121, GET_NVIDIA_DRIVER, GET_SYNCPOINT_SESSION,
+    INITIALIZE, INITIALIZE_DISPLAY_CONTEXT, INITIALIZE_FRAME_CONTEXT, INITIALIZE_GPU_CONTEXT,
+    INITIALIZE_IMAGE_CONTEXT_1501, INITIALIZE_IMAGE_CONTEXT_1502, INITIALIZE_SYNCPOINT_CONTEXT,
+    INITIALIZE_VIDEO_DECODER, INITIALIZE_VIDEO_ENCODER, MAP_NATIVE_GPU_IMAGE, OPEN_CAMERA_SESSION,
+    OPEN_DISPLAY_SESSION, OPEN_GPU_SESSION, OPEN_VIDEO_DECODER_CONTEXT,
+    OPEN_VIDEO_DECODER_CONTEXT_902, OPEN_VIDEO_ENCODER_CONTEXT, QUERY_MEMORY_MODE,
+    QUERY_NATIVE_GPU_IMAGE, QUERY_VIDEO_IMAGE, REGISTER_GPU_ADDRESS_SPACE, SEQUENCE_COMMAND_1201,
+    SEQUENCE_COMMAND_1202, SEQUENCE_COMMAND_1203, SET_GRAPHICS_CLASS_1111, UNMAP_NATIVE_GPU_IMAGE,
+};
+use crate::protocol::{Handed, bootstrap, root_command};
+
+#[cfg(test)]
+mod tests;
+
+/// The name of the root's private entry in the service registry. Starquake's own: on a console
+/// `am` makes the session itself (PR `ISelfController::GetGraphicsSupervisor`), so the root has
+/// no registered name in any reference (`starquake_services::sm`, "Private entries").
+pub const ROOT_NAME: &str = "gsv";
+
+/// Where the bootstrap is, as PR's phase machine names it (`IGraphicsSupervisor::Phase`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Phase {
+    /// Before `Initialize` (4).
+    Created,
+    /// After `Initialize`.
+    Initialized,
+    /// After `BindProcess` (11).
+    ProcessBound,
+    /// After `CompleteBootstrap` (101): every other command may run.
+    Ready,
+}
+
+impl Phase {
+    /// The phase as a word, for logs.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::Initialized => "initialized",
+            Self::ProcessBound => "process bound",
+            Self::Ready => "ready",
+        }
+    }
+
+    /// For a bootstrap command, the phase PR requires it in and the phase it moves to
+    /// (PR `Initialize`: `m_phase != Phase::Created`; `BindProcess`: `m_phase !=
+    /// Phase::Initialized`; `CompleteBootstrap`: `m_phase != Phase::ProcessBound`).
+    #[must_use]
+    pub const fn step(command: u32) -> Option<(Self, Self)> {
+        match command {
+            INITIALIZE => Some((Self::Created, Self::Initialized)),
+            BIND_PROCESS => Some((Self::Initialized, Self::ProcessBound)),
+            COMPLETE_BOOTSTRAP => Some((Self::ProcessBound, Self::Ready)),
+            _ => None,
+        }
+    }
+}
+
+/// What `Initialize` (4) was asked (PR `BootstrapRequest`, without the process handle, which
+/// names an object only for the request's length).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BootstrapRequest {
+    /// The applet resource user id.
+    pub applet_resource_user_id: u64,
+    /// The flags.
+    pub flags: u64,
+    /// The parameters after the flags.
+    pub parameters: [u64; bootstrap::PARAMETERS],
+}
+
+impl BootstrapRequest {
+    /// Whether it is a local bootstrap (no remote memory): PR `IsLocalBootstrap`.
+    #[must_use]
+    pub fn is_local(&self) -> bool {
+        bootstrap::is_local(self.flags, &self.parameters)
+    }
+
+    /// The GPU profile its flags ask for: PR `NativeGpuProfileForBootstrap`.
+    #[must_use]
+    pub const fn gpu_profile(&self) -> Option<u32> {
+        bootstrap::gpu_profile(self.flags)
+    }
+}
+
+/// The events the 204 stub has made, in the order it hands them out. Kept so that a repeated
+/// 204 hands out the same two, and so that the first is not forgotten when making the second
+/// fails.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SyncpointEvents {
+    /// None made yet.
+    #[default]
+    None,
+    /// The first made; making the second failed.
+    One(ObjectId),
+    /// Both made.
+    Both(ObjectId, ObjectId),
+}
+
+/// What every root session shares: the root server's family state. Plain data, saved in the
+/// server's snapshot. Deserialising goes through `SavedRootState`, which refuses a state the
+/// root's commands cannot reach ([`RootStateError`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "SavedRootState")]
+pub struct RootState {
+    phase: Phase,
+    bootstrap: Option<BootstrapRequest>,
+    out_of_order: u32,
+    native_memory_mode: Option<u64>,
+    syncpoint_events: SyncpointEvents,
+}
+
+/// The serialised form of [`RootState`], field for field, and what deserialising validates.
+#[derive(Deserialize)]
+struct SavedRootState {
+    phase: Phase,
+    bootstrap: Option<BootstrapRequest>,
+    out_of_order: u32,
+    native_memory_mode: Option<u64>,
+    syncpoint_events: SyncpointEvents,
+}
+
+/// Why a saved [`RootState`] could not be read back: it holds a combination of fields that no
+/// sequence of root commands leads to. The phase only ever leaves [`Phase::Created`] (no
+/// command steps back to it), only `Initialize` (4) enters [`Phase::Initialized`] and records
+/// a bootstrap, the first of 11 and 101 sent before any 4 is out of PR's order, and 204 makes
+/// two distinct events. These are every relation between the fields; the native memory mode
+/// and a lone 204 event may be anything in any phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum RootStateError {
+    /// [`Phase::Created`] with a bootstrap recorded: 4 moves the phase out of `Created`.
+    #[error("a root that no bootstrap command has reached has a recorded bootstrap")]
+    CreatedWithBootstrap,
+    /// [`Phase::Created`] with out-of-order commands counted: each counted command moves the
+    /// phase out of `Created`.
+    #[error("a root that no bootstrap command has reached has counted {count} out of order")]
+    CreatedWithCount {
+        /// The count in the data.
+        count: u32,
+    },
+    /// [`Phase::Initialized`] with no bootstrap recorded: only 4 leads there, and it records
+    /// one.
+    #[error("an initialized root has no recorded bootstrap")]
+    InitializedWithoutBootstrap,
+    /// Past [`Phase::Created`] with no bootstrap and nothing counted: with no 4 sent, the
+    /// phase left `Created` through 11 or 101, which are out of order there.
+    #[error(
+        "a root that left the created phase without a bootstrap has counted nothing out of order"
+    )]
+    UncountedWithoutBootstrap,
+    /// 204's two events are one object: it makes two.
+    #[error("the two syncpoint events are the same object")]
+    SameSyncpointEvents,
+}
+
+impl TryFrom<SavedRootState> for RootState {
+    type Error = RootStateError;
+
+    fn try_from(saved: SavedRootState) -> Result<Self, Self::Error> {
+        let SavedRootState {
+            phase,
+            bootstrap,
+            out_of_order,
+            native_memory_mode,
+            syncpoint_events,
+        } = saved;
+        match (phase, bootstrap.is_some()) {
+            (Phase::Created, true) => return Err(RootStateError::CreatedWithBootstrap),
+            (Phase::Created, false) if out_of_order != 0 => {
+                return Err(RootStateError::CreatedWithCount {
+                    count: out_of_order,
+                });
+            }
+            (Phase::Initialized, false) => {
+                return Err(RootStateError::InitializedWithoutBootstrap);
+            }
+            (Phase::ProcessBound | Phase::Ready, false) if out_of_order == 0 => {
+                return Err(RootStateError::UncountedWithoutBootstrap);
+            }
+            _ => {}
+        }
+        if let SyncpointEvents::Both(first, second) = syncpoint_events
+            && first == second
+        {
+            return Err(RootStateError::SameSyncpointEvents);
+        }
+        Ok(Self {
+            phase,
+            bootstrap,
+            out_of_order,
+            native_memory_mode,
+            syncpoint_events,
+        })
+    }
+}
+
+impl Default for RootState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RootState {
+    /// A root no command has reached: [`Phase::Created`], nothing recorded.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            phase: Phase::Created,
+            bootstrap: None,
+            out_of_order: 0,
+            native_memory_mode: None,
+            syncpoint_events: SyncpointEvents::None,
+        }
+    }
+
+    /// Where the bootstrap is.
+    #[must_use]
+    pub const fn phase(&self) -> Phase {
+        self.phase
+    }
+
+    /// What the last `Initialize` asked, if one was sent.
+    #[must_use]
+    pub const fn bootstrap(&self) -> Option<&BootstrapRequest> {
+        self.bootstrap.as_ref()
+    }
+
+    /// How many bootstrap commands came in a phase other than the one PR requires (decision 7).
+    /// It stops at `u32::MAX`.
+    #[must_use]
+    pub const fn out_of_order(&self) -> u32 {
+        self.out_of_order
+    }
+
+    /// The mode the last `ConfigureNativeMemory` (115) named, if one was sent.
+    #[must_use]
+    pub const fn native_memory_mode(&self) -> Option<u64> {
+        self.native_memory_mode
+    }
+
+    /// The events the 204 stub has made.
+    #[must_use]
+    pub const fn syncpoint_events(&self) -> SyncpointEvents {
+        self.syncpoint_events
+    }
+
+    /// Moves the bootstrap to the phase `command` leads to, logging and counting it if the
+    /// bootstrap was not in the phase PR requires (see "The bootstrap" in the module docs).
+    fn step(&mut self, command: u32) {
+        let Some((required, next)) = Phase::step(command) else {
+            return;
+        };
+        if self.phase != required {
+            self.out_of_order = self.out_of_order.saturating_add(1);
+            tracing::warn!(
+                command,
+                phase = self.phase.word(),
+                required = required.word(),
+                "gsv: bootstrap command out of order; accepted (decision 7)"
+            );
+        }
+        self.phase = next;
+    }
+
+    /// Logs a command PR runs only once the bootstrap is complete, if it is not.
+    fn note_unready(&self, command: u32) {
+        if self.phase != Phase::Ready {
+            tracing::warn!(
+                command,
+                phase = self.phase.word(),
+                "gsv: command before the bootstrap is complete; accepted (decision 7)"
+            );
+        }
+    }
+}
+
+/// The root interface: what a session on the root's server is. It keeps nothing; the state is
+/// the server's ([`RootState`]).
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct GsvRoot;
+
+/// The session a stub hands out in place of a family's own (see "Stubs" in the module docs). It
+/// has no commands.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct Placeholder {
+    command: u32,
+}
+
+impl Placeholder {
+    /// The root command that handed it out.
+    #[must_use]
+    pub const fn command(&self) -> u32 {
+        self.command
+    }
+}
+
+commands! {
+    impl GsvRoot {}
+    tipc {
+        INITIALIZE => initialize,
+        BIND_PROCESS => bind_process,
+        COMPLETE_BOOTSTRAP => complete_bootstrap,
+        QUERY_MEMORY_MODE => query_memory_mode,
+        CONFIGURE_NATIVE_MEMORY => configure_native_memory,
+        INITIALIZE_SYNCPOINT_CONTEXT => stub,
+        GET_SYNCPOINT_SESSION => stub,
+        BIND_SYNCPOINT_MEMORY => stub,
+        INITIALIZE_DISPLAY_CONTEXT => stub,
+        FINALIZE_DISPLAY_CONTEXT => stub,
+        OPEN_DISPLAY_SESSION => stub,
+        INITIALIZE_GPU_CONTEXT => stub,
+        ACTIVATE_GPU_CONTEXT => stub,
+        REGISTER_GPU_ADDRESS_SPACE => stub,
+        OPEN_GPU_SESSION => stub,
+        GET_NVIDIA_DRIVER => stub,
+        CREATE_NATIVE_MEMORY => stub,
+        DESTROY_NATIVE_MEMORY => stub,
+        BIND_NATIVE_MEMORY => stub,
+        BIND_NATIVE_GPU_MEMORY => stub,
+        CREATE_NATIVE_IMAGE => stub,
+        DESTROY_NATIVE_IMAGE => stub,
+        CALCULATE_NATIVE_IMAGE_SIZE => stub,
+        CALCULATE_IMAGE_REQUIREMENTS => stub,
+        DESTROY_NATIVE_WINDOW_ALIAS_IMAGE_POOL => stub,
+        CREATE_NATIVE_WINDOW_ALIAS_IMAGE_POOL => stub,
+        MAP_NATIVE_GPU_IMAGE => stub,
+        UNMAP_NATIVE_GPU_IMAGE => stub,
+        QUERY_NATIVE_GPU_IMAGE => stub,
+        INITIALIZE_VIDEO_DECODER => stub,
+        OPEN_VIDEO_DECODER_CONTEXT_902 => stub,
+        FINALIZE_VIDEO_DECODER => stub,
+        OPEN_VIDEO_DECODER_CONTEXT => stub,
+        CREATE_VIDEO_IMAGE_POOL => stub,
+        DESTROY_VIDEO_IMAGE_POOL => stub,
+        QUERY_VIDEO_IMAGE => stub,
+        CALCULATE_VIDEO_IMAGE_REQUIREMENTS => stub,
+        INITIALIZE_VIDEO_ENCODER => stub,
+        OPEN_VIDEO_ENCODER_CONTEXT => stub,
+        FINALIZE_VIDEO_ENCODER => stub,
+        INITIALIZE_FRAME_CONTEXT => stub,
+        ACTIVATE_FRAME_CONTEXT => stub,
+        SET_GRAPHICS_CLASS_1111 => stub,
+        GET_NATIVE_EVENT_1121 => stub,
+        SEQUENCE_COMMAND_1201 => stub,
+        SEQUENCE_COMMAND_1202 => stub,
+        SEQUENCE_COMMAND_1203 => stub,
+        CREATE_CHAT_IMAGE_POOL => stub,
+        CALCULATE_REQUIRED_BUFFER_MEMORY => stub,
+        INITIALIZE_IMAGE_CONTEXT_1501 => stub,
+        INITIALIZE_IMAGE_CONTEXT_1502 => stub,
+        CREATE_CAMERA_CONTEXT => stub,
+        OPEN_CAMERA_SESSION => stub,
+    }
+}
+
+// No command: every request goes to the server's unknown-command policy (module docs, "Stubs").
+commands! {
+    impl Placeholder {}
+}
+
+impl GsvRoot {
+    /// `Initialize` (4). in: copy handle 0, the process; `u64` applet resource user id, `u64`
+    /// flags, four `u64` parameters. Everything is read before anything is recorded, so a short
+    /// request changes nothing.
+    fn initialize(
+        _: &mut Self,
+        cx: &mut Context<'_>,
+        req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        // PR checks the process handle before the phase and the fields.
+        req.copy_handle(0)?;
+        let mut payload = req.payload();
+        let applet_resource_user_id = payload.read_u64()?;
+        let flags = payload.read_u64()?;
+        let mut parameters = [0; bootstrap::PARAMETERS];
+        for parameter in &mut parameters {
+            *parameter = payload.read_u64()?;
+        }
+        let request = BootstrapRequest {
+            applet_resource_user_id,
+            flags,
+            parameters,
+        };
+        if !request.is_local() {
+            tracing::warn!(
+                flags,
+                "gsv: a remote-memory bootstrap; accepted as NX2 does, with no remote memory"
+            );
+        }
+        let state = cx.family::<RootState>()?;
+        state.step(INITIALIZE);
+        state.bootstrap = Some(request);
+        reply.ok()
+    }
+
+    /// `BindProcess` (11). in: copy handle 0, the process.
+    fn bind_process(
+        _: &mut Self,
+        cx: &mut Context<'_>,
+        req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        req.copy_handle(0)?;
+        cx.family::<RootState>()?.step(BIND_PROCESS);
+        reply.ok()
+    }
+
+    /// `CompleteBootstrap` (101).
+    fn complete_bootstrap(
+        _: &mut Self,
+        cx: &mut Context<'_>,
+        _req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        cx.family::<RootState>()?.step(COMPLETE_BOOTSTRAP);
+        reply.ok()
+    }
+
+    /// `QueryMemoryMode` (126). out: `u32` 0, no remote memory.
+    fn query_memory_mode(
+        _: &mut Self,
+        cx: &mut Context<'_>,
+        _req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        cx.family::<RootState>()?.note_unready(QUERY_MEMORY_MODE);
+        reply.payload().write_u32(bootstrap::NO_REMOTE_MEMORY_MODE);
+        reply.ok()
+    }
+
+    /// `ConfigureNativeMemory` (115). in: `u64` mode. out: `u64` 0.
+    fn configure_native_memory(
+        _: &mut Self,
+        cx: &mut Context<'_>,
+        req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        let mode = req.payload().read_u64()?;
+        let state = cx.family::<RootState>()?;
+        state.note_unready(CONFIGURE_NATIVE_MEMORY);
+        // PR `ConfigureNativeMemory`: `packet[2] == 0 || packet[2] == 2`, `packet[3] == 0`.
+        if mode != 0 && mode != 2 {
+            tracing::warn!(mode, "gsv: native memory mode PR refuses; accepted");
+        }
+        state.native_memory_mode = Some(mode);
+        reply.payload().write_u64(bootstrap::NO_NATIVE_MEMORY_MODE);
+        reply.ok()
+    }
+
+    /// Every other root command: logs it and replies success with its known reply shape (module
+    /// docs, "Stubs").
+    fn stub(_: &mut Self, cx: &mut Context<'_>, req: &Request<'_>, reply: &mut Reply) -> Outcome {
+        let id = req.command_id();
+        let Some(row) = root_command(id) else {
+            // The command table and `ROOT_COMMANDS` list the same ids (a test checks): a
+            // mistake in the service, not something a guest did.
+            tracing::error!(command = id, "gsv: a stub with no row in the command table");
+            return Err(NOT_SUPPORTED.into());
+        };
+        let phase = cx.family::<RootState>()?.phase;
+        tracing::info!(
+            command = id,
+            name = row.name,
+            mark = row.mark.word(),
+            phase = phase.word(),
+            "gsv: stub"
+        );
+        // Only 204 returns events: the two it keeps.
+        let events = if row.reply.handles.contains(&Handed::Event) {
+            syncpoint_events(cx)?.to_vec()
+        } else {
+            Vec::new()
+        };
+        let mut next_event = events.into_iter();
+        for handed in row.reply.handles {
+            match handed {
+                Handed::Session => {
+                    reply.copy_session(Box::new(Placeholder { command: id }));
+                }
+                Handed::Event => {
+                    let event = next_event.next().ok_or(Fault::from(NOT_SUPPORTED))?;
+                    reply.copy_handle(event);
+                }
+            }
+        }
+        for _ in 0..row.reply.words {
+            reply.payload().write_u32(0);
+        }
+        reply.ok()
+    }
+}
+
+/// The two events the 204 stub hands out, made the first time and kept (module docs, "Stubs").
+fn syncpoint_events(cx: &mut Context<'_>) -> Result<[ObjectId; 2], Fault> {
+    let first = match cx.family::<RootState>()?.syncpoint_events {
+        SyncpointEvents::Both(first, second) => return Ok([first, second]),
+        SyncpointEvents::One(first) => first,
+        SyncpointEvents::None => {
+            let first = cx.create_event()?;
+            cx.family::<RootState>()?.syncpoint_events = SyncpointEvents::One(first);
+            first
+        }
+    };
+    let second = cx.create_event()?;
+    cx.family::<RootState>()?.syncpoint_events = SyncpointEvents::Both(first, second);
+    Ok([first, second])
+}
+
+/// The interfaces a root server's sessions can be.
+#[must_use]
+pub fn root_interfaces() -> Interfaces {
+    Interfaces::new().with::<GsvRoot>().with::<Placeholder>()
+}
+
+/// The root's server: every session a [`GsvRoot`], sharing one [`RootState`].
+#[must_use]
+pub fn root_server(policy: UnknownPolicy) -> Server {
+    Server::new(ROOT_NAME, policy)
+        .with_root(|| Box::new(GsvRoot))
+        .with_interfaces(root_interfaces())
+        .with_family(RootState::new())
+}

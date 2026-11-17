@@ -67,10 +67,13 @@
 //!   is open; every pending token is below the next token id, and is for a session whose
 //!   request the queue marks deferred; every deferred session has exactly one pending token; a
 //!   deferred request's reply has a domain header exactly when its session leads to a domain.
-//! - The family state: present exactly when the server has some, and decodes as its type.
+//! - The family state: present exactly when the server has some, and decodes as its type; for
+//!   a family set with [`Server::with_checked_family`], it also passes that family's check
+//!   against the server's own state ([`SnapshotError::FamilyWiring`]).
 //!
 //! Not checked, because the snapshot holds nothing to check them against: the values inside a
-//! session's or a family's state (see "Format"), a deferred request's command id and argument
+//! session's or a family's state (see "Format") beyond what the state's own deserialisation
+//! and a family's check refuse, a deferred request's command id and argument
 //! size (they only go into its trace event), and whether a deferred request on a session that
 //! is not a domain was CMIF or TIPC.
 //!
@@ -156,6 +159,10 @@ pub enum SnapshotError {
     /// The parts of the snapshot disagree with each other.
     #[error("inconsistent snapshot: {0}")]
     Inconsistent(&'static str),
+    /// The snapshot's family state disagrees with the server's on the run's wiring
+    /// ([`Server::with_checked_family`]): it was saved by a run put together differently.
+    #[error("the snapshot does not fit this run: {0}")]
+    FamilyWiring(&'static str),
 }
 
 /// Encodes a session's or a family's state. [`commands!`](crate::commands) calls it; a service
@@ -166,7 +173,7 @@ pub fn encode<T: Serialize + ?Sized>(state: &T) -> Result<Vec<u8>, SnapshotError
 
 /// Decodes a whole value: bytes left over are an error, since they mean the bytes were written
 /// as some other type.
-fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, postcard::Error> {
+pub(super) fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, postcard::Error> {
     let (value, rest) = postcard::take_from_bytes(bytes)?;
     if rest.is_empty() {
         Ok(value)
@@ -409,7 +416,12 @@ impl Server {
         requests.check()?;
         // The family is loaded last: it is the one step that changes the server and can fail.
         match (self.family.as_deref_mut(), body.family) {
-            (Some(family), Some(saved)) => family.load_state(&saved)?,
+            (Some(family), Some(saved)) => {
+                if let Some(check) = &self.family_check {
+                    check(&*family, &saved)?;
+                }
+                family.load_state(&saved)?;
+            }
             (None, None) => {}
             _ => return Err(SnapshotError::FamilyMismatch),
         }

@@ -16,7 +16,7 @@ use super::*;
 use crate::framework::control::CONVERT_CURRENT_OBJECT_TO_DOMAIN;
 use crate::framework::fake::FakeKernel;
 use crate::framework::result::{INVALID_CMIF_REQUEST, UNKNOWN_COMMAND_ID};
-use crate::framework::{Handled, Kernel, Protocol, Session};
+use crate::framework::{Handled, Kernel, Protocol, Session, SnapshotError};
 
 use super::command::application_functions::NOTIFY_RUNNING;
 use super::command::common_state_getter::{
@@ -28,7 +28,7 @@ use super::command::proxy::{
 };
 use super::command::proxy_service::OPEN_APPLICATION_PROXY;
 use super::command::self_controller::{
-    GET_ACCUMULATED_SUSPENDED_TICK_CHANGED_EVENT, SET_FOCUS_HANDLING_MODE,
+    GET_ACCUMULATED_SUSPENDED_TICK_CHANGED_EVENT, GET_GRAPHICS_SUPERVISOR, SET_FOCUS_HANDLING_MODE,
     SET_OPERATION_MODE_CHANGED_NOTIFICATION, SET_OUT_OF_FOCUS_SUSPENDING_ENABLED,
     SET_PERFORMANCE_MODE_CHANGED_NOTIFICATION,
 };
@@ -1077,4 +1077,157 @@ fn a_new_message_event_whose_signal_fails_is_still_kept() {
     let copied = rig.object(getter, GET_EVENT_HANDLE, &[]).copies[0];
     assert_eq!(rig.object_of(copied), event);
     assert_eq!(rig.kernel.signals(event), Some(0));
+}
+
+// ----- ISelfController: GetGraphicsSupervisor (Switch 2) -------------------------------------
+
+/// The number the tests' graphics server's root is known by: distinct from every other number
+/// the fake kernel knows.
+const GRAPHICS: ServiceId = ServiceId(0x6575);
+
+impl Rig {
+    /// A rig whose applet names [`GRAPHICS`] as the graphics server, which the kernel knows.
+    fn with_graphics() -> Self {
+        let mut rig = Self::new();
+        rig.kernel.add_service(GRAPHICS);
+        let applet = Applet::new(AppletSettings::eden_default()).with_graphics_server(GRAPHICS);
+        let mut server = oe_server_for(applet, UnknownPolicy::Strict);
+        server.accept(rig.session).unwrap();
+        rig.server = server;
+        rig
+    }
+}
+
+#[test]
+fn get_graphics_supervisor_copies_a_session_on_the_graphics_server_and_the_reply_is_these_bytes() {
+    let mut rig = Rig::with_graphics();
+    let proxy = rig.proxy();
+    let controller = rig.open(proxy, GET_SELF_CONTROLLER);
+    let handles = rig.kernel.handle_count();
+    let reply = rig.object_raw(controller, GET_GRAPHICS_SUPERVISOR, &[]);
+    // One more handle: the copied one, which names the new session.
+    assert_eq!(rig.kernel.handle_count(), handles + 1);
+    let message = Message::parse_reply(&reply, SessionKind::Domain).unwrap();
+    assert_eq!(message.move_handles, Vec::<u32>::new());
+    let [handle] = message.copy_handles[..] else {
+        unreachable!("one copied handle: {:?}", message.copy_handles);
+    };
+    assert_eq!(reply, copied_handle_reply(handle));
+    let session = rig.object_of(handle);
+    assert_eq!(rig.kernel.owner(session), Some(GRAPHICS));
+    // The graphics server's server is told of it, to open its root interface.
+    assert_eq!(rig.kernel.take_connections(), [(GRAPHICS, session)]);
+    // appletOE itself opened nothing more: the root, the proxy and the controller.
+    assert_eq!(rig.server.interface_count(), 3);
+}
+
+/// The conflict the module docs list ("The graphics server"): NX2's new session per call, not
+/// PR's one cached session.
+#[test]
+fn get_graphics_supervisor_makes_a_new_session_on_every_call() {
+    let mut rig = Rig::with_graphics();
+    let proxy = rig.proxy();
+    let controller = rig.open(proxy, GET_SELF_CONTROLLER);
+    let first = rig.object(controller, GET_GRAPHICS_SUPERVISOR, &[]);
+    let second = rig.object(controller, GET_GRAPHICS_SUPERVISOR, &[]);
+    assert_eq!(first.result, ResultCode::SUCCESS);
+    assert_eq!(second.result, ResultCode::SUCCESS);
+    let first = rig.object_of(first.copies[0]);
+    let second = rig.object_of(second.copies[0]);
+    assert_ne!(first, second);
+    assert_eq!(
+        rig.kernel.take_connections(),
+        [(GRAPHICS, first), (GRAPHICS, second)]
+    );
+}
+
+/// Starquake's own answer (module docs, "The graphics server"): no handle, no session.
+#[test]
+fn get_graphics_supervisor_without_a_graphics_server_is_unknown() {
+    let mut rig = Rig::new();
+    rig.kernel.add_service(GRAPHICS);
+    let proxy = rig.proxy();
+    let controller = rig.open(proxy, GET_SELF_CONTROLLER);
+    let handles = rig.kernel.handle_count();
+    let reply = rig.object_raw(controller, GET_GRAPHICS_SUPERVISOR, &[]);
+    assert_eq!(reply, domain_reply(UNKNOWN, &[], &[]));
+    assert_eq!(rig.kernel.handle_count(), handles);
+    assert_eq!(rig.kernel.take_connections(), []);
+    assert_eq!(rig.applet().graphics_server(), None);
+}
+
+/// An `appletOE` server built for a run whose graphics server is `graphics`, if it has one.
+fn oe_server_with(graphics: Option<ServiceId>) -> Server {
+    let applet = Applet::new(AppletSettings::eden_default());
+    let applet = match graphics {
+        Some(graphics) => applet.with_graphics_server(graphics),
+        None => applet,
+    };
+    oe_server_for(applet, UnknownPolicy::Strict)
+}
+
+/// A restored server of the same run still hands out sessions on the graphics server, from a
+/// controller opened before the save.
+#[test]
+fn a_restored_server_still_hands_out_sessions_on_the_graphics_server() {
+    let mut rig = Rig::with_graphics();
+    let proxy = rig.proxy();
+    let controller = rig.open(proxy, GET_SELF_CONTROLLER);
+    let saved = rig.server.save().unwrap();
+    let mut restored = oe_server_with(Some(GRAPHICS));
+    restored.restore(&saved).unwrap();
+    assert_eq!(
+        restored.family::<Applet>().unwrap().graphics_server(),
+        Some(GRAPHICS)
+    );
+    rig.server = restored;
+    let reply = rig.object(controller, GET_GRAPHICS_SUPERVISOR, &[]);
+    assert_eq!(reply.result, ResultCode::SUCCESS);
+    let session = rig.object_of(reply.copies[0]);
+    assert_eq!(rig.kernel.take_connections(), [(GRAPHICS, session)]);
+}
+
+/// The graphics server's number is the run's wiring (module docs, "The graphics server"): a
+/// snapshot whose number is not the restoring server's is refused, whichever side has one, and
+/// the server keeps its own number and nothing of the snapshot.
+#[test]
+fn a_snapshot_with_another_graphics_server_is_refused() {
+    let another = ServiceId(0x101);
+    let cases = [
+        (Some(GRAPHICS), Some(another)),
+        (Some(another), Some(GRAPHICS)),
+        (Some(GRAPHICS), None),
+        (None, Some(GRAPHICS)),
+    ];
+    for (saved_with, run) in cases {
+        let mut saving = oe_server_with(saved_with);
+        let mut kernel = FakeKernel::new(0).unwrap();
+        let session = kernel.new_object();
+        saving.accept(session).unwrap();
+        let saved = saving.save().unwrap();
+
+        let mut restored = oe_server_with(run);
+        let refused = SnapshotError::FamilyWiring("its applet names another graphics server");
+        assert_eq!(
+            restored.restore(&saved),
+            Err(refused.clone()),
+            "{saved_with:?} {run:?}"
+        );
+        assert_eq!(
+            refused.to_string(),
+            "the snapshot does not fit this run: its applet names another graphics server"
+        );
+        assert_eq!(restored.family::<Applet>().unwrap().graphics_server(), run);
+        assert_eq!(restored.session_count(), 0, "{saved_with:?} {run:?}");
+    }
+    // The same number on both sides, or none on both, restores.
+    for graphics in [Some(GRAPHICS), None] {
+        let mut saving = oe_server_with(graphics);
+        let mut kernel = FakeKernel::new(0).unwrap();
+        saving.accept(kernel.new_object()).unwrap();
+        let saved = saving.save().unwrap();
+        let mut restored = oe_server_with(graphics);
+        restored.restore(&saved).unwrap();
+        assert_eq!(restored.session_count(), 1, "{graphics:?}");
+    }
 }

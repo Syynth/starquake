@@ -16,9 +16,10 @@
 //! # Commands
 //!
 //! Ids and names are Eden's tables. These are exactly the commands the startup fixture's trace
-//! sends (`tests/homebrew/startup/reference/startup.trace`; its README's gap list named them);
-//! every other command of these interfaces is left out and answered by the server's
-//! unknown-command policy.
+//! sends (`tests/homebrew/startup/reference/startup.trace`; its README's gap list named them),
+//! and `ISelfController` 2000, a Switch 2 command (see "The graphics server" below); every
+//! other command of these interfaces is left out and answered by the server's unknown-command
+//! policy.
 //!
 //! | Interface | Id | Command | In | Out |
 //! |---|---|---|---|---|
@@ -40,6 +41,7 @@
 //! | | 13 | `SetFocusHandlingMode` | `bool notify, bool background, bool suspend`, a byte each | nothing |
 //! | | 16 | `SetOutOfFocusSuspendingEnabled` | `bool` | nothing |
 //! | | 91 | `GetAccumulatedSuspendedTickChangedEvent` | nothing | copy handle: the applet's suspended-tick event |
+//! | | 2000 | `GetGraphicsSupervisor` (Switch 2) | nothing | copy handle: a new session on the graphics server's root |
 //! | [`IWindowController`] | 1 | `GetAppletResourceUserId` | nothing | `u64` the applet resource user id |
 //! | | 10 | `AcquireForegroundRights` | nothing | nothing |
 //! | [`IApplicationFunctions`] | 40 | `NotifyRunning` | nothing | `bool` (a byte): true |
@@ -149,16 +151,53 @@
 //!   The handle is not otherwise used: Eden keeps it for the display layer manager, which is not
 //!   ported.
 //!
-//! The Switch 2 additions (`appletOE` command 10, `IApplicationProxy` 40 and 60,
-//! `IApplicationFunctions` 320 and 321, `ISelfController` 2000:
-//! `docs/switch2-eden-diff-scoping.md`, "Services (HLE)") are left out; each is one more row
-//! and method.
+//! The other Switch 2 additions (`appletOE` command 10, `IApplicationProxy` 40 and 60,
+//! `IApplicationFunctions` 320 and 321: `docs/switch2-eden-diff-scoping.md`, "Services (HLE)")
+//! are left out; each is one more row and method.
+//!
+//! # The graphics server
+//!
+//! `ISelfController` 2000 returns a session to the graphics server's root, which the title then
+//! speaks TIPC on (`docs/specs/graphics-server.md`, "The root"; `eden-nx2/NX2_NOTES.md` row 17,
+//! observed). `am` may not depend on the graphics server's crate, so it is given the number of
+//! the root's server ([`Applet::with_graphics_server`]): whoever puts the services together
+//! gives it the same number the service registry's private entry for the root holds
+//! (`crate::sm`, "Private entries"). It hands out a session on it with
+//! [`Reply::copy_service`], and the root's server opens its root interface for the session.
+//!
+//! - **A copied handle.** Both references copy it: Eden PR #4588
+//!   (`eden-pr4588/src/core/hle/service/am/service/self_controller.cpp` @ e5fb3b97,
+//!   `GetGraphicsSupervisor`: `IPC::ResponseBuilder rb{ctx, 2, 1}`, `PushCopyObjects`) and
+//!   Eden-NX2 (`eden-nx2/src/core/hle/service/nx2_gsv.h` @ 50fa86bb, `ReturnRawSession`:
+//!   `PushCopyObjects`). The reply is the result and the one copied handle.
+//! - **A new session each time: conflict.** PR keeps the session it made the first time and
+//!   copies a handle to that same session on every later call; NX2 makes a new session on every
+//!   call. NX2's is followed, as the one a title ran on (row 17), by the graphics-server spec's
+//!   house rule (decision 8). The root's state is its server's, which every session shares.
+//!   Against PR, then, the two differ only in how many sessions exist. Against NX2 they differ
+//!   in the state too: each NX2 session owns its own objects and syncpoint events, so a second
+//!   one starts fresh, where a second session here sees the first one's bootstrap phase and
+//!   204 events (`starquake_gsv::root`, "Where this differs from the references"). A trace of a
+//!   title calling 2000 twice would settle it. Pinned by
+//!   `get_graphics_supervisor_makes_a_new_session_on_every_call`.
+//! - **A run without a graphics server** answers [`UNKNOWN`], starquake's own choice: no
+//!   reference has an `am` without one
+//!   (`get_graphics_supervisor_without_a_graphics_server_is_unknown`).
+//! - **The number is the run's wiring, not the guest's state.** It is saved with the applet,
+//!   but a restore keeps the number the server was built with: a snapshot whose number differs
+//!   (another server, or one where the run has none, or none where it has one) is refused with
+//!   [`SnapshotError::FamilyWiring`], and the server is left as it was
+//!   (`a_snapshot_with_another_graphics_server_is_refused`). Otherwise a snapshot could point
+//!   2000 at any server.
 //!
 //! [`INVALID_CMIF_REQUEST`]: crate::framework::result::INVALID_CMIF_REQUEST
+//! [`Reply::copy_service`]: crate::framework::Reply::copy_service
+//! [`SnapshotError::FamilyWiring`]: crate::framework::SnapshotError::FamilyWiring
 
 use serde::{Deserialize, Serialize};
 use starquake_kernel::id::ObjectId;
 use starquake_kernel::result::ResultCode;
+use starquake_trace::ServiceId;
 
 use crate::apm::PerformanceMode;
 use crate::commands;
@@ -364,10 +403,14 @@ pub struct Applet {
     message_event: Option<ObjectId>,
     /// The suspended-tick event, once a command has returned it.
     suspended_tick_event: Option<ObjectId>,
+    /// The server of the graphics server's root, which `GetGraphicsSupervisor` hands sessions
+    /// on out (module docs, "The graphics server"); `None` in a run without one.
+    graphics_server: Option<ServiceId>,
 }
 
 impl Applet {
-    /// A freshly launched application's applet, reporting `settings`.
+    /// A freshly launched application's applet, reporting `settings`, in a run without a
+    /// graphics server.
     #[must_use]
     pub fn new(settings: AppletSettings) -> Self {
         Self {
@@ -375,7 +418,22 @@ impl Applet {
             lifecycle: Lifecycle::default(),
             message_event: None,
             suspended_tick_event: None,
+            graphics_server: None,
         }
+    }
+
+    /// The same applet, in a run whose graphics server's root is the server known as `root`
+    /// (the number the service registry has for it: `Registry::private_service`).
+    #[must_use]
+    pub fn with_graphics_server(mut self, root: ServiceId) -> Self {
+        self.graphics_server = Some(root);
+        self
+    }
+
+    /// The server `GetGraphicsSupervisor` hands sessions on out, if the run has one.
+    #[must_use]
+    pub fn graphics_server(&self) -> Option<ServiceId> {
+        self.graphics_server
     }
 
     /// What the applet reports.
@@ -557,6 +615,14 @@ pub mod command {
         pub const SET_OUT_OF_FOCUS_SUSPENDING_ENABLED: u32 = 16;
         /// `{91, D<&ISelfController::GetAccumulatedSuspendedTickChangedEvent>, ..}`.
         pub const GET_ACCUMULATED_SUSPENDED_TICK_CHANGED_EVENT: u32 = 91;
+        /// The Switch 2 addition that returns a session to the graphics server's root (module
+        /// docs, "The graphics server"). Eden PR #4588
+        /// (`eden-pr4588/src/core/hle/service/am/service/self_controller.cpp` @ e5fb3b97):
+        /// `{2000, &ISelfController::GetGraphicsSupervisor, "GetGraphicsSupervisor"}`; Eden-NX2
+        /// (`eden-nx2/src/core/hle/service/am/service/self_controller.cpp` @ 50fa86bb):
+        /// `{2000, &ISelfController::GetNx2GraphicsSystemSession, ..}`; `eden-nx2/NX2_NOTES.md`
+        /// row 17 (observed).
+        pub const GET_GRAPHICS_SUPERVISOR: u32 = 2000;
     }
 
     /// `IWindowController`'s commands (`IWindowController::IWindowController`).
@@ -618,6 +684,7 @@ commands! {
             set_out_of_focus_suspending_enabled,
         self_controller::GET_ACCUMULATED_SUSPENDED_TICK_CHANGED_EVENT =>
             get_accumulated_suspended_tick_changed_event,
+        self_controller::GET_GRAPHICS_SUPERVISOR => get_graphics_supervisor,
     }
 }
 
@@ -909,6 +976,22 @@ impl ISelfController {
         reply.copy_handle(event?);
         reply.ok()
     }
+
+    /// `GetGraphicsSupervisor` (Switch 2). out: a copy handle to a new session on the graphics
+    /// server's root (module docs, "The graphics server").
+    fn get_graphics_supervisor(
+        _: &mut Self,
+        cx: &mut Context<'_>,
+        _req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        let Some(root) = cx.family::<Applet>()?.graphics_server else {
+            tracing::warn!("appletOE: GetGraphicsSupervisor with no graphics server in the run");
+            return Err(UNKNOWN.into());
+        };
+        reply.copy_service(root);
+        reply.ok()
+    }
 }
 
 impl IWindowController {
@@ -964,11 +1047,29 @@ pub fn oe_interfaces() -> Interfaces {
         .with::<IDebugFunctions>()
 }
 
-/// The `appletOE` server, for an application that reports `settings`.
+/// The `appletOE` server, for an application that reports `settings`, in a run without a
+/// graphics server.
 #[must_use]
 pub fn oe_server(settings: AppletSettings, policy: UnknownPolicy) -> Server {
+    oe_server_for(Applet::new(settings), policy)
+}
+
+/// The `appletOE` server for `applet`: what [`oe_server`] builds, for an applet made with
+/// [`Applet::new`] and, in a run with a graphics server, [`Applet::with_graphics_server`].
+#[must_use]
+pub fn oe_server_for(applet: Applet, policy: UnknownPolicy) -> Server {
     Server::new(OE_NAME, policy)
         .with_root(|| Box::new(IApplicationProxyService))
         .with_interfaces(oe_interfaces())
-        .with_family(Applet::new(settings))
+        .with_checked_family(applet, same_graphics_server)
+}
+
+/// The restore check of the `appletOE` server's applet: a snapshot's graphics server number
+/// is the run's (module docs, "The graphics server").
+fn same_graphics_server(run: &Applet, saved: &Applet) -> Result<(), &'static str> {
+    if run.graphics_server == saved.graphics_server {
+        Ok(())
+    } else {
+        Err("its applet names another graphics server")
+    }
 }
