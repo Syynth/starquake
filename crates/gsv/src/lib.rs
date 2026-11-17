@@ -10,6 +10,7 @@
 //! * [`shared`]: the state handlers and the timer thread share, the lock order, and the drain.
 //! * [`note`]: the notes gsv records for replay.
 //! * [`nvsrv`]: the NVIDIA driver session (the nvdrv protocol) and `/dev/nvmap`.
+//! * [`syncpt`]: the syncpt session: slot events, armed waits and counter queries.
 
 pub mod completion;
 pub mod note;
@@ -17,3 +18,7 @@ pub mod nvsrv;
 pub mod protocol;
 pub mod root;
 pub mod shared;
+pub mod syncpt;
+
+#[cfg(test)]
+mod testing;

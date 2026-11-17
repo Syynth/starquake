@@ -20,10 +20,10 @@ use starquake_gpu::syncpoint::Syncpoints;
 use starquake_gsv::completion::{Completion, CompletionQueue};
 use starquake_gsv::shared::{Shared, TimerHost};
 use starquake_kernel::dispatch::DeviceShareError;
-use starquake_kernel::id::ProcessId;
+use starquake_kernel::id::{ObjectId, ProcessId};
 use starquake_kernel::memory::DeviceShareToken;
 use starquake_kernel::memory::testing::device_share_token;
-use starquake_kernel::result::KernelError;
+use starquake_kernel::result::{KernelError, SvcResult};
 use starquake_kernel::slab::SlabId;
 use starquake_trace::{EventKind, ServiceId};
 use tracing::span::{Attributes, Id, Record};
@@ -71,6 +71,10 @@ impl TimerHost for Answers {
 
     fn unlock_device_share(&mut self, _token: DeviceShareToken) -> Result<(), DeviceShareError> {
         self.0.pop_front().unwrap_or(Ok(()))
+    }
+
+    fn signal_event(&mut self, _event: ObjectId) -> SvcResult<()> {
+        Ok(())
     }
 }
 
