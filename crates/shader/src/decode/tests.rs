@@ -486,59 +486,27 @@ fn unconfirmed_text_of_the_wide_slot_forms() {
     );
 }
 
-/// Turns PR #4588's row words (low word first) into a mask.
-fn row(words: [u32; 4]) -> u128 {
-    words
-        .iter()
-        .rev()
-        .fold(0, |bits, &word| (bits << 32) | u128::from(word))
-}
-
 /// The known-bit mask of the form of `opcode`.
 fn known_of(opcode: u16) -> u128 {
     lookup(opcode).expect("a form").known
 }
 
-/// The known-bit masks against PR #4588's generated table (`ampere_isa_table.h` @ e5fb3b97;
-/// each row's four words, low word first): equal for every form except `MOV`'s register,
-/// constant-buffer and uniform-register forms, which differ by bits 62 and 63 only (the
-/// divergence in `op::integer`'s docs).
+/// Each group's known-bit masks against the rows of PR #4588's generated table that the group
+/// lists (`REFERENCE_ROWS`, one per form, in form order): equal, except for the bits a row
+/// drops, which the form rejects (only `MOV`'s register, constant-buffer and uniform-register
+/// forms drop any, bits 62 and 63: `mov_rejects_source_modifier_bits`).
 #[test]
 fn masks_match_the_reference_table() {
-    let rows: [(u16, [u32; 4]); 15] = [
-        (0x802, [0x00ff_ffff, 0xffff_ffff, 0x0000_0f00, 0xffff_fe00]),
-        (0x223, [0xffff_ffff, 0xc000_00ff, 0x0001_ffff, 0xffff_fe00]),
-        (0x423, [0xffff_ffff, 0xffff_ffff, 0x0001_ffff, 0xffff_fe00]),
-        (0x623, [0xffff_ffff, 0xc7ff_ffff, 0x0801_ffff, 0xffff_fe00]),
-        (0x823, [0xffff_ffff, 0xffff_ffff, 0x0001_ffff, 0xffff_fe00]),
-        (0xa23, [0xffff_ffff, 0xc7ff_ffff, 0x0801_ffff, 0xffff_fe00]),
-        (0xc23, [0xffff_ffff, 0xc000_003f, 0x0801_ffff, 0xffff_fe00]),
-        (0xe23, [0xffff_ffff, 0xc000_003f, 0x0801_ffff, 0xffff_fe00]),
-        (0x321, [0xffff_ffff, 0x0003_ffff, 0x0000_bc00, 0xffff_fe00]),
-        (0x322, [0xff00_ffff, 0x0003_ffff, 0x0000_3cff, 0xffff_fe00]),
-        (0x94d, [0x0000_ffff, 0x0000_0000, 0x07b0_0000, 0xffff_fe00]),
-        (0x919, [0x00ff_ffff, 0x0000_0000, 0x0000_ff00, 0xffff_fe00]),
-        (0x202, [0x00ff_ffff, 0xc000_00ff, 0x0000_0f00, 0xffff_fe00]),
-        (0xa02, [0x00ff_ffff, 0xc7ff_ffff, 0x0800_0f00, 0xffff_fe00]),
-        (0xc02, [0x00ff_ffff, 0xc000_003f, 0x0800_0f00, 0xffff_fe00]),
-    ];
-    let slot_modifiers = SLOT_ABS.mask() | SLOT_NEG.mask();
-    let mov_with_modifiers = [
-        AluForm::Reg.opcode(MOV_OPCODE),
-        AluForm::CBufSrc1.opcode(MOV_OPCODE),
-        AluForm::UniformSrc1.opcode(MOV_OPCODE),
-    ];
-    for (opcode, words) in rows {
-        let mine = known_of(opcode);
-        if mov_with_modifiers.contains(&opcode) {
-            assert_eq!(mine & slot_modifiers, 0, "{opcode:#x}");
-            assert_eq!(mine | slot_modifiers, row(words), "{opcode:#x}");
-        } else {
-            assert_eq!(mine, row(words), "{opcode:#x}");
+    for (forms, hooks) in GROUPS.iter().zip(&GROUP_HOOKS) {
+        let rows = hooks.reference_rows;
+        assert_eq!(forms.len(), rows.len());
+        for (form, row) in forms.iter().zip(rows) {
+            let opcode = form.opcode;
+            assert_eq!(opcode, row.opcode);
+            assert_eq!(form.known & row.dropped, 0, "{opcode:#x}");
+            assert_eq!(form.known | row.dropped, row.mask(), "{opcode:#x}");
         }
     }
-    // Every decoded form is in the list above.
-    assert_eq!(forms().len(), rows.len());
 }
 
 /// `MOV` rejects the slot's modifier bits in each form whose slot has them in PR #4588's table.
@@ -564,6 +532,19 @@ fn mov_rejects_source_modifier_bits() {
             mov(MovSrc::UniformReg(UniformReg::URZ)),
         ),
     ];
+    // These forms, and no other `MOV` form, drop exactly the two bits from PR #4588's rows.
+    let forms: Vec<u16> = words
+        .iter()
+        .map(|(form, _)| form.opcode(MOV_OPCODE))
+        .collect();
+    for row in integer::REFERENCE_ROWS {
+        let expected = if forms.contains(&row.opcode) {
+            SLOT_ABS.mask() | SLOT_NEG.mask()
+        } else {
+            0
+        };
+        assert_eq!(row.dropped, expected, "{:#x}", row.opcode);
+    }
     for (form, word) in words {
         assert!(decode(word).is_ok());
         for bit in [SLOT_ABS, SLOT_NEG] {

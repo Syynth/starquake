@@ -33,7 +33,9 @@
 //! An instruction its slice has not built yet is a **shell**: an empty struct that prints its
 //! mnemonic, which no decode form produces and the test assembler refuses
 //! (`EncodeError::NoEncoding`). A slice turns a shell into a real struct in its own module
-//! (fields, printer, decode forms, encoder) without touching the enum. The mnemonics are
+//! (fields, printer, decode forms, encoder) without touching the enum, and lists there what the
+//! shared tests read: PR #4588's row for each new form (`REFERENCE_ROWS`) and a generator of
+//! each decoded operation (`any_ops`), which `form`'s `GROUP_HOOKS` joins. The mnemonics are
 //! `nvdisasm`'s names lower-cased; those of shells are guesses until their slice checks them.
 
 use std::fmt::{self, Display, Formatter};

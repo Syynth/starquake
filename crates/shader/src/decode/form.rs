@@ -3,10 +3,14 @@
 //! A [`Form`] is one 12-bit opcode: the bits it can explain (its known-bit mask, PR #4588's
 //! `IsaRow::known`), the bits every valid word of it has set, and the function that reads its
 //! fields. Each instruction group lists its forms in its module under `op` (`FORMS`), and
-//! [`GROUPS`] joins the lists; [`lookup`] indexes them by opcode through a table built at compile
-//! time, as PR #4588's `IsaTable` does (`eden-pr4588/src/shader_recompiler/frontend/ampere/isa.h`
-//! @ e5fb3b97). No two forms share an opcode
-//! (`decode::tests::framework::forms_have_distinct_opcodes_and_lookup_finds_each`).
+//! [`GROUPS`] joins the lists; [`lookup`] indexes them by opcode through a table built at
+//! compile time, as PR #4588's `IsaTable` does
+//! (`eden-pr4588/src/shader_recompiler/frontend/ampere/isa.h` @ e5fb3b97). No two forms share an
+//! opcode (`decode::tests::framework::forms_have_distinct_opcodes_and_lookup_finds_each`).
+//!
+//! For tests, `GROUP_HOOKS` joins each group's reference rows (`REFERENCE_ROWS`) and operation
+//! generators (`any_ops`) the same way, from the same list of modules, so a slice adds a form
+//! and its tests' data in its own module and edits no shared list.
 //!
 //! The [`Reader`] records every bit a decode function reads, the way PR #4588's translator
 //! records the bits it takes (`visitor.cpp`, `Visitor::Take`): after the form's function has
@@ -58,18 +62,81 @@ impl Form {
     }
 }
 
-/// Every instruction group's forms, in slice order (6a to 6i).
-pub(crate) const GROUPS: [&[Form]; 9] = [
-    integer::FORMS,
-    float::FORMS,
-    half_double::FORMS,
-    uniform::FORMS,
-    memory::FORMS,
-    texture::FORMS,
-    attribute::FORMS,
-    control::FORMS,
-    tensor::FORMS,
-];
+/// One row of PR #4588's decode table for a decoded form (`ampere_isa_table.h` @ e5fb3b97), and
+/// the bits of it the form rejects. Each group lists the rows of its own forms, in its `FORMS`
+/// order, as `REFERENCE_ROWS`; `decode::tests::masks_match_the_reference_table` checks them.
+#[cfg(test)]
+pub(crate) struct ReferenceRow {
+    /// The row's opcode.
+    pub(crate) opcode: u16,
+    /// The row's known-bit mask: its four words, low word first.
+    pub(crate) words: [u32; 4],
+    /// Bits the row marks known that the form rejects: a divergence the group's module docs
+    /// list and a test of its own pins.
+    pub(crate) dropped: u128,
+}
+
+#[cfg(test)]
+impl ReferenceRow {
+    /// The row of `opcode` with the mask `words`, which the form matches exactly.
+    pub(crate) const fn new(opcode: u16, words: [u32; 4]) -> Self {
+        Self {
+            opcode,
+            words,
+            dropped: 0,
+        }
+    }
+
+    /// This row, with `dropped` bits that the form rejects.
+    pub(crate) const fn dropping(self, dropped: u128) -> Self {
+        Self { dropped, ..self }
+    }
+
+    /// The row's known-bit mask.
+    pub(crate) fn mask(&self) -> u128 {
+        self.words
+            .iter()
+            .rev()
+            .fold(0, |bits, &word| (bits << 32) | u128::from(word))
+    }
+}
+
+/// One group's test hooks, so that a slice adds its tests' data in its own module.
+#[cfg(test)]
+pub(crate) struct GroupHooks {
+    /// PR #4588's rows for the group's forms, in `FORMS` order.
+    pub(crate) reference_rows: &'static [ReferenceRow],
+    /// Generators of the group's decoded operations, one per operation; none for a group with
+    /// no forms. `testing::any_instr` combines every group's.
+    pub(crate) any_ops: fn() -> Vec<proptest::strategy::BoxedStrategy<Op>>,
+}
+
+/// Defines [`GROUPS`] and, for tests, `GROUP_HOOKS` from one list of the group modules.
+macro_rules! groups {
+    ($($group:ident),* $(,)?) => {
+        /// Every instruction group's forms, in slice order (6a to 6i).
+        pub(crate) const GROUPS: [&[Form]; 9] = [$($group::FORMS),*];
+
+        /// Every instruction group's test hooks, in the order of [`GROUPS`].
+        #[cfg(test)]
+        pub(crate) const GROUP_HOOKS: [GroupHooks; 9] = [$(GroupHooks {
+            reference_rows: $group::REFERENCE_ROWS,
+            any_ops: $group::any_ops,
+        }),*];
+    };
+}
+
+groups!(
+    integer,
+    float,
+    half_double,
+    uniform,
+    memory,
+    texture,
+    attribute,
+    control,
+    tensor,
+);
 
 /// How many 12-bit opcodes there are.
 const OPCODES: usize = 1 << 12;

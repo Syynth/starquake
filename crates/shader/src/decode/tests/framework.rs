@@ -1,7 +1,10 @@
 //! Tests of the decoder framework: the form table, the order of checks, the layouts of the wide
 //! slot, every operand type at the edges of its encoding, and the shells.
 
-use super::super::form::Reader;
+use proptest::strategy::ValueTree;
+use proptest::test_runner::TestRunner;
+
+use super::super::form::{Form, Reader};
 use super::super::op::{attribute, control, float, half_double, integer, memory, tensor};
 use super::super::op::{texture, uniform};
 use super::*;
@@ -23,8 +26,35 @@ fn shells() -> Vec<Op> {
     .concat()
 }
 
-/// The operations decoded so far.
-const DECODED: [&str; 6] = ["mov", "ffma", "ald", "ast", "s2r", "exit"];
+/// The operations decoded so far: every operation that is not a shell.
+fn decoded() -> Vec<&'static str> {
+    let shells: Vec<&str> = shells().iter().map(Op::mnemonic).collect();
+    MNEMONICS
+        .iter()
+        .copied()
+        .filter(|mnemonic| !shells.contains(mnemonic))
+        .collect()
+}
+
+/// The mnemonics the forms of `forms` decode to, sorted, without repeats: each form's word with
+/// only its opcode and fixed bits set (which every form accepts:
+/// `every_bit_outside_a_form_is_rejected`).
+fn mnemonics_of(forms: &[Form]) -> Vec<&'static str> {
+    let mut mnemonics: Vec<&str> = forms
+        .iter()
+        .map(|form| {
+            let word =
+                Instruction::from_bits(form.fixed).with_field(OPCODE, u64::from(form.opcode));
+            decode(word)
+                .expect("a form's bare word decodes")
+                .op
+                .mnemonic()
+        })
+        .collect();
+    mnemonics.sort_unstable();
+    mnemonics.dedup();
+    mnemonics
+}
 
 #[test]
 fn forms_have_distinct_opcodes_and_lookup_finds_each() {
@@ -44,8 +74,40 @@ fn forms_have_distinct_opcodes_and_lookup_finds_each() {
         assert_eq!(fixed & !known, 0);
         assert_eq!(COMMON & !known, 0);
     }
-    // MOV in four forms, FFMA in seven, ALD, AST, S2R, EXIT.
-    assert_eq!(super::forms().len(), 4 + 7 + 4);
+    // Each group has exactly the forms it lists reference rows for, in the same order.
+    for (group, hooks) in GROUPS.iter().zip(&GROUP_HOOKS) {
+        let opcodes: Vec<u16> = group.iter().map(|form| form.opcode).collect();
+        let rows: Vec<u16> = hooks.reference_rows.iter().map(|row| row.opcode).collect();
+        assert_eq!(opcodes, rows);
+    }
+}
+
+/// The operations that are not shells are exactly those the forms decode to.
+#[test]
+fn the_decoded_operations_are_those_the_forms_produce() {
+    let mut decoded = decoded();
+    decoded.sort_unstable();
+    let all: Vec<Form> = GROUPS.concat();
+    assert_eq!(mnemonics_of(&all), decoded);
+}
+
+/// Each group's generators make every operation the group's forms decode to, one generator per
+/// operation, so `any_instr` covers every decoded operation. Each generator makes one kind of
+/// operation, so one value from each names it.
+#[test]
+fn each_group_generates_every_operation_it_decodes() {
+    let mut runner = TestRunner::new(config());
+    for (forms, hooks) in GROUPS.iter().zip(&GROUP_HOOKS) {
+        let mut generated: Vec<&str> = (hooks.any_ops)()
+            .iter()
+            .map(|strategy| {
+                let tree = strategy.new_tree(&mut runner).expect("a value");
+                tree.current().mnemonic()
+            })
+            .collect();
+        generated.sort_unstable();
+        assert_eq!(generated, mnemonics_of(forms));
+    }
 }
 
 #[test]
@@ -473,9 +535,6 @@ fn every_operation_has_a_distinct_lower_case_mnemonic() {
     for mnemonic in MNEMONICS {
         assert_eq!(mnemonic.to_lowercase(), *mnemonic);
     }
-    for decoded in DECODED {
-        assert!(MNEMONICS.contains(&decoded), "{decoded}");
-    }
 }
 
 /// Every operation that is not decoded is a shell: it prints its mnemonic and the assembler
@@ -483,10 +542,11 @@ fn every_operation_has_a_distinct_lower_case_mnemonic() {
 #[test]
 fn shells_print_their_mnemonic_and_have_no_encoding() {
     let shells = shells();
-    assert_eq!(shells.len(), MNEMONICS.len() - DECODED.len());
+    let decoded = decoded();
+    // No shell is listed twice.
+    assert_eq!(shells.len(), MNEMONICS.len() - decoded.len());
     for op in shells {
         let mnemonic = op.mnemonic();
-        assert!(!DECODED.contains(&mnemonic));
         assert_eq!(Instr::new(op).to_string(), format!("{mnemonic};"));
         let refused = assemble(&Instr::new(op));
         assert_eq!(refused, Err(EncodeError::NoEncoding { mnemonic }));

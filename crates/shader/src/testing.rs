@@ -2,11 +2,12 @@
 //! words.
 
 use proptest::prelude::*;
+use proptest::strategy::Union;
 use proptest::test_runner::{Config, RngSeed};
 
 use crate::decode::{
-    AluSrc, CBuf, CBufRef, GROUPS, Gpr, Instr, Instruction, MovSrc, OPCODE, Op, OpALd, OpASt,
-    OpExit, OpFFma, OpMov, OpS2R, Pred, PredSrc, RoundMode, SpecialReg, UniformReg,
+    AluSrc, CBuf, CBufRef, GROUP_HOOKS, GROUPS, Gpr, Instr, Instruction, OPCODE, Pred, PredSrc,
+    UniformReg,
 };
 
 /// A fixed seed keeps every property test deterministic.
@@ -47,7 +48,7 @@ pub(crate) fn any_uniform_reg() -> impl Strategy<Value = UniformReg> {
         .prop_map(|index| UniformReg::new(index).unwrap_or(UniformReg::URZ))
 }
 
-fn any_pred_src() -> impl Strategy<Value = PredSrc> {
+pub(crate) fn any_pred_src() -> impl Strategy<Value = PredSrc> {
     (0..=Pred::PT.index(), any::<bool>()).prop_map(|(reg, negated)| PredSrc {
         reg: Pred::new(reg).unwrap_or(Pred::PT),
         negated,
@@ -64,7 +65,7 @@ pub(crate) fn any_cbuf() -> impl Strategy<Value = CBufRef> {
 }
 
 /// A register source with any modifiers.
-fn any_reg_src() -> impl Strategy<Value = AluSrc> {
+pub(crate) fn any_reg_src() -> impl Strategy<Value = AluSrc> {
     (any_gpr(), any::<bool>(), any::<bool>()).prop_map(|(reg, abs, neg)| AluSrc::Reg {
         reg,
         abs,
@@ -73,7 +74,7 @@ fn any_reg_src() -> impl Strategy<Value = AluSrc> {
 }
 
 /// A source that takes the wide slot, with any modifiers its kind has.
-fn any_wide_src() -> impl Strategy<Value = AluSrc> {
+pub(crate) fn any_wide_src() -> impl Strategy<Value = AluSrc> {
     prop_oneof![
         any::<u32>().prop_map(AluSrc::Imm),
         (any_cbuf(), any::<bool>(), any::<bool>()).prop_map(|(cbuf, abs, neg)| AluSrc::CBuf {
@@ -86,91 +87,9 @@ fn any_wide_src() -> impl Strategy<Value = AluSrc> {
     ]
 }
 
-fn any_ffma() -> impl Strategy<Value = Op> {
-    let srcs = prop_oneof![
-        (any_reg_src(), any_reg_src(), any_reg_src()).prop_map(|(a, b, c)| [a, b, c]),
-        (any_reg_src(), any_wide_src(), any_reg_src()).prop_map(|(a, b, c)| [a, b, c]),
-        (any_reg_src(), any_reg_src(), any_wide_src()).prop_map(|(a, b, c)| [a, b, c]),
-    ];
-    (any_gpr(), srcs, any::<[bool; 3]>(), 0_u64..4).prop_map(|(dst, srcs, flags, rnd)| {
-        let [saturate, ftz, dnz] = flags;
-        Op::FFma(OpFFma {
-            dst,
-            srcs,
-            saturate,
-            rnd: RoundMode::from_bits(rnd),
-            ftz,
-            dnz,
-        })
-    })
-}
-
-fn any_mov() -> impl Strategy<Value = Op> {
-    let src = prop_oneof![
-        any_gpr().prop_map(MovSrc::Reg),
-        any::<u32>().prop_map(MovSrc::Imm),
-        any_cbuf().prop_map(MovSrc::CBuf),
-        any_uniform_reg().prop_map(MovSrc::UniformReg),
-    ];
-    (any_gpr(), src, 0_u8..16).prop_map(|(dst, src, quad_lanes)| {
-        Op::Mov(OpMov {
-            dst,
-            src,
-            quad_lanes,
-        })
-    })
-}
-
-/// Any encodable instruction of the decoded forms.
+/// Any encodable instruction of the decoded forms: a guard and an operation from one of every
+/// group's generators (`any_ops` in each group's module), each operation equally likely.
 pub(crate) fn any_instr() -> impl Strategy<Value = Instr> {
-    let attr = || {
-        (
-            any_gpr(),
-            any_gpr(),
-            any_gpr(),
-            0_u16..1024,
-            1_u8..=4,
-            any::<[bool; 3]>(),
-        )
-    };
-    let ald = attr().prop_map(|(dst, vtx, offset, addr, comps, [patch, phys, output])| {
-        Op::ALd(OpALd {
-            dst,
-            vtx,
-            offset,
-            addr,
-            comps,
-            patch,
-            phys,
-            output,
-        })
-    });
-    let ast = attr().prop_map(|(data, vtx, offset, addr, comps, [patch, phys, _])| {
-        Op::ASt(OpASt {
-            data,
-            vtx,
-            offset,
-            addr,
-            comps,
-            patch,
-            phys,
-        })
-    });
-    let exit = (any::<bool>(), any::<bool>(), any_pred_src()).prop_map(
-        |(keep_ref_count, no_at_exit, pred)| {
-            Op::Exit(OpExit {
-                keep_ref_count,
-                no_at_exit,
-                pred,
-            })
-        },
-    );
-    let s2r = (any_gpr(), any::<u8>()).prop_map(|(dst, sr)| {
-        Op::S2R(OpS2R {
-            dst,
-            sr: SpecialReg(sr),
-        })
-    });
-    let op = prop_oneof![any_mov(), any_ffma(), ald, ast, exit, s2r];
-    (any_pred_src(), op).prop_map(|(guard, op)| Instr { guard, op })
+    let ops = GROUP_HOOKS.iter().flat_map(|hooks| (hooks.any_ops)());
+    (any_pred_src(), Union::new(ops)).prop_map(|(guard, op)| Instr { guard, op })
 }

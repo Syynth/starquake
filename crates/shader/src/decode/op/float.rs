@@ -18,6 +18,8 @@ use super::super::instruction::Field;
 use super::super::operand::{AluSrc, Gpr, RoundMode};
 use super::super::print::{FloatOperand, flag};
 use super::{Named, Op, shells};
+#[cfg(test)]
+use {super::super::form::ReferenceRow, proptest::strategy::BoxedStrategy};
 
 /// `FFMA`'s 9-bit opcode (`impl SM70Op for OpFFma`: `encode_alu(0x023, ..)`).
 pub(crate) const FFMA_OPCODE: u16 = 0x023;
@@ -108,6 +110,47 @@ pub(crate) const FORMS: &[Form] = &[
     ffma(AluForm::ALL[5]),
     ffma(AluForm::ALL[6]),
 ];
+
+/// PR #4588's rows for the group's forms, in [`FORMS`] order
+/// (`eden-pr4588/src/shader_recompiler/frontend/ampere/ampere_isa_table.h` @ e5fb3b97; each
+/// row's four words, low word first).
+#[cfg(test)]
+pub(crate) const REFERENCE_ROWS: &[ReferenceRow] = &[
+    ReferenceRow::new(0x223, [0xffff_ffff, 0xc000_00ff, 0x0001_ffff, 0xffff_fe00]),
+    ReferenceRow::new(0x423, [0xffff_ffff, 0xffff_ffff, 0x0001_ffff, 0xffff_fe00]),
+    ReferenceRow::new(0x623, [0xffff_ffff, 0xc7ff_ffff, 0x0801_ffff, 0xffff_fe00]),
+    ReferenceRow::new(0x823, [0xffff_ffff, 0xffff_ffff, 0x0001_ffff, 0xffff_fe00]),
+    ReferenceRow::new(0xa23, [0xffff_ffff, 0xc7ff_ffff, 0x0801_ffff, 0xffff_fe00]),
+    ReferenceRow::new(0xc23, [0xffff_ffff, 0xc000_003f, 0x0801_ffff, 0xffff_fe00]),
+    ReferenceRow::new(0xe23, [0xffff_ffff, 0xc000_003f, 0x0801_ffff, 0xffff_fe00]),
+];
+
+/// Generators of the group's decoded operations, one per operation.
+#[cfg(test)]
+pub(crate) fn any_ops() -> Vec<BoxedStrategy<Op>> {
+    use proptest::prelude::*;
+
+    use crate::testing::{any_gpr, any_reg_src, any_wide_src};
+
+    let srcs = prop_oneof![
+        (any_reg_src(), any_reg_src(), any_reg_src()).prop_map(|(a, b, c)| [a, b, c]),
+        (any_reg_src(), any_wide_src(), any_reg_src()).prop_map(|(a, b, c)| [a, b, c]),
+        (any_reg_src(), any_reg_src(), any_wide_src()).prop_map(|(a, b, c)| [a, b, c]),
+    ];
+    let rnd = proptest::sample::select(RoundMode::ALL.to_vec());
+    let ffma = (any_gpr(), srcs, any::<[bool; 3]>(), rnd).prop_map(|(dst, srcs, flags, rnd)| {
+        let [saturate, ftz, dnz] = flags;
+        Op::FFma(OpFFma {
+            dst,
+            srcs,
+            saturate,
+            rnd,
+            ftz,
+            dnz,
+        })
+    });
+    vec![ffma.boxed()]
+}
 
 shells! {
     FAdd(OpFAdd) = "fadd";

@@ -13,6 +13,8 @@ use super::super::instruction::Field;
 use super::super::operand::{Pred, PredSrc};
 use super::super::print::flag;
 use super::{Named, Op, shells};
+#[cfg(test)]
+use {super::super::form::ReferenceRow, proptest::strategy::BoxedStrategy};
 
 /// `EXIT` (`impl SM70Op for OpExit`: `set_opcode(0x94d)`).
 pub(crate) const EXIT_OPCODE: u16 = 0x94d;
@@ -72,6 +74,34 @@ pub(crate) const FORMS: &[Form] = &[Form::new(
     ]),
     |reader| Ok(decode_exit(reader)),
 )];
+
+/// PR #4588's rows for the group's forms, in [`FORMS`] order
+/// (`eden-pr4588/src/shader_recompiler/frontend/ampere/ampere_isa_table.h` @ e5fb3b97; each
+/// row's four words, low word first).
+#[cfg(test)]
+pub(crate) const REFERENCE_ROWS: &[ReferenceRow] = &[ReferenceRow::new(
+    0x94d,
+    [0x0000_ffff, 0x0000_0000, 0x07b0_0000, 0xffff_fe00],
+)];
+
+/// Generators of the group's decoded operations, one per operation.
+#[cfg(test)]
+pub(crate) fn any_ops() -> Vec<BoxedStrategy<Op>> {
+    use proptest::prelude::*;
+
+    use crate::testing::any_pred_src;
+
+    let exit = (any::<bool>(), any::<bool>(), any_pred_src()).prop_map(
+        |(keep_ref_count, no_at_exit, pred)| {
+            Op::Exit(OpExit {
+                keep_ref_count,
+                no_at_exit,
+                pred,
+            })
+        },
+    );
+    vec![exit.boxed()]
+}
 
 shells! {
     Bra(OpBra) = "bra";

@@ -65,7 +65,7 @@ use thiserror::Error;
 pub(crate) use alu::{AluForm, Slot, Source};
 pub(crate) use fields::*;
 #[cfg(test)]
-pub(crate) use form::GROUPS;
+pub(crate) use form::{GROUP_HOOKS, GROUPS};
 pub use instruction::{Field, Instruction, LengthError};
 pub use op::*;
 #[cfg(any(test, feature = "test-support"))]

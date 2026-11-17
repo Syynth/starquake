@@ -13,6 +13,8 @@ use super::super::instruction::Field;
 use super::super::operand::Gpr;
 use super::super::print::flag;
 use super::{Named, Op, shells};
+#[cfg(test)]
+use {super::super::form::ReferenceRow, proptest::strategy::BoxedStrategy};
 
 /// `ALD` (`impl SM70Op for OpALd`: `set_opcode(0x321)`).
 pub(crate) const ALD_OPCODE: u16 = 0x321;
@@ -284,6 +286,65 @@ pub(crate) const FORMS: &[Form] = &[
         Ok(decode_s2r(reader))
     }),
 ];
+
+/// PR #4588's rows for the group's forms, in [`FORMS`] order
+/// (`eden-pr4588/src/shader_recompiler/frontend/ampere/ampere_isa_table.h` @ e5fb3b97; each
+/// row's four words, low word first).
+#[cfg(test)]
+pub(crate) const REFERENCE_ROWS: &[ReferenceRow] = &[
+    ReferenceRow::new(0x321, [0xffff_ffff, 0x0003_ffff, 0x0000_bc00, 0xffff_fe00]),
+    ReferenceRow::new(0x322, [0xff00_ffff, 0x0003_ffff, 0x0000_3cff, 0xffff_fe00]),
+    ReferenceRow::new(0x919, [0x00ff_ffff, 0x0000_0000, 0x0000_ff00, 0xffff_fe00]),
+];
+
+/// Generators of the group's decoded operations, one per operation.
+#[cfg(test)]
+pub(crate) fn any_ops() -> Vec<BoxedStrategy<Op>> {
+    use proptest::prelude::*;
+
+    use crate::testing::any_gpr;
+
+    let attr = || {
+        (
+            any_gpr(),
+            any_gpr(),
+            any_gpr(),
+            0_u16..(1 << ATTR_ADDR.width),
+            1_u8..=(1 << ATTR_COMPS.width),
+            any::<[bool; 3]>(),
+        )
+    };
+    let ald = attr().prop_map(|(dst, vtx, offset, addr, comps, [patch, phys, output])| {
+        Op::ALd(OpALd {
+            dst,
+            vtx,
+            offset,
+            addr,
+            comps,
+            patch,
+            phys,
+            output,
+        })
+    });
+    let ast = attr().prop_map(|(data, vtx, offset, addr, comps, [patch, phys, _])| {
+        Op::ASt(OpASt {
+            data,
+            vtx,
+            offset,
+            addr,
+            comps,
+            patch,
+            phys,
+        })
+    });
+    let s2r = (any_gpr(), any::<u8>()).prop_map(|(dst, sr)| {
+        Op::S2R(OpS2R {
+            dst,
+            sr: SpecialReg(sr),
+        })
+    });
+    vec![ald.boxed(), ast.boxed(), s2r.boxed()]
+}
 
 shells! {
     Ipa(OpIpa) = "ipa";

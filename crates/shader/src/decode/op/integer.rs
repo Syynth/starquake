@@ -23,6 +23,12 @@ use super::super::form::{Form, Reader};
 use super::super::instruction::Field;
 use super::super::operand::{AluSrc, CBufRef, Gpr, UniformReg};
 use super::{Named, Op, shells};
+#[cfg(test)]
+use {
+    super::super::fields::{SLOT_ABS, SLOT_NEG},
+    super::super::form::ReferenceRow,
+    proptest::strategy::BoxedStrategy,
+};
 
 /// `MOV`'s 9-bit opcode (`impl SM70Op for OpMov`: `encode_alu(0x002, ..)`).
 pub(crate) const MOV_OPCODE: u16 = 0x002;
@@ -169,6 +175,49 @@ pub(crate) const FORMS: &[Form] = &[
     mov(MOV_FORMS[2]),
     mov(MOV_FORMS[3]),
 ];
+
+/// PR #4588's rows for the group's forms, in [`FORMS`] order
+/// (`eden-pr4588/src/shader_recompiler/frontend/ampere/ampere_isa_table.h` @ e5fb3b97; each
+/// row's four words, low word first). The rows of the register, constant-buffer and
+/// uniform-register forms drop bits 62 and 63, the divergence in the module docs.
+#[cfg(test)]
+pub(crate) const REFERENCE_ROWS: &[ReferenceRow] = &[
+    ReferenceRow::new(0x202, [0x00ff_ffff, 0xc000_00ff, 0x0000_0f00, 0xffff_fe00])
+        .dropping(MOV_DROPPED),
+    ReferenceRow::new(0x802, [0x00ff_ffff, 0xffff_ffff, 0x0000_0f00, 0xffff_fe00]),
+    ReferenceRow::new(0xa02, [0x00ff_ffff, 0xc7ff_ffff, 0x0800_0f00, 0xffff_fe00])
+        .dropping(MOV_DROPPED),
+    ReferenceRow::new(0xc02, [0x00ff_ffff, 0xc000_003f, 0x0800_0f00, 0xffff_fe00])
+        .dropping(MOV_DROPPED),
+];
+
+/// The bits PR #4588's `MOV` rows mark known that `MOV` rejects: the wide slot's modifiers.
+#[cfg(test)]
+pub(crate) const MOV_DROPPED: u128 = mask_of(&[SLOT_ABS, SLOT_NEG]);
+
+/// Generators of the group's decoded operations, one per operation.
+#[cfg(test)]
+pub(crate) fn any_ops() -> Vec<BoxedStrategy<Op>> {
+    use proptest::prelude::*;
+
+    use crate::testing::{any_cbuf, any_gpr, any_uniform_reg};
+
+    let src = prop_oneof![
+        any_gpr().prop_map(MovSrc::Reg),
+        any::<u32>().prop_map(MovSrc::Imm),
+        any_cbuf().prop_map(MovSrc::CBuf),
+        any_uniform_reg().prop_map(MovSrc::UniformReg),
+    ];
+    let mov =
+        (any_gpr(), src, 0_u8..(1 << MOV_QUAD_LANES.width)).prop_map(|(dst, src, quad_lanes)| {
+            Op::Mov(OpMov {
+                dst,
+                src,
+                quad_lanes,
+            })
+        });
+    vec![mov.boxed()]
+}
 
 shells! {
     IAdd3(OpIAdd3) = "iadd3";
