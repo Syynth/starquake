@@ -17,8 +17,9 @@
 //!
 //! Ids and names are Eden's tables. These are exactly the commands the startup fixture's trace
 //! sends (`tests/homebrew/startup/reference/startup.trace`; its README's gap list named them),
-//! and `ISelfController` 2000, a Switch 2 command (see "The graphics server" below); every
-//! other command of these interfaces is left out and answered by the server's unknown-command
+//! `ISelfController::Exit` (0), which libnx sends when the program ends (see "Exit" below), and
+//! `ISelfController` 2000, a Switch 2 command (see "The graphics server" below); every other
+//! command of these interfaces is left out and answered by the server's unknown-command
 //! policy.
 //!
 //! | Interface | Id | Command | In | Out |
@@ -36,7 +37,8 @@
 //! | | 5 | `GetOperationMode` | nothing | `u8` [`OperationMode`] |
 //! | | 6 | `GetPerformanceMode` | nothing | `s32` [`PerformanceMode`] |
 //! | | 9 | `GetCurrentFocusState` | nothing | `u8` [`FocusState`] |
-//! | [`ISelfController`] | 11 | `SetOperationModeChangedNotification` | `bool` (a byte) | nothing |
+//! | [`ISelfController`] | 0 | `Exit` | nothing | nothing; the process ends after the reply |
+//! | | 11 | `SetOperationModeChangedNotification` | `bool` (a byte) | nothing |
 //! | | 12 | `SetPerformanceModeChangedNotification` | `bool` | nothing |
 //! | | 13 | `SetFocusHandlingMode` | `bool notify, bool background, bool suspend`, a byte each | nothing |
 //! | | 16 | `SetOutOfFocusSuspendingEnabled` | `bool` | nothing |
@@ -48,9 +50,6 @@
 //!
 //! [`IAudioController`], [`IDisplayController`], [`ILibraryAppletCreator`] and
 //! [`IDebugFunctions`] have no command here: libnx opens them at start-up and sends them nothing.
-//! `ISelfController::Exit` (0), which libnx sends when the program ends, is not ported: the
-//! fixture's run in starquake stops long before it (the fixture's README says where), and
-//! ending the process needs a kernel interface the services spec does not give a service.
 //!
 //! Layouts, each the client's and the reference's:
 //!
@@ -69,6 +68,8 @@
 //!   `s32` enum.
 //! - `GetAppletResourceUserId`: libnx `_appletCmdNoInOutU64`; Eden `Out<AppletResourceUserId>`,
 //!   a `ProcessId` (`eden/src/core/hle/service/cmif_types.h`), one `u64`.
+//! - `Exit`: libnx `_appletSelfExit` (`_appletCmdNoIO`: no payload, nothing out); Eden
+//!   `Result Exit()`.
 //! - `NotifyRunning`: libnx `_appletCmdNoInOutBool` (a `u8`, of which it keeps bit 0); Eden
 //!   `Out<bool>`, set to true.
 //! - The `Set...` commands with one flag: libnx `_appletCmdInBoolNoOut` (one `u8`, 0 or 1); Eden a
@@ -112,11 +113,17 @@
 //! `SetFocusState(InFocus)` at launch finds a focus change pending, with notifications on), and
 //! libnx's `SetFocusHandlingMode(0, 0, 1)` turns the notifications off.
 //!
-//! Eden signals or clears the event in `SignalSystemEventIfNeeded`, when the cached "a message
-//! is available" differs from `ShouldSignalSystemEvent`. Here the event's state is compared
-//! before and after each command that changes an input of that condition ([`Lifecycle`]): the
-//! same transitions, because in this port only those commands change the inputs, and Eden calls
-//! `SignalSystemEventIfNeeded` after each of them.
+//! Eden signals or clears the event in `SignalSystemEventIfNeeded`
+//! (`eden/src/core/hle/service/am/lifecycle_manager.cpp` @ cf654052: `m_system_event.Signal`
+//! when a message became available, `m_system_event.Clear` when one stopped being available),
+//! when the cached "a message is available" differs from `ShouldSignalSystemEvent`. Here the
+//! event's state is compared before and after each command that changes an input of that
+//! condition ([`Lifecycle`]): the same transitions, because in this port only those commands
+//! change the inputs, and Eden calls `SignalSystemEventIfNeeded` after each of them. A message
+//! that stops being available clears the event ([`Context::clear_event`]): libnx's
+//! `SetFocusHandlingMode(0, 0, 1)` at start-up does (Eden: `SetFocusStateChangedNotificationEnabled`
+//! in `lifecycle_manager.h`), so libnx's `appletMainLoop`, which waits on the event, does not
+//! wake on every poll.
 //!
 //! The events are created the first time a command returns them, not when the applet is: the
 //! kernel interface is reached only while a request is handled. A message event created then is
@@ -128,14 +135,15 @@
 //!
 //! Each difference is pinned by the test named, in `am/tests.rs`:
 //!
-//! - **The message event is never cleared.** Where Eden's `SignalSystemEventIfNeeded` clears it
-//!   (a message stops being available: libnx's `SetFocusHandlingMode(0, 0, 1)` at start-up), the
-//!   kernel event here stays signalled, because the services spec's kernel interface creates and
-//!   signals events and does not clear them. The applet's own record of the condition does go
-//!   false, so a later change signals the event again as Eden would
-//!   (`turning_focus_notifications_off_does_not_clear_the_message_event`). A guest that waits on
-//!   the event then wakes where on Eden it would sleep; `ReceiveMessage`, which it would send
-//!   next, is not ported.
+//! - **`Exit` replies before the process ends.** Eden's `Exit` calls `KProcess::Terminate` on
+//!   the applet's process inside the handler and then answers success. Here the method asks
+//!   the kernel to end the caller's process ([`Context::end_process`]), and the kernel does so
+//!   once the success reply is in the caller's message buffer and the request is recorded, as
+//!   the services spec says (approved 2026-11-16). libnx reads that reply: on success it sleeps
+//!   until it is ended (`libnx/nx/source/services/applet.c`, `_appletExitProcess`). The order is
+//!   pinned on the real kernel by `exit_replies_and_then_the_kernel_ends_the_process`
+//!   (`tests/am_on_the_kernel.rs`); over the fake, `exit_answers_success_and_asks_once_to_end_the_process`.
+//!   Eden ends the applet's process, which is the caller's here (the next item).
 //! - **Any process is the application.** Eden finds the applet by the caller's process id and
 //!   answers `ResultUnknown` when no applet was launched for it
 //!   (`IApplicationProxyService::GetAppletFromProcessId`). starquake has no applet manager, so
@@ -461,9 +469,10 @@ impl Applet {
     }
 
     /// Changes the lifecycle state with `change`, then signals the message event if a message
-    /// became available: Eden's `SignalSystemEventIfNeeded` after the change (module docs, "The
-    /// message event"). Where a message stops being available Eden clears the event; that is
-    /// the listed divergence, and only the state records it.
+    /// became available, or clears it if one stopped being available: Eden's
+    /// `SignalSystemEventIfNeeded` after the change (module docs, "The message event"). Before
+    /// the event exists there is nothing to signal or clear: it is made in the state the
+    /// condition says.
     fn update(
         &mut self,
         cx: &mut Context<'_>,
@@ -478,10 +487,11 @@ impl Applet {
         {
             cx.signal_event(event)?;
         }
-        if before && !after {
-            tracing::debug!(
-                "appletOE: the message event would be cleared here; it stays signalled"
-            );
+        if before
+            && !after
+            && let Some(event) = self.message_event
+        {
+            cx.clear_event(event)?;
         }
         Ok(())
     }
@@ -605,6 +615,8 @@ pub mod command {
 
     /// `ISelfController`'s commands (`ISelfController::ISelfController`).
     pub mod self_controller {
+        /// `{0, D<&ISelfController::Exit>, "Exit"}`.
+        pub const EXIT: u32 = 0;
         /// `{11, D<&ISelfController::SetOperationModeChangedNotification>, ..}`.
         pub const SET_OPERATION_MODE_CHANGED_NOTIFICATION: u32 = 11;
         /// `{12, D<&ISelfController::SetPerformanceModeChangedNotification>, ..}`.
@@ -675,6 +687,7 @@ commands! {
 
 commands! {
     impl ISelfController {
+        self_controller::EXIT => exit,
         self_controller::SET_OPERATION_MODE_CHANGED_NOTIFICATION =>
             set_operation_mode_changed_notification,
         self_controller::SET_PERFORMANCE_MODE_CHANGED_NOTIFICATION =>
@@ -891,6 +904,15 @@ impl ISelfController {
         let updated = applet.update(cx, change);
         *cx.family::<Applet>()? = applet;
         updated
+    }
+
+    /// `Exit`: the caller's process ends once this success reply reaches it (module docs,
+    /// "Where this differs from Eden"). Eden: `m_applet->process->Terminate()`, then
+    /// `R_SUCCEED()`.
+    fn exit(_: &mut Self, cx: &mut Context<'_>, _req: &Request<'_>, reply: &mut Reply) -> Outcome {
+        tracing::info!("appletOE: the application exits");
+        cx.end_process()?;
+        reply.ok()
     }
 
     /// `SetOperationModeChangedNotification`. in: `bool` enabled.

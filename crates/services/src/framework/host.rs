@@ -51,6 +51,15 @@ impl Kernel for IpcContext<'_> {
         IpcContext::signal_event(self, event)
     }
 
+    fn clear_event(&mut self, event: ObjectId) -> SvcResult<()> {
+        IpcContext::clear_event(self, event)
+    }
+
+    fn end_process(&mut self) -> SvcResult<()> {
+        IpcContext::end_process(self);
+        Ok(())
+    }
+
     fn create_shared_memory(
         &mut self,
         size: u64,

@@ -29,6 +29,14 @@
 //! attribute is whatever ranges a test marks ([`FakeKernel::mark_gpu_accessible`]); and a
 //! device-share lock is a count per exact range ([`FakeKernel::device_locks`]), taken only on
 //! mapped memory and released only for a range that holds one.
+//!
+//! Clearing and ending are modelled as plainly. An event the fake made is signalled from a
+//! signal until a clear ([`FakeKernel::is_signalled`]); clearing any other id is the kernel's
+//! [`KernelError::InvalidHandle`]. The fake makes no difference between servers, so it takes
+//! every event it made as the caller's own, where the kernel lets only the server that made an
+//! event clear it. Ending the process only counts the asks ([`FakeKernel::ends`]): the fake has
+//! no process to end, and the reply comes before the end on the real kernel
+//! (`starquake_kernel::dispatch`, the IPC arms' module docs).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -86,6 +94,10 @@ pub struct FakeKernel {
     refs: RefCounts,
     minted: u32,
     events: BTreeMap<ObjectId, u32>,
+    /// The events made that are signalled now: a signal adds one, a clear takes it out.
+    signalled: BTreeSet<ObjectId>,
+    /// How often the caller asked to end its process.
+    ends: u32,
     /// The hooked events made: each writable end's readable end and hook.
     hooked: BTreeMap<ObjectId, (ObjectId, Arc<dyn EventHook>)>,
     /// The ranges a test marked GPU-accessible, as `(address, size)`.
@@ -128,6 +140,8 @@ impl FakeKernel {
             refs: RefCounts::new(),
             minted: 0,
             events: BTreeMap::new(),
+            signalled: BTreeSet::new(),
+            ends: 0,
             hooked: BTreeMap::new(),
             gpu_accessible: Vec::new(),
             device_locks: BTreeMap::new(),
@@ -224,6 +238,21 @@ impl FakeKernel {
     #[must_use]
     pub fn signals(&self, event: ObjectId) -> Option<u32> {
         self.events.get(&event).copied()
+    }
+
+    /// Whether `event` is signalled now: signalled since its last clear. `None` if it is not an
+    /// event this fake created.
+    #[must_use]
+    pub fn is_signalled(&self, event: ObjectId) -> Option<bool> {
+        self.events
+            .contains_key(&event)
+            .then(|| self.signalled.contains(&event))
+    }
+
+    /// How often [`Kernel::end_process`] was called.
+    #[must_use]
+    pub fn ends(&self) -> u32 {
+        self.ends
     }
 
     /// Plays the guest's `SignalEvent` on `writable`, the writable end of an event
@@ -327,6 +356,23 @@ impl Kernel for FakeKernel {
         let signals = self.events.get_mut(&event);
         let signals = signals.ok_or(KernelError::InvalidHandle)?;
         *signals = signals.saturating_add(1);
+        self.signalled.insert(event);
+        Ok(())
+    }
+
+    /// [`KernelError::InvalidHandle`] for an id that is not an event this fake made (the
+    /// readable end of a hooked event is one; its writable end is not, here).
+    fn clear_event(&mut self, event: ObjectId) -> SvcResult<()> {
+        if !self.events.contains_key(&event) {
+            return Err(KernelError::InvalidHandle);
+        }
+        self.signalled.remove(&event);
+        Ok(())
+    }
+
+    /// Counts the ask ([`FakeKernel::ends`]).
+    fn end_process(&mut self) -> SvcResult<()> {
+        self.ends = self.ends.saturating_add(1);
         Ok(())
     }
 

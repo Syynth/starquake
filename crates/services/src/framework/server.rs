@@ -869,6 +869,7 @@ impl Server {
             },
             env: self.env.as_ref(),
             executor: self.executor.as_ref(),
+            ending: false,
         };
         let outcome = match checked {
             Some(Err(fault)) => Some(Err(fault)),
