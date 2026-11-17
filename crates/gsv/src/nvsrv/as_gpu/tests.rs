@@ -547,7 +547,15 @@ fn own_space(direct: &mut Direct) -> (i32, AsId) {
         direct.ioctl(fd, AS_ALLOC_AS_EX, &request).result,
         NvResult::Success
     );
-    (fd, direct.state.as_gpu().view(fd.cast_unsigned()).unwrap().space)
+    (
+        fd,
+        direct
+            .state
+            .as_gpu()
+            .view(fd.cast_unsigned())
+            .unwrap()
+            .space,
+    )
 }
 
 /// A flags-5 view of `space` on a new fd, inside [`OWN`]'s small pages, or, for a space gpu 33
@@ -665,7 +673,10 @@ fn gpu_33_and_as_gpu_share_the_slots_at_the_limit() {
         }
         // One below the limit: the last slot, by the other path than the ones below.
         let last = if as_gpu_below {
-            direct.memory.create_address_space(&direct.front).map(|_| ())
+            direct
+                .memory
+                .create_address_space(&direct.front)
+                .map(|_| ())
         } else {
             fds.push(own_space(&mut direct).0);
             Ok(())
@@ -728,7 +739,12 @@ fn a_child_keeps_the_space_nameable_after_its_creator_closes() {
     let (second, result) = view_of(&mut direct, space, false);
     assert_eq!(result, NvResult::Success);
     assert_eq!(
-        direct.state.as_gpu().view(second.cast_unsigned()).unwrap().space,
+        direct
+            .state
+            .as_gpu()
+            .view(second.cast_unsigned())
+            .unwrap()
+            .space,
         space
     );
 }
@@ -756,11 +772,8 @@ fn a_state_saved_before_a_destroy_is_refused_against_the_memory_after_it() {
     // A view of a space gsv does not hold, alone and beside the made space's fault.
     let fd = on_native.cast_unsigned();
     let empty = GpuMemory::new();
-    let views_only = AsGpu::try_from(saved(
-        &[(fd, direct.state.as_gpu().view(fd).unwrap())],
-        &[],
-    ))
-    .unwrap();
+    let views_only =
+        AsGpu::try_from(saved(&[(fd, direct.state.as_gpu().view(fd).unwrap())], &[])).unwrap();
     assert_eq!(
         views_only.check_spaces(&empty),
         Err(AsGpuStateError::ViewSpaceNotHeld {
@@ -1203,7 +1216,8 @@ fn a_saved_state_alloc_as_ex_cannot_reach_is_refused() {
             AsGpuStateError::MadeLayout { space: 3 },
         ),
     ];
-    for (state, error) in cases.into_iter().chain(unissued_and_creators()) {
+    let more = unissued_and_creators().into_iter().chain(unheld());
+    for (state, error) in cases.into_iter().chain(more) {
         assert_eq!(AsGpu::try_from(state), Err(error), "{error}");
     }
 }
@@ -1289,8 +1303,19 @@ fn unissued_and_creators() -> Vec<(SavedAsGpu, AsGpuStateError)> {
             ),
             AsGpuStateError::ViewLayout { fd: 9 },
         ),
-        // A made space no view holds: only a destroy leaves one. Alone, beside a held one, and
-        // after the faults checked before it.
+    ]
+}
+
+/// The unheld-space cases of `a_saved_state_alloc_as_ex_cannot_reach_is_refused`: a made space
+/// no view holds (only a destroy leaves one), alone, beside a held one, and after the faults
+/// checked before it.
+fn unheld() -> Vec<(SavedAsGpu, AsGpuStateError)> {
+    let space = |id: u32| AsId(id);
+    let view = |id, layout| View {
+        space: space(id),
+        layout,
+    };
+    vec![
         (
             saved(&[], &[(space(3), MADE)]),
             AsGpuStateError::MadeSpaceUnheld { space: 3 },

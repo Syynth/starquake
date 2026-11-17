@@ -26,6 +26,14 @@
 //!   calls, so it counts against the same [`MAX_ADDRESS_SPACES`] and takes the next id of the
 //!   same sequence.
 //!
+//! **What `as_fd` names.** In PR it is an nvdrv fd, because PR's gpu 33 opens an as-gpu fd and
+//! answers that fd as the address-space id (`IGpuSession::CreateAddressSpace`). So the id gpu 33
+//! answers is what NvRm passes. Here gpu 33's id is gsv's own ([`AsId`]), not an nvsrv fd, so
+//! `as_fd` is read as an [`AsId`]: it names the address space gpu 33 (or an earlier parentless
+//! `AllocAsEx`) made, checked against what gsv holds. A title that named another as-gpu *fd*
+//! as the parent would find a different object here, or none; nothing shows NvRm doing that
+//! (a **guess**: a trace of `AllocAsEx`'s `as_fd` against gpu 33's reply settles it).
+//!
 //! # Closing
 //!
 //! Closing an fd drops its view. An address space a parentless `AllocAsEx` made is held by every
@@ -33,16 +41,19 @@
 //! the space is destroyed ([`GpuMemory::destroy_address_space`]: its mappings removed in order on
 //! the GPU, its slot of [`MAX_ADDRESS_SPACES`] free at once, its layout forgotten), so a title
 //! that opens, allocates and closes in a loop never runs out of address spaces
-//! (`opening_allocating_and_closing_never_runs_out`). An address space gpu 33 made is never
-//! destroyed here: the gpu session holds it, as PR's `GpuDeviceRegistry::address_spaces` holds
-//! its fd until the session's state goes (`eden-pr4588/src/core/hle/service/am/service/gpu_session.cpp`
-//! @ e5fb3b97, `~GpuDeviceRegistry`), so closing a view of one leaves it
+//! (`opening_allocating_and_closing_never_runs_out`; gpu 33 and as-gpu sharing the slots at the
+//! limit: `gpu_33_and_as_gpu_share_the_slots_at_the_limit`). An address space gpu 33 made is
+//! never destroyed here: the gpu session holds it, as PR's `GpuDeviceRegistry::address_spaces`
+//! holds its fd until the session's state goes
+//! (`eden-pr4588/src/core/hle/service/am/service/gpu_session.cpp` @ e5fb3b97,
+//! `~GpuDeviceRegistry`), so closing a view of one leaves it
 //! (`closing_a_view_of_a_gpu_33_space_keeps_it`).
 //!
-//! This is PR's lifetime: a view holds its parent (`nvhost_as_gpu.h`: `std::shared_ptr<nvhost_as_gpu>
-//! m_shared_parent`, and `AllocAsEx`'s `gmmu = m_shared_parent->gmmu`), `Module::Close` drops
-//! the fd's device (`nvdrv.cpp`: `open_files.erase(itr)`), and the GMMU (`std::shared_ptr<
-//! Tegra::MemoryManager> gmmu`) goes with its last holder
+//! This is PR's lifetime (@ e5fb3b97): a view holds its parent (`nvhost_as_gpu.h`:
+//! `std::shared_ptr<nvhost_as_gpu> m_shared_parent`, and `AllocAsEx`'s `gmmu =
+//! m_shared_parent->gmmu`), `Module::Close` drops the fd's device (`nvdrv.cpp`:
+//! `open_files.erase(itr)`), and the GMMU (`std::shared_ptr<Tegra::MemoryManager> gmmu`) goes
+//! with its last holder
 //! (`the_last_close_destroys_the_space_and_the_one_before_keeps_it`). PR's channels hold it too
 //! (`BindChannel`: `memory_manager_owner`); `BindChannel` is not built (see "Not built"), so no
 //! channel holds a space here yet.
@@ -54,14 +65,6 @@
 //! hold (`a_state_saved_before_a_destroy_is_refused_against_the_memory_after_it`). What is not
 //! checked here: whether a space gsv holds and nvsrv does not name is one gpu 33 made (gsv does
 //! not record which path made a space).
-//!
-//! **What `as_fd` names.** In PR it is an nvdrv fd, because PR's gpu 33 opens an as-gpu fd and
-//! answers that fd as the address-space id (`IGpuSession::CreateAddressSpace`). So the id gpu 33
-//! answers is what NvRm passes. Here gpu 33's id is gsv's own ([`AsId`]), not an nvsrv fd, so
-//! `as_fd` is read as an [`AsId`]: it names the address space gpu 33 (or an earlier parentless
-//! `AllocAsEx`) made, checked against what gsv holds. A title that named another as-gpu *fd*
-//! as the parent would find a different object here, or none; nothing shows NvRm doing that
-//! (a **guess**: a trace of `AllocAsEx`'s `as_fd` against gpu 33's reply settles it).
 //!
 //! # The ioctls
 //!
@@ -144,7 +147,7 @@
 //! | `as_fd` naming the fd itself | `BadParameter` | cannot happen: the fd has no address space before its `AllocAsEx` |
 //! | The parent's layout | the parent fd's own | the layout an earlier parentless `AllocAsEx` gave the space, or [`NATIVE_LAYOUT`] (what PR's gpu 33 asks for) for a space gpu 33 made (`a_view_of_a_gpu_session_space_uses_the_native_layout`) |
 //! | A layout out of order, not page aligned, or past [`VA_LIMIT`] | accepted; its allocators then hold truncated 32-bit page numbers | `BadValue`, nothing made (`a_layout_out_of_order_is_a_bad_value`, `a_layout_past_the_va_limit_is_a_bad_value`) |
-//! | More address spaces than [`MAX_ADDRESS_SPACES`] | no limit | `InsufficientMemory`, shared with gpu 33's count (`address_spaces_are_bounded_with_gpu_33_s`) |
+//! | More address spaces than [`MAX_ADDRESS_SPACES`] | no limit | `InsufficientMemory`, shared with gpu 33's count (`address_spaces_are_bounded_with_gpu_33_s`, `gpu_33_and_as_gpu_share_the_slots_at_the_limit`) |
 //! | Closing the last fd holding a space | the GMMU goes at once | the space goes from gsv at once, and its mappings are removed on the GPU in order (`crate::gpu::memory`, "Destroying an address space") (`the_last_close_destroys_the_space_and_the_one_before_keeps_it`) |
 //! | A new view naming a space whose creator fd is closed while a child view holds it | `BadParameter`: `as_fd` names the closed fd | accepted: `as_fd` names the space, which lives (`a_child_keeps_the_space_nameable_after_its_creator_closes`) |
 //! | Two views of one address space asking for the shim | each places its own (the GMMU keeps the last) | the first places it, the second reports the same page (`a_second_view_reports_the_same_shim`) |
@@ -170,8 +173,8 @@ use starquake_memory::PAGE_SIZE;
 use super::ctrl_gpu;
 use super::ioctl::Fixed;
 use super::{GpuAccess, IoctlAnswer, IoctlCall, IoctlVariant, NvResult};
-use crate::gpu::{AsId, GpuMemory};
 use crate::gpu::memory::{FIRST_ADDRESS_SPACE, MAX_ADDRESS_SPACES, VA_WINDOW_END, VA_WINDOW_START};
+use crate::gpu::{AsId, GpuMemory};
 
 #[cfg(test)]
 mod tests;
@@ -644,7 +647,11 @@ impl AsGpu {
     /// naming a space that was destroyed (its last fd closed) is refused (module docs,
     /// "Closing").
     pub fn check_spaces(&self, memory: &GpuMemory) -> Result<(), AsGpuStateError> {
-        if let Some(&space) = self.made.keys().find(|&&space| memory.table(space).is_none()) {
+        if let Some(&space) = self
+            .made
+            .keys()
+            .find(|&&space| memory.table(space).is_none())
+        {
             return Err(AsGpuStateError::MadeSpaceNotHeld { space: space.0 });
         }
         if let Some((&fd, view)) = self
