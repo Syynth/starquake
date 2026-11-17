@@ -38,7 +38,7 @@
 //! | `GetThreadId` (0x25) | [`thread::get_thread_id`] | the scheduler and the handle table, both shared, and the calling core |
 //! | `Break` (0x26) | [`exception::break_execution`] | guest memory |
 //! | `OutputDebugString` (0x27) | [`debug::output_debug_string`] | guest memory, a [`DebugSink`] and the dispatch's guest time |
-//! | `GetInfo` (0x29) | [`info::get_info`] | the handle table, the address space and the scheduler, all shared, and the calling process (the dispatcher first draws the process's entropy from the environment, with the scheduler exclusive, the first time it is asked for) |
+//! | `GetInfo` (0x29) | [`info::get_info`] | the handle table and the scheduler, both exclusive (`MesosphereCurrentProcess` adds a handle), the address space, shared, the calling process and the calling core (the dispatcher first draws the process's entropy from the environment the first time it is asked for) |
 //! | `WaitForAddress` (0x34) | [`arbitration::wait_for_address`] | the address space, shared, the scheduler, guest memory, the calling thread and the dispatch's clock reading |
 //! | `SignalToAddress` (0x35) | [`arbitration::signal_to_address`] | the address space, shared, the scheduler, guest memory and the calling core |
 //! | `CreateEvent` (0x45) | [`event::create_event`] | the handle table and the scheduler, both exclusive |

@@ -1079,13 +1079,14 @@ fn get_info_decodes_x1_to_x3_and_writes_the_value_to_x1() {
         (regs.x[0], regs.x[1]),
         (word(KernelError::InvalidEnumValue), 0)
     );
-    // An id this slice does not answer is a result like any other, not a call that is
-    // missing: the outputs are written.
+    // Another process id reads the process's facts: its core mask.
     let mut regs = before.clone();
     regs.x[1] = u64::from(crate::svc::info::InfoType::CoreMask.number());
     let (record, _) = dispatch_on(&dispatcher, id.number(), &mut regs, 0);
     assert_eq!(record.outcome, Outcome::Completed);
-    assert_eq!((regs.x[0], regs.x[1]), (not_implemented_word(), 0));
+    let core_mask = tables().processes.own_info().unwrap().core_mask();
+    assert_ne!(core_mask, 0);
+    assert_eq!((regs.x[0], regs.x[1]), (0, core_mask));
 }
 
 #[test]
@@ -1105,9 +1106,10 @@ fn the_memory_calls_declare_the_address_space_and_get_info_all_three_tables() {
         LockWaits {
             timed: false,
             // Five acquisitions; the three that change memory declared it exclusively, and
-            // GetInfo the scheduler, where the first ask for the entropy keeps what it drew.
+            // GetInfo the scheduler, where the first ask for the entropy keeps what it drew,
+            // and the handle table, where `MesosphereCurrentProcess` adds a handle.
             lock: waits(5, 4, 0, Duration::ZERO),
-            handles: waits(1, 0, 0, Duration::ZERO),
+            handles: waits(1, 1, 0, Duration::ZERO),
             address_space: waits(5, 3, 0, Duration::ZERO),
             scheduler: waits(1, 1, 0, Duration::ZERO),
         }
