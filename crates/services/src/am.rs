@@ -12,19 +12,29 @@
 //! `lifecycle_manager.h` (`LifecycleManager`), `applet.cpp` (`Applet::UpdateSuspensionStateLocked`),
 //! `applet_manager.cpp` (the launch) and `am_types.h` (`FocusState`, `OperationMode`). The request
 //! layouts are checked against the client, libnx (`libnx/nx/source/services/applet.c`, ISC).
+//! The Switch 2 additions are ported from Eden PR #4588 @ e5fb3b97 (GPL-3.0-or-later):
+//! `eden-pr4588/src/core/hle/service/am/service/application_proxy_service.cpp`
+//! (`OpenApplicationProxyWithFlags`), `application_proxy.cpp` (`IApplicationProxy` 40 and 60),
+//! `performance_functions.cpp` (`IPerformanceFunctions`),
+//! `graphics_scaling_parameters_functions.cpp` and `.h` (`IGraphicsScalingParametersFunctions`)
+//! and `application_functions.cpp` (`IApplicationFunctions` 320 and 321), with the applet's
+//! initial values from `eden-pr4588/src/core/hle/service/am/applet.h` (see "The Switch 2
+//! additions").
 //!
 //! # Commands
 //!
 //! Ids and names are Eden's tables. These are exactly the commands the startup fixture's trace
 //! sends (`tests/homebrew/startup/reference/startup.trace`; its README's gap list named them),
 //! `ISelfController::Exit` (0), which libnx sends when the program ends (see "Where this
-//! differs from Eden"), and `ISelfController` 2000, a Switch 2 command (see "The graphics
-//! server" below); every other command of these interfaces is left out and answered by the
+//! differs from Eden"), `ISelfController` 2000, a Switch 2 command (see "The graphics
+//! server" below), and the other Switch 2 additions the scoping doc names (see "The Switch 2
+//! additions" below); every other command of these interfaces is left out and answered by the
 //! server's unknown-command policy.
 //!
 //! | Interface | Id | Command | In | Out |
 //! |---|---|---|---|---|
 //! | `appletOE` ([`IApplicationProxyService`]) | 0 | `OpenApplicationProxy` | the caller's process id, attached by the kernel; a `u64` placeholder in the payload, not read; copy handle 0: the caller's process | an [`IApplicationProxy`] |
+//! | | 10 | `OpenApplicationProxyWithFlags` (Switch 2) | `u32` flags at offset 0; then as command 0, with the `u64` placeholder at offset 8, not read | an [`IApplicationProxy`] |
 //! | [`IApplicationProxy`] | 0 | `GetCommonStateGetter` | nothing | an [`ICommonStateGetter`] |
 //! | | 1 | `GetSelfController` | nothing | an [`ISelfController`] |
 //! | | 2 | `GetWindowController` | nothing | an [`IWindowController`] |
@@ -32,6 +42,8 @@
 //! | | 4 | `GetDisplayController` | nothing | an [`IDisplayController`] |
 //! | | 11 | `GetLibraryAppletCreator` | nothing | an [`ILibraryAppletCreator`] |
 //! | | 20 | `GetApplicationFunctions` | nothing | an [`IApplicationFunctions`] |
+//! | | 40 | `GetPerformanceFunctions` (Switch 2) | nothing | an [`IPerformanceFunctions`] |
+//! | | 60 | `GetGraphicsScalingParametersFunctions` (Switch 2) | nothing | an [`IGraphicsScalingParametersFunctions`] |
 //! | | 1000 | `GetDebugFunctions` | nothing | an [`IDebugFunctions`] |
 //! | [`ICommonStateGetter`] | 0 | `GetEventHandle` | nothing | copy handle: the applet's message event |
 //! | | 5 | `GetOperationMode` | nothing | `u8` [`OperationMode`] |
@@ -47,9 +59,15 @@
 //! | [`IWindowController`] | 1 | `GetAppletResourceUserId` | nothing | `u64` the applet resource user id |
 //! | | 10 | `AcquireForegroundRights` | nothing | nothing |
 //! | [`IApplicationFunctions`] | 40 | `NotifyRunning` | nothing | `bool` (a byte): true |
+//! | | 320 | `GetScreenShotAndContinuousRecordingInitiallyEnabled` (Switch 2) | nothing | `bool screenshot, bool recording`, a byte each: [`SCREENSHOT_INITIALLY_ENABLED`], [`CONTINUOUS_RECORDING_INITIALLY_ENABLED`] |
+//! | | 321 | `Unknown321` (Switch 2) | nothing | `bool` (a byte): [`UNKNOWN_321_ENABLED`] |
+//! | [`IGraphicsScalingParametersFunctions`] (Switch 2) | 10 | `GetGraphicsScalingParameters` | nothing | a [`GraphicsScalingParameters`]: three `u32`s |
+//! | | 1050 | `SetGraphicsScaleChangedNotificationEnabled` | `bool` (a byte) | nothing |
 //!
 //! [`IAudioController`], [`IDisplayController`], [`ILibraryAppletCreator`] and
 //! [`IDebugFunctions`] have no command here: libnx opens them at start-up and sends them nothing.
+//! [`IPerformanceFunctions`] has none either: PR #4588 names its two commands and implements
+//! neither (see "The Switch 2 additions").
 //!
 //! Layouts, each the client's and the reference's:
 //!
@@ -77,6 +95,17 @@
 //!   (`struct { u8 inval0; u8 inval1; u8 inval2; }`); Eden `(bool notify, bool background, bool
 //!   suspend)`, at offsets 0, 1 and 2 (`cmif_serialization.h`, `ReadInArgument`: each argument at
 //!   its own alignment).
+//!
+//! - `OpenApplicationProxyWithFlags`: no libnx client. PR #4588's
+//!   `OpenApplicationProxyWithFlags(Out<..>, u32 flags, ClientProcessId pid,
+//!   InCopyHandle<KProcess>)`: by `ReadInArgument`, `flags` at offset 0 and the process id's
+//!   `u64` slot at offset 8 (its own alignment), 16 bytes in all. The slot is not read, as for
+//!   command 0: the id is the kernel's.
+//! - `GetScreenShotAndContinuousRecordingInitiallyEnabled`: PR #4588 `(Out<bool>, Out<bool>)`,
+//!   at offsets 0 and 1. `Unknown321`: `Out<bool>`. `GetGraphicsScalingParameters`:
+//!   `Out<GraphicsScalingParameters>`, a 12-byte struct of three `u32`s
+//!   (`graphics_scaling_parameters_functions.h`: `static_assert(sizeof(GraphicsScalingParameters)
+//!   == 12)`). `SetGraphicsScaleChangedNotificationEnabled`: a `bool` argument.
 //!
 //! A flag is read as true when its byte is not zero. Eden copies the byte into a C++ `bool`
 //! (`std::memcpy` in `ReadInArgument`), which is defined only for 0 and 1; what it makes of
@@ -163,9 +192,58 @@
 //!   The handle is not otherwise used: Eden keeps it for the display layer manager, which is not
 //!   ported.
 //!
-//! The other Switch 2 additions (`appletOE` command 10, `IApplicationProxy` 40 and 60,
-//! `IApplicationFunctions` 320 and 321: `docs/switch2-eden-diff-scoping.md`, "Services (HLE)")
-//! are left out; each is one more row and method.
+//! # The Switch 2 additions
+//!
+//! The scoping doc's `am` row (`docs/switch2-eden-diff-scoping.md`, "Services (HLE)") names
+//! them: "`appletOE` cmd 10 is the new OpenApplicationProxy. `IApplicationProxy` gains cmd 60
+//! (graphics scale) and cmd 40. `IApplicationFunctions` gains 320 and 321." Each is ported as
+//! PR #4588 has it (`ISelfController` 2000 is the next section):
+//!
+//! - **`OpenApplicationProxyWithFlags` (10)** checks its flags and is then
+//!   `OpenApplicationProxy`, through the same method, so the proxy it returns is the one command
+//!   0 returns. PR's check is `R_UNLESS(flags == 0 || flags == 2, ResultUnknown)`, with the
+//!   comment that 0 is what most titles send and 2 what one title sends, and that no other value
+//!   has been observed: [`PROXY_FLAGS_ACCEPTED`], answered [`UNKNOWN`] otherwise. What the flags
+//!   mean is not known; they are not kept. The checks run in PR's order: the flags first, then
+//!   command 0's (the process id, then the process handle).
+//! - **`GetPerformanceFunctions` (40)** returns an [`IPerformanceFunctions`]. PR #4588's table
+//!   for it is `{0, nullptr, "IsCpuOverclockEnabled"}, {1, nullptr, "SetCpuOverclockEnabled"}`:
+//!   no command is implemented, so here both go to the unknown-command policy.
+//! - **`GetGraphicsScalingParametersFunctions` (60)** returns an
+//!   [`IGraphicsScalingParametersFunctions`], of whose commands PR implements two:
+//!   `GetGraphicsScalingParameters` (10) answers [`GraphicsScalingParameters::PR_4588`], and
+//!   `SetGraphicsScaleChangedNotificationEnabled` (1050) keeps its flag in the applet
+//!   ([`Applet::graphics_scale_changed_notification_enabled`], initially false: `applet.h`,
+//!   `bool graphics_scale_changed_notification_enabled{}`). PR reads the flag nowhere else, so
+//!   it changes no answer. PR's other rows (1000, 1010, 1020, 1030 and 1040, all `...ForDebug`)
+//!   are `nullptr`, and go to the unknown-command policy.
+//! - **`IApplicationFunctions` 320** (`GetScreenShotAndContinuousRecordingInitiallyEnabled`)
+//!   answers PR's expressions over the applet: screenshots are enabled when
+//!   `screenshot_permission != ScreenshotPermission::Disable`, and continuous recording when
+//!   `game_play_recording_supported && game_play_recording_state ==
+//!   GamePlayRecordingState::Enabled`. Nothing ported here changes those fields (PR's
+//!   `ISelfController::SetScreenShotPermission` and `IApplicationFunctions::
+//!   SetGamePlayRecordingState` are not ported), so they keep `applet.h`'s initial values:
+//!   `ScreenshotPermission::Inherit` (the enum's 0, `screenshot_permission{}`), `false` and
+//!   `GamePlayRecordingState::Disabled`. So the answer is fixed: [`SCREENSHOT_INITIALLY_ENABLED`]
+//!   true and [`CONTINUOUS_RECORDING_INITIALLY_ENABLED`] false. A port of either setter turns the
+//!   two into applet state.
+//! - **`IApplicationFunctions` 321** (`Unknown321`) answers false ([`UNKNOWN_321_ENABLED`]).
+//!   PR names it `Unknown321`, and its comment says what the SDK uses the bool for; both the
+//!   meaning and the value are PR's guesses.
+//!
+//! PR's `IApplicationFunctions` table also has 330 (`Unknown330`, marked 20.0.0+), which the
+//! scoping doc does not name; it is not ported, and goes to the unknown-command policy.
+//!
+//! Where these differ from PR #4588:
+//!
+//! - **A payload too short for a read field is refused** with [`INVALID_CMIF_REQUEST`] and
+//!   changes nothing: `OpenApplicationProxyWithFlags` with fewer than 4 bytes (it reads only the
+//!   flags), `SetGraphicsScaleChangedNotificationEnabled` with none. PR's `ReadInArgument` copies
+//!   the bytes at the argument's offset whatever the message's size. Pinned by
+//!   `open_application_proxy_with_flags_checks_its_flags_first` and
+//!   `set_graphics_scale_changed_notification_enabled_keeps_its_flag`.
+//! - The process id and handle checks are command 0's ("Where this differs from Eden").
 //!
 //! # The graphics server
 //!
@@ -214,7 +292,7 @@ use starquake_trace::ServiceId;
 use crate::apm::PerformanceMode;
 use crate::commands;
 use crate::framework::{
-    Context, Fault, Interfaces, Outcome, Reader, Reply, Request, Server, UnknownPolicy,
+    Context, Fault, Interfaces, Outcome, Reader, Reply, Request, Server, UnknownPolicy, Writer,
 };
 
 #[cfg(test)]
@@ -228,6 +306,65 @@ pub const OE_NAME: &str = "appletOE";
 /// ResultUnknown(UINT32_MAX)`), which `OpenApplicationProxy` answers when it finds no applet for
 /// the caller.
 pub const UNKNOWN: ResultCode = ResultCode::from_raw(u32::MAX);
+
+/// The flags `OpenApplicationProxyWithFlags` accepts (module docs, "The Switch 2 additions"):
+/// Eden PR #4588 (`eden-pr4588/src/core/hle/service/am/service/application_proxy_service.cpp` @
+/// e5fb3b97, `OpenApplicationProxyWithFlags`): `R_UNLESS(flags == 0 || flags == 2,
+/// ResultUnknown)`. Any other value is answered [`UNKNOWN`].
+pub const PROXY_FLAGS_ACCEPTED: [u32; 2] = [0, 2];
+
+/// Whether screenshots are initially enabled, as
+/// `GetScreenShotAndContinuousRecordingInitiallyEnabled` answers: PR #4588's
+/// `screenshot_permission != ScreenshotPermission::Disable`, over the initial
+/// `ScreenshotPermission::Inherit` (module docs, "The Switch 2 additions").
+pub const SCREENSHOT_INITIALLY_ENABLED: bool = true;
+
+/// Whether continuous recording is initially enabled, as
+/// `GetScreenShotAndContinuousRecordingInitiallyEnabled` answers: PR #4588's
+/// `game_play_recording_supported && game_play_recording_state ==
+/// GamePlayRecordingState::Enabled`, over the initial `false` and `Disabled` (module docs, "The
+/// Switch 2 additions").
+pub const CONTINUOUS_RECORDING_INITIALLY_ENABLED: bool = false;
+
+/// What `IApplicationFunctions` 321 answers: PR #4588's `Unknown321` sets `*out_enabled = false`
+/// (`eden-pr4588/src/core/hle/service/am/service/application_functions.cpp` @ e5fb3b97). A guess
+/// of PR's: the command's meaning is not known, and a console trace of the reply would confirm
+/// the value.
+pub const UNKNOWN_321_ENABLED: bool = false;
+
+/// The graphics scaling parameters `GetGraphicsScalingParameters` answers (Eden PR #4588,
+/// `eden-pr4588/src/core/hle/service/am/service/graphics_scaling_parameters_functions.h` @
+/// e5fb3b97, `struct GraphicsScalingParameters`, 12 bytes). The reply carries the fields in
+/// declaration order, each a little-endian `u32`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GraphicsScalingParameters {
+    /// `graphics_scale`.
+    pub graphics_scale: u32,
+    /// `screen_ratio_numerator`.
+    pub screen_ratio_numerator: u32,
+    /// `screen_ratio_denominator`.
+    pub screen_ratio_denominator: u32,
+}
+
+impl GraphicsScalingParameters {
+    /// PR #4588's answer, `*out_parameters = {10, 1, 1}`, with its comment: "Prototype policy:
+    /// lowest SDK scale (10 maps to public scale 0), unit screen ratio. The ratio field
+    /// interpretation is inferred from the adjacent debug API." All three values, and what the
+    /// ratio fields mean, are PR's guesses; a console trace of the reply would confirm them.
+    pub const PR_4588: Self = Self {
+        graphics_scale: 10,
+        screen_ratio_numerator: 1,
+        screen_ratio_denominator: 1,
+    };
+
+    /// Writes the parameters as the reply carries them.
+    fn write(&self, payload: &mut Writer) {
+        payload
+            .write_u32(self.graphics_scale)
+            .write_u32(self.screen_ratio_numerator)
+            .write_u32(self.screen_ratio_denominator);
+    }
+}
 
 /// What the console reports as its operation mode (`nn::oe::OperationMode`;
 /// `eden/src/core/hle/service/am/am_types.h`, `enum class OperationMode : u8`).
@@ -418,6 +555,9 @@ pub struct Applet {
     /// The server of the graphics server's root, which `GetGraphicsSupervisor` hands sessions
     /// on out (module docs, "The graphics server"); `None` in a run without one.
     graphics_server: Option<ServiceId>,
+    /// PR #4588's `graphics_scale_changed_notification_enabled`, which
+    /// `SetGraphicsScaleChangedNotificationEnabled` sets (module docs, "The Switch 2 additions").
+    graphics_scale_changed_notification_enabled: bool,
 }
 
 impl Applet {
@@ -431,6 +571,7 @@ impl Applet {
             message_event: None,
             suspended_tick_event: None,
             graphics_server: None,
+            graphics_scale_changed_notification_enabled: false,
         }
     }
 
@@ -446,6 +587,13 @@ impl Applet {
     #[must_use]
     pub fn graphics_server(&self) -> Option<ServiceId> {
         self.graphics_server
+    }
+
+    /// Whether the applet asked to be told when the graphics scale changes
+    /// (`SetGraphicsScaleChangedNotificationEnabled`); initially false.
+    #[must_use]
+    pub fn graphics_scale_changed_notification_enabled(&self) -> bool {
+        self.graphics_scale_changed_notification_enabled
     }
 
     /// What the applet reports.
@@ -577,12 +725,27 @@ pub struct ILibraryAppletCreator;
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct IDebugFunctions;
 
+/// `IPerformanceFunctions` (Switch 2): PR #4588 implements none of its commands (module docs,
+/// "The Switch 2 additions").
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct IPerformanceFunctions;
+
+/// `IGraphicsScalingParametersFunctions` (Switch 2). The state it changes is the applet's.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct IGraphicsScalingParametersFunctions;
+
 /// The ids of the commands ported here, per interface (Eden's tables, each row cited).
 pub mod command {
     /// `appletOE`'s commands (`IApplicationProxyService::IApplicationProxyService`).
     pub mod proxy_service {
         /// `{0, D<&IApplicationProxyService::OpenApplicationProxy>, "OpenApplicationProxy"}`.
         pub const OPEN_APPLICATION_PROXY: u32 = 0;
+        /// Switch 2. Eden PR #4588
+        /// (`eden-pr4588/src/core/hle/service/am/service/application_proxy_service.cpp` @
+        /// e5fb3b97): `{10, D<&IApplicationProxyService::OpenApplicationProxyWithFlags>,
+        /// "OpenApplicationProxyWithFlags"}`; the scoping doc's `am` row ("`appletOE` cmd 10 is
+        /// the new OpenApplicationProxy").
+        pub const OPEN_APPLICATION_PROXY_WITH_FLAGS: u32 = 10;
     }
 
     /// `IApplicationProxy`'s commands (`IApplicationProxy::IApplicationProxy`).
@@ -601,6 +764,14 @@ pub mod command {
         pub const GET_LIBRARY_APPLET_CREATOR: u32 = 11;
         /// `{20, D<&IApplicationProxy::GetApplicationFunctions>, "GetApplicationFunctions"}`.
         pub const GET_APPLICATION_FUNCTIONS: u32 = 20;
+        /// Switch 2. Eden PR #4588
+        /// (`eden-pr4588/src/core/hle/service/am/service/application_proxy.cpp` @ e5fb3b97):
+        /// `{40, D<&IApplicationProxy::GetPerformanceFunctions>, "GetPerformanceFunctions"}`.
+        pub const GET_PERFORMANCE_FUNCTIONS: u32 = 40;
+        /// Switch 2. Eden PR #4588 (`application_proxy.cpp` @ e5fb3b97): `{60,
+        /// D<&IApplicationProxy::GetGraphicsScalingParametersFunctions>,
+        /// "GetGraphicsScalingParametersFunctions"}`.
+        pub const GET_GRAPHICS_SCALING_PARAMETERS_FUNCTIONS: u32 = 60;
         /// `{1000, D<&IApplicationProxy::GetDebugFunctions>, "GetDebugFunctions"}`.
         pub const GET_DEBUG_FUNCTIONS: u32 = 1000;
     }
@@ -653,17 +824,39 @@ pub mod command {
     pub mod application_functions {
         /// `{40, D<&IApplicationFunctions::NotifyRunning>, "NotifyRunning"}`.
         pub const NOTIFY_RUNNING: u32 = 40;
+        /// Switch 2. Eden PR #4588
+        /// (`eden-pr4588/src/core/hle/service/am/service/application_functions.cpp` @
+        /// e5fb3b97): `{320,
+        /// D<&IApplicationFunctions::GetScreenShotAndContinuousRecordingInitiallyEnabled>,
+        /// "GetScreenShotAndContinuousRecordingInitiallyEnabled"}`.
+        pub const GET_SCREEN_SHOT_AND_CONTINUOUS_RECORDING_INITIALLY_ENABLED: u32 = 320;
+        /// Switch 2. Eden PR #4588 (`application_functions.cpp` @ e5fb3b97): `{321,
+        /// D<&IApplicationFunctions::Unknown321>, "Unknown321"}`; PR's name.
+        pub const UNKNOWN_321: u32 = 321;
+    }
+
+    /// `IGraphicsScalingParametersFunctions`' commands (Switch 2), from Eden PR #4588
+    /// (`eden-pr4588/src/core/hle/service/am/service/graphics_scaling_parameters_functions.cpp`
+    /// @ e5fb3b97, `IGraphicsScalingParametersFunctions::IGraphicsScalingParametersFunctions`).
+    pub mod graphics_scaling_parameters_functions {
+        /// `{10, D<&IGraphicsScalingParametersFunctions::GetGraphicsScalingParameters>, ..}`.
+        pub const GET_GRAPHICS_SCALING_PARAMETERS: u32 = 10;
+        /// `{1050,
+        /// D<&IGraphicsScalingParametersFunctions::SetGraphicsScaleChangedNotificationEnabled>,
+        /// ..}`.
+        pub const SET_GRAPHICS_SCALE_CHANGED_NOTIFICATION_ENABLED: u32 = 1050;
     }
 }
 
 use command::{
-    application_functions, common_state_getter, proxy, proxy_service, self_controller,
-    window_controller,
+    application_functions, common_state_getter, graphics_scaling_parameters_functions, proxy,
+    proxy_service, self_controller, window_controller,
 };
 
 commands! {
     impl IApplicationProxyService {
         proxy_service::OPEN_APPLICATION_PROXY => open_application_proxy,
+        proxy_service::OPEN_APPLICATION_PROXY_WITH_FLAGS => open_application_proxy_with_flags,
     }
 }
 
@@ -676,6 +869,9 @@ commands! {
         proxy::GET_DISPLAY_CONTROLLER => get_display_controller,
         proxy::GET_LIBRARY_APPLET_CREATOR => get_library_applet_creator,
         proxy::GET_APPLICATION_FUNCTIONS => get_application_functions,
+        proxy::GET_PERFORMANCE_FUNCTIONS => get_performance_functions,
+        proxy::GET_GRAPHICS_SCALING_PARAMETERS_FUNCTIONS =>
+            get_graphics_scaling_parameters_functions,
         proxy::GET_DEBUG_FUNCTIONS => get_debug_functions,
     }
 }
@@ -715,10 +911,22 @@ commands! {
 commands! {
     impl IApplicationFunctions {
         application_functions::NOTIFY_RUNNING => notify_running,
+        application_functions::GET_SCREEN_SHOT_AND_CONTINUOUS_RECORDING_INITIALLY_ENABLED =>
+            get_screen_shot_and_continuous_recording_initially_enabled,
+        application_functions::UNKNOWN_321 => unknown_321,
     }
 }
 
-// No command of these four is ported (module docs, "Commands"); every request to one goes to the
+commands! {
+    impl IGraphicsScalingParametersFunctions {
+        graphics_scaling_parameters_functions::GET_GRAPHICS_SCALING_PARAMETERS =>
+            get_graphics_scaling_parameters,
+        graphics_scaling_parameters_functions::SET_GRAPHICS_SCALE_CHANGED_NOTIFICATION_ENABLED =>
+            set_graphics_scale_changed_notification_enabled,
+    }
+}
+
+// No command of these five is ported (module docs, "Commands"); every request to one goes to the
 // unknown-command policy.
 commands! {
     impl IAudioController {}
@@ -736,6 +944,10 @@ commands! {
     impl IDebugFunctions {}
 }
 
+commands! {
+    impl IPerformanceFunctions {}
+}
+
 impl IApplicationProxyService {
     /// `OpenApplicationProxy`. in: the caller's process id, and its process as copy handle 0.
     /// out: an [`IApplicationProxy`].
@@ -745,6 +957,32 @@ impl IApplicationProxyService {
         req: &Request<'_>,
         reply: &mut Reply,
     ) -> Outcome {
+        Self::open_proxy(req, reply)
+    }
+
+    /// `OpenApplicationProxyWithFlags` (Switch 2). in: `u32` flags, then as
+    /// `OpenApplicationProxy`. out: an [`IApplicationProxy`]. The flags are checked first
+    /// ([`PROXY_FLAGS_ACCEPTED`]), as PR #4588 does before it calls `OpenApplicationProxy`.
+    fn open_application_proxy_with_flags(
+        _: &mut Self,
+        _cx: &mut Context<'_>,
+        req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        let flags = req.payload().read_u32()?;
+        if !PROXY_FLAGS_ACCEPTED.contains(&flags) {
+            tracing::debug!(
+                flags,
+                "appletOE: OpenApplicationProxyWithFlags refuses its flags"
+            );
+            return Err(UNKNOWN.into());
+        }
+        Self::open_proxy(req, reply)
+    }
+
+    /// What `OpenApplicationProxy` does, and `OpenApplicationProxyWithFlags` once its flags are
+    /// accepted: checks the process id, then the process handle, then returns the proxy.
+    fn open_proxy(req: &Request<'_>, reply: &mut Reply) -> Outcome {
         let Some(aruid) = req.process_id() else {
             return Err(UNKNOWN.into());
         };
@@ -829,6 +1067,29 @@ impl IApplicationProxy {
         reply: &mut Reply,
     ) -> Outcome {
         reply.push_session(Box::new(IApplicationFunctions));
+        reply.ok()
+    }
+
+    /// `GetPerformanceFunctions` (Switch 2). out: an [`IPerformanceFunctions`].
+    fn get_performance_functions(
+        _: &mut Self,
+        _cx: &mut Context<'_>,
+        _req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        reply.push_session(Box::new(IPerformanceFunctions));
+        reply.ok()
+    }
+
+    /// `GetGraphicsScalingParametersFunctions` (Switch 2). out: an
+    /// [`IGraphicsScalingParametersFunctions`].
+    fn get_graphics_scaling_parameters_functions(
+        _: &mut Self,
+        _cx: &mut Context<'_>,
+        _req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        reply.push_session(Box::new(IGraphicsScalingParametersFunctions));
         reply.ok()
     }
 
@@ -1055,6 +1316,58 @@ impl IApplicationFunctions {
         reply.payload().write_u8(u8::from(true));
         reply.ok()
     }
+
+    /// `GetScreenShotAndContinuousRecordingInitiallyEnabled` (Switch 2). out: `bool screenshot,
+    /// bool recording`, a byte each (module docs, "The Switch 2 additions").
+    fn get_screen_shot_and_continuous_recording_initially_enabled(
+        _: &mut Self,
+        _cx: &mut Context<'_>,
+        _req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        reply
+            .payload()
+            .write_u8(u8::from(SCREENSHOT_INITIALLY_ENABLED))
+            .write_u8(u8::from(CONTINUOUS_RECORDING_INITIALLY_ENABLED));
+        reply.ok()
+    }
+
+    /// `Unknown321` (Switch 2). out: `bool`, [`UNKNOWN_321_ENABLED`].
+    fn unknown_321(
+        _: &mut Self,
+        _cx: &mut Context<'_>,
+        _req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        reply.payload().write_u8(u8::from(UNKNOWN_321_ENABLED));
+        reply.ok()
+    }
+}
+
+impl IGraphicsScalingParametersFunctions {
+    /// `GetGraphicsScalingParameters`. out: [`GraphicsScalingParameters::PR_4588`].
+    fn get_graphics_scaling_parameters(
+        _: &mut Self,
+        _cx: &mut Context<'_>,
+        _req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        GraphicsScalingParameters::PR_4588.write(reply.payload());
+        reply.ok()
+    }
+
+    /// `SetGraphicsScaleChangedNotificationEnabled`. in: `bool` enabled, kept in the applet.
+    fn set_graphics_scale_changed_notification_enabled(
+        _: &mut Self,
+        cx: &mut Context<'_>,
+        req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        let enabled = read_flag(&mut req.payload())?;
+        cx.family::<Applet>()?
+            .graphics_scale_changed_notification_enabled = enabled;
+        reply.ok()
+    }
 }
 
 /// The interfaces an `appletOE` server's sessions can be.
@@ -1071,6 +1384,8 @@ pub fn oe_interfaces() -> Interfaces {
         .with::<IDisplayController>()
         .with::<ILibraryAppletCreator>()
         .with::<IDebugFunctions>()
+        .with::<IPerformanceFunctions>()
+        .with::<IGraphicsScalingParametersFunctions>()
 }
 
 /// The `appletOE` server, for an application that reports `settings`, in a run without a
