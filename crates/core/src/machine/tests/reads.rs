@@ -26,6 +26,7 @@ use starquake_services::framework::{Executor, Finish, Job};
 use starquake_services::fsp::host::{CHANNEL, HostRequest, Mount};
 use starquake_services::fsp::{self, command};
 use starquake_services::sm::{self, MAX_NAME_LEN, ServiceName};
+use starquake_services::time;
 use starquake_trace::{EnvCall, EnvError, HostIoReply, HostIoRequest, HostNanos};
 
 use super::*;
@@ -678,12 +679,13 @@ impl Env for FailsHostIo {
     }
 }
 
-/// `sm:`'s `Initialize` and `GetService("fsp-srv")`, then the requests `fsp` makes, each sent
+/// `sm:`'s `Initialize` and `GetService(service)`, then the requests `requests` makes, each sent
 /// after the call before succeeded; then a step that says the guest ran again, and
 /// `ExitProcess`.
 fn guest_failed_by_its_environment(
     guest: &Script,
-    fsp: Vec<Writes>,
+    service: &'static str,
+    requests: Vec<Writes>,
     ran_again: &Rc<std::cell::Cell<bool>>,
 ) -> ScriptedVcpu {
     let name = guest.base + NAME_AT;
@@ -714,13 +716,13 @@ fn guest_failed_by_its_environment(
                 move |_| *sm_handle.borrow(),
                 |guest| {
                     guest.read_reply(0);
-                    let name: [u8; MAX_NAME_LEN] = ServiceName::new(fsp::NAME).unwrap().to_field();
+                    let name: [u8; MAX_NAME_LEN] = ServiceName::new(service).unwrap().to_field();
                     guest.write(&libnx(sm::command::GET_SERVICE).data(&name));
                 },
             ),
             svc(SvcId::SendSyncRequest),
         );
-    for write in fsp {
+    for write in requests {
         vcpu = vcpu.then(
             send(
                 guest,
@@ -737,10 +739,14 @@ fn guest_failed_by_its_environment(
     vcpu.then(move |_| ran_again.set(true), svc(SvcId::ExitProcess))
 }
 
-/// Runs `fsp`'s requests (see [`guest_failed_by_its_environment`]) with the title RomFS as the
-/// data storage, and the services `install` sets up; returns the report and whether the guest
-/// ran again after its last request.
-fn run_failed(fsp: Vec<Writes>, install: &Install) -> (RunReport, bool) {
+/// Runs `requests` to `service` (see [`guest_failed_by_its_environment`]) with the title RomFS
+/// as the data storage, and the services `install` sets up; returns the report and whether the
+/// guest ran again after its last request.
+fn run_failed(
+    service: &'static str,
+    requests: Vec<Writes>,
+    install: &Install,
+) -> (RunReport, bool) {
     let guest = super::Guest::new(&programs::hello().unwrap());
     let page = usize::try_from(crate::image::PAGE).unwrap();
     let tls = Arc::new(FlatMemory::new(guest.tls, page));
@@ -754,7 +760,7 @@ fn run_failed(fsp: Vec<Writes>, install: &Install) -> (RunReport, bool) {
         seen: Rc::new(RefCell::new(Seen::default())),
     };
     let ran_again = Rc::new(std::cell::Cell::new(false));
-    let mut main = guest_failed_by_its_environment(&view, fsp, &ran_again);
+    let mut main = guest_failed_by_its_environment(&view, service, requests, &ran_again);
     let options = RunOptions {
         timeout: Some(RUN_LIMIT),
         command_line: Vec::new(),
@@ -786,9 +792,61 @@ fn an_environment_failure_in_a_handler_stops_the_run() {
             command::fsp_srv::OPEN_DATA_STORAGE_BY_CURRENT_PROCESS,
         ));
     });
-    let (report, ran_again) = run_failed(vec![open], &install);
+    let (report, ran_again) = run_failed(fsp::NAME, vec![open], &install);
     let reason = "the environment failed fsp-srv while it handled a request: recording exhausted \
                   at record 9: the replay asked for HostIo";
+    assert_eq!(
+        report.exit,
+        ExitReason::EmulatorError(reason.to_owned()),
+        "{}",
+        report.trace
+    );
+    assert!(!ran_again, "the guest ran after the environment failed");
+}
+
+/// What [`FailsRandom`] answers every random draw with: a replay whose next record answers
+/// another kind of call.
+const RANDOM_FAILURE: EnvError = EnvError::Mismatch {
+    index: 4,
+    requested: EnvCall::Random,
+    recorded: EnvCall::Clock,
+};
+
+/// The run's environment, but with every random draw failed as a replay that disagrees would
+/// fail it.
+struct FailsRandom(Arc<dyn Env>);
+
+impl Env for FailsRandom {
+    fn now(&self) -> Result<HostNanos, EnvError> {
+        self.0.now()
+    }
+
+    fn random_u64(&self) -> Result<u64, EnvError> {
+        Err(RANDOM_FAILURE)
+    }
+
+    fn host_io(&self, request: &HostIoRequest) -> Result<HostIoReply, EnvError> {
+        self.0.host_io(request)
+    }
+}
+
+#[test]
+fn an_environment_failure_in_time_u_stops_the_run() {
+    // `time:u`'s set-up draws its clock source from an environment whose random draws fail:
+    // `GetSharedMemoryNativeHandle` stops the run, with the reason naming `time:u`, through the
+    // halt `crate::hle::install` gives it.
+    let install = |dispatcher: &Dispatcher, given: Given| {
+        let env: Arc<dyn Env> = Arc::new(FailsRandom(Arc::clone(&given.env)));
+        real_services(dispatcher, Given { env, ..given })
+    };
+    let get: Writes = Box::new(|guest| {
+        guest.write(&libnx(
+            time::command::static_service::GET_SHARED_MEMORY_NATIVE_HANDLE,
+        ));
+    });
+    let (report, ran_again) = run_failed(time::NAME, vec![get], &install);
+    let reason = "the environment failed time:u while it handled a request: record 4 answers \
+                  Clock but the replay asked for Random";
     assert_eq!(
         report.exit,
         ExitReason::EmulatorError(reason.to_owned()),
@@ -826,7 +884,7 @@ fn an_environment_failure_in_a_read_stops_the_run() {
             .receive_buffer(room(guest, 4));
         guest.write(&read);
     });
-    let (report, ran_again) = run_failed(vec![open, read], &install);
+    let (report, ran_again) = run_failed(fsp::NAME, vec![open, read], &install);
     let reason = "the environment failed file-system job 0: recording exhausted at record 9: \
                   the replay asked for HostIo";
     assert_eq!(
@@ -927,7 +985,7 @@ fn a_halt_no_delivery_follows_stops_a_guest_waiting_for_its_reply() {
         guest.write(&read);
     });
     let started = Instant::now();
-    let (report, ran_again) = run_failed(vec![open, read], &install);
+    let (report, ran_again) = run_failed(fsp::NAME, vec![open, read], &install);
     let reason = "the environment failed file-system job 0: recording exhausted at record 9: \
                   the replay asked for HostIo";
     assert_eq!(
