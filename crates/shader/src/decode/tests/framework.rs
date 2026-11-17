@@ -290,9 +290,10 @@ fn predicates_at_the_edges_of_their_encoding() {
 /// checked directly.
 #[test]
 fn uniform_predicates_at_the_edges_of_their_encoding() {
-    let reg_field = Field::new(87, 3);
+    let reg_field = Field::new(87, UniformPred::BITS);
     let not_field = Field::bit(90);
     let last = UniformPred::UPT.index();
+    assert_eq!(u64::from(last), (1 << UniformPred::BITS) - 1);
     for (index, negated, text) in [
         (0, false, "up0"),
         (last - 1, true, "!up6"),

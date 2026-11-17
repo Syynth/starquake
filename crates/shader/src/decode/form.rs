@@ -195,7 +195,7 @@ impl Reader {
         }
     }
 
-    /// Reads a uniform predicate field (three bits) and its negation bit.
+    /// Reads a uniform predicate field ([`UniformPred::BITS`] wide) and its negation bit.
     #[cfg_attr(
         not(test),
         expect(
@@ -205,7 +205,7 @@ impl Reader {
     )]
     pub(crate) fn uniform_pred_src(&mut self, reg: Field, not: Field) -> UniformPredSrc {
         UniformPredSrc {
-            // Cannot fail for a three-bit field.
+            // Cannot fail for a field of `UniformPred::BITS`.
             reg: UniformPred::new(self.byte(reg)).unwrap_or(UniformPred::UPT),
             negated: self.flag(not),
         }

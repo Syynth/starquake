@@ -110,6 +110,9 @@ pub struct UniformPred(u8);
 impl UniformPred {
     /// `UPT`.
     pub const UPT: Self = Self(7);
+    /// The width of a uniform predicate field (`set_pred_reg`, which serves both predicate
+    /// files, asserts a 3-bit range).
+    pub const BITS: u32 = 3;
 
     /// Uniform predicate `index`, if it exists (`UPT` included).
     pub const fn new(index: u8) -> Option<Self> {
@@ -276,8 +279,8 @@ impl RoundMode {
         }
     }
 
-    /// The mode a two-bit encoding names; only the low two bits are read.
+    /// The mode an encoding names; only the low [`RoundMode::BITS`] bits are read.
     pub const fn from_bits(bits: u64) -> Self {
-        Self::ALL[(bits & 3) as usize]
+        Self::ALL[(bits & ((1 << Self::BITS) - 1)) as usize]
     }
 }
