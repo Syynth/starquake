@@ -11,14 +11,19 @@ use std::collections::BTreeSet;
 
 use proptest::prelude::*;
 use proptest::test_runner::{Config, RngAlgorithm, RngSeed};
-use starquake_ipc::{BUFFER_SIZE, Message, SessionKind, TIPC_COMMAND_OFFSET};
+use starquake_ipc::{
+    BUFFER_SIZE, CommandType, Message, RequestBuilder, SFCO_MAGIC, SessionKind, TIPC_COMMAND_OFFSET,
+};
 use starquake_kernel::handle::Handle;
 use starquake_kernel::id::ObjectId;
 use starquake_kernel::memory::{SharedPages, SvcPermission};
 use starquake_kernel::result::{KernelError, ResultCode, SvcResult};
+use starquake_kernel::slab::SlabId;
 use starquake_services::framework::fake::FakeKernel;
 use starquake_services::framework::result::INVALID_CMIF_REQUEST;
-use starquake_services::framework::{Handled, Kernel, Protocol, Session, UNKNOWN_COMMAND_ID};
+use starquake_services::framework::{
+    Family, Handled, Kernel, Protocol, Session, SnapshotError, StubbedCommand, UNKNOWN_COMMAND_ID,
+};
 use starquake_trace::{EventKind, IpcOutcome, ServiceId};
 
 use super::*;
@@ -329,6 +334,12 @@ fn every_root_command_s_reply_bytes() {
                     // It answers as a placeholder: by the server's policy.
                     let asked = rig.send_on(object, &[tipc_type(0), 0]);
                     assert_eq!(asked, result_only(0, UNKNOWN_COMMAND_ID), "{id}");
+                    // It records the command that handed it out: the snapshot holds a
+                    // placeholder whose saved state is this row's id.
+                    let saved = rig.server.save().unwrap();
+                    let row = saved_placeholder(id);
+                    let found = saved.windows(row.len()).any(|w| w == row.as_slice());
+                    assert!(found, "no placeholder saved with command {id}");
                 }
                 Handed::Event => assert_eq!(rig.kernel.signals(object), Some(0), "{id}"),
             }
@@ -337,6 +348,53 @@ fn every_root_command_s_reply_bytes() {
     // The header words written as PR checks them are the ones the ids make.
     assert_eq!(tipc_type(BIND_PROCESS), 0x1B);
     assert_eq!(tipc_type(CONFIGURE_NATIVE_MEMORY), 0x83);
+}
+
+/// A placeholder session as a server snapshot holds it: its interface's name and its saved
+/// state, each with its length (`SavedTarget::Interface` in the framework's `targets.rs`), for
+/// a placeholder handed out by command `id`.
+fn saved_placeholder(id: u32) -> Vec<u8> {
+    let name = Placeholder::interface().as_bytes();
+    let state = Placeholder { command: id }.save().unwrap();
+    let mut row = vec![u8::try_from(name.len()).unwrap()];
+    row.extend(name);
+    row.push(u8::try_from(state.len()).unwrap());
+    row.extend(state);
+    row
+}
+
+/// A CMIF request to the root, with a TIPC command's id in it, is answered by the server's
+/// unknown-command policy: the root's CMIF table is empty. The replies are CMIF replies on a
+/// plain session: the header (raw size 6), padding, `SFCO`, the version, the result, and the
+/// token.
+#[test]
+fn a_cmif_request_to_the_root_goes_to_the_policy() {
+    for (policy, result) in [
+        (UnknownPolicy::Strict, UNKNOWN_COMMAND_ID),
+        (UnknownPolicy::AutoStub, ResultCode::SUCCESS),
+    ] {
+        let mut rig = Rig::with(policy);
+        let mut buffer = vec![STALE; BUFFER_SIZE];
+        RequestBuilder::cmif(CommandType::Request, INITIALIZE)
+            .build(&mut buffer)
+            .unwrap();
+        let handled = rig.server.handle(&mut rig.kernel, rig.session, &mut buffer);
+        assert_eq!(handled, Ok(Handled::Replied), "{policy:?}");
+        let expected = buffer_of(&[0, 6, 0, 0, SFCO_MAGIC, 0, result.raw(), 0]);
+        assert_eq!(buffer, expected, "{policy:?}");
+        // Not the bootstrap's `Initialize`: nothing is recorded.
+        assert_eq!(rig.state(), RootState::new(), "{policy:?}");
+        let stubbed: Vec<_> = rig.server.stubbed().copied().collect();
+        let expected = match policy {
+            UnknownPolicy::Strict => vec![],
+            UnknownPolicy::AutoStub => vec![StubbedCommand {
+                interface: GsvRoot.name(),
+                protocol: Protocol::Cmif,
+                id: INITIALIZE,
+            }],
+        };
+        assert_eq!(stubbed, expected, "{policy:?}");
+    }
 }
 
 #[test]
@@ -776,6 +834,50 @@ impl Kernel for RefusesAfter {
     }
 }
 
+/// The listed divergence from NX2 ("The server"): a second root session, as a second 2000 makes,
+/// shares the first one's state. The bootstrap begun on one is carried on in order on the
+/// other, and both get the same two 204 events. In NX2 the second session would start in no
+/// phase of its own and make two events of its own.
+#[test]
+fn two_root_sessions_share_the_phase_and_the_syncpoint_events() {
+    let mut rig = Rig::new();
+    let second = rig.kernel.new_object();
+    rig.server.accept(second).unwrap();
+    assert_eq!(rig.initialize(&local()), success(INITIALIZE, &[], &[]));
+    let process = rig.process();
+    let bind = rig.send_on(
+        second,
+        &[tipc_type(BIND_PROCESS), SPECIAL, ONE_COPY, process],
+    );
+    assert_eq!(bind, success(BIND_PROCESS, &[], &[]));
+    // In order on the second session: the first session's 4 counts there.
+    assert_eq!(
+        (rig.state().phase(), rig.state().out_of_order()),
+        (Phase::ProcessBound, 0)
+    );
+    let words = [tipc_type(BIND_SYNCPOINT_MEMORY), 0];
+    let on_first = copied(&rig.send(&words));
+    let on_second = copied(&rig.send_on(second, &words));
+    let objects = |rig: &Rig, handles: &[u32]| -> Vec<ObjectId> {
+        let resolve = |h: &u32| rig.kernel.resolve_handle(Handle::from_raw(*h)).unwrap();
+        handles.iter().map(resolve).collect()
+    };
+    let made = objects(&rig, &on_first);
+    assert_eq!(made.len(), 2);
+    assert_eq!(objects(&rig, &on_second), made);
+    assert_eq!(
+        rig.state().syncpoint_events(),
+        SyncpointEvents::Both(made[0], made[1])
+    );
+    // 101 on the second session completes the bootstrap the first began.
+    let complete = rig.send_on(second, &[tipc_type(COMPLETE_BOOTSTRAP), 0]);
+    assert_eq!(complete, success(COMPLETE_BOOTSTRAP, &[], &[]));
+    assert_eq!(
+        (rig.state().phase(), rig.state().out_of_order()),
+        (Phase::Ready, 0)
+    );
+}
+
 /// Each session a stub hands out is a new one, recording the command that made it.
 #[test]
 fn each_session_stub_hands_out_a_new_placeholder() {
@@ -895,4 +997,253 @@ fn the_server_is_named_and_serves_tipc_only() {
     );
     assert_eq!(Phase::Ready.word(), "ready");
     assert_eq!(Mark::Conflict.word(), "conflict");
+}
+
+// ----- Saved layouts ---------------------------------------------------------------------------
+
+/// An object id with distinct, non-zero parts.
+fn object(index: u32, generation: u32) -> ObjectId {
+    ObjectId::from_parts(index, generation)
+}
+
+/// A bootstrap request whose six fields are `first`, `first + 1`, ... `first + 5`.
+fn counting_request(first: u64) -> BootstrapRequest {
+    BootstrapRequest {
+        applet_resource_user_id: first,
+        flags: first + 1,
+        parameters: [first + 2, first + 3, first + 4, first + 5],
+    }
+}
+
+/// The saved layouts of the root's state and sessions, as `postcard` writes them (field order,
+/// a variant's index, `Option`'s tag; every value here below 0x80, one byte each, except the
+/// placeholder's command). One state per phase, and each kind of syncpoint events among them,
+/// with every value distinct and non-zero where the state allows it (`Created` has no
+/// bootstrap and counts nothing). Each decodes back to itself.
+#[test]
+fn the_saved_root_layouts_are_pinned() {
+    let cases: [(RootState, &[u8]); 4] = [
+        (
+            RootState {
+                phase: Phase::Created,
+                bootstrap: None,
+                out_of_order: 0,
+                native_memory_mode: Some(0x0B),
+                syncpoint_events: SyncpointEvents::One(object(0x0C, 0x0D)),
+            },
+            // phase 0; no bootstrap; count 0; mode Some(0x0B); One(index, generation).
+            &[0, 0, 0, 1, 0x0B, 1, 0x0C, 0x0D],
+        ),
+        (
+            RootState {
+                phase: Phase::Initialized,
+                bootstrap: Some(counting_request(0x11)),
+                out_of_order: 0x17,
+                native_memory_mode: None,
+                syncpoint_events: SyncpointEvents::Both(object(0x18, 0x19), object(0x1A, 0x1B)),
+            },
+            // phase 1; Some(user id, flags, four parameters); count; no mode; Both(a, b).
+            &[
+                1, 1, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0, 2, 0x18, 0x19, 0x1A, 0x1B,
+            ],
+        ),
+        (
+            RootState {
+                phase: Phase::ProcessBound,
+                bootstrap: None,
+                out_of_order: 0x21,
+                native_memory_mode: Some(0x22),
+                syncpoint_events: SyncpointEvents::None,
+            },
+            // phase 2; no bootstrap; count; mode; no events.
+            &[2, 0, 0x21, 1, 0x22, 0],
+        ),
+        (
+            RootState {
+                phase: Phase::Ready,
+                bootstrap: Some(counting_request(0x31)),
+                out_of_order: 0x37,
+                native_memory_mode: Some(0x38),
+                syncpoint_events: SyncpointEvents::One(object(0x39, 0x3A)),
+            },
+            &[
+                3, 1, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 1, 0x38, 1, 0x39, 0x3A,
+            ],
+        ),
+    ];
+    for (state, bytes) in cases {
+        assert_eq!(state.save_state().unwrap(), bytes, "{state:?}");
+        let mut loaded = RootState::new();
+        loaded.load_state(bytes).unwrap();
+        assert_eq!(loaded, state);
+    }
+    // The placeholder: its command, 202 as a varint (0x4A | 0x80, then 1).
+    assert_eq!(GET_SYNCPOINT_SESSION, 0xCA);
+    let placeholder = Placeholder {
+        command: GET_SYNCPOINT_SESSION,
+    };
+    assert_eq!(placeholder.save().unwrap(), [0xCA, 0x01]);
+    // The root session keeps nothing.
+    assert_eq!(GsvRoot.save().unwrap(), Vec::<u8>::new());
+}
+
+/// Each saved state no sequence of commands reaches, and the error it is refused with: the
+/// first of them is the hostile snapshot that would hand out one event twice.
+fn unreachable_states() -> Vec<(RootState, RootStateError)> {
+    let reachable = RootState::new();
+    let event = object(0x0C, 0x0D);
+    vec![
+        (
+            RootState {
+                bootstrap: Some(local()),
+                out_of_order: 7,
+                syncpoint_events: SyncpointEvents::Both(event, event),
+                ..reachable
+            },
+            // Both faults: the phase's is reported first.
+            RootStateError::CreatedWithBootstrap,
+        ),
+        (
+            RootState {
+                bootstrap: Some(local()),
+                ..reachable
+            },
+            RootStateError::CreatedWithBootstrap,
+        ),
+        (
+            RootState {
+                out_of_order: 1,
+                ..reachable
+            },
+            RootStateError::CreatedWithCount { count: 1 },
+        ),
+        (
+            RootState {
+                phase: Phase::Initialized,
+                out_of_order: 1,
+                ..reachable
+            },
+            RootStateError::InitializedWithoutBootstrap,
+        ),
+        (
+            RootState {
+                phase: Phase::ProcessBound,
+                ..reachable
+            },
+            RootStateError::UncountedWithoutBootstrap,
+        ),
+        (
+            RootState {
+                phase: Phase::Ready,
+                ..reachable
+            },
+            RootStateError::UncountedWithoutBootstrap,
+        ),
+        (
+            RootState {
+                syncpoint_events: SyncpointEvents::Both(event, event),
+                ..reachable
+            },
+            RootStateError::SameSyncpointEvents,
+        ),
+    ]
+}
+
+/// The saved form of `state`, field for field.
+fn saved(state: RootState) -> SavedRootState {
+    SavedRootState {
+        phase: state.phase,
+        bootstrap: state.bootstrap,
+        out_of_order: state.out_of_order,
+        native_memory_mode: state.native_memory_mode,
+        syncpoint_events: state.syncpoint_events,
+    }
+}
+
+#[test]
+fn a_saved_state_no_command_reaches_is_refused() {
+    for (state, error) in unreachable_states() {
+        assert_eq!(RootState::try_from(saved(state)), Err(error), "{state:?}");
+        // Through a whole server snapshot: refused, and the server is left as it was.
+        let bytes = root_server(UnknownPolicy::Strict)
+            .with_family(state)
+            .save()
+            .unwrap();
+        let mut restored = root_server(UnknownPolicy::Strict);
+        let refused = SnapshotError::Decode(postcard::Error::SerdeDeCustom);
+        assert_eq!(restored.restore(&bytes), Err(refused), "{state:?}");
+        assert_eq!(restored.family::<RootState>(), Some(&RootState::new()));
+    }
+}
+
+/// Each relation's edge, on the side that is reachable: accepted as it is.
+#[test]
+fn a_saved_state_at_each_edge_is_accepted() {
+    let reachable = RootState::new();
+    let cases = [
+        reachable,
+        RootState {
+            phase: Phase::Initialized,
+            bootstrap: Some(local()),
+            ..reachable
+        },
+        RootState {
+            phase: Phase::ProcessBound,
+            out_of_order: 1,
+            ..reachable
+        },
+        RootState {
+            phase: Phase::Ready,
+            out_of_order: 1,
+            ..reachable
+        },
+        RootState {
+            phase: Phase::Ready,
+            bootstrap: Some(local()),
+            ..reachable
+        },
+        RootState {
+            syncpoint_events: SyncpointEvents::Both(object(1, 0), object(1, 1)),
+            ..reachable
+        },
+    ];
+    for state in cases {
+        assert_eq!(RootState::try_from(saved(state)), Ok(state), "{state:?}");
+        let bytes = root_server(UnknownPolicy::Strict)
+            .with_family(state)
+            .save()
+            .unwrap();
+        let mut restored = root_server(UnknownPolicy::Strict);
+        restored.restore(&bytes).unwrap();
+        assert_eq!(restored.family::<RootState>(), Some(&state));
+    }
+}
+
+#[test]
+fn a_refused_state_is_said_in_plain_words() {
+    let said = [
+        (
+            RootStateError::CreatedWithBootstrap,
+            "a root that no bootstrap command has reached has a recorded bootstrap",
+        ),
+        (
+            RootStateError::CreatedWithCount { count: 7 },
+            "a root that no bootstrap command has reached has counted 7 out of order",
+        ),
+        (
+            RootStateError::InitializedWithoutBootstrap,
+            "an initialized root has no recorded bootstrap",
+        ),
+        (
+            RootStateError::UncountedWithoutBootstrap,
+            "a root that left the created phase without a bootstrap has counted nothing out of order",
+        ),
+        (
+            RootStateError::SameSyncpointEvents,
+            "the two syncpoint events are the same object",
+        ),
+    ];
+    for (error, words) in said {
+        assert_eq!(error.to_string(), words);
+    }
 }

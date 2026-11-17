@@ -15,12 +15,21 @@
 //! (decision 6). It is a private entry of the service registry under [`ROOT_NAME`], which no
 //! title can open through `sm:`; whoever puts the services together gives its number to `am`
 //! (`starquake_services::am`, "The graphics server"). Every session on it is a [`GsvRoot`], and
-//! all of them share one [`RootState`], the server's family state: a run has one process, and
-//! the state is per process in both references.
+//! all of them share one [`RootState`], the server's family state. This matches PR, where `am`'s
+//! `ISelfController` keeps the root session it made on the first 2000
+//! (`m_graphics_supervisor_session`) and hands that same session out on every later one, so
+//! there is one root state. It does not match NX2: `am` makes a new
+//! `INx2GraphicsSystemSession` on every 2000
+//! (`eden-nx2/src/core/hle/service/am/service/self_controller.cpp` @ 50fa86bb,
+//! `GetNx2GraphicsSystemSession`), and each session owns its own `m_objects` and
+//! `m_syncpt_events` (`eden-nx2/src/core/hle/service/nx2_gsv.h`), so a second NX2 session
+//! starts fresh. Here a second root session sees the first one's phase, out-of-order count and
+//! 204 events (listed under "Where this differs from the references").
 //!
 //! Every command is TIPC, as in both references (PR `RegisterHandlersTipc`; NX2
-//! `RegisterHandlersTipc`): a CMIF request, and a TIPC command the table does not list, is
-//! answered by the server's unknown-command policy.
+//! `RegisterHandlersTipc`): a CMIF request (`a_cmif_request_to_the_root_goes_to_the_policy`),
+//! and a TIPC command the table does not list, is answered by the server's unknown-command
+//! policy.
 //!
 //! # The bootstrap
 //!
@@ -77,6 +86,7 @@
 //! | 115 with a mode other than 0 or 2 | `ResultInvalidCombination` | not in its table: auto-stubbed, success | success, the mode recorded, logged (`configure_native_memory_records_any_mode`) |
 //! | 126, 115 and the stubs before the bootstrap is complete | `ResultInvalidState` for most | success | success, the phase logged (`every_root_command_s_reply_bytes`, sent before any bootstrap) |
 //! | A TIPC command the table does not list | `ResultNotImplemented` | auto-stubbed | the server's unknown-command policy (`a_command_the_table_does_not_list_goes_to_the_policy`) |
+//! | A second root session (a second 2000) | the same session as the first: one state | a new session with its own `m_objects` and `m_syncpt_events` | a new session that shares the first one's [`RootState`]: its phase, its out-of-order count and 204's two events (`two_root_sessions_share_the_phase_and_the_syncpoint_events`) |
 
 use serde::{Deserialize, Serialize};
 use starquake_kernel::id::ObjectId;
@@ -192,15 +202,100 @@ pub enum SyncpointEvents {
 }
 
 /// What every root session shares: the root server's family state. Plain data, saved in the
-/// server's snapshot; every value of every field is a state the root can reach, so restoring
-/// checks nothing beyond the types.
+/// server's snapshot. Deserialising goes through `SavedRootState`, which refuses a state the
+/// root's commands cannot reach ([`RootStateError`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "SavedRootState")]
 pub struct RootState {
     phase: Phase,
     bootstrap: Option<BootstrapRequest>,
     out_of_order: u32,
     native_memory_mode: Option<u64>,
     syncpoint_events: SyncpointEvents,
+}
+
+/// The serialised form of [`RootState`], field for field, and what deserialising validates.
+#[derive(Deserialize)]
+struct SavedRootState {
+    phase: Phase,
+    bootstrap: Option<BootstrapRequest>,
+    out_of_order: u32,
+    native_memory_mode: Option<u64>,
+    syncpoint_events: SyncpointEvents,
+}
+
+/// Why a saved [`RootState`] could not be read back: it holds a combination of fields that no
+/// sequence of root commands leads to. The phase only ever leaves [`Phase::Created`] (no
+/// command steps back to it), only `Initialize` (4) enters [`Phase::Initialized`] and records
+/// a bootstrap, the first of 11 and 101 sent before any 4 is out of PR's order, and 204 makes
+/// two distinct events. These are every relation between the fields; the native memory mode
+/// and a lone 204 event may be anything in any phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum RootStateError {
+    /// [`Phase::Created`] with a bootstrap recorded: 4 moves the phase out of `Created`.
+    #[error("a root that no bootstrap command has reached has a recorded bootstrap")]
+    CreatedWithBootstrap,
+    /// [`Phase::Created`] with out-of-order commands counted: each counted command moves the
+    /// phase out of `Created`.
+    #[error("a root that no bootstrap command has reached has counted {count} out of order")]
+    CreatedWithCount {
+        /// The count in the data.
+        count: u32,
+    },
+    /// [`Phase::Initialized`] with no bootstrap recorded: only 4 leads there, and it records
+    /// one.
+    #[error("an initialized root has no recorded bootstrap")]
+    InitializedWithoutBootstrap,
+    /// Past [`Phase::Created`] with no bootstrap and nothing counted: with no 4 sent, the
+    /// phase left `Created` through 11 or 101, which are out of order there.
+    #[error(
+        "a root that left the created phase without a bootstrap has counted nothing out of order"
+    )]
+    UncountedWithoutBootstrap,
+    /// 204's two events are one object: it makes two.
+    #[error("the two syncpoint events are the same object")]
+    SameSyncpointEvents,
+}
+
+impl TryFrom<SavedRootState> for RootState {
+    type Error = RootStateError;
+
+    fn try_from(saved: SavedRootState) -> Result<Self, Self::Error> {
+        let SavedRootState {
+            phase,
+            bootstrap,
+            out_of_order,
+            native_memory_mode,
+            syncpoint_events,
+        } = saved;
+        match (phase, bootstrap.is_some()) {
+            (Phase::Created, true) => return Err(RootStateError::CreatedWithBootstrap),
+            (Phase::Created, false) if out_of_order != 0 => {
+                return Err(RootStateError::CreatedWithCount {
+                    count: out_of_order,
+                });
+            }
+            (Phase::Initialized, false) => {
+                return Err(RootStateError::InitializedWithoutBootstrap);
+            }
+            (Phase::ProcessBound | Phase::Ready, false) if out_of_order == 0 => {
+                return Err(RootStateError::UncountedWithoutBootstrap);
+            }
+            _ => {}
+        }
+        if let SyncpointEvents::Both(first, second) = syncpoint_events
+            && first == second
+        {
+            return Err(RootStateError::SameSyncpointEvents);
+        }
+        Ok(Self {
+            phase,
+            bootstrap,
+            out_of_order,
+            native_memory_mode,
+            syncpoint_events,
+        })
+    }
 }
 
 impl Default for RootState {

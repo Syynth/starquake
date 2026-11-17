@@ -350,8 +350,8 @@ pub const ROOT_COMMANDS: &[RootCommand] = &[
     row(DESTROY_NATIVE_IMAGE, "DestroyNativeImage", Observed, "rows 33, 47; PR and NX2 DestroyNativeImage", NONE, 0),
     row(CALCULATE_NATIVE_IMAGE_SIZE, "CalculateNativeImageSize", Observed, "rows 33, 47; PR CalculateImageRequirements (435); NX2 CalculateNativeImageSize", NONE, 2),
     row(CALCULATE_IMAGE_REQUIREMENTS, "CalculateImageRequirements", Observed, "rows 33, 47; PR CalculateImageRequirements; NX2 CalculateRequirements", NONE, 4),
-    row(DESTROY_NATIVE_WINDOW_ALIAS_IMAGE_POOL, "DestroyNativeWindowAliasImagePool", Observed, "rows 33, 47; PR and NX2 ConfigureNativeWindowImagePool (314)", NONE, 0),
-    row(CREATE_NATIVE_WINDOW_ALIAS_IMAGE_POOL, "CreateNativeWindowAliasImagePool", Observed, "rows 33, 47; PR and NX2 ConfigureNativeWindowImagePool (315)", NONE, 0),
+    row(DESTROY_NATIVE_WINDOW_ALIAS_IMAGE_POOL, "DestroyNativeWindowAliasImagePool", Observed, "rows 33, 47; PR ConfigureNativeWindowImagePool, NX2 ConfigureWindowImagePool (314)", NONE, 0),
+    row(CREATE_NATIVE_WINDOW_ALIAS_IMAGE_POOL, "CreateNativeWindowAliasImagePool", Observed, "rows 33, 47; PR ConfigureNativeWindowImagePool, NX2 ConfigureWindowImagePool (315)", NONE, 0),
     // Native images for the GPU: 426 and 428 push a u64 address, a u64 last address, sixteen
     // u64 descriptor words and a u32 zero.
     row(MAP_NATIVE_GPU_IMAGE, "MapNativeGpuImage", Read, "PR MapVideoGpuImage (426)", NONE, 2 + 2 + 16 * 2 + 1),
