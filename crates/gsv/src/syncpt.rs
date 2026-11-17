@@ -58,7 +58,10 @@
 //! - **21** refuses a count above [`MAXIMUM_EVENT_COUNT`] with `InvalidCombination` (PR:
 //!   `packet[2] <= MaximumEventCount`), changing nothing. Otherwise every slot from the count up
 //!   to [`MAXIMUM_EVENT_COUNT`] loses its armed wait and its event, if it has one, is cleared
-//!   (PR: `m_waits[slot].reset(); m_events[slot]->Clear(kernel)`), and the count is set. A
+//!   (PR: `m_waits[slot].reset(); m_events[slot]->Clear(kernel)`), and the count is set. If
+//!   the kernel refuses to clear one of the events, the others are still cleared, every one of
+//!   those slots still loses its wait, the count is still set, and the reply is the kernel's
+//!   error (`a_refused_clear_still_leaves_every_slot_from_the_count_up_without_a_wait`). A
 //!   session starts with a count of 0 (PR `m_event_count{}`).
 //! - **22** refuses a slot at or above the count with `InvalidArgument` (PR); otherwise it
 //!   makes the slot's event the first time any command needs it, and hands it out, copied.

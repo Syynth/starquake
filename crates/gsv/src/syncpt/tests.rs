@@ -766,12 +766,26 @@ fn cancel_makes_and_signals_an_event_no_command_made() {
 
 // ----- The lock order -------------------------------------------------------------------------------
 
-/// A kernel that answers as the fake does, and notes, for each event clear and signal, whether
+/// A kernel that answers as the fake does, but refuses to clear the events in `refused` (as the
+/// kernel refuses an id it does not have), and notes, for each event clear and signal, whether
 /// gsv's shared lock was held.
 struct Checking {
     inner: FakeKernel,
     shared: Arc<Shared>,
     calls: Vec<(&'static str, bool)>,
+    refused: Vec<ObjectId>,
+}
+
+impl Checking {
+    fn over(rig: Rig) -> (Self, Server, ObjectId) {
+        let kernel = Self {
+            inner: rig.kernel,
+            shared: rig.shared,
+            calls: Vec::new(),
+            refused: Vec::new(),
+        };
+        (kernel, rig.server, rig.session)
+    }
 }
 
 impl Kernel for Checking {
@@ -798,6 +812,9 @@ impl Kernel for Checking {
 
     fn clear_event(&mut self, event: ObjectId) -> SvcResult<()> {
         self.calls.push(("clear", self.shared.lock_is_held()));
+        if self.refused.contains(&event) {
+            return Err(KernelError::InvalidHandle);
+        }
         self.inner.clear_event(event)
     }
 
@@ -834,22 +851,22 @@ impl Kernel for Checking {
     }
 }
 
+/// Sends `words` on `session` of `server` through `kernel`; the message buffer afterwards.
+fn send_through(
+    server: &mut Server,
+    kernel: &mut Checking,
+    session: ObjectId,
+    words: &[u32],
+) -> Vec<u8> {
+    let mut buffer = buffer_of(words);
+    server.handle(kernel, session, &mut buffer).unwrap();
+    buffer
+}
+
 #[test]
 fn arm_and_cancel_call_the_kernel_with_the_shared_lock_held() {
-    let rig = Rig::counted();
-    let mut kernel = Checking {
-        inner: rig.kernel,
-        shared: Arc::clone(&rig.shared),
-        calls: Vec::new(),
-    };
-    let mut server = rig.server;
-    let mut send = |words: &[u32]| {
-        let mut buffer = buffer_of(words);
-        server
-            .handle(&mut kernel, rig.session, &mut buffer)
-            .unwrap();
-        buffer
-    };
+    let (mut kernel, mut server, session) = Checking::over(Rig::counted());
+    let mut send = |words: &[u32]| send_through(&mut server, &mut kernel, session, words);
     assert_eq!(send(&arm_wait(0, counter(SP), 1, 0)), ok(ARM_WAIT));
     assert_eq!(send(&cancel_wait(0)), ok(CANCEL_WAIT));
     assert_eq!(send(&arm_wait(0, !SYNCPOINT_COUNT, 1, 0)), ok(ARM_WAIT));
@@ -864,7 +881,42 @@ fn arm_and_cancel_call_the_kernel_with_the_shared_lock_held() {
         ]
     );
     // And released after each.
-    assert!(!rig.shared.lock_is_held());
+    assert!(!kernel.shared.lock_is_held());
+}
+
+#[test]
+fn a_refused_clear_still_leaves_every_slot_from_the_count_up_without_a_wait() {
+    let (mut kernel, mut server, session) = Checking::over(Rig::counted());
+    let mut events = Vec::new();
+    for slot in [3, 4, 5] {
+        let reply = send_through(&mut server, &mut kernel, session, &get_event(slot));
+        let handle = Handle::from_raw(copied(&reply)[0]);
+        events.push(kernel.resolve_handle(handle).unwrap());
+        let arm = arm_wait(slot, counter(SP), 9, 0);
+        assert_eq!(
+            send_through(&mut server, &mut kernel, session, &arm),
+            ok(ARM_WAIT)
+        );
+        Kernel::signal_event(&mut kernel.inner, *events.last().unwrap()).unwrap();
+    }
+    // The kernel refuses the first of the two clears: the reply is its error, and both slots
+    // lose their waits, and the second is still cleared.
+    kernel.refused.push(events[1]);
+    assert_eq!(
+        send_through(&mut server, &mut kernel, session, &set_event_count(4)),
+        refused(SET_EVENT_COUNT, KernelError::InvalidHandle)
+    );
+    let shared = Arc::clone(&kernel.shared);
+    assert!(shared.lock().waiters().get(events[0]).is_some());
+    assert_eq!(shared.lock().waiters().get(events[1]), None);
+    assert_eq!(shared.lock().waiters().get(events[2]), None);
+    assert_eq!(kernel.inner.is_signalled(events[2]), Some(false));
+    assert_eq!(kernel.inner.is_signalled(events[0]), Some(true));
+    // The count was set.
+    assert_eq!(
+        send_through(&mut server, &mut kernel, session, &get_event(4)),
+        refused(GET_EVENT, KernelError::InvalidArgument)
+    );
 }
 
 // ----- Sessions, recording and snapshots ------------------------------------------------------------
