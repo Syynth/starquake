@@ -179,6 +179,57 @@ delegation that let the lead promote proposals ended with milestone 1, so everyt
   address-space recording row above.
 - The wave 9 rows (run a title, RomFS from NUP, a narrow title API in `core`) stand as written.
 
+### From waves 17 and 18 (ledger: #22)
+
+Filed from these waves under the delegation: #177, #178, #179–#194 (graphics-server slices), #199,
+#200 and #203. #33 is retargeted to M2. The rest:
+
+| Status | Proposal | Why | Suggested |
+|---|---|---|---|
+| promoted #208 (lead, under delegation) | **Charge a process's system resource (META 0x14) to its pool**, as Eden's `KProcess::Initialize` does; check `svc` info process handles against `ProcessRecord::object` | `GetInfo` over-reports free memory, and #178's fit check documents the gap | area:kernel, M2 |
+| proposed (fold into #161's build hint) | **`FakeKernel::resolve_handle` models handle translation** | So a services test can send libnx's exact `OpenApplicationProxy` with `CURRENT_PROCESS` | area:services, M2 |
+| proposed | **Size the stage-1 table pool with guest RAM** (a fixed 4 MiB today) and settle the 16 MiB working-RAM guess | A larger title runs out of table pages before RAM; may need an owner decision on sizing to the whole application pool | area:cpu, M2 |
+| proposed | **Export the NSO header offsets** from the loader; a trampolined-program RAM-sizing test once #203 lands | `crates/core/tests/guest_ram.rs` restates the `.bss` offset | area:loader |
+| proposed | **The kernel half of `WriteWatch`**: arm every taken request, take and protect under the fault path's lock, range-wide invalidation, a cancel path | #197 documents the two promises the kernel must keep | area:kernel, M3 |
+| proposed | **The `RawView` host-access type** in the memory crate | `GpuMemory::view` waits on it; needs `unsafe` and volatile or atomic accessors | area:memory, M3 |
+| proposed | **G16/G17 caches re-read a range on first use after arming; G22 takes `GpuMemory::generation` from `Translate::generation`** | Review notes on #197 | area:gpu, M3 |
+| proposed (fold into the decoder slice issues 6a–6i) | **Shader decoder follow-ups**: fp16 swizzle and source-2 modifier bits; uniform ALU forms; encodings for JMX, UP2UR and BPT; owners for IMAD.HI, ERRBAR, ATOMS.POPC and BCLEAR; the shared bit-91 list in the framework tests | Review notes on #201 | area:shader, M3 |
+| proposed | **`docs/architecture.md`'s walking-skeleton paragraph** names `System::from_nup` and NUP titles | Skipped in #173 as outside its files | docs |
+
+### From waves 19 and 20 (ledger: #22)
+
+Filed from these waves under the delegation: #215, #216, #221, #223–#226. Review notes for
+graphics-server slice 7 are on #185, and the owner's hook and unlock rulings are on #183 and
+#185.
+
+| Status | Proposal | Why | Suggested |
+|---|---|---|---|
+| ruled (lead, under delegation) | **`GetInfo` ids 29–33 follow PR #4588's values**, each marked as a guess with its citation and what would confirm it (#223) | The title stops at id 29. The kernel spec says the ids land citing the scoping doc; the only reference that answers them is PR #4588, and a guess marker keeps it honest | area:kernel, M2 |
+| awaiting the owner | **Spec note: shared mappings write their stage-1 entries eagerly** | #218 backs a shared mapping's every page at map time; the execution model spec says pages are backed on first touch | execution model |
+| awaiting the owner | **Graphics-server verification item 1 gains the 211-overlap, kind, exact-match and root 115 conflicts**, and a ruling on whether a 211 over a live mapping is refused or ordered | Found building GpuVm (#217) and the root (#219); decision 8's house rule applies until then | gsv |
+| proposed | **Kernel tests pin `QueryMemory` reporting GeneratedCode as 0x14 and `SetProcessMemoryPermission` requiring FlagCode**; a trampoline and code-memory test once `ControlCodeMemory` lands | Review of #211 | area:kernel |
+| proposed | **A fixed-length body for the Syncpoints snapshot** | Review of #212; low priority | area:gpu |
+| proposed | **Service framework: a session-close notification** (a closed `IAppletResource` frees its row as Eden's destructor does) **and a ruling on short CMIF payloads** (a 0- or 4-byte `ToCalendarTimeWithMyRule` payload answers success because the reader reads padding) | Review of #213 | area:services |
+| later (not M2) | **Cross-process shared memory** (system-wide guest RAM and shared-run records) and **`Break` terminating one process in a multi-process kernel** | #218 and #222 document both limits | area:kernel |
+
+### From wave 21 (ledger: #22)
+
+Filed from this wave under the delegation: #232 (every `GetInfo` id Eden answers; the title stops
+at id 22), #233 (the device-share release token, which blocks #185) and #234 (a process end asked
+during a timer-thread delivery). Notes for #182, #183, #185, #194 and #208 are comments on those
+issues.
+
+| Status | Proposal | Why | Suggested |
+|---|---|---|---|
+| awaiting the owner | **The Switch 1 caller gate for `GetInfo` ids 29–33** | #223 refuses them to a Switch 1 caller with `InvalidEnumValue`; PR #4588 has no gate. The two exact cases where the answers differ are listed in `crates/kernel/src/svc/info.rs` | area:kernel |
+| awaiting the owner | **What "the stack" is for a crash backtrace walk** | #206 walks the user read-write block that holds sp, falling back to the one that holds x29 when sp has left the stack. That is a guess, marked as one | area:core |
+| awaiting the owner | **Monotonicity of drained syncpoint values** | #181 documents that drained values can go backwards (push 5, drain, push 4, drain) rather than remember each id's last value, which would compare wrongly after 2^31 increments | gsv |
+| awaiting the owner | **What a failed completion drain does**, and **the encoding of multi-field service notes and their coalescing rule** | Not settled by graphics-server.md; needed by #194 | gsv |
+| awaiting the owner | **An end asked by a handler that then fails**: #199 honours it (pinned by `an_end_asked_by_a_handler_that_then_fails_is_honoured`) | The services spec says the end runs after the reply; it does not say what happens when the handler then returns an error | services |
+| proposed | **A test-only `Processes` constructor whose own row is not first** | `Processes::own` is always the first row, so `GetInfo` and other callers cannot be tested with a non-default caller id, against the house rule on lookups | area:kernel, M2 |
+| proposed | **Crash-report extras**: backtraces for every thread, captured at crash time; suspend flags and wait targets; symbols; each thread's last events; a test for `Scheduler::threads()` | Scope review of #206 | area:core, M3 |
+| proposed | **Correct the record that PR #4588 is the only reference for ids 29–33** where a second source turns up | Scope review of #223 | docs |
+
 ## House-rule candidates
 
 Rules distilled from review findings. A vetted rule moves into `CLAUDE.md`; until then it is
@@ -269,35 +320,11 @@ passed to build agents as a provisional rule for the next wave.
 | proposed | When a shared resource is taken out and its lock released, the admission logic must know it is out; pin it with a threaded test that sends a second request meanwhile. |
 | dropped: covered by existing rules | Mutation-check new bounds; back every stated invariant with an assertion; test documented orderings with two competing items; grep the code before stating a docs claim. |
 
-### From waves 17 and 18 (ledger: #22)
+### From wave 21 (ledger: #22)
 
-Filed from these waves under the delegation: #177, #178, #179–#194 (graphics-server slices), #199,
-#200 and #203. #33 is retargeted to M2. The rest:
-
-| Status | Proposal | Why | Suggested |
-|---|---|---|---|
-| promoted #208 (lead, under delegation) | **Charge a process's system resource (META 0x14) to its pool**, as Eden's `KProcess::Initialize` does; check `svc` info process handles against `ProcessRecord::object` | `GetInfo` over-reports free memory, and #178's fit check documents the gap | area:kernel, M2 |
-| proposed (fold into #161's build hint) | **`FakeKernel::resolve_handle` models handle translation** | So a services test can send libnx's exact `OpenApplicationProxy` with `CURRENT_PROCESS` | area:services, M2 |
-| proposed | **Size the stage-1 table pool with guest RAM** (a fixed 4 MiB today) and settle the 16 MiB working-RAM guess | A larger title runs out of table pages before RAM; may need an owner decision on sizing to the whole application pool | area:cpu, M2 |
-| proposed | **Export the NSO header offsets** from the loader; a trampolined-program RAM-sizing test once #203 lands | `crates/core/tests/guest_ram.rs` restates the `.bss` offset | area:loader |
-| proposed | **The kernel half of `WriteWatch`**: arm every taken request, take and protect under the fault path's lock, range-wide invalidation, a cancel path | #197 documents the two promises the kernel must keep | area:kernel, M3 |
-| proposed | **The `RawView` host-access type** in the memory crate | `GpuMemory::view` waits on it; needs `unsafe` and volatile or atomic accessors | area:memory, M3 |
-| proposed | **G16/G17 caches re-read a range on first use after arming; G22 takes `GpuMemory::generation` from `Translate::generation`** | Review notes on #197 | area:gpu, M3 |
-| proposed (fold into the decoder slice issues 6a–6i) | **Shader decoder follow-ups**: fp16 swizzle and source-2 modifier bits; uniform ALU forms; encodings for JMX, UP2UR and BPT; owners for IMAD.HI, ERRBAR, ATOMS.POPC and BCLEAR; the shared bit-91 list in the framework tests | Review notes on #201 | area:shader, M3 |
-| proposed | **`docs/architecture.md`'s walking-skeleton paragraph** names `System::from_nup` and NUP titles | Skipped in #173 as outside its files | docs |
-
-### From waves 19 and 20 (ledger: #22)
-
-Filed from these waves under the delegation: #215, #216, #221, #223–#226. Review notes for
-graphics-server slice 7 are on #185, and the owner's hook and unlock rulings are on #183 and
-#185.
-
-| Status | Proposal | Why | Suggested |
-|---|---|---|---|
-| ruled (lead, under delegation) | **`GetInfo` ids 29–33 follow PR #4588's values**, each marked as a guess with its citation and what would confirm it (#223) | The title stops at id 29. The kernel spec says the ids land citing the scoping doc; the only reference that answers them is PR #4588, and a guess marker keeps it honest | area:kernel, M2 |
-| awaiting the owner | **Spec note: shared mappings write their stage-1 entries eagerly** | #218 backs a shared mapping's every page at map time; the execution model spec says pages are backed on first touch | execution model |
-| awaiting the owner | **Graphics-server verification item 1 gains the 211-overlap, kind, exact-match and root 115 conflicts**, and a ruling on whether a 211 over a live mapping is refused or ordered | Found building GpuVm (#217) and the root (#219); decision 8's house rule applies until then | gsv |
-| proposed | **Kernel tests pin `QueryMemory` reporting GeneratedCode as 0x14 and `SetProcessMemoryPermission` requiring FlagCode**; a trampoline and code-memory test once `ControlCodeMemory` lands | Review of #211 | area:kernel |
-| proposed | **A fixed-length body for the Syncpoints snapshot** | Review of #212; low priority | area:gpu |
-| proposed | **Service framework: a session-close notification** (a closed `IAppletResource` frees its row as Eden's destructor does) **and a ruling on short CMIF payloads** (a 0- or 4-byte `ToCalendarTimeWithMyRule` payload answers success because the reader reads padding) | Review of #213 | area:services |
-| later (not M2) | **Cross-process shared memory** (system-wide guest RAM and shared-run records) and **`Break` terminating one process in a multi-process kernel** | #218 and #222 document both limits | area:kernel |
+| Status | Candidate |
+|---|---|
+| proposed | Give every test double the real implementation's contract, with a parity test that runs one scenario on both; list and pin each difference. |
+| proposed | Pin every documented concurrency property (lock order, callbacks with no lock held, latched wakes) with a bounded-timeout threaded test, mutation-checked. |
+| proposed | A queue or map that coalesces or reorders states its exact ordering and monotonicity guarantee, checked by a model test that interleaves entry kinds. |
+| proposed | A type with a cross-field invariant has no public `Default` or `DerefMut` that bypasses its constructor, and a small enum where a free-form field would do. |
