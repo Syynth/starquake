@@ -11,6 +11,22 @@
 //! On a host with no CPU backend (anything but macOS on Apple Silicon, until the KVM and JIT
 //! backends exist) a program still parses, and [`System::run`] reports [`Error::NoCpuBackend`]
 //! as an emulator error.
+//!
+//! A run's guest RAM is sized from the program it loads, up to the application pool of the
+//! program's console, and a program that cannot fit is refused before the VM is made, as
+//! [`Error::OutOfRam`] (the `ram` module docs say what is counted; [`THREAD_LOCAL_RAM`] and
+//! [`WORKING_RAM`] are two of the parts).
+
+#[cfg_attr(
+    not(any(test, all(target_os = "macos", target_arch = "aarch64"))),
+    expect(
+        dead_code,
+        reason = "only a CPU backend sizes guest RAM; hosts without one build this for its tests"
+    )
+)]
+mod ram;
+
+pub use ram::{THREAD_LOCAL_RAM, WORKING_RAM};
 
 use std::time::Instant;
 
@@ -36,6 +52,19 @@ pub enum Error {
     /// The program's address space could not be built.
     #[error("the program could not be mapped into guest memory: {0}")]
     AddressSpace(#[from] SpaceError),
+    /// The program needs more guest RAM than an application may use on the console it is built
+    /// for: found before the VM is made and before anything is loaded.
+    #[error(
+        "the program needs {needed:#x} bytes of guest RAM, more than the {available:#x} bytes an \
+         application may use on its console"
+    )]
+    OutOfRam {
+        /// What loading the program and starting its process need: its pages (modules,
+        /// `.bss` and counter trampolines), its main thread's stack and thread-local page.
+        needed: u64,
+        /// The application pool of the program's console.
+        available: u64,
+    },
 }
 
 /// A loaded program, ready to run.
@@ -63,8 +92,8 @@ impl System {
 
     /// Runs the program until it calls `ExitProcess`, crashes, or `options.timeout` passes, and
     /// reports what happened. A failure to start (no CPU backend, no VM, a program too large
-    /// for guest memory) is reported the same way, as an emulator error with nothing else in
-    /// the report.
+    /// for guest memory, [`Error::OutOfRam`]) is reported the same way, as an emulator error
+    /// with nothing else in the report.
     ///
     /// The vCPU is created on, and runs on, the calling thread. Hypervisor.framework allows one
     /// VM per process, so a second `run` in the same process waits for the first to finish.
@@ -91,8 +120,9 @@ mod host {
     use starquake_memory::Access;
 
     use super::Error;
+    use super::ram::GuestRam;
     use crate::clock::{CounterClock, Timebase};
-    use crate::image::{Loaded, Program, load};
+    use crate::image::{IMAGE_BASE, Loaded, Program, load_placed, place};
     use crate::machine::{self, GuestProgram, GuestSpace, Vcpus};
 
     use crate::report::{RunOptions, RunReport};
@@ -124,16 +154,12 @@ mod host {
         options: &RunOptions,
         started: Instant,
     ) -> Result<RunReport, Error> {
-        let _one_vm = ONE_VM.lock().unwrap_or_else(PoisonError::into_inner);
-        // PROVISIONAL: the backend's default guest RAM (16 MiB), and all of its table pool for
-        // the one address space.
-        let backend = HvfBackend::new(RamConfig::default())?;
-        let ram = backend.ram();
         // One rate and one zero point for guest time (kernel spec, "Guest time"): the patcher
         // rescales the backend's counter to the rate of the console the program's description
         // names, the kernel converts its clock with the same rate, and that clock is the
-        // backend's counter.
-        let host_hz = backend.counter_frequency();
+        // backend's counter. The rate is the host's, read before the VM is made: what the
+        // patcher adds is part of what guest RAM must hold.
+        let host_hz = HvfBackend::host_counter_frequency();
         let time = Timebase {
             console: program.description().console,
             clock: CounterClock::new(host_hz).ok_or_else(|| {
@@ -144,6 +170,15 @@ mod host {
             host_hz,
             guest_hz: time.rate().hz(),
         };
+        // The program is laid out and its guest RAM sized, or refused, before a VM exists.
+        let layout = place(program, IMAGE_BASE, Some(counter))?;
+        let guest_ram = GuestRam::for_program(&layout, program.description())?;
+        let ram_config = RamConfig::at_least(guest_ram.size)
+            .map_err(|error| starquake_cpu::Error::Host(format!("guest RAM: {error}")))?;
+        let _one_vm = ONE_VM.lock().unwrap_or_else(PoisonError::into_inner);
+        // PROVISIONAL: all of the backend's table pool for the one address space.
+        let backend = HvfBackend::new(ram_config)?;
+        let ram = backend.ram();
         // The kernel's address space decides what is mapped; this one makes it real, and is
         // what the loader and the kernel read and write guest memory through.
         let space = Arc::new(AddressSpace::new(
@@ -155,7 +190,7 @@ mod host {
         let Loaded {
             placed,
             address_space,
-        } = load(program, Some(counter), Box::new(mapper), &*space)?;
+        } = load_placed(program, layout, Box::new(mapper), &*space)?;
         // Every core's vCPU runs in the one address space, with the same pointer-authentication
         // keys, so that a thread can move from core to core. PROVISIONAL: the keys are fixed
         // (zero), not the process's own (`crate::machine`, "Start state").
