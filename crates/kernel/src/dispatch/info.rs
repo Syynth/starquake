@@ -22,13 +22,7 @@ impl Dispatcher {
         self.call_in_process::<(&HandleTable, &AddressSpace, &mut Scheduler)>(
             call,
             |(handles, space, scheduler), call, _, processes| {
-                get_info(
-                    (handles, space, scheduler),
-                    processes,
-                    id,
-                    convention,
-                    call,
-                )
+                get_info((handles, space, scheduler), processes, id, convention, call)
             },
         )
     }

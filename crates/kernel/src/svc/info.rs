@@ -1,7 +1,9 @@
 //! `GetInfo` (0x29): facts about a process. This slice answers the ids a libnx program asks at
 //! start-up (the alias, heap, ASLR and stack regions, the alias region's extra size, the total
-//! and used memory), the random entropy that rtld asks for after its module walk, and whether a
-//! debugger is attached.
+//! and used memory), the random entropy that rtld asks for after its module walk, whether a
+//! debugger is attached, and the Switch 2 ids 29 to 33 (the remote region's address and size,
+//! remote memory used and in all, and the mapping alignment; scoping doc, "Process, memory,
+//! kernel", "New `svcGetInfo` ids").
 //!
 //! Ported from Eden `eden/src/core/hle/kernel/svc/svc_info.cpp` @ cf654052 (GPL-3.0-or-later),
 //! `GetInfo`; the ids are `InfoType` in `eden/src/core/hle/kernel/svc_types.h` @ cf654052.
@@ -31,6 +33,33 @@
 //! PR #4588 (`eden-pr4588/src/core/hle/kernel/svc/svc_info.cpp` @ e5fb3b97) changes none of
 //! these, so a Switch 2 program is answered the same.
 //!
+//! - **The Switch 2 ids** (29 to 33), from PR #4588's `GetInfo`, which answers them in an `if`
+//!   before Eden's `switch`:
+//!   1. The calling process was built for Switch 2, else [`KernelError::InvalidEnumValue`]
+//!      (Eden's `default`, `R_THROW(ResultInvalidEnumValue)`: a Switch 1 kernel does not know
+//!      the ids; see the divergences).
+//!   2. `info_sub_id == 0`, else `ResultInvalidEnumValue`.
+//!   3. The handle names a process (`GetObject<KProcess>`), else `ResultInvalidHandle`.
+//!   4. That process was built for Switch 2 (`process->UsesPAuthReturns()`, which Eden PR
+//!      #4588 sets from the NPDM's extended ACID: [`crate::process::Console::Switch2`]), else
+//!      `ResultInvalidEnumValue`.
+//!
+//!   Then the value is PR #4588's: zero for ids 29 to 32 ("Remote mappings are absent") and
+//!   the page size for id 33 ("ordinary mappings use the kernel page size"). **Each value is a
+//!   guess** ([`REMOTE_REGION_ADDRESS`], [`REMOTE_REGION_SIZE`], [`REMOTE_MEMORY_USED`],
+//!   [`REMOTE_MEMORY_TOTAL`], [`MEMORY_MAPPING_ALIGNMENT`]): a trace from a console, or the
+//!   SDK's use of the value, would confirm it. The references disagree on two of them:
+//!   Eden-NX2 (`eden-nx2/src/core/hle/kernel/svc/svc_info.cpp` @ 50fa86bb) answers ids 29 and
+//!   30 with the upper half of the alias region, answers every process whatever it was built
+//!   for, and names 31 and 32 the other way round (size, then used). starquake follows PR
+//!   #4588 (the lead's choice under the delegation, issue #223). A process the
+//!   process table has no row for, named by a handle or calling, is an internal failure after
+//!   the guest's checks. Tests: `each_switch_2_id_answers_a_switch_2_program`,
+//!   `a_switch_2_id_with_a_sub_id_other_than_zero_is_an_invalid_enum_value_before_the_handle`,
+//!   `a_switch_2_id_needs_a_handle_to_a_process`,
+//!   `a_switch_2_id_is_answered_by_the_console_of_the_process_the_handle_names`,
+//!   `a_handle_to_a_process_the_table_has_no_row_for_is_an_internal_failure`.
+//!
 //! # Divergences from Eden
 //!
 //! - **Ids Eden answers that this slice does not** return [`KernelError::NotImplemented`]
@@ -40,13 +69,19 @@
 //!   ids 37 and 38, and Atmosphère's two. Eden answers each. They belong to the slices that
 //!   build what they report (process creation, threads, resource limits). Test:
 //!   `an_id_this_slice_does_not_answer_is_not_implemented_whatever_else_is_passed`.
-//! - **The Switch 2 ids 29 to 33** (`eden-pr4588/src/core/hle/kernel/svc/svc_info.cpp` @
-//!   e5fb3b97; scoping doc, "New `svcGetInfo` ids") are not built either and return
-//!   [`KernelError::NotImplemented`]. PR #4588 answers them only for a Switch 2 program; Eden
-//!   returns `ResultInvalidEnumValue`. Same test.
-//! - **Any process handle names the one process there is.** With one process, a handle to a
-//!   process object and the pseudo-handle are the same process (kernel slice 8 makes
-//!   processes rows of a table). Test: `a_handle_must_name_a_process`.
+//! - **A Switch 1 program asking a Switch 2 id** is told [`KernelError::InvalidEnumValue`]
+//!   before any check, whatever its handle and sub id, as Eden answers every program
+//!   (`eden/src/core/hle/kernel/svc/svc_info.cpp` @ cf654052, `GetInfo`'s `default`) and as
+//!   Horizon's Switch 1 kernel does (fact only,
+//!   `atmosphere/libraries/libmesosphere/source/svc/kern_svc_info.cpp` @ 4e3f3703, `GetInfo`'s
+//!   `default`). PR #4588 checks the sub id and the handle first for every program, so there a
+//!   Switch 1 program passing sub id 0 and a handle that names no process is told
+//!   `ResultInvalidHandle`; here it is `InvalidEnumValue`. Test:
+//!   `a_switch_1_program_is_told_the_switch_2_ids_are_an_invalid_enum_value_whatever_is_passed`.
+//! - **The memory ids read the calling process's address space, whatever process the handle
+//!   names.** With one address space beside the tables, a handle to another process object
+//!   is answered as the pseudo-handle is. The Switch 2 ids do check the process the handle
+//!   names (its console, from the process table). Test: `a_handle_must_name_a_process`.
 //! - **The entropy is drawn when it is first asked for**, not when the process is created
 //!   (Eden's `KProcess::Initialize`, `GenerateRandom(m_entropy)`): the dispatcher draws the
 //!   [`ENTROPY_COUNT`] words from the environment's random numbers at the first
@@ -249,10 +284,16 @@ pub fn get_info(
     match id {
         // `case InfoType::DebuggerAttached: *result = 0; R_SUCCEED();`
         InfoType::DebuggerAttached => Ok(0),
-        InfoType::RandomEntropy => {
-            random_entropy(scheduler, processes.own(), handle, info_sub_id)
-        }
-        _ => memory_info(handles, space, scheduler, processes, id, handle, info_sub_id),
+        InfoType::RandomEntropy => random_entropy(scheduler, processes.own(), handle, info_sub_id),
+        _ => memory_info(
+            handles,
+            space,
+            scheduler,
+            processes,
+            id,
+            handle,
+            info_sub_id,
+        ),
     }
 }
 
@@ -294,7 +335,10 @@ fn switch_2_info(
     if console_of(processes, named)? != Console::Switch2 {
         return Err(KernelError::InvalidEnumValue.into());
     }
-    tracing::debug!(value, "GetInfo Switch 2 id answered with PR #4588's guessed value");
+    tracing::debug!(
+        value,
+        "GetInfo Switch 2 id answered with PR #4588's guessed value"
+    );
     Ok(value)
 }
 

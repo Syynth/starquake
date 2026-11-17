@@ -1,5 +1,6 @@
 //! `GetInfo`: the values a libnx program is told at start-up, against what the reference
-//! emulator told the homebrew fixture, and Horizon's result for each request it refuses.
+//! emulator told the homebrew fixture, the Switch 2 ids for a Switch 2 and a Switch 1 program,
+//! and Horizon's result for each request it refuses.
 
 use super::*;
 use crate::handle::ObjectRefs;
@@ -174,7 +175,15 @@ fn a_sub_id_other_than_zero_is_an_invalid_enum_value() {
         for sub_id in [1, u64::MAX] {
             for handle in [Handle::CURRENT_PROCESS, Handle::INVALID] {
                 assert_eq!(
-                    get_info(&handles, &space, &scheduler, &processes(), id, handle, sub_id),
+                    get_info(
+                        &handles,
+                        &space,
+                        &scheduler,
+                        &processes(),
+                        id,
+                        handle,
+                        sub_id
+                    ),
                     kernel(KernelError::InvalidEnumValue),
                     "id {id} sub id {sub_id:#x}"
                 );
@@ -254,7 +263,15 @@ fn an_id_this_slice_does_not_answer_is_not_implemented_whatever_else_is_passed()
             (Handle::CURRENT_PROCESS, 7),
         ] {
             assert_eq!(
-                get_info(&handles, &space, &scheduler, &processes(), id, handle, sub_id),
+                get_info(
+                    &handles,
+                    &space,
+                    &scheduler,
+                    &processes(),
+                    id,
+                    handle,
+                    sub_id
+                ),
                 kernel(KernelError::NotImplemented),
                 "id {id}"
             );
@@ -529,10 +546,10 @@ const SWITCH_2: [(InfoType, u64); 5] = [
     (InfoType::MemoryMappingAlignment, MEMORY_MAPPING_ALIGNMENT),
 ];
 
-/// Tables for the Switch 2 ids: a handle table holding a handle to a thread and one to each
-/// process of `processes` besides the calling one, and a scheduler whose object table names
-/// them. Returns the thread's handle and the process handles, in `others`' order.
-fn tables_naming(others: &[ProcessId]) -> (HandleTable, Scheduler, Handle, Vec<Handle>) {
+/// Tables for the Switch 2 ids: a handle table holding a handle to a thread and one to the
+/// object of each process in `named`, and a scheduler whose object table holds them. Returns
+/// the thread's handle and the process handles, in `named`'s order.
+fn tables_naming(named: &[ProcessId]) -> (HandleTable, Scheduler, Handle, Vec<Handle>) {
     let (mut handles, mut scheduler) = tables();
     let thread = scheduler
         .create_thread(Priority::new(44).unwrap(), CoreId::new(0).unwrap())
@@ -544,7 +561,7 @@ fn tables_naming(others: &[ProcessId]) -> (HandleTable, Scheduler, Handle, Vec<H
         handle
     };
     let thread_handle = add(Object::Thread(thread));
-    let process_handles = others
+    let process_handles = named
         .iter()
         .map(|&process| add(Object::Process(process)))
         .collect();
@@ -568,7 +585,15 @@ fn each_switch_2_id_answers_a_switch_2_program() {
         // The pseudo-handle, and a handle to the calling process's own object.
         for handle in [Handle::CURRENT_PROCESS, named[0]] {
             assert_eq!(
-                get_info(&handles, &space, &scheduler, &processes, id.number(), handle, 0),
+                get_info(
+                    &handles,
+                    &space,
+                    &scheduler,
+                    &processes,
+                    id.number(),
+                    handle,
+                    0
+                ),
                 Ok(value),
                 "{id:?} handle {:#x}",
                 handle.raw()
@@ -670,7 +695,15 @@ fn a_switch_2_id_needs_a_handle_to_a_process() {
             thread_handle,
         ] {
             assert_eq!(
-                get_info(&handles, &space, &scheduler, &processes, id.number(), handle, 0),
+                get_info(
+                    &handles,
+                    &space,
+                    &scheduler,
+                    &processes,
+                    id.number(),
+                    handle,
+                    0
+                ),
                 kernel(KernelError::InvalidHandle),
                 "{id:?} handle {:#x}",
                 handle.raw()
@@ -695,9 +728,21 @@ fn a_switch_2_id_is_answered_by_the_console_of_the_process_the_handle_names() {
     let (handles, scheduler, _, named) = tables_naming(&[switch_1, switch_2]);
     for (id, value) in SWITCH_2 {
         let ask = |handle| {
-            get_info(&handles, &space, &scheduler, &processes, id.number(), handle, 0)
+            get_info(
+                &handles,
+                &space,
+                &scheduler,
+                &processes,
+                id.number(),
+                handle,
+                0,
+            )
         };
-        assert_eq!(ask(named[0]), kernel(KernelError::InvalidEnumValue), "{id:?}");
+        assert_eq!(
+            ask(named[0]),
+            kernel(KernelError::InvalidEnumValue),
+            "{id:?}"
+        );
         assert_eq!(ask(named[1]), Ok(value), "{id:?}");
     }
     // And the other way round: a Switch 1 program is refused even about a Switch 2 process.
@@ -734,7 +779,15 @@ fn a_handle_to_a_process_the_table_has_no_row_for_is_an_internal_failure() {
     let (handles, scheduler, _, named) = tables_naming(&[ghost]);
     for (id, _) in SWITCH_2 {
         let ask = |sub_id| {
-            get_info(&handles, &space, &scheduler, &processes, id.number(), named[0], sub_id)
+            get_info(
+                &handles,
+                &space,
+                &scheduler,
+                &processes,
+                id.number(),
+                named[0],
+                sub_id,
+            )
         };
         assert_eq!(ask(0), Err(SvcError::internal(&missing)), "{id:?}");
         assert_eq!(ask(1), kernel(KernelError::InvalidEnumValue), "{id:?}");
