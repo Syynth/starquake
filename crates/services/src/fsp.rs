@@ -275,12 +275,12 @@ use starquake_kernel::result::ResultCode;
 use starquake_trace::Env;
 
 use crate::commands;
+use crate::framework::halt::{self, Halt};
 use crate::framework::{
-    Context, DEFERRED_REPLY_DROPPED, DeferredBuffer, Finish, Interfaces, Outcome, Reply,
-    ReplyToken, Request, Server, UnknownPolicy,
+    Context, DeferredBuffer, Finish, Interfaces, Outcome, Reply, ReplyToken, Request, Server,
+    UnknownPolicy,
 };
 
-pub mod halt;
 pub mod host;
 pub mod path;
 pub mod worker;
@@ -352,7 +352,7 @@ pub mod result {
 /// gave up on, which the guest never runs to see.
 fn failed(mount: Mount, answer: &Answer) -> ResultCode {
     match answer {
-        Answer::Stopped => DEFERRED_REPLY_DROPPED,
+        Answer::Stopped => halt::STOPPED,
         Answer::Failed(HostFailure::NoDevice) | Answer::Unavailable => no_device(mount),
         Answer::Failed(HostFailure::NotFound | HostFailure::NotAFile) => result::PATH_NOT_FOUND,
         Answer::Failed(HostFailure::Io | HostFailure::BadRequest) | Answer::Broken => {
@@ -832,14 +832,15 @@ pub fn interfaces() -> Interfaces {
 }
 
 /// An `fsp-srv` server whose host file systems are `env`'s ([`host`]), which tells `halt` when
-/// `env` fails one of its handlers ([`halt`]). Its reads run on the executor it is given with
-/// [`Server::with_executor`] (in a run, [`worker::Workers`], which tell a halt of their own),
+/// `env` fails one of its handlers (the framework's one path for that, [`halt`]). Its reads run
+/// on the executor it is given with [`Server::with_executor`] (in a run, [`worker::Workers`],
+/// which tell a halt of their own),
 /// through the environment that executor gives them; a server given none answers `Read` with
 /// the framework's `NOT_SUPPORTED` ([`Context::executor`]).
 #[must_use]
-pub fn server(policy: UnknownPolicy, env: Arc<dyn Env>, halt: Arc<dyn halt::Halt>) -> Server {
+pub fn server(policy: UnknownPolicy, env: Arc<dyn Env>, halt: Arc<dyn Halt>) -> Server {
     Server::new(NAME, policy)
         .with_root(|| Box::new(FspSrv))
         .with_interfaces(interfaces())
-        .with_env(Arc::new(halt::Watched::new(env, halt)))
+        .with_env(env, halt)
 }

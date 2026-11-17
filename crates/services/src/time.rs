@@ -121,11 +121,25 @@
 //!   (`to_calendar_time_with_my_rule_answers_in_utc_and_the_reply_is_these_bytes`).
 //! - **A failure to set the clocks up is the reply's.** Eden's set-up cannot fail where a guest
 //!   sees it. Here an error from the kernel when the memory is made is the reply's result, and an
-//!   environment that fails (a replay that left its recording) or an uptime past `i64`'s
-//!   nanoseconds is [`FAILED`], logged; a base past `i64`'s nanoseconds is [`OVERFLOW`]. Nothing
-//!   is kept, so the next request tries again
+//!   uptime past `i64`'s nanoseconds is [`FAILED`], logged; a base past `i64`'s nanoseconds is
+//!   [`OVERFLOW`]. Nothing is kept, so the next request tries again
 //!   (`a_failed_set_up_is_the_reply_and_keeps_nothing`,
 //!   `a_base_past_the_nanoseconds_an_i64_holds_is_an_overflow`).
+//!
+//! # When the environment fails
+//!
+//! The set-up reads the environment the server was given ([`server`]), and a failure of it (a
+//! replay that ran out of answers or disagreed with what was asked) is not a result the guest
+//! sees: it stops the run, through the framework's one path for it
+//! ([`halt`](crate::framework::halt); decision log, 2026-11-17, "Env failures"). The run's halt
+//! is told [`Stop::Handler`](crate::framework::Stop::Handler) naming [`NAME`] and the error, at
+//! the first of the three reads that fails, and no later read is made; the request is answered
+//! as one the server gave up on, which the guest never runs to see, and nothing is kept
+//! (`an_environment_failure_stops_the_run_and_keeps_nothing`, for each read, with a replay that
+//! runs out and one that disagrees). `time:u` sends no host I/O, so it has no host failure to
+//! answer with a result code.
+
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use starquake_kernel::id::ObjectId;
@@ -136,7 +150,7 @@ use starquake_trace::{Env, HostNanos};
 use crate::commands;
 use crate::framework::result::code;
 use crate::framework::{
-    Context, Fault, Interfaces, Outcome, Reply, Request, Server, UnknownPolicy,
+    Context, Fault, Halt, Interfaces, Outcome, Reply, Request, Server, UnknownPolicy,
 };
 
 pub mod calendar;
@@ -163,7 +177,7 @@ pub const TIME_MODULE: u32 = 116;
 /// 201}`).
 pub const OVERFLOW: ResultCode = code(TIME_MODULE, 201);
 /// `ResultFailed` (`errors.h`: `{ErrorModule::TimeService, 801}`): what this port answers when
-/// the clocks cannot be read from the environment (module docs).
+/// the environment's clock reads past the nanoseconds an `s64` holds (module docs).
 pub const FAILED: ResultCode = code(TIME_MODULE, 801);
 
 /// Nanoseconds in a second.
@@ -484,15 +498,13 @@ impl IStaticService {
 }
 
 /// Reads the environment and sets the clocks up (module docs, "The clocks"): two random draws,
-/// then one clock reading.
+/// then one clock reading. An environment that fails stops the run (module docs, "When the
+/// environment fails"): `env` is the server's, which has told the run's halt before it returns
+/// the error, and `?` answers the request as one the server gave up on.
 fn read_clock_inputs(env: &dyn Env) -> Result<(ClockSourceId, Uptime), Fault> {
-    let failed = |error: &dyn core::fmt::Display| {
-        tracing::error!(%error, "the environment failed while the clocks were set up");
-        Fault::Result(FAILED)
-    };
-    let low = env.random_u64().map_err(|e| failed(&e))?;
-    let high = env.random_u64().map_err(|e| failed(&e))?;
-    let reading = env.now().map_err(|e| failed(&e))?;
+    let low = env.random_u64()?;
+    let high = env.random_u64()?;
+    let reading = env.now()?;
     let mut source = [0; 16];
     source[..8].copy_from_slice(&low.to_le_bytes());
     source[8..].copy_from_slice(&high.to_le_bytes());
@@ -553,16 +565,17 @@ pub fn interfaces() -> Interfaces {
 }
 
 /// The `time:u` server, whose clocks start from `settings` and read `env` (module docs, "The
-/// clocks").
+/// clocks"), telling `halt` when `env` fails it (module docs, "When the environment fails").
 #[must_use]
 pub fn server(
     settings: TimeSettings,
     policy: UnknownPolicy,
-    env: std::sync::Arc<dyn Env>,
+    env: Arc<dyn Env>,
+    halt: Arc<dyn Halt>,
 ) -> Server {
     Server::new(NAME, policy)
         .with_root(|| Box::new(IStaticService))
         .with_interfaces(interfaces())
         .with_family(Clocks::new(settings))
-        .with_env(env)
+        .with_env(env, halt)
 }

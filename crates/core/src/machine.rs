@@ -109,16 +109,18 @@
 //! An `Env` call that fails (a replay that ran out or disagreed) stops the run as an emulator
 //! error, never a guest-visible result (decision log, 2026-11-17, "Env failures"). For the
 //! kernel's own calls that is [`Outcome::EnvFailed`](starquake_kernel::dispatch::Outcome). For
-//! `fsp-srv`, whose handlers and workers see the failure on their own threads, it is
-//! [`Halted`], the `starquake_services::fsp::halt::Halt` the run gives the services
+//! the services (`fsp-srv`'s handlers and workers and `time:u`'s handler, which see the failure
+//! on their own threads; `starquake_services::framework::halt`, "Who reads the environment"),
+//! it is [`Halted`], the `starquake_services::framework::Halt` the run gives the services
 //! ([`Given::halt`]): told the reason on the thread that saw the failure, before the request is
 //! answered, it keeps the first reason and rings the timer. From then on [`Machine::is_stopped`]
 //! is true, and the first loop to ask ends the run with the reason's words. Every core asks
 //! after it has chosen the thread it runs and before it enters the guest, so no core enters the
 //! guest once the halt is told: not for the requesting thread, whose reply comes after the
-//! halt, and not for any other. The tests `an_environment_failure_in_a_handler_stops_the_run`
-//! and `an_environment_failure_in_a_read_stops_the_run` (`machine/tests/reads.rs`) pin the
-//! reason the run ends with and that the guest's next step never runs. The check before
+//! halt, and not for any other. The tests `an_environment_failure_in_a_handler_stops_the_run`,
+//! `an_environment_failure_in_time_u_stops_the_run` and
+//! `an_environment_failure_in_a_read_stops_the_run` (`machine/tests/reads.rs`) pin the reason
+//! the run ends with and that the guest's next step never runs. The check before
 //! entering is what covers a halt told after a core's loop last asked and before it enters the
 //! guest (a thread that a delivery woke on another thread while the halt was told);
 //! `a_halt_told_as_a_thread_is_loaded_keeps_the_guest_out` tells the halt at exactly that point,
@@ -145,7 +147,7 @@ use starquake_kernel::svc::DebugSink;
 use starquake_kernel::tables::{AddressSpace, Scheduler};
 use starquake_kernel::time::CounterRate;
 use starquake_memory::{Access, GuestMemory};
-use starquake_services::fsp::halt::{Halt, Stop};
+use starquake_services::framework::{Halt, Stop};
 use starquake_services::fsp::worker::{self, Recording, StartError, Workers};
 use starquake_trace::{
     DumpError, Env, EventKind, FlightRecorder, GuestTicks, HostClock, HostNanos, LifecyclePhase,
@@ -243,7 +245,7 @@ impl crate::hle::Deliveries for Ready {
     }
 }
 
-/// What `fsp-srv` tells when the environment fails it (module docs, "When the environment fails
+/// What a service tells when the environment fails it (module docs, "When the environment fails
 /// a service"): the first reason it is told, which the run then ends with. Cloned into the
 /// services, which may outlive the loop; every clone is the same one.
 pub(crate) struct Halted {
