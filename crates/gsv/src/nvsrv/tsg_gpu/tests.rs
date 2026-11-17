@@ -408,7 +408,8 @@ fn a_saved_state_the_ioctls_cannot_reach_is_refused() {
 }
 
 /// The nvsrv state checks a group's fd and its channels' fds against its files: a group on an fd
-/// that is not an open tsg-gpu, and a channel fd never handed out, are refused.
+/// that is not an open tsg-gpu, a channel fd never handed out, and a channel fd open as anything
+/// but an nvhost-gpu, are refused.
 #[test]
 fn a_saved_group_must_fit_the_files() {
     let (mut direct, tsg, [a, _]) = opened();
@@ -438,6 +439,50 @@ fn a_saved_group_must_fit_the_files() {
     assert_eq!(
         check(&channel_closed),
         Err(NvsrvStateError::ChannelNotIssued { fd: a })
+    );
+    // A bound channel's fd that is still open must be an nvhost-gpu: a bind takes no other
+    // device, and fds are never reused. An open nvmap fd, and the group's own fd, are refused.
+    let mut nvmap = Direct::new();
+    let map = u32::try_from(nvmap.open(Device::Nvmap)).unwrap();
+    let group_tsg = nvmap.open(Device::NvhostTsgGpu);
+    let channel = u32::try_from(nvmap.open(Device::NvhostGpu)).unwrap();
+    nvmap.ioctl(group_tsg, BIND_CHANNEL_EX, &binding_ex(channel, 2));
+    let mut on_nvmap = nvmap.state;
+    let group_tsg = u32::try_from(group_tsg).unwrap();
+    let mut held = on_nvmap.tsg_gpu.groups.remove(&group_tsg).unwrap();
+    let sub = held.channels.remove(&channel).unwrap();
+    held.channels.insert(map, sub);
+    on_nvmap.tsg_gpu.groups.insert(group_tsg, held);
+    assert_eq!(
+        check(&on_nvmap),
+        Err(NvsrvStateError::NotAChannel { fd: map })
+    );
+    let mut on_itself = state.clone();
+    let mut held = on_itself.tsg_gpu.groups.remove(&tsg).unwrap();
+    let sub = held.channels.remove(&a).unwrap();
+    held.channels.insert(tsg, sub);
+    on_itself.tsg_gpu.groups.insert(tsg, held);
+    assert_eq!(
+        check(&on_itself),
+        Err(NvsrvStateError::NotAChannel { fd: tsg })
+    );
+    // Closed, the nvmap fd may stay bound, as a closed channel's does.
+    let mut nvmap_closed = on_nvmap.clone();
+    nvmap_closed.files.remove(&map);
+    assert_eq!(check(&nvmap_closed).as_ref(), Ok(&nvmap_closed));
+    // Both faults at once: never handed out is reported before open as another device.
+    let mut both = on_nvmap.clone();
+    let mut held = both.tsg_gpu.groups.remove(&group_tsg).unwrap();
+    held.channels.insert(both.next_fd, 0);
+    both.tsg_gpu.groups.insert(group_tsg, held);
+    let unissued = both.next_fd;
+    assert_eq!(
+        check(&both),
+        Err(NvsrvStateError::ChannelNotIssued { fd: unissued })
+    );
+    assert_eq!(
+        NvsrvStateError::NotAChannel { fd: 6 }.to_string(),
+        "channel fd 6 is bound to a timeslice group but is open as another device"
     );
     assert_eq!(
         NvsrvStateError::ChannelNotIssued { fd: 7 }.to_string(),

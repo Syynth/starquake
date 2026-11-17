@@ -51,7 +51,7 @@
 //! | 0x44–0x4F | warp count, VA bits (0x28: 40), reserved | Eden's | Eden's | PR copies them |
 //! | 0x50 | flags | Eden's 0x55, and bits 8, 22, 26, 34, 35, 40–43 | the same | 8 and 22: row 45; 26: row 46; 34: row 149 (observed); 35 and 40–43: PR (read) |
 //! | 0x58–0x6F | 2D, 3D, compute, GPFIFO, inline-to-memory, DMA copy classes | Eden's (Maxwell) | Eden's | PR copies them |
-//! | 0x70 | nine `s16` interface levels | 0x1C, 0xB, -1, 0x1D, 0x14, 0, 0, 0, 0 | the fourth 0x1F | row 24 (observed: "must be >= 6"); values PR's |
+//! | 0x70 | nine `s16` interface levels | 0x1C, 0xB, -1, 0x1D, 0x14, 0, 0, 0, 0 | the fourth 0x1F | values PR's; the level at +0x78 at least 6, NX2's comment in `ApplyNx2Characteristics` (row 24 says more, see "Conflicts") |
 //! | 0xB4 | subcontexts per TSG (`u32`) | 64 | 64 | row 45 (observed); PR `NativeGpuSubcontextCount` |
 //!
 //! The 0xD0 block is pinned byte for byte by `the_block_s_golden_bytes`, and each listed bit by
@@ -69,6 +69,17 @@
 //! bytes pin them. Open question, for the spec's verification item 1 (it does not list these
 //! yet): which of these fields does NvRm or NVN read, and does a title behave differently with
 //! NX2's values? A trace of the reads that follow the ioctl settles it.
+//!
+//! **The interface levels.** Row 24 (observed) says the `s16` levels "at 0x70..0x80 must be >= 6
+//! etc.", all of them. NX2's own comment in `ApplyNx2Characteristics` is narrower: NvRm
+//! "requires e.g. [0x78] >= 6 and enables features above 0xa, 0x1f and 0x26". PR's levels,
+//! used here, meet the narrower reading (0x14 at +0x78, pinned by
+//! `levels_and_subcontexts_are_where_the_sdk_reads_them`) but not row 24's: -1 at +0x74 and 0
+//! from +0x7A to +0x80 are below 6. And PR's channel level at +0x76 in the 0xD0 block, 0x1D, is
+//! below NX2's 0x1F feature threshold (the 0xD8 block's 0x1F is not above it either; NX2 does
+//! not say which level each threshold is for), where NX2 reports 0x40 everywhere. Open question: which levels does NvRm read, and which features
+//! does it gate on each? A trace of NvRm's reads of the block, or a title that fails with PR's
+//! levels and runs with NX2's, settles it.
 //!
 //! # Where this differs from the references
 //!

@@ -137,7 +137,7 @@
 //! not saved), and restoring checks every relation between their fields ([`NvsrvStateError`],
 //! [`nvmap::NvMapStateError`], [`as_gpu::AsGpuStateError`], [`tsg_gpu::TsgStateError`]): each
 //! view on an open as-gpu fd, each group on an open tsg-gpu fd, each bound channel's fd one that
-//! was handed out.
+//! was handed out and, while it is still open, an nvhost-gpu.
 //!
 //! The address spaces themselves are gsv's shared state's, saved with it
 //! ([`crate::gpu::saved`]). That a view's address space is one the shared state holds is a
@@ -520,6 +520,15 @@ pub enum NvsrvStateError {
         /// The channel's fd.
         fd: u32,
     },
+    /// A bound channel whose fd is open as a device other than `/dev/nvhost-gpu`. A bind takes
+    /// only an open nvhost-gpu fd, fds are never reused and a file's device never changes, so a
+    /// bound channel's fd that is still open is an nvhost-gpu; one that was closed may stay
+    /// bound.
+    #[error("channel fd {fd} is bound to a timeslice group but is open as another device")]
+    NotAChannel {
+        /// The channel's fd.
+        fd: u32,
+    },
 }
 
 impl TryFrom<SavedNvsrvState> for NvsrvState {
@@ -554,6 +563,13 @@ impl TryFrom<SavedNvsrvState> for NvsrvState {
             .find(|&fd| fd < FIRST_FD || fd >= next_fd)
         {
             return Err(NvsrvStateError::ChannelNotIssued { fd });
+        }
+        if let Some(fd) = tsg_gpu.channels().find(|fd| {
+            files
+                .get(fd)
+                .is_some_and(|&device| device != Device::NvhostGpu)
+        }) {
+            return Err(NvsrvStateError::NotAChannel { fd });
         }
         Ok(Self {
             files,

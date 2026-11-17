@@ -594,6 +594,44 @@ fn the_shim_is_on_the_page_below_the_split() {
     assert_eq!(shims, 1);
 }
 
+/// A split at the start leaves the small-page region empty, and the shim goes on the page below
+/// the start, outside every region the fd reports, as PR's `va_range_split - YUZU_PAGESIZE`
+/// places it (`AllocateFixed`, no range check); for a start of one page, at GPU address 0.
+#[test]
+fn a_split_at_the_start_puts_the_shim_below_the_view() {
+    for start in [0x10_0000, SMALL_PAGE_SIZE] {
+        let (mut direct, fd) = opened();
+        let end = 0x100_0000;
+        let request = plain(0, start, end, start);
+        assert_eq!(
+            direct.ioctl(fd, AS_ALLOC_AS_EX, &request).result,
+            NvResult::Success
+        );
+        let regions = direct.ioctl(fd, AS_GET_VA_REGIONS, &va_request());
+        assert_eq!(regions.result, NvResult::Success);
+        // The big pages start at the split rounded down to a big page.
+        let big_page = u64::from(DEFAULT_BIG_PAGE_SIZE);
+        let small_word = u32::try_from(SMALL_PAGE_SIZE).unwrap();
+        let small = region(start, small_word, 0);
+        let big = region(
+            start / big_page * big_page,
+            DEFAULT_BIG_PAGE_SIZE,
+            end / big_page - start / big_page,
+        );
+        let size = u32::try_from(2 * REGION_BYTES).unwrap();
+        assert_eq!(regions.output, va_reply(size, &[small, big]));
+        let below = start - SMALL_PAGE_SIZE;
+        let answer = direct.ioctl(fd, AS_SHIM_INFO, &shim_request());
+        assert_eq!(answer.result, NvResult::Success, "{start:#x}");
+        assert_eq!(
+            answer.output,
+            shim_reply(below, SHIM_STRIDE_BYTES, SYNCPOINT_COUNT)
+        );
+        assert_eq!(direct.memory.shim(AsId(1)), Some(below));
+        assert!(below < start, "{start:#x}");
+    }
+}
+
 /// Two views of one address space: the first to ask places the shim, the second reports the
 /// same page, not its own split's.
 #[test]
@@ -944,9 +982,93 @@ fn a_saved_state_alloc_as_ex_cannot_reach_is_refused() {
             AsGpuStateError::MadeLayout { space: 3 },
         ),
     ];
-    for (state, error) in cases {
+    for (state, error) in cases.into_iter().chain(unissued_and_creators()) {
         assert_eq!(AsGpu::try_from(state), Err(error), "{error}");
     }
+}
+
+/// The address-space id and creator cases of
+/// `a_saved_state_alloc_as_ex_cannot_reach_is_refused`, first fault first.
+fn unissued_and_creators() -> Vec<(SavedAsGpu, AsGpuStateError)> {
+    let space = |id: u32| AsId(id);
+    let bad = Layout { start: 0, ..MADE };
+    let below_first = AsId(FIRST_ADDRESS_SPACE.0 - 1);
+    let view = |id, layout| View {
+        space: space(id),
+        layout,
+    };
+    vec![
+        // An id below the first gsv hands out: as a made space, and as a view's space (whose
+        // layout would otherwise pass as a view of a gpu-33 space).
+        (
+            saved(&[], &[(below_first, MADE)]),
+            AsGpuStateError::MadeSpaceNotIssued {
+                space: below_first.0,
+            },
+        ),
+        (
+            saved(&[(7, view(below_first.0, child_of(&NATIVE_LAYOUT)))], &[]),
+            AsGpuStateError::ViewSpaceNotIssued {
+                fd: 7,
+                space: below_first.0,
+            },
+        ),
+        // Two faults: an unissued made id before its layout, before an unissued view id.
+        (
+            saved(
+                &[(7, view(below_first.0, child_of(&NATIVE_LAYOUT)))],
+                &[(below_first, bad)],
+            ),
+            AsGpuStateError::MadeSpaceNotIssued {
+                space: below_first.0,
+            },
+        ),
+        // An unissued view id before a made layout.
+        (
+            saved(
+                &[(7, view(below_first.0, child_of(&NATIVE_LAYOUT)))],
+                &[(space(3), bad)],
+            ),
+            AsGpuStateError::ViewSpaceNotIssued {
+                fd: 7,
+                space: below_first.0,
+            },
+        ),
+        // Two fds with the creator's own layout, which is not a view of itself: only the fd whose
+        // `AllocAsEx` made the space has it.
+        (
+            saved(
+                &[(1, view(3, MADE)), (2, view(3, MADE))],
+                &[(space(3), MADE)],
+            ),
+            AsGpuStateError::TwoCreators {
+                space: 3,
+                first: 1,
+                second: 2,
+            },
+        ),
+        // A view layout fault before two creators.
+        (
+            saved(
+                &[
+                    (1, view(3, MADE)),
+                    (2, view(3, MADE)),
+                    (
+                        9,
+                        view(
+                            3,
+                            Layout {
+                                end: 0x200_0000,
+                                ..MADE
+                            },
+                        ),
+                    ),
+                ],
+                &[(space(3), MADE)],
+            ),
+            AsGpuStateError::ViewLayout { fd: 9 },
+        ),
+    ]
 }
 
 /// Each relation's reachable side is accepted: the most made spaces, a creator's view, a view of
@@ -982,6 +1104,52 @@ fn a_saved_state_at_each_edge_is_accepted() {
     let state = AsGpu::try_from(saved(&views, &all)).unwrap();
     let bytes = postcard::to_allocvec(&state).unwrap();
     assert_eq!(postcard::from_bytes::<AsGpu>(&bytes).unwrap(), state);
+    // The first id gsv hands out is accepted, as a made space and as a view's.
+    let first = [(FIRST_ADDRESS_SPACE, MADE)];
+    let on_first = [(
+        2,
+        View {
+            space: FIRST_ADDRESS_SPACE,
+            layout: MADE,
+        },
+    )];
+    assert!(AsGpu::try_from(saved(&on_first, &first)).is_ok());
+    let native_first = [(
+        2,
+        View {
+            space: FIRST_ADDRESS_SPACE,
+            layout: child_of(&NATIVE_LAYOUT),
+        },
+    )];
+    assert!(AsGpu::try_from(saved(&native_first, &[])).is_ok());
+    // A creator whose layout is a view of itself (split at the end, 4 KiB big pages asked for)
+    // shares it with any number of views; one creator of each of two spaces is accepted too.
+    let own = child_of(&MADE);
+    assert!(own.is_view_of(&own));
+    let shared = [
+        (
+            1,
+            View {
+                space: AsId(3),
+                layout: own,
+            },
+        ),
+        (
+            2,
+            View {
+                space: AsId(3),
+                layout: own,
+            },
+        ),
+        (
+            4,
+            View {
+                space: AsId(5),
+                layout: MADE,
+            },
+        ),
+    ];
+    assert!(AsGpu::try_from(saved(&shared, &[(AsId(3), own), (AsId(5), MADE)])).is_ok());
     // Through postcard, a refused state is refused.
     let refused = AsGpu {
         views: BTreeMap::from([(
@@ -1011,6 +1179,22 @@ fn a_refused_state_is_said_in_plain_words() {
         (
             AsGpuStateError::ViewLayout { fd: 7 },
             "fd 7 has a view its address space cannot have",
+        ),
+        (
+            AsGpuStateError::MadeSpaceNotIssued { space: 4 },
+            "address space 4 was made through nvhost-as-gpu but is not an id gsv hands out",
+        ),
+        (
+            AsGpuStateError::ViewSpaceNotIssued { fd: 6, space: 5 },
+            "fd 6 has a view of address space 5, which is not an id gsv hands out",
+        ),
+        (
+            AsGpuStateError::TwoCreators {
+                space: 3,
+                first: 1,
+                second: 2,
+            },
+            "fds 1 and 2 both hold the layout address space 3 was made with",
         ),
     ];
     for (error, words) in said {

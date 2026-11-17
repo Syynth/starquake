@@ -139,7 +139,9 @@ fn levels_and_subcontexts_are_where_the_sdk_reads_them() {
     };
     let levels: Vec<i16> = (0..9).map(level).collect();
     assert_eq!(levels, [0x1C, 0xB, -1, 0x1D, 0x14, 0, 0, 0, 0]);
-    // Row 24: NvRm requires the level at +0x78 to be at least 6.
+    // NX2's comment in `ApplyNx2Characteristics`: NvRm requires the level at +0x78 to be at
+    // least 6. (Row 24 says every level from 0x70 to 0x80; the module docs' "Conflicts".)
+    assert_eq!(layout::LEVELS + 2 * 4, 0x78);
     assert!(level(4) >= 6);
     let at = layout::SUBCONTEXTS;
     let count = u32::from_le_bytes(block[at..at + 4].try_into().unwrap());

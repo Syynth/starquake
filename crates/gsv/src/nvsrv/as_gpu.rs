@@ -97,7 +97,13 @@
 //!   gpu 33's id in `as_fd`? (`split_0_without_a_parent_takes_small_pages_to_the_end`.)
 //! - **The shim's address**: PR puts it on the page below the split, NX2 on the page below its
 //!   end. PR's is used: both are reported to the title (row 46), and PR's keeps it inside the
-//!   view's small-page region (`the_shim_is_on_the_page_below_the_split`).
+//!   view's small-page region when that region is not empty
+//!   (`the_shim_is_on_the_page_below_the_split`). A parentless `AllocAsEx` whose split equals
+//!   its start leaves the small-page region empty; then PR's rule puts the shim on the page
+//!   below the start, outside every region the fd reports, and for a start of one page at GPU
+//!   address 0 (PR reserves it with `AllocateFixed` and no range check). Here it does the same,
+//!   with `Success` (`a_split_at_the_start_puts_the_shim_below_the_view`). Open question: does
+//!   NvRm ever send a split equal to its start?
 //!
 //! # Where this differs from the references
 //!
@@ -135,7 +141,7 @@ use super::ctrl_gpu;
 use super::ioctl::Fixed;
 use super::{GpuAccess, IoctlAnswer, IoctlCall, IoctlVariant, NvResult};
 use crate::gpu::AsId;
-use crate::gpu::memory::{MAX_ADDRESS_SPACES, VA_WINDOW_END, VA_WINDOW_START};
+use crate::gpu::memory::{FIRST_ADDRESS_SPACE, MAX_ADDRESS_SPACES, VA_WINDOW_END, VA_WINDOW_START};
 
 #[cfg(test)]
 mod tests;
@@ -436,6 +442,20 @@ pub enum AsGpuStateError {
         /// How many.
         count: usize,
     },
+    /// A made address space's id is below [`FIRST_ADDRESS_SPACE`], so gsv never handed it out.
+    #[error("address space {space} was made through nvhost-as-gpu but is not an id gsv hands out")]
+    MadeSpaceNotIssued {
+        /// The address space's id.
+        space: u32,
+    },
+    /// A view's address space id is below [`FIRST_ADDRESS_SPACE`], so gsv never handed it out.
+    #[error("fd {fd} has a view of address space {space}, which is not an id gsv hands out")]
+    ViewSpaceNotIssued {
+        /// The fd.
+        fd: u32,
+        /// The address space's id.
+        space: u32,
+    },
     /// A made address space's layout is not one `AllocAsEx` makes.
     #[error("address space {space} has a layout nvhost-as-gpu cannot make")]
     MadeLayout {
@@ -448,6 +468,17 @@ pub enum AsGpuStateError {
         /// The fd.
         fd: u32,
     },
+    /// Two fds hold the layout a made address space was made with, which is not a view of
+    /// itself: only the fd whose parentless `AllocAsEx` made the space has it.
+    #[error("fds {first} and {second} both hold the layout address space {space} was made with")]
+    TwoCreators {
+        /// The address space's id.
+        space: u32,
+        /// The lower fd.
+        first: u32,
+        /// The higher fd.
+        second: u32,
+    },
 }
 
 impl TryFrom<SavedAsGpu> for AsGpu {
@@ -457,6 +488,18 @@ impl TryFrom<SavedAsGpu> for AsGpu {
         let SavedAsGpu { views, made } = saved;
         if made.len() > MAX_ADDRESS_SPACES {
             return Err(AsGpuStateError::TooManySpaces { count: made.len() });
+        }
+        if let Some(space) = made.keys().find(|&&space| space < FIRST_ADDRESS_SPACE) {
+            return Err(AsGpuStateError::MadeSpaceNotIssued { space: space.0 });
+        }
+        if let Some((&fd, view)) = views
+            .iter()
+            .find(|(_, view)| view.space < FIRST_ADDRESS_SPACE)
+        {
+            return Err(AsGpuStateError::ViewSpaceNotIssued {
+                fd,
+                space: view.space.0,
+            });
         }
         if let Some(space) = made.iter().find(|(_, layout)| !layout.is_valid()) {
             return Err(AsGpuStateError::MadeLayout { space: space.0.0 });
@@ -468,6 +511,25 @@ impl TryFrom<SavedAsGpu> for AsGpu {
         };
         if let Some((&fd, _)) = views.iter().find(|(_, view)| !fits(view)) {
             return Err(AsGpuStateError::ViewLayout { fd });
+        }
+        // The creator's own layout is on one fd at most, unless a view of the space can have it
+        // too (a creator whose layout is a view of itself).
+        let mut creators: BTreeMap<AsId, u32> = BTreeMap::new();
+        for (&fd, view) in &views {
+            let Some(own) = made.get(&view.space) else {
+                continue;
+            };
+            if *own != view.layout || own.is_view_of(own) {
+                continue;
+            }
+            if let Some(&first) = creators.get(&view.space) {
+                return Err(AsGpuStateError::TwoCreators {
+                    space: view.space.0,
+                    first,
+                    second: fd,
+                });
+            }
+            creators.insert(view.space, fd);
         }
         Ok(Self { views, made })
     }
