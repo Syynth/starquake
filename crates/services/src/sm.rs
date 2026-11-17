@@ -10,7 +10,9 @@
 //!   family's state, so all `sm:` sessions share it and it is saved once in a snapshot. A
 //!   provider today is always an HLE server, named by its number ([`Provider::Hle`]); a service a
 //!   guest process registers (deferred, `docs/specs/kernel.md`) is one more kind of provider, and
-//!   a caller of `GetService` cannot tell which kind it got.
+//!   a caller of `GetService` cannot tell which kind it got. An entry may be private
+//!   ([`Registry::register_private`], [`Provider::Private`]): reachable only from other
+//!   services, never handed to a title (see "Private entries" below).
 //! - [`Sm`]: the interface behind an `sm:` session, with the commands below.
 //! - [`Stub`]: the generic session an unknown name gets under the auto-stub policy.
 //! - [`server`]: the `sm:` server, put together.
@@ -52,6 +54,29 @@
 //! | TIPC `GetService` that fails | `GetServiceTipc` replies the result and one moved handle slot holding zero | the reply holds the result only, like every failed reply of the framework. libnx reads no handle from a failed reply (`libnx/nx/include/switch/sf/tipc.h`, `tipcParseResponse`: `if (R_FAILED(rc)) return rc`) (`a_failed_tipc_get_service_carries_no_handle`) |
 //! | A request that carries a buffer descriptor | `Initialize` and `GetService` read no buffer, and the descriptor is ignored | the framework refuses it before the command runs, as the console does: `INVALID_CMIF_REQUEST`, over TIPC too, where the console answers `tipc::ResultInvalidMessageFormat` (`framework::buffers`) (`a_tipc_request_with_a_buffer_is_refused`) |
 //! | The caller's handle table is full | the session is created, then `PushMoveObjects` fails to add its handle | no session is created ([`Kernel::connect`](crate::framework::Kernel::connect) is all or nothing); the reply is the kernel's "out of handles" (`a_full_handle_table_gets_no_session`) |
+//!
+//! # Private entries
+//!
+//! The service spec's "entries reachable only from other services" (`docs/specs/services.md`,
+//! "The service manager"): the graphics server's root is the first, which `am`'s
+//! `ISelfController` 2000 returns to the title as a session (`docs/specs/graphics-server.md`,
+//! "The root").
+//!
+//! - **`GetService` answers a private name exactly as a name nothing provides**: under strict,
+//!   [`NOT_REGISTERED`]; under auto-stub, a [`Stub`]; either way the name is recorded with
+//!   [`Registry::unknown_names`]. A title cannot tell a private name from one nobody
+//!   registered. Test: `get_service_never_hands_out_a_private_entry`.
+//! - **Another service reaches it through the same registry**: whoever puts the services
+//!   together looks the name up ([`Registry::private_service`]) and gives the number to the
+//!   service that hands the entry out, which returns a session on it with
+//!   [`Reply::push_service`]; the session's server opens its root interface for it, as for a
+//!   session `GetService` hands out. Test: `another_service_hands_out_a_private_entry`.
+//!
+//! A name is registered once, as public or private. No pinned reference has such entries: on a
+//! console the graphics server's root is a session `am` makes itself (Eden PR #4588,
+//! `eden-pr4588/src/core/hle/service/am/service/self_controller.cpp` @ e5fb3b97), so its name
+//! here is starquake's own, and how a console's `sm` answers a title that asks for such a name
+//! (likely an access-control refusal, `ResultNotAllowed`) is a guess this design does not need.
 //!
 //! Access control from the NPDM (which names a title may open) is not checked or logged yet:
 //! the kernel does not yet tell a service which process is calling beyond its id. The service
@@ -194,6 +219,9 @@ pub enum Provider {
     /// An HLE server, by the number it is known to the kernel by
     /// ([`Server::with_service_id`]): `GetService` hands out a session on it.
     Hle(ServiceId),
+    /// An HLE server only other services may open ([`Registry::register_private`]):
+    /// `GetService` answers as for a name nothing provides.
+    Private(ServiceId),
 }
 
 /// Why a service could not be registered.
@@ -269,13 +297,40 @@ impl Registry {
         Ok(())
     }
 
-    /// What provides `name`, if anything is registered under it.
+    /// Registers the HLE server known as `service` under `name` as a private entry: one only
+    /// other services reach ([`Registry::private_service`]), which `GetService` never hands to a
+    /// title (see "Private entries" in the module docs). A name is registered once, public or
+    /// private.
+    pub fn register_private(
+        &mut self,
+        name: ServiceName,
+        service: ServiceId,
+    ) -> Result<(), RegistryError> {
+        if self.services.contains_key(&name) {
+            return Err(RegistryError::AlreadyRegistered(name));
+        }
+        self.services.insert(name, Provider::Private(service));
+        Ok(())
+    }
+
+    /// The number of the server registered privately under `name`: what another service is
+    /// given to hand a session on it out ([`Reply::push_service`]). `None` for a name nothing is
+    /// registered under, and for a public one.
+    #[must_use]
+    pub fn private_service(&self, name: &ServiceName) -> Option<ServiceId> {
+        match self.services.get(name) {
+            Some(Provider::Private(service)) => Some(*service),
+            Some(Provider::Hle(_)) | None => None,
+        }
+    }
+
+    /// What provides `name`, if anything is registered under it, public or private.
     #[must_use]
     pub fn provider(&self, name: &ServiceName) -> Option<Provider> {
         self.services.get(name).copied()
     }
 
-    /// The registered names, in order.
+    /// The registered names, public and private, in order.
     pub fn names(&self) -> impl Iterator<Item = &ServiceName> {
         self.services.keys()
     }
