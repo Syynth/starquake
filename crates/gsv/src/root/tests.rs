@@ -100,7 +100,6 @@ impl Rig {
     }
 }
 
-
 /// `Initialize` (4) as PR's `DecodeBootstrap` reads it: `0x14, 0x8000000c, 2`, the process
 /// handle at word 3, the applet resource user id at words 4–5, the flags at 6–7 and the four
 /// parameters at 8–15.

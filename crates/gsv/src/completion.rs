@@ -18,6 +18,7 @@
 //! | `Syncpoints::increment`, for a watched id only (the watched-id fast path, below) | the same | [`Completion::Gpu`] with [`GpuCompletion::SyncpointChanged`] |
 //! | The kernel's hook on an event gsv created ([`EventHook`]), after the kernel lock is released | [`EventHook::signalled`] | [`Completion::GuestSignalled`] |
 //! | The thread that learns the host GPU is past the work that could use a device-share lock | [`CompletionQueue::push`] | [`Completion::DeviceShareReleased`] |
+//! | gsv's syncpt session, arming a wait the counter already satisfies, so the drain fires and records it ([`crate::syncpt`], "Commands": 201) | [`CompletionQueue::push`] | [`Completion::Gpu`] with [`GpuCompletion::SyncpointChanged`] |
 //!
 //! **A device-share release** (owner's ruling of 2026-11-17, graphics-server "The model"):
 //! taking a device-share lock returns a token naming the process and the exact range

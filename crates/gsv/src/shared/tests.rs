@@ -88,7 +88,7 @@ impl TimerHost for Host {
     }
 }
 
-/// One call a [`Calls`] host received.
+/// One call a [`Journal`] host received.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Call {
     Record(EventKind),
@@ -100,13 +100,13 @@ enum Call {
 /// next of its answers (success once they run out), and refuses to signal the events in
 /// `refused`.
 #[derive(Default)]
-struct Calls {
+struct Journal {
     calls: Vec<Call>,
     answers: std::collections::VecDeque<Result<(), DeviceShareError>>,
     refused: Vec<ObjectId>,
 }
 
-impl TimerHost for Calls {
+impl TimerHost for Journal {
     fn record(&mut self, kind: EventKind) {
         self.calls.push(Call::Record(kind));
     }
@@ -809,7 +809,7 @@ fn the_drain_unlocks_each_release_through_the_kernel_in_queue_order() {
     shared.queue().push(released(4));
     shared.queue().push(released(5));
     shared.queue().push(ordered(3));
-    let mut host = Calls::default();
+    let mut host = Journal::default();
     assert_eq!(
         shared.drain(&mut host),
         [
@@ -846,7 +846,7 @@ fn a_refused_release_is_logged_and_the_drain_goes_on() {
         shared.queue().push(released(n));
         shared.queue().push(ordered(n));
     }
-    let mut host = Calls {
+    let mut host = Journal {
         answers: [
             Err(DeviceShareError::ProcessEnded),
             Err(DeviceShareError::NotLocked {
@@ -855,7 +855,7 @@ fn a_refused_release_is_logged_and_the_drain_goes_on() {
             }),
         ]
         .into(),
-        ..Calls::default()
+        ..Journal::default()
     };
     assert_eq!(shared.drain(&mut host).len(), 6);
     let record = |ticket| {
@@ -985,7 +985,7 @@ fn a_change_fires_its_waits_after_its_note_in_event_order() {
     let shared = fresh();
     arm_mixed(&shared);
     shared.queue().push(changed(20, REACHED));
-    let mut host = Calls::default();
+    let mut host = Journal::default();
     shared.drain(&mut host);
     assert_eq!(
         host.calls,
@@ -1049,9 +1049,9 @@ fn a_refused_signal_is_logged_and_the_drain_goes_on() {
     arm_mixed(&shared);
     shared.queue().push(changed(20, REACHED));
     shared.queue().push(ordered(5));
-    let mut host = Calls {
+    let mut host = Journal {
         refused: vec![event(6)],
-        ..Calls::default()
+        ..Journal::default()
     };
     assert_eq!(shared.drain(&mut host).len(), 2);
     // Every reached wait was signalled, the refused one included, and the next completion was
@@ -1062,9 +1062,7 @@ fn a_refused_signal_is_logged_and_the_drain_goes_on() {
             Call::Signal(event(3)),
             Call::Signal(event(6)),
             Call::Signal(event(9)),
-            Call::Record(note_event(Note::GpuOrderedDone {
-                ticket: Ticket(5)
-            })),
+            Call::Record(note_event(Note::GpuOrderedDone { ticket: Ticket(5) })),
         ]
     );
     // The refused wait is gone, with its watch.

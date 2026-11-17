@@ -75,7 +75,8 @@
 //! is gone, and a stale value drained after a newer one satisfies no wait the newer one did
 //! not, unless the two are 2^31 or more apart under the wrapping comparison. A refused signal
 //! (the kernel no longer has the event) is logged as an error and the drain goes on; the wait
-//! is gone either way (`a_refused_signal_is_logged_and_the_drain_goes_on`).
+//! is gone either way (`a_refused_signal_is_logged_and_the_drain_goes_on`; the level is pinned
+//! by `tests/signal_log_level.rs`, a test binary of its own).
 //!
 //! Later slices act on them as well: the shared page (5), the ordered completion of unmaps and
 //! destroys (7), deferred submissions (11).

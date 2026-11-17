@@ -266,7 +266,9 @@ struct SavedSyncptSession {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum SyncptSessionError {
     /// The event count is above [`MAXIMUM_EVENT_COUNT`]: 21 refuses that.
-    #[error("a syncpt session's event count is {found}, above the maximum of {MAXIMUM_EVENT_COUNT}")]
+    #[error(
+        "a syncpt session's event count is {found}, above the maximum of {MAXIMUM_EVENT_COUNT}"
+    )]
     EventCount {
         /// The count in the data.
         found: u32,
@@ -434,7 +436,14 @@ impl SyncptSession {
         let first = usize::try_from(count).map_err(|_| KernelError::InvalidCombination)?;
         let shared = shared(cx)?;
         let mut state = shared.lock();
-        let events: Vec<ObjectId> = self.events.get(first..).unwrap_or_default().iter().flatten().copied().collect();
+        let events: Vec<ObjectId> = self
+            .events
+            .get(first..)
+            .unwrap_or_default()
+            .iter()
+            .flatten()
+            .copied()
+            .collect();
         self.event_count = count;
         // Every slot's wait is taken out and every event cleared, even after a refusal, so the
         // slots from the count up are left with no wait whatever the kernel says.
@@ -453,12 +462,7 @@ impl SyncptSession {
     }
 
     /// `GetEvent` (22). in: `u32` slot. out: copy handle, the slot's event.
-    fn get_event(
-        &mut self,
-        cx: &mut Context<'_>,
-        req: &Request<'_>,
-        reply: &mut Reply,
-    ) -> Outcome {
+    fn get_event(&mut self, cx: &mut Context<'_>, req: &Request<'_>, reply: &mut Reply) -> Outcome {
         let index = self.slot(req.payload().read_u32()?)?;
         let event = self.slot_event(cx, index)?;
         reply.copy_handle(event);
@@ -473,12 +477,11 @@ impl SyncptSession {
         reply: &mut Reply,
     ) -> Outcome {
         let counter = req.payload().read_u32()?;
-        let value = match syncpoint_of(counter) {
-            Some(id) => shared(cx)?.syncpoints().read(id),
-            None => {
-                tracing::debug!(counter, "gsv:syncpt: a counter id naming no syncpoint");
-                0
-            }
+        let value = if let Some(id) = syncpoint_of(counter) {
+            shared(cx)?.syncpoints().read(id)
+        } else {
+            tracing::debug!(counter, "gsv:syncpt: a counter id naming no syncpoint");
+            0
         };
         tracing::trace!(counter, value, "gsv:syncpt: query counter");
         reply.payload().write_u64(u64::from(value)).write_u32(0);
@@ -487,12 +490,7 @@ impl SyncptSession {
 
     /// `ArmWait` (201). in: `u32` slot, `u32` `SyncCounterId`, `u64` threshold, `u32` mode
     /// (module docs, "Commands", for the order of the checks).
-    fn arm_wait(
-        &mut self,
-        cx: &mut Context<'_>,
-        req: &Request<'_>,
-        reply: &mut Reply,
-    ) -> Outcome {
+    fn arm_wait(&mut self, cx: &mut Context<'_>, req: &Request<'_>, reply: &mut Reply) -> Outcome {
         let mut payload = req.payload();
         let slot = payload.read_u32()?;
         let counter = payload.read_u32()?;
@@ -503,7 +501,10 @@ impl SyncptSession {
         let index = self.slot(slot)?;
         let shared = shared(cx)?;
         let Some(id) = syncpoint_of(counter) else {
-            tracing::warn!(counter, "gsv:syncpt: a wait on no syncpoint; signalled at once");
+            tracing::warn!(
+                counter,
+                "gsv:syncpt: a wait on no syncpoint; signalled at once"
+            );
             let event = self.slot_event(cx, index)?;
             let mut state = shared.lock();
             state.disarm(event);
@@ -525,7 +526,10 @@ impl SyncptSession {
         if wait.reached(value) {
             shared
                 .queue()
-                .push(Completion::Gpu(GpuCompletion::SyncpointChanged { id, value }));
+                .push(Completion::Gpu(GpuCompletion::SyncpointChanged {
+                    id,
+                    value,
+                }));
         }
         drop(state);
         reply.ok()
