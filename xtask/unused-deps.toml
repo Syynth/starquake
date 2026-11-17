@@ -40,8 +40,3 @@ reason = "core wires the whole stack (docs/architecture.md, 'Crates and dependen
 package = "starquake-gpu"
 dependencies = ["starquake-shader"]
 reason = "gpu depends on shader (docs/architecture.md, 'Crates and dependency direction'); the back asks the shader cache for programs, which is not written yet"
-
-[[allow]]
-package = "starquake-gsv"
-dependencies = ["starquake-gpu"]
-reason = "the graphics service layer sits on gpu (docs/architecture.md); the root (port slice 1) hands nothing to the GPU yet; the GPU sessions (slice 7) do"
