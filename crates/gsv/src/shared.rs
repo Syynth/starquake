@@ -358,7 +358,10 @@ fn release(host: &mut dyn TimerHost, token: DeviceShareToken) {
     match host.unlock_device_share(token) {
         Ok(()) => {}
         Err(DeviceShareError::ProcessEnded) => {
-            tracing::debug!(?token, "a device-share release came after its process ended");
+            tracing::debug!(
+                ?token,
+                "a device-share release came after its process ended"
+            );
         }
         Err(error) => {
             tracing::error!(%error, ?token, "the kernel refused gsv's device-share release");

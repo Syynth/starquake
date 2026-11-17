@@ -467,7 +467,8 @@ fn a_push_does_not_wait_for_the_shared_lock() {
 /// Saves `syncpoints` and restores them over a new queue, and restores `shared`'s state over
 /// them: a run brought back from a snapshot.
 fn round_trip(shared: &Shared) -> Result<Shared, SnapshotError> {
-    let queue = Arc::new(CompletionQueue::restore(&shared.queue().save().unwrap(), &locks()).unwrap());
+    let queue =
+        Arc::new(CompletionQueue::restore(&shared.queue().save().unwrap(), &locks()).unwrap());
     let completions: Arc<dyn Completions> = Arc::<CompletionQueue>::clone(&queue);
     let syncpoints =
         Arc::new(Syncpoints::restore(&shared.syncpoints().save().unwrap(), completions).unwrap());
@@ -787,7 +788,11 @@ fn a_refused_release_is_logged_and_the_drain_goes_on() {
         ..Calls::default()
     };
     assert_eq!(shared.drain(&mut host).len(), 6);
-    let record = |ticket| Call::Record(note_event(Note::GpuOrderedDone { ticket: Ticket(ticket) }));
+    let record = |ticket| {
+        Call::Record(note_event(Note::GpuOrderedDone {
+            ticket: Ticket(ticket),
+        }))
+    };
     assert_eq!(
         host.calls,
         [

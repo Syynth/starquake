@@ -499,7 +499,9 @@ pub enum SnapshotError {
         index: usize,
     },
     /// The kernel refused a device-share release's token ([`Reclaim`]).
-    #[error("entry {index} of the completion queue snapshot releases a device-share lock the kernel refused: {error}")]
+    #[error(
+        "entry {index} of the completion queue snapshot releases a device-share lock the kernel refused: {error}"
+    )]
     Release {
         /// The entry's position.
         index: usize,

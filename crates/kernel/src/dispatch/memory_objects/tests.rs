@@ -633,7 +633,10 @@ fn a_server_locks_the_senders_memory_against_change_and_unlocks_it() {
         &request(),
         Box::new(move |cx, _| {
             let mut errors = keep.lock().unwrap();
-            errors.push(cx.lock_device_share(CODE - PAGE_SIZE, PAGE_SIZE).map(|_| ()));
+            errors.push(
+                cx.lock_device_share(CODE - PAGE_SIZE, PAGE_SIZE)
+                    .map(|_| ()),
+            );
             errors.push(cx.unlock_device_share(spent));
             Ok(())
         }),

@@ -135,12 +135,7 @@ mod on_the_kernel {
             reply.ok()
         }
 
-        fn lock(
-            &mut self,
-            cx: &mut Context<'_>,
-            req: &Request<'_>,
-            reply: &mut Reply,
-        ) -> Answer {
+        fn lock(&mut self, cx: &mut Context<'_>, req: &Request<'_>, reply: &mut Reply) -> Answer {
             let (address, size) = range(req)?;
             let token = cx.lock_device_share(address, size)?;
             self.tokens
@@ -153,12 +148,7 @@ mod on_the_kernel {
 
         /// Unlocks with the latest token a lock of the request's range returned, which stays
         /// held, so a second unlock presents it again.
-        fn unlock(
-            &mut self,
-            cx: &mut Context<'_>,
-            req: &Request<'_>,
-            reply: &mut Reply,
-        ) -> Answer {
+        fn unlock(&mut self, cx: &mut Context<'_>, req: &Request<'_>, reply: &mut Reply) -> Answer {
             let (address, size) = range(req)?;
             let token = self
                 .tokens
@@ -349,9 +339,9 @@ mod on_the_kernel {
         let reprotect =
             |rig: &Rig| rig.call(SvcId::SetMemoryPermission, [WORK, PAGE_SIZE, read, 0]);
         assert_eq!(rig.send(session, &with_range(LOCK, WORK, PAGE_SIZE)).0, 0);
-        let [token] = tokens.all()[..] else {
-            panic!("one token");
-        };
+        let all = tokens.all();
+        assert_eq!(all.len(), 1);
+        let token = all[0];
         assert_eq!((token.address(), token.size()), (WORK, PAGE_SIZE));
         assert_eq!(
             reprotect(&rig).x[0],

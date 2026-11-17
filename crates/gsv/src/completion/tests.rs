@@ -535,7 +535,8 @@ fn the_snapshot_layout_is_pinned() {
             0x01, 0x84, 0x06, // GpuOrdered: ticket 0x304
             0x02, 0x06, // GpuQueueRoom: channel 6
             0x03, 0x07, 0x08, // GuestSignalled: event index 7, generation 8
-            0x04, 0x09, 0x0A, 0x0B, 0x0C, // DeviceShareReleased: process (9, 10), 0xC bytes at 0xB
+            0x04, 0x09, 0x0A, 0x0B,
+            0x0C, // DeviceShareReleased: process (9, 10), 0xC bytes at 0xB
         ]
     );
     // It restores to the same queue, with the kernel's token.
@@ -587,7 +588,12 @@ fn a_restored_queue_keeps_coalescing_and_order() {
 fn an_empty_queue_saves_and_restores() {
     let bytes = CompletionQueue::new().save().unwrap();
     assert_eq!(bytes, snapshot(&[0x00]));
-    assert_eq!(CompletionQueue::restore(&bytes, &locks()).unwrap().take_all(), []);
+    assert_eq!(
+        CompletionQueue::restore(&bytes, &locks())
+            .unwrap()
+            .take_all(),
+        []
+    );
 }
 
 #[test]
@@ -625,7 +631,9 @@ fn a_cut_snapshot_is_refused() {
     queue.push(ordered(0x0304));
     let bytes = queue.save().unwrap();
     for len in 0..bytes.len() {
-        let error = CompletionQueue::restore(&bytes[..len], &locks()).err().unwrap();
+        let error = CompletionQueue::restore(&bytes[..len], &locks())
+            .err()
+            .unwrap();
         assert!(
             matches!(error, SnapshotError::Decode(_)),
             "cut to {len}: {error:?}"
@@ -652,7 +660,9 @@ fn an_entry_naming_no_syncpoint_is_refused_at_the_count() {
     // The last syncpoint is accepted.
     let good = snapshot(&[0x02, 0x01, 0x05, 0x00, last, 0x01]);
     assert_eq!(
-        CompletionQueue::restore(&good, &locks()).unwrap().take_all(),
+        CompletionQueue::restore(&good, &locks())
+            .unwrap()
+            .take_all(),
         [ordered(5), changed(last, 1)]
     );
     // One past it is refused, at its index.
@@ -683,7 +693,9 @@ fn a_repeated_coalesced_entry_is_refused() {
         &[0x03, 0x03, 0x04, 0x05, 0x01, 0x09, 0x03, 0x04, 0x05], // event (4, 5) twice
     ];
     for body in repeats {
-        let error = CompletionQueue::restore(&snapshot(body), &locks()).err().unwrap();
+        let error = CompletionQueue::restore(&snapshot(body), &locks())
+            .err()
+            .unwrap();
         assert_eq!(error, SnapshotError::Repeated { index: 2 }, "{body:x?}");
         assert_eq!(
             error.to_string(),
@@ -694,12 +706,16 @@ fn a_repeated_coalesced_entry_is_refused() {
     // accepted; so is a repeated ticket, which is not coalesced.
     let across = snapshot(&[0x03, 0x00, 0x05, 0x01, 0x01, 0x09, 0x00, 0x05, 0x02]);
     assert_eq!(
-        CompletionQueue::restore(&across, &locks()).unwrap().take_all(),
+        CompletionQueue::restore(&across, &locks())
+            .unwrap()
+            .take_all(),
         [changed(5, 1), ordered(9), changed(5, 2)]
     );
     let tickets = snapshot(&[0x02, 0x01, 0x09, 0x01, 0x09]);
     assert_eq!(
-        CompletionQueue::restore(&tickets, &locks()).unwrap().take_all(),
+        CompletionQueue::restore(&tickets, &locks())
+            .unwrap()
+            .take_all(),
         [ordered(9), ordered(9)]
     );
 }
@@ -710,13 +726,17 @@ fn entries_are_checked_in_order() {
     let first_out = u8::try_from(SYNCPOINT_COUNT).unwrap();
     let body = [0x03, 0x02, 0x04, 0x02, 0x04, 0x00, first_out, 0x01];
     assert_eq!(
-        CompletionQueue::restore(&snapshot(&body), &locks()).err().unwrap(),
+        CompletionQueue::restore(&snapshot(&body), &locks())
+            .err()
+            .unwrap(),
         SnapshotError::Repeated { index: 1 }
     );
     // The other way round.
     let body = [0x03, 0x02, 0x04, 0x00, first_out, 0x01, 0x02, 0x04];
     assert_eq!(
-        CompletionQueue::restore(&snapshot(&body), &locks()).err().unwrap(),
+        CompletionQueue::restore(&snapshot(&body), &locks())
+            .err()
+            .unwrap(),
         SnapshotError::NoSuchSyncpoint {
             index: 1,
             id: first_out
@@ -814,7 +834,12 @@ fn a_release_the_kernel_refuses_is_refused_at_its_index() {
     let other = ProcessId::from_parts(process().index() + 1, process().generation());
     let held = token(1);
     for (process, address, size, error) in [
-        (other, held.address(), held.size(), DeviceShareError::WrongProcess),
+        (
+            other,
+            held.address(),
+            held.size(),
+            DeviceShareError::WrongProcess,
+        ),
         // One range short, and one long, of a held lock.
         (
             process(),
@@ -864,7 +889,9 @@ fn a_release_the_kernel_refuses_is_refused_at_its_index() {
     // The held lock itself is taken back.
     let bytes = one_release(process(), held.address(), held.size());
     assert_eq!(
-        CompletionQueue::restore(&bytes, &locks()).unwrap().take_all(),
+        CompletionQueue::restore(&bytes, &locks())
+            .unwrap()
+            .take_all(),
         [released(1)]
     );
 }
@@ -904,9 +931,7 @@ fn a_refused_release_and_a_repeat_are_answered_in_entry_order() {
 /// A dispatcher over a fresh process, which holds no device-share lock, and that process.
 fn real_kernel() -> (starquake_kernel::dispatch::Dispatcher, ProcessId) {
     use starquake_kernel::memory::testing::RecordingMapper;
-    use starquake_kernel::memory::{
-        AddressSpace, MemoryArrangement, ProcessMemory, RegionOffsets,
-    };
+    use starquake_kernel::memory::{AddressSpace, MemoryArrangement, ProcessMemory, RegionOffsets};
     use starquake_kernel::process::{self, Console, ProcessDescription};
 
     let (mapper, _log) = RecordingMapper::new();

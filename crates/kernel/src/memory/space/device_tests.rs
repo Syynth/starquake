@@ -407,17 +407,25 @@ fn the_lock_count_is_kept_per_exact_range() {
     let (mut space, heap) = with_heap(4);
     space.lock_device_share(heap, 2 * PAGE_SIZE).unwrap();
     space.lock_device_share(heap, 2 * PAGE_SIZE).unwrap();
-    space.lock_device_share(heap + PAGE_SIZE, PAGE_SIZE).unwrap();
+    space
+        .lock_device_share(heap + PAGE_SIZE, PAGE_SIZE)
+        .unwrap();
     assert_eq!(space.device_locks(heap, 2 * PAGE_SIZE), 2);
     assert_eq!(space.device_locks(heap + PAGE_SIZE, PAGE_SIZE), 1);
     // A range inside or around a locked one has none of its own.
     assert_eq!(space.device_locks(heap, PAGE_SIZE), 0);
     assert_eq!(space.device_locks(heap, 3 * PAGE_SIZE), 0);
     // A refused lock counts nothing: free memory past the heap.
-    assert_eq!(space.lock_device_share(heap + 4 * PAGE_SIZE, PAGE_SIZE), INVALID);
+    assert_eq!(
+        space.lock_device_share(heap + 4 * PAGE_SIZE, PAGE_SIZE),
+        INVALID
+    );
     assert_eq!(space.device_locks(heap + 4 * PAGE_SIZE, PAGE_SIZE), 0);
     // The inner lock goes on its own, and the outer one's count is unchanged.
-    assert_eq!(space.unlock_device_share(heap + PAGE_SIZE, PAGE_SIZE), Ok(()));
+    assert_eq!(
+        space.unlock_device_share(heap + PAGE_SIZE, PAGE_SIZE),
+        Ok(())
+    );
     assert_eq!(space.device_locks(heap + PAGE_SIZE, PAGE_SIZE), 0);
     assert_eq!(space.device_locks(heap, 2 * PAGE_SIZE), 2);
     assert_eq!(space.unlock_device_share(heap, 2 * PAGE_SIZE), Ok(()));
