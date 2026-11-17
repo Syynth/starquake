@@ -326,15 +326,6 @@ pub(crate) fn in_window(start: u64, size: u64) -> bool {
     (VA_WINDOW_START..VA_WINDOW_END).contains(&start) && size <= VA_WINDOW_END - start
 }
 
-/// The part of `range` inside `start..end`, if any.
-fn intersect(range: PageRange, start: u64, end: u64) -> Option<PageRange> {
-    let low = range.start().max(start);
-    let high = range.end().min(end);
-    (low < high)
-        .then(|| PageRange::new(low, high - low).ok())
-        .flatten()
-}
-
 /// The spans of `spans` cut to `low..high`.
 fn clip(spans: &[Span], low: u64, high: u64) -> Vec<Span> {
     spans

@@ -158,7 +158,7 @@
 //! | The state of two gpu sessions | each 497 makes its own events, devices, address spaces and worker | one object per 497, its worker the same object | one per process, shared by every session (`two_sessions_share_the_state`) |
 //! | 22 called twice | the same worker session | the same object | a new worker session each time, over the same state (`two_sessions_share_the_state`) |
 //! | Handles from 12 and 22 | moved | copied | copied: the spec's **conflict**, NX2's (`notification_events_are_made_once_and_copied`) |
-//! | An address space before root 434 registers it | `NotFound` from every worker job | no check | usable at once: root 434 is a stub (`a_fresh_address_space_takes_jobs`) |
+//! | An address space before root 434 registers it | `NotFound` from every worker job | no check | usable at once: root 434 is a stub (`a_map_is_published_and_signalled_at_once`, which sends no 434) |
 //! | A request whose header words are not PR's exact ones | `InvalidCombination` | read as it comes | too few data words is `INVALID_CMIF_REQUEST`; more are read (`a_short_request_is_refused`) |
 //! | A refused request's reply | the result and the reply's data words, zero | as on success | the result only, as the service framework answers every refusal (`a_refused_map_signals_and_answers_the_result_only`) |
 //! | A 213 on a sparse region, a 215 on a 211 mapping | allowed: both search one list | no checks | `NotFound`: each searches its own (`unmap_matches_a_mapping_exactly`) |

@@ -206,79 +206,44 @@ fn locks_beyond_the_kernel_s_are_refused_at_the_first_extra_one() {
     );
 }
 
-/// Each check refuses its fault, with the error it names; where two faults are present, the
-/// one checked first answers.
-#[test]
-fn every_check_refuses_its_fault() {
-    type Break = fn(&mut State);
-    let cases: [(Break, SnapshotError); 14] = [
-        (
-            |s| s.next.0 = 0,
-            SnapshotError::OutOfRange {
-                part: Part::Counters,
-                index: 0,
-            },
-        ),
+/// A change to the golden state that breaks one check.
+type Break = fn(&mut State);
+
+/// An out-of-range refusal of the first `part`.
+fn out(part: Part) -> SnapshotError {
+    SnapshotError::OutOfRange { part, index: 0 }
+}
+
+/// A dangling-reference refusal of the first `part`.
+fn dangling(part: Part) -> SnapshotError {
+    SnapshotError::Dangling { part, index: 0 }
+}
+
+/// Each fault, and the error it must be refused with.
+fn faults() -> [(Break, SnapshotError); 14] {
+    [
+        (|s| s.next.0 = 0, out(Part::Counters)),
         // An event index past the range, and a device 0: the event first.
         (
             |s| {
                 s.events[0].0 = NOTIFICATION_COUNT;
                 s.devices[0].0 = 0;
             },
-            SnapshotError::OutOfRange {
-                part: Part::Event,
-                index: 0,
-            },
+            out(Part::Event),
         ),
-        (
-            |s| s.devices[0].0 = 0,
-            SnapshotError::OutOfRange {
-                part: Part::Device,
-                index: 0,
-            },
-        ),
-        (
-            |s| s.spaces[0].id = 3,
-            SnapshotError::OutOfRange {
-                part: Part::Space,
-                index: 0,
-            },
-        ),
-        (
-            |s| s.registrations[0].size = 1,
-            SnapshotError::OutOfRange {
-                part: Part::Registration,
-                index: 0,
-            },
-        ),
-        (
-            |s| s.spaces[0].regions[0].0 = W - PAGE,
-            SnapshotError::OutOfRange {
-                part: Part::Region,
-                index: 0,
-            },
-        ),
-        (
-            |s| s.spaces[0].regions[0].2 = 0x34,
-            SnapshotError::OutOfRange {
-                part: Part::Region,
-                index: 0,
-            },
-        ),
+        (|s| s.devices[0].0 = 0, out(Part::Device)),
+        (|s| s.spaces[0].id = 3, out(Part::Space)),
+        (|s| s.registrations[0].size = 1, out(Part::Registration)),
+        (|s| s.spaces[0].regions[0].0 = W - PAGE, out(Part::Region)),
+        (|s| s.spaces[0].regions[0].2 = 0x34, out(Part::Region)),
         (
             |s| s.spaces[0].records[0].handle = 6,
-            SnapshotError::Dangling {
-                part: Part::Mapping,
-                index: 0,
-            },
+            dangling(Part::Mapping),
         ),
         // The offset at its edge is accepted below; one page more is refused.
         (
             |s| s.spaces[0].records[0].offset = 2 * PAGE,
-            SnapshotError::OutOfRange {
-                part: Part::Mapping,
-                index: 0,
-            },
+            out(Part::Mapping),
         ),
         (
             |s| s.spaces[0].records[0].spans[1].0 += PAGE,
@@ -288,36 +253,21 @@ fn every_check_refuses_its_fault() {
             },
         ),
         (
-            |s| s.spaces[0].records[0].spans.pop().map(drop).unwrap_or(()),
-            SnapshotError::OutOfRange {
-                part: Part::Mapping,
-                index: 0,
-            },
+            |s| s.spaces[0].records[0].spans.truncate(1),
+            out(Part::Mapping),
         ),
-        (
-            |s| s.pending[0].ticket = 0x0A,
-            SnapshotError::OutOfRange {
-                part: Part::Job,
-                index: 0,
-            },
-        ),
-        (
-            |s| s.pending[0].event = object(1, 1),
-            SnapshotError::Dangling {
-                part: Part::Job,
-                index: 0,
-            },
-        ),
-        (
-            |s| s.pending[0].reveal[0].0 = 1,
-            SnapshotError::Dangling {
-                part: Part::Job,
-                index: 0,
-            },
-        ),
-    ];
+        (|s| s.pending[0].ticket = 0x0A, out(Part::Job)),
+        (|s| s.pending[0].event = object(1, 1), dangling(Part::Job)),
+        (|s| s.pending[0].reveal[0].0 = 1, dangling(Part::Job)),
+    ]
+}
+
+/// Each check refuses its fault, with the error it names; where two faults are present, the
+/// one checked first answers.
+#[test]
+fn every_check_refuses_its_fault() {
     let front = Front::default();
-    for (index, (fault, error)) in cases.into_iter().enumerate() {
+    for (index, (fault, error)) in faults().into_iter().enumerate() {
         let mut state = golden();
         fault(&mut state);
         assert_eq!(

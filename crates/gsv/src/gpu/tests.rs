@@ -140,6 +140,19 @@ impl TimerHost for Timer<'_> {
     }
 }
 
+/// A timer host that unlocks and keeps the tokens, and signals nothing: [`TimerHost`]'s default
+/// refusal.
+struct Refusing(Vec<DeviceShareToken>);
+
+impl TimerHost for Refusing {
+    fn record(&mut self, _: EventKind) {}
+
+    fn unlock_device_share(&mut self, token: DeviceShareToken) -> Result<(), DeviceShareError> {
+        self.0.push(token);
+        Ok(())
+    }
+}
+
 // ----- The rig ---------------------------------------------------------------------------------
 
 /// A gpu server over gsv's shared state, a fake front, a kernel, and one gpu session.
@@ -305,12 +318,11 @@ fn halves(value: u64) -> [u32; 2] {
 fn reply_of(buffer: &[u8]) -> (ResultCode, Vec<u32>) {
     let message = Message::parse_reply(buffer, SessionKind::Session).unwrap();
     let Body::TipcReply { result, data } = message.body else {
-        panic!("not a TIPC reply: {:?}", message.body);
+        unreachable!("not a TIPC reply: {:?}", message.body);
     };
-    let words = data
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
-        .collect();
+    let (chunks, rest) = data.as_chunks::<4>();
+    assert!(rest.is_empty(), "a reply's data is whole words");
+    let words = chunks.iter().map(|c| u32::from_le_bytes(*c)).collect();
     (ResultCode::from_raw(result), words)
 }
 
@@ -437,6 +449,10 @@ fn range_words(command: u32, space: u32, first: u64, last: u64, sync: u32, slot:
 
 /// 214 (`0xe6, 10`, PR `DecodeGpuSparseRegion`): space 2, first 3–4, last 5–6, page shift 7,
 /// mode 8, device 9, sync 10, slot 11.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one argument per request word, in the order the layout gives them"
+)]
 fn sparse_words(
     space: u32,
     first: u64,
@@ -482,11 +498,11 @@ impl Ready {
         );
         self.rig.send_on(self.worker, &words)
     }
+}
 
-    /// The registration's own mapping.
-    fn own(&self) -> Mapping {
-        guest(page_range(MEMORY, MEMORY_SIZE), MEMORY, SELF_MAP_KIND)
-    }
+/// The tests' registration's own mapping.
+fn own() -> Mapping {
+    guest(page_range(MEMORY, MEMORY_SIZE), MEMORY, SELF_MAP_KIND)
 }
 
 use starquake_gpu::interface::Kind;
@@ -511,7 +527,7 @@ fn notification_events_are_made_once_and_copied() {
     let first = rig.send(&[tipc_type(GET_NOTIFICATION_EVENT), 1, last]);
     let message = Message::parse_reply(&first, SessionKind::Session).unwrap();
     assert_eq!(message.copy_handles.len(), 1);
-    assert!(message.move_handles.is_empty());
+    assert_eq!(message.move_handles, Vec::<u32>::new());
     let event = rig.gpu().gpu_memory().notification_event(last).unwrap();
     rig.send(&[tipc_type(GET_NOTIFICATION_EVENT), 1, last]);
     assert_eq!(rig.gpu().gpu_memory().notification_event(last), Some(event));
@@ -651,8 +667,8 @@ fn a_registration_is_locked_and_mapped_in_every_space() {
     let mut s = ready();
     assert_eq!(s.rig.kernel.device_locks(MEMORY, MEMORY_SIZE), 1);
     let later = s.rig.address_space();
-    assert_eq!(s.rig.mappings(s.space), [s.own()]);
-    assert_eq!(s.rig.mappings(later), [s.own()]);
+    assert_eq!(s.rig.mappings(s.space), [own()]);
+    assert_eq!(s.rig.mappings(later), [own()]);
     let registration = *s.rig.gpu().gpu_memory().registration(s.handle).unwrap();
     assert_eq!(registration.range, page_range(MEMORY, MEMORY_SIZE));
     assert_eq!(registration.device, u8::try_from(s.device).unwrap());
@@ -739,7 +755,7 @@ fn a_map_is_published_and_signalled_at_once() {
     assert_eq!(data(&reply), [3]);
     assert_eq!(s.rig.kernel.signals(s.event), Some(1));
     let mapped = guest(page_range(GPU_VA, PAGE_SIZE), MEMORY + PAGE_SIZE, S8Z24);
-    assert_eq!(s.rig.mappings(s.space), [s.own(), mapped]);
+    assert_eq!(s.rig.mappings(s.space), [own(), mapped]);
 }
 
 /// A refused 211 (after its slot) signals its event and replies with the result alone; one with
@@ -758,7 +774,7 @@ fn a_refused_map_signals_and_answers_the_result_only() {
     );
     let reply = s.rig.send_on(s.worker, &words);
     assert_eq!(result_of(&reply), code(KernelError::InvalidCurrentMemory));
-    assert!(data(&reply).is_empty());
+    assert_eq!(data(&reply), Vec::<u32>::new());
     assert_eq!(s.rig.kernel.signals(s.event), Some(1));
     let no_slot = map_words(
         s.space,
@@ -901,7 +917,7 @@ fn a_map_over_a_mapping_cuts_it() {
     assert_eq!(
         s.rig.mappings(s.space),
         [
-            s.own(),
+            own(),
             guest(page_range(GPU_VA, PAGE_SIZE), MEMORY, kind),
             guest(
                 page_range(GPU_VA + PAGE_SIZE, PAGE_SIZE),
@@ -974,7 +990,7 @@ fn an_unmap_s_event_fires_only_after_the_barrier() {
     let calls = s.rig.finish();
     assert_eq!(calls.last(), Some(&TimerCall::Signal(s.event)));
     assert_eq!(s.rig.kernel.signals(s.event), before.map(|n| n + 1));
-    assert_eq!(s.rig.mappings(s.space), [s.own()]);
+    assert_eq!(s.rig.mappings(s.space), [own()]);
 }
 
 /// 213 matches exactly one 211 mapping: a page shorter or longer, or a sparse region, is
@@ -1058,7 +1074,7 @@ fn a_destroy_releases_the_lock_only_when_the_gpu_is_done() {
     assert_eq!(result_of(&reply), ResultCode::SUCCESS);
     assert_eq!(s.rig.kernel.device_locks(MEMORY, MEMORY_SIZE), 1);
     assert_eq!(s.rig.kernel.signals(s.event), Some(0));
-    assert_eq!(s.rig.mappings(s.space), [s.own()]);
+    assert_eq!(s.rig.mappings(s.space), [own()]);
     let calls = s.rig.finish();
     let acted: Vec<TimerCall> = calls
         .into_iter()
@@ -1070,7 +1086,7 @@ fn a_destroy_releases_the_lock_only_when_the_gpu_is_done() {
     );
     assert_eq!(s.rig.kernel.device_locks(MEMORY, MEMORY_SIZE), 0);
     assert_eq!(s.rig.kernel.signals(s.event), Some(1));
-    assert!(s.rig.mappings(s.space).is_empty());
+    assert_eq!(s.rig.mappings(s.space), Vec::<Mapping>::new());
 }
 
 /// conflict (the larger): a 102 takes the registration's 211 mappings out with it, in one job.
@@ -1093,7 +1109,7 @@ fn a_destroy_unmaps_the_registration_s_maps() {
         ]
     );
     s.rig.finish();
-    assert!(s.rig.mappings(s.space).is_empty());
+    assert_eq!(s.rig.mappings(s.space), Vec::<Mapping>::new());
 }
 
 #[test]
@@ -1239,62 +1255,38 @@ fn sparse_region_checks_answer_in_prs_order() {
         ask(space, REGION, last, 12, 1, device, 2),
         code(KernelError::NotImplemented)
     );
+}
+
+/// 214's window and overlap checks, each at both sides of its edge.
+#[test]
+fn sparse_region_bounds_are_checked_at_their_edges() {
+    let mut s = ready();
+    let (space, device) = (s.space, s.device);
+    let mut ask = |space: u32, first: u64, last: u64| {
+        result_of(&s.rig.send_on(
+            s.worker,
+            &sparse_words(space, first, last, 12, 0, device, 0, 0),
+        ))
+    };
+    let last = REGION + PAGE_SIZE - 1;
     let refused = code(KernelError::InvalidCurrentMemory);
     assert_eq!(
-        ask(
-            space,
-            VA_WINDOW_START - PAGE_SIZE,
-            VA_WINDOW_START - 1,
-            12,
-            0,
-            device,
-            0
-        ),
+        ask(space, VA_WINDOW_START - PAGE_SIZE, VA_WINDOW_START - 1),
         refused
     );
     assert_eq!(
-        ask(
-            space,
-            VA_WINDOW_END,
-            VA_WINDOW_END + PAGE_SIZE - 1,
-            12,
-            0,
-            device,
-            0
-        ),
+        ask(space, VA_WINDOW_END, VA_WINDOW_END + PAGE_SIZE - 1),
         refused
     );
     assert_eq!(
-        ask(
-            space,
-            VA_WINDOW_END - PAGE_SIZE,
-            VA_WINDOW_END - 1,
-            12,
-            0,
-            device,
-            0
-        ),
+        ask(space, VA_WINDOW_END - PAGE_SIZE, VA_WINDOW_END - 1),
         ResultCode::SUCCESS
     );
-    assert_eq!(
-        ask(space, REGION, last, 12, 0, device, 0),
-        ResultCode::SUCCESS
-    );
+    assert_eq!(ask(space, REGION, last), ResultCode::SUCCESS);
     // Overlapping it by one page, and the neighbour exactly at its end.
+    assert_eq!(ask(space, REGION, last + PAGE_SIZE), refused);
     assert_eq!(
-        ask(space, REGION, last + PAGE_SIZE, 12, 0, device, 0),
-        refused
-    );
-    assert_eq!(
-        ask(
-            space,
-            REGION + PAGE_SIZE,
-            last + PAGE_SIZE,
-            12,
-            0,
-            device,
-            0
-        ),
+        ask(space, REGION + PAGE_SIZE, last + PAGE_SIZE),
         ResultCode::SUCCESS
     );
 }
@@ -1318,14 +1310,14 @@ fn an_unmap_inside_a_sparse_region_shows_the_region_again() {
         },
         kind: SPARSE_KIND,
     };
-    assert_eq!(s.rig.mappings(s.space), [s.own(), sparse(REGION, size)]);
+    assert_eq!(s.rig.mappings(s.space), [own(), sparse(REGION, size)]);
     let inside = REGION + 2 * PAGE_SIZE;
     s.map_at(inside);
     let mapped = guest(page_range(inside, MEMORY_SIZE), MEMORY, GENERIC_16BX2);
     assert_eq!(
         s.rig.mappings(s.space),
         [
-            s.own(),
+            own(),
             sparse(REGION, 2 * PAGE_SIZE),
             mapped,
             sparse(inside + MEMORY_SIZE, 2 * PAGE_SIZE)
@@ -1347,7 +1339,7 @@ fn an_unmap_inside_a_sparse_region_shows_the_region_again() {
     assert_eq!(
         s.rig.mappings(s.space),
         [
-            s.own(),
+            own(),
             sparse(REGION, 2 * PAGE_SIZE),
             sparse(inside, MEMORY_SIZE),
             sparse(inside + MEMORY_SIZE, 2 * PAGE_SIZE)
@@ -1374,7 +1366,7 @@ fn a_sparse_region_lies_under_a_registration() {
         result_of(&s.rig.send_on(s.worker, &words)),
         ResultCode::SUCCESS
     );
-    assert_eq!(s.rig.mappings(s.space), [s.own()]);
+    assert_eq!(s.rig.mappings(s.space), [own()]);
     s.rig.send_on(s.worker, &[0x76, 2, s.handle, 0]);
     s.rig.finish();
     let region = Mapping {
@@ -1439,7 +1431,7 @@ fn a_sparse_region_is_destroyed_in_order() {
     s.rig.finish();
     assert_eq!(s.rig.kernel.signals(s.event), Some(signals + 1));
     let mapped = guest(page_range(REGION, MEMORY_SIZE), MEMORY, GENERIC_16BX2);
-    assert_eq!(s.rig.mappings(s.space), [s.own(), mapped]);
+    assert_eq!(s.rig.mappings(s.space), [own(), mapped]);
 }
 
 // ----- Bounds and the shim ---------------------------------------------------------------------
@@ -1615,14 +1607,6 @@ fn the_drain_skips_unknown_tickets_and_goes_on_after_a_refused_signal() {
     }));
     s.rig.front.finish(&queue);
     // A host that signals nothing: the trait's default refusal.
-    struct Refusing(Vec<DeviceShareToken>);
-    impl TimerHost for Refusing {
-        fn record(&mut self, _: EventKind) {}
-        fn unlock_device_share(&mut self, token: DeviceShareToken) -> Result<(), DeviceShareError> {
-            self.0.push(token);
-            Ok(())
-        }
-    }
     let mut host = Refusing(Vec::new());
     let taken = s.rig.shared.drain(&mut host);
     assert_eq!(taken.len(), 3);
