@@ -121,20 +121,106 @@ fn a_guest_signal_on_a_hooked_event_reaches_the_queue() {
 
 #[test]
 fn a_queued_syncpoint_change_keeps_its_place_and_the_value_further_ahead() {
+    // With no ordered entry behind it, a second change of the id folds into the first.
     let queue = CompletionQueue::new();
     queue.push(changed(5, 10));
-    queue.push(ordered(1));
+    queue.push(changed(6, 3));
     queue.push(changed(5, 12));
     // Pushed late by a second incrementer: behind the value held, so the held one stays.
     queue.push(changed(5, 11));
-    queue.push(changed(6, 3));
-    assert_eq!(
-        queue.take_all(),
-        [changed(5, 12), ordered(1), changed(6, 3)]
-    );
+    assert_eq!(queue.take_all(), [changed(5, 12), changed(6, 3)]);
     // Once taken, the next change is queued again.
     queue.push(changed(5, 13));
     assert_eq!(queue.take_all(), [changed(5, 13)]);
+}
+
+#[test]
+fn a_syncpoint_change_is_not_folded_across_an_ordered_entry() {
+    // A change pushed after an ordered entry drains after it (the spec's "Order": increments
+    // and ordered updates take effect in call order), so it takes a new place, which later
+    // changes of the id fold into until the next ordered entry. The other id, whose entry is
+    // behind the same ordered entry, is folded across it: nothing ordered follows its entry.
+    let queue = CompletionQueue::new();
+    queue.push(changed(5, 10));
+    queue.push(ordered(1));
+    queue.push(changed(6, 3));
+    queue.push(changed(5, 12));
+    queue.push(changed(5, 14));
+    queue.push(changed(6, 4));
+    queue.push(ordered(2));
+    queue.push(ordered(3));
+    queue.push(changed(5, 15));
+    queue.push(changed(5, 16));
+    assert_eq!(
+        queue.take_all(),
+        [
+            changed(5, 10),
+            ordered(1),
+            changed(6, 4),
+            changed(5, 14),
+            ordered(2),
+            ordered(3),
+            changed(5, 16),
+        ]
+    );
+}
+
+#[test]
+fn a_syncpoint_takes_at_most_one_entry_more_than_the_ordered_entries() {
+    // The bound the module docs give: per id, one entry plus one per queued ordered entry.
+    const ORDERED: u64 = 3;
+    let queue = CompletionQueue::new();
+    for ticket in 0..ORDERED {
+        for value in 0..4 {
+            queue.push(changed(5, u32::try_from(ticket * 4 + value).unwrap()));
+        }
+        queue.push(ordered(ticket));
+    }
+    for value in 100..104 {
+        queue.push(changed(5, value));
+    }
+    let taken = queue.take_all();
+    let changes = taken
+        .iter()
+        .filter(|completion| {
+            matches!(
+                completion,
+                Completion::Gpu(GpuCompletion::SyncpointChanged { .. })
+            )
+        })
+        .count();
+    assert_eq!(changes, usize::try_from(ORDERED + 1).unwrap());
+    assert_eq!(
+        taken,
+        [
+            changed(5, 3),
+            ordered(0),
+            changed(5, 7),
+            ordered(1),
+            changed(5, 11),
+            ordered(2),
+            changed(5, 103),
+        ]
+    );
+}
+
+#[test]
+fn drained_syncpoint_values_are_not_monotone() {
+    // A late incrementer's older value pushed after the newer one was taken is queued again,
+    // and so is one pushed behind an ordered entry: the module docs say the drained values of
+    // an id are not monotone across drains or across an ordered entry.
+    let queue = CompletionQueue::new();
+    queue.push(changed(5, 5));
+    assert_eq!(queue.take_all(), [changed(5, 5)]);
+    queue.push(changed(5, 4));
+    assert_eq!(queue.take_all(), [changed(5, 4)]);
+    queue.push(changed(5, 10));
+    queue.push(ordered(1));
+    queue.push(changed(5, 9));
+    assert_eq!(
+        queue.take_all(),
+        [changed(5, 10), ordered(1), changed(5, 9)]
+    );
 }
 
 #[test]
@@ -202,7 +288,7 @@ fn the_timer_is_woken_once_per_empty_to_queued() {
     queue.push(ordered(1));
     queue.push(changed(5, 2));
     assert_eq!(counter.count(), 1);
-    assert_eq!(queue.take_all().len(), 2);
+    assert_eq!(queue.take_all().len(), 3);
     // Empty again: the next push wakes.
     queue.push(changed(5, 3));
     assert_eq!(counter.count(), 2);
@@ -210,6 +296,48 @@ fn the_timer_is_woken_once_per_empty_to_queued() {
     queue.take_all();
     assert_eq!(queue.take_all(), []);
     assert_eq!(counter.count(), 2);
+}
+
+/// A [`Wake`] that takes from the queue it belongs to, which it can do only if the queue's lock
+/// is not held while it is told.
+struct Taker {
+    queue: std::sync::Weak<CompletionQueue>,
+    taken: Arc<Mutex<Vec<Completion>>>,
+}
+
+impl Wake for Taker {
+    fn completion_queued(&self) {
+        if let Some(queue) = self.queue.upgrade() {
+            let taken = queue.take_all();
+            self.taken.lock().unwrap().extend(taken);
+        }
+    }
+}
+
+#[test]
+fn the_wake_is_told_with_no_lock_held() {
+    // The module docs promise the `Wake` is told with no lock held. A `Wake` that takes from the
+    // queue would deadlock if the queue's lock were still held, so the push runs on a thread
+    // whose end is awaited with a timeout.
+    let taken = Arc::new(Mutex::new(Vec::new()));
+    let queue = Arc::new_cyclic(|weak| {
+        let wake: Arc<dyn Wake> = Arc::new(Taker {
+            queue: std::sync::Weak::clone(weak),
+            taken: Arc::clone(&taken),
+        });
+        CompletionQueue::new().with_wake(wake)
+    });
+    let (done, finished) = std::sync::mpsc::channel();
+    let pusher = Arc::clone(&queue);
+    std::thread::spawn(move || {
+        pusher.push(ordered(1));
+        done.send(()).unwrap();
+    });
+    finished
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the push did not finish: the Wake was told with the queue's lock held");
+    assert_eq!(*taken.lock().unwrap(), [ordered(1)]);
+    assert_eq!(queue.take_all(), []);
 }
 
 #[test]
@@ -282,32 +410,40 @@ fn step() -> impl Strategy<Value = Step> {
     ]
 }
 
-/// The queue as a list scanned from the front: what the module docs say it keeps.
+/// The queue as a list: what the module docs say it keeps. A syncpoint change folds into the
+/// id's last entry if no ordered entry follows it; a room or a signal folds into any entry
+/// naming the same thing.
 fn model_push(model: &mut Vec<Completion>, completion: Completion) {
-    let same = |held: &Completion| match (held, completion) {
-        (
-            Completion::Gpu(GpuCompletion::SyncpointChanged { id: a, .. }),
-            Completion::Gpu(GpuCompletion::SyncpointChanged { id: b, .. }),
-        ) => *a == b,
-        (
-            Completion::Gpu(GpuCompletion::GpuQueueRoom { channel: a }),
-            Completion::Gpu(GpuCompletion::GpuQueueRoom { channel: b }),
-        ) => *a == b,
-        (Completion::GuestSignalled { event: a }, Completion::GuestSignalled { event: b }) => {
-            *a == b
-        }
-        _ => false,
-    };
-    match model.iter_mut().find(|held| same(held)) {
-        Some(Completion::Gpu(GpuCompletion::SyncpointChanged { value: held, .. })) => {
-            if let Completion::Gpu(GpuCompletion::SyncpointChanged { value, .. }) = completion
-                && value.wrapping_sub(*held).cast_signed() >= 0
-            {
-                *held = value;
+    match completion {
+        Completion::Gpu(GpuCompletion::SyncpointChanged { id, value }) => {
+            let mut target = None;
+            for held in model.iter_mut() {
+                match held {
+                    Completion::Gpu(GpuCompletion::SyncpointChanged {
+                        id: other,
+                        value: held,
+                    }) if *other == id => {
+                        target = Some(held);
+                    }
+                    Completion::Gpu(GpuCompletion::GpuOrdered { .. }) => target = None,
+                    _ => {}
+                }
+            }
+            match target {
+                Some(held) => {
+                    if value.wrapping_sub(*held).cast_signed() >= 0 {
+                        *held = value;
+                    }
+                }
+                None => model.push(completion),
             }
         }
-        Some(_) => {}
-        None => model.push(completion),
+        Completion::Gpu(GpuCompletion::GpuOrdered { .. }) => model.push(completion),
+        Completion::Gpu(GpuCompletion::GpuQueueRoom { .. }) | Completion::GuestSignalled { .. } => {
+            if !model.contains(&completion) {
+                model.push(completion);
+            }
+        }
     }
 }
 
@@ -398,22 +534,33 @@ fn a_restored_queue_keeps_coalescing_and_order() {
     queue.push(room(2));
     queue.push(signalled(1));
     queue.push(ordered(4));
+    queue.push(changed(6, 1));
     let (restored, counter) = {
         let counter = Arc::new(Counter::default());
         let wake: Arc<dyn Wake> = Arc::<Counter>::clone(&counter);
         let restored = CompletionQueue::restore(&queue.save().unwrap()).unwrap();
         (restored.with_wake(wake), counter)
     };
-    // Used after the restore: repeats fold into the restored entries, a new thing queues
-    // behind them, and a push onto the restored (non-empty) queue does not wake.
+    // Used after the restore: repeats fold into the restored entries, except a change of
+    // syncpoint 5, whose restored entry has the restored ordered entry behind it; a new thing
+    // queues behind them; and a push onto the restored (non-empty) queue does not wake.
     restored.push(changed(5, 11));
+    restored.push(changed(6, 2));
     restored.push(room(2));
     restored.push(signalled(1));
     restored.push(room(3));
     assert_eq!(counter.count(), 0);
     assert_eq!(
         restored.take_all(),
-        [changed(5, 11), room(2), signalled(1), ordered(4), room(3)]
+        [
+            changed(5, 10),
+            room(2),
+            signalled(1),
+            ordered(4),
+            changed(6, 2),
+            changed(5, 11),
+            room(3)
+        ]
     );
     restored.push(ordered(9));
     assert_eq!(counter.count(), 1);
@@ -440,22 +587,19 @@ fn a_snapshot_with_the_wrong_magic_is_refused() {
 
 #[test]
 fn a_snapshot_of_another_version_is_refused() {
-    let mut bytes = CompletionQueue::new().save().unwrap();
-    bytes[SNAPSHOT_MAGIC.len()] = u8::try_from(SNAPSHOT_VERSION + 1).unwrap();
-    let error = CompletionQueue::restore(&bytes).err().unwrap();
-    assert_eq!(
-        error,
-        SnapshotError::UnsupportedVersion {
-            found: SNAPSHOT_VERSION + 1
-        }
-    );
-    assert_eq!(
-        error.to_string(),
-        format!(
-            "completion queue snapshot layout version {} is not supported (this build reads {SNAPSHOT_VERSION})",
-            SNAPSHOT_VERSION + 1
-        )
-    );
+    // One version either side of the one this build reads.
+    for found in [SNAPSHOT_VERSION - 1, SNAPSHOT_VERSION + 1] {
+        let mut bytes = CompletionQueue::new().save().unwrap();
+        bytes[SNAPSHOT_MAGIC.len()] = u8::try_from(found).unwrap();
+        let error = CompletionQueue::restore(&bytes).err().unwrap();
+        assert_eq!(error, SnapshotError::UnsupportedVersion { found });
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "completion queue snapshot layout version {found} is not supported (this build reads {SNAPSHOT_VERSION})"
+            )
+        );
+    }
 }
 
 #[test]
@@ -514,9 +658,10 @@ fn an_entry_naming_no_syncpoint_is_refused_at_the_count() {
 
 #[test]
 fn a_repeated_coalesced_entry_is_refused() {
-    // Each coalesced kind twice, at index 2 after an unrelated entry.
+    // Each coalesced kind twice, at index 2 after an unrelated entry (not an ordered one for the
+    // syncpoint, which would make the second change a new entry).
     let repeats: [&[u8]; 3] = [
-        &[0x03, 0x00, 0x05, 0x01, 0x01, 0x09, 0x00, 0x05, 0x02], // syncpoint 5 twice
+        &[0x03, 0x00, 0x05, 0x01, 0x02, 0x09, 0x00, 0x05, 0x02], // syncpoint 5 twice
         &[0x03, 0x02, 0x04, 0x01, 0x09, 0x02, 0x04],             // channel 4 twice
         &[0x03, 0x03, 0x04, 0x05, 0x01, 0x09, 0x03, 0x04, 0x05], // event (4, 5) twice
     ];
@@ -528,7 +673,13 @@ fn a_repeated_coalesced_entry_is_refused() {
             "entry 2 of the completion queue snapshot repeats an earlier entry"
         );
     }
-    // A repeated ticket is not coalesced, so it is accepted.
+    // A syncpoint's second change with an ordered entry between is a new entry, so it is
+    // accepted; so is a repeated ticket, which is not coalesced.
+    let across = snapshot(&[0x03, 0x00, 0x05, 0x01, 0x01, 0x09, 0x00, 0x05, 0x02]);
+    assert_eq!(
+        CompletionQueue::restore(&across).unwrap().take_all(),
+        [changed(5, 1), ordered(9), changed(5, 2)]
+    );
     let tickets = snapshot(&[0x02, 0x01, 0x09, 0x01, 0x09]);
     assert_eq!(
         CompletionQueue::restore(&tickets).unwrap().take_all(),
