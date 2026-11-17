@@ -19,7 +19,7 @@ use super::defer::{Completed, Deferral, Framing, Mailbox, Notify, Pending, Poste
 use super::kernel::Kernel;
 use super::payload::Writer;
 use super::queue::{Admission, QueueError, RequestQueue};
-use super::reply::{Moved, Reply};
+use super::reply::{Copied, Moved, Reply};
 use super::request::Request;
 use super::result::{
     Completion, DEFERRED_REPLY_DROPPED, Fault, NOT_SUPPORTED, OUT_OF_DOMAIN_ENTRIES,
@@ -984,8 +984,13 @@ impl Server {
             }
         }
         let mut builder = frame.reply(ResultCode::SUCCESS).data(payload.as_bytes());
-        for object in copies {
-            builder = builder.copy_handle(kernel.insert_handle(object)?.raw());
+        for copied in copies {
+            let handle = match copied {
+                Copied::Object(object) => kernel.insert_handle(object)?,
+                Copied::Session(session) => self.open_new(kernel, session)?,
+                Copied::Service(service) => kernel.connect(service)?.1,
+            };
+            builder = builder.copy_handle(handle.raw());
         }
         let mut objects = Vec::new();
         for moved in moves {
