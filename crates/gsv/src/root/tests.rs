@@ -285,9 +285,9 @@ fn the_table_the_shapes_and_the_dispatch_list_the_same_commands() {
     assert_eq!(table.len(), shapes.len());
     assert_eq!(table.len(), tipc.len());
     // Every root command is TIPC: the CMIF list is empty.
-    assert!(dispatch.cmif.is_empty());
-    assert!(Placeholder::default().commands().tipc.is_empty());
-    assert!(Placeholder::default().commands().cmif.is_empty());
+    assert_eq!(dispatch.cmif, []);
+    assert_eq!(Placeholder::default().commands().tipc, []);
+    assert_eq!(Placeholder::default().commands().cmif, []);
     for &(id, mark, handles, words) in SHAPES {
         let row = root_command(id).unwrap();
         assert_eq!(row.mark, mark, "{id}");
@@ -532,7 +532,7 @@ fn a_short_bootstrap_request_is_refused_and_a_longer_one_is_read() {
 
     let mut short = full.clone();
     short.pop();
-    short[1] = SPECIAL | 11;
+    short[1] = SPECIAL | 0xB;
     assert_eq!(
         rig.send(&short),
         result_only(INITIALIZE, INVALID_CMIF_REQUEST)
@@ -550,7 +550,7 @@ fn a_short_bootstrap_request_is_refused_and_a_longer_one_is_read() {
 
     let mut long = full.clone();
     long.push(0xFFFF_FFFF);
-    long[1] = SPECIAL | 13;
+    long[1] = SPECIAL | 0xD;
     assert_eq!(rig.send(&long), success(INITIALIZE, &[], &[]));
     assert_eq!(rig.state().bootstrap(), Some(&local()));
 
@@ -568,7 +568,7 @@ fn the_handle_is_checked_before_the_data() {
     let names_nothing = Handle::INVALID.raw();
     let mut both = initialize_words(names_nothing, &local());
     both.pop();
-    both[1] = SPECIAL | 11;
+    both[1] = SPECIAL | 0xB;
     let reply = rig.send(&both);
     assert_eq!(
         reply,
@@ -703,9 +703,9 @@ fn a_refused_second_event_keeps_the_first() {
     assert_eq!(rig.kernel.signals(first), Some(0));
 
     let reply = rig.send(&[tipc_type(BIND_SYNCPOINT_MEMORY), 0]);
-    let handles = copied(&reply);
+    let copies = copied(&reply);
     let object = |at: usize| {
-        let handle = Handle::from_raw(handles[at]);
+        let handle = Handle::from_raw(copies[at]);
         rig.kernel.resolve_handle(handle).unwrap()
     };
     assert_eq!(object(0), first);

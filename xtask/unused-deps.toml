@@ -31,7 +31,6 @@
 package = "starquake-core"
 dependencies = [
     "starquake-gpu",
-    "starquake-gsv",
     "starquake-render",
     "starquake-shader",
 ]
@@ -44,10 +43,10 @@ reason = "gpu depends on shader (docs/architecture.md, 'Crates and dependency di
 
 [[allow]]
 package = "starquake-gsv"
-dependencies = ["starquake-gpu", "starquake-ipc", "starquake-kernel", "starquake-services"]
-reason = "the graphics service layer sits on services and gpu (docs/architecture.md); the crate is a scaffold with no code yet"
+dependencies = ["starquake-gpu"]
+reason = "the graphics service layer sits on gpu (docs/architecture.md); the root (port slice 1) hands nothing to the GPU yet; the GPU sessions (slice 7) do"
 
 [[allow]]
 package = "starquake-gsv"
-dependencies = ["thiserror", "tracing"]
-reason = "error type and logging arrive with the crate's first handler"
+dependencies = ["thiserror"]
+reason = "the root (port slice 1) has no error type of its own; the first slice with a fallible table (slice 2's syncpoint allocation is in gpu; slice 4's waiter table) brings one"

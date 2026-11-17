@@ -9,8 +9,13 @@
 //! [`FSP_SRV`], [`APM`], [`APPLET_OE`], [`HID`], [`TIME_U`]), so a `GetService("set:sys")` hands
 //! out a session on it.
 //!
-//! The numbers ([`SM`], [`SET_SYS`], [`FSP_SRV`], [`APM`], [`APPLET_OE`], [`HID`], [`TIME_U`]) are
-//! starquake's own:
+//! The graphics server's root ([`GSV_ROOT`], `docs/specs/graphics-server.md`, "The root") is a
+//! private entry of the registry ([`Registry::register_private`]): `GetService` never hands it
+//! out, and `appletOE`'s `ISelfController` 2000 is given its number, from the registry, to hand
+//! a session on it to the title.
+//!
+//! The numbers ([`SM`], [`SET_SYS`], [`FSP_SRV`], [`APM`], [`APPLET_OE`], [`HID`], [`TIME_U`],
+//! [`GSV_ROOT`]) are starquake's own:
 //! Horizon names a service by its name only. They appear in the trace, as the `service` of an IPC
 //! event; [`service_name`] says which is which.
 //!
@@ -29,9 +34,10 @@
 
 use std::sync::Arc;
 
+use starquake_gsv::root;
 use starquake_kernel::dispatch::Dispatcher;
 use starquake_kernel::ipc::{IpcError, PortName, PortNameError};
-use starquake_services::am::{self, AppletSettings};
+use starquake_services::am::{self, Applet, AppletSettings};
 use starquake_services::apm;
 use starquake_services::framework::UnknownPolicy;
 use starquake_services::fsp;
@@ -59,9 +65,11 @@ pub const APPLET_OE: ServiceId = ServiceId(5);
 pub const HID: ServiceId = ServiceId(6);
 /// The number the kernel knows `time:u`'s server by.
 pub const TIME_U: ServiceId = ServiceId(7);
+/// The number the kernel knows the graphics server's root's server by.
+pub const GSV_ROOT: ServiceId = ServiceId(8);
 
 /// The services a run has, with the names they are known by.
-const SERVICES: [(ServiceId, &str); 7] = [
+const SERVICES: &[(ServiceId, &str)] = &[
     (SM, sm::PORT_NAME),
     (SET_SYS, set::SYS_NAME),
     (FSP_SRV, fsp::NAME),
@@ -69,6 +77,7 @@ const SERVICES: [(ServiceId, &str); 7] = [
     (APPLET_OE, am::OE_NAME),
     (HID, hid::NAME),
     (TIME_U, time::NAME),
+    (GSV_ROOT, root::ROOT_NAME),
 ];
 
 /// The name of the service a number stands for, if a run has it.
@@ -108,6 +117,7 @@ pub fn install(dispatcher: &Dispatcher, env: Arc<dyn Env>) -> Result<(), Service
     registry.register(ServiceName::new(am::OE_NAME)?, APPLET_OE)?;
     registry.register(ServiceName::new(hid::NAME)?, HID)?;
     registry.register(ServiceName::new(time::NAME)?, TIME_U)?;
+    registry.register_private(ServiceName::new(root::ROOT_NAME)?, GSV_ROOT)?;
 
     let manager = sm::server(registry, policy).with_service_id(SM);
     let port = PortName::new(sm::PORT_NAME)?;
@@ -125,8 +135,13 @@ pub fn install(dispatcher: &Dispatcher, env: Arc<dyn Env>) -> Result<(), Service
     let performance = apm::server(policy).with_service_id(APM);
     dispatcher.add_server(apm::NAME, APM, None, Box::new(performance))?;
 
-    let applets = am::oe_server(AppletSettings::eden_default(), policy).with_service_id(APPLET_OE);
+    // `appletOE` hands out sessions on the server the registry's private entry names.
+    let applet = Applet::new(AppletSettings::eden_default()).with_graphics_server(GSV_ROOT);
+    let applets = am::oe_server_for(applet, policy).with_service_id(APPLET_OE);
     dispatcher.add_server(am::OE_NAME, APPLET_OE, None, Box::new(applets))?;
+
+    let graphics_root = root::root_server(policy).with_service_id(GSV_ROOT);
+    dispatcher.add_server(root::ROOT_NAME, GSV_ROOT, None, Box::new(graphics_root))?;
 
     let input = hid::server(policy).with_service_id(HID);
     dispatcher.add_server(hid::NAME, HID, None, Box::new(input))?;
