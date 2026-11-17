@@ -182,9 +182,9 @@ pub enum SchedError {
     /// telling the scheduler, or named the wrong one.
     #[error("the scheduler has no process {0:?}")]
     UnknownProcess(ProcessId),
-    /// The object table refused to make a new process's object. Only [`ObjectError::Full`]
-    /// reaches the guest, as [`KernelError::OutOfResource`], the result
-    /// `From<ObjectError> for SvcError` gives it.
+    /// The object table refused to make a new process's object. It reaches the guest as
+    /// [`ObjectError::kernel_error`] says (only [`ObjectError::Full`] does, as
+    /// [`KernelError::OutOfResource`]), the same result `From<ObjectError> for SvcError` gives.
     #[error(transparent)]
     Object(#[from] ObjectError),
 }
@@ -203,11 +203,8 @@ impl SchedError {
             | Self::CoreCount { .. }
             | Self::NoCurrentThread { .. }
             | Self::Corrupt
-            | Self::UnknownProcess(_)
-            | Self::Object(
-                ObjectError::Stale { .. } | ObjectError::Refs(_) | ObjectError::Corrupt,
-            ) => None,
-            Self::Object(ObjectError::Full { .. }) => Some(KernelError::OutOfResource),
+            | Self::UnknownProcess(_) => None,
+            Self::Object(error) => error.kernel_error(),
         }
     }
 }

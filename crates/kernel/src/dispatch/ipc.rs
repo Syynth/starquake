@@ -1006,8 +1006,7 @@ fn begin(
 /// not runnable or is in a wait already (only a caller that names its thread by hand can be),
 /// has none, and its sender is only reported woken.
 fn calling_waiter(scheduler: &Scheduler, core: u8) -> Option<crate::id::ThreadId> {
-    let core = crate::sched::CoreId::new(core)?;
-    let thread = scheduler.current(core).ok().flatten()?;
+    let thread = calling_scheduler_thread(scheduler, core)?;
     let runnable = scheduler
         .thread(thread)
         .is_ok_and(|row| row.state() == crate::sched::ThreadState::Runnable);
@@ -1018,9 +1017,15 @@ fn calling_waiter(scheduler: &Scheduler, core: u8) -> Option<crate::id::ThreadId
 /// [`Handle::CURRENT_THREAD`] names. `None` when the core runs no scheduler thread, or one with
 /// no object (only a thread of no process, which the core loop never runs for a guest).
 fn calling_thread_object(scheduler: &Scheduler, core: u8) -> Option<ObjectId> {
-    let core = crate::sched::CoreId::new(core)?;
-    let thread = scheduler.current(core).ok().flatten()?;
+    let thread = calling_scheduler_thread(scheduler, core)?;
     scheduler.thread(thread).ok()?.object()
+}
+
+/// The scheduler's thread on the sender's `core`, if the scheduler names that core and it runs
+/// a thread: what [`calling_waiter`] and [`calling_thread_object`] start from.
+fn calling_scheduler_thread(scheduler: &Scheduler, core: u8) -> Option<crate::id::ThreadId> {
+    let core = crate::sched::CoreId::new(core)?;
+    scheduler.current(core).ok().flatten()
 }
 
 /// Makes the scheduler's thread behind `sender` wait for the reply to its request on
