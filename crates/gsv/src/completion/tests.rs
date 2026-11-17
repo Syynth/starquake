@@ -487,8 +487,25 @@ proptest! {
         for completion in &pushes {
             queue.push(*completion);
         }
-        let restored = CompletionQueue::restore(&queue.save().unwrap(), &locks()).unwrap();
+        // The kernel holds a lock for each release queued: a queue cannot hold more.
+        let kernel = locks_for(&pushes);
+        let restored = CompletionQueue::restore(&queue.save().unwrap(), &kernel).unwrap();
         prop_assert_eq!(restored.take_all(), queue.take_all());
+    }
+}
+
+/// A kernel holding one lock of [`process`] for each release in `completions`: as many on a
+/// range as `completions` releases it.
+fn locks_for(completions: &[Completion]) -> Locks {
+    let mut live = BTreeMap::new();
+    for completion in completions {
+        if let Completion::DeviceShareReleased { token } = completion {
+            *live.entry((token.address(), token.size())).or_insert(0) += 1;
+        }
+    }
+    Locks {
+        process: process(),
+        live,
     }
 }
 
