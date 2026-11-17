@@ -144,6 +144,18 @@ fn a_shared_mapping_backs_every_page_at_once_with_the_permission_asked_for() {
         let pages = space.allocate_shared(3 * PAGE_SIZE).unwrap();
         let next = space.shadow().next;
         assert_eq!(space.map_shared(LOW, pages, perms), Ok(()));
+        // The shadow, which `protect`, `unmap` and `touch` read, records the permission too.
+        assert_eq!(
+            space.shadow().mapping(LOW),
+            Some((
+                LOW,
+                Mapped {
+                    end: LOW + 3 * PAGE_SIZE,
+                    perms
+                }
+            )),
+            "{perms:?}"
+        );
         for index in 0..3 {
             assert_eq!(
                 space.tables.walk(LOW + index * PAGE_SIZE),
@@ -225,6 +237,23 @@ fn a_shared_mapping_ending_where_a_neighbour_starts_leaves_the_neighbour_alone()
     let mut buf = [0; 4];
     space.read(neighbour, &mut buf).unwrap();
     assert_eq!(&buf, b"next");
+}
+
+/// The shadow's check alone refuses an overlap on the last page: the neighbour there is
+/// untouched, so it has no table entry for the tables to refuse.
+#[test]
+fn a_shared_mapping_whose_last_page_is_an_untouched_neighbour_is_refused_there() {
+    let space = space();
+    let neighbour = LOW + PAGE_SIZE;
+    space.map(neighbour, PAGE_SIZE, Perms::ReadWrite).unwrap();
+    let pages = space.allocate_shared(2 * PAGE_SIZE).unwrap();
+    let before = snapshot(&space);
+    assert_eq!(
+        space.map_shared(LOW, pages, Perms::Read),
+        Err(SpaceError::Map(MapError::AlreadyMapped { va: neighbour }))
+    );
+    assert_eq!(snapshot(&space), before);
+    assert!(unmapped_at(&space, LOW));
 }
 
 #[test]
@@ -352,6 +381,33 @@ fn a_shared_mapping_with_no_room_for_its_tables_is_refused_and_changes_nothing()
             Ok(page(0, Perms::Read))
         );
     }
+}
+
+/// A touch or a host write that the tables refuse takes no RAM: the address space moves past
+/// a page only once its table entry is made.
+#[test]
+fn a_page_the_tables_have_no_room_for_takes_no_ram_from_a_touch_or_a_host_write() {
+    let space = space();
+    let pages = space.allocate_shared(PAGE_SIZE).unwrap();
+    // One mapping in each 1 GiB slot needs new tables each time, until the pool runs out.
+    let mut slot = 0;
+    while space
+        .map_shared(slot * LEVEL_1_SPAN, pages, Perms::Read)
+        .is_ok()
+    {
+        slot += 1;
+    }
+    let fresh = slot * LEVEL_1_SPAN;
+    space.map(fresh, PAGE_SIZE, Perms::ReadWrite).unwrap();
+    let before = snapshot(&space);
+    assert_eq!(
+        space.touch(fresh, Access::Write),
+        Touch::Failed(SpaceError::Map(MapError::OutOfTablePages))
+    );
+    assert_eq!(snapshot(&space), before);
+    assert_eq!(space.write(fresh, b"x"), Err(Fault { address: fresh }));
+    assert_eq!(snapshot(&space), before);
+    assert!(unmapped_at(&space, fresh));
 }
 
 // ----- After mapping ----------------------------------------------------------------------------
