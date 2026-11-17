@@ -10,7 +10,7 @@ use starquake_kernel::slab::SlabId;
 use starquake_services::framework::Kernel;
 use starquake_services::framework::fake::FakeKernel;
 
-use super::testing::{LOCKS, Locks, locks, process, released, token};
+use super::testing::{LOCKS, Locks, locks, process, real_kernel, released, token};
 use super::*;
 
 fn id(value: u8) -> SyncpointId {
@@ -943,26 +943,6 @@ fn a_refused_release_and_a_repeat_are_answered_in_entry_order() {
         restore(&[room, room, refused]),
         SnapshotError::Repeated { index: 1 }
     );
-}
-
-/// A dispatcher over a fresh process, which holds no device-share lock, and that process.
-fn real_kernel() -> (starquake_kernel::dispatch::Dispatcher, ProcessId) {
-    use starquake_kernel::memory::testing::RecordingMapper;
-    use starquake_kernel::memory::{AddressSpace, MemoryArrangement, ProcessMemory, RegionOffsets};
-    use starquake_kernel::process::{self, Console, ProcessDescription};
-
-    let (mapper, _log) = RecordingMapper::new();
-    let memory = ProcessMemory {
-        code_address: 0x8000_0000,
-        code_size: 0x1000,
-        arrangement: MemoryArrangement::FourGb,
-        alias_region_extra: false,
-        offsets: RegionOffsets::default(),
-    };
-    let space = AddressSpace::new(&memory, Box::new(mapper)).unwrap();
-    let tables = process::create(&ProcessDescription::homebrew(Console::Switch2), space).unwrap();
-    let own = tables.processes.own();
-    (starquake_kernel::dispatch::Dispatcher::new(tables), own)
 }
 
 #[test]

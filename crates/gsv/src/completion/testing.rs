@@ -72,3 +72,23 @@ pub(crate) fn locks() -> Locks {
             .collect(),
     }
 }
+
+/// A dispatcher over a fresh process, which holds no device-share lock, and that process.
+pub(crate) fn real_kernel() -> (starquake_kernel::dispatch::Dispatcher, ProcessId) {
+    use starquake_kernel::memory::testing::RecordingMapper;
+    use starquake_kernel::memory::{AddressSpace, MemoryArrangement, ProcessMemory, RegionOffsets};
+    use starquake_kernel::process::{self, Console, ProcessDescription};
+
+    let (mapper, _log) = RecordingMapper::new();
+    let memory = ProcessMemory {
+        code_address: 0x8000_0000,
+        code_size: 0x1000,
+        arrangement: MemoryArrangement::FourGb,
+        alias_region_extra: false,
+        offsets: RegionOffsets::default(),
+    };
+    let space = AddressSpace::new(&memory, Box::new(mapper)).unwrap();
+    let tables = process::create(&ProcessDescription::homebrew(Console::Switch2), space).unwrap();
+    let own = tables.processes.own();
+    (starquake_kernel::dispatch::Dispatcher::new(tables), own)
+}
