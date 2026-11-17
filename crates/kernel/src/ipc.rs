@@ -10,6 +10,8 @@
 //! - [`SessionHandler`] is the code behind a server, which the dispatcher keeps outside the
 //!   tables and calls without the kernel lock ([`IpcContext`] is what it reaches the kernel
 //!   through).
+//! - [`EventHook`] is what a service attaches to an event it created, run when the guest
+//!   signals it.
 //!
 //! The system calls are dispatcher arms (`crate::dispatch`): `ConnectToNamedPort` (0x1f),
 //! `SendSyncRequest` (0x21), and `CloseHandle` (0x16) when it closes a session's last handle.
@@ -20,6 +22,7 @@
 //! from the same session rows; nothing in the client path here knows which kind it talks to.
 
 pub mod handler;
+pub mod hook;
 pub mod message;
 pub mod port;
 pub mod queue;
@@ -27,6 +30,7 @@ mod table;
 
 pub use crate::dispatch::IpcContext;
 pub use handler::{Handled, HandlerError, SessionHandler};
+pub use hook::EventHook;
 pub use message::{MessageBuffer, Translated};
 pub use port::{NAME_LENGTH_MAX, PortName, PortNameError};
 pub use queue::{Admission, DEFAULT_WORKERS, QueueError, RequestQueue};

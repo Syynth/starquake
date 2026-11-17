@@ -225,6 +225,7 @@ use crate::tables::{AddressSpace, Processes, Scheduler};
 
 mod arbitration;
 mod cores;
+mod hooks;
 mod ipc;
 mod lifecycle;
 mod memory_objects;
@@ -610,6 +611,8 @@ struct Call<'c, 'k> {
 pub struct Dispatcher {
     state: Mutex<State>,
     timer: Option<Box<dyn LockTimer>>,
+    /// The hooks of service-created events (`dispatch/hooks.rs`), outside the kernel lock.
+    hooks: hooks::Hooks,
 }
 
 impl fmt::Debug for Dispatcher {
@@ -636,6 +639,7 @@ impl Dispatcher {
                 latest: GuestTicks(0),
             }),
             timer: None,
+            hooks: hooks::Hooks::default(),
         }
     }
 

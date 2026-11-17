@@ -3,6 +3,9 @@
 //! outside a system call: [`Dispatcher::signal_event`] for a host thread (a service's vsync or
 //! input thread) and [`Dispatcher::fire_timers`] for the timer thread.
 //!
+//! A `SignalEvent` that succeeds on an event a service hooked runs the hook once the dispatch
+//! is over and the kernel lock released (`crate::ipc::hook`, `dispatch/hooks.rs`).
+//!
 //! The functions behind the arms are [`crate::svc::event`] and [`crate::svc::sync`]; the
 //! objects and waits are [`crate::sync`].
 //!
@@ -93,15 +96,26 @@ impl Dispatcher {
         convention: &Convention,
     ) -> Outcome {
         match id {
-            SvcId::SignalEvent => self.call::<(&HandleTable, &mut Scheduler)>(
-                call,
-                |(handles, scheduler), call, _| {
-                    returning(id, convention, call.regs, |[handle]| {
-                        event::signal_event(handles, scheduler, Handle::from_register(handle))?;
-                        Ok([])
-                    })
-                },
-            ),
+            SvcId::SignalEvent => {
+                // The event the guest signalled, once the call has succeeded: its hook, if it
+                // has one, runs after the lock is released (`crate::ipc::hook`).
+                let mut signalled = None;
+                let outcome = self.call::<(&HandleTable, &mut Scheduler)>(
+                    call,
+                    |(handles, scheduler), call, _| {
+                        returning(id, convention, call.regs, |[handle]| {
+                            let handle = Handle::from_register(handle);
+                            event::signal_event(handles, scheduler, handle)?;
+                            signalled = handles.get(handle).ok();
+                            Ok([])
+                        })
+                    },
+                );
+                if let Some(event) = signalled {
+                    self.run_event_hook(event);
+                }
+                outcome
+            }
             SvcId::ClearEvent => self.call::<(&HandleTable, &mut Scheduler)>(
                 call,
                 |(handles, scheduler), call, _| {
