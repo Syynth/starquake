@@ -521,13 +521,17 @@ fn the_state_a_snapshot_holds_is_these_bytes() {
     let mut registry = Registry::new();
     registry.register(name("set:sys"), ServiceId(0x21)).unwrap();
     registry.register(name("a"), ServiceId(0x22)).unwrap();
+    registry
+        .register_private(name("p"), ServiceId(0x23))
+        .unwrap();
     assert!(registry.note_unknown(&name("hid")));
-    // `postcard`: two services in name order, each a length-prefixed name, the provider's
-    // variant (0, an HLE server) and its number; then the unknown names.
+    // `postcard`: three services in name order, each a length-prefixed name, the provider's
+    // variant (0, an HLE server; 1, a private one) and its number; then the unknown names.
     #[rustfmt::skip]
     let golden = [
-        2,
+        3,
         1, b'a',                                      0, 0x22,
+        1, b'p',                                      1, 0x23,
         7, b's', b'e', b't', b':', b's', b'y', b's',  0, 0x21,
         1,
         3, b'h', b'i', b'd',
@@ -618,6 +622,141 @@ fn a_name_is_registered_once() {
     assert_eq!(
         RegistryError::AlreadyRegistered(name("hid")).to_string(),
         "a service is already registered as hid"
+    );
+}
+
+#[test]
+fn a_name_is_registered_once_public_or_private() {
+    let mut registry = Registry::new();
+    registry.register(name("hid"), ServiceId(5)).unwrap();
+    registry
+        .register_private(name("root"), ServiceId(6))
+        .unwrap();
+    // Neither kind may take a name already taken by either.
+    for (public, taken) in [
+        (true, "hid"),
+        (false, "hid"),
+        (true, "root"),
+        (false, "root"),
+    ] {
+        let refused = if public {
+            registry.register(name(taken), ServiceId(7))
+        } else {
+            registry.register_private(name(taken), ServiceId(7))
+        };
+        assert_eq!(
+            refused,
+            Err(RegistryError::AlreadyRegistered(name(taken))),
+            "{taken} {public}"
+        );
+    }
+    assert_eq!(
+        registry.provider(&name("root")),
+        Some(Provider::Private(ServiceId(6)))
+    );
+    assert_eq!(
+        registry.provider(&name("hid")),
+        Some(Provider::Hle(ServiceId(5)))
+    );
+    // Only a private entry is found as one.
+    assert_eq!(registry.private_service(&name("root")), Some(ServiceId(6)));
+    assert_eq!(registry.private_service(&name("hid")), None);
+    assert_eq!(registry.private_service(&name("none")), None);
+    assert_eq!(
+        registry.names().collect::<Vec<_>>(),
+        [&name("hid"), &name("root")]
+    );
+}
+
+/// The private name the tests register `set:sys` under: as a stand-in for the graphics
+/// server's root, which a title never gets from `sm:`.
+const PRIVATE: &str = "set:priv";
+
+/// A host whose `set:sys` is registered privately, as [`PRIVATE`], and not publicly.
+fn private_host(policy: UnknownPolicy) -> (FakeHost, Handle) {
+    let mut registry = Registry::new();
+    registry.register_private(name(PRIVATE), SET_SYS).unwrap();
+    let settings = set::Settings {
+        firmware: set::FirmwareVersion::eden_default(),
+    };
+    let mut host = FakeHost::new(FakeKernel::new(0).unwrap());
+    host.add(server(registry, policy).with_service_id(SM));
+    host.add(set::sys_server(settings, policy).with_service_id(SET_SYS));
+    let sm = host.connect(SM).unwrap();
+    (host, sm)
+}
+
+#[test]
+fn get_service_never_hands_out_a_private_entry() {
+    // Strict: the answer for a name nothing provides, and the name is on record.
+    let (mut host, sm) = private_host(UnknownPolicy::Strict);
+    initialize(&mut host, sm);
+    let ask = cmif_get_service(name(PRIVATE).to_field());
+    assert_eq!(send(&mut host, sm, &ask), cmif_result(NOT_REGISTERED));
+    assert_eq!(host.server(SET_SYS).unwrap().session_count(), 0);
+    let registry = host.server(SM).unwrap().family::<Registry>().unwrap();
+    assert_eq!(
+        registry.unknown_names().collect::<Vec<_>>(),
+        [&name(PRIVATE)]
+    );
+    // Auto-stub: a stub on `sm:` itself, not a session on the private server.
+    let (mut host, sm) = private_host(UnknownPolicy::AutoStub);
+    initialize(&mut host, sm);
+    let stub = moved_handle(&send(&mut host, sm, &ask));
+    let session = host.kernel.resolve_handle(stub).unwrap();
+    assert_eq!(host.kernel.owner(session), Some(SM));
+    assert_eq!(host.server(SET_SYS).unwrap().session_count(), 0);
+}
+
+/// A service that hands out a session on the server it was given the number of: how `am`'s
+/// `ISelfController` 2000 hands out the graphics server's root.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Lobby {
+    root: ServiceId,
+}
+
+/// `Lobby`'s one command: out a moved session handle.
+const OPEN_ROOT: u32 = 0;
+
+commands! {
+    impl Lobby {
+        OPEN_ROOT => open_root,
+    }
+}
+
+impl Lobby {
+    fn open_root(&mut self, _: &mut Context<'_>, _: &Request<'_>, reply: &mut Reply) -> Outcome {
+        reply.push_service(self.root);
+        reply.ok()
+    }
+}
+
+#[test]
+fn another_service_hands_out_a_private_entry() {
+    const LOBBY: ServiceId = ServiceId(3);
+    let (mut host, _) = private_host(UnknownPolicy::Strict);
+    // Whoever puts the services together looks the private name up in the registry.
+    let registry = host.server(SM).unwrap().family::<Registry>().unwrap();
+    let root = registry.private_service(&name(PRIVATE)).unwrap();
+    host.add(
+        Server::new("lobby", UnknownPolicy::Strict)
+            .with_service_id(LOBBY)
+            .with_root(move || Box::new(Lobby { root })),
+    );
+    let lobby = host.connect(LOBBY).unwrap();
+    let reply = send(
+        &mut host,
+        lobby,
+        &RequestBuilder::cmif(CommandType::Request, OPEN_ROOT),
+    );
+    let handle = moved_handle(&reply);
+    // A session on the private server, opened with its root interface, that answers as it.
+    let session = host.kernel.resolve_handle(handle).unwrap();
+    assert_eq!(host.kernel.owner(session), Some(SET_SYS));
+    assert_eq!(host.server(SET_SYS).unwrap().session_count(), 1);
+    assert_eq!(
+        firmware_version(&mut host, handle),
+        set::FirmwareVersion::eden_default().to_bytes()
     );
 }
 

@@ -4,6 +4,7 @@ use core::any::Any;
 use std::sync::Arc;
 
 use starquake_kernel::id::ObjectId;
+use starquake_kernel::ipc::EventHook;
 use starquake_kernel::memory::{SharedPages, SvcPermission};
 use starquake_trace::Env;
 
@@ -65,6 +66,37 @@ impl Context<'_> {
         permission: SvcPermission,
     ) -> Result<(ObjectId, SharedPages), Fault> {
         Ok(self.kernel.create_shared_memory(size, permission)?)
+    }
+
+    /// Creates an event whose writable end the caller signals, and attaches `hook` to it: the
+    /// kernel runs the hook, without its lock, each time the caller signals that end. Returns
+    /// the writable end, which the caller gets with
+    /// [`Reply::copy_handle`](super::Reply::copy_handle), and the readable end, in that order.
+    /// The hook may only queue work for the service. See [`Kernel::create_hooked_event`].
+    pub fn create_hooked_event(
+        &mut self,
+        hook: Arc<dyn EventHook>,
+    ) -> Result<(ObjectId, ObjectId), Fault> {
+        Ok(self.kernel.create_hooked_event(hook)?)
+    }
+
+    /// Whether every page of the caller's `size` bytes at `address` has the GPU-accessible
+    /// attribute `svc 0x80` sets: whether the caller marked the memory for the GPU. See
+    /// [`Kernel::is_gpu_accessible`].
+    pub fn is_gpu_accessible(&self, address: u64, size: u64) -> Result<bool, Fault> {
+        Ok(self.kernel.is_gpu_accessible(address, size)?)
+    }
+
+    /// Takes a device-share lock on the caller's `size` bytes at `address`, so that the CPU
+    /// mapping under memory the GPU may use cannot change. See [`Kernel::lock_device_share`].
+    pub fn lock_device_share(&mut self, address: u64, size: u64) -> Result<(), Fault> {
+        Ok(self.kernel.lock_device_share(address, size)?)
+    }
+
+    /// Releases a device-share lock taken on the same range with
+    /// [`Context::lock_device_share`]. See [`Kernel::unlock_device_share`].
+    pub fn unlock_device_share(&mut self, address: u64, size: u64) -> Result<(), Fault> {
+        Ok(self.kernel.unlock_device_share(address, size)?)
     }
 
     /// Copies `out.len()` bytes of the caller's memory at `address` into `out`.

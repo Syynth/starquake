@@ -3,6 +3,9 @@
 //! outside a system call: [`Dispatcher::signal_event`] for a host thread (a service's vsync or
 //! input thread) and [`Dispatcher::fire_timers`] for the timer thread.
 //!
+//! A `SignalEvent` that succeeds on an event a service hooked runs the hook once the dispatch
+//! is over and the kernel lock released (`crate::ipc::hook`, `dispatch/hooks.rs`).
+//!
 //! The functions behind the arms are [`crate::svc::event`] and [`crate::svc::sync`]; the
 //! objects and waits are [`crate::sync`].
 //!
@@ -93,15 +96,7 @@ impl Dispatcher {
         convention: &Convention,
     ) -> Outcome {
         match id {
-            SvcId::SignalEvent => self.call::<(&HandleTable, &mut Scheduler)>(
-                call,
-                |(handles, scheduler), call, _| {
-                    returning(id, convention, call.regs, |[handle]| {
-                        event::signal_event(handles, scheduler, Handle::from_register(handle))?;
-                        Ok([])
-                    })
-                },
-            ),
+            SvcId::SignalEvent => self.signal_event_call(call, id, convention),
             SvcId::ClearEvent => self.call::<(&HandleTable, &mut Scheduler)>(
                 call,
                 |(handles, scheduler), call, _| {
@@ -191,6 +186,30 @@ impl Dispatcher {
                 ),
             _ => self.call::<()>(call, |(), call, _| super::unimplemented(id, call.regs)),
         }
+    }
+
+    /// `SignalEvent`'s arm. Once the call has succeeded and the lock is released, the hook of
+    /// the event the guest signalled runs, if it has one (`crate::ipc::hook`).
+    fn signal_event_call(
+        &self,
+        call: &mut Call<'_, '_>,
+        id: SvcId,
+        convention: &Convention,
+    ) -> Outcome {
+        let mut signalled = None;
+        let outcome =
+            self.call::<(&HandleTable, &mut Scheduler)>(call, |(handles, scheduler), call, _| {
+                returning(id, convention, call.regs, |[handle]| {
+                    let handle = Handle::from_register(handle);
+                    event::signal_event(handles, scheduler, handle)?;
+                    signalled = handles.get(handle).ok();
+                    Ok([])
+                })
+            });
+        if let Some(event) = signalled {
+            self.run_event_hook(event);
+        }
+        outcome
     }
 
     /// Signals the event `event` names, either end, from a host thread outside any system call:

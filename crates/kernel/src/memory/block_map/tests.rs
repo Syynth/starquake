@@ -455,6 +455,145 @@ fn an_update_over_a_block_locked_for_ipc_is_refused_and_changes_nothing() {
     assert_eq!(update(&mut map, 0, 2, MemoryPermission::USER_READ), Ok(()));
 }
 
+/// A heap row with the device-shared attribute: what a device lock leaves.
+fn shared_heap(first: u64, pages: u64, barrier: DisableMerge) -> Row {
+    (
+        page(first),
+        pages,
+        MemoryState::Normal,
+        MemoryPermission::USER_READ_WRITE,
+        MemoryAttribute::DEVICE_SHARED,
+        barrier,
+    )
+}
+
+/// The device use count of each block, in address order.
+fn device_counts(map: &BlockMap) -> Vec<u16> {
+    map.blocks().map(MemoryBlock::device_use_count).collect()
+}
+
+#[test]
+fn a_device_lock_in_the_middle_splits_marks_the_ends_and_unlocking_merges_back() {
+    let mut map = map();
+    map_heap(&mut map, 0, 8);
+    let before = map.clone();
+    map.update_lock(page(2), 3, DeviceLock::Share).unwrap();
+    let ends = DisableMerge::DEVICE_LEFT | DisableMerge::DEVICE_RIGHT;
+    assert_eq!(
+        rows(&map),
+        [
+            heap(0, 2, DisableMerge::NORMAL),
+            shared_heap(2, 3, ends),
+            // The neighbour that starts exactly at the end of the range is unchanged.
+            heap(5, 3, DisableMerge::NONE),
+            free(8, PAGES - 8)
+        ]
+    );
+    assert_eq!(device_counts(&map), [0, 1, 0, 0]);
+    assert!(map.check_state());
+    map.update_lock(page(2), 3, DeviceLock::Unshare).unwrap();
+    assert_eq!(map, before);
+}
+
+#[test]
+fn overlapping_device_locks_count_per_block_and_unlock_in_any_order() {
+    let mut map = map();
+    map_heap(&mut map, 0, 8);
+    let before = map.clone();
+    map.update_lock(page(1), 4, DeviceLock::Share).unwrap();
+    map.update_lock(page(3), 4, DeviceLock::Share).unwrap();
+    // Blocks 1-2 (first lock), 3-4 (both), 5-6 (second lock).
+    assert_eq!(
+        rows(&map)
+            .iter()
+            .map(|row| (row.0, row.1))
+            .collect::<Vec<_>>(),
+        [
+            (page(0), 1),
+            (page(1), 2),
+            (page(3), 2),
+            (page(5), 2),
+            (page(7), 1),
+            (page(8), PAGES - 8)
+        ]
+    );
+    assert_eq!(device_counts(&map), [0, 1, 2, 1, 0, 0]);
+    assert!(map.check_state());
+    // The first lock goes first: blocks 3-6 stay shared, once each.
+    map.update_lock(page(1), 4, DeviceLock::Unshare).unwrap();
+    assert_eq!(device_counts(&map), [0, 1, 0, 0]);
+    assert_eq!(
+        rows(&map)[1],
+        shared_heap(3, 4, DisableMerge::DEVICE_LEFT | DisableMerge::DEVICE_RIGHT)
+    );
+    map.update_lock(page(3), 4, DeviceLock::Unshare).unwrap();
+    assert_eq!(map, before);
+}
+
+#[test]
+fn a_device_lock_that_one_block_cannot_take_changes_no_block() {
+    let mut map = map();
+    map_heap(&mut map, 0, 8);
+    map.update_lock(page(1), 1, DeviceLock::Share).unwrap();
+    let before = map.clone();
+    // Unlocking pages 1-2: page 1 is shared and could be, page 2 is not shared at all.
+    assert_eq!(
+        map.update_lock(page(1), 2, DeviceLock::Unshare),
+        Err(BlockMapError::DeviceCount { address: page(2) })
+    );
+    assert_eq!(map, before);
+    // Unlocking less than a lock: the range ends inside the locked block, where no device
+    // mapping ends (Eden asserts `old_device_disable_merge_right_count > 0`).
+    map.update_lock(page(4), 3, DeviceLock::Share).unwrap();
+    let before = map.clone();
+    assert_eq!(
+        map.update_lock(page(4), 2, DeviceLock::Unshare),
+        Err(BlockMapError::DeviceCount { address: page(4) })
+    );
+    assert_eq!(map, before);
+    // A range outside the map, or off a page.
+    for (address, pages) in [
+        (page(PAGES), 1),
+        (page(PAGES - 1), 2),
+        (BASE + 1, 1),
+        (BASE, 0),
+    ] {
+        assert_eq!(
+            map.update_lock(address, pages, DeviceLock::Share),
+            Err(BlockMapError::BadRange { address, pages }),
+            "{address:#x}+{pages}"
+        );
+    }
+    assert_eq!(map, before);
+    assert_eq!(
+        BlockMapError::DeviceCount { address: 0x1000 }.to_string(),
+        "the block at 0x1000 cannot take this device lock or unlock"
+    );
+}
+
+#[test]
+fn a_device_lock_crosses_blocks_of_different_kinds() {
+    // Heap at pages 0-3 and a separate mapping at 4-5 (its own barrier): one lock over both
+    // marks the left end on the first block only and the right end on the last only.
+    let mut map = map();
+    map_heap(&mut map, 0, 4);
+    map_heap(&mut map, 4, 2);
+    let before = map.clone();
+    map.update_lock(page(2), 3, DeviceLock::Share).unwrap();
+    assert_eq!(
+        rows(&map),
+        [
+            heap(0, 2, DisableMerge::NORMAL),
+            shared_heap(2, 2, DisableMerge::DEVICE_LEFT),
+            shared_heap(4, 1, DisableMerge::NORMAL | DisableMerge::DEVICE_RIGHT),
+            heap(5, 1, DisableMerge::NONE),
+            free(6, PAGES - 6)
+        ]
+    );
+    map.update_lock(page(2), 3, DeviceLock::Unshare).unwrap();
+    assert_eq!(map, before);
+}
+
 #[test]
 fn a_broken_map_fails_its_check() {
     let whole = map();
@@ -729,8 +868,8 @@ const PERMISSIONS: [MemoryPermission; 3] = [
     MemoryPermission::USER_READ,
     MemoryPermission::USER_READ_WRITE,
 ];
-/// Attributes an update may set, and the masks and values an attribute update may use: every
-/// subset of the two settable bits.
+/// Attributes an update may set, and the masks and values an attribute update may use: the
+/// empty set, the two settable bits of Eden's `SetMask` alone, and the whole `SetMask`.
 const ATTRIBUTES: [MemoryAttribute; 4] = [
     MemoryAttribute::NONE,
     MemoryAttribute::UNCACHED,

@@ -26,6 +26,9 @@ const PERM_READ_EXECUTE: u32 = 5;
 /// `Uncached` is bit 3, `PermissionLocked` bit 4.
 const ATTR_UNCACHED: u32 = 1 << 3;
 const ATTR_PERMISSION_LOCKED: u32 = 1 << 4;
+/// The Switch 2 attribute `svc 0x80` sets (`Svc::MemoryAttribute::GpuAccessible` in Eden-NX2's
+/// and PR #4588's `svc_types.h`): bit 5.
+const ATTR_GPU: u32 = 1 << 5;
 
 // ----- SetHeapSize ----------------------------------------------------------------------------
 
@@ -210,6 +213,12 @@ fn address_and_size_are_checked_in_horizons_order() {
                 ATTR_PERMISSION_LOCKED,
                 ATTR_PERMISSION_LOCKED
             ),
+            kernel(error),
+            "{address:#x}+{size:#x}"
+        );
+        // `SetGpuMemoryAttribute` makes the same checks in the same order (PR #4588).
+        assert_eq!(
+            set_gpu_memory_attribute(&mut space, true, address, size, ATTR_GPU, ATTR_GPU),
             kernel(error),
             "{address:#x}+{size:#x}"
         );
@@ -427,6 +436,149 @@ fn set_memory_attribute_on_memory_whose_state_forbids_it_is_invalid_current_memo
             );
         }
     }
+}
+
+// ----- SetGpuMemoryAttribute ----------------------------------------------------------------
+//
+// "PR" is `eden-pr4588/src/core/hle/kernel/svc/svc_memory.cpp` @ e5fb3b97,
+// `SetGpuMemoryAttribute`; "NX2" is `eden-nx2/src/core/hle/kernel/svc.cpp` @ 50fa86bb, `Call`.
+
+/// The fixture's loaded address space with one heap allocation unit. Returns the heap's start.
+fn with_heap() -> (AddressSpace, u64) {
+    let (mut space, _log, _) = loaded();
+    let heap = set_heap_size(&mut space, HEAP_SIZE_ALIGNMENT).unwrap();
+    (space, heap)
+}
+
+#[test]
+fn set_gpu_memory_attribute_marks_heap_for_the_gpu_and_query_memory_reports_it() {
+    let (mut space, heap) = with_heap();
+    assert_eq!(
+        set_gpu_memory_attribute(&mut space, true, heap, PAGE_SIZE, ATTR_GPU, ATTR_GPU),
+        Ok(())
+    );
+    assert_eq!(
+        space.query_info(heap).unwrap().svc_info().attribute,
+        ATTR_GPU
+    );
+    assert!(space.is_gpu_accessible(heap, PAGE_SIZE));
+    // The page after it is untouched.
+    assert_eq!(
+        space
+            .query_info(heap + PAGE_SIZE)
+            .unwrap()
+            .svc_info()
+            .attribute,
+        0
+    );
+    // Cleared again with the mask alone.
+    assert_eq!(
+        set_gpu_memory_attribute(&mut space, true, heap, PAGE_SIZE, ATTR_GPU, 0),
+        Ok(())
+    );
+    assert_eq!(space.query_info(heap).unwrap().svc_info().attribute, 0);
+    // An empty mask changes nothing and is allowed.
+    assert_eq!(
+        set_gpu_memory_attribute(&mut space, true, heap, PAGE_SIZE, 0, 0),
+        Ok(())
+    );
+}
+
+#[test]
+fn set_gpu_memory_attribute_is_not_implemented_for_a_switch_1_process() {
+    // PR: `R_UNLESS(process.UsesPAuthReturns(), ResultNotImplemented)`, before every other
+    // check: also with an address that is off a page and a combination that is wrong.
+    let (mut space, heap) = with_heap();
+    let before = space.query_info(heap).unwrap();
+    for (address, mask, attribute) in [(heap, ATTR_GPU, ATTR_GPU), (heap + 1, 0, u32::MAX)] {
+        assert_eq!(
+            set_gpu_memory_attribute(&mut space, false, address, PAGE_SIZE, mask, attribute),
+            kernel(KernelError::NotImplemented)
+        );
+    }
+    assert_eq!(space.query_info(heap).unwrap(), before);
+}
+
+#[test]
+fn set_gpu_memory_attribute_takes_the_gpu_bit_alone() {
+    let (mut space, heap) = with_heap();
+    let before = space.query_info(heap).unwrap();
+    let end = space.regions().address_space.end;
+    for (mask, attribute) in [
+        // `(attr & ~mask) != 0`: the attribute outside the mask.
+        (0, ATTR_GPU),
+        // `((mask | attr) & ~SupportedMask) != 0`: `SetMemoryAttribute`'s two bits, the
+        // counted ones, `Locked`, a bit above the eight a block keeps, and everything.
+        (ATTR_UNCACHED, ATTR_UNCACHED),
+        (ATTR_PERMISSION_LOCKED, ATTR_PERMISSION_LOCKED),
+        (ATTR_GPU | ATTR_UNCACHED, ATTR_GPU),
+        (1, 0),
+        (1 << 1, 0),
+        (1 << 2, 1 << 2),
+        (ATTR_GPU | 1 << 8, ATTR_GPU),
+        (u32::MAX, u32::MAX),
+    ] {
+        // The combination is checked before `Contains`: a range above the address space too.
+        for address in [heap, end] {
+            assert_eq!(
+                set_gpu_memory_attribute(&mut space, true, address, PAGE_SIZE, mask, attribute),
+                kernel(KernelError::InvalidCombination),
+                "mask {mask:#x} attribute {attribute:#x} at {address:#x}"
+            );
+        }
+    }
+    assert_eq!(space.query_info(heap).unwrap(), before);
+    // A good combination above the address space gets as far as `Contains`.
+    assert_eq!(
+        set_gpu_memory_attribute(&mut space, true, end, PAGE_SIZE, ATTR_GPU, ATTR_GPU),
+        kernel(KernelError::InvalidCurrentMemory)
+    );
+    // `SetMemoryAttribute` (0x03) still refuses the GPU bit: it is this call's alone.
+    assert_eq!(
+        set_memory_attribute(&mut space, heap, PAGE_SIZE, ATTR_GPU, ATTR_GPU),
+        kernel(KernelError::InvalidCombination)
+    );
+}
+
+#[test]
+fn set_gpu_memory_attribute_checks_the_wrap_before_the_combination() {
+    // Both faults at once: PR answers the wrap (`R_UNLESS(address < address + size,
+    // ResultInvalidCurrentMemory)` comes first); NX2 would answer the combination.
+    let (mut space, _) = with_heap();
+    assert_eq!(
+        set_gpu_memory_attribute(
+            &mut space,
+            true,
+            u64::MAX - PAGE_SIZE + 1,
+            PAGE_SIZE,
+            0,
+            ATTR_GPU
+        ),
+        kernel(KernelError::InvalidCurrentMemory)
+    );
+    // And the size before the combination, as both do.
+    assert_eq!(
+        set_gpu_memory_attribute(&mut space, true, 0, 0, 0, ATTR_GPU),
+        kernel(KernelError::InvalidSize)
+    );
+}
+
+#[test]
+fn set_gpu_memory_attribute_on_memory_whose_state_forbids_it_is_invalid_current_memory() {
+    // `FlagCanChangeAttribute`: text, read-only data, the stack and free memory lack it.
+    let (mut space, _log, stack_top) = loaded();
+    for address in [CODE, RODATA, stack_top - PAGE_SIZE, CODE - PAGE_SIZE] {
+        assert_eq!(
+            set_gpu_memory_attribute(&mut space, true, address, PAGE_SIZE, ATTR_GPU, ATTR_GPU),
+            kernel(KernelError::InvalidCurrentMemory),
+            "{address:#x}"
+        );
+    }
+    // Data has it.
+    assert_eq!(
+        set_gpu_memory_attribute(&mut space, true, DATA, PAGE_SIZE, ATTR_GPU, ATTR_GPU),
+        Ok(())
+    );
 }
 
 // ----- QueryMemory ----------------------------------------------------------------------------

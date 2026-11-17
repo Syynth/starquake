@@ -559,3 +559,78 @@ fn a_server_reads_and_writes_a_transfer_memory_it_is_sent_within_its_bounds() {
     world.memory.read(DATA + PAGE_SIZE - 1, &mut last).unwrap();
     assert_eq!(last, [0x42]);
 }
+
+// ----- The graphics server's address-space calls, through `IpcContext` -----------------------
+
+#[test]
+fn a_server_asks_whether_the_senders_memory_is_gpu_accessible() {
+    let world = World::new();
+    // The guest marks the data's first page with `svc 0x80`.
+    let gpu = u64::from(MemoryAttribute::GPU_ACCESSIBLE.svc());
+    let mut regs = GuestRegs::default();
+    regs.x[..4].copy_from_slice(&[DATA, PAGE_SIZE, gpu, gpu]);
+    world.call(SvcId::SetGpuMemoryAttribute, &mut regs);
+    assert_eq!(regs.x[0], 0);
+    let answers = Arc::new(Mutex::new(Vec::new()));
+    let keep = Arc::clone(&answers);
+    let session = world.session();
+    let result = world.send(
+        session,
+        &request(),
+        Box::new(move |cx, _| {
+            let mut answers = keep.lock().unwrap();
+            for (address, size) in [(DATA, PAGE_SIZE), (DATA, PAGE_SIZE + 1), (DATA - 1, 1)] {
+                answers.push(cx.is_gpu_accessible(address, size));
+            }
+            Ok(())
+        }),
+    );
+    assert_eq!(result, 0);
+    assert_eq!(*answers.lock().unwrap(), [true, false, false]);
+}
+
+#[test]
+fn a_server_locks_the_senders_memory_against_change_and_unlocks_it() {
+    let world = World::new();
+    let session = world.session();
+    let lock = |unlock: bool| -> Script {
+        Box::new(move |cx, _| {
+            let done = if unlock {
+                cx.unlock_device_share(DATA, PAGE_SIZE)
+            } else {
+                cx.lock_device_share(DATA, PAGE_SIZE)
+            };
+            done.map_err(|error| HandlerError(error.to_string()))
+        })
+    };
+    let reprotect = || {
+        let mut regs = GuestRegs::default();
+        regs.x[..3].copy_from_slice(&[DATA, PAGE_SIZE, u64::from(SvcPermission::Read.bits())]);
+        world.call(SvcId::SetMemoryPermission, &mut regs);
+        regs.x[0]
+    };
+    assert_eq!(world.send(session, &request(), lock(false)), 0);
+    assert!(world.block(DATA).4.contains(MemoryAttribute::DEVICE_SHARED));
+    // While it is locked the guest cannot change it.
+    assert_eq!(reprotect(), code(KernelError::InvalidCurrentMemory));
+    assert_eq!(world.send(session, &request(), lock(true)), 0);
+    assert_eq!(world.block(DATA).4, MemoryAttribute::NONE);
+    assert_eq!(reprotect(), 0);
+    // The address space's errors reach the server: free memory cannot be locked, and memory
+    // that is not locked cannot be unlocked.
+    let errors = Arc::new(Mutex::new(Vec::new()));
+    let keep = Arc::clone(&errors);
+    let result = world.send(
+        session,
+        &request(),
+        Box::new(move |cx, _| {
+            let mut errors = keep.lock().unwrap();
+            errors.push(cx.lock_device_share(CODE - PAGE_SIZE, PAGE_SIZE));
+            errors.push(cx.unlock_device_share(DATA, PAGE_SIZE));
+            Ok(())
+        }),
+    );
+    assert_eq!(result, 0);
+    let invalid = Err(KernelError::InvalidCurrentMemory);
+    assert_eq!(*errors.lock().unwrap(), [invalid, invalid]);
+}

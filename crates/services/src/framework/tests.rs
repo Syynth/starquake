@@ -27,6 +27,7 @@ mod buffers;
 mod control;
 mod deferred;
 mod domain;
+mod graphics_kernel;
 mod handles;
 mod later;
 mod plain;

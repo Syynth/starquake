@@ -29,3 +29,6 @@ tracing.workspace = true
 # Turns `test-support` on for this crate's unit tests, integration tests and doctests.
 starquake-services = { workspace = true, features = ["test-support"] }
 proptest.workspace = true
+# The integration tests drive services on the real kernel: a guest's registers and memory.
+starquake-cpu.workspace = true
+starquake-memory.workspace = true

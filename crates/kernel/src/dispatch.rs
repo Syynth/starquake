@@ -214,6 +214,7 @@ use starquake_trace::{
 use crate::handle::{Handle, HandleTable};
 use crate::id::{ObjectId, ServerId};
 use crate::ipc::SessionHandler;
+use crate::process::Console;
 use crate::result::{CallResult, KernelError, ResultCode, SvcError};
 use crate::sched::CoreId;
 use crate::svc::{
@@ -224,6 +225,7 @@ use crate::tables::{AddressSpace, Processes, Scheduler};
 
 mod arbitration;
 mod cores;
+mod hooks;
 mod ipc;
 mod lifecycle;
 mod memory_objects;
@@ -609,6 +611,8 @@ struct Call<'c, 'k> {
 pub struct Dispatcher {
     state: Mutex<State>,
     timer: Option<Box<dyn LockTimer>>,
+    /// The hooks of service-created events (`dispatch/hooks.rs`), outside the kernel lock.
+    hooks: hooks::Hooks,
 }
 
 impl fmt::Debug for Dispatcher {
@@ -635,6 +639,7 @@ impl Dispatcher {
                 latest: GuestTicks(0),
             }),
             timer: None,
+            hooks: hooks::Hooks::default(),
         }
     }
 
@@ -836,6 +841,7 @@ impl Dispatcher {
             SvcId::QueryMemory => self.call::<(&AddressSpace,)>(call, |(space,), call, _| {
                 query_memory(space, call.caller.memory, id, convention, call.regs)
             }),
+            SvcId::SetGpuMemoryAttribute => self.set_gpu_memory_attribute(call, id, convention),
             SvcId::GetInfo => self.call::<(&HandleTable, &AddressSpace, &Scheduler)>(
                 call,
                 |(handles, space, scheduler), call, _| {
@@ -952,6 +958,37 @@ fn set_memory_attribute(
         memory::set_memory_attribute(space, address, size, mask, attribute)?;
         Ok([])
     })
+}
+
+impl Dispatcher {
+    /// `SetGpuMemoryAttribute`'s arm: it declares the address space, and reads which console the
+    /// process was built for from the process facts.
+    fn set_gpu_memory_attribute(
+        &self,
+        call: &mut Call<'_, '_>,
+        id: SvcId,
+        convention: &Convention,
+    ) -> Outcome {
+        self.call_in_process::<(&mut AddressSpace,)>(call, |(space,), call, _, processes| {
+            returning(
+                id,
+                convention,
+                call.regs,
+                |[address, size, mask, attribute]| {
+                    let console = processes
+                        .own_info()
+                        .map_err(|error| SvcError::internal(&error))?
+                        .console();
+                    let switch_2 = console == Console::Switch2;
+                    let (mask, attribute) = (word(mask)?, word(attribute)?);
+                    memory::set_gpu_memory_attribute(
+                        space, switch_2, address, size, mask, attribute,
+                    )?;
+                    Ok([])
+                },
+            )
+        })
+    }
 }
 
 fn query_memory(

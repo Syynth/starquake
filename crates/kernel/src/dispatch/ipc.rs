@@ -91,6 +91,7 @@
 //! dispatcher without a core loop) is only reported woken, as before slice 10.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use starquake_cpu::GuestRegs;
 use starquake_ipc::BUFFER_SIZE;
@@ -108,7 +109,8 @@ use crate::handle::{Handle, HandleError, HandleTable};
 use crate::id::{ObjectId, ProcessId, ServerId};
 use crate::ipc::message::{Current, MessageBuffer, Translated, Translation, translate};
 use crate::ipc::{
-    Admission, Done, Finish, Handled, IpcError, Notice, PortName, Request, Sender, SessionHandler,
+    Admission, Done, EventHook, Finish, Handled, IpcError, Notice, PortName, Request, Sender,
+    SessionHandler,
 };
 use crate::memory::shared::span_within;
 use crate::memory::{
@@ -227,6 +229,54 @@ impl IpcContext<'_> {
     pub fn create_event(&mut self) -> SvcResult<ObjectId> {
         self.dispatcher
             .with::<(&mut Scheduler,), _>(|(scheduler,)| scheduler.create_readable_event())
+            .map_err(call_error)
+    }
+
+    /// Creates an event with both ends, for the server to give the sender its writable end
+    /// (with a copy handle) and to hear, through `hook`, when the sender signals it
+    /// ([`EventHook`]; `crate::ipc::hook` says exactly when the hook runs). Returns the
+    /// writable end and the readable end, in that order ([`Scheduler::create_event`]). The
+    /// server keeps the creator's reference to each for as long as it lives, as it does an
+    /// event's from [`IpcContext::create_event`]. [`KernelError::OutOfResource`] when the object
+    /// table is full; no event or hook is left behind then.
+    pub fn create_hooked_event(
+        &mut self,
+        hook: Arc<dyn EventHook>,
+    ) -> SvcResult<(ObjectId, ObjectId)> {
+        let dispatcher = self.dispatcher;
+        dispatcher
+            .with::<(&mut Scheduler,), _>(|(scheduler,)| {
+                let (writable, readable) = scheduler.create_event()?;
+                dispatcher.hooks.attach(scheduler.objects(), writable, hook);
+                Ok((writable, readable))
+            })
+            .map_err(call_error)
+    }
+
+    /// Whether every page of the sender's `size` bytes at `address` has the GPU-accessible
+    /// attribute `svc 0x80` sets ([`AddressSpace::is_gpu_accessible`]): what the graphics
+    /// server asks before it registers memory for the GPU (kernel spec, "Address space").
+    #[must_use]
+    pub fn is_gpu_accessible(&self, address: u64, size: u64) -> bool {
+        self.dispatcher
+            .with::<(&AddressSpace,), _>(|(space,)| space.is_gpu_accessible(address, size))
+    }
+
+    /// Takes a device-share lock on the sender's `size` bytes at `address`
+    /// ([`AddressSpace::lock_device_share`], whose errors these are): while it is held, the CPU
+    /// mapping under the range cannot change. Each lock is released by one
+    /// [`IpcContext::unlock_device_share`] of the same range.
+    pub fn lock_device_share(&mut self, address: u64, size: u64) -> SvcResult<()> {
+        self.dispatcher
+            .with::<(&mut AddressSpace,), _>(|(space,)| space.lock_device_share(address, size))
+            .map_err(call_error)
+    }
+
+    /// Releases a device-share lock that [`IpcContext::lock_device_share`] took on the same
+    /// range ([`AddressSpace::unlock_device_share`], whose errors these are).
+    pub fn unlock_device_share(&mut self, address: u64, size: u64) -> SvcResult<()> {
+        self.dispatcher
+            .with::<(&mut AddressSpace,), _>(|(space,)| space.unlock_device_share(address, size))
             .map_err(call_error)
     }
 
