@@ -292,8 +292,9 @@ pub struct Server {
     pub(super) next_token: u64,
     pub(super) mailbox: Arc<Mailbox>,
     pub(super) notify: Option<Arc<dyn Notify>>,
-    /// The environment methods reach the host through; not saved.
-    env: Option<Arc<dyn Env>>,
+    /// The environment methods reach the host through, as [`Server::with_env`] wrapped it; not
+    /// saved. Typed as the wrapper, so no other environment can be stored here.
+    env: Option<Arc<Watched>>,
     /// Where methods send work that takes time; not saved.
     executor: Option<Arc<dyn Executor>>,
     stubbed: BTreeSet<StubbedCommand>,

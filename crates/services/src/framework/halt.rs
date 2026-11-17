@@ -38,7 +38,8 @@
 //!
 //! # Who reads the environment
 //!
-//! Exactly these, in this crate:
+//! These, in this crate, which is all the search under "What is checked" finds (it says what it
+//! cannot see):
 //!
 //! - **`fsp-srv`'s handlers**, through [`Context::env`](super::Context::env):
 //!   `OpenSdCardFileSystem`, `OpenDataStorageByCurrentProcess`,
@@ -60,17 +61,28 @@
 //!
 //! # What is checked
 //!
-//! - **By the compiler**: a server keeps no environment but the wrapped one, and the wrapper is
-//!   private to this module, so [`Context::env`](super::Context::env) cannot hand a method an
-//!   environment that does not tell the halt.
+//! - **By the compiler**: a server keeps no environment but the wrapped one. Its field, and the
+//!   one [`Context`](super::Context) borrows, are typed as the wrapper (`Watched`, visible only
+//!   inside `framework`), which tells the halt of every failure, so
+//!   [`Context::env`](super::Context::env) cannot hand a method an environment that does not.
+//!   Storing the environment [`Server::with_env`](super::Server::with_env) is given without
+//!   wrapping it does not compile.
 //! - **By a test**: a method could still reach an environment some other way: a hand-written
 //!   [`Family`](super::Family) (which `serde` does not force to be plain data) holding one, a
 //!   job capturing one, or a free function given one. The test
 //!   `only_the_listed_files_name_the_environment` (`framework/halt/tests.rs`) reads this crate's
-//!   non-test sources and fails when a file outside an exact list names `Env`, so a new reader of
-//!   the environment has to be added there, with its path, and to the list above. The check is a
-//!   text search for the word `Env` in code (not comments); it cannot see an environment reached
-//!   through a type alias or a re-export under another name, which is for review to catch.
+//!   non-test sources (every `.rs` file below `src/` except a `tests.rs` file or one in a `tests`
+//!   folder) and fails when a file outside an exact list, or a listed file no longer, has a line
+//!   that counts. A line counts when its first non-blank characters are not `//` and it has a
+//!   word (a run of ASCII letters, digits and `_`) that ends in `Env` (`Env`, `LiveEnv`; not
+//!   `EnvError`), the text `.env()` (a call of [`Context::env`](super::Context::env), which needs
+//!   no import of `Env`: `cx.env()?.now()?`), or the word `with_env`. So a line comment does not
+//!   count, but a block comment or a comment after code that has such a word does. A new reader
+//!   of the environment in this crate is found by one of the three, whichever crate gives its
+//!   server the environment, and has to be added to the list there, with its path, and to the
+//!   list above. The search cannot see an environment reached through a type alias, a re-export
+//!   under another name, or a method value (`Context::env` passed as a function rather than
+//!   called), nor anything outside this crate's `src/`; those are for review to catch.
 
 use std::sync::Arc;
 

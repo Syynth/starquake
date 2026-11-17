@@ -361,9 +361,11 @@ fn a_recording_halt_keeps_every_stop_in_order() {
 
 // ----- who reads the environment -----------------------------------------------------------------
 
-/// The non-test files of this crate that may name an environment type (`Env`, or a name ending
-/// in it: `LiveEnv`, `ReplayEnv`), relative to `src/`, each with why. The module docs, "Who
-/// reads the environment", say who reads one; this is where it is checked.
+/// The non-test files of this crate that may read an environment or hand one to a server
+/// ([`reads_the_environment`]: name an environment type, `Env` or a name ending in it such as
+/// `LiveEnv`, call [`Context::env`], or name [`Server::with_env`]), relative to `src/`, each with
+/// why. The module docs, "Who reads the environment", say who reads one; this is where it is
+/// checked.
 const NAMES_THE_ENVIRONMENT: [(&str, &str); 8] = [
     (
         "framework/context.rs",
@@ -408,6 +410,19 @@ fn names_an_environment(code: &str) -> bool {
         .any(|word| word.ends_with("Env"))
 }
 
+/// Whether `code` reads an environment or hands one to a server: it names an environment type
+/// ([`names_an_environment`]), calls [`Context::env`] (contains `.env()`), or names
+/// [`Server::with_env`] (a word that is `with_env`). A method
+/// call on a `dyn Env` needs no import, so a handler that only does `cx.env()?.now()?` names no
+/// environment type; and a server may be given its environment in another crate.
+fn reads_the_environment(code: &str) -> bool {
+    names_an_environment(code)
+        || code.contains(".env()")
+        || code
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .any(|word| word == "with_env")
+}
+
 /// Every `.rs` file below `folder`, sorted.
 fn sources(folder: &Path, found: &mut Vec<PathBuf>) {
     let mut entries: Vec<PathBuf> = std::fs::read_dir(folder)
@@ -424,7 +439,8 @@ fn sources(folder: &Path, found: &mut Vec<PathBuf>) {
     }
 }
 
-/// The non-test files below `src` whose code (comment lines left out) names an environment type,
+/// The non-test files below `src` with a line that [`reads_the_environment`], leaving out lines
+/// whose first non-blank characters are `//` (but not block comments, or a comment after code),
 /// relative to `src`, with `/` between folders, sorted as strings.
 fn files_naming_the_environment(src: &Path) -> Vec<String> {
     let mut files = Vec::new();
@@ -440,7 +456,7 @@ fn files_naming_the_environment(src: &Path) -> Vec<String> {
             let mentions = text
                 .lines()
                 .filter(|line| !line.trim_start().starts_with("//"))
-                .any(names_an_environment);
+                .any(reads_the_environment);
             let parts: Vec<String> = relative
                 .components()
                 .map(|part| part.as_os_str().to_string_lossy().into_owned())
@@ -463,16 +479,19 @@ fn only_the_listed_files_name_the_environment() {
     assert_eq!(
         files_naming_the_environment(&src),
         listed,
-        "a file names an environment type that `framework::halt` does not list (a new reader of \
-         the environment, which must go through `Server::with_env`), or a listed one no longer \
-         does: update the list and the module docs, \"Who reads the environment\""
+        "a file names an environment type, calls `Context::env` or names `Server::with_env`, \
+         and `framework::halt` does not list it (a new reader of the environment, which must go \
+         through `Server::with_env`), or a listed one no longer does: update the list and the \
+         module docs, \"Who reads the environment\""
     );
 }
 
 #[test]
 fn the_search_sees_each_way_of_naming_an_environment() {
-    // What the search counts, and what it leaves out: the words around it, a comment line, and a
-    // name that only starts with `Env`.
+    // What the search counts (a type named `Env` or ending in it, a call of `Context::env`, a
+    // call of `with_env`), and what it leaves out: the words around them, a name that only
+    // starts with `Env`, `std::env` and `env!`, a field named `env`, and the definition of a
+    // method named `env`.
     for code in [
         "fn f(env: &dyn Env) {}",
         "let e: Arc<dyn Env> = x;",
@@ -480,17 +499,25 @@ fn the_search_sees_each_way_of_naming_an_environment() {
         "let live = LiveEnv::new(clock, 0);",
         "ReplayEnv::new(records)",
         "Env",
+        "let env = cx.env()?;",
+        "let reading = cx.env()?.now()?;",
+        "    .env()?",
+        "Server::new(\"hid\", policy).with_env(env, halt)",
+        "pub fn with_env(mut self, env: Arc<dyn Env>, halt: Arc<dyn Halt>) -> Self {",
     ] {
-        assert!(names_an_environment(code), "{code}");
+        assert!(reads_the_environment(code), "{code}");
     }
     for code in [
         "fn f() -> Result<(), EnvError> {}",
         "EnvCall::Clock",
         "EnvRecord::Random(1)",
-        "let env = cx.env()?;",
         "Environment",
+        "let path = std::env::temp_dir();",
+        "env!(\"CARGO_MANIFEST_DIR\")",
+        "let env = this.env;",
+        "pub fn env(&self) -> Result<Arc<dyn Trace>, Fault> {",
     ] {
-        assert!(!names_an_environment(code), "{code}");
+        assert!(!reads_the_environment(code), "{code}");
     }
     // Test code, by path.
     assert!(is_test_code(Path::new("time/tests.rs")));
@@ -520,7 +547,22 @@ fn the_search_finds_a_new_reader_and_skips_comments_and_tests() {
     write("b/tests.rs", "fn h(env: &dyn Env) {}\n");
     write("e/tests/f.rs", "fn i(env: &dyn Env) {}\n");
     write("g.txt", "Env\n");
+    // A handler that only calls `Context::env` names no environment type (a method call on
+    // `dyn Env` needs no import), and a server set up with `with_env` may be built in another
+    // crate: each is found by its call.
+    write(
+        "h.rs",
+        "fn now(cx: &mut Context<'_>) -> Outcome {\n    let reading = cx.env()?.now()?;\n}\n",
+    );
+    write(
+        "i/j.rs",
+        "let server = Server::new(\"hid\", policy).with_env(env, halt);\n",
+    );
+    write(
+        "i/k.rs",
+        "    // cx.env()?.now()? and with_env(env, halt), in a comment.\n",
+    );
     let found = files_naming_the_environment(&src);
     std::fs::remove_dir_all(&src).unwrap();
-    assert_eq!(found, ["a.rs", "b/c.rs"]);
+    assert_eq!(found, ["a.rs", "b/c.rs", "h.rs", "i/j.rs"]);
 }

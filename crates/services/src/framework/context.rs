@@ -9,6 +9,7 @@ use starquake_kernel::memory::{DeviceShareToken, SharedPages, SvcPermission, Tra
 use starquake_trace::Env;
 
 use super::defer::{Deferral, ReplyToken, TokenId};
+use super::halt::Watched;
 use super::kernel::Kernel;
 use super::result::{Fault, NOT_SUPPORTED};
 use super::server::UnknownPolicy;
@@ -32,7 +33,7 @@ pub struct Context<'a> {
     pub(super) family: Option<&'a mut dyn Family>,
     pub(super) policy: UnknownPolicy,
     pub(super) deferral: Deferral<'a>,
-    pub(super) env: Option<&'a Arc<dyn Env>>,
+    pub(super) env: Option<&'a Arc<Watched>>,
     pub(super) executor: Option<&'a Arc<dyn Executor>>,
     /// Whether the method asked to end the caller's process ([`Context::end_process`]).
     pub(super) ending: bool,
@@ -198,7 +199,9 @@ impl Context<'_> {
     /// A server with no environment is a mistake in how it was put together: it is logged as an
     /// error and the request fails with [`NOT_SUPPORTED`], as for [`Context::family`].
     pub fn env(&self) -> Result<Arc<dyn Env>, Fault> {
-        let env = self.env.map(Arc::clone);
+        let env = self
+            .env
+            .map(|env| -> Arc<dyn Env> { Arc::<Watched>::clone(env) });
         if env.is_none() {
             tracing::error!("the server has no environment, and a method asked for it");
         }
