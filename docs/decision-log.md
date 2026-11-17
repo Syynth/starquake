@@ -434,3 +434,35 @@ Entry format:
 - **SCOPE:** minor/local (spec amendment)
 - **WHAT:** syncpt 201's mode 1, where PR #4588 compares as 64 bits and Eden-NX2 does not, joins the graphics-server spec's list of reference disagreements a title trace settles ("What to verify before building", item 1). The code keeps PR's reading, per decision 8, until then.
 - **WHY:** It is a real disagreement between the references with no trace yet; listing it with the others means it is checked when traces are taken.
+
+## Defer as-gpu ModifyKind and Remap, and ctrl-gpu QueryEvent 1 and 2, until a title sends them
+- **WHEN:** 2026-11-17
+- **PROJECT:** starquake
+- **SYSTEM:** graphics-server
+- **SCOPE:** moderate (spec amendment)
+- **WHAT:** The spec's device table marks as-gpu ModifyKind (0xC) and Remap (0x14), and ctrl-gpu QueryEvent 1 and 2, as deferred. They go to the unknown-ioctl policy, which logs them, until a title sends one. The spec says how they would be added: an ordered GPU-memory job with no notification event, plus as-gpu AllocateSpace for Remap. #188 can close without them.
+- **WHY:** Only PR #4588's code names them; no trace shows a title using them. Row 30 shows Switch 2 never mapping through as-gpu, and row 149 shows mapping changes arriving as gsv 212, which is already built. Building them would add machinery nothing else needs. Deferring doesn't rule them out, because the unknown-ioctl log names any title that sends one.
+
+## Address-space restore checks attributes against state flags, not a permission table
+- **WHEN:** 2026-11-17
+- **PROJECT:** starquake
+- **SYSTEM:** kernel
+- **SCOPE:** moderate
+- **WHAT:** Restoring an address space refuses an attribute that the block's memory state doesn't allow, using the reference's own state flags (CanChangeAttribute for Uncached and GpuAccessible, CanPermissionLock for PermissionLocked). Locked ranges are checked against the transfer memory that lent them once the object-table snapshot (#260) lands. There is no per-state permission table: restore keeps accepting any permission a system call can set, and the docs say so.
+- **WHY:** The flag checks come straight from the reference, so restore can't refuse anything a live address space could hold. A permission table would be stricter than the live kernel, whose internal path can set read-execute on Normal memory; only the system call refuses that. The only threat here is a corrupt or hostile snapshot file.
+
+## Keep PR's shim placement when a view's start equals its split
+- **WHEN:** 2026-11-17
+- **PROJECT:** starquake
+- **SYSTEM:** graphics-server
+- **SCOPE:** minor/local (spec amendment)
+- **WHAT:** When a parentless AllocAsEx's split equals its start, as-gpu keeps PR #4588's rule and answers Success. The shim goes on the page below the start, which is GPU address 0 when the start is the first page. The case is added to the spec's verification item 1, so a trace can show whether NvRm ever sends it.
+- **WHY:** Nobody knows whether NvRm sends this layout. Refusing it, or switching to NX2's rule for this one case, could break a title that runs under PR. A test already pins the behaviour, and the stakes are low.
+
+## Keep PR's ctrl-gpu interface levels until a trace of NvRm's reads settles them
+- **WHEN:** 2026-11-17
+- **PROJECT:** starquake
+- **SYSTEM:** graphics-server
+- **SCOPE:** moderate (spec amendment)
+- **WHAT:** The characteristics block keeps PR #4588's nine interface levels at +0x70. The conflict goes into the spec's verification item 1: row 24 asks for every level to be at least 6, NX2's comment asks only for [0x78] at least 6 plus feature thresholds, and NX2 ships 0x40 everywhere. When the title first reaches this ioctl, a reference-emulator trace finds which levels NvRm reads. If the title fails there, NX2's 0x40 values are the first experiment.
+- **WHY:** The spec already takes PR's whole layout. PR's values meet NX2's narrower rule but not row 24's broad reading, and nothing says yet which levels NvRm reads. A trace settles it with evidence instead of a guess.
