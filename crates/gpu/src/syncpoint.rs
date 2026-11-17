@@ -598,6 +598,14 @@ impl CounterExtension {
         *previous = extend_counter(*previous, current);
         *previous
     }
+
+    /// The 64-bit value of counter `id` as last observed ([`CounterExtension::observe`]), or
+    /// [`UNALLOCATED`] if no allocated value has been observed: what the shared syncpoint page
+    /// shows for it (gsv's `shared::page`). Reading changes nothing.
+    #[must_use]
+    pub fn value(&self, id: SyncpointId) -> u64 {
+        self.previous[usize::from(id.get())]
+    }
 }
 
 impl TryFrom<Vec<u64>> for CounterExtension {

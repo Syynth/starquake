@@ -195,6 +195,24 @@ fn counter_extension_observes_per_id() {
 }
 
 #[test]
+fn counter_extension_value_is_the_last_observed_and_reading_it_changes_nothing() {
+    let mut extension = CounterExtension::default();
+    let (a, b) = (id(5), last_id());
+    assert_eq!(extension.value(a), UNALLOCATED);
+    extension.observe(a, Some(9));
+    extension.observe(a, Some(2));
+    assert_eq!(extension.value(a), WRAP | 2);
+    assert_eq!(extension.value(a), WRAP | 2);
+    // An unallocated read leaves the value as it was; another id keeps its own.
+    extension.observe(a, None);
+    assert_eq!(extension.value(a), WRAP | 2);
+    assert_eq!(extension.value(b), UNALLOCATED);
+    extension.observe(b, Some(1));
+    assert_eq!(extension.value(b), 1);
+    assert_eq!(extension.value(a), WRAP | 2);
+}
+
+#[test]
 fn counter_extension_layout_is_pinned() {
     let mut extension = CounterExtension::default();
     extension.observe(id(0), Some(5));
