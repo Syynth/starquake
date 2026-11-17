@@ -59,11 +59,22 @@
 //!   (`R_UNLESS(m_physical_address != 0, ResultOutOfMemory)` in `KSharedMemory::Initialize`).
 //!   Here guest RAM is [`SpaceError::OutOfRam`], which the kernel's address space turns into its
 //!   own failure (`SvcError::Internal`), and a server's `IpcContext::create_shared_memory` into
-//!   `InvalidState`. Test:
-//!   `running_out_of_ram_by_exactly_one_page_is_the_kernels_own_failure_and_not_a_panic`.
+//!   `InvalidState`. Tests: the `SvcError::Internal` half is
+//!   `running_out_of_ram_by_exactly_one_page_is_the_kernels_own_failure_and_not_a_panic`
+//!   (`space/tests/kernel.rs`); the `InvalidState` half is
+//!   `a_translation_with_no_backing_to_share_is_the_kernels_failure`
+//!   (`crates/kernel/src/dispatch/memory_objects/tests.rs`, on a mapper that refuses).
 //! - **Stricter: a shared mapping must name exactly a run [`AddressSpace::allocate_shared`]
-//!   handed out**, or it is [`SpaceError::NotShared`]. The kernel always names a shared
-//!   memory's whole run (`SharedMemory::backing`), so no guest reaches this. Test:
+//!   handed out**, or it is [`SpaceError::NotShared`]. The run is recorded in the shadow of the
+//!   one address space that handed it out, so this holds only while a run has one process:
+//!   there the kernel always names a shared memory's whole run (`SharedMemory::backing`) and
+//!   maps it in the address space that made it (a server's `IpcContext::create_shared_memory`
+//!   allocates through the kernel address space its dispatcher holds, which drives this one
+//!   through [`SpaceMapper`]), so no guest reaches this. A second process mapping the same
+//!   shared memory would be refused here, and the kernel would answer `SvcError::Internal`,
+//!   where Eden maps the pages of its global page heap into any process (`MapPageGroup` in
+//!   `KSharedMemory::Map`, `eden/src/core/hle/kernel/k_shared_memory.cpp` @ cf654052). See
+//!   the PROVISIONAL list below. Test:
 //!   `pages_that_are_not_one_shared_memory_are_refused_and_change_nothing`.
 //!
 //! PROVISIONAL, and what replaces each part:
@@ -75,6 +86,11 @@
 //!   from the program a run loads, plus a working allowance (`crate::system`'s `ram` module),
 //!   which is usually far smaller than what the kernel lets a process reserve, and a guest that
 //!   touches more ends its run as an emulator error.
+//! - **A shared memory can be mapped only in the address space that handed it out**: its run
+//!   is recorded in that [`AddressSpace`]'s shadow, and its pages are taken from that address
+//!   space's RAM. System-wide guest RAM and one record of the shared runs (the execution
+//!   model's backing pools), instead of per-`AddressSpace` ones, replace it, so that any
+//!   process's address space can map any shared memory.
 //! - **One page per fault.** A guest that touches a large mapping takes one exit per page.
 //!   Backing a run of pages at once is a measurement away.
 //! - **Host access ignores permissions**, which is what lets the loader write a code page that

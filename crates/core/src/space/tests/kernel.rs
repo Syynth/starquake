@@ -1,7 +1,42 @@
 //! The kernel's shared-memory calls (`starquake_kernel::svc::shared_memory`) over the real
-//! mapper: the scenarios of the kernel's own tests (`crates/kernel/src/svc/shared_memory/tests.rs`,
-//! which run on a recording mapper), checked here in the translation guest code runs on, read
-//! back with the software table walker. `space/tests/hvf.rs` runs them on a vCPU.
+//! mapper, checked in the translation guest code runs on and read back with the software table
+//! walker. `space/tests/hvf.rs` checks a mapping on a vCPU: guest loads and stores through it,
+//! a store to a read-only one, and a load after unmapping.
+//!
+//! Five of the fifteen tests in the kernel's own `crates/kernel/src/svc/shared_memory/tests.rs`
+//! (which run on a recording mapper) are mirrored here, because each one reaches the mapper:
+//!
+//! - `mapping_shared_memory_maps_its_pages_and_holds_a_reference_until_it_is_unmapped`:
+//!   `mapping_shared_memory_maps_its_pages_as_asked_and_unmapping_takes_them_away`.
+//! - `a_host_write_is_visible_through_the_guest_mapping_and_the_reverse`: the test of the same
+//!   name.
+//! - `a_mapping_must_lie_in_the_alias_code_region_up_to_its_last_byte` (a mapping ending at the
+//!   region's end) and `unmapping_shared_memory_needs_the_mapping_of_that_shared_memory_at_its_start`
+//!   (unmapping leaves the neighbour that starts where the range ends):
+//!   `a_mapping_that_ends_where_its_neighbour_starts_and_one_that_ends_at_the_regions_end`.
+//! - `mapping_one_shared_memory_twice_at_one_place_is_refused_and_at_two_places_is_not`:
+//!   `one_shared_memory_mapped_at_two_places_shares_its_pages`, and its refusal over the
+//!   mapping already there in `each_refused_mapping_changes_neither_the_blocks_nor_the_translation`,
+//!   which also checks that refusals of the kinds the kernel tests pin leave the translation as
+//!   it was.
+//!
+//! The other ten are not mirrored, because the real mapper adds nothing to what they observe:
+//!
+//! - Refused before the mapper is called, which the kernel tests pin with an empty mapper log:
+//!   `each_refusal_of_a_mapping_has_its_result_in_eden_order_and_changes_nothing` and
+//!   `each_refusal_of_an_unmapping_has_its_result_in_eden_order_and_changes_nothing`.
+//! - Refused before the mapper is called, with no mapping that reaches it checked beyond its
+//!   result or the kernel's block: `the_permission_must_be_the_user_permission`,
+//!   `a_permission_that_is_neither_read_nor_read_write_is_refused_before_the_handle_is_read`
+//!   and `the_size_checked_is_the_objects_not_the_one_asked_for`.
+//! - Checking only the kernel's blocks or the object's reference count:
+//!   `unmapping_leaves_the_blocks_as_they_were_before_the_mapping`,
+//!   `a_mapping_keeps_its_shared_memory_alive_after_every_handle_and_the_server_let_go` and
+//!   `unmapping_the_last_mapping_of_a_shared_memory_with_no_server_leaves_it_to_its_handle`.
+//! - Checking a mapper other than this one: `the_address_space_takes_only_whole_pages_of_the_size_it_asked_for`
+//!   (a mapper that hands out a page too many; this mapper's whole-page check is in
+//!   `space/tests/shared.rs`) and `a_translation_with_the_default_has_no_shared_backing` (the
+//!   default refusing mapper, which [`SpaceMapper`] replaces).
 
 use starquake_kernel::handle::{Handle, HandleTable};
 use starquake_kernel::id::ObjectId;
