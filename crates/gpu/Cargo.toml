@@ -19,6 +19,8 @@ test-support = []
 starquake-memory.workspace = true
 starquake-shader.workspace = true
 starquake-render.workspace = true
+postcard.workspace = true
+serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 

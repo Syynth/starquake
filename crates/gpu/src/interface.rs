@@ -6,9 +6,11 @@
 //! definition.
 //!
 //! This module holds the ones that exist so far: [`ChannelId`], [`SyncpointId`] and
-//! [`SYNCPOINT_COUNT`], and the present's [`PresentRequest`] with its [`ImageDesc`], [`LayerId`]
-//! and [`DisplayId`]. The rest of the block (`Fence`, `Syncpoints`, `Submission`, `GpuFront`,
-//! ...) belongs here too when its slice lands.
+//! [`SYNCPOINT_COUNT`], the present's [`PresentRequest`] with its [`ImageDesc`], [`LayerId`]
+//! and [`DisplayId`], and graphics-server slice 2's [`Fence`], [`Ticket`], [`GpuCompletion`] and
+//! [`Completions`]. The block's `Syncpoints` has behaviour, not only a shape, so it lives in
+//! [`crate::syncpoint`] with the comparisons and the allocation it ports. The rest of the block
+//! (`Submission`, `GpuFront`, ...) belongs here too when its slice lands.
 
 use starquake_render::command::Rect;
 
@@ -34,6 +36,57 @@ impl SyncpointId {
     pub const fn get(self) -> u8 {
         self.0
     }
+}
+
+/// A fence: done once syncpoint `id` reaches `value` (graphics-server, "Syncpoints and the syncpt
+/// session"), by the 32-bit wrapping comparison of
+/// [`Syncpoints::reached`](crate::syncpoint::Syncpoints::reached).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Fence {
+    /// The syncpoint.
+    pub id: SyncpointId,
+    /// The value it has to reach.
+    pub value: u32,
+}
+
+/// The ticket of an ordered update or a barrier (`GpuFront::update_vm`, `GpuFront::barrier`),
+/// reported back in [`GpuCompletion::GpuOrdered`]. Not a protocol fact: gsv hands tickets out
+/// and only compares them, so the width is this crate's choice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Ticket(pub u64);
+
+/// What a host thread reports to gsv's completion queue (graphics-server, "Who signals what: the
+/// completion queue"; the same block in gpu-protocol, "Graphics server sessions (#11)").
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GpuCompletion {
+    /// A watched syncpoint changed. Pushed by
+    /// [`Syncpoints::increment`](crate::syncpoint::Syncpoints::increment), which the back thread
+    /// calls after host completion and gsv's video worker calls per finished frame.
+    SyncpointChanged {
+        /// The syncpoint.
+        id: SyncpointId,
+        /// Its value after the change.
+        value: u32,
+    },
+    /// An ordered update or a barrier is done.
+    GpuOrdered {
+        /// The ticket it was queued with.
+        ticket: Ticket,
+    },
+    /// A full channel queue has room again.
+    GpuQueueRoom {
+        /// The channel.
+        channel: ChannelId,
+    },
+}
+
+/// Where host threads push [`GpuCompletion`]s: gsv's completion queue, which gsv implements
+/// (graphics-server slice 3) and drains on its timer thread, so guest waiters wake in one
+/// recorded order. `push` never blocks and is the only call from the GPU into gsv
+/// (graphics-server, "What gsv assumes").
+pub trait Completions: Send + Sync {
+    /// Queues `completion`.
+    fn push(&self, completion: GpuCompletion);
 }
 
 /// A vi2 layer. A **guess** at the width: `nn::vi` layer ids are 64-bit; graphics-server names
