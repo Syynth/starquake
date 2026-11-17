@@ -2451,8 +2451,8 @@ fn a_restored_event_the_kernel_made_is_copied_unchanged() {
 /// `am_types.h`'s `enum class AppletMessage : u32` @ cf654052, every value but `None = 0`, in
 /// declaration order: the reference's list, written out here to check [`AppletMessage::raw`].
 const EDEN_MESSAGE_WORDS: [u32; 31] = [
-    1, 2, 4, 6, 15, 16, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 50, 51, 55, 56,
-    57, 60, 90, 91, 92, 93, 95,
+    1, 2, 4, 6, 15, 16, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 50, 51, 55, 56, 57,
+    60, 90, 91, 92, 93, 95,
 ];
 
 /// The reply to a `ReceiveMessage` that delivers `message`.
