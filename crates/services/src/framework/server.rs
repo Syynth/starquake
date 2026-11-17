@@ -17,6 +17,7 @@ use super::commands::{Protocol, Session};
 use super::context::Context;
 use super::defer::ReplyToken;
 use super::defer::{Completed, Deferral, Framing, Mailbox, Notify, Pending, Posted, TokenId};
+use super::halt::{Halt, Watched};
 use super::kernel::Kernel;
 use super::payload::Writer;
 use super::queue::{Admission, QueueError, RequestQueue};
@@ -291,8 +292,9 @@ pub struct Server {
     pub(super) next_token: u64,
     pub(super) mailbox: Arc<Mailbox>,
     pub(super) notify: Option<Arc<dyn Notify>>,
-    /// The environment methods reach the host through; not saved.
-    env: Option<Arc<dyn Env>>,
+    /// The environment methods reach the host through, as [`Server::with_env`] wrapped it; not
+    /// saved. Typed as the wrapper, so no other environment can be stored here.
+    env: Option<Arc<Watched>>,
     /// Where methods send work that takes time; not saved.
     executor: Option<Arc<dyn Executor>>,
     stubbed: BTreeSet<StubbedCommand>,
@@ -403,11 +405,13 @@ impl Server {
     }
 
     /// Sets the injectable environment the server's methods read the host through
-    /// ([`Context::env`]). It is how a run reaches its host, not state: a snapshot neither saves
-    /// nor replaces it.
+    /// ([`Context::env`]), and the run's `halt`, which is told, as
+    /// [`Stop::Handler`](super::Stop::Handler) naming this server, of every call to it that fails
+    /// ([`halt`](super::halt)). The server keeps the environment only so wrapped. It is how a run
+    /// reaches its host, not state: a snapshot neither saves nor replaces it.
     #[must_use]
-    pub fn with_env(mut self, env: Arc<dyn Env>) -> Self {
-        self.env = Some(env);
+    pub fn with_env(mut self, env: Arc<dyn Env>, halt: Arc<dyn Halt>) -> Self {
+        self.env = Some(Arc::new(Watched::new(self.name.clone(), env, halt)));
         self
     }
 

@@ -21,7 +21,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use starquake_services::framework::{Executor, Finish};
-use starquake_services::fsp::halt::{Halt, Stop};
+use starquake_services::framework::{Halt, Stop};
 use starquake_services::fsp::worker::{
     COUNT, Completed, FINISH_PANICKED, JOB_PANICKED, JobIndex, Recording, Replay, Workers,
 };
