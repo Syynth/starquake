@@ -52,9 +52,8 @@ use starquake_kernel::id::ServerId;
 use starquake_kernel::ipc::{IpcError, PortName, PortNameError};
 use starquake_services::am::{self, Applet, AppletSettings};
 use starquake_services::apm;
-use starquake_services::framework::{Executor, Notify, UnknownPolicy};
+use starquake_services::framework::{Executor, Halt, Notify, UnknownPolicy};
 use starquake_services::fsp;
-use starquake_services::fsp::halt::Halt;
 use starquake_services::hid;
 use starquake_services::set::{self, FirmwareVersion, Settings};
 use starquake_services::sm::{self, NameError, Registry, RegistryError, ServiceName};
@@ -142,9 +141,10 @@ pub struct Reads {
     pub executor: Arc<dyn Executor>,
     /// Told when a read's reply is ready.
     pub ready: Arc<dyn Deliveries>,
-    /// Told when the environment fails `fsp-srv`, while one of its handlers runs or one of its
-    /// reads does, so that the run stops (`starquake_services::fsp::halt`): the run's own, in a
-    /// run. The executor is given its own when it is made.
+    /// Told when the environment fails a service, so that the run stops
+    /// (`starquake_services::framework::halt`): while one of `fsp-srv`'s handlers runs or one of
+    /// its reads does, and while `time:u`'s handler does ([`install`] gives it to both servers).
+    /// The run's own, in a run. The executor is given its own when it is made.
     pub halt: Arc<dyn Halt>,
 }
 
@@ -202,7 +202,7 @@ pub fn install(
         ready: reads.ready,
     });
     let notify: Arc<dyn Notify> = Arc::<Delivering>::clone(&delivering);
-    let files = fsp::server(policy, Arc::clone(&env), reads.halt)
+    let files = fsp::server(policy, Arc::clone(&env), Arc::clone(&reads.halt))
         .with_service_id(FSP_SRV)
         .with_executor(reads.executor)
         .with_notify(notify);
@@ -225,7 +225,8 @@ pub fn install(
     let input = hid::server(policy).with_service_id(HID);
     dispatcher.add_server(hid::NAME, HID, None, Box::new(input))?;
 
-    let clocks = time::server(TimeSettings::eden_default(), policy, env).with_service_id(TIME_U);
+    let clocks =
+        time::server(TimeSettings::eden_default(), policy, env, reads.halt).with_service_id(TIME_U);
     dispatcher.add_server(time::NAME, TIME_U, None, Box::new(clocks))?;
     Ok(())
 }

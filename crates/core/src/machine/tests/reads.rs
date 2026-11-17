@@ -652,6 +652,14 @@ const HOST_IO_FAILURE: EnvError = EnvError::Exhausted {
     requested: EnvCall::HostIo,
 };
 
+/// What `fsp-srv`'s handlers tell the halt when [`FailsHostIo`] fails them.
+fn fsp_handler_failed() -> Stop {
+    Stop::Handler {
+        service: fsp::NAME.to_owned(),
+        error: HOST_IO_FAILURE,
+    }
+}
+
 /// The run's environment, but with every host request failed as a replay that ran out would
 /// fail it.
 struct FailsHostIo(Arc<dyn Env>);
@@ -839,7 +847,7 @@ fn a_halt_keeps_its_first_reason_and_rings_the_timer_each_time() {
     let halted = Halted::new(Arc::clone(&bell));
     assert!(!bell.take_ring());
     assert_eq!(halted.reason(), None);
-    let first = Stop::Handler(HOST_IO_FAILURE);
+    let first = fsp_handler_failed();
     halted.halt(first.clone());
     assert!(bell.take_ring());
     let reason = first.to_string();
@@ -964,7 +972,7 @@ impl<V> GuestSpace<V> for HaltsAtSettle<'_> {
             });
         if counted == Ok(1) {
             let halt = self.halt.get().expect("the services were installed");
-            halt.halt(Stop::Handler(HOST_IO_FAILURE));
+            halt.halt(fsp_handler_failed());
         }
         Ok(())
     }
@@ -1016,7 +1024,7 @@ fn a_halt_told_as_a_thread_is_loaded_keeps_the_guest_out() {
         Limits::DEFAULT,
         &install,
     );
-    let reason = Stop::Handler(HOST_IO_FAILURE).to_string();
+    let reason = fsp_handler_failed().to_string();
     assert_eq!(
         report.exit,
         ExitReason::EmulatorError(reason),

@@ -17,6 +17,7 @@ use super::commands::{Protocol, Session};
 use super::context::Context;
 use super::defer::ReplyToken;
 use super::defer::{Completed, Deferral, Framing, Mailbox, Notify, Pending, Posted, TokenId};
+use super::halt::{Halt, Watched};
 use super::kernel::Kernel;
 use super::payload::Writer;
 use super::queue::{Admission, QueueError, RequestQueue};
@@ -403,11 +404,13 @@ impl Server {
     }
 
     /// Sets the injectable environment the server's methods read the host through
-    /// ([`Context::env`]). It is how a run reaches its host, not state: a snapshot neither saves
-    /// nor replaces it.
+    /// ([`Context::env`]), and the run's `halt`, which is told, as
+    /// [`Stop::Handler`](super::Stop::Handler) naming this server, of every call to it that fails
+    /// ([`halt`](super::halt)). The server keeps the environment only so wrapped. It is how a run
+    /// reaches its host, not state: a snapshot neither saves nor replaces it.
     #[must_use]
-    pub fn with_env(mut self, env: Arc<dyn Env>) -> Self {
-        self.env = Some(env);
+    pub fn with_env(mut self, env: Arc<dyn Env>, halt: Arc<dyn Halt>) -> Self {
+        self.env = Some(Arc::new(Watched::new(self.name.clone(), env, halt)));
         self
     }
 

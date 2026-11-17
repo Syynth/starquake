@@ -237,7 +237,7 @@ fn without_a_romfs_opening_the_data_storage_is_eden_s_unknown() {
     let command = OPEN_DATA_STORAGE_BY_CURRENT_PROCESS;
     let reply = open_with(Arc::new(Broken), command, halt);
     assert_eq!(reply, only(DEFERRED_REPLY_DROPPED));
-    assert_eq!(halts.stops(), [Stop::Handler(broken_error())]);
+    assert_eq!(halts.stops(), [handler_failed(broken_error())]);
     // A probe answered with bytes is not a storage either.
     let rig = Rig::with_storage();
     rig.env.host().forced = Some((Asked::Probe, Ok(HostIoReply::Data(vec![0]))));

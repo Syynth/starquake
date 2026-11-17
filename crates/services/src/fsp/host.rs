@@ -364,7 +364,7 @@ pub(crate) enum Answer {
     /// The host failed with a code this module does not know.
     Broken,
     /// The environment itself failed (a replay that ran out or disagreed): not a host answer at
-    /// all. The run stops (`fsp::halt`); the request gets no answer the guest sees.
+    /// all. The run stops (`framework::halt`); the request gets no answer the guest sees.
     Stopped,
 }
 

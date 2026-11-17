@@ -15,7 +15,7 @@ use starquake_kernel::handle::Handle;
 use starquake_kernel::id::ObjectId;
 use starquake_kernel::memory::SvcPermission;
 use starquake_kernel::result::{KernelError, ResultCode};
-use starquake_trace::{EnvCall, EnvRecord, FixedClock, LiveEnv, ReplayEnv};
+use starquake_trace::{EnvCall, EnvError, EnvRecord, FixedClock, LiveEnv, ReplayEnv};
 
 use super::calendar::{REPLY_SIZE, SECONDS_PER_DAY, UTC_NAME, to_calendar_time_utc};
 use super::command::static_service::{
@@ -27,8 +27,9 @@ use super::command::time_zone_service::TO_CALENDAR_TIME_WITH_MY_RULE;
 use super::shared_memory::{ClockSourceId, SIZE, image};
 use super::*;
 use crate::framework::fake::FakeKernel;
+use crate::framework::halt::Halts;
 use crate::framework::result::UNKNOWN_COMMAND_ID;
-use crate::framework::{Handled, Kernel, Protocol, Session};
+use crate::framework::{DEFERRED_REPLY_DROPPED, Handled, Kernel, Protocol, Session, Stop};
 
 /// `StaticService::GetEphemeralNetworkSystemClock`, which this port leaves out, so it has no
 /// shipping constant (`glue/time/static.cpp`: `{5, ..}`).
@@ -46,28 +47,46 @@ const SEED: u64 = 0x5EED_0F71_AE00;
 /// What fills the message buffer beforehand.
 const STALE: u8 = 0xA5;
 
-/// A `time:u` server, a kernel, one session, and the environment the server reads.
+/// A `time:u` server, a kernel, one session, the environment the server reads, and the halt it
+/// tells when that environment fails.
 struct Rig {
     kernel: FakeKernel,
     server: Server,
     session: ObjectId,
     env: Arc<LiveEnv>,
+    halts: Arc<Halts>,
 }
 
 impl Rig {
     fn with(settings: TimeSettings, clock_start: u64) -> Self {
         let env = Arc::new(LiveEnv::new(FixedClock::new(clock_start, 1), SEED));
+        let shared: Arc<dyn Env> = Arc::<LiveEnv>::clone(&env);
+        let halts = Arc::new(Halts::default());
+        let server = server(settings, UnknownPolicy::Strict, shared, halts.shared());
         let mut kernel = FakeKernel::new(0).unwrap();
         let session = kernel.new_object();
-        let shared: Arc<dyn Env> = Arc::<LiveEnv>::clone(&env);
-        let mut server = server(settings, UnknownPolicy::Strict, shared);
-        server.accept(session).unwrap();
-        Self {
+        let mut rig = Self {
             kernel,
             server,
             session,
             env,
-        }
+            halts,
+        };
+        rig.server.accept(rig.session).unwrap();
+        rig
+    }
+
+    /// A rig whose server reads `env` instead of the rig's live environment.
+    fn reading(env: Arc<dyn Env>) -> Self {
+        let mut rig = Self::new();
+        rig.server = server(
+            TimeSettings::eden_default(),
+            UnknownPolicy::Strict,
+            env,
+            rig.halts.shared(),
+        );
+        rig.server.accept(rig.session).unwrap();
+        rig
     }
 
     fn new() -> Self {
@@ -469,23 +488,13 @@ fn a_failed_set_up_is_the_reply_and_keeps_nothing() {
     rig.memory();
     assert!(rig.clocks().set_up().is_some());
 
-    // An environment that has nothing to replay.
-    let mut rig = Rig::new();
-    rig.server = server(
-        TimeSettings::eden_default(),
-        UnknownPolicy::Strict,
-        Arc::new(ReplayEnv::new(Vec::new())),
-    );
-    rig.server.accept(rig.session).unwrap();
-    assert_eq!(rig.send_raw(rig.session, &ask), only(FAILED));
-    assert_eq!(rig.clocks().set_up(), None);
-    assert_eq!(rig.kernel.sessions(), []);
-
-    // A clock reading past the nanoseconds an `s64` holds, and one exactly at the limit.
+    // A clock reading past the nanoseconds an `s64` holds, and one exactly at the limit. The
+    // environment answered, so nothing stops the run.
     let limit = u64::try_from(i64::MAX).unwrap();
     let mut rig = Rig::with(TimeSettings::eden_default(), limit + 1);
     assert_eq!(rig.send_raw(rig.session, &ask), only(FAILED));
     assert_eq!(rig.clocks().set_up(), None);
+    assert_eq!(rig.halts.stops(), []);
     let settings = TimeSettings {
         rtc_at_boot: 0,
         automatic_correction: true,
@@ -494,6 +503,86 @@ fn a_failed_set_up_is_the_reply_and_keeps_nothing() {
     rig.memory();
     let contents = rig.clocks().set_up().unwrap().contents;
     assert_eq!(contents.continuous_adjustment.rtc_offset, i64::MAX);
+}
+
+/// A replay of the set-up's reads that leaves its recording at read `index` (0 and 1 the random
+/// draws, 2 the clock), by running out there or, with `disagree`, by holding an answer of the
+/// wrong kind there; and the error it then answers with.
+fn replay_failing_at(index: usize, disagree: bool) -> (ReplayEnv, EnvError) {
+    let asked = [EnvCall::Random, EnvCall::Random, EnvCall::Clock];
+    // Answers of the right kind before `index`, each distinct.
+    let mut records: Vec<EnvRecord> = asked[..index]
+        .iter()
+        .zip(1..)
+        .map(|(call, value)| match call {
+            EnvCall::Clock => EnvRecord::Clock(HostNanos(value)),
+            _ => EnvRecord::Random(value),
+        })
+        .collect();
+    let requested = asked[index];
+    let error = if disagree {
+        // An answer of the other kind of the two the set-up asks for.
+        let (wrong, recorded) = match requested {
+            EnvCall::Clock => (EnvRecord::Random(7), EnvCall::Random),
+            _ => (EnvRecord::Clock(HostNanos(7)), EnvCall::Clock),
+        };
+        records.push(wrong);
+        EnvError::Mismatch {
+            index,
+            requested,
+            recorded,
+        }
+    } else {
+        EnvError::Exhausted { index, requested }
+    };
+    (ReplayEnv::new(records), error)
+}
+
+#[test]
+fn an_environment_failure_stops_the_run_and_keeps_nothing() {
+    // At each of the set-up's three reads, a replay that runs out and one that disagrees: the
+    // run is told to stop, once, naming `time:u` and exactly the replay's error; no later read
+    // is made; the request is answered as one the server gave up on, and nothing is kept.
+    let ask = libnx_request(GET_SHARED_MEMORY_NATIVE_HANDLE);
+    for index in 0..3 {
+        for disagree in [false, true] {
+            let case = format!("read {index}, disagreeing: {disagree}");
+            let (replay, error) = replay_failing_at(index, disagree);
+            let replay = Arc::new(replay);
+            let env: Arc<dyn Env> = Arc::<ReplayEnv>::clone(&replay);
+            let mut rig = Rig::reading(env);
+            let reply = rig.send_raw(rig.session, &ask);
+            assert_eq!(reply, only(DEFERRED_REPLY_DROPPED), "{case}");
+            let stop = Stop::Handler {
+                service: NAME.to_owned(),
+                error: error.clone(),
+            };
+            assert_eq!(rig.halts.stops(), [stop], "{case}");
+            assert_eq!(replay.consumed(), index, "{case}");
+            assert_eq!(replay.first_error(), Some(error), "{case}");
+            assert_eq!(rig.clocks().set_up(), None, "{case}");
+            assert_eq!(rig.kernel.sessions(), [], "{case}");
+        }
+    }
+    // The words the run ends with, for a replay that runs out and one that disagrees.
+    let words = |index, disagree| {
+        let error = replay_failing_at(index, disagree).1;
+        Stop::Handler {
+            service: NAME.to_owned(),
+            error,
+        }
+        .to_string()
+    };
+    assert_eq!(
+        words(0, false),
+        "the environment failed time:u while it handled a request: recording exhausted at record \
+         0: the replay asked for Random"
+    );
+    assert_eq!(
+        words(2, true),
+        "the environment failed time:u while it handled a request: record 2 answers Random but \
+         the replay asked for Clock"
+    );
 }
 
 #[test]
@@ -551,7 +640,12 @@ fn a_restored_server_hands_out_the_saved_memory_without_reading_again() {
     let calls = rig.env_calls().len();
     let saved = rig.server.save().unwrap();
     let env: Arc<dyn Env> = Arc::<LiveEnv>::clone(&rig.env);
-    let mut restored = server(TimeSettings::eden_default(), UnknownPolicy::Strict, env);
+    let mut restored = server(
+        TimeSettings::eden_default(),
+        UnknownPolicy::Strict,
+        env,
+        rig.halts.shared(),
+    );
     restored.restore(&saved).unwrap();
     assert_eq!(restored.save().unwrap(), saved);
     rig.server = restored;
