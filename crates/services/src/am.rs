@@ -195,9 +195,9 @@
 //! # The Switch 2 additions
 //!
 //! The scoping doc's `am` row (`docs/switch2-eden-diff-scoping.md`, "Services (HLE)") names
-//! them: "`appletOE` cmd 10 is the new OpenApplicationProxy. `IApplicationProxy` gains cmd 60
-//! (graphics scale) and cmd 40. `IApplicationFunctions` gains 320 and 321." Each is ported as
-//! PR #4588 has it (`ISelfController` 2000 is the next section):
+//! them: `appletOE` command 10 as the new `OpenApplicationProxy`, `IApplicationProxy` 60
+//! (graphics scale) and 40, and `IApplicationFunctions` 320 and 321. Each is ported as PR #4588
+//! has it (`ISelfController` 2000 is the next section):
 //!
 //! - **`OpenApplicationProxyWithFlags` (10)** checks its flags and is then
 //!   `OpenApplicationProxy`, through the same method, so the proxy it returns is the one command
@@ -743,8 +743,8 @@ pub mod command {
         /// Switch 2. Eden PR #4588
         /// (`eden-pr4588/src/core/hle/service/am/service/application_proxy_service.cpp` @
         /// e5fb3b97): `{10, D<&IApplicationProxyService::OpenApplicationProxyWithFlags>,
-        /// "OpenApplicationProxyWithFlags"}`; the scoping doc's `am` row ("`appletOE` cmd 10 is
-        /// the new OpenApplicationProxy").
+        /// "OpenApplicationProxyWithFlags"}`; the scoping doc's `am` row (`appletOE` command 10
+        /// as the new `OpenApplicationProxy`).
         pub const OPEN_APPLICATION_PROXY_WITH_FLAGS: u32 = 10;
     }
 

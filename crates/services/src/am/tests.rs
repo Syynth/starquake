@@ -1682,12 +1682,16 @@ fn the_switch_2_answers_are_pr_4588_s() {
             screen_ratio_denominator: 1,
         }
     );
-    // `application_functions.cpp`, 320 over `applet.h`'s initial values: `Inherit !=
-    // Disable`, and `false && ..`.
-    assert!(SCREENSHOT_INITIALLY_ENABLED);
-    assert!(!CONTINUOUS_RECORDING_INITIALLY_ENABLED);
-    // 321: `*out_enabled = false`.
-    assert!(!UNKNOWN_321_ENABLED);
+    // `application_functions.cpp`: 320 over `applet.h`'s initial values (`Inherit !=
+    // Disable`, and `false && ..`), then 321's `*out_enabled = false`.
+    assert_eq!(
+        [
+            SCREENSHOT_INITIALLY_ENABLED,
+            CONTINUOUS_RECORDING_INITIALLY_ENABLED,
+            UNKNOWN_321_ENABLED,
+        ],
+        [true, false, false]
+    );
 }
 
 #[test]
