@@ -7,13 +7,20 @@
 //! `Svc::MemoryInfo` in `eden/src/core/hle/kernel/svc_types.h` @ cf654052, which matches libnx's
 //! `MemoryInfo` (`libnx/nx/include/switch/kernel/svc.h` @ b156b477).
 //!
-//! A block carries every count Horizon's does (kernel spec, rule 4), though this slice has no
-//! operation that changes one: the IPC lock count, the device use count, and the three counts
-//! behind the merge barriers. The operations that do (`LockForIpc`, `ShareToDevice` and their
-//! inverses) land with IPC buffer mapping and device address spaces.
+//! A block carries every count Horizon's does (kernel spec, rule 4): the IPC lock count, the
+//! device use count, and the three counts behind the merge barriers. The device counts change
+//! through [`MemoryBlock::share_to_device`] and [`MemoryBlock::unshare_to_device`]
+//! (`ShareToDevice`, `UnshareToDevice` and the `UpdateDeviceDisableMergeStateFor*` functions
+//! they call), which the device-share lock uses (kernel spec, "Address space": the two calls for
+//! the graphics server). `LockForIpc` and its inverse land with IPC buffer mapping.
 //!
 //! Where Eden asserts, this module returns `None` or an error and changes nothing; the map
-//! turns that into an internal failure.
+//! turns that into an internal failure. For the device counts that is: sharing a block that is
+//! not shared but has a use count (Eden: `ASSERT(DeviceShared || m_device_use_count == 0)`),
+//! a count that would pass `u16::MAX` (`ASSERT(new_count > 0)` and its two twins for the merge
+//! counts), unsharing a block that is not shared (`ASSERT(DeviceShared)`), and unsharing the
+//! end of a range from a block with no device mapping ending there
+//! (`ASSERT(old_device_disable_merge_right_count > 0)`).
 
 use starquake_memory::PAGE_SIZE;
 
@@ -230,6 +237,80 @@ impl MemoryBlock {
         self.attribute = (self.attribute & !mask) | attribute;
     }
 
+    /// Counts one more device mapping of the block (`ShareToDevice`): the use count goes up and
+    /// the block is [`MemoryAttribute::DEVICE_SHARED`]. `left` says the mapping starts at this
+    /// block and `right` that it ends at it: each raises the count behind its merge barrier and
+    /// sets the barrier (`UpdateDeviceDisableMergeStateForShareLeft` and `..Right`).
+    ///
+    /// `None`, with nothing changed, where Eden asserts (see the module docs).
+    pub(super) fn share_to_device(&mut self, left: bool, right: bool) -> Option<()> {
+        // We must either be shared or have a zero lock count.
+        if !self.attribute.contains(MemoryAttribute::DEVICE_SHARED) && self.device_use_count != 0
+        {
+            return None;
+        }
+        let count = self.device_use_count.checked_add(1)?;
+        let left_count = raised(self.device_disable_merge_left_count, left)?;
+        let right_count = raised(self.device_disable_merge_right_count, right)?;
+        // Share.
+        self.device_use_count = count;
+        self.attribute = self.attribute | MemoryAttribute::DEVICE_SHARED;
+        self.device_disable_merge_left_count = left_count;
+        self.device_disable_merge_right_count = right_count;
+        if left {
+            self.disable_merge = self.disable_merge | DisableMerge::DEVICE_LEFT;
+        }
+        if right {
+            self.disable_merge = self.disable_merge | DisableMerge::DEVICE_RIGHT;
+        }
+        Some(())
+    }
+
+    /// Counts one device mapping of the block fewer (`UnshareToDevice`): the use count goes
+    /// down, and at zero [`MemoryAttribute::DEVICE_SHARED`] goes. `left` and `right` say the
+    /// mapping started and ended at this block, as for [`Self::share_to_device`], and lower the
+    /// counts behind the barriers as `UpdateDeviceDisableMergeStateForUnshareLeft` and
+    /// `..Right` do: the left count is lowered unless it is already zero (and then nothing more
+    /// happens on that side), and otherwise kept no higher than the use count, and its barrier
+    /// goes when it reaches zero; the right count is lowered, and its barrier goes when it was
+    /// one.
+    ///
+    /// `None`, with nothing changed, where Eden asserts (see the module docs).
+    pub(super) fn unshare_to_device(&mut self, left: bool, right: bool) -> Option<()> {
+        // We must be shared.
+        if !self.attribute.contains(MemoryAttribute::DEVICE_SHARED) {
+            return None;
+        }
+        let old_count = self.device_use_count;
+        let count = old_count.checked_sub(1)?;
+        let old_right = self.device_disable_merge_right_count;
+        let right_count = if right { old_right.checked_sub(1)? } else { old_right };
+        // Unshare.
+        self.device_use_count = count;
+        if old_count == 1 {
+            self.attribute = self.attribute & !MemoryAttribute::DEVICE_SHARED;
+        }
+        // The left side: an early return in Eden when the count is already zero.
+        let left_done = left && self.device_disable_merge_left_count == 0;
+        if !left_done {
+            if left {
+                // Not zero: `left_done` covers that.
+                self.device_disable_merge_left_count =
+                    self.device_disable_merge_left_count.saturating_sub(1);
+            }
+            self.device_disable_merge_left_count = self.device_disable_merge_left_count.min(count);
+            if self.device_disable_merge_left_count == 0 {
+                self.disable_merge = self.disable_merge & !DisableMerge::DEVICE_LEFT;
+            }
+        }
+        // The right side.
+        self.device_disable_merge_right_count = right_count;
+        if right && old_right == 1 {
+            self.disable_merge = self.disable_merge & !DisableMerge::DEVICE_RIGHT;
+        }
+        Some(())
+    }
+
     /// Splits the block at `address` (`Split`): this block becomes the part from `address` up,
     /// and the part below is returned. The lower part keeps the barriers that face down and the
     /// counts behind them; the upper part keeps the ones that face up.
@@ -269,6 +350,11 @@ impl MemoryBlock {
             device_count: u32::from(self.device_use_count),
         }
     }
+}
+
+/// `count` raised by one when `raise` is set, or kept; `None` when it would pass `u16::MAX`.
+fn raised(count: u16, raise: bool) -> Option<u16> {
+    if raise { count.checked_add(1) } else { Some(count) }
 }
 
 /// What `QueryMemory` reports about a block (`Svc::MemoryInfo`).
@@ -627,5 +713,151 @@ mod tests {
 
     impl SvcPermissionBits {
         const READ_WRITE: u8 = 0b11;
+    }
+
+    /// The device counts and barriers of a block, for the share tests.
+    fn device(block: &MemoryBlock) -> (u16, u16, u16, bool, DisableMerge) {
+        (
+            block.device_use_count,
+            block.device_disable_merge_left_count,
+            block.device_disable_merge_right_count,
+            block.attribute.contains(MemoryAttribute::DEVICE_SHARED),
+            block.disable_merge,
+        )
+    }
+
+    #[test]
+    fn sharing_counts_the_use_and_raises_only_the_barriers_at_the_mappings_ends() {
+        let (left, right) = (DisableMerge::DEVICE_LEFT, DisableMerge::DEVICE_RIGHT);
+        let both = left | right;
+        for (at_left, at_right, counts, barriers) in [
+            (false, false, (0, 0), DisableMerge::NONE),
+            (true, false, (1, 0), left),
+            (false, true, (0, 1), right),
+            (true, true, (1, 1), both),
+        ] {
+            let mut subject = block(1);
+            assert_eq!(subject.share_to_device(at_left, at_right), Some(()));
+            assert_eq!(
+                device(&subject),
+                (1, counts.0, counts.1, true, barriers),
+                "{at_left} {at_right}"
+            );
+            assert_eq!(subject.svc_info().device_count, 1);
+        }
+        // A second share of a shared block adds to the counts, and keeps the attribute.
+        let mut subject = block(1);
+        subject.share_to_device(true, true).unwrap();
+        subject.share_to_device(true, false).unwrap();
+        assert_eq!(device(&subject), (2, 2, 1, true, both));
+    }
+
+    #[test]
+    fn a_share_that_would_pass_a_counts_limit_is_refused_and_changes_nothing() {
+        // Eden asserts `new_count > 0` for each of the three counts; here the share is refused.
+        type Count = fn(&mut MemoryBlock) -> &mut u16;
+        let counts: [(Count, bool, bool); 3] = [
+            (|b| &mut b.device_use_count, false, false),
+            (|b| &mut b.device_disable_merge_left_count, true, false),
+            (|b| &mut b.device_disable_merge_right_count, false, true),
+        ];
+        for (count, left, right) in counts {
+            // One below the limit still takes one more, to exactly the limit.
+            let mut subject = block(1);
+            subject.share_to_device(false, false).unwrap();
+            // Only this count is near its limit.
+            *count(&mut subject) = u16::MAX - 1;
+            assert_eq!(subject.share_to_device(left, right), Some(()));
+            assert_eq!(*count(&mut subject), u16::MAX);
+            // At the limit nothing changes.
+            let before = subject;
+            assert_eq!(subject.share_to_device(left, right), None);
+            assert_eq!(subject, before);
+        }
+    }
+
+    #[test]
+    fn a_block_with_a_use_count_but_no_shared_attribute_is_not_shared() {
+        let mut subject = block(1);
+        subject.device_use_count = 1;
+        let before = subject;
+        assert_eq!(subject.share_to_device(true, true), None);
+        assert_eq!(subject, before);
+    }
+
+    #[test]
+    fn unsharing_the_last_use_clears_the_attribute_and_the_barriers_its_counts_held() {
+        let mut subject = block(1);
+        subject.share_to_device(true, true).unwrap();
+        subject.share_to_device(true, true).unwrap();
+        let both = DisableMerge::DEVICE_LEFT | DisableMerge::DEVICE_RIGHT;
+        // The first of two: the counts go down, the attribute and the barriers stay.
+        assert_eq!(subject.unshare_to_device(true, true), Some(()));
+        assert_eq!(device(&subject), (1, 1, 1, true, both));
+        // The last: everything goes.
+        assert_eq!(subject.unshare_to_device(true, true), Some(()));
+        assert_eq!(device(&subject), (0, 0, 0, false, DisableMerge::NONE));
+        assert_eq!(subject.svc_info().device_count, 0);
+    }
+
+    #[test]
+    fn unsharing_away_from_a_mappings_ends_keeps_their_counts_except_the_left_clamp() {
+        // Shared twice, the second time from this block (left) only.
+        let mut subject = block(1);
+        subject.share_to_device(false, true).unwrap();
+        subject.share_to_device(true, false).unwrap();
+        let both = DisableMerge::DEVICE_LEFT | DisableMerge::DEVICE_RIGHT;
+        assert_eq!(device(&subject), (2, 1, 1, true, both));
+        // Neither end here: the left count is kept no higher than the use count (1 <= 1), and
+        // the right count is untouched.
+        assert_eq!(subject.unshare_to_device(false, false), Some(()));
+        assert_eq!(device(&subject), (1, 1, 1, true, both));
+        // The left clamp: a left count above the use count comes down to it.
+        let mut clamped = block(1);
+        clamped.share_to_device(true, false).unwrap();
+        clamped.share_to_device(true, false).unwrap();
+        clamped.share_to_device(false, false).unwrap();
+        assert_eq!(clamped.unshare_to_device(false, false), Some(()));
+        assert_eq!(device(&clamped), (2, 2, 0, true, DisableMerge::DEVICE_LEFT));
+        assert_eq!(clamped.unshare_to_device(false, false), Some(()));
+        assert_eq!(device(&clamped), (1, 1, 0, true, DisableMerge::DEVICE_LEFT));
+        // At zero the left barrier goes too.
+        assert_eq!(clamped.unshare_to_device(false, false), Some(()));
+        assert_eq!(device(&clamped), (0, 0, 0, false, DisableMerge::NONE));
+    }
+
+    #[test]
+    fn an_unshare_from_the_left_with_no_left_count_skips_the_left_side() {
+        // `UpdateDeviceDisableMergeStateForUnshareLeft` returns early when the count is zero:
+        // no clamp, and the barrier is left alone.
+        let mut subject = block(1);
+        subject.share_to_device(false, false).unwrap();
+        subject.disable_merge = DisableMerge::DEVICE_LEFT;
+        assert_eq!(subject.unshare_to_device(true, false), Some(()));
+        assert_eq!(device(&subject), (0, 0, 0, false, DisableMerge::DEVICE_LEFT));
+        // The same block unshared away from the left clears the barrier: the count is zero.
+        let mut other = block(1);
+        other.share_to_device(false, false).unwrap();
+        other.disable_merge = DisableMerge::DEVICE_LEFT;
+        assert_eq!(other.unshare_to_device(false, false), Some(()));
+        assert_eq!(device(&other), (0, 0, 0, false, DisableMerge::NONE));
+    }
+
+    #[test]
+    fn an_unshare_eden_would_assert_on_is_refused_and_changes_nothing() {
+        // Not shared at all (`ASSERT(DeviceShared)`).
+        let mut subject = block(1);
+        assert_eq!(subject.unshare_to_device(false, false), None);
+        assert_eq!(subject, block(1));
+        // The end of a range at a block where no device mapping ends
+        // (`ASSERT(old_device_disable_merge_right_count > 0)`).
+        subject.share_to_device(true, false).unwrap();
+        let before = subject;
+        assert_eq!(subject.unshare_to_device(true, true), None);
+        assert_eq!(subject, before);
+        // Shared, with the attribute but a zero use count (a broken block).
+        let mut broken = block(1);
+        broken.attribute = MemoryAttribute::DEVICE_SHARED;
+        assert_eq!(broken.unshare_to_device(false, false), None);
     }
 }

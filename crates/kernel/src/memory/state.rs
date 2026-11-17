@@ -7,9 +7,11 @@
 //! `eden/src/core/hle/kernel/svc_types.h` @ cf654052 (`MemoryState`, `MemoryPermission`,
 //! `MemoryAttribute`).
 //!
-//! Not ported: the Switch 2 attribute bit `GpuAccessible` (`1 << 5`,
-//! `eden-pr4588/src/core/hle/kernel/svc_types.h` @ e5fb3b97), which only `svc 0x80` sets. It
-//! lands with that call.
+//! The Switch 2 attribute bit `GpuAccessible` (`1 << 5`) and the `SetMask` that includes it are
+//! Eden-NX2's and Eden PR #4588's (`eden-nx2/src/core/hle/kernel/svc_types.h` @ 50fa86bb and
+//! `eden-pr4588/src/core/hle/kernel/svc_types.h` @ e5fb3b97, `MemoryAttribute::GpuAccessible`;
+//! `k_memory_block.h` in both, `KMemoryAttribute::SetMask`). Only `svc 0x80` sets it
+//! ([`crate::svc::memory::set_gpu_memory_attribute`]).
 
 use core::ops::{BitAnd, BitOr, Not};
 
@@ -50,7 +52,8 @@ pub mod flag {
     pub const REFERENCE_COUNTED: u32 = 1 << 22;
     /// `FlagCanMapProcess`.
     pub const CAN_MAP_PROCESS: u32 = 1 << 23;
-    /// `FlagCanChangeAttribute`: `SetMemoryAttribute` may change its `Uncached` bit.
+    /// `FlagCanChangeAttribute`: `SetMemoryAttribute` may change its `Uncached` bit, and
+    /// `svc 0x80` its `GpuAccessible` bit (Eden-NX2 and PR #4588, `KPageTableBase::SetMemoryAttribute`).
     pub const CAN_CHANGE_ATTRIBUTE: u32 = 1 << 24;
     /// `FlagCanCodeMemory`.
     pub const CAN_CODE_MEMORY: u32 = 1 << 25;
@@ -435,8 +438,17 @@ impl MemoryAttribute {
     pub const UNCACHED: Self = Self(1 << 3);
     /// Its permission can no longer be changed.
     pub const PERMISSION_LOCKED: Self = Self(1 << 4);
-    /// What `SetMemoryAttribute` may change (`SetMask`).
-    pub const SET_MASK: Self = Self(Self::UNCACHED.0 | Self::PERMISSION_LOCKED.0);
+    /// Switch 2: the program marked it for the GPU (`GpuAccessible`, set by `svc 0x80`).
+    pub const GPU_ACCESSIBLE: Self = Self(1 << 5);
+    /// What the page table's `SetMemoryAttribute` may change (`SetMask`): Eden-NX2's and PR
+    /// #4588's, which add [`Self::GPU_ACCESSIBLE`] to Eden's `Uncached | PermissionLocked`.
+    pub const SET_MASK: Self =
+        Self(Self::UNCACHED.0 | Self::PERMISSION_LOCKED.0 | Self::GPU_ACCESSIBLE.0);
+    /// What the `SetMemoryAttribute` system call accepts in its mask and attribute
+    /// (`SupportedMask` in `SetMemoryAttribute`, `svc/svc_memory.cpp`; the same in Eden, Eden-NX2
+    /// and PR #4588): [`Self::GPU_ACCESSIBLE`] is `svc 0x80`'s alone.
+    pub const SET_MEMORY_ATTRIBUTE_SUPPORTED: Self =
+        Self(Self::UNCACHED.0 | Self::PERMISSION_LOCKED.0);
     /// The two attributes that only count locks and shares, which most checks ignore
     /// (`DefaultMemoryIgnoreAttr` in `eden/src/core/hle/kernel/k_page_table_base.h`, and
     /// `AttributeIgnoreMask` in `KMemoryBlock::HasProperties`).
@@ -619,19 +631,23 @@ mod tests {
     #[test]
     fn the_bit_sets_have_the_references_values() {
         // `Svc::MemoryAttribute` in svc_types.h: Locked, IpcLocked, DeviceShared, Uncached,
-        // PermissionLocked are bits 0 to 4.
+        // PermissionLocked are bits 0 to 4, and Eden-NX2's and PR #4588's GpuAccessible bit 5.
         let attributes = [
             MemoryAttribute::LOCKED,
             MemoryAttribute::IPC_LOCKED,
             MemoryAttribute::DEVICE_SHARED,
             MemoryAttribute::UNCACHED,
             MemoryAttribute::PERMISSION_LOCKED,
+            MemoryAttribute::GPU_ACCESSIBLE,
         ];
         for (bit, attribute) in (0..).zip(attributes) {
             assert_eq!(attribute.bits(), 1 << bit);
             assert_eq!(attribute.svc(), 1 << bit);
         }
-        assert_eq!(MemoryAttribute::SET_MASK.bits(), 0x18);
+        // `KMemoryAttribute::SetMask` (Eden-NX2, PR #4588): Uncached | PermissionLocked |
+        // GpuAccessible. The system call's `SupportedMask`: Uncached | PermissionLocked.
+        assert_eq!(MemoryAttribute::SET_MASK.bits(), 0x38);
+        assert_eq!(MemoryAttribute::SET_MEMORY_ATTRIBUTE_SUPPORTED.bits(), 0x18);
         assert_eq!(MemoryAttribute::COUNTED.bits(), 0x06);
         // `KMemoryBlockDisableMergeAttribute`: Normal, DeviceLeft, IpcLeft, Locked, DeviceRight
         // are bits 0 to 4; the first four face left.

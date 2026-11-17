@@ -2,11 +2,12 @@
 //! merging.
 //!
 //! Ported from Eden `eden/src/core/hle/kernel/k_memory_block_manager.cpp` @ cf654052
-//! (GPL-3.0-or-later): `Initialize`, `FindFreeArea`, `Update`, `UpdateAttribute`,
-//! `CoalesceForUpdate` and `CheckState`, and `FindBlock` from `k_memory_block_manager.h`.
+//! (GPL-3.0-or-later): `Initialize`, `FindFreeArea`, `Update`, `UpdateAttribute`, `UpdateLock`
+//! (with the device lock functions, [`DeviceLock`]), `CoalesceForUpdate` and `CheckState`, and
+//! `FindBlock` from `k_memory_block_manager.h`.
 //!
-//! Not ported yet, because nothing in this slice calls them: `UpdateLock` (IPC and device
-//! locks) and `UpdateIfMatch` (`UnmapPhysicalMemory`).
+//! Not ported yet, because nothing calls them: `UpdateLock` with the IPC lock functions, and
+//! `UpdateIfMatch` (`UnmapPhysicalMemory`).
 //!
 //! Divergences from Eden:
 //!
@@ -19,6 +20,11 @@
 //!   (tests: `a_range_outside_the_map_or_off_a_page_is_refused_and_changes_nothing`,
 //!   `an_update_over_a_block_locked_for_ipc_is_refused_and_changes_nothing`). A caller sees the
 //!   error before it has touched the translation by asking [`BlockMap::check_update`] first.
+//! - Eden's `UpdateLock` asserts inside the lock functions. Here [`BlockMap::update_lock`] tries
+//!   the change on a copy of every block it would touch first, and refuses with
+//!   [`BlockMapError::DeviceCount`], changing nothing, when one would fail (see
+//!   `memory::block` for the cases). Test:
+//!   `a_device_lock_that_one_block_cannot_take_changes_no_block`.
 
 use std::collections::BTreeMap;
 
@@ -56,12 +62,40 @@ pub enum BlockMapError {
     /// An update was given a lock or share attribute, which only counts can set.
     #[error("an update cannot set the IPC-locked or device-shared attribute")]
     CountedAttribute,
+    /// A device lock or unlock that a block of the range cannot take (see
+    /// [`BlockMap::update_lock`]).
+    #[error("the block at {address:#x} cannot take this device lock or unlock")]
+    DeviceCount {
+        /// The first address of the block, as the range would cut it.
+        address: u64,
+    },
     /// The map has a hole or an overlap: its blocks do not tile it.
     #[error("the block map is broken at {address:#x}")]
     Broken {
         /// Where a block was expected and not found.
         address: u64,
     },
+}
+
+/// The device lock functions `UpdateLock` is given (`KMemoryBlock::ShareToDevice` and
+/// `UnshareToDevice`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceLock {
+    /// One more device mapping ([`MemoryBlock::share_to_device`]).
+    Share,
+    /// One device mapping fewer ([`MemoryBlock::unshare_to_device`]).
+    Unshare,
+}
+
+impl DeviceLock {
+    /// Applies the lock function to `block`; `left` and `right` say the range starts and ends
+    /// at it.
+    fn apply(self, block: &mut MemoryBlock, left: bool, right: bool) -> Option<()> {
+        match self {
+            Self::Share => block.share_to_device(left, right),
+            Self::Unshare => block.unshare_to_device(left, right),
+        }
+    }
 }
 
 /// The memory blocks of one address space (`KMemoryBlockManager`): they tile it from its first
@@ -274,6 +308,58 @@ impl BlockMap {
                 .get_mut(&at)
                 .ok_or(BlockMapError::Broken { address: at })?;
             block.update_attribute(mask, attribute);
+            cursor = block.end().unwrap_or(end);
+        }
+        self.coalesce(address, end)
+    }
+
+    /// Applies a device lock function to every block of `pages` pages at `address`
+    /// (`UpdateLock`), splitting the blocks at the ends of the range and merging what can be
+    /// merged afterwards. Each block is told whether the range starts at it and whether it ends
+    /// at it. Unlike [`Self::update`], every block is changed, whatever it holds.
+    ///
+    /// Refused, with nothing changed, for a range that is not whole pages inside the map, and
+    /// with [`BlockMapError::DeviceCount`] when the function would fail on one of the blocks as
+    /// the range cuts them.
+    pub fn update_lock(
+        &mut self,
+        address: u64,
+        pages: u64,
+        lock: DeviceLock,
+    ) -> Result<(), BlockMapError> {
+        let end = self.range_end(address, pages)?;
+        // Try the change on a copy of each block as the range would cut it.
+        for block in self.blocks_from(address) {
+            if block.address() >= end {
+                break;
+            }
+            let mut cut = *block;
+            if cut.address() < address {
+                cut.split(address)
+                    .ok_or(BlockMapError::Broken { address })?;
+            }
+            if cut.last() >= end {
+                let mut above = cut;
+                cut = above.split(end).ok_or(BlockMapError::Broken { address: end })?;
+            }
+            let left = cut.address() == address;
+            let right = cut.end() == Some(end);
+            lock.apply(&mut cut, left, right)
+                .ok_or(BlockMapError::DeviceCount {
+                    address: cut.address(),
+                })?;
+        }
+        let mut cursor = address;
+        while cursor < end {
+            let at = self.isolate(cursor, end)?;
+            let block = self
+                .blocks
+                .get_mut(&at)
+                .ok_or(BlockMapError::Broken { address: at })?;
+            let right = block.end() == Some(end);
+            // The trial above passed on the same block, so this cannot fail.
+            lock.apply(block, at == address, right)
+                .ok_or(BlockMapError::DeviceCount { address: at })?;
             cursor = block.end().unwrap_or(end);
         }
         self.coalesce(address, end)

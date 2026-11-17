@@ -152,7 +152,7 @@ pub fn set_memory_attribute(
     // Validate address / size.
     check_range(address, size)?;
     // Validate the attribute and mask.
-    let supported = MemoryAttribute::SET_MASK.svc();
+    let supported = MemoryAttribute::SET_MEMORY_ATTRIBUTE_SUPPORTED.svc();
     if mask | attribute != mask || mask | attribute | supported != supported {
         return Err(KernelError::InvalidCombination.into());
     }

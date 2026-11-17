@@ -11,6 +11,16 @@
 //!   `KProcess::Initialize` (reserve and map the code), of `KProcess::Run` (reserve and map the
 //!   main thread's stack, set the largest heap), and `GetUsedUserPhysicalMemorySize` and
 //!   `GetTotalUserPhysicalMemorySize`.
+//! - `eden/src/core/hle/kernel/k_page_table_base.cpp` @ cf654052, for the graphics server's
+//!   device-share lock (kernel spec, "Address space"): `LockForMapDeviceAddressSpace` (as Eden
+//!   PR #4588's graphics server calls it: no permission, aligned, heap checked;
+//!   `eden-pr4588/src/core/hle/service/am/service/graphics_supervisor.cpp` @ e5fb3b97,
+//!   `BindNativeMemoryBacking`), `UnlockForDeviceAddressSpace` and
+//!   `CheckMemoryStateContiguous`. `SetMemoryAttribute`'s state test for the Switch 2 attribute
+//!   is Eden-NX2's and PR #4588's (`k_page_table_base.cpp` @ 50fa86bb and @ e5fb3b97): the mask
+//!   `Uncached | GpuAccessible` needs `FlagCanChangeAttribute`. The GPU-accessible range query
+//!   is PR #4588's walk in `BindNativeMemoryBacking` and `IGpuWorker::CreateGpuAccessibleMemory`
+//!   (`eden-pr4588/src/core/hle/service/am/service/gpu_session.cpp` @ e5fb3b97).
 //! - `eden/src/core/hle/kernel/k_page_table_base.cpp` @ cf654052, for shared and transfer
 //!   memory: `MapPageGroup` (the form with an address) and `UnmapPageGroup`, which
 //!   `KSharedMemory::Map` and `Unmap` call with `KMemoryState::Shared`;
@@ -74,6 +84,34 @@
 //!   `svc::transfer_memory::tests::while_lent_the_owner_cannot_change_the_pages_and_closing_the_handle_gives_them_back`
 //!   (`SetMemoryPermission`, `SetMemoryAttribute`, the heap shrink and a second lend, each
 //!   refused while the pages are lent).
+//! - **A device-share lock that would take a block's device count past `u16::MAX`** is
+//!   [`KernelError::OutOfResource`] with nothing changed; Eden asserts (`ShareToDevice`:
+//!   `ASSERT(new_count > 0)`). The result is starquake's own: a guess, which no reference
+//!   settles because Horizon aborts. Test:
+//!   `a_device_lock_past_the_largest_count_is_out_of_resource`.
+//! - **A device-share unlock whose range ends where no lock ends** (it ends inside a locked
+//!   block, or at a block no lock ends at) is [`KernelError::InvalidCurrentMemory`] with
+//!   nothing changed; Eden asserts (`UnshareToDevice`:
+//!   `ASSERT(old_device_disable_merge_right_count > 0)`). Test:
+//!   `an_unlock_that_ends_where_no_lock_ends_is_refused_and_changes_nothing`.
+//! - **The device-share lock does not report I/O memory.** Eden's `LockForMapDeviceAddressSpace`
+//!   says whether the locked memory was `Io`; no application process here can have I/O memory
+//!   (`MapIoRegion` is not planned, `crate::svc::ids`), so there is nothing to report.
+//!
+//! # What a device-share lock stops
+//!
+//! A locked range's blocks have [`MemoryAttribute::DEVICE_SHARED`] (kernel spec, rule 4). The
+//! operations here that check a range for no attributes at all refuse it, so the CPU mapping
+//! under memory the GPU may use cannot change: [`AddressSpace::set_memory_permission`],
+//! [`AddressSpace::set_process_memory_permission`], the heap shrink of
+//! [`AddressSpace::set_heap_size`] and [`AddressSpace::lock_for_transfer_memory`] (as in Eden,
+//! whose checks for these pass `KMemoryAttribute::All` and expect `None`). Shared memory cannot
+//! be locked at all (its state has no [`flag::CAN_ALIGNED_DEVICE_MAP`]), so
+//! [`AddressSpace::unmap_shared`] never meets a lock. [`AddressSpace::set_memory_attribute`]
+//! ignores it, as Eden's does (`AttributeTestMask` leaves `DeviceShared` out), and so does
+//! another device-share lock, which counts. Tests (in `memory/space/device_tests.rs`):
+//! `a_device_locked_range_refuses_what_would_change_its_mapping_until_unlocked` and
+//! `locked_code_cannot_be_reprotected`.
 
 use core::fmt;
 use std::collections::BTreeMap;
@@ -81,7 +119,7 @@ use std::collections::BTreeMap;
 use starquake_memory::{BackingRange, PAGE_SIZE};
 
 use super::block::MemoryBlock;
-use super::block_map::{BlockMap, BlockMapError};
+use super::block_map::{BlockMap, BlockMapError, DeviceLock};
 use super::layout::{LayoutError, LayoutRequest, Region, RegionOffsets, Regions, pages_to_bytes};
 use super::mapper::{Mapper, MapperError};
 use super::pool::{MemoryArrangement, MemoryLimit};
@@ -445,6 +483,30 @@ impl AddressSpace {
     /// `check.ignore` aside) and passes the masked tests. The range must lie inside the
     /// address space. A failed test is [`KernelError::InvalidCurrentMemory`].
     fn check_memory_state(&self, address: u64, size: u64, check: &Check) -> SvcResult<Checked> {
+        self.walk_check(address, size, check, true)
+    }
+
+    /// `CheckMemoryStateContiguous`: every block that the `size` bytes at `address` touch
+    /// passes the masked tests, each on its own (`check.ignore` is not used). The range must
+    /// lie inside the address space. A failed test is [`KernelError::InvalidCurrentMemory`].
+    fn check_memory_state_contiguous(
+        &self,
+        address: u64,
+        size: u64,
+        check: &Check,
+    ) -> SvcResult<Checked> {
+        self.walk_check(address, size, check, false)
+    }
+
+    /// The walk both checks make; `alike` adds `CheckMemoryState`'s comparison of every block
+    /// with the first.
+    fn walk_check(
+        &self,
+        address: u64,
+        size: u64,
+        check: &Check,
+        alike: bool,
+    ) -> SvcResult<Checked> {
         let invalid = KernelError::InvalidCurrentMemory;
         let last = size
             .checked_sub(1)
@@ -456,9 +518,10 @@ impl AddressSpace {
         let mut block = first;
         loop {
             // Validate the current block against the first, then against the provided masks.
-            let uniform = block.state() == first.state()
-                && block.permission() == first.permission()
-                && (block.attribute() | ignore) == (first.attribute() | ignore);
+            let uniform = !alike
+                || block.state() == first.state()
+                    && block.permission() == first.permission()
+                    && (block.attribute() | ignore) == (first.attribute() | ignore);
             let passes = block.state().word() & check.state_mask == check.state
                 && block.permission() & check.permission_mask == check.permission
                 && block.attribute() & check.attribute_mask == check.attribute;
@@ -711,8 +774,9 @@ impl AddressSpace {
     ///
     /// [`KernelError::InvalidCurrentMemory`] unless the range has one state and permission
     /// throughout, the state allows each attribute in the mask to change
-    /// ([`flag::CAN_CHANGE_ATTRIBUTE`] for `Uncached`, [`flag::CAN_PERMISSION_LOCK`] for
-    /// `PermissionLocked`), and no attribute other than those two and `DeviceShared` is set.
+    /// ([`flag::CAN_CHANGE_ATTRIBUTE`] for `Uncached` and `GpuAccessible`,
+    /// [`flag::CAN_PERMISSION_LOCK`] for `PermissionLocked`), and no attribute other than those
+    /// three and `DeviceShared` is set.
     pub fn set_memory_attribute(
         &mut self,
         address: u64,
@@ -731,14 +795,17 @@ impl AddressSpace {
         // Verify we can change the memory attribute.
         let test_mask = !(MemoryAttribute::SET_MASK | MemoryAttribute::DEVICE_SHARED);
         let state_test = [
-            (MemoryAttribute::UNCACHED, flag::CAN_CHANGE_ATTRIBUTE),
+            (
+                MemoryAttribute::UNCACHED | MemoryAttribute::GPU_ACCESSIBLE,
+                flag::CAN_CHANGE_ATTRIBUTE,
+            ),
             (
                 MemoryAttribute::PERMISSION_LOCKED,
                 flag::CAN_PERMISSION_LOCK,
             ),
         ]
         .into_iter()
-        .filter(|(bit, _)| mask.contains(*bit))
+        .filter(|(bits, _)| !mask.excludes(*bits))
         .fold(0, |flags, (_, flag)| flags | flag);
         let check = Check {
             state_mask: state_test,
@@ -1017,6 +1084,104 @@ impl AddressSpace {
         self.apply(address, pages, change, effect)
     }
 
+    /// Whether every page the `size` bytes at `address` touch has
+    /// [`MemoryAttribute::GPU_ACCESSIBLE`], the attribute `svc 0x80` sets: the graphics
+    /// server's range query (kernel spec, "Address space"), PR #4588's walk of `QueryInfo`
+    /// blocks in `BindNativeMemoryBacking`.
+    ///
+    /// False for an empty range and for one that wraps or does not lie wholly inside the
+    /// address space: the walk reaches the end of the block map before the range's last byte
+    /// (PR #4588's callers check `Contains` first, with `ResultInvalidCurrentMemory`, the result
+    /// they give a range without the attribute too). The empty range is starquake's choice (a
+    /// guess): the reference's callers refuse a size of zero before they walk.
+    #[must_use]
+    pub fn is_gpu_accessible(&self, address: u64, size: u64) -> bool {
+        let Some(last) = size
+            .checked_sub(1)
+            .and_then(|offset| address.checked_add(offset))
+        else {
+            return false;
+        };
+        // The walk ends at the block holding `last`, or at the end of the map (false).
+        for block in self.blocks.blocks_from(address) {
+            if !block.attribute().contains(MemoryAttribute::GPU_ACCESSIBLE) {
+                return false;
+            }
+            if last <= block.last() {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Takes a device-share lock on `size` bytes at `address`
+    /// (`LockForMapDeviceAddressSpace(address, size, KMemoryPermission::None, is_aligned: true,
+    /// check_heap: true)`, as PR #4588's graphics server calls it): every block of the range
+    /// counts one more device use and has [`MemoryAttribute::DEVICE_SHARED`] (see "What a
+    /// device-share lock stops" in the module docs). Locks nest: each is undone by one
+    /// [`Self::unlock_device_share`] of the same range.
+    ///
+    /// In this order: [`KernelError::InvalidCurrentMemory`] unless the range is whole pages
+    /// inside the address space (`Contains`; see "Divergences" for the pages); then unless it
+    /// has one state, permission and attributes throughout (`DeviceShared` aside), its state
+    /// can be device mapped aligned and is reference counted
+    /// ([`flag::CAN_ALIGNED_DEVICE_MAP`], [`flag::REFERENCE_COUNTED`]), and it is neither
+    /// [`MemoryAttribute::LOCKED`] nor [`MemoryAttribute::IPC_LOCKED`]; then
+    /// [`KernelError::OutOfResource`] when a block's device count is at its largest.
+    pub fn lock_device_share(&mut self, address: u64, size: u64) -> CallResult<()> {
+        let pages = self.pages_of(address, size)?;
+        // Check the memory state.
+        let test_state = flag::CAN_ALIGNED_DEVICE_MAP | flag::REFERENCE_COUNTED;
+        let check = Check {
+            state_mask: test_state,
+            state: test_state,
+            permission_mask: MemoryPermission::NONE,
+            permission: MemoryPermission::NONE,
+            attribute_mask: MemoryAttribute::IPC_LOCKED | MemoryAttribute::LOCKED,
+            attribute: MemoryAttribute::NONE,
+            ignore: MemoryAttribute::DEVICE_SHARED,
+        };
+        self.check_memory_state(address, size, &check)?;
+        // Update the memory blocks.
+        self.blocks
+            .update_lock(address, pages, DeviceLock::Share)
+            .map_err(|error| match error {
+                BlockMapError::DeviceCount { .. } => KernelError::OutOfResource.into(),
+                error => broken(error),
+            })
+    }
+
+    /// Releases a device-share lock on `size` bytes at `address` that
+    /// [`Self::lock_device_share`] took (`UnlockForDeviceAddressSpace`): every block of the range
+    /// counts one device use fewer, and loses [`MemoryAttribute::DEVICE_SHARED`] with its last.
+    ///
+    /// [`KernelError::InvalidCurrentMemory`] unless the range is whole pages inside the address
+    /// space; then unless each of its blocks can be device mapped ([`flag::CAN_DEVICE_MAP`]),
+    /// is [`MemoryAttribute::DEVICE_SHARED`] and is not [`MemoryAttribute::LOCKED`]
+    /// (`CheckMemoryStateContiguous`: the blocks need not be alike); then unless the range ends
+    /// where a lock ends (see "Divergences").
+    pub fn unlock_device_share(&mut self, address: u64, size: u64) -> CallResult<()> {
+        let pages = self.pages_of(address, size)?;
+        // Check the memory state.
+        let check = Check {
+            state_mask: flag::CAN_DEVICE_MAP,
+            state: flag::CAN_DEVICE_MAP,
+            permission_mask: MemoryPermission::NONE,
+            permission: MemoryPermission::NONE,
+            attribute_mask: MemoryAttribute::DEVICE_SHARED | MemoryAttribute::LOCKED,
+            attribute: MemoryAttribute::DEVICE_SHARED,
+            ignore: MemoryAttribute::NONE,
+        };
+        self.check_memory_state_contiguous(address, size, &check)?;
+        // Update the memory blocks.
+        self.blocks
+            .update_lock(address, pages, DeviceLock::Unshare)
+            .map_err(|error| match error {
+                BlockMapError::DeviceCount { .. } => KernelError::InvalidCurrentMemory.into(),
+                error => broken(error),
+            })
+    }
+
     /// The block that holds `address` (`QueryInfo`). Above the address space it is one
     /// inaccessible block from the address space's end to the end of the 64-bit space.
     pub fn query_info(&self, address: u64) -> CallResult<MemoryBlock> {
@@ -1082,3 +1247,6 @@ impl AddressSpace {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod device_tests;
