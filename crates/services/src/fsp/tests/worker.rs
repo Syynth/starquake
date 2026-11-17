@@ -16,7 +16,7 @@ use crate::fsp::worker::{
 
 /// The longest a test waits for something that should happen.
 const WAIT: Duration = Duration::from_secs(10);
-/// How long a finish that must not be overtaken waits for a second one, which must not come.
+/// How long the first finish of the record-order test holds its window open.
 const HOLD: Duration = Duration::from_millis(300);
 
 /// The offset of [`HELLO`] whose reads wait at the [`Gate`], and the one whose reads the host
@@ -266,15 +266,16 @@ impl Finished {
 }
 
 /// A job that reads [`HELLO`] at `offset` through its environment, and whose finish pushes `job`
-/// to `finished`. With `hold`, the first finish to push then waits up to [`HOLD`] for a second
-/// before it returns: the window in which a second finish could overtake its record.
+/// to `finished`. With `hold`, the first finish to push then waits [`HOLD`] before
+/// it returns: the window in which a second finish could overtake its record.
 fn job_reading(offset: u64, job: u64, hold: bool, finished: &Arc<Finished>) -> Job {
     let finished = Arc::clone(finished);
     Box::new(move |env: &dyn Env| {
         env.host_io(&hello_read(offset, 4)).unwrap();
         let finish: Finish = Box::new(move || {
             if finished.push(job) == 1 && hold {
-                finished.await_count(2, HOLD);
+                // The whole window, so a second finish that runs in it is recorded within it.
+                std::thread::sleep(HOLD);
             }
         });
         finish
