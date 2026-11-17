@@ -390,6 +390,15 @@ impl Shared {
         )
     }
 
+    /// Sets syncpoint `id`'s waiter count to `count` behind the watched bit's back, for tests
+    /// of a count at its maximum.
+    #[cfg(test)]
+    pub(crate) fn set_watchers(&self, id: SyncpointId, count: u32) {
+        if let Some(watchers) = self.lock().state.watchers.get_mut(usize::from(id.get())) {
+            *watchers = count;
+        }
+    }
+
     /// Writes [`GsvShared`] (module docs, "Snapshot format"). Take it while nothing changes the
     /// state or the watched bitmap.
     pub fn save(&self) -> Result<Vec<u8>, SnapshotError> {

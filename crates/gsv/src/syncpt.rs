@@ -36,13 +36,13 @@
 //!
 //! | Id | Command | In | Out | Mark |
 //! |---|---|---|---|---|
-//! | 0 | [`HANDSHAKE`](command::HANDSHAKE) | `u64` token | the same `u64` | observed (row 43; NX2 `Handshake`; PR has no 0) |
-//! | 1 | [`GET_MAXIMUM_EVENT_COUNT`](command::GET_MAXIMUM_EVENT_COUNT) | nothing | `u32` [`MAXIMUM_EVENT_COUNT`] | **conflict** (row 19; PR 63, NX2 32) |
-//! | 21 | [`SET_EVENT_COUNT`](command::SET_EVENT_COUNT) | `u32` count | nothing | read (PR `SetEventCount`; NX2 has no 21) |
-//! | 22 | [`GET_EVENT`](command::GET_EVENT) | `u32` slot | copy handle: the slot's event | observed (row 29; PR `GetEvent`, NX2 `GetSlotEvent`) |
-//! | 103 | [`QUERY_COUNTER`](command::QUERY_COUNTER) | `u32` `SyncCounterId` | `u64` counter, `u32` 0 | read (PR and NX2 `QueryCounter`) |
-//! | 201 | [`ARM_WAIT`](command::ARM_WAIT) | `u32` slot, `u32` `SyncCounterId`, `u64` threshold, `u32` mode | nothing | observed (rows 29, 147; PR `ArmWait`, `DecodeSyncpointWait`; NX2 `RequestSlotEvent`) |
-//! | 202 | [`CANCEL_WAIT`](command::CANCEL_WAIT) | `u32` slot | nothing | observed (row 147; PR `CancelWait`, NX2 `CancelSlotEvent`) |
+//! | 0 | [`HANDSHAKE`] | `u64` token | the same `u64` | observed (row 43; NX2 `Handshake`; PR has no 0) |
+//! | 1 | [`GET_MAXIMUM_EVENT_COUNT`] | nothing | `u32` [`MAXIMUM_EVENT_COUNT`] | **conflict** (row 19; PR 63, NX2 32) |
+//! | 21 | [`SET_EVENT_COUNT`] | `u32` count | nothing | read (PR `SetEventCount`; NX2 has no 21) |
+//! | 22 | [`GET_EVENT`] | `u32` slot | copy handle: the slot's event | observed (row 29; PR `GetEvent`, NX2 `GetSlotEvent`) |
+//! | 103 | [`QUERY_COUNTER`] | `u32` `SyncCounterId` | `u64` counter, `u32` 0 | read (PR and NX2 `QueryCounter`) |
+//! | 201 | [`ARM_WAIT`] | `u32` slot, `u32` `SyncCounterId`, `u64` threshold, `u32` mode | nothing | observed (rows 29, 147; PR `ArmWait`, `DecodeSyncpointWait`; NX2 `RequestSlotEvent`) |
+//! | 202 | [`CANCEL_WAIT`] | `u32` slot | nothing | observed (row 147; PR `CancelWait`, NX2 `CancelSlotEvent`) |
 //!
 //! A `SyncCounterId` is the bitwise NOT of the syncpoint id (NX2 `QueryCounter`: "the counter
 //! is the bitwise NOT of the host1x syncpoint id"; PR `DecodeSyncpointWait`: `~packet[3]`;
@@ -80,7 +80,10 @@
 //!   after its id is watched, already satisfies the wait, the value is pushed to the completion
 //!   queue as a syncpoint change, so the timer thread fires the wait, signals the event and
 //!   records the value, as it does for every value it acts on (spec, "What is recorded"). The
-//!   handler never signals a reached wait itself and never blocks.
+//!   handler never signals a reached wait itself and never blocks. If the syncpoint's waiter
+//!   count is at its maximum (`u32::MAX`), 201 answers `OutOfResource`, starquake's own answer to a
+//!   case neither reference has, and the slot keeps the wait it had, its event cleared
+//!   (`a_wait_that_cannot_watch_its_syncpoint_is_refused`).
 //! - **202** refuses a slot at or above the count with `InvalidArgument` (PR). Otherwise, under
 //!   gsv's shared lock, it takes out the slot's wait, if any, and signals the slot's event,
 //!   making it first if no command has (NX2: "a cancel signals it like a completion, also when

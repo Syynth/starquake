@@ -583,6 +583,28 @@ fn a_wait_with_an_unknown_mode_is_refused() {
 }
 
 #[test]
+fn a_wait_that_cannot_watch_its_syncpoint_is_refused() {
+    let mut rig = Rig::counted();
+    let event = rig.event(0);
+    assert_eq!(rig.send(&arm_wait(0, counter(SP), 4, 0)), ok(ARM_WAIT));
+    let earlier = rig.wait(event);
+    Kernel::signal_event(&mut rig.kernel, event).unwrap();
+    // Another syncpoint's waiter count at its maximum: one below it is the case arming passes.
+    let full = SP + 1;
+    rig.shared.lock().watch(id(full)).unwrap();
+    rig.shared.set_watchers(id(full), u32::MAX - 1);
+    assert_eq!(rig.send(&arm_wait(1, counter(full), 4, 0)), ok(ARM_WAIT));
+    assert_eq!(
+        rig.send(&arm_wait(0, counter(full), 4, 0)),
+        refused(ARM_WAIT, KernelError::OutOfResource)
+    );
+    assert_eq!(rig.wait(event), earlier);
+    assert_eq!(rig.watchers(SP), 1);
+    assert_eq!(rig.watchers(full), u32::MAX);
+    assert!(!rig.signalled(event));
+}
+
+#[test]
 fn a_wide_wait_above_any_counter_is_refused() {
     let mut rig = Rig::counted();
     let event = rig.event(0);

@@ -15,8 +15,8 @@
 //!
 //! # Snapshot form
 //!
-//! The table is saved as a list of [`SavedWait`], one per wait in ascending event order, inside
-//! gsv's shared-state snapshot ([`crate::shared`], "Snapshot format"). [`Waiters::restore`]
+//! The table is saved as a list of `SavedWait`, one per wait in ascending event order, inside
+//! gsv's shared-state snapshot ([`crate::shared`], "Snapshot format"). Restoring
 //! checks each entry, in list order, and returns the first failure: that its event comes after
 //! the one before (so no event has two waits), that its syncpoint id is below
 //! `SYNCPOINT_COUNT`, that its mode is one 201 accepts ([`compare_mode`]), and that a 64-bit
