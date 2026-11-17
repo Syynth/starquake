@@ -14,6 +14,7 @@ workspace = true
 starquake-kernel.workspace = true
 starquake-services.workspace = true
 starquake-gpu.workspace = true
+starquake-memory.workspace = true
 starquake-trace.workspace = true
 postcard.workspace = true
 serde.workspace = true

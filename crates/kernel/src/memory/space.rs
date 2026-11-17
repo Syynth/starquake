@@ -488,6 +488,13 @@ impl AddressSpace {
         }
     }
 
+    /// The most memory the process may use (`KProcess::m_max_process_memory`), which
+    /// [`Self::total_user_physical_memory_size`] is capped at.
+    #[must_use]
+    pub const fn max_process_memory(&self) -> u64 {
+        self.max_process_memory
+    }
+
     /// The region memory of `state` goes in (`GetRegionAddress` and `GetRegionSize`), or
     /// `None` for [`MemoryState::Inaccessible`], which has none (Eden: `UNREACHABLE`).
     fn region_for(&self, state: MemoryState) -> Option<Region> {

@@ -1,13 +1,15 @@
 //! The dispatch arm of `GetInfo` (0x29): the call ([`info::get_info`]) with the handle table,
-//! the address space and the scheduler, after the process's entropy is drawn the first time a
-//! `RandomEntropy` call asks for it ([`draw_entropy`]). The scheduler is declared exclusive for
-//! that draw, which keeps the entropy in the process's row; the call itself reads it shared.
+//! the address space, the scheduler and the calling core, after the process's entropy is drawn
+//! the first time a `RandomEntropy` call asks for it ([`draw_entropy`]). The scheduler is
+//! declared exclusive for that draw, which keeps the entropy in the process's row, and for
+//! `MesosphereCurrentProcess`, which adds a handle (and so a reference to the process's object):
+//! the handle table is declared exclusive for that too.
 
-use super::{Call, Dispatcher, Outcome, fault, returning, word};
+use super::{Call, Dispatcher, Outcome, calling_core, fault, returning, word};
 use crate::handle::{Handle, HandleTable};
 use crate::id::ProcessId;
 use crate::process::ENTROPY_COUNT;
-use crate::svc::info::{self, InfoType};
+use crate::svc::info::{self, InfoTables, InfoType};
 use crate::svc::{Convention, SvcId};
 use crate::tables::{AddressSpace, Processes, Scheduler};
 
@@ -19,7 +21,7 @@ impl Dispatcher {
         id: SvcId,
         convention: &Convention,
     ) -> Outcome {
-        self.call_in_process::<(&HandleTable, &AddressSpace, &mut Scheduler)>(
+        self.call_in_process::<(&mut HandleTable, &AddressSpace, &mut Scheduler)>(
             call,
             |(handles, space, scheduler), call, _, processes| {
                 get_info((handles, space, scheduler), processes, id, convention, call)
@@ -29,10 +31,10 @@ impl Dispatcher {
 }
 
 /// `GetInfo`'s arm for the calling process ([`Processes::own`]). A `RandomEntropy` call first
-/// draws the process's entropy if it has none ([`draw_entropy`]); then the call runs with the
-/// scheduler shared.
+/// draws the process's entropy if it has none ([`draw_entropy`]); then the call runs, on the
+/// calling core.
 fn get_info(
-    (handles, space, scheduler): (&HandleTable, &AddressSpace, &mut Scheduler),
+    (handles, space, scheduler): (&mut HandleTable, &AddressSpace, &mut Scheduler),
     processes: &Processes,
     id: SvcId,
     convention: &Convention,
@@ -41,12 +43,22 @@ fn get_info(
     if let Err(outcome) = draw_entropy(scheduler, processes.own(), id, convention, call) {
         return outcome;
     }
-    let scheduler = &*scheduler;
+    let core = call.caller.core;
     returning(id, convention, call.regs, |[info_type, handle, sub_id]| {
         let handle = Handle::from_register(handle);
         let info_type = word(info_type)?;
+        let tables = InfoTables {
+            handles,
+            space,
+            scheduler,
+            processes,
+        };
         Ok([info::get_info(
-            handles, space, scheduler, processes, info_type, handle, sub_id,
+            tables,
+            calling_core(core)?,
+            info_type,
+            handle,
+            sub_id,
         )?])
     })
 }
