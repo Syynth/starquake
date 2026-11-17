@@ -285,3 +285,19 @@ Filed from these waves under the delegation: #177, #178, #179–#194 (graphics-s
 | proposed | **G16/G17 caches re-read a range on first use after arming; G22 takes `GpuMemory::generation` from `Translate::generation`** | Review notes on #197 | area:gpu, M3 |
 | proposed (fold into the decoder slice issues 6a–6i) | **Shader decoder follow-ups**: fp16 swizzle and source-2 modifier bits; uniform ALU forms; encodings for JMX, UP2UR and BPT; owners for IMAD.HI, ERRBAR, ATOMS.POPC and BCLEAR; the shared bit-91 list in the framework tests | Review notes on #201 | area:shader, M3 |
 | proposed | **`docs/architecture.md`'s walking-skeleton paragraph** names `System::from_nup` and NUP titles | Skipped in #173 as outside its files | docs |
+
+### From waves 19 and 20 (ledger: #22)
+
+Filed from these waves under the delegation: #215, #216, #221, #223–#226. Review notes for
+graphics-server slice 7 are on #185, and the owner's hook and unlock rulings are on #183 and
+#185.
+
+| Status | Proposal | Why | Suggested |
+|---|---|---|---|
+| ruled (lead, under delegation) | **`GetInfo` ids 29–33 follow PR #4588's values**, each marked as a guess with its citation and what would confirm it (#223) | The title stops at id 29. The kernel spec says the ids land citing the scoping doc; the only reference that answers them is PR #4588, and a guess marker keeps it honest | area:kernel, M2 |
+| awaiting the owner | **Spec note: shared mappings write their stage-1 entries eagerly** | #218 backs a shared mapping's every page at map time; the execution model spec says pages are backed on first touch | execution model |
+| awaiting the owner | **Graphics-server verification item 1 gains the 211-overlap, kind, exact-match and root 115 conflicts**, and a ruling on whether a 211 over a live mapping is refused or ordered | Found building GpuVm (#217) and the root (#219); decision 8's house rule applies until then | gsv |
+| proposed | **Kernel tests pin `QueryMemory` reporting GeneratedCode as 0x14 and `SetProcessMemoryPermission` requiring FlagCode**; a trampoline and code-memory test once `ControlCodeMemory` lands | Review of #211 | area:kernel |
+| proposed | **A fixed-length body for the Syncpoints snapshot** | Review of #212; low priority | area:gpu |
+| proposed | **Service framework: a session-close notification** (a closed `IAppletResource` frees its row as Eden's destructor does) **and a ruling on short CMIF payloads** (a 0- or 4-byte `ToCalendarTimeWithMyRule` payload answers success because the reader reads padding) | Review of #213 | area:services |
+| later (not M2) | **Cross-process shared memory** (system-wide guest RAM and shared-run records) and **`Break` terminating one process in a multi-process kernel** | #218 and #222 document both limits | area:kernel |
