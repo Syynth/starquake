@@ -586,6 +586,52 @@ fn to_calendar_time_with_my_rule_answers_in_utc_and_the_reply_is_these_bytes() {
     assert_eq!(rig.env_calls(), []);
 }
 
+/// Both reply structs with a distinct non-zero value in every field, against bytes written out
+/// from Eden's layout (`eden/src/core/hle/service/psc/time/common.h`): `CalendarTime` is `s16
+/// year; s8 month, day, hour, minute, second;` (0x8 bytes, the last one padding), and
+/// `CalendarAdditionalInfo` is `s32 day_of_week; s32 day_of_year; std::array<char, 8> name; s32
+/// is_dst; s32 ut_offset;` (0x18 bytes). The reply test above runs under UTC, where `is_dst` and
+/// `ut_offset` are both zero, so only this one shows the two swapped.
+#[test]
+fn the_calendar_structs_are_pinned_by_golden_bytes() {
+    let calendar = CalendarTime {
+        year: 0x0102,
+        month: 0x03,
+        day: 0x04,
+        hour: 0x05,
+        minute: 0x06,
+        second: 0x07,
+    };
+    #[rustfmt::skip]
+    let calendar_golden: [u8; 8] = [
+        0x02, 0x01,                           // 0x0 year
+        0x03,                                 // 0x2 month
+        0x04,                                 // 0x3 day
+        0x05,                                 // 0x4 hour
+        0x06,                                 // 0x5 minute
+        0x07,                                 // 0x6 second
+        0x00,                                 // 0x7 padding
+    ];
+    assert_eq!(calendar.to_bytes(), calendar_golden);
+
+    let info = CalendarAdditionalInfo {
+        day_of_week: 0x1112_1314,
+        day_of_year: 0x2122_2324,
+        name: *b"ABCDEFG\0",
+        is_dst: 0x3132_3334,
+        ut_offset: 0x4142_4344,
+    };
+    #[rustfmt::skip]
+    let info_golden: [u8; 0x18] = [
+        0x14, 0x13, 0x12, 0x11,               // 0x00 day_of_week
+        0x24, 0x23, 0x22, 0x21,               // 0x04 day_of_year
+        b'A', b'B', b'C', b'D', b'E', b'F', b'G', 0, // 0x08 name
+        0x34, 0x33, 0x32, 0x31,               // 0x10 is_dst
+        0x44, 0x43, 0x42, 0x41,               // 0x14 ut_offset
+    ];
+    assert_eq!(info.to_bytes(), info_golden);
+}
+
 /// `(year, month, day, hour, minute, second, day of week, day of year)`.
 type Fields = (i16, i8, i8, i8, i8, i8, i32, i32);
 

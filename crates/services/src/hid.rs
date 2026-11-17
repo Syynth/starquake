@@ -60,11 +60,21 @@
 //!   `CreateAppletResource` registers the id itself, while the table has room
 //!   (`a_full_table_gives_a_new_id_no_memory`). A request whose id Eden would find
 //!   unregistered (any id, here) still answers success, as Eden's does.
-//! - **No process id is refused.** Eden takes the id from the kernel whether or not the request
-//!   asked for it. Here a request without it is answered [`INVALID_CMIF_REQUEST`]
-//!   (`create_applet_resource_needs_the_process_id`), as `appletOE` answers its own
-//!   (`crate::am`). Which code the console gives is a guess; a console trace would settle it.
-//!   libnx always sends the id.
+//! - **No process id is refused.** Eden's request context holds `u64 pid{}`, set from the kernel
+//!   only when the request's handle descriptor has `send_current_pid`
+//!   (`eden/src/core/hle/service/hle_ipc.cpp`). Without it the id is 0, which is `SystemAruid`
+//!   (`eden/src/hid_core/resources/applet_resource.h`), and
+//!   `ResourceManager::CreateAppletResource` takes its `RegisterCoreAppletResource` branch
+//!   (`eden/src/hid_core/resource_manager.cpp`). Here a request without the id is answered
+//!   [`INVALID_CMIF_REQUEST`] (`create_applet_resource_needs_the_process_id`), as `appletOE`
+//!   answers its own (`crate::am`). Which code the console gives is a guess; a console trace
+//!   would settle it. libnx always sends the id.
+//! - **Id 0 is an id like any other.** Eden treats `SystemAruid` (0) apart:
+//!   `ResourceManager::CreateAppletResource` registers the core applet resource for it and
+//!   activates the npad, instead of making the id a row. Here 0 gets a row and its own memory as
+//!   any other id does (`the_system_aruid_is_an_id_like_any_other`). The id is the kernel's
+//!   process id, and those start at `starquake_kernel::tables::FIRST_USER_PROCESS_ID`, so a
+//!   request through the kernel cannot carry 0.
 //! - **A failure to make the memory is the reply's.** Eden ignores the resource manager's result.
 //!   Here an error from the kernel when the memory is made is the reply's result, and no row is
 //!   kept (`a_kernel_failure_to_make_the_memory_is_the_reply_and_keeps_no_row`). The kernel
@@ -152,10 +162,48 @@ impl IAppletResource {
 }
 
 /// The `hid` server's family state: each applet resource user id that has asked, and its input
-/// shared memory (module docs, "The applet resources").
+/// shared memory (module docs, "The applet resources"). At most [`ARUID_INDEX_MAX`] rows.
+///
+/// It is saved in a snapshot, so it derives `serde`. Deserialising goes through
+/// `AppletResourcesData`, which checks the one bound the server's own commands keep,
+/// [`ARUID_INDEX_MAX`] rows.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "AppletResourcesData")]
 pub struct AppletResources {
     memories: BTreeMap<u64, ObjectId>,
+}
+
+/// The serialised form of [`AppletResources`], and what deserialisation validates.
+#[derive(Deserialize)]
+struct AppletResourcesData {
+    memories: BTreeMap<u64, ObjectId>,
+}
+
+/// Why saved [`AppletResources`] could not be read back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum AppletResourcesLayoutError {
+    /// More rows than the table holds.
+    #[error(
+        "{count} applet resource user ids have a row, more than the {ARUID_INDEX_MAX} the table holds"
+    )]
+    TooManyRows {
+        /// The rows in the data.
+        count: usize,
+    },
+}
+
+impl TryFrom<AppletResourcesData> for AppletResources {
+    type Error = AppletResourcesLayoutError;
+
+    fn try_from(data: AppletResourcesData) -> Result<Self, Self::Error> {
+        let count = data.memories.len();
+        if count > ARUID_INDEX_MAX {
+            return Err(AppletResourcesLayoutError::TooManyRows { count });
+        }
+        Ok(Self {
+            memories: data.memories,
+        })
+    }
 }
 
 impl AppletResources {

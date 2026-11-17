@@ -21,7 +21,7 @@ use super::shared_memory::{
 use super::*;
 use crate::framework::fake::FakeKernel;
 use crate::framework::result::UNKNOWN_COMMAND_ID;
-use crate::framework::{Handled, Kernel, Protocol, Session};
+use crate::framework::{Handled, Kernel, Protocol, Session, SnapshotError};
 
 /// `IHidServer::ActivateDebugPad`, which this port leaves out, so it has no shipping constant
 /// (`eden/src/core/hle/service/hid/hid_server.cpp`: `{1, C<&IHidServer::ActivateDebugPad>, ..}`).
@@ -339,7 +339,8 @@ fn a_full_table_gives_a_new_id_no_memory() {
     assert_eq!(rig.memory_of(resource).result, ResultCode::SUCCESS);
 }
 
-/// Divergence from Eden, which takes the id from the kernel whether or not the request asked.
+/// Divergence from Eden, where a request without the process id has id 0, `SystemAruid`, and
+/// takes the core applet resource's branch (module docs).
 #[test]
 fn create_applet_resource_needs_the_process_id() {
     let mut rig = Rig::new();
@@ -348,6 +349,26 @@ fn create_applet_resource_needs_the_process_id() {
     assert_eq!(reply, only(INVALID_CMIF_REQUEST));
     assert!(rig.resources().is_empty());
     assert_eq!(rig.server.interface_count(), 1);
+}
+
+/// Divergence from Eden, which registers the core applet resource for `SystemAruid` (0) instead
+/// of giving it a row (module docs): here 0 gets a row and its own memory, as any other id.
+#[test]
+fn the_system_aruid_is_an_id_like_any_other() {
+    const SYSTEM_ARUID: u64 = 0;
+    let mut rig = Rig::new();
+    let other = rig.resource();
+    let other_memory = rig.memory(other);
+
+    rig.kernel.set_process_id(SYSTEM_ARUID);
+    let system = rig.resource();
+    let reply = rig.memory_of(system);
+    assert_eq!(reply.result, ResultCode::SUCCESS);
+    let system_memory = rig.object_of(reply.copies[0]);
+    assert_ne!(system_memory, other_memory);
+    assert_eq!(rig.resources().memory(SYSTEM_ARUID), Some(system_memory));
+    assert_eq!(rig.resources().memory(PROCESS_ID), Some(other_memory));
+    assert_eq!(rig.resources().len(), 2);
 }
 
 /// Divergence from Eden, which ignores the resource manager's result.
@@ -429,4 +450,57 @@ fn a_restored_server_hands_out_the_saved_memory() {
     assert_eq!(rig.object_of(reply.copies[0]), memory);
     let again = rig.resource();
     assert_eq!(rig.memory(again), memory);
+}
+
+/// Restoring checks the bound the server's own commands keep: a table of exactly
+/// [`ARUID_INDEX_MAX`] rows restores, one more row is refused, and the server is left as it was.
+#[test]
+fn a_restored_table_holds_at_most_the_rows_the_table_has_room_for() {
+    let mut kernel = FakeKernel::new(0).unwrap();
+    // A server snapshot whose table has `rows` rows, made without the server's own commands.
+    let mut saved = |rows: usize| {
+        let mut resources = AppletResources::default();
+        for aruid in 0..u64::try_from(rows).unwrap() {
+            resources.memories.insert(aruid, kernel.new_object());
+        }
+        let server = Server::new(NAME, UnknownPolicy::Strict)
+            .with_root(|| Box::new(IHidServer))
+            .with_interfaces(interfaces())
+            .with_family(resources.clone());
+        (server.save().unwrap(), resources)
+    };
+
+    // Exactly at the limit: restored as it was saved.
+    let (bytes, at_limit) = saved(ARUID_INDEX_MAX);
+    let mut restored = server(UnknownPolicy::Strict);
+    assert_eq!(restored.restore(&bytes), Ok(()));
+    assert_eq!(restored.family::<AppletResources>(), Some(&at_limit));
+
+    // One past it: refused, and the server keeps the table it had.
+    let (bytes, _) = saved(ARUID_INDEX_MAX + 1);
+    // postcard reports a failed `try_from` as a custom error and drops its text, so the error
+    // itself is checked on the same data.
+    assert_eq!(
+        restored.restore(&bytes),
+        Err(SnapshotError::Decode(postcard::Error::SerdeDeCustom))
+    );
+    assert_eq!(restored.family::<AppletResources>(), Some(&at_limit));
+
+    let mut too_many = AppletResources::default();
+    for aruid in 0..=u64::try_from(ARUID_INDEX_MAX).unwrap() {
+        too_many.memories.insert(aruid, kernel.new_object());
+    }
+    let data: AppletResourcesData =
+        postcard::from_bytes(&postcard::to_allocvec(&too_many).unwrap()).unwrap();
+    let error = AppletResourcesLayoutError::TooManyRows {
+        count: ARUID_INDEX_MAX + 1,
+    };
+    assert_eq!(AppletResources::try_from(data).map(|_| ()), Err(error));
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "{} applet resource user ids have a row, more than the {ARUID_INDEX_MAX} the table holds",
+            ARUID_INDEX_MAX + 1
+        )
+    );
 }

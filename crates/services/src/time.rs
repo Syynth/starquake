@@ -77,7 +77,14 @@
 //!   (`StandardSteadyClockCore::SetContinuousAdjustment`).
 //!
 //! The uptime is the environment's clock reading ([`Uptime`]), read once, after the two random
-//! draws (Eden draws the UUID before it reads the time).
+//! draws. Eden reads the ticks on both sides of its draw: `StandardSteadyClockResource::Initialize`
+//! calls `SetCurrentTime()` first (two `GetClockTicks` reads and the host's RTC), then
+//! `Common::UUID::MakeRandom()`, and after the draw it reads the ticks again
+//! (`SetupStandardSteadyClockCore`'s `GetRawTime` and `GetClockTicks`,
+//! `SetContinuousAdjustment`, and the local clock's `GetCurrentTimePoint`). The one reading here
+//! stands for those later reads. The earlier one is not needed: it only turns the host's RTC
+//! into a base at uptime zero, and here the RTC is a setting at uptime zero already
+//! ([`TimeSettings::rtc_at_boot`]).
 //!
 //! # Where this differs from Eden
 //!
@@ -94,6 +101,20 @@
 //!   Only the context's steady time point and the continuous adjustment's `rtc_offset` record
 //!   when that was; what the clocks read does not change
 //!   (`the_clocks_follow_the_settings_and_the_environment`).
+//! - **The memory is written once and never updated.** Eden's `TimeWorker`
+//!   (`glue/time/worker.cpp`) schedules its steady-clock timer with
+//!   `ScheduleLoopingEvent(0ns, standard_steady_clock_rtc_update_interval_minutes)`, 5 minutes
+//!   by default (`set/system_settings_server.cpp`), so straight after set-up, and every 5
+//!   minutes after that, it runs `SetStandardSteadyClockBaseTime`
+//!   (`psc/time/service_manager.cpp`). That rewrites `steady_time_points`
+//!   (`SharedMemory::UpdateBaseTime`: counter 2, the value in copy 0) and
+//!   `continuous_adjustment_time_points` (a later `rtc_offset`, and
+//!   `StandardSteadyClockCore::UpdateContinuousAdjustmentTime` can set `diff_scale` to -55 or 55
+//!   and `shift_amount` to 14). A guest under Eden never sees those two values as this port
+//!   leaves them, counter 1 and the value in copy 1 ([`shared_memory`], "A value and its
+//!   counter"); here nothing runs on a timer, so every value keeps the image its one write gives
+//!   (`the_shared_memory_layout_is_pinned_by_golden_bytes`,
+//!   `a_second_request_gets_the_same_memory_and_reads_nothing`).
 //! - **The device's time zone is UTC.** Eden uses the zone its settings name, or the host's
 //!   (`GetTimeZoneString`), with rules from its time zone archive; this port has the UTC rule
 //!   only ([`calendar`], which lists its own divergence)

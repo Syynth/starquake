@@ -623,12 +623,19 @@ mod tests {
                 .map(|(object, _)| object),
             refused
         );
-        // The kernel's own checks still come first.
+        // The kernel's own checks still come first: the size, then the permission.
         assert_eq!(
             kernel
                 .create_shared_memory(0, SvcPermission::Read)
                 .map(|(object, _)| object),
             Err(KernelError::InvalidSize)
+        );
+        assert!(!is_shared_memory_permission(SvcPermission::ReadExecute));
+        assert_eq!(
+            kernel
+                .create_shared_memory(SIZE, SvcPermission::ReadExecute)
+                .map(|(object, _)| object),
+            Err(KernelError::InvalidNewMemoryPermission)
         );
         // Nothing was made, so the next object is the first.
         kernel.refuse_objects(None);

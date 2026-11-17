@@ -15,6 +15,16 @@
 //! alignment. A write increments the counter and stores the value in copy `counter % 2`, so
 //! after the one write each value gets when the clocks are set up the counter is
 //! [`COUNTER_AFTER_SETUP`] and the value is in copy 1 ([`image`]).
+//!
+//! That is the image this port keeps for the server's life: it writes the memory once and never
+//! updates it. Eden does not stop there for two of the values. Its `TimeWorker`'s steady-clock
+//! timer fires straight after set-up and every 5 minutes after that
+//! (`glue/time/worker.cpp`, `ScheduleLoopingEvent(0ns,
+//! standard_steady_clock_rtc_update_interval_minutes)`), and each time
+//! `SetStandardSteadyClockBaseTime` rewrites `steady_time_points` and
+//! `continuous_adjustment_time_points`; after the first, each has counter 2 and its value in
+//! copy 0. So a guest under Eden never sees those two as counter 1 and copy 1. This divergence
+//! is listed in the `time` module's docs ("Where this differs from Eden").
 
 use serde::{Deserialize, Serialize};
 
@@ -88,7 +98,10 @@ pub mod offset {
 }
 
 /// The counter of every value once the clocks are set up: one write each
-/// (`WriteToLockFreeAtomicType`: `++counter`).
+/// (`WriteToLockFreeAtomicType`: `++counter`). In this port it stays so for the server's life.
+/// In Eden it is so only until the steady-clock timer's first run, straight after set-up, which
+/// writes `steady_time_points` and `continuous_adjustment_time_points` again (module docs, "A
+/// value and its counter").
 pub const COUNTER_AFTER_SETUP: u32 = 1;
 
 /// Where a value's first copy lies after its counter, for a value of alignment 8 (every value
