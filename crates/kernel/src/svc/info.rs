@@ -48,13 +48,14 @@
 //!   the page size for id 33 ("ordinary mappings use the kernel page size"). **Each value is a
 //!   guess** ([`REMOTE_REGION_ADDRESS`], [`REMOTE_REGION_SIZE`], [`REMOTE_MEMORY_USED`],
 //!   [`REMOTE_MEMORY_TOTAL`], [`MEMORY_MAPPING_ALIGNMENT`]): a trace from a console, or the
-//!   SDK's use of the value, would confirm it. The references disagree on two of them:
-//!   Eden-NX2 (`eden-nx2/src/core/hle/kernel/svc/svc_info.cpp` @ 50fa86bb) answers ids 29 and
-//!   30 with the upper half of the alias region, answers every process whatever it was built
-//!   for, and names 31 and 32 the other way round (size, then used). starquake follows PR
-//!   #4588 (the lead's choice under the delegation, issue #223). A process the
-//!   process table has no row for, named by a handle or calling, is an internal failure after
-//!   the guest's checks. Tests: `each_switch_2_id_answers_a_switch_2_program`,
+//!   SDK's use of the value, would confirm it. The references disagree: Eden-NX2
+//!   (`eden-nx2/src/core/hle/kernel/svc/svc_info.cpp` @ 50fa86bb) answers ids 29 and 30 with
+//!   the upper half of the alias region, answers every process whatever it was built for, and
+//!   names 31 and 32 the other way round (size, then used). starquake follows PR #4588 (the
+//!   lead's ruling under the delegation, `docs/proposals.md`, #223). A process a handle names
+//!   that the process table has no row for is an internal failure, after the guest's checks.
+//!   (A calling process with no row would be one before them, at step 1; it cannot arise, as
+//!   the table never drops its own process.) Tests: `each_switch_2_id_answers_a_switch_2_program`,
 //!   `a_switch_2_id_with_a_sub_id_other_than_zero_is_an_invalid_enum_value_before_the_handle`,
 //!   `a_switch_2_id_needs_a_handle_to_a_process`,
 //!   `a_switch_2_id_is_answered_by_the_console_of_the_process_the_handle_names`,
