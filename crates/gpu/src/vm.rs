@@ -211,7 +211,10 @@ pub enum VmError {
         size: u64,
     },
     /// A `SyncpointShim` mapping is not exactly [`SHIM_PAGES`] pages.
-    #[error("the syncpoint shim is one page, not {size:#x} bytes")]
+    #[error(
+        "the syncpoint shim is {expected:#x} bytes, not {size:#x} bytes",
+        expected = SHIM_PAGES * PAGE_SIZE
+    )]
     ShimSize {
         /// The range's size.
         size: u64,

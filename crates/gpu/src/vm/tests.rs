@@ -190,12 +190,13 @@ fn a_map_replaces_what_it_overlaps() {
     );
 
     // A map strictly inside one mapping leaves both of its ends.
-    vm.map(pages(3, 1), Target::SyncpointShim, Kind(5)).unwrap();
+    vm.map(pages(3, SHIM_PAGES), Target::SyncpointShim, Kind(5))
+        .unwrap();
     assert_eq!(translate(&vm, 2), Some(at(guest(0x6000_0000), 3)));
     assert_eq!(translate(&vm, 3), Some(at(Target::SyncpointShim, 5)));
     assert_eq!(
-        translate(&vm, 4),
-        Some(at(guest(0x6000_0000 + 2 * PAGE_SIZE), 3))
+        translate(&vm, 3 + SHIM_PAGES),
+        Some(at(guest(0x6000_0000 + (1 + SHIM_PAGES) * PAGE_SIZE), 3))
     );
 }
 
@@ -634,21 +635,35 @@ fn state(mappings: Vec<SavedMapping>) -> State {
 
 const GUEST_0: SavedTarget = SavedTarget::Guest { cpu_va: 0 };
 
+/// [`golden`]'s body under a header of `magic` and `version`.
+fn reheaded(magic: [u8; 4], version: u32) -> Vec<u8> {
+    let shipping = postcard::to_allocvec(&Header {
+        magic: SNAPSHOT_MAGIC,
+        version: SNAPSHOT_VERSION,
+    })
+    .unwrap();
+    let mut bytes = postcard::to_allocvec(&Header { magic, version }).unwrap();
+    bytes.extend_from_slice(&golden()[shipping.len()..]);
+    bytes
+}
+
 #[test]
 fn a_bad_header_is_refused() {
     let good = golden();
+    assert_eq!(reheaded(SNAPSHOT_MAGIC, SNAPSHOT_VERSION), good);
     let mut magic = good.clone();
     magic[0] = b'X';
     assert_eq!(GpuVm::restore(&magic).unwrap_err(), SnapshotError::BadMagic);
-    let mut version = good.clone();
-    version[4] = 2;
-    assert_eq!(
-        GpuVm::restore(&version).unwrap_err(),
-        SnapshotError::UnsupportedVersion { found: 2 }
-    );
+    // The version check at its edge on both sides: one below and one above the shipping version.
+    for found in [SNAPSHOT_VERSION - 1, SNAPSHOT_VERSION + 1] {
+        assert_eq!(
+            GpuVm::restore(&reheaded(SNAPSHOT_MAGIC, found)).unwrap_err(),
+            SnapshotError::UnsupportedVersion { found },
+            "version {found}"
+        );
+    }
     // Both at once: the magic is checked first.
-    let mut both = version;
-    both[0] = b'X';
+    let both = reheaded(*b"XQVM", SNAPSHOT_VERSION + 1);
     assert_eq!(GpuVm::restore(&both).unwrap_err(), SnapshotError::BadMagic);
     assert!(matches!(
         GpuVm::restore(&good[..3]),
@@ -733,11 +748,15 @@ fn every_mapping_check_is_enforced() {
             },
         ),
         (
-            saved(4 * PAGE_SIZE, 2 * PAGE_SIZE, SavedTarget::SyncpointShim),
+            saved(
+                4 * PAGE_SIZE,
+                (SHIM_PAGES + 1) * PAGE_SIZE,
+                SavedTarget::SyncpointShim,
+            ),
             SnapshotError::Target {
                 index: 1,
                 error: VmError::ShimSize {
-                    size: 2 * PAGE_SIZE,
+                    size: (SHIM_PAGES + 1) * PAGE_SIZE,
                 },
             },
         ),
@@ -783,16 +802,16 @@ fn mapping_faults_are_reported_in_the_documented_order() {
         Err(SnapshotError::Target { index: 1, .. })
     ));
     // Faults in two mappings: the earlier one is reported.
-    let late = saved(8 * PAGE_SIZE, 0, GUEST_0);
-    let early = saved(4 * PAGE_SIZE, PAGE_SIZE, SavedTarget::SyncpointShim);
-    let shim_two = saved(5 * PAGE_SIZE, 2 * PAGE_SIZE, SavedTarget::SyncpointShim);
+    let shim = SHIM_PAGES * PAGE_SIZE;
+    let too_big = (SHIM_PAGES + 1) * PAGE_SIZE;
+    let early = saved(4 * PAGE_SIZE, shim, SavedTarget::SyncpointShim);
+    let shim_too_big = saved(4 * PAGE_SIZE + shim, too_big, SavedTarget::SyncpointShim);
+    let late = saved(4 * PAGE_SIZE + shim + too_big, 0, GUEST_0);
     assert_eq!(
-        GpuVm::restore(&raw(&state(vec![first, early, shim_two, late]))).unwrap_err(),
+        GpuVm::restore(&raw(&state(vec![first, early, shim_too_big, late]))).unwrap_err(),
         SnapshotError::Target {
             index: 2,
-            error: VmError::ShimSize {
-                size: 2 * PAGE_SIZE
-            }
+            error: VmError::ShimSize { size: too_big }
         }
     );
 }
@@ -811,9 +830,10 @@ fn errors_read_as_plain_words() {
         .to_string(),
         "a target of 0x1000 bytes at 0xf000 runs past the end of the address space"
     );
+    let shim = SHIM_PAGES * PAGE_SIZE;
     assert_eq!(
-        VmError::ShimSize { size: 0x2000 }.to_string(),
-        "the syncpoint shim is one page, not 0x2000 bytes"
+        VmError::ShimSize { size: 0x7000 }.to_string(),
+        format!("the syncpoint shim is {shim:#x} bytes, not 0x7000 bytes")
     );
     assert_eq!(
         SnapshotError::Overlap { index: 3 }.to_string(),
@@ -822,10 +842,12 @@ fn errors_read_as_plain_words() {
     assert_eq!(
         SnapshotError::Target {
             index: 2,
-            error: VmError::ShimSize { size: 0x2000 }
+            error: VmError::ShimSize { size: 0x7000 }
         }
         .to_string(),
-        "mapping 2 of the GPU VM snapshot: the syncpoint shim is one page, not 0x2000 bytes"
+        format!(
+            "mapping 2 of the GPU VM snapshot: the syncpoint shim is {shim:#x} bytes, not 0x7000 bytes"
+        )
     );
     assert_eq!(
         SnapshotError::Range {
@@ -949,7 +971,7 @@ fn expected_map(count: u64, target: GenTarget) -> (Target, Result<(), VmError>) 
             offset_page,
         } => (gpu_only(region, offset_page * PAGE_SIZE), Ok(())),
         GenTarget::Shim => {
-            let answer = if count == 1 {
+            let answer = if count == SHIM_PAGES {
                 Ok(())
             } else {
                 Err(VmError::ShimSize {
