@@ -304,7 +304,7 @@ fn the_restored_space_is_used_as_the_original_is() {
     let [first, second] = rich.shared;
     let invalid: CallResult<()> = Err(SvcError::Kernel(KernelError::InvalidCurrentMemory));
     // The same steps on both, each with the result it should have.
-    let steps: Vec<Step> = vec![
+    let mut steps: Vec<Step> = vec![
         (
             "unlock the twice-locked range",
             Box::new(move |s| s.unlock_device_share(page(heap, 2), 2 * PAGE_SIZE)),
@@ -350,36 +350,9 @@ fn the_restored_space_is_used_as_the_original_is() {
             Box::new(move |s| s.unlock_for_transfer_memory(page(heap, 12), 2 * PAGE_SIZE)),
             Ok(()),
         ),
-        (
-            "unmapping the alias a device holds is refused",
-            Box::new(move |s| s.unmap_memory(page(stack, 48), page(heap, 6), PAGE_SIZE)),
-            invalid.clone(),
-        ),
-        (
-            "unmapping the second alias as the first's source is refused",
-            Box::new(move |s| s.unmap_memory(page(stack, 50), page(heap, 6), PAGE_SIZE)),
-            Err(SvcError::Kernel(KernelError::InvalidMemoryRegion)),
-        ),
-        (
-            "unmap the second alias's last page",
-            Box::new(move |s| s.unmap_memory(page(stack, 51), page(heap, 11), PAGE_SIZE)),
-            Ok(()),
-        ),
-        (
-            "the device lets go of the first alias",
-            Box::new(move |s| s.unlock_device_share(page(stack, 48), PAGE_SIZE)),
-            Ok(()),
-        ),
-        (
-            "unmap the first alias",
-            Box::new(move |s| s.unmap_memory(page(stack, 48), page(heap, 6), PAGE_SIZE)),
-            Ok(()),
-        ),
-        (
-            "alias the first source again, elsewhere",
-            Box::new(move |s| s.map_memory(page(stack, 56), page(heap, 6), PAGE_SIZE)),
-            Ok(()),
-        ),
+    ];
+    steps.extend(alias_steps(heap, stack));
+    steps.extend::<[Step; 2]>([
         (
             "grow the heap",
             Box::new(|s| s.set_heap_size(32 * PAGE_SIZE).map(drop)),
@@ -390,7 +363,7 @@ fn the_restored_space_is_used_as_the_original_is() {
             Box::new(move |s| s.lock_device_share(page(heap, 20), 4 * PAGE_SIZE)),
             Ok(()),
         ),
-    ];
+    ]);
     for (what, step, expected) in &steps {
         assert_eq!(step(&mut rich.space), *expected, "original: {what}");
         assert_eq!(step(&mut restored), *expected, "restored: {what}");
@@ -421,6 +394,43 @@ fn the_restored_space_is_used_as_the_original_is() {
     let calls = rich.log.take();
     assert_ne!(calls.len(), 0);
     assert_eq!(restored_log.take(), calls);
+}
+
+/// The steps of `the_restored_space_is_used_as_the_original_is` on the rich space's aliases.
+fn alias_steps(heap: u64, stack: u64) -> Vec<Step> {
+    let invalid: CallResult<()> = Err(SvcError::Kernel(KernelError::InvalidCurrentMemory));
+    vec![
+        (
+            "unmapping the alias a device holds is refused",
+            Box::new(move |s| s.unmap_memory(page(stack, 48), page(heap, 6), PAGE_SIZE)),
+            invalid,
+        ),
+        (
+            "unmapping the second alias as the first's source is refused",
+            Box::new(move |s| s.unmap_memory(page(stack, 50), page(heap, 6), PAGE_SIZE)),
+            Err(SvcError::Kernel(KernelError::InvalidMemoryRegion)),
+        ),
+        (
+            "unmap the second alias's last page",
+            Box::new(move |s| s.unmap_memory(page(stack, 51), page(heap, 11), PAGE_SIZE)),
+            Ok(()),
+        ),
+        (
+            "the device lets go of the first alias",
+            Box::new(move |s| s.unlock_device_share(page(stack, 48), PAGE_SIZE)),
+            Ok(()),
+        ),
+        (
+            "unmap the first alias",
+            Box::new(move |s| s.unmap_memory(page(stack, 48), page(heap, 6), PAGE_SIZE)),
+            Ok(()),
+        ),
+        (
+            "alias the first source again, elsewhere",
+            Box::new(move |s| s.map_memory(page(stack, 56), page(heap, 6), PAGE_SIZE)),
+            Ok(()),
+        ),
+    ]
 }
 
 #[test]
@@ -1148,14 +1158,15 @@ fn a_refusal_before_the_translation_asks_the_new_mapper_nothing() {
 /// The unmap that undoes `call`, a mapping a restore made.
 fn undo(call: MapperCall) -> MapperCall {
     match call {
-        MapperCall::Map { address, size, .. } => MapperCall::Unmap { address, size },
+        MapperCall::Map { address, size, .. } | MapperCall::MapAlias { address, size, .. } => {
+            MapperCall::Unmap { address, size }
+        }
         MapperCall::MapShared {
             address, backing, ..
         } => MapperCall::Unmap {
             address,
             size: backing.size(),
         },
-        MapperCall::MapAlias { address, size, .. } => MapperCall::Unmap { address, size },
         other => unreachable!("a restore makes only mappings, not {other:?}"),
     }
 }

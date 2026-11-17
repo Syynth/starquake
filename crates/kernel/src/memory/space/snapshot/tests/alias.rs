@@ -28,6 +28,12 @@ fn error_of(body: &Body) -> SnapshotError {
     restore_body(body).0.unwrap_err()
 }
 
+/// A change to one saved alias, given the address space's end.
+type AliasChange = fn(&mut SavedAlias, u64);
+
+/// A change to a body.
+type BodyChange = Box<dyn Fn(&mut Body)>;
+
 const fn alias(index: usize, fault: AliasFault) -> SnapshotError {
     SnapshotError::Alias { index, fault }
 }
@@ -369,7 +375,7 @@ fn side_by_side_aliases_restore() {
 fn an_alias_must_be_whole_pages_inside_the_address_space() {
     let (body, ..) = side_by_side();
     let end = body.regions.address_space.1;
-    let cases: Vec<(&str, fn(&mut SavedAlias, u64), AliasFault)> = vec![
+    let cases: Vec<(&str, AliasChange, AliasFault)> = vec![
         ("no pages", |a, _| a.size = 0, AliasFault::Shape),
         (
             "a size not whole pages",
@@ -480,7 +486,7 @@ fn each_part_of_the_source_check_refuses_on_its_own() {
     let read = MemoryPermission::from_svc(SvcPermission::Read).bits();
     let uncached = MemoryAttribute::UNCACHED.bits();
     let source = page(heap, 2);
-    let cases: Vec<(&str, Box<dyn Fn(&mut Body)>)> = vec![
+    let cases: Vec<(&str, BodyChange)> = vec![
         (
             "a source the guest can read",
             Box::new(move |b| change_block(b, source, |s| s.permission = read)),
@@ -548,7 +554,7 @@ fn each_part_of_the_destination_check_refuses_on_its_own() {
     let read = MemoryPermission::from_svc(SvcPermission::Read).bits();
     let uncached = MemoryAttribute::UNCACHED.bits();
     let destination = page(stack, 2);
-    let cases: Vec<(&str, Box<dyn Fn(&mut Body)>)> = vec![
+    let cases: Vec<(&str, BodyChange)> = vec![
         (
             "a read-only destination",
             Box::new(move |b| change_block(b, destination, |d| d.permission = read)),

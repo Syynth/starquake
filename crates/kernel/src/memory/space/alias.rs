@@ -52,6 +52,13 @@
 //! `a_reprotect_before_a_refused_alias_still_owes_its_flush` in
 //! `crates/core/src/space/tests/alias.rs`).
 //!
+//! # Snapshots
+//!
+//! The address space's snapshot saves the alias record ([`Aliases`]) run by run, checks each
+//! run against [`LOCKED_SOURCE_CHECK`] and [`ALIAS_DESTINATION_CHECK`] on restore, and maps
+//! each again with [`Mapper::map_alias`] after every other mapping (`snapshot` module docs,
+//! checks 8 and 10; `snapshot::alias`).
+//!
 //! # Divergences from Eden
 //!
 //! - **The page-table half checks its ranges itself.** Eden's two functions trust the system

@@ -1287,7 +1287,7 @@ fn rebuild<'a>(
             made.push((address, size));
         }
     }
-    let mut aliased: Vec<(u64, u64)> = Vec::new();
+    let mut alias_maps: Vec<(u64, u64)> = Vec::new();
     for alias in aliases {
         let (address, size) = (alias.address, alias.size);
         let result = translation(MemoryPermission::USER_READ_WRITE)
@@ -1297,10 +1297,10 @@ fn rebuild<'a>(
                 address,
                 size,
                 error,
-                stuck: undo(mapper, &aliased, &made),
+                stuck: undo(mapper, &alias_maps, &made),
             });
         }
-        aliased.push((address, size));
+        alias_maps.push((address, size));
     }
     Ok(())
 }

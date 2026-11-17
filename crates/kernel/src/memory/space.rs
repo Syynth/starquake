@@ -738,7 +738,7 @@ impl AddressSpace {
         let first = blocks.next().ok_or(invalid)?;
         let mut block = first;
         loop {
-            if !check.admits(&first, &block, alike) {
+            if !check.admits(first, block, alike) {
                 return Err(invalid);
             }
             if last <= block.last() {
