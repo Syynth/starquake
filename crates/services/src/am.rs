@@ -240,9 +240,15 @@
 //! - **A payload too short for a read field is refused** with [`INVALID_CMIF_REQUEST`] and
 //!   changes nothing: `OpenApplicationProxyWithFlags` with fewer than 4 bytes (it reads only the
 //!   flags), `SetGraphicsScaleChangedNotificationEnabled` with none. PR's `ReadInArgument` copies
-//!   the bytes at the argument's offset whatever the message's size. Pinned by
-//!   `open_application_proxy_with_flags_checks_its_flags_first` and
-//!   `set_graphics_scale_changed_notification_enabled_keeps_its_flag`.
+//!   the bytes at the argument's offset whatever the message's size. What counts as the payload
+//!   depends on the session ([`Request::payload`]): on a domain it is the domain header's `size`
+//!   less the `SFCI` header, so a request that carries fewer bytes is refused; on an ordinary
+//!   CMIF session it runs to the end of the message's raw data, padding included, so a request
+//!   with fewer argument bytes is refused only when the raw data also ends before the field, and
+//!   otherwise reads the padding and succeeds. Only the domain case is pinned:
+//!   `open_application_proxy_with_flags_checks_its_flags_first` (0 bytes, then 1, 2 and 3 bytes
+//!   with libnx's exact domain `size`, refused, and 4 bytes, accepted) and
+//!   `set_graphics_scale_changed_notification_enabled_keeps_its_flag` (0 bytes).
 //! - The process id and handle checks are command 0's ("Where this differs from Eden").
 //!
 //! # The graphics server

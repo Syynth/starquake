@@ -1480,8 +1480,9 @@ fn open_application_proxy_with_flags_laid_out_by_hand_opens_the_proxy_on_a_domai
 }
 
 /// PR #4588's check, `R_UNLESS(flags == 0 || flags == 2, ResultUnknown)`: 0 and 2 open the
-/// proxy; 1 and 3, the neighbours of 2, and the largest value are refused with `ResultUnknown`,
-/// and open nothing.
+/// proxy; 1 and 3, the neighbours of 2, the largest value, and values whose low byte or low
+/// half is 0 or 2 but whose higher bytes are not zero are refused with `ResultUnknown`, and open
+/// nothing. The last set shows the whole `u32` is read, not only its low byte or half.
 #[test]
 fn open_application_proxy_with_flags_accepts_only_0_and_2() {
     assert_eq!(PROXY_FLAGS_ACCEPTED, [0, 2]);
@@ -1491,6 +1492,14 @@ fn open_application_proxy_with_flags_accepts_only_0_and_2() {
         (2, true),
         (3, false),
         (u32::MAX, false),
+        // Low byte accepted, the second byte set.
+        (0x0000_0100, false),
+        (0x0000_0102, false),
+        // Low half accepted, the third byte set.
+        (0x0001_0000, false),
+        (0x0001_0002, false),
+        // Low three bytes accepted, the top byte set.
+        (0x0200_0000, false),
     ];
     for (flags, accepted) in cases {
         let mut rig = Rig::new();
@@ -1571,6 +1580,34 @@ fn open_application_proxy_with_flags_checks_its_flags_first() {
     }
     // Only the last case opened anything.
     assert_eq!(rig.server.interface_count(), 2);
+
+    // The exact edge, with libnx's layout, whose domain `size` counts the exact argument bytes
+    // (the default layout rounds them up to a whole word, so a short payload would arrive as
+    // four bytes): every length short of the flags is refused, the flags' own length opens the
+    // proxy.
+    let mut rig = Rig::new();
+    let root = rig.convert();
+    let process = rig.process.raw();
+    let flags = accepted.to_le_bytes();
+    for len in 0..=flags.len() {
+        let request = RequestBuilder::domain(
+            CommandType::Request,
+            root,
+            OPEN_APPLICATION_PROXY_WITH_FLAGS,
+        )
+        .layout(RequestLayout::Libnx)
+        .send_pid(PROCESS_ID)
+        .copy_handle(process)
+        .data(&flags[..len]);
+        let reply = parse(&rig.send_raw(rig.session, &request), SessionKind::Domain);
+        let (result, interfaces) = if len == flags.len() {
+            (ResultCode::SUCCESS, 2)
+        } else {
+            (INVALID_CMIF_REQUEST, 1)
+        };
+        assert_eq!(reply.result, result, "{len} bytes");
+        assert_eq!(rig.server.interface_count(), interfaces, "{len} bytes");
+    }
 }
 
 #[test]
@@ -1719,7 +1756,8 @@ fn get_graphics_scaling_parameters_answers_pr_4588_s_parameters() {
 }
 
 /// The flag is kept in the applet, initially false; each step changes it or leaves it, and a
-/// payload with no byte is refused and changes nothing, whichever value it holds.
+/// payload with no byte is refused and changes nothing, whichever value it holds. Only the first
+/// byte is the `bool`: a zero byte followed by a non-zero one clears the flag.
 #[test]
 fn set_graphics_scale_changed_notification_enabled_keeps_its_flag() {
     let mut rig = Rig::new();
@@ -1727,7 +1765,7 @@ fn set_graphics_scale_changed_notification_enabled_keeps_its_flag() {
     let scaling = rig.open(proxy, GET_GRAPHICS_SCALING_PARAMETERS_FUNCTIONS);
     assert!(!rig.applet().graphics_scale_changed_notification_enabled());
     let refused = domain_reply(INVALID_CMIF_REQUEST, &[], &[]);
-    let steps: [(&[u8], bool); 7] = [
+    let steps: [(&[u8], bool); 8] = [
         (&[], false),
         (&[0], false),
         (&[1], true),
@@ -1735,6 +1773,7 @@ fn set_graphics_scale_changed_notification_enabled_keeps_its_flag() {
         (&[0xFF], true),
         (&[0], false),
         (&[2], true),
+        (&[0, 1], false),
     ];
     for (data, expected) in steps {
         let before = rig.applet();
