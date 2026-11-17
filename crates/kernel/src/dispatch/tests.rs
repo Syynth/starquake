@@ -727,7 +727,7 @@ fn close_handle_takes_the_handle_table_and_the_scheduler_and_closes_the_handle()
     assert!(tables.handles.get(kept).is_ok());
     // The handle held the object's last reference, so the object is gone too.
     assert_eq!(tables.scheduler.objects().refs(object), 0);
-    assert_eq!(tables.scheduler.objects().len(), 1);
+    assert_eq!(tables.scheduler.objects_besides_processes(), 1);
 }
 
 #[test]
@@ -757,7 +757,10 @@ fn get_thread_priority_reads_the_scheduler_through_a_handle_in_x1() {
     // A query: both tables are as they were.
     let tables = dispatcher.into_tables();
     assert_eq!(
-        (tables.handles.len(), tables.scheduler.objects().len()),
+        (
+            tables.handles.len(),
+            tables.scheduler.objects_besides_processes()
+        ),
         (1, 1)
     );
 }
