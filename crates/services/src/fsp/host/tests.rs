@@ -9,8 +9,8 @@ use starquake_trace::{EnvError, HostNanos};
 use super::*;
 
 /// A request of every kind with distinct, non-zero values, and its bytes laid out by hand; the
-/// last three are for the data storage.
-fn golden() -> [(HostRequest, Vec<u8>); 6] {
+/// fourth to sixth are for the data storage, the last for the data file system.
+fn golden() -> [(HostRequest, Vec<u8>); 7] {
     let probe = HostRequest::Probe {
         mount: Mount::SdCard,
     };
@@ -57,6 +57,19 @@ fn golden() -> [(HostRequest, Vec<u8>); 6] {
         &[0x38, 0x37, 0x36, 0x35, 0x34, 0x33, 0x32, 0x31],
     ]
     .concat();
+    let data_read = HostRequest::Read {
+        mount: Mount::DataFileSystem,
+        path: b"/d/e".to_vec(),
+        offset: 0x4142_4344_4546_4748,
+        len: 0x5152_5354_5556_5758,
+    };
+    let data_read_bytes = [
+        &[1, 3, 3, 0, 4, 0, 0, 0][..],
+        &[0x48, 0x47, 0x46, 0x45, 0x44, 0x43, 0x42, 0x41],
+        &[0x58, 0x57, 0x56, 0x55, 0x54, 0x53, 0x52, 0x51],
+        b"/d/e",
+    ]
+    .concat();
     [
         (probe, probe_bytes),
         (size, size_bytes),
@@ -64,6 +77,7 @@ fn golden() -> [(HostRequest, Vec<u8>); 6] {
         (storage_probe, storage_probe_bytes),
         (storage_size, storage_size_bytes),
         (storage_read, storage_read_bytes),
+        (data_read, data_read_bytes),
     ]
 }
 
@@ -80,8 +94,8 @@ fn every_request_has_these_bytes() {
         .iter()
         .map(|(request, _)| request.mount())
         .collect();
-    let (sd, data) = (Mount::SdCard, Mount::DataStorage);
-    assert_eq!(mounts, [sd, sd, sd, data, data, data]);
+    let (sd, data, files) = (Mount::SdCard, Mount::DataStorage, Mount::DataFileSystem);
+    assert_eq!(mounts, [sd, sd, sd, data, data, data, files]);
     // The header's fields are where the layout says.
     let bytes = &golden()[2].1;
     assert_eq!(bytes[layout::VERSION], VERSION);
@@ -159,9 +173,9 @@ fn each_header_field_is_checked() {
         ),
         (
             layout::MOUNT,
-            3,
-            RequestError::Mount(3),
-            "mount 3 is not a host file system",
+            4,
+            RequestError::Mount(4),
+            "mount 4 is not a host file system",
         ),
         (
             layout::RESERVED,
@@ -281,12 +295,12 @@ fn failure_codes_name_their_failures() {
     assert_eq!(HostFailure::from_code(0), None);
     assert_eq!(HostFailure::from_code(6), None);
     let numbers: Vec<u8> = Mount::ALL.iter().map(|m| m.number()).collect();
-    assert_eq!(numbers, [1, 2]);
+    assert_eq!(numbers, [1, 2, 3]);
     for mount in Mount::ALL {
         assert_eq!(Mount::from_number(mount.number()), Some(mount));
     }
     assert_eq!(Mount::from_number(0), None);
-    assert_eq!(Mount::from_number(3), None);
+    assert_eq!(Mount::from_number(4), None);
 }
 
 /// An environment that answers host I/O with one scripted reply and keeps what it was asked.
@@ -324,7 +338,9 @@ fn replies_are_sorted_by_what_they_say() {
         ),
         (Ok(HostIoReply::Failed(99)), Answer::Broken),
         (Ok(HostIoReply::Unavailable), Answer::Unavailable),
-        (Err(exhausted), Answer::Broken),
+        // The environment's own failure is not a host answer (decision log, 2026-11-17, "Env
+        // failures"): it stops the run, where an unknown code is a failed request.
+        (Err(exhausted), Answer::Stopped),
     ];
     let request = &golden()[1].0;
     for (reply, answer) in cases {

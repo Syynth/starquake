@@ -10,6 +10,7 @@ use starquake_trace::EnvRecord;
 
 use super::*;
 use crate::framework::{DEFERRED_REPLY_DROPPED, Finish};
+use crate::fsp::halt::{Halt, Stop};
 use crate::fsp::worker::{
     COUNT, Completed, Failure, JobIndex, Question, RecordError, Recording, Replay, ReplayError,
     StartError, Workers,
@@ -37,9 +38,16 @@ fn each(env: Arc<dyn Env>) -> Vec<Arc<dyn Env>> {
     vec![env; COUNT.get()]
 }
 
-/// A replay of `record`, which numbers no job twice.
+/// A replay of `record`, which numbers no job twice, whose test expects it never to stop the
+/// run.
 fn replay_of(record: Vec<Completed>) -> Replay {
-    Replay::new(record).unwrap()
+    Replay::new(record, unwatched()).unwrap()
+}
+
+/// A replay of `record`, which numbers no job twice, and what it tells the run.
+fn replay_halting(record: Vec<Completed>) -> (Replay, Arc<Halts>) {
+    let (halt, halts) = halts();
+    (Replay::new(record, halt).unwrap(), halts)
 }
 
 /// The failure the environment answers `asked` with in a test: [`ENV_FAILURE`].
@@ -168,19 +176,35 @@ fn hello_record(job: u64, offset: u64, len: u64) -> Completed {
     }
 }
 
-/// A rig whose server's reads run on `COUNT` workers over [`Gated`], keeping their record.
+/// A rig whose server's reads run on `COUNT` workers over [`Gated`], keeping their record, whose
+/// test expects them never to stop the run.
 fn rig_on_workers(recording: Recording) -> (Rig, Arc<Workers>, Arc<Gate>, Receiver<()>) {
+    rig_on_workers_telling(recording, unwatched())
+}
+
+/// [`rig_on_workers`], whose workers tell `halt` when a read's environment fails it.
+fn rig_on_workers_telling(
+    recording: Recording,
+    halt: Arc<dyn Halt>,
+) -> (Rig, Arc<Workers>, Arc<Gate>, Receiver<()>) {
     let host = FakeEnv::new(true);
     let gate = Arc::new(Gate::default());
     let env = Arc::new(Gated {
         host: Arc::clone(&host),
         gate: Arc::clone(&gate),
     });
-    let workers = Arc::new(Workers::new(each(env), recording).unwrap());
+    let workers = Arc::new(Workers::new(each(env), recording, halt).unwrap());
     let (notify, posted) = posts();
     let executor: Arc<dyn Executor> = Arc::<Workers>::clone(&workers);
     let rig = Rig::over(host, executor, notify);
     (rig, workers, gate, posted)
+}
+
+/// A halt to give, and the record of what it is told.
+fn halts() -> (Arc<dyn Halt>, Arc<Halts>) {
+    let halts = Arc::new(Halts::default());
+    let halt: Arc<dyn Halt> = Arc::<Halts>::clone(&halts);
+    (halt, halts)
 }
 
 /// Delivers the oldest completion and returns its reply and the first `len` bytes of the
@@ -315,7 +339,7 @@ fn the_record_holds_completions_in_the_order_they_reached_the_mailbox() {
         host,
         gate: Arc::clone(&gate),
     });
-    let workers = Workers::new(each(env), Recording::Kept).unwrap();
+    let workers = Workers::new(each(env), Recording::Kept, unwatched()).unwrap();
     let finished = Arc::new(Finished::default());
     let offset = u64::try_from(GATED).unwrap();
     workers.submit(job_reading(offset, 0, true, &finished));
@@ -383,7 +407,8 @@ fn a_replay_delivers_the_reads_in_the_recorded_order() {
 
 #[test]
 fn a_job_the_record_does_not_hold_is_a_divergence_and_its_request_is_dropped() {
-    let replay = Arc::new(replay_of(vec![hello_record(0, 0, 4)]));
+    let (replay, halts) = replay_halting(vec![hello_record(0, 0, 4)]);
+    let replay = Arc::new(replay);
     let (notify, posted) = posts();
     let executor: Arc<dyn Executor> = Arc::<Replay>::clone(&replay);
     let mut rig = Rig::over(FakeEnv::new(true), executor, notify);
@@ -392,15 +417,25 @@ fn a_job_the_record_does_not_hold_is_a_divergence_and_its_request_is_dropped() {
     await_posts(&posted, 1);
     assert_eq!(delivered(&mut rig, 4), (s64(4), four_at(0)));
     assert_eq!(replay.check(), Ok(()));
+    assert_eq!(halts.stops(), []);
     rig.defer(To::Session(file), READ, read(0, 4, 16));
+    // The run is told to stop when the job is submitted, before its request is dropped.
+    let unrecorded = ReplayError::Unrecorded { job: 1 };
+    assert_eq!(halts.stops(), [Stop::Replay(unrecorded.clone())]);
     await_posts(&posted, 1);
     assert_eq!(delivered(&mut rig, 4).0, only(DEFERRED_REPLY_DROPPED));
-    assert_eq!(replay.check(), Err(ReplayError::Unrecorded { job: 1 }));
+    assert_eq!(replay.check(), Err(unrecorded));
+    assert_eq!(
+        halts.stops()[0].to_string(),
+        "the replay of fsp-srv's reads left its record: the replay ran file-system job 1, which \
+         the recorded run never finished"
+    );
 }
 
 #[test]
 fn a_read_that_asks_otherwise_than_the_record_is_a_divergence() {
-    let replay = Arc::new(replay_of(vec![hello_record(0, 0, 4)]));
+    let (replay, halts) = replay_halting(vec![hello_record(0, 0, 4)]);
+    let replay = Arc::new(replay);
     let (notify, posted) = posts();
     let executor: Arc<dyn Executor> = Arc::<Replay>::clone(&replay);
     let mut rig = Rig::over(FakeEnv::new(true), executor, notify);
@@ -411,25 +446,41 @@ fn a_read_that_asks_otherwise_than_the_record_is_a_divergence() {
         job: 0,
         error: EnvError::HostIoRequestMismatch { index: 0 },
     };
-    assert_eq!(replay.check(), Err(error));
+    assert_eq!(replay.check(), Err(error.clone()));
     assert_eq!(
         replay.check().unwrap_err().to_string(),
         "file-system job 0 read differently from the recorded run: record 0: the host I/O \
          request differs from the recorded one"
     );
-    // Not the guest's concern, but answered: the environment's error is a broken host.
-    assert_eq!(delivered(&mut rig, 4).0, only(result::HOST_IO_FAILED));
+    // The run stops; the request is answered as one the server gave up on, unfinished.
+    assert_eq!(halts.stops(), [Stop::Replay(error)]);
+    assert_eq!(delivered(&mut rig, 4).0, only(DEFERRED_REPLY_DROPPED));
 }
 
 #[test]
-fn a_failure_the_environment_gave_is_recorded_and_replayed() {
-    let (mut live, workers, gate, posted) = rig_on_workers(Recording::Kept);
+fn an_environment_failure_in_a_read_stops_the_run() {
+    // Live, on the workers: the run is told to stop with the job and the environment's error,
+    // the job's finish is dropped unrun, and the job is recorded with its failure.
+    let (halt, live_halts) = halts();
+    let (mut live, workers, gate, posted) = rig_on_workers_telling(Recording::Kept, halt);
     gate.open();
     let file = live.hello();
     live.defer(To::Session(file), READ, read(ENV_FAILING, 4, 16));
     await_posts(&posted, 1);
     let answered = delivered(&mut live, 4);
-    assert_eq!(answered.0, only(result::HOST_IO_FAILED));
+    assert_eq!(answered, (only(DEFERRED_REPLY_DROPPED), vec![STALE; 4]));
+    let stop = Stop::Job {
+        job: 0,
+        error: ENV_FAILURE,
+    };
+    assert_eq!(live_halts.stops(), [stop.clone()]);
+    assert_eq!(
+        stop.to_string(),
+        "the environment failed file-system job 0: recording exhausted at record 7: the replay \
+         asked for HostIo"
+    );
+    // The server's own handlers were not failed.
+    assert_eq!(live.halts.stops(), []);
     let record = workers.take_record();
     let offset = u64::try_from(ENV_FAILING).unwrap();
     let expected = Completed {
@@ -439,7 +490,9 @@ fn a_failure_the_environment_gave_is_recorded_and_replayed() {
     };
     assert_eq!(record, [expected]);
 
-    let replay = Arc::new(replay_of(record));
+    // Replayed: the job reaches its recorded failure and stops the run as the live one did.
+    let (replay, halts) = replay_halting(record);
+    let replay = Arc::new(replay);
     let (notify, posted) = posts();
     let executor: Arc<dyn Executor> = Arc::<Replay>::clone(&replay);
     let mut again = Rig::over(FakeEnv::new(true), executor, notify);
@@ -447,6 +500,7 @@ fn a_failure_the_environment_gave_is_recorded_and_replayed() {
     again.defer(To::Session(file), READ, read(ENV_FAILING, 4, 16));
     await_posts(&posted, 1);
     assert_eq!(delivered(&mut again, 4), answered);
+    assert_eq!(halts.stops(), [stop]);
     assert_eq!(replay.check(), Ok(()));
 }
 
@@ -471,15 +525,22 @@ fn a_recorded_failure_ends_the_jobs_answers_live_and_in_replay() {
         failure: Some(env_failure(Question::Clock)),
     };
     let expected = [Ok(HostNanos(5)), Err(ENV_FAILURE.clone()), Err(ENV_FAILURE)];
-    // Replayed: the answer, then the failure for every later call.
+    // Replayed: the answer, then the failure for every later call; the run is told to stop
+    // once, as the live run was.
     let seen = Arc::new(Mutex::new(Vec::new()));
-    let replay = replay_of(vec![failed.clone()]);
+    let (replay, halts) = replay_halting(vec![failed.clone()]);
     replay.submit(job_timing(3, &seen));
     assert_eq!(*seen.lock().unwrap(), expected);
     assert_eq!(replay.check(), Ok(()));
+    let reached = Stop::Job {
+        job: 0,
+        error: ENV_FAILURE,
+    };
+    assert_eq!(halts.stops(), [reached]);
 
-    // A job that stops before the recorded failure has not followed the record.
-    let replay = replay_of(vec![failed.clone()]);
+    // A job that stops before the recorded failure has not followed the record: the run is
+    // told when the job returns.
+    let (replay, halts) = replay_halting(vec![failed.clone()]);
     replay.submit(job_timing(1, &Arc::new(Mutex::new(Vec::new()))));
     let error = ReplayError::Diverged {
         job: 0,
@@ -488,12 +549,14 @@ fn a_recorded_failure_ends_the_jobs_answers_live_and_in_replay() {
             remaining: 1,
         },
     };
-    assert_eq!(replay.check(), Err(error));
+    assert_eq!(replay.check(), Err(error.clone()));
+    assert_eq!(halts.stops(), [Stop::Replay(error)]);
 
-    // A job that asks for more than the record holds, with no failure recorded, has not either.
+    // A job that asks for more than the record holds, with no failure recorded, has not either:
+    // the run is told when the job is answered with the error, once.
     let mut answered = failed;
     answered.failure = None;
-    let replay = replay_of(vec![answered]);
+    let (replay, halts) = replay_halting(vec![answered]);
     replay.submit(job_timing(2, &Arc::new(Mutex::new(Vec::new()))));
     let error = ReplayError::Diverged {
         job: 0,
@@ -502,7 +565,8 @@ fn a_recorded_failure_ends_the_jobs_answers_live_and_in_replay() {
             requested: EnvCall::Clock,
         },
     };
-    assert_eq!(replay.check(), Err(error));
+    assert_eq!(replay.check(), Err(error.clone()));
+    assert_eq!(halts.stops(), [Stop::Replay(error)]);
 }
 
 /// An environment that answers the time once, then fails, and counts the calls that reach it.
@@ -536,19 +600,31 @@ fn a_live_failure_ends_the_jobs_use_of_the_environment() {
 fn a_live_failure_ends_the_jobs_use_of_the_environment_with(recording: Recording) {
     let env = Arc::new(FailsSecond(AtomicUsize::new(0)));
     let env_handle: Arc<dyn Env> = Arc::<FailsSecond>::clone(&env);
-    let workers = Workers::new(each(env_handle), recording).unwrap();
+    let (halt, halts) = halts();
+    let workers = Workers::new(each(env_handle), recording, halt).unwrap();
     let seen = Arc::new(Mutex::new(Vec::new()));
     let finished = Arc::new(Finished::default());
     let pushed = Arc::clone(&finished);
     let timing = job_timing(3, &seen);
+    let (unrun, dropped) = mpsc::channel();
+    let guard = Unrun(Some(unrun), 0);
     workers.submit(Box::new(move |env: &dyn Env| {
         drop(timing(env));
         let finish: Finish = Box::new(move || {
+            guard.ran();
             pushed.push(0);
         });
         finish
     }));
-    assert!(finished.await_count(1, WAIT));
+    // The finish is dropped without being called.
+    assert_eq!(dropped.recv_timeout(WAIT), Ok(0));
+    assert!(finished.order().is_empty());
+    // The run was told once, at the first failure; the later call did not tell it again.
+    let stop = Stop::Job {
+        job: 0,
+        error: ENV_FAILURE,
+    };
+    assert_eq!(halts.stops(), [stop], "{recording:?}");
     let expected = [
         Ok(HostNanos(5)),
         Err(ENV_FAILURE.clone()),
@@ -566,7 +642,15 @@ fn a_live_failure_ends_the_jobs_use_of_the_environment_with(recording: Recording
         Recording::Kept => vec![entry],
         Recording::Off => Vec::new(),
     };
-    assert_eq!(workers.take_record(), expected, "{recording:?}");
+    // The entry follows the dropped finish: wait for it, within the bound.
+    let mut recorded = Vec::new();
+    let started = std::time::Instant::now();
+    while recorded.len() < expected.len() && started.elapsed() < WAIT {
+        recorded.extend(workers.take_record());
+        std::thread::yield_now();
+    }
+    drop(workers);
+    assert_eq!(recorded, expected, "{recording:?}");
 }
 
 #[test]
@@ -622,7 +706,7 @@ fn dropping_the_workers_with_reads_in_flight_leaves_no_thread_behind() {
         gate: Arc::clone(&gate),
     });
     let env_handle: Arc<dyn Env> = Arc::<Gated>::clone(&env);
-    let workers = Workers::new(each(env_handle), Recording::Kept).unwrap();
+    let workers = Workers::new(each(env_handle), Recording::Kept, unwatched()).unwrap();
     let finished = Arc::new(Finished::default());
     let (unrun, dropped) = mpsc::channel();
     // One read in flight per worker, and one more queued behind them.
@@ -694,10 +778,10 @@ fn a_start_error_says_so_in_plain_words() {
 
 #[test]
 fn workers_given_no_environment_are_refused_and_one_is_enough() {
-    let refused = Workers::new(Vec::new(), Recording::Kept);
+    let refused = Workers::new(Vec::new(), Recording::Kept, unwatched());
     assert!(matches!(refused, Err(StartError::NoEnvironment)));
     let env: Arc<dyn Env> = FakeEnv::new(true);
-    let one = Workers::new(vec![env], Recording::Kept).unwrap();
+    let one = Workers::new(vec![env], Recording::Kept, unwatched()).unwrap();
     let finished = Arc::new(Finished::default());
     one.submit(job_reading(0, 0, false, &finished));
     assert!(finished.await_count(1, WAIT));
@@ -728,23 +812,30 @@ fn the_first_of_two_divergences_is_the_one_reported() {
         job,
         error: EnvError::HostIoRequestMismatch { index: 0 },
     };
-    // A read that differs from the record, then a job the record does not hold.
-    let replay = replay_of(vec![hello_record(0, 0, 4)]);
+    // A read that differs from the record, then a job the record does not hold. The run is
+    // told of both, in the order they were found; the first is the one that stops it.
+    let (replay, halts) = replay_halting(vec![hello_record(0, 0, 4)]);
     replay.submit(job_ignoring(hello_read(4, 4)));
     replay.submit(job_ignoring(hello_read(0, 4)));
     assert_eq!(replay.check(), Err(mismatch(0)));
+    let unrecorded = ReplayError::Unrecorded { job: 1 };
+    let told = [Stop::Replay(mismatch(0)), Stop::Replay(unrecorded)];
+    assert_eq!(halts.stops(), told);
 
     // A job the record does not hold, then a read that differs from the record.
-    let replay = replay_of(vec![hello_record(1, 0, 4)]);
+    let (replay, halts) = replay_halting(vec![hello_record(1, 0, 4)]);
     replay.submit(job_ignoring(hello_read(0, 4)));
     replay.submit(job_ignoring(hello_read(4, 4)));
-    assert_eq!(replay.check(), Err(ReplayError::Unrecorded { job: 0 }));
+    let unrecorded = ReplayError::Unrecorded { job: 0 };
+    assert_eq!(replay.check(), Err(unrecorded.clone()));
+    let told = [Stop::Replay(unrecorded), Stop::Replay(mismatch(1))];
+    assert_eq!(halts.stops(), told);
 }
 
 #[test]
 fn a_divergence_is_reported_before_the_recorded_jobs_left_unfinished() {
     // Job 0 diverges, and job 1, which the record holds too, is never submitted.
-    let replay = replay_of(vec![hello_record(0, 0, 4), hello_record(1, 0, 4)]);
+    let (replay, _halts) = replay_halting(vec![hello_record(0, 0, 4), hello_record(1, 0, 4)]);
     replay.submit(job_ignoring(hello_read(4, 4)));
     assert_eq!(
         replay.check(),
@@ -763,53 +854,53 @@ fn a_mismatch_before_a_recorded_failure_is_answered_as_the_mismatch() {
         answers: hello_record(0, 0, 4).answers,
         failure: Some(env_failure(Question::HostIo(hello_read(4, 4)))),
     };
-    let replay = replay_of(vec![failed]);
+    let (replay, halts) = replay_halting(vec![failed]);
     let seen = Arc::new(Mutex::new(Vec::new()));
     // The replayed job's first read differs from the recorded first read.
     replay.submit(job_asking(hello_read(8, 4), &seen));
     let mismatch = EnvError::HostIoRequestMismatch { index: 0 };
     assert_eq!(*seen.lock().unwrap(), [Err(mismatch.clone())]);
-    assert_eq!(
-        replay.check(),
-        Err(ReplayError::Diverged {
-            job: 0,
-            error: mismatch,
-        })
-    );
+    let diverged = ReplayError::Diverged {
+        job: 0,
+        error: mismatch,
+    };
+    assert_eq!(replay.check(), Err(diverged.clone()));
+    assert_eq!(halts.stops(), [Stop::Replay(diverged)]);
 }
 
 #[test]
 fn a_replay_that_asks_otherwise_where_the_live_job_failed_is_a_divergence() {
     // The recorded run: the environment failed the read at `ENV_FAILING`.
-    let (mut live, workers, gate, posted) = rig_on_workers(Recording::Kept);
+    let (halt, _live_halts) = halts();
+    let (mut live, workers, gate, posted) = rig_on_workers_telling(Recording::Kept, halt);
     gate.open();
     let file = live.hello();
     live.defer(To::Session(file), READ, read(ENV_FAILING, 4, 16));
     await_posts(&posted, 1);
-    assert_eq!(delivered(&mut live, 4).0, only(result::HOST_IO_FAILED));
+    assert_eq!(delivered(&mut live, 4).0, only(DEFERRED_REPLY_DROPPED));
     let record = workers.take_record();
 
     // The replay reads at another offset where the live job failed.
-    let replay = Arc::new(replay_of(record.clone()));
+    let (replay, halts) = replay_halting(record.clone());
+    let replay = Arc::new(replay);
     let (notify, posted) = posts();
     let executor: Arc<dyn Executor> = Arc::<Replay>::clone(&replay);
     let mut again = Rig::over(FakeEnv::new(true), executor, notify);
     let file = again.hello();
     again.defer(To::Session(file), READ, read(0, 4, 16));
     await_posts(&posted, 1);
-    assert_eq!(delivered(&mut again, 4).0, only(result::HOST_IO_FAILED));
+    assert_eq!(delivered(&mut again, 4).0, only(DEFERRED_REPLY_DROPPED));
     let mismatch = EnvError::HostIoRequestMismatch { index: 0 };
-    assert_eq!(
-        replay.check(),
-        Err(ReplayError::Diverged {
-            job: 0,
-            error: mismatch.clone(),
-        })
-    );
+    let diverged = ReplayError::Diverged {
+        job: 0,
+        error: mismatch.clone(),
+    };
+    assert_eq!(replay.check(), Err(diverged.clone()));
+    assert_eq!(halts.stops(), [Stop::Replay(diverged)]);
 
     // Directly: a different request, and then a different kind of call, where the live job
     // failed; each answered with how it differs, every later call alike.
-    let replay = replay_of(record.clone());
+    let (replay, _halts) = replay_halting(record.clone());
     let seen = Arc::new(Mutex::new(Vec::new()));
     let asked = Arc::clone(&seen);
     replay.submit(Box::new(move |env: &dyn Env| {
@@ -830,7 +921,7 @@ fn a_replay_that_asks_otherwise_where_the_live_job_failed_is_a_divergence() {
             error: mismatch,
         })
     );
-    let replay = replay_of(record);
+    let (replay, _halts) = replay_halting(record);
     let seen = Arc::new(Mutex::new(Vec::new()));
     replay.submit(job_timing(1, &seen));
     let kind = EnvError::Mismatch {
@@ -878,7 +969,7 @@ fn job_drawing(drawn: &Sender<Result<u64, EnvError>>) -> Job {
 #[test]
 fn a_random_number_a_worker_drew_is_recorded_and_replayed() {
     const VALUE: u64 = 0x5EED_0123_4567_89AB;
-    let workers = Workers::new(each(Arc::new(Rolls(VALUE))), Recording::Kept).unwrap();
+    let workers = Workers::new(each(Arc::new(Rolls(VALUE))), Recording::Kept, unwatched()).unwrap();
     let (send, drawn) = mpsc::channel();
     workers.submit(job_drawing(&send));
     assert_eq!(drawn.recv_timeout(WAIT), Ok(Ok(VALUE)));
@@ -899,7 +990,7 @@ fn a_random_number_a_worker_drew_is_recorded_and_replayed() {
 #[test]
 fn a_job_that_panics_leaves_its_thread_to_run_the_next() {
     let env: Arc<dyn Env> = FakeEnv::new(true);
-    let workers = Workers::new(each(env), Recording::Kept).unwrap();
+    let workers = Workers::new(each(env), Recording::Kept, unwatched()).unwrap();
     let (unrun, dropped) = mpsc::channel();
     let count = u64::try_from(COUNT.get()).unwrap();
     // One job that panics per thread: unfixed, each takes its thread with it.
@@ -948,10 +1039,10 @@ fn a_record_that_holds_a_job_twice_is_refused_at_the_second_entry() {
         hello_record(0, 8, 4),
         hello_record(2, 0, 4),
     ];
-    assert!(Replay::new(distinct.clone()).is_ok());
+    assert!(Replay::new(distinct.clone(), unwatched()).is_ok());
     let mut twice = distinct.clone();
     twice.push(hello_record(0, 0, 4));
-    let error = Replay::new(twice).err().unwrap();
+    let error = Replay::new(twice, unwatched()).err().unwrap();
     assert_eq!(error, RecordError::Duplicate { job: 0, entry: 3 });
     assert_eq!(
         error.to_string(),
@@ -960,7 +1051,103 @@ fn a_record_that_holds_a_job_twice_is_refused_at_the_second_entry() {
     // At once after the first.
     let next = vec![hello_record(5, 0, 4), hello_record(5, 8, 4)];
     assert_eq!(
-        Replay::new(next).err(),
+        Replay::new(next, unwatched()).err(),
         Some(RecordError::Duplicate { job: 5, entry: 1 })
     );
+}
+
+/// Holds every job that arrives until `count` have, within [`WAIT`]: a job held here keeps its
+/// thread, so `count` jobs held at once are on `count` threads.
+#[derive(Default)]
+struct Meeting {
+    arrived: Mutex<usize>,
+    all: Condvar,
+}
+
+impl Meeting {
+    fn arrive(&self, count: usize) {
+        let mut arrived = self.arrived.lock().unwrap();
+        *arrived += 1;
+        self.all.notify_all();
+        let (arrived, timeout) = self
+            .all
+            .wait_timeout_while(arrived, WAIT, |arrived| *arrived < count)
+            .unwrap();
+        drop(arrived);
+        assert!(!timeout.timed_out(), "the jobs never met");
+    }
+}
+
+#[test]
+fn a_panicking_job_on_every_thread_leaves_the_pool_whole() {
+    let (mut rig, workers, gate, posted) = rig_on_workers(Recording::Kept);
+    // One job per thread, held until every thread has one, each then panicking: unfixed, the
+    // pool loses every thread.
+    let meeting = Arc::new(Meeting::default());
+    for _ in 0..COUNT.get() {
+        let meeting = Arc::clone(&meeting);
+        workers.submit(Box::new(move |_: &dyn Env| {
+            meeting.arrive(COUNT.get());
+            std::panic::resume_unwind(Box::new("a job panicked"))
+        }));
+    }
+    // The pool keeps its size: as many reads as it has threads are in flight at once.
+    let first = rig.hello();
+    let second = rig.hello();
+    rig.defer(To::Session(first), READ, read(GATED, 4, 16));
+    rig.defer(To::Session(second), READ, read(GATED, 4, 16));
+    gate.await_waiting(COUNT.get());
+    gate.open();
+    // And the next reads complete.
+    await_posts(&posted, 2);
+    assert_eq!(delivered(&mut rig, 4), (s64(4), four_at(GATED)));
+    assert_eq!(delivered(&mut rig, 4), (s64(4), four_at(GATED)));
+    let count = u64::try_from(COUNT.get()).unwrap();
+    let mut recorded: Vec<u64> = workers
+        .take_record()
+        .iter()
+        .map(|entry| entry.job.raw())
+        .collect();
+    recorded.sort_unstable();
+    assert_eq!(recorded, [count, count + 1]);
+}
+
+#[test]
+fn a_job_that_panics_in_a_replay_does_not_unwind_into_its_submitter() {
+    // Three recorded jobs: the replayed first panics in its job, the second in its finish, and
+    // the third must still be run and finished.
+    let record = vec![
+        hello_record(0, 0, 4),
+        hello_record(1, 4, 4),
+        hello_record(2, 8, 4),
+    ];
+    let replay = Arc::new(replay_of(record));
+    let (notify, posted) = posts();
+    let executor: Arc<dyn Executor> = Arc::<Replay>::clone(&replay);
+    let mut rig = Rig::over(FakeEnv::new(true), executor, notify);
+    let (unrun, dropped) = mpsc::channel();
+    let guard = Unrun(Some(unrun.clone()), 0);
+    replay.submit(Box::new(move |env: &dyn Env| {
+        let _guard = guard;
+        env.host_io(&hello_read(0, 4)).unwrap();
+        std::panic::resume_unwind(Box::new("a replayed job panicked"))
+    }));
+    let guard = Unrun(Some(unrun), 1);
+    replay.submit(Box::new(move |env: &dyn Env| {
+        env.host_io(&hello_read(4, 4)).unwrap();
+        let finish: Finish = Box::new(move || {
+            let _guard = guard;
+            std::panic::resume_unwind(Box::new("a replayed finish panicked"))
+        });
+        finish
+    }));
+    // Both ran on this thread, in the record's order, and unwound no further than the replay.
+    let unwound = [dropped.recv_timeout(WAIT), dropped.recv_timeout(WAIT)];
+    assert_eq!(unwound, [Ok(0), Ok(1)]);
+    // The replay's lock is not left poisoned: the next read, submitted as a request, completes.
+    let file = rig.hello();
+    rig.defer(To::Session(file), READ, read(8, 4, 16));
+    await_posts(&posted, 1);
+    assert_eq!(delivered(&mut rig, 4), (s64(4), four_at(8)));
+    assert_eq!(replay.check(), Ok(()));
 }

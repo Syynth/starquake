@@ -26,6 +26,7 @@ use starquake_services::framework::control::{
     CONVERT_CURRENT_OBJECT_TO_DOMAIN, QUERY_POINTER_BUFFER_SIZE,
 };
 use starquake_services::framework::{DEFAULT_POINTER_BUFFER_SIZE, Protocol, Session};
+use starquake_services::fsp::halt::{Halt, Stop};
 use starquake_services::fsp::worker::{self, Recording, Workers};
 use starquake_services::fsp::{FspSrv, IFile, IFileSystem};
 use starquake_services::set::{self, FIRMWARE_VERSION_SIZE, FirmwareVersion, SetSys, layout};
@@ -92,13 +93,29 @@ impl ReadyServers {
     }
 }
 
+/// A halt for services whose test expects the environment never to fail: a stop fails the test.
+struct Unexpected;
+
+impl Halt for Unexpected {
+    fn halt(&self, stop: Stop) {
+        panic!("the run was told to stop: {stop}");
+    }
+}
+
 /// `fsp-srv`'s reads on its workers, over `env`, telling `ready`.
 fn reads_on(env: Arc<dyn Env>, ready: &Arc<ReadyServers>) -> Reads {
-    let workers = Workers::new(vec![env; worker::COUNT.get()], Recording::Off).unwrap();
+    let halt: Arc<dyn Halt> = Arc::new(Unexpected);
+    let workers = Workers::new(
+        vec![env; worker::COUNT.get()],
+        Recording::Off,
+        Arc::clone(&halt),
+    )
+    .unwrap();
     let ready: Arc<dyn Deliveries> = Arc::<ReadyServers>::clone(ready);
     Reads {
         executor: Arc::new(workers),
         ready,
+        halt,
     }
 }
 

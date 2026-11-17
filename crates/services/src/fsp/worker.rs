@@ -31,10 +31,23 @@
 //! [`COUNT`] is starquake's own choice, not the console's (which no pinned reference states): two,
 //! so that one long read does not hold up every other.
 //!
-//! A job or a finish that panics does not take its thread with it: the thread goes on to the next
-//! job. The panicking job's reply token is dropped as the panic unwinds, so its caller gets
-//! `DEFERRED_REPLY_DROPPED`, and a job that panics before it returns its [`Finish`] is not
-//! recorded (`a_job_that_panics_leaves_its_thread_to_run_the_next`).
+//! A job or a finish that panics does not take its thread with it: the thread catches the panic,
+//! logs it as an error naming the job, and goes on to the next job, so the pool never shrinks
+//! and no thread has to be replaced. The panicking job's reply token is dropped as the panic
+//! unwinds, so its caller gets `DEFERRED_REPLY_DROPPED` and never waits for ever, and a job that
+//! panics before it returns its [`Finish`] is not recorded
+//! (`a_job_that_panics_leaves_its_thread_to_run_the_next`, and with every thread at once,
+//! `a_panicking_job_on_every_thread_leaves_the_pool_whole`; the log is pinned in
+//! `crates/services/tests/fsp_job_panics.rs`).
+//!
+//! # When the environment fails a job
+//!
+//! A job's environment that fails it (an `EnvError`: a replay that ran out or disagreed) stops
+//! the run ([`halt`](super::halt)): at its first failure the job's environment tells the
+//! workers' [`Halt`] [`Stop::Job`], on the worker thread, before the job returns. Its
+//! [`Finish`] is then dropped without being called, which drops its reply token: the request is
+//! answered as one the server gave up on, which the guest never runs to see. The job is still
+//! recorded, with its failure (`an_environment_failure_in_a_read_stops_the_run`).
 //!
 //! Dropping [`Workers`] stops them and waits for every thread to end: a job running then runs to
 //! its end and is finished, and the jobs still queued are dropped without running, so each of
@@ -87,15 +100,28 @@
 //! replies are delivered in the recorded order with the recorded bytes
 //! (`a_replay_delivers_the_reads_in_the_recorded_order`).
 //!
-//! A replay that does not follow the record is a finding, not a guest-visible result (decision
-//! log, 2026-11-17, "Env failures"): [`Replay::check`] says how it first diverged
+//! A replay that does not follow the record stops the run, never a guest-visible result
+//! (decision log, 2026-11-17, "Env failures"): the replay's [`Halt`] is told [`Stop::Replay`],
+//! on the thread that submitted the job, and [`Replay::check`] says how it first diverged
 //! ([`ReplayError`]). A replayed job that reaches its recorded failure must ask what the live
 //! job asked when it failed (the same kind of call, and for host I/O the same request), or it
-//! has diverged too. A record that numbers one job twice is refused when the replay is made
-//! ([`RecordError`]).
-//! What becomes of the job's request then is not the guest's concern, since the run is no longer
-//! the recorded one: a job the record does not hold is dropped, and one whose reads differ from
-//! the record is finished with what the environment answered (`ReplayEnv`'s error).
+//! has diverged too; if it does ask that, it is answered with the recorded failure and the halt
+//! is told [`Stop::Job`], as the live run's was. A record that numbers one job twice is refused
+//! when the replay is made ([`RecordError`]).
+//!
+//! The halt is told when the replay finds the divergence: a job the record does not hold, when
+//! it is submitted; a job given an error answer (a question that differs from the record's, or
+//! one past it), when it is given it; a job that asked for fewer answers than the record holds,
+//! when it returns. Its request is then answered as one the server gave up on: a job the record
+//! does not hold is dropped without running, and a job that was told of a divergence or of its
+//! recorded failure has its [`Finish`] dropped without being called.
+//!
+//! A replayed job or finish that panics is caught on the submitting thread, as on a worker: it
+//! is logged as an error naming the job, its reply token is dropped as the panic unwinds, the
+//! replay's lock is not left poisoned for the next job, and the replay goes on to the jobs due
+//! after it (`a_job_that_panics_in_a_replay_does_not_unwind_into_its_submitter`). A job that
+//! panicked before it used every answer the record holds for it has diverged too (it asked for
+//! fewer).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::num::NonZeroUsize;
@@ -107,7 +133,8 @@ use starquake_trace::{
     Env, EnvCall, EnvError, EnvRecord, HostIoReply, HostIoRequest, HostNanos, ReplayEnv,
 };
 
-use crate::framework::{Executor, Job};
+use super::halt::{Halt, Stop};
+use crate::framework::{Executor, Finish, Job};
 
 /// How many threads `fsp-srv`'s [`Workers`] run (module docs, "The workers").
 pub const COUNT: NonZeroUsize = NonZeroUsize::MIN.saturating_add(1);
@@ -195,6 +222,25 @@ pub enum StartError {
     Thread(#[source] std::io::Error),
 }
 
+/// The message a worker or a replay logs, as an error with the job's number in its `job` field,
+/// when a job panics before it returns its [`Finish`] (module docs, "The workers").
+pub const JOB_PANICKED: &str = "a file-system job panicked";
+
+/// The message a worker or a replay logs, as an error with the job's number in its `job` field,
+/// when a job's [`Finish`] panics.
+pub const FINISH_PANICKED: &str = "a file-system job's finish panicked";
+
+/// Drops the finish of `job`, whose environment failed it, without calling it: its reply token
+/// is dropped, and the run has been told to stop (module docs, "When the environment fails a
+/// job").
+fn drop_unfinished(job: JobIndex, finish: Finish) {
+    tracing::error!(
+        job = job.raw(),
+        "the environment failed a file-system job: its request is dropped unanswered"
+    );
+    drop(finish);
+}
+
 /// A mutex's value, whatever a panicking holder left: every value here is valid between the
 /// steps that change it.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -226,6 +272,8 @@ struct Shared {
     /// The record. Its lock is also held while a job is finished, so the entries are in the
     /// order completions reached the mailbox.
     record: Mutex<Vec<Completed>>,
+    /// Told when a job's environment fails it (module docs, "When the environment fails a job").
+    halt: Arc<dyn Halt>,
 }
 
 impl Shared {
@@ -249,24 +297,21 @@ impl Shared {
 
     /// A worker thread's loop: run, finish and record jobs, each with the thread's own `env`,
     /// until the queue closes. A job or a finish that panics is logged, and the thread goes on
-    /// (module docs, "The workers").
+    /// (module docs, "The workers"); a job whose environment failed it is not finished (module
+    /// docs, "When the environment fails a job").
     fn work(&self, env: &dyn Env) {
         while let Some((job, run)) = self.next_job() {
-            let recorded = Recorded::new(env, self.recording);
+            let recorded = Recorded::new(env, self.recording, job, &*self.halt);
             let Ok(finish) = catch_unwind(AssertUnwindSafe(|| run(&recorded))) else {
-                tracing::error!(
-                    job = job.raw(),
-                    "a file-system job panicked: its request is dropped"
-                );
+                tracing::error!(job = job.raw(), "{JOB_PANICKED}: its request is dropped");
                 continue;
             };
             let (answers, failure) = recorded.into_record();
             let mut record = lock(&self.record);
-            if catch_unwind(AssertUnwindSafe(finish)).is_err() {
-                tracing::error!(
-                    job = job.raw(),
-                    "a file-system job's finish panicked: its request is dropped"
-                );
+            if failure.is_some() {
+                drop_unfinished(job, finish);
+            } else if catch_unwind(AssertUnwindSafe(finish)).is_err() {
+                tracing::error!(job = job.raw(), "{FINISH_PANICKED}: its request is dropped");
             }
             if self.recording == Recording::Kept {
                 record.push(Completed {
@@ -288,13 +333,18 @@ pub struct Workers {
 impl Workers {
     /// One thread per environment in `envs`, whose jobs read the host through that thread's
     /// environment alone, keeping a record of what they finish or not (module docs, "The
-    /// workers").
+    /// workers"), and telling `halt` when a job's environment fails it (module docs, "When the
+    /// environment fails a job").
     ///
     /// # Errors
     ///
     /// [`StartError::NoEnvironment`] when `envs` is empty, and [`StartError::Thread`] when the
     /// host cannot start a thread. The threads started before it are stopped and waited for.
-    pub fn new(envs: Vec<Arc<dyn Env>>, recording: Recording) -> Result<Self, StartError> {
+    pub fn new(
+        envs: Vec<Arc<dyn Env>>,
+        recording: Recording,
+        halt: Arc<dyn Halt>,
+    ) -> Result<Self, StartError> {
         if envs.is_empty() {
             return Err(StartError::NoEnvironment);
         }
@@ -307,6 +357,7 @@ impl Workers {
             queued: Condvar::new(),
             recording,
             record: Mutex::new(Vec::new()),
+            halt,
         });
         let mut workers = Self {
             shared,
@@ -371,19 +422,23 @@ impl Drop for Workers {
 
 /// The environment one job runs with on a worker: its thread's own, with every answer kept for
 /// the job's record when the workers keep one. The first error ends the job's use of the
-/// environment: it and every later call get that error, which is held whether or not answers
-/// are kept.
+/// environment: `halt` is told of it, and it and every later call get that error, which is held
+/// whether or not answers are kept.
 struct Recorded<'a> {
     env: &'a dyn Env,
     recording: Recording,
+    job: JobIndex,
+    halt: &'a dyn Halt,
     kept: Mutex<(Vec<EnvRecord>, Option<Failure>)>,
 }
 
 impl<'a> Recorded<'a> {
-    fn new(env: &'a dyn Env, recording: Recording) -> Self {
+    fn new(env: &'a dyn Env, recording: Recording, job: JobIndex, halt: &'a dyn Halt) -> Self {
         Self {
             env,
             recording,
+            job,
+            halt,
             kept: Mutex::new((Vec::new(), None)),
         }
     }
@@ -410,6 +465,10 @@ impl<'a> Recorded<'a> {
             Err(error) => {
                 kept.1 = Some(Failure {
                     asked: asked(),
+                    error: error.clone(),
+                });
+                self.halt.halt(Stop::Job {
+                    job: self.job.raw(),
                     error: error.clone(),
                 });
                 Err(error)
@@ -505,11 +564,15 @@ struct Replaying {
     next: u64,
     /// The first divergence.
     error: Option<ReplayError>,
+    /// Told when the replay diverges, or a job reaches its recorded failure (module docs,
+    /// "Replaying").
+    halt: Arc<dyn Halt>,
 }
 
 impl Replaying {
     /// Runs and finishes each job whose turn has come, in the record's order, until the next
-    /// one recorded has not been submitted yet.
+    /// one recorded has not been submitted yet. A job or finish that panics is caught and
+    /// logged, and the turn goes on (module docs, "Replaying").
     fn run_due(&mut self) {
         // Bounded by the record: each turn takes one entry from it.
         while let Some(due) = self.record.front().map(|entry| entry.job) {
@@ -519,15 +582,27 @@ impl Replaying {
             let Some(entry) = self.record.pop_front() else {
                 return;
             };
-            let env = Replayed::new(entry);
-            let finish = job(&env);
+            let env = Replayed::new(entry, due, Arc::clone(&self.halt));
+            let ran = catch_unwind(AssertUnwindSafe(|| job(&env)));
+            if ran.is_err() {
+                tracing::error!(job = due.raw(), "{JOB_PANICKED}: its request is dropped");
+            }
             if let Err(error) = env.check() {
-                self.error.get_or_insert(ReplayError::Diverged {
+                let diverged = ReplayError::Diverged {
                     job: due.raw(),
                     error,
-                });
+                };
+                env.tell(Stop::Replay(diverged.clone()));
+                self.error.get_or_insert(diverged);
             }
-            finish();
+            let Ok(finish) = ran else {
+                continue;
+            };
+            if env.told() {
+                drop_unfinished(due, finish);
+            } else if catch_unwind(AssertUnwindSafe(finish)).is_err() {
+                tracing::error!(job = due.raw(), "{FINISH_PANICKED}: its request is dropped");
+            }
         }
     }
 }
@@ -538,13 +613,14 @@ pub struct Replay {
 }
 
 impl Replay {
-    /// A replay of `record`, as [`Workers::take_record`] gave it.
+    /// A replay of `record`, as [`Workers::take_record`] gave it, telling `halt` when it leaves
+    /// the record or a job reaches its recorded failure (module docs, "Replaying").
     ///
     /// # Errors
     ///
     /// [`RecordError::Duplicate`] at the first entry whose job an earlier entry holds: a job
     /// is finished once, and a second entry would wait in front of the jobs after it forever.
-    pub fn new(record: Vec<Completed>) -> Result<Self, RecordError> {
+    pub fn new(record: Vec<Completed>, halt: Arc<dyn Halt>) -> Result<Self, RecordError> {
         let mut seen = BTreeSet::new();
         for (entry, completed) in record.iter().enumerate() {
             if !seen.insert(completed.job) {
@@ -560,6 +636,7 @@ impl Replay {
                 waiting: BTreeMap::new(),
                 next: 0,
                 error: None,
+                halt,
             }),
         })
     }
@@ -597,9 +674,11 @@ impl Executor for Replay {
                 job = index.raw(),
                 "the replay ran a file-system job the recorded run never finished"
             );
-            state
-                .error
-                .get_or_insert(ReplayError::Unrecorded { job: index.raw() });
+            let unrecorded = ReplayError::Unrecorded { job: index.raw() };
+            state.halt.halt(Stop::Replay(unrecorded.clone()));
+            state.error.get_or_insert(unrecorded);
+            // Dropped without running: its token answers as a request the server gave up on.
+            drop(job);
             return;
         }
         state.waiting.insert(index, job);
@@ -608,6 +687,8 @@ impl Executor for Replay {
 }
 
 /// The environment a replayed job runs with: its recorded answers, then its recorded failure.
+/// It tells the replay's halt, once, of the first error it answers with (module docs,
+/// "Replaying").
 struct Replayed {
     answers: ReplayEnv,
     count: usize,
@@ -615,35 +696,74 @@ struct Replayed {
     /// Whether the first call past the recorded answers asked what the recorded failure
     /// answered: `Ok` if it did, else how it differed. Every later call gets the same.
     reached: Mutex<Option<Result<(), EnvError>>>,
+    job: JobIndex,
+    halt: Arc<dyn Halt>,
+    /// Whether the halt has been told about this job.
+    told: Mutex<bool>,
 }
 
 impl Replayed {
-    fn new(entry: Completed) -> Self {
+    fn new(entry: Completed, job: JobIndex, halt: Arc<dyn Halt>) -> Self {
         Self {
             count: entry.answers.len(),
             answers: ReplayEnv::new(entry.answers),
             failure: entry.failure,
             reached: Mutex::new(None),
+            job,
+            halt,
+            told: Mutex::new(false),
         }
+    }
+
+    /// Tells the halt `stop`, unless it has been told about this job already.
+    fn tell(&self, stop: Stop) {
+        let mut told = lock(&self.told);
+        if !*told {
+            *told = true;
+            self.halt.halt(stop);
+        }
+    }
+
+    /// Whether the halt has been told about this job: its finish is then not called.
+    fn told(&self) -> bool {
+        *lock(&self.told)
     }
 
     /// `answer`, unless the recorded answers have run out where the recorded job failed: then
     /// the recorded failure, as the live job got it, if the job asked what the live job asked
-    /// then (`call`, and for host I/O `request`), and otherwise how its question differs.
+    /// then (`call`, and for host I/O `request`), and otherwise how its question differs. An
+    /// error answer tells the halt: the recorded failure as [`Stop::Job`], anything else as the
+    /// divergence it is.
     fn answer<T>(
         &self,
         call: EnvCall,
         request: Option<&HostIoRequest>,
         answer: Result<T, EnvError>,
     ) -> Result<T, EnvError> {
+        let diverged = |error: EnvError| {
+            self.tell(Stop::Replay(ReplayError::Diverged {
+                job: self.job.raw(),
+                error: error.clone(),
+            }));
+            Err(error)
+        };
         match (answer, &self.failure) {
             (Err(EnvError::Exhausted { index, .. }), Some(failure)) if index == self.count => {
-                let mut reached = lock(&self.reached);
-                let verdict = reached
+                let verdict = lock(&self.reached)
                     .get_or_insert_with(|| self.compare(failure, call, request))
                     .clone();
-                Err(verdict.err().unwrap_or_else(|| failure.error.clone()))
+                match verdict {
+                    Ok(()) => {
+                        self.tell(Stop::Job {
+                            job: self.job.raw(),
+                            error: failure.error.clone(),
+                        });
+                        Err(failure.error.clone())
+                    }
+                    Err(error) => diverged(error),
+                }
             }
+            (Err(error), _) => diverged(error),
             (answer, _) => answer,
         }
     }
