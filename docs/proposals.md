@@ -270,6 +270,25 @@ Notes for #185 (command 216 is still to build) and #194 are comments on those is
 | proposed | **`FlushDataCache` (0x2B)**: the homebrew gap trace in `crates/core/tests/homebrew.rs` now stops there | Scope review of #240 | area:kernel |
 | proposed | **Reads take turns under the `LiveEnv` lock** | Scope review of #241; a throughput note | area:core |
 
+### From wave 24 (ledger: #22)
+
+Filed from this wave under the delegation:
+- #257: `MapMemory` and `UnmapMemory`. The title now gets past appletOE command 10 and the application proxy's commands, then stops: `MapMemory` isn't built, so it fails, and the title calls `svcBreak`.
+- #258: appletOE application proxy commands 900 and 130 (auto-stubbed today), `IApplicationFunctions` 330, and the inputs of 320.
+- #259: destroy a gsv address space when its last as-gpu fd closes. Without it the 8 slots run out.
+- #260: snapshot and restore of the object table and handle tables.
+- #261: snapshot of touched guest pages, and the address space's `Map` recording point.
+
+#188 stays open for as-gpu `ModifyKind` and `Remap`, which wait for the first question below.
+
+| Status | Proposal | Why | Suggested |
+|---|---|---|---|
+| awaiting the owner | **Build or drop as-gpu `ModifyKind` (0xC) and `Remap` (0x14), and ctrl-gpu `QueryEvent` 1 and 2** | They come only from PR #4588, and row 30 shows Switch 2 never mapping through as-gpu. Building them needs an ordered kind change with no notification event, and as-gpu `AllocateSpace` allocations in `GpuMemory`. Today they fall to the unknown-ioctl policy, and `QueryEvent` 1 and 2 answer `BadParameter`, although the nvsrv docs promised them | gsv |
+| awaiting the owner | **Whether address-space restore should match live operations exactly**, using a table of the permissions each state allows | Scope review of #250. Restore refuses unknown bits and non-SVC permissions. It doesn't check per-state permission and attribute relations. For example, `Normal` or `CodeData` with RX is refused only by `SetMemoryPermission`, so a snapshot that has it restores as saved. Unknown `DisableMerge` bits also restore as saved | kernel |
+| awaiting the owner | **as-gpu's shim when a view's start equals its split** | Review of #188. starquake keeps PR's behaviour: the shim lands below the view's start, or at GPU address 0 for a one-page start, and the call succeeds. The module docs list the question | gsv |
+| awaiting the owner | **Which ctrl-gpu characteristics levels the SDK reads** | Review of #188. Three sources conflict: row 24 says every level at 0x70..0x80 is at least 6; PR has -1 at +0x74 and zeros from +0x7A; PR's channel level is 0x1D, but NX2's feature threshold is 0x1f. The module docs list all three | gsv |
+| proposed | **Move `Dispatcher::transfer_memory` next to `IpcContext::transfer_memory` in `dispatch/ipc.rs`** | #183 put it in `dispatch/hooks.rs` to stay inside its own files | area:kernel |
+
 ## House-rule candidates
 
 Rules distilled from review findings. A vetted rule moves into `CLAUDE.md`; until then it is
@@ -388,3 +407,14 @@ passed to build agents as a provisional rule for the next wave.
 | proposed | Per-session growth is bounded over a run's lifetime: closing a session cleans up what it armed or opened, with a test at the cap. |
 | proposed | A deferred change shows its pending state to every observer until it is applied; test the in-between state. |
 | proposed | Sibling slices that extend one shared struct, trait or drain add beside each other and never change each other's signatures. |
+
+### From wave 24 (ledger: #22)
+
+| Status | Candidate |
+|---|---|
+| proposed | Every multi-byte read of guest input is tested with values that differ only above the low byte, and with payloads one byte short at each width; a mutated read width fails a test. |
+| proposed | Every comparison is tested at equal, one below and one above, with a duplicate as well as a swapped pair; swapping the operator fails a test. |
+| proposed | Restore validation lists every field, id and cross-field relation that live operations enforce. Each one gets its own exact-error refusal, or is listed under "Not checked here". |
+| proposed | Every fallible step runs before the first write to guest memory or shared state. The failure test asserts nothing was touched and that the next attempt succeeds. |
+| proposed | A record, note or event the spec defines is emitted on every path that triggers it, including the case with no values, and a test expects it there. |
+| proposed | Every id read from a snapshot is checked against what the kernel actually made, including its kind and size, or listed as "not checked here". |
