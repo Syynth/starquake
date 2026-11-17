@@ -937,6 +937,59 @@ fn an_armed_wait_holds_one_watch_of_its_syncpoint() {
 }
 
 #[test]
+fn unwatch_cannot_take_an_armed_wait_s_watch() {
+    let shared = fresh();
+    let sp = id(50);
+    // A neighbour with an armed wait and a spare watch, so a hard-coded id would be caught.
+    let neighbour = id(51);
+    shared
+        .lock()
+        .arm(event(2), wait(51, 9, CompareMode::Wrapping32))
+        .unwrap();
+    shared.lock().watch(neighbour).unwrap();
+    shared
+        .lock()
+        .arm(event(1), wait(50, 2, CompareMode::Wrapping32))
+        .unwrap();
+    // The one watch is the wait's: refused, and nothing changes.
+    let error = shared.lock().unwatch(sp).unwrap_err();
+    assert_eq!(error, WatchError::HeldByWaits { id: sp, waits: 1 });
+    assert_eq!(
+        error.to_string(),
+        "syncpoint 50 has no waiters but its 1 armed waits"
+    );
+    assert_eq!(shared.lock().watchers(sp), 1);
+    assert!(shared.syncpoints().is_watched(sp));
+    // Another watcher's watch above the wait's can be given back, exactly down to the waits.
+    shared.lock().watch(sp).unwrap();
+    assert_eq!(shared.lock().unwatch(sp), Ok(()));
+    assert_eq!(shared.lock().watchers(sp), 1);
+    assert_eq!(
+        shared.lock().unwatch(sp),
+        Err(WatchError::HeldByWaits { id: sp, waits: 1 })
+    );
+    // The neighbour's spare watch is given back; its wait's is not.
+    assert_eq!(shared.lock().unwatch(neighbour), Ok(()));
+    assert_eq!(
+        shared.lock().unwatch(neighbour),
+        Err(WatchError::HeldByWaits {
+            id: neighbour,
+            waits: 1
+        })
+    );
+    // The wait still fires, and the state still saves.
+    shared.syncpoints().increment(sp);
+    shared.syncpoints().increment(sp);
+    let mut host = Host::default();
+    shared.drain(&mut host);
+    assert_eq!(host.2, [event(1)]);
+    assert_eq!(shared.lock().watchers(sp), 0);
+    assert!(shared.save().is_ok());
+    // With the wait gone, an id with no waiters is still `NotWatched`.
+    assert_eq!(shared.lock().unwatch(sp), Err(WatchError::NotWatched(sp)));
+}
+
+#[test]
 fn an_arm_that_cannot_watch_changes_nothing() {
     let shared = fresh();
     let sp = id(12);
@@ -1010,8 +1063,8 @@ fn a_change_fires_its_waits_after_its_note_in_event_order() {
 
 #[test]
 fn a_wait_fires_exactly_at_its_threshold_not_one_before() {
-    // Both modes, with the threshold across a wrap for the wrapping one: a counter at 2 has
-    // reached a threshold of 2 + 2^32 by the 32-bit comparison.
+    // Both modes, the wrapping one with its threshold's high half set (the counter itself does
+    // not wrap): a counter at 2 has reached a threshold of 2 + 2^32 by the 32-bit comparison.
     for (mode, threshold) in [
         (CompareMode::Wrapping32, 0x1_0000_0002),
         (CompareMode::Wide64, 2),

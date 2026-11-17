@@ -20,7 +20,9 @@
 //! the watch of the wait it replaces; [`Locked::disarm`] and the drain's firing give it back
 //! (`an_armed_wait_holds_one_watch_of_its_syncpoint`). Other watchers (the shared page, slice
 //! 5) may hold more watches, so a syncpoint's waiter count is at least its number of armed
-//! waits.
+//! waits. [`Locked::unwatch`] keeps it so: it refuses to take a watch an armed wait holds
+//! ([`WatchError::HeldByWaits`]), which would leave the wait's id unwatched and the wait never
+//! fired (`unwatch_cannot_take_an_armed_wait_s_watch`).
 //!
 //! # The watched-id fast path
 //!
@@ -209,6 +211,15 @@ pub enum WatchError {
     /// The syncpoint has no waiter to remove.
     #[error("syncpoint {} has no waiters", .0.get())]
     NotWatched(SyncpointId),
+    /// Every waiter left on the syncpoint is the watch of an armed wait, which only disarming
+    /// or firing the wait gives back (module docs, "The pieces").
+    #[error("syncpoint {} has no waiters but its {waits} armed waits", .id.get())]
+    HeldByWaits {
+        /// The syncpoint.
+        id: SyncpointId,
+        /// The waits armed on it, each holding one of its waiters.
+        waits: usize,
+    },
 }
 
 /// gsv's shared state, locked: [`GsvShared`] and the syncpoints it watches (module docs, "The
@@ -236,9 +247,27 @@ impl Locked<'_> {
         Ok(self.syncpoints.read(id))
     }
 
-    /// Removes a waiter on syncpoint `id`, marking it not watched if that was the last. Nothing
+    /// Removes a waiter on syncpoint `id`, marking it not watched if that was the last. It
+    /// refuses, in this order, an id with no waiters ([`WatchError::NotWatched`]) and one whose
+    /// waiters are all armed waits' watches ([`WatchError::HeldByWaits`]): a wait's watch is
+    /// given back only by disarming or firing the wait (module docs, "The pieces"). Nothing
     /// changes on an error.
     pub fn unwatch(&mut self, id: SyncpointId) -> Result<(), WatchError> {
+        let count = self.watchers(id);
+        if count == 0 {
+            return Err(WatchError::NotWatched(id));
+        }
+        let waits = self.state.waiters.on(id);
+        if usize::try_from(count).is_ok_and(|count| count <= waits) {
+            return Err(WatchError::HeldByWaits { id, waits });
+        }
+        self.drop_watch(id)
+    }
+
+    /// Removes a waiter on syncpoint `id` without the armed-wait check, marking it not watched
+    /// if that was the last: for giving back the watch of a wait already out of the table, and
+    /// for [`Locked::unwatch`] once it has checked. Nothing changes on an error.
+    fn drop_watch(&mut self, id: SyncpointId) -> Result<(), WatchError> {
         let count = self
             .state
             .watchers
@@ -281,10 +310,11 @@ impl Locked<'_> {
         fired
     }
 
-    /// Gives back the watch a wait on `id` held. A wait always holds one, so a refusal means
-    /// gsv's own bookkeeping is wrong: it is logged as an error.
+    /// Gives back the watch a wait on `id` held, once the wait is out of the table. A wait
+    /// always holds one, so a refusal means gsv's own bookkeeping is wrong: it is logged as an
+    /// error.
     fn release(&mut self, id: SyncpointId) {
-        if let Err(error) = self.unwatch(id) {
+        if let Err(error) = self.drop_watch(id) {
             tracing::error!(%error, "gsv: an armed wait held no watch of its syncpoint");
         }
     }
