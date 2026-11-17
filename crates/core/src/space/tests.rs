@@ -50,9 +50,15 @@ fn unmapped_at(space: &AddressSpace<FlatMemory>, va: u64) -> bool {
     matches!(space.tables.walk(va), Err(WalkError::Unmapped { .. }))
 }
 
-/// What [`snapshot`] takes: the next page of RAM, the mappings, the backed pages, and how
-/// many table pages are in use.
-type Snapshot = (u64, Vec<(u64, Mapped)>, Vec<(u64, u64)>, u64);
+/// What [`snapshot`] takes: the next page of RAM, the mappings, the backed pages, the runs of
+/// RAM handed out as shared memory, and how many table pages are in use.
+type Snapshot = (
+    u64,
+    Vec<(u64, Mapped)>,
+    Vec<(u64, u64)>,
+    Vec<(u64, u64)>,
+    u64,
+);
 
 /// Everything the tests can see of an address space, for "nothing changed".
 fn snapshot(space: &AddressSpace<FlatMemory>) -> Snapshot {
@@ -61,6 +67,7 @@ fn snapshot(space: &AddressSpace<FlatMemory>) -> Snapshot {
         shadow.next,
         shadow.mapped.iter().map(|(k, v)| (*k, *v)).collect(),
         shadow.backed.iter().map(|(k, v)| (*k, *v)).collect(),
+        shadow.shared.iter().map(|(k, v)| (*k, *v)).collect(),
         space.tables.table_pages_in_use(),
     )
 }
@@ -664,3 +671,5 @@ fn the_kernels_mapper_drives_the_address_space_and_reports_refusals_in_words() {
         )
     );
 }
+
+mod shared;

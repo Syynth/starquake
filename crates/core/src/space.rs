@@ -41,7 +41,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use starquake_kernel::memory::{Mapper, MapperError};
+use starquake_kernel::memory::{Mapper, MapperError, SharedPages};
 use starquake_memory::stage1::{Stage1Tables, TableRoot, VA_SPACE_END};
 use starquake_memory::{
     Access, BackingRange, Fault, GuestMemory, MapError, PAGE_SIZE, Perms, Translation,
@@ -54,13 +54,25 @@ pub enum SpaceError {
     /// not one the address space can map, unmap or reprotect.
     #[error("the guest's translation tables refused a mapping: {0}")]
     Map(#[from] MapError),
-    /// Guest RAM has fewer bytes left than a page needs.
+    /// Guest RAM has fewer bytes left than a page, or a shared memory, needs.
     #[error("mapping {size:#x} bytes needs more guest RAM than the {available:#x} bytes left")]
     OutOfRam {
         /// Bytes needed.
         size: u64,
         /// Bytes of guest RAM not yet handed out.
         available: u64,
+    },
+    /// Pages a shared mapping names are not the pages of one shared memory this address
+    /// space handed out ([`AddressSpace::allocate_shared`]).
+    #[error(
+        "the {size:#x} bytes of guest RAM at {base:#x} are not a shared memory this address \
+         space handed out"
+    )]
+    NotShared {
+        /// The first guest-physical address of the pages.
+        base: u64,
+        /// Their size in bytes.
+        size: u64,
     },
 }
 
@@ -96,6 +108,9 @@ struct Shadow {
     mapped: BTreeMap<u64, Mapped>,
     /// The pages that have backing: virtual page address to guest-physical page address.
     backed: BTreeMap<u64, u64>,
+    /// The runs of RAM handed out as shared memory, by first guest-physical address: one past
+    /// the last address of each.
+    shared: BTreeMap<u64, u64>,
 }
 
 impl Shadow {
@@ -228,6 +243,7 @@ impl<M: GuestMemory> AddressSpace<M> {
                 next: ram.base(),
                 mapped: BTreeMap::new(),
                 backed: BTreeMap::new(),
+                shared: BTreeMap::new(),
             }),
         })
     }
@@ -320,22 +336,80 @@ impl<M: GuestMemory> AddressSpace<M> {
         Ok(())
     }
 
+    /// The next `size` bytes of RAM not handed out yet, which the caller takes by moving
+    /// `shadow.next` past them once nothing else can fail. RAM starts out zeroed and is never
+    /// handed out twice, so they read as zero.
+    ///
+    /// The size is checked before the room: a size that is not whole pages
+    /// ([`MapError::MisalignedSize`]) or is zero ([`MapError::Empty`]) is refused as that,
+    /// however much RAM is left; then [`SpaceError::OutOfRam`] when fewer than `size` bytes
+    /// are left.
+    fn next_ram(&self, shadow: &Shadow, size: u64) -> Result<BackingRange, SpaceError> {
+        if !size.is_multiple_of(PAGE_SIZE) {
+            return Err(MapError::MisalignedSize { size }.into());
+        }
+        if size == 0 {
+            return Err(MapError::Empty.into());
+        }
+        let available = self.ram.end().saturating_sub(shadow.next);
+        if available < size {
+            return Err(SpaceError::OutOfRam { size, available });
+        }
+        Ok(BackingRange::new(shadow.next, size)?)
+    }
+
     /// Gives the page at `page` a zeroed page of RAM and a table entry with `perms`.
     fn back(&self, shadow: &mut Shadow, page: u64, perms: Perms) -> Result<u64, SpaceError> {
-        let available = self.ram.end().saturating_sub(shadow.next);
-        if available < PAGE_SIZE {
-            return Err(SpaceError::OutOfRam {
-                size: PAGE_SIZE,
-                available,
+        let pages = self.next_ram(shadow, PAGE_SIZE)?;
+        self.tables.map(page, pages, perms)?;
+        shadow.next = pages.end();
+        shadow.backed.insert(page, pages.base());
+        Ok(pages.base())
+    }
+
+    /// Hands out `size` bytes of RAM as the pages of one shared memory: one run, zeroed, that
+    /// nothing else is handed out from, and that [`Self::map_shared`] maps. Maps nothing
+    /// itself. Refused as [`Self::next_ram`] says, with nothing changed.
+    pub(crate) fn allocate_shared(&self, size: u64) -> Result<BackingRange, SpaceError> {
+        let mut shadow = self.shadow();
+        let pages = self.next_ram(&shadow, size)?;
+        shadow.next = pages.end();
+        shadow.shared.insert(pages.base(), pages.end());
+        Ok(pages)
+    }
+
+    /// Records that guest code may use the pages of the shared memory `pages` at `va` as
+    /// `perms` allows, and gives every page its table entry at once: the pages exist already,
+    /// so nothing waits for a touch. Nothing may be mapped there.
+    ///
+    /// Checked in this order, and refused with nothing changed: the range
+    /// ([`MapError`], as for [`Self::map`]); then the pages, which must be exactly one run
+    /// [`Self::allocate_shared`] handed out ([`SpaceError::NotShared`]); then what is mapped
+    /// ([`MapError::AlreadyMapped`]); then the tables ([`MapError::OutOfTablePages`] among
+    /// them).
+    pub(crate) fn map_shared(
+        &self,
+        va: u64,
+        pages: BackingRange,
+        perms: Perms,
+    ) -> Result<(), SpaceError> {
+        let end = Self::range_end(va, pages.size())?;
+        let mut shadow = self.shadow();
+        if shadow.shared.get(&pages.base()) != Some(&pages.end()) {
+            return Err(SpaceError::NotShared {
+                base: pages.base(),
+                size: pages.size(),
             });
         }
-        // RAM starts out zeroed and is never handed out twice, so the page reads as zero.
-        let pa = shadow.next;
-        self.tables
-            .map(page, BackingRange::new(pa, PAGE_SIZE)?, perms)?;
-        shadow.next = pa + PAGE_SIZE;
-        shadow.backed.insert(page, pa);
-        Ok(pa)
+        if let Some(taken) = shadow.first_mapped(va, end) {
+            return Err(MapError::AlreadyMapped { va: taken }.into());
+        }
+        self.tables.map(va, pages, perms)?;
+        shadow.mapped.insert(va, Mapped { end, perms });
+        let virtual_pages = (va..end).step_by(PAGE_STEP);
+        let physical_pages = (pages.base()..pages.end()).step_by(PAGE_STEP);
+        shadow.backed.extend(virtual_pages.zip(physical_pages));
+        Ok(())
     }
 
     /// Decides what a guest access that faulted at `address` comes to (see [`Touch`]), and
@@ -443,6 +517,22 @@ fn refused(error: SpaceError) -> MapperError {
     MapperError(error.to_string())
 }
 
+/// The guest-physical memory an address space's tables and backing lie in, addressed by
+/// guest-physical address: what the [`SharedPages`] of a shared memory it handed out read and
+/// write through. [`SharedPages`] keeps each access inside its own pages.
+#[derive(Debug)]
+struct Physical<M>(Arc<AddressSpace<M>>);
+
+impl<M: GuestMemory> GuestMemory for Physical<M> {
+    fn read(&self, pa: u64, buf: &mut [u8]) -> Result<(), Fault> {
+        self.0.tables.memory().read(pa, buf)
+    }
+
+    fn write(&self, pa: u64, data: &[u8]) -> Result<(), Fault> {
+        self.0.tables.memory().write(pa, data)
+    }
+}
+
 impl<M: GuestMemory + 'static> Mapper for SpaceMapper<M> {
     fn map(&mut self, address: u64, size: u64, perms: Perms) -> Result<(), MapperError> {
         self.0.map(address, size, perms).map_err(refused)
@@ -454,6 +544,23 @@ impl<M: GuestMemory + 'static> Mapper for SpaceMapper<M> {
 
     fn protect(&mut self, address: u64, size: u64, perms: Perms) -> Result<(), MapperError> {
         self.0.protect(address, size, perms).map_err(refused)
+    }
+
+    fn allocate_shared(&mut self, size: u64) -> Result<SharedPages, MapperError> {
+        let pages = self.0.allocate_shared(size).map_err(refused)?;
+        Ok(SharedPages::new(
+            pages,
+            Arc::new(Physical(Arc::clone(&self.0))),
+        ))
+    }
+
+    fn map_shared(
+        &mut self,
+        address: u64,
+        backing: BackingRange,
+        perms: Perms,
+    ) -> Result<(), MapperError> {
+        self.0.map_shared(address, backing, perms).map_err(refused)
     }
 }
 
