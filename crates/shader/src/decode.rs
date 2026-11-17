@@ -105,6 +105,21 @@ pub enum DecodeError {
 
 /// Decodes one instruction.
 pub fn decode(word: Instruction) -> Result<Instr, DecodeError> {
+    let (opcode, instr, reader) = read(word)?;
+    let unread = reader.unread();
+    if unread != 0 {
+        return Err(DecodeError::UnknownBit {
+            opcode,
+            bit: unread.trailing_zeros(),
+        });
+    }
+    Ok(instr)
+}
+
+/// Steps 1 to 4 of [`decode`]: the opcode, the instruction the form's function reads, and the
+/// reader, which knows the bits read. [`decode`] adds step 5; the tests' `bits_read` runs these
+/// same steps, so its oracle cannot drift from the decoder's checks.
+fn read(word: Instruction) -> Result<(u16, Instr, Reader), DecodeError> {
     // Cannot fail: the field is 12 bits wide.
     let opcode = u16::try_from(word.field(OPCODE)).unwrap_or(u16::MAX);
     let form = lookup(opcode).ok_or(DecodeError::UnknownOpcode { opcode })?;
@@ -125,27 +140,12 @@ pub fn decode(word: Instruction) -> Result<Instr, DecodeError> {
     let mut reader = Reader::new(word);
     let guard = reader.guard();
     let op = (form.decode)(&mut reader)?;
-    let unread = reader.unread();
-    if unread != 0 {
-        return Err(DecodeError::UnknownBit {
-            opcode,
-            bit: unread.trailing_zeros(),
-        });
-    }
-    Ok(Instr { guard, op })
+    Ok((opcode, Instr { guard, op }, reader))
 }
 
-/// The bits the form's function reads from `word`, when `word` has a form, no bit outside its
-/// mask and every fixed bit, and the function accepts it: what step 5 checks against.
+/// The bits the form's function reads from `word`, when steps 1 to 4 of [`decode`] accept it:
+/// what step 5 checks against.
 #[cfg(test)]
 pub(crate) fn bits_read(word: Instruction) -> Option<u128> {
-    let opcode = u16::try_from(word.field(OPCODE)).ok()?;
-    let form = lookup(opcode)?;
-    if word.bits() & !form.known != 0 || form.fixed & !word.bits() != 0 {
-        return None;
-    }
-    let mut reader = Reader::new(word);
-    reader.guard();
-    (form.decode)(&mut reader).ok()?;
-    Some(reader.read())
+    read(word).ok().map(|(_, _, reader)| reader.read())
 }
