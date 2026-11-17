@@ -34,8 +34,8 @@
 //!    bound buffer reads its index (bits 54..59) and a bindless one its uniform register (bits
 //!    32..38), so a word with the other layout's bits set fails here.
 //!
-//! Step 5 makes every accepted word re-assemble to itself, scheduling bits aside
-//! (`tests::decode_then_assemble_round_trips`). PR #4588's table lets those layout bits through
+//! Step 5 is what lets an accepted word re-assemble to itself, scheduling bits aside
+//! (`tests::decode_then_assemble_round_trips` checks it on generated words of every form). PR #4588's table lets those layout bits through
 //! (its rows are one mask per opcode); its translator rejects them, as it records the bits it
 //! takes (`visitor.cpp`, `Visitor::Take`). The scheduling bits 105..128 are part of every mask
 //! and are not decoded: they encode stalls and dependency barriers, which NAK computes for
@@ -46,8 +46,8 @@
 //! uniform-register forms require bit 91 (the table marks it known; the PR's translator
 //! requires it set, `Visitor::WideSlot`: "native uniform source flag"); `MOV`'s forms 2, 3 and
 //! 7, which the table has rows for, are unknown opcodes here (see `op::integer`). Pinned by
-//! `tests::mov_rejects_source_modifier_bits`, `tests::uniform_forms_require_bit_91` and
-//! `tests::masks_match_the_reference_table`.
+//! `tests::mov_rejects_source_modifier_bits`, `tests::framework::uniform_forms_require_bit_91`,
+//! `tests::unknown_opcodes_name_the_opcode` and `tests::masks_match_the_reference_table`.
 
 mod alu;
 mod fields;

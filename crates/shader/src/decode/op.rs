@@ -22,9 +22,13 @@
 //! forms of the ALU instructions such as `UMOV`, `ULDC` and `UPLOP3` as the vector op with
 //! uniform operands), the variant is NAK's and the slice adds the field that tells them apart.
 //! That split of the uniform forms is NAK's model, not a fact of the encoding; slice 6d may
-//! revisit it. The instructions only PR #4588 knows (`BRX`, `JMX`, `CALL`, `RET`, `DEPBAR`,
-//! `P2R`, `R2P`, `FSEL`, `I2FP`, `UP2UR`, `LDGSTS`, `LDGDEPBAR`, `BPT`) get variants of their
-//! own, named in NAK's style.
+//! revisit it (NAK: `impl SM70Op for OpMov` encodes a uniform `MOV` as `0xc82`, `OpAtom` without
+//! a destination as `RED`, `OpSuAtom` without one as `SURED`; `nvdisasm_tests.rs`, `test_ldc`,
+//! prints a uniform `OpLdc` as `uldc`). The instructions NAK has no op for get variants of their
+//! own, named in NAK's style: `BRX`, `CALL`, `RET`, `DEPBAR`, `P2R`, `R2P`, `FSEL`, `I2FP`,
+//! `LDGSTS` and `LDGDEPBAR`, which PR #4588's table has rows for (`ampere_isa_table.h`), and
+//! `JMX`, `UP2UR` and `BPT`, which only the spec's slice list names (their slices need a source
+//! for their encodings).
 //!
 //! An instruction its slice has not built yet is a **shell**: an empty struct that prints its
 //! mnemonic, which no decode form produces and the test assembler refuses

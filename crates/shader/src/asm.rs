@@ -136,7 +136,7 @@ impl Writer {
     }
 
     /// Sets `field` to `value` in two's complement, which must be in the field's signed range
-    /// (`width` from 1 to 64).
+    /// (`width` from 1 to 64; a zero-width field holds no value).
     #[cfg_attr(
         not(test),
         expect(
@@ -152,11 +152,10 @@ impl Writer {
     ) -> Result<(), EncodeError> {
         let unused = 64_u32.saturating_sub(field.width);
         // In range exactly when shifting the sign bit to bit 63 and back is lossless.
-        let in_range = field.width >= 1
-            && value
-                .checked_shl(unused)
-                .and_then(|shifted| shifted.checked_shr(unused))
-                == Some(value);
+        let in_range = value
+            .checked_shl(unused)
+            .and_then(|shifted| shifted.checked_shr(unused))
+            == Some(value);
         if !in_range {
             return Err(EncodeError::OutOfRange {
                 what,

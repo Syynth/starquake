@@ -5,7 +5,8 @@
 //! fields. Each instruction group lists its forms in its module under `op` (`FORMS`), and
 //! [`GROUPS`] joins the lists; [`lookup`] indexes them by opcode through a table built at compile
 //! time, as PR #4588's `IsaTable` does (`eden-pr4588/src/shader_recompiler/frontend/ampere/isa.h`
-//! @ e5fb3b97). No two forms share an opcode (`tests::forms_have_distinct_opcodes`).
+//! @ e5fb3b97). No two forms share an opcode
+//! (`decode::tests::framework::forms_have_distinct_opcodes_and_lookup_finds_each`).
 //!
 //! The [`Reader`] records every bit a decode function reads, the way PR #4588's translator
 //! records the bits it takes (`visitor.cpp`, `Visitor::Take`): after the form's function has
