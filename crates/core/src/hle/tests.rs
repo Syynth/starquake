@@ -221,8 +221,9 @@ fn every_service_has_its_name_and_no_other_number_has_one() {
     assert_eq!(service_name(APPLET_OE), Some("appletOE"));
     assert_eq!(service_name(HID), Some("hid"));
     assert_eq!(service_name(TIME_U), Some("time:u"));
+    assert_eq!(service_name(GSV_ROOT), Some("gsv"));
     assert_eq!(service_name(ServiceId(0)), None);
-    assert_eq!(service_name(ServiceId(8)), None);
+    assert_eq!(service_name(ServiceId(9)), None);
 }
 
 #[test]
@@ -598,6 +599,105 @@ fn applet_oe_serves_the_start_up_with_real_events() {
         );
     }
 }
+
+/// The graphics server's root through the real dispatcher: `appletOE`'s `ISelfController` 2000
+/// copies a handle to a session on the root's server, which is not on a port, and the title's
+/// first TIPC request on it, the bootstrap's `Initialize`, laid out as Eden PR #4588's
+/// `DecodeBootstrap` reads it (`eden-pr4588/.../graphics_supervisor_protocol.h` @ e5fb3b97), is
+/// answered with success.
+#[test]
+fn applet_oe_hands_out_the_graphics_server_s_root() {
+    use starquake_gsv::protocol::{bootstrap, command};
+    use starquake_ipc::TIPC_COMMAND_OFFSET;
+
+    let rig = Rig::new();
+    let oe = rig.service(am::OE_NAME);
+    let root = rig.convert(oe);
+    let (code, buffer) = rig.send(oe, &open_proxy(root, Handle::CURRENT_PROCESS));
+    let (_, _, objects) = domain_reply(&buffer, 0);
+    assert_eq!(code, ResultCode::SUCCESS);
+    let proxy_interface = am::IApplicationProxy::default();
+    let (_, buffer) = rig.send(
+        oe,
+        &domain(objects[0], &proxy_interface, "get_self_controller"),
+    );
+    let (_, _, controller) = domain_reply(&buffer, 0);
+    let ask = domain(
+        controller[0],
+        &am::ISelfController,
+        "get_graphics_supervisor",
+    );
+    let (code, buffer) = rig.send(oe, &ask);
+    assert_eq!(code, ResultCode::SUCCESS);
+    let message = Message::parse_reply_sized(&buffer, SessionKind::Domain, 0).unwrap();
+    assert_eq!(message.move_handles, Vec::<u32>::new());
+    let gsv = Handle::from_raw(message.copy_handles[0]);
+
+    // `Initialize`: one copied handle (the process) and twelve data words.
+    let mut words = vec![
+        u32::from(TIPC_COMMAND_OFFSET) + command::INITIALIZE,
+        0x8000_000C,
+        2,
+        Handle::CURRENT_PROCESS.raw(),
+    ];
+    let flags = bootstrap::LOCAL_FLAGS[0];
+    let fields = [PROCESS_ID_WORD, flags, 0, 0, 0, 0];
+    for field in fields {
+        let bytes = field.to_le_bytes();
+        words.push(u32::from_le_bytes(bytes[..4].try_into().unwrap()));
+        words.push(u32::from_le_bytes(bytes[4..].try_into().unwrap()));
+    }
+    let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let mut message = [0; BUFFER_SIZE];
+    message[..bytes.len()].copy_from_slice(&bytes);
+    rig.memory.write(TLS, &message).unwrap();
+    let regs = rig.call(SvcId::SendSyncRequest, u64::from(gsv.raw()), 0);
+    assert_eq!(result(&regs), ResultCode::SUCCESS);
+    rig.memory.read(TLS, &mut message).unwrap();
+    let reply = Message::parse_reply(&message, SessionKind::Session).unwrap();
+    let starquake_ipc::Body::TipcReply { result, data } = reply.body else {
+        unreachable!("not a TIPC reply: {:?}", reply.body);
+    };
+    assert_eq!((result, data.len()), (ResultCode::SUCCESS.raw(), 0));
+    // The request reached the root's server, after the requests to `sm:` and `appletOE`.
+    assert_eq!(rig.ipc().last(), Some(&(GSV_ROOT, command::INITIALIZE)));
+
+    // Not on a port: only `sm:` is.
+    let tables = rig.dispatcher.into_tables();
+    let ipc = tables.scheduler.ipc();
+    let server = ipc.service(GSV_ROOT).unwrap();
+    assert_eq!(ipc.server_name(server), Ok(root::ROOT_NAME));
+    assert_eq!(ipc.port(&PortName::new(root::ROOT_NAME).unwrap()), None);
+}
+
+/// The graphics server's root is a private entry: `GetService("gsv")` through `sm:` hands out
+/// the service manager's own stub (auto-stub policy), and a request on that session is served
+/// by `sm:`, never by [`GSV_ROOT`].
+#[test]
+fn get_service_never_hands_out_the_graphics_server_s_root() {
+    let rig = Rig::new();
+    let session = rig.service(root::ROOT_NAME);
+    let (code, buffer) = rig.send(
+        session,
+        &libnx(starquake_gsv::protocol::command::INITIALIZE),
+    );
+    assert_eq!(code, ResultCode::SUCCESS);
+    // Auto-stubbed by `sm:`'s server: success, nothing more.
+    let (word, data, moved) = reply(&buffer, 0);
+    assert_eq!((word, data, moved), (0, Vec::new(), Vec::new()));
+    let ipc = rig.ipc();
+    assert_eq!(
+        ipc.last(),
+        Some(&(SM, starquake_gsv::protocol::command::INITIALIZE))
+    );
+    assert!(
+        ipc.iter().all(|(service, _)| *service != GSV_ROOT),
+        "{ipc:?}"
+    );
+}
+
+/// Any applet resource user id the bootstrap names: the root does not check it.
+const PROCESS_ID_WORD: u64 = 0x0000_0051_0000_0001;
 
 /// `hid` as libnx starts it (`_hidInitialize`): `CreateAppletResource` hands out a session, and
 /// its `GetSharedMemoryHandle` a copied handle to a shared memory.

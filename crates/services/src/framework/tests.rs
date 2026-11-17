@@ -25,6 +25,7 @@ use crate::commands;
 
 mod buffers;
 mod control;
+mod copied;
 mod deferred;
 mod domain;
 mod graphics_kernel;

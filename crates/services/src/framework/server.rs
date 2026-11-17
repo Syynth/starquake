@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use serde::de::DeserializeOwned;
 use starquake_ipc::{
     BUFFER_SIZE, Body, CmifRequest, CommandType, IpcError, Message, ReplyBuilder, SessionKind,
 };
@@ -19,13 +20,13 @@ use super::defer::{Completed, Deferral, Framing, Mailbox, Notify, Pending, Poste
 use super::kernel::Kernel;
 use super::payload::Writer;
 use super::queue::{Admission, QueueError, RequestQueue};
-use super::reply::{Moved, Reply};
+use super::reply::{Copied, Moved, Reply};
 use super::request::Request;
 use super::result::{
     Completion, DEFERRED_REPLY_DROPPED, Fault, NOT_SUPPORTED, OUT_OF_DOMAIN_ENTRIES,
     TARGET_NOT_FOUND, UNKNOWN_COMMAND_ID,
 };
-use super::snapshot::{Family, Interfaces};
+use super::snapshot::{Family, Interfaces, SnapshotError, decode};
 use super::targets::{Domain, TargetError, TargetId, Targets};
 use super::trace::{self, Asked};
 use super::work::Executor;
@@ -261,6 +262,10 @@ struct Call<'m> {
 /// Makes the root interface of a new session.
 type Root = Box<dyn Fn() -> Box<dyn Session> + Send>;
 
+/// Checks a snapshot's family state (its bytes) against the server's own before a restore
+/// loads it: see [`Server::with_checked_family`].
+pub(super) type FamilyCheck = Box<dyn Fn(&dyn Family, &[u8]) -> Result<(), SnapshotError> + Send>;
+
 /// One service family's sessions and the interfaces behind them: the Rust side of a server
 /// (`docs/specs/services.md`, "Concurrency").
 ///
@@ -275,6 +280,8 @@ pub struct Server {
     root: Option<Root>,
     pub(super) interfaces: Interfaces,
     pub(super) family: Option<Box<dyn Family>>,
+    /// The check a snapshot's family state must pass before it is loaded; not saved.
+    pub(super) family_check: Option<FamilyCheck>,
     pub(super) sessions: BTreeMap<ObjectId, TargetId>,
     pub(super) targets: Targets,
     pub(super) queue: RequestQueue,
@@ -304,6 +311,7 @@ impl Server {
             root: None,
             interfaces: Interfaces::new(),
             family: None,
+            family_check: None,
             sessions: BTreeMap::new(),
             targets: Targets::default(),
             queue: RequestQueue::new(),
@@ -355,6 +363,33 @@ impl Server {
     #[must_use]
     pub fn with_family(mut self, family: impl Family) -> Self {
         self.family = Some(Box::new(family));
+        self.family_check = None;
+        self
+    }
+
+    /// Sets the family's own state, as [`Server::with_family`], with a check that
+    /// [`Server::restore`] runs before it loads a snapshot's family state: `check` is given
+    /// the server's state and the snapshot's, and an `Err` refuses the snapshot with
+    /// [`SnapshotError::FamilyWiring`], leaving the server as it was. It is for state that is
+    /// the run's wiring rather than the guest's (a number another server is known by), which
+    /// a snapshot must agree with but cannot change. A later [`Server::with_family`] drops the
+    /// check.
+    #[must_use]
+    pub fn with_checked_family<T: Family + DeserializeOwned>(
+        mut self,
+        family: T,
+        check: fn(&T, &T) -> Result<(), &'static str>,
+    ) -> Self {
+        self.family = Some(Box::new(family));
+        self.family_check = Some(Box::new(move |current: &dyn Family, saved: &[u8]| {
+            let current: &dyn core::any::Any = current;
+            // The check is set with the family and dropped with it, so the family is a `T`.
+            let current = current
+                .downcast_ref::<T>()
+                .ok_or(SnapshotError::FamilyMismatch)?;
+            let saved: T = decode(saved).map_err(SnapshotError::Decode)?;
+            check(current, &saved).map_err(SnapshotError::FamilyWiring)
+        }));
         self
     }
 
@@ -984,8 +1019,13 @@ impl Server {
             }
         }
         let mut builder = frame.reply(ResultCode::SUCCESS).data(payload.as_bytes());
-        for object in copies {
-            builder = builder.copy_handle(kernel.insert_handle(object)?.raw());
+        for copied in copies {
+            let handle = match copied {
+                Copied::Object(object) => kernel.insert_handle(object)?,
+                Copied::Session(session) => self.open_new(kernel, session)?,
+                Copied::Service(service) => kernel.connect(service)?.1,
+            };
+            builder = builder.copy_handle(handle.raw());
         }
         let mut objects = Vec::new();
         for moved in moves {
