@@ -144,8 +144,8 @@ svc_ids! {
     GetInfo = 0x29, Implemented;
     FlushEntireDataCache = 0x2a, Planned;
     FlushDataCache = 0x2b, Planned;
-    MapPhysicalMemory = 0x2c, Planned;
-    UnmapPhysicalMemory = 0x2d, Planned;
+    MapPhysicalMemory = 0x2c, Implemented;
+    UnmapPhysicalMemory = 0x2d, Implemented;
     GetDebugFutureThreadInfo = 0x2e, Planned;
     GetLastThreadInfo = 0x2f, Planned;
     GetResourceLimitLimitValue = 0x30, Planned;
@@ -340,6 +340,8 @@ mod tests {
                 | SvcId::Break
                 | SvcId::OutputDebugString
                 | SvcId::GetInfo
+                | SvcId::MapPhysicalMemory
+                | SvcId::UnmapPhysicalMemory
                 | SvcId::SetGpuMemoryAttribute
                 // Not a retail call, but the kernel spec builds events (kernel slice 4).
                 | SvcId::CreateEvent => Status::Implemented,

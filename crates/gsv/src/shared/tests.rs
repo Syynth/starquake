@@ -7,12 +7,15 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use starquake_gpu::interface::{ChannelId, Completions, Ticket};
+use starquake_gpu::syncpoint::CompareMode;
 use starquake_kernel::id::ObjectId;
 use starquake_kernel::ipc::EventHook;
+use starquake_kernel::result::KernelError;
 use starquake_kernel::slab::SlabId;
 
 use super::*;
 use crate::completion::testing::{locks, released, token};
+use crate::syncpt::waiters::{MODE_WIDE_64, MODE_WRAPPING_32, WaitError};
 
 /// The number the tests' gsv records its notes under: not the default, so a hard-coded one
 /// fails.
@@ -27,6 +30,16 @@ fn id(value: u8) -> SyncpointId {
 
 fn last_id() -> SyncpointId {
     id(u8::try_from(SYNCPOINT_COUNT - 1).unwrap())
+}
+
+/// The slot event `n`: not generation 0 or 1, so an id built with another generation differs.
+fn event(n: u32) -> ObjectId {
+    ObjectId::from_parts(n, 5)
+}
+
+/// A wait on syncpoint `sp` for `threshold` by `mode`.
+fn wait(sp: u8, threshold: u64, mode: CompareMode) -> Wait {
+    Wait::new(id(sp), threshold, mode).unwrap()
 }
 
 fn changed(sp: u8, value: u32) -> Completion {
@@ -54,10 +67,10 @@ fn fresh() -> Shared {
     Shared::new(syncpoints, queue, GSV)
 }
 
-/// A [`TimerHost`] that keeps what was recorded, and the tokens it was asked to unlock, each of
-/// which it unlocks.
+/// A [`TimerHost`] that keeps what was recorded, the tokens it was asked to unlock, each of
+/// which it unlocks, and the events it was asked to signal, each of which it signals.
 #[derive(Default)]
-struct Host(Vec<EventKind>, Vec<DeviceShareToken>);
+struct Host(Vec<EventKind>, Vec<DeviceShareToken>, Vec<ObjectId>);
 
 impl TimerHost for Host {
     fn record(&mut self, kind: EventKind) {
@@ -68,24 +81,32 @@ impl TimerHost for Host {
         self.1.push(token);
         Ok(())
     }
+
+    fn signal_event(&mut self, event: ObjectId) -> SvcResult<()> {
+        self.2.push(event);
+        Ok(())
+    }
 }
 
-/// One call a [`Calls`] host received.
+/// One call a [`Journal`] host received.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Call {
     Record(EventKind),
     Unlock(DeviceShareToken),
+    Signal(ObjectId),
 }
 
-/// A [`TimerHost`] that keeps every call in one list, in order, and answers each unlock with
-/// the next of its answers (success once they run out).
+/// A [`TimerHost`] that keeps every call in one list, in order, answers each unlock with the
+/// next of its answers (success once they run out), and refuses to signal the events in
+/// `refused`.
 #[derive(Default)]
-struct Calls {
+struct Journal {
     calls: Vec<Call>,
     answers: std::collections::VecDeque<Result<(), DeviceShareError>>,
+    refused: Vec<ObjectId>,
 }
 
-impl TimerHost for Calls {
+impl TimerHost for Journal {
     fn record(&mut self, kind: EventKind) {
         self.calls.push(Call::Record(kind));
     }
@@ -93,6 +114,15 @@ impl TimerHost for Calls {
     fn unlock_device_share(&mut self, token: DeviceShareToken) -> Result<(), DeviceShareError> {
         self.calls.push(Call::Unlock(token));
         self.answers.pop_front().unwrap_or(Ok(()))
+    }
+
+    fn signal_event(&mut self, event: ObjectId) -> SvcResult<()> {
+        self.calls.push(Call::Signal(event));
+        if self.refused.contains(&event) {
+            Err(KernelError::InvalidHandle)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -351,6 +381,11 @@ impl TimerHost for LockChecker<'_> {
         self.check();
         Ok(())
     }
+
+    fn signal_event(&mut self, _event: ObjectId) -> SvcResult<()> {
+        self.check();
+        Ok(())
+    }
 }
 
 #[test]
@@ -360,12 +395,18 @@ fn the_drain_calls_the_kernel_with_the_shared_lock_held() {
         shared.queue().push(ordered(ticket));
         shared.queue().push(released(ticket));
     }
+    // A change that fires a wait: one record and one signal.
+    shared
+        .lock()
+        .arm(event(1), wait(9, 1, CompareMode::Wrapping32))
+        .unwrap();
+    shared.syncpoints().increment(id(9));
     let mut checker = LockChecker {
         shared: &shared,
         calls: 0,
     };
-    assert_eq!(shared.drain(&mut checker).len(), 6);
-    assert_eq!(checker.calls, 6);
+    assert_eq!(shared.drain(&mut checker).len(), 7);
+    assert_eq!(checker.calls, 8);
     // And released after.
     assert!(shared.state.try_lock().is_ok());
 }
@@ -408,6 +449,12 @@ impl TimerHost for Pusher<'_> {
     }
 
     fn unlock_device_share(&mut self, _token: DeviceShareToken) -> Result<(), DeviceShareError> {
+        self.pushed += 1;
+        self.queue.push(ordered(100 + self.pushed));
+        Ok(())
+    }
+
+    fn signal_event(&mut self, _event: ObjectId) -> SvcResult<()> {
         self.pushed += 1;
         self.queue.push(ordered(100 + self.pushed));
         Ok(())
@@ -494,11 +541,23 @@ fn push_varint(bytes: &mut Vec<u8>, mut value: u64) {
     bytes.push(u8::try_from(value).unwrap());
 }
 
-fn snapshot(body: &[u8]) -> Vec<u8> {
+/// A snapshot whose body is `counts` and `waits`, both already encoded.
+fn snapshot_with(counts: &[u8], waits: &[u8]) -> Vec<u8> {
     let mut bytes = SNAPSHOT_MAGIC.to_vec();
     bytes.push(u8::try_from(SNAPSHOT_VERSION).unwrap());
-    bytes.extend_from_slice(body);
+    bytes.extend_from_slice(counts);
+    bytes.extend_from_slice(waits);
     bytes
+}
+
+/// A snapshot whose body is `counts`, already encoded, and no armed waits.
+fn snapshot(counts: &[u8]) -> Vec<u8> {
+    snapshot_with(counts, &waits(&[]))
+}
+
+/// Encodes `saved` as the snapshot's list of waits.
+fn waits(saved: &[SavedWait]) -> Vec<u8> {
+    postcard::to_allocvec(saved).unwrap()
 }
 
 #[test]
@@ -512,17 +571,28 @@ fn the_snapshot_layout_is_pinned() {
             shared.lock().watch(id(sp)).unwrap();
         }
     }
-    // The magic, version 1, then 192 counts (a two-byte varint) and each count.
-    let mut expected = vec![b'S', b'Q', b'G', b'S', 0x01, 0xC0, 0x01];
+    // Two waits, one of each mode, armed in the reverse of their events' order, with distinct
+    // ids, thresholds and events; each adds a watch to its id.
+    let wrapping = wait(63, 0x1_0000_0002, CompareMode::Wrapping32);
+    let wide = wait(64, u64::from(u32::MAX), CompareMode::Wide64);
+    shared.lock().arm(event(0x90), wrapping).unwrap();
+    shared.lock().arm(event(0x81), wide).unwrap();
+    // The magic, version 2, then 192 counts (a two-byte varint) and each count.
+    let mut expected = vec![b'S', b'Q', b'G', b'S', 0x02, 0xC0, 0x01];
     for index in 0..COUNT {
         match index {
             0 => expected.push(0x01),
-            63 => expected.push(0x02),
-            64 => expected.push(0x03),
+            63 => expected.push(0x03),
+            64 => expected.push(0x04),
             191 => expected.extend([0x80, 0x01]),
             _ => expected.push(0x00),
         }
     }
+    // Then two waits, in ascending event order: the event (index and generation varints), the
+    // id byte, the threshold varint, the mode byte.
+    expected.push(0x02);
+    expected.extend([0x81, 0x01, 0x05, 0x40, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0x01]);
+    expected.extend([0x90, 0x01, 0x05, 0x3F, 0x82, 0x80, 0x80, 0x80, 0x10, 0x00]);
     assert_eq!(shared.save().unwrap(), expected);
 }
 
@@ -739,7 +809,7 @@ fn the_drain_unlocks_each_release_through_the_kernel_in_queue_order() {
     shared.queue().push(released(4));
     shared.queue().push(released(5));
     shared.queue().push(ordered(3));
-    let mut host = Calls::default();
+    let mut host = Journal::default();
     assert_eq!(
         shared.drain(&mut host),
         [
@@ -776,7 +846,7 @@ fn a_refused_release_is_logged_and_the_drain_goes_on() {
         shared.queue().push(released(n));
         shared.queue().push(ordered(n));
     }
-    let mut host = Calls {
+    let mut host = Journal {
         answers: [
             Err(DeviceShareError::ProcessEnded),
             Err(DeviceShareError::NotLocked {
@@ -785,7 +855,7 @@ fn a_refused_release_is_logged_and_the_drain_goes_on() {
             }),
         ]
         .into(),
-        ..Calls::default()
+        ..Journal::default()
     };
     assert_eq!(shared.drain(&mut host).len(), 6);
     let record = |ticket| {
@@ -815,4 +885,496 @@ fn a_release_restored_from_a_snapshot_is_unlocked_with_the_kernel_s_token() {
     assert_eq!(restored.drain(&mut host), [released(6)]);
     assert_eq!(host.1, [token(6)]);
     assert_eq!(host.0, []);
+}
+
+// ----- The waiter table -------------------------------------------------------------------------
+
+#[test]
+fn an_armed_wait_holds_one_watch_of_its_syncpoint() {
+    let shared = fresh();
+    let (a, b) = (id(30), id(31));
+    // Arming takes a watch, and the counter it returns is read after it.
+    shared.syncpoints().increment(a);
+    assert_eq!(
+        shared
+            .lock()
+            .arm(event(1), wait(30, 5, CompareMode::Wrapping32)),
+        Ok(1)
+    );
+    assert_eq!(shared.lock().watchers(a), 1);
+    assert!(shared.syncpoints().is_watched(a));
+    // Re-arming the same event on the same id replaces the wait and keeps one watch.
+    let replacement = wait(30, 6, CompareMode::Wrapping32);
+    shared.lock().arm(event(1), replacement).unwrap();
+    assert_eq!(shared.lock().watchers(a), 1);
+    assert_eq!(shared.lock().waiters().get(event(1)), Some(replacement));
+    // Re-arming it on another id moves the watch.
+    let moved = wait(31, 7, CompareMode::Wide64);
+    shared.lock().arm(event(1), moved).unwrap();
+    assert_eq!(shared.lock().watchers(a), 0);
+    assert!(!shared.syncpoints().is_watched(a));
+    assert_eq!(shared.lock().watchers(b), 1);
+    assert_eq!(shared.lock().waiters().get(event(1)), Some(moved));
+    // A second event adds a second watch.
+    shared.lock().arm(event(2), moved).unwrap();
+    assert_eq!(shared.lock().watchers(b), 2);
+    assert_eq!(shared.lock().waiters().on(b), 2);
+    assert_eq!(shared.lock().waiters().len(), 2);
+    // Disarming gives one back and returns the wait.
+    assert_eq!(shared.lock().disarm(event(1)), Some(moved));
+    assert_eq!(shared.lock().watchers(b), 1);
+    assert_eq!(shared.lock().waiters().get(event(1)), None);
+    // Disarming an event with no wait changes nothing.
+    assert_eq!(shared.lock().disarm(event(1)), None);
+    assert_eq!(shared.lock().watchers(b), 1);
+    // Firing gives the last one back.
+    shared.queue().push(changed(31, 7));
+    let mut host = Host::default();
+    shared.drain(&mut host);
+    assert_eq!(host.2, [event(2)]);
+    assert_eq!(shared.lock().watchers(b), 0);
+    assert!(shared.lock().waiters().is_empty());
+}
+
+#[test]
+fn unwatch_cannot_take_an_armed_wait_s_watch() {
+    let shared = fresh();
+    let sp = id(50);
+    // A neighbour with an armed wait and a spare watch, so a hard-coded id would be caught.
+    let neighbour = id(51);
+    shared
+        .lock()
+        .arm(event(2), wait(51, 9, CompareMode::Wrapping32))
+        .unwrap();
+    shared.lock().watch(neighbour).unwrap();
+    shared
+        .lock()
+        .arm(event(1), wait(50, 2, CompareMode::Wrapping32))
+        .unwrap();
+    // The one watch is the wait's: refused, and nothing changes.
+    let error = shared.lock().unwatch(sp).unwrap_err();
+    assert_eq!(error, WatchError::HeldByWaits { id: sp, waits: 1 });
+    assert_eq!(
+        error.to_string(),
+        "syncpoint 50 has no waiters but its 1 armed waits"
+    );
+    assert_eq!(shared.lock().watchers(sp), 1);
+    assert!(shared.syncpoints().is_watched(sp));
+    // Another watcher's watch above the wait's can be given back, exactly down to the waits.
+    shared.lock().watch(sp).unwrap();
+    assert_eq!(shared.lock().unwatch(sp), Ok(()));
+    assert_eq!(shared.lock().watchers(sp), 1);
+    assert_eq!(
+        shared.lock().unwatch(sp),
+        Err(WatchError::HeldByWaits { id: sp, waits: 1 })
+    );
+    // The neighbour's spare watch is given back; its wait's is not.
+    assert_eq!(shared.lock().unwatch(neighbour), Ok(()));
+    assert_eq!(
+        shared.lock().unwatch(neighbour),
+        Err(WatchError::HeldByWaits {
+            id: neighbour,
+            waits: 1
+        })
+    );
+    // The wait still fires, and the state still saves.
+    shared.syncpoints().increment(sp);
+    shared.syncpoints().increment(sp);
+    let mut host = Host::default();
+    shared.drain(&mut host);
+    assert_eq!(host.2, [event(1)]);
+    assert_eq!(shared.lock().watchers(sp), 0);
+    assert!(shared.save().is_ok());
+    // With the wait gone, an id with no waiters is still `NotWatched`.
+    assert_eq!(shared.lock().unwatch(sp), Err(WatchError::NotWatched(sp)));
+}
+
+#[test]
+fn an_arm_that_cannot_watch_changes_nothing() {
+    let shared = fresh();
+    let sp = id(12);
+    let earlier = wait(13, 2, CompareMode::Wrapping32);
+    shared.lock().arm(event(4), earlier).unwrap();
+    shared.lock().watch(sp).unwrap();
+    shared.lock().state.watchers[usize::from(sp.get())] = u32::MAX;
+    let error = shared
+        .lock()
+        .arm(event(4), wait(12, 1, CompareMode::Wrapping32))
+        .unwrap_err();
+    assert_eq!(error, WatchError::TooManyWaiters(sp));
+    // The earlier wait and its watch stand.
+    assert_eq!(shared.lock().waiters().get(event(4)), Some(earlier));
+    assert_eq!(shared.lock().watchers(id(13)), 1);
+    assert_eq!(shared.lock().watchers(sp), u32::MAX);
+}
+
+/// The value [`arm_mixed`]'s change takes syncpoint 20 to.
+const REACHED: u32 = 0x40;
+
+/// Waits on syncpoint 20, armed out of event order: three that a change to [`REACHED`] reaches
+/// (of both modes), one it does not, and one on syncpoint 21 that the same value would reach.
+fn arm_mixed(shared: &Shared) {
+    let mut state = shared.lock();
+    let at = u64::from(REACHED);
+    state
+        .arm(event(9), wait(20, at, CompareMode::Wrapping32))
+        .unwrap();
+    state
+        .arm(event(3), wait(20, at - 1, CompareMode::Wide64))
+        .unwrap();
+    state
+        .arm(event(12), wait(20, at + 1, CompareMode::Wrapping32))
+        .unwrap();
+    state
+        .arm(event(6), wait(20, 1, CompareMode::Wrapping32))
+        .unwrap();
+    state
+        .arm(event(2), wait(21, 1, CompareMode::Wrapping32))
+        .unwrap();
+}
+
+#[test]
+fn a_change_fires_its_waits_after_its_note_in_event_order() {
+    let shared = fresh();
+    arm_mixed(&shared);
+    shared.queue().push(changed(20, REACHED));
+    let mut host = Journal::default();
+    shared.drain(&mut host);
+    assert_eq!(
+        host.calls,
+        [
+            Call::Record(note_event(Note::SyncpointObserved {
+                id: id(20),
+                value: REACHED
+            })),
+            Call::Signal(event(3)),
+            Call::Signal(event(6)),
+            Call::Signal(event(9)),
+        ]
+    );
+    // The wait the value does not reach, and the wait on another id, stay, with their watches.
+    let state = shared.lock();
+    assert_eq!(state.waiters().len(), 2);
+    assert!(state.waiters().get(event(12)).is_some());
+    assert!(state.waiters().get(event(2)).is_some());
+    assert_eq!(state.watchers(id(20)), 1);
+    assert_eq!(state.watchers(id(21)), 1);
+}
+
+#[test]
+fn a_wait_fires_exactly_at_its_threshold_not_one_before() {
+    // Both modes, the wrapping one with its threshold's high half set (the counter itself does
+    // not wrap): a counter at 2 has reached a threshold of 2 + 2^32 by the 32-bit comparison.
+    for (mode, threshold) in [
+        (CompareMode::Wrapping32, 0x1_0000_0002),
+        (CompareMode::Wide64, 2),
+    ] {
+        let shared = fresh();
+        let sp = id(44);
+        shared
+            .lock()
+            .arm(event(8), wait(44, threshold, mode))
+            .unwrap();
+        // One before: the change is recorded, and nothing fires.
+        shared.syncpoints().increment(sp);
+        let mut host = Host::default();
+        shared.drain(&mut host);
+        assert_eq!(host.0.len(), 1, "{mode:?}");
+        assert_eq!(host.2, [], "{mode:?}");
+        assert!(shared.lock().waiters().get(event(8)).is_some());
+        // At the threshold: it fires.
+        shared.syncpoints().increment(sp);
+        let mut host = Host::default();
+        shared.drain(&mut host);
+        assert_eq!(host.2, [event(8)], "{mode:?}");
+        assert!(shared.lock().waiters().is_empty());
+        // And it fires once: a later change finds no wait.
+        shared.queue().push(changed(44, 3));
+        let mut host = Host::default();
+        shared.drain(&mut host);
+        assert_eq!(host.2, [], "{mode:?}");
+    }
+}
+
+#[test]
+fn a_refused_signal_is_logged_and_the_drain_goes_on() {
+    let shared = fresh();
+    arm_mixed(&shared);
+    shared.queue().push(changed(20, REACHED));
+    shared.queue().push(ordered(5));
+    let mut host = Journal {
+        refused: vec![event(6)],
+        ..Journal::default()
+    };
+    assert_eq!(shared.drain(&mut host).len(), 2);
+    // Every reached wait was signalled, the refused one included, and the next completion was
+    // acted on.
+    assert_eq!(
+        host.calls[1..],
+        [
+            Call::Signal(event(3)),
+            Call::Signal(event(6)),
+            Call::Signal(event(9)),
+            Call::Record(note_event(Note::GpuOrderedDone { ticket: Ticket(5) })),
+        ]
+    );
+    // The refused wait is gone, with its watch.
+    assert_eq!(shared.lock().waiters().get(event(6)), None);
+    assert_eq!(shared.lock().watchers(id(20)), 1);
+}
+
+#[test]
+fn armed_waits_are_used_as_saved() {
+    let shared = fresh();
+    arm_mixed(&shared);
+    let restored = round_trip(&shared).unwrap();
+    assert_eq!(*restored.lock(), *shared.lock());
+    // The restored watches came back with the waits: an increment of a watched id is pushed,
+    // and fires its wait.
+    restored.syncpoints().increment(id(21));
+    restored.queue().push(changed(20, REACHED));
+    let mut host = Host::default();
+    restored.drain(&mut host);
+    assert_eq!(host.2, [event(2), event(3), event(6), event(9)]);
+    assert_eq!(restored.lock().watchers(id(20)), 1);
+    assert_eq!(restored.lock().watchers(id(21)), 0);
+}
+
+/// A wait as a snapshot holds it.
+fn saved(event_index: u32, sp: u8, threshold: u64, mode: u8) -> SavedWait {
+    SavedWait {
+        event: event(event_index),
+        id: sp,
+        threshold,
+        mode,
+    }
+}
+
+/// Restores counts with one waiter on each of `watched` over syncpoints that watch them, and
+/// `entries` as the waits.
+fn restore_waits(watched: &[u8], entries: &[SavedWait]) -> Result<Shared, SnapshotError> {
+    let shared = fresh();
+    for &sp in watched {
+        shared.syncpoints().watch(id(sp));
+    }
+    let counts = counts(COUNT, |index| {
+        u32::from(watched.iter().any(|&sp| usize::from(sp) == index))
+    });
+    Shared::restore(
+        &snapshot_with(&counts, &waits(entries)),
+        Arc::clone(shared.syncpoints()),
+        Arc::clone(shared.queue()),
+        GSV,
+    )
+}
+
+#[test]
+fn saved_waits_must_be_in_ascending_event_order() {
+    let first = saved(4, 10, 1, MODE_WRAPPING_32);
+    let second = saved(5, 11, 1, MODE_WRAPPING_32);
+    assert!(restore_waits(&[10, 11], &[first, second]).is_ok());
+    // Swapped, and one event twice.
+    for entries in [[second, first], [first, SavedWait { id: 11, ..first }]] {
+        let error = restore_waits(&[10, 11], &entries).err().unwrap();
+        assert_eq!(
+            error,
+            SnapshotError::Wait(SavedWaitError::OutOfOrder { index: 1 })
+        );
+        assert_eq!(
+            error.to_string(),
+            "the gsv shared state snapshot's waits: saved wait 1 is not in ascending event order"
+        );
+    }
+    // Events that differ only in their generation are two events, ordered by it.
+    let older = SavedWait {
+        event: ObjectId::from_parts(4, 4),
+        ..second
+    };
+    assert!(restore_waits(&[10, 11], &[older, first]).is_ok());
+    assert!(restore_waits(&[10, 11], &[first, older]).is_err());
+}
+
+#[test]
+fn a_saved_wait_must_name_a_syncpoint() {
+    let last = u8::try_from(SYNCPOINT_COUNT - 1).unwrap();
+    assert!(restore_waits(&[last], &[saved(1, last, 1, MODE_WRAPPING_32)]).is_ok());
+    let beyond = last + 1;
+    let error = restore_waits(&[], &[saved(1, beyond, 1, MODE_WRAPPING_32)])
+        .err()
+        .unwrap();
+    assert_eq!(
+        error,
+        SnapshotError::Wait(SavedWaitError::NoSuchSyncpoint {
+            index: 0,
+            id: beyond
+        })
+    );
+    assert_eq!(
+        error.to_string(),
+        "the gsv shared state snapshot's waits: saved wait 0 names syncpoint 192, and there are 192"
+    );
+}
+
+#[test]
+fn a_saved_wait_must_have_a_mode_201_accepts() {
+    assert!(restore_waits(&[3], &[saved(1, 3, 1, MODE_WIDE_64)]).is_ok());
+    let mode = MODE_WIDE_64 + 1;
+    let error = restore_waits(&[3], &[saved(1, 3, 1, mode)]).err().unwrap();
+    assert_eq!(
+        error,
+        SnapshotError::Wait(SavedWaitError::UnknownMode { index: 0, mode })
+    );
+    assert_eq!(
+        error.to_string(),
+        "the gsv shared state snapshot's waits: saved wait 0 has mode 2, which no wait is armed with"
+    );
+}
+
+#[test]
+fn a_saved_wide_wait_must_be_one_a_counter_can_reach() {
+    let edge = u64::from(u32::MAX);
+    assert!(restore_waits(&[3], &[saved(1, 3, edge, MODE_WIDE_64)]).is_ok());
+    // The same threshold is fine for a wrapping wait.
+    assert!(restore_waits(&[3], &[saved(1, 3, edge + 1, MODE_WRAPPING_32)]).is_ok());
+    let error = restore_waits(&[3], &[saved(1, 3, edge + 1, MODE_WIDE_64)])
+        .err()
+        .unwrap();
+    assert_eq!(
+        error,
+        SnapshotError::Wait(SavedWaitError::Refused {
+            index: 0,
+            error: WaitError::WideThreshold {
+                threshold: edge + 1
+            }
+        })
+    );
+    assert_eq!(
+        error.to_string(),
+        "the gsv shared state snapshot's waits: saved wait 0 could not have been armed: a 64-bit wait for 0x100000000 can never be reached by a 32-bit counter"
+    );
+}
+
+#[test]
+fn a_syncpoint_s_waits_may_not_outnumber_its_waiters() {
+    // Exactly as many waits as waiters: accepted.
+    let one = saved(1, 7, 1, MODE_WRAPPING_32);
+    let two = saved(2, 7, 1, MODE_WRAPPING_32);
+    assert!(restore_waits(&[7], &[one]).is_ok());
+    // One more wait than waiters.
+    let error = restore_waits(&[7], &[one, two]).err().unwrap();
+    assert_eq!(
+        error,
+        SnapshotError::WaitsOutnumberWatchers {
+            id: 7,
+            waits: 2,
+            waiters: 1
+        }
+    );
+    assert_eq!(
+        error.to_string(),
+        "the gsv shared state snapshot arms 2 waits on syncpoint 7, which has 1 waiters"
+    );
+    // A wait on an id with no waiter at all, next to a watched neighbour.
+    let error = restore_waits(&[7], &[saved(1, 8, 1, MODE_WRAPPING_32)])
+        .err()
+        .unwrap();
+    assert_eq!(
+        error,
+        SnapshotError::WaitsOutnumberWatchers {
+            id: 8,
+            waits: 1,
+            waiters: 0
+        }
+    );
+}
+
+#[test]
+fn wait_checks_run_in_the_documented_order() {
+    let bad_mode = MODE_WIDE_64 + 1;
+    // A bad entry and a short count list: the count list is found first.
+    let bad = saved(1, 3, 1, bad_mode);
+    let short = snapshot_with(&counts(COUNT - 1, |_| 0), &waits(&[bad]));
+    assert_eq!(
+        restore_over_fresh(&short).err().unwrap(),
+        SnapshotError::WaiterCounts { found: COUNT - 1 }
+    );
+    // A bad entry and a watched-bit mismatch: the entry is found first.
+    let mismatch = snapshot_with(
+        &counts(COUNT, |index| u32::from(index == 17)),
+        &waits(&[bad]),
+    );
+    assert_eq!(
+        restore_over_fresh(&mismatch).err().unwrap(),
+        SnapshotError::Wait(SavedWaitError::UnknownMode {
+            index: 0,
+            mode: bad_mode
+        })
+    );
+    // Two bad entries: the first in list order, though its fault is a later check than the
+    // second's.
+    let entries = [bad, saved(2, 200, 1, MODE_WRAPPING_32)];
+    assert_eq!(
+        restore_waits(&[3], &entries).err().unwrap(),
+        SnapshotError::Wait(SavedWaitError::UnknownMode {
+            index: 0,
+            mode: bad_mode
+        })
+    );
+    // Within one entry: the order, then the id, then the mode, then the threshold.
+    let all = saved(1, 200, u64::MAX, bad_mode);
+    let ahead = saved(2, 3, 1, MODE_WRAPPING_32);
+    assert_eq!(
+        restore_waits(&[3], &[ahead, all]).err().unwrap(),
+        SnapshotError::Wait(SavedWaitError::OutOfOrder { index: 1 })
+    );
+    assert_eq!(
+        restore_waits(&[], &[all]).err().unwrap(),
+        SnapshotError::Wait(SavedWaitError::NoSuchSyncpoint { index: 0, id: 200 })
+    );
+    assert_eq!(
+        restore_waits(&[3], &[SavedWait { id: 3, ..all }])
+            .err()
+            .unwrap(),
+        SnapshotError::Wait(SavedWaitError::UnknownMode {
+            index: 0,
+            mode: bad_mode
+        })
+    );
+    // On one id, the watched bit before the waits: two waits on an id whose count is 1 but
+    // which the syncpoints do not watch.
+    let unwatched = snapshot_with(
+        &counts(COUNT, |index| u32::from(index == 17)),
+        &waits(&[
+            saved(1, 17, 1, MODE_WRAPPING_32),
+            saved(2, 17, 1, MODE_WRAPPING_32),
+        ]),
+    );
+    assert_eq!(
+        restore_over_fresh(&unwatched).err().unwrap(),
+        SnapshotError::WatchMismatch {
+            id: 17,
+            waiters: 1,
+            watched: false
+        }
+    );
+}
+
+#[test]
+fn saving_refuses_waits_that_outnumber_their_watchers() {
+    // A watch given back behind the wait's back: saving refuses what restoring would.
+    let shared = fresh();
+    shared
+        .lock()
+        .arm(event(1), wait(9, 1, CompareMode::Wrapping32))
+        .unwrap();
+    shared.lock().state.watchers[9] = 0;
+    shared.syncpoints().unwatch(id(9));
+    assert_eq!(
+        shared.save(),
+        Err(SnapshotError::WaitsOutnumberWatchers {
+            id: 9,
+            waits: 1,
+            waiters: 0
+        })
+    );
 }

@@ -140,8 +140,7 @@ impl TimerHost for Timer<'_> {
     }
 }
 
-/// A timer host that unlocks and keeps the tokens, and signals nothing: [`TimerHost`]'s default
-/// refusal.
+/// A timer host that unlocks and keeps the tokens, and refuses every signal.
 struct Refusing(Vec<DeviceShareToken>);
 
 impl TimerHost for Refusing {
@@ -150,6 +149,10 @@ impl TimerHost for Refusing {
     fn unlock_device_share(&mut self, token: DeviceShareToken) -> Result<(), DeviceShareError> {
         self.0.push(token);
         Ok(())
+    }
+
+    fn signal_event(&mut self, _event: ObjectId) -> Result<(), KernelError> {
+        Err(KernelError::NotImplemented)
     }
 }
 
