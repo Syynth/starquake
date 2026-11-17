@@ -249,6 +249,27 @@ comments on those issues.
 | proposed | **`Nup::open` refuses `/` in a node name**; **the cost of `romfs::build`'s sort comparator**; **the `RomFsStorage` cache mutex held through decompression** | Scope review of #200 | area:loader |
 | proposed | **A 12 GiB test fixture for the `GetInfo` rig** | #232 builds one ad hoc for a single test | area:kernel |
 
+### From wave 23 (ledger: #22)
+
+Filed from this wave under the delegation:
+- #249: appletOE's Switch 2 commands. The title now stops at appletOE command 10.
+- #250: address-space snapshot and restore. #240 is closed, and its snapshot item moved here.
+- #251: fsp-srv follow-ups.
+
+Notes for #185 (command 216 is still to build) and #194 are comments on those issues.
+
+| Status | Proposal | Why | Suggested |
+|---|---|---|---|
+| awaiting the owner | **The auto-stub policy for a command whose reply carries an object or handle** | The title's unknown appletOE command 10 was answered success with no object. The title then read through a null pointer, a crash far from its cause. Refusing such commands, or stopping the run with a plain-words error naming the command, would point at the cause. The services spec's stub policy doesn't separate the two | services |
+| awaiting the owner | **Graphics-server verification item 1 gains the 211-over-a-live-mapping and 102-with-live-211-maps conflicts**, and **whether `GpuFront` needs an ordered map** | Scope review of #185 | gsv |
+| awaiting the owner | **How replay reconciles 201's reached-at-arm push with the `SyncpointObserved` notes fed back** | Scope review of #182 | gsv, observability |
+| awaiting the owner | **The result code for an unreadable data storage** (FS 5000 is a guess) | Scope review of #241 | services |
+| proposed | **A session-close hook in the service framework, and a bound on gsv's syncpt waiter table**. A closed syncpt session leaves up to 63 waits armed. Extends the wave 19–20 entry "Service framework: a session-close notification" | Scope review of #182; both references clean up in their destructors | area:services, M2 |
+| proposed | **Run-level `--record` and `--replay` for reads** | Scope review of #241. Check #226 for overlap | area:core |
+| proposed | **`MapPhysicalMemoryUnsafe` and `UnmapPhysicalMemoryUnsafe`** (0x48, 0x49), which Eden lacks too | Scope review of #240 | area:kernel |
+| proposed | **`FlushDataCache` (0x2B)**: the homebrew gap trace in `crates/core/tests/homebrew.rs` now stops there | Scope review of #240 | area:kernel |
+| proposed | **Reads take turns under the `LiveEnv` lock** | Scope review of #241; a throughput note | area:core |
+
 ## House-rule candidates
 
 Rules distilled from review findings. A vetted rule moves into `CLAUDE.md`; until then it is
@@ -357,3 +378,13 @@ passed to build agents as a provisional rule for the next wave.
 | proposed | Don't call a constructor "test-only" or a value "unforgeable" unless the compiler enforces it. |
 | proposed | A documented log level or other observable side effect is pinned by a test that captures it, or the claim goes. |
 | proposed | When two algorithms would both satisfy a sort or order rule on the golden data, add a case where they differ. |
+
+### From wave 23 (ledger: #22)
+
+| Status | Candidate |
+|---|---|
+| proposed | Every documented check order, cap and restore validation has its own failing test, and both faults present at once for ordering. |
+| proposed | Concurrent workers each get their own environment or handle, or the docs say they serialize; test the production arrangement, not only a double. |
+| proposed | Per-session growth is bounded over a run's lifetime: closing a session cleans up what it armed or opened, with a test at the cap. |
+| proposed | A deferred change shows its pending state to every observer until it is applied; test the in-between state. |
+| proposed | Sibling slices that extend one shared struct, trait or drain add beside each other and never change each other's signatures. |
