@@ -293,6 +293,26 @@ impl RamConfig {
             _ => Err(LayoutError::OutOfRange),
         }
     }
+
+    /// RAM of at least `size` bytes at the default base (`0x1_0000_0000`): `size` rounded up to
+    /// a whole number of 16 KiB host pages, as [`RamConfig::new`] requires. The same checks
+    /// apply: `size` must not be zero, and the rounded RAM must end at or below the backend's
+    /// own region (`0xf_0000_0000`), so at most 56 GiB.
+    pub fn at_least(size: u64) -> Result<Self, LayoutError> {
+        let size = size
+            .checked_next_multiple_of(HOST_PAGE)
+            .ok_or(LayoutError::OutOfRange)?;
+        Self::new(
+            DEFAULT_RAM_BASE,
+            usize::try_from(size).map_err(|_| LayoutError::OutOfRange)?,
+        )
+    }
+
+    /// The size of the RAM in bytes.
+    #[must_use]
+    pub const fn size(&self) -> u64 {
+        self.size
+    }
 }
 
 impl Default for RamConfig {
@@ -563,6 +583,14 @@ impl HvfBackend {
     /// rate.
     #[must_use]
     pub fn counter_frequency(&self) -> u64 {
+        Self::host_counter_frequency()
+    }
+
+    /// The same rate as [`HvfBackend::counter_frequency`], read without a VM: the host's
+    /// `CNTFRQ_EL0`, which the backend does not change. A run reads it before it makes the VM,
+    /// to patch the program's counter reads and size guest RAM for what the patcher adds.
+    #[must_use]
+    pub fn host_counter_frequency() -> u64 {
         ffi::cntfrq_el0()
     }
 }
@@ -1156,6 +1184,37 @@ mod tests {
             RamConfig::new(u64::MAX - (HOST_PAGE - 1), page),
             Err(LayoutError::OutOfRange)
         );
+    }
+
+    #[test]
+    fn ram_of_at_least_a_size_is_rounded_up_to_whole_host_pages_at_the_default_base() {
+        let page = usize::try_from(HOST_PAGE).unwrap();
+        // A whole number of host pages is kept as it is.
+        assert_eq!(
+            RamConfig::at_least(HOST_PAGE),
+            RamConfig::new(DEFAULT_RAM_BASE, page)
+        );
+        assert_eq!(RamConfig::at_least(HOST_PAGE).unwrap().size(), HOST_PAGE);
+        // One byte, or one guest page, over a host page is rounded up to the next one; one byte
+        // under stays at one.
+        for size in [HOST_PAGE + 1, HOST_PAGE + PAGE] {
+            assert_eq!(RamConfig::at_least(size).unwrap().size(), 2 * HOST_PAGE);
+        }
+        assert_eq!(
+            RamConfig::at_least(HOST_PAGE - 1).unwrap().size(),
+            HOST_PAGE
+        );
+        assert_eq!(RamConfig::at_least(0), Err(LayoutError::Empty));
+        // The largest RAM ends exactly where the backend's own region starts; one byte more is
+        // a host page too many.
+        let largest = SYSTEM_BASE - DEFAULT_RAM_BASE;
+        assert_eq!(RamConfig::at_least(largest).unwrap().size(), largest);
+        assert_eq!(
+            RamConfig::at_least(largest + 1),
+            Err(LayoutError::OutOfRange)
+        );
+        // A size that cannot be rounded up without overflowing.
+        assert_eq!(RamConfig::at_least(u64::MAX), Err(LayoutError::OutOfRange));
     }
 
     #[test]
