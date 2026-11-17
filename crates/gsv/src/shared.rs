@@ -58,7 +58,8 @@
 //! that used its memory), and is logged at debug level; any other refusal means gsv's own
 //! bookkeeping is wrong, and is logged as an error. Either way the lock stays as the kernel
 //! keeps it, and the next completions are acted on
-//! (`a_refused_release_is_logged_and_the_drain_goes_on`).
+//! (`a_refused_release_is_logged_and_the_drain_goes_on`; the levels are pinned by
+//! `tests/release_log_levels.rs`, a test binary of its own).
 //!
 //! Later slices act on them as well: the syncpt waiter table (slice 4), the shared page (5), the
 //! ordered completion of unmaps and destroys (7), deferred submissions (11).
