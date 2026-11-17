@@ -230,6 +230,25 @@ issues.
 | proposed | **Crash-report extras**: backtraces for every thread, captured at crash time; suspend flags and wait targets; symbols; each thread's last events; a test for `Scheduler::threads()` | Scope review of #206 | area:core, M3 |
 | proposed | **Correct the record that PR #4588 is the only reference for ids 29–33** where a second source turns up | Scope review of #223 | docs |
 
+### From wave 22 (ledger: #22)
+
+Filed from this wave under the delegation: #240 (`MapPhysicalMemory`, where the title now stops),
+#241 (an `fsp-srv` worker in a real run), #242 (a resource limit for each process) and #243
+(ending a process releases its device-share locks and nvmap handles). Notes for #194 and #208 are
+comments on those issues.
+
+| Status | Proposal | Why | Suggested |
+|---|---|---|---|
+| awaiting the owner | **Replaying device-share releases**: a note in the observability spec on how a recorded release is replayed | Scope review of #233 | observability |
+| awaiting the owner | **A one-line amendment to `services.md`** for the device-share release path, and **which gsv thread pushes `DeviceShareReleased`** | Scope review of #233; graphics-server.md does not name the thread | services, gsv |
+| awaiting the owner | **Whether an nvmap free's unlock waits for GPU ordering** | Scope review of #187 | gsv |
+| awaiting the owner | **The NX2 stub-device divergence**, and **the CMIF evidence for the spec's open question 9** | Scope review of #187 | gsv |
+| proposed | **Reserve a process-local region in `process::run`** (`GetInfo` 20) and **keep per-thread and idle tick counts in the scheduler** (`GetInfo` 10 and 25) | #232 answers all three as zero, listed as divergences | area:kernel, M2 |
+| proposed | **A `Context` API to mark a reply as auto-stubbed** (`IpcOutcome::Stubbed` with a sub-key), so nvsrv's unknown ioctls show up in the "commands still to implement" trace the services spec promises | Scope review of #187; #207 only marks which service an event is for | area:services, M2 |
+| proposed | **`starquake inspect` shows the package `newest_package` picks** | Scope review of #200 | area:loader |
+| proposed | **`Nup::open` refuses `/` in a node name**; **the cost of `romfs::build`'s sort comparator**; **the `RomFsStorage` cache mutex held through decompression** | Scope review of #200 | area:loader |
+| proposed | **A 12 GiB test fixture for the `GetInfo` rig** | #232 builds one ad hoc for a single test | area:kernel |
+
 ## House-rule candidates
 
 Rules distilled from review findings. A vetted rule moves into `CLAUDE.md`; until then it is
@@ -328,3 +347,13 @@ passed to build agents as a provisional rule for the next wave.
 | proposed | Pin every documented concurrency property (lock order, callbacks with no lock held, latched wakes) with a bounded-timeout threaded test, mutation-checked. |
 | proposed | A queue or map that coalesces or reorders states its exact ordering and monotonicity guarantee, checked by a model test that interleaves entry kinds. |
 | proposed | A type with a cross-field invariant has no public `Default` or `DerefMut` that bypasses its constructor, and a small enum where a free-form field would do. |
+
+### From wave 22 (ledger: #22)
+
+| Status | Candidate |
+|---|---|
+| proposed | A doc claim that a branch is unreachable names the configuration that does reach it, and a test runs on that configuration. |
+| proposed | A restore that consumes a counted resource (locks, handles, tokens) counts per key against the live count; N is accepted and N+1 refused at the extra entry's index. |
+| proposed | Don't call a constructor "test-only" or a value "unforgeable" unless the compiler enforces it. |
+| proposed | A documented log level or other observable side effect is pinned by a test that captures it, or the claim goes. |
+| proposed | When two algorithms would both satisfy a sort or order rule on the golden data, add a case where they differ. |
