@@ -227,6 +227,13 @@ fn a_rich_space_saves_and_restores_as_it_was() {
     assert_eq!(log.take(), expected_calls(&body, &rich.objects));
 }
 
+/// One step a test takes on two address spaces: what it is, what it does, and its result.
+type Step = (
+    &'static str,
+    Box<dyn Fn(&mut AddressSpace) -> CallResult<()>>,
+    CallResult<()>,
+);
+
 #[test]
 fn the_restored_space_is_used_as_the_original_is() {
     let mut rich = rich();
@@ -238,11 +245,7 @@ fn the_restored_space_is_used_as_the_original_is() {
     let [first, second] = rich.shared;
     let invalid: CallResult<()> = Err(SvcError::Kernel(KernelError::InvalidCurrentMemory));
     // The same steps on both, each with the result it should have.
-    let steps: Vec<(
-        &str,
-        Box<dyn Fn(&mut AddressSpace) -> CallResult<()>>,
-        CallResult<()>,
-    )> = vec![
+    let steps: Vec<Step> = vec![
         (
             "unlock the twice-locked range",
             Box::new(move |s| s.unlock_device_share(page(heap, 2), 2 * PAGE_SIZE)),
@@ -318,7 +321,7 @@ fn the_restored_space_is_used_as_the_original_is() {
     }
     // Both translations were asked the same things.
     let calls = rich.log.take();
-    assert!(!calls.is_empty());
+    assert_ne!(calls.len(), 0);
     assert_eq!(restored_log.take(), calls);
 }
 
@@ -716,6 +719,10 @@ const fn pool() -> u64 {
 }
 
 /// The faults, in the order the module docs give the checks, each named.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one fault per documented check, in the documented order, reads best as one list"
+)]
 fn faults() -> Vec<(&'static str, Fault)> {
     vec![
         ("arrangement", |case, _| {
@@ -961,7 +968,7 @@ fn undo(call: MapperCall) -> MapperCall {
             address,
             size: backing.size(),
         },
-        other => panic!("a restore makes only mappings, not {other:?}"),
+        other => unreachable!("a restore makes only mappings, not {other:?}"),
     }
 }
 
@@ -992,10 +999,10 @@ fn an_unmap_refused_in_the_undo_counts_its_bytes_as_stuck() {
     let (restored, calls) = case.restore();
     let made = expected_calls(&case.body, &rich.objects);
     let MapperCall::Unmap { size, .. } = undo(made[0]) else {
-        panic!("an undo is an unmap");
+        unreachable!("an undo is an unmap");
     };
     let Err(SnapshotError::Translation { stuck, .. }) = restored else {
-        panic!("not a translation refusal");
+        unreachable!("not a translation refusal");
     };
     assert_eq!(stuck, size);
     // The second is still unmapped after the first's unmap was refused.
@@ -1020,6 +1027,10 @@ type BlockChange = Box<dyn Fn(&mut SavedBlock)>;
 const WRITE_ONLY: u8 = MemoryPermission::USER_WRITE.bits() & MemoryPermission::USER_MASK.bits();
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one case per check of a block, in the documented order, reads best as one list"
+)]
 fn each_check_of_one_block_has_its_own_fault() {
     let rich = rich();
     let tls = thread_local(&rich);
@@ -1324,6 +1335,12 @@ fn of_two_faults_in_one_block_the_earlier_check_is_reported() {
             "{name}"
         );
     }
+}
+
+#[test]
+fn of_two_faults_on_the_first_last_or_two_blocks_the_earlier_check_is_reported() {
+    let rich = rich();
+    let tls = thread_local(&rich);
     // Free before IPC, on the first block (free).
     let mut case = Case::new(&rich);
     case.body.blocks[0].permission = MemoryPermission::KERNEL_READ.bits();
@@ -1910,6 +1927,9 @@ fn a_lock_range_saved_twice_is_out_of_order() {
     );
 }
 
+/// A change to one saved block, as a plain function.
+type SavedChange = fn(&mut SavedBlock);
+
 #[test]
 fn each_device_count_is_checked_against_the_locks_on_its_own() {
     // Heap pages 3-5 are locked once, overlapping the twice-locked pages 2-3: page 3 is used by
@@ -1929,13 +1949,13 @@ fn each_device_count_is_checked_against_the_locks_on_its_own() {
     };
     assert_eq!(counts(middle), (3, 1, 2));
     assert_eq!(counts(last), (1, 0, 1));
-    let changes: [(&str, u64, fn(&mut SavedBlock)); 3] = [
+    let changes: [(&str, u64, SavedChange); 3] = [
         ("a use count", last, |b| b.device_use_count = 2),
         ("a left count", middle, |b| {
-            b.device_disable_merge_left_count = 2
+            b.device_disable_merge_left_count = 2;
         }),
         ("a right count", middle, |b| {
-            b.device_disable_merge_right_count = 1
+            b.device_disable_merge_right_count = 1;
         }),
     ];
     for (name, address, change) in changes {
