@@ -2048,7 +2048,25 @@ fn apply(space: &mut AddressSpace, op: &Op) -> bool {
         Op::Lend(at, n) => {
             space.lock_for_transfer_memory(page(heap, at), bytes(n), SvcPermission::None)
         }
-        Op::TakeBack(at, n) => space.unlock_for_transfer_memory(page(heap, at), bytes(n)),
+        Op::TakeBack(at, n) => {
+            // The kernel takes back only a range a transfer memory locked, never an alias's
+            // source (module docs, "Why each relation holds live": the aliases), which this
+            // call would take as well, since it does not test the permission.
+            let range = Region {
+                start: page(heap, at),
+                end: page(heap, at + n),
+            };
+            let a_source = space.aliases.runs().iter().any(|&(_, source, size)| {
+                range.overlaps(Region {
+                    start: source,
+                    end: source + size,
+                })
+            });
+            if a_source {
+                return false;
+            }
+            space.unlock_for_transfer_memory(page(heap, at), bytes(n))
+        }
         Op::Alias { dst, src, n } => {
             let dst = stack_top(space, dst);
             space.map_memory(dst, page(heap, src), bytes(n))
