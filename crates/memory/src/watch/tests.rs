@@ -169,6 +169,30 @@ fn page_set_removes_a_page_and_leaves_its_neighbours() {
 }
 
 #[test]
+fn page_set_inserts_a_range_except_the_given_pages() {
+    let mut except = PageSet::default();
+    // Ends exactly at the range's start, overlaps its start, sits inside it, overlaps its end,
+    // and starts exactly at its end: only the middle three cut into it.
+    for (first, count) in [(5, 5), (9, 2), (13, 1), (15, 2), (19, 3), (20, 2)] {
+        except.insert(pages(first, count));
+    }
+    let mut set = PageSet::default();
+    set.insert_except(pages(10, 10), &except); // 10..20
+    assert_eq!(ranges(&mut set), [pages(11, 2), pages(14, 1), pages(17, 2)]);
+    // Nothing excepted: the whole range. Everything excepted: nothing.
+    set.insert_except(pages(10, 10), &PageSet::default());
+    assert_eq!(ranges(&mut set), [pages(10, 10)]);
+    let mut all = PageSet::default();
+    all.insert(pages(9, 12));
+    set.insert_except(pages(10, 10), &all);
+    assert_eq!(ranges(&mut set), []);
+    // The excepted pages already in the set stay: it only skips adding them.
+    set.insert(pages(13, 1));
+    set.insert_except(pages(10, 10), &except);
+    assert_eq!(ranges(&mut set), [pages(11, 4), pages(17, 2)]);
+}
+
+#[test]
 fn page_set_handles_the_highest_representable_page() {
     let last = u64::MAX - (PAGE_SIZE - 1);
     let top = PageRange::new(last - 2 * PAGE_SIZE, 2 * PAGE_SIZE).unwrap();
@@ -200,8 +224,6 @@ fn a_request_is_armed_only_after_the_kernel_arms_it() {
     assert!(!watch.has_requests());
     // Taken is not armed: the kernel has not protected and flushed yet.
     assert!(!watch.armed(ticket));
-    // Nor are its pages watched yet.
-    assert!(!watch.record_fault(4 * PAGE_SIZE));
 
     watch.arm(&taken).unwrap();
     assert!(watch.armed(ticket));
@@ -308,6 +330,132 @@ fn a_waiting_request_holds_back_later_ones() {
 }
 
 #[test]
+fn a_write_between_protect_and_arm_is_the_watchs() {
+    let watch = WriteWatch::new();
+    let ticket = watch.request(pages(4, 2)); // 4..6
+    let mut taken = Vec::new();
+    watch.take_requests(&mut taken);
+    // The kernel has protected and flushed but not armed yet: a store on another core faults.
+    assert!(watch.record_fault(5 * PAGE_SIZE + 0x40));
+    // Its permission was restored: a second store to it is not the watch's.
+    assert!(!watch.record_fault(5 * PAGE_SIZE));
+    // `armed` still waits for `arm`.
+    assert!(!watch.armed(ticket));
+    assert_eq!(drain(&watch), [pages(5, 1)]);
+    // Pages of a request still waiting to be taken are not protected: not the watch's.
+    let waiting = watch.request(pages(8, 1));
+    assert!(!watch.record_fault(8 * PAGE_SIZE));
+
+    watch.arm(&taken).unwrap();
+    assert!(watch.armed(ticket));
+    assert!(!watch.armed(waiting));
+    // The written page had its permission restored: it is not watched after `arm`.
+    assert!(!watch.record_fault(5 * PAGE_SIZE));
+    // The page that was not written is.
+    assert!(watch.record_fault(4 * PAGE_SIZE));
+    assert_eq!(drain(&watch), [pages(4, 1)]);
+}
+
+#[test]
+fn a_write_while_taken_leaves_every_taken_request_that_covers_the_page() {
+    let watch = WriteWatch::new();
+    watch.request(pages(1, 3)); // 1..4
+    watch.request(pages(2, 1));
+    let mut taken = Vec::new();
+    watch.take_requests(&mut taken);
+    assert!(watch.record_fault(2 * PAGE_SIZE));
+    // Arming the request that covers only the written page watches nothing; the wider one
+    // watches its other pages.
+    watch.arm(&taken[1..]).unwrap();
+    assert!(!watch.record_fault(2 * PAGE_SIZE));
+    watch.arm(&taken[..1]).unwrap();
+    assert!(!watch.record_fault(2 * PAGE_SIZE));
+    assert!(watch.record_fault(PAGE_SIZE));
+    assert!(watch.record_fault(3 * PAGE_SIZE));
+    assert_eq!(drain(&watch), [pages(1, 3)]);
+}
+
+#[test]
+fn a_write_to_a_watched_page_also_leaves_a_taken_request_for_it() {
+    let watch = WriteWatch::new();
+    let mut taken = Vec::new();
+    watch.request(pages(1, 1));
+    watch.take_requests(&mut taken);
+    watch.arm(&taken).unwrap();
+    // A second request for the same page is taken (protection already in place), then written.
+    taken.clear();
+    watch.request(pages(1, 1));
+    watch.take_requests(&mut taken);
+    assert!(watch.record_fault(PAGE_SIZE));
+    // The write restored the permission, so arming the second request does not watch the page.
+    watch.arm(&taken).unwrap();
+    assert!(!watch.record_fault(PAGE_SIZE));
+    assert_eq!(drain(&watch), [pages(1, 1)]);
+}
+
+#[test]
+fn a_page_written_while_taken_stays_watched_by_a_later_protection() {
+    let watch = WriteWatch::new();
+    let mut first = Vec::new();
+    watch.request(pages(1, 1));
+    watch.take_requests(&mut first);
+    assert!(watch.record_fault(PAGE_SIZE));
+    // A later request protects the page again and is armed before the first one.
+    let mut second = Vec::new();
+    watch.request(pages(1, 1));
+    watch.take_requests(&mut second);
+    watch.arm(&second).unwrap();
+    // Arming the first request must not undo the second one's watch.
+    watch.arm(&first).unwrap();
+    assert!(watch.record_fault(PAGE_SIZE));
+    assert_eq!(drain(&watch), [pages(1, 1)]);
+}
+
+#[test]
+fn a_taken_request_never_armed_holds_back_every_later_ticket() {
+    // The kernel must arm every request it takes (module docs): until it does, every later
+    // ticket reads as unarmed, however many later batches are armed.
+    let watch = WriteWatch::new();
+    let mut held = Vec::new();
+    let first = watch.request(pages(1, 1));
+    watch.take_requests(&mut held);
+    let mut later = Vec::new();
+    for page in 2..6 {
+        let ticket = watch.request(pages(page, 1));
+        let mut taken = Vec::new();
+        watch.take_requests(&mut taken);
+        watch.arm(&taken).unwrap();
+        later.push(ticket);
+        assert!(!watch.armed(first));
+        assert!(later.iter().all(|&t| !watch.armed(t)), "after page {page}");
+    }
+    // Arming it ends the false negative for every later ticket at once.
+    watch.arm(&held).unwrap();
+    assert!(watch.armed(first));
+    assert!(later.iter().all(|&t| watch.armed(t)));
+}
+
+#[test]
+fn arm_checks_the_ticket_and_range_not_which_watch_issued_them() {
+    // `arm` checks only that the ticket is taken and not yet armed here, with the same range
+    // (`WatchError::NotTaken`). A request taken from another watch that matches both is
+    // accepted; one that does not match is refused.
+    let a = WriteWatch::new();
+    let b = WriteWatch::new();
+    let mut from_a = Vec::new();
+    let mut from_b = Vec::new();
+    a.request(pages(1, 1));
+    a.take_requests(&mut from_a);
+    b.request(pages(1, 1));
+    b.request(pages(2, 1));
+    b.take_requests(&mut from_b);
+    assert_eq!(a.arm(&from_b[1..]), Err(WatchError::NotTaken { ticket: 1 }));
+    assert_eq!(a.arm(&from_b[..1]), Ok(()));
+    assert!(a.armed(from_a[0].ticket()));
+    assert_eq!(a.arm(&from_a), Err(WatchError::NotTaken { ticket: 0 }));
+}
+
+#[test]
 fn arm_is_all_or_nothing() {
     let watch = WriteWatch::new();
     watch.request(pages(1, 1));
@@ -328,7 +476,9 @@ fn arm_is_all_or_nothing() {
         Err(WatchError::NotTaken { ticket: 1 })
     );
     assert!(!watch.armed(valid.ticket()));
-    assert!(!watch.record_fault(PAGE_SIZE));
+    // The stray's page was not watched either. (The valid request's page is the watch's from
+    // the take on, armed or not, so it cannot show this.)
+    assert!(!watch.record_fault(2 * PAGE_SIZE));
 
     // A taken ticket with a different range is refused too.
     let forged = WatchRequest {

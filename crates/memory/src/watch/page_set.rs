@@ -59,8 +59,31 @@ impl PageSet {
         true
     }
 
+    /// Adds every page of `range` that is not in `except`.
+    pub(super) fn insert_except(&mut self, range: PageRange, except: &PageSet) {
+        let mut from = range.start();
+        for (&start, &end) in except.ranges.range(..range.end()) {
+            if end <= from {
+                continue;
+            }
+            // `from < start < range.end()`, so the gap is a valid, non-empty range.
+            if start > from {
+                self.insert(PageRange {
+                    start: from,
+                    size: start - from,
+                });
+            }
+            from = end;
+        }
+        if from < range.end() {
+            self.insert(PageRange {
+                start: from,
+                size: range.end() - from,
+            });
+        }
+    }
+
     /// Whether the page holding `va` is in the set.
-    #[cfg(test)]
     pub(super) fn contains(&self, va: u64) -> bool {
         self.ranges
             .range(..=va)

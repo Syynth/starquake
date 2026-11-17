@@ -10,8 +10,8 @@ use super::{PageRange, WatchError, WatchRequest, WriteWatch};
 use crate::translation::{MapError, PAGE_SIZE};
 
 /// Plays the kernel against a [`WriteWatch`]: [`Self::enter`] is a kernel entry that applies
-/// every waiting request, and [`Self::cpu_write`] is a guest store that faults on each watched
-/// page it touches, exactly as the real kernel's calls into the watch would.
+/// every waiting request, and [`Self::cpu_write`] is a permitted guest store that faults on each
+/// watched page it touches, making the calls into the watch the real kernel would make.
 #[derive(Debug)]
 pub struct FakeWatchKernel {
     watch: Arc<WriteWatch>,
@@ -41,8 +41,14 @@ impl FakeWatchKernel {
         Ok(self.taken.len())
     }
 
-    /// A guest store of `len` bytes at `va`: each page it touches that is watched faults once
-    /// and is recorded dirty ([`WriteWatch::record_fault`]). Returns how many pages faulted.
+    /// A guest store of `len` bytes at `va` that the guest's own permission allows: each page it
+    /// touches that is the watch's faults once and is recorded dirty
+    /// ([`WriteWatch::record_fault`]). Returns how many pages faulted.
+    ///
+    /// It models permitted stores only. The real kernel delivers a store the guest's permission
+    /// does not allow (a read-only mapping, a code page) to the guest as a permission fault and
+    /// never asks the watch; this fake has no guest permissions, so a test must not use it for
+    /// such a store.
     ///
     /// Walks every page of the store, so it is meant for test-sized stores. The range must be
     /// one [`PageRange::covering`] accepts.
