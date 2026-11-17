@@ -203,6 +203,11 @@ use crate::memory::state::{
 };
 use crate::snapshot::{Format, FormatError, decode, encode};
 
+mod alias;
+
+pub use alias::AliasFault;
+use alias::SavedAlias;
+
 #[cfg(test)]
 mod tests;
 
@@ -210,7 +215,9 @@ mod tests;
 pub const ADDRESS_SPACE_MAGIC: [u8; 4] = *b"SQAS";
 
 /// Layout version written into every address space snapshot and required when reading one.
-pub const ADDRESS_SPACE_VERSION: u32 = 1;
+///
+/// Version 1 had no aliases; version 2 appends them to the body (module docs, "Format").
+pub const ADDRESS_SPACE_VERSION: u32 = 2;
 
 /// The address space snapshot's header.
 const FORMAT: Format = Format {
@@ -471,16 +478,13 @@ pub enum SnapshotError {
     /// The checked blocks did not make a block map: a bug in the checks.
     #[error("the address space snapshot's blocks do not make a block map: {0}")]
     BlockMap(BlockMapError),
-    /// The address space has a `MapMemory` alias, which a snapshot does not save yet (module
-    /// docs, "Divergences and what is not checked").
-    #[error(
-        "the address space has {size:#x} bytes at {address:#x} aliased by MapMemory, which a snapshot cannot save yet"
-    )]
-    Aliased {
-        /// Where the first alias starts.
-        address: u64,
-        /// Its size.
-        size: u64,
+    /// A `MapMemory` alias is wrong.
+    #[error("alias {index} of the address space snapshot {fault}")]
+    Alias {
+        /// Its position in the list.
+        index: usize,
+        /// What is wrong with it.
+        fault: AliasFault,
     },
 }
 
@@ -558,9 +562,10 @@ struct Body {
     blocks: Vec<SavedBlock>,
     shared: Vec<SavedShared>,
     locks: Vec<SavedLock>,
+    aliases: Vec<SavedAlias>,
 }
 
-/// What checks 2 to 7 found: what a restore builds from.
+/// What checks 2 to 8 found: what a restore builds from.
 struct Checked {
     memory: ProcessMemory,
     regions: Regions,
@@ -647,10 +652,11 @@ impl Body {
                     count,
                 })
                 .collect(),
+            aliases: alias::saved(&space.aliases),
         }
     }
 
-    /// Checks 2 to 7 of the module docs, in order.
+    /// Checks 2 to 8 of the module docs, in order.
     fn check(&self) -> Result<Checked, SnapshotError> {
         let (memory, regions) = self.check_layout()?;
         self.check_counts(&memory, &regions)?;
@@ -658,6 +664,7 @@ impl Body {
         self.check_ranges(&memory, &regions, &blocks)?;
         self.check_shared(&blocks)?;
         self.check_locks(&regions, &blocks)?;
+        alias::check(&self.aliases, &regions, &blocks)?;
         Ok(Checked {
             memory,
             regions,
@@ -1053,13 +1060,18 @@ fn overlap(block: &MemoryBlock, region: Region) -> u64 {
 /// empty (the layout refuses code of no bytes: `the_code_must_have_pages`). The blocks tile the
 /// address space in order, so the walk starts at the block holding the range's start.
 fn every_block(blocks: &[MemoryBlock], range: Region, test: impl Fn(MemoryState) -> bool) -> bool {
+    blocks_touching(blocks, range).all(|block| test(block.state()))
+}
+
+/// The blocks that `range` touches, in address order. The blocks tile the address space in
+/// order, so the walk starts at the block holding the range's start.
+fn blocks_touching(blocks: &[MemoryBlock], range: Region) -> impl Iterator<Item = &MemoryBlock> {
     let first = blocks.partition_point(|block| block.end().is_some_and(|end| end <= range.start));
     blocks
         .get(first..)
         .unwrap_or_default()
         .iter()
-        .take_while(|block| block.address() < range.end)
-        .all(|block| test(block.state()))
+        .take_while(move |block| block.address() < range.end)
 }
 
 /// How many bytes of `Normal` memory lie inside `region`.
@@ -1086,15 +1098,10 @@ fn block_ending_at(blocks: &[MemoryBlock], end: u64) -> Option<usize> {
 }
 
 impl AddressSpace {
-    /// The address space as a snapshot (module docs, "Format"), after checks 2 to 7 of the
-    /// module docs on what it is about to write: a failure is a bug in the kernel. Before them,
-    /// an address space with a live `MapMemory` alias is refused with
-    /// [`SnapshotError::Aliased`], naming the alias with the lowest address: the format has no
-    /// place for one yet (module docs, "Divergences and what is not checked").
+    /// The address space as a snapshot (module docs, "Format"), its `MapMemory` aliases with
+    /// it, after checks 2 to 8 of the module docs on what it is about to write: a failure is a
+    /// bug in the kernel.
     pub fn save(&self) -> Result<Vec<u8>, SnapshotError> {
-        if let Some((address, size)) = self.aliases.first() {
-            return Err(SnapshotError::Aliased { address, size });
-        }
         let body = Body::of(self);
         body.check()?;
         Ok(encode(FORMAT, &body)?)
@@ -1104,8 +1111,8 @@ impl AddressSpace {
     /// "Checks", for what is checked and in what order). `shared` gives the shared memory an
     /// object id names, for each shared memory mapping, from the restored object table.
     ///
-    /// `mapper` must be new: nothing mapped. On a refusal before check 9 it has been asked
-    /// nothing; on a refusal in check 9 it has been asked to unmap what it mapped.
+    /// `mapper` must be new: nothing mapped. On a refusal before check 10 it has been asked
+    /// nothing; on a refusal in check 10 it has been asked to unmap what it mapped.
     pub fn restore(
         bytes: &[u8],
         mapper: Box<dyn Mapper>,
@@ -1117,7 +1124,7 @@ impl AddressSpace {
             regions,
             blocks,
         } = body.check()?;
-        // Check 8: the shared memory each mapping names.
+        // Check 9: the shared memory each mapping names.
         let mut objects = BTreeMap::new();
         for (index, mapping) in body.shared.iter().enumerate() {
             let fault = |fault| SnapshotError::Shared { index, fault };
@@ -1150,9 +1157,9 @@ impl AddressSpace {
             blocks,
         )
         .map_err(SnapshotError::BlockMap)?;
-        // Check 9: the translation.
+        // Check 10: the translation.
         let mut mapper = mapper;
-        rebuild(mapper.as_mut(), blocks.blocks(), &objects)?;
+        rebuild(mapper.as_mut(), blocks.blocks(), &objects, &body.aliases)?;
         Ok(Self {
             created_from: memory,
             regions,
@@ -1180,54 +1187,95 @@ impl AddressSpace {
                 .map(|lock| ((lock.address, lock.size), lock.count))
                 .collect(),
             mapped_physical_memory_size: body.mapped_physical_memory_size,
-            aliases: super::alias::Aliases::default(),
+            aliases: alias::restored(&body.aliases),
             mapper,
         })
     }
 }
 
-/// Check 9: maps every block that is not free through `mapper`, in address order, a `Shared`
-/// one with the pages of the shared memory `objects` holds for its address. A refusal unmaps
-/// what was mapped, in address order.
+/// Check 10: maps every block that is not free through `mapper`, in address order, a `Shared`
+/// one with the pages of the shared memory `objects` holds for its address, any other as fresh
+/// memory without the pages `aliases` covers (one call for each part left, in address order);
+/// then each of `aliases`, in address order, as its source's pages ([`Mapper::map_alias`]),
+/// read-write (check 8 found every page of each destination read-write). A refusal unmaps
+/// what was mapped: the aliases first, since each maps pages of a source mapped before it,
+/// then the rest, each in address order.
 fn rebuild<'a>(
     mapper: &mut dyn Mapper,
     blocks: impl IntoIterator<Item = &'a MemoryBlock>,
     objects: &BTreeMap<u64, SharedMemory>,
+    aliases: &[SavedAlias],
 ) -> Result<(), SnapshotError> {
     let mut made: Vec<(u64, u64)> = Vec::new();
     for block in blocks {
-        if block.state() == MemoryState::Free {
+        let state = block.state();
+        if state == MemoryState::Free {
             continue;
         }
-        let (address, size) = (block.address(), block.size());
-        let result = match block.permission().guest() {
-            None => Err(MapperError(format!(
-                "permission {:#x} has no translation",
-                block.permission().bits()
-            ))),
-            Some(perms) if block.state() == MemoryState::Shared => match objects.get(&address) {
-                Some(memory) => mapper.map_shared(address, memory.backing(), perms),
-                None => Err(MapperError(
-                    "no shared memory was resolved for this mapping".into(),
-                )),
-            },
-            Some(perms) => mapper.map(address, size, perms),
+        let parts = if state == MemoryState::Shared {
+            vec![(block.address(), block.size())]
+        } else {
+            alias::uncovered(block, aliases)
         };
-        if let Err(error) = result {
-            let mut stuck = 0_u64;
-            for &(at, bytes) in &made {
-                if mapper.unmap(at, bytes).is_err() {
-                    stuck = stuck.saturating_add(bytes);
+        for (address, size) in parts {
+            let result = translation(block.permission()).and_then(|perms| {
+                if state != MemoryState::Shared {
+                    return mapper.map(address, size, perms);
                 }
+                match objects.get(&address) {
+                    Some(memory) => mapper.map_shared(address, memory.backing(), perms),
+                    None => Err(MapperError(
+                        "no shared memory was resolved for this mapping".into(),
+                    )),
+                }
+            });
+            if let Err(error) = result {
+                return Err(SnapshotError::Translation {
+                    address,
+                    size,
+                    error,
+                    stuck: undo(mapper, &[], &made),
+                });
             }
+            made.push((address, size));
+        }
+    }
+    let mut aliased: Vec<(u64, u64)> = Vec::new();
+    for alias in aliases {
+        let (address, size) = (alias.address, alias.size);
+        let result = translation(MemoryPermission::USER_READ_WRITE)
+            .and_then(|perms| mapper.map_alias(address, alias.source, size, perms));
+        if let Err(error) = result {
             return Err(SnapshotError::Translation {
                 address,
                 size,
                 error,
-                stuck,
+                stuck: undo(mapper, &aliased, &made),
             });
         }
-        made.push((address, size));
+        aliased.push((address, size));
     }
     Ok(())
+}
+
+/// The translation's permission for `permission`, or the refusal [`rebuild`] reports.
+fn translation(permission: MemoryPermission) -> Result<starquake_memory::Perms, MapperError> {
+    permission.guest().ok_or_else(|| {
+        MapperError(format!(
+            "permission {:#x} has no translation",
+            permission.bits()
+        ))
+    })
+}
+
+/// Unmaps what [`rebuild`] mapped before a refusal: `aliased`, then `made`, each in the order
+/// given (address order). Returns the bytes whose unmap was refused.
+fn undo(mapper: &mut dyn Mapper, aliased: &[(u64, u64)], made: &[(u64, u64)]) -> u64 {
+    let mut stuck = 0_u64;
+    for &(at, bytes) in aliased.iter().chain(made) {
+        if mapper.unmap(at, bytes).is_err() {
+            stuck = stuck.saturating_add(bytes);
+        }
+    }
+    stuck
 }

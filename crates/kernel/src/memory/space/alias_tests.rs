@@ -8,7 +8,6 @@
 use starquake_memory::Perms;
 
 use super::alias::{Aliases, LOCKED_SOURCE};
-use super::snapshot::SnapshotError;
 use super::*;
 use crate::memory::fixture::loaded;
 use crate::memory::testing::{MapperCall, MapperLog, RecordingMapper};
@@ -527,7 +526,6 @@ fn the_alias_record_matches_page_by_page_and_cuts_runs_at_both_ends() {
     aliases.remove(13 * p, 2 * p);
     aliases.remove(20 * p, p);
     assert_eq!(aliases.runs(), [(10 * p, 100 * p, p)]);
-    assert_eq!(aliases.first(), Some((10 * p, p)));
 }
 
 // ----- A refusing translation ---------------------------------------------------------------------
@@ -690,10 +688,87 @@ fn a_refused_remap_leaves_the_destination_free_and_the_source_locked() {
     assert_eq!(rig.block(rig.dst(2)).state(), MemoryState::Stack);
 }
 
+// ----- Device-share locks on either range ---------------------------------------------------------
+
+#[test]
+fn map_memory_refuses_a_source_a_device_holds_on_any_of_its_pages() {
+    // Eden's source check masks every attribute (`KMemoryAttribute::All`, `None` expected), the
+    // counted `DeviceShared` among them: a source a device holds, wholly or on one page, is
+    // `InvalidCurrentMemory`.
+    let mut rig = Rig::new();
+    let dst = rig.dst(0);
+    rig.space.lock_device_share(rig.src(1), PAGE_SIZE).unwrap();
+    let before = rig.blocks();
+    drop(rig.log.take());
+    for (src, size) in [(rig.src(1), PAGE_SIZE), (rig.src(0), pages(2))] {
+        assert_eq!(
+            rig.space.map_memory(dst, src, size),
+            invalid(KernelError::InvalidCurrentMemory),
+            "{src:#x}"
+        );
+    }
+    assert_eq!(rig.blocks(), before);
+    assert_eq!(rig.log.take(), []);
+    assert_eq!(rig.runs(), []);
+    // The page below the held one, which ends where it starts, is aliased.
+    assert_eq!(rig.space.map_memory(dst, rig.src(0), PAGE_SIZE), Ok(()));
+    // Once the device lets go, the held page is aliased too.
+    assert_eq!(rig.space.unlock_device_share(rig.src(1), PAGE_SIZE), Ok(()));
+    assert_eq!(
+        rig.space.map_memory(rig.dst(1), rig.src(1), PAGE_SIZE),
+        Ok(())
+    );
+}
+
+#[test]
+fn a_locked_source_cannot_be_device_share_locked_and_a_free_destination_neither() {
+    // `LockForMapDeviceAddressSpace` masks `IpcLocked | Locked` (`None` expected), so a source
+    // `MapMemory` locked never becomes device shared, and `UnmapMemory`'s source check never
+    // meets one; and free memory has no `FlagCanAlignedDeviceMap`, so `MapMemory`'s
+    // destination is never device shared either.
+    let mut rig = Rig::new();
+    let (src, dst) = (rig.src(0), rig.dst(0));
+    rig.space.map_memory(dst, src, PAGE_SIZE).unwrap();
+    let before = rig.blocks();
+    assert_eq!(
+        rig.space.lock_device_share(src, PAGE_SIZE),
+        invalid(KernelError::InvalidCurrentMemory)
+    );
+    assert_eq!(
+        rig.space.lock_device_share(rig.dst(1), PAGE_SIZE),
+        invalid(KernelError::InvalidCurrentMemory)
+    );
+    assert_eq!(rig.blocks(), before);
+    assert_eq!(rig.space.device_locks(src, PAGE_SIZE), 0);
+    // The alias itself can be held.
+    assert_eq!(rig.space.lock_device_share(dst, PAGE_SIZE), Ok(()));
+}
+
+#[test]
+fn unmapping_part_of_an_alias_a_device_holds_on_another_page_is_taken() {
+    // The destination check is of the range unmapped: a held page below it, ending where it
+    // starts, does not refuse it, and stays held.
+    let mut rig = Rig::new();
+    let (src, dst) = (rig.src(0), rig.dst(0));
+    rig.space.map_memory(dst, src, pages(2)).unwrap();
+    rig.space.lock_device_share(dst, PAGE_SIZE).unwrap();
+    assert_eq!(
+        rig.space.unmap_memory(dst, src, pages(2)),
+        invalid(KernelError::InvalidCurrentMemory)
+    );
+    assert_eq!(
+        rig.space.unmap_memory(rig.dst(1), rig.src(1), PAGE_SIZE),
+        Ok(())
+    );
+    assert_eq!(rig.block(dst).attribute(), MemoryAttribute::DEVICE_SHARED);
+    assert_eq!(rig.space.device_locks(dst, PAGE_SIZE), 1);
+    assert_eq!(rig.runs(), [(dst, src, PAGE_SIZE)]);
+}
+
 // ----- Snapshots ----------------------------------------------------------------------------------
 
 #[test]
-fn an_address_space_with_an_alias_is_not_saved() {
+fn an_address_space_with_aliases_saves_them_and_its_restore_unmaps_them() {
     let mut rig = Rig::new();
     rig.space
         .map_memory(rig.dst(4), rig.src(4), PAGE_SIZE)
@@ -701,37 +776,26 @@ fn an_address_space_with_an_alias_is_not_saved() {
     rig.space
         .map_memory(rig.dst(0), rig.src(0), pages(2))
         .unwrap();
-    // The alias with the lowest address is named.
-    let refused = rig.space.save();
-    assert_eq!(
-        refused,
-        Err(SnapshotError::Aliased {
-            address: rig.dst(0),
-            size: pages(2)
-        })
-    );
-    assert_eq!(
-        refused.unwrap_err().to_string(),
-        format!(
-            "the address space has {:#x} bytes at {:#x} aliased by MapMemory, which a snapshot \
-             cannot save yet",
-            pages(2),
-            rig.dst(0)
-        )
-    );
-    // Once the aliases are gone it saves, and what it restores can alias again.
-    rig.space
-        .unmap_memory(rig.dst(0), rig.src(0), pages(2))
-        .unwrap();
-    assert!(rig.space.save().is_err());
-    rig.space
-        .unmap_memory(rig.dst(4), rig.src(4), PAGE_SIZE)
-        .unwrap();
     let bytes = rig.space.save().unwrap();
     let (mapper, _log) = RecordingMapper::new();
     let mut restored = AddressSpace::restore(&bytes, Box::new(mapper), |_| None).unwrap();
+    assert_eq!(restored.aliases.runs(), rig.runs());
+    // The restored record is used: a mismatched pair is refused, each pair unmaps, and what
+    // was a source can be aliased again.
     assert_eq!(
-        restored.map_memory(rig.dst(0), rig.src(0), PAGE_SIZE),
+        restored.unmap_memory(rig.dst(4), rig.src(0), PAGE_SIZE),
+        invalid(KernelError::InvalidMemoryRegion)
+    );
+    assert_eq!(
+        restored.unmap_memory(rig.dst(0), rig.src(0), pages(2)),
+        Ok(())
+    );
+    assert_eq!(
+        restored.unmap_memory(rig.dst(4), rig.src(4), PAGE_SIZE),
+        Ok(())
+    );
+    assert_eq!(
+        restored.map_memory(rig.dst(8), rig.src(0), PAGE_SIZE),
         Ok(())
     );
 }
@@ -740,7 +804,8 @@ fn an_address_space_with_an_alias_is_not_saved() {
 fn a_restored_alias_shape_is_not_an_alias() {
     // Blocks shaped like an aliased pair, made without `MapMemory`: heap lent to a transfer
     // memory with no access for its owner (`Normal`, `KernelRead | NotMapped`, `Locked`), and
-    // a stack page.
+    // a stack page. The snapshot's alias record is what makes an alias, not the shape (the
+    // `snapshot` module docs, "Not checked here").
     let mut rig = Rig::new();
     let (src, dst) = (rig.src(0), rig.dst(0));
     rig.space

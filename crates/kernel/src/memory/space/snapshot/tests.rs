@@ -13,10 +13,14 @@ use crate::id::SlabId;
 use crate::memory::fixture::{CODE, DATA, RODATA, SHARED, loaded, shared_memory};
 use crate::memory::layout::LayoutError;
 use crate::memory::state::SvcPermission;
+use starquake_memory::Perms;
+
 use crate::memory::testing::{MapperCall, MapperLog, RecordingMapper};
 use crate::object::Objects;
 use crate::result::{CallResult, KernelError, SvcError};
 use crate::snapshot::FormatError;
+
+mod alias;
 
 /// Fixed seed so a run is reproducible; failures are not persisted to disk.
 const PROPTEST_SEED: u64 = 0x5351_4153_534E_4150;
@@ -43,6 +47,15 @@ struct Rich {
     shared: [ObjectId; 2],
     heap: u64,
     alias: u64,
+    /// The first of the free pages near the stack region's top that `MapMemory` aliases go to
+    /// ([`stack_top`]).
+    stack: u64,
+}
+
+/// Page `n` of the 64 pages below the stack region's top: free in the fixture's loaded space,
+/// whose main thread's stack is at the region's bottom.
+fn stack_top(space: &AddressSpace, n: u64) -> u64 {
+    page(space.regions().stack.end - 64 * PAGE_SIZE, n)
 }
 
 /// Page `index` from `start`.
@@ -57,12 +70,15 @@ const GENERATED: u64 = SHARED + 8 * PAGE_SIZE;
 /// runs at the alias region's start; device-share locks taken twice on heap pages 2-3, once on
 /// heap pages 3-5 (overlapping the first) and once on the first alias page; heap pages 8-9
 /// GPU accessible and page 9 uncached too; heap pages 12-13 lent to a transfer memory; two
-/// shared memory mappings side by side; a thread-local page; two pages of generated code; and
-/// the data segment's first page permission locked. The mapper log is empty.
+/// shared memory mappings side by side; a thread-local page; two pages of generated code; the
+/// data segment's first page permission locked; and two `MapMemory` aliases, heap page 6 at
+/// stack page 48 ([`stack_top`]), device-share locked once there, and heap pages 10-11 at
+/// stack pages 50-51. The mapper log is empty.
 fn rich() -> Rich {
     let (mut space, log, _) = loaded();
     let heap = space.regions().heap.start;
     let alias = space.regions().alias.start;
+    let stack = stack_top(&space, 0);
     space.set_heap_size(16 * PAGE_SIZE).unwrap();
     space.map_physical_memory(alias, 2 * PAGE_SIZE).unwrap();
     space
@@ -117,6 +133,13 @@ fn rich() -> Rich {
     space
         .set_memory_attribute(DATA, PAGE_SIZE, locked, locked)
         .unwrap();
+    space
+        .map_memory(page(stack, 48), page(heap, 6), PAGE_SIZE)
+        .unwrap();
+    space.lock_device_share(page(stack, 48), PAGE_SIZE).unwrap();
+    space
+        .map_memory(page(stack, 50), page(heap, 10), 2 * PAGE_SIZE)
+        .unwrap();
     drop(log.take());
     Rich {
         space,
@@ -125,6 +148,7 @@ fn rich() -> Rich {
         shared: shared.map(Option::unwrap),
         heap,
         alias,
+        stack,
     }
 }
 
@@ -141,35 +165,70 @@ fn restore_with(
 }
 
 /// The calls a restore makes of its mapper for `body`'s blocks: each block that is not free,
-/// in address order.
+/// in address order, without the pages an alias covers (found page by page here, not by the
+/// restore's walk), then each alias in address order.
 fn expected_calls(body: &Body, objects: &Resolver) -> Vec<MapperCall> {
     let backing: BTreeMap<u64, _> = body
         .shared
         .iter()
         .map(|mapping| (mapping.address, objects[&mapping.object].backing()))
         .collect();
-    body.blocks
+    let aliased: BTreeSet<u64> = body
+        .aliases
+        .iter()
+        .flat_map(|alias| (0..alias.size / PAGE_SIZE).map(|n| page(alias.address, n)))
+        .collect();
+    let mut calls = Vec::new();
+    for block in body
+        .blocks
         .iter()
         .filter(|block| block.state != MemoryState::Free.word())
-        .map(|block| {
-            let address = block.address;
-            let perms = MemoryPermission::from_bits(block.permission)
-                .guest()
-                .unwrap();
-            match backing.get(&address) {
-                Some(&backing) => MapperCall::MapShared {
-                    address,
-                    backing,
-                    perms,
-                },
-                None => MapperCall::Map {
-                    address,
-                    size: block.pages * PAGE_SIZE,
-                    perms,
-                },
+    {
+        let address = block.address;
+        let perms = MemoryPermission::from_bits(block.permission)
+            .guest()
+            .unwrap();
+        if let Some(&backing) = backing.get(&address) {
+            calls.push(MapperCall::MapShared {
+                address,
+                backing,
+                perms,
+            });
+            continue;
+        }
+        // Each run of pages no alias covers.
+        let mut run: Option<(u64, u64)> = None;
+        for n in 0..block.pages {
+            let at = page(address, n);
+            match run {
+                _ if aliased.contains(&at) => {
+                    if let Some((address, size)) = run.take() {
+                        calls.push(MapperCall::Map {
+                            address,
+                            size,
+                            perms,
+                        });
+                    }
+                }
+                Some((_, ref mut size)) => *size += PAGE_SIZE,
+                None => run = Some((at, PAGE_SIZE)),
             }
-        })
-        .collect()
+        }
+        if let Some((address, size)) = run {
+            calls.push(MapperCall::Map {
+                address,
+                size,
+                perms,
+            });
+        }
+    }
+    calls.extend(body.aliases.iter().map(|alias| MapperCall::MapAlias {
+        address: alias.address,
+        source: alias.source,
+        size: alias.size,
+        perms: Perms::ReadWrite,
+    }));
+    calls
 }
 
 /// The index of the saved block that starts at `address`.
@@ -241,7 +300,7 @@ fn the_restored_space_is_used_as_the_original_is() {
     let (restored, restored_log) = restore_with(&bytes, &rich.objects);
     let mut restored = restored.unwrap();
     drop(restored_log.take());
-    let (heap, alias) = (rich.heap, rich.alias);
+    let (heap, alias, stack) = (rich.heap, rich.alias, rich.stack);
     let [first, second] = rich.shared;
     let invalid: CallResult<()> = Err(SvcError::Kernel(KernelError::InvalidCurrentMemory));
     // The same steps on both, each with the result it should have.
@@ -292,6 +351,36 @@ fn the_restored_space_is_used_as_the_original_is() {
             Ok(()),
         ),
         (
+            "unmapping the alias a device holds is refused",
+            Box::new(move |s| s.unmap_memory(page(stack, 48), page(heap, 6), PAGE_SIZE)),
+            invalid.clone(),
+        ),
+        (
+            "unmapping the second alias as the first's source is refused",
+            Box::new(move |s| s.unmap_memory(page(stack, 50), page(heap, 6), PAGE_SIZE)),
+            Err(SvcError::Kernel(KernelError::InvalidMemoryRegion)),
+        ),
+        (
+            "unmap the second alias's last page",
+            Box::new(move |s| s.unmap_memory(page(stack, 51), page(heap, 11), PAGE_SIZE)),
+            Ok(()),
+        ),
+        (
+            "the device lets go of the first alias",
+            Box::new(move |s| s.unlock_device_share(page(stack, 48), PAGE_SIZE)),
+            Ok(()),
+        ),
+        (
+            "unmap the first alias",
+            Box::new(move |s| s.unmap_memory(page(stack, 48), page(heap, 6), PAGE_SIZE)),
+            Ok(()),
+        ),
+        (
+            "alias the first source again, elsewhere",
+            Box::new(move |s| s.map_memory(page(stack, 56), page(heap, 6), PAGE_SIZE)),
+            Ok(()),
+        ),
+        (
             "grow the heap",
             Box::new(|s| s.set_heap_size(32 * PAGE_SIZE).map(drop)),
             Ok(()),
@@ -311,6 +400,10 @@ fn the_restored_space_is_used_as_the_original_is() {
             page(alias, 1),
             page(SHARED, 2),
             page(heap, 12),
+            page(heap, 6),
+            page(heap, 11),
+            page(stack, 48),
+            page(stack, 51),
         ] {
             assert_eq!(
                 restored.query_info(address).unwrap(),
@@ -318,6 +411,11 @@ fn the_restored_space_is_used_as_the_original_is() {
                 "query of {address:#x} after: {what}"
             );
         }
+        assert_eq!(
+            restored.aliases.runs(),
+            rich.space.aliases.runs(),
+            "aliases after: {what}"
+        );
     }
     // Both translations were asked the same things.
     let calls = rich.log.take();
@@ -402,6 +500,11 @@ fn golden_body() -> Body {
             size: 0x2b,
             count: 0x2c,
         }],
+        aliases: vec![SavedAlias {
+            address: 0x2d,
+            source: 0x2e,
+            size: 0x2f,
+        }],
     }
 }
 
@@ -467,8 +570,10 @@ fn golden_bytes() -> Vec<u8> {
         bytes.push(0xa0 + n);
     }
     // One shared mapping (address, size, object index and generation), one lock (address,
-    // size, count).
-    bytes.extend([1, 0x26, 0x27, 0x28, 0x29, 1, 0x2a, 0x2b, 0x2c]);
+    // size, count), one alias (address, source, size).
+    bytes.extend([
+        1, 0x26, 0x27, 0x28, 0x29, 1, 0x2a, 0x2b, 0x2c, 1, 0x2d, 0x2e, 0x2f,
+    ]);
     bytes
 }
 
@@ -613,6 +718,11 @@ fn any_body() -> impl Strategy<Value = Body> {
             size,
             count,
         });
+    let alias = any::<[u64; 3]>().prop_map(|[address, source, size]| SavedAlias {
+        address,
+        source,
+        size,
+    });
     (
         request,
         regions,
@@ -620,19 +730,23 @@ fn any_body() -> impl Strategy<Value = Body> {
         prop::collection::vec(block, 0..4),
         prop::collection::vec(shared, 0..3),
         prop::collection::vec(lock, 0..3),
+        prop::collection::vec(alias, 0..3),
     )
-        .prop_map(|(request, regions, sizes, blocks, shared, locks)| Body {
-            request,
-            regions,
-            heap_size: sizes[0],
-            max_heap_size: sizes[1],
-            reserved: sizes[2],
-            main_thread_stack_size: sizes[3],
-            mapped_physical_memory_size: sizes[4],
-            blocks,
-            shared,
-            locks,
-        })
+        .prop_map(
+            |(request, regions, sizes, blocks, shared, locks, aliases)| Body {
+                request,
+                regions,
+                heap_size: sizes[0],
+                max_heap_size: sizes[1],
+                reserved: sizes[2],
+                main_thread_stack_size: sizes[3],
+                mapped_physical_memory_size: sizes[4],
+                blocks,
+                shared,
+                locks,
+                aliases,
+            },
+        )
 }
 
 proptest! {
@@ -723,6 +837,11 @@ fn device_share_alone(body: &mut Body, address: u64) {
     block.device_disable_merge_left_count = 1;
     block.device_disable_merge_right_count = 1;
     block.disable_merge |= (DisableMerge::DEVICE_LEFT | DisableMerge::DEVICE_RIGHT).bits();
+}
+
+/// `fault` in the rich space's second alias.
+const fn alias_fault(fault: AliasFault) -> SnapshotError {
+    SnapshotError::Alias { index: 1, fault }
 }
 
 /// The pool the rich space draws from.
@@ -890,6 +1009,40 @@ fn faults() -> Vec<(&'static str, Fault)> {
                 block: at(&case.body, first),
             }
         }),
+        // Each alias fault is on the second alias, so that a pair of them is reported by the
+        // order of the checks of one alias, not by which alias comes first.
+        ("alias shape", |case, _| {
+            case.body.aliases[1].size += 1;
+            alias_fault(AliasFault::Shape)
+        }),
+        ("alias order", |case, _| {
+            case.body.aliases[1].address = case.body.aliases[0].address;
+            alias_fault(AliasFault::Order)
+        }),
+        ("alias region", |case, rich| {
+            // Its two pages across the stack region's end.
+            case.body.aliases[1].address = rich.space.regions().stack.end - PAGE_SIZE;
+            alias_fault(AliasFault::Region)
+        }),
+        ("alias overlap", |case, _| {
+            case.body.aliases[1].source = case.body.aliases[1].address;
+            alias_fault(AliasFault::Overlap)
+        }),
+        ("alias source", |case, rich| {
+            // Heap page 7, which is not aliased.
+            case.body.aliases[1].source = page(rich.heap, 7);
+            alias_fault(AliasFault::Source)
+        }),
+        ("alias destination", |case, rich| {
+            // Free stack pages above the second alias.
+            case.body.aliases[1].address = page(rich.stack, 56);
+            alias_fault(AliasFault::Destination)
+        }),
+        ("alias source taken", |case, _| {
+            // The first alias takes the second's first source page.
+            case.body.aliases[0].source = case.body.aliases[1].source;
+            alias_fault(AliasFault::SourceTaken)
+        }),
         ("shared missing", |case, rich| {
             case.objects.remove(&rich.shared[0]);
             SnapshotError::Shared {
@@ -1002,6 +1155,7 @@ fn undo(call: MapperCall) -> MapperCall {
             address,
             size: backing.size(),
         },
+        MapperCall::MapAlias { address, size, .. } => MapperCall::Unmap { address, size },
         other => unreachable!("a restore makes only mappings, not {other:?}"),
     }
 }
@@ -1816,11 +1970,33 @@ enum Op {
     Protect(u64, u64, bool),
     Lend(u64, u64),
     TakeBack(u64, u64),
+    /// `MapMemory` of `n` heap pages from heap page `src` to stack page `dst` ([`stack_top`]).
+    Alias {
+        dst: u64,
+        src: u64,
+        n: u64,
+    },
+    /// `UnmapMemory` of up to `n` pages from page `skip` of the live alias run this picks,
+    /// with the source pages it maps.
+    Unalias {
+        pick: usize,
+        skip: u64,
+        n: u64,
+    },
+    /// A device-share lock on stack pages ([`stack_top`]), where aliases go.
+    LockStack(u64, u64),
 }
 
 fn any_op() -> impl Strategy<Value = Op> {
     let range = || (0_u64..12, 1_u64..5);
     prop_oneof![
+        (0_u64..12, range()).prop_map(|(dst, (src, n))| Op::Alias { dst, src, n }),
+        (any::<usize>(), 0_u64..4, 1_u64..4).prop_map(|(pick, skip, n)| Op::Unalias {
+            pick,
+            skip,
+            n
+        }),
+        range().prop_map(|(at, n)| Op::LockStack(at, n)),
         (0_u64..16).prop_map(Op::Heap),
         range().prop_map(|(at, n)| Op::MapPhysical(at, n)),
         range().prop_map(|(at, n)| Op::UnmapPhysical(at, n)),
@@ -1873,6 +2049,23 @@ fn apply(space: &mut AddressSpace, op: &Op) -> bool {
             space.lock_for_transfer_memory(page(heap, at), bytes(n), SvcPermission::None)
         }
         Op::TakeBack(at, n) => space.unlock_for_transfer_memory(page(heap, at), bytes(n)),
+        Op::Alias { dst, src, n } => {
+            let dst = stack_top(space, dst);
+            space.map_memory(dst, page(heap, src), bytes(n))
+        }
+        Op::Unalias { pick, skip, n } => {
+            let runs = space.aliases.runs();
+            match runs.get(pick % runs.len().max(1)) {
+                Some(&(address, source, size)) => {
+                    let pages = size / PAGE_SIZE;
+                    let skip = skip % pages;
+                    let n = n.min(pages - skip);
+                    space.unmap_memory(page(address, skip), page(source, skip), bytes(n))
+                }
+                None => Ok(()),
+            }
+        }
+        Op::LockStack(at, n) => space.lock_device_share(stack_top(space, at), bytes(n)),
     };
     result.is_ok()
 }
@@ -2451,6 +2644,39 @@ fn the_new_errors_read_as_plain_words() {
         .to_string(),
         "device-share lock 0 of the address space snapshot covers a block whose memory state cannot be shared with a device"
     );
+    let alias = |index, fault| SnapshotError::Alias { index, fault }.to_string();
+    for (fault, words) in [
+        (
+            AliasFault::Shape,
+            "alias 1 of the address space snapshot is not whole pages inside the address space",
+        ),
+        (
+            AliasFault::Order,
+            "alias 1 of the address space snapshot is out of order or overlaps the one before it",
+        ),
+        (
+            AliasFault::Region,
+            "alias 1 of the address space snapshot is outside the stack region",
+        ),
+        (
+            AliasFault::Overlap,
+            "alias 1 of the address space snapshot has a source that overlaps its destination",
+        ),
+        (
+            AliasFault::Source,
+            "alias 1 of the address space snapshot has a source that is not memory MapMemory locked",
+        ),
+        (
+            AliasFault::Destination,
+            "alias 1 of the address space snapshot has a destination that is not the stack memory MapMemory makes",
+        ),
+        (
+            AliasFault::SourceTaken,
+            "alias 1 of the address space snapshot has a source that an alias before it maps too",
+        ),
+    ] {
+        assert_eq!(alias(1, fault), words);
+    }
 }
 
 #[test]
