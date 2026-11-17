@@ -156,7 +156,7 @@ use crate::ipc::{
 };
 use crate::memory::shared::span_within;
 use crate::memory::{
-    AddressSpace, SharedMemory, SharedPages, SvcPermission, TransferMemory,
+    AddressSpace, DeviceShareToken, SharedMemory, SharedPages, SvcPermission, TransferMemory,
     is_shared_memory_permission, shared_memory_size,
 };
 use crate::object::Object;
@@ -347,20 +347,24 @@ impl IpcContext<'_> {
 
     /// Takes a device-share lock on the sender's `size` bytes at `address`
     /// ([`AddressSpace::lock_device_share`], whose errors these are): while it is held, the CPU
-    /// mapping under the range cannot change. Each lock is released by one
-    /// [`IpcContext::unlock_device_share`] of the same range.
-    pub fn lock_device_share(&mut self, address: u64, size: u64) -> SvcResult<()> {
+    /// mapping under the range cannot change. Returns the token that names the process and the
+    /// exact range; each lock is released by one unlock of its token, on the timer thread
+    /// ([`Dispatcher::unlock_device_share`]) or during a request
+    /// ([`IpcContext::unlock_device_share`]). See `dispatch/device.rs`.
+    pub fn lock_device_share(&mut self, address: u64, size: u64) -> SvcResult<DeviceShareToken> {
         self.dispatcher
-            .with::<(&mut AddressSpace,), _>(|(space,)| space.lock_device_share(address, size))
+            .lock_device_share(address, size)
             .map_err(call_error)
     }
 
-    /// Releases a device-share lock that [`IpcContext::lock_device_share`] took on the same
-    /// range ([`AddressSpace::unlock_device_share`], whose errors these are).
-    pub fn unlock_device_share(&mut self, address: u64, size: u64) -> SvcResult<()> {
+    /// Releases the device-share lock `token` names, as [`Dispatcher::unlock_device_share`]
+    /// does: what a server does when a request that took a lock fails after taking it. A
+    /// refusal of the token itself is [`KernelError::InvalidCurrentMemory`]
+    /// (`DeviceShareError`'s mapping); the address space's own refusals are its results.
+    pub fn unlock_device_share(&mut self, token: DeviceShareToken) -> SvcResult<()> {
         self.dispatcher
-            .with::<(&mut AddressSpace,), _>(|(space,)| space.unlock_device_share(address, size))
-            .map_err(call_error)
+            .unlock_device_share(token)
+            .map_err(|error| call_error(error.into_svc_error()))
     }
 
     /// Signals the event `event` is an end of ([`Scheduler::signal_object`]), waking the guest

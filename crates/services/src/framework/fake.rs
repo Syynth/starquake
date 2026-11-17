@@ -28,7 +28,10 @@
 //! when a test plays the guest's `SignalEvent` ([`FakeKernel::guest_signal`]); the GPU-accessible
 //! attribute is whatever ranges a test marks ([`FakeKernel::mark_gpu_accessible`]); and a
 //! device-share lock is a count per exact range ([`FakeKernel::device_locks`]), taken only on
-//! mapped memory and released only for a range that holds one.
+//! mapped memory, whose token names [`FakeKernel::process`] (made with the kernel's
+//! `test-support` constructor), and released only by a token naming that process and a range
+//! that holds one. Ending the process does not make the fake refuse a token, as the kernel's
+//! unlock does once the process has ended.
 //!
 //! Clearing and ending are modelled as plainly. An event the fake made is signalled from a
 //! signal until a clear ([`FakeKernel::is_signalled`]). Either end of a hooked event clears it,
@@ -43,12 +46,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use starquake_kernel::handle::{Handle, HandleError, HandleTable, RefCounts, Resolved};
-use starquake_kernel::id::{ObjectId, SlabId};
+use starquake_kernel::id::{ObjectId, ProcessId, SlabId};
 use starquake_kernel::ipc::EventHook;
 use starquake_kernel::ipc::message::Current;
-use starquake_kernel::memory::testing::standalone_shared_pages;
+use starquake_kernel::memory::testing::{device_share_token, standalone_shared_pages};
 use starquake_kernel::memory::{
-    SharedPages, SvcPermission, is_shared_memory_permission, shared_memory_size,
+    DeviceShareToken, SharedPages, SvcPermission, is_shared_memory_permission, shared_memory_size,
 };
 use starquake_kernel::result::{KernelError, ResultCode, SvcResult};
 use starquake_trace::{
@@ -276,6 +279,13 @@ impl FakeKernel {
         self.gpu_accessible.push((address, size));
     }
 
+    /// The process the fake's device-share tokens name: the caller's, as the fake plays it
+    /// (module docs).
+    #[must_use]
+    pub fn process(&self) -> ProcessId {
+        ProcessId::from_parts(0, GENERATION)
+    }
+
     /// How many device-share locks are held on exactly the `size` bytes at `address`.
     #[must_use]
     pub fn device_locks(&self, address: u64, size: u64) -> u16 {
@@ -429,26 +439,33 @@ impl Kernel for FakeKernel {
 
     /// [`KernelError::InvalidCurrentMemory`] unless one mapped range holds the whole of the
     /// `size` bytes at `address`, and [`KernelError::OutOfResource`] when the range already
-    /// holds `u16::MAX` locks, as the kernel answers.
-    fn lock_device_share(&mut self, address: u64, size: u64) -> SvcResult<()> {
+    /// holds `u16::MAX` locks, as the kernel answers. The token names [`FakeKernel::process`].
+    fn lock_device_share(&mut self, address: u64, size: u64) -> SvcResult<DeviceShareToken> {
         let len = usize::try_from(size).map_err(|_| KernelError::InvalidCurrentMemory)?;
         if size == 0 || self.memory(address, len).is_none() {
             return Err(KernelError::InvalidCurrentMemory);
         }
         let count = self.device_locks.entry((address, size)).or_insert(0);
         *count = count.checked_add(1).ok_or(KernelError::OutOfResource)?;
-        Ok(())
+        Ok(device_share_token(self.process(), address, size))
     }
 
-    /// [`KernelError::InvalidCurrentMemory`] unless a lock is held on exactly this range.
-    fn unlock_device_share(&mut self, address: u64, size: u64) -> SvcResult<()> {
+    /// [`KernelError::InvalidCurrentMemory`] unless the token names [`FakeKernel::process`] and
+    /// a lock is held on exactly its range, as the kernel answers a server. The fake has no
+    /// process to end, so it never refuses a token as the kernel does once its process has
+    /// ended (module docs).
+    fn unlock_device_share(&mut self, token: DeviceShareToken) -> SvcResult<()> {
+        if token.process() != self.process() {
+            return Err(KernelError::InvalidCurrentMemory);
+        }
+        let range = (token.address(), token.size());
         let count = self
             .device_locks
-            .get_mut(&(address, size))
+            .get_mut(&range)
             .ok_or(KernelError::InvalidCurrentMemory)?;
         *count = count.saturating_sub(1);
         if *count == 0 {
-            self.device_locks.remove(&(address, size));
+            self.device_locks.remove(&range);
         }
         Ok(())
     }
