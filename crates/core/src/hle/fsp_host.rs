@@ -20,9 +20,20 @@
 //! from the image at the first request for the data file system and kept by this host.
 //!
 //! - A probe answers that it is there when the run has a title `RomFS` whose tables read, and
-//!   [`HostFailure::NoDevice`] when it has none. Tables that do not read (the image is damaged,
-//!   or the title file failed) are [`HostFailure::Io`], logged in plain words once, and every
-//!   later request for the data file system gets the same: the failure is kept.
+//!   [`HostFailure::NoDevice`] when it has none. Tables that the loader's reader refuses would be
+//!   [`HostFailure::Io`], logged in plain words, and every later request for the data file
+//!   system this host gets would get the same: the failure is kept, per host.
+//!
+//!   No input reaches that failure today. The only [`RomFs`] is a `RomFsStorage`
+//!   (`starquake_loader::nup::storage`), whose header and tables the loader builds in memory
+//!   from the container's table of contents, and which its reader reads back (the loader's
+//!   tests, `romfs/build/tests.rs` and `nup/storage/tests.rs`); reading them reads nothing from
+//!   the title file, so a title file that fails does not fail them
+//!   (`a_file_the_title_file_fails_to_read_is_an_io_failure`). The arm is kept for a `RomFs`
+//!   whose tables can fail; it, the log and the keeping are **untested**, as no input reaches
+//!   them. The log is once per host, not once per run: each environment of a run holds its
+//!   own copy of this host (the handlers' and one per `fsp-srv` worker, `worker::COUNT`), and a
+//!   copy reads the tables again, so a run would log it up to `1 + worker::COUNT` times.
 //! - A size request answers the file's size; a read the file's bytes from its offset on, at most
 //!   the length asked for, fewer at the end of the file and none past it.
 //! - A path that names no file (nothing there, a directory, a path that is not UTF-8 or not
@@ -66,7 +77,7 @@ pub struct FspHost {
     sd_card: Option<HostFolder>,
     romfs: Option<RomFs>,
     /// The data file system's tables, read at its first request; `Err` once they did not read
-    /// (module docs).
+    /// (module docs: no input reaches that today).
     files: Option<Result<Files, ()>>,
 }
 
@@ -151,7 +162,10 @@ fn answer_files(files: &Files, request: &HostRequest) -> Result<Vec<u8>, HostFai
             path, offset, len, ..
         } => {
             let entry = file(files, path)?;
-            // The data must lie in the image before a byte is held for it.
+            // The data must lie in the image before a byte is held for it: this bounds the
+            // allocation below by the image, not by the entry's size. Unreachable today, and so
+            // untested: the loader builds the tables from the container's table of contents,
+            // which places every file's data inside the image (module docs).
             files
                 .file_extent(&entry)
                 .map_err(|error| io_failure(&error))?;
@@ -172,6 +186,8 @@ fn file(files: &Files, path: &[u8]) -> Result<FileEntry, HostFailure> {
     let path = std::str::from_utf8(path).map_err(|_| HostFailure::NotFound)?;
     match files.find_file(path) {
         Ok(Some(entry)) => Ok(entry),
+        // `PathTooLong` is past the loader's `MAX_PATH_LEN` (0x300), which no request reaches:
+        // `HostRequest::decode` refuses a path over `ENTRY_NAME_LENGTH_MAX`, the same 0x300.
         Ok(None) | Err(RomFsError::InvalidPath { .. } | RomFsError::PathTooLong) => {
             Err(HostFailure::NotFound)
         }

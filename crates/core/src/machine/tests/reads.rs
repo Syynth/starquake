@@ -10,6 +10,7 @@
 use std::cell::RefCell;
 use std::io;
 use std::sync::Condvar;
+use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{self, Sender};
 
@@ -827,4 +828,200 @@ fn an_environment_failure_in_a_read_stops_the_run() {
         report.trace
     );
     assert!(!ran_again, "the guest ran after the environment failed");
+}
+
+#[test]
+fn a_halt_keeps_its_first_reason_and_rings_the_timer_each_time() {
+    // The ring is what wakes a timer thread asleep until its next deadline; without it the run
+    // would still stop, at the timer's next turn (at most one preemption interval later), so
+    // only this test can see it.
+    let bell = Arc::new(timer::Bell::default());
+    let halted = Halted::new(Arc::clone(&bell));
+    assert!(!bell.take_ring());
+    assert_eq!(halted.reason(), None);
+    let first = Stop::Handler(HOST_IO_FAILURE);
+    halted.halt(first.clone());
+    assert!(bell.take_ring());
+    let reason = first.to_string();
+    assert_eq!(halted.reason(), Some(reason.as_str()));
+    // A later stop rings again, and the reason stays the first.
+    halted.halt(Stop::Job {
+        job: 3,
+        error: HOST_IO_FAILURE,
+    });
+    assert!(bell.take_ring());
+    assert_eq!(halted.reason(), Some(reason.as_str()));
+}
+
+/// How long [`HaltsLater`] waits before it tells the run's halt: long enough that the guest is
+/// waiting for its reply by then. (If it were not, the test would still pass: the halt ends the
+/// run either way.)
+const HALT_AFTER: Duration = Duration::from_millis(100);
+
+/// An executor that keeps every job it is given, never run, until it is dropped, and for each
+/// tells the run's halt from a thread of its own [`HALT_AFTER`] later: a halt that no reply
+/// delivery follows.
+struct HaltsLater {
+    halt: Arc<dyn Halt>,
+    jobs: Mutex<Vec<Job>>,
+    threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
+}
+
+impl Executor for HaltsLater {
+    fn submit(&self, job: Job) {
+        lock(&self.jobs).push(job);
+        let halt = Arc::clone(&self.halt);
+        let thread = std::thread::spawn(move || {
+            std::thread::sleep(HALT_AFTER);
+            halt.halt(Stop::Job {
+                job: 0,
+                error: HOST_IO_FAILURE,
+            });
+        });
+        lock(&self.threads).push(thread);
+    }
+}
+
+impl Drop for HaltsLater {
+    fn drop(&mut self) {
+        for thread in std::mem::take(&mut *lock(&self.threads)) {
+            thread.join().unwrap();
+        }
+    }
+}
+
+#[test]
+fn a_halt_no_delivery_follows_stops_a_guest_waiting_for_its_reply() {
+    // The storage read is handed to an executor that never runs it, so the guest waits for its
+    // reply with no deadline; another thread then tells the run's halt.
+    let install = |dispatcher: &Dispatcher, given: Given| {
+        let reads = Reads {
+            executor: Arc::new(HaltsLater {
+                halt: Arc::clone(&given.halt),
+                jobs: Mutex::default(),
+                threads: Mutex::default(),
+            }),
+            ready: Arc::new(given.ready),
+            halt: given.halt,
+        };
+        crate::hle::install(dispatcher, given.env, reads).map_err(|error| error.to_string())
+    };
+    let open: Writes = Box::new(|guest| {
+        guest.write(&libnx(
+            command::fsp_srv::OPEN_DATA_STORAGE_BY_CURRENT_PROCESS,
+        ));
+    });
+    let read: Writes = Box::new(|guest| {
+        let payload = [0_i64.to_le_bytes(), 4_i64.to_le_bytes()].concat();
+        let read = libnx(command::storage::READ)
+            .data(&payload)
+            .receive_buffer(room(guest, 4));
+        guest.write(&read);
+    });
+    let started = Instant::now();
+    let (report, ran_again) = run_failed(vec![open, read], &install);
+    let reason = "the environment failed file-system job 0: recording exhausted at record 9: \
+                  the replay asked for HostIo";
+    assert_eq!(
+        report.exit,
+        ExitReason::EmulatorError(reason.to_owned()),
+        "{}",
+        report.trace
+    );
+    assert!(!ran_again, "the guest ran after the halt");
+    assert!(started.elapsed() < RUN_LIMIT);
+}
+
+/// A guest's flat memory as its address space, which tells the run's halt at the settle
+/// `countdown` says: armed by the guest, it counts the settles down, and the one that takes it
+/// to zero tells the halt.
+struct HaltsAtSettle<'a> {
+    memory: &'a FlatMemory,
+    halt: Arc<OnceLock<Arc<dyn Halt>>>,
+    countdown: Arc<AtomicUsize>,
+}
+
+impl GuestMemory for HaltsAtSettle<'_> {
+    fn read(&self, va: u64, buf: &mut [u8]) -> Result<(), Fault> {
+        self.memory.read(va, buf)
+    }
+
+    fn write(&self, va: u64, data: &[u8]) -> Result<(), Fault> {
+        self.memory.write(va, data)
+    }
+}
+
+impl<V> GuestSpace<V> for HaltsAtSettle<'_> {
+    fn touch(&self, _: u64, _: Access) -> Touch {
+        Touch::Refused
+    }
+
+    fn settle(&self, _: &mut V) -> Result<(), starquake_cpu::Error> {
+        let counted = self
+            .countdown
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(1)
+            });
+        if counted == Ok(1) {
+            let halt = self.halt.get().expect("the services were installed");
+            halt.halt(Stop::Handler(HOST_IO_FAILURE));
+        }
+        Ok(())
+    }
+}
+
+/// How long the guest of `a_halt_told_as_a_thread_is_loaded_keeps_the_guest_out` sleeps.
+const SLEEP_NS: u64 = 1_000_000;
+
+#[test]
+fn a_halt_told_as_a_thread_is_loaded_keeps_the_guest_out() {
+    // The halt lands after the core has chosen the thread it runs and before it enters the
+    // guest: at the settle of the switch that loads the thread its sleep's end woke. The core
+    // loop's own check at the top of its turn has passed by then, so only the check before
+    // entering the guest keeps the guest's next step from running.
+    let guest = Guest::new(&programs::hello().unwrap());
+    let halt = Arc::new(OnceLock::new());
+    let countdown = Arc::new(AtomicUsize::new(0));
+    let space = HaltsAtSettle {
+        memory: &guest.memory,
+        halt: Arc::clone(&halt),
+        countdown: Arc::clone(&countdown),
+    };
+    let install = move |_: &Dispatcher, given: Given| {
+        halt.set(given.halt)
+            .map_err(|_| "installed twice".to_owned())
+    };
+    let ran_again = Rc::new(Cell::new(false));
+    let ran = Rc::clone(&ran_again);
+    let mut main = ScriptedVcpu::new()
+        .then(
+            move |regs| {
+                // The settles to come: the one after this call, which began a wait, then the
+                // one of the switch that loads the thread again once the sleep ends.
+                countdown.store(2, Ordering::SeqCst);
+                regs.x[0] = SLEEP_NS;
+            },
+            svc(SvcId::SleepThread),
+        )
+        .then(move |_| ran.set(true), svc(SvcId::ExitProcess));
+    let options = RunOptions {
+        timeout: Some(RUN_LIMIT),
+        ..RunOptions::default()
+    };
+    let report = run_serving(
+        vcpus(&mut main),
+        guest.program(&space),
+        &options,
+        (Instant::now(), timebase()),
+        Limits::DEFAULT,
+        &install,
+    );
+    let reason = Stop::Handler(HOST_IO_FAILURE).to_string();
+    assert_eq!(
+        report.exit,
+        ExitReason::EmulatorError(reason),
+        "{}",
+        report.trace
+    );
+    assert!(!ran_again.get(), "the guest ran after the halt");
 }

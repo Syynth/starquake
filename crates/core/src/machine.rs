@@ -119,8 +119,15 @@
 //! halt, and not for any other. The tests `an_environment_failure_in_a_handler_stops_the_run`
 //! and `an_environment_failure_in_a_read_stops_the_run` (`machine/tests/reads.rs`) pin the
 //! reason the run ends with and that the guest's next step never runs. The check before
-//! entering is what covers a thread that a delivery woke on another thread while the halt was
-//! told; that race is not one those tests force.
+//! entering is what covers a halt told after a core's loop last asked and before it enters the
+//! guest (a thread that a delivery woke on another thread while the halt was told);
+//! `a_halt_told_as_a_thread_is_loaded_keeps_the_guest_out` tells the halt at exactly that point,
+//! as the core loads the thread. A halt that no delivery follows, told while the guest waits
+//! for a reply with no deadline, ends the run too
+//! (`a_halt_no_delivery_follows_stops_a_guest_waiting_for_its_reply`). The ring only shortens
+//! the timer thread's sleep: without it the run would still stop at the timer's next turn, at
+//! most one preemption interval later, so the run-level tests cannot see it;
+//! `a_halt_keeps_its_first_reason_and_rings_the_timer_each_time` pins it on [`Halted`] itself.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};

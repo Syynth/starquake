@@ -6,6 +6,7 @@
 use super::storage::{Broken, broken_error, open_with};
 use super::*;
 use crate::fsp::command::fsp_srv::OPEN_DATA_FILE_SYSTEM_BY_CURRENT_PROCESS;
+use crate::fsp::command::storage::GET_SIZE as STORAGE_GET_SIZE;
 
 /// The `RomFS` file the tests read: every byte distinct from its neighbours, and from
 /// [`HELLO`]'s, so a read of the SD card's file instead shows.
@@ -177,4 +178,70 @@ fn a_data_file_system_s_snapshot_bytes_are_pinned() {
     // And a file opened on the restored file system is the data file system's too.
     let reply = rig.open_file(fs, ROMFS_PATH);
     assert_eq!(reply.result, ResultCode::SUCCESS);
+}
+
+#[test]
+fn every_open_of_the_data_file_system_asks_the_host_again() {
+    // Eden keeps the RomFS it opened (`FSP_SRV::romfs`); here each open probes the host.
+    let mut rig = Rig::with_romfs();
+    rig.open_data_files();
+    rig.open_data_files();
+    let probe = HostRequest::Probe {
+        mount: Mount::DataFileSystem,
+    };
+    assert_eq!(rig.env.asked(), [probe.clone(), probe.clone()]);
+    // So a third open the host refuses is refused, though two before it opened.
+    rig.env.host().files = None;
+    let reply = rig.send(
+        To::Session(rig.session),
+        OPEN_DATA_FILE_SYSTEM_BY_CURRENT_PROCESS,
+        |r| r,
+    );
+    assert_eq!(reply, only(result::UNKNOWN));
+    assert_eq!(rig.env.asked(), [probe.clone(), probe.clone(), probe]);
+}
+
+#[test]
+fn a_romfs_session_restored_without_a_romfs_answers_eden_s_unknown() {
+    // A run with a RomFS saves a data file system, a file on it and the data storage, open.
+    let mut rig = Rig::with_romfs();
+    rig.env.host().storage = Some(romfs_text());
+    let fs = rig.open_data_files();
+    let reply = rig.open_file(fs, ROMFS_PATH);
+    let file = rig.object_of(reply.moves[0]);
+    let storage = rig.open_storage();
+    let saved = rig.server.save().unwrap();
+    // They are restored into a run that has none.
+    {
+        let mut host = rig.env.host();
+        host.files = None;
+        host.storage = None;
+    }
+    let env: Arc<dyn Env> = Arc::<FakeEnv>::clone(&rig.env);
+    let executor: Arc<dyn Executor> = Arc::<Jobs>::clone(&rig.jobs);
+    let mut restored = server(UnknownPolicy::Strict, env, unwatched()).with_executor(executor);
+    restored.restore(&saved).unwrap();
+    rig.server = restored;
+    // Each command on them answers Eden's code for a process with no RomFS, not the SD card's.
+    assert_eq!(rig.open_file(fs, ROMFS_PATH), only(result::UNKNOWN));
+    assert_eq!(
+        rig.send(To::Session(file), GET_SIZE, |r| r),
+        only(result::UNKNOWN)
+    );
+    rig.defer(To::Session(file), READ, read(0, 4, 16));
+    rig.jobs.run();
+    assert_eq!(rig.deliver(SessionKind::Session), only(result::UNKNOWN));
+    assert_eq!(rig.kernel.memory(DATA_AT, 16).unwrap(), [STALE; 16]);
+    assert_eq!(
+        rig.send(To::Session(storage), STORAGE_GET_SIZE, |r| r),
+        only(result::UNKNOWN)
+    );
+    // The SD card beside them keeps its own code when it is not there.
+    rig.env.host().card = None;
+    let reply = rig.send(
+        To::Session(rig.session),
+        crate::fsp::command::fsp_srv::OPEN_SD_CARD_FILE_SYSTEM,
+        |r| r,
+    );
+    assert_eq!(reply, only(result::PORT_SD_CARD_NO_DEVICE));
 }

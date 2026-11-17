@@ -35,9 +35,9 @@
 //! logs it as an error naming the job, and goes on to the next job, so the pool never shrinks
 //! and no thread has to be replaced. The panicking job's reply token is dropped as the panic
 //! unwinds, so its caller gets `DEFERRED_REPLY_DROPPED` and never waits for ever, and a job that
-//! panics before it returns its [`Finish`] is not recorded
-//! (`a_job_that_panics_leaves_its_thread_to_run_the_next`, and with every thread at once,
-//! `a_panicking_job_on_every_thread_leaves_the_pool_whole`; the log is pinned in
+//! panics before it returns its [`Finish`] is not recorded, unless its environment had failed it
+//! first (next section) (`a_job_that_panics_leaves_its_thread_to_run_the_next`, and with every
+//! thread at once, `a_panicking_job_on_every_thread_leaves_the_pool_whole`; the log is pinned in
 //! `crates/services/tests/fsp_job_panics.rs`).
 //!
 //! # When the environment fails a job
@@ -47,7 +47,10 @@
 //! workers' [`Halt`] [`Stop::Job`], on the worker thread, before the job returns. Its
 //! [`Finish`] is then dropped without being called, which drops its reply token: the request is
 //! answered as one the server gave up on, which the guest never runs to see. The job is still
-//! recorded, with its failure (`an_environment_failure_in_a_read_stops_the_run`).
+//! recorded, with its failure (`an_environment_failure_in_a_read_stops_the_run`), also when it
+//! panics after the failure and returns no [`Finish`]: its replay then reaches the recorded
+//! failure and stops the run with the same [`Stop::Job`] as the live run
+//! (`a_job_that_panics_after_its_environment_failed_is_recorded_and_replays_the_same_stop`).
 //!
 //! Dropping [`Workers`] stops them and waits for every thread to end: a job running then runs to
 //! its end and is finished, and the jobs still queued are dropped without running, so each of
@@ -302,16 +305,29 @@ impl Shared {
     fn work(&self, env: &dyn Env) {
         while let Some((job, run)) = self.next_job() {
             let recorded = Recorded::new(env, self.recording, job, &*self.halt);
-            let Ok(finish) = catch_unwind(AssertUnwindSafe(|| run(&recorded))) else {
-                tracing::error!(job = job.raw(), "{JOB_PANICKED}: its request is dropped");
-                continue;
-            };
+            let ran = catch_unwind(AssertUnwindSafe(|| run(&recorded)));
             let (answers, failure) = recorded.into_record();
+            let finish = ran.ok();
+            if finish.is_none() {
+                tracing::error!(job = job.raw(), "{JOB_PANICKED}: its request is dropped");
+                // Recorded only when its environment had failed it, so that its replay stops
+                // the run for the same reason (module docs, "When the environment fails a job").
+                if failure.is_none() {
+                    continue;
+                }
+            }
             let mut record = lock(&self.record);
-            if failure.is_some() {
-                drop_unfinished(job, finish);
-            } else if catch_unwind(AssertUnwindSafe(finish)).is_err() {
-                tracing::error!(job = job.raw(), "{FINISH_PANICKED}: its request is dropped");
+            match finish {
+                Some(finish) if failure.is_some() => drop_unfinished(job, finish),
+                Some(finish) => {
+                    if catch_unwind(AssertUnwindSafe(finish)).is_err() {
+                        tracing::error!(
+                            job = job.raw(),
+                            "{FINISH_PANICKED}: its request is dropped"
+                        );
+                    }
+                }
+                None => {}
             }
             if self.recording == Recording::Kept {
                 record.push(Completed {

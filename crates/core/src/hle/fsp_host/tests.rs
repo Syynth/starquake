@@ -10,6 +10,7 @@ use starquake_loader::nup::storage::{CACHE_CAP, RomFsStorage};
 use starquake_loader::nup::{Nup, PackageKind};
 use starquake_loader::read_at::{Positional, ReadAt};
 use starquake_services::fsp::host::CHANNEL;
+use starquake_services::fsp::path::ENTRY_NAME_LENGTH_MAX;
 
 use super::*;
 use crate::hle::tests::Scratch;
@@ -427,4 +428,29 @@ fn other_channels_and_bad_requests_are_turned_away() {
         payload: vec![9; 4],
     };
     assert_eq!(host.handle(&garbage), HostFailure::BadRequest.reply());
+}
+
+#[test]
+fn a_path_at_the_length_limit_is_not_found_and_one_past_it_is_a_bad_request() {
+    // The request's limit and the loader's are the same, so the loader's own refusal of a long
+    // path (`PathTooLong`) is never what a request gets.
+    assert_eq!(starquake_loader::romfs::MAX_PATH_LEN, ENTRY_NAME_LENGTH_MAX);
+    let (romfs, _) = files_romfs();
+    let mut host = FspHost::new(None, Some(romfs));
+    let path = |len: usize| [&b"/"[..], &vec![b'a'; len - 1]].concat();
+    let at = path(ENTRY_NAME_LENGTH_MAX);
+    assert_eq!(
+        ask(&mut host, &files_size(&at)),
+        HostFailure::NotFound.reply()
+    );
+    let past = path(ENTRY_NAME_LENGTH_MAX + 1);
+    assert_eq!(
+        ask(&mut host, &files_size(&past)),
+        HostFailure::BadRequest.reply()
+    );
+    // The files beside them still answer.
+    assert!(matches!(
+        ask(&mut host, &files_size(b"/top.bin")),
+        HostIoReply::Data(_)
+    ));
 }

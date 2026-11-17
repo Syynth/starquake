@@ -653,6 +653,51 @@ fn a_live_failure_ends_the_jobs_use_of_the_environment_with(recording: Recording
     assert_eq!(recorded, expected, "{recording:?}");
 }
 
+/// A job that asks the environment for the time twice, then panics before it returns its
+/// finish.
+fn job_timing_then_panicking() -> Job {
+    Box::new(|env: &dyn Env| {
+        let _ = (env.now(), env.now());
+        std::panic::resume_unwind(Box::new("a job panicked after its environment failed it"))
+    })
+}
+
+#[test]
+fn a_job_that_panics_after_its_environment_failed_is_recorded_and_replays_the_same_stop() {
+    // Live: the environment answers the time once, then fails; the job then panics.
+    let env: Arc<dyn Env> = Arc::new(FailsSecond(AtomicUsize::new(0)));
+    let (halt, halts) = halts();
+    let workers = Workers::new(each(env), Recording::Kept, halt).unwrap();
+    workers.submit(job_timing_then_panicking());
+    let stop = Stop::Job {
+        job: 0,
+        error: ENV_FAILURE,
+    };
+    // The job is recorded with its failure, though it returned no finish: wait for the entry,
+    // within the bound.
+    let mut recorded = Vec::new();
+    let started = std::time::Instant::now();
+    while recorded.is_empty() && started.elapsed() < WAIT {
+        recorded.extend(workers.take_record());
+        std::thread::yield_now();
+    }
+    drop(workers);
+    assert_eq!(halts.stops(), std::slice::from_ref(&stop));
+    let entry = Completed {
+        job: JobIndex::new(0),
+        answers: vec![EnvRecord::Clock(HostNanos(5))],
+        failure: Some(env_failure(Question::Clock)),
+    };
+    assert_eq!(recorded, [entry]);
+
+    // Replayed: the same job reaches the recorded failure, panics again, and the run stops for
+    // the same reason as the live run, not as a job the record does not hold.
+    let (replay, halts) = replay_halting(recorded);
+    replay.submit(job_timing_then_panicking());
+    assert_eq!(halts.stops(), [stop]);
+    assert_eq!(replay.check(), Ok(()));
+}
+
 #[test]
 fn a_replay_that_has_not_reached_a_recorded_job_is_unfinished() {
     let record = vec![hello_record(1, 0, 4), hello_record(0, 8, 4)];
