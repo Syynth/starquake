@@ -29,7 +29,8 @@
 //!    `process::run`.
 //!
 //! ```text
-//! IMAGE_BASE - n pages   counter trampolines of every module (only when a read was patched)
+//! IMAGE_BASE - n pages   counter trampolines of every module (only when a read was patched),
+//!                        generated code, read-execute
 //! IMAGE_BASE             the first module (rtld, or main), then .bss
 //!                        each later module, from the end of the one before
 //! above the code, each 2 MiB aligned (starquake_kernel::memory::layout):
@@ -115,28 +116,70 @@
 //! | `.data`, `.bss` | read, write | `ReprotectSegment(DataSegment, ReadWrite)`; both loaders add `.bss` to the data segment (the loader's `codeset` module docs) |
 //! | pages of a module in no segment | nothing (mapped, so the loader can write the image) | `KProcess::Initialize`, "Map the code region": `KernelRead \| NotMapped` |
 //! | stack | read, write | `KProcess::Run`, `KMemoryState::Stack`, `UserReadWrite` |
-//! | counter trampolines | read, execute | starquake's own: see below |
+//! | counter trampolines | read, execute (state `GeneratedCode`) | starquake's own: see below |
 //!
 //! A segment covers whole pages: its size is rounded up to a page, as `LoadNroImpl` and
 //! `AppLoader_NSO::LoadModule` do (`PageAlignSize`). Divergences from Eden, each pinned by a
 //! test here:
 //!
 //! - **The counter trampolines** are pages a console does not have. Every module's are in one
-//!   run of pages, mapped as code, read-execute, right below the first module, where no region
-//!   is placed and nothing a program asks about lies: the pages after the last module, where a
-//!   console's loader would put a program's arguments, are free as on a console
+//!   run of pages, read-execute, right below the first module, where no region is placed and
+//!   nothing a program asks about lies: the pages after the last module, where a console's
+//!   loader would put a program's arguments, are free as on a console
 //!   (`the_trampolines_lie_below_the_image_and_the_page_after_the_module_is_free`). They are
 //!   not counted as the process's memory, so `GetInfo` reports what a console would
-//!   (`the_trampolines_are_not_counted_as_the_processs_memory`). `QueryMemory` does show them.
-//!   Under NCE, Eden appends its patch section to each module's image instead
-//!   (`eden/src/core/loader/nro.cpp`, `LoadNroImpl`, `HAS_NCE`), where it is counted.
+//!   (`the_trampolines_are_not_counted_as_the_processs_memory`). Under NCE, Eden appends its
+//!   patch section to each module's image instead (`eden/src/core/loader/nro.cpp`,
+//!   `LoadNroImpl`, `HAS_NCE`), where it is counted.
+//!
+//!   They are mapped in the state [`TRAMPOLINE_STATE`], `GeneratedCode`, not `Code`, and
+//!   `QueryMemory` reports that state for them (`Svc::MemoryState::GeneratedCode`, 0x14,
+//!   `eden/src/core/hle/kernel/svc_types.h`). Atmosphère's debugger walks a process's address
+//!   space for modules (source below): from address 0, `QueryMemory` about each block in turn,
+//!   taking every block whose state is `Code` (or `AliasCode`) and whose permission is
+//!   read-execute for a module. Neither walker cited below reads `MOD0` (`CollectModules`
+//!   reads the module's path after the block; `QueryModule` searches for the segment's head
+//!   and tail). The word at a module's offset 4 is the offset of its `MOD0` header (Eden's
+//!   `ModuleHeaderLocation::header_offset`, `eden/src/core/arm/symbols.cpp`). Guess, inferred
+//!   from the fault in #203 and not from any source here: a program's start-up walks its
+//!   address space with that rule and reads that word of every block it takes, so that, mapped
+//!   as `Code`, the trampolines were taken for a module whose `MOD0` offset is an instruction.
+//!   Reading `rtld`'s module walk, or tracing a retail title's start-up on the reference
+//!   emulator up to that read, would confirm it. `GeneratedCode` is the state
+//!   Horizon gives a process's own executable code that no loader placed: JIT code, mapped
+//!   read-execute in its owner by `ControlCodeMemory`'s `MapToOwner`
+//!   (`eden/src/core/hle/kernel/k_code_memory.cpp`, `KCodeMemory::MapToOwner`:
+//!   `MapPageGroup(address, *m_page_group, KMemoryState::GeneratedCode, k_perm)` with
+//!   `k_perm` `UserReadExecute` for `Svc::MemoryPermission::ReadExecute`). It lies in the same
+//!   region as `Code` for a 39-bit space (`KPageTableBase::GetRegionAddress` gives both
+//!   states' regions; starquake's kernel gives both the code region), so the pages stay where
+//!   they were. The walk's rule is Atmosphère's (fact only, @ 4e3f3703):
+//!   `stratosphere/dmnt.gen2/source/dmnt2_debug_process.cpp`, `DebugProcess::CollectModules`,
+//!   takes a block for a module when its permission is read-execute and its state is `Code`
+//!   or `AliasCode`, and stops at the first `Inaccessible` block; `libstratosphere`'s
+//!   `ro/impl/ro_ro_exception_info.os.horizon.cpp`, `QueryModule`, has the same two checks.
+//!   Guess, not checked against any source here: a title's `rtld` walks with that rule too,
+//!   so it skips a `GeneratedCode` block. A retail title's `rtld` finishing its walk with
+//!   the trampolines mapped this way is consistent with it; reading `rtld`'s walk would
+//!   confirm it. Pinned
+//!   by `a_module_walk_over_query_memory_finds_the_programs_modules_and_no_trampolines` here
+//!   and, with a guest program that walks as above, by `crates/core/tests/module_walk.rs`.
+//!   Divergence from Horizon: a `GeneratedCode` block on a console is backed by a code memory
+//!   object the process created; the trampolines have none, so no `ControlCodeMemory` call
+//!   can name them. Their flags are `KMemoryState::GeneratedCode`'s
+//!   (`eden/src/core/hle/kernel/k_memory_block.h`): unlike `Code`, without `FlagCode`,
+//!   `FlagCanUseIpc`, `FlagCanUseNonSecureIpc`, `FlagCanUseNonDeviceIpc`,
+//!   `FlagCanQueryPhysical`, `FlagCanDeviceMap`, `FlagCanAlignedDeviceMap` and
+//!   `FlagCanMapProcess`, so a kernel call that requires one of those of its range refuses the
+//!   trampolines' pages, as it would refuse JIT code (`SetProcessMemoryPermission`, which
+//!   requires `FlagCode`, in
+//!   `the_trampolines_lie_below_the_image_and_the_page_after_the_module_is_free`).
+//!
 //!   A module's trampolines must be within a branch's reach (128 MiB) of every read the module
 //!   has: a set whose patched reads lie further above the trampolines is refused with the
 //!   patcher's `BranchOutOfRange` (`a_read_out_of_the_trampolines_reach_is_refused`); placing
 //!   trampolines between modules would lift that limit and move the modules off Eden's
-//!   addresses. Guess, not checked against any source here: a title's `rtld` finds modules by
-//!   walking the address space for code; it walks upwards from its own module, so it does not
-//!   meet pages below the first module. Running a retail title would confirm it.
+//!   addresses.
 //!   While guest code is inside a trampoline its program counter is the trampoline's address,
 //!   not the patched read's: an exit there (a fault on the two stack words a trampoline saves,
 //!   or the timeout's interrupt) is reported at that address, which the memory map names
@@ -200,6 +243,9 @@ pub(crate) const IMAGE_BASE: u64 = 0x8000_0000;
 pub(crate) const MODULE_NAME: &str = starquake_loader::exefs::MAIN_MODULE;
 /// Alignment of each module's first trampoline (`patch_text` requires 8).
 const TRAMPOLINE_ALIGN: u64 = 8;
+/// The memory state the counter trampolines' pages are mapped with (see "Permissions" in the
+/// module docs).
+pub(crate) const TRAMPOLINE_STATE: MemoryState = MemoryState::GeneratedCode;
 
 /// Why a program could not be loaded into guest memory.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -679,7 +725,7 @@ pub(crate) fn load_placed(
             .map_pages(
                 trampolines.start,
                 trampolines.size / PAGE,
-                MemoryState::Code,
+                TRAMPOLINE_STATE,
                 MemoryPermission::USER_READ_EXECUTE,
             )
             .map_err(refused("counter trampolines"))?;
@@ -725,6 +771,7 @@ pub(crate) fn load_placed(
 #[cfg(test)]
 mod tests {
     use starquake_kernel::memory::GUARD_PAGES;
+    use starquake_kernel::memory::state::{STATE_MASK, flag};
     use starquake_kernel::memory::testing::{MapperCall, RecordingMapper};
     use starquake_kernel::result::KernelError;
     use starquake_memory::FlatMemory;
@@ -1376,7 +1423,7 @@ mod tests {
         let (
             Loaded {
                 placed,
-                address_space,
+                mut address_space,
             },
             memory,
             calls,
@@ -1385,15 +1432,43 @@ mod tests {
             placed.mappings[0],
             mapping("trampolines", BASE - PAGE, BASE)
         );
-        // Code, read-execute, a block of its own (it is no part of the module).
+        // Generated code, read-execute, a block of its own: it is no part of the module, and a
+        // module walk does not take it for one
+        // (`a_module_walk_over_query_memory_finds_the_programs_modules_and_no_trampolines`).
         assert_eq!(
             block(&address_space, BASE - 1),
             (
                 BASE - PAGE,
                 PAGE,
-                MemoryState::Code,
+                TRAMPOLINE_STATE,
                 MemoryPermission::USER_READ_EXECUTE
             )
+        );
+        assert_ne!(TRAMPOLINE_STATE.svc(), MemoryState::Code.svc());
+        // The flags `Code` has and the trampolines' state lacks, as the module docs list them;
+        // it has none that `Code` lacks.
+        let flags = |state: MemoryState| state.word() & !STATE_MASK;
+        assert_eq!(
+            flags(MemoryState::Code) & !flags(TRAMPOLINE_STATE),
+            flag::CODE
+                | flag::CAN_USE_IPC
+                | flag::CAN_USE_NON_SECURE_IPC
+                | flag::CAN_USE_NON_DEVICE_IPC
+                | flag::CAN_QUERY_PHYSICAL
+                | flag::CAN_DEVICE_MAP
+                | flag::CAN_ALIGNED_DEVICE_MAP
+                | flag::CAN_MAP_PROCESS
+        );
+        assert_eq!(flags(TRAMPOLINE_STATE) & !flags(MemoryState::Code), 0);
+        // Not code memory to `SetProcessMemoryPermission` (no `FlagCode`), as a module's
+        // pages are: the call that made the module's text read-execute refuses them.
+        assert_eq!(
+            address_space.set_process_memory_permission(
+                BASE - PAGE,
+                PAGE,
+                SvcPermission::ReadExecute
+            ),
+            Err(KernelError::InvalidCurrentMemory.into())
         );
         assert_eq!(block(&address_space, BASE).0, BASE);
         // The pages after the module are free, up to the kernel-map region (where the kernel
@@ -1415,6 +1490,70 @@ mod tests {
         let mut first = [0; 4];
         memory.read(BASE - PAGE, &mut first).unwrap();
         assert_ne!(first, [0; 4]);
+    }
+
+    /// The bases of the blocks a module walker takes for modules: it asks `QueryMemory` about
+    /// address 0, then about the end of each block it is told of, until it is told of the
+    /// inaccessible block above the address space, and takes every block whose state is
+    /// `Code` or `AliasCode` and whose permission is read-execute (Atmosphère's
+    /// `stratosphere/dmnt.gen2/source/dmnt2_debug_process.cpp`, `CollectModules` @ 4e3f3703,
+    /// fact only; that a title's `rtld` uses the same rule is a guess, see the module docs).
+    fn modules_a_walker_finds(space: &KernelSpace) -> Vec<u64> {
+        let code = [MemoryState::Code.svc(), MemoryState::AliasCode.svc()];
+        let read_execute = u32::from(SvcPermission::ReadExecute.bits());
+        let mut found = Vec::new();
+        let mut address = 0;
+        // Each step must move past one block, so the walk ends within the block map's length;
+        // a block that ends at or below the address asked about (a zero-size block, or one
+        // that does not move forward) fails the test instead of spinning, as Atmosphère's
+        // walker stops at `next_address <= address`.
+        loop {
+            let info = space.query_info(address).unwrap().svc_info();
+            if info.state == MemoryState::Inaccessible.svc() {
+                return found;
+            }
+            if code.contains(&info.state) && info.permission == read_execute {
+                found.push(info.base_address);
+            }
+            let next = info
+                .base_address
+                .checked_add(info.size)
+                .expect("a block ends inside the address space");
+            assert!(
+                next > address,
+                "the block at {address:#x} ends at {next:#x}, not past it"
+            );
+            address = next;
+        }
+    }
+
+    #[test]
+    fn a_module_walk_over_query_memory_finds_the_programs_modules_and_no_trampolines() {
+        // Three modules, each with a counter read, so each has trampolines in the run below
+        // the first.
+        let modules = ["rtld", "main", "subsdk0"]
+            .into_iter()
+            .map(|name| (name, nso(&[a64::nop(), read_counter()], 0)))
+            .collect();
+        let program = program_of(modules);
+        let (mapper, _log) = RecordingMapper::new();
+        let loaded = load(&program, Some(RESCALE), Box::new(mapper), &flat()).unwrap();
+        let trampolines = loaded
+            .placed
+            .mappings
+            .iter()
+            .find(|mapping| mapping.name == "trampolines")
+            .expect("the counter reads were patched");
+        assert_eq!(trampolines.end, BASE);
+        // Each module's text starts at its base, the one block a walker takes for it.
+        let bases: Vec<u64> = loaded.placed.modules.iter().map(|m| m.base).collect();
+        assert_eq!(bases.len(), 3);
+        assert_eq!(modules_a_walker_finds(&loaded.address_space), bases);
+        // The trampolines are still mapped and still read-execute, in a state of their own.
+        let (start, size, state, permission) = block(&loaded.address_space, trampolines.start);
+        assert_eq!((start, start + size), (trampolines.start, BASE));
+        assert_eq!(state, TRAMPOLINE_STATE);
+        assert_eq!(permission, MemoryPermission::USER_READ_EXECUTE);
     }
 
     #[test]
