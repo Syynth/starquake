@@ -1,6 +1,6 @@
 //! `GetInfo`: the values a libnx program is told at start-up, against what the reference
 //! emulator told the homebrew fixture, the Switch 2 ids for a Switch 2 and a Switch 1 program,
-//! and Horizon's result for each request it refuses.
+//! and Horizon's result for each request it refuses. The other ids are in `process_ids`.
 
 use super::*;
 use crate::handle::ObjectRefs;
@@ -96,8 +96,8 @@ const STACK_REGION_ADDRESS: u32 = 14;
 const STACK_REGION_SIZE: u32 = 15;
 const ALIAS_REGION_EXTRA_SIZE: u32 = 28;
 
-/// Every memory id this slice answers: the ids of Eden's first group, which take a process
-/// handle and sub id 0.
+/// The address-space ids of Eden's first group that read only the address space: they take a
+/// process handle and sub id 0. The rest of the group is in `process_ids`.
 const ANSWERED: [u32; 11] = [
     ALIAS_REGION_ADDRESS,
     ALIAS_REGION_SIZE,

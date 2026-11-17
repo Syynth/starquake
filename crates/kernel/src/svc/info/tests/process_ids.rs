@@ -446,7 +446,8 @@ fn the_system_resource_used_is_zero_whatever_its_size() {
 #[test]
 fn the_non_system_total_takes_edens_branch_at_the_exact_edge() {
     // `used_size + free_size > max_size`, where `used_size` adds the secure size: at the edge
-    // the total is `free + used`, one byte of free memory past it is `max - secure`.
+    // the total is `free + used`, one byte of free memory past it is `max - secure`. (The two
+    // branches give the same number exactly at the edge, so `>` and `>=` agree there.)
     let (used, secure, max) = (0x30_0000, 0x5000, 0x100_0000);
     let edge = max - used - secure;
     assert_eq!(non_system_total(used, edge, max, secure), edge + used);

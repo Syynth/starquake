@@ -175,9 +175,10 @@
 //!   `U` the non-system used size, `F` the free memory here and `M` the process maximum
 //!   ([`AddressSpace::max_process_memory`]), where Eden's free memory is `F - S`:
 //!   - **21** applies Eden's formula to `F`: `M - S` when `U + S + F > M`, else `F + U`. Eden
-//!     answers `M - S` when `U + F > M`, else `F - S + U`. The two agree when `U + F > M`;
-//!     when `U + F <= M` the answer here is `S` higher (`F + U` against `F - S + U`), or, when
-//!     `U + F <= M < U + S + F`, `M - S` where Eden has `F - S + U`. Test:
+//!     answers `M - S` when `U + F > M`, else `F - S + U`. So the two agree when
+//!     `U + F > M`; when `U + S + F <= M` the answer here is `S` higher (`F + U` against
+//!     `F - S + U`); and when `U + F <= M < U + S + F` it is `M - S` where Eden has
+//!     `F - S + U`. Test:
 //!     `the_non_system_total_is_s_higher_than_edens_while_the_resource_is_not_charged`.
 //!   - **An `S` larger than `M`** cannot arise in Eden (the reservation fails with
 //!     `ResultLimitReached` and the process is not created); here 21 answers zero rather than
@@ -243,10 +244,12 @@
 //! - **The address-space ids (2 to 7, 21, 22 and 28) read the calling process's address
 //!   space, whatever process the handle names.** With one address space beside the tables, a
 //!   handle to another process object is answered as the pseudo-handle is; 21 also takes the
-//!   calling process's system resource, to match its address space. The fact ids (0, 1, 16,
-//!   17, 18 and 24) and the Switch 2 ids do read the process the handle names, from the
-//!   process table and the scheduler; one the tables have no row for is an internal failure,
-//!   after the guest's checks. Tests: `a_handle_must_name_a_process`,
+//!   calling process's system resource, to match its address space (no test tells which
+//!   process's it takes: the resource changes 21 only once `U + S + F > M`, which the address
+//!   spaces the tests build never reach, their pool being below their maximum). The fact ids
+//!   (0, 1, 16, 17, 18 and 24) and the Switch 2 ids do read the process the handle names, from
+//!   the process table and the scheduler; one the tables have no row for is an internal
+//!   failure, after the guest's checks. Tests: `a_handle_must_name_a_process`,
 //!   `the_facts_are_the_named_process_s_and_the_sizes_the_caller_s`,
 //!   `a_fact_about_a_process_with_no_row_is_an_internal_failure_after_the_checks`.
 //! - **The entropy is drawn when it is first asked for**, not when the process is created
