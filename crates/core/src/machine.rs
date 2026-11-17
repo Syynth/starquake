@@ -93,13 +93,16 @@
 //! - **The environment** is live, with a fixed random seed and nothing recorded to disk; the
 //!   `--clock`, `--seed` and `--record` flags of the headless contract are not built. Its
 //!   recording, which grows by a clock reading per system call, is dropped as it is made (test:
-//!   `the_environments_recording_is_dropped_as_it_is_made`). `fsp-srv`'s workers read through
-//!   a second live environment over the same host ([`Session::reads_environment`]), so that
-//!   reads on their threads stay out of the first one's recording, where their place would be
-//!   host timing, and off its lock, which the kernel takes for every system call. Its
-//!   recording is dropped as it is made too, and the workers keep no record of their own
-//!   (`Recording::Off`): the order the reads became visible in is in the event stream, as each
-//!   delivery's request event.
+//!   `the_environments_recording_is_dropped_as_it_is_made`). Each of `fsp-srv`'s workers reads
+//!   through a live environment of its own over the same host ([`Session::reads_environments`]),
+//!   so that reads on their threads stay out of the first one's recording, where their place
+//!   would be host timing, and off its lock, which the kernel takes for every system call. One
+//!   each, because a live environment holds its lock for the whole of a host request: two
+//!   workers sharing one would wait for each other's reads (test:
+//!   `a_read_held_at_the_title_does_not_hold_up_a_card_read`). Their recordings are dropped as
+//!   they are made too, and the workers keep no record of their own (`Recording::Off`, test:
+//!   `a_real_runs_workers_keep_no_record`): the order the reads became visible in is in the
+//!   event stream, as each delivery's request event.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -117,7 +120,7 @@ use starquake_kernel::svc::DebugSink;
 use starquake_kernel::tables::{AddressSpace, Scheduler};
 use starquake_kernel::time::CounterRate;
 use starquake_memory::{Access, GuestMemory};
-use starquake_services::fsp::worker::{self, Recording, Workers};
+use starquake_services::fsp::worker::{self, Recording, StartError, Workers};
 use starquake_trace::{
     DumpError, Env, EventKind, FlightRecorder, GuestTicks, HostClock, HostNanos, LifecyclePhase,
     LiveEnv, Recorder, TextSink, ThreadId,
@@ -218,9 +221,9 @@ impl crate::hle::Deliveries for Ready {
 pub(crate) struct Given {
     /// The environment the services' methods read the host through.
     pub(crate) env: Arc<dyn Env>,
-    /// The environment the services' workers read the host through
-    /// ([`Session::reads_environment`]).
-    pub(crate) reads: Arc<dyn Env>,
+    /// The environments the services' workers read the host through, one per worker
+    /// ([`Session::reads_environments`]).
+    pub(crate) reads: Vec<Arc<LiveEnv>>,
     /// How a service says its deferred replies are ready.
     pub(crate) ready: Ready,
 }
@@ -232,13 +235,22 @@ pub(crate) type Install = dyn Fn(&Dispatcher, Given) -> Result<(), String> + Syn
 /// The services of a real run ([`crate::hle::install`]), with `fsp-srv`'s reads on its workers,
 /// which keep no record (module docs, "The environment").
 fn real_services(dispatcher: &Dispatcher, given: Given) -> Result<(), String> {
-    let workers = Workers::new(worker::COUNT, given.reads, Recording::Off)
-        .map_err(|error| error.to_string())?;
+    let workers = reads_workers(&given.reads).map_err(|error| error.to_string())?;
     let reads = Reads {
         executor: Arc::new(workers),
         ready: Arc::new(given.ready),
     };
     crate::hle::install(dispatcher, given.env, reads).map_err(|error| error.to_string())
+}
+
+/// A real run's `fsp-srv` workers: one thread on each of `envs`, keeping no record (module docs,
+/// "The environment").
+fn reads_workers(envs: &[Arc<LiveEnv>]) -> Result<Workers, StartError> {
+    let envs = envs
+        .iter()
+        .map(|env| -> Arc<dyn Env> { Arc::<LiveEnv>::clone(env) })
+        .collect();
+    Workers::new(envs, Recording::Off)
 }
 
 /// How much of a run is kept in memory for its report. A guest can make system calls and write
@@ -340,14 +352,17 @@ impl<C: HostClock + Clone> Session<'_, C> {
         })
     }
 
-    /// The environment `fsp-srv`'s workers read through during this run: a second one made as
-    /// [`Session::environment`] makes the first, over the same SD card folder and the same
-    /// RomFS (whose source and cache a clone shares). See the module docs, "The environment".
-    fn reads_environment(&self) -> Arc<LiveEnv>
+    /// The environments `fsp-srv`'s workers read through during this run, one per worker
+    /// ([`worker::COUNT`]): each made as [`Session::environment`] makes the first, over the same
+    /// SD card folder and the same RomFS (whose source and cache a clone shares). See the module
+    /// docs, "The environment".
+    fn reads_environments(&self) -> Vec<Arc<LiveEnv>>
     where
         C: 'static,
     {
-        self.environment()
+        (0..worker::COUNT.get())
+            .map(|_| self.environment())
+            .collect()
     }
 }
 
@@ -482,8 +497,9 @@ struct Machine<'a, V: Vcpu, C> {
     /// run is stopping.
     bell: Arc<timer::Bell>,
     ready: Ready,
-    /// The environment `fsp-srv`'s workers read through ([`Session::reads_environment`]).
-    reads: Arc<LiveEnv>,
+    /// The environments `fsp-srv`'s workers read through, one each
+    /// ([`Session::reads_environments`]).
+    reads: Vec<Arc<LiveEnv>>,
     /// The program counter of each thread a core's vCPU held when the core stopped, with the
     /// core, by the thread's id as the guest knows it (`core_loop`'s `Core::leave`).
     held: Mutex<BTreeMap<u64, (u8, u64)>>,
@@ -822,12 +838,12 @@ impl<'a, V: Vcpu, C: HostClock + Clone> Machine<'a, V, C> {
                 bell: Arc::clone(&bell),
             },
             bell,
-            reads: session.reads_environment(),
+            reads: session.reads_environments(),
             held: Mutex::new(BTreeMap::new()),
         };
         let given = Given {
             env: Arc::<LiveEnv>::clone(env),
-            reads: Arc::<LiveEnv>::clone(&machine.reads),
+            reads: machine.reads.clone(),
             ready: machine.ready.clone(),
         };
         if let Err(error) = install(&machine.dispatcher, given) {
@@ -851,7 +867,9 @@ impl<'a, V: Vcpu, C: HostClock + Clone> Machine<'a, V, C> {
     fn finish(self) -> (Ending, GuestLog, Tally, Aftermath) {
         // PROVISIONAL: nothing keeps the environments' recordings (see the module docs).
         drop(self.env.take_recording());
-        drop(self.reads.take_recording());
+        for reads in &self.reads {
+            drop(reads.take_recording());
+        }
         let ending = lock(&self.ending)
             .take()
             .unwrap_or_else(|| Ending::Failed("the run stopped without saying why".to_owned()));

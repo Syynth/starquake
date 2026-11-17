@@ -11,20 +11,30 @@
 //!
 //! # The workers
 //!
-//! [`Workers`] is [`COUNT`] host threads that take jobs from one queue, oldest first. Each job
-//! runs with the environment the workers were given, reads the host through it alone, and
-//! returns its [`Finish`]. The thread then calls the [`Finish`], which completes the job's reply
-//! token: the server's mailbox has the completion, and the server's [`Notify`](crate::framework::Notify)
-//! is told (a run's tells the core loop, which delivers the reply).
+//! [`Workers`] is one host thread per environment it is given ([`COUNT`] in a run), and the
+//! threads take jobs from one queue, oldest first. Each thread runs its jobs with its own
+//! environment, and a job reads the host through it alone and returns its [`Finish`]. The
+//! thread then calls the [`Finish`], which completes the job's reply token: the server's mailbox
+//! has the completion, and the server's [`Notify`](crate::framework::Notify) is told (a run's
+//! tells the core loop, which delivers the reply).
 //!
-//! Two reads in flight complete independently: a job that waits on the host holds up its own
-//! thread only, and a read that fails fails only its own request
+//! Each thread has an environment of its own because an environment may answer one request at
+//! a time: a `LiveEnv` (`starquake-trace`) holds its lock for the whole of a host request. Two
+//! threads sharing one would wait for each other's host reads. With one each, two reads in
+//! flight complete independently: a job that waits on the host holds up its own thread and its
+//! own environment only, and a read that fails fails only its own request
 //! (`two_reads_in_flight_complete_independently`, `a_read_that_fails_fails_only_its_own_request`
-//! in `fsp/tests/worker.rs`). How far two reads really run at once is up to the environment: a
-//! `LiveEnv` (`starquake-trace`) answers one host request at a time, under its lock.
+//! in `fsp/tests/worker.rs`; on a run's own environments,
+//! `a_read_held_at_the_title_does_not_hold_up_a_card_read` in `starquake-core`'s
+//! `machine/tests/reads.rs`).
 //!
 //! [`COUNT`] is starquake's own choice, not the console's (which no pinned reference states): two,
 //! so that one long read does not hold up every other.
+//!
+//! A job or a finish that panics does not take its thread with it: the thread goes on to the next
+//! job. The panicking job's reply token is dropped as the panic unwinds, so its caller gets
+//! `DEFERRED_REPLY_DROPPED`, and a job that panics before it returns its [`Finish`] is not
+//! recorded (`a_job_that_panics_leaves_its_thread_to_run_the_next`).
 //!
 //! Dropping [`Workers`] stops them and waits for every thread to end: a job running then runs to
 //! its end and is finished, and the jobs still queued are dropped without running, so each of
@@ -44,8 +54,9 @@
 //!   the same requests submits the same jobs with the same numbers.
 //! - [`Completed::answers`]: every answer the environment gave the job, in order, as
 //!   [`EnvRecord`]s (for a read, the one host I/O exchange with its bytes).
-//! - [`Completed::failure`]: the error the environment answered the job with, if one did; the
-//!   job's later calls get the same error without reaching the environment.
+//! - [`Completed::failure`]: the error the environment answered the job with, if one did, with
+//!   the question that got it ([`Failure`]); the job's later calls get the same error without
+//!   reaching the environment.
 //!
 //! Entries are kept in the order the jobs were finished. The thread finishes the job and appends
 //! its entry under one lock, so the order of the entries is the order the completions reached the
@@ -61,7 +72,8 @@
 //!
 //! [`Workers::take_record`] takes what has been recorded. With [`Recording::Off`] nothing is kept
 //! (`with_recording_off_nothing_is_kept`): the record holds every byte every read returned, so a
-//! run that does not write it out must not keep it.
+//! run that does not write it out must not keep it. A job's answers are not copied then either:
+//! only its first failure is held while it runs, so that its later calls get the same error.
 //!
 //! # Replaying
 //!
@@ -76,17 +88,24 @@
 //! (`a_replay_delivers_the_reads_in_the_recorded_order`).
 //!
 //! A replay that does not follow the record is a finding, not a guest-visible result (decision
-//! log, 2026-11-17, "Env failures"): [`Replay::check`] says how it diverged ([`ReplayError`]).
+//! log, 2026-11-17, "Env failures"): [`Replay::check`] says how it first diverged
+//! ([`ReplayError`]). A replayed job that reaches its recorded failure must ask what the live
+//! job asked when it failed (the same kind of call, and for host I/O the same request), or it
+//! has diverged too. A record that numbers one job twice is refused when the replay is made
+//! ([`RecordError`]).
 //! What becomes of the job's request then is not the guest's concern, since the run is no longer
 //! the recorded one: a job the record does not hold is dropped, and one whose reads differ from
 //! the record is finished with what the environment answered (`ReplayEnv`'s error).
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::num::NonZeroUsize;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 
-use starquake_trace::{Env, EnvError, EnvRecord, HostIoReply, HostIoRequest, HostNanos, ReplayEnv};
+use starquake_trace::{
+    Env, EnvCall, EnvError, EnvRecord, HostIoReply, HostIoRequest, HostNanos, ReplayEnv,
+};
 
 use crate::framework::{Executor, Job};
 
@@ -121,7 +140,39 @@ pub struct Completed {
     pub answers: Vec<EnvRecord>,
     /// The error the environment answered it with, if one did: after `answers`, every call the
     /// job made got it.
-    pub failure: Option<EnvError>,
+    pub failure: Option<Failure>,
+}
+
+/// What a job asked the environment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Question {
+    /// The time ([`Env::now`]).
+    Clock,
+    /// A random number ([`Env::random_u64`]).
+    Random,
+    /// This host I/O request ([`Env::host_io`]).
+    HostIo(HostIoRequest),
+}
+
+impl Question {
+    /// The kind of call it is.
+    #[must_use]
+    pub fn call(&self) -> EnvCall {
+        match self {
+            Self::Clock => EnvCall::Clock,
+            Self::Random => EnvCall::Random,
+            Self::HostIo(_) => EnvCall::HostIo,
+        }
+    }
+}
+
+/// The error the environment answered a job with, and the question that got it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Failure {
+    /// What the job asked.
+    pub asked: Question,
+    /// What the environment answered.
+    pub error: EnvError,
 }
 
 /// Whether [`Workers`] keep a record of the jobs they finish.
@@ -135,14 +186,13 @@ pub enum Recording {
 
 /// Why [`Workers`] could not be started.
 #[derive(Debug, thiserror::Error)]
-#[error("a file-system worker thread could not be started: {0}")]
-pub struct StartError(#[source] std::io::Error);
-
-#[cfg(test)]
-impl StartError {
-    pub(crate) fn from_io(error: std::io::Error) -> Self {
-        Self(error)
-    }
+pub enum StartError {
+    /// The workers were given no environment, so they would have no thread.
+    #[error("the file-system workers were given no environment to run a thread with")]
+    NoEnvironment,
+    /// The host could not start a thread.
+    #[error("a file-system worker thread could not be started: {0}")]
+    Thread(#[source] std::io::Error),
 }
 
 /// A mutex's value, whatever a panicking holder left: every value here is valid between the
@@ -172,7 +222,6 @@ struct Shared {
     queue: Mutex<Queue>,
     /// Rung when a job is queued or the queue closes.
     queued: Condvar,
-    env: Arc<dyn Env>,
     recording: Recording,
     /// The record. Its lock is also held while a job is finished, so the entries are in the
     /// order completions reached the mailbox.
@@ -198,14 +247,27 @@ impl Shared {
         }
     }
 
-    /// A worker thread's loop: run, finish and record jobs until the queue closes.
-    fn work(&self) {
+    /// A worker thread's loop: run, finish and record jobs, each with the thread's own `env`,
+    /// until the queue closes. A job or a finish that panics is logged, and the thread goes on
+    /// (module docs, "The workers").
+    fn work(&self, env: &dyn Env) {
         while let Some((job, run)) = self.next_job() {
-            let env = Recorded::new(&*self.env);
-            let finish = run(&env);
-            let (answers, failure) = env.into_record();
+            let recorded = Recorded::new(env, self.recording);
+            let Ok(finish) = catch_unwind(AssertUnwindSafe(|| run(&recorded))) else {
+                tracing::error!(
+                    job = job.raw(),
+                    "a file-system job panicked: its request is dropped"
+                );
+                continue;
+            };
+            let (answers, failure) = recorded.into_record();
             let mut record = lock(&self.record);
-            finish();
+            if catch_unwind(AssertUnwindSafe(finish)).is_err() {
+                tracing::error!(
+                    job = job.raw(),
+                    "a file-system job's finish panicked: its request is dropped"
+                );
+            }
             if self.recording == Recording::Kept {
                 record.push(Completed {
                     job,
@@ -224,18 +286,18 @@ pub struct Workers {
 }
 
 impl Workers {
-    /// `count` threads whose jobs read the host through `env`, keeping a record of what they
-    /// finish or not.
+    /// One thread per environment in `envs`, whose jobs read the host through that thread's
+    /// environment alone, keeping a record of what they finish or not (module docs, "The
+    /// workers").
     ///
     /// # Errors
     ///
-    /// [`StartError`] when the host cannot start a thread. The threads started before it are
-    /// stopped and waited for.
-    pub fn new(
-        count: NonZeroUsize,
-        env: Arc<dyn Env>,
-        recording: Recording,
-    ) -> Result<Self, StartError> {
+    /// [`StartError::NoEnvironment`] when `envs` is empty, and [`StartError::Thread`] when the
+    /// host cannot start a thread. The threads started before it are stopped and waited for.
+    pub fn new(envs: Vec<Arc<dyn Env>>, recording: Recording) -> Result<Self, StartError> {
+        if envs.is_empty() {
+            return Err(StartError::NoEnvironment);
+        }
         let shared = Arc::new(Shared {
             queue: Mutex::new(Queue {
                 jobs: VecDeque::new(),
@@ -243,20 +305,19 @@ impl Workers {
                 closed: false,
             }),
             queued: Condvar::new(),
-            env,
             recording,
             record: Mutex::new(Vec::new()),
         });
         let mut workers = Self {
             shared,
-            threads: Vec::with_capacity(count.get()),
+            threads: Vec::with_capacity(envs.len()),
         };
-        for number in 0..count.get() {
+        for (number, env) in envs.into_iter().enumerate() {
             let shared = Arc::clone(&workers.shared);
             let thread = std::thread::Builder::new()
                 .name(format!("starquake-fsp-{number}"))
-                .spawn(move || shared.work())
-                .map_err(StartError)?;
+                .spawn(move || shared.work(&*env))
+                .map_err(StartError::Thread)?;
             workers.threads.push(thread);
         }
         Ok(workers)
@@ -308,45 +369,55 @@ impl Drop for Workers {
     }
 }
 
-/// The environment one job runs with on a worker: the workers' own, with every answer kept for
-/// the job's record. The first error ends the job's use of the environment: it and every later
-/// call get that error.
+/// The environment one job runs with on a worker: its thread's own, with every answer kept for
+/// the job's record when the workers keep one. The first error ends the job's use of the
+/// environment: it and every later call get that error, which is held whether or not answers
+/// are kept.
 struct Recorded<'a> {
     env: &'a dyn Env,
-    kept: Mutex<(Vec<EnvRecord>, Option<EnvError>)>,
+    recording: Recording,
+    kept: Mutex<(Vec<EnvRecord>, Option<Failure>)>,
 }
 
 impl<'a> Recorded<'a> {
-    fn new(env: &'a dyn Env) -> Self {
+    fn new(env: &'a dyn Env, recording: Recording) -> Self {
         Self {
             env,
+            recording,
             kept: Mutex::new((Vec::new(), None)),
         }
     }
 
-    /// Asks the environment with `ask`, unless it has already failed, and keeps the answer.
+    /// Asks the environment with `ask`, unless it has already failed, and keeps the answer when
+    /// the workers keep a record. `asked` says what was asked, for a failure.
     fn ask<T>(
         &self,
+        asked: impl FnOnce() -> Question,
         ask: impl FnOnce(&dyn Env) -> Result<T, EnvError>,
         keep: impl FnOnce(&T) -> EnvRecord,
     ) -> Result<T, EnvError> {
         let mut kept = lock(&self.kept);
         if let Some(failure) = &kept.1 {
-            return Err(failure.clone());
+            return Err(failure.error.clone());
         }
         match ask(self.env) {
             Ok(answer) => {
-                kept.0.push(keep(&answer));
+                if self.recording == Recording::Kept {
+                    kept.0.push(keep(&answer));
+                }
                 Ok(answer)
             }
             Err(error) => {
-                kept.1 = Some(error.clone());
+                kept.1 = Some(Failure {
+                    asked: asked(),
+                    error: error.clone(),
+                });
                 Err(error)
             }
         }
     }
 
-    fn into_record(self) -> (Vec<EnvRecord>, Option<EnvError>) {
+    fn into_record(self) -> (Vec<EnvRecord>, Option<Failure>) {
         self.kept
             .into_inner()
             .unwrap_or_else(PoisonError::into_inner)
@@ -355,15 +426,24 @@ impl<'a> Recorded<'a> {
 
 impl Env for Recorded<'_> {
     fn now(&self) -> Result<HostNanos, EnvError> {
-        self.ask(|env| env.now(), |now| EnvRecord::Clock(*now))
+        self.ask(
+            || Question::Clock,
+            |env| env.now(),
+            |now| EnvRecord::Clock(*now),
+        )
     }
 
     fn random_u64(&self) -> Result<u64, EnvError> {
-        self.ask(|env| env.random_u64(), |value| EnvRecord::Random(*value))
+        self.ask(
+            || Question::Random,
+            |env| env.random_u64(),
+            |value| EnvRecord::Random(*value),
+        )
     }
 
     fn host_io(&self, request: &HostIoRequest) -> Result<HostIoReply, EnvError> {
         self.ask(
+            || Question::HostIo(request.clone()),
             |env| env.host_io(request),
             |reply| EnvRecord::HostIo {
                 request: request.clone(),
@@ -371,6 +451,19 @@ impl Env for Recorded<'_> {
             },
         )
     }
+}
+
+/// Why a record cannot be replayed ([`Replay::new`]).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RecordError {
+    /// The record holds two completions of one job.
+    #[error("file-system job {job} is recorded twice, the second time at entry {entry}")]
+    Duplicate {
+        /// The job's number.
+        job: u64,
+        /// Where in the record the second completion is, from zero.
+        entry: usize,
+    },
 }
 
 /// How a replay left its record ([`Replay::check`]).
@@ -446,16 +539,29 @@ pub struct Replay {
 
 impl Replay {
     /// A replay of `record`, as [`Workers::take_record`] gave it.
-    #[must_use]
-    pub fn new(record: Vec<Completed>) -> Self {
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// [`RecordError::Duplicate`] at the first entry whose job an earlier entry holds: a job
+    /// is finished once, and a second entry would wait in front of the jobs after it forever.
+    pub fn new(record: Vec<Completed>) -> Result<Self, RecordError> {
+        let mut seen = BTreeSet::new();
+        for (entry, completed) in record.iter().enumerate() {
+            if !seen.insert(completed.job) {
+                return Err(RecordError::Duplicate {
+                    job: completed.job.raw(),
+                    entry,
+                });
+            }
+        }
+        Ok(Self {
             state: Mutex::new(Replaying {
                 record: record.into(),
                 waiting: BTreeMap::new(),
                 next: 0,
                 error: None,
             }),
-        }
+        })
     }
 
     /// Whether the replay has followed the record so far and finished all of it: the first
@@ -505,7 +611,10 @@ impl Executor for Replay {
 struct Replayed {
     answers: ReplayEnv,
     count: usize,
-    failure: Option<EnvError>,
+    failure: Option<Failure>,
+    /// Whether the first call past the recorded answers asked what the recorded failure
+    /// answered: `Ok` if it did, else how it differed. Every later call gets the same.
+    reached: Mutex<Option<Result<(), EnvError>>>,
 }
 
 impl Replayed {
@@ -514,25 +623,62 @@ impl Replayed {
             count: entry.answers.len(),
             answers: ReplayEnv::new(entry.answers),
             failure: entry.failure,
+            reached: Mutex::new(None),
         }
     }
 
     /// `answer`, unless the recorded answers have run out where the recorded job failed: then
-    /// the recorded failure, as the live job got it.
-    fn answer<T>(&self, answer: Result<T, EnvError>) -> Result<T, EnvError> {
+    /// the recorded failure, as the live job got it, if the job asked what the live job asked
+    /// then (`call`, and for host I/O `request`), and otherwise how its question differs.
+    fn answer<T>(
+        &self,
+        call: EnvCall,
+        request: Option<&HostIoRequest>,
+        answer: Result<T, EnvError>,
+    ) -> Result<T, EnvError> {
         match (answer, &self.failure) {
             (Err(EnvError::Exhausted { index, .. }), Some(failure)) if index == self.count => {
-                Err(failure.clone())
+                let mut reached = lock(&self.reached);
+                let verdict = reached
+                    .get_or_insert_with(|| self.compare(failure, call, request))
+                    .clone();
+                Err(verdict.err().unwrap_or_else(|| failure.error.clone()))
             }
             (answer, _) => answer,
         }
     }
 
+    /// Whether `call` (with `request`, for host I/O) is the question `failure` answered.
+    fn compare(
+        &self,
+        failure: &Failure,
+        call: EnvCall,
+        request: Option<&HostIoRequest>,
+    ) -> Result<(), EnvError> {
+        let recorded = failure.asked.call();
+        if recorded != call {
+            return Err(EnvError::Mismatch {
+                index: self.count,
+                requested: call,
+                recorded,
+            });
+        }
+        match (&failure.asked, request) {
+            (Question::HostIo(asked), Some(request)) if asked != request => {
+                Err(EnvError::HostIoRequestMismatch { index: self.count })
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Whether the job asked what the recorded one asked: every recorded answer used, and no
-    /// question that differs. A recorded failure is the end of the recording, not a divergence.
+    /// question that differs, up to and including the one the recorded failure answered. A
+    /// recorded failure is the end of the recording, not a divergence.
     fn check(&self) -> Result<(), EnvError> {
         match (self.answers.finish(), &self.failure) {
-            (Err(EnvError::Exhausted { index, .. }), Some(_)) if index == self.count => Ok(()),
+            (Err(EnvError::Exhausted { index, .. }), Some(_)) if index == self.count => {
+                lock(&self.reached).clone().unwrap_or(Ok(()))
+            }
             // The recorded failure is one more answer, which the job never asked for.
             (Ok(()), Some(_)) => Err(EnvError::Unconsumed {
                 index: self.count,
@@ -545,14 +691,18 @@ impl Replayed {
 
 impl Env for Replayed {
     fn now(&self) -> Result<HostNanos, EnvError> {
-        self.answer(self.answers.now())
+        self.answer(EnvCall::Clock, None, self.answers.now())
     }
 
     fn random_u64(&self) -> Result<u64, EnvError> {
-        self.answer(self.answers.random_u64())
+        self.answer(EnvCall::Random, None, self.answers.random_u64())
     }
 
     fn host_io(&self, request: &HostIoRequest) -> Result<HostIoReply, EnvError> {
-        self.answer(self.answers.host_io(request))
+        self.answer(
+            EnvCall::HostIo,
+            Some(request),
+            self.answers.host_io(request),
+        )
     }
 }

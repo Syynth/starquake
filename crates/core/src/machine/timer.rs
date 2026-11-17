@@ -178,7 +178,9 @@ pub(super) fn deliver<V: Vcpu, C: HostClock + Clone>(
     // PROVISIONAL: nothing keeps the environments' recordings (`machine` module docs). Every
     // read `fsp-srv`'s workers finish rings this turn, so what they read is dropped here.
     drop(machine.env.take_recording());
-    drop(machine.reads.take_recording());
+    for reads in &machine.reads {
+        drop(reads.take_recording());
+    }
     machine
         .dispatcher
         .reschedule(&mut machine.signals())

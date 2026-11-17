@@ -37,11 +37,11 @@
 //! `IFile::Read` and `IStorage::Read` defer their reply and hand the read to `fsp-srv`'s
 //! executor ([`Reads::executor`]): in a run, `fsp-srv`'s workers
 //! (`starquake_services::fsp::worker::Workers`), whose jobs read the title's RomFS through the
-//! loader's positional source behind [`FspHost`], on an environment of their own. When a job
-//! is finished, its completion reaches the `fsp-srv` server's mailbox, and the server's
-//! notification tells [`Reads::ready`] the server's number in the kernel; the core loop then
-//! delivers the reply (`crate::machine`, "Deferred replies"). What is recorded, and how a
-//! replay delivers the reads in the recorded order, is the worker module's
+//! loader's positional source behind [`FspHost`], each worker on an environment of its own.
+//! When a job is finished, its completion reaches the `fsp-srv` server's mailbox, and the
+//! server's notification tells [`Reads::ready`] the server's number in the kernel; the core
+//! loop then delivers the reply (`crate::machine`, "Deferred replies"). What is recorded, and
+//! how a replay delivers the reads in the recorded order, is the worker module's
 //! (`starquake_services::fsp::worker`, "What is recorded").
 
 use std::sync::{Arc, OnceLock};
@@ -122,8 +122,13 @@ pub enum ServicesError {
 }
 
 /// Told when a server has deferred replies ready to deliver: the core loop's, in a run
-/// (`crate::machine`, "Deferred replies"). It is called on the thread that completed a reply
-/// token, with no lock of the services held, and must not block.
+/// (`crate::machine`, "Deferred replies"). It is called on the thread that completed or dropped
+/// a reply token, from the server's notification, and must not block. For `fsp-srv`'s reads that
+/// is the executor's finish step, which runs with a lock of the executor held: on one of the
+/// workers (`starquake_services::fsp::worker::Workers`), the workers' record lock; in a replay
+/// (`starquake_services::fsp::worker::Replay`), the replay's state lock, on the thread that
+/// submitted the job. So it must not call `Workers::take_record` or submit a job to the
+/// server's executor, which wait for those locks.
 pub trait Deliveries: Send + Sync {
     /// The deferred replies of the server the kernel numbers `server` are ready.
     fn ready(&self, server: ServerId);
@@ -157,9 +162,11 @@ impl Notify for Delivering {
     }
 }
 
-/// Puts the run's services in front of `dispatcher`. `env` is the environment the services read
-/// the host through: the run's own, so that what they read is recorded with everything else.
-/// `reads` is where `fsp-srv`'s reads run, and who is told when one is done.
+/// Puts the run's services in front of `dispatcher`. `env` is the environment the services'
+/// methods read the host through while they handle a request: the run's own, so that what they
+/// read there is recorded with everything else. `fsp-srv`'s reads do not use it: their jobs read
+/// through the environments of `reads`' executor (module docs, "Reads"). `reads` is where
+/// `fsp-srv`'s reads run, and who is told when one is done.
 pub fn install(
     dispatcher: &Dispatcher,
     env: Arc<dyn Env>,

@@ -11,6 +11,7 @@ use std::cell::RefCell;
 use std::io;
 use std::sync::Condvar;
 use std::sync::atomic::AtomicBool;
+use std::sync::mpsc::{self, Sender};
 
 use starquake_ipc::{
     BUFFER_SIZE, Body, BufferDescriptor, CommandType, Message, RequestBuilder, RequestLayout,
@@ -20,8 +21,11 @@ use starquake_loader::nup::build::{self, Content, PackageSpec, ROMFS_DIR_NAME, T
 use starquake_loader::nup::storage::{CACHE_CAP, RomFsStorage};
 use starquake_loader::nup::{Nup, PackageKind};
 use starquake_loader::read_at::{Positional, ReadAt};
+use starquake_services::framework::{Executor, Finish, Job};
+use starquake_services::fsp::host::{CHANNEL, HostRequest, Mount};
 use starquake_services::fsp::{self, command};
 use starquake_services::sm::{self, MAX_NAME_LEN, ServiceName};
+use starquake_trace::{HostIoReply, HostIoRequest};
 
 use super::*;
 use crate::hle::tests::Scratch;
@@ -51,23 +55,61 @@ const CARD_LEN: u64 = 9;
 struct Source {
     bytes: Vec<u8>,
     holding: AtomicBool,
+    gate: Mutex<Held>,
+    /// Rung when [`Held`] changes.
+    changed: Condvar,
+}
+
+/// Where a [`Source`]'s held read is.
+#[derive(Default)]
+struct Held {
+    /// Set when a read starts being held.
+    entered: bool,
+    /// Set by the test to let a held read go before [`HELD_FOR`].
+    opened: bool,
     /// Set when a held read has returned.
-    released: Mutex<bool>,
-    opened: Condvar,
+    released: bool,
 }
 
 /// The longest [`Source`] holds a read.
 const HELD_FOR: Duration = Duration::from_secs(3);
 
+impl Source {
+    /// Whether a held read has returned.
+    fn released(&self) -> bool {
+        lock(&self.gate).released
+    }
+
+    /// Waits, for at most [`RUN_LIMIT`], until a read is being held.
+    fn await_entered(&self) {
+        let gate = lock(&self.gate);
+        let (gate, timeout) = self
+            .changed
+            .wait_timeout_while(gate, RUN_LIMIT, |gate| !gate.entered)
+            .unwrap();
+        drop(gate);
+        assert!(!timeout.timed_out(), "no read reached the title file");
+    }
+
+    /// Lets a held read go.
+    fn open(&self) {
+        lock(&self.gate).opened = true;
+        self.changed.notify_all();
+    }
+}
+
 impl ReadAt for Source {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
         if self.holding.load(Ordering::SeqCst) {
-            let released = lock(&self.released);
-            let (mut released, _) = self
-                .opened
-                .wait_timeout(released, HELD_FOR)
+            let mut gate = lock(&self.gate);
+            gate.entered = true;
+            self.changed.notify_all();
+            let (mut gate, _) = self
+                .changed
+                .wait_timeout_while(gate, HELD_FOR, |gate| !gate.opened)
                 .unwrap_or_else(PoisonError::into_inner);
-            *released = true;
+            gate.released = true;
+            self.changed.notify_all();
             return Err(io::Error::other("the read was held"));
         }
         self.bytes.read_at(offset, buf)
@@ -438,11 +480,164 @@ fn a_run_that_ends_with_a_read_in_flight_waits_for_it_and_leaves_no_thread() {
     let (report, seen) = run_reading("machine-reads-in-flight", romfs, timeout);
     assert_eq!(report.exit, ExitReason::Timeout, "{}", report.trace);
     // The run did not return before the worker's read did, so no worker thread outlived it.
-    assert!(
-        *lock(&source.released),
-        "the run returned with a read in flight"
-    );
+    assert!(source.released(), "the run returned with a read in flight");
     assert!(started.elapsed() < RUN_LIMIT);
     // The guest never saw the read's reply.
     assert_eq!(seen.reads, Vec::<Vec<u8>>::new());
+}
+
+/// A run's session over `options`, with no guest behind it: what a run builds its workers'
+/// environments from.
+fn session_over<'a>(memory: &'a FlatMemory, options: &'a RunOptions) -> Session<'a, SystemClock> {
+    Session {
+        memory,
+        options,
+        clock: RunClock::new(timebase()),
+        recorder: Recorder::new(),
+    }
+}
+
+/// The host request of a read of `len` bytes from `offset` of the file at `path` on `mount`.
+fn host_read(mount: Mount, path: &[u8], offset: u64, len: u64) -> HostIoRequest {
+    HostRequest::Read {
+        mount,
+        path: path.to_vec(),
+        offset,
+        len,
+    }
+    .to_host_io()
+}
+
+/// A job that asks the host for `request` and whose finish sends `name` and the answer on
+/// `answers`.
+fn asking(
+    name: &'static str,
+    request: HostIoRequest,
+    answers: &Sender<(&'static str, HostIoReply)>,
+) -> Job {
+    let answers = answers.clone();
+    Box::new(move |env: &dyn Env| {
+        let reply = env.host_io(&request).unwrap();
+        let finish: Finish = Box::new(move || answers.send((name, reply)).unwrap());
+        finish
+    })
+}
+
+#[test]
+fn a_read_held_at_the_title_does_not_hold_up_a_card_read() {
+    // A real run's workers on a real run's environments: a live environment holds its lock for
+    // the whole of a host request, so workers that shared one would wait for each other.
+    let (romfs, source) = romfs();
+    source.holding.store(true, Ordering::SeqCst);
+    let scratch = Scratch::new("machine-reads-held-title");
+    scratch.file("card.txt", CARD_TEXT);
+    let options = RunOptions {
+        timeout: None,
+        command_line: Vec::new(),
+        sd_card: Some(scratch.path()),
+        romfs: Some(romfs),
+    };
+    let memory = FlatMemory::new(RAM_BASE, RAM_SIZE);
+    let session = session_over(&memory, &options);
+    let workers = reads_workers(&session.reads_environments()).unwrap();
+    let (send, answers) = mpsc::channel();
+    let title = host_read(Mount::DataStorage, b"", IMAGE_OFFSET, IMAGE_LEN);
+    workers.submit(asking("title", title, &send));
+    source.await_entered();
+    let card = host_read(Mount::SdCard, b"/card.txt", CARD_OFFSET, CARD_LEN);
+    workers.submit(asking("card", card, &send));
+
+    // The card read completes while the title read is still held.
+    let (name, reply) = answers.recv_timeout(RUN_LIMIT).unwrap();
+    assert!(
+        !source.released(),
+        "the card read waited for the title read"
+    );
+    let start = usize::try_from(CARD_OFFSET).unwrap();
+    let end = start + usize::try_from(CARD_LEN).unwrap();
+    assert_eq!(
+        (name, reply),
+        ("card", HostIoReply::Data(CARD_TEXT[start..end].to_vec()))
+    );
+    source.open();
+    let (name, _) = answers.recv_timeout(RUN_LIMIT).unwrap();
+    assert_eq!(name, "title");
+}
+
+#[test]
+fn a_real_runs_workers_keep_no_record() {
+    let options = RunOptions::default();
+    let memory = FlatMemory::new(RAM_BASE, RAM_SIZE);
+    let session = session_over(&memory, &options);
+    let workers = reads_workers(&session.reads_environments()).unwrap();
+    let (send, answers) = mpsc::channel();
+    let probe = HostRequest::Probe {
+        mount: Mount::SdCard,
+    }
+    .to_host_io();
+    workers.submit(asking("probe", probe, &send));
+    // The record is kept, if it is, under the lock the finish runs in.
+    assert_eq!(
+        answers.recv_timeout(RUN_LIMIT).unwrap(),
+        ("probe", HostIoReply::Unavailable)
+    );
+    assert_eq!(workers.take_record(), []);
+}
+
+#[test]
+fn a_runs_workers_read_through_environments_of_their_own() {
+    // The services are given one environment per worker, none of them the kernel's: what the
+    // workers read is in their own recordings, not in the kernel's.
+    let guest = Guest::new(&programs::hello().unwrap());
+    let options = RunOptions::default();
+    let session = session_over(&guest.memory, &options);
+    let env = session.environment();
+    let mut vcpu = ScriptedVcpu::new().then(|_| {}, svc(SvcId::ExitProcess));
+    let checked = Arc::new(AtomicBool::new(false));
+    let kernels = Arc::clone(&env);
+    let checking = Arc::clone(&checked);
+    let install = move |dispatcher: &Dispatcher, given: Given| {
+        assert_eq!(given.reads.len(), worker::COUNT.get());
+        let before = kernels.recording();
+        for (number, reads) in given.reads.iter().enumerate() {
+            let request = HostIoRequest {
+                channel: CHANNEL,
+                payload: vec![u8::try_from(number).unwrap(); 3],
+            };
+            let reply = reads.host_io(&request).unwrap();
+            for (other, theirs) in given.reads.iter().enumerate() {
+                let expected = if other <= number {
+                    vec![EnvRecord::HostIo {
+                        request: HostIoRequest {
+                            channel: CHANNEL,
+                            payload: vec![u8::try_from(other).unwrap(); 3],
+                        },
+                        reply: reply.clone(),
+                    }]
+                } else {
+                    Vec::new()
+                };
+                assert_eq!(theirs.recording(), expected, "worker {other}'s environment");
+            }
+        }
+        assert_eq!(
+            kernels.recording(),
+            before,
+            "a worker read through the kernel's environment"
+        );
+        checking.store(true, Ordering::SeqCst);
+        real_services(dispatcher, given)
+    };
+    let (dispatcher, _) = boot(guest.address_space(), &guest.placed, &guest.memory).unwrap();
+    let (ending, ..) = drive(
+        vcpus(&mut vcpu),
+        dispatcher,
+        &guest.memory,
+        &session,
+        &env,
+        Limits::DEFAULT,
+        &install,
+    );
+    assert!(matches!(ending, Ending::Exited));
+    assert!(checked.load(Ordering::SeqCst));
 }

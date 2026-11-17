@@ -94,7 +94,7 @@ impl ReadyServers {
 
 /// `fsp-srv`'s reads on its workers, over `env`, telling `ready`.
 fn reads_on(env: Arc<dyn Env>, ready: &Arc<ReadyServers>) -> Reads {
-    let workers = Workers::new(worker::COUNT, env, Recording::Off).unwrap();
+    let workers = Workers::new(vec![env; worker::COUNT.get()], Recording::Off).unwrap();
     let ready: Arc<dyn Deliveries> = Arc::<ReadyServers>::clone(ready);
     Reads {
         executor: Arc::new(workers),
