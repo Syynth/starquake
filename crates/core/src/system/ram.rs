@@ -20,10 +20,15 @@
 //! | the main thread's thread-local page | [`THREAD_LOCAL_RAM`], one page | `starquake_kernel::process::run` takes the thread's region from a new page (`ThreadLocalPages::reserve`) and writes it |
 //! | working RAM | [`WORKING_RAM`], or what the maximum leaves of it | a guess: see the constant |
 //!
-//! Not counted: the process's system resource (`META` 0x14). In Horizon it holds the process's
-//! page tables; here the translation tables live in the backend's own table pool, outside guest
-//! RAM (`starquake_cpu::hvf`, "Guest-physical memory"). GPU-only memory is never guest memory
-//! (execution model, "Sparse and lazy memory").
+//! Not counted: the process's system resource (`META` 0x14). Eden makes it a
+//! `KSecureSystemResource` of that size, reserved from the process's resource limit
+//! (`KProcess::Initialize`, `secure_resource->Initialize(kernel, system_resource_num_pages *
+//! PageSize, res_limit, m_memory_pool)`, `eden/src/core/hle/kernel/k_process.cpp` @ cf654052),
+//! for the kernel's own structures for the process. Here nothing is allocated from it: the
+//! translation tables live in the backend's own table pool, outside guest RAM
+//! (`starquake_cpu::hvf`, "Guest-physical memory"), and the kernel's pool accounting does not
+//! charge it either. GPU-only memory is never guest memory (execution model, "Sparse and lazy
+//! memory").
 //!
 //! # The maximum and the fit check
 //!
@@ -31,21 +36,25 @@
 //! (`starquake_kernel::memory::MemoryArrangement::application_pool_size`, through
 //! `crate::image::memory_arrangement`): 3285 MiB for a Switch 1 program, 9809 MiB for a
 //! Switch 2 one. A program whose `needed` is above it is [`Error::OutOfRam`], before a VM is
-//! made, so running out of RAM while loading is never reported as a fault on a guest write.
+//! made. A program that fits has RAM for every page loading writes (the trampolines and the
+//! modules' bytes, all inside the counted extent), so loading it does not run out of RAM; a
+//! guest that touches more than its RAM once it runs still ends as an emulator error
+//! (`crate::space`).
+//!
 //! A program that fits gets `needed` plus [`WORKING_RAM`], or the maximum if that is less: a
 //! program that fits with no byte to spare loads, with no working RAM. The backend rounds the
 //! size up to its own pages (`starquake_cpu::hvf::RamConfig::at_least`, 16 KiB), which never
 //! passes the maximum: both pool sizes are whole 16 KiB pages
 //! (`both_maximums_are_whole_host_pages`).
 //!
-//! Divergence from Eden (stricter): Eden reserves only the code (`KProcess::Initialize`,
-//! `KScopedResourceReservation` of `code_size`) and the main thread's stack
-//! (`KProcess::Run`) against the pool (`eden/src/core/hle/kernel/k_process.cpp` @ cf654052). Its
-//! thread-local page comes from the kernel's page buffers (`KPageBuffer::Allocate` in
-//! `KThreadLocalPage::Initialize`, `k_thread_local_page.cpp`), and it has no counter
-//! trampolines. So a program whose code and stack fill the pool to within less than a page (and
-//! its trampolines) loads under Eden and is [`Error::OutOfRam`] here. Test:
-//! `code_and_stack_that_fill_the_pool_leave_no_room_for_the_thread_local_page`.
+//! Divergence from Eden (stricter): of what is counted here, Eden reserves against the pool the
+//! code (`KProcess::Initialize`, a `KScopedResourceReservation` of `code_size`) and the main
+//! thread's stack (`KProcess::Run`), both in `eden/src/core/hle/kernel/k_process.cpp` @
+//! cf654052. Its thread-local page comes from the kernel's page buffers
+//! (`KPageBuffer::Allocate` in `KThreadLocalPage::Initialize`, `k_thread_local_page.cpp`), and
+//! it has no counter trampolines. So a program whose code and stack fill the pool to within
+//! less than a page (and its trampolines) loads under Eden and is [`Error::OutOfRam`] here.
+//! Test: `code_and_stack_that_fill_the_pool_leave_no_room_for_the_thread_local_page`.
 
 use starquake_kernel::process::ProcessDescription;
 use starquake_memory::PAGE_SIZE;

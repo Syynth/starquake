@@ -1,8 +1,9 @@
 //! Loading a program into a guest address space: what process it is ([`Program`], with its
 //! description from its metadata), where its modules, their `.bss` and the counter trampolines
-//! go ([`place`]), and creating the process's memory around them with the kernel ([`load`]):
-//! the code and the main thread's stack. The main thread itself, and its thread-local page, are
-//! the kernel's process creation's (`starquake_kernel::process::run`, called by the core loop).
+//! go ([`place`]), and creating the process's memory around them with the kernel
+//! ([`load_placed`]): the code and the main thread's stack. The main thread itself, and its
+//! thread-local page, are the kernel's process creation's (`starquake_kernel::process::run`,
+//! called by the core loop).
 //!
 //! A program is an NRO ([`Program::parse`]: one module, `main`) or an ExeFS
 //! ([`Program::from_exefs`]: `main.npdm` and up to thirteen NSO modules, in the loader's
@@ -10,8 +11,8 @@
 //! loader's ([`CodeSet`]: segments, `MOD0` and `.bss`, the module's size); relocations are the
 //! guest's own (the loader's `codeset` module docs, "Relocations").
 //!
-//! [`load`] follows Eden's process start for a program (paths relative to the reference folder,
-//! all @ cf654052):
+//! [`load_placed`] follows Eden's process start for a program (paths relative to the reference
+//! folder, all @ cf654052):
 //!
 //! 1. `KProcess::LoadFromMetadata` and `KProcess::Initialize`
 //!    (`eden/src/core/hle/kernel/k_process.cpp`): the kernel lays out the address space around
@@ -425,7 +426,8 @@ pub(crate) struct Placement {
     pub(crate) description: ProcessDescription,
 }
 
-/// What [`load`] hands back: where things are, and the kernel's address space that holds them.
+/// What [`load_placed`] hands back: where things are, and the kernel's address space that holds
+/// them.
 #[derive(Debug)]
 pub(crate) struct Loaded {
     /// Where the program and its stack are.
