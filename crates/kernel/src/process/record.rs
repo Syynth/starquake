@@ -3,11 +3,24 @@
 //! table ([`crate::sched::Scheduler::process`]): Horizon changes each of these under its
 //! scheduler lock (`KProcess::ChangeState`, `CreateThreadLocalRegion`,
 //! `IncrementScheduledCount`, `eden/src/core/hle/kernel/k_process.cpp` @ cf654052).
+//!
+//! The row also keeps the process's random entropy (`KProcess::m_entropy`, which `GetInfo`'s
+//! `RandomEntropy` id reads). Horizon draws it in `KProcess::Initialize` (`GenerateRandom(
+//! m_entropy)`, `k_process.cpp` @ cf654052, line 239) and never changes it. Here it is drawn
+//! from the environment the first time `GetInfo` asks for it, because creating a process has no
+//! route to the environment's random numbers ([`crate::svc::info`] lists the divergence), and
+//! never changes after that.
 
 use std::collections::BTreeSet;
 
 use super::tls::ThreadLocalPages;
 use crate::id::{ObjectId, ThreadId};
+
+/// How many words of random entropy a process has: `std::array<u64, 4> m_entropy`
+/// (`eden/src/core/hle/kernel/k_process.h` @ cf654052, line 103; the same in
+/// `eden-pr4588/src/core/hle/kernel/k_process.h` @ e5fb3b97, so the same for a Switch 2
+/// program).
+pub const ENTROPY_COUNT: usize = 4;
 
 /// A process's state: the part of Eden's `KProcess::State` a process without a debugger goes
 /// through (`Created`, `Running`, `Terminated`; `Terminating` is never seen from outside a call
@@ -35,6 +48,8 @@ pub struct ProcessRecord {
     pub(crate) tls: ThreadLocalPages,
     /// `m_schedule_count`: what its threads' yields compare with.
     pub(crate) scheduled_count: u64,
+    /// `m_entropy`, once drawn (see the module docs).
+    pub(crate) entropy: Option<[u64; ENTROPY_COUNT]>,
 }
 
 impl ProcessRecord {
@@ -48,6 +63,7 @@ impl ProcessRecord {
             threads: BTreeSet::new(),
             tls: ThreadLocalPages::new(),
             scheduled_count: 0,
+            entropy: None,
         }
     }
 
@@ -85,5 +101,12 @@ impl ProcessRecord {
     #[must_use]
     pub const fn scheduled_count(&self) -> u64 {
         self.scheduled_count
+    }
+
+    /// Its random entropy (`GetRandomEntropy`), or `None` while it has not been drawn
+    /// ([`crate::sched::Scheduler::set_entropy`]).
+    #[must_use]
+    pub const fn entropy(&self) -> Option<[u64; ENTROPY_COUNT]> {
+        self.entropy
     }
 }

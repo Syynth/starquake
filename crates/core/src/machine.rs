@@ -398,7 +398,9 @@ const UNDEFINED: Exception = Exception::UndefinedInstruction;
 /// How the loop ended.
 enum Ending {
     Exited,
-    Crashed(Exception, Syndrome, Box<GuestRegs>),
+    /// The guest crashed with the exception, the syndrome the CPU backend reported for it (none
+    /// for a `Break` system call), and its registers.
+    Crashed(Exception, Option<Syndrome>, Box<GuestRegs>),
     TimedOut,
     Failed(String),
 }
@@ -551,17 +553,20 @@ pub(crate) fn run_serving<V: Vcpu, C: HostClock + Clone + 'static>(
             });
             ExitReason::EmulatorError(message)
         }
-        Ending::Crashed(exception, syndrome, regs) => ExitReason::GuestCrashed(Box::new(
-            CrashReport::new(
+        Ending::Crashed(exception, syndrome, regs) => {
+            let report = CrashReport::new(
                 exception,
                 &regs,
                 &mappings,
                 &placed.modules,
                 last_events(&flight),
                 &options.command_line,
-            )
-            .with_syndrome(syndrome),
-        )),
+            );
+            ExitReason::GuestCrashed(Box::new(match syndrome {
+                Some(syndrome) => report.with_syndrome(syndrome),
+                None => report,
+            }))
+        }
     };
     let (exit, events, events_error) = settle_dump(flight.dump(), exit);
     RunReport {

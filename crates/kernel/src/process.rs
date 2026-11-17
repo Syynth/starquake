@@ -65,7 +65,7 @@ pub use description::{
     ProcessDescription, ProcessError, ProcessInfo, Range, VIRTUAL_CORE_COUNT,
     VIRTUAL_TO_PHYSICAL_CORE, physical_core, physical_mask,
 };
-pub use record::{ProcessRecord, ProcessState};
+pub use record::{ENTROPY_COUNT, ProcessRecord, ProcessState};
 pub use tls::{
     CURRENT_THREAD_HANDLE_OFFSET, REGIONS_PER_PAGE, THREAD_LOCAL_REGION_SIZE, ThreadLocalPages,
 };

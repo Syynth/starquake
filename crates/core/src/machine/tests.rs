@@ -345,11 +345,13 @@ fn an_unimplemented_call_returns_not_implemented_and_is_listed_as_stubbed() {
     // A number in the gap after GetResourceLimitPeakValue, which Horizon does not list.
     let unlisted = SvcId::GetResourceLimitPeakValue.number() + 1;
     assert_eq!(SvcId::from_number(unlisted), None);
+    let planned = SvcId::ReturnFromException;
+    assert_eq!(planned.status(), starquake_kernel::svc::Status::Planned);
     let vcpu = ScriptedVcpu::new()
-        .then(|_| {}, svc(SvcId::Break))
+        .then(|_| {}, svc(planned))
         .then(
             move |regs| assert_eq!(regs.x[0], not_implemented),
-            svc(SvcId::Break),
+            svc(planned),
         )
         .then(|_| {}, Exit::Svc(unlisted))
         .then(
@@ -361,17 +363,85 @@ fn an_unimplemented_call_returns_not_implemented_and_is_listed_as_stubbed() {
     assert_eq!(
         report.stubbed,
         BTreeSet::from([
-            format!("Break ({:#x})", SvcId::Break.number()),
+            format!("ReturnFromException ({:#x})", planned.number()),
             format!("{unlisted:#x}")
         ])
     );
     assert_eq!(
         report.system_calls,
         BTreeMap::from([
-            ("Break".to_owned(), 2),
             ("ExitProcess".to_owned(), 1),
+            ("ReturnFromException".to_owned(), 2),
             (format!("{unlisted:#x}"), 1)
         ])
+    );
+}
+
+#[test]
+fn a_break_ends_the_run_as_a_crash_naming_its_reason_and_a_notification_returns() {
+    use starquake_kernel::svc::exception::{
+        BreakReason, NOTIFICATION_ONLY_FLAG, RESULT_ARGUMENT_SIZE,
+    };
+    let guest = Guest::new(&programs::hello().unwrap());
+    // The buffer: a result-code word in the scratch memory.
+    let buffer = SCRATCH;
+    let code: u32 = 0x1d59;
+    guest.memory.write(buffer, &code.to_le_bytes()).unwrap();
+    let notice = u64::from(BreakReason::PreLoadDll.raw() | NOTIFICATION_ONLY_FLAG);
+    let panic = u64::from(BreakReason::Panic.raw());
+    let instruction = guest.placed.entry + 0x24;
+    let vcpu = ScriptedVcpu::new()
+        .then(
+            move |regs| (regs.x[0], regs.x[1], regs.x[2]) = (notice, buffer, 0x5000),
+            svc(SvcId::Break),
+        )
+        .then(
+            move |regs| {
+                // The notification returned and wrote no register.
+                assert_eq!((regs.x[0], regs.x[1], regs.x[2]), (notice, buffer, 0x5000));
+                (regs.x[0], regs.x[1], regs.x[2]) = (panic, buffer, RESULT_ARGUMENT_SIZE);
+                regs.x[3] = 0x3333;
+                regs.pc = instruction;
+            },
+            svc(SvcId::Break),
+        );
+    let report = guest.run(vcpu, &RunOptions::default());
+    assert_eq!(report.exit_code(), exit_code::GUEST_CRASHED);
+    let crash = report.crash().expect("a crash report");
+    assert_eq!(
+        crash.exception,
+        Exception::SvcBreak {
+            reason: BreakReason::Panic.raw(),
+            reason_name: Some("panic"),
+            address: buffer,
+            size: RESULT_ARGUMENT_SIZE,
+            code: Some(code),
+        }
+    );
+    assert!(
+        crash
+            .to_text()
+            .contains("exception: svc Break, reason panic (0x0), buffer "),
+        "{}",
+        crash.to_text()
+    );
+    assert_eq!(crash.syndrome, None);
+    assert_eq!(crash.pc, instruction);
+    assert_eq!(
+        crash.registers.x[..4],
+        [panic, buffer, RESULT_ARGUMENT_SIZE, 0x3333]
+    );
+    assert_eq!(crash.fault_mapping, None);
+    // Both calls ran, neither is stubbed, and the run's last events end with the break.
+    assert_eq!(
+        report.system_calls,
+        BTreeMap::from([("Break".to_owned(), 2)])
+    );
+    assert_eq!(report.stubbed, BTreeSet::new());
+    let last = crash.last_events.last().expect("events");
+    assert!(
+        last.contains(&format!("svc {:#x}", SvcId::Break.number())),
+        "{last}"
     );
 }
 
@@ -1217,7 +1287,7 @@ fn the_address_space_is_settled_after_every_system_call_before_the_guest_runs_ag
     };
     let mut vcpu = ScriptedVcpu::new()
         .then(expect(1), svc(SvcId::GetSystemTick))
-        .then(expect(2), svc(SvcId::Break))
+        .then(expect(2), svc(SvcId::ReturnFromException))
         .then(expect(3), svc(SvcId::CloseHandle))
         .then(expect(4), svc(SvcId::ExitProcess));
     let report = run(

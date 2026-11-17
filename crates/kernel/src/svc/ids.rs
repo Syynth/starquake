@@ -138,7 +138,7 @@ svc_ids! {
     SendAsyncRequestWithUserBuffer = 0x23, Planned;
     GetProcessId = 0x24, Implemented;
     GetThreadId = 0x25, Implemented;
-    Break = 0x26, Planned;
+    Break = 0x26, Implemented;
     OutputDebugString = 0x27, Implemented;
     ReturnFromException = 0x28, Planned;
     GetInfo = 0x29, Implemented;
@@ -337,6 +337,7 @@ mod tests {
                 | SvcId::SendSyncRequest
                 | SvcId::GetProcessId
                 | SvcId::GetThreadId
+                | SvcId::Break
                 | SvcId::OutputDebugString
                 | SvcId::GetInfo
                 | SvcId::SetGpuMemoryAttribute

@@ -217,15 +217,18 @@ use crate::ipc::SessionHandler;
 use crate::process::Console;
 use crate::result::{CallResult, KernelError, ResultCode, SvcError};
 use crate::sched::CoreId;
+use crate::svc::exception::Break;
 use crate::svc::{
-    Convention, ConventionError, DebugSink, Kind, Status, SvcId, debug, handle, info, memory,
-    processor, thread, tick, transfer_memory,
+    Convention, ConventionError, DebugSink, Kind, Status, SvcId, debug, handle, memory, processor,
+    thread, tick, transfer_memory,
 };
 use crate::tables::{AddressSpace, Processes, Scheduler};
 
 mod arbitration;
 mod cores;
+mod exception;
 mod hooks;
+mod info;
 mod ipc;
 mod lifecycle;
 mod memory_objects;
@@ -502,6 +505,11 @@ pub enum Outcome {
     /// them (`dispatch/sync.rs`, `dispatch/ipc.rs`), and reschedules
     /// ([`Dispatcher::switch`]).
     Waiting,
+    /// `Break` ran without [`crate::svc::exception::NOTIFICATION_ONLY_FLAG`]: the program
+    /// stopped itself, and the caller must not resume it, but end the run as a guest crash
+    /// that reports this call. No register was written; the call's event was recorded
+    /// (`dispatch/exception.rs`).
+    Broke(Break),
 }
 
 /// One dispatched system call, as the recording point sees it: the fields of the event stream's
@@ -842,12 +850,8 @@ impl Dispatcher {
                 query_memory(space, call.caller.memory, id, convention, call.regs)
             }),
             SvcId::SetGpuMemoryAttribute => self.set_gpu_memory_attribute(call, id, convention),
-            SvcId::GetInfo => self.call::<(&HandleTable, &AddressSpace, &Scheduler)>(
-                call,
-                |(handles, space, scheduler), call, _| {
-                    get_info((handles, space, scheduler), id, convention, call.regs)
-                },
-            ),
+            SvcId::GetInfo => self.get_info(call, id, convention),
+            SvcId::Break => self.break_call(call, id, convention),
             SvcId::ExitProcess
             | SvcId::ExitThread
             | SvcId::CreateThread
@@ -1004,21 +1008,6 @@ fn query_memory(
     })
 }
 
-fn get_info(
-    (handles, space, scheduler): (&HandleTable, &AddressSpace, &Scheduler),
-    id: SvcId,
-    convention: &Convention,
-    regs: &mut GuestRegs,
-) -> Outcome {
-    returning(id, convention, regs, |[info_type, process, sub_id]| {
-        let process = Handle::from_register(process);
-        let info_type = word(info_type)?;
-        Ok([info::get_info(
-            handles, space, scheduler, info_type, process, sub_id,
-        )?])
-    })
-}
-
 /// RECORDING POINT for the event stream: the dispatcher's one call into the recorder
 /// (observability spec, "The event stream"). It runs after the call with the kernel lock still
 /// held, so the recorder's `seq` follows the kernel's order. `time` is the dispatch's one clock
@@ -1062,7 +1051,9 @@ fn recorded_result(id: Option<SvcId>, outcome: &Outcome, regs: &GuestRegs) -> Op
     match outcome {
         Outcome::EnvFailed(_) | Outcome::Waiting => None,
         Outcome::NotImplemented => Some(KernelError::NotImplemented.code()),
-        Outcome::ProcessExited | Outcome::ThreadExited => Some(ResultCode::SUCCESS),
+        Outcome::ProcessExited | Outcome::ThreadExited | Outcome::Broke(_) => {
+            Some(ResultCode::SUCCESS)
+        }
         Outcome::Completed => {
             let result = id
                 .and_then(SvcId::convention)
