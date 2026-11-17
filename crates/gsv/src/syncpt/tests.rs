@@ -1099,5 +1099,5 @@ fn syncpoint_of_is_the_bitwise_not_below_the_count() {
     assert_eq!(syncpoint_of(!SYNCPOINT_COUNT), None);
     assert_eq!(syncpoint_of(u32::from(SP)), None);
     assert_eq!(mode_byte(0xABCD_EF01), 0x01);
-    assert_eq!(mode_byte(MODE_MASK), u8::MAX);
+    assert_eq!(mode_byte(0xFF), u8::MAX);
 }

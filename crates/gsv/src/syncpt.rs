@@ -47,7 +47,7 @@
 //! A `SyncCounterId` is the bitwise NOT of the syncpoint id (NX2 `QueryCounter`: "the counter
 //! is the bitwise NOT of the host1x syncpoint id"; PR `DecodeSyncpointWait`: `~packet[3]`;
 //! [`syncpoint_of`]). 201's mode is the low byte of its word (PR `packet[6] & 0xff`,
-//! [`MODE_MASK`]): 0 compares 32-bit wrapping, 1 as 64 bits ([`waiters::compare_mode`]).
+//! [`mode_byte`]): 0 compares 32-bit wrapping, 1 as 64 bits ([`waiters::compare_mode`]).
 //!
 //! What each does, step by step:
 //!
@@ -185,10 +185,6 @@ pub const MAXIMUM_EVENT_COUNT: u32 = 63;
 /// [`MAXIMUM_EVENT_COUNT`] as an index bound.
 const SLOTS: usize = MAXIMUM_EVENT_COUNT as usize;
 
-/// The bits of 201's mode word that are the mode: PR `DecodeSyncpointWait` reads `packet[6] &
-/// 0xff`.
-pub const MODE_MASK: u32 = 0xFF;
-
 /// The syncpoint a `SyncCounterId` names: its bitwise NOT (NX2 `QueryCounter`, PR
 /// `DecodeSyncpointWait`), or `None` if that is not below `SYNCPOINT_COUNT`.
 #[must_use]
@@ -196,10 +192,11 @@ pub fn syncpoint_of(counter: u32) -> Option<SyncpointId> {
     u8::try_from(!counter).ok().and_then(SyncpointId::new)
 }
 
-/// The mode byte of 201's mode word ([`MODE_MASK`]).
+/// The mode byte of 201's mode word: its low byte, the rest ignored (PR `DecodeSyncpointWait`
+/// reads `packet[6] & 0xff`).
 #[must_use]
 pub fn mode_byte(word: u32) -> u8 {
-    let [low, ..] = (word & MODE_MASK).to_le_bytes();
+    let [low, ..] = word.to_le_bytes();
     low
 }
 
