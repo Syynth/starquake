@@ -61,8 +61,15 @@
 //!
 //! `Open` names a device by path ([`Device`]): every path Eden's `Module` builds a device for,
 //! and `/dev/nvhost-tsg-gpu`, which PR adds (`eden-pr4588/src/core/hle/service/nvdrv/nvdrv.cpp`)
-//! and Switch 2's NvRm opens (rows 26, 45). The path is the buffer's bytes up to the first zero
-//! byte (`Common::StringFromBuffer`). It answers:
+//! and Switch 2's NvRm opens (rows 26, 45). PR gates that one device: its `Module::Open` returns
+//! `INVALID_NVDRV_FD` for `/dev/nvhost-tsg-gpu` unless the session's process
+//! `UsesPAuthReturns()`, which PR sets from the title's metadata
+//! (`eden-pr4588/src/core/hle/kernel/k_process.cpp`: `m_uses_pauth_returns =
+//! metadata.UsesExtendedAcid()`). Here it opens with no such check: nvsrv is reachable only
+//! through gsv 1402, which only Switch 2 processes call, so every caller is one the gate lets
+//! through. That every Switch 2 title's metadata has the extended ACID is a guess; a title that
+//! reaches 1402 without it would confirm or refute it. The path is the buffer's bytes up to the
+//! first zero byte (`Common::StringFromBuffer`). It answers:
 //!
 //! - `/dev/nvhost-prof-gpu` ([`PROFILER_PATH`]): fd 0 and `NotSupported` ("cannot be opened in
 //!   production"), before anything else is looked at;
@@ -124,6 +131,7 @@
 //! | A path no device has, under auto-stub | NX2 opens any `/dev/nvhost-*` path as a stub device | refused under both policies, as Eden refuses it (`an_unknown_path_is_refused_under_both_policies`) |
 //! | [`MAX_OPEN_FILES`] files open, or fds used up | no limit; the next fd overflows its `s32` | fd -1 and `FileOperationFailed` (a guess), nothing opened and no fd used (`open_refuses_a_full_table_and_spent_fds`) |
 //! | A TIPC request | NX2 and PR: auto-stubbed or refused, as for any command they lack | the server's unknown-command policy (`a_tipc_request_goes_to_the_policy`) |
+//! | An ioctl the device does not know, under auto-stub | the spec asks for the service framework's auto-stub policy (`docs/specs/services.md`): logged once per command, and the request marked as stubbed in the trace | answered as the spec says, but the request is recorded as `Done`, not `Stubbed`, and is not listed in `Server::stubbed`: the framework marks only the commands it stubs itself, and `Ioctl` is a command nvsrv serves. Every such call is logged, at warn, not only the first (`an_auto_stubbed_ioctl_is_recorded_as_done`) |
 //!
 //! A change an ioctl made stands if writing its out buffer then fails (the caller's memory is not
 //! mapped): the caller gets the kernel's error, as for any service whose reply writes a buffer.

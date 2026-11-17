@@ -41,7 +41,7 @@
 //! | Case | Eden | Here |
 //! |---|---|---|
 //! | `IocAlloc` and `IocFree`'s device-share lock | `IocAlloc` locks the range for the device (`LockForMapDeviceAddressSpace`, its failure only asserted) and `IocFree` unlocks it once the last reference goes | neither touches the kernel: no device reads an nvmap handle yet (nvhost-as-gpu maps them, slice 10), and the lock's interface is changing to return a release token (owner's ruling of 2026-11-17). Taking it is the follow-up of whichever lands second (`nvsrv/tests.rs`: `alloc_and_free_take_no_device_lock`) |
-//! | `IocAlloc` whose address plus page-rounded size is past 2^64 | stored; the lock fails and Eden asserts, then succeeds | `BadValue` (a guess), nothing stored (`an_allocation_past_the_address_space_is_refused`) |
+//! | `IocAlloc` whose address plus page-rounded size reaches 2^64 (the range's end, one past its last byte, is 2^64 or more) | stored; the lock fails and Eden asserts, then succeeds | `BadValue` (a guess), nothing stored (`an_allocation_past_the_address_space_is_refused`) |
 //! | The table full, or handle ids used up | neither is bounded (the next id wraps after 2^30 handles) | at most [`MAX_HANDLES`] handles, ids up to `0xFFFF_FFFC`, then `InsufficientMemory` (a guess), nothing made (`create_refuses_a_full_table_and_spent_ids`) |
 //! | A handle duplicated [`MAX_DUPES`] times | the `s32` count overflows | `BadValue` (a guess), the count unchanged (`from_id_stops_at_the_duplicate_limit`) |
 //! | Flags kept for an allocation | the whole word, bit 2 cleared when an address is given | only bit 0 ([`MAP_UNCACHED`]), the one bit anything reads back (`IocFree`) |
@@ -176,13 +176,17 @@ pub const MAP_UNCACHED: u32 = 1 << 0;
 /// `next_handle_id{HandleIdIncrement}`).
 pub const HANDLE_ID_INCREMENT: u32 = 4;
 
-/// One past the last handle id: ids are `u32`s.
-const HANDLE_ID_END: u64 = 1 << u32::BITS;
+/// One past the last `u32`. Handle ids and handle sizes are separate `u32` facts, each bounded
+/// by it: [`HANDLE_ID_END`] and [`MAX_HANDLE_SIZE`].
+const U32_END: u64 = 1 << u32::BITS;
 
-/// The largest page-rounded size a handle can have: the size is a `u32` in Eden, rounded up as a
-/// `u32` (`Common::AlignUp(params.size, YUZU_PAGESIZE)`), so anything rounding past it wraps to 0
-/// and is refused.
-pub const MAX_HANDLE_SIZE: u64 = HANDLE_ID_END - PAGE_SIZE;
+/// One past the last handle id: ids are `u32`s (`core/nvmap.h`: `Handle::Id`).
+const HANDLE_ID_END: u64 = U32_END;
+
+/// The largest page-rounded size a handle can have: the size is a `u32` in Eden
+/// (`devices/nvmap.h`: `IocCreateParams::size`), rounded up as a `u32` (`Common::AlignUp(params.size,
+/// YUZU_PAGESIZE)`), so anything rounding past it wraps to 0 and is refused.
+pub const MAX_HANDLE_SIZE: u64 = U32_END - PAGE_SIZE;
 
 /// The most handles the table holds at once. A guess: Eden has no limit. It bounds what a
 /// title can make the table hold.
@@ -345,8 +349,9 @@ pub enum NvMapStateError {
         /// Its alignment.
         align: u32,
     },
-    /// Memory that runs past the end of the address space.
-    #[error("nvmap handle {id:#x} at {address:#x} runs past the end of the address space")]
+    /// Memory that reaches the end of the address space: its address plus its page-rounded
+    /// size is 2^64 or more, so its last byte is the address space's last or beyond it.
+    #[error("nvmap handle {id:#x} at {address:#x} reaches the end of the address space")]
     PastTheEnd {
         /// The handle.
         id: u32,
@@ -545,7 +550,7 @@ impl NvMap {
         }
         let address = args.u64_at::<ALLOC_ADDRESS>();
         if address.checked_add(handle.size()).is_none() {
-            tracing::warn!(id, address, "nvmap: an allocation past the address space");
+            tracing::warn!(id, address, "nvmap: an allocation reaching 2^64");
             return NvResult::BadValue;
         }
         if address == 0 {

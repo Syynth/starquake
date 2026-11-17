@@ -907,8 +907,33 @@ fn an_out_buffer_gets_only_the_answer() {
     assert_eq!((reply, output), (ok(&[0]), Vec::new()));
 }
 
+/// The device's struct is written back whatever the result (Eden `WrapGeneric` and
+/// `NVDRV::Ioctl1` write the output after any device answer): `IocAlloc` on a handle that does
+/// not exist answers `BadValue`, and out buffer 0 still gets the struct with its alignment raised
+/// to a page, every other field as sent.
+#[test]
+fn a_failed_ioctl_still_writes_its_struct_back() {
+    let mut rig = Rig::new();
+    let fd = rig.open_device(Device::Nvmap);
+    let missing = HANDLE_ID_INCREMENT;
+    let page = u32::try_from(starquake_memory::PAGE_SIZE).unwrap();
+    let sent = le(&[missing, 0x11, 0x22, 0, 0x33, 0x44, 0x6000, 0x55]);
+    let (reply, output) = rig.ioctl(fd, NVMAP_ALLOC, &sent, sent.len());
+    assert_eq!(reply, ok(&[NvResult::BadValue.raw()]));
+    assert_eq!(
+        output,
+        le(&[missing, 0x11, 0x22, page, 0x33, 0x44, 0x6000, 0x55])
+    );
+    assert!(rig.state().nvmap().is_empty());
+}
+
 /// Only [`ioctl::MAX_ARGUMENT_BYTES`] bytes of an in buffer are read: a buffer whose tail is not
 /// mapped still works, and the argument at its start is found.
+///
+/// This pins the upper edge only: reading one byte more fails here, but reading one byte fewer
+/// would pass, since no device of this slice reads anywhere near that far into its argument
+/// (nvmap's largest struct is 32 bytes). The lower edge gets a test when a device whose argument
+/// can be that long arrives.
 #[test]
 fn an_in_buffer_is_read_up_to_the_largest_argument() {
     let mut rig = Rig::new();
@@ -1024,6 +1049,49 @@ fn each_request_is_recorded() {
             ),
         ]
     );
+}
+
+/// An ioctl auto-stubbed under [`UnknownPolicy::AutoStub`] is recorded as a done request, not a
+/// stubbed one, and is not in the server's record of stubbed commands, however often it is sent
+/// (module docs, "Where this differs from the references"). An unknown command on the same rig
+/// is recorded as stubbed, so the rig can tell the two apart.
+#[test]
+fn an_auto_stubbed_ioctl_is_recorded_as_done() {
+    let mut rig = Rig::with(UnknownPolicy::AutoStub);
+    let fd = rig.open_device(Device::NvhostCtrlGpu);
+    let input = vec![0x3C; 0xB0];
+    for _ in 0..2 {
+        let (reply, _) = rig.ioctl(fd, CTRL_GPU_CHARACTERISTICS, &input, 0x100);
+        assert_eq!(reply, ok(&[NvResult::Success.raw()]));
+    }
+    assert_eq!(rig.server.stubbed().count(), 0);
+    rig.send(&cmif(MAP_SHARED_MEM, &[]));
+    let recorded: Vec<_> = rig
+        .kernel
+        .recorded()
+        .into_iter()
+        .filter_map(|event| match event.kind {
+            EventKind::Ipc {
+                command,
+                result,
+                outcome,
+                ..
+            } => Some((command, result.0, outcome)),
+            _ => None,
+        })
+        .collect();
+    let success = ResultCode::SUCCESS.raw();
+    assert_eq!(
+        recorded,
+        [
+            (OPEN, success, IpcOutcome::Done),
+            (IOCTL, success, IpcOutcome::Done),
+            (IOCTL, success, IpcOutcome::Done),
+            (MAP_SHARED_MEM, success, IpcOutcome::Stubbed),
+        ]
+    );
+    let stubbed: Vec<_> = rig.server.stubbed().map(|stub| stub.id).collect();
+    assert_eq!(stubbed, [MAP_SHARED_MEM]);
 }
 
 /// A server saved with files open and a handle allocated restores to the same state, and the

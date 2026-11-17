@@ -325,8 +325,9 @@ fn the_alignment_is_at_least_a_page() {
     }
 }
 
-/// The handle's page-rounded size from its address must not run past 2^64: at the edge it fits,
-/// one byte further it is refused and nothing is stored (a starquake check; Eden stores it).
+/// The handle's page-rounded size from its address must end below 2^64: a range ending at
+/// 2^64 - 1 fits, and one a byte further, ending exactly at 2^64, is refused and nothing is
+/// stored (a starquake check; Eden stores it).
 #[test]
 fn an_allocation_past_the_address_space_is_refused() {
     let mut map = NvMap::new();
@@ -902,7 +903,7 @@ fn a_refused_table_is_said_in_plain_words() {
                 id: 4,
                 address: 0xFFFF_FFFF_FFFF_E000,
             },
-            "nvmap handle 0x4 at 0xffffffffffffe000 runs past the end of the address space",
+            "nvmap handle 0x4 at 0xffffffffffffe000 reaches the end of the address space",
         ),
     ];
     for (error, words) in said {
