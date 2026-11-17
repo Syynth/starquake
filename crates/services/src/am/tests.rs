@@ -20,10 +20,13 @@ use crate::framework::result::{INVALID_CMIF_REQUEST, UNKNOWN_COMMAND_ID};
 use crate::framework::{Handled, Kernel, Protocol, Session, SnapshotError};
 
 use super::command::application_functions::{
-    GET_SCREEN_SHOT_AND_CONTINUOUS_RECORDING_INITIALLY_ENABLED, NOTIFY_RUNNING, UNKNOWN_321,
+    GET_GPU_ERROR_DETECTED_SYSTEM_EVENT,
+    GET_SCREEN_SHOT_AND_CONTINUOUS_RECORDING_INITIALLY_ENABLED, IS_GAME_PLAY_RECORDING_SUPPORTED,
+    NOTIFY_RUNNING, SET_GAME_PLAY_RECORDING_STATE, UNKNOWN_321, UNKNOWN_330,
 };
 use super::command::common_state_getter::{
     GET_CURRENT_FOCUS_STATE, GET_EVENT_HANDLE, GET_OPERATION_MODE, GET_PERFORMANCE_MODE,
+    SET_REQUEST_EXIT_TO_LIBRARY_APPLET_AT_EXECUTE_NEXT_PROGRAM_ENABLED,
 };
 use super::command::graphics_scaling_parameters_functions::{
     GET_GRAPHICS_SCALING_PARAMETERS, SET_GRAPHICS_SCALE_CHANGED_NOTIFICATION_ENABLED,
@@ -38,6 +41,7 @@ use super::command::self_controller::{
     EXIT, GET_ACCUMULATED_SUSPENDED_TICK_CHANGED_EVENT, GET_GRAPHICS_SUPERVISOR,
     SET_FOCUS_HANDLING_MODE, SET_OPERATION_MODE_CHANGED_NOTIFICATION,
     SET_OUT_OF_FOCUS_SUSPENDING_ENABLED, SET_PERFORMANCE_MODE_CHANGED_NOTIFICATION,
+    SET_SCREEN_SHOT_PERMISSION,
 };
 use super::command::window_controller::{ACQUIRE_FOREGROUND_RIGHTS, GET_APPLET_RESOURCE_USER_ID};
 
@@ -866,16 +870,18 @@ fn commands_that_are_left_out_go_to_the_unknown_command_policy() {
     }
 }
 
+/// The ids and method names of `session`'s CMIF table, in its order.
+fn names(session: &dyn Session) -> Vec<(u32, &'static str)> {
+    session
+        .commands()
+        .cmif
+        .iter()
+        .map(|row| (row.id, row.name))
+        .collect()
+}
+
 #[test]
 fn the_tables_name_the_commands_as_eden_does() {
-    let names = |session: &dyn Session| -> Vec<(u32, &'static str)> {
-        session
-            .commands()
-            .cmif
-            .iter()
-            .map(|row| (row.id, row.name))
-            .collect()
-    };
     assert_eq!(
         names(&IApplicationProxyService),
         [
@@ -909,10 +915,23 @@ fn the_tables_name_the_commands_as_eden_does() {
         [
             (NOTIFY_RUNNING, "notify_running"),
             (
+                IS_GAME_PLAY_RECORDING_SUPPORTED,
+                "is_game_play_recording_supported"
+            ),
+            (
+                SET_GAME_PLAY_RECORDING_STATE,
+                "set_game_play_recording_state"
+            ),
+            (
+                GET_GPU_ERROR_DETECTED_SYSTEM_EVENT,
+                "get_gpu_error_detected_system_event"
+            ),
+            (
                 GET_SCREEN_SHOT_AND_CONTINUOUS_RECORDING_INITIALLY_ENABLED,
                 "get_screen_shot_and_continuous_recording_initially_enabled"
             ),
             (UNKNOWN_321, "unknown_321"),
+            (UNKNOWN_330, "unknown_330"),
         ]
     );
     assert_eq!(
@@ -928,12 +947,6 @@ fn the_tables_name_the_commands_as_eden_does() {
             ),
         ]
     );
-    assert_eq!(
-        ICommonStateGetter
-            .commands()
-            .name(Protocol::Cmif, GET_EVENT_HANDLE),
-        Some("get_event_handle")
-    );
     for empty in [
         names(&IAudioController),
         names(&IDisplayController),
@@ -943,6 +956,54 @@ fn the_tables_name_the_commands_as_eden_does() {
     ] {
         assert_eq!(empty, []);
     }
+}
+
+#[test]
+fn the_getter_and_controller_tables_name_the_commands_as_eden_does() {
+    assert_eq!(
+        names(&ICommonStateGetter),
+        [
+            (GET_EVENT_HANDLE, "get_event_handle"),
+            (GET_OPERATION_MODE, "get_operation_mode"),
+            (GET_PERFORMANCE_MODE, "get_performance_mode"),
+            (GET_CURRENT_FOCUS_STATE, "get_current_focus_state"),
+            (
+                SET_REQUEST_EXIT_TO_LIBRARY_APPLET_AT_EXECUTE_NEXT_PROGRAM_ENABLED,
+                "set_request_exit_to_library_applet_at_execute_next_program_enabled"
+            ),
+        ]
+    );
+    assert_eq!(
+        names(&ISelfController),
+        [
+            (EXIT, "exit"),
+            (SET_SCREEN_SHOT_PERMISSION, "set_screen_shot_permission"),
+            (
+                SET_OPERATION_MODE_CHANGED_NOTIFICATION,
+                "set_operation_mode_changed_notification"
+            ),
+            (
+                SET_PERFORMANCE_MODE_CHANGED_NOTIFICATION,
+                "set_performance_mode_changed_notification"
+            ),
+            (SET_FOCUS_HANDLING_MODE, "set_focus_handling_mode"),
+            (
+                SET_OUT_OF_FOCUS_SUSPENDING_ENABLED,
+                "set_out_of_focus_suspending_enabled"
+            ),
+            (
+                GET_ACCUMULATED_SUSPENDED_TICK_CHANGED_EVENT,
+                "get_accumulated_suspended_tick_changed_event"
+            ),
+            (GET_GRAPHICS_SUPERVISOR, "get_graphics_supervisor"),
+        ]
+    );
+    assert_eq!(
+        ICommonStateGetter
+            .commands()
+            .name(Protocol::Cmif, GET_EVENT_HANDLE),
+        Some("get_event_handle")
+    );
 }
 
 // ----- The start-up and snapshots ------------------------------------------------------------
@@ -1370,10 +1431,6 @@ const PERFORMANCE_FUNCTIONS_ROWS: [u32; 2] = [0, 1];
 /// `SetSupportingGraphicsScalingParametersForDebug`, 1010 `SetGpuQuotaForDebug`, 1020
 /// `ClearGpuQuotaForDebug`, 1030 `SetScreenRatioForDebug`, 1040 `ClearScreenRatioForDebug`).
 const GRAPHICS_SCALING_DEBUG_ROWS: [u32; 5] = [1000, 1010, 1020, 1030, 1040];
-/// `IApplicationFunctions::Unknown330`, which PR #4588 has and this port leaves out, so it has
-/// no shipping constant (`application_functions.cpp` @ e5fb3b97: `{330,
-/// D<&IApplicationFunctions::Unknown330>, "Unknown330"}`).
-const UNKNOWN_330: u32 = 330;
 
 /// The interfaces the Switch 2 proxy commands open, each with the proxy's command.
 const SWITCH2_OPENED: [(u32, &str); 2] = [
@@ -1722,12 +1779,48 @@ fn the_switch_2_answers_are_pr_4588_s() {
     // `application_functions.cpp`: 320 over `applet.h`'s initial values (`Inherit !=
     // Disable`, and `false && ..`), then 321's `*out_enabled = false`.
     assert_eq!(
-        [
-            SCREENSHOT_INITIALLY_ENABLED,
-            CONTINUOUS_RECORDING_INITIALLY_ENABLED,
+        Applet::new(AppletSettings::eden_default())
+            .screenshot_and_continuous_recording_initially_enabled(),
+        (true, false)
+    );
+    // `applet.h`'s initial fields: `ScreenshotPermission screenshot_permission{}` (`Inherit`),
+    // and `GamePlayRecordingState game_play_recording_state{GamePlayRecordingState::Disabled}`.
+    let applet = Applet::new(AppletSettings::eden_default());
+    assert_eq!(
+        applet.screenshot_permission(),
+        ScreenshotPermission::INHERIT
+    );
+    assert_eq!(
+        applet.game_play_recording_state(),
+        GamePlayRecordingState::DISABLED
+    );
+    // 321's `false`, `applet.h`'s `bool game_play_recording_supported{}`, and 330's `*out = 0`.
+    assert_eq!(
+        (
             UNKNOWN_321_ENABLED,
-        ],
-        [true, false, false]
+            GAME_PLAY_RECORDING_SUPPORTED,
+            UNKNOWN_330_VALUE
+        ),
+        (false, false, 0)
+    );
+    // `am_types.h`: `ScreenshotPermission { Inherit = 0, Enable = 1, Disable = 2 }` and
+    // `GamePlayRecordingState { Disabled, Enabled }`.
+    assert_eq!(
+        [
+            ScreenshotPermission::INHERIT,
+            ScreenshotPermission::ENABLE,
+            ScreenshotPermission::DISABLE,
+        ]
+        .map(ScreenshotPermission::raw),
+        [0, 1, 2]
+    );
+    assert_eq!(
+        [
+            GamePlayRecordingState::DISABLED,
+            GamePlayRecordingState::ENABLED
+        ]
+        .map(GamePlayRecordingState::raw),
+        [0, 1]
     );
 }
 
@@ -1805,10 +1898,8 @@ fn get_screen_shot_and_continuous_recording_initially_enabled_answers_two_bytes(
     let mut rig = Rig::new();
     let proxy = rig.proxy();
     let functions = rig.open(proxy, GET_APPLICATION_FUNCTIONS);
-    let expected = [
-        u8::from(SCREENSHOT_INITIALLY_ENABLED),
-        u8::from(CONTINUOUS_RECORDING_INITIALLY_ENABLED),
-    ];
+    // Screenshots on (`Inherit`), recording off: distinct bytes, so a swap of the two fails.
+    let expected = [1, 0];
     assert_eq!(
         rig.object_raw(
             functions,
@@ -1830,15 +1921,13 @@ fn unknown_321_answers_pr_4588_s_guess() {
     );
 }
 
-/// PR #4588's `nullptr` rows, and 330, which the scoping doc does not name, go to the
-/// unknown-command policy.
+/// PR #4588's `nullptr` rows go to the unknown-command policy.
 #[test]
 fn the_switch_2_commands_pr_4588_leaves_unimplemented_go_to_the_unknown_command_policy() {
     let mut rig = Rig::new();
     let proxy = rig.proxy();
     let performance = rig.open(proxy, GET_PERFORMANCE_FUNCTIONS);
     let scaling = rig.open(proxy, GET_GRAPHICS_SCALING_PARAMETERS_FUNCTIONS);
-    let functions = rig.open(proxy, GET_APPLICATION_FUNCTIONS);
     let refused = domain_reply(UNKNOWN_COMMAND_ID, &[], &[]);
     for command in PERFORMANCE_FUNCTIONS_ROWS {
         assert_eq!(
@@ -1850,7 +1939,6 @@ fn the_switch_2_commands_pr_4588_leaves_unimplemented_go_to_the_unknown_command_
     for command in GRAPHICS_SCALING_DEBUG_ROWS {
         assert_eq!(rig.object_raw(scaling, command, &[]), refused, "{command}");
     }
-    assert_eq!(rig.object_raw(functions, UNKNOWN_330, &[]), refused);
 }
 
 /// A server saved with the Switch 2 interfaces open and the notification flag set restores, and
@@ -1904,4 +1992,423 @@ fn a_server_with_the_switch_2_interfaces_saves_and_restores() {
         rig.object_raw(window, GET_APPLET_RESOURCE_USER_ID, &[]),
         domain_reply(ResultCode::SUCCESS, &PROCESS_ID.to_le_bytes(), &[])
     );
+}
+
+// ----- The title's start-up commands: 900, 130 and 330 ---------------------------------------
+
+/// `ICommonStateGetter` 900 takes nothing, answers nothing, and sets the applet's flag; a second
+/// call leaves it set. Nothing else in the applet changes.
+#[test]
+fn set_request_exit_to_library_applet_at_execute_next_program_enabled_sets_the_flag() {
+    let mut rig = Rig::new();
+    let proxy = rig.proxy();
+    let getter = rig.open(proxy, GET_COMMON_STATE_GETTER);
+    let before = rig.applet();
+    assert!(!before.request_exit_to_library_applet_at_execute_next_program_enabled());
+    for _ in 0..2 {
+        assert_eq!(
+            rig.object_raw(
+                getter,
+                SET_REQUEST_EXIT_TO_LIBRARY_APPLET_AT_EXECUTE_NEXT_PROGRAM_ENABLED,
+                &[]
+            ),
+            domain_reply(ResultCode::SUCCESS, &[], &[])
+        );
+        let after = rig.applet();
+        assert!(after.request_exit_to_library_applet_at_execute_next_program_enabled());
+        assert_eq!(
+            Applet {
+                request_exit_to_library_applet_at_execute_next_program_enabled: false,
+                ..after
+            },
+            before
+        );
+    }
+}
+
+/// `IApplicationFunctions` 130 copies one event, made the first time and never signalled: the
+/// same event on every call, and not the message or suspended-tick event.
+#[test]
+fn get_gpu_error_detected_system_event_copies_one_event_never_signalled() {
+    let mut rig = Rig::new();
+    let proxy = rig.proxy();
+    let functions = rig.open(proxy, GET_APPLICATION_FUNCTIONS);
+    let getter = rig.open(proxy, GET_COMMON_STATE_GETTER);
+    let controller = rig.open(proxy, GET_SELF_CONTROLLER);
+    assert_eq!(rig.applet().gpu_error_detected_event(), None);
+    let raw = rig.object_raw(functions, GET_GPU_ERROR_DETECTED_SYSTEM_EVENT, &[]);
+    let first = parse(&raw, SessionKind::Domain).copies[0];
+    assert_eq!(raw, copied_handle_reply(first));
+    let event = rig.object_of(first);
+    assert_eq!(rig.applet().gpu_error_detected_event(), Some(event));
+    assert_eq!(rig.kernel.signals(event), Some(0));
+
+    let again = rig.object(functions, GET_GPU_ERROR_DETECTED_SYSTEM_EVENT, &[]);
+    assert_eq!(again.result, ResultCode::SUCCESS);
+    assert_eq!(rig.object_of(again.copies[0]), event);
+
+    let message = rig.object(getter, GET_EVENT_HANDLE, &[]).copies[0];
+    let tick = rig
+        .object(
+            controller,
+            GET_ACCUMULATED_SUSPENDED_TICK_CHANGED_EVENT,
+            &[],
+        )
+        .copies[0];
+    assert_ne!(rig.object_of(message), event);
+    assert_ne!(rig.object_of(tick), event);
+    assert_eq!(rig.applet().gpu_error_detected_event(), Some(event));
+    assert_eq!(rig.kernel.signals(event), Some(0));
+}
+
+#[test]
+fn unknown_330_answers_the_references_byte() {
+    let mut rig = Rig::new();
+    let proxy = rig.proxy();
+    let functions = rig.open(proxy, GET_APPLICATION_FUNCTIONS);
+    let before = rig.applet();
+    assert_eq!(
+        rig.object_raw(functions, UNKNOWN_330, &[]),
+        domain_reply(ResultCode::SUCCESS, &[UNKNOWN_330_VALUE], &[])
+    );
+    assert_eq!(rig.applet(), before);
+}
+
+// ----- Screenshots and recording: 10, 65, 67 and 320 -----------------------------------------
+
+#[test]
+fn is_game_play_recording_supported_answers_the_references_false() {
+    let mut rig = Rig::new();
+    let proxy = rig.proxy();
+    let functions = rig.open(proxy, GET_APPLICATION_FUNCTIONS);
+    let supported = domain_reply(
+        ResultCode::SUCCESS,
+        &[u8::from(GAME_PLAY_RECORDING_SUPPORTED)],
+        &[],
+    );
+    assert_eq!(
+        rig.object_raw(functions, IS_GAME_PLAY_RECORDING_SUPPORTED, &[]),
+        supported
+    );
+    // Setting the recording state on does not make it supported.
+    let on = rig.object(
+        functions,
+        SET_GAME_PLAY_RECORDING_STATE,
+        &GamePlayRecordingState::ENABLED.raw().to_le_bytes(),
+    );
+    assert_eq!(on.result, ResultCode::SUCCESS);
+    assert_eq!(
+        rig.object_raw(functions, IS_GAME_PLAY_RECORDING_SUPPORTED, &[]),
+        supported
+    );
+}
+
+/// Words that differ from `value` only above its low byte, one for each higher byte.
+fn above_the_low_byte(value: u32) -> [u32; 3] {
+    [value | 1 << 8, value | 1 << 16, value | 1 << 24]
+}
+
+/// Screenshots are off exactly for `Disable`: every other word, including ones whose low byte
+/// is `Disable`'s, enables them.
+#[test]
+fn screenshots_are_enabled_for_every_permission_but_disable() {
+    let disable = ScreenshotPermission::DISABLE.raw();
+    assert!(!ScreenshotPermission::DISABLE.screenshots_enabled());
+    let mut enabled = vec![
+        ScreenshotPermission::INHERIT.raw(),
+        ScreenshotPermission::ENABLE.raw(),
+        disable - 1,
+        disable + 1,
+        u32::MAX,
+    ];
+    enabled.extend(above_the_low_byte(disable));
+    for raw in enabled {
+        assert!(
+            ScreenshotPermission::from_raw(raw).screenshots_enabled(),
+            "{raw:#x}"
+        );
+    }
+}
+
+/// Recording is on exactly when the applet supports it and the state is `Enabled`.
+#[test]
+fn continuous_recording_needs_support_and_the_enabled_state() {
+    let enabled = GamePlayRecordingState::ENABLED.raw();
+    let mut others = vec![
+        GamePlayRecordingState::DISABLED.raw(),
+        enabled + 1,
+        u32::MAX,
+    ];
+    others.extend(above_the_low_byte(enabled));
+    for supported in [false, true] {
+        assert_eq!(
+            GamePlayRecordingState::ENABLED.continuous_recording_enabled(supported),
+            supported
+        );
+        for raw in &others {
+            assert!(
+                !GamePlayRecordingState::from_raw(*raw).continuous_recording_enabled(supported),
+                "{raw:#x} {supported}"
+            );
+        }
+    }
+}
+
+/// `SetScreenShotPermission` keeps the word it is sent, whatever it is, and 320's first byte
+/// follows it: off exactly for `Disable`, on for a word that differs from it only above the low
+/// byte. Each step changes the permission or leaves it as it was.
+#[test]
+fn set_screen_shot_permission_keeps_its_word_and_320_follows_it() {
+    let mut rig = Rig::new();
+    let proxy = rig.proxy();
+    let controller = rig.open(proxy, GET_SELF_CONTROLLER);
+    let functions = rig.open(proxy, GET_APPLICATION_FUNCTIONS);
+    let disable = ScreenshotPermission::DISABLE.raw();
+    let mut steps = vec![
+        disable,
+        disable,
+        ScreenshotPermission::ENABLE.raw(),
+        disable,
+        ScreenshotPermission::INHERIT.raw(),
+        u32::MAX,
+    ];
+    for above in above_the_low_byte(disable) {
+        steps.extend([disable, above]);
+    }
+    for raw in steps {
+        let reply = rig.object_raw(controller, SET_SCREEN_SHOT_PERMISSION, &raw.to_le_bytes());
+        assert_eq!(
+            reply,
+            domain_reply(ResultCode::SUCCESS, &[], &[]),
+            "{raw:#x}"
+        );
+        assert_eq!(rig.applet().screenshot_permission().raw(), raw);
+        let screenshot = u8::from(raw != disable);
+        assert_eq!(
+            rig.object_raw(
+                functions,
+                GET_SCREEN_SHOT_AND_CONTINUOUS_RECORDING_INITIALLY_ENABLED,
+                &[]
+            ),
+            domain_reply(ResultCode::SUCCESS, &[screenshot, 0], &[]),
+            "{raw:#x}"
+        );
+    }
+}
+
+/// `SetGamePlayRecordingState` keeps the word it is sent, whatever it is. 320's second byte
+/// stays off whatever the state, because the applet does not support recording.
+#[test]
+fn set_game_play_recording_state_keeps_its_word_and_recording_stays_off() {
+    let mut rig = Rig::new();
+    let proxy = rig.proxy();
+    let functions = rig.open(proxy, GET_APPLICATION_FUNCTIONS);
+    let enabled = GamePlayRecordingState::ENABLED.raw();
+    let mut steps = vec![
+        enabled,
+        enabled,
+        GamePlayRecordingState::DISABLED.raw(),
+        enabled,
+        u32::MAX,
+    ];
+    steps.extend(above_the_low_byte(enabled));
+    for raw in steps {
+        let reply = rig.object_raw(functions, SET_GAME_PLAY_RECORDING_STATE, &raw.to_le_bytes());
+        assert_eq!(
+            reply,
+            domain_reply(ResultCode::SUCCESS, &[], &[]),
+            "{raw:#x}"
+        );
+        assert_eq!(rig.applet().game_play_recording_state().raw(), raw);
+        assert_eq!(
+            rig.object_raw(
+                functions,
+                GET_SCREEN_SHOT_AND_CONTINUOUS_RECORDING_INITIALLY_ENABLED,
+                &[]
+            ),
+            domain_reply(ResultCode::SUCCESS, &[1, 0], &[]),
+            "{raw:#x}"
+        );
+    }
+}
+
+/// Both `u32` setters refuse a payload one, two or three bytes short of the word (and an empty
+/// one) with [`INVALID_CMIF_REQUEST`], and change nothing; the full word is accepted. The
+/// requests use libnx's layout, whose domain `size` counts the exact argument bytes (the default
+/// layout rounds them up to a whole word, so a short payload would arrive as four bytes).
+#[test]
+fn a_payload_too_short_for_the_word_is_refused_and_changes_nothing() {
+    let mut rig = Rig::new();
+    let proxy = rig.proxy();
+    let controller = rig.open(proxy, GET_SELF_CONTROLLER);
+    let functions = rig.open(proxy, GET_APPLICATION_FUNCTIONS);
+    let word = u32::MAX.to_le_bytes();
+    for (object, command) in [
+        (controller, SET_SCREEN_SHOT_PERMISSION),
+        (functions, SET_GAME_PLAY_RECORDING_STATE),
+    ] {
+        for len in 0..=word.len() {
+            let before = rig.applet();
+            let request = RequestBuilder::domain(CommandType::Request, object, command)
+                .layout(RequestLayout::Libnx)
+                .data(&word[..len]);
+            let reply = parse(&rig.send_raw(rig.session, &request), SessionKind::Domain);
+            if len == word.len() {
+                assert_eq!(reply.result, ResultCode::SUCCESS, "{command}");
+            } else {
+                assert_eq!(reply.result, INVALID_CMIF_REQUEST, "{command} {len}");
+                assert_eq!(rig.applet(), before, "{command} {len}");
+            }
+        }
+    }
+    assert_eq!(rig.applet().screenshot_permission().raw(), u32::MAX);
+    assert_eq!(rig.applet().game_play_recording_state().raw(), u32::MAX);
+}
+
+/// A server saved after the title's start-up commands restores, and answers from what it saved:
+/// the screenshot permission, the recording state, the flag and the GPU-error event.
+#[test]
+fn a_server_after_the_titles_start_up_commands_saves_and_restores() {
+    let mut rig = Rig::new();
+    let proxy = rig.proxy();
+    let getter = rig.open(proxy, GET_COMMON_STATE_GETTER);
+    let controller = rig.open(proxy, GET_SELF_CONTROLLER);
+    let functions = rig.open(proxy, GET_APPLICATION_FUNCTIONS);
+    let steps: [(u32, u32, Vec<u8>); 4] = [
+        (
+            getter,
+            SET_REQUEST_EXIT_TO_LIBRARY_APPLET_AT_EXECUTE_NEXT_PROGRAM_ENABLED,
+            Vec::new(),
+        ),
+        (functions, GET_GPU_ERROR_DETECTED_SYSTEM_EVENT, Vec::new()),
+        (
+            controller,
+            SET_SCREEN_SHOT_PERMISSION,
+            ScreenshotPermission::DISABLE.raw().to_le_bytes().to_vec(),
+        ),
+        (
+            functions,
+            SET_GAME_PLAY_RECORDING_STATE,
+            GamePlayRecordingState::ENABLED.raw().to_le_bytes().to_vec(),
+        ),
+    ];
+    for (object, command, data) in &steps {
+        let reply = rig.object(*object, *command, data);
+        assert_eq!(reply.result, ResultCode::SUCCESS, "{command}");
+    }
+    let event = rig.applet().gpu_error_detected_event().unwrap();
+    let saved = rig.server.save().unwrap();
+
+    let mut restored = oe_server(AppletSettings::eden_default(), UnknownPolicy::Strict);
+    restored.restore(&saved).unwrap();
+    assert_eq!(restored.family::<Applet>(), Some(&rig.applet()));
+    assert_eq!(restored.save().unwrap(), saved);
+    rig.server = restored;
+
+    let applet = rig.applet();
+    assert!(applet.request_exit_to_library_applet_at_execute_next_program_enabled());
+    assert_eq!(
+        applet.screenshot_permission(),
+        ScreenshotPermission::DISABLE
+    );
+    assert_eq!(
+        applet.game_play_recording_state(),
+        GamePlayRecordingState::ENABLED
+    );
+    assert_eq!(
+        rig.object_raw(
+            functions,
+            GET_SCREEN_SHOT_AND_CONTINUOUS_RECORDING_INITIALLY_ENABLED,
+            &[]
+        ),
+        domain_reply(ResultCode::SUCCESS, &[0, 0], &[])
+    );
+    let again = rig.object(functions, GET_GPU_ERROR_DETECTED_SYSTEM_EVENT, &[]);
+    assert_eq!(again.result, ResultCode::SUCCESS);
+    assert_eq!(rig.object_of(again.copies[0]), event);
+}
+
+/// How a test reads the id the applet keeps for one of its events.
+type KeptEvent = fn(&Applet) -> Option<ObjectId>;
+
+/// The two never-signalled events, each with the interface that returns it, the command, and
+/// how to read the id the applet keeps for it.
+fn never_signalled_events() -> [(u32, u32, KeptEvent); 2] {
+    [
+        (
+            GET_SELF_CONTROLLER,
+            GET_ACCUMULATED_SUSPENDED_TICK_CHANGED_EVENT,
+            Applet::suspended_tick_event,
+        ),
+        (
+            GET_APPLICATION_FUNCTIONS,
+            GET_GPU_ERROR_DETECTED_SYSTEM_EVENT,
+            Applet::gpu_error_detected_event,
+        ),
+    ]
+}
+
+/// A restored suspended-tick or GPU-error event is checked against the kernel before its handle
+/// is copied (module docs, "The applet"): restored onto a kernel where the saved id
+/// names another kind of object, or nothing the kernel made, the command answers the kernel's
+/// `InvalidHandle`, copies no handle and leaves the applet as it was, on every call.
+#[test]
+fn a_restored_event_the_kernel_did_not_make_is_refused() {
+    for (interface, command, kept) in never_signalled_events() {
+        let mut rig = Rig::new();
+        let proxy = rig.proxy();
+        let object = rig.open(proxy, interface);
+        let reply = rig.object(object, command, &[]);
+        assert_eq!(reply.result, ResultCode::SUCCESS, "{command}");
+        let event = kept(&rig.applet()).unwrap();
+        let saved = rig.server.save().unwrap();
+
+        for names_an_object in [true, false] {
+            // A fresh kernel mints the same session id; the event's id is the next it mints,
+            // made here as an object that is not an event, or never made.
+            let mut fresh = Rig::new();
+            assert_eq!(fresh.session, rig.session);
+            if names_an_object {
+                assert_eq!(fresh.kernel.new_object(), event);
+            }
+            assert_eq!(fresh.kernel.signals(event), None);
+            fresh.server.restore(&saved).unwrap();
+            let before = fresh.applet();
+            let handles = fresh.kernel.handle_count();
+            for _ in 0..2 {
+                assert_eq!(
+                    fresh.object_raw(object, command, &[]),
+                    domain_reply(KernelError::InvalidHandle.code(), &[], &[]),
+                    "{command} {names_an_object}"
+                );
+                assert_eq!(fresh.kernel.handle_count(), handles);
+                assert_eq!(fresh.applet(), before);
+                assert_eq!(kept(&fresh.applet()), Some(event));
+            }
+        }
+    }
+}
+
+/// The check of a kept event does not signal or clear it: restored onto the kernel that made
+/// it, the command copies the same event, still never signalled.
+#[test]
+fn a_restored_event_the_kernel_made_is_copied_unchanged() {
+    for (interface, command, kept) in never_signalled_events() {
+        let mut rig = Rig::new();
+        let proxy = rig.proxy();
+        let object = rig.open(proxy, interface);
+        rig.object(object, command, &[]);
+        let event = kept(&rig.applet()).unwrap();
+        let saved = rig.server.save().unwrap();
+        let mut restored = oe_server(AppletSettings::eden_default(), UnknownPolicy::Strict);
+        restored.restore(&saved).unwrap();
+        rig.server = restored;
+
+        let raw = rig.object_raw(object, command, &[]);
+        let copied = parse(&raw, SessionKind::Domain).copies[0];
+        assert_eq!(raw, copied_handle_reply(copied), "{command}");
+        assert_eq!(rig.object_of(copied), event);
+        assert_eq!(rig.kernel.signals(event), Some(0));
+        assert_eq!(rig.kernel.is_signalled(event), Some(false));
+    }
 }
