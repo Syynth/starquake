@@ -65,14 +65,27 @@
 //! - **No page groups.** Eden compares the physical pages the destination maps with the
 //!   source's (`IsValidPageGroup`). With no physical pages, the address space records, for
 //!   each run of alias pages, the source page its first page maps again ([`Aliases`]), and
-//!   checks each destination page against that record. The two agree: a source page is
-//!   aliased at most once at a time (step 1 of `MapMemory` refuses a `Locked` source), an
-//!   alias cannot be a source (`Stack` has no [`flag::CAN_ALIAS`]), and the states that have
-//!   it (heap and physical memory, `Normal`; module data, `CodeData`; their `AliasCodeData`
-//!   twin) are memory whose pages no other virtual page maps, so destination page `i` holds
-//!   the source's page `i` exactly when the record says so. A range that covers parts
-//!   of two aliases passes when their pages line up with the source, as Eden's walk does.
-//!   Test: `unmapping_needs_each_page_to_alias_the_source_page_at_its_offset`.
+//!   checks each destination page against that record. With the system calls built today
+//!   the two give the same answer: a source page is aliased at most once at a time (step 1
+//!   of `MapMemory` refuses a `Locked` source), an alias cannot be a source (`Stack` has no
+//!   [`flag::CAN_ALIAS`]), and the other states that have it and that a guest can reach here
+//!   (heap and physical memory, `Normal`; module data, `CodeData`) are memory whose pages no
+//!   other virtual page maps, so destination page `i` holds the source's page `i` exactly
+//!   when the record says so. A range that covers parts of two aliases passes when their
+//!   pages line up with the source, as Eden's walk does. Test:
+//!   `unmapping_needs_each_page_to_alias_the_source_page_at_its_offset`.
+//!
+//!   **The exception, once `MapProcessCodeMemory` (0x77, deferred today) is built:** Eden's
+//!   `KPageTableBase::MapCodeMemory` leaves its `Normal` source `KernelRead | NotMapped` and
+//!   [`MemoryAttribute::LOCKED`], and maps the same physical pages at an `AliasCode`
+//!   destination, which becomes `AliasCodeData` (a state with [`flag::CAN_ALIAS`]) when made
+//!   writable (`KPageTableBase::SetProcessMemoryPermission`). A `MapMemory` alias of that `AliasCodeData` range then maps the locked `Normal`
+//!   source's pages too, and that source passes `UnmapMemory`'s source check (step 1). So
+//!   Eden accepts `UnmapMemory(the alias, the code memory's locked source)`, its page groups
+//!   being the same physical pages, while the record here, which names the `AliasCodeData`
+//!   range as the alias's source, refuses it with [`KernelError::InvalidMemoryRegion`]. No
+//!   guest can reach this until 0x77 is built; the record has to follow code memory's
+//!   sources then, or the divergence stays and is pinned by a test.
 //! - **A [`Mapper`] that refuses** fails the call as an internal failure. Eden's `Operate`
 //!   does not fail on these paths, and it asserts its undo (`R_ASSERT`). Here, when the undo
 //!   fails too, the bookkeeping says what the translation then holds: in `MapMemory`, the
@@ -97,7 +110,7 @@ use crate::result::{CallResult, KernelError, SvcError};
 
 /// What `MapMemory` makes of the source: `KernelRead | NotMapped`, no access for the guest
 /// (`new_src_perm` in `KPageTableBase::MapMemory`).
-const LOCKED_SOURCE: MemoryPermission = MemoryPermission::from_bits(
+pub(super) const LOCKED_SOURCE: MemoryPermission = MemoryPermission::from_bits(
     MemoryPermission::KERNEL_READ.bits() | MemoryPermission::NOT_MAPPED.bits(),
 );
 

@@ -7,17 +7,12 @@
 
 use starquake_memory::Perms;
 
-use super::alias::Aliases;
+use super::alias::{Aliases, LOCKED_SOURCE};
 use super::snapshot::SnapshotError;
 use super::*;
 use crate::memory::fixture::loaded;
 use crate::memory::testing::{MapperCall, MapperLog, RecordingMapper};
 use crate::svc::memory::HEAP_SIZE_ALIGNMENT;
-
-/// What `MapMemory` makes of the source (`new_src_perm`).
-const LOCKED_SOURCE: MemoryPermission = MemoryPermission::from_bits(
-    MemoryPermission::KERNEL_READ.bits() | MemoryPermission::NOT_MAPPED.bits(),
-);
 
 fn invalid<T>(error: KernelError) -> CallResult<T> {
     Err(SvcError::Kernel(error))
@@ -402,6 +397,33 @@ fn unmapping_what_was_never_mapped_or_a_mismatched_pair_gives_the_references_err
             (rig.dst(4), rig.src(4), PAGE_SIZE)
         ]
     );
+}
+
+#[test]
+fn an_alias_a_device_holds_is_not_unmapped_until_the_device_lets_go() {
+    // Eden's destination check masks every attribute (`KMemoryAttribute::All`, `None`
+    // expected), the counted `DeviceShared` among them: a device-share lock on the alias
+    // refuses `UnmapMemory`, so the guest cannot take pages a device still holds.
+    let mut rig = Rig::new();
+    let (src, dst) = (rig.src(0), rig.dst(0));
+    rig.space.map_memory(dst, src, PAGE_SIZE).unwrap();
+    assert_eq!(rig.space.lock_device_share(dst, PAGE_SIZE), Ok(()));
+    assert_eq!(rig.block(dst).attribute(), MemoryAttribute::DEVICE_SHARED);
+    let before = rig.blocks();
+    drop(rig.log.take());
+    assert_eq!(
+        rig.space.unmap_memory(dst, src, PAGE_SIZE),
+        invalid(KernelError::InvalidCurrentMemory)
+    );
+    assert_eq!(rig.blocks(), before);
+    assert_eq!(rig.log.take(), []);
+    assert_eq!(rig.runs(), [(dst, src, PAGE_SIZE)]);
+    assert_eq!(rig.space.device_locks(dst, PAGE_SIZE), 1);
+    // Once the device lets go, the same call unmaps it.
+    assert_eq!(rig.space.unlock_device_share(dst, PAGE_SIZE), Ok(()));
+    assert_eq!(rig.space.unmap_memory(dst, src, PAGE_SIZE), Ok(()));
+    assert_eq!(rig.block(dst).state(), MemoryState::Free);
+    assert_eq!(rig.runs(), []);
 }
 
 #[test]

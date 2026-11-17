@@ -139,25 +139,41 @@ fn the_source_must_lie_inside_the_address_space() {
         let (mut space, _, _, stack) = rig();
         let end = space.regions().address_space.end;
         let start = space.regions().address_space.start;
-        // Ending exactly at the address space's end passes this check (the page there is not
-        // heap, so the page table refuses it); a page further does not.
+        // The destination is a free page of the heap region, which the stack region's check
+        // (the next one) refuses with `InvalidMemoryRegion`: a source that passes this check
+        // gets that result, and one that fails it `InvalidCurrentMemory`. Ending exactly at
+        // the address space's end passes; a page further does not.
+        let free_heap = space.regions().heap.start + HEAP_SIZE_ALIGNMENT;
         assert_eq!(
-            call(&mut space, stack, end - PAGE_SIZE, PAGE_SIZE),
+            call(&mut space, free_heap, end - PAGE_SIZE, PAGE_SIZE),
+            kernel(KernelError::InvalidMemoryRegion),
+            "{name}"
+        );
+        assert_eq!(
+            call(&mut space, free_heap, end - PAGE_SIZE, 2 * PAGE_SIZE),
             kernel(KernelError::InvalidCurrentMemory),
             "{name}"
         );
+        // Starting exactly at the address space's start passes; a page below it does not.
+        assert_eq!(
+            call(&mut space, free_heap, start, PAGE_SIZE),
+            kernel(KernelError::InvalidMemoryRegion),
+            "{name}"
+        );
+        if let Some(below) = start.checked_sub(PAGE_SIZE) {
+            assert_eq!(
+                call(&mut space, free_heap, below, PAGE_SIZE),
+                kernel(KernelError::InvalidCurrentMemory),
+                "{name}"
+            );
+        }
+        // With a destination the stack region holds, a source a page past the end is still
+        // this check's result.
         assert_eq!(
             call(&mut space, stack, end - PAGE_SIZE, 2 * PAGE_SIZE),
             kernel(KernelError::InvalidCurrentMemory),
             "{name}"
         );
-        if let Some(below) = start.checked_sub(PAGE_SIZE) {
-            assert_eq!(
-                call(&mut space, stack, below, PAGE_SIZE),
-                kernel(KernelError::InvalidCurrentMemory),
-                "{name}"
-            );
-        }
         // Outside the address space and with a destination outside the stack region: the
         // source's check comes first. (A source inside, with the same destination, is the
         // stack region's result.)
