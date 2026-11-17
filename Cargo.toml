@@ -9,7 +9,7 @@ exclude = ["tools/oracle", "tools/pump"]
 version = "0.0.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
-rust-version = "1.99"
+rust-version = "1.100"
 publish = false
 
 # Every dependency is declared here with its version; crates use `dep.workspace = true`.
@@ -62,6 +62,13 @@ proptest = "1.12.0"
 # tests (docs/specs/shader-pipeline.md, "What to verify before building"). Takes a naga module
 # directly (`naga-ir`); Metal on macOS, Vulkan elsewhere. Pinned with naga.
 wgpu = { version = "=30.0.1", default-features = false, features = ["std", "metal", "vulkan", "naga-ir"] }
+
+# Cargo's own unused-dependency lints (new in Rust 1.100) cannot say why a dependency is declared
+# ahead of the task that uses it. The gate's unused-dependency check is the authority instead:
+# every exception is listed with a reason in xtask/unused-deps.toml, exact in both directions.
+[workspace.lints.cargo]
+unused_dependencies = "allow"
+unused_workspace_dependencies = "allow"
 
 [workspace.lints.rust]
 # Denied everywhere; the few crates that must talk to the host or run guest code (cpu, later

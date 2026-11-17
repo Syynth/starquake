@@ -973,7 +973,7 @@ pub struct Violation {
 /// The folder that holds the submodules of `file`: next to a `lib.rs`, `main.rs` or `mod.rs`,
 /// and in the folder named like the file otherwise.
 fn module_folder(file: &Path) -> PathBuf {
-    let parent = file.parent().map(Path::to_path_buf).unwrap_or_default();
+    let parent = file.parent().map_or_default(Path::to_path_buf);
     match file.file_stem().and_then(|stem| stem.to_str()) {
         Some("lib" | "main" | "mod") | None => parent,
         Some(stem) => parent.join(stem),

@@ -422,10 +422,7 @@ fn strip_comments(text: &str) -> Result<Stripped, usize> {
     if let Some((line, _)) = in_comment {
         return Err(line);
     }
-    let notice = first_comment
-        .as_deref()
-        .map(clean_notice)
-        .unwrap_or_default();
+    let notice = first_comment.as_deref().map_or_default(clean_notice);
     Ok(Stripped { lines, notice })
 }
 

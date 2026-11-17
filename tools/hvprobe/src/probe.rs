@@ -228,8 +228,8 @@ fn run(v: &Vcpu, test: Test, args: &[(u32, u64)]) -> Outcome {
     }
     out.elapsed = start.elapsed();
     out.since_stamp = stamp.map(|s| s.elapsed());
-    for i in 0..16 {
-        out.x[i] = v.get(HV_REG_X0 + i as u32);
+    for (reg, x) in (HV_REG_X0..).zip(out.x.iter_mut()) {
+        *x = v.get(reg);
     }
     out
 }

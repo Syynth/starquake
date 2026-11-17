@@ -458,8 +458,7 @@ fn workspace_list<'a>(table: &'a toml::Table, list: &str) -> Vec<&'a str> {
         .get("workspace")
         .and_then(|workspace| workspace.get(list))
         .and_then(toml::Value::as_array)
-        .map(|entries| entries.iter().filter_map(toml::Value::as_str).collect())
-        .unwrap_or_default()
+        .map_or_default(|entries| entries.iter().filter_map(toml::Value::as_str).collect())
 }
 
 /// The manifests of the workspace members named by the root manifest's `members` list, relative

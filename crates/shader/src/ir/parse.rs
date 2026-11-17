@@ -498,7 +498,7 @@ fn parse_inst(body: &str, annotation: Option<Type>) -> Result<Inst> {
         .into_iter()
         .map(parse_operand)
         .collect::<Result<Vec<_>>>()?;
-    let flags = parse_flags(opcode.flags_kind(), &flags.map(items).unwrap_or_default())?;
+    let flags = parse_flags(opcode.flags_kind(), &flags.map_or_default(items))?;
     Ok(Inst::Op(Operation {
         opcode,
         args,

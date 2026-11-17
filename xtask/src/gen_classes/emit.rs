@@ -61,16 +61,11 @@ pub fn emit(source: &Source, header: &Header) -> String {
             source.header,
             source
                 .only
-                .map(|only| format!(" whose name starts with `{prefix}{only}`"))
-                .unwrap_or_default(),
-            header
-                .class
-                .as_ref()
-                .map(|class| format!(
-                    " The class id define, `{}`, is [`{CLASS_ITEM}`].",
-                    class.name
-                ))
-                .unwrap_or_default(),
+                .map_or_default(|only| format!(" whose name starts with `{prefix}{only}`")),
+            header.class.as_ref().map_or_default(|class| format!(
+                " The class id define, `{}`, is [`{CLASS_ITEM}`].",
+                class.name
+            )),
             if header.methods.is_empty() {
                 "Bit ranges are the header's own."
             } else {
@@ -279,9 +274,7 @@ fn write_named_field(out: &mut Out, full: &str, field: &Field, indent: &str) {
 /// The bit-range constant of a field named `full`, and one constant per value. `method` is the
 /// method the field belongs to, if any.
 fn write_field_const(out: &mut Out, prefix: &str, full: &str, field: &Field, method: Option<&str>) {
-    let owner = method
-        .map(|method| format!(" of `{method}`"))
-        .unwrap_or_default();
+    let owner = method.map_or_default(|method| format!(" of `{method}`"));
     let name = ident(full);
     match field.bits {
         Bits::Word { high, low } => {

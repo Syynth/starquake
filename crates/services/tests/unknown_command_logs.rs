@@ -66,7 +66,7 @@ struct Levels(Arc<Mutex<Vec<Level>>>);
 
 impl Levels {
     fn seen(&self) -> Vec<Level> {
-        self.0.lock().map(|seen| seen.clone()).unwrap_or_default()
+        self.0.lock().map_or_default(|seen| seen.clone())
     }
 }
 
