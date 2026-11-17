@@ -193,10 +193,7 @@ fn a_partly_mapped_range_maps_only_its_free_pages_and_reserves_only_them() {
     );
     // Five pages were free.
     assert_eq!(space.limit().reserved(), reserved + 5 * PAGE_SIZE);
-    assert_eq!(
-        space.mapped_physical_memory_size(),
-        mapped + 5 * PAGE_SIZE
-    );
+    assert_eq!(space.mapped_physical_memory_size(), mapped + 5 * PAGE_SIZE);
     // The new pages have no barrier, so they merge with the physical memory beside them; the
     // IPC page keeps its barrier, and its own state.
     assert_eq!(
@@ -266,10 +263,7 @@ fn the_pool_refuses_a_map_one_page_past_its_free_memory_and_takes_one_exactly_at
     assert_eq!(state(&space), before);
 
     // Exactly the free memory: taken whole.
-    assert_eq!(
-        space.map_physical_memory(page(0), free + PAGE_SIZE),
-        Ok(())
-    );
+    assert_eq!(space.map_physical_memory(page(0), free + PAGE_SIZE), Ok(()));
     assert_eq!(log.take(), [map_call(page(1), free / PAGE_SIZE)]);
     assert_eq!(space.limit().free(), 0);
     assert_eq!(space.mapped_physical_memory_size(), free + PAGE_SIZE);
@@ -356,10 +350,7 @@ fn unmapping_frees_only_what_was_mapped_and_gives_it_back() {
     let used = space.used_user_physical_memory_size();
 
     assert_eq!(space.unmap_physical_memory(page(0), 10 * PAGE_SIZE), Ok(()));
-    assert_eq!(
-        log.take(),
-        [unmap_call(page(2), 2), unmap_call(page(6), 2)]
-    );
+    assert_eq!(log.take(), [unmap_call(page(2), 2), unmap_call(page(6), 2)]);
     assert_eq!(
         rows(&space, page(0), page(12)),
         [free(page(0), 10), physical(page(10), 2)]
@@ -463,7 +454,10 @@ fn unmapping_from_the_alias_regions_start_clears_a_head_barrier() {
     // memory above.
     let (mut space, page) = barrier_at_start();
     space.unmap_physical_memory(page(0), 2 * PAGE_SIZE).unwrap();
-    assert_eq!(space.query_info(page(0)).unwrap().disable_merge(), DisableMerge::NONE);
+    assert_eq!(
+        space.query_info(page(0)).unwrap().disable_merge(),
+        DisableMerge::NONE
+    );
     assert!(space.query_info(page(0)).unwrap().pages() > 2);
     // From one page in, the first block starts below the range: the barrier stays.
     let (mut space, page) = barrier_at_start();
@@ -573,7 +567,9 @@ fn a_piece_whose_undo_fails_too_stays_mapped_and_counted() {
 fn an_unmap_refused_partway_frees_what_it_unmapped() {
     let (mut space, log, page) = alias_space();
     for first in [0, 3, 6] {
-        space.map_physical_memory(page(first), 2 * PAGE_SIZE).unwrap();
+        space
+            .map_physical_memory(page(first), 2 * PAGE_SIZE)
+            .unwrap();
     }
     drop(log.take());
     let reserved = space.limit().reserved();

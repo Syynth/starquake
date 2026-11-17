@@ -31,6 +31,12 @@
 //! block of the range is neither free nor `Normal` with no attributes
 //! ([`AddressSpace::map_physical_memory`], [`AddressSpace::unmap_physical_memory`]).
 //!
+//! The page-table half checks the alias region again, with the same result
+//! ([`AddressSpace::map_physical_memory`]; its module's "Divergences"), and in Eden too
+//! `IsInAliasRegion` includes `Contains`. So which of the three checks refuses a range outside
+//! the alias region is not observable from the result; the tests
+//! (`each_check_refuses_at_its_edge_and_passes_just_inside_it`) pin the result at each edge.
+//!
 //! The system resource is the one `GetInfo` 16 reports
 //! ([`secure_resource_size`](crate::svc::info::secure_resource_size): the size the program's
 //! metadata asks for, in whole pages); the dispatcher reads it from the process facts.

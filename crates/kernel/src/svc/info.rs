@@ -38,7 +38,8 @@
 //!     [`USER_EXCEPTION_CONTEXT_ADDRESS`] here (see the divergences).
 //!   - 21 `TotalNonSystemMemorySize` and 22 `UsedNonSystemMemorySize`:
 //!     `GetTotalNonSystemUserPhysicalMemorySize` and `GetUsedNonSystemUserPhysicalMemorySize`
-//!     ([`non_system_total`]; the used size is the heap, the code and the main thread's stack,
+//!     ([`non_system_total`]; the used size is the normal memory (the heap and what
+//!     `MapPhysicalMemory` mapped), the code and the main thread's stack,
 //!     [`AddressSpace::used_user_physical_memory_size`]).
 //!   - 23 `IsApplication`: `IsApplication`; [`IS_APPLICATION`] here (see the divergences).
 //!   - 24 `FreeThreadCount`: the process's resource limit's `ThreadCountMax` limit less its
@@ -538,12 +539,12 @@ pub const fn secure_resource_size(process: &ProcessInfo) -> u64 {
 }
 
 /// `KProcess::GetTotalNonSystemUserPhysicalMemorySize` (`eden/src/core/hle/kernel/k_process.cpp`
-/// @ cf654052) of a process that uses `used_non_system` bytes (the heap, the code and the main
-/// thread's stack: `GetUsedNonSystemUserPhysicalMemorySize`), can still reserve `free`, may use
-/// at most `max` (`m_max_process_memory`) and whose secure system resource needs `secure`
-/// ([`secure_resource_size`]): `max - secure` when `used_non_system + secure + free > max`, else
-/// `free + used_non_system`. A `secure` above `max`, which Eden cannot reach, answers zero (see
-/// the module docs).
+/// @ cf654052) of a process that uses `used_non_system` bytes (its normal memory, the code and
+/// the main thread's stack: `GetUsedNonSystemUserPhysicalMemorySize`), can still reserve
+/// `free`, may use at most `max` (`m_max_process_memory`) and whose secure system resource
+/// needs `secure` ([`secure_resource_size`]): `max - secure` when
+/// `used_non_system + secure + free > max`, else `free + used_non_system`. A `secure` above
+/// `max`, which Eden cannot reach, answers zero (see the module docs).
 #[must_use]
 pub const fn non_system_total(used_non_system: u64, free: u64, max: u64, secure: u64) -> u64 {
     let used = used_non_system.saturating_add(secure);

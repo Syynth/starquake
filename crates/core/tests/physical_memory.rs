@@ -47,7 +47,9 @@ mod support {
     pub(crate) const VALUE: u32 = 0x1234;
     /// A system resource of one page: the smallest a process can have (`GetInfo` 16 reports
     /// the size in whole pages).
-    pub(crate) const RESOURCE: u32 = PAGE_SIZE as u32;
+    pub(crate) fn resource() -> u32 {
+        u32::try_from(PAGE_SIZE).unwrap()
+    }
 
     /// What a program does once it has mapped the memory and used it.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,11 +190,11 @@ mod support {
     }
 }
 
-use support::{RESOURCE, SIZE, Then, alias_start, results, run, uses_physical_memory};
+use support::{SIZE, Then, alias_start, resource, results, run, uses_physical_memory};
 
 #[test]
 fn a_program_reads_and_writes_the_memory_it_maps_and_unmaps_it() {
-    let Some(report) = run(&uses_physical_memory(Then::UnmapAndExit), RESOURCE) else {
+    let Some(report) = run(&uses_physical_memory(Then::UnmapAndExit), resource()) else {
         return;
     };
     assert_eq!(
@@ -214,7 +216,7 @@ fn a_program_reads_and_writes_the_memory_it_maps_and_unmaps_it() {
 
 #[test]
 fn the_word_past_the_mapped_range_is_not_there() {
-    let Some(report) = run(&uses_physical_memory(Then::StorePastTheEnd), RESOURCE) else {
+    let Some(report) = run(&uses_physical_memory(Then::StorePastTheEnd), resource()) else {
         return;
     };
     // Everything up to the store worked; the store, one byte past the range, faults there.
@@ -235,7 +237,7 @@ fn the_word_past_the_mapped_range_is_not_there() {
 
 #[test]
 fn memory_that_was_unmapped_is_not_there() {
-    let Some(report) = run(&uses_physical_memory(Then::LoadAfterUnmapping), RESOURCE) else {
+    let Some(report) = run(&uses_physical_memory(Then::LoadAfterUnmapping), resource()) else {
         return;
     };
     let crash = report.crash().expect("a crash report");
@@ -258,7 +260,7 @@ fn a_program_with_no_system_resource_is_refused_with_invalid_state() {
     let program = uses_physical_memory(Then::UnmapAndExit);
     // The same program with a system resource one byte short of a page (none, in whole pages),
     // and as an NRO alone (Eden's defaults for a program with no NPDM: no system resource).
-    let Some(short) = run(&program, RESOURCE - 1) else {
+    let Some(short) = run(&program, resource() - 1) else {
         return;
     };
     let alone = common::run(&program, GENEROUS).unwrap();

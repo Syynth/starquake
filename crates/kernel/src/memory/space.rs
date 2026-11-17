@@ -1266,8 +1266,11 @@ impl AddressSpace {
         let mut pieces = Vec::new();
         let mut cursor = address;
         for block in self.blocks.blocks_from(address) {
-            // `block` holds `cursor`: the first holds `address`, each next one starts where
-            // the one before ended.
+            // `block` holds `cursor` in a sound map: the first holds `address`, each next one
+            // starts where the one before ended.
+            if !block.contains(cursor) {
+                return Err(broken(BlockMapError::Broken { address: cursor }));
+            }
             let piece_last = block.last().min(last);
             pieces.push(Piece {
                 address: cursor,
@@ -1321,12 +1324,13 @@ impl AddressSpace {
         // Reserve the memory from the process resource limit. (The pieces are the range, so
         // `mapped_size < size`.)
         let unmapped = size - mapped_size;
+        let perms = PHYSICAL
+            .permission
+            .guest()
+            .ok_or_else(|| SvcError::Internal("read-write memory has no translation".into()))?;
         self.limit.reserve(unmapped)?;
         // Map the free pieces.
         let free: Vec<Piece> = pieces.into_iter().filter(Piece::is_free).collect();
-        let perms = PHYSICAL.permission.guest().ok_or_else(|| {
-            SvcError::Internal("read-write memory has no translation".into())
-        })?;
         for (index, piece) in free.iter().enumerate() {
             if let Err(error) = self.mapper.map(piece.address, piece.size, perms) {
                 let mapped = free.get(..index).unwrap_or_default();
@@ -1462,7 +1466,10 @@ impl AddressSpace {
             _ => DisableMerge::NONE,
         };
         // Unmap the mapped pieces.
-        let normal: Vec<Piece> = pieces.into_iter().filter(|piece| !piece.is_free()).collect();
+        let normal: Vec<Piece> = pieces
+            .into_iter()
+            .filter(|piece| !piece.is_free())
+            .collect();
         for (index, piece) in normal.iter().enumerate() {
             if let Err(error) = self.mapper.unmap(piece.address, piece.size) {
                 let unmapped = normal.get(..index).unwrap_or_default();

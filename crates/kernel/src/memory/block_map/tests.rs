@@ -1028,7 +1028,11 @@ enum Op {
 fn picked(
     (state, permission, attribute): (usize, usize, usize),
 ) -> (MemoryState, MemoryPermission, MemoryAttribute) {
-    (STATES[state], PERMISSIONS[permission], ATTRIBUTES[attribute])
+    (
+        STATES[state],
+        PERMISSIONS[permission],
+        ATTRIBUTES[attribute],
+    )
 }
 
 /// Indexes into [`STATES`], [`PERMISSIONS`] and [`ATTRIBUTES`].

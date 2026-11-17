@@ -19,6 +19,10 @@ fn kernel(error: KernelError) -> CallResult<()> {
     Err(SvcError::Kernel(error))
 }
 
+const ADDRESS: SvcResult<()> = Err(KernelError::InvalidAddress);
+const SIZE: SvcResult<()> = Err(KernelError::InvalidSize);
+const REGION: SvcResult<()> = Err(KernelError::InvalidMemoryRegion);
+
 type Call = fn(&mut AddressSpace, u64, u64, u64) -> CallResult<()>;
 
 /// Both calls, by name.
@@ -86,29 +90,33 @@ fn each_check_refuses_at_its_edge_and_passes_just_inside_it() {
     // (address, size, system resource, result), for each check in Eden's order.
     let cases = [
         // `IsAligned(addr, YUZU_PAGESIZE)`: `ResultInvalidAddress`.
-        (page(0) + 1, PAGE_SIZE, RESOURCE, Err(KernelError::InvalidAddress)),
-        (page(1) - 1, PAGE_SIZE, RESOURCE, Err(KernelError::InvalidAddress)),
+        (page(0) + 1, PAGE_SIZE, RESOURCE, ADDRESS),
+        (page(1) - 1, PAGE_SIZE, RESOURCE, ADDRESS),
         // `IsAligned(size, YUZU_PAGESIZE)`: `ResultInvalidSize`.
-        (page(0), PAGE_SIZE + 1, RESOURCE, Err(KernelError::InvalidSize)),
-        (page(0), PAGE_SIZE - 1, RESOURCE, Err(KernelError::InvalidSize)),
+        (page(0), PAGE_SIZE + 1, RESOURCE, SIZE),
+        (page(0), PAGE_SIZE - 1, RESOURCE, SIZE),
         // `size == 0`: `ResultInvalidSize`.
-        (page(0), 0, RESOURCE, Err(KernelError::InvalidSize)),
+        (page(0), 0, RESOURCE, SIZE),
         // `addr < addr + size`: `ResultInvalidMemoryRegion`, also for a sum of exactly 2^64.
-        (u64::MAX - PAGE_SIZE + 1, PAGE_SIZE, RESOURCE, Err(KernelError::InvalidMemoryRegion)),
-        (u64::MAX - PAGE_SIZE + 1, 2 * PAGE_SIZE, RESOURCE, Err(KernelError::InvalidMemoryRegion)),
+        (u64::MAX - PAGE_SIZE + 1, PAGE_SIZE, RESOURCE, REGION),
+        (u64::MAX - PAGE_SIZE + 1, 2 * PAGE_SIZE, RESOURCE, REGION),
         // `GetTotalSystemResourceSize() == 0`: `ResultInvalidState`.
         (page(0), PAGE_SIZE, 0, Err(KernelError::InvalidState)),
-        // `Contains`: `ResultInvalidMemoryRegion`; the last page of the address space is
-        // inside it, the page past it is not.
-        (address_space.end, PAGE_SIZE, RESOURCE, Err(KernelError::InvalidMemoryRegion)),
-        (address_space.end - PAGE_SIZE, 2 * PAGE_SIZE, RESOURCE, Err(KernelError::InvalidMemoryRegion)),
+        // `Contains`: `ResultInvalidMemoryRegion`, from the page past the address space's end.
+        (address_space.end, PAGE_SIZE, RESOURCE, REGION),
+        (
+            address_space.end - PAGE_SIZE,
+            2 * PAGE_SIZE,
+            RESOURCE,
+            REGION,
+        ),
         // `IsInAliasRegion`: `ResultInvalidMemoryRegion`, one page below the alias region or
-        // one past its end.
-        (alias.start - PAGE_SIZE, PAGE_SIZE, RESOURCE, Err(KernelError::InvalidMemoryRegion)),
-        (alias.start - PAGE_SIZE, 2 * PAGE_SIZE, RESOURCE, Err(KernelError::InvalidMemoryRegion)),
-        (alias.end, PAGE_SIZE, RESOURCE, Err(KernelError::InvalidMemoryRegion)),
-        (alias.end - PAGE_SIZE, 2 * PAGE_SIZE, RESOURCE, Err(KernelError::InvalidMemoryRegion)),
-        (address_space.end - PAGE_SIZE, PAGE_SIZE, RESOURCE, Err(KernelError::InvalidMemoryRegion)),
+        // one past its end, and the address space's last page, which is outside it.
+        (alias.start - PAGE_SIZE, PAGE_SIZE, RESOURCE, REGION),
+        (alias.start - PAGE_SIZE, 2 * PAGE_SIZE, RESOURCE, REGION),
+        (alias.end, PAGE_SIZE, RESOURCE, REGION),
+        (alias.end - PAGE_SIZE, 2 * PAGE_SIZE, RESOURCE, REGION),
+        (address_space.end - PAGE_SIZE, PAGE_SIZE, RESOURCE, REGION),
         // Just inside every edge.
         (page(0), PAGE_SIZE, RESOURCE, Ok(())),
         (alias.end - PAGE_SIZE, PAGE_SIZE, RESOURCE, Ok(())),
@@ -146,7 +154,12 @@ fn with_two_faults_the_one_checked_first_is_reported() {
         // An unaligned size and no system resource: the size first.
         (alias.start, 1, 0, KernelError::InvalidSize),
         // A range that wraps and no system resource: the wrap first.
-        (u64::MAX - PAGE_SIZE + 1, PAGE_SIZE, 0, KernelError::InvalidMemoryRegion),
+        (
+            u64::MAX - PAGE_SIZE + 1,
+            PAGE_SIZE,
+            0,
+            KernelError::InvalidMemoryRegion,
+        ),
         // No system resource and a range outside the alias region: the resource first.
         (heap, PAGE_SIZE, 0, KernelError::InvalidState),
     ];

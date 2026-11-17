@@ -76,7 +76,10 @@ fn mapped_physical_memory_is_used_memory_that_get_info_reports_and_unmapping_giv
 
     assert_eq!(call(&dispatcher, SvcId::MapPhysicalMemory, alias, size), 0);
     dispatcher.with::<(&AddressSpace,), _>(|(space,)| {
-        assert_eq!(space.query_info(alias).unwrap().state(), MemoryState::Normal);
+        assert_eq!(
+            space.query_info(alias).unwrap().state(),
+            MemoryState::Normal
+        );
         assert_eq!(space.mapped_physical_memory_size(), size);
     });
     // The used sizes (7, 22) grow by the memory mapped; the totals (6, 21) do not move, as
@@ -86,7 +89,10 @@ fn mapped_physical_memory_is_used_memory_that_get_info_reports_and_unmapping_giv
         [total, used + size, non_system_total, non_system_used + size]
     );
 
-    assert_eq!(call(&dispatcher, SvcId::UnmapPhysicalMemory, alias, size), 0);
+    assert_eq!(
+        call(&dispatcher, SvcId::UnmapPhysicalMemory, alias, size),
+        0
+    );
     dispatcher.with::<(&AddressSpace,), _>(|(space,)| {
         assert_eq!(space.query_info(alias).unwrap().state(), MemoryState::Free);
         assert_eq!(space.mapped_physical_memory_size(), 0);

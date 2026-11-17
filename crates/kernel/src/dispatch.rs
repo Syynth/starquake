@@ -1003,7 +1003,12 @@ impl Dispatcher {
 impl Dispatcher {
     /// `MapPhysicalMemory`'s and `UnmapPhysicalMemory`'s arm: they declare the address space,
     /// and read the process's system resource size from the process facts.
-    fn physical_memory(&self, call: &mut Call<'_, '_>, id: SvcId, convention: &Convention) -> Outcome {
+    fn physical_memory(
+        &self,
+        call: &mut Call<'_, '_>,
+        id: SvcId,
+        convention: &Convention,
+    ) -> Outcome {
         self.call_in_process::<(&mut AddressSpace,)>(call, |(space,), call, _, processes| {
             returning(id, convention, call.regs, |[address, size]| {
                 let system_resource_size = crate::svc::info::secure_resource_size(

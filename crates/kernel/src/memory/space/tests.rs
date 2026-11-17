@@ -1260,11 +1260,7 @@ fn op() -> impl Strategy<Value = Op> {
             pages,
             set
         }),
-        (range, any::<bool>()).prop_map(|((first, pages), map)| Op::Physical {
-            first,
-            pages,
-            map
-        }),
+        (range, any::<bool>()).prop_map(|((first, pages), map)| Op::Physical { first, pages, map }),
     ]
 }
 
