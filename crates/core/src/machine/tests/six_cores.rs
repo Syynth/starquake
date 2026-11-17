@@ -563,6 +563,42 @@ fn a_deferred_reply_is_delivered_by_the_timers_turn_and_wakes_its_sender() {
 }
 
 #[test]
+fn a_delivery_turn_drops_what_the_workers_environment_recorded() {
+    // `fsp-srv`'s workers read through the run's second environment, which records every
+    // answer, bytes and all; every read they finish makes a delivery turn, which drops them.
+    let guest = Guest::new(&programs::hello().unwrap());
+    let main = ScriptedVcpu::new().then(|_| {}, svc(SvcId::ExitProcess));
+    let mut turns = Vec::new();
+    let outcome = stepped(
+        &guest,
+        &guest.memory,
+        vec![main],
+        &real_services,
+        |round, machine| {
+            if round > 0 {
+                return;
+            }
+            let request = starquake_trace::HostIoRequest {
+                channel: 0,
+                payload: vec![0x7E; 3],
+            };
+            machine.reads.host_io(&request).unwrap();
+            // A turn with nothing ready keeps it; a turn that delivers drops it.
+            assert!(crate::machine::timer::deliver(machine).is_ok());
+            turns.push(machine.reads.recording().len());
+            let fsp = machine.dispatcher.with::<(&Scheduler,), _>(|(scheduler,)| {
+                scheduler.ipc().service(crate::hle::FSP_SRV)
+            });
+            machine.ready.push(fsp.unwrap());
+            assert!(crate::machine::timer::deliver(machine).is_ok());
+            turns.push(machine.reads.recording().len());
+        },
+    );
+    assert_exited(&outcome);
+    assert_eq!(turns, [1, 0]);
+}
+
+#[test]
 fn a_run_whose_threads_all_wait_on_nothing_that_can_end_is_an_emulator_error() {
     let guest = Guest::new(&programs::hello().unwrap());
     // A sleep too long for any deadline: no timer, and no other thread.
