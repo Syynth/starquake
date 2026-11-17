@@ -241,9 +241,12 @@ struct Finished {
 }
 
 impl Finished {
-    fn push(&self, job: u64) {
-        self.order.lock().unwrap().push(job);
+    /// Pushes `job`; how many have been pushed since.
+    fn push(&self, job: u64) -> usize {
+        let mut order = self.order.lock().unwrap();
+        order.push(job);
         self.pushed.notify_all();
+        order.len()
     }
 
     fn order(&self) -> MutexGuard<'_, Vec<u64>> {
@@ -263,16 +266,16 @@ impl Finished {
 }
 
 /// A job that reads [`HELLO`] at `offset` through its environment, and whose finish pushes `job`
-/// to `finished`, first waiting up to [`HOLD`] for another finish when `hold` is set.
+/// to `finished`. With `hold`, the first finish to push then waits up to [`HOLD`] for a second
+/// before it returns: the window in which a second finish could overtake its record.
 fn job_reading(offset: u64, job: u64, hold: bool, finished: &Arc<Finished>) -> Job {
     let finished = Arc::clone(finished);
     Box::new(move |env: &dyn Env| {
         env.host_io(&hello_read(offset, 4)).unwrap();
         let finish: Finish = Box::new(move || {
-            if hold {
-                finished.await_count(1, HOLD);
+            if finished.push(job) == 1 && hold {
+                finished.await_count(2, HOLD);
             }
-            finished.push(job);
         });
         finish
     })
@@ -280,8 +283,9 @@ fn job_reading(offset: u64, job: u64, hold: bool, finished: &Arc<Finished>) -> J
 
 #[test]
 fn the_record_holds_completions_in_the_order_they_reached_the_mailbox() {
-    // Both jobs wait at the gate, then race to finish. The first finish to start waits for the
-    // other, which must not overtake it: a job is finished and recorded under one lock.
+    // Both jobs wait at the gate, then race to finish. The first finish to post waits for the
+    // other before it returns, and the other must not post and be recorded in between: a job is
+    // finished and recorded under one lock.
     let host = FakeEnv::new(true);
     let gate = Arc::new(Gate::default());
     let env = Arc::new(Gated {
@@ -297,11 +301,13 @@ fn the_record_holds_completions_in_the_order_they_reached_the_mailbox() {
     gate.open();
     assert!(finished.await_count(2, WAIT), "the jobs were not finished");
     let order = finished.order().clone();
-    let recorded: Vec<u64> = workers
-        .take_record()
-        .iter()
-        .map(|entry| entry.job.raw())
-        .collect();
+    // The last record follows its finish: wait for it, within the bound.
+    let mut recorded = Vec::new();
+    let started = std::time::Instant::now();
+    while recorded.len() < 2 && started.elapsed() < WAIT {
+        recorded.extend(workers.take_record().iter().map(|entry| entry.job.raw()));
+        std::thread::yield_now();
+    }
     assert_eq!(recorded, order);
 }
 
@@ -500,7 +506,9 @@ fn a_live_failure_ends_the_jobs_use_of_the_environment() {
     let timing = job_timing(3, &seen);
     workers.submit(Box::new(move |env: &dyn Env| {
         drop(timing(env));
-        let finish: Finish = Box::new(move || pushed.push(0));
+        let finish: Finish = Box::new(move || {
+            pushed.push(0);
+        });
         finish
     }));
     assert!(finished.await_count(1, WAIT));
