@@ -115,7 +115,7 @@ use starquake_trace::{
 
 use crate::clock::Timebase;
 use crate::crash::{Backtrace, CrashReport, Exception};
-use crate::hle::HostFolder;
+use crate::hle::{FspHost, HostFolder};
 use crate::image::{PAGE, Placement};
 use crate::report::{ExitReason, Mapping, RunOptions, RunReport, ThreadPc, empty_dump};
 use crate::space::Touch;
@@ -300,15 +300,19 @@ impl<C: HostClock + Clone> Session<'_, C> {
 
     /// The environment the kernel and the services read during this run: live, on the other
     /// copy of the run's clock, with the fixed random seed, and serving the SD card folder the
-    /// run names ([`RunOptions::sd_card`]) to `fsp-srv`.
+    /// run names ([`RunOptions::sd_card`]) and the title's RomFS ([`RunOptions::romfs`]) to
+    /// `fsp-srv`.
     fn environment(&self) -> Arc<LiveEnv>
     where
         C: 'static,
     {
         let env = LiveEnv::new(self.clock.for_environment(), RANDOM_SEED);
-        Arc::new(match &self.options.sd_card {
-            Some(folder) => env.with_host_io(HostFolder::new(folder)),
-            None => env,
+        let sd_card = self.options.sd_card.as_ref().map(HostFolder::new);
+        let host = FspHost::new(sd_card, self.options.romfs.clone());
+        Arc::new(if host.is_empty() {
+            env
+        } else {
+            env.with_host_io(host)
         })
     }
 }

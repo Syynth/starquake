@@ -47,6 +47,10 @@ pub struct RunOptions {
     /// The host folder the guest sees as its SD card, read-only (`fsp-srv`'s
     /// `OpenSdCardFileSystem`). `None`: the run has no SD card.
     pub sd_card: Option<PathBuf>,
+    /// The title's RomFS, which the guest opens as its data storage (`fsp-srv`'s
+    /// `OpenDataStorageByCurrentProcess`), from the narrow title API (`crate::title::open`).
+    /// `None`: the run has no data storage.
+    pub romfs: Option<crate::title::RomFs>,
 }
 
 /// How a run ended.

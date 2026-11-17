@@ -2,14 +2,17 @@
 //! ([`Env::host_io`]), and the replies it expects.
 //!
 //! The file systems a run has are host folders (for now one: the SD card), named in the run's
-//! configuration. `crates/services` never touches the host file system itself (the gate's
+//! configuration, and the title's data storage: its `RomFS` image, which the run's title serves
+//! ([`Mount::DataStorage`]; one storage, so its requests carry an empty path). `crates/services` never touches the host file system itself (the gate's
 //! host-access step forbids it): it sends a [`HostRequest`] on [`CHANNEL`], and whoever built the
 //! environment answers it. `starquake-core` does that from the configured folder; a test answers
 //! from memory. Live runs record each exchange and replays feed it back, as for every other use
 //! of the environment (`docs/specs/observability.md`, rule 1).
 //!
 //! Everything here is starquake's own: no reference has a host I/O channel. The layout is
-//! versioned ([`VERSION`]) because recorded runs keep these bytes.
+//! versioned ([`VERSION`]) because recorded runs keep these bytes. Mount 2 is a new value of an
+//! existing field, not a change of layout: every request of version 1 decodes as it did, so the
+//! version stays 1.
 //!
 //! # Request layout
 //!
@@ -18,7 +21,7 @@
 //! ```text
 //! 0x00  u8  VERSION
 //! 0x01  u8  operation: 1 probe, 2 size, 3 read
-//! 0x02  u8  mount: 1 the SD card
+//! 0x02  u8  mount: 1 the SD card, 2 the current process's data storage
 //! 0x03  u8  reserved, zero
 //! 0x04  u32 path length in bytes, at most ENTRY_NAME_LENGTH_MAX
 //! 0x08  u64 offset (read; zero otherwise)
@@ -67,19 +70,31 @@ pub mod layout {
 }
 
 /// A file system the host provides.
+///
+/// A file system interface keeps its mount in a snapshot, and only a folder can be one: the
+/// data storage is never saved as a mount (`#[serde(skip)]`), so a snapshot naming it is refused
+/// as it is decoded. The storage interface (`IStorage`) keeps nothing.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Mount {
     /// The SD card (`OpenSdCardFileSystem`).
     #[default]
     SdCard,
+    /// The current process's data storage, its `RomFS` image
+    /// (`OpenDataStorageByCurrentProcess`).
+    #[serde(skip)]
+    DataStorage,
 }
 
 impl Mount {
+    /// Every mount, in number order.
+    pub const ALL: [Self; 2] = [Self::SdCard, Self::DataStorage];
+
     /// The mount's number in a request.
     #[must_use]
     pub const fn number(self) -> u8 {
         match self {
             Self::SdCard => 1,
+            Self::DataStorage => 2,
         }
     }
 
@@ -88,6 +103,7 @@ impl Mount {
     pub const fn from_number(number: u8) -> Option<Self> {
         match number {
             1 => Some(Self::SdCard),
+            2 => Some(Self::DataStorage),
             _ => None,
         }
     }
@@ -181,6 +197,14 @@ fn u64_at(bytes: &[u8], offset: usize) -> u64 {
 }
 
 impl HostRequest {
+    /// The mount the request is for.
+    #[must_use]
+    pub fn mount(&self) -> Mount {
+        match self {
+            Self::Probe { mount } | Self::Size { mount, .. } | Self::Read { mount, .. } => *mount,
+        }
+    }
+
     /// The request's bytes (see the [module docs](self)).
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
@@ -265,7 +289,8 @@ impl HostRequest {
 }
 
 /// Why the host could not do what a [`HostRequest`] asked: the code of a
-/// [`HostIoReply::Failed`].
+/// [`HostIoReply::Failed`]. For the data storage, [`HostFailure::NoDevice`] is a title with no
+/// `RomFS`, and [`HostFailure::Io`] a read of it that failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostFailure {
     /// The mount is not there.

@@ -28,7 +28,9 @@
 //!
 //! `fsp-srv` reads the host through the environment it is given ([`install`]'s `env`): the SD
 //! card is the folder the run's configuration names, which [`HostFolder`] serves on the
-//! environment's host I/O channel; a run that names none has no SD card. PROVISIONAL: the server
+//! environment's host I/O channel, and the data storage is the run's title's RomFS; [`FspHost`]
+//! serves both. A run that names no folder has no SD card, and one with no title RomFS no data
+//! storage. PROVISIONAL: the server
 //! has no executor, so `Read` answers the framework's `NOT_SUPPORTED`. A read defers its reply;
 //! the core loop delivers deferred replies a service says are ready (`crate::machine`,
 //! "Deferred replies"), and an executor that says so when its job is done is not built yet.
@@ -48,8 +50,10 @@ use starquake_services::sm::{self, NameError, Registry, RegistryError, ServiceNa
 use starquake_services::time::{self, TimeSettings};
 use starquake_trace::{Env, ServiceId};
 
+mod fsp_host;
 mod host_folder;
 
+pub use fsp_host::FspHost;
 pub use host_folder::HostFolder;
 
 /// The number the kernel knows the service manager's server by.

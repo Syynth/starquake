@@ -216,6 +216,7 @@ fn a_timed_out_run_reports_where_its_thread_spins() {
         timeout: Some(timeout),
         command_line: Vec::new(),
         sd_card: None,
+        romfs: None,
     };
     let vcpu = ScriptedVcpu::new().then_spin();
     let interrupters = Interrupters::default();

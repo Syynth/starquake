@@ -29,6 +29,8 @@ use super::command::file::{GET_SIZE, READ};
 use super::command::file_system::OPEN_FILE;
 use super::command::fsp_srv::{OPEN_SD_CARD_FILE_SYSTEM, SET_CURRENT_PROCESS};
 
+mod storage;
+
 /// `IFile::Write`, which this subset leaves out, so it has no shipping constant
 /// (`eden/src/core/hle/service/filesystem/fsp/fs_i_file.cpp`: `{1, D<&IFile::Write>, "Write"}`).
 const WRITE: u32 = 1;
@@ -80,9 +82,12 @@ impl Asked {
     }
 }
 
-/// The host behind the environment: an SD card in memory, answering the host file protocol.
+/// The host behind the environment: an SD card and a data storage in memory, answering the host
+/// file protocol.
 struct FakeHost {
     card: Option<BTreeMap<Vec<u8>, Entry>>,
+    /// The data storage (`storage.rs`); `None`: the run has no `RomFS`.
+    storage: Option<Vec<u8>>,
     mischief: Mischief,
     /// What the environment returns, in place of the card's answer, for every request of a kind.
     forced: Option<(Asked, Result<HostIoReply, EnvError>)>,
@@ -102,6 +107,7 @@ impl FakeEnv {
         });
         Arc::new(Self(Mutex::new(FakeHost {
             card,
+            storage: None,
             mischief: Mischief::None,
             forced: None,
             asked: Vec::new(),
@@ -119,6 +125,9 @@ impl FakeEnv {
 
 impl FakeHost {
     fn answer(&mut self, request: &HostRequest) -> HostIoReply {
+        if storage::is_storage(request) {
+            return self.answer_storage(request);
+        }
         let Some(card) = &self.card else {
             return HostFailure::NoDevice.reply();
         };

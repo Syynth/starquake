@@ -38,6 +38,7 @@ mod support {
             timeout: Some(GENEROUS),
             command_line: Vec::new(),
             sd_card: None,
+            romfs: None,
         }))
     }
 

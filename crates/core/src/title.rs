@@ -1,27 +1,42 @@
 //! A NUP title as a program to run: the narrow title API that `starquake run <title.nup>` uses,
 //! so a frontend opens a title through this crate instead of driving the loader itself.
 //!
-//! [`System::from_nup`] opens a NUP container from any `Read + Seek` source, chooses the title's
-//! ExeFS, reads `main.npdm` and the modules from it, and loads them as [`System::from_exefs`]
-//! does: the process its `main.npdm` describes, with the module set placed in the loader's
+//! [`open`] opens a NUP container from a positional source (`starquake_loader::read_at::ReadAt`:
+//! a host file, or bytes in memory), chooses the package the title runs, reads `main.npdm` and
+//! the modules from its ExeFS, and loads them as [`System::from_exefs`] does: the process its
+//! `main.npdm` describes, with the module set placed in the loader's
 //! `starquake_loader::exefs::MODULE_NAMES` order (`rtld`, `main`, `subsdk0` to `subsdk9`,
-//! `sdk`). [`is_nup`] tells a frontend whether a file's first bytes are a NUP container's.
+//! `sdk`). It also makes that same package's RomFS the run's data storage ([`RomFs`], which a
+//! run is given in `RunOptions::romfs`), served to `fsp-srv`'s `OpenDataStorageByCurrentProcess`
+//! through the environment (`crate::hle::FspHost`). [`System::from_nup`] loads the program alone,
+//! from any `Read + Seek` source. [`is_nup`] tells a frontend whether a file's first bytes are a
+//! NUP container's.
 //!
-//! # Which ExeFS
+//! # Which package
 //!
-//! The ExeFS is the one `starquake inspect` shows, because both take it from the loader's
-//! `Nup::title`: the newest update's ExeFS as a whole when that update has one, the base's
-//! otherwise (the loader's `nup::title` module docs, which cite Eden's
-//! `PatchManager::PatchExeFS`, and list the guess in "newest"). A title with no ExeFS in either
-//! is [`TitleError::NoExeFs`], as Eden's `AppLoader_NCA::Load` returns `ErrorNoExeFS` when
-//! neither the program nor its update has one (`eden/src/core/loader/nca.cpp` @ cf654052, path
-//! relative to the reference folder).
+//! The loader's `Nup::newest_package` (decision log, 2026-11-16, "M2 runs a title's newest
+//! package, whole"): the newest update when the container has one, the base otherwise, with that
+//! one package's ExeFS and RomFS; base and update are never mixed. A newest update that lacks a
+//! part its base has (an ExeFS, or a RomFS) is a patch that needs its base, and is
+//! [`TitleError::Container`] with the loader's `NupError::IncompleteUpdate`, in plain words. The
+//! loader's `nup::title` module docs list the guesses this rests on ("newest", and what makes an
+//! update not complete). `starquake inspect` shows the loader's `Nup::title`, which agrees except
+//! for an update with no ExeFS: inspect shows the base's, and a run refuses it.
+//!
+//! A package with no ExeFS is [`TitleError::NoExeFs`], as Eden's `AppLoader_NCA::Load` returns
+//! `ErrorNoExeFS` when neither the program nor its update has one
+//! (`eden/src/core/loader/nca.cpp` @ cf654052, path relative to the reference folder). A package
+//! with no RomFS runs with no data storage: `OpenDataStorageByCurrentProcess` then fails as
+//! Eden's does (`starquake_services::fsp`, "No data storage").
 //!
 //! # What is read
 //!
 //! Only the container's table of contents (`Nup::open`), `main.npdm` and the ExeFS files named
-//! in `MODULE_NAMES` are read from the source. Other ExeFS files and the RomFS are not, so a
-//! title of tens of gigabytes is never loaded whole. Each file is read whole and checked
+//! in `MODULE_NAMES` are read from the source while loading. Other ExeFS files and the RomFS are
+//! not, so a title of tens of gigabytes is never loaded whole: the RomFS's image is laid out from
+//! the table of contents, and its files are read when the guest reads them (the loader's
+//! `nup::storage`, which keeps compressed files decompressed in a cache capped at
+//! `starquake_loader::nup::storage::CACHE_CAP`). Each file is read whole and checked
 //! against its size and SHA-256 by the loader's reader. The reads are bounded, so a corrupt
 //! size cannot make a run allocate more: at most [`NPDM_READ_LIMIT`] bytes of `main.npdm`, and
 //! at most [`EXEFS_READ_LIMIT`] bytes for `main.npdm` and the modules together. Both are
@@ -30,16 +45,14 @@
 //! [`EXEFS_READ_LIMIT`] budget after the files read before it; `main.npdm` is the exception,
 //! read first with the smaller of [`NPDM_READ_LIMIT`] and the whole budget as its limit.
 //!
-//! The RomFS is not served yet: a title that opens its RomFS gets the file-system service's
-//! current answer.
-//!
 //! # Order of checks
 //!
 //! The first failure is the error:
 //!
-//! 1. The container opens (`Nup::open`) and has a title (`Nup::title`: a program package, and
-//!    no two updates sharing the newest version): [`TitleError::Container`].
-//! 2. The title has an ExeFS: [`TitleError::NoExeFs`].
+//! 1. The container opens (`Nup::open`) and has a package to run (`Nup::newest_package`: a
+//!    program package, no two updates sharing the newest version, and a newest update that
+//!    needs nothing of its base): [`TitleError::Container`].
+//! 2. The package has an ExeFS: [`TitleError::NoExeFs`].
 //! 3. The ExeFS has a `main.npdm`: [`TitleError::ExeFs`] with `ExeFsError::MissingNpdm`, before
 //!    any file is read.
 //! 4. `main.npdm`, then each module present in `MODULE_NAMES` order, is read within its limit:
@@ -47,12 +60,17 @@
 //! 5. The loader parses the files (`ExeFs::parse`, whose docs give its own order: the metadata,
 //!    `main` missing, then each module): [`TitleError::ExeFs`].
 //! 6. The program loads as [`System::from_exefs`] loads it: [`TitleError::Load`].
+//! 7. For [`open`], the package's RomFS, if it has one, is laid out as an image:
+//!    [`TitleError::RomFs`].
 
-use std::io::{Read, Seek};
+use std::io::{self, Read, Seek};
+use std::sync::Arc;
 
 use starquake_loader::exefs::{ExeFs, ExeFsError, MODULE_NAMES, NPDM_FILE};
 use starquake_loader::nup::layout::MAGIC;
-use starquake_loader::nup::{FileId, Nup, NupError};
+use starquake_loader::nup::storage::{CACHE_CAP, RomFsStorage, StorageError};
+use starquake_loader::nup::{DirId, FileId, Node, Nup, NupError, Whole};
+use starquake_loader::read_at::{Positional, ReadAt};
 
 use crate::system::{Error, System};
 
@@ -102,6 +120,92 @@ pub enum TitleError {
     /// The program could not be loaded.
     #[error(transparent)]
     Load(#[from] Error),
+    /// The RomFS could not be laid out as the image the title reads.
+    #[error("the title's RomFS could not be served: {0}")]
+    RomFs(#[from] StorageError),
+}
+
+/// A title's RomFS, served as the `RomFS` image its file-system library reads: the run's data
+/// storage. Cloning it shares the one image, its source and its cache; two are equal when they
+/// are the same one.
+#[derive(Clone)]
+pub struct RomFs {
+    image: Arc<dyn ReadAt>,
+    size: u64,
+}
+
+impl RomFs {
+    /// The `RomFS` that `storage` serves.
+    pub fn new<S: ReadAt + 'static>(storage: RomFsStorage<S>) -> Self {
+        let size = storage.size();
+        Self {
+            image: Arc::new(storage),
+            size,
+        }
+    }
+
+    /// The image's size in bytes.
+    #[must_use]
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// Reads up to `buf.len()` bytes of the image from `offset`: fewer only at its end, none at
+    /// or past it. A failure carries the loader's `StorageError` in plain words.
+    pub fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+        self.image.read_at(offset, buf)
+    }
+}
+
+impl std::fmt::Debug for RomFs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RomFs")
+            .field("size", &self.size)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for RomFs {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.image, &other.image)
+    }
+}
+
+impl Eq for RomFs {}
+
+/// A NUP title opened to run ([`open`]): its program, and its RomFS when it has one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Title {
+    /// The program the title's package holds.
+    pub system: System,
+    /// The same package's RomFS: the run's data storage (`RunOptions::romfs`).
+    pub romfs: Option<RomFs>,
+}
+
+/// Opens the NUP title in `source` to run: its program, loaded as [`System::from_nup`] loads it,
+/// and its RomFS, served from `source` as the guest reads it. See the module docs for what is
+/// read and in which order it is checked.
+///
+/// # Errors
+///
+/// A [`TitleError`] saying which check failed.
+pub fn open<S: ReadAt + 'static>(source: S) -> Result<Title, TitleError> {
+    open_with(source, READ_LIMITS, CACHE_CAP)
+}
+
+/// [`open`] with `limits` and a decompression cache of `cache_cap` bytes.
+fn open_with<S: ReadAt + 'static>(
+    source: S,
+    limits: ReadLimits,
+    cache_cap: u64,
+) -> Result<Title, TitleError> {
+    let (mut nup, whole) = container(Positional::new(source))?;
+    let system = load_program(&mut nup, whole.exefs, limits)?;
+    let romfs = match whole.romfs {
+        Some(dir) => Some(RomFs::new(RomFsStorage::new(nup, dir, cache_cap)?)),
+        None => None,
+    };
+    Ok(Title { system, romfs })
 }
 
 /// The read limits of a title's run.
@@ -135,19 +239,40 @@ impl System {
 
 /// [`System::from_nup`] with `limits`.
 fn load<S: Read + Seek>(source: S, limits: ReadLimits) -> Result<System, TitleError> {
-    let mut nup = Nup::open(source).map_err(TitleError::Container)?;
-    let title = nup.title().map_err(TitleError::Container)?;
-    if title.exefs.is_none() {
-        return Err(TitleError::NoExeFs);
+    let (mut nup, whole) = container(source)?;
+    load_program(&mut nup, whole.exefs, limits)
+}
+
+/// The container in `source`, opened, and the package it runs (module docs, check 1).
+fn container<S: Read + Seek>(source: S) -> Result<(Nup<S>, Whole), TitleError> {
+    let nup = Nup::open(source).map_err(TitleError::Container)?;
+    let whole = nup.newest_package().map_err(TitleError::Container)?;
+    Ok((nup, whole))
+}
+
+/// The file of the ExeFS `exefs` called `name`.
+fn exefs_file<S>(nup: &Nup<S>, exefs: DirId, name: &str) -> Option<FileId> {
+    match nup.lookup(exefs, name.as_bytes())? {
+        Node::File(file) => Some(file),
+        Node::Dir(_) => None,
     }
-    let Some(npdm) = title.exefs_file(&nup, NPDM_FILE) else {
+}
+
+/// Loads the program in the ExeFS `exefs` of `nup` (module docs, checks 2 to 6).
+fn load_program<S: Read + Seek>(
+    nup: &mut Nup<S>,
+    exefs: Option<DirId>,
+    limits: ReadLimits,
+) -> Result<System, TitleError> {
+    let exefs = exefs.ok_or(TitleError::NoExeFs)?;
+    let Some(npdm) = exefs_file(nup, exefs, NPDM_FILE) else {
         return Err(ExeFsError::MissingNpdm.into());
     };
     let mut wanted: Vec<(&'static str, FileId)> = vec![(NPDM_FILE, npdm)];
     wanted.extend(
         MODULE_NAMES
             .into_iter()
-            .filter_map(|name| Some((name, title.exefs_file(&nup, name)?))),
+            .filter_map(|name| Some((name, exefs_file(nup, exefs, name)?))),
     );
 
     let mut budget = limits.exefs;
