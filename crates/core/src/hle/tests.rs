@@ -219,8 +219,10 @@ fn every_service_has_its_name_and_no_other_number_has_one() {
     assert_eq!(service_name(FSP_SRV), Some("fsp-srv"));
     assert_eq!(service_name(APM), Some("apm"));
     assert_eq!(service_name(APPLET_OE), Some("appletOE"));
+    assert_eq!(service_name(HID), Some("hid"));
+    assert_eq!(service_name(TIME_U), Some("time:u"));
     assert_eq!(service_name(ServiceId(0)), None);
-    assert_eq!(service_name(ServiceId(6)), None);
+    assert_eq!(service_name(ServiceId(8)), None);
 }
 
 #[test]
@@ -595,4 +597,69 @@ fn applet_oe_serves_the_start_up_with_real_events() {
             "{name}"
         );
     }
+}
+
+/// `hid` as libnx starts it (`_hidInitialize`): `CreateAppletResource` hands out a session, and
+/// its `GetSharedMemoryHandle` a copied handle to a shared memory.
+#[test]
+fn hid_hands_out_an_applet_resource_and_its_shared_memory() {
+    let rig = Rig::new();
+    let hid_session = rig.service(hid::NAME);
+    let create = command(&hid::IHidServer, "create_applet_resource");
+    let request = libnx(create).send_pid(0).data(&0_u64.to_le_bytes());
+    let (code, buffer) = rig.send(hid_session, &request);
+    let (word, _, moved) = reply(&buffer, 0);
+    assert_eq!((code, word, moved.len()), (ResultCode::SUCCESS, 0, 1));
+    let resource = Handle::from_raw(moved[0]);
+    let get = command(&hid::IAppletResource::default(), "get_shared_memory_handle");
+    let (code, buffer) = rig.send(resource, &libnx(get));
+    let message = Message::parse_reply_sized(&buffer, SessionKind::Session, 0).unwrap();
+    assert_eq!((code, message.copy_handles.len()), (ResultCode::SUCCESS, 1));
+    let ipc = rig.ipc();
+    assert_eq!(ipc[ipc.len() - 2..], [(HID, create), (HID, get)]);
+}
+
+/// `time:u` as libnx starts it (`_timeInitialize`, then `__libnx_init_time`'s
+/// `timeToCalendarTimeWithMyRule`): five interfaces, the shared memory, and a calendar time under
+/// UTC.
+#[test]
+fn time_u_hands_out_its_clocks_its_shared_memory_and_a_calendar_time() {
+    let rig = Rig::new();
+    let time_session = rig.service(time::NAME);
+    let mut zone = None;
+    for name in [
+        "get_standard_user_system_clock",
+        "get_standard_network_system_clock",
+        "get_standard_steady_clock",
+        "get_time_zone_service",
+        "get_standard_local_system_clock",
+    ] {
+        let request = libnx(command(&time::IStaticService, name));
+        let (code, buffer) = rig.send(time_session, &request);
+        let (word, _, moved) = reply(&buffer, 0);
+        assert_eq!(
+            (code, word, moved.len()),
+            (ResultCode::SUCCESS, 0, 1),
+            "{name}"
+        );
+        if name == "get_time_zone_service" {
+            zone = Some(Handle::from_raw(moved[0]));
+        }
+    }
+    let get = command(&time::IStaticService, "get_shared_memory_native_handle");
+    let (code, buffer) = rig.send(time_session, &libnx(get));
+    let message = Message::parse_reply_sized(&buffer, SessionKind::Session, 0).unwrap();
+    assert_eq!((code, message.copy_handles.len()), (ResultCode::SUCCESS, 1));
+
+    let to_calendar = command(&time::ITimeZoneService, "to_calendar_time_with_my_rule");
+    let start = TimeSettings::eden_default().rtc_at_boot;
+    let request = libnx(to_calendar).data(&start.to_le_bytes());
+    let (code, buffer) = rig.send(zone.unwrap(), &request);
+    let (word, data, _) = reply(&buffer, time::calendar::REPLY_SIZE);
+    assert_eq!((code, word), (ResultCode::SUCCESS, 0));
+    // 2023-01-01T00:00:00, a Sunday, the first day of the year, in `UTC`.
+    assert_eq!(data[..8], [0xE7, 0x07, 1, 1, 0, 0, 0, 0]);
+    assert_eq!(data[8..16], [0; 8]);
+    assert_eq!(data[16..24], time::calendar::UTC_NAME);
+    assert_eq!(rig.ipc().last(), Some(&(TIME_U, to_calendar)));
 }
