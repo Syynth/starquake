@@ -19,8 +19,8 @@ use super::kernel::{CODE, PAGES, SHARED, SIZE, World, raw};
 use super::*;
 use crate::system::host::ONE_VM;
 
-/// The test program: loads the word at `x1` into `x0`, stores `x2` eight bytes past it, and
-/// makes a system call. Five words, so it fits one page.
+/// The test program: loads the doubleword at `x1` into `x0`, stores `x2` eight bytes past
+/// it, and makes a system call: three instructions, well inside one page.
 fn program() -> Vec<u8> {
     a64::to_bytes(&[
         a64::ldr(0, 1, 0).unwrap(),
@@ -112,19 +112,23 @@ fn guest_code_reaches_shared_memory_as_mapped_and_not_after_it_is_unmapped() {
     let second = 0x99aa_bbcc_ddee_ff00_u64;
     assert_eq!(run(&mut vcpu, SHARED + PAGE_SIZE, second), Exit::Svc(0));
     assert_eq!(vcpu.regs().unwrap().x[0], first);
-    let mut word = [0; 8];
-    writable.pages.read(PAGE_SIZE + 8, &mut word).unwrap();
-    assert_eq!(u64::from_le_bytes(word), second);
+    let mut bytes = [0; 8];
+    writable.pages.read(PAGE_SIZE + 8, &mut bytes).unwrap();
+    assert_eq!(u64::from_le_bytes(bytes), second);
 
     // Read-only: the load works, the store is a permission fault and writes nothing.
     let exit = run(&mut vcpu, read_only_at, second);
     assert_eq!(vcpu.regs().unwrap().x[0], first);
-    let Some((address, true, Some(FaultStatus::Permission { .. }))) = abort(exit) else {
-        panic!("a store to read-only shared memory ended as {exit:?}");
-    };
-    assert_eq!(address, read_only_at + 8);
-    read_only.pages.read(8, &mut word).unwrap();
-    assert_eq!(word, [0; 8]);
+    assert!(
+        matches!(
+            abort(exit),
+            Some((address, true, Some(FaultStatus::Permission { .. })))
+                if address == read_only_at + 8
+        ),
+        "a store to read-only shared memory ended as {exit:?}"
+    );
+    read_only.pages.read(8, &mut bytes).unwrap();
+    assert_eq!(bytes, [0; 8]);
 
     // Unmapped, and its flush run: the load is a translation fault, and the pages keep what
     // they hold.
@@ -132,12 +136,16 @@ fn guest_code_reaches_shared_memory_as_mapped_and_not_after_it_is_unmapped() {
     vcpu.flush_pending(world.space.tables(), FIRST_ASID)
         .unwrap();
     let exit = run(&mut vcpu, SHARED + PAGE_SIZE, 0);
-    let Some((address, false, Some(FaultStatus::Translation { .. }))) = abort(exit) else {
-        panic!("a load from unmapped shared memory ended as {exit:?}");
-    };
-    assert_eq!(address, SHARED + PAGE_SIZE);
-    writable.pages.read(PAGE_SIZE + 8, &mut word).unwrap();
-    assert_eq!(u64::from_le_bytes(word), second);
+    assert!(
+        matches!(
+            abort(exit),
+            Some((address, false, Some(FaultStatus::Translation { .. })))
+                if address == SHARED + PAGE_SIZE
+        ),
+        "a load from unmapped shared memory ended as {exit:?}"
+    );
+    writable.pages.read(PAGE_SIZE + 8, &mut bytes).unwrap();
+    assert_eq!(u64::from_le_bytes(bytes), second);
 
     // Mapped again elsewhere, the guest sees the same bytes.
     let again = SHARED + 2 * SIZE;
