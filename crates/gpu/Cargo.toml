@@ -10,6 +10,11 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Exports `memory::TestGpuMemory`, a `GpuMemory` over a page table of guest memory, for other
+# crates' tests (`docs/specs/testing.md`, "Shared test support").
+test-support = []
+
 [dependencies]
 starquake-memory.workspace = true
 starquake-shader.workspace = true
