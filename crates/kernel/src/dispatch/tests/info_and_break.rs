@@ -128,6 +128,22 @@ fn a_first_ask_that_the_checks_refuse_still_draws_the_entropy() {
 }
 
 #[test]
+fn a_process_with_no_scheduler_row_draws_nothing_and_is_refused_by_the_call() {
+    // `draw_entropy` leaves a process with no row to the call itself, which reports the
+    // guest's checks first: here the handle is not the invalid handle. No random number is
+    // drawn, so a replay holding only the dispatch's clock reading is used up exactly.
+    let mut tables = tables();
+    tables.scheduler = Scheduler::default();
+    let dispatcher = Dispatcher::new(tables);
+    let env = ReplayEnv::new(vec![clock(0)]);
+    assert_eq!(
+        ask_entropy(&dispatcher, &env, Handle::CURRENT_PROCESS, 0),
+        [word(KernelError::InvalidHandle), 0]
+    );
+    assert_eq!(env.finish(), Ok(()));
+}
+
+#[test]
 fn other_ids_draw_nothing() {
     // Each id, with the arguments it accepts, reads only the clock. DebuggerAttached's value
     // is zero; the memory id's comes from the address space.
