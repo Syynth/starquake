@@ -123,7 +123,9 @@
 //!   (`svc::shared_memory`), since no `Shared` state can be reprotected.
 //! - **The device-share locks' states.** [`AddressSpace::lock_device_share`] takes a lock only
 //!   on blocks with `CanAlignedDeviceMap | ReferenceCounted`, every state with those has
-//!   `CanDeviceMap` too (what [`AddressSpace::unlock_device_share`] tests), and the only state
+//!   `CanDeviceMap` too (what [`AddressSpace::unlock_device_share`] tests; so check 7's test
+//!   of `CanDeviceMap` refuses no block the other two pass, and is there in case a state is
+//!   added: `every_state_a_lock_can_be_taken_on_can_be_unlocked`), and the only state
 //!   change a device-shared block can go through here, `SetProcessMemoryPermission`'s `Code` to
 //!   `CodeData` (or `AliasCode` to `AliasCodeData`), keeps all three.
 //! - **The device counts.** A lock raises the use count of every block of its range and the

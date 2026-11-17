@@ -2194,6 +2194,55 @@ fn a_lock_over_a_block_whose_state_cannot_be_device_mapped_is_refused() {
 }
 
 #[test]
+fn a_lock_over_memory_that_cannot_be_device_mapped_aligned_is_refused() {
+    // The first alias page, locked once, made IPC memory without the device flag: device
+    // mappable and reference counted, but not aligned (what `lock_device_share` tests). It is
+    // no longer mapped physical memory, so the counts follow.
+    let rich = rich();
+    let state = MemoryState::NonDeviceIpc;
+    assert_ne!(state.word() & flag::CAN_DEVICE_MAP, 0);
+    assert_ne!(state.word() & flag::REFERENCE_COUNTED, 0);
+    assert_eq!(state.word() & flag::CAN_ALIGNED_DEVICE_MAP, 0);
+    let mut case = Case::new(&rich);
+    let block = at(&case.body, rich.alias);
+    assert_eq!(case.body.blocks[block].pages, 1);
+    case.body.blocks[block].state = state.word();
+    case.body.mapped_physical_memory_size -= PAGE_SIZE;
+    case.body.reserved -= PAGE_SIZE;
+    let index = case
+        .body
+        .locks
+        .iter()
+        .position(|lock| (lock.address, lock.size) == (rich.alias, PAGE_SIZE))
+        .unwrap();
+    assert_eq!(
+        case.error(),
+        SnapshotError::Lock {
+            index,
+            fault: LockFault::State
+        }
+    );
+}
+
+#[test]
+fn every_state_a_lock_can_be_taken_on_can_be_unlocked() {
+    // Module docs, "The device-share locks' states": the unlock's flag adds nothing to the
+    // lock's for the states there are, so check 7's test of it cannot be told apart from
+    // the lock's alone by any block. This pins that it stays so.
+    for &state in MemoryState::ALL {
+        let word = state.word();
+        if word & DEVICE_SHARE_LOCK_STATE == DEVICE_SHARE_LOCK_STATE {
+            assert_eq!(
+                word & DEVICE_SHARE_UNLOCK_STATE,
+                DEVICE_SHARE_UNLOCK_STATE,
+                "{}",
+                state.name()
+            );
+        }
+    }
+}
+
+#[test]
 fn a_lock_over_a_block_neither_shared_nor_lockable_is_reported_as_not_shared() {
     // The thread-local page as it is (not device shared, a state with no device mapping), and a
     // lock over it: both faults, and the earlier check's is reported.
@@ -2226,6 +2275,8 @@ fn the_lock_state_check_takes_every_block_of_the_range() {
         ([lockable, lockable], None),
         ([lockable, not_lockable], Some(LockFault::State)),
         ([not_lockable, lockable], Some(LockFault::State)),
+        // Device mappable, aligned too, but not reference counted.
+        ([lockable, MemoryState::IoMemory], Some(LockFault::State)),
     ] {
         let mut case = Case::new(&rich);
         let index = at(&case.body, GENERATED);
@@ -2400,4 +2451,26 @@ fn the_new_errors_read_as_plain_words() {
         .to_string(),
         "device-share lock 0 of the address space snapshot covers a block whose memory state cannot be shared with a device"
     );
+}
+
+#[test]
+fn an_unknown_merge_barrier_bit_restores_as_it_is() {
+    // Module docs, "Not checked here": the barriers other than the IPC and device ones are not
+    // checked, so a bit `DisableMerge` does not name (bit 7) restores and is kept.
+    let unknown = 1_u8 << 7;
+    let all_named = (DisableMerge::NORMAL
+        | DisableMerge::DEVICE_LEFT
+        | DisableMerge::IPC_LEFT
+        | DisableMerge::LOCKED
+        | DisableMerge::DEVICE_RIGHT)
+        .bits();
+    assert_eq!(all_named & unknown, 0);
+    let rich = rich();
+    let tls = thread_local(&rich);
+    let mut case = Case::new(&rich);
+    let index = at(&case.body, tls);
+    case.body.blocks[index].disable_merge |= unknown;
+    let restored = case.restore().0.unwrap();
+    let block = restored.query_info(tls).unwrap();
+    assert_eq!(block.disable_merge().bits() & unknown, unknown);
 }
