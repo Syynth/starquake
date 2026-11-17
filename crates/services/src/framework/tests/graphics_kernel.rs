@@ -311,9 +311,15 @@ fn the_fakes_token_names_its_process_and_the_exact_range_and_another_process_s_i
         (token.process(), token.address(), token.size()),
         (kernel.process(), MEMORY, 0x1000)
     );
+    // Another slot, and the fake's own slot in another generation.
     let other = ProcessId::from_parts(token.process().index().wrapping_add(1), 1);
+    let stale = ProcessId::from_parts(
+        token.process().index(),
+        token.process().generation().wrapping_add(1),
+    );
     for refused in [
         device_share_token(other, MEMORY, 0x1000),
+        device_share_token(stale, MEMORY, 0x1000),
         device_share_token(kernel.process(), MEMORY, 0x2000),
         device_share_token(kernel.process(), MEMORY + 0x1000, 0x1000),
     ] {
