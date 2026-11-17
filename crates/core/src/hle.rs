@@ -11,8 +11,9 @@
 //!
 //! The graphics server's root ([`GSV_ROOT`], `docs/specs/graphics-server.md`, "The root") is a
 //! private entry of the registry ([`Registry::register_private`]): `GetService` never hands it
-//! out, and `appletOE`'s `ISelfController` 2000 is given its number, from the registry, to hand
-//! a session on it to the title.
+//! out, and `appletOE`'s `ISelfController` 2000 is given the same number, the constant
+//! [`GSV_ROOT`] that the private entry is registered under, to hand a session on it to the
+//! title.
 //!
 //! The numbers ([`SM`], [`SET_SYS`], [`FSP_SRV`], [`APM`], [`APPLET_OE`], [`HID`], [`TIME_U`],
 //! [`GSV_ROOT`]) are starquake's own:
@@ -135,7 +136,7 @@ pub fn install(dispatcher: &Dispatcher, env: Arc<dyn Env>) -> Result<(), Service
     let performance = apm::server(policy).with_service_id(APM);
     dispatcher.add_server(apm::NAME, APM, None, Box::new(performance))?;
 
-    // `appletOE` hands out sessions on the server the registry's private entry names.
+    // `appletOE` hands out sessions on `GSV_ROOT`, the number the registry's private entry holds.
     let applet = Applet::new(AppletSettings::eden_default()).with_graphics_server(GSV_ROOT);
     let applets = am::oe_server_for(applet, policy).with_service_id(APPLET_OE);
     dispatcher.add_server(am::OE_NAME, APPLET_OE, None, Box::new(applets))?;

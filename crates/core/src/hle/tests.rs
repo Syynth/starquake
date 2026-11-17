@@ -670,6 +670,32 @@ fn applet_oe_hands_out_the_graphics_server_s_root() {
     assert_eq!(ipc.port(&PortName::new(root::ROOT_NAME).unwrap()), None);
 }
 
+/// The graphics server's root is a private entry: `GetService("gsv")` through `sm:` hands out
+/// the service manager's own stub (auto-stub policy), and a request on that session is served
+/// by `sm:`, never by [`GSV_ROOT`].
+#[test]
+fn get_service_never_hands_out_the_graphics_server_s_root() {
+    let rig = Rig::new();
+    let session = rig.service(root::ROOT_NAME);
+    let (code, buffer) = rig.send(
+        session,
+        &libnx(starquake_gsv::protocol::command::INITIALIZE),
+    );
+    assert_eq!(code, ResultCode::SUCCESS);
+    // Auto-stubbed by `sm:`'s server: success, nothing more.
+    let (word, data, moved) = reply(&buffer, 0);
+    assert_eq!((word, data, moved), (0, Vec::new(), Vec::new()));
+    let ipc = rig.ipc();
+    assert_eq!(
+        ipc.last(),
+        Some(&(SM, starquake_gsv::protocol::command::INITIALIZE))
+    );
+    assert!(
+        ipc.iter().all(|(service, _)| *service != GSV_ROOT),
+        "{ipc:?}"
+    );
+}
+
 /// Any applet resource user id the bootstrap names: the root does not check it.
 const PROCESS_ID_WORD: u64 = 0x0000_0051_0000_0001;
 
