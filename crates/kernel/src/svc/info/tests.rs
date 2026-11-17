@@ -310,8 +310,10 @@ fn entropy_count() -> u64 {
 
 #[test]
 fn a_debugger_is_never_attached_whatever_is_passed() {
-    // `case InfoType::DebuggerAttached: *result = 0`: no check of the handle or the sub id, and
-    // no process is needed (the scheduler here has none).
+    // `case InfoType::DebuggerAttached: *result = 0`: Eden checks neither the handle nor the
+    // sub id, and no process is needed (the scheduler here has none). Horizon would refuse a
+    // handle that is not the invalid handle, and then a non-zero sub id; following Eden,
+    // starquake is looser (the module docs list it).
     let (space, _log, _) = loaded();
     let (handles, scheduler) = tables();
     for handle in NOT_ZERO.into_iter().chain([Handle::INVALID]) {

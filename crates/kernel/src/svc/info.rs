@@ -14,8 +14,13 @@
 //!      or a handle to a process), else `ResultInvalidHandle`.
 //!
 //!   Then the value is read from that process's page table, or (ids 6 and 7) from the process.
-//! - **`DebuggerAttached`** (8): no check at all; the value is zero (`*result = 0`). No
-//!   debugger is ever attached here, so that is the fact, not a stub.
+//! - **`DebuggerAttached`** (8): Eden checks neither the handle nor the sub id; the value is
+//!   zero (`*result = 0`). No debugger is ever attached here, so the value is the fact, not a
+//!   stub. Eden, and so starquake, is looser than Horizon here: Horizon checks
+//!   `handle == InvalidHandle`, else `ResultInvalidHandle`, and then `info_subtype == 0`, else
+//!   `ResultInvalidCombination` (fact only,
+//!   `atmosphere/libraries/libmesosphere/source/svc/kern_svc_info.cpp` @ 4e3f3703,
+//!   `InfoType_DebuggerAttached`). Test: `a_debugger_is_never_attached_whatever_is_passed`.
 //! - **`RandomEntropy`** (11):
 //!   1. `handle == 0` (the invalid handle, not a process), else `ResultInvalidHandle`.
 //!   2. `info_sub_id < 4` ([`ENTROPY_COUNT`]), else `ResultInvalidCombination`.
