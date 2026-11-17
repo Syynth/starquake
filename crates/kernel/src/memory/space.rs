@@ -305,6 +305,24 @@ impl Check {
             ignore: MemoryAttribute::COUNTED,
         }
     }
+
+    /// Whether `block`, one of a range whose first block is `first`, passes: the masked tests,
+    /// and with `alike` (`CheckMemoryState`, not `CheckMemoryStateContiguous`) the same state,
+    /// permission and attributes as `first`, `ignore` aside. The test of one block in the
+    /// walk the address space's checks make, and in a snapshot's checks of a `MapMemory`
+    /// alias (`snapshot::alias`).
+    fn admits(&self, first: &MemoryBlock, block: &MemoryBlock, alike: bool) -> bool {
+        // Validate the current block against the first, then against the provided masks.
+        let ignore = self.ignore;
+        let uniform = !alike
+            || block.state() == first.state()
+                && block.permission() == first.permission()
+                && (block.attribute() | ignore) == (first.attribute() | ignore);
+        let passes = block.state().word() & self.state_mask == self.state
+            && block.permission() & self.permission_mask == self.permission
+            && block.attribute() & self.attribute_mask == self.attribute;
+        uniform && passes
+    }
 }
 
 /// What a passed check found: the state and permission every block of the range has.
@@ -718,18 +736,9 @@ impl AddressSpace {
             .ok_or(invalid)?;
         let mut blocks = self.blocks.blocks_from(address);
         let first = blocks.next().ok_or(invalid)?;
-        let ignore = check.ignore;
         let mut block = first;
         loop {
-            // Validate the current block against the first, then against the provided masks.
-            let uniform = !alike
-                || block.state() == first.state()
-                    && block.permission() == first.permission()
-                    && (block.attribute() | ignore) == (first.attribute() | ignore);
-            let passes = block.state().word() & check.state_mask == check.state
-                && block.permission() & check.permission_mask == check.permission
-                && block.attribute() & check.attribute_mask == check.attribute;
-            if !uniform || !passes {
+            if !check.admits(first, block, alike) {
                 return Err(invalid);
             }
             if last <= block.last() {

@@ -3,8 +3,9 @@
 //! mapper, then used. Guest code at EL0 reads the restored mapped physical memory and heap; the
 //! restored kernel maps more physical memory, which guest code reads, queries it, and unmaps
 //! it, after which a load from it is a translation fault (`starquake_kernel::memory`'s
-//! `space::snapshot` module docs, check 9: the restore maps every block that is not free
-//! through the new mapper).
+//! `space::snapshot` module docs, check 10: the restore maps every block that is not free
+//! through the new mapper). A restored pair of `MapMemory` aliases maps its sources' pages:
+//! guest code reads and writes each source through its alias.
 //!
 //! What guest memory holds is not part of the address space's snapshot, so the test writes the
 //! program and the values through the host's view after the restore, as the guest memory part
@@ -121,5 +122,100 @@ fn a_restored_address_space_runs_guest_code_and_maps_queries_and_unmaps() {
     // The heap is still there.
     assert_eq!(run(&mut vcpu, heap, 0), Exit::Svc(0));
     assert_eq!(vcpu.regs().unwrap().x[0], second);
+    drop(vcpu);
+}
+
+#[test]
+fn restored_aliases_map_their_sources_pages_for_guest_code() {
+    if std::env::var_os("CI").is_some() {
+        return;
+    }
+    // The original, over plain memory: two `MapMemory` aliases near the stack region's top,
+    // heap page 0 at stack page 0 and heap pages 2-3 at stack pages 4-5.
+    let mut original = World::over(space());
+    let kernel = &mut original.kernel;
+    kernel
+        .set_process_memory_permission(CODE, PAGE_SIZE, SvcPermission::ReadExecute)
+        .unwrap();
+    kernel.create_main_thread_stack(PAGE_SIZE).unwrap();
+    let heap = kernel.set_heap_size(4 * PAGE_SIZE).unwrap();
+    let stack = kernel.regions().stack.end - 16 * PAGE_SIZE;
+    let (first_alias, first_source) = (stack, heap);
+    let (second_alias, second_source) = (stack + 4 * PAGE_SIZE, heap + 2 * PAGE_SIZE);
+    kernel
+        .map_memory(first_alias, first_source, PAGE_SIZE)
+        .unwrap();
+    kernel
+        .map_memory(second_alias, second_source, 2 * PAGE_SIZE)
+        .unwrap();
+    let bytes = kernel.save().unwrap();
+
+    // The restore, over the VM's memory.
+    let _one_vm = ONE_VM.lock().unwrap_or_else(PoisonError::into_inner);
+    let backend = HvfBackend::new(RamConfig::default()).expect("create the VM");
+    let space = Arc::new(
+        AddressSpace::<PhysicalMemory>::new(
+            backend.physical(),
+            backend.ram(),
+            backend.table_pool(),
+        )
+        .unwrap(),
+    );
+    let mapper = Box::new(SpaceMapper(Arc::clone(&space)));
+    let mut kernel = KernelSpace::restore(&bytes, mapper, |_| None).unwrap();
+    space.write(CODE, &program()).unwrap();
+    // What each source holds, written through the host's view: the second alias's is in its
+    // second page.
+    let first = 0x0bad_cafe_f00d_d00d_u64;
+    let second = 0x1357_9bdf_2468_ace0_u64;
+    space.write(first_source, &first.to_le_bytes()).unwrap();
+    space
+        .write(second_source + PAGE_SIZE, &second.to_le_bytes())
+        .unwrap();
+
+    // Declared after the backend, so it is dropped first, as the VM requires.
+    let mut vcpu = backend.create_vcpu().unwrap();
+    vcpu.set_address_space(space.root(), FIRST_ASID).unwrap();
+    vcpu.set_pac_keys(&PacKeys::default()).unwrap();
+    vcpu.flush_pending(space.tables(), FIRST_ASID).unwrap();
+
+    // Guest code reads each source through its alias, and its write through the alias reaches
+    // the source.
+    assert_eq!(run(&mut vcpu, first_alias, 0x5a), Exit::Svc(0));
+    assert_eq!(vcpu.regs().unwrap().x[0], first);
+    assert_eq!(read_u64(&space, first_source + 8), 0x5a);
+    let second_page = second_alias + PAGE_SIZE;
+    assert_eq!(run(&mut vcpu, second_page, 0xa5), Exit::Svc(0));
+    assert_eq!(vcpu.regs().unwrap().x[0], second);
+    assert_eq!(read_u64(&space, second_source + PAGE_SIZE + 8), 0xa5);
+
+    // The source is not the guest's while it is aliased.
+    let exit = run(&mut vcpu, first_source, 0);
+    assert!(
+        matches!(exit, Exit::DataAbort { address, write: false, .. } if address == first_source),
+        "a load from an aliased source ended as {exit:?}"
+    );
+
+    // The restored kernel unmaps the second alias: its source is the guest's again and holds
+    // what was written through the alias, and the alias is gone.
+    kernel
+        .unmap_memory(second_alias, second_source, 2 * PAGE_SIZE)
+        .unwrap();
+    vcpu.flush_pending(space.tables(), FIRST_ASID).unwrap();
+    assert_eq!(run(&mut vcpu, second_source + PAGE_SIZE, 0), Exit::Svc(0));
+    assert_eq!(vcpu.regs().unwrap().x[0], second);
+    let exit = run(&mut vcpu, second_page, 0);
+    assert!(
+        matches!(
+            exit,
+            Exit::DataAbort { address, write: false, syndrome }
+                if address == second_page
+                    && matches!(syndrome.fault(), Some(FaultStatus::Translation { .. }))
+        ),
+        "a load from an unmapped alias ended as {exit:?}"
+    );
+    // The first alias still reaches its source.
+    assert_eq!(run(&mut vcpu, first_alias, 0), Exit::Svc(0));
+    assert_eq!(vcpu.regs().unwrap().x[0], first);
     drop(vcpu);
 }
