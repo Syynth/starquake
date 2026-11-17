@@ -2,14 +2,17 @@
 //! does, run natively under the hypervisor backend: it must find its own module and no other,
 //! even though its counter read was patched and its counter trampolines are mapped below it.
 //!
-//! The walker's rule is Atmosphère's (`stratosphere/dmnt.gen2/source/dmnt2_debug_process.cpp`,
-//! `DebugProcess::CollectModules` @ 4e3f3703, fact only): start at address 0, take every block
-//! whose state is `Code` or `AliasCode` and whose permission is read-execute for a module, move
-//! to the end of
-//! each block, and stop at the inaccessible block above the address space. A module walker
-//! then reads the word at the module's offset 4 as the offset of its `MOD0` header; this one
-//! does too, and checks that the header is the program's own. That a title's `rtld` walks with
-//! the same rule is a guess (`crates/core/src/image.rs`, "Permissions").
+//! The walker's rule is the one Atmosphère's debugger uses
+//! (`stratosphere/dmnt.gen2/source/dmnt2_debug_process.cpp`, `DebugProcess::CollectModules`
+//! @ 4e3f3703, fact only): start at address 0, take every block whose state is `Code` or
+//! `AliasCode` and whose permission is read-execute for a module, move to the end of each
+//! block, and stop at the inaccessible block above the address space. This walker then reads
+//! the word at each module's offset 4 as the offset of its `MOD0` header (Eden's
+//! `ModuleHeaderLocation::header_offset`, `eden/src/core/arm/symbols.cpp`) and checks that the
+//! header is the program's own. `CollectModules` does not read `MOD0`. Guesses, inferred from
+//! the fault in #203 and not from any source here: that a title's start-up (its `rtld`) walks
+//! with this rule, and that it reads offset 4 of every block it takes; reading `rtld`'s module
+//! walk would confirm both (`crates/core/src/image.rs`, "Permissions").
 //!
 //! These need a Mac with Apple Silicon. They skip themselves only when the `CI` environment
 //! variable is set (hosted runners can't create VMs); anywhere else, failing to create a VM

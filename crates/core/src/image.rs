@@ -134,12 +134,18 @@
 //!
 //!   They are mapped in the state [`TRAMPOLINE_STATE`], `GeneratedCode`, not `Code`, and
 //!   `QueryMemory` reports that state for them (`Svc::MemoryState::GeneratedCode`, 0x14,
-//!   `eden/src/core/hle/kernel/svc_types.h`). A program's start-up walks its address space for
-//!   modules: from address 0, `QueryMemory` about each block in turn, taking every block whose
-//!   state is `Code` (or `AliasCode`) and whose permission is read-execute for a module and
-//!   reading the word at
-//!   its offset 4 as the offset of its `MOD0` header. Mapped as `Code`, the trampolines were
-//!   taken for a module whose `MOD0` offset is an instruction. `GeneratedCode` is the state
+//!   `eden/src/core/hle/kernel/svc_types.h`). Atmosphère's debugger walks a process's address
+//!   space for modules (source below): from address 0, `QueryMemory` about each block in turn,
+//!   taking every block whose state is `Code` (or `AliasCode`) and whose permission is
+//!   read-execute for a module. Neither walker cited below reads `MOD0` (`CollectModules`
+//!   reads the module's path after the block; `QueryModule` searches for the segment's head
+//!   and tail). The word at a module's offset 4 is the offset of its `MOD0` header (Eden's
+//!   `ModuleHeaderLocation::header_offset`, `eden/src/core/arm/symbols.cpp`). Guess, inferred
+//!   from the fault in #203 and not from any source here: a program's start-up walks its
+//!   address space with that rule and reads that word of every block it takes, so that, mapped
+//!   as `Code`, the trampolines were taken for a module whose `MOD0` offset is an instruction.
+//!   Reading `rtld`'s module walk, or tracing a retail title's start-up on the reference
+//!   emulator up to that read, would confirm it. `GeneratedCode` is the state
 //!   Horizon gives a process's own executable code that no loader placed: JIT code, mapped
 //!   read-execute in its owner by `ControlCodeMemory`'s `MapToOwner`
 //!   (`eden/src/core/hle/kernel/k_code_memory.cpp`, `KCodeMemory::MapToOwner`:
@@ -149,9 +155,8 @@
 //!   states' regions; starquake's kernel gives both the code region), so the pages stay where
 //!   they were. The walk's rule is Atmosphère's (fact only, @ 4e3f3703):
 //!   `stratosphere/dmnt.gen2/source/dmnt2_debug_process.cpp`, `DebugProcess::CollectModules`,
-//!   takes a block for a module when
-//!   `memory_info.permission == svc::MemoryPermission_ReadExecute && (memory_info.state == svc::MemoryState_Code || memory_info.state == svc::MemoryState_AliasCode)`
-//!   and stops at `svc::MemoryState_Inaccessible`; `libstratosphere`'s
+//!   takes a block for a module when its permission is read-execute and its state is `Code`
+//!   or `AliasCode`, and stops at the first `Inaccessible` block; `libstratosphere`'s
 //!   `ro/impl/ro_ro_exception_info.os.horizon.cpp`, `QueryModule`, has the same two checks.
 //!   Guess, not checked against any source here: a title's `rtld` walks with that rule too,
 //!   so it skips a `GeneratedCode` block. A retail title's `rtld` finishing its walk with
@@ -1498,7 +1503,10 @@ mod tests {
         let read_execute = u32::from(SvcPermission::ReadExecute.bits());
         let mut found = Vec::new();
         let mut address = 0;
-        // Each step moves past one block, so the walk ends within the block map's length.
+        // Each step must move past one block, so the walk ends within the block map's length;
+        // a block that ends at or below the address asked about (a zero-size block, or one
+        // that does not move forward) fails the test instead of spinning, as Atmosphère's
+        // walker stops at `next_address <= address`.
         loop {
             let info = space.query_info(address).unwrap().svc_info();
             if info.state == MemoryState::Inaccessible.svc() {
@@ -1507,7 +1515,15 @@ mod tests {
             if code.contains(&info.state) && info.permission == read_execute {
                 found.push(info.base_address);
             }
-            address = info.base_address + info.size;
+            let next = info
+                .base_address
+                .checked_add(info.size)
+                .expect("a block ends inside the address space");
+            assert!(
+                next > address,
+                "the block at {address:#x} ends at {next:#x}, not past it"
+            );
+            address = next;
         }
     }
 
