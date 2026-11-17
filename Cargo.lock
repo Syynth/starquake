@@ -1127,7 +1127,9 @@ dependencies = [
 name = "starquake-gpu"
 version = "0.0.0"
 dependencies = [
+ "postcard",
  "proptest",
+ "serde",
  "starquake-memory",
  "starquake-render",
  "starquake-shader",
