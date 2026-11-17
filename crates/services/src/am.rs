@@ -160,10 +160,10 @@
 //! `ISelfController` 2000 returns a session to the graphics server's root, which the title then
 //! speaks TIPC on (`docs/specs/graphics-server.md`, "The root"; `eden-nx2/NX2_NOTES.md` row 17,
 //! observed). `am` may not depend on the graphics server's crate, so it is given the number of
-//! the root's server ([`Applet::with_graphics_server`]), which whoever puts the services
-//! together looks up in the service registry's private entry (`crate::sm`, "Private entries"),
-//! and hands out a session on it with [`Reply::copy_service`]. The root's server opens its root
-//! interface for the session.
+//! the root's server ([`Applet::with_graphics_server`]): whoever puts the services together
+//! gives it the same number the service registry's private entry for the root holds
+//! (`crate::sm`, "Private entries"). It hands out a session on it with
+//! [`Reply::copy_service`], and the root's server opens its root interface for the session.
 //!
 //! - **A copied handle.** Both references copy it: Eden PR #4588
 //!   (`eden-pr4588/src/core/hle/service/am/service/self_controller.cpp` @ e5fb3b97,
@@ -173,15 +173,26 @@
 //! - **A new session each time: conflict.** PR keeps the session it made the first time and
 //!   copies a handle to that same session on every later call; NX2 makes a new session on every
 //!   call. NX2's is followed, as the one a title ran on (row 17), by the graphics-server spec's
-//!   house rule (decision 8). The root's state is its server's, which every session shares, so
-//!   the two differ only in how many sessions exist. A trace of a title calling 2000 twice would
-//!   settle it. Pinned by `get_graphics_supervisor_makes_a_new_session_on_every_call`.
+//!   house rule (decision 8). The root's state is its server's, which every session shares.
+//!   Against PR, then, the two differ only in how many sessions exist. Against NX2 they differ
+//!   in the state too: each NX2 session owns its own objects and syncpoint events, so a second
+//!   one starts fresh, where a second session here sees the first one's bootstrap phase and
+//!   204 events (`starquake_gsv::root`, "Where this differs from the references"). A trace of a
+//!   title calling 2000 twice would settle it. Pinned by
+//!   `get_graphics_supervisor_makes_a_new_session_on_every_call`.
 //! - **A run without a graphics server** answers [`UNKNOWN`], starquake's own choice: no
 //!   reference has an `am` without one
 //!   (`get_graphics_supervisor_without_a_graphics_server_is_unknown`).
+//! - **The number is the run's wiring, not the guest's state.** It is saved with the applet,
+//!   but a restore keeps the number the server was built with: a snapshot whose number differs
+//!   (another server, or one where the run has none, or none where it has one) is refused with
+//!   [`SnapshotError::FamilyWiring`], and the server is left as it was
+//!   (`a_snapshot_with_another_graphics_server_is_refused`). Otherwise a snapshot could point
+//!   2000 at any server.
 //!
 //! [`INVALID_CMIF_REQUEST`]: crate::framework::result::INVALID_CMIF_REQUEST
 //! [`Reply::copy_service`]: crate::framework::Reply::copy_service
+//! [`SnapshotError::FamilyWiring`]: crate::framework::SnapshotError::FamilyWiring
 
 use serde::{Deserialize, Serialize};
 use starquake_kernel::id::ObjectId;
@@ -1050,5 +1061,15 @@ pub fn oe_server_for(applet: Applet, policy: UnknownPolicy) -> Server {
     Server::new(OE_NAME, policy)
         .with_root(|| Box::new(IApplicationProxyService))
         .with_interfaces(oe_interfaces())
-        .with_family(applet)
+        .with_checked_family(applet, same_graphics_server)
+}
+
+/// The restore check of the `appletOE` server's applet: a snapshot's graphics server number
+/// is the run's (module docs, "The graphics server").
+fn same_graphics_server(run: &Applet, saved: &Applet) -> Result<(), &'static str> {
+    if run.graphics_server == saved.graphics_server {
+        Ok(())
+    } else {
+        Err("its applet names another graphics server")
+    }
 }

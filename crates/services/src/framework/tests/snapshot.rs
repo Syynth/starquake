@@ -510,6 +510,42 @@ fn family_state_is_restored_only_into_a_server_that_has_some() {
     assert_eq!(wide.family::<Wide>().map(|w| (w.a, w.b)), Some((1, 2)));
 }
 
+/// The check of [`same_a`]: the family's `a` is the run's wiring.
+fn same_a(run: &Wide, saved: &Wide) -> Result<(), &'static str> {
+    if run.a == saved.a {
+        Ok(())
+    } else {
+        Err("another a")
+    }
+}
+
+/// A checked family's check runs before its state loads, given the server's state and the
+/// snapshot's: a refusal is [`SnapshotError::FamilyWiring`] and leaves the server's state as it
+/// was, a pass loads the snapshot's whole state, and a later `with_family` drops the check.
+#[test]
+fn a_checked_family_is_restored_only_when_its_check_passes() {
+    let bare = || Server::new("toy", UnknownPolicy::Strict).with_interfaces(toy_interfaces());
+    let saved = bare().with_family(Wide { a: 1, b: 2 }).save().unwrap();
+    let state = |server: &Server| server.family::<Wide>().map(|w| (w.a, w.b));
+
+    let mut other = bare().with_checked_family(Wide { a: 3, b: 4 }, same_a);
+    assert_eq!(
+        other.restore(&saved),
+        Err(SnapshotError::FamilyWiring("another a"))
+    );
+    assert_eq!(state(&other), Some((3, 4)));
+
+    let mut same = bare().with_checked_family(Wide { a: 1, b: 5 }, same_a);
+    assert_eq!(same.restore(&saved), Ok(()));
+    assert_eq!(state(&same), Some((1, 2)));
+
+    let mut unchecked = bare()
+        .with_checked_family(Wide { a: 3, b: 4 }, same_a)
+        .with_family(Wide { a: 3, b: 4 });
+    assert_eq!(unchecked.restore(&saved), Ok(()));
+    assert_eq!(state(&unchecked), Some((1, 2)));
+}
+
 #[test]
 fn a_snapshot_whose_requests_disagree_is_refused() {
     type Damage = fn(&mut Rig, TokenId);

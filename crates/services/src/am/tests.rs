@@ -16,7 +16,7 @@ use super::*;
 use crate::framework::control::CONVERT_CURRENT_OBJECT_TO_DOMAIN;
 use crate::framework::fake::FakeKernel;
 use crate::framework::result::{INVALID_CMIF_REQUEST, UNKNOWN_COMMAND_ID};
-use crate::framework::{Handled, Kernel, Protocol, Session};
+use crate::framework::{Handled, Kernel, Protocol, Session, SnapshotError};
 
 use super::command::application_functions::NOTIFY_RUNNING;
 use super::command::common_state_getter::{
@@ -1156,15 +1156,25 @@ fn get_graphics_supervisor_without_a_graphics_server_is_unknown() {
     assert_eq!(rig.applet().graphics_server(), None);
 }
 
-/// The graphics server's number is part of the saved applet: a restored server still hands out
-/// sessions on it, from a controller opened before the save.
+/// An `appletOE` server built for a run whose graphics server is `graphics`, if it has one.
+fn oe_server_with(graphics: Option<ServiceId>) -> Server {
+    let applet = Applet::new(AppletSettings::eden_default());
+    let applet = match graphics {
+        Some(graphics) => applet.with_graphics_server(graphics),
+        None => applet,
+    };
+    oe_server_for(applet, UnknownPolicy::Strict)
+}
+
+/// A restored server of the same run still hands out sessions on the graphics server, from a
+/// controller opened before the save.
 #[test]
 fn a_restored_server_still_hands_out_sessions_on_the_graphics_server() {
     let mut rig = Rig::with_graphics();
     let proxy = rig.proxy();
     let controller = rig.open(proxy, GET_SELF_CONTROLLER);
     let saved = rig.server.save().unwrap();
-    let mut restored = oe_server(AppletSettings::eden_default(), UnknownPolicy::Strict);
+    let mut restored = oe_server_with(Some(GRAPHICS));
     restored.restore(&saved).unwrap();
     assert_eq!(
         restored.family::<Applet>().unwrap().graphics_server(),
@@ -1175,4 +1185,49 @@ fn a_restored_server_still_hands_out_sessions_on_the_graphics_server() {
     assert_eq!(reply.result, ResultCode::SUCCESS);
     let session = rig.object_of(reply.copies[0]);
     assert_eq!(rig.kernel.take_connections(), [(GRAPHICS, session)]);
+}
+
+/// The graphics server's number is the run's wiring (module docs, "The graphics server"): a
+/// snapshot whose number is not the restoring server's is refused, whichever side has one, and
+/// the server keeps its own number and nothing of the snapshot.
+#[test]
+fn a_snapshot_with_another_graphics_server_is_refused() {
+    let another = ServiceId(0x101);
+    let cases = [
+        (Some(GRAPHICS), Some(another)),
+        (Some(another), Some(GRAPHICS)),
+        (Some(GRAPHICS), None),
+        (None, Some(GRAPHICS)),
+    ];
+    for (saved_with, run) in cases {
+        let mut saving = oe_server_with(saved_with);
+        let mut kernel = FakeKernel::new(0).unwrap();
+        let session = kernel.new_object();
+        saving.accept(session).unwrap();
+        let saved = saving.save().unwrap();
+
+        let mut restored = oe_server_with(run);
+        let refused = SnapshotError::FamilyWiring("its applet names another graphics server");
+        assert_eq!(
+            restored.restore(&saved),
+            Err(refused.clone()),
+            "{saved_with:?} {run:?}"
+        );
+        assert_eq!(
+            refused.to_string(),
+            "the snapshot does not fit this run: its applet names another graphics server"
+        );
+        assert_eq!(restored.family::<Applet>().unwrap().graphics_server(), run);
+        assert_eq!(restored.session_count(), 0, "{saved_with:?} {run:?}");
+    }
+    // The same number on both sides, or none on both, restores.
+    for graphics in [Some(GRAPHICS), None] {
+        let mut saving = oe_server_with(graphics);
+        let mut kernel = FakeKernel::new(0).unwrap();
+        saving.accept(kernel.new_object()).unwrap();
+        let saved = saving.save().unwrap();
+        let mut restored = oe_server_with(graphics);
+        restored.restore(&saved).unwrap();
+        assert_eq!(restored.session_count(), 1, "{graphics:?}");
+    }
 }
