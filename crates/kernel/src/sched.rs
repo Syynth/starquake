@@ -108,6 +108,7 @@ pub use thread::{
 };
 
 use crate::id::ProcessId;
+use crate::object::ObjectError;
 use crate::result::{KernelError, SvcError};
 use crate::slab::{SlabError, StoredIdStale};
 
@@ -181,6 +182,11 @@ pub enum SchedError {
     /// telling the scheduler, or named the wrong one.
     #[error("the scheduler has no process {0:?}")]
     UnknownProcess(ProcessId),
+    /// The object table refused to make a new process's object. It reaches the guest as
+    /// [`ObjectError::kernel_error`] says (only [`ObjectError::Full`] does, as
+    /// [`KernelError::OutOfResource`]), the same result `From<ObjectError> for SvcError` gives.
+    #[error(transparent)]
+    Object(#[from] ObjectError),
 }
 
 impl SchedError {
@@ -198,6 +204,7 @@ impl SchedError {
             | Self::NoCurrentThread { .. }
             | Self::Corrupt
             | Self::UnknownProcess(_) => None,
+            Self::Object(error) => error.kernel_error(),
         }
     }
 }
@@ -250,6 +257,23 @@ mod tests {
                 SchedError::UnknownProcess(crate::id::SlabId::from_parts(2, 7)),
                 None,
             ),
+            (
+                SchedError::Object(ObjectError::Full { max_slots: 5 }),
+                Some(KernelError::OutOfResource),
+            ),
+            (
+                SchedError::Object(ObjectError::Stale {
+                    id: crate::id::SlabId::from_parts(4, 3),
+                }),
+                None,
+            ),
+            (
+                SchedError::Object(ObjectError::Refs(crate::handle::RefError::Overflow {
+                    object: crate::id::SlabId::from_parts(6, 1),
+                })),
+                None,
+            ),
+            (SchedError::Object(ObjectError::Corrupt), None),
         ]
     }
 

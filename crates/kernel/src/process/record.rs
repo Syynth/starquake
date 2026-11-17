@@ -7,7 +7,7 @@
 use std::collections::BTreeSet;
 
 use super::tls::ThreadLocalPages;
-use crate::id::ThreadId;
+use crate::id::{ObjectId, ThreadId};
 
 /// A process's state: the part of Eden's `KProcess::State` a process without a debugger goes
 /// through (`Created`, `Running`, `Terminated`; `Terminating` is never seen from outside a call
@@ -25,6 +25,8 @@ pub enum ProcessState {
 /// One process's row in the scheduler table. See the module docs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessRecord {
+    /// The process's row in the object table, whose one reference this row holds.
+    pub(crate) object: ObjectId,
     pub(crate) state: ProcessState,
     /// Threads started and not yet ended (`m_num_running_threads`).
     pub(crate) running_threads: u32,
@@ -36,16 +38,24 @@ pub struct ProcessRecord {
 }
 
 impl ProcessRecord {
-    /// A newly created process.
+    /// A newly created process, whose object is `object`.
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(object: ObjectId) -> Self {
         Self {
+            object,
             state: ProcessState::Created,
             running_threads: 0,
             threads: BTreeSet::new(),
             tls: ThreadLocalPages::new(),
             scheduled_count: 0,
         }
+    }
+
+    /// Its row in the object table ([`crate::object::Object::Process`]): what a copied
+    /// [`crate::handle::Handle::CURRENT_PROCESS`] names in an IPC request.
+    #[must_use]
+    pub const fn object(&self) -> ObjectId {
+        self.object
     }
 
     /// Its state.
@@ -75,11 +85,5 @@ impl ProcessRecord {
     #[must_use]
     pub const fn scheduled_count(&self) -> u64 {
         self.scheduled_count
-    }
-}
-
-impl Default for ProcessRecord {
-    fn default() -> Self {
-        Self::new()
     }
 }

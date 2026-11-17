@@ -145,7 +145,7 @@ mod trace {
     /// How many lines of the startup fixture's reference a run in starquake matches, at least:
     /// the ratchet (see the module docs). Raise it when a change makes the run match more; the
     /// on-hardware test prints the new count when it does.
-    const STARTUP_MATCHED: usize = 41;
+    const STARTUP_MATCHED: usize = 85;
 
     /// The arguments that are addresses, for each call the fixtures make: the same list as
     /// `ADDRESSES` in `tools/oracle/normalise.py`. A call that is not listed is refused, so no

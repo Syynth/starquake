@@ -1,8 +1,9 @@
 //! Loading a program into a guest address space: what process it is ([`Program`], with its
 //! description from its metadata), where its modules, their `.bss` and the counter trampolines
-//! go ([`place`]), and creating the process's memory around them with the kernel ([`load`]):
-//! the code and the main thread's stack. The main thread itself, and its thread-local page, are
-//! the kernel's process creation's (`starquake_kernel::process::run`, called by the core loop).
+//! go ([`place`]), and creating the process's memory around them with the kernel
+//! ([`load_placed`]): the code and the main thread's stack. The main thread itself, and its
+//! thread-local page, are the kernel's process creation's (`starquake_kernel::process::run`,
+//! called by the core loop).
 //!
 //! A program is an NRO ([`Program::parse`]: one module, `main`) or an ExeFS
 //! ([`Program::from_exefs`]: `main.npdm` and up to thirteen NSO modules, in the loader's
@@ -10,8 +11,8 @@
 //! loader's ([`CodeSet`]: segments, `MOD0` and `.bss`, the module's size); relocations are the
 //! guest's own (the loader's `codeset` module docs, "Relocations").
 //!
-//! [`load`] follows Eden's process start for a program (paths relative to the reference folder,
-//! all @ cf654052):
+//! [`load_placed`] follows Eden's process start for a program (paths relative to the reference
+//! folder, all @ cf654052):
 //!
 //! 1. `KProcess::LoadFromMetadata` and `KProcess::Initialize`
 //!    (`eden/src/core/hle/kernel/k_process.cpp`): the kernel lays out the address space around
@@ -397,6 +398,15 @@ impl Layout {
             .last()
             .map_or(self.entry, |module| module.base.saturating_add(module.size))
     }
+
+    /// Bytes from the first page of the counter trampolines (the first module's base when there
+    /// are none) to the end of the code: every page of guest memory the program's own bytes and
+    /// `.bss` can take, a whole number of pages.
+    pub(crate) fn extent(&self) -> u64 {
+        let start = self.trampolines.map_or(self.entry, |region| region.start);
+        // `place` puts the trampolines below the entry and every module above it.
+        self.code_end().saturating_sub(start)
+    }
 }
 
 /// A loaded program, as the core loop and the run's report need it.
@@ -416,7 +426,8 @@ pub(crate) struct Placement {
     pub(crate) description: ProcessDescription,
 }
 
-/// What [`load`] hands back: where things are, and the kernel's address space that holds them.
+/// What [`load_placed`] hands back: where things are, and the kernel's address space that holds
+/// them.
 #[derive(Debug)]
 pub(crate) struct Loaded {
     /// Where the program and its stack are.
@@ -623,19 +634,35 @@ fn reprotection(perms: Perms) -> Option<SvcPermission> {
     }
 }
 
-/// Loads `program` at [`IMAGE_BASE`]: creates its address space with the kernel, with `mapper`
-/// making the kernel's mappings real, copies the modules into `memory` (that same address
-/// space, as host code sees it) and gives the process a main thread's stack of the size its
-/// description asks for. Counter reads are rewritten for `counter` if one is given. See the
-/// module docs for the steps.
+/// [`place`]s `program` at [`IMAGE_BASE`], rewriting counter reads for `counter` if one is
+/// given, and [`load_placed`]s it.
+#[cfg(test)]
 pub(crate) fn load(
     program: &Program,
     counter: Option<CounterRescale>,
     mapper: Box<dyn Mapper>,
     memory: &dyn GuestMemory,
 ) -> Result<Loaded, LoadError> {
+    load_placed(
+        program,
+        place(program, IMAGE_BASE, counter)?,
+        mapper,
+        memory,
+    )
+}
+
+/// Loads `program`, laid out as `layout` (what [`place`] made of it at [`IMAGE_BASE`]): creates
+/// its address space with the kernel, with `mapper` making the kernel's mappings real, copies
+/// the modules into `memory` (that same address space, as host code sees it) and gives the
+/// process a main thread's stack of the size its description asks for. See the module docs for
+/// the steps.
+pub(crate) fn load_placed(
+    program: &Program,
+    layout: Layout,
+    mapper: Box<dyn Mapper>,
+    memory: &dyn GuestMemory,
+) -> Result<Loaded, LoadError> {
     let description = program.description();
-    let layout = place(program, IMAGE_BASE, counter)?;
     let refused = |what: &'static str| move |error: SvcError| LoadError::Map { what, error };
     let mut space = KernelSpace::new(
         &ProcessMemory {

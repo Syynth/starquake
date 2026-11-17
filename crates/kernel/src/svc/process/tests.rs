@@ -96,7 +96,8 @@ fn exiting_the_process_ends_every_thread_and_closes_every_handle() {
     let record = tables.scheduler.process(own).unwrap();
     assert_eq!(record.tls().used(), 0);
     assert_eq!(record.running_threads(), 0);
-    assert!(tables.scheduler.objects().is_empty());
+    // The process's own object outlives its threads and handles.
+    assert_eq!(tables.scheduler.objects_besides_processes(), 0);
 }
 
 #[test]

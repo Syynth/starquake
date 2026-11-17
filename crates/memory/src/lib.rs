@@ -6,12 +6,17 @@
 //! [`GuestMemory`].
 //!
 //! [`translation`] holds the [`Translation`] trait that maps guest virtual ranges; [`stage1`]
-//! implements it with AArch64 stage-1 tables for the native backends.
+//! implements it with AArch64 stage-1 tables for the native backends. [`watch`] holds the
+//! [`WriteWatch`] through which the GPU's caches learn of guest CPU writes.
 
 pub mod stage1;
 pub mod translation;
+pub mod watch;
 
 pub use translation::{Access, BackingRange, MapError, PAGE_SIZE, Perms, Translation};
+#[cfg(any(test, feature = "test-support"))]
+pub use watch::FakeWatchKernel;
+pub use watch::{PageRange, WatchError, WatchRequest, WatchTicket, WriteWatch};
 
 /// An access to guest memory that isn't mapped, or isn't allowed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
