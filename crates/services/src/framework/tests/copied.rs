@@ -79,7 +79,12 @@ impl Desk {
         reply.ok()
     }
 
-    fn copy_lobby(_: &mut Self, _: &mut Context<'_>, _: &Request<'_>, reply: &mut Reply) -> Outcome {
+    fn copy_lobby(
+        _: &mut Self,
+        _: &mut Context<'_>,
+        _: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
         reply.copy_service(LOBBY);
         reply.ok()
     }
