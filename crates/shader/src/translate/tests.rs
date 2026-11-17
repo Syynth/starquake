@@ -87,9 +87,9 @@ fn vertex_program_golden_ir() {
         Instr::new(Op::FFma(OpFFma {
             dst: r(2),
             srcs: [
-                FloatSrc::reg(r(0)),
-                FloatSrc::Imm(0.5_f32.to_bits()),
-                FloatSrc::Reg {
+                AluSrc::reg(r(0)),
+                AluSrc::Imm(0.5_f32.to_bits()),
+                AluSrc::Reg {
                     reg: r(1),
                     abs: true,
                     neg: true,
@@ -267,11 +267,82 @@ fn mov_lane_mask_must_be_full() {
     assert!(one(mov(r(0), MovSrc::Imm(1))).is_ok());
 }
 
+/// The decoder reads uniform-register and constant-buffer sources of `MOV` and `FFMA`; the
+/// translator rejects them, in every source position, and keeps translating register and
+/// immediate sources.
+#[test]
+fn uniform_and_constant_buffer_sources_are_rejected() {
+    use crate::decode::{CBuf, CBufRef, UniformReg};
+    let cbuf = CBufRef {
+        buf: CBuf::Binding(1),
+        offset: 0x10,
+    };
+    let ureg = UniformReg::new(4).expect("ur4");
+    for src in [MovSrc::CBuf(cbuf), MovSrc::UniformReg(ureg)] {
+        let instr = mov(r(0), src);
+        assert_eq!(one(instr), unsupported(instr, Unsupported::Source));
+    }
+    let wide = [
+        AluSrc::CBuf {
+            cbuf,
+            abs: false,
+            neg: false,
+        },
+        AluSrc::UniformReg {
+            reg: ureg,
+            abs: false,
+            neg: false,
+        },
+    ];
+    let reg = AluSrc::reg(r(1));
+    for src in wide {
+        for srcs in [[reg, src, reg], [reg, reg, src]] {
+            let instr = Instr::new(Op::FFma(OpFFma {
+                dst: r(0),
+                srcs,
+                saturate: false,
+                rnd: RoundMode::NearestEven,
+                ftz: false,
+                dnz: false,
+            }));
+            assert_eq!(one(instr), unsupported(instr, Unsupported::Source));
+        }
+    }
+    let instr = mov(r(0), MovSrc::UniformReg(ureg));
+    assert_eq!(
+        one(instr).map_err(|error| error.to_string()),
+        Err(
+            "instruction 0 (mov r0, ur4;): a uniform-register or constant-buffer source is not \
+             supported"
+                .into()
+        )
+    );
+    assert!(one(mov(r(0), MovSrc::Reg(r(1)))).is_ok());
+}
+
+/// Every operation but the six of slice 1 is rejected by its mnemonic.
+#[test]
+fn other_instructions_are_rejected_by_mnemonic() {
+    use crate::decode::{OpIAdd3, OpNop, OpTex};
+    for op in [Op::IAdd3(OpIAdd3 {}), Op::Nop(OpNop {}), Op::Tex(OpTex {})] {
+        let instr = Instr::new(op);
+        assert_eq!(
+            one(instr),
+            unsupported(instr, Unsupported::Instruction(op.mnemonic()))
+        );
+    }
+    let instr = Instr::new(Op::Nop(OpNop {}));
+    assert_eq!(
+        one(instr).map_err(|error| error.to_string()),
+        Err("instruction 0 (nop;): nop is not supported".into())
+    );
+}
+
 #[test]
 fn ffma_multiply_zero_mode_is_rejected() {
     let op = OpFFma {
         dst: r(0),
-        srcs: [FloatSrc::reg(r(1)); 3],
+        srcs: [AluSrc::reg(r(1)); 3],
         saturate: false,
         rnd: RoundMode::NearestEven,
         ftz: false,
@@ -300,7 +371,7 @@ fn ffma_controls_follow_the_reference() {
         for (ftz, fmz_mode) in [(false, FmzMode::None), (true, FmzMode::Ftz)] {
             let op = OpFFma {
                 dst: r(0),
-                srcs: [FloatSrc::reg(r(1)); 3],
+                srcs: [AluSrc::reg(r(1)); 3],
                 saturate: false,
                 rnd,
                 ftz,

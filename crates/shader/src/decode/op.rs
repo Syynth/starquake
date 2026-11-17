@@ -1,288 +1,181 @@
-//! Decoded instructions: one struct of typed operands per instruction.
+//! Decoded instructions: the [`Op`] enum, with one variant per instruction, and [`Instr`].
 //!
-//! The shapes follow NAK's `Op*` structs in `mesa-nouveau/src/nouveau/compiler/nak/ir.rs`
-//! @ 52238762 (MIT, Copyright 2022 Collabora, Ltd.): `OpMov`, `OpFFma`, `OpALd`, `OpASt`,
-//! `OpExit`, `OpS2R`. Differences: registers are plain register numbers (no SSA values or
-//! register-file tags), a source is an enum of exactly what the form can encode, and `OpExit`
-//! carries the mode and predicate bits NAK's encoder only writes as constants.
+//! The variants follow NAK's `Op*` structs (`mesa-nouveau/src/nouveau/compiler/nak/ir.rs`
+//! @ 52238762, MIT, Copyright 2022 Collabora, Ltd.; spec, "The SM86 decoder"), one per
+//! instruction of the decoder slices 6a to 6i, grouped in one module per slice so the slices can
+//! be built side by side without editing a shared file:
+//!
+//! | Module | Slice | Instructions |
+//! |---|---|---|
+//! | `integer` | 6a | `IADD3`, `IADD3.X`, `IMAD`, `IMAD.WIDE`, `LOP3`, `SHF`, `LEA`, `LEA.X`, `ISETP`, `IMNMX`, `PRMT`, `POPC`, `FLO`, `BREV`, `SGXT`, `BMSK`, `IABS`, `IDP4`, `MOV`, `SEL`, `PLOP3`, `P2R`, `R2P` |
+//! | `float` | 6b | `FADD`, `FMUL`, `FFMA`, `FMNMX`, `FSET`, `FSETP`, `FSEL`, `MUFU`, `FSWZADD`, `FRND`, `F2F`, `F2I`, `I2F`, `I2FP`, `F2FP` |
+//! | `half_double` | 6c | `HADD2`, `HFMA2`, `HMUL2`, `HSET2`, `HSETP2`, `HMNMX2`, `DADD`, `DMUL`, `DFMA`, `DSETP` |
+//! | `uniform` | 6d | `R2UR`, `UP2UR` |
+//! | `memory` | 6e | `LD`/`ST` (every space), `LDC`, `ATOM` (with `ATOMS`, `ATOMG`, `RED`), `CCTL`, `MEMBAR`, `LDGSTS`, `LDGDEPBAR` |
+//! | `texture` | 6f | `TEX`, `TLD`, `TLD4`, `TMML`, `TXD`, `TXQ`, `SULD`, `SUST`, `SUATOM` (with `SURED`) |
+//! | `attribute` | 6g | `ALD`, `AST`, `IPA`, `AL2P`, `S2R`, `CS2R`, `PIXLD`, `OUT`, `OUT.FINAL`, `ISBERD`, `ISBEWR`, `LDTRAM` |
+//! | `control` | 6h | `BRA`, `BRX`, `JMX`, `CALL`, `RET`, `EXIT`, `KILL`, `BSSY`, `BSYNC`, `BREAK`, `BMOV`, `WARPSYNC`, `BAR`, `VOTE`, `SHFL`, `MATCH`, `REDUX`, `NOP`, `DEPBAR`, `NANOSLEEP`, `BPT` |
+//! | `tensor` | 6i | `HMMA`, `IMMA`, `LDSM`, `MOVM` |
+//!
+//! Where NAK models an instruction as a form of another (the memory spaces of `LD` and `ST`,
+//! `RED` as an `ATOM` without a destination, `SURED` as an `SUATOM` without one, the uniform
+//! forms of the ALU instructions such as `UMOV`, `ULDC` and `UPLOP3` as the vector op with
+//! uniform operands), the variant is NAK's and the slice adds the field that tells them apart.
+//! That split of the uniform forms is NAK's model, not a fact of the encoding; slice 6d may
+//! revisit it. The instructions only PR #4588 knows (`BRX`, `JMX`, `CALL`, `RET`, `DEPBAR`,
+//! `P2R`, `R2P`, `FSEL`, `I2FP`, `UP2UR`, `LDGSTS`, `LDGDEPBAR`, `BPT`) get variants of their
+//! own, named in NAK's style.
+//!
+//! An instruction its slice has not built yet is a **shell**: an empty struct that prints its
+//! mnemonic, which no decode form produces and the test assembler refuses
+//! (`EncodeError::NoEncoding`). A slice turns a shell into a real struct in its own module
+//! (fields, printer, decode forms, encoder) without touching the enum. The mnemonics are
+//! `nvdisasm`'s names lower-cased; those of shells are guesses until their slice checks them.
 
-/// A per-thread register, R0 to R254; R255 is `RZ`, which reads zero and discards writes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct Gpr(u8);
+use std::fmt::{self, Display, Formatter};
 
-impl Gpr {
-    /// `RZ` (NAK: `zero_reg(RegFile::GPR)` is register 255).
-    pub const RZ: Self = Self(255);
+use super::operand::PredSrc;
 
-    /// Register `index`; 255 is [`Gpr::RZ`].
-    pub const fn new(index: u8) -> Self {
-        Self(index)
-    }
+pub(crate) mod attribute;
+pub(crate) mod control;
+pub(crate) mod float;
+pub(crate) mod half_double;
+pub(crate) mod integer;
+pub(crate) mod memory;
+pub(crate) mod tensor;
+pub(crate) mod texture;
+pub(crate) mod uniform;
 
-    /// The register number.
-    pub const fn index(self) -> u8 {
-        self.0
-    }
+pub use attribute::SpecialReg;
+pub use integer::MovSrc;
 
-    /// Whether this is [`Gpr::RZ`].
-    pub const fn is_zero(self) -> bool {
-        self.0 == Self::RZ.0
-    }
+/// An operation's mnemonic, as `nvdisasm` writes it lower-cased (for a shell, a guess).
+pub(crate) trait Named {
+    /// The mnemonic.
+    const MNEMONIC: &'static str;
 }
 
-/// A predicate register, P0 to P6; P7 is `PT`, which is always true.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct Pred(u8);
+/// Defines shell operations: for each, an empty struct, its mnemonic and a printer that writes
+/// the mnemonic; and, for tests, a list of every shell of the module as an [`Op`].
+macro_rules! shells {
+    ($($variant:ident($name:ident) = $mnemonic:literal;)*) => {
+        $(
+            #[doc = concat!("`", $mnemonic, "`: a shell, not decoded yet (see the `op` module).")]
+            #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+            pub struct $name {}
 
-impl Pred {
-    /// `PT` (NAK: `true_reg` is register 7).
-    pub const PT: Self = Self(7);
+            impl $crate::decode::op::Named for $name {
+                const MNEMONIC: &'static str = $mnemonic;
+            }
 
-    /// Predicate register `index`, or `None` past [`Pred::PT`]; the encoding has three bits.
-    pub const fn new(index: u8) -> Option<Self> {
-        if index <= Self::PT.0 {
-            Some(Self(index))
-        } else {
-            None
-        }
-    }
+            impl ::std::fmt::Display for $name {
+                fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+                    f.write_str($mnemonic)
+                }
+            }
+        )*
 
-    /// The register number.
-    pub const fn index(self) -> u8 {
-        self.0
-    }
-
-    /// Whether this is [`Pred::PT`].
-    pub const fn is_true(self) -> bool {
-        self.0 == Self::PT.0
-    }
-}
-
-/// A predicate operand: a register, possibly negated.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct PredSrc {
-    /// The register.
-    pub reg: Pred,
-    /// Whether the value is negated.
-    pub negated: bool,
-}
-
-impl PredSrc {
-    /// `PT`: the guard of an instruction that always runs.
-    pub const TRUE: Self = Self {
-        reg: Pred::PT,
-        negated: false,
+        /// Every shell of this module, as an operation.
+        #[cfg(test)]
+        pub(crate) const SHELLS: &[$crate::decode::Op] =
+            &[$($crate::decode::Op::$variant($name {})),*];
     };
-
-    /// Whether this is plain `PT`.
-    pub const fn is_true(self) -> bool {
-        self.reg.is_true() && !self.negated
-    }
 }
+pub(crate) use shells;
 
-/// A 32-bit float source of an ALU instruction.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum FloatSrc {
-    /// A register, with NAK's `FAbs`/`FNeg` modifiers.
-    Reg {
-        /// The register.
-        reg: Gpr,
-        /// Take the absolute value first.
-        abs: bool,
-        /// Then negate.
-        neg: bool,
-    },
-    /// A 32-bit immediate: the bits of an `f32`.
-    Imm(u32),
-}
-
-impl FloatSrc {
-    /// An unmodified register.
-    pub const fn reg(reg: Gpr) -> Self {
-        Self::Reg {
-            reg,
-            abs: false,
-            neg: false,
+/// Calls `$callback!` with every operation, as `Variant(Struct)` pairs grouped by the module
+/// that defines them, in slice order: the one list the [`Op`] enum, its printer, the
+/// re-exports and the test assembler's dispatch are generated from.
+macro_rules! op_list {
+    ($callback:ident) => {
+        $callback! {
+            integer {
+                IAdd3(OpIAdd3), IAdd3X(OpIAdd3X), IMad(OpIMad), IMad64(OpIMad64), Lop3(OpLop3),
+                Shf(OpShf), Lea(OpLea), LeaX(OpLeaX), ISetP(OpISetP), IMnMx(OpIMnMx),
+                Prmt(OpPrmt), PopC(OpPopC), Flo(OpFlo), BRev(OpBRev), Sgxt(OpSgxt),
+                BMsk(OpBMsk), IAbs(OpIAbs), IDp4(OpIDp4), Mov(OpMov), Sel(OpSel),
+                PLop3(OpPLop3), P2R(OpP2R), R2P(OpR2P),
+            }
+            float {
+                FAdd(OpFAdd), FMul(OpFMul), FFma(OpFFma), FMnMx(OpFMnMx), FSet(OpFSet),
+                FSetP(OpFSetP), FSel(OpFSel), MuFu(OpMuFu), FSwzAdd(OpFSwzAdd), FRnd(OpFRnd),
+                F2F(OpF2F), F2I(OpF2I), I2F(OpI2F), I2FP(OpI2FP), F2FP(OpF2FP),
+            }
+            half_double {
+                HAdd2(OpHAdd2), HFma2(OpHFma2), HMul2(OpHMul2), HSet2(OpHSet2),
+                HSetP2(OpHSetP2), HMnMx2(OpHMnMx2), DAdd(OpDAdd), DMul(OpDMul), DFma(OpDFma),
+                DSetP(OpDSetP),
+            }
+            uniform {
+                R2UR(OpR2UR), UP2UR(OpUP2UR),
+            }
+            memory {
+                Ld(OpLd), St(OpSt), Ldc(OpLdc), Atom(OpAtom), CCtl(OpCCtl), MemBar(OpMemBar),
+                LdGsts(OpLdGsts), LdgDepBar(OpLdgDepBar),
+            }
+            texture {
+                Tex(OpTex), Tld(OpTld), Tld4(OpTld4), Tmml(OpTmml), Txd(OpTxd), Txq(OpTxq),
+                SuLd(OpSuLd), SuSt(OpSuSt), SuAtom(OpSuAtom),
+            }
+            attribute {
+                ALd(OpALd), ASt(OpASt), Ipa(OpIpa), AL2P(OpAL2P), S2R(OpS2R), CS2R(OpCS2R),
+                PixLd(OpPixLd), Out(OpOut), OutFinal(OpOutFinal), Isberd(OpIsberd),
+                Isbewr(OpIsbewr), LdTram(OpLdTram),
+            }
+            control {
+                Bra(OpBra), Brx(OpBrx), Jmx(OpJmx), Call(OpCall), Ret(OpRet), Exit(OpExit),
+                Kill(OpKill), BSSy(OpBSSy), BSync(OpBSync), Break(OpBreak), BMov(OpBMov),
+                WarpSync(OpWarpSync), Bar(OpBar), Vote(OpVote), Shfl(OpShfl), Match(OpMatch),
+                Redux(OpRedux), Nop(OpNop), DepBar(OpDepBar), Nanosleep(OpNanosleep),
+                Bpt(OpBpt),
+            }
+            tensor {
+                Hmma(OpHmma), Imma(OpImma), Ldsm(OpLdsm), Movm(OpMovm),
+            }
         }
-    }
+    };
 }
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use op_list;
 
-/// The source of a `MOV`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum MovSrc {
-    /// A register.
-    Reg(Gpr),
-    /// A 32-bit immediate.
-    Imm(u32),
-}
+/// Defines [`Op`], its mnemonic, its printer and the re-exports of every operation struct from
+/// the list.
+macro_rules! define_op {
+    ($($module:ident { $($variant:ident($name:ident),)* })*) => {
+        $(pub use $module::{$($name),*};)*
 
-/// A floating-point rounding mode (NAK's `FRndMode`, encoded by `set_rnd_mode`: 0 to nearest
-/// even, 1 toward negative infinity, 2 toward positive infinity, 3 toward zero).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum RoundMode {
-    /// To nearest, ties to even.
-    NearestEven,
-    /// Toward negative infinity.
-    NegInf,
-    /// Toward positive infinity.
-    PosInf,
-    /// Toward zero.
-    Zero,
-}
-
-impl RoundMode {
-    /// Every mode, in encoding order.
-    pub const ALL: [Self; 4] = [Self::NearestEven, Self::NegInf, Self::PosInf, Self::Zero];
-
-    /// The two-bit encoding.
-    pub const fn bits(self) -> u64 {
-        match self {
-            Self::NearestEven => 0,
-            Self::NegInf => 1,
-            Self::PosInf => 2,
-            Self::Zero => 3,
+        /// A decoded instruction's operation.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+        pub enum Op {
+            $($(
+                #[doc = concat!("[`", stringify!($name), "`].")]
+                $variant($name),
+            )*)*
         }
-    }
 
-    /// The mode a two-bit encoding names; only the low two bits are read.
-    pub const fn from_bits(bits: u64) -> Self {
-        Self::ALL[(bits & 3) as usize]
-    }
+        impl Op {
+            /// The operation's mnemonic, as `nvdisasm` writes it lower-cased, without modifiers.
+            pub const fn mnemonic(&self) -> &'static str {
+                match self {
+                    $($(Self::$variant(_) => <$name as Named>::MNEMONIC,)*)*
+                }
+            }
+        }
+
+        impl Display for Op {
+            fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+                match self {
+                    $($(Self::$variant(op) => op.fmt(f),)*)*
+                }
+            }
+        }
+
+        /// Every operation's mnemonic, in list order.
+        #[cfg(test)]
+        pub(crate) const MNEMONICS: &[&str] = &[$($(<$name as Named>::MNEMONIC),*),*];
+    };
 }
-
-/// `MOV dst, src`: copies a register or an immediate.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct OpMov {
-    /// The destination.
-    pub dst: Gpr,
-    /// The source.
-    pub src: MovSrc,
-    /// Which lanes of each quad write (four bits; `0xf` is every lane).
-    pub quad_lanes: u8,
-}
-
-impl OpMov {
-    /// The mask of a `MOV` that every lane performs.
-    pub const ALL_LANES: u8 = 0xf;
-}
-
-/// `FFMA dst, a, b, c`: `a * b + c` in 32-bit float, fused.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct OpFFma {
-    /// The destination.
-    pub dst: Gpr,
-    /// `a`, `b`, `c`. `a` is always a register; at most one of `b` and `c` is an immediate.
-    pub srcs: [FloatSrc; 3],
-    /// Clamp the result to [0, 1].
-    pub saturate: bool,
-    /// The rounding mode.
-    pub rnd: RoundMode,
-    /// Flush denormal inputs and results to zero.
-    pub ftz: bool,
-    /// NAK's `dnz` bit; PR #4588 calls it the multiply-by-zero mode
-    /// (`ops_alu.cpp`, `FFMA`: "native FFMA multiply-zero mode").
-    pub dnz: bool,
-}
-
-/// `ALD dst, a[vtx][addr + offset]`: reads `comps` 32-bit words of attributes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct OpALd {
-    /// The first destination register; the others follow it.
-    pub dst: Gpr,
-    /// The vertex (for stages that read several vertices); `RZ` for none.
-    pub vtx: Gpr,
-    /// A register added to the address; `RZ` for none.
-    pub offset: Gpr,
-    /// The attribute byte address (ten bits).
-    pub addr: u16,
-    /// How many 32-bit words, 1 to 4.
-    pub comps: u8,
-    /// Read per-patch attributes.
-    pub patch: bool,
-    /// Treat the address as physical.
-    pub phys: bool,
-    /// Read the stage's outputs instead of its inputs.
-    pub output: bool,
-}
-
-/// `AST a[vtx][addr + offset], data`: writes `comps` 32-bit words of attributes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct OpASt {
-    /// The first data register; the others follow it.
-    pub data: Gpr,
-    /// The vertex; `RZ` for none.
-    pub vtx: Gpr,
-    /// A register added to the address; `RZ` for none.
-    pub offset: Gpr,
-    /// The attribute byte address (ten bits).
-    pub addr: u16,
-    /// How many 32-bit words, 1 to 4.
-    pub comps: u8,
-    /// Write per-patch attributes.
-    pub patch: bool,
-    /// Treat the address as physical.
-    pub phys: bool,
-}
-
-/// `EXIT`: ends the thread.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct OpExit {
-    /// Bit 84 (NAK: `./.KEEPREFCOUNT/.PREEMPTED/.INVALID3` with bit 85).
-    pub keep_ref_count: bool,
-    /// Bit 85 (NAK: `.NO_ATEXIT`).
-    pub no_at_exit: bool,
-    /// The exit's own predicate (NAK always writes `PT`).
-    pub pred: PredSrc,
-}
-
-/// A special register index, as `S2R` names it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct SpecialReg(pub u8);
-
-impl SpecialReg {
-    /// The lane's index in its warp (`SR_LANEID = 0`:
-    /// `eden/src/shader_recompiler/frontend/maxwell/translate/impl/move_special_register.cpp`
-    /// @ cf654052, `SpecialRegister`).
-    pub const LANE_ID: Self = Self(0);
-    /// `SR_TID_X = 33` (same enum).
-    pub const TID_X: Self = Self(33);
-    /// `SR_TID_Y = 34`.
-    pub const TID_Y: Self = Self(34);
-    /// `SR_TID_Z = 35`.
-    pub const TID_Z: Self = Self(35);
-    /// `SR_CTAID_X = 37`.
-    pub const CTAID_X: Self = Self(37);
-    /// `SR_CTAID_Y = 38`.
-    pub const CTAID_Y: Self = Self(38);
-    /// `SR_CTAID_Z = 39`.
-    pub const CTAID_Z: Self = Self(39);
-}
-
-/// `S2R dst, sr`: reads a special register.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct OpS2R {
-    /// The destination.
-    pub dst: Gpr,
-    /// The special register.
-    pub sr: SpecialReg,
-}
-
-/// A decoded instruction's operation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Op {
-    /// `MOV`.
-    Mov(OpMov),
-    /// `FFMA`.
-    FFma(OpFFma),
-    /// `ALD`.
-    ALd(OpALd),
-    /// `AST`.
-    ASt(OpASt),
-    /// `EXIT`.
-    Exit(OpExit),
-    /// `S2R`.
-    S2R(OpS2R),
-}
+op_list!(define_op);
 
 /// A decoded instruction: an operation under a guard predicate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

@@ -6,8 +6,8 @@ use naga::valid::{ValidationFlags, Validator};
 use super::*;
 use crate::asm::assemble_program;
 use crate::decode::{
-    FloatSrc, Gpr, Instr, MovSrc, Op, OpALd, OpASt, OpExit, OpFFma, OpMov, OpS2R, PredSrc,
-    RoundMode, SpecialReg,
+    AluSrc, Gpr, Instr, MovSrc, Op, OpALd, OpASt, OpExit, OpFFma, OpMov, OpS2R, PredSrc, RoundMode,
+    SpecialReg,
 };
 use crate::gpu_harness::TestDevice;
 use crate::ir::ATTRIBUTE_WORD_BYTES;
@@ -76,7 +76,7 @@ fn mov(dst: Gpr, src: MovSrc) -> Instr {
     }))
 }
 
-fn ffma(dst: Gpr, srcs: [FloatSrc; 3]) -> Instr {
+fn ffma(dst: Gpr, srcs: [AluSrc; 3]) -> Instr {
     Instr::new(Op::FFma(OpFFma {
         dst,
         srcs,
@@ -105,9 +105,9 @@ fn vertex_program() -> Vec<u8> {
         ffma(
             r(0),
             [
-                FloatSrc::reg(r(0)),
-                FloatSrc::Imm(0.5_f32.to_bits()),
-                FloatSrc::reg(r(4)),
+                AluSrc::reg(r(0)),
+                AluSrc::Imm(0.5_f32.to_bits()),
+                AluSrc::reg(r(4)),
             ],
         ),
         mov(r(6), MovSrc::Imm(ONE)),
@@ -126,9 +126,9 @@ fn pixel_program() -> Vec<u8> {
         ffma(
             r(1),
             [
-                FloatSrc::reg(r(4)),
-                FloatSrc::Imm(2.0_f32.to_bits()),
-                FloatSrc::reg(r(0)),
+                AluSrc::reg(r(4)),
+                AluSrc::Imm(2.0_f32.to_bits()),
+                AluSrc::reg(r(0)),
             ],
         ),
         mov(r(2), MovSrc::Reg(Gpr::RZ)),
@@ -799,7 +799,7 @@ fn pair_golden_bodies() {
 /// lands where its register says.
 #[test]
 fn modifiers_and_saturation_lower_to_their_naga_forms() {
-    let modified = |reg, abs, neg| FloatSrc::Reg { reg, abs, neg };
+    let modified = |reg, abs, neg| AluSrc::Reg { reg, abs, neg };
     let program = assemble_program(&[
         ald(r(0), GENERIC_0_X * 4, 3),
         Instr::new(Op::FFma(OpFFma {
@@ -908,7 +908,7 @@ fn lower_errors_read_as_words() {
 /// test shows that the IR core still produces the same naga modules (issue #151).
 #[test]
 fn skeleton_modules_are_unchanged() {
-    let modified = |reg, abs, neg| FloatSrc::Reg { reg, abs, neg };
+    let modified = |reg, abs, neg| AluSrc::Reg { reg, abs, neg };
     let modifiers = assemble_program(&[
         ald(r(0), GENERIC_0_X * 4, 3),
         Instr::new(Op::FFma(OpFFma {
