@@ -10,7 +10,8 @@
 //! * [`shared`]: the state handlers and the timer thread share, the lock order, the drain, and
 //!   the shared syncpoint page gsv 204 binds ([`shared::page`]).
 //! * [`note`]: the notes gsv records for replay.
-//! * [`nvsrv`]: the NVIDIA driver session (the nvdrv protocol) and `/dev/nvmap`.
+//! * [`nvsrv`]: the NVIDIA driver session (the nvdrv protocol), `/dev/nvmap`, and the GPU devices
+//!   (ctrl-gpu characteristics, as-gpu address-space views, tsg-gpu timeslice groups).
 //! * [`syncpt`]: the syncpt session: slot events, armed waits and counter queries.
 //! * [`gpu`]: the gpu session (497) and its worker: GPU memory, mappings and sparse regions.
 

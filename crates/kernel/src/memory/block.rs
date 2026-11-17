@@ -355,6 +355,61 @@ impl MemoryBlock {
     }
 }
 
+/// The counts a block keeps beside its properties: every count `KMemoryBlock` has, including
+/// the three behind the merge barriers, which `QueryInfo` does not report. What a snapshot
+/// saves of a block besides its properties (`memory::space::snapshot`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) struct BlockCounts {
+    /// `m_ipc_lock_count`.
+    pub(super) ipc_lock: u16,
+    /// `m_device_use_count`.
+    pub(super) device_use: u16,
+    /// `m_ipc_disable_merge_count`.
+    pub(super) ipc_disable_merge: u16,
+    /// `m_device_disable_merge_left_count`.
+    pub(super) device_disable_merge_left: u16,
+    /// `m_device_disable_merge_right_count`.
+    pub(super) device_disable_merge_right: u16,
+}
+
+impl MemoryBlock {
+    /// Every count of the block (see [`BlockCounts`]).
+    pub(super) const fn counts(&self) -> BlockCounts {
+        BlockCounts {
+            ipc_lock: self.ipc_lock_count,
+            device_use: self.device_use_count,
+            ipc_disable_merge: self.ipc_disable_merge_count,
+            device_disable_merge_left: self.device_disable_merge_left_count,
+            device_disable_merge_right: self.device_disable_merge_right_count,
+        }
+    }
+
+    /// A block as a snapshot saved it: [`Self::new`]'s block, with `original_permission`,
+    /// `counts` and `disable_merge` as given. `None` where [`Self::new`] gives `None`. Nothing
+    /// relates the fields to each other here; the snapshot's restore checks that.
+    pub(super) fn restored(
+        address: u64,
+        pages: u64,
+        properties: (MemoryState, MemoryPermission, MemoryAttribute),
+        original_permission: MemoryPermission,
+        counts: BlockCounts,
+        disable_merge: DisableMerge,
+    ) -> Option<Self> {
+        let (state, permission, attribute) = properties;
+        let block = Self::new(address, pages, state, permission, attribute)?;
+        Some(Self {
+            original_permission,
+            ipc_lock_count: counts.ipc_lock,
+            device_use_count: counts.device_use,
+            ipc_disable_merge_count: counts.ipc_disable_merge,
+            device_disable_merge_left_count: counts.device_disable_merge_left,
+            device_disable_merge_right_count: counts.device_disable_merge_right,
+            disable_merge,
+            ..block
+        })
+    }
+}
+
 /// `count` raised by one when `raise` is set, or kept; `None` when it would pass `u16::MAX`.
 fn raised(count: u16, raise: bool) -> Option<u16> {
     if raise {

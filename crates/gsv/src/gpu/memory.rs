@@ -97,6 +97,10 @@ pub const NOTIFICATION_COUNT: u32 = 64;
 /// (`std::array<std::optional<s32>, 8>`); the ninth is `OutOfResource`.
 pub const MAX_ADDRESS_SPACES: usize = 8;
 
+/// The first address space id handed out ([`GpuMemory::create_address_space`] counts up from
+/// it), so an id below it never names an address space.
+pub const FIRST_ADDRESS_SPACE: AsId = AsId(Counters::FIRST.space);
+
 /// The size of PR's graphics device table (`GpuDeviceRegistry::devices`, 256 entries); gpu 41
 /// hands out ids 1 to one less (`for (u32 candidate = 1; ...)`), and a device byte names one.
 pub const DEVICE_SLOTS: u32 = 256;
@@ -1162,6 +1166,13 @@ impl GpuMemory {
         held.shim = Some(range.start());
         self.republish(space, range);
         Ok(())
+    }
+
+    /// Where address space `space`'s syncpoint shim is, if one is placed
+    /// ([`map_syncpoint_shim`](Self::map_syncpoint_shim)).
+    #[must_use]
+    pub fn shim(&self, space: AsId) -> Option<u64> {
+        self.spaces.get(&space).and_then(|held| held.shim)
     }
 
     /// The GPU reported `ticket` done: the job's ranges are no longer held, and are published

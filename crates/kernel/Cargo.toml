@@ -19,10 +19,10 @@ starquake-memory.workspace = true
 starquake-cpu.workspace = true
 starquake-ipc.workspace = true
 starquake-trace.workspace = true
+postcard.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-postcard.workspace = true
 proptest.workspace = true
