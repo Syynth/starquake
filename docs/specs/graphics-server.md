@@ -308,10 +308,20 @@ these devices:
 | Device | Used for | Source |
 |---|---|---|
 | `/dev/nvhost-ctrl-gpu` | A 0xD0-byte characteristics block: architecture 0x170 + implementation 0xE (chip 0x17E), flags with bits 8 and 22 (TSG, subcontexts), 26 (syncpoint shim), 34 (mapping modify: without it compressible textures get GPU address 0) and 35, 40–43; signed interface levels from +0x70; 64 subcontexts at +0xB4 | rows 24, 45, 46, 149 (observed); full layout read (PR `native_gpu_characteristics.h`) |
-| `/dev/nvhost-as-gpu` | Address space allocation (AllocAsEx, flags 5, small pages), VA regions, shim info (0xB), ModifyKind (0xC), Remap (0x14) | rows 25, 46 (observed); 0xC, 0x14 read (PR `nvhost_as_gpu.cpp`) |
+| `/dev/nvhost-as-gpu` | Address space allocation (AllocAsEx, flags 5, small pages), VA regions, shim info (0xB) | rows 25, 46 (observed) |
 | `/dev/nvhost-tsg-gpu` | Timeslice groups and subcontexts | rows 26, 45 (observed) |
 | `/dev/nvhost-gpu` | Channels: AllocGPFIFOEx2 (0x1A), AllocObjCtx (0x9; classes C797 3D, C7C0 compute, C7B5 copy, and class 0), SubmitGPFIFO (0x8, 0x1B), per-channel events (QueryEvent 7) | rows 26, 31, 34 (observed) |
 | `/dev/nvmap` | Memory handles | Eden, unchanged |
+
+**Deferred until a title sends them** (owner's decision, 2026-11-17): as-gpu `ModifyKind` (0xC)
+and `Remap` (0x14), which only PR #4588's code names (PR `nvhost_as_gpu.cpp`, read), and
+ctrl-gpu's `QueryEvent` 1 and 2. No trace shows a Switch 2 title using them: row 30 (observed)
+shows Switch 2 never mapping through as-gpu, and row 149 (observed) shows mapping changes
+arriving as gpu 212. Until a title sends one they go to the server's unknown-ioctl policy, whose
+log names the ioctl. To add them later: `ModifyKind` is an ordered job in gsv's GPU memory that
+changes a mapping's kind and has no notification event; `Remap` needs the same, plus as-gpu's
+`AllocateSpace` (0x2) allocations to remap into; `QueryEvent` 1 and 2 need ctrl-gpu events
+made at open, as nvhost-gpu's are.
 
 These are ports of Eden's `src/core/hle/service/nvdrv/devices/` (`@ cf654052`) with the Switch 2
 changes from both references. The address-space ioctls and the gpu worker act on the same
@@ -755,7 +765,20 @@ change a decision.
    211 and 213 reply shapes, 1001–1003, copy or move handles, and syncpt 201's mode 1 (PR
    compares as 64 bits, NX2 does not; built as PR's reading, pinned in `crates/gpu/src/syncpoint.rs`). Until a trace, each follows the
    house rule of decision 8. A trace of the replies the title reads (its next request shows what
-   it took from the last reply) settles each.
+   it took from the last reply) settles each. Two more, added by the owner's decisions of
+   2026-11-17, are built as PR's reading:
+   - **as-gpu's shim when a parentless `AllocAsEx` has its split equal to its start.** PR puts
+     the shim on the page below the split, NX2 below the end. With an empty small-page region,
+     PR's rule puts it below the start, outside every region the fd reports, and at GPU address
+     0 for a one-page start. Does NvRm ever send this layout? (Pinned in
+     `crates/gsv/src/nvsrv/as_gpu.rs`, "Conflicts".)
+   - **ctrl-gpu's interface levels at +0x70.** Row 24 says every level from 0x70 to 0x80 must be
+     at least 6. NX2's comment says only the one at +0x78 must be, with features above 0xA, 0x1F
+     and 0x26, and NX2 reports 0x40 for all nine. PR's levels (0x1C, 0xB, -1, 0x1D, 0x14, then
+     zeros) meet NX2's reading, not row 24's. When the title first reaches this ioctl, a
+     reference-emulator trace of which levels NvRm reads settles it. If the title fails there,
+     NX2's 0x40 values are the first experiment. (Pinned in
+     `crates/gsv/src/nvsrv/ctrl_gpu.rs`, "Conflicts".)
 2. **vi2 31/32:** does the title register request groups with 261 before waiting on them? (vsync
    fallback, slice 13)
 3. **Does the title wait for the "buffer available" notification before reusing a buffer?** If
