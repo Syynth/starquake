@@ -382,16 +382,13 @@ impl<M: GuestMemory> AddressSpace<M> {
     /// `shadow.next` past them once nothing else can fail. RAM starts out zeroed and is never
     /// handed out twice, so they read as zero.
     ///
-    /// The size is checked before the room: a size that is not whole pages
-    /// ([`MapError::MisalignedSize`]) or is zero ([`MapError::Empty`]) is refused as that,
-    /// however much RAM is left; then [`SpaceError::OutOfRam`] when fewer than `size` bytes
-    /// are left.
+    /// The size is checked before the room: a size that is not whole pages is
+    /// [`MapError::MisalignedSize`] however much RAM is left; then [`SpaceError::OutOfRam`]
+    /// when fewer than `size` bytes are left. A size of zero always fits, and is
+    /// [`MapError::Empty`] ([`BackingRange::new`] refuses it).
     fn next_ram(&self, shadow: &Shadow, size: u64) -> Result<BackingRange, SpaceError> {
         if !size.is_multiple_of(PAGE_SIZE) {
             return Err(MapError::MisalignedSize { size }.into());
-        }
-        if size == 0 {
-            return Err(MapError::Empty.into());
         }
         let available = self.ram.end().saturating_sub(shadow.next);
         if available < size {

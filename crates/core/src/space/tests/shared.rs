@@ -128,6 +128,11 @@ fn an_allocation_that_exhausts_ram_by_exactly_one_page_is_refused_and_changes_no
     assert_eq!(space.allocate_shared(PAGE_SIZE), Err(none_left));
     space.map(FAR, PAGE_SIZE, Perms::ReadWrite).unwrap();
     assert_eq!(space.touch(FAR, Access::Read), Touch::Failed(none_left));
+    // A size of zero needs no room, and is refused as empty even now.
+    assert_eq!(
+        space.allocate_shared(0),
+        Err(SpaceError::Map(MapError::Empty))
+    );
 }
 
 // ----- Mapping ------------------------------------------------------------------------------------
