@@ -852,7 +852,7 @@ fn the_environments_recording_is_dropped_as_it_is_made() {
     let mut vcpu = vcpu.then(|_| {}, svc(SvcId::ExitProcess));
 
     let (dispatcher, _) = boot(guest.address_space(), &guest.placed, &guest.memory).unwrap();
-    let (ending, _, tally) = drive(
+    let (ending, _, tally, _) = drive(
         vcpus(&mut vcpu),
         dispatcher,
         &guest.memory,
@@ -1418,3 +1418,4 @@ fn a_clock_for_another_console_than_the_descriptions_ends_the_run_before_the_gue
 }
 
 mod six_cores;
+mod stopped;

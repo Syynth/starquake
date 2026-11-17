@@ -374,6 +374,10 @@ pub fn conclude(
             report.trace_events_dropped
         );
     }
+    // Where each thread was, when the run ended at its timeout (empty otherwise).
+    for thread in &report.threads {
+        let _ = writeln!(stdout, "starquake: at the timeout, {}", thread.text());
+    }
     let ended = describe(report);
     match artifacts::write(folder, report) {
         Ok(()) => {

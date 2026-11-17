@@ -31,7 +31,7 @@
 //! - `clock`: an NRO's process counts time at the Switch 1 rate, a guess (an NRO does not say
 //!   which console it was built for).
 //! - [`system`]: one VM per run, hypervisor backend only.
-//! - [`crash`]: the part of the crash report that needs no backtrace or symbols.
+//! - [`crash`]: the part of the crash report that needs no symbols.
 
 pub mod artifacts;
 #[cfg_attr(
@@ -74,7 +74,7 @@ pub mod system;
 pub mod title;
 
 pub use image::LoadError;
-pub use report::{ExitReason, Mapping, RunOptions, RunReport, Summary, exit_code};
+pub use report::{ExitReason, Mapping, RunOptions, RunReport, Summary, ThreadPc, exit_code};
 pub use space::SpaceError;
 pub use system::{Error, System};
 pub use title::TitleError;

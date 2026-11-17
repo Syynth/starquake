@@ -75,6 +75,7 @@ mod support {
             stubbed: BTreeSet::new(),
             patched_counter_reads: vec![0x8000_00b0],
             memory_map: Vec::new(),
+            threads: Vec::new(),
         }
     }
 

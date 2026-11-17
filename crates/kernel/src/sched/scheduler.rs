@@ -220,6 +220,12 @@ impl Scheduler {
         Ok(self.threads.get(id)?)
     }
 
+    /// Every thread the table holds, terminated ones included until their row is freed, in row
+    /// order, with their ids.
+    pub fn threads(&self) -> impl Iterator<Item = (ThreadId, &Thread)> {
+        self.threads.iter()
+    }
+
     fn thread_mut(&mut self, id: ThreadId) -> Result<&mut Thread, SchedError> {
         Ok(self.threads.get_mut(id)?)
     }

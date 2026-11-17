@@ -15,6 +15,8 @@ use std::time::Duration;
 use starquake_core::artifacts::{
     CRASH_JSON_FILE, CRASH_TEXT_FILE, EVENTS_FILE, GUEST_LOG_FILE, SUMMARY_FILE, TRACE_FILE,
 };
+use starquake_core::crash::Location;
+use starquake_core::report::ThreadPc;
 use starquake_core::{ExitReason, RunReport, exit_code};
 use starquake_testkit::programs;
 
@@ -408,6 +410,67 @@ fn an_endless_loop_exits_with_code_3_at_its_timeout() {
     assert_eq!(summary["exit_reason"], "timeout");
     assert_eq!(summary["exit_code"], 3);
     assert!(summary["duration_ms"].as_u64().unwrap() >= 1000);
+    // The one thread spins in the program's `b .`, and the run says where.
+    let threads = summary["threads"].as_array().unwrap();
+    assert_eq!(threads.len(), 1, "{summary}");
+    let thread = &threads[0];
+    assert_eq!(thread["state"], "runnable");
+    assert_eq!(thread["core"], 0);
+    assert_eq!(thread["pc_location"]["module"], "main");
+    let line = format!(
+        "starquake: at the timeout, thread {}, runnable on core 0, pc {} (main+{})\n",
+        thread["thread"],
+        thread["pc"].as_str().unwrap(),
+        thread["pc_location"]["offset"].as_str().unwrap()
+    );
+    assert!(ran.stdout.contains(&line), "{}", ran.stdout);
+}
+
+#[test]
+fn a_timed_out_run_prints_where_each_thread_was_before_how_it_ended() {
+    let folder = scratch("timed-out");
+    let report = RunReport {
+        exit: ExitReason::Timeout,
+        threads: vec![
+            ThreadPc {
+                thread: 0x51,
+                state: "runnable",
+                core: Some(2),
+                pc: 0x8000_40b8,
+                pc_location: Some(Location {
+                    module: "main".into(),
+                    offset: 0xb8,
+                }),
+            },
+            ThreadPc {
+                thread: 0x52,
+                state: "waiting",
+                core: None,
+                pc: 0x7000_1234,
+                pc_location: None,
+            },
+        ],
+        ..clean_report()
+    };
+    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+    let artifacts = folder.join("artifacts");
+    let code = starquake::conclude(&report, &artifacts, &mut stdout, &mut stderr);
+    assert_eq!(code, exit_code::TIMEOUT);
+    assert_eq!(
+        String::from_utf8(stdout).unwrap(),
+        format!(
+            "[guest] a line\n\
+             starquake: at the timeout, thread 81, runnable on core 2, pc 0x800040b8 (main+0xb8)\n\
+             starquake: at the timeout, thread 82, waiting, pc 0x70001234 (in no module)\n\
+             starquake: the timeout passed (exit code 3); artifacts in {}\n",
+            artifacts.display()
+        )
+    );
+    assert_eq!(String::from_utf8(stderr).unwrap(), "");
+    assert_eq!(
+        json(&artifacts, SUMMARY_FILE)["threads"][1]["state"],
+        "waiting"
+    );
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]

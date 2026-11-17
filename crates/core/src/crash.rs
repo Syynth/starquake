@@ -3,37 +3,77 @@
 //!
 //! Source: `docs/specs/observability.md`, "Crash reports". This is the part of that list the
 //! walking skeleton can fill in: the exception, the registers, the faulting instruction as module
-//! plus offset, the memory map and the block the faulting address is in, the modules with their
-//! build ids, the last events from the flight recorder, the emulator's version and the run's
-//! command line.
+//! plus offset, a backtrace by frame pointer with each frame as module plus offset
+//! ([`Backtrace`]), the memory map and the block the faulting address is in, the modules with
+//! their build ids, the last events from the flight recorder, the emulator's version and the
+//! run's command line.
 //!
 //! PROVISIONAL (walking skeleton, #74). Not here yet, and owned by the crash-report step of the
-//! observability spec's order of work: a backtrace by frame pointer, symbol names, and the events
-//! split per thread (the report quotes the newest events of every thread, merged in order). The
-//! exception is one of four kinds: a data abort, an instruction abort, a `Break` system call
-//! that is not a notification (the program stopped itself), and everything else as an
-//! undefined instruction. The CPU backend's syndrome for it ([`CrashReport::with_syndrome`])
-//! says the rest: whether an abort was a missing page or a refused access, and what an
-//! "undefined instruction" really was. A `Break` has no syndrome: the CPU took an ordinary
-//! system call, and the report's `syndrome` is `null`.
+//! observability spec's order of work: symbol names, and the events split per thread (the report
+//! quotes the newest events of every thread, merged in order). The exception is one of four
+//! kinds: a data abort, an instruction abort, a `Break` system call that is not a notification
+//! (the program stopped itself), and everything else as an undefined instruction. The CPU
+//! backend's syndrome for it ([`CrashReport::with_syndrome`]) says the rest: whether an abort was
+//! a missing page or a refused access, and what an "undefined instruction" really was. A `Break`
+//! has no syndrome: the CPU took an ordinary system call, and the report's `syndrome` is `null`.
+//!
+//! # The backtrace
+//!
+//! [`Backtrace::walk`] follows Eden's `GetAArch64Backtrace` (`eden/src/core/arm/debug.cpp` @
+//! cf654052): frame 0 is the program counter, frame 1 the link register (`x30`) as the
+//! registers hold it, and each later frame the return address read from a frame record, the two
+//! words `x29` points to (the caller's frame pointer at +0, the return address at +8). Frame 1
+//! repeats frame 2 when the crashing function had already saved its link register in its own
+//! frame record, as Eden's does; a leaf function that saved none needs it. Addresses are the
+//! return addresses as read, not the calls before them.
+//!
+//! The walk stops at the first of these, checked in this order for each frame pointer:
+//!
+//! 1. it is zero ([`BacktraceEnd::NullFramePointer`]: the chain is complete);
+//! 2. it is not a multiple of [`FRAME_POINTER_ALIGN`] ([`BacktraceEnd::Misaligned`]);
+//! 3. the walk already read the record it points to ([`BacktraceEnd::Loop`]);
+//! 4. the [`FRAME_RECORD_SIZE`] bytes it points to are not all inside the stack
+//!    ([`BacktraceEnd::OutsideStack`]);
+//! 5. [`MAX_FRAME_RECORDS`] records have been read already ([`BacktraceEnd::DepthLimit`]);
+//! 6. guest memory refuses the read of the record ([`BacktraceEnd::Unreadable`]).
+//!
+//! Where it differs from Eden's:
+//!
+//! - **The stack** is starquake's own idea (a guess at what a frame record may be in, not a
+//!   reference fact): the block of the kernel's memory map that holds the crashing thread's stack
+//!   pointer, when the guest may both read and write it. Eden accepts a record anywhere its
+//!   `IsValidVirtualAddressRange` does (any mapped memory). A crash whose stack pointer is in no
+//!   such block has no stack, and its walk stops at the first record. Test:
+//!   `a_record_outside_the_stack_ends_the_walk`.
+//! - **Loops** end the walk at the first record read twice; Eden reads on until its loop bound.
+//!   Test: `a_chain_that_loops_ends_at_the_first_record_read_twice`.
+//! - **The depth limit** is Eden's loop bound, 256 records, but Eden adds the return address of
+//!   only the first 255 of them (the last one it reads is never added); here every record read
+//!   adds its frame. Test: `the_walk_reads_at_most_its_limit_of_records`.
+//! - **A record the guest's memory refuses** ends the walk with a note
+//!   ([`BacktraceEnd::Unreadable`]), never a panic. Eden checks the range is mapped first and then
+//!   reads it.
 //!
 //! The JSON layout is this crate's own (the spec gives none), versioned by [`CRASH_VERSION`] and
 //! pinned by a test. Addresses and register values are hex strings, so no reader loses bits to a
-//! floating-point number. Version 2 added the `syndrome` field, and version 3 the `svc_break`
-//! exception kind. (The `instruction_abort` kind came earlier, inside version 1; before it, a
-//! fetch from an address nothing maps was reported as a `data_abort` read.)
+//! floating-point number. Version 2 added the `syndrome` field, version 3 the `svc_break`
+//! exception kind, and version 4 the `backtrace` field. (The `instruction_abort` kind came
+//! earlier, inside version 1; before it, a fetch from an address nothing maps was reported as a
+//! `data_abort` read.)
 
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
 use serde::{Serialize, Serializer};
 use starquake_cpu::{ExceptionClass, FaultStatus, GuestRegs, Syndrome};
 use starquake_kernel::svc::exception::Break;
+use starquake_memory::GuestMemory;
 
 use crate::report::Mapping;
 
 /// Version of the `crash.json` layout. Any change to the layout bumps it: a field or exception
 /// kind added, renamed or removed, or a field's meaning changed.
-pub const CRASH_VERSION: u32 = 3;
+pub const CRASH_VERSION: u32 = 4;
 
 /// Serialises a `u64` as a hex string (`"0x80000000"`).
 #[expect(
@@ -62,6 +102,18 @@ fn hex_word<S: Serializer>(value: &u32, serializer: S) -> Result<S::Ok, S::Error
 fn hex_word_or_null<S: Serializer>(value: &Option<u32>, serializer: S) -> Result<S::Ok, S::Error> {
     match value {
         Some(value) => hex_word(value, serializer),
+        None => serializer.serialize_none(),
+    }
+}
+
+/// Serialises an optional `u64` as a hex string, or `null`.
+#[expect(
+    clippy::ref_option,
+    reason = "serde's `serialize_with` calls this with a reference to the field"
+)]
+fn hex_or_null<S: Serializer>(value: &Option<u64>, serializer: S) -> Result<S::Ok, S::Error> {
+    match value {
+        Some(value) => hex(value, serializer),
         None => serializer.serialize_none(),
     }
 }
@@ -249,6 +301,241 @@ pub struct Location {
     pub offset: u64,
 }
 
+impl Location {
+    /// `address` as the module of `modules` that holds it plus the offset into it; `None` when
+    /// no module holds it. A module holds its base and not its end (`base + size`).
+    #[must_use]
+    pub fn of(address: u64, modules: &[Module]) -> Option<Self> {
+        modules.iter().find_map(|module| {
+            let offset = address.checked_sub(module.base)?;
+            (offset < module.size).then(|| Self {
+                module: module.name.clone(),
+                offset,
+            })
+        })
+    }
+}
+
+/// `main+0xb8`.
+impl std::fmt::Display for Location {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}+{:#x}", self.module, self.offset)
+    }
+}
+
+/// An address and where it is, in words: `0x800000b8 (main+0xb8)`, or `0x10 (in no module)`.
+#[must_use]
+pub fn address_text(address: u64, location: Option<&Location>) -> String {
+    match location {
+        Some(location) => format!("{address:#x} ({location})"),
+        None => format!("{address:#x} (in no module)"),
+    }
+}
+
+/// The register that holds the frame pointer, `x29` (AAPCS64; Eden's `ThreadContext::fp`, after
+/// `r[0..29]`, `eden/src/core/hle/kernel/svc_types.h` @ cf654052).
+pub const FRAME_POINTER_REGISTER: usize = 29;
+/// The link register, `x30` (Eden's `ThreadContext::lr`, the same file).
+pub const LINK_REGISTER: usize = 30;
+/// The most frame records a backtrace reads: the bound of Eden's loop in `GetAArch64Backtrace`
+/// (`eden/src/core/arm/debug.cpp` @ cf654052, `for (size_t i = 0; i < 256; i++)`).
+pub const MAX_FRAME_RECORDS: usize = 256;
+/// A frame pointer the walk follows is a multiple of this: Eden's check, `fp % 4 != 0` ends its
+/// walk (the same function).
+pub const FRAME_POINTER_ALIGN: u64 = 4;
+/// The size of a frame record in bytes: the caller's frame pointer, then the return address, a
+/// 64-bit word each (Eden's comment in the same function: "Frame records are two words long").
+pub const FRAME_RECORD_SIZE: usize = 16;
+/// Where the return address is in a frame record (`fp+8 : value of lr for frame`, the same
+/// comment); the caller's frame pointer is at its start.
+pub const FRAME_RECORD_RETURN: usize = 8;
+
+/// One frame of a backtrace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Frame {
+    /// The program counter (frame 0), the link register (frame 1), or the return address a
+    /// frame record holds (every later frame).
+    #[serde(serialize_with = "hex")]
+    pub address: u64,
+    /// That address as module plus offset, when it is inside a module.
+    pub location: Option<Location>,
+    /// The address of the frame record the return address was read from; `null` for frames 0
+    /// and 1, which come from the registers.
+    #[serde(serialize_with = "hex_or_null")]
+    pub record: Option<u64>,
+}
+
+/// Why a backtrace's walk ended (see the module docs for the order of the checks).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(tag = "reason", rename_all = "snake_case")]
+pub enum BacktraceEnd {
+    /// The frame pointer is zero: the chain is complete.
+    NullFramePointer,
+    /// The frame pointer is not a multiple of [`FRAME_POINTER_ALIGN`].
+    Misaligned {
+        /// The frame pointer.
+        #[serde(serialize_with = "hex")]
+        frame_pointer: u64,
+    },
+    /// The frame pointer names a record the walk already read: the chain loops.
+    Loop {
+        /// The frame pointer.
+        #[serde(serialize_with = "hex")]
+        frame_pointer: u64,
+    },
+    /// The record the frame pointer names is not wholly inside the stack, or there is no stack.
+    OutsideStack {
+        /// The frame pointer.
+        #[serde(serialize_with = "hex")]
+        frame_pointer: u64,
+    },
+    /// [`MAX_FRAME_RECORDS`] records were read, and the chain goes on.
+    DepthLimit,
+    /// Guest memory refused the read of the record the frame pointer names.
+    Unreadable {
+        /// The frame pointer.
+        #[serde(serialize_with = "hex")]
+        frame_pointer: u64,
+    },
+}
+
+impl BacktraceEnd {
+    /// Why the walk ended, in words.
+    #[must_use]
+    pub fn text(&self) -> String {
+        match *self {
+            Self::NullFramePointer => "the chain ends at a null frame pointer".to_owned(),
+            Self::Misaligned { frame_pointer } => format!(
+                "cut short: the frame pointer {frame_pointer:#x} is not a multiple of \
+                 {FRAME_POINTER_ALIGN}"
+            ),
+            Self::Loop { frame_pointer } => format!(
+                "cut short: the frame record at {frame_pointer:#x} was read before (the chain \
+                 loops)"
+            ),
+            Self::OutsideStack { frame_pointer } => {
+                format!("cut short: the frame record at {frame_pointer:#x} is outside the stack")
+            }
+            Self::DepthLimit => format!(
+                "cut short: {MAX_FRAME_RECORDS} frame records were read, the most a backtrace \
+                 reads"
+            ),
+            Self::Unreadable { frame_pointer } => {
+                format!("cut short: the frame record at {frame_pointer:#x} could not be read")
+            }
+        }
+    }
+}
+
+/// The crashing thread's frame-pointer chain (see the module docs).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Backtrace {
+    /// The memory block every frame record must be in: the one holding the stack pointer, named
+    /// by its state in the kernel's memory map (`Stack`, `Normal`, ...); `null` when the stack
+    /// pointer is in no block the guest can read and write.
+    pub stack: Option<Mapping>,
+    /// Innermost first: the program counter, the link register, then one frame per record read.
+    pub frames: Vec<Frame>,
+    /// Why the walk ended.
+    pub end: BacktraceEnd,
+}
+
+impl Backtrace {
+    /// Walks the chain of frame records from the registers `regs`, reading `memory`, with every
+    /// record inside `stack` (see the module docs), and places each frame in `modules`.
+    #[must_use]
+    pub fn walk(
+        regs: &GuestRegs,
+        stack: Option<Mapping>,
+        memory: &dyn GuestMemory,
+        modules: &[Module],
+    ) -> Self {
+        let frame = |address: u64, record: Option<u64>| Frame {
+            address,
+            location: Location::of(address, modules),
+            record,
+        };
+        let mut frames = vec![frame(regs.pc, None), frame(regs.x[LINK_REGISTER], None)];
+        // The records read, by address: at most `MAX_FRAME_RECORDS` of them.
+        let mut read = BTreeSet::new();
+        let mut frame_pointer = regs.x[FRAME_POINTER_REGISTER];
+        let end = loop {
+            if frame_pointer == 0 {
+                break BacktraceEnd::NullFramePointer;
+            }
+            if !frame_pointer.is_multiple_of(FRAME_POINTER_ALIGN) {
+                break BacktraceEnd::Misaligned { frame_pointer };
+            }
+            if read.contains(&frame_pointer) {
+                break BacktraceEnd::Loop { frame_pointer };
+            }
+            if !stack
+                .as_ref()
+                .is_some_and(|stack| holds_record(stack, frame_pointer))
+            {
+                break BacktraceEnd::OutsideStack { frame_pointer };
+            }
+            if read.len() >= MAX_FRAME_RECORDS {
+                break BacktraceEnd::DepthLimit;
+            }
+            let mut record = [0; FRAME_RECORD_SIZE];
+            if memory.read(frame_pointer, &mut record).is_err() {
+                break BacktraceEnd::Unreadable { frame_pointer };
+            }
+            read.insert(frame_pointer);
+            let (caller, rest) = record.split_at(FRAME_RECORD_RETURN);
+            frames.push(frame(word(rest), Some(frame_pointer)));
+            frame_pointer = word(caller);
+        };
+        Self { stack, frames, end }
+    }
+
+    fn write_text(&self, out: &mut String) -> std::fmt::Result {
+        writeln!(out, "\nbacktrace, innermost first:")?;
+        for (index, frame) in self.frames.iter().enumerate() {
+            let source = match (index, frame.record) {
+                (_, Some(record)) => format!("frame record at {record:#x}"),
+                (0, None) => "pc".to_owned(),
+                (_, None) => "lr".to_owned(),
+            };
+            writeln!(
+                out,
+                "  #{index} {}, {source}",
+                address_text(frame.address, frame.location.as_ref())
+            )?;
+        }
+        match &self.stack {
+            Some(Mapping { name, start, end }) => {
+                writeln!(out, "  stack: {start:#x}-{end:#x} {name}")?;
+            }
+            None => writeln!(
+                out,
+                "  stack: none (the stack pointer is in no memory the guest can read and write)"
+            )?,
+        }
+        writeln!(out, "  {}", self.end.text())
+    }
+}
+
+/// Whether the frame record at `address` is wholly inside `stack`: its first byte at or above
+/// the start, and its end at or below the stack's end, without wrapping.
+fn holds_record(stack: &Mapping, address: u64) -> bool {
+    let size = FRAME_RECORD_SIZE as u64;
+    address >= stack.start
+        && address
+            .checked_add(size)
+            .is_some_and(|end| end <= stack.end)
+}
+
+/// The little-endian 64-bit word `bytes` holds (eight bytes; fewer read as zero-padded).
+fn word(bytes: &[u8]) -> u64 {
+    let mut word = [0; 8];
+    for (to, from) in word.iter_mut().zip(bytes) {
+        *to = *from;
+    }
+    u64::from_le_bytes(word)
+}
+
 /// Everything recorded about a guest crash.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CrashReport {
@@ -267,6 +554,8 @@ pub struct CrashReport {
     pub pc: u64,
     /// That address as module plus offset, when it is inside a module.
     pub pc_location: Option<Location>,
+    /// The crashing thread's frame-pointer chain; `null` when the report was built without one.
+    pub backtrace: Option<Backtrace>,
     /// For a data abort or an instruction abort, the name of the mapping the faulting address
     /// is in; `null` when the address is not mapped, and for other exceptions.
     pub fault_mapping: Option<String>,
@@ -291,13 +580,7 @@ impl CrashReport {
         last_events: Vec<String>,
         command_line: &[String],
     ) -> Self {
-        let pc_location = modules.iter().find_map(|module| {
-            let offset = regs.pc.checked_sub(module.base)?;
-            (offset < module.size).then(|| Location {
-                module: module.name.clone(),
-                offset,
-            })
-        });
+        let pc_location = Location::of(regs.pc, modules);
         let fault_mapping = match exception {
             Exception::DataAbort { address, .. } | Exception::InstructionAbort { address } => {
                 memory_map
@@ -315,6 +598,7 @@ impl CrashReport {
             syndrome: None,
             pc: regs.pc,
             pc_location,
+            backtrace: None,
             fault_mapping,
             registers: Registers {
                 x: regs.x.to_vec(),
@@ -334,6 +618,13 @@ impl CrashReport {
     #[must_use]
     pub fn with_syndrome(mut self, syndrome: Syndrome) -> Self {
         self.syndrome = Some(SyndromeReport::new(syndrome));
+        self
+    }
+
+    /// The report with `backtrace`, the crashing thread's ([`Backtrace::walk`]).
+    #[must_use]
+    pub fn with_backtrace(mut self, backtrace: Backtrace) -> Self {
+        self.backtrace = Some(backtrace);
         self
     }
 
@@ -389,12 +680,10 @@ impl CrashReport {
     /// Where it happened: `pc 0x800000b8 (main+0xb8)`.
     #[must_use]
     pub fn instruction_text(&self) -> String {
-        match &self.pc_location {
-            Some(Location { module, offset }) => {
-                format!("pc {:#x} ({module}+{offset:#x})", self.pc)
-            }
-            None => format!("pc {:#x} (in no module)", self.pc),
-        }
+        format!(
+            "pc {}",
+            address_text(self.pc, self.pc_location.as_ref())
+        )
     }
 
     fn write_text(&self, out: &mut String) -> std::fmt::Result {
@@ -408,6 +697,9 @@ impl CrashReport {
             writeln!(out, "syndrome: {esr:#010x} ({text})")?;
         }
         writeln!(out, "instruction: {}", self.instruction_text())?;
+        if let Some(backtrace) = &self.backtrace {
+            backtrace.write_text(out)?;
+        }
         writeln!(out, "\nregisters:")?;
         for (row, values) in self.registers.x.chunks(4).enumerate() {
             write!(out, " ")?;
@@ -701,14 +993,47 @@ mod tests {
         .with_syndrome(Syndrome::data_abort(
             FaultStatus::Permission { level: 3 },
             true,
-        ));
+        ))
+        .with_backtrace(Backtrace {
+            stack: Some(Mapping {
+                name: "Stack".into(),
+                start: 0x80f0_0000,
+                end: 0x8100_0000,
+            }),
+            frames: vec![
+                Frame {
+                    address: 0x8000_00b8,
+                    location: Some(Location {
+                        module: "main".into(),
+                        offset: 0xb8,
+                    }),
+                    record: None,
+                },
+                Frame {
+                    address: 0x8000_0124,
+                    location: Some(Location {
+                        module: "main".into(),
+                        offset: 0x124,
+                    }),
+                    record: None,
+                },
+                Frame {
+                    address: 0x7000_0010,
+                    location: None,
+                    record: Some(0x80ff_ffd0),
+                },
+            ],
+            end: BacktraceEnd::Misaligned {
+                frame_pointer: 0x80ff_ffe2,
+            },
+        });
         report.emulator = "starquake 9.9.9".into();
         report.registers.x.truncate(2);
         let json = serde_json::to_string_pretty(&report).unwrap();
         assert_eq!(
             json,
             r##"{
-  "version": 3,
+  "version": 4,
   "emulator": "starquake 9.9.9",
   "command_line": [
     "starquake",
@@ -728,6 +1053,40 @@ mod tests {
   "pc_location": {
     "module": "main",
     "offset": "0xb8"
+  },
+  "backtrace": {
+    "stack": {
+      "name": "Stack",
+      "start": "0x80f00000",
+      "end": "0x81000000"
+    },
+    "frames": [
+      {
+        "address": "0x800000b8",
+        "location": {
+          "module": "main",
+          "offset": "0xb8"
+        },
+        "record": null
+      },
+      {
+        "address": "0x80000124",
+        "location": {
+          "module": "main",
+          "offset": "0x124"
+        },
+        "record": null
+      },
+      {
+        "address": "0x70000010",
+        "location": null,
+        "record": "0x80ffffd0"
+      }
+    ],
+    "end": {
+      "reason": "misaligned",
+      "frame_pointer": "0x80ffffe2"
+    }
   },
   "fault_mapping": "stack",
   "registers": {
@@ -768,7 +1127,7 @@ mod tests {
         );
         // The golden text pins the version as a literal, so a layout change that forgets to bump
         // `CRASH_VERSION` fails here.
-        assert_eq!(CRASH_VERSION, 3);
+        assert_eq!(CRASH_VERSION, 4);
         let undefined = serde_json::to_value(Exception::UndefinedInstruction).unwrap();
         assert_eq!(
             undefined,
@@ -790,6 +1149,8 @@ mod tests {
         // `Null`, so check the object itself).
         let without = without.as_object().unwrap();
         assert_eq!(without.get("syndrome"), Some(&serde_json::Value::Null));
+        // And one built without a backtrace.
+        assert_eq!(without.get("backtrace"), Some(&serde_json::Value::Null));
     }
 
     /// A break with every field set, each to a distinct value.
@@ -898,9 +1259,9 @@ mod tests {
                 "code": null,
             })
         );
-        // In a whole report, with the version that added the kind.
+        // In a whole report (version 3 added the kind).
         let json = serde_json::to_value(report(assert_break())).unwrap();
-        assert_eq!(json["version"], 3);
+        assert_eq!(json["version"], CRASH_VERSION);
         assert_eq!(json["exception"]["kind"], "svc_break");
         assert_eq!(json["syndrome"], serde_json::Value::Null);
     }
@@ -915,3 +1276,6 @@ mod tests {
         assert!(report.to_text().contains("pstate 0xf1001000\n"));
     }
 }
+
+#[cfg(test)]
+mod backtrace_tests;
