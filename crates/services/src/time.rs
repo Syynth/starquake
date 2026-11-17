@@ -139,12 +139,12 @@
 //! runs out and one that disagrees). `time:u` sends no host I/O, so it has no host failure to
 //! answer with a result code.
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 use starquake_kernel::id::ObjectId;
 use starquake_kernel::memory::SvcPermission;
 use starquake_kernel::result::{KernelError, ResultCode};
-use std::sync::Arc;
-
 use starquake_trace::{Env, HostNanos};
 
 use crate::commands;
