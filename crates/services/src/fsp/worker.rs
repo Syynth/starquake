@@ -43,7 +43,7 @@
 //! # When the environment fails a job
 //!
 //! A job's environment that fails it (an `EnvError`: a replay that ran out or disagreed) stops
-//! the run ([`halt`](super::halt)): at its first failure the job's environment tells the
+//! the run ([`halt`](crate::framework::halt)): at its first failure the job's environment tells the
 //! workers' [`Halt`] [`Stop::Job`], on the worker thread, before the job returns. Its
 //! [`Finish`] is then dropped without being called, which drops its reply token: the request is
 //! answered as one the server gave up on, which the guest never runs to see. The job is still
@@ -136,7 +136,7 @@ use starquake_trace::{
     Env, EnvCall, EnvError, EnvRecord, HostIoReply, HostIoRequest, HostNanos, ReplayEnv,
 };
 
-use super::halt::{Halt, Stop};
+use crate::framework::halt::{Halt, Stop};
 use crate::framework::{Executor, Finish, Job};
 
 /// How many threads `fsp-srv`'s [`Workers`] run (module docs, "The workers").

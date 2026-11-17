@@ -68,8 +68,8 @@
 //! - [`Context`] is the rest of what a method may touch: guest memory by copy, events, the
 //!   state its family shares ([`Context::family`]), a reply token for a request it cannot
 //!   answer yet ([`Context::defer`], see [`defer`]), and the host: the injectable environment
-//!   ([`Context::env`]) and a worker for work that takes time ([`Context::executor`], see
-//!   [`work`]).
+//!   ([`Context::env`]; a failure of it stops the run, see [`halt`]) and a worker for work that
+//!   takes time ([`Context::executor`], see [`work`]).
 //!
 //! # Running one
 //!
@@ -208,6 +208,7 @@ pub mod control;
 pub mod defer;
 #[cfg(any(test, feature = "test-support"))]
 pub mod fake;
+pub mod halt;
 mod host;
 mod kernel;
 pub mod payload;
@@ -228,6 +229,7 @@ pub use buffers::{BufferKind, DeclaredBuffer, DescriptorList};
 pub use commands::{Command, CommandTable, Protocol, Session};
 pub use context::Context;
 pub use defer::{Completed, Notify, ReplyToken, TokenId};
+pub use halt::{Halt, Stop};
 pub use kernel::Kernel;
 pub use payload::{Reader, Writer};
 pub use queue::{Admission, DEFAULT_WORKERS, QueueError, RequestQueue};

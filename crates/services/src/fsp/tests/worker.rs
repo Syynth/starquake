@@ -10,7 +10,7 @@ use starquake_trace::EnvRecord;
 
 use super::*;
 use crate::framework::{DEFERRED_REPLY_DROPPED, Finish};
-use crate::fsp::halt::{Halt, Stop};
+use crate::framework::{Halt, Stop};
 use crate::fsp::worker::{
     COUNT, Completed, Failure, JobIndex, Question, RecordError, Recording, Replay, ReplayError,
     StartError, Workers,

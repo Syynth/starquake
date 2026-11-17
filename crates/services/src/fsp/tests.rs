@@ -15,16 +15,18 @@ use starquake_kernel::id::ObjectId;
 use starquake_kernel::result::{KernelError, ResultCode};
 use starquake_trace::{EnvCall, EnvError, HostIoReply, HostIoRequest, HostNanos};
 
-use super::halt::{Halt, Stop};
 use super::host::{CHANNEL, HostFailure, HostRequest, Mount};
 use super::*;
+use crate::framework::DEFERRED_REPLY_DROPPED;
 use crate::framework::control::CONVERT_CURRENT_OBJECT_TO_DOMAIN;
 use crate::framework::fake::FakeKernel;
+use crate::framework::halt::Halts;
 use crate::framework::result::{INVALID_CMIF_REQUEST, NOT_SUPPORTED, UNKNOWN_COMMAND_ID};
 use crate::framework::{
     Executor, Handled, Job, Kernel, Notify, SNAPSHOT_MAGIC, SNAPSHOT_VERSION, Session,
     SnapshotError,
 };
+use crate::framework::{Halt, Stop};
 
 use super::command::file::{GET_SIZE, READ};
 use super::command::file_system::OPEN_FILE;
@@ -235,22 +237,6 @@ struct Wakes(AtomicUsize);
 impl Notify for Wakes {
     fn completion_posted(&self) {
         self.0.fetch_add(1, Ordering::SeqCst);
-    }
-}
-
-/// A halt that keeps every stop it is told, in order: the run's, which would stop.
-#[derive(Default)]
-struct Halts(Mutex<Vec<Stop>>);
-
-impl Halt for Halts {
-    fn halt(&self, stop: Stop) {
-        self.0.lock().unwrap().push(stop);
-    }
-}
-
-impl Halts {
-    fn stops(&self) -> Vec<Stop> {
-        self.0.lock().unwrap().clone()
     }
 }
 
@@ -1342,12 +1328,29 @@ fn a_broken_host_fails_open_file_and_read() {
     assert_eq!(rig.halts.stops(), []);
 }
 
+/// What the halt is told when the environment fails one of `fsp-srv`'s handlers with `error`.
+fn handler_failed(error: EnvError) -> Stop {
+    Stop::Handler {
+        service: NAME.to_owned(),
+        error,
+    }
+}
+
 /// An environment failure the test forces: each case gets its own index, so a stop told for
-/// the wrong request shows.
-fn env_failed(index: usize) -> EnvError {
-    EnvError::Exhausted {
-        index,
-        requested: EnvCall::HostIo,
+/// the wrong request shows. A replay that runs out, or, with `disagree`, one whose next record
+/// answers another kind of call.
+fn env_failed(index: usize, disagree: bool) -> EnvError {
+    if disagree {
+        EnvError::Mismatch {
+            index,
+            requested: EnvCall::HostIo,
+            recorded: EnvCall::Random,
+        }
+    } else {
+        EnvError::Exhausted {
+            index,
+            requested: EnvCall::HostIo,
+        }
     }
 }
 
@@ -1359,9 +1362,10 @@ fn an_environment_failure_in_a_handler_stops_the_run() {
     use super::command::storage::GET_SIZE as STORAGE_GET_SIZE;
     // Every handler that reads the environment: the three opens' probes, `OpenFile`'s and the
     // two `GetSize`s' size requests. Each case opens what its request needs, then the
-    // environment fails every request of the kind the handler asks. The request is answered as
-    // one the server gave up on, no session is made, and the run is told to stop, once, with
-    // exactly the environment's error.
+    // environment fails every request of the kind the handler asks, as a replay that runs out
+    // and as one that disagrees. The request is answered as one the server gave up on, no
+    // session is made, and the run is told to stop, once, naming `fsp-srv` and exactly the
+    // environment's error.
     type Prepare = fn(&mut Rig) -> ObjectId;
     type Send = fn(&mut Rig, ObjectId) -> Answered;
     let root: Prepare = |rig| rig.session;
@@ -1395,20 +1399,32 @@ fn an_environment_failure_in_a_handler_stops_the_run() {
         ),
     ];
     for (index, (asked, prepare, send)) in cases.into_iter().enumerate() {
-        let mut rig = Rig::new();
-        let to = prepare(&mut rig);
-        let sessions = rig.server.session_count();
-        rig.force(asked, Err(env_failed(index)));
-        let reply = send(&mut rig, to);
-        assert_eq!(reply, only(DEFERRED_REPLY_DROPPED), "case {index}");
-        let stops = rig.halts.stops();
-        assert_eq!(stops, [Stop::Handler(env_failed(index))], "case {index}");
-        assert_eq!(rig.server.session_count(), sessions, "case {index}");
+        for disagree in [false, true] {
+            let case = format!("case {index}, disagreeing: {disagree}");
+            let mut rig = Rig::new();
+            let to = prepare(&mut rig);
+            let sessions = rig.server.session_count();
+            rig.force(asked, Err(env_failed(index, disagree)));
+            let reply = send(&mut rig, to);
+            assert_eq!(reply, only(DEFERRED_REPLY_DROPPED), "{case}");
+            let stops = rig.halts.stops();
+            assert_eq!(
+                stops,
+                [handler_failed(env_failed(index, disagree))],
+                "{case}"
+            );
+            assert_eq!(rig.server.session_count(), sessions, "{case}");
+        }
     }
     assert_eq!(
-        Stop::Handler(env_failed(3)).to_string(),
+        handler_failed(env_failed(3, false)).to_string(),
         "the environment failed fsp-srv while it handled a request: recording exhausted at \
          record 3: the replay asked for HostIo"
+    );
+    assert_eq!(
+        handler_failed(env_failed(4, true)).to_string(),
+        "the environment failed fsp-srv while it handled a request: record 4 answers Random but \
+         the replay asked for HostIo"
     );
 }
 
