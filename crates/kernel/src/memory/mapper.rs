@@ -19,6 +19,10 @@
 //! default that refuses, for a translation with no backing to share (the kernel then fails the
 //! call inside itself). `starquake-core`'s translation hands out guest RAM for both
 //! (`SpaceMapper` in `crates/core/src/space.rs`).
+//!
+//! `MapMemory`'s alias is the other exception: its pages must be the source's, so
+//! [`Mapper::map_alias`] names the source by its address. It has a default that refuses too
+//! ([`NO_ALIAS`]); `starquake-core`'s translation maps the source's backing a second time.
 
 use starquake_memory::{BackingRange, Perms};
 
@@ -26,6 +30,9 @@ use super::shared::SharedPages;
 
 /// What the default [`Mapper::allocate_shared`] and [`Mapper::map_shared`] refuse with.
 pub const NO_SHARED_BACKING: &str = "this translation has no backing to share";
+
+/// What the default [`Mapper::map_alias`] refuses with.
+pub const NO_ALIAS: &str = "this translation cannot map the same pages at two addresses";
 
 /// Why a [`Mapper`] could not make a change real.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -43,8 +50,8 @@ pub trait Mapper: Send {
     fn map(&mut self, address: u64, size: u64, perms: Perms) -> Result<(), MapperError>;
     /// Guest code may no longer use the `size` bytes at `address`. All of it was mapped. What
     /// it held is gone: mapped again, it reads as zero. Pages mapped with
-    /// [`Mapper::map_shared`] are the exception: they belong to their shared memory and keep
-    /// what they hold.
+    /// [`Mapper::map_shared`] or [`Mapper::map_alias`] are the exception: they belong to their
+    /// shared memory, or to the alias's source, and keep what they hold there.
     fn unmap(&mut self, address: u64, size: u64) -> Result<(), MapperError>;
     /// Guest code may now use the `size` bytes at `address` as `perms` allows, and no
     /// otherwise. All of it was mapped, and keeps what it holds.
@@ -73,5 +80,22 @@ pub trait Mapper: Send {
         _perms: Perms,
     ) -> Result<(), MapperError> {
         Err(MapperError(NO_SHARED_BACKING.into()))
+    }
+
+    /// Guest code may now use the `size` bytes at `address` as `perms` allows, and they are the
+    /// pages of the `size` bytes at `source`: what is written through one is read through the
+    /// other (`MapPageGroupImpl` with the source's page group, in `KPageTableBase::MapMemory`).
+    /// Nothing was mapped at `address`; all of `source` was mapped, and keeps its own
+    /// permission. [`Mapper::unmap`] of the alias leaves the source's pages and what they hold.
+    ///
+    /// The default refuses with [`NO_ALIAS`].
+    fn map_alias(
+        &mut self,
+        _address: u64,
+        _source: u64,
+        _size: u64,
+        _perms: Perms,
+    ) -> Result<(), MapperError> {
+        Err(MapperError(NO_ALIAS.into()))
     }
 }

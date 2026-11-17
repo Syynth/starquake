@@ -104,8 +104,8 @@ svc_ids! {
     SetHeapSize = 0x01, Implemented;
     SetMemoryPermission = 0x02, Implemented;
     SetMemoryAttribute = 0x03, Implemented;
-    MapMemory = 0x04, Planned;
-    UnmapMemory = 0x05, Planned;
+    MapMemory = 0x04, Implemented;
+    UnmapMemory = 0x05, Implemented;
     QueryMemory = 0x06, Implemented;
     ExitProcess = 0x07, Implemented;
     CreateThread = 0x08, Implemented;
@@ -306,6 +306,8 @@ mod tests {
                 SvcId::SetHeapSize
                 | SvcId::SetMemoryPermission
                 | SvcId::SetMemoryAttribute
+                | SvcId::MapMemory
+                | SvcId::UnmapMemory
                 | SvcId::QueryMemory
                 | SvcId::ExitProcess
                 | SvcId::CreateThread

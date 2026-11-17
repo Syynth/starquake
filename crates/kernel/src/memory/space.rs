@@ -387,6 +387,8 @@ pub struct AddressSpace {
     /// Bytes `MapPhysicalMemory` has mapped and `UnmapPhysicalMemory` has not unmapped
     /// (`m_mapped_physical_memory_size`).
     mapped_physical_memory_size: u64,
+    /// The `MapMemory` aliases, by where each run of alias pages starts (see [`alias`]).
+    aliases: alias::Aliases,
     mapper: Box<dyn Mapper>,
 }
 
@@ -443,6 +445,7 @@ impl fmt::Debug for AddressSpace {
                 "mapped_physical_memory_size",
                 &self.mapped_physical_memory_size,
             )
+            .field("aliases", &self.aliases)
             .field("created_from", &self.created_from)
             .finish_non_exhaustive()
     }
@@ -557,6 +560,7 @@ impl AddressSpace {
             shared: BTreeMap::new(),
             device_locks: BTreeMap::new(),
             mapped_physical_memory_size: 0,
+            aliases: alias::Aliases::default(),
             mapper,
         };
         // Reserve memory for our code resource.
@@ -1758,10 +1762,15 @@ impl AddressSpace {
     }
 }
 
+mod alias;
+
 pub mod snapshot;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod alias_tests;
 
 #[cfg(test)]
 mod device_tests;

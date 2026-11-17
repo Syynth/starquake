@@ -848,6 +848,7 @@ impl Dispatcher {
                 .call::<(&mut AddressSpace,)>(call, |(space,), call, _| {
                     set_memory_attribute(space, id, convention, call.regs)
                 }),
+            SvcId::MapMemory | SvcId::UnmapMemory => self.map_unmap_memory(call, id, convention),
             SvcId::QueryMemory => self.call::<(&AddressSpace,)>(call, |(space,), call, _| {
                 query_memory(space, call.caller.memory, id, convention, call.regs)
             }),
@@ -967,6 +968,27 @@ fn set_memory_attribute(
         memory::set_memory_attribute(space, address, size, mask, attribute)?;
         Ok([])
     })
+}
+
+impl Dispatcher {
+    /// `MapMemory`'s and `UnmapMemory`'s arm: they declare the address space.
+    fn map_unmap_memory(
+        &self,
+        call: &mut Call<'_, '_>,
+        id: SvcId,
+        convention: &Convention,
+    ) -> Outcome {
+        self.call::<(&mut AddressSpace,)>(call, |(space,), call, _| {
+            returning(id, convention, call.regs, |[dst, src, size]| {
+                if id == SvcId::MapMemory {
+                    memory::map_memory(space, dst, src, size)?;
+                } else {
+                    memory::unmap_memory(space, dst, src, size)?;
+                }
+                Ok([])
+            })
+        })
+    }
 }
 
 impl Dispatcher {
