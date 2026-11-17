@@ -12,8 +12,15 @@
 //! first, then `Syncpoints::new` with the queue as its `Completions`, then [`Shared::new`].
 //!
 //! [`GsvShared`] holds, so far, the waiter count of each syncpoint ([`Locked::watch`],
-//! [`Locked::unwatch`]); later slices add the waiter tables, the shared page, the GPU memory
-//! bookkeeping, vi2's queues and the native object tables (spec, "Concurrency inside gsv").
+//! [`Locked::unwatch`]) and the syncpt sessions' waiter table ([`Waiters`]: [`Locked::arm`],
+//! [`Locked::disarm`]; slice 4); later slices add the shared page, the GPU memory bookkeeping,
+//! vi2's queues and the native object tables (spec, "Concurrency inside gsv").
+//!
+//! Each armed wait holds one watch of its syncpoint: [`Locked::arm`] takes it, and gives back
+//! the watch of the wait it replaces; [`Locked::disarm`] and the drain's firing give it back
+//! (`an_armed_wait_holds_one_watch_of_its_syncpoint`). Other watchers (the shared page, slice
+//! 5) may hold more watches, so a syncpoint's waiter count is at least its number of armed
+//! waits.
 //!
 //! # The watched-id fast path
 //!
@@ -42,12 +49,12 @@
 //! acts, so a completion pushed meanwhile (by the kernel's hook, say) waits for the next drain
 //! (`a_push_during_the_drain_waits_for_the_next_one`).
 //!
-//! What the drain does with each completion, so far, is record it, except a device-share
-//! release, which it unlocks:
+//! What the drain does with each completion, so far, is record it, fire the waits a syncpoint's
+//! change reaches, and unlock a device-share release:
 //!
 //! | Completion | What the drain does |
 //! |---|---|
-//! | `GpuCompletion::SyncpointChanged` | records `SyncpointObserved` ([`crate::note`]) |
+//! | `GpuCompletion::SyncpointChanged` | records `SyncpointObserved` ([`crate::note`]), then fires every armed wait on the id that the drained value satisfies: takes it out of the table, unwatches its id, and signals its event through the kernel ([`TimerHost::signal_event`]), in ascending event order (`a_change_fires_its_waits_after_its_note_in_event_order`) |
 //! | `GpuCompletion::GpuOrdered` | records `GpuOrderedDone` |
 //! | `GpuCompletion::GpuQueueRoom` | records `QueueRoom` |
 //! | [`Completion::GuestSignalled`] | nothing: the guest's `SignalEvent` is recorded as its system call, and what gsv does about it (the shared page's answer, slice 5) records its own note |
@@ -61,8 +68,17 @@
 //! (`a_refused_release_is_logged_and_the_drain_goes_on`; the levels are pinned by
 //! `tests/release_log_levels.rs`, a test binary of its own).
 //!
-//! Later slices act on them as well: the syncpt waiter table (slice 4), the shared page (5), the
-//! ordered completion of unmaps and destroys (7), deferred submissions (11).
+//! **Waits fire on the drained value, not the counter.** A wait is compared with the value the
+//! drain took from the queue, the one it records as `SyncpointObserved`, so that what gsv acts
+//! on is what replay feeds back. Drained values are not monotone (the completion module's
+//! "Coalescing"), which a wait tolerates: a wait fires on the first value that satisfies it and
+//! is gone, and a stale value drained after a newer one satisfies no wait the newer one did
+//! not, unless the two are 2^31 or more apart under the wrapping comparison. A refused signal
+//! (the kernel no longer has the event) is logged as an error and the drain goes on; the wait
+//! is gone either way (`a_refused_signal_is_logged_and_the_drain_goes_on`).
+//!
+//! Later slices act on them as well: the shared page (5), the ordered completion of unmaps and
+//! destroys (7), deferred submissions (11).
 //!
 //! # The timer thread, until the wiring
 //!
@@ -76,17 +92,25 @@
 //!
 //! [`Shared::save`] writes [`GsvShared`] (graphics-server, "What is snapshotted": "the watched
 //! bitmap and every armed wait"; the bitmap itself is in the `Syncpoints` snapshot, the counts
-//! here). `postcard`, after a header of [`SNAPSHOT_MAGIC`] and [`SNAPSHOT_VERSION`] that is
-//! decoded and checked before the body. The body is the waiter count of each syncpoint, by id.
+//! and the waits here). `postcard`, after a header of [`SNAPSHOT_MAGIC`] and
+//! [`SNAPSHOT_VERSION`] that is decoded and checked before the body. The body is the waiter
+//! count of each syncpoint, by id, then the armed waits in ascending event order, each its
+//! event, syncpoint id, threshold and mode byte (`crate::syncpt::waiters`, "Snapshot form").
 //! The golden-bytes test `the_snapshot_layout_is_pinned` pins it; changing it means bumping
-//! [`SNAPSHOT_VERSION`]. The queue has its own snapshot ([`CompletionQueue::save`]), because it
+//! [`SNAPSHOT_VERSION`]. Version 2 added the waits. The queue has its own snapshot ([`CompletionQueue::save`]), because it
 //! must exist before the `Syncpoints` that pushes to it.
 //!
 //! A snapshot is a file and is not trusted. [`Shared::restore`] checks, in this order, and
 //! returns the first failure: the magic, the version, that the body decodes, that no bytes
-//! follow it, that it holds `SYNCPOINT_COUNT` counts, and then, id by id, that the count is not
-//! zero exactly when the restored `Syncpoints` has the id watched. [`Shared::save`] runs the same
+//! follow it, that it holds `SYNCPOINT_COUNT` counts, then each wait in list order
+//! ([`SavedWaitError`]), and then, id by id, that the count is not zero exactly when the
+//! restored `Syncpoints` has the id watched, and that the count is at least the number of waits
+//! armed on the id ([`SnapshotError::WaitsOutnumberWatchers`]). [`Shared::save`] runs the same
 //! checks on what it is about to write.
+//!
+//! Not checked here: that each wait's event is a slot event of an open syncpt session, which
+//! the syncpt server's own snapshot holds. A whole-machine restore (slice 16) checks that
+//! relation across the two.
 
 use std::ops::Deref;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -95,12 +119,15 @@ use serde::{Deserialize, Serialize};
 use starquake_gpu::interface::{GpuCompletion, SYNCPOINT_COUNT, SyncpointId};
 use starquake_gpu::syncpoint::Syncpoints;
 use starquake_kernel::dispatch::DeviceShareError;
+use starquake_kernel::id::ObjectId;
 use starquake_kernel::memory::DeviceShareToken;
+use starquake_kernel::result::SvcResult;
 use starquake_trace::{EventKind, ServiceId};
 use thiserror::Error;
 
 use crate::completion::{Completion, CompletionQueue};
 use crate::note::Note;
+use crate::syncpt::waiters::{SavedWait, SavedWaitError, Wait, Waiters};
 
 #[cfg(test)]
 mod tests;
@@ -112,7 +139,7 @@ const COUNT: usize = SYNCPOINT_COUNT as usize;
 pub const SNAPSHOT_MAGIC: [u8; 4] = *b"SQGS";
 
 /// Layout version written into every gsv shared-state snapshot and required when reading one.
-pub const SNAPSHOT_VERSION: u32 = 1;
+pub const SNAPSHOT_VERSION: u32 = 2;
 
 /// How the timer thread's drain reaches the kernel and the event stream. The wiring implements
 /// it over the kernel's dispatcher; tests implement it with a fake (module docs, "The timer
@@ -128,6 +155,10 @@ pub trait TimerHost {
     /// Releases the device-share lock `token` names, through the kernel, which checks the token
     /// (`Dispatcher::unlock_device_share`, whose refusals these are).
     fn unlock_device_share(&mut self, token: DeviceShareToken) -> Result<(), DeviceShareError>;
+
+    /// Signals `event`, an event a gsv server made, through the kernel: how the drain fires an
+    /// armed wait (module docs, "Lock order and the drain").
+    fn signal_event(&mut self, event: ObjectId) -> SvcResult<()>;
 }
 
 /// What gsv's request handlers and its timer thread share (module docs, "The pieces").
@@ -139,6 +170,8 @@ pub trait TimerHost {
 pub struct GsvShared {
     /// The number of waiters on each syncpoint, by id.
     watchers: Vec<u32>,
+    /// The syncpt sessions' armed waits.
+    waiters: Waiters,
 }
 
 impl GsvShared {
@@ -146,7 +179,14 @@ impl GsvShared {
     fn fresh() -> Self {
         Self {
             watchers: vec![0; COUNT],
+            waiters: Waiters::default(),
         }
+    }
+
+    /// The syncpt sessions' armed waits.
+    #[must_use]
+    pub const fn waiters(&self) -> &Waiters {
+        &self.waiters
     }
 
     /// The number of waiters on syncpoint `id`.
@@ -208,6 +248,44 @@ impl Locked<'_> {
             self.syncpoints.unwatch(id);
         }
         Ok(())
+    }
+
+    /// Arms `wait` on `event`, replacing the wait armed on it before, and returns the wait's
+    /// counter, read after its id was watched ([`Locked::watch`]): the caller compares the
+    /// threshold with it, and any later increment is pushed to the queue. The replaced wait's
+    /// watch is given back (module docs, "The pieces"). Nothing changes on an error.
+    pub fn arm(&mut self, event: ObjectId, wait: Wait) -> Result<u32, WatchError> {
+        let value = self.watch(wait.id())?;
+        if let Some(replaced) = self.state.waiters.insert(event, wait) {
+            self.release(replaced.id());
+        }
+        Ok(value)
+    }
+
+    /// Takes the wait armed on `event` out of the table, unwatching its id, and returns it;
+    /// `None` if no wait was armed on it.
+    pub fn disarm(&mut self, event: ObjectId) -> Option<Wait> {
+        let wait = self.state.waiters.remove(event)?;
+        self.release(wait.id());
+        Some(wait)
+    }
+
+    /// Fires the waits on `id` that `value` satisfies: takes them out, unwatches their id, and
+    /// returns their events in ascending order (module docs, "Lock order and the drain").
+    fn fire(&mut self, id: SyncpointId, value: u32) -> Vec<ObjectId> {
+        let fired = self.state.waiters.take_reached(id, value);
+        for _ in &fired {
+            self.release(id);
+        }
+        fired
+    }
+
+    /// Gives back the watch a wait on `id` held. A wait always holds one, so a refusal means
+    /// gsv's own bookkeeping is wrong: it is logged as an error.
+    fn release(&mut self, id: SyncpointId) {
+        if let Err(error) = self.unwatch(id) {
+            tracing::error!(%error, "gsv: an armed wait held no watch of its syncpoint");
+        }
     }
 }
 
@@ -280,7 +358,7 @@ impl Shared {
     /// completion in the queue's order, recording its note through `host` (module docs, "Lock
     /// order and the drain"). Returns what it took, in order.
     pub fn drain(&self, host: &mut dyn TimerHost) -> Vec<Completion> {
-        let state = self.lock();
+        let mut state = self.lock();
         let taken = self.queue.take_all();
         for completion in &taken {
             match *completion {
@@ -288,18 +366,38 @@ impl Shared {
                 Completion::GuestSignalled { .. } => {
                     tracing::trace!(?completion, "gsv drained a guest signal");
                 }
-                Completion::Gpu(gpu) => host.record(note(gpu).event(self.service)),
+                Completion::Gpu(gpu) => {
+                    host.record(note(gpu).event(self.service));
+                    if let GpuCompletion::SyncpointChanged { id, value } = gpu {
+                        for event in state.fire(id, value) {
+                            signal(host, event);
+                        }
+                    }
+                }
             }
         }
         drop(state);
         taken
     }
 
+    /// Whether gsv's shared lock is held now, for tests of the lock order.
+    #[cfg(test)]
+    pub(crate) fn lock_is_held(&self) -> bool {
+        matches!(
+            self.state.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        )
+    }
+
     /// Writes [`GsvShared`] (module docs, "Snapshot format"). Take it while nothing changes the
     /// state or the watched bitmap.
     pub fn save(&self) -> Result<Vec<u8>, SnapshotError> {
-        let saved = State {
-            watchers: self.lock().watchers.clone(),
+        let saved = {
+            let state = self.lock();
+            State {
+                watchers: state.watchers.clone(),
+                waits: state.waiters.save(),
+            }
         };
         saved.check(&self.syncpoints)?;
         let mut bytes = postcard::to_allocvec(&Header {
@@ -335,9 +433,10 @@ impl Shared {
         if !rest.is_empty() {
             return Err(SnapshotError::TrailingBytes { count: rest.len() });
         }
-        saved.check(&syncpoints)?;
+        let waiters = saved.check(&syncpoints)?;
         let state = GsvShared {
             watchers: saved.watchers,
+            waiters,
         };
         Ok(Self::with_state(state, syncpoints, queue, service))
     }
@@ -350,6 +449,14 @@ fn note(completion: GpuCompletion) -> Note {
         GpuCompletion::SyncpointChanged { id, value } => Note::SyncpointObserved { id, value },
         GpuCompletion::GpuOrdered { ticket } => Note::GpuOrderedDone { ticket },
         GpuCompletion::GpuQueueRoom { channel } => Note::QueueRoom { channel },
+    }
+}
+
+/// Signals `event` through `host` to fire its wait, logging a refusal (module docs, "Lock order
+/// and the drain").
+fn signal(host: &mut dyn TimerHost, event: ObjectId) {
+    if let Err(error) = host.signal_event(event) {
+        tracing::error!(%error, ?event, "the kernel refused to signal an armed wait's event");
     }
 }
 
@@ -415,6 +522,21 @@ pub enum SnapshotError {
         /// Whether the syncpoints have it watched.
         watched: bool,
     },
+    /// A saved wait could not be read back.
+    #[error("the gsv shared state snapshot's waits: {0}")]
+    Wait(#[from] SavedWaitError),
+    /// A syncpoint has more armed waits than waiters: each wait holds one watch.
+    #[error(
+        "the gsv shared state snapshot arms {waits} waits on syncpoint {id}, which has {waiters} waiters"
+    )]
+    WaitsOutnumberWatchers {
+        /// The syncpoint.
+        id: u8,
+        /// The waits armed on it.
+        waits: usize,
+        /// Its waiter count.
+        waiters: u32,
+    },
 }
 
 /// The snapshot header.
@@ -431,27 +553,39 @@ struct Header {
 struct State {
     /// The waiter count of each syncpoint, by id.
     watchers: Vec<u32>,
+    /// The armed waits, in ascending event order.
+    waits: Vec<SavedWait>,
 }
 
 impl State {
     /// The checks [`Shared::save`] and [`Shared::restore`] share, in the documented order.
-    fn check(&self, syncpoints: &Syncpoints) -> Result<(), SnapshotError> {
+    /// Returns the waiter table the snapshot holds.
+    fn check(&self, syncpoints: &Syncpoints) -> Result<Waiters, SnapshotError> {
         if self.watchers.len() != COUNT {
             return Err(SnapshotError::WaiterCounts {
                 found: self.watchers.len(),
             });
         }
+        let waiters = Waiters::restore(&self.waits)?;
         let ids = (0..=u8::MAX).map_while(SyncpointId::new);
-        for (id, &waiters) in ids.zip(&self.watchers) {
+        for (id, &count) in ids.zip(&self.watchers) {
             let watched = syncpoints.is_watched(id);
-            if (waiters != 0) != watched {
+            if (count != 0) != watched {
                 return Err(SnapshotError::WatchMismatch {
                     id: id.get(),
-                    waiters,
+                    waiters: count,
                     watched,
                 });
             }
+            let waits = waiters.on(id);
+            if u32::try_from(waits).map_or(true, |waits| waits > count) {
+                return Err(SnapshotError::WaitsOutnumberWatchers {
+                    id: id.get(),
+                    waits,
+                    waiters: count,
+                });
+            }
         }
-        Ok(())
+        Ok(waiters)
     }
 }

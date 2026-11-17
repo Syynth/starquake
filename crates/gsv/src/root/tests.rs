@@ -11,9 +11,7 @@ use std::collections::BTreeSet;
 
 use proptest::prelude::*;
 use proptest::test_runner::{Config, RngAlgorithm, RngSeed};
-use starquake_ipc::{
-    BUFFER_SIZE, CommandType, Message, RequestBuilder, SFCO_MAGIC, SessionKind, TIPC_COMMAND_OFFSET,
-};
+use starquake_ipc::{BUFFER_SIZE, CommandType, RequestBuilder, SFCO_MAGIC};
 use starquake_kernel::handle::Handle;
 use starquake_kernel::id::ObjectId;
 use starquake_kernel::memory::{SharedPages, SvcPermission};
@@ -28,14 +26,12 @@ use starquake_trace::{EventKind, IpcOutcome, ServiceId};
 
 use super::*;
 use crate::protocol::{HANDLE_KIND, Mark, ROOT_COMMANDS};
+use crate::testing::{
+    SPECIAL, STALE, buffer_of, copied, halves, le, result_only, success, tipc_type,
+};
 
 /// The number the tests' root server is known by.
 const ROOT: ServiceId = ServiceId(0x0657);
-/// What fills a message buffer before a request is laid into it.
-const STALE: u8 = 0xA5;
-/// The TIPC header's "a special header follows" bit (PR `DecodeBootstrap`: `packet[1] !=
-/// 0x8000000c`, a special header and twelve data words).
-const SPECIAL: u32 = 0x8000_0000;
 /// A special header that counts one copied handle (PR `DecodeBootstrap`: `packet[2] != 2`).
 const ONE_COPY: u32 = 2;
 
@@ -104,29 +100,6 @@ impl Rig {
     }
 }
 
-/// Little-endian words as bytes.
-fn le(words: &[u32]) -> Vec<u8> {
-    words.iter().flat_map(|w| w.to_le_bytes()).collect()
-}
-
-/// A whole message buffer that starts with `words` and is zero after them.
-fn buffer_of(words: &[u32]) -> Vec<u8> {
-    let mut buffer = le(words);
-    buffer.resize(BUFFER_SIZE, 0);
-    buffer
-}
-
-/// A TIPC message's type word for command `id`.
-fn tipc_type(id: u32) -> u32 {
-    u32::from(TIPC_COMMAND_OFFSET) + id
-}
-
-/// The low and high words of a `u64`.
-fn halves(value: u64) -> [u32; 2] {
-    let bytes = value.to_le_bytes();
-    let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
-    [word(0), word(4)]
-}
 
 /// `Initialize` (4) as PR's `DecodeBootstrap` reads it: `0x14, 0x8000000c, 2`, the process
 /// handle at word 3, the applet resource user id at words 4–5, the flags at 6–7 and the four
@@ -142,36 +115,6 @@ fn initialize_words(process: u32, request: &BootstrapRequest) -> Vec<u32> {
     }
     assert_eq!(words.len(), 16);
     words
-}
-
-/// A TIPC reply to command `id` that holds a result and nothing else.
-fn result_only(id: u32, result: ResultCode) -> Vec<u8> {
-    buffer_of(&[tipc_type(id), 1, result.raw()])
-}
-
-/// A successful TIPC reply to `id` with these copied handles and data words: the header (raw
-/// size: the result word and the data), the special header when there are handles, the
-/// handles, the result, the data.
-fn success(id: u32, copies: &[u32], data: &[u32]) -> Vec<u8> {
-    let raw = 1 + u32::try_from(data.len()).unwrap();
-    let mut words = vec![tipc_type(id)];
-    if copies.is_empty() {
-        words.push(raw);
-    } else {
-        words.push(SPECIAL | raw);
-        words.push(u32::try_from(copies.len()).unwrap() << 1);
-        words.extend(copies);
-    }
-    words.push(ResultCode::SUCCESS.raw());
-    words.extend(data);
-    buffer_of(&words)
-}
-
-/// The handles a reply copied.
-fn copied(buffer: &[u8]) -> Vec<u32> {
-    Message::parse_reply(buffer, SessionKind::Session)
-        .unwrap()
-        .copy_handles
 }
 
 /// A local bootstrap request whose fields are all distinct and non-zero except the parameters,
