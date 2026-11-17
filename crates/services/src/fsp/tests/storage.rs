@@ -75,7 +75,7 @@ impl Rig {
     }
 
     /// `OpenDataStorageByCurrentProcess` on the rig's session: the storage's session.
-    fn open_storage(&mut self) -> ObjectId {
+    pub(super) fn open_storage(&mut self) -> ObjectId {
         let reply = self.send(
             To::Session(self.session),
             OPEN_DATA_STORAGE_BY_CURRENT_PROCESS,
@@ -170,8 +170,16 @@ fn a_storage_works_as_a_domain_object() {
     assert_eq!(rig.kernel.memory(DATA_AT, 4).unwrap(), &image()[..4]);
 }
 
+/// What [`Broken`] answers every host request with.
+pub(super) fn broken_error() -> EnvError {
+    EnvError::Exhausted {
+        index: 0,
+        requested: EnvCall::HostIo,
+    }
+}
+
 /// An environment whose every host request fails.
-struct Broken;
+pub(super) struct Broken;
 
 impl Env for Broken {
     fn now(&self) -> Result<HostNanos, EnvError> {
@@ -183,21 +191,23 @@ impl Env for Broken {
     }
 
     fn host_io(&self, _: &HostIoRequest) -> Result<HostIoReply, EnvError> {
-        Err(EnvError::Exhausted {
-            index: 0,
-            requested: EnvCall::HostIo,
-        })
+        Err(broken_error())
     }
 }
 
 /// `OpenDataStorageByCurrentProcess` on a fresh server over `env`.
 fn open_over(env: Arc<dyn Env>) -> Answered {
+    open_with(env, OPEN_DATA_STORAGE_BY_CURRENT_PROCESS, unwatched())
+}
+
+/// The open `command` (one of the `RomFS` opens) on a fresh server over `env`, telling `halt`.
+pub(super) fn open_with(env: Arc<dyn Env>, command: u32, halt: Arc<dyn Halt>) -> Answered {
     let mut kernel = FakeKernel::new(0).unwrap();
     let session = kernel.new_object();
-    let mut server = server(UnknownPolicy::Strict, env);
+    let mut server = server(UnknownPolicy::Strict, env, halt);
     server.accept(session).unwrap();
     let mut buffer = vec![STALE; BUFFER_SIZE];
-    RequestBuilder::cmif(CommandType::Request, OPEN_DATA_STORAGE_BY_CURRENT_PROCESS)
+    RequestBuilder::cmif(CommandType::Request, command)
         .build(&mut buffer)
         .unwrap();
     let handled = server.handle(&mut kernel, session, &mut buffer);
@@ -218,9 +228,16 @@ fn without_a_romfs_opening_the_data_storage_is_eden_s_unknown() {
     assert_eq!(reply, only(result::UNKNOWN));
     assert_eq!(result::UNKNOWN.raw(), u32::MAX);
     assert_eq!(rig.server.session_count(), 1);
-    // No handler at all, and an environment that fails, answer the same.
+    // No handler at all answers the same.
     assert_eq!(open_over(Arc::new(NoHost)), only(result::UNKNOWN));
-    assert_eq!(open_over(Arc::new(Broken)), only(result::UNKNOWN));
+    // An environment that fails is no answer of the host's: it stops the run (decision log,
+    // 2026-11-17, "Env failures"), and the request is answered as one the server gave up on.
+    let halts = Arc::new(Halts::default());
+    let halt: Arc<dyn Halt> = Arc::<Halts>::clone(&halts);
+    let command = OPEN_DATA_STORAGE_BY_CURRENT_PROCESS;
+    let reply = open_with(Arc::new(Broken), command, halt);
+    assert_eq!(reply, only(DEFERRED_REPLY_DROPPED));
+    assert_eq!(halts.stops(), [Stop::Handler(broken_error())]);
     // A probe answered with bytes is not a storage either.
     let rig = Rig::with_storage();
     rig.env.host().forced = Some((Asked::Probe, Ok(HostIoReply::Data(vec![0]))));
@@ -325,7 +342,7 @@ fn an_open_storage_is_saved_and_a_restored_one_answers() {
     let saved = rig.server.save().unwrap();
     let env: Arc<dyn Env> = Arc::<FakeEnv>::clone(&rig.env);
     let executor: Arc<dyn Executor> = Arc::<Jobs>::clone(&rig.jobs);
-    let mut restored = server(UnknownPolicy::Strict, env).with_executor(executor);
+    let mut restored = server(UnknownPolicy::Strict, env, unwatched()).with_executor(executor);
     restored.restore(&saved).unwrap();
     assert_eq!(restored.session_count(), 2);
     rig.server = restored;
@@ -340,21 +357,25 @@ fn an_open_storage_is_saved_and_a_restored_one_answers() {
 
 #[test]
 fn a_file_system_on_the_data_storage_is_never_saved_or_restored() {
-    // Only a folder is a file system's mount; the storage's mount is not saved, and a snapshot
-    // naming it (variant 1) is refused.
+    // Only a file system is a file system's mount; the storage's mount is not saved, and a
+    // snapshot naming a variant past the saved ones (2, the storage's place) is refused.
     let file_system = IFileSystem {
         mount: Mount::DataStorage,
     };
     assert!(file_system.save().is_err());
     assert_eq!(
-        postcard::from_bytes::<IFileSystem>(&[1]).unwrap_err(),
+        postcard::from_bytes::<IFileSystem>(&[2]).unwrap_err(),
         postcard::Error::SerdeDeCustom
     );
-    let bytes = postcard::to_allocvec(&(1u8, b"/a")).unwrap();
+    let bytes = postcard::to_allocvec(&(2u8, b"/a")).unwrap();
     assert!(postcard::from_bytes::<IFile>(&bytes).is_err());
-    // The SD card's still is.
+    // The SD card's and the data file system's still are.
     assert_eq!(
         postcard::from_bytes::<IFileSystem>(&[0]).unwrap().mount,
         Mount::SdCard
+    );
+    assert_eq!(
+        postcard::from_bytes::<IFileSystem>(&[1]).unwrap().mount,
+        Mount::DataFileSystem
     );
 }

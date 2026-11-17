@@ -103,10 +103,35 @@
 //!   they are made too, and the workers keep no record of their own (`Recording::Off`, test:
 //!   `a_real_runs_workers_keep_no_record`): the order the reads became visible in is in the
 //!   event stream, as each delivery's request event.
+//!
+//! # When the environment fails a service
+//!
+//! An `Env` call that fails (a replay that ran out or disagreed) stops the run as an emulator
+//! error, never a guest-visible result (decision log, 2026-11-17, "Env failures"). For the
+//! kernel's own calls that is [`Outcome::EnvFailed`](starquake_kernel::dispatch::Outcome). For
+//! `fsp-srv`, whose handlers and workers see the failure on their own threads, it is
+//! [`Halted`], the `starquake_services::fsp::halt::Halt` the run gives the services
+//! ([`Given::halt`]): told the reason on the thread that saw the failure, before the request is
+//! answered, it keeps the first reason and rings the timer. From then on [`Machine::is_stopped`]
+//! is true, and the first loop to ask ends the run with the reason's words. Every core asks
+//! after it has chosen the thread it runs and before it enters the guest, so no core enters the
+//! guest once the halt is told: not for the requesting thread, whose reply comes after the
+//! halt, and not for any other. The tests `an_environment_failure_in_a_handler_stops_the_run`
+//! and `an_environment_failure_in_a_read_stops_the_run` (`machine/tests/reads.rs`) pin the
+//! reason the run ends with and that the guest's next step never runs. The check before
+//! entering is what covers a halt told after a core's loop last asked and before it enters the
+//! guest (a thread that a delivery woke on another thread while the halt was told);
+//! `a_halt_told_as_a_thread_is_loaded_keeps_the_guest_out` tells the halt at exactly that point,
+//! as the core loads the thread. A halt that no delivery follows, told while the guest waits
+//! for a reply with no deadline, ends the run too
+//! (`a_halt_no_delivery_follows_stops_a_guest_waiting_for_its_reply`). The ring only shortens
+//! the timer thread's sleep: without it the run would still stop at the timer's next turn, at
+//! most one preemption interval later, so the run-level tests cannot see it;
+//! `a_halt_keeps_its_first_reason_and_rings_the_timer_each_time` pins it on [`Halted`] itself.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Instant;
 
 use starquake_cpu::{GuestRegs, Syndrome, Vcpu};
@@ -120,6 +145,7 @@ use starquake_kernel::svc::DebugSink;
 use starquake_kernel::tables::{AddressSpace, Scheduler};
 use starquake_kernel::time::CounterRate;
 use starquake_memory::{Access, GuestMemory};
+use starquake_services::fsp::halt::{Halt, Stop};
 use starquake_services::fsp::worker::{self, Recording, StartError, Workers};
 use starquake_trace::{
     DumpError, Env, EventKind, FlightRecorder, GuestTicks, HostClock, HostNanos, LifecyclePhase,
@@ -217,6 +243,38 @@ impl crate::hle::Deliveries for Ready {
     }
 }
 
+/// What `fsp-srv` tells when the environment fails it (module docs, "When the environment fails
+/// a service"): the first reason it is told, which the run then ends with. Cloned into the
+/// services, which may outlive the loop; every clone is the same one.
+pub(crate) struct Halted {
+    reason: OnceLock<String>,
+    bell: Arc<timer::Bell>,
+}
+
+impl Halted {
+    fn new(bell: Arc<timer::Bell>) -> Self {
+        Self {
+            reason: OnceLock::new(),
+            bell,
+        }
+    }
+
+    /// The first reason the run was told to stop for, in plain words.
+    fn reason(&self) -> Option<&str> {
+        self.reason.get().map(String::as_str)
+    }
+}
+
+impl Halt for Halted {
+    fn halt(&self, stop: Stop) {
+        let reason = stop.to_string();
+        if self.reason.set(reason).is_ok() {
+            tracing::error!(%stop, "a service was failed by the environment: the run stops");
+        }
+        self.bell.ring();
+    }
+}
+
 /// What a run gives the services it installs ([`Install`]).
 pub(crate) struct Given {
     /// The environment the services' methods read the host through.
@@ -226,6 +284,8 @@ pub(crate) struct Given {
     pub(crate) reads: Vec<Arc<LiveEnv>>,
     /// How a service says its deferred replies are ready.
     pub(crate) ready: Ready,
+    /// How a service stops the run when the environment fails it ([`Halted`]).
+    pub(crate) halt: Arc<dyn Halt>,
 }
 
 /// Puts a run's services in front of its dispatcher, with what the run gives them ([`Given`]).
@@ -235,22 +295,24 @@ pub(crate) type Install = dyn Fn(&Dispatcher, Given) -> Result<(), String> + Syn
 /// The services of a real run ([`crate::hle::install`]), with `fsp-srv`'s reads on its workers,
 /// which keep no record (module docs, "The environment").
 fn real_services(dispatcher: &Dispatcher, given: Given) -> Result<(), String> {
-    let workers = reads_workers(&given.reads).map_err(|error| error.to_string())?;
+    let workers =
+        reads_workers(&given.reads, Arc::clone(&given.halt)).map_err(|error| error.to_string())?;
     let reads = Reads {
         executor: Arc::new(workers),
         ready: Arc::new(given.ready),
+        halt: given.halt,
     };
     crate::hle::install(dispatcher, given.env, reads).map_err(|error| error.to_string())
 }
 
 /// A real run's `fsp-srv` workers: one thread on each of `envs`, keeping no record (module docs,
-/// "The environment").
-fn reads_workers(envs: &[Arc<LiveEnv>]) -> Result<Workers, StartError> {
+/// "The environment"), telling `halt` when a read's environment fails it.
+fn reads_workers(envs: &[Arc<LiveEnv>], halt: Arc<dyn Halt>) -> Result<Workers, StartError> {
     let envs = envs
         .iter()
         .map(|env| -> Arc<dyn Env> { Arc::<LiveEnv>::clone(env) })
         .collect();
-    Workers::new(envs, Recording::Off)
+    Workers::new(envs, Recording::Off, halt)
 }
 
 /// How much of a run is kept in memory for its report. A guest can make system calls and write
@@ -497,6 +559,9 @@ struct Machine<'a, V: Vcpu, C> {
     /// run is stopping.
     bell: Arc<timer::Bell>,
     ready: Ready,
+    /// What a service tells when the environment fails it (module docs, "When the environment
+    /// fails a service").
+    halted: Arc<Halted>,
     /// The environments `fsp-srv`'s workers read through, one each
     /// ([`Session::reads_environments`]).
     reads: Vec<Arc<LiveEnv>>,
@@ -520,8 +585,17 @@ impl<V: Vcpu, C: HostClock + Clone> Machine<'_, V, C> {
         self.bell.ring();
     }
 
+    /// Whether the run has stopped. A service told the run to stop ([`Halted`]) stops it here,
+    /// with the reason it was told, if nothing has stopped it first.
     fn is_stopped(&self) -> bool {
-        self.stopped.load(Ordering::SeqCst)
+        if self.stopped.load(Ordering::SeqCst) {
+            return true;
+        }
+        let Some(reason) = self.halted.reason() else {
+            return false;
+        };
+        self.stop(Ending::Failed(reason.to_owned()));
+        true
     }
 
     /// The scheduler's signals to the cores.
@@ -837,6 +911,7 @@ impl<'a, V: Vcpu, C: HostClock + Clone> Machine<'a, V, C> {
                 servers: Arc::new(Mutex::new(Vec::new())),
                 bell: Arc::clone(&bell),
             },
+            halted: Arc::new(Halted::new(Arc::clone(&bell))),
             bell,
             reads: session.reads_environments(),
             held: Mutex::new(BTreeMap::new()),
@@ -845,6 +920,7 @@ impl<'a, V: Vcpu, C: HostClock + Clone> Machine<'a, V, C> {
             env: Arc::<LiveEnv>::clone(env),
             reads: machine.reads.clone(),
             ready: machine.ready.clone(),
+            halt: Arc::<Halted>::clone(&machine.halted),
         };
         if let Err(error) = install(&machine.dispatcher, given) {
             let ending = Ending::Failed(format!("the services could not be set up: {error}"));

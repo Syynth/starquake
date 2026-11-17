@@ -63,6 +63,13 @@ impl Bell {
         self.ring.notify_all();
     }
 
+    /// Whether the bell has been rung since this was last asked, or since its timer thread last
+    /// woke; asking clears it.
+    #[cfg(test)]
+    pub(super) fn take_ring(&self) -> bool {
+        std::mem::take(&mut *lock(&self.rung))
+    }
+
     /// Sleeps for at most `limit`, or until rung.
     fn sleep(&self, limit: Duration) {
         let mut rung = lock(&self.rung);

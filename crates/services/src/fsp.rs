@@ -1,6 +1,7 @@
 //! `fsp-srv`, the file-system service: a first subset (`docs/specs/services.md`, port plan
 //! slice 6). A title opens the SD card, opens a file on it, reads it, asks its size and closes
-//! it; and it opens its own data storage (its `RomFS` image), reads it and asks its size.
+//! it; it opens its own data storage (its `RomFS` image), reads it and asks its size; and it opens
+//! its own data file system (the files of its `RomFS`) and reads a file on it as on the SD card.
 //!
 //! Ported from `eden/src/core/hle/service/filesystem/fsp/fsp_srv.cpp` (`FSP_SRV`),
 //! `fs_i_filesystem.cpp` (`IFileSystem`), `fs_i_file.cpp` (`IFile`) and `fs_i_storage.cpp`
@@ -21,6 +22,7 @@
 //! | Interface | Id | Command | In | Out |
 //! |---|---|---|---|---|
 //! | `fsp-srv` ([`FspSrv`]) | 1 | `SetCurrentProcess` | the caller's process id, attached by the kernel; a `u64` placeholder in the payload, not read | nothing |
+//! | | 2 | `OpenDataFileSystemByCurrentProcess` | nothing | an [`IFileSystem`] |
 //! | | 18 | `OpenSdCardFileSystem` | nothing | an [`IFileSystem`] |
 //! | | 200 | `OpenDataStorageByCurrentProcess` | nothing | an [`IStorage`] |
 //! | [`IFileSystem`] | 8 | `OpenFile` | `u32` open mode; in buffer 0 (pointer, an X descriptor): the path | an [`IFile`] |
@@ -37,6 +39,9 @@
 //!   against raw data value?").
 //! - `OpenSdCardFileSystem`: libnx `fsOpenSdCardFileSystem` (`_fsCmdGetSession`, one out
 //!   object); Eden `OpenSdCardFileSystem(OutInterface<IFileSystem>)`.
+//! - `OpenDataFileSystemByCurrentProcess`: libnx `fsOpenDataFileSystemByCurrentProcess`
+//!   (`_fsCmdGetSession(&g_fsSrv, &out->s, 2)`, one out object); Eden
+//!   `OpenDataFileSystemByCurrentProcess(OutInterface<IFileSystem>)`.
 //! - `OpenFile`: libnx `_fsFsOpenCommon` (`u32` flags, a `HipcPointer` in buffer of `FS_MAX_PATH`
 //!   (0x301) bytes, one out object); Eden `OpenFile(OutInterface<IFile>, InLargeData<Sf::Path,
 //!   BufferAttr_HipcPointer>, u32 mode)`, and `Sf::Path` is `char str[EntryNameLengthMax + 1]`
@@ -65,6 +70,17 @@
 //! count: the bytes go into the buffer, fewer at the end of the storage, as Eden's backend reads
 //! them (`VfsFile::Read` returns the bytes there are).
 //!
+//! # The data file system
+//!
+//! `OpenDataFileSystemByCurrentProcess` is Eden's `FSP_SRV::OpenDataFileSystemByCurrentProcess`,
+//! which extracts the current process's `RomFS` (`FileSys::ExtractRomFS`) and hands out an
+//! `IFileSystem` over the files in it. Here it probes
+//! [`Mount::DataFileSystem`](host::Mount::DataFileSystem), and the [`IFileSystem`] it hands out
+//! is the SD card's, on that mount: `OpenFile`, `IFile::Read` and `IFile::GetSize` are the same
+//! commands with the same checks, and the host finds each path in the image (in a run,
+//! `starquake-core`'s `FspHost`, through the loader's `RomFS` reader). The image is the one the
+//! data storage serves, so a file reads as the bytes the storage holds at the file's data.
+//!
 //! # The host behind it
 //!
 //! A file system is a host folder named in the run's configuration, read-only. This crate never
@@ -90,7 +106,8 @@
 //!
 //! # Where this differs from Eden
 //!
-//! Each difference is pinned by the test named, in `fsp/tests.rs`:
+//! Each difference is pinned by the test named, in `fsp/tests.rs` or the files beside it in
+//! `fsp/tests/`:
 //!
 //! - **No SD card.** Eden's `OpenSdCardFileSystem` ignores the `ResultPortSdCardNoDevice` that
 //!   `FileSystemController::OpenSDMC` returns when there is no SD card, and replies success with
@@ -149,20 +166,45 @@
 //!   (`read_checks_the_offset_before_the_size`, `read_checks_size_against_the_buffer`,
 //!   `a_read_of_nothing_answers_at_once`, `a_read_whose_end_overflows_is_out_of_range`).
 //! - **Host failures.** Eden's file system cannot fail to read a file it opened. A host failure
-//!   here (a file that went away, an I/O error, an environment that has no answer) is
-//!   [`result::PATH_NOT_FOUND`] for a missing file and [`result::HOST_IO_FAILED`] otherwise
-//!   (`a_host_failure_during_a_read_fails_the_read`). An environment that fails, or a host
-//!   failure code with no name, is [`result::HOST_IO_FAILED`] for `OpenFile` and for `Read`
+//!   here (a file that went away, an I/O error) is [`result::PATH_NOT_FOUND`] for a missing file
+//!   and [`result::HOST_IO_FAILED`] otherwise
+//!   (`a_host_failure_during_a_read_fails_the_read`). A host failure code with no name is
+//!   [`result::HOST_IO_FAILED`] for `OpenFile` and for `Read`
 //!   (`a_broken_host_fails_open_file_and_read`). A size answer that is not exactly 8 bytes, or
 //!   that is over `i64::MAX`, is [`result::HOST_IO_FAILED`] for `OpenFile` and `GetSize`
 //!   (`a_size_answer_of_other_than_eight_bytes_fails`, `a_size_over_s64_max_fails`), and so is a
 //!   probe answered with any bytes (`a_probe_answered_with_bytes_opens_nothing`).
+//!   [`result::HOST_IO_FAILED`] itself is a guess (see its docs): which code the reference has
+//!   for an unreadable file waits for the owner.
+//! - **The environment failing** is not a host failure and has no result code: it stops the run
+//!   ([`halt`]; decision log, 2026-11-17, "Env failures"). The request is answered as one the
+//!   server gave up on, `DEFERRED_REPLY_DROPPED`, which the guest never runs to see
+//!   (`an_environment_failure_in_a_handler_stops_the_run` here, for each handler that reads the
+//!   environment; `an_environment_failure_in_a_read_stops_the_run` in `fsp/tests/worker.rs`).
 //!
 //! - **No data storage.** Eden's `OpenDataStorageByCurrentProcess` answers `ResultUnknown`
 //!   (`eden/src/core/hle/result.h`, `ResultUnknown(UINT32_MAX)`) when the current process has no
 //!   `RomFS` ("No file system interface available!"). Here every answer to the probe but an
-//!   empty one (no `RomFS`, a broken environment, no handler) is that same
-//!   [`result::UNKNOWN`] (`without_a_romfs_opening_the_data_storage_is_eden_s_unknown`).
+//!   empty one (no `RomFS`, a host failure, no handler) is that same [`result::UNKNOWN`]
+//!   (`without_a_romfs_opening_the_data_storage_is_eden_s_unknown`), except the environment
+//!   failing, which stops the run.
+//! - **No data file system.** Eden's `OpenDataFileSystemByCurrentProcess` answers
+//!   `ResultUnknown` when the current process has no `RomFS`, and when `ExtractRomFS` cannot
+//!   read it ("Failed to extract RomFS for the current process!"). Here every answer to the
+//!   probe of [`Mount::DataFileSystem`](host::Mount::DataFileSystem) but an empty one is
+//!   [`result::UNKNOWN`] likewise, except the environment failing
+//!   (`without_a_romfs_opening_the_data_file_system_is_eden_s_unknown`). Eden keeps the `RomFS`
+//!   it opened (`FSP_SRV::romfs`); here every open asks the host again, so a session keeps
+//!   nothing a snapshot would have to hold, and a second open can be refused where the first was
+//!   not (`every_open_of_the_data_file_system_asks_the_host_again`).
+//! - **A `RomFS` session restored into a run without one.** An [`IFileSystem`] or [`IFile`] on
+//!   the data file system, and an [`IStorage`], are saved with the server, and restoring them
+//!   does not check that the run has a `RomFS`. Eden's sessions hold the `RomFS` they were
+//!   opened on, so they never meet a missing one. Here the host answers that the mount is not
+//!   there ([`HostFailure::NoDevice`], or no host I/O handler at all), and `OpenFile`, `GetSize`
+//!   and `Read` on these sessions answer [`result::UNKNOWN`], Eden's code for a process with no
+//!   `RomFS`, not the SD card's [`result::PORT_SD_CARD_NO_DEVICE`]
+//!   (`a_romfs_session_restored_without_a_romfs_answers_eden_s_unknown`).
 //! - **`IStorage::Read`'s checks** are the console's (Atmosphère
 //!   `fssrv_storage_interface_adapter.cpp`, `StorageInterfaceAdapter::Read`, fact only): a
 //!   negative offset is [`result::INVALID_OFFSET`], then a negative size, or one larger than the
@@ -192,15 +234,26 @@
 //! the other commands none. `IStorage`'s `Read` takes one B descriptor too
 //! (`a_storage_read_refuses_a_pointer_buffer`).
 //!
-//! # Where this departs from the service spec
+//! # Metadata on the calling thread
 //!
-//! `docs/specs/services.md`, "Concurrency", says methods never block and do no blocking I/O:
-//! work that takes time goes to a worker. `OpenSdCardFileSystem`, `OpenFile` and `GetSize` do
-//! not follow it: each calls the environment's host I/O on the core thread and waits for the
-//! answer. Behind a host folder (`starquake-core`'s `HostFolder`) a probe is a `metadata` of the
-//! folder, and a size is two `canonicalize`s, a `metadata` and a `File::open`, all made while the
-//! live environment holds its lock. Only `Read` is deferred. This is a deliberate departure,
-//! left for the owner to accept or to have these three deferred like `Read`.
+//! `docs/specs/services.md`, "Concurrency", says methods never block, with one accepted
+//! exception (approved by the owner, 2026-11-12): short host metadata lookups may run on the
+//! calling thread. The three opens, `OpenFile` and the two `GetSize`s are those: each calls the
+//! environment's host I/O on the core thread and waits for the answer. Behind a host folder
+//! (`starquake-core`'s `HostFolder`) a probe is a `metadata` of the folder, and a size is two
+//! `canonicalize`s, a `metadata` and a `File::open`, all made while the live environment holds
+//! its lock; behind the title's `RomFS` a size is a lookup in its tables. Only `Read` is
+//! deferred.
+//!
+//! Behind the title's `RomFS`, the first request for the data file system that an environment's
+//! host gets also reads the image's whole directory and file tables (`starquake-core`'s
+//! `FspHost`, through the loader's `RomFS` reader, which copies and checks them from the image
+//! the loader built in memory, at most `romfs::build::MAX_METADATA_SIZE` bytes). For the
+//! environment the handlers read, that request is the probe of the first
+//! `OpenDataFileSystemByCurrentProcess`, so the tables are read on the core thread while the
+//! live environment holds its lock. That is more than a short metadata lookup; whether it fits
+//! the exception is for the owner to judge. (Each worker's environment reads the tables again,
+//! at its own first read of the data file system, on its worker thread.)
 //!
 //! # Snapshots and reads in flight
 //!
@@ -223,10 +276,11 @@ use starquake_trace::Env;
 
 use crate::commands;
 use crate::framework::{
-    Context, DeferredBuffer, Finish, Interfaces, Outcome, Reply, ReplyToken, Request, Server,
-    UnknownPolicy,
+    Context, DEFERRED_REPLY_DROPPED, DeferredBuffer, Finish, Interfaces, Outcome, Reply,
+    ReplyToken, Request, Server, UnknownPolicy,
 };
 
+pub mod halt;
 pub mod host;
 pub mod path;
 pub mod worker;
@@ -293,12 +347,13 @@ pub mod result {
     pub const UNKNOWN: ResultCode = ResultCode::from_raw(u32::MAX);
 }
 
-/// The result a host answer that is not data stands for.
-fn failed(answer: &Answer) -> ResultCode {
+/// The result a host answer that is not data stands for, on `mount`. The environment failing
+/// stands for none: the run has stopped ([`halt`]), and the request is answered as one the server
+/// gave up on, which the guest never runs to see.
+fn failed(mount: Mount, answer: &Answer) -> ResultCode {
     match answer {
-        Answer::Failed(HostFailure::NoDevice) | Answer::Unavailable => {
-            result::PORT_SD_CARD_NO_DEVICE
-        }
+        Answer::Stopped => DEFERRED_REPLY_DROPPED,
+        Answer::Failed(HostFailure::NoDevice) | Answer::Unavailable => no_device(mount),
         Answer::Failed(HostFailure::NotFound | HostFailure::NotAFile) => result::PATH_NOT_FOUND,
         Answer::Failed(HostFailure::Io | HostFailure::BadRequest) | Answer::Broken => {
             result::HOST_IO_FAILED
@@ -310,12 +365,23 @@ fn failed(answer: &Answer) -> ResultCode {
     }
 }
 
+/// The result for a `mount` the host does not have: the SD card's own code, and for the title's
+/// `RomFS`, as its data storage or its data file system, Eden's [`result::UNKNOWN`], which is
+/// what Eden answers a process with no `RomFS` (module docs, "No data storage", "No data file
+/// system" and "A `RomFS` session restored into a run without one").
+fn no_device(mount: Mount) -> ResultCode {
+    match mount {
+        Mount::SdCard => result::PORT_SD_CARD_NO_DEVICE,
+        Mount::DataStorage | Mount::DataFileSystem => result::UNKNOWN,
+    }
+}
+
 /// The size of the file at `path`, from the host.
 fn file_size(env: &dyn Env, mount: Mount, path: &[u8]) -> Result<i64, ResultCode> {
     let path = path.to_vec();
     let answer = host::ask(env, &HostRequest::Size { mount, path });
     let Answer::Data(bytes) = &answer else {
-        return Err(failed(&answer));
+        return Err(failed(mount, &answer));
     };
     let size = <[u8; 8]>::try_from(bytes.as_slice()).map(u64::from_le_bytes);
     let size = size.ok().and_then(|size| i64::try_from(size).ok());
@@ -340,6 +406,9 @@ pub mod command {
     pub mod fsp_srv {
         /// `SetCurrentProcess` (`{1, D<&FSP_SRV::SetCurrentProcess>, ..}`).
         pub const SET_CURRENT_PROCESS: u32 = 1;
+        /// `OpenDataFileSystemByCurrentProcess`
+        /// (`{2, D<&FSP_SRV::OpenDataFileSystemByCurrentProcess>, ..}`).
+        pub const OPEN_DATA_FILE_SYSTEM_BY_CURRENT_PROCESS: u32 = 2;
         /// `OpenSdCardFileSystem` (`{18, D<&FSP_SRV::OpenSdCardFileSystem>, ..}`).
         pub const OPEN_SD_CARD_FILE_SYSTEM: u32 = 18;
         /// `OpenDataStorageByCurrentProcess`
@@ -373,6 +442,7 @@ pub mod command {
 commands! {
     impl FspSrv {
         command::fsp_srv::SET_CURRENT_PROCESS => set_current_process,
+        command::fsp_srv::OPEN_DATA_FILE_SYSTEM_BY_CURRENT_PROCESS => open_data_file_system_by_current_process,
         command::fsp_srv::OPEN_SD_CARD_FILE_SYSTEM => open_sd_card_file_system,
         command::fsp_srv::OPEN_DATA_STORAGE_BY_CURRENT_PROCESS => open_data_storage_by_current_process,
     }
@@ -403,7 +473,7 @@ impl FspSrv {
         let answer = host::ask(&*cx.env()?, &HostRequest::Probe { mount });
         match answer {
             Answer::Data(bytes) if bytes.is_empty() => {}
-            answer => return Err(failed(&answer).into()),
+            answer => return Err(failed(mount, &answer).into()),
         }
         reply.push_session(Box::new(IFileSystem { mount }));
         reply.ok()
@@ -416,21 +486,46 @@ impl FspSrv {
         _req: &Request<'_>,
         reply: &mut Reply,
     ) -> Outcome {
-        let mount = Mount::DataStorage;
-        let answer = host::ask(&*cx.env()?, &HostRequest::Probe { mount });
-        if !matches!(&answer, Answer::Data(bytes) if bytes.is_empty()) {
-            tracing::warn!(
-                ?answer,
-                "the run has no data storage for the current process"
-            );
-            return Err(result::UNKNOWN.into());
-        }
+        probe_romfs(&*cx.env()?, Mount::DataStorage)?;
         reply.push_session(Box::new(IStorage));
+        reply.ok()
+    }
+
+    /// `OpenDataFileSystemByCurrentProcess`. out: an [`IFileSystem`] on the files of the title's
+    /// `RomFS` (module docs, "The data file system").
+    fn open_data_file_system_by_current_process(
+        _: &mut Self,
+        cx: &mut Context<'_>,
+        _req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        let mount = Mount::DataFileSystem;
+        probe_romfs(&*cx.env()?, mount)?;
+        reply.push_session(Box::new(IFileSystem { mount }));
         reply.ok()
     }
 }
 
-/// A file system (`IFileSystem`): a host folder, read-only. The default is the SD card.
+/// Whether the host has `mount`, a way of reading the current process's `RomFS`: an empty answer
+/// to a probe. Any other answer is Eden's [`result::UNKNOWN`] (module docs, "No data storage" and
+/// "No data file system"), except the environment failing, which stops the run.
+fn probe_romfs(env: &dyn Env, mount: Mount) -> Result<(), ResultCode> {
+    match host::ask(env, &HostRequest::Probe { mount }) {
+        Answer::Data(bytes) if bytes.is_empty() => Ok(()),
+        Answer::Stopped => Err(failed(mount, &Answer::Stopped)),
+        answer => {
+            tracing::warn!(
+                ?answer,
+                ?mount,
+                "the run has no RomFS for the current process to open this way"
+            );
+            Err(result::UNKNOWN)
+        }
+    }
+}
+
+/// A file system (`IFileSystem`), read-only: a host folder, or the files of the title's `RomFS`.
+/// The default is the SD card.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct IFileSystem {
     mount: Mount,
@@ -577,7 +672,7 @@ impl ReadJob {
         };
         let answer = host::ask(env, &request);
         let Answer::Data(bytes) = answer else {
-            return Err(failed(&answer));
+            return Err(failed(self.mount, &answer));
         };
         let read = i64::try_from(bytes.len())
             .ok()
@@ -736,14 +831,15 @@ pub fn interfaces() -> Interfaces {
         .with::<IStorage>()
 }
 
-/// An `fsp-srv` server whose host file systems are `env`'s ([`host`]). Its reads run on the
-/// executor it is given with [`Server::with_executor`] (in a run, [`worker::Workers`]), through
-/// the environment that executor gives them; a server given none answers `Read` with the
-/// framework's `NOT_SUPPORTED` ([`Context::executor`]).
+/// An `fsp-srv` server whose host file systems are `env`'s ([`host`]), which tells `halt` when
+/// `env` fails one of its handlers ([`halt`]). Its reads run on the executor it is given with
+/// [`Server::with_executor`] (in a run, [`worker::Workers`], which tell a halt of their own),
+/// through the environment that executor gives them; a server given none answers `Read` with
+/// the framework's `NOT_SUPPORTED` ([`Context::executor`]).
 #[must_use]
-pub fn server(policy: UnknownPolicy, env: Arc<dyn Env>) -> Server {
+pub fn server(policy: UnknownPolicy, env: Arc<dyn Env>, halt: Arc<dyn halt::Halt>) -> Server {
     Server::new(NAME, policy)
         .with_root(|| Box::new(FspSrv))
         .with_interfaces(interfaces())
-        .with_env(env)
+        .with_env(Arc::new(halt::Watched::new(env, halt)))
 }

@@ -15,6 +15,7 @@ use starquake_kernel::id::ObjectId;
 use starquake_kernel::result::{KernelError, ResultCode};
 use starquake_trace::{EnvCall, EnvError, HostIoReply, HostIoRequest, HostNanos};
 
+use super::halt::{Halt, Stop};
 use super::host::{CHANNEL, HostFailure, HostRequest, Mount};
 use super::*;
 use crate::framework::control::CONVERT_CURRENT_OBJECT_TO_DOMAIN;
@@ -29,6 +30,7 @@ use super::command::file::{GET_SIZE, READ};
 use super::command::file_system::OPEN_FILE;
 use super::command::fsp_srv::{OPEN_SD_CARD_FILE_SYSTEM, SET_CURRENT_PROCESS};
 
+mod data_files;
 mod storage;
 mod worker;
 
@@ -87,6 +89,8 @@ impl Asked {
 /// file protocol.
 struct FakeHost {
     card: Option<BTreeMap<Vec<u8>, Entry>>,
+    /// The data file system's files (`data_files.rs`); `None`: the run has no `RomFS`.
+    files: Option<BTreeMap<Vec<u8>, Entry>>,
     /// The data storage (`storage.rs`); `None`: the run has no `RomFS`.
     storage: Option<Vec<u8>>,
     mischief: Mischief,
@@ -108,6 +112,7 @@ impl FakeEnv {
         });
         Arc::new(Self(Mutex::new(FakeHost {
             card,
+            files: None,
             storage: None,
             mischief: Mischief::None,
             forced: None,
@@ -129,7 +134,11 @@ impl FakeHost {
         if storage::is_storage(request) {
             return self.answer_storage(request);
         }
-        let Some(card) = &self.card else {
+        let folder = match request.mount() {
+            Mount::DataFileSystem => &self.files,
+            _ => &self.card,
+        };
+        let Some(card) = folder else {
             return HostFailure::NoDevice.reply();
         };
         match request {
@@ -229,6 +238,35 @@ impl Notify for Wakes {
     }
 }
 
+/// A halt that keeps every stop it is told, in order: the run's, which would stop.
+#[derive(Default)]
+struct Halts(Mutex<Vec<Stop>>);
+
+impl Halt for Halts {
+    fn halt(&self, stop: Stop) {
+        self.0.lock().unwrap().push(stop);
+    }
+}
+
+impl Halts {
+    fn stops(&self) -> Vec<Stop> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+/// A halt for a server whose test expects the environment never to fail: a stop fails the test.
+struct Unexpected;
+
+impl Halt for Unexpected {
+    fn halt(&self, stop: Stop) {
+        unreachable!("the run was told to stop: {stop}");
+    }
+}
+
+fn unwatched() -> Arc<dyn Halt> {
+    Arc::new(Unexpected)
+}
+
 /// An `fsp-srv` server, a kernel, the host, and one session.
 struct Rig {
     kernel: FakeKernel,
@@ -237,6 +275,8 @@ struct Rig {
     env: Arc<FakeEnv>,
     jobs: Arc<Jobs>,
     wakes: Arc<Wakes>,
+    /// What the server's handlers told the run (its jobs' executor tells its own).
+    halts: Arc<Halts>,
 }
 
 /// A parsed reply.
@@ -303,7 +343,9 @@ impl Rig {
         kernel.set_process_id(PROCESS_ID);
         let session = kernel.new_object();
         let env_handle: Arc<dyn Env> = Arc::<FakeEnv>::clone(&env);
-        let mut server = server(UnknownPolicy::Strict, env_handle).with_notify(notify);
+        let halts = Arc::new(Halts::default());
+        let halt: Arc<dyn Halt> = Arc::<Halts>::clone(&halts);
+        let mut server = server(UnknownPolicy::Strict, env_handle, halt).with_notify(notify);
         if let Some(executor) = executor {
             server = server.with_executor(executor);
         }
@@ -316,6 +358,7 @@ impl Rig {
             env,
             jobs,
             wakes,
+            halts,
         }
     }
 
@@ -668,7 +711,7 @@ impl Env for NoHost {
 fn a_run_with_no_host_folder_has_no_sd_card() {
     let mut kernel = FakeKernel::new(0).unwrap();
     let session = kernel.new_object();
-    let mut server = server(UnknownPolicy::Strict, Arc::new(NoHost));
+    let mut server = server(UnknownPolicy::Strict, Arc::new(NoHost), unwatched());
     server.accept(session).unwrap();
     let mut buffer = vec![STALE; BUFFER_SIZE];
     let request = RequestBuilder::cmif(CommandType::Request, OPEN_SD_CARD_FILE_SYSTEM);
@@ -1185,7 +1228,7 @@ fn an_open_file_survives_a_snapshot() {
     let saved = rig.server.save().unwrap();
 
     let env: Arc<dyn Env> = Arc::<FakeEnv>::clone(&rig.env);
-    let mut restored = server(UnknownPolicy::Strict, env);
+    let mut restored = server(UnknownPolicy::Strict, env, unwatched());
     restored.restore(&saved).unwrap();
     assert_eq!(restored.session_count(), rig.server.session_count());
     rig.server = restored;
@@ -1273,37 +1316,100 @@ fn a_probe_answered_with_bytes_opens_nothing() {
     assert_eq!(rig.server.session_count(), 2);
 }
 
-/// What a broken host answers: an environment that fails, and a failure code with no name.
-fn broken() -> [Result<HostIoReply, EnvError>; 2] {
+#[test]
+fn a_broken_host_fails_open_file_and_read() {
+    // A host failure code with no name.
     let unnamed = 99;
     assert_eq!(HostFailure::from_code(unnamed), None);
-    let exhausted = EnvError::Exhausted {
-        index: 0,
+    let answer = Ok(HostIoReply::Failed(unnamed));
+    let mut rig = Rig::new();
+    let fs = rig.open_sd();
+    let sessions = rig.server.session_count();
+    rig.force(Asked::Size, answer.clone());
+    let opened = rig.open_file(fs, HELLO_PATH);
+    assert_eq!(opened, only(result::HOST_IO_FAILED));
+    assert_eq!(rig.server.session_count(), sessions);
+
+    let mut rig = Rig::new();
+    let file = To::Session(rig.hello());
+    rig.force(Asked::Read, answer);
+    rig.defer(file, READ, read(0, 4, 16));
+    rig.jobs.run();
+    let reply = rig.deliver(SessionKind::Session);
+    assert_eq!(reply, only(result::HOST_IO_FAILED));
+    assert_eq!(rig.kernel.memory(DATA_AT, 16).unwrap(), [STALE; 16]);
+    // A failure of the host is a result code: nothing stops the run.
+    assert_eq!(rig.halts.stops(), []);
+}
+
+/// An environment failure the test forces: each case gets its own index, so a stop told for
+/// the wrong request shows.
+fn env_failed(index: usize) -> EnvError {
+    EnvError::Exhausted {
+        index,
         requested: EnvCall::HostIo,
-    };
-    [Err(exhausted), Ok(HostIoReply::Failed(unnamed))]
+    }
 }
 
 #[test]
-fn a_broken_host_fails_open_file_and_read() {
-    for answer in broken() {
+fn an_environment_failure_in_a_handler_stops_the_run() {
+    use super::command::fsp_srv::{
+        OPEN_DATA_FILE_SYSTEM_BY_CURRENT_PROCESS, OPEN_DATA_STORAGE_BY_CURRENT_PROCESS,
+    };
+    use super::command::storage::GET_SIZE as STORAGE_GET_SIZE;
+    // Every handler that reads the environment: the three opens' probes, `OpenFile`'s and the
+    // two `GetSize`s' size requests. Each case opens what its request needs, then the
+    // environment fails every request of the kind the handler asks. The request is answered as
+    // one the server gave up on, no session is made, and the run is told to stop, once, with
+    // exactly the environment's error.
+    type Prepare = fn(&mut Rig) -> ObjectId;
+    type Send = fn(&mut Rig, ObjectId) -> Answered;
+    let root: Prepare = |rig| rig.session;
+    let cases: [(Asked, Prepare, Send); 6] = [
+        (Asked::Probe, root, |rig, to| {
+            rig.send(To::Session(to), OPEN_SD_CARD_FILE_SYSTEM, |r| r)
+        }),
+        (Asked::Probe, root, |rig, to| {
+            rig.send(To::Session(to), OPEN_DATA_STORAGE_BY_CURRENT_PROCESS, |r| r)
+        }),
+        (Asked::Probe, root, |rig, to| {
+            rig.send(
+                To::Session(to),
+                OPEN_DATA_FILE_SYSTEM_BY_CURRENT_PROCESS,
+                |r| r,
+            )
+        }),
+        (Asked::Size, Rig::open_sd, |rig, fs| {
+            rig.open_file(fs, HELLO_PATH)
+        }),
+        (Asked::Size, Rig::hello, |rig, file| {
+            rig.send(To::Session(file), GET_SIZE, |r| r)
+        }),
+        (
+            Asked::Size,
+            |rig| {
+                rig.env.host().storage = Some(vec![1, 2, 3]);
+                rig.open_storage()
+            },
+            |rig, storage| rig.send(To::Session(storage), STORAGE_GET_SIZE, |r| r),
+        ),
+    ];
+    for (index, (asked, prepare, send)) in cases.into_iter().enumerate() {
         let mut rig = Rig::new();
-        let fs = rig.open_sd();
+        let to = prepare(&mut rig);
         let sessions = rig.server.session_count();
-        rig.force(Asked::Size, answer.clone());
-        let opened = rig.open_file(fs, HELLO_PATH);
-        assert_eq!(opened, only(result::HOST_IO_FAILED), "{answer:?}");
-        assert_eq!(rig.server.session_count(), sessions);
-
-        let mut rig = Rig::new();
-        let file = To::Session(rig.hello());
-        rig.force(Asked::Read, answer.clone());
-        rig.defer(file, READ, read(0, 4, 16));
-        rig.jobs.run();
-        let reply = rig.deliver(SessionKind::Session);
-        assert_eq!(reply, only(result::HOST_IO_FAILED), "{answer:?}");
-        assert_eq!(rig.kernel.memory(DATA_AT, 16).unwrap(), [STALE; 16]);
+        rig.force(asked, Err(env_failed(index)));
+        let reply = send(&mut rig, to);
+        assert_eq!(reply, only(DEFERRED_REPLY_DROPPED), "case {index}");
+        let stops = rig.halts.stops();
+        assert_eq!(stops, [Stop::Handler(env_failed(index))], "case {index}");
+        assert_eq!(rig.server.session_count(), sessions, "case {index}");
     }
+    assert_eq!(
+        Stop::Handler(env_failed(3)).to_string(),
+        "the environment failed fsp-srv while it handled a request: recording exhausted at \
+         record 3: the replay asked for HostIo"
+    );
 }
 
 #[test]
@@ -1315,7 +1421,7 @@ fn a_snapshot_with_a_read_in_flight_restores_a_read_nothing_completes() {
 
     let env: Arc<dyn Env> = Arc::<FakeEnv>::clone(&rig.env);
     let executor: Arc<dyn Executor> = Arc::<Jobs>::clone(&rig.jobs);
-    let mut restored = server(UnknownPolicy::Strict, env).with_executor(executor);
+    let mut restored = server(UnknownPolicy::Strict, env, unwatched()).with_executor(executor);
     restored.restore(&saved).unwrap();
     let pending: Vec<ObjectId> = restored.pending().map(|(_, session)| session).collect();
     assert_eq!(pending, [file]);
@@ -1367,7 +1473,7 @@ const SNAPSHOT: &[u8] = &[
 #[test]
 fn an_open_file_s_snapshot_bytes_are_pinned() {
     let mount = Mount::SdCard;
-    // `FspSrv` holds nothing; `Mount` has one variant, so its index is 0.
+    // `FspSrv` holds nothing; `SdCard` is `Mount`'s first variant, so its index is 0.
     assert_eq!(FspSrv.save().unwrap(), []);
     assert_eq!(IFileSystem { mount }.save().unwrap(), [0]);
     let file = IFile {
@@ -1409,7 +1515,7 @@ fn a_snapshot_with_a_path_that_is_not_normalised_is_refused() {
     ];
     for path in refused {
         let env: Arc<dyn Env> = FakeEnv::new(true);
-        let mut restored = server(UnknownPolicy::Strict, env);
+        let mut restored = server(UnknownPolicy::Strict, env, unwatched());
         let error = SnapshotError::State {
             interface: "IFile".to_owned(),
             error: postcard::Error::SerdeDeCustom,
@@ -1419,7 +1525,7 @@ fn a_snapshot_with_a_path_that_is_not_normalised_is_refused() {
         assert_eq!(restored.session_count(), 0);
     }
     let env: Arc<dyn Env> = FakeEnv::new(true);
-    let mut restored = server(UnknownPolicy::Strict, env);
+    let mut restored = server(UnknownPolicy::Strict, env, unwatched());
     restored.restore(&snapshot_with(HELLO_PATH)).unwrap();
     assert_eq!(restored.session_count(), 3);
 }

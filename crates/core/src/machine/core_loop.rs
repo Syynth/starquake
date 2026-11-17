@@ -135,6 +135,12 @@ impl<'m, 'a, V: Vcpu, C: HostClock + Clone> Core<'m, 'a, V, C> {
             self.must_switch = true;
             return Ok(Stepped::Running);
         };
+        // A service may have stopped the run since this loop last asked, and the thread just
+        // chosen may be one its reply woke: the guest is not entered again (`machine`, "When
+        // the environment fails a service").
+        if self.machine.is_stopped() {
+            return Ok(Stepped::Running);
+        }
         let exit = vcpu.run().map_err(|error| Self::failed(&error))?;
         let handled = match exit {
             Exit::Svc(number) => self.svc(vcpu, running, number),
