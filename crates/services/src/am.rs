@@ -10,7 +10,8 @@
 //! `library_applet_creator.cpp` and `debug_functions.cpp` (their interfaces' names only), with the
 //! applet's state from `eden/src/core/hle/service/am/lifecycle_manager.cpp` and
 //! `lifecycle_manager.h` (`LifecycleManager`), `applet.cpp` (`Applet::UpdateSuspensionStateLocked`),
-//! `applet_manager.cpp` (the launch) and `am_types.h` (`FocusState`, `OperationMode`). The request
+//! `applet_manager.cpp` (the launch), `am_types.h` (`FocusState`, `OperationMode`,
+//! `AppletMessage`) and `am_results.h` (`ResultNoMessages`). The request
 //! layouts are checked against the client, libnx (`libnx/nx/source/services/applet.c`, ISC).
 //! The Switch 2 additions are ported from Eden PR #4588 @ e5fb3b97 (GPL-3.0-or-later):
 //! `eden-pr4588/src/core/hle/service/am/service/application_proxy_service.cpp`
@@ -35,7 +36,8 @@
 //! differs from Eden"), `ISelfController` 2000, a Switch 2 command (see "The graphics
 //! server" below), the other Switch 2 additions the scoping doc names (see "The Switch 2
 //! additions" below), the commands a Switch 2 title sends at start-up that those leave out
-//! (`ICommonStateGetter` 900 and `IApplicationFunctions` 130), `IApplicationFunctions` 330,
+//! (`ICommonStateGetter` 900 and `IApplicationFunctions` 130), `ICommonStateGetter` 1, which a
+//! title that waits on the message event sends (see "The messages"), `IApplicationFunctions` 330,
 //! next to 320 and 321 in PR's table (see "The title's start-up commands"), and the three
 //! commands whose state 320 reads (see "Screenshots and recording"); every other command of
 //! these interfaces is left out and answered by the server's unknown-command policy.
@@ -55,6 +57,7 @@
 //! | | 60 | `GetGraphicsScalingParametersFunctions` (Switch 2) | nothing | an [`IGraphicsScalingParametersFunctions`] |
 //! | | 1000 | `GetDebugFunctions` | nothing | an [`IDebugFunctions`] |
 //! | [`ICommonStateGetter`] | 0 | `GetEventHandle` | nothing | copy handle: the applet's message event |
+//! | | 1 | `ReceiveMessage` | nothing | `u32` [`AppletMessage`]; or [`NO_MESSAGES`] and nothing |
 //! | | 5 | `GetOperationMode` | nothing | `u8` [`OperationMode`] |
 //! | | 6 | `GetPerformanceMode` | nothing | `s32` [`PerformanceMode`] |
 //! | | 9 | `GetCurrentFocusState` | nothing | `u8` [`FocusState`] |
@@ -102,6 +105,8 @@
 //!   `u32`; for 67 libnx sends `state != 0`, so 0 or 1); Eden one `ScreenshotPermission` or
 //!   `GamePlayRecordingState` argument, each an `enum class : u32` (`am_types.h`), at offset 0.
 //! - `IsGamePlayRecordingSupported`: libnx `_appletCmdNoInOutBool`; Eden `Out<bool>`.
+//! - `ReceiveMessage`: libnx `_appletCmdNoInOutU32`; Eden `Out<AppletMessage>`, a `u32` enum
+//!   (`am_types.h`), at offset 0.
 //! - `Unknown330`: no libnx client; Eden `Out<u8>`.
 //! - `GetOperationMode`, `GetCurrentFocusState`: libnx `_appletCmdNoInOutU8`; Eden
 //!   `Out<OperationMode>` and `Out<FocusState>`, both `u8` enums (`am_types.h`).
@@ -151,9 +156,10 @@
 //!   (`applet_manager.cpp`: `SetFocusState(FocusState::InFocus)`, "Applet was started by
 //!   frontend, so it is foreground"), and nothing in a run changes it.
 //!
-//! A restore checks only the graphics server's number against the run (see "The graphics
-//! server"); it has no kernel to check the applet's event ids against, so it believes them, and
-//! the commands check them when they use them:
+//! A restore checks the graphics server's number against the run (see "The graphics server")
+//! and reads every queued message through [`AppletMessage::from_raw`] (see "The messages"); it
+//! has no kernel to check the applet's event ids against, so it believes them, and the commands
+//! check them when they use them:
 //!
 //! - **The suspended-tick and GPU-error events** are checked each time
 //!   `GetAccumulatedSuspendedTickChangedEvent` or `GetGpuErrorDetectedSystemEvent` returns a
@@ -169,21 +175,29 @@
 //!   a restored message-event id that names another object is copied as it is. The lifecycle
 //!   commands that signal or clear it answer the kernel's error for an id that is not an event
 //!   (`a_failed_signal_still_keeps_the_lifecycle_change`,
-//!   `a_failed_clear_still_keeps_the_lifecycle_change`).
+//!   `a_failed_clear_still_keeps_the_lifecycle_change`, and for `ReceiveMessage`
+//!   `a_failed_clear_leaves_the_message_to_be_received_again`).
+//! - **Not checked here: whether the message event's state agrees with the restored
+//!   messages.** The event's signalled state is the kernel's, saved with the kernel; a restore
+//!   here cannot read it.
 //!
 //! # The message event
 //!
 //! `GetEventHandle` returns the applet's message event (Eden: the lifecycle manager's system
 //! event), which is signalled while the applet has a message to receive. Of Eden's
-//! `ShouldSignalSystemEvent`, this port keeps the one term that can hold in a run: for an
-//! application, focus-state-change notifications are enabled and the focus state has changed
-//! since the applet last received a message. Its other terms (unordered messages, resume, exit,
-//! sleep, display requests, operation- and performance-mode changes, SD card removal,
-//! temperature, battery, auto power-down, album events, and the library-applet focus terms) are
-//! all false in a run: nothing here raises them, and the settings never change while it runs.
-//! A port that raises one adds its term. So the event is signalled from launch (Eden's
-//! `SetFocusState(InFocus)` at launch finds a focus change pending, with notifications on), and
-//! libnx's `SetFocusHandlingMode(0, 0, 1)` turns the notifications off.
+//! `ShouldSignalSystemEvent`, this port keeps the terms of the messages it ports (see "The
+//! messages", [`Lifecycle::message_available`]): for an application, focus-state-change
+//! notifications are enabled and the focus state has changed since the applet last received
+//! it; or an operation-mode or performance-mode change is pending; or an unordered message is
+//! queued. Of these only the first is ever raised in a run: the settings never change while it
+//! runs, and nothing here pushes an unordered message; the others hold only in an applet a
+//! snapshot restored. Eden's other terms (resume, exit, sleep, display requests, SD card
+//! removal, temperature, battery, auto power-down, album events, and the library-applet focus
+//! terms) are left out: nothing here raises them. A port that raises one adds its term, and its
+//! place in [`Lifecycle::pop_message_in_order_of_priority`]. So the event is signalled from
+//! launch (Eden's `SetFocusState(InFocus)` at launch finds a focus change pending, with
+//! notifications on); `ReceiveMessage` takes that message and clears the event, and so does
+//! libnx's `SetFocusHandlingMode(0, 0, 1)`, which turns the notifications off.
 //!
 //! Eden signals or clears the event in `SignalSystemEventIfNeeded`
 //! (`eden/src/core/hle/service/am/lifecycle_manager.cpp` @ cf654052: `m_system_event.Signal`
@@ -203,9 +217,46 @@
 //! that moment. The suspended-tick and GPU-error events are never signalled, as in Eden (only
 //! the applet's constructor names them, `applet.cpp`).
 //!
+//! # The messages
+//!
+//! `ReceiveMessage` (Eden: `ICommonStateGetter::ReceiveMessage`, `common_state_getter.cpp` @
+//! cf654052) takes the applet's next message and answers its word, or [`NO_MESSAGES`] when it
+//! has none. Which message is next is Eden's `LifecycleManager::PopMessageInOrderOfPriority`
+//! (`lifecycle_manager.cpp` @ cf654052) for an application, over the terms this port keeps, in
+//! Eden's order ([`Lifecycle::pop_message_in_order_of_priority`]): the focus change (while its
+//! notifications are on), the operation-mode change, the performance-mode change, then the
+//! unordered messages, oldest first. Then, as Eden's `PopMessage` does, the message event is
+//! cleared if no message is left. `lifecycle_manager.cpp`, `.h`, `am_results.h`, the
+//! `AppletMessage` values and `ReceiveMessage` are the same in Eden-NX2 @ 50fa86bb and Eden PR
+//! #4588 @ e5fb3b97, and the scoping doc has no row for them: the Switch 2 changes nothing here.
+//!
+//! So a freshly launched application's first `ReceiveMessage` answers
+//! [`AppletMessage::FocusStateChanged`] (Eden's `m_has_focus_state_changed{true}`), and the next
+//! answers [`NO_MESSAGES`], with the event clear
+//! (`receive_message_answers_the_focus_change_then_no_messages`). A title that waits on the
+//! event and then receives therefore stops waking once it has the focus change.
+//!
+//! The message state is saved with the applet. A queued message is saved as its word and read
+//! back through [`AppletMessage::from_raw`], so a snapshot whose queue holds a word Eden does not
+//! declare, or `None` (0, which no message carries), is refused with
+//! [`SnapshotError::Decode`]`(postcard::Error::SerdeDeCustom)`, and the server is left as it
+//! was (`a_snapshot_with_an_invalid_queued_message_is_refused`); `postcard` keeps no text for a
+//! refusal of this kind. A restore accepts any declared word in the queue, including the
+//! messages Eden raises only through its flags (`FocusStateChanged`, `OperationModeChanged`,
+//! `PerformanceModeChanged`) or sends only to other applets: such a message is delivered as
+//! Eden's `PopMessage` would deliver it had it been pushed
+//! (`a_restored_queue_is_delivered_in_order_after_the_flags`).
+//!
 //! # Where this differs from Eden
 //!
 //! Each difference is pinned by the test named, in `am/tests.rs`:
+//!
+//! - **A failed clear in `ReceiveMessage` leaves the message pending.** Eden's event cannot fail
+//!   to clear. Here the kernel refuses to clear a restored message-event id that is not an
+//!   event; `ReceiveMessage` then answers the kernel's error and writes nothing back, so the
+//!   message is not lost undelivered and the next `ReceiveMessage` takes it again
+//!   (`a_failed_clear_leaves_the_message_to_be_received_again`). The `ISelfController` commands
+//!   instead keep their change on a failed clear ("The applet").
 //!
 //! - **`Exit` replies before the process ends.** Eden's `Exit` calls `KProcess::Terminate` on
 //!   the applet's process inside the handler and then answers success. Here the method asks
@@ -370,14 +421,18 @@
 //! [`INVALID_CMIF_REQUEST`]: crate::framework::result::INVALID_CMIF_REQUEST
 //! [`Reply::copy_service`]: crate::framework::Reply::copy_service
 //! [`SnapshotError::FamilyWiring`]: crate::framework::SnapshotError::FamilyWiring
+//! [`SnapshotError::Decode`]: crate::framework::SnapshotError::Decode
 
 use serde::{Deserialize, Serialize};
 use starquake_kernel::id::ObjectId;
 use starquake_kernel::result::ResultCode;
 use starquake_trace::ServiceId;
 
+use std::collections::VecDeque;
+
 use crate::apm::PerformanceMode;
 use crate::commands;
+use crate::framework::result::code;
 use crate::framework::{
     Context, Fault, Interfaces, Outcome, Reader, Reply, Request, Server, UnknownPolicy, Writer,
 };
@@ -393,6 +448,17 @@ pub const OE_NAME: &str = "appletOE";
 /// ResultUnknown(UINT32_MAX)`), which `OpenApplicationProxy` answers when it finds no applet for
 /// the caller.
 pub const UNKNOWN: ResultCode = ResultCode::from_raw(u32::MAX);
+
+/// `ErrorModule::AM` (`eden/src/core/hle/result.h` @ cf654052: `AM = 128`).
+pub const AM_MODULE: u32 = 128;
+
+/// `ResultNoMessages` (`eden/src/core/hle/service/am/am_results.h` @ cf654052: `constexpr Result
+/// ResultNoMessages{ErrorModule::AM, 3}`; the same in Eden-NX2 @ 50fa86bb and Eden PR #4588 @
+/// e5fb3b97), which `ReceiveMessage` answers when the applet has no message (module docs, "The
+/// messages"). libnx tells it apart by the same word: `appletMainLoop` skips a failure whose
+/// `R_VALUE(rc) == 0x680`, and `appletGetMessage` checks `MAKERESULT(128, 3)`
+/// (`libnx/nx/source/services/applet.c`).
+pub const NO_MESSAGES: ResultCode = code(AM_MODULE, 3);
 
 /// The flags `OpenApplicationProxyWithFlags` accepts (module docs, "The Switch 2 additions"):
 /// Eden PR #4588 (`eden-pr4588/src/core/hle/service/am/service/application_proxy_service.cpp` @
@@ -599,6 +665,186 @@ pub enum FocusHandlingMode {
     NoSuspend,
 }
 
+/// A message an applet receives with `ReceiveMessage` (`nn::am::AppletMessage`;
+/// `eden/src/core/hle/service/am/am_types.h` @ cf654052, `enum class AppletMessage : u32`, the
+/// same values in Eden-NX2 @ 50fa86bb and Eden PR #4588 @ e5fb3b97).
+///
+/// Every value Eden declares is a variant, except `None = 0`, which Eden's
+/// `PopMessageInOrderOfPriority` returns for "no message" and `ReceiveMessage` never sends: here
+/// "no message" is `Option::None` ([`Lifecycle::pop_message_in_order_of_priority`]). So the type
+/// holds exactly the values a message can carry, and a snapshot that names any other word is
+/// refused (it is read through [`AppletMessage::from_raw`]; module docs, "The messages").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "u32", into = "u32")]
+pub enum AppletMessage {
+    /// `ChangeIntoForeground = 1`.
+    ChangeIntoForeground,
+    /// `ChangeIntoBackground = 2`.
+    ChangeIntoBackground,
+    /// `Exit = 4`.
+    Exit,
+    /// `ApplicationExited = 6`.
+    ApplicationExited,
+    /// `FocusStateChanged = 15`.
+    FocusStateChanged,
+    /// `Resume = 16`.
+    Resume,
+    /// `DetectShortPressingHomeButton = 20`.
+    DetectShortPressingHomeButton,
+    /// `DetectLongPressingHomeButton = 21`.
+    DetectLongPressingHomeButton,
+    /// `DetectShortPressingPowerButton = 22`.
+    DetectShortPressingPowerButton,
+    /// `DetectMiddlePressingPowerButton = 23`.
+    DetectMiddlePressingPowerButton,
+    /// `DetectLongPressingPowerButton = 24`.
+    DetectLongPressingPowerButton,
+    /// `RequestToPrepareSleep = 25`.
+    RequestToPrepareSleep,
+    /// `FinishedSleepSequence = 26`.
+    FinishedSleepSequence,
+    /// `SleepRequiredByHighTemperature = 27`.
+    SleepRequiredByHighTemperature,
+    /// `SleepRequiredByLowBattery = 28`.
+    SleepRequiredByLowBattery,
+    /// `AutoPowerDown = 29`.
+    AutoPowerDown,
+    /// `OperationModeChanged = 30`.
+    OperationModeChanged,
+    /// `PerformanceModeChanged = 31`.
+    PerformanceModeChanged,
+    /// `DetectReceivingCecSystemStandby = 32`.
+    DetectReceivingCecSystemStandby,
+    /// `SdCardRemoved = 33`.
+    SdCardRemoved,
+    /// `LaunchApplicationRequested = 50`.
+    LaunchApplicationRequested,
+    /// `RequestToDisplay = 51`.
+    RequestToDisplay,
+    /// `ShowApplicationLogo = 55`.
+    ShowApplicationLogo,
+    /// `HideApplicationLogo = 56`.
+    HideApplicationLogo,
+    /// `ForceHideApplicationLogo = 57`.
+    ForceHideApplicationLogo,
+    /// `FloatingApplicationDetected = 60`.
+    FloatingApplicationDetected,
+    /// `DetectShortPressingCaptureButton = 90`.
+    DetectShortPressingCaptureButton,
+    /// `DetectLongPressingCaptureButton = 91`.
+    DetectLongPressingCaptureButton,
+    /// `AlbumScreenShotTaken = 92`.
+    AlbumScreenShotTaken,
+    /// `AlbumRecordingSaved = 93`.
+    AlbumRecordingSaved,
+    /// `StartupLogoDisappeared = 95`.
+    StartupLogoDisappeared,
+}
+
+impl AppletMessage {
+    /// Every message, in Eden's declaration order (which is also the order of their words).
+    pub const ALL: [Self; 31] = [
+        Self::ChangeIntoForeground,
+        Self::ChangeIntoBackground,
+        Self::Exit,
+        Self::ApplicationExited,
+        Self::FocusStateChanged,
+        Self::Resume,
+        Self::DetectShortPressingHomeButton,
+        Self::DetectLongPressingHomeButton,
+        Self::DetectShortPressingPowerButton,
+        Self::DetectMiddlePressingPowerButton,
+        Self::DetectLongPressingPowerButton,
+        Self::RequestToPrepareSleep,
+        Self::FinishedSleepSequence,
+        Self::SleepRequiredByHighTemperature,
+        Self::SleepRequiredByLowBattery,
+        Self::AutoPowerDown,
+        Self::OperationModeChanged,
+        Self::PerformanceModeChanged,
+        Self::DetectReceivingCecSystemStandby,
+        Self::SdCardRemoved,
+        Self::LaunchApplicationRequested,
+        Self::RequestToDisplay,
+        Self::ShowApplicationLogo,
+        Self::HideApplicationLogo,
+        Self::ForceHideApplicationLogo,
+        Self::FloatingApplicationDetected,
+        Self::DetectShortPressingCaptureButton,
+        Self::DetectLongPressingCaptureButton,
+        Self::AlbumScreenShotTaken,
+        Self::AlbumRecordingSaved,
+        Self::StartupLogoDisappeared,
+    ];
+
+    /// The message's word, as `ReceiveMessage`'s reply carries it: the one place each value is
+    /// written down.
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        match self {
+            Self::ChangeIntoForeground => 1,
+            Self::ChangeIntoBackground => 2,
+            Self::Exit => 4,
+            Self::ApplicationExited => 6,
+            Self::FocusStateChanged => 15,
+            Self::Resume => 16,
+            Self::DetectShortPressingHomeButton => 20,
+            Self::DetectLongPressingHomeButton => 21,
+            Self::DetectShortPressingPowerButton => 22,
+            Self::DetectMiddlePressingPowerButton => 23,
+            Self::DetectLongPressingPowerButton => 24,
+            Self::RequestToPrepareSleep => 25,
+            Self::FinishedSleepSequence => 26,
+            Self::SleepRequiredByHighTemperature => 27,
+            Self::SleepRequiredByLowBattery => 28,
+            Self::AutoPowerDown => 29,
+            Self::OperationModeChanged => 30,
+            Self::PerformanceModeChanged => 31,
+            Self::DetectReceivingCecSystemStandby => 32,
+            Self::SdCardRemoved => 33,
+            Self::LaunchApplicationRequested => 50,
+            Self::RequestToDisplay => 51,
+            Self::ShowApplicationLogo => 55,
+            Self::HideApplicationLogo => 56,
+            Self::ForceHideApplicationLogo => 57,
+            Self::FloatingApplicationDetected => 60,
+            Self::DetectShortPressingCaptureButton => 90,
+            Self::DetectLongPressingCaptureButton => 91,
+            Self::AlbumScreenShotTaken => 92,
+            Self::AlbumRecordingSaved => 93,
+            Self::StartupLogoDisappeared => 95,
+        }
+    }
+
+    /// The message whose word is `raw`, or [`NotAnAppletMessage`] for a word that is not one of
+    /// [`AppletMessage::ALL`]'s (`0`, Eden's `None`, among them).
+    pub fn from_raw(raw: u32) -> Result<Self, NotAnAppletMessage> {
+        Self::ALL
+            .into_iter()
+            .find(|message| message.raw() == raw)
+            .ok_or(NotAnAppletMessage(raw))
+    }
+}
+
+impl TryFrom<u32> for AppletMessage {
+    type Error = NotAnAppletMessage;
+
+    fn try_from(raw: u32) -> Result<Self, Self::Error> {
+        Self::from_raw(raw)
+    }
+}
+
+impl From<AppletMessage> for u32 {
+    fn from(message: AppletMessage) -> Self {
+        message.raw()
+    }
+}
+
+/// A word that is not an [`AppletMessage`]: what [`AppletMessage::from_raw`] answers for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("{0} is not an applet message")]
+pub struct NotAnAppletMessage(pub u32);
+
 /// What the console reports to the application: the run's configuration of `appletOE` (see the
 /// module docs, "The applet").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -650,14 +896,25 @@ impl Default for Notifications {
 
 /// The part of Eden's `LifecycleManager` that the ported commands read and change, with Eden's
 /// initial values (`lifecycle_manager.h`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Lifecycle {
     /// The notifications the applet asked for.
     pub notifications: Notifications,
-    /// `m_has_focus_state_changed`, initially true; only `ReceiveMessage` (not ported) clears it.
+    /// `m_has_focus_state_changed`, initially true; `ReceiveMessage` clears it when it delivers
+    /// [`AppletMessage::FocusStateChanged`].
     pub has_focus_state_changed: bool,
     /// `m_focus_handling_mode`.
     pub focus_handling_mode: FocusHandlingMode,
+    /// `m_has_operation_mode_changed`, initially false; `ReceiveMessage` clears it when it
+    /// delivers [`AppletMessage::OperationModeChanged`]. Nothing in a run sets it (module docs,
+    /// "The messages").
+    pub has_operation_mode_changed: bool,
+    /// `m_has_performance_mode_changed`, initially false; `ReceiveMessage` clears it when it
+    /// delivers [`AppletMessage::PerformanceModeChanged`]. Nothing in a run sets it.
+    pub has_performance_mode_changed: bool,
+    /// `m_unordered_messages`, initially empty: messages delivered first in, first out, after
+    /// every flag above. Nothing in a run pushes one (module docs, "The messages").
+    pub unordered_messages: VecDeque<AppletMessage>,
 }
 
 impl Default for Lifecycle {
@@ -666,17 +923,53 @@ impl Default for Lifecycle {
             notifications: Notifications::default(),
             has_focus_state_changed: true,
             focus_handling_mode: FocusHandlingMode::SuspendHomeSleep,
+            has_operation_mode_changed: false,
+            has_performance_mode_changed: false,
+            unordered_messages: VecDeque::new(),
         }
     }
 }
 
 impl Lifecycle {
-    /// Whether the applet has a message to receive, so its message event is signalled: the one
-    /// term of `LifecycleManager::ShouldSignalSystemEvent` that can hold in a run (module docs,
-    /// "The message event").
+    /// Whether the applet has a message to receive, so its message event is signalled: the terms
+    /// of `LifecycleManager::ShouldSignalSystemEvent` for an application that this port keeps
+    /// (module docs, "The message event"). It holds exactly when
+    /// [`Lifecycle::pop_message_in_order_of_priority`] would return a message.
     #[must_use]
-    pub const fn message_available(&self) -> bool {
-        self.notifications.focus_state_changed && self.has_focus_state_changed
+    pub fn message_available(&self) -> bool {
+        (self.notifications.focus_state_changed && self.has_focus_state_changed)
+            || !self.unordered_messages.is_empty()
+            || self.has_operation_mode_changed
+            || self.has_performance_mode_changed
+    }
+
+    /// `LifecycleManager::PopMessageInOrderOfPriority` for an application (Eden's
+    /// `m_is_application`), over the terms this port keeps: the first of these that holds is
+    /// taken and returned, or `None` when none does (Eden's `AppletMessage::None`):
+    ///
+    /// 1. a focus change, while focus-change notifications are on: clears
+    ///    [`Lifecycle::has_focus_state_changed`], [`AppletMessage::FocusStateChanged`];
+    /// 2. an operation-mode change: clears [`Lifecycle::has_operation_mode_changed`],
+    ///    [`AppletMessage::OperationModeChanged`];
+    /// 3. a performance-mode change: clears [`Lifecycle::has_performance_mode_changed`],
+    ///    [`AppletMessage::PerformanceModeChanged`];
+    /// 4. the oldest of [`Lifecycle::unordered_messages`], removed.
+    ///
+    /// A focus change pending while the notifications are off stays pending, as in Eden.
+    pub fn pop_message_in_order_of_priority(&mut self) -> Option<AppletMessage> {
+        if self.notifications.focus_state_changed && self.has_focus_state_changed {
+            self.has_focus_state_changed = false;
+            return Some(AppletMessage::FocusStateChanged);
+        }
+        if self.has_operation_mode_changed {
+            self.has_operation_mode_changed = false;
+            return Some(AppletMessage::OperationModeChanged);
+        }
+        if self.has_performance_mode_changed {
+            self.has_performance_mode_changed = false;
+            return Some(AppletMessage::PerformanceModeChanged);
+        }
+        self.unordered_messages.pop_front()
     }
 
     /// `LifecycleManager::SetFocusHandlingMode(suspend)`.
@@ -710,8 +1003,10 @@ impl Lifecycle {
 /// applet").
 ///
 /// A method that changes it while it calls the kernel works on a copy and writes the copy back
-/// before it reports any error, so a kernel object it created is never forgotten.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// before it reports any error, so a kernel object it created is never forgotten. The one
+/// exception is `ReceiveMessage`, which writes its copy back only once the message event agrees
+/// with it (module docs, "The messages").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Applet {
     settings: AppletSettings,
     lifecycle: Lifecycle,
@@ -872,6 +1167,18 @@ impl Applet {
         Ok(())
     }
 
+    /// Takes the applet's next message ([`Lifecycle::pop_message_in_order_of_priority`]), then
+    /// clears the message event if no message is left: Eden's `LifecycleManager::PopMessage`,
+    /// which calls `SignalSystemEventIfNeeded` after the pop. Taking a message never makes one
+    /// available, so the event is only ever cleared here, never signalled.
+    fn pop_message(&mut self, cx: &mut Context<'_>) -> Result<Option<AppletMessage>, Fault> {
+        let mut message = None;
+        self.update(cx, |lifecycle| {
+            message = lifecycle.pop_message_in_order_of_priority();
+        })?;
+        Ok(message)
+    }
+
     /// The message event, created (and signalled if a message is available) the first time.
     fn message_event_or_create(&mut self, cx: &mut Context<'_>) -> Result<ObjectId, Fault> {
         if let Some(event) = self.message_event {
@@ -930,7 +1237,7 @@ fn reply_with_applet_event(
     reply: &mut Reply,
     get: impl FnOnce(&mut Applet, &mut Context<'_>) -> Result<ObjectId, Fault>,
 ) -> Outcome {
-    let mut applet = *cx.family::<Applet>()?;
+    let mut applet = cx.family::<Applet>()?.clone();
     let event = get(&mut applet, cx);
     *cx.family::<Applet>()? = applet;
     reply.copy_handle(event?);
@@ -1043,6 +1350,11 @@ pub mod command {
     pub mod common_state_getter {
         /// `{0, D<&ICommonStateGetter::GetEventHandle>, "GetEventHandle"}`.
         pub const GET_EVENT_HANDLE: u32 = 0;
+        /// `{1, D<&ICommonStateGetter::ReceiveMessage>, "ReceiveMessage"}`, the same row in Eden
+        /// @ cf654052, Eden-NX2 @ 50fa86bb and Eden PR #4588 @ e5fb3b97
+        /// (`src/core/hle/service/am/service/common_state_getter.cpp` in each); libnx
+        /// `_appletReceiveMessage` sends 1 to `ICommonStateGetter` with `_appletCmdNoInOutU32`.
+        pub const RECEIVE_MESSAGE: u32 = 1;
         /// `{5, D<&ICommonStateGetter::GetOperationMode>, "GetOperationMode"}`.
         pub const GET_OPERATION_MODE: u32 = 5;
         /// `{6, D<&ICommonStateGetter::GetPerformanceMode>, "GetPerformanceMode"}`.
@@ -1173,6 +1485,7 @@ commands! {
 commands! {
     impl ICommonStateGetter {
         common_state_getter::GET_EVENT_HANDLE => get_event_handle,
+        common_state_getter::RECEIVE_MESSAGE => receive_message,
         common_state_getter::GET_OPERATION_MODE => get_operation_mode,
         common_state_getter::GET_PERFORMANCE_MODE => get_performance_mode,
         common_state_getter::GET_CURRENT_FOCUS_STATE => get_current_focus_state,
@@ -1419,6 +1732,32 @@ impl ICommonStateGetter {
         reply_with_applet_event(cx, reply, Applet::message_event_or_create)
     }
 
+    /// `ReceiveMessage`. out: `u32` the applet's next message ([`AppletMessage::raw`]), or
+    /// [`NO_MESSAGES`] with nothing when there is none (Eden: `if
+    /// (!lifecycle_manager.PopMessage(..)) R_THROW(AM::ResultNoMessages)`).
+    ///
+    /// The message is taken on a copy of the applet, which is written back only once the
+    /// message event is cleared (if no message is left): a clear that fails (a restored event id
+    /// that is not an event) answers the kernel's error and leaves the message to be received
+    /// again (module docs, "The messages").
+    fn receive_message(
+        _: &mut Self,
+        cx: &mut Context<'_>,
+        _req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        let mut applet = cx.family::<Applet>()?.clone();
+        let message = applet.pop_message(cx)?;
+        *cx.family::<Applet>()? = applet;
+        let Some(message) = message else {
+            tracing::debug!("appletOE: ReceiveMessage with no message");
+            return Err(NO_MESSAGES.into());
+        };
+        tracing::debug!(message = message.raw(), "appletOE: ReceiveMessage");
+        reply.payload().write_u32(message.raw());
+        reply.ok()
+    }
+
     /// `SetRequestExitToLibraryAppletAtExecuteNextProgramEnabled`. in: nothing. out: nothing.
     /// Sets the applet's flag (Eden: `m_applet->
     /// request_exit_to_library_applet_at_execute_next_program_enabled = true`), which no
@@ -1479,7 +1818,7 @@ impl ISelfController {
     /// Runs `change` on the applet's lifecycle state, signalling the message event as
     /// [`Applet::update`] says.
     fn update(cx: &mut Context<'_>, change: impl FnOnce(&mut Lifecycle)) -> Result<(), Fault> {
-        let mut applet = *cx.family::<Applet>()?;
+        let mut applet = cx.family::<Applet>()?.clone();
         let updated = applet.update(cx, change);
         *cx.family::<Applet>()? = applet;
         updated
