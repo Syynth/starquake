@@ -245,6 +245,13 @@ impl<'m, 'a, V: Vcpu, C: HostClock + Clone> Core<'m, 'a, V, C> {
             Outcome::EnvFailed(error) => Err(Ending::Failed(format!(
                 "the environment failed during svc {number:#x}: {error}"
             ))),
+            // The program stopped itself: a crash with the registers it called `Break` with,
+            // and no syndrome (the CPU took an ordinary system call).
+            Outcome::Broke(call) => Err(Ending::Crashed(
+                Exception::svc_break(&call),
+                None,
+                Box::new(regs),
+            )),
         }
     }
 
@@ -303,7 +310,7 @@ impl<'m, 'a, V: Vcpu, C: HostClock + Clone> Core<'m, 'a, V, C> {
 /// they are now.
 fn crashed<V: Vcpu>(vcpu: &V, exception: Exception, syndrome: Syndrome) -> Ending {
     match vcpu.regs() {
-        Ok(regs) => Ending::Crashed(exception, syndrome, Box::new(regs)),
+        Ok(regs) => Ending::Crashed(exception, Some(syndrome), Box::new(regs)),
         Err(error) => Ending::Failed(format!("the vCPU failed: {error}")),
     }
 }

@@ -7,8 +7,15 @@ use crate::id::{ProcessId, SlabId};
 use crate::memory::fixture::{CODE_SIZE, STACK_SIZE, loaded, memory};
 use crate::memory::testing::RecordingMapper;
 use crate::memory::{MemoryArrangement, ProcessMemory};
+use crate::process::ENTROPY_COUNT;
 use crate::result::SvcError;
-use crate::sched::{CoreId, Priority};
+use crate::sched::{CoreId, Priority, SchedError};
+
+/// The process the tests ask about: not the first id a table hands out, so a lookup that ignores
+/// it shows.
+fn process() -> ProcessId {
+    ProcessId::from_parts(3, 2)
+}
 
 fn kernel(error: KernelError) -> CallResult<u64> {
     Err(SvcError::Kernel(error))
@@ -22,10 +29,20 @@ fn tables() -> (HandleTable, Scheduler) {
 /// Asks the loaded fixture's address space for `id` with the current-process pseudo-handle.
 fn ask(space: &AddressSpace, id: u32) -> CallResult<u64> {
     let (handles, scheduler) = tables();
-    get_info(&handles, space, &scheduler, id, Handle::CURRENT_PROCESS, 0)
+    get_info(
+        &handles,
+        space,
+        &scheduler,
+        process(),
+        id,
+        Handle::CURRENT_PROCESS,
+        0,
+    )
 }
 
 /// The numbers of the ids this slice answers, by Eden's `InfoType` (`svc_types.h`).
+const DEBUGGER_ATTACHED: u32 = 8;
+const RANDOM_ENTROPY: u32 = 11;
 const ALIAS_REGION_ADDRESS: u32 = 2;
 const ALIAS_REGION_SIZE: u32 = 3;
 const HEAP_REGION_ADDRESS: u32 = 4;
@@ -38,7 +55,8 @@ const STACK_REGION_ADDRESS: u32 = 14;
 const STACK_REGION_SIZE: u32 = 15;
 const ALIAS_REGION_EXTRA_SIZE: u32 = 28;
 
-/// Every id this slice answers.
+/// Every memory id this slice answers: the ids of Eden's first group, which take a process
+/// handle and sub id 0.
 const ANSWERED: [u32; 11] = [
     ALIAS_REGION_ADDRESS,
     ALIAS_REGION_SIZE,
@@ -147,7 +165,7 @@ fn a_sub_id_other_than_zero_is_an_invalid_enum_value() {
         for sub_id in [1, u64::MAX] {
             for handle in [Handle::CURRENT_PROCESS, Handle::INVALID] {
                 assert_eq!(
-                    get_info(&handles, &space, &scheduler, id, handle, sub_id),
+                    get_info(&handles, &space, &scheduler, process(), id, handle, sub_id),
                     kernel(KernelError::InvalidEnumValue),
                     "id {id} sub id {sub_id:#x}"
                 );
@@ -174,7 +192,7 @@ fn a_handle_must_name_a_process() {
     let process_handle = add(Object::Process(ProcessId::from_parts(0, 1)));
 
     for id in ANSWERED {
-        let ask = |handle| get_info(&handles, &space, &scheduler, id, handle, 0);
+        let ask = |handle| get_info(&handles, &space, &scheduler, process(), id, handle, 0);
         // `R_UNLESS(process.IsNotNull(), ResultInvalidHandle)`: the invalid handle, the
         // current-thread pseudo-handle, a handle no entry has, and a handle to a thread.
         for handle in [
@@ -200,18 +218,22 @@ fn a_handle_must_name_a_process() {
 fn an_id_this_slice_does_not_answer_is_not_implemented_whatever_else_is_passed() {
     let (space, _log, _) = loaded();
     let (handles, scheduler) = tables();
+    let others = [DEBUGGER_ATTACHED, RANDOM_ENTROPY];
     let unanswered: Vec<u32> = InfoType::ALL
         .iter()
         .map(|id| id.number())
-        .filter(|number| !ANSWERED.contains(number))
+        .filter(|number| !ANSWERED.contains(number) && !others.contains(number))
         .collect();
-    // Every id Eden answers besides the eleven, and the five Switch 2 ids.
-    assert_eq!(unanswered.len(), InfoType::ALL.len() - ANSWERED.len());
+    // Every id Eden answers besides the thirteen, and the five Switch 2 ids.
+    assert_eq!(
+        unanswered.len(),
+        InfoType::ALL.len() - ANSWERED.len() - others.len()
+    );
     assert_eq!(
         unanswered,
         [
-            0, 1, 8, 9, 10, 11, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 29, 30, 31, 32, 33, 37, 38,
-            65000, 65001
+            0, 1, 9, 10, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 29, 30, 31, 32, 33, 37, 38, 65000,
+            65001
         ]
     );
     for id in unanswered {
@@ -221,7 +243,7 @@ fn an_id_this_slice_does_not_answer_is_not_implemented_whatever_else_is_passed()
             (Handle::CURRENT_PROCESS, 7),
         ] {
             assert_eq!(
-                get_info(&handles, &space, &scheduler, id, handle, sub_id),
+                get_info(&handles, &space, &scheduler, process(), id, handle, sub_id),
                 kernel(KernelError::NotImplemented),
                 "id {id}"
             );
@@ -251,4 +273,227 @@ fn every_listed_id_has_its_own_number_in_order() {
     for &id in InfoType::ALL {
         assert_eq!(InfoType::from_raw(id.number()), Some(id));
     }
+}
+
+/// A scheduler with a row for [`process`] and nothing to run, the row's entropy `entropy` when
+/// it is given.
+fn scheduler_of(entropy: Option<[u64; ENTROPY_COUNT]>) -> Scheduler {
+    let mut scheduler = Scheduler::default();
+    scheduler.add_process(process()).unwrap();
+    if let Some(entropy) = entropy {
+        scheduler.set_entropy(process(), entropy).unwrap();
+    }
+    scheduler
+}
+
+/// Entropy words that all differ, so a wrong index shows.
+const ENTROPY: [u64; ENTROPY_COUNT] = [
+    0x1111_2222_3333_4444,
+    0x5555_6666_7777_8888,
+    0x9999_aaaa_bbbb_cccc,
+    0xdddd_eeee_ffff_0001,
+];
+
+/// Handles other than the invalid one: the pseudo-handles, a handle no entry has, and the
+/// smallest non-zero value.
+const NOT_ZERO: [Handle; 4] = [
+    Handle::CURRENT_PROCESS,
+    Handle::CURRENT_THREAD,
+    Handle::from_raw(0x0001_0001),
+    Handle::from_raw(1),
+];
+
+/// [`ENTROPY_COUNT`] as a sub id.
+fn entropy_count() -> u64 {
+    u64::try_from(ENTROPY_COUNT).unwrap()
+}
+
+#[test]
+fn a_debugger_is_never_attached_whatever_is_passed() {
+    // `case InfoType::DebuggerAttached: *result = 0`: no check of the handle or the sub id, and
+    // no process is needed (the scheduler here has none).
+    let (space, _log, _) = loaded();
+    let (handles, scheduler) = tables();
+    for handle in NOT_ZERO.into_iter().chain([Handle::INVALID]) {
+        for sub_id in [0, 1, entropy_count(), u64::MAX] {
+            assert_eq!(
+                get_info(
+                    &handles,
+                    &space,
+                    &scheduler,
+                    process(),
+                    DEBUGGER_ATTACHED,
+                    handle,
+                    sub_id
+                ),
+                Ok(0),
+                "handle {:#x} sub id {sub_id:#x}",
+                handle.raw()
+            );
+        }
+    }
+}
+
+#[test]
+fn each_entropy_sub_id_reads_its_own_word() {
+    let (space, _log, _) = loaded();
+    let handles = HandleTable::new(8).unwrap();
+    let scheduler = scheduler_of(Some(ENTROPY));
+    for (sub_id, word) in (0_u64..).zip(ENTROPY) {
+        assert_eq!(
+            get_info(
+                &handles,
+                &space,
+                &scheduler,
+                process(),
+                RANDOM_ENTROPY,
+                Handle::INVALID,
+                sub_id
+            ),
+            Ok(word),
+            "sub id {sub_id}"
+        );
+    }
+}
+
+#[test]
+fn an_entropy_sub_id_at_the_count_or_above_is_an_invalid_combination() {
+    // `R_UNLESS(info_sub_id < 4, ResultInvalidCombination)`: the last word is readable, the
+    // count itself is not.
+    let (space, _log, _) = loaded();
+    let handles = HandleTable::new(8).unwrap();
+    let scheduler = scheduler_of(Some(ENTROPY));
+    let count = entropy_count();
+    let ask = |sub_id| {
+        get_info(
+            &handles,
+            &space,
+            &scheduler,
+            process(),
+            RANDOM_ENTROPY,
+            Handle::INVALID,
+            sub_id,
+        )
+    };
+    assert_eq!(ask(count - 1), Ok(ENTROPY[ENTROPY_COUNT - 1]));
+    for sub_id in [count, count + 1, u64::from(u32::MAX) + 1, u64::MAX] {
+        assert_eq!(
+            ask(sub_id),
+            kernel(KernelError::InvalidCombination),
+            "sub id {sub_id:#x}"
+        );
+    }
+}
+
+#[test]
+fn entropy_is_asked_for_with_the_invalid_handle_and_the_handle_is_checked_first() {
+    // `R_UNLESS(handle == 0, ResultInvalidHandle)` comes before the sub id's check: with both
+    // wrong, the handle is reported.
+    let (space, _log, _) = loaded();
+    let handles = HandleTable::new(8).unwrap();
+    let scheduler = scheduler_of(Some(ENTROPY));
+    for handle in NOT_ZERO {
+        for sub_id in [0, entropy_count()] {
+            assert_eq!(
+                get_info(
+                    &handles,
+                    &space,
+                    &scheduler,
+                    process(),
+                    RANDOM_ENTROPY,
+                    handle,
+                    sub_id
+                ),
+                kernel(KernelError::InvalidHandle),
+                "handle {:#x} sub id {sub_id}",
+                handle.raw()
+            );
+        }
+    }
+}
+
+#[test]
+fn entropy_that_was_never_drawn_is_an_internal_failure_after_the_checks() {
+    let (space, _log, _) = loaded();
+    let handles = HandleTable::new(8).unwrap();
+    let scheduler = scheduler_of(None);
+    let ask = |process, handle, sub_id| {
+        get_info(
+            &handles,
+            &space,
+            &scheduler,
+            process,
+            RANDOM_ENTROPY,
+            handle,
+            sub_id,
+        )
+    };
+    // The guest's mistakes are still reported as Eden reports them.
+    assert_eq!(
+        ask(process(), Handle::CURRENT_PROCESS, 0),
+        kernel(KernelError::InvalidHandle)
+    );
+    assert_eq!(
+        ask(process(), Handle::INVALID, entropy_count()),
+        kernel(KernelError::InvalidCombination)
+    );
+    assert_eq!(
+        ask(process(), Handle::INVALID, 0),
+        Err(SvcError::Internal(
+            "the process's entropy was asked for before it was drawn".to_owned()
+        ))
+    );
+    // A process the scheduler has no row for is an internal failure too.
+    let other = ProcessId::from_parts(4, 2);
+    assert!(
+        matches!(
+            ask(other, Handle::INVALID, 0),
+            Err(SvcError::Internal(ref what)) if what.contains("no process")
+        ),
+        "{:?}",
+        ask(other, Handle::INVALID, 0)
+    );
+}
+
+#[test]
+fn the_entropy_read_is_the_named_process_s() {
+    // Two processes with different entropy: each is answered with its own.
+    let (space, _log, _) = loaded();
+    let handles = HandleTable::new(8).unwrap();
+    let mut scheduler = scheduler_of(Some(ENTROPY));
+    let other = ProcessId::from_parts(4, 2);
+    let reversed = [ENTROPY[3], ENTROPY[2], ENTROPY[1], ENTROPY[0]];
+    scheduler.add_process(other).unwrap();
+    scheduler.set_entropy(other, reversed).unwrap();
+    for (process, expected) in [(process(), ENTROPY[0]), (other, reversed[0])] {
+        assert_eq!(
+            get_info(
+                &handles,
+                &space,
+                &scheduler,
+                process,
+                RANDOM_ENTROPY,
+                Handle::INVALID,
+                0
+            ),
+            Ok(expected)
+        );
+    }
+}
+
+#[test]
+fn entropy_once_set_is_kept() {
+    let mut scheduler = scheduler_of(Some(ENTROPY));
+    assert_eq!(
+        scheduler.set_entropy(process(), [0; ENTROPY_COUNT]),
+        Err(SchedError::Corrupt)
+    );
+    assert_eq!(
+        scheduler.process(process()).unwrap().entropy(),
+        Some(ENTROPY)
+    );
+    // A new process has none until it is set.
+    let other = ProcessId::from_parts(4, 2);
+    scheduler.add_process(other).unwrap();
+    assert_eq!(scheduler.process(other).unwrap().entropy(), None);
 }

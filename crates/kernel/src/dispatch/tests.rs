@@ -1089,7 +1089,7 @@ fn get_info_decodes_x1_to_x3_and_writes_the_value_to_x1() {
 }
 
 #[test]
-fn the_memory_calls_declare_the_address_space_and_get_info_all_three_tables_shared() {
+fn the_memory_calls_declare_the_address_space_and_get_info_all_three_tables() {
     let dispatcher = Dispatcher::new(tables());
     for id in [
         SvcId::SetHeapSize,
@@ -1104,11 +1104,12 @@ fn the_memory_calls_declare_the_address_space_and_get_info_all_three_tables_shar
         dispatcher.lock_waits(),
         LockWaits {
             timed: false,
-            // Five acquisitions; the three that change memory declared it exclusively.
-            lock: waits(5, 3, 0, Duration::ZERO),
+            // Five acquisitions; the three that change memory declared it exclusively, and
+            // GetInfo the scheduler, where the first ask for the entropy keeps what it drew.
+            lock: waits(5, 4, 0, Duration::ZERO),
             handles: waits(1, 0, 0, Duration::ZERO),
             address_space: waits(5, 3, 0, Duration::ZERO),
-            scheduler: waits(1, 0, 0, Duration::ZERO),
+            scheduler: waits(1, 1, 0, Duration::ZERO),
         }
     );
 }
@@ -1519,6 +1520,10 @@ fn the_dispatcher_runs_exactly_the_calls_marked_implemented() {
         let record = dispatch_running(id.number(), &mut regs, &memory);
         let expected = match (id.status(), id) {
             (Status::Implemented, SvcId::ExitProcess | SvcId::ExitThread) => Outcome::ProcessExited,
+            // Reason 0, a panic, with no buffer: the program stops.
+            (Status::Implemented, SvcId::Break) => {
+                Outcome::Broke(crate::svc::exception::Break::decode(0, 0, 0))
+            }
             (Status::Implemented, _) => Outcome::Completed,
             _ => Outcome::NotImplemented,
         };
@@ -1806,3 +1811,5 @@ fn set_gpu_memory_attribute_is_not_implemented_for_a_process_built_for_switch_1(
         assert_eq!(space.query_info(DATA).unwrap().svc_info().attribute, 0);
     });
 }
+
+mod info_and_break;

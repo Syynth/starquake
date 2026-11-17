@@ -10,27 +10,30 @@
 //! PROVISIONAL (walking skeleton, #74). Not here yet, and owned by the crash-report step of the
 //! observability spec's order of work: a backtrace by frame pointer, symbol names, and the events
 //! split per thread (the report quotes the newest events of every thread, merged in order). The
-//! exception is one of three kinds: a data
-//! abort, an instruction abort, and everything else as an undefined instruction. The CPU
-//! backend's syndrome for it ([`CrashReport::with_syndrome`]) says the rest: whether an abort was
-//! a missing page or a refused access, and what an "undefined instruction" really was.
+//! exception is one of four kinds: a data abort, an instruction abort, a `Break` system call
+//! that is not a notification (the program stopped itself), and everything else as an
+//! undefined instruction. The CPU backend's syndrome for it ([`CrashReport::with_syndrome`])
+//! says the rest: whether an abort was a missing page or a refused access, and what an
+//! "undefined instruction" really was. A `Break` has no syndrome: the CPU took an ordinary
+//! system call, and the report's `syndrome` is `null`.
 //!
 //! The JSON layout is this crate's own (the spec gives none), versioned by [`CRASH_VERSION`] and
 //! pinned by a test. Addresses and register values are hex strings, so no reader loses bits to a
-//! floating-point number. Version 2 added the `syndrome` field. (The `instruction_abort` kind
-//! came earlier, inside version 1; before it, a fetch from an address nothing maps was reported
-//! as a `data_abort` read.)
+//! floating-point number. Version 2 added the `syndrome` field, and version 3 the `svc_break`
+//! exception kind. (The `instruction_abort` kind came earlier, inside version 1; before it, a
+//! fetch from an address nothing maps was reported as a `data_abort` read.)
 
 use std::fmt::Write as _;
 
 use serde::{Serialize, Serializer};
 use starquake_cpu::{ExceptionClass, FaultStatus, GuestRegs, Syndrome};
+use starquake_kernel::svc::exception::Break;
 
 use crate::report::Mapping;
 
 /// Version of the `crash.json` layout. Any change to the layout bumps it: a field or exception
 /// kind added, renamed or removed, or a field's meaning changed.
-pub const CRASH_VERSION: u32 = 2;
+pub const CRASH_VERSION: u32 = 3;
 
 /// Serialises a `u64` as a hex string (`"0x80000000"`).
 #[expect(
@@ -39,6 +42,28 @@ pub const CRASH_VERSION: u32 = 2;
 )]
 pub(crate) fn hex<S: Serializer>(value: &u64, serializer: S) -> Result<S::Ok, S::Error> {
     serializer.collect_str(&format_args!("{value:#x}"))
+}
+
+/// Serialises a `u32` as a hex string (`"0x1"`).
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's `serialize_with` calls this with a reference to the field"
+)]
+fn hex_word<S: Serializer>(value: &u32, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.collect_str(&format_args!("{value:#x}"))
+}
+
+/// Serialises an optional `u32` as a hex string, or `null`.
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    clippy::ref_option,
+    reason = "serde's `serialize_with` calls this with a reference to the field"
+)]
+fn hex_word_or_null<S: Serializer>(value: &Option<u32>, serializer: S) -> Result<S::Ok, S::Error> {
+    match value {
+        Some(value) => hex_word(value, serializer),
+        None => serializer.serialize_none(),
+    }
 }
 
 /// Serialises `u64`s as a list of hex strings.
@@ -80,6 +105,40 @@ pub enum Exception {
     /// An instruction the guest may not execute: undefined, a breakpoint, a failed pointer
     /// authentication, a misaligned PC or SP.
     UndefinedInstruction,
+    /// The program called `Break` without the notification flag: it stopped itself
+    /// ([`starquake_kernel::svc::exception`]).
+    SvcBreak {
+        /// The reason word as passed (`Svc::BreakReason`); the notification flag is clear.
+        #[serde(serialize_with = "hex_word")]
+        reason: u32,
+        /// The reason in words (`panic`, `assert`, ...), or `null` for a reason Eden does not
+        /// name.
+        reason_name: Option<&'static str>,
+        /// The buffer's address (`x1`).
+        #[serde(serialize_with = "hex")]
+        address: u64,
+        /// The buffer's size (`x2`).
+        #[serde(serialize_with = "hex")]
+        size: u64,
+        /// The word a four-byte buffer held, usually a result code; `null` when the buffer was
+        /// not four bytes or could not be read.
+        #[serde(serialize_with = "hex_word_or_null")]
+        code: Option<u32>,
+    },
+}
+
+impl Exception {
+    /// The exception a `Break` call that is not a notification ends the run with.
+    #[must_use]
+    pub const fn svc_break(call: &Break) -> Self {
+        Self::SvcBreak {
+            reason: call.raw_reason(),
+            reason_name: call.reason.name(),
+            address: call.address,
+            size: call.size,
+            code: call.code,
+        }
+    }
 }
 
 /// The exception's syndrome, as the CPU backend reported it.
@@ -246,7 +305,7 @@ impl CrashReport {
                     .find(|mapping| mapping.contains(address))
                     .map(|mapping| mapping.name.clone())
             }
-            Exception::UndefinedInstruction => None,
+            Exception::UndefinedInstruction | Exception::SvcBreak { .. } => None,
         };
         Self {
             version: CRASH_VERSION,
@@ -310,6 +369,20 @@ impl CrashReport {
                 )
             }
             Exception::UndefinedInstruction => "undefined instruction".to_owned(),
+            Exception::SvcBreak {
+                reason,
+                reason_name,
+                address,
+                size,
+                code,
+            } => {
+                let reason = reason_name.map_or_else(
+                    || format!("reason {reason:#x}"),
+                    |name| format!("reason {name} ({reason:#x})"),
+                );
+                let code = code.map_or_else(String::new, |code| format!(", code {code:#x}"));
+                format!("svc Break, {reason}, buffer {address:#x} size {size:#x}{code}")
+            }
         }
     }
 
@@ -635,7 +708,7 @@ mod tests {
         assert_eq!(
             json,
             r##"{
-  "version": 2,
+  "version": 3,
   "emulator": "starquake 9.9.9",
   "command_line": [
     "starquake",
@@ -695,7 +768,7 @@ mod tests {
         );
         // The golden text pins the version as a literal, so a layout change that forgets to bump
         // `CRASH_VERSION` fails here.
-        assert_eq!(CRASH_VERSION, 2);
+        assert_eq!(CRASH_VERSION, 3);
         let undefined = serde_json::to_value(Exception::UndefinedInstruction).unwrap();
         assert_eq!(
             undefined,
@@ -717,6 +790,119 @@ mod tests {
         // `Null`, so check the object itself).
         let without = without.as_object().unwrap();
         assert_eq!(without.get("syndrome"), Some(&serde_json::Value::Null));
+    }
+
+    /// A break with every field set, each to a distinct value.
+    fn assert_break() -> Exception {
+        Exception::SvcBreak {
+            reason: 1,
+            reason_name: Some("assert"),
+            address: 0x80f0_0010,
+            size: 4,
+            code: Some(0x2a_0c0e),
+        }
+    }
+
+    #[test]
+    fn a_break_names_its_reason_its_buffer_and_its_code() {
+        let report = report(assert_break());
+        // The buffer is not a faulting address: no mapping is named, though it is in one.
+        assert_eq!(report.fault_mapping, None);
+        assert_eq!(report.syndrome, None);
+        assert_eq!(
+            report.exception_text(),
+            "svc Break, reason assert (0x1), buffer 0x80f00010 size 0x4, code 0x2a0c0e"
+        );
+        assert!(
+            report.to_text().contains(
+                "exception: svc Break, reason assert (0x1), buffer 0x80f00010 size 0x4, \
+                 code 0x2a0c0e\ninstruction: pc 0x800000b8 (main+0xb8)\n"
+            ),
+            "{}",
+            report.to_text()
+        );
+        // A reason Eden does not name is given by number, and no code is no code.
+        let unnamed = super::tests::report(Exception::SvcBreak {
+            reason: 0x99,
+            reason_name: None,
+            address: 0,
+            size: 0,
+            code: None,
+        });
+        assert_eq!(
+            unnamed.exception_text(),
+            "svc Break, reason 0x99, buffer 0x0 size 0x0"
+        );
+    }
+
+    #[test]
+    fn a_break_is_reported_as_the_kernel_decoded_it() {
+        use starquake_kernel::svc::exception::{BreakReason, NOTIFICATION_ONLY_FLAG};
+        let mut call = Break::decode(BreakReason::Assert.raw(), 0x80f0_0010, 4);
+        call.code = Some(0x2a_0c0e);
+        assert_eq!(Exception::svc_break(&call), assert_break());
+        // A reason with no name keeps its number, and has no name.
+        let other = Break::decode(0x99, 0x10, 0x20);
+        assert_eq!(
+            Exception::svc_break(&other),
+            Exception::SvcBreak {
+                reason: 0x99,
+                reason_name: None,
+                address: 0x10,
+                size: 0x20,
+                code: None,
+            }
+        );
+        // Were a notification ever reported, its word would keep the flag.
+        let notice = Break::decode(NOTIFICATION_ONLY_FLAG | 3, 0, 0);
+        assert!(matches!(
+            Exception::svc_break(&notice),
+            Exception::SvcBreak {
+                reason: 0x8000_0003,
+                reason_name: Some("pre_load_dll"),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn the_break_kind_s_json_layout_is_pinned() {
+        // Every field distinct and non-zero.
+        assert_eq!(
+            serde_json::to_string_pretty(&assert_break()).unwrap(),
+            r#"{
+  "kind": "svc_break",
+  "reason": "0x1",
+  "reason_name": "assert",
+  "address": "0x80f00010",
+  "size": "0x4",
+  "code": "0x2a0c0e"
+}"#
+        );
+        // The two optional fields are written as `null`, not left out.
+        let unnamed = Exception::SvcBreak {
+            reason: 0x99,
+            reason_name: None,
+            address: 0x10,
+            size: 0x20,
+            code: None,
+        };
+        assert_eq!(
+            serde_json::to_value(unnamed).unwrap(),
+            serde_json::json!({
+                "kind": "svc_break",
+                "reason": "0x99",
+                "reason_name": null,
+                "address": "0x10",
+                "size": "0x20",
+                "code": null,
+            })
+        );
+        // In a whole report, with the version that added the kind.
+        let json = serde_json::to_value(report(assert_break())).unwrap();
+        assert_eq!(json["version"], 3);
+        assert_eq!(json["exception"]["kind"], "svc_break");
+        assert_eq!(json["syndrome"], serde_json::Value::Null);
     }
 
     #[test]

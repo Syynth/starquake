@@ -1,26 +1,39 @@
-//! `GetInfo` (0x29): the memory facts of a process. This slice answers the ids a libnx program
-//! asks at start-up: the alias, heap, ASLR and stack regions, the alias region's extra size,
-//! and the total and used memory.
+//! `GetInfo` (0x29): facts about a process. This slice answers the ids a libnx program asks at
+//! start-up (the alias, heap, ASLR and stack regions, the alias region's extra size, the total
+//! and used memory), the random entropy that rtld asks for after its module walk, and whether a
+//! debugger is attached.
 //!
 //! Ported from Eden `eden/src/core/hle/kernel/svc/svc_info.cpp` @ cf654052 (GPL-3.0-or-later),
 //! `GetInfo`; the ids are `InfoType` in `eden/src/core/hle/kernel/svc_types.h` @ cf654052.
-//! For the ids answered here, Eden checks in this order:
+//! Eden's checks, in its order, for each group of ids answered here:
 //!
-//! 1. `info_sub_id == 0`, else `ResultInvalidEnumValue`.
-//! 2. The handle names a process (`GetObject<KProcess>`: the current-process pseudo-handle, or
-//!    a handle to a process), else `ResultInvalidHandle`.
+//! - **The memory ids** (2 to 7, 12 to 15 and 28, in the first `case` group of Eden's
+//!   `switch`):
+//!   1. `info_sub_id == 0`, else `ResultInvalidEnumValue`.
+//!   2. The handle names a process (`GetObject<KProcess>`: the current-process pseudo-handle,
+//!      or a handle to a process), else `ResultInvalidHandle`.
 //!
-//! and then reads the value from that process's page table, or (ids 6 and 7) from the process.
+//!   Then the value is read from that process's page table, or (ids 6 and 7) from the process.
+//! - **`DebuggerAttached`** (8): no check at all; the value is zero (`*result = 0`). No
+//!   debugger is ever attached here, so that is the fact, not a stub.
+//! - **`RandomEntropy`** (11):
+//!   1. `handle == 0` (the invalid handle, not a process), else `ResultInvalidHandle`.
+//!   2. `info_sub_id < 4` ([`ENTROPY_COUNT`]), else `ResultInvalidCombination`.
+//!
+//!   Then the value is word `info_sub_id` of the calling process's entropy
+//!   (`GetCurrentProcess(...).GetRandomEntropy(info_sub_id)`).
+//!
+//! PR #4588 (`eden-pr4588/src/core/hle/kernel/svc/svc_info.cpp` @ e5fb3b97) changes none of
+//! these, so a Switch 2 program is answered the same.
 //!
 //! # Divergences from Eden
 //!
 //! - **Ids Eden answers that this slice does not** return [`KernelError::NotImplemented`]
-//!   and are logged: the core and priority masks,
-//!   the debugger, resource-limit, tick-count and entropy ids, the system-resource sizes, the
-//!   program id, the initial process id range, the exception context address, the non-system
-//!   memory sizes, `IsApplication`, the free thread count, ids 37 and 38, and Atmosphère's two.
-//!   Eden answers each. They belong to the slices that build what they report (process
-//!   creation, threads, resource limits). Test:
+//!   and are logged: the core and priority masks, the resource-limit and tick-count ids, the
+//!   system-resource sizes, the program id, the initial process id range, the exception
+//!   context address, the non-system memory sizes, `IsApplication`, the free thread count,
+//!   ids 37 and 38, and Atmosphère's two. Eden answers each. They belong to the slices that
+//!   build what they report (process creation, threads, resource limits). Test:
 //!   `an_id_this_slice_does_not_answer_is_not_implemented_whatever_else_is_passed`.
 //! - **The Switch 2 ids 29 to 33** (`eden-pr4588/src/core/hle/kernel/svc/svc_info.cpp` @
 //!   e5fb3b97; scoping doc, "New `svcGetInfo` ids") are not built either and return
@@ -29,15 +42,27 @@
 //! - **Any process handle names the one process there is.** With one process, a handle to a
 //!   process object and the pseudo-handle are the same process (kernel slice 8 makes
 //!   processes rows of a table). Test: `a_handle_must_name_a_process`.
+//! - **The entropy is drawn when it is first asked for**, not when the process is created
+//!   (Eden's `KProcess::Initialize`, `GenerateRandom(m_entropy)`): the dispatcher draws the
+//!   [`ENTROPY_COUNT`] words from the environment's random numbers at the first
+//!   `RandomEntropy` call, whatever its handle and sub id, and keeps them in the process's
+//!   row ([`crate::process::ProcessRecord::entropy`]). Creating a process has no route to the
+//!   environment yet. The guest cannot tell: the words are random either way, and never change
+//!   once drawn. Test (in `dispatch/tests/info_and_break.rs`):
+//!   `the_entropy_is_drawn_once_at_the_first_ask_and_kept`. A process whose entropy was not
+//!   drawn is an internal failure here, not a value. Test:
+//!   `entropy_that_was_never_drawn_is_an_internal_failure_after_the_checks`.
 //!
 //! Ids Eden does not list (`IsSvcPermitted` 26, `IoRegionHint` 27, `TransferMemoryHint` 34 and
 //! every number that is not an `InfoType`) return [`KernelError::InvalidEnumValue`], as Eden's
 //! `default` does.
 
 use crate::handle::{Handle, HandleTable, Resolved};
+use crate::id::ProcessId;
 use crate::memory::AddressSpace;
 use crate::object::Object;
-use crate::result::{CallResult, KernelError};
+use crate::process::ENTROPY_COUNT;
+use crate::result::{CallResult, KernelError, SvcError};
 use crate::tables::Scheduler;
 
 /// Defines [`InfoType`] from `Name = number;` rows, so an id and its number are written once.
@@ -170,18 +195,64 @@ fn process_from_handle(
     }
 }
 
-/// Answers `GetInfo(info_type, handle, info_sub_id)` for the calling process, whose handle
-/// table is `handles` and whose address space is `space`. `info_type` is the raw value the
-/// guest passed.
+/// Answers `GetInfo(info_type, handle, info_sub_id)` for the calling process, `process`, whose
+/// handle table is `handles` and whose address space is `space`. `info_type` is the raw value
+/// the guest passed. Each group of ids checks what Eden checks, in its order (see the module
+/// docs).
 pub fn get_info(
     handles: &HandleTable,
     space: &AddressSpace,
     scheduler: &Scheduler,
+    process: ProcessId,
     info_type: u32,
     handle: Handle,
     info_sub_id: u64,
 ) -> CallResult<u64> {
     let id = InfoType::from_raw(info_type).ok_or(KernelError::InvalidEnumValue)?;
+    match id {
+        // `case InfoType::DebuggerAttached: *result = 0; R_SUCCEED();`
+        InfoType::DebuggerAttached => Ok(0),
+        InfoType::RandomEntropy => random_entropy(scheduler, process, handle, info_sub_id),
+        _ => memory_info(handles, space, scheduler, id, handle, info_sub_id),
+    }
+}
+
+/// `RandomEntropy`: word `info_sub_id` of `process`'s entropy, after Eden's two checks.
+fn random_entropy(
+    scheduler: &Scheduler,
+    process: ProcessId,
+    handle: Handle,
+    info_sub_id: u64,
+) -> CallResult<u64> {
+    // `R_UNLESS(handle == 0, ResultInvalidHandle)`.
+    if handle != Handle::INVALID {
+        return Err(KernelError::InvalidHandle.into());
+    }
+    // `R_UNLESS(info_sub_id < 4, ResultInvalidCombination)`.
+    let index = usize::try_from(info_sub_id)
+        .ok()
+        .filter(|&index| index < ENTROPY_COUNT)
+        .ok_or(KernelError::InvalidCombination)?;
+    let entropy = scheduler.process(process)?.entropy().ok_or_else(|| {
+        SvcError::Internal("the process's entropy was asked for before it was drawn".to_owned())
+    })?;
+    entropy
+        .get(index)
+        .copied()
+        .ok_or_else(|| KernelError::InvalidCombination.into())
+}
+
+/// The memory ids: Eden's checks for its first group, then the value. An id of that group, or
+/// of any other, that this slice does not answer is [`KernelError::NotImplemented`] before any
+/// check.
+fn memory_info(
+    handles: &HandleTable,
+    space: &AddressSpace,
+    scheduler: &Scheduler,
+    id: InfoType,
+    handle: Handle,
+    info_sub_id: u64,
+) -> CallResult<u64> {
     // The value is a plain read, so it is taken before the checks; what is not built has none.
     let Some(value) = memory_fact(space, id) else {
         tracing::warn!(?id, number = id.number(), "GetInfo id not implemented");

@@ -24,6 +24,7 @@ use starquake_kernel::memory::MemoryArrangement;
 use starquake_kernel::process::{Console, ProcessDescription};
 use starquake_kernel::result::KernelError;
 use starquake_kernel::svc::SvcId;
+use starquake_kernel::svc::exception::{BreakReason, RESULT_ARGUMENT_SIZE};
 use starquake_loader::exefs::{ExeFs, MAIN_MODULE, NPDM_FILE};
 use starquake_loader::npdm::AcidLayout;
 use starquake_loader::nso::Nso;
@@ -221,13 +222,27 @@ fn a_nup_title_that_fits_its_pool_with_no_byte_to_spare_runs_and_one_byte_more_i
     let fits = run_title(&title(&nso_with_bss(bss))).unwrap();
     // It loads and runs. With its module and stack filling the pool, libnx's start-up then
     // asks for a heap and is told the limit is reached, as on a console whose pool is full,
-    // and stops at `Break`: the guest's own end, not the emulator's.
+    // and stops at `Break`: the guest's own end, not the emulator's. libnx breaks with a
+    // panic and its own result in a four-byte buffer (`diagAbortWithResult`,
+    // `libnx/nx/source/runtime/diag.c` and `runtime/init.c` @ b156b477):
+    // `MAKERESULT(Module_Libnx, LibnxError_HeapAllocFailed)`: module 345 (0x159) and
+    // description 15 (`libnx/nx/include/switch/result.h`), the description shifted left
+    // 9 bits.
     let crash = fits
         .crash()
         .expect("libnx stops at Break when it has no heap");
+    let heap_alloc_failed = 0x159 | (0xf << 9);
+    // The buffer is the result on libnx's stack, its address in `x1`.
+    let address = crash.registers.x[1];
     assert_eq!(
         crash.exception,
-        Exception::UndefinedInstruction,
+        Exception::SvcBreak {
+            reason: BreakReason::Panic.raw(),
+            reason_name: Some("panic"),
+            address,
+            size: RESULT_ARGUMENT_SIZE,
+            code: Some(heap_alloc_failed),
+        },
         "{}",
         crash.to_text()
     );

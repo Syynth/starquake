@@ -51,8 +51,8 @@ use crate::id::{ObjectId, ProcessId, ThreadId};
 use crate::memory::AddressSpace;
 use crate::object::Object;
 use crate::process::{
-    IDEAL_CORE_DONT_CARE, IDEAL_CORE_NO_UPDATE, ProcessRecord, ProcessState, physical_core,
-    physical_mask,
+    ENTROPY_COUNT, IDEAL_CORE_DONT_CARE, IDEAL_CORE_NO_UPDATE, ProcessRecord, ProcessState,
+    physical_core, physical_mask,
 };
 use crate::result::{CallResult, KernelError, SvcError};
 
@@ -125,6 +125,22 @@ impl Scheduler {
         self.processes
             .get_mut(&process)
             .ok_or(SchedError::UnknownProcess(process))
+    }
+
+    /// Gives `process` its random entropy ([`ProcessRecord::entropy`]), drawn once. Horizon never
+    /// changes a process's entropy, so a process that already has it is
+    /// [`SchedError::Corrupt`], and keeps the entropy it had.
+    pub fn set_entropy(
+        &mut self,
+        process: ProcessId,
+        entropy: [u64; ENTROPY_COUNT],
+    ) -> Result<(), SchedError> {
+        let record = self.record_mut(process)?;
+        if record.entropy.is_some() {
+            return Err(SchedError::Corrupt);
+        }
+        record.entropy = Some(entropy);
+        Ok(())
     }
 
     /// Marks a created process as running (`KProcess::Run`'s `ChangeState`): anything but
