@@ -268,3 +268,20 @@ passed to build agents as a provisional rule for the next wave.
 | proposed | Never discard with `let _ =` a result that reports a freed resource; route it through the one teardown path, on error paths too. |
 | proposed | When a shared resource is taken out and its lock released, the admission logic must know it is out; pin it with a threaded test that sends a second request meanwhile. |
 | dropped: covered by existing rules | Mutation-check new bounds; back every stated invariant with an assertion; test documented orderings with two competing items; grep the code before stating a docs claim. |
+
+### From waves 17 and 18 (ledger: #22)
+
+Filed from these waves under the delegation: #177, #178, #179–#194 (graphics-server slices), #199,
+#200 and #203. #33 is retargeted to M2. The rest:
+
+| Status | Proposal | Why | Suggested |
+|---|---|---|---|
+| proposed | **Charge a process's system resource (META 0x14) to its pool**, as Eden's `KProcess::Initialize` does; check `svc` info process handles against `ProcessRecord::object` | `GetInfo` over-reports free memory, and #178's fit check documents the gap | area:kernel, M2 |
+| proposed (fold into #161's build hint) | **`FakeKernel::resolve_handle` models handle translation** | So a services test can send libnx's exact `OpenApplicationProxy` with `CURRENT_PROCESS` | area:services, M2 |
+| proposed | **Size the stage-1 table pool with guest RAM** (a fixed 4 MiB today) and settle the 16 MiB working-RAM guess | A larger title runs out of table pages before RAM; may need an owner decision on sizing to the whole application pool | area:cpu, M2 |
+| proposed | **Export the NSO header offsets** from the loader; a trampolined-program RAM-sizing test once #203 lands | `crates/core/tests/guest_ram.rs` restates the `.bss` offset | area:loader |
+| proposed | **The kernel half of `WriteWatch`**: arm every taken request, take and protect under the fault path's lock, range-wide invalidation, a cancel path | #197 documents the two promises the kernel must keep | area:kernel, M3 |
+| proposed | **The `RawView` host-access type** in the memory crate | `GpuMemory::view` waits on it; needs `unsafe` and volatile or atomic accessors | area:memory, M3 |
+| proposed | **G16/G17 caches re-read a range on first use after arming; G22 takes `GpuMemory::generation` from `Translate::generation`** | Review notes on #197 | area:gpu, M3 |
+| proposed (fold into the decoder slice issues 6a–6i) | **Shader decoder follow-ups**: fp16 swizzle and source-2 modifier bits; uniform ALU forms; encodings for JMX, UP2UR and BPT; owners for IMAD.HI, ERRBAR, ATOMS.POPC and BCLEAR; the shared bit-91 list in the framework tests | Review notes on #201 | area:shader, M3 |
+| proposed | **`docs/architecture.md`'s walking-skeleton paragraph** names `System::from_nup` and NUP titles | Skipped in #173 as outside its files | docs |
