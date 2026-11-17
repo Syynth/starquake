@@ -8,8 +8,9 @@ use starquake_trace::{EnvError, HostNanos};
 
 use super::*;
 
-/// A request of every kind with distinct, non-zero values, and its bytes laid out by hand.
-fn golden() -> [(HostRequest, Vec<u8>); 3] {
+/// A request of every kind with distinct, non-zero values, and its bytes laid out by hand; the
+/// last three are for the data storage.
+fn golden() -> [(HostRequest, Vec<u8>); 6] {
     let probe = HostRequest::Probe {
         mount: Mount::SdCard,
     };
@@ -36,7 +37,34 @@ fn golden() -> [(HostRequest, Vec<u8>); 3] {
         b"/x",
     ]
     .concat();
-    [(probe, probe_bytes), (size, size_bytes), (read, read_bytes)]
+    let mount = Mount::DataStorage;
+    let storage_probe = HostRequest::Probe { mount };
+    let storage_probe_bytes = [&[1, 1, 2, 0][..], &[0; 4], &[0; 16]].concat();
+    let storage_size = HostRequest::Size {
+        mount,
+        path: Vec::new(),
+    };
+    let storage_size_bytes = [&[1, 2, 2, 0][..], &[0; 4], &[0; 16]].concat();
+    let storage_read = HostRequest::Read {
+        mount,
+        path: Vec::new(),
+        offset: 0x2122_2324_2526_2728,
+        len: 0x3132_3334_3536_3738,
+    };
+    let storage_read_bytes = [
+        &[1, 3, 2, 0, 0, 0, 0, 0][..],
+        &[0x28, 0x27, 0x26, 0x25, 0x24, 0x23, 0x22, 0x21],
+        &[0x38, 0x37, 0x36, 0x35, 0x34, 0x33, 0x32, 0x31],
+    ]
+    .concat();
+    [
+        (probe, probe_bytes),
+        (size, size_bytes),
+        (read, read_bytes),
+        (storage_probe, storage_probe_bytes),
+        (storage_size, storage_size_bytes),
+        (storage_read, storage_read_bytes),
+    ]
 }
 
 #[test]
@@ -47,6 +75,13 @@ fn every_request_has_these_bytes() {
         let io = request.to_host_io();
         assert_eq!((io.channel, io.payload), (CHANNEL, bytes));
     }
+    // Each names its mount.
+    let mounts: Vec<Mount> = golden()
+        .iter()
+        .map(|(request, _)| request.mount())
+        .collect();
+    let (sd, data) = (Mount::SdCard, Mount::DataStorage);
+    assert_eq!(mounts, [sd, sd, sd, data, data, data]);
     // The header's fields are where the layout says.
     let bytes = &golden()[2].1;
     assert_eq!(bytes[layout::VERSION], VERSION);
@@ -124,9 +159,9 @@ fn each_header_field_is_checked() {
         ),
         (
             layout::MOUNT,
-            2,
-            RequestError::Mount(2),
-            "mount 2 is not a host file system",
+            3,
+            RequestError::Mount(3),
+            "mount 3 is not a host file system",
         ),
         (
             layout::RESERVED,
@@ -245,10 +280,13 @@ fn failure_codes_name_their_failures() {
     }
     assert_eq!(HostFailure::from_code(0), None);
     assert_eq!(HostFailure::from_code(6), None);
-    assert_eq!(
-        Mount::from_number(Mount::SdCard.number()),
-        Some(Mount::SdCard)
-    );
+    let numbers: Vec<u8> = Mount::ALL.iter().map(|m| m.number()).collect();
+    assert_eq!(numbers, [1, 2]);
+    for mount in Mount::ALL {
+        assert_eq!(Mount::from_number(mount.number()), Some(mount));
+    }
+    assert_eq!(Mount::from_number(0), None);
+    assert_eq!(Mount::from_number(3), None);
 }
 
 /// An environment that answers host I/O with one scripted reply and keeps what it was asked.
@@ -311,19 +349,17 @@ fn config() -> Config {
 
 fn requests() -> impl Strategy<Value = HostRequest> {
     let path = || proptest::collection::vec(any::<u8>(), 0..=ENTRY_NAME_LENGTH_MAX);
+    let mount = || prop::sample::select(Mount::ALL.to_vec());
     prop_oneof![
-        Just(HostRequest::Probe {
-            mount: Mount::SdCard
-        }),
-        path().prop_map(|path| HostRequest::Size {
-            mount: Mount::SdCard,
-            path
-        }),
-        (path(), any::<u64>(), any::<u64>()).prop_map(|(path, offset, len)| HostRequest::Read {
-            mount: Mount::SdCard,
-            path,
-            offset,
-            len
+        mount().prop_map(|mount| HostRequest::Probe { mount }),
+        (mount(), path()).prop_map(|(mount, path)| HostRequest::Size { mount, path }),
+        (mount(), path(), any::<u64>(), any::<u64>()).prop_map(|(mount, path, offset, len)| {
+            HostRequest::Read {
+                mount,
+                path,
+                offset,
+                len,
+            }
         }),
     ]
 }

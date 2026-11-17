@@ -29,8 +29,54 @@
 //! part of the title once an update with an `ExeFS` is present. Pinned by
 //! `an_update_replaces_the_whole_exefs`. `RomFS` layering is not done here (out of scope for
 //! issue #95).
+//!
+//! # The package a title runs, whole
+//!
+//! [`Nup::newest_package`] is what `starquake run` runs (decision log, 2026-11-16, "M2 runs a
+//! title's newest package, whole"): the newest update when the container has one, the base
+//! otherwise, chosen as [`Nup::title`] chooses them, with that one package's `ExeFS` and that
+//! same package's `RomFS`. Base and update are never mixed. An update that lacks a part its base
+//! has (an `ExeFS`, then a `RomFS`; the first missing one is the error) is a patch that needs its
+//! base, and is [`NupError::IncompleteUpdate`] until the rules for laying an update over its base
+//! are decided. That a part missing from an update but present in its base is what makes an
+//! update "not complete" is **a guess**: the spec stores updates as whole trees (§3.1.4, shared
+//! files are deduplicated, delta packaging is a possible version 2 extension) and says nothing
+//! about an update that omits one. A part that neither has is not an error here: a title may
+//! have no `RomFS`, and one with no `ExeFS` is refused by whoever loads the program. Pinned by
+//! `the_newest_package_is_run_whole_and_an_incomplete_update_is_refused` and
+//! `a_missing_exefs_is_named_before_a_missing_romfs`.
 
 use super::{DirId, FileId, Node, Nup, NupError, PackageKind};
+
+/// A part of a package's tree that an update can lack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Part {
+    /// The `ExeFS` directory.
+    ExeFs,
+    /// The `RomFS` directory.
+    RomFs,
+}
+
+impl Part {
+    /// The part's name, for messages.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::ExeFs => "ExeFS",
+            Self::RomFs => "RomFS",
+        }
+    }
+}
+
+/// The one package a title runs, with its own `ExeFS` and `RomFS` ([`Nup::newest_package`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Whole {
+    /// The package: the newest update, or the base when there is none.
+    pub package: usize,
+    /// Its `ExeFS` directory, if it has one.
+    pub exefs: Option<DirId>,
+    /// Its `RomFS` directory, if it has one.
+    pub romfs: Option<DirId>,
+}
 
 /// Where the title's `ExeFS` comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,10 +103,7 @@ pub struct Title {
 impl Title {
     /// The `ExeFS` file called `name` (`main`, `main.npdm`, `rtld`, `sdk`, `subsdk0`, ...).
     pub fn exefs_file<S>(&self, nup: &Nup<S>, name: &str) -> Option<FileId> {
-        match nup.lookup(self.exefs?.dir, name.as_bytes())? {
-            Node::File(file) => Some(file),
-            Node::Dir(_) => None,
-        }
+        nup.file_in(self.exefs?.dir, name.as_bytes())
     }
 
     /// The `ExeFS` files in name order (subdirectories, which an `ExeFS` does not have, are
@@ -80,6 +123,34 @@ impl Title {
 }
 
 impl<S> Nup<S> {
+    /// The package the title runs, whole: see the module docs, "The package a title runs,
+    /// whole". The errors of [`Nup::title`] come first.
+    pub fn newest_package(&self) -> Result<Whole, NupError> {
+        let title = self.title()?;
+        let chosen = title.update.unwrap_or(title.program);
+        let package = self.packages().get(chosen).ok_or(NupError::NoProgram)?;
+        let base = title.base.and_then(|base| self.packages().get(base));
+        if let Some(base) = base.filter(|_| package.kind == PackageKind::Update) {
+            let lacking = [
+                (Part::ExeFs, package.exefs, base.exefs),
+                (Part::RomFs, package.romfs, base.romfs),
+            ]
+            .into_iter()
+            .find(|(_, own, bases)| own.is_none() && bases.is_some());
+            if let Some((part, _, _)) = lacking {
+                return Err(NupError::IncompleteUpdate {
+                    package: chosen,
+                    part,
+                });
+            }
+        }
+        Ok(Whole {
+            package: chosen,
+            exefs: package.exefs,
+            romfs: package.romfs,
+        })
+    }
+
     /// The title this container holds: see the module docs.
     pub fn title(&self) -> Result<Title, NupError> {
         let packages = self.packages();

@@ -10,7 +10,9 @@ use starquake_loader::nup::build::{
     self, Content, EXEFS_DIR_NAME, PackageSpec, ROMFS_DIR_NAME, Tree,
 };
 use starquake_loader::nup::layout::SUPERBLOCK_SIZE;
-use starquake_loader::nup::{NupError, PackageKind};
+use starquake_loader::nup::{NupError, PackageKind, Part};
+
+mod romfs;
 
 use super::*;
 use crate::image::LoadError;
@@ -140,16 +142,29 @@ fn the_newest_updates_exefs_wins_over_the_base() {
     ];
     assert!(System::from_nup(container(&newest_broken)).is_err());
 
-    // An update with no ExeFS leaves the base's.
+    // An update with no ExeFS would need the base's, and base and update are never mixed
+    // (decision log, 2026-11-16, "M2 runs a title's newest package, whole").
     let romfs_only = Tree::new()
         .with_file(
             &format!("{ROMFS_DIR_NAME}/data"),
             Content::raw(b"data".to_vec()),
         )
         .unwrap();
+    let error = System::from_nup(container(&[base(good), update(1, romfs_only)])).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            TitleError::Container(NupError::IncompleteUpdate {
+                package: 1,
+                part: Part::ExeFs
+            })
+        ),
+        "{error:?}"
+    );
     assert_eq!(
-        System::from_nup(container(&[base(good), update(1, romfs_only)])).unwrap(),
-        expected(&HELLO)
+        error.to_string(),
+        "the title could not be opened: the newest update (package 1) has no ExeFS of its own \
+         and would need the base's; an update that patches its base is not supported yet"
     );
 }
 

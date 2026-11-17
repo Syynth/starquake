@@ -33,6 +33,8 @@ use starquake_trace::{EventKind, FixedClock, GuestTicks, LiveEnv, Recorder, Thre
 
 use super::*;
 
+mod data_storage;
+
 /// Where the process's memory is: four pages the guest may read and write.
 const BASE: u64 = 0x8000_0000;
 const PAGES: u64 = 4;

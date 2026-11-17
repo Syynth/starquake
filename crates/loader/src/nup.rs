@@ -10,7 +10,13 @@
 //! its table of contents in memory (bounded by [`Limits::max_toc_size`] before anything is
 //! allocated). [`Nup::reader`] then streams one file's bytes, decompressing as it goes and
 //! checking the size and the SHA-256 at the end; [`Nup::verify`] runs that over every file.
-//! [`Nup::title`] layers the newest update over the base ([`title`]).
+//! [`Nup::title`] layers the newest update over the base ([`title`]), and
+//! [`Nup::newest_package`] picks the one package a title runs whole.
+//!
+//! A container whose source is a [`ReadAt`](crate::read_at::ReadAt) (opened through
+//! [`Positional`](crate::read_at::Positional)) also reads positionally, through `&self`:
+//! [`Nup::reader_at`], [`Nup::read_to_vec_at`] and [`Nup::read_raw_at`], so that several open
+//! files share one source. [`storage`] serves a package's `RomFS` that way, as a `RomFS` image.
 //!
 //! # Sources
 //!
@@ -128,10 +134,12 @@
 //! `main.npdm` is read from the `ExeFS` tree, which the spec makes authoritative for content
 //! (§5, "the tree wins for content").
 
+mod cache;
 mod check;
 mod error;
 pub mod layout;
 mod read;
+pub mod storage;
 pub mod title;
 
 #[cfg(any(test, feature = "test-support"))]
@@ -151,7 +159,7 @@ pub use error::{NupError, Region, VerifyError, VerifySummary};
 pub use layout::{Codec, PackageKind};
 use layout::{RawSuperblock, SHA256_SIZE, SUPERBLOCK_SIZE};
 pub use read::FileReader;
-pub use title::{ExeFs, Title};
+pub use title::{ExeFs, Part, Title, Whole};
 
 /// The largest table of contents [`Nup::open`] reads: 256 MiB. A starquake limit, not the
 /// spec's: at 0x50 bytes per file record it leaves room for over three million files.
@@ -406,6 +414,14 @@ impl<S> Nup<S> {
             .binary_search_by(|&child| self.name(child).cmp(name))
             .ok()
             .and_then(|at| children.get(at).copied())
+    }
+
+    /// The file of `dir` called `name`; `None` when there is none or `name` is a directory.
+    pub fn file_in(&self, dir: DirId, name: &[u8]) -> Option<FileId> {
+        match self.lookup(dir, name)? {
+            Node::File(file) => Some(file),
+            Node::Dir(_) => None,
+        }
     }
 
     /// The node at `path` below `dir`, `/`-separated; empty segments are skipped.

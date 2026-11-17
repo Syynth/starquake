@@ -57,7 +57,12 @@ use std::collections::HashSet;
 use std::io::{Read, Seek};
 use std::ops::{ControlFlow, Range};
 
-use crate::pfs0::{Le, checked_extent, read_exact_at, read_vec_at, read_window, source_len};
+use crate::pfs0::{
+    Le, checked_extent, read_exact_at, read_vec_at, read_window, read_window_at, source_len,
+};
+use crate::read_at::ReadAt;
+
+pub mod build;
 
 /// Size of the header (`static_assert(sizeof(RomFSHeader) == 0x50)`).
 pub const HEADER_SIZE: usize = 0x50;
@@ -456,18 +461,6 @@ impl<R: Read + Seek> RomFs<R> {
         })
     }
 
-    /// The byte range of the source that `file`'s data occupies, checked for overflow and against
-    /// the source length.
-    pub fn file_extent(&self, file: &FileEntry) -> Result<Range<u64>, RomFsError> {
-        checked_extent(self.header.data_offset, file.offset, file.size, self.len).ok_or(
-            RomFsError::FileOutOfBounds {
-                offset: file.offset,
-                size: file.size,
-                len: self.len,
-            },
-        )
-    }
-
     /// Reads the whole of `file`.
     pub fn read_file(&mut self, file: &FileEntry) -> Result<Vec<u8>, RomFsError> {
         let extent = self.file_extent(file)?;
@@ -547,6 +540,37 @@ impl<R: Read + Seek> RomFs<R> {
             out.push(entry);
         }
         Ok(out)
+    }
+}
+
+impl<R> RomFs<R> {
+    /// The byte range of the source that `file`'s data occupies, checked for overflow and against
+    /// the source length.
+    pub fn file_extent(&self, file: &FileEntry) -> Result<Range<u64>, RomFsError> {
+        checked_extent(self.header.data_offset, file.offset, file.size, self.len).ok_or(
+            RomFsError::FileOutOfBounds {
+                offset: file.offset,
+                size: file.size,
+                len: self.len,
+            },
+        )
+    }
+}
+
+/// Reads through `&self` when the source reads positionally (`crate::read_at`), so two files of
+/// one image can be read at once, interleaved, without a mutable borrow. Open such an image with
+/// `RomFs::new(Positional::new(source))`.
+impl<R: ReadAt> RomFs<R> {
+    /// [`RomFs::read_file_at`] through a shared reference: up to `buf.len()` bytes of `file` from
+    /// `offset` bytes into it, fewer only at its end and none at or past it.
+    pub fn read_file_shared(
+        &self,
+        file: &FileEntry,
+        offset: u64,
+        buf: &mut [u8],
+    ) -> Result<usize, RomFsError> {
+        let extent = self.file_extent(file)?;
+        Ok(read_window_at(&self.reader, extent, offset, buf)?)
     }
 }
 

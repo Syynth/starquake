@@ -3,9 +3,10 @@
 //! and `starquake verify`, which read a NUP title ([`title`]).
 //!
 //! The program `run` takes is an NRO, or a NUP title: a file whose first bytes are a NUP
-//! container's is run as the title's ExeFS (that of its newest update, or of its base, the one
-//! `inspect` shows), loaded by `starquake_core::System::from_nup`; any other file is read as an
-//! NRO. A title that cannot be loaded is an emulator error, like an NRO that cannot.
+//! container's is run as the title's newest package, whole (its newest update, or its base),
+//! opened by `starquake_core::title::open`: that package's ExeFS is the program, and its RomFS
+//! the data storage the guest opens, read from the file as the guest reads it. Any other file is
+//! read as an NRO. A title that cannot be loaded is an emulator error, like an NRO that cannot.
 //!
 //! ```text
 //! starquake run <program> [--until timeout=<n>s] [--artifacts <folder>]
@@ -32,11 +33,12 @@
 
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{BufReader, Read, Seek, Write};
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use starquake_core::title as title_api;
+use starquake_core::loader::read_at::{Positional, ReadAt};
+use starquake_core::title::{self as title_api, RomFs};
 use starquake_core::{ExitReason, RunOptions, RunReport, System, artifacts, exit_code};
 
 pub mod title;
@@ -282,9 +284,9 @@ fn describe(report: &RunReport) -> String {
 
 /// Loads the program file at `path` ([`load_program`]). The error is the line the run's summary
 /// carries.
-fn load(path: &Path) -> Result<System, String> {
+fn load(path: &Path) -> Result<Loaded, String> {
     let unreadable = |error: std::io::Error| format!("could not read {}: {error}", path.display());
-    let file = BufReader::new(File::open(path).map_err(unreadable)?);
+    let file = File::open(path).map_err(unreadable)?;
     load_program(file).map_err(|failure| match failure {
         LoadFailure::Unreadable(error) => unreadable(error),
         LoadFailure::Refused(message) => format!("{}: {message}", path.display()),
@@ -300,25 +302,43 @@ enum LoadFailure {
     Refused(String),
 }
 
+/// A loaded program, and the title's RomFS when it is a NUP title that has one.
+#[derive(Debug, PartialEq, Eq)]
+struct Loaded {
+    system: System,
+    romfs: Option<RomFs>,
+}
+
 /// Loads the program in `source`: a NUP title when its first bytes are a NUP container's
-/// (`starquake_core::title::is_nup`), opened through `starquake_core` so that only its table of
-/// contents and its ExeFS's `main.npdm` and modules are read, and an NRO, read whole, otherwise.
-fn load_program<S: Read + Seek>(mut source: S) -> Result<System, LoadFailure> {
+/// (`starquake_core::title::is_nup`), opened through `starquake_core::title::open` so that only
+/// its table of contents and its ExeFS's `main.npdm` and modules are read while loading (its
+/// RomFS is read later, as the guest reads it), and an NRO, read whole, otherwise.
+fn load_program<S: ReadAt + 'static>(source: S) -> Result<Loaded, LoadFailure> {
+    let mut cursor = Positional::new(source);
     let mut prefix = Vec::with_capacity(title_api::PREFIX_LEN);
     let prefix_len = u64::try_from(title_api::PREFIX_LEN).unwrap_or(u64::MAX);
-    (&mut source)
+    (&mut cursor)
         .take(prefix_len)
         .read_to_end(&mut prefix)
         .map_err(LoadFailure::Unreadable)?;
-    source.rewind().map_err(LoadFailure::Unreadable)?;
+    cursor.rewind().map_err(LoadFailure::Unreadable)?;
     if title_api::is_nup(&prefix) {
-        return System::from_nup(source).map_err(|error| LoadFailure::Refused(error.to_string()));
+        let title = title_api::open(cursor.into_inner())
+            .map_err(|error| LoadFailure::Refused(error.to_string()))?;
+        return Ok(Loaded {
+            system: title.system,
+            romfs: title.romfs,
+        });
     }
     let mut bytes = Vec::new();
-    source
+    cursor
         .read_to_end(&mut bytes)
         .map_err(LoadFailure::Unreadable)?;
-    System::new(&bytes).map_err(|error| LoadFailure::Refused(error.to_string()))
+    let system = System::new(&bytes).map_err(|error| LoadFailure::Refused(error.to_string()))?;
+    Ok(Loaded {
+        system,
+        romfs: None,
+    })
 }
 
 /// Runs the program `args` names and writes its artifacts. Returns the process exit code.
@@ -329,14 +349,14 @@ fn run(
     stderr: &mut dyn Write,
 ) -> u8 {
     let started = Instant::now();
-    let options = RunOptions {
-        timeout: args.timeout,
-        command_line,
-        sd_card: None,
-    };
     let report = match load(&args.program) {
         Err(message) => RunReport::emulator_error(message, started.elapsed()),
-        Ok(system) => system.run(&options),
+        Ok(Loaded { system, romfs }) => system.run(&RunOptions {
+            timeout: args.timeout,
+            command_line,
+            sd_card: None,
+            romfs,
+        }),
     };
 
     let folder = args
@@ -682,25 +702,22 @@ mod tests {
     /// A title in memory whose reads fail at and past `end`, as a disk that gives out after the
     /// title's ExeFS: a read that starts before `end` returns at most the bytes before it.
     struct FailingTail {
-        inner: std::io::Cursor<Vec<u8>>,
+        inner: Vec<u8>,
         end: u64,
     }
 
-    impl Read for FailingTail {
-        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            let at = self.inner.position();
+    impl ReadAt for FailingTail {
+        fn read_at(&self, at: u64, buf: &mut [u8]) -> std::io::Result<usize> {
             if at >= self.end {
                 return Err(std::io::Error::other("read past the ExeFS"));
             }
             let room = usize::try_from(self.end - at).unwrap_or(usize::MAX);
             let len = buf.len().min(room);
-            self.inner.read(&mut buf[..len])
+            self.inner.read_at(at, &mut buf[..len])
         }
-    }
 
-    impl Seek for FailingTail {
-        fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
-            self.inner.seek(to)
+        fn size(&self) -> std::io::Result<u64> {
+            self.inner.size()
         }
     }
 
@@ -742,9 +759,17 @@ mod tests {
 
         let whole = System::from_nup(std::io::Cursor::new(built.bytes.clone())).unwrap();
         let source = FailingTail {
-            inner: std::io::Cursor::new(built.bytes),
+            inner: built.bytes,
             end: u64::try_from(exefs_end).unwrap(),
         };
-        assert_eq!(load_program(source).unwrap(), whole);
+        let loaded = load_program(source).unwrap();
+        assert_eq!(loaded.system, whole);
+        // The RomFS is there, laid out from the table of contents; reading its file's data is
+        // what reaches past the ExeFS, and fails here.
+        let romfs = loaded.romfs.unwrap();
+        assert!(romfs.size() > u64::try_from(romfs_len).unwrap());
+        let mut all = vec![0u8; usize::try_from(romfs.size()).unwrap()];
+        let error = romfs.read_at(0, &mut all).unwrap_err();
+        assert!(error.to_string().contains("read past the ExeFS"), "{error}");
     }
 }

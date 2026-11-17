@@ -160,3 +160,31 @@ fn other_channels_and_bad_requests() {
     };
     assert_eq!(folder.handle(&garbage), HostFailure::BadRequest.reply());
 }
+
+#[test]
+fn the_data_storage_is_not_the_folders_to_answer() {
+    let (_scratch, mut folder) = folder("storage");
+    let mount = Mount::DataStorage;
+    let requests = [
+        HostRequest::Probe { mount },
+        HostRequest::Size {
+            mount,
+            path: Vec::new(),
+        },
+        HostRequest::Read {
+            mount,
+            path: Vec::new(),
+            offset: 0,
+            len: 4,
+        },
+    ];
+    for request in requests {
+        assert_eq!(
+            ask(&mut folder, &request),
+            HostFailure::NoDevice.reply(),
+            "{request:?}"
+        );
+    }
+    // The card's own requests are still answered.
+    assert_eq!(ask(&mut folder, &PROBE), HostIoReply::Data(Vec::new()));
+}

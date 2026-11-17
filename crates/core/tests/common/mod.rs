@@ -18,6 +18,7 @@ pub fn run(file: &[u8], timeout: Duration) -> Option<RunReport> {
         timeout: Some(timeout),
         command_line: Vec::new(),
         sd_card: None,
+        romfs: None,
     };
     match System::new(file) {
         Ok(system) => Some(system.run(&options)),

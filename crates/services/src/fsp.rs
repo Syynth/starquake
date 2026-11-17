@@ -1,9 +1,10 @@
 //! `fsp-srv`, the file-system service: a first subset (`docs/specs/services.md`, port plan
 //! slice 6). A title opens the SD card, opens a file on it, reads it, asks its size and closes
-//! it.
+//! it; and it opens its own data storage (its `RomFS` image), reads it and asks its size.
 //!
 //! Ported from `eden/src/core/hle/service/filesystem/fsp/fsp_srv.cpp` (`FSP_SRV`),
-//! `fs_i_filesystem.cpp` (`IFileSystem`) and `fs_i_file.cpp` (`IFile`), with the checks of
+//! `fs_i_filesystem.cpp` (`IFileSystem`), `fs_i_file.cpp` (`IFile`) and `fs_i_storage.cpp`
+//! (`IStorage`), with the checks of
 //! `eden/src/core/file_sys/fsa/fs_i_file.h` and `fs_i_filesystem.h` (`FileSys::Fsa`), the open
 //! modes of `eden/src/core/file_sys/fs_filesystem.h` and the result codes of
 //! `eden/src/core/file_sys/errors.h`, all @ cf654052 (GPL-3.0-or-later). The request layouts are
@@ -21,8 +22,11 @@
 //! |---|---|---|---|---|
 //! | `fsp-srv` ([`FspSrv`]) | 1 | `SetCurrentProcess` | the caller's process id, attached by the kernel; a `u64` placeholder in the payload, not read | nothing |
 //! | | 18 | `OpenSdCardFileSystem` | nothing | an [`IFileSystem`] |
+//! | | 200 | `OpenDataStorageByCurrentProcess` | nothing | an [`IStorage`] |
 //! | [`IFileSystem`] | 8 | `OpenFile` | `u32` open mode; in buffer 0 (pointer, an X descriptor): the path | an [`IFile`] |
 //! | [`IFile`] | 0 | `Read` | `u32` option, 4 bytes of padding, `s64` offset, `s64` size; out buffer 0 (map-alias, a B descriptor): room for the bytes | `s64` bytes read, and the bytes in out buffer 0 |
+//! | | 4 | `GetSize` | nothing | `s64` size |
+//! | [`IStorage`] | 0 | `Read` | `s64` offset, `s64` size; out buffer 0 (map-alias, a B descriptor): room for the bytes | the bytes in out buffer 0 |
 //! | | 4 | `GetSize` | nothing | `s64` size |
 //!
 //! Layouts, each the client's and the reference's:
@@ -42,6 +46,24 @@
 //!   OutBuffer<BufferAttr_HipcMapAlias ...>, s64 size)`, where `ReadOption` is a `u32`
 //!   (`eden/src/core/file_sys/fs_file.h`).
 //! - `GetSize`: libnx `fsFileGetSize`; Eden `GetSize(Out<s64>)`.
+//! - `OpenDataStorageByCurrentProcess`: libnx `fsOpenDataStorageByCurrentProcess`
+//!   (`_fsCmdGetSession(&g_fsSrv, &out->s, 200)`, one out object); Eden
+//!   `OpenDataStorageByCurrentProcess(OutInterface<IStorage>)`.
+//! - `IStorage::Read`: libnx `fsStorageRead` (`struct { s64 offset; u64 read_size; }`, a
+//!   `HipcMapAlias` out buffer, nothing out); Eden `Read(OutBuffer<BufferAttr_HipcMapAlias ...>,
+//!   s64 offset, s64 length)`.
+//! - `IStorage::GetSize`: libnx `fsStorageGetSize(FsStorage*, s64*)`; Eden `GetSize(Out<u64>)`
+//!   (the same eight bytes for every size up to `i64::MAX`, the most a size answer may be).
+//!
+//! # The data storage
+//!
+//! `OpenDataStorageByCurrentProcess` asks the host whether the run has a data storage (a probe
+//! of [`Mount::DataStorage`](host::Mount::DataStorage)); the run's title answers with its
+//! `RomFS`, built as an image (`starquake-core`'s narrow title API). [`IStorage`] reads it and
+//! asks its size through the same host channel, with an empty path: the storage is one file.
+//! Its `Read` is deferred as `IFile`'s is (see "The host behind it"), and its reply carries no
+//! count: the bytes go into the buffer, fewer at the end of the storage, as Eden's backend reads
+//! them (`VfsFile::Read` returns the bytes there are).
 //!
 //! # The host behind it
 //!
@@ -134,11 +156,39 @@
 //!   (`a_size_answer_of_other_than_eight_bytes_fails`, `a_size_over_s64_max_fails`), and so is a
 //!   probe answered with any bytes (`a_probe_answered_with_bytes_opens_nothing`).
 //!
+//! - **No data storage.** Eden's `OpenDataStorageByCurrentProcess` answers `ResultUnknown`
+//!   (`eden/src/core/hle/result.h`, `ResultUnknown(UINT32_MAX)`) when the current process has no
+//!   `RomFS` ("No file system interface available!"). Here every answer to the probe but an
+//!   empty one (no `RomFS`, a broken environment, no handler) is that same
+//!   [`result::UNKNOWN`] (`without_a_romfs_opening_the_data_storage_is_eden_s_unknown`).
+//! - **`IStorage::Read`'s checks** are the console's (Atmosphère
+//!   `fssrv_storage_interface_adapter.cpp`, `StorageInterfaceAdapter::Read`, fact only): a
+//!   negative offset is [`result::INVALID_OFFSET`], then a negative size, or one larger than the
+//!   buffer, is [`result::INVALID_SIZE`]. Eden checks the size before the offset, and not against
+//!   the buffer, so a request with both a negative offset and a negative size is
+//!   `INVALID_SIZE` there and `INVALID_OFFSET` here
+//!   (`a_storage_read_checks_the_offset_before_the_size_and_the_buffer`). A size of zero answers
+//!   at once with nothing read, as Eden's read of zero bytes ends.
+//! - **`IStorage::Read` is stricter than the reference about an end past `s64`.** An offset and
+//!   size whose sum overflows an `s64` is [`result::OUT_OF_RANGE`] here, the check `IFile`'s
+//!   `Read` makes. Neither Eden's `IStorage::Read`
+//!   (`eden/src/core/hle/service/filesystem/fsp/fs_i_storage.cpp`, which checks only
+//!   `length >= 0` and `offset >= 0`, then reads) nor the console's
+//!   `StorageInterfaceAdapter::Read` (Atmosphère, above; fact only) checks the sum, so there
+//!   such a read succeeds with whatever its storage holds at the offset. Pinned by
+//!   `a_storage_read_of_nothing_answers_at_once_and_one_that_overflows_is_out_of_range`.
+//!   Eden's `IStorage::Read` also sleeps to hold reads to 40 MB/s; nothing here sleeps (a
+//!   service never blocks), so reads take what the host takes.
+//! - **Data storage failures.** A read of the storage that the host fails is
+//!   [`result::HOST_IO_FAILED`], and a size answer that is not exactly 8 bytes is too, as for a
+//!   file (`a_storage_read_the_host_fails_fails`). Eden's storage cannot fail.
+//!
 //! The framework's own rules apply as for every service: each command's buffers are declared in
 //! its table row with the kind Eden's signature gives them, and a request whose descriptors do
 //! not match is `INVALID_CMIF_REQUEST` before the command runs (`framework::buffers`): `Read`
 //! takes one B descriptor (`read_refuses_a_pointer_buffer`), `OpenFile` one X descriptor, and
-//! the other commands none.
+//! the other commands none. `IStorage`'s `Read` takes one B descriptor too
+//! (`a_storage_read_refuses_a_pointer_buffer`).
 //!
 //! # Where this departs from the service spec
 //!
@@ -234,6 +284,9 @@ pub mod result {
     pub const INVALID_SIZE: ResultCode = code(FS_MODULE, 6062);
     /// `ResultInvalidOpenMode` (FS 6072).
     pub const INVALID_OPEN_MODE: ResultCode = code(FS_MODULE, 6072);
+    /// `ResultUnknown`: Eden's answer to `OpenDataStorageByCurrentProcess` when the process has
+    /// no `RomFS` (`eden/src/core/hle/result.h`: `constexpr Result ResultUnknown(UINT32_MAX)`).
+    pub const UNKNOWN: ResultCode = ResultCode::from_raw(u32::MAX);
 }
 
 /// The result a host answer that is not data stands for.
@@ -285,6 +338,9 @@ pub mod command {
         pub const SET_CURRENT_PROCESS: u32 = 1;
         /// `OpenSdCardFileSystem` (`{18, D<&FSP_SRV::OpenSdCardFileSystem>, ..}`).
         pub const OPEN_SD_CARD_FILE_SYSTEM: u32 = 18;
+        /// `OpenDataStorageByCurrentProcess`
+        /// (`{200, D<&FSP_SRV::OpenDataStorageByCurrentProcess>, ..}`).
+        pub const OPEN_DATA_STORAGE_BY_CURRENT_PROCESS: u32 = 200;
     }
 
     /// [`IFileSystem`](super::IFileSystem)'s commands.
@@ -300,12 +356,21 @@ pub mod command {
         /// `GetSize` (`{4, D<&IFile::GetSize>, ..}`).
         pub const GET_SIZE: u32 = 4;
     }
+
+    /// [`IStorage`](super::IStorage)'s commands (`fs_i_storage.cpp`, `IStorage::IStorage`).
+    pub mod storage {
+        /// `Read` (`{0, D<&IStorage::Read>, "Read"}`).
+        pub const READ: u32 = 0;
+        /// `GetSize` (`{4, D<&IStorage::GetSize>, "GetSize"}`).
+        pub const GET_SIZE: u32 = 4;
+    }
 }
 
 commands! {
     impl FspSrv {
         command::fsp_srv::SET_CURRENT_PROCESS => set_current_process,
         command::fsp_srv::OPEN_SD_CARD_FILE_SYSTEM => open_sd_card_file_system,
+        command::fsp_srv::OPEN_DATA_STORAGE_BY_CURRENT_PROCESS => open_data_storage_by_current_process,
     }
 }
 
@@ -337,6 +402,26 @@ impl FspSrv {
             answer => return Err(failed(&answer).into()),
         }
         reply.push_session(Box::new(IFileSystem { mount }));
+        reply.ok()
+    }
+
+    /// `OpenDataStorageByCurrentProcess`. out: an [`IStorage`] on the title's `RomFS` image.
+    fn open_data_storage_by_current_process(
+        _: &mut Self,
+        cx: &mut Context<'_>,
+        _req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        let mount = Mount::DataStorage;
+        let answer = host::ask(&*cx.env()?, &HostRequest::Probe { mount });
+        if !matches!(&answer, Answer::Data(bytes) if bytes.is_empty()) {
+            tracing::warn!(
+                ?answer,
+                "the run has no data storage for the current process"
+            );
+            return Err(result::UNKNOWN.into());
+        }
+        reply.push_session(Box::new(IStorage));
         reply.ok()
     }
 }
@@ -455,13 +540,15 @@ commands! {
     }
 }
 
-/// A read handed to the executor: what to ask the host, and where the bytes go.
+/// A read handed to the executor: what to ask the host, where the bytes go, and whether the
+/// reply says how many were read (`IFile`'s does; `IStorage`'s does not).
 struct ReadJob {
     mount: Mount,
     path: Vec<u8>,
     offset: u64,
     len: u64,
     buffer: DeferredBuffer,
+    count: bool,
 }
 
 impl ReadJob {
@@ -473,7 +560,8 @@ impl ReadJob {
         }
     }
 
-    /// The reply: the bytes read as an `s64`, and the bytes for out buffer 0.
+    /// The reply: the bytes read as an `s64` (when the job says so), and the bytes for out
+    /// buffer 0.
     fn fetch(self, env: &dyn Env) -> Result<Reply, ResultCode> {
         let request = HostRequest::Read {
             mount: self.mount,
@@ -497,12 +585,59 @@ impl ReadJob {
             return Err(result::HOST_IO_FAILED);
         };
         let mut reply = Reply::default();
-        reply.payload().write_i64(read);
+        if self.count {
+            reply.payload().write_i64(read);
+        }
         reply
             .write_buffer(self.buffer, bytes)
             .map_err(|fault| fault.result())?;
         Ok(reply)
     }
+}
+
+/// A read of `size` bytes from `offset` of `path` on `mount` into out buffer 0: the checks
+/// `IFile` and `IStorage` share (module docs, "Read's checks" and "`IStorage::Read`'s checks"),
+/// then the read handed to the executor. `count` says whether the reply carries the number of
+/// bytes read; a read of nothing answers at once.
+fn deferred_read(
+    cx: &mut Context<'_>,
+    req: &Request<'_>,
+    reply: &mut Reply,
+    target: (Mount, &[u8]),
+    (offset, size): (i64, i64),
+    count: bool,
+) -> Outcome {
+    let buffer = req.deferred_out_buffer(0)?;
+    // The console's checks.
+    let start = u64::try_from(offset).map_err(|_| result::INVALID_OFFSET)?;
+    let len = u64::try_from(size).map_err(|_| result::INVALID_SIZE)?;
+    if len > buffer.len() {
+        return Err(result::INVALID_SIZE.into());
+    }
+    // Eden's (`Fsa::IFile::Read`: `CanAddWithoutOverflow<s64>(offset, size)`).
+    if len == 0 {
+        if count {
+            reply.payload().write_i64(0);
+        }
+        return reply.ok();
+    }
+    if offset.checked_add(size).is_none() {
+        return Err(result::OUT_OF_RANGE.into());
+    }
+    let env = cx.env()?;
+    let executor = cx.executor()?;
+    let token = cx.defer()?;
+    let (mount, path) = target;
+    let job = ReadJob {
+        mount,
+        path: path.to_vec(),
+        offset: start,
+        len,
+        buffer,
+        count,
+    };
+    executor.submit(Box::new(move || job.run(&*env, token)));
+    reply.deferred()
 }
 
 impl IFile {
@@ -519,33 +654,14 @@ impl IFile {
         payload.align(8)?;
         let offset = payload.read_i64()?;
         let size = payload.read_i64()?;
-        let buffer = req.deferred_out_buffer(0)?;
-        // The console's checks (module docs, "Read's checks").
-        let start = u64::try_from(offset).map_err(|_| result::INVALID_OFFSET)?;
-        let len = u64::try_from(size).map_err(|_| result::INVALID_SIZE)?;
-        if len > buffer.len() {
-            return Err(result::INVALID_SIZE.into());
-        }
-        // Eden's (`Fsa::IFile::Read`: `CanAddWithoutOverflow<s64>(offset, size)`).
-        if len == 0 {
-            reply.payload().write_i64(0);
-            return reply.ok();
-        }
-        if offset.checked_add(size).is_none() {
-            return Err(result::OUT_OF_RANGE.into());
-        }
-        let env = cx.env()?;
-        let executor = cx.executor()?;
-        let token = cx.defer()?;
-        let job = ReadJob {
-            mount: this.mount,
-            path: this.path.clone(),
-            offset: start,
-            len,
-            buffer,
-        };
-        executor.submit(Box::new(move || job.run(&*env, token)));
-        reply.deferred()
+        deferred_read(
+            cx,
+            req,
+            reply,
+            (this.mount, &this.path),
+            (offset, size),
+            true,
+        )
     }
 
     /// `GetSize`. out: `s64` size.
@@ -561,6 +677,50 @@ impl IFile {
     }
 }
 
+/// The current process's data storage (`IStorage`): its `RomFS` image, read-only. It keeps
+/// nothing: there is one data storage, [`Mount::DataStorage`](host::Mount::DataStorage).
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct IStorage;
+
+// The bytes go to a map-alias buffer: Eden's `OutBuffer<BufferAttr_HipcMapAlias |
+// BufferAttr_HipcMapTransferAllowsNonSecure>`.
+commands! {
+    impl IStorage {
+        command::storage::READ => read [Out(MapAlias)],
+        command::storage::GET_SIZE => get_size,
+    }
+}
+
+impl IStorage {
+    /// `Read`. in: `s64` offset, `s64` size; out buffer 0. out: nothing but the bytes. Deferred:
+    /// see the module docs, "The data storage".
+    fn read(_: &mut Self, cx: &mut Context<'_>, req: &Request<'_>, reply: &mut Reply) -> Outcome {
+        let mut payload = req.payload();
+        let offset = payload.read_i64()?;
+        let size = payload.read_i64()?;
+        deferred_read(
+            cx,
+            req,
+            reply,
+            (Mount::DataStorage, &[]),
+            (offset, size),
+            false,
+        )
+    }
+
+    /// `GetSize`. out: `s64` size.
+    fn get_size(
+        _: &mut Self,
+        cx: &mut Context<'_>,
+        _req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        let size = file_size(&*cx.env()?, Mount::DataStorage, &[])?;
+        reply.payload().write_i64(size);
+        reply.ok()
+    }
+}
+
 /// The interfaces an `fsp-srv` server's sessions can be.
 #[must_use]
 pub fn interfaces() -> Interfaces {
@@ -568,6 +728,7 @@ pub fn interfaces() -> Interfaces {
         .with::<FspSrv>()
         .with::<IFileSystem>()
         .with::<IFile>()
+        .with::<IStorage>()
 }
 
 /// An `fsp-srv` server whose host file systems are `env`'s ([`host`]). Its reads run on the

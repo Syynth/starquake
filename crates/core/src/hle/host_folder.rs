@@ -1,5 +1,7 @@
 //! [`HostFolder`]: a host folder as the SD card `fsp-srv` opens, answering its host file requests
-//! (`starquake_services::fsp::host`) on the environment's host I/O channel.
+//! (`starquake_services::fsp::host`) on the environment's host I/O channel. A request for any
+//! other mount (the data storage, which [`FspHost`](super::FspHost) serves) is
+//! [`HostFailure::NoDevice`].
 //!
 //! Read-only: the protocol has no request that writes. A path in a request is one the service
 //! has normalised (`starquake_services::fsp::path`), but it comes from the guest, and a replayed
@@ -98,22 +100,40 @@ impl HostFolder {
         Ok(bytes)
     }
 
-    fn answer(&self, request: &HostRequest) -> Result<Vec<u8>, HostFailure> {
+    /// The answer to `request`: the SD card's, or [`HostFailure::NoDevice`] for another mount.
+    pub(super) fn answer(&self, request: &HostRequest) -> Result<Vec<u8>, HostFailure> {
+        if request.mount() != Mount::SdCard {
+            return Err(HostFailure::NoDevice);
+        }
         match request {
-            HostRequest::Probe {
-                mount: Mount::SdCard,
-            } => self.probe(),
-            HostRequest::Size {
-                mount: Mount::SdCard,
-                path,
-            } => self.size(path),
+            HostRequest::Probe { .. } => self.probe(),
+            HostRequest::Size { path, .. } => self.size(path),
             HostRequest::Read {
-                mount: Mount::SdCard,
-                path,
-                offset,
-                len,
+                path, offset, len, ..
             } => self.read(path, *offset, *len),
         }
+    }
+}
+
+/// Answers a host I/O request on `fsp-srv`'s channel with `answer`: anything on another channel
+/// is unavailable, and a request that does not decode is [`HostFailure::BadRequest`]. Shared by
+/// every handler of the channel.
+pub(super) fn serve(
+    request: &HostIoRequest,
+    answer: impl FnOnce(&HostRequest) -> Result<Vec<u8>, HostFailure>,
+) -> HostIoReply {
+    if request.channel != CHANNEL {
+        return HostIoReply::Unavailable;
+    }
+    let answer = HostRequest::decode(&request.payload)
+        .map_err(|error| {
+            tracing::error!(%error, "a host file request could not be decoded");
+            HostFailure::BadRequest
+        })
+        .and_then(|request| answer(&request));
+    match answer {
+        Ok(bytes) => HostIoReply::Data(bytes),
+        Err(failure) => failure.reply(),
     }
 }
 
@@ -128,19 +148,7 @@ fn failure(error: &io::Error) -> HostFailure {
 
 impl HostIoHandler for HostFolder {
     fn handle(&mut self, request: &HostIoRequest) -> HostIoReply {
-        if request.channel != CHANNEL {
-            return HostIoReply::Unavailable;
-        }
-        let answer = HostRequest::decode(&request.payload)
-            .map_err(|error| {
-                tracing::error!(%error, "a host file request could not be decoded");
-                HostFailure::BadRequest
-            })
-            .and_then(|request| self.answer(&request));
-        match answer {
-            Ok(bytes) => HostIoReply::Data(bytes),
-            Err(failure) => failure.reply(),
-        }
+        serve(request, |request| self.answer(request))
     }
 }
 

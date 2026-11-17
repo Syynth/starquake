@@ -30,6 +30,8 @@
 use std::io::{Read, Seek, SeekFrom};
 use std::ops::Range;
 
+use crate::read_at::ReadAt;
+
 /// Magic of a `PFS0` partition (`Header::HasValidMagicValue`).
 pub const PFS0_MAGIC: [u8; 4] = *b"PFS0";
 /// Magic of an `HFS0` partition (`Header::HasValidMagicValue`).
@@ -313,17 +315,38 @@ pub(crate) fn read_window<R: Read + Seek>(
     offset: u64,
     buf: &mut [u8],
 ) -> std::io::Result<usize> {
-    let remaining = (extent.end - extent.start).saturating_sub(offset);
-    let count = usize::try_from(remaining).map_or(buf.len(), |remaining| remaining.min(buf.len()));
-    let Some(window) = buf.get_mut(..count) else {
+    let Some((at, window)) = window(&extent, offset, buf) else {
         return Ok(0);
     };
-    if count == 0 {
-        return Ok(0);
-    }
-    // `offset < extent.end - extent.start` here (count > 0), so the sum cannot pass `extent.end`.
-    read_exact_at(reader, extent.start + offset, window)?;
+    let count = window.len();
+    read_exact_at(reader, at, window)?;
     Ok(count)
+}
+
+/// [`read_window`] through a shared reference to a positional source (`crate::read_at`).
+pub(crate) fn read_window_at<S: ReadAt + ?Sized>(
+    source: &S,
+    extent: Range<u64>,
+    offset: u64,
+    buf: &mut [u8],
+) -> std::io::Result<usize> {
+    let Some((at, window)) = window(&extent, offset, buf) else {
+        return Ok(0);
+    };
+    let count = window.len();
+    crate::read_at::read_exact_at(source, at, window)?;
+    Ok(count)
+}
+
+/// Where a read of `buf.len()` bytes from `offset` bytes into `extent` starts in the source, and
+/// the part of `buf` it fills; `None` when it reads nothing (an empty buffer, or an offset at or
+/// past the extent's end).
+fn window<'b>(extent: &Range<u64>, offset: u64, buf: &'b mut [u8]) -> Option<(u64, &'b mut [u8])> {
+    let remaining = (extent.end.saturating_sub(extent.start)).saturating_sub(offset);
+    let count = usize::try_from(remaining).map_or(buf.len(), |remaining| remaining.min(buf.len()));
+    let window = buf.get_mut(..count).filter(|window| !window.is_empty())?;
+    // `offset < extent.end - extent.start` here (count > 0), so the sum cannot pass `extent.end`.
+    Some((extent.start.saturating_add(offset), window))
 }
 
 /// The NUL-terminated name at `offset` in `strtab`; an unterminated name ends with the table.
