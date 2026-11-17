@@ -343,6 +343,42 @@ fn hand_built_words_decode() {
     );
 }
 
+/// `FFMA r1, r2, r3, r4` built by hand with one more bit of word 2 (bits 64..96) set, so each
+/// modifier, rounding-mode and flag position is pinned by a word the assembler did not make.
+#[test]
+fn hand_built_ffma_words_pin_each_modifier_and_mode_bit() {
+    // Opcode 0x223, guard PT (7 << 12), dst 1 << 16, src0 2 << 24, src1 3 << 32, src2 4 << 64.
+    let plain = 0x0000_0000_0000_0004_0000_0003_0201_7223_u128;
+    let cases = [
+        // Bit 72 (word 2 bit 8): source 0's negation.
+        (0x100, "ffma r1, -r2, r3, r4;"),
+        // Bit 73: source 0's absolute value.
+        (0x200, "ffma r1, |r2|, r3, r4;"),
+        // Bit 74: source 2's absolute value.
+        (0x400, "ffma r1, r2, r3, |r4|;"),
+        // Bit 75: source 2's negation.
+        (0x800, "ffma r1, r2, r3, -r4;"),
+        // Bit 76: the multiply-by-zero mode.
+        (0x1000, "ffma.fmz r1, r2, r3, r4;"),
+        // Bit 77: saturate.
+        (0x2000, "ffma.sat r1, r2, r3, r4;"),
+        // Bits 78..80 = 1: toward negative infinity.
+        (0x4000, "ffma.rm r1, r2, r3, r4;"),
+        // Bits 78..80 = 2: toward positive infinity.
+        (0x8000, "ffma.rp r1, r2, r3, r4;"),
+        // Bits 78..80 = 3: toward zero.
+        (0xc000, "ffma.rz r1, r2, r3, r4;"),
+    ];
+    for (word2, expected) in cases {
+        let word = Instruction::from_bits(plain | (word2 << 64));
+        assert_eq!(
+            decode(word).map(|i| i.to_string()),
+            Ok(expected.into()),
+            "{word2:#x}"
+        );
+    }
+}
+
 /// Hand-built words of the operand forms slice 4 added: constant buffers (bound and bindless)
 /// and uniform registers, in source 1 and source 2.
 #[test]

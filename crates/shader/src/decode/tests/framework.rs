@@ -188,6 +188,22 @@ fn checks_run_in_the_documented_order() {
             bit: 100
         })
     );
+    // Step 2 names the lowest stray bit: an EXIT word with bits 16 and 100 set, both outside
+    // its mask.
+    let exit = control::EXIT_OPCODE;
+    let low = Field::bit(16);
+    assert_eq!(known_of(exit) & (low.mask() | outside.mask()), 0);
+    let two_stray = Instruction::default()
+        .with_field(OPCODE, u64::from(exit))
+        .with_flag(low, true)
+        .with_flag(outside, true);
+    assert_eq!(
+        decode(two_stray),
+        Err(DecodeError::UnknownBit {
+            opcode: exit,
+            bit: low.start
+        })
+    );
     // Step 5 names the lowest unread bit.
     assert_eq!(
         decode(
