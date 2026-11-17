@@ -66,9 +66,10 @@ use crate::handle::{Handle, HandleTable, Resolved};
 use crate::id::ProcessId;
 use crate::memory::AddressSpace;
 use crate::object::Object;
-use crate::process::ENTROPY_COUNT;
+use crate::process::{Console, ENTROPY_COUNT, ProcessInfo};
 use crate::result::{CallResult, KernelError, SvcError};
 use crate::tables::{Processes, Scheduler};
+use starquake_memory::PAGE_SIZE;
 
 /// Defines [`InfoType`] from `Name = number;` rows, so an id and its number are written once.
 macro_rules! info_types {
@@ -170,6 +171,31 @@ info_types! {
     MesosphereCurrentProcess = 65001;
 }
 
+/// What `RemoteRegionAddress` (29) tells a Switch 2 program: no remote region. A guess, from
+/// PR #4588 (`eden-pr4588/src/core/hle/kernel/svc/svc_info.cpp` @ e5fb3b97, `GetInfo`:
+/// "Remote mappings are absent", `*result = 0`). A trace from a console, or the SDK's use of
+/// the value, would confirm it.
+pub const REMOTE_REGION_ADDRESS: u64 = 0;
+
+/// What `RemoteRegionSize` (30) tells a Switch 2 program: no remote region. A guess, from the
+/// same line of PR #4588 as [`REMOTE_REGION_ADDRESS`], confirmed the same way.
+pub const REMOTE_REGION_SIZE: u64 = 0;
+
+/// What `RemoteMemoryUsed` (31) tells a Switch 2 program: no remote memory. A guess, from the
+/// same line of PR #4588 as [`REMOTE_REGION_ADDRESS`], confirmed the same way.
+pub const REMOTE_MEMORY_USED: u64 = 0;
+
+/// What `RemoteMemoryTotal` (32) tells a Switch 2 program: no remote memory. A guess, from the
+/// same line of PR #4588 as [`REMOTE_REGION_ADDRESS`], confirmed the same way.
+pub const REMOTE_MEMORY_TOTAL: u64 = 0;
+
+/// What `MemoryMappingAlignment` (33) tells a Switch 2 program: the page size, [`PAGE_SIZE`]. A
+/// guess, from PR #4588 (`eden-pr4588/src/core/hle/kernel/svc/svc_info.cpp` @ e5fb3b97,
+/// `GetInfo`: "ordinary mappings use the kernel page size", `*result = PageSize`; the scoping
+/// doc's row, "page granule 0x1000"). A trace from a console, or the SDK's use of the value,
+/// would confirm it.
+pub const MEMORY_MAPPING_ALIGNMENT: u64 = PAGE_SIZE;
+
 impl InfoType {
     /// The id with this number, if it is listed.
     #[must_use]
@@ -216,6 +242,10 @@ pub fn get_info(
     info_sub_id: u64,
 ) -> CallResult<u64> {
     let id = InfoType::from_raw(info_type).ok_or(KernelError::InvalidEnumValue)?;
+    // PR #4588 answers its ids in an `if` before Eden's `switch`.
+    if let Some(value) = switch_2_fact(id) {
+        return switch_2_info(handles, scheduler, processes, handle, info_sub_id, value);
+    }
     match id {
         // `case InfoType::DebuggerAttached: *result = 0; R_SUCCEED();`
         InfoType::DebuggerAttached => Ok(0),
@@ -224,6 +254,57 @@ pub fn get_info(
         }
         _ => memory_info(handles, space, scheduler, processes, id, handle, info_sub_id),
     }
+}
+
+/// What a Switch 2 id answers ([`REMOTE_REGION_ADDRESS`] to [`MEMORY_MAPPING_ALIGNMENT`]), or
+/// `None` for any other id.
+const fn switch_2_fact(id: InfoType) -> Option<u64> {
+    Some(match id {
+        InfoType::RemoteRegionAddress => REMOTE_REGION_ADDRESS,
+        InfoType::RemoteRegionSize => REMOTE_REGION_SIZE,
+        InfoType::RemoteMemoryUsed => REMOTE_MEMORY_USED,
+        InfoType::RemoteMemoryTotal => REMOTE_MEMORY_TOTAL,
+        InfoType::MemoryMappingAlignment => MEMORY_MAPPING_ALIGNMENT,
+        _ => return None,
+    })
+}
+
+/// A Switch 2 id, whose answer is `value`: for a Switch 1 program, Eden's `default`; for a
+/// Switch 2 program, PR #4588's three checks in its order (see the module docs).
+fn switch_2_info(
+    handles: &HandleTable,
+    scheduler: &Scheduler,
+    processes: &Processes,
+    handle: Handle,
+    info_sub_id: u64,
+    value: u64,
+) -> CallResult<u64> {
+    // A Switch 1 kernel does not know the id: Eden's `default`, `R_THROW(ResultInvalidEnumValue)`.
+    if console_of(processes, processes.own())? != Console::Switch2 {
+        return Err(KernelError::InvalidEnumValue.into());
+    }
+    // `R_UNLESS(info_sub_id == 0, ResultInvalidEnumValue)`.
+    if info_sub_id != 0 {
+        return Err(KernelError::InvalidEnumValue.into());
+    }
+    // `R_UNLESS(process.IsNotNull(), ResultInvalidHandle)`.
+    let named = process_from_handle(handles, scheduler, processes, handle)?;
+    // `R_UNLESS(process->UsesPAuthReturns(), ResultInvalidEnumValue)`: the process the handle
+    // names was built for Switch 2 (an extended ACID).
+    if console_of(processes, named)? != Console::Switch2 {
+        return Err(KernelError::InvalidEnumValue.into());
+    }
+    tracing::debug!(value, "GetInfo Switch 2 id answered with PR #4588's guessed value");
+    Ok(value)
+}
+
+/// The console `process` was built for. A process the table has no row for is an internal
+/// failure: a process object or the calling process always names a created process.
+fn console_of(processes: &Processes, process: ProcessId) -> CallResult<Console> {
+    processes
+        .get(process)
+        .map(ProcessInfo::console)
+        .map_err(|error| SvcError::internal(&error))
 }
 
 /// `RandomEntropy`: word `info_sub_id` of `process`'s entropy, after Eden's two checks.

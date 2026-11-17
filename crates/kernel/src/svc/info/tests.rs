@@ -228,21 +228,23 @@ fn an_id_this_slice_does_not_answer_is_not_implemented_whatever_else_is_passed()
     let (space, _log, _) = loaded();
     let (handles, scheduler) = tables();
     let others = [DEBUGGER_ATTACHED, RANDOM_ENTROPY];
+    let switch_2: Vec<u32> = SWITCH_2.iter().map(|(id, _)| id.number()).collect();
     let unanswered: Vec<u32> = InfoType::ALL
         .iter()
         .map(|id| id.number())
-        .filter(|number| !ANSWERED.contains(number) && !others.contains(number))
+        .filter(|number| {
+            !ANSWERED.contains(number) && !others.contains(number) && !switch_2.contains(number)
+        })
         .collect();
-    // Every id Eden answers besides the thirteen, and the five Switch 2 ids.
+    // Every id Eden answers besides the thirteen and the five Switch 2 ids.
     assert_eq!(
         unanswered.len(),
-        InfoType::ALL.len() - ANSWERED.len() - others.len()
+        InfoType::ALL.len() - ANSWERED.len() - others.len() - SWITCH_2.len()
     );
     assert_eq!(
         unanswered,
         [
-            0, 1, 9, 10, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 29, 30, 31, 32, 33, 37, 38, 65000,
-            65001
+            0, 1, 9, 10, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 37, 38, 65000, 65001
         ]
     );
     for id in unanswered {
@@ -516,4 +518,225 @@ fn entropy_once_set_is_kept() {
     let other = ProcessId::from_parts(4, 2);
     scheduler.add_process(other).unwrap();
     assert_eq!(scheduler.process(other).unwrap().entropy(), None);
+}
+
+/// The Switch 2 ids and what each answers a Switch 2 program, from the shipping constants.
+const SWITCH_2: [(InfoType, u64); 5] = [
+    (InfoType::RemoteRegionAddress, REMOTE_REGION_ADDRESS),
+    (InfoType::RemoteRegionSize, REMOTE_REGION_SIZE),
+    (InfoType::RemoteMemoryUsed, REMOTE_MEMORY_USED),
+    (InfoType::RemoteMemoryTotal, REMOTE_MEMORY_TOTAL),
+    (InfoType::MemoryMappingAlignment, MEMORY_MAPPING_ALIGNMENT),
+];
+
+/// Tables for the Switch 2 ids: a handle table holding a handle to a thread and one to each
+/// process of `processes` besides the calling one, and a scheduler whose object table names
+/// them. Returns the thread's handle and the process handles, in `others`' order.
+fn tables_naming(others: &[ProcessId]) -> (HandleTable, Scheduler, Handle, Vec<Handle>) {
+    let (mut handles, mut scheduler) = tables();
+    let thread = scheduler
+        .create_thread(Priority::new(44).unwrap(), CoreId::new(0).unwrap())
+        .unwrap();
+    let mut add = |object: Object| {
+        let id = scheduler.objects_mut().create(object).unwrap();
+        let handle = handles.add(scheduler.objects_mut(), id).unwrap();
+        scheduler.objects_mut().close(id).unwrap();
+        handle
+    };
+    let thread_handle = add(Object::Thread(thread));
+    let process_handles = others
+        .iter()
+        .map(|&process| add(Object::Process(process)))
+        .collect();
+    (handles, scheduler, thread_handle, process_handles)
+}
+
+#[test]
+fn the_switch_2_ids_are_numbered_as_pr_4588_numbers_them() {
+    // `eden-pr4588/src/core/hle/kernel/svc/svc_info.cpp` @ e5fb3b97: 29 to 33, in this order.
+    let numbers: Vec<u32> = SWITCH_2.iter().map(|(id, _)| id.number()).collect();
+    assert_eq!(numbers, [29, 30, 31, 32, 33]);
+}
+
+#[test]
+fn each_switch_2_id_answers_a_switch_2_program() {
+    let (space, _log, _) = loaded();
+    let processes = processes();
+    let own = processes.own();
+    let (handles, scheduler, _, named) = tables_naming(&[own]);
+    for (id, value) in SWITCH_2 {
+        // The pseudo-handle, and a handle to the calling process's own object.
+        for handle in [Handle::CURRENT_PROCESS, named[0]] {
+            assert_eq!(
+                get_info(&handles, &space, &scheduler, &processes, id.number(), handle, 0),
+                Ok(value),
+                "{id:?} handle {:#x}",
+                handle.raw()
+            );
+        }
+    }
+    // PR #4588's values: zero for the remote region and remote memory, the page size for the
+    // mapping alignment (each a guess; the module docs say what would confirm it).
+    assert_eq!(MEMORY_MAPPING_ALIGNMENT, starquake_memory::PAGE_SIZE);
+    for remote in [
+        REMOTE_REGION_ADDRESS,
+        REMOTE_REGION_SIZE,
+        REMOTE_MEMORY_USED,
+        REMOTE_MEMORY_TOTAL,
+    ] {
+        assert_eq!(remote, 0);
+    }
+}
+
+#[test]
+fn a_switch_1_program_is_told_the_switch_2_ids_are_an_invalid_enum_value_whatever_is_passed() {
+    // Eden's `default`: `R_THROW(ResultInvalidEnumValue)` before any check. PR #4588 checks
+    // the sub id and the handle first (so a bad handle is `InvalidHandle` there); starquake
+    // follows Eden for a Switch 1 program (the module docs list the divergence).
+    let (space, _log, _) = loaded();
+    let processes = processes_of(Console::Switch1);
+    let own = processes.own();
+    let (handles, scheduler, thread_handle, named) = tables_naming(&[own]);
+    for (id, _) in SWITCH_2 {
+        for handle in [
+            Handle::CURRENT_PROCESS,
+            named[0],
+            Handle::INVALID,
+            Handle::CURRENT_THREAD,
+            Handle::from_raw(0x0001_0001),
+            thread_handle,
+        ] {
+            for sub_id in [0, 1, u64::MAX] {
+                assert_eq!(
+                    get_info(
+                        &handles,
+                        &space,
+                        &scheduler,
+                        &processes,
+                        id.number(),
+                        handle,
+                        sub_id
+                    ),
+                    kernel(KernelError::InvalidEnumValue),
+                    "{id:?} handle {:#x} sub id {sub_id:#x}",
+                    handle.raw()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_switch_2_id_with_a_sub_id_other_than_zero_is_an_invalid_enum_value_before_the_handle() {
+    // `R_UNLESS(info_sub_id == 0, ResultInvalidEnumValue)` comes first: with the handle wrong
+    // too, the sub id is reported.
+    let (space, _log, _) = loaded();
+    let processes = processes();
+    let (handles, scheduler, thread_handle, _) = tables_naming(&[]);
+    for (id, _) in SWITCH_2 {
+        for handle in [Handle::CURRENT_PROCESS, Handle::INVALID, thread_handle] {
+            for sub_id in [1, u64::MAX] {
+                assert_eq!(
+                    get_info(
+                        &handles,
+                        &space,
+                        &scheduler,
+                        &processes,
+                        id.number(),
+                        handle,
+                        sub_id
+                    ),
+                    kernel(KernelError::InvalidEnumValue),
+                    "{id:?} handle {:#x} sub id {sub_id:#x}",
+                    handle.raw()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_switch_2_id_needs_a_handle_to_a_process() {
+    // `R_UNLESS(process.IsNotNull(), ResultInvalidHandle)`: the invalid handle, the
+    // current-thread pseudo-handle, a handle no entry has, and a handle to a thread.
+    let (space, _log, _) = loaded();
+    let processes = processes();
+    let (handles, scheduler, thread_handle, _) = tables_naming(&[]);
+    for (id, _) in SWITCH_2 {
+        for handle in [
+            Handle::INVALID,
+            Handle::CURRENT_THREAD,
+            Handle::from_raw(0x0001_0001),
+            thread_handle,
+        ] {
+            assert_eq!(
+                get_info(&handles, &space, &scheduler, &processes, id.number(), handle, 0),
+                kernel(KernelError::InvalidHandle),
+                "{id:?} handle {:#x}",
+                handle.raw()
+            );
+        }
+    }
+}
+
+#[test]
+fn a_switch_2_id_is_answered_by_the_console_of_the_process_the_handle_names() {
+    // `R_UNLESS(process->UsesPAuthReturns(), ResultInvalidEnumValue)`, on the process the
+    // handle names: a Switch 2 program asking about a Switch 1 process is refused, and about
+    // another Switch 2 process is answered.
+    let (space, _log, _) = loaded();
+    let mut processes = processes();
+    let switch_1 = processes
+        .create(&ProcessDescription::homebrew(Console::Switch1))
+        .unwrap();
+    let switch_2 = processes
+        .create(&ProcessDescription::homebrew(Console::Switch2))
+        .unwrap();
+    let (handles, scheduler, _, named) = tables_naming(&[switch_1, switch_2]);
+    for (id, value) in SWITCH_2 {
+        let ask = |handle| {
+            get_info(&handles, &space, &scheduler, &processes, id.number(), handle, 0)
+        };
+        assert_eq!(ask(named[0]), kernel(KernelError::InvalidEnumValue), "{id:?}");
+        assert_eq!(ask(named[1]), Ok(value), "{id:?}");
+    }
+    // And the other way round: a Switch 1 program is refused even about a Switch 2 process.
+    let mut switch_1_caller = processes_of(Console::Switch1);
+    let switch_2 = switch_1_caller
+        .create(&ProcessDescription::homebrew(Console::Switch2))
+        .unwrap();
+    let (handles, scheduler, _, named) = tables_naming(&[switch_2]);
+    for (id, _) in SWITCH_2 {
+        assert_eq!(
+            get_info(
+                &handles,
+                &space,
+                &scheduler,
+                &switch_1_caller,
+                id.number(),
+                named[0],
+                0
+            ),
+            kernel(KernelError::InvalidEnumValue),
+            "{id:?}"
+        );
+    }
+}
+
+#[test]
+fn a_handle_to_a_process_the_table_has_no_row_for_is_an_internal_failure() {
+    // A process object always names a created process; one that does not is the kernel's own
+    // inconsistency, reported with the table's message after the guest's checks.
+    let (space, _log, _) = loaded();
+    let processes = processes();
+    let ghost = ProcessId::from_parts(5, 3);
+    let missing = processes.get(ghost).unwrap_err();
+    let (handles, scheduler, _, named) = tables_naming(&[ghost]);
+    for (id, _) in SWITCH_2 {
+        let ask = |sub_id| {
+            get_info(&handles, &space, &scheduler, &processes, id.number(), named[0], sub_id)
+        };
+        assert_eq!(ask(0), Err(SvcError::internal(&missing)), "{id:?}");
+        assert_eq!(ask(1), kernel(KernelError::InvalidEnumValue), "{id:?}");
+    }
 }
