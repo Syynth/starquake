@@ -113,7 +113,7 @@ All vetted by the lead under delegation; open to the owner's review.
 | promoted (lead, under delegation): split by what the homebrew fixture needs. Slice 6 is #97 and slice 9 is #98; slices 4, 5, 8 and 10 are filed after milestone 1 | **Kernel slices 4–10** | Unchanged from wave 3. |
 | folded into #75 (lead, under delegation) | **Align the zero point of patched counter reads and `GetSystemTick`; per-process counter rate; name the environment's clock type for what it returns (host nanoseconds)** | The skeleton shares a rate between the two clocks but not a starting point. |
 | not delivered: #85 closed without it; proposed again under "From waves 8 and 9" | **Unpatched counter reads answered at the host rate by the shim** | A read the patcher misses would disagree with patched ones. |
-| proposed | **Crash report: a frame-pointer backtrace; a program counter for timed-out runs** | Reviewer follow-up; useful once real programs run. |
+| promoted #206 (lead, under delegation) | **Crash report: a frame-pointer backtrace; a program counter for timed-out runs** | Reviewer follow-up; useful once real programs run. |
 | proposed | **A stop handle for runs (Ctrl-C leaves no artifacts); print guest log lines as they happen; a default timeout** | Reviewer and builder follow-ups on the command-line app. |
 | proposed | **Stage-1 tables: a failed write during `map` can leave a table page registered but unlinked; a table descriptor with other ignored bits set is accepted** | Found by #76's fix pass; neither affects correct guests. |
 | proposed | **Pinned threads** | No kernel slice owns them (from wave 4). |
@@ -133,8 +133,8 @@ All vetted by the lead under delegation; open to the owner's review.
 | folded into #97 | **`AddressSpace::pieces` loops forever on a zero-length piece; nextest has no slow-test timeout** | Found by a wave 8 reviewer; a hang in a test would stall the gate. |
 | folded into #98 | **A golden-trace test for the homebrew fixture** | Milestone 1's "done when" needs one; the expected trace lived only in a README. |
 | adopted (lead, under delegation) | **Each agent builds in its own checkout's build folder** | A shared `CARGO_TARGET_DIR` served a sibling's stale build several times across waves 2 and 8 (decision log). |
-| proposed | **The shim answers unpatched `cntpct_el0` reads at the guest's rate** | A read the patcher misses returns the raw host counter while patched reads are rescaled. Needs the interrupt-recovery cases and a hardware test. |
-| proposed | **Something owns which counter rate a program gets** | The kernel has a per-process rate (#75) but every process is given the Switch 1 rate. Belongs with process creation (slice 8). |
+| promoted #205 (lead, under delegation) | **The shim answers unpatched `cntpct_el0` reads at the guest's rate** | A read the patcher misses returns the raw host counter while patched reads are rescaled. Needs the interrupt-recovery cases and a hardware test. |
+| done: a program's console, from its NPDM, sets its counter rate (`crates/core/src/system.rs`, `clock.rs`) | **Something owns which counter rate a program gets** | The kernel has a per-process rate (#75) but every process is given the Switch 1 rate. Belongs with process creation (slice 8). |
 | proposed | **A backend-neutral TLB flush on the `Vcpu` trait** | The flush is a method of the hypervisor backend only, and `run` does not refuse while a flush is owed. The kernel is generic over `Vcpu`, and KVM will share the tables. |
 | proposed | **The loader reads libnx's `LNY0`/`LNY1` extension to MOD0** (GOT and RELRO ranges) | libnx protects its own RELRO page at start-up (the fixture's first system call), so nothing on the milestone 1 path needs it yet. |
 | proposed | **A second homebrew fixture built with a firmware version set** | The first leaves it at zero, so the TIPC form of `sm:` and `set:sys` command 4 are never exercised. |
@@ -146,10 +146,10 @@ All vetted by the lead under delegation; open to the owner's review.
 | folded into #36 | **Narrow #36** to `wfi`/`wfe`, the instruction-cache policy and printing the syndrome in crash reports | #85 delivered the syndrome in exits and the TLB flush entry point. |
 | folded into #25 | **Measure** the ASID width (8 bits on this host), whether an unmap is visible to other vCPUs before the flush, and a bound for the number of flush ranges (512 is a guess) | #85's hardware tests and `tools/hvprobe` disagree on how long a stale translation survives; the spec's sentence stays until measured. |
 | ruled (lead, under delegation): yes | **Does a new crash-report kind bump `CRASH_VERSION`?** | An older reader would meet a kind it does not know. Any change to a serialised layout bumps its version (`CLAUDE.md`); the constant's doc comment is corrected with the next crash-report change. |
-| proposed | **Should `RamConfig` refuse a RAM base below 4 GiB?** | Raised in review of #85; no guest needs it either way yet. |
-| proposed | **Run a title: map a title's ExeFS into a process, `starquake run <title.nup>`** | Nothing turns an opened title into a running process. Fold with #33 (wiring the parsers into process creation). After milestone 1. |
+| dropped (lead): no guest needs it either way | **Should `RamConfig` refuse a RAM base below 4 GiB?** | Raised in review of #85; no guest needs it either way yet. |
+| done by #173 | **Run a title: map a title's ExeFS into a process, `starquake run <title.nup>`** | Nothing turns an opened title into a running process. Fold with #33 (wiring the parsers into process creation). After milestone 1. |
 | ruled by the owner, 2026-11-16: positional reads on a shared source; a compressed file is decompressed whole on first open into a size-capped in-memory cache, evicted least-recently-used (decision log) | **Design: RomFS from a NUP file for the file-system service** (positional reads; seeking inside a compressed file) | The reader borrows its source mutably, and a compressed file is one zstd frame with no random access. Settle before `fsp-srv` builds on it. |
-| proposed | **A narrow title API in `core`** in place of re-exporting the loader crate | `core` re-exports the whole loader and the app's tests depend on the loader directly; "frontends only see `core`" covers neither. |
+| partly done by #173; the rest stays proposed | **A narrow title API in `core`** in place of re-exporting the loader crate | `core` re-exports the whole loader and the app's tests depend on the loader directly; "frontends only see `core`" covers neither. |
 | proposed | **NUP follow-ups**: read the meta block's TLVs (and raise the 0-based against 1-based numbering upstream); parse only the NSO header for `inspect`; cap the total path bytes of a directory walk (names that are prefixes of one pooled string make it quadratic); `verify` says "damaged" for an I/O error; the tree depth limit of 128 is a guess | Review findings on #99. |
 | ruled by the owner for M2, 2026-11-16: run the base package only and log that updates are ignored; the rules are settled when a title needs an update (decision log) | **Three rules for combining a title's packages**: an update replaces the whole ExeFS or overlays it; the highest version wins; how a base and its update are related by title id | The reader reports packages and leaves the choice to its caller. The first needs a ruling against the reference before a title is mapped. |
 
@@ -164,14 +164,14 @@ delegation that let the lead promote proposals ended with milestone 1, so everyt
 |---|---|---|
 | proposed | **The brief for kernel slice 10 (core loop and timers)** names: wiring `Dispatcher::deliver_replies` and `take_woken` into the loop; making the loop's service set injectable so its waiting arm can be tested; notices that arrive while a handler is out | These exist and are tested in the kernel but nothing in a real run reaches them, and the loop's waiting arm has no test. |
 | proposed | **One request queue per HLE server; serialisable IPC tables** | The kernel and the service framework each keep a queue that must agree. `Ipc`, `Request` and `Translated` are not serialisable, which snapshots need. |
-| proposed | **Trace: a protocol or control mark on IPC events; fill `service_commands` in `summary.json`** (a trace layout version bump) | The fixture's comparison infers which service a control request belongs to from the next request. A run's summary lists no service commands. Merge with the service-hardening proposal. |
-| proposed | **IPC failure paths**: roll back handles that a failed handler put in the sender's table | The error-path rule; nothing does this yet. No program on the current path triggers it. |
+| promoted #207 (lead, under delegation) | **Trace: a protocol or control mark on IPC events; fill `service_commands` in `summary.json`** (a trace layout version bump) | The fixture's comparison infers which service a control request belongs to from the next request. A run's summary lists no service commands. Merge with the service-hardening proposal. |
+| promoted #209 (lead, under delegation) | **IPC failure paths**: roll back handles that a failed handler put in the sender's table | The error-path rule; nothing does this yet. No program on the current path triggers it. |
 | proposed | **Session limits on `ConnectToNamedPort`** | The reference can refuse with a limit error; starquake has no session limits. Listed as a divergence and pinned by a test. |
 | proposed, for the kernel spec | **Two notes**: the kernel does not read buffer descriptors when a request is sent; moving a handle into a guest server's table is untracked | Neither is ruled out by the design; both need a sentence in the spec when guest servers are taken up. |
 | proposed | **Record address-space changes in the event stream; a serialisable address-space table** | No kernel slice owns the recording point for map, unmap and protect. Snapshots must rebuild the table's mapper. |
 | proposed | **ZBIC follow-ups**: a fallback when a rewritten block crosses a zstd limit (hold until a title trips it); a cap on the decoder's up-front window reservation from an untrusted size; a strict verification mode; whether NRO and NRR can carry ZBIC | The reservation is the only one a hostile file can reach today; it is documented and pinned by a test, not prevented. |
 | proposed (the owner passed on it for now, 2026-11-12) | **`starquake ls` and `extract` for a title's files** | A first use of the RomFS reading path the file-system service needs. The `nup_tally` example in the loader covers looking around for now. |
-| proposed | **After milestone 1: kernel slices 4 (events, waits), 5 (address arbiter, condition variables), 8 (process and threads) and 10 (core loop); CPU #35 and #36; title mapping #33; then services** | The widest set of work that can run side by side before the graphics designs are approved: at most two kernel lanes, one CPU lane, one loader lane, then one lane per service. |
+| done: milestone 1 delivered these; the remaining items are filed (#33 and the M2 issues) | **After milestone 1: kernel slices 4 (events, waits), 5 (address arbiter, condition variables), 8 (process and threads) and 10 (core loop); CPU #35 and #36; title mapping #33; then services** | The widest set of work that can run side by side before the graphics designs are approved: at most two kernel lanes, one CPU lane, one loader lane, then one lane per service. |
 
 ### Folded or already recorded (waves 10 to 12)
 
@@ -268,3 +268,20 @@ passed to build agents as a provisional rule for the next wave.
 | proposed | Never discard with `let _ =` a result that reports a freed resource; route it through the one teardown path, on error paths too. |
 | proposed | When a shared resource is taken out and its lock released, the admission logic must know it is out; pin it with a threaded test that sends a second request meanwhile. |
 | dropped: covered by existing rules | Mutation-check new bounds; back every stated invariant with an assertion; test documented orderings with two competing items; grep the code before stating a docs claim. |
+
+### From waves 17 and 18 (ledger: #22)
+
+Filed from these waves under the delegation: #177, #178, #179–#194 (graphics-server slices), #199,
+#200 and #203. #33 is retargeted to M2. The rest:
+
+| Status | Proposal | Why | Suggested |
+|---|---|---|---|
+| promoted #208 (lead, under delegation) | **Charge a process's system resource (META 0x14) to its pool**, as Eden's `KProcess::Initialize` does; check `svc` info process handles against `ProcessRecord::object` | `GetInfo` over-reports free memory, and #178's fit check documents the gap | area:kernel, M2 |
+| proposed (fold into #161's build hint) | **`FakeKernel::resolve_handle` models handle translation** | So a services test can send libnx's exact `OpenApplicationProxy` with `CURRENT_PROCESS` | area:services, M2 |
+| proposed | **Size the stage-1 table pool with guest RAM** (a fixed 4 MiB today) and settle the 16 MiB working-RAM guess | A larger title runs out of table pages before RAM; may need an owner decision on sizing to the whole application pool | area:cpu, M2 |
+| proposed | **Export the NSO header offsets** from the loader; a trampolined-program RAM-sizing test once #203 lands | `crates/core/tests/guest_ram.rs` restates the `.bss` offset | area:loader |
+| proposed | **The kernel half of `WriteWatch`**: arm every taken request, take and protect under the fault path's lock, range-wide invalidation, a cancel path | #197 documents the two promises the kernel must keep | area:kernel, M3 |
+| proposed | **The `RawView` host-access type** in the memory crate | `GpuMemory::view` waits on it; needs `unsafe` and volatile or atomic accessors | area:memory, M3 |
+| proposed | **G16/G17 caches re-read a range on first use after arming; G22 takes `GpuMemory::generation` from `Translate::generation`** | Review notes on #197 | area:gpu, M3 |
+| proposed (fold into the decoder slice issues 6a–6i) | **Shader decoder follow-ups**: fp16 swizzle and source-2 modifier bits; uniform ALU forms; encodings for JMX, UP2UR and BPT; owners for IMAD.HI, ERRBAR, ATOMS.POPC and BCLEAR; the shared bit-91 list in the framework tests | Review notes on #201 | area:shader, M3 |
+| proposed | **`docs/architecture.md`'s walking-skeleton paragraph** names `System::from_nup` and NUP titles | Skipped in #173 as outside its files | docs |
