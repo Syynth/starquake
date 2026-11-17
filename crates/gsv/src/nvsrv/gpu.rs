@@ -1,0 +1,1056 @@
+//! `/dev/nvhost-gpu`: GPU channels, their object classes and events, and GPFIFO submission, with
+//! a deferred reply when the GPU's queue for the channel is full
+//! (`docs/specs/graphics-server.md`, "Channels and submission: nvsrv" and decision 12; port
+//! slice 11).
+//!
+//! * [`submits`]: the submissions that wait for room in gsv's shared state, and their snapshot.
+//!
+//! Ported from Eden (GPL-3.0-or-later) @ cf654052,
+//! `eden/src/core/hle/service/nvdrv/devices/nvhost_gpu.cpp` and `nvhost_gpu.h` (`Ioctl1`,
+//! `Ioctl2`, `AllocGPFIFOEx2`, `AllocateObjectContext`, `GetObjectContextClassNumberIndex`,
+//! `SubmitGPFIFOImpl`, `SubmitGPFIFOBase1`, `SubmitGPFIFOBase2`, `QueryEvent`, the argument
+//! structs) and `nvdata.h` (`NvFence`), with Eden-NX2's Switch 2 changes (GPL-3.0-or-later,
+//! Copyright 2026 Eden Emulator Project) @ 50fa86bb,
+//! `eden-nx2/src/core/hle/service/nvdrv/devices/nvhost_gpu.cpp` (the Ampere and class-0 mapping
+//! in `AllocateObjectContext`, `BuildIncrementCountCommandList`, `QueryEvent`'s extra events),
+//! and Eden PR #4588's readings (GPL-3.0-or-later) @ e5fb3b97,
+//! `eden-pr4588/src/core/hle/service/nvdrv/devices/nvhost_gpu.cpp` (`QueryEvent`'s event 7,
+//! `GetNativeGpuContextSlot` in `native_gpu_context.h`). "Row N" is a row of
+//! `eden-nx2/NX2_NOTES.md` @ 50fa86bb: rows 26 (channel setup: Ampere and class-0 objects), 31
+//! (the Ampere classes C797, C7C0, C7B5 and class 0 bound), 32 (NVN2 sets bit 8 and expects the
+//! increments though its commands hold none) and 34 (a per-channel event, `QueryEvent` 7), all
+//! observed. libnx (`libnx/nx/source/nvidia/ioctl/nvchannel.c` @ b156b477) sends the same
+//! numbers: `_NV_IOWR(0x48, 0x08, ..)` with the entries after the struct, `nvIoctl2` with
+//! `_NV_IOWR(0x48, 0x1B, ..)` and the entries inline, `_NV_IOWR(0x48, 0x09, ..)` and
+//! `_NV_IOWR(0x48, 0x1A, ..)`.
+//!
+//! # The channel
+//!
+//! Each nvhost-gpu fd is one channel, as each Eden `nvhost_gpu` device is (one per `Open`). Its
+//! state ([`Channel`]) is made by its first ioctl or event query and goes when its fd closes:
+//!
+//! - its **syncpoint**, allocated by `AllocGPFIFOEx2` from gsv's `Syncpoints` (the spec:
+//!   "Channel creation (`AllocGPFIFOEx2`) allocates a syncpoint"; Eden allocates it when the fd
+//!   opens, a listed divergence) and freed when the fd closes;
+//! - its **address space**, which nvhost-as-gpu's `BindChannel` binds it to
+//!   ([`super::as_gpu`]: the binding holds the space);
+//! - its **GPU channel** ([`ChannelFront::create_channel`]), made once it has both, at
+//!   `AllocGPFIFOEx2` if the channel is bound by then, otherwise at its first submission, as
+//!   Eden's `SubmitGPFIFOImpl` initialises a channel lazily ("Lazily initialize channel when
+//!   address space is available"); destroyed when the fd closes;
+//! - its **object classes** (`AllocObjCtx`), one per engine slot, each given to the GPU channel
+//!   as it is bound, or in the order bound when the GPU channel is made;
+//! - its **events** for `QueryEvent`.
+//!
+//! # The ioctls
+//!
+//! Group `'H'` ([`GROUP`]); each argument a fixed struct ([`super::ioctl::Fixed`]), given back
+//! whole whatever the result, every field the ioctl does not set as the caller sent it
+//! (`WrapFixed`, `WrapFixedVariable`, `WrapFixedInlIn`).
+//!
+//! | Variant | Cmd | Ioctl | Argument (offset: field) |
+//! |---|---|---|---|
+//! | `Ioctl` | 0x1A | `AllocGPFIFOEx2` | 0: entries, 4: jobs, 8: flags, 12: fence out (`s32` id, 16: `u32` value), 20: three reserved words |
+//! | `Ioctl` | 0x9 | `AllocObjCtx` | 0: class, 4: flags, 8: object id (`u64`) |
+//! | `Ioctl` | 0x8 | `SubmitGPFIFO` | 0: address (`u64`, not read), 8: entry count, 12: flags, 16: fence (`s32` id, 20: `u32` value); the entries after the struct, 8 bytes each |
+//! | `Ioctl2` | 0x1B | `SubmitGPFIFO` (libnx `KickoffPb`) | as 0x8, the entries in the inline input (in buffer 1) |
+//!
+//! Every other number, and `Ioctl3`, goes to the server's unknown-ioctl policy (see "Not built").
+//!
+//! **`AllocGPFIFOEx2`**, the first failing check answering: the channel has a syncpoint already,
+//! `AlreadyAllocated` (Eden: `channel_state->initialized`); no syncpoint is free,
+//! `InsufficientMemory` (a guess: Eden's allocator asserts); the channel is bound and the GPU
+//! refuses a channel, `InsufficientMemory` (a guess), and the syncpoint is freed again. Then the
+//! fence out is the syncpoint and its maximum (`GetSyncpointFence`). Nothing else is read.
+//!
+//! **`AllocObjCtx`** (NX2's, row 26): non-zero flags are logged and given back as 0 (Eden:
+//! `params.flags = allowed_mask`). The class is mapped onto Eden's engine slots ([`slot_class`]:
+//! the Ampere, Turing and Volta classes onto the Maxwell ones; class 0 onto the first free of
+//! 3D, compute, copy, 2D and inline-to-memory), and the mapped class is what comes back. Then: a
+//! class with no slot, `BadParameter`; a slot taken, `AlreadyAllocated`; the GPU refusing the
+//! class on a channel already made, `BadParameter` (a guess: Eden cannot refuse), and nothing
+//! recorded. The GPU is given the class as the caller sent it (the spec: "binding an object class
+//! goes to the front unchanged"), class 0 as the class it was mapped onto.
+//!
+//! **`SubmitGPFIFO`**, the steps in order (Eden `SubmitGPFIFOBase1`, `SubmitGPFIFOBase2`,
+//! `SubmitGPFIFOImpl`; the spec's steps 1 to 4); the first failing check answers, and nothing
+//! changes:
+//!
+//! 1. the count above the entries the request carries (whole 8-byte entries after the struct for
+//!    0x8, in the inline input for 0x1B): `InvalidSize` (Eden: `params.num_entries >
+//!    commands.size()`);
+//! 2. the count above [`CHANNEL_QUEUE_ENTRIES`]: `InvalidSize` (starquake's: such a submission
+//!    could never be queued);
+//! 3. flags bit 0 and bit 8 together: `BadParameter` (Eden: `fence_wait` with
+//!    `increment_value`);
+//! 4. the increment overflows 32 bits: `BadParameter` (starquake's, below);
+//! 5. bit 0 with a wait fence whose id is not a syncpoint: `BadParameter` (starquake's: Eden
+//!    indexes its table with it);
+//! 6. the channel has no syncpoint, or no GPU channel and no address space to make one in:
+//!    `InvalidState` (starquake's: Eden submits to a channel it never initialised); the GPU
+//!    refusing the channel made now: `InsufficientMemory` (a guess).
+//!
+//! Then the fence ([`plan`]): the increment is 2 if bit 1 ([`FENCE_INCREMENT`]) plus the fence
+//! value if bit 8 ([`INCREMENT_VALUE`]); the channel syncpoint's maximum is raised by it, and the
+//! fence given back is (the channel's syncpoint, the new maximum), the flags word 0 (Eden:
+//! `flags.raw = 0`). The GPU front is handed one [`Submission`]: the entries as sent, the wait
+//! fence if bit 0 ([`FENCE_WAIT`]), the increment as the number of increments it appends after
+//! them (row 32), and the wait-for-idle flag, set unless bit 4 ([`SUPPRESS_WFI`]). The reply does
+//! not wait for the GPU.
+//!
+//! **A full queue** (decision 12). If the front answers [`Submitted::Full`], or submissions of
+//! the channel wait already (so this one cannot pass them), the request takes a reply token and
+//! its submission waits in gsv's shared state ([`submits::Submits`]); the argument with its fence
+//! is written to the caller's out buffer at once, and only the result word waits. When the
+//! front reports room (`GpuCompletion::GpuQueueRoom`), the timer thread's drain gives the
+//! channel's waiting submissions to the front again, oldest first, and completes the reply of
+//! each one queued, until the front answers `Full` again. Entries reach the front in the order
+//! the submissions came, whether they waited or not.
+//!
+//! # Events
+//!
+//! `QueryEvent` on an nvhost-gpu fd answers ids 1 (SM exception breakpoint interrupt), 2 (SM
+//! exception breakpoint pause) and 3 (error notifier), Eden's, and 7, PR's, which is the error
+//! notifier's event too (PR: "The native SDK requests this event immediately before configuring
+//! `CHANNEL_SET_ERROR_NOTIFIER`"; row 34: NVN asks for 7). Each is made the first time it is asked
+//! for and copied out with `Success`; any other id answers `BadParameter`, Eden's answer for an
+//! event the device does not have. Nothing signals them yet: channel errors are #12's
+//! (`GpuFront::channel_error`), not built here.
+//!
+//! # Conflicts
+//!
+//! Each is picked by the house rule of decision 8 and pinned by the test named, in
+//! `gpu/tests.rs`. The spec's verification item 1 does not list them yet; the open question
+//! with each settles it.
+//!
+//! - **The class `AllocObjCtx` gives back.** NX2 gives back the Maxwell class it mapped onto
+//!   (`params.class_num = mapped`); PR gives back the class as sent. NX2's is used, the one a
+//!   title ran on (row 26). Open question: does NvRm read the class back?
+//!   (`alloc_obj_ctx_gives_back_the_mapped_class`.)
+//! - **Which classes `AllocObjCtx` takes.** PR takes C797, C7C0, C7B5 and C56F; NX2 also the
+//!   Turing and Volta classes, C76F and class 0. NX2's, the larger
+//!   (`every_mapped_class_is_taken_and_others_refused`).
+//! - **Event ids.** NX2 makes an event for every id it is asked; PR answers 1, 2, 3 and 7. PR's,
+//!   because NX2's grows without bound with the ids a title sends (a listed divergence too).
+//!   Open question: does NvRm ask for any id besides 7? (`events_1_2_3_and_7_are_answered`.)
+//! - **Increments past 64.** PR refuses a native submission whose bit-8 value is above 64; NX2
+//!   takes any. NX2's, the larger (`a_large_increment_value_is_taken`).
+//!
+//! # Where this differs from the references
+//!
+//! Each row is pinned by the test named, in `gpu/tests.rs`:
+//!
+//! | Case | Eden (and NX2, PR) | Here |
+//! |---|---|---|
+//! | When the syncpoint is allocated | when the fd opens | at `AllocGPFIFOEx2`, as the spec says (`the_syncpoint_comes_with_alloc_gpfifo_ex2`) |
+//! | A second `AllocGPFIFOEx2` before the channel is bound | succeeds again | `AlreadyAllocated` (`a_second_alloc_gpfifo_ex2_is_already_allocated`) |
+//! | Bits 1 and 8 together | the maximum raised by 2 plus the value, but only 2 increments pushed (NX2 appends its count only without bit 1) | the front is asked for all of them, so the fence is reached (`fence_arithmetic_for_every_flag_combination`) |
+//! | An increment past `u32::MAX` | wraps | `BadParameter` (`an_overflowing_increment_is_refused`) |
+//! | A wait fence on a reached syncpoint | no wait pushed | the wait goes to the front, which checks it (`fence_arithmetic_for_every_flag_combination`) |
+//! | A wait fence id that is not a syncpoint | out-of-range table access | `BadParameter` (`a_wait_on_no_syncpoint_is_refused`) |
+//! | A submission before `AllocGPFIFOEx2`, or unbound | pushed to an uninitialised channel | `InvalidState` (`a_submission_needs_a_syncpoint_and_a_space`) |
+//! | More entries than [`CHANNEL_QUEUE_ENTRIES`] in one submission | taken | `InvalidSize` (`a_submission_larger_than_a_queue_is_refused`) |
+//! | A full queue | no queue bound | the reply waits for room (`a_full_queue_defers_and_room_completes`) |
+//! | The out buffer of a submission that waits | written when the ioctl returns | written at once, before the reply (`a_waiting_submission_writes_its_fence_at_once`) |
+//! | Closing a channel whose submissions wait | not possible: Eden never waits | each waiting reply answers `NotImplemented`, as a request on a closed fd does; the out buffer keeps the fence (`closing_a_channel_answers_its_waiting_submissions`) |
+//! | `QueryEvent` with any other id | NX2: a new event | `BadParameter` (`events_1_2_3_and_7_are_answered`) |
+//! | `SubmitGPFIFO` 0x1B on `Ioctl` (entries read from the guest's memory at the struct's address) | served | not served: the unknown-ioctl policy (`submissions_from_memory_go_to_the_policy`) |
+//!
+//! # What is recorded and what is saved
+//!
+//! Every request is one IPC event, recorded by the service framework with its payload (the
+//! entries included: spec, "Submitted GPFIFO entries are part of the IPC payload"); a waiting
+//! reply is recorded when it is delivered. The front's `GpuQueueRoom` comes back as a
+//! `QueueRoom` note the drain records before it acts on it, so what waits and what is queued is
+//! a function of the recorded requests and notes in their order.
+//!
+//! The channels ([`NvhostGpu`]) are plain data saved with the nvsrv state: per fd the syncpoint,
+//! the GPU channel and the space it was made in, the classes and the events, checked on restore
+//! ([`GpuStateError`], and against the open files and the bindings by
+//! [`super::NvsrvStateError`]). The waiting submissions are saved with gsv's shared state by
+//! their own snapshot ([`submits`]), as ids (spec: "outstanding tickets and deferred replies, as
+//! ids").
+//!
+//! Not checked here, but by [`NvhostGpu::check_syncpoints`] when a restore composes nvsrv's state
+//! with the restored `Syncpoints`: that each channel's syncpoint is allocated. Not checked at all
+//! yet: that the GPU channels exist on the restored front (the front's engine state is #12's;
+//! the wiring slice, 16, makes them again), that an event is one the kernel holds, and that a
+//! waiting submission's channel is a channel of the restored nvsrv state.
+//!
+//! # Not built
+//!
+//! The rest of Eden's nvhost-gpu: `SetNVMAPfd` (0x1), `ChannelSetTimeout` (0x3), `ZCullBind`
+//! (0xB), `SetErrorNotifier` (0xC), `SetChannelPriority` (0xD), `AllocGPFIFOEx` (0x18),
+//! `ChannelSetTimeslice` (0x1D), `GetWaitbase` (group 0, 0x3), `SetClientData` and
+//! `GetClientData` ('G' 0x14, 0x15), PR's `SetPreemptionModes` (0x1F), the ioctls row 26 names
+//! (0x1F, 0x20), and 0x1B on `Ioctl`. They go to the unknown-ioctl policy until a title needs
+//! one. What binding a channel to a timeslice group does to the channel (PR hands it the group's
+//! macro context) is engine state, #12's.
+
+pub mod submits;
+
+#[cfg(test)]
+mod tests;
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use serde::{Deserialize, Serialize};
+use starquake_gpu::classes::{cl902d, cla140, clc76f, clc797, clc7b5, clc7c0};
+use starquake_gpu::fifo::GP_ENTRY_BYTES;
+use starquake_gpu::interface::{ChannelId, Fence, SyncpointId};
+use starquake_gpu::syncpoint::{FIRST_ALLOCATABLE, RESERVED_SYNCPOINTS, Syncpoints};
+use starquake_kernel::id::ObjectId;
+
+use super::as_gpu::AsGpu;
+use super::ioctl::{Fixed, Ioctl};
+use super::{IoctlAnswer, IoctlCall, IoctlVariant, NvResult};
+use crate::gpu::AsId;
+use submits::Submits;
+
+/// nvhost-gpu's ioctl group, `'H'` (`nvhost_gpu::Ioctl1`: `case 'H':`).
+pub const GROUP: u32 = 0x48;
+
+/// nvhost-gpu's commands in the group (`nvhost_gpu::Ioctl1` and `Ioctl2`).
+pub mod command {
+    /// `SubmitGPFIFO` with the entries after the struct (`case 0x8:`, `SubmitGPFIFOBase1`).
+    pub const SUBMIT_GPFIFO: u32 = 0x8;
+    /// `AllocObjCtx` (`case 0x9:`, `AllocateObjectContext`).
+    pub const ALLOC_OBJ_CTX: u32 = 0x9;
+    /// `AllocGPFIFOEx2` (`case 0x1a:`).
+    pub const ALLOC_GPFIFO_EX2: u32 = 0x1A;
+    /// `SubmitGPFIFO` with the entries inline, on `Ioctl2` (`case 0x1b:`, `SubmitGPFIFOBase2`;
+    /// libnx `nvioctlChannel_KickoffPb`).
+    pub const SUBMIT_GPFIFO_INLINE: u32 = 0x1B;
+}
+
+/// Where each field of each argument struct is, and each struct's size (`nvhost_gpu.h`:
+/// `IoctlAllocGpfifoEx`, `IoctlAllocObjCtx`, `IoctlSubmitGpfifo` and their `static_assert`ed
+/// sizes; `nvdata.h`: `NvFence { s32 id; u32 value; }`; little-endian `u32`s unless noted).
+pub mod layout {
+    /// `IoctlAllocGpfifoEx`: 32 bytes.
+    pub const ALLOC_GPFIFO_BYTES: usize = 32;
+    /// `num_entries`.
+    pub const ALLOC_NUM_ENTRIES: usize = 0;
+    /// `num_jobs`.
+    pub const ALLOC_NUM_JOBS: usize = 4;
+    /// `flags`.
+    pub const ALLOC_FLAGS: usize = 8;
+    /// `fence_out.id`, an `s32`.
+    pub const ALLOC_FENCE_ID: usize = 12;
+    /// `fence_out.value`.
+    pub const ALLOC_FENCE_VALUE: usize = 16;
+    /// `reserved`, three words.
+    pub const ALLOC_RESERVED: usize = 20;
+
+    /// `IoctlAllocObjCtx`: 16 bytes.
+    pub const OBJ_CTX_BYTES: usize = 16;
+    /// `class_num`.
+    pub const OBJ_CLASS: usize = 0;
+    /// `flags`.
+    pub const OBJ_FLAGS: usize = 4;
+    /// `obj_id`, a `u64` nothing reads.
+    pub const OBJ_ID: usize = 8;
+
+    /// `IoctlSubmitGpfifo`: 24 bytes (`16 + sizeof(NvFence)`).
+    pub const SUBMIT_BYTES: usize = 24;
+    /// `address`, a `u64` nothing reads here.
+    pub const SUBMIT_ADDRESS: usize = 0;
+    /// `num_entries`.
+    pub const SUBMIT_NUM_ENTRIES: usize = 8;
+    /// `flags`.
+    pub const SUBMIT_FLAGS: usize = 12;
+    /// `fence.id`, an `s32`.
+    pub const SUBMIT_FENCE_ID: usize = 16;
+    /// `fence.value`.
+    pub const SUBMIT_FENCE_VALUE: usize = 20;
+}
+
+use layout::{
+    ALLOC_FENCE_ID, ALLOC_FENCE_VALUE, ALLOC_GPFIFO_BYTES, OBJ_CLASS, OBJ_CTX_BYTES, OBJ_FLAGS,
+    SUBMIT_BYTES, SUBMIT_FENCE_ID, SUBMIT_FENCE_VALUE, SUBMIT_FLAGS, SUBMIT_NUM_ENTRIES,
+};
+
+/// `SubmitGPFIFO` flag bit 0: wait on the given fence first (`BitField<0, 1> fence_wait`).
+pub const FENCE_WAIT: u32 = 1 << 0;
+/// Bit 1: increment the channel's syncpoint by [`FENCE_INCREMENT_AMOUNT`] at the end
+/// (`BitField<1, 1> fence_increment`).
+pub const FENCE_INCREMENT: u32 = 1 << 1;
+/// Bit 2: the new hardware format (`BitField<2, 1> new_hw_format`, "mostly ignored"): read by
+/// nothing, here as in Eden's `SubmitGPFIFOImpl`.
+pub const NEW_HW_FORMAT: u32 = 1 << 2;
+/// Bit 4: skip the wait-for-idle (`BitField<4, 1> suppress_wfi`).
+pub const SUPPRESS_WFI: u32 = 1 << 4;
+/// Bit 8: increment the channel's syncpoint by the fence's value (`BitField<8, 1>
+/// increment_value`).
+pub const INCREMENT_VALUE: u32 = 1 << 8;
+
+/// What bit 1 adds to the increment (`SubmitGPFIFOImpl`: `fence_increment ? 2 : 0`;
+/// `BuildIncrementCommandList` pushes two increments).
+pub const FENCE_INCREMENT_AMOUNT: u32 = 2;
+
+/// The most GP entries a channel's submission queue holds (decided by the owner, decision 12;
+/// gpu-protocol, "Back-pressure", where the figure is a **guess** at a size no title reaches).
+/// The front enforces it ([`Submitted::Full`]); gsv refuses a single submission larger than it,
+/// which could never be queued. Shared with `crates/gpu` when its front defines it.
+pub const CHANNEL_QUEUE_ENTRIES: usize = 65_536;
+
+/// The most bytes of GP entries a submission's request is read for: [`CHANNEL_QUEUE_ENTRIES`]
+/// entries. The inline input of `SubmitGPFIFO` 0x1B is read up to this.
+pub const MAX_ENTRY_BYTES: usize = CHANNEL_QUEUE_ENTRIES * GP_ENTRY_BYTES;
+
+/// One GP entry as the guest wrote it: 8 bytes, little-endian (graphics-server's `GpfifoEntry`;
+/// `starquake_gpu::fifo::GpEntry::from_raw` decodes it). Kept raw so that a submission is saved
+/// and handed on exactly as sent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct GpfifoEntry(pub u64);
+
+/// What gsv hands the GPU front for one `SubmitGPFIFO` (graphics-server's `Submission`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Submission {
+    /// The entries, in order.
+    pub entries: Vec<GpfifoEntry>,
+    /// The fence to wait on first (flag bit 0).
+    pub wait: Option<Fence>,
+    /// How many increments of the channel's syncpoint to perform after the entries.
+    pub increments: u32,
+    /// Whether to wait for idle before the increments (flag bit 4 clear).
+    pub wfi: bool,
+}
+
+/// What [`ChannelFront::submit`] answers (graphics-server's `Submitted`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Submitted {
+    /// The submission is in the channel's queue.
+    Queued,
+    /// The channel's queue cannot take it; nothing was queued, and `GpuQueueRoom` follows once
+    /// there is room.
+    Full,
+}
+
+/// What a GPU channel is made with (graphics-server's `ChannelConfig`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChannelConfig {
+    /// The address space its addresses resolve in.
+    pub space: AsId,
+    /// The syncpoint its increments go to.
+    pub syncpoint: SyncpointId,
+}
+
+/// The GPU front refused a request (graphics-server's `GpuError`; what it holds is #12's).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("the GPU front refused the request")]
+pub struct GpuError;
+
+/// What gsv asks of the GPU's front for channels: the part of the spec's `GpuFront` this slice
+/// uses, with the spec's names and signatures (graphics-server, "What this spec offers and
+/// assumes of the GPU front/back"). `crates/gpu` does not define `GpuFront` yet; when it does,
+/// it implements this, or this becomes part of it, with [`crate::gpu::GpuVmFront`].
+///
+/// Called with gsv's shared lock held: an implementation must not block on the GPU or call into
+/// gsv (it reports only through `Completions::push`).
+pub trait ChannelFront: Send + Sync {
+    /// A new channel in `config`'s address space, incrementing `config`'s syncpoint.
+    fn create_channel(&self, config: ChannelConfig) -> Result<ChannelId, GpuError>;
+
+    /// Binds object class `class` on `channel`.
+    fn bind_class(&self, channel: ChannelId, class: u32) -> Result<(), GpuError>;
+
+    /// Queues `submission` on `channel`, or answers [`Submitted::Full`] and queues nothing.
+    fn submit(&self, channel: ChannelId, submission: Submission) -> Submitted;
+
+    /// Destroys `channel`.
+    fn destroy_channel(&self, channel: ChannelId);
+}
+
+/// Eden's object-context classes (`nvhost_gpu.h`: `enum class CtxClasses`), the Maxwell engine
+/// slots NX2 maps the Switch 2 classes onto.
+pub mod class {
+    /// `Ctx2D = 0x902D`.
+    pub const CTX_2D: u32 = super::cl902d::CLASS;
+    /// `Ctx3D = 0xB197`.
+    pub const CTX_3D: u32 = 0xB197;
+    /// `CtxCompute = 0xB1C0`.
+    pub const CTX_COMPUTE: u32 = 0xB1C0;
+    /// `CtxKepler = 0xA140` (inline to memory).
+    pub const CTX_KEPLER: u32 = super::cla140::CLASS;
+    /// `CtxDMA = 0xB0B5` (copy).
+    pub const CTX_DMA: u32 = 0xB0B5;
+    /// `CtxChannelGPFIFO = 0xB06F`.
+    pub const CTX_CHANNEL_GPFIFO: u32 = 0xB06F;
+
+    /// The slots in Eden's order (`GetObjectContextClassNumberIndex`: 2D 0, 3D 1, compute 2,
+    /// Kepler 3, DMA 4, GPFIFO 5).
+    pub const SLOTS: [u32; 6] = [
+        CTX_2D,
+        CTX_3D,
+        CTX_COMPUTE,
+        CTX_KEPLER,
+        CTX_DMA,
+        CTX_CHANNEL_GPFIFO,
+    ];
+
+    /// The slots class 0 may fill, in NX2's order (`for (const auto candidate : {Ctx3D,
+    /// CtxCompute, CtxDMA, Ctx2D, CtxKepler})`).
+    pub const ZERO_CANDIDATES: [u32; 5] = [CTX_3D, CTX_COMPUTE, CTX_DMA, CTX_2D, CTX_KEPLER];
+
+    /// What NX2 maps onto 3D: `0xC797` (row 31), `0xC697`, `0xC597`.
+    pub const ON_3D: [u32; 3] = [super::clc797::CLASS, 0xC697, 0xC597];
+    /// What NX2 maps onto compute: `0xC7C0` (row 31), `0xC6C0`, `0xC5C0`.
+    pub const ON_COMPUTE: [u32; 3] = [super::clc7c0::CLASS, 0xC6C0, 0xC5C0];
+    /// What NX2 maps onto copy: `0xC7B5` (row 31), `0xC6B5`, `0xC5B5`.
+    pub const ON_DMA: [u32; 3] = [super::clc7b5::CLASS, 0xC6B5, 0xC5B5];
+    /// What NX2 maps onto the GPFIFO slot: `0xC56F`, `0xC76F`.
+    pub const ON_GPFIFO: [u32; 2] = [0xC56F, super::clc76f::CLASS];
+}
+
+/// The number of engine slots ([`class::SLOTS`]).
+pub const CLASS_SLOTS: usize = class::SLOTS.len();
+
+/// The Maxwell class `requested` is mapped onto (NX2's `AllocateObjectContext` switch), or
+/// itself; class 0 is not mapped here ([`resolve_class`]).
+#[must_use]
+pub fn slot_class(requested: u32) -> u32 {
+    if class::ON_3D.contains(&requested) {
+        class::CTX_3D
+    } else if class::ON_COMPUTE.contains(&requested) {
+        class::CTX_COMPUTE
+    } else if class::ON_DMA.contains(&requested) {
+        class::CTX_DMA
+    } else if class::ON_GPFIFO.contains(&requested) {
+        class::CTX_CHANNEL_GPFIFO
+    } else {
+        requested
+    }
+}
+
+/// The engine slot of a mapped class (`GetObjectContextClassNumberIndex`), or `None` (Eden's
+/// `-1`).
+#[must_use]
+pub fn slot_of(mapped: u32) -> Option<usize> {
+    class::SLOTS.iter().position(|&slot| slot == mapped)
+}
+
+/// The class `requested` is mapped onto when `taken` slots are taken: [`slot_class`], or for
+/// class 0 the first of [`class::ZERO_CANDIDATES`] whose slot is free, or 0 if none is.
+#[must_use]
+pub fn resolve_class(requested: u32, taken: &[usize]) -> u32 {
+    if requested != 0 {
+        return slot_class(requested);
+    }
+    class::ZERO_CANDIDATES
+        .into_iter()
+        .find(|&candidate| slot_of(candidate).is_some_and(|slot| !taken.contains(&slot)))
+        .unwrap_or(0)
+}
+
+/// What a submission's flags and fence value make of it (module docs, "The ioctls"): whether it
+/// waits, how many increments follow it, and whether a wait-for-idle comes before them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Plan {
+    /// Flag bit 0: wait on the given fence first.
+    pub wait: bool,
+    /// The increment of the channel's syncpoint.
+    pub increments: u32,
+    /// Wait for idle first: flag bit 4 clear.
+    pub wfi: bool,
+}
+
+/// The plan of a submission with `flags` and fence value `value`, or `BadParameter` for bits 0
+/// and 8 together and for an increment past `u32::MAX`, in that order (module docs, "The ioctls",
+/// checks 3 and 4).
+pub fn plan(flags: u32, value: u32) -> Result<Plan, NvResult> {
+    let wait = flags & FENCE_WAIT != 0;
+    let by_value = flags & INCREMENT_VALUE != 0;
+    if wait && by_value {
+        return Err(NvResult::BadParameter);
+    }
+    let fixed = if flags & FENCE_INCREMENT == 0 {
+        0
+    } else {
+        FENCE_INCREMENT_AMOUNT
+    };
+    let increments = fixed
+        .checked_add(if by_value { value } else { 0 })
+        .ok_or(NvResult::BadParameter)?;
+    Ok(Plan {
+        wait,
+        increments,
+        wfi: flags & SUPPRESS_WFI == 0,
+    })
+}
+
+/// The events `QueryEvent` answers on an nvhost-gpu fd (module docs, "Events").
+pub mod event {
+    /// SM exception breakpoint interrupt (Eden `QueryEvent`: `case 1`).
+    pub const SM_EXCEPTION_INT: u32 = 1;
+    /// SM exception breakpoint pause (`case 2`).
+    pub const SM_EXCEPTION_PAUSE: u32 = 2;
+    /// Error notifier (`case 3`).
+    pub const ERROR_NOTIFIER: u32 = 3;
+    /// PR's `case 7`: the error notifier's event.
+    pub const NATIVE_ERROR: u32 = 7;
+}
+
+/// How many distinct events a channel has: 1, 2 and 3 (7 is 3's).
+pub const EVENT_SLOTS: usize = 3;
+
+/// The slot of event `id`, or `None` for an id the device has no event for.
+#[must_use]
+pub const fn event_slot(id: u32) -> Option<usize> {
+    match id {
+        event::SM_EXCEPTION_INT => Some(0),
+        event::SM_EXCEPTION_PAUSE => Some(1),
+        event::ERROR_NOTIFIER | event::NATIVE_ERROR => Some(2),
+        _ => None,
+    }
+}
+
+/// A channel's GPU channel, once made, and the address space it was made in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Made {
+    /// The front's channel id.
+    pub channel: u32,
+    /// The address space.
+    pub space: AsId,
+}
+
+/// One nvhost-gpu fd's channel (module docs, "The channel").
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Channel {
+    /// The syncpoint `AllocGPFIFOEx2` allocated.
+    pub syncpoint: Option<u8>,
+    /// The GPU channel, once made.
+    pub made: Option<Made>,
+    /// The classes given to the GPU, in the order `AllocObjCtx` bound them, one per slot.
+    pub classes: Vec<u32>,
+    /// The events made so far, by slot ([`event_slot`]).
+    pub events: [Option<ObjectId>; EVENT_SLOTS],
+}
+
+impl Channel {
+    /// The slots its classes take.
+    fn slots(&self) -> Vec<usize> {
+        self.classes
+            .iter()
+            .filter_map(|&class| slot_of(resolve_class(class, &[])))
+            .collect()
+    }
+
+    /// Its syncpoint, if it has one.
+    fn syncpoint_id(&self) -> Option<SyncpointId> {
+        self.syncpoint.and_then(SyncpointId::new)
+    }
+}
+
+/// Whether `id` is one `Syncpoints::allocate` can hand out: from [`FIRST_ALLOCATABLE`] up, below
+/// the count, not reserved.
+fn allocatable(id: u8) -> bool {
+    id >= FIRST_ALLOCATABLE && SyncpointId::new(id).is_some() && !RESERVED_SYNCPOINTS.contains(&id)
+}
+
+/// Every nvhost-gpu fd's channel. Plain data, saved with the nvsrv state; deserialising goes
+/// through `SavedNvhostGpu`, which refuses a state the ioctls cannot reach ([`GpuStateError`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "SavedNvhostGpu")]
+pub struct NvhostGpu {
+    channels: BTreeMap<u32, Channel>,
+}
+
+/// The serialised form of [`NvhostGpu`].
+#[derive(Deserialize)]
+struct SavedNvhostGpu {
+    channels: BTreeMap<u32, Channel>,
+}
+
+/// Why a saved [`NvhostGpu`] could not be read back. Deserialising checks, in this order, the
+/// first that fails reported: each channel's syncpoint (fd order), then its GPU channel, then its
+/// classes; then that no two channels share a syncpoint, then that no two share a GPU channel.
+/// [`NvhostGpu::check_syncpoints`] checks the last against the restored syncpoints.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum GpuStateError {
+    /// A syncpoint `AllocGPFIFOEx2` cannot hand out.
+    #[error("channel fd {fd} has syncpoint {id}, which a channel cannot be given")]
+    Syncpoint {
+        /// The channel's fd.
+        fd: u32,
+        /// The syncpoint.
+        id: u8,
+    },
+    /// A GPU channel made with no syncpoint.
+    #[error("channel fd {fd} has a GPU channel but no syncpoint")]
+    MadeWithoutSyncpoint {
+        /// The channel's fd.
+        fd: u32,
+    },
+    /// A class `AllocObjCtx` does not bind, or two classes on one slot, or more than the slots.
+    #[error("channel fd {fd} has class {class:#x}, which it cannot have")]
+    Class {
+        /// The channel's fd.
+        fd: u32,
+        /// The class.
+        class: u32,
+    },
+    /// Two channels with one syncpoint.
+    #[error("channel fds {first} and {second} share syncpoint {id}")]
+    SharedSyncpoint {
+        /// The lower fd.
+        first: u32,
+        /// The higher fd.
+        second: u32,
+        /// The syncpoint.
+        id: u8,
+    },
+    /// Two channels with one GPU channel.
+    #[error("channel fds {first} and {second} share GPU channel {channel}")]
+    SharedChannel {
+        /// The lower fd.
+        first: u32,
+        /// The higher fd.
+        second: u32,
+        /// The GPU channel.
+        channel: u32,
+    },
+    /// A channel's syncpoint the restored syncpoints do not have allocated
+    /// ([`NvhostGpu::check_syncpoints`]).
+    #[error("channel fd {fd} has syncpoint {id}, which is not allocated")]
+    SyncpointNotAllocated {
+        /// The channel's fd.
+        fd: u32,
+        /// The syncpoint.
+        id: u8,
+    },
+}
+
+impl TryFrom<SavedNvhostGpu> for NvhostGpu {
+    type Error = GpuStateError;
+
+    fn try_from(saved: SavedNvhostGpu) -> Result<Self, Self::Error> {
+        let SavedNvhostGpu { channels } = saved;
+        for (&fd, channel) in &channels {
+            if let Some(id) = channel.syncpoint
+                && !allocatable(id)
+            {
+                return Err(GpuStateError::Syncpoint { fd, id });
+            }
+            if channel.made.is_some() && channel.syncpoint.is_none() {
+                return Err(GpuStateError::MadeWithoutSyncpoint { fd });
+            }
+            let mut slots = Vec::new();
+            for &class in &channel.classes {
+                let slot = slot_of(resolve_class(class, &[])).filter(|slot| !slots.contains(slot));
+                let Some(slot) = slot.filter(|_| class != 0) else {
+                    return Err(GpuStateError::Class { fd, class });
+                };
+                slots.push(slot);
+            }
+        }
+        let mut syncpoints: BTreeMap<u8, u32> = BTreeMap::new();
+        for (&fd, channel) in &channels {
+            if let Some(id) = channel.syncpoint
+                && let Some(&first) = syncpoints.get(&id)
+            {
+                return Err(GpuStateError::SharedSyncpoint {
+                    first,
+                    second: fd,
+                    id,
+                });
+            }
+            if let Some(id) = channel.syncpoint {
+                syncpoints.insert(id, fd);
+            }
+        }
+        let mut made: BTreeMap<u32, u32> = BTreeMap::new();
+        for (&fd, channel) in &channels {
+            let Some(Made { channel: id, .. }) = channel.made else {
+                continue;
+            };
+            if let Some(&first) = made.get(&id) {
+                return Err(GpuStateError::SharedChannel {
+                    first,
+                    second: fd,
+                    channel: id,
+                });
+            }
+            made.insert(id, fd);
+        }
+        Ok(Self { channels })
+    }
+}
+
+/// What nvhost-gpu reaches beside the nvsrv state: gsv's waiting submissions (under gsv's shared
+/// lock), the syncpoints, the channel front, and where a submission that must wait is handed
+/// back to the caller, which takes its reply token ([`super::NvsrvFamily::ioctl`]).
+pub struct ChannelAccess<'a> {
+    /// The submissions that wait for room.
+    pub submits: &'a mut Submits,
+    /// gsv's syncpoints.
+    pub syncpoints: &'a Syncpoints,
+    /// The channel front.
+    pub front: &'a Arc<dyn ChannelFront>,
+    /// Set by a submission that must wait.
+    pub deferred: &'a mut Option<Deferral>,
+}
+
+/// A submission that must wait for room: its channel and what the front is to be given.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Deferral {
+    /// The GPU channel.
+    pub channel: ChannelId,
+    /// The submission.
+    pub submission: Submission,
+}
+
+/// What `QueryEvent` finds on an nvhost-gpu fd.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Queried {
+    /// The event, made already.
+    Event(ObjectId),
+    /// An event the device has but has not made: make it and [`NvhostGpu::set_event`] it.
+    Make,
+    /// No such event: `BadParameter`.
+    Missing,
+}
+
+/// Where a submission's entries are: the bytes after the struct (`Ioctl`), or the inline input
+/// (`Ioctl2`).
+fn entry_bytes<'a>(call: &IoctlCall<'a>) -> &'a [u8] {
+    match call.variant {
+        IoctlVariant::Ioctl2 => call.inline_input,
+        _ => call.input.get(SUBMIT_BYTES..).unwrap_or_default(),
+    }
+}
+
+/// The whole 8-byte entries in `bytes`.
+fn entries_of(bytes: &[u8]) -> Vec<GpfifoEntry> {
+    bytes
+        .as_chunks::<GP_ENTRY_BYTES>()
+        .0
+        .iter()
+        .map(|entry| GpfifoEntry(u64::from_le_bytes(*entry)))
+        .collect()
+}
+
+impl NvhostGpu {
+    /// No channels.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The channel of fd `fd`, if an ioctl or event query made one.
+    #[must_use]
+    pub fn channel(&self, fd: u32) -> Option<&Channel> {
+        self.channels.get(&fd)
+    }
+
+    /// The channels' fds, in order.
+    pub fn fds(&self) -> impl Iterator<Item = u32> + '_ {
+        self.channels.keys().copied()
+    }
+
+    /// The address space fd `fd`'s GPU channel was made in, if it was made.
+    #[must_use]
+    pub fn made_in(&self, fd: u32) -> Option<AsId> {
+        self.channels.get(&fd)?.made.map(|made| made.space)
+    }
+
+    /// Whether every channel's syncpoint is allocated in `syncpoints`, in fd order, the first
+    /// that is not reported. A restore that composes nvsrv's state with the restored syncpoints
+    /// calls this (module docs, "What is recorded and what is saved").
+    pub fn check_syncpoints(&self, syncpoints: &Syncpoints) -> Result<(), GpuStateError> {
+        for (&fd, channel) in &self.channels {
+            if let Some(id) = channel.syncpoint
+                && !channel
+                    .syncpoint_id()
+                    .is_some_and(|id| syncpoints.is_allocated(id))
+            {
+                return Err(GpuStateError::SyncpointNotAllocated { fd, id });
+            }
+        }
+        Ok(())
+    }
+
+    /// `QueryEvent` of event `id` on fd `fd` (module docs, "Events").
+    #[must_use]
+    pub fn event(&self, fd: u32, id: u32) -> Queried {
+        let Some(slot) = event_slot(id) else {
+            return Queried::Missing;
+        };
+        let made = self
+            .channels
+            .get(&fd)
+            .and_then(|channel| channel.events.get(slot).copied().flatten());
+        made.map_or(Queried::Make, Queried::Event)
+    }
+
+    /// Keeps `event` as fd `fd`'s event `id`, made for a [`Queried::Make`].
+    pub(super) fn set_event(&mut self, fd: u32, id: u32, event: ObjectId) {
+        if let Some(slot) = event_slot(id)
+            && let Some(kept) = self.channels.entry(fd).or_default().events.get_mut(slot)
+        {
+            *kept = Some(event);
+        }
+    }
+
+    /// Fd `fd` was closed: its waiting submissions are answered, its GPU channel destroyed and
+    /// its syncpoint freed, in that order (module docs, "Where this differs"). Without `channels`
+    /// (a server with no channel front) a channel holds only events.
+    pub(super) fn close(&mut self, fd: u32, channels: Option<&mut ChannelAccess<'_>>) {
+        let Some(channel) = self.channels.remove(&fd) else {
+            return;
+        };
+        let Some(access) = channels else {
+            if channel.syncpoint.is_some() {
+                tracing::error!(fd, "nvsrv: a channel with a syncpoint closed with no front");
+            }
+            return;
+        };
+        if let Some(made) = channel.made {
+            let id = ChannelId(made.channel);
+            access.submits.cancel(id);
+            access.front.destroy_channel(id);
+        }
+        if let Some(id) = channel.syncpoint_id()
+            && let Err(error) = access.syncpoints.free(id)
+        {
+            tracing::error!(%error, fd, "nvsrv: a closed channel's syncpoint was not allocated");
+        }
+    }
+
+    /// An ioctl on nvhost-gpu fd `fd`, or `None` for one the device does not know (module docs,
+    /// "The ioctls"). `as_gpu` says which address space the channel is bound to.
+    pub(super) fn ioctl(
+        &mut self,
+        fd: u32,
+        call: &IoctlCall<'_>,
+        as_gpu: &AsGpu,
+        access: &mut ChannelAccess<'_>,
+    ) -> Option<IoctlAnswer> {
+        let ioctl = call.ioctl;
+        if ioctl.group() != GROUP {
+            return None;
+        }
+        match (call.variant, ioctl.command()) {
+            (IoctlVariant::Ioctl, command::ALLOC_GPFIFO_EX2) => {
+                let mut arg = Fixed::<ALLOC_GPFIFO_BYTES>::from_input(call.input);
+                let result = self.alloc_gpfifo(fd, &mut arg, as_gpu, access);
+                Some(IoctlAnswer::with(result, arg.into_output()))
+            }
+            (IoctlVariant::Ioctl, command::ALLOC_OBJ_CTX) => {
+                let mut arg = Fixed::<OBJ_CTX_BYTES>::from_input(call.input);
+                let result = self.alloc_obj_ctx(fd, &mut arg, access);
+                Some(IoctlAnswer::with(result, arg.into_output()))
+            }
+            (IoctlVariant::Ioctl, command::SUBMIT_GPFIFO)
+            | (IoctlVariant::Ioctl2, command::SUBMIT_GPFIFO_INLINE) => {
+                Some(self.submit(fd, call, as_gpu, access))
+            }
+            _ => None,
+        }
+    }
+
+    /// `AllocGPFIFOEx2` (module docs, "The ioctls").
+    fn alloc_gpfifo(
+        &mut self,
+        fd: u32,
+        arg: &mut Fixed<ALLOC_GPFIFO_BYTES>,
+        as_gpu: &AsGpu,
+        access: &mut ChannelAccess<'_>,
+    ) -> NvResult {
+        let mut channel = self.channels.get(&fd).cloned().unwrap_or_default();
+        if channel.syncpoint.is_some() {
+            return NvResult::AlreadyAllocated;
+        }
+        let id = match access.syncpoints.allocate() {
+            Ok(id) => id,
+            Err(error) => {
+                tracing::warn!(%error, fd, "nvsrv: no syncpoint for a channel");
+                return NvResult::InsufficientMemory;
+            }
+        };
+        channel.syncpoint = Some(id.get());
+        if let Some(space) = as_gpu.bound(fd)
+            && let Err(result) = make(&mut channel, space, access)
+        {
+            if let Err(error) = access.syncpoints.free(id) {
+                tracing::error!(%error, fd, "nvsrv: a syncpoint just allocated was not");
+            }
+            return result;
+        }
+        let Ok(fence) = access.syncpoints.fence(id) else {
+            // `allocate` just handed it out.
+            return NvResult::InvalidState;
+        };
+        arg.set_u32::<ALLOC_FENCE_ID>(u32::from(id.get()));
+        arg.set_u32::<ALLOC_FENCE_VALUE>(fence.value);
+        self.channels.insert(fd, channel);
+        NvResult::Success
+    }
+
+    /// `AllocObjCtx` (module docs, "The ioctls").
+    fn alloc_obj_ctx(
+        &mut self,
+        fd: u32,
+        arg: &mut Fixed<OBJ_CTX_BYTES>,
+        access: &ChannelAccess<'_>,
+    ) -> NvResult {
+        let requested = arg.u32_at::<OBJ_CLASS>();
+        let flags = arg.u32_at::<OBJ_FLAGS>();
+        if flags != 0 {
+            tracing::warn!(flags, requested, "nvsrv: object context flags ignored");
+            arg.set_u32::<OBJ_FLAGS>(0);
+        }
+        let channel = self.channels.get(&fd);
+        let taken = channel.map_or_default(Channel::slots);
+        let mapped = resolve_class(requested, &taken);
+        arg.set_u32::<OBJ_CLASS>(mapped);
+        let Some(slot) = slot_of(mapped) else {
+            return NvResult::BadParameter;
+        };
+        if taken.contains(&slot) {
+            return NvResult::AlreadyAllocated;
+        }
+        let given = if requested == 0 { mapped } else { requested };
+        if let Some(made) = channel.and_then(|channel| channel.made)
+            && let Err(error) = access.front.bind_class(ChannelId(made.channel), given)
+        {
+            tracing::warn!(%error, class = given, "nvsrv: the GPU refused an object class");
+            return NvResult::BadParameter;
+        }
+        self.channels.entry(fd).or_default().classes.push(given);
+        NvResult::Success
+    }
+
+    /// `SubmitGPFIFO` through 0x8 or 0x1B (module docs, "The ioctls"): the argument given back,
+    /// and for 0x8 the entries after it.
+    fn submit(
+        &mut self,
+        fd: u32,
+        call: &IoctlCall<'_>,
+        as_gpu: &AsGpu,
+        access: &mut ChannelAccess<'_>,
+    ) -> IoctlAnswer {
+        let mut arg = Fixed::<SUBMIT_BYTES>::from_input(call.input);
+        let source = entry_bytes(call);
+        let echo = |arg: Fixed<SUBMIT_BYTES>| {
+            let mut output = arg.into_output();
+            if call.variant == IoctlVariant::Ioctl {
+                let whole = source.len() / GP_ENTRY_BYTES * GP_ENTRY_BYTES;
+                output.extend(source.get(..whole).unwrap_or_default());
+            }
+            output
+        };
+        match self.submission(fd, &arg, source, as_gpu, access) {
+            Err(result) => IoctlAnswer::with(result, echo(arg)),
+            Ok((channel, fence, submission)) => {
+                arg.set_u32::<SUBMIT_FENCE_ID>(u32::from(fence.id.get()));
+                arg.set_u32::<SUBMIT_FENCE_VALUE>(fence.value);
+                arg.set_u32::<SUBMIT_FLAGS>(0);
+                if access.submits.is_waiting(channel)
+                    || access.front.submit(channel, submission.clone()) == Submitted::Full
+                {
+                    *access.deferred = Some(Deferral {
+                        channel,
+                        submission,
+                    });
+                }
+                IoctlAnswer::with(NvResult::Success, echo(arg))
+            }
+        }
+    }
+
+    /// The checks of `SubmitGPFIFO` and its fence (module docs, "The ioctls"): the GPU channel,
+    /// the fence the reply gives back, and what the front is to be given. The channel's
+    /// syncpoint's maximum is raised only once every check has passed.
+    fn submission(
+        &mut self,
+        fd: u32,
+        arg: &Fixed<SUBMIT_BYTES>,
+        source: &[u8],
+        as_gpu: &AsGpu,
+        access: &mut ChannelAccess<'_>,
+    ) -> Result<(ChannelId, Fence, Submission), NvResult> {
+        let count = usize::try_from(arg.u32_at::<SUBMIT_NUM_ENTRIES>()).unwrap_or(usize::MAX);
+        if count > source.len() / GP_ENTRY_BYTES || count > CHANNEL_QUEUE_ENTRIES {
+            return Err(NvResult::InvalidSize);
+        }
+        let plan = plan(arg.u32_at::<SUBMIT_FLAGS>(), arg.u32_at::<SUBMIT_FENCE_VALUE>())?;
+        let wait = if plan.wait {
+            let id = u8::try_from(arg.u32_at::<SUBMIT_FENCE_ID>().cast_signed())
+                .ok()
+                .and_then(SyncpointId::new)
+                .ok_or(NvResult::BadParameter)?;
+            Some(Fence {
+                id,
+                value: arg.u32_at::<SUBMIT_FENCE_VALUE>(),
+            })
+        } else {
+            None
+        };
+        let channel = self.channels.get_mut(&fd).ok_or(NvResult::InvalidState)?;
+        let syncpoint = channel.syncpoint_id().ok_or(NvResult::InvalidState)?;
+        let id = if let Some(made) = channel.made {
+            ChannelId(made.channel)
+        } else {
+            let space = as_gpu.bound(fd).ok_or(NvResult::InvalidState)?;
+            make(channel, space, access)?
+        };
+        let value = access
+            .syncpoints
+            .increment_max(syncpoint, plan.increments)
+            .map_err(|error| {
+                tracing::error!(%error, fd, "nvsrv: a channel's syncpoint was not allocated");
+                NvResult::InvalidState
+            })?;
+        let entries = entries_of(source.get(..count * GP_ENTRY_BYTES).unwrap_or_default());
+        let submission = Submission {
+            entries,
+            wait,
+            increments: plan.increments,
+            wfi: plan.wfi,
+        };
+        let fence = Fence {
+            id: syncpoint,
+            value,
+        };
+        Ok((id, fence, submission))
+    }
+}
+
+/// Makes `channel`'s GPU channel in `space` and binds its classes on it, in the order bound; a
+/// class the front refuses is logged. `InvalidState` without a syncpoint, `InsufficientMemory`
+/// if the front refuses the channel (a guess).
+fn make(
+    channel: &mut Channel,
+    space: AsId,
+    access: &ChannelAccess<'_>,
+) -> Result<ChannelId, NvResult> {
+    let syncpoint = channel.syncpoint_id().ok_or(NvResult::InvalidState)?;
+    let id = access
+        .front
+        .create_channel(ChannelConfig { space, syncpoint })
+        .map_err(|error| {
+            tracing::warn!(%error, "nvsrv: the GPU refused a channel");
+            NvResult::InsufficientMemory
+        })?;
+    for &class in &channel.classes {
+        if let Err(error) = access.front.bind_class(id, class) {
+            tracing::warn!(%error, class, "nvsrv: the GPU refused an object class");
+        }
+    }
+    channel.made = Some(Made {
+        channel: id.0,
+        space,
+    });
+    Ok(id)
+}
+
+/// Whether nvhost-gpu reads the inline input of `ioctl` sent through `variant`: `SubmitGPFIFO`
+/// 0x1B on `Ioctl2`, whose entries are there.
+#[must_use]
+pub fn reads_inline_input(variant: IoctlVariant, ioctl: Ioctl) -> bool {
+    variant == IoctlVariant::Ioctl2
+        && ioctl.group() == GROUP
+        && ioctl.command() == command::SUBMIT_GPFIFO_INLINE
+}

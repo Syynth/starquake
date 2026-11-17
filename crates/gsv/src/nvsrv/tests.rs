@@ -168,12 +168,14 @@ impl Direct {
             fd,
             ioctl: Ioctl::from_raw(raw),
             input,
+            inline_input: &[],
             out_len,
             inline_out_len,
         };
         let gpu = GpuAccess {
             memory: &mut self.memory,
             front: &self.front,
+            channels: None,
         };
         self.state.ioctl(policy, &call, gpu)
     }
@@ -183,6 +185,7 @@ impl Direct {
         let gpu = GpuAccess {
             memory: &mut self.memory,
             front: &self.front,
+            channels: None,
         };
         self.state.close(fd, gpu)
     }
@@ -377,10 +380,25 @@ impl Rig {
         shared: Arc<Shared>,
         front: Arc<RecordingFront>,
     ) -> Self {
+        Self::over_with(policy, state, shared, front, None)
+    }
+
+    /// A rig over `shared` and `front`, its state `state`, and `channels` as its channel front
+    /// if given.
+    pub(super) fn over_with(
+        policy: UnknownPolicy,
+        state: NvsrvState,
+        shared: Arc<Shared>,
+        front: Arc<RecordingFront>,
+        channels: Option<Arc<dyn gpu::ChannelFront>>,
+    ) -> Self {
         let mut kernel = FakeKernel::new(0).unwrap();
         kernel.set_current_service(NVSRV);
         let session = kernel.new_object();
-        let family = NvsrvFamily::new(Arc::clone(&shared), as_front(&front)).with_state(state);
+        let mut family = NvsrvFamily::new(Arc::clone(&shared), as_front(&front)).with_state(state);
+        if let Some(channels) = channels {
+            family = family.with_channel_front(channels);
+        }
         let mut server = nvsrv_server(Arc::clone(&shared), as_front(&front), policy)
             .with_family(family)
             .with_service_id(NVSRV);
@@ -412,8 +430,13 @@ impl Rig {
         state_of(&self.server).unwrap()
     }
 
+    /// The session the rig opened.
+    pub(super) const fn session(&self) -> ObjectId {
+        self.session
+    }
+
     /// Sends `request` on `session`; the message buffer afterwards.
-    fn send_on(&mut self, session: ObjectId, request: &RequestBuilder) -> Vec<u8> {
+    pub(super) fn send_on(&mut self, session: ObjectId, request: &RequestBuilder) -> Vec<u8> {
         let mut buffer = vec![STALE; BUFFER_SIZE];
         request.build(&mut buffer).unwrap();
         let handled = self.server.handle(&mut self.kernel, session, &mut buffer);
@@ -1347,9 +1370,11 @@ fn a_saved_server_restores_and_carries_on() {
 
 /// The saved layout of the state, as `postcard` writes it: the file count, each fd and its
 /// device's index, the next fd, the nvmap table (its own layout is pinned in `nvmap/tests.rs`),
-/// then nvhost-as-gpu's views and the layouts of the address spaces it made, then
-/// nvhost-tsg-gpu's groups. Every device appears, each fd distinct; the state is reached by
-/// ioctls, each field of a view, a layout and a group a distinct non-zero value.
+/// then nvhost-as-gpu's views, the layouts of the address spaces it made and its bound channels,
+/// then nvhost-tsg-gpu's groups, then nvhost-gpu's channels. Every device appears, each fd
+/// distinct; the state is reached by ioctls, each field of a view, a layout, a binding, a group
+/// and a channel a distinct non-zero value. (A channel's GPU channel, classes and events are
+/// pinned with values by `gpu/tests.rs`: `a_channel_s_saved_layout_is_pinned`.)
 #[test]
 fn the_saved_state_s_layout_is_pinned() {
     let mut direct = Direct::new();
@@ -1389,8 +1414,12 @@ fn the_saved_state_s_layout_is_pinned() {
     // One address space made: 2, its layout.
     expected.extend([1, 2]);
     expected.extend(layout);
+    // No bound channel.
+    expected.push(0);
     // One group: fd 4, timeslice 0x77, one channel: fd 5, subcontext 0x21.
     expected.extend([1, 4, 0x77, 1, 5, 0x21]);
+    // No nvhost-gpu channel.
+    expected.push(0);
     let bytes = state.save_state().unwrap();
     assert_eq!(bytes, expected);
     let mut loaded = NvsrvState::new();
@@ -1463,6 +1492,7 @@ pub(super) fn saved(state: &NvsrvState) -> SavedNvsrvState {
         nvmap: state.nvmap.clone(),
         as_gpu: state.as_gpu.clone(),
         tsg_gpu: state.tsg_gpu.clone(),
+        gpu: state.gpu.clone(),
     }
 }
 
@@ -1494,10 +1524,11 @@ fn a_saved_state_with_a_bad_table_is_refused() {
         &le(&[0x1000, 0]),
     );
     let mut bytes = state.save_state().unwrap();
-    // The table's last byte is its next id, 8, before three empty maps (as-gpu's views and
-    // made spaces, tsg-gpu's groups): make it 2, which no table reaches.
-    let at = bytes.len() - 4;
-    assert_eq!(bytes[at..], [8, 0, 0, 0]);
+    // The table's last byte is its next id, 8, before five empty maps (as-gpu's views, made
+    // spaces and bindings, tsg-gpu's groups, nvhost-gpu's channels): make it 2, which no table
+    // reaches.
+    let at = bytes.len() - 6;
+    assert_eq!(bytes[at..], [8, 0, 0, 0, 0, 0]);
     bytes[at] = 2;
     let mut loaded = NvsrvState::new();
     assert_eq!(

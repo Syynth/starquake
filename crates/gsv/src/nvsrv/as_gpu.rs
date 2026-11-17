@@ -54,17 +54,26 @@
 //! m_shared_parent->gmmu`), `Module::Close` drops the fd's device (`nvdrv.cpp`:
 //! `open_files.erase(itr)`), and the GMMU (`std::shared_ptr<Tegra::MemoryManager> gmmu`) goes
 //! with its last holder
-//! (`the_last_close_destroys_the_space_and_the_one_before_keeps_it`). PR's channels hold it too
-//! (`BindChannel`: `memory_manager_owner`); `BindChannel` is not built (see "Not built"), so no
-//! channel holds a space here yet.
+//! (`the_last_close_destroys_the_space_and_the_one_before_keeps_it`).
+//!
+//! **A bound channel holds its space too.** PR's `BindChannel` gives the channel
+//! `memory_manager_owner`, a `shared_ptr` that keeps the as-gpu fd's device, and so its GMMU,
+//! alive. Here `BindChannel` ([`command::BIND_CHANNEL`], below) records the binding (channel fd
+//! to address space), and a made space is destroyed only once no view and no binding holds it:
+//! closing the last as-gpu fd of a space a channel is bound to keeps the space until the
+//! channel's fd closes or the channel is bound elsewhere (`nvsrv/gpu/tests.rs`:
+//! `a_bound_channel_keeps_its_space_after_the_last_view_closes`,
+//! `rebinding_releases_the_old_space`). Closing a channel's fd drops its binding
+//! ([`AsGpu::unbind`]).
 //!
 //! **Snapshots.** A destroyed space is in neither snapshot: gsv's GPU memory no longer holds it,
 //! and nvsrv's state no longer names it. Restoring nvsrv's state refuses a made space that no
-//! view holds ([`AsGpuStateError::MadeSpaceUnheld`]: only a destroy leaves one), and
-//! [`AsGpu::check_spaces`] refuses a made space or a view whose space gsv's GPU memory does not
-//! hold (`a_state_saved_before_a_destroy_is_refused_against_the_memory_after_it`). What is not
-//! checked here: whether a space gsv holds and nvsrv does not name is one gpu 33 made (gsv does
-//! not record which path made a space).
+//! view and no binding holds ([`AsGpuStateError::MadeSpaceUnheld`]: only a destroy leaves one),
+//! and [`AsGpu::check_spaces`] refuses a made space, a view or a binding whose space gsv's GPU
+//! memory does not hold (`a_state_saved_before_a_destroy_is_refused_against_the_memory_after_it`;
+//! for a binding, `nvsrv/gpu/tests.rs`: `a_binding_s_space_is_checked_against_the_memory`).
+//! What is not checked here: whether a space gsv holds and nvsrv does not name is one gpu 33 made
+//! (gsv does not record which path made a space).
 //!
 //! # The ioctls
 //!
@@ -76,6 +85,7 @@
 //! | `Ioctl` | 0x9 | `AllocAsEx` | 0: flags, 4: `as_fd` (`s32`), 8: big page size, 12: reserved, 16: start, 24: end, 32: split (the three `u64`) |
 //! | `Ioctl`, `Ioctl3` | 0x8 | `GetVARegions` | 0: buffer address (`u64`), 8: buffer size, 12: reserved, 16: two regions of 0x18 bytes (offset `u64`, page size, padding, pages `u64`); `Ioctl3` also writes the regions to out buffer 1 |
 //! | `Ioctl` | 0xB | `GetSyncpointShimInfo` | 0: address (`u64`), 8: stride, 12: count |
+//! | `Ioctl` | 0x1 | `BindChannel` | 0: channel fd (`s32`) |
 //!
 //! **`AllocAsEx`**, PR's checks in its order, the first that fails answering:
 //!
@@ -112,6 +122,22 @@
 //! ([`GpuMemory::map_syncpoint_shim`](crate::gpu::GpuMemory::map_syncpoint_shim)); the stride 4
 //! and the count [`SYNCPOINT_COUNT`] (192). An address space has one shim: a view whose address
 //! space has one already reports that one's page.
+//!
+//! **`BindChannel`** (port slice 11; served only by a server given a channel front,
+//! `crate::nvsrv::gpu`, and otherwise left to the unknown-ioctl policy), PR's checks in its
+//! order, the first that fails answering, the argument given back as sent whatever the result:
+//!
+//! 1. the channel fd negative, not open, or not an nvhost-gpu: `BadParameter` (PR: `!device ||
+//!    device->GetType() != nvdevice::Type::GpuChannel`);
+//! 2. this fd has no view yet: `InvalidState` (PR: `!vm.initialised || !gmmu`);
+//! 3. the channel's GPU channel was made already, in another address space: `InvalidState` (PR:
+//!    `channel_state->initialized && channel_state->memory_manager != gmmu.get()`).
+//!
+//! Otherwise the channel is bound to the view's address space, replacing a binding it had; a
+//! made space the replaced binding was the last holder of is destroyed then. Eden and NX2 make
+//! none of these checks (`nvhost_as_gpu.cpp`: `GetDevice<nvhost_gpu>(params.fd)` and the
+//! assignment, with no null check); PR's are used: Eden's answer to the requests PR refuses is
+//! to dereference a missing device.
 //!
 //! Every other as-gpu ioctl goes to the server's unknown-ioctl policy (see "Not built").
 //!
@@ -155,7 +181,7 @@
 //!
 //! # Not built
 //!
-//! `BindChannel` (0x1, which needs nvhost-gpu's channels, port slice 11), `AllocateSpace` (0x2),
+//! `AllocateSpace` (0x2),
 //! `FreeSpace` (0x3), `UnmapBuffer` (0x5), `MapBufferEx` (0x6), `ModifyKind` (0xC), PR's native
 //! remap (0xD) and `Remap` (0x14). Row 30 (observed): Switch 2 never maps through nvhost-as-gpu;
 //! row 149 (observed): NvRm's mapping modify reaches gsv as gpu 212, which the gpu worker
@@ -171,8 +197,8 @@ use starquake_gpu::interface::SYNCPOINT_COUNT;
 use starquake_memory::PAGE_SIZE;
 
 use super::ctrl_gpu;
-use super::ioctl::Fixed;
-use super::{GpuAccess, IoctlAnswer, IoctlCall, IoctlVariant, NvResult};
+use super::ioctl::{Fixed, Ioctl};
+use super::{Device, GpuAccess, IoctlAnswer, IoctlCall, IoctlVariant, NvResult};
 use crate::gpu::memory::{FIRST_ADDRESS_SPACE, MAX_ADDRESS_SPACES, VA_WINDOW_END, VA_WINDOW_START};
 use crate::gpu::{AsId, GpuMemory};
 
@@ -190,6 +216,9 @@ pub mod command {
     pub const ALLOC_AS_EX: u32 = 0x9;
     /// `GetSyncpointShimInfo` (`case 0xb:`).
     pub const GET_SYNCPOINT_SHIM_INFO: u32 = 0xB;
+    /// `BindChannel` (`case 0x1:`; libnx `nvioctlNvhostAsGpu_BindChannel` sends
+    /// `_NV_IOW(0x41, 0x01, data)`).
+    pub const BIND_CHANNEL: u32 = 0x1;
 }
 
 /// Where each field of each argument struct is, and each struct's size (`nvhost_as_gpu.h`:
@@ -241,11 +270,16 @@ pub mod layout {
     pub const SHIM_STRIDE: usize = 8;
     /// `count`.
     pub const SHIM_COUNT: usize = 12;
+
+    /// `IoctlBindChannel`: 4 bytes.
+    pub const BIND_CHANNEL_BYTES: usize = 4;
+    /// `fd`, an `s32`: the channel's.
+    pub const BIND_FD: usize = 0;
 }
 
 use layout::{
     ALLOC_AS_EX_BYTES, ALLOC_AS_FD, ALLOC_BIG_PAGE_SIZE, ALLOC_END, ALLOC_FLAGS, ALLOC_RESERVED,
-    ALLOC_SPLIT, ALLOC_START, REGION_BYTES, REGION_OFFSET, REGION_PAGE_SIZE, REGION_PAGES,
+    ALLOC_SPLIT, ALLOC_START, BIND_CHANNEL_BYTES, BIND_FD, REGION_BYTES, REGION_OFFSET, REGION_PAGE_SIZE, REGION_PAGES,
     SHIM_ADDRESS, SHIM_BYTES, SHIM_COUNT, SHIM_STRIDE, VA_BUF_SIZE, VA_REGION_0, VA_REGION_1,
     VA_REGIONS_BYTES,
 };
@@ -448,14 +482,15 @@ pub struct View {
     pub layout: Layout,
 }
 
-/// Every as-gpu fd's view, and the layouts of the address spaces parentless `AllocAsEx`s made.
-/// Plain data, saved with the nvsrv state; deserialising goes through `SavedAsGpu`, which
-/// refuses a state `AllocAsEx` cannot reach ([`AsGpuStateError`]).
+/// Every as-gpu fd's view, the layouts of the address spaces parentless `AllocAsEx`s made, and
+/// the channels `BindChannel` bound. Plain data, saved with the nvsrv state; deserialising goes
+/// through `SavedAsGpu`, which refuses a state the ioctls cannot reach ([`AsGpuStateError`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "SavedAsGpu")]
 pub struct AsGpu {
     views: BTreeMap<u32, View>,
     made: BTreeMap<AsId, Layout>,
+    bound: BTreeMap<u32, AsId>,
 }
 
 /// The serialised form of [`AsGpu`], field for field.
@@ -463,6 +498,7 @@ pub struct AsGpu {
 struct SavedAsGpu {
     views: BTreeMap<u32, View>,
     made: BTreeMap<AsId, Layout>,
+    bound: BTreeMap<u32, AsId>,
 }
 
 /// Why a saved [`AsGpu`] could not be read back. The checks run in this order, the first that
@@ -490,6 +526,15 @@ pub enum AsGpuStateError {
         /// The address space's id.
         space: u32,
     },
+    /// A bound channel's address space id is below [`FIRST_ADDRESS_SPACE`], so gsv never handed
+    /// it out.
+    #[error("channel fd {fd} is bound to address space {space}, which is not an id gsv hands out")]
+    BoundSpaceNotIssued {
+        /// The channel's fd.
+        fd: u32,
+        /// The address space's id.
+        space: u32,
+    },
     /// A made address space's layout is not one `AllocAsEx` makes.
     #[error("address space {space} has a layout nvhost-as-gpu cannot make")]
     MadeLayout {
@@ -513,8 +558,8 @@ pub enum AsGpuStateError {
         /// The higher fd.
         second: u32,
     },
-    /// A made address space no view holds: the last fd holding it was closed, which destroyed
-    /// it.
+    /// A made address space no view and no bound channel holds: the last holder went, which
+    /// destroyed it.
     #[error("address space {space} was made through nvhost-as-gpu but no fd holds it")]
     MadeSpaceUnheld {
         /// The address space's id.
@@ -534,13 +579,22 @@ pub enum AsGpuStateError {
         /// The address space's id.
         space: u32,
     },
+    /// A channel bound to an address space gsv's GPU memory does not hold
+    /// ([`AsGpu::check_spaces`]).
+    #[error("channel fd {fd} is bound to address space {space}, which gsv does not hold")]
+    BoundSpaceNotHeld {
+        /// The channel's fd.
+        fd: u32,
+        /// The address space's id.
+        space: u32,
+    },
 }
 
 impl TryFrom<SavedAsGpu> for AsGpu {
     type Error = AsGpuStateError;
 
     fn try_from(saved: SavedAsGpu) -> Result<Self, Self::Error> {
-        let SavedAsGpu { views, made } = saved;
+        let SavedAsGpu { views, made, bound } = saved;
         if made.len() > MAX_ADDRESS_SPACES {
             return Err(AsGpuStateError::TooManySpaces { count: made.len() });
         }
@@ -555,6 +609,12 @@ impl TryFrom<SavedAsGpu> for AsGpu {
                 fd,
                 space: view.space.0,
             });
+        }
+        if let Some((&fd, &space)) = bound
+            .iter()
+            .find(|&(_, &space)| space < FIRST_ADDRESS_SPACE)
+        {
+            return Err(AsGpuStateError::BoundSpaceNotIssued { fd, space: space.0 });
         }
         if let Some(space) = made.iter().find(|(_, layout)| !layout.is_valid()) {
             return Err(AsGpuStateError::MadeLayout { space: space.0.0 });
@@ -586,13 +646,14 @@ impl TryFrom<SavedAsGpu> for AsGpu {
             }
             creators.insert(view.space, fd);
         }
-        if let Some(&space) = made
-            .keys()
-            .find(|&&space| !views.values().any(|view| view.space == space))
-        {
+        let held = |space: AsId| {
+            views.values().any(|view| view.space == space)
+                || bound.values().any(|&bound| bound == space)
+        };
+        if let Some(&space) = made.keys().find(|&&space| !held(space)) {
             return Err(AsGpuStateError::MadeSpaceUnheld { space: space.0 });
         }
-        Ok(Self { views, made })
+        Ok(Self { views, made, bound })
     }
 }
 
@@ -620,14 +681,41 @@ impl AsGpu {
         self.made.get(&space).copied()
     }
 
-    /// Fd `fd` was closed: its view goes, and if it was the last view of an address space a
+    /// The address space channel fd `channel` is bound to, if `BindChannel` bound it.
+    #[must_use]
+    pub fn bound(&self, channel: u32) -> Option<AsId> {
+        self.bound.get(&channel).copied()
+    }
+
+    /// The bound channels' fds and their address spaces, in fd order.
+    pub fn bindings(&self) -> impl Iterator<Item = (u32, AsId)> + '_ {
+        self.bound.iter().map(|(&fd, &space)| (fd, space))
+    }
+
+    /// Fd `fd` was closed: its view goes, and if it was the last holder of an address space a
     /// parentless `AllocAsEx` made, that space is destroyed in `gpu` (module docs, "Closing").
     pub(super) fn close(&mut self, fd: u32, gpu: &mut GpuAccess<'_>) {
         let Some(view) = self.views.remove(&fd) else {
             return;
         };
-        let space = view.space;
-        if !self.made.contains_key(&space) || self.views.values().any(|v| v.space == space) {
+        self.release(view.space, gpu);
+    }
+
+    /// Channel fd `channel` was closed: its binding goes, and if it was the last holder of a
+    /// made address space, that space is destroyed in `gpu` (module docs, "Closing").
+    pub(super) fn unbind(&mut self, channel: u32, gpu: &mut GpuAccess<'_>) {
+        if let Some(space) = self.bound.remove(&channel) {
+            self.release(space, gpu);
+        }
+    }
+
+    /// A holder of `space` went: if `space` is a made address space that no view and no binding
+    /// holds any more, it is destroyed in `gpu`.
+    fn release(&mut self, space: AsId, gpu: &mut GpuAccess<'_>) {
+        if !self.made.contains_key(&space)
+            || self.views.values().any(|view| view.space == space)
+            || self.bound.values().any(|&bound| bound == space)
+        {
             return;
         }
         self.made.remove(&space);
@@ -642,7 +730,8 @@ impl AsGpu {
     }
 
     /// Whether every address space this state names is one `memory` holds: each made space in
-    /// id order, then each view's in fd order, the first that is not reported. A restore that
+    /// id order, then each view's in fd order, then each binding's in channel fd order, the
+    /// first that is not reported. A restore that
     /// composes nvsrv's state with gsv's GPU memory calls this, so that an nvsrv snapshot
     /// naming a space that was destroyed (its last fd closed) is refused (module docs,
     /// "Closing").
@@ -664,8 +753,61 @@ impl AsGpu {
                 space: view.space.0,
             });
         }
+        if let Some((&fd, &space)) = self
+            .bound
+            .iter()
+            .find(|&(_, &space)| memory.table(space).is_none())
+        {
+            return Err(AsGpuStateError::BoundSpaceNotHeld { fd, space: space.0 });
+        }
         Ok(())
     }
+
+    /// `BindChannel` on as-gpu fd `fd` (module docs, "The ioctls"): the channel fd is checked
+    /// against `files`, and `made_in` gives the address space a channel's GPU channel was made
+    /// in, if it was made. The argument comes back as sent.
+    pub(super) fn bind_channel(
+        &mut self,
+        fd: u32,
+        call: &IoctlCall<'_>,
+        files: &BTreeMap<u32, Device>,
+        made_in: &dyn Fn(u32) -> Option<AsId>,
+        gpu: &mut GpuAccess<'_>,
+    ) -> IoctlAnswer {
+        let arg = Fixed::<BIND_CHANNEL_BYTES>::from_input(call.input);
+        let channel = u32::try_from(arg.u32_at::<BIND_FD>().cast_signed()).ok();
+        let result = match channel {
+            Some(channel) if files.get(&channel) == Some(&Device::NvhostGpu) => {
+                match self.views.get(&fd).map(|view| view.space) {
+                    None => NvResult::InvalidState,
+                    Some(space) if made_in(channel).is_some_and(|made| made != space) => {
+                        NvResult::InvalidState
+                    }
+                    Some(space) => {
+                        if let Some(old) = self.bound.insert(channel, space)
+                            && old != space
+                        {
+                            self.release(old, gpu);
+                        }
+                        NvResult::Success
+                    }
+                }
+            }
+            _ => NvResult::BadParameter,
+        };
+        IoctlAnswer::with(result, arg.into_output())
+    }
+}
+
+/// Whether `ioctl`, sent through `variant`, is `BindChannel` (module docs, "The ioctls").
+#[must_use]
+pub fn is_bind_channel(variant: IoctlVariant, ioctl: Ioctl) -> bool {
+    variant == IoctlVariant::Ioctl
+        && ioctl.group() == GROUP
+        && ioctl.command() == command::BIND_CHANNEL
+}
+
+impl AsGpu {
 
     /// An ioctl on as-gpu fd `fd`, or `None` for one the device does not know (module docs,
     /// "The ioctls").

@@ -8,6 +8,7 @@
 //! * [`ctrl_gpu`]: `/dev/nvhost-ctrl-gpu`, the GPU's characteristics block (slice 10).
 //! * [`as_gpu`]: `/dev/nvhost-as-gpu`, address-space views over gsv's GPU memory (slice 10).
 //! * [`tsg_gpu`]: `/dev/nvhost-tsg-gpu`, timeslice groups (slice 10).
+//! * [`gpu`]: `/dev/nvhost-gpu`, channels and GPFIFO submission (slice 11).
 //!
 //! Ported from Eden (GPL-3.0-or-later) @ cf654052: `eden/src/core/hle/service/nvdrv/`
 //! `nvdrv_interface.cpp` (`NVDRV`: the commands and their framing), `nvdrv.cpp` (`Module`: the
@@ -90,12 +91,17 @@
 //! **What each device does.** `/dev/nvmap` has its ioctls ([`nvmap`]); `/dev/nvhost-ctrl-gpu`
 //! answers `GetCharacteristics` ([`ctrl_gpu`]); `/dev/nvhost-as-gpu` makes views of gsv's GPU
 //! address spaces and reports their regions and syncpoint shim ([`as_gpu`]); and
-//! `/dev/nvhost-tsg-gpu` keeps timeslice groups ([`tsg_gpu`]). Each lists the ioctls it does not
-//! serve yet. The others open, but have no ioctls yet: nvhost-gpu comes with port slice 11, and
-//! the rest are Switch 1 devices (decision 11 builds only what Switch 2's driver uses). No device
-//! has events yet, so `QueryEvent` on an open fd answers `BadParameter`, Eden's answer for a
-//! device with none (`nvdevice::QueryEvent` returns `nullptr`); nvhost-gpu's events come with
-//! slice 11, and ctrl-gpu's two are not built ([`ctrl_gpu`], "Not built").
+//! `/dev/nvhost-tsg-gpu` keeps timeslice groups ([`tsg_gpu`]); and `/dev/nvhost-gpu` is a
+//! channel ([`gpu`]), on a server given a channel front ([`NvsrvFamily::with_channel_front`]:
+//! without one its ioctls, and as-gpu's `BindChannel`, go to the unknown-ioctl policy). Each lists
+//! the ioctls it does not serve yet. The others open, but have no ioctls: they are Switch 1
+//! devices (decision 11 builds only what Switch 2's driver uses).
+//!
+//! `QueryEvent` on an nvhost-gpu fd answers its channel's events ([`gpu`], "Events"): a copied
+//! handle and `Success` (Eden `NVDRV::QueryEvent`: `rb.PushCopyObjects(ctx, readable_event);
+//! rb.PushEnum(NvResult::Success)`). On any other open fd it answers `BadParameter` and no
+//! handle, Eden's answer for a device with no such event (`nvdevice::QueryEvent` returns
+//! `nullptr`); ctrl-gpu's two are not built ([`ctrl_gpu`], "Not built").
 //!
 //! **The server's wiring.** nvhost-as-gpu acts on gsv's GPU memory, the bookkeeping the gpu
 //! session's 33 and its worker use, so [`nvsrv_server`] takes gsv's shared state and the GPU's
@@ -135,11 +141,14 @@
 //! Every request is one IPC event in the run's stream, recorded by the service framework with
 //! its payload; nvsrv has no input from the host, so it writes no notes. The open files, the
 //! nvmap handles, nvhost-as-gpu's views and the layouts of the address spaces it made, and
-//! nvhost-tsg-gpu's groups are the family state, plain data saved with the server (the wiring is
-//! not saved), and restoring checks every relation between their fields ([`NvsrvStateError`],
-//! [`nvmap::NvMapStateError`], [`as_gpu::AsGpuStateError`], [`tsg_gpu::TsgStateError`]): each
-//! view on an open as-gpu fd, each group on an open tsg-gpu fd, each bound channel's fd one that
-//! was handed out and, while it is still open, an nvhost-gpu.
+//! nvhost-tsg-gpu's groups and nvhost-gpu's channels are the family state, plain data saved with
+//! the server (the wiring is not saved), and restoring checks every relation between their fields
+//! ([`NvsrvStateError`], [`nvmap::NvMapStateError`], [`as_gpu::AsGpuStateError`],
+//! [`tsg_gpu::TsgStateError`], [`gpu::GpuStateError`]): each view on an open as-gpu fd, each
+//! group on an open tsg-gpu fd, each channel a group holds one whose fd was handed out and, while
+//! it is still open, an nvhost-gpu, each nvhost-gpu channel and each as-gpu binding on an open
+//! nvhost-gpu fd, and each made GPU channel bound to the address space it was made in. The
+//! submissions that wait for room are gsv's shared state's ([`gpu::submits`]).
 //!
 //! The address spaces themselves are gsv's shared state's, saved with it
 //! ([`crate::gpu::saved`]). That a view's address space is one the shared state holds is a
@@ -169,6 +178,7 @@
 
 pub mod as_gpu;
 pub mod ctrl_gpu;
+pub mod gpu;
 pub mod ioctl;
 pub mod nvmap;
 pub mod tsg_gpu;
@@ -179,11 +189,12 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use starquake_services::commands;
 use starquake_services::framework::{
-    Context, Family, Fault, Interfaces, Outcome, Reply, Request, Server, SnapshotError,
-    UnknownPolicy,
+    Context, Family, Fault, Interfaces, NOT_SUPPORTED, Outcome, Reply, ReplyToken, Request, Server,
+    SnapshotError, UnknownPolicy,
 };
 
 use self::as_gpu::AsGpu;
+use self::gpu::{ChannelAccess, ChannelFront, Deferral, NvhostGpu, Queried};
 use self::ioctl::{Ioctl, MAX_ARGUMENT_BYTES};
 use self::nvmap::NvMap;
 use self::tsg_gpu::TsgGpu;
@@ -250,8 +261,12 @@ pub enum NvResult {
     InsufficientMemory,
     /// `InvalidState = 0x8`: a negative fd.
     InvalidState,
+    /// `InvalidSize = 0xA`: a submission with more entries than it carries.
+    InvalidSize,
     /// `BadValue = 0xB`.
     BadValue,
+    /// `AlreadyAllocated = 0xD`: a channel's second `AllocGPFIFOEx2`, a class slot taken.
+    AlreadyAllocated,
     /// `Busy = 0xE`: a channel already bound to a timeslice group.
     Busy,
     /// `FileOperationFailed = 0x30003`: a path no device has.
@@ -271,7 +286,9 @@ impl NvResult {
             Self::BadParameter => 0x4,
             Self::InsufficientMemory => 0x6,
             Self::InvalidState => 0x8,
+            Self::InvalidSize => 0xA,
             Self::BadValue => 0xB,
+            Self::AlreadyAllocated => 0xD,
             Self::Busy => 0xE,
             Self::FileOperationFailed => 0x3_0003,
             Self::AccessDenied => 0x3_0010,
@@ -431,6 +448,9 @@ pub struct IoctlCall<'a> {
     pub ioctl: Ioctl,
     /// In buffer 0, up to [`MAX_ARGUMENT_BYTES`].
     pub input: &'a [u8],
+    /// `Ioctl2`'s in buffer 1, the inline input, up to [`gpu::MAX_ENTRY_BYTES`]: read only for
+    /// the ioctl that takes one ([`gpu::reads_inline_input`]), empty otherwise.
+    pub inline_input: &'a [u8],
     /// Out buffer 0's size.
     pub out_len: usize,
     /// Out buffer 1's size for `Ioctl3`, 0 otherwise.
@@ -438,12 +458,14 @@ pub struct IoctlCall<'a> {
 }
 
 /// gsv's GPU memory, under gsv's shared lock, and the GPU's front: what nvhost-as-gpu acts on
-/// ([`as_gpu`]).
+/// ([`as_gpu`]); and, on a server with a channel front, what nvhost-gpu acts on ([`gpu`]).
 pub struct GpuAccess<'a> {
     /// The bookkeeping gpu 33 and the gpu worker share.
     pub memory: &'a mut GpuMemory,
     /// The GPU's front, which a new address space is given to.
     pub front: &'a dyn GpuVmFront,
+    /// The channels' wiring, if the server has a channel front.
+    pub channels: Option<ChannelAccess<'a>>,
 }
 
 /// The fd `Open` answers when no device has the path (`nvdata.h`: `INVALID_NVDRV_FD = -1`).
@@ -470,6 +492,7 @@ pub struct NvsrvState {
     nvmap: NvMap,
     as_gpu: AsGpu,
     tsg_gpu: TsgGpu,
+    gpu: NvhostGpu,
 }
 
 /// The serialised form of [`NvsrvState`], field for field, and what deserialising validates.
@@ -480,6 +503,7 @@ struct SavedNvsrvState {
     nvmap: NvMap,
     as_gpu: AsGpu,
     tsg_gpu: TsgGpu,
+    gpu: NvhostGpu,
 }
 
 /// Why a saved [`NvsrvState`] could not be read back: its open files are not ones `Open` and
@@ -532,6 +556,27 @@ pub enum NvsrvStateError {
         /// The channel's fd.
         fd: u32,
     },
+    /// An nvhost-gpu channel on an fd that is not an open `/dev/nvhost-gpu`: a channel goes
+    /// when its fd closes.
+    #[error("fd {fd} has a GPU channel but is not an open nvhost-gpu")]
+    NotAGpuChannel {
+        /// The fd.
+        fd: u32,
+    },
+    /// An address-space binding on an fd that is not an open `/dev/nvhost-gpu`: `BindChannel`
+    /// takes only an open nvhost-gpu fd, and the binding goes when the fd closes.
+    #[error("fd {fd} is bound to an address space but is not an open nvhost-gpu")]
+    NotABoundChannel {
+        /// The fd.
+        fd: u32,
+    },
+    /// A GPU channel made in an address space its fd is not bound to: `BindChannel` refuses
+    /// another space once the channel is made, and the channel is made only in the bound one.
+    #[error("channel fd {fd}'s GPU channel was made in an address space it is not bound to")]
+    MadeUnbound {
+        /// The channel's fd.
+        fd: u32,
+    },
 }
 
 impl TryFrom<SavedNvsrvState> for NvsrvState {
@@ -544,6 +589,7 @@ impl TryFrom<SavedNvsrvState> for NvsrvState {
             nvmap,
             as_gpu,
             tsg_gpu,
+            gpu,
         } = saved;
         if !(FIRST_FD..=FD_END).contains(&next_fd) {
             return Err(NvsrvStateError::NextFd { next: next_fd });
@@ -574,12 +620,28 @@ impl TryFrom<SavedNvsrvState> for NvsrvState {
         }) {
             return Err(NvsrvStateError::NotAChannel { fd });
         }
+        if let Some(fd) = gpu.fds().find(|fd| !open_as(fd, Device::NvhostGpu)) {
+            return Err(NvsrvStateError::NotAGpuChannel { fd });
+        }
+        if let Some((fd, _)) = as_gpu
+            .bindings()
+            .find(|(fd, _)| !open_as(fd, Device::NvhostGpu))
+        {
+            return Err(NvsrvStateError::NotABoundChannel { fd });
+        }
+        if let Some(fd) = gpu.fds().find(|&fd| {
+            gpu.made_in(fd)
+                .is_some_and(|space| as_gpu.bound(fd) != Some(space))
+        }) {
+            return Err(NvsrvStateError::MadeUnbound { fd });
+        }
         Ok(Self {
             files,
             next_fd,
             nvmap,
             as_gpu,
             tsg_gpu,
+            gpu,
         })
     }
 }
@@ -606,7 +668,14 @@ impl NvsrvState {
             nvmap: NvMap::new(),
             as_gpu: AsGpu::new(),
             tsg_gpu: TsgGpu::new(),
+            gpu: NvhostGpu::new(),
         }
+    }
+
+    /// The nvhost-gpu fds' channels.
+    #[must_use]
+    pub const fn gpu(&self) -> &NvhostGpu {
+        &self.gpu
     }
 
     /// The nvmap handle table.
@@ -671,8 +740,10 @@ impl NvsrvState {
         (fd, NvResult::Success)
     }
 
-    /// `Close` (`Module::Close`): an as-gpu fd's view and a tsg-gpu fd's group go with it, and
-    /// an address space whose last view that was is destroyed in `gpu` ([`as_gpu`], "Closing").
+    /// `Close` (`Module::Close`): an as-gpu fd's view, a tsg-gpu fd's group and an nvhost-gpu
+    /// fd's channel go with it (its waiting submissions answered, its GPU channel destroyed and
+    /// its syncpoint freed, [`gpu`]), and then the channel's binding; an address space whose last
+    /// holder that was is destroyed in `gpu` ([`as_gpu`], "Closing").
     pub fn close(&mut self, fd: i32, mut gpu: GpuAccess<'_>) -> NvResult {
         let key = match key(fd) {
             Ok(key) => key,
@@ -683,31 +754,44 @@ impl NvsrvState {
         }
         self.as_gpu.close(key, &mut gpu);
         self.tsg_gpu.close(key);
+        self.gpu.close(key, gpu.channels.as_mut());
+        self.as_gpu.unbind(key, &mut gpu);
         NvResult::Success
     }
 
-    /// `QueryEvent` (`Module::QueryEvent`): no device has events in this slice (module docs).
-    pub fn query_event(&self, fd: i32, event: u32) -> NvResult {
-        match self.file(fd) {
-            Err(result) => result,
-            Ok(device) => {
-                tracing::warn!(
-                    device = device.path(),
-                    event,
-                    "nvsrv: an event no device has"
-                );
-                NvResult::BadParameter
-            }
+    /// `QueryEvent` (`Module::QueryEvent`): the fd checks, then the event (module docs,
+    /// "Devices and fds"). Only nvhost-gpu has events.
+    pub fn query_event(&self, fd: i32, event: u32) -> Result<Queried, NvResult> {
+        let device = self.file(fd)?;
+        let queried = match device {
+            Device::NvhostGpu => self.gpu.event(key(fd)?, event),
+            _ => Queried::Missing,
+        };
+        if queried == Queried::Missing {
+            tracing::warn!(
+                device = device.path(),
+                event,
+                "nvsrv: an event no device has"
+            );
+        }
+        Ok(queried)
+    }
+
+    /// Keeps `made` as nvhost-gpu fd `fd`'s event `event`, made for a [`Queried::Make`].
+    pub fn set_event(&mut self, fd: i32, event: u32, made: starquake_kernel::id::ObjectId) {
+        if let Ok(key) = key(fd) {
+            self.gpu.set_event(key, event, made);
         }
     }
 
     /// `call`: the fd checks, then the device, then the policy for an ioctl the device does not
-    /// know (module docs, "Ioctls"). nvhost-as-gpu acts on `gpu`.
+    /// know (module docs, "Ioctls"). nvhost-as-gpu and nvhost-gpu act on `gpu`; a submission that
+    /// must wait for room is left in `gpu`'s channel access ([`ChannelAccess::deferred`]).
     pub fn ioctl(
         &mut self,
         policy: UnknownPolicy,
         call: &IoctlCall<'_>,
-        gpu: GpuAccess<'_>,
+        mut gpu: GpuAccess<'_>,
     ) -> IoctlAnswer {
         let IoctlCall {
             variant, fd, ioctl, ..
@@ -724,8 +808,20 @@ impl NvsrvState {
                 .ioctl(ioctl, call.input)
                 .map(|(result, output)| IoctlAnswer::with(result, output)),
             (Device::NvhostCtrlGpu, IoctlVariant::Ioctl3) => ctrl_gpu::ioctl3(call),
+            (Device::NvhostAsGpu, _)
+                if gpu.channels.is_some() && as_gpu::is_bind_channel(variant, ioctl) =>
+            {
+                let channels = &self.gpu;
+                let made_in = |fd: u32| channels.made_in(fd);
+                let files = &self.files;
+                Some(self.as_gpu.bind_channel(key, call, files, &made_in, &mut gpu))
+            }
             (Device::NvhostAsGpu, _) => self.as_gpu.ioctl(key, call, gpu),
             (Device::NvhostTsgGpu, _) => self.tsg_gpu.ioctl(key, call, &self.files),
+            (Device::NvhostGpu, _) => match gpu.channels.as_mut() {
+                Some(access) => self.gpu.ioctl(key, call, &self.as_gpu, access),
+                None => None,
+            },
             _ => None,
         };
         if let Some(answer) = known {
@@ -829,7 +925,8 @@ impl Nvsrv {
         reply.ok()
     }
 
-    /// `QueryEvent` (4). in: `s32` fd, `u32` event id. out: the result.
+    /// `QueryEvent` (4). in: `s32` fd, `u32` event id. out: the event, copied, and `Success`;
+    /// or the result alone (module docs, "Devices and fds").
     fn query_event(
         _: &mut Self,
         cx: &mut Context<'_>,
@@ -839,8 +936,27 @@ impl Nvsrv {
         let mut payload = req.payload();
         let fd = payload.read_i32()?;
         let event = payload.read_u32()?;
-        let result = cx.family::<NvsrvFamily>()?.state.query_event(fd, event);
-        reply.payload().write_u32(result.raw());
+        let queried = cx.family::<NvsrvFamily>()?.state.query_event(fd, event);
+        let made = match queried {
+            Err(result) => {
+                reply.payload().write_u32(result.raw());
+                return reply.ok();
+            }
+            Ok(Queried::Missing) => {
+                reply.payload().write_u32(NvResult::BadParameter.raw());
+                return reply.ok();
+            }
+            Ok(Queried::Event(made)) => made,
+            Ok(Queried::Make) => {
+                let made = cx.create_event()?;
+                cx.family::<NvsrvFamily>()?
+                    .state
+                    .set_event(fd, event, made);
+                made
+            }
+        };
+        reply.copy_handle(made);
+        reply.payload().write_u32(NvResult::Success.raw());
         reply.ok()
     }
 
@@ -883,7 +999,9 @@ impl Nvsrv {
 }
 
 /// `Ioctl`, `Ioctl2` and `Ioctl3`. in: `s32` fd, `u32` ioctl; in buffer 0, the argument. out:
-/// out buffer 0, the argument back if the ioctl's `is_out` bit is set; the result.
+/// out buffer 0, the argument back if the ioctl's `is_out` bit is set; the result. A submission
+/// that must wait for room ([`gpu`], "The ioctls") writes its out buffer at once and defers the
+/// result.
 fn run_ioctl(
     variant: IoctlVariant,
     cx: &mut Context<'_>,
@@ -895,6 +1013,13 @@ fn run_ioctl(
     let ioctl = Ioctl::from_raw(payload.read_u32()?);
     let limit = usize::try_from(MAX_ARGUMENT_BYTES).unwrap_or_default();
     let input = read_in(cx, req, 0, limit)?;
+    let inline_input = if gpu::reads_inline_input(variant, ioctl)
+        && cx.family::<NvsrvFamily>()?.reads_channels(fd)
+    {
+        read_in(cx, req, 1, gpu::MAX_ENTRY_BYTES)?
+    } else {
+        Vec::new()
+    };
     let out_len = out_buffer_len(cx, req, 0)?;
     let inline_out_len = if variant == IoctlVariant::Ioctl3 {
         out_buffer_len(cx, req, 1)?
@@ -906,16 +1031,22 @@ fn run_ioctl(
         fd,
         ioctl,
         input: &input,
+        inline_input: &inline_input,
         out_len,
         inline_out_len,
     };
     let policy = cx.policy();
-    let answer = cx.family::<NvsrvFamily>()?.ioctl(policy, &call);
+    let (answer, deferral) = cx.family::<NvsrvFamily>()?.ioctl(policy, &call);
     if ioctl.is_out() {
         write_out(cx, req, 0, &answer.output)?;
         if variant == IoctlVariant::Ioctl3 && !answer.inline.is_empty() {
             write_out(cx, req, 1, &answer.inline)?;
         }
+    }
+    if let Some(deferral) = deferral {
+        let token = cx.defer()?;
+        cx.family::<NvsrvFamily>()?.wait_for_room(deferral, token);
+        return reply.deferred();
     }
     reply.payload().write_u32(answer.result.raw());
     reply.ok()
@@ -947,23 +1078,42 @@ pub fn nvsrv_interfaces() -> Interfaces {
 }
 
 /// The nvsrv server's family: the state every session shares ([`NvsrvState`]), and the wiring
-/// nvhost-as-gpu reaches gsv's GPU memory through: gsv's shared state and the GPU's front.
-/// Only the state is saved; the wiring is the run's.
+/// nvhost-as-gpu and nvhost-gpu reach gsv through: gsv's shared state, the GPU's front and, once
+/// given, its channel front. Only the state is saved; the wiring is the run's.
 pub struct NvsrvFamily {
     state: NvsrvState,
     shared: Arc<Shared>,
     front: Arc<dyn GpuVmFront>,
+    channels: Option<Arc<dyn ChannelFront>>,
 }
 
 impl NvsrvFamily {
-    /// A new state over `shared`'s GPU memory and `front`.
+    /// A new state over `shared`'s GPU memory and `front`, with no channel front: nvhost-gpu's
+    /// ioctls go to the unknown-ioctl policy until [`with_channel_front`](Self::with_channel_front).
     #[must_use]
     pub fn new(shared: Arc<Shared>, front: Arc<dyn GpuVmFront>) -> Self {
         Self {
             state: NvsrvState::new(),
             shared,
             front,
+            channels: None,
         }
+    }
+
+    /// The same wiring with `channels` as the channel front nvhost-gpu's channels are made on
+    /// ([`gpu`]).
+    #[must_use]
+    pub fn with_channel_front(self, channels: Arc<dyn ChannelFront>) -> Self {
+        Self {
+            channels: Some(channels),
+            ..self
+        }
+    }
+
+    /// Whether an ioctl on `fd` reaches a channel: the server has a channel front and `fd` is
+    /// an open nvhost-gpu.
+    fn reads_channels(&self, fd: i32) -> bool {
+        self.channels.is_some() && self.state.file(fd) == Ok(Device::NvhostGpu)
     }
 
     /// The same wiring with `state` in place of the state.
@@ -979,26 +1129,72 @@ impl NvsrvFamily {
     }
 
     /// [`NvsrvState::ioctl`] with gsv's shared lock held, taken for every ioctl. No device calls
-    /// the kernel, so nothing is called under it but the GPU's front, which never calls back into
-    /// gsv (`crate::gpu`, "The server").
-    pub fn ioctl(&mut self, policy: UnknownPolicy, call: &IoctlCall<'_>) -> IoctlAnswer {
+    /// the kernel, so nothing is called under it but the GPU's fronts, which never call back into
+    /// gsv (`crate::gpu`, "The server"). The answer, and the submission that must wait for room,
+    /// if one must ([`wait_for_room`](Self::wait_for_room)).
+    pub fn ioctl(
+        &mut self,
+        policy: UnknownPolicy,
+        call: &IoctlCall<'_>,
+    ) -> (IoctlAnswer, Option<Deferral>) {
         let shared = Arc::clone(&self.shared);
+        let syncpoints = Arc::clone(shared.syncpoints());
         let mut locked = shared.lock();
+        let (memory, submits) = locked.gpu_and_submits();
+        let mut deferred = None;
+        let channels = self.channels.as_ref().map(|front| ChannelAccess {
+            submits,
+            syncpoints: &syncpoints,
+            front,
+            deferred: &mut deferred,
+        });
         let gpu = GpuAccess {
-            memory: locked.gpu(),
+            memory,
             front: &*self.front,
+            channels,
         };
-        self.state.ioctl(policy, call, gpu)
+        let answer = self.state.ioctl(policy, call, gpu);
+        (answer, deferred)
+    }
+
+    /// `deferral`'s submission waits for room in gsv's shared state, `token` answering its
+    /// request; the channel's queue is tried once more under gsv's lock, so a room report that
+    /// came since the front answered `Full` is not lost ([`gpu::submits`]).
+    pub fn wait_for_room(&mut self, deferral: Deferral, token: ReplyToken) {
+        let Some(front) = self.channels.as_ref() else {
+            // Only a server with a channel front defers a submission.
+            tracing::error!("nvsrv: a submission waits with no channel front");
+            token.fail(NOT_SUPPORTED);
+            return;
+        };
+        let front = Arc::clone(front);
+        let mut locked = self.shared.lock();
+        let Deferral {
+            channel,
+            submission,
+        } = deferral;
+        locked.submits().push(channel, token, submission, front);
     }
 
     /// [`NvsrvState::close`] with gsv's shared lock held, as for [`ioctl`](Self::ioctl): the
-    /// close may destroy an address space in gsv's GPU memory.
+    /// close may destroy an address space in gsv's GPU memory, a GPU channel, and answer the
+    /// channel's waiting submissions.
     pub fn close(&mut self, fd: i32) -> NvResult {
         let shared = Arc::clone(&self.shared);
+        let syncpoints = Arc::clone(shared.syncpoints());
         let mut locked = shared.lock();
+        let (memory, submits) = locked.gpu_and_submits();
+        let mut deferred = None;
+        let channels = self.channels.as_ref().map(|front| ChannelAccess {
+            submits,
+            syncpoints: &syncpoints,
+            front,
+            deferred: &mut deferred,
+        });
         let gpu = GpuAccess {
-            memory: locked.gpu(),
+            memory,
             front: &*self.front,
+            channels,
         };
         self.state.close(fd, gpu)
     }
