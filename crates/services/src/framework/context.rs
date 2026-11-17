@@ -168,8 +168,9 @@ impl Context<'_> {
 
     /// The injectable environment the server was given
     /// ([`Server::with_env`](super::Server::with_env)): the only way a method reaches host files,
-    /// the clock or random numbers (`docs/specs/observability.md`, rule 1). A copy of the handle,
-    /// so a [`Job`](super::work::Job) can take it along.
+    /// the clock or random numbers (`docs/specs/observability.md`, rule 1), while it handles a
+    /// request. A [`Job`](super::work::Job) does not take it along: its executor gives it the
+    /// environment it reads through ([`work`](super::work)).
     ///
     /// A server with no environment is a mistake in how it was put together: it is logged as an
     /// error and the request fails with [`NOT_SUPPORTED`], as for [`Context::family`].

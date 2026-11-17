@@ -30,6 +30,7 @@ use super::command::file_system::OPEN_FILE;
 use super::command::fsp_srv::{OPEN_SD_CARD_FILE_SYSTEM, SET_CURRENT_PROCESS};
 
 mod storage;
+mod worker;
 
 /// `IFile::Write`, which this subset leaves out, so it has no shipping constant
 /// (`eden/src/core/hle/service/filesystem/fsp/fs_i_file.cpp`: `{1, D<&IFile::Write>, "Write"}`).
@@ -184,26 +185,36 @@ impl Env for FakeEnv {
     }
 }
 
-/// An executor that keeps its jobs until the test runs them.
-#[derive(Default)]
-struct Jobs(Mutex<Vec<Job>>);
+/// An executor that keeps its jobs until the test runs them, with the environment it was made
+/// with.
+struct Jobs {
+    jobs: Mutex<Vec<Job>>,
+    env: Arc<dyn Env>,
+}
 
 impl Executor for Jobs {
     fn submit(&self, job: Job) {
-        self.0.lock().unwrap().push(job);
+        self.jobs.lock().unwrap().push(job);
     }
 }
 
 impl Jobs {
-    fn len(&self) -> usize {
-        self.0.lock().unwrap().len()
+    fn new(env: Arc<dyn Env>) -> Self {
+        Self {
+            jobs: Mutex::default(),
+            env,
+        }
     }
 
-    /// Runs every job, oldest first, on this thread.
+    fn len(&self) -> usize {
+        self.jobs.lock().unwrap().len()
+    }
+
+    /// Runs every job, oldest first, on this thread, each finished as soon as it has run.
     fn run(&self) {
-        let jobs = std::mem::take(&mut *self.0.lock().unwrap());
+        let jobs = std::mem::take(&mut *self.jobs.lock().unwrap());
         for job in jobs {
-            job();
+            job(&*self.env)();
         }
     }
 }
@@ -259,17 +270,41 @@ enum To {
 
 impl Rig {
     fn with(card: bool, executor: bool) -> Self {
+        let env = FakeEnv::new(card);
+        let env_handle: Arc<dyn Env> = Arc::<FakeEnv>::clone(&env);
+        let jobs = Arc::new(Jobs::new(env_handle));
+        let wakes = Arc::new(Wakes::default());
+        let notify: Arc<dyn Notify> = Arc::<Wakes>::clone(&wakes);
+        let executor = executor.then(|| {
+            let executor: Arc<dyn Executor> = Arc::<Jobs>::clone(&jobs);
+            executor
+        });
+        Self::built(env, (jobs, executor), (wakes, notify))
+    }
+
+    /// A rig over `env` whose server hands its jobs to `executor` and tells `notify` of its
+    /// completions (`worker.rs`); its own [`Jobs`] and [`Wakes`] are not used.
+    fn over(env: Arc<FakeEnv>, executor: Arc<dyn Executor>, notify: Arc<dyn Notify>) -> Self {
+        let env_handle: Arc<dyn Env> = Arc::<FakeEnv>::clone(&env);
+        let jobs = Arc::new(Jobs::new(env_handle));
+        Self::built(
+            env,
+            (jobs, Some(executor)),
+            (Arc::new(Wakes::default()), notify),
+        )
+    }
+
+    fn built(
+        env: Arc<FakeEnv>,
+        (jobs, executor): (Arc<Jobs>, Option<Arc<dyn Executor>>),
+        (wakes, notify): (Arc<Wakes>, Arc<dyn Notify>),
+    ) -> Self {
         let mut kernel = FakeKernel::new(0).unwrap();
         kernel.set_process_id(PROCESS_ID);
         let session = kernel.new_object();
-        let env = FakeEnv::new(card);
-        let jobs = Arc::new(Jobs::default());
-        let wakes = Arc::new(Wakes::default());
         let env_handle: Arc<dyn Env> = Arc::<FakeEnv>::clone(&env);
-        let notify: Arc<dyn Notify> = Arc::<Wakes>::clone(&wakes);
         let mut server = server(UnknownPolicy::Strict, env_handle).with_notify(notify);
-        if executor {
-            let executor: Arc<dyn Executor> = Arc::<Jobs>::clone(&jobs);
+        if let Some(executor) = executor {
             server = server.with_executor(executor);
         }
         server.accept(session).unwrap();
@@ -1099,7 +1134,7 @@ fn a_dropped_read_job_answers_the_caller() {
     let mut rig = Rig::new();
     let file = To::Session(rig.hello());
     rig.defer(file, READ, read(0, 4, 16));
-    drop(std::mem::take(&mut *rig.jobs.0.lock().unwrap()));
+    drop(std::mem::take(&mut *rig.jobs.jobs.lock().unwrap()));
     let reply = rig.deliver(SessionKind::Session);
     assert_eq!(reply, only(crate::framework::DEFERRED_REPLY_DROPPED));
 }

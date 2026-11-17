@@ -244,4 +244,4 @@ pub use server::{
 pub use snapshot::{Family, Interfaces, SNAPSHOT_MAGIC, SNAPSHOT_VERSION, SnapshotError};
 pub use targets::{MAX_DOMAIN_OBJECTS, TargetError};
 pub use trace::NO_COMMAND_ID;
-pub use work::{Executor, Job};
+pub use work::{Executor, Finish, Job};

@@ -221,11 +221,13 @@ use starquake_trace::Env;
 
 use crate::commands;
 use crate::framework::{
-    Context, DeferredBuffer, Interfaces, Outcome, Reply, ReplyToken, Request, Server, UnknownPolicy,
+    Context, DeferredBuffer, Finish, Interfaces, Outcome, Reply, ReplyToken, Request, Server,
+    UnknownPolicy,
 };
 
 pub mod host;
 pub mod path;
+pub mod worker;
 
 #[cfg(test)]
 mod tests;
@@ -552,12 +554,14 @@ struct ReadJob {
 }
 
 impl ReadJob {
-    /// Asks the host and completes the token with the answer.
-    fn run(self, env: &dyn Env, token: ReplyToken) {
-        match self.fetch(env) {
+    /// Asks the host through `env`, the environment the executor gives the job, and returns the
+    /// step that completes the token with the answer ([`Finish`]).
+    fn run(self, env: &dyn Env, token: ReplyToken) -> Finish {
+        let answer = self.fetch(env);
+        Box::new(move || match answer {
             Ok(reply) => token.complete(reply),
             Err(code) => token.fail(code),
-        }
+        })
     }
 
     /// The reply: the bytes read as an `s64` (when the job says so), and the bytes for out
@@ -624,7 +628,6 @@ fn deferred_read(
     if offset.checked_add(size).is_none() {
         return Err(result::OUT_OF_RANGE.into());
     }
-    let env = cx.env()?;
     let executor = cx.executor()?;
     let token = cx.defer()?;
     let (mount, path) = target;
@@ -636,7 +639,7 @@ fn deferred_read(
         buffer,
         count,
     };
-    executor.submit(Box::new(move || job.run(&*env, token)));
+    executor.submit(Box::new(move |env: &dyn Env| job.run(env, token)));
     reply.deferred()
 }
 
