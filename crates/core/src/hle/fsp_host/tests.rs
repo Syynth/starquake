@@ -315,7 +315,7 @@ fn a_file_of_the_data_file_system_is_the_storage_s_bytes_at_its_data() {
     let whole = image(&romfs);
     let mut host = FspHost::new(None, Some(romfs));
     let HostIoReply::Data(file) = ask(&mut host, &files_read(b"/top.bin", 0, u64::MAX)) else {
-        panic!("the file did not read");
+        unreachable!("the file did not read");
     };
     let at = whole
         .windows(file.len())

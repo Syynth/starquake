@@ -85,17 +85,17 @@ fn a_guest_opens_the_titles_romfs_as_a_file_system_and_reads_a_file() {
     // A read is deferred to `fsp-srv`'s workers, and the file's bytes arrive with the reply:
     // from offset 7, more than the file has left, so the count is what there was.
     let offset = 7;
-    let room = 0x80;
+    let capacity = 0x80;
     let buffer_room = BufferDescriptor {
         address: FIRMWARE,
-        size: room,
+        size: capacity,
         flags: 0,
     };
     let payload = [
         &0_u32.to_le_bytes()[..],
         &[0; 4],
         &i64::try_from(offset).unwrap().to_le_bytes(),
-        &i64::try_from(room).unwrap().to_le_bytes(),
+        &i64::try_from(capacity).unwrap().to_le_bytes(),
     ]
     .concat();
     let read = domain(file, &IFile::default(), "read")

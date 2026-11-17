@@ -114,10 +114,13 @@
 //! ([`Given::halt`]): told the reason on the thread that saw the failure, before the request is
 //! answered, it keeps the first reason and rings the timer. From then on [`Machine::is_stopped`]
 //! is true, and the first loop to ask ends the run with the reason's words. Every core asks
-//! after it has chosen the thread it runs and before it enters the guest, so no guest
-//! instruction runs once the halt is told: not the requesting thread's, whose reply is written
-//! after the halt, and not any other's (tests: `an_environment_failure_in_a_handler_stops_the_run`
-//! and `an_environment_failure_in_a_read_stops_the_run`, in `machine/tests/reads.rs`).
+//! after it has chosen the thread it runs and before it enters the guest, so no core enters the
+//! guest once the halt is told: not for the requesting thread, whose reply comes after the
+//! halt, and not for any other. The tests `an_environment_failure_in_a_handler_stops_the_run`
+//! and `an_environment_failure_in_a_read_stops_the_run` (`machine/tests/reads.rs`) pin the
+//! reason the run ends with and that the guest's next step never runs. The check before
+//! entering is what covers a thread that a delivery woke on another thread while the halt was
+//! told; that race is not one those tests force.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};

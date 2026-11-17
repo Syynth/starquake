@@ -95,11 +95,11 @@ impl ReadyServers {
 }
 
 /// A halt for services whose test expects the environment never to fail: a stop fails the test.
-struct Unexpected;
+pub(crate) struct Unexpected;
 
 impl Halt for Unexpected {
     fn halt(&self, stop: Stop) {
-        panic!("the run was told to stop: {stop}");
+        unreachable!("the run was told to stop: {stop}");
     }
 }
 

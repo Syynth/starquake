@@ -473,7 +473,7 @@ fn an_environment_failure_in_a_read_stops_the_run() {
         job: 0,
         error: ENV_FAILURE,
     };
-    assert_eq!(live_halts.stops(), [stop.clone()]);
+    assert_eq!(live_halts.stops(), std::slice::from_ref(&stop));
     assert_eq!(
         stop.to_string(),
         "the environment failed file-system job 0: recording exhausted at record 7: the replay \
@@ -844,6 +844,56 @@ fn a_divergence_is_reported_before_the_recorded_jobs_left_unfinished() {
             error: EnvError::HostIoRequestMismatch { index: 0 },
         })
     );
+}
+
+/// A replayed job that asks for `request`, notes how many stops `halts` had been told once it
+/// had its answer, and whose finish, if it is ever called, sends its number on `guard`.
+fn job_noting_stops(
+    request: HostIoRequest,
+    halts: &Arc<Halts>,
+    guard: Unrun,
+) -> (Job, Arc<Mutex<Vec<usize>>>) {
+    let noted = Arc::new(Mutex::new(Vec::new()));
+    let noting = Arc::clone(&noted);
+    let halts = Arc::clone(halts);
+    let job: Job = Box::new(move |env: &dyn Env| {
+        drop(env.host_io(&request));
+        noting.lock().unwrap().push(halts.stops().len());
+        let finish: Finish = Box::new(move || guard.ran());
+        finish
+    });
+    (job, noted)
+}
+
+#[test]
+fn a_replayed_job_stops_the_run_at_its_answer_and_is_left_unfinished() {
+    // A divergence, and a recorded failure reached: each is told while the job runs, before it
+    // returns, and the job's finish is dropped without being called.
+    let failed = Completed {
+        job: JobIndex::new(0),
+        answers: Vec::new(),
+        failure: Some(env_failure(Question::HostIo(hello_read(4, 4)))),
+    };
+    for (record, request) in [
+        (hello_record(0, 0, 4), hello_read(8, 4)),
+        (failed, hello_read(4, 4)),
+    ] {
+        let (replay, halts) = replay_halting(vec![record]);
+        let (unrun, dropped) = mpsc::channel();
+        let (job, noted) = job_noting_stops(request, &halts, Unrun(Some(unrun), 0));
+        replay.submit(job);
+        assert_eq!(*noted.lock().unwrap(), [1]);
+        assert_eq!(halts.stops().len(), 1);
+        assert_eq!(dropped.recv_timeout(WAIT), Ok(0), "the finish was called");
+    }
+    // A job that follows the record is finished, and nothing is told.
+    let (replay, halts) = replay_halting(vec![hello_record(0, 0, 4)]);
+    let (unrun, dropped) = mpsc::channel();
+    let (job, noted) = job_noting_stops(hello_read(0, 4), &halts, Unrun(Some(unrun), 0));
+    replay.submit(job);
+    assert_eq!(*noted.lock().unwrap(), [0]);
+    assert_eq!(halts.stops(), []);
+    assert!(dropped.try_recv().is_err(), "the finish was not called");
 }
 
 #[test]

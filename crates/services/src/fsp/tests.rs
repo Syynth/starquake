@@ -259,7 +259,7 @@ struct Unexpected;
 
 impl Halt for Unexpected {
     fn halt(&self, stop: Stop) {
-        panic!("the run was told to stop: {stop}");
+        unreachable!("the run was told to stop: {stop}");
     }
 }
 

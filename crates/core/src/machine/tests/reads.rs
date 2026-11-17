@@ -28,7 +28,7 @@ use starquake_services::sm::{self, MAX_NAME_LEN, ServiceName};
 use starquake_trace::{EnvCall, EnvError, HostIoReply, HostIoRequest, HostNanos};
 
 use super::*;
-use crate::hle::tests::Scratch;
+use crate::hle::tests::{Scratch, Unexpected};
 use crate::title::RomFs;
 
 /// Where in the thread-local page the port's name, a path and the read buffer are.
@@ -642,14 +642,8 @@ fn a_runs_workers_read_through_environments_of_their_own() {
     assert!(checked.load(Ordering::SeqCst));
 }
 
-/// A halt for workers whose test expects the environment never to fail: a stop fails the test.
-struct Unexpected;
-
-impl Halt for Unexpected {
-    fn halt(&self, stop: Stop) {
-        panic!("the run was told to stop: {stop}");
-    }
-}
+/// A step of a scripted guest that writes its next request.
+type Writes = Box<dyn FnOnce(&Script)>;
 
 /// What [`FailsHostIo`] answers every host request with.
 const HOST_IO_FAILURE: EnvError = EnvError::Exhausted {
@@ -680,7 +674,7 @@ impl Env for FailsHostIo {
 /// `ExitProcess`.
 fn guest_failed_by_its_environment(
     guest: &Script,
-    fsp: Vec<Box<dyn FnOnce(&Script)>>,
+    fsp: Vec<Writes>,
     ran_again: &Rc<std::cell::Cell<bool>>,
 ) -> ScriptedVcpu {
     let name = guest.base + NAME_AT;
@@ -737,7 +731,7 @@ fn guest_failed_by_its_environment(
 /// Runs `fsp`'s requests (see [`guest_failed_by_its_environment`]) with the title RomFS as the
 /// data storage, and the services `install` sets up; returns the report and whether the guest
 /// ran again after its last request.
-fn run_failed(fsp: Vec<Box<dyn FnOnce(&Script)>>, install: &Install) -> (RunReport, bool) {
+fn run_failed(fsp: Vec<Writes>, install: &Install) -> (RunReport, bool) {
     let guest = super::Guest::new(&programs::hello().unwrap());
     let page = usize::try_from(crate::image::PAGE).unwrap();
     let tls = Arc::new(FlatMemory::new(guest.tls, page));
@@ -778,7 +772,7 @@ fn an_environment_failure_in_a_handler_stops_the_run() {
         let env: Arc<dyn Env> = Arc::new(FailsHostIo(Arc::clone(&given.env)));
         real_services(dispatcher, Given { env, ..given })
     };
-    let open: Box<dyn FnOnce(&Script)> = Box::new(|guest| {
+    let open: Writes = Box::new(|guest| {
         guest.write(&libnx(
             command::fsp_srv::OPEN_DATA_STORAGE_BY_CURRENT_PROCESS,
         ));
@@ -811,12 +805,12 @@ fn an_environment_failure_in_a_read_stops_the_run() {
         };
         crate::hle::install(dispatcher, given.env, reads).map_err(|error| error.to_string())
     };
-    let open: Box<dyn FnOnce(&Script)> = Box::new(|guest| {
+    let open: Writes = Box::new(|guest| {
         guest.write(&libnx(
             command::fsp_srv::OPEN_DATA_STORAGE_BY_CURRENT_PROCESS,
         ));
     });
-    let read: Box<dyn FnOnce(&Script)> = Box::new(|guest| {
+    let read: Writes = Box::new(|guest| {
         let payload = [0_i64.to_le_bytes(), 4_i64.to_le_bytes()].concat();
         let read = libnx(command::storage::READ)
             .data(&payload)

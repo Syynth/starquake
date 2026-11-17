@@ -14,6 +14,7 @@
 //!
 //! Every wait is bounded by [`WAIT`].
 
+use std::error::Error;
 use std::fmt;
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
@@ -44,19 +45,21 @@ struct Logged {
 #[derive(Clone, Default)]
 struct Logs(Arc<(Mutex<Vec<Logged>>, Condvar)>);
 
+/// What a check returns: nothing, or whatever stopped it.
+type Check<T = ()> = Result<T, Box<dyn Error>>;
+
 impl Logs {
     /// Waits, for at most [`WAIT`], until an event like `wanted` has been logged.
-    fn await_logged(&self, wanted: &Logged) {
+    fn await_logged(&self, wanted: &Logged) -> Check {
         let (logged, changed) = &*self.0;
-        let logged = logged.lock().unwrap();
+        let logged = logged.lock().map_err(|_| "the log was poisoned")?;
         let (logged, timeout) = changed
             .wait_timeout_while(logged, WAIT, |logged| !logged.contains(wanted))
-            .unwrap();
-        assert!(
-            !timeout.timed_out(),
-            "{wanted:?} was not logged; these were: {:?}",
-            *logged
-        );
+            .map_err(|_| "the log was poisoned")?;
+        if timeout.timed_out() {
+            return Err(format!("{wanted:?} was not logged; these were: {:?}", *logged).into());
+        }
+        Ok(())
     }
 }
 
@@ -135,7 +138,7 @@ struct Unexpected;
 
 impl Halt for Unexpected {
     fn halt(&self, stop: Stop) {
-        panic!("the run was told to stop: {stop}");
+        unreachable!("the run was told to stop: {stop}");
     }
 }
 
@@ -161,29 +164,33 @@ fn finish_panicking() -> starquake_services::framework::Job {
     })
 }
 
-/// A job whose finish says it ran.
+/// A job whose finish says it ran. A finish whose test has stopped listening has nobody to tell.
 fn job_finishing(finished: &mpsc::Sender<u64>, job: u64) -> starquake_services::framework::Job {
     let finished = finished.clone();
     Box::new(move |_: &dyn Env| {
-        let finish: Finish = Box::new(move || finished.send(job).unwrap());
+        let finish: Finish = Box::new(move || {
+            if finished.send(job).is_err() {
+                // The test stopped listening: nobody to tell.
+            }
+        });
         finish
     })
 }
 
-fn a_panic_on_a_worker_is_logged_with_its_job(logs: &Logs) {
+fn a_panic_on_a_worker_is_logged_with_its_job(logs: &Logs) -> Check {
     let env: Arc<dyn Env> = Arc::new(Unread);
     let envs = vec![env; COUNT.get()];
-    let workers = Workers::new(envs, Recording::Off, Arc::new(Unexpected)).unwrap();
+    let workers = Workers::new(envs, Recording::Off, Arc::new(Unexpected))?;
     let (finished, done) = mpsc::channel();
     workers.submit(job_panicking());
     workers.submit(finish_panicking());
     workers.submit(job_finishing(&finished, 2));
     assert_eq!(done.recv_timeout(WAIT), Ok(2));
-    logs.await_logged(&panicked(JOB_PANICKED, 0));
-    logs.await_logged(&panicked(FINISH_PANICKED, 1));
+    logs.await_logged(&panicked(JOB_PANICKED, 0))?;
+    logs.await_logged(&panicked(FINISH_PANICKED, 1))
 }
 
-fn a_panic_in_a_replay_is_logged_with_its_job(logs: &Logs) {
+fn a_panic_in_a_replay_is_logged_with_its_job(logs: &Logs) -> Check {
     let record = (0..3)
         .map(|job| Completed {
             job: JobIndex::new(job),
@@ -191,22 +198,23 @@ fn a_panic_in_a_replay_is_logged_with_its_job(logs: &Logs) {
             failure: None,
         })
         .collect();
-    let replay = Replay::new(record, Arc::new(Unexpected)).unwrap();
+    let replay = Replay::new(record, Arc::new(Unexpected))?;
     let (finished, done) = mpsc::channel();
     // Each runs on this thread as it is submitted; none unwinds into the submission.
     replay.submit(job_panicking());
-    logs.await_logged(&panicked(JOB_PANICKED, 0));
+    logs.await_logged(&panicked(JOB_PANICKED, 0))?;
     replay.submit(finish_panicking());
-    logs.await_logged(&panicked(FINISH_PANICKED, 1));
+    logs.await_logged(&panicked(FINISH_PANICKED, 1))?;
     replay.submit(job_finishing(&finished, 2));
     assert_eq!(done.recv_timeout(WAIT), Ok(2));
     assert_eq!(replay.check(), Ok(()));
+    Ok(())
 }
 
 #[test]
-fn a_job_that_panics_is_logged_as_an_error_naming_it() {
+fn a_job_that_panics_is_logged_as_an_error_naming_it() -> Check {
     let logs = Logs::default();
-    tracing::subscriber::set_global_default(logs.clone()).unwrap();
-    a_panic_on_a_worker_is_logged_with_its_job(&logs);
-    a_panic_in_a_replay_is_logged_with_its_job(&logs);
+    tracing::subscriber::set_global_default(logs.clone())?;
+    a_panic_on_a_worker_is_logged_with_its_job(&logs)?;
+    a_panic_in_a_replay_is_logged_with_its_job(&logs)
 }

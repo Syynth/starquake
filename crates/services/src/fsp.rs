@@ -106,7 +106,8 @@
 //!
 //! # Where this differs from Eden
 //!
-//! Each difference is pinned by the test named, in `fsp/tests.rs`:
+//! Each difference is pinned by the test named, in `fsp/tests.rs` or the files beside it in
+//! `fsp/tests/`:
 //!
 //! - **No SD card.** Eden's `OpenSdCardFileSystem` ignores the `ResultPortSdCardNoDevice` that
 //!   `FileSystemController::OpenSDMC` returns when there is no SD card, and replies success with
@@ -178,8 +179,8 @@
 //! - **The environment failing** is not a host failure and has no result code: it stops the run
 //!   ([`halt`]; decision log, 2026-11-17, "Env failures"). The request is answered as one the
 //!   server gave up on, `DEFERRED_REPLY_DROPPED`, which the guest never runs to see
-//!   (`an_environment_failure_in_a_handler_stops_the_run`,
-//!   `an_environment_failure_in_a_read_stops_the_run`).
+//!   (`an_environment_failure_in_a_handler_stops_the_run` here, for each handler that reads the
+//!   environment; `an_environment_failure_in_a_read_stops_the_run` in `fsp/tests/worker.rs`).
 //!
 //! - **No data storage.** Eden's `OpenDataStorageByCurrentProcess` answers `ResultUnknown`
 //!   (`eden/src/core/hle/result.h`, `ResultUnknown(UINT32_MAX)`) when the current process has no
