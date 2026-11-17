@@ -19,7 +19,13 @@
 //! `graphics_scaling_parameters_functions.cpp` and `.h` (`IGraphicsScalingParametersFunctions`)
 //! and `application_functions.cpp` (`IApplicationFunctions` 320 and 321), with the applet's
 //! initial values from `eden-pr4588/src/core/hle/service/am/applet.h` (see "The Switch 2
-//! additions").
+//! additions"). The other commands a Switch 2 title sends at start-up, and the setters 320
+//! reads, are ported from PR #4588 @ e5fb3b97 too, whose handlers for them are Eden's own:
+//! `common_state_getter.cpp` (`ICommonStateGetter` 900), `application_functions.cpp`
+//! (`IApplicationFunctions` 65, 67, 130 and 330) and `self_controller.cpp` (`ISelfController`
+//! 10), with `ScreenshotPermission` and `GamePlayRecordingState` from
+//! `eden-pr4588/src/core/hle/service/am/am_types.h` (see "The title's start-up commands" and
+//! "Screenshots and recording").
 //!
 //! # Commands
 //!
@@ -27,9 +33,12 @@
 //! sends (`tests/homebrew/startup/reference/startup.trace`; its README's gap list named them),
 //! `ISelfController::Exit` (0), which libnx sends when the program ends (see "Where this
 //! differs from Eden"), `ISelfController` 2000, a Switch 2 command (see "The graphics
-//! server" below), and the other Switch 2 additions the scoping doc names (see "The Switch 2
-//! additions" below); every other command of these interfaces is left out and answered by the
-//! server's unknown-command policy.
+//! server" below), the other Switch 2 additions the scoping doc names (see "The Switch 2
+//! additions" below), the commands a Switch 2 title sends at start-up that those leave out
+//! (`ICommonStateGetter` 900 and `IApplicationFunctions` 130), `IApplicationFunctions` 330,
+//! next to 320 and 321 in PR's table (see "The title's start-up commands"), and the three
+//! commands whose state 320 reads (see "Screenshots and recording"); every other command of
+//! these interfaces is left out and answered by the server's unknown-command policy.
 //!
 //! | Interface | Id | Command | In | Out |
 //! |---|---|---|---|---|
@@ -49,7 +58,9 @@
 //! | | 5 | `GetOperationMode` | nothing | `u8` [`OperationMode`] |
 //! | | 6 | `GetPerformanceMode` | nothing | `s32` [`PerformanceMode`] |
 //! | | 9 | `GetCurrentFocusState` | nothing | `u8` [`FocusState`] |
+//! | | 900 | `SetRequestExitToLibraryAppletAtExecuteNextProgramEnabled` | nothing | nothing |
 //! | [`ISelfController`] | 0 | `Exit` | nothing | nothing; the process ends after the reply |
+//! | | 10 | `SetScreenShotPermission` | `u32` [`ScreenshotPermission`] | nothing |
 //! | | 11 | `SetOperationModeChangedNotification` | `bool` (a byte) | nothing |
 //! | | 12 | `SetPerformanceModeChangedNotification` | `bool` | nothing |
 //! | | 13 | `SetFocusHandlingMode` | `bool notify, bool background, bool suspend`, a byte each | nothing |
@@ -59,8 +70,12 @@
 //! | [`IWindowController`] | 1 | `GetAppletResourceUserId` | nothing | `u64` the applet resource user id |
 //! | | 10 | `AcquireForegroundRights` | nothing | nothing |
 //! | [`IApplicationFunctions`] | 40 | `NotifyRunning` | nothing | `bool` (a byte): true |
-//! | | 320 | `GetScreenShotAndContinuousRecordingInitiallyEnabled` (Switch 2) | nothing | `bool screenshot, bool recording`, a byte each: [`SCREENSHOT_INITIALLY_ENABLED`], [`CONTINUOUS_RECORDING_INITIALLY_ENABLED`] |
+//! | | 65 | `IsGamePlayRecordingSupported` | nothing | `bool` (a byte): [`GAME_PLAY_RECORDING_SUPPORTED`] |
+//! | | 67 | `SetGamePlayRecordingState` | `u32` [`GamePlayRecordingState`] | nothing |
+//! | | 130 | `GetGpuErrorDetectedSystemEvent` | nothing | copy handle: the applet's GPU-error event |
+//! | | 320 | `GetScreenShotAndContinuousRecordingInitiallyEnabled` (Switch 2) | nothing | `bool screenshot, bool recording`, a byte each, from the applet ([`Applet::screenshot_and_continuous_recording_initially_enabled`]) |
 //! | | 321 | `Unknown321` (Switch 2) | nothing | `bool` (a byte): [`UNKNOWN_321_ENABLED`] |
+//! | | 330 | `Unknown330` | nothing | `u8`: [`UNKNOWN_330_VALUE`] |
 //! | [`IGraphicsScalingParametersFunctions`] (Switch 2) | 10 | `GetGraphicsScalingParameters` | nothing | a [`GraphicsScalingParameters`]: three `u32`s |
 //! | | 1050 | `SetGraphicsScaleChangedNotificationEnabled` | `bool` (a byte) | nothing |
 //!
@@ -78,8 +93,16 @@
 //!   (`eden/src/core/hle/service/cmif_serialization.h`, `InProcessId`: `pid = ctx.GetPID()`).
 //! - The `Get...` commands that return an interface: libnx `_appletCmdGetSession` (no payload,
 //!   one out object); Eden `Out<SharedPointer<..>>`.
-//! - `GetEventHandle`, `GetAccumulatedSuspendedTickChangedEvent`: libnx `_appletCmdGetEvent` (one
-//!   copied handle); Eden `OutCopyHandle<KReadableEvent>`.
+//! - `GetEventHandle`, `GetAccumulatedSuspendedTickChangedEvent`,
+//!   `GetGpuErrorDetectedSystemEvent`: libnx `_appletCmdGetEvent` (one copied handle); Eden
+//!   `OutCopyHandle<KReadableEvent>`.
+//! - `SetRequestExitToLibraryAppletAtExecuteNextProgramEnabled`: libnx `_appletCmdNoIO`; Eden
+//!   `Result SetRequestExitToLibraryAppletAtExecuteNextProgramEnabled()`.
+//! - `SetScreenShotPermission`, `SetGamePlayRecordingState`: libnx `_appletCmdInU32NoOut` (one
+//!   `u32`; for 67 libnx sends `state != 0`, so 0 or 1); Eden one `ScreenshotPermission` or
+//!   `GamePlayRecordingState` argument, each an `enum class : u32` (`am_types.h`), at offset 0.
+//! - `IsGamePlayRecordingSupported`: libnx `_appletCmdNoInOutBool`; Eden `Out<bool>`.
+//! - `Unknown330`: no libnx client; Eden `Out<u8>`.
 //! - `GetOperationMode`, `GetCurrentFocusState`: libnx `_appletCmdNoInOutU8`; Eden
 //!   `Out<OperationMode>` and `Out<FocusState>`, both `u8` enums (`am_types.h`).
 //!   `GetPerformanceMode`: libnx `_appletCmdNoInOutU32`; Eden `Out<APM::PerformanceMode>`, an
@@ -128,6 +151,12 @@
 //!   (`applet_manager.cpp`: `SetFocusState(FocusState::InFocus)`, "Applet was started by
 //!   frontend, so it is foreground"), and nothing in a run changes it.
 //!
+//! A restore checks only the graphics server's number against the run (see "The graphics
+//! server"). Not checked here: the event ids the applet saves (the message, suspended-tick and
+//! GPU-error events). A restore believes them, and a command that then uses one the kernel did
+//! not make answers the kernel's error (`a_failed_signal_still_keeps_the_lifecycle_change`
+//! shows it for the message event).
+//!
 //! # The message event
 //!
 //! `GetEventHandle` returns the applet's message event (Eden: the lifecycle manager's system
@@ -157,8 +186,8 @@
 //! The events are created the first time a command returns them, not when the applet is: the
 //! kernel interface is reached only while a request is handled. A message event created then is
 //! signalled exactly when the condition above holds, which is the state Eden's event is in at
-//! that moment. The suspended-tick event is never signalled, as in Eden (only its constructor
-//! names it, `applet.cpp`).
+//! that moment. The suspended-tick and GPU-error events are never signalled, as in Eden (only
+//! the applet's constructor names them, `applet.cpp`).
 //!
 //! # Where this differs from Eden
 //!
@@ -218,22 +247,10 @@
 //!   it changes no answer. PR's other rows (1000, 1010, 1020, 1030 and 1040, all `...ForDebug`)
 //!   are `nullptr`, and go to the unknown-command policy.
 //! - **`IApplicationFunctions` 320** (`GetScreenShotAndContinuousRecordingInitiallyEnabled`)
-//!   answers PR's expressions over the applet: screenshots are enabled when
-//!   `screenshot_permission != ScreenshotPermission::Disable`, and continuous recording when
-//!   `game_play_recording_supported && game_play_recording_state ==
-//!   GamePlayRecordingState::Enabled`. Nothing ported here changes those fields (PR's
-//!   `ISelfController::SetScreenShotPermission` and `IApplicationFunctions::
-//!   SetGamePlayRecordingState` are not ported), so they keep `applet.h`'s initial values:
-//!   `ScreenshotPermission::Inherit` (the enum's 0, `screenshot_permission{}`), `false` and
-//!   `GamePlayRecordingState::Disabled`. So the answer is fixed: [`SCREENSHOT_INITIALLY_ENABLED`]
-//!   true and [`CONTINUOUS_RECORDING_INITIALLY_ENABLED`] false. A port of either setter turns the
-//!   two into applet state.
+//!   answers PR's expressions over the applet (see "Screenshots and recording").
 //! - **`IApplicationFunctions` 321** (`Unknown321`) answers false ([`UNKNOWN_321_ENABLED`]).
 //!   PR names it `Unknown321`, and its comment says what the SDK uses the bool for; both the
 //!   meaning and the value are PR's guesses.
-//!
-//! PR's `IApplicationFunctions` table also has 330 (`Unknown330`, marked 20.0.0+), which the
-//! scoping doc does not name; it is not ported, and goes to the unknown-command policy.
 //!
 //! Where these differ from PR #4588:
 //!
@@ -247,9 +264,59 @@
 //!   with fewer argument bytes is refused only when the raw data also ends before the field, and
 //!   otherwise reads the padding and succeeds. Only the domain case is pinned:
 //!   `open_application_proxy_with_flags_checks_its_flags_first` (0 bytes, then 1, 2 and 3 bytes
-//!   with libnx's exact domain `size`, refused, and 4 bytes, accepted) and
-//!   `set_graphics_scale_changed_notification_enabled_keeps_its_flag` (0 bytes).
+//!   with libnx's exact domain `size`, refused, and 4 bytes, accepted),
+//!   `set_graphics_scale_changed_notification_enabled_keeps_its_flag` (0 bytes) and, for
+//!   `SetScreenShotPermission` and `SetGamePlayRecordingState` (Eden's handlers, under the same
+//!   `ReadInArgument`), `a_payload_too_short_for_the_word_is_refused_and_changes_nothing` (0, 1,
+//!   2 and 3 bytes with libnx's exact domain `size`, refused, and 4 bytes, accepted).
 //! - The process id and handle checks are command 0's ("Where this differs from Eden").
+//!
+//! # Screenshots and recording
+//!
+//! 320 answers, in this order, PR's `screenshot_permission != ScreenshotPermission::Disable`
+//! ([`ScreenshotPermission::screenshots_enabled`]) and `game_play_recording_supported &&
+//! game_play_recording_state == GamePlayRecordingState::Enabled`
+//! ([`GamePlayRecordingState::continuous_recording_enabled`]), over the applet
+//! (`eden-pr4588/src/core/hle/service/am/service/application_functions.cpp` @ e5fb3b97). The
+//! fields follow the commands that set them, as in PR:
+//!
+//! - **`ISelfController::SetScreenShotPermission` (10)** keeps the `u32` it is sent in the
+//!   applet ([`Applet::screenshot_permission`]), initially `Inherit` (`applet.h`,
+//!   `screenshot_permission{}`). Any word is kept, as PR's `enum class : u32` keeps it; only
+//!   `Disable` (2) turns screenshots off, so a word that differs from 2 above its low byte
+//!   leaves them on (`set_screen_shot_permission_keeps_its_word_and_320_follows_it`).
+//! - **`IApplicationFunctions::SetGamePlayRecordingState` (67)** keeps its `u32` likewise
+//!   ([`Applet::game_play_recording_state`]), initially `Disabled` (`applet.h`).
+//! - **`IApplicationFunctions::IsGamePlayRecordingSupported` (65)** answers
+//!   `game_play_recording_supported`, which no command of Eden, Eden-NX2 or PR writes, so it
+//!   keeps `applet.h`'s `false`: [`GAME_PLAY_RECORDING_SUPPORTED`], a constant here. So 320's
+//!   second byte is false whatever the state
+//!   (`set_game_play_recording_state_keeps_its_word_and_recording_stays_off`); the expression
+//!   itself is pinned for both values of the support flag by
+//!   `continuous_recording_needs_support_and_the_enabled_state`. A port of something that
+//!   writes the flag makes it applet state.
+//!
+//! `IApplicationFunctions::InitializeGamePlayRecording` (66), which libnx sends before it sets
+//! the state on, is not ported: it goes to the unknown-command policy.
+//!
+//! # The title's start-up commands
+//!
+//! A Switch 2 title sends two commands at start-up that the scoping doc has no row for:
+//! `ICommonStateGetter` 900 and `IApplicationFunctions` 130. Each is ported as Eden, Eden-NX2
+//! and PR #4588 have it, the same handler in all three:
+//!
+//! - **`SetRequestExitToLibraryAppletAtExecuteNextProgramEnabled` (900)** sets the applet's
+//!   `request_exit_to_library_applet_at_execute_next_program_enabled` to true
+//!   ([`Applet::request_exit_to_library_applet_at_execute_next_program_enabled`], initially
+//!   false: `applet.h`) and answers nothing. No reference reads the flag, so it changes no
+//!   answer.
+//! - **`GetGpuErrorDetectedSystemEvent` (130)** copies a handle to the applet's GPU-error event
+//!   ([`Applet::gpu_error_detected_event`]), made the first time, as the suspended-tick event
+//!   is, and never signalled: no reference signals `gpu_error_detected_event`.
+//!
+//! `IApplicationFunctions` 330 (`Unknown330`, marked 20.0.0+) sits next to 320 and 321 in PR's
+//! table and is the same in all three references, `Out<u8>` set to 0
+//! ([`UNKNOWN_330_VALUE`]); the scoping doc has no row for it either.
 //!
 //! # The graphics server
 //!
@@ -319,18 +386,98 @@ pub const UNKNOWN: ResultCode = ResultCode::from_raw(u32::MAX);
 /// ResultUnknown)`. Any other value is answered [`UNKNOWN`].
 pub const PROXY_FLAGS_ACCEPTED: [u32; 2] = [0, 2];
 
-/// Whether screenshots are initially enabled, as
-/// `GetScreenShotAndContinuousRecordingInitiallyEnabled` answers: PR #4588's
-/// `screenshot_permission != ScreenshotPermission::Disable`, over the initial
-/// `ScreenshotPermission::Inherit` (module docs, "The Switch 2 additions").
-pub const SCREENSHOT_INITIALLY_ENABLED: bool = true;
+/// Whether the applet supports game-play recording, as `IsGamePlayRecordingSupported` answers
+/// and `GetScreenShotAndContinuousRecordingInitiallyEnabled` reads (module docs, "Screenshots
+/// and recording"): `applet.h`'s `bool game_play_recording_supported{}`, false, in Eden @
+/// cf654052, Eden-NX2 @ 50fa86bb and Eden PR #4588 @ e5fb3b97 alike. No command of any of the
+/// three writes the field, so it is a constant here rather than applet state.
+pub const GAME_PLAY_RECORDING_SUPPORTED: bool = false;
 
-/// Whether continuous recording is initially enabled, as
-/// `GetScreenShotAndContinuousRecordingInitiallyEnabled` answers: PR #4588's
-/// `game_play_recording_supported && game_play_recording_state ==
-/// GamePlayRecordingState::Enabled`, over the initial `false` and `Disabled` (module docs, "The
-/// Switch 2 additions").
-pub const CONTINUOUS_RECORDING_INITIALLY_ENABLED: bool = false;
+/// What `IApplicationFunctions` 330 answers: `Unknown330(Out<u8> out)` sets `*out = 0` in Eden
+/// (`eden/src/core/hle/service/am/service/application_functions.cpp` @ cf654052), Eden-NX2
+/// (`eden-nx2/src/core/hle/service/am/service/application_functions.cpp` @ 50fa86bb) and Eden
+/// PR #4588 (`eden-pr4588/src/core/hle/service/am/service/application_functions.cpp` @
+/// e5fb3b97) alike. The scoping doc has no row for it. A guess of the references': the
+/// command's meaning is not known, and a console trace of the reply would confirm the value.
+pub const UNKNOWN_330_VALUE: u8 = 0;
+
+/// An applet's screenshot permission, as `SetScreenShotPermission` sets it (Eden PR #4588,
+/// `eden-pr4588/src/core/hle/service/am/am_types.h` @ e5fb3b97: `enum class
+/// ScreenshotPermission : u32 { Inherit = 0, Enable = 1, Disable = 2 }`; libnx's
+/// `AppletScreenShotPermission` has the same values).
+///
+/// It holds any `u32`: the reference copies the request's word into the enum whatever its
+/// value (`cmif_serialization.h`, `ReadInArgument`), and only compares it with `Disable`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScreenshotPermission(u32);
+
+impl ScreenshotPermission {
+    /// `Inherit = 0`: the applet's initial permission (`applet.h`, `ScreenshotPermission
+    /// screenshot_permission{}`).
+    pub const INHERIT: Self = Self(0);
+    /// `Enable = 1`.
+    pub const ENABLE: Self = Self(1);
+    /// `Disable = 2`.
+    pub const DISABLE: Self = Self(2);
+
+    /// The permission a request's word names.
+    #[must_use]
+    pub const fn from_raw(raw: u32) -> Self {
+        Self(raw)
+    }
+
+    /// The permission's word.
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+
+    /// Whether screenshots are enabled under it: PR #4588's `screenshot_permission !=
+    /// ScreenshotPermission::Disable` (`application_functions.cpp`,
+    /// `GetScreenShotAndContinuousRecordingInitiallyEnabled`).
+    #[must_use]
+    pub const fn screenshots_enabled(self) -> bool {
+        self.0 != Self::DISABLE.0
+    }
+}
+
+/// An applet's game-play recording state, as `SetGamePlayRecordingState` sets it (Eden PR
+/// #4588, `eden-pr4588/src/core/hle/service/am/am_types.h` @ e5fb3b97: `enum class
+/// GamePlayRecordingState : u32 { Disabled, Enabled }`).
+///
+/// It holds any `u32`, as [`ScreenshotPermission`] does: the reference stores the request's
+/// word whatever its value, and only compares it with `Enabled`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GamePlayRecordingState(u32);
+
+impl GamePlayRecordingState {
+    /// `Disabled = 0`: the applet's initial state (`applet.h`, `GamePlayRecordingState
+    /// game_play_recording_state{GamePlayRecordingState::Disabled}`).
+    pub const DISABLED: Self = Self(0);
+    /// `Enabled = 1`.
+    pub const ENABLED: Self = Self(1);
+
+    /// The state a request's word names.
+    #[must_use]
+    pub const fn from_raw(raw: u32) -> Self {
+        Self(raw)
+    }
+
+    /// The state's word.
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+
+    /// Whether continuous recording is enabled in this state, for an applet that does or does
+    /// not support recording: PR #4588's `game_play_recording_supported &&
+    /// game_play_recording_state == GamePlayRecordingState::Enabled` (`application_functions.cpp`,
+    /// `GetScreenShotAndContinuousRecordingInitiallyEnabled`).
+    #[must_use]
+    pub const fn continuous_recording_enabled(self, supported: bool) -> bool {
+        supported && self.0 == Self::ENABLED.0
+    }
+}
 
 /// What `IApplicationFunctions` 321 answers: PR #4588's `Unknown321` sets `*out_enabled = false`
 /// (`eden-pr4588/src/core/hle/service/am/service/application_functions.cpp` @ e5fb3b97). A guess
@@ -564,6 +711,19 @@ pub struct Applet {
     /// PR #4588's `graphics_scale_changed_notification_enabled`, which
     /// `SetGraphicsScaleChangedNotificationEnabled` sets (module docs, "The Switch 2 additions").
     graphics_scale_changed_notification_enabled: bool,
+    /// `screenshot_permission`, which `SetScreenShotPermission` sets (module docs, "Screenshots
+    /// and recording").
+    screenshot_permission: ScreenshotPermission,
+    /// `game_play_recording_state`, which `SetGamePlayRecordingState` sets (module docs,
+    /// "Screenshots and recording").
+    game_play_recording_state: GamePlayRecordingState,
+    /// `request_exit_to_library_applet_at_execute_next_program_enabled`, which
+    /// `SetRequestExitToLibraryAppletAtExecuteNextProgramEnabled` sets (module docs, "The
+    /// title's start-up commands").
+    request_exit_to_library_applet_at_execute_next_program_enabled: bool,
+    /// The GPU-error event, once a command has returned it (module docs, "The title's start-up
+    /// commands").
+    gpu_error_detected_event: Option<ObjectId>,
 }
 
 impl Applet {
@@ -578,6 +738,10 @@ impl Applet {
             suspended_tick_event: None,
             graphics_server: None,
             graphics_scale_changed_notification_enabled: false,
+            screenshot_permission: ScreenshotPermission::INHERIT,
+            game_play_recording_state: GamePlayRecordingState::DISABLED,
+            request_exit_to_library_applet_at_execute_next_program_enabled: false,
+            gpu_error_detected_event: None,
         }
     }
 
@@ -626,6 +790,46 @@ impl Applet {
         self.suspended_tick_event
     }
 
+    /// The GPU-error event (`GetGpuErrorDetectedSystemEvent`), if a command has returned it
+    /// yet.
+    #[must_use]
+    pub fn gpu_error_detected_event(&self) -> Option<ObjectId> {
+        self.gpu_error_detected_event
+    }
+
+    /// The screenshot permission (`SetScreenShotPermission`); initially
+    /// [`ScreenshotPermission::INHERIT`].
+    #[must_use]
+    pub fn screenshot_permission(&self) -> ScreenshotPermission {
+        self.screenshot_permission
+    }
+
+    /// The game-play recording state (`SetGamePlayRecordingState`); initially
+    /// [`GamePlayRecordingState::DISABLED`].
+    #[must_use]
+    pub fn game_play_recording_state(&self) -> GamePlayRecordingState {
+        self.game_play_recording_state
+    }
+
+    /// Whether the application asked to exit to the library applet when it executes its next
+    /// program (`SetRequestExitToLibraryAppletAtExecuteNextProgramEnabled`); initially false.
+    #[must_use]
+    pub fn request_exit_to_library_applet_at_execute_next_program_enabled(&self) -> bool {
+        self.request_exit_to_library_applet_at_execute_next_program_enabled
+    }
+
+    /// What `GetScreenShotAndContinuousRecordingInitiallyEnabled` answers: whether screenshots
+    /// are enabled, then whether continuous recording is (module docs, "Screenshots and
+    /// recording").
+    #[must_use]
+    pub fn screenshot_and_continuous_recording_initially_enabled(&self) -> (bool, bool) {
+        (
+            self.screenshot_permission.screenshots_enabled(),
+            self.game_play_recording_state
+                .continuous_recording_enabled(GAME_PLAY_RECORDING_SUPPORTED),
+        )
+    }
+
     /// Changes the lifecycle state with `change`, then signals the message event if a message
     /// became available, or clears it if one stopped being available: Eden's
     /// `SignalSystemEventIfNeeded` after the change (module docs, "The message event"). Before
@@ -671,13 +875,44 @@ impl Applet {
 
     /// The suspended-tick event, created the first time. It is never signalled.
     fn suspended_tick_event_or_create(&mut self, cx: &mut Context<'_>) -> Result<ObjectId, Fault> {
-        if let Some(event) = self.suspended_tick_event {
-            return Ok(event);
-        }
-        let event = cx.create_event()?;
-        self.suspended_tick_event = Some(event);
-        Ok(event)
+        unsignalled_event_or_create(&mut self.suspended_tick_event, cx)
     }
+
+    /// The GPU-error event, created the first time. It is never signalled.
+    fn gpu_error_detected_event_or_create(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Result<ObjectId, Fault> {
+        unsignalled_event_or_create(&mut self.gpu_error_detected_event, cx)
+    }
+}
+
+/// The event `slot` names, or a new one the kernel makes, kept in `slot`: how the applet makes
+/// each of its events that nothing signals.
+fn unsignalled_event_or_create(
+    slot: &mut Option<ObjectId>,
+    cx: &mut Context<'_>,
+) -> Result<ObjectId, Fault> {
+    if let Some(event) = *slot {
+        return Ok(event);
+    }
+    let event = cx.create_event()?;
+    *slot = Some(event);
+    Ok(event)
+}
+
+/// Runs `get` on a copy of the applet, writes the copy back before any error `get` reports (so
+/// an event it made is never forgotten), and copies the event it returns into the reply.
+fn reply_with_applet_event(
+    cx: &mut Context<'_>,
+    reply: &mut Reply,
+    get: impl FnOnce(&mut Applet, &mut Context<'_>) -> Result<ObjectId, Fault>,
+) -> Outcome {
+    let mut applet = *cx.family::<Applet>()?;
+    let event = get(&mut applet, cx);
+    *cx.family::<Applet>()? = applet;
+    reply.copy_handle(event?);
+    reply.ok()
 }
 
 /// Reads a flag: one byte, true when it is not zero (see the module docs, "Layouts").
@@ -792,12 +1027,23 @@ pub mod command {
         pub const GET_PERFORMANCE_MODE: u32 = 6;
         /// `{9, D<&ICommonStateGetter::GetCurrentFocusState>, "GetCurrentFocusState"}`.
         pub const GET_CURRENT_FOCUS_STATE: u32 = 9;
+        /// `{900,
+        /// D<&ICommonStateGetter::SetRequestExitToLibraryAppletAtExecuteNextProgramEnabled>,
+        /// "SetRequestExitToLibraryAppletAtExecuteNextProgramEnabled"}, //11.0.0+`, the same row
+        /// in Eden @ cf654052, Eden-NX2 @ 50fa86bb and Eden PR #4588 @ e5fb3b97
+        /// (`src/core/hle/service/am/service/common_state_getter.cpp` in each); libnx
+        /// `appletSetRequestExitToLibraryAppletAtExecuteNextProgramEnabled` sends 900 to
+        /// `ICommonStateGetter`. The scoping doc has no row for it.
+        pub const SET_REQUEST_EXIT_TO_LIBRARY_APPLET_AT_EXECUTE_NEXT_PROGRAM_ENABLED: u32 = 900;
     }
 
     /// `ISelfController`'s commands (`ISelfController::ISelfController`).
     pub mod self_controller {
         /// `{0, D<&ISelfController::Exit>, "Exit"}`.
         pub const EXIT: u32 = 0;
+        /// `{10, D<&ISelfController::SetScreenShotPermission>, "SetScreenShotPermission"}`;
+        /// libnx `appletSetScreenShotPermission` sends 10 with `_appletCmdInU32NoOut`.
+        pub const SET_SCREEN_SHOT_PERMISSION: u32 = 10;
         /// `{11, D<&ISelfController::SetOperationModeChangedNotification>, ..}`.
         pub const SET_OPERATION_MODE_CHANGED_NOTIFICATION: u32 = 11;
         /// `{12, D<&ISelfController::SetPerformanceModeChangedNotification>, ..}`.
@@ -830,6 +1076,21 @@ pub mod command {
     pub mod application_functions {
         /// `{40, D<&IApplicationFunctions::NotifyRunning>, "NotifyRunning"}`.
         pub const NOTIFY_RUNNING: u32 = 40;
+        /// `{65, D<&IApplicationFunctions::IsGamePlayRecordingSupported>,
+        /// "IsGamePlayRecordingSupported"}`; libnx `appletIsGamePlayRecordingSupported` sends 65
+        /// with `_appletCmdNoInOutBool`.
+        pub const IS_GAME_PLAY_RECORDING_SUPPORTED: u32 = 65;
+        /// `{67, D<&IApplicationFunctions::SetGamePlayRecordingState>,
+        /// "SetGamePlayRecordingState"}`; libnx `appletSetGamePlayRecordingState` sends 67 with
+        /// `_appletCmdInU32NoOut`.
+        pub const SET_GAME_PLAY_RECORDING_STATE: u32 = 67;
+        /// `{130, D<&IApplicationFunctions::GetGpuErrorDetectedSystemEvent>,
+        /// "GetGpuErrorDetectedSystemEvent"}`, the same row in Eden @ cf654052, Eden-NX2 @
+        /// 50fa86bb and Eden PR #4588 @ e5fb3b97
+        /// (`src/core/hle/service/am/service/application_functions.cpp` in each); libnx
+        /// `appletGetGpuErrorDetectedSystemEvent` sends 130 to `IApplicationFunctions` for an
+        /// application (`_appletCmdGetEvent`). The scoping doc has no row for it.
+        pub const GET_GPU_ERROR_DETECTED_SYSTEM_EVENT: u32 = 130;
         /// Switch 2. Eden PR #4588
         /// (`eden-pr4588/src/core/hle/service/am/service/application_functions.cpp` @
         /// e5fb3b97): `{320,
@@ -839,6 +1100,11 @@ pub mod command {
         /// Switch 2. Eden PR #4588 (`application_functions.cpp` @ e5fb3b97): `{321,
         /// D<&IApplicationFunctions::Unknown321>, "Unknown321"}`; PR's name.
         pub const UNKNOWN_321: u32 = 321;
+        /// `{330, D<&IApplicationFunctions::Unknown330>, "Unknown330"}, // [20.0.0+]`, the same
+        /// row in Eden @ cf654052, Eden-NX2 @ 50fa86bb and Eden PR #4588 @ e5fb3b97
+        /// (`src/core/hle/service/am/service/application_functions.cpp` in each); their name.
+        /// The scoping doc has no row for it.
+        pub const UNKNOWN_330: u32 = 330;
     }
 
     /// `IGraphicsScalingParametersFunctions`' commands (Switch 2), from Eden PR #4588
@@ -888,12 +1154,15 @@ commands! {
         common_state_getter::GET_OPERATION_MODE => get_operation_mode,
         common_state_getter::GET_PERFORMANCE_MODE => get_performance_mode,
         common_state_getter::GET_CURRENT_FOCUS_STATE => get_current_focus_state,
+        common_state_getter::SET_REQUEST_EXIT_TO_LIBRARY_APPLET_AT_EXECUTE_NEXT_PROGRAM_ENABLED =>
+            set_request_exit_to_library_applet_at_execute_next_program_enabled,
     }
 }
 
 commands! {
     impl ISelfController {
         self_controller::EXIT => exit,
+        self_controller::SET_SCREEN_SHOT_PERMISSION => set_screen_shot_permission,
         self_controller::SET_OPERATION_MODE_CHANGED_NOTIFICATION =>
             set_operation_mode_changed_notification,
         self_controller::SET_PERFORMANCE_MODE_CHANGED_NOTIFICATION =>
@@ -917,9 +1186,15 @@ commands! {
 commands! {
     impl IApplicationFunctions {
         application_functions::NOTIFY_RUNNING => notify_running,
+        application_functions::IS_GAME_PLAY_RECORDING_SUPPORTED =>
+            is_game_play_recording_supported,
+        application_functions::SET_GAME_PLAY_RECORDING_STATE => set_game_play_recording_state,
+        application_functions::GET_GPU_ERROR_DETECTED_SYSTEM_EVENT =>
+            get_gpu_error_detected_system_event,
         application_functions::GET_SCREEN_SHOT_AND_CONTINUOUS_RECORDING_INITIALLY_ENABLED =>
             get_screen_shot_and_continuous_recording_initially_enabled,
         application_functions::UNKNOWN_321 => unknown_321,
+        application_functions::UNKNOWN_330 => unknown_330,
     }
 }
 
@@ -1119,10 +1394,21 @@ impl ICommonStateGetter {
         _req: &Request<'_>,
         reply: &mut Reply,
     ) -> Outcome {
-        let mut applet = *cx.family::<Applet>()?;
-        let event = applet.message_event_or_create(cx);
-        *cx.family::<Applet>()? = applet;
-        reply.copy_handle(event?);
+        reply_with_applet_event(cx, reply, Applet::message_event_or_create)
+    }
+
+    /// `SetRequestExitToLibraryAppletAtExecuteNextProgramEnabled`. in: nothing. out: nothing.
+    /// Sets the applet's flag (Eden: `m_applet->
+    /// request_exit_to_library_applet_at_execute_next_program_enabled = true`), which no
+    /// reference reads.
+    fn set_request_exit_to_library_applet_at_execute_next_program_enabled(
+        _: &mut Self,
+        cx: &mut Context<'_>,
+        _req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        cx.family::<Applet>()?
+            .request_exit_to_library_applet_at_execute_next_program_enabled = true;
         reply.ok()
     }
 
@@ -1263,10 +1549,19 @@ impl ISelfController {
         _req: &Request<'_>,
         reply: &mut Reply,
     ) -> Outcome {
-        let mut applet = *cx.family::<Applet>()?;
-        let event = applet.suspended_tick_event_or_create(cx);
-        *cx.family::<Applet>()? = applet;
-        reply.copy_handle(event?);
+        reply_with_applet_event(cx, reply, Applet::suspended_tick_event_or_create)
+    }
+
+    /// `SetScreenShotPermission`. in: `u32` permission, any value, kept in the applet (Eden PR
+    /// #4588: `m_applet->screenshot_permission = screen_shot_permission`). out: nothing.
+    fn set_screen_shot_permission(
+        _: &mut Self,
+        cx: &mut Context<'_>,
+        req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        let permission = ScreenshotPermission::from_raw(req.payload().read_u32()?);
+        cx.family::<Applet>()?.screenshot_permission = permission;
         reply.ok()
     }
 
@@ -1323,9 +1618,9 @@ impl IApplicationFunctions {
         reply.ok()
     }
 
-    /// `GetScreenShotAndContinuousRecordingInitiallyEnabled` (Switch 2). out: `bool screenshot,
-    /// bool recording`, a byte each (module docs, "The Switch 2 additions").
-    fn get_screen_shot_and_continuous_recording_initially_enabled(
+    /// `IsGamePlayRecordingSupported`. out: `bool`, [`GAME_PLAY_RECORDING_SUPPORTED`] (Eden PR
+    /// #4588: `*out_is_game_play_recording_supported = m_applet->game_play_recording_supported`).
+    fn is_game_play_recording_supported(
         _: &mut Self,
         _cx: &mut Context<'_>,
         _req: &Request<'_>,
@@ -1333,8 +1628,51 @@ impl IApplicationFunctions {
     ) -> Outcome {
         reply
             .payload()
-            .write_u8(u8::from(SCREENSHOT_INITIALLY_ENABLED))
-            .write_u8(u8::from(CONTINUOUS_RECORDING_INITIALLY_ENABLED));
+            .write_u8(u8::from(GAME_PLAY_RECORDING_SUPPORTED));
+        reply.ok()
+    }
+
+    /// `SetGamePlayRecordingState`. in: `u32` state, any value, kept in the applet (Eden PR
+    /// #4588: `m_applet->game_play_recording_state = game_play_recording_state`). out: nothing.
+    fn set_game_play_recording_state(
+        _: &mut Self,
+        cx: &mut Context<'_>,
+        req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        let state = GamePlayRecordingState::from_raw(req.payload().read_u32()?);
+        cx.family::<Applet>()?.game_play_recording_state = state;
+        reply.ok()
+    }
+
+    /// `GetGpuErrorDetectedSystemEvent`. out: a copy handle to the applet's GPU-error event
+    /// (Eden: `*out_event = m_applet->gpu_error_detected_event.GetHandle()`), made the first
+    /// time and never signalled.
+    fn get_gpu_error_detected_system_event(
+        _: &mut Self,
+        cx: &mut Context<'_>,
+        _req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        reply_with_applet_event(cx, reply, Applet::gpu_error_detected_event_or_create)
+    }
+
+    /// `GetScreenShotAndContinuousRecordingInitiallyEnabled` (Switch 2). out: `bool screenshot,
+    /// bool recording`, a byte each, from the applet
+    /// ([`Applet::screenshot_and_continuous_recording_initially_enabled`]).
+    fn get_screen_shot_and_continuous_recording_initially_enabled(
+        _: &mut Self,
+        cx: &mut Context<'_>,
+        _req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        let (screenshot, recording) = cx
+            .family::<Applet>()?
+            .screenshot_and_continuous_recording_initially_enabled();
+        reply
+            .payload()
+            .write_u8(u8::from(screenshot))
+            .write_u8(u8::from(recording));
         reply.ok()
     }
 
@@ -1346,6 +1684,17 @@ impl IApplicationFunctions {
         reply: &mut Reply,
     ) -> Outcome {
         reply.payload().write_u8(u8::from(UNKNOWN_321_ENABLED));
+        reply.ok()
+    }
+
+    /// `Unknown330`. out: `u8`, [`UNKNOWN_330_VALUE`].
+    fn unknown_330(
+        _: &mut Self,
+        _cx: &mut Context<'_>,
+        _req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        reply.payload().write_u8(UNKNOWN_330_VALUE);
         reply.ok()
     }
 }
