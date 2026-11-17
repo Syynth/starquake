@@ -11,9 +11,7 @@ use std::collections::BTreeSet;
 
 use proptest::prelude::*;
 use proptest::test_runner::{Config, RngAlgorithm, RngSeed};
-use starquake_ipc::{
-    BUFFER_SIZE, CommandType, Message, RequestBuilder, SFCO_MAGIC, SessionKind, TIPC_COMMAND_OFFSET,
-};
+use starquake_ipc::{BUFFER_SIZE, CommandType, RequestBuilder, SFCO_MAGIC};
 use starquake_kernel::handle::Handle;
 use starquake_kernel::id::ObjectId;
 use starquake_kernel::memory::{SharedPages, SvcPermission};
@@ -28,14 +26,12 @@ use starquake_trace::{EventKind, IpcOutcome, ServiceId};
 
 use super::*;
 use crate::protocol::{HANDLE_KIND, Mark, ROOT_COMMANDS};
+use crate::testing::{
+    SPECIAL, STALE, buffer_of, copied, halves, le, result_only, success, tipc_type,
+};
 
 /// The number the tests' root server is known by.
 const ROOT: ServiceId = ServiceId(0x0657);
-/// What fills a message buffer before a request is laid into it.
-const STALE: u8 = 0xA5;
-/// The TIPC header's "a special header follows" bit (PR `DecodeBootstrap`: `packet[1] !=
-/// 0x8000000c`, a special header and twelve data words).
-const SPECIAL: u32 = 0x8000_0000;
 /// A special header that counts one copied handle (PR `DecodeBootstrap`: `packet[2] != 2`).
 const ONE_COPY: u32 = 2;
 
@@ -104,30 +100,6 @@ impl Rig {
     }
 }
 
-/// Little-endian words as bytes.
-fn le(words: &[u32]) -> Vec<u8> {
-    words.iter().flat_map(|w| w.to_le_bytes()).collect()
-}
-
-/// A whole message buffer that starts with `words` and is zero after them.
-fn buffer_of(words: &[u32]) -> Vec<u8> {
-    let mut buffer = le(words);
-    buffer.resize(BUFFER_SIZE, 0);
-    buffer
-}
-
-/// A TIPC message's type word for command `id`.
-fn tipc_type(id: u32) -> u32 {
-    u32::from(TIPC_COMMAND_OFFSET) + id
-}
-
-/// The low and high words of a `u64`.
-fn halves(value: u64) -> [u32; 2] {
-    let bytes = value.to_le_bytes();
-    let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
-    [word(0), word(4)]
-}
-
 /// `Initialize` (4) as PR's `DecodeBootstrap` reads it: `0x14, 0x8000000c, 2`, the process
 /// handle at word 3, the applet resource user id at words 4–5, the flags at 6–7 and the four
 /// parameters at 8–15.
@@ -142,36 +114,6 @@ fn initialize_words(process: u32, request: &BootstrapRequest) -> Vec<u32> {
     }
     assert_eq!(words.len(), 16);
     words
-}
-
-/// A TIPC reply to command `id` that holds a result and nothing else.
-fn result_only(id: u32, result: ResultCode) -> Vec<u8> {
-    buffer_of(&[tipc_type(id), 1, result.raw()])
-}
-
-/// A successful TIPC reply to `id` with these copied handles and data words: the header (raw
-/// size: the result word and the data), the special header when there are handles, the
-/// handles, the result, the data.
-fn success(id: u32, copies: &[u32], data: &[u32]) -> Vec<u8> {
-    let raw = 1 + u32::try_from(data.len()).unwrap();
-    let mut words = vec![tipc_type(id)];
-    if copies.is_empty() {
-        words.push(raw);
-    } else {
-        words.push(SPECIAL | raw);
-        words.push(u32::try_from(copies.len()).unwrap() << 1);
-        words.extend(copies);
-    }
-    words.push(ResultCode::SUCCESS.raw());
-    words.extend(data);
-    buffer_of(&words)
-}
-
-/// The handles a reply copied.
-fn copied(buffer: &[u8]) -> Vec<u32> {
-    Message::parse_reply(buffer, SessionKind::Session)
-        .unwrap()
-        .copy_handles
 }
 
 /// A local bootstrap request whose fields are all distinct and non-zero except the parameters,
@@ -1030,9 +972,11 @@ fn the_saved_root_layouts_are_pinned() {
                 out_of_order: 0,
                 native_memory_mode: Some(0x0B),
                 syncpoint_events: SyncpointEvents::One(object(0x0C, 0x0D)),
+                gpu_server: None,
             },
-            // phase 0; no bootstrap; count 0; mode Some(0x0B); One(index, generation).
-            &[0, 0, 0, 1, 0x0B, 1, 0x0C, 0x0D],
+            // phase 0; no bootstrap; count 0; mode Some(0x0B); One(index, generation); no gpu
+            // server.
+            &[0, 0, 0, 1, 0x0B, 1, 0x0C, 0x0D, 0],
         ),
         (
             RootState {
@@ -1041,10 +985,13 @@ fn the_saved_root_layouts_are_pinned() {
                 out_of_order: 0x17,
                 native_memory_mode: None,
                 syncpoint_events: SyncpointEvents::Both(object(0x18, 0x19), object(0x1A, 0x1B)),
+                gpu_server: Some(ServiceId(0x1C)),
             },
-            // phase 1; Some(user id, flags, four parameters); count; no mode; Both(a, b).
+            // phase 1; Some(user id, flags, four parameters); count; no mode; Both(a, b); Some(gpu
+            // server).
             &[
-                1, 1, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0, 2, 0x18, 0x19, 0x1A, 0x1B,
+                1, 1, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0, 2, 0x18, 0x19, 0x1A, 0x1B, 1,
+                0x1C,
             ],
         ),
         (
@@ -1054,9 +1001,10 @@ fn the_saved_root_layouts_are_pinned() {
                 out_of_order: 0x21,
                 native_memory_mode: Some(0x22),
                 syncpoint_events: SyncpointEvents::None,
+                gpu_server: None,
             },
-            // phase 2; no bootstrap; count; mode; no events.
-            &[2, 0, 0x21, 1, 0x22, 0],
+            // phase 2; no bootstrap; count; mode; no events; no gpu server.
+            &[2, 0, 0x21, 1, 0x22, 0, 0],
         ),
         (
             RootState {
@@ -1065,9 +1013,10 @@ fn the_saved_root_layouts_are_pinned() {
                 out_of_order: 0x37,
                 native_memory_mode: Some(0x38),
                 syncpoint_events: SyncpointEvents::One(object(0x39, 0x3A)),
+                gpu_server: Some(ServiceId(0x3B)),
             },
             &[
-                3, 1, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 1, 0x38, 1, 0x39, 0x3A,
+                3, 1, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 1, 0x38, 1, 0x39, 0x3A, 1, 0x3B,
             ],
         ),
     ];
@@ -1157,6 +1106,7 @@ fn saved(state: RootState) -> SavedRootState {
         out_of_order: state.out_of_order,
         native_memory_mode: state.native_memory_mode,
         syncpoint_events: state.syncpoint_events,
+        gpu_server: state.gpu_server,
     }
 }
 
@@ -1246,4 +1196,64 @@ fn a_refused_state_is_said_in_plain_words() {
     for (error, words) in said {
         assert_eq!(error.to_string(), words);
     }
+}
+
+// ----- 497 and the gpu server ------------------------------------------------------------------
+
+/// The number the tests' gpu server is known by.
+const GPU: ServiceId = ServiceId(0x0749);
+
+/// A root wired to a gpu server.
+fn wired() -> Rig {
+    let mut kernel = FakeKernel::new(0).unwrap();
+    kernel.set_current_service(ROOT);
+    kernel.add_service(GPU);
+    let session = kernel.new_object();
+    let state = RootState::new().with_gpu_server(GPU);
+    let mut server = root_server_for(state, UnknownPolicy::Strict).with_service_id(ROOT);
+    server.accept(session).unwrap();
+    Rig {
+        kernel,
+        server,
+        session,
+    }
+}
+
+/// 497 (`0x201, 2`, PR `OpenGpuSession`: flags at words 2-3) copies a new session on the gpu
+/// server, with flags 4 or any other (logged, decision 7), bootstrap complete or not.
+#[test]
+fn open_gpu_session_copies_a_session_on_the_gpu_server() {
+    let mut rig = wired();
+    assert_eq!(tipc_type(OPEN_GPU_SESSION), 0x201);
+    for flags in [GPU_SESSION_FLAGS, 5] {
+        let [low, high] = halves(flags);
+        let reply = rig.send(&[0x201, 2, low, high]);
+        assert_eq!(copied(&reply).len(), 1);
+        let connections = rig.kernel.take_connections();
+        assert_eq!(connections.len(), 1);
+        assert_eq!(connections[0].0, GPU);
+    }
+    // Only the root's own session: no placeholder was made.
+    assert_eq!(rig.server.session_count(), 1);
+    assert_eq!(rig.state().gpu_server(), Some(GPU));
+    // A short request is refused.
+    let short = rig.send(&[0x201, 1, 4]);
+    assert_eq!(short, result_only(OPEN_GPU_SESSION, INVALID_CMIF_REQUEST));
+}
+
+/// A snapshot that names another gpu server, or none, is refused, and the server keeps its own.
+#[test]
+fn a_snapshot_with_another_gpu_server_is_refused() {
+    let unwired = Rig::new();
+    let saved = unwired.server.save().unwrap();
+    let mut rig = wired();
+    assert_eq!(
+        rig.server.restore(&saved),
+        Err(SnapshotError::FamilyWiring(
+            "its root names another gpu server"
+        ))
+    );
+    assert_eq!(rig.state().gpu_server(), Some(GPU));
+    let own = rig.server.save().unwrap();
+    assert_eq!(rig.server.restore(&own), Ok(()));
 }

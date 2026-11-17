@@ -113,17 +113,26 @@ pub const PAGE_INFO_FLAGS: u32 = 0;
 /// The size of what `QueryMemory` writes, as an address offset.
 const RESULT_SIZE: u64 = SvcMemoryInfo::SIZE as u64;
 
-/// The checks `SetMemoryPermission` and `SetMemoryAttribute` share, and the shared and
-/// transfer memory calls open with: a page-aligned address ([`KernelError::InvalidAddress`]), a
-/// page-aligned size that is not zero ([`KernelError::InvalidSize`]), and a range that does not
-/// wrap ([`KernelError::InvalidCurrentMemory`]), in that order.
-pub(super) fn check_range(address: u64, size: u64) -> SvcResult<()> {
+/// The first two checks of every call that takes a range of pages: a page-aligned address
+/// ([`KernelError::InvalidAddress`]), then a page-aligned size that is not zero
+/// ([`KernelError::InvalidSize`]). What a call checks next, the wrap, has a different result in
+/// different calls.
+pub(super) fn check_pages(address: u64, size: u64) -> SvcResult<()> {
     if !address.is_multiple_of(PAGE_SIZE) {
         return Err(KernelError::InvalidAddress);
     }
     if !size.is_multiple_of(PAGE_SIZE) || size == 0 {
         return Err(KernelError::InvalidSize);
     }
+    Ok(())
+}
+
+/// The checks `SetMemoryPermission` and `SetMemoryAttribute` share, and the shared and
+/// transfer memory calls open with: a page-aligned address ([`KernelError::InvalidAddress`]), a
+/// page-aligned size that is not zero ([`KernelError::InvalidSize`]), and a range that does not
+/// wrap ([`KernelError::InvalidCurrentMemory`]), in that order.
+pub(super) fn check_range(address: u64, size: u64) -> SvcResult<()> {
+    check_pages(address, size)?;
     // `address < address + size`, which is false when the sum wraps, also to exactly zero.
     if address.checked_add(size).is_none() {
         return Err(KernelError::InvalidCurrentMemory);
