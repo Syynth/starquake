@@ -1926,3 +1926,279 @@ fn a_run_is_not_stalled_while_a_delivery_runs_a_request_queued_behind_the_deferr
     assert_eq!(world.tls(A), [0xA0; BUFFER_SIZE]);
     assert_eq!(world.tls(B), [0xB0; BUFFER_SIZE]);
 }
+
+// ----- Clearing a server's event, and ending the sender's process ----------------------------
+
+/// Whether the event `event` is an end of is signalled.
+fn signalled(world: &World, event: ObjectId) -> bool {
+    world.with_tables(|_, scheduler| {
+        let readable = match scheduler.objects().get(event).unwrap() {
+            Object::Event(event) => event.readable(),
+            Object::ReadableEvent(_) => event,
+            other => panic!("{event:?} is {other:?}, not an event"),
+        };
+        match scheduler.objects().get(readable).unwrap() {
+            Object::ReadableEvent(state) => state.is_signalled(),
+            other => panic!("{readable:?} is {other:?}"),
+        }
+    })
+}
+
+/// A script that runs `body` on the context, keeps what it returns in `kept`, and replies
+/// with zeros.
+fn step<T: Send + 'static>(
+    kept: &Arc<Mutex<Vec<T>>>,
+    body: impl Fn(&mut IpcContext<'_>) -> T + Send + 'static,
+) -> Script {
+    let kept = Arc::clone(kept);
+    Box::new(move |cx, _, message| {
+        let value = body(cx);
+        lock(&kept).push(value);
+        message.fill(0);
+        Ok(Handled::Replied)
+    })
+}
+
+/// A hook that does nothing.
+struct Deaf;
+
+impl EventHook for Deaf {
+    fn signalled(&self, _: ObjectId) {}
+}
+
+#[test]
+fn a_handler_clears_an_event_it_made_whether_or_not_it_is_signalled() {
+    let world = World::new();
+    let handle = world.session();
+    let made = Arc::new(Mutex::new(Vec::new()));
+    world.first.script(step(&made, |cx| {
+        let event = cx.create_event().unwrap();
+        cx.signal_event(event).unwrap();
+        event
+    }));
+    world.send(A, handle, &request());
+    let event = lock(&made)[0];
+    assert!(signalled(&world, event));
+
+    // Signalled: cleared. Not signalled: stays so, and the clear still succeeds.
+    let cleared = Arc::new(Mutex::new(Vec::new()));
+    world
+        .first
+        .script(step(&cleared, move |cx| cx.clear_event(event)));
+    world.send(A, handle, &request());
+    assert!(!signalled(&world, event));
+    world.send(A, handle, &request());
+    assert!(!signalled(&world, event));
+    assert_eq!(*lock(&cleared), [Ok(()), Ok(())]);
+}
+
+#[test]
+fn a_handler_clears_either_end_of_a_hooked_event_it_made() {
+    let world = World::new();
+    let handle = world.session();
+    let made = Arc::new(Mutex::new(Vec::new()));
+    world.first.script(step(&made, |cx| {
+        cx.create_hooked_event(Arc::new(Deaf)).unwrap()
+    }));
+    world.send(A, handle, &request());
+    let (writable, readable) = lock(&made)[0];
+    for end in [writable, readable] {
+        let cleared = Arc::new(Mutex::new(Vec::new()));
+        world.first.script(step(&cleared, move |cx| {
+            cx.signal_event(readable).unwrap();
+            cx.clear_event(end)
+        }));
+        world.send(A, handle, &request());
+        assert_eq!(*lock(&cleared), [Ok(())], "{end:?}");
+        assert!(!signalled(&world, readable), "{end:?}");
+    }
+}
+
+#[test]
+fn clearing_an_event_the_server_did_not_make_is_an_invalid_handle_and_changes_nothing() {
+    let world = World::new();
+    let handle = world.session();
+
+    // An event the second server made and signalled, on a session the first one hands out.
+    let connected = Arc::new(Mutex::new(Vec::new()));
+    world
+        .first
+        .script(step(&connected, |cx| cx.connect(SECOND).unwrap().1));
+    world.send(A, handle, &request());
+    let second = lock(&connected)[0];
+    let made = Arc::new(Mutex::new(Vec::new()));
+    world.second.script(step(&made, |cx| {
+        let event = cx.create_event().unwrap();
+        cx.signal_event(event).unwrap();
+        event
+    }));
+    world.send(A, second, &request());
+    let theirs = lock(&made)[0];
+
+    // A guest's event, both ends, signalled.
+    let (_, regs) = world.call(A, SvcId::CreateEvent, 0, 0);
+    assert_eq!(result(&regs), ResultCode::SUCCESS);
+    let (writable, readable) = (regs.x[1], regs.x[2]);
+    let (_, signal) = world.call(A, SvcId::SignalEvent, writable, 0);
+    assert_eq!(result(&signal), ResultCode::SUCCESS);
+    let guest = [writable, readable].map(|raw| world.object(Handle::from_register(raw)));
+
+    // And an object that is no event at all: the session.
+    let session = world.object(handle);
+    let ids = [theirs, guest[0], guest[1], session];
+    let refused = Arc::new(Mutex::new(Vec::new()));
+    world
+        .first
+        .script(step(&refused, move |cx| ids.map(|id| cx.clear_event(id))));
+    world.send(A, handle, &request());
+    assert_eq!(*lock(&refused), [[Err(KernelError::InvalidHandle); 4]]);
+    assert!(signalled(&world, theirs));
+    assert!(signalled(&world, guest[1]));
+
+    // The server that made it may clear it: the check is the running server's.
+    let cleared = Arc::new(Mutex::new(Vec::new()));
+    world
+        .second
+        .script(step(&cleared, move |cx| cx.clear_event(theirs)));
+    world.send(A, second, &request());
+    assert_eq!(*lock(&cleared), [Ok(())]);
+    assert!(!signalled(&world, theirs));
+}
+
+/// Replies with every byte `fill`, records an IPC event, and asks to end the process.
+fn reply_and_end(fill: u8) -> Script {
+    Box::new(move |cx, _, message| {
+        message.fill(fill);
+        cx.record(ipc_event(COMMAND));
+        cx.end_process();
+        cx.end_process();
+        Ok(Handled::Replied)
+    })
+}
+
+/// What the process `thread` (a thread object) belongs to holds: its handles, the objects
+/// besides each process's own, and its threads that have not ended; and whether it has ended.
+fn holdings(world: &World, thread: ObjectId) -> (usize, usize, usize, bool) {
+    world.with_tables(|handles, scheduler| {
+        let Object::Thread(id) = scheduler.objects().get(thread).unwrap() else {
+            panic!("{thread:?} is not a thread");
+        };
+        let process = scheduler.thread(id).unwrap().process().unwrap();
+        let record = scheduler.process(process).unwrap();
+        let running = record
+            .threads()
+            .filter(|thread| {
+                scheduler.thread(*thread).unwrap().state() != crate::sched::ThreadState::Terminated
+            })
+            .count();
+        (
+            handles.len(),
+            scheduler.objects_besides_processes(),
+            running,
+            record.state() == crate::process::ProcessState::Terminated,
+        )
+    })
+}
+
+#[test]
+fn a_handler_that_ends_the_process_replies_first_and_then_releases_everything() {
+    let (world, thread) = world_running_a_user_thread(A);
+    let handle = world.session();
+    let session = world.object(handle);
+    // The thread and the session, each held once: the session by its handle, the thread by
+    // its creator's reference.
+    assert_eq!(holdings(&world, thread), (1, 2, 1, false));
+    world.first.script(reply_and_end(0xE0));
+    let before = world.events().len();
+    let (record, regs) = world.send(A, handle, &request());
+
+    assert_eq!(record.outcome, Outcome::ProcessExited);
+    // The reply reached the sender, with its result, and the request was recorded: a sender
+    // whose thread had already ended would have got neither.
+    assert_eq!(world.tls(A), [0xE0; BUFFER_SIZE]);
+    assert_eq!(result(&regs), ResultCode::SUCCESS);
+    assert_eq!(
+        threads_and_kinds(&world.events()[before..]),
+        [
+            (A, ipc_event(COMMAND)),
+            send_event(A, handle, ResultCode::SUCCESS),
+        ]
+    );
+    // Then everything went, as `ExitProcess` lets it go: the session's server was told.
+    // The one object left is the thread's, which the test's own reference (its creator's,
+    // `world_running_a_user_thread`) still holds; letting it go leaves nothing.
+    assert_eq!(holdings(&world, thread), (0, 1, 0, true));
+    world
+        .dispatcher
+        .with::<(&mut Scheduler,), _>(|(scheduler,)| scheduler.release_objects(&[thread]))
+        .unwrap();
+    world.with_tables(|_, scheduler| assert_eq!(scheduler.objects_besides_processes(), 0));
+    assert_eq!(world.first.log().closed, [session]);
+    world.with_tables(|_, scheduler| assert!(!scheduler.ipc().is_session(session)));
+}
+
+#[test]
+fn an_end_asked_by_a_handler_that_defers_is_not_honoured() {
+    let (world, thread) = world_running_a_user_thread(A);
+    let handle = world.session();
+    let session = world.object(handle);
+    world.first.script(Box::new(|cx, _, _| {
+        cx.end_process();
+        Ok(Handled::Deferred)
+    }));
+    let (record, _) = world.send(A, handle, &request());
+    assert_eq!(record.outcome, Outcome::Waiting);
+    assert_eq!(holdings(&world, thread), (1, 2, 1, false));
+
+    // Its reply, when it comes, ends nothing either.
+    lock(&world.first.ready).push_back((session, Ok(0xD0)));
+    world.deliver(&world.first);
+    assert_eq!(world.tls(A), [0xD0; BUFFER_SIZE]);
+    assert_eq!(holdings(&world, thread), (1, 2, 1, false));
+}
+
+#[test]
+fn an_end_asked_by_a_request_a_delivery_runs_is_not_honoured() {
+    let world = World::new();
+    let handle = world.session();
+    let session = world.object(handle);
+    world
+        .first
+        .script(Box::new(|_, _, _| Ok(Handled::Deferred)));
+    world.send(A, handle, &request());
+    // B's request waits behind A's, and asks to end the process when it runs.
+    world.first.script(reply_and_end(0xB0));
+    assert_eq!(world.send(B, handle, &request()).0.outcome, Outcome::Waiting);
+
+    lock(&world.first.ready).push_back((session, Ok(0xA0)));
+    world.deliver(&world.first);
+    // B was answered, and the process goes on: its session is still open.
+    assert_eq!(world.tls(B), [0xB0; BUFFER_SIZE]);
+    world.with_tables(|handles, scheduler| {
+        assert_eq!(handles.get(handle), Ok(session));
+        assert!(scheduler.ipc().is_session(session));
+    });
+    assert_eq!(world.first.log().closed, Vec::<ObjectId>::new());
+}
+
+#[test]
+fn an_event_noted_for_no_server_is_let_go_again() {
+    let world = World::new();
+    let nowhere = ServerId::from_parts(9, 9);
+    let noted = world.first.id;
+    world
+        .dispatcher
+        .with::<(&mut Scheduler,), _>(|(scheduler,)| {
+            let before = scheduler.objects().len();
+            let (writable, readable) = scheduler.create_event().unwrap();
+            assert_eq!(
+                note_server_events(scheduler, nowhere, &[writable, readable]),
+                Err(SvcError::internal(&IpcError::UnknownServer(nowhere)))
+            );
+            assert_eq!(scheduler.objects().len(), before);
+            let readable = scheduler.create_readable_event().unwrap();
+            note_server_events(scheduler, noted, &[readable]).unwrap();
+            assert!(scheduler.ipc().is_server_event(noted, readable));
+            assert_eq!(scheduler.objects().len(), before + 1);
+        });
+}
