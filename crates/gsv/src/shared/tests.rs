@@ -2,8 +2,9 @@
 //! snapshots.
 
 use std::sync::TryLockError;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use starquake_gpu::interface::{ChannelId, Completions, Ticket};
 use starquake_kernel::id::ObjectId;
@@ -100,6 +101,77 @@ fn watching_returns_the_counter_read_after_marking() {
     assert_eq!(shared.lock().watch(sp), Ok(4));
 }
 
+/// A [`Completions`] that keeps every syncpoint value pushed to it, in push order and
+/// uncoalesced.
+#[derive(Default)]
+struct Pushed(Mutex<Vec<u32>>);
+
+impl Completions for Pushed {
+    fn push(&self, completion: GpuCompletion) {
+        if let GpuCompletion::SyncpointChanged { value, .. } = completion {
+            self.0.lock().unwrap().push(value);
+        }
+    }
+}
+
+#[test]
+fn watching_misses_no_increment_that_races_it() {
+    // An incrementer runs while a waiter watches. Every value past the one `watch` returns must
+    // have been pushed (module docs, "The watched-id fast path"): reading the counter before
+    // marking the id would lose the increments that land between the two steps. The pushes go
+    // to a recorder rather than a queue, so none is folded away. Fixed trials; each
+    // incrementer stops at a flag or a cap, and every wait is bounded.
+    const TRIALS: usize = 200;
+    const CAP: u32 = 1 << 20;
+    let sp = id(33);
+    for trial in 0..TRIALS {
+        let pushed = Arc::new(Pushed::default());
+        let completions: Arc<dyn Completions> = Arc::<Pushed>::clone(&pushed);
+        let syncpoints = Arc::new(Syncpoints::new(completions));
+        let shared = Shared::new(
+            Arc::clone(&syncpoints),
+            Arc::new(CompletionQueue::new()),
+            GSV,
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+        let (done, finished) = mpsc::channel();
+        {
+            let syncpoints = Arc::clone(&syncpoints);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut count = 0;
+                while !stop.load(Ordering::SeqCst) && count < CAP {
+                    syncpoints.increment(sp);
+                    count += 1;
+                }
+                done.send(()).unwrap();
+            });
+        }
+        let deadline = Instant::now() + PATIENCE;
+        while syncpoints.read(sp) == 0 {
+            assert!(Instant::now() < deadline, "the incrementer did not start");
+            std::hint::spin_loop();
+        }
+        let seen = shared.lock().watch(sp).unwrap();
+        stop.store(true, Ordering::SeqCst);
+        finished
+            .recv_timeout(PATIENCE)
+            .expect("the incrementer did not stop");
+        let last = syncpoints.read(sp);
+        let pushed = pushed.0.lock().unwrap();
+        assert!(
+            pushed
+                .iter()
+                .copied()
+                .filter(|&value| value > seen)
+                .eq(seen + 1..=last),
+            "trial {trial}: watch returned {seen} and the counter ended at {last}, but the values \
+             pushed past {seen} start at {:?}",
+            pushed.iter().find(|&&value| value > seen)
+        );
+    }
+}
+
 #[test]
 fn the_bit_follows_the_waiter_count() {
     let shared = fresh();
@@ -163,7 +235,7 @@ fn the_waiter_count_stops_at_its_maximum() {
     let shared = fresh();
     let sp = id(12);
     shared.lock().watch(sp).unwrap();
-    shared.lock().watchers[usize::from(sp.get())] = u32::MAX - 1;
+    shared.lock().state.watchers[usize::from(sp.get())] = u32::MAX - 1;
     // One below the maximum: the last waiter fits.
     assert_eq!(shared.lock().watch(sp), Ok(0));
     assert_eq!(shared.lock().watchers(sp), u32::MAX);
@@ -251,6 +323,30 @@ fn the_drain_calls_the_kernel_with_the_shared_lock_held() {
     assert_eq!(checker.calls, 3);
     // And released after.
     assert!(shared.state.try_lock().is_ok());
+}
+
+#[test]
+fn the_drain_takes_the_queue_after_the_shared_lock() {
+    // The lock order is gsv's lock, then the queue (module docs, "Lock order and the drain"):
+    // what is pushed while the drain waits for gsv's lock is in its take. Taking the queue
+    // first would leave `ordered(2)` for the next drain. The pass does not depend on the pause;
+    // the pause gives the drain time to take the queue first if the order were swapped.
+    let shared = Arc::new(fresh());
+    shared.queue().push(ordered(1));
+    let held = shared.lock();
+    let (done, finished) = mpsc::channel();
+    let drainer = Arc::clone(&shared);
+    std::thread::spawn(move || {
+        done.send(drainer.drain(&mut Host::default())).unwrap();
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    shared.queue().push(ordered(2));
+    drop(held);
+    let taken = finished
+        .recv_timeout(PATIENCE)
+        .expect("the drain did not finish after gsv's lock was released");
+    assert_eq!(taken, [ordered(1), ordered(2)]);
+    assert_eq!(shared.queue().take_all(), []);
 }
 
 /// A [`TimerHost`] that pushes onto the queue while the drain is under way, as the kernel's hook
@@ -437,22 +533,19 @@ fn restore_over_fresh(bytes: &[u8]) -> Result<Shared, SnapshotError> {
 
 #[test]
 fn a_snapshot_of_another_version_is_refused() {
-    let mut bytes = fresh().save().unwrap();
-    bytes[SNAPSHOT_MAGIC.len()] = u8::try_from(SNAPSHOT_VERSION + 1).unwrap();
-    let error = restore_over_fresh(&bytes).err().unwrap();
-    assert_eq!(
-        error,
-        SnapshotError::UnsupportedVersion {
-            found: SNAPSHOT_VERSION + 1
-        }
-    );
-    assert_eq!(
-        error.to_string(),
-        format!(
-            "gsv shared state snapshot layout version {} is not supported (this build reads {SNAPSHOT_VERSION})",
-            SNAPSHOT_VERSION + 1
-        )
-    );
+    // One version either side of the one this build reads.
+    for found in [SNAPSHOT_VERSION - 1, SNAPSHOT_VERSION + 1] {
+        let mut bytes = fresh().save().unwrap();
+        bytes[SNAPSHOT_MAGIC.len()] = u8::try_from(found).unwrap();
+        let error = restore_over_fresh(&bytes).err().unwrap();
+        assert_eq!(error, SnapshotError::UnsupportedVersion { found });
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "gsv shared state snapshot layout version {found} is not supported (this build reads {SNAPSHOT_VERSION})"
+            )
+        );
+    }
 }
 
 #[test]

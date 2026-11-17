@@ -23,15 +23,17 @@
 //! the count is not zero (a snapshot is checked for it). `watch` reads the counter after setting
 //! the bit and returns it, so a waiter compares its threshold with that value and misses no
 //! increment: one that came before is in the value, one that came after is pushed (the
-//! threaded test of `starquake_gpu::syncpoint` checks the `Syncpoints` side; the order of the
-//! two steps here is for review to keep, since swapping them only loses an increment that lands
-//! between them).
+//! threaded test of `starquake_gpu::syncpoint` checks the `Syncpoints` side;
+//! `watching_misses_no_increment_that_races_it` checks the order of the two steps here with a
+//! racing incrementer over fixed trials, so it catches a swap with high likelihood rather than
+//! certainty, since only an increment that lands between the two steps is lost).
 //!
 //! # Lock order and the drain
 //!
 //! The order is gsv's shared lock, then the kernel's (spec, "Who signals what"). [`Shared::drain`]
-//! is the timer thread's turn: it takes gsv's lock, takes everything queued, and acts on each
-//! completion in push order through the [`TimerHost`], which is how it reaches the kernel; so
+//! is the timer thread's turn: it takes gsv's lock, then takes everything queued
+//! (`the_drain_takes_the_queue_after_the_shared_lock`), and acts on each completion in the
+//! queue's order through the [`TimerHost`], which is how it reaches the kernel; so
 //! every kernel call it makes is made with gsv's lock held and never the other way round
 //! (`the_drain_calls_the_kernel_with_the_shared_lock_held`). Nothing calls into gsv with the
 //! kernel lock held: the kernel's event hook runs after it releases its lock and only pushes, and
@@ -75,7 +77,7 @@
 //! zero exactly when the restored `Syncpoints` has the id watched. [`Shared::save`] runs the same
 //! checks on what it is about to write.
 
-use std::ops::{Deref, DerefMut};
+use std::ops::Deref;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use serde::{Deserialize, Serialize};
@@ -112,21 +114,24 @@ pub trait TimerHost {
 }
 
 /// What gsv's request handlers and its timer thread share (module docs, "The pieces").
+///
+/// Built only here (fresh, or restored from a checked snapshot), and reached only through
+/// [`Locked`], which gives shared access to it and changes the waiter counts only with their
+/// watched bits; so no caller can replace it and leave a count out of step with its bit.
 #[derive(Debug, PartialEq, Eq)]
 pub struct GsvShared {
     /// The number of waiters on each syncpoint, by id.
     watchers: Vec<u32>,
 }
 
-impl Default for GsvShared {
-    fn default() -> Self {
+impl GsvShared {
+    /// No waiters on any syncpoint: the state over fresh syncpoints, which watch nothing.
+    fn fresh() -> Self {
         Self {
             watchers: vec![0; COUNT],
         }
     }
-}
 
-impl GsvShared {
     /// The number of waiters on syncpoint `id`.
     #[must_use]
     pub fn watchers(&self, id: SyncpointId) -> u32 {
@@ -149,7 +154,9 @@ pub enum WatchError {
 }
 
 /// gsv's shared state, locked: [`GsvShared`] and the syncpoints it watches (module docs, "The
-/// watched-id fast path").
+/// watched-id fast path"). It derefs to [`GsvShared`] for reading only; the waiter counts change
+/// through [`Locked::watch`] and [`Locked::unwatch`], which keep each count in step with its
+/// watched bit.
 pub struct Locked<'a> {
     state: MutexGuard<'a, GsvShared>,
     syncpoints: &'a Syncpoints,
@@ -195,12 +202,6 @@ impl Deref for Locked<'_> {
     }
 }
 
-impl DerefMut for Locked<'_> {
-    fn deref_mut(&mut self) -> &mut GsvShared {
-        &mut self.state
-    }
-}
-
 /// gsv's shared state, its syncpoints and its completion queue (module docs, "The pieces").
 pub struct Shared {
     state: Mutex<GsvShared>,
@@ -218,7 +219,7 @@ impl Shared {
         queue: Arc<CompletionQueue>,
         service: ServiceId,
     ) -> Self {
-        Self::with_state(GsvShared::default(), syncpoints, queue, service)
+        Self::with_state(GsvShared::fresh(), syncpoints, queue, service)
     }
 
     fn with_state(
@@ -259,8 +260,8 @@ impl Shared {
     }
 
     /// The timer thread's turn: takes gsv's lock, then everything queued, and acts on each
-    /// completion in push order, recording its note through `host` (module docs, "Lock order
-    /// and the drain"). Returns what it took, in order.
+    /// completion in the queue's order, recording its note through `host` (module docs, "Lock
+    /// order and the drain"). Returns what it took, in order.
     pub fn drain(&self, host: &mut dyn TimerHost) -> Vec<Completion> {
         let state = self.lock();
         let taken = self.queue.take_all();
