@@ -1524,6 +1524,9 @@ fn the_guest_reads_the_counter_frequency_the_backend_reports() {
     let guest_reads = vcpu.regs().unwrap().x[0];
     assert_ne!(guest_reads, 0);
     assert_eq!(guest_reads, guest.backend.counter_frequency());
+    // The rate is the host's, so it can be read before a VM exists, as a run does to size guest
+    // RAM for the patched program.
+    assert_eq!(HvfBackend::host_counter_frequency(), guest_reads);
 }
 
 #[test]

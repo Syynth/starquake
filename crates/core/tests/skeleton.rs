@@ -17,10 +17,11 @@
 use std::time::Duration;
 
 use starquake_core::crash::{Exception, Location};
+use starquake_core::system::{THREAD_LOCAL_RAM, WORKING_RAM};
 use starquake_core::{Error, ExitReason, LoadError, RunReport, exit_code};
+use starquake_kernel::memory::MemoryArrangement;
 use starquake_kernel::memory::layout::{LayoutRequest, RegionOffsets, Regions};
-use starquake_kernel::memory::{CreateError, MemoryArrangement};
-use starquake_kernel::result::{KernelError, SvcError};
+use starquake_kernel::process::{Console, ProcessDescription};
 use starquake_kernel::svc::SvcId;
 use starquake_memory::PAGE_SIZE;
 use starquake_testkit::a64::SysReg;
@@ -761,25 +762,36 @@ fn an_endless_loop_is_ended_by_the_timeout() {
 #[test]
 fn a_program_larger_than_an_application_may_be_is_an_emulator_error() {
     // As much `.bss` as the application pool of the console holds (with the page of text, one
-    // page too much): the kernel cannot reserve the program's code.
+    // page too much): refused before the VM is made, with what it needed (its image and `.bss`,
+    // its stack and its thread-local page) and what an application may use.
     let pool = MemoryArrangement::FourGb.application_pool_size();
-    let file = NroBuilder::new(&[a64::nop()])
+    let builder = || NroBuilder::new(&[a64::nop()]);
+    let image = u64::try_from(builder().build().unwrap().len())
+        .unwrap()
+        .next_multiple_of(PAGE_SIZE);
+    let file = builder()
         .bss_size(u32::try_from(pool).unwrap())
         .build()
         .unwrap();
     let Some(report) = run(&file, GENEROUS) else {
         return;
     };
-    let error = Error::Load(LoadError::AddressSpace(CreateError::Code(
-        SvcError::Kernel(KernelError::LimitReached),
-    )));
+    // An NRO runs as a Switch 1 program, with Eden's defaults for a program with no NPDM.
+    let stack = ProcessDescription::homebrew(Console::Switch1).main_thread_stack_size;
+    let needed = image + pool + stack + THREAD_LOCAL_RAM;
+    let error = Error::OutOfRam {
+        needed,
+        available: pool,
+    };
     assert_eq!(report.exit, ExitReason::EmulatorError(error.to_string()));
     assert_eq!(report.exit_code(), exit_code::EMULATOR_ERROR);
     assert_eq!(report.trace, "");
     assert_eq!(
         error.to_string(),
-        "the program's address space could not be created: the program's code could not be \
-         mapped: limit reached"
+        format!(
+            "the program needs {needed:#x} bytes of guest RAM, more than the {pool:#x} bytes an \
+             application may use on its console"
+        )
     );
 }
 
@@ -926,6 +938,54 @@ mod memory_calls {
                 asm.emit(a64::ldr(3, 9, 0).unwrap());
             }
         }
+        asm.emit(svc(SvcId::ExitProcess));
+        asm.bind(fail).unwrap();
+        asm.emit(a64::brk(1).unwrap());
+        NroBuilder::new(&asm.finish().unwrap()).build().unwrap()
+    }
+
+    /// A program that sets its heap to `heap` bytes (bits 16 to 31 only: a multiple of
+    /// `HEAP_SIZE_ALIGNMENT` below 4 GiB) and stores to the first word of each of the first
+    /// `pages` pages of it, and exits. A failed call ends at `brk #1`.
+    ///
+    /// ```text
+    ///       movz x1, #(heap >> 16), lsl #16
+    ///       svc  #0x1              ; SetHeapSize: x1 = the heap's address
+    ///       cbnz x0, fail
+    ///       mov  x0, x1
+    ///       movz/movk x1, #pages
+    ///       movz/movk x2, #-0x1000
+    /// loop: str  x1, [x0]
+    ///       sub  x0, x0, x2        ; the next page
+    ///       sub  x1, x1, #1
+    ///       cbnz x1, loop
+    ///       svc  #0x7
+    /// fail: brk  #1
+    /// ```
+    pub(crate) fn touches_heap(heap: u64, pages: u64) -> Vec<u8> {
+        let halfword = |value: u64, shift: u32| {
+            u32::try_from((value >> shift) & u64::from(a64::MAX_IMM16)).unwrap()
+        };
+        assert_eq!(heap & !(u64::from(a64::MAX_IMM16) << 16), 0, "{heap:#x}");
+        let mut asm = Assembler::new();
+        let fail = asm.label();
+        asm.emit(a64::movz(1, halfword(heap, 16), 16).unwrap());
+        asm.emit(svc(SvcId::SetHeapSize));
+        asm.cbnz(0, fail).unwrap();
+        asm.emit(a64::mov(0, 1).unwrap());
+        asm.emit(a64::movz(1, halfword(pages, 0), 0).unwrap());
+        asm.emit(a64::movk(1, halfword(pages, 16), 16).unwrap());
+        let step = PAGE_SIZE.wrapping_neg();
+        asm.emit(a64::movz(2, halfword(step, 0), 0).unwrap());
+        for shift in [16, 32, 48] {
+            asm.emit(a64::movk(2, halfword(step, shift), shift).unwrap());
+        }
+        let again = asm.label();
+        asm.bind(again).unwrap();
+        asm.emit(a64::str(1, 0, 0).unwrap());
+        asm.emit(a64::sub(0, 0, 2).unwrap());
+        asm.emit(a64::sub_imm(1, 1, 1).unwrap());
+        asm.cbnz(1, again).unwrap();
         asm.emit(svc(SvcId::ExitProcess));
         asm.bind(fail).unwrap();
         asm.emit(a64::brk(1).unwrap());
@@ -1141,11 +1201,44 @@ fn the_first_word_after_a_heap_and_a_heap_that_was_freed_are_not_there() {
 }
 
 #[test]
-fn memory_a_program_never_touches_needs_no_guest_ram() {
-    /// More `.bss` than the backend's guest RAM holds (16 MiB); a whole number of pages.
-    const BSS: u32 = 64 << 20;
+fn a_large_bss_is_backed_as_it_is_touched_and_all_of_it_fits_the_ram_sized_for_it() {
+    // More `.bss` than the working RAM a run adds to what is loaded; a whole number of pages.
+    let bss = u32::try_from(4 * WORKING_RAM).unwrap();
+    let crash_text = |report: &RunReport| {
+        report
+            .crash()
+            .map(starquake_core::crash::CrashReport::to_text)
+    };
     // Touching a few pages of it is fine.
-    let Some(report) = run(&memory_calls::touches_bss(BSS, 8), GENEROUS) else {
+    let Some(report) = run(&memory_calls::touches_bss(bss, 8), GENEROUS) else {
+        return;
+    };
+    assert_eq!(
+        report.exit,
+        ExitReason::ProcessExited,
+        "{:?}",
+        crash_text(&report)
+    );
+    // So is touching every page: guest RAM is sized from what is loaded, `.bss` included.
+    let pages = bss / u32::try_from(PAGE_SIZE).unwrap();
+    let report = run(&memory_calls::touches_bss(bss, pages), GENEROUS).unwrap();
+    assert_eq!(
+        report.exit,
+        ExitReason::ProcessExited,
+        "{:?}",
+        crash_text(&report)
+    );
+}
+
+#[test]
+fn a_heap_touched_past_the_working_ram_runs_out_of_guest_ram_as_an_emulator_error() {
+    // Twice the working RAM a run adds to what is loaded: more than all of guest RAM for a
+    // program of one page with the default stack.
+    let heap = 2 * WORKING_RAM;
+    assert!(heap.is_multiple_of(starquake_kernel::svc::memory::HEAP_SIZE_ALIGNMENT));
+    let working_pages = WORKING_RAM / PAGE_SIZE;
+    // Touching as many pages of it as the working RAM holds is fine.
+    let Some(report) = run(&memory_calls::touches_heap(heap, working_pages), GENEROUS) else {
         return;
     };
     assert_eq!(
@@ -1158,10 +1251,14 @@ fn memory_a_program_never_touches_needs_no_guest_ram() {
     );
 
     // Touching all of it runs out of guest RAM, which is the emulator's failure (PROVISIONAL:
-    // the kernel's accounting lets an application use far more than the backend backs). The
-    // run names the page that could not be backed: one of `.bss`, on a page boundary.
-    let pages = BSS / u32::try_from(PAGE_SIZE).unwrap();
-    let report = run(&memory_calls::touches_bss(BSS, pages), GENEROUS).unwrap();
+    // the kernel's accounting lets an application use far more than the run backs). The run
+    // names the page that could not be backed: one of the heap, on a page boundary, past the
+    // pages the working RAM holds.
+    let report = run(
+        &memory_calls::touches_heap(heap, heap / PAGE_SIZE),
+        GENEROUS,
+    )
+    .unwrap();
     assert_eq!(report.exit_code(), exit_code::EMULATOR_ERROR);
     let ExitReason::EmulatorError(message) = &report.exit else {
         unreachable!("{:?}", report.exit);
@@ -1175,15 +1272,12 @@ fn memory_a_program_never_touches_needs_no_guest_ram() {
         .and_then(|rest| rest.strip_suffix(&format!(" could not be backed: {out_of_ram}")))
         .and_then(|digits| u64::from_str_radix(digits, 16).ok())
         .unwrap_or_else(|| unreachable!("{message}"));
-    let bss = report
-        .memory_map
-        .iter()
-        .find(|mapping| mapping.name == "main.bss")
-        .expect("a .bss mapping");
-    assert!(bss.contains(address), "{address:#x}");
+    let start = heap_region_start(&report);
+    assert!(
+        (start + WORKING_RAM..start + heap).contains(&address),
+        "{address:#x}"
+    );
     assert!(address.is_multiple_of(PAGE_SIZE), "{address:#x}");
-    // Not the first page: RAM held what came before it.
-    assert!(address > bss.start);
 }
 
 #[test]

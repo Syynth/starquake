@@ -61,7 +61,11 @@ impl SetSys {
   on events the service created, run after the kernel lock is released; the address-space
   queries (whether a range has the GPU-accessible attribute that `svc 0x80` sets); the
   device-share lock and unlock over a range; and transfer memory (kernel spec, "Waiting and
-  waking" and "Address space"). (Approved by the owner, 2026-11-12.)
+  waking" and "Address space"). (Approved by the owner, 2026-11-12.) The kernel interface also
+  clears an event the service created (Eden clears the applet message event at
+  `SetFocusHandlingMode(0,0,1)`), and lets a service end the calling process
+  (`ISelfController::Exit`): the request is recorded, the reply is sent, and then the kernel tears
+  the process down through its normal termination path. (Approved by the owner, 2026-11-16.)
 - Payload layouts are read and written field by field with explicit alignment, citing the
   reference. No transmuting structs: guest data is untrusted, and `unsafe` is denied here.
 
