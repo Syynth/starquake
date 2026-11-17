@@ -73,6 +73,18 @@
 //!   same two and a failure between the two keeps the first. Slice 5 replaces them with the
 //!   shared page's request and answer events.
 //!
+//! # The gpu session (497)
+//!
+//! A root built for a run with a gpu server ([`RootState::with_gpu_server`], [`root_server_for`])
+//! answers 497 with a copied session on that server ([`Reply::copy_service`]), whose root
+//! interface is the gpu session (`crate::gpu`). 497's `u64` is read: PR requires 4
+//! (`OpenGpuSession`: `flags == 4`, else `ResultInvalidCombination`) and the bootstrap complete
+//! (`ResultInvalidState`); here another value, or a bootstrap not complete, is logged and
+//! accepted, as for the other root commands (decision 7). A root with no gpu server answers 497
+//! with the stub's placeholder session. The server's number is the run's wiring, as `am`'s
+//! graphics server number is: a snapshot that names another one is refused
+//! (`a_snapshot_with_another_gpu_server_is_refused`).
+//!
 //! # Where this differs from the references
 //!
 //! Each row is pinned by the test named, in `root/tests.rs`:
@@ -94,6 +106,7 @@ use starquake_services::commands;
 use starquake_services::framework::{
     Context, Fault, Interfaces, NOT_SUPPORTED, Outcome, Reply, Request, Server, UnknownPolicy,
 };
+use starquake_trace::ServiceId;
 
 use crate::protocol::command::{
     ACTIVATE_FRAME_CONTEXT, ACTIVATE_GPU_CONTEXT, BIND_NATIVE_GPU_MEMORY, BIND_NATIVE_MEMORY,
@@ -212,6 +225,7 @@ pub struct RootState {
     out_of_order: u32,
     native_memory_mode: Option<u64>,
     syncpoint_events: SyncpointEvents,
+    gpu_server: Option<ServiceId>,
 }
 
 /// The serialised form of [`RootState`], field for field, and what deserialising validates.
@@ -222,6 +236,7 @@ struct SavedRootState {
     out_of_order: u32,
     native_memory_mode: Option<u64>,
     syncpoint_events: SyncpointEvents,
+    gpu_server: Option<ServiceId>,
 }
 
 /// Why a saved [`RootState`] could not be read back: it holds a combination of fields that no
@@ -267,6 +282,7 @@ impl TryFrom<SavedRootState> for RootState {
             out_of_order,
             native_memory_mode,
             syncpoint_events,
+            gpu_server,
         } = saved;
         match (phase, bootstrap.is_some()) {
             (Phase::Created, true) => return Err(RootStateError::CreatedWithBootstrap),
@@ -294,6 +310,7 @@ impl TryFrom<SavedRootState> for RootState {
             out_of_order,
             native_memory_mode,
             syncpoint_events,
+            gpu_server,
         })
     }
 }
@@ -314,7 +331,22 @@ impl RootState {
             out_of_order: 0,
             native_memory_mode: None,
             syncpoint_events: SyncpointEvents::None,
+            gpu_server: None,
         }
+    }
+
+    /// The root of a run whose gpu server is known by `service` (module docs, "The gpu
+    /// session").
+    #[must_use]
+    pub const fn with_gpu_server(mut self, service: ServiceId) -> Self {
+        self.gpu_server = Some(service);
+        self
+    }
+
+    /// The number of the gpu server 497 hands sessions on, if the run has one.
+    #[must_use]
+    pub const fn gpu_server(&self) -> Option<ServiceId> {
+        self.gpu_server
     }
 
     /// Where the bootstrap is.
@@ -415,7 +447,7 @@ commands! {
         INITIALIZE_GPU_CONTEXT => stub,
         ACTIVATE_GPU_CONTEXT => stub,
         REGISTER_GPU_ADDRESS_SPACE => stub,
-        OPEN_GPU_SESSION => stub,
+        OPEN_GPU_SESSION => open_gpu_session,
         GET_NVIDIA_DRIVER => stub,
         CREATE_NATIVE_MEMORY => stub,
         DESTROY_NATIVE_MEMORY => stub,
@@ -552,6 +584,30 @@ impl GsvRoot {
         reply.ok()
     }
 
+    /// `OpenGpuSession` (497). in: `u64` flags. out: copy handle, a session on the gpu server
+    /// (module docs, "The gpu session"); the stub's placeholder in a run with none.
+    fn open_gpu_session(
+        this: &mut Self,
+        cx: &mut Context<'_>,
+        req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        let Some(gpu) = cx.family::<RootState>()?.gpu_server else {
+            return Self::stub(this, cx, req, reply);
+        };
+        let flags = req.payload().read_u64()?;
+        let state = cx.family::<RootState>()?;
+        state.note_unready(OPEN_GPU_SESSION);
+        if flags != GPU_SESSION_FLAGS {
+            tracing::warn!(
+                flags,
+                "gsv: 497 with flags PR refuses; accepted (decision 7)"
+            );
+        }
+        reply.copy_service(gpu);
+        reply.ok()
+    }
+
     /// Every other root command: logs it and replies success with its known reply shape (module
     /// docs, "Stubs").
     fn stub(_: &mut Self, cx: &mut Context<'_>, req: &Request<'_>, reply: &mut Reply) -> Outcome {
@@ -617,11 +673,33 @@ pub fn root_interfaces() -> Interfaces {
     Interfaces::new().with::<GsvRoot>().with::<Placeholder>()
 }
 
-/// The root's server: every session a [`GsvRoot`], sharing one [`RootState`].
+/// The flags word 497 carries: PR's `OpenGpuSession` requires `flags == 4` (graphics-server,
+/// "The root": "497 takes a u64 (4)").
+pub const GPU_SESSION_FLAGS: u64 = 4;
+
+/// The root's server: every session a [`GsvRoot`], sharing one [`RootState`], in a run with no
+/// gpu server.
 #[must_use]
 pub fn root_server(policy: UnknownPolicy) -> Server {
+    root_server_for(RootState::new(), policy)
+}
+
+/// The root's server over `state`: [`RootState::new`], and in a run with a gpu server
+/// [`RootState::with_gpu_server`]. A snapshot whose gpu server number differs from `state`'s is
+/// refused (module docs, "The gpu session").
+#[must_use]
+pub fn root_server_for(state: RootState, policy: UnknownPolicy) -> Server {
     Server::new(ROOT_NAME, policy)
         .with_root(|| Box::new(GsvRoot))
         .with_interfaces(root_interfaces())
-        .with_family(RootState::new())
+        .with_checked_family(state, same_gpu_server)
+}
+
+/// The restore check of the root's state: a snapshot's gpu server number is the run's.
+fn same_gpu_server(run: &RootState, saved: &RootState) -> Result<(), &'static str> {
+    if run.gpu_server == saved.gpu_server {
+        Ok(())
+    } else {
+        Err("its root names another gpu server")
+    }
 }

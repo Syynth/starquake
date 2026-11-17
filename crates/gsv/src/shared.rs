@@ -12,8 +12,9 @@
 //! first, then `Syncpoints::new` with the queue as its `Completions`, then [`Shared::new`].
 //!
 //! [`GsvShared`] holds, so far, the waiter count of each syncpoint ([`Locked::watch`],
-//! [`Locked::unwatch`]); later slices add the waiter tables, the shared page, the GPU memory
-//! bookkeeping, vi2's queues and the native object tables (spec, "Concurrency inside gsv").
+//! [`Locked::unwatch`]) and the GPU memory bookkeeping ([`Locked::gpu`], slice 7); later slices
+//! add the waiter tables, the shared page, vi2's queues and the native object tables (spec,
+//! "Concurrency inside gsv").
 //!
 //! # The watched-id fast path
 //!
@@ -42,13 +43,13 @@
 //! acts, so a completion pushed meanwhile (by the kernel's hook, say) waits for the next drain
 //! (`a_push_during_the_drain_waits_for_the_next_one`).
 //!
-//! What the drain does with each completion, so far, is record it, except a device-share
-//! release, which it unlocks:
+//! What the drain does with each completion, so far, is record it, then act on it as the table
+//! says:
 //!
 //! | Completion | What the drain does |
 //! |---|---|
 //! | `GpuCompletion::SyncpointChanged` | records `SyncpointObserved` ([`crate::note`]) |
-//! | `GpuCompletion::GpuOrdered` | records `GpuOrderedDone` |
+//! | `GpuCompletion::GpuOrdered` | records `GpuOrderedDone`; then, if a gpu worker job waits on the ticket ([`crate::gpu::GpuMemory::ordered_done`]), publishes the ranges it removed again, releases its device-share locks as a `DeviceShareReleased` is released (below), and only then signals its event ([`TimerHost::signal_event`]) |
 //! | `GpuCompletion::GpuQueueRoom` | records `QueueRoom` |
 //! | [`Completion::GuestSignalled`] | nothing: the guest's `SignalEvent` is recorded as its system call, and what gsv does about it (the shared page's answer, slice 5) records its own note |
 //! | [`Completion::DeviceShareReleased`] | unlocks through the kernel with the token ([`TimerHost::unlock_device_share`]), which checks it; records nothing (the spec's "What is recorded" has no note for it) |
@@ -61,8 +62,10 @@
 //! (`a_refused_release_is_logged_and_the_drain_goes_on`; the levels are pinned by
 //! `tests/release_log_levels.rs`, a test binary of its own).
 //!
-//! Later slices act on them as well: the syncpt waiter table (slice 4), the shared page (5), the
-//! ordered completion of unmaps and destroys (7), deferred submissions (11).
+//! A job's event that the kernel refuses to signal is logged as an error, and the drain goes on.
+//!
+//! Later slices act on them as well: the syncpt waiter table (slice 4), the shared page (5),
+//! deferred submissions (11).
 //!
 //! # The timer thread, until the wiring
 //!
@@ -80,7 +83,8 @@
 //! decoded and checked before the body. The body is the waiter count of each syncpoint, by id.
 //! The golden-bytes test `the_snapshot_layout_is_pinned` pins it; changing it means bumping
 //! [`SNAPSHOT_VERSION`]. The queue has its own snapshot ([`CompletionQueue::save`]), because it
-//! must exist before the `Syncpoints` that pushes to it.
+//! must exist before the `Syncpoints` that pushes to it. The GPU memory bookkeeping has its own
+//! too ([`crate::gpu::saved`]); composing it into this one is the wiring slice's (16).
 //!
 //! A snapshot is a file and is not trusted. [`Shared::restore`] checks, in this order, and
 //! returns the first failure: the magic, the version, that the body decodes, that no bytes
@@ -95,11 +99,14 @@ use serde::{Deserialize, Serialize};
 use starquake_gpu::interface::{GpuCompletion, SYNCPOINT_COUNT, SyncpointId};
 use starquake_gpu::syncpoint::Syncpoints;
 use starquake_kernel::dispatch::DeviceShareError;
+use starquake_kernel::id::ObjectId;
 use starquake_kernel::memory::DeviceShareToken;
+use starquake_kernel::result::KernelError;
 use starquake_trace::{EventKind, ServiceId};
 use thiserror::Error;
 
 use crate::completion::{Completion, CompletionQueue};
+use crate::gpu::GpuMemory;
 use crate::note::Note;
 
 #[cfg(test)]
@@ -128,6 +135,13 @@ pub trait TimerHost {
     /// Releases the device-share lock `token` names, through the kernel, which checks the token
     /// (`Dispatcher::unlock_device_share`, whose refusals these are).
     fn unlock_device_share(&mut self, token: DeviceShareToken) -> Result<(), DeviceShareError>;
+
+    /// Signals the kernel event `event`, from the timer thread (`Dispatcher::signal_event`):
+    /// how the drain completes a gpu worker job. The default answers
+    /// [`KernelError::NotImplemented`], for a host whose test signals nothing.
+    fn signal_event(&mut self, _event: ObjectId) -> Result<(), KernelError> {
+        Err(KernelError::NotImplemented)
+    }
 }
 
 /// What gsv's request handlers and its timer thread share (module docs, "The pieces").
@@ -139,6 +153,8 @@ pub trait TimerHost {
 pub struct GsvShared {
     /// The number of waiters on each syncpoint, by id.
     watchers: Vec<u32>,
+    /// The GPU memory bookkeeping (slice 7).
+    gpu: GpuMemory,
 }
 
 impl GsvShared {
@@ -146,6 +162,7 @@ impl GsvShared {
     fn fresh() -> Self {
         Self {
             watchers: vec![0; COUNT],
+            gpu: GpuMemory::new(),
         }
     }
 
@@ -156,6 +173,12 @@ impl GsvShared {
             .get(usize::from(id.get()))
             .copied()
             .unwrap_or(0)
+    }
+
+    /// The GPU memory bookkeeping.
+    #[must_use]
+    pub fn gpu_memory(&self) -> &GpuMemory {
+        &self.gpu
     }
 }
 
@@ -208,6 +231,11 @@ impl Locked<'_> {
             self.syncpoints.unwatch(id);
         }
         Ok(())
+    }
+
+    /// The GPU memory bookkeeping, to change (the gpu server's handlers, slice 7).
+    pub fn gpu(&mut self) -> &mut GpuMemory {
+        &mut self.state.gpu
     }
 }
 
@@ -280,7 +308,7 @@ impl Shared {
     /// completion in the queue's order, recording its note through `host` (module docs, "Lock
     /// order and the drain"). Returns what it took, in order.
     pub fn drain(&self, host: &mut dyn TimerHost) -> Vec<Completion> {
-        let state = self.lock();
+        let mut state = self.lock();
         let taken = self.queue.take_all();
         for completion in &taken {
             match *completion {
@@ -288,7 +316,19 @@ impl Shared {
                 Completion::GuestSignalled { .. } => {
                     tracing::trace!(?completion, "gsv drained a guest signal");
                 }
-                Completion::Gpu(gpu) => host.record(note(gpu).event(self.service)),
+                Completion::Gpu(gpu) => {
+                    host.record(note(gpu).event(self.service));
+                    if let GpuCompletion::GpuOrdered { ticket } = gpu
+                        && let Some(finished) = state.gpu().ordered_done(ticket)
+                    {
+                        for token in finished.releases {
+                            release(host, token);
+                        }
+                        if let Err(error) = host.signal_event(finished.event) {
+                            tracing::error!(%error, ?ticket, "gsv: a gpu job's event was not signalled");
+                        }
+                    }
+                }
             }
         }
         drop(state);
@@ -338,6 +378,7 @@ impl Shared {
         saved.check(&syncpoints)?;
         let state = GsvShared {
             watchers: saved.watchers,
+            gpu: GpuMemory::new(),
         };
         Ok(Self::with_state(state, syncpoints, queue, service))
     }

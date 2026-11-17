@@ -1030,9 +1030,11 @@ fn the_saved_root_layouts_are_pinned() {
                 out_of_order: 0,
                 native_memory_mode: Some(0x0B),
                 syncpoint_events: SyncpointEvents::One(object(0x0C, 0x0D)),
+                gpu_server: None,
             },
-            // phase 0; no bootstrap; count 0; mode Some(0x0B); One(index, generation).
-            &[0, 0, 0, 1, 0x0B, 1, 0x0C, 0x0D],
+            // phase 0; no bootstrap; count 0; mode Some(0x0B); One(index, generation); no gpu
+            // server.
+            &[0, 0, 0, 1, 0x0B, 1, 0x0C, 0x0D, 0],
         ),
         (
             RootState {
@@ -1041,10 +1043,13 @@ fn the_saved_root_layouts_are_pinned() {
                 out_of_order: 0x17,
                 native_memory_mode: None,
                 syncpoint_events: SyncpointEvents::Both(object(0x18, 0x19), object(0x1A, 0x1B)),
+                gpu_server: Some(ServiceId(0x1C)),
             },
-            // phase 1; Some(user id, flags, four parameters); count; no mode; Both(a, b).
+            // phase 1; Some(user id, flags, four parameters); count; no mode; Both(a, b); Some(gpu
+            // server).
             &[
-                1, 1, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0, 2, 0x18, 0x19, 0x1A, 0x1B,
+                1, 1, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0, 2, 0x18, 0x19, 0x1A, 0x1B, 1,
+                0x1C,
             ],
         ),
         (
@@ -1054,9 +1059,10 @@ fn the_saved_root_layouts_are_pinned() {
                 out_of_order: 0x21,
                 native_memory_mode: Some(0x22),
                 syncpoint_events: SyncpointEvents::None,
+                gpu_server: None,
             },
-            // phase 2; no bootstrap; count; mode; no events.
-            &[2, 0, 0x21, 1, 0x22, 0],
+            // phase 2; no bootstrap; count; mode; no events; no gpu server.
+            &[2, 0, 0x21, 1, 0x22, 0, 0],
         ),
         (
             RootState {
@@ -1065,9 +1071,10 @@ fn the_saved_root_layouts_are_pinned() {
                 out_of_order: 0x37,
                 native_memory_mode: Some(0x38),
                 syncpoint_events: SyncpointEvents::One(object(0x39, 0x3A)),
+                gpu_server: Some(ServiceId(0x3B)),
             },
             &[
-                3, 1, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 1, 0x38, 1, 0x39, 0x3A,
+                3, 1, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 1, 0x38, 1, 0x39, 0x3A, 1, 0x3B,
             ],
         ),
     ];
@@ -1157,6 +1164,7 @@ fn saved(state: RootState) -> SavedRootState {
         out_of_order: state.out_of_order,
         native_memory_mode: state.native_memory_mode,
         syncpoint_events: state.syncpoint_events,
+        gpu_server: state.gpu_server,
     }
 }
 
@@ -1246,4 +1254,64 @@ fn a_refused_state_is_said_in_plain_words() {
     for (error, words) in said {
         assert_eq!(error.to_string(), words);
     }
+}
+
+// ----- 497 and the gpu server ------------------------------------------------------------------
+
+/// The number the tests' gpu server is known by.
+const GPU: ServiceId = ServiceId(0x0749);
+
+/// A root wired to a gpu server.
+fn wired() -> Rig {
+    let mut kernel = FakeKernel::new(0).unwrap();
+    kernel.set_current_service(ROOT);
+    kernel.add_service(GPU);
+    let session = kernel.new_object();
+    let state = RootState::new().with_gpu_server(GPU);
+    let mut server = root_server_for(state, UnknownPolicy::Strict).with_service_id(ROOT);
+    server.accept(session).unwrap();
+    Rig {
+        kernel,
+        server,
+        session,
+    }
+}
+
+/// 497 (`0x201, 2`, PR `OpenGpuSession`: flags at words 2-3) copies a new session on the gpu
+/// server, with flags 4 or any other (logged, decision 7), bootstrap complete or not.
+#[test]
+fn open_gpu_session_copies_a_session_on_the_gpu_server() {
+    let mut rig = wired();
+    assert_eq!(tipc_type(OPEN_GPU_SESSION), 0x201);
+    for flags in [GPU_SESSION_FLAGS, 5] {
+        let [low, high] = halves(flags);
+        let reply = rig.send(&[0x201, 2, low, high]);
+        assert_eq!(copied(&reply).len(), 1);
+        let connections = rig.kernel.take_connections();
+        assert_eq!(connections.len(), 1);
+        assert_eq!(connections[0].0, GPU);
+    }
+    // Only the root's own session: no placeholder was made.
+    assert_eq!(rig.server.session_count(), 1);
+    assert_eq!(rig.state().gpu_server(), Some(GPU));
+    // A short request is refused.
+    let short = rig.send(&[0x201, 1, 4]);
+    assert_eq!(short, result_only(OPEN_GPU_SESSION, INVALID_CMIF_REQUEST));
+}
+
+/// A snapshot that names another gpu server, or none, is refused, and the server keeps its own.
+#[test]
+fn a_snapshot_with_another_gpu_server_is_refused() {
+    let unwired = Rig::new();
+    let saved = unwired.server.save().unwrap();
+    let mut rig = wired();
+    assert_eq!(
+        rig.server.restore(&saved),
+        Err(SnapshotError::FamilyWiring(
+            "its root names another gpu server"
+        ))
+    );
+    assert_eq!(rig.state().gpu_server(), Some(GPU));
+    let own = rig.server.save().unwrap();
+    assert_eq!(rig.server.restore(&own), Ok(()));
 }

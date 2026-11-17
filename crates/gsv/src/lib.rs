@@ -10,8 +10,10 @@
 //! * [`shared`]: the state handlers and the timer thread share, the lock order, and the drain.
 //! * [`note`]: the notes gsv records for replay.
 //! * [`nvsrv`]: the NVIDIA driver session (the nvdrv protocol) and `/dev/nvmap`.
+//! * [`gpu`]: the gpu session (497) and its worker: GPU memory, mappings and sparse regions.
 
 pub mod completion;
+pub mod gpu;
 pub mod note;
 pub mod nvsrv;
 pub mod protocol;
