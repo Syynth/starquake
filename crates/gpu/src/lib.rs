@@ -14,3 +14,4 @@ pub mod memory;
 pub mod mme;
 pub mod ring;
 pub mod sema;
+pub mod syncpoint;
