@@ -30,9 +30,12 @@
 //! counter, then read the watched bit), so for every increment either gsv's read sees its value
 //! or the incrementer sees the bit and pushes. The threaded test
 //! `an_increment_after_a_watch_is_either_seen_or_pushed` checks the outcome (no value above the
-//! one gsv read goes unpushed) and fails if `increment` skips the push; it cannot show that a
-//! weaker ordering is wrong, since a weakly ordered race is not reliably reproduced on the host,
-//! so the orderings are for review to keep.
+//! one gsv read goes unpushed) and fails if `increment` skips the push. It does not reliably
+//! catch reordering `increment` to read the watched bit before the add, which loses pushes: the
+//! loss needs a watch to land between the two steps, and in one review the test caught that
+//! mutation once in six runs. Nor can it show that a weaker memory ordering is wrong, since a
+//! weakly ordered race is not reliably reproduced on the host. Both the order of the two steps
+//! and the orderings are for review to keep.
 //!
 //! # What is recorded and what is snapshotted
 //!
@@ -70,8 +73,12 @@
 //! - **[`Syncpoints::read`] reads any id.** Eden's `ReadSyncpointMinValue` asserts on an id
 //!   that is not allocated; the GPU reads through the syncpoint shim and increments without
 //!   asking gsv, so here reads and increments work on any id
-//!   (`reads_and_increments_work_on_any_id`). [`Syncpoints::read_allocated`] is PR's
-//!   `ReadAllocatedSyncpoint`, `None` for an id that is not allocated.
+//!   (`reads_and_increments_work_on_any_id`). Likewise [`Syncpoints::reached`] compares the
+//!   counter of an id that is not allocated, where Eden's `HasSyncpointExpired` asserts and
+//!   returns false (`if (!syncpoint.reserved)`), so it can be true here
+//!   (`reached_compares_the_counter_wrapping`, on the unallocated id 40).
+//!   [`Syncpoints::read_allocated`] is PR's `ReadAllocatedSyncpoint`, `None` for an id that is
+//!   not allocated.
 //! - **One counter, not a cache of host1x.** Eden's `counter_min` is a copy of the host1x
 //!   counter synced by `UpdateMin`; here the counter is the value itself, incremented in place.
 //! - **Allocation takes no lock.** Eden scans under a mutex; here each id is claimed with one
@@ -87,11 +94,17 @@
 //! - The count (192, [`SYNCPOINT_COUNT`]) and the reserved ids ([`RESERVED_SYNCPOINTS`]) are
 //!   Eden's Switch 1 values; that Switch 2 keeps them is a guess (graphics-server, "What to
 //!   verify before building", item 10).
-//! - [`CompareMode::Wide64`] compares the 32-bit counter, zero-extended, with the 64-bit
-//!   threshold, as PR's `IsSyncpointWaitSatisfied` does; it does not compare the extended value
-//!   of [`CounterExtension`]. NX2 passes only the low 32 bits of the threshold whatever the mode
-//!   (`eden-nx2/src/core/hle/service/nx2_gsv.h` @ 50fa86bb, `RequestSlotEvent`), so the
-//!   references disagree; the spec takes PR's reading ("mode 1 compares as 64-bit"). A trace
+//!
+//! # Conflicts
+//!
+//! - **conflict:** [`CompareMode::Wide64`] (mode 1). PR's `IsSyncpointWaitSatisfied` compares
+//!   the 32-bit counter, zero-extended to 64 bits, with the 64-bit threshold; NX2 passes only
+//!   the low 32 bits of the threshold whatever the mode
+//!   (`eden-nx2/src/core/hle/service/nx2_gsv.h` @ 50fa86bb, `RequestSlotEvent`). The spec takes
+//!   PR's reading under its decision 8 ("mode 1 compares as 64-bit"), and so does this code. It
+//!   does not compare the extended value of [`CounterExtension`]. Pinned by
+//!   `the_wide_comparison_at_the_edge_on_both_sides`, through
+//!   `!wait_satisfied(u32::MAX, WRAP, Wide64)`, which NX2's reading would call reached. A trace
 //!   of a mode-1 wait with a threshold above `u32::MAX` would settle it.
 //!
 //! # Snapshot format
@@ -176,7 +189,7 @@ pub enum CompareMode {
     /// Mode 0: reached once `current - threshold`, both 32 bits and wrapping, is not negative.
     Wrapping32,
     /// Mode 1: reached once the counter, zero-extended, is at least the 64-bit threshold. A
-    /// guess as to the console (module docs, "Guesses").
+    /// conflict between the references, settled by PR's reading (module docs, "Conflicts").
     Wide64,
 }
 
@@ -533,9 +546,12 @@ impl State {
                 found: self.maxima.len(),
             });
         }
-        for id in 0..usize::from(FIRST_ALLOCATABLE) {
-            if self.allocated[id / WORD_BITS] & (1 << (id % WORD_BITS)) != 0 {
-                return Err(SnapshotError::NeverAllocated { id });
+        for id in all_ids().take(usize::from(FIRST_ALLOCATABLE)) {
+            let (word, mask) = bit(id);
+            if self.allocated[word] & mask != 0 {
+                return Err(SnapshotError::NeverAllocated {
+                    id: usize::from(id.get()),
+                });
             }
         }
         Ok(())

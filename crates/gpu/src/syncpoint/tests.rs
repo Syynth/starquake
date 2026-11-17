@@ -85,6 +85,15 @@ fn the_wrapping_comparison_at_the_wrap_edge_on_both_sides() {
 }
 
 #[test]
+fn the_sign_bit_is_pr_s() {
+    // PR `IsSyncpointWaitSatisfied` tests `0x80000000U`, written out here so a wrong `SIGN_BIT`
+    // cannot move the edge with it: a difference of 0x7FFF_FFFF is reached, 0x8000_0000 is not.
+    let mode = CompareMode::Wrapping32;
+    assert!(wait_satisfied(7 + 0x7FFF_FFFF, 7, mode));
+    assert!(!wait_satisfied(7 + 0x8000_0000, 7, mode));
+}
+
+#[test]
 fn the_wide_comparison_at_the_edge_on_both_sides() {
     let mode = CompareMode::Wide64;
     assert!(wait_satisfied(100, 100, mode));
@@ -106,6 +115,8 @@ fn the_wide_comparison_at_the_edge_on_both_sides() {
 fn reached_compares_the_counter_wrapping() {
     let (syncpoints, _) = fresh();
     let sp = id(40);
+    // Not allocated: Eden's `HasSyncpointExpired` would return false for every fence below.
+    assert!(!syncpoints.is_allocated(sp));
     set_counter(&syncpoints, sp, u32::MAX - 1);
     let at_max = Fence {
         id: sp,
@@ -453,6 +464,30 @@ fn increment_pushes_only_when_watched() {
 }
 
 #[test]
+fn watching_twice_keeps_the_id_watched() {
+    let (syncpoints, recorder) = fresh();
+    let sp = id(64);
+    syncpoints.watch(sp);
+    syncpoints.watch(sp);
+    assert!(syncpoints.is_watched(sp));
+    assert_eq!(syncpoints.increment(sp), 1);
+    assert_eq!(
+        recorder.taken(),
+        [GpuCompletion::SyncpointChanged { id: sp, value: 1 }]
+    );
+}
+
+#[test]
+fn unwatching_an_unwatched_id_leaves_it_unwatched() {
+    let (syncpoints, recorder) = fresh();
+    let sp = id(64);
+    syncpoints.unwatch(sp);
+    assert!(!syncpoints.is_watched(sp));
+    assert_eq!(syncpoints.increment(sp), 1);
+    assert_eq!(recorder.taken(), []);
+}
+
+#[test]
 fn watched_increments_push_in_order() {
     let (syncpoints, recorder) = fresh();
     let a = id(2);
@@ -692,6 +727,18 @@ fn restore_refuses_a_bad_header() {
         error.to_string(),
         format!(
             "syncpoint snapshot layout version 2 is not supported (this build reads {SNAPSHOT_VERSION})"
+        )
+    );
+
+    // A version below the supported one is refused too.
+    let mut old = good.clone();
+    old[4] = 0;
+    let error = restore_error(&old);
+    assert_eq!(error, SnapshotError::UnsupportedVersion { found: 0 });
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "syncpoint snapshot layout version 0 is not supported (this build reads {SNAPSHOT_VERSION})"
         )
     );
 
