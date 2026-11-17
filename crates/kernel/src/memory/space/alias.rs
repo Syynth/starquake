@@ -242,7 +242,7 @@ impl AddressSpace {
             set: DisableMerge::NORMAL,
             clear: DisableMerge::NONE,
         };
-        self.check_updates(src, dst, pages, &source_change, &alias_change)?;
+        self.check_updates(src, dst, pages, source_change, alias_change)?;
         let locked = guest_perms(LOCKED_SOURCE)?;
         let read_write = guest_perms(MemoryPermission::USER_READ_WRITE)?;
         // Reprotect the source as kernel-read/not mapped.
@@ -254,12 +254,14 @@ impl AddressSpace {
             let failed = refused(Effect::Map, dst, size, &error);
             return Err(match self.mapper.protect(src, size, read_write) {
                 Ok(()) => SvcError::Internal(failed),
-                Err(undo) => self.keep_source_inaccessible(src, pages, source.state, failed, &undo),
+                Err(undo) => {
+                    self.keep_source_inaccessible(src, pages, source.state, &failed, &undo)
+                }
             });
         }
         // Apply the memory block updates.
-        self.update(src, pages, &source_change)?;
-        self.update(dst, pages, &alias_change)?;
+        self.update(src, pages, source_change)?;
+        self.update(dst, pages, alias_change)?;
         self.aliases.insert(dst, src, size);
         Ok(())
     }
@@ -310,7 +312,7 @@ impl AddressSpace {
             set: DisableMerge::NONE,
             clear: DisableMerge::NORMAL,
         };
-        self.check_updates(src, dst, pages, &source_change, &free_change)?;
+        self.check_updates(src, dst, pages, source_change, free_change)?;
         let read_write = guest_perms(MemoryPermission::USER_READ_WRITE)?;
         // Unmap the aliased copy of the pages.
         self.mapper
@@ -322,12 +324,12 @@ impl AddressSpace {
             let failed = refused(Effect::Protect, src, size, &error);
             return Err(match self.mapper.map_alias(dst, src, size, read_write) {
                 Ok(()) => SvcError::Internal(failed),
-                Err(undo) => self.forget_alias(dst, pages, &free_change, failed, &undo),
+                Err(undo) => self.forget_alias(dst, pages, free_change, &failed, &undo),
             });
         }
         // Apply the memory block updates.
-        self.update(src, pages, &source_change)?;
-        self.update(dst, pages, &free_change)?;
+        self.update(src, pages, source_change)?;
+        self.update(dst, pages, free_change)?;
         self.aliases.remove(dst, size);
         Ok(())
     }
@@ -338,8 +340,8 @@ impl AddressSpace {
         src: u64,
         dst: u64,
         pages: u64,
-        source: &Change,
-        alias: &Change,
+        source: Change,
+        alias: Change,
     ) -> CallResult<()> {
         for (address, change) in [(src, source), (dst, alias)] {
             self.blocks
@@ -356,7 +358,7 @@ impl AddressSpace {
     }
 
     /// Applies `change` to the block map, which [`Self::check_updates`] said it would take.
-    fn update(&mut self, address: u64, pages: u64, change: &Change) -> CallResult<()> {
+    fn update(&mut self, address: u64, pages: u64, change: Change) -> CallResult<()> {
         self.blocks
             .update(
                 address,
@@ -378,7 +380,7 @@ impl AddressSpace {
         src: u64,
         pages: u64,
         state: MemoryState,
-        failed: String,
+        failed: &str,
         undo: &MapperError,
     ) -> SvcError {
         let kept = Change {
@@ -388,7 +390,7 @@ impl AddressSpace {
             set: DisableMerge::NONE,
             clear: DisableMerge::NONE,
         };
-        match self.update(src, pages, &kept) {
+        match self.update(src, pages, kept) {
             Ok(()) => SvcError::Internal(format!(
                 "{failed}; reprotecting the source back failed too, so the guest cannot reach \
                  it: {undo}"
@@ -404,8 +406,8 @@ impl AddressSpace {
         &mut self,
         dst: u64,
         pages: u64,
-        free: &Change,
-        failed: String,
+        free: Change,
+        failed: &str,
         undo: &MapperError,
     ) -> SvcError {
         if let Err(error) = self.update(dst, pages, free) {

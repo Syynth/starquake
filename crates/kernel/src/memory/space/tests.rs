@@ -1287,18 +1287,18 @@ impl Translated {
                     address,
                     size,
                     perms,
+                }
+                | MapperCall::MapAlias {
+                    address,
+                    size,
+                    perms,
+                    ..
                 } => self.map(address, size, perms),
                 MapperCall::MapShared {
                     address,
                     backing,
                     perms,
                 } => self.map(address, backing.size(), perms),
-                MapperCall::MapAlias {
-                    address,
-                    size,
-                    perms,
-                    ..
-                } => self.map(address, size, perms),
                 MapperCall::AllocateShared { .. } => {}
                 MapperCall::Unmap { address, size } => {
                     for page in pages_of(address, size) {
