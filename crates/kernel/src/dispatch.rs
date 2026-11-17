@@ -215,6 +215,7 @@ use crate::handle::{Handle, HandleTable};
 use crate::id::{ObjectId, ServerId};
 use crate::ipc::SessionHandler;
 use crate::result::{CallResult, KernelError, ResultCode, SvcError};
+use crate::process::Console;
 use crate::sched::CoreId;
 use crate::svc::{
     Convention, ConventionError, DebugSink, Kind, Status, SvcId, debug, handle, info, memory,
@@ -836,6 +837,12 @@ impl Dispatcher {
             SvcId::QueryMemory => self.call::<(&AddressSpace,)>(call, |(space,), call, _| {
                 query_memory(space, call.caller.memory, id, convention, call.regs)
             }),
+            SvcId::SetGpuMemoryAttribute => self.call_in_process::<(&mut AddressSpace,)>(
+                call,
+                |(space,), call, _, processes| {
+                    set_gpu_memory_attribute(space, processes, id, convention, call.regs)
+                },
+            ),
             SvcId::GetInfo => self.call::<(&HandleTable, &AddressSpace, &Scheduler)>(
                 call,
                 |(handles, space, scheduler), call, _| {
@@ -950,6 +957,25 @@ fn set_memory_attribute(
     returning(id, convention, regs, |[address, size, mask, attribute]| {
         let (mask, attribute) = (word(mask)?, word(attribute)?);
         memory::set_memory_attribute(space, address, size, mask, attribute)?;
+        Ok([])
+    })
+}
+
+fn set_gpu_memory_attribute(
+    space: &mut AddressSpace,
+    processes: &Processes,
+    id: SvcId,
+    convention: &Convention,
+    regs: &mut GuestRegs,
+) -> Outcome {
+    returning(id, convention, regs, |[address, size, mask, attribute]| {
+        let console = processes
+            .own_info()
+            .map_err(|error| SvcError::internal(&error))?
+            .console();
+        let switch_2 = console == Console::Switch2;
+        let (mask, attribute) = (word(mask)?, word(attribute)?);
+        memory::set_gpu_memory_attribute(space, switch_2, address, size, mask, attribute)?;
         Ok([])
     })
 }

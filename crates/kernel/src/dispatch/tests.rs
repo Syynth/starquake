@@ -1478,7 +1478,7 @@ fn a_planned_call_returns_not_implemented_and_leaves_its_outputs_alone() {
     let mut sink = Collect::default();
     for (id, status) in [
         (SvcId::GetResourceLimitLimitValue, Status::Planned),
-        (SvcId::SetGpuMemoryAttribute, Status::Planned),
+        (SvcId::MapMemory, Status::Planned),
         (SvcId::SynchronizePreemptionState, Status::Planned),
         (SvcId::SendSyncRequestLight, Status::Deferred),
     ] {
@@ -1714,4 +1714,66 @@ fn the_dispatcher_can_be_shared_between_core_threads() {
         format!("{:?}", Dispatcher::new(tables())),
         "Dispatcher { timed: false, .. }"
     );
+}
+
+// --- SetGpuMemoryAttribute (0x80) -----------------------------------------------------------
+
+#[test]
+fn set_gpu_memory_attribute_decodes_x0_to_x3_and_writes_the_result() {
+    let dispatcher = Dispatcher::new(tables());
+    let id = SvcId::SetGpuMemoryAttribute;
+    // The mask and attribute are 32 bits: the upper halves of their registers are junk.
+    let junk = 0xdead_beef_0000_0000;
+    let gpu = u64::from(MemoryAttribute::GPU_ACCESSIBLE.svc());
+    let page = starquake_memory::PAGE_SIZE;
+    let mut regs = regs();
+    regs.x[..4].copy_from_slice(&[DATA, page, junk | gpu, junk | gpu]);
+    let before = regs.clone();
+    let (record, events) = dispatch_on(&dispatcher, id.number(), &mut regs, 0);
+    assert_eq!(record.outcome, Outcome::Completed);
+    assert_eq!(regs.x[0], 0);
+    assert_untouched_from(&regs, &before, 1);
+    let mut args = [0; SVC_ARG_COUNT];
+    args[..4].copy_from_slice(&[DATA, page, gpu, gpu]);
+    assert_eq!(
+        kinds(&events),
+        [EventKind::Svc {
+            id: u32::from(id.number()),
+            args,
+            result: starquake_trace::ResultCode(0),
+        }]
+    );
+    dispatcher.with::<(&AddressSpace,), _>(|(space,)| {
+        assert_eq!(
+            u64::from(space.query_info(DATA).unwrap().svc_info().attribute),
+            gpu
+        );
+        assert!(space.is_gpu_accessible(DATA, page));
+    });
+    // An error is the result in x0, and nothing else.
+    let mut regs = before.clone();
+    regs.x[0] = DATA + 1;
+    let (record, _) = dispatch_on(&dispatcher, id.number(), &mut regs, 0);
+    assert_eq!(record.outcome, Outcome::Completed);
+    assert_eq!(regs.x[0], word(KernelError::InvalidAddress));
+    assert_untouched_from(&regs, &before, 1);
+}
+
+#[test]
+fn set_gpu_memory_attribute_is_not_implemented_for_a_process_built_for_switch_1() {
+    // PR #4588's `UsesPAuthReturns` check: the call's own result, not the dispatcher's "not
+    // implemented" path (the call is implemented, and its event says so).
+    let dispatcher = Dispatcher::new(tables_at(Console::Switch1));
+    let id = SvcId::SetGpuMemoryAttribute;
+    let gpu = u64::from(MemoryAttribute::GPU_ACCESSIBLE.svc());
+    let mut regs = regs();
+    regs.x[..4].copy_from_slice(&[DATA, starquake_memory::PAGE_SIZE, gpu, gpu]);
+    let before = regs.clone();
+    let (record, _) = dispatch_on(&dispatcher, id.number(), &mut regs, 0);
+    assert_eq!(record.outcome, Outcome::Completed);
+    assert_eq!(regs.x[0], not_implemented_word());
+    assert_untouched_from(&regs, &before, 1);
+    dispatcher.with::<(&AddressSpace,), _>(|(space,)| {
+        assert_eq!(space.query_info(DATA).unwrap().svc_info().attribute, 0);
+    });
 }

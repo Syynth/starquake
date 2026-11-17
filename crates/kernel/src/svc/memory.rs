@@ -1,5 +1,6 @@
 //! The memory system calls of the calling process: `SetHeapSize` (0x01), `SetMemoryPermission`
-//! (0x02), `SetMemoryAttribute` (0x03) and `QueryMemory` (0x06).
+//! (0x02), `SetMemoryAttribute` (0x03), `QueryMemory` (0x06), and Switch 2's
+//! `SetGpuMemoryAttribute` (0x80).
 //!
 //! Each validates its arguments as Horizon does, in Horizon's order, and then calls the
 //! [`AddressSpace`] operation of the same name. Ported from Eden (GPL-3.0-or-later), paths
@@ -12,6 +13,13 @@
 //!   `QueryProcessMemory`.
 //! - The constants: `HeapSizeAlignment` (`eden/src/core/hle/kernel/svc_common.h`) and
 //!   `MainMemorySizeMax` (`eden/src/core/hle/kernel/k_memory_layout.h`).
+//! - `SetGpuMemoryAttribute`: Eden PR #4588's
+//!   (`eden-pr4588/src/core/hle/kernel/svc/svc_memory.cpp` @ e5fb3b97), checked against
+//!   Eden-NX2's (`eden-nx2/src/core/hle/kernel/svc.cpp` @ 50fa86bb, the `imm == 0x80` case of
+//!   `Call`). Both then call the page table's `SetMemoryAttribute`, whose Switch 2 form is in
+//!   [`AddressSpace::set_memory_attribute`]. The call is a Switch 2 one (scoping doc, "Process,
+//!   memory, kernel": "New SVC: `svc 0x80`"); what a console does is known only from these two
+//!   ports and from the SDK callers they captured, so its checks are theirs.
 //!
 //! # Results, in the order they are checked
 //!
@@ -36,6 +44,11 @@
 //! | | the range's state allows the change | `InvalidCurrentMemory` |
 //! | `QueryMemory` | the guest may write every byte of the result: each block the 0x28 bytes touch has user write permission | `InvalidPointer` |
 //! | | the result can be written to the caller's memory | `InvalidPointer` |
+//! | `SetGpuMemoryAttribute` | the process was built for Switch 2 (PR: `UsesPAuthReturns`) | `NotImplemented` |
+//! | | address, size and wrap, as `SetMemoryPermission` | as above |
+//! | | the attribute lies inside the mask, and both inside `GpuAccessible` | `InvalidCombination` |
+//! | | the range lies inside the address space | `InvalidCurrentMemory` |
+//! | | the range's state allows the change (`FlagCanChangeAttribute`) and its attributes are settable or `DeviceShared` | `InvalidCurrentMemory` |
 //!
 //! # Divergences from Eden
 //!
@@ -65,8 +78,21 @@
 //! - **`QueryMemory` takes no handle**: Eden resolves the current-process pseudo-handle and
 //!   queries that process, which is the caller.
 //!
-//! The Switch 2 attribute `GpuAccessible` (`svc 0x80`, and bit 5 of what `QueryMemory`
-//! reports) is not built; it lands with that call.
+//! # Where the two Switch 2 references differ on `SetGpuMemoryAttribute`
+//!
+//! PR #4588 is followed, and Eden-NX2 differs in two places, each pinned by a test:
+//!
+//! - **A process not built for Switch 2.** PR returns `ResultNotImplemented` before any other
+//!   check (`R_UNLESS(process.UsesPAuthReturns(), ResultNotImplemented)`); Eden-NX2 runs the
+//!   call for any process. Test:
+//!   `set_gpu_memory_attribute_is_not_implemented_for_a_switch_1_process`.
+//! - **A range that wraps and a combination that is wrong, at once.** PR checks the wrap
+//!   (`ResultInvalidCurrentMemory`) before the combination (`ResultInvalidCombination`), as
+//!   `SetMemoryAttribute` does; Eden-NX2 checks the combination first and the wrap together
+//!   with `Contains`. Test: `set_gpu_memory_attribute_checks_the_wrap_before_the_combination`.
+//!
+//! `QueryMemory` reports the attribute as bit 5 of the block's attributes, as it reports the
+//! others (`KMemoryInfo::GetSvcMemoryInfo` copies them).
 
 use starquake_memory::{GuestMemory, PAGE_SIZE};
 
@@ -166,6 +192,42 @@ pub fn set_memory_attribute(
         return Err(KernelError::InvalidCurrentMemory.into());
     }
     // Both fit eight bits: they lie inside the supported mask.
+    let narrow = |bits: u32| {
+        u8::try_from(bits)
+            .map(MemoryAttribute::from_bits)
+            .map_err(|_| KernelError::InvalidCombination)
+    };
+    space.set_memory_attribute(address, size, narrow(mask)?, narrow(attribute)?)
+}
+
+/// Replaces the GPU-accessible attribute in `mask` with `attribute` on `size` bytes of the
+/// calling process's memory at `address` (`SetGpuMemoryAttribute`, Switch 2's `svc 0x80`): what
+/// the SDK does to memory before it registers it with the GPU, and undoes when it destroys it.
+/// `switch_2` says whether the calling process was built for Switch 2. Both bit sets are the raw
+/// values the guest passed. See the module docs for the checks and their order.
+pub fn set_gpu_memory_attribute(
+    space: &mut AddressSpace,
+    switch_2: bool,
+    address: u64,
+    size: u64,
+    mask: u32,
+    attribute: u32,
+) -> CallResult<()> {
+    if !switch_2 {
+        return Err(KernelError::NotImplemented.into());
+    }
+    // Validate address / size.
+    check_range(address, size)?;
+    // Validate the attribute and mask: only the GPU-accessible bit.
+    let supported = MemoryAttribute::GPU_ACCESSIBLE.svc();
+    if attribute & !mask != 0 || (mask | attribute) & !supported != 0 {
+        return Err(KernelError::InvalidCombination.into());
+    }
+    // Validate that the region is in range for the current process.
+    if !space.regions().contains(address, size) {
+        return Err(KernelError::InvalidCurrentMemory.into());
+    }
+    // Both fit eight bits: they lie inside the supported bit.
     let narrow = |bits: u32| {
         u8::try_from(bits)
             .map(MemoryAttribute::from_bits)

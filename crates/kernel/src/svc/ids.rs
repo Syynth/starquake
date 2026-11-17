@@ -222,7 +222,7 @@ svc_ids! {
     CreateResourceLimit = 0x7d, Deferred;
     SetResourceLimitLimitValue = 0x7e, Deferred;
     CallSecureMonitor = 0x7f, NotPlanned;
-    SetGpuMemoryAttribute = 0x80, Planned;
+    SetGpuMemoryAttribute = 0x80, Implemented;
     MapInsecureMemory = 0x90, Deferred;
     UnmapInsecureMemory = 0x91, Deferred;
 }
@@ -339,6 +339,7 @@ mod tests {
                 | SvcId::GetThreadId
                 | SvcId::OutputDebugString
                 | SvcId::GetInfo
+                | SvcId::SetGpuMemoryAttribute
                 // Not a retail call, but the kernel spec builds events (kernel slice 4).
                 | SvcId::CreateEvent => Status::Implemented,
                 _ if hardware_facing(id.name()) => Status::NotPlanned,
@@ -358,11 +359,11 @@ mod tests {
                 assert!(is_retail(id), "{}", id.name());
             }
         }
-        // The edges of the retail range: the last retail call is planned, the first call past it
-        // is not, and the Switch 2 call is.
+        // The edges of the retail range: the last retail call is planned, and the first call
+        // past it is not. (The Switch 2 call, 0x80, is implemented.)
         assert_eq!(SvcId::SynchronizePreemptionState.status(), Status::Planned);
         assert_eq!(SvcId::GetResourceLimitPeakValue.status(), Status::Deferred);
-        assert_eq!(SvcId::SetGpuMemoryAttribute.status(), Status::Planned);
+        assert_eq!(SvcId::SetGpuMemoryAttribute.status(), Status::Implemented);
         for status in [
             Status::Implemented,
             Status::Planned,
