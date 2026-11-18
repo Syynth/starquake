@@ -961,7 +961,7 @@ fn a_host_event_is_recorded_with_one_reading_of_the_clock() {
         let events = world.events();
         let last = events.last().unwrap();
         assert_eq!(
-            (last.core, last.thread, last.kind.clone()),
+            (last.core, last.thread, last.kind),
             (HOST_CORE, HOST_THREAD, note(value))
         );
         assert_eq!(

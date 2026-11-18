@@ -48,9 +48,9 @@ fn rig_with(graphics: &Graphics) -> Rig {
     let env = Arc::new(LiveEnv::new(FixedClock::new(0, 1), 0));
     let services: Arc<dyn Env> = Arc::<LiveEnv>::clone(&env);
     let ready = Arc::new(ReadyServers::default());
-    let reads = reads_on(Arc::clone(&services), &ready);
+    let fsp_reads = reads_on(Arc::clone(&services), &ready);
     let guest_log: Arc<dyn lm::GuestLog> = Arc::new(NoGuestLog);
-    install_with_graphics(&dispatcher, services, reads, guest_log, graphics).unwrap();
+    install_with_graphics(&dispatcher, services, fsp_reads, guest_log, graphics).unwrap();
     let recorder = Recorder::new();
     let events = Arc::new(VecSink::new());
     recorder.add_sink(Arc::clone(&events));
@@ -325,6 +325,17 @@ fn session(rig: &Rig, mut turn: impl FnMut(usize)) -> Session {
     turn(0);
     assert_eq!(poll(rig, slot_event), ResultCode::SUCCESS);
 
+    let job_event = gpu_job(rig, root, || turn(1));
+    Session {
+        slot_event,
+        job_event,
+        syncpoint,
+    }
+}
+
+/// The session's second half: a gpu worker job (a sparse region's destroy) that completes only
+/// once the GPU says the ordered update is done and `turn` drains that; the job's event.
+fn gpu_job(rig: &Rig, root: Handle, turn: impl FnOnce()) -> Handle {
     // The gpu session (497, flags 4) and its worker: 12 (the last index's event), 21 and 22,
     // as `starquake_gsv::gpu`'s tests set it up; slot 0's event (12, index 0); a graphics device
     // (41: name, flags 0, label) and an address space (33).
@@ -401,14 +412,9 @@ fn session(rig: &Rig, mut turn: impl FnMut(usize)) -> Session {
     );
     assert_eq!(destroy.result, 0);
     assert_eq!(poll(rig, job_event), KernelError::TimedOut.code());
-    turn(1);
+    turn();
     assert_eq!(poll(rig, job_event), ResultCode::SUCCESS);
-
-    Session {
-        slot_event,
-        job_event,
-        syncpoint,
-    }
+    job_event
 }
 
 /// The gsv notes among `events`, in order, decoded.
@@ -806,12 +812,9 @@ fn the_kernel_host_records_on_its_core_and_keeps_the_environment_s_first_failure
         channel: starquake_gpu::interface::ChannelId(5),
     }
     .event(GSV_ROOT);
-    host.record(note.clone());
+    host.record(note);
     assert_eq!(host.finish(), Ok(()));
-    assert_eq!(
-        rig.all_events().last(),
-        Some(&(3, ThreadId(0x77), note.clone()))
-    );
+    assert_eq!(rig.all_events().last(), Some(&(3, ThreadId(0x77), note)));
 
     let failing = starquake_trace::ReplayEnv::new(Vec::new());
     let mut host = KernelHost::new(&rig.dispatcher, &failing, &rig.recorder, &rig.memory, TIMER);

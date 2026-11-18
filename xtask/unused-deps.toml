@@ -30,7 +30,6 @@
 [[allow]]
 package = "starquake-core"
 dependencies = [
-    "starquake-gpu",
     "starquake-render",
     "starquake-shader",
 ]
