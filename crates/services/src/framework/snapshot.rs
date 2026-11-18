@@ -73,8 +73,10 @@
 //!   against the server's own state ([`SnapshotError::FamilyWiring`]); then, for a family with a
 //!   [`Server::with_family_objects`] check, the server is being restored beside a kernel
 //!   ([`SnapshotError::NeedsKernel`] from [`Server::restore`]) and every kernel object id the
-//!   check reads is one that kernel holds, of the kind the family keeps
-//!   ([`SnapshotError::FamilyObject`]; [`Server::restore_beside`]).
+//!   check reads is one that kernel holds live, of the kind the family keeps, and, where the
+//!   family's check asks, made by the server (an event) or of the size and permission the
+//!   family maps it with (a shared memory) ([`SnapshotError::FamilyObject`];
+//!   [`Server::restore_beside`]).
 //!
 //! Not checked, because the snapshot holds nothing to check them against: the values inside a
 //! session's or a family's state (see "Format") beyond what the state's own deserialisation
@@ -179,9 +181,13 @@ pub enum SnapshotError {
     /// and [`Server::restore`] was called.
     #[error("the server keeps kernel objects, so it is restored only beside the kernel")]
     NeedsKernel,
-    /// The snapshot's family state names a kernel object that the kernel it is restored beside
-    /// does not hold, or holds as another kind ([`Server::with_family_objects`]).
-    #[error("the snapshot names a kernel object this kernel does not hold: {0}")]
+    /// The snapshot's family state names a kernel object that does not match the kernel it is
+    /// restored beside ([`Server::with_family_objects`]): the kernel holds nothing live under
+    /// the id, or holds an object of another kind, or (where the family's check asks) one
+    /// another maker made (another server's or the guest's event), or a shared memory of
+    /// another size or permission. The message is the family's: it names the slot and what
+    /// the slot was checked for.
+    #[error("the snapshot names a kernel object that does not match this kernel: {0}")]
     FamilyObject(&'static str),
 }
 
@@ -412,6 +418,11 @@ impl Server {
     /// family names: a family with a [`Server::with_family_objects`] check has each checked
     /// against it, after the family's wiring check and before its state loads. For a server
     /// with no such check this is [`Server::restore`], and `kernel` is not asked.
+    ///
+    /// With the kernel's `Dispatcher` as `kernel`, call this with the dispatcher's table lock
+    /// free: not from inside a `Dispatcher::with` or `Dispatcher::inspect_handlers` closure,
+    /// which hold it. The check takes that lock and it is not re-entrant
+    /// ([`RestoredKernel`]'s impl for the dispatcher).
     pub fn restore_beside(
         &mut self,
         bytes: &[u8],
@@ -639,7 +650,7 @@ mod tests {
         );
         assert_eq!(
             SnapshotError::FamilyObject("its event is not one").to_string(),
-            "the snapshot names a kernel object this kernel does not hold: its event is not one"
+            "the snapshot names a kernel object that does not match this kernel: its event is not one"
         );
     }
 }
