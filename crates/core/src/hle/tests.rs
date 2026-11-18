@@ -36,6 +36,7 @@ use super::*;
 
 mod data_file_system;
 mod data_storage;
+mod graphics;
 
 /// Where the process's memory is: four pages the guest may read and write.
 const BASE: u64 = 0x8000_0000;
@@ -347,9 +348,12 @@ fn every_service_has_its_name_and_no_other_number_has_one() {
     assert_eq!(service_name(LM), Some("lm"));
     assert_eq!(service_name(ECTX_AW), Some("ectx:aw"));
     assert_eq!(service_name(AOC_U), Some("aoc:u"));
+    assert_eq!(service_name(GSV_SYNCPT), Some("gsv:syncpt"));
+    assert_eq!(service_name(GSV_GPU), Some("gsv:gpu"));
+    assert_eq!(service_name(GSV_NVSRV), Some("nvsrv"));
     assert_eq!(service_name(ServiceId(0)), None);
     assert_eq!(service_name(ServiceId(9)), None);
-    assert_eq!(service_name(ServiceId(19)), None);
+    assert_eq!(service_name(ServiceId(22)), None);
 }
 
 #[test]

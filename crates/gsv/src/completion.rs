@@ -390,6 +390,14 @@ impl CompletionQueue {
         }
     }
 
+    /// Whether nothing is queued now. A push from another thread can change the answer at
+    /// once; the wiring asks it with gsv's shared lock held, after any drain in progress, to
+    /// tell whether the timer thread has anything left to act on.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.pending().order.is_empty()
+    }
+
     /// Takes everything queued, in the queue's order (module docs, "Coalescing"), leaving the
     /// queue empty. The timer thread's half of the queue ([`crate::shared::Shared::drain`] calls
     /// it).

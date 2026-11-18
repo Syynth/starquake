@@ -22,6 +22,7 @@
 //!     fire the kernel's timeouts that are due, then reschedule
 //!     every 10 ms: preempt (rotate each core's queue at its preemption priority)
 //!     deliver the deferred replies the run's services say are ready
+//!     the graphics server's turn: drain its completion queue, answer its shared page
 //!     end the run at its timeout
 //!     sleep until the next of those, or until a core or a service rings the timer
 //! ```
@@ -30,7 +31,8 @@
 //! [`CoreSignals`](starquake_kernel::sched::CoreSignals) (`machine/cores.rs`): it interrupts
 //! a core running guest code (the vCPU's interrupter) and wakes a parked one (a condition
 //! variable). Stopping the run interrupts and wakes every core. A run whose cores have all
-//! parked while nothing could ever end a wait ([`Dispatcher::is_stalled`]) ends as an emulator
+//! parked while nothing could ever end a wait (the graphics server idle,
+//! `crate::hle::Graphics::is_idle`, and then [`Dispatcher::is_stalled`]) ends as an emulator
 //! error ([`WAITING`]).
 //!
 //! It is generic over [`Vcpu`], so everything here runs on any host against scripted vCPUs; the
@@ -82,7 +84,8 @@
 //!   keeps its first events and the guest log its first lines, and both say when they stopped.
 //!   The observability spec's size cap per run, with its own flags, replaces the constants.
 //! - **Deferred replies.** A run's services are installed by a function the run is given
-//!   ([`Install`]; a real run's calls [`crate::hle::install_with_guest_log`]), which may keep a
+//!   ([`Install`]; a real run's calls [`crate::hle::install_with_graphics`] with the run's
+//!   graphics server, whose turns the timer thread runs), which may keep a
 //!   [`Ready`] to say when a server's deferred replies are ready; the timer thread then
 //!   delivers them ([`Dispatcher::deliver_replies`]), or, when a core has the server's handler
 //!   out, that core does when it puts the handler back. In a real run `fsp-srv`'s reads defer: they run on
@@ -157,7 +160,7 @@ use starquake_trace::{
 
 use crate::clock::Timebase;
 use crate::crash::{Backtrace, CrashReport, Exception};
-use crate::hle::{FspHost, HostFolder, Reads};
+use crate::hle::{FrontMode, FspHost, Graphics, HostFolder, Reads};
 use crate::image::{PAGE, Placement};
 use crate::report::{
     ExitReason, GUEST_LOG_BYTES, Mapping, RunOptions, RunReport, ThreadPc, empty_dump,
@@ -294,14 +297,18 @@ pub(crate) struct Given {
     pub(crate) halt: Arc<dyn Halt>,
     /// The run's guest log, for `lm`'s loggers ([`ServicesLog`]).
     pub(crate) guest_log: Arc<dyn lm::GuestLog>,
+    /// The run's graphics server, whose turns the timer thread runs ([`crate::hle::graphics`]):
+    /// a real run's services add its servers.
+    pub(crate) graphics: Arc<Graphics>,
 }
 
 /// Puts a run's services in front of its dispatcher, with what the run gives them ([`Given`]).
 /// A failure ends the run before the guest runs, with the message given.
 pub(crate) type Install = dyn Fn(&Dispatcher, Given) -> Result<(), String> + Sync;
 
-/// The services of a real run ([`crate::hle::install_with_guest_log`], given the run's guest log
-/// through [`Given::guest_log`]), with `fsp-srv`'s reads on its workers, which keep no record
+/// The services of a real run ([`crate::hle::install_with_graphics`], given the run's guest log
+/// through [`Given::guest_log`] and the run's graphics server, whose turns the timer thread runs,
+/// through [`Given::graphics`]), with `fsp-srv`'s reads on its workers, which keep no record
 /// (module docs, "The environment").
 fn real_services(dispatcher: &Dispatcher, given: Given) -> Result<(), String> {
     let workers =
@@ -311,8 +318,14 @@ fn real_services(dispatcher: &Dispatcher, given: Given) -> Result<(), String> {
         ready: Arc::new(given.ready),
         halt: given.halt,
     };
-    crate::hle::install_with_guest_log(dispatcher, given.env, reads, given.guest_log)
-        .map_err(|error| error.to_string())
+    crate::hle::install_with_graphics(
+        dispatcher,
+        given.env,
+        reads,
+        given.guest_log,
+        &given.graphics,
+    )
+    .map_err(|error| error.to_string())
 }
 
 /// A real run's `fsp-srv` workers: one thread on each of `envs`, keeping no record (module docs,
@@ -601,6 +614,8 @@ struct Machine<'a, V: Vcpu, C> {
     /// The environments `fsp-srv`'s workers read through, one each
     /// ([`Session::reads_environments`]).
     reads: Vec<Arc<LiveEnv>>,
+    /// The graphics server, whose turns the timer thread runs (`machine/timer.rs`).
+    graphics: Arc<Graphics>,
     /// The program counter of each thread a core's vCPU held when the core stopped, with the
     /// core, by the thread's id as the guest knows it (`core_loop`'s `Core::leave`).
     held: Mutex<BTreeMap<u64, (u8, u64)>>,
@@ -955,6 +970,10 @@ impl<'a, V: Vcpu, C: HostClock + Clone> Machine<'a, V, C> {
                 bell: Arc::clone(&bell),
             },
             halted: Arc::new(Halted::new(Arc::clone(&bell))),
+            graphics: Arc::new(Graphics::new(
+                FrontMode::Live,
+                Some(Arc::<timer::Bell>::clone(&bell)),
+            )),
             bell,
             reads: session.reads_environments(),
             held: Mutex::new(BTreeMap::new()),
@@ -965,6 +984,7 @@ impl<'a, V: Vcpu, C: HostClock + Clone> Machine<'a, V, C> {
             ready: machine.ready.clone(),
             halt: Arc::<Halted>::clone(&machine.halted),
             guest_log: Arc::new(ServicesLog(Arc::clone(&machine.log))),
+            graphics: Arc::clone(&machine.graphics),
         };
         if let Err(error) = install(&machine.dispatcher, given) {
             let ending = Ending::Failed(format!("the services could not be set up: {error}"));

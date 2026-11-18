@@ -933,3 +933,53 @@ fn a_signal_made_while_delivering_a_deferred_reply_is_recorded_when_the_delivery
         .collect();
     assert_eq!(woken, [B, A]);
 }
+
+/// A host thread's event (a service's note, recorded by its timer thread) goes to the recorder
+/// on the core and thread the caller names, stamped with one reading of the environment's clock
+/// per call, each the next reading; a clock that fails records nothing.
+#[test]
+fn a_host_event_is_recorded_with_one_reading_of_the_clock() {
+    const HOST_CORE: u8 = 3;
+    const HOST_THREAD: ThreadId = ThreadId(0);
+    let world = World::new();
+    let note = |value| EventKind::ServiceNote {
+        service: ServiceId(0x51),
+        code: 0x52,
+        value,
+    };
+    for (n, value) in [(0, 0x53), (1, 0x54)] {
+        assert_eq!(
+            world.dispatcher.record_host_event(
+                HOST_CORE,
+                HOST_THREAD,
+                note(value),
+                &world.env,
+                &world.recorder
+            ),
+            Ok(())
+        );
+        let events = world.events();
+        let last = events.last().unwrap();
+        assert_eq!(
+            (last.core, last.thread, last.kind),
+            (HOST_CORE, HOST_THREAD, note(value))
+        );
+        assert_eq!(
+            last.time,
+            CounterRate::SWITCH_2.ticks_at(HostNanos(CLOCK_START_NS + n * CLOCK_STEP_NS))
+        );
+    }
+    let before = world.events().len();
+    let replay = ReplayEnv::new(Vec::new());
+    assert!(matches!(
+        world.dispatcher.record_host_event(
+            HOST_CORE,
+            HOST_THREAD,
+            note(0x55),
+            &replay,
+            &world.recorder
+        ),
+        Err(EnvError::Exhausted { .. })
+    ));
+    assert_eq!(world.events().len(), before);
+}

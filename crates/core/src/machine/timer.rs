@@ -36,18 +36,36 @@
 //! through it) is not dropped: the kernel keeps it owed, and the core delivers it when it puts
 //! the handler back, before its own call returns.
 //!
-//! Not here yet: vsync, and draining the graphics server's completion queue (both come with
-//! the graphics server).
+//! # The graphics server's turn
+//!
+//! Each turn, after the deliveries, runs the graphics server's turn
+//! (`crate::hle::Graphics::turn`): it drains the graphics server's completion queue and answers
+//! its shared syncpoint page, through a [`KernelHost`] over the run's dispatcher, on core [`CORE`]
+//! and no guest thread, with the time read from the environment's clock (the spec: "The turn's
+//! time is the timer thread's, from the `Env` clock"). The cores are then rescheduled, since the
+//! drain's signals may have woken threads. While the graphics server is idle
+//! (`crate::hle::Graphics::is_idle`: nothing queued, no request held by the page, no page signal
+//! waiting) the turn is skipped, the clock not read: the environment is read only when there is
+//! work, as for the kernel's timeouts and the deliveries, so an idle server adds no reading that
+//! falls among the cores' by host timing (`an_idle_graphics_turn_reads_nothing_and_a_busy_one_reads_the_clock`). The queue rings the timer thread's [`Bell`] when
+//! something is queued onto it ([`Wake`]), and the thread sleeps no later than the graphics
+//! server's deadline (`crate::hle::Graphics::deadline`). An environment that fails during the
+//! turn ends the run (`crate::hle::graphics`, "The timer thread's turn"), with the words
+//! [`GRAPHICS_ENV_FAILED`] and the failure's.
+//!
+//! Not here yet: vsync (the graphics server's slice 12).
 
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use starquake_cpu::Vcpu;
+use starquake_gsv::completion::Wake;
 use starquake_kernel::dispatch::{Caller, Dispatcher};
 use starquake_kernel::sched::PREEMPTION_INTERVAL_NS;
-use starquake_trace::{HostClock, HostNanos, ThreadId};
+use starquake_trace::{Env, HostClock, HostNanos, ThreadId};
 
 use super::{CORE, Ending, LogSink, Machine, lock};
+use crate::hle::graphics::KernelHost;
 
 /// What the timer thread sleeps on: rung when it should look again.
 #[derive(Default)]
@@ -82,6 +100,17 @@ impl Bell {
         *rung = false;
     }
 }
+
+impl Wake for Bell {
+    fn completion_queued(&self) {
+        self.ring();
+    }
+}
+
+/// How a run ends when the environment fails during the graphics server's turn (module docs),
+/// before the failure's own words.
+pub(super) const GRAPHICS_ENV_FAILED: &str =
+    "the environment failed during the graphics server's turn";
 
 /// The event stream's name for no guest thread: deliveries the timer thread makes are recorded
 /// for the senders they answer, never for this.
@@ -133,6 +162,7 @@ fn turns<V: Vcpu, C: HostClock + Clone>(machine: &Machine<'_, V, C>) -> Result<(
             next_preemption = HostNanos(now.0.saturating_add(PREEMPTION_INTERVAL_NS));
         }
         deliver(machine)?;
+        graphics(machine)?;
         let woken = machine.dispatcher.take_woken();
         if !woken.is_empty() {
             tracing::trace!(count = woken.len(), "guest threads woken");
@@ -141,6 +171,9 @@ fn turns<V: Vcpu, C: HostClock + Clone>(machine: &Machine<'_, V, C>) -> Result<(
         let now = clock.host_now();
         let mut sleep = until(now, next_preemption);
         if let Some(deadline) = next_deadline(&machine.dispatcher) {
+            sleep = sleep.min(until(now, deadline));
+        }
+        if let Some(deadline) = machine.graphics.deadline() {
             sleep = sleep.min(until(now, deadline));
         }
         if let Some(end) = end {
@@ -188,6 +221,36 @@ pub(super) fn deliver<V: Vcpu, C: HostClock + Clone>(
     for reads in &machine.reads {
         drop(reads.take_recording());
     }
+    machine
+        .dispatcher
+        .reschedule(&mut machine.signals())
+        .map_err(|error| Ending::Failed(format!("the scheduler failed: {error}")))?;
+    Ok(())
+}
+
+/// The graphics server's turn (module docs, "The graphics server's turn"), then a reschedule;
+/// nothing at all, the clock not read, while the graphics server is idle.
+pub(super) fn graphics<V: Vcpu, C: HostClock + Clone>(
+    machine: &Machine<'_, V, C>,
+) -> Result<(), Ending> {
+    if machine.graphics.is_idle() {
+        return Ok(());
+    }
+    let failed = |error| Ending::Failed(format!("{GRAPHICS_ENV_FAILED}: {error}"));
+    let env = &**machine.env;
+    let now = env.now().map_err(failed)?;
+    let mut host = KernelHost::new(
+        &machine.dispatcher,
+        env,
+        &machine.session.recorder,
+        machine.session.memory,
+        (CORE, NO_THREAD),
+    );
+    machine.graphics.turn(&mut host, now);
+    let turned = host.finish();
+    // PROVISIONAL: nothing keeps the environment's recording (`machine` module docs).
+    drop(machine.env.take_recording());
+    turned.map_err(failed)?;
     machine
         .dispatcher
         .reschedule(&mut machine.signals())

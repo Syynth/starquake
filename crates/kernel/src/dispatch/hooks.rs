@@ -10,17 +10,21 @@
 //! ([`Dispatcher::reattach_event_hook`]), and checks the other kernel objects its snapshot names
 //! against what the kernel holds: the events its server made
 //! ([`Dispatcher::is_service_event`]) and the transfer memories it was lent
-//! ([`Dispatcher::transfer_memory`]).
+//! ([`Dispatcher::transfer_memory`]). The copies in and out of a lent transfer memory
+//! ([`Dispatcher::read_transfer_memory`], [`Dispatcher::write_transfer_memory`]) live beside
+//! that lookup, so a request and a host turn outside any request check the same bounds.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
+use starquake_memory::GuestMemory;
 use starquake_trace::ServiceId;
 
 use super::Dispatcher;
 use crate::id::ObjectId;
 use crate::ipc::EventHook;
 use crate::memory::TransferMemory;
+use crate::memory::shared::span_within;
 use crate::object::{Object, Objects};
 use crate::result::{KernelError, SvcResult};
 use crate::tables::Scheduler;
@@ -140,6 +144,49 @@ impl Dispatcher {
             Ok(Object::TransferMemory(transfer)) if transfer.is_locked() => Ok(transfer),
             _ => Err(KernelError::InvalidHandle),
         }
+    }
+
+    /// Copies `out.len()` bytes at `offset` into the transfer memory `object` names into `out`,
+    /// through `memory`, the owner's guest memory: the one check a server's request
+    /// ([`IpcContext::read_transfer_memory`](super::IpcContext::read_transfer_memory)) and a
+    /// host turn outside any request make. [`KernelError::InvalidHandle`] as for
+    /// [`Dispatcher::transfer_memory`], and [`KernelError::InvalidCurrentMemory`] unless the
+    /// bytes lie wholly inside the transfer memory (`span_within`) and `memory` reads them;
+    /// nothing is copied then.
+    pub fn read_transfer_memory(
+        &self,
+        memory: &dyn GuestMemory,
+        object: ObjectId,
+        offset: u64,
+        out: &mut [u8],
+    ) -> SvcResult<()> {
+        let address = self.lent_range(object, offset, out.len())?;
+        memory
+            .read(address, out)
+            .map_err(|_| KernelError::InvalidCurrentMemory)
+    }
+
+    /// Copies `data` into the transfer memory `object` names, at `offset`, through `memory`.
+    /// The same rules as [`Dispatcher::read_transfer_memory`].
+    pub fn write_transfer_memory(
+        &self,
+        memory: &dyn GuestMemory,
+        object: ObjectId,
+        offset: u64,
+        data: &[u8],
+    ) -> SvcResult<()> {
+        let address = self.lent_range(object, offset, data.len())?;
+        memory
+            .write(address, data)
+            .map_err(|_| KernelError::InvalidCurrentMemory)
+    }
+
+    /// The owner's address of `len` bytes at `offset` into the transfer memory `object` names,
+    /// if they lie wholly inside it.
+    fn lent_range(&self, object: ObjectId, offset: u64, len: usize) -> SvcResult<u64> {
+        let transfer = self.transfer_memory(object)?;
+        span_within(transfer.address(), transfer.size(), offset, len)
+            .ok_or(KernelError::InvalidCurrentMemory)
     }
 
     /// Forgets every hook, as a dispatcher restored from a snapshot holds none (hooks are code,

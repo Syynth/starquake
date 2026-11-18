@@ -50,7 +50,12 @@ pub(super) fn run<V: Vcpu, C: HostClock + Clone>(
         match this.step(vcpu) {
             Ok(Stepped::Running) => {}
             Ok(Stepped::Parked) => {
-                let parked = machine.cores.park(core, || machine.dispatcher.is_stalled());
+                // The graphics server's turn can still end a wait the kernel thinks nothing can
+                // (`crate::hle::graphics`, "Telling a stalled run"); asked first, outside the
+                // kernel lock.
+                let parked = machine.cores.park(core, || {
+                    machine.graphics.is_idle() && machine.dispatcher.is_stalled()
+                });
                 match parked {
                     Parked::Woken | Parked::Stopped => {}
                     Parked::Stalled => machine.stop(Ending::Failed(WAITING.to_owned())),

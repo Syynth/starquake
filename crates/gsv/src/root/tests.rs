@@ -976,10 +976,12 @@ fn the_saved_root_layouts_are_pinned() {
                 native_memory_mode: Some(0x0B),
                 syncpoint_events: SyncpointEvents::One(object(0x0C, 0x0D)),
                 gpu_server: None,
+                syncpt_server: Some(ServiceId(0x0E)),
+                nvsrv_server: None,
             },
             // phase 0; no bootstrap; count 0; mode Some(0x0B); One(index, generation); no gpu
-            // server.
-            &[0, 0, 0, 1, 0x0B, 1, 0x0C, 0x0D, 0],
+            // server; Some(syncpt server); no nvsrv server.
+            &[0, 0, 0, 1, 0x0B, 1, 0x0C, 0x0D, 0, 1, 0x0E, 0],
         ),
         (
             RootState {
@@ -989,12 +991,14 @@ fn the_saved_root_layouts_are_pinned() {
                 native_memory_mode: None,
                 syncpoint_events: SyncpointEvents::Both(object(0x18, 0x19), object(0x1A, 0x1B)),
                 gpu_server: Some(ServiceId(0x1C)),
+                syncpt_server: None,
+                nvsrv_server: Some(ServiceId(0x1D)),
             },
             // phase 1; Some(user id, flags, four parameters); count; no mode; Both(a, b); Some(gpu
-            // server).
+            // server); no syncpt server; Some(nvsrv server).
             &[
                 1, 1, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0, 2, 0x18, 0x19, 0x1A, 0x1B, 1,
-                0x1C,
+                0x1C, 0, 1, 0x1D,
             ],
         ),
         (
@@ -1005,9 +1009,11 @@ fn the_saved_root_layouts_are_pinned() {
                 native_memory_mode: Some(0x22),
                 syncpoint_events: SyncpointEvents::None,
                 gpu_server: None,
+                syncpt_server: None,
+                nvsrv_server: None,
             },
-            // phase 2; no bootstrap; count; mode; no events; no gpu server.
-            &[2, 0, 0x21, 1, 0x22, 0, 0],
+            // phase 2; no bootstrap; count; mode; no events; no gpu, syncpt or nvsrv server.
+            &[2, 0, 0x21, 1, 0x22, 0, 0, 0, 0],
         ),
         (
             RootState {
@@ -1017,9 +1023,12 @@ fn the_saved_root_layouts_are_pinned() {
                 native_memory_mode: Some(0x38),
                 syncpoint_events: SyncpointEvents::One(object(0x39, 0x3A)),
                 gpu_server: Some(ServiceId(0x3B)),
+                syncpt_server: Some(ServiceId(0x3C)),
+                nvsrv_server: Some(ServiceId(0x3D)),
             },
             &[
-                3, 1, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 1, 0x38, 1, 0x39, 0x3A, 1, 0x3B,
+                3, 1, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 1, 0x38, 1, 0x39, 0x3A, 1, 0x3B, 1,
+                0x3C, 1, 0x3D,
             ],
         ),
     ];
@@ -1110,6 +1119,8 @@ fn saved(state: RootState) -> SavedRootState {
         native_memory_mode: state.native_memory_mode,
         syncpoint_events: state.syncpoint_events,
         gpu_server: state.gpu_server,
+        syncpt_server: state.syncpt_server,
+        nvsrv_server: state.nvsrv_server,
     }
 }
 
@@ -1265,4 +1276,215 @@ fn a_snapshot_with_another_gpu_server_is_refused() {
     assert_eq!(rig.state().gpu_server(), Some(GPU));
     let own = rig.server.save().unwrap();
     assert_eq!(rig.server.restore(&own), Ok(()));
+}
+
+// ----- 202, 1402 and their servers -------------------------------------------------------------
+
+/// The numbers the tests' syncpt and nvsrv servers are known by.
+const SYNCPT: ServiceId = ServiceId(0x0202);
+const NVSRV: ServiceId = ServiceId(0x1402);
+
+/// A root over `state`, with every family server it names known to the kernel.
+fn wired_with(state: RootState) -> Rig {
+    let mut kernel = FakeKernel::new(0).unwrap();
+    kernel.set_current_service(ROOT);
+    for service in [state.gpu_server, state.syncpt_server, state.nvsrv_server]
+        .into_iter()
+        .flatten()
+    {
+        kernel.add_service(service);
+    }
+    let session = kernel.new_object();
+    let mut server = root_server_for(state, UnknownPolicy::Strict).with_service_id(ROOT);
+    server.accept(session).unwrap();
+    Rig {
+        kernel,
+        server,
+        session,
+    }
+}
+
+/// 202 (PR `GetSyncpointSession`: `packet[0] == 0xda && packet[1] == 0`) and 1402 (PR
+/// `GetNvidiaDriver`: `packet[0] != 0x58a || packet[1] != 0`), as the header words PR compares.
+const GET_SYNCPOINT_SESSION_WORDS: [u32; 2] = [0xDA, 0];
+const GET_NVIDIA_DRIVER_WORDS: [u32; 2] = [0x58A, 0];
+
+#[test]
+fn the_family_session_header_words_are_the_command_ids() {
+    assert_eq!(
+        GET_SYNCPOINT_SESSION_WORDS[0],
+        tipc_type(GET_SYNCPOINT_SESSION)
+    );
+    assert_eq!(GET_NVIDIA_DRIVER_WORDS[0], tipc_type(GET_NVIDIA_DRIVER));
+    assert_eq!((GET_SYNCPOINT_SESSION, GET_NVIDIA_DRIVER), (202, 1402));
+}
+
+/// The server one of 202 and 1402 connected to, or `None` when it answered with the stub's
+/// placeholder (a new session on the root's own server).
+fn opened(rig: &mut Rig, words: &[u32]) -> Option<ServiceId> {
+    let sessions = rig.server.session_count();
+    let reply = rig.send(words);
+    assert_eq!(copied(&reply).len(), 1, "{words:x?}");
+    let connections = rig.kernel.take_connections();
+    match connections.as_slice() {
+        [] => {
+            assert_eq!(rig.server.session_count(), sessions + 1);
+            None
+        }
+        [(service, _)] => {
+            assert_eq!(rig.server.session_count(), sessions);
+            Some(*service)
+        }
+        more => unreachable!("one request made {} connections", more.len()),
+    }
+}
+
+/// 202 and 1402 each copy a session on their own server once the root names it, before the
+/// bootstrap and after it, and the stub's placeholder while it does not: each server is wired
+/// alone too, so a root that sent one command to another's server would fail.
+#[test]
+fn each_family_command_hands_out_a_session_on_its_own_server() {
+    let cases = [
+        (RootState::new(), None, None),
+        (
+            RootState::new().with_syncpt_server(SYNCPT),
+            Some(SYNCPT),
+            None,
+        ),
+        (RootState::new().with_nvsrv_server(NVSRV), None, Some(NVSRV)),
+        (RootState::new().with_gpu_server(GPU), None, None),
+        (
+            RootState::new()
+                .with_gpu_server(GPU)
+                .with_syncpt_server(SYNCPT)
+                .with_nvsrv_server(NVSRV),
+            Some(SYNCPT),
+            Some(NVSRV),
+        ),
+    ];
+    for (state, syncpt, nvsrv) in cases {
+        let mut rig = wired_with(state);
+        assert_eq!(
+            opened(&mut rig, &GET_SYNCPOINT_SESSION_WORDS),
+            syncpt,
+            "{state:?}"
+        );
+        assert_eq!(
+            opened(&mut rig, &GET_NVIDIA_DRIVER_WORDS),
+            nvsrv,
+            "{state:?}"
+        );
+        rig.initialize(&local());
+        rig.bind_process();
+        rig.complete_bootstrap();
+        assert_eq!(rig.state().phase(), Phase::Ready);
+        assert_eq!(
+            opened(&mut rig, &GET_SYNCPOINT_SESSION_WORDS),
+            syncpt,
+            "{state:?}"
+        );
+        assert_eq!(
+            opened(&mut rig, &GET_NVIDIA_DRIVER_WORDS),
+            nvsrv,
+            "{state:?}"
+        );
+        assert_eq!(rig.state().syncpt_server(), syncpt);
+        assert_eq!(rig.state().nvsrv_server(), nvsrv);
+    }
+}
+
+/// A wired 202 or 1402 replies a success word and one copied handle, nothing more.
+#[test]
+fn a_family_session_reply_is_one_copied_handle_and_success() {
+    let state = RootState::new()
+        .with_syncpt_server(SYNCPT)
+        .with_nvsrv_server(NVSRV);
+    for (words, command) in [
+        (GET_SYNCPOINT_SESSION_WORDS, GET_SYNCPOINT_SESSION),
+        (GET_NVIDIA_DRIVER_WORDS, GET_NVIDIA_DRIVER),
+    ] {
+        let mut rig = wired_with(state);
+        let reply = rig.send(&words);
+        let handle = copied(&reply)[0];
+        // A special header with one data word (the result) and one copied handle.
+        let expected = le(&[tipc_type(command), SPECIAL | 1, ONE_COPY, handle, 0]);
+        assert_eq!(&reply[..expected.len()], &expected[..], "{command}");
+    }
+}
+
+/// A 202 or 1402 whose header is not the one PR compares (`0xda, 0`, `0x58a, 0`) because it
+/// counts data words is accepted, the data not read: PR answers `ResultInvalidState` (202) and
+/// `ResultInvalidCombination` (1402), NX2 success (module docs, "Where this differs from the
+/// references"). The data words differ from each other and from the reply's, so a handler that
+/// read or echoed them would show it.
+#[test]
+fn a_family_command_with_a_data_word_is_accepted() {
+    let state = RootState::new()
+        .with_syncpt_server(SYNCPT)
+        .with_nvsrv_server(NVSRV);
+    for (command, server) in [(GET_SYNCPOINT_SESSION, SYNCPT), (GET_NVIDIA_DRIVER, NVSRV)] {
+        for data in [&[0xDEAD_BEEF][..], &[0x1234_5678, 0x9ABC_DEF0][..]] {
+            let mut words = vec![tipc_type(command), u32::try_from(data.len()).unwrap()];
+            words.extend(data);
+            let mut rig = wired_with(state);
+            assert_eq!(opened(&mut rig, &words), Some(server), "{words:x?}");
+            let reply = rig.send(&words);
+            let handle = copied(&reply)[0];
+            let expected = le(&[tipc_type(command), SPECIAL | 1, ONE_COPY, handle, 0]);
+            assert_eq!(&reply[..expected.len()], &expected[..], "{words:x?}");
+            assert_eq!(rig.state(), state);
+        }
+    }
+}
+
+/// A snapshot whose gpu, syncpt or nvsrv server is not the run's is refused, and the server
+/// keeps its own. With the gpu server and the nvsrv server both different, the gpu server's
+/// refusal is reported; with the syncpt and nvsrv servers both different, the syncpt server's.
+#[test]
+fn a_snapshot_with_other_family_servers_is_refused_gpu_first() {
+    let run = RootState::new()
+        .with_gpu_server(GPU)
+        .with_syncpt_server(SYNCPT)
+        .with_nvsrv_server(NVSRV);
+    let other = ServiceId(0x0999);
+    let cases = [
+        (
+            RootState::new()
+                .with_gpu_server(other)
+                .with_syncpt_server(SYNCPT)
+                .with_nvsrv_server(other),
+            "its root names another gpu server",
+        ),
+        (
+            RootState::new()
+                .with_gpu_server(GPU)
+                .with_syncpt_server(other)
+                .with_nvsrv_server(other),
+            "its root names another syncpt server",
+        ),
+        (
+            RootState::new()
+                .with_gpu_server(GPU)
+                .with_syncpt_server(SYNCPT),
+            "its root names another nvsrv server",
+        ),
+        (
+            RootState::new()
+                .with_gpu_server(GPU)
+                .with_nvsrv_server(NVSRV),
+            "its root names another syncpt server",
+        ),
+    ];
+    for (saved, refusal) in cases {
+        let bytes = wired_with(saved).server.save().unwrap();
+        let mut rig = wired_with(run);
+        assert_eq!(
+            rig.server.restore(&bytes),
+            Err(SnapshotError::FamilyWiring(refusal)),
+            "{saved:?}"
+        );
+        assert_eq!(rig.state(), run);
+        let own = rig.server.save().unwrap();
+        assert_eq!(rig.server.restore(&own), Ok(()));
+    }
 }

@@ -67,7 +67,8 @@
 //! - **A session** is a new session on this server, a [`Placeholder`] that has no commands, so
 //!   every request to it is answered by the server's unknown-command policy, logged. NX2 began
 //!   the same way (`INx2NvsrvSession`, "a placeholder ... every command gets an empty success
-//!   and is logged"). The family's slice replaces it with a session on its own server.
+//!   and is logged"). The family's slice replaces it with a session on its own server: 202,
+//!   497 and 1402 do in a root wired to their servers (below, "The family sessions").
 //! - **An event** (only 204's two) is a kernel event, unsignalled. They are made the first time
 //!   204 is asked and kept ([`RootState::syncpoint_events`]), so a repeated 204 hands out the
 //!   same two and a failure between the two keeps the first. A root built with gsv's shared
@@ -94,6 +95,34 @@
 //! graphics server number is: a snapshot that names another one is refused
 //! (`a_snapshot_with_another_gpu_server_is_refused`).
 //!
+//! # The family sessions (202, 497, 1402)
+//!
+//! 202 and 1402 hand out sessions on the syncpt server ([`RootState::with_syncpt_server`],
+//! [`crate::syncpt`]) and the nvsrv server ([`RootState::with_nvsrv_server`], [`crate::nvsrv`])
+//! as 497 does on the gpu server: one session handle and no data (observed: rows 19 and 23; PR
+//! `GetSyncpointSession`, `GetNvidiaDriver`; NX2 `OpenSyncptSession`, `OpenNvsrvSession`, which
+//! put the handle at word 3 and the result at word 4).
+//!
+//! **conflict: the handle's kind.** PR moves the session (`rb.PushMoveObjects(ctx, client)` in
+//! both); NX2 copies it (`ReturnRawSession`: `rb.PushCopyObjects(ctx, *client)`). Neither
+//! answer contains the other, so by decision 8 the one a title ran on wins: NX2's, a copied
+//! session ([`Reply::copy_service`]), as for 497 and every root handle
+//! ([`crate::protocol::HANDLE_KIND`]). A trace of the reply's handle descriptor settles it.
+//!
+//! Neither reads a data word. PR checks the header and its state differently for the two: 202
+//! answers `ResultInvalidState` unless the header is `0xda, 0`, 201 has been sent
+//! (`m_syncpoint_context_initialized`) and so has 1402 (`m_nv_module`), all in one condition,
+//! so a bad header on 202 is `ResultInvalidState` too; 1402 answers `ResultInvalidCombination`
+//! for a header other than `0x58a, 0`, then `ResultInvalidState` before the bootstrap is
+//! complete (`m_phase != Phase::Ready`) or the image formats are set up
+//! (`m_image_formats_initialized`). NX2 checks none of it. Here none of it is checked, as the
+//! root keeps none of that state: any header that reaches the command is accepted, and a
+//! command before the bootstrap is complete is logged and accepted (decision 7). A root with no
+//! server for the family answers with the stub's placeholder. Each server's number is
+//! the run's wiring, checked on a snapshot as the gpu server's is, the gpu server's first, then
+//! the syncpt server's, then the nvsrv server's
+//! (`a_snapshot_with_other_family_servers_is_refused_gpu_first`).
+//!
 //! # Where this differs from the references
 //!
 //! Each row is pinned by the test named, in `root/tests.rs`:
@@ -108,6 +137,9 @@
 //! | 126, 115 and the stubs before the bootstrap is complete | `ResultInvalidState` for most | success | success, the phase logged (`every_root_command_s_reply_bytes`, sent before any bootstrap) |
 //! | A TIPC command the table does not list | `ResultNotImplemented` | auto-stubbed | the server's unknown-command policy (`a_command_the_table_does_not_list_goes_to_the_policy`) |
 //! | A second root session (a second 2000) | the same session as the first: one state | a new session with its own `m_objects` and `m_syncpt_events` | a new session that shares the first one's [`RootState`]: its phase, its out-of-order count and 204's two events (`two_root_sessions_share_the_phase_and_the_syncpoint_events`); with the shared page, the one page (`a_second_bind_is_refused_and_changes_nothing`, in `shared/page/tests.rs`) |
+//! | The handle 202 and 1402 hand out | moved | copied | **conflict**: copied, NX2's (`a_family_session_reply_is_one_copied_handle_and_success`) |
+//! | 202 before 201 and 1402, or 1402 before the bootstrap is complete and the image formats are set up | `ResultInvalidState` | success | success (`each_family_command_hands_out_a_session_on_its_own_server`) |
+//! | 202 or 1402 whose header is not PR's exact one (here: a data word) | `ResultInvalidState` (202), `ResultInvalidCombination` (1402) | success | success: the data is not read (`a_family_command_with_a_data_word_is_accepted`) |
 
 use std::sync::Arc;
 
@@ -240,6 +272,8 @@ pub struct RootState {
     native_memory_mode: Option<u64>,
     syncpoint_events: SyncpointEvents,
     gpu_server: Option<ServiceId>,
+    syncpt_server: Option<ServiceId>,
+    nvsrv_server: Option<ServiceId>,
 }
 
 /// The serialised form of [`RootState`], field for field, and what deserialising validates.
@@ -251,6 +285,8 @@ struct SavedRootState {
     native_memory_mode: Option<u64>,
     syncpoint_events: SyncpointEvents,
     gpu_server: Option<ServiceId>,
+    syncpt_server: Option<ServiceId>,
+    nvsrv_server: Option<ServiceId>,
 }
 
 /// Why a saved [`RootState`] could not be read back: it holds a combination of fields that no
@@ -297,6 +333,8 @@ impl TryFrom<SavedRootState> for RootState {
             native_memory_mode,
             syncpoint_events,
             gpu_server,
+            syncpt_server,
+            nvsrv_server,
         } = saved;
         match (phase, bootstrap.is_some()) {
             (Phase::Created, true) => return Err(RootStateError::CreatedWithBootstrap),
@@ -325,6 +363,8 @@ impl TryFrom<SavedRootState> for RootState {
             native_memory_mode,
             syncpoint_events,
             gpu_server,
+            syncpt_server,
+            nvsrv_server,
         })
     }
 }
@@ -346,6 +386,8 @@ impl RootState {
             native_memory_mode: None,
             syncpoint_events: SyncpointEvents::None,
             gpu_server: None,
+            syncpt_server: None,
+            nvsrv_server: None,
         }
     }
 
@@ -361,6 +403,34 @@ impl RootState {
     #[must_use]
     pub const fn gpu_server(&self) -> Option<ServiceId> {
         self.gpu_server
+    }
+
+    /// The root of a run whose syncpt server is known by `service` (module docs, "The family
+    /// sessions").
+    #[must_use]
+    pub const fn with_syncpt_server(mut self, service: ServiceId) -> Self {
+        self.syncpt_server = Some(service);
+        self
+    }
+
+    /// The number of the syncpt server 202 hands sessions on, if the run has one.
+    #[must_use]
+    pub const fn syncpt_server(&self) -> Option<ServiceId> {
+        self.syncpt_server
+    }
+
+    /// The root of a run whose nvsrv server is known by `service` (module docs, "The family
+    /// sessions").
+    #[must_use]
+    pub const fn with_nvsrv_server(mut self, service: ServiceId) -> Self {
+        self.nvsrv_server = Some(service);
+        self
+    }
+
+    /// The number of the nvsrv server 1402 hands sessions on, if the run has one.
+    #[must_use]
+    pub const fn nvsrv_server(&self) -> Option<ServiceId> {
+        self.nvsrv_server
     }
 
     /// Where the bootstrap is.
@@ -453,7 +523,7 @@ commands! {
         QUERY_MEMORY_MODE => query_memory_mode,
         CONFIGURE_NATIVE_MEMORY => configure_native_memory,
         INITIALIZE_SYNCPOINT_CONTEXT => stub,
-        GET_SYNCPOINT_SESSION => stub,
+        GET_SYNCPOINT_SESSION => get_syncpoint_session,
         BIND_SYNCPOINT_MEMORY => bind_syncpoint_memory,
         INITIALIZE_DISPLAY_CONTEXT => stub,
         FINALIZE_DISPLAY_CONTEXT => stub,
@@ -462,7 +532,7 @@ commands! {
         ACTIVATE_GPU_CONTEXT => stub,
         REGISTER_GPU_ADDRESS_SPACE => stub,
         OPEN_GPU_SESSION => open_gpu_session,
-        GET_NVIDIA_DRIVER => stub,
+        GET_NVIDIA_DRIVER => get_nvidia_driver,
         CREATE_NATIVE_MEMORY => stub,
         DESTROY_NATIVE_MEMORY => stub,
         BIND_NATIVE_MEMORY => stub,
@@ -610,16 +680,41 @@ impl GsvRoot {
             return Self::stub(this, cx, req, reply);
         };
         let flags = req.payload().read_u64()?;
-        let state = root_state(cx)?;
-        state.note_unready(OPEN_GPU_SESSION);
         if flags != GPU_SESSION_FLAGS {
             tracing::warn!(
                 flags,
                 "gsv: 497 with flags PR refuses; accepted (decision 7)"
             );
         }
-        reply.copy_service(gpu);
-        reply.ok()
+        hand_out(cx, reply, OPEN_GPU_SESSION, gpu)
+    }
+
+    /// `GetSyncpointSession` (202). in: nothing. out: copy handle, a session on the syncpt
+    /// server (module docs, "The family sessions"); the stub's placeholder in a run with none.
+    fn get_syncpoint_session(
+        this: &mut Self,
+        cx: &mut Context<'_>,
+        req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        match root_state(cx)?.syncpt_server {
+            Some(syncpt) => hand_out(cx, reply, GET_SYNCPOINT_SESSION, syncpt),
+            None => Self::stub(this, cx, req, reply),
+        }
+    }
+
+    /// `GetNvidiaDriver` (1402). in: nothing. out: copy handle, a session on the nvsrv server
+    /// (module docs, "The family sessions"); the stub's placeholder in a run with none.
+    fn get_nvidia_driver(
+        this: &mut Self,
+        cx: &mut Context<'_>,
+        req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        match root_state(cx)?.nvsrv_server {
+            Some(nvsrv) => hand_out(cx, reply, GET_NVIDIA_DRIVER, nvsrv),
+            None => Self::stub(this, cx, req, reply),
+        }
     }
 
     /// `BindSyncpointMemory` (204): binds the shared syncpoint page (module docs, "The shared
@@ -678,6 +773,14 @@ impl GsvRoot {
         }
         reply.ok()
     }
+}
+
+/// Answers `command` with a copied session on the server known by `service`, logging the
+/// command if the bootstrap is not complete (module docs, "The family sessions").
+fn hand_out(cx: &mut Context<'_>, reply: &mut Reply, command: u32, service: ServiceId) -> Outcome {
+    root_state(cx)?.note_unready(command);
+    reply.copy_service(service);
+    reply.ok()
 }
 
 /// The root's state, from the server's family.
@@ -763,8 +866,9 @@ fn root_server_over(family: RootFamily, policy: UnknownPolicy) -> Server {
 ///
 /// It implements [`Family`] by hand: a snapshot holds the [`RootState`] alone, as the
 /// [`RootState`]'s own `serde` form, and loading one keeps the handle. Loading refuses a
-/// snapshot whose gpu server number is not the run's ([`SnapshotError::FamilyWiring`]), before it
-/// changes anything (module docs, "The gpu session").
+/// snapshot whose gpu, syncpt or nvsrv server number is not the run's
+/// ([`SnapshotError::FamilyWiring`]), in that order, before it changes anything (module docs,
+/// "The family sessions").
 pub struct RootFamily {
     state: RootState,
     shared: Option<Arc<Shared>>,
@@ -790,14 +894,24 @@ impl Family for RootFamily {
         self.state.save_state()
     }
 
-    /// Reads a [`RootState`] and, if its gpu server number is the run's, takes it; the handle to
-    /// gsv's shared state stays.
+    /// Reads a [`RootState`] and, if its gpu, syncpt and nvsrv server numbers are the run's,
+    /// takes it; the handle to gsv's shared state stays.
     fn load_state(&mut self, bytes: &[u8]) -> Result<(), SnapshotError> {
         let mut saved = RootState::new();
         saved.load_state(bytes)?;
         if saved.gpu_server != self.state.gpu_server {
             return Err(SnapshotError::FamilyWiring(
                 "its root names another gpu server",
+            ));
+        }
+        if saved.syncpt_server != self.state.syncpt_server {
+            return Err(SnapshotError::FamilyWiring(
+                "its root names another syncpt server",
+            ));
+        }
+        if saved.nvsrv_server != self.state.nvsrv_server {
+            return Err(SnapshotError::FamilyWiring(
+                "its root names another nvsrv server",
             ));
         }
         self.state = saved;
