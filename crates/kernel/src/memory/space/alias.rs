@@ -52,6 +52,13 @@
 //! `a_reprotect_before_a_refused_alias_still_owes_its_flush` in
 //! `crates/core/src/space/tests/alias.rs`).
 //!
+//! # Snapshots
+//!
+//! The address space's snapshot saves the alias record ([`Aliases`]) run by run, checks each
+//! run against [`LOCKED_SOURCE_CHECK`] and [`ALIAS_DESTINATION_CHECK`] on restore, and maps
+//! each again with [`Mapper::map_alias`] after every other mapping (`snapshot` module docs,
+//! checks 8 and 10; `snapshot::alias`).
+//!
 //! # Divergences from Eden
 //!
 //! - **The page-table half checks its ranges itself.** Eden's two functions trust the system
@@ -114,6 +121,37 @@ pub(super) const LOCKED_SOURCE: MemoryPermission = MemoryPermission::from_bits(
     MemoryPermission::KERNEL_READ.bits() | MemoryPermission::NOT_MAPPED.bits(),
 );
 
+/// What `UnmapMemory` requires of the source, and so what a snapshot's restore requires of
+/// each alias's source (`snapshot::alias`): a state with [`flag::CAN_ALIAS`], the permission
+/// [`LOCKED_SOURCE`] exactly, and the attribute [`MemoryAttribute::LOCKED`] alone, every block
+/// alike (Eden's `CheckMemoryState` of `src_address` in `KPageTableBase::UnmapMemory`).
+pub(super) const LOCKED_SOURCE_CHECK: Check = Check {
+    state_mask: flag::CAN_ALIAS,
+    state: flag::CAN_ALIAS,
+    permission_mask: MemoryPermission::ALL,
+    permission: LOCKED_SOURCE,
+    attribute_mask: MemoryAttribute::ALL,
+    attribute: MemoryAttribute::LOCKED,
+    ignore: MemoryAttribute::COUNTED,
+};
+
+/// What `MapMemory` leaves at the destination, and so what a snapshot's restore requires of
+/// each alias's destination (`snapshot::alias`): [`MemoryState::Stack`], read-write, and no
+/// attribute but [`MemoryAttribute::DEVICE_SHARED`], which a device-share lock on the alias
+/// adds. Not `UnmapMemory`'s check of the destination, which refuses a device-shared one
+/// (`an_alias_a_device_holds_is_not_unmapped_until_the_device_lets_go`), and does not test the
+/// permission: nothing changes a `Stack` block's permission or other attributes (its state has
+/// neither [`flag::CAN_REPROTECT`] nor [`flag::CAN_CHANGE_ATTRIBUTE`]).
+pub(super) const ALIAS_DESTINATION_CHECK: Check = Check {
+    state_mask: STATE_ALL,
+    state: MemoryState::Stack.word(),
+    permission_mask: MemoryPermission::ALL,
+    permission: MemoryPermission::USER_READ_WRITE,
+    attribute_mask: MemoryAttribute::from_bits(!MemoryAttribute::DEVICE_SHARED.bits()),
+    attribute: MemoryAttribute::NONE,
+    ignore: MemoryAttribute::COUNTED,
+};
+
 /// One run of alias pages: the first source page it maps again, and its size in bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Run {
@@ -128,20 +166,17 @@ struct Run {
 pub(super) struct Aliases(BTreeMap<u64, Run>);
 
 impl Aliases {
-    /// The run with the lowest address, as `(address, size)`.
-    pub(super) fn first(&self) -> Option<(u64, u64)> {
+    /// Every run, in address order, as `(address, source, size)`: what a snapshot saves.
+    pub(super) fn iter(&self) -> impl Iterator<Item = (u64, u64, u64)> + '_ {
         self.0
-            .first_key_value()
-            .map(|(address, run)| (*address, run.size))
+            .iter()
+            .map(|(address, run)| (*address, run.source, run.size))
     }
 
     /// Every run, in address order, as `(address, source, size)`.
     #[cfg(test)]
     pub(super) fn runs(&self) -> Vec<(u64, u64, u64)> {
-        self.0
-            .iter()
-            .map(|(address, run)| (*address, run.source, run.size))
-            .collect()
+        self.iter().collect()
     }
 
     /// Records that the `size` bytes at `address` map the source pages from `source` on.
@@ -286,16 +321,7 @@ impl AddressSpace {
     pub fn unmap_memory(&mut self, dst: u64, src: u64, size: u64) -> CallResult<()> {
         let pages = self.alias_pages(dst, src, size)?;
         // Validate that the source address's state is valid.
-        let source_check = Check {
-            state_mask: flag::CAN_ALIAS,
-            state: flag::CAN_ALIAS,
-            permission_mask: MemoryPermission::ALL,
-            permission: LOCKED_SOURCE,
-            attribute_mask: MemoryAttribute::ALL,
-            attribute: MemoryAttribute::LOCKED,
-            ignore: MemoryAttribute::COUNTED,
-        };
-        let source = self.check_memory_state(src, size, &source_check)?;
+        let source = self.check_memory_state(src, size, &LOCKED_SOURCE_CHECK)?;
         // Validate that the dst address's state is valid.
         let alias_check = Check {
             state_mask: STATE_ALL,

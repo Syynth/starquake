@@ -8,7 +8,10 @@
 //! every memory block with every count it keeps (the counts behind the merge barriers too), the
 //! heap's size, the largest heap, the main thread's stack size, the bytes reserved from the
 //! pool, the mapped physical memory size (`m_mapped_physical_memory_size`), the shared memory
-//! mappings, and the device-share locks by exact range with how many are live on each.
+//! mappings, the device-share locks by exact range with how many are live on each, and the
+//! `MapMemory` aliases: each run of alias pages the address space records
+//! (`memory::space::alias`), as where it starts, the first source page it maps again, and its
+//! size.
 //!
 //! Not saved, because a restore derives it: the largest process memory (the heap region's size)
 //! and the pool's limit (the arrangement's application pool). Not saved because it is not the
@@ -26,7 +29,9 @@
 //! thread's stack size and the mapped physical memory size; the blocks (each address, pages,
 //! state word, permission, original permission, attributes, IPC lock count, device use count,
 //! IPC merge count, device left and right merge counts, merge barriers); the shared memory
-//! mappings (each address, size, object); the device-share locks (each address, size, count).
+//! mappings (each address, size, object); the device-share locks (each address, size, count);
+//! the aliases (each address, source, size; version 2 added them, and a version 1 snapshot is
+//! refused with the version error: `a_version_1_snapshot_is_refused_with_the_version_error`).
 //! The arrangement tag is starquake's own ([`ARRANGEMENT_TAGS`]); the state word is the
 //! reference's (`KMemoryState`, [`MemoryState::word`]), and the bit sets are the reference's
 //! bits ([`super::super::state`]). The golden-bytes tests `the_body_layout_is_pinned` and
@@ -76,20 +81,34 @@
 //!    `CanDeviceMap`). Then that each
 //!    block's device use count and its left and right merge counts are what the locks over,
 //!    starting at and ending at it add up to ([`SnapshotError::DeviceCounts`]).
-//! 8. Each shared memory mapping's object, from the caller: it exists, is the mapping's size,
+//! 8. Each `MapMemory` alias in turn ([`SnapshotError::Alias`], first failing check of the
+//!    first failing alias, in [`AliasFault`]'s order): its destination, source and size are
+//!    whole pages and both ranges inside the address space ([`AliasFault::Shape`]); it starts
+//!    at or after the end of the one before ([`AliasFault::Order`]); the stack region can hold
+//!    its destination ([`AliasFault::Region`], `CanContain` of `Stack`); its source and
+//!    destination share no page ([`AliasFault::Overlap`]); every block of its source passes
+//!    `UnmapMemory`'s check of a source, alike with the first (a state with `CanAlias`,
+//!    `KernelRead | NotMapped`, `Locked` alone: [`AliasFault::Source`]); every block of its
+//!    destination is what `MapMemory` leaves there (`Stack`, read-write, no attribute but
+//!    `DeviceShared`: [`AliasFault::Destination`]); and its source shares no page with an
+//!    earlier alias's ([`AliasFault::SourceTaken`]).
+//! 9. Each shared memory mapping's object, from the caller: it exists, is the mapping's size,
 //!    and its user permission is the permission of the mapping's block ([`SharedFault::Missing`],
 //!    [`SharedFault::Size`], [`SharedFault::Permission`]).
-//! 9. The translation: every block that is not free is mapped through the new [`Mapper`], in
-//!    address order, a `Shared` one with its shared memory's pages ([`Mapper::map_shared`]),
-//!    any other as fresh memory ([`Mapper::map`]), with the guest permission of its
-//!    permission. A refusal unmaps what was mapped, in address order, and is
-//!    [`SnapshotError::Translation`], which counts the bytes whose unmap was refused too. The
-//!    pool's count and the block map are built before it (their own errors,
-//!    [`SnapshotError::OverLimit`] and [`SnapshotError::BlockMap`], would be bugs in checks 3
-//!    and 4), so this is the last step that can fail: whatever a restore returns as an error,
-//!    nothing it mapped is left mapped, except the bytes `stuck` counts.
+//! 10. The translation: every block that is not free is mapped through the new [`Mapper`], in
+//!     address order, a `Shared` one with its shared memory's pages ([`Mapper::map_shared`]),
+//!     any other as fresh memory ([`Mapper::map`]), with the guest permission of its
+//!     permission, leaving out the pages an alias covers (one call for each part left). Then
+//!     each alias, in address order, as its source's pages, read-write
+//!     ([`Mapper::map_alias`]). A refusal unmaps what was mapped, the aliases first (each maps
+//!     pages of a source mapped before it), then the rest, each in address order, and is
+//!     [`SnapshotError::Translation`], which counts the bytes whose unmap was refused too. The
+//!     pool's count, the block map and the alias record are built before it (the first two's
+//!     own errors, [`SnapshotError::OverLimit`] and [`SnapshotError::BlockMap`], would be bugs
+//!     in checks 3 and 4), so this is the last step that can fail: whatever a restore returns
+//!     as an error, nothing it mapped is left mapped, except the bytes `stuck` counts.
 //!
-//! [`AddressSpace::save`] runs checks 2 to 7 on what it is about to write: a live address space
+//! [`AddressSpace::save`] runs checks 2 to 8 on what it is about to write: a live address space
 //! that fails one is a bug in the kernel, which it reports rather than writes.
 //!
 //! # Why each relation holds live
@@ -137,13 +156,42 @@
 //!   `UpdateDeviceDisableMergeStateForUnshareLeft` also caps the left count at the use count;
 //!   with exact-range unlocks the cap never bites, since a block's left count never passes the
 //!   locks over it.
+//! - **The aliases** (`KPageTableBase::MapMemory` and `UnmapMemory` in
+//!   `eden/src/core/hle/kernel/k_page_table_base.cpp` @ cf654052; `memory::space::alias`).
+//!   `MapMemory` checks both ranges are whole pages inside the address space and that the
+//!   stack region can hold the destination, takes a source whose blocks are alike, of a state
+//!   with `CanAlias`, read-write and with no attribute (`KMemoryAttribute::All` masked, so not
+//!   device shared either), and a free destination, and leaves the source `KernelRead |
+//!   NotMapped` and `Locked` and the destination `Stack`, read-write, with no attribute. Since
+//!   the source is not free and the destination is, they share no page; since a `Locked`
+//!   source is refused, no source page is aliased twice. After that, `UnmapMemory` changes
+//!   both ranges (cutting a run where it unmaps part of it). Of the other operations on a
+//!   source's blocks, [`AddressSpace::set_process_memory_permission`],
+//!   [`AddressSpace::set_memory_permission`],
+//!   [`AddressSpace::set_memory_attribute`], [`AddressSpace::set_heap_size`]'s shrink,
+//!   [`AddressSpace::lock_for_transfer_memory`] and the device-share lock test the attributes
+//!   with `Locked` in the mask and `None` expected, so they refuse it, and
+//!   [`AddressSpace::unmap_physical_memory`] takes only `Normal` memory with no attribute. The
+//!   exception is [`AddressSpace::unlock_for_transfer_memory`], which expects `Locked` and does
+//!   not test the permission, so it would take a source; the kernel calls it only on the
+//!   range a transfer memory locked, and that is never a source, since each of the transfer
+//!   memory lock and `MapMemory` refuses the other's `Locked` range. Of the operations on a
+//!   destination's blocks, `Stack` has neither `CanReprotect` nor `CanChangeAttribute`, and a
+//!   device-share lock is the one change, adding `DeviceShared`. Pinned by
+//!   `a_locked_source_cannot_be_device_share_locked_and_a_free_destination_neither`,
+//!   `map_memory_refuses_a_source_a_device_holds_on_any_of_its_pages` and
+//!   `a_transfer_memory_lend_and_an_alias_refuse_each_others_source_but_the_take_back_does_not`
+//!   (`memory/space/alias_tests.rs`).
 //!
 //! The generated test `a_space_built_by_random_operations_saves_and_restores_as_it_was` runs
 //! random sequences of heap size changes, physical memory maps and unmaps, device-share locks and
-//! unlocks, attribute and permission changes, and transfer memory lends and returns on a live
-//! address space, and saves and restores after each, so a relation those operations can break
-//! fails it. Shared memory, the stack, thread-local pages and generated code are in the fixed
-//! round trip `a_rich_space_saves_and_restores_as_it_was`.
+//! unlocks (of heap, physical memory and stack pages), attribute and permission changes,
+//! transfer memory lends and returns, and `MapMemory` and `UnmapMemory` (of whole runs and parts
+//! of them) on a live address space, and saves and restores after each, so a relation those
+//! operations can break fails it (`the_random_operations_reach_split_and_merged_aliases` shows
+//! they reach two runs in one block and a run cut by an unmap). Shared memory, the stack,
+//! thread-local pages and generated code are in the fixed round trip
+//! `a_rich_space_saves_and_restores_as_it_was`, with an alias a device holds.
 //!
 //! # Divergences and what is not checked
 //!
@@ -158,19 +206,18 @@
 //!   is saved, and other memory may have the `Stack` state), where the `Normal` and
 //!   `Locked` merge barriers sit, and which merge barrier bits a block has beyond the IPC and
 //!   device ones it checks (an unknown barrier bit restores as it is).
-//! - **`MapMemory` aliases are not saved, and an address space with one is not saved at all.**
-//!   The format has no place for which source page each alias page maps again (the
-//!   `MapMemory` record `memory::space::alias` keeps), and a restore maps every block as fresh
-//!   memory (check 9), which would give an alias pages of its own. So [`AddressSpace::save`]
-//!   refuses an address space with a live alias ([`SnapshotError::Aliased`]) rather than write
-//!   one that restores wrong. A restored address space has no alias, and so no snapshot restores
-//!   an aliased pair. The shapes an alias leaves in the blocks are not checked: a snapshot whose
-//!   blocks look like one (`Normal` memory that is `Locked` with no user access, and `Stack`
-//!   memory beside it) restores as those blocks with no alias between them, and `UnmapMemory`
-//!   of them is refused with `InvalidMemoryRegion`, as Eden's page group check refuses pages
-//!   that are not the source's. Saving aliases changes the format, and bumps
-//!   [`ADDRESS_SPACE_VERSION`]. Tests: `an_address_space_with_an_alias_is_not_saved` and
-//!   `a_restored_alias_shape_is_not_an_alias` (in `memory/space/alias_tests.rs`).
+//! - **Not checked here, for the aliases:** that every block shaped like an alias's source is
+//!   one. A transfer memory lent with no permission leaves its owner's memory the same way
+//!   (`Normal`, `KernelRead | NotMapped`, `Locked`), so such a block that no alias names
+//!   restores as it is, and `UnmapMemory` of it is refused with `InvalidMemoryRegion`, as
+//!   Eden's page group check refuses pages that are not the source's
+//!   (`a_restored_alias_shape_is_not_an_alias`, in `memory/space/alias_tests.rs`). Likewise
+//!   not checked: that an alias's source is not instead such a lend (the transfer memory
+//!   objects are the object table's); that every `Stack` block is an alias (the main thread's
+//!   stack is `Stack` too, and a block may hold an alias and plain stack pages both:
+//!   `a_block_holding_two_aliases_and_a_block_partly_aliased_restore`); and that two runs
+//!   that could be one (side by side in both ranges) were saved as one: the record matches
+//!   page by page either way.
 //! - **Not checked here: which permission and attributes each state may carry**, beyond the two
 //!   permission rules of check 4 and the attribute rules above (no unknown bit, no IPC lock,
 //!   `DeviceShared` exactly with a use count). So a restore accepts, for example, `Normal` or
@@ -203,6 +250,11 @@ use crate::memory::state::{
 };
 use crate::snapshot::{Format, FormatError, decode, encode};
 
+mod alias;
+
+pub use alias::AliasFault;
+use alias::SavedAlias;
+
 #[cfg(test)]
 mod tests;
 
@@ -210,7 +262,9 @@ mod tests;
 pub const ADDRESS_SPACE_MAGIC: [u8; 4] = *b"SQAS";
 
 /// Layout version written into every address space snapshot and required when reading one.
-pub const ADDRESS_SPACE_VERSION: u32 = 1;
+///
+/// Version 1 had no aliases; version 2 appends them to the body (module docs, "Format").
+pub const ADDRESS_SPACE_VERSION: u32 = 2;
 
 /// The address space snapshot's header.
 const FORMAT: Format = Format {
@@ -471,16 +525,13 @@ pub enum SnapshotError {
     /// The checked blocks did not make a block map: a bug in the checks.
     #[error("the address space snapshot's blocks do not make a block map: {0}")]
     BlockMap(BlockMapError),
-    /// The address space has a `MapMemory` alias, which a snapshot does not save yet (module
-    /// docs, "Divergences and what is not checked").
-    #[error(
-        "the address space has {size:#x} bytes at {address:#x} aliased by MapMemory, which a snapshot cannot save yet"
-    )]
-    Aliased {
-        /// Where the first alias starts.
-        address: u64,
-        /// Its size.
-        size: u64,
+    /// A `MapMemory` alias is wrong.
+    #[error("alias {index} of the address space snapshot {fault}")]
+    Alias {
+        /// Its position in the list.
+        index: usize,
+        /// What is wrong with it.
+        fault: AliasFault,
     },
 }
 
@@ -558,9 +609,10 @@ struct Body {
     blocks: Vec<SavedBlock>,
     shared: Vec<SavedShared>,
     locks: Vec<SavedLock>,
+    aliases: Vec<SavedAlias>,
 }
 
-/// What checks 2 to 7 found: what a restore builds from.
+/// What checks 2 to 8 found: what a restore builds from.
 struct Checked {
     memory: ProcessMemory,
     regions: Regions,
@@ -647,10 +699,11 @@ impl Body {
                     count,
                 })
                 .collect(),
+            aliases: alias::saved(&space.aliases),
         }
     }
 
-    /// Checks 2 to 7 of the module docs, in order.
+    /// Checks 2 to 8 of the module docs, in order.
     fn check(&self) -> Result<Checked, SnapshotError> {
         let (memory, regions) = self.check_layout()?;
         self.check_counts(&memory, &regions)?;
@@ -658,6 +711,7 @@ impl Body {
         self.check_ranges(&memory, &regions, &blocks)?;
         self.check_shared(&blocks)?;
         self.check_locks(&regions, &blocks)?;
+        alias::check(&self.aliases, &regions, &blocks)?;
         Ok(Checked {
             memory,
             regions,
@@ -1053,13 +1107,18 @@ fn overlap(block: &MemoryBlock, region: Region) -> u64 {
 /// empty (the layout refuses code of no bytes: `the_code_must_have_pages`). The blocks tile the
 /// address space in order, so the walk starts at the block holding the range's start.
 fn every_block(blocks: &[MemoryBlock], range: Region, test: impl Fn(MemoryState) -> bool) -> bool {
+    blocks_touching(blocks, range).all(|block| test(block.state()))
+}
+
+/// The blocks that `range` touches, in address order. The blocks tile the address space in
+/// order, so the walk starts at the block holding the range's start.
+fn blocks_touching(blocks: &[MemoryBlock], range: Region) -> impl Iterator<Item = &MemoryBlock> {
     let first = blocks.partition_point(|block| block.end().is_some_and(|end| end <= range.start));
     blocks
         .get(first..)
         .unwrap_or_default()
         .iter()
-        .take_while(|block| block.address() < range.end)
-        .all(|block| test(block.state()))
+        .take_while(move |block| block.address() < range.end)
 }
 
 /// How many bytes of `Normal` memory lie inside `region`.
@@ -1086,15 +1145,10 @@ fn block_ending_at(blocks: &[MemoryBlock], end: u64) -> Option<usize> {
 }
 
 impl AddressSpace {
-    /// The address space as a snapshot (module docs, "Format"), after checks 2 to 7 of the
-    /// module docs on what it is about to write: a failure is a bug in the kernel. Before them,
-    /// an address space with a live `MapMemory` alias is refused with
-    /// [`SnapshotError::Aliased`], naming the alias with the lowest address: the format has no
-    /// place for one yet (module docs, "Divergences and what is not checked").
+    /// The address space as a snapshot (module docs, "Format"), its `MapMemory` aliases with
+    /// it, after checks 2 to 8 of the module docs on what it is about to write: a failure is a
+    /// bug in the kernel.
     pub fn save(&self) -> Result<Vec<u8>, SnapshotError> {
-        if let Some((address, size)) = self.aliases.first() {
-            return Err(SnapshotError::Aliased { address, size });
-        }
         let body = Body::of(self);
         body.check()?;
         Ok(encode(FORMAT, &body)?)
@@ -1104,8 +1158,8 @@ impl AddressSpace {
     /// "Checks", for what is checked and in what order). `shared` gives the shared memory an
     /// object id names, for each shared memory mapping, from the restored object table.
     ///
-    /// `mapper` must be new: nothing mapped. On a refusal before check 9 it has been asked
-    /// nothing; on a refusal in check 9 it has been asked to unmap what it mapped.
+    /// `mapper` must be new: nothing mapped. On a refusal before check 10 it has been asked
+    /// nothing; on a refusal in check 10 it has been asked to unmap what it mapped.
     pub fn restore(
         bytes: &[u8],
         mapper: Box<dyn Mapper>,
@@ -1117,7 +1171,7 @@ impl AddressSpace {
             regions,
             blocks,
         } = body.check()?;
-        // Check 8: the shared memory each mapping names.
+        // Check 9: the shared memory each mapping names.
         let mut objects = BTreeMap::new();
         for (index, mapping) in body.shared.iter().enumerate() {
             let fault = |fault| SnapshotError::Shared { index, fault };
@@ -1150,9 +1204,9 @@ impl AddressSpace {
             blocks,
         )
         .map_err(SnapshotError::BlockMap)?;
-        // Check 9: the translation.
+        // Check 10: the translation.
         let mut mapper = mapper;
-        rebuild(mapper.as_mut(), blocks.blocks(), &objects)?;
+        rebuild(mapper.as_mut(), blocks.blocks(), &objects, &body.aliases)?;
         Ok(Self {
             created_from: memory,
             regions,
@@ -1180,54 +1234,95 @@ impl AddressSpace {
                 .map(|lock| ((lock.address, lock.size), lock.count))
                 .collect(),
             mapped_physical_memory_size: body.mapped_physical_memory_size,
-            aliases: super::alias::Aliases::default(),
+            aliases: alias::restored(&body.aliases),
             mapper,
         })
     }
 }
 
-/// Check 9: maps every block that is not free through `mapper`, in address order, a `Shared`
-/// one with the pages of the shared memory `objects` holds for its address. A refusal unmaps
-/// what was mapped, in address order.
+/// Check 10: maps every block that is not free through `mapper`, in address order, a `Shared`
+/// one with the pages of the shared memory `objects` holds for its address, any other as fresh
+/// memory without the pages `aliases` covers (one call for each part left, in address order);
+/// then each of `aliases`, in address order, as its source's pages ([`Mapper::map_alias`]),
+/// read-write (check 8 found every page of each destination read-write). A refusal unmaps
+/// what was mapped: the aliases first, since each maps pages of a source mapped before it,
+/// then the rest, each in address order.
 fn rebuild<'a>(
     mapper: &mut dyn Mapper,
     blocks: impl IntoIterator<Item = &'a MemoryBlock>,
     objects: &BTreeMap<u64, SharedMemory>,
+    aliases: &[SavedAlias],
 ) -> Result<(), SnapshotError> {
     let mut made: Vec<(u64, u64)> = Vec::new();
     for block in blocks {
-        if block.state() == MemoryState::Free {
+        let state = block.state();
+        if state == MemoryState::Free {
             continue;
         }
-        let (address, size) = (block.address(), block.size());
-        let result = match block.permission().guest() {
-            None => Err(MapperError(format!(
-                "permission {:#x} has no translation",
-                block.permission().bits()
-            ))),
-            Some(perms) if block.state() == MemoryState::Shared => match objects.get(&address) {
-                Some(memory) => mapper.map_shared(address, memory.backing(), perms),
-                None => Err(MapperError(
-                    "no shared memory was resolved for this mapping".into(),
-                )),
-            },
-            Some(perms) => mapper.map(address, size, perms),
+        let parts = if state == MemoryState::Shared {
+            vec![(block.address(), block.size())]
+        } else {
+            alias::uncovered(block, aliases)
         };
-        if let Err(error) = result {
-            let mut stuck = 0_u64;
-            for &(at, bytes) in &made {
-                if mapper.unmap(at, bytes).is_err() {
-                    stuck = stuck.saturating_add(bytes);
+        for (address, size) in parts {
+            let result = translation(block.permission()).and_then(|perms| {
+                if state != MemoryState::Shared {
+                    return mapper.map(address, size, perms);
                 }
+                match objects.get(&address) {
+                    Some(memory) => mapper.map_shared(address, memory.backing(), perms),
+                    None => Err(MapperError(
+                        "no shared memory was resolved for this mapping".into(),
+                    )),
+                }
+            });
+            if let Err(error) = result {
+                return Err(SnapshotError::Translation {
+                    address,
+                    size,
+                    error,
+                    stuck: undo(mapper, &[], &made),
+                });
             }
+            made.push((address, size));
+        }
+    }
+    let mut alias_maps: Vec<(u64, u64)> = Vec::new();
+    for alias in aliases {
+        let (address, size) = (alias.address, alias.size);
+        let result = translation(MemoryPermission::USER_READ_WRITE)
+            .and_then(|perms| mapper.map_alias(address, alias.source, size, perms));
+        if let Err(error) = result {
             return Err(SnapshotError::Translation {
                 address,
                 size,
                 error,
-                stuck,
+                stuck: undo(mapper, &alias_maps, &made),
             });
         }
-        made.push((address, size));
+        alias_maps.push((address, size));
     }
     Ok(())
+}
+
+/// The translation's permission for `permission`, or the refusal [`rebuild`] reports.
+fn translation(permission: MemoryPermission) -> Result<starquake_memory::Perms, MapperError> {
+    permission.guest().ok_or_else(|| {
+        MapperError(format!(
+            "permission {:#x} has no translation",
+            permission.bits()
+        ))
+    })
+}
+
+/// Unmaps what [`rebuild`] mapped before a refusal: `aliased`, then `made`, each in the order
+/// given (address order). Returns the bytes whose unmap was refused.
+fn undo(mapper: &mut dyn Mapper, aliased: &[(u64, u64)], made: &[(u64, u64)]) -> u64 {
+    let mut stuck = 0_u64;
+    for &(at, bytes) in aliased.iter().chain(made) {
+        if mapper.unmap(at, bytes).is_err() {
+            stuck = stuck.saturating_add(bytes);
+        }
+    }
+    stuck
 }
