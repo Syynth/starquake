@@ -10,6 +10,7 @@ use super::*;
 use crate::completion::testing::{Locks, process};
 use crate::native::layout::Preference;
 use crate::native::tests::laid_out;
+use crate::video::layout::{CODE_BGRA_NX2, WORD_CODE, WORD_EXTENT};
 
 /// A one-page image: 16 pixels, 64 rows in 64-row blocks (64 * 64 = 4096 bytes).
 fn image_a() -> Preference {
@@ -749,7 +750,7 @@ fn each_pool_check_refuses_on_its_own() {
     }
     // A preference 911 refuses, and a count over the limit.
     let mut bad = pool_at(9, 6, 1);
-    bad.preference[1] = 7;
+    bad.preference[WORD_CODE] = 7;
     assert_eq!(
         refusal(&with_pools(vec![bad])),
         SnapshotError::PoolLayout { index: 0 }.to_string()
@@ -826,8 +827,8 @@ fn each_mapping_check_refuses_on_its_own() {
         source: SavedSource::Process(false),
     });
     let mut preference = [0; PREFERENCE_WORDS];
-    preference[1] = 2;
-    preference[2] = 0xFFFF | (16_255 << 16);
+    preference[WORD_CODE] = CODE_BGRA_NX2;
+    preference[WORD_EXTENT] = 0xFFFF | (16_255 << 16);
     wide.next_image = 0;
     wide.pools = vec![SavedPool {
         first: 0x20,

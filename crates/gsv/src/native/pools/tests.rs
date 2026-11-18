@@ -401,6 +401,24 @@ fn an_offset_past_32_bits_is_refused() {
     );
 }
 
+/// 961's bound at its edge: `offset + image bytes <= u32::MAX`. Code 2 at 65536 x 8192 is 2^31
+/// bytes an image, back to back, so image 1 ends exactly at 2^32, one past `u32::MAX`, and is
+/// refused, while its offset (2^31) still fits 428; image 0 is taken.
+#[test]
+fn an_image_ending_at_two_to_the_32_is_refused() {
+    let preference = pool_preference(CODE_BGRA_NX2, 65_536, 8_192);
+    let image = u64::from(layout::layout(&preference, 2).unwrap().image_bytes);
+    assert_eq!(2 * image, u64::from(u32::MAX) + 1);
+    let (mut objects, memory) = tables(MEMORY, 2 * image);
+    let first = objects.create_pool(&preference, 2, memory).unwrap();
+    assert!(objects.video_descriptor(first).is_ok());
+    assert_eq!(
+        objects.video_descriptor(first + 1),
+        Err(code(KernelError::InvalidSize))
+    );
+    assert!(objects.gpu_descriptor(first + 1).is_ok());
+}
+
 #[test]
 fn the_gpu_descriptor_is_pr_s() {
     let (mut objects, memory) = tables(MEMORY, 2 * 0x65400);
