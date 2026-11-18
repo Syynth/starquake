@@ -764,8 +764,7 @@ impl Dispatcher {
 
         let finished = self.deliver_owed(server, caller.memory, process_id);
         // No sender is the delivering thread's own: every one is reported woken.
-        let (_, ended) =
-            self.settle_and_end(finished, None, caller.memory, caller.recorder, time);
+        let (_, ended) = self.settle_and_end(finished, None, caller.memory, caller.recorder, time);
         self.settle_notices();
         Ok(ended)
     }
@@ -1190,7 +1189,6 @@ impl Dispatcher {
             }
         }
     }
-
 }
 
 /// Settles one request that is over, under `locked`: writes its reply into its sender's

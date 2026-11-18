@@ -611,18 +611,12 @@ fn holds_the_reply(space: &WithTls<'_>, tls: u64) -> bool {
 fn a_handler_ending_the_process_during_the_timers_delivery_ends_the_run_after_the_reply() {
     let guest = Guest::new(&programs::hello().unwrap());
     let (space, main) = sending_once(&guest);
-    let outcome = stepped(
-        &guest,
-        &space,
-        vec![main],
-        &install_ending,
-        |_, machine| {
-            // Every round is a timer turn, which stops the run as the timer thread does.
-            if let Err(ending) = crate::machine::timer::deliver(machine) {
-                machine.stop(ending);
-            }
-        },
-    );
+    let outcome = stepped(&guest, &space, vec![main], &install_ending, |_, machine| {
+        // Every round is a timer turn, which stops the run as the timer thread does.
+        if let Err(ending) = crate::machine::timer::deliver(machine) {
+            machine.stop(ending);
+        }
+    });
     assert_exited(&outcome);
     assert!(holds_the_reply(&space, guest.tls));
     // The request is recorded, answered with success, and then the process's end, for the

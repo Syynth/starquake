@@ -1893,7 +1893,7 @@ fn settling_takes_the_lock(end: bool, waiting: &[ThreadId]) -> (u64, Vec<Ended>)
         world.send(*sender, handle, &request());
     }
     if end {
-        lock(&world.first.hooks).take_reply = Some(Box::new(|cx| cx.end_process()));
+        lock(&world.first.hooks).take_reply = Some(Box::new(ask_to_end));
     }
     lock(&world.first.ready).push_back((session, Ok(0xA0)));
     // The first half of a delivery (`deliver_replies`), by hand.
@@ -1905,14 +1905,24 @@ fn settling_takes_the_lock(end: bool, waiting: &[ThreadId]) -> (u64, Vec<Ended>)
         .tables
         .processes
         .process_id();
-    world.dispatcher.lock::<(&mut Scheduler,)>().state.owed.insert(server);
-    let finished = world.dispatcher.deliver_owed(server, &world.memory, process_id);
+    world
+        .dispatcher
+        .lock::<(&mut Scheduler,)>()
+        .state
+        .owed
+        .insert(server);
+    let finished = world
+        .dispatcher
+        .deliver_owed(server, &world.memory, process_id);
     assert_eq!(finished.len(), 1 + waiting.len());
     let before = world.dispatcher.lock_waits().lock.acquisitions;
-    let (mine, ended) =
-        world
-            .dispatcher
-            .settle_and_end(finished, None, &world.memory, &world.recorder, GuestTicks(0));
+    let (mine, ended) = world.dispatcher.settle_and_end(
+        finished,
+        None,
+        &world.memory,
+        &world.recorder,
+        GuestTicks(0),
+    );
     let taken = world.dispatcher.lock_waits().lock.acquisitions - before;
     assert_eq!(mine, None);
     assert_eq!(world.tls(A), [0xA0; BUFFER_SIZE]);
@@ -1925,7 +1935,10 @@ fn replies_and_the_end_they_ask_for_are_settled_under_one_hold_of_the_lock() {
     // reported under one more.
     for waiting in [&[][..], &[B][..], &[B, C][..]] {
         let count = u64::try_from(waiting.len()).unwrap();
-        assert_eq!(settling_takes_the_lock(false, waiting), (count + 2, Vec::new()));
+        assert_eq!(
+            settling_takes_the_lock(false, waiting),
+            (count + 2, Vec::new())
+        );
         // With an end asked, everything (every reply, the reports and the end) is one hold, so
         // no core can run a sender of the ending process between its reply and the end.
         let (taken, ended) = settling_takes_the_lock(true, waiting);
@@ -1945,7 +1958,7 @@ fn a_run_whose_process_a_delivery_ended_is_not_stalled() {
         .first
         .script(Box::new(|_, _, _| Ok(Handled::Deferred)));
     world.send(A, handle, &request());
-    lock(&world.first.hooks).take_reply = Some(Box::new(|cx| cx.end_process()));
+    lock(&world.first.hooks).take_reply = Some(Box::new(ask_to_end));
     lock(&world.first.ready).push_back((session, Ok(0xA0)));
     assert_eq!(world.deliver(&world.first).len(), 1);
     assert_eq!(holdings(&world, thread), (0, 1, 0, true));
@@ -2208,6 +2221,11 @@ fn clearing_an_event_the_server_did_not_make_is_an_invalid_handle_and_changes_no
     world.send(A, second, &request());
     assert_eq!(*lock(&cleared), [Ok(())]);
     assert!(!signalled(&world, theirs));
+}
+
+/// A `take_reply` hook that asks to end the sender's process as the reply is given.
+fn ask_to_end(cx: &mut IpcContext<'_>) {
+    cx.end_process();
 }
 
 /// Replies with every byte `fill`, records an IPC event, and asks to end the process.
@@ -2639,7 +2657,9 @@ fn ending_a_process_that_has_ended_already_fails_and_reports_nothing() {
     assert_eq!(record.outcome, Outcome::ProcessExited);
     drop(world.dispatcher.take_woken());
     let before = world.events().len();
-    let mut locked = world.dispatcher.lock::<(&mut HandleTable, &mut Scheduler)>();
+    let mut locked = world
+        .dispatcher
+        .lock::<(&mut HandleTable, &mut Scheduler)>();
     assert!(!terminate_asked(
         &mut locked,
         process,
@@ -2666,7 +2686,7 @@ fn a_delivery_does_not_report_an_end_asked_for_a_process_that_ended_meanwhile() 
     run_thread_for(&world, C);
     let (record, _) = world.call(C, SvcId::ExitProcess, 0, 0);
     assert_eq!(record.outcome, Outcome::ProcessExited);
-    assert_eq!(holdings(&world, thread).3, true);
+    assert!(holdings(&world, thread).3);
     let asked = Arc::new(Mutex::new(0));
     let counted = Arc::clone(&asked);
     lock(&world.first.hooks).take_reply = Some(Box::new(move |cx| {
