@@ -77,11 +77,11 @@
 //! - an event is signalled by `Dispatcher::signal_event`, which records the waits it ends;
 //! - a device-share lock is released by `Dispatcher::unlock_device_share`, which checks the
 //!   token;
-//! - the shared page's transfer memories are read and written through the run's guest memory,
-//!   at the transfer memory as the kernel holds it now (`Dispatcher::transfer_memory`), with the
-//!   bounds `IpcContext::read_transfer_memory` uses (`span_within`), so a turn sees the same
-//!   errors a request would: `InvalidHandle` for a transfer memory that is gone,
-//!   `InvalidCurrentMemory` for bytes outside it.
+//! - the shared page's transfer memories are read and written through the run's guest memory
+//!   by `Dispatcher::read_transfer_memory` and `Dispatcher::write_transfer_memory`, at the
+//!   transfer memory as the kernel holds it now: the same calls `IpcContext`'s copies make, so
+//!   a turn sees the same errors a request would: `InvalidHandle` for a transfer memory that is
+//!   gone, `InvalidCurrentMemory` for bytes outside it.
 //!
 //! An environment that fails while the turn records or signals (a replay that diverged) is kept,
 //! the first one only, and [`KernelHost::finish`] returns it: the run then stops, as for any
@@ -120,7 +120,7 @@
 //! syncpoint into one, which a single drain of the run did not do.
 //!
 //! What this replays exactly, and what it does not (the test
-//! `a_recorded_session_replays_to_the_same_state`, in `graphics/tests.rs`, pins the first):
+//! `a_recorded_session_replays_to_the_same_state`, in `hle/tests/graphics.rs`, pins the first):
 //!
 //! - **Replayed:** a session of requests whose GPU inputs are the notes above: the IPC events,
 //!   the notes in their order, the events the drain signals, and the state of gsv's shared
@@ -166,7 +166,6 @@ use starquake_gsv::syncpt;
 use starquake_kernel::dispatch::{DeviceShareError, Dispatcher, WakeError};
 use starquake_kernel::id::ObjectId;
 use starquake_kernel::memory::DeviceShareToken;
-use starquake_kernel::memory::shared::span_within;
 use starquake_kernel::result::{KernelError, SvcError, SvcResult};
 use starquake_memory::GuestMemory;
 use starquake_services::framework::{Notify, UnknownPolicy};
@@ -499,14 +498,6 @@ impl<'a> KernelHost<'a> {
         tracing::error!(%error, "the environment failed during the graphics server's turn");
         self.failed.get_or_insert(error);
     }
-
-    /// The owner's address of `len` bytes at `offset` into the transfer memory `memory` names,
-    /// as `IpcContext` finds it (module docs, "The timer thread's turn").
-    fn lent(&self, memory: ObjectId, offset: u64, len: usize) -> SvcResult<u64> {
-        let transfer = self.dispatcher.transfer_memory(memory)?;
-        span_within(transfer.address(), transfer.size(), offset, len)
-            .ok_or(KernelError::InvalidCurrentMemory)
-    }
 }
 
 impl TimerHost for KernelHost<'_> {
@@ -548,10 +539,8 @@ impl TimerHost for KernelHost<'_> {
         offset: u64,
         out: &mut [u8],
     ) -> SvcResult<()> {
-        let address = self.lent(memory, offset, out.len())?;
-        self.memory
-            .read(address, out)
-            .map_err(|_| KernelError::InvalidCurrentMemory)
+        self.dispatcher
+            .read_transfer_memory(self.memory, memory, offset, out)
     }
 
     fn write_transfer_memory(
@@ -560,9 +549,7 @@ impl TimerHost for KernelHost<'_> {
         offset: u64,
         data: &[u8],
     ) -> SvcResult<()> {
-        let address = self.lent(memory, offset, data.len())?;
-        self.memory
-            .write(address, data)
-            .map_err(|_| KernelError::InvalidCurrentMemory)
+        self.dispatcher
+            .write_transfer_memory(self.memory, memory, offset, data)
     }
 }

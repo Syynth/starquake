@@ -157,7 +157,6 @@ use crate::ipc::{
     Admission, Done, EventHook, Finish, Handled, IpcError, Notice, PortName, Request, Sender,
     SessionHandler,
 };
-use crate::memory::shared::span_within;
 use crate::memory::{
     AddressSpace, DeviceShareToken, SharedMemory, SharedPages, SvcPermission, TransferMemory,
     is_shared_memory_permission, shared_memory_size,
@@ -509,10 +508,8 @@ impl IpcContext<'_> {
         offset: u64,
         out: &mut [u8],
     ) -> SvcResult<()> {
-        let address = self.lent_range(object, offset, out.len())?;
-        self.memory
-            .read(address, out)
-            .map_err(|_| KernelError::InvalidCurrentMemory)
+        self.dispatcher
+            .read_transfer_memory(self.memory, object, offset, out)
     }
 
     /// Copies `data` into the transfer memory `object` names, at `offset`. The same rules as
@@ -523,18 +520,8 @@ impl IpcContext<'_> {
         offset: u64,
         data: &[u8],
     ) -> SvcResult<()> {
-        let address = self.lent_range(object, offset, data.len())?;
-        self.memory
-            .write(address, data)
-            .map_err(|_| KernelError::InvalidCurrentMemory)
-    }
-
-    /// The owner's address of `len` bytes at `offset` into the transfer memory `object` names,
-    /// if they lie wholly inside it.
-    fn lent_range(&self, object: ObjectId, offset: u64, len: usize) -> SvcResult<u64> {
-        let transfer = self.transfer_memory(object)?;
-        span_within(transfer.address(), transfer.size(), offset, len)
-            .ok_or(KernelError::InvalidCurrentMemory)
+        self.dispatcher
+            .write_transfer_memory(self.memory, object, offset, data)
     }
 
     /// Records an event for the request. It is recorded, stamped with the request's sender and
