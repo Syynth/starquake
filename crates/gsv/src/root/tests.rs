@@ -29,10 +29,10 @@ use crate::protocol::{HANDLE_KIND, Mark, ROOT_COMMANDS};
 
 mod restore;
 mod video;
-use restore::EveryEvent;
 use crate::testing::{
     SPECIAL, STALE, buffer_of, copied, halves, le, result_only, success, tipc_type,
 };
+use restore::EveryEvent;
 
 /// The number the tests' root server is known by.
 const ROOT: ServiceId = ServiceId(0x0657);

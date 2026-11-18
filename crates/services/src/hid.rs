@@ -50,6 +50,36 @@
 //! memory, and its `GetSharedMemoryHandle` answers [`ARUID_NOT_REGISTERED`]: Eden's answer for
 //! an id with no row (`AppletResource::GetSharedMemoryHandle`, `index >= AruidIndexMax`).
 //!
+//! # Restoring
+//!
+//! A snapshot is a file, so a restore believes nothing in the table. In this order, the first
+//! that fails refusing the snapshot and leaving the server as it was:
+//!
+//! 1. At most [`ARUID_INDEX_MAX`] rows (`a_restored_table_holds_at_most_the_rows_the_table_has_room_for`),
+//!    then no memory kept by two rows, which `CreateAppletResource` never leaves
+//!    (`a_restored_table_keeps_each_memory_once`): both refused as the table decodes, with
+//!    [`SnapshotError::Decode`]`(postcard::Error::SerdeDeCustom)` ([`AppletResourcesLayoutError`]
+//!    says which).
+//! 2. Beside the kernel the server is restored beside ([`Server::restore_beside`]), each row's
+//!    memory, in id order: it names a live shared memory, of [`shared_memory::SIZE`] bytes
+//!    rounded up to whole pages as the kernel makes it, that processes map read-only, as
+//!    `CreateAppletResource` makes one; the first that fails is refused with
+//!    [`SnapshotError::FamilyObject`] saying which of the three it failed, checked in that order
+//!    (`each_restored_memory_is_a_live_read_only_input_shared_memory`,
+//!    `the_first_refused_row_in_id_order_is_reported`). The server keeps kernel objects, so
+//!    [`Server::restore`], which has no kernel, refuses its snapshots with
+//!    [`SnapshotError::NeedsKernel`] (`a_hid_server_is_restored_only_beside_the_kernel`).
+//!
+//! Not checked here:
+//!
+//! - **Which server made a row's memory.** The kernel notes which server made an event, not a
+//!   shared memory. A forged snapshot can name a read-only shared memory of the same size that
+//!   another server made; the guest is then handed that memory as its input memory. No other
+//!   service makes a shared memory of this size today (`time:u`'s is one page).
+//! - **The applet resource user ids.** Live, any id the kernel reports for a caller gets a row,
+//!   and an ended process's row stays; the ids are not checked against the kernel's processes.
+//! - **What the memory holds.** Its bytes are guest memory, saved with the guest's.
+//!
 //! # Where this differs from Eden
 //!
 //! Each difference is pinned by the test named, in `hid/tests.rs`:
@@ -93,6 +123,11 @@
 //!   the server's life (`closing_a_resource_keeps_its_row_and_memory`).
 //!
 //! [`INVALID_CMIF_REQUEST`]: crate::framework::result::INVALID_CMIF_REQUEST
+//! [`SnapshotError::Decode`]: crate::framework::SnapshotError::Decode
+//! [`SnapshotError::FamilyObject`]: crate::framework::SnapshotError::FamilyObject
+//! [`SnapshotError::NeedsKernel`]: crate::framework::SnapshotError::NeedsKernel
+//! [`Server::restore_beside`]: crate::framework::Server::restore_beside
+//! [`Server::restore`]: crate::framework::Server::restore
 
 use std::collections::BTreeMap;
 

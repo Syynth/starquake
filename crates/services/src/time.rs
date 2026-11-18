@@ -158,6 +158,32 @@
 //! (`an_environment_failure_stops_the_run_and_keeps_nothing`, for each read, with a replay that
 //! runs out and one that disagrees). `time:u` sends no host I/O, so it has no host failure to
 //! answer with a result code.
+//!
+//! # Restoring
+//!
+//! A snapshot is a file, so a restore believes nothing in the clocks. Once set up, they keep one
+//! kernel object, their memory, and beside the kernel the server is restored beside
+//! ([`Server::restore_beside`](crate::framework::Server::restore_beside)) it must name a live
+//! shared memory, of [`shared_memory::SIZE`] bytes rounded up to whole pages as the kernel makes
+//! it, that processes map read-only, as the set-up makes it; the first of the three that fails
+//! refuses the snapshot with
+//! [`SnapshotError::FamilyObject`](crate::framework::SnapshotError::FamilyObject) saying which,
+//! checked in that order, and leaves the server as it was
+//! (`the_clocks_memory_restores_only_as_a_live_read_only_time_shared_memory`). The server can
+//! keep a kernel object, so [`Server::restore`](crate::framework::Server::restore), which has no
+//! kernel, refuses its snapshots with
+//! [`SnapshotError::NeedsKernel`](crate::framework::SnapshotError::NeedsKernel), clocks not set
+//! up included (`a_time_server_is_restored_only_beside_the_kernel`).
+//!
+//! Not checked here:
+//!
+//! - **Which server made the memory.** The kernel notes which server made an event, not a
+//!   shared memory. A forged snapshot can name a read-only one-page shared memory another server
+//!   made; the guest is then handed it as the time memory. No other service makes a shared
+//!   memory of this size today (`hid`'s is 64 pages).
+//! - **The settings, and whether the saved contents are what the memory holds.** Neither names
+//!   a kernel object or a service: the settings are the run's (a snapshot's are taken as they
+//!   are), and the memory's bytes are guest memory, saved with the guest's.
 
 use std::sync::Arc;
 

@@ -31,7 +31,9 @@ use super::*;
 use crate::framework::fake::FakeKernel;
 use crate::framework::halt::Halts;
 use crate::framework::result::UNKNOWN_COMMAND_ID;
-use crate::framework::{DEFERRED_REPLY_DROPPED, Handled, Kernel, Protocol, Session, Stop};
+use crate::framework::{
+    DEFERRED_REPLY_DROPPED, Handled, Kernel, Protocol, Session, SnapshotError, Stop,
+};
 
 /// `StaticService::GetEphemeralNetworkSystemClock`, which this port leaves out, so it has no
 /// shipping constant (`glue/time/static.cpp`: `{5, ..}`).
@@ -1013,4 +1015,107 @@ proptest! {
             Err(other) => prop_assert!(false, "{other:?}"),
         }
     }
+}
+
+// ----- restoring the clocks' memory -----------------------------------------------------------
+
+/// A `time:u` server snapshot whose clocks are `clocks`, made without the server's commands.
+fn saved_clocks(clocks: Clocks) -> Vec<u8> {
+    Server::new(NAME, UnknownPolicy::Strict)
+        .with_root(|| Box::new(IStaticService))
+        .with_interfaces(interfaces())
+        .with_family(clocks)
+        .save()
+        .unwrap()
+}
+
+impl Rig {
+    /// A `time:u` server over Eden's default settings on the rig's environment, with no clocks
+    /// set up.
+    fn fresh_server(&self) -> Server {
+        let env: Arc<dyn Env> = Arc::<LiveEnv>::clone(&self.env);
+        server(
+            TimeSettings::eden_default(),
+            UnknownPolicy::Strict,
+            env,
+            self.halts.shared(),
+        )
+    }
+}
+
+/// Once set up, the clocks' memory is restored only as a live shared memory of the time shared
+/// memory's size that processes map read-only, as the first `GetSharedMemoryNativeHandle` makes
+/// it (module docs, "Restoring"): each other id is refused with its exact error and leaves the
+/// server as it was, and the next restore of the server's own snapshot succeeds and hands out
+/// the same memory. With two faults in one memory, the size is reported before the permission.
+#[test]
+fn the_clocks_memory_restores_only_as_a_live_read_only_time_shared_memory() {
+    let mut rig = Rig::new();
+    rig.memory();
+    let live = rig.clocks();
+    let set_up = *live.set_up().unwrap();
+    let own = rig.server.save().unwrap();
+    let page = starquake_memory::PAGE_SIZE;
+    let event = rig.kernel.create_event().unwrap();
+    let nothing = rig.kernel.new_object();
+    let mut memory =
+        |size, permission| rig.kernel.create_shared_memory(size, permission).unwrap().0;
+    let larger = memory(SIZE + page, SvcPermission::Read);
+    let writable = memory(SIZE, SvcPermission::ReadWrite);
+    let both = memory(SIZE + page, SvcPermission::ReadWrite);
+    let not_shared = SnapshotError::FamilyObject("its clocks' memory is not a live shared memory");
+    let other_size =
+        SnapshotError::FamilyObject("its clocks' memory is not the size of the time shared memory");
+    let not_read_only = SnapshotError::FamilyObject("its clocks' memory is not mapped read-only");
+    let cases = [
+        (event, not_shared.clone()),
+        (nothing, not_shared),
+        (larger, other_size.clone()),
+        (writable, not_read_only),
+        (both, other_size),
+    ];
+    let fresh = Clocks::new(TimeSettings::eden_default());
+    for (memory, refused) in cases {
+        let forged = Clocks {
+            set_up: Some(SetUp { memory, ..set_up }),
+            ..live
+        };
+        let mut restored = rig.fresh_server();
+        assert_eq!(
+            restored.restore_beside(&saved_clocks(forged), &rig.kernel),
+            Err(refused.clone()),
+            "{memory:?}"
+        );
+        assert_eq!(restored.family::<Clocks>(), Some(&fresh));
+        assert_eq!(restored.restore_beside(&own, &rig.kernel), Ok(()));
+        assert_eq!(restored.family::<Clocks>(), Some(&live));
+    }
+    // Restored, the server hands out the saved memory.
+    let mut restored = rig.fresh_server();
+    restored.restore_beside(&own, &rig.kernel).unwrap();
+    rig.server = restored;
+    assert_eq!(rig.memory(), set_up.memory);
+}
+
+/// A `time:u` server keeps a kernel object once its clocks are set up, so `restore` refuses its
+/// snapshots whatever they hold, clocks not yet set up included, and leaves the server as it
+/// was; clocks not set up name no object and restore beside any kernel.
+#[test]
+fn a_time_server_is_restored_only_beside_the_kernel() {
+    let mut rig = Rig::new();
+    let not_set_up = rig.server.save().unwrap();
+    rig.memory();
+    let set_up = rig.server.save().unwrap();
+    let fresh = Clocks::new(TimeSettings::eden_default());
+    for bytes in [&not_set_up, &set_up] {
+        let mut restored = rig.fresh_server();
+        assert_eq!(restored.restore(bytes), Err(SnapshotError::NeedsKernel));
+        assert_eq!(restored.family::<Clocks>(), Some(&fresh));
+        assert_eq!(restored.restore_beside(bytes, &rig.kernel), Ok(()));
+    }
+    let empty = FakeKernel::new(0).unwrap();
+    assert_eq!(
+        rig.fresh_server().restore_beside(&not_set_up, &empty),
+        Ok(())
+    );
 }

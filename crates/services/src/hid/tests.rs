@@ -516,8 +516,11 @@ fn input_memory(kernel: &mut FakeKernel) -> ObjectId {
         .0
 }
 
+/// One row of a table: an applet resource user id and its memory.
+type Row = (u64, ObjectId);
+
 /// A `hid` server snapshot whose table holds `rows`, made without the server's own commands.
-fn saved_table(rows: &[(u64, ObjectId)]) -> Vec<u8> {
+fn saved_table(rows: &[Row]) -> Vec<u8> {
     let mut resources = AppletResources::default();
     resources.memories.extend(rows.iter().copied());
     Server::new(NAME, UnknownPolicy::Strict)
@@ -617,7 +620,7 @@ fn a_restored_table_keeps_each_memory_once() {
     let mut kernel = FakeKernel::new(0).unwrap();
     let [a, b, c] = [(); 3].map(|()| input_memory(&mut kernel));
     let refused = SnapshotError::Decode(postcard::Error::SerdeDeCustom);
-    let shared: [(&[(u64, ObjectId)], (u64, u64)); 3] = [
+    let shared: [(&[Row], (u64, u64)); 3] = [
         (&[(1, a), (2, a)], (1, 2)),
         (&[(1, a), (2, b), (3, a), (4, b)], (1, 3)),
         (&[(1, a), (2, b), (3, c), (4, b)], (2, 4)),

@@ -3469,3 +3469,234 @@ fn a_server_after_the_later_start_up_commands_saves_and_restores() {
     rig.object(controller, SET_RESTART_MESSAGE_ENABLED, &[0]);
     assert!(!rig.applet().resume_notification_enabled());
 }
+
+// ----- restoring the applet's events beside the kernel ---------------------------------------
+
+/// A hook that does nothing, for a hooked event's writable end.
+struct QuietHook;
+
+impl starquake_kernel::ipc::EventHook for QuietHook {
+    fn signalled(&self, _: ObjectId) {}
+}
+
+/// Another server's number, whose events are not `appletOE`'s.
+const OTHER_SERVER: ServiceId = ServiceId(0x0777);
+
+/// Each kept event's slot with the refusal a restore answers for an id in it that is not a live
+/// readable event this server made, in the order of the applet's fields.
+fn kept_event_refusals() -> [(SetKeptEvent, SnapshotError); 4] {
+    let [message, tick, gpu, unknown] = kept_event_slots().map(|(_, set)| set);
+    [
+        (
+            message,
+            SnapshotError::FamilyObject(
+                "its applet's message event is not a live readable event its server made",
+            ),
+        ),
+        (
+            tick,
+            SnapshotError::FamilyObject(
+                "its applet's suspended-tick event is not a live readable event its server made",
+            ),
+        ),
+        (
+            gpu,
+            SnapshotError::FamilyObject(
+                "its applet's GPU-error event is not a live readable event its server made",
+            ),
+        ),
+        (
+            unknown,
+            SnapshotError::FamilyObject(
+                "its applet's unknown event is not a live readable event its server made",
+            ),
+        ),
+    ]
+}
+
+impl Rig {
+    /// Has every command that makes one of the applet's four events run, so each slot keeps
+    /// one.
+    fn with_every_event(&mut self) {
+        let proxy = self.proxy();
+        let getter = self.open(proxy, GET_COMMON_STATE_GETTER);
+        let controller = self.open(proxy, GET_SELF_CONTROLLER);
+        let functions = self.open(proxy, GET_APPLICATION_FUNCTIONS);
+        let steps = [
+            (getter, GET_EVENT_HANDLE),
+            (controller, GET_ACCUMULATED_SUSPENDED_TICK_CHANGED_EVENT),
+            (functions, GET_GPU_ERROR_DETECTED_SYSTEM_EVENT),
+            (functions, GET_UNKNOWN_EVENT_210),
+        ];
+        for (object, command) in steps {
+            assert_eq!(
+                self.object(object, command, &[]).result,
+                ResultCode::SUCCESS
+            );
+        }
+        let applet = self.applet();
+        assert!(
+            [
+                applet.message_event(),
+                applet.suspended_tick_event(),
+                applet.gpu_error_detected_event(),
+                applet.unknown_event()
+            ]
+            .iter()
+            .all(Option::is_some)
+        );
+    }
+
+    /// Ids that are not a readable event this server made, each made on the rig's kernel (whose
+    /// current service is the server's), by what each is.
+    fn not_the_servers(&mut self) -> [(&'static str, ObjectId); 4] {
+        let nothing = self.kernel.new_object();
+        self.kernel.set_current_service(OTHER_SERVER);
+        let others = self.kernel.create_event().unwrap();
+        self.kernel.set_current_service(ServiceId(0));
+        let hooked = self
+            .kernel
+            .create_hooked_event(std::sync::Arc::new(QuietHook));
+        let page = starquake_memory::PAGE_SIZE;
+        let memory = self
+            .kernel
+            .create_shared_memory(page, starquake_kernel::memory::SvcPermission::Read);
+        [
+            ("an id that names nothing", nothing),
+            ("another server's event", others),
+            ("a writable end this server made", hooked.unwrap().0),
+            ("a shared memory", memory.unwrap().0),
+        ]
+    }
+}
+
+/// Each of the four events is restored only as a live readable event this server made (module
+/// docs, "The applet"): any other id in one slot, the other three the server's own, is refused
+/// with that slot's exact error, the server is left as it was, and the next restore of the
+/// server's own snapshot succeeds.
+#[test]
+fn each_kept_event_restores_only_as_a_live_readable_event_its_server_made() {
+    let mut rig = Rig::new();
+    rig.with_every_event();
+    let live = rig.applet();
+    let own = rig.server.save().unwrap();
+    let fresh = Applet::new(AppletSettings::eden_default());
+    for (what, bad) in rig.not_the_servers() {
+        for (set, refused) in kept_event_refusals() {
+            let mut forged = live.clone();
+            set(&mut forged, Some(bad));
+            let saved = oe_server_for(forged, UnknownPolicy::Strict).save().unwrap();
+            let mut restored = oe_server(AppletSettings::eden_default(), UnknownPolicy::Strict);
+            assert_eq!(
+                restored.restore_beside(&saved, &rig.kernel),
+                Err(refused.clone()),
+                "{what}: {refused}"
+            );
+            assert_eq!(restored.family::<Applet>(), Some(&fresh));
+            assert_eq!(restored.restore_beside(&own, &rig.kernel), Ok(()));
+            assert_eq!(restored.family::<Applet>(), Some(&live));
+        }
+    }
+}
+
+/// The slots are checked in the order of the applet's fields: with two slots wrong, the earlier
+/// one is reported, for every pair.
+#[test]
+fn the_earliest_wrong_event_slot_is_reported() {
+    let mut rig = Rig::new();
+    rig.with_every_event();
+    let live = rig.applet();
+    let [(_, nothing), (_, others), ..] = rig.not_the_servers();
+    let slots = kept_event_refusals();
+    for (index, (set_first, refused)) in slots.iter().enumerate() {
+        for (set_second, _) in slots.iter().skip(index + 1) {
+            let mut forged = live.clone();
+            set_first(&mut forged, Some(nothing));
+            set_second(&mut forged, Some(others));
+            let saved = oe_server_for(forged, UnknownPolicy::Strict).save().unwrap();
+            let mut restored = oe_server(AppletSettings::eden_default(), UnknownPolicy::Strict);
+            assert_eq!(
+                restored.restore_beside(&saved, &rig.kernel),
+                Err(refused.clone())
+            );
+        }
+    }
+}
+
+/// The events are checked under the number the server is known by: a server known by another
+/// number refuses the events this one made, and takes the events made while the kernel's
+/// current service was that number.
+#[test]
+fn the_events_are_checked_under_the_server_s_own_number() {
+    let mut rig = Rig::new();
+    rig.with_every_event();
+    let saved = rig.server.save().unwrap();
+    let elsewhere = || {
+        oe_server(AppletSettings::eden_default(), UnknownPolicy::Strict)
+            .with_service_id(OTHER_SERVER)
+    };
+    let [(_, message_refused), ..] = kept_event_refusals();
+    assert_eq!(
+        elsewhere().restore_beside(&saved, &rig.kernel),
+        Err(message_refused)
+    );
+
+    let mut other = Rig::new();
+    other.kernel.set_current_service(OTHER_SERVER);
+    other.with_every_event();
+    let saved = other.server.save().unwrap();
+    assert_eq!(elsewhere().restore_beside(&saved, &other.kernel), Ok(()));
+}
+
+/// The graphics server's number is checked before the events: a snapshot with both wrong is
+/// refused for the number, and the same snapshot with the server's own events for nothing.
+#[test]
+fn the_graphics_server_is_checked_before_the_events() {
+    let mut rig = Rig::with_graphics();
+    rig.with_every_event();
+    let live = rig.applet();
+    let [(_, nothing), ..] = rig.not_the_servers();
+    let mut forged = live.clone();
+    forged.message_event = Some(nothing);
+    forged.graphics_server = None;
+    let saved = oe_server_for(forged, UnknownPolicy::Strict).save().unwrap();
+    let mut restored = oe_server_with(Some(GRAPHICS));
+    assert_eq!(
+        restored.restore_beside(&saved, &rig.kernel),
+        Err(SnapshotError::FamilyWiring(
+            "its applet names another graphics server"
+        ))
+    );
+    let mut own_events = live;
+    own_events.graphics_server = None;
+    let saved = oe_server_for(own_events, UnknownPolicy::Strict)
+        .save()
+        .unwrap();
+    assert_eq!(
+        restored.restore_beside(&saved, &rig.kernel),
+        Err(SnapshotError::FamilyWiring(
+            "its applet names another graphics server"
+        ))
+    );
+    assert_eq!(
+        oe_server_with(None).restore_beside(&saved, &rig.kernel),
+        Ok(())
+    );
+}
+
+/// An `appletOE` server keeps kernel objects, so `restore` refuses its snapshots whatever they
+/// hold, an applet with no events included, and leaves the server as it was.
+#[test]
+fn an_appletoe_server_is_restored_only_beside_the_kernel() {
+    let mut rig = Rig::new();
+    rig.with_every_event();
+    let with_events = rig.server.save().unwrap();
+    let without = Rig::new().server.save().unwrap();
+    let fresh = Applet::new(AppletSettings::eden_default());
+    for bytes in [with_events, without] {
+        let mut restored = oe_server(AppletSettings::eden_default(), UnknownPolicy::Strict);
+        assert_eq!(restored.restore(&bytes), Err(SnapshotError::NeedsKernel));
+        assert_eq!(restored.family::<Applet>(), Some(&fresh));
+        assert_eq!(restored.restore_beside(&bytes, &rig.kernel), Ok(()));
+    }
+}

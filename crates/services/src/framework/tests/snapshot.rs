@@ -13,8 +13,8 @@ use starquake_kernel::result::ResultCode;
 use starquake_trace::{InterfaceName, ServiceId};
 
 use super::super::defer::{Framing, Pending, TokenId};
-use super::super::targets::Domain;
 use super::super::fake::FakeKernel;
+use super::super::targets::Domain;
 use super::super::{
     Admission, DEFAULT_WORKERS, Interfaces, Kernel, Reply, ReplyToken, RequestQueue,
     RestoredKernel, SNAPSHOT_MAGIC, SNAPSHOT_VERSION, Server, SnapshotError, UnknownPolicy,
@@ -617,7 +617,10 @@ fn a_family_s_objects_are_checked_beside_the_kernel() {
     assert_eq!(state(&server), Some(good.clone()));
 
     // Another server's event: refused, and the server keeps its state.
-    let bad = Keeps { a: 1, event: others };
+    let bad = Keeps {
+        a: 1,
+        event: others,
+    };
     let mut server = checked();
     assert_eq!(
         server.restore_beside(&saved(bad.clone()), &kernel),
@@ -643,7 +646,10 @@ fn a_family_s_objects_are_checked_beside_the_kernel() {
     );
 
     // Both faults at once: the wiring check is first.
-    let both = Keeps { a: 2, event: others };
+    let both = Keeps {
+        a: 2,
+        event: others,
+    };
     assert_eq!(
         checked().restore_beside(&saved(both), &kernel),
         Err(SnapshotError::FamilyWiring("another a"))
@@ -679,7 +685,9 @@ fn a_family_s_objects_are_checked_beside_the_kernel() {
         .with_family_objects(|_: &u8, _: &dyn RestoredKernel, _: ServiceId| Ok(()));
     assert_eq!(
         wrong.restore_beside(&saved(good), &kernel),
-        Err(SnapshotError::Decode(postcard::Error::DeserializeBadEncoding))
+        Err(SnapshotError::Decode(
+            postcard::Error::DeserializeBadEncoding
+        ))
     );
     assert_eq!(state(&wrong), Some(initial));
 }

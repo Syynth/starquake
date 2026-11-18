@@ -186,12 +186,29 @@
 //!   (`applet_manager.cpp`: `SetFocusState(FocusState::InFocus)`, "Applet was started by
 //!   frontend, so it is foreground"), and nothing in a run changes it.
 //!
-//! A restore checks the graphics server's number against the run (see "The graphics server"),
-//! reads every queued message through [`AppletMessage::from_raw`] (see "The messages"), and
-//! checks that the four event ids the applet keeps (message, suspended-tick, GPU-error and
-//! unknown) are distinct, as live operation always leaves them. It has no kernel to check the
-//! ids themselves against, so it believes them, and the commands check them when they use them:
+//! A restore reads every queued message through [`AppletMessage::from_raw`] (see "The
+//! messages"), checks that the four event ids the applet keeps (message, suspended-tick,
+//! GPU-error and unknown) are distinct, as live operation always leaves them, then checks the
+//! graphics server's number against the run (see "The graphics server"), and then, beside the
+//! kernel the server is restored beside ([`Server::restore_beside`]), the four ids themselves,
+//! in that order (`the_graphics_server_is_checked_before_the_events`):
 //!
+//! - **Each kept event is a live readable event this server made**, as the commands make them
+//!   ([`Context::create_event`] returns an event's readable end, and the kernel notes it as the
+//!   server's): checked in the order of the applet's fields (message, suspended-tick, GPU-error,
+//!   unknown) under the number the server is known by ([`Server::with_service_id`]), the first
+//!   that fails refused with [`SnapshotError::FamilyObject`] naming its slot, and the server
+//!   left as it was. An id that names nothing live, an object of another kind (a shared memory,
+//!   an event's writable end), or an event another server or the guest made is refused
+//!   (`each_kept_event_restores_only_as_a_live_readable_event_its_server_made`,
+//!   `the_earliest_wrong_event_slot_is_reported`,
+//!   `the_events_are_checked_under_the_server_s_own_number`; on the kernel,
+//!   `appletoe_restores_beside_the_kernel_it_ran_on` in `tests/am_on_the_kernel.rs`). The
+//!   server keeps kernel objects, so [`Server::restore`], which has no kernel, refuses its
+//!   snapshots with [`SnapshotError::NeedsKernel`]
+//!   (`an_appletoe_server_is_restored_only_beside_the_kernel`). Which server made an event is
+//!   the kernel's IPC table's note, which has no snapshot of its own yet, so today a snapshot
+//!   restores only beside the tables the server ran on (`framework::restored`).
 //! - **Two event slots holding one id** are refused with
 //!   [`SnapshotError::Decode`]`(postcard::Error::SerdeDeCustom)`, whichever two, and the server
 //!   is left as it was (`a_snapshot_that_keeps_one_event_in_two_slots_is_refused`). Slots with
@@ -200,9 +217,11 @@
 //!   `GetGpuErrorDetectedSystemEvent` clear the signalled message event while a message is
 //!   pending, and a guest waiting on it would never wake
 //!   (`a_snapshot_whose_unknown_event_is_the_message_event_is_refused`).
-//! - **The suspended-tick, GPU-error and unknown events** are checked each time
+//! - **The suspended-tick, GPU-error and unknown events** are checked again each time
 //!   `GetAccumulatedSuspendedTickChangedEvent`, `GetGpuErrorDetectedSystemEvent` or
-//!   `GetUnknownEvent210` returns a kept one, before its handle is copied: the kernel's
+//!   `GetUnknownEvent210` returns a kept one, before its handle is copied, on whatever kernel
+//!   the server runs on then (the tests restore beside the kernel that made the event and run
+//!   on one that did not): the kernel's
 //!   `clear_event` answers `InvalidHandle` for an id that is not an event this server made
 //!   (another kind of object, another server's or the guest's event, or nothing), and the
 //!   command answers that error, copies nothing and leaves the applet as it was
@@ -213,19 +232,23 @@
 //!   when the snapshot leaves that slot empty or names another id in it.** Such an id is an
 //!   event this server made, so the kernel's `clear_event` accepts it; if it is the message
 //!   event, the clear empties it while a message may be pending, as above. Telling it apart
-//!   needs the kernel's record of which event the server made for which slot, which a restore
-//!   here cannot read.
-//! - **Not checked here: the message event** when `GetEventHandle` copies it. The kernel calls
-//!   that check an event id (`clear_event`, `signal_event`) change its state, and the guest may
-//!   have cleared the event itself, so no call checks it without changing what the guest sees;
-//!   a restored message-event id that names another object is copied as it is. The lifecycle
-//!   commands that signal or clear it answer the kernel's error for an id that is not an event
+//!   needs the kernel's record of which event the server made for which slot, which the kernel
+//!   does not keep.
+//! - **Not checked again: the message event** when `GetEventHandle` copies it. The restore
+//!   checked it; the kernel calls that check an event id (`clear_event`, `signal_event`) change
+//!   its state, and the guest may have cleared the event itself, so no call checks it again
+//!   without changing what the guest sees. The lifecycle commands that signal or clear it answer
+//!   the kernel's error for an id that is not an event, which a server run on another kernel
+//!   than the one it was restored beside meets
 //!   (`a_failed_signal_still_keeps_the_lifecycle_change`,
 //!   `a_failed_clear_still_keeps_the_lifecycle_change`, and for `ReceiveMessage`
 //!   `a_failed_clear_leaves_the_message_to_be_received_again`).
 //! - **Not checked here: whether the message event's state agrees with the restored
 //!   messages.** The event's signalled state is the kernel's, saved with the kernel; a restore
-//!   here cannot read it.
+//!   here does not ask it ([`RestoredKernel`] has no question for it), and does not signal or
+//!   clear it: an event restored unsignalled while a message is pending stays unsignalled.
+//! - **Not checked here: the settings and the lifecycle's own fields** beyond what their
+//!   deserialisation refuses: they hold no kernel object or service id.
 //!
 //! # The message event
 //!
@@ -530,6 +553,12 @@
 //! [`Reply::copy_service`]: crate::framework::Reply::copy_service
 //! [`SnapshotError::FamilyWiring`]: crate::framework::SnapshotError::FamilyWiring
 //! [`SnapshotError::Decode`]: crate::framework::SnapshotError::Decode
+//! [`SnapshotError::FamilyObject`]: crate::framework::SnapshotError::FamilyObject
+//! [`SnapshotError::NeedsKernel`]: crate::framework::SnapshotError::NeedsKernel
+//! [`Server::restore_beside`]: crate::framework::Server::restore_beside
+//! [`Server::restore`]: crate::framework::Server::restore
+//! [`Server::with_service_id`]: crate::framework::Server::with_service_id
+//! [`Context::create_event`]: crate::framework::Context::create_event
 
 use serde::{Deserialize, Serialize};
 use starquake_kernel::id::ObjectId;

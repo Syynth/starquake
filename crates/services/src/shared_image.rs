@@ -66,7 +66,72 @@ pub(crate) fn put(image: &mut [u8], offset: u64, bytes: &[u8], memory: &str) {
 
 #[cfg(test)]
 mod tests {
+    use starquake_kernel::memory::SharedMemory;
+    use starquake_kernel::slab::SlabId;
+    use starquake_memory::{BackingRange, PAGE_SIZE};
+    use starquake_trace::ServiceId;
+
     use super::*;
+
+    /// A kernel that holds at most one shared memory, which every id names.
+    struct Holds(Option<SharedMemory>);
+
+    impl RestoredKernel for Holds {
+        fn is_service_readable_event(&self, _: ServiceId, _: ObjectId) -> bool {
+            false
+        }
+
+        fn shared_memory(&self, _: ObjectId) -> Option<SharedMemory> {
+            self.0
+        }
+    }
+
+    /// A kernel holding a shared memory of `pages` pages mapped with `permission`.
+    fn holding(pages: u64, permission: SvcPermission) -> Holds {
+        let backing = BackingRange::new(0x10_0000, pages * PAGE_SIZE).unwrap();
+        Holds(Some(SharedMemory::new(backing, permission).unwrap()))
+    }
+
+    const REFUSALS: Refusals = Refusals {
+        not_shared_memory: "not one",
+        size: "size",
+        permission: "permission",
+    };
+
+    /// Each check of [`check_restored`] at its edge on both sides, in its order: no memory,
+    /// then the size (rounded up to whole pages, as the kernel makes it; a page under, at and
+    /// over), then the permission (compared with the one asked, either one), with both faults
+    /// at once reported as the size.
+    #[test]
+    fn a_restored_memory_is_checked_for_kind_then_size_then_permission() {
+        let id = ObjectId::from_parts(3, 1);
+        let read = SvcPermission::Read;
+        let write = SvcPermission::ReadWrite;
+        let three_pages = 3 * PAGE_SIZE;
+        let cases = [
+            (Holds(None), three_pages, read, Err("not one")),
+            (holding(2, read), three_pages, read, Err("size")),
+            (holding(3, read), three_pages, read, Ok(())),
+            (holding(4, read), three_pages, read, Err("size")),
+            // A size that is not whole pages is the size the kernel rounds it to.
+            (holding(3, read), three_pages - 1, read, Ok(())),
+            (holding(3, read), 2 * PAGE_SIZE + 1, read, Ok(())),
+            (holding(3, read), 2 * PAGE_SIZE, read, Err("size")),
+            // No shared memory is made for zero bytes, so none has that size.
+            (holding(1, read), 0, read, Err("size")),
+            (holding(3, write), three_pages, read, Err("permission")),
+            (holding(3, write), three_pages, write, Ok(())),
+            (holding(3, read), three_pages, write, Err("permission")),
+            (holding(4, write), three_pages, read, Err("size")),
+        ];
+        for (kernel, size, permission, expected) in cases {
+            assert_eq!(
+                check_restored(&kernel, id, size, permission, &REFUSALS),
+                expected,
+                "{size:#x} {permission:?}"
+            );
+        }
+    }
 
     #[test]
     fn a_field_is_written_only_where_it_fits_whole() {
