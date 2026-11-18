@@ -19,6 +19,10 @@
 //! per name, known by [`PCTL`], [`PCTL_A`], [`PCTL_S`] and [`PCTL_R`]: each name's factory has a
 //! capability of its own (`starquake_services::pctl`, "Capabilities").
 //!
+//! `lm`, `ectx:aw` and `aoc:u` are one server each, known by [`LM`], [`ECTX_AW`] and [`AOC_U`].
+//! `lm`'s loggers write each finished message's text to the guest log [`install_with_guest_log`]
+//! is given (the run's, in a run); [`install`] gives them one that keeps nothing.
+//!
 //! The numbers ([`SM`], [`SET_SYS`], [`FSP_SRV`], [`APM`], [`APPLET_OE`], [`HID`], [`TIME_U`],
 //! [`GSV_ROOT`]) are starquake's own:
 //! Horizon names a service by its name only. They appear in the trace, as the `service` of an IPC
@@ -63,6 +67,7 @@ use starquake_services::pctl;
 use starquake_services::set::{self, FirmwareVersion, Settings};
 use starquake_services::sm::{self, NameError, Registry, RegistryError, ServiceName};
 use starquake_services::time::{self, TimeSettings};
+use starquake_services::{aoc, ectx, lm};
 use starquake_trace::{Env, ServiceId};
 
 mod fsp_host;
@@ -95,6 +100,12 @@ pub const PCTL_A: ServiceId = ServiceId(13);
 pub const PCTL_S: ServiceId = ServiceId(14);
 /// The number the kernel knows `pctl:r`'s server by.
 pub const PCTL_R: ServiceId = ServiceId(15);
+/// The number the kernel knows `lm`'s server by.
+pub const LM: ServiceId = ServiceId(16);
+/// The number the kernel knows `ectx:aw`'s server by.
+pub const ECTX_AW: ServiceId = ServiceId(17);
+/// The number the kernel knows `aoc:u`'s server by.
+pub const AOC_U: ServiceId = ServiceId(18);
 
 /// The parental-control names, each with the number its server is known by: one server per
 /// name, since each name's factory has its own capability ([`pctl::Name::capability`]).
@@ -119,6 +130,9 @@ const SERVICES: &[(ServiceId, &str)] = &[
     (PCTL_A, pctl::Name::A.as_str()),
     (PCTL_S, pctl::Name::S.as_str()),
     (PCTL_R, pctl::Name::R.as_str()),
+    (LM, lm::NAME),
+    (ECTX_AW, ectx::AW_NAME),
+    (AOC_U, aoc::U_NAME),
 ];
 
 /// The name of the service a number stands for, if a run has it.
@@ -193,15 +207,35 @@ impl Notify for Delivering {
     }
 }
 
-/// Puts the run's services in front of `dispatcher`. `env` is the environment the services'
-/// methods read the host through while they handle a request: the run's own, so that what they
-/// read there is recorded with everything else. `fsp-srv`'s reads do not use it: their jobs read
-/// through the environments of `reads`' executor (module docs, "Reads"). `reads` is where
-/// `fsp-srv`'s reads run, and who is told when one is done.
+/// A guest log that keeps nothing: what [`install`] gives `lm`'s loggers.
+struct NoGuestLog;
+
+impl lm::GuestLog for NoGuestLog {
+    fn line(&self, _text: &[u8]) {}
+}
+
+/// Puts the run's services in front of `dispatcher`, as [`install_with_guest_log`] does, with a
+/// guest log that keeps nothing: the text `lm`'s loggers are sent is dropped.
 pub fn install(
     dispatcher: &Dispatcher,
     env: Arc<dyn Env>,
     reads: Reads,
+) -> Result<(), ServicesError> {
+    install_with_guest_log(dispatcher, env, reads, Arc::new(NoGuestLog))
+}
+
+/// Puts the run's services in front of `dispatcher`. `env` is the environment the services'
+/// methods read the host through while they handle a request: the run's own, so that what they
+/// read there is recorded with everything else. `fsp-srv`'s reads do not use it: their jobs read
+/// through the environments of `reads`' executor (module docs, "Reads"). `reads` is where
+/// `fsp-srv`'s reads run, and who is told when one is done. `guest_log` is where `lm`'s loggers
+/// write each finished message's text: the run's guest log, in a run
+/// (`starquake_services::lm`, "Where the messages go").
+pub fn install_with_guest_log(
+    dispatcher: &Dispatcher,
+    env: Arc<dyn Env>,
+    reads: Reads,
+    guest_log: Arc<dyn lm::GuestLog>,
 ) -> Result<(), ServicesError> {
     let policy = UnknownPolicy::AutoStub;
     let mut registry = Registry::new();
@@ -215,6 +249,9 @@ pub fn install(
     for (number, name) in PCTL_SERVICES {
         registry.register(ServiceName::new(name.as_str())?, number)?;
     }
+    registry.register(ServiceName::new(lm::NAME)?, LM)?;
+    registry.register(ServiceName::new(ectx::AW_NAME)?, ECTX_AW)?;
+    registry.register(ServiceName::new(aoc::U_NAME)?, AOC_U)?;
 
     let manager = sm::server(registry, policy).with_service_id(SM);
     let port = PortName::new(sm::PORT_NAME)?;
@@ -262,6 +299,15 @@ pub fn install(
         let parental = pctl::server(name, policy).with_service_id(number);
         dispatcher.add_server(name.as_str(), number, None, Box::new(parental))?;
     }
+
+    let loggers = lm::server(policy, guest_log).with_service_id(LM);
+    dispatcher.add_server(lm::NAME, LM, None, Box::new(loggers))?;
+
+    let contexts = ectx::aw_server(policy).with_service_id(ECTX_AW);
+    dispatcher.add_server(ectx::AW_NAME, ECTX_AW, None, Box::new(contexts))?;
+
+    let add_ons = aoc::u_server(policy).with_service_id(AOC_U);
+    dispatcher.add_server(aoc::U_NAME, AOC_U, None, Box::new(add_ons))?;
     Ok(())
 }
 

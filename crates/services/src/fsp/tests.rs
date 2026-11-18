@@ -30,7 +30,9 @@ use crate::framework::{Halt, Stop};
 
 use super::command::file::{GET_SIZE, READ};
 use super::command::file_system::OPEN_FILE;
-use super::command::fsp_srv::{OPEN_SD_CARD_FILE_SYSTEM, SET_CURRENT_PROCESS};
+use super::command::fsp_srv::{
+    GET_GLOBAL_ACCESS_LOG_MODE, OPEN_SD_CARD_FILE_SYSTEM, SET_CURRENT_PROCESS,
+};
 
 mod data_files;
 mod storage;
@@ -39,6 +41,11 @@ mod worker;
 /// `IFile::Write`, which this subset leaves out, so it has no shipping constant
 /// (`eden/src/core/hle/service/filesystem/fsp/fs_i_file.cpp`: `{1, D<&IFile::Write>, "Write"}`).
 const WRITE: u32 = 1;
+
+/// `FSP_SRV::SetGlobalAccessLogMode`, which this subset leaves out, so it has no shipping
+/// constant (`eden/src/core/hle/service/filesystem/fsp/fsp_srv.cpp`: `{1004,
+/// D<&FSP_SRV::SetGlobalAccessLogMode>, "SetGlobalAccessLogMode"}`).
+const SET_GLOBAL_ACCESS_LOG_MODE: u32 = 1004;
 
 /// The process the caller is in.
 const PROCESS_ID: u64 = 0x51;
@@ -662,6 +669,52 @@ fn set_current_process_without_a_process_id_is_target_not_found() {
     assert_eq!(reply, only(result::TARGET_NOT_FOUND));
 }
 
+/// `GetGlobalAccessLogMode` answers Eden's default, `AccessLogMode::None` (0), as one `u32`,
+/// on a plain session and in a domain, and asks the host nothing. `AccessLogMode::None` is
+/// checked against Eden's enum (`None, Log, SdCard`, from 0).
+#[test]
+fn get_global_access_log_mode_answers_eden_s_default() {
+    assert_eq!(GLOBAL_ACCESS_LOG_MODE, 0);
+    let expected = Answered {
+        data: GLOBAL_ACCESS_LOG_MODE.to_le_bytes().to_vec(),
+        ..only(ResultCode::SUCCESS)
+    };
+    let mut rig = Rig::new();
+    for _ in 0..2 {
+        let reply = rig.send(To::Session(rig.session), GET_GLOBAL_ACCESS_LOG_MODE, |r| r);
+        assert_eq!(reply, expected);
+    }
+    let root = rig.convert();
+    let reply = rig.send(To::Object(root), GET_GLOBAL_ACCESS_LOG_MODE, |r| r);
+    assert_eq!(reply, expected);
+    assert_eq!(rig.env.asked(), []);
+}
+
+/// `GetGlobalAccessLogMode`'s id is the reference's: `{1005, D<&FSP_SRV::GetGlobalAccessLogMode>,
+/// "GetGlobalAccessLogMode"}` in `eden/src/core/hle/service/filesystem/fsp/fsp_srv.cpp` @
+/// cf654052, written out here, since every other test sends the shipping constant and so passes
+/// whatever its value.
+#[test]
+fn get_global_access_log_mode_s_id_is_the_reference_s() {
+    assert_eq!(GET_GLOBAL_ACCESS_LOG_MODE, 1005);
+}
+
+/// Divergence from Eden, whose `GetGlobalAccessLogMode` answers what `SetGlobalAccessLogMode`
+/// (1004) last set: 1004 is left out here, so it goes to the unknown-command policy and the mode
+/// stays Eden's default.
+#[test]
+fn set_global_access_log_mode_is_left_out_so_the_mode_stays_the_default() {
+    let mut rig = Rig::new();
+    let root = To::Session(rig.session);
+    let sd_card = 2_u32;
+    let set = rig.send(root, SET_GLOBAL_ACCESS_LOG_MODE, |r| {
+        r.data(&sd_card.to_le_bytes())
+    });
+    assert_eq!(set, only(UNKNOWN_COMMAND_ID));
+    let get = rig.send(root, GET_GLOBAL_ACCESS_LOG_MODE, |r| r);
+    assert_eq!(get.data, GLOBAL_ACCESS_LOG_MODE.to_le_bytes());
+}
+
 #[test]
 fn without_an_sd_card_opening_it_fails_with_no_device() {
     let mut rig = Rig::with(false, true);
@@ -1182,13 +1235,18 @@ fn commands_this_subset_leaves_out_are_unknown() {
 fn the_command_tables_name_eden_s_commands() {
     use crate::framework::Protocol::Cmif;
     let root = FspSrv;
-    let names =
-        [SET_CURRENT_PROCESS, OPEN_SD_CARD_FILE_SYSTEM].map(|id| root.commands().name(Cmif, id));
+    let names = [
+        SET_CURRENT_PROCESS,
+        OPEN_SD_CARD_FILE_SYSTEM,
+        GET_GLOBAL_ACCESS_LOG_MODE,
+    ]
+    .map(|id| root.commands().name(Cmif, id));
     assert_eq!(
         names,
         [
             Some("set_current_process"),
-            Some("open_sd_card_file_system")
+            Some("open_sd_card_file_system"),
+            Some("get_global_access_log_mode"),
         ]
     );
     let fs = IFileSystem {

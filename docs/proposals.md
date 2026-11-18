@@ -330,6 +330,7 @@ Filed from this wave under the delegation:
 | proposed | **`unlock_for_transfer_memory` gets Eden's page-group or permission check**, and #260 adds the alias-source versus transfer-memory cross-check | Review of #269. Called directly, it unlocks an alias source and leaves a stale alias record | area:kernel |
 | proposed | **am: the operation and performance-mode change message, `PushUnorderedMessage` sources, and a bound on the unordered and restored queues** | Review of #268 | area:services |
 | proposed | **A deterministic per-call cost test** (a counting allocator in its own test binary) in place of #268's wall-clock one | Review of #268; the wall-clock test has about 8x headroom | area:services |
+| proposed | **Wire the title's NACP through to `appletOE`** so `IApplicationFunctions::GetDesiredLanguage` reads its supported languages, as Eden does, and make the system language a setting | #282: without the NACP the command answers Eden's no-metadata answer, `en-US`, even for a title that does not support American English (`crates/services/src/am.rs`, "The title's later start-up commands") | area:services, area:loader |
 
 ## House-rule candidates
 

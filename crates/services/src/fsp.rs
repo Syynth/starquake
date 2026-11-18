@@ -10,7 +10,10 @@
 //! modes of `eden/src/core/file_sys/fs_filesystem.h` and the result codes of
 //! `eden/src/core/file_sys/errors.h`, all @ cf654052 (GPL-3.0-or-later). The request layouts are
 //! checked against the client, libnx (`libnx/nx/source/services/fs.c`, ISC). Paths are normalised
-//! by [`path`], a port of Eden's `fs_path_utility.h`.
+//! by [`path`], a port of Eden's `fs_path_utility.h`. `GetGlobalAccessLogMode` is ported from
+//! `fsp_srv.cpp` and `fsp_srv.h` (`AccessLogMode`, `FSP_SRV::access_log_mode`) with
+//! `eden/src/common/settings.h` (`enable_fs_access_log`) @ cf654052, which Eden-NX2 @ 50fa86bb
+//! and Eden PR #4588 @ e5fb3b97 have unchanged (see "The access log mode").
 //!
 //! # Commands
 //!
@@ -25,6 +28,7 @@
 //! | | 2 | `OpenDataFileSystemByCurrentProcess` | nothing | an [`IFileSystem`] |
 //! | | 18 | `OpenSdCardFileSystem` | nothing | an [`IFileSystem`] |
 //! | | 200 | `OpenDataStorageByCurrentProcess` | nothing | an [`IStorage`] |
+//! | | 1005 | `GetGlobalAccessLogMode` | nothing | `u32` mode: [`GLOBAL_ACCESS_LOG_MODE`] |
 //! | [`IFileSystem`] | 8 | `OpenFile` | `u32` open mode; in buffer 0 (pointer, an X descriptor): the path | an [`IFile`] |
 //! | [`IFile`] | 0 | `Read` | `u32` option, 4 bytes of padding, `s64` offset, `s64` size; out buffer 0 (map-alias, a B descriptor): room for the bytes | `s64` bytes read, and the bytes in out buffer 0 |
 //! | | 4 | `GetSize` | nothing | `s64` size |
@@ -59,6 +63,25 @@
 //!   s64 offset, s64 length)`.
 //! - `IStorage::GetSize`: libnx `fsStorageGetSize(FsStorage*, s64*)`; Eden `GetSize(Out<u64>)`
 //!   (the same eight bytes for every size up to `i64::MAX`, the most a size answer may be).
+//! - `GetGlobalAccessLogMode`: libnx `fsGetGlobalAccessLogMode` (`_fsObjectDispatchOut(&g_fsSrv,
+//!   1005, *out_mode)`, one `u32` out); Eden `GetGlobalAccessLogMode(Out<AccessLogMode>)`, where
+//!   `AccessLogMode` is an `enum class : u32`.
+//!
+//! # The access log mode
+//!
+//! `GetGlobalAccessLogMode` answers [`GLOBAL_ACCESS_LOG_MODE`], `AccessLogMode::None`: Eden's
+//! `access_log_mode` as `FSP_SRV` starts with it under Eden's default settings
+//! (`enable_fs_access_log` off). It asks the host nothing and keeps nothing
+//! (`get_global_access_log_mode_answers_eden_s_default`). Eden's answers whatever
+//! `SetGlobalAccessLogMode` (1004) last set; 1004 is not ported, so it goes to the server's
+//! unknown-command policy and the mode never changes here
+//! (`set_global_access_log_mode_is_left_out_so_the_mode_stays_the_default`). Under auto-stub a
+//! title that sets the mode is answered success and then reads `None` back, where Eden would
+//! answer the mode it set. Porting 1004 makes the mode a session's state, as Eden's is: Eden
+//! registers `fsp-srv` with a factory (`eden/src/core/hle/service/filesystem/filesystem.cpp`,
+//! `LoopProcess`), and its server manager calls it for every session it accepts
+//! (`eden/src/core/hle/service/server_manager.cpp`, `Port::CreateHandler`), so each session has
+//! its own `FSP_SRV` and its own mode.
 //!
 //! # The data storage
 //!
@@ -298,6 +321,15 @@ pub const NAME: &str = "fsp-srv";
 /// (`eden/src/core/file_sys/fssrv/fssrv_sf_path.h`; libnx `FS_MAX_PATH` is the same 0x301).
 pub const PATH_BUFFER_SIZE: usize = path::ENTRY_NAME_LENGTH_MAX + 1;
 
+/// What `GetGlobalAccessLogMode` answers: `AccessLogMode::None`, 0
+/// (`eden/src/core/hle/service/filesystem/fsp/fsp_srv.h` @ cf654052: `enum class AccessLogMode
+/// : u32 { None, Log, SdCard }`, and `FSP_SRV`'s `AccessLogMode access_log_mode =
+/// AccessLogMode::None`). Eden's constructor sets `SdCard` instead when its
+/// `enable_fs_access_log` setting is on, which it is not by default (`eden/src/common/settings.h`:
+/// `Setting<bool> enable_fs_access_log{linkage, false, ..}`). The same in Eden-NX2 @ 50fa86bb and
+/// Eden PR #4588 @ e5fb3b97. Module docs, "The access log mode".
+pub const GLOBAL_ACCESS_LOG_MODE: u32 = 0;
+
 /// The open-mode bits (`eden/src/core/file_sys/fs_filesystem.h`, `OpenMode`).
 pub mod open_mode {
     /// `OpenMode::Read`.
@@ -414,6 +446,10 @@ pub mod command {
         /// `OpenDataStorageByCurrentProcess`
         /// (`{200, D<&FSP_SRV::OpenDataStorageByCurrentProcess>, ..}`).
         pub const OPEN_DATA_STORAGE_BY_CURRENT_PROCESS: u32 = 200;
+        /// `GetGlobalAccessLogMode` (`{1005, D<&FSP_SRV::GetGlobalAccessLogMode>,
+        /// "GetGlobalAccessLogMode"}`, the same row in Eden @ cf654052, Eden-NX2 @ 50fa86bb and
+        /// Eden PR #4588 @ e5fb3b97); libnx `fsGetGlobalAccessLogMode` sends 1005.
+        pub const GET_GLOBAL_ACCESS_LOG_MODE: u32 = 1005;
     }
 
     /// [`IFileSystem`](super::IFileSystem)'s commands.
@@ -445,6 +481,7 @@ commands! {
         command::fsp_srv::OPEN_DATA_FILE_SYSTEM_BY_CURRENT_PROCESS => open_data_file_system_by_current_process,
         command::fsp_srv::OPEN_SD_CARD_FILE_SYSTEM => open_sd_card_file_system,
         command::fsp_srv::OPEN_DATA_STORAGE_BY_CURRENT_PROCESS => open_data_storage_by_current_process,
+        command::fsp_srv::GET_GLOBAL_ACCESS_LOG_MODE => get_global_access_log_mode,
     }
 }
 
@@ -459,6 +496,18 @@ impl FspSrv {
         if req.process_id().is_none() {
             return Err(result::TARGET_NOT_FOUND.into());
         }
+        reply.ok()
+    }
+
+    /// `GetGlobalAccessLogMode`. out: `u32` mode, [`GLOBAL_ACCESS_LOG_MODE`] (module docs,
+    /// "The access log mode").
+    fn get_global_access_log_mode(
+        _: &mut Self,
+        _cx: &mut Context<'_>,
+        _req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        reply.payload().write_u32(GLOBAL_ACCESS_LOG_MODE);
         reply.ok()
     }
 

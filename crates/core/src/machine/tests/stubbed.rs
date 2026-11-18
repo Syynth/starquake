@@ -23,8 +23,9 @@ use crate::services_report::{StubbedCommand, StubbedRequestReport};
 
 /// Where in the thread-local page the port's name is.
 const NAME_AT: u64 = 0x300;
-/// The service the guest asks for, which nothing provides.
-const UNKNOWN: &str = "lm";
+/// The service the guest asks for, which nothing provides: a made-up name, so that no service
+/// a later change registers can take it (`lm`, the name used first, is now registered).
+const UNKNOWN: &str = "absent";
 /// The command it sends the service.
 const COMMAND: u32 = 5;
 /// The longest a run here may take: its timeout.

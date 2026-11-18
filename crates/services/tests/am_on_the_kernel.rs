@@ -1,6 +1,7 @@
 //! `appletOE` on the real kernel: libnx's `SetFocusHandlingMode(0, 0, 1)` clears the message
-//! event the guest holds a handle to, and `ISelfController::Exit` answers the guest and then
-//! ends its process, releasing everything the process held.
+//! event the guest holds a handle to, `ISelfController::Exit` answers the guest and then
+//! ends its process, releasing everything the process held, and `IApplicationFunctions` 210
+//! copies a handle the guest can wait on, to the same event on every call.
 //!
 //! The caller is a thread the scheduler runs (`run_a_user_thread`), so the kernel writes a reply
 //! only while that thread has not ended: a kernel that ended the process before writing the
@@ -30,8 +31,11 @@ mod on_the_kernel {
     use starquake_kernel::svc::{DebugSink, SvcId};
     use starquake_kernel::tables::Scheduler;
     use starquake_memory::{FlatMemory, GuestMemory, PAGE_SIZE};
+    use starquake_services::am::command::application_functions::GET_UNKNOWN_EVENT_210;
     use starquake_services::am::command::common_state_getter::GET_EVENT_HANDLE;
-    use starquake_services::am::command::proxy::{GET_COMMON_STATE_GETTER, GET_SELF_CONTROLLER};
+    use starquake_services::am::command::proxy::{
+        GET_APPLICATION_FUNCTIONS, GET_COMMON_STATE_GETTER, GET_SELF_CONTROLLER,
+    };
     use starquake_services::am::command::proxy_service::OPEN_APPLICATION_PROXY;
     use starquake_services::am::command::self_controller::{EXIT, SET_FOCUS_HANDLING_MODE};
     use starquake_services::am::{AppletSettings, OE_NAME, oe_server};
@@ -46,6 +50,8 @@ mod on_the_kernel {
     const PAGES: u64 = 2;
     const TLS: u64 = BASE;
     const NAME: u64 = BASE + PAGE_SIZE;
+    /// Where the guest keeps the handle array it waits on: after the port name.
+    const WAITED: u64 = NAME + 0x100;
     /// The number the test registers `appletOE`'s server under.
     const OE: ServiceId = ServiceId(0x64);
     /// The calling guest thread, and the core it runs on.
@@ -211,6 +217,21 @@ mod on_the_kernel {
                 .x[0]
         }
 
+        /// `WaitSynchronization` on `handle` alone, with a timeout of zero (a poll): its
+        /// result (`x0`).
+        fn poll(&self, handle: Handle) -> u64 {
+            self.memory
+                .write(WAITED, &handle.raw().to_le_bytes())
+                .unwrap();
+            self.call(SvcId::WaitSynchronization, [0, WAITED, 1, 0]).x[0]
+        }
+
+        /// The object `handle` names in the process's handle table.
+        fn object_of(&self, handle: Handle) -> starquake_kernel::id::ObjectId {
+            self.dispatcher
+                .with::<(&HandleTable,), _>(|(handles,)| handles.get(handle).unwrap())
+        }
+
         /// `SetFocusHandlingMode(notify, background, suspend)` on `controller`.
         fn set_focus_handling_mode(&self, controller: Handle, flags: [u8; 3]) {
             let request =
@@ -296,6 +317,28 @@ mod on_the_kernel {
         // Notifications on again: the pending focus change signals it again.
         rig.set_focus_handling_mode(controller, [1, 0, 1]);
         assert_eq!(rig.reset(event), 0);
+    }
+
+    /// The handle 210 copies names a synchronisation object the guest can wait on (a poll of it
+    /// times out, where a handle that is not one is `InvalidHandle`), an event never signalled
+    /// (`ResetSignal` finds it clear), and two calls copy two handles to the same event.
+    #[test]
+    fn get_unknown_event_210_copies_a_handle_the_guest_waits_on() {
+        let rig = Rig::new();
+        let functions = rig.open(GET_APPLICATION_FUNCTIONS);
+        let request = RequestBuilder::cmif(CommandType::Request, GET_UNKNOWN_EVENT_210);
+        let first = Handle::from_raw(rig.send(functions, &request).copies[0]);
+        let second = Handle::from_raw(rig.send(functions, &request).copies[0]);
+        assert_ne!(first, second);
+        assert_eq!(rig.object_of(first), rig.object_of(second));
+        let timed_out = u64::from(KernelError::TimedOut.code().raw());
+        for handle in [first, second] {
+            assert_eq!(rig.poll(handle), timed_out);
+            assert_eq!(rig.reset(handle), invalid_state());
+        }
+        // A client session is no synchronisation object: its poll is refused, not timed out.
+        let invalid = u64::from(KernelError::InvalidHandle.code().raw());
+        assert_eq!(rig.poll(functions), invalid);
     }
 
     #[test]

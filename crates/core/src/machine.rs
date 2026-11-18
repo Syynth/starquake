@@ -82,10 +82,10 @@
 //!   keeps its first events and the guest log its first lines, and both say when they stopped.
 //!   The observability spec's size cap per run, with its own flags, replaces the constants.
 //! - **Deferred replies.** A run's services are installed by a function the run is given
-//!   ([`Install`]; a real run's is [`crate::hle::install`]), which may keep a [`Ready`] to say
-//!   when a server's deferred replies are ready; the timer thread then delivers them
-//!   ([`Dispatcher::deliver_replies`]), or, when a core has the server's handler out, that core
-//!   does when it puts the handler back. In a real run `fsp-srv`'s reads defer: they run on
+//!   ([`Install`]; a real run's calls [`crate::hle::install_with_guest_log`]), which may keep a
+//!   [`Ready`] to say when a server's deferred replies are ready; the timer thread then
+//!   delivers them ([`Dispatcher::deliver_replies`]), or, when a core has the server's handler
+//!   out, that core does when it puts the handler back. In a real run `fsp-srv`'s reads defer: they run on
 //!   `fsp-srv`'s workers (`starquake_services::fsp::worker`), whose finished jobs tell the
 //!   [`Ready`] through the server's notification ([`crate::hle`], "Reads"). The workers belong
 //!   to the `fsp-srv` server, which the dispatcher owns, so they stop, and their threads end,
@@ -149,6 +149,7 @@ use starquake_kernel::time::CounterRate;
 use starquake_memory::{Access, GuestMemory};
 use starquake_services::framework::{Halt, Stop};
 use starquake_services::fsp::worker::{self, Recording, StartError, Workers};
+use starquake_services::lm;
 use starquake_trace::{
     DumpError, Env, EventKind, FlightRecorder, GuestTicks, HostClock, HostNanos, LifecyclePhase,
     LiveEnv, Recorder, TextSink, ThreadId,
@@ -291,14 +292,17 @@ pub(crate) struct Given {
     pub(crate) ready: Ready,
     /// How a service stops the run when the environment fails it ([`Halted`]).
     pub(crate) halt: Arc<dyn Halt>,
+    /// The run's guest log, for `lm`'s loggers ([`ServicesLog`]).
+    pub(crate) guest_log: Arc<dyn lm::GuestLog>,
 }
 
 /// Puts a run's services in front of its dispatcher, with what the run gives them ([`Given`]).
 /// A failure ends the run before the guest runs, with the message given.
 pub(crate) type Install = dyn Fn(&Dispatcher, Given) -> Result<(), String> + Sync;
 
-/// The services of a real run ([`crate::hle::install`]), with `fsp-srv`'s reads on its workers,
-/// which keep no record (module docs, "The environment").
+/// The services of a real run ([`crate::hle::install_with_guest_log`], given the run's guest log
+/// through [`Given::guest_log`]), with `fsp-srv`'s reads on its workers, which keep no record
+/// (module docs, "The environment").
 fn real_services(dispatcher: &Dispatcher, given: Given) -> Result<(), String> {
     let workers =
         reads_workers(&given.reads, Arc::clone(&given.halt)).map_err(|error| error.to_string())?;
@@ -307,7 +311,8 @@ fn real_services(dispatcher: &Dispatcher, given: Given) -> Result<(), String> {
         ready: Arc::new(given.ready),
         halt: given.halt,
     };
-    crate::hle::install(dispatcher, given.env, reads).map_err(|error| error.to_string())
+    crate::hle::install_with_guest_log(dispatcher, given.env, reads, given.guest_log)
+        .map_err(|error| error.to_string())
 }
 
 /// A real run's `fsp-srv` workers: one thread on each of `envs`, keeping no record (module docs,
@@ -490,6 +495,30 @@ impl<C: HostClock + Clone> DebugSink for LogSink<'_, C> {
     }
 }
 
+/// The services' way into the guest log: `lm`'s loggers keep each finished message's text as a
+/// line, in the same log and under the same limit as [`LogSink`]'s. On one guest thread the two
+/// kinds of line keep the order that thread wrote them in; across cores they are in the order
+/// they reach the log's lock, not the order of the kernel's events. No guest-log event is
+/// recorded for these lines, a departure from the observability spec that is an open owner
+/// question (`starquake_services::lm`, "Where the messages go"). It is called from `lm`'s
+/// handler, which runs without the kernel's lock (unlike [`LogSink`], which runs under it), and
+/// takes only the log's lock.
+struct ServicesLog(Arc<Mutex<GuestLog>>);
+
+impl lm::GuestLog for ServicesLog {
+    fn line(&self, text: &[u8]) {
+        lock(&self.0).keep(text);
+    }
+}
+
+/// Takes what `log` kept, leaving it empty: how the run's report gets the guest log while the
+/// services, which hold the log too ([`ServicesLog`]), may still be alive.
+fn take_log(log: &Mutex<GuestLog>) -> GuestLog {
+    let mut log = lock(log);
+    let limit = log.limit;
+    std::mem::replace(&mut *log, GuestLog::new(limit))
+}
+
 /// Counts of the system calls the guest made.
 #[derive(Default)]
 struct Tally {
@@ -556,7 +585,7 @@ struct Machine<'a, V: Vcpu, C> {
     space: &'a dyn GuestSpace<V>,
     dispatcher: Dispatcher,
     env: &'a Arc<LiveEnv>,
-    log: Mutex<GuestLog>,
+    log: Arc<Mutex<GuestLog>>,
     tally: Mutex<Tally>,
     cores: Cores<V::Interrupter>,
     /// How the run ended: the first ending wins.
@@ -916,7 +945,7 @@ impl<'a, V: Vcpu, C: HostClock + Clone> Machine<'a, V, C> {
             space,
             dispatcher,
             env,
-            log: Mutex::new(GuestLog::new(limits.guest_log_bytes)),
+            log: Arc::new(Mutex::new(GuestLog::new(limits.guest_log_bytes))),
             tally: Mutex::new(Tally::default()),
             cores: Cores::new(count),
             ending: Mutex::new(None),
@@ -935,14 +964,11 @@ impl<'a, V: Vcpu, C: HostClock + Clone> Machine<'a, V, C> {
             reads: machine.reads.clone(),
             ready: machine.ready.clone(),
             halt: Arc::<Halted>::clone(&machine.halted),
+            guest_log: Arc::new(ServicesLog(Arc::clone(&machine.log))),
         };
         if let Err(error) = install(&machine.dispatcher, given) {
             let ending = Ending::Failed(format!("the services could not be set up: {error}"));
-            return Err(Box::new((
-                ending,
-                machine.log.into_inner_or_poisoned(),
-                Tally::default(),
-            )));
+            return Err(Box::new((ending, take_log(&machine.log), Tally::default())));
         }
         session.record(EventKind::Lifecycle {
             phase: LifecyclePhase::ProcessStart,
@@ -982,7 +1008,7 @@ impl<'a, V: Vcpu, C: HostClock + Clone> Machine<'a, V, C> {
         };
         (
             ending,
-            self.log.into_inner_or_poisoned(),
+            take_log(&self.log),
             self.tally.into_inner_or_poisoned(),
             aftermath,
         )

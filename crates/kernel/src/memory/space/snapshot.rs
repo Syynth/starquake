@@ -64,8 +64,17 @@
 //!    device counts agree with its attribute and barriers, that its permission has a
 //!    translation, that a block that is not free has a permission the kernel gives its state
 //!    ([`BlockFault::Permission`]: one of the four converted system call permissions, and not
-//!    writable if its state is code), and that it lies in the region of its state. Then that
-//!    the blocks reach the address space's end ([`SnapshotError::Short`]).
+//!    writable if its state is code), that it is `Uncached` or `GpuAccessible` only if its
+//!    state has `CanChangeAttribute` ([`BlockFault::ChangedAttribute`]), that it is
+//!    `PermissionLocked` only if its state has `CanPermissionLock`
+//!    ([`BlockFault::PermissionLock`]), and that it lies in the region of its state. Then that
+//!    the blocks reach the address space's end ([`SnapshotError::Short`]). The two attribute
+//!    rules are the reference's own state flags (`FlagCanChangeAttribute`, bit 24, and
+//!    `FlagCanPermissionLock`, bit 27, of `KMemoryState` in
+//!    `eden/src/core/hle/kernel/k_memory_block.h` @ cf654052), as
+//!    `KPageTableBase::SetMemoryAttribute` tests them ([`ATTRIBUTE_STATE_FLAGS`]; decision log,
+//!    2026-11-17, "Address-space restore checks attributes against state flags, not a
+//!    permission table").
 //! 5. The code's pages are `Code` or `CodeData` ([`SnapshotError::CodeRange`]); the heap's
 //!    pages are `Normal` and the heap region holds no other `Normal` memory
 //!    ([`SnapshotError::HeapRange`]); the mapped physical memory size is the bytes of `Normal`
@@ -140,6 +149,23 @@
 //!   `CanReprotect`). A `Shared` block keeps the permission it was mapped with, which
 //!   `MapSharedMemory` requires to be the shared memory's user permission
 //!   (`svc::shared_memory`), since no `Shared` state can be reprotected.
+//! - **The attributes and their states.** Only [`AddressSpace::set_memory_attribute`] (the
+//!   system calls `SetMemoryAttribute` and `svc 0x80`) sets `Uncached`, `GpuAccessible` or
+//!   `PermissionLocked`, and only on blocks whose state has the flag
+//!   [`ATTRIBUTE_STATE_FLAGS`] pairs with it (`KPageTableBase::SetMemoryAttribute`'s
+//!   `state_test_mask`). Of the calls that change a block's state, those that map fresh
+//!   memory (heap growth, `MapPhysicalMemory`, `MapSharedMemory`, [`AddressSpace::map_pages`]
+//!   and its callers, and `MapMemory`'s destination) start from `Free` blocks, which have no
+//!   attributes;
+//!   `SetProcessMemoryPermission`, a heap shrink and `UnmapPhysicalMemory` take only blocks
+//!   with none of the three (each tests the attributes with them in the mask and none
+//!   expected); and `UnmapSharedMemory` and `UnmapMemory`'s destination change only `Shared`
+//!   and `Stack` blocks, states with neither flag, which so never hold one. The other calls
+//!   keep a block's state. So no live block holds one of the three on a state without its
+//!   flag, and check 4 refuses nothing a live space holds: the rich round trip keeps `Normal`
+//!   memory uncached and GPU accessible and `CodeData` permission locked, and
+//!   `a_live_space_taken_through_every_attribute_change_saves_restores_and_keeps_its_rules`
+//!   (`snapshot/tests/attribute.rs`) adds code made writable and then given all three.
 //! - **The device-share locks' states.** [`AddressSpace::lock_device_share`] takes a lock only
 //!   on blocks with `CanAlignedDeviceMap | ReferenceCounted`, every state with those has
 //!   `CanDeviceMap` too (what [`AddressSpace::unlock_device_share`] tests; so check 7's test
@@ -200,8 +226,7 @@
 //!   ([`BlockFault::Ipc`]): nothing here takes IPC locks yet (`memory::block_map`, "Not ported
 //!   yet"), so no live address space has any. The snapshot version changes when they land.
 //!   Test: `a_block_with_ipc_lock_state_is_refused`.
-//! - **Not checked here:** which transfer memory holds a `Locked` range (the transfer memory
-//!   objects are the object table's), that a shared mapping's object is the one the guest mapped
+//! - **Not checked here:** that a shared mapping's object is the one the guest mapped
 //!   beyond its size (the caller resolves it), where the main thread's stack is (only its size
 //!   is saved, and other memory may have the `Stack` state), where the `Normal` and
 //!   `Locked` merge barriers sit, and which merge barrier bits a block has beyond the IPC and
@@ -218,16 +243,21 @@
 //!   `a_block_holding_two_aliases_and_a_block_partly_aliased_restore`); and that two runs
 //!   that could be one (side by side in both ranges) were saved as one: the record matches
 //!   page by page either way.
-//! - **Not checked here: which permission and attributes each state may carry**, beyond the two
-//!   permission rules of check 4 and the attribute rules above (no unknown bit, no IPC lock,
-//!   `DeviceShared` exactly with a use count). So a restore accepts, for example, `Normal` or
-//!   `CodeData` memory that is read and execute (the kernel's
-//!   [`AddressSpace::set_memory_permission`] allows it; only the system call refuses it:
-//!   `IsValidSetMemoryPermission` in `eden/src/core/hle/kernel/svc/svc_memory.cpp`), memory
-//!   whose state has no `CanChangeAttribute` that is `Uncached` or `GpuAccessible`, memory whose
-//!   state has no `CanPermissionLock` that is `PermissionLocked`, and `Locked` memory outside a
-//!   transfer memory lend. A live address space has none of these; a snapshot that has one
-//!   restores it as it is.
+//! - **Decision: no per-state permission table.** Beyond the two permission rules of check 4,
+//!   a restore accepts any permission a system call can set, on any state that is not free
+//!   (decision log, 2026-11-17, "Address-space restore checks attributes against state flags,
+//!   not a permission table"). So it accepts, for example, `Normal` or `CodeData` memory that
+//!   is read and execute: the kernel's [`AddressSpace::set_memory_permission`] allows it, and
+//!   only the system call refuses it (`IsValidSetMemoryPermission` in
+//!   `eden/src/core/hle/kernel/svc/svc_memory.cpp`). A table of the permissions each state may
+//!   carry would be stricter than the live kernel. Test:
+//!   `every_converted_permission_is_accepted_where_the_state_is_not_code`.
+//! - **Not checked here, until the object table's snapshot (#260):** `Locked` memory outside a
+//!   transfer memory lend, and which transfer memory lent each `Locked` range (the transfer
+//!   memory objects are the object table's). The attribute rules of check 4 cover `Uncached`,
+//!   `GpuAccessible` and `PermissionLocked` only; `Locked` is tested only by check 8, which
+//!   requires it on an alias's source and refuses it on an alias's destination, and a
+//!   snapshot that has it on any other block restores it as it is.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -235,8 +265,8 @@ use serde::{Deserialize, Serialize};
 use starquake_memory::PAGE_SIZE;
 
 use super::{
-    AddressSpace, DEVICE_SHARE_LOCK_STATE, DEVICE_SHARE_UNLOCK_STATE, MemoryLimit, ProcessMemory,
-    SharedMapping, can_contain, layout, max_process_memory,
+    ATTRIBUTE_STATE_FLAGS, AddressSpace, DEVICE_SHARE_LOCK_STATE, DEVICE_SHARE_UNLOCK_STATE,
+    MemoryLimit, ProcessMemory, SharedMapping, can_contain, layout, max_process_memory,
 };
 use crate::id::ObjectId;
 use crate::memory::block::{BlockCounts, MemoryBlock};
@@ -343,6 +373,14 @@ pub enum BlockFault {
     /// code (a state with [`flag::CODE`]).
     #[error("has a permission the kernel never gives its state")]
     Permission,
+    /// It is `Uncached` or `GpuAccessible` and its state has no `CanChangeAttribute`
+    /// ([`ATTRIBUTE_STATE_FLAGS`]).
+    #[error("is uncached or GPU accessible, which its memory state does not allow")]
+    ChangedAttribute,
+    /// It is `PermissionLocked` and its state has no `CanPermissionLock`
+    /// ([`ATTRIBUTE_STATE_FLAGS`]).
+    #[error("is permission locked, which its memory state does not allow")]
+    PermissionLock,
     /// It is not in the region its state belongs in.
     #[error("is outside the region of its state")]
     Region,
@@ -1067,6 +1105,17 @@ fn check_block(
     if state != MemoryState::Free && !is_live_permission(state, permission) {
         return Err(BlockFault::Permission);
     }
+    // `SetMemoryAttribute` changes these attributes only on a state with their flag
+    // ([`ATTRIBUTE_STATE_FLAGS`]), and no state change keeps them on a state without it
+    // (module docs, "Why each relation holds live": the attributes).
+    let [(changeable, change_flag), (lockable, lock_flag)] = ATTRIBUTE_STATE_FLAGS;
+    let word = state.word();
+    if !attribute.excludes(changeable) && word & change_flag != change_flag {
+        return Err(BlockFault::ChangedAttribute);
+    }
+    if !attribute.excludes(lockable) && word & lock_flag != lock_flag {
+        return Err(BlockFault::PermissionLock);
+    }
     Ok(block)
 }
 
@@ -1076,7 +1125,8 @@ fn check_block(
 /// (`SetProcessMemoryPermission` makes writable `Code` `CodeData` and writable `AliasCode`
 /// `AliasCodeData`: `is_w` in `KPageTableBase::SetProcessMemoryPermission`,
 /// `eden/src/core/hle/kernel/k_page_table_base.cpp`; and no state with [`flag::CODE`] can be
-/// reprotected). See "Not checked here" in the module docs for what this leaves out.
+/// reprotected). See "Decision: no per-state permission table" in the module docs for what
+/// this leaves out.
 fn is_live_permission(state: MemoryState, permission: MemoryPermission) -> bool {
     let converted = SvcPermission::ALL
         .into_iter()

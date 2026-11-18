@@ -26,7 +26,20 @@
 //! (`IApplicationFunctions` 65, 67, 130 and 330) and `self_controller.cpp` (`ISelfController`
 //! 10), with `ScreenshotPermission` and `GamePlayRecordingState` from
 //! `eden-pr4588/src/core/hle/service/am/am_types.h` (see "The title's start-up commands" and
-//! "Screenshots and recording").
+//! "Screenshots and recording"). The commands a Switch 2 title sends after those (see "The
+//! title's later start-up commands") are ported from Eden @ cf654052, whose handlers Eden-NX2 @
+//! 50fa86bb and PR #4588 @ e5fb3b97 share: `application_functions.cpp` (`IApplicationFunctions`
+//! 21 and 210), with what 21 reads from
+//! `eden/src/core/hle/service/ns/read_only_application_control_data_interface.cpp`
+//! (`GetApplicationDesiredLanguage`, `ConvertApplicationLanguageToLanguageCode`),
+//! `eden/src/core/hle/service/ns/language.cpp`, `eden/src/core/hle/service/set/settings_types.h`
+//! (`LanguageCode`) and `eden/src/common/settings.h` (`language_index`);
+//! `common_state_getter.cpp` (`ICommonStateGetter` 66), with
+//! `eden/src/core/hle/service/apm/apm_interface.cpp` (`APM_Sys::SetCpuBoostMode`) and
+//! `apm_controller.cpp` and `.h` (`Controller::SetFromCpuBoostMode`, `CpuBoostMode`); and
+//! `self_controller.cpp` (`ISelfController` 14), with `lifecycle_manager.h`
+//! (`SetResumeNotificationEnabled`). `ISelfController` 2400 is ported from PR #4588 @ e5fb3b97
+//! alone (`eden-pr4588/src/core/hle/service/am/service/self_controller.cpp`).
 //!
 //! # Commands
 //!
@@ -39,8 +52,10 @@
 //! (`ICommonStateGetter` 900 and `IApplicationFunctions` 130), `ICommonStateGetter` 1, which a
 //! title that waits on the message event sends (see "The messages"), `IApplicationFunctions` 330,
 //! next to 320 and 321 in PR's table (see "The title's start-up commands"), and the three
-//! commands whose state 320 reads (see "Screenshots and recording"); every other command of
-//! these interfaces is left out and answered by the server's unknown-command policy.
+//! commands whose state 320 reads (see "Screenshots and recording"), and the five a Switch 2
+//! title sends after those (`IApplicationFunctions` 21 and 210, `ICommonStateGetter` 66,
+//! `ISelfController` 14 and 2400; see "The title's later start-up commands"); every other command
+//! of these interfaces is left out and answered by the server's unknown-command policy.
 //!
 //! | Interface | Id | Command | In | Out |
 //! |---|---|---|---|---|
@@ -61,21 +76,26 @@
 //! | | 5 | `GetOperationMode` | nothing | `u8` [`OperationMode`] |
 //! | | 6 | `GetPerformanceMode` | nothing | `s32` [`PerformanceMode`] |
 //! | | 9 | `GetCurrentFocusState` | nothing | `u8` [`FocusState`] |
+//! | | 66 | `SetCpuBoostMode` | `u32` [`CpuBoostMode`], any word | nothing |
 //! | | 900 | `SetRequestExitToLibraryAppletAtExecuteNextProgramEnabled` | nothing | nothing |
 //! | [`ISelfController`] | 0 | `Exit` | nothing | nothing; the process ends after the reply |
 //! | | 10 | `SetScreenShotPermission` | `u32` [`ScreenshotPermission`] | nothing |
 //! | | 11 | `SetOperationModeChangedNotification` | `bool` (a byte) | nothing |
 //! | | 12 | `SetPerformanceModeChangedNotification` | `bool` | nothing |
 //! | | 13 | `SetFocusHandlingMode` | `bool notify, bool background, bool suspend`, a byte each | nothing |
+//! | | 14 | `SetRestartMessageEnabled` | `bool` | nothing |
 //! | | 16 | `SetOutOfFocusSuspendingEnabled` | `bool` | nothing |
 //! | | 91 | `GetAccumulatedSuspendedTickChangedEvent` | nothing | copy handle: the applet's suspended-tick event |
 //! | | 2000 | `GetGraphicsSupervisor` (Switch 2) | nothing | copy handle: a new session on the graphics server's root |
+//! | | 2400 | `SetRtcScreenSharingAudioEnabled` (Switch 2) | `bool` | nothing |
 //! | [`IWindowController`] | 1 | `GetAppletResourceUserId` | nothing | `u64` the applet resource user id |
 //! | | 10 | `AcquireForegroundRights` | nothing | nothing |
-//! | [`IApplicationFunctions`] | 40 | `NotifyRunning` | nothing | `bool` (a byte): true |
+//! | [`IApplicationFunctions`] | 21 | `GetDesiredLanguage` | nothing | `u64` language code: [`DESIRED_LANGUAGE_CODE`] |
+//! | | 40 | `NotifyRunning` | nothing | `bool` (a byte): true |
 //! | | 65 | `IsGamePlayRecordingSupported` | nothing | `bool` (a byte): [`GAME_PLAY_RECORDING_SUPPORTED`] |
 //! | | 67 | `SetGamePlayRecordingState` | `u32` [`GamePlayRecordingState`] | nothing |
 //! | | 130 | `GetGpuErrorDetectedSystemEvent` | nothing | copy handle: the applet's GPU-error event |
+//! | | 210 | `GetUnknownEvent210` (Eden's name `Unknown210`) | nothing | copy handle: the applet's unknown event |
 //! | | 320 | `GetScreenShotAndContinuousRecordingInitiallyEnabled` (Switch 2) | nothing | `bool screenshot, bool recording`, a byte each, from the applet ([`Applet::screenshot_and_continuous_recording_initially_enabled`]) |
 //! | | 321 | `Unknown321` (Switch 2) | nothing | `bool` (a byte): [`UNKNOWN_321_ENABLED`] |
 //! | | 330 | `Unknown330` | nothing | `u8`: [`UNKNOWN_330_VALUE`] |
@@ -98,7 +118,17 @@
 //!   one out object); Eden `Out<SharedPointer<..>>`.
 //! - `GetEventHandle`, `GetAccumulatedSuspendedTickChangedEvent`,
 //!   `GetGpuErrorDetectedSystemEvent`: libnx `_appletCmdGetEvent` (one copied handle); Eden
+//!   `OutCopyHandle<KReadableEvent>`. `GetUnknownEvent210`: no libnx client; Eden
 //!   `OutCopyHandle<KReadableEvent>`.
+//! - `GetDesiredLanguage`: libnx `appletGetDesiredLanguage` (`_appletCmdNoInOutU64`); Eden
+//!   `Out<u64>`.
+//! - `SetCpuBoostMode`: libnx `appletSetCpuBoostMode` (`_appletCmdInU32NoOut`); Eden hands the
+//!   request to `APM_Sys::SetCpuBoostMode`, which pops one `u32` enum at offset 0
+//!   (`rp.PopEnum<CpuBoostMode>()`).
+//! - `SetRestartMessageEnabled`: libnx `_appletCmdInBoolNoOut`; Eden a `bool` argument, as the
+//!   other one-flag `Set...` commands below. `SetRtcScreenSharingAudioEnabled`: no libnx client;
+//!   PR #4588 a `bool` argument ("SDK 23.0 serializes this command as one bool input with no
+//!   output payload").
 //! - `SetRequestExitToLibraryAppletAtExecuteNextProgramEnabled`: libnx `_appletCmdNoIO`; Eden
 //!   `Result SetRequestExitToLibraryAppletAtExecuteNextProgramEnabled()`.
 //! - `SetScreenShotPermission`, `SetGamePlayRecordingState`: libnx `_appletCmdInU32NoOut` (one
@@ -156,19 +186,35 @@
 //!   (`applet_manager.cpp`: `SetFocusState(FocusState::InFocus)`, "Applet was started by
 //!   frontend, so it is foreground"), and nothing in a run changes it.
 //!
-//! A restore checks the graphics server's number against the run (see "The graphics server")
-//! and reads every queued message through [`AppletMessage::from_raw`] (see "The messages"); it
-//! has no kernel to check the applet's event ids against, so it believes them, and the commands
-//! check them when they use them:
+//! A restore checks the graphics server's number against the run (see "The graphics server"),
+//! reads every queued message through [`AppletMessage::from_raw`] (see "The messages"), and
+//! checks that the four event ids the applet keeps (message, suspended-tick, GPU-error and
+//! unknown) are distinct, as live operation always leaves them. It has no kernel to check the
+//! ids themselves against, so it believes them, and the commands check them when they use them:
 //!
-//! - **The suspended-tick and GPU-error events** are checked each time
-//!   `GetAccumulatedSuspendedTickChangedEvent` or `GetGpuErrorDetectedSystemEvent` returns a
-//!   kept one, before its handle is copied: the kernel's `clear_event` answers `InvalidHandle`
-//!   for an id that is not an event this server made (another kind of object, another server's
-//!   or the guest's event, or nothing), and the command answers that error, copies nothing and
-//!   leaves the applet as it was (`a_restored_event_the_kernel_did_not_make_is_refused`). On
-//!   the server's own event the clear changes nothing, as neither event is ever signalled
-//!   (`a_restored_event_the_kernel_made_is_copied_unchanged`).
+//! - **Two event slots holding one id** are refused with
+//!   [`SnapshotError::Decode`]`(postcard::Error::SerdeDeCustom)`, whichever two, and the server
+//!   is left as it was (`a_snapshot_that_keeps_one_event_in_two_slots_is_refused`). Slots with
+//!   no event (`None`) are not ids and may be any number. Without it, an applet whose unknown
+//!   or GPU-error event named its message event would have `GetUnknownEvent210` or
+//!   `GetGpuErrorDetectedSystemEvent` clear the signalled message event while a message is
+//!   pending, and a guest waiting on it would never wake
+//!   (`a_snapshot_whose_unknown_event_is_the_message_event_is_refused`).
+//! - **The suspended-tick, GPU-error and unknown events** are checked each time
+//!   `GetAccumulatedSuspendedTickChangedEvent`, `GetGpuErrorDetectedSystemEvent` or
+//!   `GetUnknownEvent210` returns a kept one, before its handle is copied: the kernel's
+//!   `clear_event` answers `InvalidHandle` for an id that is not an event this server made
+//!   (another kind of object, another server's or the guest's event, or nothing), and the
+//!   command answers that error, copies nothing and leaves the applet as it was
+//!   (`a_restored_event_the_kernel_did_not_make_is_refused`). On the event this server made
+//!   for that same slot the clear changes nothing, as none of these three events is ever
+//!   signalled (`a_restored_event_the_kernel_made_is_copied_unchanged`).
+//! - **Not checked here: a kept id that names the event this server made for another slot,
+//!   when the snapshot leaves that slot empty or names another id in it.** Such an id is an
+//!   event this server made, so the kernel's `clear_event` accepts it; if it is the message
+//!   event, the clear empties it while a message may be pending, as above. Telling it apart
+//!   needs the kernel's record of which event the server made for which slot, which a restore
+//!   here cannot read.
 //! - **Not checked here: the message event** when `GetEventHandle` copies it. The kernel calls
 //!   that check an event id (`clear_event`, `signal_event`) change its state, and the guest may
 //!   have cleared the event itself, so no call checks it without changing what the guest sees;
@@ -214,8 +260,9 @@
 //! The events are created the first time a command returns them, not when the applet is: the
 //! kernel interface is reached only while a request is handled. A message event created then is
 //! signalled exactly when the condition above holds, which is the state Eden's event is in at
-//! that moment. The suspended-tick and GPU-error events are never signalled, as in Eden (only
-//! the applet's constructor names them, `applet.cpp`).
+//! that moment. The suspended-tick, GPU-error and unknown events are never signalled, as in
+//! Eden (only the applet's constructor and the commands that hand them out name them,
+//! `applet.cpp`).
 //!
 //! # The messages
 //!
@@ -390,6 +437,60 @@
 //! table and is the same in all three references, `Out<u8>` set to 0
 //! ([`UNKNOWN_330_VALUE`]); the scoping doc has no row for it either.
 //!
+//! # The title's later start-up commands
+//!
+//! Once its parental-control check passes, a Switch 2 title sends five more commands of
+//! `appletOE` at start-up. Each is ported as Eden has it; the handlers of the four that Eden has
+//! are the same in Eden-NX2 and PR #4588:
+//!
+//! - **`GetDesiredLanguage` (21)** answers [`DESIRED_LANGUAGE_CODE`], `en-US`. Eden reads the
+//!   title's supported languages from its NACP when it can, and asks `ns` for the first entry of
+//!   the system language's priority list that the title supports. The NACP is not available to
+//!   this service, so this is Eden's answer when the metadata is missing (supported languages 0,
+//!   which accepts any language), under Eden's default system language (see the constant). Two
+//!   divergences follow, both pinned by
+//!   `get_desired_language_answers_eden_s_answer_with_no_metadata`: a title whose NACP leaves
+//!   out American English is answered `en-US` all the same, where Eden answers the first
+//!   language of the priority list the title supports; and the system language is not a
+//!   setting here. Wiring the NACP through is a proposal (`docs/proposals.md`).
+//! - **`GetUnknownEvent210` (210)** copies a handle to the applet's unknown event
+//!   ([`Applet::unknown_event`], Eden's `unknown_event`), made the first time, as the GPU-error
+//!   event is, and kept by the applet: every call copies a handle to the same event. Nothing
+//!   signals it: no reference signals `unknown_event` (Eden's library-applet accessor hands the
+//!   same event out, and signals it nowhere either).
+//! - **`SetCpuBoostMode` (66)** answers success for any word, as Eden does. Eden forwards it to
+//!   `apm:sys`, whose controller checks the word (`u32(mode) < BOOST_MODE_TO_CONFIG_MAP.size()`,
+//!   3: [`CpuBoostMode::from_raw`]) and, for a mode, records performance configuration 7, 13 or
+//!   15 as the boost mode's and calls `SetClockSpeed`, which does nothing (a `TODO`); a word
+//!   that is not a mode is only logged. **apm is not affected here**: starquake's `apm` keeps no
+//!   performance configuration, and no ported command reads one (`apm`'s `ISession`
+//!   `GetPerformanceConfiguration` and `apm:sys` are not ported, [`crate::apm`]), so the check
+//!   changes only what is logged, and Eden's recorded configuration is not kept. Eden's
+//!   `GetPerformanceMode` depends on the operation mode alone, not on the configuration, so
+//!   `ICommonStateGetter::GetPerformanceMode` answers the same after it
+//!   (`set_cpu_boost_mode_answers_success_and_keeps_nothing`). A port of `apm`'s configuration
+//!   commands makes the boost configuration state that `appletOE` and `apm` share.
+//! - **`SetRestartMessageEnabled` (14)** keeps its flag in the applet
+//!   ([`Applet::resume_notification_enabled`], Eden's `m_resume_notification_enabled`,
+//!   initially false), and
+//!   touches nothing else: Eden's `SetResumeNotificationEnabled` sets the flag without calling
+//!   `SignalSystemEventIfNeeded`
+//!   (`set_restart_message_enabled_keeps_its_flag_and_leaves_the_message_event`). Eden reads the
+//!   flag only in `RequestResumeNotification`, which raises the `Resume` message when an applet
+//!   is resumed; nothing here resumes the applet, so the flag changes no answer yet.
+//! - **`SetRtcScreenSharingAudioEnabled` (2400)** is a Switch 2 command, a fact of the PR #4588
+//!   fork only (`eden-pr4588/src/core/hle/service/am/service/self_controller.cpp` @ e5fb3b97,
+//!   line 84; Eden and Eden-NX2 have no row 2400). PR only logs its flag and answers success,
+//!   and so does this port; nothing is kept
+//!   (`set_rtc_screen_sharing_audio_enabled_answers_success_and_keeps_nothing`).
+//!
+//! The scoping doc has no row for any of the five. A payload too short for the argument of 66,
+//! 14 or 2400 is refused with [`INVALID_CMIF_REQUEST`] and changes nothing, where Eden reads
+//! past the argument whatever the message's size: the same divergence, with the same session
+//! rule, as "The Switch 2 additions" lists for 10 and 1050. It is pinned for the domain case by
+//! `the_later_commands_refuse_a_payload_too_short_and_change_nothing` (0 to 3 bytes for 66, and
+//! none for 14 and 2400, with libnx's exact domain `size`, refused; the whole argument accepted).
+//!
 //! # The graphics server
 //!
 //! `ISelfController` 2000 returns a session to the graphics server's root, which the title then
@@ -563,6 +664,71 @@ impl GamePlayRecordingState {
     #[must_use]
     pub const fn continuous_recording_enabled(self, supported: bool) -> bool {
         supported && self.0 == Self::ENABLED.0
+    }
+}
+
+/// `LanguageCode::EN_US` (`eden/src/core/hle/service/set/settings_types.h` @ cf654052: `EN_US =
+/// 0x00000053552D6E65`; the same in Eden-NX2 @ 50fa86bb and Eden PR #4588 @ e5fb3b97): the bytes
+/// of `en-US`, zero-padded to eight, read as a little-endian `u64`.
+pub const LANGUAGE_CODE_EN_US: u64 = 0x0000_0053_552D_6E65;
+
+/// What `IApplicationFunctions::GetDesiredLanguage` answers: Eden's answer for an application
+/// whose metadata it cannot read, under Eden's default system language (module docs, "The
+/// title's later start-up commands").
+///
+/// Eden starts from `supported_languages = 0` ("Default to 0 (all languages supported)") and
+/// reads the NACP's only when `GetApplicationMetadata` finds it
+/// (`eden/src/core/hle/service/am/service/application_functions.cpp` @ cf654052,
+/// `GetDesiredLanguage`). `IReadOnlyApplicationControlDataInterface::GetApplicationDesiredLanguage`
+/// (`eden/src/core/hle/service/ns/read_only_application_control_data_interface.cpp`) then takes
+/// the system language (`Settings::values.language_index`, `Language::EnglishAmerican` by
+/// default: `eden/src/common/settings.h`; index 1 of `available_language_codes`, `EN_US`:
+/// `set/settings_types.h`), turns it into `ApplicationLanguage::AmericanEnglish`
+/// (`ns/language.cpp`, `ConvertToApplicationLanguage`), and returns the first language of its
+/// priority list (`priority_list_american_english`, whose first entry is `AmericanEnglish`) for
+/// which `supported_languages == 0 || (supported_languages & supported_flag) == supported_flag`
+/// holds, so with 0 the first. `ConvertApplicationLanguageToLanguageCode` turns that back into
+/// `EN_US` (`ConvertToLanguageCode`). The same files are identical in Eden-NX2 @ 50fa86bb and
+/// Eden PR #4588 @ e5fb3b97.
+pub const DESIRED_LANGUAGE_CODE: u64 = LANGUAGE_CODE_EN_US;
+
+/// A CPU boost mode, as `ICommonStateGetter::SetCpuBoostMode` sends it (`nn::oe::CpuBoostMode`;
+/// `eden/src/core/hle/service/apm/apm_controller.h` @ cf654052: `enum class CpuBoostMode : u32
+/// { Normal = 0, FastLoad = 1, Partial = 2 }`; libnx's `ApmCpuBoostMode` has the same values,
+/// naming the third `Type2`).
+///
+/// Every value Eden accepts is a variant: `Controller::SetFromCpuBoostMode` (`apm_controller.cpp`)
+/// checks `u32(mode) < BOOST_MODE_TO_CONFIG_MAP.size()`, a map of three entries, so exactly the
+/// words 0, 1 and 2 are modes ([`CpuBoostMode::from_raw`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CpuBoostMode {
+    /// `Normal = 0`: boost off.
+    Normal,
+    /// `FastLoad = 1`.
+    FastLoad,
+    /// `Partial = 2`.
+    Partial,
+}
+
+impl CpuBoostMode {
+    /// Every mode, in Eden's declaration order (which is also the order of their words).
+    pub const ALL: [Self; 3] = [Self::Normal, Self::FastLoad, Self::Partial];
+
+    /// The mode's word: the one place each value is written down.
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        match self {
+            Self::Normal => 0,
+            Self::FastLoad => 1,
+            Self::Partial => 2,
+        }
+    }
+
+    /// The mode whose word is `raw`, or `None` for a word Eden's check refuses (module docs,
+    /// "The title's later start-up commands").
+    #[must_use]
+    pub fn from_raw(raw: u32) -> Option<Self> {
+        Self::ALL.into_iter().find(|mode| mode.raw() == raw)
     }
 }
 
@@ -902,7 +1068,11 @@ impl Default for Notifications {
 }
 
 /// The part of Eden's `LifecycleManager` that the ported commands read and change, with Eden's
-/// initial values (`lifecycle_manager.h`).
+/// initial values (`lifecycle_manager.h`), but for one flag: `m_resume_notification_enabled`,
+/// which `SetRestartMessageEnabled` changes, is kept on the applet
+/// ([`Applet::resume_notification_enabled`]), since no message term here reads it. Eden's
+/// `RequestResumeNotification` reads it to raise `Resume`, so a port of resuming makes it
+/// lifecycle state and moves it here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Lifecycle {
     /// The notifications the applet asked for.
@@ -1039,7 +1209,13 @@ impl Lifecycle {
 /// and an error the kernel reports leaves the change kept. The one exception is
 /// `ReceiveMessage`, which clears the message event before it takes the message, and takes
 /// nothing if the clear fails (module docs, "The messages").
+///
+/// It is read back from a snapshot through [`SavedApplet`], which refuses an applet that keeps
+/// one kernel object in two of its event slots (module docs, "The applet"). Live operation
+/// cannot make such an applet: each slot's event is created once, by the kernel, which never
+/// hands out one id twice; so saving needs no check of its own.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "SavedApplet")]
 pub struct Applet {
     settings: AppletSettings,
     lifecycle: Lifecycle,
@@ -1066,6 +1242,74 @@ pub struct Applet {
     /// The GPU-error event, once a command has returned it (module docs, "The title's start-up
     /// commands").
     gpu_error_detected_event: Option<ObjectId>,
+    /// Eden's `unknown_event`, which `GetUnknownEvent210` returns, once a command has returned
+    /// it (module docs, "The title's later start-up commands").
+    unknown_event: Option<ObjectId>,
+    /// The lifecycle manager's `m_resume_notification_enabled`, which `SetRestartMessageEnabled`
+    /// sets (module docs, "The title's later start-up commands"). Kept here rather than in
+    /// [`Lifecycle`], which holds the state that decides whether a message is available: this
+    /// flag is not a term of it.
+    resume_notification_enabled: bool,
+}
+
+/// An [`Applet`] as a snapshot holds it, before the check that turns it into one: the same
+/// fields in the same order, so the encoding is the applet's own.
+#[derive(Deserialize)]
+struct SavedApplet {
+    settings: AppletSettings,
+    lifecycle: Lifecycle,
+    message_event: Option<ObjectId>,
+    suspended_tick_event: Option<ObjectId>,
+    graphics_server: Option<ServiceId>,
+    graphics_scale_changed_notification_enabled: bool,
+    screenshot_permission: ScreenshotPermission,
+    game_play_recording_state: GamePlayRecordingState,
+    request_exit_to_library_applet_at_execute_next_program_enabled: bool,
+    gpu_error_detected_event: Option<ObjectId>,
+    unknown_event: Option<ObjectId>,
+    resume_notification_enabled: bool,
+}
+
+/// Why a snapshot's applet was refused. `postcard` keeps no text for it: a restore answers
+/// [`SnapshotError::Decode`]`(postcard::Error::SerdeDeCustom)`.
+///
+/// [`SnapshotError::Decode`]: crate::framework::SnapshotError::Decode
+#[derive(Debug, thiserror::Error)]
+#[error("the applet keeps one kernel object as two of its events")]
+struct SharedEvent;
+
+impl TryFrom<SavedApplet> for Applet {
+    type Error = SharedEvent;
+
+    fn try_from(saved: SavedApplet) -> Result<Self, SharedEvent> {
+        let kept = [
+            saved.message_event,
+            saved.suspended_tick_event,
+            saved.gpu_error_detected_event,
+            saved.unknown_event,
+        ];
+        for (index, id) in kept.iter().enumerate() {
+            if id.is_some() && kept.iter().skip(index + 1).any(|other| other == id) {
+                return Err(SharedEvent);
+            }
+        }
+        Ok(Self {
+            settings: saved.settings,
+            lifecycle: saved.lifecycle,
+            message_event: saved.message_event,
+            suspended_tick_event: saved.suspended_tick_event,
+            graphics_server: saved.graphics_server,
+            graphics_scale_changed_notification_enabled: saved
+                .graphics_scale_changed_notification_enabled,
+            screenshot_permission: saved.screenshot_permission,
+            game_play_recording_state: saved.game_play_recording_state,
+            request_exit_to_library_applet_at_execute_next_program_enabled: saved
+                .request_exit_to_library_applet_at_execute_next_program_enabled,
+            gpu_error_detected_event: saved.gpu_error_detected_event,
+            unknown_event: saved.unknown_event,
+            resume_notification_enabled: saved.resume_notification_enabled,
+        })
+    }
 }
 
 impl Applet {
@@ -1084,6 +1328,8 @@ impl Applet {
             game_play_recording_state: GamePlayRecordingState::DISABLED,
             request_exit_to_library_applet_at_execute_next_program_enabled: false,
             gpu_error_detected_event: None,
+            unknown_event: None,
+            resume_notification_enabled: false,
         }
     }
 
@@ -1137,6 +1383,19 @@ impl Applet {
     #[must_use]
     pub fn gpu_error_detected_event(&self) -> Option<ObjectId> {
         self.gpu_error_detected_event
+    }
+
+    /// The unknown event (`GetUnknownEvent210`), if a command has returned it yet.
+    #[must_use]
+    pub fn unknown_event(&self) -> Option<ObjectId> {
+        self.unknown_event
+    }
+
+    /// Whether the applet asked to be told when it is resumed (`SetRestartMessageEnabled`);
+    /// initially false, as Eden's `bool m_resume_notification_enabled{}` (`lifecycle_manager.h`).
+    #[must_use]
+    pub fn resume_notification_enabled(&self) -> bool {
+        self.resume_notification_enabled
     }
 
     /// The screenshot permission (`SetScreenShotPermission`); initially
@@ -1254,26 +1513,26 @@ impl Applet {
     fn gpu_error_detected_event_or_create(cx: &mut Context<'_>) -> Result<ObjectId, Fault> {
         unsignalled_event_or_create(cx, |applet| &mut applet.gpu_error_detected_event)
     }
+
+    /// The server's applet's unknown event (Eden's `unknown_event`), created the first time.
+    /// It is never signalled.
+    fn unknown_event_or_create(cx: &mut Context<'_>) -> Result<ObjectId, Fault> {
+        unsignalled_event_or_create(cx, |applet| &mut applet.unknown_event)
+    }
 }
 
 /// The event the server's applet keeps in `slot`, or a new one the kernel makes, kept there: how
 /// the applet makes each of its events that nothing signals.
 ///
-/// An event already in `slot` is checked first with [`Context::clear_event`], which the kernel
-/// answers `InvalidHandle` for any id that is not an event this server made (the kernel's
-/// `IpcContext::clear_event`), so a restored id that names another object, or nothing, is
-/// refused before a handle to it is copied (module docs, "The applet"). On an event the server
-/// made the clear changes nothing: nothing signals these events, and the guest is given only
-/// their readable end, which it cannot signal.
+/// An event already in `slot` is checked first ([`crate::events::unsignalled_event`]), so a
+/// restored id that names another object, or nothing, is refused before a handle to it is
+/// copied (module docs, "The applet").
 fn unsignalled_event_or_create(
     cx: &mut Context<'_>,
     slot: fn(&mut Applet) -> &mut Option<ObjectId>,
 ) -> Result<ObjectId, Fault> {
-    if let Some(event) = *slot(cx.family::<Applet>()?) {
-        cx.clear_event(event)?;
-        return Ok(event);
-    }
-    let event = cx.create_event()?;
+    let kept = *slot(cx.family::<Applet>()?);
+    let event = crate::events::unsignalled_event(cx, kept)?;
     *slot(cx.family::<Applet>()?) = Some(event);
     Ok(event)
 }
@@ -1414,6 +1673,12 @@ pub mod command {
         /// `appletSetRequestExitToLibraryAppletAtExecuteNextProgramEnabled` sends 900 to
         /// `ICommonStateGetter`. The scoping doc has no row for it.
         pub const SET_REQUEST_EXIT_TO_LIBRARY_APPLET_AT_EXECUTE_NEXT_PROGRAM_ENABLED: u32 = 900;
+        /// `{66, &ICommonStateGetter::SetCpuBoostMode, "SetCpuBoostMode"}`, the same row in
+        /// Eden @ cf654052, Eden-NX2 @ 50fa86bb and Eden PR #4588 @ e5fb3b97
+        /// (`src/core/hle/service/am/service/common_state_getter.cpp` in each); libnx
+        /// `appletSetCpuBoostMode` sends 66 to `ICommonStateGetter` with
+        /// `_appletCmdInU32NoOut`. The scoping doc has no row for it.
+        pub const SET_CPU_BOOST_MODE: u32 = 66;
     }
 
     /// `ISelfController`'s commands (`ISelfController::ISelfController`).
@@ -1441,6 +1706,18 @@ pub mod command {
         /// `{2000, &ISelfController::GetNx2GraphicsSystemSession, ..}`; `eden-nx2/NX2_NOTES.md`
         /// row 17 (observed).
         pub const GET_GRAPHICS_SUPERVISOR: u32 = 2000;
+        /// `{14, D<&ISelfController::SetRestartMessageEnabled>, "SetRestartMessageEnabled"}`,
+        /// the same row in Eden @ cf654052, Eden-NX2 @ 50fa86bb and Eden PR #4588 @ e5fb3b97
+        /// (`src/core/hle/service/am/service/self_controller.cpp` in each); libnx
+        /// `appletSetRestartMessageEnabled` sends 14 to `ISelfController` with
+        /// `_appletCmdInBoolNoOut`. The scoping doc has no row for it.
+        pub const SET_RESTART_MESSAGE_ENABLED: u32 = 14;
+        /// Switch 2, a fact of the PR #4588 fork only. Eden PR #4588
+        /// (`eden-pr4588/src/core/hle/service/am/service/self_controller.cpp` @ e5fb3b97, line
+        /// 84): `{2400, D<&ISelfController::SetRtcScreenSharingAudioEnabled>,
+        /// "SetRtcScreenSharingAudioEnabled"}`. Eden and Eden-NX2 have no row 2400, and the
+        /// scoping doc has no row for it.
+        pub const SET_RTC_SCREEN_SHARING_AUDIO_ENABLED: u32 = 2400;
     }
 
     /// `IWindowController`'s commands (`IWindowController::IWindowController`).
@@ -1484,6 +1761,17 @@ pub mod command {
         /// (`src/core/hle/service/am/service/application_functions.cpp` in each); their name.
         /// The scoping doc has no row for it.
         pub const UNKNOWN_330: u32 = 330;
+        /// `{21, D<&IApplicationFunctions::GetDesiredLanguage>, "GetDesiredLanguage"}`, the same
+        /// row in Eden @ cf654052, Eden-NX2 @ 50fa86bb and Eden PR #4588 @ e5fb3b97
+        /// (`src/core/hle/service/am/service/application_functions.cpp` in each); libnx
+        /// `appletGetDesiredLanguage` sends 21 to `IApplicationFunctions` with
+        /// `_appletCmdNoInOutU64`. The scoping doc has no row for it.
+        pub const GET_DESIRED_LANGUAGE: u32 = 21;
+        /// `{210, D<&IApplicationFunctions::GetUnknownEvent210>, "Unknown210"}`, line 117 of
+        /// `src/core/hle/service/am/service/application_functions.cpp` in Eden @ cf654052,
+        /// Eden-NX2 @ 50fa86bb and Eden PR #4588 @ e5fb3b97 alike; Eden's name. libnx has no
+        /// client for it, and the scoping doc has no row for it.
+        pub const GET_UNKNOWN_EVENT_210: u32 = 210;
     }
 
     /// `IGraphicsScalingParametersFunctions`' commands (Switch 2), from Eden PR #4588
@@ -1534,6 +1822,7 @@ commands! {
         common_state_getter::GET_OPERATION_MODE => get_operation_mode,
         common_state_getter::GET_PERFORMANCE_MODE => get_performance_mode,
         common_state_getter::GET_CURRENT_FOCUS_STATE => get_current_focus_state,
+        common_state_getter::SET_CPU_BOOST_MODE => set_cpu_boost_mode,
         common_state_getter::SET_REQUEST_EXIT_TO_LIBRARY_APPLET_AT_EXECUTE_NEXT_PROGRAM_ENABLED =>
             set_request_exit_to_library_applet_at_execute_next_program_enabled,
     }
@@ -1548,11 +1837,14 @@ commands! {
         self_controller::SET_PERFORMANCE_MODE_CHANGED_NOTIFICATION =>
             set_performance_mode_changed_notification,
         self_controller::SET_FOCUS_HANDLING_MODE => set_focus_handling_mode,
+        self_controller::SET_RESTART_MESSAGE_ENABLED => set_restart_message_enabled,
         self_controller::SET_OUT_OF_FOCUS_SUSPENDING_ENABLED =>
             set_out_of_focus_suspending_enabled,
         self_controller::GET_ACCUMULATED_SUSPENDED_TICK_CHANGED_EVENT =>
             get_accumulated_suspended_tick_changed_event,
         self_controller::GET_GRAPHICS_SUPERVISOR => get_graphics_supervisor,
+        self_controller::SET_RTC_SCREEN_SHARING_AUDIO_ENABLED =>
+            set_rtc_screen_sharing_audio_enabled,
     }
 }
 
@@ -1565,12 +1857,14 @@ commands! {
 
 commands! {
     impl IApplicationFunctions {
+        application_functions::GET_DESIRED_LANGUAGE => get_desired_language,
         application_functions::NOTIFY_RUNNING => notify_running,
         application_functions::IS_GAME_PLAY_RECORDING_SUPPORTED =>
             is_game_play_recording_supported,
         application_functions::SET_GAME_PLAY_RECORDING_STATE => set_game_play_recording_state,
         application_functions::GET_GPU_ERROR_DETECTED_SYSTEM_EVENT =>
             get_gpu_error_detected_system_event,
+        application_functions::GET_UNKNOWN_EVENT_210 => get_unknown_event_210,
         application_functions::GET_SCREEN_SHOT_AND_CONTINUOUS_RECORDING_INITIALLY_ENABLED =>
             get_screen_shot_and_continuous_recording_initially_enabled,
         application_functions::UNKNOWN_321 => unknown_321,
@@ -1816,6 +2110,34 @@ impl ICommonStateGetter {
         reply.ok()
     }
 
+    /// `SetCpuBoostMode`. in: `u32` mode. out: nothing. Always success, as Eden's (`APM_Sys::
+    /// SetCpuBoostMode` answers `ResultSuccess` whatever the mode). The mode is checked as
+    /// Eden's `Controller::SetFromCpuBoostMode` checks it ([`CpuBoostMode::from_raw`]), which
+    /// changes only what is logged: Eden records a performance configuration for a mode it
+    /// accepts, which nothing here keeps (module docs, "The title's later start-up commands"),
+    /// and for a word that is not a mode only logs it (`LOG_ERROR(Service_APM, "{} invalid
+    /// mode", mode)`, `eden/src/core/hle/service/apm/apm_controller.cpp` @ cf654052,
+    /// `Controller::SetFromCpuBoostMode`). The branch below is log-only: neither the reply nor
+    /// any state depends on it, and no test captures the log, so a mutation that swaps or
+    /// deletes it is equivalent under the tests.
+    fn set_cpu_boost_mode(
+        _: &mut Self,
+        _cx: &mut Context<'_>,
+        req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        let mode = req.payload().read_u32()?;
+        if CpuBoostMode::from_raw(mode).is_some() {
+            tracing::debug!(mode, "appletOE: SetCpuBoostMode");
+        } else {
+            tracing::warn!(
+                mode,
+                "appletOE: SetCpuBoostMode with a word that is not a mode"
+            );
+        }
+        reply.ok()
+    }
+
     /// `GetOperationMode`. out: `u8` operation mode.
     fn get_operation_mode(
         _: &mut Self,
@@ -1966,6 +2288,36 @@ impl ISelfController {
         reply.ok()
     }
 
+    /// `SetRestartMessageEnabled`. in: `bool` enabled, kept in the applet
+    /// ([`Applet::resume_notification_enabled`]). out: nothing. Eden:
+    /// `lifecycle_manager.SetResumeNotificationEnabled(enabled)`, which only sets the flag: it
+    /// does not call `SignalSystemEventIfNeeded`, and the flag is not a term of whether a
+    /// message is available, so the message event is not touched.
+    fn set_restart_message_enabled(
+        _: &mut Self,
+        cx: &mut Context<'_>,
+        req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        let enabled = read_flag(&mut req.payload())?;
+        cx.family::<Applet>()?.resume_notification_enabled = enabled;
+        reply.ok()
+    }
+
+    /// `SetRtcScreenSharingAudioEnabled` (Switch 2). in: `bool` enabled, not kept. out:
+    /// nothing. PR #4588 only logs it ("SDK 23.0 serializes this command as one bool input
+    /// with no output payload").
+    fn set_rtc_screen_sharing_audio_enabled(
+        _: &mut Self,
+        _cx: &mut Context<'_>,
+        req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        let enabled = read_flag(&mut req.payload())?;
+        tracing::debug!(enabled, "appletOE: SetRtcScreenSharingAudioEnabled");
+        reply.ok()
+    }
+
     /// `GetGraphicsSupervisor` (Switch 2). out: a copy handle to a new session on the graphics
     /// server's root (module docs, "The graphics server").
     fn get_graphics_supervisor(
@@ -2017,6 +2369,28 @@ impl IApplicationFunctions {
     ) -> Outcome {
         reply.payload().write_u8(u8::from(true));
         reply.ok()
+    }
+
+    /// `GetDesiredLanguage`. out: `u64` language code, [`DESIRED_LANGUAGE_CODE`].
+    fn get_desired_language(
+        _: &mut Self,
+        _cx: &mut Context<'_>,
+        _req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        reply.payload().write_u64(DESIRED_LANGUAGE_CODE);
+        reply.ok()
+    }
+
+    /// `GetUnknownEvent210`. out: a copy handle to the applet's unknown event (Eden: `*out_event
+    /// = m_applet->unknown_event.GetHandle()`), made the first time and never signalled.
+    fn get_unknown_event_210(
+        _: &mut Self,
+        cx: &mut Context<'_>,
+        _req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        reply_with_applet_event(cx, reply, Applet::unknown_event_or_create)
     }
 
     /// `IsGamePlayRecordingSupported`. out: `bool`, [`GAME_PLAY_RECORDING_SUPPORTED`] (Eden PR
