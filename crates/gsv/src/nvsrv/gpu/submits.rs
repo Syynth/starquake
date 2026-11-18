@@ -180,15 +180,17 @@ impl Queue {
 /// the cap (module docs, "The cap").
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
 #[error(
-    "GPU channel {channel} has {waiting} entries waiting, and {entries} more would pass the cap of {MAX_WAITING_ENTRIES}"
+    "GPU channel {channel}'s waiting submissions count {charged} entries against the cap of {MAX_WAITING_ENTRIES}, and a submission of {entries} entries, counted as {charge}, would pass it"
 )]
 pub struct OverCap {
     /// The GPU channel.
     pub channel: u32,
-    /// What its waiting submissions count against the cap.
-    pub waiting: usize,
+    /// What its waiting submissions count against the cap: the sum of each one's [`charge`].
+    pub charged: usize,
     /// The refused submission's entries.
     pub entries: usize,
+    /// What the refused submission counts against the cap: [`charge`] of its entries.
+    pub charge: usize,
 }
 
 /// The submissions that wait for room, by channel, oldest first (module docs, "The table").
@@ -299,8 +301,9 @@ impl Submits {
             }
             return Err(OverCap {
                 channel: channel.0,
-                waiting: self.waiting_entries(channel),
+                charged: self.waiting_entries(channel),
                 entries,
+                charge: charge(entries),
             });
         }
         self.waiting.entry(channel).or_default().push_back(Waiting {

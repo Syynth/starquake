@@ -1278,8 +1278,24 @@ impl Live {
         let count = u32::try_from(entries.len()).unwrap();
         let input = submit_struct(count, flags, id, value);
         let inline = entry_bytes(entries);
-        let input_at = self.rig.place(&input);
         let inline_at = self.rig.place(&inline);
+        let (handled, buffer) =
+            self.kickoff_at(session, fd, &input, (inline_at, inline.len()), out_at);
+        (handled, buffer, out_at)
+    }
+
+    /// `SubmitGPFIFO` 0x1B through `Ioctl2` on `session` and `fd` with `input`, in buffer 1 of
+    /// `inline_len` bytes at `inline_at`, and a 24-byte out buffer at `out_at`; neither need be
+    /// mapped. How it was handled, and the message buffer.
+    fn kickoff_at(
+        &mut self,
+        session: ObjectId,
+        fd: i32,
+        input: &[u8],
+        (inline_at, inline_len): (u64, usize),
+        out_at: u64,
+    ) -> (Handled, Vec<u8>) {
+        let input_at = self.rig.place(input);
         let request = cmif(IOCTL2, &fd_and(fd, KICKOFF));
         let request = Auto::alias(input_at, len16(input.len())).send(request, 0);
         // In buffer 1 as `Auto::alias(..).send(request, 1)` writes it, with a length that may
@@ -1287,7 +1303,7 @@ impl Live {
         let request = request
             .send_buffer(starquake_ipc::BufferDescriptor {
                 address: inline_at,
-                size: u64::try_from(inline.len()).unwrap(),
+                size: u64::try_from(inline_len).unwrap(),
                 flags: 0,
             })
             .static_descriptor(starquake_ipc::StaticDescriptor {
@@ -1303,7 +1319,7 @@ impl Live {
             .server
             .handle(&mut self.rig.kernel, session, &mut buffer)
             .unwrap();
-        (handled, buffer, out_at)
+        (handled, buffer)
     }
 
     /// Pushes room for `channel` and runs the timer thread's drain; what it recorded.
@@ -2742,8 +2758,9 @@ fn the_cap_is_each_channel_s() {
 }
 
 /// Each check before the cap answers first when both faults are present: with the channel at
-/// the cap, a count above the entries sent is `InvalidSize`; bits 0 and 8, an overflowing
-/// increment, and a wait on no syncpoint are `BadParameter`; and nothing is raised.
+/// the cap, a count above the entries sent (check 1) and a count above a queue's entries
+/// (check 2) are `InvalidSize`; bits 0 and 8, an overflowing increment, and a wait on no
+/// syncpoint (checks 3 to 5) are `BadParameter`; and nothing is raised.
 #[test]
 fn the_checks_before_the_cap_answer_first() {
     let mut bench = Bench::new();
@@ -2751,11 +2768,17 @@ fn the_checks_before_the_cap_answer_first() {
     bench.fake.hold(channel, CHANNEL_QUEUE_ENTRIES);
     wait_with(&mut bench, fd, MAX_WAITING_ENTRIES);
     let before = bench.syncpoints.fence(syncpoint).unwrap();
-    // Count 2 with one entry sent.
+    // Check 1: count 2 with one entry sent.
     let mut input = submit_struct(2, 0, 0, 0);
     input.extend(entry_bytes(&entries_from(1, 1)));
     let (answer, _) = bench.call(IoctlVariant::Ioctl, fd, submit_number(1), &input, &[]);
     assert_eq!(answer.result, NvResult::InvalidSize);
+    // Check 2: one entry more than a queue holds, all of them sent.
+    let over = entries_from(1, CHANNEL_QUEUE_ENTRIES + 1);
+    let count = u32::try_from(over.len()).unwrap();
+    let (answer, deferral) = bench.kickoff(fd, count, &entry_bytes(&over), 0);
+    assert_eq!((answer.result, deferral), (NvResult::InvalidSize, None));
+    assert_eq!(bench.submits.waiting_entries(channel), MAX_WAITING_ENTRIES);
     let no_syncpoint = SYNCPOINT_COUNT;
     let faults = [
         (FENCE_WAIT | INCREMENT_VALUE, (0, 0)),
@@ -2812,8 +2835,9 @@ fn a_push_past_the_cap_is_refused() {
             .push(channel, token, submission(2), Arc::clone(&front));
     let over = OverCap {
         channel: channel.0,
-        waiting: MAX_WAITING_ENTRIES - 1,
+        charged: MAX_WAITING_ENTRIES - 1,
         entries: 2,
+        charge: 2,
     };
     assert_eq!(refused, Err(over));
     assert_eq!(live.deliver(), [(session, ok(&[NvResult::Busy.raw()]))]);
@@ -2837,25 +2861,44 @@ fn a_push_past_the_cap_is_refused() {
         .push(channel, None, submission(0), front);
     let over = OverCap {
         channel: channel.0,
-        waiting: MAX_WAITING_ENTRIES,
+        charged: MAX_WAITING_ENTRIES,
         entries: 0,
+        charge: charge(0),
     };
     assert_eq!(refused, Err(over));
     assert_eq!(live.waiting(channel), 2);
 }
 
+/// The refusal names what the channel's waiting submissions count, and the refused
+/// submission's entries and what they count, also for a submission with no entries.
 #[test]
 fn a_push_past_the_cap_is_said_in_plain_words() {
     let over = OverCap {
         channel: 0x30,
-        waiting: 7,
+        charged: 7,
         entries: 2,
+        charge: 3,
     };
     assert_eq!(
         over.to_string(),
         format!(
-            "GPU channel 48 has 7 entries waiting, and 2 more would pass the cap of \
-             {MAX_WAITING_ENTRIES}"
+            "GPU channel 48's waiting submissions count 7 entries against the cap of \
+             {MAX_WAITING_ENTRIES}, and a submission of 2 entries, counted as 3, would pass it"
+        )
+    );
+    let empty = OverCap {
+        channel: 0x31,
+        charged: MAX_WAITING_ENTRIES,
+        entries: 0,
+        charge: charge(0),
+    };
+    let one = charge(0);
+    assert_eq!(
+        empty.to_string(),
+        format!(
+            "GPU channel 49's waiting submissions count {MAX_WAITING_ENTRIES} entries against \
+             the cap of {MAX_WAITING_ENTRIES}, and a submission of 0 entries, counted as {one}, \
+             would pass it"
         )
     );
 }
@@ -2956,6 +2999,44 @@ fn closing_a_channel_destroys_it_before_the_space_it_held() {
             .all(|&call| call == Logged::Update(space)),
         "{logged:?}"
     );
+}
+
+// ----- Whose inline input is read ---------------------------------------------------------------
+
+/// With a channel front present, `Ioctl2` 0x1B reads its inline input only on an nvhost-gpu fd.
+/// On an nvmap fd and on a closed fd, in buffer 1 lies where nothing is mapped and is not read:
+/// the request answers what the fd gives (the strict policy's `NotImplemented` for nvmap,
+/// `NvsrvState::file`'s `NotImplemented` for the closed fd) and its out buffer is untouched. On
+/// the channel fd the same buffer is read, and the request answers the kernel's fault.
+#[test]
+fn inline_input_is_read_only_on_a_channel_fd() {
+    let mut live = Live::new();
+    let channel_fd = live.channel();
+    let nvmap = live.rig.open_device(Device::Nvmap);
+    let closed = live.rig.open_device(Device::NvhostGpu);
+    let reply = answer(&live.rig.send(&cmif(CLOSE, &closed.to_le_bytes())), 1);
+    assert_eq!(reply, ok(&[NvResult::Success.raw()]));
+    let session = live.session();
+    let input = submit_struct(1, 0, 0, 0);
+    // The address the out-buffer tests use: nothing is mapped there.
+    let inline = (UNMAPPED_OUT, entry_bytes(&entries_from(1, 1)).len());
+    for fd in [nvmap, closed] {
+        let out_at = live.rig.place(&[STALE; 24]);
+        let (handled, buffer) = live.kickoff_at(session, fd, &input, inline, out_at);
+        assert_eq!(handled, Handled::Replied, "fd {fd}");
+        assert_eq!(
+            answer(&buffer, 1),
+            ok(&[NvResult::NotImplemented.raw()]),
+            "fd {fd}"
+        );
+        assert_eq!(live.rig.memory(out_at, 24), vec![STALE; 24], "fd {fd}");
+    }
+    assert_eq!(live.fake.queued(), []);
+    let out_at = live.rig.place(&[STALE; 24]);
+    let (handled, buffer) = live.kickoff_at(session, channel_fd, &input, inline, out_at);
+    assert_eq!(handled, Handled::Replied);
+    assert_ne!(answer(&buffer, 0).result, ResultCode::SUCCESS.raw());
+    assert_eq!(live.fake.queued(), []);
 }
 
 // ----- What a whole queue's inline submission reads --------------------------------------------
