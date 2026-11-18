@@ -124,8 +124,10 @@
 //!   the saved list.
 //!
 //! The round trips `a_live_kernel_saves_restores_and_saves_the_same_bytes` and
-//! `a_space_held_by_a_lend_and_handles_of_every_kind_round_trip` (in `object/snapshot/tests.rs`)
-//! save live tables with every object kind.
+//! `a_space_held_by_a_lend_and_handles_of_every_kind_round_trip_with_a_second_process` (in
+//! `object/snapshot/tests.rs`) save live tables with every object kind, and
+//! `tables_built_by_random_operations_save_and_restore_as_they_were` saves and restores after
+//! each of random events, lends, signals, second handles and closes.
 //!
 //! # Not checked here
 //!

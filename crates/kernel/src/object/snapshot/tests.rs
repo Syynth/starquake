@@ -1459,3 +1459,220 @@ fn the_errors_read_as_plain_words() {
          locked page at 0x5000 is lent to no transfer memory and is no alias's source"
     );
 }
+
+#[test]
+fn the_first_stale_handle_is_found_in_process_order() {
+    // A stale handle in each process's table: the own process's comes first, whichever slot
+    // its object has.
+    let mut kernel = kernel();
+    let second = second_process(&mut kernel);
+    let own = kernel.own();
+    let bytes = second.save(&kernel).unwrap();
+    let mut body: Body = decode(FORMAT, &bytes).unwrap();
+    let (handle, session) = kernel.session;
+    body.objects.remove(session).unwrap();
+    body.objects.remove(second.transfer).unwrap();
+    let restore = |body: &Body| second.restore(&kernel, &encode(FORMAT, body).unwrap());
+    assert_eq!(
+        restore(&body).unwrap_err(),
+        ObjectSnapshotError::Handle {
+            process: own,
+            handle,
+            fault: HandleFault::Stale
+        }
+    );
+    // With the own one sound, the second's.
+    let mut body: Body = decode(FORMAT, &bytes).unwrap();
+    body.objects.remove(second.transfer).unwrap();
+    assert_eq!(
+        restore(&body).unwrap_err(),
+        ObjectSnapshotError::Handle {
+            process: second.process,
+            handle: second.handles.handles()[0],
+            fault: HandleFault::Stale
+        }
+    );
+}
+
+/// One live operation on a started process, its operands picks among what exists.
+#[derive(Debug, Clone)]
+enum LiveOp {
+    /// `CreateEvent`: a handle to each end, the creator's references closed.
+    Event,
+    /// Closes the handle this picks, and unlocks a transfer memory that goes with it.
+    Close(usize),
+    /// `CreateTransferMemory` of `n` heap pages from page `at`, keeping the permission this
+    /// picks.
+    Lend(u64, u64, usize),
+    /// Signals the object the handle this picks names, if it is an event.
+    Signal(usize),
+    /// A second handle to the object the handle this picks names.
+    Duplicate(usize),
+}
+
+fn any_live_op() -> impl Strategy<Value = LiveOp> {
+    prop_oneof![
+        Just(LiveOp::Event),
+        any::<usize>().prop_map(LiveOp::Close),
+        (0_u64..8, 1_u64..4, 0_usize..3).prop_map(|(at, n, keep)| LiveOp::Lend(at, n, keep)),
+        any::<usize>().prop_map(LiveOp::Signal),
+        any::<usize>().prop_map(LiveOp::Duplicate),
+    ]
+}
+
+/// The fixture's process, started, with eight pages of heap: its tables and the heap's start.
+fn started() -> (Tables, u64) {
+    let (space, _log, stack_top) = fixture::loaded();
+    let mut tables =
+        process::create(&ProcessDescription::homebrew(Console::Switch2), space).unwrap();
+    let tls = tables.address_space.regions().kernel_map.start + GUARD_PAGES * PAGE_SIZE;
+    let memory = FlatMemory::new(tls, usize::try_from(PAGE_SIZE).unwrap());
+    process::run(&mut tables, &memory, ENTRY, stack_top).unwrap();
+    let heap = tables.address_space.set_heap_size(8 * PAGE_SIZE).unwrap();
+    (tables, heap)
+}
+
+/// Applies `op` to `tables`. Refusals are part of the run; the main thread's handle is never
+/// closed (closing the last handle to a running thread is the thread table's business).
+fn apply_live(tables: &mut Tables, heap: u64, op: &LiveOp) {
+    let own = tables.processes.own();
+    let handles: Vec<Handle> = tables.handles.handles();
+    let pick = |n: usize| handles.get(n % handles.len().max(1)).copied();
+    match *op {
+        LiveOp::Event => {
+            if let Ok((writable, readable)) = tables.scheduler.create_event() {
+                for end in [writable, readable] {
+                    let _added = tables.handles.add(tables.scheduler.objects_mut(), end);
+                    tables.scheduler.close_object(end).unwrap();
+                }
+            }
+        }
+        LiveOp::Close(n) => {
+            // The main thread's handle stays.
+            let thread = |handle: &Handle| {
+                let object = tables.handles.get(*handle);
+                matches!(
+                    object.map(|object| tables.scheduler.objects().get(object)),
+                    Ok(Ok(Object::Thread(_)))
+                )
+            };
+            if let Some(handle) = pick(n).filter(|handle| !thread(handle)) {
+                tables
+                    .handles
+                    .remove(tables.scheduler.objects_mut(), handle)
+                    .unwrap();
+                unlock_released(&mut tables.scheduler, &mut tables.address_space, own).unwrap();
+            }
+        }
+        LiveOp::Lend(at, n, keep) => {
+            let keeps = [
+                SvcPermission::None,
+                SvcPermission::Read,
+                SvcPermission::ReadWrite,
+            ];
+            let Tables {
+                handles,
+                address_space,
+                scheduler,
+                ..
+            } = tables;
+            let _lent = create_transfer_memory(
+                handles,
+                address_space,
+                scheduler,
+                own,
+                heap + at * PAGE_SIZE,
+                n * PAGE_SIZE,
+                u32::from(keeps[keep % keeps.len()].bits()),
+            );
+        }
+        LiveOp::Signal(n) => {
+            if let Some(object) = pick(n).and_then(|handle| tables.handles.get(handle).ok()) {
+                let _signalled = tables.scheduler.signal_object(object);
+            }
+        }
+        LiveOp::Duplicate(n) => {
+            if let Some(object) = pick(n).and_then(|handle| tables.handles.get(handle).ok()) {
+                let _added = tables.handles.add(tables.scheduler.objects_mut(), object);
+            }
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(config(96))]
+
+    /// Random live operations on a started process: after each, its tables save, restore as
+    /// they were, and save again to the same bytes.
+    #[test]
+    fn tables_built_by_random_operations_save_and_restore_as_they_were(
+        ops in prop::collection::vec(any_live_op(), 1..24)
+    ) {
+        let (mut tables, heap) = started();
+        for op in &ops {
+            apply_live(&mut tables, heap, op);
+            let own = tables.processes.own();
+            let objects = tables.scheduler.objects();
+            let save = |objects: &Objects, handles: &HandleTable| {
+                objects.save(
+                    &[(own, handles)],
+                    &[],
+                    &tables.scheduler,
+                    &[(own, &tables.address_space)],
+                )
+            };
+            let bytes = save(objects, &tables.handles);
+            prop_assert!(bytes.is_ok(), "save after {:?}: {:?}", op, bytes);
+            let bytes = bytes.unwrap_or_default();
+            let restored = Objects::restore(&bytes, &tables.scheduler)
+                .and_then(|pending| pending.finish(&[(own, &tables.address_space)]));
+            prop_assert!(restored.is_ok(), "restore after {:?}: {:?}", op, restored);
+            if let Ok(restored) = restored {
+                prop_assert_eq!(&restored.objects, objects);
+                prop_assert_eq!(&restored.handles[0].1, &tables.handles);
+                prop_assert_eq!(save(&restored.objects, &restored.handles[0].1), Ok(bytes));
+            }
+        }
+    }
+}
+
+#[test]
+fn the_random_operations_reach_lends_signals_and_shared_handles() {
+    // A fixed sequence of the generated kind, so the property test is known to reach two lends
+    // and one of them closed, a signalled event and an object with two handles. Picks count
+    // the handles lowest index first, and the table hands out its highest index first: after
+    // the event, the readable end, the writable end, the second lend, the first, the thread.
+    let (mut tables, heap) = started();
+    for op in [
+        LiveOp::Lend(0, 2, 1),
+        LiveOp::Lend(2, 1, 0),
+        LiveOp::Event,
+        LiveOp::Signal(0),
+        LiveOp::Duplicate(1),
+        LiveOp::Close(3),
+    ] {
+        apply_live(&mut tables, heap, &op);
+    }
+    let kinds: Vec<&str> = tables
+        .handles
+        .entries()
+        .map(|(_, object)| match tables.scheduler.objects().get(object) {
+            Ok(Object::Thread(_)) => "thread",
+            Ok(Object::Event(_)) => "event",
+            Ok(Object::ReadableEvent(state)) if state.is_signalled() => "signalled",
+            Ok(Object::ReadableEvent(_)) => "readable",
+            Ok(Object::TransferMemory(_)) => "lend",
+            other => unreachable!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(kinds, ["event", "signalled", "event", "lend", "thread"]);
+    // The second lend's page was given back; the first's are still lent.
+    let locked = |page: u64| {
+        let block = tables
+            .address_space
+            .query_info(heap + page * PAGE_SIZE)
+            .unwrap();
+        block.attribute().contains(MemoryAttribute::LOCKED)
+    };
+    assert_eq!((locked(0), locked(1), locked(2)), (true, true, false));
+}
