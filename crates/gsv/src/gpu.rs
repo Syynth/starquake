@@ -6,6 +6,7 @@
 //! * [`memory`]: the bookkeeping ([`GpuMemory`]), its checks, and what the table shows.
 //! * [`kind`]: which page-table kind a request gets.
 //! * [`saved`]: the bookkeeping's snapshot.
+//! * [`sparse_map`]: 216's 40-byte entries and their decoding.
 //!
 //! Ported from Eden PR #4588, `eden-pr4588/src/core/hle/service/am/service/gpu_session.cpp`,
 //! `gpu_session.h` and `gpu_memory_registration.h` @ e5fb3b97 (`IGpuSession`, `IGpuWorker`), and
@@ -67,14 +68,17 @@
 //! | 213 | `NormalUnmapGpuMemory4K` | space 2, first 3–4, last 5–6, sync 7, slot 8 | `u64` bytes unmapped | in order |
 //! | 214 | `CreateSparseRegion` | space 2, first 3–4, last 5–6, page shift 7, mode 8, device 9, sync 10, slot 11 | nothing | at once |
 //! | 215 | `DestroySparseRegion` | as 213 | nothing | in order |
+//! | 216 | `ExecuteSparseMapRequests` | an A descriptor (the entries) and a B descriptor (the selected kinds), then count 8–9, space 10, entry size 11–12, sync 13, slot 14 | `u64` entries processed | at once, or in order if it takes something out |
 //!
 //! Sources: rows 27, 40, 42 (101, 211), 68 (102, 213), 57, 80, 85 (214, 215), 149 (212), all
 //! observed; the fields are PR's (`DecodeGpuMemoryRegistration`, `MapMemory`,
 //! `NormalModifyGpuMemory4K`, `NormalUnmapGpuMemory4K`, `DecodeGpuSparseRegion`,
 //! `DestroySparseRegion`'s comment). The reply shapes of 211 and 213 are a **conflict**: PR's
 //! (the selected kind, the bytes unmapped) are used, NX2 replies with the result only (spec,
-//! "verify"). 216 (`ExecuteSparseMapRequests`) is not served yet: it goes to the server's
-//! unknown-command policy (see "Not built").
+//! "verify"). 216 is PR's alone (read; NX2 does not serve it): its words are
+//! `ExecuteSparseMapRequests`'s (`ReadPair(packet, 8)`, `packet[10]`, `ReadPair(packet, 11)`,
+//! `packet[13] & 0xff`, `packet[14]`, after the descriptors its `packet[0] == 0x011000e8` names),
+//! its entries `GpuSparseMapRequest`'s ([`sparse_map`]).
 //!
 //! **Checks, in order.** Each list is PR's order; the first failing check answers.
 //!
@@ -111,16 +115,30 @@
 //!   shift of 16, a mode over 1 or sync over 1, `NotImplemented`; more than `u32::MAX` pages, a
 //!   range outside NVN's window, or one overlapping another sparse region or a 211 mapping of
 //!   the address space, `InvalidCurrentMemory`; no room, `OutOfResource`.
+//! - 216: a descriptor count other than one A and one B, or too few data words, is the
+//!   framework's `INVALID_CMIF_REQUEST`, nothing signalled. Then, signalled at once on every
+//!   refusal if the slot has an event: a count of 0 or over [`sparse_map::MAX_ENTRIES`], or an
+//!   entry size other than [`sparse_map::ENTRY_SIZE`], `InvalidSize`; sync over 1,
+//!   `NotImplemented`; no such address space or no event at the slot, `NotFound` (PR's one
+//!   `R_UNLESS`; with no event, nothing is signalled); an in buffer that is not exactly the
+//!   entries' bytes or an out buffer of fewer bytes than entries, `InvalidSize`; then the
+//!   batch's checks ([`GpuMemory::check_sparse_map`]: each entry's decoding, `NotImplemented`,
+//!   and handle, `NotFound`, entry by entry; then each entry's place in one sparse region, its
+//!   source inside its registration and its kinds, then the address space's pieces,
+//!   `InvalidCurrentMemory`; then room for a job if the batch takes something out, `Busy`);
+//!   last, the write of the selected kinds to the out buffer, whose error passes through. The
+//!   batch changes nothing before that write succeeds (`an_unwritable_out_buffer_changes_nothing`,
+//!   in `gpu/tests/sparse_map.rs`).
 //!
 //! **Completion.** A job that completes at once signals its slot's event during the request. An
-//! ordered job (102, 212, 213, 215) changes the bookkeeping during the request, sends the GPU
-//! its updates and a barrier ([`GpuVmFront::update_vm`], [`GpuVmFront::barrier`]), and replies;
-//! its event is signalled only when the barrier's ticket comes back through the completion
-//! queue and the timer thread's drain takes it (`crate::shared::Shared::drain`). A 102's
-//! device-share lock is released then, by the drain, before the event is signalled, so a title
-//! that reuses the memory once the event fires finds it unlocked (the owner's ruling of
-//! 2026-11-17: the release goes through the completion queue's drain, in its recorded order).
-//! Row 68: NX2 crashed when 102 and 213 completed at once.
+//! ordered job (102, 212, 213, 215, and a 216 that takes something out) changes the bookkeeping
+//! during the request, sends the GPU its updates and a barrier ([`GpuVmFront::update_vm`],
+//! [`GpuVmFront::barrier`]), and replies; its event is signalled only when the barrier's ticket
+//! comes back through the completion queue and the timer thread's drain takes it
+//! (`crate::shared::Shared::drain`). A 102's device-share lock is released then, by the drain,
+//! before the event is signalled, so a title that reuses the memory once the event fires finds it
+//! unlocked (the owner's ruling of 2026-11-17: the release goes through the completion queue's
+//! drain, in its recorded order). Row 68: NX2 crashed when 102 and 213 completed at once.
 //!
 //! # The model
 //!
@@ -128,6 +146,8 @@
 //! address in every address space (decision 5; rows 30 and 68: "every address space"), a 211
 //! maps part of one at a GPU address, a 214 maps GPU-only pages, and a range shows the top layer
 //! the bookkeeping holds there. A 102 takes its registration out with every 211 mapping of it.
+//! A 216 batch maps parts of registrations inside sparse regions, as 211 mappings, or puts a
+//! region's own pages back under them ([`memory`]'s `sparse` module docs).
 //!
 //! # Conflicts
 //!
@@ -170,7 +190,11 @@
 //! | 212, 213 and 215's completion | at once | 213 and 215 after the GPU, 212 at once | all three after the GPU's barrier (`an_unmap_s_event_fires_only_after_the_barrier`) |
 //! | A 214 overlapping a registration's own mapping | no such mapping | replaces it | allowed: the region is under it (`a_sparse_region_lies_under_a_registration`) |
 //! | A 215 of a region with 211 mappings inside | none lie there: `MapNative4K` refuses a 211 over a region's allocation | trims them: `SubDestroySparseRegion` calls `Nx2GpuMemoryRegistry::Unmap(first, last - first + 1)`, whose `TrimMappings` drops every mapping in the range (`eden-nx2/src/core/hle/service/nvdrv/devices/nx2_stub_device.h`) | they stay in the bookkeeping, and show again once the destroy is done (`a_sparse_region_is_destroyed_in_order`) |
-//! | 216 | served | not served | not served yet (`sparse_map_requests_go_to_the_policy`) |
+//! | 216 | served | not served | served, as PR (`gpu/tests/sparse_map.rs`) |
+//! | 216 with descriptors other than one A and one B | `InvalidCombination`, the slot's event signalled | not served | `INVALID_CMIF_REQUEST` from the framework, nothing signalled (`a_malformed_request_is_refused_unsignalled`) |
+//! | 216's completion | signals at once | not served | at once if it takes nothing out; otherwise after the GPU's barrier, its removals held as a 213's are (`an_entry_with_no_handle_completes_in_order`) |
+//! | 216 with no room for a job | no such check | not served | `Busy` if the batch takes something out (`a_batch_that_takes_out_is_busy_at_the_job_limit`) |
+//! | 216's piece bound | over 65536 native sparse ranges, `InvalidCurrentMemory` | not served | over [`memory::MAX_PIECES`] pieces of every kind, `InvalidCurrentMemory` (`a_batch_is_bounded_at_the_piece_limit`) |
 //! | 201 to 203 | 202 and 203 check the address space (PR's numbering) | no checks | NX2's replies, no checks (`partition_replies_are_nx2_s`) |
 //!
 //! # Bounds
@@ -179,7 +203,9 @@
 //! (registrations, sparse regions and runs of one kind of 211 mappings, counted together; a
 //! request that would pass it is `OutOfResource`, pinned at the edge by
 //! `pieces_are_bounded_at_the_limit`), [`memory::MAX_ADDRESS_SPACES`], [`memory::DEVICE_SLOTS`],
-//! [`NOTIFICATION_COUNT`] and [`memory::MAX_PENDING_JOBS`] (`Busy`). Each translation table holds
+//! [`NOTIFICATION_COUNT`] and [`memory::MAX_PENDING_JOBS`] (`Busy`). A 216 batch is at most
+//! [`sparse_map::MAX_ENTRIES`] entries, and the bound on pieces holds for the whole batch
+//! applied (`a_batch_is_bounded_at_the_piece_limit`). Each translation table holds
 //! at most three entries per piece (a map splits at most two older entries).
 //!
 //! The time a publish takes is one sweep of the pieces in the span it writes, not one per range:
@@ -197,15 +223,13 @@
 //!
 //! # Not built
 //!
-//! - 216 `ExecuteSparseMapRequests` (PR only, read): a batch of 40-byte entries in a buffer that
-//!   map memory into sparse regions. The model it needs is here (a 211 inside a sparse region);
-//!   its decoding is not.
 //! - Root 434 (`RegisterGpuAddressSpace`), which PR requires before a worker job may name an
 //!   address space.
 
 pub mod kind;
 pub mod memory;
 pub mod saved;
+pub mod sparse_map;
 
 #[cfg(test)]
 mod tests;
@@ -226,9 +250,10 @@ use starquake_services::framework::{
 use crate::shared::Shared;
 pub use memory::GpuMemory;
 use memory::{
-    Device, MapRequest, ModifyRequest, RangeRequest, RegisterRequest, SparseRequest, VA_WINDOW_END,
-    VA_WINDOW_START,
+    Device, MapRequest, ModifyRequest, RangeRequest, RegisterRequest, SparseCompletion,
+    SparseRequest, VA_WINDOW_END, VA_WINDOW_START,
 };
+use sparse_map::{ENTRY_SIZE, MAX_ENTRIES, SparseMapRequest};
 
 /// The name of the gpu family's server, for logs. Starquake's own: the server is reached only
 /// through root 497, never by name.
@@ -274,16 +299,16 @@ pub mod command {
     pub const CREATE_SPARSE_REGION: u32 = 214;
     /// `DestroySparseRegion`.
     pub const DESTROY_SPARSE_REGION: u32 = 215;
-    /// `ExecuteSparseMapRequests` (not served yet).
+    /// `ExecuteSparseMapRequests`.
     pub const EXECUTE_SPARSE_MAP_REQUESTS: u32 = 216;
 }
 
 use command::{
     ACQUIRE_WORKER, CREATE_ADDRESS_SPACE, CREATE_GPU_ACCESSIBLE_MEMORY, CREATE_GRAPHICS_DEVICE,
     CREATE_SPARSE_REGION, DESTROY_GPU_ACCESSIBLE_MEMORY, DESTROY_GRAPHICS_DEVICE,
-    DESTROY_SPARSE_REGION, GET_GSV_PARTITION, GET_NOTIFICATION_EVENT, GET_NOTIFICATION_RANGE,
-    GET_USER_PARTITION, GET_VA_RANGE, NORMAL_MAP_GPU_MEMORY_4K, NORMAL_MODIFY_MEMORY_KIND_4K,
-    NORMAL_UNMAP_GPU_MEMORY_4K, REQUEST_WORKER,
+    DESTROY_SPARSE_REGION, EXECUTE_SPARSE_MAP_REQUESTS, GET_GSV_PARTITION, GET_NOTIFICATION_EVENT,
+    GET_NOTIFICATION_RANGE, GET_USER_PARTITION, GET_VA_RANGE, NORMAL_MAP_GPU_MEMORY_4K,
+    NORMAL_MODIFY_MEMORY_KIND_4K, NORMAL_UNMAP_GPU_MEMORY_4K, REQUEST_WORKER,
 };
 
 /// NX2's `GetVaRange` kind word (`constexpr u64 kind = 1`).
@@ -403,6 +428,7 @@ commands! {
         NORMAL_UNMAP_GPU_MEMORY_4K => normal_unmap_gpu_memory_4k,
         CREATE_SPARSE_REGION => create_sparse_region,
         DESTROY_SPARSE_REGION => destroy_sparse_region,
+        EXECUTE_SPARSE_MAP_REQUESTS => execute_sparse_map_requests [In(MapAlias), Out(MapAlias)],
     }
 }
 
@@ -770,6 +796,38 @@ impl GpuWorker {
         reply.ok()
     }
 
+    /// Command 216: Words: count 8–9, space 10, entry size 11–12, sync 13, slot 14 (after an A
+    /// and a B descriptor); in buffer: the entries; out buffer: a selected kind per entry. out:
+    /// `u64` entries processed. Completes at once, or in order if it takes something out.
+    fn execute_sparse_map_requests(
+        _: &mut Self,
+        cx: &mut Context<'_>,
+        req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        let mut words = req.payload();
+        let header = SparseMapHeader {
+            count: words.read_u64()?,
+            space: AsId(words.read_u32()?),
+            entry_size: words.read_u64()?,
+            sync: low_byte(words.read_u32()?),
+        };
+        let slot = words.read_u32()?;
+        with_gpu(cx, |cx, gpu, front| {
+            let event = gpu.notification_event(slot);
+            let completion = sparse_map(cx, req, gpu, front, &header, event);
+            // PR signals the slot's event whatever the result; an ordered batch's, at its drain.
+            if let Some(event) = event
+                && !matches!(completion, Ok(SparseCompletion::Ordered(_)))
+            {
+                cx.signal_event(event)?;
+            }
+            completion.map(|_| ())
+        })?;
+        reply.payload().write_u64(header.count);
+        reply.ok()
+    }
+
     /// Command 215: Words: as 213. Completes in order.
     fn destroy_sparse_region(
         _: &mut Self,
@@ -787,6 +845,62 @@ impl GpuWorker {
         })?;
         reply.ok()
     }
+}
+
+/// 216's words after its two descriptors (PR `ExecuteSparseMapRequests`: `ReadPair(packet, 8)`,
+/// `packet[10]`, `ReadPair(packet, 11)`, `packet[13] & 0xff`, `packet[14]`), but for the slot.
+struct SparseMapHeader {
+    /// How many entries the batch has.
+    count: u64,
+    /// The address space.
+    space: AsId,
+    /// The size of one entry, as the request names it.
+    entry_size: u64,
+    /// The sync byte.
+    sync: u8,
+}
+
+/// 216's checks after its slot, in PR's order (module docs, "The worker"), then the batch's
+/// ([`GpuMemory::check_sparse_map`]); writes the selected kinds to the out buffer and applies the
+/// batch. `event` is the slot's, if gpu 12 made one.
+fn sparse_map(
+    cx: &mut Context<'_>,
+    req: &Request<'_>,
+    gpu: &mut GpuMemory,
+    front: &dyn GpuVmFront,
+    header: &SparseMapHeader,
+    event: Option<ObjectId>,
+) -> Result<SparseCompletion, Fault> {
+    let count = usize::try_from(header.count)
+        .ok()
+        .filter(|&count| count != 0 && header.count <= MAX_ENTRIES)
+        .filter(|_| usize::try_from(header.entry_size) == Ok(ENTRY_SIZE))
+        .ok_or(KernelError::InvalidSize)?;
+    if header.sync > MAX_SYNC {
+        return Err(KernelError::NotImplemented.into());
+    }
+    let event = event
+        .filter(|_| gpu.table(header.space).is_some())
+        .ok_or(KernelError::NotFound)?;
+    // `count` is at most `MAX_ENTRIES`, so this fits.
+    let bytes = count
+        .checked_mul(ENTRY_SIZE)
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or(KernelError::InvalidSize)?;
+    let sent = req.in_buffer(cx, 0)?.len();
+    let room = req.out_buffer(cx, 0)?.len();
+    if sent != bytes || room < header.count {
+        return Err(KernelError::InvalidSize.into());
+    }
+    let read = req
+        .in_buffer(cx, 0)?
+        .read_all(count.saturating_mul(ENTRY_SIZE))?;
+    let (entries, _) = read.as_chunks::<ENTRY_SIZE>();
+    let requests: Vec<SparseMapRequest> = entries.iter().map(SparseMapRequest::parse).collect();
+    let admitted = gpu.check_sparse_map(header.space, &requests)?;
+    // The last fallible step: once the kinds are written, the batch is applied.
+    req.out_buffer(cx, 0)?.write(admitted.selected())?;
+    Ok(admitted.apply(front, event))
 }
 
 /// The interfaces a gpu server's sessions can be.

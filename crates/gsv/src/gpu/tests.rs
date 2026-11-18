@@ -22,7 +22,7 @@ use starquake_kernel::result::ResultCode;
 use starquake_memory::{PAGE_SIZE, PageRange};
 use starquake_services::framework::fake::FakeKernel;
 use starquake_services::framework::result::INVALID_CMIF_REQUEST;
-use starquake_services::framework::{Handled, Kernel, UNKNOWN_COMMAND_ID};
+use starquake_services::framework::{Handled, Kernel};
 use starquake_trace::{EventKind, ServiceId};
 
 use super::command::*;
@@ -684,12 +684,14 @@ fn partition_replies_are_nx2_s() {
     assert_eq!(data(&range), [1, 0, start[0], start[1], size[0], size[1]]);
 }
 
+/// 216 is served (`sparse_map`'s tests drive it): a request with none of its descriptors is the
+/// framework's refusal, not the unknown-command policy's.
 #[test]
-fn sparse_map_requests_go_to_the_policy() {
+fn sparse_map_requests_are_served() {
     let mut rig = Rig::new();
     let worker = rig.worker();
     let reply = rig.send_on(worker, &[tipc_type(EXECUTE_SPARSE_MAP_REQUESTS), 0]);
-    assert_eq!(result_of(&reply), UNKNOWN_COMMAND_ID);
+    assert_eq!(result_of(&reply), INVALID_CMIF_REQUEST);
 }
 
 #[test]
@@ -1842,6 +1844,67 @@ fn an_unmap_keeps_the_shim() {
     assert_eq!(s.rig.mappings(s.space), [own(), shim_mapping]);
 }
 
+/// A 212 sends its kind change only where its mapping shows: the shim inside it keeps its kind
+/// while the GPU applies the change, and after the drain.
+#[test]
+fn a_kind_change_keeps_the_shim() {
+    let mut s = ready();
+    s.map_at(GPU_VA);
+    let shim = GPU_VA + PAGE_SIZE;
+    s.rig
+        .gpu()
+        .gpu()
+        .map_syncpoint_shim(AsId(s.space), shim)
+        .unwrap();
+    let words = modify_words(s.space, GPU_VA, GPU_VA + MEMORY_SIZE - 1, 0xB, 1, 0, 0);
+    let reply = s.rig.send_on(s.worker, &words);
+    assert_eq!(result_of(&reply), ResultCode::SUCCESS);
+    assert_eq!(data(&reply), [1]);
+    let space = AsId(s.space);
+    let calls = s.rig.front.calls();
+    assert_eq!(
+        calls[calls.len() - 3..],
+        [
+            FrontCall::Update(
+                space,
+                VmUpdate::ModifyKind {
+                    range: page_range(GPU_VA, PAGE_SIZE),
+                    kind: Z16
+                },
+                None
+            ),
+            FrontCall::Update(
+                space,
+                VmUpdate::ModifyKind {
+                    range: page_range(GPU_VA + 2 * PAGE_SIZE, 2 * PAGE_SIZE),
+                    kind: Z16
+                },
+                None
+            ),
+            FrontCall::Barrier(Ticket(1)),
+        ]
+    );
+    let shim_page = Some((Target::SyncpointShim, SELF_MAP_KIND));
+    s.rig.apply();
+    assert_eq!(s.rig.at(s.space, shim), shim_page);
+    assert_eq!(s.rig.at(s.space, GPU_VA), page_at(MEMORY, Z16));
+    s.rig.drain();
+    assert_eq!(s.rig.at(s.space, shim), shim_page);
+    assert_eq!(
+        s.rig.at(s.space, GPU_VA + 3 * PAGE_SIZE),
+        page_at(MEMORY + 3 * PAGE_SIZE, Z16)
+    );
+    // A 212 of the shim's page alone sends no kind change, only its barrier.
+    let words = modify_words(s.space, shim, shim + PAGE_SIZE - 1, 6, 6, 0, 0);
+    assert_eq!(
+        result_of(&s.rig.send_on(s.worker, &words)),
+        ResultCode::SUCCESS
+    );
+    let calls = s.rig.front.calls();
+    assert_eq!(calls.last(), Some(&FrontCall::Barrier(Ticket(2))));
+    assert!(matches!(calls[calls.len() - 2], FrontCall::Barrier(_)));
+}
+
 /// A 102 sends its destroy only where its registration shows: another registration's own
 /// mapping, another handle's 211 mapping and the shim on its range stay in the table while the
 /// GPU applies it, and after the drain.
@@ -2491,3 +2554,5 @@ fn a_later_102_is_ordered_after_the_destroy_s_removals() {
         ]
     );
 }
+
+mod sparse_map;
