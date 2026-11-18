@@ -6,7 +6,8 @@
 
 use std::sync::Arc;
 
-use starquake_gpu::interface::{Completions, Fence, SyncpointId};
+use serde::{Deserialize, Serialize};
+use starquake_gpu::interface::{Completions, Fence, SYNCPOINT_COUNT, SyncpointId};
 use starquake_gpu::syncpoint::{FIRST_ALLOCATABLE, Syncpoints};
 use starquake_ipc::BUFFER_SIZE;
 use starquake_kernel::handle::Handle;
@@ -14,7 +15,7 @@ use starquake_kernel::memory::testing::device_share_token;
 use starquake_kernel::result::KernelError;
 use starquake_kernel::slab::SlabId;
 use starquake_services::framework::fake::FakeKernel;
-use starquake_services::framework::result::INVALID_CMIF_REQUEST;
+use starquake_services::framework::result::{INVALID_CMIF_REQUEST, NOT_SUPPORTED};
 use starquake_services::framework::{Handled, Kernel, Server, UnknownPolicy};
 use starquake_trace::ServiceId;
 
@@ -898,6 +899,240 @@ fn two_decoders_count_on_their_own_syncpoints() {
     assert_eq!((rig.syncpoints().read(a), rig.syncpoints().read(b)), (0, 1));
 }
 
+// ---- Commits ----
+
+/// `saved`, a server's snapshot, with the decoder state `from` replaced by `to`: each session's
+/// state is saved as its bytes after their length (`Rig::state`), and nothing else in the
+/// snapshot counts bytes.
+fn forge(saved: &[u8], from: &DecoderService, to: &DecoderService) -> Vec<u8> {
+    let framed = |state: &DecoderService| {
+        let bytes = postcard::to_allocvec(state).unwrap();
+        let mut framed = postcard::to_allocvec(&bytes.len()).unwrap();
+        framed.extend(bytes);
+        framed
+    };
+    let (old, new) = (framed(from), framed(to));
+    let at = saved
+        .windows(old.len())
+        .position(|window| window == old)
+        .unwrap();
+    assert!(
+        !saved[at + 1..]
+            .windows(old.len())
+            .any(|window| window == old),
+        "the state to forge is saved twice"
+    );
+    let mut forged = saved[..at].to_vec();
+    forged.extend(new);
+    forged.extend(&saved[at + old.len()..]);
+    forged
+}
+
+/// Restores the rig's server from its own snapshot with `decoder`'s state replaced by `to`.
+fn restore_as(rig: &mut Rig, decoder: ObjectId, to: &DecoderService) {
+    let from = rig.state(decoder);
+    let forged = forge(&rig.server.save().unwrap(), &from, to);
+    rig.server.restore(&forged).unwrap();
+    assert_eq!(&rig.state(decoder), to);
+}
+
+/// A ready event the kernel refuses to signal or clear (one a restored session names) does not
+/// undo or refuse what a command did: each is answered as done, and its change stands (module
+/// docs, "Commits").
+#[test]
+fn a_refused_ready_signal_keeps_what_the_command_did() {
+    let mut rig = Rig::new();
+    let decoder = rig.decoder();
+    rig.send_on(decoder, &configure(4, 4));
+    // An id the fake kernel minted for nothing: not an event it holds.
+    let stray = rig.kernel.new_object();
+    let forged = DecoderService {
+        event: Some(stray),
+        ..rig.state(decoder)
+    };
+    restore_as(&mut rig, decoder, &forged);
+    let id = first_syncpoint();
+
+    assert_eq!(
+        rig.send_on(decoder, &configure(8, 6)),
+        success(CONFIGURE, &[], &[0, 0])
+    );
+    assert_eq!(rig.state(decoder).configuration().unwrap().width, 8);
+    let handed = rig.send_on(decoder, &register(rig.first));
+    let state = rig.state(decoder);
+    assert_eq!(
+        handed,
+        success(REGISTER_IMAGE, &[], &handle_words(id, state.value(1)))
+    );
+    assert_eq!(state.handouts().count(), 1);
+    assert_eq!(
+        rig.send_on(decoder, &submit(3, 7, 0)),
+        success(SUBMIT, &[], &[3, 0])
+    );
+    assert_eq!(rig.syncpoints().read(id), state.value(1));
+    assert_eq!(
+        rig.send_on(decoder, &[0xE5, 0]),
+        output_reply(rig.first, 8, 6, 7 * NS_PER_US, false)
+    );
+    assert_eq!(
+        rig.send_on(decoder, &release(rig.first)),
+        success(RELEASE_IMAGE, &[], &handle_words(id, state.value(2)))
+    );
+    rig.send_on(decoder, &submit(3, 8, 0));
+    rig.send_on(decoder, &submit(3, 9, 0));
+    assert_eq!(rig.state(decoder).pending().count(), 1);
+    assert_eq!(rig.send_on(decoder, &[0x18, 0]), success(FLUSH, &[], &[]));
+    assert_eq!(rig.state(decoder).pending().count(), 0);
+    assert_eq!(
+        rig.send_on(decoder, &[0x83, 0]),
+        success(FINALIZE, &[], &[])
+    );
+    assert!(!rig.syncpoints().is_allocated(id));
+    let mut expected = DecoderService::new();
+    expected.event = Some(stray);
+    assert_eq!(rig.state(decoder), expected);
+}
+
+/// A family that is not the video family: [`shared`] fails on its server, as on a server put
+/// together wrong.
+#[derive(Serialize, Deserialize)]
+struct NotVideo;
+
+/// A command that cannot reach gsv's shared state (the server's family is not the video
+/// family) is refused before it changes anything: the frame is not queued, the output not
+/// taken, the counter not moved; and the same commands succeed on the video family after.
+#[test]
+fn a_command_that_cannot_reach_the_pools_changes_nothing() {
+    let mut rig = Rig::new();
+    let decoder = rig.decoder();
+    rig.send_on(decoder, &register(rig.first));
+    rig.send_on(decoder, &submit(1, 3, 0));
+    rig.send_on(decoder, &register(rig.first + 1));
+    let before = rig.state(decoder);
+    let id = before.syncpoint().unwrap();
+    let counter = rig.syncpoints().read(id);
+    let saved = rig.server.save().unwrap();
+    let mut bare = Server::new(VIDEO_NAME, UnknownPolicy::Strict)
+        .with_root(|| Box::new(VideoContext))
+        .with_interfaces(video_interfaces())
+        .with_family(NotVideo)
+        .with_service_id(VIDEO);
+    bare.restore(&saved).unwrap();
+    let video = std::mem::replace(&mut rig.server, bare);
+    for (words, command) in [
+        (submit(1, 4, 0), SUBMIT),
+        (vec![0xE5, 0], GET_OUTPUT_PROPERTIES),
+        (release(rig.first + 1), RELEASE_IMAGE),
+        (register(rig.first + 2), REGISTER_IMAGE),
+        (vec![0x83, 0], FINALIZE),
+    ] {
+        assert_eq!(
+            rig.send_on(decoder, &words),
+            result_only(command, NOT_SUPPORTED)
+        );
+        assert_eq!(rig.state(decoder), before);
+        assert_eq!(rig.syncpoints().read(id), counter);
+    }
+    rig.server = video;
+    assert_eq!(
+        rig.send_on(decoder, &[0xE5, 0]),
+        output_reply(rig.first, 0, 0, 3 * NS_PER_US, false)
+    );
+    rig.send_on(decoder, &submit(1, 4, 0));
+    assert_eq!(rig.syncpoints().read(id), before.value(2));
+}
+
+/// The handout count is a `u64`: at `u64::MAX` (a restored session; no run gets there) 311 and
+/// 314 are `OutOfResource` with nothing changed, and one below it the last handout is made.
+#[test]
+fn a_handout_count_at_its_limit_is_refused() {
+    let mut rig = Rig::new();
+    let decoder = rig.decoder();
+    rig.send_on(decoder, &register(rig.first));
+    rig.send_on(decoder, &submit(1, 0, 0));
+    rig.send_on(decoder, &[0xE5, 0]);
+    let finished = rig.state(decoder);
+    let id = finished.syncpoint().unwrap();
+
+    let below = DecoderService {
+        handed: u64::MAX - 1,
+        reached: u64::MAX - 1,
+        ..finished.clone()
+    };
+    restore_as(&mut rig, decoder, &below);
+    assert_eq!(
+        rig.send_on(decoder, &release(rig.first)),
+        success(RELEASE_IMAGE, &[], &handle_words(id, below.value(u64::MAX)))
+    );
+    let last = rig.state(decoder);
+    assert_eq!(last.handed(), u64::MAX);
+    assert_eq!(
+        last.handouts().copied().collect::<Vec<_>>(),
+        [Handout {
+            image: rig.first,
+            number: u64::MAX
+        }]
+    );
+
+    let at = DecoderService {
+        handed: u64::MAX,
+        reached: u64::MAX,
+        ..finished
+    };
+    restore_as(&mut rig, decoder, &at);
+    let counter = rig.syncpoints().read(id);
+    for (words, command) in [
+        (release(rig.first), RELEASE_IMAGE),
+        (register(rig.first + 1), REGISTER_IMAGE),
+    ] {
+        assert_eq!(
+            rig.send_on(decoder, &words),
+            result_only(command, KernelError::OutOfResource.code())
+        );
+        assert_eq!(rig.state(decoder), at);
+        assert_eq!(rig.syncpoints().read(id), counter);
+    }
+}
+
+/// Two decoder services restored with one syncpoint (a relation between sessions, not checked
+/// on reading: module docs, "What is recorded and what is saved") both move its counter, so
+/// one's frame reaches the other's handle with no frame of its own.
+#[test]
+fn two_sessions_sharing_a_syncpoint_are_restored() {
+    let mut rig = Rig::new();
+    let a = rig.decoder();
+    let b = rig.decoder();
+    rig.send_on(a, &register(rig.first));
+    let b_value = value_of(&rig.send_on(b, &register(rig.first + 1)));
+    let (first, second) = (rig.state(a), rig.state(b));
+    let (shared_id, own_id) = (first.syncpoint().unwrap(), second.syncpoint().unwrap());
+    assert_ne!(shared_id, own_id);
+    let sharing = DecoderService {
+        syncpoint: first.syncpoint,
+        base: first.base,
+        ..second
+    };
+    restore_as(&mut rig, b, &sharing);
+    let b_value_now = sharing.value(1);
+    assert_eq!(b_value_now, first.value(1));
+    let own = rig.syncpoints().read(own_id);
+    // a's frame reaches b's handle on the shared counter.
+    assert!(!rig.syncpoints().reached(Fence {
+        id: shared_id,
+        value: b_value_now
+    }));
+    rig.send_on(a, &submit(1, 0, 0));
+    assert!(rig.syncpoints().reached(Fence {
+        id: shared_id,
+        value: b_value_now
+    }));
+    // b's frame moves the shared counter once more, and its own syncpoint not at all.
+    rig.send_on(b, &submit(1, 0, 0));
+    assert_eq!(rig.syncpoints().read(shared_id), first.value(2));
+    assert_eq!(rig.syncpoints().read(own_id), own);
+    assert_eq!(own.wrapping_add(1), b_value);
+}
+
 // ---- What is saved ----
 
 /// A decoder service with every field set, each value distinct.
@@ -1005,7 +1240,7 @@ fn unreachable_sessions() -> Vec<(DecoderService, DecoderServiceError)> {
         ),
         (
             DecoderService {
-                syncpoint: Some(192),
+                syncpoint: Some(u8::try_from(SYNCPOINT_COUNT).unwrap()),
                 ..golden()
             },
             DecoderServiceError::Syncpoint,
@@ -1143,6 +1378,50 @@ fn unreachable_handouts() -> Vec<(DecoderService, DecoderServiceError)> {
             },
             DecoderServiceError::Unfinished,
         ),
+        // A configuration with no event.
+        (
+            DecoderService {
+                event: None,
+                ..golden()
+            },
+            DecoderServiceError::Event,
+        ),
+        // One output more than the handouts finished: with none finished, and with one.
+        (
+            DecoderService {
+                reached: 0,
+                ..golden()
+            },
+            DecoderServiceError::Outputs {
+                found: 1,
+                reached: 0,
+            },
+        ),
+        (
+            DecoderService {
+                reached: 1,
+                outputs: VecDeque::from([golden().outputs[0]; 2]),
+                ..golden()
+            },
+            DecoderServiceError::Outputs {
+                found: 2,
+                reached: 1,
+            },
+        ),
+        // Outputs with no syncpoint: none was ever finished.
+        (
+            DecoderService {
+                syncpoint: None,
+                handed: 0,
+                reached: 0,
+                handouts: VecDeque::new(),
+                ..golden()
+            },
+            DecoderServiceError::Outputs {
+                found: 1,
+                reached: 0,
+            },
+        ),
     ]
 }
 
@@ -1203,6 +1482,89 @@ fn a_saved_session_no_command_reaches_is_refused() {
         ..golden()
     };
     assert!(read(&full).is_ok());
+    // As many outputs as handouts finished, and an event with no configuration (after 115),
+    // are taken.
+    for edge in [
+        DecoderService {
+            reached: 1,
+            ..golden()
+        },
+        DecoderService {
+            reached: 2,
+            outputs: VecDeque::from([golden().outputs[0]; 2]),
+            ..golden()
+        },
+        DecoderService {
+            configuration: None,
+            ..golden()
+        },
+    ] {
+        assert!(read(&edge).is_ok(), "{edge:?}");
+    }
+}
+
+/// The checks run in the documented order: with two faults at once, the earlier one answers.
+#[test]
+fn the_first_failing_check_answers() {
+    let saved = |state: DecoderService| SavedDecoderService {
+        configuration: state.configuration,
+        event: state.event,
+        syncpoint: state.syncpoint,
+        base: state.base,
+        handed: state.handed,
+        reached: state.reached,
+        images: state.images,
+        handouts: state.handouts,
+        pending: state.pending,
+        outputs: state.outputs,
+    };
+    // More than eight images and a syncpoint past the last: the images.
+    let both = DecoderService {
+        images: (1..=9).collect(),
+        handouts: VecDeque::new(),
+        syncpoint: Some(u8::try_from(SYNCPOINT_COUNT).unwrap()),
+        ..golden()
+    };
+    assert_eq!(
+        DecoderService::try_from(saved(both)),
+        Err(DecoderServiceError::Images { found: 9 })
+    );
+    // A configuration with no event and more outputs than finished: the event.
+    let both = DecoderService {
+        event: None,
+        reached: 0,
+        ..golden()
+    };
+    assert_eq!(
+        DecoderService::try_from(saved(both)),
+        Err(DecoderServiceError::Event)
+    );
+    // A frame left unfinished and a configuration with no event: the frame.
+    let both = DecoderService {
+        event: None,
+        pending: VecDeque::from([Input {
+            timestamp: 0,
+            end: false,
+        }]),
+        ..golden()
+    };
+    assert_eq!(
+        DecoderService::try_from(saved(both)),
+        Err(DecoderServiceError::Unfinished)
+    );
+    // A handout out of order and a configuration with no event: the handout.
+    let both = DecoderService {
+        event: None,
+        handouts: VecDeque::from([Handout {
+            image: 0x1A,
+            number: 0x19,
+        }]),
+        ..golden()
+    };
+    assert_eq!(
+        DecoderService::try_from(saved(both)),
+        Err(DecoderServiceError::Handout { index: 0 })
+    );
 }
 
 #[test]
@@ -1222,6 +1584,18 @@ fn error_text_is_plain_words() {
     assert_eq!(
         DecoderServiceError::Unfinished.to_string(),
         "a decoder service has a frame, a handout and room, unfinished"
+    );
+    assert_eq!(
+        DecoderServiceError::Event.to_string(),
+        "a decoder service is configured but has no ready event"
+    );
+    assert_eq!(
+        DecoderServiceError::Outputs {
+            found: 1,
+            reached: 0
+        }
+        .to_string(),
+        "a decoder service's waiting outputs (1) outnumber the handouts it finished (0)"
     );
 }
 

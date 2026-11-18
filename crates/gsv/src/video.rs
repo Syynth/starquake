@@ -98,13 +98,28 @@
 //!   configuration, images, handouts, frames and outputs are dropped; the event is kept,
 //!   cleared.
 //!
+//! # Commits
+//!
+//! Each command does every step that can fail before its first change to the session or to
+//! gsv's shared state: it reads its words and buffers, reaches the shared state, makes the
+//! event (3, 101) and runs its checks; for 311 and 314 allocating the syncpoint is the last of
+//! them. What follows cannot fail the request: the ready event's signal or clear after the
+//! change (3, 8, 101, 109, 115, 207, 213, 311, 314), and 115's free of the syncpoint, are
+//! logged as errors when the kernel or the syncpoints refuse them, and the command is answered
+//! as done (`a_refused_ready_signal_keeps_what_the_command_did`,
+//! `a_command_that_cannot_reach_the_pools_changes_nothing`). One refusal a session can meet is
+//! an event the kernel does not hold (`InvalidHandle`), which a restored session can name. 6
+//! changes nothing, so its signal's refusal is its answer.
+//!
 //! # Bounds
 //!
 //! What a title can make a decoder service hold: [`MAX_REGISTERED`] images (PR: `registered_images.size()
 //! < 8`, `OutOfResource`), [`MAX_HANDOUTS`] waiting handouts, [`MAX_PENDING`] waiting frames
 //! (PR `MaximumPendingInputs`, answered [`VIDEO_QUEUE_FULL`]) and [`MAX_OUTPUTS`] finished
 //! outputs (a frame waits while the output queue is full), one syncpoint and one event. A
-//! command's work is bounded by those. A session the title closes keeps its syncpoint and its
+//! command's work is bounded by those. The handout count is a `u64`: a 311 or 314 when it is
+//! at `u64::MAX`, which only a restored session can hold, is `OutOfResource`, with nothing
+//! changed (`a_handout_count_at_its_limit_is_refused`). A session the title closes keeps its syncpoint and its
 //! event: the service framework tells a session nothing when it closes, as for the syncpt
 //! sessions (`crate::syncpt`, "Where this differs from the references"); a title that keeps
 //! opening decoder services, registering an image and closing them uses up the syncpoints. A
@@ -132,6 +147,7 @@
 //! | Waiting handouts | at most [`MAX_REGISTERED`] images, but 314 re-tickets without bound | unbounded | at most [`MAX_HANDOUTS`], then `OutOfResource` (`handouts_are_bounded_at_the_limit`) |
 //! | Finished outputs not yet read | unbounded | unbounded | at most [`MAX_OUTPUTS`]; a frame then waits (`outputs_are_bounded_and_a_frame_waits`) |
 //! | 212 of an image not registered, or while started | `NotFound`, `InvalidState` | taken | `NotFound`; any time (`unregister_refuses_an_unknown_image`) |
+//! | The counter after 212 took a waiting handout out | moves by one a finished frame (`PumpOutput`: one `IncrementGuest` an output), so each later handle is reached one frame late for each handout taken out | the same (`DecodeLoop`: one `IncrementGuest` an output) | **departs from both**: it is brought to the finishing handout's value, passing the gap, so each later handle is reached by its own frame (`an_unregistered_image_s_handouts_are_skipped`) |
 //! | 8 (flush) | AV1: `NotImplemented`; H.264: decodes and drains what waits | drops what waits | NX2's (`flush_keeps_images_already_handed_out`) |
 //! | 207 (stop) | drops the waiting frames and the finished outputs, and clears started | as its flush | NX2's: as 8 (`stop_is_flush`) |
 //! | The ready event's signals | signalled when the queue has room after a pump, from 101 on | signalled on every 3, and every 4 ms while there is room | signalled after every command that leaves room, from the first 3 or 101: no timer (`the_ready_event_follows_the_input_queue`) |
@@ -144,11 +160,24 @@
 //! again: the spec's `VideoFrameDone` note is for the decoding worker (decision 10's later
 //! slice), whose frames finish on a host thread, and is not written here
 //! (`crate::note`: code 7, "reserved for the video worker"). The syncpoint increments push
-//! `SyncpointChanged` for a watched id, which the drain records as any other. A session is plain
+//! `SyncpointChanged` for a watched id, which the drain records as any other, and a syncpt 201
+//! wait armed at a handle fires at that drain
+//! (`a_wait_on_a_decoder_s_handle_fires_when_its_frame_finishes`, in `starquake-core`'s
+//! `hle/tests/graphics/video.rs`). A session is plain
 //! data saved with the server, checked as it is read back ([`DecoderServiceError`]). Not
-//! checked there: that the syncpoint is allocated in the restored `Syncpoints` and its counter
-//! is `base` plus the last finished handout's number, and that the event is one the kernel
-//! holds; a whole-machine restore checks those across the pieces.
+//! checked there:
+//!
+//! - that the syncpoint is allocated in the restored `Syncpoints` and its counter is `base`
+//!   plus the last finished handout's number, and that the event is one the kernel holds; a
+//!   whole-machine restore checks those across the pieces. An event the kernel does not hold
+//!   is refused at each signal, which is logged ("Commits").
+//! - that no two decoder services name the same syncpoint or the same event: a relation
+//!   between sessions, which each session's reading cannot see. Two that share a syncpoint
+//!   both move its counter, so each one's frames reach the other's handles early, and the
+//!   first 115 frees the syncpoint while the other still counts on it (the next allocation may
+//!   hand it to another client); two that share an event signal and clear it in turn, so it
+//!   shows the room of whichever ran a command last
+//!   (`two_sessions_sharing_a_syncpoint_are_restored`).
 
 pub mod camera;
 pub mod layout;
@@ -459,6 +488,21 @@ pub enum DecoderServiceError {
     /// finished it.
     #[error("a decoder service has a frame, a handout and room, unfinished")]
     Unfinished,
+    /// A configuration with no ready event: 101 makes the event before it keeps the
+    /// configuration.
+    #[error("a decoder service is configured but has no ready event")]
+    Event,
+    /// More finished outputs wait than handouts were finished: each output is a finished
+    /// handout, so with no syncpoint (none finished) there are none.
+    #[error(
+        "a decoder service's waiting outputs ({found}) outnumber the handouts it finished ({reached})"
+    )]
+    Outputs {
+        /// How many outputs wait.
+        found: usize,
+        /// The last finished handout's number.
+        reached: u64,
+    },
 }
 
 impl TryFrom<SavedDecoderService> for DecoderService {
@@ -512,6 +556,16 @@ impl TryFrom<SavedDecoderService> for DecoderService {
         }
         if !pending.is_empty() && !handouts.is_empty() && outputs.len() < MAX_OUTPUTS {
             return Err(DecoderServiceError::Unfinished);
+        }
+        if configuration.is_some() && event.is_none() {
+            return Err(DecoderServiceError::Event);
+        }
+        // The queue check above bounds the length at `MAX_OUTPUTS`, so it fits a `u64`.
+        if u64::try_from(outputs.len()).unwrap_or(u64::MAX) > reached {
+            return Err(DecoderServiceError::Outputs {
+                found: outputs.len(),
+                reached,
+            });
         }
         Ok(Self {
             configuration,
@@ -656,7 +710,7 @@ impl DecoderService {
     }
 
     /// Signals the ready event if the input queue has room, and clears it if not; nothing if
-    /// no command has made it.
+    /// no command has made it. For a command that has changed nothing yet ([`START`]).
     fn update_ready(&self, cx: &mut Context<'_>) -> Result<(), Fault> {
         let Some(event) = self.event else {
             return Ok(());
@@ -665,6 +719,14 @@ impl DecoderService {
             cx.signal_event(event)
         } else {
             cx.clear_event(event)
+        }
+    }
+
+    /// [`DecoderService::update_ready`] after a command has made its changes: a refusal is
+    /// logged, not answered, because the changes stand (module docs, "Commits").
+    fn settle_ready(&self, cx: &mut Context<'_>) {
+        if let Err(error) = self.update_ready(cx) {
+            tracing::error!(%error, "gsv:video: the kernel refused a decoder service's ready event");
         }
     }
 
@@ -679,8 +741,10 @@ impl DecoderService {
     }
 
     /// Hands image `image` out with the next number, after the checks its command made, and
-    /// finishes what it can. Allocates the syncpoint the first time: the last step that can
-    /// fail. Returns the handout's value.
+    /// finishes what it can. Checks, in order: [`MAX_HANDOUTS`] handouts, or a handout count at
+    /// `u64::MAX` (reachable only through a restored session), `OutOfResource`; then allocates
+    /// the syncpoint the first time (none left, `OutOfResource`): the last step that can fail,
+    /// and the first that changes anything. Returns the handout's value.
     fn hand_out(
         &mut self,
         cx: &mut Context<'_>,
@@ -690,8 +754,16 @@ impl DecoderService {
         if self.handouts.len() >= MAX_HANDOUTS {
             return Err(KernelError::OutOfResource.into());
         }
+        let allocated = self.syncpoint();
+        let number = if allocated.is_some() {
+            self.handed
+                .checked_add(1)
+                .ok_or(Fault::from(KernelError::OutOfResource))?
+        } else {
+            1
+        };
         let syncpoints = shared.syncpoints();
-        let id = if let Some(id) = self.syncpoint() {
+        let id = if let Some(id) = allocated {
             id
         } else {
             let id = syncpoints.allocate().map_err(|error| {
@@ -700,18 +772,16 @@ impl DecoderService {
             })?;
             self.syncpoint = Some(id.get());
             self.base = syncpoints.read(id);
-            self.handed = 0;
             self.reached = 0;
             id
         };
-        self.handed += 1;
-        let number = self.handed;
+        self.handed = number;
         if !self.images.contains(&image) {
             self.images.push(image);
         }
         self.handouts.push_back(Handout { image, number });
         self.pump(syncpoints);
-        self.update_ready(cx)?;
+        self.settle_ready(cx);
         Ok((id, self.value(number)))
     }
 
@@ -735,7 +805,7 @@ impl DecoderService {
         reply: &mut Reply,
     ) -> Outcome {
         let event = this.ready_event(cx)?;
-        this.update_ready(cx)?;
+        this.settle_ready(cx);
         reply.copy_handle(event);
         reply.ok()
     }
@@ -759,7 +829,7 @@ impl DecoderService {
         reply: &mut Reply,
     ) -> Outcome {
         this.pending.clear();
-        this.update_ready(cx)?;
+        this.settle_ready(cx);
         reply.ok()
     }
 
@@ -788,7 +858,7 @@ impl DecoderService {
         );
         this.ready_event(cx)?;
         this.configuration = Some(configuration);
-        this.update_ready(cx)?;
+        this.settle_ready(cx);
         reply.payload().write_u64(0);
         reply.ok()
     }
@@ -805,13 +875,13 @@ impl DecoderService {
         let timestamp = words.read_u64()?;
         let end = low_byte(words.read_u32()?) != 0;
         let bytes = req.in_buffer(cx, 0)?.len();
+        let shared = shared(cx)?;
         if this.pending.len() >= MAX_PENDING {
             return Err(VIDEO_QUEUE_FULL.into());
         }
         this.pending.push_back(Input { timestamp, end });
-        let shared = shared(cx)?;
         this.pump(shared.syncpoints());
-        this.update_ready(cx)?;
+        this.settle_ready(cx);
         reply.payload().write_u64(bytes);
         reply.ok()
     }
@@ -824,17 +894,19 @@ impl DecoderService {
         _req: &Request<'_>,
         reply: &mut Reply,
     ) -> Outcome {
-        if let Some(id) = this.syncpoint() {
-            let shared = shared(cx)?;
-            if let Err(error) = shared.syncpoints().free(id) {
-                tracing::error!(%error, "gsv:video: a decoder service's syncpoint was not allocated");
-            }
+        let shared = shared(cx)?;
+        if let Some(id) = this.syncpoint()
+            && let Err(error) = shared.syncpoints().free(id)
+        {
+            tracing::error!(%error, "gsv:video: a decoder service's syncpoint was not allocated");
         }
         let event = this.event;
         *this = Self::new();
         this.event = event;
-        if let Some(event) = event {
-            cx.clear_event(event)?;
+        if let Some(event) = event
+            && let Err(error) = cx.clear_event(event)
+        {
+            tracing::error!(%error, "gsv:video: the kernel refused a decoder service's ready event");
         }
         reply.ok()
     }
@@ -893,13 +965,13 @@ impl DecoderService {
         _req: &Request<'_>,
         reply: &mut Reply,
     ) -> Outcome {
+        let shared = shared(cx)?;
         let output = this
             .outputs
             .pop_front()
             .ok_or(Fault::from(VIDEO_NO_OUTPUT))?;
-        let shared = shared(cx)?;
         this.pump(shared.syncpoints());
-        this.update_ready(cx)?;
+        this.settle_ready(cx);
         let out = reply.payload();
         for word in output.words() {
             out.write_u32(word);
@@ -909,8 +981,7 @@ impl DecoderService {
 
     /// `RegisterImage` (311). Words: image 2. out: a native sync handle. Checks, in PR's order:
     /// [`MAX_REGISTERED`] images, `OutOfResource`; registered already, `InvalidState`; no pool
-    /// image with the id, `NotFound`; [`MAX_HANDOUTS`] handouts, or no syncpoint left,
-    /// `OutOfResource`.
+    /// image with the id, `NotFound`; then [`DecoderService::hand_out`]'s (`OutOfResource`).
     fn register_image(
         this: &mut Self,
         cx: &mut Context<'_>,
@@ -933,7 +1004,7 @@ impl DecoderService {
     }
 
     /// `ReleaseImage` (314). Words: image 2. out: a native sync handle. Checks: not registered,
-    /// `NotFound`; [`MAX_HANDOUTS`] handouts, `OutOfResource`.
+    /// `NotFound`; then [`DecoderService::hand_out`]'s (`OutOfResource`).
     fn release_image(
         this: &mut Self,
         cx: &mut Context<'_>,
