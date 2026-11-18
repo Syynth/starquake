@@ -666,6 +666,9 @@ modules:
 
 last events, oldest first:
   #0 core 0 thread 1: lifecycle ProcessStart 1
+
+last auto-stubbed requests, oldest first:
+  none
 "
     );
 }

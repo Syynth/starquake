@@ -5,8 +5,9 @@
 //! walking skeleton can fill in: the exception, the registers, the faulting instruction as module
 //! plus offset, a backtrace by frame pointer with each frame as module plus offset
 //! ([`Backtrace`]), the memory map and the block the faulting address is in, the modules with
-//! their build ids, the last events from the flight recorder, the emulator's version and the
-//! run's command line.
+//! their build ids, the last events from the flight recorder, the last requests the services
+//! answered by auto-stub ([`CrashReport::last_stubbed`]), the emulator's version and the run's
+//! command line.
 //!
 //! PROVISIONAL (walking skeleton, #74). Not here yet, and owned by the crash-report step of the
 //! observability spec's order of work: symbol names, and the events split per thread (the report
@@ -63,7 +64,7 @@
 //! The JSON layout is this crate's own (the spec gives none), versioned by [`CRASH_VERSION`] and
 //! pinned by a test. Addresses and register values are hex strings, so no reader loses bits to a
 //! floating-point number. Version 2 added the `syndrome` field, version 3 the `svc_break`
-//! exception kind, and version 4 the `backtrace` field. (The `instruction_abort` kind came
+//! exception kind, version 4 the `backtrace` field, and version 5 the `last_stubbed` field. (The `instruction_abort` kind came
 //! earlier, inside version 1; before it, a fetch from an address nothing maps was reported as a
 //! `data_abort` read.)
 
@@ -76,10 +77,11 @@ use starquake_kernel::svc::exception::Break;
 use starquake_memory::GuestMemory;
 
 use crate::report::Mapping;
+use crate::services_report::StubbedRequestReport;
 
 /// Version of the `crash.json` layout. Any change to the layout bumps it: a field or exception
 /// kind added, renamed or removed, or a field's meaning changed.
-pub const CRASH_VERSION: u32 = 4;
+pub const CRASH_VERSION: u32 = 5;
 
 /// Serialises a `u64` as a hex string (`"0x80000000"`).
 #[expect(
@@ -573,6 +575,11 @@ pub struct CrashReport {
     pub modules: Vec<Module>,
     /// The newest events from the flight recorder, oldest first, one line each.
     pub last_events: Vec<String>,
+    /// The last requests the services answered by auto-stub before the crash, oldest first, at
+    /// most [`LAST_STUBBED`](crate::services_report::LAST_STUBBED), each naming the interface
+    /// it went to (for a session `sm:` handed out for a name nothing provides, that name). Kept
+    /// apart from the flight recorder, so they are here however many events came after them.
+    pub last_stubbed: Vec<StubbedRequestReport>,
 }
 
 impl CrashReport {
@@ -617,7 +624,16 @@ impl CrashReport {
             memory_map: memory_map.to_vec(),
             modules: modules.to_vec(),
             last_events,
+            last_stubbed: Vec::new(),
         }
+    }
+
+    /// The report with `last_stubbed`, the run's last auto-stubbed requests
+    /// ([`CrashReport::last_stubbed`]).
+    #[must_use]
+    pub fn with_last_stubbed(mut self, last_stubbed: Vec<StubbedRequestReport>) -> Self {
+        self.last_stubbed = last_stubbed;
+        self
     }
 
     /// The report with `syndrome`, the one the CPU backend reported for the exception.
@@ -739,6 +755,13 @@ impl CrashReport {
         writeln!(out, "\nlast events, oldest first:")?;
         for event in &self.last_events {
             writeln!(out, "  {event}")?;
+        }
+        writeln!(out, "\nlast auto-stubbed requests, oldest first:")?;
+        if self.last_stubbed.is_empty() {
+            writeln!(out, "  none")?;
+        }
+        for request in &self.last_stubbed {
+            writeln!(out, "  {}", request.text())?;
         }
         Ok(())
     }
@@ -1005,14 +1028,22 @@ mod tests {
                 record: Some(0x80ff_ffd0),
             }],
             end: BacktraceEnd::DepthLimit,
-        });
+        })
+        .with_last_stubbed(vec![StubbedRequestReport {
+            seq: 0x31,
+            thread: 0x32,
+            service: "sm:".into(),
+            interface: "lm".into(),
+            protocol: "tipc",
+            command: 0x33,
+        }]);
         report.emulator = "starquake 9.9.9".into();
         report.registers.x.truncate(2);
         let json = serde_json::to_string_pretty(&report).unwrap();
         assert_eq!(
             json,
             r##"{
-  "version": 4,
+  "version": 5,
   "emulator": "starquake 9.9.9",
   "command_line": [
     "starquake",
@@ -1080,12 +1111,22 @@ mod tests {
   ],
   "last_events": [
     "#0 core 0 thread 1: lifecycle ProcessStart 1"
+  ],
+  "last_stubbed": [
+    {
+      "seq": 49,
+      "thread": 50,
+      "service": "sm:",
+      "interface": "lm",
+      "protocol": "tipc",
+      "command": 51
+    }
   ]
 }"##
         );
         // The golden text pins the version as a literal, so a layout change that forgets to bump
         // `CRASH_VERSION` fails here.
-        assert_eq!(CRASH_VERSION, 4);
+        assert_eq!(CRASH_VERSION, 5);
         assert_eq!(report.version, CRASH_VERSION);
     }
 
@@ -1113,6 +1154,39 @@ mod tests {
         assert_eq!(without.get("syndrome"), Some(&serde_json::Value::Null));
         // And one built without a backtrace.
         assert_eq!(without.get("backtrace"), Some(&serde_json::Value::Null));
+        // And one built without stubbed requests has an empty list.
+        assert_eq!(without.get("last_stubbed"), Some(&serde_json::json!([])));
+    }
+
+    #[test]
+    fn the_text_ends_with_the_last_auto_stubbed_requests_oldest_first() {
+        let none = report(Exception::UndefinedInstruction);
+        assert!(
+            none.to_text()
+                .ends_with("\nlast auto-stubbed requests, oldest first:\n  none\n"),
+            "{}",
+            none.to_text()
+        );
+        let request = |seq, interface: &str, protocol, command| StubbedRequestReport {
+            seq,
+            thread: 7,
+            service: "sm:".into(),
+            interface: interface.into(),
+            protocol,
+            command,
+        };
+        let two = report(Exception::UndefinedInstruction).with_last_stubbed(vec![
+            request(40, "lm", "cmif", 5),
+            request(41, "aoc:u", "tipc", 9),
+        ]);
+        assert!(
+            two.to_text().ends_with(
+                "\nlast auto-stubbed requests, oldest first:\n  #40 thread 7: lm (on sm:) cmif \
+                 command 5\n  #41 thread 7: aoc:u (on sm:) tipc command 9\n"
+            ),
+            "{}",
+            two.to_text()
+        );
     }
 
     /// A break with every field set, each to a distinct value.

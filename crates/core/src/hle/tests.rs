@@ -126,7 +126,7 @@ fn install_with(dispatcher: &Dispatcher, env: Arc<dyn Env>) -> Result<(), Servic
 }
 
 /// A dispatcher over a process with nothing but its code mapped, read-write.
-fn dispatcher() -> Dispatcher {
+pub(crate) fn dispatcher() -> Dispatcher {
     let (mapper, _log) = RecordingMapper::new();
     let memory = ProcessMemory {
         code_address: BASE,
