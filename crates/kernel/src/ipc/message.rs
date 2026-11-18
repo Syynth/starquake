@@ -772,6 +772,44 @@ mod tests {
     }
 
     #[test]
+    fn a_special_header_word_without_the_flag_is_not_read() {
+        // A message whose third word would decode as a special header with a copied and a
+        // moved handle, and whose handle words name real handles, but whose second header
+        // word does not say a special header follows: neither a reply nor a request has one.
+        let (mut handles, mut objects, made) = table(2);
+        let mut message = build(
+            &request()
+                .copy_handle(made[0].raw())
+                .move_handle(made[1].raw()),
+        );
+        let words = [
+            word(&message, 0).unwrap(),
+            word(&message, HEADER_WORD_1).unwrap(),
+        ];
+        let mut header = CommandHeader::decode(words).unwrap();
+        assert!(header.has_special_header);
+        header.has_special_header = false;
+        let [_, word1] = header.encode().unwrap();
+        message[HEADER_WORD_1..HEADER_WORD_1 + WORD].copy_from_slice(&word1.to_le_bytes());
+        assert_eq!(reply_handles(&message), []);
+        let before = message;
+        let Translation {
+            translated,
+            result,
+            destroyed,
+        } = translate(
+            &mut message,
+            0,
+            Current::default(),
+            &mut handles,
+            &mut objects,
+        );
+        assert_eq!((translated, result), (Translated::default(), Ok(())));
+        assert_eq!(destroyed, Vec::<ObjectId>::new());
+        assert_eq!((message, handles.len()), (before, 2));
+    }
+
+    #[test]
     fn invalid_handle_words_in_a_reply_are_not_handles() {
         let built = ReplyBuilder::cmif(0)
             .copy_handle(Handle::INVALID.raw())
