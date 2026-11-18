@@ -321,10 +321,10 @@ pub fn install_with_graphics(
     let applets = am::oe_server_for(applet, policy).with_service_id(APPLET_OE);
     dispatcher.add_server(am::OE_NAME, APPLET_OE, None, Box::new(applets))?;
 
-    graphics.add_servers(dispatcher, policy, reads.ready)?;
-    graphics.add_vi2_server(
+    graphics.add_servers(
         dispatcher,
         policy,
+        reads.ready,
         Arc::clone(&env),
         Arc::clone(&reads.halt),
     )?;

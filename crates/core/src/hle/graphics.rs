@@ -19,7 +19,7 @@
 //! | syncpt | [`GSV_SYNCPT`] | `syncpt_server` over the shared state |
 //! | gpu | [`GSV_GPU`] | `gpu_server` over the shared state and the front |
 //! | nvsrv | [`GSV_NVSRV`] | `nvsrv_server` over the shared state and the front, with the front as its channel front too, and told of deferred replies as `fsp-srv` is ([`super::Reads::ready`]) |
-//! | vi2 | [`GSV_VI2`] | `vi2_server` over the shared state, with the services' environment and halt ([`Graphics::add_vi2_server`], which [`install_with_graphics`](super::install_with_graphics) calls after the others) |
+//! | vi2 | [`GSV_VI2`] | `vi2_server` over the shared state, with the services' environment and halt, which [`Graphics::add_servers`] takes so that the root never names a vi2 server that is not added |
 //! | video | [`GSV_VIDEO`] | `video_server` over the shared state: the video context 902, 906 and 1002 hand out, and its decoder services with the null decoder (`starquake_gsv::video`, slice 15) |
 //!
 //! The root answers 202, 204, 497 and 1402 with its family's server (`starquake_gsv::root`,
@@ -396,12 +396,18 @@ impl Graphics {
     }
 
     /// Puts gsv's servers in front of `dispatcher` (module docs, "What is built"), telling
-    /// `ready` of nvsrv's deferred replies.
+    /// `ready` of nvsrv's deferred replies. The vi2 server reads `env`, the services'
+    /// environment, and tells `halt` when it fails: a request group that starts listening to the
+    /// vsync clock reads its clock (`starquake_gsv::vi2`, "The server"). Every server the root
+    /// names is added here, so the root's 305 never hands out a session on a number with no
+    /// server.
     pub(super) fn add_servers(
         &self,
         dispatcher: &Dispatcher,
         policy: UnknownPolicy,
         ready: Arc<dyn Deliveries>,
+        env: Arc<dyn Env>,
+        halt: Arc<dyn Halt>,
     ) -> Result<(), ServicesError> {
         let syncpt =
             syncpt::syncpt_server(policy, Arc::clone(&self.shared)).with_service_id(GSV_SYNCPT);
@@ -429,6 +435,11 @@ impl Graphics {
             tracing::error!("nvsrv's server was numbered twice");
         }
 
+        let display = vi2::vi2_server(policy, Arc::clone(&self.shared))
+            .with_service_id(GSV_VI2)
+            .with_env(env, halt);
+        dispatcher.add_server(vi2::VI2_NAME, GSV_VI2, None, Box::new(display))?;
+
         let codecs =
             video::video_server(Arc::clone(&self.shared), policy).with_service_id(GSV_VIDEO);
         dispatcher.add_server(video::VIDEO_NAME, GSV_VIDEO, None, Box::new(codecs))?;
@@ -442,24 +453,6 @@ impl Graphics {
         let graphics_root = root::root_server_with_page(state, policy, Arc::clone(&self.shared))
             .with_service_id(GSV_ROOT);
         dispatcher.add_server(root::ROOT_NAME, GSV_ROOT, None, Box::new(graphics_root))?;
-        Ok(())
-    }
-
-    /// Puts gsv's vi2 server in front of `dispatcher` (module docs, "What is built"), reading
-    /// `env`, the services' environment, and telling `halt` when it fails: a request group that
-    /// starts listening to the vsync clock reads its clock (`starquake_gsv::vi2`, "The
-    /// server"). The root [`Graphics::add_servers`] adds names it as 305's server.
-    pub(super) fn add_vi2_server(
-        &self,
-        dispatcher: &Dispatcher,
-        policy: UnknownPolicy,
-        env: Arc<dyn Env>,
-        halt: Arc<dyn Halt>,
-    ) -> Result<(), ServicesError> {
-        let display = vi2::vi2_server(policy, Arc::clone(&self.shared))
-            .with_service_id(GSV_VI2)
-            .with_env(env, halt);
-        dispatcher.add_server(vi2::VI2_NAME, GSV_VI2, None, Box::new(display))?;
         Ok(())
     }
 

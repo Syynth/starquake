@@ -461,6 +461,61 @@ fn state_of(rig: &Rig, graphics: &Graphics) -> Vec<Vec<u8>> {
     state
 }
 
+/// [`Graphics::add_servers`] alone adds every server its root names, the vi2 server among them
+/// (it takes the services' environment and halt for it), so the root never hands out a session on
+/// a number with no server: the root's named servers are read from the root itself, not restated.
+#[test]
+fn add_servers_alone_adds_every_server_its_root_names() {
+    let graphics = Graphics::new(FrontMode::Live, None);
+    let dispatcher = dispatcher();
+    let env: Arc<dyn Env> = Arc::new(LiveEnv::new(FixedClock::new(0, 1), 0));
+    let servers = Arc::new(ReadyServers::default());
+    let fsp_reads = reads_on(Arc::clone(&env), &servers);
+    graphics
+        .add_servers(
+            &dispatcher,
+            starquake_services::framework::UnknownPolicy::AutoStub,
+            fsp_reads.ready,
+            env,
+            fsp_reads.halt,
+        )
+        .unwrap();
+    let mut added = Vec::new();
+    let mut named = Vec::new();
+    let out = dispatcher.inspect_handlers(|service, handler| {
+        added.push(service);
+        if service == GSV_ROOT {
+            let handler: &dyn core::any::Any = handler;
+            let server = handler
+                .downcast_ref::<starquake_services::framework::Server>()
+                .unwrap();
+            let state = server
+                .family::<starquake_gsv::root::RootFamily>()
+                .unwrap()
+                .state();
+            named.extend(
+                [
+                    state.syncpt_server(),
+                    state.gpu_server(),
+                    state.nvsrv_server(),
+                    state.vi2_server(),
+                    state.video_server(),
+                ]
+                .into_iter()
+                .flatten(),
+            );
+        }
+    });
+    assert_eq!(out, 0);
+    assert!(named.contains(&GSV_VI2), "{named:?}");
+    for service in &named {
+        assert!(
+            added.contains(service),
+            "{service:?} is named but not added"
+        );
+    }
+}
+
 /// The root of a run hands out the syncpt, nvsrv and gpu servers' sessions, and each answers its
 /// own commands: nvsrv's 13, the command a title sends right after 1402, is nvsrv's
 /// (`SetGraphicsFirmwareMemoryMarginEnabled`, an Eden stub that replies nothing), and recorded
