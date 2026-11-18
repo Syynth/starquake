@@ -143,8 +143,11 @@ fn a_new_session_that_gets_no_handle_is_not_opened() {
     );
 }
 
-/// The documented limit of [`Server`](super::super::Server)'s reply building: handles added
-/// before the table filled up stay, as in Eden.
+/// The [`FakeKernel`](super::super::fake::FakeKernel)'s divergence from the real kernel: when
+/// the table fills up part-way through [`Server`](super::super::Server)'s reply, the handles
+/// added before it stay in the fake's table, as in Eden's HLE path. The fake delivers no reply,
+/// so it takes nothing back; the real kernel takes these handles back
+/// (`tests/reply_rollback_on_the_kernel.rs`).
 #[test]
 fn handles_added_before_the_table_filled_stay_in_it() {
     // `interleave` adds a copy, a move, a session and a move; the table holds two.
@@ -160,7 +163,9 @@ fn handles_added_before_the_table_filled_stay_in_it() {
     );
 }
 
-/// The same limit one handle later: a session opened before the table filled up stays open.
+/// The fake's same divergence one handle later: a session opened before the table filled up
+/// stays open on the [`FakeKernel`](super::super::fake::FakeKernel). The real kernel takes its
+/// handle back and tears the session down (`tests/reply_rollback_on_the_kernel.rs`).
 #[test]
 fn a_session_opened_before_the_table_filled_stays_open() {
     // Room for the copy, the first move and the session; the second move does not fit.
@@ -173,7 +178,8 @@ fn a_session_opened_before_the_table_filled_stays_open() {
         (rig.server.session_count(), rig.server.interface_count()),
         (2, 2)
     );
-    // It is a working session, though the caller was never told its handle.
+    // On the fake it is a working session, though the caller was never told its handle; the
+    // real kernel would have taken it back.
     let child = rig.kernel.sessions()[0];
     assert_eq!(rig.child_tag(child), super::INTERLEAVED_TAG);
 }
