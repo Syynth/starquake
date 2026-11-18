@@ -956,7 +956,7 @@ impl lm::GuestLog for Lines {
 
 /// One whole `lm` log packet whose message is a text chunk of `text`
 /// (`starquake_services::lm::packet`, "The layout").
-fn log_packet(text: &[u8]) -> Vec<u8> {
+pub(crate) fn log_packet(text: &[u8]) -> Vec<u8> {
     use starquake_services::lm::packet::{ChunkKey, FLAG_HEAD, FLAG_TAIL};
     let len = u8::try_from(text.len()).unwrap();
     assert!(len < 0x80, "one LEB128 byte");
