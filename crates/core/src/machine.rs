@@ -739,7 +739,7 @@ pub(crate) fn run_serving<V: Vcpu, C: HostClock + Clone + 'static>(
                 session.memory,
                 &placed.modules,
             ))
-            .with_last_stubbed(services.name_requests(&stubs.requests()));
+            .with_services(&services, services.name_requests(&stubs.requests()));
             ExitReason::GuestCrashed(Box::new(match syndrome {
                 Some(syndrome) => report.with_syndrome(syndrome),
                 None => report,

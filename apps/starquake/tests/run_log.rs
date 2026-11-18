@@ -168,6 +168,8 @@ fn the_log_the_summary_and_the_crash_report_name_an_unknown_service_and_its_comm
     // The crash report.
     let crash: serde_json::Value =
         serde_json::from_str(&text(&artifacts, CRASH_JSON_FILE)).unwrap();
+    assert_eq!(crash["unknown_services"], serde_json::json!([UNKNOWN]));
+    assert_eq!(crash["stubbed_commands"], summary["stubbed_commands"]);
     let stubbed = &crash["last_stubbed"];
     assert_eq!(stubbed.as_array().map(Vec::len), Some(1), "{stubbed}");
     assert_eq!(stubbed[0]["service"], service);

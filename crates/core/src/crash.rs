@@ -5,8 +5,9 @@
 //! walking skeleton can fill in: the exception, the registers, the faulting instruction as module
 //! plus offset, a backtrace by frame pointer with each frame as module plus offset
 //! ([`Backtrace`]), the memory map and the block the faulting address is in, the modules with
-//! their build ids, the last events from the flight recorder, the last requests the services
-//! answered by auto-stub ([`CrashReport::last_stubbed`]), the emulator's version and the run's
+//! their build ids, the last events from the flight recorder, what the services stubbed (the
+//! service names nothing provides, every auto-stubbed command, and the last auto-stubbed requests
+//! before the crash: [`CrashReport::with_services`]), the emulator's version and the run's
 //! command line.
 //!
 //! PROVISIONAL (walking skeleton, #74). Not here yet, and owned by the crash-report step of the
@@ -64,7 +65,8 @@
 //! The JSON layout is this crate's own (the spec gives none), versioned by [`CRASH_VERSION`] and
 //! pinned by a test. Addresses and register values are hex strings, so no reader loses bits to a
 //! floating-point number. Version 2 added the `syndrome` field, version 3 the `svc_break`
-//! exception kind, version 4 the `backtrace` field, and version 5 the `last_stubbed` field. (The `instruction_abort` kind came
+//! exception kind, version 4 the `backtrace` field, and version 5 the `unknown_services`,
+//! `stubbed_commands` and `last_stubbed` fields. (The `instruction_abort` kind came
 //! earlier, inside version 1; before it, a fetch from an address nothing maps was reported as a
 //! `data_abort` read.)
 
@@ -77,7 +79,7 @@ use starquake_kernel::svc::exception::Break;
 use starquake_memory::GuestMemory;
 
 use crate::report::Mapping;
-use crate::services_report::StubbedRequestReport;
+use crate::services_report::{ServicesReport, StubbedCommand, StubbedRequestReport};
 
 /// Version of the `crash.json` layout. Any change to the layout bumps it: a field or exception
 /// kind added, renamed or removed, or a field's meaning changed.
@@ -575,6 +577,12 @@ pub struct CrashReport {
     pub modules: Vec<Module>,
     /// The newest events from the flight recorder, oldest first, one line each.
     pub last_events: Vec<String>,
+    /// The service names the guest asked `sm:` for that nothing provides, in order (as
+    /// `summary.json`'s `unknown_services`).
+    pub unknown_services: Vec<String>,
+    /// Every command the services answered by auto-stub, with its service and interface, in
+    /// order (as `summary.json`'s `stubbed_commands`).
+    pub stubbed_commands: Vec<StubbedCommand>,
     /// The last requests the services answered by auto-stub before the crash, oldest first, at
     /// most [`LAST_STUBBED`](crate::services_report::LAST_STUBBED), each naming the interface
     /// it went to (for a session `sm:` handed out for a name nothing provides, that name). Kept
@@ -624,14 +632,23 @@ impl CrashReport {
             memory_map: memory_map.to_vec(),
             modules: modules.to_vec(),
             last_events,
+            unknown_services: Vec::new(),
+            stubbed_commands: Vec::new(),
             last_stubbed: Vec::new(),
         }
     }
 
-    /// The report with `last_stubbed`, the run's last auto-stubbed requests
+    /// The report with what the services stubbed: `services`' unknown service names and
+    /// stubbed commands, and `last_stubbed`, the run's last auto-stubbed requests
     /// ([`CrashReport::last_stubbed`]).
     #[must_use]
-    pub fn with_last_stubbed(mut self, last_stubbed: Vec<StubbedRequestReport>) -> Self {
+    pub fn with_services(
+        mut self,
+        services: &ServicesReport,
+        last_stubbed: Vec<StubbedRequestReport>,
+    ) -> Self {
+        self.unknown_services.clone_from(&services.unknown_services);
+        self.stubbed_commands.clone_from(&services.stubbed);
         self.last_stubbed = last_stubbed;
         self
     }
@@ -755,6 +772,20 @@ impl CrashReport {
         writeln!(out, "\nlast events, oldest first:")?;
         for event in &self.last_events {
             writeln!(out, "  {event}")?;
+        }
+        writeln!(out, "\nservices nothing provides:")?;
+        if self.unknown_services.is_empty() {
+            writeln!(out, "  none")?;
+        }
+        for name in &self.unknown_services {
+            writeln!(out, "  {name}")?;
+        }
+        writeln!(out, "\nauto-stubbed commands:")?;
+        if self.stubbed_commands.is_empty() {
+            writeln!(out, "  none")?;
+        }
+        for command in &self.stubbed_commands {
+            writeln!(out, "  {}", command.text())?;
         }
         writeln!(out, "\nlast auto-stubbed requests, oldest first:")?;
         if self.last_stubbed.is_empty() {
@@ -1029,14 +1060,26 @@ mod tests {
             }],
             end: BacktraceEnd::DepthLimit,
         })
-        .with_last_stubbed(vec![StubbedRequestReport {
-            seq: 0x31,
-            thread: 0x32,
-            service: "sm:".into(),
-            interface: "lm".into(),
-            protocol: "tipc",
-            command: 0x33,
-        }]);
+        .with_services(
+            &ServicesReport {
+                unknown_services: vec!["aoc:u".into(), "lm".into()],
+                stubbed: vec![StubbedCommand {
+                    service: "sm:".into(),
+                    interface: "aoc:u".into(),
+                    protocol: "cmif",
+                    command: 0x34,
+                }],
+                ..ServicesReport::default()
+            },
+            vec![StubbedRequestReport {
+                seq: 0x31,
+                thread: 0x32,
+                service: "sm:".into(),
+                interface: "lm".into(),
+                protocol: "tipc",
+                command: 0x33,
+            }],
+        );
         report.emulator = "starquake 9.9.9".into();
         report.registers.x.truncate(2);
         report
@@ -1118,6 +1161,18 @@ mod tests {
   "last_events": [
     "#0 core 0 thread 1: lifecycle ProcessStart 1"
   ],
+  "unknown_services": [
+    "aoc:u",
+    "lm"
+  ],
+  "stubbed_commands": [
+    {
+      "service": "sm:",
+      "interface": "aoc:u",
+      "protocol": "cmif",
+      "command": 52
+    }
+  ],
   "last_stubbed": [
     {
       "seq": 49,
@@ -1160,16 +1215,20 @@ mod tests {
         assert_eq!(without.get("syndrome"), Some(&serde_json::Value::Null));
         // And one built without a backtrace.
         assert_eq!(without.get("backtrace"), Some(&serde_json::Value::Null));
-        // And one built without stubbed requests has an empty list.
-        assert_eq!(without.get("last_stubbed"), Some(&serde_json::json!([])));
+        // And one built without what the services stubbed has empty lists.
+        for key in ["unknown_services", "stubbed_commands", "last_stubbed"] {
+            assert_eq!(without.get(key), Some(&serde_json::json!([])), "{key}");
+        }
     }
 
     #[test]
-    fn the_text_ends_with_the_last_auto_stubbed_requests_oldest_first() {
+    fn the_text_ends_with_what_the_services_stubbed() {
         let none = report(Exception::UndefinedInstruction);
         assert!(
-            none.to_text()
-                .ends_with("\nlast auto-stubbed requests, oldest first:\n  none\n"),
+            none.to_text().ends_with(
+                "\nservices nothing provides:\n  none\n\nauto-stubbed commands:\n  none\n\n\
+                 last auto-stubbed requests, oldest first:\n  none\n"
+            ),
             "{}",
             none.to_text()
         );
@@ -1181,13 +1240,29 @@ mod tests {
             protocol,
             command,
         };
-        let two = report(Exception::UndefinedInstruction).with_last_stubbed(vec![
-            request(40, "lm", "cmif", 5),
-            request(41, "aoc:u", "tipc", 9),
-        ]);
+        let command = |interface: &str, protocol, command| StubbedCommand {
+            service: "sm:".into(),
+            interface: interface.into(),
+            protocol,
+            command,
+        };
+        let services = ServicesReport {
+            unknown_services: vec!["aoc:u".into(), "lm".into()],
+            stubbed: vec![command("aoc:u", "tipc", 9), command("lm", "cmif", 5)],
+            ..ServicesReport::default()
+        };
+        let two = report(Exception::UndefinedInstruction).with_services(
+            &services,
+            vec![
+                request(40, "lm", "cmif", 5),
+                request(41, "aoc:u", "tipc", 9),
+            ],
+        );
         assert!(
             two.to_text().ends_with(
-                "\nlast auto-stubbed requests, oldest first:\n  #40 thread 7: lm (on sm:) cmif \
+                "\nservices nothing provides:\n  aoc:u\n  lm\n\nauto-stubbed commands:\n  \
+                 aoc:u (on sm:) tipc command 9\n  lm (on sm:) cmif command 5\n\n\
+                 last auto-stubbed requests, oldest first:\n  #40 thread 7: lm (on sm:) cmif \
                  command 5\n  #41 thread 7: aoc:u (on sm:) tipc command 9\n"
             ),
             "{}",

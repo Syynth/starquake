@@ -82,6 +82,17 @@ pub struct StubbedCommand {
     pub command: u32,
 }
 
+impl StubbedCommand {
+    /// The command in one line, as `crash.txt` writes it: `lm (on sm:) cmif command 5`.
+    #[must_use]
+    pub fn text(&self) -> String {
+        format!(
+            "{} (on {}) {} command {}",
+            self.interface, self.service, self.protocol, self.command
+        )
+    }
+}
+
 /// What the run's services left behind ([module docs](self)).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ServicesReport {

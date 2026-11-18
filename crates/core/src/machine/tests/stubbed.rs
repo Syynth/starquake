@@ -211,20 +211,25 @@ fn a_crash_after_it_names_the_last_auto_stubbed_command_and_its_service() {
             command: COMMAND,
         }]
     );
+    assert_eq!(crash.unknown_services, [UNKNOWN]);
+    assert_eq!(crash.stubbed_commands, report.services.stubbed);
+    let service = sm::PORT_NAME;
     let line = format!(
-        "  #{} thread {}: {UNKNOWN} (on {}) cmif command {COMMAND}\n",
-        stubbed[0],
-        MAIN_THREAD.0,
-        sm::PORT_NAME
+        "  #{} thread {}: {UNKNOWN} (on {service}) cmif command {COMMAND}\n",
+        stubbed[0], MAIN_THREAD.0,
     );
     assert!(
         crash.to_text().ends_with(&format!(
-            "last auto-stubbed requests, oldest first:\n{line}"
+            "\nservices nothing provides:\n  {UNKNOWN}\n\nauto-stubbed commands:\n  {UNKNOWN} \
+             (on {service}) cmif command {COMMAND}\n\nlast auto-stubbed requests, oldest \
+             first:\n{line}"
         )),
         "{}",
         crash.to_text()
     );
     let json = serde_json::to_value(crash).unwrap();
+    assert_eq!(json["unknown_services"], serde_json::json!([UNKNOWN]));
+    assert_eq!(json["stubbed_commands"][0]["interface"], UNKNOWN);
     assert_eq!(json["last_stubbed"][0]["interface"], UNKNOWN);
     assert_eq!(json["last_stubbed"][0]["command"], COMMAND);
 }
