@@ -7,6 +7,7 @@
 //! packet[1] == 3`), which the tests write as they are. Replies are compared as whole message
 //! buffers, laid out by hand the same way.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use proptest::prelude::*;
@@ -24,6 +25,7 @@ use starquake_trace::ServiceId;
 
 use super::*;
 use crate::completion::CompletionQueue;
+use crate::completion::testing::Locks;
 use crate::gpu::memory::{Device, RegisterRequest};
 use crate::gpu::{AsId, GpuVmFront};
 use crate::root::{RootState, root_server_with_page};
@@ -1001,6 +1003,41 @@ fn a_zero_count_is_gsv_s_invalid_size() {
             result_only(command, code(KernelError::InvalidCombination))
         );
     }
+}
+
+// ----- The snapshot, in use --------------------------------------------------------------------
+
+/// The state live commands leave (a retired memory held by its image, a memory bound by 423)
+/// saves, restores against the kernel's locks, and the restored tables answer the next
+/// commands: the image's destroy releases the retired memory's lock, and ids go on.
+#[test]
+fn a_restored_table_answers_commands() {
+    let mut rig = Rig::new();
+    let parent = rig.register(MEMORY, 2 * PAGE);
+    let retired = rig.bound(MEMORY + 2 * PAGE, PAGE);
+    let image = rig.image(&page_image(), retired);
+    rig.destroy(retired);
+    let gpu = rig.created(PAGE);
+    rig.bind_gpu(gpu, MEMORY, PAGE, parent, 0, [0; 4]);
+    let bytes = rig.native().save().unwrap();
+    let locks = Locks {
+        process: rig.kernel.process(),
+        live: BTreeMap::from([((MEMORY + 2 * PAGE, PAGE), 1), ((MEMORY, PAGE), 1)]),
+    };
+    let restored = NativeObjects::restore(&bytes, &locks).unwrap();
+    assert_eq!(restored, rig.native());
+    // Without it, the image is unknown; with it, its destroy releases the retired memory.
+    *rig.shared.lock().native() = NativeObjects::new();
+    assert_eq!(
+        rig.destroy_image(image),
+        result_only(DESTROY_NATIVE_IMAGE, code(KernelError::NotFound))
+    );
+    *rig.shared.lock().native() = restored;
+    assert_eq!(rig.destroy_image(image), success(DESTROY_NATIVE_IMAGE, &[], &[]));
+    assert_eq!(rig.kernel.device_locks(MEMORY + 2 * PAGE, PAGE), 0);
+    assert_eq!(rig.destroy(gpu), success(DESTROY_NATIVE_MEMORY, &[], &[]));
+    assert_eq!(rig.kernel.device_locks(MEMORY, PAGE), 0);
+    assert_eq!(rig.created(PAGE), gpu + 1);
 }
 
 fn config() -> ProptestConfig {

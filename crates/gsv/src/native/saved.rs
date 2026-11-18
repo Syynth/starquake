@@ -150,7 +150,7 @@ pub enum SnapshotError {
         index: usize,
     },
     /// A list is longer than its bound.
-    #[error("the native tables snapshot holds too many of {part}")]
+    #[error("the native tables snapshot holds more {part} entries than the limit")]
     TooMany {
         /// What it holds too many of.
         part: Part,
