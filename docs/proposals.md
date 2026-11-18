@@ -461,6 +461,14 @@ Landed: #234 (a process end asked during a timer-thread delivery, PR #315), #243
 | awaiting the owner | **`Family::session_closed`**, a count-only services hook #313 adds so nvsrv learns its last session closed: keep it, or fold it into the wave-31 session-close hook that runs with a `Context` | #243 | area:services |
 | awaiting the owner | **Map events are stamped core 0 and the main thread** with a copy of the run's clock, not the dispatch's caller and `Env` reading. Pass the caller to the `Mapper`, or have the dispatcher record queued Map events under its lock? | #261 | observability |
 
+### From wave 35 (ledger: #22)
+
+Landed: #226's two missing tests (PR #317): host-I/O payload bytes count toward the kept recording's cap, tested at the exact one-byte edge, and the console check at boot comes before any draw. With it, the open milestone 2 issues are #33 (needs design), #205 (waiting on the owner's counter-register question) and #21 (the owner's).
+
+| Status | Proposal | Why | Suggested |
+|---|---|---|---|
+| proposed | **Whole-run replay across several cores:** calls from different cores and the timer thread reach the `Env` in host-timing order, and the timer thread reads an unrecorded copy of the clock, so a whole-run replay is not deterministic. Needs recorded ordering (observability rule 3) or the deterministic interpreter backend (#47). Later milestone | #226 | observability |
+
 ## House-rule candidates
 
 Rules distilled from review findings. A vetted rule moves into `CLAUDE.md`; until then it is
@@ -683,3 +691,8 @@ passed to build agents as a provisional rule for the next wave.
 - A function whose result must be acted on (tokens to release, steps to forward) is `pub(crate)` and `#[must_use]`.
 - Untrusted snapshots decode through a budget on entries and in-memory size, not only a byte-length bound, with a test at the exact edge.
 - A request that arrives after its process or session ended is refused with the ended error and logged at the same level on every path that can produce it.
+
+### From wave 35 (ledger: #22)
+
+- A refusing size-bound test sets the limit at the exact edge (two records at twice the size less one), so an undercount of one byte flips the outcome.
+- Size accounting is tested with items of different sizes, pushed in one call and across several calls.
