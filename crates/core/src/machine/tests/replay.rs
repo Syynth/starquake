@@ -37,7 +37,10 @@ fn entropy_guest(seen: &Seen) -> ScriptedVcpu {
     let first = Rc::clone(seen);
     let mut vcpu = ScriptedVcpu::new().then(
         move |regs| {
-            first.borrow_mut().push(regs.x[CFI_REGISTER]);
+            // `x18` by its literal index, not through `CFI_REGISTER`, so a wrong constant
+            // fails the replay tests: `ctx.r[18]` in `ResetThreadContext64`
+            // (`eden/src/core/hle/kernel/k_thread.cpp` @ cf654052, line 61).
+            first.borrow_mut().push(regs.x[18]);
             ask(regs, 0);
         },
         svc(SvcId::GetInfo),

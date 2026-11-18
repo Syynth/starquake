@@ -400,6 +400,10 @@ fn the_entropy_and_x18_are_drawn_once_at_creation_in_order() {
         DRAWN[ENTROPY_COUNT] | CFI_VALUE_SET_BITS
     );
     assert_eq!(context.x[CFI_REGISTER], 0x5555_0000_0000_00e7);
+    // The register itself, read by its literal index so a wrong `CFI_REGISTER` fails here:
+    // `ctx.r[18]` in `ResetThreadContext64` (`eden/src/core/hle/kernel/k_thread.cpp` @
+    // cf654052, line 61).
+    assert_eq!(context.x[18], 0x5555_0000_0000_00e7);
     // The rest of the start state is `run`'s: x0 zero, x1 the handle, every other register
     // zero.
     assert_eq!(context.x[0], 0);
