@@ -34,24 +34,90 @@
 //! allocated), and 0 for "shared memory mapped" (only `MapSharedMem`, command 5, which is not
 //! served, sets it in Eden).
 //!
+//! # The device-share lock
+//!
+//! `IocAlloc` locks the handle's memory for the device and `IocFree` unlocks it when the
+//! handle's last reference goes, as Eden's do (`eden/src/core/hle/service/nvdrv/devices/nvmap.cpp`
+//! @ cf654052): `nvmap::IocAlloc`, once `Handle::Alloc` has succeeded, calls
+//! `process->GetPageTable().LockForMapDeviceAddressSpace(&is_out_io, handle_description->address,
+//! handle_description->size, Kernel::KMemoryPermission::None, true, false)` inside an `ASSERT`;
+//! `nvmap::IocFree` calls `UnlockForDeviceAddressSpace(freeInfo->address, freeInfo->size)`, also
+//! inside an `ASSERT`, when `FreeHandle` reports `can_unlock` (the handle is gone: its last
+//! reference went). Eden's `ASSERT` only logs (`AssertFailSoftImpl`, unless debug asserts are on),
+//! so in both a refusal is logged and the ioctl still answers `Success`.
+//!
+//! The table cannot reach the kernel, so each ioctl leaves its step ([`DeviceShareStep`]) and
+//! the request that ran it takes it through the kernel before it writes the reply
+//! (`nvsrv::run_ioctl`): a lock over the allocation's address and page-rounded size, whose token
+//! the handle then keeps (`NvMap::keep_lock`, [`NvMap::lock`]); and the release of that token
+//! (`Context::unlock_device_share`). A refusal of either leaves the answer unchanged: the
+//! allocation stands with no lock, and a freed handle is gone. It is logged as an error, except
+//! the kernel's refusal for a process that has ended (`TerminationRequested`: another core
+//! ended the process during the request), which is logged at debug level, as gsv's drain logs
+//! that refusal; `nvsrv`'s `refused_as_ended` tells them apart
+//! (`a_refusal_for_an_ended_process_is_told_apart`, in `nvsrv/tests.rs`). No test captures the
+//! log lines themselves. Tests (in `nvsrv/tests.rs`):
+//! `alloc_locks_the_handle_s_memory_and_the_last_free_releases_it`,
+//! `a_refused_lock_leaves_the_handle_allocated_with_no_lock`.
+//!
+//! # When the lock is released: a departure from the kernel spec (owner question)
+//!
+//! `docs/specs/kernel.md` (the device-share lock, approved 2026-11-12) says: "gsv releases the
+//! lock only once the GPU is past the work that could still use it." nvmap does not follow that
+//! rule today, on two paths:
+//!
+//! - **`IocFree`** releases the lock during the request, as Eden's `IocFree` does, with no
+//!   wait for the GPU.
+//! - **The last session's close** (below) posts each freed handle's release to gsv's
+//!   completion queue with no GPU barrier, and the timer thread's drain then releases it while
+//!   the process lives (`nvsrv/tests.rs`:
+//!   `closing_the_last_session_frees_each_handle_once_and_queues_its_lock`;
+//!   `nvsrv/tests/on_the_kernel.rs`: `a_release_drained_while_the_process_lives_unlocks_once`).
+//!
+//! This matters because nvhost-as-gpu takes no device-share lock of its own on an nvmap handle
+//! it maps, so the handle's lock is the only thing that keeps the CPU mapping under that memory
+//! from changing while the GPU may still use it. Whether a free's release must wait for GPU
+//! ordering is awaiting the owner in `docs/proposals.md` ("Whether an nvmap free's unlock waits
+//! for GPU ordering", scope review of #187). If the answer is yes, both paths would push the
+//! release through the completion queue behind a GPU barrier instead of releasing it at once.
+//!
+//! # When the process's last session closes
+//!
+//! Eden frees a process's handles when its last nvdrv session goes (`~NVDRV` calls
+//! `Container::CloseSession`, `eden/src/core/hle/service/nvdrv/core/container.cpp` @ cf654052,
+//! which, once the process's session count reaches 0, calls `NvMap::UnmapAllHandles`): one
+//! `FreeHandle(id, false)` for each handle of the session whose `dupes` is above 0. That is one
+//! reference fewer for each handle, so a handle `IocFromId` duplicated stays with the rest, as
+//! it would after one `IocFree`. Ending a process closes every session it holds, so this is
+//! also what ending the process does to its handles. Here every handle is the one process's,
+//! and the server tells its family when its last session closes
+//! ([`crate::nvsrv::NvsrvFamily`]'s `session_closed`), which runs `NvMap::close_session`.
+//!
 //! # Where this differs from Eden
 //!
 //! Each is pinned by the test named, in `nvmap/tests.rs` unless another file is given:
 //!
 //! | Case | Eden | Here |
 //! |---|---|---|
-//! | `IocAlloc` and `IocFree`'s device-share lock | `IocAlloc` locks the range for the device (`LockForMapDeviceAddressSpace`, its failure only asserted) and `IocFree` unlocks it once the last reference goes | neither touches the kernel: no device reads an nvmap handle yet (nvhost-as-gpu maps them, slice 10), and the lock's interface is changing to return a release token (owner's ruling of 2026-11-17). Taking it is the follow-up of whichever lands second (`nvsrv/tests.rs`: `alloc_and_free_take_no_device_lock`) |
+//! | A handle whose lock was refused, freed by its last reference | `IocFree` unlocks the range all the same; that fails (and is logged) unless something else holds a lock on it, which it then releases | nothing is released: the handle holds no token (`nvsrv/tests.rs`: `a_refused_lock_leaves_the_handle_allocated_with_no_lock`) |
+//! | The memory states the lock takes | `check_heap` is false: the range need only be `FlagCanAlignedDeviceMap` | the kernel's lock also asks for `FlagReferenceCounted` (`AddressSpace::lock_device_share`). The two differ only for I/O memory, which no process here can map (`MapIoRegion` is not planned), so they answer alike for every state a process here holds, and no test can tell them apart |
+//! | The locks of the handles `CloseSession` frees | not released: `UnmapAllHandles` ignores what `FreeHandle` reports, and the page table goes with the process | each is posted to gsv's completion queue as a release ([`crate::completion::Completion::DeviceShareReleased`]), with no GPU barrier, which the timer thread's drain takes to the kernel: refused as ended once the process has ended (the kernel released its locks when it ended), and released if the process lives on, which departs from the kernel spec's release rule (above, "When the lock is released") (`nvsrv/tests.rs`: `closing_the_last_session_frees_each_handle_once_and_queues_its_lock`) |
+//! | When `IocFree` releases the lock | during the request | the same, which departs from the kernel spec's release rule (above, "When the lock is released") (`nvsrv/tests.rs`: `alloc_locks_the_handle_s_memory_and_the_last_free_releases_it`) |
+//! | The order `CloseSession` frees in | `handles` is an `unordered_map`, copied and walked in its own order | ascending handle id, so the releases are queued in one order a replay repeats (`close_session_frees_in_ascending_id_order`) |
+//! | A handle's lock across a snapshot | no snapshots | not saved: a restored table holds no token, so the handle's last `IocFree` releases nothing and the lock stays until the process ends (`a_restored_table_holds_no_locks`). A gap, not a choice: reclaiming the locks through the kernel on restore, as gsv's GPU memory does, is a follow-up |
 //! | `IocAlloc` whose address plus page-rounded size reaches 2^64 (the range's end, one past its last byte, is 2^64 or more) | stored; the lock fails and Eden asserts, then succeeds | `BadValue` (a guess), nothing stored (`an_allocation_past_the_address_space_is_refused`) |
 //! | The table full, or handle ids used up | neither is bounded (the next id wraps after 2^30 handles) | at most [`MAX_HANDLES`] handles, ids up to `0xFFFF_FFFC`, then `InsufficientMemory` (a guess), nothing made (`create_refuses_a_full_table_and_spent_ids`) |
 //! | A handle duplicated [`MAX_DUPES`] times | the `s32` count overflows | `BadValue` (a guess), the count unchanged (`from_id_stops_at_the_duplicate_limit`) |
 //! | Flags kept for an allocation | the whole word, bit 2 cleared when an address is given | only bit 0 ([`MAP_UNCACHED`]), the one bit anything reads back (`IocFree`) |
 //!
 //! Eden's handles also carry SMMU pins, emulator-internal duplicates and a session; nothing in this
-//! slice pins a handle or duplicates one internally, so they are left out.
+//! slice pins a handle or duplicates one internally, so they are left out, and every handle is
+//! the one process's, so its session need not be kept.
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use starquake_kernel::memory::DeviceShareToken;
 use starquake_memory::PAGE_SIZE;
 
 use super::NvResult;
@@ -195,6 +261,24 @@ pub const MAX_HANDLES: usize = 0x1_0000;
 /// The most references one handle can hold: Eden counts them in an `s32` (`Handle::dupes`).
 pub const MAX_DUPES: u32 = i32::MAX.unsigned_abs();
 
+/// What an ioctl leaves for the request to do through the kernel, which the table cannot reach
+/// (module docs, "The device-share lock").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceShareStep {
+    /// `IocAlloc` allocated `handle` over `size` bytes at `address`: lock them for the device
+    /// and keep the token ([`NvMap::keep_lock`]).
+    Lock {
+        /// The handle allocated.
+        handle: u32,
+        /// The caller's address of its memory.
+        address: u64,
+        /// Its page-rounded size.
+        size: u64,
+    },
+    /// `IocFree` dropped the last reference of a handle that held this lock: release it.
+    Unlock(DeviceShareToken),
+}
+
 /// How a handle was allocated (`IocAlloc`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Allocation {
@@ -277,6 +361,14 @@ fn page_size(size: u32) -> u64 {
 pub struct NvMap {
     handles: BTreeMap<u32, NvMapHandle>,
     next_id: u64,
+    /// The device-share lock each allocated handle holds, by id: the run's, not saved (module
+    /// docs, "The device-share lock").
+    #[serde(skip)]
+    locks: BTreeMap<u32, DeviceShareToken>,
+    /// What the ioctls left for the request to take through the kernel, oldest first; not
+    /// saved ([`NvMap::take_steps`]).
+    #[serde(skip)]
+    steps: Vec<DeviceShareStep>,
 }
 
 /// The serialised form of [`NvMap`], field for field, and what deserialising validates.
@@ -377,7 +469,12 @@ impl TryFrom<SavedNvMap> for NvMap {
         for (&id, handle) in &handles {
             check_handle(id, handle, next_id)?;
         }
-        Ok(Self { handles, next_id })
+        Ok(Self {
+            handles,
+            next_id,
+            locks: BTreeMap::new(),
+            steps: Vec::new(),
+        })
     }
 }
 
@@ -439,6 +536,8 @@ impl NvMap {
         Self {
             handles: BTreeMap::new(),
             next_id: u64::from(HANDLE_ID_INCREMENT),
+            locks: BTreeMap::new(),
+            steps: Vec::new(),
         }
     }
 
@@ -458,6 +557,72 @@ impl NvMap {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.handles.is_empty()
+    }
+
+    /// The device-share lock handle `id` holds, if it holds one (module docs, "The device-share
+    /// lock").
+    #[must_use]
+    pub fn lock(&self, id: u32) -> Option<DeviceShareToken> {
+        self.locks.get(&id).copied()
+    }
+
+    /// The device-share steps the ioctls left, oldest first, taken out: an `IocAlloc`'s lock to
+    /// take and an `IocFree`'s lock to release (module docs, "The device-share lock"). The
+    /// request that ran the ioctl takes them through the kernel before it replies
+    /// (`nvsrv::run_ioctl`); a lock taken goes back with [`keep_lock`](Self::keep_lock). A
+    /// step dropped unacted on leaves a lock untaken or a kernel lock held until the process
+    /// ends, so the result must be used.
+    #[must_use = "a dropped step leaves a lock untaken or a kernel lock held until the process ends"]
+    pub(crate) fn take_steps(&mut self) -> Vec<DeviceShareStep> {
+        core::mem::take(&mut self.steps)
+    }
+
+    /// Keeps `token` as the lock of handle `id`, which a [`DeviceShareStep::Lock`] asked for.
+    /// The token is given back, kept by nothing, unless `id` is still allocated over exactly the
+    /// token's range and holds no lock yet: the caller then releases it.
+    pub(crate) fn keep_lock(
+        &mut self,
+        id: u32,
+        token: DeviceShareToken,
+    ) -> Result<(), DeviceShareToken> {
+        let fits = self.handles.get(&id).is_some_and(|handle| {
+            handle.allocation.is_some_and(|allocation| {
+                allocation.address == token.address() && handle.size() == token.size()
+            })
+        });
+        if !fits || self.locks.contains_key(&id) {
+            return Err(token);
+        }
+        self.locks.insert(id, token);
+        Ok(())
+    }
+
+    /// Eden's `Container::CloseSession` for the process whose last nvdrv session closed:
+    /// `NvMap::UnmapAllHandles`, one `FreeHandle` for each handle, in ascending id order. Each
+    /// handle loses one reference and goes with its last, as `IocFree` does; a handle `IocFromId`
+    /// duplicated keeps the rest (module docs, "When the process's last session closes"). The
+    /// locks of the handles that went, which the caller releases: a token dropped unreleased
+    /// leaves its kernel lock held until the process ends.
+    #[must_use = "a dropped token leaves its kernel lock held until the process ends"]
+    pub(crate) fn close_session(&mut self) -> Vec<DeviceShareToken> {
+        let ids: Vec<u32> = self.handles.keys().copied().collect();
+        ids.into_iter()
+            .filter_map(|id| self.free_handle(id))
+            .collect()
+    }
+
+    /// `NvMap::FreeHandle(id, false)`: one reference fewer, the handle removed with its last.
+    /// The lock the handle held, if it went (Eden's `can_unlock`); `None` for a handle that
+    /// stays, holds no lock, or is not in the table.
+    fn free_handle(&mut self, id: u32) -> Option<DeviceShareToken> {
+        let handle = self.handles.get_mut(&id)?;
+        // A handle in the table holds at least one reference.
+        handle.dupes = handle.dupes.saturating_sub(1);
+        if handle.dupes != 0 {
+            return None;
+        }
+        self.handles.remove(&id);
+        self.locks.remove(&id)
     }
 
     /// Runs an `Ioctl` (1) on `/dev/nvmap`: its result and the argument struct to give back, or
@@ -564,6 +729,14 @@ impl NvMap {
             kind: args.u8_at::<ALLOC_KIND>(),
             address,
         });
+        // `IocAlloc`, once `Handle::Alloc` succeeded: `LockForMapDeviceAddressSpace(&is_out_io,
+        // handle_description->address, handle_description->size, ...)`, taken by the request
+        // (module docs, "The device-share lock").
+        self.steps.push(DeviceShareStep::Lock {
+            handle: id,
+            address,
+            size: handle.size(),
+        });
         NvResult::Success
     }
 
@@ -571,14 +744,14 @@ impl NvMap {
     fn free(&mut self, args: &mut Fixed<FREE_BYTES>) -> NvResult {
         let id = args.u32_at::<FREE_HANDLE>();
         // "Handle null freed?", and a handle `FreeHandle` cannot find: success, nothing written.
-        let Some(handle) = self.handles.get_mut(&id) else {
+        let Some(&handle) = self.handles.get(&id) else {
             return NvResult::Success;
         };
-        // A handle in the table holds at least one reference.
-        handle.dupes = handle.dupes.saturating_sub(1);
-        let handle = *handle;
-        if handle.dupes == 0 {
-            self.handles.remove(&id);
+        // `if (freeInfo->can_unlock) UnlockForDeviceAddressSpace(...)`: the lock goes with the
+        // handle's last reference, released by the request (module docs, "The device-share
+        // lock").
+        if let Some(token) = self.free_handle(id) {
+            self.steps.push(DeviceShareStep::Unlock(token));
         }
         let allocation = handle.allocation;
         let uncached = allocation.is_some_and(|allocation| allocation.uncached);

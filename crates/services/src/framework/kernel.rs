@@ -137,7 +137,8 @@ pub trait Kernel {
     /// unlock of its token: on the timer thread through gsv's completion queue
     /// (`Dispatcher::unlock_device_share`), or during a request with
     /// [`Kernel::unlock_device_share`]. The kernel's errors are its address space's
-    /// (`AddressSpace::lock_device_share`).
+    /// (`AddressSpace::lock_device_share`), and [`KernelError::TerminationRequested`], with
+    /// nothing locked, once the process has ended.
     ///
     /// The default answers [`KernelError::NotImplemented`].
     fn lock_device_share(&mut self, _address: u64, _size: u64) -> SvcResult<DeviceShareToken> {
@@ -146,8 +147,9 @@ pub trait Kernel {
 
     /// Releases the device-share lock `token` names, during a request: what a service does when
     /// a request that took a lock fails after taking it. A token the kernel refuses (another
-    /// process's, or one whose lock is gone) is [`KernelError::InvalidCurrentMemory`]
-    /// (`DeviceShareError`'s mapping).
+    /// process's, or one whose lock is gone) is [`KernelError::InvalidCurrentMemory`], and one
+    /// whose process has ended is [`KernelError::TerminationRequested`] (`DeviceShareError`'s
+    /// mapping).
     ///
     /// The default answers [`KernelError::NotImplemented`].
     fn unlock_device_share(&mut self, _token: DeviceShareToken) -> SvcResult<()> {

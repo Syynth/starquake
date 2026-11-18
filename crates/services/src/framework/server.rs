@@ -614,13 +614,20 @@ impl Server {
     /// Closes `session`. Interfaces no other session or domain still leads to are dropped, and
     /// so is the session's place in the queue: a request in flight on it is never answered, and
     /// a reply token for it completes into nothing. What the session's waiting senders are told
-    /// is the kernel's business.
+    /// is the kernel's business. The family state, if the server has one, is then told how many
+    /// sessions are still open ([`Family::session_closed`]), whether or not releasing the
+    /// interfaces failed; closing a session the server does not know tells it nothing.
     pub fn close(&mut self, session: ObjectId) -> Result<(), ServerError> {
         let target = self.sessions.remove(&session);
         let target = target.ok_or(ServerError::UnknownSession(session))?;
         self.queue.close(session);
         self.pending.retain(|_, request| request.session != session);
-        Ok(self.targets.release(target)?)
+        let released = self.targets.release(target);
+        let open = self.sessions.len();
+        if let Some(family) = self.family.as_deref_mut() {
+            family.session_closed(open);
+        }
+        Ok(released?)
     }
 
     /// A guest thread sent a request on `session`. [`Admission::Start`] means the kernel gives

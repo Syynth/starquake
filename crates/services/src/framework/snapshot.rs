@@ -312,6 +312,19 @@ pub trait Family: Any + Send {
 
     /// Replaces the state with what `bytes` hold. On an error the state is unchanged.
     fn load_state(&mut self, bytes: &[u8]) -> Result<(), SnapshotError>;
+
+    /// A session of the server has closed ([`Server::close`](super::Server::close): its client
+    /// end went, which ending the client's process does to every session it holds, or the
+    /// client sent a close message), and `open` sessions of the server are still open. The
+    /// default does nothing; a family whose state belongs to the client while it holds a
+    /// session (nvdrv's, which frees a process's memory handles when its last session closes)
+    /// overrides it.
+    ///
+    /// It may be called with the kernel's lock held (the kernel reports a closed client end
+    /// under it), so it must not call the kernel, nor wait for anything that does.
+    fn session_closed(&mut self, open: usize) {
+        let _ = open;
+    }
 }
 
 impl<T: Serialize + DeserializeOwned + Any + Send> Family for T {
