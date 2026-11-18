@@ -42,6 +42,13 @@ fn every_note_s_code_and_value_are_pinned() {
             0x0506_0708_090A_0B0C,
         ),
         (
+            Note::VsyncTick {
+                tick: 0x1718_191A_1B1C_1D1E,
+            },
+            4,
+            0x1718_191A_1B1C_1D1E,
+        ),
+        (
             Note::QueueRoom {
                 channel: ChannelId(0x0D0E_0F10),
             },
@@ -67,10 +74,11 @@ fn every_note_s_code_and_value_are_pinned() {
             SYNCPOINT_OBSERVED,
             SYNCPT_PAGE_ANSWERED,
             GPU_ORDERED_DONE,
+            VSYNC_TICK,
             QUEUE_ROOM,
             SYNCPT_PAGE_ACKNOWLEDGED
         ],
-        [1, 2, 3, 8, 9]
+        [1, 2, 3, 4, 8, 9]
     );
 }
 
@@ -139,7 +147,7 @@ fn a_queue_room_note_wider_than_a_channel_is_an_error() {
 #[test]
 fn a_code_gsv_does_not_write_is_an_error() {
     // Zero, each reserved code, and one past the last.
-    for code in [0, 4, 5, 6, 7, 10, u32::MAX] {
+    for code in [0, 5, 6, 7, 10, u32::MAX] {
         let error = Note::decode(code, 1).unwrap_err();
         assert_eq!(error, NoteError::UnknownCode { code });
         assert_eq!(
@@ -175,6 +183,20 @@ fn a_page_acknowledge_note_names_a_non_empty_set_of_the_page_s_groups() {
     }
 }
 
+#[test]
+fn a_vsync_tick_note_is_numbered_from_one() {
+    // The first tick and the last number a tick count can reach.
+    for tick in [1, u64::MAX] {
+        assert_eq!(Note::decode(VSYNC_TICK, tick), Ok(Note::VsyncTick { tick }));
+    }
+    let error = Note::decode(VSYNC_TICK, 0).unwrap_err();
+    assert_eq!(error, NoteError::NoSuchTick);
+    assert_eq!(
+        error.to_string(),
+        "vsync tick note value 0 is not a tick number (ticks are counted from 1)"
+    );
+}
+
 fn note() -> impl Strategy<Value = Note> {
     let ids = 0..u8::try_from(SYNCPOINT_COUNT).unwrap();
     prop_oneof![
@@ -184,6 +206,7 @@ fn note() -> impl Strategy<Value = Note> {
         any::<u64>().prop_map(|ticket| Note::GpuOrderedDone {
             ticket: Ticket(ticket)
         }),
+        (1..=u64::MAX).prop_map(|tick| Note::VsyncTick { tick }),
         any::<u32>().prop_map(|channel| Note::QueueRoom {
             channel: ChannelId(channel)
         }),

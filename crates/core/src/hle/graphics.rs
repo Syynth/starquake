@@ -21,10 +21,12 @@
 //! | nvsrv | [`GSV_NVSRV`] | `nvsrv_server` over the shared state and the front, with the front as its channel front too, and told of deferred replies as `fsp-srv` is ([`super::Reads::ready`]) |
 //!
 //! The root answers 202, 204, 497 and 1402 with its family's server (`starquake_gsv::root`,
-//! "The family sessions"); every other root command is still the root's logged stub. Slices 12
-//! to 15 (the vsync clock, vi2, present and video: issues 190 to 193) are not built: when they
-//! land, each adds its server here beside these and its number to the root, and 305, the video
-//! commands and the native image commands stop being stubs.
+//! "The family sessions"); every other root command is still the root's logged stub. The vsync
+//! clock (slice 12, `starquake_gsv::shared::vsync`) needs no server: it is part of gsv's shared
+//! state and runs in the timer thread's turn (below), and vi2 (slice 13) will start it by adding
+//! listeners. Slices 13 to 15 (vi2, present and video: issues 191 to 193) are not built: when
+//! they land, each adds its server here beside these and its number to the root, and 305, the
+//! video commands and the native image commands stop being stubs.
 //!
 //! # The GPU front
 //!
@@ -68,9 +70,15 @@
 //!
 //! Each turn of the run's timer thread (`crate::machine`'s `timer` module) calls
 //! [`Graphics::turn`] with a [`KernelHost`] over the run's dispatcher, and the time: the drain
-//! (`Shared::drain`), then the shared page's turn (`Shared::tick_page`). The thread sleeps no
-//! later than [`Graphics::deadline`], and the queue's [`Wake`] rings it. [`KernelHost`] is the
-//! drain's [`TimerHost`] over the kernel:
+//! (`Shared::drain`), then the shared page's turn (`Shared::tick_page`), then the vsync clock's:
+//! in a run ([`FrontMode::Live`]) the live turn at the turn's time (`Shared::tick_vsync`), in a
+//! replay ([`FrontMode::Replay`]) the delivery of the ticks fed back
+//! (`Shared::tick_replayed_vsync`; below, "Replay"). The thread sleeps no later than
+//! [`Graphics::deadline`], which in a run includes the vsync clock's deadline, and the queue's
+//! [`Wake`] rings it. The thread runs the turn only when [`Graphics::wants_turn`] says so: the
+//! graphics server is not idle but for the clock, or the clock's deadline has come by the loop's
+//! own copy of the clock, so a clock waiting for its deadline adds no reading of the
+//! environment. [`KernelHost`] is the drain's [`TimerHost`] over the kernel:
 //!
 //! - a note is recorded by `Dispatcher::record_host_event`, under the kernel lock, on the core
 //!   and thread the host is given (the timer thread's: core 0, no guest thread);
@@ -95,8 +103,8 @@
 //! (`crate::machine`'s `WAITING`). The kernel's own check (`Dispatcher::is_stalled`) does not
 //! know that the timer thread's turn signals gsv's events, so the core loop asks
 //! [`Graphics::is_idle`] first: a run is stalled only if the graphics server is idle too
-//! (nothing queued, nothing held by the shared page, no page signal waiting) and then the
-//! kernel says so. With [`NullFront`] nothing is in flight on a GPU, so that is everything the
+//! (nothing queued, nothing held by the shared page, no page signal waiting, no vsync tick to
+//! come: in a run the clock stopped, in a replay no tick fed back) and then the kernel says so. With [`NullFront`] nothing is in flight on a GPU, so that is everything the
 //! turn could still signal; a GPU front with work in flight must add that (a follow-up for
 //! issue 12's front).
 //!
@@ -112,6 +120,7 @@
 //! | `SyncpointObserved { id, value }` | the counter brought to `value` if it is behind it (by the 32-bit wrapping comparison: up to 2^31 - 1 ahead), then `SyncpointChanged { id, value }` pushed as it is, also for a value not ahead of the counter (a stale one, which the queue can drain after a newer one); the counter's own push, for a watched id, has the same value and the queue folds the two into one entry (`starquake_gsv::completion`, "Coalescing") |
 //! | `GpuOrderedDone { ticket }` | `GpuOrdered { ticket }` pushed |
 //! | `QueueRoom { channel }` | `GpuQueueRoom { channel }` pushed |
+//! | `VsyncTick { tick }` | fed back to the vsync clock (`Shared::replay_vsync`), which takes only the next number ([`ReplayError::Vsync`]); the next turn delivers it, counted, recorded and signalled as the run's was. In a replay the clock does not tick on its own |
 //! | `SyncptPageAnswered`, `SyncptPageAcknowledged` | refused ([`ReplayError::NotAnInput`]): they are what a page turn writes, not an input |
 //!
 //! Each note is fed back and drained on its own, in the recorded order: the drain acts on its
@@ -161,6 +170,7 @@ use starquake_gsv::note::Note;
 use starquake_gsv::nvsrv::gpu::{ChannelConfig, ChannelFront, GpuError, Submission, Submitted};
 use starquake_gsv::nvsrv::{self, NvsrvFamily};
 use starquake_gsv::root::{self, RootState};
+use starquake_gsv::shared::vsync::VsyncReplayError;
 use starquake_gsv::shared::{Shared, TimerHost};
 use starquake_gsv::syncpt;
 use starquake_kernel::dispatch::{DeviceShareError, Dispatcher, WakeError};
@@ -310,12 +320,18 @@ pub enum ReplayError {
         /// The note's code.
         code: u32,
     },
+    /// A recorded vsync tick the clock does not take: not the next one.
+    #[error("a recorded vsync tick could not be fed back: {0}")]
+    Vsync(#[from] VsyncReplayError),
 }
 
 /// The graphics server of a run: its shared state and its GPU front (module docs).
 pub struct Graphics {
     shared: Arc<Shared>,
     front: Arc<NullFront>,
+    /// Whether the run's own inputs complete things, or only recorded notes: the front's mode,
+    /// which also picks the vsync clock's turn (module docs, "The timer thread's turn").
+    mode: FrontMode,
 }
 
 impl Graphics {
@@ -336,7 +352,11 @@ impl Graphics {
             Arc::clone(&queue),
         ));
         let shared = Arc::new(Shared::new(syncpoints, queue, GSV_ROOT));
-        Self { shared, front }
+        Self {
+            shared,
+            front,
+            mode,
+        }
     }
 
     /// gsv's shared state, with its syncpoints and queue.
@@ -396,30 +416,68 @@ impl Graphics {
     }
 
     /// The timer thread's turn (module docs, "The timer thread's turn"): drains the queue
-    /// through `host`, then runs the shared page's turn at `now`. Returns what the drain took,
-    /// in order.
+    /// through `host`, then runs the shared page's turn at `now`, then the vsync clock's turn for
+    /// the front's mode. Returns what the drain took, in order.
     pub fn turn(&self, host: &mut dyn TimerHost, now: HostNanos) -> Vec<Completion> {
         let taken = self.shared.drain(host);
         self.shared.tick_page(host, now);
+        match self.mode {
+            FrontMode::Live => self.shared.tick_vsync(host, now),
+            FrontMode::Replay => self.shared.tick_replayed_vsync(host),
+        }
         taken
     }
 
-    /// When the timer thread must turn next at the latest: the shared page's deadline, if it
-    /// holds a request.
+    /// When the timer thread must turn next at the latest: the earlier of the shared page's
+    /// deadline, if it holds a request, and, in a run, the vsync clock's, while it runs.
     #[must_use]
     pub fn deadline(&self) -> Option<HostNanos> {
-        self.shared.page_deadline()
+        let page = self.shared.page_deadline();
+        let vsync = match self.mode {
+            FrontMode::Live => self.shared.vsync_deadline(),
+            FrontMode::Replay => None,
+        };
+        match (page, vsync) {
+            (Some(page), Some(vsync)) => Some(page.min(vsync)),
+            (page, vsync) => page.or(vsync),
+        }
     }
 
     /// Whether the graphics server has nothing left that could signal an event without a guest's
     /// call first (module docs, "Telling a stalled run"): nothing queued, no request held by the
-    /// shared page, and no guest signal of the page waiting for its turn. It takes gsv's shared
-    /// lock, so it waits for a drain in progress, whose signals are then made.
+    /// shared page, no guest signal of the page waiting for its turn, and no vsync tick to come
+    /// (in a run the clock stopped, in a replay no tick fed back). It takes gsv's shared lock,
+    /// so it waits for a drain in progress, whose signals are then made.
     #[must_use]
     pub fn is_idle(&self) -> bool {
+        let ticking = match self.mode {
+            FrontMode::Live => self.shared.vsync_deadline().is_some(),
+            FrontMode::Replay => false,
+        };
+        !ticking && self.is_idle_but_the_clock()
+    }
+
+    /// Whether the timer thread should run [`Graphics::turn`] at `now`, the loop's own reading
+    /// of the clock (module docs, "The timer thread's turn"): the graphics server is not idle
+    /// but for the vsync clock, or, in a run, the clock's deadline has come by `now`.
+    #[must_use]
+    pub fn wants_turn(&self, now: HostNanos) -> bool {
+        let due = match self.mode {
+            FrontMode::Live => self.shared.lock().vsync().is_due(now),
+            FrontMode::Replay => false,
+        };
+        due || !self.is_idle_but_the_clock()
+    }
+
+    /// [`Graphics::is_idle`] but for a running vsync clock: nothing queued, nothing held or
+    /// signalled at the shared page, and no tick fed back for replay.
+    fn is_idle_but_the_clock(&self) -> bool {
         let locked = self.shared.lock();
         let page = locked.page();
-        let idle = page.held().is_none() && !page.is_signalled() && self.shared.queue().is_empty();
+        let idle = page.held().is_none()
+            && !page.is_signalled()
+            && locked.vsync().replayed() == 0
+            && self.shared.queue().is_empty();
         drop(locked);
         idle
     }
@@ -435,6 +493,10 @@ impl Graphics {
             }
             Note::GpuOrderedDone { ticket } => GpuCompletion::GpuOrdered { ticket },
             Note::QueueRoom { channel } => GpuCompletion::GpuQueueRoom { channel },
+            Note::VsyncTick { tick } => {
+                self.shared.replay_vsync(tick)?;
+                return Ok(());
+            }
             Note::SyncptPageAnswered { .. } | Note::SyncptPageAcknowledged { .. } => {
                 return Err(ReplayError::NotAnInput { code: note.code() });
             }

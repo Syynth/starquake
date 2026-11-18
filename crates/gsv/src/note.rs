@@ -1,7 +1,7 @@
 //! The notes the graphics server records for replay: every input replay cannot reproduce, written
 //! by the timer thread as it drains the completion queue or answers the shared syncpoint page
 //! (`docs/specs/graphics-server.md`, "What is recorded"; port slice 3 writes codes 1, 3 and 8,
-//! slice 5 codes 2 and 9).
+//! slice 5 codes 2 and 9, slice 12 code 4).
 //!
 //! Each note is one [`EventKind::ServiceNote`]: the service's number, a code, and one `u64`
 //! value. The codes and the packing of each value are starquake's own (no reference records
@@ -13,7 +13,7 @@
 //! | 1 | `SyncpointObserved` | the id in bits 32..40 ([`SYNCPOINT_ID_SHIFT`]), the value in bits 0..32 | the drain, for each `SyncpointChanged` it takes |
 //! | 2 | `SyncptPageAnswered` | packed as code 1: the id in bits 32..40, the counter value the page's answer read in bits 0..32 | the timer thread's page turn, once for each value it writes into the page ([`crate::shared::page`], "What is recorded") |
 //! | 3 | `GpuOrderedDone` | the ticket | the drain, for each `GpuOrdered` it takes |
-//! | 4 | `VsyncTick` | reserved for the vsync clock (slice 12) | |
+//! | 4 | `VsyncTick` | the tick's number: the count of ticks the clock has delivered, this one included, so the first is 1 (0 is never written) | the timer thread's vsync turn, once for each tick, before the tick signals its listeners ([`crate::shared::vsync`], "What is recorded") |
 //! | 5 | `FrameLatched` | reserved for present (slice 14) | |
 //! | 6 | `BufferReleased` | reserved for present (slice 14) | |
 //! | 7 | `VideoFrameDone` | reserved for the video worker | |
@@ -43,6 +43,9 @@ pub const SYNCPT_PAGE_ANSWERED: u32 = 2;
 
 /// The code of a `GpuOrderedDone` note.
 pub const GPU_ORDERED_DONE: u32 = 3;
+
+/// The code of a `VsyncTick` note.
+pub const VSYNC_TICK: u32 = 4;
 
 /// The code of a `QueueRoom` note.
 pub const QUEUE_ROOM: u32 = 8;
@@ -78,6 +81,11 @@ pub enum Note {
         /// The ticket.
         ticket: Ticket,
     },
+    /// The vsync clock delivered its tick numbered `tick` ([`crate::shared::vsync`]).
+    VsyncTick {
+        /// The tick's number, counted from 1.
+        tick: u64,
+    },
     /// The full queue of `channel` has room again.
     QueueRoom {
         /// The channel.
@@ -112,6 +120,9 @@ pub enum NoteError {
         /// The value.
         value: u64,
     },
+    /// A `VsyncTick` value of 0: ticks are counted from 1.
+    #[error("vsync tick note value 0 is not a tick number (ticks are counted from 1)")]
+    NoSuchTick,
     /// A `SyncptPageAcknowledged` value that names no group, or a bit past the last group.
     #[error(
         "page acknowledge note value {value:#x} is not a non-empty set of the page's {GROUP_COUNT} groups"
@@ -130,6 +141,7 @@ impl Note {
             Self::SyncpointObserved { .. } => SYNCPOINT_OBSERVED,
             Self::SyncptPageAnswered { .. } => SYNCPT_PAGE_ANSWERED,
             Self::GpuOrderedDone { .. } => GPU_ORDERED_DONE,
+            Self::VsyncTick { .. } => VSYNC_TICK,
             Self::QueueRoom { .. } => QUEUE_ROOM,
             Self::SyncptPageAcknowledged { .. } => SYNCPT_PAGE_ACKNOWLEDGED,
         }
@@ -143,6 +155,7 @@ impl Note {
                 (u64::from(id.get()) << SYNCPOINT_ID_SHIFT) | u64::from(value)
             }
             Self::GpuOrderedDone { ticket } => ticket.0,
+            Self::VsyncTick { tick } => tick,
             Self::QueueRoom { channel } => u64::from(channel.0),
             Self::SyncptPageAcknowledged { groups } => groups,
         }
@@ -172,6 +185,10 @@ impl Note {
             GPU_ORDERED_DONE => Ok(Self::GpuOrderedDone {
                 ticket: Ticket(value),
             }),
+            VSYNC_TICK => match value {
+                0 => Err(NoteError::NoSuchTick),
+                tick => Ok(Self::VsyncTick { tick }),
+            },
             QUEUE_ROOM => Ok(Self::QueueRoom {
                 channel: ChannelId(
                     u32::try_from(value).map_err(|_| NoteError::NoSuchChannel { value })?,

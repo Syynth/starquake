@@ -39,21 +39,29 @@
 //! # The graphics server's turn
 //!
 //! Each turn, after the deliveries, runs the graphics server's turn
-//! (`crate::hle::Graphics::turn`): it drains the graphics server's completion queue and answers
-//! its shared syncpoint page, through a [`KernelHost`] over the run's dispatcher, on core [`CORE`]
+//! (`crate::hle::Graphics::turn`): it drains the graphics server's completion queue, answers
+//! its shared syncpoint page and ticks its vsync clock, through a [`KernelHost`] over the run's
+//! dispatcher, on core [`CORE`]
 //! and no guest thread, with the time read from the environment's clock (the spec: "The turn's
 //! time is the timer thread's, from the `Env` clock"). The cores are then rescheduled, since the
-//! drain's signals may have woken threads. While the graphics server is idle
-//! (`crate::hle::Graphics::is_idle`: nothing queued, no request held by the page, no page signal
-//! waiting) the turn is skipped, the clock not read: the environment is read only when there is
-//! work, as for the kernel's timeouts and the deliveries, so an idle server adds no reading that
-//! falls among the cores' by host timing (`an_idle_graphics_turn_reads_nothing_and_a_busy_one_reads_the_clock`). The queue rings the timer thread's [`Bell`] when
+//! drain's signals may have woken threads. While the graphics server has no work
+//! (`crate::hle::Graphics::wants_turn`: nothing queued, no request held by the page, no page
+//! signal waiting, and the vsync clock stopped or its deadline not yet come by the loop's copy
+//! of the clock) the turn is skipped, the environment's clock not read: it is read only when
+//! there is work, as for the kernel's timeouts and the deliveries, so an idle server, or a vsync
+//! clock between ticks, adds no reading that falls among the cores' by host timing
+//! (`an_idle_graphics_turn_reads_nothing_and_a_busy_one_reads_the_clock`,
+//! `a_waiting_vsync_clock_reads_nothing_and_a_due_one_ticks`). The queue rings the timer thread's [`Bell`] when
 //! something is queued onto it ([`Wake`]), and the thread sleeps no later than the graphics
 //! server's deadline (`crate::hle::Graphics::deadline`). An environment that fails during the
 //! turn ends the run (`crate::hle::graphics`, "The timer thread's turn"), with the words
 //! [`GRAPHICS_ENV_FAILED`] and the failure's.
 //!
-//! Not here yet: vsync (the graphics server's slice 12).
+//! A listener starts the vsync clock with its deadline one interval (16,666,666 ns) out, more
+//! than [`PREEMPTION_INTERVAL_NS`], so a sleep that began before the start ends before the
+//! deadline and the next one is bounded by it; no ring is needed for a start. A tick made by
+//! this thread reaches a waiting guest
+//! (`the_timer_thread_ticks_the_vsync_clock_and_wakes_a_listener_s_waiter`).
 
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -229,11 +237,12 @@ pub(super) fn deliver<V: Vcpu, C: HostClock + Clone>(
 }
 
 /// The graphics server's turn (module docs, "The graphics server's turn"), then a reschedule;
-/// nothing at all, the clock not read, while the graphics server is idle.
+/// nothing at all, the environment's clock not read, while the graphics server has no work by
+/// the loop's copy of the clock.
 pub(super) fn graphics<V: Vcpu, C: HostClock + Clone>(
     machine: &Machine<'_, V, C>,
 ) -> Result<(), Ending> {
-    if machine.graphics.is_idle() {
+    if !machine.graphics.wants_turn(machine.session.clock.host_now()) {
         return Ok(());
     }
     let failed = |error| Ending::Failed(format!("{GRAPHICS_ENV_FAILED}: {error}"));
