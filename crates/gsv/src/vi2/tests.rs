@@ -1577,7 +1577,7 @@ fn availability_makes_the_layer_once() {
     let mut state = Vi2Session::new();
     state.display_references = 1;
     state.next_layer = u64::MAX - 1;
-    state.clients = vec![Client::new(1, 0, 1), Client::new(2, 2, 3)];
+    state.clients = vec![Client::new(1, 0, 0, 1), Client::new(2, 1, 2, 3)];
     rig.replace(state);
     rig.ok_data(&client_only(0xE4, 1));
     assert_eq!(rig.session_state().next_layer(), u64::MAX);

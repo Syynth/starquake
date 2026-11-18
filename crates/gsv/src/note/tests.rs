@@ -50,19 +50,21 @@ fn every_note_s_code_and_value_are_pinned() {
         ),
         (
             Note::FrameLatched {
+                client: 0x1F,
                 slot: 0x0B,
                 image: 0x2122_2324,
             },
             5,
-            0x0B_2122_2324,
+            0x1F0B_2122_2324,
         ),
         (
             Note::BufferReleased {
+                client: 0x2F,
                 slot: 0x0C,
                 image: 0x3132_3334,
             },
             6,
-            0x0C_3132_3334,
+            0x2F0C_3132_3334,
         ),
         (
             Note::QueueRoom {
@@ -98,7 +100,7 @@ fn every_note_s_code_and_value_are_pinned() {
         ],
         [1, 2, 3, 4, 5, 6, 8, 9]
     );
-    assert_eq!(SLOT_SHIFT, 32);
+    assert_eq!((SLOT_SHIFT, CLIENT_SHIFT), (32, 40));
 }
 
 /// A constructor of a note that packs a syncpoint id and a counter value.
@@ -216,47 +218,91 @@ fn a_vsync_tick_note_is_numbered_from_one() {
     );
 }
 
-/// A constructor of a note that packs a buffer slot and an image.
-type MakeFrame = fn(u8, u32) -> Note;
+/// A constructor of a note that packs a client, a buffer slot and an image.
+type MakeFrame = fn(u8, u8, u32) -> Note;
 
-/// The two notes that pack a buffer slot and an image, each with its constructor.
+/// The two notes that pack a client, a buffer slot and an image, each with its constructor.
 fn frame_notes() -> [(u32, MakeFrame); 2] {
     [
-        (FRAME_LATCHED, |slot, image| Note::FrameLatched {
+        (FRAME_LATCHED, |client, slot, image| Note::FrameLatched {
+            client,
             slot,
             image,
         }),
-        (BUFFER_RELEASED, |slot, image| Note::BufferReleased {
-            slot,
-            image,
+        (BUFFER_RELEASED, |client, slot, image| {
+            Note::BufferReleased {
+                client,
+                slot,
+                image,
+            }
         }),
     ]
 }
 
+/// The last client number the present table gives.
+fn last_client() -> u8 {
+    u8::try_from(MAX_PRESENT_CLIENTS - 1).unwrap()
+}
+
 #[test]
 fn a_frame_note_reads_back_at_its_edges() {
-    // Hand-built values: slot 0 with image 0, the last slot with the highest image.
+    // Hand-built values: client 0, slot 0 and image 0; the last client, the last slot and the
+    // highest image.
     let last = SLOTS - 1;
-    let top = (u64::from(last) << SLOT_SHIFT) | u64::from(u32::MAX);
-    assert_eq!(top, 0x0E_FFFF_FFFF);
+    let top = (u64::from(last_client()) << CLIENT_SHIFT)
+        | (u64::from(last) << SLOT_SHIFT)
+        | u64::from(u32::MAX);
+    assert_eq!(top, 0x7F0E_FFFF_FFFF);
     for (code, make) in frame_notes() {
-        assert_eq!(Note::decode(code, 0), Ok(make(0, 0)));
-        assert_eq!(Note::decode(code, top), Ok(make(last, u32::MAX)));
+        assert_eq!(Note::decode(code, 0), Ok(make(0, 0, 0)));
+        assert_eq!(
+            Note::decode(code, top),
+            Ok(make(last_client(), last, u32::MAX))
+        );
     }
 }
 
 #[test]
 fn a_frame_note_naming_no_slot_is_an_error() {
-    // The first slot past the last, a bit above the slot's byte, and every bit.
+    // The first slot past the last, with an image and with a valid client; the slot byte's top
+    // bit; and every bit (which names no client either: the slot is checked first).
     let past = u64::from(SLOTS) << SLOT_SHIFT;
-    let high = 1 << (SLOT_SHIFT + u8::BITS);
+    let top_bit = 0x80 << SLOT_SHIFT;
+    let client = 1 << CLIENT_SHIFT;
     for (code, _) in frame_notes() {
-        for value in [past, past | 1, high, u64::MAX] {
+        for value in [past, past | 1, past | client, top_bit, u64::MAX] {
             let error = Note::decode(code, value).unwrap_err();
             assert_eq!(error, NoteError::NoSuchSlot { value });
             assert_eq!(
                 error.to_string(),
                 format!("frame note value {value:#x} names no buffer slot (there are 15)")
+            );
+        }
+    }
+}
+
+#[test]
+fn a_frame_note_naming_no_client_is_an_error() {
+    // The first client number past the last, the client byte's top bit, and a bit from 48 up,
+    // each with a valid slot and image.
+    let slot = u64::from(SLOTS - 1) << SLOT_SHIFT;
+    let past = u64::try_from(MAX_PRESENT_CLIENTS).unwrap() << CLIENT_SHIFT;
+    let byte_top = 0xFF << CLIENT_SHIFT;
+    let above = 1 << (CLIENT_SHIFT + u8::BITS);
+    for (code, _) in frame_notes() {
+        for value in [
+            past | slot,
+            byte_top | slot | 1,
+            above | slot,
+            !(0xF1 << SLOT_SHIFT),
+        ] {
+            let error = Note::decode(code, value).unwrap_err();
+            assert_eq!(error, NoteError::NoSuchClient { value });
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "frame note value {value:#x} names no present table client (there are 128)"
+                )
             );
         }
     }
@@ -272,8 +318,20 @@ fn note() -> impl Strategy<Value = Note> {
             ticket: Ticket(ticket)
         }),
         (1..=u64::MAX).prop_map(|tick| Note::VsyncTick { tick }),
-        (0..SLOTS, any::<u32>()).prop_map(|(slot, image)| Note::FrameLatched { slot, image }),
-        (0..SLOTS, any::<u32>()).prop_map(|(slot, image)| Note::BufferReleased { slot, image }),
+        (0..=last_client(), 0..SLOTS, any::<u32>()).prop_map(|(client, slot, image)| {
+            Note::FrameLatched {
+                client,
+                slot,
+                image,
+            }
+        }),
+        (0..=last_client(), 0..SLOTS, any::<u32>()).prop_map(|(client, slot, image)| {
+            Note::BufferReleased {
+                client,
+                slot,
+                image,
+            }
+        }),
         any::<u32>().prop_map(|channel| Note::QueueRoom {
             channel: ChannelId(channel)
         }),

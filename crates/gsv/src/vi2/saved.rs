@@ -8,10 +8,13 @@
 //! of an object id: its index, then its generation), the [`NOTIFICATION_WORDS`] words of the
 //! bitmap, the request groups (a length, then each group's event and its monitor: the display's
 //! name and the kind), the group count 51 recorded, the display's references, the clients (a
-//! length, then each one's token, retire bit, available bit, whether bound, layer, free slots and
-//! levels as `f32` bits), the endpoint's client, and the next layer number. The server's
-//! snapshot holds it within its own header; the golden-bytes test
-//! `the_saved_session_layout_is_pinned` (`vi2/tests/saved.rs`) pins it.
+//! length, then each one's token, number in gsv's present table, retire bit, available bit,
+//! whether bound, layer, free slots and levels as `f32` bits), the endpoint's client, and the
+//! next layer number. The server's snapshot holds it within its own header; the golden-bytes
+//! test `the_saved_session_layout_is_pinned` (`vi2/tests/saved.rs`) pins it. The layout has no
+//! version of its own: a server snapshot is good only for the build that wrote it
+//! (`starquake_services::framework::snapshot`, "Format"), so the client's present number, added
+//! with present (slice 14), changes the golden bytes and nothing else.
 //!
 //! # What a restore checks
 //!
@@ -33,7 +36,9 @@
 //! 6. A next layer number of at least [`FIRST_LAYER`] ([`Vi2SessionError::NextLayer`]).
 //! 7. At most [`MAX_CLIENTS`] clients ([`Vi2SessionError::TooManyClients`]).
 //! 8. Each client in order: a token that is not zero ([`Vi2SessionError::ZeroToken`]) and no
-//!    earlier client's ([`Vi2SessionError::DuplicateToken`]); two different bits below
+//!    earlier client's ([`Vi2SessionError::DuplicateToken`]); a present number below
+//!    [`MAX_PRESENT_CLIENTS`] ([`Vi2SessionError::PresentNumber`]) and no earlier client's
+//!    ([`Vi2SessionError::SharedPresentNumber`]); two different bits below
 //!    [`CLIENT_NOTIFICATIONS`] ([`Vi2SessionError::ClientBits`]) that no earlier client holds
 //!    ([`Vi2SessionError::SharedBit`]); free slots within [`ALL_SLOTS`]
 //!    ([`Vi2SessionError::Availability`]); a layer from [`FIRST_LAYER`] and below the next
@@ -55,6 +60,10 @@
 //!   them: any bit of the first word is accepted, and 21 hands it out.
 //! - That two sessions' layers have different numbers: layers are numbered per session (module
 //!   docs of [`super`], "Layers").
+//! - That a client's present number names an entry of gsv's present table that holds its token,
+//!   or that no other session's client has the number: the table is restored on its own
+//!   ([`crate::shared::Shared::restore_presents`], whose "Not checked here" gives the
+//!   consequences).
 
 use serde::Deserialize;
 use starquake_kernel::id::ObjectId;
@@ -65,6 +74,7 @@ use super::{
     MONITOR_KINDS, NOTIFICATION_WORDS, REQUEST_GROUPS, RequestGroup, Vi2Session, is_known_display,
     levels_are_valid,
 };
+use crate::shared::present::MAX_PRESENT_CLIENTS;
 
 /// The serialised form of [`Vi2Session`], field for field, and what deserialising validates
 /// (module docs).
@@ -163,6 +173,20 @@ pub enum Vi2SessionError {
     /// Two clients with one token: 201 refuses the second.
     #[error("vi2 clients {first} and {second} have the same token")]
     DuplicateToken {
+        /// The earlier client.
+        first: usize,
+        /// The later client.
+        second: usize,
+    },
+    /// A client whose present number is not below [`MAX_PRESENT_CLIENTS`]: 201 gives none.
+    #[error("vi2 client {index}'s present number is not below {MAX_PRESENT_CLIENTS}")]
+    PresentNumber {
+        /// The client's index.
+        index: usize,
+    },
+    /// Two clients with one present number: 201 gives each its own.
+    #[error("vi2 clients {first} and {second} have the same present number")]
+    SharedPresentNumber {
         /// The earlier client.
         first: usize,
         /// The later client.
@@ -270,6 +294,15 @@ impl SavedVi2Session {
             }
             if let Some(first) = earlier.iter().position(|c| c.token == client.token) {
                 return Err(Vi2SessionError::DuplicateToken {
+                    first,
+                    second: index,
+                });
+            }
+            if usize::from(client.present) >= MAX_PRESENT_CLIENTS {
+                return Err(Vi2SessionError::PresentNumber { index });
+            }
+            if let Some(first) = earlier.iter().position(|c| c.present == client.present) {
+                return Err(Vi2SessionError::SharedPresentNumber {
                     first,
                     second: index,
                 });

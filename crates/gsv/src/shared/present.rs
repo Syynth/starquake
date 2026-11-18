@@ -21,7 +21,13 @@
 //! A vi2 session keeps its clients ([`crate::vi2::Client`]) as PR keeps them, per session. The
 //! latch runs on the vsync tick, on the timer thread, which cannot reach a session's state; so
 //! what the tick reads and writes lives here, in gsv's shared state, one [`PresentClient`] per
-//! registered client, keyed by the client's token:
+//! registered client, keyed by the client's number: the lowest number below
+//! [`MAX_PRESENT_CLIENTS`] that no client holds, which 201 gives the client
+//! ([`Presents::register`]) and the session keeps beside its token. A token names a client only
+//! within its session, as in PR: two sessions may register the same token, and each gets its
+//! own entry (`a_token_is_a_client_per_session`, in `vi2/tests/present.rs`). The number is what
+//! the latch's notes name the client by ([`crate::note`], codes 5 and 6). The table holds, for
+//! each client:
 //!
 //! - the frames 229 queued, oldest first, and the one shown;
 //! - the slots the ticks released and whether they raised the client's "buffer available"
@@ -33,12 +39,12 @@
 //!
 //! 201 adds the client's entry and 202 removes it ([`Locked::unregister_present`]), so the table
 //! holds exactly the clients the sessions registered, until a session closes without 202 (below,
-//! "Bounds").
+//! "Bounds"); 202 frees the number for the next 201.
 //!
 //! # The latch
 //!
 //! Each vsync tick, after it has signalled the clock's listeners ([`crate::shared::vsync`],
-//! "Tick"), runs the latch (`Locked::latch`) over the clients in ascending token order. For
+//! "Tick"), runs the latch (`Locked::latch`) over the clients in ascending number order. For
 //! each client:
 //!
 //! 1. If the oldest queued frame's fence is reached, it is taken out of the queue and becomes the
@@ -60,12 +66,19 @@
 //! **Reached means drained.** A frame's fence counts as reached once a drained
 //! `SyncpointChanged` says so, as an armed syncpt wait fires on the drained value and not the
 //! counter (`crate::shared`, "Waits fire on the drained value"): queuing a frame watches its
-//! fence's syncpoint ([`Locked::watch`]), compares the counter read after that with the fence
-//! (32-bit wrapping, PR `static_cast<s32>(*counter - point.value) < 0`), and keeps the watch
-//! until a drained value reaches it ([`Presents::reach`], from [`crate::shared::Shared::drain`]).
-//! So what the latch acts on is what the recorded `SyncpointObserved` notes say, and a replay
-//! that feeds them back latches on the same ticks. A frame with no fence (the request's fence
-//! word is 0, PR `fence_id == ~u32{0}`) is reached at once.
+//! fence's syncpoint ([`Locked::watch`]) and keeps the watch until a drained value reaches it
+//! ([`Presents::reach`], from [`crate::shared::Shared::drain`]), which records that value as a
+//! `SyncpointObserved` note. When the counter read after the watch already reaches the fence
+//! (32-bit wrapping, PR `static_cast<s32>(*counter - point.value) < 0`), the frame is still not
+//! reached when it is queued: [`Locked::commit_frame`] hands back a
+//! `SyncpointChanged { id, value }` of that reading, which the caller pushes onto the completion
+//! queue, so the next drain records it and marks the frame reached, as syncpt 201 does for a
+//! wait reached when armed (`crate::syncpt`, "Where this differs"). So every frame with a fence
+//! is reached by a drained value that a `SyncpointObserved` note records, and a replay that
+//! feeds the notes back (where the counter moves only on what is fed back) reaches and latches
+//! it on the same ticks (`an_already_reached_fence_replays_to_the_same_latch`, in
+//! `hle/tests/graphics/present.rs` of the core crate). A frame with no fence (the request's
+//! fence word is 0, PR `fence_id == ~u32{0}`) is reached at once.
 //!
 //! **The clock runs while a present waits.** The vsync clock runs while it has a listener
 //! ([`crate::shared::vsync`], "The clock") or while this table has work: a queued frame or a held
@@ -93,13 +106,14 @@
 //! queue more, and it holds at most two), and at most one held reply per client. A session closed
 //! without 202 leaves its clients here, as it leaves its events in the kernel (the framework tells
 //! a session nothing when it closes; [`crate::vi2`], "Where this differs"): their frames still
-//! latch, and their tokens stay taken. [`MAX_PRESENT_CLIENTS`] bounds what that can grow to; past
-//! it 201 answers `OutOfResource`. Each tick's latch walks the table once.
+//! latch, and their numbers stay taken. [`MAX_PRESENT_CLIENTS`] bounds what that can grow to;
+//! past it 201 answers `OutOfResource`. Each tick's latch walks the table once.
 //!
 //! # What is recorded
 //!
-//! The latch records, for each client in token order, `FrameLatched` then `BufferReleased`
-//! ([`crate::note`], codes 5 and 6: the slot and the image), after the tick's own `VsyncTick` and
+//! The latch records, for each client in number order, `FrameLatched` then `BufferReleased`
+//! ([`crate::note`], codes 5 and 6: the client's number, the slot and the image), after the
+//! tick's own `VsyncTick` and
 //! before the release's signal. Both follow from the ticks and the drained syncpoint values a
 //! replay feeds back, so a replay does not feed them back.
 //!
@@ -107,8 +121,9 @@
 //!
 //! [`crate::shared::Shared::save_presents`] writes the table: `postcard`, after a header of
 //! [`SNAPSHOT_MAGIC`] and [`SNAPSHOT_VERSION`], decoded and checked before the body. The body is
-//! the clients in ascending token order, each its token, notification bit, notification event,
-//! queued frames oldest first, shown frame, released slots, whether the notification is raised,
+//! the clients in ascending number order, each its number, token, notification bit,
+//! notification event, queued frames oldest first, shown frame, released slots, whether the
+//! notification is raised,
 //! and its held reply (the reply's token id, if the vi2 server holds the request as pending, and
 //! how many frames were queued ahead of it). A frame is its slot, image, the present request's
 //! fields (the image's address, width, height, pitch, block height and format, the shown area's
@@ -119,13 +134,17 @@
 //! A snapshot is a file and is not trusted. [`crate::shared::Shared::restore_presents`] checks,
 //! in this order, and refuses the first failure ([`PresentSnapshotError`], in the order of its
 //! variants): the magic, the version, that the body decodes, that no bytes follow it; at most
-//! [`MAX_PRESENT_CLIENTS`] clients; then each client in order: a token that is not zero and above
-//! the one before, a notification bit below [`CLIENT_NOTIFICATIONS`], at most [`SLOTS`] queued
-//! frames, then each frame (queued oldest first, then the shown one): a slot below [`SLOTS`], a
-//! fence on a syncpoint that exists, reached if it has no fence, reached if it is the shown one,
-//! a slot no earlier frame of the client holds (for frames that hold theirs); then released
-//! slots within [`ALL_SLOTS`], a held reply with fewer frames ahead of it than are queued, a
-//! reply token no earlier client's reply has, and one the vi2 server holds as pending. Then,
+//! [`MAX_PRESENT_CLIENTS`] clients; then each client in order: a number below
+//! [`MAX_PRESENT_CLIENTS`] and above the one before, a token that is not zero, a notification
+//! bit below [`CLIENT_NOTIFICATIONS`], at most [`SLOTS`] queued frames, then each frame (queued
+//! oldest first, then the shown one): a slot below [`SLOTS`], a fence on a syncpoint that
+//! exists, reached if it has no fence, reached if it is the shown one, a slot no earlier frame
+//! of the client holds (for frames that hold theirs); then released slots within [`ALL_SLOTS`],
+//! none of them a slot a queued or shown frame holds (229 refreshes before it queues a slot
+//! again, so a live client never has both), the notification raised exactly when a slot is
+//! released (a release sets both and a refresh clears both), a held reply with fewer frames
+//! ahead of it than are queued, a reply token no earlier client's reply has, and one the vi2
+//! server holds as pending. Then,
 //! syncpoint by syncpoint, that the unreached frames on it and the syncpt waits armed on it
 //! together do not outnumber its waiters (each holds one watch; a frame's watch is what lets a
 //! drained value reach it). [`crate::shared::Shared::save_presents`] runs the same relation checks
@@ -134,9 +153,16 @@
 //!
 //! Not checked here, each with its consequence:
 //!
-//! - That each token is a client a vi2 session registered (the sessions' snapshots hold them).
-//!   An entry no session holds is never refreshed, its frames latch and its token stays taken; a
-//!   session client with no entry here answers 229 with `InvalidState`.
+//! - That each entry is a client a vi2 session registered under that number and token (the
+//!   sessions' snapshots hold them), or that no two sessions' clients name one number. An entry
+//!   no session holds is never refreshed, its frames latch and its number stays taken; a
+//!   session client whose number has no entry here answers 229 with `InvalidState`; two session
+//!   clients naming one entry share its queue and its releases.
+//! - That a frame's fence is on a syncpoint that is allocated now. Live 229 refuses a fence on
+//!   one that is not (PR `IsSyncpointAllocated(fence_id)`), but the syncpoint can be freed while
+//!   the frame waits (closing the channel that holds it), and a freed counter keeps its value
+//!   (`Syncpoints::free`), so a live table reaches this state. Such a frame waits for a drained
+//!   value of the syncpoint, as it does live (`a_restore_accepts_a_frame_fenced_on_a_freed_syncpoint`).
 //! - That each event is the notification event of the session holding the client. One the kernel
 //!   does not hold is refused at the signal, logged, and the release goes on.
 //! - That a frame's image still exists, or that its request matches the image: the frame keeps
@@ -152,7 +178,8 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 use starquake_gpu::interface::{
-    DisplayId, Fence, ImageDesc, LayerId, PresentRequest, Rect, SYNCPOINT_COUNT, SyncpointId,
+    DisplayId, Fence, GpuCompletion, ImageDesc, LayerId, PresentRequest, Rect, SYNCPOINT_COUNT,
+    SyncpointId,
 };
 use starquake_gpu::syncpoint::{CompareMode, wait_satisfied};
 use starquake_kernel::id::ObjectId;
@@ -171,7 +198,8 @@ mod tests;
 /// The most clients the table holds: room for eight vi2 sessions of PR's [`MAX_CLIENTS`] each,
 /// as [`crate::shared::vsync::MAX_LISTENERS`] is room for eight sessions' request groups.
 /// Starquake's own bound, a **guess** (module docs, "Bounds"): PR keeps clients per session and
-/// does not count sessions.
+/// does not count sessions. A client's number is below it, and fits the byte the latch's notes
+/// give it ([`crate::note::CLIENT_SHIFT`]).
 pub const MAX_PRESENT_CLIENTS: usize = 8 * MAX_CLIENTS;
 
 /// The zero words a 229 or 228 reply ends with: PR `for (u32 i = 0; i < 4; ++i)
@@ -249,7 +277,8 @@ impl Frame {
         self.fence
     }
 
-    /// Whether a drained value (or the counter when it was queued) has reached its fence.
+    /// Whether it is reached: it has no fence, or a drained value has reached its fence (module
+    /// docs, "Reached means drained").
     #[must_use]
     pub const fn reached(&self) -> bool {
         self.reached
@@ -282,8 +311,11 @@ pub struct NewFrame {
 #[must_use = "a prepared frame holds a watch until it is committed or abandoned"]
 #[derive(Debug, PartialEq, Eq)]
 pub struct Prepared {
-    token: u64,
+    client: u8,
     frame: Frame,
+    /// The counter's reading after the watch, when it already reaches the fence: the change
+    /// [`Locked::commit_frame`] hands back to push.
+    observed: Option<u32>,
 }
 
 /// A fallback reply held until the frame queued before it is latched (module docs, "The fence
@@ -309,6 +341,7 @@ impl Waiting {
 
 /// One registered client's presents (module docs, "Why the queues are shared").
 pub struct PresentClient {
+    token: u64,
     available_bit: u32,
     event: Option<ObjectId>,
     queued: VecDeque<Frame>,
@@ -320,8 +353,9 @@ pub struct PresentClient {
 
 impl PresentClient {
     /// A client 201 registered: nothing queued or shown, nothing released.
-    const fn new(available_bit: u32, event: Option<ObjectId>) -> Self {
+    const fn new(token: u64, available_bit: u32, event: Option<ObjectId>) -> Self {
         Self {
+            token,
             available_bit,
             event,
             queued: VecDeque::new(),
@@ -330,6 +364,12 @@ impl PresentClient {
             raised: false,
             waiting: None,
         }
+    }
+
+    /// The client's token, which names it within its session.
+    #[must_use]
+    pub const fn token(&self) -> u64 {
+        self.token
     }
 
     /// The client's "buffer available" notification bit.
@@ -399,13 +439,6 @@ pub struct Refresh {
 /// Why 201 could not add a client to the table ([`Presents::register`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
 pub enum RegisterError {
-    /// Another session's client already has the token (module docs of [`crate::vi2`], "Where
-    /// this differs": tokens are the table's keys).
-    #[error("another vi2 session's client already has the token {token:#x}")]
-    Held {
-        /// The token.
-        token: u64,
-    },
     /// The table already holds [`MAX_PRESENT_CLIENTS`] clients.
     #[error("the present table already holds the most clients it takes ({MAX_PRESENT_CLIENTS})")]
     Full,
@@ -414,28 +447,28 @@ pub enum RegisterError {
 /// Why a frame could not be queued ([`Locked::prepare_frame`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
 pub enum QueueError {
-    /// No client has the token in the table (only a restore without the table's snapshot leads
-    /// here: module docs, "What is saved").
-    #[error("the present table has no client with the token {token:#x}")]
+    /// No client has the number in the table (only a restore without the table's snapshot
+    /// leads here: module docs, "What is saved").
+    #[error("the present table has no client {client}")]
     NoClient {
-        /// The token.
-        token: u64,
+        /// The client's number.
+        client: u8,
     },
     /// The client already has [`SLOTS`] frames queued.
-    #[error("vi2 client {token:#x} already has the most frames queued ({SLOTS})")]
+    #[error("present table client {client} already has the most frames queued ({SLOTS})")]
     Full {
-        /// The token.
-        token: u64,
+        /// The client's number.
+        client: u8,
     },
     /// The fence's syncpoint could not be watched.
     #[error("the frame's fence could not be watched: {0}")]
     Watch(#[from] WatchError),
 }
 
-/// The presents of every registered client, by token (module docs).
+/// The presents of every registered client, by number (module docs).
 #[derive(Default)]
 pub struct Presents {
-    clients: BTreeMap<u64, PresentClient>,
+    clients: BTreeMap<u8, PresentClient>,
 }
 
 impl fmt::Debug for Presents {
@@ -460,15 +493,17 @@ impl Presents {
         Self::default()
     }
 
-    /// The client `token` names.
+    /// Client number `client`.
     #[must_use]
-    pub fn client(&self, token: u64) -> Option<&PresentClient> {
-        self.clients.get(&token)
+    pub fn client(&self, client: u8) -> Option<&PresentClient> {
+        self.clients.get(&client)
     }
 
-    /// Every client, in ascending token order.
-    pub fn clients(&self) -> impl Iterator<Item = (u64, &PresentClient)> {
-        self.clients.iter().map(|(&token, client)| (token, client))
+    /// Every client with its number, in ascending number order.
+    pub fn clients(&self) -> impl Iterator<Item = (u8, &PresentClient)> {
+        self.clients
+            .iter()
+            .map(|(&number, client)| (number, client))
     }
 
     /// Whether the vsync clock must run for the table: a client has a frame queued or a reply
@@ -478,47 +513,45 @@ impl Presents {
         self.clients.values().any(PresentClient::has_work)
     }
 
-    /// Whether client `token` has a frame that holds `slot` queued or shown: a buffer queue
+    /// Whether client `client` has a frame that holds `slot` queued or shown: a buffer queue
     /// present of the slot is refused then (PR `!state.queued[slot]`).
     #[must_use]
-    pub fn holds(&self, token: u64, slot: u8) -> bool {
+    pub fn holds(&self, client: u8, slot: u8) -> bool {
         self.clients
-            .get(&token)
+            .get(&client)
             .is_some_and(|client| client.holds(slot))
     }
 
-    /// Adds client `token` (201), with its "buffer available" bit and the session's
-    /// notification event, if 11 made it. It refuses, in this order, a token the table has
-    /// ([`RegisterError::Held`]) and a full table ([`RegisterError::Full`]); nothing changes on
-    /// an error.
+    /// Adds a client with `token` (201), its "buffer available" bit and the session's
+    /// notification event, if 11 made it, under the lowest number no client holds: that number.
+    /// A token another client has is no refusal (module docs, "Why the queues are shared"). It
+    /// refuses a full table ([`RegisterError::Full`]), and nothing changes then.
     pub fn register(
         &mut self,
         token: u64,
         available_bit: u32,
         event: Option<ObjectId>,
-    ) -> Result<(), RegisterError> {
-        if self.clients.contains_key(&token) {
-            return Err(RegisterError::Held { token });
-        }
-        if self.clients.len() >= MAX_PRESENT_CLIENTS {
-            return Err(RegisterError::Full);
-        }
+    ) -> Result<u8, RegisterError> {
+        let number = (0..=u8::MAX)
+            .take(MAX_PRESENT_CLIENTS)
+            .find(|number| !self.clients.contains_key(number))
+            .ok_or(RegisterError::Full)?;
         self.clients
-            .insert(token, PresentClient::new(available_bit, event));
-        Ok(())
+            .insert(number, PresentClient::new(token, available_bit, event));
+        Ok(number)
     }
 
-    /// Tells client `token`'s entry the session's notification event (11 made it).
-    pub fn set_event(&mut self, token: u64, event: ObjectId) {
-        if let Some(client) = self.clients.get_mut(&token) {
+    /// Tells client `client`'s entry the session's notification event (11 made it).
+    pub fn set_event(&mut self, client: u8, event: ObjectId) {
+        if let Some(client) = self.clients.get_mut(&client) {
             client.event = Some(event);
         }
     }
 
-    /// Takes what the ticks released for client `token` since the last time (module docs, "Why
-    /// the queues are shared"): nothing for a token the table does not have.
-    pub fn take_refresh(&mut self, token: u64) -> Refresh {
-        let Some(client) = self.clients.get_mut(&token) else {
+    /// Takes what the ticks released for client `client` since the last time (module docs,
+    /// "Why the queues are shared"): nothing for a number the table does not have.
+    pub fn take_refresh(&mut self, client: u8) -> Refresh {
+        let Some(client) = self.clients.get_mut(&client) else {
             return Refresh::default();
         };
         let refresh = Refresh {
@@ -562,8 +595,9 @@ impl Presents {
     fn saved(&self, pending: impl Fn(TokenId) -> bool) -> Vec<SavedClient> {
         self.clients
             .iter()
-            .map(|(&token, client)| SavedClient {
-                token,
+            .map(|(&number, client)| SavedClient {
+                number,
+                token: client.token,
                 available_bit: client.available_bit,
                 event: client.event,
                 queued: client.queued.iter().map(SavedFrame::from).collect(),
@@ -600,12 +634,12 @@ impl Locked<'_> {
         self.syncpoints.is_allocated(id)
     }
 
-    /// Removes client `token` (202): its queued frames go, each unreached one giving back its
-    /// watch, its shown frame goes, and a held reply is answered `NotFound` (a session handles
-    /// one request at a time, so its own 202 cannot come while its reply is held). Whether the
-    /// table had it.
-    pub fn unregister_present(&mut self, token: u64) -> bool {
-        let Some(client) = self.state.presents.clients.remove(&token) else {
+    /// Removes client `client` (202), freeing its number: its queued frames go, each unreached
+    /// one giving back its watch, its shown frame goes, and a held reply is answered `NotFound`
+    /// (a session handles one request at a time, so its own 202 cannot come while its reply is
+    /// held; `a_held_reply_is_refused_when_its_client_is_removed`). Whether the table had it.
+    pub fn unregister_present(&mut self, client: u8) -> bool {
+        let Some(client) = self.state.presents.clients.remove(&client) else {
             return false;
         };
         for frame in &client.queued {
@@ -622,45 +656,42 @@ impl Locked<'_> {
         true
     }
 
-    /// The first half of queuing a frame for client `token` (229): it refuses, in this order, a
-    /// token with no entry ([`QueueError::NoClient`]), a client with [`SLOTS`] frames queued
+    /// The first half of queuing a frame for client `client` (229): it refuses, in this order,
+    /// a number with no entry ([`QueueError::NoClient`]), a client with [`SLOTS`] frames queued
     /// ([`QueueError::Full`]), and a fence whose syncpoint cannot be watched
     /// ([`QueueError::Watch`]); then it compares the fence with the counter read after watching
-    /// it, and gives the watch back at once if the fence is reached (module docs, "Reached means
-    /// drained"). Nothing changes on an error. Commit or abandon what it returns before the lock
-    /// is released.
-    pub fn prepare_frame(&mut self, token: u64, frame: NewFrame) -> Result<Prepared, QueueError> {
-        let client = self
+    /// it, and keeps the watch either way: a frame with a fence is reached only by a drained
+    /// value (module docs, "Reached means drained"). Nothing changes on an error. Commit or
+    /// abandon what it returns before the lock is released.
+    pub fn prepare_frame(&mut self, client: u8, frame: NewFrame) -> Result<Prepared, QueueError> {
+        let entry = self
             .state
             .presents
             .clients
-            .get(&token)
-            .ok_or(QueueError::NoClient { token })?;
-        if client.queued.len() >= usize::from(SLOTS) {
-            return Err(QueueError::Full { token });
+            .get(&client)
+            .ok_or(QueueError::NoClient { client })?;
+        if entry.queued.len() >= usize::from(SLOTS) {
+            return Err(QueueError::Full { client });
         }
-        let reached = match frame.fence {
-            None => true,
+        let observed = match frame.fence {
+            None => None,
             Some(fence) => {
                 let value = self.watch(fence.id)?;
-                let reached =
-                    wait_satisfied(value, u64::from(fence.value), CompareMode::Wrapping32);
-                if reached {
-                    self.release(fence.id);
-                }
-                reached
+                wait_satisfied(value, u64::from(fence.value), CompareMode::Wrapping32)
+                    .then_some(value)
             }
         };
         Ok(Prepared {
-            token,
+            client,
             frame: Frame {
                 slot: frame.slot,
                 image: frame.image,
                 request: frame.request,
                 fence: frame.fence,
-                reached,
+                reached: frame.fence.is_none(),
                 holds_slot: frame.holds_slot,
             },
+            observed,
         })
     }
 
@@ -670,7 +701,7 @@ impl Locked<'_> {
         reason = "taking the prepared frame by value stops it being committed after it is abandoned"
     )]
     pub fn abandon_frame(&mut self, prepared: Prepared) {
-        let Prepared { token: _, frame } = prepared;
+        let Prepared { frame, .. } = prepared;
         if let (Some(fence), false) = (frame.fence, frame.reached) {
             self.release(fence.id);
         }
@@ -678,24 +709,37 @@ impl Locked<'_> {
 
     /// The second half of queuing a frame: puts `prepared` behind the client's queued frames,
     /// holds `reply` (the fallback's) behind the frames queued before it, and starts the vsync
-    /// clock one [`crate::shared::vsync::INTERVAL_NS`] after `now` if it is stopped (module docs, "The clock runs while
-    /// a present waits"). `now` is the `Env` clock's reading, which the caller takes when the
-    /// clock is stopped. It cannot fail: [`Locked::prepare_frame`] checked the client under the
-    /// same lock.
+    /// clock one [`crate::shared::vsync::INTERVAL_NS`] after `now` if it is stopped (module
+    /// docs, "The clock runs while a present waits"). `now` is the `Env` clock's reading, which
+    /// the caller takes when the clock is stopped. It cannot fail: [`Locked::prepare_frame`]
+    /// checked the client under the same lock.
+    ///
+    /// When the counter already reached the frame's fence as it was prepared, it returns the
+    /// `SyncpointChanged` of that reading, which the caller pushes onto the completion queue
+    /// before the lock is released (module docs, "Reached means drained"); otherwise nothing.
+    #[must_use = "a fence already reached is reached only once its change is pushed and drained"]
     pub fn commit_frame(
         &mut self,
         prepared: Prepared,
         now: Option<HostNanos>,
         reply: Option<ReplyToken>,
-    ) {
-        let Some(client) = self.state.presents.clients.get_mut(&prepared.token) else {
+    ) -> Option<GpuCompletion> {
+        let Some(client) = self.state.presents.clients.get_mut(&prepared.client) else {
             tracing::error!(
-                token = prepared.token,
+                client = prepared.client,
                 "gsv:vi2: a prepared frame's client left the table under the lock"
             );
             self.abandon_frame(prepared);
-            return;
+            return None;
         };
+        let change = prepared
+            .frame
+            .fence
+            .zip(prepared.observed)
+            .map(|(fence, value)| GpuCompletion::SyncpointChanged {
+                id: fence.id,
+                value,
+            });
         if let Some(token) = reply {
             client.waiting = Some(Waiting {
                 token: Some(token),
@@ -713,6 +757,7 @@ impl Locked<'_> {
                 );
             }
         }
+        change
     }
 
     /// The latch of one vsync tick (module docs, "The latch"), recording through `host` for
@@ -723,11 +768,12 @@ impl Locked<'_> {
         service: ServiceId,
     ) -> Vec<PresentRequest> {
         let mut presents = Vec::new();
-        for (&token, client) in &mut self.state.presents.clients {
+        for (&number, client) in &mut self.state.presents.clients {
             let latched = client.queued.front().is_some_and(|frame| frame.reached);
             if let Some(frame) = client.queued.pop_front_if(|frame| frame.reached) {
                 host.record(
                     Note::FrameLatched {
+                        client: number,
                         slot: frame.slot,
                         image: frame.image,
                     }
@@ -735,7 +781,7 @@ impl Locked<'_> {
                 );
                 presents.push(frame.request);
                 if let Some(replaced) = client.shown.replace(frame) {
-                    release_frame(host, service, token, client, replaced);
+                    release_frame(host, service, number, client, replaced);
                 }
             }
             if let Some(mut waiting) = client.waiting.take() {
@@ -743,7 +789,7 @@ impl Locked<'_> {
                     waiting.ahead = waiting.ahead.saturating_sub(1);
                 }
                 if waiting.ahead == 0 {
-                    complete(token, waiting);
+                    complete(number, waiting);
                 } else {
                     client.waiting = Some(waiting);
                 }
@@ -753,17 +799,18 @@ impl Locked<'_> {
     }
 }
 
-/// Releases `frame`, which a latched frame replaced on client `token`'s layer (module docs, "The
-/// latch", step 2).
+/// Releases `frame`, which a latched frame replaced on client `number`'s layer (module docs,
+/// "The latch", step 2).
 fn release_frame(
     host: &mut dyn TimerHost,
     service: ServiceId,
-    token: u64,
+    number: u8,
     client: &mut PresentClient,
     frame: Frame,
 ) {
     host.record(
         Note::BufferReleased {
+            client: number,
             slot: frame.slot,
             image: frame.image,
         }
@@ -779,19 +826,20 @@ fn release_frame(
     {
         tracing::error!(
             %error,
-            token,
+            client = number,
+            token = client.token,
             ?event,
             "gsv:vi2: the kernel refused to signal a released buffer's notification event"
         );
     }
 }
 
-/// Completes client `token`'s held fallback reply: every slot free (module docs, "The fence wait
-/// fallback").
-fn complete(token: u64, waiting: Waiting) {
+/// Completes client `number`'s held fallback reply: every slot free (module docs, "The fence
+/// wait fallback").
+fn complete(number: u8, waiting: Waiting) {
     let Some(reply_token) = waiting.token else {
         tracing::debug!(
-            token,
+            client = number,
             "gsv:vi2: a held present reply with no request left to answer"
         );
         return;
@@ -833,17 +881,27 @@ pub enum PresentSnapshotError {
         /// How many it holds.
         count: usize,
     },
-    /// A client whose token is zero: 201 refuses it.
-    #[error("the present table snapshot's client {index} has the token zero")]
-    ZeroToken {
+    /// A client whose number is not below [`MAX_PRESENT_CLIENTS`]: 201 gives none.
+    #[error(
+        "the present table snapshot's client {index} has the number {number}, not below {MAX_PRESENT_CLIENTS}"
+    )]
+    ClientNumber {
         /// The client's index.
         index: usize,
+        /// The number it has.
+        number: u8,
     },
-    /// A client whose token is not above the one before it: listed twice, or out of order.
+    /// A client whose number is not above the one before it: listed twice, or out of order.
     #[error(
         "the present table snapshot's client {index} is not above the one before it (listed twice or out of order)"
     )]
-    TokensNotAscending {
+    NumbersNotAscending {
+        /// The client's index.
+        index: usize,
+    },
+    /// A client whose token is zero: 201 refuses it.
+    #[error("the present table snapshot's client {index} has the token zero")]
+    ZeroToken {
         /// The client's index.
         index: usize,
     },
@@ -908,6 +966,35 @@ pub enum PresentSnapshotError {
     /// Released slots past the fifteen.
     #[error("the present table snapshot's client {index} has a released slot past the last")]
     Released {
+        /// The client's index.
+        index: usize,
+    },
+    /// A released slot that a queued or shown frame of the client holds: 229 refreshes before
+    /// it queues a slot again, so a live client never has both.
+    #[error(
+        "the present table snapshot's client {index} has slot {slot} released while a frame holds it"
+    )]
+    ReleasedHeld {
+        /// The client's index.
+        index: usize,
+        /// The lowest such slot.
+        slot: u8,
+    },
+    /// The notification raised with no slot released: a release raises it with the slot, and a
+    /// refresh clears both.
+    #[error(
+        "the present table snapshot's client {index} has its notification raised with no slot released"
+    )]
+    RaisedWithoutRelease {
+        /// The client's index.
+        index: usize,
+    },
+    /// A slot released with the notification not raised: a release raises it with the slot,
+    /// and a refresh clears both.
+    #[error(
+        "the present table snapshot's client {index} has a slot released with its notification not raised"
+    )]
+    ReleasedNotRaised {
         /// The client's index.
         index: usize,
     },
@@ -1066,6 +1153,7 @@ pub(crate) struct SavedWaiting {
 /// A client as it is saved. The field order is the layout.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SavedClient {
+    pub(crate) number: u8,
     pub(crate) token: u64,
     pub(crate) available_bit: u32,
     pub(crate) event: Option<ObjectId>,
@@ -1078,26 +1166,30 @@ pub(crate) struct SavedClient {
 
 /// A client that passed its checks, its held reply's token id still to be reissued.
 struct Checked {
-    token: u64,
+    number: u8,
     client: PresentClient,
     reply: Option<(TokenId, usize)>,
 }
 
-/// The checks of one client (module docs, "What is saved"), `previous` the token before it;
+/// The checks of one client (module docs, "What is saved"), `previous` the number before it;
 /// `pending` says whether the vi2 server holds a token id as pending, `seen` the reply tokens of
 /// earlier clients.
 fn check_client(
     index: usize,
     saved: &SavedClient,
-    previous: Option<u64>,
+    previous: Option<u8>,
     seen: &mut BTreeSet<TokenId>,
     pending: &dyn Fn(TokenId) -> bool,
 ) -> Result<Checked, PresentSnapshotError> {
+    if usize::from(saved.number) >= MAX_PRESENT_CLIENTS {
+        let number = saved.number;
+        return Err(PresentSnapshotError::ClientNumber { index, number });
+    }
+    if previous.is_some_and(|previous| previous >= saved.number) {
+        return Err(PresentSnapshotError::NumbersNotAscending { index });
+    }
     if saved.token == 0 {
         return Err(PresentSnapshotError::ZeroToken { index });
-    }
-    if previous.is_some_and(|previous| previous >= saved.token) {
-        return Err(PresentSnapshotError::TokensNotAscending { index });
     }
     if saved.available_bit >= CLIENT_NOTIFICATIONS {
         return Err(PresentSnapshotError::NotificationBit { index });
@@ -1137,9 +1229,7 @@ fn check_client(
         Some(frame) => Some(frame.frame(index)?),
         None => None,
     };
-    if saved.released & !ALL_SLOTS != 0 {
-        return Err(PresentSnapshotError::Released { index });
-    }
+    check_released(index, saved, held)?;
     let mut reply = None;
     let mut waiting = None;
     if let Some(saved_waiting) = &saved.waiting {
@@ -1166,8 +1256,9 @@ fn check_client(
         }
     }
     Ok(Checked {
-        token: saved.token,
+        number: saved.number,
         client: PresentClient {
+            token: saved.token,
             available_bit: saved.available_bit,
             event: saved.event,
             queued,
@@ -1180,9 +1271,34 @@ fn check_client(
     })
 }
 
+/// The checks of client `index`'s released slots (module docs, "What is saved"), in order:
+/// within [`ALL_SLOTS`], none of them in `held` (the slots its queued and shown frames hold), and
+/// the notification raised exactly when a slot is released.
+fn check_released(
+    index: usize,
+    saved: &SavedClient,
+    held: u64,
+) -> Result<(), PresentSnapshotError> {
+    if saved.released & !ALL_SLOTS != 0 {
+        return Err(PresentSnapshotError::Released { index });
+    }
+    let both = saved.released & held;
+    if both != 0 {
+        let slot = u8::try_from(both.trailing_zeros()).unwrap_or(u8::MAX);
+        return Err(PresentSnapshotError::ReleasedHeld { index, slot });
+    }
+    if saved.raised && saved.released == 0 {
+        return Err(PresentSnapshotError::RaisedWithoutRelease { index });
+    }
+    if !saved.raised && saved.released != 0 {
+        return Err(PresentSnapshotError::ReleasedNotRaised { index });
+    }
+    Ok(())
+}
+
 /// The relation checks [`crate::shared::Shared::save_presents`] and
 /// [`crate::shared::Shared::restore_presents`] share, in the documented order: the clients it
-/// holds, by token, with the reply tokens still to reissue.
+/// holds, by number, with the reply tokens still to reissue.
 fn check(
     saved: &[SavedClient],
     pending: &dyn Fn(TokenId) -> bool,
@@ -1196,9 +1312,8 @@ fn check(
     let mut previous = None;
     let mut checked = Vec::with_capacity(saved.len());
     for (index, client) in saved.iter().enumerate() {
-        let token = client.token;
         checked.push(check_client(index, client, previous, &mut seen, pending)?);
-        previous = Some(token);
+        previous = Some(client.number);
     }
     for id in (0..=u8::MAX).map_while(SyncpointId::new) {
         let frames = checked
@@ -1276,7 +1391,7 @@ impl super::Shared {
         };
         let mut table = Presents::new();
         for Checked {
-            token,
+            number,
             mut client,
             reply,
         } in checked
@@ -1288,7 +1403,7 @@ impl super::Shared {
                     ahead,
                 });
             }
-            table.clients.insert(token, client);
+            table.clients.insert(number, client);
         }
         state.state.presents = table;
         drop(state);

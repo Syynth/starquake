@@ -132,9 +132,11 @@
 //! - **201** refuses a zero client, a bit at or past [`CLIENT_NOTIFICATIONS`], or the same bit
 //!   twice with `InvalidCombination`; a client already registered, or a bit another client holds,
 //!   with `InvalidState`; and a session with [`MAX_CLIENTS`] clients with `OutOfResource`. Then
-//!   gsv's present table: a token another session's client holds, `InvalidState`, and a full
-//!   table ([`crate::shared::present::MAX_PRESENT_CLIENTS`]), `OutOfResource`. Otherwise the
-//!   client is registered with every slot free ([`ALL_SLOTS`]), and added to the table.
+//!   gsv's present table: a full table ([`crate::shared::present::MAX_PRESENT_CLIENTS`]),
+//!   `OutOfResource` (starquake's own bound). Otherwise the client is added to the table, which
+//!   gives it a number, and registered with that number and every slot free ([`ALL_SLOTS`]). A
+//!   token another session's client has is no refusal: a token names a client within its
+//!   session, as in PR (`a_token_is_a_client_per_session`).
 //! - **202** refuses a zero client with `InvalidCombination` and one not registered with
 //!   `NotFound`; otherwise it drops the client's presents (queued and shown frames), closes the
 //!   endpoint if the client holds it, destroys its layer, frees its bits, forgets it, and then
@@ -149,8 +151,8 @@
 //!   until the frame is released (`a_cancel_gives_a_slot_back`).
 //! - **229**, in PR `QueueNativeImage`'s order: a zero client or one not registered,
 //!   `NotFound`; a client with no layer (212 makes it), not bound to the display (251), a slot
-//!   at or past [`SLOTS`], or, under [`Pacing::BufferQueue`], a slot a queued or shown frame
-//!   holds (PR `!state.queued[slot]`), `InvalidState`; an image that does not exist or is not in
+//!   at or past [`SLOTS`] (under either pacing), or, under [`Pacing::BufferQueue`], a slot a
+//!   queued or shown frame holds (PR `!state.queued[slot]`), `InvalidState`; an image that does not exist or is not in
 //!   a window alias image pool (315), `NotFound`; a byte offset other than 0, a shown extent wider
 //!   or taller than the image, a layout other than [`PRESENT_LAYOUT`], an image whose block
 //!   height is not [`PRESENT_BLOCK_HEIGHT`] or whose format is not one of [`PRESENT_FORMATS`],
@@ -238,15 +240,23 @@
 //! 212, 228 and 229 (PR `RefreshReleasedBuffers`, which PR runs at the start of 212 and 229 and
 //! from a 1 ms poll; here 11, 21 and 228 take it too, so each answer is as fresh as PR's poll
 //! makes it). 21 holds gsv's lock from that refresh to clearing the event, so a release in
-//! between is not cleared away unseen. A frame's [`PresentRequest`] names the image's address
-//! (its native memory's binding: GPU address == CPU address), size, pitch, block height and
-//! format, the shown area from 0, 0, the client's layer and the default display
-//! ([`DEFAULT_DISPLAY`] as the `DisplayId`; a **guess** at what the GPU front wants to name a
-//! display by).
+//! between is not cleared away unseen. A frame's [`PresentRequest`] names the image's address,
+//! size, pitch, block height and format, the shown area from 0, 0, the client's layer and the
+//! default display ([`DEFAULT_DISPLAY`] as the `DisplayId`; a **guess** at what the GPU front
+//! wants to name a display by). The address is the address the image's native memory is bound
+//! at (114), handed over as the image's GPU address: that a 114 binding's address is the GPU
+//! address is a **guess**. The spec backs GPU address == CPU address only for memory the gpu
+//! worker's 101 registers (scoping doc row 30), not for native memory bound by 114; a trace of
+//! a present of 114-bound memory, or porting PR's path from the image's backing to its parent
+//! (`backing->parent_id` and its offset), would confirm or correct it.
 //!
 //! **The fence wait fallback** ([`Pacing::FenceWait`], the per-run setting of decision 1, given
-//! to [`vi2_server_paced`]): 229 makes the same checks but the slot one (a fallback present
-//! holds no slot, as NX2 checks none), queues the frame without clearing its bit, and holds its
+//! to [`vi2_server_paced`]): 229 makes the same checks but whether a frame holds the slot (a
+//! fallback present holds no slot, and NX2 checks none). It still refuses a slot at or past
+//! [`SLOTS`] with `InvalidState`, which NX2 does not check either: the latch's notes and the
+//! present table's snapshot hold only a slot below [`SLOTS`] (below, "Where this differs";
+//! `the_fallback_refuses_a_slot_past_the_last`). It queues the frame without clearing its bit,
+//! and holds its
 //! reply, which the vsync tick completes with every slot free on the first tick after the
 //! previous frame's fence (`crate::shared::present`, "The fence wait fallback";
 //! `the_fallback_s_reply_completes_on_the_first_tick_after_the_previous_frame_s_fence`).
@@ -309,9 +319,10 @@
 //! | A failure's data words | written as zero | — | not written: the result word alone (`a_failure_reply_is_the_result_word_alone`) |
 //! | Header words other than PR's | `InvalidCombination` | read as they come | read as they come; only a missing word is refused (`a_short_request_is_refused_and_a_longer_one_is_read`) |
 //! | When a slot comes back | when the producer releases the buffer's fence, found by a 1 ms poll (`RefreshReleasedBuffers`) | never taken: every reply says every slot is free | on the vsync tick that latches the frame replacing it (the spec's buffer queue; `a_present_s_slot_comes_back_on_the_tick_that_latches_the_next`) |
-//! | A token another session's client holds (201) | accepted: each session keeps its own clients | auto-stubbed | `InvalidState`: gsv's present table is keyed by token across sessions, so that the vsync tick can find a client (`a_token_is_one_client_across_sessions`) |
+//! | A token another session's client holds (201) | accepted: each session keeps its own clients | auto-stubbed | accepted, as PR: gsv's present table keys each client by the number 201 gives it, not by its token (`a_token_is_a_client_per_session`) |
 //! | 228's and 212's refresh | 212 refreshes, 228 does not (its 1 ms poll does) | — | both refresh, as the poll would have (module docs, "Present") |
 //! | 229 of a slot a frame holds, under the fence wait fallback | — (PR has no fallback) | accepted: NX2 checks no slot | accepted (`the_fallback_s_reply_completes_on_the_first_tick_after_the_previous_frame_s_fence`) |
+//! | 229 of a slot at or past [`SLOTS`], under the fence wait fallback | — (PR has no fallback) | accepted: NX2 checks no slot | `InvalidState`, as under the buffer queue: the latch's notes and the present table's snapshot hold only a slot below [`SLOTS`] (`the_fallback_refuses_a_slot_past_the_last`) |
 //! | A present's image destroyed (314, then 430) while its frame is queued or shown | its backing stays locked until the buffer retires (`DrainRetiredMemories`) | — | the frame keeps the description it was queued with, and the memory goes when 430 and 112 say; not ported, a gap for the GPU front, which reads the image when it presents |
 //! | A closed session | its layers destroyed, its events closed, its group tick stopped (destructor) | its events closed | nothing: the framework tells a session nothing when it closes. Its group events stay made, and those that listen keep listening, so they count against [`crate::shared::vsync::MAX_LISTENERS`]: after eight sessions that made eight listening groups each are closed, a new 31 answers `OutOfResource` (`closed_sessions_keep_their_groups_listening`). **Not bounded:** a group event registered for a kind other than 0 does not listen, so it does not count, and neither does a session's notification event: a title that keeps opening sessions, making such events and closing the sessions grows the kernel's events without limit. A known gap, left for a follow-up that needs a close hook from the framework |
 //!
@@ -345,6 +356,7 @@ use starquake_services::framework::{
 };
 use starquake_trace::HostNanos;
 
+use crate::completion::Completion;
 use crate::gpu::low_byte;
 use crate::native::layout::{
     FORMAT_RGB10A2, FORMAT_RGBA8, WORD_BLOCK_HEIGHT, WORD_EXTENT, WORD_FORMAT, WORD_PITCH, extent,
@@ -729,10 +741,11 @@ const fn bit(index: u32) -> u32 {
 }
 
 /// One registered client (PR `ClientState`, but its present queue, which is in gsv's shared
-/// state: [`crate::shared::present`]).
+/// state under the number 201 gave it: [`crate::shared::present`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Client {
     token: u64,
+    present: u8,
     retire: u32,
     available_bit: u32,
     bound: bool,
@@ -742,10 +755,12 @@ pub struct Client {
 }
 
 impl Client {
-    /// A client 201 registers: no display, no layer, every slot free.
-    const fn new(token: u64, retire: u32, available_bit: u32) -> Self {
+    /// A client 201 registers under number `present` of gsv's present table: no display, no
+    /// layer, every slot free.
+    const fn new(token: u64, present: u8, retire: u32, available_bit: u32) -> Self {
         Self {
             token,
+            present,
             retire,
             available_bit,
             bound: false,
@@ -759,6 +774,12 @@ impl Client {
     #[must_use]
     pub const fn token(&self) -> u64 {
         self.token
+    }
+
+    /// Its number in gsv's present table ([`crate::shared::present`]).
+    #[must_use]
+    pub const fn present(&self) -> u8 {
+        self.present
     }
 
     /// The notification 202 raises: PR `retire_notification`.
@@ -923,7 +944,7 @@ impl Vi2Session {
     /// released for it since the last time (PR `RefreshReleasedBuffers`; module docs, "Present").
     fn refresh(&mut self, state: &mut Locked<'_>) {
         for client in &mut self.clients {
-            let Refresh { released, raised } = state.presents_mut().take_refresh(client.token);
+            let Refresh { released, raised } = state.presents_mut().take_refresh(client.present);
             client.available |= released & ALL_SLOTS;
             if raised {
                 self.notifications[0] |= bit(client.available_bit);
@@ -1190,7 +1211,7 @@ impl Vi2Session {
             let event = cx.create_event()?;
             self.notification_event = Some(event);
             for client in &self.clients {
-                state.presents_mut().set_event(client.token, event);
+                state.presents_mut().set_event(client.present, event);
             }
             event
         };
@@ -1526,9 +1547,9 @@ impl Vi2Session {
             }
             return Err(KernelError::InvalidCombination.into());
         }
-        let client = Client::new(token, retire, available);
+        let bits = bit(retire) | bit(available);
         let held = self.clients.iter().fold(0, |held, c| held | c.bits());
-        if self.client(token).is_some() || held & client.bits() != 0 {
+        if self.client(token).is_some() || held & bits != 0 {
             return Err(KernelError::InvalidState.into());
         }
         if self.clients.len() >= MAX_CLIENTS {
@@ -1540,15 +1561,14 @@ impl Vi2Session {
                 .lock()
                 .presents_mut()
                 .register(token, available, self.notification_event);
-        if let Err(error) = registered {
+        let present = registered.map_err(|error| {
             tracing::debug!(%error, "gsv:vi2: register client refused");
-            return Err(match error {
-                RegisterError::Held { .. } => KernelError::InvalidState,
+            match error {
                 RegisterError::Full => KernelError::OutOfResource,
             }
-            .into());
-        }
-        self.clients.push(client);
+        })?;
+        self.clients
+            .push(Client::new(token, present, retire, available));
         reply.ok()
     }
 
@@ -1566,7 +1586,7 @@ impl Vi2Session {
         let index = self.client(token).ok_or(KernelError::NotFound)?;
         let shared = shared(cx)?;
         let client = self.clients.remove(index);
-        if !shared.lock().unregister_present(token) {
+        if !shared.lock().unregister_present(client.present) {
             tracing::debug!(token, "gsv:vi2: a retired client had no presents to drop");
         }
         if self.endpoint == Some(token) {
@@ -1657,7 +1677,12 @@ impl Vi2Session {
         } else {
             None
         };
-        let prepared = state.prepare_frame(words.token, frame).map_err(|error| {
+        let present = self
+            .clients
+            .get(index)
+            .ok_or(KernelError::NotFound)?
+            .present;
+        let prepared = state.prepare_frame(present, frame).map_err(|error| {
             tracing::error!(%error, token = words.token, "gsv:vi2: a present could not be queued");
             match error {
                 QueueError::NoClient { .. } => KernelError::InvalidState,
@@ -1672,7 +1697,9 @@ impl Vi2Session {
             "gsv:vi2: present queued"
         );
         if holds {
-            state.commit_frame(prepared, now, None);
+            if let Some(change) = state.commit_frame(prepared, now, None) {
+                shared.queue().push(Completion::Gpu(change));
+            }
             drop(state);
             let client = self.clients.get_mut(index).ok_or(KernelError::NotFound)?;
             client.available &= !slot_bit(frame.slot);
@@ -1681,7 +1708,9 @@ impl Vi2Session {
         }
         match cx.defer() {
             Ok(held) => {
-                state.commit_frame(prepared, now, Some(held));
+                if let Some(change) = state.commit_frame(prepared, now, Some(held)) {
+                    shared.queue().push(Completion::Gpu(change));
+                }
                 drop(state);
                 reply.deferred()
             }
@@ -1703,7 +1732,7 @@ impl Vi2Session {
     ) -> Result<NewFrame, Fault> {
         let client = self.clients.get(index).ok_or(KernelError::NotFound)?;
         let slot = words.slot;
-        let busy = holds && state.presents_mut().holds(words.token, slot);
+        let busy = holds && state.presents_mut().holds(client.present, slot);
         let layer = client
             .layer()
             .filter(|_| client.bound && slot < SLOTS && !busy)
@@ -1738,6 +1767,8 @@ impl Vi2Session {
         if words.fence_high != 0 || words.fence_tail != 0 || fenced && fence.is_none() {
             return Err(KernelError::InvalidCombination.into());
         }
+        // The binding's address, handed over as the GPU address: a guess for 114-bound memory
+        // (module docs, "Present").
         let address = state
             .native_objects()
             .backing(image.memory())

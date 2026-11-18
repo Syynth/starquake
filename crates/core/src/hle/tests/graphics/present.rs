@@ -105,28 +105,29 @@ fn native_image(rig: &Rig, root: Handle) -> u32 {
 
 /// 229 of `image` in `slot`, the whole image shown, with no fence.
 fn present(image: u32, slot: u32) -> Vec<u32> {
+    fenced_present(image, slot, NO_FENCE, 0)
+}
+
+/// 229 of `image` in `slot`, the whole image shown, with the fence word `fence` (`!id`, or
+/// [`NO_FENCE`]) and the fence value `value` (PR `fence_id = ~packet[22]`, the value at 24).
+fn fenced_present(image: u32, slot: u32, fence: u32, value: u32) -> Vec<u32> {
     let mut words = vec![tipc_type(vi2_command::PRESENT_CLIENT_BUFFER), 24];
     words.extend(words_of(TOKEN));
     words.extend([slot, image, 0, EXTENT, PRESENT_LAYOUT]);
     words.extend(vec![0; PRESENT_WORD_FENCE - PRESENT_WORD_LAYOUT - 1]);
-    words.extend([NO_FENCE, 0, 0, 0]);
+    words.extend([fence, 0, value, 0]);
     words
 }
 
-/// The free-slot mask a 228, 229 or 212 reply's data starts with.
-fn mask(data: &[u32]) -> u64 {
-    u64::from(data[0]) | (u64::from(data[1]) << 32)
-}
+/// The number gsv's present table gives the run's first client.
+const CLIENT: u8 = 0;
 
-/// The production constructor's wiring carries a present from the vi2 session to the latch: the
-/// turn at the vsync deadline latches it and hands it to the run's front, and the next present's
-/// latch releases the first one's slot to the guest's notification event, which 212 then shows.
-#[test]
-fn a_present_reaches_the_latch_on_a_vsync_tick() {
-    let graphics = Graphics::new(FrontMode::Live, None);
-    let rig = rig_with(&graphics);
+/// A vi2 session from 305 with its notification event, the default display open, and the
+/// client [`TOKEN`] registered, bound and given its layer (212), and a native image to present:
+/// the session, the event, the 212 request and the image.
+fn presenting(rig: &Rig) -> (Handle, Handle, [u32; 4], u32) {
     let root = rig.graphics_root();
-    let image = native_image(&rig, root);
+    let image = native_image(rig, root);
     let [low, high] = halves(DISPLAY_SESSION_FLAGS[0]);
     let opened = rig.tipc(
         root,
@@ -183,6 +184,22 @@ fn a_present_reaches_the_latch_on_a_vsync_tick() {
     ];
     let layer = rig.tipc(vi2, &availability);
     assert_eq!((layer.result, mask(&layer.data)), (0, ALL_SLOTS));
+    (vi2, notification, availability, image)
+}
+
+/// The free-slot mask a 228, 229 or 212 reply's data starts with.
+fn mask(data: &[u32]) -> u64 {
+    u64::from(data[0]) | (u64::from(data[1]) << 32)
+}
+
+/// The production constructor's wiring carries a present from the vi2 session to the latch: the
+/// turn at the vsync deadline latches it and hands it to the run's front, and the next present's
+/// latch releases the first one's slot to the guest's notification event, which 212 then shows.
+#[test]
+fn a_present_reaches_the_latch_on_a_vsync_tick() {
+    let graphics = Graphics::new(FrontMode::Live, None);
+    let rig = rig_with(&graphics);
+    let (vi2, notification, availability, image) = presenting(&rig);
     assert!(graphics.is_idle());
 
     // The present takes slot 0 and starts the clock; nothing is latched before the deadline.
@@ -196,7 +213,11 @@ fn a_present_reaches_the_latch_on_a_vsync_tick() {
     assert_eq!(notes(&rig.all_events()[before..]), []);
     assert_eq!(graphics.front().presented(), 0);
     rig.turn_at(&graphics, deadline);
-    let latched = Note::FrameLatched { slot: 0, image };
+    let latched = Note::FrameLatched {
+        client: CLIENT,
+        slot: 0,
+        image,
+    };
     assert_eq!(
         notes(&rig.all_events()[before..]),
         [Note::VsyncTick { tick: 1 }, latched]
@@ -216,8 +237,16 @@ fn a_present_reaches_the_latch_on_a_vsync_tick() {
         notes(&rig.all_events()[before..]),
         [
             Note::VsyncTick { tick: 2 },
-            Note::FrameLatched { slot: 1, image },
-            Note::BufferReleased { slot: 0, image },
+            Note::FrameLatched {
+                client: CLIENT,
+                slot: 1,
+                image
+            },
+            Note::BufferReleased {
+                client: CLIENT,
+                slot: 0,
+                image
+            },
         ]
     );
     assert_eq!(graphics.front().presented(), 2);
@@ -236,8 +265,16 @@ fn a_present_reaches_the_latch_on_a_vsync_tick() {
 fn a_replay_does_not_feed_back_the_latch_s_notes() {
     let graphics = Graphics::new(FrontMode::Replay, None);
     for note in [
-        Note::FrameLatched { slot: 1, image: 2 },
-        Note::BufferReleased { slot: 3, image: 4 },
+        Note::FrameLatched {
+            client: 5,
+            slot: 1,
+            image: 2,
+        },
+        Note::BufferReleased {
+            client: 6,
+            slot: 3,
+            image: 4,
+        },
     ] {
         assert_eq!(
             graphics.replay(note),
@@ -245,4 +282,89 @@ fn a_replay_does_not_feed_back_the_latch_s_notes() {
         );
     }
     assert!(graphics.is_idle());
+}
+
+/// A present fenced on a syncpoint whose counter a submission already moved past the fence (the
+/// null front performs a submission's increments at once, so this is the common case) replays:
+/// the live run's drain records the value that reached the frame, and a replay, whose counter
+/// moves only on the notes fed back, latches it and then releases it on the same ticks, with the
+/// same events and the same state (`starquake_gsv::shared::present`, "Reached means drained").
+#[test]
+fn an_already_reached_fence_replays_to_the_same_latch() {
+    // `turn` is the turn of tick `n`; `live` says whether the submission's increment is
+    // performed (the run's front) or not (a replay's).
+    let session = |rig: &Rig, graphics: &Graphics, live: bool, turn: &mut dyn FnMut(u64)| {
+        let (vi2, notification, availability, image) = presenting(rig);
+        let id = graphics.shared().syncpoints().allocate().unwrap();
+        if live {
+            graphics.shared().syncpoints().increment_by(id, 2);
+        }
+        let fence = !u32::from(id.get());
+        let first = rig.tipc(vi2, &fenced_present(image, 0, fence, 1));
+        assert_eq!((first.result, mask(&first.data)), (0, ALL_SLOTS & !1));
+        turn(1);
+        assert_eq!(poll(rig, notification), KernelError::TimedOut.code());
+        let second = rig.tipc(vi2, &present(image, 1));
+        assert_eq!((second.result, mask(&second.data)), (0, ALL_SLOTS & !0b11));
+        turn(2);
+        assert_eq!(poll(rig, notification), ResultCode::SUCCESS);
+        let freed = rig.tipc(vi2, &availability);
+        assert_eq!((freed.result, mask(&freed.data)), (0, ALL_SLOTS & !0b10));
+        (id, image)
+    };
+    let run = Graphics::new(FrontMode::Live, None);
+    let recorded = rig_with(&run);
+    let mut drained: Vec<Vec<Note>> = Vec::new();
+    let (id, image) = session(&recorded, &run, true, &mut |_| {
+        let before = recorded.all_events().len();
+        let deadline = run.deadline().unwrap();
+        recorded.turn_at(&run, deadline);
+        drained.push(notes(&recorded.all_events()[before..]));
+    });
+    let latched = |slot| Note::FrameLatched {
+        client: CLIENT,
+        slot,
+        image,
+    };
+    assert_eq!(
+        drained,
+        [
+            vec![
+                Note::SyncpointObserved { id, value: 2 },
+                Note::VsyncTick { tick: 1 },
+                latched(0),
+            ],
+            vec![
+                Note::VsyncTick { tick: 2 },
+                latched(1),
+                Note::BufferReleased {
+                    client: CLIENT,
+                    slot: 0,
+                    image
+                },
+            ],
+        ]
+    );
+    assert_eq!(run.front().presented(), 2);
+
+    let replay = Graphics::new(FrontMode::Replay, None);
+    let replayed = rig_with(&replay);
+    let mut fed = drained.iter();
+    session(&replayed, &replay, false, &mut |_| {
+        for &note in fed.next().unwrap() {
+            let fed_back = replay.replay(note);
+            if matches!(
+                note,
+                Note::FrameLatched { .. } | Note::BufferReleased { .. }
+            ) {
+                assert_eq!(fed_back, Err(ReplayError::NotAnInput { code: note.code() }));
+            } else {
+                assert_eq!(fed_back, Ok(()));
+            }
+        }
+        replayed.turn_at(&replay, HostNanos(0));
+    });
+    assert_eq!(replayed.all_events(), recorded.all_events());
+    assert_eq!(state_of(&replayed, &replay), state_of(&recorded, &run));
+    assert_eq!(replay.front().presented(), 2);
 }

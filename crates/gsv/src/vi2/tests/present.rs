@@ -17,10 +17,12 @@ use crate::completion::Completion;
 use crate::native::layout::{KIND_NATIVE, PREFERENCE_WORDS, Preference, WORD_ONE};
 use crate::native::{BIND_PROCESS_MEMORY, BindRequest, WINDOW_POOL_COUNT};
 use crate::note::Note;
-use crate::shared::present::slot_bit;
+use crate::shared::present::{Frame, PresentClient, slot_bit};
 
 /// The client the tests present for, and its bits.
 const TOKEN: u64 = 0x0000_00C3_0000_00D4;
+/// The number gsv's present table gives [`TOKEN`]'s client: the rig's first client.
+const CLIENT: u8 = 0;
 const RETIRE: u32 = 4;
 const AVAILABLE: u32 = 6;
 
@@ -213,6 +215,28 @@ impl Rig {
     }
 }
 
+impl Rig {
+    /// A second session with the client [`TOKEN`] registered, its notification event made
+    /// after that (11), bound to the open display and given its layer (212): the session and
+    /// the event.
+    fn second_session_client(&mut self) -> (ObjectId, ObjectId) {
+        let other = self.kernel.new_object();
+        self.server.accept(other).unwrap();
+        let ok = |command: u32| success(command, &[], &[]);
+        let opened = self.send_on(other, &open_display(DEFAULT_DISPLAY, OPEN_DISPLAY_FLAGS));
+        assert_eq!(opened, ok(OPEN_DISPLAY));
+        let registered = self.send_on(other, &register_client(TOKEN, RETIRE, AVAILABLE));
+        assert_eq!(registered, ok(REGISTER_CLIENT_STATE));
+        let reply = self.send_on(other, &get_notification_event(0));
+        let event = self.object(Self::handed(&reply));
+        let bound = self.send_on(other, &bind(TOKEN, DEFAULT_DISPLAY));
+        assert_eq!(bound, ok(BIND_CLIENT_DISPLAY));
+        let layer = self.send_on(other, &client_only(0xE4, TOKEN));
+        assert_eq!(layer, slots_reply_212(ALL_SLOTS));
+        (other, event)
+    }
+}
+
 /// 212's success reply with free slots `available`.
 fn slots_reply_212(available: u64) -> Vec<u8> {
     let [low, high] = w(available);
@@ -252,7 +276,11 @@ fn a_present_s_slot_comes_back_on_the_tick_that_latches_the_next() {
         rig.next_tick(),
         [
             Note::VsyncTick { tick: 1 },
-            Note::FrameLatched { slot: 2, image }
+            Note::FrameLatched {
+                client: CLIENT,
+                slot: 2,
+                image
+            }
         ]
     );
     assert_eq!(rig.signals(notification), 0);
@@ -264,8 +292,16 @@ fn a_present_s_slot_comes_back_on_the_tick_that_latches_the_next() {
         rig.next_tick(),
         [
             Note::VsyncTick { tick: 2 },
-            Note::FrameLatched { slot: 5, image },
-            Note::BufferReleased { slot: 2, image },
+            Note::FrameLatched {
+                client: CLIENT,
+                slot: 5,
+                image
+            },
+            Note::BufferReleased {
+                client: CLIENT,
+                slot: 2,
+                image
+            },
         ]
     );
     assert_eq!(rig.signals(notification), 1);
@@ -336,7 +372,11 @@ fn a_fenced_present_waits_for_its_fence() {
         rig.next_tick(),
         [
             Note::VsyncTick { tick: 3 },
-            Note::FrameLatched { slot: 0, image }
+            Note::FrameLatched {
+                client: CLIENT,
+                slot: 0,
+                image
+            }
         ]
     );
 }
@@ -622,22 +662,231 @@ fn a_cancel_gives_a_slot_back() {
     );
 }
 
-/// 201 refuses a token another session's client holds, as the table's key (module docs,
-/// "Where this differs"); once that client is unregistered, the token is free again.
+/// A token names a client within its session, as in PR: a second session registers the token
+/// the first session's client has, under the table's next number, and each session's frames,
+/// held slots, notes, releases, notification event and 202 are its own (module docs, "Where
+/// this differs").
 #[test]
-fn a_token_is_one_client_across_sessions() {
+fn a_token_is_a_client_per_session() {
     let mut rig = Rig::new();
-    rig.ok(&register_client(TOKEN, RETIRE, AVAILABLE));
-    let other = rig.kernel.new_object();
-    rig.server.accept(other).unwrap();
+    rig.presenting_client();
+    let image = rig.image();
+    let ok = |command: u32| success(command, &[], &[]);
+    let (other, other_event) = rig.second_session_client();
+    let second = CLIENT + 1;
     assert_eq!(
-        rig.send_on(other, &register_client(TOKEN, RETIRE + 1, AVAILABLE + 1)),
-        refused(REGISTER_CLIENT_STATE, KernelError::InvalidState)
+        rig.shared
+            .lock()
+            .presents()
+            .client(second)
+            .map(PresentClient::token),
+        Some(TOKEN)
     );
-    rig.ok(&client_only(0xDA, TOKEN));
+    assert_eq!(rig.present(Present::of(image, 2)), ALL_SLOTS & !slot_bit(2));
     assert_eq!(
-        rig.send_on(other, &register_client(TOKEN, RETIRE + 1, AVAILABLE + 1)),
-        success(REGISTER_CLIENT_STATE, &[], &[])
+        rig.send_on(other, &Present::of(image, 7).words()),
+        slots_reply(PRESENT_CLIENT_BUFFER, ALL_SLOTS & !slot_bit(7))
+    );
+    assert_eq!(
+        rig.next_tick(),
+        [
+            Note::VsyncTick { tick: 1 },
+            Note::FrameLatched {
+                client: CLIENT,
+                slot: 2,
+                image
+            },
+            Note::FrameLatched {
+                client: second,
+                slot: 7,
+                image
+            },
+        ]
+    );
+    // A slot the first session's frame holds is free to the second, and the second's own held
+    // slot is not.
+    assert_eq!(
+        rig.send_on(other, &Present::of(image, 7).words()),
+        refused(PRESENT_CLIENT_BUFFER, KernelError::InvalidState)
+    );
+    assert_eq!(rig.signals(other_event), 0);
+    // The second session's next present releases its own slot 7, not the first's slot 2, and
+    // signals its own event.
+    assert_eq!(
+        rig.send_on(other, &Present::of(image, 8).words()),
+        slots_reply(
+            PRESENT_CLIENT_BUFFER,
+            ALL_SLOTS & !slot_bit(7) & !slot_bit(8)
+        )
+    );
+    assert_eq!(
+        rig.next_tick(),
+        [
+            Note::VsyncTick { tick: 2 },
+            Note::FrameLatched {
+                client: second,
+                slot: 8,
+                image
+            },
+            Note::BufferReleased {
+                client: second,
+                slot: 7,
+                image
+            },
+        ]
+    );
+    assert_eq!(rig.signals(other_event), 1);
+    assert_eq!(
+        rig.send(&client_only(0xE4, TOKEN)),
+        slots_reply_212(ALL_SLOTS & !slot_bit(2))
+    );
+    assert_eq!(
+        rig.send_on(other, &client_only(0xE4, TOKEN)),
+        slots_reply_212(ALL_SLOTS & !slot_bit(8))
+    );
+    // The second session's own slot 2 is free though the first's frame holds slot 2.
+    assert_eq!(
+        rig.send_on(other, &Present::of(image, 2).words()),
+        slots_reply(
+            PRESENT_CLIENT_BUFFER,
+            ALL_SLOTS & !slot_bit(8) & !slot_bit(2)
+        )
+    );
+    // The second session's 202 removes its own client only.
+    assert_eq!(
+        rig.send_on(other, &client_only(0xDA, TOKEN)),
+        ok(UNREGISTER_CLIENT_STATE)
+    );
+    let state = rig.shared.lock();
+    assert!(state.presents().client(second).is_none());
+    assert_eq!(
+        state
+            .presents()
+            .client(CLIENT)
+            .and_then(PresentClient::shown)
+            .map(Frame::slot),
+        Some(2)
+    );
+}
+
+/// A fence the counter already reaches when 229 queues the frame is reached by the next drain,
+/// which records the value it acted on, and not before: the frame keeps its watch until then,
+/// and the tick after that drain latches it.
+#[test]
+fn an_already_reached_fence_is_reached_by_the_next_drain() {
+    let mut rig = Rig::new();
+    rig.presenting_client();
+    let image = rig.image();
+    let id = rig.shared.syncpoints().allocate().unwrap();
+    rig.shared.syncpoints().increment_by(id, 3);
+    rig.present(Present::of(image, 0).fenced(id, 2));
+    {
+        let state = rig.shared.lock();
+        assert_eq!(state.watchers(id), 1);
+        assert_eq!(state.presents().unreached_on(id), 1);
+    }
+    let mut host = KernelHost {
+        kernel: &mut rig.kernel,
+        recorded: Vec::new(),
+    };
+    rig.shared.drain(&mut host);
+    assert_eq!(
+        host.recorded,
+        [Note::SyncpointObserved { id, value: 3 }.event(GSV)]
+    );
+    assert_eq!(rig.shared.lock().watchers(id), 0);
+    assert_eq!(
+        rig.next_tick(),
+        [
+            Note::VsyncTick { tick: 1 },
+            Note::FrameLatched {
+                client: CLIENT,
+                slot: 0,
+                image
+            }
+        ]
+    );
+}
+
+/// Under the fence wait fallback too, a fence the counter already reaches is reached by the
+/// next drain, which records the value; the next tick then latches the frame and completes the
+/// held reply.
+#[test]
+fn an_already_reached_fence_is_reached_by_the_next_drain_under_the_fallback() {
+    let mut rig = Rig::paced(Pacing::FenceWait);
+    rig.presenting_client();
+    let image = rig.image();
+    let id = rig.shared.syncpoints().allocate().unwrap();
+    rig.shared.syncpoints().increment_by(id, 3);
+    let mut buffer = vec![STALE; starquake_ipc::BUFFER_SIZE];
+    let bytes = le(&Present::of(image, 0).fenced(id, 2).words());
+    buffer[..bytes.len()].copy_from_slice(&bytes);
+    let handled = rig.server.handle(&mut rig.kernel, rig.session, &mut buffer);
+    assert!(matches!(handled, Ok(Handled::Deferred(_))));
+    assert_eq!(rig.shared.lock().presents().unreached_on(id), 1);
+    let mut host = KernelHost {
+        kernel: &mut rig.kernel,
+        recorded: Vec::new(),
+    };
+    rig.shared.drain(&mut host);
+    assert_eq!(
+        host.recorded,
+        [Note::SyncpointObserved { id, value: 3 }.event(GSV)]
+    );
+    assert_eq!(
+        rig.next_tick(),
+        [
+            Note::VsyncTick { tick: 1 },
+            Note::FrameLatched {
+                client: CLIENT,
+                slot: 0,
+                image
+            }
+        ]
+    );
+    assert_eq!(
+        delivered(&mut rig),
+        Some(slots_reply(PRESENT_CLIENT_BUFFER, ALL_SLOTS))
+    );
+}
+
+/// Under the fence wait fallback, 229 still refuses a slot at or past [`SLOTS`] with
+/// `InvalidState` (module docs, "Where this differs"), queueing nothing; the last slot is held.
+#[test]
+fn the_fallback_refuses_a_slot_past_the_last() {
+    let mut rig = Rig::paced(Pacing::FenceWait);
+    rig.presenting_client();
+    let image = rig.image();
+    assert_eq!(
+        rig.send(&Present::of(image, u32::from(SLOTS)).words()),
+        refused(PRESENT_CLIENT_BUFFER, KernelError::InvalidState)
+    );
+    assert!(!rig.shared.lock().presents().has_work());
+    let mut buffer = vec![STALE; starquake_ipc::BUFFER_SIZE];
+    let bytes = le(&Present::of(image, u32::from(SLOTS) - 1).words());
+    buffer[..bytes.len()].copy_from_slice(&bytes);
+    let handled = rig.server.handle(&mut rig.kernel, rig.session, &mut buffer);
+    assert!(matches!(handled, Ok(Handled::Deferred(_))));
+    assert!(rig.shared.lock().presents().has_work());
+}
+
+/// A held fallback reply whose client the table removes is answered `NotFound`
+/// (`Locked::unregister_present`), not dropped.
+#[test]
+fn a_held_reply_is_refused_when_its_client_is_removed() {
+    let mut rig = Rig::paced(Pacing::FenceWait);
+    rig.presenting_client();
+    let image = rig.image();
+    let mut buffer = vec![STALE; starquake_ipc::BUFFER_SIZE];
+    let bytes = le(&Present::of(image, 0).words());
+    buffer[..bytes.len()].copy_from_slice(&bytes);
+    let handled = rig.server.handle(&mut rig.kernel, rig.session, &mut buffer);
+    assert!(matches!(handled, Ok(Handled::Deferred(_))));
+    assert!(delivered(&mut rig).is_none());
+    assert!(rig.shared.lock().unregister_present(CLIENT));
+    assert_eq!(
+        delivered(&mut rig),
+        Some(refused(PRESENT_CLIENT_BUFFER, KernelError::NotFound))
     );
 }
 
@@ -653,7 +902,7 @@ fn unregistering_a_client_drops_its_presents() {
     assert_eq!(rig.shared.lock().watchers(id), 1);
     rig.ok(&client_only(0xDA, TOKEN));
     assert_eq!(rig.shared.lock().watchers(id), 0);
-    assert!(rig.shared.lock().presents().client(TOKEN).is_none());
+    assert!(rig.shared.lock().presents().client(CLIENT).is_none());
     assert_eq!(rig.next_tick(), [Note::VsyncTick { tick: 1 }]);
     assert_eq!(rig.shared.vsync_deadline(), None);
 }
@@ -705,7 +954,11 @@ fn the_fallback_s_reply_completes_on_the_first_tick_after_the_previous_frame_s_f
         rig.next_tick(),
         [
             Note::VsyncTick { tick: 4 },
-            Note::FrameLatched { slot: 0, image }
+            Note::FrameLatched {
+                client: CLIENT,
+                slot: 0,
+                image
+            }
         ]
     );
     assert_eq!(
@@ -719,8 +972,16 @@ fn the_fallback_s_reply_completes_on_the_first_tick_after_the_previous_frame_s_f
         rig.next_tick(),
         [
             Note::VsyncTick { tick: 5 },
-            Note::FrameLatched { slot: 0, image },
-            Note::BufferReleased { slot: 0, image },
+            Note::FrameLatched {
+                client: CLIENT,
+                slot: 0,
+                image
+            },
+            Note::BufferReleased {
+                client: CLIENT,
+                slot: 0,
+                image
+            },
         ]
     );
     assert_eq!(
@@ -748,7 +1009,7 @@ fn a_held_reply_is_saved_and_restored() {
         .shared
         .lock()
         .presents()
-        .client(TOKEN)
+        .client(CLIENT)
         .map(|client| client.waiting().map(crate::shared::present::Waiting::token));
     assert_eq!(held, Some(Some(Some(token))));
     let table = rig.shared.save_presents(&rig.server).unwrap();
@@ -873,8 +1134,9 @@ fn a_restore_refuses_one_held_reply_named_twice() {
         reached: true,
         holds_slot: false,
     };
-    let client = |key: u64| SavedClient {
-        token: key,
+    let client = |number: u8| SavedClient {
+        number,
+        token: TOKEN,
         available_bit: AVAILABLE,
         event: None,
         queued: vec![frame.clone()],
@@ -892,7 +1154,7 @@ fn a_restore_refuses_one_held_reply_named_twice() {
         bytes.extend(postcard::to_allocvec(&clients).unwrap());
         bytes
     };
-    let twice = snapshot(vec![client(TOKEN), client(TOKEN + 1)]);
+    let twice = snapshot(vec![client(CLIENT), client(CLIENT + 1)]);
     assert_eq!(
         rig.shared.restore_presents(&twice, &rig.server),
         Err(PresentSnapshotError::DuplicateToken {
@@ -900,6 +1162,6 @@ fn a_restore_refuses_one_held_reply_named_twice() {
             token: token.raw()
         })
     );
-    let once = snapshot(vec![client(TOKEN + 1)]);
+    let once = snapshot(vec![client(CLIENT + 1)]);
     assert_eq!(rig.shared.restore_presents(&once, &rig.server), Ok(()));
 }

@@ -38,6 +38,7 @@ fn distinct() -> Vi2Session {
         display_references: 0x0A,
         clients: vec![Client {
             token: 0x0B,
+            present: 0x14,
             retire: 0x0C,
             available_bit: 0x0D,
             bound: true,
@@ -69,7 +70,7 @@ fn the_saved_session_layout_is_pinned() {
         1, 0x04, // group count
         0x0A, // display references
         1,    // one client
-        0x0B, 0x0C, 0x0D, 1, // token, retire, available bit, bound
+        0x0B, 0x14, 0x0C, 0x0D, 1, // token, present number, retire, available bit, bound
         1, 0x0E, // layer
         0x0F, // free slots
         1, 0x10, 0x11, 0x12, // levels
@@ -97,8 +98,16 @@ fn with(change: impl FnOnce(&mut Vi2Session)) -> Vi2Session {
     session
 }
 
+/// A client of `token`, its present number the token's low seven bits (distinct for the tokens
+/// the tests use, and from [`distinct`]'s).
 fn client(token: u64, retire: u32, available_bit: u32) -> Client {
-    Client::new(token, retire, available_bit)
+    let present = u8::try_from(token % 128).unwrap();
+    Client::new(token, present, retire, available_bit)
+}
+
+/// The last present number gsv's present table gives.
+fn last_present() -> u8 {
+    u8::try_from(crate::shared::present::MAX_PRESENT_CLIENTS - 1).unwrap()
 }
 
 /// A refused case: the session, the error and its words.
@@ -297,6 +306,29 @@ fn client_refusals() -> Vec<Refusal> {
     ]
 }
 
+/// The relations of the clients' present numbers (step 8).
+fn present_number_refusals() -> Vec<Refusal> {
+    vec![
+        (
+            with(|s| s.clients[0].present = last_present() + 1),
+            Vi2SessionError::PresentNumber { index: 0 },
+            "vi2 client 0's present number is not below 128",
+        ),
+        (
+            with(|s| {
+                let mut second = client(0x21, 1, 2);
+                second.present = s.clients[0].present;
+                s.clients.push(second);
+            }),
+            Vi2SessionError::SharedPresentNumber {
+                first: 0,
+                second: 1,
+            },
+            "vi2 clients 0 and 1 have the same present number",
+        ),
+    ]
+}
+
 /// Two faults at once: the earlier check's error.
 fn ordering_refusals() -> Vec<Refusal> {
     vec![
@@ -337,6 +369,38 @@ fn ordering_refusals() -> Vec<Refusal> {
         ),
         (
             with(|s| {
+                let mut second = client(0x0B, 1, 2);
+                second.present = s.clients[0].present;
+                s.clients.push(second);
+            }),
+            Vi2SessionError::DuplicateToken {
+                first: 0,
+                second: 1,
+            },
+            "vi2 clients 0 and 1 have the same token",
+        ),
+        (
+            with(|s| {
+                s.clients[0].present = last_present() + 1;
+                s.clients[0].retire = CLIENT_NOTIFICATIONS;
+            }),
+            Vi2SessionError::PresentNumber { index: 0 },
+            "vi2 client 0's present number is not below 128",
+        ),
+        (
+            with(|s| {
+                let mut second = client(0x21, 1, 1);
+                second.present = s.clients[0].present;
+                s.clients.push(second);
+            }),
+            Vi2SessionError::SharedPresentNumber {
+                first: 0,
+                second: 1,
+            },
+            "vi2 clients 0 and 1 have the same present number",
+        ),
+        (
+            with(|s| {
                 s.clients.push(client(0x21, 1, 2));
                 s.clients[1].available = ALL_SLOTS + 1;
                 s.clients[0].available = ALL_SLOTS + 1;
@@ -351,7 +415,13 @@ fn ordering_refusals() -> Vec<Refusal> {
 /// earlier check's error comes back.
 #[test]
 fn each_unreachable_saved_session_is_refused() {
-    let cases = [session_refusals(), client_refusals(), ordering_refusals()].concat();
+    let cases = [
+        session_refusals(),
+        client_refusals(),
+        present_number_refusals(),
+        ordering_refusals(),
+    ]
+    .concat();
     for (session, error, words) in cases {
         assert_eq!(read_back(&session), Err(error), "{session:?}");
         assert_eq!(error.to_string(), words);
@@ -386,6 +456,8 @@ fn a_saved_session_at_each_edge_is_accepted() {
             s.clients[0].available_bit = 0;
         }),
         with(|s| s.clients[0].available = ALL_SLOTS),
+        with(|s| s.clients[0].present = last_present()),
+        with(|s| s.clients[0].present = 0),
         with(|s| s.clients[0].levels = Some([1.0_f32.to_bits(), 0, f32::MAX.to_bits()])),
         with(|s| s.display_references = 0),
         Vi2Session::new(),
