@@ -121,7 +121,7 @@ fn a_replay_answers_from_its_records_and_keeps_nothing() {
     let records = vec![clock(40), EnvRecord::Random(41)];
     let env = RunEnv::new(
         &EnvSource::Replay(records),
-        || panic!("a replay reads no host"),
+        || unreachable!("a replay reads no host"),
         ENV_RECORDING_BYTES,
     );
     assert_eq!(env.now(), Ok(HostNanos(40)));
@@ -155,7 +155,7 @@ fn a_replay_of_what_a_live_run_env_kept_gives_the_same_answers() {
     assert_eq!(dropped, 0);
     let replay = RunEnv::new(
         &EnvSource::Replay(kept),
-        || panic!("a replay reads no host"),
+        || unreachable!("a replay reads no host"),
         ENV_RECORDING_BYTES,
     );
     let replayed = (

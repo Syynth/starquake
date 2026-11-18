@@ -852,24 +852,20 @@ pub(crate) fn run_serving<V: Vcpu, C: HostClock + Clone + 'static>(
 
     let env = session.environment_within(limits.env_recording_bytes);
     let mut mappings = placed.mappings.clone();
-    let booted = if console == placed.description.console {
-        boot(address_space, placed, space, &*env)
-    } else {
-        Err(CONSOLE_MISMATCH.to_owned())
-    };
-    let (ending, log, tally, aftermath) = match booted {
-        Ok((dispatcher, tls)) => {
-            mappings.push(tls);
-            mappings.sort_by_key(|mapping| mapping.start);
-            drive(vcpus, dispatcher, space, &session, &env, limits, install)
-        }
-        Err(message) => (
-            Ending::Failed(message),
-            GuestLog::new(limits.guest_log_bytes),
-            Tally::default(),
-            Aftermath::default(),
-        ),
-    };
+    let (ending, log, tally, aftermath) =
+        match boot_on(console, address_space, placed, space, &*env) {
+            Ok((dispatcher, tls)) => {
+                mappings.push(tls);
+                mappings.sort_by_key(|mapping| mapping.start);
+                drive(vcpus, dispatcher, space, &session, &env, limits, install)
+            }
+            Err(message) => (
+                Ending::Failed(message),
+                GuestLog::new(limits.guest_log_bytes),
+                Tally::default(),
+                Aftermath::default(),
+            ),
+        };
     let Aftermath {
         stack,
         threads,
@@ -910,9 +906,7 @@ pub(crate) fn run_serving<V: Vcpu, C: HostClock + Clone + 'static>(
         }
     };
     let (exit, events, events_error) = settle_dump(flight.dump(), exit);
-    // What the loop has not moved yet: all of it, for a run that ended before the loop ran.
-    env.keep();
-    let (environment, environment_dropped) = env.kept();
+    let (environment, environment_dropped) = kept_at_end(&env);
     RunReport {
         exit,
         duration: started.elapsed(),
@@ -969,6 +963,30 @@ fn settle_dump(
             (exit, empty_dump(), Some(message))
         }
     }
+}
+
+/// [`boot`], when the run's clock counts at `console`'s rate and the process's description names
+/// the same console; [`CONSOLE_MISMATCH`] otherwise (module docs), before anything is drawn.
+fn boot_on(
+    console: process::Console,
+    address_space: AddressSpace,
+    placed: &Placement,
+    memory: &dyn GuestMemory,
+    env: &dyn Env,
+) -> Result<(Dispatcher, Mapping), String> {
+    if console == placed.description.console {
+        boot(address_space, placed, memory, env)
+    } else {
+        Err(CONSOLE_MISMATCH.to_owned())
+    }
+}
+
+/// What the run kept of its environment's recording, once it has ended: what the loop has not
+/// moved yet is moved first, which is all of it for a run that ended before the loop ran
+/// (`machine/environment.rs`).
+fn kept_at_end(env: &RunEnv) -> (Vec<starquake_trace::EnvRecord>, u64) {
+    env.keep();
+    env.kept()
 }
 
 /// Creates the process with the kernel and starts its main thread

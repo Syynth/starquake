@@ -83,7 +83,7 @@ fn replaying(records: Vec<EnvRecord>) -> RunOptions {
 fn emulator_error(report: &RunReport) -> &str {
     match &report.exit {
         ExitReason::EmulatorError(message) => message,
-        other => panic!("not an emulator error: {other:?}"),
+        other => unreachable!("not an emulator error: {other:?}"),
     }
 }
 
@@ -91,10 +91,10 @@ fn emulator_error(report: &RunReport) -> &str {
 fn a_live_run_draws_the_entropy_then_x18_first_and_the_guest_sees_them() {
     let (report, seen) = run_entropy_guest(&RunOptions::default());
     assert_eq!(report.exit, ExitReason::ProcessExited);
-    let draws = boot_draws();
+    let numbers = boot_draws();
     // The report's recording starts with the five draws, in order, and nothing was cut.
-    let drawn: Vec<EnvRecord> = draws.into_iter().map(EnvRecord::Random).collect();
-    assert_eq!(report.environment[..BOOT_DRAWS], drawn[..]);
+    let records: Vec<EnvRecord> = numbers.into_iter().map(EnvRecord::Random).collect();
+    assert_eq!(report.environment[..BOOT_DRAWS], records[..]);
     assert_eq!(report.environment_dropped, 0);
     // No other random number is drawn: the GetInfo calls read what creation drew.
     let randoms = report
@@ -105,7 +105,7 @@ fn a_live_run_draws_the_entropy_then_x18_first_and_the_guest_sees_them() {
     assert_eq!(randoms, BOOT_DRAWS);
     // The guest's x18 is the fifth with its bit set, and its entropy the first four.
     let mut expected = vec![boot_x18()];
-    expected.extend(&draws[..ENTROPY_COUNT]);
+    expected.extend(&numbers[..ENTROPY_COUNT]);
     assert_eq!(seen, expected);
     assert_eq!(report.exit_code(), exit_code::STOP_CONDITION);
 }
@@ -232,7 +232,7 @@ fn a_replay_of_the_hosts_date_gives_the_run_that_date() {
     let (live, _) = run_entropy_guest(&options);
     let mut records = live.environment;
     let EnvRecord::WallClock(_) = records[BOOT_DRAWS] else {
-        panic!("the date is read right after the draws: {records:?}");
+        unreachable!("the date is read right after the draws: {records:?}");
     };
     // A date no host would read today, so it can only have come from the recording.
     let recorded = UnixSeconds(86_400);
