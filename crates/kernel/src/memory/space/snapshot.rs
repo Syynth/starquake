@@ -1125,7 +1125,8 @@ fn check_block(
 /// (`SetProcessMemoryPermission` makes writable `Code` `CodeData` and writable `AliasCode`
 /// `AliasCodeData`: `is_w` in `KPageTableBase::SetProcessMemoryPermission`,
 /// `eden/src/core/hle/kernel/k_page_table_base.cpp`; and no state with [`flag::CODE`] can be
-/// reprotected). See "Not checked here" in the module docs for what this leaves out.
+/// reprotected). See "Decision: no per-state permission table" in the module docs for what
+/// this leaves out.
 fn is_live_permission(state: MemoryState, permission: MemoryPermission) -> bool {
     let converted = SvcPermission::ALL
         .into_iter()

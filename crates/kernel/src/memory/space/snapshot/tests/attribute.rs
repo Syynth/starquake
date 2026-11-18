@@ -148,6 +148,59 @@ fn each_attribute_restores_on_a_live_state_with_its_flag_and_is_refused_on_one_w
 }
 
 #[test]
+fn of_two_faults_in_one_block_the_attribute_rules_sit_between_the_permission_and_the_region() {
+    // The thread-local page (`ThreadLocal`: neither flag) with two faults at once: the
+    // permission check before the attribute rules, `CanChangeAttribute`'s rule before
+    // `CanPermissionLock`'s, and both before the region check.
+    let rich = rich();
+    let tls = thread_local(&rich);
+    let pairs: Vec<(&str, BlockChange, BlockFault)> = vec![
+        (
+            "a permission the state never has and uncached",
+            Box::new(|b| {
+                b.permission = READ_WRITE_EXECUTE;
+                b.attribute |= MemoryAttribute::UNCACHED.bits();
+            }),
+            BlockFault::Permission,
+        ),
+        (
+            "GPU accessible and permission locked",
+            Box::new(|b| {
+                b.attribute |=
+                    (MemoryAttribute::GPU_ACCESSIBLE | MemoryAttribute::PERMISSION_LOCKED).bits();
+            }),
+            BlockFault::ChangedAttribute,
+        ),
+        (
+            "uncached and the wrong region",
+            Box::new(|b| {
+                b.attribute |= MemoryAttribute::UNCACHED.bits();
+                b.state = MemoryState::Stack.word();
+            }),
+            BlockFault::ChangedAttribute,
+        ),
+        (
+            "permission locked and the wrong region",
+            Box::new(|b| {
+                b.attribute |= MemoryAttribute::PERMISSION_LOCKED.bits();
+                b.state = MemoryState::Stack.word();
+            }),
+            BlockFault::PermissionLock,
+        ),
+    ];
+    for (name, change, fault) in pairs {
+        let mut case = Case::new(&rich);
+        let index = at(&case.body, tls);
+        change(&mut case.body.blocks[index]);
+        assert_eq!(
+            case.error(),
+            SnapshotError::Block { index, fault },
+            "{name}"
+        );
+    }
+}
+
+#[test]
 fn an_attribute_fault_comes_after_the_counts_and_before_the_ranges() {
     // Two faults at once, against the checks on either side of check 4: a permission-locked
     // heap block (check 4) with a reservation one page short (check 3) is the reservation's

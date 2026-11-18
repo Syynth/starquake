@@ -1591,38 +1591,6 @@ fn of_two_faults_in_one_block_the_earlier_check_is_reported() {
             }),
             BlockFault::Permission,
         ),
-        (
-            "a permission the state never has and uncached",
-            Box::new(|b| {
-                b.permission = READ_WRITE_EXECUTE;
-                b.attribute |= MemoryAttribute::UNCACHED.bits();
-            }),
-            BlockFault::Permission,
-        ),
-        (
-            "GPU accessible and permission locked",
-            Box::new(|b| {
-                b.attribute |=
-                    (MemoryAttribute::GPU_ACCESSIBLE | MemoryAttribute::PERMISSION_LOCKED).bits();
-            }),
-            BlockFault::ChangedAttribute,
-        ),
-        (
-            "uncached and the wrong region",
-            Box::new(|b| {
-                b.attribute |= MemoryAttribute::UNCACHED.bits();
-                b.state = MemoryState::Stack.word();
-            }),
-            BlockFault::ChangedAttribute,
-        ),
-        (
-            "permission locked and the wrong region",
-            Box::new(|b| {
-                b.attribute |= MemoryAttribute::PERMISSION_LOCKED.bits();
-                b.state = MemoryState::Stack.word();
-            }),
-            BlockFault::PermissionLock,
-        ),
     ];
     for (name, change, fault) in pairs {
         let mut case = Case::new(&rich);
@@ -2407,8 +2375,8 @@ fn a_block_has_only_a_permission_the_kernel_gives_its_state() {
 #[test]
 fn every_converted_permission_is_accepted_where_the_state_is_not_code() {
     // The heap's first block (`Normal`) with each of the four conversions, read and execute
-    // included: module docs, "Not checked here" (only the system call refuses execute on heap
-    // memory). Each restores, and keeps its permission.
+    // included: module docs, "Decision: no per-state permission table" (only the system call
+    // refuses execute on heap memory). Each restores, and keeps its permission.
     let rich = rich();
     for svc in SvcPermission::ALL {
         let permission = MemoryPermission::from_svc(svc);
