@@ -15,6 +15,10 @@
 //! [`GSV_ROOT`] that the private entry is registered under, to hand a session on it to the
 //! title.
 //!
+//! Parental control's four names (`pctl`, `pctl:a`, `pctl:s`, `pctl:r`) are four servers, one
+//! per name, known by [`PCTL`], [`PCTL_A`], [`PCTL_S`] and [`PCTL_R`]: each name's factory has a
+//! capability of its own (`starquake_services::pctl`, "Capabilities").
+//!
 //! The numbers ([`SM`], [`SET_SYS`], [`FSP_SRV`], [`APM`], [`APPLET_OE`], [`HID`], [`TIME_U`],
 //! [`GSV_ROOT`]) are starquake's own:
 //! Horizon names a service by its name only. They appear in the trace, as the `service` of an IPC
