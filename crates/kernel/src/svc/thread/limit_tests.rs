@@ -127,6 +127,9 @@ impl World {
     }
 }
 
+/// The `x18` the tests pass `CreateThread`, as the dispatcher would after drawing it.
+const X18: u64 = 0x5eed_0000_0000_0019;
+
 /// A thread at priority 44 on virtual core `core_id`.
 fn args(core_id: i32) -> CreateThread {
     CreateThread {
@@ -135,6 +138,7 @@ fn args(core_id: i32) -> CreateThread {
         stack_top: 0x10_9000_0000,
         priority: 44,
         core_id,
+        x18: X18,
     }
 }
 

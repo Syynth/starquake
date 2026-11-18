@@ -1,15 +1,13 @@
 //! The dispatch arm of `GetInfo` (0x29): the call ([`info::get_info`]) with the handle table,
-//! the address space, the scheduler and the calling core, after the process's entropy is drawn
-//! the first time a `RandomEntropy` call asks for it ([`draw_entropy`]). The scheduler is
-//! declared exclusive for that draw, which keeps the entropy in the process's row, and for
-//! `MesosphereCurrentProcess`, which adds a handle (and so a reference to the process's object):
-//! the handle table is declared exclusive for that too.
+//! the address space, the scheduler and the calling core. The handle table and the scheduler are
+//! declared exclusive for `MesosphereCurrentProcess`, which adds a handle (and so a reference to
+//! the process's object). The arm reads nothing from the environment besides the dispatch's
+//! clock: a process's entropy is drawn when it is created (`crate::process`, "What a process
+//! draws from the environment").
 
-use super::{Call, Dispatcher, Outcome, calling_core, fault, returning, word};
+use super::{Call, Dispatcher, Outcome, calling_core, returning, word};
 use crate::handle::{Handle, HandleTable};
-use crate::id::ProcessId;
-use crate::process::ENTROPY_COUNT;
-use crate::svc::info::{self, InfoTables, InfoType};
+use crate::svc::info::{self, InfoTables};
 use crate::svc::{Convention, SvcId};
 use crate::tables::{AddressSpace, Processes, Scheduler};
 
@@ -30,9 +28,7 @@ impl Dispatcher {
     }
 }
 
-/// `GetInfo`'s arm for the calling process ([`Processes::own`]). A `RandomEntropy` call first
-/// draws the process's entropy if it has none ([`draw_entropy`]); then the call runs, on the
-/// calling core.
+/// `GetInfo`'s arm for the calling process ([`Processes::own`]), on the calling core.
 fn get_info(
     (handles, space, scheduler): (&mut HandleTable, &AddressSpace, &mut Scheduler),
     processes: &Processes,
@@ -40,9 +36,6 @@ fn get_info(
     convention: &Convention,
     call: &mut Call<'_, '_>,
 ) -> Outcome {
-    if let Err(outcome) = draw_entropy(scheduler, processes.own(), id, convention, call) {
-        return outcome;
-    }
     let core = call.caller.core;
     returning(id, convention, call.regs, |[info_type, handle, sub_id]| {
         let handle = Handle::from_register(handle);
@@ -61,41 +54,4 @@ fn get_info(
             sub_id,
         )?])
     })
-}
-
-/// Draws `process`'s entropy from the caller's environment when the call asks for
-/// `RandomEntropy` and the process has none yet: [`ENTROPY_COUNT`] random numbers, in order,
-/// under the kernel lock, so a replay feeds them back in the kernel's order. Whatever the call's
-/// handle and sub id, the first such call draws them (`svc::info` lists the divergence). When
-/// the environment fails, the call does not run and writes nothing ([`Outcome::EnvFailed`]),
-/// as when its clock fails.
-fn draw_entropy(
-    scheduler: &mut Scheduler,
-    process: ProcessId,
-    id: SvcId,
-    convention: &Convention,
-    call: &mut Call<'_, '_>,
-) -> Result<(), Outcome> {
-    // A convention mismatch is reported by the call itself.
-    let Ok([info_type, _, _]) = convention.read::<3>(call.regs) else {
-        return Ok(());
-    };
-    let asks_entropy = info_type == u64::from(InfoType::RandomEntropy.number());
-    // A process with no row is reported by the call itself, after the guest's checks.
-    let undrawn = scheduler
-        .process(process)
-        .is_ok_and(|record| record.entropy().is_none());
-    if !asks_entropy || !undrawn {
-        return Ok(());
-    }
-    let mut entropy = [0; ENTROPY_COUNT];
-    for word in &mut entropy {
-        *word = call.caller.env.random_u64().map_err(|error| {
-            tracing::error!(number = call.number, %error, "environment failed");
-            Outcome::EnvFailed(error)
-        })?;
-    }
-    scheduler
-        .set_entropy(process, entropy)
-        .map_err(|error| fault(id, &error.to_string(), call.regs))
 }

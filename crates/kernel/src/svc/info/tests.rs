@@ -458,7 +458,7 @@ fn entropy_that_was_never_drawn_is_an_internal_failure_after_the_checks() {
     assert_eq!(
         ask(&scheduler, Handle::INVALID, 0),
         Err(SvcError::Internal(
-            "the process's entropy was asked for before it was drawn".to_owned()
+            "the process was made without an environment, so it has no entropy".to_owned()
         ))
     );
     // A calling process the scheduler has no row for is an internal failure too, even when

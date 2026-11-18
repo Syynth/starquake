@@ -251,15 +251,14 @@
 //!   is an internal failure, after the guest's checks. Tests: `a_handle_must_name_a_process`,
 //!   `the_facts_are_the_named_process_s_and_the_sizes_the_caller_s`,
 //!   `a_fact_about_a_process_with_no_row_is_an_internal_failure_after_the_checks`.
-//! - **The entropy is drawn when it is first asked for**, not when the process is created
-//!   (Eden's `KProcess::Initialize`, `GenerateRandom(m_entropy)`): the dispatcher draws the
-//!   [`ENTROPY_COUNT`] words from the environment's random numbers at the first
-//!   `RandomEntropy` call, whatever its handle and sub id, and keeps them in the process's
-//!   row ([`crate::process::ProcessRecord::entropy`]). Creating a process has no route to the
-//!   environment yet. The guest cannot tell: the words are random either way, and never change
-//!   once drawn. Test (in `dispatch/tests/info_and_break.rs`):
-//!   `the_entropy_is_drawn_once_at_the_first_ask_and_kept`. A process whose entropy was not
-//!   drawn is an internal failure here, not a value. Test:
+//! - **A process made without an environment has no entropy.** The entropy is drawn when the
+//!   process is created, as Eden's `KProcess::Initialize` draws it (`GenerateRandom(m_entropy)`;
+//!   [`crate::process::create_with_env`]), and `RandomEntropy` only reads it; a call draws
+//!   nothing (test, in `dispatch/tests/info_and_break.rs`:
+//!   `random_entropy_reads_what_creation_drew_and_draws_nothing`). A process made by
+//!   [`crate::process::create`], which has no environment to draw from, has none, and a
+//!   `RandomEntropy` call of it is an internal failure after the guest's checks, not a value.
+//!   Horizon never makes such a process. Test:
 //!   `entropy_that_was_never_drawn_is_an_internal_failure_after_the_checks`.
 //!
 //! Ids Eden does not list (`IsSvcPermitted` 26, `IoRegionHint` 27, `TransferMemoryHint` 34 and
@@ -925,7 +924,9 @@ fn random_entropy(
         .filter(|&index| index < ENTROPY_COUNT)
         .ok_or(KernelError::InvalidCombination)?;
     let entropy = scheduler.process(process)?.entropy().ok_or_else(|| {
-        SvcError::Internal("the process's entropy was asked for before it was drawn".to_owned())
+        SvcError::Internal(
+            "the process was made without an environment, so it has no entropy".to_owned(),
+        )
     })?;
     entropy
         .get(index)

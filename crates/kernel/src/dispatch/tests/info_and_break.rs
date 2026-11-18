@@ -1,6 +1,6 @@
-//! The `GetInfo` arm's entropy, drawn from the environment at the first ask, its Switch 2 ids,
-//! and the `Break` arm: which registers each reads and writes, how each dispatch ends and what
-//! it records.
+//! The `GetInfo` arm's entropy, which it reads from what creating the process drew and never
+//! draws itself, its Switch 2 ids, and the `Break` arm: which registers each reads and writes,
+//! how each dispatch ends and what it records.
 
 use super::*;
 use crate::handle::Resolved;
@@ -25,6 +25,18 @@ fn clock(n: u64) -> EnvRecord {
 /// The four random records of [`DRAWN`].
 fn drawn() -> Vec<EnvRecord> {
     DRAWN.iter().map(|&word| EnvRecord::Random(word)).collect()
+}
+
+/// [`tables`], made as a run makes them: with the process's entropy drawn from a replay of
+/// [`DRAWN`] ([`crate::process::create_with_env`]), which is used up exactly.
+fn drawn_tables() -> Tables {
+    let mut description = ProcessDescription::homebrew(CONSOLE);
+    description.handle_table_size = i32::from(MAX_TABLE_SIZE);
+    let env = ReplayEnv::new(drawn());
+    let tables = crate::process::create_with_env(&description, fixture::loaded().0, &env)
+        .expect("the fixture's process");
+    assert_eq!(env.finish(), Ok(()));
+    tables
 }
 
 /// Runs one call on `dispatcher` from core 0 with `env`, `memory`, and a recorder that keeps the
@@ -87,7 +99,7 @@ fn own_process(scheduler: &Scheduler) -> ProcessId {
     own
 }
 
-/// `GetInfo(RandomEntropy, invalid handle, sub_id)`'s result and value, with `env`.
+/// `GetInfo(RandomEntropy, handle, sub_id)`'s result and value, with `env`.
 fn ask_entropy(dispatcher: &Dispatcher, env: &dyn Env, handle: Handle, sub_id: u64) -> [u64; 2] {
     let memory = FlatMemory::new(BASE, 0x10);
     let mut regs = get_info_regs(InfoType::RandomEntropy, handle, sub_id);
@@ -99,14 +111,14 @@ fn ask_entropy(dispatcher: &Dispatcher, env: &dyn Env, handle: Handle, sub_id: u
 }
 
 #[test]
-fn the_entropy_is_drawn_once_at_the_first_ask_and_kept() {
-    let dispatcher = Dispatcher::new(tables());
-    assert_eq!(entropy_of(&dispatcher), None);
-    // One clock reading per dispatch, and the four random numbers right after the first.
-    let mut records = vec![clock(0)];
-    records.extend(drawn());
-    records.extend((1..u64::try_from(ENTROPY_COUNT).unwrap()).map(clock));
-    let env = ReplayEnv::new(records);
+fn random_entropy_reads_what_creation_drew_and_draws_nothing() {
+    // Creating the process drew the entropy; each ask reads one word of it, and the
+    // environment gives each dispatch its clock reading and nothing else, so a replay of only
+    // those readings is used up exactly.
+    let dispatcher = Dispatcher::new(drawn_tables());
+    assert_eq!(entropy_of(&dispatcher), Some(DRAWN));
+    let count = u64::try_from(ENTROPY_COUNT).unwrap();
+    let env = ReplayEnv::new((0..count).map(clock).collect());
     for (sub_id, word) in (0_u64..).zip(DRAWN) {
         assert_eq!(
             ask_entropy(&dispatcher, &env, Handle::INVALID, sub_id),
@@ -114,38 +126,36 @@ fn the_entropy_is_drawn_once_at_the_first_ask_and_kept() {
             "sub id {sub_id}"
         );
     }
-    // Exactly the records given: the three later asks drew nothing.
     assert_eq!(env.finish(), Ok(()));
     assert_eq!(entropy_of(&dispatcher), Some(DRAWN));
 }
 
 #[test]
-fn a_first_ask_that_the_checks_refuse_still_draws_the_entropy() {
-    // Divergence (`svc::info`): Horizon draws the entropy when the process is created, so a
-    // refused call finds it there already. Here the first ask draws it, whatever its
-    // arguments, and the call is then refused as Eden refuses it.
-    let dispatcher = Dispatcher::new(tables());
-    let mut records = vec![clock(0)];
-    records.extend(drawn());
-    records.push(clock(1));
-    let env = ReplayEnv::new(records);
+fn a_refused_entropy_ask_draws_nothing() {
+    // The guest's checks refuse the call before the entropy is read, and nothing is drawn:
+    // the replay holds only the dispatches' clock readings.
+    let dispatcher = Dispatcher::new(drawn_tables());
+    let env = ReplayEnv::new(vec![clock(0), clock(1)]);
     assert_eq!(
         ask_entropy(&dispatcher, &env, Handle::CURRENT_PROCESS, 0),
         [word(KernelError::InvalidHandle), 0]
     );
-    assert_eq!(entropy_of(&dispatcher), Some(DRAWN));
     assert_eq!(
-        ask_entropy(&dispatcher, &env, Handle::INVALID, 3),
-        [0, DRAWN[3]]
+        ask_entropy(
+            &dispatcher,
+            &env,
+            Handle::INVALID,
+            u64::try_from(ENTROPY_COUNT).unwrap()
+        ),
+        [word(KernelError::InvalidCombination), 0]
     );
     assert_eq!(env.finish(), Ok(()));
 }
 
 #[test]
 fn a_process_with_no_scheduler_row_draws_nothing_and_is_refused_by_the_call() {
-    // `draw_entropy` leaves a process with no row to the call itself, which reports the
-    // guest's checks first: here the handle is not the invalid handle. No random number is
-    // drawn, so a replay holding only the dispatch's clock reading is used up exactly.
+    // The call reports the guest's checks before it looks for the process's row: here the
+    // handle is not the invalid handle. No random number is drawn, so a replay holding only the dispatch's clock reading is used up exactly.
     let mut tables = tables();
     tables.scheduler = Scheduler::default();
     let dispatcher = Dispatcher::new(tables);
@@ -203,44 +213,6 @@ fn other_ids_draw_nothing() {
     assert_eq!(entropy_of(&dispatcher), None);
 }
 
-#[test]
-fn an_environment_that_fails_while_drawing_ends_the_call_without_writing_registers() {
-    // The fourth random number is missing: the call does not run, writes nothing and records
-    // nothing, and the process keeps no entropy, so the next ask draws all four again.
-    let dispatcher = Dispatcher::new(tables());
-    let memory = FlatMemory::new(BASE, 0x10);
-    let mut records = vec![clock(0)];
-    records.extend(drawn().into_iter().take(ENTROPY_COUNT - 1));
-    let short = ReplayEnv::new(records);
-    let mut regs = get_info_regs(InfoType::RandomEntropy, Handle::INVALID, 0);
-    let before = regs.clone();
-    let (record, events) = dispatch_with(
-        &dispatcher,
-        &short,
-        &memory,
-        SvcId::GetInfo.number(),
-        &mut regs,
-    );
-    assert_eq!(
-        record.outcome,
-        Outcome::EnvFailed(EnvError::Exhausted {
-            index: ENTROPY_COUNT,
-            requested: EnvCall::Random
-        })
-    );
-    assert_untouched_from(&regs, &before, 0);
-    assert_eq!(events, []);
-    assert_eq!(entropy_of(&dispatcher), None);
-
-    let mut records = vec![clock(1)];
-    records.extend(drawn());
-    let env = ReplayEnv::new(records);
-    assert_eq!(
-        ask_entropy(&dispatcher, &env, Handle::INVALID, 1),
-        [0, DRAWN[1]]
-    );
-    assert_eq!(env.finish(), Ok(()));
-}
 
 #[test]
 fn a_switch_2_id_is_answered_by_the_calling_process_s_console() {

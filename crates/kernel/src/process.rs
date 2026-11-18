@@ -16,10 +16,54 @@
 //! without the stack, which the caller has already mapped
 //! ([`AddressSpace::create_main_thread_stack`]).
 //!
+//! # What a process draws from the environment
+//!
+//! Horizon draws two kinds of random numbers as it makes a process. A run reads both through the
+//! environment ([`Env`]), so that a live run records them and a replay feeds them back
+//! (`docs/specs/observability.md`, rule 1):
+//!
+//! - **The process's entropy**, [`ENTROPY_COUNT`] words that `GetInfo(RandomEntropy)` reads,
+//!   drawn by `KProcess::Initialize` (`GenerateRandom(m_entropy)`,
+//!   `eden/src/core/hle/kernel/k_process.cpp` @ cf654052, line 239; the same line in
+//!   `eden-pr4588` @ e5fb3b97 and `eden-nx2` @ 50fa86bb). [`create_with_env`] draws them, in
+//!   order, after every check [`create`] makes, and keeps them in the process's row
+//!   ([`ProcessRecord::entropy`]).
+//! - **Each 64-bit thread's `x18`**, a random number with its low bit set
+//!   ([`CFI_VALUE_SET_BITS`]): `ResetThreadContext64`'s `ctx.r[18] = Common::Random::Random64(0)
+//!   | 1` (`eden/src/core/hle/kernel/k_thread.cpp` @ cf654052, line 61, called from
+//!   `KThread::Initialize` at line 240; the same lines in `eden-pr4588` and `eden-nx2`).
+//!   Atmosphère sets the same register the same way and calls it the thread's CFI value (fact
+//!   only: `atmosphere/libraries/libmesosphere/source/arch/arm64/kern_k_thread_context.cpp`,
+//!   `ctx->x[18] = KSystemControl::GenerateRandomU64() | 1`). [`run_with_env`] draws the main
+//!   thread's; the dispatcher's `CreateThread` arm draws every other thread's
+//!   (`crate::dispatch`, "Random numbers"). Eden's `Random64` widens one 32-bit
+//!   `std::random_device` draw (`eden/src/common/random.cpp`), so its top half is always zero;
+//!   here the whole 64-bit word is drawn, as Atmosphère's `GenerateRandomU64` draws it.
+//!
+//! A run draws them in this order: the four entropy words, then the main thread's `x18`
+//! (`starquake-core`'s boot). An environment that fails a draw (a replay that ran out or
+//! disagrees) fails the creation or the start ([`CreateError::Env`], [`StartError::Env`]), which
+//! the run turns into an emulator error (decision log, 2026-11-17, "Env failures").
+//!
+//! [`create`] and [`run`] are the same steps with no environment: the process has no entropy
+//! (a `GetInfo(RandomEntropy)` is then the internal failure `svc::info` names) and the main
+//! thread's `x18` is zero. Horizon never makes such a process. Both functions are public, so
+//! any caller can make one; the test rigs that never read either use them, and a run never does
+//! (`starquake-core`'s boot calls [`create_with_env`] and [`run_with_env`]). Tests:
+//! `a_process_made_without_an_environment_has_no_entropy_and_a_zero_x18`,
+//! `the_entropy_and_x18_are_drawn_once_at_creation_in_order`.
+//!
 //! # Divergences from `KProcess::Run`
 //!
+//! - **The main thread's `x18` is drawn after the state check and before the thread is made.**
+//!   Eden draws it inside `KThread::Initialize`, after the thread reservation and the
+//!   thread-local region. A start refused at either of those has drawn one number here and none
+//!   in Eden; nothing the guest sees differs, only the environment's recording. Test:
+//!   `a_start_refused_after_the_draw_has_still_drawn_one_number`.
+//!
 //! - **The thread's register state** is Eden's kernel entry convention for a program with no
-//!   homebrew argument block (`x0` zero, `x1` the main thread's handle). Eden gives an NRO that
+//!   homebrew argument block (`x0` zero, `x1` the main thread's handle; `x18` is the thread's
+//!   CFI value, above, as in Eden). Eden gives an NRO that
 //!   the loader passed an argument block `x0` = the block, `x1` = `-1`; no loader here passes
 //!   one. Test: `the_main_thread_starts_at_the_entry_with_its_own_handle`.
 //! - **The thread reservation does not wait.** Eden reserves the main thread from the
@@ -61,6 +105,7 @@ pub mod record;
 pub mod tls;
 
 use starquake_memory::GuestMemory;
+use starquake_trace::{Env, EnvError};
 
 pub use asid::{AsidError, AsidPool};
 pub use description::{
@@ -100,6 +145,9 @@ pub enum CreateError {
     /// The scheduler refused the process.
     #[error("the scheduler refused the process: {0}")]
     Scheduler(#[from] crate::sched::SchedError),
+    /// The environment failed while the process's entropy was drawn ([`create_with_env`]).
+    #[error("the environment failed while the process's entropy was drawn: {0}")]
+    Env(#[from] EnvError),
     /// The address space was made for another system resource than the description asks for
     /// ([`AddressSpace::with_system_resource`]), so its memory count would not hold the
     /// process's charge.
@@ -155,6 +203,52 @@ pub fn create(
     })
 }
 
+/// [`create`], then the process's entropy drawn from `env` (module docs, "What a process draws
+/// from the environment"): [`ENTROPY_COUNT`] random numbers, in order, after every check
+/// [`create`] makes, so a refused description draws nothing. An environment that fails a draw
+/// is [`CreateError::Env`], and the tables are dropped.
+pub fn create_with_env(
+    description: &ProcessDescription,
+    address_space: AddressSpace,
+    env: &dyn Env,
+) -> Result<Tables, CreateError> {
+    let mut tables = create(description, address_space)?;
+    let mut entropy = [0; ENTROPY_COUNT];
+    for word in &mut entropy {
+        *word = env.random_u64()?;
+    }
+    tables
+        .scheduler
+        .set_entropy(tables.processes.own(), entropy)?;
+    Ok(tables)
+}
+
+/// The bits Horizon sets in every 64-bit thread's `x18` over the random number it draws: the
+/// `| 1` of `ResetThreadContext64` (`eden/src/core/hle/kernel/k_thread.cpp` @ cf654052, line
+/// 61), and of Atmosphère's `GenerateRandomU64() | 1` (fact only, module docs).
+pub const CFI_VALUE_SET_BITS: u64 = 1;
+
+/// The register a new thread's CFI value goes in: `x18` (`ctx.r[18]`, as above).
+pub const CFI_REGISTER: usize = 18;
+
+/// A new thread's `x18`, drawn from `env`: one random number with [`CFI_VALUE_SET_BITS`] set
+/// (module docs). The one place the value is made, for [`run_with_env`] and the dispatcher's
+/// `CreateThread` arm.
+pub(crate) fn draw_cfi_value(env: &dyn Env) -> Result<u64, EnvError> {
+    Ok(env.random_u64()? | CFI_VALUE_SET_BITS)
+}
+
+/// Why [`run_with_env`] could not start the main thread.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum StartError {
+    /// The environment failed while the main thread's `x18` was drawn. Nothing was made.
+    #[error("the environment failed while the main thread's x18 was drawn: {0}")]
+    Env(#[from] EnvError),
+    /// The start was refused, as [`run`] refuses it.
+    #[error(transparent)]
+    Call(#[from] SvcError),
+}
+
 /// A started main thread.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MainThread {
@@ -179,11 +273,52 @@ pub struct MainThread {
 /// blocks in `KProcess::Run` undo it ([`undo_run`]): the thread ends, its handle is closed,
 /// which destroys it, and the process is [`ProcessState::Created`] again. Each of those later
 /// steps fails only when the kernel's own bookkeeping is broken.
+///
+/// The main thread's `x18` is zero: there is no environment to draw it from (module docs).
+/// [`run_with_env`] draws it.
 pub fn run(
     tables: &mut Tables,
     memory: &dyn GuestMemory,
     entry: u64,
     stack_top: u64,
+) -> CallResult<MainThread> {
+    ensure_created(tables)?;
+    start_main(tables, memory, (entry, stack_top), 0)
+}
+
+/// [`run`], with the main thread's `x18` drawn from `env` ([`CFI_VALUE_SET_BITS`]; module
+/// docs, "What a process draws from the environment") after the state check and before
+/// anything is made. A process that is not [`ProcessState::Created`] draws nothing
+/// ([`StartError::Call`] with [`KernelError::InvalidState`]), and an environment that fails
+/// the draw is [`StartError::Env`] with nothing made.
+pub fn run_with_env(
+    tables: &mut Tables,
+    memory: &dyn GuestMemory,
+    (entry, stack_top): (u64, u64),
+    env: &dyn Env,
+) -> Result<MainThread, StartError> {
+    ensure_created(tables)?;
+    let x18 = draw_cfi_value(env)?;
+    Ok(start_main(tables, memory, (entry, stack_top), x18)?)
+}
+
+/// `KProcess::Run`'s state check: a process that is not [`ProcessState::Created`] is
+/// [`KernelError::InvalidState`], Eden's result.
+fn ensure_created(tables: &Tables) -> CallResult<()> {
+    let process = tables.processes.own();
+    if tables.scheduler.process(process)?.state() != ProcessState::Created {
+        return Err(KernelError::InvalidState.into());
+    }
+    Ok(())
+}
+
+/// The rest of [`run`] once its state check has passed: the main thread made with `x18` in its
+/// context, its handle in `x1`, the process marked running and the thread started.
+fn start_main(
+    tables: &mut Tables,
+    memory: &dyn GuestMemory,
+    (entry, stack_top): (u64, u64),
+    x18: u64,
 ) -> CallResult<MainThread> {
     let Tables {
         handles,
@@ -195,9 +330,6 @@ pub fn run(
     let info = processes
         .get(process)
         .map_err(|error| SvcError::internal(&error))?;
-    if scheduler.process(process)?.state() != ProcessState::Created {
-        return Err(KernelError::InvalidState.into());
-    }
     let spec = UserThread {
         entry,
         argument: 0,
@@ -206,7 +338,7 @@ pub fn run(
         virtual_core: info.ideal_core(),
     };
     let (thread, handle) =
-        create_thread_with_handle((handles, space, scheduler), process, &spec, memory)?;
+        create_thread_with_handle((handles, space, scheduler), process, (&spec, x18), memory)?;
     let started = (|| -> CallResult<()> {
         scheduler.context_mut(thread)?.x[1] = u64::from(handle.raw());
         scheduler.mark_running(process)?;
@@ -249,18 +381,30 @@ pub(crate) fn undo_run(
     state
 }
 
-/// Creates a thread of `process` ([`Scheduler::create_user_thread`]) and a handle to it, zeroes
-/// the thread's region and writes the handle into it ([`initialise_region`]), and closes the
-/// creator's reference, so that the handle holds the thread's only one: the steps
-/// `CreateThread` and `KProcess::Run` share. When the handle cannot be added, closing the
-/// creator's reference destroys the thread again and the handle table's error is returned.
+/// Creates a thread of `process` ([`Scheduler::create_user_thread`]) with `x18` in its
+/// [`CFI_REGISTER`], and a handle to it, zeroes the thread's region and writes the handle into
+/// it ([`initialise_region`]), and closes the creator's reference, so that the handle holds the
+/// thread's only one: the steps `CreateThread` and `KProcess::Run` share. When `x18` cannot be
+/// set (the new thread has no row: the kernel's bookkeeping is broken) or the handle cannot be
+/// added, closing the creator's reference destroys the thread again and the error is returned.
 pub(crate) fn create_thread_with_handle(
     (handles, space, scheduler): (&mut HandleTable, &mut AddressSpace, &mut Scheduler),
     process: ProcessId,
-    spec: &UserThread,
+    (spec, x18): (&UserThread, u64),
     memory: &dyn GuestMemory,
 ) -> CallResult<(ThreadId, Handle)> {
     let (thread, object) = scheduler.create_user_thread(space, process, spec)?;
+    match scheduler.context_mut(thread) {
+        Ok(context) => {
+            if let Some(register) = context.x.get_mut(CFI_REGISTER) {
+                *register = x18;
+            }
+        }
+        Err(error) => {
+            scheduler.close_object(object)?;
+            return Err(error.into());
+        }
+    }
     let handle = match handles.add(scheduler.objects_mut(), object) {
         Ok(handle) => handle,
         Err(error) => {

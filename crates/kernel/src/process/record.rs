@@ -10,10 +10,11 @@
 //!
 //! The row also keeps the process's random entropy (`KProcess::m_entropy`, which `GetInfo`'s
 //! `RandomEntropy` id reads). Horizon draws it in `KProcess::Initialize` (`GenerateRandom(
-//! m_entropy)`, `k_process.cpp` @ cf654052, line 239) and never changes it. Here it is drawn
-//! from the environment the first time `GetInfo` asks for it, because creating a process has no
-//! route to the environment's random numbers ([`crate::svc::info`] lists the divergence), and
-//! never changes after that.
+//! m_entropy)`, `k_process.cpp` @ cf654052, line 239) and never changes it. Here
+//! [`crate::process::create_with_env`] draws it from the environment as it creates the process,
+//! and it never changes after that. A process made without an environment
+//! ([`crate::process::create`]) has none ([`crate::svc::info`] lists what a `RandomEntropy`
+//! call of it answers).
 
 use std::collections::BTreeSet;
 
@@ -55,7 +56,7 @@ pub struct ProcessRecord {
     pub(crate) tls: ThreadLocalPages,
     /// `m_schedule_count`: what its threads' yields compare with.
     pub(crate) scheduled_count: u64,
-    /// `m_entropy`, once drawn (see the module docs).
+    /// `m_entropy`, drawn at creation, or `None` (see the module docs).
     pub(crate) entropy: Option<[u64; ENTROPY_COUNT]>,
 }
 
@@ -126,8 +127,9 @@ impl ProcessRecord {
         self.scheduled_count
     }
 
-    /// Its random entropy (`GetRandomEntropy`), or `None` while it has not been drawn
-    /// ([`crate::sched::Scheduler::set_entropy`]).
+    /// Its random entropy (`GetRandomEntropy`), drawn as the process was created
+    /// ([`crate::process::create_with_env`]), or `None` for a process made without an
+    /// environment ([`crate::process::create`]).
     #[must_use]
     pub const fn entropy(&self) -> Option<[u64; ENTROPY_COUNT]> {
         self.entropy
