@@ -30,8 +30,9 @@ fn a_handle_from_get_info_answers_both_calls_through_the_dispatcher() {
     let handle = Handle::from_raw(u32::try_from(regs.x[1]).unwrap());
     let limit = dispatcher.with::<(&HandleTable, &Scheduler), _>(|(handles, scheduler)| {
         let limit = handles.get(handle).unwrap();
-        let Ok(Object::ResourceLimit(object)) = scheduler.objects().get(limit) else {
-            panic!("the handle names no resource limit");
+        let object = match scheduler.objects().get(limit) {
+            Ok(Object::ResourceLimit(object)) => object,
+            other => unreachable!("{other:?}"),
         };
         // The limit its process's row names.
         let row = scheduler.process(object.owner()).unwrap();
