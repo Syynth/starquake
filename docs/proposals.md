@@ -331,6 +331,17 @@ Filed from this wave under the delegation:
 | proposed | **am: the operation and performance-mode change message, `PushUnorderedMessage` sources, and a bound on the unordered and restored queues** | Review of #268 | area:services |
 | proposed | **A deterministic per-call cost test** (a counting allocator in its own test binary) in place of #268's wall-clock one | Review of #268; the wall-clock test has about 8x headroom | area:services |
 
+### From wave 27 (ledger: #22)
+
+Landed: #277 (parental control, PR #280), #189 (nvhost-gpu channels with the owner's cap, PR #275) and #207 (the auto-stub diagnostics, PR #281). #278 (`lm`, `ectx:aw`, `aoc:u`) was built with a green gate, but its builder returned before opening the PR. Wave 28 finishes it from its branch.
+
+With pctl in place the title no longer crashes: it runs to the timeout. It then polls `WaitSynchronization` without end on a handle the kernel calls invalid, right after the auto-stubbed `IApplicationFunctions` command 210, which Eden answers with an event. #282, filed under the delegation, covers that command and the five other start-up commands the new `stubbed_commands` list names.
+
+| Status | Proposal | Why | Suggested |
+|---|---|---|---|
+| awaiting the owner | **Whether stub records tell a guest-named stub apart from a real interface.** A stub asked for under sm's own interface name ("Sm") is counted with sm today. The collision is listed as a divergence and pinned by `sm::tests::a_stub_asked_for_by_sms_own_interface_name_is_counted_with_it` | Review of #207 (a comment on PR #281) | observability |
+| proposed | **Wire the title's NACP through to services**, so `GetDesiredLanguage` can answer from the supported languages, as Eden does | #282's scope | area:services, area:core |
+
 ## House-rule candidates
 
 Rules distilled from review findings. A vetted rule moves into `CLAUDE.md`; until then it is
@@ -482,3 +493,12 @@ passed to build agents as a provisional rule for the next wave.
 | proposed | Don't claim replay reproduces an outcome that depends on unrecorded host timing or state; name the unrecorded input in the docs. |
 | proposed | A departure from a decision-log rule or a spec is said so in the docs and PR body, with its reason, and raised as an owner question. |
 | proposed | A per-request handler never clones a container a client or snapshot can grow; a test shows per-call work doesn't grow with it. |
+
+### From wave 27 (ledger: #22)
+
+- When a table maps a name to a number (or two views of one fact), a test cross-checks the two independent sources instead of looping over the same table on both sides.
+- When a gate depends on a combination of conditions, a test varies each condition alone, on the production-like configuration.
+- Error text is read aloud against the empty, zero and one cases, and the zero case's exact string is asserted.
+- A classification branch that picks a name, protocol or interface is tested for every variant that reaches it; a fallback records "unknown" rather than borrowing another object's name.
+- Observability records are not keyed by a guest-controlled string alone, or the ambiguity is a listed divergence pinned by a test.
+- A build agent returns only when its work is pushed; no background job may still be editing tracked files.
