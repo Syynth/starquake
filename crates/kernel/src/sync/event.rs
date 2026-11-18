@@ -31,6 +31,12 @@ pub struct Event {
 }
 
 impl Event {
+    /// The writable end of the readable end `readable`: what a restored object table rebuilds
+    /// a saved event from (`crate::object::snapshot`, which checks what `readable` names).
+    pub(crate) const fn signalling(readable: ObjectId) -> Self {
+        Self { readable }
+    }
+
     /// The readable end this event signals. Its row is gone once every reference to it was
     /// closed; signalling and clearing then do nothing.
     #[must_use]
@@ -47,6 +53,12 @@ pub struct ReadableEvent {
 }
 
 impl ReadableEvent {
+    /// A readable end, signalled or not: what a restored object table rebuilds a saved one
+    /// from (`crate::object::snapshot`).
+    pub(crate) const fn with_signalled(signalled: bool) -> Self {
+        Self { signalled }
+    }
+
     /// Whether the event is signalled (`KReadableEvent::IsSignaled`). A new event is not
     /// (`KReadableEvent::Initialize`).
     #[must_use]

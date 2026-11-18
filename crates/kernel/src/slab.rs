@@ -376,6 +376,37 @@ impl<Id: SlabId, T> Slab<Id, T> {
         }
     }
 
+    /// The same slab with each row replaced by what `f` makes of it, called in slot order with
+    /// the row's id: every slot keeps its generation, and the free stack, the slot limit and the
+    /// live count are kept as they are, so every id names the same slot as before. How a table
+    /// turns its rows into their saved form and back. The first error `f` returns ends the walk
+    /// and is returned.
+    pub(crate) fn try_map<U, E>(
+        &self,
+        mut f: impl FnMut(Id, &T) -> Result<U, E>,
+    ) -> Result<Slab<Id, U>, E> {
+        let mut slots = Vec::with_capacity(self.slots.len());
+        for (slot, index) in self.slots.iter().zip(0_u32..) {
+            slots.push(match slot {
+                Slot::Vacant { generation } => Slot::Vacant {
+                    generation: *generation,
+                },
+                Slot::Occupied { generation, value } => Slot::Occupied {
+                    generation: *generation,
+                    value: f(Id::from_parts(index, *generation), value)?,
+                },
+                Slot::Retired => Slot::Retired,
+            });
+        }
+        Ok(Slab {
+            slots,
+            free: self.free.clone(),
+            max_slots: self.max_slots,
+            live: self.live,
+            _id: PhantomData,
+        })
+    }
+
     /// Live rows in slot order (ascending index), with their ids.
     pub fn iter(&self) -> impl Iterator<Item = (Id, &T)> {
         self.slots

@@ -1018,3 +1018,31 @@ fn errors_display_their_documented_text() {
         "high-water mark 9 is inconsistent"
     );
 }
+
+#[test]
+fn a_tables_data_is_its_wire_form_and_converts_back_to_it() {
+    let (t, _, _) = used_table();
+    let data = t.data();
+    assert_eq!(
+        postcard::to_allocvec(&data).unwrap(),
+        postcard::to_allocvec(&t).unwrap()
+    );
+    assert_eq!(HandleTable::try_from(data), Ok(t));
+}
+
+#[test]
+fn entries_are_each_handle_with_its_object_lowest_index_first() {
+    let (t, _, h) = used_table();
+    let entries: Vec<(Handle, ObjectId)> = t.entries().collect();
+    let expected: Vec<(Handle, ObjectId)> = t
+        .handles()
+        .into_iter()
+        .map(|handle| (handle, t.get(handle).unwrap()))
+        .collect();
+    assert_eq!(entries, expected);
+    // The three handles left, each naming what it was added for.
+    assert_eq!(entries.len(), 3);
+    for (index, object) in [(0, obj(0)), (2, obj(2)), (4, obj(1))] {
+        assert!(entries.contains(&(h[index], object)), "{index}");
+    }
+}

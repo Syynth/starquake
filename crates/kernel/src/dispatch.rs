@@ -233,6 +233,7 @@ mod info;
 mod ipc;
 mod lifecycle;
 mod memory_objects;
+mod snapshot;
 mod sync;
 #[cfg(test)]
 mod tests;
