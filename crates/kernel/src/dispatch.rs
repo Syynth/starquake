@@ -65,8 +65,9 @@
 //!   transfer memory's last reference can go in any call that drops references; the pages it
 //!   lent are unlocked before the kernel lock is let go, whichever call that was (`Locked`'s
 //!   `Drop`, [`crate::svc::transfer_memory::unlock_released`]). A shared memory's pages are
-//!   given back to the translation there too, after the unlocks, when its last reference has
-//!   gone ([`crate::svc::shared_memory::free_released`]).
+//!   given back to the translation there too, after the unlocks (and even when one failed),
+//!   when its last reference has gone ([`crate::svc::shared_memory::free_released`]); the
+//!   translation's calls show the order (`Locked`'s docs name the tests).
 //! - **`ExitProcess`** ends the process ([`crate::svc::process::exit_process`]: its threads end
 //!   and its handles close, so the servers of its sessions are told) and the dispatch in
 //!   [`Outcome::ProcessExited`]; the caller stops running the guest. **`ExitThread`** ends the
@@ -576,7 +577,12 @@ struct Locked<'d, B> {
 /// the next holder of the lock finds them as `KTransferMemory::Finalize` leaves them. A failure
 /// is the kernel's own bookkeeping, and is logged (see the divergences in
 /// [`crate::svc::transfer_memory`]). Then the pages of every shared memory that went are given
-/// back to the translation ([`shared_memory::free_released`]), a failure logged the same way.
+/// back to the translation ([`shared_memory::free_released`]), a failure logged the same way;
+/// they are given back even when an unlock failed. Both orders show in the translation's calls
+/// (an unlock is a `Mapper::protect`, a give-back a `Mapper::release_shared`), and are pinned
+/// by `exiting_the_process_unlocks_lent_pages_before_it_gives_back_shared_ones` and
+/// `a_refused_unlock_still_gives_back_shared_memory_under_the_same_lock` (in
+/// `dispatch/memory_objects/tests.rs`). The two log lines are log-only: no test captures them.
 impl<B> Drop for Locked<'_, B> {
     fn drop(&mut self) {
         let tables = &mut self.state.tables;

@@ -27,6 +27,7 @@ use crate::object::Object;
 use crate::process::{Console, ProcessDescription};
 use crate::result::{KernelError, SvcError, SvcResult};
 use crate::svc::DebugSink;
+use crate::svc::handle::remove_handle;
 
 /// The guest thread of these tests, as the event stream names it.
 const THREAD: ThreadId = ThreadId(0xA1);
@@ -852,7 +853,7 @@ fn giving_back_waits_for_the_last_reference_and_goes_after_the_unmap() {
 }
 
 #[test]
-fn unmapping_the_last_mapping_through_the_system_call_gives_the_pages_back() {
+fn closing_the_last_handle_after_the_unmap_gives_the_pages_back() {
     let world = World::new();
     let (handle, pages) = world.shared_memory(SvcPermission::Read);
     let object = world
@@ -896,4 +897,132 @@ fn unmapping_the_last_mapping_through_the_system_call_gives_the_pages_back() {
             backing: pages.backing()
         }]
     );
+}
+
+#[test]
+fn a_refused_give_back_of_an_object_not_made_returns_the_objects_error() {
+    // As `an_object_not_made_after_its_pages_gives_them_back_at_once`, but the translation
+    // refuses the give-back too: the object's error is still what the caller gets.
+    let (mut space, log, mut scheduler, _) = small_table(4, 0);
+    log.refuse_calls(&[1]);
+    assert_eq!(
+        create_shared_memory_in(&mut space, &mut scheduler, SIZE, SvcPermission::None)
+            .map(|(_, pages)| pages.size()),
+        Err(SvcError::Kernel(KernelError::InvalidNewMemoryPermission))
+    );
+    assert_eq!(
+        log.take(),
+        [MapperCall::AllocateShared {
+            backing: BackingRange::new(SHARED_BASE, SIZE).unwrap()
+        }]
+    );
+    assert!(scheduler.objects().is_empty());
+    assert!(!scheduler.objects().has_frees());
+}
+
+/// Has the server make a shared memory, and lets go of it, so the guest's handle holds its
+/// only reference (it is not mapped); then lends the data's first page, so a second handle
+/// holds a locked transfer memory's only reference. Returns the two handles, shared memory's
+/// first, and the shared memory's pages, with the log emptied.
+fn shared_then_lent(world: &World) -> (Handle, Handle, SharedPages) {
+    let (handle, pages) = world.shared_memory(SvcPermission::Read);
+    let object = world
+        .dispatcher
+        .with::<(&HandleTable,), _>(|(handles,)| handles.get(handle).unwrap());
+    world
+        .dispatcher
+        .with::<(&mut Scheduler,), _>(|(scheduler,)| scheduler.close_object(object))
+        .unwrap();
+    let lent = lend(world, SvcPermission::None);
+    assert_eq!(world.block(DATA).4, MemoryAttribute::LOCKED);
+    drop(world.log.take());
+    (handle, lent, pages)
+}
+
+/// Whether the object table still holds released transfer memories to unlock, and released
+/// shared memories to give back.
+fn pending(world: &World) -> (bool, bool) {
+    world.dispatcher.with::<(&Scheduler,), _>(|(scheduler,)| {
+        (
+            scheduler.objects().has_unlocks(),
+            scheduler.objects().has_frees(),
+        )
+    })
+}
+
+#[test]
+fn exiting_the_process_unlocks_lent_pages_before_it_gives_back_shared_ones() {
+    let world = World::new();
+    let (_, _, pages) = shared_then_lent(&world);
+    // Teardown closes the shared memory's handle before the transfer memory's (lowest index
+    // first), so the order below is the drain's, not the closing's.
+    let mut exit = GuestRegs::default();
+    assert_eq!(
+        world.call(SvcId::ExitProcess, &mut exit).outcome,
+        Outcome::ProcessExited
+    );
+    assert_eq!(
+        world.log.take(),
+        [
+            MapperCall::Protect {
+                address: DATA,
+                size: PAGE_SIZE,
+                perms: Perms::ReadWrite,
+            },
+            MapperCall::ReleaseShared {
+                backing: pages.backing()
+            },
+        ]
+    );
+    assert_eq!(pending(&world), (false, false));
+}
+
+#[test]
+fn a_refused_unlock_still_gives_back_shared_memory_under_the_same_lock() {
+    let world = World::new();
+    let (shared, lent, pages) = shared_then_lent(&world);
+    // Both last references go while the lock is held once, as in one call (a dispatch such as
+    // `ExitProcess` takes the lock more than once, and a later hold would drain what an
+    // earlier one left). The unlock's `Protect` is the first translation call.
+    world.log.refuse_calls(&[0]);
+    world
+        .dispatcher
+        .with::<(&mut HandleTable, &mut Scheduler), _>(|(handles, scheduler)| {
+            remove_handle(handles, scheduler, shared)?;
+            remove_handle(handles, scheduler, lent)
+        })
+        .unwrap();
+    assert_eq!(
+        world.log.take(),
+        [MapperCall::ReleaseShared {
+            backing: pages.backing()
+        }]
+    );
+    assert_eq!(pending(&world), (false, false));
+}
+
+#[test]
+fn a_refused_give_back_still_completes_the_call_and_leaves_none_pending() {
+    let world = World::new();
+    let (handle, _) = world.shared_memory(SvcPermission::Read);
+    let object = world
+        .dispatcher
+        .with::<(&HandleTable,), _>(|(handles,)| handles.get(handle).unwrap());
+    world
+        .dispatcher
+        .with::<(&mut Scheduler,), _>(|(scheduler,)| scheduler.close_object(object))
+        .unwrap();
+    drop(world.log.take());
+    // Closing the handle drops the last reference; the translation refuses the give-back.
+    world.log.refuse_calls(&[0]);
+    let mut close = GuestRegs::default();
+    close.x[0] = u64::from(handle.raw());
+    world.call(SvcId::CloseHandle, &mut close);
+    assert_eq!(close.x[0], 0);
+    assert_eq!(world.log.take(), []);
+    assert_eq!(pending(&world), (false, false));
+    let refs = world
+        .dispatcher
+        .with::<(&Scheduler,), _>(|(scheduler,)| scheduler.objects().refs(object));
+    assert_eq!(refs, 0);
 }

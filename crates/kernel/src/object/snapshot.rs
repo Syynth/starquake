@@ -127,8 +127,10 @@
 //!   table issued, so no later object gets it.
 //! - **Shared memory.** [`SharedMemory::new`] refuses another permission; its pages come from
 //!   the address space's [`crate::memory::Mapper::allocate_shared`], which gives each shared
-//!   memory pages of its own, and pages are never given back while (or after) a shared memory
-//!   holds them (`memory::shared`, "Not built").
+//!   memory pages of its own: a live shared memory's pages are its own. They are given back
+//!   ([`crate::memory::Mapper::release_shared`]) only after its last reference went, and the
+//!   translation hands them out again only once every flush their unmappings owe has run
+//!   (`memory::shared`, "The pages' lifetime").
 //! - **Transfer memory.** `CreateTransferMemory` checks the permission
 //!   ([`crate::memory::is_transfer_memory_permission`]); an object whose pages are not locked
 //!   lives only inside that call, which closes it on every path that fails before the lock

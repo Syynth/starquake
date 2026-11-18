@@ -541,7 +541,10 @@ impl IpcContext<'_> {
 /// `permission` a shared memory's. When the object cannot be made after all (a table that was
 /// not full refusing, which only broken bookkeeping does), the pages go back to the
 /// translation at once ([`AddressSpace::release_shared`]); a failure to give them back is
-/// logged, and the object's error returned.
+/// logged, and the object's error returned either way (tests:
+/// `an_object_not_made_after_its_pages_gives_them_back_at_once` and
+/// `a_refused_give_back_of_an_object_not_made_returns_the_objects_error`). The log line is
+/// log-only: no test captures it.
 pub(super) fn create_shared_memory_in(
     space: &mut AddressSpace,
     scheduler: &mut Scheduler,

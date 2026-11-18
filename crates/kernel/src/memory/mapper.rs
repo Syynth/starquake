@@ -18,8 +18,9 @@
 //! range of backing as [`SharedPages`], [`Mapper::map_shared`] maps that range, and
 //! [`Mapper::release_shared`] takes it back when the last reference to the shared memory has
 //! gone. All three have a default that refuses, for a translation with no backing to share (the
-//! kernel then fails the call inside itself). `starquake-core`'s translation hands out guest RAM for both
-//! (`SpaceMapper` in `crates/core/src/space.rs`).
+//! kernel then fails the call inside itself). `starquake-core`'s translation implements all
+//! three over guest RAM: it hands the pages out, maps them, and takes them back to hand out
+//! again (`SpaceMapper` in `crates/core/src/space.rs`).
 //!
 //! `MapMemory`'s alias is the other exception: its pages must be the source's, so
 //! [`Mapper::map_alias`] names the source by its address. It has a default that refuses too

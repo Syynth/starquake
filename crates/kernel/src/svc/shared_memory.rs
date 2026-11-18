@@ -18,18 +18,39 @@
 //! # The last reference
 //!
 //! A mapping holds a reference (above), so the last reference to a shared memory goes only
-//! once every mapping of it is gone: by `UnmapSharedMemory`, by closing the last handle after
-//! that, or by its server letting go. Whichever call drops it, the object table keeps the
-//! shared memory ([`crate::object::Objects::take_frees`]), and [`free_released`] gives its
-//! pages back to the translation ([`AddressSpace::release_shared`]) before the dispatcher lets
-//! the kernel lock go, as a released transfer memory's pages are unlocked. The translation hands
-//! them out again only once the flushes the unmappings owe have run. Eden's
+//! once every mapping of it is gone. `UnmapSharedMemory` never drops it: it resolves the
+//! caller's handle, and that handle holds a reference for the whole call. The last reference
+//! goes in exactly these ways:
+//!
+//! 1. Closing the last handle once no mapping is left: `CloseHandle`, or process teardown
+//!    ([`crate::svc::process::terminate_process`], which `ExitProcess` runs), which closes
+//!    every handle as `CloseHandle` does. Tests:
+//!    `closing_the_last_handle_after_the_unmap_gives_the_pages_back` and
+//!    `exiting_the_process_unlocks_lent_pages_before_it_gives_back_shared_ones` (in
+//!    `crates/kernel/src/dispatch/memory_objects/tests.rs`).
+//! 2. The server's `close_object` once the handles and mappings are gone. Test:
+//!    `giving_back_waits_for_the_last_reference_and_goes_after_the_unmap` (same file).
+//!
+//! Process teardown does not unmap the process's shared mappings or close their references,
+//! so a shared memory still mapped when its process ends keeps its pages. Eden's
+//! `KProcess::Finalize` closes the reference of every shared memory the process still maps
+//! (its `m_shared_memory_list` loop, `eden/src/core/hle/kernel/k_process.cpp` @ cf654052);
+//! that is not built here.
+//!
+//! Whichever call drops it, the object table keeps the shared memory
+//! ([`crate::object::Objects::take_frees`]), and [`free_released`] gives its pages back to the
+//! translation ([`AddressSpace::release_shared`]) before the dispatcher lets the kernel lock
+//! go, after the released transfer memories' pages are unlocked. The translation hands them
+//! out again only once the flushes the unmappings owe have run. Eden's
 //! `KSharedMemory::Finalize` also releases the system resource limit's `PhysicalMemoryMax`
 //! reservation; nothing is reserved here (see [`crate::memory::shared`], "Not built").
 //!
 //! A failed give-back is an internal failure, logged by the dispatcher, and the other
-//! give-backs still run; the pages stay used. Eden's `Finalize` cannot fail. Test:
-//! `giving_back_goes_on_past_a_refusal_and_reports_the_first`.
+//! give-backs still run; the pages stay used. Eden's `Finalize` cannot fail. Tests:
+//! `giving_back_goes_on_past_a_refusal_and_reports_the_first` here, and, through the
+//! dispatcher, `a_refused_give_back_still_completes_the_call_and_leaves_none_pending` (the
+//! call's result is unchanged and nothing stays pending). The log line itself is log-only:
+//! no test captures it, so deleting it is a mutation no test sees.
 //!
 //! # Results, in the order they are checked
 //!
