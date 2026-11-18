@@ -836,7 +836,8 @@ impl NvsrvState {
     /// events, made by the caller beforehand ([`opens_ctrl_gpu`](Self::opens_ctrl_gpu)): an
     /// nvhost-ctrl-gpu without them, or with a pair [`CtrlGpu::check`] refuses, is not opened (fd
     /// -1 and `FileOperationFailed`, logged as an error: the caller's fault); given for another
-    /// device they are not kept, which is logged as an error and changes nothing else.
+    /// device they are not kept, which is logged as an error and changes nothing else. The logs
+    /// are log-only: no test captures them.
     pub fn open(&mut self, path: &[u8], events: Option<CtrlGpuEvents>) -> (i32, NvResult) {
         let (device, fd) = match self.admit(path) {
             Ok(admitted) => admitted,

@@ -156,6 +156,10 @@
 //! `ChannelSetTimeout` makes no channel; the setters that keep something make the fd's channel
 //! if it has none yet, as an event query does; `GetClientData` makes none.
 //!
+//! The logs (`ChannelSetTimeout`'s at info, `SetErrorNotifier`'s at debug, a refused
+//! `SetPreemptionModes` at warn) are log-only: no test captures them, so a change to their level
+//! or text is not observed.
+//!
 //! # Events
 //!
 //! `QueryEvent` on an nvhost-gpu fd answers ids 1 (SM exception breakpoint interrupt), 2 (SM
