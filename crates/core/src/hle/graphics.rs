@@ -50,6 +50,11 @@
 //! | A full queue | `Full`, then `GpuQueueRoom` | never full (`a_submission_s_increments_are_performed_at_once`) |
 //! | A submission on a channel it did not make | the GPU's error | logged as an error, nothing performed, `Queued` (`a_submission_on_an_unknown_channel_does_nothing`) |
 //!
+//! **Tickets are gsv's.** gsv's GPU memory numbers every ordered update and barrier it hands the
+//! front (`starquake_gsv::gpu::GpuMemory`, whose snapshot keeps the next ticket); the front
+//! never makes one, and only gives back the ticket it was handed, as `GpuOrdered`
+//! (`ordered_updates_and_barriers_are_done_at_once_in_a_run`).
+//!
 //! In [`FrontMode::Replay`] it does none of the completions: no ticket is pushed and no
 //! increment performed, so that only the recorded notes complete anything (below, "Replay").
 //! Channels are numbered the same way in both modes, so a replay hands out the numbers the run
