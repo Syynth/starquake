@@ -365,6 +365,17 @@ The title now talks to the real nvsrv, syncpoint and gpu sessions. It then opens
 | proposed | **Watch #194's timing test on loaded runners.** It compares a wall-clock wait with half a preemption interval (5 ms). If it ever flakes, raise the threshold; never retry | Review of #194 (PR #291) | area:core |
 | proposed | **`cntvct_el0` and `cntfrq_el0` at the guest's rate.** #205 covers `cntpct_el0`; the virtual counter still reads at the host rate and `cntfrq_el0` is not yet the guest's | #205's PR body (two "done when" items not fully met) | area:cpu |
 
+### From wave 30 (ledger: #22)
+
+Landed: #190 (the vsync clock, PR #295), #186 (native memory and image layouts, PR #294) and #242 (a resource limit for each process, PR #293).
+
+The title still stops at root 305's placeholder vi2 session, as expected: wave 31 builds it (#191), with #193 (video sessions) and #185's last command (216).
+
+| Status | Proposal | Why | Suggested |
+|---|---|---|---|
+| awaiting the owner | **Whether the vsync clock keeps the spec's no-banking rule.** Both references' vsync events catch up on missed ticks (NX2's `m_vsync_timer` is a looping CoreTiming event; PR's `CoreTiming::Advance` is the same). Not banking lost time comes from NX2's present pacing (`PaceToVblank`, called from 229), which the spec applies to the clock. The code follows the approved spec | Review of #190 (PR #295) | graphics-server |
+| proposed | **Restore's fed-back tick bound (`MAX_FED_BACK = 1`)** assumes a live turn delivers at most one tick; revisit if the clock ever banks ticks | #190's fix | area:gsv |
+
 ## House-rule candidates
 
 Rules distilled from review findings. A vetted rule moves into `CLAUDE.md`; until then it is
@@ -544,3 +555,11 @@ passed to build agents as a provisional rule for the next wave.
 - Boundary tests are placed where the guarded check is the only thing that can refuse, not at the end of the backing memory.
 - Periodic work skips an idle turn before it reads the clock, so recorded readings don't depend on host timing.
 - Where references disagree, the doc says "conflict", names the winner under decision 8, and pins each case with a named test.
+
+### From wave 30 (ledger: #22)
+
+- A doc that describes a reference's behaviour traces the exact function that produces it and names file and commit.
+- Each unchecked restore relation states its exact consequence for the rest of the run, or is validated through the live kernel, and is pinned by a test.
+- Restored state is checked for wedged or never-draining outcomes, and any restored count that drives a loop is bounded, with edge tests.
+- Ids, handles and counters that start equal in a fresh rig are made to differ in at least one success case.
+- Save-side validation is pinned as well as restore-side.
