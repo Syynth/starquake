@@ -67,18 +67,16 @@
 //!   starquake ends the run there (`docs/reference-emulator.md`). Outputs other than the result
 //!   are not in starquake's event stream; what `GetInfo` answers is checked against the same
 //!   reference in `starquake-kernel` (`svc/info/tests.rs`, `memory/layout.rs`).
-//! - **`ipc`**: the service, by the name starquake registered its number under
-//!   (`starquake_core::hle::service_name`), and the command id are the reference's, and the
+//! - **`ipc`**: where the request went and its command id are the reference's, and the
 //!   reference's name for the command is the one starquake's command table lists, written in
-//!   the reference's case. A reference control request (`IpcController::<id>`) is a request
-//!   with that id on the session of the service the reference's next non-control request goes
-//!   to: starquake's IPC event does not say whether a request was a control request
-//!   (`starquake_services::framework::trace`), so this is the most the comparison can check.
-//!   A request to a sub-interface the reference names by the interface
-//!   (`IApplicationProxy::20`): it matches a request with that id on the service that hands
-//!   the interface out (`appletOE`), and its name is checked against that interface's table.
-//!   The event names the service and not the object a request went to, so this, too, is the
-//!   most the comparison can check.
+//!   the reference's case. Where it went is read from the event, which names the interface and
+//!   the protocol (`starquake_services::framework::trace`), and written as the reference writes
+//!   it: a control request (the event's protocol is `control`) as `IpcController::<id>`; a
+//!   request to a service's own interface by the name starquake registered the service's number
+//!   under (`starquake_core::hle::service_name`), `sm:::1`; and a request to any other interface
+//!   by the interface's name, `IApplicationProxy::20`, which must be one of the interfaces the
+//!   event's service hands out. The name is checked against the control table for a control
+//!   request, and otherwise against that interface's table.
 //! - **`log`**: the run logged a line of the same length and hash (an event keeps no text).
 //!   The text itself is checked against the fixture's source by the run's guest log.
 //!
@@ -116,7 +114,7 @@ mod trace {
     use starquake_services::set::SetSys;
     use starquake_services::sm::Sm;
     use starquake_services::time::{IStaticService, ISteadyClock, ISystemClock, ITimeZoneService};
-    use starquake_trace::{EventKind, SVC_ARG_COUNT, ServiceId};
+    use starquake_trace::{EventKind, InterfaceName, IpcProtocol, SVC_ARG_COUNT, ServiceId};
 
     /// A homebrew fixture and the reference emulator's run of it, normalised.
     #[derive(Debug, Clone, Copy)]
@@ -147,7 +145,7 @@ mod trace {
     /// How many lines of the startup fixture's reference a run in starquake matches, at least:
     /// the ratchet (see the module docs). Raise it when a change makes the run match more; the
     /// on-hardware test prints the new count when it does.
-    const STARTUP_MATCHED: usize = 91;
+    const STARTUP_MATCHED: usize = 135;
 
     /// The arguments that are addresses, for each call the fixtures make: the same list as
     /// `ADDRESSES` in `tools/oracle/normalise.py`. A call that is not listed is refused, so no
@@ -194,6 +192,9 @@ mod trace {
         },
         Ipc {
             service: ServiceId,
+            /// The interface the request went to, as the event names it.
+            interface: InterfaceName,
+            protocol: IpcProtocol,
             command: u32,
         },
         Log {
@@ -212,8 +213,17 @@ mod trace {
                     result: result.0,
                 }),
                 EventKind::Ipc {
-                    service, command, ..
-                } => Some(Self::Ipc { service, command }),
+                    service,
+                    interface,
+                    protocol,
+                    command,
+                    ..
+                } => Some(Self::Ipc {
+                    service,
+                    interface,
+                    protocol,
+                    command,
+                }),
                 EventKind::GuestLog { len, hash } => Some(Self::Log { len, hash }),
                 _ => None,
             }
@@ -574,6 +584,31 @@ mod trace {
         request.rsplit_once("::").map(|(target, _)| target)
     }
 
+    /// Where a request went, written as the reference writes it (module docs, `ipc`): the
+    /// control table's name for a control request, the service's registered name for a request
+    /// to the service's own interface, and otherwise the interface's own name, which must be one
+    /// the service hands out.
+    fn request_target(
+        service: ServiceId,
+        interface: InterfaceName,
+        protocol: IpcProtocol,
+    ) -> Result<String, String> {
+        if protocol == IpcProtocol::Control {
+            return Ok(CONTROL_INTERFACE.to_owned());
+        }
+        let name =
+            service_name(service).ok_or_else(|| format!("service {service:?} has no name"))?;
+        if self::interface(service).is_some_and(|own| own.trace_name() == interface.as_str()) {
+            return Ok(name.to_owned());
+        }
+        match sub_interface(interface.as_str()) {
+            Some((owner, _)) if owner == service => Ok(interface.as_str().to_owned()),
+            _ => Err(format!(
+                "a request to {interface} on {name}, which does not hand that interface out"
+            )),
+        }
+    }
+
     /// The number of the service starquake registered under `name`, if it has it.
     fn service_id(name: &str) -> Option<ServiceId> {
         SERVICES
@@ -616,11 +651,10 @@ mod trace {
         })
     }
 
-    /// The reference's lines, without its comments and without each call's outputs, with every
-    /// control request (`IpcController::<id>`) written as a request to the service the next
-    /// non-control request goes to, and its command's name kept apart:
-    /// `(line, Some(name))` for a request. A control request with no other request after it is
-    /// an error naming its line (counted from 0, without the comments).
+    /// The reference's lines, without its comments and without each call's outputs, and with
+    /// each request's command name kept apart: `(line, Some(name))` for a request. A request
+    /// line that is not written as `<target>::<command> (<name>)` is an error naming its line
+    /// (counted from 0, without the comments).
     fn reference(fixture: &Fixture) -> Result<Vec<(String, Option<String>)>, String> {
         let lines = raw_lines(fixture);
         let mut out = Vec::new();
@@ -636,27 +670,9 @@ mod trace {
                 };
                 out.push((text, None));
             } else if let Some(request) = line.strip_prefix("ipc ") {
-                let (service, command, name) =
+                let (target, command, name) =
                     request_parts(request).map_err(|error| format!("line {index}: {error}"))?;
-                let service = if service == CONTROL_INTERFACE {
-                    // A request after it that cannot be read is skipped here; it is an error
-                    // when this loop reaches its own line.
-                    lines[index + 1..]
-                        .iter()
-                        .filter_map(|line| line.strip_prefix("ipc "))
-                        .filter_map(|next| request_parts(next).ok())
-                        .map(|(next, _, _)| next)
-                        .find(|next| *next != CONTROL_INTERFACE)
-                        .ok_or_else(|| {
-                            format!(
-                                "line {index}: the control request `{line}` has no request \
-                                 after it"
-                            )
-                        })?
-                } else {
-                    service
-                };
-                out.push((format!("ipc {service}::{command}"), Some(name.to_owned())));
+                out.push((format!("ipc {target}::{command}"), Some(name.to_owned())));
             } else {
                 out.push(((*line).to_owned(), None));
             }
@@ -684,22 +700,15 @@ mod trace {
                 }
                 Ok(format!("{call} -> {result:#x}"))
             }
-            Line::Ipc { service, command } => {
-                let name = service_name(service)
-                    .ok_or_else(|| format!("service {service:?} has no name"))?;
-                // The reference names a request to a sub-interface by the interface; the event
-                // names the service. Where the service hands that interface out, the line is
-                // written the reference's way.
-                let name = match target(expected) {
-                    Some(target)
-                        if sub_interface(target).is_some_and(|(owner, _)| owner == service) =>
-                    {
-                        target
-                    }
-                    _ => name,
-                };
-                Ok(format!("ipc {name}::{command}"))
-            }
+            Line::Ipc {
+                service,
+                interface,
+                protocol,
+                command,
+            } => Ok(format!(
+                "ipc {}::{command}",
+                request_target(service, interface, protocol)?
+            )),
             Line::Log { len, hash } => {
                 // The reference's text, if the reference has a log line here and it is this
                 // line's: an event keeps only the length and the hash.
@@ -714,13 +723,20 @@ mod trace {
     }
 
     /// The reference's name for a request it writes as `<target>::<command>`, checked against
-    /// starquake's command tables: the control commands' for a control request, otherwise the
-    /// table of the interface `target` names on the line's service ([`interface_for`]).
-    fn check_name(line: &Line, target: &str, name: &str, control: bool) -> Result<(), String> {
-        let Line::Ipc { service, command } = *line else {
+    /// starquake's command tables: the control commands' for a control request (the line's
+    /// protocol), otherwise the table of the interface `target` names on the line's service
+    /// ([`interface_for`]).
+    fn check_name(line: &Line, target: &str, name: &str) -> Result<(), String> {
+        let Line::Ipc {
+            service,
+            protocol,
+            command,
+            ..
+        } = *line
+        else {
             return Ok(());
         };
-        let ours = if control {
+        let ours = if protocol == IpcProtocol::Control {
             CONTROL_COMMANDS
                 .name(Protocol::Cmif, command)
                 .map(str::to_owned)
@@ -759,7 +775,6 @@ mod trace {
             Ok(expected) => expected,
             Err(error) => return stop(0, error),
         };
-        let raw = raw_lines(fixture);
         let mut pairings = Pairings::default();
         for (index, (expected, name)) in expected.iter().enumerate() {
             let Some(line) = ours.get(index) else {
@@ -779,9 +794,8 @@ mod trace {
                 );
             }
             if let Some(name) = name {
-                let control = raw[index].starts_with(&format!("ipc {CONTROL_INTERFACE}::"));
                 let target = target(expected).unwrap_or_default();
-                if let Err(error) = check_name(line, target, name, control) {
+                if let Err(error) = check_name(line, target, name) {
                     return stop(index, format!("line {index}: {error}"));
                 }
             }
@@ -862,29 +876,23 @@ mod trace {
     fn implements_request(service: &str, command: u32, name: &str) -> bool {
         if service == CONTROL_INTERFACE {
             // Any service will do: the control table is the framework's.
-            return check_name(
-                &Line::Ipc {
-                    service: SM,
-                    command,
-                },
-                service,
-                name,
-                true,
-            )
-            .is_ok();
+            let line = Line::Ipc {
+                service: SM,
+                interface: InterfaceName::lossy(CONTROL_INTERFACE),
+                protocol: IpcProtocol::Control,
+                command,
+            };
+            return check_name(&line, service, name).is_ok();
         }
         let owner = service_id(service).or_else(|| sub_interface(service).map(|(owner, _)| owner));
         owner.is_some_and(|id| {
-            check_name(
-                &Line::Ipc {
-                    service: id,
-                    command,
-                },
-                service,
-                name,
-                false,
-            )
-            .is_ok()
+            let line = Line::Ipc {
+                service: id,
+                interface: InterfaceName::lossy(service),
+                protocol: IpcProtocol::Cmif,
+                command,
+            };
+            check_name(&line, service, name).is_ok()
         })
     }
 
@@ -1002,8 +1010,30 @@ mod trace {
             }
         }
 
+        /// A CMIF request to `service`'s own interface.
         fn ipc(service: ServiceId, command: u32) -> Line {
-            Line::Ipc { service, command }
+            let own = interface(service).map_or("?", |own| own.name());
+            to(service, own, command)
+        }
+
+        /// A CMIF request to the interface `name` on a session of `service`.
+        fn to(service: ServiceId, name: &str, command: u32) -> Line {
+            Line::Ipc {
+                service,
+                interface: InterfaceName::new(name).unwrap(),
+                protocol: IpcProtocol::Cmif,
+                command,
+            }
+        }
+
+        /// A control request on a session of `service`.
+        fn control(service: ServiceId, command: u32) -> Line {
+            Line::Ipc {
+                service,
+                interface: InterfaceName::new(CONTROL_INTERFACE).unwrap(),
+                protocol: IpcProtocol::Control,
+                command,
+            }
         }
 
         fn log(name: &str) -> Line {
@@ -1053,7 +1083,7 @@ mod trace {
                     0,
                 ),
                 call(SvcId::ConnectToNamedPort, &[(1, BASE + 0x3148)], 0),
-                ipc(SM, 3),
+                control(SM, 3),
                 send(SM_HANDLE, 0),
                 ipc(SM, 0),
                 send(SM_HANDLE, 0),
@@ -1063,7 +1093,7 @@ mod trace {
                 say(0x30c0, 0x19),
                 ipc(SM, 1),
                 send(SM_HANDLE, 0),
-                ipc(SET_SYS, 3),
+                control(SET_SYS, 3),
                 send(SET_HANDLE, 0),
                 ipc(SET_SYS, 3),
                 send(SET_HANDLE, 0),
@@ -1098,18 +1128,18 @@ mod trace {
         #[test]
         fn the_reference_is_read_as_the_module_docs_say() {
             let lines = reference(&HELLO).unwrap();
-            // A control request goes to the service of the next request after it.
+            // A control request is kept as the reference writes it.
             assert_eq!(
                 lines[17],
                 (
-                    "ipc sm:::3".to_owned(),
+                    format!("ipc {CONTROL_INTERFACE}::3"),
                     Some("QueryPointerBufferSize".to_owned())
                 )
             );
             assert_eq!(
                 lines[27],
                 (
-                    "ipc set:sys::3".to_owned(),
+                    format!("ipc {CONTROL_INTERFACE}::3"),
                     Some("QueryPointerBufferSize".to_owned())
                 )
             );
@@ -1132,13 +1162,14 @@ mod trace {
         #[test]
         fn the_startup_reference_is_read_the_same_way() {
             let lines = reference(&STARTUP).unwrap();
-            // A control request other than `QueryPointerBufferSize` goes to the next service
-            // too: `ConvertCurrentObjectToDomain` before `appletOE`'s `OpenApplicationProxy`.
+            // Every control request is kept as the reference writes it:
+            // `ConvertCurrentObjectToDomain` before `appletOE`'s `OpenApplicationProxy`, the
+            // `QueryPointerBufferSize` before it, and the two `CloneCurrentObject`s.
             let index = lines
                 .iter()
                 .position(|(_, name)| name.as_deref() == Some("ConvertCurrentObjectToDomain"))
                 .unwrap();
-            assert_eq!(lines[index].0, "ipc appletOE::0");
+            assert_eq!(lines[index].0, format!("ipc {CONTROL_INTERFACE}::0"));
             assert_eq!(
                 lines[index + 2],
                 (
@@ -1146,13 +1177,10 @@ mod trace {
                     Some("OpenApplicationProxy".to_owned())
                 )
             );
-            // A control request followed by another control request goes past it, to the
-            // next request that is not one: `QueryPointerBufferSize` before the conversion, and
-            // the two `CloneCurrentObject`s before `fsp-srv`'s `OpenSdCardFileSystem`.
             assert_eq!(
                 lines[index - 2],
                 (
-                    "ipc appletOE::3".to_owned(),
+                    format!("ipc {CONTROL_INTERFACE}::3"),
                     Some("QueryPointerBufferSize".to_owned())
                 )
             );
@@ -1161,7 +1189,8 @@ mod trace {
                 .filter(|(_, name)| name.as_deref() == Some("CloneCurrentObject"))
                 .map(|(line, _)| line.as_str())
                 .collect();
-            assert_eq!(clones, ["ipc fsp-srv::2", "ipc fsp-srv::2"]);
+            let clone = format!("ipc {CONTROL_INTERFACE}::2");
+            assert_eq!(clones, [clone.as_str(), clone.as_str()]);
             // A random answer is an output, so it is dropped like the others.
             assert!(lines.iter().any(|(line, _)| line
                 == "svc 0x29 GetInfo(info_type=0xb, handle=0x0, info_subtype=0x0) -> 0x0"));
@@ -1259,7 +1288,7 @@ mod trace {
         #[test]
         fn a_request_to_another_service_or_command_fails_at_that_line() {
             let mut lines = matching();
-            lines[29] = ipc(SM, 3);
+            lines[29] = to(SM, "Sm", 3);
             assert_eq!(
                 failure(&lines),
                 "line 29: expected `ipc set:sys::3`, found `ipc sm:::3`"
@@ -1271,10 +1300,43 @@ mod trace {
                 "line 19: expected `ipc sm:::0`, found `ipc sm:::4`"
             );
             let mut lines = matching();
-            lines[19] = ipc(ServiceId(0x99), 0);
+            lines[19] = to(ServiceId(0x99), "Sm", 0);
             assert_eq!(
                 failure(&lines),
                 "line 19: service ServiceId(153) has no name"
+            );
+        }
+
+        #[test]
+        fn a_control_request_is_told_from_a_request_by_its_protocol() {
+            // The reference's first `QueryPointerBufferSize` is on `sm:`'s session. A CMIF
+            // request with the same id on `sm:`'s own interface is not it.
+            let mut lines = matching();
+            lines[17] = ipc(SM, 3);
+            assert_eq!(
+                failure(&lines),
+                format!("line 17: expected `ipc {CONTROL_INTERFACE}::3`, found `ipc sm:::3`")
+            );
+            // And `set:sys`'s `GetFirmwareVersion` (3) is not the control request with that id.
+            let mut lines = matching();
+            lines[29] = control(SET_SYS, 3);
+            assert_eq!(
+                failure(&lines),
+                format!("line 29: expected `ipc set:sys::3`, found `ipc {CONTROL_INTERFACE}::3`")
+            );
+            // A control request is written the reference's way whatever its session's service,
+            // so it needs no request after it to say whose it is.
+            let ends = Fixture {
+                nro: HELLO.nro,
+                reference: "ipc sm:::0 (Initialize)\n\
+                    ipc IpcController::3 (QueryPointerBufferSize)\n",
+            };
+            assert_eq!(
+                progress(&ends, &[ipc(SM, 0), control(SM, 3)], &anchors()),
+                Progress {
+                    matched: 2,
+                    difference: None
+                }
             );
         }
 
@@ -1283,18 +1345,18 @@ mod trace {
             // A control request with the id of `Initialize`: the reference calls command 0
             // `Initialize`, and no control command has that name.
             assert_eq!(
-                check_name(&ipc(SM, 0), "sm:", "Initialize", true),
+                check_name(&control(SM, 0), "sm:", "Initialize"),
                 Err("the reference calls command 0 Initialize, starquake \
                      Some(\"ConvertCurrentObjectToDomain\")"
                     .to_owned())
             );
-            assert_eq!(check_name(&ipc(SM, 0), "sm:", "Initialize", false), Ok(()));
+            assert_eq!(check_name(&ipc(SM, 0), "sm:", "Initialize"), Ok(()));
             assert_eq!(
-                check_name(&ipc(SET_SYS, 3), "set:sys", "GetFirmwareVersion", false),
+                check_name(&ipc(SET_SYS, 3), "set:sys", "GetFirmwareVersion"),
                 Ok(())
             );
-            assert!(check_name(&ipc(SET_SYS, 4), "set:sys", "GetFirmwareVersion", false).is_err());
-            assert!(check_name(&ipc(ServiceId(0x99), 0), "sm:", "Initialize", false).is_err());
+            assert!(check_name(&ipc(SET_SYS, 4), "set:sys", "GetFirmwareVersion").is_err());
+            assert!(check_name(&to(ServiceId(0x99), "Sm", 0), "sm:", "Initialize").is_err());
             assert_eq!(camel("get_service"), "GetService");
         }
 
@@ -1378,7 +1440,10 @@ mod trace {
         fn a_missing_line_a_short_run_and_a_long_one_fail() {
             let mut lines = matching();
             lines.remove(17);
-            assert!(failure(&lines).starts_with("line 17: expected `ipc sm:::3`"));
+            assert!(
+                failure(&lines)
+                    .starts_with(&format!("line 17: expected `ipc {CONTROL_INTERFACE}::3`"))
+            );
             let lines = &matching()[..37];
             assert_eq!(
                 failure(lines),
@@ -1512,7 +1577,7 @@ mod trace {
         }
 
         #[test]
-        fn a_request_to_a_sub_interface_matches_on_the_service_that_hands_it_out() {
+        fn a_request_to_a_sub_interface_is_written_by_the_interface_it_went_to() {
             let fixture = Fixture {
                 nro: HELLO.nro,
                 reference: "ipc appletOE::0 (OpenApplicationProxy)\n\
@@ -1520,9 +1585,13 @@ mod trace {
                             ipc ISession::0 (SetPerformanceConfiguration)\n",
             };
             let run = |lines: &[Line]| progress(&fixture, lines, &anchors());
-            // `ISession` is `apm`'s, so the third line is a request on an `apm` session, which
-            // starquake has but whose command 0 it does not: the name check fails there.
-            let ours = [ipc(APPLET_OE, 0), ipc(APPLET_OE, 20), ipc(APM, 0)];
+            // `ISession` is `apm`'s, so the third line is a request to it on an `apm` session,
+            // which starquake has but whose command 0 it does not: the name check fails there.
+            let ours = [
+                ipc(APPLET_OE, 0),
+                to(APPLET_OE, "IApplicationProxy", 20),
+                to(APM, "ISession", 0),
+            ];
             assert_eq!(
                 run(&ours),
                 Progress {
@@ -1534,21 +1603,33 @@ mod trace {
                     ),
                 }
             );
-            // The interface's command on another service is not the request.
-            let other = [ipc(APPLET_OE, 0), ipc(APM, 20)];
+            // The service's own interface with the same command is not the request: the event
+            // says which interface it went to.
+            let own = [ipc(APPLET_OE, 0), ipc(APPLET_OE, 20)];
+            assert_eq!(
+                run(&own).difference,
+                Some(
+                    "line 1: expected `ipc IApplicationProxy::20`, found `ipc appletOE::20`"
+                        .to_owned()
+                )
+            );
+            // Nor is the interface's command on another service, which does not hand it out.
+            let other = [ipc(APPLET_OE, 0), to(APM, "IApplicationProxy", 20)];
             assert_eq!(
                 run(&other).difference,
                 Some(
-                    "line 1: expected `ipc IApplicationProxy::20`, found `ipc apm::20`".to_owned()
+                    "line 1: a request to IApplicationProxy on apm, which does not hand that \
+                     interface out"
+                        .to_owned()
                 )
             );
-            // Nor is the service's own command with the same id: the name is the interface's.
+            // The name is checked against the interface's own table.
             let named = Fixture {
                 nro: HELLO.nro,
                 reference: "ipc IApplicationProxy::0 (OpenApplicationProxy)\n",
             };
             assert_eq!(
-                progress(&named, &[ipc(APPLET_OE, 0)], &anchors()).difference,
+                progress(&named, &[to(APPLET_OE, "IApplicationProxy", 0)], &anchors()).difference,
                 Some(
                     "line 0: the reference calls command 0 OpenApplicationProxy, starquake \
                      Some(\"GetCommonStateGetter\")"
@@ -1563,8 +1644,7 @@ mod trace {
             assert_eq!(target("svc 0x21 SendSyncRequest"), None);
             // A sub-interface of another service names no command on this one: neither the
             // interface's command (20 on `apm`) nor the service's own (0, `OpenSession`).
-            let on_apm =
-                |command, name| check_name(&ipc(APM, command), "IApplicationProxy", name, false);
+            let on_apm = |command, name| check_name(&ipc(APM, command), "IApplicationProxy", name);
             assert_eq!(
                 on_apm(20, "GetApplicationFunctions"),
                 Err(
@@ -1596,6 +1676,8 @@ mod trace {
             let request = EventKind::Ipc {
                 session: starquake_trace::SessionId(5),
                 service: SET_SYS,
+                interface: InterfaceName::new("SetSys").unwrap(),
+                protocol: IpcProtocol::Tipc,
                 command: 3,
                 request_size: 8,
                 reply_size: 2,
@@ -1606,6 +1688,8 @@ mod trace {
                 Line::of(&request),
                 Some(Line::Ipc {
                     service: SET_SYS,
+                    interface: InterfaceName::new("SetSys").unwrap(),
+                    protocol: IpcProtocol::Tipc,
                     command: 3
                 })
             );
@@ -1705,26 +1789,6 @@ mod trace {
             let progress = progress(&HELLO, &lines, &anchors());
             assert_eq!(progress.matched, all);
             assert!(progress.difference.is_some());
-        }
-
-        #[test]
-        fn a_reference_that_ends_with_a_control_request_differs_at_that_line() {
-            let truncated = Fixture {
-                nro: HELLO.nro,
-                reference: "ipc sm:::0 (Initialize)\n\
-                    ipc IpcController::3 (QueryPointerBufferSize)\n",
-            };
-            assert_eq!(
-                progress(&truncated, &[ipc(SM, 0), ipc(SM, 3)], &anchors()),
-                Progress {
-                    matched: 0,
-                    difference: Some(
-                        "line 1: the control request `ipc IpcController::3 \
-                         (QueryPointerBufferSize)` has no request after it"
-                            .to_owned()
-                    )
-                }
-            );
         }
 
         #[test]
