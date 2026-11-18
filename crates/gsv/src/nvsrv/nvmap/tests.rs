@@ -208,7 +208,11 @@ fn table_of(count: usize) -> NvMap {
     let ids = (1..=u32::try_from(count).unwrap()).map(|n| n * HANDLE_ID_INCREMENT);
     let handles: BTreeMap<u32, NvMapHandle> = ids.map(|id| (id, handle)).collect();
     let next_id = (u64::try_from(count).unwrap() + 1) * u64::from(HANDLE_ID_INCREMENT);
-    NvMap { handles, next_id }
+    NvMap {
+        handles,
+        next_id,
+        ..NvMap::new()
+    }
 }
 
 #[test]
@@ -232,8 +236,8 @@ fn create_refuses_a_full_table_and_spent_ids() {
 
     // The last id is handed out; after it, ids are spent.
     let mut map = NvMap {
-        handles: BTreeMap::new(),
         next_id: HANDLE_ID_END - u64::from(HANDLE_ID_INCREMENT),
+        ..NvMap::new()
     };
     assert_eq!(create(&mut map, 1), 0xFFFF_FFFC);
     assert_eq!(map.next_id, HANDLE_ID_END);
@@ -671,6 +675,7 @@ fn the_saved_table_s_layout_is_pinned() {
             ),
         ]),
         next_id: 0x3C,
+        ..NvMap::new()
     };
     let bytes = postcard::to_allocvec(&map).unwrap();
     assert_eq!(
@@ -694,6 +699,9 @@ fn valid() -> NvMap {
     create(&mut map, PAGE);
     alloc(&mut map, first, 0, 0x1000);
     call(&mut map, FROM_ID, &le(&[first, 0]));
+    // The allocation's lock step, which a request would take to the kernel (a lock at address 0
+    // is refused there), so the table holds no lock: all a saved table can say.
+    assert_eq!(map.take_steps().len(), 1);
     map
 }
 
@@ -909,4 +917,191 @@ fn a_refused_table_is_said_in_plain_words() {
     for (error, words) in said {
         assert_eq!(error.to_string(), words);
     }
+}
+
+// ----- The device-share lock -------------------------------------------------------------------
+
+/// The process the tests' tokens name: not the first slot or generation.
+fn locker() -> starquake_kernel::id::ProcessId {
+    use starquake_kernel::id::SlabId;
+    starquake_kernel::id::ProcessId::from_parts(2, 3)
+}
+
+/// The token a lock of `size` bytes at `address` returns.
+fn token(address: u64, size: u64) -> DeviceShareToken {
+    starquake_kernel::memory::testing::device_share_token(locker(), address, size)
+}
+
+/// Creates a handle of `size` bytes, allocates it at `address` and keeps the lock the request
+/// would take; its id and the lock's token.
+fn locked(map: &mut NvMap, size: u32, address: u64) -> (u32, DeviceShareToken) {
+    let id = create(map, size);
+    assert_eq!(alloc(map, id, 0, address), NvResult::Success);
+    let held = token(address, map.handle(id).unwrap().size());
+    assert_eq!(map.take_steps().len(), 1);
+    map.keep_lock(id, held).unwrap();
+    (id, held)
+}
+
+/// An allocation leaves one lock step over its address and page-rounded size; a create, an
+/// allocation refused at each of its checks, a parameter and an id leave none (module docs,
+/// "The device-share lock").
+#[test]
+fn alloc_leaves_one_lock_step_and_a_refused_alloc_none() {
+    let mut map = NvMap::new();
+    let id = create(&mut map, PAGE + 1);
+    assert_eq!(map.take_steps(), []);
+    let address = 0x0000_0051_2345_6000;
+    // Refused: handle 0, a bad alignment, no such handle; then the one that succeeds.
+    assert_eq!(alloc(&mut map, 0, 0, address), NvResult::BadValue);
+    assert_eq!(alloc(&mut map, id, 3, address), NvResult::BadValue);
+    assert_eq!(
+        alloc(&mut map, id + HANDLE_ID_INCREMENT, 0, address),
+        NvResult::BadValue
+    );
+    assert_eq!(map.take_steps(), []);
+    assert_eq!(alloc(&mut map, id, 0, address), NvResult::Success);
+    let size = map.handle(id).unwrap().size();
+    assert_eq!(size, 2 * u64::from(PAGE));
+    assert_eq!(
+        map.take_steps(),
+        [DeviceShareStep::Lock {
+            handle: id,
+            address,
+            size,
+        }]
+    );
+    // Taken out: none are left. Allocated already, and past the end: refused, no step.
+    assert_eq!(map.take_steps(), []);
+    assert_eq!(
+        alloc(&mut map, id, 0, address),
+        NvResult::InsufficientMemory
+    );
+    let other = create(&mut map, PAGE);
+    assert_eq!(alloc(&mut map, other, 0, u64::MAX), NvResult::BadValue);
+    param_of(&mut map, id, param::SIZE);
+    call(&mut map, GET_ID, &le(&[0, id]));
+    assert_eq!(map.take_steps(), []);
+    // No lock is held until one is kept.
+    assert_eq!(map.lock(id), None);
+}
+
+/// A lock is kept only by the handle it was asked for, allocated over exactly the token's
+/// range, holding none yet; anything else gives the token back.
+#[test]
+fn keep_lock_takes_only_a_token_for_the_allocation_s_exact_range() {
+    let mut map = NvMap::new();
+    let id = create(&mut map, PAGE);
+    let unallocated = create(&mut map, PAGE);
+    let address = 0x5000_0000;
+    alloc(&mut map, id, 0, address);
+    let page = u64::from(PAGE);
+    let exact = token(address, page);
+    let refused = [
+        (id, token(address + page, page)),
+        (id, token(address - page, page)),
+        (id, token(address, 2 * page)),
+        (unallocated, token(address, page)),
+        (unallocated + HANDLE_ID_INCREMENT, exact),
+    ];
+    for (handle, offered) in refused {
+        assert_eq!(map.keep_lock(handle, offered), Err(offered), "{handle:#x}");
+    }
+    assert_eq!(map.lock(id), None);
+    assert_eq!(map.keep_lock(id, exact), Ok(()));
+    assert_eq!(map.lock(id), Some(exact));
+    // A handle holds one lock: a second is given back, the first kept.
+    assert_eq!(map.keep_lock(id, exact), Err(exact));
+    assert_eq!(map.lock(id), Some(exact));
+    assert_eq!(map.lock(unallocated), None);
+}
+
+/// `IocFree` leaves the release of the handle's lock with its last reference, and none while a
+/// reference is left or when the handle holds no lock.
+#[test]
+fn free_leaves_the_release_with_the_last_reference_only() {
+    let mut map = NvMap::new();
+    let (id, held) = locked(&mut map, PAGE, 0x5000_0000);
+    call(&mut map, FROM_ID, &le(&[id, 0]));
+    call(&mut map, FREE, &free_args(id, 0));
+    assert_eq!(map.take_steps(), []);
+    assert_eq!(map.lock(id), Some(held));
+    call(&mut map, FREE, &free_args(id, 0));
+    assert_eq!(map.take_steps(), [DeviceShareStep::Unlock(held)]);
+    assert_eq!(map.lock(id), None);
+    // A handle allocated with no lock kept (the kernel refused it) releases nothing.
+    let bare = create(&mut map, PAGE);
+    alloc(&mut map, bare, 0, 0x6000_0000);
+    assert_eq!(
+        map.take_steps(),
+        [DeviceShareStep::Lock {
+            handle: bare,
+            address: 0x6000_0000,
+            size: u64::from(PAGE),
+        }]
+    );
+    call(&mut map, FREE, &free_args(bare, 0));
+    assert_eq!(map.take_steps(), []);
+}
+
+/// `CloseSession`: one reference of each handle goes, as one `IocFree` of each would; the
+/// handles that went give their locks, and a duplicated one stays with its lock and the rest of
+/// its references (module docs, "When the process's last session closes").
+#[test]
+fn close_session_frees_one_reference_of_each_handle_and_gives_the_locks_of_those_that_went() {
+    let mut map = NvMap::new();
+    let (lone, lone_lock) = locked(&mut map, PAGE, 0x5000_0000);
+    let (twice, twice_lock) = locked(&mut map, PAGE, 0x6000_0000);
+    call(&mut map, FROM_ID, &le(&[twice, 0]));
+    let unallocated = create(&mut map, PAGE);
+    assert_eq!(map.close_session(), [lone_lock]);
+    assert_eq!(map.handle(lone), None);
+    assert_eq!(map.handle(unallocated), None);
+    assert_eq!(map.handle(twice).unwrap().dupes(), 1);
+    assert_eq!(map.lock(twice), Some(twice_lock));
+    // The ioctls left nothing for a request to take: the caller releases what it was given.
+    assert_eq!(map.take_steps(), []);
+    // A second close takes the last reference.
+    assert_eq!(map.close_session(), [twice_lock]);
+    assert!(map.is_empty());
+    assert_eq!(map.close_session(), []);
+}
+
+/// The handles go in ascending id order, whatever order they were allocated and locked in.
+#[test]
+fn close_session_frees_in_ascending_id_order() {
+    let mut map = NvMap::new();
+    let ids: Vec<u32> = (0..3).map(|_| create(&mut map, PAGE)).collect();
+    let mut tokens = BTreeMap::new();
+    // Allocated and locked last id first.
+    for (n, &id) in ids.iter().enumerate().rev() {
+        let address = 0x5000_0000 + u64::try_from(n).unwrap() * 0x10_0000;
+        alloc(&mut map, id, 0, address);
+        assert_eq!(
+            map.take_steps(),
+            [DeviceShareStep::Lock {
+                handle: id,
+                address,
+                size: u64::from(PAGE),
+            }]
+        );
+        let held = token(address, u64::from(PAGE));
+        map.keep_lock(id, held).unwrap();
+        tokens.insert(id, held);
+    }
+    let in_order: Vec<DeviceShareToken> = ids.iter().map(|id| tokens[id]).collect();
+    assert_eq!(map.close_session(), in_order);
+}
+
+/// A table's locks are the run's: saved and read back, it holds its handles and no lock
+/// (module docs, "Where this differs from Eden").
+#[test]
+fn a_restored_table_holds_no_locks() {
+    let mut map = NvMap::new();
+    let (id, held) = locked(&mut map, PAGE, 0x5000_0000);
+    assert_eq!(map.lock(id), Some(held));
+    let bytes = postcard::to_allocvec(&map).unwrap();
+    let restored = postcard::from_bytes::<NvMap>(&bytes).unwrap();
+    assert_eq!(restored.handle(id), map.handle(id));
+    assert_eq!(restored.lock(id), None);
 }

@@ -68,7 +68,10 @@
 //!
 //! The kernel's refusal of a release is logged, and the drain goes on: a token whose process
 //! has ended is refused as a matter of course (the process ended while the GPU still had work
-//! that used its memory), and is logged at debug level; any other refusal means gsv's own
+//! that used its memory, or nvsrv queued the locks of the nvmap handles its last session freed
+//! as the process ended: the kernel released every lock of the process when it ended, so the
+//! refusal releases nothing twice, `nvsrv/tests/on_the_kernel.rs`), and is logged at debug
+//! level; any other refusal means gsv's own
 //! bookkeeping is wrong, and is logged as an error. Either way the lock stays as the kernel
 //! keeps it, and the next completions are acted on
 //! (`a_refused_release_is_logged_and_the_drain_goes_on`; the levels are pinned by

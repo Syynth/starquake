@@ -1767,6 +1767,15 @@ impl AddressSpace {
             .unwrap_or(0)
     }
 
+    /// Every exact range a live device-share lock was taken on, as `(address, size, count)`:
+    /// [`Self::device_locks`] for each range that has any, in ascending order of address, then
+    /// size. Empty when no lock is held.
+    pub fn device_share_locks(&self) -> impl Iterator<Item = (u64, u64, u32)> + '_ {
+        self.device_locks
+            .iter()
+            .map(|(&(address, size), &count)| (address, size, count))
+    }
+
     /// Releases a device-share lock on `size` bytes at `address` that
     /// [`Self::lock_device_share`] took (`UnlockForDeviceAddressSpace`): every block of the range
     /// counts one device use fewer, and loses [`MemoryAttribute::DEVICE_SHARED`] with its last.
