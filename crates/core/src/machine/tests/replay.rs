@@ -279,3 +279,34 @@ fn a_report_keeps_a_prefix_of_the_recording_up_to_its_limit_and_its_replay_runs_
         )
     );
 }
+
+#[test]
+fn a_run_whose_services_could_not_be_set_up_still_keeps_what_it_drew() {
+    // The loop never ran, so nothing moved the draws or the date out of the environment; the
+    // run's end does.
+    let guest = Guest::new(&programs::hello().unwrap());
+    let mut vcpu = ScriptedVcpu::new();
+    let options = RunOptions {
+        rtc: RtcAtBoot::Host,
+        ..RunOptions::default()
+    };
+    let refuse = |_: &Dispatcher, _: Given| Err("no room".to_owned());
+    let report = run_serving(
+        vcpus(&mut vcpu),
+        guest.program(&guest.memory),
+        &options,
+        (Instant::now(), timebase()),
+        Limits::DEFAULT,
+        &refuse,
+    );
+    assert_eq!(
+        emulator_error(&report),
+        "the services could not be set up: no room"
+    );
+    let drawn: Vec<EnvRecord> = boot_draws().into_iter().map(EnvRecord::Random).collect();
+    assert_eq!(report.environment[..BOOT_DRAWS], drawn[..]);
+    assert!(matches!(
+        report.environment[BOOT_DRAWS..],
+        [EnvRecord::WallClock(_)]
+    ));
+}
