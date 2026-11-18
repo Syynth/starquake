@@ -53,8 +53,8 @@
 //! device-share lock is a count per exact range ([`FakeKernel::device_locks`]), taken only on
 //! mapped memory, whose token names [`FakeKernel::process`] (made with the kernel's
 //! `test-support` constructor), and released only by a token naming that process and a range
-//! that holds one. Ending the process does not make the fake refuse a token, as the kernel's
-//! unlock does once the process has ended. A transfer memory is a range of the caller's memory
+//! that holds one. Ending the process does not make the fake refuse a token or a lock, as the
+//! kernel does once the process has ended (`KernelError::TerminationRequested`). A transfer memory is a range of the caller's memory
 //! a test lends ([`FakeKernel::lend`]); writes through it are bounded by the kernel's own check
 //! (`starquake_kernel::memory::shared::span_within`) and reach only mapped memory. The fake
 //! does not lock the lent pages or take the owner's permission away, as the kernel does.

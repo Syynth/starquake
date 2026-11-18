@@ -206,6 +206,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use starquake_kernel::result::KernelError;
 use starquake_services::commands;
 use starquake_services::framework::{
     Context, Family, Fault, Interfaces, NOT_SUPPORTED, Outcome, Reply, ReplyToken, Request, Server,
@@ -1220,10 +1221,13 @@ fn run_ioctl(
 
 /// Takes the device-share steps nvmap's ioctl left through the kernel ([`nvmap`], "The
 /// device-share lock"), oldest first: a lock taken is kept by its handle, and a refusal of a lock
-/// or a release is logged as an error, as Eden's `ASSERT` logs it, and changes no answer. A lock
-/// its handle cannot keep (only another caller of the table, between the ioctl and this, could
-/// change it) is released at once. Fails only when the server has no nvsrv family, as the ioctl
-/// that left the steps would have.
+/// or a release changes no answer. A refusal is logged as an error, as Eden's `ASSERT` logs it,
+/// unless it is the kernel's refusal for a process that has ended ([`refused_as_ended`]), which
+/// comes as a matter of course when another core ends the process during the request and is
+/// logged at debug level, as the drain logs the same refusal (`crate::shared`, "Lock order and
+/// the drain"). A lock its handle cannot keep (only another caller of the table, between the
+/// ioctl and this, could change it) is released at once. Fails only when the server has no nvsrv
+/// family, as the ioctl that left the steps would have.
 fn settle_device_shares(cx: &mut Context<'_>) -> Result<(), Fault> {
     let steps = cx.family::<NvsrvFamily>()?.state.nvmap.take_steps();
     for step in steps {
@@ -1245,6 +1249,16 @@ fn settle_device_shares(cx: &mut Context<'_>) -> Result<(), Fault> {
                         token
                     }
                 },
+                Err(error) if refused_as_ended(&error) => {
+                    tracing::debug!(
+                        %error,
+                        handle,
+                        address,
+                        size,
+                        "nvmap: an allocation's device-share lock came after its process ended"
+                    );
+                    continue;
+                }
                 Err(error) => {
                     tracing::error!(
                         %error,
@@ -1258,11 +1272,31 @@ fn settle_device_shares(cx: &mut Context<'_>) -> Result<(), Fault> {
             },
             DeviceShareStep::Unlock(token) => token,
         };
-        if let Err(error) = cx.unlock_device_share(token) {
-            tracing::error!(%error, ?token, "nvmap: the kernel refused a device-share release");
+        match cx.unlock_device_share(token) {
+            Ok(()) => {}
+            Err(error) if refused_as_ended(&error) => {
+                tracing::debug!(
+                    %error,
+                    ?token,
+                    "nvmap: a device-share release came after its process ended"
+                );
+            }
+            Err(error) => {
+                tracing::error!(%error, ?token, "nvmap: the kernel refused a device-share release");
+            }
         }
     }
     Ok(())
+}
+
+/// Whether `fault` is the kernel's refusal of a device-share lock or release because the
+/// process has ended: [`KernelError::TerminationRequested`], which the kernel answers a server
+/// for exactly that refusal (`starquake_kernel::dispatch`'s `DeviceShareError::ProcessEnded`,
+/// and its lock's refusal once the process has ended). The address space's own refusals of a
+/// lock or an unlock are never that result. Only the level a refusal is logged at depends on it
+/// (`settle_device_shares`).
+fn refused_as_ended(fault: &Fault) -> bool {
+    matches!(fault, Fault::Kernel(KernelError::TerminationRequested))
 }
 
 /// Out buffer `index`'s size (Eden `GetWriteBufferSize`). The framework refuses a request that

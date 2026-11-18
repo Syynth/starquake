@@ -6,11 +6,13 @@ use starquake_ipc::{
 };
 use starquake_kernel::result::ResultCode;
 
+use starquake_kernel::id::SlabId;
 use starquake_kernel::result::KernelError;
+use starquake_kernel::slab::SlabError;
 use starquake_trace::ServiceId;
 
 use super::super::result::NOT_SUPPORTED;
-use super::super::targets::Domain;
+use super::super::targets::{Domain, TargetError};
 use super::super::{Handled, Kernel, Server, ServerError, UnknownPolicy};
 use super::{
     Child, ODD_BYTE, Rig, SERVICE, Tally, Toy, built, domain_request, in_domain, only, plain,
@@ -358,4 +360,29 @@ fn the_family_is_told_how_many_sessions_are_left_as_each_closes() {
         Err(ServerError::UnknownSession(second))
     );
     assert_eq!(closings(&rig), [2, 1, 0]);
+}
+
+#[test]
+fn the_family_is_told_of_a_close_whose_release_failed_and_the_error_is_returned() {
+    // A corrupted table: `second` is pointed at `first`'s target, so once `first` closes and
+    // its target goes, releasing `second`'s fails. The family is told all the same, and the
+    // release's error is the close's answer (`Server::close`).
+    let mut rig = Rig::strict();
+    let server = std::mem::replace(&mut rig.server, Server::new("toy", UnknownPolicy::Strict));
+    rig.server = server.with_family(Closings::default());
+    let (first, second) = (rig.session, rig.second_session());
+    let stolen = rig.server.sessions[&first];
+    rig.server.sessions.insert(second, stolen);
+    let closings = |rig: &Rig| rig.server.family::<Closings>().unwrap().0.clone();
+    rig.server.close(first).unwrap();
+    assert_eq!(closings(&rig), [1]);
+    assert_eq!(
+        rig.server.close(second),
+        Err(ServerError::Targets(TargetError::Table(SlabError::Stale {
+            index: stolen.index(),
+            generation: stolen.generation(),
+        })))
+    );
+    assert_eq!(closings(&rig), [1, 0]);
+    assert_eq!(rig.server.session_count(), 0);
 }

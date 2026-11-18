@@ -1258,18 +1258,32 @@ fn inline_buffers_are_left_alone() {
     }
 }
 
+/// One page: the size of the tests' nvmap handles, and so of the page-rounded lock their
+/// allocation takes.
+const ONE_PAGE: u64 = starquake_memory::PAGE_SIZE;
+
+/// [`ONE_PAGE`] as nvmap's `u32` size field.
+fn page_u32() -> u32 {
+    u32::try_from(ONE_PAGE).unwrap()
+}
+
+/// A page of zeroes, for [`Rig::place`].
+fn zero_page() -> Vec<u8> {
+    vec![0; usize::try_from(ONE_PAGE).unwrap()]
+}
+
 /// `IocAlloc`'s arguments: `handle`, one page aligned, kind 0, cached, at `address`.
 fn alloc_words(handle: u32, address: u64) -> Vec<u8> {
     let bytes = address.to_le_bytes();
     let low = u32::from_le_bytes(bytes[..4].try_into().unwrap());
     let high = u32::from_le_bytes(bytes[4..].try_into().unwrap());
-    le(&[handle, 0, 0, 0x1000, 0, 0, low, high])
+    le(&[handle, 0, 0, page_u32(), 0, 0, low, high])
 }
 
 impl Rig {
     /// Creates a one-page handle on nvmap fd `fd`; its id.
     fn create_handle(&mut self, fd: i32) -> u32 {
-        let output = self.nvmap(fd, NVMAP_CREATE, &le(&[0x1000, 0]));
+        let output = self.nvmap(fd, NVMAP_CREATE, &le(&[page_u32(), 0]));
         u32::from_le_bytes(output[4..8].try_into().unwrap())
     }
 
@@ -1286,8 +1300,8 @@ fn alloc_locks_the_handle_s_memory_and_the_last_free_releases_it() {
     let mut rig = Rig::new();
     let fd = rig.open_device(Device::Nvmap);
     let id = rig.create_handle(fd);
-    let page = 0x1000;
-    let address = rig.place(&[0; 0x1000]);
+    let page = ONE_PAGE;
+    let address = rig.place(&zero_page());
     assert_eq!(rig.kernel.device_locks(address, page), 0);
     rig.nvmap(fd, NVMAP_ALLOC, &alloc_words(id, address));
     assert_eq!(rig.kernel.device_locks(address, page), 1);
@@ -1318,8 +1332,8 @@ fn alloc_locks_the_handle_s_memory_and_the_last_free_releases_it() {
 fn a_refused_lock_leaves_the_handle_allocated_with_no_lock() {
     let mut rig = Rig::new();
     let fd = rig.open_device(Device::Nvmap);
-    let page = 0x1000;
-    let address = rig.place(&[0; 0x1000]);
+    let page = ONE_PAGE;
+    let address = rig.place(&zero_page());
     for _ in 0..u16::MAX {
         starquake_services::framework::Kernel::lock_device_share(&mut rig.kernel, address, page)
             .unwrap();
@@ -1355,7 +1369,7 @@ fn a_lock_its_handle_cannot_keep_is_released_at_once() {
         IoctlVariant::Ioctl,
         fd,
         NVMAP_CREATE,
-        &le(&[0x1000, 0]),
+        &le(&[page_u32(), 0]),
     );
     let id = u32::from_le_bytes(create.output[4..8].try_into().unwrap());
     for (raw, input) in [
@@ -1374,11 +1388,11 @@ fn a_lock_its_handle_cannot_keep_is_released_at_once() {
     }
     assert!(state.nvmap().is_empty());
     let mut rig = Rig::with_state(UnknownPolicy::Strict, state);
-    assert_eq!(rig.place(&[0; 0x1000]), PLACE_FROM);
+    assert_eq!(rig.place(&zero_page()), PLACE_FROM);
     // Any request on nvmap takes the steps left before it.
     let (answer, _) = rig.ioctl(fd, NVMAP_PARAM, &le(&[id, 1, 0]), 12);
     assert_eq!(answer, ok(&[NvResult::BadValue.raw()]));
-    assert_eq!(rig.kernel.device_locks(PLACE_FROM, 0x1000), 0);
+    assert_eq!(rig.kernel.device_locks(PLACE_FROM, ONE_PAGE), 0);
     assert_eq!(rig.state().nvmap().lock(id), None);
 }
 
@@ -1393,10 +1407,10 @@ fn closing_the_last_session_frees_each_handle_once_and_queues_its_lock() {
     let other = rig.kernel.new_object();
     rig.server.accept(other).unwrap();
     let fd = rig.open_device(Device::Nvmap);
-    let page = 0x1000;
+    let page = ONE_PAGE;
     let (lone, twice) = (rig.create_handle(fd), rig.create_handle(fd));
-    let lone_at = rig.place(&[0; 0x1000]);
-    let twice_at = rig.place(&[0; 0x1000]);
+    let lone_at = rig.place(&zero_page());
+    let twice_at = rig.place(&zero_page());
     rig.nvmap(fd, NVMAP_ALLOC, &alloc_words(lone, lone_at));
     rig.nvmap(fd, NVMAP_ALLOC, &alloc_words(twice, twice_at));
     rig.nvmap(fd, NVMAP_FROM_ID, &le(&[twice, 0]));
@@ -1427,6 +1441,30 @@ fn closing_the_last_session_frees_each_handle_once_and_queues_its_lock() {
     rig.shared.drain(&mut host);
     assert_eq!(rig.kernel.device_locks(lone_at, page), 0);
     assert_eq!(rig.kernel.device_locks(twice_at, page), 1);
+}
+
+/// The kernel's refusal of a device-share lock or release for a process that has ended,
+/// `TerminationRequested`, is told apart from the other results either can be refused with
+/// (the address space's, and the token's other refusals), and from a fault that is not the
+/// kernel's, so that only it is logged at debug level (`settle_device_shares`).
+#[test]
+fn a_refusal_for_an_ended_process_is_told_apart() {
+    assert!(refused_as_ended(&Fault::Kernel(
+        KernelError::TerminationRequested
+    )));
+    for other in [
+        KernelError::InvalidCurrentMemory,
+        KernelError::OutOfResource,
+        KernelError::InvalidState,
+        KernelError::NotImplemented,
+    ] {
+        assert!(!refused_as_ended(&Fault::Kernel(other)), "{other}");
+    }
+    assert!(!refused_as_ended(&Fault::PayloadTruncated {
+        offset: 0,
+        needed: 4,
+        len: 0,
+    }));
 }
 
 /// The timer thread's host over the fake kernel: it releases there.

@@ -319,7 +319,6 @@ fn each_refusal_reads_in_plain_words() {
 fn a_server_sees_a_refused_token_as_invalid_current_memory() {
     for refusal in [
         DeviceShareError::WrongProcess,
-        DeviceShareError::ProcessEnded,
         DeviceShareError::NotLocked {
             address: DATA,
             size: PAGE_SIZE,
@@ -399,4 +398,58 @@ fn ending_a_process_with_no_lock_changes_no_block() {
     end(&dispatcher, own);
     assert_eq!(all_locks(&dispatcher), []);
     assert_eq!(blocks(&dispatcher), before);
+}
+
+#[test]
+fn a_server_sees_an_ended_process_s_refusal_as_termination_requested() {
+    // Told apart from the token's other refusals, which are `InvalidCurrentMemory` (above).
+    assert_eq!(
+        DeviceShareError::ProcessEnded.into_svc_error(),
+        SvcError::Kernel(KernelError::TerminationRequested)
+    );
+}
+
+#[test]
+fn a_lock_after_the_process_ended_is_refused_and_takes_nothing() {
+    // The same lock on the same range: taken while the process lives, refused once it has
+    // ended (module docs, "Making a token").
+    let (dispatcher, own) = world();
+    let before = blocks(&dispatcher);
+    let live = dispatcher.lock_device_share(DATA, 2 * PAGE_SIZE).unwrap();
+    assert_eq!(dispatcher.unlock_device_share(live), Ok(()));
+    assert_eq!(blocks(&dispatcher), before);
+    end(&dispatcher, own);
+    let ended = blocks(&dispatcher);
+    assert_eq!(
+        dispatcher.lock_device_share(DATA, 2 * PAGE_SIZE),
+        Err(SvcError::Kernel(KernelError::TerminationRequested))
+    );
+    assert_eq!(all_locks(&dispatcher), []);
+    assert_eq!(device_count(&dispatcher, DATA), 0);
+    assert_eq!(blocks(&dispatcher), ended);
+}
+
+#[test]
+fn a_process_with_no_scheduler_row_counts_as_ended() {
+    // `has_ended`'s missing row, for the check and for the release: a process id the
+    // scheduler has no row for, beside the tables' own, which has one and lives.
+    let (dispatcher, own, token) = locked();
+    let gone = ProcessId::from_parts(own.index().wrapping_add(1), own.generation());
+    let held = [(DATA, 2 * PAGE_SIZE, 1)];
+    dispatcher.with::<(&mut AddressSpace, &Scheduler), _>(|(space, scheduler)| {
+        assert!(scheduler.process(gone).is_err());
+        assert!(scheduler.process(own).is_ok());
+        let named = DeviceShareToken::new(gone, token.address(), token.size());
+        assert_eq!(
+            check(gone, space, scheduler, named, 0),
+            Err(DeviceShareError::ProcessEnded)
+        );
+        assert_eq!(check(own, space, scheduler, token, 0), Ok(()));
+        // The live process's release leaves its lock; the rowless one's releases it.
+        release_ended(space, scheduler, own);
+        assert_eq!(space.device_share_locks().collect::<Vec<_>>(), held);
+        release_ended(space, scheduler, gone);
+        assert_eq!(space.device_share_locks().collect::<Vec<_>>(), []);
+    });
+    assert_eq!(device_count(&dispatcher, DATA), 0);
 }

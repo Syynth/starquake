@@ -1032,7 +1032,14 @@ fn free_leaves_the_release_with_the_last_reference_only() {
     // A handle allocated with no lock kept (the kernel refused it) releases nothing.
     let bare = create(&mut map, PAGE);
     alloc(&mut map, bare, 0, 0x6000_0000);
-    map.take_steps();
+    assert_eq!(
+        map.take_steps(),
+        [DeviceShareStep::Lock {
+            handle: bare,
+            address: 0x6000_0000,
+            size: u64::from(PAGE),
+        }]
+    );
     call(&mut map, FREE, &free_args(bare, 0));
     assert_eq!(map.take_steps(), []);
 }
@@ -1070,7 +1077,14 @@ fn close_session_frees_in_ascending_id_order() {
     for (n, &id) in ids.iter().enumerate().rev() {
         let address = 0x5000_0000 + u64::try_from(n).unwrap() * 0x10_0000;
         alloc(&mut map, id, 0, address);
-        map.take_steps();
+        assert_eq!(
+            map.take_steps(),
+            [DeviceShareStep::Lock {
+                handle: id,
+                address,
+                size: u64::from(PAGE),
+            }]
+        );
         let held = token(address, u64::from(PAGE));
         map.keep_lock(id, held).unwrap();
         tokens.insert(id, held);

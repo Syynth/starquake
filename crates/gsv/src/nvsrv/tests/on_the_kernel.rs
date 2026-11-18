@@ -35,8 +35,10 @@ const OUT: u64 = BASE + 4 * PAGE_SIZE;
 const MEMORY: u64 = BASE + 5 * PAGE_SIZE;
 const END: u64 = BASE + 6 * PAGE_SIZE;
 
-/// The size of the handle's memory: one page.
-const SIZE: u32 = 0x1000;
+/// The size of the handle's memory, one page, as nvmap's `u32` size field.
+fn size() -> u32 {
+    u32::try_from(PAGE_SIZE).unwrap()
+}
 
 struct NoDebug;
 
@@ -167,7 +169,7 @@ impl KernelRig {
     /// Opens nvmap and creates a one-page handle; the fd and the handle.
     fn created(&self) -> (i32, u32) {
         let fd = self.open_nvmap();
-        let output = self.nvmap(fd, NVMAP_CREATE, &le(&[SIZE, 0]));
+        let output = self.nvmap(fd, NVMAP_CREATE, &le(&[size(), 0]));
         let handle = u32::from_le_bytes(output[4..8].try_into().unwrap());
         (fd, handle)
     }
@@ -179,9 +181,13 @@ impl KernelRig {
         let address = MEMORY.to_le_bytes();
         let low = u32::from_le_bytes(address[..4].try_into().unwrap());
         let high = u32::from_le_bytes(address[4..].try_into().unwrap());
-        self.nvmap(fd, NVMAP_ALLOC, &le(&[handle, 0, 0, SIZE, 0, 0, low, high]));
+        self.nvmap(
+            fd,
+            NVMAP_ALLOC,
+            &le(&[handle, 0, 0, size(), 0, 0, low, high]),
+        );
         assert_eq!(self.locks(), 1);
-        assert_eq!(self.nvmap_lock(handle), Held::Lock(MEMORY, u64::from(SIZE)));
+        assert_eq!(self.nvmap_lock(handle), Held::Lock(MEMORY, PAGE_SIZE));
         (fd, handle)
     }
 
