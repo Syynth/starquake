@@ -466,3 +466,27 @@ Entry format:
 - **SCOPE:** moderate (spec amendment)
 - **WHAT:** The characteristics block keeps PR #4588's nine interface levels at +0x70. The conflict goes into the spec's verification item 1: row 24 asks for every level to be at least 6, NX2's comment asks only for [0x78] at least 6 plus feature thresholds, and NX2 ships 0x40 everywhere. When the title first reaches this ioctl, a reference-emulator trace finds which levels NvRm reads. If the title fails there, NX2's 0x40 values are the first experiment.
 - **WHY:** The spec already takes PR's whole layout. PR's values meet NX2's narrower rule but not row 24's broad reading, and nothing says yet which levels NvRm reads. A trace settles it with evidence instead of a guess.
+
+## Cap a channel's waiting submissions at 65,536 entries; past it, answer Busy
+- **WHEN:** 2026-11-17
+- **PROJECT:** starquake
+- **SYSTEM:** graphics-server
+- **SCOPE:** moderate
+- **WHAT:** Each nvhost-gpu channel holds at most 65,536 entries of submissions waiting for GPU queue room, the same figure decision 12 uses for the queue. A SubmitGPFIFO that would pass the cap answers NvResult::Busy (0xE). It is refused before the syncpoint's maximum is raised, so no fence goes out for it.
+- **WHY:** Waiting submissions can't be dropped once their fence has been given out. Without a cap, a title that abandons requests (closing its session, or giving an unwritable out buffer) grows the table without limit. Neither reference has a cap, because neither waits. A well-behaved title waits for its replies and never gets near the cap.
+
+## nvhost-gpu answers event ids 1, 2, 3 and 7 only: an accepted departure from decision 8
+- **WHEN:** 2026-11-17
+- **PROJECT:** starquake
+- **SYSTEM:** graphics-server
+- **SCOPE:** minor/local
+- **WHAT:** QueryEvent on an nvhost-gpu fd answers ids 1, 2 and 3 (Eden's) and 7 (PR #4588's; NVN asks for it, row 34). Any other id answers BadParameter. This departs from decision 8's take-the-larger rule, which would pick NX2's event-for-any-id. The departure is listed as a divergence, and verification item 1 asks whether NvRm asks for any id besides 7.
+- **WHY:** NX2's answer makes a new kernel event for every id a title sends, without bound. PR's answer covers every id that has been observed in use.
+
+## Keep the auto-stub policy, and make its failures diagnosable from one run
+- **WHEN:** 2026-11-17
+- **PROJECT:** starquake
+- **SYSTEM:** services / core
+- **SCOPE:** moderate
+- **WHAT:** Auto-stub keeps answering success to unknown commands and unknown services. To make its failures easy to trace, the run artifacts name what was stubbed: summary.json and the crash report list the unknown service names and every auto-stubbed command with its interface, and the command-line tool writes the warning log to a run artifact. This is implementation under #207, not a spec change.
+- **WHY:** Auto-stub lets one run discover a title's whole service list, which a stricter policy would lose. A stub session for an unknown service has no command table, so it can't tell which commands should return an object anyway. The real cost has been diagnosis: three times (appletOE 10, ReceiveMessage, parental control) a stubbed success sent the title wrong far from the cause, and each time finding the cause needed a scratch build.

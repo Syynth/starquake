@@ -452,8 +452,8 @@ fn commands_that_are_left_out_go_to_the_unknown_command_policy() {
     assert_eq!(
         stubbed,
         [crate::framework::StubbedCommand {
-            interface: "ILogger",
-            protocol: Protocol::Cmif,
+            interface: starquake_trace::InterfaceName::new("ILogger").unwrap(),
+            protocol: starquake_trace::IpcProtocol::Cmif,
             id: TRANSMIT_HASHED_LOG,
         }]
     );

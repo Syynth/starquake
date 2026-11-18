@@ -4,9 +4,10 @@
 //! `summary.json`, `trace.txt` and `events.bin`, plus `crash.json` and `crash.txt` when the guest
 //! crashed. Frames and snapshots are not written: nothing produces them yet.
 //!
-//! One file is added to the spec's table: [`GUEST_LOG_FILE`], the text the guest wrote with
-//! `OutputDebugString`. The event stream keeps only each line's length and hash, so without it a
-//! run's output could be checked but not read.
+//! Two files are added to the spec's table: [`GUEST_LOG_FILE`], the text the guest wrote with
+//! `OutputDebugString` (the event stream keeps only each line's length and hash, so without it a
+//! run's output could be checked but not read); and [`LOG_FILE`], the emulator's own warnings
+//! and errors during the run (the owner's ruling of 2026-11-17 on issue #207).
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -28,6 +29,12 @@ pub const EVENTS_FILE: &str = "events.bin";
 /// print that text itself, so the authority is `guest_log_lines_dropped` in `summary.json`.
 /// (`trace.txt` ends with a line of its own when it was cut short; see `trace_events_dropped`.)
 pub const GUEST_LOG_FILE: &str = "guest_log.txt";
+/// The emulator's own warnings and errors during the run ([`crate::host_log`]), one per line.
+///
+/// Bounded like the guest log: when the emulator logged more, the file holds the first lines
+/// and ends with `[truncated: <n> later lines were not kept]`; the authority is
+/// `host_log_lines_dropped` in `summary.json`. Always written, empty when nothing was logged.
+pub const LOG_FILE: &str = "log.txt";
 /// The crash report as data. Only present when the guest crashed.
 pub const CRASH_JSON_FILE: &str = "crash.json";
 /// The crash report as text. Only present when the guest crashed.
@@ -86,13 +93,18 @@ pub fn write(folder: &Path, report: &RunReport) -> Result<(), ArtifactError> {
         guest_log.push(b'\n');
     }
     if report.guest_log_dropped > 0 {
-        let marker = format!(
-            "[truncated: {} later lines were not kept]\n",
-            report.guest_log_dropped
-        );
-        guest_log.extend(marker.bytes());
+        guest_log.extend(truncated(report.guest_log_dropped).bytes());
     }
     put(GUEST_LOG_FILE, &guest_log)?;
+    let mut host_log = String::new();
+    for line in &report.host_log {
+        host_log.push_str(line);
+        host_log.push('\n');
+    }
+    if report.host_log_dropped > 0 {
+        host_log.push_str(&truncated(report.host_log_dropped));
+    }
+    put(LOG_FILE, host_log.as_bytes())?;
 
     if let Some(crash) = report.crash() {
         let data = json(CRASH_JSON_FILE, serde_json::to_string_pretty(crash))?;
@@ -110,4 +122,10 @@ pub fn write(folder: &Path, report: &RunReport) -> Result<(), ArtifactError> {
         }
     }
     Ok(())
+}
+
+/// The last line of a log file that was cut short after its first lines: `dropped` later lines
+/// were not kept.
+fn truncated(dropped: u64) -> String {
+    format!("[truncated: {dropped} later lines were not kept]\n")
 }

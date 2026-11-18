@@ -120,7 +120,8 @@
 //!   stubbed.
 //! - **Close** messages: the session is dropped from the server and nothing is written.
 //! - **Tracing.** Every request the framework answers is one event in the run's event stream,
-//!   marked when it was stubbed or deferred: see [`trace`].
+//!   naming the interface it went to and its protocol, marked when it was stubbed or deferred:
+//!   see [`trace`]. The server also counts its requests by command ([`Server::requests`]).
 //!
 //! A method's [`Fault`], and the cases in the table below, are answered with a reply that holds
 //! only a result code. The codes are in [`result`]; most are guesses, and say so there.
@@ -240,8 +241,8 @@ pub use result::{
     OUT_OF_DOMAIN_ENTRIES, Outcome, TARGET_NOT_FOUND, UNKNOWN_COMMAND_ID,
 };
 pub use server::{
-    DEFAULT_POINTER_BUFFER_SIZE, Handled, MAX_STUBBED_COMMANDS, Server, ServerError,
-    StubbedCommand, UnknownPolicy,
+    CountedCommand, DEFAULT_POINTER_BUFFER_SIZE, Handled, MAX_COUNTED_COMMANDS,
+    MAX_STUBBED_COMMANDS, RequestCount, Server, ServerError, StubbedCommand, UnknownPolicy,
 };
 pub use snapshot::{Family, Interfaces, SNAPSHOT_MAGIC, SNAPSHOT_VERSION, SnapshotError};
 pub use targets::{MAX_DOMAIN_OBJECTS, TargetError};

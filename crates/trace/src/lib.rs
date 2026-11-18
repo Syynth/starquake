@@ -9,6 +9,8 @@
 //! * [`recorder`]: the [`Recorder`] that numbers events and fans them out to [`Sink`]s.
 //! * [`flight`] and [`dump`]: the [`FlightRecorder`] ring per core, and its `postcard` [`Dump`]
 //!   with a reader.
+//! * [`interface`]: what an IPC event says of where a request went: the [`InterfaceName`] and
+//!   the [`IpcProtocol`].
 //! * [`text`]: the golden-trace text view ([`TextSink`], [`golden_trace`]).
 //! * [`env`]: the [`Env`] trait with [`LiveEnv`] and [`ReplayEnv`].
 
@@ -16,6 +18,7 @@ pub mod dump;
 pub mod env;
 pub mod event;
 pub mod flight;
+pub mod interface;
 pub mod recorder;
 pub mod text;
 
@@ -29,5 +32,8 @@ pub use event::{
     ResultCode, SVC_ARG_COUNT, ServiceId, SessionId, ThreadId, WakeReason,
 };
 pub use flight::FlightRecorder;
+pub use interface::{
+    INTERFACE_NAME_CAPACITY, InterfaceName, InterfaceNameError, IpcProtocol, REPLACEMENT,
+};
 pub use recorder::{Recorder, Sink, VecSink};
 pub use text::{TextSink, golden_trace};

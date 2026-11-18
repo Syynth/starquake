@@ -7,7 +7,7 @@ use starquake_ipc::{
 };
 use starquake_kernel::handle::Handle;
 use starquake_kernel::result::{KernelError, ResultCode};
-use starquake_trace::{EventKind, IpcOutcome, ServiceId};
+use starquake_trace::{EventKind, InterfaceName, IpcOutcome, IpcProtocol, ServiceId};
 
 use super::*;
 use crate::framework::fake::{FakeHost, FakeKernel};
@@ -403,14 +403,18 @@ fn an_unknown_name_gets_a_stub_under_auto_stub() {
         tipc_result(9, ResultCode::SUCCESS)
     );
     let stubbed: Vec<_> = host.server(SM).unwrap().stubbed().copied().collect();
-    let stub = |protocol, id| StubbedCommand {
-        interface: "Stub",
+    // Recorded under the names asked for, not as `Stub`, in order of name.
+    let stub = |unknown, protocol, id| StubbedCommand {
+        interface: InterfaceName::new(unknown).unwrap(),
         protocol,
         id,
     };
     assert_eq!(
         stubbed,
-        [stub(Protocol::Cmif, 301), stub(Protocol::Tipc, 9)]
+        [
+            stub("fsp-srv", IpcProtocol::Tipc, 9),
+            stub("hid", IpcProtocol::Cmif, 301)
+        ]
     );
     // The trace marks the two requests as stubbed.
     let outcomes: Vec<_> = (host.kernel.recorded().iter())
@@ -478,8 +482,8 @@ fn commands_that_are_left_out_go_to_the_unknown_command_policy() {
     let stubbed: Vec<_> = host.server(SM).unwrap().stubbed().copied().collect();
     assert_eq!(stubbed.len(), 1);
     assert_eq!(
-        (stubbed[0].interface, stubbed[0].id),
-        ("Sm", REGISTER_SERVICE)
+        (stubbed[0].interface.as_str(), stubbed[0].id),
+        (Sm::interface(), REGISTER_SERVICE)
     );
 }
 
@@ -833,4 +837,143 @@ fn result_codes_are_edens_words() {
     for code in [INVALID_CLIENT, INVALID_SERVICE_NAME, NOT_REGISTERED] {
         assert_eq!(code.module(), SM_MODULE);
     }
+}
+
+/// The interface, protocol and command of the last IPC event `host`'s kernel recorded.
+fn last_request(host: &FakeHost) -> (InterfaceName, IpcProtocol, u32, IpcOutcome) {
+    (host.kernel.recorded().iter().rev())
+        .find_map(|event| match event.kind {
+            EventKind::Ipc {
+                interface,
+                protocol,
+                command,
+                outcome,
+                ..
+            } => Some((interface, protocol, command, outcome)),
+            _ => None,
+        })
+        .unwrap()
+}
+
+/// A stub's requests are traced, counted and recorded as stubbed under the name the title
+/// asked for, never as `Stub`; after a restore too.
+#[test]
+fn a_stub_is_traced_and_recorded_under_the_name_asked_for() {
+    let (mut host, sm) = host(UnknownPolicy::AutoStub);
+    initialize(&mut host, sm);
+    let unknown = name("lm");
+    let stub = moved_handle(&send(&mut host, sm, &cmif_get_service(unknown.to_field())));
+    let asked = InterfaceName::new(unknown.as_str()).unwrap();
+    let command = 5;
+    send(
+        &mut host,
+        stub,
+        &RequestBuilder::cmif(CommandType::Request, command),
+    );
+    assert_eq!(
+        last_request(&host),
+        (asked, IpcProtocol::Cmif, command, IpcOutcome::Stubbed)
+    );
+    let manager = host.server(SM).unwrap();
+    assert_eq!(
+        manager.stubbed().copied().collect::<Vec<_>>(),
+        [StubbedCommand {
+            interface: asked,
+            protocol: IpcProtocol::Cmif,
+            id: command,
+        }]
+    );
+    // A second name nothing provides, sent the same command, is recorded apart: the record is
+    // by the name asked for.
+    let other = name("aoc:u");
+    let second = moved_handle(&send(&mut host, sm, &cmif_get_service(other.to_field())));
+    send(
+        &mut host,
+        second,
+        &RequestBuilder::cmif(CommandType::Request, command),
+    );
+    let other_asked = InterfaceName::new(other.as_str()).unwrap();
+    let manager = host.server(SM).unwrap();
+    assert_eq!(
+        manager.stubbed().copied().collect::<Vec<_>>(),
+        [
+            StubbedCommand {
+                interface: other_asked,
+                protocol: IpcProtocol::Cmif,
+                id: command,
+            },
+            StubbedCommand {
+                interface: asked,
+                protocol: IpcProtocol::Cmif,
+                id: command,
+            },
+        ]
+    );
+    let counted = manager
+        .requests()
+        .find(|count| count.command.interface == asked);
+    assert_eq!(
+        counted.map(|count| (count.command.id, count.name, count.count)),
+        Some((command, None, 1))
+    );
+    // The type is still `Stub` to a snapshot, which finds the session's type by it.
+    let stub_session = Stub {
+        name: unknown.clone(),
+    };
+    assert_eq!(stub_session.name(), Stub::interface());
+    assert_eq!(stub_session.trace_name(), unknown.as_str());
+
+    // Restored into a new `sm:` server, the stub still answers under its name.
+    let saved = manager.save().unwrap();
+    let mut fresh = server(Registry::new(), UnknownPolicy::AutoStub).with_service_id(SM);
+    fresh.restore(&saved).unwrap();
+    host.add(fresh);
+    send(&mut host, stub, &RequestBuilder::tipc(9));
+    assert_eq!(
+        last_request(&host),
+        (asked, IpcProtocol::Tipc, 9, IpcOutcome::Stubbed)
+    );
+}
+
+/// The divergence the framework's trace docs list: a stub asked for by the name of `sm:`'s own
+/// interface, `Sm`, is named like that interface, so the same command sent to the stub and to
+/// `sm:` itself lands on one count and one stubbed record, and nothing tells them apart.
+#[test]
+fn a_stub_asked_for_by_sms_own_interface_name_is_counted_with_it() {
+    let (mut host, sm) = host(UnknownPolicy::AutoStub);
+    initialize(&mut host, sm);
+    let own = name(Sm::interface());
+    let stub = moved_handle(&send(&mut host, sm, &cmif_get_service(own.to_field())));
+    // A command `sm:`'s own table does not have, so both requests are stubbed.
+    let command = 5;
+    assert_eq!(Sm::default().commands().name(Protocol::Cmif, command), None);
+    for session in [stub, sm] {
+        send(
+            &mut host,
+            session,
+            &RequestBuilder::cmif(CommandType::Request, command),
+        );
+        let asked = InterfaceName::new(Sm::interface()).unwrap();
+        assert_eq!(
+            last_request(&host),
+            (asked, IpcProtocol::Cmif, command, IpcOutcome::Stubbed)
+        );
+    }
+    let asked = InterfaceName::new(Sm::interface()).unwrap();
+    let manager = host.server(SM).unwrap();
+    // One record, not two: the stub and the real interface are not told apart.
+    assert_eq!(
+        manager.stubbed().copied().collect::<Vec<_>>(),
+        [StubbedCommand {
+            interface: asked,
+            protocol: IpcProtocol::Cmif,
+            id: command,
+        }]
+    );
+    let counts: Vec<_> = manager
+        .requests()
+        .filter(|count| count.command.id == command)
+        .map(|count| (count.command.interface, count.command.protocol, count.count))
+        .collect();
+    assert_eq!(counts, [(asked, IpcProtocol::Cmif, 2)]);
 }

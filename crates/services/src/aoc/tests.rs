@@ -373,8 +373,8 @@ fn commands_that_are_left_out_go_to_the_unknown_command_policy() {
             assert_eq!(reply.result, ResultCode::SUCCESS, "{command}");
             assert!(reply.data.iter().all(|byte| *byte == 0), "{command}");
             expected.push(crate::framework::StubbedCommand {
-                interface,
-                protocol: Protocol::Cmif,
+                interface: starquake_trace::InterfaceName::new(interface).unwrap(),
+                protocol: starquake_trace::IpcProtocol::Cmif,
                 id: command,
             });
         }

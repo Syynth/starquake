@@ -9,10 +9,11 @@ use starquake_ipc::{
     TIPC_COMMAND_OFFSET,
 };
 use starquake_kernel::result::ResultCode;
+use starquake_trace::{InterfaceName, IpcProtocol};
 
 use super::super::result::UNKNOWN_COMMAND_ID;
 use super::super::targets::Domain;
-use super::super::{MAX_STUBBED_COMMANDS, Protocol, Session, StubbedCommand, UnknownPolicy};
+use super::super::{MAX_STUBBED_COMMANDS, Session, StubbedCommand, UnknownPolicy};
 use super::{Mute, Rig, Toy, buffer_of, domain_request, in_domain, only, plain, request, toy};
 
 /// The CMIF id of the command the toy does not have.
@@ -37,9 +38,9 @@ fn tipc_room() -> usize {
     BUFFER_SIZE - CommandHeader::WORDS * size_of::<u32>()
 }
 
-fn stub(interface: &'static str, protocol: Protocol, id: u32) -> StubbedCommand {
+fn stub(interface: &'static str, protocol: IpcProtocol, id: u32) -> StubbedCommand {
     StubbedCommand {
-        interface,
+        interface: InterfaceName::new(interface).unwrap(),
         protocol,
         id,
     }
@@ -95,8 +96,8 @@ fn auto_stub_replies_success_and_zeros_never_the_request() {
     assert_eq!(
         stubbed,
         [
-            stub(name, Protocol::Cmif, missing()),
-            stub(name, Protocol::Tipc, missing())
+            stub(name, IpcProtocol::Cmif, missing()),
+            stub(name, IpcProtocol::Tipc, missing())
         ]
     );
 }
@@ -121,7 +122,8 @@ fn an_interface_with_no_commands_answers_by_policy_alone() {
         } else {
             0
         };
-        assert_eq!(names, vec![Mute.name(); stubbed]);
+        let mute = InterfaceName::new(Mute.name()).unwrap();
+        assert_eq!(names, vec![mute; stubbed]);
     }
 }
 
@@ -139,7 +141,7 @@ fn the_stub_record_stops_growing_exactly_at_its_limit() {
     let last = rig.server.stubbed().last().unwrap();
     assert_eq!(
         *last,
-        stub(Toy::default().name(), Protocol::Cmif, first + limit - 1)
+        stub(Toy::default().name(), IpcProtocol::Cmif, first + limit - 1)
     );
 
     // One more is still stubbed, just not recorded.

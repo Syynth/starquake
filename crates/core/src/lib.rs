@@ -32,6 +32,9 @@
 //!   which console it was built for).
 //! - [`system`]: one VM per run, hypervisor backend only.
 //! - [`crash`]: the part of the crash report that needs no symbols.
+//! - [`services_report`]: what the services leave behind for the report (requests by command,
+//!   stubbed commands, unknown service names), read from the servers once the run is over.
+//! - [`host_log`]: the emulator's own warnings during a run, kept for the run's `log.txt`.
 
 pub mod artifacts;
 #[cfg_attr(
@@ -44,6 +47,7 @@ pub mod artifacts;
 mod clock;
 pub mod crash;
 pub mod hle;
+pub mod host_log;
 #[cfg_attr(
     not(any(test, all(target_os = "macos", target_arch = "aarch64"))),
     expect(
@@ -61,6 +65,7 @@ mod image;
 )]
 mod machine;
 pub mod report;
+pub mod services_report;
 #[cfg_attr(
     not(any(test, all(target_os = "macos", target_arch = "aarch64"))),
     expect(

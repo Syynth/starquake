@@ -53,6 +53,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use serde::{Deserialize, Serialize};
 use starquake_kernel::id::ObjectId;
 use starquake_kernel::result::ResultCode;
+use starquake_trace::InterfaceName;
 
 use super::reply::Reply;
 
@@ -219,6 +220,8 @@ pub(super) struct Pending {
     pub(super) framing: Framing,
     pub(super) command: u32,
     pub(super) request_size: u32,
+    /// The interface the request was addressed to, as its event names it.
+    pub(super) interface: InterfaceName,
 }
 
 /// A deferred request whose token has completed, taken from the server to be delivered

@@ -159,7 +159,10 @@ use crate::clock::Timebase;
 use crate::crash::{Backtrace, CrashReport, Exception};
 use crate::hle::{FspHost, HostFolder, Reads};
 use crate::image::{PAGE, Placement};
-use crate::report::{ExitReason, Mapping, RunOptions, RunReport, ThreadPc, empty_dump};
+use crate::report::{
+    ExitReason, GUEST_LOG_BYTES, Mapping, RunOptions, RunReport, ThreadPc, empty_dump,
+};
+use crate::services_report::{LastStubbed, ServicesReport};
 use crate::space::Touch;
 
 mod core_loop;
@@ -340,7 +343,7 @@ impl Limits {
     /// run without fixing one.
     pub(crate) const DEFAULT: Self = Self {
         trace_events: 100_000,
-        guest_log_bytes: 4 << 20,
+        guest_log_bytes: GUEST_LOG_BYTES,
     };
 }
 
@@ -558,6 +561,8 @@ struct Aftermath {
     stack: Option<Mapping>,
     /// For a timeout: where each guest thread was, by thread id.
     threads: Vec<StoppedThread>,
+    /// What the services left behind, read from their servers after every core stopped.
+    services: ServicesReport,
 }
 
 /// One guest thread when the run stopped (see [`ThreadPc`], which this becomes).
@@ -703,8 +708,10 @@ pub(crate) fn run_serving<V: Vcpu, C: HostClock + Clone + 'static>(
         usize::from(APPLICATION_CORE_COUNT),
         FLIGHT_CAPACITY,
     ));
+    let stubs = Arc::new(LastStubbed::new());
     session.recorder.add_sink(Arc::clone(&text));
     session.recorder.add_sink(Arc::clone(&flight));
+    session.recorder.add_sink(Arc::clone(&stubs));
 
     let env = session.environment();
     let mut mappings = placed.mappings.clone();
@@ -726,7 +733,11 @@ pub(crate) fn run_serving<V: Vcpu, C: HostClock + Clone + 'static>(
             Aftermath::default(),
         ),
     };
-    let Aftermath { stack, threads } = aftermath;
+    let Aftermath {
+        stack,
+        threads,
+        services,
+    } = aftermath;
     let exit = match ending {
         Ending::Exited => ExitReason::ProcessExited,
         Ending::TimedOut => ExitReason::Timeout,
@@ -752,7 +763,8 @@ pub(crate) fn run_serving<V: Vcpu, C: HostClock + Clone + 'static>(
                 stack,
                 session.memory,
                 &placed.modules,
-            ));
+            ))
+            .with_services(&services, services.name_requests(&stubs.requests()));
             ExitReason::GuestCrashed(Box::new(match syndrome {
                 Some(syndrome) => report.with_syndrome(syndrome),
                 None => report,
@@ -773,19 +785,19 @@ pub(crate) fn run_serving<V: Vcpu, C: HostClock + Clone + 'static>(
         stubbed: tally.stubbed,
         patched_counter_reads: placed.counter_reads.clone(),
         memory_map: mappings,
-        threads: threads
-            .into_iter()
-            .map(|thread| {
-                ThreadPc::new(
-                    thread.id,
-                    thread.state,
-                    thread.core,
-                    thread.pc,
-                    &placed.modules,
-                )
-            })
-            .collect(),
+        threads: thread_pcs(threads, &placed.modules),
+        services,
+        host_log: Vec::new(),
+        host_log_dropped: 0,
     }
+}
+
+/// The threads of a timed-out run as its report says them: each placed in `modules`.
+fn thread_pcs(threads: Vec<StoppedThread>, modules: &[crate::crash::Module]) -> Vec<ThreadPc> {
+    threads
+        .into_iter()
+        .map(|thread| ThreadPc::new(thread.id, thread.state, thread.core, thread.pc, modules))
+        .collect()
 }
 
 /// Settles what `events.bin` holds when the flight recorder could or could not be written out,
@@ -973,16 +985,22 @@ impl<'a, V: Vcpu, C: HostClock + Clone> Machine<'a, V, C> {
         let ending = lock(&self.ending)
             .take()
             .unwrap_or_else(|| Ending::Failed("the run stopped without saying why".to_owned()));
+        let services = ServicesReport::read(&self.dispatcher);
         let aftermath = match &ending {
             Ending::Crashed(_, _, regs) => Aftermath {
                 stack: stack_block(&self.dispatcher, regs),
                 threads: Vec::new(),
+                services,
             },
             Ending::TimedOut => Aftermath {
                 stack: None,
                 threads: self.stopped_threads(),
+                services,
             },
-            Ending::Exited | Ending::Failed(_) => Aftermath::default(),
+            Ending::Exited | Ending::Failed(_) => Aftermath {
+                services,
+                ..Aftermath::default()
+            },
         };
         (
             ending,

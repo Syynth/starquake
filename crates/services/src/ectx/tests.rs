@@ -109,8 +109,8 @@ fn create_context_registrar_hands_out_a_registrar_that_answers() {
     assert_eq!(
         stubbed,
         [StubbedCommand {
-            interface: "IContextRegistrar",
-            protocol: Protocol::Cmif,
+            interface: starquake_trace::InterfaceName::new("IContextRegistrar").unwrap(),
+            protocol: starquake_trace::IpcProtocol::Cmif,
             id: COMPLETE,
         }]
     );
@@ -152,7 +152,10 @@ fn create_context_registrar_in_a_domain_returns_an_object() {
     };
     assert_eq!(body.header.result, ResultCode::SUCCESS.raw());
     let interfaces: Vec<_> = rig.server.stubbed().map(|stub| stub.interface).collect();
-    assert_eq!(interfaces, ["IContextRegistrar"]);
+    assert_eq!(
+        interfaces,
+        [starquake_trace::InterfaceName::new("IContextRegistrar").unwrap()]
+    );
 }
 
 #[test]

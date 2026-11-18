@@ -30,13 +30,20 @@
 //!
 //! Everything here writes to the two streams it is handed, so tests can run a command in
 //! process; `main.rs` passes the real stdout and stderr.
+//!
+//! The emulator's own warnings and errors during a run go to the run's `log.txt`
+//! (`starquake_core::artifacts::LOG_FILE`), bounded like the guest log, once
+//! [`install_host_log`] has made a `starquake_core::host_log::HostLog` the process's log
+//! subscriber; `main.rs` does that first.
 
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use starquake_core::host_log::{HostLog, HostLogError};
 use starquake_core::loader::read_at::{Positional, ReadAt};
 use starquake_core::title::{self as title_api, RomFs};
 use starquake_core::{ExitReason, RunOptions, RunReport, System, artifacts, exit_code};
@@ -349,7 +356,7 @@ fn run(
     stderr: &mut dyn Write,
 ) -> u8 {
     let started = Instant::now();
-    let report = match load(&args.program) {
+    let mut report = match load(&args.program) {
         Err(message) => RunReport::emulator_error(message, started.elapsed()),
         Ok(Loaded { system, romfs }) => system.run(&RunOptions {
             timeout: args.timeout,
@@ -358,6 +365,9 @@ fn run(
             romfs,
         }),
     };
+    if let Some(log) = HOST_LOG.get() {
+        (report.host_log, report.host_log_dropped) = log.take();
+    }
 
     let folder = args
         .artifacts
@@ -419,6 +429,22 @@ pub fn conclude(
             code
         }
     }
+}
+
+/// The emulator's log of its own warnings, once [`install_host_log`] has installed it.
+static HOST_LOG: OnceLock<HostLog> = OnceLock::new();
+
+/// Makes a [`HostLog`] the log subscriber of every thread of the process, so that a run's
+/// artifacts hold the emulator's warnings and errors (`log.txt`): each `run` puts what the log
+/// kept, since it was installed or since the last run took it, into its report. The binary does
+/// this once, before [`execute`]; without it, `log.txt` is empty. It fails if the process
+/// already has a log subscriber.
+pub fn install_host_log() -> Result<(), HostLogError> {
+    let log = HostLog::new();
+    log.install()?;
+    HOST_LOG
+        .set(log)
+        .map_err(|_| HostLogError::AlreadyInstalled)
 }
 
 /// Runs the command line `args` (the program's own name first, as `std::env::args_os` gives it)

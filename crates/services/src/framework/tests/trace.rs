@@ -4,15 +4,18 @@
 use starquake_ipc::{Body, Message, RequestBuilder, SessionKind};
 use starquake_kernel::id::ObjectId;
 use starquake_kernel::result::ResultCode;
-use starquake_trace::{EventKind, GuestTicks, IpcOutcome, ThreadId};
+use starquake_trace::{EventKind, GuestTicks, InterfaceName, IpcOutcome, IpcProtocol, ThreadId};
 
-use super::super::control::{CONVERT_CURRENT_OBJECT_TO_DOMAIN, QUERY_POINTER_BUFFER_SIZE};
+use super::super::control::{
+    CONTROL_INTERFACE, CONVERT_CURRENT_OBJECT_TO_DOMAIN, QUERY_POINTER_BUFFER_SIZE,
+};
 use super::super::result::{INVALID_CMIF_REQUEST, UNKNOWN_COMMAND_ID};
 use super::super::targets::Domain;
 use super::super::trace::session_id;
-use super::super::{NO_COMMAND_ID, Reply, UnknownPolicy};
+use super::super::{NO_COMMAND_ID, Reply, Session, UnknownPolicy};
 use super::{
-    Rig, SERVICE, built, control_request, domain_request, parked_one, payload, request, toy,
+    Child, Rig, SERVICE, Toy, built, control_request, domain_request, parked_one, payload, request,
+    toy,
 };
 
 /// The guest thread and core the requests of these tests come from.
@@ -32,9 +35,31 @@ fn argument_bytes(request: &RequestBuilder, kind: SessionKind) -> u32 {
     u32::try_from(data.len()).unwrap()
 }
 
+/// Where a request went, as its event says: the interface and the protocol.
+type To = (InterfaceName, IpcProtocol);
+
+/// A request to the interface `T` in `protocol`.
+fn to<T: Session>(protocol: IpcProtocol) -> To {
+    (InterfaceName::new(T::interface()).unwrap(), protocol)
+}
+
+/// A CMIF request to the toy, the rig's session's own interface.
+fn toy_cmif() -> To {
+    to::<Toy>(IpcProtocol::Cmif)
+}
+
+/// A control request.
+fn control() -> To {
+    (
+        InterfaceName::new(CONTROL_INTERFACE).unwrap(),
+        IpcProtocol::Control,
+    )
+}
+
 /// The event for a request on `session`.
 fn ipc(
     session: ObjectId,
+    (interface, protocol): To,
     command: u32,
     request_size: u32,
     reply_size: u32,
@@ -44,6 +69,8 @@ fn ipc(
     EventKind::Ipc {
         session: session_id(session),
         service: SERVICE,
+        interface,
+        protocol,
         command,
         request_size,
         reply_size,
@@ -81,6 +108,7 @@ fn a_request_is_one_line_of_the_golden_trace() {
         event.kind,
         ipc(
             rig.session,
+            toy_cmif(),
             toy::ADD,
             asked,
             replied,
@@ -93,10 +121,11 @@ fn a_request_is_one_line_of_the_golden_trace() {
     assert_eq!(
         rig.kernel.trace(),
         format!(
-            "thread {}\n  ipc session={session} service={} command={} req={asked} rep={replied} \
-             -> 0x0 Done\n",
+            "thread {}\n  ipc session={session} service={} interface={} cmif command={} \
+             req={asked} rep={replied} -> 0x0 Done\n",
             THREAD.0,
             SERVICE.0,
+            Toy::interface(),
             toy::ADD
         )
     );
@@ -113,8 +142,24 @@ fn a_stubbed_command_is_marked_stubbed() {
     assert_eq!(
         kinds(&rig),
         [
-            ipc(rig.session, command, asked, 0, success, IpcOutcome::Stubbed),
-            ipc(rig.session, command, 0, 0, success, IpcOutcome::Stubbed),
+            ipc(
+                rig.session,
+                toy_cmif(),
+                command,
+                asked,
+                0,
+                success,
+                IpcOutcome::Stubbed
+            ),
+            ipc(
+                rig.session,
+                to::<Toy>(IpcProtocol::Tipc),
+                command,
+                0,
+                0,
+                success,
+                IpcOutcome::Stubbed
+            ),
         ]
     );
     assert!(rig.kernel.trace().ends_with("-> 0x0 Stubbed\n"));
@@ -131,6 +176,7 @@ fn a_command_that_fails_is_done_with_its_result_and_no_payload() {
         [
             ipc(
                 rig.session,
+                toy_cmif(),
                 u32::from(toy::MISSING),
                 0,
                 0,
@@ -139,6 +185,7 @@ fn a_command_that_fails_is_done_with_its_result_and_no_payload() {
             ),
             ipc(
                 rig.session,
+                toy_cmif(),
                 toy::ADD,
                 0,
                 0,
@@ -167,6 +214,7 @@ fn control_requests_and_domain_requests_are_traced_too() {
         [
             ipc(
                 session,
+                control(),
                 QUERY_POINTER_BUFFER_SIZE,
                 0,
                 u16_size,
@@ -175,6 +223,7 @@ fn control_requests_and_domain_requests_are_traced_too() {
             ),
             ipc(
                 session,
+                control(),
                 CONVERT_CURRENT_OBJECT_TO_DOMAIN,
                 0,
                 u32_size,
@@ -182,9 +231,25 @@ fn control_requests_and_domain_requests_are_traced_too() {
                 done
             ),
             // The new object's id is not payload.
-            ipc(session, toy::OPEN_CHILD, asked, 0, success, done),
-            // Closing an object has no command id.
-            ipc(session, NO_COMMAND_ID, 0, 0, success, done),
+            ipc(
+                session,
+                toy_cmif(),
+                toy::OPEN_CHILD,
+                asked,
+                0,
+                success,
+                done
+            ),
+            // Closing an object has no command id; the event names the object it closed.
+            ipc(
+                session,
+                to::<Child>(IpcProtocol::Cmif),
+                NO_COMMAND_ID,
+                0,
+                0,
+                success,
+                done
+            ),
         ]
     );
 }
@@ -219,6 +284,7 @@ fn a_deferred_request_is_one_event_when_it_is_answered_marked_deferred() {
         recorded[1].kind,
         ipc(
             first,
+            toy_cmif(),
             toy::WAIT,
             asked,
             replied,
@@ -245,6 +311,7 @@ fn a_dropped_token_is_traced_with_its_error() {
         kinds(&rig),
         [ipc(
             rig.session,
+            toy_cmif(),
             toy::WAIT,
             0,
             0,

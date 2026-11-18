@@ -136,6 +136,8 @@ fn ipc_event(command: u32) -> EventKind {
     EventKind::Ipc {
         session: starquake_trace::SessionId(1),
         service: FIRST,
+        interface: starquake_trace::InterfaceName::lossy("IScripted"),
+        protocol: starquake_trace::IpcProtocol::Cmif,
         command,
         request_size: 0,
         reply_size: 0,
@@ -2409,4 +2411,62 @@ fn a_handler_ending_the_process_wakes_its_threads_waiters_as_exit_process_does()
             .collect::<Vec<_>>()
     );
     assert_eq!(by_handler.1, by_exit.1);
+}
+
+// ----- Reading the handlers back ---------------------------------------------------------------
+
+/// A handler as `inspect_handlers` showed it: its server's number and its log.
+type Shown = (ServiceId, Arc<Mutex<Log>>);
+
+/// Every handler `inspect_handlers` shows, and how many it did not.
+fn shown(world: &World) -> (Vec<Shown>, usize) {
+    let mut shown = Vec::new();
+    let out = world.dispatcher.inspect_handlers(|service, handler| {
+        let handler: &dyn core::any::Any = handler;
+        let scripted = handler.downcast_ref::<Scripted>().unwrap();
+        shown.push((service, Arc::clone(&scripted.log)));
+    });
+    (shown, out)
+}
+
+#[test]
+fn every_handler_in_its_slot_is_shown_with_the_number_its_server_is_known_by() {
+    let world = World::new();
+    let (handlers, out) = shown(&world);
+    assert_eq!(out, 0);
+    // In the order of the kernel's server ids, each with its own server's number.
+    assert!(world.first.id < world.second.id);
+    let services: Vec<ServiceId> = handlers.iter().map(|(service, _)| *service).collect();
+    assert_eq!(services, [FIRST, SECOND]);
+    assert!(Arc::ptr_eq(&handlers[0].1, &world.first.log));
+    assert!(Arc::ptr_eq(&handlers[1].1, &world.second.log));
+}
+
+#[test]
+fn a_handler_out_of_its_slot_is_not_shown_but_counted() {
+    let world = World::new();
+    let handle = world.session();
+    let (gate, keeper) = gate();
+    world.first.script(Box::new(move |_, _, message| {
+        gate.pass();
+        message.fill(0xA0);
+        Ok(Handled::Replied)
+    }));
+    let world = &world;
+    std::thread::scope(|scope| {
+        // A's request has the first server's handler out of its slot until the gate opens.
+        let sending = scope.spawn(move || world.send(A, handle, &request()));
+        keeper.wait();
+        let (handlers, out) = shown(world);
+        assert_eq!(out, 1);
+        assert_eq!(handlers.len(), 1);
+        assert_eq!(handlers[0].0, SECOND);
+        assert!(Arc::ptr_eq(&handlers[0].1, &world.second.log));
+        keeper.open();
+        let (_, regs) = sending.join().unwrap();
+        assert_eq!(result(&regs), ResultCode::SUCCESS);
+    });
+    // Back in its slot, it is shown again.
+    let (handlers, out) = shown(world);
+    assert_eq!((handlers.len(), out), (2, 0));
 }
