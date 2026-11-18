@@ -522,13 +522,13 @@ impl Body {
         let mut above: Option<u64> = None;
         for (index, page) in self.pages.iter().enumerate() {
             let fault = |fault| PagesError::Page { index, fault };
-            let shaped = page.va.is_multiple_of(PAGE_SIZE)
+            let well_formed = page.va.is_multiple_of(PAGE_SIZE)
                 && page.pa.is_multiple_of(PAGE_SIZE)
                 && page
                     .va
                     .checked_add(PAGE_SIZE)
                     .is_some_and(|end| end <= VA_SPACE_END);
-            if !shaped {
+            if !well_formed {
                 return Err(fault(PageFault::Shape));
             }
             if above.is_some_and(|before| page.va <= before) {

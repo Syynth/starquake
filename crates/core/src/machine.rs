@@ -860,11 +860,10 @@ pub(crate) fn run_serving<V: Vcpu, C: HostClock + Clone + 'static>(
         address_space,
     } = guest;
     let console = time.console;
-    let map_time = time.clone();
     let session = Session {
         memory: space,
         options,
-        clock: RunClock::new(time),
+        clock: RunClock::new(time.clone()),
         recorder: Arc::new(Recorder::new()),
     };
     let text = Arc::new(TextSink::with_limit(limits.trace_events));
@@ -877,7 +876,7 @@ pub(crate) fn run_serving<V: Vcpu, C: HostClock + Clone + 'static>(
     session.recorder.add_sink(Arc::clone(&flight));
     session.recorder.add_sink(Arc::clone(&stubs));
 
-    space.record_maps(session.map_sink(map_time));
+    space.record_maps(session.map_sink(time));
     let env = session.environment_within(limits.env_recording_bytes);
     let mut mappings = placed.mappings.clone();
     let (ending, log, tally, aftermath) =

@@ -454,7 +454,7 @@ fn a_run_given_back_while_a_flush_was_owed_comes_back_reusable() {
         .unwrap();
     restored.finish_restore().unwrap();
     // Waiting in the original, reusable here: the next shared memory takes it.
-    assert!(restored.shadow().released.is_empty());
+    assert_eq!(restored.shadow().released, []);
     assert_eq!(
         restored.shadow().reusable.iter().collect::<Vec<_>>(),
         [(&run.base(), &run.end())]
@@ -593,7 +593,7 @@ fn a_restored_page_gets_its_mappings_permission_and_its_ram() {
         space.tables.walk(LOW).map(|r| (r.pa, r.perms)),
         Ok((RAM_BASE, Perms::Read))
     );
-    assert!(space.shadow().pending.is_empty());
+    assert_eq!(space.shadow().pending.len(), 0);
     let mut byte = [0];
     space.read(LOW + 7, &mut byte).unwrap();
     assert_eq!(byte, [1]);
