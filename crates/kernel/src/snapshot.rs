@@ -8,6 +8,11 @@
 //! - A process's address space: [`crate::memory::AddressSpace::save`] and
 //!   [`crate::memory::AddressSpace::restore`] (`memory::space::snapshot`), with the magic
 //!   [`crate::memory::ADDRESS_SPACE_MAGIC`].
+//! - The object table, with each process's handle table and the hooked events:
+//!   [`crate::object::Objects::save`] and [`crate::object::Objects::restore`]
+//!   (`object::snapshot`), with the magic [`crate::object::OBJECTS_MAGIC`]. Its restore checks
+//!   each address space's locked memory against the transfer memories
+//!   ([`crate::memory::AddressSpace::check_lends`]).
 //!
 //! # Format
 //!

@@ -48,6 +48,13 @@ impl Hooks {
         hooks.insert(event, hook);
     }
 
+    /// The events with a hook, in id order: what a snapshot saves of the hooks
+    /// (`dispatch/snapshot.rs`).
+    pub(super) fn hooked(&self) -> Vec<ObjectId> {
+        let hooks = self.hooks.lock().unwrap_or_else(PoisonError::into_inner);
+        hooks.keys().copied().collect()
+    }
+
     /// The hook attached to `event`, if any.
     fn get(&self, event: ObjectId) -> Option<Arc<dyn EventHook>> {
         let hooks = self.hooks.lock().unwrap_or_else(PoisonError::into_inner);

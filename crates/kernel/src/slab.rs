@@ -352,6 +352,27 @@ impl<Id: SlabId, T> Slab<Id, T> {
         self.get(id).is_ok()
     }
 
+    /// Whether an [`insert`](Self::insert) has returned `id`: its row is live now or was freed
+    /// since. An id not issued yet may still be returned by a later insert (its slot is past
+    /// the end, or vacant or occupied under a generation below `id`'s), so a table that keeps
+    /// the id of a row that may be gone must take only an issued one. Generation zero is never
+    /// issued; a retired slot has issued every other generation.
+    #[must_use]
+    pub(crate) fn issued(&self, id: Id) -> bool {
+        let generation = id.generation();
+        if generation < FIRST_GENERATION {
+            return false;
+        }
+        match self.slots.get(id.index() as usize) {
+            None => false,
+            Some(Slot::Occupied {
+                generation: now, ..
+            }) => generation <= *now,
+            Some(Slot::Vacant { generation: next }) => generation < *next,
+            Some(Slot::Retired) => true,
+        }
+    }
+
     /// Frees the row `id` names and returns it. Every id minted for that row is stale afterwards.
     pub fn remove(&mut self, id: Id) -> Result<T, SlabError> {
         let Some(slot) = self.slots.get_mut(id.index() as usize) else {
@@ -374,6 +395,37 @@ impl<Id: SlabId, T> Slab<Id, T> {
                 Err(Self::stale(id))
             }
         }
+    }
+
+    /// The same slab with each row replaced by what `f` makes of it, called in slot order with
+    /// the row's id: every slot keeps its generation, and the free stack, the slot limit and the
+    /// live count are kept as they are, so every id names the same slot as before. How a table
+    /// turns its rows into their saved form and back. The first error `f` returns ends the walk
+    /// and is returned.
+    pub(crate) fn try_map<U, E>(
+        &self,
+        mut f: impl FnMut(Id, &T) -> Result<U, E>,
+    ) -> Result<Slab<Id, U>, E> {
+        let mut slots = Vec::with_capacity(self.slots.len());
+        for (slot, index) in self.slots.iter().zip(0_u32..) {
+            slots.push(match slot {
+                Slot::Vacant { generation } => Slot::Vacant {
+                    generation: *generation,
+                },
+                Slot::Occupied { generation, value } => Slot::Occupied {
+                    generation: *generation,
+                    value: f(Id::from_parts(index, *generation), value)?,
+                },
+                Slot::Retired => Slot::Retired,
+            });
+        }
+        Ok(Slab {
+            slots,
+            free: self.free.clone(),
+            max_slots: self.max_slots,
+            live: self.live,
+            _id: PhantomData,
+        })
     }
 
     /// Live rows in slot order (ascending index), with their ids.

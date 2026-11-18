@@ -232,12 +232,16 @@ pub struct HandleTable {
     max_count: u16,
 }
 
-/// The serialised form of a [`HandleTable`], and what deserialisation validates.
-#[derive(Deserialize)]
-struct HandleTableData {
+/// The serialised form of a [`HandleTable`], and what deserialisation validates
+/// ([`HandleTable::try_from`], which reports the exact [`HandleLayoutError`]): what the object
+/// table's snapshot saves of each process's handle table (`crate::object::snapshot`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct HandleTableData {
     entries: Vec<Option<Entry>>,
     free: Vec<u16>,
-    next_linear_id: u16,
+    /// The linear id the next `add` stamps; open to the crate so a snapshot's tests can damage
+    /// it.
+    pub(crate) next_linear_id: u16,
     max_count: u16,
 }
 
@@ -325,6 +329,28 @@ impl TryFrom<HandleTableData> for HandleTable {
 }
 
 impl HandleTable {
+    /// The table in its serialised form, field for field: what [`HandleTable::try_from`] takes
+    /// back.
+    pub(crate) fn data(&self) -> HandleTableData {
+        HandleTableData {
+            entries: self.entries.clone(),
+            free: self.free.clone(),
+            next_linear_id: self.next_linear_id,
+            max_count: self.max_count,
+        }
+    }
+
+    /// Every handle the table holds with the object it names, lowest index first.
+    pub(crate) fn entries(&self) -> impl Iterator<Item = (Handle, ObjectId)> + '_ {
+        self.entries
+            .iter()
+            .zip(0_u16..)
+            .filter_map(|(entry, index)| {
+                let entry = entry.as_ref()?;
+                Some((Handle::from_parts(index, entry.linear_id)?, entry.object))
+            })
+    }
+
     /// Every handle the table holds, lowest index first: the order in which
     /// `KHandleTable::Finalize` closes them (`eden/src/core/hle/kernel/k_handle_table.cpp` @
     /// cf654052, its loop over `m_table_size`).

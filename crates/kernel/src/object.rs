@@ -52,10 +52,23 @@
 //! ([`crate::svc::transfer_memory::unlock_released`]). No other call can run in between, so no
 //! guest sees the pages locked by an object that is gone. Test:
 //! `releasing_a_locked_transfer_memory_leaves_its_unlock_to_do`.
+//!
+//! # Snapshots
+//!
+//! [`snapshot`] saves and restores the table with each process's handle table and the hooked
+//! events ([`Objects::save`], [`Objects::restore`]), checking every relation a live kernel
+//! keeps.
 
 use std::num::NonZeroU32;
 
 use thiserror::Error;
+
+pub mod snapshot;
+
+pub use snapshot::{
+    HandleFault, HookFault, HookedEvent, KernelView, OBJECTS_MAGIC, OBJECTS_VERSION, ObjectFault,
+    ObjectSnapshotError, PendingObjects, RestoredObjects,
+};
 
 use crate::handle::{Closed, ObjectRefs, RefError};
 use crate::id::{ObjectId, ProcessId, ThreadId};

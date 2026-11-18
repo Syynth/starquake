@@ -28,7 +28,12 @@
 //! ([`Dispatcher::reattach_event_hook`](crate::dispatch::Dispatcher::reattach_event_hook), which
 //! takes only the writable end of an event that service's server made; owner's ruling of
 //! 2026-11-17). Tests: `a_hook_reattached_after_a_restore_runs_when_the_guest_signals`,
-//! `a_hook_is_reattached_only_to_a_writable_end_its_service_made`.
+//! `a_hook_is_reattached_only_to_a_writable_end_its_service_made`. The snapshot saves which
+//! events are hooked and by which service ([`crate::object::HookedEvent`], saved by
+//! [`Dispatcher::save_objects`](crate::dispatch::Dispatcher::save_objects)), and
+//! [`Dispatcher::unattached_event_hooks`](crate::dispatch::Dispatcher::unattached_event_hooks)
+//! names the ones no service has re-attached yet. Test:
+//! `a_saved_hook_is_named_by_the_restore_until_its_service_reattaches_it`.
 //!
 //! Eden has no such hook: its services signal and wait on their `KEvent`s from their own host
 //! threads. This is starquake's, from the kernel spec.

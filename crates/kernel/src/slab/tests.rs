@@ -601,3 +601,89 @@ fn errors_display_their_documented_text() {
         "entry 6 appears twice"
     );
 }
+
+#[test]
+fn a_mapped_slab_keeps_every_slot_and_the_free_order() {
+    let mut slab = TestSlab::new();
+    let ids: Vec<_> = (1..=6).map(|v| slab.insert(v * 7).unwrap()).collect();
+    slab.remove(ids[2]).unwrap();
+    slab.remove(ids[4]).unwrap();
+    let reused = slab.insert(99).unwrap();
+    slab.remove(ids[1]).unwrap();
+    slab.slots[0] = Slot::Retired;
+    slab.live -= 1;
+    // Each row is seen once, in slot order, with its id.
+    let mut seen = Vec::new();
+    let mapped: Slab<ObjectId, String> = slab
+        .try_map(|id, value| {
+            seen.push((id, *value));
+            Ok::<_, ()>(format!("{value}"))
+        })
+        .unwrap();
+    let rows: Vec<(ObjectId, i64)> = slab.iter().map(|(id, value)| (id, *value)).collect();
+    assert_eq!(seen, rows);
+    assert_eq!(rows, [(ids[3], 28), (reused, 99), (ids[5], 42)]);
+    // Every id names what it named, a freed or retired one nothing, and the next inserts take
+    // the same slots under the same generations.
+    for (id, value) in &rows {
+        assert_eq!(mapped.get(*id), Ok(&format!("{value}")));
+    }
+    for gone in [ids[0], ids[1], ids[2], ids[4]] {
+        assert!(!mapped.contains(gone));
+    }
+    assert_eq!(
+        (mapped.len(), mapped.max_slots()),
+        (slab.len(), slab.max_slots())
+    );
+    let mut mapped = mapped;
+    assert_eq!(mapped.insert("a".into()), slab.insert(0));
+    assert_eq!(mapped.insert("b".into()), slab.insert(0));
+    assert_eq!(mapped.insert("c".into()), slab.insert(0));
+}
+
+#[test]
+fn mapping_stops_at_the_first_error() {
+    let mut slab = TestSlab::new();
+    for value in [1, 2, 3, 4] {
+        slab.insert(value).unwrap();
+    }
+    let mut calls = 0;
+    let result: Result<Slab<ObjectId, i64>, i64> = slab.try_map(|_, value| {
+        calls += 1;
+        if *value >= 2 { Err(*value) } else { Ok(*value) }
+    });
+    assert_eq!((result, calls), (Err(2), 2));
+}
+
+#[test]
+fn an_id_is_issued_once_an_insert_has_returned_it() {
+    let mut slab = TestSlab::new();
+    let at = ObjectId::from_parts;
+    // Nothing yet: not even the first id a fresh slot gets, and never generation zero.
+    assert!(!slab.issued(at(0, FIRST_GENERATION)));
+    let first = slab.insert(1).unwrap();
+    assert_eq!(first, at(0, FIRST_GENERATION));
+    // Live: its own generation is issued, the next one and the slot past the end are not.
+    assert!(slab.issued(first));
+    assert!(!slab.issued(at(0, FIRST_GENERATION + 1)));
+    assert!(!slab.issued(at(0, 0)));
+    assert!(!slab.issued(at(1, FIRST_GENERATION)));
+    // Freed: still issued, while the generation the slot gives next is not.
+    slab.remove(first).unwrap();
+    assert!(slab.issued(first));
+    assert!(!slab.issued(at(0, FIRST_GENERATION + 1)));
+    assert!(!slab.issued(at(0, FIRST_GENERATION + 2)));
+    assert!(!slab.issued(at(0, 0)));
+    // Reused: both generations are issued, the one after them is not.
+    let second = slab.insert(2).unwrap();
+    assert_eq!(second, at(0, FIRST_GENERATION + 1));
+    assert!(slab.issued(first) && slab.issued(second));
+    assert!(!slab.issued(at(0, FIRST_GENERATION + 2)));
+    // A retired slot has issued every generation but zero.
+    slab.slots[0] = Slot::Retired;
+    slab.live -= 1;
+    assert!(slab.issued(at(0, u32::MAX)));
+    assert!(slab.issued(first));
+    assert!(!slab.issued(at(0, 0)));
+    assert!(!slab.issued(at(1, FIRST_GENERATION)));
+}

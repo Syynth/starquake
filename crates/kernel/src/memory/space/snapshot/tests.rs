@@ -22,6 +22,7 @@ use crate::snapshot::FormatError;
 
 mod alias;
 mod attribute;
+mod transfer;
 
 /// Fixed seed so a run is reproducible; failures are not persisted to disk.
 const PROPTEST_SEED: u64 = 0x5351_4153_534E_4150;

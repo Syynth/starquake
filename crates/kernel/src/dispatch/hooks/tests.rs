@@ -512,3 +512,106 @@ fn the_dispatcher_finds_a_live_transfer_memory_outside_any_request() {
         Err(KernelError::InvalidHandle)
     );
 }
+
+// ----- Snapshots (`dispatch/snapshot.rs`) -----------------------------------------------------
+
+#[test]
+fn a_saved_hook_is_named_by_the_restore_until_its_service_reattaches_it() {
+    let world = World::new();
+    let old = Arc::new(Counting::default());
+    let (handle, writable, _) = world.hooked_event(Arc::<Counting>::clone(&old));
+    // A plain event the server made, and a transfer memory the guest lends: neither is a hook.
+    plain_event(&world);
+    let mut regs = GuestRegs::default();
+    regs.x[1] = DATA;
+    regs.x[2] = PAGE_SIZE;
+    regs.x[3] = u64::from(crate::memory::SvcPermission::Read.bits());
+    world.call(SvcId::CreateTransferMemory, &mut regs);
+    assert_eq!(regs.x[0], 0);
+    let bytes = world.dispatcher.save_objects().unwrap();
+    let restored = world.dispatcher.restore_objects(&bytes).unwrap();
+    let hooked = [crate::object::HookedEvent {
+        event: writable,
+        service: SERVICE,
+    }];
+    assert_eq!(restored.hooked, hooked);
+    world
+        .dispatcher
+        .with::<(&HandleTable, &Scheduler), _>(|(handles, scheduler)| {
+            assert_eq!(&restored.objects, scheduler.objects());
+            assert_eq!(restored.handles[0].1, *handles);
+        });
+    // Restored, no hook is attached until the service re-attaches it.
+    assert_eq!(world.dispatcher.unattached_event_hooks(&hooked), []);
+    world.dispatcher.forget_event_hooks();
+    assert_eq!(world.dispatcher.unattached_event_hooks(&hooked), hooked);
+    let new = Arc::new(Counting::default());
+    let attached: Arc<dyn EventHook> = Arc::<Counting>::clone(&new);
+    world
+        .dispatcher
+        .reattach_event_hook(SERVICE, writable, attached)
+        .unwrap();
+    assert_eq!(world.dispatcher.unattached_event_hooks(&hooked), []);
+    // Saved again, the bytes are the same: the hook is saved by its event, not by its code.
+    assert_eq!(world.dispatcher.save_objects(), Ok(bytes));
+    assert_eq!(world.call_with_handle(SvcId::SignalEvent, handle), 0);
+    assert_eq!((old.signalled(), new.signalled()), (vec![], vec![writable]));
+}
+
+#[test]
+fn a_hook_on_an_event_no_server_made_is_refused_and_one_on_a_gone_event_left_out() {
+    let world = World::new();
+    let (writable, readable) = world
+        .dispatcher
+        .with::<(&mut Scheduler,), _>(|(scheduler,)| {
+            let (writable, readable) = scheduler.create_event().unwrap();
+            world.dispatcher.hooks.attach(
+                scheduler.objects(),
+                writable,
+                Arc::new(Counting::default()),
+            );
+            (writable, readable)
+        });
+    assert_eq!(
+        world.dispatcher.save_objects(),
+        Err(crate::object::ObjectSnapshotError::HookWithoutServer { event: writable })
+    );
+    // Its event gone, the hook is left out.
+    world
+        .dispatcher
+        .with::<(&mut Scheduler,), _>(|(scheduler,)| {
+            scheduler.close_object(writable).unwrap();
+            scheduler.close_object(readable).unwrap();
+        });
+    assert_eq!(world.dispatcher.hooks.len(), 1);
+    let bytes = world.dispatcher.save_objects().unwrap();
+    assert_eq!(world.dispatcher.restore_objects(&bytes).unwrap().hooked, []);
+}
+
+#[test]
+fn a_snapshot_is_checked_against_the_dispatchers_own_tables() {
+    // A snapshot of one world, checked against another whose server never made its event.
+    let saved = World::new();
+    saved.hooked_event(Arc::new(Counting::default()));
+    let bytes = saved.dispatcher.save_objects().unwrap();
+    // The session the guest connected with, the first object the other world's IPC table
+    // does not hold.
+    let session = saved
+        .dispatcher
+        .with::<(&HandleTable, &Scheduler), _>(|(handles, scheduler)| {
+            handles
+                .entries()
+                .map(|(_, object)| object)
+                .find(|object| matches!(scheduler.objects().get(*object), Ok(Object::Session)))
+                .unwrap()
+        });
+    let other = World::new();
+    assert_eq!(
+        other.dispatcher.restore_objects(&bytes).unwrap_err(),
+        crate::object::ObjectSnapshotError::Object {
+            object: session,
+            fault: crate::object::ObjectFault::Session
+        }
+    );
+    assert!(saved.dispatcher.restore_objects(&bytes).is_ok());
+}

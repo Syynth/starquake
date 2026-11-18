@@ -11,7 +11,8 @@
 //! Structure (`docs/specs/kernel.md`): kernel state lives in a few tables, objects refer to each
 //! other by typed ids, system calls declare the tables they touch, and only the dispatcher locks.
 //! The tables are saved and restored for snapshots table by table, with the header in
-//! [`snapshot`]; so far a process's address space has one.
+//! [`snapshot`]; so far a process's address space has one, and so does the object table with
+//! each process's handle table ([`object::snapshot`]).
 
 pub mod dispatch;
 pub mod handle;

@@ -556,7 +556,7 @@ fn each_part_of_the_destination_check_refuses_on_its_own() {
     // hold (it refuses `Uncached`, `GpuAccessible` and `PermissionLocked` there, since `Stack`
     // has neither `CanChangeAttribute` nor `CanPermissionLock`:
     // `an_uncached_destination_is_refused_by_the_block_check_first`). Which transfer memory
-    // holds a `Locked` range is #260's to check.
+    // holds a `Locked` range is check 11's (`snapshot::transfer`).
     let locked = MemoryAttribute::LOCKED.bits();
     let destination = page(stack, 2);
     let cases: Vec<(&str, BodyChange)> = vec![
