@@ -1126,7 +1126,7 @@ fn a_server_in_mid_start_up_saves_and_restores() {
     let saved = rig.server.save().unwrap();
 
     let mut restored = oe_server(AppletSettings::eden_default(), UnknownPolicy::Strict);
-    restored.restore(&saved).unwrap();
+    restored.restore_beside(&saved, &rig.kernel).unwrap();
     assert_eq!(restored.family::<Applet>(), Some(&rig.applet()));
     assert_eq!(restored.interface_count(), rig.server.interface_count());
     assert_eq!(restored.save().unwrap(), saved);
@@ -1141,7 +1141,7 @@ fn a_restored_server_answers_with_the_saved_applet_resource_user_id() {
 
     // The restored server takes the rig's place, on the same kernel and session.
     let mut restored = oe_server(AppletSettings::eden_default(), UnknownPolicy::Strict);
-    restored.restore(&saved).unwrap();
+    restored.restore_beside(&saved, &rig.kernel).unwrap();
     rig.server = restored;
 
     // The window controller opened before the save.
@@ -1174,7 +1174,9 @@ fn a_failed_signal_still_keeps_the_lifecycle_change() {
     let mut fresh = Rig::new();
     assert_eq!(fresh.session, rig.session);
     assert_eq!(fresh.kernel.signals(event), None);
-    fresh.server.restore(&saved).unwrap();
+    // Restored beside the kernel that made the event, so the restore's check passes; the
+    // commands then run on the fresh kernel, which did not make it.
+    fresh.server.restore_beside(&saved, &rig.kernel).unwrap();
     assert!(!fresh.applet().lifecycle().notifications.focus_state_changed);
 
     // Notify on, with a focus change pending: a message becomes available, and the signal fails.
@@ -1203,7 +1205,9 @@ fn a_failed_clear_still_keeps_the_lifecycle_change() {
     // A fresh kernel did not make the event, so the server may not clear it.
     let mut fresh = Rig::new();
     assert_eq!(fresh.kernel.is_signalled(event), None);
-    fresh.server.restore(&saved).unwrap();
+    // Restored beside the kernel that made the event, so the restore's check passes; the
+    // commands then run on the fresh kernel, which did not make it.
+    fresh.server.restore_beside(&saved, &rig.kernel).unwrap();
     let off = fresh.object(controller, SET_FOCUS_HANDLING_MODE, &[0, 0, 1]);
     assert_eq!(off.result, KernelError::InvalidHandle.code());
     let lifecycle = fresh.applet().lifecycle().clone();
@@ -1406,7 +1410,7 @@ fn a_restored_server_still_hands_out_sessions_on_the_graphics_server() {
     let controller = rig.open(proxy, GET_SELF_CONTROLLER);
     let saved = rig.server.save().unwrap();
     let mut restored = oe_server_with(Some(GRAPHICS));
-    restored.restore(&saved).unwrap();
+    restored.restore_beside(&saved, &rig.kernel).unwrap();
     assert_eq!(
         restored.family::<Applet>().unwrap().graphics_server(),
         Some(GRAPHICS)
@@ -1440,7 +1444,7 @@ fn a_snapshot_with_another_graphics_server_is_refused() {
         let mut restored = oe_server_with(run);
         let refused = SnapshotError::FamilyWiring("its applet names another graphics server");
         assert_eq!(
-            restored.restore(&saved),
+            restored.restore_beside(&saved, &kernel),
             Err(refused.clone()),
             "{saved_with:?} {run:?}"
         );
@@ -1458,7 +1462,7 @@ fn a_snapshot_with_another_graphics_server_is_refused() {
         saving.accept(kernel.new_object()).unwrap();
         let saved = saving.save().unwrap();
         let mut restored = oe_server_with(graphics);
-        restored.restore(&saved).unwrap();
+        restored.restore_beside(&saved, &kernel).unwrap();
         assert_eq!(restored.session_count(), 1, "{graphics:?}");
     }
 }
@@ -2003,7 +2007,7 @@ fn a_server_with_the_switch_2_interfaces_saves_and_restores() {
     let saved = rig.server.save().unwrap();
 
     let mut restored = oe_server(AppletSettings::eden_default(), UnknownPolicy::Strict);
-    restored.restore(&saved).unwrap();
+    restored.restore_beside(&saved, &rig.kernel).unwrap();
     assert_eq!(restored.family::<Applet>(), Some(&rig.applet()));
     assert_eq!(restored.save().unwrap(), saved);
     rig.server = restored;
@@ -2343,7 +2347,7 @@ fn a_server_after_the_titles_start_up_commands_saves_and_restores() {
     let saved = rig.server.save().unwrap();
 
     let mut restored = oe_server(AppletSettings::eden_default(), UnknownPolicy::Strict);
-    restored.restore(&saved).unwrap();
+    restored.restore_beside(&saved, &rig.kernel).unwrap();
     assert_eq!(restored.family::<Applet>(), Some(&rig.applet()));
     assert_eq!(restored.save().unwrap(), saved);
     rig.server = restored;
@@ -2420,7 +2424,9 @@ fn a_restored_event_the_kernel_did_not_make_is_refused() {
                 assert_eq!(fresh.kernel.new_object(), event);
             }
             assert_eq!(fresh.kernel.signals(event), None);
-            fresh.server.restore(&saved).unwrap();
+            // Restored beside the kernel that made the event, so the restore's check passes;
+            // the command then runs on the fresh kernel, which did not make it.
+            fresh.server.restore_beside(&saved, &rig.kernel).unwrap();
             let before = fresh.applet();
             let handles = fresh.kernel.handle_count();
             for _ in 0..2 {
@@ -2449,7 +2455,7 @@ fn a_restored_event_the_kernel_made_is_copied_unchanged() {
         let event = kept(&rig.applet()).unwrap();
         let saved = rig.server.save().unwrap();
         let mut restored = oe_server(AppletSettings::eden_default(), UnknownPolicy::Strict);
-        restored.restore(&saved).unwrap();
+        restored.restore_beside(&saved, &rig.kernel).unwrap();
         rig.server = restored;
 
         let raw = rig.object_raw(object, command, &[]);
@@ -2488,13 +2494,28 @@ fn applet_with_distinct_events() -> Applet {
     applet
 }
 
-/// A restore with `applet` as the snapshot's family state, into a fresh server: the result,
-/// and the server.
+/// A restore with `applet` as the snapshot's family state, into a fresh server, beside a kernel
+/// that holds every event the applet names ([`EveryEvent`]): the result, and the server.
 fn restore_applet(applet: Applet) -> (Result<(), SnapshotError>, Server) {
     let saved = oe_server_for(applet, UnknownPolicy::Strict).save().unwrap();
     let mut server = oe_server(AppletSettings::eden_default(), UnknownPolicy::Strict);
-    let result = server.restore(&saved);
+    let result = server.restore_beside(&saved, &EveryEvent);
     (result, server)
+}
+
+/// A kernel, for tests of what a restore refuses before it asks the kernel, that answers every
+/// id as a live readable event of every server's, and no id as a shared memory: so only the
+/// checks before the kernel's can refuse.
+struct EveryEvent;
+
+impl RestoredKernel for EveryEvent {
+    fn is_service_readable_event(&self, _: ServiceId, _: ObjectId) -> bool {
+        true
+    }
+
+    fn shared_memory(&self, _: ObjectId) -> Option<starquake_kernel::memory::SharedMemory> {
+        None
+    }
 }
 
 /// Live operation makes each kept event once, so the four ids are distinct; a snapshot that
@@ -2548,7 +2569,7 @@ fn a_snapshot_whose_unknown_event_is_the_message_event_is_refused() {
     let saved = oe_server_for(forged, UnknownPolicy::Strict).save().unwrap();
     let before = rig.applet();
     assert_eq!(
-        rig.server.restore(&saved),
+        rig.server.restore_beside(&saved, &rig.kernel),
         Err(SnapshotError::Decode(postcard::Error::SerdeDeCustom))
     );
     assert_eq!(rig.applet(), before);
@@ -2893,7 +2914,7 @@ fn a_restored_queue_is_delivered_in_order_after_the_flags() {
     let saved = rig.server.save().unwrap();
 
     let mut restored = oe_server(AppletSettings::eden_default(), UnknownPolicy::Strict);
-    restored.restore(&saved).unwrap();
+    restored.restore_beside(&saved, &rig.kernel).unwrap();
     assert_eq!(restored.family::<Applet>(), Some(&rig.applet()));
     assert_eq!(restored.save().unwrap(), saved);
     rig.server = restored;
@@ -2939,7 +2960,7 @@ fn a_snapshot_with_an_invalid_queued_message_is_refused() {
         let mut bytes = saved.clone();
         bytes[at] = word;
         let mut server = oe_server(AppletSettings::eden_default(), UnknownPolicy::Strict);
-        let result = server.restore(&bytes);
+        let result = server.restore_beside(&bytes, &FakeKernel::new(0).unwrap());
         (result, server)
     };
     let refused = SnapshotError::Decode(postcard::Error::SerdeDeCustom);
@@ -2983,7 +3004,9 @@ fn a_failed_clear_leaves_the_message_to_be_received_again() {
 
     let mut fresh = Rig::new();
     assert_eq!(fresh.kernel.is_signalled(event), None);
-    fresh.server.restore(&saved).unwrap();
+    // Restored beside the kernel that made the event, so the restore's check passes; the
+    // commands then run on the fresh kernel, which did not make it.
+    fresh.server.restore_beside(&saved, &rig.kernel).unwrap();
     let before = fresh.applet();
     assert!(before.lifecycle().has_focus_state_changed);
     for _ in 0..2 {
@@ -2998,7 +3021,9 @@ fn a_failed_clear_leaves_the_message_to_be_received_again() {
     let (_, getter, _) = rig.getter_with_event();
     let saved = rig.server.save().unwrap();
     let mut fresh = Rig::new();
-    fresh.server.restore(&saved).unwrap();
+    // Restored beside the kernel that made the event, so the restore's check passes; the
+    // commands then run on the fresh kernel, which did not make it.
+    fresh.server.restore_beside(&saved, &rig.kernel).unwrap();
     let first = fresh.object_raw(getter, RECEIVE_MESSAGE, &[]);
     assert_eq!(first, message_reply(AppletMessage::FocusStateChanged));
 }
@@ -3018,7 +3043,9 @@ fn with_no_message_pending_nothing_clears_the_message_event() {
 
     let mut fresh = Rig::new();
     assert_eq!(fresh.kernel.is_signalled(event), None);
-    fresh.server.restore(&saved).unwrap();
+    // Restored beside the kernel that made the event, so the restore's check passes; the
+    // commands then run on the fresh kernel, which did not make it.
+    fresh.server.restore_beside(&saved, &rig.kernel).unwrap();
     assert!(!fresh.applet().lifecycle().message_available());
     for _ in 0..2 {
         let none = fresh.object_raw(getter, RECEIVE_MESSAGE, &[]);
@@ -3043,7 +3070,9 @@ fn with_a_message_still_pending_nothing_signals_the_message_event() {
 
     let mut fresh = Rig::new();
     assert_eq!(fresh.kernel.is_signalled(event), None);
-    fresh.server.restore(&saved).unwrap();
+    // Restored beside the kernel that made the event, so the restore's check passes; the
+    // commands then run on the fresh kernel, which did not make it.
+    fresh.server.restore_beside(&saved, &rig.kernel).unwrap();
     let on = fresh.object(controller, SET_FOCUS_HANDLING_MODE, &[1, 0, 1]);
     assert_eq!(on.result, ResultCode::SUCCESS);
     assert!(fresh.applet().lifecycle().message_available());
@@ -3425,7 +3454,7 @@ fn a_server_after_the_later_start_up_commands_saves_and_restores() {
     let saved = rig.server.save().unwrap();
 
     let mut restored = oe_server(AppletSettings::eden_default(), UnknownPolicy::Strict);
-    restored.restore(&saved).unwrap();
+    restored.restore_beside(&saved, &rig.kernel).unwrap();
     assert_eq!(restored.family::<Applet>(), Some(&rig.applet()));
     assert_eq!(restored.save().unwrap(), saved);
     rig.server = restored;

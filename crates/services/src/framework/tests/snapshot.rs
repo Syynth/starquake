@@ -10,13 +10,14 @@ use serde::{Deserialize, Serialize};
 use starquake_ipc::{BUFFER_SIZE, RequestBuilder};
 use starquake_kernel::id::ObjectId;
 use starquake_kernel::result::ResultCode;
-use starquake_trace::InterfaceName;
+use starquake_trace::{InterfaceName, ServiceId};
 
 use super::super::defer::{Framing, Pending, TokenId};
 use super::super::targets::Domain;
+use super::super::fake::FakeKernel;
 use super::super::{
-    Admission, DEFAULT_WORKERS, Interfaces, Reply, ReplyToken, RequestQueue, SNAPSHOT_MAGIC,
-    SNAPSHOT_VERSION, Server, SnapshotError, UnknownPolicy,
+    Admission, DEFAULT_WORKERS, Interfaces, Kernel, Reply, ReplyToken, RequestQueue,
+    RestoredKernel, SNAPSHOT_MAGIC, SNAPSHOT_VERSION, Server, SnapshotError, UnknownPolicy,
 };
 use super::{
     Mute, Rig, Tally, Toy, Wakes, child, domain_request, parked, parked_one, request, toy,
@@ -546,6 +547,168 @@ fn a_checked_family_is_restored_only_when_its_check_passes() {
         .with_family(Wide { a: 3, b: 4 });
     assert_eq!(unchecked.restore(&saved), Ok(()));
     assert_eq!(state(&unchecked), Some((1, 2)));
+}
+
+/// Family state that keeps a kernel object: `a` is the run's wiring ([`same_keeps_a`]), and
+/// `event` an event the server made ([`kept_event`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Keeps {
+    a: u64,
+    event: ObjectId,
+}
+
+/// The wiring check of [`Keeps`].
+fn same_keeps_a(run: &Keeps, saved: &Keeps) -> Result<(), &'static str> {
+    if run.a == saved.a {
+        Ok(())
+    } else {
+        Err("another a")
+    }
+}
+
+/// The object check of [`Keeps`]: its event is a live readable event of the server's.
+fn kept_event(
+    saved: &Keeps,
+    kernel: &dyn RestoredKernel,
+    service: ServiceId,
+) -> Result<(), &'static str> {
+    if kernel.is_service_readable_event(service, saved.event) {
+        Ok(())
+    } else {
+        Err("its event is not one")
+    }
+}
+
+/// The number the servers of [`a_family_s_objects_are_checked_beside_the_kernel`] are known by:
+/// not the default, so a check asked about another number fails.
+const KEEPER: ServiceId = ServiceId(7);
+
+/// A family's object check runs in `restore_beside` with the kernel given and the number the
+/// server is known by, after the wiring check and before the state loads: a refusal is
+/// [`SnapshotError::FamilyObject`] and leaves the server as it was; `restore` refuses such a
+/// server's snapshots with [`SnapshotError::NeedsKernel`] whatever they hold; and a later
+/// `with_family` or `with_checked_family` drops the check.
+#[test]
+fn a_family_s_objects_are_checked_beside_the_kernel() {
+    let mut kernel = FakeKernel::new(0).unwrap();
+    kernel.set_current_service(KEEPER);
+    let own = kernel.create_event().unwrap();
+    kernel.set_current_service(ServiceId(KEEPER.0 + 1));
+    let others = kernel.create_event().unwrap();
+    let initial = Keeps { a: 1, event: own };
+    let bare = || {
+        Server::new("toy", UnknownPolicy::Strict)
+            .with_interfaces(toy_interfaces())
+            .with_service_id(KEEPER)
+    };
+    let saved = |keeps: Keeps| bare().with_family(keeps).save().unwrap();
+    let checked = || {
+        bare()
+            .with_checked_family(initial.clone(), same_keeps_a)
+            .with_family_objects(kept_event)
+    };
+    let state = |server: &Server| server.family::<Keeps>().cloned();
+    let refused = SnapshotError::FamilyObject("its event is not one");
+
+    // The server's own event, beside the kernel that made it: loaded.
+    let good = Keeps { a: 1, event: own };
+    let mut server = checked();
+    assert_eq!(server.restore_beside(&saved(good.clone()), &kernel), Ok(()));
+    assert_eq!(state(&server), Some(good.clone()));
+
+    // Another server's event: refused, and the server keeps its state.
+    let bad = Keeps { a: 1, event: others };
+    let mut server = checked();
+    assert_eq!(
+        server.restore_beside(&saved(bad.clone()), &kernel),
+        Err(refused.clone())
+    );
+    assert_eq!(state(&server), Some(initial.clone()));
+    // The next restore of a good snapshot succeeds.
+    assert_eq!(server.restore_beside(&saved(good.clone()), &kernel), Ok(()));
+
+    // The number asked is the server's: one known by the other number takes the other's event
+    // and refuses its own.
+    let other = || {
+        Server::new("toy", UnknownPolicy::Strict)
+            .with_interfaces(toy_interfaces())
+            .with_service_id(ServiceId(KEEPER.0 + 1))
+            .with_family(initial.clone())
+            .with_family_objects(kept_event)
+    };
+    assert_eq!(other().restore_beside(&saved(bad.clone()), &kernel), Ok(()));
+    assert_eq!(
+        other().restore_beside(&saved(good.clone()), &kernel),
+        Err(refused.clone())
+    );
+
+    // Both faults at once: the wiring check is first.
+    let both = Keeps { a: 2, event: others };
+    assert_eq!(
+        checked().restore_beside(&saved(both), &kernel),
+        Err(SnapshotError::FamilyWiring("another a"))
+    );
+
+    // Without a kernel, refused whatever the snapshot holds, after the wiring check.
+    let mut server = checked();
+    assert_eq!(
+        server.restore(&saved(good.clone())),
+        Err(SnapshotError::NeedsKernel)
+    );
+    assert_eq!(state(&server), Some(initial.clone()));
+    assert_eq!(
+        server.restore(&saved(Keeps { a: 2, event: own })),
+        Err(SnapshotError::FamilyWiring("another a"))
+    );
+
+    // A later `with_family` or `with_checked_family` drops the object check: `restore` loads.
+    let mut dropped = checked().with_family(initial.clone());
+    assert_eq!(dropped.restore(&saved(bad.clone())), Ok(()));
+    assert_eq!(state(&dropped), Some(bad.clone()));
+    let mut dropped = bare()
+        .with_family(initial.clone())
+        .with_family_objects(kept_event)
+        .with_checked_family(initial.clone(), same_keeps_a);
+    assert_eq!(dropped.restore(&saved(bad.clone())), Ok(()));
+    assert_eq!(state(&dropped), Some(bad));
+
+    // State that does not decode as the check's type is the decoder's error, and changes
+    // nothing.
+    let mut wrong = bare()
+        .with_family(initial.clone())
+        .with_family_objects(|_: &u8, _: &dyn RestoredKernel, _: ServiceId| Ok(()));
+    assert_eq!(
+        wrong.restore_beside(&saved(good), &kernel),
+        Err(SnapshotError::Decode(postcard::Error::DeserializeBadEncoding))
+    );
+    assert_eq!(state(&wrong), Some(initial));
+}
+
+/// A server with no object check is restored by `restore_beside` as by `restore`: the kernel
+/// is not asked.
+#[test]
+fn restore_beside_without_an_object_check_is_restore() {
+    let (rig, _) = deferred_rig();
+    let saved = rig.server.save().unwrap();
+    assert!(restores(&saved));
+    let wakes = Arc::new(Wakes::default());
+    let mut fresh = toy_server(UnknownPolicy::Strict, &wakes);
+    assert_eq!(fresh.restore_beside(&saved, &NoKernel), Ok(()));
+    assert_eq!(fresh.save().unwrap(), saved);
+    drop(parked());
+}
+
+/// A kernel no restore may ask: each question panics.
+struct NoKernel;
+
+impl RestoredKernel for NoKernel {
+    fn is_service_readable_event(&self, _: ServiceId, _: ObjectId) -> bool {
+        unreachable!("a server with no object check asked the kernel")
+    }
+
+    fn shared_memory(&self, _: ObjectId) -> Option<starquake_kernel::memory::SharedMemory> {
+        unreachable!("a server with no object check asked the kernel")
+    }
 }
 
 #[test]

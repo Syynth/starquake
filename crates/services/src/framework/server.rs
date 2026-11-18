@@ -23,6 +23,7 @@ use super::payload::Writer;
 use super::queue::{Admission, QueueError, RequestQueue};
 use super::reply::{Copied, Moved, Reply};
 use super::request::Request;
+use super::restored::RestoredKernel;
 use super::result::{
     Completion, DEFERRED_REPLY_DROPPED, Fault, NOT_SUPPORTED, OUT_OF_DOMAIN_ENTRIES,
     TARGET_NOT_FOUND, UNKNOWN_COMMAND_ID,
@@ -301,6 +302,12 @@ type Root = Box<dyn Fn() -> Box<dyn Session> + Send>;
 /// loads it: see [`Server::with_checked_family`].
 pub(super) type FamilyCheck = Box<dyn Fn(&dyn Family, &[u8]) -> Result<(), SnapshotError> + Send>;
 
+/// Checks the kernel objects a snapshot's family state (its bytes) names against the kernel the
+/// server is restored beside, given the server's own number: see
+/// [`Server::with_family_objects`].
+pub(super) type ObjectCheck =
+    Box<dyn Fn(&[u8], &dyn RestoredKernel, ServiceId) -> Result<(), SnapshotError> + Send>;
+
 /// One service family's sessions and the interfaces behind them: the Rust side of a server
 /// (`docs/specs/services.md`, "Concurrency").
 ///
@@ -317,6 +324,8 @@ pub struct Server {
     pub(super) family: Option<Box<dyn Family>>,
     /// The check a snapshot's family state must pass before it is loaded; not saved.
     pub(super) family_check: Option<FamilyCheck>,
+    /// The check of the kernel objects a snapshot's family state names; not saved.
+    pub(super) family_objects: Option<ObjectCheck>,
     pub(super) sessions: BTreeMap<ObjectId, TargetId>,
     pub(super) targets: Targets,
     pub(super) queue: RequestQueue,
@@ -352,6 +361,7 @@ impl Server {
             interfaces: Interfaces::new(),
             family: None,
             family_check: None,
+            family_objects: None,
             sessions: BTreeMap::new(),
             targets: Targets::default(),
             queue: RequestQueue::new(),
@@ -401,11 +411,13 @@ impl Server {
     }
 
     /// Sets the family's own state: what all the server's sessions share, reached with
-    /// [`Context::family`]. It is saved once in the server's snapshot.
+    /// [`Context::family`]. It is saved once in the server's snapshot. It drops a check set
+    /// before it ([`Server::with_checked_family`], [`Server::with_family_objects`]).
     #[must_use]
     pub fn with_family(mut self, family: impl Family) -> Self {
         self.family = Some(Box::new(family));
         self.family_check = None;
+        self.family_objects = None;
         self
     }
 
@@ -415,7 +427,7 @@ impl Server {
     /// [`SnapshotError::FamilyWiring`], leaving the server as it was. It is for state that is
     /// the run's wiring rather than the guest's (a number another server is known by), which
     /// a snapshot must agree with but cannot change. A later [`Server::with_family`] drops the
-    /// check.
+    /// check, and this drops a [`Server::with_family_objects`] check set before it.
     #[must_use]
     pub fn with_checked_family<T: Family + DeserializeOwned>(
         mut self,
@@ -423,6 +435,7 @@ impl Server {
         check: fn(&T, &T) -> Result<(), &'static str>,
     ) -> Self {
         self.family = Some(Box::new(family));
+        self.family_objects = None;
         self.family_check = Some(Box::new(move |current: &dyn Family, saved: &[u8]| {
             let current: &dyn core::any::Any = current;
             // The check is set with the family and dropped with it, so the family is a `T`.
@@ -432,6 +445,34 @@ impl Server {
             let saved: T = decode(saved).map_err(SnapshotError::Decode)?;
             check(current, &saved).map_err(SnapshotError::FamilyWiring)
         }));
+        self
+    }
+
+    /// Adds a check of the kernel objects the family's state names, for the family set before
+    /// it ([`Server::with_family`], [`Server::with_checked_family`], which drop it if called
+    /// later). A snapshot's family state is decoded as `S` (the form the family saves: the
+    /// family's own type, or the part of it that is saved) and given to `check` with the kernel
+    /// the server is restored beside and the number the server is known by
+    /// ([`Server::with_service_id`]); an `Err` refuses the snapshot with
+    /// [`SnapshotError::FamilyObject`], leaving the server as it was.
+    ///
+    /// It runs in [`Server::restore_beside`], after the family's wiring check
+    /// ([`Server::with_checked_family`]) and before the state loads ([`Family::load_state`]).
+    /// A server with this check is restored only beside a kernel: [`Server::restore`] refuses
+    /// its snapshots with [`SnapshotError::NeedsKernel`]. Saving runs no such check: the ids a
+    /// live family keeps are the ones the kernel handed it, and the server keeps its creator's
+    /// reference to each, so they stay live.
+    #[must_use]
+    pub fn with_family_objects<S: DeserializeOwned + 'static>(
+        mut self,
+        check: fn(&S, &dyn RestoredKernel, ServiceId) -> Result<(), &'static str>,
+    ) -> Self {
+        self.family_objects = Some(Box::new(
+            move |saved: &[u8], kernel: &dyn RestoredKernel, service: ServiceId| {
+                let saved: S = decode(saved).map_err(SnapshotError::Decode)?;
+                check(&saved, kernel, service).map_err(SnapshotError::FamilyObject)
+            },
+        ));
         self
     }
 

@@ -101,11 +101,14 @@ use starquake_kernel::id::ObjectId;
 use starquake_kernel::memory::SvcPermission;
 use starquake_kernel::result::{KernelError, ResultCode};
 
+use starquake_trace::ServiceId;
+
 use crate::commands;
 use crate::framework::result::{INVALID_CMIF_REQUEST, code};
 use crate::framework::{
-    Context, Fault, Interfaces, Outcome, Reply, Request, Server, UnknownPolicy,
+    Context, Fault, Interfaces, Outcome, Reply, Request, RestoredKernel, Server, UnknownPolicy,
 };
+use crate::shared_image::{self, Refusals};
 
 pub mod shared_memory;
 
@@ -165,8 +168,9 @@ impl IAppletResource {
 /// shared memory (module docs, "The applet resources"). At most [`ARUID_INDEX_MAX`] rows.
 ///
 /// It is saved in a snapshot, so it derives `serde`. Deserialising goes through
-/// `AppletResourcesData`, which checks the one bound the server's own commands keep,
-/// [`ARUID_INDEX_MAX`] rows.
+/// `AppletResourcesData`, which checks what the server's own commands keep without a kernel:
+/// at most [`ARUID_INDEX_MAX`] rows, then no memory kept by two rows. A restore then checks
+/// each memory against the kernel (module docs, "Restoring").
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "AppletResourcesData")]
 pub struct AppletResources {
@@ -190,6 +194,14 @@ pub enum AppletResourcesLayoutError {
         /// The rows in the data.
         count: usize,
     },
+    /// Two rows keep one memory: `CreateAppletResource` makes each id a memory of its own.
+    #[error("applet resource user ids {first:#x} and {second:#x} keep one memory")]
+    SharedMemory {
+        /// The lower of the two ids.
+        first: u64,
+        /// The higher: the first row, in id order, whose memory an earlier row keeps.
+        second: u64,
+    },
 }
 
 impl TryFrom<AppletResourcesData> for AppletResources {
@@ -199,6 +211,16 @@ impl TryFrom<AppletResourcesData> for AppletResources {
         let count = data.memories.len();
         if count > ARUID_INDEX_MAX {
             return Err(AppletResourcesLayoutError::TooManyRows { count });
+        }
+        let mut kept = BTreeMap::new();
+        for (&aruid, &memory) in &data.memories {
+            if let Some(&first) = kept.get(&memory) {
+                return Err(AppletResourcesLayoutError::SharedMemory {
+                    first,
+                    second: aruid,
+                });
+            }
+            kept.insert(memory, aruid);
         }
         Ok(Self {
             memories: data.memories,
@@ -308,4 +330,31 @@ pub fn server(policy: UnknownPolicy) -> Server {
         .with_root(|| Box::new(IHidServer))
         .with_interfaces(interfaces())
         .with_family(AppletResources::default())
+        .with_family_objects(applet_resource_memories)
+}
+
+/// What a restore answers for a row's memory that fails [`shared_image::check_restored`].
+const MEMORY_REFUSALS: Refusals = Refusals {
+    not_shared_memory: "a hid applet resource's memory is not a live shared memory",
+    size: "a hid applet resource's memory is not the size of the input shared memory",
+    permission: "a hid applet resource's memory is not mapped read-only",
+};
+
+/// The restore check of the kernel objects the `hid` server's table keeps (module docs,
+/// "Restoring"): each row's memory, in id order, is a live shared memory of the input shared
+/// memory's size, mapped read-only, as [`make_memory`] makes one.
+fn applet_resource_memories(
+    saved: &AppletResources,
+    kernel: &dyn RestoredKernel,
+    _service: ServiceId,
+) -> Result<(), &'static str> {
+    saved.memories.values().try_for_each(|memory| {
+        shared_image::check_restored(
+            kernel,
+            *memory,
+            shared_memory::SIZE,
+            SvcPermission::Read,
+            &MEMORY_REFUSALS,
+        )
+    })
 }

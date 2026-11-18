@@ -205,8 +205,8 @@ use serde::{Deserialize, Serialize};
 use starquake_kernel::id::ObjectId;
 use starquake_services::commands;
 use starquake_services::framework::{
-    Context, Family, Fault, Interfaces, NOT_SUPPORTED, Outcome, Reply, Request, Server,
-    SnapshotError, UnknownPolicy,
+    Context, Family, Fault, Interfaces, NOT_SUPPORTED, Outcome, Reply, Request, RestoredKernel,
+    Server, SnapshotError, UnknownPolicy,
 };
 use starquake_trace::ServiceId;
 
@@ -1228,6 +1228,40 @@ fn root_server_over(family: RootFamily, policy: UnknownPolicy) -> Server {
         .with_root(|| Box::new(GsvRoot))
         .with_interfaces(root_interfaces())
         .with_family(family)
+        .with_family_objects(syncpoint_event_objects)
+}
+
+/// The restore check of the kernel objects a [`RootState`] keeps (module docs, "Restoring"):
+/// each of 204's events it keeps is a live readable event the root's server made, as
+/// `syncpoint_events` makes them, the first before the second.
+fn syncpoint_event_objects(
+    saved: &RootState,
+    kernel: &dyn RestoredKernel,
+    service: ServiceId,
+) -> Result<(), &'static str> {
+    let (first, second) = match saved.syncpoint_events {
+        SyncpointEvents::None => (None, None),
+        SyncpointEvents::One(first) => (Some(first), None),
+        SyncpointEvents::Both(first, second) => (Some(first), Some(second)),
+    };
+    let kept = [
+        (
+            first,
+            "its root's first syncpoint event is not a live readable event its server made",
+        ),
+        (
+            second,
+            "its root's second syncpoint event is not a live readable event its server made",
+        ),
+    ];
+    for (event, refusal) in kept {
+        if let Some(event) = event
+            && !kernel.is_service_readable_event(service, event)
+        {
+            return Err(refusal);
+        }
+    }
+    Ok(())
 }
 
 /// What every root session shares (the root server's family): the [`RootState`], and in a run

@@ -165,13 +165,15 @@ use serde::{Deserialize, Serialize};
 use starquake_kernel::id::ObjectId;
 use starquake_kernel::memory::SvcPermission;
 use starquake_kernel::result::{KernelError, ResultCode};
-use starquake_trace::{Env, EnvError, HostNanos, UnixSeconds};
+use starquake_trace::{Env, EnvError, HostNanos, ServiceId, UnixSeconds};
 
 use crate::commands;
 use crate::framework::result::code;
 use crate::framework::{
-    Context, Fault, Halt, Interfaces, Outcome, Reply, Request, Server, UnknownPolicy,
+    Context, Fault, Halt, Interfaces, Outcome, Reply, Request, RestoredKernel, Server,
+    UnknownPolicy,
 };
+use crate::shared_image::{self, Refusals};
 
 pub mod calendar;
 pub mod shared_memory;
@@ -656,5 +658,32 @@ pub fn server(
         .with_root(|| Box::new(IStaticService))
         .with_interfaces(interfaces())
         .with_family(Clocks::new(settings))
+        .with_family_objects(clocks_memory)
         .with_env(env, halt)
+}
+
+/// What a restore answers for a memory that fails [`shared_image::check_restored`].
+const MEMORY_REFUSALS: Refusals = Refusals {
+    not_shared_memory: "its clocks' memory is not a live shared memory",
+    size: "its clocks' memory is not the size of the time shared memory",
+    permission: "its clocks' memory is not mapped read-only",
+};
+
+/// The restore check of the kernel object the `time:u` server's clocks keep (module docs,
+/// "Restoring"): once set up, their memory is a live shared memory of the time shared memory's
+/// size, mapped read-only, as [`set_up_memory`] makes it.
+fn clocks_memory(
+    saved: &Clocks,
+    kernel: &dyn RestoredKernel,
+    _service: ServiceId,
+) -> Result<(), &'static str> {
+    saved.set_up.map_or(Ok(()), |done| {
+        shared_image::check_restored(
+            kernel,
+            done.memory,
+            shared_memory::SIZE,
+            SvcPermission::Read,
+            &MEMORY_REFUSALS,
+        )
+    })
 }

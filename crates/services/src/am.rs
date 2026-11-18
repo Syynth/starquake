@@ -542,7 +542,8 @@ use crate::apm::PerformanceMode;
 use crate::commands;
 use crate::framework::result::code;
 use crate::framework::{
-    Context, Fault, Interfaces, Outcome, Reader, Reply, Request, Server, UnknownPolicy, Writer,
+    Context, Fault, Interfaces, Outcome, Reader, Reply, Request, RestoredKernel, Server,
+    UnknownPolicy, Writer,
 };
 
 #[cfg(test)]
@@ -2533,6 +2534,44 @@ pub fn oe_server_for(applet: Applet, policy: UnknownPolicy) -> Server {
         .with_root(|| Box::new(IApplicationProxyService))
         .with_interfaces(oe_interfaces())
         .with_checked_family(applet, same_graphics_server)
+        .with_family_objects(applet_events)
+}
+
+/// The restore check of the kernel objects the `appletOE` server's applet keeps (module docs,
+/// "The applet"): each of its four events that is kept is a live readable event this server
+/// made, checked in the order of the applet's fields (message, suspended-tick, GPU-error,
+/// unknown), the first that is not refused.
+fn applet_events(
+    saved: &Applet,
+    kernel: &dyn RestoredKernel,
+    service: ServiceId,
+) -> Result<(), &'static str> {
+    let kept = [
+        (
+            saved.message_event,
+            "its applet's message event is not a live readable event its server made",
+        ),
+        (
+            saved.suspended_tick_event,
+            "its applet's suspended-tick event is not a live readable event its server made",
+        ),
+        (
+            saved.gpu_error_detected_event,
+            "its applet's GPU-error event is not a live readable event its server made",
+        ),
+        (
+            saved.unknown_event,
+            "its applet's unknown event is not a live readable event its server made",
+        ),
+    ];
+    for (event, refusal) in kept {
+        if let Some(event) = event
+            && !kernel.is_service_readable_event(service, event)
+        {
+            return Err(refusal);
+        }
+    }
+    Ok(())
 }
 
 /// The restore check of the `appletOE` server's applet: a snapshot's graphics server number

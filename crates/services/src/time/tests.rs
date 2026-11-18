@@ -800,7 +800,7 @@ fn a_restored_server_hands_out_the_saved_memory_without_reading_again() {
         env,
         rig.halts.shared(),
     );
-    restored.restore(&saved).unwrap();
+    restored.restore_beside(&saved, &rig.kernel).unwrap();
     assert_eq!(restored.save().unwrap(), saved);
     rig.server = restored;
     assert_eq!(rig.memory(), memory);
