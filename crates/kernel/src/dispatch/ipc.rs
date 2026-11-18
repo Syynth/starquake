@@ -99,9 +99,14 @@
 //! into the sender's message buffer and its result into the sender's registers, records its
 //! events, settles every other request that is over with it, and only then ends the process
 //! with [`terminate_process`], the function `ExitProcess` ends it with: every thread ends and
-//! every handle closes, so the servers of its sessions are told. Each process asked for ends
+//! every handle closes, so the servers of its sessions are told. The replies and the end are
+//! made under one hold of the kernel lock (`Dispatcher::settle_and_end`), so no core can run a
+//! sender of the ending process between its reply and the end. Each process asked for ends
 //! once, in the order first asked; a second ask for the same process in one settling is not
-//! tried again (log-only: trying it would only log that the process has ended already).
+//! tried again (log-only: trying it would only log that the process has ended already). A run
+//! whose process has ended is never stalled ([`Dispatcher::is_stalled`]): a core that parks
+//! after a delivery ended the process, and before the timer thread stops the run, must not
+//! call it a deadlock.
 //!
 //! - **A `SendSyncRequest` dispatch** ends in [`Outcome::ProcessExited`] when its caller's own
 //!   process is one it ended, which its caller treats as it treats `ExitProcess`'s; otherwise
@@ -131,10 +136,16 @@
 //! is the request that asked (its handler's IPC event, then its `SendSyncRequest` event), and
 //! the end itself is the run's to record, as for `ExitProcess`.
 //!
-//! One ask is not honoured; it is logged as an error and the process goes on: **a handler that
-//! deferred its reply** ([`Handled::Deferred`]): the end follows the reply, and there is none
-//! yet. The service framework refuses the combination before it reaches the kernel. Test:
-//! `an_end_asked_by_a_handler_that_defers_is_not_honoured`.
+//! Two asks are not honoured; each is logged as an error:
+//!
+//! - **A handler that deferred its reply** ([`Handled::Deferred`]): the end follows the reply,
+//!   and there is none yet, so the process goes on. The service framework refuses the
+//!   combination before it reaches the kernel. Test:
+//!   `an_end_asked_by_a_handler_that_defers_is_not_honoured`.
+//! - **An end for a process that has ended already** (an `ExitProcess` while the request was
+//!   in flight): there is nothing left to end, and no end is reported. Tests:
+//!   `a_delivery_does_not_report_an_end_asked_for_a_process_that_ended_meanwhile` and
+//!   `ending_a_process_that_has_ended_already_fails_and_reports_nothing`.
 //!
 //! A delivery that is owed because a guest's `SendSyncRequest` dispatch has the handler out of
 //! its slot is that dispatch's to make (`deliver_owed`, when it puts the handler back), and an
