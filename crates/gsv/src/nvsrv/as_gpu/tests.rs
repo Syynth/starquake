@@ -1195,6 +1195,7 @@ fn saved(views: &[(u32, View)], made: &[(AsId, Layout)]) -> SavedAsGpu {
     SavedAsGpu {
         views: views.iter().copied().collect(),
         made: made.iter().copied().collect(),
+        bound: BTreeMap::new(),
     }
 }
 
@@ -1502,6 +1503,7 @@ fn a_saved_state_at_each_edge_is_accepted() {
             },
         )]),
         made: BTreeMap::new(),
+        bound: BTreeMap::new(),
     };
     let bytes = postcard::to_allocvec(&refused).unwrap();
     assert!(postcard::from_bytes::<AsGpu>(&bytes).is_err());
