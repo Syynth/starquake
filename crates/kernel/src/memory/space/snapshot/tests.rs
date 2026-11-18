@@ -21,6 +21,7 @@ use crate::result::{CallResult, KernelError, SvcError};
 use crate::snapshot::FormatError;
 
 mod alias;
+mod attribute;
 
 /// Fixed seed so a run is reproducible; failures are not persisted to disk.
 const PROPTEST_SEED: u64 = 0x5351_4153_534E_4150;
@@ -1367,6 +1368,21 @@ fn each_check_of_one_block_has_its_own_fault() {
             BlockFault::Permission,
         ),
         (
+            "uncached thread-local memory",
+            Box::new(|b| b.attribute |= MemoryAttribute::UNCACHED.bits()),
+            BlockFault::ChangedAttribute,
+        ),
+        (
+            "GPU-accessible thread-local memory",
+            Box::new(|b| b.attribute |= MemoryAttribute::GPU_ACCESSIBLE.bits()),
+            BlockFault::ChangedAttribute,
+        ),
+        (
+            "permission-locked thread-local memory",
+            Box::new(|b| b.attribute |= MemoryAttribute::PERMISSION_LOCKED.bits()),
+            BlockFault::PermissionLock,
+        ),
+        (
             "thread-local memory as a stack",
             Box::new(|b| b.state = MemoryState::Stack.word()),
             BlockFault::Region,
@@ -1574,6 +1590,38 @@ fn of_two_faults_in_one_block_the_earlier_check_is_reported() {
                 b.state = MemoryState::Stack.word();
             }),
             BlockFault::Permission,
+        ),
+        (
+            "a permission the state never has and uncached",
+            Box::new(|b| {
+                b.permission = READ_WRITE_EXECUTE;
+                b.attribute |= MemoryAttribute::UNCACHED.bits();
+            }),
+            BlockFault::Permission,
+        ),
+        (
+            "GPU accessible and permission locked",
+            Box::new(|b| {
+                b.attribute |=
+                    (MemoryAttribute::GPU_ACCESSIBLE | MemoryAttribute::PERMISSION_LOCKED).bits();
+            }),
+            BlockFault::ChangedAttribute,
+        ),
+        (
+            "uncached and the wrong region",
+            Box::new(|b| {
+                b.attribute |= MemoryAttribute::UNCACHED.bits();
+                b.state = MemoryState::Stack.word();
+            }),
+            BlockFault::ChangedAttribute,
+        ),
+        (
+            "permission locked and the wrong region",
+            Box::new(|b| {
+                b.attribute |= MemoryAttribute::PERMISSION_LOCKED.bits();
+                b.state = MemoryState::Stack.word();
+            }),
+            BlockFault::PermissionLock,
         ),
     ];
     for (name, change, fault) in pairs {
@@ -2656,6 +2704,22 @@ fn the_new_errors_read_as_plain_words() {
         }
         .to_string(),
         "block 2 of the address space snapshot has a permission the kernel never gives its state"
+    );
+    assert_eq!(
+        SnapshotError::Block {
+            index: 0,
+            fault: BlockFault::ChangedAttribute
+        }
+        .to_string(),
+        "block 0 of the address space snapshot is uncached or GPU accessible, which its memory state does not allow"
+    );
+    assert_eq!(
+        SnapshotError::Block {
+            index: 0,
+            fault: BlockFault::PermissionLock
+        }
+        .to_string(),
+        "block 0 of the address space snapshot is permission locked, which its memory state does not allow"
     );
     assert_eq!(
         SnapshotError::Shared {
