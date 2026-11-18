@@ -351,9 +351,11 @@ fn every_service_has_its_name_and_no_other_number_has_one() {
     assert_eq!(service_name(GSV_SYNCPT), Some("gsv:syncpt"));
     assert_eq!(service_name(GSV_GPU), Some("gsv:gpu"));
     assert_eq!(service_name(GSV_NVSRV), Some("nvsrv"));
+    assert_eq!(service_name(GSV_VI2), Some("gsv:vi2"));
+    assert_eq!(service_name(GSV_VIDEO), Some("gsv:video"));
     assert_eq!(service_name(ServiceId(0)), None);
     assert_eq!(service_name(ServiceId(9)), None);
-    assert_eq!(service_name(ServiceId(22)), None);
+    assert_eq!(service_name(ServiceId(24)), None);
 }
 
 #[test]
