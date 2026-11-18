@@ -46,14 +46,16 @@
 //! # Where the references disagree (decision 8)
 //!
 //! Each case is a **conflict**, verification 1 of the spec's "What to verify before building",
-//! pinned by the test named, in `video/layout/tests.rs`:
+//! pinned by the test named, in `video/layout/tests.rs`. Two rows (code 5 and any other code)
+//! are **departures from decision 8**, not its outcome: each says why, and each is an open
+//! question for the owner.
 //!
 //! | Case | PR | NX2 | Here |
 //! |---|---|---|---|
 //! | Code 1's layout | the module's sizes (pitch to 256 bytes, rows to 4) | pitch to 64 bytes, rows to 128 (640x360: 0x64000, row 96) | PR's, by the house rule's first clause (a reading of the system module for a layout): 640x360 is 0x65400 (`code_1_is_pr_s_layout_not_nx2_s`) |
-//! | Code 5 | block-linear RGBA | pitch-linear BGRA | PR's, as code 1 (`code_5_is_pr_s_block_linear_rgba`) |
+//! | Code 5 | block-linear RGBA: PR's own sizes, with no reading cited (its "run in emulation over a size grid" comment is on kind 1 only) | pitch-linear BGRA (`case 5:`, `Bgra8`) | **departure from decision 8, owner question**: PR's. Its first clause does not apply (no module reading for code 5), and under its second NX2's answer (a layout 961 describes as BGRA) contains PR's (a layout 961 refuses), so it would pick NX2's. Kept as built, until the owner rules: it was taken with PR's layout function, whose code 1 is a module reading, but PR cites none for code 5. Consequence: 961 of a code-5 image answers `NotImplemented` where NX2 answers a BGRA descriptor (`code_5_is_pr_s_block_linear_rgba`; `a_block_linear_pool_has_no_cpu_descriptor`, in `native/pools/tests.rs`) |
 //! | Codes 2, 3, 4, 6, 10 to 13 | refused (`NotImplemented`): PR implements only 1 and 5 | NX2's layouts | NX2's: PR's refusal is not a reading of the module, and an answer contains a refusal (the house rule's second clause) (`nx2_s_codes_have_nx2_s_layouts`) |
-//! | Any other code | refused | RGBA (NX2's `default:` case) | refused, `NotImplemented`: only the codes NX2's comment names are taken, so that an unknown code is seen in the log rather than sized as a guess (`an_unnamed_code_is_refused`) |
+//! | Any other code | refused | RGBA (NX2's `default:` case) | **departure from decision 8, owner question**: refused, `NotImplemented`. Decision 8's second clause would pick NX2's answer, which contains PR's refusal, as it does for codes 2, 3, 4 and 6. Refused so that an unknown code is seen in the log rather than sized as a guess: neither reference names a format for it (`an_unnamed_code_is_refused`) |
 //! | Word 0, words 3 to 15, a count of 0 | refused | not looked at; a count of 0 is taken as 1 | PR's checks for every code (`the_request_checks_apply_to_every_code`) |
 //! | Code 4 with an odd or one-pixel extent | not taken | taken | taken: PR's evenness check is part of its code-1 layout, not NX2's (`code_4_takes_an_odd_extent`) |
 //! | An image over 4 GiB | refused for PR's codes | sized in `u64`, then cut to 32 bits by 961 | refused for every code (`an_image_over_four_gib_is_refused`) |
