@@ -591,8 +591,10 @@ fn the_non_system_total_is_the_pool_less_the_calling_process_s_charge() {
     // arrangements is below the largest process memory: 21 is Eden's `free + used`, the pool
     // less the charge, and its `max - secure` branch is out of reach of a live address space
     // (`the_non_system_total_takes_edens_branch_at_the_exact_edge` pins it on the function).
-    // The charge is the calling process's, whichever process is named: the second process's
-    // resource differs.
+    // The answer is the calling process's pool less its own charge, whichever process is
+    // named: the second process's resource differs. (The charge reaches 21 through the free
+    // memory; the term `non_system_total` takes for it shows only in the branch no live space
+    // reaches, so which resource's size is passed there is not observable here.)
     for arrangement in [MemoryArrangement::FourGb, MemoryArrangement::TwelveGb] {
         let pool = arrangement.application_pool_size();
         for (pool_of_own, charge) in [

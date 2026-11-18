@@ -41,10 +41,13 @@
 //!
 //! # What is here that Eden keeps elsewhere
 //!
-//! Eden keeps the code size, the main thread's stack size and the largest process memory on
-//! `KProcess`, and the reservation count on its `KResourceLimit`. Starquake's process table
-//! holds only facts fixed at creation so far (kernel slice 8 builds the rest), and the kernel
-//! spec puts "the memory pools" with the address space, so they are here.
+//! Eden keeps the code size, the main thread's stack size, the largest process memory and the
+//! system resource (`m_system_resource`) on `KProcess`, and the reservation count on its
+//! `KResourceLimit`. Starquake's process table holds only facts fixed at creation so far
+//! (kernel slice 8 builds the rest), and the kernel spec puts "the memory pools" with the
+//! address space, so they are here: the system resource is the one the address space was made
+//! with ([`AddressSpace::with_system_resource`]), whose charge the count holds, and
+//! [`crate::process::create`] refuses a space made for another resource than its description's.
 //!
 //! # Divergences from Eden
 //!

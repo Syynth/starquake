@@ -31,9 +31,6 @@ pub(crate) const PROGRAM_TYPE_APPLICATION: u8 = 1;
 /// The program type of an applet: `ProgramInfoFlag_Applet = 2` (same source).
 pub(crate) const PROGRAM_TYPE_APPLET: u8 = 2;
 
-/// The program type Horizon's loader drops: `ProgramInfoFlag_InvalidType = 3` (same source).
-pub(crate) const PROGRAM_TYPE_INVALID: u8 = 3;
-
 /// Bytes of a process's name: `CreateProcessParameter::name` is `std::array<char, 12>`
 /// (`eden/src/core/hle/kernel/svc_types.h` @ cf654052), and `KProcess::LoadFromMetadata` copies
 /// that many bytes of the metadata's name into it.
@@ -84,15 +81,16 @@ const fn pool(partition: PoolPartition) -> Result<Pool, LoadError> {
 }
 
 /// The application-type bits Horizon's loader takes from the `ACI0` program-type capability
-/// (`MakeProgramInfoFlag`: the type masked with [`PROGRAM_TYPE_MASK`], unless it is
-/// [`PROGRAM_TYPE_INVALID`]), zero with no such capability (a system module's).
+/// (`MakeProgramInfoFlag`: the type masked with [`PROGRAM_TYPE_MASK`]), zero with no such
+/// capability (a system module's). `MakeProgramInfoFlag` also leaves out the invalid type
+/// (`ProgramInfoFlag_InvalidType`, 3) when it ORs the capabilities together; with the one
+/// capability the parser allows that changes nothing here, as 3 is neither an application nor
+/// an applet either way.
 fn program_type(npdm: &Npdm) -> u8 {
     npdm.aci
         .kernel_capabilities
         .program_type
-        .map(|kind| kind & PROGRAM_TYPE_MASK)
-        .filter(|&kind| kind != PROGRAM_TYPE_INVALID)
-        .unwrap_or(0)
+        .map_or(0, |kind| kind & PROGRAM_TYPE_MASK)
 }
 
 /// Whether an address space type passes Horizon's loader's test for a system resource,
@@ -358,10 +356,9 @@ mod tests {
             (
                 PROGRAM_TYPE_MASK,
                 PROGRAM_TYPE_APPLICATION,
-                PROGRAM_TYPE_APPLET,
-                PROGRAM_TYPE_INVALID
+                PROGRAM_TYPE_APPLET
             ),
-            (3, 1, 2, 3)
+            (3, 1, 2)
         );
     }
 
@@ -435,13 +432,13 @@ mod tests {
     fn only_an_application_or_an_applet_may_have_a_system_resource() {
         // `R_UNLESS(IsApplication(meta) || IsApplet(meta), ldr::ResultInvalidMeta())`, from the
         // `ACI0` program type masked to its two bits; no program type is a system module's, and
-        // the invalid type is dropped.
+        // the invalid type (3) is neither.
         for (program_type, allowed) in [
             (None, false),
             (Some(0), false),
             (Some(PROGRAM_TYPE_APPLICATION), true),
             (Some(PROGRAM_TYPE_APPLET), true),
-            (Some(PROGRAM_TYPE_INVALID), false),
+            (Some(3), false),
             // The capability's third bit is outside the mask: 5 is an application, 6 an applet.
             (Some(4), false),
             (Some(5), true),

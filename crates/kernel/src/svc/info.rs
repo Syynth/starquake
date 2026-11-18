@@ -194,6 +194,10 @@
 //!   `M` 12 GiB), so a live address space always takes the second branch: 6 is the pool and 21
 //!   the pool less `S`. The first branches are pinned on the functions
 //!   (`the_non_system_total_takes_edens_branch_at_the_exact_edge`, and the space's own tests).
+//!   So the `S` that 21 passes to [`non_system_total`] (the calling address space's charge) is
+//!   not observable through a live process: passing the size instead, or another process's,
+//!   gives the same answer, as the second branch does not read it. A mutation of it survives
+//!   every test but the function's own, and is listed here as unobservable.
 //!   Tests: `the_non_system_total_is_the_pool_less_the_calling_process_s_charge`,
 //!   `the_total_and_used_memory_count_the_system_resource_as_eden_does`.
 //! - The resource limit's `PhysicalMemoryMax` current value is the same count (#242,
