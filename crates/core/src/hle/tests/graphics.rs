@@ -506,6 +506,65 @@ fn the_root_hands_out_the_graphics_server_s_sessions() {
     );
 }
 
+/// The root of a run answers the native memory and image commands from gsv's shared state, not
+/// with its stubs: 1510 sizes an image (the stub answers zeros), 111 hands out id 1 (the stub's
+/// id is 0), and a second 112 of it is `NotFound` (the stub answers success); each is recorded
+/// under the root's number. Layouts are PR's (`CalculateImageRequirements`: `0x5f6, 17`, the
+/// preference at words 2–17 as `native_image_layout.h` reads it, the count at 18;
+/// `CreateNativeMemory`: `0x7f, 3`, mode, size; `DestroyNativeMemory`: `0x80, 1`, id).
+#[test]
+fn the_root_answers_native_memory_and_images() {
+    let graphics = Graphics::new(FrontMode::Live, None);
+    let rig = rig_with(&graphics);
+    let root = rig.graphics_root();
+
+    // 1280 by 720 RGBA8, kind 2, 128-row blocks, 80 GOBs a row; three images: 3 * 80 * 64 *
+    // 768 bytes, aligned to a page.
+    let mut words = vec![tipc_type(root_command::CALCULATE_IMAGE_REQUIREMENTS), 17];
+    words.extend([0, 2, (1280 - 1) | ((720 - 1) << 16), 0, 7, 80, 1, 1]);
+    words.extend([0; 8]);
+    words.push(3);
+    let sized = rig.tipc(root, &words);
+    let mut expected = halves(3 * 3_932_160).to_vec();
+    expected.extend(halves(0x1000));
+    assert_eq!((sized.result, sized.data), (0, expected));
+
+    let [low, high] = halves(PAGE_SIZE);
+    let created = rig.tipc(
+        root,
+        &[
+            tipc_type(root_command::CREATE_NATIVE_MEMORY),
+            3,
+            0,
+            low,
+            high,
+        ],
+    );
+    assert_eq!((created.result, created.data), (0, vec![1]));
+    let destroy = [tipc_type(root_command::DESTROY_NATIVE_MEMORY), 1, 1];
+    assert_eq!(rig.tipc(root, &destroy).result, 0);
+    assert_eq!(
+        rig.tipc(root, &destroy).result,
+        KernelError::NotFound.code().raw()
+    );
+    assert_eq!(
+        graphics.shared().lock().native_objects().memories().count(),
+        0
+    );
+
+    let ipc = rig.ipc();
+    let tail: Vec<_> = ipc.iter().rev().take(4).rev().copied().collect();
+    assert_eq!(
+        tail,
+        [
+            (GSV_ROOT, root_command::CALCULATE_IMAGE_REQUIREMENTS),
+            (GSV_ROOT, root_command::CREATE_NATIVE_MEMORY),
+            (GSV_ROOT, root_command::DESTROY_NATIVE_MEMORY),
+            (GSV_ROOT, root_command::DESTROY_NATIVE_MEMORY),
+        ]
+    );
+}
+
 /// A run's session: the null front performs the submission's increments and finishes the
 /// ordered destroy at once, and each turn drains what that pushed, recording a note for each
 /// and signalling what waited on it; nothing is signalled before its turn.
