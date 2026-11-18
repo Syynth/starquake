@@ -144,6 +144,13 @@
 //!   time and on the counters as they are when it is written, neither of which a note fixes; its
 //!   notes (codes 2 and 9) are what it wrote, and a replay that reproduces both inputs writes
 //!   the same notes. Feeding them back is not built.
+//! - **Replayed: the vsync clock's ticks.** Each `VsyncTick` note is fed back where the run's
+//!   turn made it, and the replay turn delivers it: the same note, the same signals, the same
+//!   count and listeners (`a_recorded_vsync_tick_replays_to_the_same_signal_and_state`, in
+//!   `hle/tests/graphics/vsync.rs`).
+//! - **Not replayed: the vsync clock's deadline.** It follows the times of the run's turns, which
+//!   no note records; a replay's clock keeps the deadline its start gave it and never ticks on
+//!   it.
 //! - **Not replayed: where the run's turns fell.** The recorded stream says in which order the
 //!   notes and the requests came, which is what a replay follows; a turn that drained nothing
 //!   leaves no trace.

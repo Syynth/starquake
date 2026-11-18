@@ -8,6 +8,8 @@ use starquake_memory::PageRange;
 
 use super::*;
 
+mod vsync;
+
 fn id(value: u8) -> SyncpointId {
     SyncpointId::new(value).unwrap()
 }

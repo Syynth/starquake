@@ -33,6 +33,8 @@ use starquake_trace::{EnvCall, EnvError, HostIoReply, HostIoRequest, HostNanos};
 use super::*;
 use crate::hle::graphics::KernelHost;
 
+mod vsync;
+
 /// Where nvsrv's ioctl arguments and their out buffers go: the third page, in and out halves.
 const IOCTL_IN: u64 = FIRMWARE;
 const IOCTL_OUT: u64 = FIRMWARE + PAGE_SIZE / 2;
