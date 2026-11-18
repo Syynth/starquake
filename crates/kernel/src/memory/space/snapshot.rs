@@ -116,9 +116,16 @@
 //!     own errors, [`SnapshotError::OverLimit`] and [`SnapshotError::BlockMap`], would be bugs
 //!     in checks 3 and 4), so this is the last step that can fail: whatever a restore returns
 //!     as an error, nothing it mapped is left mapped, except the bytes `stuck` counts.
+//! 11. Once the object table is restored, the `Locked` memory against the transfer memories
+//!     that lent it ([`AddressSpace::check_lends`], `snapshot::transfer`, which lists its
+//!     checks): each lend's blocks are exactly locked for it, and every locked page is a lend's
+//!     or an alias's source ([`LendError`]). It is a call of its own, not part of
+//!     [`AddressSpace::restore`], because the transfer memories are the object table's, whose
+//!     restore runs it for each process (`crate::object::snapshot`).
 //!
 //! [`AddressSpace::save`] runs checks 2 to 8 on what it is about to write: a live address space
-//! that fails one is a bug in the kernel, which it reports rather than writes.
+//! that fails one is a bug in the kernel, which it reports rather than writes. The object
+//! table's save runs check 11.
 //!
 //! # Why each relation holds live
 //!
@@ -234,12 +241,13 @@
 //! - **Not checked here, for the aliases:** that every block shaped like an alias's source is
 //!   one. A transfer memory lent with no permission leaves its owner's memory the same way
 //!   (`Normal`, `KernelRead | NotMapped`, `Locked`), so such a block that no alias names
-//!   restores as it is, and `UnmapMemory` of it is refused with `InvalidMemoryRegion`, as
-//!   Eden's page group check refuses pages that are not the source's
-//!   (`a_restored_alias_shape_is_not_an_alias`, in `memory/space/alias_tests.rs`). Likewise
-//!   not checked: that an alias's source is not instead such a lend (the transfer memory
-//!   objects are the object table's); that every `Stack` block is an alias (the main thread's
-//!   stack is `Stack` too, and a block may hold an alias and plain stack pages both:
+//!   restores as it is (check 11 then requires a lend of it), and `UnmapMemory` of it is
+//!   refused with `InvalidMemoryRegion`, as Eden's page group check refuses pages that are not
+//!   the source's (`a_restored_alias_shape_is_not_an_alias`, in `memory/space/alias_tests.rs`).
+//!   Likewise not checked by [`AddressSpace::restore`]: that an alias's source is not instead
+//!   such a lend, which check 11 refuses ([`LendFault::AliasSource`]); that every `Stack`
+//!   block is an alias (the main thread's stack is `Stack` too, and a block may hold an alias
+//!   and plain stack pages both:
 //!   `a_block_holding_two_aliases_and_a_block_partly_aliased_restore`); and that two runs
 //!   that could be one (side by side in both ranges) were saved as one: the record matches
 //!   page by page either way.
@@ -252,12 +260,14 @@
 //!   `eden/src/core/hle/kernel/svc/svc_memory.cpp`). A table of the permissions each state may
 //!   carry would be stricter than the live kernel. Test:
 //!   `every_converted_permission_is_accepted_where_the_state_is_not_code`.
-//! - **Not checked here, until the object table's snapshot (#260):** `Locked` memory outside a
-//!   transfer memory lend, and which transfer memory lent each `Locked` range (the transfer
-//!   memory objects are the object table's). The attribute rules of check 4 cover `Uncached`,
-//!   `GpuAccessible` and `PermissionLocked` only; `Locked` is tested only by check 8, which
-//!   requires it on an alias's source and refuses it on an alias's destination, and a
-//!   snapshot that has it on any other block restores it as it is.
+//! - **Checked apart, by check 11:** `Locked` memory outside a transfer memory lend and an
+//!   alias's source, and which transfer memory lent each `Locked` range. The attribute rules
+//!   of check 4 cover `Uncached`, `GpuAccessible` and `PermissionLocked` only, and
+//!   [`AddressSpace::restore`] tests `Locked` only in check 8, which requires it on an alias's
+//!   source and refuses it on an alias's destination: a snapshot that has it on any other block
+//!   restores, and check 11, which the object table's restore runs once it has the transfer
+//!   memories, refuses it (`every_locked_page_is_a_lends_or_an_aliases_source`, in
+//!   `snapshot/tests/transfer.rs`).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -281,9 +291,11 @@ use crate::memory::state::{
 use crate::snapshot::{Format, FormatError, decode, encode};
 
 mod alias;
+mod transfer;
 
 pub use alias::AliasFault;
 use alias::SavedAlias;
+pub use transfer::{LendError, LendFault};
 
 #[cfg(test)]
 mod tests;

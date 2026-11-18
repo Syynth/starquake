@@ -184,6 +184,14 @@ pub(super) const DEVICE_SHARE_LOCK_STATE: u32 =
 /// The state flag [`AddressSpace::unlock_device_share`] tests (`CanDeviceMap`).
 pub(super) const DEVICE_SHARE_UNLOCK_STATE: u32 = flag::CAN_DEVICE_MAP;
 
+/// The state flags every block of a transfer memory's range has: what
+/// [`AddressSpace::lock_for_transfer_memory`] and [`AddressSpace::unlock_for_transfer_memory`]
+/// test: `FlagCanTransfer`, which `LockForTransferMemory` and `UnlockForTransferMemory` pass,
+/// with the `FlagReferenceCounted` that `LockMemoryAndOpen` and `UnlockMemory` add to it
+/// (`eden/src/core/hle/kernel/k_page_table_base.cpp` @ cf654052). A restored object table's
+/// transfer memories are checked against it too (`snapshot::transfer`).
+pub(super) const TRANSFER_LOCK_STATE: u32 = flag::CAN_TRANSFER | flag::REFERENCE_COUNTED;
+
 /// The attributes [`AddressSpace::set_memory_attribute`] may change, each with the state flag
 /// every block of its range needs when the mask has one of them: `Uncached` and `GpuAccessible`
 /// need `CanChangeAttribute`, `PermissionLocked` needs `CanPermissionLock`
@@ -1239,7 +1247,7 @@ impl AddressSpace {
     ) -> CallResult<()> {
         let pages = self.pages_of(address, size)?;
         // Check the state.
-        let lockable = flag::CAN_TRANSFER | flag::REFERENCE_COUNTED;
+        let lockable = TRANSFER_LOCK_STATE;
         let check = Check {
             state_mask: lockable,
             state: lockable,
@@ -1279,7 +1287,7 @@ impl AddressSpace {
     pub fn unlock_for_transfer_memory(&mut self, address: u64, size: u64) -> CallResult<()> {
         let pages = self.pages_of(address, size)?;
         // Check the state.
-        let lockable = flag::CAN_TRANSFER | flag::REFERENCE_COUNTED;
+        let lockable = TRANSFER_LOCK_STATE;
         let check = Check {
             state_mask: lockable,
             state: lockable,
