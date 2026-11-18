@@ -5,7 +5,8 @@
 //!
 //! * [`ioctl`]: ioctl numbers, and the fixed-size argument structs devices read.
 //! * [`nvmap`]: `/dev/nvmap` and its handle table.
-//! * [`ctrl_gpu`]: `/dev/nvhost-ctrl-gpu`, the GPU's characteristics block (slice 10).
+//! * [`ctrl_gpu`]: `/dev/nvhost-ctrl-gpu`, the GPU's characteristics block, its layout replies
+//!   and its two events (slice 10).
 //! * [`as_gpu`]: `/dev/nvhost-as-gpu`, address-space views over gsv's GPU memory (slice 10).
 //! * [`tsg_gpu`]: `/dev/nvhost-tsg-gpu`, timeslice groups (slice 10).
 //! * [`gpu`]: `/dev/nvhost-gpu`, channels and GPFIFO submission (slice 11).
@@ -89,7 +90,8 @@
 //! open → `NotImplemented`, before the device is asked anything.
 //!
 //! **What each device does.** `/dev/nvmap` has its ioctls ([`nvmap`]); `/dev/nvhost-ctrl-gpu`
-//! answers `GetCharacteristics` ([`ctrl_gpu`]); `/dev/nvhost-as-gpu` makes views of gsv's GPU
+//! answers `GetCharacteristics` and the GPU's layout (Z-cull, TPC masks, the SM map), and has two
+//! events ([`ctrl_gpu`]); `/dev/nvhost-as-gpu` makes views of gsv's GPU
 //! address spaces and reports their regions and syncpoint shim ([`as_gpu`]); and
 //! `/dev/nvhost-tsg-gpu` keeps timeslice groups ([`tsg_gpu`]); and `/dev/nvhost-gpu` is a
 //! channel ([`gpu`]), on a server given a channel front ([`NvsrvFamily::with_channel_front`]:
@@ -97,11 +99,19 @@
 //! the ioctls it does not serve yet. The others open, but have no ioctls: they are Switch 1
 //! devices (decision 11 builds only what Switch 2's driver uses).
 //!
-//! `QueryEvent` on an nvhost-gpu fd answers its channel's events ([`gpu`], "Events"): a copied
-//! handle and `Success` (Eden `NVDRV::QueryEvent`: `rb.PushCopyObjects(ctx, readable_event);
-//! rb.PushEnum(NvResult::Success)`). On any other open fd it answers `BadParameter` and no
-//! handle, Eden's answer for a device with no such event (`nvdevice::QueryEvent` returns
-//! `nullptr`); ctrl-gpu's two are not built ([`ctrl_gpu`], "Not built").
+//! **ctrl-gpu's events.** Opening `/dev/nvhost-ctrl-gpu` makes its two events first, as both
+//! references' `nvhost_ctrl_gpu` constructor does ([`ctrl_gpu`], "Events"): `Open` asks the
+//! kernel for two events, then opens the fd with them ([`NvsrvState::opens_ctrl_gpu`],
+//! [`NvsrvState::open`]). A kernel that cannot make one fails the request with its error, and no
+//! fd is opened (an event made before the failure is not freed: the services framework has no
+//! call for it). A path `Open` refuses makes no event.
+//!
+//! `QueryEvent` on an nvhost-gpu fd answers its channel's events ([`gpu`], "Events"), and on an
+//! nvhost-ctrl-gpu fd its two ([`ctrl_gpu`], "Events"): a copied handle and `Success` (Eden
+//! `NVDRV::QueryEvent`: `rb.PushCopyObjects(ctx, readable_event);
+//! rb.PushEnum(NvResult::Success)`). An id that device has no event for, and any id on another
+//! open fd, answers `BadParameter` and no handle, Eden's answer for a device with no such event
+//! (`nvdevice::QueryEvent` returns `nullptr`).
 //!
 //! **The server's wiring.** nvhost-as-gpu acts on gsv's GPU memory, the bookkeeping the gpu
 //! session's 33 and its worker use, so [`nvsrv_server`] takes gsv's shared state and the GPU's
@@ -140,15 +150,17 @@
 //!
 //! Every request is one IPC event in the run's stream, recorded by the service framework with
 //! its payload; nvsrv has no input from the host, so it writes no notes. The open files, the
-//! nvmap handles, nvhost-as-gpu's views and the layouts of the address spaces it made, and
-//! nvhost-tsg-gpu's groups and nvhost-gpu's channels are the family state, plain data saved with
-//! the server (the wiring is not saved), and restoring checks every relation between their fields
-//! ([`NvsrvStateError`], [`nvmap::NvMapStateError`], [`as_gpu::AsGpuStateError`],
-//! [`tsg_gpu::TsgStateError`], [`gpu::GpuStateError`]): each view on an open as-gpu fd, each
-//! group on an open tsg-gpu fd, each channel a group holds one whose fd was handed out and, while
-//! it is still open, an nvhost-gpu, each nvhost-gpu channel and each as-gpu binding on an open
-//! nvhost-gpu fd, and each made GPU channel bound to the address space it was made in. The
-//! submissions that wait for room are gsv's shared state's ([`gpu::submits`]).
+//! nvmap handles, nvhost-as-gpu's views and the layouts of the address spaces it made,
+//! nvhost-tsg-gpu's groups, nvhost-gpu's channels and nvhost-ctrl-gpu's events are the family
+//! state, plain data saved with the server (the wiring is not saved), and restoring checks every
+//! relation between their fields ([`NvsrvStateError`], [`nvmap::NvMapStateError`],
+//! [`as_gpu::AsGpuStateError`], [`tsg_gpu::TsgStateError`], [`gpu::GpuStateError`],
+//! [`ctrl_gpu::CtrlGpuStateError`]): each view on an open as-gpu fd, each group on an open
+//! tsg-gpu fd, each channel a group holds one whose fd was handed out and, while it is still
+//! open, an nvhost-gpu, each nvhost-gpu channel and each as-gpu binding on an open nvhost-gpu fd,
+//! each made GPU channel bound to the address space it was made in, each fd with ctrl-gpu events
+//! an open ctrl-gpu, and each open ctrl-gpu with its events (in that order, after the fd
+//! checks). The submissions that wait for room are gsv's shared state's ([`gpu::submits`]).
 //!
 //! The address spaces themselves are gsv's shared state's, saved with it
 //! ([`crate::gpu::saved`]). That a view's address space is one the shared state holds is a
@@ -197,6 +209,7 @@ use starquake_services::framework::{
 };
 
 use self::as_gpu::AsGpu;
+use self::ctrl_gpu::{CtrlGpu, CtrlGpuEvents};
 use self::gpu::{ChannelAccess, ChannelFront, Deferral, NvhostGpu, Queried};
 use self::ioctl::{Ioctl, MAX_ARGUMENT_BYTES};
 use self::nvmap::NvMap;
@@ -497,6 +510,7 @@ pub struct NvsrvState {
     as_gpu: AsGpu,
     tsg_gpu: TsgGpu,
     gpu: NvhostGpu,
+    ctrl_gpu: CtrlGpu,
 }
 
 /// The serialised form of [`NvsrvState`], field for field, and what deserialising validates.
@@ -508,6 +522,7 @@ struct SavedNvsrvState {
     as_gpu: AsGpu,
     tsg_gpu: TsgGpu,
     gpu: NvhostGpu,
+    ctrl_gpu: CtrlGpu,
 }
 
 /// Why a saved [`NvsrvState`] could not be read back: its open files are not ones `Open` and
@@ -581,6 +596,19 @@ pub enum NvsrvStateError {
         /// The channel's fd.
         fd: u32,
     },
+    /// ctrl-gpu events on an fd that is not an open `/dev/nvhost-ctrl-gpu`: they are made when
+    /// one opens and go when it closes.
+    #[error("fd {fd} has ctrl-gpu events but is not an open nvhost-ctrl-gpu")]
+    NotACtrlGpu {
+        /// The fd.
+        fd: u32,
+    },
+    /// An open `/dev/nvhost-ctrl-gpu` without its two events, which `Open` makes with it.
+    #[error("nvhost-ctrl-gpu fd {fd} is open without its events")]
+    CtrlGpuWithoutEvents {
+        /// The fd.
+        fd: u32,
+    },
 }
 
 impl TryFrom<SavedNvsrvState> for NvsrvState {
@@ -594,6 +622,7 @@ impl TryFrom<SavedNvsrvState> for NvsrvState {
             as_gpu,
             tsg_gpu,
             gpu,
+            ctrl_gpu,
         } = saved;
         if !(FIRST_FD..=FD_END).contains(&next_fd) {
             return Err(NvsrvStateError::NextFd { next: next_fd });
@@ -639,6 +668,17 @@ impl TryFrom<SavedNvsrvState> for NvsrvState {
         }) {
             return Err(NvsrvStateError::MadeUnbound { fd });
         }
+        if let Some(fd) = ctrl_gpu
+            .fds()
+            .find(|fd| !open_as(fd, Device::NvhostCtrlGpu))
+        {
+            return Err(NvsrvStateError::NotACtrlGpu { fd });
+        }
+        if let Some((&fd, _)) = files.iter().find(|&(&fd, &device)| {
+            device == Device::NvhostCtrlGpu && ctrl_gpu.events(fd).is_none()
+        }) {
+            return Err(NvsrvStateError::CtrlGpuWithoutEvents { fd });
+        }
         Ok(Self {
             files,
             next_fd,
@@ -646,7 +686,53 @@ impl TryFrom<SavedNvsrvState> for NvsrvState {
             as_gpu,
             tsg_gpu,
             gpu,
+            ctrl_gpu,
         })
+    }
+}
+
+/// `path` up to its first zero byte (`Common::StringFromBuffer`).
+fn up_to_zero(path: &[u8]) -> &[u8] {
+    path.split(|&byte| byte == 0).next().unwrap_or_default()
+}
+
+/// Why `Open` refuses a path (module docs, "Devices and fds").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refusal {
+    /// The profiler's path.
+    Profiler,
+    /// A path no device has.
+    NoDevice,
+    /// [`MAX_OPEN_FILES`] files open.
+    TooManyFiles(Device),
+    /// The next fd is past the last `s32`.
+    FdsUsedUp(Device),
+}
+
+impl Refusal {
+    /// The fd and result `Open` of `path` answers, logged.
+    fn answer(self, path: &[u8]) -> (i32, NvResult) {
+        match self {
+            Self::Profiler => {
+                tracing::warn!("nvsrv: the profiler cannot be opened in production");
+                (0, NvResult::NotSupported)
+            }
+            Self::NoDevice => {
+                tracing::warn!(
+                    path = %String::from_utf8_lossy(up_to_zero(path)),
+                    "nvsrv: open of a device that does not exist"
+                );
+                (INVALID_FD, NvResult::FileOperationFailed)
+            }
+            Self::TooManyFiles(device) => {
+                tracing::warn!(device = device.path(), "nvsrv: too many files open");
+                (INVALID_FD, NvResult::FileOperationFailed)
+            }
+            Self::FdsUsedUp(device) => {
+                tracing::warn!(device = device.path(), "nvsrv: fds are used up");
+                (INVALID_FD, NvResult::FileOperationFailed)
+            }
+        }
     }
 }
 
@@ -673,6 +759,7 @@ impl NvsrvState {
             as_gpu: AsGpu::new(),
             tsg_gpu: TsgGpu::new(),
             gpu: NvhostGpu::new(),
+            ctrl_gpu: CtrlGpu::new(),
         }
     }
 
@@ -700,6 +787,12 @@ impl NvsrvState {
         &self.tsg_gpu
     }
 
+    /// The nvhost-ctrl-gpu fds' events.
+    #[must_use]
+    pub const fn ctrl_gpu(&self) -> &CtrlGpu {
+        &self.ctrl_gpu
+    }
+
     /// How many files are open.
     #[must_use]
     pub fn open_files(&self) -> usize {
@@ -716,30 +809,60 @@ impl NvsrvState {
             .ok_or(NvResult::NotImplemented)
     }
 
-    /// `Open`: the device whose path `path` holds, up to its first zero byte (module docs,
-    /// "Devices and fds"). The fd, and the result.
-    pub fn open(&mut self, path: &[u8]) -> (i32, NvResult) {
-        let path = path.split(|&byte| byte == 0).next().unwrap_or_default();
+    /// The device `Open` of `path` would open and the fd it would answer, or why it would
+    /// refuse (module docs, "Devices and fds"). Nothing is changed or logged.
+    fn admit(&self, path: &[u8]) -> Result<(Device, i32), Refusal> {
+        let path = up_to_zero(path);
         if path == PROFILER_PATH.as_bytes() {
-            tracing::warn!("nvsrv: the profiler cannot be opened in production");
-            return (0, NvResult::NotSupported);
+            return Err(Refusal::Profiler);
         }
-        let Some(device) = Device::from_path(path) else {
-            tracing::warn!(
-                path = %String::from_utf8_lossy(path),
-                "nvsrv: open of a device that does not exist"
-            );
-            return (INVALID_FD, NvResult::FileOperationFailed);
-        };
+        let device = Device::from_path(path).ok_or(Refusal::NoDevice)?;
         if self.files.len() >= MAX_OPEN_FILES {
-            tracing::warn!(device = device.path(), "nvsrv: too many files open");
-            return (INVALID_FD, NvResult::FileOperationFailed);
+            return Err(Refusal::TooManyFiles(device));
         }
-        let Ok(fd) = i32::try_from(self.next_fd) else {
-            tracing::warn!(device = device.path(), "nvsrv: fds are used up");
-            return (INVALID_FD, NvResult::FileOperationFailed);
+        let fd = i32::try_from(self.next_fd).map_err(|_| Refusal::FdsUsedUp(device))?;
+        Ok((device, fd))
+    }
+
+    /// Whether `Open` of `path` would open an nvhost-ctrl-gpu, whose two events the caller makes
+    /// first and gives [`open`](Self::open) (module docs, "Devices and fds").
+    #[must_use]
+    pub fn opens_ctrl_gpu(&self, path: &[u8]) -> bool {
+        matches!(self.admit(path), Ok((Device::NvhostCtrlGpu, _)))
+    }
+
+    /// `Open`: the device whose path `path` holds, up to its first zero byte (module docs,
+    /// "Devices and fds"). The fd, and the result. `events` are an nvhost-ctrl-gpu's two
+    /// events, made by the caller beforehand ([`opens_ctrl_gpu`](Self::opens_ctrl_gpu)): an
+    /// nvhost-ctrl-gpu without them, or with a pair [`CtrlGpu::check`] refuses, is not opened (fd
+    /// -1 and `FileOperationFailed`, logged as an error: the caller's fault); given for another
+    /// device they are not kept, which is logged as an error and changes nothing else.
+    pub fn open(&mut self, path: &[u8], events: Option<CtrlGpuEvents>) -> (i32, NvResult) {
+        let (device, fd) = match self.admit(path) {
+            Ok(admitted) => admitted,
+            Err(refusal) => return refusal.answer(path),
         };
-        self.files.insert(self.next_fd, device);
+        let key = self.next_fd;
+        match (device, events) {
+            (Device::NvhostCtrlGpu, None) => {
+                tracing::error!("nvsrv: nvhost-ctrl-gpu opened without its events");
+                return (INVALID_FD, NvResult::FileOperationFailed);
+            }
+            (Device::NvhostCtrlGpu, Some(events)) => {
+                if let Err(error) = self.ctrl_gpu.keep(key, events) {
+                    tracing::error!(%error, "nvsrv: nvhost-ctrl-gpu's events refused");
+                    return (INVALID_FD, NvResult::FileOperationFailed);
+                }
+            }
+            (_, Some(_)) => {
+                tracing::error!(
+                    device = device.path(),
+                    "nvsrv: events for a device without them"
+                );
+            }
+            (_, None) => {}
+        }
+        self.files.insert(key, device);
         self.next_fd += 1;
         (fd, NvResult::Success)
     }
@@ -758,17 +881,19 @@ impl NvsrvState {
         }
         self.as_gpu.close(key, &mut gpu);
         self.tsg_gpu.close(key);
+        self.ctrl_gpu.close(key);
         self.gpu.close(key, gpu.channels.as_mut());
         self.as_gpu.unbind(key, &mut gpu);
         NvResult::Success
     }
 
     /// `QueryEvent` (`Module::QueryEvent`): the fd checks, then the event (module docs,
-    /// "Devices and fds"). Only nvhost-gpu has events.
+    /// "Devices and fds"). Only nvhost-gpu and nvhost-ctrl-gpu have events.
     pub fn query_event(&self, fd: i32, event: u32) -> Result<Queried, NvResult> {
         let device = self.file(fd)?;
         let queried = match device {
             Device::NvhostGpu => self.gpu.event(key(fd)?, event),
+            Device::NvhostCtrlGpu => self.ctrl_gpu.event(key(fd)?, event),
             _ => Queried::Missing,
         };
         if queried == Queried::Missing {
@@ -811,6 +936,7 @@ impl NvsrvState {
                 .nvmap
                 .ioctl(ioctl, call.input)
                 .map(|(result, output)| IoctlAnswer::with(result, output)),
+            (Device::NvhostCtrlGpu, IoctlVariant::Ioctl) => ctrl_gpu::ioctl1(call),
             (Device::NvhostCtrlGpu, IoctlVariant::Ioctl3) => ctrl_gpu::ioctl3(call),
             (Device::NvhostAsGpu, _)
                 if gpu.channels.is_some() && as_gpu::is_bind_channel(variant, ioctl) =>
@@ -893,7 +1019,16 @@ impl Nvsrv {
         // One byte past the longest path: a path that long has no zero byte where any device's
         // would end, so it names none, and nothing further need be read.
         let path = read_in(cx, req, 0, LONGEST_PATH + 1)?;
-        let (fd, result) = cx.family::<NvsrvFamily>()?.state.open(&path);
+        // An nvhost-ctrl-gpu's events are made before it opens (module docs, "Devices and fds").
+        let events = if cx.family::<NvsrvFamily>()?.state.opens_ctrl_gpu(&path) {
+            Some(CtrlGpuEvents {
+                error_notifier: cx.create_event()?,
+                unknown: cx.create_event()?,
+            })
+        } else {
+            None
+        };
+        let (fd, result) = cx.family::<NvsrvFamily>()?.state.open(&path, events);
         reply.payload().write_i32(fd).write_u32(result.raw());
         reply.ok()
     }

@@ -18,8 +18,8 @@ use starquake_ipc::{
     BUFFER_SIZE, Body, BufferDescriptor, CommandType, Message, ReceiveDescriptor, RequestBuilder,
     RequestLayout, SFCO_MAGIC, SessionKind, StaticDescriptor,
 };
-use starquake_kernel::id::ObjectId;
-use starquake_kernel::result::ResultCode;
+use starquake_kernel::id::{ObjectId, SlabId};
+use starquake_kernel::result::{KernelError, ResultCode};
 use starquake_services::framework::fake::FakeKernel;
 use starquake_services::framework::{
     BufferKind, DeclaredBuffer, Direction, Family, Handled, Protocol, Session, SnapshotError,
@@ -145,9 +145,10 @@ impl Direct {
         }
     }
 
-    /// Opens `device`, which must succeed; its fd.
+    /// Opens `device`, which must succeed, with made-up events if it is an nvhost-ctrl-gpu; its
+    /// fd.
     pub(super) fn open(&mut self, device: Device) -> i32 {
-        let (fd, result) = self.state.open(device.path().as_bytes());
+        let (fd, result) = open_direct(&mut self.state, device);
         assert_eq!(result, NvResult::Success);
         fd
     }
@@ -202,6 +203,22 @@ impl Direct {
             sizes,
         )
     }
+}
+
+/// Two events no kernel made, distinct for each fd: what a test that drives the state without a
+/// kernel opens an nvhost-ctrl-gpu with.
+pub(super) fn made_up_events(fd: u32) -> ctrl_gpu::CtrlGpuEvents {
+    ctrl_gpu::CtrlGpuEvents {
+        error_notifier: ObjectId::from_parts(0x1_0000 + 2 * fd, 0x77),
+        unknown: ObjectId::from_parts(0x1_0001 + 2 * fd, 0x77),
+    }
+}
+
+/// [`NvsrvState::open`] of `device`'s path, with [`made_up_events`] for the next fd if `device`
+/// is an nvhost-ctrl-gpu.
+pub(super) fn open_direct(state: &mut NvsrvState, device: Device) -> (i32, NvResult) {
+    let events = (device == Device::NvhostCtrlGpu).then(|| made_up_events(state.next_fd));
+    state.open(device.path().as_bytes(), events)
 }
 
 /// [`NvsrvState::ioctl`] of `raw` on `fd` with `input`, out buffers of `input`'s size, over a
@@ -876,10 +893,13 @@ fn close_closes_only_its_fd() {
     assert_eq!(rig.state().file(third), Ok(Device::NvhostAsGpu));
 }
 
+/// The fd checks come first; a device with no events (nvmap) answers `BadParameter` and no
+/// handle for every id, 1 and 2 (ctrl-gpu's) included. ctrl-gpu's own are in `ctrl_gpu/tests.rs`
+/// (`query_event_1_and_2_hand_out_the_events_made_at_open`).
 #[test]
 fn query_event_checks_the_fd_and_finds_no_event() {
     let mut rig = Rig::new();
-    let fd = rig.open_device(Device::NvhostCtrlGpu);
+    let fd = rig.open_device(Device::Nvmap);
     let query = |rig: &mut Rig, fd: i32, event: u32| {
         let mut data = fd.to_le_bytes().to_vec();
         data.extend(event.to_le_bytes());
@@ -1064,7 +1084,7 @@ fn an_unknown_ioctl_under_each_policy() {
 fn only_nvmap_s_ioctl_1_commands_are_known() {
     let mut state = NvsrvState::new();
     for device in DEVICES {
-        state.open(device.path().as_bytes());
+        open_direct(&mut state, device);
     }
     for (index, device) in DEVICES.into_iter().enumerate() {
         let fd = i32::try_from(index).unwrap() + 1;
@@ -1422,6 +1442,9 @@ fn the_saved_state_s_layout_is_pinned() {
     expected.extend([1, 4, 0x77, 1, 5, 0x21]);
     // No nvhost-gpu channel.
     expected.push(0);
+    // One ctrl-gpu fd, 2, with its events: index 0x1_0004 (a varint), generation 0x77; index
+    // 0x1_0005, generation 0x77 (`made_up_events`).
+    expected.extend([1, 2, 0x84, 0x80, 0x04, 0x77, 0x85, 0x80, 0x04, 0x77]);
     let bytes = state.save_state().unwrap();
     assert_eq!(bytes, expected);
     let mut loaded = NvsrvState::new();
@@ -1483,7 +1506,189 @@ fn unreachable_states() -> Vec<(NvsrvState, NvsrvStateError)> {
                 count: MAX_OPEN_FILES + 2,
             },
         ),
+        (
+            // ctrl-gpu events on an open nvmap.
+            with(&|state| state.ctrl_gpu.keep(2, made_up_events(2)).unwrap()),
+            NvsrvStateError::NotACtrlGpu { fd: 2 },
+        ),
+        (
+            // ctrl-gpu events on an fd never handed out.
+            with(&|state| state.ctrl_gpu.keep(9, made_up_events(9)).unwrap()),
+            NvsrvStateError::NotACtrlGpu { fd: 9 },
+        ),
+        (
+            // An open ctrl-gpu without its events.
+            with(&|state| {
+                state.files.insert(3, Device::NvhostCtrlGpu);
+            }),
+            NvsrvStateError::CtrlGpuWithoutEvents { fd: 3 },
+        ),
+        (
+            // Two faults: events on a file that is not a ctrl-gpu are reported before a ctrl-gpu
+            // without events.
+            with(&|state| {
+                state.files.insert(3, Device::NvhostCtrlGpu);
+                state.ctrl_gpu.keep(2, made_up_events(2)).unwrap();
+            }),
+            NvsrvStateError::NotACtrlGpu { fd: 2 },
+        ),
+        (
+            // Two faults: the files are checked before the ctrl-gpu events.
+            with(&|state| {
+                state.files.insert(4, Device::Nvmap);
+                state.ctrl_gpu.keep(2, made_up_events(2)).unwrap();
+            }),
+            NvsrvStateError::NotIssued { fd: 4 },
+        ),
     ]
+}
+
+/// A ctrl-gpu fd with its events, the state `Open` leaves, restores; so does one whose fd was
+/// closed (its events gone with it). The ctrl-gpu errors read as plain words.
+#[test]
+fn a_saved_ctrl_gpu_with_its_events_restores() {
+    let mut state = full_table(3);
+    state.files.insert(2, Device::NvhostCtrlGpu);
+    state.ctrl_gpu.keep(2, made_up_events(2)).unwrap();
+    assert_eq!(NvsrvState::try_from(saved(&state)), Ok(state.clone()));
+    let bytes = state.save_state().unwrap();
+    let mut loaded = NvsrvState::new();
+    loaded.load_state(&bytes).unwrap();
+    assert_eq!(loaded, state);
+    // Closed: no file and no events.
+    state.files.remove(&2);
+    state.ctrl_gpu.close(2);
+    assert_eq!(NvsrvState::try_from(saved(&state)), Ok(state));
+    assert_eq!(
+        NvsrvStateError::NotACtrlGpu { fd: 2 }.to_string(),
+        "fd 2 has ctrl-gpu events but is not an open nvhost-ctrl-gpu"
+    );
+    assert_eq!(
+        NvsrvStateError::CtrlGpuWithoutEvents { fd: 3 }.to_string(),
+        "nvhost-ctrl-gpu fd 3 is open without its events"
+    );
+}
+
+// ----- Opening ctrl-gpu with its events --------------------------------------------------------
+
+/// The index the fake kernel gives the next object it mints, minting one to see it.
+fn next_index(rig: &mut Rig) -> u32 {
+    rig.kernel.new_object().index()
+}
+
+/// Through the server, `Open` of nvhost-ctrl-gpu makes two kernel events and keeps them as the
+/// fd's; another device, and a path `Open` refuses, makes none.
+#[test]
+fn opening_ctrl_gpu_makes_its_two_events() {
+    let mut rig = Rig::new();
+    let before = next_index(&mut rig);
+    let fd = rig.open_device(Device::NvhostCtrlGpu);
+    let events = rig.state().ctrl_gpu().events(fd.cast_unsigned()).unwrap();
+    assert_ne!(events.error_notifier, events.unknown);
+    for event in [events.error_notifier, events.unknown] {
+        // Events the kernel made (and nothing has signalled).
+        assert_eq!(rig.kernel.signals(event), Some(0), "{event:?}");
+    }
+    // Exactly two objects were made.
+    assert_eq!(next_index(&mut rig), before + 3);
+    // nvmap, the profiler and a path no device has make none.
+    let before = next_index(&mut rig);
+    rig.open_device(Device::Nvmap);
+    rig.open(PROFILER_PATH.as_bytes());
+    rig.open(b"/dev/nvhost-ctrl-gpu-not");
+    assert_eq!(next_index(&mut rig), before + 1);
+    assert_eq!(
+        rig.state().ctrl_gpu().fds().collect::<Vec<_>>(),
+        [fd.cast_unsigned()]
+    );
+}
+
+/// A full table refuses nvhost-ctrl-gpu before any event is made.
+#[test]
+fn a_refused_ctrl_gpu_open_makes_no_event() {
+    let mut rig = Rig::with_state(UnknownPolicy::Strict, full_table(MAX_OPEN_FILES));
+    let before = next_index(&mut rig);
+    let refused = ok(&[0xFFFF_FFFF, NvResult::FileOperationFailed.raw()]);
+    assert_eq!(rig.open(Device::NvhostCtrlGpu.path().as_bytes()), refused);
+    assert_eq!(next_index(&mut rig), before + 1);
+    assert_eq!(rig.state().ctrl_gpu().fds().count(), 0);
+}
+
+/// A kernel that cannot make an event fails `Open` of nvhost-ctrl-gpu with its error, and no fd
+/// is used; nvmap still opens, and once events can be made ctrl-gpu opens with the next fd.
+#[test]
+fn a_kernel_that_cannot_make_an_event_opens_no_ctrl_gpu() {
+    let mut rig = Rig::new();
+    rig.kernel.refuse_objects(Some(KernelError::OutOfResource));
+    let reply = rig.open(Device::NvhostCtrlGpu.path().as_bytes());
+    assert_eq!(reply.result, KernelError::OutOfResource.code().raw());
+    assert_eq!(rig.state().open_files(), 0);
+    assert_eq!(rig.state().ctrl_gpu().fds().count(), 0);
+    assert_eq!(rig.open_device(Device::Nvmap), 1);
+    rig.kernel.refuse_objects(None);
+    assert_eq!(rig.open_device(Device::NvhostCtrlGpu), 2);
+    assert!(rig.state().ctrl_gpu().events(2).is_some());
+}
+
+/// [`NvsrvState::open`] keeps events only for nvhost-ctrl-gpu: without them, or with a pair
+/// [`ctrl_gpu::CtrlGpu::check`] refuses, it opens nothing and uses no fd; given for another
+/// device they are not kept and the device opens.
+#[test]
+fn open_takes_events_only_for_ctrl_gpu() {
+    let path = Device::NvhostCtrlGpu.path().as_bytes();
+    let refused = (INVALID_FD, NvResult::FileOperationFailed);
+    let mut state = NvsrvState::new();
+    assert_eq!(state.open(path, None), refused);
+    let first = made_up_events(1);
+    let same = ctrl_gpu::CtrlGpuEvents {
+        error_notifier: first.unknown,
+        unknown: first.unknown,
+    };
+    assert_eq!(state.open(path, Some(same)), refused);
+    assert_eq!((state.open_files(), state.next_fd), (0, FIRST_FD));
+    assert_eq!(state.open(path, Some(first)), (1, NvResult::Success));
+    // A pair that shares one of fd 1's events.
+    let sharing = ctrl_gpu::CtrlGpuEvents {
+        error_notifier: made_up_events(2).error_notifier,
+        unknown: first.unknown,
+    };
+    assert_eq!(state.open(path, Some(sharing)), refused);
+    assert_eq!((state.open_files(), state.next_fd), (1, 2));
+    // nvmap given events: opened, the events not kept.
+    let nvmap = Device::Nvmap.path().as_bytes();
+    assert_eq!(
+        state.open(nvmap, Some(made_up_events(2))),
+        (2, NvResult::Success)
+    );
+    assert_eq!(state.ctrl_gpu().fds().collect::<Vec<_>>(), [1]);
+    assert_eq!(state.ctrl_gpu().events(1), Some(first));
+}
+
+/// `opens_ctrl_gpu` is true exactly when `Open` would open an nvhost-ctrl-gpu: its path, with or
+/// without bytes after a zero, and a table with room; not for another path, nor a full table.
+#[test]
+fn opens_ctrl_gpu_is_open_s_own_answer() {
+    let state = NvsrvState::new();
+    assert!(state.opens_ctrl_gpu(b"/dev/nvhost-ctrl-gpu"));
+    assert!(state.opens_ctrl_gpu(b"/dev/nvhost-ctrl-gpu\0junk"));
+    for path in [
+        &b"/dev/nvhost-ctrl-gpuX"[..],
+        b"/dev/nvhost-ctrl",
+        b"/dev/nvmap",
+        PROFILER_PATH.as_bytes(),
+        b"",
+    ] {
+        assert!(!state.opens_ctrl_gpu(path), "{path:?}");
+    }
+    let full = full_table(MAX_OPEN_FILES);
+    assert!(!full.opens_ctrl_gpu(b"/dev/nvhost-ctrl-gpu"));
+    let room = full_table(MAX_OPEN_FILES - 1);
+    assert!(room.opens_ctrl_gpu(b"/dev/nvhost-ctrl-gpu"));
+    let spent = NvsrvState {
+        next_fd: FD_END,
+        ..NvsrvState::new()
+    };
+    assert!(!spent.opens_ctrl_gpu(b"/dev/nvhost-ctrl-gpu"));
 }
 
 /// The saved form of `state`, field for field.
@@ -1495,6 +1700,7 @@ pub(super) fn saved(state: &NvsrvState) -> SavedNvsrvState {
         as_gpu: state.as_gpu.clone(),
         tsg_gpu: state.tsg_gpu.clone(),
         gpu: state.gpu.clone(),
+        ctrl_gpu: state.ctrl_gpu.clone(),
     }
 }
 
@@ -1516,7 +1722,7 @@ fn a_saved_state_no_command_reaches_is_refused() {
 #[test]
 fn a_saved_state_with_a_bad_table_is_refused() {
     let mut state = NvsrvState::new();
-    state.open(b"/dev/nvmap");
+    state.open(b"/dev/nvmap", None);
     direct_ioctl(
         &mut state,
         UnknownPolicy::Strict,
@@ -1526,11 +1732,11 @@ fn a_saved_state_with_a_bad_table_is_refused() {
         &le(&[0x1000, 0]),
     );
     let mut bytes = state.save_state().unwrap();
-    // The table's last byte is its next id, 8, before five empty maps (as-gpu's views, made
-    // spaces and bindings, tsg-gpu's groups, nvhost-gpu's channels): make it 2, which no table
-    // reaches.
-    let at = bytes.len() - 6;
-    assert_eq!(bytes[at..], [8, 0, 0, 0, 0, 0]);
+    // The table's last byte is its next id, 8, before six empty maps (as-gpu's views, made
+    // spaces and bindings, tsg-gpu's groups, nvhost-gpu's channels, ctrl-gpu's events): make it
+    // 2, which no table reaches.
+    let at = bytes.len() - 7;
+    assert_eq!(bytes[at..], [8, 0, 0, 0, 0, 0, 0]);
     bytes[at] = 2;
     let mut loaded = NvsrvState::new();
     assert_eq!(

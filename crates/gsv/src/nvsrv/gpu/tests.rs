@@ -23,7 +23,7 @@ use starquake_trace::EventKind;
 use super::super::command::{CLOSE, IOCTL2, QUERY_EVENT};
 use super::super::tests::{
     AS_ALLOC_AS_EX, Answer, Auto, RecordingFront, Rig, STALE, answer, as_front, cmif, fd_and, le,
-    len16, ok, saved, shared_state,
+    len16, ok, open_direct, saved, shared_state,
 };
 use super::super::{
     Device, GpuAccess, IoctlCall, NvsrvFamily, NvsrvState, NvsrvStateError, nvsrv_server,
@@ -281,7 +281,7 @@ impl Bench {
     }
 
     fn open(&mut self, device: Device) -> i32 {
-        let (fd, result) = self.state.open(device.path().as_bytes());
+        let (fd, result) = open_direct(&mut self.state, device);
         assert_eq!(result, NvResult::Success);
         fd
     }
@@ -1597,6 +1597,16 @@ fn a_channel_s_saved_layout_is_pinned() {
             None,
             Some(ObjectId::from_parts(0x53, 0x54)),
         ],
+        client_data: 0x6162,
+        error_notifier: Some(ErrorNotifier {
+            offset: 0x63,
+            size: 0x64,
+            mem: 0x65,
+        }),
+        preemption: Preemption {
+            graphics: preemption::GRAPHICS_MAX,
+            compute: preemption::COMPUTE_MAX,
+        },
     };
     let gpu = NvhostGpu::try_from(SavedNvhostGpu {
         channels: BTreeMap::from([(0x0B, channel)]),
@@ -1610,6 +1620,9 @@ fn a_channel_s_saved_layout_is_pinned() {
     expected.extend([2, 0x97, 0x8F, 0x03, 0xB5, 0xE1, 0x02]);
     // Events: some (0x51, 0x52), none, some (0x53, 0x54).
     expected.extend([1, 0x51, 0x52, 0, 1, 0x53, 0x54]);
+    // Client data 0x6162 as a varint; error notifier: some, offset 0x63, size 0x64, mem 0x65;
+    // preemption modes 1 and 2.
+    expected.extend([0xE2, 0xC2, 0x01, 1, 0x63, 0x64, 0x65, 1, 2]);
     assert_eq!(bytes, expected);
     let back: NvhostGpu = postcard::from_bytes(&bytes).unwrap();
     assert_eq!(back, gpu);
@@ -1650,8 +1663,25 @@ fn a_bound_channel_s_saved_layout_is_pinned() {
         expected
     );
     // One channel: fd 4, syncpoint some 1, GPU channel some 0x30 in space 6, no classes, no
-    // events.
-    let expected = [1, 4, 1, FIRST_ALLOCATABLE, 1, 0x30, 6, 0, 0, 0, 0];
+    // events, client data 0, no error notifier, both preemption modes the default.
+    let modes = u8::try_from(preemption::DEFAULT).unwrap();
+    let expected = [
+        1,
+        4,
+        1,
+        FIRST_ALLOCATABLE,
+        1,
+        0x30,
+        6,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        modes,
+        modes,
+    ];
     assert_eq!(postcard::to_allocvec(bench.state.gpu()).unwrap(), expected);
     // The whole state reads back as it was.
     let bytes = bench.state.save_state().unwrap();
@@ -1679,7 +1709,7 @@ fn a_saved_channel_table_no_ioctl_reaches_is_refused() {
         syncpoint,
         made,
         classes,
-        events: [None; EVENT_SLOTS],
+        ..Channel::default()
     };
     let reserved = RESERVED_SYNCPOINTS[0];
     let count = u8::try_from(SYNCPOINT_COUNT).unwrap();
@@ -1771,7 +1801,7 @@ fn two_saved_channels_share_neither_a_syncpoint_nor_a_gpu_channel() {
         syncpoint,
         made,
         classes,
-        events: [None; EVENT_SLOTS],
+        ..Channel::default()
     };
     // Two channels sharing a syncpoint, then a GPU channel.
     let pair = |a: Channel, b: Channel| SavedNvhostGpu {
@@ -3149,3 +3179,5 @@ fn a_closed_channel_s_events_are_not_freed() {
         assert_eq!(live.rig.kernel.signals(event), Some(0), "{event:?}");
     }
 }
+
+mod settings;
