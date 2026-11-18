@@ -337,3 +337,48 @@ fn the_notes_are_recorded_for_the_root() {
     );
     assert_eq!(graphics.deadline(), None);
 }
+
+/// A fresh graphics server is idle; something queued makes it not idle, and the turn that drains
+/// it makes it idle again.
+#[test]
+fn the_graphics_server_is_idle_only_with_nothing_queued() {
+    struct Quiet;
+    impl TimerHost for Quiet {
+        fn record(&mut self, _: EventKind) {}
+        fn unlock_device_share(&mut self, _: DeviceShareToken) -> Result<(), DeviceShareError> {
+            Ok(())
+        }
+        fn signal_event(&mut self, _: ObjectId) -> SvcResult<()> {
+            Ok(())
+        }
+    }
+    let graphics = graphics(FrontMode::Live);
+    assert!(graphics.is_idle());
+    graphics.front().barrier(Ticket(0x81));
+    assert!(!graphics.is_idle());
+    graphics.turn(&mut Quiet, HostNanos(0));
+    assert!(graphics.is_idle());
+}
+
+/// `is_idle` waits for gsv's shared lock, which a drain holds while it signals: asked while
+/// another thread holds the lock, it answers only once the lock is let go.
+#[test]
+fn is_idle_waits_for_a_drain_in_progress() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let graphics = Arc::new(graphics(FrontMode::Live));
+    let held = graphics.shared().lock();
+    let (answered, answer) = mpsc::channel();
+    let asking = Arc::clone(&graphics);
+    let thread = std::thread::spawn(move || {
+        answered.send(asking.is_idle()).unwrap();
+    });
+    assert_eq!(
+        answer.recv_timeout(Duration::from_millis(200)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    );
+    drop(held);
+    assert_eq!(answer.recv_timeout(Duration::from_secs(10)), Ok(true));
+    thread.join().unwrap();
+}

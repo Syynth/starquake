@@ -142,7 +142,8 @@ impl Dispatcher {
     ///
     /// Every wait left when this is true can end only by another thread's call (there is none
     /// to make one) or by a host thread signalling an event through
-    /// [`Dispatcher::signal_event`], which no service of a run does yet. A core loop whose cores
+    /// [`Dispatcher::signal_event`], which this cannot see: a run whose services signal from a
+    /// host thread (the graphics server's timer turn) asks them first. A core loop whose cores
     /// have all parked asks this to tell a deadlocked guest from one that is waiting for time
     /// to pass.
     #[must_use]

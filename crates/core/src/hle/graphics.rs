@@ -84,6 +84,17 @@
 //! to the end of what it took, since it cannot be stopped half-way: a signal the failure refused
 //! is logged as the kernel's refusal, as `NotImplemented`.
 //!
+//! # Telling a stalled run
+//!
+//! A run ends as an emulator error when every core has parked and nothing could end a wait
+//! (`crate::machine`'s `WAITING`). The kernel's own check (`Dispatcher::is_stalled`) does not
+//! know that the timer thread's turn signals gsv's events, so the core loop asks
+//! [`Graphics::is_idle`] first: a run is stalled only if the graphics server is idle too
+//! (nothing queued, nothing held by the shared page, no page signal waiting) and then the
+//! kernel says so. With [`NullFront`] nothing is in flight on a GPU, so that is everything the
+//! turn could still signal; a GPU front with work in flight must add that (a follow-up for
+//! issue 12's front).
+//!
 //! # Replay
 //!
 //! The spec's replay: "a fake `GpuFront` takes submissions, and the recorded notes are fed back
@@ -394,6 +405,19 @@ impl Graphics {
     #[must_use]
     pub fn deadline(&self) -> Option<HostNanos> {
         self.shared.page_deadline()
+    }
+
+    /// Whether the graphics server has nothing left that could signal an event without a guest's
+    /// call first (module docs, "Telling a stalled run"): nothing queued, no request held by the
+    /// shared page, and no guest signal of the page waiting for its turn. It takes gsv's shared
+    /// lock, so it waits for a drain in progress, whose signals are then made.
+    #[must_use]
+    pub fn is_idle(&self) -> bool {
+        let locked = self.shared.lock();
+        let page = locked.page();
+        let idle = page.held().is_none() && !page.is_signalled() && self.shared.queue().is_empty();
+        drop(locked);
+        idle
     }
 
     /// Feeds the recorded `note` back as the input it records (module docs, "Replay"); the next
