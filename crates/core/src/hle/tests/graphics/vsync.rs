@@ -222,3 +222,50 @@ fn a_recorded_vsync_tick_replays_to_the_same_signal_and_state() {
     assert_eq!(clock(&replay), clock(&run));
     assert_eq!(clock(&replay).0, 2);
 }
+
+/// The vi2 server as a run installs it: the root of a run answers 305 with a session on it,
+/// whose requests are recorded under its own number, and whose request group (31, PR
+/// `CreateRequestGroupEvent`: `0x2f, 1`, the group at word 2) listens to the vsync clock, which
+/// it starts from the services' `Env` clock; the run's turn at the clock's deadline signals the
+/// event the title holds, and a turn a nanosecond before does not. Requests are PR's words:
+/// 305 (`OpenDisplaySession`: `0x141, 2`, the flags at words 2–3, here PR's first), 5
+/// (`GetSessionLimit`: `0x15, 0`).
+#[test]
+fn a_vi2_request_group_is_ticked_through_the_run_s_turn() {
+    use starquake_gsv::root::DISPLAY_SESSION_FLAGS;
+    use starquake_gsv::vi2::command as vi2_command;
+
+    let graphics = Graphics::new(FrontMode::Live, None);
+    let rig = rig_with(&graphics);
+    let root = rig.graphics_root();
+    let [low, high] = halves(DISPLAY_SESSION_FLAGS[0]);
+    let opened = rig.tipc(root, &[0x141, 2, low, high]);
+    assert_eq!((opened.result, opened.copied.len()), (0, 1));
+    let vi2 = opened.copied[0];
+    let limit = rig.tipc(vi2, &[0x15, 0]);
+    assert_eq!((limit.result, limit.data), (0, vec![7]));
+    assert!(graphics.is_idle());
+
+    let group = rig.tipc(vi2, &[0x2F, 1, 0]);
+    assert_eq!((group.result, group.copied.len()), (0, 1));
+    let event = group.copied[0];
+    let deadline = graphics.deadline().unwrap();
+    assert!(deadline.0 >= INTERVAL_NS);
+    assert!(!graphics.is_idle());
+
+    rig.turn_at(&graphics, HostNanos(deadline.0 - 1));
+    assert_eq!(poll(&rig, event), KernelError::TimedOut.code());
+    rig.turn_at(&graphics, deadline);
+    assert_eq!(poll(&rig, event), ResultCode::SUCCESS);
+
+    let ipc = rig.ipc();
+    let tail: Vec<_> = ipc.iter().rev().take(3).rev().copied().collect();
+    assert_eq!(
+        tail,
+        [
+            (GSV_ROOT, root_command::OPEN_DISPLAY_SESSION),
+            (GSV_VI2, vi2_command::GET_REQUEST_GROUP_LIMIT),
+            (GSV_VI2, vi2_command::CREATE_REQUEST_GROUP_EVENT),
+        ]
+    );
+}

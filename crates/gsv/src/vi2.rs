@@ -146,10 +146,13 @@
 //!   1..5 ... also signal the group event once at registration"). Unregistering never fails
 //!   (PR: "the real impls return nothing"): a registration that matches the group, the name and
 //!   the kind is taken out and the group's event signalled; anything else changes nothing.
-//! - **301** refuses with `InvalidCombination` anything but the name [`DEFAULT_DISPLAY`], the
-//!   mask [`DISPLAY_FLAG_63`] and a value of 0 or [`DISPLAY_FLAG_63`] (PR
-//!   `IsSupportedDisplayParameter301`, "only those two forms are accepted"). Nothing keeps the
-//!   flags: PR keeps nothing either, and nothing reads them yet.
+//! - **301** refuses a name other than [`DEFAULT_DISPLAY`] with `InvalidCombination`, and takes
+//!   any value and mask on it. **conflict:** PR accepts only the mask [`DISPLAY_FLAG_63`] with a
+//!   value of 0 or [`DISPLAY_FLAG_63`] (`IsSupportedDisplayParameter301`: "only those two forms
+//!   are accepted", the two it saw the SDK send), though it reads the system module's handler as
+//!   taking any (`(flags & ~mask) | (value & mask)`, "vi2.autogen 0xf37e0"); NX2 auto-stubs
+//!   301 with success. The module's reading contains PR's two forms, so decision 8 takes it.
+//!   Nothing keeps the flags: PR keeps nothing either, and nothing reads them yet.
 //! - **351** refuses a zero client or one not registered with `NotFound`, and an encoding other
 //!   than [`OUTPUT_ENCODING`] with `NotImplemented`. That is every change it could make, so it
 //!   keeps nothing.
@@ -162,6 +165,13 @@
 //! (PR compares the header words with literals and answers `InvalidCombination`; NX2 reads what
 //! comes). A failure reply is the result word alone (the framework's rule): PR also writes its
 //! data words after a failure (104's format, 107's three values, 212's mask), as zero.
+//!
+//! **Logs.** 104 to 107 and 354, which a title calls about 75 times a second (row 119), log at
+//! trace level only; a refused one is still logged at warning by the framework, as every failed
+//! command is. The vsync fallback is logged at info (below, "Vsync"), a clock with no room for a
+//! group at error, and 201's refusal of a bit at or past [`CLIENT_NOTIFICATIONS`] and 351's of
+//! an encoding at warning. `tests/vi2_log_levels.rs` pins the fallback, the full clock and the
+//! display state commands.
 //!
 //! **Notifications.** A notification is a bit of a [`NOTIFICATION_WORDS`]-word bitmap. Raising
 //! one sets its bit and signals the notification event, if 11 has made it. A signal the kernel
@@ -221,6 +231,7 @@
 //! | 32 with a handle naming a live object that is not an event, and a group out of range | `InvalidHandle` (the handle is checked for a readable event first) | auto-stubbed | [`VI_OUT_OF_RANGE`]: the group is checked before the identity, and the server cannot tell an event from another object (`duplicate_checks_the_group_before_the_identity`) |
 //! | 104, 105 | as here | success, no data | PR's (`every_command_s_reply_bytes`) |
 //! | Player displays (`"player1"`–`"player3"`) | opened, bound and closed for GameShare | auto-stubbed | not opened (101 `NotFound`); 102 and 251 answer as PR does for one with no reference (`player_displays_are_not_opened`). Deferred with other displays (spec) |
+//! | 301 with a mask or value other than PR's two forms | `InvalidCombination` | auto-stubbed: success | **conflict**: accepted on the default display, as PR reads the system module (`display_parameter_301_takes_any_flags_on_the_default_display`) |
 //! | 106 | Eden's display resolution: 1 at 1280 × 720, `NotImplemented` otherwise | auto-stubbed | 1: the display is 1280 × 720 (handheld) until output sizes are read from a display description (spec, "Deferred") |
 //! | A failure's data words | written as zero | — | not written: the result word alone (`a_failure_reply_is_the_result_word_alone`) |
 //! | Header words other than PR's | `InvalidCombination` | read as they come | read as they come; only a missing word is refused (`a_short_request_is_refused_and_a_longer_one_is_read`) |
@@ -451,8 +462,8 @@ pub const DISPLAY_STATE_105: u32 = 0;
 pub const DISPLAY_STATE_107: [u64; 3] = [1, 1, 0];
 /// What 354 answers for a known name: PR `ReplyDisplayState(ctx, 0x172, 4, 1)`.
 pub const DISPLAY_STATE_354: u64 = 1;
-/// The display flag 301 sets or clears: PR `IsSupportedDisplayParameter301`, `Bit63 = 1ULL <<
-/// 63`.
+/// The display flag PR's 301 accepts alone (module docs, "Commands": a **conflict**): PR
+/// `IsSupportedDisplayParameter301`, `Bit63 = 1ULL << 63`.
 pub const DISPLAY_FLAG_63: u64 = 1 << 63;
 /// The display monitor kind that is the vsync: PR "Kind 0 is a display native event ... It is
 /// the vsync event".
@@ -1486,10 +1497,7 @@ impl Vi2Session {
         let value = payload.read_u64()?;
         let mask = payload.read_u64()?;
         tracing::debug!(name, value, mask, "gsv:vi2: display parameter 301");
-        let supported = name == DEFAULT_DISPLAY
-            && mask == DISPLAY_FLAG_63
-            && (value == 0 || value == DISPLAY_FLAG_63);
-        if !supported {
+        if name != DEFAULT_DISPLAY {
             return Err(KernelError::InvalidCombination.into());
         }
         reply.ok()

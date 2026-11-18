@@ -1230,28 +1230,33 @@ fn display_state_answers_by_name() {
     );
 }
 
-/// 301 accepts the two forms PR does, and refuses each one-field change of them.
+/// The listed conflict: 301 takes PR's two forms and every one-field change of them PR refuses,
+/// on the default display, whose flags the system module's handler masks in; another name,
+/// even a known one, is refused, with PR's flags or any.
 #[test]
-fn display_parameter_301_takes_two_forms() {
+fn display_parameter_301_takes_any_flags_on_the_default_display() {
     let mut rig = Rig::new();
-    rig.ok(&parameter_301(DEFAULT_DISPLAY, 0, DISPLAY_FLAG_63));
-    rig.ok(&parameter_301(
-        DEFAULT_DISPLAY,
-        DISPLAY_FLAG_63,
-        DISPLAY_FLAG_63,
-    ));
-    for (name, value, mask) in [
-        (UNKNOWN, 0, DISPLAY_FLAG_63),
-        (DEFAULT_DISPLAY, 1, DISPLAY_FLAG_63),
-        (DEFAULT_DISPLAY, DISPLAY_FLAG_63 | 1, DISPLAY_FLAG_63),
-        (DEFAULT_DISPLAY, 0, DISPLAY_FLAG_63 | 1),
-        (DEFAULT_DISPLAY, 0, 0),
+    for (value, mask) in [
+        (0, DISPLAY_FLAG_63),
+        (DISPLAY_FLAG_63, DISPLAY_FLAG_63),
+        (1, DISPLAY_FLAG_63),
+        (DISPLAY_FLAG_63 | 1, DISPLAY_FLAG_63),
+        (0, DISPLAY_FLAG_63 | 1),
+        (0, 0),
+        (u64::MAX, u64::MAX),
     ] {
-        assert_eq!(
-            rig.send(&parameter_301(name, value, mask)),
-            refused(SET_DISPLAY_PARAMETER_301, KernelError::InvalidCombination)
-        );
+        rig.ok(&parameter_301(DEFAULT_DISPLAY, value, mask));
     }
+    let null = u64::from_le_bytes(*b"null\0\0\0\0");
+    for name in [UNKNOWN, null, 0] {
+        for (value, mask) in [(0, DISPLAY_FLAG_63), (1, 1)] {
+            assert_eq!(
+                rig.send(&parameter_301(name, value, mask)),
+                refused(SET_DISPLAY_PARAMETER_301, KernelError::InvalidCombination)
+            );
+        }
+    }
+    assert_eq!(rig.session_state(), Vi2Session::new());
 }
 
 // ----- Clients ------------------------------------------------------------------------------------
