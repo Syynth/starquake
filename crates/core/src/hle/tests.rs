@@ -150,12 +150,26 @@ impl Rig {
 
     /// A rig whose kernel and services read `env`.
     fn with_env(env: LiveEnv) -> Self {
+        Self::with_env_and_log(env, None)
+    }
+
+    /// A rig whose `lm` loggers write to `guest_log`.
+    fn with_guest_log(guest_log: Arc<dyn lm::GuestLog>) -> Self {
+        Self::with_env_and_log(LiveEnv::new(FixedClock::new(0, 1), 0), Some(guest_log))
+    }
+
+    /// A rig whose kernel and services read `env`, installed with [`install_with_guest_log`]
+    /// when there is a `guest_log` and with [`install`] when there is not.
+    fn with_env_and_log(env: LiveEnv, guest_log: Option<Arc<dyn lm::GuestLog>>) -> Self {
         let dispatcher = dispatcher();
         let env = Arc::new(env);
         let services: Arc<dyn Env> = Arc::<LiveEnv>::clone(&env);
         let ready = Arc::new(ReadyServers::default());
         let fsp_reads = reads_on(Arc::clone(&services), &ready);
-        install(&dispatcher, services, fsp_reads).unwrap();
+        match guest_log {
+            Some(log) => install_with_guest_log(&dispatcher, services, fsp_reads, log).unwrap(),
+            None => install(&dispatcher, services, fsp_reads).unwrap(),
+        }
         let recorder = Recorder::new();
         let events = Arc::new(VecSink::new());
         recorder.add_sink(Arc::clone(&events));
@@ -326,6 +340,9 @@ fn every_service_has_its_name_and_no_other_number_has_one() {
     assert_eq!(service_name(HID), Some("hid"));
     assert_eq!(service_name(TIME_U), Some("time:u"));
     assert_eq!(service_name(GSV_ROOT), Some("gsv"));
+    assert_eq!(service_name(LM), Some("lm"));
+    assert_eq!(service_name(ECTX_AW), Some("ectx:aw"));
+    assert_eq!(service_name(AOC_U), Some("aoc:u"));
     assert_eq!(service_name(ServiceId(0)), None);
     assert_eq!(service_name(ServiceId(9)), None);
 }
@@ -870,4 +887,99 @@ fn time_u_hands_out_its_clocks_its_shared_memory_and_a_calendar_time() {
     assert_eq!(data[8..16], [0; 8]);
     assert_eq!(data[16..24], time::calendar::UTC_NAME);
     assert_eq!(rig.ipc().last(), Some(&(TIME_U, to_calendar)));
+}
+
+/// A guest log that keeps every line, for `lm`.
+#[derive(Default)]
+struct Lines(Mutex<Vec<Vec<u8>>>);
+
+impl lm::GuestLog for Lines {
+    fn line(&self, text: &[u8]) {
+        self.0.lock().unwrap().push(text.to_vec());
+    }
+}
+
+/// One whole `lm` log packet whose message is a text chunk of `text`
+/// (`starquake_services::lm::packet`, "The layout").
+fn log_packet(text: &[u8]) -> Vec<u8> {
+    use starquake_services::lm::packet::{ChunkKey, FLAG_HEAD, FLAG_TAIL};
+    let len = u8::try_from(text.len()).unwrap();
+    assert!(len < 0x80, "one LEB128 byte");
+    let mut chunk = vec![u8::try_from(ChunkKey::TextLog.raw()).unwrap(), len];
+    chunk.extend(text);
+    let mut packet = Vec::new();
+    packet.extend(0u64.to_le_bytes());
+    packet.extend(1u64.to_le_bytes());
+    packet.extend([FLAG_HEAD | FLAG_TAIL, 0, 1, 0]);
+    packet.extend(u32::try_from(chunk.len()).unwrap().to_le_bytes());
+    packet.extend(chunk);
+    packet
+}
+
+/// `lm` behind the real dispatcher: `GetService("lm")` hands out a session on [`LM`], whose
+/// logger writes a finished message's text to the guest log `install_with_guest_log` was given.
+#[test]
+fn lm_logs_to_the_guest_log_it_is_given() {
+    let lines = Arc::new(Lines::default());
+    let rig = Rig::with_guest_log(Arc::<Lines>::clone(&lines));
+    let lm_session = rig.service(lm::NAME);
+    let open_logger = command(&lm::Lm, "open_logger");
+    let open = libnx(open_logger).send_pid(0).data(&0_u64.to_le_bytes());
+    let (code, buffer) = rig.send(lm_session, &open);
+    let (word, _, moved) = reply(&buffer, 0);
+    assert_eq!((code, word, moved.len()), (ResultCode::SUCCESS, 0, 1));
+    assert_eq!(rig.ipc().last(), Some(&(LM, open_logger)));
+
+    let logger = Handle::from_raw(moved[0]);
+    let packet = log_packet(b"hello from lm");
+    rig.memory.write(PATH, &packet).unwrap();
+    let log = libnx(command(&lm::ILogger::new(), "log"))
+        .send_buffer(BufferDescriptor {
+            address: PATH,
+            size: u64::try_from(packet.len()).unwrap(),
+            flags: 0,
+        })
+        .static_descriptor(StaticDescriptor {
+            counter: 0,
+            address: 0,
+            size: 0,
+        });
+    let (code, buffer) = rig.send(logger, &log);
+    let (word, _, _) = reply(&buffer, 0);
+    assert_eq!((code, word), (ResultCode::SUCCESS, 0));
+    assert_eq!(*lines.0.lock().unwrap(), [b"hello from lm".to_vec()]);
+}
+
+/// [`install`] gives `lm` a guest log that keeps nothing: the logger still answers.
+#[test]
+fn install_gives_lm_a_guest_log_that_keeps_nothing() {
+    let rig = Rig::new();
+    let lm_session = rig.service(lm::NAME);
+    let open = libnx(command(&lm::Lm, "open_logger"))
+        .send_pid(0)
+        .data(&0_u64.to_le_bytes());
+    let (code, buffer) = rig.send(lm_session, &open);
+    let (_, _, moved) = reply(&buffer, 0);
+    assert_eq!((code, moved.len()), (ResultCode::SUCCESS, 1));
+}
+
+/// `ectx:aw` and `aoc:u` behind the real dispatcher: `GetService` hands out a session on each
+/// one's own server, and each answers its first command.
+#[test]
+fn ectx_aw_and_aoc_u_have_servers_of_their_own() {
+    let rig = Rig::new();
+    let ectx_session = rig.service(ectx::AW_NAME);
+    let create = command(&ectx::EctxAw, "create_context_registrar");
+    let (code, buffer) = rig.send(ectx_session, &libnx(create));
+    let (word, _, moved) = reply(&buffer, 0);
+    assert_eq!((code, word, moved.len()), (ResultCode::SUCCESS, 0, 1));
+    assert_eq!(rig.ipc().last(), Some(&(ECTX_AW, create)));
+
+    let aoc_session = rig.service(aoc::U_NAME);
+    let count = command(&aoc::IAddOnContentManager, "count_add_on_content");
+    let request = libnx(count).send_pid(0).data(&0_u64.to_le_bytes());
+    let (code, buffer) = rig.send(aoc_session, &request);
+    let (word, data, _) = reply(&buffer, 4);
+    assert_eq!((code, word, data), (ResultCode::SUCCESS, 0, vec![0; 4]));
+    assert_eq!(rig.ipc().last(), Some(&(AOC_U, count)));
 }
