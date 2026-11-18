@@ -368,7 +368,7 @@ impl IpcContext<'_> {
     }
 
     /// Asks to end the sender's process ([`Sender::process`]) once this request is over
-    /// (services spec, "Writing a service": a service "end[s] the calling process"): its reply
+    /// (services spec, "Writing a service": a service "end\[s\] the calling process"): its reply
     /// is written into the sender's message buffer and its result into the sender's registers,
     /// its events are recorded, and then the process is ended through the path `ExitProcess`
     /// takes ([`crate::svc::process::terminate_process`]). The sender's own dispatch then ends
