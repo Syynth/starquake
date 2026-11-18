@@ -242,6 +242,14 @@ fn union_and_intersects_are_bitwise() {
     assert!(both.intersects(Capability::APPLICATION));
     assert!(!both.intersects(Capability::STATUS));
     assert!(!Capability::NONE.intersects(Capability::NONE));
+    // Two bits without `Application`'s, and a capability with itself.
+    let status_and_system = Capability::STATUS.union(Capability::SYSTEM);
+    assert_eq!(
+        status_and_system.bits(),
+        Capability::STATUS.bits() | Capability::SYSTEM.bits()
+    );
+    assert_eq!(status_and_system.union(status_and_system), status_and_system);
+    assert_eq!(Capability::NONE.union(Capability::NONE), Capability::NONE);
 }
 
 /// A capability is decoded through [`Capability::from_bits`], and its layout is a `postcard`
@@ -266,6 +274,19 @@ fn a_service_is_saved_as_its_flag() {
     let initialized = IParentalControlService { initialized: true };
     assert_eq!(encode(&initialized).unwrap(), [1]);
     assert_eq!(encode(&IParentalControlServiceFactory).unwrap(), [0_u8; 0]);
+}
+
+/// The ids, from Eden's tables (`parental_control_service_factory.cpp`: `{0, ..CreateService..}`,
+/// `{1, ..CreateServiceWithoutInitialize..}`; `parental_control_service.cpp`: `{1,
+/// ..Initialize..}`), and libnx's (`pctl.c`: `_pctlCreateService` with id 0 before 4.0.0 and 1
+/// after, then `_pctlCmdNoIO(1)`). Every other test reaches them through the constants, so this
+/// is what pins their values.
+#[test]
+fn the_command_ids_are_eden_s() {
+    assert_eq!(
+        (CREATE_SERVICE, CREATE_SERVICE_WITHOUT_INITIALIZE, INITIALIZE),
+        (0, 1, 1)
+    );
 }
 
 #[test]
