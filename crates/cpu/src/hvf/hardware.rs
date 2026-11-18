@@ -235,3 +235,76 @@ fn a_guest_store_to_the_shim_or_its_tables_is_stopped_by_stage_2() {
         .unwrap();
     assert_eq!(bytes, shim);
 }
+
+/// `hv_sys_reg_t` of `CNTFRQ_EL0`: op0 3, op1 3, CRn 14, CRm 0, op2 0, encoded as `ffi`'s other
+/// system registers are. Not a register the SDK headers name (`hv_vcpu_types.h`); the test
+/// below checks that Hypervisor.framework refuses it.
+const CNTFRQ_EL0: u16 = (3 << 14) | (3 << 11) | (14 << 7);
+/// `HV_BAD_ARGUMENT` (`hv_error.h`).
+const HV_BAD_ARGUMENT: u32 = 0xfae9_4003;
+/// `msr cntfrq_el0, x0`, `mrs x1, cntfrq_el0`, `hvc #HVC_FLUSH_DONE` (assembled with LLVM).
+const WRITE_CNTFRQ: [u32; 3] = [0xd51b_e000, 0xd53b_e001, 0xd400_0062];
+/// `mrs x1, cntfrq_el0`, `svc #1`, as EL0 code.
+const READ_CNTFRQ: [u32; 2] = [0xd53b_e001, 0xd400_0021];
+
+#[test]
+fn the_guests_counter_frequency_cannot_be_changed() {
+    let Some(mut machine) = Machine::new() else {
+        return;
+    };
+    let host_hz = machine.backend.counter_frequency();
+    let wanted = host_hz + 1;
+    assert_eq!(WRITE_CNTFRQ[2], shim::hvc(shim::HVC_FLUSH_DONE));
+    // Hypervisor.framework refuses the register outright, for reading and writing.
+    let vcpu = &machine.vcpu;
+    // SAFETY: called on the owning thread with a live id.
+    let set = unsafe { ffi::hv_vcpu_set_sys_reg(vcpu.id, CNTFRQ_EL0, wanted) };
+    assert_eq!(u32::from_ne_bytes(set.to_ne_bytes()), HV_BAD_ARGUMENT);
+    assert_eq!(
+        vcpu.sys(CNTFRQ_EL0),
+        Err(Error::Host(format!(
+            "hv_vcpu_get_sys_reg failed: {HV_BAD_ARGUMENT:#x}"
+        )))
+    );
+    // The guest's EL1 cannot write it either: the `msr` is UNDEFINED there. The code goes in
+    // the shim's page past the shim (EL1 can execute only there), and the UNDEFINED lands in
+    // the shim's unused "current EL" vector, which reports itself with `hvc #1`.
+    let at = shim::LEN.next_multiple_of(16);
+    assert!(at + 4 * WRITE_CNTFRQ.len() <= usize::try_from(PAGE).unwrap());
+    let bytes: Vec<u8> = WRITE_CNTFRQ.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let at = u64::try_from(at).unwrap();
+    machine
+        .backend
+        .vm
+        .system
+        .write(CODE_OFFSET + at, &bytes)
+        .unwrap();
+    vcpu.set_reg(ffi::REG_X0, wanted).unwrap();
+    vcpu.set_reg(ffi::REG_PC, SHIM_VA + at).unwrap();
+    vcpu.set_reg(ffi::REG_CPSR, shim::CPSR_EL1H_MASKED).unwrap();
+    let exit = vcpu.enter().unwrap();
+    assert_eq!(exit.reason, ffi::EXIT_REASON_EXCEPTION);
+    assert_eq!(
+        hvc_immediate(exit.exception.syndrome),
+        Some(shim::HVC_UNEXPECTED_VECTOR)
+    );
+    assert_eq!(vcpu.sys(ffi::ELR_EL1).unwrap(), SHIM_VA + at, "the msr");
+    let esr = Syndrome::from_esr(vcpu.sys(ffi::ESR_EL1).unwrap());
+    assert_eq!(esr.class(), ExceptionClass::Unknown);
+    vcpu.park().unwrap();
+    // And EL0 still reads the host's rate.
+    let page = machine.backend.ram().base() + PAGE_SIZE;
+    let bytes: Vec<u8> = READ_CNTFRQ.iter().flat_map(|w| w.to_le_bytes()).collect();
+    machine.backend.physical().write(page, &bytes).unwrap();
+    let code = CODE + PAGE_SIZE;
+    machine
+        .tables
+        .map(
+            code,
+            BackingRange::new(page, PAGE_SIZE).unwrap(),
+            Perms::ReadExecute,
+        )
+        .unwrap();
+    assert_eq!(machine.probe(code, 0), Ok(Exit::Svc(1)));
+    assert_eq!(machine.vcpu.regs().unwrap().x[1], host_hz);
+}

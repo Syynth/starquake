@@ -1,8 +1,8 @@
 //! The guest-side EL1 shim: an exception vector table that turns EL0 exceptions into host exits.
 //!
 //! Guest code runs at EL0. Every exception it takes lands in this table at EL1, which either
-//! handles it in the guest (a trapped `mrs xN, cntpct_el0`, answered from the virtual counter) or
-//! hands it to the host with `hvc #2`. The host then reads `ESR_EL1`, `FAR_EL1` and `ELR_EL1`
+//! handles it in the guest (a trapped `mrs xN, cntpct_el0`, answered from the virtual counter
+//! rescaled to the guest's rate: "Counter reads" below) or hands it to the host with `hvc #2`. The host then reads `ESR_EL1`, `FAR_EL1` and `ELR_EL1`
 //! directly, so the shim passes nothing in general-purpose registers. Between runs a vCPU is
 //! *parked* on the shim's `eret`: its EL0 state lives in `ELR_EL1`/`SPSR_EL1`, and every run starts
 //! by returning to EL0.
@@ -14,6 +14,34 @@
 //! The shim is mapped in the upper half of the address space, through `TTBR1_EL1` and static
 //! tables the backend owns (`docs/specs/execution-model.md`, "Native backends"), so the tables
 //! a guest's address space is built from never describe it.
+//!
+//! # Counter reads
+//!
+//! An EL0 `mrs xN, cntpct_el0` traps to the shim (`CNTKCTL_EL1.EL0PCTEN` is clear), which
+//! dispatches on `Rt` to one of 32 stubs. Each reads `CNTVCT_EL0` and rescales it with the
+//! vCPU's counter scale, which the host keeps in the scratch slot [`SCALE_BELOW_SP`] bytes
+//! below `SP_EL1` (the fraction first, then the integer part):
+//!
+//! ```text
+//! guest = count * int + umulh(count, frac)      (64-bit wrapping arithmetic)
+//! ```
+//!
+//! This is the loader's patched trampoline's arithmetic (`FixedRatio::scale` in
+//! `starquake-loader`'s `patch` module), in its general two-multiply shape, which gives the
+//! same result as the trampoline's one-multiply shapes for every count when the integer part is
+//! 0 or 1. Given the same `int` and `frac`, an unpatched read and a patched one taken at the same
+//! count read the same value. A stub computes in x9-x11, moves the result to `Rt`, reloads the
+//! borrowed registers other than `Rt` and returns:
+//!
+//! ```text
+//! +0x00  ldp   x10, x11, [sp, #-48]     frac, int
+//! +0x04  mrs   x9, cntvct_el0
+//! +0x08  umulh x10, x9, x10
+//! +0x0c  madd  x9, x9, x11, x10
+//! +0x10  mov   xRt, x9                  (`mov xzr, x9` discards it for Rt = 31)
+//! +0x14  two reloads of the borrowed registers other than Rt (`stub_restore`)
+//! +0x1c  eret
+//! ```
 //!
 //! # TLB flush
 //!
@@ -35,7 +63,8 @@
 //! where it stopped.
 //!
 //! Ported from `tools/hvprobe/src/guest.rs` (vector table, `hvc` forwarding, in-guest counter
-//! emulation); this version preserves every EL0 register and emulates `cntpct_el0` for any `Rt`.
+//! emulation); this version preserves every EL0 register, emulates `cntpct_el0` for any `Rt` and
+//! rescales what it reads.
 //! The words were assembled with LLVM from the assembly beside them. Exception classes and the
 //! ISS layout are from the Arm Architecture Reference Manual (DDI 0487), `ESR_EL1`.
 
@@ -56,10 +85,13 @@ pub(super) const TO_HOST: usize = 0x450;
 pub(super) const PARKED: usize = 0x45c;
 /// Start of the 32 counter stubs, one per `Rt` (31 is `xzr`).
 pub(super) const STUBS: usize = 0x800;
-/// Size of one counter stub.
-pub(super) const STUB_LEN: usize = 16;
-/// Offset of the `eret` inside a counter stub (after it has written `Rt`).
-const STUB_ERET: usize = 12;
+/// Size of one counter stub: [`STUB_WORDS`] instructions.
+pub(super) const STUB_LEN: usize = 4 * STUB_WORDS;
+/// Instructions in one counter stub (see "Counter reads" in the module docs).
+const STUB_WORDS: usize = 8;
+/// Offset of the `eret` inside a counter stub (after it has written `Rt` and reloaded the
+/// borrowed registers).
+const STUB_ERET: usize = STUB_LEN - 4;
 /// End of the counter stubs.
 const STUBS_END: usize = STUBS + 32 * STUB_LEN;
 /// Entry point: invalidate x1 pages starting with the one x0 names, at every level.
@@ -73,6 +105,13 @@ const FLUSH_END: usize = FLUSH_ASID + 4 * FLUSH_WHOLE_ASID.len();
 
 /// How far below `SP_EL1` the shim saves x9 (x10 and x11 follow at +8 and +16).
 pub(super) const SCRATCH_BELOW_SP: u64 = 32;
+/// How far below `SP_EL1` the vCPU's counter scale is kept: its fraction, then 8 bytes above
+/// it its integer part (see "Counter reads" in the module docs). Below the saved registers.
+pub(super) const SCALE_BELOW_SP: u64 = 48;
+/// Bytes of the counter scale: the fraction and the integer part, 8 bytes each.
+pub(super) const SCALE_LEN: usize = 16;
+
+const _: () = assert!(SCALE_BELOW_SP - SCALE_LEN as u64 >= SCRATCH_BELOW_SP);
 
 /// `hvc` immediate for "EL0 took an exception the host must handle". It must not be 0: the
 /// guest's x0 is arbitrary at an exception (an `svc` argument, a counter value), and
@@ -98,20 +137,49 @@ pub(super) const MODE_EL1H: u64 = 0x5;
 /// the host. The classes of exceptions EL0 takes are [`ExceptionClass`]'s.
 pub(super) const EC_HVC64: u8 = 0x16;
 
+/// `hvc` immediate for "an exception came to a vector the shim does not use" (every vector but
+/// [`EL0_SYNC`]), such as an exception taken at EL1.
+pub(super) const HVC_UNEXPECTED_VECTOR: u16 = 1;
+
 /// `hvc #imm`.
-const fn hvc(imm: u16) -> u32 {
+pub(super) const fn hvc(imm: u16) -> u32 {
     0xd400_0002 | ((imm as u32) << 5)
 }
 
 const HVC_TO_HOST: u32 = hvc(HVC_EL0_EXCEPTION);
 const HVC_AFTER_FLUSH: u32 = hvc(HVC_FLUSH_DONE);
-const HVC_1: u32 = hvc(1); // hvc #1: an exception the shim doesn't expect
+const HVC_1: u32 = hvc(HVC_UNEXPECTED_VECTOR); // hvc #1: an exception the shim doesn't expect
 const ERET: u32 = 0xd69f_03e0; // eret
-const STUB_RESTORE: [u32; 2] = [
-    0xa97e_2be9, // ldp  x9, x10, [sp, #-32]
-    0xf85f_03eb, // ldur x11, [sp, #-16]
+const NOP: u32 = 0xd503_201f; // nop
+/// Reloads all three borrowed registers, as the path to the host does.
+const STUB_RESTORE: [u32; 2] = [LDP_X9_X10, LDUR_X11];
+const LDP_X9_X10: u32 = 0xa97e_2be9; // ldp  x9, x10, [sp, #-32]
+const LDUR_X9: u32 = 0xf85e_03e9; // ldur x9, [sp, #-32]
+const LDUR_X10: u32 = 0xf85e_83ea; // ldur x10, [sp, #-24]
+const LDUR_X11: u32 = 0xf85f_03eb; // ldur x11, [sp, #-16]
+/// The start of every counter stub: the rescaled count in x9.
+const STUB_SCALE: [u32; 4] = [
+    0xa97d_2fea, // ldp   x10, x11, [sp, #-48]     frac, int (SCALE_BELOW_SP)
+    0xd53b_e049, // mrs   x9, cntvct_el0
+    0x9bca_7d2a, // umulh x10, x9, x10
+    0x9b0b_2929, // madd  x9, x9, x11, x10
 ];
-const MRS_CNTVCT_X0: u32 = 0xd53b_e040; // mrs x0, cntvct_el0 (Rt in bits 4:0)
+const MOV_FROM_X9: u32 = 0xaa09_03e0; // mov x0, x9 (Rd in bits 4:0; 31 is xzr)
+/// Registers 9, 10 and 11: the ones the shim borrows.
+const X9: u32 = 9;
+const X10: u32 = 10;
+const X11: u32 = 11;
+
+/// The two reloads in the stub for `rt`: every borrowed register but `rt`, which holds the
+/// result. `nop` pads the stub for x11, where one `ldp` reloads both others.
+const fn stub_restore(rt: u32) -> [u32; 2] {
+    match rt {
+        X9 => [LDUR_X10, LDUR_X11],
+        X10 => [LDUR_X9, LDUR_X11],
+        X11 => [LDP_X9_X10, NOP],
+        _ => STUB_RESTORE,
+    }
+}
 
 /// The handler at [`EL0_SYNC`].
 const EL0_SYNC_HANDLER: [u32; 24] = [
@@ -130,7 +198,7 @@ const EL0_SYNC_HANDLER: [u32; 24] = [
     0x5400_0101, // 0x430  b.ne TO_HOST
     0xd345_252a, // 0x434  ubfx x10, x9, #5, #5             Rt
     0x1000_1e4b, // 0x438  adr  x11, STUBS
-    0x8b0a_116b, // 0x43c  add  x11, x11, x10, lsl #4       16 bytes per stub
+    0x8b0a_156b, // 0x43c  add  x11, x11, x10, lsl #5       32 bytes per stub (STUB_LEN)
     0xd538_402a, // 0x440  mrs  x10, elr_el1
     0x9100_114a, // 0x444  add  x10, x10, #4                skip the mrs
     0xd518_402a, // 0x448  msr  elr_el1, x10
@@ -183,15 +251,21 @@ const fn build() -> [u32; LEN / 4] {
         words[EL0_SYNC / 4 + i] = EL0_SYNC_HANDLER[i];
         i += 1;
     }
-    // Stub `Rt`: restore x9-x11, then `mrs xRt, cntvct_el0` and `eret`.
+    // Stub `Rt`: rescale the count into x9, move it to `Rt`, reload the others and `eret`.
     let (mut rt, mut stub) = (0, STUBS / 4);
     while stub < STUBS_END / 4 {
-        words[stub] = STUB_RESTORE[0];
-        words[stub + 1] = STUB_RESTORE[1];
-        words[stub + 2] = MRS_CNTVCT_X0 | rt;
-        words[stub + 3] = ERET;
+        let mut i = 0;
+        while i < STUB_SCALE.len() {
+            words[stub + i] = STUB_SCALE[i];
+            i += 1;
+        }
+        let restore = stub_restore(rt);
+        words[stub + 4] = MOV_FROM_X9 | rt;
+        words[stub + 5] = restore[0];
+        words[stub + 6] = restore[1];
+        words[stub + 7] = ERET;
         rt += 1;
-        stub += STUB_LEN / 4;
+        stub += STUB_WORDS;
     }
     let mut i = 0;
     while i < FLUSH_BY_PAGE.len() {
@@ -304,6 +378,7 @@ mod tests {
         );
         assert_ne!(HVC_EL0_EXCEPTION, 1, "hvc #1 means an unexpected vector");
         assert_eq!(hvc(1), 0xd400_0022);
+        assert_eq!(HVC_1, 0xd400_0022);
         assert_eq!(hvc(0), 0xd400_0002);
         assert_eq!(word(PARKED), ERET);
         assert_eq!(STUBS_END, FLUSH_PAGES);
@@ -363,6 +438,9 @@ mod tests {
         let adr = word(0x438);
         let imm = usize::try_from(((adr >> 5) & 0x7_ffff) << 2 | ((adr >> 29) & 3)).unwrap();
         assert_eq!(0x438 + imm, STUBS);
+        // add x11, x11, x10, lsl #imm6: imm6 at bits 15:10 scales Rt to its stub.
+        let shift = (word(0x43c) >> 10) & 0x3f;
+        assert_eq!(1 << shift, STUB_LEN);
     }
 
     #[test]
@@ -374,14 +452,75 @@ mod tests {
         }
     }
 
+    /// The words of the stub for `rt`.
+    fn stub(rt: usize) -> [u32; STUB_WORDS] {
+        let at = (STUBS + rt * STUB_LEN) / 4;
+        WORDS[at..at + STUB_WORDS].try_into().unwrap()
+    }
+
     #[test]
-    fn each_stub_writes_its_own_register() {
-        for rt in 0..32 {
-            let stub = STUBS + rt * STUB_LEN;
-            assert_eq!(word(stub), STUB_RESTORE[0]);
-            assert_eq!(word(stub + 4), STUB_RESTORE[1]);
-            assert_eq!(word(stub + 8), MRS_CNTVCT_X0 | u32::try_from(rt).unwrap());
-            assert_eq!(word(stub + STUB_ERET), ERET);
+    fn each_stub_rescales_into_its_own_register_and_reloads_the_others() {
+        // The words LLVM assembles for the stubs of x0, the three borrowed registers, x30 and
+        // xzr, written out in full.
+        let scale = [
+            0xa97d_2fea, // ldp   x10, x11, [sp, #-48]
+            0xd53b_e049, // mrs   x9, cntvct_el0
+            0x9bca_7d2a, // umulh x10, x9, x10
+            0x9b0b_2929, // madd  x9, x9, x11, x10
+        ];
+        let stub_of = |mov: u32, reload: [u32; 2]| {
+            let mut words = [0; STUB_WORDS];
+            words[..4].copy_from_slice(&scale);
+            words[4] = mov;
+            words[5..7].copy_from_slice(&reload);
+            words[7] = 0xd69f_03e0; // eret
+            words
+        };
+        let all = [0xa97e_2be9, 0xf85f_03eb]; // ldp x9, x10, [sp, #-32]; ldur x11, [sp, #-16]
+        assert_eq!(stub(0), stub_of(0xaa09_03e0, all)); // mov x0, x9
+        assert_eq!(stub(30), stub_of(0xaa09_03fe, all)); // mov x30, x9
+        assert_eq!(stub(31), stub_of(0xaa09_03ff, all)); // mov xzr, x9
+        // mov x9, x9; ldur x10, [sp, #-24]; ldur x11, [sp, #-16]
+        assert_eq!(stub(9), stub_of(0xaa09_03e9, [0xf85e_83ea, 0xf85f_03eb]));
+        // mov x10, x9; ldur x9, [sp, #-32]; ldur x11, [sp, #-16]
+        assert_eq!(stub(10), stub_of(0xaa09_03ea, [0xf85e_03e9, 0xf85f_03eb]));
+        // mov x11, x9; ldp x9, x10, [sp, #-32]; nop
+        assert_eq!(stub(11), stub_of(0xaa09_03eb, [0xa97e_2be9, 0xd503_201f]));
+        // Every other register's stub has the shape of x0's, with its own destination.
+        for rt in (1..9).chain(12..32) {
+            let mov = 0xaa09_03e0 | u32::try_from(rt).unwrap();
+            assert_eq!(stub(rt), stub_of(mov, all), "x{rt}");
+        }
+        // The scale is read from where the host keeps it: `ldp` scales its offset by 8, and the
+        // load reads the fraction (x10) first and the integer part (x11) above it.
+        let imm7 = (scale[0] >> 15) & 0x7f;
+        let offset = i64::from(imm7) - 0x80;
+        assert_eq!(offset * 8, -i64::try_from(SCALE_BELOW_SP).unwrap());
+        assert_eq!(SCALE_LEN, 16);
+        // The saved registers sit between the scale and SP_EL1, clear of each other.
+        assert!(SCALE_BELOW_SP - u64::try_from(SCALE_LEN).unwrap() >= SCRATCH_BELOW_SP);
+    }
+
+    #[test]
+    fn a_stub_moves_the_result_before_reloading_and_never_reloads_its_own_register() {
+        // Each reload word names the register it writes in bits 4:0 (and an `ldp` its second in
+        // bits 14:10): none of them may be `rt`, or the result would be lost.
+        let writes = |word: u32| -> Vec<u32> {
+            match word {
+                LDP_X9_X10 => vec![X9, X10],
+                LDUR_X9 | LDUR_X10 | LDUR_X11 => vec![word & 0x1f],
+                NOP => vec![],
+                other => panic!("{other:#x} is not a reload"),
+            }
+        };
+        for rt in 0..32u32 {
+            let words = stub(usize::try_from(rt).unwrap());
+            let reloaded: Vec<u32> = words[5..7].iter().flat_map(|&w| writes(w)).collect();
+            let mut expected: Vec<u32> = [X9, X10, X11].into_iter().filter(|&r| r != rt).collect();
+            let mut sorted = reloaded.clone();
+            sorted.sort_unstable();
+            expected.sort_unstable();
+            assert_eq!(sorted, expected, "x{rt}");
         }
     }
 
@@ -473,7 +612,9 @@ mod tests {
                 "{offset:#x}"
             );
         }
-        // Counter path after ELR_EL1 moved, and inside a stub before it wrote Rt.
+        // Counter path after ELR_EL1 moved, and inside a stub before its `eret`: the scale and
+        // the count loaded, the result computed, moved to Rt, the others partly reloaded. Each
+        // is undone by reloading all three borrowed registers and reading the counter again.
         let undo = Some(Recovery {
             restore_scratch: true,
             rewind_elr: true,
@@ -481,9 +622,13 @@ mod tests {
         assert_eq!(recovery(ELR_BUMPED, CNTPCT_ESR), undo);
         for rt in 0..32 {
             let stub = STUBS + rt * STUB_LEN;
-            for offset in [stub, stub + 4, stub + 8] {
+            let before_eret: Vec<usize> = (stub..stub + STUB_ERET).step_by(4).collect();
+            assert_eq!(before_eret.len(), STUB_WORDS - 1);
+            for offset in before_eret {
                 assert_eq!(recovery(offset, CNTPCT_ESR), undo, "{offset:#x}");
             }
+            // At the `eret` the read is complete: Rt holds it and the others are the guest's.
+            assert_eq!(word(stub + STUB_ERET), ERET);
             assert_eq!(recovery(stub + STUB_ERET, CNTPCT_ESR), Some(none));
         }
         assert_eq!(recovery(PARKED, SVC_ESR), Some(none));
