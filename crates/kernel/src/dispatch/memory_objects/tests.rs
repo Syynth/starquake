@@ -670,8 +670,8 @@ fn make_shared(world: &World, sizes: &[u64]) -> Vec<SvcResult<u64>> {
             Ok(())
         }),
     );
-    let made = results.lock().unwrap().clone();
-    made
+
+    results.lock().unwrap().clone()
 }
 
 #[test]

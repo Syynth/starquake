@@ -759,7 +759,7 @@ enum Came {
     OutOfMemory,
 }
 
-fn came<T>(result: Result<T, MapperError>) -> Came {
+fn came<T>(result: &Result<T, MapperError>) -> Came {
     match result {
         Ok(_) => Came::Ok,
         Err(MapperError::Refused(_)) => Came::Refused,
@@ -773,13 +773,13 @@ fn give_back_scenario(mapper: &mut dyn Mapper) -> (Vec<Came>, BackingRange, Back
     let pages = mapper.allocate_shared(PAGE_SIZE).unwrap().backing();
     let larger = BackingRange::new(pages.base(), 2 * PAGE_SIZE).unwrap();
     let steps = vec![
-        came(mapper.map_shared(LOW, pages, Perms::ReadWrite)),
-        came(mapper.release_shared(pages)),
-        came(mapper.release_shared(larger)),
-        came(mapper.unmap(LOW, PAGE_SIZE)),
-        came(mapper.release_shared(pages)),
-        came(mapper.release_shared(pages)),
-        came(mapper.allocate_shared(u64::MAX - (PAGE_SIZE - 1))),
+        came(&mapper.map_shared(LOW, pages, Perms::ReadWrite)),
+        came(&mapper.release_shared(pages)),
+        came(&mapper.release_shared(larger)),
+        came(&mapper.unmap(LOW, PAGE_SIZE)),
+        came(&mapper.release_shared(pages)),
+        came(&mapper.release_shared(pages)),
+        came(&mapper.allocate_shared(u64::MAX - (PAGE_SIZE - 1))),
     ];
     (
         steps,
