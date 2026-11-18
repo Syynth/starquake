@@ -410,7 +410,9 @@ impl IpcContext<'_> {
     }
 
     /// Takes a device-share lock on the sender's `size` bytes at `address`
-    /// ([`AddressSpace::lock_device_share`], whose errors these are): while it is held, the CPU
+    /// ([`AddressSpace::lock_device_share`], whose errors these are, and
+    /// [`KernelError::TerminationRequested`], with nothing locked, once the process has ended):
+    /// while it is held, the CPU
     /// mapping under the range cannot change. Returns the token that names the process and the
     /// exact range; each lock is released by one unlock of its token, on the timer thread
     /// ([`Dispatcher::unlock_device_share`]) or during a request
@@ -423,8 +425,9 @@ impl IpcContext<'_> {
 
     /// Releases the device-share lock `token` names, as [`Dispatcher::unlock_device_share`]
     /// does: what a server does when a request that took a lock fails after taking it. A
-    /// refusal of the token itself is [`KernelError::InvalidCurrentMemory`]
-    /// (`DeviceShareError`'s mapping); the address space's own refusals are its results.
+    /// refusal of the token itself is [`KernelError::TerminationRequested`] when its process has
+    /// ended and [`KernelError::InvalidCurrentMemory`] otherwise (`DeviceShareError`'s
+    /// mapping); the address space's own refusals are its results.
     pub fn unlock_device_share(&mut self, token: DeviceShareToken) -> SvcResult<()> {
         self.dispatcher
             .unlock_device_share(token)

@@ -18,6 +18,7 @@
 //! | `Syncpoints::increment`, for a watched id only (the watched-id fast path, below) | the same | [`Completion::Gpu`] with [`GpuCompletion::SyncpointChanged`] |
 //! | The kernel's hook on an event gsv created ([`EventHook`]), after the kernel lock is released | [`EventHook::signalled`] | [`Completion::GuestSignalled`] |
 //! | The thread that learns the host GPU is past the work that could use a device-share lock | [`CompletionQueue::push`] | [`Completion::DeviceShareReleased`] |
+//! | nvsrv's family, when the server's last session closes and frees the process's nvmap handles ([`crate::nvsrv::nvmap`], "When the process's last session closes"), with the kernel's lock held | [`CompletionQueue::push`] | [`Completion::DeviceShareReleased`], one per handle that held a lock, in ascending handle order |
 //! | gsv's syncpt session, arming a wait the counter already satisfies, so the drain fires and records it ([`crate::syncpt`], "Commands": 201) | [`CompletionQueue::push`] | [`Completion::Gpu`] with [`GpuCompletion::SyncpointChanged`] |
 //!
 //! **A device-share release** (owner's ruling of 2026-11-17, graphics-server "The model"):
@@ -104,7 +105,10 @@
 //! is held only to push or take, never across a call out of this module, and gsv's shared lock
 //! is never taken by a push, so a pusher waits at most for one push or one take of the queue's
 //! own entries (`a_push_does_not_wait_for_the_shared_lock`, in `shared/tests.rs`). The
-//! [`Wake`] is told with no lock held (`the_wake_is_told_with_no_lock_held`), and only when the
+//! [`Wake`] is told with the queue's lock released (`the_wake_is_told_with_no_lock_held`); the
+//! pusher may hold a lock of its own (nvsrv's family pushes the releases of a closed session's
+//! nvmap locks with the kernel's lock held, `NvsrvFamily`'s `session_closed`), which is why the
+//! [`Wake`] must not take the kernel's lock. It is told only when the
 //! queue goes from empty to not empty: the timer thread takes everything when it drains, so a
 //! push onto a non-empty queue has already been announced
 //! (`the_timer_is_woken_once_per_empty_to_queued`). That announcement can come before the timer
@@ -229,8 +233,9 @@ impl Reclaim for Dispatcher {
 
 /// Told when the queue goes from empty to holding something: the timer thread should drain it.
 ///
-/// Called on the pushing thread with no lock held. It must not block and must not call into
-/// gsv.
+/// Called on the pushing thread with the queue's lock released, and with no lock of gsv's held;
+/// the pusher may hold the kernel's lock (module docs, "Never blocking"). It must not block, must
+/// not take the kernel's lock, and must not call into gsv.
 ///
 /// **An implementation must latch the notice.** The timer thread can be told before it sleeps:
 /// a push onto the queue its drain has just emptied calls this while the timer thread is still

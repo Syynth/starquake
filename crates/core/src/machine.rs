@@ -218,7 +218,7 @@ use crate::report::{
     ExitReason, GUEST_LOG_BYTES, Mapping, RunDate, RunOptions, RunReport, ThreadPc, empty_dump,
 };
 use crate::services_report::{LastStubbed, ServicesReport};
-use crate::space::Touch;
+use crate::space::{MapSink, Touch};
 
 mod core_loop;
 mod cores;
@@ -264,6 +264,13 @@ pub(crate) trait GuestSpace<V>: GuestMemory {
     /// thread, before the thread first runs there, and after every system call, before the
     /// guest runs again, whatever the call returned.
     fn settle(&self, vcpu: &mut V) -> Result<(), starquake_cpu::Error>;
+
+    /// Sends each change the kernel makes to the address space's mappings from now on to
+    /// `sink`, as one [`EventKind::Map`] (`crate::space`, "The Map recording point"). The run
+    /// attaches its recorder here before the kernel boots the process. A space the kernel does
+    /// not map through (the loop's tests' flat memories) makes no such event, and drops `sink`:
+    /// that is the default.
+    fn record_maps(&self, _sink: MapSink) {}
 }
 
 /// The vCPUs of a run: core 0's, made by the caller on the calling thread, which runs core 0,
@@ -490,7 +497,7 @@ struct Session<'a, C> {
     memory: &'a dyn GuestMemory,
     options: &'a RunOptions,
     clock: RunClock<C>,
-    recorder: Recorder,
+    recorder: Arc<Recorder>,
 }
 
 impl<C: HostClock + Clone> Session<'_, C> {
@@ -503,6 +510,25 @@ impl<C: HostClock + Clone> Session<'_, C> {
     /// Records an event on `core` and `thread`, stamped with the time now.
     fn record_on(&self, core: u8, thread: ThreadId, kind: EventKind) {
         self.recorder.record(self.clock.now(), core, thread, kind);
+    }
+
+    /// The sink the address space's recording point sends its [`EventKind::Map`] events to
+    /// during this run ([`GuestSpace::record_maps`]): the run's recorder, each event recorded as
+    /// one of the process as a whole (core [`CORE`], thread [`MAIN_THREAD`], as
+    /// [`Session::record`] records), stamped with the time now as `time`'s clock reads it (a
+    /// copy of the run's clock, reading the same host time). PROVISIONAL: the mapper is not told
+    /// which core and thread made the system call that changed the mapping; the event names
+    /// them once it is. The mapper is called under the kernel lock, so the event's `seq` keeps
+    /// the kernel's order (observability spec, "The event stream").
+    fn map_sink(&self, time: Timebase<C>) -> MapSink
+    where
+        C: 'static,
+    {
+        let recorder = Arc::clone(&self.recorder);
+        let clock = RunClock::new(time);
+        MapSink::new(move |kind| {
+            recorder.record(clock.now(), CORE, MAIN_THREAD, kind);
+        })
     }
 
     /// The environment the kernel and the services read during this run, as its options say
@@ -837,8 +863,8 @@ pub(crate) fn run_serving<V: Vcpu, C: HostClock + Clone + 'static>(
     let session = Session {
         memory: space,
         options,
-        clock: RunClock::new(time),
-        recorder: Recorder::new(),
+        clock: RunClock::new(time.clone()),
+        recorder: Arc::new(Recorder::new()),
     };
     let text = Arc::new(TextSink::with_limit(limits.trace_events));
     let flight = Arc::new(FlightRecorder::new(
@@ -850,6 +876,7 @@ pub(crate) fn run_serving<V: Vcpu, C: HostClock + Clone + 'static>(
     session.recorder.add_sink(Arc::clone(&flight));
     session.recorder.add_sink(Arc::clone(&stubs));
 
+    space.record_maps(session.map_sink(time));
     let env = session.environment_within(limits.env_recording_bytes);
     let mut mappings = placed.mappings.clone();
     let (ending, log, tally, aftermath) =

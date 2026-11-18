@@ -578,11 +578,16 @@ struct Locked<'d, B> {
 /// is the kernel's own bookkeeping, and is logged (see the divergences in
 /// [`crate::svc::transfer_memory`]). Then the pages of every shared memory that went are given
 /// back to the translation ([`shared_memory::free_released`]), a failure logged the same way;
-/// they are given back even when an unlock failed. Both orders show in the translation's calls
+/// they are given back even when an unlock failed. Between the two, if the process has ended,
+/// every device-share lock it still holds is released ([`device::release_ended`]; a device-share
+/// release makes no translation call, so the order below is unchanged by it:
+/// `exiting_the_process_releases_device_locks_and_keeps_the_unlock_and_give_back_order`). Both
+/// orders show in the translation's calls
 /// (an unlock is a `Mapper::protect`, a give-back a `Mapper::release_shared`), and are pinned
 /// by `exiting_the_process_unlocks_lent_pages_before_it_gives_back_shared_ones` and
 /// `a_refused_unlock_still_gives_back_shared_memory_under_the_same_lock` (in
-/// `dispatch/memory_objects/tests.rs`). The two log lines are log-only: no test captures them.
+/// `dispatch/memory_objects/tests.rs`). The log lines here and in [`device::release_ended`] are
+/// log-only: no test captures them.
 impl<B> Drop for Locked<'_, B> {
     fn drop(&mut self) {
         let tables = &mut self.state.tables;
@@ -596,6 +601,12 @@ impl<B> Drop for Locked<'_, B> {
             if let Err(error) = unlocked {
                 tracing::error!(%error, "unlocking a released transfer memory's pages failed");
             }
+        }
+        // An ended process's device-share locks, between the unlocks and the give-back
+        // (`dispatch/device.rs`, "When the process ends"). Only looked at while one is held.
+        if tables.address_space.device_share_locks().next().is_some() {
+            let own = tables.processes.own();
+            device::release_ended(&mut tables.address_space, &tables.scheduler, own);
         }
         if tables.scheduler.objects().has_frees() {
             let freed =

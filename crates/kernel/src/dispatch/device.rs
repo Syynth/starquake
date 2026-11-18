@@ -11,7 +11,12 @@
 //!
 //! [`IpcContext::lock_device_share`](super::IpcContext::lock_device_share) locks the sender's
 //! range ([`AddressSpace::lock_device_share`]) and returns a [`DeviceShareToken`] naming the
-//! process and that exact range. [`Dispatcher::reclaim_device_share`] makes one from what a
+//! process and that exact range. Once the process has ended (as [`DeviceShareError::ProcessEnded`]
+//! means it) no lock is taken: the answer is [`KernelError::TerminationRequested`], what a
+//! server sees for that refusal of a token too ([`DeviceShareError::into_svc_error`]), and the
+//! address space is left as it was. A lock taken then would name a lock that the release at the
+//! end of the same call takes away at once (below, "When the process ends"), so its token would
+//! name nothing (`a_lock_after_the_process_ended_is_refused_and_takes_nothing`). [`Dispatcher::reclaim_device_share`] makes one from what a
 //! snapshot saved, only after the checks below pass for it: a restored token is checked as a
 //! live one is, and the snapshot's releases of one range are counted against the locks the
 //! kernel holds on it.
@@ -37,7 +42,9 @@
 //!    process has an address space today (`Tables`); a second brings its own, and this check
 //!    becomes a lookup.
 //! 2. [`DeviceShareError::ProcessEnded`] when that process has ended
-//!    ([`ProcessState::Terminated`]) or its scheduler row is gone.
+//!    ([`ProcessState::Terminated`]) or its scheduler row is gone. Whether the row can go
+//!    while the tables live is not this module's to say; the answer for a missing row is
+//!    pinned all the same (`a_process_with_no_scheduler_row_counts_as_ended`).
 //! 3. [`DeviceShareError::NotLocked`] unless a live lock was taken on exactly the token's range
 //!    ([`AddressSpace::device_locks`]): one page short or one page long is refused, and so is
 //!    a second unlock of a token whose one lock the first released. A reclaim is refused unless
@@ -50,8 +57,39 @@
 //! `dispatch/device/tests.rs`, one per refusal, and
 //! `the_process_is_checked_before_the_range`, which has both faults at once.
 //!
-//! A lock is not released when its process ends: the token is then refused, and the address
-//! space goes with the process.
+//! # When the process ends
+//!
+//! Ending a process releases every device-share lock its address space still holds
+//! ([`release_ended`]): each live lock on each exact range ([`AddressSpace::device_share_locks`])
+//! goes through [`AddressSpace::unlock_device_share`], the path a token's unlock takes, once per
+//! lock, ranges in ascending order. It runs where the transfer-memory unlocks and the
+//! shared-memory give-back of teardown run: when the dispatcher's lock is released after a call
+//! that ended the process (`ExitProcess`, the last thread's `ExitThread`, or a service's
+//! `IpcContext::end_process`), whichever call it was (`Locked`'s `Drop`, in `dispatch.rs`). In
+//! teardown's order it sits after the transfer-memory unlocks and before the shared-memory
+//! give-back, so every unlock of the process's pages comes before any page is given back.
+//! A device-share release makes no call to the translation (it changes only the blocks'
+//! device counts and attributes): shared memory cannot be device-locked, and a range lent as
+//! transfer memory cannot be (and the other way round), so the three never meet on one page,
+//! and the translation's calls are still `#224`'s order
+//! (`exiting_the_process_releases_device_locks_and_keeps_the_unlock_and_give_back_order`, in
+//! `dispatch/memory_objects/tests.rs`).
+//!
+//! Then a token of the process is refused as [`DeviceShareError::ProcessEnded`], before its
+//! range is looked at, so a release that was queued before the process ended and is drained
+//! after it releases nothing a second time
+//! (`ending_the_process_releases_every_lock_once_and_a_late_unlock_is_refused`). While the
+//! process lives, the check leaves its locks alone (`a_live_process_keeps_its_locks_across_calls`).
+//!
+//! No reference releases them this way: Horizon and Eden finalize the whole page table when the
+//! process goes (`eden/src/core/hle/kernel/k_process.cpp` @ cf654052, `KProcess::Finalize`:
+//! `m_page_table.Finalize()`), and the device counts go with the blocks. The address space here
+//! is not finalized when its process ends (a snapshot or a test can still read it), so the
+//! locks are released on their own. An unlock refused here is the kernel's own bookkeeping
+//! going wrong (a range a lock was counted on that its blocks do not show locked): it is logged
+//! as an error, the rest of that range's locks are left, and the next range's are released all
+//! the same. That branch is log-only, and no
+//! test reaches it, because a sound block map never refuses it.
 //!
 //! # What is recorded
 //!
@@ -96,14 +134,17 @@ pub enum DeviceShareError {
 impl DeviceShareError {
     /// The result a server sees for the refusal, when it unlocks during a request
     /// ([`IpcContext::unlock_device_share`](super::IpcContext::unlock_device_share)):
-    /// [`KernelError::InvalidCurrentMemory`], what the address space answers a range that is
-    /// not locked, for the token's own refusals (starquake's choice: Horizon has no token), and
-    /// the address space's own result otherwise.
+    /// [`KernelError::TerminationRequested`] for [`Self::ProcessEnded`], the result Horizon
+    /// gives a call made for a process that is being terminated, so that a server can tell that
+    /// refusal, which comes as a matter of course when a process ends during its request, from
+    /// the others; [`KernelError::InvalidCurrentMemory`], what the address space answers a range
+    /// that is not locked, for the token's other refusals; and the address space's own result
+    /// otherwise. Both choices are starquake's: Horizon has no token. A lock refused because
+    /// the process has ended answers the same as an unlock (module docs, "Making a token").
     pub(super) fn into_svc_error(self) -> SvcError {
         match self {
-            Self::WrongProcess | Self::ProcessEnded | Self::NotLocked { .. } => {
-                KernelError::InvalidCurrentMemory.into()
-            }
+            Self::ProcessEnded => KernelError::TerminationRequested.into(),
+            Self::WrongProcess | Self::NotLocked { .. } => KernelError::InvalidCurrentMemory.into(),
             Self::Refused(error) => error,
         }
     }
@@ -122,10 +163,7 @@ fn check(
     if token.process() != own {
         return Err(DeviceShareError::WrongProcess);
     }
-    let live = scheduler
-        .process(own)
-        .is_ok_and(|record| record.state() != ProcessState::Terminated);
-    if !live {
+    if has_ended(own, scheduler) {
         return Err(DeviceShareError::ProcessEnded);
     }
     if space.device_locks(token.address(), token.size()) <= earlier {
@@ -137,17 +175,54 @@ fn check(
     Ok(())
 }
 
+/// Whether `process` has ended ([`ProcessState::Terminated`]) or its scheduler row is gone: what
+/// [`DeviceShareError::ProcessEnded`] means, and when [`release_ended`] releases.
+fn has_ended(process: ProcessId, scheduler: &Scheduler) -> bool {
+    scheduler
+        .process(process)
+        .map_or(true, |record| record.state() == ProcessState::Terminated)
+}
+
+/// Releases every device-share lock `space` holds if `own`, the process it belongs to, has
+/// ended, each through [`AddressSpace::unlock_device_share`] (module docs, "When the process
+/// ends"); does nothing while it lives.
+pub(super) fn release_ended(space: &mut AddressSpace, scheduler: &Scheduler, own: ProcessId) {
+    if !has_ended(own, scheduler) {
+        return;
+    }
+    // Taken out first: each unlock changes the counts. As many entries as ranges locked.
+    let held: Vec<(u64, u64, u32)> = space.device_share_locks().collect();
+    for (address, size, count) in held {
+        for _ in 0..count {
+            if let Err(error) = space.unlock_device_share(address, size) {
+                tracing::error!(
+                    %error,
+                    address,
+                    size,
+                    "releasing an ended process's device-share lock failed"
+                );
+                break;
+            }
+        }
+    }
+}
+
 impl Dispatcher {
     /// Locks `size` bytes at `address` of the process the tables belong to and returns its
-    /// token ([`AddressSpace::lock_device_share`], whose errors these are).
+    /// token ([`AddressSpace::lock_device_share`], whose errors these are), unless the process
+    /// has ended: then [`KernelError::TerminationRequested`] and nothing is locked (module docs,
+    /// "Making a token").
     pub(super) fn lock_device_share(
         &self,
         address: u64,
         size: u64,
     ) -> CallResult<DeviceShareToken> {
-        let mut locked = self.lock::<(&mut AddressSpace,)>();
+        let mut locked = self.lock::<(&mut AddressSpace, &Scheduler)>();
         let own = locked.state.tables.processes.own();
-        let (space,) = locked.tables();
+        let (space, scheduler) = locked.tables();
+        if has_ended(own, scheduler) {
+            return Err(DeviceShareError::ProcessEnded.into_svc_error());
+        }
         space.lock_device_share(address, size)?;
         Ok(DeviceShareToken::new(own, address, size))
     }

@@ -6,11 +6,13 @@ use starquake_ipc::{
 };
 use starquake_kernel::result::ResultCode;
 
+use starquake_kernel::id::SlabId;
 use starquake_kernel::result::KernelError;
+use starquake_kernel::slab::SlabError;
 use starquake_trace::ServiceId;
 
 use super::super::result::NOT_SUPPORTED;
-use super::super::targets::Domain;
+use super::super::targets::{Domain, TargetError};
 use super::super::{Handled, Kernel, Server, ServerError, UnknownPolicy};
 use super::{
     Child, ODD_BYTE, Rig, SERVICE, Tally, Toy, built, domain_request, in_domain, only, plain,
@@ -316,4 +318,71 @@ fn legacy_message_types_are_not_supported() {
         let reply = plain(&rig.send(&RequestBuilder::cmif(legacy, toy::INSPECT)));
         assert_eq!(reply, only(NOT_SUPPORTED), "{legacy:?}");
     }
+}
+
+/// A family that keeps, for each session closed, how many were still open
+/// ([`Family::session_closed`](super::super::Family::session_closed)). It saves nothing.
+#[derive(Default)]
+struct Closings(Vec<usize>);
+
+impl super::super::Family for Closings {
+    fn save_state(&self) -> Result<Vec<u8>, super::super::SnapshotError> {
+        Ok(Vec::new())
+    }
+
+    fn load_state(&mut self, _: &[u8]) -> Result<(), super::super::SnapshotError> {
+        Ok(())
+    }
+
+    fn session_closed(&mut self, open: usize) {
+        self.0.push(open);
+    }
+}
+
+#[test]
+fn the_family_is_told_how_many_sessions_are_left_as_each_closes() {
+    let mut rig = Rig::strict();
+    let server = std::mem::replace(&mut rig.server, Server::new("toy", UnknownPolicy::Strict));
+    rig.server = server.with_family(Closings::default());
+    let (first, second, third) = (rig.session, rig.second_session(), rig.second_session());
+    let closings = |rig: &Rig| rig.server.family::<Closings>().unwrap().0.clone();
+    // The client end goes (as a process's end closes it), then a close message, then the last.
+    rig.server.close(second).unwrap();
+    assert_eq!(closings(&rig), [2]);
+    let (handled, _) = rig.try_send_on(first, &RequestBuilder::close());
+    assert_eq!(handled, Ok(Handled::Closed));
+    assert_eq!(closings(&rig), [2, 1]);
+    rig.server.close(third).unwrap();
+    assert_eq!(closings(&rig), [2, 1, 0]);
+    // A session the server does not know tells the family nothing.
+    assert_eq!(
+        rig.server.close(second),
+        Err(ServerError::UnknownSession(second))
+    );
+    assert_eq!(closings(&rig), [2, 1, 0]);
+}
+
+#[test]
+fn the_family_is_told_of_a_close_whose_release_failed_and_the_error_is_returned() {
+    // A corrupted table: `second` is pointed at `first`'s target, so once `first` closes and
+    // its target goes, releasing `second`'s fails. The family is told all the same, and the
+    // release's error is the close's answer (`Server::close`).
+    let mut rig = Rig::strict();
+    let server = std::mem::replace(&mut rig.server, Server::new("toy", UnknownPolicy::Strict));
+    rig.server = server.with_family(Closings::default());
+    let (first, second) = (rig.session, rig.second_session());
+    let stolen = rig.server.sessions[&first];
+    rig.server.sessions.insert(second, stolen);
+    let closings = |rig: &Rig| rig.server.family::<Closings>().unwrap().0.clone();
+    rig.server.close(first).unwrap();
+    assert_eq!(closings(&rig), [1]);
+    assert_eq!(
+        rig.server.close(second),
+        Err(ServerError::Targets(TargetError::Table(SlabError::Stale {
+            index: stolen.index(),
+            generation: stolen.generation(),
+        })))
+    );
+    assert_eq!(closings(&rig), [1, 0]);
+    assert_eq!(rig.server.session_count(), 0);
 }

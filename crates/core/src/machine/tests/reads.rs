@@ -497,7 +497,7 @@ fn session_over<'a>(memory: &'a FlatMemory, options: &'a RunOptions) -> Session<
         memory,
         options,
         clock: RunClock::new(timebase()),
-        recorder: Recorder::new(),
+        recorder: Arc::new(Recorder::new()),
     }
 }
 

@@ -744,7 +744,7 @@ fn on_a_machine(check: impl FnOnce(&Machine<'_, ScriptedVcpu, FixedClock>)) {
             console: NRO_CONSOLE,
             clock: FixedClock::new(CLOCK_STEP, CLOCK_STEP),
         }),
-        recorder: Recorder::new(),
+        recorder: Arc::new(Recorder::new()),
     };
     let env = session.environment();
     let (dispatcher, _) = boot(guest.address_space(), &guest.placed, space, &*env).unwrap();

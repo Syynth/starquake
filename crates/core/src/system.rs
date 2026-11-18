@@ -127,7 +127,7 @@ pub(crate) mod host {
     use crate::machine::{self, GuestProgram, GuestSpace, Vcpus};
 
     use crate::report::{RunOptions, RunReport};
-    use crate::space::{AddressSpace, SpaceMapper, Touch};
+    use crate::space::{AddressSpace, MapSink, SpaceMapper, Touch};
 
     /// Held for the whole of a run, and by tests that make a VM of their own:
     /// Hypervisor.framework allows one VM per process.
@@ -148,6 +148,10 @@ pub(crate) mod host {
 
         fn settle(&self, vcpu: &mut HvfVcpu) -> Result<(), starquake_cpu::Error> {
             vcpu.flush_pending(self.tables(), PROCESS_ASID)
+        }
+
+        fn record_maps(&self, sink: MapSink) {
+            AddressSpace::record_maps(self, sink);
         }
     }
 

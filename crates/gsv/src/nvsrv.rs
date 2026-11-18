@@ -84,7 +84,10 @@
 //!
 //! The open files are the family's ([`NvsrvState`]): in both references every nvsrv session
 //! shares the one nvdrv `Module`, its fds and its nvmap handles. Closing an IPC session closes
-//! none of its fds, as in Eden, where they belong to the module.
+//! none of its fds, as in Eden, where they belong to the module. Closing the server's last
+//! session frees the process's nvmap handles, as Eden's `Container::CloseSession` does when the
+//! process's last nvdrv session goes ([`nvmap`], "When the process's last session closes"); ending
+//! the process closes every session it holds, so that is also what its end does.
 //!
 //! An fd a command names is checked as Eden's `Module` checks it: negative → `InvalidState`, not
 //! open → `NotImplemented`, before the device is asked anything.
@@ -119,7 +122,8 @@
 //! the state. Every ioctl and every `Close` runs with gsv's shared lock held
 //! ([`NvsrvFamily::ioctl`], [`NvsrvFamily::close`]: closing an as-gpu fd can destroy an address
 //! space, [`as_gpu`], "Closing"); nothing under it calls the kernel, and the front never calls
-//! back into gsv.
+//! back into gsv. nvmap's device-share lock and release are taken through the kernel after the
+//! ioctl, with gsv's lock released ([`nvmap`], "The device-share lock").
 //!
 //! # Ioctls
 //!
@@ -202,6 +206,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use starquake_kernel::result::KernelError;
 use starquake_services::commands;
 use starquake_services::framework::{
     Context, Family, Fault, Interfaces, NOT_SUPPORTED, Outcome, Reply, ReplyToken, Request, Server,
@@ -212,8 +217,9 @@ use self::as_gpu::AsGpu;
 use self::ctrl_gpu::{CtrlGpu, CtrlGpuEvents};
 use self::gpu::{ChannelAccess, ChannelFront, Deferral, NvhostGpu, Queried};
 use self::ioctl::{Ioctl, MAX_ARGUMENT_BYTES};
-use self::nvmap::NvMap;
+use self::nvmap::{DeviceShareStep, NvMap};
 use self::tsg_gpu::TsgGpu;
+use crate::completion::Completion;
 use crate::gpu::{GpuMemory, GpuVmFront};
 use crate::shared::Shared;
 
@@ -1180,6 +1186,7 @@ fn run_ioctl(
     };
     let policy = cx.policy();
     let (answer, deferral) = cx.family::<NvsrvFamily>()?.ioctl(policy, &call);
+    settle_device_shares(cx)?;
     let written = if ioctl.is_out() {
         write_out(cx, req, 0, &answer.output).and_then(|()| {
             if variant == IoctlVariant::Ioctl3 && !answer.inline.is_empty() {
@@ -1210,6 +1217,86 @@ fn run_ioctl(
             Err(fault)
         }
     }
+}
+
+/// Takes the device-share steps nvmap's ioctl left through the kernel ([`nvmap`], "The
+/// device-share lock"), oldest first: a lock taken is kept by its handle, and a refusal of a lock
+/// or a release changes no answer. A refusal is logged as an error, as Eden's `ASSERT` logs it,
+/// unless it is the kernel's refusal for a process that has ended ([`refused_as_ended`]), which
+/// comes as a matter of course when another core ends the process during the request and is
+/// logged at debug level, as the drain logs the same refusal (`crate::shared`, "Lock order and
+/// the drain"). A lock its handle cannot keep (only another caller of the table, between the
+/// ioctl and this, could change it) is released at once. Fails only when the server has no nvsrv
+/// family, as the ioctl that left the steps would have.
+fn settle_device_shares(cx: &mut Context<'_>) -> Result<(), Fault> {
+    let steps = cx.family::<NvsrvFamily>()?.state.nvmap.take_steps();
+    for step in steps {
+        let token = match step {
+            DeviceShareStep::Lock {
+                handle,
+                address,
+                size,
+            } => match cx.lock_device_share(address, size) {
+                Ok(token) => match cx
+                    .family::<NvsrvFamily>()?
+                    .state
+                    .nvmap
+                    .keep_lock(handle, token)
+                {
+                    Ok(()) => continue,
+                    Err(token) => {
+                        tracing::error!(handle, "nvmap: a lock its handle cannot keep");
+                        token
+                    }
+                },
+                Err(error) if refused_as_ended(&error) => {
+                    tracing::debug!(
+                        %error,
+                        handle,
+                        address,
+                        size,
+                        "nvmap: an allocation's device-share lock came after its process ended"
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    tracing::error!(
+                        %error,
+                        handle,
+                        address,
+                        size,
+                        "nvmap: the kernel refused an allocation's device-share lock"
+                    );
+                    continue;
+                }
+            },
+            DeviceShareStep::Unlock(token) => token,
+        };
+        match cx.unlock_device_share(token) {
+            Ok(()) => {}
+            Err(error) if refused_as_ended(&error) => {
+                tracing::debug!(
+                    %error,
+                    ?token,
+                    "nvmap: a device-share release came after its process ended"
+                );
+            }
+            Err(error) => {
+                tracing::error!(%error, ?token, "nvmap: the kernel refused a device-share release");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether `fault` is the kernel's refusal of a device-share lock or release because the
+/// process has ended: [`KernelError::TerminationRequested`], which the kernel answers a server
+/// for exactly that refusal (`starquake_kernel::dispatch`'s `DeviceShareError::ProcessEnded`,
+/// and its lock's refusal once the process has ended). The address space's own refusals of a
+/// lock or an unlock are never that result. Only the level a refusal is logged at depends on it
+/// (`settle_device_shares`).
+fn refused_as_ended(fault: &Fault) -> bool {
+    matches!(fault, Fault::Kernel(KernelError::TerminationRequested))
 }
 
 /// Out buffer `index`'s size (Eden `GetWriteBufferSize`). The framework refuses a request that
@@ -1379,6 +1466,24 @@ impl Family for NvsrvFamily {
     /// the state is unchanged. The wiring stays.
     fn load_state(&mut self, bytes: &[u8]) -> Result<(), SnapshotError> {
         self.state.load_state(bytes)
+    }
+
+    /// When the server's last session has closed (`open` is 0), Eden's `Container::CloseSession`
+    /// for the process: its nvmap handles are freed ([`NvMap::close_session`]), and the lock of
+    /// each that went is posted to gsv's completion queue as a release, which the timer
+    /// thread's drain takes to the kernel ([`nvmap`], "When the process's last session closes").
+    /// Called with the kernel's lock held when a process's end closed the session: it touches
+    /// only the family's own state and the queue, whose push takes only the queue's lock
+    /// ([`crate::completion`], "Never blocking"), never gsv's shared lock or the kernel.
+    fn session_closed(&mut self, open: usize) {
+        if open != 0 {
+            return;
+        }
+        for token in self.state.nvmap.close_session() {
+            self.shared
+                .queue()
+                .push(Completion::DeviceShareReleased { token });
+        }
     }
 }
 

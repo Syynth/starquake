@@ -683,4 +683,5 @@ mod hvf;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod hvf_snapshot;
 mod kernel;
+mod record;
 mod shared;

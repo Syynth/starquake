@@ -112,6 +112,40 @@
 //!   `space/tests/alias.rs`): `an_alias_is_refused_with_its_checks_in_order_and_maps_nothing`
 //!   and `an_alias_the_tables_refuse_part_way_unmaps_what_it_mapped`.
 //!
+//! # The Map recording point
+//!
+//! The observability spec's "the address space's mutators each call the recorder once" ("The
+//! event stream"): each change to the mappings the kernel asks [`SpaceMapper`] for and this
+//! address space makes ([`Mapper::map`], [`Mapper::map_shared`] and [`Mapper::map_alias`] as
+//! [`MapKind::Map`], [`Mapper::protect`] as [`MapKind::Protect`], [`Mapper::unmap`] as
+//! [`MapKind::Unmap`]) is one [`EventKind::Map`], with the range asked for and the guest's raw
+//! permission word ([`permission_word`]; zero for an unmapping), sent to the sink a run
+//! attaches ([`AddressSpace::record_maps`]). A refused change sends nothing; handing out and
+//! giving back shared memory ([`Mapper::allocate_shared`], [`Mapper::release_shared`]) and the
+//! backing of a page on first touch change no mapping and send nothing (a touch is the core
+//! loop's fault path). The sink is called once the change is made, with no lock of this
+//! address space held, and under the kernel's lock, which every mapper call holds, so the
+//! recorder's `seq` keeps the kernel's order. A run attaches its recorder before the kernel
+//! boots the process (`crate::machine`, `GuestSpace::record_maps`): the mappings the loader
+//! makes before that (the program's modules) are not recorded; the crash report's memory map
+//! lists them. Tests (in `space/tests/record.rs`):
+//! `each_mutation_the_kernel_asks_for_is_one_map_event`,
+//! `a_refused_mutation_records_nothing`,
+//! `the_sink_is_called_with_no_lock_of_the_address_space_held`; and through a run,
+//! `the_thread_local_page_the_kernel_maps_at_boot_is_a_map_event_in_the_dump`
+//! (`crates/core/tests/map_events.rs`).
+//!
+//! # Snapshots
+//!
+//! The pages that were touched are saved and restored by the `snapshot` module, beside the
+//! kernel's address space ([`snapshot::restore`]). A restore records the shared memory runs
+//! where they were, before the kernel maps them, so [`AddressSpace::map_shared`] accepts each
+//! one in the new address space; and a page the snapshot restored that waits for its mapping
+//! (`Shadow::pending`) is backed with its own RAM, not new RAM, by whatever backs it first
+//! (an alias of it, a touch, a host write) or, for the rest, by
+//! [`AddressSpace::finish_restore`]. Until then a host read of it, where it is mapped, reads
+//! its restored bytes from that RAM, and backs nothing.
+//!
 //! PROVISIONAL, and what replaces each part:
 //!
 //! - **Backing is handed out from the start of guest RAM, a page at a time (a run at a time
@@ -124,11 +158,12 @@
 //!   from the program a run loads, plus a working allowance (`crate::system`'s `ram` module),
 //!   which is usually far smaller than what the kernel lets a process reserve, and a guest that
 //!   touches more ends its run as an emulator error.
-//! - **A shared memory can be mapped only in the address space that handed it out**: its run
-//!   is recorded in that [`AddressSpace`]'s shadow, and its pages are taken from that address
-//!   space's RAM. System-wide guest RAM and one record of the shared runs (the execution
-//!   model's backing pools), instead of per-`AddressSpace` ones, replace it, so that any
-//!   process's address space can map any shared memory.
+//! - **A shared memory can be mapped only in the address space that handed it out** (or that
+//!   a snapshot restored it into, which records the run the same way): its run is recorded in
+//!   that [`AddressSpace`]'s shadow, and its pages are taken from that address space's RAM.
+//!   System-wide guest RAM and one record of the shared runs (the execution model's backing
+//!   pools), instead of per-`AddressSpace` ones, replace it, so that any process's address
+//!   space can map any shared memory.
 //! - **An alias backs its whole source at once**, however large: the RAM a guest can force is
 //!   bounded by the source, which the kernel has already counted against the pool, and guest
 //!   RAM refuses what it cannot hold ([`SpaceError::OutOfRam`], checked before anything is
@@ -140,14 +175,25 @@
 //!   guest code may only read and execute; nothing checks that a system call's buffer is
 //!   readable or writable by the guest. The kernel's block map knows; a later slice checks.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use starquake_kernel::memory::{Mapper, MapperError, SharedPages};
+use starquake_kernel::memory::{Mapper, MapperError, MemoryPermission, SharedPages};
 use starquake_memory::stage1::{Stage1Tables, TableRoot, VA_SPACE_END};
 use starquake_memory::{
     Access, BackingRange, Fault, GuestMemory, MapError, PAGE_SIZE, Perms, Translation,
 };
+use starquake_trace::{EventKind, MapKind};
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "a run takes no snapshot yet: the run-level save and restore (observability \
+                  spec, \"Order of work\", step 6) is what calls these"
+    )
+)]
+pub(crate) mod snapshot;
 
 /// Why a guest address space could not be built or changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -240,6 +286,15 @@ struct Shadow {
     /// guest-physical address: one past the last address of each. They hold what they held;
     /// a run is zeroed when it is handed out.
     reusable: BTreeMap<u64, u64>,
+    /// The pages [`AddressSpace::map_alias`] mapped: virtual page addresses whose RAM is
+    /// another page's (their source's), so that a snapshot keeps each page of RAM once
+    /// (`snapshot` module docs).
+    aliased: BTreeSet<u64>,
+    /// Pages a snapshot restored that wait for their mapping: virtual page address to the
+    /// guest-physical page that holds what they held (`snapshot` module docs, "Restoring").
+    /// Empty except between [`AddressSpace::begin_restore`] and
+    /// [`AddressSpace::finish_restore`].
+    pending: BTreeMap<u64, u64>,
 }
 
 impl Shadow {
@@ -355,6 +410,9 @@ pub(crate) struct AddressSpace<M> {
     /// Guest RAM: where backing comes from.
     ram: BackingRange,
     shadow: Mutex<Shadow>,
+    /// Where [`SpaceMapper`]'s recording point sends its events, once a run attaches its
+    /// recorder ([`AddressSpace::record_maps`]).
+    maps: Mutex<Option<MapSink>>,
 }
 
 impl<M: GuestMemory> AddressSpace<M> {
@@ -375,7 +433,10 @@ impl<M: GuestMemory> AddressSpace<M> {
                 shared: BTreeMap::new(),
                 released: Vec::new(),
                 reusable: BTreeMap::new(),
+                aliased: BTreeSet::new(),
+                pending: BTreeMap::new(),
             }),
+            maps: Mutex::new(None),
         })
     }
 
@@ -448,6 +509,7 @@ impl<M: GuestMemory> AddressSpace<M> {
                 .retain(|page, _| !(run..run + run_size).contains(page));
         }
         shadow.mapped.retain(|start, _| !(va..end).contains(start));
+        shadow.aliased.retain(|page| !(va..end).contains(page));
         Ok(())
     }
 
@@ -486,8 +548,17 @@ impl<M: GuestMemory> AddressSpace<M> {
         Ok(BackingRange::new(shadow.next, size)?)
     }
 
-    /// Gives the page at `page` a zeroed page of RAM and a table entry with `perms`.
+    /// Gives the page at `page` a zeroed page of RAM and a table entry with `perms`; or, when
+    /// a snapshot restored what it held and it waits for its mapping (`Shadow::pending`), the
+    /// page of RAM that holds it.
     fn back(&self, shadow: &mut Shadow, page: u64, perms: Perms) -> Result<u64, SpaceError> {
+        if let Some(pa) = shadow.pending.get(&page).copied() {
+            self.tables
+                .map(page, BackingRange::new(pa, PAGE_SIZE)?, perms)?;
+            shadow.pending.remove(&page);
+            shadow.backed.insert(page, pa);
+            return Ok(pa);
+        }
         let pages = self.next_ram(shadow, PAGE_SIZE)?;
         self.tables.map(page, pages, perms)?;
         shadow.next = pages.end();
@@ -650,12 +721,17 @@ impl<M: GuestMemory> AddressSpace<M> {
         if let Some(taken) = shadow.first_mapped(va, end) {
             return Err(MapError::AlreadyMapped { va: taken }.into());
         }
-        // Back every source page, after checking guest RAM has room for all of them.
+        // Back every source page, after checking guest RAM has room for all of them: a page a
+        // snapshot restored has its RAM already (`Shadow::pending`).
         let unbacked: Vec<u64> = (source..source_end)
             .step_by(PAGE_STEP)
             .filter(|page| !shadow.backed.contains_key(page))
             .collect();
-        let needed = u64::try_from(unbacked.len())
+        let fresh = unbacked
+            .iter()
+            .filter(|page| !shadow.pending.contains_key(page))
+            .count();
+        let needed = u64::try_from(fresh)
             .ok()
             .and_then(|pages| pages.checked_mul(PAGE_SIZE))
             .unwrap_or(u64::MAX);
@@ -699,6 +775,9 @@ impl<M: GuestMemory> AddressSpace<M> {
             aliased.push((alias, pa));
         }
         shadow.mapped.insert(va, Mapped { end, perms });
+        shadow
+            .aliased
+            .extend(aliased.iter().map(|(alias, _)| *alias));
         shadow.backed.extend(aliased);
         Ok(())
     }
@@ -720,7 +799,33 @@ impl<M: GuestMemory> AddressSpace<M> {
         }
     }
 
-    /// Where the bytes at `va` are, and how many bytes from there on are in the same page.
+    /// Makes `sink` where [`SpaceMapper`]'s recording point sends its events from now on (module
+    /// docs, "The Map recording point"), in place of any sink attached before.
+    pub(crate) fn record_maps(&self, sink: MapSink) {
+        *self.maps.lock().unwrap_or_else(PoisonError::into_inner) = Some(sink);
+    }
+
+    /// The recording point: sends one [`EventKind::Map`] to the attached sink, if there is
+    /// one. The sink is called with no lock of this address space held.
+    fn record_map(&self, va: u64, size: u64, perms: Option<Perms>, kind: MapKind) {
+        let sink = self
+            .maps
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(MapSink(sink)) = sink {
+            sink(EventKind::Map {
+                va,
+                size,
+                perms: perms.map_or(0, permission_word),
+                kind,
+            });
+        }
+    }
+
+    /// Where the bytes at `va` are, and how many bytes from there on are in the same page: a
+    /// mapped page that waits for its restored RAM (`Shadow::pending`) is in that RAM, which
+    /// holds what the snapshot restored.
     fn resolve(shadow: &Shadow, va: u64) -> Option<(Piece, u64)> {
         let page = page_of(va);
         let offset = va - page;
@@ -728,7 +833,10 @@ impl<M: GuestMemory> AddressSpace<M> {
             Piece::Backed(pa + offset)
         } else {
             shadow.mapping(page)?;
-            Piece::Unbacked
+            shadow
+                .pending
+                .get(&page)
+                .map_or(Piece::Unbacked, |pa| Piece::Backed(pa + offset))
         };
         Some((piece, PAGE_SIZE - offset))
     }
@@ -798,6 +906,39 @@ impl<M: GuestMemory> GuestMemory for AddressSpace<M> {
     }
 }
 
+/// Where the address space's recording point sends each [`EventKind::Map`] it makes
+/// ([`AddressSpace::record_maps`]; module docs, "The Map recording point"). Cloned freely; every
+/// clone calls the same function.
+#[derive(Clone)]
+pub(crate) struct MapSink(Arc<dyn Fn(EventKind) + Send + Sync>);
+
+impl MapSink {
+    /// A sink that hands each event to `record`.
+    pub(crate) fn new(record: impl Fn(EventKind) + Send + Sync + 'static) -> Self {
+        Self(Arc::new(record))
+    }
+}
+
+impl std::fmt::Debug for MapSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MapSink")
+    }
+}
+
+/// The guest's raw permission word for what `perms` lets guest code do: the bits of
+/// `Svc::MemoryPermission`, read bit 0, write bit 1 and execute bit 2
+/// (`eden/src/core/hle/kernel/svc_types.h` @ cf654052), as the kernel's
+/// [`MemoryPermission::svc`] reports them. It is the inverse of [`MemoryPermission::guest`] on
+/// the user's bits: `the_permission_word_is_the_kernels_user_bits_for_every_translation`.
+pub(crate) fn permission_word(perms: Perms) -> u32 {
+    let bit = |allowed: bool, permission: MemoryPermission| {
+        if allowed { permission.svc() } else { 0 }
+    };
+    bit(perms.readable(), MemoryPermission::USER_READ)
+        | bit(perms.writable(), MemoryPermission::USER_WRITE)
+        | bit(perms.executable(), MemoryPermission::USER_EXECUTE)
+}
+
 /// A guest address space as the kernel's address space drives it: the [`Mapper`] a process's
 /// `starquake_kernel::memory::AddressSpace` owns, while the core loop keeps the address space
 /// itself for the guest's memory and its faults.
@@ -833,17 +974,26 @@ impl<M: GuestMemory> GuestMemory for Physical<M> {
     }
 }
 
+/// RECORDING POINT for the event stream: each mutation of the address space the kernel asks
+/// for and this one makes is one [`EventKind::Map`] (module docs, "The Map recording point").
 impl<M: GuestMemory + 'static> Mapper for SpaceMapper<M> {
     fn map(&mut self, address: u64, size: u64, perms: Perms) -> Result<(), MapperError> {
-        self.0.map(address, size, perms).map_err(refused)
+        self.0.map(address, size, perms).map_err(refused)?;
+        self.0.record_map(address, size, Some(perms), MapKind::Map);
+        Ok(())
     }
 
     fn unmap(&mut self, address: u64, size: u64) -> Result<(), MapperError> {
-        self.0.unmap(address, size).map_err(refused)
+        self.0.unmap(address, size).map_err(refused)?;
+        self.0.record_map(address, size, None, MapKind::Unmap);
+        Ok(())
     }
 
     fn protect(&mut self, address: u64, size: u64, perms: Perms) -> Result<(), MapperError> {
-        self.0.protect(address, size, perms).map_err(refused)
+        self.0.protect(address, size, perms).map_err(refused)?;
+        self.0
+            .record_map(address, size, Some(perms), MapKind::Protect);
+        Ok(())
     }
 
     fn allocate_shared(&mut self, size: u64) -> Result<SharedPages, MapperError> {
@@ -860,7 +1010,12 @@ impl<M: GuestMemory + 'static> Mapper for SpaceMapper<M> {
         backing: BackingRange,
         perms: Perms,
     ) -> Result<(), MapperError> {
-        self.0.map_shared(address, backing, perms).map_err(refused)
+        self.0
+            .map_shared(address, backing, perms)
+            .map_err(refused)?;
+        self.0
+            .record_map(address, backing.size(), Some(perms), MapKind::Map);
+        Ok(())
     }
 
     fn release_shared(&mut self, backing: BackingRange) -> Result<(), MapperError> {
@@ -876,7 +1031,9 @@ impl<M: GuestMemory + 'static> Mapper for SpaceMapper<M> {
     ) -> Result<(), MapperError> {
         self.0
             .map_alias(address, source, size, perms)
-            .map_err(refused)
+            .map_err(refused)?;
+        self.0.record_map(address, size, Some(perms), MapKind::Map);
+        Ok(())
     }
 }
 
