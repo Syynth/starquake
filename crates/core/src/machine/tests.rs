@@ -1479,7 +1479,7 @@ fn a_clock_for_another_console_than_the_descriptions_ends_the_run_before_the_gue
     assert_eq!(report.exit, ExitReason::ProcessExited);
     assert!(report.date.is_some());
     // That run drew at boot, so the empty recording above is the check's doing.
-    assert!(!report.environment.is_empty());
+    assert_ne!(report.environment, []);
 }
 
 mod date;

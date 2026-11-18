@@ -95,7 +95,7 @@ fn a_kept_host_io_records_payload_counts_toward_the_limit() {
     let record = host_io(100, 0);
     let mut kept = Kept::new(record_bytes(&record) + one());
     kept.push(vec![record.clone(), record.clone()]);
-    assert_eq!(kept.records(), [record.clone()]);
+    assert_eq!(kept.records(), std::slice::from_ref(&record));
     assert_eq!(kept.dropped(), 1);
 
     // The accepted side of the same edge: room for exactly both keeps both.
@@ -113,8 +113,13 @@ fn a_kept_host_io_records_payload_counts_toward_the_limit() {
     );
     let mut capped = Kept::new(ENV_RECORDING_BYTES);
     capped.push(vec![filler.clone(), record.clone(), record.clone()]);
-    assert_eq!(capped.records(), [filler, record]);
+    // Compared without `assert_eq!`, which would print the filler's reply on a failure.
     assert_eq!(capped.dropped(), 1);
+    assert!(
+        capped.records() == [filler, record],
+        "kept {} records, not the filler and one 100-byte record",
+        capped.records().len()
+    );
 }
 
 #[test]
