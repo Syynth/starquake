@@ -42,7 +42,7 @@
 //! nothing the fake makes ever goes, so every id it made stays live, where the kernel's stay
 //! live while a reference is held (a server keeps its creator's reference to what it made, so
 //! the answers agree for those). The parity of the two is pinned by
-//! `the_fake_and_the_kernel_answer_a_restore_alike` (`tests/restored_kernel.rs`).
+//! `the_fake_and_the_kernel_answer_a_restore_alike` (`tests/am_on_the_kernel.rs`).
 //!
 //! [`FakeHost`] puts a [`FakeKernel`] and several servers together, so that a session one
 //! service hands out for another ([`Kernel::connect`]) can be sent requests.
