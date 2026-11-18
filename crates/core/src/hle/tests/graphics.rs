@@ -11,15 +11,22 @@
 //! `nvhost_gpu.h` @ cf654052).
 
 use starquake_gpu::interface::SyncpointId;
+use starquake_gpu::syncpoint::UNALLOCATED;
 use starquake_gsv::gpu::command as gpu_command;
 use starquake_gsv::note::Note;
 use starquake_gsv::nvsrv::command as nv_command;
 use starquake_gsv::nvsrv::gpu::FENCE_INCREMENT;
 use starquake_gsv::nvsrv::{Device, NvResult};
 use starquake_gsv::protocol::command as root_command;
+use starquake_gsv::shared::TimerHost;
+use starquake_gsv::shared::page::{self, READ_ONLY_SIZE, WRITABLE_SIZE};
 use starquake_gsv::syncpt::command as syncpt_command;
 use starquake_ipc::{Body, TIPC_COMMAND_OFFSET};
-use starquake_trace::HostNanos;
+use starquake_kernel::dispatch::DeviceShareError;
+use starquake_kernel::handle::HandleTable;
+use starquake_kernel::id::{ObjectId, ProcessId, SlabId};
+use starquake_kernel::memory::testing::device_share_token;
+use starquake_trace::{EnvError, HostNanos};
 
 use super::*;
 use crate::hle::graphics::KernelHost;
@@ -554,4 +561,266 @@ fn a_recorded_session_replays_to_the_same_state() {
 
     assert_eq!(replayed.all_events(), recorded.all_events());
     assert_eq!(state_of(&replayed, &replay), state_of(&recorded, &run));
+}
+
+// ----- The shared page and the kernel host -----------------------------------------------------
+
+/// The title's two transfer memories for 204: the writable page at [`NAME`] (free once the root
+/// is had) and the read-only pages at [`FIRMWARE`] and [`PATH`].
+const WRITABLE_AT: u64 = NAME;
+const READ_ONLY_AT: u64 = FIRMWARE;
+
+/// A syncpoint the page is asked about: group 0, bit 40.
+const ASKED: u8 = 40;
+
+impl Rig {
+    /// Makes system call `id` with `x0` to `x3`; the registers after it.
+    fn call4(&self, id: SvcId, x: [u64; 4]) -> GuestRegs {
+        let mut regs = GuestRegs {
+            tpidrro: TLS,
+            ..GuestRegs::default()
+        };
+        regs.x[..4].copy_from_slice(&x);
+        let mut debug = NoDebug;
+        let mut caller = Caller {
+            core: 0,
+            thread: THREAD,
+            env: &*self.env,
+            memory: &self.memory,
+            debug: &mut debug,
+            recorder: &self.recorder,
+        };
+        let record = self
+            .dispatcher
+            .dispatch(id.number(), &mut regs, &mut caller);
+        assert_eq!(record.outcome, Outcome::Completed, "{}", id.name());
+        regs
+    }
+
+    /// The guest's `CreateTransferMemory` of `size` bytes at `address`, keeping `permission`.
+    fn lend(&self, address: u64, size: u32, permission: SvcPermission) -> Handle {
+        let bits = u64::from(permission.bits());
+        let regs = self.call4(
+            SvcId::CreateTransferMemory,
+            [0, address, u64::from(size), bits],
+        );
+        assert_eq!(result(&regs), ResultCode::SUCCESS);
+        Handle::from_register(regs.x[1])
+    }
+
+    /// The object a handle in the guest's table names.
+    fn object(&self, handle: Handle) -> ObjectId {
+        self.dispatcher
+            .with::<(&HandleTable,), _>(|(handles,)| handles.get(handle))
+            .unwrap()
+    }
+
+    fn read_u64(&self, address: u64) -> u64 {
+        let mut bytes = [0; 8];
+        self.memory.read(address, &mut bytes).unwrap();
+        u64::from_le_bytes(bytes)
+    }
+
+    /// A host over this rig's kernel, as [`Rig::turn`] makes one.
+    fn host(&self) -> KernelHost<'_> {
+        KernelHost::new(
+            &self.dispatcher,
+            &*self.env,
+            &self.recorder,
+            &self.memory,
+            TIMER,
+        )
+    }
+}
+
+/// The page bound by 204 through a run's root, with its two transfer memories; the request
+/// event's writable end and the answer event, as the guest holds them, and the memories.
+fn bound(rig: &Rig) -> (Handle, Handle, Handle, Handle) {
+    let root = rig.graphics_root();
+    let writable = rig.lend(WRITABLE_AT, WRITABLE_SIZE, SvcPermission::None);
+    let read_only = rig.lend(READ_ONLY_AT, READ_ONLY_SIZE, SvcPermission::Read);
+    // 204 as PR checks it (`0xdc, 0x80000006, 4`, two copied handles, then `1, 0x1ff, 0x1000,
+    // 0, 0x2000, 0`).
+    let bind = rig.tipc(
+        root,
+        &[
+            tipc_type(root_command::BIND_SYNCPOINT_MEMORY),
+            0x8000_0006,
+            4,
+            writable.raw(),
+            read_only.raw(),
+            1,
+            0x1FF,
+            WRITABLE_SIZE,
+            0,
+            READ_ONLY_SIZE,
+            0,
+        ],
+    );
+    assert_eq!((bind.result, bind.copied.len()), (0, 2));
+    (bind.copied[0], bind.copied[1], writable, read_only)
+}
+
+/// 204 through a run's root binds the page in the title's own transfer memories, and a request
+/// the title makes and signals is answered by the timer thread's turn through the kernel host:
+/// the value, the group's acknowledge and the summary written into the read-only memory, the
+/// two notes recorded, and the answer event signalled.
+#[test]
+fn the_shared_page_is_bound_and_answered_through_the_kernel() {
+    let graphics = Graphics::new(FrontMode::Live, None);
+    let rig = rig_with(&graphics);
+    let (request, answer, _, _) = bound(&rig);
+    let mut header = [0; page::HEADER_SIZE];
+    rig.memory.read(READ_ONLY_AT, &mut header).unwrap();
+    assert_eq!(header, page::header());
+    let asked = SyncpointId::new(ASKED).unwrap();
+    let value_at = READ_ONLY_AT + page::value_offset(asked);
+    assert_eq!(rig.read_u64(value_at), UNALLOCATED);
+
+    // The counter moves, the title asks about it, and signals.
+    graphics.shared().syncpoints().increment_by(asked, 2);
+    let summary = 1_u64 << 0;
+    let slot = 1_u64 << ASKED;
+    let request_at = WRITABLE_AT + u64::from(page::GROUP_REQUEST_OFFSET);
+    rig.memory
+        .write(request_at, &summary.to_le_bytes())
+        .unwrap();
+    let slot_at = WRITABLE_AT + u64::from(page::SLOT_REQUEST_OFFSET);
+    rig.memory.write(slot_at, &slot.to_le_bytes()).unwrap();
+    assert!(graphics.is_idle());
+    let regs = rig.call(SvcId::SignalEvent, u64::from(request.raw()), 0);
+    assert_eq!(result(&regs), ResultCode::SUCCESS);
+    // The signal waits in the queue for the turn: the graphics server is not idle.
+    assert!(!graphics.is_idle());
+    assert_eq!(poll(&rig, answer), KernelError::TimedOut.code());
+
+    let before = rig.all_events().len();
+    rig.turn(&graphics);
+    assert_eq!(rig.read_u64(value_at), 2);
+    let ack_at = READ_ONLY_AT + u64::from(page::SLOT_ACK_OFFSET);
+    assert_eq!(rig.read_u64(ack_at), slot);
+    let summary_at = READ_ONLY_AT + u64::from(page::GROUP_ACK_OFFSET);
+    assert_eq!(rig.read_u64(summary_at), summary);
+    assert_eq!(
+        notes(&rig.all_events()[before..]),
+        [
+            Note::SyncptPageAnswered {
+                id: asked,
+                value: 2
+            },
+            Note::SyncptPageAcknowledged { groups: summary },
+        ]
+    );
+    assert_eq!(poll(&rig, answer), ResultCode::SUCCESS);
+    assert!(graphics.is_idle());
+}
+
+/// The kernel host reads and writes a transfer memory up to its exact end and not a byte past
+/// it (`InvalidCurrentMemory`, nothing copied), refuses an object that is not a transfer memory
+/// (`InvalidHandle`), and passes the kernel's own answer to a signal or an unlock through.
+#[test]
+fn the_kernel_host_reaches_what_the_kernel_holds_and_no_more() {
+    let graphics = Graphics::new(FrontMode::Live, None);
+    let rig = rig_with(&graphics);
+    let (request, _, _, read_only) = bound(&rig);
+    let memory = rig.object(read_only);
+    let size = u64::from(READ_ONLY_SIZE);
+    let mut host = rig.host();
+
+    rig.memory
+        .write(READ_ONLY_AT + size - 4, &[1, 2, 3, 4])
+        .unwrap();
+    let mut out = [0; 4];
+    assert_eq!(
+        host.read_transfer_memory(memory, size - 4, &mut out),
+        Ok(())
+    );
+    assert_eq!(out, [1, 2, 3, 4]);
+    let mut out = [0xEE; 4];
+    assert_eq!(
+        host.read_transfer_memory(memory, size - 3, &mut out),
+        Err(KernelError::InvalidCurrentMemory)
+    );
+    assert_eq!(out, [0xEE; 4]);
+    assert_eq!(
+        host.write_transfer_memory(memory, size - 4, &[5, 6, 7, 8]),
+        Ok(())
+    );
+    let mut written = [0; 4];
+    rig.memory
+        .read(READ_ONLY_AT + size - 4, &mut written)
+        .unwrap();
+    assert_eq!(written, [5, 6, 7, 8]);
+    assert_eq!(
+        host.write_transfer_memory(memory, size - 3, &[9; 4]),
+        Err(KernelError::InvalidCurrentMemory)
+    );
+    rig.memory
+        .read(READ_ONLY_AT + size - 4, &mut written)
+        .unwrap();
+    assert_eq!(written, [5, 6, 7, 8]);
+    assert_eq!(
+        host.read_transfer_memory(memory, u64::MAX, &mut [0; 1]),
+        Err(KernelError::InvalidCurrentMemory)
+    );
+
+    // An event is not a transfer memory; a transfer memory is not an event.
+    let event = rig.object(request);
+    assert_eq!(
+        host.read_transfer_memory(event, 0, &mut [0; 1]),
+        Err(KernelError::InvalidHandle)
+    );
+    assert_eq!(
+        host.write_transfer_memory(event, 0, &[0]),
+        Err(KernelError::InvalidHandle)
+    );
+    assert_eq!(host.signal_event(memory), Err(KernelError::InvalidHandle));
+    assert_eq!(host.signal_event(event), Ok(()));
+
+    // A token of a process this kernel does not hold.
+    let token = device_share_token(ProcessId::from_parts(9, 9), 0x8000_0000, 0x1000);
+    assert_eq!(
+        host.unlock_device_share(token),
+        Err(DeviceShareError::WrongProcess)
+    );
+    assert_eq!(host.finish(), Ok(()));
+}
+
+/// A note the host records goes to the run's stream on the core and thread the host was given;
+/// an environment that fails while the host records or signals is kept, the first one, and
+/// `finish` gives it back, while a signal it failed answers `NotImplemented`.
+#[test]
+fn the_kernel_host_records_on_its_core_and_keeps_the_environment_s_first_failure() {
+    let graphics = Graphics::new(FrontMode::Live, None);
+    let rig = rig_with(&graphics);
+    let (request, ..) = bound(&rig);
+    let event = rig.object(request);
+    let mut host = KernelHost::new(
+        &rig.dispatcher,
+        &*rig.env,
+        &rig.recorder,
+        &rig.memory,
+        (3, ThreadId(0x77)),
+    );
+    let note = Note::QueueRoom {
+        channel: starquake_gpu::interface::ChannelId(5),
+    }
+    .event(GSV_ROOT);
+    host.record(note.clone());
+    assert_eq!(host.finish(), Ok(()));
+    assert_eq!(
+        rig.all_events().last(),
+        Some(&(3, ThreadId(0x77), note.clone()))
+    );
+
+    let failing = starquake_trace::ReplayEnv::new(Vec::new());
+    let mut host = KernelHost::new(&rig.dispatcher, &failing, &rig.recorder, &rig.memory, TIMER);
+    let before = rig.all_events().len();
+    host.record(note);
+    assert_eq!(host.signal_event(event), Err(KernelError::NotImplemented));
+    assert!(matches!(
+        host.finish(),
+        Err(EnvError::Exhausted { index: 0, .. })
+    ));
+    assert_eq!(rig.all_events().len(), before);
 }
