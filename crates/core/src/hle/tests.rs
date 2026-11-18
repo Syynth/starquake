@@ -888,6 +888,9 @@ fn every_pctl_name_hands_out_a_service_that_initializes_by_its_capability() {
     let create = command(&factory, "create_service_without_initialize");
     let initialize = command(&pctl::IParentalControlService::default(), "initialize");
     for (number, name) in PCTL_SERVICES {
+        // The number a name is registered and dispatched under is the one the trace names it
+        // by, so a swapped pair in `PCTL_SERVICES` shows here.
+        assert_eq!(service_name(number), Some(name.as_str()));
         let session = rig.service(name.as_str());
         let root = rig.convert(session);
         let request = domain(root, &factory, "create_service_without_initialize")
