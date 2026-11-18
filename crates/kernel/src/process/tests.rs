@@ -1,6 +1,7 @@
 //! Process creation and the main thread, driven against the fixture's address space.
 
 use starquake_memory::{FlatMemory, PAGE_SIZE};
+use starquake_trace::{EnvCall, EnvRecord, ReplayEnv};
 
 use super::*;
 use crate::handle::MAX_TABLE_SIZE;
@@ -215,9 +216,13 @@ fn a_main_thread_that_fails_to_start_is_undone() {
             scheduler,
             ..
         } = &mut tables;
-        let (thread, handle) =
-            create_thread_with_handle((handles, address_space, scheduler), own, &spec, &memory)
-                .unwrap();
+        let (thread, handle) = create_thread_with_handle(
+            (handles, address_space, scheduler),
+            own,
+            (&spec, 0),
+            &memory,
+        )
+        .unwrap();
         scheduler.mark_running(own).unwrap();
         if started {
             scheduler.start(thread).unwrap();
@@ -332,4 +337,226 @@ fn a_space_made_for_another_system_resource_is_refused() {
         create(&handles, made_with(resource)),
         Err(CreateError::Handles(_))
     ));
+}
+
+// --- What a process draws from the environment ----------------------------------------------
+
+/// The random numbers the replays below hand out, in order: the four entropy words, then the
+/// main thread's `x18`. All differ, and the last is even, so the bit `x18` gets set shows.
+const DRAWN: [u64; ENTROPY_COUNT + 1] = [
+    0x1111_0000_0000_00a1,
+    0x2222_0000_0000_00b2,
+    0x3333_0000_0000_00c3,
+    0x4444_0000_0000_00d4,
+    0x5555_0000_0000_00e6,
+];
+
+/// The first `n` of [`DRAWN`], as a replay's records.
+fn drawn(n: usize) -> Vec<EnvRecord> {
+    DRAWN
+        .iter()
+        .take(n)
+        .map(|&word| EnvRecord::Random(word))
+        .collect()
+}
+
+/// The entropy words of [`DRAWN`].
+fn entropy_words() -> [u64; ENTROPY_COUNT] {
+    let mut words = [0; ENTROPY_COUNT];
+    words.copy_from_slice(&DRAWN[..ENTROPY_COUNT]);
+    words
+}
+
+#[test]
+fn a_process_made_without_an_environment_has_no_entropy_and_a_zero_x18() {
+    let mut tables = create(&description(), fixture::loaded().0).unwrap();
+    let own = tables.processes.own();
+    assert_eq!(tables.scheduler.process(own).unwrap().entropy(), None);
+    let memory = tls_memory(&tables.address_space);
+    let main = run(&mut tables, &memory, ENTRY, STACK_TOP).unwrap();
+    let context = tables.scheduler.thread(main.thread).unwrap().context();
+    assert_eq!(context.x[CFI_REGISTER], 0);
+}
+
+#[test]
+fn the_entropy_and_x18_are_drawn_once_at_creation_in_order() {
+    // One replay for both steps, as a run boots: creation takes the first four numbers as the
+    // entropy, in order, and the start the fifth as the main thread's x18, with its low bit set.
+    let env = ReplayEnv::new(drawn(DRAWN.len()));
+    let mut tables = create_with_env(&description(), fixture::loaded().0, &env).unwrap();
+    let own = tables.processes.own();
+    assert_eq!(env.consumed(), ENTROPY_COUNT);
+    assert_eq!(
+        tables.scheduler.process(own).unwrap().entropy(),
+        Some(entropy_words())
+    );
+    let memory = tls_memory(&tables.address_space);
+    let main = run_with_env(&mut tables, &memory, (ENTRY, STACK_TOP), &env).unwrap();
+    // Exactly the five numbers were drawn.
+    assert_eq!(env.finish(), Ok(()));
+    let context = tables.scheduler.thread(main.thread).unwrap().context();
+    assert_eq!(
+        context.x[CFI_REGISTER],
+        DRAWN[ENTROPY_COUNT] | CFI_VALUE_SET_BITS
+    );
+    assert_eq!(context.x[CFI_REGISTER], 0x5555_0000_0000_00e7);
+    // The register itself, read by its literal index so a wrong `CFI_REGISTER` fails here:
+    // `ctx.r[18]` in `ResetThreadContext64` (`eden/src/core/hle/kernel/k_thread.cpp` @
+    // cf654052, line 61).
+    assert_eq!(context.x[18], 0x5555_0000_0000_00e7);
+    // The rest of the start state is `run`'s: x0 zero, x1 the handle, every other register
+    // zero.
+    assert_eq!(context.x[0], 0);
+    assert_eq!(context.x[1], u64::from(main.handle.raw()));
+    for (n, value) in context.x.iter().enumerate().skip(2) {
+        if n != CFI_REGISTER {
+            assert_eq!(*value, 0, "x{n}");
+        }
+    }
+    assert_eq!((context.pc, context.sp), (ENTRY, STACK_TOP));
+    // The entropy did not change when the thread started.
+    assert_eq!(
+        tables.scheduler.process(own).unwrap().entropy(),
+        Some(entropy_words())
+    );
+}
+
+#[test]
+fn an_x18_draw_that_is_already_odd_keeps_its_value() {
+    // `| 1` sets the bit; it does not add one.
+    let env = ReplayEnv::new(vec![EnvRecord::Random(0x0f0f_0000_0000_0001)]);
+    let mut tables = create(&description(), fixture::loaded().0).unwrap();
+    let memory = tls_memory(&tables.address_space);
+    let main = run_with_env(&mut tables, &memory, (ENTRY, STACK_TOP), &env).unwrap();
+    let context = tables.scheduler.thread(main.thread).unwrap().context();
+    assert_eq!(context.x[CFI_REGISTER], 0x0f0f_0000_0000_0001);
+}
+
+#[test]
+fn a_replay_missing_an_entropy_word_fails_creation_with_the_exact_error() {
+    // Each count short of the four: the draw that finds nothing is the record after the last
+    // one given.
+    for given in 0..ENTROPY_COUNT {
+        let env = ReplayEnv::new(drawn(given));
+        let created = create_with_env(&description(), fixture::loaded().0, &env).map(|_| ());
+        let error = EnvError::Exhausted {
+            index: given,
+            requested: EnvCall::Random,
+        };
+        assert_eq!(created, Err(CreateError::Env(error.clone())), "{given}");
+        assert_eq!(
+            CreateError::Env(error).to_string(),
+            format!(
+                "the environment failed while the process's entropy was drawn: recording \
+                 exhausted at record {given}: the replay asked for Random"
+            )
+        );
+    }
+}
+
+#[test]
+fn a_refused_description_draws_nothing() {
+    // The description's checks come first: with a replay that has nothing to give, the error
+    // is the description's, not the environment's.
+    let mut cores = description();
+    cores.cores = Range { first: 1, last: 0 };
+    let env = ReplayEnv::new(Vec::new());
+    assert_eq!(
+        create_with_env(&cores, fixture::loaded().0, &env).map(|_| ()),
+        Err(CreateError::Process(ProcessError::Capability(
+            KernelError::InvalidCombination
+        )))
+    );
+    // A space made for another system resource: refused before the draw too.
+    let mut resource = description();
+    resource.system_resource_size =
+        u32::try_from(2 * crate::memory::system_resource::SECURE_ALIGNMENT).unwrap();
+    assert!(matches!(
+        create_with_env(&resource, fixture::loaded().0, &env).map(|_| ()),
+        Err(CreateError::SystemResource { .. })
+    ));
+    assert_eq!(env.consumed(), 0);
+}
+
+#[test]
+fn a_replay_missing_the_x18_fails_the_start_with_nothing_made_and_the_next_start_succeeds() {
+    let mut tables = create(&description(), fixture::loaded().0).unwrap();
+    let own = tables.processes.own();
+    let memory = tls_memory(&tables.address_space);
+    let before = tables.scheduler.clone();
+    let empty = ReplayEnv::new(Vec::new());
+    let error = EnvError::Exhausted {
+        index: 0,
+        requested: EnvCall::Random,
+    };
+    assert_eq!(
+        run_with_env(&mut tables, &memory, (ENTRY, STACK_TOP), &empty),
+        Err(StartError::Env(error.clone()))
+    );
+    assert_eq!(
+        StartError::Env(error).to_string(),
+        "the environment failed while the main thread's x18 was drawn: recording exhausted at \
+         record 0: the replay asked for Random"
+    );
+    assert_eq!(tables.scheduler, before);
+    assert!(tables.handles.is_empty());
+    assert_eq!(
+        tables.scheduler.process(own).unwrap().state(),
+        ProcessState::Created
+    );
+    let env = ReplayEnv::new(drawn(1));
+    let main = run_with_env(&mut tables, &memory, (ENTRY, STACK_TOP), &env).unwrap();
+    assert_eq!(
+        tables.scheduler.thread(main.thread).unwrap().context().x[CFI_REGISTER],
+        DRAWN[0] | CFI_VALUE_SET_BITS
+    );
+}
+
+#[test]
+fn a_process_that_is_not_created_is_refused_before_the_draw() {
+    // Both faults at once: the process already runs, and the replay has nothing to give. The
+    // state check comes first, so the error is Eden's InvalidState and nothing is drawn.
+    let mut tables = create(&description(), fixture::loaded().0).unwrap();
+    let memory = tls_memory(&tables.address_space);
+    run(&mut tables, &memory, ENTRY, STACK_TOP).unwrap();
+    let empty = ReplayEnv::new(Vec::new());
+    assert_eq!(
+        run_with_env(&mut tables, &memory, (ENTRY, STACK_TOP), &empty),
+        Err(StartError::Call(SvcError::Kernel(
+            KernelError::InvalidState
+        )))
+    );
+    assert_eq!(empty.consumed(), 0);
+}
+
+#[test]
+fn a_start_refused_after_the_draw_has_still_drawn_one_number() {
+    // Divergence (module docs): at its thread limit the start is refused with Eden's
+    // LimitReached, after the draw; Eden's draw comes after the reservation, so it would have
+    // drawn nothing.
+    let mut tables = create(&description(), fixture::loaded().0).unwrap();
+    let own = tables.processes.own();
+    let spec = UserThread {
+        entry: ENTRY,
+        argument: 0,
+        stack_top: STACK_TOP,
+        priority: crate::sched::Priority::new(44).unwrap(),
+        virtual_core: 0,
+    };
+    let limit = crate::resource_limit::THREAD_COUNT_LIMIT;
+    for _ in 0..limit {
+        tables
+            .scheduler
+            .create_user_thread(&mut tables.address_space, own, &spec)
+            .unwrap();
+    }
+    let memory = tls_memory(&tables.address_space);
+    let env = ReplayEnv::new(drawn(1));
+    assert_eq!(
+        run_with_env(&mut tables, &memory, (ENTRY, STACK_TOP), &env),
+        Err(StartError::Call(SvcError::Kernel(
+            KernelError::LimitReached
+        )))
+    );
+    assert_eq!(env.finish(), Ok(()));
 }

@@ -8,7 +8,7 @@ use super::*;
 use crate::dispatch::Tables;
 use crate::memory::{GUARD_PAGES, fixture};
 use crate::process::{
-    CURRENT_THREAD_HANDLE_OFFSET, Console, MainThread, ProcessDescription, Range,
+    CFI_REGISTER, CURRENT_THREAD_HANDLE_OFFSET, Console, MainThread, ProcessDescription, Range,
     THREAD_LOCAL_REGION_SIZE,
 };
 use crate::sched::{CoreSignals, FIRST_THREAD_ID, ThreadState};
@@ -28,6 +28,9 @@ const ENTRY: u64 = 0x8000_0040;
 const STACK_TOP: u64 = 0x10_8000_0000;
 /// Pages of guest memory the tests give the thread-local pages: more than they use.
 const TLS_PAGES: u64 = 64;
+/// The `x18` the tests pass `CreateThread`, as the dispatcher would after drawing it: odd, and
+/// no other register holds it.
+const X18: u64 = 0x5eed_0000_0000_0019;
 
 fn core(index: u8) -> CoreId {
     CoreId::new(index).unwrap()
@@ -193,6 +196,7 @@ fn args(core_id: i32) -> CreateThread {
         stack_top: 0x10_9000_0000,
         priority: 44,
         core_id,
+        x18: X18,
     }
 }
 
@@ -219,9 +223,27 @@ fn create_start_and_exit_a_thread() {
     let context = row.context();
     let expected = args(1);
     assert_eq!(
-        (context.pc, context.sp, context.x[0], context.tpidrro),
-        (expected.entry, expected.stack_top, expected.argument, tls)
+        (
+            context.pc,
+            context.sp,
+            context.x[0],
+            context.x[CFI_REGISTER],
+            context.tpidrro
+        ),
+        (
+            expected.entry,
+            expected.stack_top,
+            expected.argument,
+            expected.x18,
+            tls
+        )
     );
+    // Every other general register is zero, as `ResetThreadContext64` leaves it.
+    for (n, value) in context.x.iter().enumerate() {
+        if n != 0 && n != CFI_REGISTER {
+            assert_eq!(*value, 0, "x{n}");
+        }
+    }
     let mut written = [0; 4];
     world
         .memory

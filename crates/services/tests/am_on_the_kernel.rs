@@ -1,7 +1,9 @@
 //! `appletOE` on the real kernel: libnx's `SetFocusHandlingMode(0, 0, 1)` clears the message
 //! event the guest holds a handle to, `ISelfController::Exit` answers the guest and then
 //! ends its process, releasing everything the process held, and `IApplicationFunctions` 210
-//! copies a handle the guest can wait on, to the same event on every call.
+//! copies a handle the guest can wait on, to the same event on every call. And restoring
+//! beside the kernel: the server, saved, restores beside the kernel it ran on, and the
+//! kernel answers a restore's questions as the services framework's fake kernel does.
 //!
 //! The caller is a thread the scheduler runs (`run_a_user_thread`), so the kernel writes a reply
 //! only while that thread has not ended: a kernel that ended the process before writing the
@@ -17,12 +19,13 @@ mod on_the_kernel {
     use starquake_ipc::{BUFFER_SIZE, Body, CommandType, Message, RequestBuilder, SessionKind};
     use starquake_kernel::dispatch::{Caller, Dispatcher, Outcome, Tables};
     use starquake_kernel::handle::{Handle, HandleTable};
-    use starquake_kernel::id::ProcessId;
-    use starquake_kernel::ipc::PortName;
+    use starquake_kernel::id::{ObjectId, ProcessId};
+    use starquake_kernel::ipc::{EventHook, PortName};
     use starquake_kernel::memory::testing::RecordingMapper;
     use starquake_kernel::memory::{
-        AddressSpace, MemoryArrangement, ProcessMemory, RegionOffsets, SvcPermission,
+        AddressSpace, MemoryArrangement, ProcessMemory, RegionOffsets, SharedMemory, SvcPermission,
     };
+    use starquake_kernel::object::Object;
     use starquake_kernel::process::{
         self, Console, ProcessDescription, ProcessState, VIRTUAL_TO_PHYSICAL_CORE,
     };
@@ -38,8 +41,11 @@ mod on_the_kernel {
     };
     use starquake_services::am::command::proxy_service::OPEN_APPLICATION_PROXY;
     use starquake_services::am::command::self_controller::{EXIT, SET_FOCUS_HANDLING_MODE};
-    use starquake_services::am::{AppletSettings, OE_NAME, oe_server};
-    use starquake_services::framework::UnknownPolicy;
+    use starquake_services::am::{Applet, AppletSettings, OE_NAME, oe_server};
+    use starquake_services::framework::fake::FakeKernel;
+    use starquake_services::framework::{
+        Kernel, RestoredKernel, Server, SnapshotError, UnknownPolicy,
+    };
     use starquake_trace::{
         EventKind, FixedClock, GuestTicks, LiveEnv, Recorder, ServiceId, ThreadId, VecSink,
     };
@@ -384,5 +390,182 @@ mod on_the_kernel {
         // resource limit, the service's event and the ended thread's creator's reference
         // remain.
         assert_eq!(rig.holdings(), (0, 4, true));
+    }
+
+    // ----- restoring beside the kernel ---------------------------------------------------------
+
+    /// What `appletOE`'s server saves now.
+    fn saved_oe(dispatcher: &Dispatcher) -> Vec<u8> {
+        let mut saved = None;
+        let out = dispatcher.inspect_handlers(|service, handler| {
+            if service == OE {
+                let handler: &dyn core::any::Any = handler;
+                saved = Some(handler.downcast_ref::<Server>().unwrap().save().unwrap());
+            }
+        });
+        assert_eq!(out, 0);
+        saved.unwrap()
+    }
+
+    /// `appletOE`'s server as a run builds it: known by the number the kernel has it under.
+    fn oe_as_wired() -> Server {
+        oe_server(AppletSettings::eden_default(), UnknownPolicy::Strict).with_service_id(OE)
+    }
+
+    /// The production arrangement: `appletOE` run on the kernel, saved, and restored beside the
+    /// same kernel into a server built as a run builds it, keeps the event the guest holds a
+    /// handle to; a server known by another number, and `restore` with no kernel, refuse the
+    /// same snapshot with the exact errors.
+    #[test]
+    fn appletoe_restores_beside_the_kernel_it_ran_on() {
+        let rig = Rig::new();
+        let event = rig.object_of(rig.message_event());
+        let saved = saved_oe(&rig.dispatcher);
+
+        let mut restored = oe_as_wired();
+        assert_eq!(restored.restore_beside(&saved, &rig.dispatcher), Ok(()));
+        assert_eq!(
+            restored.family::<Applet>().unwrap().message_event(),
+            Some(event)
+        );
+
+        let mut elsewhere = oe_server(AppletSettings::eden_default(), UnknownPolicy::Strict)
+            .with_service_id(ServiceId(OE.0 + 1));
+        assert_eq!(
+            elsewhere.restore_beside(&saved, &rig.dispatcher),
+            Err(SnapshotError::FamilyObject(
+                "its applet's message event is not a live readable event its server made"
+            ))
+        );
+        assert_eq!(
+            oe_as_wired().restore(&saved),
+            Err(SnapshotError::NeedsKernel)
+        );
+    }
+
+    /// Another server's number, for the parity test's second server.
+    const OTHER: ServiceId = ServiceId(0x65);
+
+    /// What a restore asks of a kernel about each object, by name: whether it is a live
+    /// readable event of [`OE`]'s and of [`OTHER`]'s, and the size and permission of the shared
+    /// memory it names, if any.
+    type Answers = Vec<(&'static str, bool, bool, Option<(u64, SvcPermission)>)>;
+
+    /// The questions of [`Answers`] about `objects`, asked of `kernel`.
+    fn answers(kernel: &dyn RestoredKernel, objects: &[(&'static str, ObjectId)]) -> Answers {
+        objects
+            .iter()
+            .map(|&(name, id)| {
+                let memory = kernel
+                    .shared_memory(id)
+                    .map(|memory| (memory.size(), memory.user_permission()));
+                (
+                    name,
+                    kernel.is_service_readable_event(OE, id),
+                    kernel.is_service_readable_event(OTHER, id),
+                    memory,
+                )
+            })
+            .collect()
+    }
+
+    /// A hook that does nothing.
+    struct QuietHook;
+
+    impl EventHook for QuietHook {
+        fn signalled(&self, _: ObjectId) {}
+    }
+
+    /// The fake kernel answers a restore as the kernel does (the fake's module docs, "A
+    /// restore's questions"): the same objects made on each (a readable event of each of two
+    /// servers, both ends of an event one of them made, a read-only and a read-write shared
+    /// memory, and an id that names nothing live) get the same answers, which are these.
+    #[test]
+    fn the_fake_and_the_kernel_answer_a_restore_alike() {
+        let rig = Rig::new();
+        rig.dispatcher
+            .add_server(
+                "other",
+                OTHER,
+                None,
+                Box::new(Server::new("other", UnknownPolicy::Strict)),
+            )
+            .unwrap();
+        let mine = rig.object_of(rig.message_event());
+        let made = rig
+            .dispatcher
+            .with::<(&mut AddressSpace, &mut Scheduler), _>(|(space, scheduler)| {
+                let ipc = scheduler.ipc();
+                let (oe, other) = (ipc.service(OE).unwrap(), ipc.service(OTHER).unwrap());
+                let others = scheduler.create_readable_event().unwrap();
+                let (writable, readable) = scheduler.create_event().unwrap();
+                let gone = scheduler.create_readable_event().unwrap();
+                let (_, ipc) = scheduler.ipc_mut();
+                ipc.add_server_event(other, others).unwrap();
+                for event in [writable, readable, gone] {
+                    ipc.add_server_event(oe, event).unwrap();
+                }
+                scheduler.objects_mut().release(gone).unwrap();
+                let mut memory = |permission| {
+                    let pages = space.allocate_shared(PAGE_SIZE).unwrap();
+                    let memory = SharedMemory::new(pages.backing(), permission).unwrap();
+                    scheduler
+                        .objects_mut()
+                        .create(Object::SharedMemory(memory))
+                        .unwrap()
+                };
+                let read = memory(SvcPermission::Read);
+                let write = memory(SvcPermission::ReadWrite);
+                [
+                    ("its own event", mine),
+                    ("another server's event", others),
+                    ("a writable end it made", writable),
+                    ("the readable end of that event", readable),
+                    ("a read-only shared memory", read),
+                    ("a read-write shared memory", write),
+                    ("an event that is gone", gone),
+                ]
+            });
+
+        let mut fake = FakeKernel::new(0).unwrap();
+        fake.set_current_service(OE);
+        let mine = fake.create_event().unwrap();
+        fake.set_current_service(OTHER);
+        let others = fake.create_event().unwrap();
+        fake.set_current_service(OE);
+        let (writable, readable) = fake.create_hooked_event(Arc::new(QuietHook)).unwrap();
+        let read = fake.create_shared_memory(PAGE_SIZE, SvcPermission::Read);
+        let write = fake.create_shared_memory(PAGE_SIZE, SvcPermission::ReadWrite);
+        let faked = [
+            ("its own event", mine),
+            ("another server's event", others),
+            ("a writable end it made", writable),
+            ("the readable end of that event", readable),
+            ("a read-only shared memory", read.unwrap().0),
+            ("a read-write shared memory", write.unwrap().0),
+            ("an event that is gone", fake.new_object()),
+        ];
+
+        let expected: Answers = vec![
+            ("its own event", true, false, None),
+            ("another server's event", false, true, None),
+            ("a writable end it made", false, false, None),
+            ("the readable end of that event", true, false, None),
+            (
+                "a read-only shared memory",
+                false,
+                false,
+                Some((PAGE_SIZE, SvcPermission::Read)),
+            ),
+            (
+                "a read-write shared memory",
+                false,
+                false,
+                Some((PAGE_SIZE, SvcPermission::ReadWrite)),
+            ),
+            ("an event that is gone", false, false, None),
+        ];
+        assert_eq!(answers(&rig.dispatcher, &made), expected);
+        assert_eq!(answers(&fake, &faked), expected);
     }
 }

@@ -113,7 +113,7 @@ fn a_snapshot_with_another_video_server_is_refused() {
         let bytes = wired_with(saved).server.save().unwrap();
         let mut rig = wired_with(run);
         assert_eq!(
-            rig.server.restore(&bytes),
+            rig.server.restore_beside(&bytes, &rig.kernel),
             Err(SnapshotError::FamilyWiring(
                 "its root names another video server"
             )),
@@ -127,7 +127,7 @@ fn a_snapshot_with_another_video_server_is_refused() {
     let bytes = wired_with(both).server.save().unwrap();
     let mut rig = wired_with(run);
     assert_eq!(
-        rig.server.restore(&bytes),
+        rig.server.restore_beside(&bytes, &rig.kernel),
         Err(SnapshotError::FamilyWiring(
             "its root names another gpu server"
         ))

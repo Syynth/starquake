@@ -80,7 +80,7 @@ pub mod title;
 
 pub use image::{LoadError, MEMORY_BLOCK_UNIT_SIZE, SYSTEM_RESOURCE_SIZE_MAX, SystemResourceFault};
 pub use report::{
-    DateSource, ExitReason, Mapping, RunDate, RunOptions, RunReport, Summary, ThreadPc,
+    DateSource, EnvSource, ExitReason, Mapping, RunDate, RunOptions, RunReport, Summary, ThreadPc,
     ThreadPcState, exit_code,
 };
 pub use space::SpaceError;
@@ -92,6 +92,10 @@ pub use title::TitleError;
 /// this crate.
 pub use starquake_services::time::{FIRST_RTC_AT_BOOT, LAST_RTC_AT_BOOT, RtcAtBoot};
 pub use starquake_trace::UnixSeconds;
+
+/// One answer of a run's environment, as a run's report keeps it ([`RunReport::environment`]) and
+/// a replay feeds it back ([`EnvSource::Replay`]), for frontends, which see only this crate.
+pub use starquake_trace::EnvRecord;
 
 /// The loader's formats (NUP containers, NPDM, NSO), for frontends, which see only this crate
 /// (`docs/architecture.md`, "Crates and dependency direction"): `starquake inspect` and

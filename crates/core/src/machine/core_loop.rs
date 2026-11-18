@@ -232,9 +232,9 @@ impl<'m, 'a, V: Vcpu, C: HostClock + Clone> Core<'m, 'a, V, C> {
                 recorder: &machine.session.recorder,
             },
         );
-        // PROVISIONAL: nothing keeps the environment's recording (see the module docs), and
-        // every dispatch adds a clock reading to it.
-        drop(machine.env.take_recording());
+        // Every dispatch adds a clock reading to the recording, which the run keeps (`machine`
+        // module docs, "The environment").
+        machine.env.keep();
         lock(&machine.tally).count(&record);
         // The call may have unmapped or reprotected memory. What the vCPUs have cached about it
         // must go before the guest runs again, also when the call failed part-way.

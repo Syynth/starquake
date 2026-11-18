@@ -4,15 +4,16 @@
 use starquake_cpu::GuestRegs;
 use starquake_memory::{FlatMemory, PAGE_SIZE};
 use starquake_trace::{
-    EventKind, FixedClock, GuestTicks, LiveEnv, Recorder, ThreadId as EventThread,
+    Env, EnvCall, EnvError, EnvRecord, EventKind, FixedClock, GuestTicks, HostNanos, LiveEnv,
+    Recorder, ReplayEnv, ThreadId as EventThread,
 };
 
 use super::*;
 use crate::dispatch::{Caller, Record};
 use crate::memory::{GUARD_PAGES, fixture};
 use crate::process::{
-    Console, IDEAL_CORE_DONT_CARE, IDEAL_CORE_USE_PROCESS_VALUE, MainThread, ProcessDescription,
-    THREAD_LOCAL_REGION_SIZE,
+    CFI_REGISTER, CFI_VALUE_SET_BITS, Console, IDEAL_CORE_DONT_CARE, IDEAL_CORE_USE_PROCESS_VALUE,
+    MainThread, ProcessDescription, THREAD_LOCAL_REGION_SIZE,
 };
 use crate::result::KernelError;
 use crate::sched::{CoreId, CoreSignals, FIRST_THREAD_ID, ThreadState};
@@ -365,4 +366,119 @@ fn exiting_twice_is_not_implemented_the_second_time() {
     );
     assert_eq!(regs.x[0], result(KernelError::NotImplemented));
     assert_eq!(regs.x[1..], before.x[1..]);
+}
+
+// --- CreateThread's x18 -------------------------------------------------------------------
+
+/// The random number the replays below hand `CreateThread` for its `x18`: even, so the set bit
+/// shows ([`CFI_VALUE_SET_BITS`]), and no clock reading or register value.
+const DRAWN_X18: u64 = 0x7a7a_0000_0000_0010;
+
+/// A replay of one dispatch: its clock reading, then `random` if there is one.
+fn replay(random: Option<u64>) -> ReplayEnv {
+    let mut records = vec![EnvRecord::Clock(HostNanos(1_000))];
+    records.extend(random.map(EnvRecord::Random));
+    ReplayEnv::new(records)
+}
+
+impl World {
+    /// [`World::call`] on core 0, with `env` as the caller's environment.
+    fn call_with(&self, env: &dyn Env, id: SvcId, regs: &mut GuestRegs) -> Record {
+        let mut debug = NoDebug;
+        let mut caller = Caller {
+            core: 0,
+            thread: EventThread(1),
+            env,
+            memory: &self.memory,
+            debug: &mut debug,
+            recorder: &self.recorder,
+        };
+        self.dispatcher.dispatch(id.number(), regs, &mut caller)
+    }
+
+    /// How many handles the process's table holds, and how many thread-local regions it uses.
+    fn made(&self) -> (usize, usize) {
+        self.with_tables(|handles, scheduler| {
+            let main = scheduler.thread(self.main.thread).unwrap();
+            let own = scheduler.process(main.process().unwrap()).unwrap();
+            (handles.len(), own.tls().used())
+        })
+    }
+}
+
+/// `CreateThread` registers for a thread at priority `priority` on virtual core 1.
+fn create_regs(priority: i32) -> GuestRegs {
+    let mut regs = regs();
+    regs.x[4] = word(priority);
+    regs.x[5] = word(1);
+    regs
+}
+
+#[test]
+fn create_thread_draws_the_new_thread_s_x18_after_the_dispatch_s_clock() {
+    let world = World::new();
+    let env = replay(Some(DRAWN_X18));
+    let mut regs = create_regs(44);
+    let record = world.call_with(&env, SvcId::CreateThread, &mut regs);
+    assert_eq!(record.outcome, Outcome::Completed);
+    assert_eq!(regs.x[0], 0);
+    // The clock, then one random number: the replay is used up exactly.
+    assert_eq!(env.finish(), Ok(()));
+    let handle = Handle::from_register(regs.x[1]);
+    world.with_tables(|handles, scheduler| {
+        let thread = thread::thread_from_handle(scheduler, handles, core(0), handle).unwrap();
+        let context = scheduler.thread(thread).unwrap().context();
+        assert_eq!(context.x[CFI_REGISTER], DRAWN_X18 | CFI_VALUE_SET_BITS);
+        assert_eq!(context.x[CFI_REGISTER], 0x7a7a_0000_0000_0011);
+        // The main thread's, made without an environment (`process::run`), is still zero.
+        let main = scheduler.thread(world.main.thread).unwrap().context();
+        assert_eq!(main.x[CFI_REGISTER], 0);
+    });
+}
+
+#[test]
+fn an_environment_that_fails_the_x18_draw_ends_create_thread_and_makes_nothing() {
+    let world = World::new();
+    let before_made = world.made();
+    let env = replay(None);
+    let mut regs = create_regs(44);
+    let before = regs.clone();
+    let record = world.call_with(&env, SvcId::CreateThread, &mut regs);
+    assert_eq!(
+        record.outcome,
+        Outcome::EnvFailed(EnvError::Exhausted {
+            index: 1,
+            requested: EnvCall::Random,
+        })
+    );
+    assert_eq!(regs, before, "the call writes no register");
+    assert_eq!(
+        world.made(),
+        before_made,
+        "no handle and no region was taken"
+    );
+    // The next attempt, with an environment that answers, makes the thread.
+    let env = replay(Some(DRAWN_X18));
+    let record = world.call_with(&env, SvcId::CreateThread, &mut regs);
+    assert_eq!(record.outcome, Outcome::Completed);
+    assert_eq!(regs.x[0], 0);
+    assert_eq!(world.made(), (before_made.0 + 1, before_made.1 + 1));
+}
+
+#[test]
+fn a_refused_create_thread_has_still_drawn_its_x18() {
+    // Divergence (`dispatch/lifecycle.rs`, `create_thread`): the number is drawn before the
+    // call's checks, which then refuse priority 64. Eden would draw nothing.
+    let world = World::new();
+    let before_made = world.made();
+    let env = replay(Some(DRAWN_X18));
+    let mut regs = create_regs(64);
+    let record = world.call_with(&env, SvcId::CreateThread, &mut regs);
+    assert_eq!(record.outcome, Outcome::Completed);
+    assert_eq!(
+        (regs.x[0], regs.x[1]),
+        (result(KernelError::InvalidPriority), 0)
+    );
+    assert_eq!(env.finish(), Ok(()));
+    assert_eq!(world.made(), before_made);
 }

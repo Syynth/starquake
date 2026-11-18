@@ -70,7 +70,13 @@
 //!   deferred request's reply has a domain header exactly when its session leads to a domain.
 //! - The family state: present exactly when the server has some, and decodes as its type; for
 //!   a family set with [`Server::with_checked_family`], it also passes that family's check
-//!   against the server's own state ([`SnapshotError::FamilyWiring`]).
+//!   against the server's own state ([`SnapshotError::FamilyWiring`]); then, for a family with a
+//!   [`Server::with_family_objects`] check, the server is being restored beside a kernel
+//!   ([`SnapshotError::NeedsKernel`] from [`Server::restore`]) and every kernel object id the
+//!   check reads is one that kernel holds live, of the kind the family keeps, and, where the
+//!   family's check asks, made by the server (an event) or of the size and permission the
+//!   family maps it with (a shared memory) ([`SnapshotError::FamilyObject`];
+//!   [`Server::restore_beside`]).
 //!
 //! Not checked, because the snapshot holds nothing to check them against: the values inside a
 //! session's or a family's state (see "Format") beyond what the state's own deserialisation
@@ -96,6 +102,7 @@ use starquake_kernel::slab::Slab;
 use super::commands::Session;
 use super::defer::{Framing, Mailbox, Pending, TokenId};
 use super::queue::RequestQueue;
+use super::restored::RestoredKernel;
 use super::server::Server;
 use super::targets::{Row, TargetId, Targets};
 
@@ -169,6 +176,19 @@ pub enum SnapshotError {
     /// ([`Server::with_checked_family`]): it was saved by a run put together differently.
     #[error("the snapshot does not fit this run: {0}")]
     FamilyWiring(&'static str),
+    /// The server's family names kernel objects ([`Server::with_family_objects`]), so its
+    /// snapshot is restored only beside the kernel that holds them ([`Server::restore_beside`]),
+    /// and [`Server::restore`] was called.
+    #[error("the server keeps kernel objects, so it is restored only beside the kernel")]
+    NeedsKernel,
+    /// The snapshot's family state names a kernel object that does not match the kernel it is
+    /// restored beside ([`Server::with_family_objects`]): the kernel holds nothing live under
+    /// the id, or holds an object of another kind, or (where the family's check asks) one
+    /// another maker made (another server's or the guest's event), or a shared memory of
+    /// another size or permission. The message is the family's: it names the slot and what
+    /// the slot was checked for.
+    #[error("the snapshot names a kernel object that does not match this kernel: {0}")]
+    FamilyObject(&'static str),
 }
 
 /// Encodes a session's or a family's state. [`commands!`](crate::commands) calls it; a service
@@ -386,7 +406,37 @@ impl Server {
     ///
     /// Reply tokens taken before the restore no longer lead to this server: completing one does
     /// nothing. Deferred requests in the snapshot are resumed with [`Server::reissue`].
+    ///
+    /// A server whose family names kernel objects ([`Server::with_family_objects`]) is restored
+    /// with [`Server::restore_beside`] instead: here its snapshot is refused with
+    /// [`SnapshotError::NeedsKernel`], at the point where the objects would be checked.
     pub fn restore(&mut self, bytes: &[u8]) -> Result<(), SnapshotError> {
+        self.restore_with(bytes, None)
+    }
+
+    /// [`Server::restore`], beside `kernel`, which holds the kernel objects the snapshot's
+    /// family names: a family with a [`Server::with_family_objects`] check has each checked
+    /// against it, after the family's wiring check and before its state loads. For a server
+    /// with no such check this is [`Server::restore`], and `kernel` is not asked.
+    ///
+    /// With the kernel's `Dispatcher` as `kernel`, call this with the dispatcher's table lock
+    /// free: not from inside a `Dispatcher::with` or `Dispatcher::inspect_handlers` closure,
+    /// which hold it. The check takes that lock and it is not re-entrant
+    /// ([`RestoredKernel`]'s impl for the dispatcher).
+    pub fn restore_beside(
+        &mut self,
+        bytes: &[u8],
+        kernel: &dyn RestoredKernel,
+    ) -> Result<(), SnapshotError> {
+        self.restore_with(bytes, Some(kernel))
+    }
+
+    /// [`Server::restore`] and [`Server::restore_beside`]: `kernel` is the one given, if any.
+    fn restore_with(
+        &mut self,
+        bytes: &[u8],
+        kernel: Option<&dyn RestoredKernel>,
+    ) -> Result<(), SnapshotError> {
         let (header, rest) =
             postcard::take_from_bytes::<Header>(bytes).map_err(SnapshotError::Decode)?;
         if header.magic != SNAPSHOT_MAGIC {
@@ -422,11 +472,16 @@ impl Server {
             next_token: body.next_token,
         };
         requests.check()?;
+        let service = self.service_id();
         // The family is loaded last: it is the one step that changes the server and can fail.
         match (self.family.as_deref_mut(), body.family) {
             (Some(family), Some(saved)) => {
                 if let Some(check) = &self.family_check {
                     check(&*family, &saved)?;
+                }
+                if let Some(check) = &self.family_objects {
+                    let kernel = kernel.ok_or(SnapshotError::NeedsKernel)?;
+                    check(&saved, kernel, service)?;
                 }
                 family.load_state(&saved)?;
             }
@@ -588,6 +643,14 @@ mod tests {
         assert_eq!(
             SnapshotError::Inconsistent("a deferred request has no pending token").to_string(),
             "inconsistent snapshot: a deferred request has no pending token"
+        );
+        assert_eq!(
+            SnapshotError::NeedsKernel.to_string(),
+            "the server keeps kernel objects, so it is restored only beside the kernel"
+        );
+        assert_eq!(
+            SnapshotError::FamilyObject("its event is not one").to_string(),
+            "the snapshot names a kernel object that does not match this kernel: its event is not one"
         );
     }
 }

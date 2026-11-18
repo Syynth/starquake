@@ -12,7 +12,7 @@ use std::time::Duration;
 use serde::Serialize;
 use starquake_kernel::sched::ThreadState;
 use starquake_services::time::RtcAtBoot;
-use starquake_trace::{Dump, UnixSeconds};
+use starquake_trace::{Dump, EnvRecord, UnixSeconds};
 
 use crate::crash::{CrashReport, Location, Module, address_text};
 use crate::services_report::{ServicesReport, StubbedCommand};
@@ -69,6 +69,25 @@ pub struct RunOptions {
     /// ([`RtcAtBoot::eden_default`]), so a run that does not say, as a test does not, has a date
     /// that does not depend on the host (`starquake_services::time`, "The run's date").
     pub rtc: RtcAtBoot,
+    /// Where the answers of the run's environment come from: the host, recorded
+    /// ([`EnvSource::Live`], the default), or a recording fed back ([`EnvSource::Replay`]).
+    pub environment: EnvSource,
+}
+
+/// Where the answers of a run's environment (its clock, random numbers, host I/O and wall
+/// clock: `starquake_trace::Env`) come from (`docs/specs/observability.md`, rule 1).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum EnvSource {
+    /// Read the host, and keep what it answered in the run's report
+    /// ([`RunReport::environment`]).
+    #[default]
+    Live,
+    /// Feed these answers back, in order: a replay of a run whose report kept them. A call
+    /// the recording cannot answer (it ran out, or the next record answers another kind of
+    /// call) stops the run as an emulator error (decision log, 2026-11-17, "Env failures").
+    /// `fsp-srv`'s workers still read the host: their reads are not in the recording
+    /// (`crate::machine`, "The environment").
+    Replay(Vec<EnvRecord>),
 }
 
 /// The date a run's clocks started from, and where it came from: what `summary.json` keeps as
@@ -311,6 +330,16 @@ pub struct RunReport {
     /// ended before it was read: the program could not be loaded or the kernel set up, or the
     /// read itself failed.
     pub date: Option<RunDate>,
+    /// What the run's environment answered, in order, as far as the run keeps it (16 MiB of
+    /// records, the first; `crate::machine`, "The environment"): fed back as
+    /// [`EnvSource::Replay`], it gives a run the same answers. It starts with what the process
+    /// drew as it was created (its entropy, then its main thread's `x18`) and the date, when
+    /// the run read the host's. Empty for a replay, which records nothing, and for a run that
+    /// failed before its environment was made.
+    pub environment: Vec<EnvRecord>,
+    /// How many later answers are missing from [`RunReport::environment`] because the limit
+    /// was reached.
+    pub environment_dropped: u64,
 }
 
 impl RunReport {
@@ -336,6 +365,8 @@ impl RunReport {
             host_log: Vec::new(),
             host_log_dropped: 0,
             date: None,
+            environment: Vec::new(),
+            environment_dropped: 0,
         }
     }
 
@@ -537,6 +568,9 @@ mod tests {
             host_log: vec!["WARN a".to_owned(), "ERROR b".to_owned()],
             host_log_dropped: 10,
             date: Some(RunDate::new(RtcAtBoot::Host, UnixSeconds(1_709_164_811))),
+            // Not in the summary.
+            environment: vec![starquake_trace::EnvRecord::Random(3)],
+            environment_dropped: 2,
         };
         let json = serde_json::to_string_pretty(&report.summary()).unwrap();
         assert_eq!(

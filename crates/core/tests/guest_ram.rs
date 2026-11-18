@@ -69,6 +69,7 @@ mod support {
             sd_card: None,
             romfs: None,
             rtc: starquake_core::RtcAtBoot::eden_default(),
+            environment: starquake_core::EnvSource::Live,
         }))
     }
 

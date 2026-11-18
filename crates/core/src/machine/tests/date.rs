@@ -12,8 +12,13 @@ use super::*;
 use crate::hle::TIME_U;
 use crate::report::DateSource;
 
+/// How many random numbers a run draws as it boots, before the date: the process's entropy and
+/// its main thread's `x18`.
+const BOOT_DRAWS: usize = starquake_kernel::process::ENTROPY_COUNT + 1;
+
 /// What a run's services saw as they were installed: the run's environment's recording so far,
-/// and the settings `time:u`'s server was installed with.
+/// after the process's draws at boot (its entropy and its main thread's `x18`, which come first
+/// and are all random numbers), and the settings `time:u`'s server was installed with.
 type Seen = (Vec<EnvRecord>, Option<TimeSettings>);
 
 /// Runs a guest that exits at once, with the run's date from `rtc`, through a real run's
@@ -35,7 +40,14 @@ fn run_dated(rtc: RtcAtBoot) -> (Ending, Seen) {
     let seen = Arc::new(Mutex::new(None));
     let kept = Arc::clone(&seen);
     let install = move |dispatcher: &Dispatcher, given: Given| {
-        let read = watched.recording();
+        let mut read = watched.recording();
+        let after_draws = read.split_off(BOOT_DRAWS);
+        assert!(
+            read.iter()
+                .all(|record| matches!(record, EnvRecord::Random(_))),
+            "{read:?}"
+        );
+        let read = after_draws;
         real_services(dispatcher, given)?;
         let mut settings = None;
         dispatcher.inspect_handlers(|service, handler| {
@@ -51,7 +63,7 @@ fn run_dated(rtc: RtcAtBoot) -> (Ending, Seen) {
         Ok(())
     };
     let mut vcpu = ScriptedVcpu::new().then(|_| {}, svc(SvcId::ExitProcess));
-    let (dispatcher, _) = boot(guest.address_space(), &guest.placed, &guest.memory).unwrap();
+    let (dispatcher, _) = boot(guest.address_space(), &guest.placed, &guest.memory, &*env).unwrap();
     let (ending, ..) = drive(
         vcpus(&mut vcpu),
         dispatcher,

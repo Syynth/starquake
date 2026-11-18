@@ -11,7 +11,7 @@
 //! | `SetMemoryAttribute` (0x03) | [`memory::set_memory_attribute`] | the address space, exclusive |
 //! | `QueryMemory` (0x06) | [`memory::query_memory`] | the address space, shared, and guest memory |
 //! | `ExitProcess` (0x07) | [`process::exit_process`] | the handle table and the scheduler, both exclusive, and the process facts |
-//! | `CreateThread` (0x08) | [`thread::create_thread`] | the handle table, the address space and the scheduler, all exclusive, the process facts, guest memory and the calling core |
+//! | `CreateThread` (0x08) | [`thread::create_thread`] | the handle table, the address space and the scheduler, all exclusive, the process facts, guest memory and the calling core (the dispatcher first draws the new thread's `x18` from the environment) |
 //! | `StartThread` (0x09) | [`thread::start_thread`] | the handle table, shared, the scheduler, exclusive, and the calling core |
 //! | `ExitThread` (0x0a) | [`thread::exit_thread`] | the handle table and the scheduler, both exclusive, and the calling core |
 //! | `SleepThread` (0x0b) | [`thread::sleep_thread`] | the scheduler, exclusive, and the caller as a waiter (core, clock reading, registers) |
@@ -38,7 +38,7 @@
 //! | `GetThreadId` (0x25) | [`thread::get_thread_id`] | the scheduler and the handle table, both shared, and the calling core |
 //! | `Break` (0x26) | [`exception::break_execution`] | guest memory |
 //! | `OutputDebugString` (0x27) | [`debug::output_debug_string`] | guest memory, a [`DebugSink`] and the dispatch's guest time |
-//! | `GetInfo` (0x29) | [`info::get_info`] | the handle table and the scheduler, both exclusive (`MesosphereCurrentProcess` adds a handle), the address space, shared, the calling process and the calling core (the dispatcher first draws the process's entropy from the environment the first time it is asked for) |
+//! | `GetInfo` (0x29) | [`info::get_info`] | the handle table and the scheduler, both exclusive (`MesosphereCurrentProcess` adds a handle), the address space, shared, the calling process and the calling core (a process's entropy is drawn when it is created, [`crate::process::create_with_env`]) |
 //! | `MapPhysicalMemory` (0x2c) | [`physical_memory::map_physical_memory`] | the address space, exclusive, and the process facts (its system resource size) |
 //! | `UnmapPhysicalMemory` (0x2d) | [`physical_memory::unmap_physical_memory`] | the address space, exclusive, and the process facts (its system resource size) |
 //! | `GetResourceLimitLimitValue` (0x30) | [`resource_limit::get_resource_limit_limit_value`] | the handle table, the address space and the scheduler, all shared, and the process facts |

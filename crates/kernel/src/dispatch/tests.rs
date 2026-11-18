@@ -1106,8 +1106,8 @@ fn the_memory_calls_declare_the_address_space_and_get_info_all_three_tables() {
         LockWaits {
             timed: false,
             // Five acquisitions; the three that change memory declared it exclusively, and
-            // GetInfo the scheduler, where the first ask for the entropy keeps what it drew,
-            // and the handle table, where `MesosphereCurrentProcess` adds a handle.
+            // GetInfo the handle table and the scheduler, where `MesosphereCurrentProcess` adds
+            // a handle and a reference to the process's object.
             lock: waits(5, 4, 0, Duration::ZERO),
             handles: waits(1, 1, 0, Duration::ZERO),
             address_space: waits(5, 3, 0, Duration::ZERO),
