@@ -10,6 +10,7 @@ use crate::handle::ObjectRefs;
 use crate::id::SlabId;
 use crate::memory::{GUARD_PAGES, fixture};
 use crate::process::{THREAD_LOCAL_REGION_SIZE, VIRTUAL_CORE_COUNT};
+use crate::resource_limit::THREAD_COUNT_LIMIT;
 use crate::result::ResultCode;
 use crate::sched::{CoreId, CoreSignals, FIRST_THREAD_ID};
 use crate::sync::{Timeout, WaitBegun, WaitOrigin, Wake};
@@ -125,6 +126,33 @@ fn a_virtual_core_runs_on_its_physical_core() {
         Err(SvcError::Kernel(KernelError::InvalidCoreId))
     );
     assert_eq!(small.process(process()).unwrap().tls().used(), 0);
+}
+
+#[test]
+fn the_thread_limit_is_checked_before_the_virtual_core() {
+    // A scheduler with two cores has no physical core for virtual core 3.
+    let mut space = fixture::loaded().0;
+    let mut small = Scheduler::new(2).unwrap();
+    small.add_process(process()).unwrap();
+    let below = THREAD_COUNT_LIMIT - 1;
+    for _ in 0..below {
+        small
+            .create_user_thread(&mut space, process(), &spec(0))
+            .unwrap();
+    }
+    // One below the limit, only the core is wrong.
+    assert_eq!(
+        small.create_user_thread(&mut space, process(), &spec(3)),
+        Err(SvcError::Kernel(KernelError::InvalidCoreId))
+    );
+    small
+        .create_user_thread(&mut space, process(), &spec(0))
+        .unwrap();
+    // At the limit with the core wrong too: the limit is reported.
+    assert_eq!(
+        small.create_user_thread(&mut space, process(), &spec(3)),
+        Err(SvcError::Kernel(KernelError::LimitReached))
+    );
 }
 
 #[test]
