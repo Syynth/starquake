@@ -248,7 +248,10 @@ fn union_and_intersects_are_bitwise() {
         status_and_system.bits(),
         Capability::STATUS.bits() | Capability::SYSTEM.bits()
     );
-    assert_eq!(status_and_system.union(status_and_system), status_and_system);
+    assert_eq!(
+        status_and_system.union(status_and_system),
+        status_and_system
+    );
     assert_eq!(Capability::NONE.union(Capability::NONE), Capability::NONE);
 }
 
@@ -284,7 +287,11 @@ fn a_service_is_saved_as_its_flag() {
 #[test]
 fn the_command_ids_are_eden_s() {
     assert_eq!(
-        (CREATE_SERVICE, CREATE_SERVICE_WITHOUT_INITIALIZE, INITIALIZE),
+        (
+            CREATE_SERVICE,
+            CREATE_SERVICE_WITHOUT_INITIALIZE,
+            INITIALIZE
+        ),
         (0, 1, 1)
     );
 }
@@ -512,7 +519,10 @@ fn the_tables_name_the_commands_as_eden_does() {
         IParentalControlServiceFactory::interface(),
         "IParentalControlServiceFactory"
     );
-    assert_eq!(IParentalControlService::interface(), "IParentalControlService");
+    assert_eq!(
+        IParentalControlService::interface(),
+        "IParentalControlService"
+    );
 }
 
 // ----- snapshots ----------------------------------------------------------------------------
@@ -534,7 +544,10 @@ fn a_restored_server_s_service_answers_and_keeps_its_flag() {
     restored.restore(&saved).unwrap();
     rig.server = restored;
     assert_eq!(rig.initialized(), [true, false]);
-    assert_eq!(rig.server.family::<Capability>(), Some(&Name::Pctl.capability()));
+    assert_eq!(
+        rig.server.family::<Capability>(),
+        Some(&Name::Pctl.capability())
+    );
     // The restored objects are the saved ones: the second still initializes, and the next
     // object is the one after it.
     assert_eq!(

@@ -358,15 +358,13 @@ fn server_with(name: Name, capability: Capability, policy: UnknownPolicy) -> Ser
     Server::new(name.as_str(), policy)
         .with_root(|| Box::new(IParentalControlServiceFactory))
         .with_interfaces(interfaces())
-        .with_checked_family(capability, same_capability)
-}
-
-/// The restore check of a server's capability: a snapshot's is the server's (module docs,
-/// "Snapshots").
-fn same_capability(run: &Capability, saved: &Capability) -> Result<(), &'static str> {
-    if run == saved {
-        Ok(())
-    } else {
-        Err("its parental-control capability is not this server's")
-    }
+        // The restore check of the server's capability: a snapshot's is the server's (module
+        // docs, "Snapshots").
+        .with_checked_family(capability, |run, saved| {
+            if run == saved {
+                Ok(())
+            } else {
+                Err("its parental-control capability is not this server's")
+            }
+        })
 }

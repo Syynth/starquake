@@ -898,7 +898,11 @@ fn every_pctl_name_hands_out_a_service_that_initializes_by_its_capability() {
         assert_eq!((code, word), (ResultCode::SUCCESS, 0), "{}", name.as_str());
         assert_eq!(objects.len(), 1);
 
-        let request = domain(objects[0], &pctl::IParentalControlService::default(), "initialize");
+        let request = domain(
+            objects[0],
+            &pctl::IParentalControlService::default(),
+            "initialize",
+        );
         let (code, buffer) = rig.send(session, &request);
         let (word, _, _) = domain_reply(&buffer, 0);
         let expected = if name == pctl::Name::Pctl {
@@ -913,6 +917,9 @@ fn every_pctl_name_hands_out_a_service_that_initializes_by_its_capability() {
             name.as_str()
         );
         let ipc = rig.ipc();
-        assert_eq!(ipc[ipc.len() - 2..], [(number, create), (number, initialize)]);
+        assert_eq!(
+            ipc[ipc.len() - 2..],
+            [(number, create), (number, initialize)]
+        );
     }
 }
