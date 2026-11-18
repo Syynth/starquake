@@ -285,3 +285,53 @@ fn another_process_s_limit_answers_its_threads_but_not_its_memory() {
         )
     );
 }
+
+#[test]
+fn a_handle_to_a_resource_limit_names_no_thread_process_or_event() {
+    let mut rig = Rig::new();
+    let limit = rig.limit;
+    let object = rig.tables.handles.get(limit).unwrap();
+    let core = crate::sched::CoreId::new(0).unwrap();
+    let refused = || SvcError::Kernel(KernelError::InvalidHandle);
+    let tables = &mut rig.tables;
+    assert_eq!(
+        crate::svc::thread::get_thread_priority(&tables.scheduler, &tables.handles, core, limit),
+        Err(refused())
+    );
+    assert_eq!(
+        crate::svc::process::get_process_id(
+            &tables.handles,
+            &tables.scheduler,
+            &tables.processes,
+            limit
+        ),
+        Err(refused())
+    );
+    assert_eq!(
+        crate::svc::event::reset_signal(&tables.handles, &mut tables.scheduler, limit),
+        Err(refused())
+    );
+    assert_eq!(
+        tables
+            .scheduler
+            .thread_object(&tables.handles, limit)
+            .map(|(object, _)| object),
+        Err(refused())
+    );
+    assert_eq!(tables.scheduler.signal_object(object), Err(refused()));
+    assert_eq!(tables.scheduler.clear_object(object), Err(refused()));
+    assert!(!crate::sync::is_synchronization_object(
+        tables.scheduler.objects().get(object).unwrap()
+    ));
+    // `GetInfo`'s process ids need a process.
+    let info = InfoTables {
+        handles: &mut tables.handles,
+        space: &tables.address_space,
+        scheduler: &mut tables.scheduler,
+        processes: &tables.processes,
+    };
+    assert_eq!(
+        get_info(info, core, InfoType::ProgramId.number(), limit, 0),
+        Err(refused())
+    );
+}

@@ -484,10 +484,9 @@ fn a_failure_after_the_pages_are_locked_unlocks_them_again() {
     assert!(world.create(heap, SIZE, raw(SvcPermission::None)).is_ok());
 }
 
-/// Eden's limit on a process's transfer memories (`TransferMemoryCountMax`, set to 200 in
-/// `CreateResourceLimitForProcess`, `eden/src/core/hle/kernel/k_resource_limit.cpp` @
-/// cf654052). Starquake has no such limit yet.
-const EDEN_TRANSFER_MEMORY_COUNT_MAX: u64 = 200;
+/// Eden's limit on a process's transfer memories (`TransferMemoryCountMax`), which the
+/// process's resource limit reports but does not count yet ([`crate::resource_limit`]).
+const EDEN_TRANSFER_MEMORY_COUNT_MAX: u64 = crate::resource_limit::TRANSFER_MEMORY_COUNT_LIMIT;
 
 #[test]
 fn more_transfer_memories_than_edens_limit_are_all_lent() {

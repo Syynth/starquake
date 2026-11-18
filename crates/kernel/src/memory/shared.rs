@@ -43,9 +43,9 @@
 //! # Not built
 //!
 //! - **No resource limit is charged.** Eden reserves the size from the system's resource limit
-//!   (`ResultLimitReached` when it has no room). Starquake has no system resource limit yet
-//!   (the later resource-limits slice), so making shared memory never fails that way. There is
-//!   no limit for a test to exceed until that slice lands.
+//!   (`ResultLimitReached` when it has no room). Starquake has no system resource limit (only
+//!   each process's own, [`crate::resource_limit`]), so making shared memory never fails that
+//!   way. There is no limit for a test to exceed until one is built.
 //! - **Pages are not given back** when the last reference to a shared memory goes: the
 //!   [`Mapper`](super::Mapper) has no call for it, and its only implementation
 //!   (`starquake-core`) never reuses backing anyway (PROVISIONAL there).

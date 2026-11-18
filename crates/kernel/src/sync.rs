@@ -134,9 +134,10 @@
 //! # Intentional divergences from Eden
 //!
 //! Each is pinned by the named test in `sync/tests.rs` or `dispatch/sync/tests.rs`.
-//! - **No resource limit.** `CreateEvent` reserves `LimitableResource::EventCountMax` first and
-//!   fails with `ResultLimitReached` when it can't. Resource limits are a later slice (kernel
-//!   spec, "Port plan"); PROVISIONAL. Test: `creating_many_events_never_reaches_a_limit`.
+//! - **Events are not counted in the resource limit.** `CreateEvent` reserves
+//!   `LimitableResource::EventCountMax` first and fails with `ResultLimitReached` when it
+//!   can't. The process's resource limit counts no events yet ([`crate::resource_limit`],
+//!   "Divergences from Eden"); PROVISIONAL. Test: `creating_many_events_never_reaches_a_limit`.
 //! - **An event's two ends are two rows that don't reference each other.** Eden's `KEvent`
 //!   holds its `KReadableEvent` inline and the readable end holds a reference to its parent;
 //!   when the readable end is destroyed the parent notes it (`m_readable_event_destroyed`) and

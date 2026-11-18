@@ -46,10 +46,10 @@ const CLOCK_STEP_NS: u64 = 1_000;
 const STALE: u64 = 0x5555_5555_5555_5555;
 /// The index -1 as `x1` holds it: four bytes, zero-extended.
 const MINUS_ONE: u64 = 0xFFFF_FFFF;
-/// Eden's application limit on events (`LimitableResource::EventCountMax`, 900, in
-/// `eden/src/core/hle/kernel/k_resource_limit.cpp` @ cf654052): what `CreateEvent` would stop
-/// at there.
-const EDEN_EVENT_COUNT_MAX: usize = 900;
+/// Eden's application limit on events (`LimitableResource::EventCountMax`): what `CreateEvent`
+/// would stop at there, which the process's resource limit reports but does not count yet
+/// ([`crate::resource_limit`]).
+const EDEN_EVENT_COUNT_MAX: u64 = crate::resource_limit::EVENT_COUNT_LIMIT;
 
 struct NoDebug;
 
@@ -278,7 +278,7 @@ fn creating_many_events_never_reaches_a_limit() {
     let world = World::new();
     let reserved = world.handles();
     let room = usize::from(MAX_TABLE_SIZE) - reserved;
-    assert!(room - 1 > EDEN_EVENT_COUNT_MAX);
+    assert!(u64::try_from(room - 1).unwrap() > EDEN_EVENT_COUNT_MAX);
     for _ in 0..room - 1 {
         let (writable, _) = world.create_event();
         let (_, regs) = world.call(A, SvcId::CloseHandle, [u64::from(writable.raw()), 0, 0, 0]);

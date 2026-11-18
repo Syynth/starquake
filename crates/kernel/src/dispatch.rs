@@ -858,10 +858,7 @@ impl Dispatcher {
             SvcId::MapPhysicalMemory | SvcId::UnmapPhysicalMemory => {
                 self.physical_memory(call, id, convention)
             }
-            SvcId::GetInfo => self.get_info(call, id, convention),
-            SvcId::GetResourceLimitLimitValue | SvcId::GetResourceLimitCurrentValue => {
-                self.resource_limit(call, id, convention)
-            }
+            _ if resource_limit::FACT_ARMS.contains(&id) => self.facts(call, id, convention),
             SvcId::Break => self.break_call(call, id, convention),
             SvcId::ExitProcess
             | SvcId::ExitThread

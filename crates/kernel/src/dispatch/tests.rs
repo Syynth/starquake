@@ -1817,3 +1817,4 @@ fn set_gpu_memory_attribute_is_not_implemented_for_a_process_built_for_switch_1(
 mod info_and_break;
 mod map_memory;
 mod physical_memory;
+mod resource_limit;

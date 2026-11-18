@@ -58,7 +58,11 @@
 //!   the creating process's limit (`CreateEvent`, `CreateTransferMemory`, `ConnectToNamedPort`
 //!   and the services' own sessions) and refuses past it with `ResultLimitReached`. Here their
 //!   current value is zero ([`UNCOUNTED_CURRENT_VALUE`]) and nothing is refused; their limits are
-//!   still Eden's. Test: `events_transfer_memories_and_sessions_are_not_counted`.
+//!   still Eden's. Tests: `events_transfer_memories_and_sessions_are_not_counted`, and the
+//!   calls that would be refused past the limits, `creating_many_events_never_reaches_a_limit`
+//!   (`dispatch/sync/tests.rs`), `more_transfer_memories_than_edens_limit_are_all_lent`
+//!   (`svc/transfer_memory/tests.rs`) and `connecting_many_times_never_runs_out_of_sessions`
+//!   (`dispatch/ipc/tests.rs`).
 //! - **A thread past the limit is refused at once.** Eden's `CreateThread` waits up to 100 ms
 //!   (`KResourceLimit::Reserve` with a timeout) when the count is at the limit but an exited
 //!   thread's release is pending (`m_current_hints` below `m_current_values`: a thread that has
