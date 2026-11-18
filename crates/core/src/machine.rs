@@ -1148,9 +1148,9 @@ impl<'a, V: Vcpu, C: HostClock + Clone> Machine<'a, V, C> {
     /// about the guest ([`Aftermath`]: the stack block of a crash, the threads of a timeout),
     /// once every core and the timer thread have stopped.
     fn finish(self) -> (Ending, GuestLog, Tally, Aftermath) {
-        // The run keeps the environment's recording; the workers' recordings are dropped (module
-        // docs, "The environment").
-        self.env.keep();
+        // The workers' recordings are dropped (module docs, "The environment"). What is left in
+        // the run's own is kept at the run's end ([`run_serving`]), which also covers a run whose
+        // loop never ran.
         for reads in &self.reads {
             drop(reads.take_recording());
         }

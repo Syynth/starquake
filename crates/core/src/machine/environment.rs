@@ -16,6 +16,16 @@
 //! as an emulator error: decision log, 2026-11-17, "Env failures"). A record's size is the size
 //! of an [`EnvRecord`] plus the bytes of a host I/O request and reply, which a guest can make
 //! as large as its reads.
+//!
+//! Where the loop keeps: after each dispatch (`machine/core_loop.rs`), after the timer thread's
+//! timeouts, deliveries and graphics turns (`machine/timer.rs`), and once at the run's end
+//! (`run_serving`), which also takes what a run whose loop never ran drew at boot. Each take
+//! moves everything recorded so far, so dropping one of the timer thread's keeps only leaves
+//! its answers in the environment until the next keep: the kept recording is the same, and only
+//! how long the environment holds them changes. The tests cannot tell those three apart from the
+//! others (they are equivalent mutations for the kept recording); the dispatch's keep and the
+//! end's are pinned (tests: `the_environments_recording_moves_to_the_kept_recording_as_it_is_made`,
+//! `a_run_whose_services_could_not_be_set_up_still_keeps_what_it_drew`).
 
 use std::sync::Mutex;
 
