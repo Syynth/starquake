@@ -19,7 +19,7 @@ entitlement first.
 | Guest IPA (physical address) space | default and max **36 bits (64 GiB)** | Enough for the 12 GB layout. The emulator's large GPU/SMMU spaces are its own bookkeeping, not IPA. |
 | `CNTFRQ_EL0` / counter rate | **24 MHz**, measured 23.999–24.000 MHz | Switch 2 expects 31.25 MHz. HVF can offset the virtual counter but not scale it. |
 | `CNTPCT_EL0` (the physical counter Nintendo's SDK reads) | **Always traps to the host** (EC 0x18), at EL1 and EL0, even with `CNTKCTL_EL1.EL0PCTEN=1`; **~760 ns per read** | Unpatched, Mario Kart World's ~17M reads/s would need ~13 host cores. |
-| Same read with `EL0PCTEN=0`, so it traps to the guest's own EL1 handler | **~26.5 ns per read** | ~45% of a core at 17M/s. Works as a fallback for unpatched sites, but not as the main path. |
+| Same read with `EL0PCTEN=0`, so it traps to the guest's own EL1 handler | **~26.5 ns per read** | ~45% of a core at 17M/s. Works as a fallback for unpatched sites, but not as the main path. The backend's shim answers such a read rescaled to the guest's rate ("Counter reads the patcher misses" below). |
 | Load-time patch: `mrs xN, cntpct_el0` → `bl` to a stub that reads `cntvct_el0` and rescales to 31.25 MHz | **~0.88 ns per read** | ~1.5% of a core. **Patching is the plan.** |
 | EL0 `svc` → guest EL1 vector → `hvc` → host → `eret` | **~0.76 µs per round trip** | ~1.1 ms per frame at Mario Kart World's ~1,400 SVCs/frame. Acceptable to start; worth a fast path for `WaitForAddress`/`SignalToAddress` later. |
 | PAuth visible to the guest | `ID_AA64ISAR1_EL1`: API=4 (PAuth2 + FPAC), GPI=1 (PACGA); implementation-defined algorithm | `RETAA/RETAB`, `PAC*`, `AUT*`, `PACGA` run natively. No patching needed. |
@@ -116,6 +116,19 @@ Measured by the same hardware tests on the same Apple M2 (`crates/cpu/tests/hvf.
 | V0-V31 through `hv_vcpu_get/set_simd_fp_reg` | Every byte of all 32 round-trips both ways, and a context moved to a vCPU on another thread keeps them | The vector is passed by value in `q0`; the backend makes that call with inline assembly because Rust cannot yet pass vectors to foreign functions. |
 | `FPCR`, `FPSR` with every bit written | The guest reads `0x07ff_9f00` and `0x0800_009f`; after a run the host reads the same. Before a run the host reads back the low 32 bits it wrote | The kept `FPCR` bits are Eden's `FPCR::mask` (`0x07FF9F00`, `eden/src/dynarmic/src/dynarmic/common/fp/fpcr.h`). The trap enables (`FPCR` bits 15, 12:8) are among them: a guest that sets `DZE` and divides by zero takes class 0x2c and crashes, where Eden never delivers a trapped FP exception (`FPProcessException` in `eden/src/dynarmic/src/dynarmic/common/fp/process_exception.cpp` asserts the enable is clear). A listed divergence; what the Cortex-A78C does is a guess. |
 | `PSTATE.DIT`, `PSTATE.SSBS` | `msr dit`, `msr ssbs` work at EL0; both bits show in `SPSR_EL1` at an exit and reach the guest from it | A context keeps NZCV, DIT and SSBS. |
+
+### Counter reads the patcher misses (added 2026-11-18)
+
+Measured by the hypervisor backend's hardware tests (`crates/cpu/src/hvf/hardware.rs`,
+`the_guests_counter_frequency_cannot_be_changed`; `crates/cpu/tests/hvf.rs`, module
+`counter_scale`) on the same Apple M2, macOS 27.0.1.
+
+| Question | Result | Consequence |
+|---|---|---|
+| Can the host set the guest's `CNTFRQ_EL0`? | **No.** `hv_vcpu_set_sys_reg` and `hv_vcpu_get_sys_reg` both return `HV_BAD_ARGUMENT` (`0xfae94003`) for its encoding (`0xdf00`); the SDK headers do not name it | An unpatched `mrs xN, cntfrq_el0` reads the host's 24 MHz. |
+| Can the guest's EL1 set it? | **No.** `msr cntfrq_el0, x0` at EL1 is UNDEFINED: `ESR_EL1` `0x2000000` (class 0) at the `msr`, as the Arm Architecture Reference Manual has it for a write below the highest exception level | Nothing in the VM can change the rate EL0 reads. |
+| Does an EL0 `cntfrq_el0` read trap while `CNTKCTL_EL1.EL0VCTEN` is set? | **No**, it reads 24 MHz natively (the Arm ARM traps it only when both `EL0PCTEN` and `EL0VCTEN` are clear) | Trapping it would also trap the patched trampolines' own `cntvct_el0` read. |
+| An unpatched `mrs xN, cntpct_el0` with the shim rescaling it (`EL0PCTEN` clear) | Every destination register x0-x30 and `xzr` reads the rescaled count and no other register changes, for ratios below 1, between 1 and 2, and above 2; read back to back with the loader's patched reads, the four values are in program order and between the host's readings around the run, scaled | The shim answers it at the guest's rate; only `cntvct_el0` and `cntfrq_el0` reads the patcher misses still see the host's. |
 
 What this doesn't cover yet: VM-exit cost with six vCPUs running at once, full context-switch cost,
 `hv_vcpus_exit` for preempting a vCPU, stage-2 remapping cost (lazy backing of sparse regions),

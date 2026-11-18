@@ -3,8 +3,39 @@
 //! Guest code runs natively at EL0 inside an HVF VM, in an address space built with
 //! [`Stage1Tables`]. A small EL1 shim (`shim`) catches every EL0 exception: `svc`, aborts and
 //! undefined instructions come back to the host as an [`Exit`], and EL0 reads of `cntpct_el0`
-//! are answered in the guest from the virtual counter, without a host exit. `cntvct_el0` reads,
-//! FP/SIMD and pointer authentication run natively.
+//! are answered in the guest from the virtual counter, rescaled to the guest's rate, without a
+//! host exit ("Counter reads" below). `cntvct_el0` and `cntfrq_el0` reads, FP/SIMD and pointer
+//! authentication run natively.
+//!
+//! # Counter reads
+//!
+//! The loader's patcher rewrites the counter reads it finds into branches to trampolines that
+//! read `CNTVCT_EL0` and rescale it to the rate of the program's console (`starquake-loader`,
+//! `patch`). A read it misses (code it did not scan, or code written at run time) reaches the
+//! hardware. What each kind then reads:
+//!
+//! | Unpatched read | What the guest reads | Why |
+//! |---|---|---|
+//! | `mrs xN, cntpct_el0` | the virtual counter rescaled with the vCPU's [`CounterScale`]: the value a patched read with the same scale reads at that count | it traps to the shim (`CNTKCTL_EL1.EL0PCTEN` clear), which rescales it |
+//! | `mrs xN, cntvct_el0` | the virtual counter at the host's rate | it runs natively: the patched trampolines read it, so it cannot trap |
+//! | `mrs xN, cntfrq_el0` | the host's rate ([`HvfBackend::counter_frequency`]) | it runs natively while `CNTKCTL_EL1.EL0VCTEN` is set, and the guest's `CNTFRQ_EL0` cannot be changed |
+//!
+//! The last two rows are divergences from a console, where all three agree on one rate, and an
+//! open question for the owner: making them agree means trapping every EL0 counter access
+//! (`EL0VCTEN` clear), which also traps the patched trampolines' own `cntvct_el0` read (about
+//! 26.5 ns a read instead of 0.88 ns, `tools/hvprobe/README.md`) and needs trampolines that do
+//! not rescale a second time. Measured on an Apple M2, macOS 27.0.1 (`hvf/hardware.rs`,
+//! `the_guests_counter_frequency_cannot_be_changed`): `hv_vcpu_set_sys_reg` refuses
+//! `CNTFRQ_EL0` (`HV_BAD_ARGUMENT`), and the guest's own `msr cntfrq_el0` at EL1 is UNDEFINED
+//! (`ESR_EL1` class 0), as the Arm Architecture Reference Manual has it for a write below the
+//! highest exception level. `tests/hvf.rs` pins both native reads at the host's rate.
+//!
+//! Each vCPU starts with [`CounterScale::IDENTITY`], so an unpatched `cntpct_el0` reads the
+//! virtual counter unchanged until [`HvfVcpu::set_counter_scale`] gives it the patcher's scale.
+//! If the vCPU is stopped while the shim answers a read, the read is undone and runs again on
+//! the next entry, unless the shim had reached its last instruction, the `eret`, with the read
+//! complete (`shim::recovery`; `hvf/hardware.rs`,
+//! `a_counter_read_stopped_anywhere_on_the_shims_path_is_recovered_exactly`).
 //!
 //! # Registers
 //!
@@ -179,6 +210,7 @@ const SCRATCH_VA: u64 = UPPER_HALF | SCRATCH_HALF_OFFSET;
 const _: () = assert!(shim::LEN as u64 <= PAGE);
 const _: () = assert!(MAX_VCPUS as u64 * SLOT_SIZE <= PAGE);
 const _: () = assert!(SLOT_SIZE >= shim::SCRATCH_BELOW_SP && SLOT_SIZE.is_multiple_of(16));
+const _: () = assert!(SLOT_SIZE >= shim::SCALE_BELOW_SP);
 const _: () = assert!(SYSTEM_TABLES_OFFSET + SYSTEM_TABLES as u64 * PAGE <= SCRATCH_OFFSET);
 const _: () = assert!(SCRATCH_OFFSET + PAGE <= SYSTEM_SIZE);
 const _: () = assert!(SYSTEM_BASE + SYSTEM_SIZE <= TABLE_POOL_BASE);
@@ -375,6 +407,16 @@ impl Vm {
         })?;
         mapped.push((ipa, len));
         Ok(())
+    }
+
+    /// Stores `scale` where the shim reads it for the vCPU in `slot`
+    /// ([`shim::SCALE_BELOW_SP`] below the slot's top).
+    fn set_counter_scale(&self, slot: usize, scale: CounterScale) -> Result<(), Error> {
+        slot_top(slot)
+            .and_then(|top| top.checked_sub(shim::SCALE_BELOW_SP))
+            .and_then(|offset| offset.checked_add(SCRATCH_OFFSET))
+            .and_then(|offset| self.system.write(offset, &scale.to_bytes()))
+            .ok_or_else(|| Error::Host(format!("no scratch slot {slot}")))
     }
 
     /// The EL0 values of x9-x11 the shim saved for the vCPU in `slot`.
@@ -578,9 +620,9 @@ impl HvfBackend {
 
     /// The rate, in hertz, of the counter guest code reads natively (`CNTVCT_EL0`), which is also
     /// what an unpatched `mrs xN, cntfrq_el0` reads in the guest: the host's `CNTFRQ_EL0`
-    /// (24 MHz on Apple Silicon, `tools/hvprobe/README.md`). Hypervisor.framework can offset the
-    /// guest's counter but not scale it, so the loader's counter patcher needs this as its host
-    /// rate.
+    /// (24 MHz on Apple Silicon, `tools/hvprobe/README.md`), which the guest cannot change (see
+    /// "Counter reads" in the module docs). Hypervisor.framework can offset the guest's counter
+    /// but not scale it, so the loader's counter patcher needs this as its host rate.
     #[must_use]
     pub fn counter_frequency(&self) -> u64 {
         Self::host_counter_frequency()
@@ -620,8 +662,13 @@ impl Backend for HvfBackend {
             interrupt_pending: false,
             asid_bits: 8,
             has_address_space: false,
+            counter_scale: CounterScale::IDENTITY,
         };
         vcpu.asid_bits = asid_bits(vcpu.sys(ffi::ID_AA64MMFR0_EL1)?);
+        // The slot may hold the scale of a vCPU that had it before.
+        vcpu.slot
+            .vm
+            .set_counter_scale(vcpu.slot.index, CounterScale::IDENTITY)?;
         for (reg, value) in [
             (ffi::MAIR_EL1, MAIR),
             (ffi::TCR_EL1, tcr(vcpu.asid_bits)),
@@ -641,6 +688,54 @@ impl Backend for HvfBackend {
         })?;
         vcpu.park()?;
         Ok(vcpu)
+    }
+}
+
+/// How the shim rescales an unpatched `mrs xN, cntpct_el0`: a count of the virtual counter
+/// becomes `count * int + umulh(count, frac)`, in 64-bit wrapping arithmetic.
+///
+/// The two parts are those of the loader's `FixedRatio` (`starquake-loader`, `patch`): the
+/// integer part of `guest_hz / host_hz` and the rest as a 64-bit binary fraction. The caller
+/// computes them there and hands them over unchanged (`starquake-core` does it where it hands
+/// the patcher its rates), so that an unpatched read and a patched one agree; this type only
+/// carries them. Any pair is valid arithmetic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CounterScale {
+    int: u64,
+    frac: u64,
+}
+
+impl CounterScale {
+    /// The scale that changes nothing (`int` 1, `frac` 0): a read gives the virtual counter as
+    /// it is, at the host's rate. Every vCPU starts with it.
+    pub const IDENTITY: Self = Self { int: 1, frac: 0 };
+
+    /// A scale of `int + frac / 2^64`.
+    #[must_use]
+    pub const fn new(int: u64, frac: u64) -> Self {
+        Self { int, frac }
+    }
+
+    /// The integer part.
+    #[must_use]
+    pub const fn int(&self) -> u64 {
+        self.int
+    }
+
+    /// The fractional part, in units of 2^-64.
+    #[must_use]
+    pub const fn frac(&self) -> u64 {
+        self.frac
+    }
+
+    /// The bytes the shim reads (`shim::SCALE_BELOW_SP`): the fraction, then the integer part,
+    /// each little-endian.
+    fn to_bytes(self) -> [u8; shim::SCALE_LEN] {
+        let mut bytes = [0; shim::SCALE_LEN];
+        let (frac, int) = bytes.split_at_mut(8);
+        frac.copy_from_slice(&self.frac.to_le_bytes());
+        int.copy_from_slice(&self.int.to_le_bytes());
+        bytes
     }
 }
 
@@ -696,6 +791,9 @@ pub struct HvfVcpu {
     asid_bits: u8,
     /// Whether [`Vcpu::set_address_space`] has succeeded on this vCPU.
     has_address_space: bool,
+    /// What the shim rescales an unpatched counter read with: a copy of what its scratch slot
+    /// holds.
+    counter_scale: CounterScale,
 }
 
 impl HvfVcpu {
@@ -714,6 +812,24 @@ impl HvfVcpu {
             self.set_sys(hi, high)?;
         }
         Ok(())
+    }
+
+    /// Sets the scale the shim rescales an unpatched `mrs xN, cntpct_el0` with (see "Counter
+    /// reads" in the module docs). Give it the scale the loader's patcher used for the program
+    /// this vCPU runs, and an unpatched read gives the value a patched one would at the same
+    /// count. Takes effect from the next [`Vcpu::run`]; a read the shim had begun when the vCPU
+    /// was last stopped runs again with the new scale.
+    pub fn set_counter_scale(&mut self, scale: CounterScale) -> Result<(), Error> {
+        self.slot.vm.set_counter_scale(self.slot.index, scale)?;
+        self.counter_scale = scale;
+        Ok(())
+    }
+
+    /// The scale an unpatched `mrs xN, cntpct_el0` is rescaled with:
+    /// [`CounterScale::IDENTITY`] until [`Self::set_counter_scale`] changes it.
+    #[must_use]
+    pub fn counter_scale(&self) -> CounterScale {
+        self.counter_scale
     }
 
     /// How many bits an address-space id may have on this host: 8 or 16
@@ -1215,6 +1331,28 @@ mod tests {
         );
         // A size that cannot be rounded up without overflowing.
         assert_eq!(RamConfig::at_least(u64::MAX), Err(LayoutError::OutOfRange));
+    }
+
+    #[test]
+    fn a_counter_scale_is_stored_as_the_shim_loads_it() {
+        // `ldp x10, x11, [sp, #-48]`: the fraction in the lower doubleword, the integer part in
+        // the upper, each little-endian. Each byte distinct, so a swap or a reversal fails.
+        let scale = CounterScale::new(0x0807_0605_0403_0201, 0x1817_1615_1413_1211);
+        assert_eq!(
+            scale.to_bytes(),
+            [
+                0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, // frac
+                0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, // int
+            ]
+        );
+        assert_eq!(
+            (scale.int(), scale.frac()),
+            (0x0807_0605_0403_0201, 0x1817_1615_1413_1211)
+        );
+        assert_eq!(
+            CounterScale::IDENTITY.to_bytes(),
+            [0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0]
+        );
     }
 
     #[test]

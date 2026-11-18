@@ -1121,6 +1121,7 @@ dependencies = [
 name = "starquake-cpu"
 version = "0.0.0"
 dependencies = [
+ "starquake-loader",
  "starquake-memory",
  "thiserror",
 ]
