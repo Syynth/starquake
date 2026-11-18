@@ -398,7 +398,9 @@ impl Syncpoints {
         if amount == 0 {
             return counter.load(Ordering::SeqCst);
         }
-        let value = counter.fetch_add(amount, Ordering::SeqCst).wrapping_add(amount);
+        let value = counter
+            .fetch_add(amount, Ordering::SeqCst)
+            .wrapping_add(amount);
         if self.is_watched(id) {
             self.completions
                 .push(GpuCompletion::SyncpointChanged { id, value });

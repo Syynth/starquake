@@ -496,7 +496,10 @@ fn increment_by_adds_at_once_and_pushes_once_when_watched() {
     assert_eq!(syncpoints.increment_by(sp, 0x10), 0x13);
     assert_eq!(
         recorder.taken(),
-        [GpuCompletion::SyncpointChanged { id: sp, value: 0x13 }]
+        [GpuCompletion::SyncpointChanged {
+            id: sp,
+            value: 0x13
+        }]
     );
     // Zero: nothing changes and nothing is pushed, watched as it is.
     assert_eq!(syncpoints.increment_by(sp, 0), 0x13);
@@ -506,7 +509,10 @@ fn increment_by_adds_at_once_and_pushes_once_when_watched() {
     assert_eq!(syncpoints.increment_by(sp, 1), 0x14);
     assert_eq!(
         recorder.taken(),
-        [GpuCompletion::SyncpointChanged { id: sp, value: 0x14 }]
+        [GpuCompletion::SyncpointChanged {
+            id: sp,
+            value: 0x14
+        }]
     );
     // It wraps.
     set_counter(&syncpoints, sp, u32::MAX - 1);
