@@ -21,6 +21,18 @@
 //! move path takes no pseudo-handle), so a server never sees that case, and the fake does not
 //! model the refusal.
 //!
+//! # Handles a reply does not name
+//!
+//! The fake delivers no reply to a kernel, so it does not take back the handles, or the
+//! sessions, that a reply does not name. The real kernel does: when it settles a request, it
+//! takes back every handle the handler placed in the sender's table that the delivered reply
+//! does not name (`starquake_kernel`'s `dispatch/ipc/placed.rs`). So when the caller's table
+//! fills up part-way through a reply, the handles and the session added before it stay in the
+//! fake's table, where the kernel would remove them. Pinned by the tests
+//! `handles_added_before_the_table_filled_stay_in_it` and
+//! `a_session_opened_before_the_table_filled_stays_open` (`framework/tests/handles.rs`); the
+//! kernel's behaviour is pinned by `tests/reply_rollback_on_the_kernel.rs`.
+//!
 //! [`FakeHost`] puts a [`FakeKernel`] and several servers together, so that a session one
 //! service hands out for another ([`Kernel::connect`]) can be sent requests.
 //!

@@ -126,6 +126,55 @@ fn word(message: &MessageBuffer, offset: usize) -> Option<u32> {
     Some(u32::from_le_bytes(bytes))
 }
 
+/// The special header of `message`, when its second header word says one follows, and the
+/// byte offset of its first handle word: after the process id slot when the special header asks
+/// for one (`MessageBuffer::GetSpecialDataIndex`, `SetProcessId` and `GetHandle` in
+/// `eden/src/core/hle/kernel/message_buffer.h` @ cf654052). What [`translate`] reads a request
+/// with and [`reply_handles`] a reply with.
+///
+/// Two header words, the special header, a process id and fifteen handles of each kind (the
+/// counts are four bits wide) fit well inside a message, so no handle word read from the offset
+/// returned can run past its end.
+fn special_data(message: &MessageBuffer) -> Option<(SpecialHeader, usize)> {
+    let follows = word(message, HEADER_WORD_1).is_some_and(CommandHeader::special_header_follows);
+    if !follows {
+        return None;
+    }
+    let special = word(message, SPECIAL_HEADER).map(SpecialHeader::decode)?;
+    let handles = if special.send_pid {
+        PROCESS_ID_SLOT + PROCESS_ID_SIZE
+    } else {
+        PROCESS_ID_SLOT
+    };
+    Some((special, handles))
+}
+
+/// The handle words of a reply's special header that are not [`Handle::INVALID`], the copied
+/// ones and then the moved ones, in the order the message carries them: the handles the reply
+/// gives its receiver. Empty when no special header follows the header.
+///
+/// This is the walk Eden's `CleanupSpecialData` (`eden/src/core/hle/kernel/k_server_session.cpp`
+/// @ cf654052) makes over a reply it has translated into the receiver's message: every copy and
+/// move handle word in order, skipping `Svc::InvalidHandle`. The dispatcher keeps exactly these
+/// of the handles a handler placed in the sender's table (`dispatch/ipc/placed.rs`).
+pub(crate) fn reply_handles(message: &MessageBuffer) -> Vec<Handle> {
+    let Some((special, first)) = special_data(message) else {
+        return Vec::new();
+    };
+    let count = special.num_copy_handles + special.num_move_handles;
+    (0..count)
+        .filter_map(|n| {
+            let offset = usize::try_from(n)
+                .ok()?
+                .checked_mul(WORD)?
+                .checked_add(first)?;
+            word(message, offset)
+        })
+        .map(Handle::from_raw)
+        .filter(|handle| *handle != Handle::INVALID)
+        .collect()
+}
+
 /// Translates the special header of `message`, a request sent by a thread of the process whose
 /// id is `process_id` and whose handles are `handles`: writes the process id where it was asked
 /// for and resolves the copied and moved handles (see the module docs).
@@ -144,13 +193,7 @@ pub fn translate(
         result: Ok(()),
         destroyed: Vec::new(),
     };
-    let follows = word(message, HEADER_WORD_1).is_some_and(CommandHeader::special_header_follows);
-    if !follows {
-        return translation;
-    }
-    // Two header words, the special header, a process id and fifteen handles of each kind fit
-    // well inside a message, so none of the offsets below can run past its end.
-    let Some(special) = word(message, SPECIAL_HEADER).map(SpecialHeader::decode) else {
+    let Some((special, mut offset)) = special_data(message) else {
         return translation;
     };
     let Translation {
@@ -158,13 +201,10 @@ pub fn translate(
         result,
         destroyed,
     } = &mut translation;
-    let mut offset = PROCESS_ID_SLOT;
-    if special.send_pid {
-        let end = offset + PROCESS_ID_SIZE;
-        if let Some(slot) = message.get_mut(offset..end) {
-            slot.copy_from_slice(&process_id.to_le_bytes());
-        }
-        offset = end;
+    if special.send_pid
+        && let Some(slot) = message.get_mut(PROCESS_ID_SLOT..offset)
+    {
+        slot.copy_from_slice(&process_id.to_le_bytes());
     }
     for _ in 0..special.num_copy_handles {
         let handle = Handle::from_raw(word(message, offset).unwrap_or_default());
@@ -219,7 +259,7 @@ fn hold(
 
 #[cfg(test)]
 mod tests {
-    use starquake_ipc::{CommandType, RequestBuilder};
+    use starquake_ipc::{CommandType, ReplyBuilder, RequestBuilder};
 
     use super::*;
     use crate::id::{ProcessId, SlabId, ThreadId};
@@ -643,5 +683,214 @@ mod tests {
         assert_eq!(destroyed, Vec::<ObjectId>::new());
         assert_eq!(translated.held.len(), 1);
         assert!(handles.is_empty());
+    }
+
+    // ----- reply_handles ---------------------------------------------------------------------
+
+    /// A reply built by the IPC crate's reply builder, the way an HLE server frames one.
+    fn reply(builder: &ReplyBuilder) -> MessageBuffer {
+        let mut message = [0; BUFFER_SIZE];
+        builder.build(&mut message).unwrap();
+        message
+    }
+
+    #[test]
+    fn a_reply_without_a_special_header_gives_no_handles() {
+        assert_eq!(reply_handles(&reply(&ReplyBuilder::cmif(0))), []);
+        assert_eq!(reply_handles(&reply(&ReplyBuilder::tipc(3, 0))), []);
+        // A message of zeros, as a reply a handler never wrote leaves it.
+        assert_eq!(reply_handles(&[0; BUFFER_SIZE]), []);
+    }
+
+    #[test]
+    fn a_replys_handles_are_its_copies_then_its_moves_in_order() {
+        let built = ReplyBuilder::cmif(0x1234)
+            .copy_handle(0x11)
+            .copy_handle(0x22)
+            .move_handle(0x33)
+            .data(&[0xEE; 12]);
+        let expected = [0x11, 0x22, 0x33].map(Handle::from_raw);
+        assert_eq!(reply_handles(&reply(&built)), expected);
+        // The TIPC framing carries the special header in the same place.
+        let built = ReplyBuilder::tipc(9, 0)
+            .copy_handle(0x44)
+            .move_handle(0x55)
+            .move_handle(0x66);
+        let expected = [0x44, 0x55, 0x66].map(Handle::from_raw);
+        assert_eq!(reply_handles(&reply(&built)), expected);
+    }
+
+    #[test]
+    fn a_hand_built_reply_with_a_process_id_gives_the_handles_after_it() {
+        // Words: header (type 0, no descriptors), header word 1 with only the special-header
+        // flag, the special header (process id, one copy, one move), the two process id words,
+        // then the copied and the moved handle. Built by hand, not by the IPC crate.
+        let special = SpecialHeader {
+            send_pid: true,
+            num_copy_handles: 1,
+            num_move_handles: 1,
+        };
+        let header = CommandHeader {
+            command_type: CommandType::Request,
+            num_x: 0,
+            num_a: 0,
+            num_b: 0,
+            num_w: 0,
+            raw_data_words: 0,
+            receive_list: starquake_ipc::ReceiveList::Disabled,
+            has_special_header: true,
+        };
+        let [w0, w1] = header.encode().unwrap();
+        let words = [
+            w0,
+            w1,
+            special.encode().unwrap(),
+            0xAAAA_0001,
+            0xAAAA_0002,
+            0x0007_0011,
+            0x0009_0022,
+        ];
+        let mut message = [0; BUFFER_SIZE];
+        for (n, word) in words.iter().enumerate() {
+            message[n * WORD..(n + 1) * WORD].copy_from_slice(&word.to_le_bytes());
+        }
+        assert_eq!(
+            reply_handles(&message),
+            [Handle::from_raw(0x0007_0011), Handle::from_raw(0x0009_0022)]
+        );
+        // The same words with the process id flag clear: the process id words are read as the
+        // handles, so a walk that skipped the slot unconditionally would fail one of the two.
+        let without = SpecialHeader {
+            send_pid: false,
+            ..special
+        };
+        message[2 * WORD..3 * WORD].copy_from_slice(&without.encode().unwrap().to_le_bytes());
+        assert_eq!(
+            reply_handles(&message),
+            [Handle::from_raw(0xAAAA_0001), Handle::from_raw(0xAAAA_0002)]
+        );
+    }
+
+    #[test]
+    fn a_special_header_word_without_the_flag_is_not_read() {
+        // A message whose third word would decode as a special header with a copied and a
+        // moved handle, and whose handle words name real handles, but whose second header
+        // word does not say a special header follows: neither a reply nor a request has one.
+        let (mut handles, mut objects, made) = table(2);
+        let mut message = build(
+            &request()
+                .copy_handle(made[0].raw())
+                .move_handle(made[1].raw()),
+        );
+        let words = [
+            word(&message, 0).unwrap(),
+            word(&message, HEADER_WORD_1).unwrap(),
+        ];
+        let mut header = CommandHeader::decode(words).unwrap();
+        assert!(header.has_special_header);
+        header.has_special_header = false;
+        let [_, second] = header.encode().unwrap();
+        message[HEADER_WORD_1..HEADER_WORD_1 + WORD].copy_from_slice(&second.to_le_bytes());
+        assert_eq!(reply_handles(&message), []);
+        let before = message;
+        let Translation {
+            translated,
+            result,
+            destroyed,
+        } = translate(
+            &mut message,
+            0,
+            Current::default(),
+            &mut handles,
+            &mut objects,
+        );
+        assert_eq!((translated, result), (Translated::default(), Ok(())));
+        assert_eq!(destroyed, Vec::<ObjectId>::new());
+        assert_eq!((message, handles.len()), (before, 2));
+    }
+
+    #[test]
+    fn invalid_handle_words_in_a_reply_are_not_handles() {
+        let built = ReplyBuilder::cmif(0)
+            .copy_handle(Handle::INVALID.raw())
+            .copy_handle(0x21)
+            .move_handle(Handle::INVALID.raw())
+            .move_handle(0x41);
+        assert_eq!(
+            reply_handles(&reply(&built)),
+            [Handle::from_raw(0x21), Handle::from_raw(0x41)]
+        );
+    }
+
+    #[test]
+    fn the_most_handles_a_special_header_can_count_are_all_read() {
+        // As many copies and moves as the special header's counts can say, with a process id
+        // before them.
+        let most = u32::try_from(most_handles()).unwrap();
+        let mut built = request().send_pid(0x5151);
+        for n in 0..most {
+            built = built.copy_handle(0x100 + n);
+        }
+        for n in 0..most {
+            built = built.move_handle(0x200 + n);
+        }
+        let handles = reply_handles(&build(&built));
+        let expected: Vec<Handle> = (0..most)
+            .map(|n| 0x100 + n)
+            .chain((0..most).map(|n| 0x200 + n))
+            .map(Handle::from_raw)
+            .collect();
+        assert_eq!(handles, expected);
+    }
+
+    /// The most handles of one kind a special header can count: what its decoder reads from a
+    /// count field with every bit set.
+    fn most_handles() -> usize {
+        let most = SpecialHeader::decode(u32::MAX);
+        assert_eq!(most.num_copy_handles, most.num_move_handles);
+        usize::try_from(most.num_copy_handles).unwrap()
+    }
+
+    /// Any raw handle value but [`Handle::INVALID`]'s, which a reply's handle list skips.
+    fn valid_raw_handle() -> impl proptest::strategy::Strategy<Value = u32> {
+        use proptest::strategy::Strategy as _;
+        proptest::prelude::any::<u32>().prop_filter("not the invalid handle", |raw| {
+            *raw != Handle::INVALID.raw()
+        })
+    }
+
+    fn reply_config() -> proptest::test_runner::Config {
+        proptest::test_runner::Config {
+            rng_seed: proptest::test_runner::RngSeed::Fixed(0x0209),
+            ..proptest::test_runner::Config::default()
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(reply_config())]
+
+        /// Whatever the counts and the process id flag, the handles come back as built: copies
+        /// then moves, each list in order, so a swapped read of the two lists or a misplaced
+        /// first word fails.
+        #[test]
+        fn built_handles_come_back_in_order(
+            pid in proptest::option::of(proptest::prelude::any::<u64>()),
+            copies in proptest::collection::vec(valid_raw_handle(), 0..=most_handles()),
+            moves in proptest::collection::vec(valid_raw_handle(), 0..=most_handles()),
+        ) {
+            let mut built = request();
+            if let Some(pid) = pid {
+                built = built.send_pid(pid);
+            }
+            for copy in &copies {
+                built = built.copy_handle(*copy);
+            }
+            for moved in &moves {
+                built = built.move_handle(*moved);
+            }
+            let expected: Vec<Handle> =
+                copies.iter().chain(&moves).copied().map(Handle::from_raw).collect();
+            proptest::prop_assert_eq!(reply_handles(&build(&built)), expected);
+        }
     }
 }

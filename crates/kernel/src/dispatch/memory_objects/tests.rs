@@ -6,7 +6,7 @@
 use std::sync::{Arc, Mutex, PoisonError};
 
 use starquake_cpu::GuestRegs;
-use starquake_ipc::{BUFFER_SIZE, CommandType, RequestBuilder, SpecialHeader};
+use starquake_ipc::{BUFFER_SIZE, CommandType, ReplyBuilder, RequestBuilder, SpecialHeader};
 use starquake_memory::{FlatMemory, GuestMemory, PAGE_SIZE, Perms};
 use starquake_trace::{FixedClock, GuestTicks, LiveEnv, Recorder, ServiceId, ThreadId};
 
@@ -151,15 +151,8 @@ impl World {
         regs.x[0]
     }
 
-    /// The first word of the reply in the message buffer.
-    fn reply_word(&self) -> u32 {
-        let mut word = [0; 4];
-        self.memory.read(TLS, &mut word).unwrap();
-        u32::from_le_bytes(word)
-    }
-
     /// Has the server make a shared memory of [`SIZE`] bytes with `permission` and give the
-    /// guest a handle to it (the reply's first word); returns the handle and the pages.
+    /// guest a handle to it (the reply's copied handle); returns the handle and the pages.
     fn shared_memory(&self, permission: SvcPermission) -> (Handle, SharedPages) {
         let session = self.session();
         let made = Arc::new(Mutex::new(None));
@@ -170,14 +163,20 @@ impl World {
             Box::new(move |cx, message| {
                 let (object, pages) = cx.create_shared_memory(SIZE, permission).unwrap();
                 let handle = cx.insert_handle(object).unwrap();
-                message[..4].copy_from_slice(&handle.raw().to_le_bytes());
+                // The reply names the handle, so the guest keeps it (`dispatch/ipc/placed.rs`).
+                ReplyBuilder::cmif(0)
+                    .copy_handle(handle.raw())
+                    .build(message)
+                    .unwrap();
                 *keep.lock().unwrap() = Some(pages);
                 Ok(())
             }),
         );
         assert_eq!(result, 0);
         let pages = made.lock().unwrap().take().unwrap();
-        (Handle::from_raw(self.reply_word()), pages)
+        let mut reply = [0; BUFFER_SIZE];
+        self.memory.read(TLS, &mut reply).unwrap();
+        (copied_handle(&reply), pages)
     }
 
     fn block(&self, address: u64) -> (u64, u64, MemoryState, MemoryPermission, MemoryAttribute) {
