@@ -376,6 +376,27 @@ The title still stops at root 305's placeholder vi2 session, as expected: wave 3
 | awaiting the owner | **Whether the vsync clock keeps the spec's no-banking rule.** Both references' vsync events catch up on missed ticks (NX2's `m_vsync_timer` is a looping CoreTiming event; PR's `CoreTiming::Advance` is the same). Not banking lost time comes from NX2's present pacing (`PaceToVblank`, called from 229), which the spec applies to the clock. The code follows the approved spec | Review of #190 (PR #295) | graphics-server |
 | proposed | **Restore's fed-back tick bound (`MAX_FED_BACK = 1`)** assumes a live turn delivers at most one tick; revisit if the clock ever banks ticks | #190's fix | area:gsv |
 
+### From wave 31 (ledger: #22)
+
+Landed: #191 (the vi2 session, PR #299), #193 (video sessions without decoding, PR #298) and #185's last command, 216 (PR #297).
+
+The title now gets past root 305 into nvsrv. It stops on eight ctrl-gpu and nvhost-gpu ioctls nvsrv does not know, plus ctrl-gpu `QueryEvent` 2, which the owner deferred on 2026-11-17 until a title sent it. That work is filed as #300 (in wave 32). No frame is drawn yet.
+
+| Status | Proposal | Why | Suggested |
+|---|---|---|---|
+| proposed | **A services-framework session-close hook that runs with a `Context`**, keeping the lock order (gsv's lock, then the kernel's), used by vi2, syncpt, video and nvsrv. Merges the entries from waves 19 and 20 and the #182 and #189 reviews. Closed vi2, syncpt and video sessions keep their events, syncpoints and listening group events; vsync's listener cap (64) can be used up by closed vi2 sessions | Scope review of wave 31; #191 and #193 | area:services |
+| proposed | **Root 434 address-space registration, and GPU mapping of memory bound by 114.** 426 answers on the GPU VA == CPU VA rule and accepts any address space; 912 releases memory a decoder still has images registered in, which is safe only with the null decoder | #193's build | area:gsv |
+| proposed | **Cap the total reveal ranges held across waiting jobs** (Busy past it), with the matching `gpu::saved` restore check and edge tests. #185's second note, not done | #185's build | area:gsv |
+| proposed | **A layout version on `SavedRootState`**, whose golden bytes changed when the video server field was added | Scope review of wave 31 | area:gsv |
+| proposed | **Rustdoc with warnings denied in the gate** (extends the earlier proposal): `cargo doc -p starquake-gsv` fails on public docs linking private items | #185's build | infra |
+| proposed | **Move closed #190, #191 and #193 from M3 to M2** (waves 29 and 30 proposed the same) | Scope review | owner |
+| awaiting the owner | **vi2 `NOTIFICATION_LIMIT` and the 1/3 commands.** The limit comes from NX2 while the bitmap bounds follow PR. Either answer 0, or widen 201, the client masks and the saved bitmap check to `(NOTIFICATION_LIMIT + 1) * 32`. Documented in `crates/gsv/src/vi2.rs` | Review of #191 (PR #299) | graphics-server |
+| awaiting the owner | **Three new reference conflicts for verification item 1**, settled by decision 8: vi2 1/3 (PR 0, NX2 1), the 11/13 word (PR requires 0), the 301 flags; and 352's result, set to `VI_OUT_OF_RANGE` | #191 | graphics-server |
+| awaiting the owner | **The vsync fallback's "after the first frame" grace.** The spec has it; the code ticks from the first tick, since the clock gives vi2 no per-tick turn | #191 | graphics-server |
+| awaiting the owner | **Video layout codes that depart from decision 8.** Code 5 keeps PR's block-linear RGBA layout, so 961 refuses where NX2 answers a BGRA descriptor; codes neither reference names are refused where NX2 sizes them as RGBA; code 1's size follows PR (640x360 gives 0x65400, NX2's observed row gives 0x64000); 109 replies with PR's consumed size | Review of #193 (PR #298) | graphics-server |
+| awaiting the owner | **216's completion and limit.** A 216 that takes something out completes after the GPU's barrier (PR completes at once), and 216 answers Busy at the job limit (PR has no such check) | #185 | graphics-server |
+| proposed | **A guess to confirm with a trace:** a part a 216 batch takes out and maps again in a later entry is a hole until the drain | #185 | area:gsv |
+
 ## House-rule candidates
 
 Rules distilled from review findings. A vetted rule moves into `CLAUDE.md`; until then it is
@@ -563,3 +584,11 @@ passed to build agents as a provisional rule for the next wave.
 - Restored state is checked for wedged or never-draining outcomes, and any restored count that drives a loop is bounded, with edge tests.
 - Ids, handles and counters that start equal in a fresh rig are made to differ in at least one success case.
 - Save-side validation is pinned as well as restore-side.
+
+### From wave 31 (ledger: #22)
+
+- Every data-reading command gets a table-driven short-payload test that trims the last word and asserts the exact refusal with the session unchanged.
+- A step that can fail after the commit point is made non-fatal and logged, and the docs' "last step that can fail" matches the code.
+- A restored counter that is later incremented is bounded so the next step cannot overflow, tested at `u64::MAX`.
+- A test a doc names as pinning a behaviour exercises that exact path, and its comments describe what it sends.
+- A constant taken from one reference while related bounds come from the other has its dependent bounds derived from it, or the coupling is flagged as an owner question.
