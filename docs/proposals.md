@@ -418,6 +418,26 @@ The title gets one ioctl further: nvsrv now logs only nvhost-gpu `ZCullBind` (`0
 | awaiting the owner | **`--date <seconds>`**: #302 adds it because #221 asks the command line to pin a date; the observability spec's headless contract has no date flag. Its name, format (whole seconds since the epoch) and range are the owner's call. Also, the one reading at boot is taken as the RTC at uptime zero, where Eden subtracts the uptime at the moment it reads | #221 | observability |
 | awaiting the owner | **Horizon's "64-bit" loader check** is the bitwise test `flags & AddressSpace64Bit39`, which also passes 36-bit and 32-bit-no-alias spaces; #303 follows the code, not the comment. Also, Horizon takes application/applet from ACI0's program type while Eden's GetInfo 23 uses the ACID pool, and the two can disagree | #208 | area:kernel |
 
+### From wave 33 (ledger: #22)
+
+Landed: #306 (nvhost-gpu ZCullBind, PR #308), #224 (shared-memory lifetime, PR #309), #225 (checked ids in restored family state, PR #310) and #226 (entropy and x18 drawn at creation through `Env`, PR #311).
+
+**A review gap.** The disk dropped below the test-breaking reviewer's 20 GiB floor, so the test-breaking reviews of #310 and #311 did not run. The fix agents skipped those "review not run" findings as naming no file, and both PRs merged with one review. The lead freed about 28 GiB of leftover review clones and ran both reviews after the merge; their results are on the PRs. From wave 34 the pump treats "review not run" as blocking, and reviewers delete their own clones.
+
+**The title.** ZCullBind was not the blocker: the title sends the same requests whether it answers or not. nvsrv now logs no unknown ioctl, and the run ends polling one handle with a zero timeout until the time limit, with no frame drawn. A bring-up investigation (one agent) is finding which object that is and what should signal it.
+
+| Status | Proposal | Why | Suggested |
+|---|---|---|---|
+| proposed | **The session-close hook and free-event call** (waves 31 and 32) should also check restored session-state kernel ids: vi2's event and notification event, syncpt's events, video's event. Fold #243 in as a comment | #225's scope | area:services |
+| proposed | **Process exit closes its shared-mapping references** (Eden's `KProcess::Finalize` does; teardown does not unmap them today), plus an end-to-end give-back test through `Dispatcher`, `Locked::drop`, `AddressSpace::release_shared` and `SpaceMapper` | #224 | area:kernel |
+| proposed | **A service's `SharedPages` are not invalidated when pages are given back**; safe only while no server lets go of a shared memory it made. Needs a generation check before any such API | #224 | area:kernel |
+| proposed | **Restore-check hardening:** aoc's two event ids restore unchecked; gsv's `RestoreKernel` overlaps `framework::RestoredKernel`; time:u settings through `with_checked_family`; a version for nvsrv `Channel` snapshot state | #225, #306 | area:services |
+| proposed | **Persist and replay the `Env` recording:** `--record`, `--seed`, `--replay`, `environment_dropped` in summary.json (a `SUMMARY_VERSION` bump), end-of-run checks for unconsumed records; fsp-srv workers' `Env` under replay; per-process pointer-authentication keys through `Env` | #226 | area:core |
+| proposed | **Draw order versus Eden:** x18 is drawn before the thread reservation and `CreateThread`'s argument checks, so a refused call consumes a random number (not guest-visible) | #226 | area:kernel |
+| awaiting the owner | **Who consumes `Channel::zcull`?** #308 stores the bind; the spec defers zcull and nothing reads it | #306 | graphics-server |
+| awaiting the owner | **Should the kernel note which server made a shared memory?** Without it, hid's and time:u's restore checks cover kind, size and permission only | #225 | area:kernel |
+| awaiting the owner | **Unconsumed replay records: reported, or an error?** And is the `RunOptions`/`RunReport` replay API shape, with its 16 MiB recording cap, what the observability spec should say? | #226 | observability |
+
 ## House-rule candidates
 
 Rules distilled from review findings. A vetted rule moves into `CLAUDE.md`; until then it is
@@ -623,3 +643,11 @@ passed to build agents as a provisional rule for the next wave.
 - Replay-sensitive code records the same notes as live, and a test feeds a live run's notes into a replay and asserts identical outputs.
 - A design departure that narrows compatibility or drops a spec-listed field is flagged as an owner question, not landed as the rule's outcome.
 - User-facing numeric inputs are validated against the downstream bound, and end-to-end tests pin dates, seeds and other environment inputs.
+
+### From wave 33 (ledger: #22)
+
+- Protocol constants are pinned against reference literals written out in one test, never only through the shipping constant.
+- A test double enforces the real component's refusals, and a shared scenario runs against both.
+- After changing a behaviour, docs, invariant lists, architecture tables and test names are searched for the old claim and updated in the same change.
+- A refusal routed through an existing error variant gets its Display text and docs reread and its exact-string test updated.
+- A review that did not run blocks the merge; it is never skipped as a finding with no file.
