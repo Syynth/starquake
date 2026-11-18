@@ -136,6 +136,9 @@ fn a_lend_shares_no_page_with_an_aliases_source() {
         lend(page(rich.heap, 6), 1, SvcPermission::None),
         lend(page(rich.heap, 11), 1, SvcPermission::None),
         lend(page(rich.heap, 5), 2, SvcPermission::None),
+        // Starts exactly where the first source ends and reaches the second: the walk must
+        // move past the first source to see the overlap with heap page 10.
+        lend(page(rich.heap, 7), 4, SvcPermission::None),
     ] {
         assert_eq!(
             fault_of(&rich, bad),
