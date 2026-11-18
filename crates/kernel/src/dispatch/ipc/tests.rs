@@ -393,10 +393,12 @@ impl World {
             .1
     }
 
-    fn deliver(&self, server: &Server) {
+    /// Delivers `server`'s ready replies as the timer thread does, with A's core as the caller,
+    /// and returns the processes the delivery ended.
+    fn deliver(&self, server: &Server) -> Vec<Ended> {
         self.dispatcher
             .deliver_replies(server.id, &mut self.caller(A))
-            .unwrap();
+            .unwrap()
     }
 
     fn events(&self) -> Vec<Event> {
@@ -632,6 +634,13 @@ fn world_running_a_user_thread(thread: ThreadId) -> (World, ObjectId) {
     )
     .unwrap();
     let own = tables.processes.own();
+    let object = run_user_thread(&mut tables, own, thread);
+    (World::with_process(tables), object)
+}
+
+/// Starts a user thread of `process` on `thread`'s core and has the core run it; returns its
+/// object.
+fn run_user_thread(tables: &mut Tables, process: ProcessId, thread: ThreadId) -> ObjectId {
     let core = crate::sched::CoreId::new(core_of(thread)).unwrap();
     let spec = crate::sched::UserThread {
         entry: CODE,
@@ -644,12 +653,43 @@ fn world_running_a_user_thread(thread: ThreadId) -> (World, ObjectId) {
     };
     let scheduler = &mut tables.scheduler;
     let (id, object) = scheduler
-        .create_user_thread(&mut tables.address_space, own, &spec)
+        .create_user_thread(&mut tables.address_space, process, &spec)
         .unwrap();
     scheduler.start(id).unwrap();
     scheduler.update(GuestTicks(0), None, &mut Quiet).unwrap();
     assert_eq!(scheduler.schedule(core, &mut Quiet), Ok(Some(id)));
-    (World::with_process(tables), object)
+    object
+}
+
+/// A world of two processes: the tables' own, which runs a user thread on A's core, and a
+/// second one, which runs a user thread on B's core. Returns the world and the two processes,
+/// A's first.
+fn world_of_two_processes() -> (World, ProcessId, ProcessId) {
+    let description = ProcessDescription::homebrew(Console::Switch2);
+    let mut tables = crate::process::create(&description, fixture::loaded().0).unwrap();
+    let own = tables.processes.own();
+    let other = tables.processes.create(&description).unwrap();
+    tables.scheduler.add_process(other).unwrap();
+    run_user_thread(&mut tables, own, A);
+    run_user_thread(&mut tables, other, B);
+    (World::with_process(tables), own, other)
+}
+
+/// Whether `process` has ended, and how many of its threads have not.
+fn process_state(world: &World, process: ProcessId) -> (bool, usize) {
+    world.with_tables(|_, scheduler| {
+        let record = scheduler.process(process).unwrap();
+        let running = record
+            .threads()
+            .filter(|thread| {
+                scheduler.thread(*thread).unwrap().state() != crate::sched::ThreadState::Terminated
+            })
+            .count();
+        (
+            record.state() == crate::process::ProcessState::Terminated,
+            running,
+        )
+    })
 }
 
 #[test]
@@ -2175,36 +2215,164 @@ fn an_end_asked_by_a_handler_that_defers_is_not_honoured() {
 
     // Its reply, when it comes, ends nothing either.
     lock(&world.first.ready).push_back((session, Ok(0xD0)));
-    world.deliver(&world.first);
+    assert_eq!(world.deliver(&world.first), []);
     assert_eq!(world.tls(A), [0xD0; BUFFER_SIZE]);
     assert_eq!(holdings(&world, thread), (1, 2, 1, false));
 }
 
 #[test]
-fn an_end_asked_by_a_request_a_delivery_runs_is_not_honoured() {
-    let world = World::new();
+fn an_end_asked_by_a_request_a_delivery_runs_is_honoured_after_the_replies() {
+    let (world, thread) = world_running_a_user_thread(A);
     let handle = world.session();
     let session = world.object(handle);
     world
         .first
         .script(Box::new(|_, _, _| Ok(Handled::Deferred)));
     world.send(A, handle, &request());
-    // B's request waits behind A's, and asks to end the process when it runs.
+    // B's request waits behind A's, and asks to end the process when it runs. B's core runs
+    // no scheduler thread, so B sends for the tables' own process.
     world.first.script(reply_and_end(0xB0));
     assert_eq!(
         world.send(B, handle, &request()).0.outcome,
         Outcome::Waiting
     );
+    let own = world.with_tables(|_, scheduler| process_of(scheduler, thread));
 
     lock(&world.first.ready).push_back((session, Ok(0xA0)));
-    world.deliver(&world.first);
-    // B was answered, and the process goes on: its session is still open.
+    let before = world.events().len();
+    let ended = world.deliver(&world.first);
+    assert_eq!(
+        ended,
+        [Ended {
+            process: own,
+            thread: B,
+            core: core_of(B)
+        }]
+    );
+    // Both replies reached their senders and were recorded, A's first, before the end.
+    assert_eq!(world.tls(A), [0xA0; BUFFER_SIZE]);
     assert_eq!(world.tls(B), [0xB0; BUFFER_SIZE]);
-    world.with_tables(|handles, scheduler| {
-        assert_eq!(handles.get(handle), Ok(session));
-        assert!(scheduler.ipc().is_session(session));
-    });
-    assert_eq!(world.first.log().closed, Vec::<ObjectId>::new());
+    assert_eq!(
+        threads_and_kinds(&world.events()[before..]),
+        [
+            send_event(A, handle, ResultCode::SUCCESS),
+            (B, ipc_event(COMMAND)),
+            send_event(B, handle, ResultCode::SUCCESS),
+        ]
+    );
+    // Then the process let everything go, as `ExitProcess` lets it go.
+    assert_eq!(holdings(&world, thread), (0, 1, 0, true));
+    assert_eq!(world.first.log().closed, [session]);
+    world.with_tables(|_, scheduler| assert!(!scheduler.ipc().is_session(session)));
+}
+
+#[test]
+fn an_end_asked_while_a_delivery_takes_a_deferred_reply_is_honoured_after_it() {
+    let (world, thread) = world_running_a_user_thread(A);
+    let handle = world.session();
+    let session = world.object(handle);
+    world
+        .first
+        .script(Box::new(|_, _, _| Ok(Handled::Deferred)));
+    assert_eq!(
+        world.send(A, handle, &request()).0.outcome,
+        Outcome::Waiting
+    );
+    let own = world.with_tables(|_, scheduler| process_of(scheduler, thread));
+    // The handler asks while it gives the reply, as a service that defers `Exit` would.
+    lock(&world.first.hooks).take_reply = Some(Box::new(|cx| {
+        cx.end_process();
+        cx.record(ipc_event(COMMAND));
+    }));
+    lock(&world.first.ready).push_back((session, Ok(0xA0)));
+    let before = world.events().len();
+    assert_eq!(
+        world.deliver(&world.first),
+        [Ended {
+            process: own,
+            thread: A,
+            core: core_of(A)
+        }]
+    );
+    assert_eq!(world.tls(A), [0xA0; BUFFER_SIZE]);
+    assert_eq!(
+        threads_and_kinds(&world.events()[before..]),
+        [
+            (A, ipc_event(COMMAND)),
+            send_event(A, handle, ResultCode::SUCCESS),
+        ]
+    );
+    assert_eq!(holdings(&world, thread), (0, 1, 0, true));
+    assert_eq!(world.first.log().closed, [session]);
+}
+
+#[test]
+fn a_delivery_ends_the_process_of_the_request_that_asked_and_no_other() {
+    let (world, own, other) = world_of_two_processes();
+    let handle = world.session();
+    let session = world.object(handle);
+    world
+        .first
+        .script(Box::new(|_, _, _| Ok(Handled::Deferred)));
+    assert_eq!(
+        world.send(A, handle, &request()).0.outcome,
+        Outcome::Waiting
+    );
+    // B, a thread of the other process, asks to end its process from behind A's request.
+    world.first.script(reply_and_end(0xB0));
+    assert_eq!(
+        world.send(B, handle, &request()).0.outcome,
+        Outcome::Waiting
+    );
+    assert_eq!(process_state(&world, own), (false, 1));
+    assert_eq!(process_state(&world, other), (false, 1));
+
+    // The delivery is made on A's core, on behalf of B's process.
+    lock(&world.first.ready).push_back((session, Ok(0xA0)));
+    assert_eq!(
+        world.deliver(&world.first),
+        [Ended {
+            process: other,
+            thread: B,
+            core: core_of(B)
+        }]
+    );
+    assert_eq!(world.tls(A), [0xA0; BUFFER_SIZE]);
+    assert_eq!(world.tls(B), [0xB0; BUFFER_SIZE]);
+    assert_eq!(process_state(&world, other), (true, 0));
+    assert_eq!(process_state(&world, own), (false, 1));
+}
+
+#[test]
+fn a_delivery_ends_a_process_two_requests_asked_for_once_naming_the_first() {
+    let (world, thread) = world_running_a_user_thread(A);
+    let handle = world.session();
+    let session = world.object(handle);
+    world
+        .first
+        .script(Box::new(|_, _, _| Ok(Handled::Deferred)));
+    world.send(A, handle, &request());
+    // B's request and then C's wait behind A's, and both ask to end the process.
+    world.first.script(reply_and_end(0xBC));
+    for sender in [B, C] {
+        assert_eq!(
+            world.send(sender, handle, &request()).0.outcome,
+            Outcome::Waiting
+        );
+    }
+    let own = world.with_tables(|_, scheduler| process_of(scheduler, thread));
+    lock(&world.first.ready).push_back((session, Ok(0xA0)));
+    assert_eq!(
+        world.deliver(&world.first),
+        [Ended {
+            process: own,
+            thread: B,
+            core: core_of(B)
+        }]
+    );
+    assert_eq!(world.tls(B), [0xBC; BUFFER_SIZE]);
+    assert_eq!(world.tls(C), [0xBC; BUFFER_SIZE]);
+    assert_eq!(holdings(&world, thread), (0, 1, 0, true));
 }
 
 #[test]
@@ -2324,6 +2492,56 @@ fn an_end_asked_by_a_request_the_dispatch_putting_the_handler_back_runs_is_honou
         assert!(!scheduler.ipc().is_session(deferred_object));
         assert!(!scheduler.ipc().is_session(other_object));
     });
+}
+
+#[test]
+fn a_dispatch_that_ends_another_process_returns_its_own_result() {
+    let (world, own, other) = world_of_two_processes();
+    let deferred = world.session();
+    let unrelated = world.session();
+    let (deferred_object, unrelated_object) = (world.object(deferred), world.object(unrelated));
+    world
+        .first
+        .script(Box::new(|_, _, _| Ok(Handled::Deferred)));
+    assert_eq!(
+        world.send(A, deferred, &request()).0.outcome,
+        Outcome::Waiting
+    );
+    // B, a thread of the other process, asks to end it from behind A's deferred request; C,
+    // whose core runs no thread of a process and so sends for the tables' own, stops in its
+    // handler on another session until the test lets it through.
+    let (gate, keeper) = gate();
+    world.first.script(Box::new(move |cx, session, message| {
+        if session == unrelated_object {
+            gate.pass();
+            message.fill(0xC0);
+        } else {
+            message.fill(0xB0);
+            cx.end_process();
+        }
+        Ok(Handled::Replied)
+    }));
+    assert_eq!(
+        world.send(B, deferred, &request()).0.outcome,
+        Outcome::Waiting
+    );
+    std::thread::scope(|scope| {
+        let sending = scope.spawn(|| world.send(C, unrelated, &request()));
+        keeper.wait();
+        // Owed while C's core has the handler out: this delivery ends nothing itself.
+        lock(&world.first.ready).push_back((deferred_object, Ok(0xA0)));
+        assert_eq!(world.deliver(&world.first), []);
+        keeper.open();
+        let (record, regs) = sending.join().unwrap();
+        // C's dispatch ran B's request and ended B's process, not its own.
+        assert_eq!(record.outcome, Outcome::Completed);
+        assert_eq!(result(&regs), ResultCode::SUCCESS);
+    });
+    assert_eq!(world.tls(A), [0xA0; BUFFER_SIZE]);
+    assert_eq!(world.tls(B), [0xB0; BUFFER_SIZE]);
+    assert_eq!(world.tls(C), [0xC0; BUFFER_SIZE]);
+    assert_eq!(process_state(&world, other), (true, 0));
+    assert_eq!(process_state(&world, own), (false, 1));
 }
 
 #[test]

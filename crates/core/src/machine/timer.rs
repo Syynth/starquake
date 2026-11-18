@@ -36,6 +36,22 @@
 //! through it) is not dropped: the kernel keeps it owed, and the core delivers it when it puts
 //! the handler back, before its own call returns.
 //!
+//! # A process a handler ends during a delivery
+//!
+//! A handler may ask to end its request's sender's process (`IpcContext::end_process`, for
+//! `ISelfController::Exit`) while this thread delivers: as it gives a deferred reply, or in a
+//! request the delivery starts once the deferred one freed the server. The kernel writes and
+//! records every reply first, then ends the process through the teardown `ExitProcess` uses,
+//! and returns it ([`Dispatcher::deliver_replies`], `starquake_kernel::dispatch::Ended`). The
+//! turn then records the process's end for the sender whose request asked, on its core, as a
+//! core records it for a thread whose call ended in `Outcome::ProcessExited`, and the run
+//! ends as it ends for `ExitProcess` ([`Ending::Exited`]); the servers still named ready are
+//! not delivered to. The run has one process (PROVISIONAL, as in the kernel), so any process a
+//! delivery ends is the run's. Tests:
+//! `a_handler_ending_the_process_during_the_timers_delivery_ends_the_run_after_the_reply`
+//! (stepped), and `the_timer_thread_ends_the_run_when_a_delivery_ends_the_process` (the real
+//! timer thread).
+//!
 //! # The graphics server's turn
 //!
 //! Each turn, after the deliveries, runs the graphics server's turn
@@ -71,9 +87,9 @@ use starquake_cpu::Vcpu;
 use starquake_gsv::completion::Wake;
 use starquake_kernel::dispatch::{Caller, Dispatcher};
 use starquake_kernel::sched::PREEMPTION_INTERVAL_NS;
-use starquake_trace::{Env, HostClock, HostNanos, ThreadId};
+use starquake_trace::{Env, EventKind, HostClock, HostNanos, LifecyclePhase, ThreadId};
 
-use super::{CORE, Ending, LogSink, Machine, lock};
+use super::{CORE, Ending, LogSink, Machine, PROCESS_ID, lock};
 use crate::hle::graphics::KernelHost;
 
 /// What the timer thread sleeps on: rung when it should look again.
@@ -193,7 +209,9 @@ fn turns<V: Vcpu, C: HostClock + Clone>(machine: &Machine<'_, V, C>) -> Result<(
 }
 
 /// Delivers the deferred replies of every server a [`Ready`](super::Ready) named since the last
-/// turn ([`Dispatcher::deliver_replies`]), then tells the cores whose thread changed.
+/// turn ([`Dispatcher::deliver_replies`]), then tells the cores whose thread changed. A
+/// delivery that ended the process ends the run instead ([`Ending::Exited`]; module docs, "A
+/// process a handler ends during a delivery").
 pub(super) fn deliver<V: Vcpu, C: HostClock + Clone>(
     machine: &Machine<'_, V, C>,
 ) -> Result<(), Ending> {
@@ -207,6 +225,7 @@ pub(super) fn deliver<V: Vcpu, C: HostClock + Clone>(
         core: CORE,
         thread: NO_THREAD,
     };
+    let mut ended = None;
     for server in servers {
         // The caller's memory, clock and recorder are what a delivery uses; it names no core
         // or thread of its own (`Dispatcher::deliver_replies`).
@@ -218,10 +237,14 @@ pub(super) fn deliver<V: Vcpu, C: HostClock + Clone>(
             debug: &mut debug,
             recorder: &machine.session.recorder,
         };
-        machine
+        let delivered = machine
             .dispatcher
             .deliver_replies(server, &mut caller)
             .map_err(|error| Ending::Failed(format!("a reply could not be delivered: {error}")))?;
+        if let Some(end) = delivered.first() {
+            ended = Some(*end);
+            break;
+        }
     }
     // The run keeps the environment's recording; the workers' recordings are dropped (`machine`
     // module docs, "The environment"). Every read `fsp-srv`'s workers finish rings this turn, so
@@ -229,6 +252,17 @@ pub(super) fn deliver<V: Vcpu, C: HostClock + Clone>(
     machine.env.keep();
     for reads in &machine.reads {
         drop(reads.take_recording());
+    }
+    if let Some(end) = ended {
+        machine.session.record_on(
+            end.core,
+            end.thread,
+            EventKind::Lifecycle {
+                phase: LifecyclePhase::ProcessExit,
+                subject: PROCESS_ID,
+            },
+        );
+        return Err(Ending::Exited);
     }
     machine
         .dispatcher

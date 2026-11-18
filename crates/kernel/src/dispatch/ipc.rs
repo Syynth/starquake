@@ -93,33 +93,53 @@
 //! The services spec ("Writing a service", approved 2026-11-16) lets a service end the calling
 //! process (`ISelfController::Exit`): "the request is recorded, the reply is sent, and then the
 //! kernel tears the process down through its normal termination path". A handler asks with
-//! [`IpcContext::end_process`]. The `SendSyncRequest` dispatch that settles the request (step 4)
-//! writes its reply into the sender's message buffer and its result into the sender's
-//! registers, records its events, and only then ends the process with
-//! [`terminate_process`], the function `ExitProcess` ends it with: every thread ends and every
-//! handle closes, so the servers of its sessions are told. The dispatch ends in
-//! [`Outcome::ProcessExited`], which its caller treats as it treats `ExitProcess`'s. Test:
-//! `a_handler_that_ends_the_process_replies_first_and_then_releases_everything`.
+//! [`IpcContext::end_process`], and the request that is over carries the process to end: its
+//! sender's ([`Sender::process`]), whichever thread settles it. Whoever settles the request (a
+//! `SendSyncRequest` dispatch, step 4, or a [`Dispatcher::deliver_replies`]) writes its reply
+//! into the sender's message buffer and its result into the sender's registers, records its
+//! events, settles every other request that is over with it, and only then ends the process
+//! with [`terminate_process`], the function `ExitProcess` ends it with: every thread ends and
+//! every handle closes, so the servers of its sessions are told. Each process asked for ends
+//! once, in the order first asked; a second ask for the same process in one settling is not
+//! tried again (log-only: trying it would only log that the process has ended already).
+//!
+//! - **A `SendSyncRequest` dispatch** ends in [`Outcome::ProcessExited`] when its caller's own
+//!   process is one it ended, which its caller treats as it treats `ExitProcess`'s; otherwise
+//!   it ends with its own result. Tests:
+//!   `a_handler_that_ends_the_process_replies_first_and_then_releases_everything`, and
+//!   `a_dispatch_that_ends_another_process_returns_its_own_result` for a request of another
+//!   process that the dispatch ran.
+//! - **A delivery** (the timer thread's, `deliver_replies`) returns the processes it ended
+//!   ([`Ended`]), with the sender of the request that asked, for the run to stop and record
+//!   the end, as a core does for [`Outcome::ProcessExited`]. That covers a deferred reply
+//!   whose `take_reply` asked, and a request the delivery started once the deferred one freed
+//!   the server. Tests: `an_end_asked_while_a_delivery_takes_a_deferred_reply_is_honoured_after_it`,
+//!   `an_end_asked_by_a_request_a_delivery_runs_is_honoured_after_the_replies`, and
+//!   `a_delivery_ends_the_process_of_the_request_that_asked_and_no_other`.
+//!
+//! The sender's process is that of the scheduler's thread on its core, or, for a core that
+//! runs no thread of a process (the tests that drive the dispatcher without a core loop), the
+//! process these tables belong to ([`crate::tables::Processes::own`]). PROVISIONAL (one process
+//! per set of tables): the guest-visible process id and the `CURRENT_PROCESS` pseudo-handle a
+//! request is given are still those of the tables' process, and the process an end names
+//! shares the one handle table, which [`terminate_process`] closes whichever process it ends
+//! (as `ExitThread` ending the last thread of any process closes it). A core loop runs only the
+//! tables' process's threads, so in a run the two always agree. A dispatch whose caller's
+//! process did not end does not report another process ending: nothing in a run makes one.
 //!
 //! Neither this nor [`IpcContext::clear_event`] records an event of its own: what is recorded
 //! is the request that asked (its handler's IPC event, then its `SendSyncRequest` event), and
-//! the end itself is the run's to record, as for `ExitProcess`, when the dispatch ends in
-//! [`Outcome::ProcessExited`].
+//! the end itself is the run's to record, as for `ExitProcess`.
 //!
-//! Two asks are not honoured; each is logged as an error and the process goes on:
-//!
-//! - **A handler that deferred its reply** ([`Handled::Deferred`]): the end follows the reply,
-//!   and there is none yet. The service framework refuses the combination before it reaches
-//!   the kernel. Test: `an_end_asked_by_a_handler_that_defers_is_not_honoured`.
-//! - **A request [`Dispatcher::deliver_replies`] runs** (a deferred reply freed the server, and
-//!   the delivering thread starts the next request): the delivering thread is not a guest's
-//!   dispatch, so nothing would end in [`Outcome::ProcessExited`] and stop the guest's cores.
-//!   Test: `an_end_asked_by_a_request_a_delivery_runs_is_not_honoured`.
+//! One ask is not honoured; it is logged as an error and the process goes on: **a handler that
+//! deferred its reply** ([`Handled::Deferred`]): the end follows the reply, and there is none
+//! yet. The service framework refuses the combination before it reaches the kernel. Test:
+//! `an_end_asked_by_a_handler_that_defers_is_not_honoured`.
 //!
 //! A delivery that is owed because a guest's `SendSyncRequest` dispatch has the handler out of
 //! its slot is that dispatch's to make (`deliver_owed`, when it puts the handler back), and an
-//! end asked by a request it then runs is honoured: the dispatch ends in
-//! [`Outcome::ProcessExited`] after settling that request with the others. Test:
+//! end asked by a request it then runs is honoured there, after settling that request with
+//! the others. Test:
 //! `an_end_asked_by_a_request_the_dispatch_putting_the_handler_back_runs_is_honoured`. An end
 //! asked by a handler that then fails, or that closes the session ([`Handled::Closed`]), is
 //! honoured too, once the request has ended with [`KernelError::SessionClosed`]. Tests:
@@ -190,14 +210,28 @@ pub struct Woken {
     pub result: ResultCode,
 }
 
+/// A process a handler's request ended during [`Dispatcher::deliver_replies`] (module docs, "A
+/// handler ends the sender's process"): the process, and the sender of the request that asked,
+/// which the run records the end for, as a core records it for the thread whose
+/// `SendSyncRequest` ended in [`Outcome::ProcessExited`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ended {
+    /// The process that ended: the sender's ([`Sender::process`]).
+    pub process: ProcessId,
+    /// The sending thread, as the event stream names it.
+    pub thread: ThreadId,
+    /// The core it called from.
+    pub core: u8,
+}
+
 /// A request that is over, with the events its handler recorded, waiting to be settled.
 struct Finished {
     session: ObjectId,
     done: Done,
     events: Vec<EventKind>,
-    /// Whether its handler asked to end the sender's process ([`IpcContext::end_process`]):
-    /// the process ends once the request is settled.
-    end: bool,
+    /// The sender's process ([`Sender::process`]), when its handler asked to end it
+    /// ([`IpcContext::end_process`]): that process ends once the request is settled.
+    end: Option<ProcessId>,
     /// The handles its handler placed in the sender's table: those its reply names are kept
     /// when the reply is written, and the rest taken back (`dispatch/ipc/placed.rs`).
     placed: Placed,
@@ -322,13 +356,13 @@ impl IpcContext<'_> {
             .map_err(call_error)
     }
 
-    /// Asks to end the sender's process once this request is over (services spec, "Writing a
-    /// service": a service "end[s] the calling process"): its reply is written into the
-    /// sender's message buffer and its result into the sender's registers, its events are
-    /// recorded, and then the process is ended through the path `ExitProcess` takes
-    /// ([`crate::svc::process::terminate_process`]), and the dispatch ends in
-    /// [`Outcome::ProcessExited`]. Asking twice is asking once. The module docs say when the
-    /// ask is not honoured.
+    /// Asks to end the sender's process ([`Sender::process`]) once this request is over
+    /// (services spec, "Writing a service": a service "end[s] the calling process"): its reply
+    /// is written into the sender's message buffer and its result into the sender's registers,
+    /// its events are recorded, and then the process is ended through the path `ExitProcess`
+    /// takes ([`crate::svc::process::terminate_process`]). The sender's own dispatch then ends
+    /// in [`Outcome::ProcessExited`], and a delivery reports the end ([`Ended`]). Asking twice
+    /// is asking once. The module docs say when the ask is not honoured.
     pub fn end_process(&mut self) {
         self.end = true;
     }
@@ -696,6 +730,12 @@ impl Dispatcher {
     /// and its clock reading stamps the events. The senders are reported by
     /// [`Dispatcher::take_woken`].
     ///
+    /// Returns the processes ended because a handler asked to ([`IpcContext::end_process`]),
+    /// each once, in the order first asked, after every request that is over is settled (module
+    /// docs, "A handler ends the sender's process"). Each is its request's sender's process,
+    /// whoever the `caller` is. Empty when no handler asked, and without a process that could
+    /// not end (logged).
+    ///
     /// The delivery is owed until a thread with the handler in hand makes it: this one, or,
     /// when the handler is out of its slot (a core is running a request through it), the one
     /// that puts it back, which delivers before its own call returns (`deliver_owed`). Either
@@ -704,7 +744,7 @@ impl Dispatcher {
         &self,
         server: ServerId,
         caller: &mut Caller<'_>,
-    ) -> Result<(), EnvError> {
+    ) -> Result<Vec<Ended>, EnvError> {
         let mut locked = self.lock::<(&mut Scheduler,)>();
         let time = locked.guest_time(caller.env)?;
         let process_id = locked.state.tables.processes.process_id();
@@ -712,21 +752,23 @@ impl Dispatcher {
         drop(locked);
 
         let finished = self.deliver_owed(server, caller.memory, process_id);
-        if finished.iter().any(|finished| finished.end) {
-            // Module docs: no guest dispatch is here to end in `Outcome::ProcessExited`.
-            tracing::error!(
-                ?server,
-                "a handler asked to end the process during a delivery; the process goes on"
-            );
-        }
+        let asked = asked(&finished);
         let woken = self.settle(finished, caller.memory, caller.recorder, time);
         let mut locked = self.lock::<()>();
         locked.state.woken.extend(woken);
         // Waits the handler's signals ended (`dispatch/sync.rs`).
         drain_wakes(&mut locked.state, caller.recorder, time);
         drop(locked);
+        // Only now that every reply is written and recorded (services spec: "the reply is
+        // sent, and then the kernel tears the process down").
+        let mut ended = Vec::new();
+        for end in asked {
+            if self.terminate_asked(end.process, caller.recorder, time) {
+                ended.push(end);
+            }
+        }
         self.settle_notices();
-        Ok(())
+        Ok(ended)
     }
 
     /// Makes the deliveries `server` owes ([`Dispatcher::deliver_replies`]) while one is owed
@@ -803,13 +845,16 @@ impl Dispatcher {
             let (_, ipc) = scheduler.ipc_mut();
             let over = match written {
                 Ok(()) => match ipc.complete(session, Box::new(message)) {
-                    Ok(done) => vec![Finished {
-                        session,
-                        done,
-                        events: cx.events,
-                        end: cx.end,
-                        placed: Placed::default(),
-                    }],
+                    Ok(done) => {
+                        let end = cx.end.then_some(done.request.sender.process);
+                        vec![Finished {
+                            session,
+                            done,
+                            events: cx.events,
+                            end,
+                            placed: Placed::default(),
+                        }]
+                    }
                     Err(error) => {
                         tracing::error!(%error, ?session, "a deferred reply has no request");
                         Vec::new()
@@ -933,7 +978,9 @@ impl Dispatcher {
             core: call.caller.core,
             message_address: call.regs.tpidrro,
             session_handle: handle,
+            process: sending_process(scheduler, call.caller.core).unwrap_or(process),
         };
+        let caller_process = sender.process;
         let begun = begin(
             handles,
             scheduler,
@@ -965,7 +1012,7 @@ impl Dispatcher {
         // deliver now that it is back.
         finished.extend(self.deliver_owed(server, call.caller.memory, process_id));
         let own = call.caller.thread;
-        let end = finished.iter().any(|finished| finished.end);
+        let asked = asked(&finished);
         let mut woken = self.settle(finished, call.caller.memory, call.caller.recorder, time);
         let outcome = match woken.iter().position(|woken| woken.thread == own) {
             Some(index) => {
@@ -980,11 +1027,16 @@ impl Dispatcher {
         // Waits the handler's signals ended (`dispatch/sync.rs`).
         drain_wakes(&mut locked.state, call.caller.recorder, time);
         drop(locked);
-        let outcome = if end {
-            self.end_process(process, outcome, call.caller.recorder, time)
-        } else {
-            outcome
-        };
+        // Each process asked for ends once every request is settled; the call ends in
+        // `Outcome::ProcessExited` when its caller's own process is one of them (module docs).
+        let mut outcome = outcome;
+        for end in asked {
+            if end.process == caller_process {
+                outcome = self.end_process(end.process, outcome, call.caller.recorder, time);
+            } else {
+                self.terminate_asked(end.process, call.caller.recorder, time);
+            }
+        }
         self.settle_notices();
         outcome
     }
@@ -1003,19 +1055,37 @@ impl Dispatcher {
         recorder: &Recorder,
         time: GuestTicks,
     ) -> Outcome {
+        if self.terminate_asked(process, recorder, time) {
+            Outcome::ProcessExited
+        } else {
+            outcome
+        }
+    }
+
+    /// Ends `process` because a handler asked to, through
+    /// [`crate::svc::process::terminate_process`], and records and reports the waits its
+    /// ending threads ended. Returns whether it ended; when it could not (only the kernel's own
+    /// bookkeeping can make that happen: a process that has ended already), the failure is
+    /// logged. What [`Dispatcher::end_process`] and [`Dispatcher::deliver_replies`] both end a
+    /// process with.
+    fn terminate_asked(&self, process: ProcessId, recorder: &Recorder, time: GuestTicks) -> bool {
         let mut locked = self.lock::<(&mut HandleTable, &mut Scheduler)>();
         let (handles, scheduler) = locked.tables();
-        tracing::info!("a service ended the process after its reply");
+        tracing::info!(?process, "a service ended the process after its reply");
         let ended = terminate_process(handles, scheduler, process);
         // Waits the ending threads ended (a thread's waiters wake as it terminates), recorded
         // and reported now, as `ExitProcess` does. Test:
         // `a_handler_ending_the_process_wakes_its_threads_waiters_as_exit_process_does`.
         drain_wakes(&mut locked.state, recorder, time);
         match ended {
-            Ok(()) => Outcome::ProcessExited,
+            Ok(()) => true,
             Err(error) => {
-                tracing::error!(%error, "a service asked to end the process, and it could not end");
-                outcome
+                tracing::error!(
+                    %error,
+                    ?process,
+                    "a service asked to end the process, and it could not end"
+                );
+                false
             }
         }
     }
@@ -1328,6 +1398,14 @@ fn calling_scheduler_thread(scheduler: &Scheduler, core: u8) -> Option<crate::id
     scheduler.current(core).ok().flatten()
 }
 
+/// The process of the scheduler's thread on the sender's `core`, when the scheduler names that
+/// core and it runs a thread of a process: what the request is sent for ([`Sender::process`]).
+/// `None` for a core that runs no scheduler thread, or a thread of no process.
+fn sending_process(scheduler: &Scheduler, core: u8) -> Option<ProcessId> {
+    let thread = calling_scheduler_thread(scheduler, core)?;
+    scheduler.thread(thread).ok()?.process()
+}
+
 /// Makes the scheduler's thread behind `sender` wait for the reply to its request on
 /// `session`, unless it waits for that reply already (a queued request that was started and
 /// then deferred). Returns whether the sender now waits; one with no scheduler thread does
@@ -1392,7 +1470,7 @@ fn finish(
             session,
             done,
             events: events.take().unwrap_or_default(),
-            end: false,
+            end: None,
             placed: Placed::default(),
         })
         .collect()
@@ -1417,15 +1495,15 @@ fn carry(
 }
 
 /// Marks the first of `finished`, the request a handler ran, as asking to end its sender's
-/// process when `end` says the handler asked ([`IpcContext::end_process`]). When `finished` is
-/// empty there is nothing to mark, and the ask is not honoured, and logged. That happens in
-/// two cases: the handler deferred its reply (the end follows the reply, and there is none
+/// process ([`Sender::process`]) when `end` says the handler asked ([`IpcContext::end_process`]).
+/// When `finished` is empty there is nothing to mark, and the ask is not honoured, and logged.
+/// That happens in two cases: the handler deferred its reply (the end follows the reply, and there is none
 /// yet; module docs), or ending the request failed on the kernel's own bookkeeping
 /// ([`finish`] logs that failure and returns nothing).
 fn ending(mut finished: Vec<Finished>, end: bool) -> Vec<Finished> {
     if end {
         if let Some(first) = finished.first_mut() {
-            first.end = true;
+            first.end = Some(first.done.request.sender.process);
         } else {
             tracing::error!(
                 "a handler asked to end the process, and its request is not over (its reply \
@@ -1434,6 +1512,27 @@ fn ending(mut finished: Vec<Finished>, end: bool) -> Vec<Finished> {
         }
     }
     finished
+}
+
+/// The processes the handlers of `finished` asked to end, each once, in the order first asked,
+/// each with the sender of the first request that asked for it. Bounded by `finished`.
+fn asked(finished: &[Finished]) -> Vec<Ended> {
+    let mut asked: Vec<Ended> = Vec::new();
+    for finished in finished {
+        let Some(process) = finished.end else {
+            continue;
+        };
+        if asked.iter().any(|end| end.process == process) {
+            continue;
+        }
+        let sender = finished.done.request.sender;
+        asked.push(Ended {
+            process,
+            thread: sender.thread,
+            core: sender.core,
+        });
+    }
+    asked
 }
 
 /// Closes the server end of a session whose handler failed (see [`HandlerError`](crate::ipc::HandlerError)): its requests
