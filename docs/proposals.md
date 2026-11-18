@@ -438,6 +438,29 @@ Landed: #306 (nvhost-gpu ZCullBind, PR #308), #224 (shared-memory lifetime, PR #
 | awaiting the owner | **Should the kernel note which server made a shared memory?** Without it, hid's and time:u's restore checks cover kind, size and permission only | #225 | area:kernel |
 | awaiting the owner | **Unconsumed replay records: reported, or an error?** And is the `RunOptions`/`RunReport` replay API shape, with its 16 MiB recording cap, what the observability spec should say? | #226 | observability |
 
+### From wave 34 (ledger: #22)
+
+Landed: #234 (a process end asked during a timer-thread delivery, PR #315), #243 (a process end releases its device-share locks and nvmap handles, PR #313) and #261 (touched-page snapshots and the address space's Map recording point, PR #314). Every PR had both reviews; all findings were applied.
+
+**The title, and milestone 2.** The title now submits GPFIFO work through nvhost-gpu (`SubmitGpfifo`, `0xc018481b`), which is milestone 2's exit ("as far as its first GPU submission"). It then spins: thread 1 waits for a GPU semaphore release (Switch 2 scoping, row 35), and the handle it polls with a zero timeout is nvhost-gpu's error-notifier event, which neither reference ever signals. `NullFront` drops what a submission carries and performs only syncpoint increments, so the release is never written. The fix is the GPU front: gpu-protocol slices G8 (channel pusher), G14 (front loop), G15 (back fences and release writes), G19 (back executor) and G21 (`Gpu` as `GpuFront`), none filed yet. Not yet confirmed: whether the release is a host-method or an engine (QMD) release, and which page is polled; the two references disagree.
+
+| Status | Proposal | Why | Suggested |
+|---|---|---|---|
+| proposed | **Find the cause of the timer-thread test's flakiness**, now that `a_held_page_request_is_answered_at_the_bound_by_the_timer_thread` has failed a second gate run (5.18 ms against its 5 ms bound) and 1 run in 30 alone. Replaces wave 32's "watch" row | #311's review | area:core |
+| proposed | **A scripted-guest check that fails should fail the test**; today it hangs until nextest's timeout | #311's review | area:core |
+| proposed | **Tests around #243's teardown:** the widened completion-queue `Wake` contract (a pusher may hold the kernel's lock) with the production `Bell`, the real `Dispatcher` and the timer thread; a real-kernel nvsrv rig where the process ends through its last thread's `ExitThread`; teardown's device-share step gated by a "process ended" pending flag, like `has_unlocks` and `has_frees` | #243 | area:gsv |
+| proposed | **nvmap locks across a snapshot:** a restored table holds no tokens, so a later `IocFree` releases nothing and the lock stays until the process ends. Save a "locked" flag and reclaim the tokens on restore, which needs one per-range lock count shared by gsv's lock holders (the gap noted in `gpu/saved.rs`) | #243 | area:gsv |
+| proposed | **A framework hook so a deferred reply can end the process**: `framework/server.rs` `deliver` builds no `Context`. Needed only when a title defers `ISelfController::Exit` | #234 | area:services |
+| proposed | **Multi-process kernel (later milestone):** a handle table, guest process id and `CURRENT_PROCESS` per process; end reports for other processes; `timer::deliver` no longer stopping at the first ended server; `is_stalled` across processes; a must-use return for `Vec<Ended>`. #234 and #243 are marked provisional, one process per set of tables. Pairs with the cross-process shared-memory rows (#218, #222) | #234, #243 | area:kernel |
+| proposed | **Snapshot completeness (observability "Order of work", step 6):** a run-level snapshot, which removes the `dead_code` expect on the snapshot module; a `SharedPages` constructor for service restore (`Physical` is private to `space.rs`); check restored shared runs against the restored shared memories; refuse a hostile entry count at the first entry past the budget (a `DeserializeSeed`), not after counting the whole list | #261 | area:core |
+| proposed | **Record the loader's mappings**: `load_placed` runs before the run's recorder exists | #261 | area:core |
+| awaiting the owner | **Is milestone 2 reached, and do the GPU-front slices (G8 to G23) get filed for milestone 3?** | the title | roadmap |
+| awaiting the owner | **A stopgap until the GPU front exists:** let `NullFront` perform host-method semaphore releases so the title gets past its spin. Gpu-protocol decision 2 has the back perform releases, in ring order, after the host work before them; a front that writes them while drawing nothing departs from that, so it is the owner's call. The alternative is to wait for G8 to G21 | the title | gpu-protocol |
+| awaiting the owner | **nvmap releases its device-share lock during `IocFree` and at session close**, as Eden does and #243 asks, where the kernel spec's sentence has the lock held until GPU ordering allows. The departure is quoted in `crates/gsv/src/nvsrv/nvmap.rs`; the open wave-31 row on whether a free waits for GPU ordering is the same question | #243 | kernel |
+| awaiting the owner | **A lock asked for after the process ended reaches a server as `TerminationRequested`.** #313 chose it over `InvalidCurrentMemory`; neither reference has this case | #243 | kernel |
+| awaiting the owner | **`Family::session_closed`**, a count-only services hook #313 adds so nvsrv learns its last session closed: keep it, or fold it into the wave-31 session-close hook that runs with a `Context` | #243 | area:services |
+| awaiting the owner | **Map events are stamped core 0 and the main thread** with a copy of the run's clock, not the dispatch's caller and `Env` reading. Pass the caller to the `Mapper`, or have the dispatcher record queued Map events under its lock? | #261 | observability |
+
 ## House-rule candidates
 
 Rules distilled from review findings. A vetted rule moves into `CLAUDE.md`; until then it is
@@ -651,3 +674,12 @@ passed to build agents as a provisional rule for the next wave.
 - After changing a behaviour, docs, invariant lists, architecture tables and test names are searched for the old claim and updated in the same change.
 - A refusal routed through an existing error variant gets its Display text and docs reread and its exact-string test updated.
 - A review that did not run blocks the merge; it is never skipped as a finding with no file.
+
+### From wave 34 (ledger: #22)
+
+- A test of a value taken from a request, sender or event (core, thread, process) uses a sender that differs from the rig's defaults and from the handler's own, and asserts the exact field.
+- Each branch of a deliver, settle or end path (an error while ending, first versus last of several requests) has its own test asserting the exact reports and their order.
+- A departure from an approved spec sentence quotes the sentence in the module docs and PR body, and every path that triggers it is covered, not just the main one.
+- A function whose result must be acted on (tokens to release, steps to forward) is `pub(crate)` and `#[must_use]`.
+- Untrusted snapshots decode through a budget on entries and in-memory size, not only a byte-length bound, with a test at the exact edge.
+- A request that arrives after its process or session ended is refused with the ended error and logged at the same level on every path that can produce it.
