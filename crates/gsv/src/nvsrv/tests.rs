@@ -1327,13 +1327,59 @@ fn a_refused_lock_leaves_the_handle_allocated_with_no_lock() {
     for at in [address, 0] {
         let id = rig.create_handle(fd);
         rig.nvmap(fd, NVMAP_ALLOC, &alloc_words(id, at));
-        let allocation = rig.state().nvmap().handle(id).unwrap().allocation().copied();
+        let allocation = rig
+            .state()
+            .nvmap()
+            .handle(id)
+            .unwrap()
+            .allocation()
+            .copied();
         assert_eq!(allocation.map(|allocation| allocation.address()), Some(at));
         assert_eq!(rig.nvmap_lock(id), None);
         rig.nvmap(fd, NVMAP_FREE, &le(&[id, 0, 0, 0, 0, 0]));
         assert_eq!(rig.state().nvmap().handle(id), None);
         assert_eq!(rig.kernel.device_locks(address, page), u16::MAX);
     }
+}
+
+/// A lock step whose handle went before the request took it (only a caller that ran the
+/// state's ioctls directly, outside a request, can leave one) takes the lock, which the handle
+/// cannot keep, and releases it at once (`settle_device_shares`).
+#[test]
+fn a_lock_its_handle_cannot_keep_is_released_at_once() {
+    let mut state = NvsrvState::new();
+    let (fd, _) = open_direct(&mut state, Device::Nvmap);
+    let create = direct_ioctl(
+        &mut state,
+        UnknownPolicy::Strict,
+        IoctlVariant::Ioctl,
+        fd,
+        NVMAP_CREATE,
+        &le(&[0x1000, 0]),
+    );
+    let id = u32::from_le_bytes(create.output[4..8].try_into().unwrap());
+    for (raw, input) in [
+        (NVMAP_ALLOC, alloc_words(id, PLACE_FROM)),
+        (NVMAP_FREE, le(&[id, 0, 0, 0, 0, 0])),
+    ] {
+        let answer = direct_ioctl(
+            &mut state,
+            UnknownPolicy::Strict,
+            IoctlVariant::Ioctl,
+            fd,
+            raw,
+            &input,
+        );
+        assert_eq!(answer.result, NvResult::Success);
+    }
+    assert!(state.nvmap().is_empty());
+    let mut rig = Rig::with_state(UnknownPolicy::Strict, state);
+    assert_eq!(rig.place(&[0; 0x1000]), PLACE_FROM);
+    // Any request on nvmap takes the steps left before it.
+    let (answer, _) = rig.ioctl(fd, NVMAP_PARAM, &le(&[id, 1, 0]), 12);
+    assert_eq!(answer, ok(&[NvResult::BadValue.raw()]));
+    assert_eq!(rig.kernel.device_locks(PLACE_FROM, 0x1000), 0);
+    assert_eq!(rig.state().nvmap().lock(id), None);
 }
 
 /// Closing the server's last session frees one reference of each nvmap handle, as Eden's
@@ -1354,7 +1400,10 @@ fn closing_the_last_session_frees_each_handle_once_and_queues_its_lock() {
     rig.nvmap(fd, NVMAP_ALLOC, &alloc_words(lone, lone_at));
     rig.nvmap(fd, NVMAP_ALLOC, &alloc_words(twice, twice_at));
     rig.nvmap(fd, NVMAP_FROM_ID, &le(&[twice, 0]));
-    let (lone_lock, twice_lock) = (rig.nvmap_lock(lone).unwrap(), rig.nvmap_lock(twice).unwrap());
+    let (lone_lock, twice_lock) = (
+        rig.nvmap_lock(lone).unwrap(),
+        rig.nvmap_lock(twice).unwrap(),
+    );
     rig.server.close(other).unwrap();
     assert_eq!(rig.state().nvmap().len(), 2);
     assert_eq!(rig.shared.queue().take_all(), []);

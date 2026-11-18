@@ -354,7 +354,10 @@ fn ending_the_process_releases_every_lock_once_and_a_late_unlock_is_refused() {
         .unwrap();
     assert_eq!(
         all_locks(&dispatcher),
-        [(DATA, 2 * PAGE_SIZE, 2), (DATA + 2 * PAGE_SIZE, PAGE_SIZE, 1)]
+        [
+            (DATA, 2 * PAGE_SIZE, 2),
+            (DATA + 2 * PAGE_SIZE, PAGE_SIZE, 1)
+        ]
     );
     assert_eq!(device_count(&dispatcher, DATA), 2);
     end(&dispatcher, own);

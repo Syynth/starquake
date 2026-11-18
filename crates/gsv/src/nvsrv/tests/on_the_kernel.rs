@@ -181,10 +181,7 @@ impl KernelRig {
         let high = u32::from_le_bytes(address[4..].try_into().unwrap());
         self.nvmap(fd, NVMAP_ALLOC, &le(&[handle, 0, 0, SIZE, 0, 0, low, high]));
         assert_eq!(self.locks(), 1);
-        assert_eq!(
-            self.nvmap_lock(handle),
-            Some(Some((MEMORY, u64::from(SIZE))))
-        );
+        assert_eq!(self.nvmap_lock(handle), Held::Lock(MEMORY, u64::from(SIZE)));
         (fd, handle)
     }
 
@@ -213,14 +210,12 @@ impl KernelRig {
         seen.unwrap()
     }
 
-    /// The range of the lock handle `handle` holds, if it is in the table.
-    fn nvmap_lock(&self, handle: u32) -> Option<Option<(u64, u64)>> {
-        self.read_nvmap(|nvmap| {
-            nvmap.handle(handle).map(|_| {
-                nvmap
-                    .lock(handle)
-                    .map(|token| (token.address(), token.size()))
-            })
+    /// What nvmap holds for `handle`.
+    fn nvmap_lock(&self, handle: u32) -> Held {
+        self.read_nvmap(|nvmap| match (nvmap.handle(handle), nvmap.lock(handle)) {
+            (None, _) => Held::Gone,
+            (Some(_), None) => Held::NoLock,
+            (Some(_), Some(token)) => Held::Lock(token.address(), token.size()),
         })
     }
 
@@ -242,6 +237,17 @@ impl KernelRig {
         self.shared.drain(&mut host);
         host.answers
     }
+}
+
+/// What nvmap holds for a handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Held {
+    /// The handle is not in the table.
+    Gone,
+    /// It is, holding no lock.
+    NoLock,
+    /// It is, holding a lock on this address and size.
+    Lock(u64, u64),
 }
 
 /// The timer thread's host over the kernel's dispatcher: releases go to
@@ -271,7 +277,7 @@ fn alloc_takes_the_kernel_s_lock_and_the_last_free_releases_it() {
     let (fd, handle) = rig.allocated();
     rig.nvmap(fd, NVMAP_FREE, &le(&[handle, 0, 0, 0, 0, 0]));
     assert_eq!(rig.locks(), 0);
-    assert_eq!(rig.nvmap_lock(handle), None);
+    assert_eq!(rig.nvmap_lock(handle), Held::Gone);
     // Nothing was queued: the free released the lock during its request.
     assert_eq!(rig.drain(), []);
 }
@@ -286,7 +292,7 @@ fn a_process_ending_with_a_locked_handle_releases_the_lock_once_and_frees_the_ha
     assert_eq!(rig.locks(), 0);
     assert!(!rig.any_lock());
     assert!(rig.read_nvmap(NvMap::is_empty));
-    assert_eq!(rig.nvmap_lock(handle), None);
+    assert_eq!(rig.nvmap_lock(handle), Held::Gone);
     // The drain's release is refused for the ended process and releases nothing again.
     assert_eq!(rig.drain(), [Err(DeviceShareError::ProcessEnded)]);
     assert_eq!(rig.locks(), 0);
@@ -296,7 +302,7 @@ fn a_process_ending_with_a_locked_handle_releases_the_lock_once_and_frees_the_ha
 fn a_process_ending_with_an_unallocated_handle_frees_it_and_queues_nothing() {
     let rig = KernelRig::new();
     let (_, handle) = rig.created();
-    assert_eq!(rig.nvmap_lock(handle), Some(None));
+    assert_eq!(rig.nvmap_lock(handle), Held::NoLock);
     rig.exit();
     assert!(rig.read_nvmap(NvMap::is_empty));
     assert!(!rig.any_lock());

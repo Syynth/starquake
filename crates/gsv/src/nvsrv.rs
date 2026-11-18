@@ -1233,7 +1233,11 @@ fn settle_device_shares(cx: &mut Context<'_>) -> Result<(), Fault> {
                 address,
                 size,
             } => match cx.lock_device_share(address, size) {
-                Ok(token) => match cx.family::<NvsrvFamily>()?.state.nvmap.keep_lock(handle, token)
+                Ok(token) => match cx
+                    .family::<NvsrvFamily>()?
+                    .state
+                    .nvmap
+                    .keep_lock(handle, token)
                 {
                     Ok(()) => continue,
                     Err(token) => {

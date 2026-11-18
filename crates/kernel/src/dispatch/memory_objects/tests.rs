@@ -986,7 +986,10 @@ fn exiting_the_process_releases_device_locks_and_keeps_the_unlock_and_give_back_
     let (_, _, pages) = shared_then_lent(&world);
     let (_, _, state, permission, _) = world.block(NAMES);
     for _ in 0..2 {
-        world.dispatcher.lock_device_share(NAMES, PAGE_SIZE).unwrap();
+        world
+            .dispatcher
+            .lock_device_share(NAMES, PAGE_SIZE)
+            .unwrap();
     }
     assert_eq!(world.block(NAMES).4, MemoryAttribute::DEVICE_SHARED);
     drop(world.log.take());
