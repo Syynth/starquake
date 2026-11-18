@@ -352,6 +352,14 @@ impl Targets {
         Ok(())
     }
 
+    /// The interface in a row, unless it is a domain, checked out or frozen.
+    pub(super) fn interface(&self, id: TargetId) -> Option<&dyn Session> {
+        match &self.rows.get(id).ok()?.target {
+            Target::Interface(Slot::Live(session)) => Some(&**session),
+            Target::Interface(Slot::Out | Slot::Frozen { .. }) | Target::Domain(_) => None,
+        }
+    }
+
     /// The interface in a row, unless it is a domain or checked out.
     pub(super) fn interface_mut(&mut self, id: TargetId) -> Option<&mut dyn Session> {
         match self.slot(id).ok()? {

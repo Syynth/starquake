@@ -34,6 +34,7 @@ mod handles;
 mod later;
 mod plain;
 mod queue;
+mod requests;
 mod server;
 mod shared_memory;
 mod snapshot;
@@ -453,8 +454,9 @@ struct Child {
 
 commands! {
     impl Child {
-        0 => tag,
-        1 => set_tag,
+        child::TAG => tag,
+        child::SET_TAG => set_tag,
+        child::WAIT => wait,
     }
 }
 
@@ -470,12 +472,20 @@ impl Child {
         self.tag = req.payload().read_u32()?;
         reply.ok()
     }
+
+    /// Defers its reply, parking the token as the toy's `wait` does.
+    fn wait(_: &mut Self, cx: &mut Context<'_>, _req: &Request<'_>, reply: &mut Reply) -> Outcome {
+        let token = cx.defer()?;
+        PARKED.with_borrow_mut(|parked| parked.push(token));
+        reply.deferred()
+    }
 }
 
 /// Child command ids.
 mod child {
     pub(super) const TAG: u32 = 0;
     pub(super) const SET_TAG: u32 = 1;
+    pub(super) const WAIT: u32 = 2;
 }
 
 /// An interface with no commands at all.

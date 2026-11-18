@@ -106,6 +106,16 @@ pub trait Session: Any + Send {
     /// The interface's name in logs and traces.
     fn name(&self) -> &'static str;
 
+    /// The name requests to this interface are traced, counted and reported under: its
+    /// [`Session::name`], unless the interface stands in for something else. The session
+    /// [`sm`](crate::sm) hands out for a name nothing provides ([`Stub`](crate::sm::Stub))
+    /// returns that name, so a request to it names the service the title asked for. The trace
+    /// keeps at most [`INTERFACE_NAME_CAPACITY`](starquake_trace::INTERFACE_NAME_CAPACITY) bytes
+    /// of it ([`InterfaceName::lossy`](starquake_trace::InterfaceName::lossy)).
+    fn trace_name(&self) -> &str {
+        self.name()
+    }
+
     /// The session's state as bytes, for a snapshot. [`Interfaces`](super::Interfaces) turns
     /// them back into the session.
     fn save(&self) -> Result<Vec<u8>, SnapshotError>;

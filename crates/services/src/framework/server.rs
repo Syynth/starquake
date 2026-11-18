@@ -10,7 +10,7 @@ use starquake_ipc::{
 use starquake_kernel::handle::Handle;
 use starquake_kernel::id::ObjectId;
 use starquake_kernel::result::{KernelError, ResultCode};
-use starquake_trace::{Env, IpcOutcome, ServiceId};
+use starquake_trace::{Env, InterfaceName, IpcOutcome, IpcProtocol, ServiceId};
 
 use super::buffers;
 use super::commands::{Protocol, Session};
@@ -60,8 +60,10 @@ pub enum Handled {
 /// A command a server answered by auto-stub.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct StubbedCommand {
-    /// The interface the command was sent to ([`Session::name`]).
-    pub interface: &'static str,
+    /// The interface the command was sent to, by its [`Session::trace_name`]: for a session
+    /// `sm:` handed out for a name nothing provides, that name. A control command's is
+    /// [`CONTROL_INTERFACE`](super::control::CONTROL_INTERFACE).
+    pub interface: InterfaceName,
     /// The protocol it came in.
     pub protocol: Protocol,
     /// The command id.
@@ -73,6 +75,37 @@ pub struct StubbedCommand {
 /// starquake's own bound: command ids are the guest's to choose, so the record must not grow
 /// with them. Commands past the bound are still stubbed; they are just not recorded or logged.
 pub const MAX_STUBBED_COMMANDS: usize = 4096;
+
+/// One command a server was sent, as [`Server::requests`] counts it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CountedCommand {
+    /// The interface the request was addressed to, as its trace event names it
+    /// ([`trace`](super::trace)).
+    pub interface: InterfaceName,
+    /// The protocol it came in.
+    pub protocol: IpcProtocol,
+    /// The command id: the interface's, or the control table's for a control request.
+    pub id: u32,
+}
+
+/// How many requests a server was sent for one [`CountedCommand`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestCount {
+    /// The command.
+    pub command: CountedCommand,
+    /// Its name in the interface's command table (the control table's for a control request),
+    /// or `None` when the table does not list it.
+    pub name: Option<&'static str>,
+    /// How many requests.
+    pub count: u64,
+}
+
+/// The most distinct commands a server counts requests for ([`Server::requests`]).
+///
+/// starquake's own bound, the same as [`MAX_STUBBED_COMMANDS`]: command ids are the guest's to
+/// choose, so the counts must not grow with them. A request for a command past the bound is
+/// counted in [`Server::uncounted_requests`] instead.
+pub const MAX_COUNTED_COMMANDS: usize = 4096;
 
 /// The pointer buffer size a server reports unless told otherwise: Eden's default
 /// (`eden/src/core/hle/kernel/k_process.h`, `m_pointer_buffer_size = 0x8000`).
@@ -299,6 +332,10 @@ pub struct Server {
     executor: Option<Arc<dyn Executor>>,
     stubbed: BTreeSet<StubbedCommand>,
     stub_record_full: bool,
+    /// Requests by command, each with the command's name ([`Server::requests`]); not saved.
+    requests: BTreeMap<CountedCommand, (Option<&'static str>, u64)>,
+    /// Requests for commands past [`MAX_COUNTED_COMMANDS`]; not saved.
+    uncounted: u64,
 }
 
 impl Server {
@@ -325,6 +362,8 @@ impl Server {
             executor: None,
             stubbed: BTreeSet::new(),
             stub_record_full: false,
+            requests: BTreeMap::new(),
+            uncounted: 0,
         }
     }
 
@@ -458,6 +497,44 @@ impl Server {
     /// list of what a title needs that nobody has implemented.
     pub fn stubbed(&self) -> impl Iterator<Item = &StubbedCommand> {
         self.stubbed.iter()
+    }
+
+    /// How many requests the server was sent for each command, in order of interface,
+    /// protocol and id: one for every request that has or will have a trace event
+    /// ([`trace`](super::trace)), counted when it is answered or deferred, so a deferred request
+    /// whose reply was never written is counted too. A close message and a message the server
+    /// fails on ([`ServerError`]) are not counted. At most [`MAX_COUNTED_COMMANDS`] commands are
+    /// listed; requests for further ones are [`Server::uncounted_requests`]. Like
+    /// [`Server::stubbed`], the counts are not part of a snapshot.
+    pub fn requests(&self) -> impl Iterator<Item = RequestCount> + '_ {
+        (self.requests.iter()).map(|(command, (name, count))| RequestCount {
+            command: *command,
+            name: *name,
+            count: *count,
+        })
+    }
+
+    /// How many requests were for commands past [`MAX_COUNTED_COMMANDS`], and so are not in
+    /// [`Server::requests`].
+    #[must_use]
+    pub fn uncounted_requests(&self) -> u64 {
+        self.uncounted
+    }
+
+    /// Counts one request ([`Server::requests`]).
+    fn count(&mut self, asked: Asked) {
+        let command = CountedCommand {
+            interface: asked.interface,
+            protocol: asked.protocol,
+            id: asked.command,
+        };
+        if let Some((_, count)) = self.requests.get_mut(&command) {
+            *count = count.saturating_add(1);
+        } else if self.requests.len() < MAX_COUNTED_COMMANDS {
+            self.requests.insert(command, (asked.name, 1));
+        } else {
+            self.uncounted = self.uncounted.saturating_add(1);
+        }
     }
 
     /// The family's state, as the family's own type, if the server has state of that type.
@@ -607,12 +684,14 @@ impl Server {
             return Ok(Handled::Closed);
         }
         let frame = Frame::of(&message, target);
-        let asked = Asked::of(&message);
+        // Before the request runs, which may close the object it names.
+        let asked = Asked::of(&message, &self.targets, target);
         let answered = match self.answer(kernel, session, target, frame, &message) {
             Ok(answered) => answered,
             Err(Refusal::Result(code)) => Answered::Now(frame.only(code)),
             Err(Refusal::Server(error)) => return Err(error),
         };
+        self.count(asked);
         match answered {
             Answered::Now(answer) => {
                 self.send(kernel, session, asked, &answer, false, buffer)?;
@@ -624,6 +703,7 @@ impl Server {
                     framing: frame.framing(),
                     command: asked.command,
                     request_size: asked.request_size,
+                    interface: asked.interface,
                 };
                 self.pending.insert(token, request);
                 Ok(Handled::Deferred(token))
@@ -733,8 +813,11 @@ impl Server {
             Posted::Dropped => frame.only(DEFERRED_REPLY_DROPPED),
         };
         let asked = Asked {
+            interface: pending.interface,
+            protocol: trace::deferred_protocol(pending.framing),
             command: pending.command,
             request_size: pending.request_size,
+            name: None,
         };
         self.send(kernel, session, asked, &answer, true, buffer)
     }
@@ -881,6 +964,7 @@ impl Server {
         };
         let token = cx.deferral.taken;
         let name = object.name();
+        let label = InterfaceName::lossy(object.trace_name());
         let command_name = row.map(|row| row.name);
         self.targets.check_in(interface, object)?;
         match (outcome, token) {
@@ -911,7 +995,7 @@ impl Server {
                 Err(fault.into())
             }
             (None, _) => Ok(Answered::Now(
-                self.unknown(name, protocol, command_id, frame),
+                self.unknown(label, protocol, command_id, frame),
             )),
         }
     }
@@ -919,7 +1003,7 @@ impl Server {
     /// The reply to a command the interface does not list.
     pub(super) fn unknown(
         &mut self,
-        interface: &'static str,
+        interface: InterfaceName,
         protocol: Protocol,
         id: u32,
         frame: Frame,
@@ -931,7 +1015,13 @@ impl Server {
         };
         match self.policy {
             UnknownPolicy::Strict => {
-                tracing::warn!(service = %self.name, ?command, "unknown command");
+                tracing::warn!(
+                    service = %self.name,
+                    interface = %command.interface,
+                    protocol = ?command.protocol,
+                    command = command.id,
+                    "unknown command"
+                );
                 frame.only(UNKNOWN_COMMAND_ID)
             }
             UnknownPolicy::AutoStub => {
@@ -965,7 +1055,9 @@ impl Server {
         }
         tracing::warn!(
             service = %self.name,
-            ?command,
+            interface = %command.interface,
+            protocol = ?command.protocol,
+            command = command.id,
             "unknown command auto-stubbed: replying success with a zeroed payload"
         );
         self.stubbed.insert(command);

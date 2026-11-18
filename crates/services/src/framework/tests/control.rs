@@ -3,6 +3,7 @@
 use starquake_ipc::{CommandType, RequestBuilder, SFCO_MAGIC};
 use starquake_kernel::id::ObjectId;
 use starquake_kernel::result::{KernelError, ResultCode};
+use starquake_trace::InterfaceName;
 
 use super::super::control::{
     CLONE_CURRENT_OBJECT, CLONE_CURRENT_OBJECT_EX, CONTROL_COMMANDS, CONTROL_INTERFACE,
@@ -272,7 +273,7 @@ fn the_listed_control_commands_are_answered_and_any_other_id_is_unknown() {
         assert_eq!(control_result(&mut rig, id), only(ResultCode::SUCCESS));
         let stubbed: Vec<_> = rig.server.stubbed().copied().collect();
         let command = StubbedCommand {
-            interface: CONTROL_INTERFACE,
+            interface: InterfaceName::new(CONTROL_INTERFACE).unwrap(),
             protocol: Protocol::Cmif,
             id,
         };

@@ -9,6 +9,7 @@ use starquake_ipc::{
     TIPC_COMMAND_OFFSET,
 };
 use starquake_kernel::result::ResultCode;
+use starquake_trace::InterfaceName;
 
 use super::super::result::UNKNOWN_COMMAND_ID;
 use super::super::targets::Domain;
@@ -39,7 +40,7 @@ fn tipc_room() -> usize {
 
 fn stub(interface: &'static str, protocol: Protocol, id: u32) -> StubbedCommand {
     StubbedCommand {
-        interface,
+        interface: InterfaceName::new(interface).unwrap(),
         protocol,
         id,
     }
@@ -121,7 +122,8 @@ fn an_interface_with_no_commands_answers_by_policy_alone() {
         } else {
             0
         };
-        assert_eq!(names, vec![Mute.name(); stubbed]);
+        let mute = InterfaceName::new(Mute.name()).unwrap();
+        assert_eq!(names, vec![mute; stubbed]);
     }
 }
 

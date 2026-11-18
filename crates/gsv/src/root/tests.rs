@@ -330,7 +330,7 @@ fn a_cmif_request_to_the_root_goes_to_the_policy() {
         let expected = match policy {
             UnknownPolicy::Strict => vec![],
             UnknownPolicy::AutoStub => vec![StubbedCommand {
-                interface: GsvRoot.name(),
+                interface: starquake_trace::InterfaceName::lossy(GsvRoot.name()),
                 protocol: Protocol::Cmif,
                 id: INITIALIZE,
             }],

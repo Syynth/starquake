@@ -136,6 +136,8 @@ fn ipc_event(command: u32) -> EventKind {
     EventKind::Ipc {
         session: starquake_trace::SessionId(1),
         service: FIRST,
+        interface: starquake_trace::InterfaceName::lossy("IScripted"),
+        protocol: starquake_trace::IpcProtocol::Cmif,
         command,
         request_size: 0,
         reply_size: 0,

@@ -53,6 +53,7 @@ use starquake_ipc::CmifRequest;
 use starquake_kernel::handle::Handle;
 use starquake_kernel::id::ObjectId;
 use starquake_kernel::result::ResultCode;
+use starquake_trace::InterfaceName;
 
 use super::commands::{Command, CommandTable, Protocol};
 use super::kernel::Kernel;
@@ -133,7 +134,12 @@ impl Server {
             QUERY_POINTER_BUFFER_SIZE => {
                 Ok(Frame::Cmif.with_payload(&self.pointer_buffer_size.to_le_bytes()))
             }
-            id => Ok(self.unknown(CONTROL_INTERFACE, Protocol::Cmif, id, Frame::Cmif)),
+            id => Ok(self.unknown(
+                InterfaceName::lossy(CONTROL_INTERFACE),
+                Protocol::Cmif,
+                id,
+                Frame::Cmif,
+            )),
         }
     }
 

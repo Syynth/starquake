@@ -89,7 +89,11 @@ impl InterfaceName {
         let mut kept = [0; INTERFACE_NAME_CAPACITY];
         let mut len = 0;
         for (slot, byte) in kept.iter_mut().zip(name.bytes()) {
-            *slot = if is_printable(byte) { byte } else { REPLACEMENT };
+            *slot = if is_printable(byte) {
+                byte
+            } else {
+                REPLACEMENT
+            };
             len += 1;
         }
         if len == 0 {

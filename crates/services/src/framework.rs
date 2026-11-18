@@ -240,8 +240,8 @@ pub use result::{
     OUT_OF_DOMAIN_ENTRIES, Outcome, TARGET_NOT_FOUND, UNKNOWN_COMMAND_ID,
 };
 pub use server::{
-    DEFAULT_POINTER_BUFFER_SIZE, Handled, MAX_STUBBED_COMMANDS, Server, ServerError,
-    StubbedCommand, UnknownPolicy,
+    CountedCommand, DEFAULT_POINTER_BUFFER_SIZE, Handled, MAX_COUNTED_COMMANDS,
+    MAX_STUBBED_COMMANDS, RequestCount, Server, ServerError, StubbedCommand, UnknownPolicy,
 };
 pub use snapshot::{Family, Interfaces, SNAPSHOT_MAGIC, SNAPSHOT_VERSION, SnapshotError};
 pub use targets::{MAX_DOMAIN_OBJECTS, TargetError};
