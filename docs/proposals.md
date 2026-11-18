@@ -260,7 +260,7 @@ Notes for #185 (command 216 is still to build) and #194 are comments on those is
 
 | Status | Proposal | Why | Suggested |
 |---|---|---|---|
-| awaiting the owner | **The auto-stub policy for a command whose reply carries an object or handle** | The title's unknown appletOE command 10 was answered success with no object. The title then read through a null pointer, a crash far from its cause. Refusing such commands, or stopping the run with a plain-words error naming the command, would point at the cause. The services spec's stub policy doesn't separate the two | services |
+| ruled 2026-11-17 (decision log: keep it, make failures diagnosable under #207) | **The auto-stub policy for a command whose reply carries an object or handle** | The title's unknown appletOE command 10 was answered success with no object. The title then read through a null pointer, a crash far from its cause. Refusing such commands, or stopping the run with a plain-words error naming the command, would point at the cause. The services spec's stub policy doesn't separate the two | services |
 | awaiting the owner | **Graphics-server verification item 1 gains the 211-over-a-live-mapping and 102-with-live-211-maps conflicts**, and **whether `GpuFront` needs an ordered map** | Scope review of #185 | gsv |
 | awaiting the owner | **How replay reconciles 201's reached-at-arm push with the `SyncpointObserved` notes fed back** | Scope review of #182 | gsv, observability |
 | awaiting the owner | **The result code for an unreadable data storage** (FS 5000 is a guess) | Scope review of #241 | services |
@@ -310,6 +310,26 @@ Notes for #189 (a bound channel holds its address space) and #207 (name the inte
 | proposed | **`IApplicationFunctions::InitializeGamePlayRecording` (66)** | Review of #258. libnx sends it before setting the recording state; no title has needed it yet | area:services |
 | proposed | **Back a `MapMemory` alias lazily** | Review of #257. core's `map_alias` backs the whole source up front; the execution model's backing pools should make it lazy | area:core |
 | proposed | **Share one copy of the RomFS tables between fsp-srv's environments** (behind an `Arc`) | Review of #251. Each of the three environments keeps its own copy | area:services |
+
+### From wave 26 (ledger: #22)
+
+Filed from this wave under the delegation:
+- #277: parental control. The title now gets past `ReceiveMessage`. It then asks for `pctl:a`, `pctl:s`, `pctl:r` and `pctl`, gets auto-stubs, and reads through the null object its `CreateServiceWithoutInitialize` "returned".
+- #278: `lm`, `ectx:aw` and `aoc:u`, which the title also asks for and nothing provides.
+
+#189's PR (#275) waits for its waiting-submission cap. The owner ruled on that cap and on its event ids on 2026-11-17 (decision log). #207 gains the auto-stub diagnostics the owner asked for the same day (a comment on #207).
+
+| Status | Proposal | Why | Suggested |
+|---|---|---|---|
+| awaiting the owner | **Whether a services family-state change bumps the run snapshot version**, and **a dedicated `SnapshotError` variant for family validation** | Scope review of wave 26 | observability |
+| awaiting the owner | **Whether `GpuFront::submit` hands the submission back on `Full`**, and **what happens to a deferred `SubmitGPFIFO` whose session closes** | Review of #189 | gpu-protocol, graphics-server |
+| awaiting the owner | **Recording `Submitted::Full`**: which submissions wait depends on host timing, which isn't recorded, so replay may differ | Review of #189 | observability, graphics-server |
+| proposed | **A framework call that closes a kernel event, and a serialisable `DeferredBuffer`** | Review of #189. Each closed channel fd leaves up to three events, and gpu 497 has the same leak. A restored deferred reply can't write its out buffer (nvhost-gpu, fsp-srv `Read`) | area:services |
+| proposed | **Generalise `Stop::Job` and `Stop::Replay`** so the framework stops importing fsp's `ReplayError`, and share one test `Unexpected` halt | Review of #270 | area:services |
+| proposed | **Extend the host-access gate and the `Env` scan** to `starquake_trace`'s `HostClock`, `SystemClock` and `HostIoHandler`, and to `crates/gsv` and `crates/core` | Review of #270: a scratch file passed both checks | area:xtask |
+| proposed | **`unlock_for_transfer_memory` gets Eden's page-group or permission check**, and #260 adds the alias-source versus transfer-memory cross-check | Review of #269. Called directly, it unlocks an alias source and leaves a stale alias record | area:kernel |
+| proposed | **am: the operation and performance-mode change message, `PushUnorderedMessage` sources, and a bound on the unordered and restored queues** | Review of #268 | area:services |
+| proposed | **A deterministic per-call cost test** (a counting allocator in its own test binary) in place of #268's wall-clock one | Review of #268; the wall-clock test has about 8x headroom | area:services |
 
 ## House-rule candidates
 
@@ -453,3 +473,12 @@ passed to build agents as a provisional rule for the next wave.
 | proposed | Restore tests accept the real state that live operations leave, not only the refusal cases. |
 | proposed | A doc claim of an error set, "logged once" or "same in replay" names the exact paths, with a test that fails if one is dropped. |
 | proposed | A restored id or mount the current run may not support is validated against the live run, or its answer is a listed divergence pinned by a test. |
+
+### From wave 26 (ledger: #22)
+
+| Status | Candidate |
+|---|---|
+| proposed | When docs call a text search or scan exact, list the call forms it can't see, and test each one, or widen the scan. |
+| proposed | Don't claim replay reproduces an outcome that depends on unrecorded host timing or state; name the unrecorded input in the docs. |
+| proposed | A departure from a decision-log rule or a spec is said so in the docs and PR body, with its reason, and raised as an owner question. |
+| proposed | A per-request handler never clones a container a client or snapshot can grow; a test shows per-call work doesn't grow with it. |
