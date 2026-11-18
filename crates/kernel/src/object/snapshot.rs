@@ -31,7 +31,7 @@
 //! occupied with its generation and row, or retired; the free stack; the slot limit; the live
 //! count), each row its object then its reference count; the handle tables (each its process,
 //! then the table's entries, free list, next linear id and high-water mark); the hooked events
-//! (each the writable end, then the service). An object is a tag ([`SavedObject`]'s variant
+//! (each the writable end, then the service). An object is a tag (`SavedObject`'s variant
 //! index) then its fields: a thread or process its id; a session nothing; an event's writable
 //! end its readable end; a readable end whether it is signalled; a shared memory the base and
 //! size of its pages and its user permission's bits; a transfer memory its owner, address,

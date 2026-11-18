@@ -1,6 +1,7 @@
 //! The dispatcher's side of the kernel object snapshot ([`crate::object::snapshot`]): saving the
 //! object table with the handle table, address space and hooked events it holds
-//! ([`Dispatcher::save_objects`]), and saying which hooks a restored snapshot names that no
+//! ([`Dispatcher::save_objects`]), checking a snapshot against the dispatcher's tables
+//! ([`Dispatcher::restore_objects`]), and saying which hooks a restored snapshot names that no
 //! service has re-attached yet ([`Dispatcher::unattached_event_hooks`]): the kernel half of the
 //! owner's ruling of 2026-11-17 ("Event hooks are re-attached by their owner after a restore").
 //!
@@ -11,7 +12,7 @@
 use super::Dispatcher;
 use crate::handle::HandleTable;
 use crate::id::ObjectId;
-use crate::object::{HookedEvent, Object, ObjectSnapshotError};
+use crate::object::{HookedEvent, Object, ObjectSnapshotError, Objects, RestoredObjects};
 use crate::tables::{AddressSpace, Scheduler};
 
 /// The hooked events among `events` (the dispatcher's hooked ids, in id order), each with the
@@ -55,6 +56,19 @@ impl Dispatcher {
             &tables.scheduler,
             &[(own, &tables.address_space)],
         )
+    }
+
+    /// The tables a kernel object snapshot holds ([`crate::object::Objects::restore`] and
+    /// [`crate::object::PendingObjects::finish`]), checked against this dispatcher's tables
+    /// under the lock: its scheduler as the [`crate::object::KernelView`], and its process's
+    /// address space for the lends. Nothing is installed: the scheduler and IPC tables have no
+    /// snapshot yet, so the restored tables can be put in place only beside the tables they
+    /// were saved with, and the hooks are left as they are.
+    pub fn restore_objects(&self, bytes: &[u8]) -> Result<RestoredObjects, ObjectSnapshotError> {
+        let locked = self.lock::<(&AddressSpace, &Scheduler)>();
+        let tables = &locked.state.tables;
+        let own = tables.processes.own();
+        Objects::restore(bytes, &tables.scheduler)?.finish(&[(own, &tables.address_space)])
     }
 
     /// Of `hooked`, the hooked events a restored snapshot names

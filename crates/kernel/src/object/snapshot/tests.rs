@@ -83,6 +83,31 @@ fn add_handle(tables: &mut Tables, object: ObjectId) -> Handle {
         .unwrap()
 }
 
+/// Two servers in `tables`, each with a hooked event whose writable end the guest has a
+/// handle to, and the first with a session the guest has a handle to: the hooked events'
+/// ends, the session and the guest's handle to it.
+fn servers(tables: &mut Tables) -> ([(ObjectId, ObjectId); 2], ObjectId, Handle) {
+    let mut hooks = Vec::new();
+    let mut session = None;
+    for (name, service) in [("first", SERVICE), ("second", OTHER_SERVICE)] {
+        let (objects, ipc) = tables.scheduler.ipc_mut();
+        let server = ipc.add_server(name, service).unwrap();
+        if session.is_none() {
+            session = Some(ipc.open_session(objects, server, true).unwrap());
+        }
+        let (writable, readable) = tables.scheduler.create_event().unwrap();
+        let (_, ipc) = tables.scheduler.ipc_mut();
+        ipc.add_server_event(server, writable).unwrap();
+        ipc.add_server_event(server, readable).unwrap();
+        add_handle(tables, writable);
+        hooks.push((writable, readable));
+    }
+    let session = session.unwrap();
+    let handle = add_handle(tables, session);
+    tables.scheduler.close_object(session).unwrap();
+    (hooks.try_into().unwrap(), session, handle)
+}
+
 /// The fixture's process, started, with: a second handle to its main thread and one to its
 /// process; a transfer memory over heap pages 1-2; an event the guest made, signalled, with a
 /// handle to each end; an event whose readable end is gone; two servers, each with a hooked
@@ -132,28 +157,7 @@ fn kernel() -> Kernel {
     add_handle(&mut tables, lone);
     tables.scheduler.close_object(lone).unwrap();
     tables.scheduler.close_object(gone).unwrap();
-    // The servers, their hooked events and the first's session.
-    let mut hooks = [(lone, lone); 2];
-    let mut session = None;
-    for (slot, (name, service)) in hooks
-        .iter_mut()
-        .zip([("first", SERVICE), ("second", OTHER_SERVICE)])
-    {
-        let (objects, ipc) = tables.scheduler.ipc_mut();
-        let server = ipc.add_server(name, service).unwrap();
-        if session.is_none() {
-            session = Some(ipc.open_session(objects, server, true).unwrap());
-        }
-        let (writable, readable) = tables.scheduler.create_event().unwrap();
-        let (_, ipc) = tables.scheduler.ipc_mut();
-        ipc.add_server_event(server, writable).unwrap();
-        ipc.add_server_event(server, readable).unwrap();
-        add_handle(&mut tables, writable);
-        *slot = (writable, readable);
-    }
-    let session = session.unwrap();
-    let session_handle = add_handle(&mut tables, session);
-    tables.scheduler.close_object(session).unwrap();
+    let (hooks, session, session_handle) = servers(&mut tables);
     // The shared memories, the first mapped.
     let mut shared = [lone; 2];
     for (slot, pages) in shared.iter_mut().zip([2, 1]) {
@@ -172,7 +176,7 @@ fn kernel() -> Kernel {
     }
     let first = match tables.scheduler.objects().get(shared[0]) {
         Ok(Object::SharedMemory(memory)) => memory,
-        other => panic!("{other:?}"),
+        other => unreachable!("{other:?}"),
     };
     tables
         .address_space
@@ -260,7 +264,7 @@ fn the_restored_tables_work_as_the_saved_ones_did() {
     let (writable, readable) = kernel.event;
     let signalled = |kernel: &Kernel| match kernel.objects().get(readable) {
         Ok(Object::ReadableEvent(state)) => state.is_signalled(),
-        other => panic!("{other:?}"),
+        other => unreachable!("{other:?}"),
     };
     assert!(signalled(&kernel));
     kernel.tables.scheduler.clear_object(writable).unwrap();
@@ -317,6 +321,11 @@ fn a_space_held_by_a_lend_and_handles_of_every_kind_round_trip_with_a_second_pro
     assert_eq!(&restored.objects, kernel.objects());
 }
 
+/// Both processes' handle tables, in process order.
+type Handles<'a> = [(ProcessId, &'a HandleTable); 2];
+/// Both processes' address spaces, in process order.
+type Spaces<'a> = [(ProcessId, &'a AddressSpace); 2];
+
 /// A second process beside the kernel's own, with a handle table holding a handle to its own
 /// transfer memory over heap pages 0-1 of its own address space.
 struct Second {
@@ -327,13 +336,7 @@ struct Second {
 }
 
 impl Second {
-    fn tables<'a>(
-        &'a self,
-        kernel: &'a Kernel,
-    ) -> (
-        [(ProcessId, &'a HandleTable); 2],
-        [(ProcessId, &'a AddressSpace); 2],
-    ) {
+    fn tables<'a>(&'a self, kernel: &'a Kernel) -> (Handles<'a>, Spaces<'a>) {
         let own = kernel.own();
         (
             [(own, &kernel.tables.handles), (self.process, &self.handles)],
@@ -823,7 +826,7 @@ fn a_shared_memory_has_pages_and_a_shared_memory_permission() {
     let object = kernel.shared[1];
     let (base, size) = match kernel.objects().get(object) {
         Ok(Object::SharedMemory(memory)) => (memory.backing().base(), memory.size()),
-        other => panic!("{other:?}"),
+        other => unreachable!("{other:?}"),
     };
     let saved = |base: u64, size: u64, permission: u8| SavedObject::SharedMemory {
         base,
@@ -868,7 +871,7 @@ fn shared_memories_share_no_page() {
     let [first, second] = kernel.shared;
     let (base, size) = match kernel.objects().get(first) {
         Ok(Object::SharedMemory(memory)) => (memory.backing().base(), memory.size()),
-        other => panic!("{other:?}"),
+        other => unreachable!("{other:?}"),
     };
     assert!(first < second);
     let saved = |base: u64| SavedObject::SharedMemory {
@@ -1148,12 +1151,10 @@ fn each_space_is_checked_against_the_lends_of_its_own_process() {
 // ----- The order of the checks ---------------------------------------------------------------
 
 #[test]
-fn the_checks_come_in_their_documented_order() {
+fn the_handle_tables_come_before_the_objects() {
     let kernel = kernel();
     let own = kernel.own();
-    let (writable, readable) = kernel.event;
-    let (handle, session) = kernel.session;
-    let (_, transfer) = kernel.transfer;
+    let (writable, _) = kernel.event;
     // Handle tables (check 2) before objects (check 3): a damaged layout and an object with no
     // references.
     let mut case = Case::new(&kernel);
@@ -1180,6 +1181,14 @@ fn the_checks_come_in_their_documented_order() {
         case.error(),
         ObjectSnapshotError::HandleOrder { process: unknown }
     );
+}
+
+#[test]
+fn the_objects_are_checked_in_slot_order_and_each_check_in_its_order() {
+    let kernel = kernel();
+    let own = kernel.own();
+    let (writable, readable) = kernel.event;
+    let (_, transfer) = kernel.transfer;
     // The first faulty object in slot order, either way round.
     for (low, high) in [(writable, readable), (readable, writable)] {
         let mut case = Case::new(&kernel);
@@ -1206,7 +1215,7 @@ fn the_checks_come_in_their_documented_order() {
     let mut case = Case::new(&kernel);
     let base = match kernel.objects().get(first_shared) {
         Ok(Object::SharedMemory(memory)) => memory.backing().base(),
-        other => panic!("{other:?}"),
+        other => unreachable!("{other:?}"),
     };
     case.row(second_shared).object = SavedObject::SharedMemory {
         base,
@@ -1233,6 +1242,14 @@ fn the_checks_come_in_their_documented_order() {
         };
         assert_eq!(case.error(), object_error(transfer, fault));
     }
+}
+
+#[test]
+fn the_objects_come_before_the_handles_and_the_handles_before_the_hooks() {
+    let kernel = kernel();
+    let own = kernel.own();
+    let (_, readable) = kernel.event;
+    let (handle, session) = kernel.session;
     // Objects (check 3) before handles (check 4): a stale handle and a faulty object.
     let mut case = Case::new(&kernel);
     case.body.objects.remove(session).unwrap();
@@ -1276,6 +1293,12 @@ fn the_checks_come_in_their_documented_order() {
             fault: HandleFault::Stale
         }
     );
+}
+
+#[test]
+fn the_hooks_are_checked_in_order_and_each_check_in_its_order() {
+    let kernel = kernel();
+    let (writable, _) = kernel.event;
     // Within a hook: the order before the event, the event before the service, the service
     // before who made it.
     let [(first, first_readable), (second, _)] = kernel.hooks;
