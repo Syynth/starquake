@@ -82,10 +82,10 @@
 //!   keeps its first events and the guest log its first lines, and both say when they stopped.
 //!   The observability spec's size cap per run, with its own flags, replaces the constants.
 //! - **Deferred replies.** A run's services are installed by a function the run is given
-//!   ([`Install`]; a real run's is [`crate::hle::install`]), which may keep a [`Ready`] to say
-//!   when a server's deferred replies are ready; the timer thread then delivers them
-//!   ([`Dispatcher::deliver_replies`]), or, when a core has the server's handler out, that core
-//!   does when it puts the handler back. In a real run `fsp-srv`'s reads defer: they run on
+//!   ([`Install`]; a real run's calls [`crate::hle::install_with_guest_log`]), which may keep a
+//!   [`Ready`] to say when a server's deferred replies are ready; the timer thread then
+//!   delivers them ([`Dispatcher::deliver_replies`]), or, when a core has the server's handler
+//!   out, that core does when it puts the handler back. In a real run `fsp-srv`'s reads defer: they run on
 //!   `fsp-srv`'s workers (`starquake_services::fsp::worker`), whose finished jobs tell the
 //!   [`Ready`] through the server's notification ([`crate::hle`], "Reads"). The workers belong
 //!   to the `fsp-srv` server, which the dispatcher owns, so they stop, and their threads end,
@@ -300,8 +300,9 @@ pub(crate) struct Given {
 /// A failure ends the run before the guest runs, with the message given.
 pub(crate) type Install = dyn Fn(&Dispatcher, Given) -> Result<(), String> + Sync;
 
-/// The services of a real run ([`crate::hle::install`]), with `fsp-srv`'s reads on its workers,
-/// which keep no record (module docs, "The environment").
+/// The services of a real run ([`crate::hle::install_with_guest_log`], given the run's guest log
+/// through [`Given::guest_log`]), with `fsp-srv`'s reads on its workers, which keep no record
+/// (module docs, "The environment").
 fn real_services(dispatcher: &Dispatcher, given: Given) -> Result<(), String> {
     let workers =
         reads_workers(&given.reads, Arc::clone(&given.halt)).map_err(|error| error.to_string())?;
@@ -495,10 +496,13 @@ impl<C: HostClock + Clone> DebugSink for LogSink<'_, C> {
 }
 
 /// The services' way into the guest log: `lm`'s loggers keep each finished message's text as a
-/// line, in the same log and under the same limit as [`LogSink`]'s, so the two kinds of line
-/// keep the order the guest wrote them in. No guest-log event is recorded for these lines
-/// (`starquake_services::lm`, "Where the messages go"). It is called with the kernel's lock
-/// held, as [`LogSink`] is, and takes the log's lock after it.
+/// line, in the same log and under the same limit as [`LogSink`]'s. On one guest thread the two
+/// kinds of line keep the order that thread wrote them in; across cores they are in the order
+/// they reach the log's lock, not the order of the kernel's events. No guest-log event is
+/// recorded for these lines, a departure from the observability spec that is an open owner
+/// question (`starquake_services::lm`, "Where the messages go"). It is called from `lm`'s
+/// handler, which runs without the kernel's lock (unlike [`LogSink`], which runs under it), and
+/// takes only the log's lock.
 struct ServicesLog(Arc<Mutex<GuestLog>>);
 
 impl lm::GuestLog for ServicesLog {

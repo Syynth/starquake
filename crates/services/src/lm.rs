@@ -27,8 +27,11 @@
 //! `Log` hands its packet to the logger's [`Pending`] messages ([`packet`]); when a tail packet
 //! finishes a message, its text chunk ([`LogRecord::text`]) is one line of the run's guest log,
 //! through the [`GuestLog`] the server was given ([`server`]). In a run that is the guest log
-//! `OutputDebugString` writes to, under the same limit (`guest_log.txt`), so the two kinds of
-//! line are in the order the guest wrote them. A message with no text chunk adds no line. Eden
+//! `OutputDebugString` writes to, under the same limit (`guest_log.txt`). On one guest thread
+//! the two kinds of line are in the order that thread wrote them. Across threads on different
+//! cores they are in the order they reach the guest log's own lock, which need not be the
+//! order of the kernel's events for the requests and system calls that wrote them. A message
+//! with no text chunk adds no line. Eden
 //! instead prints every chunk it knows, with the process and thread ids, to its own debug log
 //! (`ParseLog`, `LOG_DEBUG`); that is the emulator's log, not the guest's output, so the other
 //! chunks are read and checked here but not written anywhere.
@@ -36,6 +39,14 @@
 //! A line is not a guest-log event in the trace, unlike an `OutputDebugString` line: the `Log`
 //! request is already one IPC event there, and the service has no core or thread to stamp a
 //! second event with. So a replay compares that a `Log` request was made, not its text.
+//!
+//! **Owner question: this departs from the observability spec.** The spec's golden trace holds
+//! the guest's log lines, and `docs/architecture.md` says each line of `guest_log.txt` has a
+//! `GuestLog` event (its length and hash). `lm`'s lines are in `guest_log.txt` with no such
+//! event, so that promise no longer holds for them. The reason above is this port's, not an
+//! approved design: the owner has to decide whether `lm`'s lines get `GuestLog` events (which
+//! needs a way to stamp an event from a service handler), go to a file of their own, or stay
+//! as they are with the spec and the architecture document changed to say so.
 //!
 //! The destination `SetDestination` sets is kept ([`ILogger::destination`]) and changes
 //! nothing, as in Eden, where it only names the destination in the debug log. A new logger's is
@@ -65,9 +76,12 @@
 //!
 //! # Locks
 //!
-//! [`GuestLog::line`] is called while `Log`'s handler runs: in a run, on the guest thread that
-//! sent the request, with the kernel's lock held, as `OutputDebugString`'s sink is. It must not
-//! call into the kernel or a service.
+//! [`GuestLog::line`] is called while `Log`'s handler runs: in a run, on the core that runs the
+//! request, **without** the kernel's lock, as every service handler runs (the kernel's
+//! `dispatch/ipc.rs` module docs, step 2, and `docs/specs/services.md`, "How a request flows",
+//! step 2). `OutputDebugString`'s sink, by contrast, is called under the kernel's lock. The
+//! run's implementation takes only the guest log's own lock. It must not call into the kernel
+//! or a service.
 
 pub mod packet;
 
