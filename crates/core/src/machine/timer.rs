@@ -59,7 +59,8 @@
 //!
 //! A listener starts the vsync clock with its deadline one interval (16,666,666 ns) out, more
 //! than [`PREEMPTION_INTERVAL_NS`], so a sleep that began before the start ends before the
-//! deadline and the next one is bounded by it; no ring is needed for a start. A tick made by
+//! deadline and the next one is bounded by it; no ring is needed for a start
+//! (`a_waiting_vsync_clock_reads_nothing_and_a_due_one_ticks` checks the two intervals). A tick made by
 //! this thread reaches a waiting guest
 //! (`the_timer_thread_ticks_the_vsync_clock_and_wakes_a_listener_s_waiter`).
 

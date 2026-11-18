@@ -103,7 +103,7 @@
 //! | Case | PR | NX2 | Here |
 //! |---|---|---|---|
 //! | The interval | 16,667,000 ns | 16,666,666 ns | **conflict**, NX2's (above; `the_interval_and_the_note_code_are_the_references_values`) |
-//! | A tick a turn meets late | every missed tick, each in turn (Eden's `CoreTiming::Advance` fires a looping event again while its time is still behind) | one, and lost time is not banked (`PaceToVblank`) | NX2's, as the spec says (`a_late_tick_does_not_double_up`) |
+//! | A tick a turn meets late | every missed tick, each in turn (`StartGroupTick` schedules a looping event, and PR's `CoreTiming::Advance`, `eden-pr4588/src/core/core_timing.cpp` @ e5fb3b97, fires one again while its next time, its last plus the interval, is still behind) | one, and lost time is not banked (`PaceToVblank`) | NX2's, as the spec says (`a_late_tick_does_not_double_up`) |
 //! | How many clocks | one per vi2 session (`m_group_tick`) | one per vi2 session (`m_vsync_timer`) | one for the graphics server: every listener ticks together (`a_tick_records_its_number_then_signals_every_listener_in_event_order`) |
 //! | When it stops | when the session is destroyed | when the session is destroyed | when the last listener leaves, the next start taking a new phase (`the_last_listener_leaving_stops_the_clock_and_the_next_restarts_it`) |
 //! | Speed limit | none | `PaceToVblank` paces nothing when the speed limit is off, and scales the interval with it | none: always [`INTERVAL_NS`] (there is no speed-limit setting) |

@@ -48,6 +48,9 @@ fn a_waiting_vsync_clock_reads_nothing_and_a_due_one_ticks() {
         assert!(!machine.graphics.is_idle());
         let deadline = machine.graphics.deadline().unwrap();
         assert_eq!(deadline, HostNanos(start.0 + INTERVAL_NS));
+        // The timer thread needs no ring for a start (`machine/timer.rs`): the first deadline is
+        // further out than the longest sleep that can have begun before it.
+        const { assert!(INTERVAL_NS > PREEMPTION_INTERVAL_NS) };
 
         let before = reading().0;
         assert!(timer::graphics(machine).is_ok());
