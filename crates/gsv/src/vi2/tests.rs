@@ -1281,7 +1281,20 @@ fn register_client_checks_its_bits() {
         );
     }
     rig.ok(&register_client(1, last, 0));
-    assert_eq!(rig.session_state().clients()[0].bits(), (1 << last) | 1);
+    let registered = rig.session_state().clients()[0];
+    assert_eq!(registered.bits(), (1 << last) | 1);
+    // A fresh client: its fields as 201 read them, every slot free, no display, layer or levels.
+    assert_eq!(
+        (
+            registered.token(),
+            registered.retire(),
+            registered.available_bit()
+        ),
+        (1, last, 0)
+    );
+    assert_eq!(registered.available(), ALL_SLOTS);
+    assert!(!registered.is_bound());
+    assert_eq!((registered.layer(), registered.levels()), (None, None));
     for words in [
         register_client(1, 2, 3),
         register_client(2, 3, last),
