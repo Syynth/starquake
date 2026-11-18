@@ -1,7 +1,8 @@
 //! The dispatcher's synchronisation arms (`SignalEvent`, `ClearEvent`, `ResetSignal`,
 //! `WaitSynchronization`, `CancelSynchronization`, `CreateEvent`), and the two ways a wait ends
 //! outside a system call: [`Dispatcher::signal_event`] for a host thread (a service's vsync or
-//! input thread) and [`Dispatcher::fire_timers`] for the timer thread.
+//! input thread) and [`Dispatcher::fire_timers`] for the timer thread. A host thread's own events
+//! (a service's notes) are recorded under the kernel lock by [`Dispatcher::record_host_event`].
 //!
 //! A `SignalEvent` that succeeds on an event a service hooked runs the hook once the dispatch
 //! is over and the kernel lock released (`crate::ipc::hook`, `dispatch/hooks.rs`).
@@ -31,7 +32,7 @@
 //! releases it; `SendSyncRequest` and [`Dispatcher::deliver_replies`] drain it when they end.
 //! The event is the waiter's own `WaitSynchronization` event, stamped with its thread and core.
 
-use starquake_trace::{EnvError, EventKind, GuestTicks, HostNanos, Recorder};
+use starquake_trace::{EnvError, EventKind, GuestTicks, HostNanos, Recorder, ThreadId};
 
 use super::{
     Answer, Call, Dispatcher, Outcome, State, Woken, answering, calling_core, recorded_args,
@@ -232,6 +233,27 @@ impl Dispatcher {
         let signalled = scheduler.signal_object(event);
         drain_wakes(&mut locked.state, recorder, now.guest);
         Ok(signalled?)
+    }
+
+    /// Records `kind`, an event a host thread outside any system call makes (a service's note,
+    /// written by the timer thread as it drains the service's completions), on `core` and
+    /// `thread` as the caller names them. It takes the kernel lock, reads the environment's
+    /// clock once under it, and records with that reading converted at the process's counter
+    /// rate before it releases the lock, so the event's time and its place in the stream agree
+    /// with every system call's. A failing clock records nothing.
+    pub fn record_host_event(
+        &self,
+        core: u8,
+        thread: ThreadId,
+        kind: EventKind,
+        env: &dyn starquake_trace::Env,
+        recorder: &Recorder,
+    ) -> Result<(), EnvError> {
+        let mut locked = self.lock::<()>();
+        let now = locked.guest_time(env)?;
+        recorder.record(now, core, thread, kind);
+        drop(locked);
+        Ok(())
     }
 
     /// Expires every timeout due at the environment's clock reading, read once under the lock,

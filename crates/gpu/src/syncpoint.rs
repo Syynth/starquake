@@ -22,7 +22,9 @@
 //! gsv allocates and frees ids, raises maxima to compute fences ([`Syncpoints::increment_max`]),
 //! and marks the ids someone waits on ([`Syncpoints::watch`]). The GPU's back thread (after host
 //! completion) and gsv's video worker call [`Syncpoints::increment`], which pushes
-//! [`GpuCompletion::SyncpointChanged`] to gsv's [`Completions`] only for a watched id. Anyone
+//! [`GpuCompletion::SyncpointChanged`] to gsv's [`Completions`] only for a watched id;
+//! [`Syncpoints::increment_by`] does several at once with one push (the null GPU front of a run
+//! with no GPU back end, `starquake-core`'s graphics wiring, and its replay). Anyone
 //! reads ([`Syncpoints::read`], [`Syncpoints::reached`]).
 //!
 //! Watching and incrementing race. Both sides use sequentially consistent operations in the
@@ -381,9 +383,24 @@ impl Syncpoints {
     /// pushes [`GpuCompletion::SyncpointChanged`] with that value; otherwise the cost beyond
     /// the add is one load.
     pub fn increment(&self, id: SyncpointId) -> u32 {
-        let value = self.counters[usize::from(id.get())]
-            .fetch_add(1, Ordering::SeqCst)
-            .wrapping_add(1);
+        self.increment_by(id, 1)
+    }
+
+    /// Adds `amount` to counter `id` at once, wrapping, and returns the new value: `amount`
+    /// increments with one push, the one the last of them would make. If `id` is watched,
+    /// pushes [`GpuCompletion::SyncpointChanged`] with the new value; an `amount` of 0 changes
+    /// nothing and pushes nothing. For an incrementer that finishes several increments at one
+    /// moment (a GPU with no host work behind them), so that the work does not grow with the
+    /// count; the same order of the add and the watched check as [`Syncpoints::increment`]
+    /// (module docs, "Who calls what").
+    pub fn increment_by(&self, id: SyncpointId, amount: u32) -> u32 {
+        let counter = &self.counters[usize::from(id.get())];
+        if amount == 0 {
+            return counter.load(Ordering::SeqCst);
+        }
+        let value = counter
+            .fetch_add(amount, Ordering::SeqCst)
+            .wrapping_add(amount);
         if self.is_watched(id) {
             self.completions
                 .push(GpuCompletion::SyncpointChanged { id, value });

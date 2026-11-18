@@ -481,6 +481,50 @@ fn increment_pushes_only_when_watched() {
     assert_eq!(recorder.taken(), []);
 }
 
+/// `increment_by` adds its amount at once, wrapping, and pushes one change with the new value
+/// only when the id is watched; an amount of 0 changes nothing and pushes nothing, watched or
+/// not. The neighbour of the id is untouched.
+#[test]
+fn increment_by_adds_at_once_and_pushes_once_when_watched() {
+    let (syncpoints, recorder) = fresh();
+    let sp = id(64);
+    // Unwatched: added, nothing pushed.
+    assert_eq!(syncpoints.increment_by(sp, 3), 3);
+    assert_eq!(recorder.taken(), []);
+    // Watched: one push with the new value, however many increments it stands for.
+    syncpoints.watch(sp);
+    assert_eq!(syncpoints.increment_by(sp, 0x10), 0x13);
+    assert_eq!(
+        recorder.taken(),
+        [GpuCompletion::SyncpointChanged {
+            id: sp,
+            value: 0x13
+        }]
+    );
+    // Zero: nothing changes and nothing is pushed, watched as it is.
+    assert_eq!(syncpoints.increment_by(sp, 0), 0x13);
+    assert_eq!(syncpoints.read(sp), 0x13);
+    assert_eq!(recorder.taken(), []);
+    // One is `increment`.
+    assert_eq!(syncpoints.increment_by(sp, 1), 0x14);
+    assert_eq!(
+        recorder.taken(),
+        [GpuCompletion::SyncpointChanged {
+            id: sp,
+            value: 0x14
+        }]
+    );
+    // It wraps.
+    set_counter(&syncpoints, sp, u32::MAX - 1);
+    assert_eq!(syncpoints.increment_by(sp, 3), 1);
+    assert_eq!(
+        recorder.taken(),
+        [GpuCompletion::SyncpointChanged { id: sp, value: 1 }]
+    );
+    assert_eq!(syncpoints.read(id(63)), 0);
+    assert_eq!(syncpoints.read(id(65)), 0);
+}
+
 #[test]
 fn watching_twice_keeps_the_id_watched() {
     let (syncpoints, recorder) = fresh();

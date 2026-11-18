@@ -1049,3 +1049,17 @@ fn one_lock_and_two_saved_releases_of_it_are_refused_at_the_second() {
         }
     );
 }
+
+/// `is_empty` says whether anything is queued: false after one push of each kind, true again
+/// once everything is taken, and true for a fresh queue.
+#[test]
+fn is_empty_says_whether_anything_is_queued() {
+    let queue = CompletionQueue::new();
+    assert!(queue.is_empty());
+    for completion in [changed(3, 1), ordered(4), room(5), signalled(6)] {
+        queue.push(completion);
+        assert!(!queue.is_empty(), "{completion:?}");
+        assert_eq!(queue.take_all(), [completion]);
+        assert!(queue.is_empty());
+    }
+}
