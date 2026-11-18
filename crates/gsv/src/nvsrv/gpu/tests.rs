@@ -2167,22 +2167,6 @@ fn refused_tables() -> Vec<(Vec<u8>, SnapshotError)> {
         wait: Some((count, 9)),
         ..entry(0x30, 1)
     };
-    let below_cap = SavedSubmit {
-        entries: vec![1; MAX_WAITING_ENTRIES - 1],
-        ..entry(0x30, 1)
-    };
-    let at_cap = SavedSubmit {
-        entries: vec![1; MAX_WAITING_ENTRIES],
-        ..entry(0x30, 1)
-    };
-    let two = SavedSubmit {
-        entries: vec![1, 2],
-        ..entry(0x30, 3)
-    };
-    let empty = SavedSubmit {
-        entries: Vec::new(),
-        ..tokenless(0x30)
-    };
     vec![
         (bad_magic, SnapshotError::BadMagic),
         (version, SnapshotError::UnsupportedVersion { found: 2 }),
@@ -2203,22 +2187,6 @@ fn refused_tables() -> Vec<(Vec<u8>, SnapshotError)> {
             SnapshotError::TooManyEntries {
                 index: 1,
                 count: CHANNEL_QUEUE_ENTRIES + 1,
-            },
-        ),
-        // A channel's waiting entries one past the cap, with entries and with none (charged
-        // one).
-        (
-            snapshot_of(&[below_cap.clone(), two.clone()]),
-            SnapshotError::OverCap {
-                index: 1,
-                channel: 0x30,
-            },
-        ),
-        (
-            snapshot_of(&[at_cap.clone(), empty]),
-            SnapshotError::OverCap {
-                index: 1,
-                channel: 0x30,
             },
         ),
         (
@@ -2254,6 +2222,60 @@ fn refused_tables() -> Vec<(Vec<u8>, SnapshotError)> {
             snapshot_of(&[entry(0x31, 3), entry(0x30, 3)]),
             SnapshotError::DuplicateToken { index: 1, token: 3 },
         ),
+        (
+            snapshot_of(&[entry(0x31, 2), entry(0x30, 5)]),
+            SnapshotError::Misordered { index: 1 },
+        ),
+        // An entry without a token: its channel is still ordered, and it does not reset the
+        // last token id of its channel.
+        (
+            snapshot_of(&[entry(0x31, 2), tokenless(0x30)]),
+            SnapshotError::Misordered { index: 1 },
+        ),
+        (
+            snapshot_of(&[entry(0x30, 3), tokenless(0x30), entry(0x30, 1)]),
+            SnapshotError::Misordered { index: 2 },
+        ),
+    ]
+}
+
+/// Each snapshot `Submits::restore` refuses for the cap on a channel's waiting entries
+/// while requests 1, 2 and 3 are pending, and its error, first fault first.
+fn refused_by_the_cap() -> Vec<(Vec<u8>, SnapshotError)> {
+    let entry = waiting_entry;
+    let below_cap = SavedSubmit {
+        entries: vec![1; MAX_WAITING_ENTRIES - 1],
+        ..entry(0x30, 1)
+    };
+    let at_cap = SavedSubmit {
+        entries: vec![1; MAX_WAITING_ENTRIES],
+        ..entry(0x30, 1)
+    };
+    let two = SavedSubmit {
+        entries: vec![1, 2],
+        ..entry(0x30, 3)
+    };
+    let empty = SavedSubmit {
+        entries: Vec::new(),
+        ..tokenless(0x30)
+    };
+    vec![
+        // A channel's waiting entries one past the cap, with entries and with none (charged
+        // one).
+        (
+            snapshot_of(&[below_cap.clone(), two.clone()]),
+            SnapshotError::OverCap {
+                index: 1,
+                channel: 0x30,
+            },
+        ),
+        (
+            snapshot_of(&[at_cap.clone(), empty]),
+            SnapshotError::OverCap {
+                index: 1,
+                channel: 0x30,
+            },
+        ),
         // The count before the cap, the cap before the duplicate.
         (
             snapshot_of(&[
@@ -2275,20 +2297,6 @@ fn refused_tables() -> Vec<(Vec<u8>, SnapshotError)> {
                 channel: 0x30,
             },
         ),
-        (
-            snapshot_of(&[entry(0x31, 2), entry(0x30, 5)]),
-            SnapshotError::Misordered { index: 1 },
-        ),
-        // An entry without a token: its channel is still ordered, and it does not reset the
-        // last token id of its channel.
-        (
-            snapshot_of(&[entry(0x31, 2), tokenless(0x30)]),
-            SnapshotError::Misordered { index: 1 },
-        ),
-        (
-            snapshot_of(&[entry(0x30, 3), tokenless(0x30), entry(0x30, 1)]),
-            SnapshotError::Misordered { index: 2 },
-        ),
     ]
 }
 
@@ -2306,7 +2314,7 @@ fn tokenless(channel: u32) -> SavedSubmit {
 fn a_waiting_table_no_run_reaches_is_refused() {
     let (mut live, _, _) = three_waiting();
     let front = channel_front(&live.fake);
-    for (bytes, error) in refused_tables() {
+    for (bytes, error) in refused_tables().into_iter().chain(refused_by_the_cap()) {
         assert_eq!(
             Submits::restore(&bytes, &live.rig.server, &front).err(),
             Some(error.clone()),
@@ -2748,7 +2756,7 @@ fn the_checks_before_the_cap_answer_first() {
     input.extend(entry_bytes(&entries_from(1, 1)));
     let (answer, _) = bench.call(IoctlVariant::Ioctl, fd, submit_number(1), &input, &[]);
     assert_eq!(answer.result, NvResult::InvalidSize);
-    let no_syncpoint = u32::try_from(SYNCPOINT_COUNT).unwrap();
+    let no_syncpoint = SYNCPOINT_COUNT;
     let faults = [
         (FENCE_WAIT | INCREMENT_VALUE, (0, 0)),
         (FENCE_INCREMENT | INCREMENT_VALUE, (0, u32::MAX)),
@@ -2796,12 +2804,12 @@ fn a_push_past_the_cap_is_refused() {
     };
     // Two entries pass the cap by one: refused, and the reissued token answers `Busy`.
     let token = live.rig.server.reissue(pending);
-    let refused = live
-        .rig
-        .shared
-        .lock()
-        .submits()
-        .push(channel, token, submission(2), Arc::clone(&front));
+    let refused =
+        live.rig
+            .shared
+            .lock()
+            .submits()
+            .push(channel, token, submission(2), Arc::clone(&front));
     let over = OverCap {
         channel: channel.0,
         waiting: MAX_WAITING_ENTRIES - 1,
@@ -2812,13 +2820,13 @@ fn a_push_past_the_cap_is_refused() {
     assert_eq!(live.waiting(channel), 1);
     assert_eq!(live.waiting_entries(channel), MAX_WAITING_ENTRIES - 1);
     // One entry reaches it: taken.
-    let taken = live
-        .rig
-        .shared
-        .lock()
-        .submits()
-        .push(channel, None, submission(1), Arc::clone(&front));
-    assert_eq!(taken, Ok(()));
+    let accepted =
+        live.rig
+            .shared
+            .lock()
+            .submits()
+            .push(channel, None, submission(1), Arc::clone(&front));
+    assert_eq!(accepted, Ok(()));
     assert_eq!(live.waiting_entries(channel), MAX_WAITING_ENTRIES);
     // At the cap, a submission with no entries is refused too, without a token.
     let refused = live

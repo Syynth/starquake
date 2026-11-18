@@ -134,7 +134,8 @@
 //!
 //! Each is picked by the house rule of decision 8 ("where one answer contains the other, the
 //! larger"), except the event ids, and pinned by the test named, in `gpu/tests.rs`. The spec's
-//! verification item 1 does not list them yet; the open question with each settles it.
+//! verification item 1 lists the event ids; it does not list the other three yet. The open
+//! question with each settles it.
 //!
 //! - **The class `AllocObjCtx` gives back.** NX2 gives back the Maxwell class it mapped onto
 //!   (`params.class_num = mapped`); PR gives back the class as sent. NX2's is used, the one a
