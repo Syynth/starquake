@@ -614,7 +614,6 @@ passed to build agents as a provisional rule for the next wave.
 - A test a doc names as pinning a behaviour exercises that exact path, and its comments describe what it sends.
 - A constant taken from one reference while related bounds come from the other has its dependent bounds derived from it, or the coupling is flagged as an owner question.
 
-
 ### From wave 32 (ledger: #22)
 
 - Every documented check or error order gets a test with both faults present at once, mutation-checked by swapping the order.
