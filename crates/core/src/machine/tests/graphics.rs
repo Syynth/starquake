@@ -5,6 +5,12 @@
 //! the core loop must not take the run for stalled while the queue holds the job's completion
 //! (`crate::hle::graphics`, "Telling a stalled run").
 //!
+//! A second scripted guest binds the shared syncpoint page with 204 and asks it, again and
+//! again, about a counter that does not move, so each request is held to the page's bound and
+//! only the timer thread's turn at that bound answers it, well before the next preemption. On a
+//! machine whose cores never step, a completion queued for the graphics server rings the timer
+//! thread, and the turn reads the environment only when the graphics server is not idle.
+//!
 //! Requests are laid out by hand: libnx's for `sm:` and `appletOE` (`libnx/nx/source/services/
 //! sm.c`, `applet.c` @ b156b477), and the TIPC header words PR compares for gsv's root and gpu
 //! sessions (`eden-pr4588/src/core/hle/service/am/service/graphics_supervisor.cpp` and
@@ -12,15 +18,24 @@
 
 use std::cell::RefCell;
 
+use starquake_gpu::interface::ChannelId;
 use starquake_gsv::gpu::command as gpu_command;
+use starquake_gsv::note::Note;
 use starquake_gsv::protocol::command as root_command;
+use starquake_gsv::shared::page::{
+    ANSWER_BOUND, GROUP_REQUEST_OFFSET, READ_ONLY_SIZE, SLOT_REQUEST_OFFSET, WRITABLE_SIZE,
+};
 use starquake_ipc::{
     BUFFER_SIZE, Body, CommandType, Message, RequestBuilder, RequestLayout, SessionKind,
     TIPC_COMMAND_OFFSET,
 };
+use starquake_kernel::memory::SvcPermission;
+use starquake_kernel::sched::PREEMPTION_INTERVAL_NS;
 use starquake_services::am;
 use starquake_services::framework::control::CONVERT_CURRENT_OBJECT_TO_DOMAIN;
 use starquake_services::sm::{self, MAX_NAME_LEN, ServiceName};
+use starquake_testkit::a64;
+use starquake_testkit::nro::NroBuilder;
 
 use super::reads::WithTls;
 use super::*;
@@ -50,6 +65,15 @@ struct Vars {
     space: u32,
     /// Set by the last step: the wait ended with success.
     waited: Option<u64>,
+    /// The shared page's guest: its two transfer memories, and 204's request and answer events.
+    writable: u32,
+    read_only: u32,
+    request: u32,
+    answer: u32,
+    /// When the page guest's last request was signalled.
+    asked: Option<Instant>,
+    /// Each of the page guest's waits for an answer: its result and how long from the signal.
+    answers: Vec<(u64, Duration)>,
 }
 
 /// The scripted guest's view of its thread-local page and its variables.
@@ -160,20 +184,13 @@ fn step(
     }
 }
 
-/// The scripted guest (module docs), ending with `ExitProcess`.
-#[expect(
-    clippy::too_many_lines,
-    reason = "one step per request of the conversation, in order"
-)]
-fn waiting_guest(script: &Script) -> ScriptedVcpu {
+/// The scripted guest's first steps: from `sm:` to `ISelfController` 2000, whose reply (the
+/// graphics server's root, copied) the next step reads.
+fn asking_for_the_root(script: &Script) -> ScriptedVcpu {
     let name = script.base + NAME_AT;
     script.tls.write(name, b"sm:\0").unwrap();
     let send = || svc(SvcId::SendSyncRequest);
     let take_sm = script.clone();
-    let wait = script.clone();
-    let done = script.clone();
-    let [first_low, first_high] = halves(REGION);
-    let [last_low, last_high] = halves(REGION + REGION_SIZE - 1);
     ScriptedVcpu::new()
         .then(move |regs| regs.x[1] = name, svc(SvcId::ConnectToNamedPort))
         .then(
@@ -252,6 +269,20 @@ fn waiting_guest(script: &Script) -> ScriptedVcpu {
             }),
             send(),
         )
+}
+
+/// The scripted guest (module docs), ending with `ExitProcess`.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one step per request of the conversation, in order"
+)]
+fn waiting_guest(script: &Script) -> ScriptedVcpu {
+    let send = || svc(SvcId::SendSyncRequest);
+    let wait = script.clone();
+    let done = script.clone();
+    let [first_low, first_high] = halves(REGION);
+    let [last_low, last_high] = halves(REGION + REGION_SIZE - 1);
+    asking_for_the_root(script)
         .then(
             step(script, |script, vars| {
                 vars.gsv = script.cmif(SessionKind::Domain, 0).2[0];
@@ -430,4 +461,337 @@ fn the_timer_thread_s_graphics_turn_ends_a_guest_s_wait() {
         starquake_gsv::note::GPU_ORDERED_DONE
     );
     assert!(report.trace.contains(&note), "{}", report.trace);
+}
+
+// ----- The shared page through the real timer thread -------------------------------------------
+
+/// How many times the page guest asks: the first may be answered at once (the page shows no
+/// value yet), every later one is held to the bound, its counter unmoved.
+const PAGE_ROUNDS: usize = 9;
+
+/// The longest the page guest waits for one answer: a wait that ends so is a failure, and keeps
+/// a run whose turns never answer (a turn at a time that never passes the bound) bounded.
+const ANSWER_WAIT: Duration = Duration::from_millis(500);
+
+/// A syncpoint the page guest asks about: group 0, bit 40, as `crate::hle`'s page tests ask.
+const ASKED: u8 = 40;
+
+/// A program whose `.bss` holds the page's two transfer memories, page-aligned: its code is
+/// never run (a scripted vCPU makes its exits).
+fn page_program() -> Vec<u8> {
+    let pages = (WRITABLE_SIZE + READ_ONLY_SIZE) / 0x1000 + 1;
+    NroBuilder::new(&[a64::nop()])
+        .bss_size(pages * 0x1000)
+        .build()
+        .unwrap()
+}
+
+/// A page guest's memory: the page's two transfer memories (`.bss` pages the kernel maps, held
+/// apart so the script can write its requests there), over the image and its thread-local page.
+struct WithPage<'a> {
+    page: Arc<FlatMemory>,
+    rest: WithTls<'a>,
+}
+
+impl GuestMemory for WithPage<'_> {
+    fn read(&self, va: u64, buf: &mut [u8]) -> Result<(), Fault> {
+        self.page.read(va, buf).or_else(|_| self.rest.read(va, buf))
+    }
+
+    fn write(&self, va: u64, data: &[u8]) -> Result<(), Fault> {
+        self.page
+            .write(va, data)
+            .or_else(|_| self.rest.write(va, data))
+    }
+}
+
+impl<V> GuestSpace<V> for WithPage<'_> {
+    fn touch(&self, _: u64, _: Access) -> Touch {
+        Touch::Refused
+    }
+
+    fn settle(&self, _: &mut V) -> Result<(), starquake_cpu::Error> {
+        Ok(())
+    }
+}
+
+/// The page guest's first steps: gets the root, lends the writable memory at `writable` and the
+/// read-only one right after it, and sends 204 with both, whose reply the next step reads.
+fn binding_the_page(script: &Script, writable: u64) -> ScriptedVcpu {
+    let read_only = writable + u64::from(WRITABLE_SIZE);
+    let lend_writable = script.clone();
+    let lend_read_only = script.clone();
+    let bind = script.clone();
+    asking_for_the_root(script)
+        .then(
+            move |regs| {
+                assert_eq!(regs.x[0], 0, "2000 failed");
+                let mut vars = lend_writable.vars.borrow_mut();
+                vars.gsv = lend_writable.cmif(SessionKind::Domain, 0).2[0];
+                regs.x[1] = writable;
+                regs.x[2] = u64::from(WRITABLE_SIZE);
+                regs.x[3] = u64::from(SvcPermission::None.bits());
+            },
+            svc(SvcId::CreateTransferMemory),
+        )
+        .then(
+            move |regs| {
+                assert_eq!(regs.x[0], 0, "lending the writable memory failed");
+                lend_read_only.vars.borrow_mut().writable = u32::try_from(regs.x[1]).unwrap();
+                regs.x[1] = read_only;
+                regs.x[2] = u64::from(READ_ONLY_SIZE);
+                regs.x[3] = u64::from(SvcPermission::Read.bits());
+            },
+            svc(SvcId::CreateTransferMemory),
+        )
+        .then(
+            move |regs| {
+                assert_eq!(regs.x[0], 0, "lending the read-only memory failed");
+                let mut vars = bind.vars.borrow_mut();
+                vars.read_only = u32::try_from(regs.x[1]).unwrap();
+                // 204 as PR checks it (`0xdc, 0x80000006, 4`, two copied handles, then `1,
+                // 0x1ff, 0x1000, 0, 0x2000, 0`), as `crate::hle`'s page tests send it.
+                bind.write_words(&[
+                    tipc_type(root_command::BIND_SYNCPOINT_MEMORY),
+                    0x8000_0006,
+                    4,
+                    vars.writable,
+                    vars.read_only,
+                    1,
+                    0x1FF,
+                    WRITABLE_SIZE,
+                    0,
+                    READ_ONLY_SIZE,
+                    0,
+                ]);
+                regs.x[0] = u64::from(vars.gsv);
+            },
+            svc(SvcId::SendSyncRequest),
+        )
+}
+
+/// The scripted page guest: gets the root, lends the writable memory at the start of `page`
+/// and the read-only one right after it, binds them with 204, then [`PAGE_ROUNDS`] times flips
+/// its request bits (group 0 and [`ASKED`]), signals the request event, waits for the answer
+/// event (at most [`ANSWER_WAIT`]) and clears it, timing each wait from the signal; then exits.
+fn page_guest(script: &Script, page: &Arc<FlatMemory>, writable: u64) -> ScriptedVcpu {
+    let mut guest = binding_the_page(script, writable);
+    for round in 0..PAGE_ROUNDS {
+        let ask = script.clone();
+        let wait = script.clone();
+        let clear = script.clone();
+        let requests = Arc::clone(page);
+        guest = guest
+            .then(
+                move |regs| {
+                    let mut vars = ask.vars.borrow_mut();
+                    if round == 0 {
+                        assert_eq!(regs.x[0], 0, "204 failed");
+                        let handles = ask.tipc().1;
+                        (vars.request, vars.answer) = (handles[0], handles[1]);
+                    } else {
+                        assert_eq!(regs.x[0], 0, "clearing the answer failed");
+                    }
+                    // Flip the group's summary bit and the slot's bit.
+                    let summary = u64::from(round % 2 == 0);
+                    let slot = summary << ASKED;
+                    let request_at = writable + u64::from(GROUP_REQUEST_OFFSET);
+                    let slot_at = writable + u64::from(SLOT_REQUEST_OFFSET);
+                    requests.write(request_at, &summary.to_le_bytes()).unwrap();
+                    requests.write(slot_at, &slot.to_le_bytes()).unwrap();
+                    vars.asked = Some(Instant::now());
+                    regs.x[0] = u64::from(vars.request);
+                },
+                svc(SvcId::SignalEvent),
+            )
+            .then(
+                move |regs| {
+                    assert_eq!(regs.x[0], 0, "signalling the request failed");
+                    let answer = wait.vars.borrow().answer;
+                    wait.tls
+                        .write(wait.base + HANDLES_AT, &answer.to_le_bytes())
+                        .unwrap();
+                    regs.x[1] = wait.base + HANDLES_AT;
+                    regs.x[2] = 1;
+                    regs.x[3] = u64::try_from(ANSWER_WAIT.as_nanos()).unwrap();
+                },
+                svc(SvcId::WaitSynchronization),
+            )
+            .then(
+                move |regs| {
+                    let mut vars = clear.vars.borrow_mut();
+                    let waited = vars.asked.take().unwrap().elapsed();
+                    vars.answers.push((regs.x[0], waited));
+                    regs.x[0] = u64::from(vars.answer);
+                },
+                svc(SvcId::ResetSignal),
+            );
+    }
+    let done = script.clone();
+    guest.then(
+        move |regs| {
+            assert_eq!(regs.x[0], 0, "clearing the answer failed");
+            done.vars.borrow_mut().waited = Some(0);
+        },
+        svc(SvcId::ExitProcess),
+    )
+}
+
+/// A held page request is answered by the real timer thread at the bound, well before the next
+/// preemption: each wait after the first (a request whose counter has not moved, so held to
+/// [`ANSWER_BOUND`]) ends, by the median, in under half of [`PREEMPTION_INTERVAL_NS`]. Each of
+/// these makes that so, and without any one of them the request waits for the next preemption
+/// tick, which runs the turn and reschedules anyway: the thread sleeps no later than the page's
+/// deadline, the turn reads its time from the environment's clock (a turn at a time that never
+/// passes the bound never answers: every wait then ends at [`ANSWER_WAIT`]), and the cores are
+/// rescheduled after the turn, so the answer's signal wakes the waiting thread's core at once.
+///
+/// It cannot see whether the queue rings the timer thread: the guest's timed wait gives the
+/// kernel a deadline, which wakes the thread soon after the signal anyway.
+/// `a_completion_queued_for_the_graphics_server_rings_the_timer_thread` pins the ring.
+#[test]
+fn a_held_page_request_is_answered_at_the_bound_by_the_timer_thread() {
+    let guest = super::Guest::new(&page_program());
+    let bss = guest.start_of("main.bss");
+    let writable = bss.next_multiple_of(crate::image::PAGE);
+    let page_size = usize::try_from(crate::image::PAGE).unwrap();
+    let tls = Arc::new(FlatMemory::new(guest.tls, page_size));
+    let lent = usize::try_from(WRITABLE_SIZE + READ_ONLY_SIZE).unwrap();
+    let page = Arc::new(FlatMemory::new(writable, lent));
+    let space = WithPage {
+        page: Arc::clone(&page),
+        rest: WithTls {
+            image: &guest.memory,
+            tls: Arc::clone(&tls),
+        },
+    };
+    let vars = Rc::new(RefCell::new(Vars::default()));
+    let script = Script {
+        tls,
+        base: guest.tls,
+        vars: Rc::clone(&vars),
+    };
+    let mut main = page_guest(&script, &page, writable);
+    let options = RunOptions {
+        timeout: Some(RUN_LIMIT),
+        command_line: Vec::new(),
+        sd_card: None,
+        romfs: None,
+    };
+    let report = run(
+        vcpus(&mut main),
+        guest.program(&space),
+        &options,
+        Instant::now(),
+        timebase(),
+    );
+    drop((script, main));
+    assert_eq!(report.exit, ExitReason::ProcessExited, "{}", report.trace);
+    let vars = vars.borrow();
+    assert_eq!(vars.waited, Some(0));
+    assert_eq!(vars.answers.len(), PAGE_ROUNDS);
+    for (round, (result, _)) in vars.answers.iter().enumerate() {
+        assert_eq!(*result, 0, "wait {round} ended with {result:#x}");
+    }
+    let mut held: Vec<Duration> = vars.answers[1..]
+        .iter()
+        .map(|(_, waited)| *waited)
+        .collect();
+    held.sort();
+    let median = held[held.len() / 2];
+    let bound = Duration::from_nanos(ANSWER_BOUND);
+    let preemption = Duration::from_nanos(PREEMPTION_INTERVAL_NS);
+    assert!(
+        median >= bound && median < preemption / 2,
+        "held waits {held:?}"
+    );
+    // Each held request's answer is in the trace: the value and the acknowledge notes.
+    let acknowledged = format!(
+        "note service={} code={}",
+        crate::hle::GSV_ROOT.0,
+        starquake_gsv::note::SYNCPT_PAGE_ACKNOWLEDGED
+    );
+    assert_eq!(
+        report.trace.matches(&acknowledged).count(),
+        PAGE_ROUNDS,
+        "{}",
+        report.trace
+    );
+}
+
+// ----- The turn on a machine whose cores never step ---------------------------------------------
+
+/// How far each reading of the machine's environment clock is from the last.
+const CLOCK_STEP: u64 = 1_000;
+
+/// Runs `check` on a machine of the hello program with a real run's services and no thread of
+/// its own running (no core steps, no timer thread), its environment's clock reading
+/// [`CLOCK_STEP`] further each time it is read.
+fn on_a_machine(check: impl FnOnce(&Machine<'_, ScriptedVcpu, FixedClock>)) {
+    let guest = super::Guest::new(&programs::hello().unwrap());
+    let space: &dyn GuestSpace<ScriptedVcpu> = &guest.memory;
+    let options = RunOptions::default();
+    let session = Session {
+        memory: space,
+        options: &options,
+        clock: RunClock::new(Timebase {
+            console: NRO_CONSOLE,
+            clock: FixedClock::new(CLOCK_STEP, CLOCK_STEP),
+        }),
+        recorder: Recorder::new(),
+    };
+    let env = session.environment();
+    let (dispatcher, _) = boot(guest.address_space(), &guest.placed, space).unwrap();
+    let Ok(machine) = Machine::start(
+        dispatcher,
+        space,
+        &session,
+        &env,
+        Limits::DEFAULT,
+        &real_services,
+    ) else {
+        unreachable!("the services could not be installed");
+    };
+    check(&machine);
+    drop(machine.finish());
+}
+
+/// A completion queued for the run's graphics server rings the timer thread's bell: the machine
+/// gives the graphics server its bell as the queue's wake (`machine/timer.rs`, "The graphics
+/// server's turn").
+#[test]
+fn a_completion_queued_for_the_graphics_server_rings_the_timer_thread() {
+    on_a_machine(|machine| {
+        assert!(!machine.bell.take_ring());
+        let room = Note::QueueRoom {
+            channel: ChannelId(crate::hle::graphics::FIRST_CHANNEL),
+        };
+        machine.graphics.replay(room).unwrap();
+        assert!(machine.bell.take_ring());
+        assert!(!machine.bell.take_ring());
+    });
+}
+
+/// The timer thread's graphics turn reads nothing while the graphics server is idle (the clock
+/// read just before and just after it are one step apart), and reads the clock, at least, once
+/// something is queued, which it drains.
+#[test]
+fn an_idle_graphics_turn_reads_nothing_and_a_busy_one_reads_the_clock() {
+    on_a_machine(|machine| {
+        let reading = || machine.env.now().unwrap().0;
+        assert!(machine.graphics.is_idle());
+        let before = reading();
+        assert!(timer::graphics(machine).is_ok());
+        assert_eq!(reading() - before, CLOCK_STEP);
+
+        let room = Note::QueueRoom {
+            channel: ChannelId(crate::hle::graphics::FIRST_CHANNEL),
+        };
+        machine.graphics.replay(room).unwrap();
+        assert!(!machine.graphics.is_idle());
+        let before = reading();
+        assert!(timer::graphics(machine).is_ok());
+        assert!(reading() - before > CLOCK_STEP);
+        assert!(machine.graphics.is_idle());
+    });
 }
