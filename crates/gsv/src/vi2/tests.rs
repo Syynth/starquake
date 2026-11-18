@@ -283,10 +283,10 @@ fn the_command_ids_are_prs() {
 /// The constants against the values the references write out.
 #[test]
 fn the_constants_are_the_references_values() {
-    // `Result{ErrorModule::VI, n}`: module 114 in the low nine bits, the description above.
-    assert_eq!(VI_OUT_OF_RANGE.raw(), 114 | (4 << 9));
-    assert_eq!(VI_PERMISSION_DENIED.raw(), 114 | (5 << 9));
-    assert_eq!(VI_NOT_FOUND.raw(), 114 | (7 << 9));
+    // `Result{ErrorModule::VI, n}`: module 114 (0x72) in the low nine bits, the description above.
+    assert_eq!(VI_OUT_OF_RANGE.raw(), 0x72 | (4 << 9));
+    assert_eq!(VI_PERMISSION_DENIED.raw(), 0x72 | (5 << 9));
+    assert_eq!(VI_NOT_FOUND.raw(), 0x72 | (7 << 9));
     assert_eq!(DEFAULT_DISPLAY, 0x0074_6C75_6166_6564);
     assert_eq!(
         (
@@ -423,7 +423,7 @@ impl Rig {
     }
 
     /// The handle a reply copied, checked to be the reply's only one.
-    fn handed(&self, reply: &[u8]) -> u32 {
+    fn handed(reply: &[u8]) -> u32 {
         let handles = copied(reply);
         assert_eq!(handles.len(), 1);
         handles[0]
@@ -432,7 +432,7 @@ impl Rig {
     /// 31 for `group`, expected to succeed: its event.
     fn group_event(&mut self, group: u32) -> ObjectId {
         let reply = self.send(&create_group(group));
-        let handle = self.handed(&reply);
+        let handle = Self::handed(&reply);
         assert_eq!(reply, success(CREATE_REQUEST_GROUP_EVENT, &[handle], &[]));
         self.object(handle)
     }
@@ -440,7 +440,7 @@ impl Rig {
     /// 11 with 0, expected to succeed: the notification event.
     fn notification_event(&mut self) -> ObjectId {
         let reply = self.send(&get_notification_event(0));
-        let handle = self.handed(&reply);
+        let handle = Self::handed(&reply);
         assert_eq!(reply, success(GET_NOTIFICATION_EVENT, &[handle], &[]));
         self.object(handle)
     }
@@ -533,7 +533,7 @@ fn every_command_s_reply_bytes() {
     let event = rig.group_event(3);
     let handle = rig.kernel.insert_handle(event).unwrap().raw();
     let reply = rig.send(&duplicate_group(handle, 3));
-    let again = rig.handed(&reply);
+    let again = Rig::handed(&reply);
     assert_eq!(reply, success(DUPLICATE_REQUEST_GROUP_EVENT, &[again], &[]));
     assert_eq!(rig.object(again), event);
     rig.ok(&configure_groups(REQUEST_GROUPS - 1));
@@ -588,7 +588,7 @@ fn every_command_s_reply_bytes() {
     // 21: no data; the bitmap goes to the buffer: client 4's retire bit and the display's.
     assert_eq!(rig.signals(notification), 2);
     rig.ok(&get_notifications(128));
-    let mut expected = vec![0; 128];
+    let mut expected = [0; 128];
     expected[0] = (1 << 4) | (1 << OPEN_DISPLAY_FLAGS);
     assert_eq!(rig.kernel.memory(BUFFER, 128).unwrap(), &expected[..]);
 }
@@ -757,7 +757,7 @@ fn create_request_group_event_checks_its_group() {
         .session_state()
         .groups()
         .iter()
-        .map(|g| g.event())
+        .map(super::RequestGroup::event)
         .collect();
     let mut expected = vec![None; 8];
     expected[0] = Some(first);
@@ -770,7 +770,7 @@ fn create_request_group_event_checks_its_group() {
 fn the_request_group_event_is_handed_out_copied() {
     let mut rig = Rig::new();
     let reply = rig.send(&create_group(0));
-    let handle = rig.handed(&reply);
+    let handle = Rig::handed(&reply);
     assert_eq!(
         &reply[..20],
         &le(&[0x2F, SPECIAL | 1, ONE_COPY, handle, 0])[..]
@@ -787,7 +787,7 @@ fn duplicate_hands_out_the_same_event_and_refuses_another() {
     let zero_handle = rig.kernel.insert_handle(zero).unwrap().raw();
     let one_handle = rig.kernel.insert_handle(one).unwrap().raw();
     let reply = rig.send(&duplicate_group(zero_handle, 0));
-    assert_eq!(rig.object(rig.handed(&reply)), zero);
+    assert_eq!(rig.object(Rig::handed(&reply)), zero);
     assert_eq!(
         rig.send(&duplicate_group(one_handle, 0)),
         refused(DUPLICATE_REQUEST_GROUP_EVENT, KernelError::InvalidHandle)
@@ -1134,7 +1134,7 @@ fn player_displays_are_not_opened() {
     let mut rig = Rig::new();
     for name in [*b"player1\0", *b"player3\0"] {
         let name = u64::from_le_bytes(name);
-        assert_eq!(player_display(name).is_some(), true);
+        assert!(player_display(name).is_some());
         assert_eq!(
             rig.send(&open_display(name, OPEN_DISPLAY_FLAGS)),
             refused(OPEN_DISPLAY, KernelError::NotFound)
@@ -1582,9 +1582,49 @@ fn notification_commands_take_any_word() {
     let event = rig.notification_event();
     for word in [1, 0x8000_0000, u32::MAX] {
         let reply = rig.send(&get_notification_event(word));
-        let handle = rig.handed(&reply);
+        let handle = Rig::handed(&reply);
         assert_eq!(reply, success(GET_NOTIFICATION_EVENT, &[handle], &[]));
         assert_eq!(rig.object(handle), event);
         rig.ok(&release_notification_event(word));
     }
+}
+
+/// The listed gap: a closed session's groups keep listening, so after eight sessions that made
+/// eight groups each are closed, a new session's 31 answers `OutOfResource`; a group registered
+/// for another kind does not listen, so it does not count. Each group's state is what
+/// `RequestGroup::listens` says it is.
+#[test]
+fn closed_sessions_keep_their_groups_listening() {
+    let mut rig = Rig::new();
+    let per_session = u32::try_from(MAX_LISTENERS / 8).unwrap();
+    assert_eq!(per_session, REQUEST_GROUPS);
+    for session in 0..8 {
+        if session > 0 {
+            rig.session = rig.kernel.new_object();
+            rig.server.accept(rig.session).unwrap();
+        }
+        for group in 0..per_session {
+            rig.group_event(group);
+        }
+        if session == 0 {
+            // One group of the first session monitors kind 1: it stops listening.
+            rig.ok(&monitor(REGISTER_HDR_STATUS_MONITOR, DEFAULT_DISPLAY, 0));
+            let state = rig.session_state();
+            let listening: Vec<bool> = state.groups().iter().map(RequestGroup::listens).collect();
+            let mut expected = vec![true; 8];
+            expected[0] = false;
+            assert_eq!(listening, expected);
+            let monitor = state.groups()[0].monitor().unwrap();
+            assert_eq!((monitor.display(), monitor.kind()), (DEFAULT_DISPLAY, 1));
+        }
+        rig.server.close(rig.session).unwrap();
+    }
+    assert_eq!(rig.listeners().len(), MAX_LISTENERS - 1);
+    rig.session = rig.kernel.new_object();
+    rig.server.accept(rig.session).unwrap();
+    rig.group_event(0);
+    assert_eq!(
+        rig.send(&create_group(1)),
+        refused(CREATE_REQUEST_GROUP_EVENT, KernelError::OutOfResource)
+    );
 }

@@ -101,14 +101,12 @@ fn client(token: u64, retire: u32, available_bit: u32) -> Client {
     Client::new(token, retire, available_bit)
 }
 
-/// Each relation, refused with its exact error and said in plain words; with two faults the
-/// earlier check's error comes back.
-#[test]
-fn each_unreachable_saved_session_is_refused() {
-    let full: Vec<Client> = (0..17_u32)
-        .map(|i| client(u64::from(i) + 1, i % 16 * 2, i % 16 * 2 + 1))
-        .collect();
-    let cases: Vec<(Vi2Session, Vi2SessionError, &str)> = vec![
+/// A refused case: the session, the error and its words.
+type Refusal = (Vi2Session, Vi2SessionError, &'static str);
+
+/// The relations of the groups and the session (`vi2::saved`, steps 1 to 6).
+fn session_refusals() -> Vec<Refusal> {
+    vec![
         (
             with(|s| s.groups.truncate(7)),
             Vi2SessionError::Groups { found: 7 },
@@ -195,6 +193,15 @@ fn each_unreachable_saved_session_is_refused() {
             Vi2SessionError::NextLayer { found: 0 },
             "a vi2 session's next layer number is 0, below the first, 1",
         ),
+    ]
+}
+
+/// The relations of the clients and the endpoint (steps 7 to 9).
+fn client_refusals() -> Vec<Refusal> {
+    let full: Vec<Client> = (0..17_u32)
+        .map(|i| client(u64::from(i) + 1, i % 16 * 2, i % 16 * 2 + 1))
+        .collect();
+    vec![
         (
             with(|s| {
                 s.clients.clone_from(&full);
@@ -287,7 +294,12 @@ fn each_unreachable_saved_session_is_refused() {
             Vi2SessionError::EndpointWithoutClient,
             "a vi2 session's endpoint names no registered client",
         ),
-        // Two faults at once: the earlier check's error.
+    ]
+}
+
+/// Two faults at once: the earlier check's error.
+fn ordering_refusals() -> Vec<Refusal> {
+    vec![
         (
             with(|s| {
                 s.groups[1].monitor = Some(Monitor {
@@ -332,7 +344,14 @@ fn each_unreachable_saved_session_is_refused() {
             Vi2SessionError::Availability { index: 0 },
             "vi2 client 0 has a free slot past the last",
         ),
-    ];
+    ]
+}
+
+/// Each relation, refused with its exact error and said in plain words; with two faults the
+/// earlier check's error comes back.
+#[test]
+fn each_unreachable_saved_session_is_refused() {
+    let cases = [session_refusals(), client_refusals(), ordering_refusals()].concat();
     for (session, error, words) in cases {
         assert_eq!(read_back(&session), Err(error), "{session:?}");
         assert_eq!(error.to_string(), words);
@@ -408,7 +427,7 @@ fn a_restored_session_carries_on() {
     );
     let handle = rig.kernel.insert_handle(event).unwrap().raw();
     let reply = rig.send(&duplicate_group(handle, 6));
-    assert_eq!(rig.object(rig.handed(&reply)), event);
+    assert_eq!(rig.object(Rig::handed(&reply)), event);
     assert_eq!(
         rig.send(&register_client(0xA3, 4, 7)),
         refused(REGISTER_CLIENT_STATE, KernelError::InvalidState)

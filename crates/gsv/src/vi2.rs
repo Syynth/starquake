@@ -99,7 +99,7 @@
 //!   event out again.
 //! - **51** refuses a count at or past [`REQUEST_GROUPS`] with [`VI_OUT_OF_RANGE`] and a second 51
 //!   with [`VI_PERMISSION_DENIED`]; otherwise it records the count. Nothing else reads it (PR:
-//!   "Only the driver being up is required; ConfigureRequestGroups is not").
+//!   "Only the driver being up is required; `ConfigureRequestGroups` is not").
 //! - **101** refuses a name other than [`DEFAULT_DISPLAY`] with `NotFound`, flags other than
 //!   [`OPEN_DISPLAY_FLAGS`] with `NotImplemented`, and a display already opened
 //!   [`MAX_DISPLAY_REFERENCES`] times with `OutOfResource`; otherwise it counts one more
@@ -205,12 +205,13 @@
 //! So a group's event listens exactly while it has no registration or a kind-0 one. Where a
 //! full clock ([`crate::shared::vsync::MAX_LISTENERS`]) refuses a group that should listen, 31
 //! answers `OutOfResource` having made nothing, and 261 and an unregister log an error and
-//! succeed, the group not ticked until a later 261 (kind 0) is let in.
+//! succeed: the group is not ticked until an unregister that matches finds room, and after that
+//! a 261 (kind 0) (`a_full_clock_leaves_a_registered_group_unticked`).
 //!
 //! **The fallback's first frame.** The spec ticks an unregistered group "after the first frame".
 //! The clock signals its listeners on every tick and offers vi2 no turn of its own, so the grace
 //! of one frame is not built: an unregistered group is ticked from the clock's first tick on.
-//! This departs from the spec's wording and is an owner question (the PR says so); a title that
+//! This departs from the spec's wording and is an owner question; a title that
 //! registers kind 0 before the first tick, or waits on the event for two ticks as row 82's did,
 //! sees no difference.
 //!
@@ -227,15 +228,15 @@
 //! | 11 | one event per session | a new event per call | PR's (`the_notification_event_is_made_once_and_signalled_while_raised`) |
 //! | 11 and 13 with a word other than 0 | `InvalidCombination` | 11 takes any word; 13 auto-stubbed | **conflict**: any word, NX2's, the one a title ran on (`notification_commands_take_any_word`) |
 //! | 31 and 32 | a group's event, ticked once registered for kind 0 | a new event per call, every one ticked | **conflict**: PR's, with NX2's ticking as the fallback (above; `an_unregistered_group_is_ticked_by_the_fallback`, `a_kind_zero_monitor_ticks_its_group`) |
-//! | The handle kind of 11, 31 and 32 | moved | copied | **conflict**: copied, as [`crate::protocol::HANDLE_KIND`] (`the_request_group_event_is_handed_out_copied`) |
+//! | The handle kind of 11, 31 and 32 | moved | copied | **conflict**: copied, as [`crate::protocol::HANDLE_KIND`] (`the_request_group_event_is_handed_out_copied`; 11 and 32 in `every_command_s_reply_bytes`) |
 //! | 32 with a handle naming a live object that is not an event, and a group out of range | `InvalidHandle` (the handle is checked for a readable event first) | auto-stubbed | [`VI_OUT_OF_RANGE`]: the group is checked before the identity, and the server cannot tell an event from another object (`duplicate_checks_the_group_before_the_identity`) |
 //! | 104, 105 | as here | success, no data | PR's (`every_command_s_reply_bytes`) |
-//! | Player displays (`"player1"`–`"player3"`) | opened, bound and closed for GameShare | auto-stubbed | not opened (101 `NotFound`); 102 and 251 answer as PR does for one with no reference (`player_displays_are_not_opened`). Deferred with other displays (spec) |
+//! | Player displays (`"player1"`–`"player3"`) | opened, bound and closed for `GameShare` | auto-stubbed | not opened (101 `NotFound`); 102 and 251 answer as PR does for one with no reference (`player_displays_are_not_opened`). Deferred with other displays (spec) |
 //! | 301 with a mask or value other than PR's two forms | `InvalidCombination` | auto-stubbed: success | **conflict**: accepted on the default display, as PR reads the system module (`display_parameter_301_takes_any_flags_on_the_default_display`) |
 //! | 106 | Eden's display resolution: 1 at 1280 × 720, `NotImplemented` otherwise | auto-stubbed | 1: the display is 1280 × 720 (handheld) until output sizes are read from a display description (spec, "Deferred") |
 //! | A failure's data words | written as zero | — | not written: the result word alone (`a_failure_reply_is_the_result_word_alone`) |
 //! | Header words other than PR's | `InvalidCombination` | read as they come | read as they come; only a missing word is refused (`a_short_request_is_refused_and_a_longer_one_is_read`) |
-//! | A closed session | its layers destroyed, its events closed, its group tick stopped (destructor) | its events closed | nothing: the framework tells a session nothing when it closes. Its group events stay made and keep listening, so they count against [`crate::shared::vsync::MAX_LISTENERS`]: after eight sessions that made eight groups each are closed, a new 31 answers `OutOfResource` (`a_full_vsync_clock_refuses_a_new_group`). Its notification event stays made too, one per session, not bounded. A known gap, left for a follow-up that needs a close hook from the framework |
+//! | A closed session | its layers destroyed, its events closed, its group tick stopped (destructor) | its events closed | nothing: the framework tells a session nothing when it closes. Its group events stay made, and those that listen keep listening, so they count against [`crate::shared::vsync::MAX_LISTENERS`]: after eight sessions that made eight listening groups each are closed, a new 31 answers `OutOfResource` (`closed_sessions_keep_their_groups_listening`). **Not bounded:** a group event registered for a kind other than 0 does not listen, so it does not count, and neither does a session's notification event: a title that keeps opening sessions, making such events and closing the sessions grows the kernel's events without limit. A known gap, left for a follow-up that needs a close hook from the framework |
 //!
 //! # What is recorded and what is saved
 //!
@@ -419,7 +420,7 @@ pub const NOTIFICATION_LIMIT: u32 = 1;
 /// What 3 answers: the same **conflict** as [`NOTIFICATION_LIMIT`] (NX2 "TIPC 3 -> u32 < 8").
 pub const SESSION_LIMIT: u32 = 1;
 /// What 5 answers: PR's `GetSessionLimit` (`ctx.GetCommand() == 5 ? 7 : 0`) and NX2's
-/// `GetTimestampRecorderCount` agree on 7 (row 21: "LayerHistory creates 7 timestamp
+/// `GetTimestampRecorderCount` agree on 7 (row 21: "`LayerHistory` creates 7 timestamp
 /// recorders"), the last index of [`REQUEST_GROUPS`] groups.
 pub const REQUEST_GROUP_LIMIT: u32 = 7;
 
@@ -517,8 +518,9 @@ pub fn monitor_kind(command: u32) -> Option<(u32, bool)> {
     (kind < MONITOR_KINDS).then_some((kind, offset % 2 == 0))
 }
 
-/// Whether 352's levels are accepted: PR `levels[0] >= 0.0f && levels[0] <= 1.0f && levels[1]
-/// >= 0.0f && levels[1] <= 1.0f && levels[2] >= 0.0f`, so a NaN anywhere is refused.
+/// Whether 352's levels are accepted, as PR checks them: each of the first two at least `0.0f`
+/// and at most `1.0f`, the third at least `0.0f` (`levels[0] >= 0.0f && levels[0] <= 1.0f`, the
+/// same for `levels[1]`, then `levels[2] >= 0.0f`), so a NaN anywhere is refused.
 #[must_use]
 pub fn levels_are_valid(levels: [f32; 3]) -> bool {
     let [first, second, third] = levels;
@@ -948,13 +950,12 @@ impl Vi2Session {
     ) -> Outcome {
         let word = req.payload().read_u32()?;
         tracing::debug!(word, "gsv:vi2: notification event");
-        let event = match self.notification_event {
-            Some(event) => event,
-            None => {
-                let event = cx.create_event()?;
-                self.notification_event = Some(event);
-                event
-            }
+        let event = if let Some(event) = self.notification_event {
+            event
+        } else {
+            let event = cx.create_event()?;
+            self.notification_event = Some(event);
+            event
         };
         if self.notifications.iter().any(|&word| word != 0) {
             cx.signal_event(event)?;
@@ -1440,12 +1441,11 @@ impl Vi2Session {
                 kind,
             });
         }
-        match now {
-            Some(now) => listen(&mut state, event, group, now, false),
-            None => {
-                state.unlisten_vsync(event);
-                cx.signal_event(event)?;
-            }
+        if let Some(now) = now {
+            listen(&mut state, event, group, now, false);
+        } else {
+            state.unlisten_vsync(event);
+            cx.signal_event(event)?;
         }
         drop(state);
         Ok(())

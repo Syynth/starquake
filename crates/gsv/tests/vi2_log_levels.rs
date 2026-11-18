@@ -97,6 +97,7 @@ fn tipc_type(id: u32) -> u32 {
 }
 
 /// The low and high words of a `u64`.
+#[cfg(test)]
 fn halves(value: u64) -> [u32; 2] {
     let bytes = value.to_le_bytes();
     let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
@@ -110,6 +111,7 @@ struct Rig {
     session: ObjectId,
 }
 
+#[cfg(test)]
 impl Rig {
     fn over(server: Server, service: ServiceId) -> Self {
         let mut kernel = FakeKernel::new(0).unwrap();
