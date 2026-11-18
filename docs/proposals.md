@@ -343,6 +343,17 @@ With pctl in place the title no longer crashes: it runs to the timeout. It then 
 | awaiting the owner | **Whether stub records tell a guest-named stub apart from a real interface.** A stub asked for under sm's own interface name ("Sm") is counted with sm today. The collision is listed as a divergence and pinned by `sm::tests::a_stub_asked_for_by_sms_own_interface_name_is_counted_with_it` | Review of #207 (a comment on PR #281) | observability |
 | proposed | **Wire the title's NACP through to services**, so `GetDesiredLanguage` can answer from the supported languages, as Eden does | #282's scope | area:services, area:core |
 
+### From wave 28 (ledger: #22)
+
+Landed: #278 (`lm`, `ectx:aw`, `aoc:u`, PR #285), #282 (the six start-up commands, PR #286), #271 (address-space restore checks attributes against state flags, PR #284) and #209 (IPC reply rollback, PR #287).
+
+The title no longer spins: command 210's event now waits properly. It then reaches the graphics server and asks gsv root command 1402 for the nvsrv session. The root still hands out a placeholder session with no commands, so nvsrv's command 13 is auto-stubbed, and the title records a terminate result and calls `Break`. Wiring the real servers is #194 (graphics-server slice 16), which wave 29 builds with one agent.
+
+| Status | Proposal | Why | Suggested |
+|---|---|---|---|
+| awaiting the owner | **lm's lines have no `GuestLog` event**, which departs from the observability spec. Options: give lm lines `GuestLog` events, send them to a file of their own, or amend the spec and `docs/architecture.md` | Review of #278 (PR #285) | observability |
+| proposed | **aoc's purchased event is one per server**, where Eden makes and closes one per manager; the departure is listed in aoc's module docs | Review of #278 | area:services |
+
 ## House-rule candidates
 
 Rules distilled from review findings. A vetted rule moves into `CLAUDE.md`; until then it is
@@ -503,3 +514,13 @@ passed to build agents as a provisional rule for the next wave.
 - A classification branch that picks a name, protocol or interface is tested for every variant that reaches it; a fallback records "unknown" rather than borrowing another object's name.
 - Observability records are not keyed by a guest-controlled string alone, or the ambiguity is a listed divergence pinned by a test.
 - A build agent returns only when its work is pushed; no background job may still be editing tracked files.
+
+### From wave 28 (ledger: #22)
+
+- Restore validation checks that ids of the same role are pairwise distinct and that no two slots share one kernel object.
+- A branch that only changes a log level or other side effect gets a captured-log test, or the docs say its mutation is equivalent.
+- Command ids, opcodes and layout constants are pinned against the cited reference values written as literals in one test.
+- Attribute, flag and permission checks are pinned with every non-empty subset of flags on each state, against a model.
+- An object made per session or per manager has a bounded lifetime, and any departure from the reference's lifetime is listed.
+- A wiring change gets one end-to-end test through the production constructor that asserts the output reaches the final report or the guest.
+- Each rollback error path is tested for every taking path: placed handles released, reference counts restored, services-side state forgotten.
