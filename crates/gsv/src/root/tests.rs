@@ -1412,6 +1412,31 @@ fn a_family_session_reply_is_one_copied_handle_and_success() {
     }
 }
 
+/// A 202 or 1402 whose header is not the one PR compares (`0xda, 0`, `0x58a, 0`) because it
+/// counts data words is accepted, the data not read: PR answers `ResultInvalidState` (202) and
+/// `ResultInvalidCombination` (1402), NX2 success (module docs, "Where this differs from the
+/// references"). The data words differ from each other and from the reply's, so a handler that
+/// read or echoed them would show it.
+#[test]
+fn a_family_command_with_a_data_word_is_accepted() {
+    let state = RootState::new()
+        .with_syncpt_server(SYNCPT)
+        .with_nvsrv_server(NVSRV);
+    for (command, server) in [(GET_SYNCPOINT_SESSION, SYNCPT), (GET_NVIDIA_DRIVER, NVSRV)] {
+        for data in [&[0xDEAD_BEEF][..], &[0x1234_5678, 0x9ABC_DEF0][..]] {
+            let mut words = vec![tipc_type(command), u32::try_from(data.len()).unwrap()];
+            words.extend(data);
+            let mut rig = wired_with(state);
+            assert_eq!(opened(&mut rig, &words), Some(server), "{words:x?}");
+            let reply = rig.send(&words);
+            let handle = copied(&reply)[0];
+            let expected = le(&[tipc_type(command), SPECIAL | 1, ONE_COPY, handle, 0]);
+            assert_eq!(&reply[..expected.len()], &expected[..], "{words:x?}");
+            assert_eq!(rig.state(), state);
+        }
+    }
+}
+
 /// A snapshot whose gpu, syncpt or nvsrv server is not the run's is refused, and the server
 /// keeps its own. With the gpu server and the nvsrv server both different, the gpu server's
 /// refusal is reported; with the syncpt and nvsrv servers both different, the syncpt server's.

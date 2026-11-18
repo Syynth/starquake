@@ -99,15 +99,26 @@
 //!
 //! 202 and 1402 hand out sessions on the syncpt server ([`RootState::with_syncpt_server`],
 //! [`crate::syncpt`]) and the nvsrv server ([`RootState::with_nvsrv_server`], [`crate::nvsrv`])
-//! as 497 does on the gpu server: a copied session ([`Reply::copy_service`]), with no data
-//! (observed: rows 19 and 23; PR `GetSyncpointSession`, `GetNvidiaDriver`; NX2
-//! `OpenSyncptSession`, `OpenNvsrvSession`, which put the handle at word 3 and the result at
-//! word 4). Neither reads a data word. PR refuses a request whose header is not `0xda, 0` (202)
-//! or `0x58a, 0` (1402) with `ResultInvalidCombination`, and answers `ResultInvalidState` for a
-//! 202 before 201 and 1402 have been sent, and for a 1402 before the bootstrap is complete and
-//! the image formats are set up; here neither is checked, and a command before the bootstrap is
-//! complete is logged and accepted (decision 7), as the root keeps none of that state. A root
-//! with no server for the family answers with the stub's placeholder. Each server's number is
+//! as 497 does on the gpu server: one session handle and no data (observed: rows 19 and 23; PR
+//! `GetSyncpointSession`, `GetNvidiaDriver`; NX2 `OpenSyncptSession`, `OpenNvsrvSession`, which
+//! put the handle at word 3 and the result at word 4).
+//!
+//! **conflict: the handle's kind.** PR moves the session (`rb.PushMoveObjects(ctx, client)` in
+//! both); NX2 copies it (`ReturnRawSession`: `rb.PushCopyObjects(ctx, *client)`). Neither
+//! answer contains the other, so by decision 8 the one a title ran on wins: NX2's, a copied
+//! session ([`Reply::copy_service`]), as for 497 and every root handle
+//! ([`crate::protocol::HANDLE_KIND`]). A trace of the reply's handle descriptor settles it.
+//!
+//! Neither reads a data word. PR checks the header and its state differently for the two: 202
+//! answers `ResultInvalidState` unless the header is `0xda, 0`, 201 has been sent
+//! (`m_syncpoint_context_initialized`) and so has 1402 (`m_nv_module`), all in one condition,
+//! so a bad header on 202 is `ResultInvalidState` too; 1402 answers `ResultInvalidCombination`
+//! for a header other than `0x58a, 0`, then `ResultInvalidState` before the bootstrap is
+//! complete (`m_phase != Phase::Ready`) or the image formats are set up
+//! (`m_image_formats_initialized`). NX2 checks none of it. Here none of it is checked, as the
+//! root keeps none of that state: any header that reaches the command is accepted, and a
+//! command before the bootstrap is complete is logged and accepted (decision 7). A root with no
+//! server for the family answers with the stub's placeholder. Each server's number is
 //! the run's wiring, checked on a snapshot as the gpu server's is, the gpu server's first, then
 //! the syncpt server's, then the nvsrv server's
 //! (`a_snapshot_with_other_family_servers_is_refused_gpu_first`).
@@ -126,6 +137,9 @@
 //! | 126, 115 and the stubs before the bootstrap is complete | `ResultInvalidState` for most | success | success, the phase logged (`every_root_command_s_reply_bytes`, sent before any bootstrap) |
 //! | A TIPC command the table does not list | `ResultNotImplemented` | auto-stubbed | the server's unknown-command policy (`a_command_the_table_does_not_list_goes_to_the_policy`) |
 //! | A second root session (a second 2000) | the same session as the first: one state | a new session with its own `m_objects` and `m_syncpt_events` | a new session that shares the first one's [`RootState`]: its phase, its out-of-order count and 204's two events (`two_root_sessions_share_the_phase_and_the_syncpoint_events`); with the shared page, the one page (`a_second_bind_is_refused_and_changes_nothing`, in `shared/page/tests.rs`) |
+//! | The handle 202 and 1402 hand out | moved | copied | **conflict**: copied, NX2's (`a_family_session_reply_is_one_copied_handle_and_success`) |
+//! | 202 before 201 and 1402, or 1402 before the bootstrap is complete and the image formats are set up | `ResultInvalidState` | success | success (`each_family_command_hands_out_a_session_on_its_own_server`) |
+//! | 202 or 1402 whose header is not PR's exact one (here: a data word) | `ResultInvalidState` (202), `ResultInvalidCombination` (1402) | success | success: the data is not read (`a_family_command_with_a_data_word_is_accepted`) |
 
 use std::sync::Arc;
 
