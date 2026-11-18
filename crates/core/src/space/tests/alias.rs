@@ -273,7 +273,7 @@ fn the_kernel_reaches_the_alias_through_the_mapper() {
     // A refusal is the address space's error, in words.
     assert_eq!(
         mapper.map_alias(ALIAS, SOURCE, PAGE_SIZE, Perms::ReadWrite),
-        Err(MapperError(
+        Err(MapperError::Refused(
             SpaceError::Map(MapError::AlreadyMapped { va: ALIAS }).to_string()
         ))
     );

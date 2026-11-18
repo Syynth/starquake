@@ -1299,7 +1299,7 @@ impl Translated {
                     backing,
                     perms,
                 } => self.map(address, backing.size(), perms),
-                MapperCall::AllocateShared { .. } => {}
+                MapperCall::AllocateShared { .. } | MapperCall::ReleaseShared { .. } => {}
                 MapperCall::Unmap { address, size } => {
                     for page in pages_of(address, size) {
                         assert!(self.0.remove(&page).is_some(), "not mapped: {page:#x}");

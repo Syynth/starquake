@@ -459,12 +459,21 @@ impl IpcContext<'_> {
     /// server reads and writes by offset ([`SharedPages`]). The server keeps the creator's
     /// reference for as long as it lives, as it does an event's.
     ///
-    /// [`KernelError::InvalidSize`] for a size of zero or one that rounds past the 64-bit space
-    /// (a guess: see [`shared_memory_size`]), [`KernelError::InvalidNewMemoryPermission`] unless
-    /// `permission` is read or read-write, and [`KernelError::OutOfResource`] when the object
-    /// table is full. A translation with no backing to share
-    /// ([`Mapper::allocate_shared`](crate::memory::Mapper::allocate_shared)) is the kernel's
-    /// own failure, logged, and [`KernelError::InvalidState`] here.
+    /// Refused, in this order, with nothing taken: [`KernelError::InvalidSize`] for a size of
+    /// zero or one that rounds past the 64-bit space (a guess: see [`shared_memory_size`]);
+    /// [`KernelError::InvalidNewMemoryPermission`] unless `permission` is read or read-write;
+    /// [`KernelError::OutOfResource`] when the object table is full (`KSharedMemory::Create`
+    /// comes before `Initialize`); then [`KernelError::OutOfMemory`] when the translation has
+    /// no room for the pages (`KSharedMemory::Initialize`'s `ResultOutOfMemory`,
+    /// [`AddressSpace::allocate_shared`]). The pages are taken last, after every check that can
+    /// refuse, so a refused create takes no guest RAM. A translation with no backing to share,
+    /// or that refuses for another reason, is the kernel's own failure, logged, and
+    /// [`KernelError::InvalidState`] here.
+    ///
+    /// Eden's `Initialize` reserves the size from the system's resource limit before it
+    /// allocates (`ResultLimitReached`); starquake has no system resource limit, and charges
+    /// neither the process's pool nor its resource limit, which Eden does not charge either
+    /// ([`crate::memory::shared`], "Not built").
     pub fn create_shared_memory(
         &mut self,
         size: u64,
@@ -476,12 +485,7 @@ impl IpcContext<'_> {
         }
         self.dispatcher
             .with::<(&mut AddressSpace, &mut Scheduler), _>(|(space, scheduler)| {
-                let pages = space.allocate_shared(size)?;
-                let memory = SharedMemory::new(pages.backing(), permission)?;
-                let object = scheduler
-                    .objects_mut()
-                    .create(Object::SharedMemory(memory))?;
-                Ok((object, pages))
+                create_shared_memory_in(space, scheduler, size, permission)
             })
             .map_err(call_error)
     }
@@ -529,6 +533,41 @@ impl IpcContext<'_> {
     /// the dispatch's time, when the request is settled, before the system call's own event.
     pub fn record(&mut self, kind: EventKind) {
         self.events.push(kind);
+    }
+}
+
+/// [`IpcContext::create_shared_memory`] once its arguments are checked: room in the object
+/// table, then the pages, then the object. `size` is whole pages and not zero, and
+/// `permission` a shared memory's. When the object cannot be made after all (a table that was
+/// not full refusing, which only broken bookkeeping does), the pages go back to the
+/// translation at once ([`AddressSpace::release_shared`]); a failure to give them back is
+/// logged, and the object's error returned.
+pub(super) fn create_shared_memory_in(
+    space: &mut AddressSpace,
+    scheduler: &mut Scheduler,
+    size: u64,
+    permission: SvcPermission,
+) -> CallResult<(ObjectId, SharedPages)> {
+    if scheduler.objects().is_full() {
+        // `KSharedMemory::Create` returning null.
+        return Err(KernelError::OutOfResource.into());
+    }
+    let pages = space.allocate_shared(size)?;
+    let made = SharedMemory::new(pages.backing(), permission)
+        .map_err(SvcError::from)
+        .and_then(|memory| {
+            Ok(scheduler
+                .objects_mut()
+                .create(Object::SharedMemory(memory))?)
+        });
+    match made {
+        Ok(object) => Ok((object, pages)),
+        Err(error) => {
+            if let Err(release) = space.release_shared(pages.backing()) {
+                tracing::error!(%release, "the pages of a shared memory not made stay used");
+            }
+            Err(error)
+        }
     }
 }
 

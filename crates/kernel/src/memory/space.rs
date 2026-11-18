@@ -1200,18 +1200,27 @@ impl AddressSpace {
     /// ([`Mapper::allocate_shared`]). `size` is whole pages and not zero: the caller rounds it
     /// ([`super::shared_memory_size`]). Pages of any other size than asked for are refused.
     ///
-    /// An internal failure when the translation has no backing to share, or refuses.
+    /// [`KernelError::OutOfMemory`] when the translation has no room for them
+    /// ([`MapperError::OutOfMemory`]), as Eden answers when its page heap has no run of the
+    /// size (`R_UNLESS(m_physical_address != 0, ResultOutOfMemory)` in
+    /// `KSharedMemory::Initialize`, `eden/src/core/hle/kernel/k_shared_memory.cpp` @
+    /// cf654052). An internal failure when the translation has no backing to share, or refuses
+    /// for any other reason ([`MapperError::Refused`]).
     pub fn allocate_shared(&mut self, size: u64) -> CallResult<SharedPages> {
         if !size.is_multiple_of(PAGE_SIZE) || size == 0 {
             return Err(SvcError::Internal(format!(
                 "shared memory of {size:#x} bytes is not whole pages"
             )));
         }
-        let pages = self.mapper.allocate_shared(size).map_err(|error| {
-            SvcError::Internal(format!(
-                "the translation gave no backing for {size:#x} bytes of shared memory: {error}"
-            ))
-        })?;
+        let pages = self
+            .mapper
+            .allocate_shared(size)
+            .map_err(|error| match error {
+                MapperError::OutOfMemory(_) => SvcError::Kernel(KernelError::OutOfMemory),
+                MapperError::Refused(_) => SvcError::Internal(format!(
+                    "the translation gave no backing for {size:#x} bytes of shared memory: {error}"
+                )),
+            })?;
         if pages.size() != size {
             return Err(SvcError::Internal(format!(
                 "the translation gave {:#x} bytes of shared memory for {size:#x}",
@@ -1219,6 +1228,21 @@ impl AddressSpace {
             )));
         }
         Ok(pages)
+    }
+
+    /// Gives the pages of a shared memory whose last reference has gone back to the [`Mapper`]
+    /// ([`Mapper::release_shared`]; `KSharedMemory::Finalize` closes its page group). Every
+    /// mapping of it held a reference ([`crate::svc::shared_memory`]), so none is left. An
+    /// internal failure when the translation refuses: the pages stay as they were, used.
+    pub fn release_shared(&mut self, backing: BackingRange) -> CallResult<()> {
+        self.mapper.release_shared(backing).map_err(|error| {
+            SvcError::Internal(format!(
+                "the translation would not take back the {:#x} bytes of shared memory at \
+                 {:#x}: {error}",
+                backing.size(),
+                backing.base()
+            ))
+        })
     }
 
     /// Maps the shared memory `memory`, which `object` names, at `address` with `permission`

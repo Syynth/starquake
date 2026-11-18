@@ -18,6 +18,7 @@ use crate::snapshot::FormatError;
 use crate::svc::resource_limit::{
     LimitTables, get_resource_limit_current_value, get_resource_limit_limit_value,
 };
+use crate::svc::shared_memory::free_released;
 use crate::svc::transfer_memory::{create_transfer_memory, unlock_released};
 
 /// The test servers' service numbers: distinct, so a lookup that ignores the number fails.
@@ -707,6 +708,47 @@ fn a_save_with_transfer_memories_still_to_unlock_is_refused() {
         &mut kernel.tables.scheduler,
         &mut kernel.tables.address_space,
         own,
+    )
+    .unwrap();
+    assert!(kernel.save().is_ok());
+}
+
+#[test]
+fn a_save_with_shared_memories_still_to_give_back_is_refused_after_the_unlocks() {
+    let mut kernel = kernel();
+    // The second shared memory is unmapped and only its creator holds it: its last reference.
+    let unmapped = kernel.shared[1];
+    kernel.tables.scheduler.close_object(unmapped).unwrap();
+    assert_eq!(
+        kernel.save(),
+        Err(ObjectSnapshotError::PendingFrees { count: 1 })
+    );
+    // Both kinds pending: the unlocks are reported first.
+    let (lent, _) = kernel.transfer;
+    kernel
+        .tables
+        .handles
+        .remove(kernel.tables.scheduler.objects_mut(), lent)
+        .unwrap();
+    assert_eq!(
+        kernel.save(),
+        Err(ObjectSnapshotError::PendingUnlocks { count: 1 })
+    );
+    let own = kernel.own();
+    unlock_released(
+        &mut kernel.tables.scheduler,
+        &mut kernel.tables.address_space,
+        own,
+    )
+    .unwrap();
+    assert_eq!(
+        kernel.save(),
+        Err(ObjectSnapshotError::PendingFrees { count: 1 })
+    );
+    // Once the dispatcher has given the pages back, the save goes ahead.
+    free_released(
+        &mut kernel.tables.scheduler,
+        &mut kernel.tables.address_space,
     )
     .unwrap();
     assert!(kernel.save().is_ok());
@@ -1617,6 +1659,11 @@ fn the_errors_read_as_plain_words() {
         ObjectSnapshotError::PendingUnlocks { count: 1 }.to_string(),
         "released transfer memories whose pages are still locked: 1 (a snapshot is taken \
          between calls, when there are none)"
+    );
+    assert_eq!(
+        ObjectSnapshotError::PendingFrees { count: 2 }.to_string(),
+        "released shared memories whose pages are still to be given back: 2 (a snapshot is \
+         taken between calls, when there are none)"
     );
     assert_eq!(
         ObjectSnapshotError::Handle {

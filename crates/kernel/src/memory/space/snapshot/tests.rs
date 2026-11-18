@@ -1157,7 +1157,7 @@ fn faults() -> Vec<(&'static str, Fault)> {
             SnapshotError::Translation {
                 address: third.address,
                 size: third.pages * PAGE_SIZE,
-                error: MapperError("the test told the mapper to refuse".into()),
+                error: MapperError::Refused("the test told the mapper to refuse".into()),
                 stuck: 0,
             }
         }),
@@ -2038,7 +2038,7 @@ fn the_errors_read_as_plain_words() {
         SnapshotError::Translation {
             address: 0x4000_0000,
             size: 0x2000,
-            error: MapperError("no".into()),
+            error: MapperError::Refused("no".into()),
             stuck: 0x1000
         }
         .to_string(),

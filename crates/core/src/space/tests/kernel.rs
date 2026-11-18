@@ -20,6 +20,12 @@
 //!   which also checks that refusals of the kinds the kernel tests pin leave the translation as
 //!   it was.
 //!
+//! The release hook (`KSharedMemory::Finalize`) reaches this mapper too: its pages come back to
+//! guest RAM only after the last reference and the unmapping's flush,
+//! `the_last_reference_gives_the_pages_back_and_a_close_while_mapped_does_not` (the kernel's
+//! own on a recording mapper is `giving_back_waits_for_the_last_reference_and_goes_after_the_unmap`
+//! in `crates/kernel/src/dispatch/memory_objects/tests.rs`).
+//!
 //! The other ten are not mirrored, because the real mapper adds nothing to what they observe:
 //!
 //! - Refused before the mapper is called, which the kernel tests pin with an empty mapper log:
@@ -46,7 +52,7 @@ use starquake_kernel::memory::{
 };
 use starquake_kernel::object::Object;
 use starquake_kernel::result::{CallResult, KernelError, SvcError};
-use starquake_kernel::svc::shared_memory::{map_shared_memory, unmap_shared_memory};
+use starquake_kernel::svc::shared_memory::{free_released, map_shared_memory, unmap_shared_memory};
 use starquake_kernel::tables::Scheduler;
 
 use super::*;
@@ -359,19 +365,84 @@ fn one_shared_memory_mapped_at_two_places_shares_its_pages() {
 }
 
 #[test]
-fn running_out_of_ram_by_exactly_one_page_is_the_kernels_own_failure_and_not_a_panic() {
+fn running_out_of_ram_by_exactly_one_page_is_out_of_memory_and_not_a_panic() {
     let mut world = World::new();
     let all = RAM_PAGES * PAGE_SIZE;
     let over = all + PAGE_SIZE;
+    let out_of_memory = Err(SvcError::Kernel(KernelError::OutOfMemory));
     assert_eq!(
         world.kernel.allocate_shared(over).map(|pages| pages.size()),
-        Err(SvcError::Internal(format!(
-            "the translation gave no backing for {over:#x} bytes of shared memory: mapping \
-             {over:#x} bytes needs more guest RAM than the {all:#x} bytes left"
-        )))
+        out_of_memory
     );
     assert_eq!(
         world.kernel.allocate_shared(all).map(|pages| pages.size()),
         Ok(all)
     );
+    // Exactly the last page is gone: one more page is refused the same way.
+    assert_eq!(
+        world
+            .kernel
+            .allocate_shared(PAGE_SIZE)
+            .map(|pages| pages.size()),
+        out_of_memory
+    );
+}
+
+#[test]
+fn the_last_reference_gives_the_pages_back_and_a_close_while_mapped_does_not() {
+    let mut world = World::new();
+    let all = RAM_PAGES * PAGE_SIZE;
+    let out_of_memory = Err(SvcError::Kernel(KernelError::OutOfMemory));
+    // One shared memory takes all of guest RAM.
+    let shared = world.shared(RAM_PAGES, SvcPermission::ReadWrite);
+    let read_write = raw(SvcPermission::ReadWrite);
+    world.map(shared.handle, SHARED, all, read_write).unwrap();
+    shared.pages.write(all - 4, b"last").unwrap();
+    // The guest's handle and the server's reference go; the mapping's is left, so nothing is
+    // given back, and RAM is still all used.
+    world
+        .handles
+        .remove(world.scheduler.objects_mut(), shared.handle)
+        .unwrap();
+    world.scheduler.close_object(shared.object).unwrap();
+    assert_eq!(world.refs(shared.object), 1);
+    assert!(!world.scheduler.objects().has_frees());
+    assert_eq!(
+        free_released(&mut world.scheduler, &mut world.kernel),
+        Ok(())
+    );
+    assert_eq!(
+        world
+            .kernel
+            .allocate_shared(PAGE_SIZE)
+            .map(|pages| pages.size()),
+        out_of_memory
+    );
+    // Unmapping drops the last reference: the pages are given back, but the unmapping's
+    // flush is still owed, so they are not handed out yet.
+    world
+        .kernel
+        .unmap_shared(SHARED, all, shared.object)
+        .unwrap();
+    world.scheduler.close_object(shared.object).unwrap();
+    assert_eq!(world.refs(shared.object), 0);
+    assert_eq!(
+        free_released(&mut world.scheduler, &mut world.kernel),
+        Ok(())
+    );
+    assert!(!world.scheduler.objects().has_frees());
+    assert_eq!(
+        world
+            .kernel
+            .allocate_shared(PAGE_SIZE)
+            .map(|pages| pages.size()),
+        out_of_memory
+    );
+    // Once the flush has been handed out, all of RAM is there again, zeroed.
+    assert_eq!(world.space.tables().take_pending_flushes().len(), 1);
+    let again = world.kernel.allocate_shared(all).unwrap();
+    assert_eq!(again.backing(), shared.pages.backing());
+    let mut last = [0xFF; 4];
+    again.read(all - 4, &mut last).unwrap();
+    assert_eq!(last, [0; 4]);
 }

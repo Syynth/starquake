@@ -9,6 +9,22 @@
 //! bytes), and [`MapperLog::shared_view`] reads and writes guest addresses that
 //! [`Mapper::map_shared`] mapped, through the same pages, so a test can see a host write
 //! through a guest mapping and the reverse.
+//!
+//! # How it differs from the real translation
+//!
+//! `starquake-core`'s `SpaceMapper` is the translation the kernel runs on. This one keeps its
+//! contract for shared memory with these differences:
+//!
+//! - **Running out**: more than the room left ([`SHARED_CAPACITY`] in all) is
+//!   [`MapperError::OutOfMemory`], as the real one's is, but in words of its own.
+//! - **Released pages are never handed out again** ([`Mapper::release_shared`]): the call is
+//!   recorded ([`MapperCall::ReleaseShared`]) and checked, and the pages stay used. The real
+//!   one hands them out again once every flush owed by their unmappings has run; this one has
+//!   no flushes to wait for, and the tests that use it observe the call, not the reuse.
+//!   A release is refused, with nothing recorded, unless the pages are exactly a run it
+//!   handed out and not released yet, and no mapping of them is left, as the real one
+//!   refuses. Those two checks come before the refusal switches ([`MapperLog::refuse`],
+//!   [`MapperLog::refuse_calls`]), so a release they refuse is not counted as a call.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -58,6 +74,11 @@ pub enum MapperCall {
         /// The pages handed out.
         backing: BackingRange,
     },
+    /// [`Mapper::release_shared`].
+    ReleaseShared {
+        /// The pages given back.
+        backing: BackingRange,
+    },
     /// [`Mapper::map_shared`].
     MapShared {
         /// The first address.
@@ -95,6 +116,9 @@ struct State {
     next: u64,
     /// What `map_shared` mapped and nothing has unmapped since: first address to the pages.
     shared: BTreeMap<u64, BackingRange>,
+    /// The runs `allocate_shared` handed out and `release_shared` has not taken back: first
+    /// address to one past the last.
+    handed_out: BTreeMap<u64, u64>,
 }
 
 impl Default for State {
@@ -108,6 +132,7 @@ impl Default for State {
             physical: Arc::new(FlatMemory::new(SHARED_BASE, capacity)),
             next: SHARED_BASE,
             shared: BTreeMap::new(),
+            handed_out: BTreeMap::new(),
         }
     }
 }
@@ -227,7 +252,9 @@ impl RecordingMapper {
             let number = state.counted;
             state.counted = state.counted.saturating_add(1);
             if state.refuse || state.refuse_calls.contains(&number) {
-                return Err(MapperError("the test told the mapper to refuse".into()));
+                return Err(MapperError::Refused(
+                    "the test told the mapper to refuse".into(),
+                ));
             }
             state.calls.push(call);
             Ok(())
@@ -271,13 +298,45 @@ impl Mapper for RecordingMapper {
                 .filter(|end| *end <= SHARED_BASE + SHARED_CAPACITY)
                 .and_then(|_| BackingRange::new(state.next, size).ok())
                 .ok_or_else(|| {
-                    MapperError(format!("no room for {size:#x} bytes of shared memory"))
+                    MapperError::OutOfMemory(format!(
+                        "no room for {size:#x} bytes of shared memory"
+                    ))
                 })?;
             Ok::<_, MapperError>((backing, Arc::clone(&state.physical)))
         })?;
         self.record(MapperCall::AllocateShared { backing })?;
-        self.0.with(|state| state.next = backing.end());
+        self.0.with(|state| {
+            state.next = backing.end();
+            state.handed_out.insert(backing.base(), backing.end());
+        });
         Ok(SharedPages::new(backing, physical))
+    }
+
+    fn release_shared(&mut self, backing: BackingRange) -> Result<(), MapperError> {
+        self.0.with(|state| {
+            let (base, size) = (backing.base(), backing.size());
+            if state.handed_out.get(&base) != Some(&backing.end()) {
+                return Err(MapperError::Refused(format!(
+                    "the {size:#x} bytes at {base:#x} are not a shared memory this mapper \
+                     handed out"
+                )));
+            }
+            if let Some(address) = state
+                .shared
+                .iter()
+                .find(|(_, mapped)| **mapped == backing)
+                .map(|(address, _)| *address)
+            {
+                return Err(MapperError::Refused(format!(
+                    "the {size:#x} bytes at {base:#x} are still mapped at {address:#x}"
+                )));
+            }
+            Ok(())
+        })?;
+        self.record(MapperCall::ReleaseShared { backing })?;
+        self.0
+            .with(|state| state.handed_out.remove(&backing.base()));
+        Ok(())
     }
 
     fn map_shared(

@@ -1424,7 +1424,7 @@ fn rebuild<'a>(
                 }
                 match objects.get(&address) {
                     Some(memory) => mapper.map_shared(address, memory.backing(), perms),
-                    None => Err(MapperError(
+                    None => Err(MapperError::Refused(
                         "no shared memory was resolved for this mapping".into(),
                     )),
                 }
@@ -1461,7 +1461,7 @@ fn rebuild<'a>(
 /// The translation's permission for `permission`, or the refusal [`rebuild`] reports.
 fn translation(permission: MemoryPermission) -> Result<starquake_memory::Perms, MapperError> {
     permission.guest().ok_or_else(|| {
-        MapperError(format!(
+        MapperError::Refused(format!(
             "permission {:#x} has no translation",
             permission.bits()
         ))

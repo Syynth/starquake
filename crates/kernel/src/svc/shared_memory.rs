@@ -10,7 +10,26 @@
 //!   `RemoveSharedMemory`, which open a reference to the shared memory for each mapping and
 //!   close it when the mapping goes (or when the mapping fails, `ON_RESULT_FAILURE`).
 //!
+//! - `eden/src/core/hle/kernel/k_shared_memory.cpp` @ cf654052: `KSharedMemory::Finalize`,
+//!   which closes the page group when the last reference goes: [`free_released`].
+//!
 //! The page-table steps are [`AddressSpace::map_shared`] and [`AddressSpace::unmap_shared`].
+//!
+//! # The last reference
+//!
+//! A mapping holds a reference (above), so the last reference to a shared memory goes only
+//! once every mapping of it is gone: by `UnmapSharedMemory`, by closing the last handle after
+//! that, or by its server letting go. Whichever call drops it, the object table keeps the
+//! shared memory ([`crate::object::Objects::take_frees`]), and [`free_released`] gives its
+//! pages back to the translation ([`AddressSpace::release_shared`]) before the dispatcher lets
+//! the kernel lock go, as a released transfer memory's pages are unlocked. The translation hands
+//! them out again only once the flushes the unmappings owe have run. Eden's
+//! `KSharedMemory::Finalize` also releases the system resource limit's `PhysicalMemoryMax`
+//! reservation; nothing is reserved here (see [`crate::memory::shared`], "Not built").
+//!
+//! A failed give-back is an internal failure, logged by the dispatcher, and the other
+//! give-backs still run; the pages stay used. Eden's `Finalize` cannot fail. Test:
+//! `giving_back_goes_on_past_a_refusal_and_reports_the_first`.
 //!
 //! # Results, in the order they are checked
 //!
@@ -135,6 +154,22 @@ fn map(
         return Err(KernelError::InvalidNewMemoryPermission.into());
     }
     space.map_shared(address, object, memory, permission)
+}
+
+/// Gives back the pages of every shared memory whose last reference went
+/// ([`crate::object::Objects::take_frees`]), oldest first: `KSharedMemory::Finalize` for each,
+/// through [`AddressSpace::release_shared`]. All are given back even when one fails, and the
+/// first failure is returned: every failure is the kernel's own bookkeeping (pages the
+/// translation did not hand out, or still mapped).
+pub fn free_released(scheduler: &mut Scheduler, space: &mut AddressSpace) -> CallResult<()> {
+    let mut result = Ok(());
+    for memory in scheduler.objects_mut().take_frees() {
+        let released = space.release_shared(memory.backing());
+        if result.is_ok() {
+            result = released;
+        }
+    }
+    result
 }
 
 /// Unmaps the shared memory `handle` names from `address` in the caller's address space, where

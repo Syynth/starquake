@@ -1,6 +1,8 @@
 //! Shared memory in the address space over flat guest-physical memory: runs of guest RAM handed
 //! out whole, mapped at once wherever the kernel maps them, with the permission it asks for,
-//! and never handed out again.
+//! and handed out again only once given back and every flush has run.
+
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use starquake_memory::stage1::VA_SPACE_END;
 
@@ -499,16 +501,251 @@ fn the_kernels_mapper_reports_a_shared_memory_refusal_in_words() {
         mapper
             .allocate_shared(ALL_RAM + PAGE_SIZE)
             .map(|pages| pages.backing()),
-        Err(MapperError(format!(
+        Err(MapperError::OutOfMemory(format!(
             "mapping {:#x} bytes needs more guest RAM than the {ALL_RAM:#x} bytes left",
             ALL_RAM + PAGE_SIZE
         )))
     );
     assert_eq!(
         mapper.map_shared(LOW, ram(0, 1), Perms::Read),
-        Err(MapperError(format!(
+        Err(MapperError::Refused(format!(
             "the {PAGE_SIZE:#x} bytes of guest RAM at {RAM_BASE:#x} are not a shared memory this \
              address space handed out"
         )))
     );
+    // Giving back: pages that are not a run handed out, and pages still mapped.
+    assert_eq!(
+        mapper.release_shared(ram(0, 1)),
+        Err(MapperError::Refused(format!(
+            "the {PAGE_SIZE:#x} bytes of guest RAM at {RAM_BASE:#x} are not a shared memory this \
+             address space handed out"
+        )))
+    );
+    let shared = mapper.allocate_shared(PAGE_SIZE).unwrap();
+    mapper
+        .map_shared(LOW, shared.backing(), Perms::Read)
+        .unwrap();
+    assert_eq!(
+        mapper.release_shared(shared.backing()),
+        Err(MapperError::Refused(format!(
+            "the {PAGE_SIZE:#x} bytes of guest RAM at {RAM_BASE:#x} are still mapped, at \
+             {LOW:#x} among other places"
+        )))
+    );
+}
+
+// ----- Giving back ------------------------------------------------------------------------------
+
+#[test]
+fn given_back_pages_wait_for_every_flush_and_come_back_zeroed() {
+    let space = Arc::new(space());
+    let mut mapper = SpaceMapper(Arc::clone(&space));
+    let shared = mapper.allocate_shared(2 * PAGE_SIZE).unwrap();
+    assert_eq!(shared.backing(), ram(0, 2));
+    mapper
+        .map_shared(LOW, shared.backing(), Perms::ReadWrite)
+        .unwrap();
+    space.write(LOW + PAGE_SIZE + 8, b"held").unwrap();
+    mapper.unmap(LOW, 2 * PAGE_SIZE).unwrap();
+    assert!(space.tables().has_pending_flushes());
+    assert_eq!(mapper.release_shared(shared.backing()), Ok(()));
+    // While the unmapping's flush is owed, a vCPU may still reach the pages: a shared memory
+    // of their size comes from RAM never handed out, and they keep what they held.
+    assert_eq!(space.allocate_shared(2 * PAGE_SIZE), Ok(ram(2, 2)));
+    assert_eq!(ram_bytes::<4>(&space, 1, 8), *b"held");
+    // Once the flush is handed out, they are handed out again, zeroed.
+    assert_eq!(space.tables().take_pending_flushes().len(), 1);
+    assert_eq!(space.allocate_shared(2 * PAGE_SIZE), Ok(ram(0, 2)));
+    assert_eq!(ram_bytes::<4>(&space, 1, 8), [0; 4]);
+    // Reuse took nothing from the RAM never handed out.
+    assert_eq!(space.shadow().next, RAM_BASE + 4 * PAGE_SIZE);
+    assert_eq!(
+        space.shadow().shared.iter().collect::<Vec<_>>(),
+        [
+            (&RAM_BASE, &(RAM_BASE + 2 * PAGE_SIZE)),
+            (&(RAM_BASE + 2 * PAGE_SIZE), &(RAM_BASE + 4 * PAGE_SIZE))
+        ]
+    );
+}
+
+#[test]
+fn a_run_given_back_with_no_flush_owed_is_reusable_at_the_next_allocation() {
+    let space = space();
+    let pages = space.allocate_shared(PAGE_SIZE).unwrap();
+    // Never mapped, so no flush is owed for it, and none for anything else.
+    assert!(!space.tables().has_pending_flushes());
+    assert_eq!(space.release_shared(pages), Ok(()));
+    assert_eq!(space.allocate_shared(PAGE_SIZE), Ok(ram(0, 1)));
+}
+
+#[test]
+fn given_back_runs_are_reused_first_in_address_order_and_split() {
+    let space = space();
+    let three = space.allocate_shared(3 * PAGE_SIZE).unwrap();
+    let kept = space.allocate_shared(PAGE_SIZE).unwrap();
+    let one = space.allocate_shared(PAGE_SIZE).unwrap();
+    assert_eq!((three, kept, one), (ram(0, 3), ram(3, 1), ram(4, 1)));
+    // Given back highest first: reuse goes by address, not by the order they came back.
+    space.release_shared(one).unwrap();
+    space.release_shared(three).unwrap();
+    // One page: the first run in address order that holds it (a best fit would take the run
+    // of exactly one page), whose rest stays reusable.
+    assert_eq!(space.allocate_shared(PAGE_SIZE), Ok(ram(0, 1)));
+    assert_eq!(
+        space.shadow().reusable.iter().collect::<Vec<_>>(),
+        [
+            (&(RAM_BASE + PAGE_SIZE), &(RAM_BASE + 3 * PAGE_SIZE)),
+            (&(RAM_BASE + 4 * PAGE_SIZE), &(RAM_BASE + 5 * PAGE_SIZE))
+        ]
+    );
+    // Two pages: the rest, which holds exactly two.
+    assert_eq!(space.allocate_shared(2 * PAGE_SIZE), Ok(ram(1, 2)));
+    // Two more: no run holds them, so they come from RAM never handed out.
+    assert_eq!(space.allocate_shared(2 * PAGE_SIZE), Ok(ram(5, 2)));
+    assert_eq!(space.allocate_shared(PAGE_SIZE), Ok(ram(4, 1)));
+    assert_eq!(space.shadow().reusable.len(), 0);
+}
+
+#[test]
+fn running_out_counts_the_largest_reusable_run_as_available() {
+    let space = space();
+    let two = space.allocate_shared(2 * PAGE_SIZE).unwrap();
+    space.allocate_shared(ALL_RAM - 2 * PAGE_SIZE).unwrap();
+    space.release_shared(two).unwrap();
+    // RAM never handed out is used up; the run given back holds two pages.
+    let before = snapshot(&space);
+    assert_eq!(
+        space.allocate_shared(3 * PAGE_SIZE),
+        Err(SpaceError::OutOfRam {
+            size: 3 * PAGE_SIZE,
+            available: 2 * PAGE_SIZE
+        })
+    );
+    // The refusal made the run reusable (no flush is owed), and handed nothing out.
+    let promoted = snapshot(&space);
+    assert_eq!((promoted.0, &promoted.3), (before.0, &before.3));
+    assert_eq!(promoted.4, []);
+    assert_eq!(promoted.5, [(RAM_BASE, RAM_BASE + 2 * PAGE_SIZE)]);
+    // Exactly the run fits, and then nothing is left.
+    assert_eq!(space.allocate_shared(2 * PAGE_SIZE), Ok(ram(0, 2)));
+    assert_eq!(
+        space.allocate_shared(PAGE_SIZE),
+        Err(SpaceError::OutOfRam {
+            size: PAGE_SIZE,
+            available: 0
+        })
+    );
+    // The size is still checked before the room, and a reusable run does not change that.
+    space.release_shared(ram(0, 2)).unwrap();
+    assert_eq!(
+        space.allocate_shared(PAGE_SIZE + 1),
+        Err(SpaceError::Map(MapError::MisalignedSize {
+            size: PAGE_SIZE + 1
+        }))
+    );
+    assert_eq!(
+        space.allocate_shared(0),
+        Err(SpaceError::Map(MapError::Empty))
+    );
+}
+
+#[test]
+fn a_release_is_refused_unless_the_pages_are_a_run_handed_out_and_unmapped() {
+    let space = space();
+    let pages = space.allocate_shared(2 * PAGE_SIZE).unwrap();
+    // A neighbour whose pages start exactly where these end, mapped throughout.
+    let neighbour = space.allocate_shared(PAGE_SIZE).unwrap();
+    assert_eq!(neighbour.base(), pages.end());
+    space.map_shared(FAR, pages, Perms::Read).unwrap();
+    space.map_shared(LOW, pages, Perms::ReadWrite).unwrap();
+    space
+        .map_shared(LOW + 2 * PAGE_SIZE, neighbour, Perms::ReadWrite)
+        .unwrap();
+    let before = snapshot(&space);
+    let not_shared = |range: BackingRange| {
+        Err(SpaceError::NotShared {
+            base: range.base(),
+            size: range.size(),
+        })
+    };
+    // Part of the run, and a run never handed out: not one run. The part is mapped too, and
+    // that is checked second.
+    assert_eq!(space.release_shared(ram(0, 1)), not_shared(ram(0, 1)));
+    assert_eq!(space.release_shared(ram(1, 1)), not_shared(ram(1, 1)));
+    assert_eq!(space.release_shared(ram(6, 1)), not_shared(ram(6, 1)));
+    // The run, mapped at two places: the lowest is named.
+    let still_mapped = |va| {
+        Err(SpaceError::StillMapped {
+            base: RAM_BASE,
+            size: 2 * PAGE_SIZE,
+            va,
+        })
+    };
+    assert_eq!(space.release_shared(pages), still_mapped(LOW));
+    assert_eq!(snapshot(&space), before);
+    space.unmap(LOW, 2 * PAGE_SIZE).unwrap();
+    assert_eq!(space.release_shared(pages), still_mapped(FAR));
+    // Unmapped everywhere: given back, though the neighbour is still mapped.
+    space.unmap(FAR, 2 * PAGE_SIZE).unwrap();
+    assert_eq!(space.release_shared(pages), Ok(()));
+    assert_eq!(space.shadow().released, [pages]);
+    // A second time: no longer a run handed out.
+    assert_eq!(space.release_shared(pages), not_shared(pages));
+    assert_eq!(space.shadow().released, [pages]);
+}
+
+/// Guest-physical memory whose RAM can be told to refuse writes: the zeroing write's failure.
+#[derive(Debug)]
+struct RefusingRam {
+    inner: FlatMemory,
+    refuse: AtomicBool,
+}
+
+impl GuestMemory for RefusingRam {
+    fn read(&self, pa: u64, buf: &mut [u8]) -> Result<(), Fault> {
+        self.inner.read(pa, buf)
+    }
+
+    fn write(&self, pa: u64, data: &[u8]) -> Result<(), Fault> {
+        if pa >= RAM_BASE && self.refuse.load(Ordering::SeqCst) {
+            return Err(Fault { address: pa });
+        }
+        self.inner.write(pa, data)
+    }
+}
+
+#[test]
+fn a_run_whose_zeroing_fails_is_not_handed_out_and_stays_reusable() {
+    let pages = usize::try_from((POOL_PAGES + RAM_PAGES) * PAGE_SIZE).unwrap();
+    let memory = RefusingRam {
+        inner: FlatMemory::new(POOL_BASE, pages),
+        refuse: AtomicBool::new(false),
+    };
+    let pool = BackingRange::new(POOL_BASE, POOL_PAGES * PAGE_SIZE).unwrap();
+    let space = Arc::new(AddressSpace::new(memory, ram(0, RAM_PAGES), pool).unwrap());
+    let mut mapper = SpaceMapper(Arc::clone(&space));
+    let shared = mapper.allocate_shared(2 * PAGE_SIZE).unwrap();
+    mapper.release_shared(shared.backing()).unwrap();
+    // Made reusable by a first allocation, which the run cannot hold.
+    assert_eq!(space.allocate_shared(3 * PAGE_SIZE), Ok(ram(2, 3)));
+    let before = snapshot(&space);
+    space.tables.memory().refuse.store(true, Ordering::SeqCst);
+    let fault = Fault { address: RAM_BASE };
+    assert_eq!(
+        space.allocate_shared(2 * PAGE_SIZE),
+        Err(SpaceError::Zeroing(fault))
+    );
+    assert_eq!(snapshot(&space), before);
+    // The kernel hears of it as a refusal, in words.
+    assert_eq!(
+        mapper
+            .allocate_shared(PAGE_SIZE)
+            .map(|pages| pages.backing()),
+        Err(MapperError::Refused(format!(
+            "guest RAM refused the write that zeroes pages handed out again: {fault}"
+        )))
+    );
+    assert_eq!(snapshot(&space), before);
+    space.tables.memory().refuse.store(false, Ordering::SeqCst);
+    assert_eq!(space.allocate_shared(2 * PAGE_SIZE), Ok(ram(0, 2)));
 }

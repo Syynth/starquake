@@ -282,20 +282,28 @@ impl<Id: SlabId, T> Slab<Id, T> {
         }
     }
 
+    /// Whether [`Self::insert`] would refuse with [`SlabError::Full`]: no freed slot to reuse,
+    /// and no room for another slot under the limit.
+    #[must_use]
+    pub fn is_full(&self) -> bool {
+        self.free.is_empty()
+            && u32::try_from(self.slots.len()).map_or(true, |next| next >= self.max_slots)
+    }
+
     /// Stores `value` and returns its id.
     ///
     /// Reuses the most recently freed slot if there is one, otherwise appends a slot.
     pub fn insert(&mut self, value: T) -> Result<Id, SlabError> {
+        if self.is_full() {
+            return Err(SlabError::Full {
+                max_slots: self.max_slots,
+            });
+        }
         let index = if let Some(&index) = self.free.last() {
             index
         } else {
-            let full = SlabError::Full {
-                max_slots: self.max_slots,
-            };
-            let next = u32::try_from(self.slots.len()).map_err(|_| full)?;
-            if next >= self.max_slots {
-                return Err(full);
-            }
+            // Not full, so the slot count fits under the limit.
+            let next = u32::try_from(self.slots.len()).map_err(|_| SlabError::Corrupt)?;
             self.slots.push(Slot::Vacant {
                 generation: FIRST_GENERATION,
             });

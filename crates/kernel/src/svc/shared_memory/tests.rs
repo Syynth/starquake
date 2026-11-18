@@ -8,8 +8,8 @@ use super::*;
 use crate::handle::Closed;
 use crate::id::{ProcessId, SlabId};
 use crate::memory::fixture::{self, SHARED};
-use crate::memory::testing::{MapperCall, MapperLog};
-use crate::memory::{MemoryAttribute, MemoryBlock, MemoryPermission, SharedPages};
+use crate::memory::testing::{MapperCall, MapperLog, SHARED_CAPACITY};
+use crate::memory::{MapperError, MemoryAttribute, MemoryBlock, MemoryPermission, SharedPages};
 
 /// Pages in the tests' usual shared memory.
 const PAGES: u64 = 2;
@@ -606,7 +606,8 @@ fn a_translation_with_the_default_has_no_shared_backing() {
     }
     let memory = fixture::memory(crate::memory::MemoryArrangement::FourGb);
     let mut plain = Plain;
-    let refused = crate::memory::MapperError(crate::memory::mapper::NO_SHARED_BACKING.into());
+    let refused =
+        crate::memory::MapperError::Refused(crate::memory::mapper::NO_SHARED_BACKING.into());
     assert_eq!(
         crate::memory::Mapper::allocate_shared(&mut plain, PAGE_SIZE).map(|pages| pages.size()),
         Err(refused.clone())
@@ -616,6 +617,10 @@ fn a_translation_with_the_default_has_no_shared_backing() {
         crate::memory::Mapper::map_shared(&mut plain, SHARED, backing, Perms::Read),
         Err(refused.clone())
     );
+    assert_eq!(
+        crate::memory::Mapper::release_shared(&mut plain, backing),
+        Err(refused.clone())
+    );
     let mut space = AddressSpace::new(&memory, Box::new(Plain)).unwrap();
     assert_eq!(
         space.allocate_shared(PAGE_SIZE).map(|pages| pages.size()),
@@ -623,4 +628,141 @@ fn a_translation_with_the_default_has_no_shared_backing() {
             "the translation gave no backing for {PAGE_SIZE:#x} bytes of shared memory: {refused}"
         )))
     );
+    assert_eq!(
+        space.release_shared(backing),
+        Err(SvcError::Internal(format!(
+            "the translation would not take back the {PAGE_SIZE:#x} bytes of shared memory at \
+             0x0: {refused}"
+        )))
+    );
+}
+
+#[test]
+fn a_translation_out_of_room_is_out_of_memory_and_any_other_refusal_is_internal() {
+    let mut world = World::new();
+    // All of the recording mapper's room, then one page more.
+    assert_eq!(
+        world
+            .space
+            .allocate_shared(SHARED_CAPACITY)
+            .map(|pages| pages.size()),
+        Ok(SHARED_CAPACITY)
+    );
+    assert_eq!(
+        world
+            .space
+            .allocate_shared(PAGE_SIZE)
+            .map(|pages| pages.size()),
+        Err(SvcError::Kernel(KernelError::OutOfMemory))
+    );
+    // A translation told to refuse, with room: the kernel's own failure.
+    let fresh = World::new();
+    fresh.log.refuse(true);
+    let mut space = fresh.space;
+    let refused = MapperError::Refused("the test told the mapper to refuse".into());
+    assert_eq!(
+        space.allocate_shared(PAGE_SIZE).map(|pages| pages.size()),
+        Err(SvcError::Internal(format!(
+            "the translation gave no backing for {PAGE_SIZE:#x} bytes of shared memory: {refused}"
+        )))
+    );
+}
+
+#[test]
+fn the_last_close_gives_the_pages_back_and_a_close_while_mapped_does_not() {
+    let mut world = World::new();
+    let shared = world.shared(PAGES, SvcPermission::ReadWrite);
+    let read_write = raw(SvcPermission::ReadWrite);
+    world.map(shared.handle, SHARED, SIZE, read_write).unwrap();
+    drop(world.log.take());
+    // The server's reference and the guest's handle go while the mapping holds one.
+    world.scheduler.close_object(shared.object).unwrap();
+    world
+        .handles
+        .remove(world.scheduler.objects_mut(), shared.handle)
+        .unwrap();
+    assert_eq!(world.refs(shared.object), 1);
+    assert!(!world.scheduler.objects().has_frees());
+    assert_eq!(
+        free_released(&mut world.scheduler, &mut world.space),
+        Ok(())
+    );
+    assert_eq!(world.log.take(), []);
+    // The mapping goes: the last reference, and the pages are given back after the unmap.
+    world
+        .space
+        .unmap_shared(SHARED, SIZE, shared.object)
+        .unwrap();
+    world.scheduler.close_object(shared.object).unwrap();
+    assert!(world.scheduler.objects().has_frees());
+    assert_eq!(
+        free_released(&mut world.scheduler, &mut world.space),
+        Ok(())
+    );
+    let backing = shared.pages.backing();
+    assert_eq!(
+        world.log.take(),
+        [
+            MapperCall::Unmap {
+                address: SHARED,
+                size: SIZE
+            },
+            MapperCall::ReleaseShared { backing },
+        ]
+    );
+    assert!(!world.scheduler.objects().has_frees());
+    // Nothing is left to give back.
+    assert_eq!(
+        free_released(&mut world.scheduler, &mut world.space),
+        Ok(())
+    );
+    assert_eq!(world.log.take(), []);
+}
+
+#[test]
+fn giving_back_goes_on_past_a_refusal_and_reports_the_first() {
+    let mut world = World::new();
+    let shareds: Vec<Shared> = (1..=3)
+        .map(|pages| world.shared(pages, SvcPermission::Read))
+        .collect();
+    // The second's pages are mapped behind the kernel's back, so the mapper refuses them for a
+    // reason of its own, after the first was refused by the switch.
+    let second = shareds[1].pages.backing();
+    for shared in &shareds {
+        world
+            .handles
+            .remove(world.scheduler.objects_mut(), shared.handle)
+            .unwrap();
+        world.scheduler.close_object(shared.object).unwrap();
+    }
+    let unseen = SharedMemory::new(second, SvcPermission::Read).unwrap();
+    world
+        .space
+        .map_shared(
+            SHARED,
+            ObjectId::from_parts(0, 1),
+            unseen,
+            SvcPermission::Read,
+        )
+        .unwrap();
+    drop(world.log.take());
+    world.log.refuse_calls(&[0]);
+    let first = shareds[0].pages.backing();
+    assert_eq!(
+        free_released(&mut world.scheduler, &mut world.space),
+        Err(SvcError::Internal(format!(
+            "the translation would not take back the {:#x} bytes of shared memory at {:#x}: the \
+             test told the mapper to refuse",
+            first.size(),
+            first.base()
+        )))
+    );
+    // The third was still given back, and nothing is left.
+    assert_eq!(
+        world.log.take(),
+        [MapperCall::ReleaseShared {
+            backing: shareds[2].pages.backing()
+        }]
+    );
+    assert!(!world.scheduler.objects().has_frees());
 }
