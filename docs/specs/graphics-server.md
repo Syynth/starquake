@@ -779,6 +779,9 @@ change a decision.
      reference-emulator trace of which levels NvRm reads settles it. If the title fails there,
      NX2's 0x40 values are the first experiment. (Pinned in
      `crates/gsv/src/nvsrv/ctrl_gpu.rs`, "Conflicts".)
+   - **nvhost-gpu's event ids.** PR #4588 answers `QueryEvent` 1, 2, 3 and 7; NX2 makes an
+     event for any id. Built as PR's, by the owner's decision of 2026-11-17, which departs from
+     decision 8 because NX2's answer is unbounded. Does NvRm ask for any id besides 7?
 2. **vi2 31/32:** does the title register request groups with 261 before waiting on them? (vsync
    fallback, slice 13)
 3. **Does the title wait for the "buffer available" notification before reusing a buffer?** If
