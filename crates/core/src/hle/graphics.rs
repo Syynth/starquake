@@ -21,12 +21,15 @@
 //! | nvsrv | [`GSV_NVSRV`] | `nvsrv_server` over the shared state and the front, with the front as its channel front too, and told of deferred replies as `fsp-srv` is ([`super::Reads::ready`]) |
 //!
 //! The root answers 202, 204, 497 and 1402 with its family's server (`starquake_gsv::root`,
-//! "The family sessions"); every other root command is still the root's logged stub. The vsync
-//! clock (slice 12, `starquake_gsv::shared::vsync`) needs no server: it is part of gsv's shared
-//! state and runs in the timer thread's turn (below), and vi2 (slice 13) will start it by adding
-//! listeners. Slices 13 to 15 (vi2, present and video: issues 191 to 193) are not built: when
-//! they land, each adds its server here beside these and its number to the root, and 305, the
-//! video commands and the native image commands stop being stubs.
+//! "The family sessions"). Built with the shared state, the root also answers the native memory
+//! and image commands (111, 112, 114, 314, 315, 423, 429, 430, 435, 1510) from the native tables
+//! in it (`starquake_gsv::native`, slice 8; `the_root_answers_native_memory_and_images`); every
+//! other root command is still the root's logged stub. The vsync clock (slice 12,
+//! `starquake_gsv::shared::vsync`) needs no server: it is part of gsv's shared state and runs in
+//! the timer thread's turn (below), and vi2 (slice 13) will start it by adding listeners. Slices
+//! 13 to 15 (vi2, present and video: issues 191 to 193) are not built: when they land, each adds
+//! its server here beside these and its number to the root, and 305 and the video commands stop
+//! being stubs.
 //!
 //! # The GPU front
 //!

@@ -355,7 +355,7 @@ fn with_gpu<R>(
 }
 
 /// The low byte of a word: a one-byte field (module docs, "The worker").
-const fn low_byte(word: u32) -> u8 {
+pub(crate) const fn low_byte(word: u32) -> u8 {
     word.to_le_bytes()[0]
 }
 

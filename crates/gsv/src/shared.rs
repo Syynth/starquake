@@ -15,9 +15,10 @@
 //! [`Locked::unwatch`]), the syncpt sessions' waiter table ([`Waiters`]: [`Locked::arm`],
 //! [`Locked::disarm`]; slice 4), the GPU memory bookkeeping ([`Locked::gpu`], slice 7), the
 //! shared syncpoint page ([`page`], slice 5) and the submissions that wait for room in a full GPU
-//! queue ([`Locked::submits`], slice 11: [`crate::nvsrv::gpu::submits`]); the vsync clock
-//! ([`vsync`], slice 12) has its own place beside them; later slices add vi2's queues and the
-//! native object tables (spec, "Concurrency inside gsv").
+//! queue ([`Locked::submits`], slice 11: [`crate::nvsrv::gpu::submits`]) and the native memories
+//! and images ([`Locked::native`], slice 8: [`crate::native`]); the vsync clock ([`vsync`],
+//! slice 12) has its own place beside them; later slices add vi2's queues (spec, "Concurrency
+//! inside gsv").
 //!
 //! Each armed wait holds one watch of its syncpoint: [`Locked::arm`] takes it, and gives back
 //! the watch of the wait it replaces; [`Locked::disarm`] and the drain's firing give it back
@@ -145,6 +146,7 @@ use thiserror::Error;
 
 use crate::completion::{Completion, CompletionQueue};
 use crate::gpu::GpuMemory;
+use crate::native::NativeObjects;
 use crate::note::Note;
 use crate::nvsrv::gpu::submits::Submits;
 use crate::syncpt::waiters::{SavedWait, SavedWaitError, Wait, Waiters};
@@ -234,6 +236,8 @@ pub struct GsvShared {
     submits: Submits,
     /// The vsync clock (slice 12).
     vsync: Vsync,
+    /// The native memories and images (slice 8).
+    native: NativeObjects,
 }
 
 impl GsvShared {
@@ -246,6 +250,7 @@ impl GsvShared {
             page: Page::default(),
             submits: Submits::new(),
             vsync: Vsync::new(),
+            native: NativeObjects::new(),
         }
     }
 
@@ -274,6 +279,12 @@ impl GsvShared {
     #[must_use]
     pub fn gpu_memory(&self) -> &GpuMemory {
         &self.gpu
+    }
+
+    /// The native memories and images.
+    #[must_use]
+    pub const fn native_objects(&self) -> &NativeObjects {
+        &self.native
     }
 }
 
@@ -363,6 +374,11 @@ impl Locked<'_> {
     /// The submissions that wait for room, to change (nvsrv's handlers, slice 11).
     pub fn submits(&mut self) -> &mut Submits {
         &mut self.state.submits
+    }
+
+    /// The native memories and images, to change (the root's native handlers, slice 8).
+    pub fn native(&mut self) -> &mut NativeObjects {
+        &mut self.state.native
     }
 
     /// The GPU memory bookkeeping and the waiting submissions together, for nvsrv's handlers,
@@ -587,6 +603,7 @@ impl Shared {
             page: Page::default(),
             submits: Submits::new(),
             vsync: Vsync::new(),
+            native: NativeObjects::new(),
         };
         Ok(Self::with_state(state, syncpoints, queue, service))
     }
