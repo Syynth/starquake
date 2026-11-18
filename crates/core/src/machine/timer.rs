@@ -156,8 +156,7 @@ fn turns<V: Vcpu, C: HostClock + Clone>(machine: &Machine<'_, V, C>) -> Result<(
                 .dispatcher
                 .fire_timers(&**machine.env, &machine.session.recorder)
                 .map_err(|error| Ending::Failed(format!("a timeout could not end: {error}")))?;
-            // PROVISIONAL: nothing keeps the environment's recording (`machine` module docs).
-            drop(machine.env.take_recording());
+            machine.env.keep();
             machine
                 .dispatcher
                 .reschedule(&mut machine.signals())
@@ -224,9 +223,10 @@ pub(super) fn deliver<V: Vcpu, C: HostClock + Clone>(
             .deliver_replies(server, &mut caller)
             .map_err(|error| Ending::Failed(format!("a reply could not be delivered: {error}")))?;
     }
-    // PROVISIONAL: nothing keeps the environments' recordings (`machine` module docs). Every
-    // read `fsp-srv`'s workers finish rings this turn, so what they read is dropped here.
-    drop(machine.env.take_recording());
+    // The run keeps the environment's recording; the workers' recordings are dropped (`machine`
+    // module docs, "The environment"). Every read `fsp-srv`'s workers finish rings this turn, so
+    // what they read is dropped here.
+    machine.env.keep();
     for reads in &machine.reads {
         drop(reads.take_recording());
     }
@@ -261,8 +261,7 @@ pub(super) fn graphics<V: Vcpu, C: HostClock + Clone>(
     );
     machine.graphics.turn(&mut host, now);
     let turned = host.finish();
-    // PROVISIONAL: nothing keeps the environment's recording (`machine` module docs).
-    drop(machine.env.take_recording());
+    machine.env.keep();
     turned.map_err(failed)?;
     machine
         .dispatcher

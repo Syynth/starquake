@@ -415,6 +415,7 @@ fn run_options(args: &RunArgs, command_line: Vec<String>, romfs: Option<RomFs>) 
         sd_card: None,
         romfs,
         rtc: rtc_at_boot(args.date),
+        environment: starquake_core::EnvSource::Live,
     }
 }
 

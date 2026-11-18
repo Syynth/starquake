@@ -189,9 +189,11 @@ use crate::space::Touch;
 
 mod core_loop;
 mod cores;
+mod environment;
 mod timer;
 
 use cores::Cores;
+use environment::{ENV_RECORDING_BYTES, RunEnv};
 
 /// The core the vCPU the caller made stands for, and the core the process's start is recorded
 /// on.
@@ -396,15 +398,19 @@ pub(crate) struct Limits {
     /// Bytes of guest log text kept: whole lines, from the first, while their total stays at
     /// or below this. From the first line that does not fit, lines are counted and not kept.
     pub(crate) guest_log_bytes: usize,
+    /// Bytes of the environment's recording kept ([`RunReport::environment`]): whole records,
+    /// from the first, while their total stays at or below this (`machine/environment.rs`).
+    pub(crate) env_recording_bytes: usize,
 }
 
 impl Limits {
-    /// The limits of a real run: 100,000 trace events (about 10 MiB of events) and 4 MiB of
-    /// guest log text. Starquake's own numbers; the observability spec asks for a size cap per
-    /// run without fixing one.
+    /// The limits of a real run: 100,000 trace events (about 10 MiB of events), 4 MiB of
+    /// guest log text and 16 MiB of the environment's recording. Starquake's own numbers; the
+    /// observability spec asks for a size cap per run without fixing one.
     pub(crate) const DEFAULT: Self = Self {
         trace_events: 100_000,
         guest_log_bytes: GUEST_LOG_BYTES,
+        env_recording_bytes: ENV_RECORDING_BYTES,
     };
 }
 
@@ -466,34 +472,57 @@ impl<C: HostClock + Clone> Session<'_, C> {
         self.recorder.record(self.clock.now(), core, thread, kind);
     }
 
-    /// The environment the kernel and the services read during this run: live, on the other
-    /// copy of the run's clock, with the fixed random seed, and serving the SD card folder the
-    /// run names ([`RunOptions::sd_card`]) and the title's RomFS ([`RunOptions::romfs`]) to
-    /// `fsp-srv`.
-    fn environment(&self) -> Arc<LiveEnv>
+    /// The environment the kernel and the services read during this run, as its options say
+    /// ([`RunOptions::environment`]): live ([`Session::live_environment`]), keeping up to
+    /// [`ENV_RECORDING_BYTES`] of its recording, or a replay of the recording the options hold
+    /// (module docs, "The environment").
+    #[cfg(test)]
+    fn environment(&self) -> Arc<RunEnv>
+    where
+        C: 'static,
+    {
+        self.environment_within(ENV_RECORDING_BYTES)
+    }
+
+    /// [`Session::environment`], keeping up to `limit` bytes of a live environment's recording.
+    fn environment_within(&self, limit: usize) -> Arc<RunEnv>
+    where
+        C: 'static,
+    {
+        Arc::new(RunEnv::new(
+            &self.options.environment,
+            || self.live_environment(),
+            limit,
+        ))
+    }
+
+    /// A live environment over the host: on the other copy of the run's clock, with the fixed
+    /// random seed, and serving the SD card folder the run names ([`RunOptions::sd_card`]) and
+    /// the title's RomFS ([`RunOptions::romfs`]) to `fsp-srv`.
+    fn live_environment(&self) -> LiveEnv
     where
         C: 'static,
     {
         let env = LiveEnv::new(self.clock.for_environment(), RANDOM_SEED);
         let sd_card = self.options.sd_card.as_ref().map(HostFolder::new);
         let host = FspHost::new(sd_card, self.options.romfs.clone());
-        Arc::new(if host.is_empty() {
+        if host.is_empty() {
             env
         } else {
             env.with_host_io(host)
-        })
+        }
     }
 
     /// The environments `fsp-srv`'s workers read through during this run, one per worker
-    /// ([`worker::COUNT`]): each made as [`Session::environment`] makes the first, over the same
-    /// SD card folder and the same RomFS (whose source and cache a clone shares). See the module
-    /// docs, "The environment".
+    /// ([`worker::COUNT`]): each live, made as [`Session::live_environment`] makes it, over the
+    /// same SD card folder and the same RomFS (whose source and cache a clone shares), in a
+    /// replayed run too. See the module docs, "The environment".
     fn reads_environments(&self) -> Vec<Arc<LiveEnv>>
     where
         C: 'static,
     {
         (0..worker::COUNT.get())
-            .map(|_| self.environment())
+            .map(|_| Arc::new(self.live_environment()))
             .collect()
     }
 }
@@ -651,7 +680,7 @@ struct Machine<'a, V: Vcpu, C> {
     session: &'a Session<'a, C>,
     space: &'a dyn GuestSpace<V>,
     dispatcher: Dispatcher,
-    env: &'a Arc<LiveEnv>,
+    env: &'a Arc<RunEnv>,
     log: Arc<Mutex<GuestLog>>,
     tally: Mutex<Tally>,
     cores: Cores<V::Interrupter>,
@@ -788,10 +817,10 @@ pub(crate) fn run_serving<V: Vcpu, C: HostClock + Clone + 'static>(
     session.recorder.add_sink(Arc::clone(&flight));
     session.recorder.add_sink(Arc::clone(&stubs));
 
-    let env = session.environment();
+    let env = session.environment_within(limits.env_recording_bytes);
     let mut mappings = placed.mappings.clone();
     let booted = if console == placed.description.console {
-        boot(address_space, placed, space)
+        boot(address_space, placed, space, &*env)
     } else {
         Err(CONSOLE_MISMATCH.to_owned())
     };
@@ -848,6 +877,9 @@ pub(crate) fn run_serving<V: Vcpu, C: HostClock + Clone + 'static>(
         }
     };
     let (exit, events, events_error) = settle_dump(flight.dump(), exit);
+    // What the loop has not moved yet: all of it, for a run that ended before the loop ran.
+    env.keep();
+    let (environment, environment_dropped) = env.kept();
     RunReport {
         exit,
         duration: started.elapsed(),
@@ -866,6 +898,8 @@ pub(crate) fn run_serving<V: Vcpu, C: HostClock + Clone + 'static>(
         host_log: Vec::new(),
         host_log_dropped: 0,
         date,
+        environment,
+        environment_dropped,
     }
 }
 
@@ -905,9 +939,12 @@ fn settle_dump(
 }
 
 /// Creates the process with the kernel and starts its main thread
-/// (`starquake_kernel::process::create` and `run`, see "Start state" in the module docs): the
-/// process `placed` describes, whose memory is `address_space`, entering at the program's
-/// entry with the stack `placed` has; `memory` is where its thread-local page is cleared. The
+/// (`starquake_kernel::process::create_with_env` and `run_with_env`, see "Start state" in the
+/// module docs): the process `placed` describes, whose memory is `address_space`, entering at
+/// the program's entry with the stack `placed` has; `memory` is where its thread-local page is
+/// cleared. `env` gives the process its entropy and the main thread its `x18`, in that order
+/// (module docs, "The environment"); a failed draw ends the run as an emulator error, the words
+/// "the kernel could not be set up: " and the kernel's error. The
 /// main thread is runnable and runs nowhere yet: the first core the scheduler gives it to loads
 /// it. Returns the dispatcher over the process's tables, and the memory-map entry of the main
 /// thread's thread-local page.
@@ -915,10 +952,12 @@ fn boot(
     address_space: AddressSpace,
     placed: &Placement,
     memory: &dyn GuestMemory,
+    env: &dyn Env,
 ) -> Result<(Dispatcher, Mapping), String> {
     let failed = |error: &dyn std::fmt::Display| format!("the kernel could not be set up: {error}");
-    let mut tables = process::create(&placed.description, address_space).map_err(|e| failed(&e))?;
-    let main = process::run(&mut tables, memory, placed.entry, placed.stack_top)
+    let mut tables = process::create_with_env(&placed.description, address_space, env)
+        .map_err(|e| failed(&e))?;
+    let main = process::run_with_env(&mut tables, memory, (placed.entry, placed.stack_top), env)
         .map_err(|e| failed(&e))?;
     let tpidrro = tables
         .scheduler
@@ -945,7 +984,7 @@ fn drive<V: Vcpu, C: HostClock + Clone + 'static>(
     dispatcher: Dispatcher,
     space: &dyn GuestSpace<V>,
     session: &Session<'_, C>,
-    env: &Arc<LiveEnv>,
+    env: &Arc<RunEnv>,
     limits: Limits,
     install: &Install,
 ) -> (Ending, GuestLog, Tally, Aftermath) {
@@ -1010,7 +1049,7 @@ impl<'a, V: Vcpu, C: HostClock + Clone> Machine<'a, V, C> {
         dispatcher: Dispatcher,
         space: &'a dyn GuestSpace<V>,
         session: &'a Session<'a, C>,
-        env: &'a Arc<LiveEnv>,
+        env: &'a Arc<RunEnv>,
         limits: Limits,
         install: &Install,
     ) -> Result<Self, Box<Unstarted>>
@@ -1050,7 +1089,7 @@ impl<'a, V: Vcpu, C: HostClock + Clone> Machine<'a, V, C> {
         // wall clock always answers (module docs, "The run's date").
         let started = set_up_services(date_at_boot(rtc, &**env), |time| {
             let given = Given {
-                env: Arc::<LiveEnv>::clone(env),
+                env: Arc::<RunEnv>::clone(env),
                 reads: machine.reads.clone(),
                 ready: machine.ready.clone(),
                 halt: Arc::<Halted>::clone(&machine.halted),
@@ -1079,8 +1118,9 @@ impl<'a, V: Vcpu, C: HostClock + Clone> Machine<'a, V, C> {
     /// about the guest ([`Aftermath`]: the stack block of a crash, the threads of a timeout),
     /// once every core and the timer thread have stopped.
     fn finish(self) -> (Ending, GuestLog, Tally, Aftermath) {
-        // PROVISIONAL: nothing keeps the environments' recordings (see the module docs).
-        drop(self.env.take_recording());
+        // The run keeps the environment's recording; the workers' recordings are dropped (module
+        // docs, "The environment").
+        self.env.keep();
         for reads in &self.reads {
             drop(reads.take_recording());
         }

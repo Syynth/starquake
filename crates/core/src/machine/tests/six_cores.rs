@@ -212,7 +212,7 @@ fn stepped(
     let sink = Arc::new(VecSink::new());
     session.recorder.add_sink(Arc::clone(&sink));
     let env = session.environment();
-    let (dispatcher, _) = boot(guest.address_space(), &guest.placed, space).unwrap();
+    let (dispatcher, _) = boot(guest.address_space(), &guest.placed, space, &*env).unwrap();
     let Ok(machine) = Machine::start(dispatcher, space, &session, &env, Limits::DEFAULT, install)
     else {
         unreachable!("the services could not be installed");
@@ -623,6 +623,7 @@ fn a_run_whose_threads_all_wait_on_nothing_that_can_end_is_an_emulator_error() {
         sd_card: None,
         romfs: None,
         rtc: RtcAtBoot::eden_default(),
+        environment: crate::EnvSource::Live,
     };
     let report = guest.run(main, &options);
     assert_eq!(report.exit, ExitReason::EmulatorError(WAITING.to_owned()));
@@ -741,6 +742,7 @@ fn the_runs_timeout_stops_every_core() {
                 sd_card: None,
                 romfs: None,
                 rtc: RtcAtBoot::eden_default(),
+                environment: crate::EnvSource::Live,
             },
             Instant::now(),
             timebase(),
@@ -801,7 +803,7 @@ fn a_timed_out_run_says_where_each_thread_is_and_which_core_held_it() {
         recorder: Recorder::new(),
     };
     let env = session.environment();
-    let (dispatcher, _) = boot(guest.address_space(), &guest.placed, &guest.memory).unwrap();
+    let (dispatcher, _) = boot(guest.address_space(), &guest.placed, &guest.memory, &*env).unwrap();
     let Ok(machine) = Machine::start(
         dispatcher,
         &guest.memory,
@@ -882,7 +884,7 @@ fn a_run_that_did_not_time_out_reads_no_threads() {
         recorder: Recorder::new(),
     };
     let env = session.environment();
-    let (dispatcher, _) = boot(guest.address_space(), &guest.placed, &guest.memory).unwrap();
+    let (dispatcher, _) = boot(guest.address_space(), &guest.placed, &guest.memory, &*env).unwrap();
     let Ok(machine) = Machine::start(
         dispatcher,
         &guest.memory,

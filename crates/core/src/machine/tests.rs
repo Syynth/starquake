@@ -22,7 +22,9 @@ use starquake_trace::{
 };
 
 use super::*;
-use starquake_kernel::process::{Console, ProcessDescription};
+use starquake_kernel::process::{
+    CFI_REGISTER, CFI_VALUE_SET_BITS, Console, ENTROPY_COUNT, ProcessDescription,
+};
 
 use crate::clock::NRO_CONSOLE;
 use crate::crash::{Location, SyndromeReport};
@@ -201,6 +203,23 @@ fn svc(id: SvcId) -> Exit {
     Exit::Svc(id.number())
 }
 
+/// The random numbers a live run draws as it boots, in order (module docs, "The environment"):
+/// the process's entropy, then its main thread's `x18` before its bit is set. Drawn here from
+/// a live environment of the run's seed, independently of the run.
+fn boot_draws() -> [u64; ENTROPY_COUNT + 1] {
+    let env = LiveEnv::new(FixedClock::new(0, 1), RANDOM_SEED);
+    let mut draws = [0; ENTROPY_COUNT + 1];
+    for draw in &mut draws {
+        *draw = env.random_u64().unwrap();
+    }
+    draws
+}
+
+/// The main thread's `x18` in a live run: the last of [`boot_draws`] with its bit set.
+fn boot_x18() -> u64 {
+    boot_draws()[ENTROPY_COUNT] | CFI_VALUE_SET_BITS
+}
+
 fn lifecycle(phase: LifecyclePhase) -> EventKind {
     EventKind::Lifecycle {
         phase,
@@ -266,17 +285,20 @@ fn a_guest_that_prints_two_lines_and_exits_is_reported_in_full() {
     let (entry, stack_top, tls) = (guest.placed.entry, guest.placed.stack_top, guest.tls);
     let main_thread = Handle::from_parts(MAX_TABLE_SIZE - 1, MIN_LINEAR_ID).unwrap();
     assert_eq!(main_thread.raw(), 0x83ff);
+    let x18 = boot_x18();
 
     let vcpu = ScriptedVcpu::new()
         .then(
             move |regs| {
                 // What the loop starts the thread with: `x1` is a handle to the main thread,
                 // the first handle of a full-size table (its last index, the first linear
-                // id), and everything else is zero. The reference emulator's trace of the
-                // homebrew fixture shows the same value, 0x83ff, left in `x2`.
+                // id), `x18` the number the run drew for it, and everything else is zero. The
+                // reference emulator's trace of the homebrew fixture shows the same value,
+                // 0x83ff, left in `x2`.
                 assert_eq!((regs.pc, regs.sp, regs.tpidrro), (entry, stack_top, tls));
                 let mut x = [0; 31];
                 x[1] = u64::from(main_thread.raw());
+                x[CFI_REGISTER] = x18;
                 assert_eq!((regs.x, regs.tpidr, regs.pstate), (x, 0, 0));
                 regs.x[0] = first_at;
                 regs.x[1] = first_len;
@@ -469,6 +491,7 @@ fn a_data_abort_is_a_crash_that_names_the_address_and_the_instruction() {
         sd_card: None,
         romfs: None,
         rtc: RtcAtBoot::eden_default(),
+        environment: crate::EnvSource::Live,
     };
     let report = guest.run(vcpu, &options);
 
@@ -673,6 +696,7 @@ fn a_guest_that_never_stops_is_ended_by_the_timeout() {
         sd_card: None,
         romfs: None,
         rtc: RtcAtBoot::eden_default(),
+        environment: crate::EnvSource::Live,
     };
     let vcpu = ScriptedVcpu::new().then_spin();
     let interrupters = Interrupters::default();
@@ -693,6 +717,7 @@ fn a_run_that_ends_before_its_timeout_does_not_wait_for_it() {
         sd_card: None,
         romfs: None,
         rtc: RtcAtBoot::eden_default(),
+        environment: crate::EnvSource::Live,
     };
     let vcpu = ScriptedVcpu::new().then(|_| {}, svc(SvcId::ExitProcess));
     let started = Instant::now();
@@ -837,10 +862,11 @@ fn get_system_tick_is_the_clock_at_the_rate_the_run_was_given() {
 }
 
 #[test]
-fn the_environments_recording_is_dropped_as_it_is_made() {
+fn the_environments_recording_moves_to_the_kept_recording_as_it_is_made() {
     // Every dispatch reads the environment's clock once, and a live environment keeps every
-    // answer it gives. Nothing in a run uses that recording, so the loop must not let it grow
-    // with the number of system calls the guest makes.
+    // answer it gives. The loop moves each answer into the run's kept recording, which its
+    // limit bounds, so the environment's own does not grow with the number of system calls the
+    // guest makes.
     const CALLS: u64 = 1_000;
     let guest = Guest::new(&programs::hello().unwrap());
     let options = RunOptions::default();
@@ -857,7 +883,7 @@ fn the_environments_recording_is_dropped_as_it_is_made() {
     }
     let mut vcpu = vcpu.then(|_| {}, svc(SvcId::ExitProcess));
 
-    let (dispatcher, _) = boot(guest.address_space(), &guest.placed, &guest.memory).unwrap();
+    let (dispatcher, _) = boot(guest.address_space(), &guest.placed, &guest.memory, &*env).unwrap();
     let (ending, _, tally, _) = drive(
         vcpus(&mut vcpu),
         dispatcher,
@@ -879,6 +905,18 @@ fn the_environments_recording_is_dropped_as_it_is_made() {
     // ...and none of their clock readings is still held. (The count, not the records: a
     // failure would otherwise print one record per call.)
     assert_eq!(env.recording().len(), 0);
+    // They were kept, after the boot's draws: one clock reading per dispatch.
+    let (kept, dropped) = env.kept();
+    assert_eq!(dropped, 0);
+    let draws: Vec<EnvRecord> = boot_draws().into_iter().map(EnvRecord::Random).collect();
+    assert_eq!(kept[..draws.len()], draws[..]);
+    let readings = &kept[draws.len()..];
+    assert_eq!(readings.len(), usize::try_from(CALLS + 1).unwrap());
+    assert!(
+        readings
+            .iter()
+            .all(|record| matches!(record, EnvRecord::Clock(_)))
+    );
     // It is an environment that records: one more reading is one record.
     let reading = env.now().unwrap();
     assert_eq!(env.recording(), [EnvRecord::Clock(reading)]);
@@ -934,6 +972,7 @@ fn the_trace_and_the_guest_log_stop_growing_at_their_limits() {
     let limits = Limits {
         trace_events: 4,
         guest_log_bytes: lines[0].len() + lines[1].len(),
+        env_recording_bytes: ENV_RECORDING_BYTES,
     };
     let mut vcpu = printing(&guest.memory, &lines);
     let report = run_within(
@@ -980,6 +1019,7 @@ fn a_run_within_its_limits_is_not_truncated() {
     let limits = Limits {
         trace_events: 7,
         guest_log_bytes: 10,
+        env_recording_bytes: ENV_RECORDING_BYTES,
     };
     let mut vcpu = printing(&guest.memory, &lines);
     let report = run_within(
@@ -1002,7 +1042,8 @@ fn a_run_within_its_limits_is_not_truncated() {
         Limits::DEFAULT,
         Limits {
             trace_events: 100_000,
-            guest_log_bytes: 4 << 20
+            guest_log_bytes: 4 << 20,
+            env_recording_bytes: 16 << 20,
         }
     );
 }
@@ -1428,6 +1469,7 @@ mod date;
 mod graphics;
 mod guest_log;
 mod reads;
+mod replay;
 mod six_cores;
 mod stopped;
 mod stubbed;
