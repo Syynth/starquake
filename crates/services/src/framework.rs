@@ -120,7 +120,8 @@
 //!   stubbed.
 //! - **Close** messages: the session is dropped from the server and nothing is written.
 //! - **Tracing.** Every request the framework answers is one event in the run's event stream,
-//!   marked when it was stubbed or deferred: see [`trace`].
+//!   naming the interface it went to and its protocol, marked when it was stubbed or deferred:
+//!   see [`trace`]. The server also counts its requests by command ([`Server::requests`]).
 //!
 //! A method's [`Fault`], and the cases in the table below, are answered with a reply that holds
 //! only a result code. The codes are in [`result`]; most are guesses, and say so there.
