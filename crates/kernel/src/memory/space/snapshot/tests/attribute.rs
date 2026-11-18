@@ -1,8 +1,10 @@
 //! Check 4's attribute rules (decision log, 2026-11-17, "Address-space restore checks attributes
 //! against state flags, not a permission table"): `Uncached` and `GpuAccessible` only on a state
 //! with `CanChangeAttribute`, `PermissionLocked` only on a state with `CanPermissionLock`. Every
-//! state on both sides of each rule, the order against the checks around them, and a live space
-//! taken through every attribute change the kernel makes, saved, restored and used.
+//! state on both sides of each rule, every combination of the three attributes on every state
+//! against a model (so a rule that tests for exactly its attributes, not any one of them, fails),
+//! the order against the checks around them, and a live space taken through every attribute
+//! change the kernel makes, saved, restored and used.
 
 use super::*;
 use crate::memory::fixture::TEXT_PAGES;
@@ -89,6 +91,127 @@ fn each_attribute_is_refused_exactly_on_the_states_without_its_flag() {
             refused,
             MemoryState::ALL.len() - 1 - allowed.len(),
             "{name}"
+        );
+    }
+}
+
+/// The three attributes check 4 tests against a state flag, for building their combinations.
+const RULED: [MemoryAttribute; 3] = [
+    MemoryAttribute::UNCACHED,
+    MemoryAttribute::GPU_ACCESSIBLE,
+    MemoryAttribute::PERMISSION_LOCKED,
+];
+
+/// Every non-empty combination of [`RULED`]: the seven subsets of three attributes.
+fn ruled_combinations() -> Vec<MemoryAttribute> {
+    (1_u8..1 << RULED.len())
+        .map(|subset| {
+            RULED
+                .iter()
+                .enumerate()
+                .filter(|(bit, _)| subset & (1 << bit) != 0)
+                .fold(MemoryAttribute::NONE, |all, (_, &one)| all | one)
+        })
+        .collect()
+}
+
+/// The fault check 4's model gives `attribute` on `state`, from the hand-listed states: any of
+/// `Uncached` and `GpuAccessible` on a state without `CanChangeAttribute` first, then
+/// `PermissionLocked` on a state without `CanPermissionLock`; `None` when both rules pass.
+fn model_fault(state: MemoryState, attribute: MemoryAttribute) -> Option<BlockFault> {
+    let changed = attribute.contains(MemoryAttribute::UNCACHED)
+        || attribute.contains(MemoryAttribute::GPU_ACCESSIBLE);
+    let locked = attribute.contains(MemoryAttribute::PERMISSION_LOCKED);
+    if changed && !CAN_CHANGE_ATTRIBUTE.contains(&state) {
+        Some(BlockFault::ChangedAttribute)
+    } else if locked && !CAN_PERMISSION_LOCK.contains(&state) {
+        Some(BlockFault::PermissionLock)
+    } else {
+        None
+    }
+}
+
+#[test]
+fn every_combination_of_the_attributes_on_every_state_matches_the_model() {
+    // Each of the seven combinations on the thread-local page made each state that is not
+    // free, read-only. Combinations matter on the states with `CanChangeAttribute` and not
+    // `CanPermissionLock` (`Normal`, `Transferred`, `Insecure`): there `Uncached` alone passes,
+    // and `Uncached | PermissionLocked` must still be `PermissionLock`'s fault, so a rule that
+    // tests for exactly its attributes rather than any one of them fails here.
+    let rich = rich();
+    let tls = thread_local(&rich);
+    let read = MemoryPermission::from_svc(SvcPermission::Read).bits();
+    let combinations = ruled_combinations();
+    assert_eq!(combinations.len(), 7);
+    let mut checked = 0;
+    for &state in MemoryState::ALL {
+        if state == MemoryState::Free {
+            continue;
+        }
+        let mut case = Case::new(&rich);
+        let index = at(&case.body, tls);
+        let block = &mut case.body.blocks[index];
+        block.state = state.word();
+        block.permission = read;
+        let without = case.restore().0.err();
+        let saved = case.body.blocks[index].attribute;
+        for &attribute in &combinations {
+            case.body.blocks[index].attribute = saved | attribute.bits();
+            let with = case.restore().0.err();
+            let expected = model_fault(state, attribute).map_or_else(
+                || without.clone(),
+                |fault| Some(SnapshotError::Block { index, fault }),
+            );
+            assert_eq!(with, expected, "{attribute:?} on {state:?}");
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, (MemoryState::ALL.len() - 1) * combinations.len());
+}
+
+#[test]
+fn heap_memory_with_another_attribute_and_permission_locked_is_the_lock_s_fault() {
+    // `Normal` has `CanChangeAttribute` but not `CanPermissionLock`. Heap blocks of the rich
+    // space that are, or are made, uncached, GPU accessible or device shared restore as they
+    // are; each of them permission locked too is refused with `PermissionLock`.
+    let rich = rich();
+    let heap = rich.heap;
+    let uncached = MemoryAttribute::UNCACHED;
+    let gpu = MemoryAttribute::GPU_ACCESSIBLE;
+    let locked = MemoryAttribute::PERMISSION_LOCKED;
+    for (name, address, extra) in [
+        // The heap's last block (pages 14-15), made uncached.
+        ("uncached", page(heap, 14), uncached),
+        // The same block made GPU accessible.
+        ("GPU accessible", page(heap, 14), gpu),
+        // Page 9: already GPU accessible and uncached.
+        (
+            "GPU accessible and uncached",
+            page(heap, 9),
+            MemoryAttribute::NONE,
+        ),
+        // Page 3: device shared, with the use count of its three locks.
+        ("device shared", page(heap, 3), MemoryAttribute::NONE),
+    ] {
+        let mut case = Case::new(&rich);
+        let index = at(&case.body, address);
+        case.body.blocks[index].attribute |= extra.bits();
+        let attribute = MemoryAttribute::from_bits(case.body.blocks[index].attribute);
+        assert_ne!(attribute, MemoryAttribute::NONE, "{name}");
+        let restored = case.restore().0.unwrap();
+        assert_eq!(
+            restored.query_info(address).unwrap().attribute(),
+            attribute,
+            "{name}"
+        );
+        case.body.blocks[index].attribute |= locked.bits();
+        assert_eq!(
+            case.error(),
+            SnapshotError::Block {
+                index,
+                fault: BlockFault::PermissionLock
+            },
+            "{name} and permission locked"
         );
     }
 }
