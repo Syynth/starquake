@@ -231,9 +231,9 @@ fn ordered_and_room_notes_are_fed_back_as_their_completions() {
 }
 
 /// A `SyncpointObserved` note brings the counter to its value when that is ahead by the 32-bit
-/// wrapping comparison (up to 2^31 - 1 ahead), with one push, the counter's own for a watched
-/// id and an explicit one for an unwatched id; a value not ahead (equal, behind, or exactly
-/// 2^31 away) leaves the counter and is pushed as it is.
+/// wrapping comparison (up to 2^31 - 1 ahead), and is pushed as it is: one entry, watched or
+/// not (the counter's own push of a watched id folds into it); a value not ahead (equal, behind,
+/// or exactly 2^31 away) leaves the counter and is pushed as it is.
 #[test]
 fn a_syncpoint_note_brings_the_counter_to_its_value_when_ahead() {
     const START: u32 = 0x10;

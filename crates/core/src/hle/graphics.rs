@@ -104,7 +104,7 @@
 //!
 //! | Note | Fed back as |
 //! |---|---|
-//! | `SyncpointObserved { id, value }` | the counter brought to `value` if it is behind it (by the 32-bit wrapping comparison), with one push if the id is watched; otherwise, and for a value not ahead of the counter (a stale one, which the queue can drain after a newer one), `SyncpointChanged { id, value }` pushed as it is |
+//! | `SyncpointObserved { id, value }` | the counter brought to `value` if it is behind it (by the 32-bit wrapping comparison: up to 2^31 - 1 ahead), then `SyncpointChanged { id, value }` pushed as it is, also for a value not ahead of the counter (a stale one, which the queue can drain after a newer one); the counter's own push, for a watched id, has the same value and the queue folds the two into one entry (`starquake_gsv::completion`, "Coalescing") |
 //! | `GpuOrderedDone { ticket }` | `GpuOrdered { ticket }` pushed |
 //! | `QueueRoom { channel }` | `GpuQueueRoom { channel }` pushed |
 //! | `SyncptPageAnswered`, `SyncptPageAcknowledged` | refused ([`ReplayError::NotAnInput`]): they are what a page turn writes, not an input |
@@ -426,9 +426,7 @@ impl Graphics {
         let queue = self.shared.queue();
         let completion = match note {
             Note::SyncpointObserved { id, value } => {
-                if self.advance(id, value) {
-                    return Ok(());
-                }
+                self.advance(id, value);
                 GpuCompletion::SyncpointChanged { id, value }
             }
             Note::GpuOrderedDone { ticket } => GpuCompletion::GpuOrdered { ticket },
@@ -441,17 +439,13 @@ impl Graphics {
         Ok(())
     }
 
-    /// Brings counter `id` to `value` if it is behind it by the 32-bit wrapping comparison;
-    /// whether that pushed the change (the id is watched), so nothing more is to be pushed.
-    fn advance(&self, id: SyncpointId, value: u32) -> bool {
+    /// Brings counter `id` to `value` if it is behind it by the 32-bit wrapping comparison.
+    fn advance(&self, id: SyncpointId, value: u32) {
         let syncpoints = self.shared.syncpoints();
         let behind = value.wrapping_sub(syncpoints.read(id));
-        if behind.cast_signed() <= 0 {
-            return false;
+        if behind.cast_signed() > 0 {
+            syncpoints.increment_by(id, behind);
         }
-        let watched = syncpoints.is_watched(id);
-        syncpoints.increment_by(id, behind);
-        watched
     }
 }
 

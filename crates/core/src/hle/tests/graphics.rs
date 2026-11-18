@@ -196,6 +196,11 @@ impl Rig {
 
     /// The timer thread's turn over this rig's kernel, at time 0.
     fn turn(&self, graphics: &Graphics) {
+        self.turn_at(graphics, HostNanos(0));
+    }
+
+    /// The timer thread's turn over this rig's kernel, at `now`.
+    fn turn_at(&self, graphics: &Graphics, now: HostNanos) {
         let mut host = KernelHost::new(
             &self.dispatcher,
             &*self.env,
@@ -203,7 +208,7 @@ impl Rig {
             &self.memory,
             TIMER,
         );
-        graphics.turn(&mut host, HostNanos(0));
+        graphics.turn(&mut host, now);
         host.finish().unwrap();
     }
 
@@ -701,7 +706,14 @@ fn the_shared_page_is_bound_and_answered_through_the_kernel() {
     assert_eq!(poll(&rig, answer), KernelError::TimedOut.code());
 
     let before = rig.all_events().len();
-    rig.turn(&graphics);
+    // The drain alone takes the signal and marks the page: with nothing queued, the graphics
+    // server is still not idle, since the page's turn has the request to answer.
+    let mut host = rig.host();
+    graphics.shared().drain(&mut host);
+    assert!(graphics.shared().queue().is_empty());
+    assert!(!graphics.is_idle());
+    graphics.shared().tick_page(&mut host, HostNanos(0));
+    host.finish().unwrap();
     assert_eq!(rig.read_u64(value_at), 2);
     let ack_at = READ_ONLY_AT + u64::from(page::SLOT_ACK_OFFSET);
     assert_eq!(rig.read_u64(ack_at), slot);
@@ -719,6 +731,28 @@ fn the_shared_page_is_bound_and_answered_through_the_kernel() {
     );
     assert_eq!(poll(&rig, answer), ResultCode::SUCCESS);
     assert!(graphics.is_idle());
+
+    // Asked again with the counter where the page shows it, the request is held: not idle,
+    // with nothing queued, until the turn at the bound answers it.
+    rig.reset(answer);
+    let summary = summary ^ 1;
+    let slot = slot ^ (1 << ASKED);
+    rig.memory
+        .write(request_at, &summary.to_le_bytes())
+        .unwrap();
+    rig.memory.write(slot_at, &slot.to_le_bytes()).unwrap();
+    let regs = rig.call(SvcId::SignalEvent, u64::from(request.raw()), 0);
+    assert_eq!(result(&regs), ResultCode::SUCCESS);
+    rig.turn_at(&graphics, HostNanos(0));
+    assert!(graphics.shared().queue().is_empty());
+    assert!(!graphics.is_idle());
+    assert_eq!(graphics.deadline(), Some(HostNanos(page::ANSWER_BOUND)));
+    assert_eq!(poll(&rig, answer), KernelError::TimedOut.code());
+    rig.turn_at(&graphics, HostNanos(page::ANSWER_BOUND));
+    assert_eq!(rig.read_u64(summary_at), summary);
+    assert_eq!(poll(&rig, answer), ResultCode::SUCCESS);
+    assert!(graphics.is_idle());
+    assert_eq!(graphics.deadline(), None);
 }
 
 /// The kernel host reads and writes a transfer memory up to its exact end and not a byte past
