@@ -238,7 +238,10 @@ fn a_handle_must_name_a_process() {
         handle
     };
     let thread_handle = add(Object::Thread(thread));
-    let process_handle = add(Object::Process(ProcessId::from_parts(0, 1)));
+    // The calling process's own object, as process creation makes it.
+    scheduler.add_process(process()).unwrap();
+    let own = scheduler.process(process()).unwrap().object();
+    let process_handle = handles.add(scheduler.objects_mut(), own).unwrap();
 
     for id in ANSWERED {
         let ask =
@@ -532,23 +535,28 @@ const SWITCH_2: [(InfoType, u64); 5] = [
 ];
 
 /// Tables for the Switch 2 ids: a handle table holding a handle to a thread and one to the
-/// object of each process in `named`, and a scheduler whose object table holds them. Returns
-/// the thread's handle and the process handles, in `named`'s order.
+/// object of each process in `named`, and a scheduler whose object table holds them, with a row
+/// for each process in `named` whose own object is the one its handle names (as
+/// [`Scheduler::add_process`] makes it). Returns the thread's handle and the process handles,
+/// in `named`'s order.
 fn tables_naming(named: &[ProcessId]) -> (HandleTable, Scheduler, Handle, Vec<Handle>) {
     let (mut handles, mut scheduler) = tables();
     let thread = scheduler
         .create_thread(Priority::new(44).unwrap(), CoreId::new(0).unwrap())
         .unwrap();
-    let mut add = |object: Object| {
-        let id = scheduler.objects_mut().create(object).unwrap();
-        let handle = handles.add(scheduler.objects_mut(), id).unwrap();
-        scheduler.objects_mut().close(id).unwrap();
-        handle
-    };
-    let thread_handle = add(Object::Thread(thread));
+    let id = scheduler
+        .objects_mut()
+        .create(Object::Thread(thread))
+        .unwrap();
+    let thread_handle = handles.add(scheduler.objects_mut(), id).unwrap();
+    scheduler.objects_mut().close(id).unwrap();
     let process_handles = named
         .iter()
-        .map(|&process| add(Object::Process(process)))
+        .map(|&process| {
+            scheduler.add_process(process).unwrap();
+            let object = scheduler.process(process).unwrap().object();
+            handles.add(scheduler.objects_mut(), object).unwrap()
+        })
         .collect();
     (handles, scheduler, thread_handle, process_handles)
 }
@@ -778,6 +786,60 @@ fn a_handle_to_a_process_the_table_has_no_row_for_is_an_internal_failure() {
         };
         assert_eq!(ask(0), Err(SvcError::internal(&missing)), "{id:?}");
         assert_eq!(ask(1), kernel(KernelError::InvalidEnumValue), "{id:?}");
+    }
+}
+
+/// What a handle to a process object that is not its process's own gives, after the checks.
+fn not_its_own() -> CallResult<u64> {
+    Err(SvcError::Internal(
+        "a handle names a process object that is not its process's own".into(),
+    ))
+}
+
+#[test]
+fn a_switch_2_id_checks_the_process_object_against_the_process_s_row() {
+    // The id a process object holds is checked against what was allocated: the scheduler's
+    // row for it, whose own object must be the one named. A second object naming the calling
+    // process (only a kernel bug makes one) is an internal failure, and so is one naming a
+    // process the scheduler has no row for; both after the guest's checks.
+    let (space, _log, _) = loaded();
+    let mut processes = processes();
+    let own = processes.own();
+    let rowless = processes
+        .create(&ProcessDescription::homebrew(Console::Switch2))
+        .unwrap();
+    let (mut handles, mut scheduler, _, named) = tables_naming(&[own]);
+    let mut forge = |process| {
+        let object = scheduler
+            .objects_mut()
+            .create(Object::Process(process))
+            .unwrap();
+        handles.add(scheduler.objects_mut(), object).unwrap()
+    };
+    let (twin, unscheduled) = (forge(own), forge(rowless));
+    let no_row = SvcError::from(scheduler.process(rowless).unwrap_err());
+    for (id, value) in SWITCH_2 {
+        let ask = |handle, sub_id| {
+            get_info_shared(
+                &handles,
+                &space,
+                &scheduler,
+                &processes,
+                id.number(),
+                handle,
+                sub_id,
+            )
+        };
+        assert_eq!(ask(named[0], 0), Ok(value), "{id:?}");
+        assert_eq!(ask(twin, 0), not_its_own(), "{id:?}");
+        assert_eq!(ask(unscheduled, 0), Err(no_row.clone()), "{id:?}");
+        for handle in [twin, unscheduled] {
+            assert_eq!(
+                ask(handle, 1),
+                kernel(KernelError::InvalidEnumValue),
+                "{id:?}"
+            );
+        }
     }
 }
 

@@ -39,7 +39,8 @@
 //!
 //! The system resource is the one `GetInfo` 16 reports
 //! ([`secure_resource_size`](crate::svc::info::secure_resource_size): the size the program's
-//! metadata asks for, in whole pages); the dispatcher reads it from the process facts.
+//! metadata asks for, in whole pages, whatever its pool); the dispatcher reads it from the
+//! process facts.
 //!
 //! The 32-bit wrappers (`MapPhysicalMemory64From32`) are not built: only 64-bit programs run
 //! (`crate::memory::layout`).

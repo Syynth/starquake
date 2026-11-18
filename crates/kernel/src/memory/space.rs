@@ -41,10 +41,13 @@
 //!
 //! # What is here that Eden keeps elsewhere
 //!
-//! Eden keeps the code size, the main thread's stack size and the largest process memory on
-//! `KProcess`, and the reservation count on its `KResourceLimit`. Starquake's process table
-//! holds only facts fixed at creation so far (kernel slice 8 builds the rest), and the kernel
-//! spec puts "the memory pools" with the address space, so they are here.
+//! Eden keeps the code size, the main thread's stack size, the largest process memory and the
+//! system resource (`m_system_resource`) on `KProcess`, and the reservation count on its
+//! `KResourceLimit`. Starquake's process table holds only facts fixed at creation so far
+//! (kernel slice 8 builds the rest), and the kernel spec puts "the memory pools" with the
+//! address space, so they are here: the system resource is the one the address space was made
+//! with ([`AddressSpace::with_system_resource`]), whose charge the count holds, and
+//! [`crate::process::create`] refuses a space made for another resource than its description's.
 //!
 //! # Divergences from Eden
 //!
@@ -171,6 +174,7 @@ use super::shared::{SharedMemory, SharedPages};
 use super::state::{
     DisableMerge, MemoryAttribute, MemoryPermission, MemoryState, STATE_ALL, SvcPermission, flag,
 };
+use super::system_resource::SystemResource;
 use crate::id::{ObjectId, ProcessId};
 use crate::result::{CallResult, KernelError, SvcError, SvcResult};
 
@@ -294,6 +298,9 @@ pub enum CreateError {
     /// The code could not be reserved or mapped.
     #[error("the program's code could not be mapped: {0}")]
     Code(#[from] SvcError),
+    /// The system resource could not be set aside ([`SystemResource::initialize`]).
+    #[error("the program's system resource could not be set aside: {0}")]
+    SystemResource(KernelError),
 }
 
 /// One test of `CheckMemoryState`: what a range's blocks must be.
@@ -424,6 +431,9 @@ pub struct AddressSpace {
     code_size: u64,
     /// Bytes of the main thread's stack (`KProcess::m_main_thread_stack_size`).
     main_thread_stack_size: u64,
+    /// The process's system resource (`KProcess::m_system_resource`), charged to `limit` when
+    /// the address space was made.
+    system_resource: SystemResource,
     /// The shared memory mapped here, by where each mapping starts (see "No page groups" in
     /// the module docs).
     shared: BTreeMap<u64, SharedMapping>,
@@ -485,6 +495,7 @@ impl fmt::Debug for AddressSpace {
             .field("limit", &self.limit)
             .field("code_size", &self.code_size)
             .field("main_thread_stack_size", &self.main_thread_stack_size)
+            .field("system_resource", &self.system_resource)
             .field("shared", &self.shared)
             .field("device_locks", &self.device_locks)
             .field(
@@ -589,7 +600,27 @@ impl AddressSpace {
     /// Code that is not whole pages inside the code region is [`LayoutError::BadCode`], and
     /// code the pool has no room for [`KernelError::LimitReached`] inside
     /// [`CreateError::Code`].
+    ///
+    /// The process has no secure system resource ([`SystemResource::NONE`]); see
+    /// [`Self::with_system_resource`] for one that has.
     pub fn new(memory: &ProcessMemory, mapper: Box<dyn Mapper>) -> Result<Self, CreateError> {
+        Self::with_system_resource(memory, SystemResource::NONE, mapper)
+    }
+
+    /// The address space of a new process whose system resource is `resource`, as
+    /// [`Self::new`] makes one, with the resource set aside between the code's reservation and
+    /// the code's mapping, in the order of Eden's `KProcess::Initialize`
+    /// (`eden/src/core/hle/kernel/k_process.cpp` @ cf654052; [`super::system_resource`]): its
+    /// [`SystemResource::required_secure_memory_size`] is charged to the process's memory count
+    /// for the life of the address space. A resource that cannot be set aside is
+    /// [`CreateError::SystemResource`] with [`SystemResource::initialize`]'s result
+    /// ([`KernelError::LimitReached`] when the code leaves no room for it), checked after the
+    /// code's own reservation.
+    pub fn with_system_resource(
+        memory: &ProcessMemory,
+        resource: SystemResource,
+        mapper: Box<dyn Mapper>,
+    ) -> Result<Self, CreateError> {
         let regions = layout(memory)?;
         let blocks = BlockMap::new(regions.address_space.start, regions.address_space.end)
             .map_err(broken)?;
@@ -603,6 +634,7 @@ impl AddressSpace {
             limit: MemoryLimit::new(memory.arrangement.application_pool_size()),
             code_size: memory.code_size,
             main_thread_stack_size: 0,
+            system_resource: resource,
             shared: BTreeMap::new(),
             device_locks: BTreeMap::new(),
             mapped_physical_memory_size: 0,
@@ -614,6 +646,10 @@ impl AddressSpace {
             .limit
             .reserve(memory.code_size)
             .map_err(SvcError::from)?;
+        // Set up our system resource (`secure_resource->Initialize`, when it has pages).
+        resource
+            .initialize(&mut space.limit)
+            .map_err(CreateError::SystemResource)?;
         // Map the code region. (Eden first checks `CanContain(.., KMemoryState::Code)`, for
         // `ResultInvalidMemoryRegion`; the layout has already refused code outside the code
         // region, and the regions it places never overlap the code.)
@@ -670,19 +706,46 @@ impl AddressSpace {
         self.mapped_physical_memory_size
     }
 
-    /// The memory the process uses (`KProcess::GetUsedUserPhysicalMemorySize`, with no secure
-    /// system resource): its normal memory ([`Self::normal_memory_size`]: the heap and the
-    /// memory `MapPhysicalMemory` mapped), its code and its main thread's stack.
+    /// The process's system resource, set aside when the address space was made.
     #[must_use]
-    pub const fn used_user_physical_memory_size(&self) -> u64 {
+    pub const fn system_resource(&self) -> SystemResource {
+        self.system_resource
+    }
+
+    /// What the system resource charges to the process's memory count
+    /// (`KProcess::GetRequiredSecureMemorySize`; `GetRequiredSecureMemorySizeNonDefault` is
+    /// the same, as it differs only for the shared default resource, which charges nothing
+    /// either).
+    #[must_use]
+    pub const fn secure_memory_size(&self) -> u64 {
+        self.system_resource.required_secure_memory_size()
+    }
+
+    /// The memory the process uses besides its system resource
+    /// (`KProcess::GetUsedNonSystemUserPhysicalMemorySize`): its normal memory
+    /// ([`Self::normal_memory_size`]: the heap and the memory `MapPhysicalMemory` mapped), its
+    /// code and its main thread's stack.
+    #[must_use]
+    pub const fn used_non_system_user_physical_memory_size(&self) -> u64 {
         self.normal_memory_size()
             .saturating_add(self.code_size)
             .saturating_add(self.main_thread_stack_size)
     }
 
-    /// The memory the process can use in all (`KProcess::GetTotalUserPhysicalMemorySize`, with
-    /// no secure system resource): what it uses plus what it can still reserve, or the largest
-    /// process memory if that is less.
+    /// The memory the process uses (`KProcess::GetUsedUserPhysicalMemorySize`): what it uses
+    /// besides its system resource ([`Self::used_non_system_user_physical_memory_size`]) and
+    /// what the resource charges ([`Self::secure_memory_size`]): what the memory count holds
+    /// reserved.
+    #[must_use]
+    pub const fn used_user_physical_memory_size(&self) -> u64 {
+        self.used_non_system_user_physical_memory_size()
+            .saturating_add(self.secure_memory_size())
+    }
+
+    /// The memory the process can use in all (`KProcess::GetTotalUserPhysicalMemorySize`):
+    /// what it uses, its system resource's charge included
+    /// ([`Self::used_user_physical_memory_size`]), plus what it can still reserve, or the
+    /// largest process memory if that is less.
     #[must_use]
     pub const fn total_user_physical_memory_size(&self) -> u64 {
         let used = self.used_user_physical_memory_size();
@@ -1805,3 +1868,6 @@ mod device_tests;
 
 #[cfg(test)]
 mod physical_tests;
+
+#[cfg(test)]
+mod resource_tests;
