@@ -23,6 +23,8 @@ use crate::process::{Console, ProcessDescription};
 use crate::svc::DebugSink;
 use crate::tables::FIRST_USER_PROCESS_ID;
 
+mod rollback;
+
 /// The guest threads of these tests, distinct so a swap shows.
 const A: ThreadId = ThreadId(0xA1);
 const B: ThreadId = ThreadId(0xB2);
