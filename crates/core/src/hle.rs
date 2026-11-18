@@ -13,7 +13,9 @@
 //! private entry of the registry ([`Registry::register_private`]): `GetService` never hands it
 //! out, and `appletOE`'s `ISelfController` 2000 is given the same number, the constant
 //! [`GSV_ROOT`] that the private entry is registered under, to hand a session on it to the
-//! title.
+//! title. The root hands out sessions on the graphics server's other servers, [`GSV_SYNCPT`],
+//! [`GSV_GPU`] and [`GSV_NVSRV`], which are in no registry; [`graphics`] builds the graphics
+//! server and says what it wires.
 //!
 //! Parental control's four names (`pctl`, `pctl:a`, `pctl:s`, `pctl:r`) are four servers, one
 //! per name, known by [`PCTL`], [`PCTL_A`], [`PCTL_S`] and [`PCTL_R`]: each name's factory has a
@@ -24,7 +26,7 @@
 //! is given (the run's, in a run); [`install`] gives them one that keeps nothing.
 //!
 //! The numbers ([`SM`], [`SET_SYS`], [`FSP_SRV`], [`APM`], [`APPLET_OE`], [`HID`], [`TIME_U`],
-//! [`GSV_ROOT`]) are starquake's own:
+//! [`GSV_ROOT`] and the others above) are starquake's own:
 //! Horizon names a service by its name only. They appear in the trace, as the `service` of an IPC
 //! event; [`service_name`] says which is which.
 //!
@@ -54,7 +56,7 @@
 
 use std::sync::{Arc, OnceLock};
 
-use starquake_gsv::root;
+use starquake_gsv::{gpu, nvsrv, root, syncpt};
 use starquake_kernel::dispatch::Dispatcher;
 use starquake_kernel::id::ServerId;
 use starquake_kernel::ipc::{IpcError, PortName, PortNameError};
@@ -71,9 +73,11 @@ use starquake_services::{aoc, ectx, lm};
 use starquake_trace::{Env, ServiceId};
 
 mod fsp_host;
+pub mod graphics;
 mod host_folder;
 
 pub use fsp_host::FspHost;
+pub use graphics::{FrontMode, Graphics};
 pub use host_folder::HostFolder;
 
 /// The number the kernel knows the service manager's server by.
@@ -106,6 +110,12 @@ pub const LM: ServiceId = ServiceId(16);
 pub const ECTX_AW: ServiceId = ServiceId(17);
 /// The number the kernel knows `aoc:u`'s server by.
 pub const AOC_U: ServiceId = ServiceId(18);
+/// The number the kernel knows the graphics server's syncpt server by.
+pub const GSV_SYNCPT: ServiceId = ServiceId(19);
+/// The number the kernel knows the graphics server's gpu server by.
+pub const GSV_GPU: ServiceId = ServiceId(20);
+/// The number the kernel knows the graphics server's nvsrv server by.
+pub const GSV_NVSRV: ServiceId = ServiceId(21);
 
 /// The parental-control names, each with the number its server is known by: one server per
 /// name, since each name's factory has its own capability ([`pctl::Name::capability`]).
@@ -133,6 +143,9 @@ const SERVICES: &[(ServiceId, &str)] = &[
     (LM, lm::NAME),
     (ECTX_AW, ectx::AW_NAME),
     (AOC_U, aoc::U_NAME),
+    (GSV_SYNCPT, syncpt::SYNCPT_NAME),
+    (GSV_GPU, gpu::GPU_NAME),
+    (GSV_NVSRV, nvsrv::NVSRV_NAME),
 ];
 
 /// The name of the service a number stands for, if a run has it.
@@ -237,6 +250,23 @@ pub fn install_with_guest_log(
     reads: Reads,
     guest_log: Arc<dyn lm::GuestLog>,
 ) -> Result<(), ServicesError> {
+    let graphics = Graphics::new(FrontMode::Live, None);
+    install_with_graphics(dispatcher, env, reads, guest_log, &graphics)
+}
+
+/// Puts the run's services in front of `dispatcher`, as [`install_with_guest_log`] does, with
+/// `graphics` as the graphics server: its servers are added, and the caller keeps it to run its
+/// timer thread's turn ([`Graphics::turn`]) and, in a replay, feed its notes back
+/// ([`Graphics::replay`]). [`install_with_guest_log`] gives one whose queue rings nothing and
+/// whose turns nothing runs: its requests are answered, and what waits for the GPU or for a
+/// turn never completes.
+pub fn install_with_graphics(
+    dispatcher: &Dispatcher,
+    env: Arc<dyn Env>,
+    reads: Reads,
+    guest_log: Arc<dyn lm::GuestLog>,
+    graphics: &Graphics,
+) -> Result<(), ServicesError> {
     let policy = UnknownPolicy::AutoStub;
     let mut registry = Registry::new();
     registry.register(ServiceName::new(set::SYS_NAME)?, SET_SYS)?;
@@ -265,7 +295,7 @@ pub fn install_with_guest_log(
 
     let delivering = Arc::new(Delivering {
         server: OnceLock::new(),
-        ready: reads.ready,
+        ready: Arc::clone(&reads.ready),
     });
     let notify: Arc<dyn Notify> = Arc::<Delivering>::clone(&delivering);
     let files = fsp::server(policy, Arc::clone(&env), Arc::clone(&reads.halt))
@@ -285,8 +315,7 @@ pub fn install_with_guest_log(
     let applets = am::oe_server_for(applet, policy).with_service_id(APPLET_OE);
     dispatcher.add_server(am::OE_NAME, APPLET_OE, None, Box::new(applets))?;
 
-    let graphics_root = root::root_server(policy).with_service_id(GSV_ROOT);
-    dispatcher.add_server(root::ROOT_NAME, GSV_ROOT, None, Box::new(graphics_root))?;
+    graphics.add_servers(dispatcher, policy, reads.ready)?;
 
     let input = hid::server(policy).with_service_id(HID);
     dispatcher.add_server(hid::NAME, HID, None, Box::new(input))?;
