@@ -364,8 +364,14 @@ fn hello_exits_with_code_0_and_leaves_its_output_and_trace() {
     assert!(trace.ends_with("  lifecycle ProcessExit 1\n"), "{trace}");
     let dump = std::fs::read(artifacts.join(EVENTS_FILE)).unwrap();
     let events = starquake_trace::Dump::from_bytes(&dump).unwrap().merged();
-    // Start, two lines each with its call, the exit call, and the exit.
-    assert_eq!(events.len(), 7);
+    // Start, the mapping of the main thread's thread-local page (the address space's recording
+    // point), two lines each with its call, the exit call, and the exit.
+    assert_eq!(events.len(), 8);
+    let maps = events
+        .iter()
+        .filter(|event| matches!(event.kind, starquake_trace::EventKind::Map { .. }))
+        .count();
+    assert_eq!(maps, 1);
 }
 
 /// The one run here that does not pin a date: it reads the host's, and its summary says which

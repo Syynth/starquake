@@ -17,7 +17,8 @@
 //! Not saved, because a restore derives it: the largest process memory (the heap region's size)
 //! and the pool's limit (the arrangement's application pool). Not saved because it is not the
 //! address space's: the [`Mapper`] (a restore is handed a new one and rebuilds what it maps,
-//! below), what guest memory holds (the snapshot's guest memory part, not built yet), and the
+//! below), what guest memory holds (the guest-pages snapshot, `starquake_core`'s
+//! `space::snapshot`, whose restore runs this one in between its two steps), and the
 //! shared and transfer memory objects (the object table's part).
 //!
 //! # Format

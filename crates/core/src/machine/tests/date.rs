@@ -33,7 +33,7 @@ fn run_dated(rtc: RtcAtBoot) -> (Ending, Seen) {
         memory: &guest.memory,
         options: &options,
         clock: RunClock::new(timebase()),
-        recorder: Recorder::new(),
+        recorder: Arc::new(Recorder::new()),
     };
     let env = session.environment();
     let watched = Arc::clone(&env);

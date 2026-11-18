@@ -874,7 +874,7 @@ fn the_environments_recording_moves_to_the_kept_recording_as_it_is_made() {
         memory: &guest.memory,
         options: &options,
         clock: RunClock::new(timebase()),
-        recorder: Recorder::new(),
+        recorder: Arc::new(Recorder::new()),
     };
     let env = session.environment();
     // The most the environment held, unmoved, each time the guest ran: after the first call,
