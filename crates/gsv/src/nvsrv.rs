@@ -1200,7 +1200,12 @@ impl NvsrvFamily {
             channel,
             submission,
         } = deferral;
-        locked.submits().push(channel, token, submission, front);
+        // The ioctl refused a submission past the cap before raising its fence, and holds the
+        // family between that check and this push, so this refusal is only for another caller
+        // of `Submits::push`; the push has answered the token `Busy` (`gpu::submits`, "The cap").
+        if let Err(error) = locked.submits().push(channel, token, submission, front) {
+            tracing::error!(%error, "nvsrv: a waiting submission passed the cap");
+        }
     }
 
     /// [`NvsrvState::close`] with gsv's shared lock held, as for [`ioctl`](Self::ioctl): the

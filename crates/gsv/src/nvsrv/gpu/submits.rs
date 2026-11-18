@@ -99,6 +99,20 @@ pub const SNAPSHOT_MAGIC: [u8; 4] = *b"SQSB";
 /// Layout version written into every waiting-submissions snapshot and required when reading one.
 pub const SNAPSHOT_VERSION: u32 = 1;
 
+/// The most entries of submissions that may wait for room on one GPU channel (module docs, "The
+/// cap"): the owner's ruling of 2026-11-17 in the decision log, "Cap a channel's waiting
+/// submissions at 65,536 entries; past it, answer Busy", which takes the figure decision 12 uses
+/// for a channel's queue. Each waiting submission counts its [`charge`] against it.
+pub const MAX_WAITING_ENTRIES: usize = CHANNEL_QUEUE_ENTRIES;
+
+/// What a waiting submission of `entries` GP entries counts against [`MAX_WAITING_ENTRIES`]: its
+/// entries, and at least one, so that submissions with no entries cannot pile up without bound
+/// either (module docs, "The cap": a departure from the ruling's wording, for the owner).
+#[must_use]
+pub const fn charge(entries: usize) -> usize {
+    if entries == 0 { 1 } else { entries }
+}
+
 /// One waiting submission.
 struct Waiting {
     token: Option<ReplyToken>,
@@ -106,10 +120,50 @@ struct Waiting {
     front: Arc<dyn ChannelFront>,
 }
 
+/// One channel's waiting submissions, oldest first, and what they count against the cap: the
+/// sum of each one's [`charge`], kept as they come and go, so that a check never walks the queue.
+#[derive(Default)]
+struct Queue {
+    waiting: VecDeque<Waiting>,
+    charged: usize,
+}
+
+impl Queue {
+    /// Adds `waiting` at the back. The caller has checked that it fits under the cap.
+    fn push_back(&mut self, waiting: Waiting) {
+        let charged = charge(waiting.submission.entries.len());
+        self.charged = self.charged.saturating_add(charged);
+        self.waiting.push_back(waiting);
+    }
+
+    /// Takes the oldest submission out.
+    fn pop_front(&mut self) -> Option<Waiting> {
+        let waiting = self.waiting.pop_front()?;
+        let charged = charge(waiting.submission.entries.len());
+        self.charged = self.charged.saturating_sub(charged);
+        Some(waiting)
+    }
+}
+
+/// A submission [`Submits::push`] refused because its channel's waiting submissions would pass
+/// the cap (module docs, "The cap").
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
+#[error(
+    "GPU channel {channel} has {waiting} entries waiting, and {entries} more would pass the cap of {MAX_WAITING_ENTRIES}"
+)]
+pub struct OverCap {
+    /// The GPU channel.
+    pub channel: u32,
+    /// What its waiting submissions count against the cap.
+    pub waiting: usize,
+    /// The refused submission's entries.
+    pub entries: usize,
+}
+
 /// The submissions that wait for room, by channel, oldest first (module docs, "The table").
 #[derive(Default)]
 pub struct Submits {
-    waiting: BTreeMap<ChannelId, VecDeque<Waiting>>,
+    waiting: BTreeMap<ChannelId, Queue>,
 }
 
 impl fmt::Debug for Submits {
@@ -152,13 +206,32 @@ impl Submits {
     /// How many submissions of `channel` wait.
     #[must_use]
     pub fn waiting(&self, channel: ChannelId) -> usize {
-        self.waiting.get(&channel).map_or(0, VecDeque::len)
+        self.waiting
+            .get(&channel)
+            .map_or(0, |queue| queue.waiting.len())
+    }
+
+    /// What `channel`'s waiting submissions count against [`MAX_WAITING_ENTRIES`]: the sum of
+    /// each one's [`charge`].
+    #[must_use]
+    pub fn waiting_entries(&self, channel: ChannelId) -> usize {
+        self.waiting.get(&channel).map_or(0, |queue| queue.charged)
+    }
+
+    /// Whether a submission of `entries` entries may wait behind `channel`'s waiting ones
+    /// without passing [`MAX_WAITING_ENTRIES`] (module docs, "The cap"). It does not walk the
+    /// queue.
+    #[must_use]
+    pub fn admits(&self, channel: ChannelId, entries: usize) -> bool {
+        self.waiting_entries(channel)
+            .checked_add(charge(entries))
+            .is_some_and(|charged| charged <= MAX_WAITING_ENTRIES)
     }
 
     /// How many submissions wait, of every channel.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.waiting.values().map(VecDeque::len).sum()
+        self.waiting.values().map(|queue| queue.waiting.len()).sum()
     }
 
     /// Whether nothing waits.
@@ -173,25 +246,39 @@ impl Submits {
         self.waiting
             .get(&channel)
             .into_iter()
-            .flatten()
+            .flat_map(|queue| &queue.waiting)
             .filter_map(|waiting| waiting.token.as_ref().map(ReplyToken::id))
     }
 
     /// Adds `submission`, whose request `token` answers if given, behind `channel`'s waiting
-    /// ones, then tries the channel's queue (module docs, "The table").
+    /// ones, then tries the channel's queue (module docs, "The table"). A submission that would
+    /// take the channel past [`MAX_WAITING_ENTRIES`] is refused instead: `token`, if given,
+    /// answers `Busy`, nothing is added, and the queue is not tried (module docs, "The cap").
     pub fn push(
         &mut self,
         channel: ChannelId,
         token: Option<ReplyToken>,
         submission: Submission,
         front: Arc<dyn ChannelFront>,
-    ) {
+    ) -> Result<(), OverCap> {
+        let entries = submission.entries.len();
+        if !self.admits(channel, entries) {
+            if let Some(token) = token {
+                token.complete(reply(NvResult::Busy));
+            }
+            return Err(OverCap {
+                channel: channel.0,
+                waiting: self.waiting_entries(channel),
+                entries,
+            });
+        }
         self.waiting.entry(channel).or_default().push_back(Waiting {
             token,
             submission,
             front,
         });
         self.room(channel);
+        Ok(())
     }
 
     /// `channel`'s queue has room: its waiting submissions go to the front, oldest first, until
@@ -200,7 +287,7 @@ impl Submits {
         let Some(queue) = self.waiting.get_mut(&channel) else {
             return;
         };
-        while let Some(head) = queue.front() {
+        while let Some(head) = queue.waiting.front() {
             if head.front.submit(channel, head.submission.clone()) == Submitted::Full {
                 break;
             }
@@ -208,7 +295,7 @@ impl Submits {
                 token.complete(reply(NvResult::Success));
             }
         }
-        if queue.is_empty() {
+        if queue.waiting.is_empty() {
             self.waiting.remove(&channel);
         }
     }
@@ -225,7 +312,8 @@ impl Submits {
     /// `channel` is going: each waiting reply answers `NotImplemented`, oldest first, and nothing
     /// goes to the front (module docs, "The table").
     pub fn cancel(&mut self, channel: ChannelId) {
-        let waiting = self.waiting.remove(&channel).into_iter().flatten();
+        let waiting = self.waiting.remove(&channel).into_iter();
+        let waiting = waiting.flat_map(|queue| queue.waiting);
         for token in waiting.filter_map(|waiting| waiting.token) {
             token.complete(reply(NvResult::NotImplemented));
         }
@@ -237,7 +325,7 @@ impl Submits {
         self.waiting
             .iter()
             .flat_map(|(&channel, queue)| {
-                queue.iter().map(move |waiting| SavedSubmit {
+                queue.waiting.iter().map(move |waiting| SavedSubmit {
                     channel: channel.0,
                     token: waiting
                         .token
@@ -299,6 +387,8 @@ impl Submits {
             return Err(SnapshotError::TrailingBytes { count: rest.len() });
         }
         let mut seen = BTreeSet::new();
+        // What each channel's entries so far count against the cap.
+        let mut charged_by: BTreeMap<u32, usize> = BTreeMap::new();
         // The channel of the entry before, and the last token id seen in that channel.
         let mut previous: Option<(u32, Option<TokenId>)> = None;
         let mut checked = Vec::with_capacity(saved.len());
@@ -314,6 +404,14 @@ impl Submits {
                 let count = entry.entries.len();
                 return Err(SnapshotError::TooManyEntries { index, count });
             }
+            let charged = charged_by.entry(entry.channel).or_default();
+            *charged = charged
+                .checked_add(charge(entry.entries.len()))
+                .filter(|&charged| charged <= MAX_WAITING_ENTRIES)
+                .ok_or(SnapshotError::OverCap {
+                    index,
+                    channel: entry.channel,
+                })?;
             if let Some(token) = entry.token
                 && !seen.insert(token)
             {
@@ -440,6 +538,17 @@ pub enum SnapshotError {
         index: usize,
         /// How many.
         count: usize,
+    },
+    /// The first entry whose channel's waiting submissions, counted up to and with it, pass
+    /// [`MAX_WAITING_ENTRIES`] (module docs, "The cap").
+    #[error(
+        "waiting submission {index} takes GPU channel {channel}'s waiting entries past the cap of {MAX_WAITING_ENTRIES}"
+    )]
+    OverCap {
+        /// The entry's place in the list.
+        index: usize,
+        /// Its channel.
+        channel: u32,
     },
     /// A token id an earlier entry has.
     #[error("waiting submission {index} answers request {token}, which an earlier one answers")]

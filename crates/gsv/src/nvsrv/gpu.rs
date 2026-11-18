@@ -1020,6 +1020,10 @@ impl NvhostGpu {
             let space = as_gpu.bound(fd).ok_or(NvResult::InvalidState)?;
             make(channel, space, access)?
         };
+        // Check 7: before the maximum is raised, so no fence goes out for a refused one.
+        if !access.submits.admits(id, count) {
+            return Err(NvResult::Busy);
+        }
         let value = access
             .syncpoints
             .increment_max(syncpoint, plan.increments)

@@ -28,7 +28,10 @@ use super::super::tests::{
 use super::super::{
     Device, GpuAccess, IoctlCall, NvsrvFamily, NvsrvState, NvsrvStateError, nvsrv_server,
 };
-use super::submits::{SNAPSHOT_MAGIC, SNAPSHOT_VERSION, SavedSubmit, SnapshotError};
+use super::submits::{
+    MAX_WAITING_ENTRIES, OverCap, SNAPSHOT_MAGIC, SNAPSHOT_VERSION, SavedSubmit, SnapshotError,
+    charge,
+};
 use super::*;
 use crate::gpu::GpuMemory;
 use crate::shared::TimerHost;
@@ -1279,7 +1282,19 @@ impl Live {
         let inline_at = self.rig.place(&inline);
         let request = cmif(IOCTL2, &fd_and(fd, KICKOFF));
         let request = Auto::alias(input_at, len16(input.len())).send(request, 0);
-        let request = Auto::alias(inline_at, len16(inline.len())).send(request, 1);
+        // In buffer 1 as `Auto::alias(..).send(request, 1)` writes it, with a length that may
+        // pass 16 bits (a submission of up to a whole queue's entries).
+        let request = request
+            .send_buffer(starquake_ipc::BufferDescriptor {
+                address: inline_at,
+                size: u64::try_from(inline.len()).unwrap(),
+                flags: 0,
+            })
+            .static_descriptor(starquake_ipc::StaticDescriptor {
+                counter: 1,
+                address: 0,
+                size: 0,
+            });
         let request = Auto::alias(out_at, 24).receive(request);
         let mut buffer = vec![STALE; BUFFER_SIZE];
         request.build(&mut buffer).unwrap();
@@ -1319,6 +1334,12 @@ impl Live {
         let shared = &self.rig.shared;
         let mut locked = shared.lock();
         locked.submits().waiting(channel)
+    }
+
+    fn waiting_entries(&self, channel: ChannelId) -> usize {
+        let shared = &self.rig.shared;
+        let mut locked = shared.lock();
+        locked.submits().waiting_entries(channel)
     }
 }
 
@@ -2146,6 +2167,22 @@ fn refused_tables() -> Vec<(Vec<u8>, SnapshotError)> {
         wait: Some((count, 9)),
         ..entry(0x30, 1)
     };
+    let below_cap = SavedSubmit {
+        entries: vec![1; MAX_WAITING_ENTRIES - 1],
+        ..entry(0x30, 1)
+    };
+    let at_cap = SavedSubmit {
+        entries: vec![1; MAX_WAITING_ENTRIES],
+        ..entry(0x30, 1)
+    };
+    let two = SavedSubmit {
+        entries: vec![1, 2],
+        ..entry(0x30, 3)
+    };
+    let empty = SavedSubmit {
+        entries: Vec::new(),
+        ..tokenless(0x30)
+    };
     vec![
         (bad_magic, SnapshotError::BadMagic),
         (version, SnapshotError::UnsupportedVersion { found: 2 }),
@@ -2166,6 +2203,22 @@ fn refused_tables() -> Vec<(Vec<u8>, SnapshotError)> {
             SnapshotError::TooManyEntries {
                 index: 1,
                 count: CHANNEL_QUEUE_ENTRIES + 1,
+            },
+        ),
+        // A channel's waiting entries one past the cap, with entries and with none (charged
+        // one).
+        (
+            snapshot_of(&[below_cap.clone(), two.clone()]),
+            SnapshotError::OverCap {
+                index: 1,
+                channel: 0x30,
+            },
+        ),
+        (
+            snapshot_of(&[at_cap.clone(), empty]),
+            SnapshotError::OverCap {
+                index: 1,
+                channel: 0x30,
             },
         ),
         (
@@ -2200,6 +2253,27 @@ fn refused_tables() -> Vec<(Vec<u8>, SnapshotError)> {
         (
             snapshot_of(&[entry(0x31, 3), entry(0x30, 3)]),
             SnapshotError::DuplicateToken { index: 1, token: 3 },
+        ),
+        // The count before the cap, the cap before the duplicate.
+        (
+            snapshot_of(&[
+                below_cap,
+                SavedSubmit {
+                    entries: vec![1; CHANNEL_QUEUE_ENTRIES + 1],
+                    ..entry(0x30, 3)
+                },
+            ]),
+            SnapshotError::TooManyEntries {
+                index: 1,
+                count: CHANNEL_QUEUE_ENTRIES + 1,
+            },
+        ),
+        (
+            snapshot_of(&[at_cap, entry(0x30, 1)]),
+            SnapshotError::OverCap {
+                index: 1,
+                channel: 0x30,
+            },
         ),
         (
             snapshot_of(&[entry(0x31, 2), entry(0x30, 5)]),
@@ -2260,6 +2334,29 @@ fn a_waiting_table_no_run_reaches_is_refused() {
             entries: vec![1; CHANNEL_QUEUE_ENTRIES],
             ..waiting_entry(0x30, 1)
         }],
+        // A channel's waiting entries exactly at the cap, in two entries, and in each of two
+        // channels at once.
+        vec![
+            SavedSubmit {
+                entries: vec![1; MAX_WAITING_ENTRIES - 1],
+                ..waiting_entry(0x30, 1)
+            },
+            waiting_entry(0x30, 3),
+        ],
+        vec![
+            SavedSubmit {
+                entries: vec![1; MAX_WAITING_ENTRIES - 1],
+                ..waiting_entry(0x30, 1)
+            },
+            SavedSubmit {
+                entries: Vec::new(),
+                ..tokenless(0x30)
+            },
+            SavedSubmit {
+                entries: vec![1; MAX_WAITING_ENTRIES],
+                ..waiting_entry(0x31, 2)
+            },
+        ],
         // Entries without a token before, between and after the others, several in a channel.
         vec![
             tokenless(0x30),
@@ -2316,6 +2413,17 @@ fn a_refused_waiting_table_is_said_in_plain_words() {
     for (error, words) in said {
         assert_eq!(error.to_string(), words);
     }
+    let over = SnapshotError::OverCap {
+        index: 1,
+        channel: 0x30,
+    };
+    assert_eq!(
+        over.to_string(),
+        format!(
+            "waiting submission 1 takes GPU channel 48's waiting entries past the cap of \
+             {MAX_WAITING_ENTRIES}"
+        )
+    );
 }
 
 /// The drain records `QueueRoom` before it acts on it, and records it for a channel with
@@ -2434,24 +2542,264 @@ fn a_closed_session_s_waiting_submission_saves_and_restores() {
     assert!(live.rig.shared.lock().submits().is_empty());
 }
 
-/// The gap `submits`' module docs state ("What bounds the table: nothing yet"): while the queue
-/// stays full, each session that submits and closes leaves a submission waiting with no request
-/// pending.
+// ----- The cap on a channel's waiting entries --------------------------------------------------
+
+/// What `submits`' module docs state ("The cap"): while the queue stays full, sessions that
+/// submit and close leave submissions waiting with no request pending, but only up to
+/// [`MAX_WAITING_ENTRIES`] entries. The submission that reaches the cap exactly waits; the next
+/// one answers `Busy` with the argument as sent, its syncpoint's maximum not raised and nothing
+/// given to the front. Once room drains the table, the channel takes submissions again.
 #[test]
-fn abandoned_submissions_are_not_bounded_yet() {
+fn abandoned_submissions_are_bounded_by_the_cap() {
+    let mut live = Live::new();
+    let fd = live.channel();
+    let channel = live.made(fd);
+    let syncpoint = SyncpointId::new(FIRST_ALLOCATABLE).unwrap();
+    live.fake.hold(channel, CHANNEL_QUEUE_ENTRIES);
+    // All but one entry of the cap, abandoned.
+    let big = live.session();
+    let entries = entries_from(1, MAX_WAITING_ENTRIES - 1);
+    let (handled, _, _) = live.submit_on(big, fd, &entries, FENCE_INCREMENT);
+    assert!(matches!(handled, Handled::Deferred(_)));
+    live.rig.server.close(big).unwrap();
+    // One entry more reaches the cap exactly: it waits, and is abandoned too.
+    let last = live.session();
+    let (handled, _, _) = live.submit_on(last, fd, &entries_from(0x10, 1), FENCE_INCREMENT);
+    assert!(matches!(handled, Handled::Deferred(_)));
+    live.rig.server.close(last).unwrap();
+    assert_eq!(live.waiting_entries(channel), MAX_WAITING_ENTRIES);
+    assert_eq!(live.waiting(channel), 2);
+    assert_eq!(live.rig.server.pending().count(), 0);
+    let raised = 2 * FENCE_INCREMENT_AMOUNT;
+    let fence = |live: &Live| live.rig.shared.syncpoints().fence(syncpoint).unwrap().value;
+    assert_eq!(fence(&live), raised);
+    // One past the cap: `Busy`.
+    live.fake.clear();
+    let refused = live.session();
+    let (handled, buffer, out_at) =
+        live.submit_on(refused, fd, &entries_from(0x20, 1), FENCE_INCREMENT);
+    assert_eq!(handled, Handled::Replied);
+    assert_eq!(answer(&buffer, 1), ok(&[NvResult::Busy.raw()]));
+    assert_eq!(
+        live.rig.memory(out_at, 24),
+        submit_struct(1, FENCE_INCREMENT, 0, 0)
+    );
+    assert_eq!(fence(&live), raised);
+    assert_eq!(live.fake.calls(), []);
+    assert_eq!(live.waiting_entries(channel), MAX_WAITING_ENTRIES);
+    assert_eq!(live.rig.server.pending().count(), 0);
+    // Room drains both, oldest first; then the channel takes a submission again.
+    live.fake.hold(channel, 0);
+    live.room(channel);
+    assert_eq!(live.waiting(channel), 0);
+    assert_eq!(increments_queued(&live, channel), raised);
+    // The GPU has run them.
+    live.fake.hold(channel, 0);
+    let again = live.session();
+    let (handled, buffer, _) = live.submit_on(again, fd, &entries_from(0x30, 1), FENCE_INCREMENT);
+    assert_eq!(handled, Handled::Replied);
+    assert_eq!(answer(&buffer, 1), ok(&[NvResult::Success.raw()]));
+    assert_eq!(fence(&live), raised + FENCE_INCREMENT_AMOUNT);
+}
+
+/// Defers a submission of `count` entries on `fd`, whose channel's queue the caller keeps full,
+/// and puts it in the bench's waiting table, as the server does.
+fn wait_with(bench: &mut Bench, fd: i32, count: usize) {
+    let (answer, deferral) = bench.submit(fd, &entries_from(1, count), FENCE_INCREMENT, (0, 0));
+    assert_eq!(answer.result, NvResult::Success);
+    let Deferral {
+        channel,
+        submission,
+    } = deferral.unwrap();
+    let front = Arc::clone(&bench.front);
+    bench
+        .submits
+        .push(channel, None, submission, front)
+        .unwrap();
+}
+
+/// The cap's edge, each pair differing only there: a submission that reaches the cap waits, one
+/// a single entry past it is `Busy` before its fence is raised; a submission with no entries is
+/// charged one entry (a listed departure). A whole queue's entries wait when nothing else does.
+#[test]
+fn the_cap_takes_a_submission_that_reaches_it_and_refuses_one_past() {
+    let mut bench = Bench::new();
+    let (fd, _, syncpoint, channel) = bench.channel();
+    bench.fake.hold(channel, CHANNEL_QUEUE_ENTRIES);
+    let max = |bench: &Bench| bench.syncpoints.fence(syncpoint).unwrap().value;
+    // Nothing waits: a whole queue's entries wait, though they fill the cap.
+    wait_with(&mut bench, fd, CHANNEL_QUEUE_ENTRIES);
+    assert_eq!(bench.submits.waiting_entries(channel), MAX_WAITING_ENTRIES);
+    bench.submits.cancel(channel);
+    // One entry below the cap.
+    wait_with(&mut bench, fd, MAX_WAITING_ENTRIES - 1);
+    let before = max(&bench);
+    // Two entries pass it by one: `Busy`, the argument as sent, the maximum as it was.
+    let flags = FENCE_INCREMENT;
+    let (answer, deferral) = bench.submit(fd, &entries_from(5, 2), flags, (0, 0));
+    assert_eq!((answer.result, deferral), (NvResult::Busy, None));
+    let mut sent = submit_struct(2, flags, 0, 0);
+    sent.extend(entry_bytes(&entries_from(5, 2)));
+    assert_eq!(answer.output, sent);
+    assert_eq!(max(&bench), before);
+    // No entries, charged one, reach it: taken, with the fence the refused one did not raise.
+    let (answer, deferral) = bench.submit(fd, &[], flags, (0, 0));
+    assert_eq!(answer.result, NvResult::Success);
+    let expected = before + FENCE_INCREMENT_AMOUNT;
+    assert_eq!(fence_of(&answer), (u32::from(syncpoint.get()), expected));
+    let Deferral {
+        channel: waits_on,
+        submission,
+    } = deferral.unwrap();
+    bench
+        .submits
+        .push(waits_on, None, submission, Arc::clone(&bench.front))
+        .unwrap();
+    assert_eq!(bench.submits.waiting_entries(channel), MAX_WAITING_ENTRIES);
+    // At the cap: no entries, and one entry, are both `Busy`.
+    for count in [0, 1] {
+        let (answer, deferral) = bench.submit(fd, &entries_from(9, count), flags, (0, 0));
+        assert_eq!((answer.result, deferral), (NvResult::Busy, None), "{count}");
+    }
+    assert_eq!(max(&bench), expected);
+    assert_eq!(bench.submits.waiting(channel), 2);
+}
+
+/// The cap is each channel's: another channel, with nothing waiting, takes a submission while
+/// the first is at the cap.
+#[test]
+fn the_cap_is_each_channel_s() {
+    let mut bench = Bench::new();
+    let (fd, _, _, channel) = bench.channel();
+    let (other_fd, _, _, other) = bench.channel();
+    bench.fake.hold(channel, CHANNEL_QUEUE_ENTRIES);
+    wait_with(&mut bench, fd, MAX_WAITING_ENTRIES);
+    let (answer, deferral) = bench.submit(other_fd, &entries_from(1, 1), 0, (0, 0));
+    assert_eq!((answer.result, deferral), (NvResult::Success, None));
+    assert_eq!(bench.fake.queued().last().map(|(c, _)| *c), Some(other));
+    // And with the other's queue full too, it waits rather than being refused.
+    bench.fake.hold(other, CHANNEL_QUEUE_ENTRIES);
+    wait_with(&mut bench, other_fd, 1);
+    assert_eq!(bench.submits.waiting_entries(other), 1);
+}
+
+/// Each check before the cap answers first when both faults are present: with the channel at
+/// the cap, a count above the entries sent is `InvalidSize`; bits 0 and 8, an overflowing
+/// increment, and a wait on no syncpoint are `BadParameter`; and nothing is raised.
+#[test]
+fn the_checks_before_the_cap_answer_first() {
+    let mut bench = Bench::new();
+    let (fd, _, syncpoint, channel) = bench.channel();
+    bench.fake.hold(channel, CHANNEL_QUEUE_ENTRIES);
+    wait_with(&mut bench, fd, MAX_WAITING_ENTRIES);
+    let before = bench.syncpoints.fence(syncpoint).unwrap();
+    // Count 2 with one entry sent.
+    let mut input = submit_struct(2, 0, 0, 0);
+    input.extend(entry_bytes(&entries_from(1, 1)));
+    let (answer, _) = bench.call(IoctlVariant::Ioctl, fd, submit_number(1), &input, &[]);
+    assert_eq!(answer.result, NvResult::InvalidSize);
+    let no_syncpoint = u32::try_from(SYNCPOINT_COUNT).unwrap();
+    let faults = [
+        (FENCE_WAIT | INCREMENT_VALUE, (0, 0)),
+        (FENCE_INCREMENT | INCREMENT_VALUE, (0, u32::MAX)),
+        (FENCE_WAIT, (no_syncpoint, 0)),
+    ];
+    for (flags, fence) in faults {
+        let (answer, deferral) = bench.submit(fd, &entries_from(1, 1), flags, fence);
+        assert_eq!((answer.result, deferral), (NvResult::BadParameter, None));
+    }
+    assert_eq!(bench.syncpoints.fence(syncpoint).unwrap(), before);
+}
+
+/// A submission with no entries is charged one, and one with entries what it holds.
+#[test]
+fn a_waiting_submission_is_charged_its_entries_and_at_least_one() {
+    assert_eq!(charge(0), 1);
+    assert_eq!(charge(1), 1);
+    assert_eq!(charge(2), 2);
+    assert_eq!(charge(MAX_WAITING_ENTRIES), MAX_WAITING_ENTRIES);
+}
+
+/// `Submits::push` refuses a submission that would pass the cap, whoever calls it: its token,
+/// if it has one, answers `Busy`, and the table is unchanged. One that reaches the cap exactly
+/// is taken.
+#[test]
+fn a_push_past_the_cap_is_refused() {
     let mut live = Live::new();
     let fd = live.channel();
     let channel = live.made(fd);
     live.fake.hold(channel, CHANNEL_QUEUE_ENTRIES);
-    let rounds = 3;
-    for round in 0..rounds {
-        let session = live.session();
-        let first = u64::try_from(round).unwrap();
-        live.submit_on(session, fd, &entries_from(first, 1), 0);
-        live.rig.server.close(session).unwrap();
-    }
-    assert_eq!(live.waiting(channel), rounds);
-    assert_eq!(live.rig.server.pending().count(), 0);
+    let session = live.session();
+    let entries = entries_from(1, MAX_WAITING_ENTRIES - 1);
+    let (handled, _, _) = live.submit_on(session, fd, &entries, 0);
+    assert!(matches!(handled, Handled::Deferred(_)));
+    let (pending, _) = live.rig.server.pending().next().unwrap();
+    let front = channel_front(&live.fake);
+    let submission = |count: usize| Submission {
+        entries: entries_from(0x40, count)
+            .into_iter()
+            .map(GpfifoEntry)
+            .collect(),
+        wait: None,
+        increments: 0,
+        wfi: true,
+    };
+    // Two entries pass the cap by one: refused, and the reissued token answers `Busy`.
+    let token = live.rig.server.reissue(pending);
+    let refused = live
+        .rig
+        .shared
+        .lock()
+        .submits()
+        .push(channel, token, submission(2), Arc::clone(&front));
+    let over = OverCap {
+        channel: channel.0,
+        waiting: MAX_WAITING_ENTRIES - 1,
+        entries: 2,
+    };
+    assert_eq!(refused, Err(over));
+    assert_eq!(live.deliver(), [(session, ok(&[NvResult::Busy.raw()]))]);
+    assert_eq!(live.waiting(channel), 1);
+    assert_eq!(live.waiting_entries(channel), MAX_WAITING_ENTRIES - 1);
+    // One entry reaches it: taken.
+    let taken = live
+        .rig
+        .shared
+        .lock()
+        .submits()
+        .push(channel, None, submission(1), Arc::clone(&front));
+    assert_eq!(taken, Ok(()));
+    assert_eq!(live.waiting_entries(channel), MAX_WAITING_ENTRIES);
+    // At the cap, a submission with no entries is refused too, without a token.
+    let refused = live
+        .rig
+        .shared
+        .lock()
+        .submits()
+        .push(channel, None, submission(0), front);
+    let over = OverCap {
+        channel: channel.0,
+        waiting: MAX_WAITING_ENTRIES,
+        entries: 0,
+    };
+    assert_eq!(refused, Err(over));
+    assert_eq!(live.waiting(channel), 2);
+}
+
+#[test]
+fn a_push_past_the_cap_is_said_in_plain_words() {
+    let over = OverCap {
+        channel: 0x30,
+        waiting: 7,
+        entries: 2,
+    };
+    assert_eq!(
+        over.to_string(),
+        format!(
+            "GPU channel 48 has 7 entries waiting, and 2 more would pass the cap of \
+             {MAX_WAITING_ENTRIES}"
+        )
+    );
 }
 
 // ----- The order of a channel fd's close -------------------------------------------------------
