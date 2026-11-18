@@ -33,7 +33,9 @@
 //! Each vCPU starts with [`CounterScale::IDENTITY`], so an unpatched `cntpct_el0` reads the
 //! virtual counter unchanged until [`HvfVcpu::set_counter_scale`] gives it the patcher's scale.
 //! If the vCPU is stopped while the shim answers a read, the read is undone and runs again on
-//! the next entry (`shim`, "Counter reads", and the recovery cases there).
+//! the next entry, unless the shim had reached its last instruction, the `eret`, with the read
+//! complete (`shim::recovery`; `hvf/hardware.rs`,
+//! `a_counter_read_stopped_anywhere_on_the_shims_path_is_recovered_exactly`).
 //!
 //! # Registers
 //!
@@ -1329,6 +1331,28 @@ mod tests {
         );
         // A size that cannot be rounded up without overflowing.
         assert_eq!(RamConfig::at_least(u64::MAX), Err(LayoutError::OutOfRange));
+    }
+
+    #[test]
+    fn a_counter_scale_is_stored_as_the_shim_loads_it() {
+        // `ldp x10, x11, [sp, #-48]`: the fraction in the lower doubleword, the integer part in
+        // the upper, each little-endian. Each byte distinct, so a swap or a reversal fails.
+        let scale = CounterScale::new(0x0807_0605_0403_0201, 0x1817_1615_1413_1211);
+        assert_eq!(
+            scale.to_bytes(),
+            [
+                0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, // frac
+                0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, // int
+            ]
+        );
+        assert_eq!(
+            (scale.int(), scale.frac()),
+            (0x0807_0605_0403_0201, 0x1817_1615_1413_1211)
+        );
+        assert_eq!(
+            CounterScale::IDENTITY.to_bytes(),
+            [0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0]
+        );
     }
 
     #[test]

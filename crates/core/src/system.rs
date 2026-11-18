@@ -124,8 +124,7 @@ pub(crate) mod host {
     use super::Error;
     use super::ram::GuestRam;
     use crate::clock::{CounterClock, Timebase, shim_scale};
-    use crate::image::LoadError;
-    use crate::image::{IMAGE_BASE, Loaded, Program, load_placed, place};
+    use crate::image::{IMAGE_BASE, LoadError, Loaded, Program, load_placed, place};
     use crate::machine::{self, GuestProgram, GuestSpace, Vcpus};
 
     use crate::report::{RunOptions, RunReport};
