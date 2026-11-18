@@ -87,6 +87,37 @@ fn a_host_io_record_that_fits_exactly_is_kept() {
 }
 
 #[test]
+fn a_kept_host_io_records_payload_counts_toward_the_limit() {
+    // Two identical host I/O records carrying 100 bytes each, into room for one of them plus a
+    // record that carries nothing: the second fits only if the first's payload went uncounted,
+    // so it is dropped. The fit check counts the payload of the record it checks, so this is
+    // what fails when the running total counts only the size of an `EnvRecord`.
+    let record = host_io(100, 0);
+    let mut kept = Kept::new(record_bytes(&record) + one());
+    kept.push(vec![record.clone(), record.clone()]);
+    assert_eq!(kept.records(), [record.clone()]);
+    assert_eq!(kept.dropped(), 1);
+
+    // The accepted side of the same edge: room for exactly both keeps both.
+    let mut both = Kept::new(2 * record_bytes(&record));
+    both.push(vec![record.clone(), record.clone()]);
+    assert_eq!(both.records(), [record.clone(), record.clone()]);
+    assert_eq!(both.dropped(), 0);
+
+    // The same at the shipping cap: a first host I/O record whose reply fills the cap up to
+    // room for one 100-byte record plus an empty one, then the two identical records.
+    let filler = host_io(0, ENV_RECORDING_BYTES - record_bytes(&record) - 2 * one());
+    assert_eq!(
+        record_bytes(&filler) + record_bytes(&record) + one(),
+        ENV_RECORDING_BYTES
+    );
+    let mut capped = Kept::new(ENV_RECORDING_BYTES);
+    capped.push(vec![filler.clone(), record.clone(), record.clone()]);
+    assert_eq!(capped.records(), [filler, record]);
+    assert_eq!(capped.dropped(), 1);
+}
+
+#[test]
 fn a_live_run_env_answers_from_the_host_and_keeps_what_it_moved() {
     let env = RunEnv::new(&EnvSource::Live, live, ENV_RECORDING_BYTES);
     assert_eq!(env.now(), Ok(HostNanos(0)));
