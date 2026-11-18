@@ -84,7 +84,8 @@
 //!   keeps its first events and the guest log its first lines, and both say when they stopped.
 //!   The observability spec's size cap per run, with its own flags, replaces the constants.
 //! - **Deferred replies.** A run's services are installed by a function the run is given
-//!   ([`Install`]; a real run's calls [`crate::hle::install_with_guest_log`]), which may keep a
+//!   ([`Install`]; a real run's calls [`crate::hle::install_with_graphics`] with the run's
+//!   graphics server, whose turns the timer thread runs), which may keep a
 //!   [`Ready`] to say when a server's deferred replies are ready; the timer thread then
 //!   delivers them ([`Dispatcher::deliver_replies`]), or, when a core has the server's handler
 //!   out, that core does when it puts the handler back. In a real run `fsp-srv`'s reads defer: they run on
@@ -305,8 +306,9 @@ pub(crate) struct Given {
 /// A failure ends the run before the guest runs, with the message given.
 pub(crate) type Install = dyn Fn(&Dispatcher, Given) -> Result<(), String> + Sync;
 
-/// The services of a real run ([`crate::hle::install_with_guest_log`], given the run's guest log
-/// through [`Given::guest_log`]), with `fsp-srv`'s reads on its workers, which keep no record
+/// The services of a real run ([`crate::hle::install_with_graphics`], given the run's guest log
+/// through [`Given::guest_log`] and the run's graphics server, whose turns the timer thread runs,
+/// through [`Given::graphics`]), with `fsp-srv`'s reads on its workers, which keep no record
 /// (module docs, "The environment").
 fn real_services(dispatcher: &Dispatcher, given: Given) -> Result<(), String> {
     let workers =
