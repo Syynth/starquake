@@ -493,19 +493,33 @@ fn a_message_is_capped_at_its_limit() {
     );
 }
 
-/// [`Pending`]'s saved shape, without its limits, to write states it refuses.
+/// [`Pending`]'s saved shape, without its checks, to write states it refuses: the messages as a
+/// list, in the order given.
 #[derive(Serialize)]
 struct RawPending {
-    messages: BTreeMap<MessageKey, Vec<u8>>,
+    messages: Vec<(MessageKey, Vec<u8>)>,
 }
 
 fn restored(raw: &RawPending) -> Result<Pending, postcard::Error> {
     postcard::from_bytes(&postcard::to_allocvec(raw).unwrap())
 }
 
+/// The checks a saved [`Pending`] goes through, on the list given, without `postcard`.
+fn checked(messages: Vec<(MessageKey, Vec<u8>)>) -> Result<Pending, RestoreError> {
+    Pending::try_from(PendingState { messages })
+}
+
+/// `count` messages of `len` bytes, under distinct keys in their order.
+fn saved(count: usize, len: usize) -> Vec<(MessageKey, Vec<u8>)> {
+    (0..count)
+        .map(|index| (head_of(index).key(), vec![0; len]))
+        .collect()
+}
+
 #[test]
 fn a_saved_pending_is_read_back_through_its_limits() {
-    // What live packets leave is read back as it was.
+    // What live packets leave is read back as it was, and its bytes are those of the list the
+    // restore reads.
     let mut pending = Pending::new();
     for index in 0..MAX_IN_PROGRESS {
         pending.push(&head_of(index), b"part").unwrap();
@@ -513,35 +527,162 @@ fn a_saved_pending_is_read_back_through_its_limits() {
     let bytes = postcard::to_allocvec(&pending).unwrap();
     let back: Pending = postcard::from_bytes(&bytes).unwrap();
     assert_eq!(back, pending);
-
-    // At the limits it is accepted; past either it is refused.
-    let full = |count: usize, len: usize| RawPending {
-        messages: (0..count)
-            .map(|index| (head_of(index).key(), vec![0; len]))
+    let as_list = RawPending {
+        messages: (0..MAX_IN_PROGRESS)
+            .map(|index| (head_of(index).key(), b"part".to_vec()))
             .collect(),
     };
-    assert!(restored(&full(MAX_IN_PROGRESS, MAX_MESSAGE_BYTES)).is_ok());
-    assert!(restored(&full(MAX_IN_PROGRESS + 1, 1)).is_err());
-    assert!(restored(&full(1, MAX_MESSAGE_BYTES + 1)).is_err());
+    assert_eq!(postcard::to_allocvec(&as_list).unwrap(), bytes);
+
+    // At the limits it is accepted; past either it is refused, through `postcard` too.
+    let full = checked(saved(MAX_IN_PROGRESS, MAX_MESSAGE_BYTES)).unwrap();
+    assert_eq!(full.len(), MAX_IN_PROGRESS);
+    assert!(
+        restored(&RawPending {
+            messages: saved(MAX_IN_PROGRESS, MAX_MESSAGE_BYTES)
+        })
+        .is_ok()
+    );
+    assert!(
+        restored(&RawPending {
+            messages: saved(MAX_IN_PROGRESS + 1, 1)
+        })
+        .is_err()
+    );
+    assert!(
+        restored(&RawPending {
+            messages: saved(1, MAX_MESSAGE_BYTES + 1)
+        })
+        .is_err()
+    );
     // The checks themselves, by name.
-    let state = |count: usize, len: usize| PendingState {
-        messages: full(count, len).messages,
-    };
     assert_eq!(
-        Pending::try_from(state(MAX_IN_PROGRESS + 1, 1)),
-        Err(PacketError::TooManyInProgress)
+        checked(saved(MAX_IN_PROGRESS + 1, 1)),
+        Err(RestoreError::TooManyInProgress {
+            count: MAX_IN_PROGRESS + 1
+        })
     );
     assert_eq!(
-        Pending::try_from(state(1, MAX_MESSAGE_BYTES + 1)),
-        Err(PacketError::MessageTooLarge {
+        checked(saved(1, MAX_MESSAGE_BYTES + 1)),
+        Err(RestoreError::MessageTooLarge {
+            index: 0,
             len: MAX_MESSAGE_BYTES + 1
         })
     );
     // Both faults at once: the count is checked first.
     assert_eq!(
-        Pending::try_from(state(MAX_IN_PROGRESS + 1, MAX_MESSAGE_BYTES + 1)),
-        Err(PacketError::TooManyInProgress)
+        checked(saved(MAX_IN_PROGRESS + 1, MAX_MESSAGE_BYTES + 1)),
+        Err(RestoreError::TooManyInProgress {
+            count: MAX_IN_PROGRESS + 1
+        })
     );
+}
+
+#[test]
+fn a_saved_pending_with_a_repeated_or_misordered_key_is_refused() {
+    let [first, second, third] = [0, 1, 2].map(|index| head_of(index).key());
+    assert!(first < second && second < third);
+    let part = || b"part".to_vec();
+
+    // A key twice is refused at the repeat, not merged into one message.
+    let repeated = vec![
+        (first, part()),
+        (second, part()),
+        (second, b"other".to_vec()),
+    ];
+    assert_eq!(
+        checked(repeated.clone()),
+        Err(RestoreError::DuplicateKey { index: 2 })
+    );
+    assert!(restored(&RawPending { messages: repeated }).is_err());
+    // A pair out of order is refused at the second of the pair.
+    let swapped = vec![(first, part()), (third, part()), (second, part())];
+    assert_eq!(
+        checked(swapped.clone()),
+        Err(RestoreError::KeyOutOfOrder { index: 2 })
+    );
+    assert!(restored(&RawPending { messages: swapped }).is_err());
+    // The same keys in order are accepted, each with its own message.
+    let ordered = checked(vec![
+        (first, part()),
+        (second, b"two".to_vec()),
+        (third, part()),
+    ])
+    .unwrap();
+    assert_eq!(ordered.len(), 3);
+    assert_eq!(ordered.message(&second), Some(&b"two"[..]));
+
+    // One message with both faults: the key is checked before the size.
+    let too_large = || vec![0; MAX_MESSAGE_BYTES + 1];
+    assert_eq!(
+        checked(vec![(first, part()), (first, too_large())]),
+        Err(RestoreError::DuplicateKey { index: 1 })
+    );
+    assert_eq!(
+        checked(vec![(second, part()), (first, too_large())]),
+        Err(RestoreError::KeyOutOfOrder { index: 1 })
+    );
+    // Faults on two messages: the first message's is reported, whichever kind it is.
+    assert_eq!(
+        checked(vec![
+            (first, part()),
+            (first, part()),
+            (second, too_large())
+        ]),
+        Err(RestoreError::DuplicateKey { index: 1 })
+    );
+    assert_eq!(
+        checked(vec![
+            (first, part()),
+            (second, too_large()),
+            (second, part())
+        ]),
+        Err(RestoreError::MessageTooLarge {
+            index: 1,
+            len: MAX_MESSAGE_BYTES + 1
+        })
+    );
+    // A message exactly at the size limit after a valid key is accepted.
+    assert!(checked(vec![(first, part()), (second, vec![0; MAX_MESSAGE_BYTES])]).is_ok());
+}
+
+#[test]
+fn restore_errors_read_as_plain_words() {
+    let cases = [
+        (
+            RestoreError::TooManyInProgress {
+                count: MAX_IN_PROGRESS + 1,
+            },
+            format!(
+                "the saved logger holds {} log messages in progress, more than the \
+                 {MAX_IN_PROGRESS} kept",
+                MAX_IN_PROGRESS + 1
+            ),
+        ),
+        (
+            RestoreError::DuplicateKey { index: 2 },
+            "the saved log message at index 2 has the same key as the one before it".to_owned(),
+        ),
+        (
+            RestoreError::KeyOutOfOrder { index: 1 },
+            "the saved log message at index 1 has a key that comes before the one before it"
+                .to_owned(),
+        ),
+        (
+            RestoreError::MessageTooLarge {
+                index: 0,
+                len: MAX_MESSAGE_BYTES + 1,
+            },
+            format!(
+                "the saved log message at index 0 holds {} bytes, more than the \
+                 {MAX_MESSAGE_BYTES} kept",
+                MAX_MESSAGE_BYTES + 1
+            ),
+        ),
+    ];
+    for (error, text) in cases {
+        assert_eq!(error.to_string(), text);
+    }
 }
 
 // Chunks.
@@ -621,6 +762,20 @@ fn session_and_unknown_chunks_are_skipped_by_their_size() {
         alone.extend(hidden);
         assert_eq!(LogRecord::parse(&alone), Ok(LogRecord::default()));
     }
+}
+
+#[test]
+fn a_chunk_key_past_u32_is_not_truncated() {
+    // Eden casts the key to its `u32` enum, so this key's low 32 bits, `TextLog`, would set the
+    // text there. Here the whole number is the key: an unknown one, whose chunk is skipped
+    // (module docs, "Where this differs from Eden").
+    let raw = (1u64 << 32) | ChunkKey::TextLog.raw();
+    assert_eq!(ChunkKey::from_raw(raw), ChunkKey::Other(raw));
+    let bytes = chunk(ChunkKey::from_raw(raw), b"hidden");
+    assert_eq!(LogRecord::parse(&bytes), Ok(LogRecord::default()));
+    // The key's low bits alone are the text.
+    let low = chunk(ChunkKey::TextLog, b"shown");
+    assert_eq!(LogRecord::parse(&low).unwrap().text, Some(&b"shown"[..]));
 }
 
 #[test]

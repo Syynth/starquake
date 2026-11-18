@@ -73,6 +73,14 @@
 //!   `a_message_is_capped_at_its_limit`). Both limits are starquake's own guesses, not a
 //!   console's: a trace of a title that logs more would show they are too small.
 //!
+//! - **A chunk key of 2^32 or more is not truncated.** Eden reads the key as a `u64` and casts
+//!   it to `LogDataChunkKey`, whose underlying type is `u32` (`static_cast<LogDataChunkKey>
+//!   (ReadLeb128(log_data, offset))`, `enum class LogDataChunkKey : u32`), so only the low 32
+//!   bits count: `0x1_0000_0002` is `TextLog` there. Here the whole number is the key
+//!   ([`ChunkKey::from_raw`]), so that key is [`ChunkKey::Other`] and its chunk is skipped
+//!   (`a_chunk_key_past_u32_is_not_truncated`). A LEB128 number of [`MAX_LEB128_BYTES`] bytes
+//!   holds up to 56 bits, so such a key can be sent.
+//!
 //! What Eden refuses is refused the same way: a header shorter than [`HEADER_SIZE`] (Eden:
 //! "Data size is too small for header!") and a packet that is not a head when no message is in
 //! progress for its key (Eden: "Log entry does not exist!") ([`PacketError::NoHead`]).
@@ -359,37 +367,96 @@ pub struct MessageKey {
 }
 
 /// The messages in progress on one logger (Eden's `ILogger::entries`), within
-/// [`MAX_IN_PROGRESS`] messages of at most [`MAX_MESSAGE_BYTES`] each. A snapshot is read back
-/// through the same limits, so a saved logger that holds more is refused.
+/// [`MAX_IN_PROGRESS`] messages of at most [`MAX_MESSAGE_BYTES`] each.
+///
+/// A snapshot holds the messages as a list of key and bytes, in the keys' order (`postcard`
+/// writes a map and such a list the same way). It is read back as a list and checked
+/// ([`RestoreError`]) in this order: first the number of messages, against
+/// [`MAX_IN_PROGRESS`]; then each message from the first, its key against the one before it
+/// (a repeated key, then a key out of order), then its size against [`MAX_MESSAGE_BYTES`]. The
+/// first fault found is the one reported. So a saved logger that holds more than live packets
+/// can leave, or a key twice, is refused rather than merged.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "PendingState")]
 pub struct Pending {
     messages: BTreeMap<MessageKey, Vec<u8>>,
 }
 
-/// [`Pending`] as a snapshot holds it, before its limits are checked.
+/// [`Pending`] as a snapshot holds it, before it is checked: the messages as a list, so that a
+/// repeated key is seen rather than merged.
 #[derive(Deserialize)]
 struct PendingState {
-    messages: BTreeMap<MessageKey, Vec<u8>>,
+    messages: Vec<(MessageKey, Vec<u8>)>,
+}
+
+/// Why a saved [`Pending`] was refused (its docs give the order of the checks). `index` counts
+/// the saved messages from 0.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RestoreError {
+    /// More messages than [`MAX_IN_PROGRESS`].
+    #[error(
+        "the saved logger holds {count} log messages in progress, more than the \
+         {MAX_IN_PROGRESS} kept"
+    )]
+    TooManyInProgress {
+        /// How many messages it holds.
+        count: usize,
+    },
+    /// A message with the same key as the one before it.
+    #[error("the saved log message at index {index} has the same key as the one before it")]
+    DuplicateKey {
+        /// The message's index.
+        index: usize,
+    },
+    /// A message whose key comes before the one before it.
+    #[error("the saved log message at index {index} has a key that comes before the one before it")]
+    KeyOutOfOrder {
+        /// The message's index.
+        index: usize,
+    },
+    /// A message larger than [`MAX_MESSAGE_BYTES`].
+    #[error(
+        "the saved log message at index {index} holds {len} bytes, more than the \
+         {MAX_MESSAGE_BYTES} kept"
+    )]
+    MessageTooLarge {
+        /// The message's index.
+        index: usize,
+        /// Its size.
+        len: usize,
+    },
 }
 
 impl TryFrom<PendingState> for Pending {
-    type Error = PacketError;
+    type Error = RestoreError;
 
-    fn try_from(state: PendingState) -> Result<Self, PacketError> {
-        if state.messages.len() > MAX_IN_PROGRESS {
-            return Err(PacketError::TooManyInProgress);
+    fn try_from(state: PendingState) -> Result<Self, RestoreError> {
+        let count = state.messages.len();
+        if count > MAX_IN_PROGRESS {
+            return Err(RestoreError::TooManyInProgress { count });
         }
-        if let Some(message) = state
-            .messages
-            .values()
-            .find(|message| message.len() > MAX_MESSAGE_BYTES)
-        {
-            return Err(PacketError::MessageTooLarge { len: message.len() });
+        let mut messages = BTreeMap::new();
+        let mut previous: Option<MessageKey> = None;
+        for (index, (key, message)) in state.messages.into_iter().enumerate() {
+            match previous.map(|previous| key.cmp(&previous)) {
+                Some(std::cmp::Ordering::Equal) => {
+                    return Err(RestoreError::DuplicateKey { index });
+                }
+                Some(std::cmp::Ordering::Less) => {
+                    return Err(RestoreError::KeyOutOfOrder { index });
+                }
+                Some(std::cmp::Ordering::Greater) | None => {}
+            }
+            if message.len() > MAX_MESSAGE_BYTES {
+                return Err(RestoreError::MessageTooLarge {
+                    index,
+                    len: message.len(),
+                });
+            }
+            previous = Some(key);
+            messages.insert(key, message);
         }
-        Ok(Self {
-            messages: state.messages,
-        })
+        Ok(Self { messages })
     }
 }
 
