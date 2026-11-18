@@ -1081,4 +1081,8 @@ impl Env for Failing {
     fn host_io(&self, _: &HostIoRequest) -> Result<HostIoReply, EnvError> {
         Err(self.fail(EnvCall::HostIo))
     }
+
+    fn wall_clock(&self) -> Result<starquake_trace::UnixSeconds, EnvError> {
+        Err(self.fail(EnvCall::WallClock))
+    }
 }
