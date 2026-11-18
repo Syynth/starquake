@@ -13,9 +13,10 @@
 //!
 //! [`GsvShared`] holds, so far, the waiter count of each syncpoint ([`Locked::watch`],
 //! [`Locked::unwatch`]), the syncpt sessions' waiter table ([`Waiters`]: [`Locked::arm`],
-//! [`Locked::disarm`]; slice 4), the GPU memory bookkeeping ([`Locked::gpu`], slice 7) and the
-//! shared syncpoint page ([`page`], slice 5); later slices add vi2's queues and the native object
-//! tables (spec, "Concurrency inside gsv").
+//! [`Locked::disarm`]; slice 4), the GPU memory bookkeeping ([`Locked::gpu`], slice 7), the
+//! shared syncpoint page ([`page`], slice 5) and the submissions that wait for room in a full GPU
+//! queue ([`Locked::submits`], slice 11: [`crate::nvsrv::gpu::submits`]); later slices add vi2's
+//! queues and the native object tables (spec, "Concurrency inside gsv").
 //!
 //! Each armed wait holds one watch of its syncpoint: [`Locked::arm`] takes it, and gives back
 //! the watch of the wait it replaces; [`Locked::disarm`] and the drain's firing give it back
@@ -59,7 +60,7 @@
 //! |---|---|
 //! | `GpuCompletion::SyncpointChanged` | records `SyncpointObserved` ([`crate::note`]), then fires every armed wait on the id that the drained value satisfies: takes it out of the table, unwatches its id, and signals its event through the kernel ([`TimerHost::signal_event`]), in ascending event order (`a_change_fires_its_waits_after_its_note_in_event_order`) |
 //! | `GpuCompletion::GpuOrdered` | records `GpuOrderedDone`; then, if a gpu worker job waits on the ticket ([`crate::gpu::GpuMemory::ordered_done`]), publishes the ranges it removed again, releases its device-share locks as a `DeviceShareReleased` is released (below), and only then signals its event ([`TimerHost::signal_event`]) |
-//! | `GpuCompletion::GpuQueueRoom` | records `QueueRoom` |
+//! | `GpuCompletion::GpuQueueRoom` | records `QueueRoom`; then gives the channel's waiting submissions to the front again, oldest first, completing the reply of each one it queues, until the front answers `Full` ([`crate::nvsrv::gpu::submits::Submits::room`]) |
 //! | [`Completion::GuestSignalled`] | records nothing (the guest's `SignalEvent` is recorded as its system call); if the event is the bound shared page's request event, marks the page signalled, and the next page turn ([`Shared::tick_page`]) reads the request and records what it answers ([`page`]) |
 //! | [`Completion::DeviceShareReleased`] | unlocks through the kernel with the token ([`TimerHost::unlock_device_share`]), which checks it; records nothing (the spec's "What is recorded" has no note for it) |
 //!
@@ -82,8 +83,6 @@
 //! (the kernel no longer has the event) is logged as an error and the drain goes on; the wait
 //! is gone either way (`a_refused_signal_is_logged_and_the_drain_goes_on`; the level is pinned
 //! by `tests/signal_log_level.rs`, a test binary of its own).
-//!
-//! Later slices act on them as well: deferred submissions (11).
 //!
 //! **The page turn.** After each drain the timer thread runs [`Shared::tick_page`] with the
 //! turn's time, which answers the shared page's requests ([`page`], "When a request is
@@ -140,6 +139,7 @@ use thiserror::Error;
 use crate::completion::{Completion, CompletionQueue};
 use crate::gpu::GpuMemory;
 use crate::note::Note;
+use crate::nvsrv::gpu::submits::Submits;
 use crate::syncpt::waiters::{SavedWait, SavedWaitError, Wait, Waiters};
 
 pub mod page;
@@ -221,6 +221,8 @@ pub struct GsvShared {
     waiters: Waiters,
     /// The shared syncpoint page (slice 5).
     page: Page,
+    /// The submissions that wait for room (slice 11).
+    submits: Submits,
 }
 
 impl GsvShared {
@@ -231,7 +233,14 @@ impl GsvShared {
             gpu: GpuMemory::new(),
             waiters: Waiters::default(),
             page: Page::default(),
+            submits: Submits::new(),
         }
+    }
+
+    /// The submissions that wait for room in a full GPU queue.
+    #[must_use]
+    pub const fn submits(&self) -> &Submits {
+        &self.submits
     }
 
     /// The syncpt sessions' armed waits.
@@ -337,6 +346,18 @@ impl Locked<'_> {
     /// The GPU memory bookkeeping, to change (the gpu server's handlers, slice 7).
     pub fn gpu(&mut self) -> &mut GpuMemory {
         &mut self.state.gpu
+    }
+
+    /// The submissions that wait for room, to change (nvsrv's handlers, slice 11).
+    pub fn submits(&mut self) -> &mut Submits {
+        &mut self.state.submits
+    }
+
+    /// The GPU memory bookkeeping and the waiting submissions together, for nvsrv's handlers,
+    /// which reach both in one ioctl.
+    pub fn gpu_and_submits(&mut self) -> (&mut GpuMemory, &mut Submits) {
+        let state = &mut *self.state;
+        (&mut state.gpu, &mut state.submits)
     }
 
     /// Arms `wait` on `event`, replacing the wait armed on it before, and returns the wait's
@@ -474,6 +495,9 @@ impl Shared {
                             signal(host, event);
                         }
                     }
+                    if let GpuCompletion::GpuQueueRoom { channel } = gpu {
+                        state.submits().room(channel);
+                    }
                 }
             }
         }
@@ -549,6 +573,7 @@ impl Shared {
             gpu: GpuMemory::new(),
             waiters,
             page: Page::default(),
+            submits: Submits::new(),
         };
         Ok(Self::with_state(state, syncpoints, queue, service))
     }
