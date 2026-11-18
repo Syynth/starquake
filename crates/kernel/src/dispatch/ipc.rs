@@ -1033,9 +1033,12 @@ impl Dispatcher {
     /// When a process is to end, all of this happens under one hold of the lock, so that no
     /// core can run a sender of that process between its reply and the end: a sender the timer
     /// thread's delivery answers, or one a dispatch answers for another thread, is left as a
-    /// dispatch's own caller is, answered and ended before it could run again. Test:
-    /// `a_sender_whose_process_a_delivery_ends_is_never_seen_runnable`. Otherwise each request
-    /// is settled under a lock of its own, as before ends existed.
+    /// dispatch's own caller is, answered and ended before it could run again. Otherwise each
+    /// request is settled under a lock of its own, and the woken are reported under one more.
+    /// Test: `replies_and_the_end_they_ask_for_are_settled_under_one_hold_of_the_lock`, which
+    /// counts the acquisitions ([`Dispatcher::lock_waits`]). Without the one hold, a sender the
+    /// timer thread answered could run in between (seen in repeated runs of
+    /// `the_timer_thread_ends_the_run_when_a_delivery_ends_the_process`, `starquake-core`).
     fn settle_and_end(
         &self,
         finished: Vec<Finished>,

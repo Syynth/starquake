@@ -1875,53 +1875,62 @@ fn a_run_whose_only_thread_waits_for_a_deferred_reply_is_not_stalled() {
     assert!(!world.dispatcher.is_stalled());
 }
 
-#[test]
-fn a_sender_whose_process_a_delivery_ends_is_never_seen_runnable() {
-    // Another thread (a core asking what to run) looks at A's thread, over and over, while
-    // the delivery answers A and ends its process. Its reply and the end come under one hold
-    // of the lock, so A goes from waiting to ended and no core could have run it in between.
-    // A watcher that sees it runnable proves the window open; one that does not cannot prove
-    // it shut, so this pins the order only as often as the watcher lands in the window.
-    const LOOKS: Duration = Duration::from_secs(10);
-    let (world, thread) = world_running_a_user_thread(A);
+/// What [`Dispatcher::settle_and_end`] does with the requests a delivery of the first server's
+/// replies leaves over, in a world whose process runs A, whose deferred request is answered:
+/// how many times it takes the lock, and the processes it ends. `end` is whether the handler
+/// asks to end the process as it gives the reply. Every other request in flight (`waiting`
+/// senders queued behind A's) is answered by the same delivery.
+fn settling_takes_the_lock(end: bool, waiting: &[ThreadId]) -> (u64, Vec<Ended>) {
+    let (world, _) = world_running_a_user_thread(A);
     let handle = world.session();
     let session = world.object(handle);
     world
         .first
         .script(Box::new(|_, _, _| Ok(Handled::Deferred)));
     world.send(A, handle, &request());
-    let a = world.with_tables(|_, scheduler| match scheduler.objects().get(thread) {
-        Ok(Object::Thread(id)) => id,
-        other => unreachable!("{other:?} is not a thread"),
-    });
-    lock(&world.first.hooks).take_reply = Some(Box::new(|cx| cx.end_process()));
+    world.first.script(reply_with(0xBC));
+    for sender in waiting {
+        world.send(*sender, handle, &request());
+    }
+    if end {
+        lock(&world.first.hooks).take_reply = Some(Box::new(|cx| cx.end_process()));
+    }
     lock(&world.first.ready).push_back((session, Ok(0xA0)));
-    let (watching, watched) = mpsc::sync_channel(1);
-    let world = &world;
-    let seen = std::thread::scope(|scope| {
-        let watcher = scope.spawn(move || {
-            let started = std::time::Instant::now();
-            let mut seen = Vec::new();
-            watching.send(()).unwrap();
-            while started.elapsed() < LOOKS {
-                let state =
-                    world.with_tables(|_, scheduler| scheduler.thread(a).unwrap().state());
-                if seen.last() != Some(&state) {
-                    seen.push(state);
-                }
-                if state == ThreadState::Terminated {
-                    break;
-                }
-            }
-            seen
-        });
-        watched.recv_timeout(LOOKS).unwrap();
-        assert_eq!(world.deliver(&world.first).len(), 1);
-        watcher.join().unwrap()
-    });
-    assert_eq!(seen.last(), Some(&ThreadState::Terminated), "{seen:?}");
-    assert!(!seen.contains(&ThreadState::Runnable), "{seen:?}");
+    // The first half of a delivery (`deliver_replies`), by hand.
+    let server = world.first.id;
+    let process_id = world
+        .dispatcher
+        .lock::<(&mut Scheduler,)>()
+        .state
+        .tables
+        .processes
+        .process_id();
+    world.dispatcher.lock::<(&mut Scheduler,)>().state.owed.insert(server);
+    let finished = world.dispatcher.deliver_owed(server, &world.memory, process_id);
+    assert_eq!(finished.len(), 1 + waiting.len());
+    let before = world.dispatcher.lock_waits().lock.acquisitions;
+    let (mine, ended) =
+        world
+            .dispatcher
+            .settle_and_end(finished, None, &world.memory, &world.recorder, GuestTicks(0));
+    let taken = world.dispatcher.lock_waits().lock.acquisitions - before;
+    assert_eq!(mine, None);
     assert_eq!(world.tls(A), [0xA0; BUFFER_SIZE]);
+    (taken, ended)
+}
+
+#[test]
+fn replies_and_the_end_they_ask_for_are_settled_under_one_hold_of_the_lock() {
+    // Each request with no end asked is settled under a lock of its own, and the woken are
+    // reported under one more.
+    for waiting in [&[][..], &[B][..], &[B, C][..]] {
+        let count = u64::try_from(waiting.len()).unwrap();
+        assert_eq!(settling_takes_the_lock(false, waiting), (count + 2, Vec::new()));
+        // With an end asked, everything (every reply, the reports and the end) is one hold, so
+        // no core can run a sender of the ending process between its reply and the end.
+        let (taken, ended) = settling_takes_the_lock(true, waiting);
+        assert_eq!((taken, ended.len()), (1, 1));
+    }
 }
 
 #[test]
