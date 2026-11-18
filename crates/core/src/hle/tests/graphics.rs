@@ -10,6 +10,8 @@
 //! arguments from Eden's structs (`eden/src/core/hle/service/nvdrv/devices/nvhost_as_gpu.h` and
 //! `nvhost_gpu.h` @ cf654052).
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use starquake_gpu::interface::SyncpointId;
 use starquake_gpu::syncpoint::UNALLOCATED;
 use starquake_gsv::gpu::command as gpu_command;
@@ -26,7 +28,7 @@ use starquake_kernel::dispatch::DeviceShareError;
 use starquake_kernel::handle::HandleTable;
 use starquake_kernel::id::{ObjectId, ProcessId, SlabId};
 use starquake_kernel::memory::testing::device_share_token;
-use starquake_trace::{EnvError, HostNanos};
+use starquake_trace::{EnvCall, EnvError, HostIoReply, HostIoRequest, HostNanos};
 
 use super::*;
 use crate::hle::graphics::KernelHost;
@@ -756,13 +758,14 @@ fn the_shared_page_is_bound_and_answered_through_the_kernel() {
 }
 
 /// The kernel host reads and writes a transfer memory up to its exact end and not a byte past
-/// it (`InvalidCurrentMemory`, nothing copied), refuses an object that is not a transfer memory
+/// it (`InvalidCurrentMemory`, nothing copied), also where mapped memory follows the transfer
+/// memory, so only its bounds can refuse; it refuses an object that is not a transfer memory
 /// (`InvalidHandle`), and passes the kernel's own answer to a signal or an unlock through.
 #[test]
 fn the_kernel_host_reaches_what_the_kernel_holds_and_no_more() {
     let graphics = Graphics::new(FrontMode::Live, None);
     let rig = rig_with(&graphics);
-    let (request, _, _, read_only) = bound(&rig);
+    let (request, _, writable, read_only) = bound(&rig);
     let memory = rig.object(read_only);
     let size = u64::from(READ_ONLY_SIZE);
     let mut host = rig.host();
@@ -802,6 +805,45 @@ fn the_kernel_host_reaches_what_the_kernel_holds_and_no_more() {
     assert_eq!(
         host.read_transfer_memory(memory, u64::MAX, &mut [0; 1]),
         Err(KernelError::InvalidCurrentMemory)
+    );
+
+    // The read-only memory ends where the rig's memory does, so a byte past it is refused by the
+    // memory too. The writable one is followed by mapped memory (the read-only one's first
+    // page): a byte past its end is refused by the transfer memory's bounds alone.
+    let writable_memory = rig.object(writable);
+    let size = u64::from(WRITABLE_SIZE);
+    assert_eq!(WRITABLE_AT + size, READ_ONLY_AT);
+    let mut past = [0; 4];
+    rig.memory.read(WRITABLE_AT + size - 3, &mut past).unwrap();
+    rig.memory
+        .write(WRITABLE_AT + size - 4, &[0x11, 0x22, 0x33, 0x44])
+        .unwrap();
+    let mut out = [0; 4];
+    assert_eq!(
+        host.read_transfer_memory(writable_memory, size - 4, &mut out),
+        Ok(())
+    );
+    assert_eq!(out, [0x11, 0x22, 0x33, 0x44]);
+    let mut out = [0xEE; 4];
+    assert_eq!(
+        host.read_transfer_memory(writable_memory, size - 3, &mut out),
+        Err(KernelError::InvalidCurrentMemory)
+    );
+    assert_eq!(out, [0xEE; 4]);
+    assert_eq!(
+        host.write_transfer_memory(writable_memory, size - 4, &[0x55, 0x66, 0x77, 0x88]),
+        Ok(())
+    );
+    let before = rig.read_u64(WRITABLE_AT + size - 4);
+    assert_eq!(
+        host.write_transfer_memory(writable_memory, size - 3, &[0x99; 4]),
+        Err(KernelError::InvalidCurrentMemory)
+    );
+    assert_eq!(rig.read_u64(WRITABLE_AT + size - 4), before);
+    assert_eq!(
+        before.to_le_bytes()[..4],
+        [0x55, 0x66, 0x77, 0x88],
+        "the write up to the end"
     );
 
     // An event is not a transfer memory; a transfer memory is not an event.
@@ -868,4 +910,58 @@ fn the_kernel_host_records_on_its_core_and_keeps_the_environment_s_first_failure
         );
     }
     assert_eq!(rig.all_events().len(), before);
+
+    // Two failures told apart: each reading of this environment fails with the next index, so
+    // the host must give back the one with index 0 whichever call met it, not a later one.
+    for records_first in [true, false] {
+        let failing = Failing::default();
+        let mut host =
+            KernelHost::new(&rig.dispatcher, &failing, &rig.recorder, &rig.memory, TIMER);
+        for records in [records_first, !records_first] {
+            if records {
+                host.record(note);
+            } else {
+                assert_eq!(host.signal_event(event), Err(KernelError::NotImplemented));
+            }
+        }
+        assert!(failing.readings() >= 2, "{records_first}");
+        let first = host.finish();
+        assert!(
+            matches!(first, Err(EnvError::Exhausted { index: 0, .. })),
+            "{records_first}: {first:?}"
+        );
+    }
+    assert_eq!(rig.all_events().len(), before);
+}
+
+/// An environment every reading of which fails, each with the next index
+/// (`EnvError::Exhausted { index }`), so two failures can be told apart.
+#[derive(Default)]
+struct Failing {
+    readings: AtomicUsize,
+}
+
+impl Failing {
+    fn fail(&self, requested: EnvCall) -> EnvError {
+        let index = self.readings.fetch_add(1, Ordering::SeqCst);
+        EnvError::Exhausted { index, requested }
+    }
+
+    fn readings(&self) -> usize {
+        self.readings.load(Ordering::SeqCst)
+    }
+}
+
+impl Env for Failing {
+    fn now(&self) -> Result<HostNanos, EnvError> {
+        Err(self.fail(EnvCall::Clock))
+    }
+
+    fn random_u64(&self) -> Result<u64, EnvError> {
+        Err(self.fail(EnvCall::Random))
+    }
+
+    fn host_io(&self, _: &HostIoRequest) -> Result<HostIoReply, EnvError> {
+        Err(self.fail(EnvCall::HostIo))
+    }
 }
