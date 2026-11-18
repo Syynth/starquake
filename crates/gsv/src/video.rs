@@ -32,8 +32,9 @@
 //! **conflict: 1002.** NX2 reads it as a second decoder (`OpenVideoDecoderSession2`), PR as the
 //! video encoder (`OpenVideoEncoderContext`, whose codec refuses to initialise as a decoder).
 //! The reply is a session either way (row 105, observed). By decision 8, the larger answer: a
-//! context like 902's, whose decoder service works (`a_1002_context_makes_a_working_decoder`,
-//! in `crates/gsv/src/root/tests.rs`). Verification 1 settles it.
+//! context like 902's, whose decoder service works
+//! (`the_root_hands_out_video_sessions_that_count_frames`, in `starquake-core`'s
+//! `hle/tests/graphics/video.rs`). Verification 1 settles it.
 //!
 //! # The context
 //!
@@ -740,13 +741,23 @@ impl DecoderService {
     }
 
     /// `Start` (6).
-    fn start(this: &mut Self, cx: &mut Context<'_>, _req: &Request<'_>, reply: &mut Reply) -> Outcome {
+    fn start(
+        this: &mut Self,
+        cx: &mut Context<'_>,
+        _req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
         this.update_ready(cx)?;
         reply.ok()
     }
 
     /// `Flush` (8) and `Stop` (207): drops the frames waiting for an image.
-    fn flush(this: &mut Self, cx: &mut Context<'_>, _req: &Request<'_>, reply: &mut Reply) -> Outcome {
+    fn flush(
+        this: &mut Self,
+        cx: &mut Context<'_>,
+        _req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
         this.pending.clear();
         this.update_ready(cx)?;
         reply.ok()

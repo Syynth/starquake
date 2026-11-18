@@ -25,7 +25,9 @@ use crate::native::layout::PREFERENCE_WORDS;
 use crate::native::{Binding, FIRST_ID, MAX_IMAGES, Source};
 use crate::root::{RootState, root_server_with_page};
 use crate::testing::{STALE, halves, le, result_only, success, tipc_type};
-use crate::video::layout::{CODE_BGRA_NX2, CODE_NV12, CODE_NV12_NX2, CODE_RGBA_BLOCK, CODES_RGBA_NX2};
+use crate::video::layout::{
+    CODE_BGRA_NX2, CODE_NV12, CODE_NV12_NX2, CODE_RGBA_BLOCK, CODES_RGBA_NX2,
+};
 
 /// The number the tests' root server is known by.
 const ROOT: ServiceId = ServiceId(0x0758);
@@ -218,7 +220,9 @@ fn pools_are_bounded_at_the_limit() {
         objects.create_pool(&small(), MAX_POOL_IMAGES + 1, memory),
         Err(code(KernelError::NotImplemented))
     );
-    let first = objects.create_pool(&small(), MAX_POOL_IMAGES, memory).unwrap();
+    let first = objects
+        .create_pool(&small(), MAX_POOL_IMAGES, memory)
+        .unwrap();
     objects.destroy_pool(first).unwrap();
     for _ in 0..MAX_POOLS {
         objects.create_pool(&small(), 1, memory).unwrap();
@@ -241,7 +245,10 @@ fn destroying_a_pool_needs_its_first_id() {
     );
     assert_eq!(objects.destroy_pool(first), Ok(None));
     assert!(objects.pool_image(first).is_none());
-    assert_eq!(objects.destroy_pool(first), Err(code(KernelError::NotFound)));
+    assert_eq!(
+        objects.destroy_pool(first),
+        Err(code(KernelError::NotFound))
+    );
     // Its ids are not handed out again.
     assert_eq!(objects.create_pool(&small(), 1, memory), Ok(first + 2));
 }
@@ -328,7 +335,11 @@ fn the_nv12_descriptor_is_pr_s_record() {
 #[test]
 fn a_pitch_linear_rgba_descriptor_is_nx2_s() {
     // 100x50: pitch 448, image 57344; image 1 at 57344.
-    for (code, kind) in [(CODE_BGRA_NX2, 9), (CODES_RGBA_NX2[0], 8), (CODES_RGBA_NX2[5], 8)] {
+    for (code, kind) in [
+        (CODE_BGRA_NX2, 9),
+        (CODES_RGBA_NX2[0], 8),
+        (CODES_RGBA_NX2[5], 8),
+    ] {
         let (mut objects, memory) = tables(MEMORY, 2 * 57_344);
         let first = objects
             .create_pool(&pool_preference(code, 100, 50), 2, memory)
@@ -337,7 +348,11 @@ fn a_pitch_linear_rgba_descriptor_is_nx2_s() {
         expected[0] = kind;
         expected[1] = 57_344;
         expected[2] = 448;
-        assert_eq!(objects.video_descriptor(first + 1), Ok(expected), "code {code}");
+        assert_eq!(
+            objects.video_descriptor(first + 1),
+            Ok(expected),
+            "code {code}"
+        );
     }
 }
 
@@ -596,16 +611,25 @@ fn calculate_answers_the_size_and_alignment() {
     let mut words = vec![0x3EF, 17];
     words.extend(pool_preference(CODE_NV12, 640, 360));
     words.push(2);
-    assert_eq!(rig.send(&words), success(991, &[], &data(&[2 * 0x65400, 4096])));
+    assert_eq!(
+        rig.send(&words),
+        success(991, &[], &data(&[2 * 0x65400, 4096]))
+    );
     let mut words = vec![0x3EF, 17];
     words.extend(pool_preference(CODE_NV12_NX2, 640, 360));
     words.push(1);
     // NX2's row 96 answer, with NX2's alignment.
-    assert_eq!(rig.send(&words), success(991, &[], &data(&[0x64000, 0x2000])));
+    assert_eq!(
+        rig.send(&words),
+        success(991, &[], &data(&[0x64000, 0x2000]))
+    );
     let mut words = vec![0x3EF, 17];
     words.extend(pool_preference(7, 2, 2));
     words.push(1);
-    assert_eq!(rig.send(&words), result_only(991, code(KernelError::NotImplemented)));
+    assert_eq!(
+        rig.send(&words),
+        result_only(991, code(KernelError::NotImplemented))
+    );
     // A count missing: the request is refused before anything is read into a layout.
     let mut words = vec![0x3EF, 16];
     words.extend(small());
@@ -625,10 +649,20 @@ fn create_query_and_destroy_through_the_root() {
     expected[2] = 256;
     expected[3] = (256 << 32) | (4096 + 1024);
     expected[4] = 256;
-    assert_eq!(rig.send(&[0x3D1, 1, FIRST_ID + 1]), success(961, &[], &data(&expected)));
+    assert_eq!(
+        rig.send(&[0x3D1, 1, FIRST_ID + 1]),
+        success(961, &[], &data(&expected))
+    );
     // 428: `0x1bc, 1`, image: two u64 zeros, the descriptor, a u32 zero.
     let mut gpu = vec![0, 0];
-    gpu.extend([1, u64::from(1_u32 | (1 << 16)), 0, 0, 0x1_0100_0001, 4096 | (4096 << 32)]);
+    gpu.extend([
+        1,
+        u64::from(1_u32 | (1 << 16)),
+        0,
+        0,
+        0x1_0100_0001,
+        4096 | (4096 << 32),
+    ]);
     gpu.extend([0; 10]);
     let mut gpu = data(&gpu);
     gpu.push(0);
@@ -650,7 +684,10 @@ fn a_destroy_releases_a_retired_memory_s_lock() {
     let mut rig = Rig::new();
     let memory = rig.memory(PAGE);
     assert_eq!(rig.kernel.device_locks(MEMORY, PAGE), 1);
-    assert_eq!(rig.create(&small(), 1, memory), success(911, &[], &[FIRST_ID]));
+    assert_eq!(
+        rig.create(&small(), 1, memory),
+        success(911, &[], &[FIRST_ID])
+    );
     // 112: retired; the lock stays.
     assert_eq!(rig.send(&[0x80, 1, memory]), success(112, &[], &[]));
     assert_eq!(rig.kernel.device_locks(MEMORY, PAGE), 1);
@@ -669,7 +706,12 @@ fn a_mapping_needs_an_address_space() {
         rig.send(&[0x1BA, 4, FIRST_ID, 1, 0, 1]),
         result_only(426, code(KernelError::NotFound))
     );
-    let space = rig.shared.lock().gpu().create_address_space(&NoFront).unwrap();
+    let space = rig
+        .shared
+        .lock()
+        .gpu()
+        .create_address_space(&NoFront)
+        .unwrap();
     let map = |mode: u32, word_3: u32| [0x1BA, 4, FIRST_ID, word_3, space.0, mode];
     // Word 3 not 1, or a mode byte neither 1 nor 3: InvalidCombination, before the space.
     for (mode, word_3) in [(1, 0), (1, 2), (0, 1), (2, 1), (4, 1), (0x101, 1)] {
@@ -688,7 +730,14 @@ fn a_mapping_needs_an_address_space() {
     // The mapping: the address, the last address, the descriptor with word 5's low half
     // cleared, a u32 zero.
     let mut expected = vec![MEMORY, MEMORY + PAGE - 1];
-    expected.extend([1, u64::from(1_u32 | (1 << 16)), 0, 0, 0x1_0100_0001, 4096 << 32]);
+    expected.extend([
+        1,
+        u64::from(1_u32 | (1 << 16)),
+        0,
+        0,
+        0x1_0100_0001,
+        4096 << 32,
+    ]);
     expected.extend([0; 10]);
     let mut expected = data(&expected);
     expected.push(0);
@@ -699,7 +748,10 @@ fn a_mapping_needs_an_address_space() {
     unmap.extend(halves(MEMORY + PAGE - 1));
     assert_eq!(rig.send(&unmap), success(427, &[], &[]));
     assert_eq!(rig.send(&unmap), success(427, &[], &[]));
-    assert_eq!(rig.send(&unmap), result_only(427, code(KernelError::NotFound)));
+    assert_eq!(
+        rig.send(&unmap),
+        result_only(427, code(KernelError::NotFound))
+    );
 }
 
 #[test]
@@ -707,7 +759,10 @@ fn pool_commands_need_no_901() {
     // No 4, 11, 101 or 901 sent: each answers from the tables (decision 7).
     let mut rig = Rig::new();
     let memory = rig.memory(PAGE);
-    assert_eq!(rig.create(&small(), 1, memory), success(911, &[], &[FIRST_ID]));
+    assert_eq!(
+        rig.create(&small(), 1, memory),
+        success(911, &[], &[FIRST_ID])
+    );
     assert_eq!(rig.shared.lock().native_objects().pools().count(), 1);
 }
 

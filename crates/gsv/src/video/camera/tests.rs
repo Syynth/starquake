@@ -150,7 +150,13 @@ fn open_device_knows_two_names() {
         rig.send_on(camera, &cmif(OPEN_DEVICE, &padded)),
         cmif_reply(ResultCode::SUCCESS, &device)
     );
-    for unknown in [&b"default"[..], b"Defaul", b"DefaultX", b"", b"External0123456"] {
+    for unknown in [
+        &b"default"[..],
+        b"Defaul",
+        b"DefaultX",
+        b"",
+        b"External0123456",
+    ] {
         assert_eq!(
             rig.send_on(camera, &cmif(OPEN_DEVICE, &name(unknown))),
             cmif_reply(GSV_UNKNOWN_ARGUMENT, &[]),
@@ -206,7 +212,10 @@ fn every_probe_command_answers_pr_s_shape() {
 
 #[test]
 fn the_camera_session_keeps_nothing() {
-    assert_eq!(postcard::to_allocvec(&CameraSession).unwrap(), Vec::<u8>::new());
+    assert_eq!(
+        postcard::to_allocvec(&CameraSession).unwrap(),
+        Vec::<u8>::new()
+    );
     assert!(is_device_name(b"Default\0\0\0\0\0\0\0\0\0"));
     assert!(!is_device_name(b"Default\x01\0\0\0\0\0\0\0\0"));
 }

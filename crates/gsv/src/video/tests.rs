@@ -10,9 +10,9 @@ use starquake_gpu::interface::{Completions, Fence, SyncpointId};
 use starquake_gpu::syncpoint::{FIRST_ALLOCATABLE, Syncpoints};
 use starquake_ipc::BUFFER_SIZE;
 use starquake_kernel::handle::Handle;
-use starquake_kernel::slab::SlabId;
 use starquake_kernel::memory::testing::device_share_token;
 use starquake_kernel::result::KernelError;
+use starquake_kernel::slab::SlabId;
 use starquake_services::framework::fake::FakeKernel;
 use starquake_services::framework::result::INVALID_CMIF_REQUEST;
 use starquake_services::framework::{Handled, Kernel, Server, UnknownPolicy};
@@ -79,8 +79,8 @@ impl Rig {
             preference[layout::WORD_EXTENT] = 1 | (1 << 16);
             native.create_pool(&preference, POOL, memory).unwrap()
         };
-        let mut server = video_server(Arc::clone(&shared), UnknownPolicy::Strict)
-            .with_service_id(VIDEO);
+        let mut server =
+            video_server(Arc::clone(&shared), UnknownPolicy::Strict).with_service_id(VIDEO);
         server.accept(context).unwrap();
         Self {
             kernel,
@@ -175,7 +175,21 @@ fn submit(bytes: u32, timestamp: u64, end: u32) -> Vec<u32> {
 /// 101: one A descriptor of the codec's name (10 bytes, `"video/vp9\0"`), width, height,
 /// frame rate, input capacity, four zeros.
 fn configure(width: u32, height: u32) -> Vec<u32> {
-    vec![0x75 | ONE_A, 8, 10, BUFFER, 0, width, height, 30, 0x10_0000, 0, 0, 0, 0]
+    vec![
+        0x75 | ONE_A,
+        8,
+        10,
+        BUFFER,
+        0,
+        width,
+        height,
+        30,
+        0x10_0000,
+        0,
+        0,
+        0,
+        0,
+    ]
 }
 
 /// The eight data words of a native sync handle reply.
@@ -341,10 +355,13 @@ fn frames_wait_for_images_and_images_for_frames() {
     // An image: the oldest frame takes it at once.
     rig.send_on(decoder, &register(rig.first));
     let state = rig.state(decoder);
-    assert_eq!(state.pending().copied().collect::<Vec<_>>(), [Input {
-        timestamp: 11,
-        end: false
-    }]);
+    assert_eq!(
+        state.pending().copied().collect::<Vec<_>>(),
+        [Input {
+            timestamp: 11,
+            end: false
+        }]
+    );
     assert_eq!(state.outputs().next().unwrap().timestamp, 10);
     assert_eq!(state.handouts().count(), 0);
 }
@@ -376,13 +393,20 @@ fn flush_keeps_images_already_handed_out() {
     assert_eq!((second, third), (first + 1, first + 2));
     let before = rig.state(decoder).handouts().copied().collect::<Vec<_>>();
     assert_eq!(rig.send_on(decoder, &[0x18, 0]), success(FLUSH, &[], &[]));
-    assert_eq!(rig.state(decoder).handouts().copied().collect::<Vec<_>>(), before);
+    assert_eq!(
+        rig.state(decoder).handouts().copied().collect::<Vec<_>>(),
+        before
+    );
     rig.send_on(decoder, &submit(1, 5, 0));
     assert_eq!(syncpoints.read(id), second);
     rig.send_on(decoder, &submit(1, 6, 0));
     assert_eq!(syncpoints.read(id), third);
     // The finished outputs, in order: the one from before the flushes, then these two.
-    let images: Vec<u32> = rig.state(decoder).outputs().map(|output| output.image).collect();
+    let images: Vec<u32> = rig
+        .state(decoder)
+        .outputs()
+        .map(|output| output.image)
+        .collect();
     assert_eq!(images, [rig.first, rig.first + 1, rig.first + 2]);
 }
 
@@ -427,7 +451,11 @@ fn an_unregistered_image_s_handouts_are_skipped() {
     rig.send_on(decoder, &submit(1, 2, 0));
     assert_eq!(syncpoints.read(id), c);
     assert!(syncpoints.reached(Fence { id, value: b }));
-    let images: Vec<u32> = rig.state(decoder).outputs().map(|output| output.image).collect();
+    let images: Vec<u32> = rig
+        .state(decoder)
+        .outputs()
+        .map(|output| output.image)
+        .collect();
     assert_eq!(images, [rig.first, rig.first + 2]);
 }
 
@@ -462,7 +490,11 @@ fn releasing_a_waiting_image_hands_it_out_again() {
     rig.send_on(decoder, &submit(1, 2, 0));
     let id = rig.state(decoder).syncpoint().unwrap();
     assert_eq!(syncpoints.read(id), second);
-    let images: Vec<u32> = rig.state(decoder).outputs().map(|output| output.image).collect();
+    let images: Vec<u32> = rig
+        .state(decoder)
+        .outputs()
+        .map(|output| output.image)
+        .collect();
     assert_eq!(images, [rig.first, rig.first]);
 }
 
@@ -579,11 +611,17 @@ fn outputs_are_bounded_and_a_frame_waits() {
     // One more frame waits, though handouts wait too.
     rig.send_on(decoder, &submit(1, 99, 0));
     let state = rig.state(decoder);
-    assert_eq!((state.pending().count(), state.outputs().count()), (1, MAX_OUTPUTS));
+    assert_eq!(
+        (state.pending().count(), state.outputs().count()),
+        (1, MAX_OUTPUTS)
+    );
     // Reading one output makes room: the frame finishes.
     rig.send_on(decoder, &[0xE5, 0]);
     let state = rig.state(decoder);
-    assert_eq!((state.pending().count(), state.outputs().count()), (0, MAX_OUTPUTS));
+    assert_eq!(
+        (state.pending().count(), state.outputs().count()),
+        (0, MAX_OUTPUTS)
+    );
     assert_eq!(state.outputs().last().unwrap().timestamp, 99);
 }
 
@@ -631,7 +669,10 @@ fn configure_takes_any_codec_and_size() {
     let mut short = configure(1, 1);
     short.truncate(8);
     short[1] = 3;
-    assert_eq!(rig.send_on(decoder, &short), result_only(CONFIGURE, INVALID_CMIF_REQUEST));
+    assert_eq!(
+        rig.send_on(decoder, &short),
+        result_only(CONFIGURE, INVALID_CMIF_REQUEST)
+    );
     assert_eq!(rig.state(decoder).configuration().unwrap().width, 640);
 }
 
@@ -684,7 +725,17 @@ fn the_timestamp_is_in_ns_wrapping() {
     };
     let ns = 0x0000_0044_0000_0055_u64 * 1000;
     let mut expected = [0; OUTPUT_WORDS];
-    expected[..9].copy_from_slice(&[0x11, 0x22, 0x33, 0x22, 0x33, 0, halves(ns)[0], halves(ns)[1], 1]);
+    expected[..9].copy_from_slice(&[
+        0x11,
+        0x22,
+        0x33,
+        0x22,
+        0x33,
+        0,
+        halves(ns)[0],
+        halves(ns)[1],
+        1,
+    ]);
     assert_eq!(output.words(), expected);
 }
 
@@ -699,7 +750,9 @@ fn the_ready_event_follows_the_input_queue() {
     assert_eq!(reply, success(GET_SUBMISSION_EVENT, &copies, &[]));
     let event = rig.state(decoder).event().unwrap();
     assert_eq!(
-        rig.kernel.resolve_handle(Handle::from_raw(copies[0])).unwrap(),
+        rig.kernel
+            .resolve_handle(Handle::from_raw(copies[0]))
+            .unwrap(),
         event
     );
     assert_eq!(rig.kernel.is_signalled(event), Some(true));
@@ -719,7 +772,9 @@ fn the_ready_event_follows_the_input_queue() {
     // 3 again hands out the same event.
     let again = copied(&rig.send_on(decoder, &[0x13, 0]));
     assert_eq!(
-        rig.kernel.resolve_handle(Handle::from_raw(again[0])).unwrap(),
+        rig.kernel
+            .resolve_handle(Handle::from_raw(again[0]))
+            .unwrap(),
         event
     );
 }
@@ -760,13 +815,22 @@ fn initialize_reads_its_words_and_checks_nothing() {
     let handle = rig.kernel.insert_handle(memory).unwrap().raw();
     // 200: `0xd8, 0x80000005, 2`, the handle, size, codec 1, formats 3 and 3.
     let two_hundred = [0xD8, 0x8000_0005, 2, handle, 0x2000, 0, 1, 3, 3];
-    assert_eq!(rig.send_on(decoder, &two_hundred), success(INITIALIZE_200, &[], &[]));
+    assert_eq!(
+        rig.send_on(decoder, &two_hundred),
+        success(INITIALIZE_200, &[], &[])
+    );
     // 201: `0xd9, 0x80000006, 2`, then the output mode; a codec PR refuses is taken.
     let two_oh_one = [0xD9, 0x8000_0006, 2, handle, 0, 0, 99, 99, 99, 99];
-    assert_eq!(rig.send_on(decoder, &two_oh_one), success(INITIALIZE, &[], &[]));
+    assert_eq!(
+        rig.send_on(decoder, &two_oh_one),
+        success(INITIALIZE, &[], &[])
+    );
     // 201 without its output mode: refused; 200 without a handle: refused.
     let short = [0xD9, 0x8000_0005, 2, handle, 0, 0, 1, 1, 1];
-    assert_eq!(rig.send_on(decoder, &short), result_only(INITIALIZE, INVALID_CMIF_REQUEST));
+    assert_eq!(
+        rig.send_on(decoder, &short),
+        result_only(INITIALIZE, INVALID_CMIF_REQUEST)
+    );
     let unhandled = rig.send_on(decoder, &[0xD8, 5, 0, 0, 1, 3, 3]);
     assert_ne!(&unhandled[8..12], &[0; 4]);
     assert_eq!(rig.state(decoder), DecoderService::new());
@@ -803,7 +867,10 @@ fn finalize_frees_the_syncpoint_and_forgets() {
     let event = rig.state(decoder).event().unwrap();
     let id = first_syncpoint();
     assert_eq!(rig.syncpoints().read(id), 1);
-    assert_eq!(rig.send_on(decoder, &[0x83, 0]), success(FINALIZE, &[], &[]));
+    assert_eq!(
+        rig.send_on(decoder, &[0x83, 0]),
+        success(FINALIZE, &[], &[])
+    );
     assert!(!rig.syncpoints().is_allocated(id));
     let mut expected = DecoderService::new();
     expected.event = Some(event);
@@ -881,7 +948,10 @@ fn the_session_layout_is_pinned() {
     expected.push(0); // pending
     expected.extend([1, 0x1D, 0x1E, 0x1F, 0x20, 1]); // outputs
     assert_eq!(bytes, expected);
-    assert_eq!(postcard::from_bytes::<DecoderService>(&bytes).unwrap(), state);
+    assert_eq!(
+        postcard::from_bytes::<DecoderService>(&bytes).unwrap(),
+        state
+    );
     // The pending frames: a waiting frame needs no handout waiting, or a full output queue.
     state.handouts.clear();
     state.pending.push_back(Input {
@@ -891,9 +961,15 @@ fn the_session_layout_is_pinned() {
     let bytes = postcard::to_allocvec(&state).unwrap();
     let tail = [1, 0x21, 1, 1, 0x1D, 0x1E, 0x1F, 0x20, 1];
     assert_eq!(&bytes[bytes.len() - tail.len()..], tail);
-    assert_eq!(postcard::from_bytes::<DecoderService>(&bytes).unwrap(), state);
+    assert_eq!(
+        postcard::from_bytes::<DecoderService>(&bytes).unwrap(),
+        state
+    );
     // The context keeps nothing.
-    assert_eq!(postcard::to_allocvec(&VideoContext).unwrap(), Vec::<u8>::new());
+    assert_eq!(
+        postcard::to_allocvec(&VideoContext).unwrap(),
+        Vec::<u8>::new()
+    );
 }
 
 /// Reads `state` back through its bytes.
@@ -963,7 +1039,12 @@ fn unreachable_sessions() -> Vec<(DecoderService, DecoderServiceError)> {
         ),
         (
             DecoderService {
-                pending: VecDeque::from([Input { timestamp: 0, end: false }; MAX_PENDING + 1]),
+                pending: VecDeque::from(
+                    [Input {
+                        timestamp: 0,
+                        end: false,
+                    }; MAX_PENDING + 1],
+                ),
                 handouts: VecDeque::new(),
                 ..golden()
             },
@@ -986,7 +1067,12 @@ fn unreachable_sessions() -> Vec<(DecoderService, DecoderServiceError)> {
         ),
         (
             DecoderService {
-                handouts: VecDeque::from([Handout { image: 0x1A, number: 0x1C }; MAX_HANDOUTS + 1]),
+                handouts: VecDeque::from(
+                    [Handout {
+                        image: 0x1A,
+                        number: 0x1C,
+                    }; MAX_HANDOUTS + 1],
+                ),
                 ..golden()
             },
             DecoderServiceError::Queues,
@@ -1000,7 +1086,10 @@ fn unreachable_handouts() -> Vec<(DecoderService, DecoderServiceError)> {
         // A handout of an image not registered.
         (
             DecoderService {
-                handouts: VecDeque::from([Handout { image: 0x30, number: 0x1C }]),
+                handouts: VecDeque::from([Handout {
+                    image: 0x30,
+                    number: 0x1C,
+                }]),
                 ..golden()
             },
             DecoderServiceError::Handout { index: 0 },
@@ -1008,7 +1097,10 @@ fn unreachable_handouts() -> Vec<(DecoderService, DecoderServiceError)> {
         // A handout at the last finished number, not above it.
         (
             DecoderService {
-                handouts: VecDeque::from([Handout { image: 0x1A, number: 0x19 }]),
+                handouts: VecDeque::from([Handout {
+                    image: 0x1A,
+                    number: 0x19,
+                }]),
                 ..golden()
             },
             DecoderServiceError::Handout { index: 0 },
@@ -1017,8 +1109,14 @@ fn unreachable_handouts() -> Vec<(DecoderService, DecoderServiceError)> {
         (
             DecoderService {
                 handouts: VecDeque::from([
-                    Handout { image: 0x1A, number: 0x1C },
-                    Handout { image: 0x1B, number: 0x1B },
+                    Handout {
+                        image: 0x1A,
+                        number: 0x1C,
+                    },
+                    Handout {
+                        image: 0x1B,
+                        number: 0x1B,
+                    },
                 ]),
                 ..golden()
             },
@@ -1027,14 +1125,20 @@ fn unreachable_handouts() -> Vec<(DecoderService, DecoderServiceError)> {
         // A handout past the last made.
         (
             DecoderService {
-                handouts: VecDeque::from([Handout { image: 0x1A, number: 0x1D }]),
+                handouts: VecDeque::from([Handout {
+                    image: 0x1A,
+                    number: 0x1D,
+                }]),
                 ..golden()
             },
             DecoderServiceError::Handout { index: 0 },
         ),
         (
             DecoderService {
-                pending: VecDeque::from([Input { timestamp: 0, end: false }]),
+                pending: VecDeque::from([Input {
+                    timestamp: 0,
+                    end: false,
+                }]),
                 ..golden()
             },
             DecoderServiceError::Unfinished,
@@ -1073,12 +1177,20 @@ fn a_saved_session_no_command_reaches_is_refused() {
     let edge = DecoderService {
         reached: 0x1C,
         handouts: VecDeque::new(),
-        pending: VecDeque::from([Input { timestamp: 0, end: false }; MAX_PENDING]),
+        pending: VecDeque::from(
+            [Input {
+                timestamp: 0,
+                end: false,
+            }; MAX_PENDING],
+        ),
         ..golden()
     };
     assert!(read(&edge).is_ok());
     let full = DecoderService {
-        pending: VecDeque::from([Input { timestamp: 0, end: false }]),
+        pending: VecDeque::from([Input {
+            timestamp: 0,
+            end: false,
+        }]),
         outputs: VecDeque::from(
             [Output {
                 image: 1,

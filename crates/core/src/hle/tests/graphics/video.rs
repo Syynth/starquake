@@ -12,7 +12,9 @@
 use starquake_gsv::native::{BIND_PROCESS_MEMORY, BindRequest};
 use starquake_gsv::video::command as video_command;
 use starquake_gsv::video::counter_id;
-use starquake_gsv::video::layout::{CODE_NV12, CODE_NV12_NX2, PREFERENCE_WORDS, WORD_CODE, WORD_EXTENT};
+use starquake_gsv::video::layout::{
+    CODE_NV12, CODE_NV12_NX2, PREFERENCE_WORDS, WORD_CODE, WORD_EXTENT,
+};
 
 use super::*;
 
@@ -35,7 +37,11 @@ fn pool(graphics: &Graphics, count: u32) -> u32 {
         offset: 0,
     };
     let admission = native.check_bind(&request).unwrap();
-    admission.bind(device_share_token(ProcessId::from_parts(1, 1), POOL_AT, size));
+    admission.bind(device_share_token(
+        ProcessId::from_parts(1, 1),
+        POOL_AT,
+        size,
+    ));
     let mut preference = [0; PREFERENCE_WORDS];
     preference[WORD_CODE] = CODE_NV12;
     preference[WORD_EXTENT] = 1 | (1 << 16);
@@ -53,7 +59,13 @@ fn decoder(rig: &Rig, context: Handle) -> Handle {
 /// stream: PR's `0x10007d, 3` (the A descriptor count is bits 20 to 23 of word 0).
 fn submit(timestamp: u64) -> Vec<u32> {
     let address = u32::try_from(NAME).unwrap();
-    let mut words = vec![tipc_type(video_command::SUBMIT) | (1 << 20), 3, 0x10, address, 0];
+    let mut words = vec![
+        tipc_type(video_command::SUBMIT) | (1 << 20),
+        3,
+        0x10,
+        address,
+        0,
+    ];
     words.extend(halves(timestamp));
     words.push(0);
     words
@@ -71,7 +83,10 @@ fn the_root_hands_out_video_sessions_that_count_frames() {
     let root = rig.graphics_root();
     let syncpt = rig.family(root, root_command::GET_SYNCPOINT_SESSION);
 
-    let mut words = vec![tipc_type(root_command::CALCULATE_VIDEO_IMAGE_REQUIREMENTS), 17];
+    let mut words = vec![
+        tipc_type(root_command::CALCULATE_VIDEO_IMAGE_REQUIREMENTS),
+        17,
+    ];
     let mut preference = [0; PREFERENCE_WORDS];
     preference[WORD_CODE] = CODE_NV12_NX2;
     preference[WORD_EXTENT] = (640 - 1) | ((360 - 1) << 16);
@@ -101,7 +116,10 @@ fn the_root_hands_out_video_sessions_that_count_frames() {
     let submitted = rig.tipc(service, &submit(0x55));
     assert_eq!((submitted.result, submitted.data), (0, vec![0x10, 0]));
     assert_eq!(rig.tipc(syncpt, &query).data, [value, 0, 0]);
-    let output = rig.tipc(service, &[tipc_type(video_command::GET_OUTPUT_PROPERTIES), 0]);
+    let output = rig.tipc(
+        service,
+        &[tipc_type(video_command::GET_OUTPUT_PROPERTIES), 0],
+    );
     assert_eq!(output.result, 0);
     assert_eq!(output.data[0], first);
     assert_eq!(output.data[6..8], halves(0x55 * 1000));

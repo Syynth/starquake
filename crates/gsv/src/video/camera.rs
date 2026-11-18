@@ -105,7 +105,10 @@ commands! {
 /// Whether `name`, up to its first zero byte, is one 3 takes.
 #[must_use]
 pub fn is_device_name(name: &[u8; NAME_BYTES]) -> bool {
-    let end = name.iter().position(|&byte| byte == 0).unwrap_or(NAME_BYTES);
+    let end = name
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(NAME_BYTES);
     DEVICE_NAMES.contains(&&name[..end])
 }
 
@@ -148,17 +151,32 @@ impl CameraSession {
     }
 
     /// PR `Generic<0>`.
-    fn no_output(_: &mut Self, _cx: &mut Context<'_>, req: &Request<'_>, reply: &mut Reply) -> Outcome {
+    fn no_output(
+        _: &mut Self,
+        _cx: &mut Context<'_>,
+        req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
         Self::zeros(req, reply, 0)
     }
 
     /// PR `Generic<1>`.
-    fn one_output(_: &mut Self, _cx: &mut Context<'_>, req: &Request<'_>, reply: &mut Reply) -> Outcome {
+    fn one_output(
+        _: &mut Self,
+        _cx: &mut Context<'_>,
+        req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
         Self::zeros(req, reply, 1)
     }
 
     /// PR `Generic<2>`.
-    fn two_outputs(_: &mut Self, _cx: &mut Context<'_>, req: &Request<'_>, reply: &mut Reply) -> Outcome {
+    fn two_outputs(
+        _: &mut Self,
+        _cx: &mut Context<'_>,
+        req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
         Self::zeros(req, reply, 2)
     }
 }

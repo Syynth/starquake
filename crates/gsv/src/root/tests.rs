@@ -26,6 +26,8 @@ use starquake_trace::{EventKind, IpcOutcome, ServiceId};
 
 use super::*;
 use crate::protocol::{HANDLE_KIND, Mark, ROOT_COMMANDS};
+
+mod video;
 use crate::testing::{
     SPECIAL, STALE, buffer_of, copied, halves, le, result_only, success, tipc_type,
 };
@@ -1294,9 +1296,14 @@ const NVSRV: ServiceId = ServiceId(0x1402);
 fn wired_with(state: RootState) -> Rig {
     let mut kernel = FakeKernel::new(0).unwrap();
     kernel.set_current_service(ROOT);
-    for service in [state.gpu_server, state.syncpt_server, state.nvsrv_server]
-        .into_iter()
-        .flatten()
+    for service in [
+        state.gpu_server,
+        state.syncpt_server,
+        state.nvsrv_server,
+        state.video_server,
+    ]
+    .into_iter()
+    .flatten()
     {
         kernel.add_service(service);
     }

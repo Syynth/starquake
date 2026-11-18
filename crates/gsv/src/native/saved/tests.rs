@@ -224,7 +224,12 @@ fn a_restore_reads_every_field() {
     assert_eq!((restored.next_memory, restored.next_image), (10, 11));
     let pool = restored.pool_image(9).unwrap();
     assert_eq!(
-        (pool.first, pool.index, pool.pool.memory(), pool.pool.count()),
+        (
+            pool.first,
+            pool.index,
+            pool.pool.memory(),
+            pool.pool.count()
+        ),
         (9, 0, 6, 1)
     );
     assert_eq!(pool.pool.preference(), &video_pool());
@@ -673,5 +678,259 @@ fn error_messages_are_plain_words() {
     assert_eq!(
         SnapshotError::TooMany { part: Part::Memory }.to_string(),
         "the native tables snapshot holds more native memory entries than the limit"
+    );
+}
+
+/// The golden state with `pools` and no mappings.
+fn with_pools(pools: Vec<SavedPool>) -> State {
+    State {
+        pools,
+        mappings: Vec::new(),
+        ..golden()
+    }
+}
+
+/// A one-image pool of [`video_pool`] at `first` in memory `memory`.
+fn pool_at(first: u32, memory: u32, count: u32) -> SavedPool {
+    SavedPool {
+        first,
+        memory,
+        preference: video_pool(),
+        count,
+    }
+}
+
+#[test]
+fn each_pool_check_refuses_on_its_own() {
+    let pool = Part::Pool;
+    let out_of_range = |index| SnapshotError::OutOfRange { part: pool, index }.to_string();
+    // The first id 0.
+    assert_eq!(
+        refusal(&with_pools(vec![pool_at(0, 6, 1)])),
+        out_of_range(0)
+    );
+    // The end exactly at the next image id is taken; one past is refused.
+    assert!(restore(&with_pools(vec![pool_at(10, 6, 1)])).is_ok());
+    assert_eq!(
+        refusal(&with_pools(vec![pool_at(10, 6, 2)])),
+        out_of_range(0)
+    );
+    // With the ids run out (0), the end may be 2^32 exactly.
+    let mut run_out = with_pools(vec![pool_at(u32::MAX, 6, 1)]);
+    run_out.next_image = 0;
+    assert!(restore(&run_out).is_ok());
+    // A pool that starts before the end of the one before it; one that starts exactly at it is
+    // taken (memory 5, 0x3000 bytes, holds three images).
+    let overlapping = vec![pool_at(1, 5, 2), pool_at(2, 5, 1)];
+    assert_eq!(
+        refusal(&with_pools(overlapping)),
+        SnapshotError::Order {
+            part: pool,
+            index: 1
+        }
+        .to_string()
+    );
+    assert!(restore(&with_pools(vec![pool_at(1, 5, 2), pool_at(3, 5, 1)])).is_ok());
+    // A pool holding a native image's id (8), at its first id or inside it; one that ends at 8
+    // is taken.
+    for overlapping in [pool_at(8, 5, 1), pool_at(7, 5, 2)] {
+        assert_eq!(
+            refusal(&with_pools(vec![overlapping])),
+            SnapshotError::PoolOverlap { index: 0 }.to_string()
+        );
+    }
+    assert!(restore(&with_pools(vec![pool_at(5, 5, 3)])).is_ok());
+    // A memory missing, or not bound (9).
+    for memory in [42, 9] {
+        assert_eq!(
+            refusal(&with_pools(vec![pool_at(9, memory, 1)])),
+            SnapshotError::PoolDangling { index: 0 }.to_string()
+        );
+    }
+    // A preference 911 refuses, and a count over the limit.
+    let mut bad = pool_at(9, 6, 1);
+    bad.preference[1] = 7;
+    assert_eq!(
+        refusal(&with_pools(vec![bad])),
+        SnapshotError::PoolLayout { index: 0 }.to_string()
+    );
+    let mut many = with_pools(vec![pool_at(0x100, 6, MAX_POOL_IMAGES + 1)]);
+    many.next_image = 0;
+    assert_eq!(
+        refusal(&many),
+        SnapshotError::PoolLayout { index: 0 }.to_string()
+    );
+    // A pool larger than its memory: two 4096-byte images in memory 6's 0x1000.
+    assert_eq!(
+        refusal(&with_pools(vec![pool_at(9, 6, 2)])),
+        out_of_range(0)
+    );
+}
+
+#[test]
+fn pools_are_bounded_at_the_limit() {
+    let limit = u32::try_from(MAX_POOLS).unwrap();
+    let mut state = with_pools((0..limit).map(|n| pool_at(0x100 + n, 6, 1)).collect());
+    state.next_image = 0;
+    assert!(restore(&state).is_ok());
+    state.pools.push(pool_at(0x100 + limit, 6, 1));
+    assert_eq!(
+        refusal(&state),
+        SnapshotError::TooMany { part: Part::Pool }.to_string()
+    );
+}
+
+#[test]
+fn each_mapping_check_refuses_on_its_own() {
+    let part = Part::Mapping;
+    let mapping = |space, image, references| SavedMapping {
+        space,
+        image,
+        references,
+    };
+    let with = |mappings: Vec<SavedMapping>| State {
+        mappings,
+        ..golden()
+    };
+    // Two of one key, and two out of order.
+    for mappings in [
+        vec![mapping(2, 9, 1), mapping(2, 9, 1)],
+        vec![mapping(3, 9, 1), mapping(2, 9, 1)],
+    ] {
+        assert_eq!(
+            refusal(&with(mappings)),
+            SnapshotError::Order { part, index: 1 }.to_string()
+        );
+    }
+    assert!(restore(&with(vec![mapping(2, 9, 1), mapping(3, 9, 1)])).is_ok());
+    // An image no pool holds: the one past the pool, and a native image.
+    for image in [10, 8] {
+        assert_eq!(
+            refusal(&with(vec![mapping(2, image, 1)])),
+            SnapshotError::MappingDangling { index: 0 }.to_string()
+        );
+    }
+    // No references.
+    assert_eq!(
+        refusal(&with(vec![mapping(2, 9, 0)])),
+        SnapshotError::OutOfRange { part, index: 0 }.to_string()
+    );
+    // An image whose offset passes 32 bits: code 2 at 65536 x 16256 is 4_261_412_864 bytes an
+    // image, so image 2 of a pool starts past 2^32; image 1 starts under it.
+    let mut wide = golden();
+    let image = 4_261_412_864_u64;
+    wide.memories[3].size = 3 * image;
+    wide.memories[3].binding = Some(SavedBinding {
+        address: 0x1_0000_0000,
+        process: process(),
+        source: SavedSource::Process(false),
+    });
+    let mut preference = [0; PREFERENCE_WORDS];
+    preference[1] = 2;
+    preference[2] = 0xFFFF | (16_255 << 16);
+    wide.next_image = 0;
+    wide.pools = vec![SavedPool {
+        first: 0x20,
+        memory: 9,
+        preference,
+        count: 3,
+    }];
+    wide.mappings = vec![mapping(1, 0x21, 1)];
+    assert!(State::check(&wide).is_ok());
+    wide.mappings = vec![mapping(1, 0x22, 1)];
+    assert_eq!(
+        State::check(&wide).unwrap_err().to_string(),
+        SnapshotError::OutOfRange { part, index: 0 }.to_string()
+    );
+}
+
+#[test]
+fn mappings_are_bounded_at_the_limit() {
+    let limit = u32::try_from(MAX_MAPPINGS).unwrap();
+    let mut state = golden();
+    state.mappings = (0..limit)
+        .map(|space| SavedMapping {
+            space,
+            image: 9,
+            references: 1,
+        })
+        .collect();
+    assert!(restore(&state).is_ok());
+    state.mappings.push(SavedMapping {
+        space: limit,
+        image: 9,
+        references: 1,
+    });
+    assert_eq!(
+        refusal(&state),
+        SnapshotError::TooMany {
+            part: Part::Mapping
+        }
+        .to_string()
+    );
+}
+
+#[test]
+fn a_retired_memory_a_pool_uses_is_kept() {
+    // Memory 5 (retired) loses its image to memory 3 and holds the pool alone.
+    let mut state = golden();
+    state.images[0].memory = 3;
+    state.pools = vec![pool_at(9, 5, 1)];
+    assert!(restore(&state).is_ok());
+    // With the pool (and its mapping) gone too, it is refused.
+    state.pools.clear();
+    state.mappings.clear();
+    assert_eq!(
+        refusal(&state),
+        SnapshotError::RetiredUnused { index: 1 }.to_string()
+    );
+}
+
+/// The pools are checked after the images and before the mappings, and the mappings before the
+/// retired relation: with faults in two parts at once, the earlier part's is reported.
+#[test]
+fn pools_and_mappings_are_checked_in_order() {
+    let mut state = with_pools(vec![pool_at(0, 6, 1)]);
+    state.images[0].size = 1;
+    assert_eq!(
+        refusal(&state),
+        SnapshotError::Size { index: 0 }.to_string()
+    );
+    let mut state = with_pools(vec![pool_at(0, 6, 1)]);
+    state.mappings = vec![SavedMapping {
+        space: 1,
+        image: 77,
+        references: 1,
+    }];
+    assert_eq!(
+        refusal(&state),
+        SnapshotError::OutOfRange {
+            part: Part::Pool,
+            index: 0
+        }
+        .to_string()
+    );
+    let mut state = golden();
+    state.mappings[0].references = 0;
+    state.images.remove(0);
+    assert_eq!(
+        refusal(&state),
+        SnapshotError::OutOfRange {
+            part: Part::Mapping,
+            index: 0
+        }
+        .to_string()
+    );
+}
+
+/// The save runs the same checks: a pool whose memory the live tables do not hold.
+#[test]
+fn saving_checks_the_pools() {
+    let mut objects = restore(&golden()).unwrap();
+    let pool = *objects.pools.get(&9).unwrap();
+    objects.pools.insert(9, VideoPool { memory: 42, ..pool });
+    assert_eq!(
+        objects.save().unwrap_err().to_string(),
+        SnapshotError::PoolDangling { index: 0 }.to_string()
     );
 }

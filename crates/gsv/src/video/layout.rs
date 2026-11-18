@@ -203,7 +203,9 @@ pub enum LayoutError {
     #[error("the video image count is 0")]
     ZeroCount,
     /// Code 1 with a width or height that is odd or 1.
-    #[error("an NV12 image of {width}x{height} pixels needs an even width and height of at least 2")]
+    #[error(
+        "an NV12 image of {width}x{height} pixels needs an even width and height of at least 2"
+    )]
     Extent {
         /// The width.
         width: u64,

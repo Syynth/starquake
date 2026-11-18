@@ -9,8 +9,11 @@
 //! then the source: 0 for process memory with the GPU-accessible flag byte, 1 for a gpu worker
 //! registration with its handle and offset), the images (id, memory id, the sixteen preference
 //! words, count, size, whether it is in a window pool), then the next memory id and the next
-//! image id. The golden-bytes test `the_snapshot_layout_is_pinned` pins it; changing it means
-//! bumping [`SNAPSHOT_VERSION`].
+//! image id, then the video image pools (first image id, memory id, the sixteen preference
+//! words, count) and the GPU mappings of pool images (address space, image, count); a pool's
+//! layout and a mapping's address and size are made again from those. The golden-bytes test
+//! `the_snapshot_layout_is_pinned` pins it; changing it means bumping [`SNAPSHOT_VERSION`].
+//! Version 2 added the pools and the mappings.
 //!
 //! # Checks
 //!
@@ -26,8 +29,19 @@
 //! [`SnapshotError::Dangling`]), its size ([`super::layout::requirements`] of its preference
 //! and count, with the preference's kind [`super::layout::KIND_NATIVE`],
 //! [`SnapshotError::Size`]; at most its memory's size, [`SnapshotError::OutOfRange`]); the
-//! images (at most [`MAX_IMAGES`], [`SnapshotError::TooMany`]); that every retired memory has
-//! an image ([`SnapshotError::RetiredUnused`]). Last, every binding's device-share lock is taken
+//! images (at most [`MAX_IMAGES`], [`SnapshotError::TooMany`]); then each pool in list order:
+//! its ids (the first from [`FIRST_ID`], the end at most the next image id, or 2^32 when the ids
+//! have run out, [`SnapshotError::OutOfRange`]; starting at or after the end of the pool before
+//! it, [`SnapshotError::Order`]; holding no native image's id, [`SnapshotError::PoolOverlap`]),
+//! its memory (a memory of the snapshot that is bound, [`SnapshotError::PoolDangling`]), its
+//! preference and count (ones 911 takes, [`SnapshotError::PoolLayout`]), and its size (at most
+//! its memory's, [`SnapshotError::OutOfRange`]); the pools (at most [`MAX_POOLS`],
+//! [`SnapshotError::TooMany`]); then each mapping in list order: its key above the one before
+//! it ([`SnapshotError::Order`]), its image one a pool holds
+//! ([`SnapshotError::MappingDangling`]), its count not 0 and its image's offset within 32 bits
+//! ([`SnapshotError::OutOfRange`]); the mappings (at most [`MAX_MAPPINGS`],
+//! [`SnapshotError::TooMany`]); that every retired memory has an image or a pool
+//! ([`SnapshotError::RetiredUnused`]). Last, every binding's device-share lock is taken
 //! back from the kernel in memory order ([`Reclaim`]), counting earlier ones of the same exact
 //! range, so that N locks on a range take back N tokens and the next is refused at its own index
 //! ([`SnapshotError::Release`]). [`NativeObjects::save`] runs the same checks, but the kernel's,
@@ -41,6 +55,10 @@
 //!
 //! **Not checked here:**
 //!
+//! - **That a mapping's address space is one of the GPU memory's.** 426 maps only into one that
+//!   exists, but the address space can be destroyed afterwards while the mapping stays; the
+//!   mapping is bookkeeping only (nothing is published in a translation table), so a stale one
+//!   answers 427 and nothing else.
 //! - **That a 423 binding's parent is a registration of the GPU memory.** A 102 of the parent
 //!   goes ahead while the binding stays ([`super`], "Where this differs from the references"),
 //!   so a live table can hold a parent that no longer exists. Its range is checked as 114's is,
@@ -66,8 +84,8 @@ use super::{
     Binding, FIRST_ID, MAX_IMAGES, MAX_MEMORIES, MAX_MEMORY_SIZE, MAX_MODE, NativeImage,
     NativeMemory, NativeObjects, Source,
 };
-use crate::video::layout::{VideoLayout, layout};
 use crate::completion::Reclaim;
+use crate::video::layout::{VideoLayout, layout};
 
 #[cfg(test)]
 mod tests;
@@ -586,8 +604,11 @@ impl State {
         memories: &BTreeMap<u32, &SavedMemory>,
     ) -> Result<(), SnapshotError> {
         let part = Part::Mapping;
-        let memory_of: BTreeMap<u32, u32> =
-            self.pools.iter().map(|pool| (pool.first, pool.memory)).collect();
+        let memory_of: BTreeMap<u32, u32> = self
+            .pools
+            .iter()
+            .map(|pool| (pool.first, pool.memory))
+            .collect();
         let mut previous = None;
         for (index, mapping) in self.mappings.iter().enumerate() {
             let key = (mapping.space, mapping.image);

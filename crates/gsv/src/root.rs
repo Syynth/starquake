@@ -69,7 +69,8 @@
 //!   every request to it is answered by the server's unknown-command policy, logged. NX2 began
 //!   the same way (`INx2NvsrvSession`, "a placeholder ... every command gets an empty success
 //!   and is logged"). The family's slice replaces it with a session on its own server: 202,
-//!   497 and 1402 do in a root wired to their servers (below, "The family sessions").
+//!   497 and 1402 do in a root wired to their servers (below, "The family sessions"), and 902,
+//!   906 and 1002 in one wired to the video server (below, "Video (slice 15)").
 //! - **An event** (only 204's two) is a kernel event, unsignalled. They are made the first time
 //!   204 is asked and kept ([`RootState::syncpoint_events`]), so a repeated 204 hands out the
 //!   same two and a failure between the two keeps the first. A root built with gsv's shared
@@ -143,7 +144,9 @@
 //! [`VIDEO_LIBRARY_VERSION`] is `NotImplemented`; NX2 reads nothing, row 146). Here they are
 //! logged and accepted, the larger answer by decision 8, and so is any of the three before 901
 //! (PR: `InvalidState`; decision 7). 1002 is the **conflict** the protocol table names: its
-//! context is the same as 902's ([`crate::video`], "The server").
+//! context is the same as 902's ([`crate::video`], "The server"). The 906 values PR refuses are
+//! only logged, a warning, which no test captures: its mutation (dropping the warning) is not
+//! observable but in the log. Pinned in `root/tests/video.rs`.
 //!
 //! 901, 903, 1001 and 1003 stay the stubs: success, nothing kept. PR keeps whether each was
 //! sent, to refuse the other video commands without it (`InvalidState`), which decision 7 logs
@@ -172,6 +175,13 @@
 //! | The handle 202 and 1402 hand out | moved | copied | **conflict**: copied, NX2's (`a_family_session_reply_is_one_copied_handle_and_success`) |
 //! | 202 before 201 and 1402, or 1402 before the bootstrap is complete and the image formats are set up | `ResultInvalidState` | success | success (`each_family_command_hands_out_a_session_on_its_own_server`) |
 //! | 202 or 1402 whose header is not PR's exact one (here: a data word) | `ResultInvalidState` (202), `ResultInvalidCombination` (1402) | success | success: the data is not read (`a_family_command_with_a_data_word_is_accepted`) |
+//! | 902, 906 or 1002 before 901 (or 1001), or before the bootstrap is complete | `ResultInvalidState` | success | success (`each_video_open_hands_out_a_session_on_the_video_server`) |
+//! | 906 with a remote-memory byte not 0, or a library version not [`VIDEO_LIBRARY_VERSION`] | `ResultInvalidCombination` (a byte above 1), `ResultNotImplemented` | success | success, logged (`each_video_open_hands_out_a_session_on_the_video_server`) |
+//! | The handle 902, 906 and 1002 hand out | moved | copied | **conflict**: copied, NX2's (`a_video_open_reply_is_one_copied_handle_and_success`) |
+//! | 1002 | the encoder's context, whose codec refuses to initialise as a decoder | a second decoder | **conflict**: the same context as 902's (`the_root_hands_out_video_sessions_that_count_frames`, in `starquake-core`'s `hle/tests/graphics/video.rs`) |
+//! | 901, 903, 1001 and 1003 | kept: whether each video service is initialised | 901 and 1001 stubbed; no 903 or 1003 | the stubs: success, nothing kept (`every_root_command_s_reply_bytes`) |
+//! | 602 with a device type above 1 | `0x280f3` | (no 602) | `0x280f3` (`open_camera_session_takes_device_types_0_and_1`, in `video/camera/tests.rs`) |
+//! | 601 and 602 before the bootstrap is complete | `ResultInvalidState` | (no 601 or 602) | success, logged (decision 7) |
 
 use std::sync::Arc;
 
@@ -186,6 +196,7 @@ use starquake_trace::ServiceId;
 
 use crate::gpu::low_byte;
 use crate::native;
+use crate::native::pools;
 use crate::protocol::command::{
     ACTIVATE_FRAME_CONTEXT, ACTIVATE_GPU_CONTEXT, BIND_NATIVE_GPU_MEMORY, BIND_NATIVE_MEMORY,
     BIND_PROCESS, BIND_SYNCPOINT_MEMORY, CALCULATE_IMAGE_REQUIREMENTS, CALCULATE_NATIVE_IMAGE_SIZE,
@@ -203,7 +214,6 @@ use crate::protocol::command::{
     QUERY_NATIVE_GPU_IMAGE, QUERY_VIDEO_IMAGE, REGISTER_GPU_ADDRESS_SPACE, SEQUENCE_COMMAND_1201,
     SEQUENCE_COMMAND_1202, SEQUENCE_COMMAND_1203, SET_GRAPHICS_CLASS_1111, UNMAP_NATIVE_GPU_IMAGE,
 };
-use crate::native::pools;
 use crate::protocol::{Handed, bootstrap, root_command};
 use crate::shared::Shared;
 use crate::shared::page;

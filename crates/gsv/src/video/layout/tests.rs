@@ -124,7 +124,10 @@ fn code_5_is_pr_s_block_linear_rgba() {
         (448, 57_344, 57_344)
     );
     assert_eq!(layout.size, 2 * 57_344 + 57_344);
-    assert_eq!((layout.chroma_offset, layout.luma_bytes, layout.chroma_bytes), (0, 0, 0));
+    assert_eq!(
+        (layout.chroma_offset, layout.luma_bytes, layout.chroma_bytes),
+        (0, 0, 0)
+    );
     // A one-pixel image is raised to one block of rows: 64 * 128 = 8192, over PR's 4096 floor.
     let tiny = super::layout(&preference(CODE_RGBA_BLOCK, 1, 1), 1).unwrap();
     assert_eq!((tiny.pitch, tiny.image_bytes), (64, 8192));
@@ -146,7 +149,10 @@ fn nx2_s_codes_have_nx2_s_layouts() {
         (bgra.planes, bgra.tiling, bgra.reading),
         (Planes::Bgra, Tiling::PitchLinear, Reading::Nx2)
     );
-    assert_eq!((bgra.pitch, bgra.image_bytes, bgra.size), (448, 57_344, 114_688));
+    assert_eq!(
+        (bgra.pitch, bgra.image_bytes, bgra.size),
+        (448, 57_344, 114_688)
+    );
     for code in CODES_RGBA_NX2 {
         let rgba = layout(&preference(code, 100, 50), 2).unwrap();
         assert_eq!(
@@ -154,7 +160,10 @@ fn nx2_s_codes_have_nx2_s_layouts() {
             (Planes::Rgba, Tiling::PitchLinear, Reading::Nx2),
             "code {code}"
         );
-        assert_eq!((rgba.pitch, rgba.image_bytes, rgba.size), (448, 57_344, 114_688));
+        assert_eq!(
+            (rgba.pitch, rgba.image_bytes, rgba.size),
+            (448, 57_344, 114_688)
+        );
     }
 }
 
@@ -191,7 +200,10 @@ fn the_request_checks_apply_to_every_code() {
             Err(LayoutError::WordNotZero { word: 0, value: 9 }),
             "code {code}"
         );
-        assert_eq!(layout(&preference(code, 2, 2), 0), Err(LayoutError::ZeroCount));
+        assert_eq!(
+            layout(&preference(code, 2, 2), 0),
+            Err(LayoutError::ZeroCount)
+        );
         for word in FIRST_TAIL_WORD..PREFERENCE_WORDS {
             let mut tail = preference(code, 2, 2);
             tail[word] = 0x100 + u32::try_from(word).unwrap();
@@ -261,7 +273,10 @@ fn error_text_is_plain_words() {
         LayoutError::Code(7).to_string(),
         "video output layout code 7 is not one starquake sizes"
     );
-    assert_eq!(LayoutError::ZeroCount.to_string(), "the video image count is 0");
+    assert_eq!(
+        LayoutError::ZeroCount.to_string(),
+        "the video image count is 0"
+    );
     assert_eq!(
         LayoutError::Extent {
             width: 3,
