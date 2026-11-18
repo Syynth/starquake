@@ -222,7 +222,10 @@ type MakeFrame = fn(u8, u32) -> Note;
 /// The two notes that pack a buffer slot and an image, each with its constructor.
 fn frame_notes() -> [(u32, MakeFrame); 2] {
     [
-        (FRAME_LATCHED, |slot, image| Note::FrameLatched { slot, image }),
+        (FRAME_LATCHED, |slot, image| Note::FrameLatched {
+            slot,
+            image,
+        }),
         (BUFFER_RELEASED, |slot, image| Note::BufferReleased {
             slot,
             image,

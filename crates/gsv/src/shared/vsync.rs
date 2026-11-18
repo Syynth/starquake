@@ -407,7 +407,9 @@ pub enum VsyncSnapshotError {
     },
     /// A deadline with no listener while vi2's presents have no work: a clock runs only while
     /// something listens or a present waits for a tick.
-    #[error("the vsync clock snapshot has a deadline but no listeners, and no present waits for a tick")]
+    #[error(
+        "the vsync clock snapshot has a deadline but no listeners, and no present waits for a tick"
+    )]
     DeadlineWithoutListeners,
     /// More ticks fed back than [`MAX_FED_BACK`].
     #[error("the vsync clock snapshot holds {replayed} ticks fed back, more than {MAX_FED_BACK}")]
@@ -526,7 +528,11 @@ impl Locked<'_> {
     /// latch, then drops each listener the kernel refused and stops the clock if nothing is left
     /// for it. Returns the latched frames' requests. A count at `u64::MAX` delivers none and
     /// stops the clock (module docs, "The end of the counts").
-    fn deliver_tick(&mut self, host: &mut dyn TimerHost, service: ServiceId) -> Vec<PresentRequest> {
+    fn deliver_tick(
+        &mut self,
+        host: &mut dyn TimerHost,
+        service: ServiceId,
+    ) -> Vec<PresentRequest> {
         let vsync = &mut self.state.vsync;
         let Some(tick) = vsync.tick.checked_add(1) else {
             tracing::error!("gsv: the vsync clock has counted every tick a u64 holds; it stops");

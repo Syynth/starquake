@@ -201,7 +201,10 @@ impl Rig {
     fn drain(&mut self, id: SyncpointId, value: u32) {
         self.shared
             .queue()
-            .push(Completion::Gpu(GpuCompletion::SyncpointChanged { id, value }));
+            .push(Completion::Gpu(GpuCompletion::SyncpointChanged {
+                id,
+                value,
+            }));
         let mut host = KernelHost {
             kernel: &mut self.kernel,
             recorded: Vec::new(),
@@ -229,7 +232,10 @@ fn the_present_header_words_are_the_command_ids() {
     assert_eq!((CANCEL_CLIENT_BUFFER, PRESENT_CLIENT_BUFFER), (228, 229));
     assert_eq!((PRESENT_LAYOUT, PRESENT_BLOCK_HEIGHT), (3, 7));
     assert_eq!(PRESENT_FORMATS, [1, 4]);
-    assert_eq!((PRESENT_WORD_LAYOUT, PRESENT_WORD_FENCE, NO_FENCE), (8, 22, 0));
+    assert_eq!(
+        (PRESENT_WORD_LAYOUT, PRESENT_WORD_FENCE, NO_FENCE),
+        (8, 22, 0)
+    );
 }
 
 /// A present takes its slot and answers the rest free; the next tick latches it, handing its
@@ -241,10 +247,7 @@ fn a_present_s_slot_comes_back_on_the_tick_that_latches_the_next() {
     let notification = rig.notification_event();
     rig.presenting_client();
     let image = rig.image();
-    assert_eq!(
-        rig.present(Present::of(image, 2)),
-        ALL_SLOTS & !slot_bit(2)
-    );
+    assert_eq!(rig.present(Present::of(image, 2)), ALL_SLOTS & !slot_bit(2));
     assert_eq!(
         rig.next_tick(),
         [
@@ -367,20 +370,71 @@ fn each_present_check_refuses_its_fault() {
     let base = Present::of(image, 0);
     let cases = [
         (Present { token: 0, ..base }, KernelError::NotFound),
-        (Present { token: TOKEN + 1, ..base }, KernelError::NotFound),
-        (Present { slot: u32::from(SLOTS), ..base }, KernelError::InvalidState),
-        (Present { image: image + 100, ..base }, KernelError::NotFound),
-        (Present { image: loose, ..base }, KernelError::NotFound),
+        (
+            Present {
+                token: TOKEN + 1,
+                ..base
+            },
+            KernelError::NotFound,
+        ),
+        (
+            Present {
+                slot: u32::from(SLOTS),
+                ..base
+            },
+            KernelError::InvalidState,
+        ),
+        (
+            Present {
+                image: image + 100,
+                ..base
+            },
+            KernelError::NotFound,
+        ),
+        (
+            Present {
+                image: loose,
+                ..base
+            },
+            KernelError::NotFound,
+        ),
         (Present { offset: 1, ..base }, KernelError::NotImplemented),
-        (Present { shown: EXTENT + 1, ..base }, KernelError::NotImplemented),
-        (Present { shown: EXTENT + (1 << 16), ..base }, KernelError::NotImplemented),
-        (Present { layout: PRESENT_LAYOUT + 1, ..base }, KernelError::NotImplemented),
+        (
+            Present {
+                shown: EXTENT + 1,
+                ..base
+            },
+            KernelError::NotImplemented,
+        ),
+        (
+            Present {
+                shown: EXTENT + (1 << 16),
+                ..base
+            },
+            KernelError::NotImplemented,
+        ),
+        (
+            Present {
+                layout: PRESENT_LAYOUT + 1,
+                ..base
+            },
+            KernelError::NotImplemented,
+        ),
         (Present { image: low, ..base }, KernelError::NotImplemented),
         (Present { high: 1, ..base }, KernelError::InvalidCombination),
         (Present { tail: 1, ..base }, KernelError::InvalidCombination),
         (base.fenced(unallocated, 1), KernelError::InvalidCombination),
-        (Present { fence: !192, ..base }, KernelError::InvalidCombination),
-        (Present { fence: 1, ..base }, KernelError::InvalidCombination),
+        (
+            Present {
+                fence: !192,
+                ..base
+            },
+            KernelError::InvalidCombination,
+        ),
+        (
+            Present { fence: 1, ..base },
+            KernelError::InvalidCombination,
+        ),
     ];
     for (present, error) in cases {
         assert_eq!(
@@ -391,15 +445,34 @@ fn each_present_check_refuses_its_fault() {
         );
     }
     assert!(!rig.shared.lock().presents().has_work());
-    // The accepted side of each edge: the last slot, an RGB10A2 image, a fenced present, the
-    // slot in the word's low byte.
+}
+
+/// The accepted side of 229's edges: the last slot, an RGB10A2 image, a fenced present on an
+/// allocated syncpoint, and the slot in the word's low byte.
+#[test]
+fn the_accepted_side_of_each_present_edge() {
+    let mut rig = Rig::new();
+    rig.presenting_client();
+    let image = rig.image();
+    let free = rig.shared.syncpoints().allocate().unwrap();
+    let base = Present::of(image, 0);
     let ten = rig.image_with(&preference(PRESENT_BLOCK_HEIGHT, PRESENT_FORMATS[1]), true);
     assert_eq!(
-        rig.present(Present { slot: u32::from(SLOTS) - 1, ..base }),
+        rig.present(Present {
+            slot: u32::from(SLOTS) - 1,
+            ..base
+        }),
         ALL_SLOTS & !slot_bit(SLOTS - 1)
     );
     assert_eq!(
-        rig.present(Present { image: ten, slot: 0x100 + 3, ..base }.fenced(free, 1)),
+        rig.present(
+            Present {
+                image: ten,
+                slot: 0x100 + 3,
+                ..base
+            }
+            .fenced(free, 1)
+        ),
         ALL_SLOTS & !slot_bit(SLOTS - 1) & !slot_bit(3)
     );
 }
@@ -448,13 +521,41 @@ fn the_present_checks_come_in_order() {
     let base = Present::of(image, 0);
     let cases = [
         // An unknown client and a slot past the last: the client.
-        (Present { token: TOKEN + 1, slot: 99, ..base }, KernelError::NotFound),
+        (
+            Present {
+                token: TOKEN + 1,
+                slot: 99,
+                ..base
+            },
+            KernelError::NotFound,
+        ),
         // A slot past the last and an unknown image: the slot.
-        (Present { slot: 99, image: 0, ..base }, KernelError::InvalidState),
+        (
+            Present {
+                slot: 99,
+                image: 0,
+                ..base
+            },
+            KernelError::InvalidState,
+        ),
         // An unknown image and an offset: the image.
-        (Present { image: 0, offset: 1, ..base }, KernelError::NotFound),
+        (
+            Present {
+                image: 0,
+                offset: 1,
+                ..base
+            },
+            KernelError::NotFound,
+        ),
         // An offset and a non-zero word 23: the offset.
-        (Present { offset: 1, high: 1, ..base }, KernelError::NotImplemented),
+        (
+            Present {
+                offset: 1,
+                high: 1,
+                ..base
+            },
+            KernelError::NotImplemented,
+        ),
     ];
     for (present, error) in cases {
         assert_eq!(
@@ -643,17 +744,23 @@ fn a_held_reply_is_saved_and_restored() {
     let Ok(Handled::Deferred(token)) = handled else {
         unreachable!("the fallback holds its reply");
     };
-    let held = rig.shared.lock().presents().client(TOKEN).map(|client| {
-        client.waiting().map(crate::shared::present::Waiting::token)
-    });
+    let held = rig
+        .shared
+        .lock()
+        .presents()
+        .client(TOKEN)
+        .map(|client| client.waiting().map(crate::shared::present::Waiting::token));
     assert_eq!(held, Some(Some(Some(token))));
     let table = rig.shared.save_presents(&rig.server).unwrap();
     let server = rig.server.save().unwrap();
     let env: Arc<dyn Env> = Arc::new(LiveEnv::new(FixedClock::new(START, 7), 0));
-    let mut restored =
-        vi2_server_paced(UnknownPolicy::Strict, Arc::clone(&rig.shared), Pacing::FenceWait)
-            .with_service_id(VI2)
-            .with_env(env, Arc::new(NoHalt));
+    let mut restored = vi2_server_paced(
+        UnknownPolicy::Strict,
+        Arc::clone(&rig.shared),
+        Pacing::FenceWait,
+    )
+    .with_service_id(VI2)
+    .with_env(env, Arc::new(NoHalt));
     restored.restore(&server).unwrap();
     rig.shared.restore_presents(&table, &restored).unwrap();
     assert_eq!(rig.shared.save_presents(&restored).unwrap(), table);
@@ -708,10 +815,7 @@ fn each_refreshing_command_takes_the_tick_s_release() {
         slots_reply(CANCEL_CLIENT_BUFFER, freed)
     );
     let (mut rig, image) = released_slot_zero(Notify::Never);
-    assert_eq!(
-        rig.present(Present::of(image, 2)),
-        freed & !slot_bit(2)
-    );
+    assert_eq!(rig.present(Present::of(image, 2)), freed & !slot_bit(2));
     let (mut rig, _) = released_slot_zero(Notify::Never);
     rig.ok(&get_notifications(128));
     assert_eq!(

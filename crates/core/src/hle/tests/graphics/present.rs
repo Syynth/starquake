@@ -19,8 +19,8 @@ use starquake_gsv::native::layout::{FORMAT_RGBA8, KIND_NATIVE, PREFERENCE_WORDS}
 use starquake_gsv::root::DISPLAY_SESSION_FLAGS;
 use starquake_gsv::vi2::command as vi2_command;
 use starquake_gsv::vi2::{
-    ALL_SLOTS, DEFAULT_DISPLAY, NO_FENCE, OPEN_DISPLAY_FLAGS, PRESENT_BLOCK_HEIGHT,
-    PRESENT_LAYOUT, PRESENT_WORD_FENCE, PRESENT_WORD_LAYOUT,
+    ALL_SLOTS, DEFAULT_DISPLAY, NO_FENCE, OPEN_DISPLAY_FLAGS, PRESENT_BLOCK_HEIGHT, PRESENT_LAYOUT,
+    PRESENT_WORD_FENCE, PRESENT_WORD_LAYOUT,
 };
 
 use super::*;
@@ -201,9 +201,7 @@ fn a_present_reaches_the_latch_on_a_vsync_tick() {
         notes(&rig.all_events()[before..]),
         [Note::VsyncTick { tick: 1 }, latched]
     );
-    assert!(
-        rig.all_events()[before..].contains(&(TIMER.0, TIMER.1, latched.event(GSV_ROOT)))
-    );
+    assert!(rig.all_events()[before..].contains(&(TIMER.0, TIMER.1, latched.event(GSV_ROOT))));
     assert_eq!(graphics.front().presented(), 1);
     assert_eq!(poll(&rig, notification), KernelError::TimedOut.code());
 

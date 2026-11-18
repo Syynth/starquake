@@ -866,7 +866,9 @@ pub enum PresentSnapshotError {
         count: usize,
     },
     /// A frame whose slot is not below [`SLOTS`].
-    #[error("the present table snapshot's client {index} has a frame in slot {slot}, past the last")]
+    #[error(
+        "the present table snapshot's client {index} has a frame in slot {slot}, past the last"
+    )]
     Slot {
         /// The client's index.
         index: usize,
@@ -923,7 +925,9 @@ pub enum PresentSnapshotError {
         queued: usize,
     },
     /// A held reply's token that an earlier client's has.
-    #[error("the present table snapshot's client {index} holds reply token {token}, which an earlier client holds")]
+    #[error(
+        "the present table snapshot's client {index} holds reply token {token}, which an earlier client holds"
+    )]
     DuplicateToken {
         /// The client's index.
         index: usize,
@@ -931,7 +935,9 @@ pub enum PresentSnapshotError {
         token: u64,
     },
     /// A held reply's request the vi2 server does not hold as pending.
-    #[error("the present table snapshot's client {index} holds reply token {token}, which the vi2 server does not hold as pending")]
+    #[error(
+        "the present table snapshot's client {index} holds reply token {token}, which the vi2 server does not hold as pending"
+    )]
     NotPending {
         /// The client's index.
         index: usize,
@@ -1016,7 +1022,8 @@ impl SavedFrame {
         let fence = match self.fence {
             None => None,
             Some((id, value)) => Some(Fence {
-                id: SyncpointId::new(id).ok_or(PresentSnapshotError::FenceSyncpoint { index, id })?,
+                id: SyncpointId::new(id)
+                    .ok_or(PresentSnapshotError::FenceSyncpoint { index, id })?,
                 value,
             }),
         };

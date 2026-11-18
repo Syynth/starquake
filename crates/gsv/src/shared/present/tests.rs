@@ -395,7 +395,10 @@ fn a_refused_release_signal_does_not_stop_the_latch() {
     assert!(host.calls.contains(&Call::Signal(event(2))));
     let mut state = shared.lock();
     for token in [FIRST_TOKEN, SECOND_TOKEN] {
-        assert_eq!(state.presents_mut().take_refresh(token).released, slot_bit(0));
+        assert_eq!(
+            state.presents_mut().take_refresh(token).released,
+            slot_bit(0)
+        );
     }
 }
 
@@ -416,7 +419,9 @@ fn a_frame_is_reached_by_the_counter_it_is_queued_against() {
     for (slot, (value, reached)) in (0..).zip(cases) {
         let mut state = shared.lock();
         let before = state.watchers(fenced_on());
-        let prepared = state.prepare_frame(FIRST_TOKEN, frame(slot, Some(value))).unwrap();
+        let prepared = state
+            .prepare_frame(FIRST_TOKEN, frame(slot, Some(value)))
+            .unwrap();
         assert_eq!(prepared.frame.reached, reached, "{value:#x}");
         assert_eq!(
             state.watchers(fenced_on()),
@@ -437,16 +442,33 @@ fn a_drained_value_reaches_only_frames_on_its_syncpoint() {
     let other = SyncpointId::new(0x18).unwrap();
     queue(&shared, FIRST_TOKEN, frame(0, Some(5)));
     let on_other = NewFrame {
-        fence: Some(Fence { id: other, value: 5 }),
+        fence: Some(Fence {
+            id: other,
+            value: 5,
+        }),
         ..frame(1, None)
     };
     queue(&shared, FIRST_TOKEN, on_other);
     let mut state = shared.lock();
     assert_eq!(state.presents_mut().reach(fenced_on(), 4), 0);
-    assert_eq!(state.presents_mut().reach(fenced_on(), 5 + i32::MAX.cast_unsigned()), 1);
-    assert_eq!(state.presents_mut().reach(fenced_on(), 5), 0, "already reached");
+    assert_eq!(
+        state
+            .presents_mut()
+            .reach(fenced_on(), 5 + i32::MAX.cast_unsigned()),
+        1
+    );
+    assert_eq!(
+        state.presents_mut().reach(fenced_on(), 5),
+        0,
+        "already reached"
+    );
     assert_eq!(state.presents().unreached_on(other), 1);
-    assert_eq!(state.presents_mut().reach(other, 5u32.wrapping_add(1 << 31)), 0);
+    assert_eq!(
+        state
+            .presents_mut()
+            .reach(other, 5u32.wrapping_add(1 << 31)),
+        0
+    );
     assert_eq!(state.presents_mut().reach(other, 6), 1);
 }
 
@@ -589,7 +611,15 @@ fn unregistering_gives_back_the_watches() {
     let state = shared.lock();
     assert_eq!(state.watchers(fenced_on()), 1);
     assert!(state.presents().client(FIRST_TOKEN).is_none());
-    assert_eq!(state.presents().client(SECOND_TOKEN).unwrap().queued().len(), 1);
+    assert_eq!(
+        state
+            .presents()
+            .client(SECOND_TOKEN)
+            .unwrap()
+            .queued()
+            .len(),
+        1
+    );
 }
 
 /// 11's event reaches the client's entry; a token the table does not have changes nothing.
@@ -694,12 +724,16 @@ fn the_snapshot_layout_is_pinned() {
     // pitch 302, block height 7, format 1, shown 0, 0, 12, 22, layer 42, display 52, the fence
     // (some: 0x17, 0x41), not reached, holds.
     expected.extend([0x01, 0x02, 0x31, 0x80, 0x80, 0x80, 0x01]);
-    expected.extend([0x66, 0xCA, 0x01, 0xAE, 0x02, 0x07, 0x01, 0x00, 0x00, 0x0C, 0x16]);
+    expected.extend([
+        0x66, 0xCA, 0x01, 0xAE, 0x02, 0x07, 0x01, 0x00, 0x00, 0x0C, 0x16,
+    ]);
     expected.extend([0x2A, 0x34, 0x01, 0x17, 0x41, 0x00, 0x01]);
     // The shown frame: some; slot 3, image 0x32, address 0x100000, width 101, height 201,
     // pitch 301, 7, 1, shown 0, 0, 11, 21, layer 41, display 51, no fence, reached, holds.
     expected.extend([0x01, 0x03, 0x32, 0x80, 0x80, 0x40]);
-    expected.extend([0x65, 0xC9, 0x01, 0xAD, 0x02, 0x07, 0x01, 0x00, 0x00, 0x0B, 0x15]);
+    expected.extend([
+        0x65, 0xC9, 0x01, 0xAD, 0x02, 0x07, 0x01, 0x00, 0x00, 0x0B, 0x15,
+    ]);
     expected.extend([0x29, 0x33, 0x00, 0x01, 0x01]);
     // Released slot 1 (bit 2), raised, no held reply.
     expected.extend([0x02, 0x01, 0x00]);
@@ -720,7 +754,9 @@ fn a_restored_table_is_used_as_saved() {
 
     let target = shared_arc();
     target.lock().watch(fenced_on()).unwrap();
-    target.restore_presents(&bytes, &no_server(&target)).unwrap();
+    target
+        .restore_presents(&bytes, &no_server(&target))
+        .unwrap();
     assert_eq!(target.lock().presents(), source.lock().presents());
     assert!(target.lock().listen_vsync(event(9), START).is_ok());
     drain_change(&target, 4);
@@ -896,7 +932,10 @@ fn the_restore_checks_accept_their_edges() {
     shared
         .restore_presents(&snapshot(&clients), &no_server(&shared))
         .unwrap();
-    assert_eq!(shared.lock().presents().clients().count(), MAX_PRESENT_CLIENTS);
+    assert_eq!(
+        shared.lock().presents().clients().count(),
+        MAX_PRESENT_CLIENTS
+    );
     assert_eq!(shared.lock().presents().unreached_on(last), 1);
 }
 
