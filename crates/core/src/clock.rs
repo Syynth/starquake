@@ -13,6 +13,13 @@
 //! `tests/skeleton.rs` reads a tick each way and checks that they do; the core loop refuses a
 //! run whose clock and process name different consoles (`crate::machine`).
 //!
+//! A counter read the patcher missed is the backend's to answer. Under the hypervisor backend
+//! an unpatched `mrs xN, cntpct_el0` traps to its shim, which rescales it with the scale each
+//! vCPU is given ([`shim_scale`]: the patcher's own ratio, handed over unchanged), so that it
+//! reads what a patched read would. The run makes the patcher's rates and that scale together,
+//! as one [`CounterScaling`] ([`Timebase::counter_scaling`]). Unpatched `cntvct_el0` and `cntfrq_el0` reads still see the
+//! host's rate: a divergence the backend lists (`starquake_cpu::hvf`, "Counter reads").
+//!
 //! An ExeFS's console is its metadata's (`crate::image`, "The process's description"). An NRO
 //! carries nothing that says which console it was built for, so it is described as built for
 //! [`NRO_CONSOLE`]: the homebrew this emulator runs is built for the first Switch (a guess, and
@@ -48,6 +55,78 @@ impl<C> Timebase<C> {
     pub(crate) const fn rate(&self) -> CounterRate {
         self.console.counter_rate()
     }
+
+    /// What the loader's patcher rescales the program's counter reads with: from the backend's
+    /// counter, which runs at `host_hz` hertz, to the process's [`Timebase::rate`]. Only a CPU
+    /// backend's run patches counter reads.
+    #[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
+    pub(crate) const fn counter_rescale(
+        &self,
+        host_hz: u64,
+    ) -> starquake_loader::patch::CounterRescale {
+        starquake_loader::patch::CounterRescale {
+            host_hz,
+            guest_hz: self.rate().hz(),
+        }
+    }
+
+    /// Both halves of a run's counter rescaling under the hypervisor backend, made from the one
+    /// pair of rates [`Timebase::counter_rescale`] gives for `host_hz`: what the patcher
+    /// rescales with, and the scale each vCPU rescales the reads the patcher missed with
+    /// ([`shim_scale`]). Refused, as the patcher refuses it, for a rate of zero.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub(crate) fn counter_scaling(
+        &self,
+        host_hz: u64,
+    ) -> Result<CounterScaling, starquake_loader::patch::PatchError> {
+        let patcher = self.counter_rescale(host_hz);
+        Ok(CounterScaling {
+            patcher,
+            shim: shim_scale(patcher)?,
+        })
+    }
+}
+
+/// A run's counter rescaling under the hypervisor backend: the rates the loader's patcher
+/// rescales patched reads with, and the scale the backend rescales the reads the patcher missed
+/// with. Only [`Timebase::counter_scaling`] makes one, from one pair of rates, so the two halves
+/// cannot disagree; the run hands this one value to the patcher and to every vCPU.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CounterScaling {
+    /// The patcher's rates.
+    patcher: starquake_loader::patch::CounterRescale,
+    /// [`shim_scale`] of `patcher`.
+    shim: starquake_cpu::hvf::CounterScale,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl CounterScaling {
+    /// The rates the loader's patcher rescales patched reads with.
+    pub(crate) const fn patcher(&self) -> starquake_loader::patch::CounterRescale {
+        self.patcher
+    }
+
+    /// The scale a vCPU rescales the reads the patcher missed with: the patcher's own ratio.
+    pub(crate) const fn shim(&self) -> starquake_cpu::hvf::CounterScale {
+        self.shim
+    }
+}
+
+/// The scale the hypervisor backend rescales a counter read the patcher missed with: the
+/// patcher's ratio for `rescale` (`CounterRescale::ratio`), handed over unchanged, so that an
+/// unpatched read and a patched one taken at the same count read the same value
+/// (`starquake_cpu::hvf`, "Counter reads"). Refused, as the patcher refuses it, for a rate of
+/// zero.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn shim_scale(
+    rescale: starquake_loader::patch::CounterRescale,
+) -> Result<starquake_cpu::hvf::CounterScale, starquake_loader::patch::PatchError> {
+    let ratio = rescale.ratio()?;
+    Ok(starquake_cpu::hvf::CounterScale::new(
+        ratio.int(),
+        ratio.frac(),
+    ))
 }
 
 /// A count of a `hz` hertz host counter, as host nanoseconds since the counter's zero: rounded
@@ -160,6 +239,192 @@ mod tests {
                         "{name}: {value} for {count} at {rate:?}, exact {exact}"
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn the_patchers_rates_are_the_backends_and_the_processs() {
+        // Each console's rate is the kernel's (`Console::counter_rate`), and the host's is the
+        // one given: a distinct value for each, so swapped fields fail.
+        for console in [Console::Switch1, Console::Switch2] {
+            let time = Timebase { console, clock: () };
+            assert_eq!(
+                time.counter_rescale(HOST_HZ.get()),
+                CounterRescale {
+                    host_hz: HOST_HZ.get(),
+                    guest_hz: console.counter_rate().hz(),
+                }
+            );
+        }
+        assert_ne!(
+            Console::Switch1.counter_rate(),
+            Console::Switch2.counter_rate()
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn the_shims_scale_is_the_patchers_ratio_and_refuses_a_rate_of_zero() {
+        for guest_hz in [CounterRate::SWITCH_1.hz(), CounterRate::SWITCH_2.hz()] {
+            let rescale = CounterRescale {
+                host_hz: HOST_HZ.get(),
+                guest_hz,
+            };
+            let ratio = rescale.ratio().unwrap();
+            let scale = shim_scale(rescale).unwrap();
+            assert_eq!((scale.int(), scale.frac()), (ratio.int(), ratio.frac()));
+        }
+        let zero = CounterRescale {
+            host_hz: 0,
+            guest_hz: CounterRate::SWITCH_2.hz(),
+        };
+        assert_eq!(shim_scale(zero), Err(zero.ratio().unwrap_err()));
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn a_runs_patcher_rates_and_shim_scale_are_made_as_one_pair() {
+        // A host rate distinct from each console's, so a pair whose scale was made from other
+        // rates (the guest's rate given as the host's, ratio 1, or the rates swapped) fails.
+        for console in [Console::Switch1, Console::Switch2] {
+            assert_ne!(HOST_HZ.get(), console.counter_rate().hz());
+            let time = Timebase { console, clock: () };
+            let counter = time.counter_scaling(HOST_HZ.get()).unwrap();
+            let rescale = CounterRescale {
+                host_hz: HOST_HZ.get(),
+                guest_hz: console.counter_rate().hz(),
+            };
+            assert_eq!(counter.patcher(), rescale, "{console:?}");
+            let ratio = rescale.ratio().unwrap();
+            assert_eq!(
+                (counter.shim().int(), counter.shim().frac()),
+                (ratio.int(), ratio.frac()),
+                "{console:?}"
+            );
+            assert_ne!(
+                counter.shim(),
+                starquake_cpu::hvf::CounterScale::IDENTITY,
+                "{console:?}"
+            );
+        }
+        // Refused for a rate of zero, as the patcher refuses it.
+        let time = Timebase {
+            console: Console::Switch2,
+            clock: (),
+        };
+        assert_eq!(
+            time.counter_scaling(0),
+            Err(time.counter_rescale(0).ratio().unwrap_err())
+        );
+    }
+
+    /// The vCPUs of a run under the hypervisor backend: what `crate::system` makes them with.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    mod on_hardware {
+        use std::sync::PoisonError;
+
+        use starquake_cpu::hvf::{HvfBackend, PhysicalMemory, RamConfig};
+        use starquake_cpu::{Exit, GuestRegs, Vcpu, host_counter};
+        use starquake_loader::patch::{PatchConfig, SiteKind, patch_text};
+        use starquake_memory::{GuestMemory, PAGE_SIZE, Perms};
+        use starquake_testkit::a64::{self, SysReg};
+
+        use super::*;
+        use crate::space::AddressSpace;
+        use crate::system::host::{ONE_VM, process_vcpu};
+
+        /// Where the test's code goes, and its trampolines a page above.
+        const TEXT: u64 = 0x80_0000;
+        const TRAMPOLINES: u64 = TEXT + PAGE_SIZE;
+        /// A page of stack, for the trampolines to save their scratch registers on, two pages
+        /// above the trampolines.
+        const STACK: u64 = TRAMPOLINES + 2 * PAGE_SIZE;
+
+        /// Patched reads into x19 and x21, each followed by an unpatched one (x20, x22) written
+        /// after the patcher ran, as code written at run time would be, then `svc #0`. Returns
+        /// the text and the trampolines.
+        fn back_to_back(rescale: CounterRescale) -> (Vec<u8>, Vec<u8>) {
+            let read = |rt| a64::mrs(rt, SysReg::CntPctEl0).unwrap();
+            let words = [
+                read(19),
+                a64::nop(),
+                read(21),
+                a64::nop(),
+                a64::svc(0).unwrap(),
+            ];
+            let mut text = a64::to_bytes(&words);
+            let config = PatchConfig {
+                counter: Some(rescale),
+            };
+            let patched = patch_text(&mut text, TEXT, TRAMPOLINES, &config).unwrap();
+            let sites: Vec<_> = patched
+                .sites
+                .iter()
+                .map(|site| (site.kind, site.register))
+                .collect();
+            assert_eq!(sites, [(SiteKind::CntPct, 19), (SiteKind::CntPct, 21)]);
+            let insn = usize::try_from(a64::INSN_SIZE).unwrap();
+            for (index, rt) in [(1, 20), (3, 22)] {
+                text[index * insn..(index + 1) * insn].copy_from_slice(&read(rt).to_le_bytes());
+            }
+            (text, patched.trampolines)
+        }
+
+        #[test]
+        fn a_runs_vcpu_answers_an_unpatched_read_as_the_patched_reads_around_it() {
+            if std::env::var_os("CI").is_some() {
+                return;
+            }
+            let _one_vm = ONE_VM.lock().unwrap_or_else(PoisonError::into_inner);
+            let host_hz = HvfBackend::host_counter_frequency();
+            let backend = HvfBackend::new(RamConfig::default()).unwrap();
+            let space = AddressSpace::<PhysicalMemory>::new(
+                backend.physical(),
+                backend.ram(),
+                backend.table_pool(),
+            )
+            .unwrap();
+            space.map(TEXT, 2 * PAGE_SIZE, Perms::ReadExecute).unwrap();
+            space.map(STACK, PAGE_SIZE, Perms::ReadWrite).unwrap();
+            // Written once, so the page has backing before the guest stores to it.
+            let page = vec![0; usize::try_from(PAGE_SIZE).unwrap()];
+            space.write(STACK, &page).unwrap();
+            // One console whose rate is below the host's and one above it: a vCPU that read the
+            // host's counter unscaled would fall out of order either way.
+            for console in [Console::Switch1, Console::Switch2] {
+                let time = Timebase {
+                    console,
+                    clock: CounterClock::new(host_hz).unwrap(),
+                };
+                let counter = time.counter_scaling(host_hz).unwrap();
+                let rescale = counter.patcher();
+                let (text, trampolines) = back_to_back(rescale);
+                space.write(TEXT, &text).unwrap();
+                space.write(TRAMPOLINES, &trampolines).unwrap();
+                // Made as the run makes every core's vCPU.
+                let mut vcpu = process_vcpu(&backend, space.root(), counter).unwrap();
+                vcpu.set_regs(&GuestRegs {
+                    pc: TEXT,
+                    sp: STACK + PAGE_SIZE,
+                    ..GuestRegs::default()
+                })
+                .unwrap();
+                let before = host_counter::read();
+                assert_eq!(vcpu.run(), Ok(Exit::Svc(0)), "{console:?}");
+                let after = host_counter::read();
+                let x = vcpu.regs().unwrap().x;
+                let reads = [x[19], x[20], x[21], x[22]];
+                // One clock: each read at or after the one before, all four between the host's
+                // readings around the run, scaled as the patcher scales.
+                let ratio = rescale.ratio().unwrap();
+                assert!(reads.is_sorted(), "{console:?}: {reads:?}");
+                assert!(
+                    ratio.scale(before) <= reads[0] && reads[3] <= ratio.scale(after),
+                    "{console:?}: {reads:?} not in {}..={}",
+                    ratio.scale(before),
+                    ratio.scale(after)
+                );
             }
         }
     }

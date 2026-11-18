@@ -19,12 +19,13 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
 use starquake_cpu::hvf::{
-    HvfBackend, HvfVcpu, MAX_PAGE_FLUSHES, PacKeys, PhysicalMemory, RamConfig,
+    CounterScale, HvfBackend, HvfVcpu, MAX_PAGE_FLUSHES, PacKeys, PhysicalMemory, RamConfig,
 };
 use starquake_cpu::{
     Backend, Error, ExceptionClass, Exit, FaultStatus, GUEST_PSTATE_MASK, GuestRegs, Interrupter,
-    PSTATE_DIT, PSTATE_NZCV, PSTATE_SSBS, Syndrome, VECTOR_REGS, Vcpu,
+    PSTATE_DIT, PSTATE_NZCV, PSTATE_SSBS, Syndrome, VECTOR_REGS, Vcpu, host_counter,
 };
+use starquake_loader::patch::{CounterRescale, FixedRatio, PatchConfig, SiteKind, patch_text};
 use starquake_memory::stage1::{
     FlushRange, Stage1Tables, TableRoot, VA_SPACE_END, WalkError, translate,
 };
@@ -2139,5 +2140,336 @@ fn svc_reaches_the_host_whatever_x0_holds() {
         let after = vcpu.regs().unwrap();
         assert_eq!((after.x[0], after.x[1]), (x0, 0x1111), "x0 = {x0:#x}");
         assert_eq!(after.pc, base + 4, "x0 = {x0:#x}");
+    }
+}
+
+/// Counter scale: what an unpatched `mrs xN, cntpct_el0` reads once the vCPU has the patcher's
+/// scale (see "Counter reads" in the backend's module docs). In a `cfg(test)` module so its
+/// helpers may unwrap like the tests do.
+#[cfg(test)]
+mod counter_scale {
+    use super::*;
+
+    /// `mrs x<rt>, cntpct_el0` (Arm ARM, `MRS`: `op0` 3, `op1` 3, `CRn` 14, `CRm` 0, `op2` 1;
+    /// `Rt` in bits 4:0).
+    fn mrs_cntpct(rt: u32) -> u32 {
+        0xd53b_e020 | rt
+    }
+
+    /// `mrs x<rt>, cntvct_el0` (`op2` 2).
+    fn mrs_cntvct(rt: u32) -> u32 {
+        0xd53b_e040 | rt
+    }
+
+    /// `mrs x<rt>, cntfrq_el0` (`op2` 0).
+    fn mrs_cntfrq(rt: u32) -> u32 {
+        0xd53b_e000 | rt
+    }
+
+    /// `nop`.
+    const NOP: u32 = 0xd503_201f;
+
+    /// Guest rates that give each of the patcher's trampoline shapes, derived from the host's rate:
+    /// below it (`umulh` alone), between it and twice it (`add` and `umulh`), and more than twice
+    /// it (`madd` and `umulh`). None is a console's rate: the shim must not depend on which.
+    fn test_rates(host_hz: u64) -> [u64; 3] {
+        [host_hz * 4 / 5, host_hz * 13 / 10, host_hz * 4 + 7]
+    }
+
+    /// The patcher's ratio from the host's rate to `guest_hz`, and the scale the vCPU is given for
+    /// it: the same two numbers.
+    fn ratio_and_scale(host_hz: u64, guest_hz: u64) -> (FixedRatio, CounterScale) {
+        let ratio = CounterRescale { host_hz, guest_hz }.ratio().unwrap();
+        (ratio, CounterScale::new(ratio.int(), ratio.frac()))
+    }
+
+    /// A distinct value for register `n`, far from any counter reading.
+    fn marker(n: usize) -> u64 {
+        let n = n as u64;
+        0x5a5a_0000_0000_0000 | (n << 8) | n
+    }
+
+    /// Runs `vcpu` from the start of the window to its next exit, and returns that exit with the
+    /// host counter read just before and just after.
+    fn run_timed(vcpu: &mut HvfVcpu) -> (Exit, u64, u64) {
+        let before = host_counter::read();
+        let exit = vcpu.run().unwrap();
+        let after = host_counter::read();
+        (exit, before, after)
+    }
+
+    #[test]
+    fn a_new_vcpu_reads_the_counter_unscaled_even_where_another_vcpu_had_a_scale() {
+        let Some(guest) = Guest::new() else { return };
+        let host_hz = guest.backend.counter_frequency();
+        let program = [mrs_cntpct(0), SVC_0];
+        // A fresh vCPU has the identity scale, and reads the host's counter as it is.
+        let mut first = guest.vcpu(&program, |_| {});
+        assert_eq!(first.counter_scale(), CounterScale::IDENTITY);
+        assert_eq!(
+            (CounterScale::IDENTITY.int(), CounterScale::IDENTITY.frac()),
+            (1, 0)
+        );
+        let (exit, before, after) = run_timed(&mut first);
+        assert_eq!(exit, Exit::Svc(0));
+        let read = first.regs().unwrap().x[0];
+        assert!(
+            before <= read && read <= after,
+            "{before} <= {read} <= {after}"
+        );
+        // Given a scale four times the host's, it reads four times the host's counter...
+        let (ratio, scale) = ratio_and_scale(host_hz, host_hz * 4);
+        first.set_counter_scale(scale).unwrap();
+        assert_eq!(first.counter_scale(), scale);
+        let mut regs = first.regs().unwrap();
+        regs.pc = guest.base();
+        first.set_regs(&regs).unwrap();
+        let (exit, before, after) = run_timed(&mut first);
+        assert_eq!(exit, Exit::Svc(0));
+        let read = first.regs().unwrap().x[0];
+        assert!(
+            ratio.scale(before) <= read && read <= ratio.scale(after),
+            "{before} <= {read} <= {after}, scaled"
+        );
+        // ...and a vCPU made once it is gone, in the scratch slot it had, starts unscaled again.
+        drop(first);
+        let mut second = guest.vcpu(&program, |_| {});
+        assert_eq!(second.counter_scale(), CounterScale::IDENTITY);
+        let (exit, before, after) = run_timed(&mut second);
+        assert_eq!(exit, Exit::Svc(0));
+        let read = second.regs().unwrap().x[0];
+        assert!(
+            before <= read && read <= after,
+            "{before} <= {read} <= {after}"
+        );
+    }
+
+    #[test]
+    fn an_unpatched_counter_read_is_rescaled_into_any_register_and_touches_no_other() {
+        let Some(guest) = Guest::new() else { return };
+        let host_hz = guest.backend.counter_frequency();
+        for guest_hz in test_rates(host_hz) {
+            let (ratio, scale) = ratio_and_scale(host_hz, guest_hz);
+            for rt in 0..32u32 {
+                let mut vcpu = guest.vcpu(&[mrs_cntpct(rt), SVC_0], |regs| {
+                    for (n, x) in regs.x.iter_mut().enumerate() {
+                        *x = marker(n);
+                    }
+                });
+                vcpu.set_counter_scale(scale).unwrap();
+                let (exit, before, after) = run_timed(&mut vcpu);
+                assert_eq!(exit, Exit::Svc(0), "x{rt} at {guest_hz} Hz");
+                let x = vcpu.regs().unwrap().x;
+                for (n, &value) in (0u32..).zip(x.iter()) {
+                    if n == rt {
+                        // The guest's count lies between the host's readings around the run
+                        // (`tests/host_counter.rs`), and the scale keeps the order.
+                        assert!(
+                            ratio.scale(before) <= value && value <= ratio.scale(after),
+                            "x{rt} at {guest_hz} Hz: {value} not in {}..={}",
+                            ratio.scale(before),
+                            ratio.scale(after)
+                        );
+                    } else {
+                        assert_eq!(
+                            value,
+                            marker(n as usize),
+                            "x{n} after a read into x{rt} at {guest_hz} Hz"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The guest's text for the back-to-back tests, patched for `guest_hz` with its trampolines at
+    /// `trampolines_at`: patched reads into x19 and x21, each followed by an unpatched read (x20,
+    /// x22), then `svc #0`. The unpatched reads are written after the patcher ran, as code written
+    /// at run time would be: the patcher saw a `nop` there. Returns the words and the trampolines.
+    fn back_to_back(
+        host_hz: u64,
+        guest_hz: u64,
+        text_at: u64,
+        trampolines_at: u64,
+    ) -> (Vec<u32>, Vec<u8>) {
+        let words = [mrs_cntpct(19), NOP, mrs_cntpct(21), NOP, SVC_0];
+        let mut text: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let config = PatchConfig {
+            counter: Some(CounterRescale { host_hz, guest_hz }),
+        };
+        let patched = patch_text(&mut text, text_at, trampolines_at, &config).unwrap();
+        let sites: Vec<_> = patched
+            .sites
+            .iter()
+            .map(|site| (site.kind, site.register))
+            .collect();
+        assert_eq!(sites, [(SiteKind::CntPct, 19), (SiteKind::CntPct, 21)]);
+        let mut words: Vec<u32> = text
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| u32::from_le_bytes(*chunk))
+            .collect();
+        assert_eq!((words[1], words[3]), (NOP, NOP));
+        words[1] = mrs_cntpct(20);
+        words[3] = mrs_cntpct(22);
+        (words, patched.trampolines)
+    }
+
+    /// Runs [`back_to_back`] for `guest_hz` on a fresh vCPU given `scale`, and returns the four
+    /// reads in program order (patched, unpatched, patched, unpatched) with the host counter read
+    /// just before and just after the run.
+    fn run_back_to_back(guest: &Guest, guest_hz: u64, scale: CounterScale) -> ([u64; 4], u64, u64) {
+        let host_hz = guest.backend.counter_frequency();
+        let trampolines_at = guest.base() + 0x1000;
+        let (words, trampolines) = back_to_back(host_hz, guest_hz, guest.base(), trampolines_at);
+        guest.memory().write(trampolines_at, &trampolines).unwrap();
+        let mut vcpu = guest.vcpu(&words, |_| {});
+        vcpu.set_counter_scale(scale).unwrap();
+        let (exit, before, after) = run_timed(&mut vcpu);
+        assert_eq!(exit, Exit::Svc(0), "{guest_hz} Hz");
+        let x = vcpu.regs().unwrap().x;
+        ([x[19], x[20], x[21], x[22]], before, after)
+    }
+
+    #[test]
+    fn unpatched_and_patched_reads_agree_back_to_back() {
+        let Some(guest) = Guest::new() else { return };
+        let host_hz = guest.backend.counter_frequency();
+        // Every trampoline shape, and equal rates, where a patched read is `cntvct_el0` as it is.
+        let mut rates = test_rates(host_hz).to_vec();
+        rates.push(host_hz);
+        for guest_hz in rates {
+            let (ratio, scale) = ratio_and_scale(host_hz, guest_hz);
+            let (reads, before, after) = run_back_to_back(&guest, guest_hz, scale);
+            // Patched and unpatched reads are one clock: both are `ratio.scale` of the counter, so
+            // a read is never below the one before it (the counter only moves forward, and equal
+            // counts read equal values; `crates/core/src/clock.rs` says how that rounds against
+            // the exact rate), and all four lie between the host's readings around the run.
+            assert!(
+                reads.is_sorted(),
+                "{guest_hz} Hz: patched {}, unpatched {}, patched {}, unpatched {}",
+                reads[0],
+                reads[1],
+                reads[2],
+                reads[3]
+            );
+            assert!(
+                ratio.scale(before) <= reads[0] && reads[3] <= ratio.scale(after),
+                "{guest_hz} Hz: {reads:?} not in {}..={}",
+                ratio.scale(before),
+                ratio.scale(after)
+            );
+            // The bracket is one entry to the guest wide: far under a second of guest ticks.
+            assert!(reads[3] - reads[0] < guest_hz, "{guest_hz} Hz: {reads:?}");
+        }
+    }
+
+    #[test]
+    fn without_the_patchers_scale_an_unpatched_read_falls_outside_the_patched_ones() {
+        // The control for the test above: a vCPU left with the identity scale reads the host's
+        // count unpatched while the patched reads around it are 30% more, so the same order check
+        // fails; given the scale, it passes.
+        let Some(guest) = Guest::new() else { return };
+        let host_hz = guest.backend.counter_frequency();
+        let guest_hz = test_rates(host_hz)[1];
+        let (reads, ..) = run_back_to_back(&guest, guest_hz, CounterScale::IDENTITY);
+        assert!(reads[1] < reads[0], "{reads:?}");
+        assert!(!reads.is_sorted(), "{reads:?}");
+        let (_, scale) = ratio_and_scale(host_hz, guest_hz);
+        let (reads, ..) = run_back_to_back(&guest, guest_hz, scale);
+        assert!(reads.is_sorted(), "{reads:?}");
+    }
+
+    #[test]
+    fn a_counter_scale_rescales_cntpct_only_while_cntvct_and_cntfrq_read_the_host() {
+        // The divergences the backend's module docs list ("Counter reads"): `cntvct_el0` and
+        // `cntfrq_el0` run natively, so a scale changes neither.
+        let Some(guest) = Guest::new() else { return };
+        let host_hz = guest.backend.counter_frequency();
+        let (ratio, scale) = ratio_and_scale(host_hz, host_hz * 4);
+        let mut vcpu = guest.vcpu(
+            &[mrs_cntvct(0), mrs_cntpct(1), mrs_cntfrq(2), SVC_0],
+            |_| {},
+        );
+        vcpu.set_counter_scale(scale).unwrap();
+        let (exit, before, after) = run_timed(&mut vcpu);
+        assert_eq!(exit, Exit::Svc(0));
+        let x = vcpu.regs().unwrap().x;
+        assert!(before <= x[0] && x[0] <= after, "cntvct_el0 read {}", x[0]);
+        assert!(
+            ratio.scale(before) <= x[1] && x[1] <= ratio.scale(after),
+            "cntpct_el0 read {}",
+            x[1]
+        );
+        assert_eq!(x[2], host_hz, "cntfrq_el0");
+    }
+
+    #[test]
+    fn interrupts_never_lose_or_repeat_a_rescaled_counter_read() {
+        // Like `interrupts_never_lose_or_repeat_guest_work`, with a scale four times the host's
+        // and a read into a borrowed register: an interrupt inside a counter stub is undone and
+        // the read runs again, so every read is a rescaled count, and the registers the shim
+        // borrows keep the guest's values.
+        let Some(guest) = Guest::new() else { return };
+        let host_hz = guest.backend.counter_frequency();
+        let (ratio, scale) = ratio_and_scale(host_hz, host_hz * 4);
+        let mut vcpu = guest.vcpu(
+            &[
+                mrs_cntpct(1),  // 0x00  mrs x1, cntpct_el0
+                mrs_cntpct(10), // 0x04  mrs x10, cntpct_el0   (a register the shim borrows)
+                0x9100_0442,    // 0x08  add x2, x2, #1
+                0xd400_00a1,    // 0x0c  svc #5
+                0x17ff_fffc,    // 0x10  b 0x00
+            ],
+            |regs| {
+                regs.x[9] = 0x99;
+                regs.x[11] = 0x1111;
+            },
+        );
+        vcpu.set_counter_scale(scale).unwrap();
+        let base = guest.base();
+        let interrupter = vcpu.interrupter();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::clone(&stop);
+        let pest = std::thread::spawn(move || {
+            while !stopped.load(Ordering::Relaxed) {
+                interrupter.interrupt().unwrap();
+                std::thread::yield_now();
+            }
+        });
+        let start = ratio.scale(host_counter::read());
+        let (mut svcs, mut interrupts) = (0u64, 0u64);
+        let started = Instant::now();
+        while svcs < 2_000 || interrupts < 10 {
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "only {interrupts} interrupts landed in 60 s"
+            );
+            let exit = vcpu.run().unwrap();
+            let now = ratio.scale(host_counter::read());
+            let regs = vcpu.regs().unwrap();
+            assert_eq!((regs.x[9], regs.x[11]), (0x99, 0x1111));
+            match exit {
+                Exit::Svc(5) => {
+                    svcs += 1;
+                    assert_eq!(regs.x[2], svcs);
+                    assert_eq!(regs.pc, base + 0x10);
+                    let (first, second) = (regs.x[1], regs.x[10]);
+                    assert!(
+                        start <= first && first <= second && second <= now,
+                        "{start} <= {first} <= {second} <= {now}"
+                    );
+                }
+                Exit::Interrupted => {
+                    interrupts += 1;
+                    assert!((base..=base + 0x10).contains(&regs.pc), "{:#x}", regs.pc);
+                }
+                other => assert_eq!(other, Exit::Svc(5), "unexpected exit"),
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        pest.join().unwrap();
+        assert!(interrupts > 0, "no interrupt landed");
     }
 }
