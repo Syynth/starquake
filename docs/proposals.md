@@ -354,6 +354,17 @@ The title no longer spins: command 210's event now waits properly. It then reach
 | awaiting the owner | **lm's lines have no `GuestLog` event**, which departs from the observability spec. Options: give lm lines `GuestLog` events, send them to a file of their own, or amend the spec and `docs/architecture.md` | Review of #278 (PR #285) | observability |
 | proposed | **aoc's purchased event is one per server**, where Eden makes and closes one per manager; the departure is listed in aoc's module docs | Review of #278 | area:services |
 
+### From wave 29 (ledger: #22)
+
+Landed: #194 (gsv's servers wired into core, PR #291), #260 (the kernel's object and handle tables in a snapshot, PR #290) and #205 (counter reads the patcher missed, PR #289).
+
+The title now talks to the real nvsrv, syncpoint and gpu sessions. It then opens the display context and asks root command 305 for the vi2 session, which is still a placeholder (slice 13, #191). Its commands 3, 1 and 11 are auto-stubbed, and the title polls a handle that does not exist. Wave 30 builds the vsync clock (#190) that the vi2 session needs first, alongside #186 and #242. #191 follows.
+
+| Status | Proposal | Why | Suggested |
+|---|---|---|---|
+| proposed | **Watch #194's timing test on loaded runners.** It compares a wall-clock wait with half a preemption interval (5 ms). If it ever flakes, raise the threshold; never retry | Review of #194 (PR #291) | area:core |
+| proposed | **`cntvct_el0` and `cntfrq_el0` at the guest's rate.** #205 covers `cntpct_el0`; the virtual counter still reads at the host rate and `cntfrq_el0` is not yet the guest's | #205's PR body (two "done when" items not fully met) | area:cpu |
+
 ## House-rule candidates
 
 Rules distilled from review findings. A vetted rule moves into `CLAUDE.md`; until then it is
@@ -524,3 +535,12 @@ passed to build agents as a provisional rule for the next wave.
 - An object made per session or per manager has a bounded lifetime, and any departure from the reference's lifetime is listed.
 - A wiring change gets one end-to-end test through the production constructor that asserts the output reaches the final report or the guest.
 - Each rollback error path is tested for every taking path: placed handles released, reference counts restored, services-side state forgotten.
+
+### From wave 29 (ledger: #22)
+
+- A new timer, bell or wake path gets a test that fails if that exact path is removed, with the effect asserted well inside the fallback interval.
+- Each new background turn gets at least one test through the production thread or constructor and the real clock.
+- A method that keeps the first or last of several failures is tested with two distinguishable failures.
+- Boundary tests are placed where the guarded check is the only thing that can refuse, not at the end of the backing memory.
+- Periodic work skips an idle turn before it reads the clock, so recorded readings don't depend on host timing.
+- Where references disagree, the doc says "conflict", names the winner under decision 8, and pins each case with a named test.
