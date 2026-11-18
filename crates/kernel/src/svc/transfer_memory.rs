@@ -34,7 +34,8 @@
 //! - **No resource limit.** Eden reserves one `TransferMemoryCountMax` from the process's
 //!   resource limit first (`ResultLimitReached`; Eden's limit is 200,
 //!   `CreateResourceLimitForProcess` in `eden/src/core/hle/kernel/k_resource_limit.cpp`).
-//!   Starquake's resource limits are a later slice, so this call never fails that way.
+//!   The process's resource limit counts no transfer memories yet ([`crate::resource_limit`]),
+//!   so this call never fails that way.
 //!   PROVISIONAL. Test: `more_transfer_memories_than_edens_limit_are_all_lent`.
 //! - **The receiver never maps the pages.** `MapTransferMemory` (0x51) and
 //!   `UnmapTransferMemory` (0x52) are server-side calls, deferred with the rest (kernel spec);

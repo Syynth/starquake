@@ -22,9 +22,12 @@
 //!   homebrew argument block (`x0` zero, `x1` the main thread's handle). Eden gives an NRO that
 //!   the loader passed an argument block `x0` = the block, `x1` = `-1`; no loader here passes
 //!   one. Test: `the_main_thread_starts_at_the_entry_with_its_own_handle`.
-//! - **No resource limit**: Eden reserves a thread from the process's limit
-//!   (`ThreadCountMax`) and can fail with `ResultLimitReached`; the resource-limits slice
-//!   adds it.
+//! - **The thread reservation does not wait.** Eden reserves the main thread from the
+//!   process's limit (`ThreadCountMax`) after the state check, failing with
+//!   `ResultLimitReached`, and can wait for a pending release; here the reservation is
+//!   [`Scheduler::create_user_thread`]'s check, after the state check too, and never waits
+//!   ([`crate::resource_limit`], "Divergences from Eden"). Test (in `svc/thread/limit_tests.rs`):
+//!   `starting_a_process_at_its_thread_limit_is_limit_reached_after_its_state`.
 //!
 //! # Divergences from `KProcess::Initialize`
 //!

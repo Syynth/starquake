@@ -61,8 +61,9 @@
 //!   which runs after the handle is reserved, refuses with `ResultLimitReached` when the
 //!   process's `LimitableResource::SessionCountMax` reservation fails and with
 //!   `ResultOutOfSessions` when the port already has `m_max_sessions` sessions; neither error
-//!   can happen here. PROVISIONAL: resource limits are a later kernel slice (kernel spec, "Port
-//!   plan"). Test: `connecting_many_times_never_runs_out_of_sessions`.
+//!   can happen here. PROVISIONAL: the process's resource limit counts no sessions yet
+//!   ([`crate::resource_limit`], "Divergences from Eden"), and ports have no maximum. Test:
+//!   `connecting_many_times_never_runs_out_of_sessions`.
 //!
 //! # Senders wait as scheduler threads (kernel slice 10)
 //!

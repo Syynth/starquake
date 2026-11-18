@@ -10,6 +10,7 @@ use crate::handle::ObjectRefs;
 use crate::id::SlabId;
 use crate::memory::{GUARD_PAGES, fixture};
 use crate::process::{THREAD_LOCAL_REGION_SIZE, VIRTUAL_CORE_COUNT};
+use crate::resource_limit::THREAD_COUNT_LIMIT;
 use crate::result::ResultCode;
 use crate::sched::{CoreId, CoreSignals, FIRST_THREAD_ID};
 use crate::sync::{Timeout, WaitBegun, WaitOrigin, Wake};
@@ -128,6 +129,33 @@ fn a_virtual_core_runs_on_its_physical_core() {
 }
 
 #[test]
+fn the_thread_limit_is_checked_before_the_virtual_core() {
+    // A scheduler with two cores has no physical core for virtual core 3.
+    let mut space = fixture::loaded().0;
+    let mut small = Scheduler::new(2).unwrap();
+    small.add_process(process()).unwrap();
+    let below = THREAD_COUNT_LIMIT - 1;
+    for _ in 0..below {
+        small
+            .create_user_thread(&mut space, process(), &spec(0))
+            .unwrap();
+    }
+    // One below the limit, only the core is wrong.
+    assert_eq!(
+        small.create_user_thread(&mut space, process(), &spec(3)),
+        Err(SvcError::Kernel(KernelError::InvalidCoreId))
+    );
+    small
+        .create_user_thread(&mut space, process(), &spec(0))
+        .unwrap();
+    // At the limit with the core wrong too: the limit is reported.
+    assert_eq!(
+        small.create_user_thread(&mut space, process(), &spec(3)),
+        Err(SvcError::Kernel(KernelError::LimitReached))
+    );
+}
+
+#[test]
 fn a_thread_of_an_unknown_process_is_not_made() {
     let (mut scheduler, mut space) = world();
     let stranger = ProcessId::from_parts(9, 9);
@@ -143,42 +171,103 @@ fn a_thread_of_an_unknown_process_is_not_made() {
 }
 
 #[test]
-fn a_new_process_gets_an_object_its_row_holds_and_a_second_add_makes_none() {
+fn a_new_process_gets_an_object_and_a_resource_limit_its_row_holds_and_a_second_add_makes_none() {
     let mut scheduler = Scheduler::default();
     scheduler.add_process(process()).unwrap();
-    let object = scheduler.process(process()).unwrap().object();
+    let record = scheduler.process(process()).unwrap();
+    let (object, limit) = (record.object(), record.resource_limit());
     assert_eq!(
         scheduler.objects().get(object),
         Ok(Object::Process(process()))
     );
+    // The limit is made after the process's object, as `LoadFromMetadata` makes it after
+    // `KProcess::Create`, and names its process.
+    assert!(limit > object);
+    assert_eq!(
+        scheduler.objects().get(limit),
+        Ok(Object::ResourceLimit(ResourceLimit::of(process())))
+    );
+    assert_eq!(
+        scheduler.resource_limit(process()),
+        Ok(ResourceLimit::of(process()))
+    );
+    // The row holds one reference to each.
     assert_eq!(scheduler.objects().refs(object), 1);
-    assert_eq!(scheduler.objects().len(), 1);
+    assert_eq!(scheduler.objects().refs(limit), 1);
+    assert_eq!(scheduler.objects().len(), 2);
     // A process added twice is refused before a second object is made.
     assert_eq!(scheduler.add_process(process()), Err(SchedError::Corrupt));
-    assert_eq!(scheduler.objects().len(), 1);
-    assert_eq!(scheduler.process(process()).unwrap().object(), object);
+    assert_eq!(scheduler.objects().len(), 2);
+    let record = scheduler.process(process()).unwrap();
+    assert_eq!((record.object(), record.resource_limit()), (object, limit));
 }
 
 #[test]
-fn a_process_whose_object_does_not_fit_gets_no_row() {
-    // Room for exactly one object: the process's fits.
+fn a_process_whose_objects_do_not_fit_gets_no_row_and_leaves_no_object() {
+    // Room for exactly two objects: the process's and its limit's fit.
     let mut room = Scheduler::default();
-    *room.objects_mut() = crate::object::Objects::with_max_slots(1);
+    *room.objects_mut() = crate::object::Objects::with_max_slots(2);
     room.add_process(process()).unwrap();
-    assert_eq!(room.objects().len(), 1);
-    // Room for none: the table refuses, which a guest sees as out of resource, and no row is
-    // added.
-    let mut full = Scheduler::default();
-    *full.objects_mut() = crate::object::Objects::with_max_slots(0);
-    let refused = SchedError::Object(crate::object::ObjectError::Full { max_slots: 0 });
-    assert_eq!(full.add_process(process()), Err(refused));
+    assert_eq!(room.objects().len(), 2);
+    // Room for one, or none: the table refuses, which a guest sees as out of resource, no row
+    // is added, and a process object made before the limit's refusal is released again.
+    for max_slots in [1, 0] {
+        let mut full = Scheduler::default();
+        *full.objects_mut() = crate::object::Objects::with_max_slots(max_slots);
+        let refused = SchedError::Object(crate::object::ObjectError::Full { max_slots });
+        assert_eq!(full.add_process(process()), Err(refused));
+        assert_eq!(
+            full.process(process()),
+            Err(SchedError::UnknownProcess(process()))
+        );
+        assert!(full.objects().is_empty(), "{max_slots}");
+        assert_eq!(
+            SvcError::from(refused),
+            SvcError::Kernel(KernelError::OutOfResource)
+        );
+        // The next attempt, with room, succeeds.
+        *full.objects_mut() = crate::object::Objects::with_max_slots(2);
+        assert_eq!(full.add_process(process()), Ok(()));
+    }
+}
+
+#[test]
+fn a_row_whose_limit_object_is_wrong_is_broken_bookkeeping() {
+    let mut scheduler = Scheduler::default();
+    scheduler.add_process(process()).unwrap();
+    let limit = scheduler.process(process()).unwrap().resource_limit();
+    let other = ProcessId::from_parts(process().index() + 1, process().generation());
+    // A limit of another process.
+    scheduler
+        .objects_mut()
+        .replace(limit, Object::ResourceLimit(ResourceLimit::of(other)))
+        .unwrap();
     assert_eq!(
-        full.process(process()),
-        Err(SchedError::UnknownProcess(process()))
+        scheduler.resource_limit(process()),
+        Err(SchedError::Corrupt)
     );
+    assert_eq!(scheduler.thread_values(process()), Err(SchedError::Corrupt));
+    // Another kind of object.
+    scheduler
+        .objects_mut()
+        .replace(limit, Object::Process(process()))
+        .unwrap();
     assert_eq!(
-        SvcError::from(refused),
-        SvcError::Kernel(KernelError::OutOfResource)
+        scheduler.resource_limit(process()),
+        Err(SchedError::Corrupt)
+    );
+    // Gone.
+    scheduler.objects_mut().release(limit).unwrap();
+    assert_eq!(
+        scheduler.resource_limit(process()),
+        Err(SchedError::Object(crate::object::ObjectError::Stale {
+            id: limit
+        }))
+    );
+    // A process the scheduler has no row for.
+    assert_eq!(
+        scheduler.resource_limit(other),
+        Err(SchedError::UnknownProcess(other))
     );
 }
 

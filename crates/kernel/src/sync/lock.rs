@@ -539,7 +539,8 @@ impl Scheduler {
             | Object::Event(_)
             | Object::ReadableEvent(_)
             | Object::SharedMemory(_)
-            | Object::TransferMemory(_) => Err(KernelError::InvalidHandle.into()),
+            | Object::TransferMemory(_)
+            | Object::ResourceLimit(_) => Err(KernelError::InvalidHandle.into()),
         }
     }
 

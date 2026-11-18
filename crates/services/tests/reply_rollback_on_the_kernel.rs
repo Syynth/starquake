@@ -255,10 +255,10 @@ mod on_the_kernel {
         let answer = rig.send(session, EVENT_SESSION_EVENT);
         assert_eq!(answer.result, KernelError::OutOfHandles.code());
         assert_eq!(answer.copies, Vec::<Handle>::new());
-        // One handle, the session's; the objects are the process, that session and the two
-        // events, which only the server holds now (its creator's references). The new session
-        // went with its handle.
-        assert_eq!(rig.holdings(), (1, 4, vec![1, 1]));
+        // One handle, the session's; the objects are the process, its resource limit, that
+        // session and the two events, which only the server holds now (its creator's
+        // references). The new session went with its handle.
+        assert_eq!(rig.holdings(), (1, 5, vec![1, 1]));
         // The server forgot the session it recorded for the reply, and its interface: its
         // sessions and interfaces are as they were before the request.
         assert_eq!(rig.server_counts(), before);
@@ -266,7 +266,7 @@ mod on_the_kernel {
         let answer = rig.send(session, ONE_EVENT);
         assert_eq!(answer.result, ResultCode::SUCCESS);
         assert_eq!(answer.copies.len(), 1);
-        assert_eq!(rig.holdings(), (2, 5, vec![1, 1, 2]));
+        assert_eq!(rig.holdings(), (2, 6, vec![1, 1, 2]));
     }
 
     #[test]
@@ -281,11 +281,11 @@ mod on_the_kernel {
         // The server keeps the session it opened for the reply, and that session's interface.
         assert_eq!(rig.server_counts(), (sessions + 1, interfaces + 1));
         // Four handles: the port's session, the two events and the new session, each event
-        // held by the server and the caller; and the process's own object.
-        assert_eq!(rig.holdings(), (4, 5, vec![2, 2]));
+        // held by the server and the caller; and the process's own object and resource limit.
+        assert_eq!(rig.holdings(), (4, 6, vec![2, 2]));
         // The new session works: it answers on the same interface.
         let answer = rig.send(answer.copies[1], ONE_EVENT);
         assert_eq!(answer.result, ResultCode::SUCCESS);
-        assert_eq!(rig.holdings(), (5, 6, vec![2, 2, 2]));
+        assert_eq!(rig.holdings(), (5, 7, vec![2, 2, 2]));
     }
 }
