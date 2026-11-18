@@ -284,7 +284,9 @@ impl Scheduler {
     /// decides what destroying each kind means. A session's client end goes and its server is
     /// told (`KClientSession::Destroy`); a thread is destroyed (`KThread::Finalize`); a process
     /// object names a row that outlives it; an event's end, and a shared memory, is its row,
-    /// which the object table has removed already. A transfer memory whose owner's pages are
+    /// which the object table has removed already; a resource limit holds no state of its own
+    /// (`KResourceLimit::Finalize` does nothing), and its process's row keeps a reference to it
+    /// for as long as the row lives. A transfer memory whose owner's pages are
     /// locked has left their unlock to the dispatcher ([`crate::object::Objects::take_unlocks`]),
     /// which holds the owner's address space.
     pub fn tear_down(&mut self, object: ObjectId, kind: Object) -> CallResult<()> {
