@@ -1,7 +1,8 @@
 //! Taking back the handles a handler placed in its sender's table that the sender does not
 //! receive (`dispatch/ipc/placed.rs`, issue #209): a failure at each position, a full table, a
-//! write that faults, a handler that fails or closes the session, a deferred reply, a sender
-//! that ended, and a reply with no failure, which is unchanged. Each asserts the sender's table
+//! write that faults, a handler that fails or closes the session, a deferred reply (one that
+//! is written, one that fails, and one for a session with no deferred request), a sender that
+//! ended, and a reply with no failure, which is unchanged. Each asserts the sender's table
 //! and every object's reference count afterwards.
 
 use starquake_memory::{Fault, GuestMemory};
@@ -558,6 +559,84 @@ fn handles_placed_by_a_handler_that_defers_are_taken_back_when_it_returns() {
         (before.0 + 1, vec![1, 2], before.2)
     );
     world.with_tables(|handles, _| assert_eq!(handles.get(late_handle), Ok(late)));
+}
+
+/// Defers thread A's request on the first server, and has that server place a handle to
+/// `object` in A's table each time it is asked for a reply. Returns A's session handle, its
+/// session and the handles placed.
+fn defer_and_place_on_take_reply(
+    world: &World,
+    object: ObjectId,
+) -> (Handle, ObjectId, Arc<Mutex<Vec<Handle>>>) {
+    let handle = world.session();
+    let session = world.object(handle);
+    world
+        .first
+        .script(Box::new(|_, _, _| Ok(Handled::Deferred)));
+    let (record, _) = world.send(A, handle, &request());
+    assert_eq!(record.outcome, Outcome::Waiting);
+    let placed = Arc::new(Mutex::new(Vec::new()));
+    let keep = Arc::clone(&placed);
+    lock(&world.first.hooks).take_reply = Some(Box::new(move |cx| {
+        lock(&keep).push(cx.insert_handle(object).unwrap());
+    }));
+    (handle, session, placed)
+}
+
+#[test]
+fn handles_placed_by_a_deferred_reply_that_fails_go_with_the_closed_request() {
+    let world = World::new();
+    let objects = server_events(&world, 1);
+    let (_, session, placed) = defer_and_place_on_take_reply(&world, objects[0]);
+    let before = snapshot(&world, &objects);
+    assert_eq!(before.1, [1], "only the server holds the event");
+    // The handler places a handle while it fails to write A's reply: the session closes.
+    lock(&world.first.ready).push_back((session, Err(HandlerError("lost".to_owned()))));
+    world.deliver(&world.first);
+    assert_eq!(
+        world.dispatcher.take_woken(),
+        [Woken {
+            thread: A,
+            core: core_of(A),
+            result: KernelError::SessionClosed.code()
+        }]
+    );
+    let placed = lock(&placed).clone();
+    assert_eq!(placed.len(), 1);
+    // A got no reply, so it keeps none of the handle: gone from its table, and the event is
+    // back to the server's one reference.
+    world.with_tables(|handles, _| assert!(handles.get(placed[0]).is_err()));
+    assert_eq!(snapshot(&world, &objects), before);
+}
+
+#[test]
+fn handles_placed_by_a_reply_to_a_session_with_no_deferred_request_are_taken_back_at_once() {
+    let world = World::new();
+    let objects = server_events(&world, 1);
+    let (_, session, placed) = defer_and_place_on_take_reply(&world, objects[0]);
+    let before = snapshot(&world, &objects);
+    // A reply for an object that has no deferred request: there is no request to carry the
+    // handle placed for it, so it is taken back as the reply is refused.
+    lock(&world.first.ready).push_back((objects[0], Ok(0)));
+    world.deliver(&world.first);
+    assert_eq!(world.dispatcher.take_woken(), Vec::<Woken>::new());
+    let placed = lock(&placed).clone();
+    assert_eq!(placed.len(), 1);
+    world.with_tables(|handles, _| assert!(handles.get(placed[0]).is_err()));
+    assert_eq!(snapshot(&world, &objects), before);
+    // A's request is still deferred, and its own reply still reaches it.
+    lock(&world.first.hooks).take_reply = None;
+    lock(&world.first.ready).push_back((session, Ok(0)));
+    world.deliver(&world.first);
+    assert_eq!(
+        world.dispatcher.take_woken(),
+        [Woken {
+            thread: A,
+            core: core_of(A),
+            result: ResultCode::SUCCESS
+        }]
+    );
+    assert_eq!(snapshot(&world, &objects), before);
 }
 
 #[test]
