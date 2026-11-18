@@ -250,10 +250,11 @@ fn a_list_request_without_its_room_is_refused() {
 }
 
 #[test]
-fn a_new_server_has_no_list_changed_event_and_a_new_manager_no_purchased_event() {
+fn a_new_server_has_no_list_changed_event_and_no_purchased_event() {
     assert_eq!(AddOnContent::default().list_changed_event(), None);
-    assert_eq!(IPurchaseEventManager::default().purchased_event(), None);
+    assert_eq!(AddOnContent::default().purchased_event(), None);
     assert_eq!(Rig::new().family().list_changed_event(), None);
+    assert_eq!(Rig::new().family().purchased_event(), None);
 }
 
 #[test]
@@ -284,23 +285,68 @@ fn both_list_changed_commands_hand_out_one_event_for_every_session() {
 }
 
 #[test]
-fn both_create_commands_hand_out_a_manager_with_its_own_event() {
+fn every_manager_hands_out_the_servers_one_purchased_event() {
+    // Divergence from Eden, which makes an event per manager (module docs, "Where this differs
+    // from Eden").
     let mut rig = Rig::new();
     let managers = [
         rig.manager(CREATE_EC_PURCHASED_EVENT_MANAGER),
         rig.manager(CREATE_PERMANENT_EC_PURCHASED_EVENT_MANAGER),
     ];
     assert_eq!(rig.server.session_count(), 3);
-    let events = managers.map(|manager| rig.event(manager, &request(GET_PURCHASED_EVENT)));
-    assert_ne!(events[0], events[1]);
-    // Asked again, a manager hands out the event it made.
-    for (manager, event) in managers.into_iter().zip(events) {
-        assert_eq!(rig.event(manager, &request(GET_PURCHASED_EVENT)), event);
-        assert_eq!(rig.kernel.signals(event), Some(0));
-    }
-    // Neither is the server's list-changed event.
+    assert_eq!(rig.family().purchased_event(), None);
+    let first = rig.event(managers[0], &request(GET_PURCHASED_EVENT));
+    assert_eq!(rig.family().purchased_event(), Some(first));
+    // The other kind of manager, a manager asked again, and a manager made on another session
+    // of the server all hand out the same event.
+    assert_eq!(rig.event(managers[1], &request(GET_PURCHASED_EVENT)), first);
+    assert_eq!(rig.event(managers[0], &request(GET_PURCHASED_EVENT)), first);
+    let other = rig.kernel.new_object();
+    rig.server.accept(other).unwrap();
+    let reply = rig.send(other, &request(CREATE_EC_PURCHASED_EVENT_MANAGER));
+    let third = rig.object_of(reply.moves[0]);
+    assert_eq!(rig.event(third, &request(GET_PURCHASED_EVENT)), first);
+    assert_eq!(rig.kernel.signals(first), Some(0));
+    // It is not the server's list-changed event, and asking for that one leaves it kept.
     let list_changed = rig.event(rig.session, &request(GET_ADD_ON_CONTENT_LIST_CHANGED_EVENT));
-    assert!(!events.contains(&list_changed));
+    assert_ne!(list_changed, first);
+    assert_eq!(rig.family().purchased_event(), Some(first));
+    assert_eq!(rig.family().list_changed_event(), Some(list_changed));
+}
+
+#[test]
+fn opening_and_closing_managers_makes_one_purchased_event() {
+    // A guest that opens a manager, asks it for its event and closes it, again and again, makes
+    // one event in all: the kernel is asked for none after the first.
+    let mut rig = Rig::new();
+    let manager = rig.manager(CREATE_EC_PURCHASED_EVENT_MANAGER);
+    let first = rig.event(manager, &request(GET_PURCHASED_EVENT));
+    rig.server.close(manager).unwrap();
+    let sessions = rig.server.session_count();
+    for round in 0..8 {
+        let manager = rig.manager(CREATE_PERMANENT_EC_PURCHASED_EVENT_MANAGER);
+        // The kernel refuses to make anything more, so a new event would be an error.
+        rig.kernel.refuse_objects(Some(KernelError::OutOfResource));
+        assert_eq!(
+            rig.event(manager, &request(GET_PURCHASED_EVENT)),
+            first,
+            "{round}"
+        );
+        rig.kernel.refuse_objects(None);
+        rig.server.close(manager).unwrap();
+        assert_eq!(rig.server.session_count(), sessions, "{round}");
+    }
+    // A fresh server under the same refusal cannot make the event: the refusal is real.
+    let mut fresh = Rig::new();
+    let manager = fresh.manager(CREATE_EC_PURCHASED_EVENT_MANAGER);
+    fresh
+        .kernel
+        .refuse_objects(Some(KernelError::OutOfResource));
+    assert_eq!(
+        fresh.send(manager, &request(GET_PURCHASED_EVENT)).result,
+        KernelError::OutOfResource.code()
+    );
+    assert_eq!(fresh.family().purchased_event(), None);
 }
 
 #[test]
@@ -474,7 +520,7 @@ fn the_tables_name_the_commands() {
         assert_eq!(manager.name(Protocol::Cmif, id), Some(name));
     }
     assert_eq!(manager.cmif.len(), names.len());
-    let purchase = IPurchaseEventManager::default().commands();
+    let purchase = IPurchaseEventManager.commands();
     assert_eq!(
         purchase.name(Protocol::Cmif, GET_PURCHASED_EVENT),
         Some("get_purchased_event")

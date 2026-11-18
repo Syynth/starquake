@@ -20,7 +20,7 @@
 //! | | 10 | `GetAddOnContentListChangedEventWithProcessId` | client process id (not read) | the same event |
 //! | | 100 | `CreateEcPurchasedEventManager` | nothing | an [`IPurchaseEventManager`] |
 //! | | 101 | `CreatePermanentEcPurchasedEventManager` | nothing | an [`IPurchaseEventManager`] |
-//! | [`IPurchaseEventManager`] | 2 | `GetPurchasedEvent` | nothing | a copied handle: the manager's purchased event |
+//! | [`IPurchaseEventManager`] | 2 | `GetPurchasedEvent` | nothing | a copied handle: the server's purchased event |
 //! | | 3 | `PopPurchasedProductInfo` | nothing | [`NO_PURCHASED_PRODUCT_INFO_AVAILABLE`] |
 //! | | 4 | `PopPurchasedProductInfoWithUid` | nothing | [`NO_PURCHASED_PRODUCT_INFO_AVAILABLE`] |
 //!
@@ -40,11 +40,12 @@
 //! every `aoc:u` session (`RegisterNamedService("aoc:u", std::make_shared<..>)`), which makes
 //! the event in its constructor, so commands 8 and 10 hand out the same event on every session.
 //! Here it is the server's family state ([`AddOnContent`]), made the first time a command asks
-//! for it. Each [`IPurchaseEventManager`] has an event of its own, as Eden makes one in each
-//! manager's constructor, made here the first time `GetPurchasedEvent` asks for it. Nothing
-//! signals either: Eden never does. A kept event is checked against the kernel before its
-//! handle is copied ([`crate::events::unsignalled_event`]), so a restored id that is not an
-//! event this server made is refused with the kernel's error.
+//! for it. The purchased event is one per server too, kept beside it in [`AddOnContent`] and
+//! made the first time any manager's `GetPurchasedEvent` asks for it, so every
+//! [`IPurchaseEventManager`] hands out the same event (unlike Eden, "Where this differs from
+//! Eden"). Nothing signals either: Eden never does. A kept event is checked against the kernel
+//! before its handle is copied ([`crate::events::unsignalled_event`]), so a restored id that is
+//! not an event this server made is refused with the kernel's error.
 //!
 //! # Left out
 //!
@@ -67,6 +68,20 @@
 //!
 //! # Where this differs from Eden
 //!
+//! - **One purchased event for every manager, kept for the server's life.** Eden makes an event
+//!   in each `IPurchaseEventManager`'s constructor and closes it in its destructor
+//!   (`eden/src/core/hle/service/aoc/purchase_event_manager.cpp`: `service_context.CreateEvent`
+//!   and `CloseEvent`). Here a session object is dropped when its session closes
+//!   ([`Server::close`]), with no way to call the kernel, the services' kernel interface has no
+//!   call that closes an event, and the kernel keeps an event a server made for as long as the
+//!   server lives (its `create_event` in `dispatch/ipc.rs`), so an event per manager would never
+//!   be freed: a guest that opened managers, asked each for its event and
+//!   closed it would fill the kernel's object table. So the event is the server's: made once,
+//!   handed out by every manager, and never freed. Nothing signals it in either, and the guest
+//!   gets only its readable end, which it cannot signal, so no manager can see another's use of
+//!   it; what differs is that two managers' handles name one event where Eden's name two
+//!   (`aoc/tests.rs`: `every_manager_hands_out_the_servers_one_purchased_event`,
+//!   `opening_and_closing_managers_makes_one_purchased_event`).
 //! - **A payload too short for `ListAddOnContent`'s offset and count** is the framework's
 //!   payload error ([`crate::framework::Fault::PayloadTruncated`]), where Eden reads whatever
 //!   the message buffer holds past the payload (`aoc/tests.rs`:
@@ -104,11 +119,12 @@ pub const APPLICATION_RECORD_NOT_FOUND: ResultCode = code(AM_MODULE, 37);
 /// `IPurchaseEventManager`'s pop commands answer.
 pub const NO_PURCHASED_PRODUCT_INFO_AVAILABLE: ResultCode = code(NIM_SHOP_MODULE, 400);
 
-/// The `aoc:u` server's family state: the list-changed event, once a command has returned it
-/// (module docs, "The events").
+/// The `aoc:u` server's family state: the list-changed event and the purchased event, each once
+/// a command has returned it (module docs, "The events").
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AddOnContent {
     list_changed_event: Option<ObjectId>,
+    purchased_event: Option<ObjectId>,
 }
 
 impl AddOnContent {
@@ -117,6 +133,27 @@ impl AddOnContent {
     pub const fn list_changed_event(&self) -> Option<ObjectId> {
         self.list_changed_event
     }
+
+    /// The purchased event every manager hands out, if `GetPurchasedEvent` has returned it yet.
+    /// A new server's has none (module docs, "Where this differs from Eden").
+    #[must_use]
+    pub const fn purchased_event(&self) -> Option<ObjectId> {
+        self.purchased_event
+    }
+}
+
+/// Copies a handle to the server's event that `slot` picks, made the first time
+/// ([`unsignalled_event`]), into `reply`.
+fn reply_with_kept_event(
+    cx: &mut Context<'_>,
+    reply: &mut Reply,
+    slot: fn(&mut AddOnContent) -> &mut Option<ObjectId>,
+) -> Outcome {
+    let kept = *slot(cx.family::<AddOnContent>()?);
+    let event = unsignalled_event(cx, kept)?;
+    *slot(cx.family::<AddOnContent>()?) = Some(event);
+    reply.copy_handle(event);
+    reply.ok()
 }
 
 /// The root interface of an `aoc:u` session (`IAddOnContentManager`). Its state is the server's
@@ -124,20 +161,10 @@ impl AddOnContent {
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct IAddOnContentManager;
 
-/// A purchase event manager (`IPurchaseEventManager`): what commands 100 and 101 hand out.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IPurchaseEventManager {
-    purchased_event: Option<ObjectId>,
-}
-
-impl IPurchaseEventManager {
-    /// The manager's purchased event, if `GetPurchasedEvent` has returned it yet. A new
-    /// manager's has none.
-    #[must_use]
-    pub const fn purchased_event(&self) -> Option<ObjectId> {
-        self.purchased_event
-    }
-}
+/// A purchase event manager (`IPurchaseEventManager`): what commands 100 and 101 hand out. Its
+/// event is the server's ([`AddOnContent::purchased_event`]), so it keeps nothing.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct IPurchaseEventManager;
 
 /// The ids of the commands ported here, per interface (Eden's tables).
 pub mod command {
@@ -233,11 +260,7 @@ impl IAddOnContentManager {
         _req: &Request<'_>,
         reply: &mut Reply,
     ) -> Outcome {
-        let kept = cx.family::<AddOnContent>()?.list_changed_event;
-        let event = unsignalled_event(cx, kept)?;
-        cx.family::<AddOnContent>()?.list_changed_event = Some(event);
-        reply.copy_handle(event);
-        reply.ok()
+        reply_with_kept_event(cx, reply, |state| &mut state.list_changed_event)
     }
 
     /// `CreateEcPurchasedEventManager` and `CreatePermanentEcPurchasedEventManager`. out: a new
@@ -248,24 +271,21 @@ impl IAddOnContentManager {
         _req: &Request<'_>,
         reply: &mut Reply,
     ) -> Outcome {
-        reply.push_session(Box::new(IPurchaseEventManager::default()));
+        reply.push_session(Box::new(IPurchaseEventManager));
         reply.ok()
     }
 }
 
 impl IPurchaseEventManager {
-    /// `GetPurchasedEvent`. out: a copied handle to the manager's purchased event, made the
-    /// first time.
+    /// `GetPurchasedEvent`. out: a copied handle to the server's purchased event, made the first
+    /// time any manager asks (module docs, "Where this differs from Eden").
     fn get_purchased_event(
-        &mut self,
+        _: &mut Self,
         cx: &mut Context<'_>,
         _req: &Request<'_>,
         reply: &mut Reply,
     ) -> Outcome {
-        let event = unsignalled_event(cx, self.purchased_event)?;
-        self.purchased_event = Some(event);
-        reply.copy_handle(event);
-        reply.ok()
+        reply_with_kept_event(cx, reply, |state| &mut state.purchased_event)
     }
 
     /// `PopPurchasedProductInfo` and `PopPurchasedProductInfoWithUid`: always
