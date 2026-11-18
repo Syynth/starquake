@@ -6,6 +6,7 @@
 /// Everything in a `cfg(test)` module, so that the helpers may unwrap as the tests do.
 #[cfg(test)]
 mod on_the_kernel {
+    use std::any::Any;
     use std::sync::{Arc, Mutex};
 
     use starquake_cpu::GuestRegs;
@@ -227,6 +228,21 @@ mod on_the_kernel {
                     (handles.len(), scheduler.objects().len(), refs)
                 })
         }
+
+        /// The `gifts` server's own count of its open sessions and of its live interfaces.
+        fn server_counts(&self) -> (usize, usize) {
+            let mut counts = Vec::new();
+            let parked = self.dispatcher.inspect_handlers(|service, handler| {
+                if service == SERVICE {
+                    let any: &dyn Any = handler;
+                    let server = any.downcast_ref::<Server>().unwrap();
+                    counts.push((server.session_count(), server.interface_count()));
+                }
+            });
+            assert_eq!(parked, 0, "a handler is out of its slot");
+            assert_eq!(counts.len(), 1, "one gifts server");
+            counts[0]
+        }
     }
 
     #[test]
@@ -235,6 +251,7 @@ mod on_the_kernel {
         // placed, and the second event does not fit.
         let rig = Rig::new(3);
         let session = rig.connect();
+        let before = rig.server_counts();
         let answer = rig.send(session, EVENT_SESSION_EVENT);
         assert_eq!(answer.result, KernelError::OutOfHandles.code());
         assert_eq!(answer.copies, Vec::<Handle>::new());
@@ -242,6 +259,9 @@ mod on_the_kernel {
         // events, which only the server holds now (its creator's references). The new session
         // went with its handle.
         assert_eq!(rig.holdings(), (1, 4, vec![1, 1]));
+        // The server forgot the session it recorded for the reply, and its interface: its
+        // sessions and interfaces are as they were before the request.
+        assert_eq!(rig.server_counts(), before);
         // The table has its room back, and a reply that fits keeps what it names.
         let answer = rig.send(session, ONE_EVENT);
         assert_eq!(answer.result, ResultCode::SUCCESS);
@@ -254,9 +274,12 @@ mod on_the_kernel {
         // Room for the port's session, the reply's three handles and one more.
         let rig = Rig::new(5);
         let session = rig.connect();
+        let (sessions, interfaces) = rig.server_counts();
         let answer = rig.send(session, EVENT_SESSION_EVENT);
         assert_eq!(answer.result, ResultCode::SUCCESS);
         assert_eq!(answer.copies.len(), 3);
+        // The server keeps the session it opened for the reply, and that session's interface.
+        assert_eq!(rig.server_counts(), (sessions + 1, interfaces + 1));
         // Four handles: the port's session, the two events and the new session, each event
         // held by the server and the caller; and the process's own object.
         assert_eq!(rig.holdings(), (4, 5, vec![2, 2]));
