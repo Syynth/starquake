@@ -1076,10 +1076,14 @@ impl Server {
     /// The buffers are written first, in the order the method added them; a write the kernel
     /// refuses makes the reply its error, with no handle added and no interface opened.
     /// Handles are added in Eden's order, copies and then moves
-    /// (`eden/src/core/hle/service/hle_ipc.cpp`, `WriteToOutgoingCommandBuffer`). If the caller's
-    /// handle table fills up part-way, the reply is the kernel's error and the handles and
-    /// sessions already added stay, as in Eden (`R_TRY(handle_table.Add(...))` there returns
-    /// part-way too); new domain objects are only added once every handle is in.
+    /// (`eden/src/core/hle/service/hle_ipc.cpp`, `WriteToOutgoingCommandBuffer`). If a handle
+    /// cannot be added part-way (the caller's handle table is full, a service is unknown), the
+    /// reply is the kernel's error and names none of the handles already added; new domain
+    /// objects are only added once every handle is in. The real kernel then takes back the
+    /// handles, and the sessions, that the reply it delivers does not name (kernel
+    /// `dispatch/ipc/placed.rs`), where Eden's `R_TRY(handle_table.Add(...))` leaves them. The
+    /// [`FakeKernel`](super::fake::FakeKernel) delivers no reply, so they stay in its table.
+    /// Test: `tests/reply_rollback_on_the_kernel.rs`.
     fn build_reply(
         &mut self,
         kernel: &mut dyn Kernel,

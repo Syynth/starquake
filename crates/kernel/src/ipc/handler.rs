@@ -48,6 +48,12 @@ pub trait SessionHandler: Send + core::any::Any {
     fn closed(&mut self, session: ObjectId);
 
     /// Handles the request in `message`, sent on `session`, writing the reply over it.
+    ///
+    /// A handle placed in the sender's table through `cx` stays there only if the reply
+    /// written into the sender's message buffer names it in its special header; the kernel
+    /// takes back every other one when the request is settled, and all of them when there is
+    /// no such reply (the handler fails, closes the session or defers). See
+    /// `dispatch/ipc/placed.rs`.
     fn handle(
         &mut self,
         cx: &mut IpcContext<'_>,

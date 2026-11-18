@@ -29,7 +29,8 @@
 //! that defers ([`Handled::Deferred`](crate::ipc::Handled::Deferred)) are taken back when that
 //! call returns: a deferred reply's handles are placed when its reply is written
 //! ([`SessionHandler::take_reply`](crate::ipc::SessionHandler::take_reply)), with that call's
-//! context, as the service framework places them.
+//! context, as the service framework places them. Test:
+//! `rollback::handles_placed_by_a_handler_that_defers_are_taken_back_when_it_returns`.
 //!
 //! # The order, from Eden's reply path
 //!
@@ -45,7 +46,10 @@
 //! handles are taken back in the order they were placed (the framework places copies and then
 //! moves, `eden/src/core/hle/service/hle_ipc.cpp`, `WriteToOutgoingCommandBuffer`), before the
 //! sender is woken with its result, its request's references are released and its events are
-//! recorded (`Dispatcher::settle`).
+//! recorded (`Dispatcher::settle`). Those steps happen under one hold of the kernel lock, so no
+//! other thread sees between them: their order follows Eden's, and only the order in which the
+//! handles are taken back is observable (a taken-back session's server is told in that order).
+//! Test: `rollback::taken_back_sessions_are_torn_down_and_their_servers_told_in_the_order_placed`.
 //!
 //! A taken-back handle is removed as `CloseHandle` removes one
 //! ([`crate::svc::handle::remove_handle`]): when it held its object's last reference, the object
