@@ -89,7 +89,7 @@
 //! resource whose code and stack fill the pool is refused here as Eden refuses it
 //! (`ResultLimitReached` there, [`Error::OutOfRam`] here, before a VM is made). Tests:
 //! `a_system_resource_is_counted_so_a_title_that_eden_refuses_is_refused`,
-//! `a_system_resource_that_fits_with_no_byte_to_spare_loads_and_one_page_more_does_not`.
+//! `a_system_resource_that_fits_with_no_byte_to_spare_fits_and_one_page_more_does_not`.
 
 use starquake_kernel::process::ProcessDescription;
 use starquake_memory::PAGE_SIZE;
@@ -432,8 +432,11 @@ mod tests {
     }
 
     #[test]
-    fn a_system_resource_that_fits_with_no_byte_to_spare_loads_and_one_page_more_does_not() {
-        // The program's own pages and a resource that together are the pool, exactly.
+    fn a_system_resource_that_fits_with_no_byte_to_spare_fits_and_one_page_more_does_not() {
+        // The program's own pages and a resource that together are the pool, exactly. This pins
+        // the fit check only: the charge is generally not whole `SECURE_ALIGNMENT`s, so the
+        // kernel would refuse the resource (`InvalidSize`) when the address space is made, and
+        // this description would not load.
         let program = nro(0);
         let layout = place(&program, IMAGE_BASE, Some(RESCALE)).unwrap();
         let mut description = program.description().clone();
