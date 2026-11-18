@@ -131,14 +131,14 @@
 //!   in `gpu/tests/sparse_map.rs`).
 //!
 //! **Completion.** A job that completes at once signals its slot's event during the request. An
-//! ordered job (102, 212, 213, 215, and a 216 that takes something out) changes the bookkeeping during the request, sends the GPU
-//! its updates and a barrier ([`GpuVmFront::update_vm`], [`GpuVmFront::barrier`]), and replies;
-//! its event is signalled only when the barrier's ticket comes back through the completion
-//! queue and the timer thread's drain takes it (`crate::shared::Shared::drain`). A 102's
-//! device-share lock is released then, by the drain, before the event is signalled, so a title
-//! that reuses the memory once the event fires finds it unlocked (the owner's ruling of
-//! 2026-11-17: the release goes through the completion queue's drain, in its recorded order).
-//! Row 68: NX2 crashed when 102 and 213 completed at once.
+//! ordered job (102, 212, 213, 215, and a 216 that takes something out) changes the bookkeeping
+//! during the request, sends the GPU its updates and a barrier ([`GpuVmFront::update_vm`],
+//! [`GpuVmFront::barrier`]), and replies; its event is signalled only when the barrier's ticket
+//! comes back through the completion queue and the timer thread's drain takes it
+//! (`crate::shared::Shared::drain`). A 102's device-share lock is released then, by the drain,
+//! before the event is signalled, so a title that reuses the memory once the event fires finds it
+//! unlocked (the owner's ruling of 2026-11-17: the release goes through the completion queue's
+//! drain, in its recorded order). Row 68: NX2 crashed when 102 and 213 completed at once.
 //!
 //! # The model
 //!

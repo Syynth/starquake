@@ -308,8 +308,8 @@ fn an_entry_over_bare_region_pages_completes_at_once() {
 }
 
 /// Entries apply in order, each over what the ones before it left: a later map over an earlier
-/// one wins; a removal then a map of the same pages unmaps them all the same, and shows the new
-/// map at the drain; a map then a removal of it leaves the region.
+/// one wins; a removal of two pages then a map of the first replaces the first at once and
+/// unmaps only the second, its net removal; a map then a removal of it leaves the region.
 #[test]
 fn later_entries_apply_over_earlier_ones() {
     let mut s = sparse_ready();
@@ -340,21 +340,24 @@ fn later_entries_apply_over_earlier_ones() {
             FrontCall::Update(
                 AsId(space),
                 VmUpdate::Unmap {
-                    range: page_range(REGION, 2 * PAGE_SIZE)
+                    range: page_range(REGION + PAGE_SIZE, PAGE_SIZE)
                 },
                 None
             ),
             FrontCall::Barrier(Ticket(1)),
         ]
     );
-    assert_eq!(s.rig.at(space, REGION), page_at(MEMORY, GENERIC_16BX2));
-    s.rig.apply();
-    assert_eq!(s.rig.at(space, REGION), None);
-    s.rig.drain();
+    let replaced = page_at(MEMORY + 2 * PAGE_SIZE, GENERIC_16BX2);
+    assert_eq!(s.rig.at(space, REGION), replaced);
     assert_eq!(
-        s.rig.at(space, REGION),
-        page_at(MEMORY + 2 * PAGE_SIZE, GENERIC_16BX2)
+        s.rig.at(space, REGION + PAGE_SIZE),
+        page_at(MEMORY + 3 * PAGE_SIZE, Z16)
     );
+    s.rig.apply();
+    assert_eq!(s.rig.at(space, REGION), replaced);
+    assert_eq!(s.rig.at(space, REGION + PAGE_SIZE), None);
+    s.rig.drain();
+    assert_eq!(s.rig.at(space, REGION), replaced);
     assert_eq!(s.rig.at(space, REGION + PAGE_SIZE), region_page(PAGE_SIZE));
 
     let last = REGION + 7 * PAGE_SIZE;
@@ -367,6 +370,97 @@ fn later_entries_apply_over_earlier_ones() {
             .records
             .contains_key(&last)
     );
+}
+
+/// A removal is a page a mapping covered before the batch and none covers after it, not a cut
+/// within the batch: a map then a removal of the same bare region page changes nothing, so the
+/// batch completes at once, sends the GPU nothing, signals during the request, and the region's
+/// page shows throughout.
+#[test]
+fn a_map_then_back_over_a_bare_page_completes_at_once() {
+    let mut s = sparse_ready();
+    let space = s.space;
+    let page = REGION + 3 * PAGE_SIZE;
+    let before = (s.signals(), s.rig.front.calls().len());
+    let reply = s.batch(&[Entry::mapped(page, 1, s.handle, 0), Entry::back(page, 1)]);
+    assert_eq!(result_of(&reply), ResultCode::SUCCESS);
+    assert_eq!(s.out(2), [6, UNTOUCHED]);
+    assert_eq!(s.signals(), before.0 + 1);
+    assert_eq!(s.rig.front.calls().len(), before.1);
+    assert_eq!(s.rig.gpu().gpu_memory().pending_jobs(), 0);
+    assert_eq!(s.rig.at(space, page), region_page(3 * PAGE_SIZE));
+    s.rig.apply();
+    assert_eq!(s.rig.at(space, page), region_page(3 * PAGE_SIZE));
+    assert_eq!(s.rig.drain(), []);
+    assert_eq!(s.signals(), before.0 + 1);
+    assert_eq!(s.rig.at(space, page), region_page(3 * PAGE_SIZE));
+}
+
+/// A removal then a map of the same pages of a live mapping is a replacement: published at
+/// once, as a 211 over a live mapping is, with no unmap and no job.
+#[test]
+fn a_back_then_map_over_a_mapping_replaces_it_at_once() {
+    let mut s = sparse_ready();
+    let space = s.space;
+    s.batch(&[Entry::mapped(REGION, 1, s.handle, 0)]);
+    assert_eq!(s.rig.at(space, REGION), page_at(MEMORY, GENERIC_16BX2));
+    let before = (s.signals(), s.rig.front.calls().len());
+    let reply = s.batch(&[
+        Entry::back(REGION, 1),
+        Entry::mapped(REGION, 1, s.handle, 2 * PAGE_SIZE),
+    ]);
+    assert_eq!(result_of(&reply), ResultCode::SUCCESS);
+    assert_eq!(s.signals(), before.0 + 1);
+    assert_eq!(s.rig.front.calls().len(), before.1);
+    assert_eq!(s.rig.gpu().gpu_memory().pending_jobs(), 0);
+    assert_eq!(
+        s.rig.at(space, REGION),
+        page_at(MEMORY + 2 * PAGE_SIZE, GENERIC_16BX2)
+    );
+}
+
+/// Two entries with no handle whose ranges are apart, each over its own mapping, take both out:
+/// an unmap for each, one barrier, and no mapping left after the drain.
+#[test]
+fn two_disjoint_removals_unmap_both() {
+    let mut s = sparse_ready();
+    let space = s.space;
+    let far = REGION + 4 * PAGE_SIZE;
+    s.batch(&[
+        Entry::mapped(REGION, 1, s.handle, 0),
+        Entry::mapped(far, 1, s.handle, 0),
+    ]);
+    let reply = s.batch(&[Entry::back(REGION, 1), Entry::back(far, 1)]);
+    assert_eq!(result_of(&reply), ResultCode::SUCCESS);
+    let calls = s.rig.front.calls();
+    assert_eq!(
+        calls[calls.len() - 3..],
+        [
+            FrontCall::Update(
+                AsId(space),
+                VmUpdate::Unmap {
+                    range: page_range(REGION, PAGE_SIZE)
+                },
+                None
+            ),
+            FrontCall::Update(
+                AsId(space),
+                VmUpdate::Unmap {
+                    range: page_range(far, PAGE_SIZE)
+                },
+                None
+            ),
+            FrontCall::Barrier(Ticket(1)),
+        ]
+    );
+    s.rig.finish();
+    assert!(
+        s.rig.gpu().gpu_memory().spaces[&AsId(space)]
+            .records
+            .is_empty()
+    );
+    assert_eq!(s.rig.at(space, REGION), region_page(0));
+    assert_eq!(s.rig.at(space, far), region_page(4 * PAGE_SIZE));
 }
 
 /// An entry with no handle sends its unmap only where the mapping shows: the shim inside it stays
@@ -512,6 +606,27 @@ fn header_checks_answer_in_prs_order() {
     s.place(&[bad]);
     let words = batch_words(one, 0, OUT_AT, 1, space, size, 0, 0);
     assert_eq!(result_of(&s.rig.send_on(s.worker, &words)), invalid_size);
+}
+
+/// The out buffer holds at least a byte per entry: with two entries, one byte is `InvalidSize`,
+/// signalled, the out buffer untouched and nothing mapped; two bytes succeed.
+#[test]
+fn an_out_buffer_short_of_the_count_is_refused() {
+    let mut s = sparse_ready();
+    let entries = [
+        Entry::mapped(REGION, 1, s.handle, 0),
+        Entry::mapped(REGION + PAGE_SIZE, 1, s.handle, 0),
+    ];
+    let before = s.signals();
+    assert_eq!(
+        result_of(&s.batch_with(&entries, 1)),
+        code(KernelError::InvalidSize)
+    );
+    assert_eq!(s.signals(), before + 1);
+    assert_eq!(s.out(2), [STALE, STALE]);
+    assert_eq!(s.rig.at(s.space, REGION), region_page(0));
+    assert_eq!(result_of(&s.batch_with(&entries, 2)), ResultCode::SUCCESS);
+    assert_eq!(s.out(3), [6, 6, STALE]);
 }
 
 /// [`MAX_ENTRIES`] entries are accepted, one more refused.
@@ -805,16 +920,12 @@ fn a_batch_that_takes_out_is_busy_at_the_job_limit() {
     assert_eq!(only_maps.apply(&front, event), SparseCompletion::AtOnce);
 }
 
-/// A batch that would leave more than [`MAX_PIECES`] pieces is `InvalidCurrentMemory` and
-/// changes nothing; one that reaches the limit exactly fits; one that replaces a mapping adds
-/// nothing and fits at the limit; one that splits a mapping adds two.
-#[test]
-fn a_batch_is_bounded_at_the_piece_limit() {
+/// A bookkeeping one piece below [`MAX_PIECES`]: an address space with a registration of
+/// [`MEMORY_SIZE`], a three-page region at [`REGION`], then one-page regions after it.
+fn one_below_the_piece_limit() -> (GpuMemory, FakeFront, AsId, u32) {
     let (mut gpu, front) = bare();
     let space = gpu.create_address_space(&front).unwrap();
     let handle = register_bare(&mut gpu, page_range(MEMORY, MEMORY_SIZE));
-    let event = ObjectId::from_parts(4, 5);
-    // A three-page region first, then one-page regions after it up to one below the limit.
     let wide = SparseRequest {
         last: REGION + 3 * PAGE_SIZE - 1,
         ..sparse_at(space, 0, 1)
@@ -824,6 +935,16 @@ fn a_batch_is_bounded_at_the_piece_limit() {
         gpu.create_sparse_region(&sparse_at(space, n, 1)).unwrap();
     }
     assert_eq!(gpu.pieces(space), MAX_PIECES - 1);
+    (gpu, front, space, handle)
+}
+
+/// A batch that would leave more than [`MAX_PIECES`] pieces is `InvalidCurrentMemory` and
+/// changes nothing; one that reaches the limit exactly fits; one that replaces a mapping adds
+/// nothing and fits at the limit; one that splits a mapping adds two.
+#[test]
+fn a_batch_is_bounded_at_the_piece_limit() {
+    let (mut gpu, front, space, handle) = one_below_the_piece_limit();
+    let event = ObjectId::from_parts(4, 5);
     let three = request_at(REGION, 3, handle);
     gpu.check_sparse_map(space, &[three])
         .unwrap()
@@ -860,6 +981,47 @@ fn a_batch_is_bounded_at_the_piece_limit() {
         .apply(&front, event);
     assert!(matches!(completion, SparseCompletion::Ordered(_)));
     assert_eq!(gpu.pieces(space), MAX_PIECES);
+}
+
+/// The piece bound (check 4) answers before room for a job (check 5): at [`MAX_PIECES`] pieces
+/// with [`MAX_PENDING_JOBS`] jobs waiting, a removal that splits a mapping is
+/// `InvalidCurrentMemory`; one that differs only in adding no piece is `Busy`. Neither changes
+/// anything.
+#[test]
+fn the_piece_bound_answers_before_busy() {
+    let (mut gpu, front, space, handle) = one_below_the_piece_limit();
+    let event = ObjectId::from_parts(4, 5);
+    gpu.check_sparse_map(space, &[request_at(REGION, 3, handle)])
+        .unwrap()
+        .apply(&front, event);
+    assert_eq!(gpu.pieces(space), MAX_PIECES);
+    let modify = ModifyRequest {
+        space,
+        first: REGION,
+        last: REGION + 3 * PAGE_SIZE - 1,
+        kind: 6,
+        fallback: 6,
+    };
+    for _ in 0..MAX_PENDING_JOBS {
+        gpu.modify_kind(&front, &modify, event).unwrap();
+    }
+    assert_eq!(gpu.pending_jobs(), MAX_PENDING_JOBS);
+    assert_eq!(gpu.pieces(space), MAX_PIECES);
+    let records = gpu.spaces[&space].records.clone();
+    // Both faults: the middle page back splits the mapping, and there is no room for its job.
+    let middle = request_at(REGION + PAGE_SIZE, 1, 0);
+    assert_eq!(
+        gpu.check_sparse_map(space, &[middle]).err(),
+        Some(KernelError::InvalidCurrentMemory)
+    );
+    // The job fault alone: the first page back only shortens the mapping.
+    let first = request_at(REGION, 1, 0);
+    assert_eq!(
+        gpu.check_sparse_map(space, &[first]).err(),
+        Some(KernelError::Busy)
+    );
+    assert_eq!(gpu.spaces[&space].records, records);
+    assert_eq!(gpu.pending_jobs(), MAX_PENDING_JOBS);
 }
 
 /// A bookkeeping with a batch's mapping and its waiting removal saves, restores, and completes

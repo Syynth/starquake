@@ -29,8 +29,11 @@
 //!    applied, `InvalidCurrentMemory` (PR: `updated.Ranges().size() > 65536` is
 //!    `InsufficientMemory`, which 216 answers `InvalidCurrentMemory`; PR counts only the native
 //!    sparse ranges, here every piece counts, as for 211);
-//! 5. the batch takes something out and there is no room for another job, `Busy`
-//!    ([`MAX_PENDING_JOBS`](super::MAX_PENDING_JOBS); PR completes at once and has no such check).
+//! 5. the batch takes something out (its net removals, "Applying a batch") and there is no room
+//!    for another job, `Busy` ([`MAX_PENDING_JOBS`](super::MAX_PENDING_JOBS); PR completes at
+//!    once and has no such check).
+//!
+//! Check 4 answers before check 5 when both fail (`the_piece_bound_answers_before_busy`).
 //!
 //! PR's `NativeRemap` also refuses a space whose VM is not set up in the native ABI
 //! (`!m_extended_abi || !vm.initialised`) and a handle that is not allocated or belongs to
@@ -50,15 +53,19 @@
 //!   region's GPU-only pages show again (PR: `gmmu->MapSparse`).
 //!
 //! **Maps at once, removals in order**, as everywhere in the bookkeeping (`super`'s module docs,
-//! "What the table shows"). The parts of mappings an entry with no handle takes out are sent to
-//! the GPU as `VmUpdate::Unmap`s where they are the top layer (where the syncpoint shim is not),
-//! then a barrier, and those pages are held until the barrier's ticket is drained; the job's
-//! event is signalled then ([`SparseCompletion::Ordered`]). A part taken out and mapped again by
-//! a later entry of the same batch is unmapped all the same, and its new mapping shows at the
-//! drain. A batch that takes nothing out (only entries with handles, or entries with no handle
-//! over pages already the region's) completes at once ([`SparseCompletion::AtOnce`]). A part
-//! an entry with a handle replaces is not a removal: it is published at once, as a 211 over a
-//! live mapping is.
+//! "What the table shows"). A batch's removals are its net effect, not the cuts its entries make
+//! on the way: the pages a 211 mapping covered before the batch and no mapping covers once the
+//! whole batch is applied. They are sent to the GPU as `VmUpdate::Unmap`s where they are the top
+//! layer (where the syncpoint shim is not), then a barrier, and those pages are held until the
+//! barrier's ticket is drained; the job's event is signalled then
+//! ([`SparseCompletion::Ordered`]). A batch with no removals completes at once
+//! ([`SparseCompletion::AtOnce`]): one of entries with handles only, one whose entries with no
+//! handle lie over pages that were the region's before the batch (a map then a removal of a
+//! bare region page included: `a_map_then_back_over_a_bare_page_completes_at_once`), and one
+//! that takes a mapping's pages out and maps them again in a later entry. A part of a mapping
+//! that another mapping covers after the batch is a replacement, not a removal: it is published
+//! at once, as a 211 over a live mapping is (`a_back_then_map_over_a_mapping_replaces_it_at_once`;
+//! PR's `NativeSparseMappingTable::Replace` likewise leaves no hole).
 //!
 //! **The selected kinds.** One byte per entry, in order (PR writes `entries[i].fallback_kind`
 //! after `NativeRemap`): for an entry with a handle the selected kind [`kind::select`] gives; for
@@ -71,7 +78,8 @@
 //! map, over the union of the ranges), applies the entries to the copy, and keeps the result for
 //! [`SparseAdmission::apply`] to put in place: every mapping copied is cut or replaced by the
 //! batch. So what is copied is the batch's entries and the mappings it changes, never the
-//! address space's other mappings. Beyond that, the piece count walks the address space's
+//! address space's other mappings. The removals compare what the copy covers before and after,
+//! each merged once and walked together. Beyond that, the piece count walks the address space's
 //! mappings once ([`GpuMemory::pieces`] is a sum over their runs), as a 211 and a 212 do.
 
 use std::collections::BTreeMap;
@@ -83,8 +91,8 @@ use starquake_kernel::result::KernelError;
 use super::super::kind;
 use super::super::sparse_map::{SparseMap, SparseMapRequest, decode};
 use super::{
-    AsId, GpuMemory, GpuVmFront, Layer, MAX_PIECES, Record, Space, in_range, page_range, trimmed,
-    union,
+    AsId, GpuMemory, GpuVmFront, Layer, MAX_PIECES, Record, Space, in_range, page_range, subtract,
+    trimmed, union,
 };
 
 /// How a 216 completes ([`SparseAdmission::apply`]).
@@ -166,26 +174,15 @@ struct Checked {
     selected: u8,
 }
 
-/// The batch applied to a copy of the mappings its ranges overlap: the copy afterwards, and the
-/// parts of mappings its entries with no handle took out.
-struct Applied {
-    records: BTreeMap<u64, Record>,
-    removed: Vec<(u64, u64)>,
-}
-
 /// Applies `checked`, in order, to `records` (the mappings the batch's ranges overlap, copied):
-/// each entry cuts the mappings it overlaps, and one with a handle maps in their place.
-fn apply_entries(mut records: BTreeMap<u64, Record>, checked: &[Checked]) -> Applied {
-    let mut removed = Vec::new();
+/// each entry cuts the mappings it overlaps, and one with a handle maps in their place. The copy
+/// afterwards.
+fn apply_entries(mut records: BTreeMap<u64, Record>, checked: &[Checked]) -> BTreeMap<u64, Record> {
     for Checked { entry, backend, .. } in checked {
         let (start, end) = (entry.range.start(), entry.range.end());
         let (cut, kept) = trimmed(&records, start, end);
         for at in cut {
-            if let Some(record) = records.remove(&at)
-                && backend.is_none()
-            {
-                removed.push((at.max(start), record.end.min(end)));
-            }
+            records.remove(&at);
         }
         records.extend(kept);
         if let Some(kind) = *backend {
@@ -198,7 +195,12 @@ fn apply_entries(mut records: BTreeMap<u64, Record>, checked: &[Checked]) -> App
             records.insert(start, record);
         }
     }
-    Applied { records, removed }
+    records
+}
+
+/// What `records` (non-overlapping, keyed by start) cover, merged ([`union`]'s form).
+fn extents(records: &BTreeMap<u64, Record>) -> Vec<(u64, u64)> {
+    union(records.iter().map(|(&start, r)| (start, r.end)).collect())
 }
 
 impl GpuMemory {
@@ -237,17 +239,22 @@ impl GpuMemory {
         }
         let replaced: Vec<u64> = copied.keys().copied().collect();
         let spans_before: usize = copied.values().map(|r| r.spans.len()).sum();
-        let Applied { records, removed } = apply_entries(copied, &checked);
+        let covered_before = extents(&copied);
+        let records = apply_entries(copied, &checked);
         let spans_after: usize = records.values().map(|r| r.spans.len()).sum();
         let after = (self.pieces_of(held) + spans_after).saturating_sub(spans_before);
         if after > MAX_PIECES {
             return Err(refused);
         }
+        // The batch's net removals: what a mapping covered before it and none covers after it.
+        let covered_after = extents(&records);
         let mut updates = Vec::new();
-        for (low, high) in union(removed) {
-            for (from, to) in self.shown(held, Layer::Mapping, low, high) {
-                if let Some(range) = page_range(from, to) {
-                    updates.push((space, VmUpdate::Unmap { range }));
+        for (low, high) in covered_before {
+            for (gone, gone_end) in subtract(low, high, &covered_after) {
+                for (from, to) in self.shown(held, Layer::Mapping, gone, gone_end) {
+                    if let Some(range) = page_range(from, to) {
+                        updates.push((space, VmUpdate::Unmap { range }));
+                    }
                 }
             }
         }
