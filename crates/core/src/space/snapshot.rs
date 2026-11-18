@@ -55,6 +55,20 @@
 //! Tests: `a_snapshot_exactly_at_the_bound_is_decoded_and_one_byte_more_is_refused` and
 //! `a_snapshot_of_every_page_of_ram_is_within_the_bound`.
 //!
+//! The byte bound alone does not bound what decoding keeps: a [`Contents::Zero`] is one byte
+//! in the snapshot and a whole [`Contents`] once decoded, and a shared run with no pages two
+//! bytes and a whole run, so bytes at the bound could decode to some twenty-four times their
+//! length. The body is therefore decoded twice. The first pass keeps no entry: it counts the
+//! entries of the three lists ([`Entries`]), each shared page, each given-back run and each
+//! private page as one, and a shared run with no pages as one too (check 5 refuses it). A body
+//! that holds more than [`max_entries`] of the RAM, one for each of its pages, is refused
+//! ([`PagesError::TooManyEntries`]) before the second pass keeps anything. A snapshot that
+//! save writes is within it: each page of RAM is in at most one entry, and each given-back run
+//! is at least a page. What the second pass keeps is then at most one fixed-size entry for
+//! each page of RAM, and the bytes of the pages, which the byte bound holds. Tests:
+//! `a_snapshot_of_as_many_entries_as_ram_has_pages_is_kept_and_one_more_is_refused` and
+//! `a_snapshot_at_the_byte_bound_made_of_zero_pages_is_refused_by_the_count`.
+//!
 //! # Checks
 //!
 //! A snapshot is a file and is not trusted. [`AddressSpace::begin_restore`] checks, in this
@@ -64,17 +78,20 @@
 //!    ([`PagesError::NotFresh`]).
 //! 2. The length ([`PagesError::TooLarge`], above).
 //! 3. The header and the body's encoding ([`starquake_kernel::snapshot::decode`]: header,
-//!    magic, version, body, trailing bytes; [`PagesError::Format`]).
-//! 4. `next` is page aligned and not below RAM's start ([`PagesError::Next`]), and not past
+//!    magic, version, body, trailing bytes; [`PagesError::Format`]), decoded without keeping
+//!    any entry (above, "The bound").
+//! 4. The number of entries, at most [`max_entries`] ([`PagesError::TooManyEntries`], above).
+//!    Only then is the body decoded and kept.
+//! 5. `next` is page aligned and not below RAM's start ([`PagesError::Next`]), and not past
 //!    RAM's end ([`PagesError::PastRam`]).
-//! 5. Each shared run in turn ([`PagesError::Shared`], first failing check of the first failing
+//! 6. Each shared run in turn ([`PagesError::Shared`], first failing check of the first failing
 //!    run, in [`RunFault`]'s order): whole pages that do not wrap ([`RunFault::Shape`]), inside
 //!    the RAM handed out (from RAM's start to `next`: [`RunFault::Ram`]), starting at or after
 //!    the end of the one before ([`RunFault::Order`]), and each page's bytes a page long
 //!    ([`RunFault::Length`]).
-//! 6. Each given-back run in turn ([`PagesError::Free`]): the same shape, RAM and order checks,
+//! 7. Each given-back run in turn ([`PagesError::Free`]): the same shape, RAM and order checks,
 //!    then that it shares no page with a shared run ([`RunFault::Shared`]).
-//! 7. Each private page in turn ([`PagesError::Page`], in [`PageFault`]'s order): both
+//! 8. Each private page in turn ([`PagesError::Page`], in [`PageFault`]'s order): both
 //!    addresses page aligned and the page inside the address space the tables translate
 //!    ([`PageFault::Shape`]), above the one before ([`PageFault::Order`]), its RAM inside the
 //!    RAM handed out ([`PageFault::Ram`]) and in no run ([`PageFault::Run`]), not an earlier
@@ -84,11 +101,16 @@
 //! [`PagesError::Ram`], and the pages written before it are zeroed again. Only then is
 //! anything recorded in the address space, so a refused restore leaves it new.
 //!
-//! [`AddressSpace::save_pages`] runs checks 4 to 7 on what it is about to write (a failure is a
+//! [`AddressSpace::save_pages`] runs checks 5 to 8 on what it is about to write (a failure is a
 //! bug here), and first that no restore is unfinished ([`PagesError::Unfinished`]) and that each
 //! alias page maps a page the snapshot keeps ([`PagesError::Alias`]).
 //!
 //! # Restoring
+//!
+//! Between [`AddressSpace::begin_restore`] and [`AddressSpace::finish_restore`], a page that
+//! waits for its mapping and lies inside one reads, from the host, as the bytes the snapshot
+//! restored into its RAM; the read backs nothing, and the page still waits. Test:
+//! `a_waiting_page_reads_as_its_restored_bytes_and_stays_waiting`.
 //!
 //! The order is [`restore`]'s: the kernel's object table first (it holds the shared memories);
 //! then [`AddressSpace::begin_restore`] on a new address space, which records the shared and
@@ -121,9 +143,10 @@
 //!   unmapped is in no list (it is never handed out again), so a gap is accepted.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::marker::PhantomData;
 use std::sync::Arc;
 
-use serde::de::{self, Visitor};
+use serde::de::{self, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use starquake_kernel::id::ObjectId;
 use starquake_kernel::memory::{AddressSpace as KernelSpace, SharedMemory, SnapshotError};
@@ -183,16 +206,22 @@ const MAX_CONTENTS: u64 = 1 + varint_len(PAGE_SIZE) + PAGE_SIZE;
 /// its first page) and its contents.
 const MAX_PER_PAGE: u64 = 2 * MAX_VARINT_U64 + MAX_CONTENTS;
 
+/// The most entries a guest-pages snapshot of an address space with guest RAM `ram` can hold:
+/// one for each of its pages (module docs, "The bound", for what an entry is).
+pub(crate) fn max_entries(ram: BackingRange) -> u64 {
+    ram.size() / PAGE_SIZE
+}
+
 /// The most bytes a guest-pages snapshot of an address space with guest RAM `ram` can take
 /// (module docs, "The bound"), saturating.
 pub(crate) fn max_snapshot_bytes(ram: BackingRange) -> u64 {
-    (ram.size() / PAGE_SIZE)
+    max_entries(ram)
         .saturating_mul(MAX_PER_PAGE)
         .saturating_add(MAX_HEADER + MAX_FIXED_BODY)
 }
 
 /// The bytes of one page, as the snapshot holds them: `postcard` writes them as a byte string
-/// (their count, then the bytes). Any length decodes; check 5 and 7 refuse one that is not a
+/// (their count, then the bytes). Any length decodes; checks 6 and 8 refuse one that is not a
 /// page ([`RunFault::Length`], [`PageFault::Length`]).
 #[derive(Clone, PartialEq, Eq)]
 struct PageBytes(Vec<u8>);
@@ -301,6 +330,152 @@ struct Body {
     pages: Vec<SavedPage>,
 }
 
+/// How many entries one item of a snapshot's lists counts for (module docs, "The bound").
+trait Entries {
+    /// Its entries.
+    fn entries(&self) -> u64;
+}
+
+/// One of a snapshot's lists decoded and counted, its items dropped as they are read: what the
+/// first pass keeps (module docs, "The bound").
+struct Counted<T> {
+    /// The entries its items count for, in all (saturating).
+    entries: u64,
+    /// What it is a list of.
+    items: PhantomData<T>,
+}
+
+impl<'de, T: Deserialize<'de> + Entries> Deserialize<'de> for Counted<T> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        /// Reads a list, one item at a time.
+        struct Count<T>(PhantomData<T>);
+
+        impl<'de, T: Deserialize<'de> + Entries> Visitor<'de> for Count<T> {
+            type Value = Counted<T>;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a list of a guest pages snapshot")
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Counted<T>, A::Error> {
+                let mut entries = 0_u64;
+                while let Some(item) = seq.next_element::<T>()? {
+                    entries = entries.saturating_add(item.entries());
+                }
+                Ok(Counted {
+                    entries,
+                    items: PhantomData,
+                })
+            }
+        }
+
+        // `Vec`'s own `Deserialize` reads a sequence too: the two read the same bytes.
+        deserializer.deserialize_seq(Count(PhantomData))
+    }
+}
+
+/// A page's bytes read and not kept: [`PageBytes`] for the first pass.
+struct SkippedBytes;
+
+impl<'de> Deserialize<'de> for SkippedBytes {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        /// Reads a byte string, borrowing it.
+        struct Skip;
+
+        impl Visitor<'_> for Skip {
+            type Value = SkippedBytes;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("the bytes of a page")
+            }
+
+            fn visit_bytes<E: de::Error>(self, _: &[u8]) -> Result<SkippedBytes, E> {
+                Ok(SkippedBytes)
+            }
+        }
+
+        // What `PageBytes` asks for, so that the two read the same bytes.
+        deserializer.deserialize_byte_buf(Skip)
+    }
+}
+
+/// [`Contents`] for the first pass: the same variants, in the same order.
+#[derive(Deserialize)]
+enum ContentsCount {
+    /// [`Contents::Zero`].
+    Zero,
+    /// [`Contents::Bytes`].
+    Bytes(SkippedBytes),
+}
+
+impl Entries for ContentsCount {
+    fn entries(&self) -> u64 {
+        1
+    }
+}
+
+/// [`SharedRun`] for the first pass: the same fields, in the same order.
+#[derive(Deserialize)]
+struct SharedRunCount {
+    /// [`SharedRun::base`].
+    _base: u64,
+    /// [`SharedRun::pages`].
+    pages: Counted<ContentsCount>,
+}
+
+impl Entries for SharedRunCount {
+    /// Its pages, and one for a run with none.
+    fn entries(&self) -> u64 {
+        self.pages.entries.max(1)
+    }
+}
+
+impl Entries for FreeRun {
+    fn entries(&self) -> u64 {
+        1
+    }
+}
+
+/// [`SavedPage`] for the first pass: the same fields, in the same order.
+#[derive(Deserialize)]
+struct SavedPageCount {
+    /// [`SavedPage::va`].
+    _va: u64,
+    /// [`SavedPage::pa`].
+    _pa: u64,
+    /// [`SavedPage::contents`].
+    _contents: ContentsCount,
+}
+
+impl Entries for SavedPageCount {
+    fn entries(&self) -> u64 {
+        1
+    }
+}
+
+/// [`Body`] for the first pass: the same fields, in the same order, its lists counted.
+#[derive(Deserialize)]
+struct BodyCount {
+    /// [`Body::next`].
+    _next: u64,
+    /// [`Body::shared`].
+    shared: Counted<SharedRunCount>,
+    /// [`Body::free`].
+    free: Counted<FreeRun>,
+    /// [`Body::pages`].
+    pages: Counted<SavedPageCount>,
+}
+
+impl BodyCount {
+    /// The entries of the three lists, in all (saturating).
+    fn entries(&self) -> u64 {
+        self.shared
+            .entries
+            .saturating_add(self.free.entries)
+            .saturating_add(self.pages.entries)
+    }
+}
+
 /// What went wrong with one run ([`PagesError::Shared`], [`PagesError::Free`]), in the order
 /// they are checked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -365,6 +540,17 @@ pub(crate) enum PagesError {
     /// The header or the body's encoding.
     #[error(transparent)]
     Format(#[from] FormatError),
+    /// The body holds more entries than guest RAM has pages (module docs, "The bound").
+    #[error(
+        "the guest pages snapshot holds {count} pages and given-back runs, more than the {limit} \
+         pages of this guest RAM"
+    )]
+    TooManyEntries {
+        /// The entries it holds.
+        count: u64,
+        /// [`max_entries`] of the RAM.
+        limit: u64,
+    },
     /// `next` is not page aligned, or lies below RAM's start.
     #[error("the end of the guest RAM handed out, {next:#x}, is not a page of guest RAM")]
     Next {
@@ -439,7 +625,7 @@ pub(crate) enum PagesError {
     },
 }
 
-/// What [`Body::check`] found: the pages of RAM in each run, for check 7.
+/// What [`Body::check`] found: the pages of RAM in each run, for check 8.
 struct Runs {
     /// Each shared and given-back run, by first address: one past its last address.
     all: BTreeMap<u64, u64>,
@@ -456,7 +642,7 @@ impl Runs {
 }
 
 impl Body {
-    /// Checks 4 to 7 of the module docs, against guest RAM `ram`.
+    /// Checks 5 to 8 of the module docs, against guest RAM `ram`.
     fn check(&self, ram: BackingRange) -> Result<Runs, PagesError> {
         let next = self.next;
         if !next.is_multiple_of(PAGE_SIZE) || next < ram.base() {
@@ -652,6 +838,11 @@ impl<M: GuestMemory> AddressSpace<M> {
         let size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
         if size > limit {
             return Err(PagesError::TooLarge { size, limit });
+        }
+        let count = decode::<BodyCount>(FORMAT, bytes)?.entries();
+        let most = max_entries(self.ram);
+        if count > most {
+            return Err(PagesError::TooManyEntries { count, limit: most });
         }
         let body: Body = decode(FORMAT, bytes)?;
         body.check(self.ram)?;

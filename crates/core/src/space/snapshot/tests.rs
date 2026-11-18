@@ -234,9 +234,9 @@ struct Scene {
 
 /// A synthetic guest: code loaded and made executable, a stack, four pages of heap (the guest
 /// stores to the first, loads from the second, aliases the third at the top of the stack
-/// region and writes through the alias, and leaves the fourth untouched), physical memory written by the host, a shared memory
-/// mapped and written by the service and the guest, one only the service holds, and one given
-/// back after it.
+/// region and writes through the alias, and leaves the fourth untouched), physical memory
+/// written by the host, a shared memory mapped and written by the service and the guest, one
+/// only the service holds, and one given back after it.
 fn scene() -> Scene {
     let space = Arc::new(rig());
     let mut kernel =
@@ -465,6 +465,50 @@ fn a_run_given_back_while_a_flush_was_owed_comes_back_reusable() {
 }
 
 #[test]
+fn runs_given_back_out_of_address_order_are_saved_in_it_and_come_back_reusable() {
+    // Three runs, low to high. The middle one is reusable (given back with no flush owed, and
+    // made reusable by the next shared memory, which it is too small for); the high one and
+    // then the low one are given back while a flush is owed, so they wait, high first, and a
+    // waiting run lies both above and below the reusable one.
+    let space = rig();
+    let low = space.allocate_shared(PAGE_SIZE).unwrap();
+    let middle = space.allocate_shared(PAGE_SIZE).unwrap();
+    let high = space.allocate_shared(PAGE_SIZE).unwrap();
+    space.release_shared(middle).unwrap();
+    space.allocate_shared(2 * PAGE_SIZE).unwrap();
+    space.map(LOW, PAGE_SIZE, Perms::ReadWrite).unwrap();
+    assert_eq!(space.touch(LOW, Access::Write), Touch::Backed);
+    space.unmap(LOW, PAGE_SIZE).unwrap();
+    assert!(space.tables.has_pending_flushes());
+    space.release_shared(high).unwrap();
+    space.release_shared(low).unwrap();
+    assert_eq!(space.shadow().released, [high, low]);
+    assert_eq!(
+        space.shadow().reusable.iter().collect::<Vec<_>>(),
+        [(&middle.base(), &middle.end())]
+    );
+
+    let restored = rig();
+    restored
+        .begin_restore(&space.save_pages().unwrap())
+        .unwrap();
+    restored.finish_restore().unwrap();
+    assert_eq!(restored.shadow().released, []);
+    assert_eq!(
+        restored.shadow().reusable.iter().collect::<Vec<_>>(),
+        [
+            (&low.base(), &low.end()),
+            (&middle.base(), &middle.end()),
+            (&high.base(), &high.end()),
+        ]
+    );
+    // Each is handed out again, the first in address order first.
+    for run in [low, middle, high] {
+        assert_eq!(restored.allocate_shared(PAGE_SIZE), Ok(run));
+    }
+}
+
+#[test]
 fn an_alias_of_restored_pages_needs_no_new_ram() {
     // Every page of RAM handed out: the alias's source pages have their RAM from the snapshot,
     // so mapping the alias asks for none.
@@ -597,6 +641,51 @@ fn a_restored_page_gets_its_mappings_permission_and_its_ram() {
     let mut byte = [0];
     space.read(LOW + 7, &mut byte).unwrap();
     assert_eq!(byte, [1]);
+}
+
+#[test]
+fn a_waiting_page_reads_as_its_restored_bytes_and_stays_waiting() {
+    // Two waiting pages, of 1s and 2s, and a mapping of the first only: between the begin and
+    // the finish, a read of the mapped one sees its bytes, and one that reaches the unmapped
+    // one faults there and reads nothing.
+    let space = rig();
+    space
+        .begin_restore(&bytes_of(&private(&[LOW, LOW + PAGE_SIZE])))
+        .unwrap();
+    space.map(LOW, PAGE_SIZE, Perms::Read).unwrap();
+    let mut bytes = [0xFF; 2];
+    space.read(LOW + PAGE_SIZE - 2, &mut bytes).unwrap();
+    assert_eq!(bytes, [1, 1]);
+    let mut across = [0xFF; 4];
+    assert_eq!(
+        space.read(LOW + PAGE_SIZE - 2, &mut across),
+        Err(Fault {
+            address: LOW + PAGE_SIZE
+        })
+    );
+    assert_eq!(across, [0xFF; 4]);
+    // The read backed nothing: both still wait, and neither has a table entry.
+    assert_eq!(
+        space
+            .shadow()
+            .pending
+            .iter()
+            .map(|(v, p)| (*v, *p))
+            .collect::<Vec<_>>(),
+        [(LOW, RAM_BASE), (LOW + PAGE_SIZE, RAM_BASE + PAGE_SIZE)]
+    );
+    assert!(space.shadow().backed.is_empty());
+    assert!(matches!(
+        space.tables.walk(LOW),
+        Err(WalkError::Unmapped { .. })
+    ));
+    // Mapped, the second reads as its bytes too, across the two.
+    space.map(LOW + PAGE_SIZE, PAGE_SIZE, Perms::Read).unwrap();
+    space.read(LOW + PAGE_SIZE - 2, &mut across).unwrap();
+    assert_eq!(across, [1, 1, 2, 2]);
+    space.finish_restore().unwrap();
+    space.read(LOW + PAGE_SIZE - 2, &mut across).unwrap();
+    assert_eq!(across, [1, 1, 2, 2]);
 }
 
 #[test]
@@ -808,6 +897,119 @@ fn a_snapshot_of_every_page_of_ram_is_within_the_bound() {
         .unwrap();
     restored.finish_restore().unwrap();
     assert_eq!(ram_bytes(&restored), ram_bytes(&space));
+}
+
+/// A snapshot whose lists hold, in all, `entries` entries of [`max_entries`]' count: a shared
+/// run of `shared_pages` zero pages, `empty_runs` shared runs with no pages, `free` given-back
+/// runs and `private` private pages; `next` is not a page, so a body that passes the count is
+/// refused by the next check ([`PagesError::Next`]). None of it need lie in RAM: the count
+/// comes before the checks of what the lists hold.
+fn counted(shared_pages: usize, empty_runs: usize, free: usize, private: usize) -> Body {
+    let mut shared = vec![SharedRun {
+        base: RAM_BASE,
+        pages: vec![Contents::Zero; shared_pages],
+    }];
+    shared.extend((0..empty_runs).map(|_| SharedRun {
+        base: RAM_BASE,
+        pages: Vec::new(),
+    }));
+    Body {
+        next: RAM_BASE + 1,
+        shared,
+        free: vec![
+            FreeRun {
+                base: RAM_BASE,
+                size: PAGE_SIZE,
+            };
+            free
+        ],
+        pages: vec![
+            SavedPage {
+                va: LOW,
+                pa: RAM_BASE,
+                contents: Contents::Zero,
+            };
+            private
+        ],
+    }
+}
+
+#[test]
+fn a_snapshot_of_as_many_entries_as_ram_has_pages_is_kept_and_one_more_is_refused() {
+    // The budget split over every kind of entry: shared pages, a shared run with no pages
+    // (which counts as one), given-back runs and private pages. One more of any kind is
+    // refused before anything else of the body is checked.
+    let limit = max_entries(ram());
+    assert_eq!(limit, RAM_PAGES);
+    let quarter = usize::try_from(limit / 4).unwrap();
+    let rest = usize::try_from(limit).unwrap() - 3 * quarter - 1;
+    let at_limit = counted(quarter, 1, quarter, quarter + rest);
+    assert_eq!(
+        begin(&at_limit),
+        Err(PagesError::Next { next: RAM_BASE + 1 })
+    );
+    let over = Err(PagesError::TooManyEntries {
+        count: limit + 1,
+        limit,
+    });
+    for (name, body) in [
+        (
+            "a shared page",
+            counted(quarter + 1, 1, quarter, quarter + rest),
+        ),
+        (
+            "a shared run with no pages",
+            counted(quarter, 2, quarter, quarter + rest),
+        ),
+        (
+            "a given-back run",
+            counted(quarter, 1, quarter + 1, quarter + rest),
+        ),
+        (
+            "a private page",
+            counted(quarter, 1, quarter, quarter + rest + 1),
+        ),
+    ] {
+        assert!(
+            u64::try_from(bytes_of(&body).len()).unwrap() <= max_snapshot_bytes(ram()),
+            "{name}"
+        );
+        assert_eq!(begin(&body), over, "{name}");
+    }
+}
+
+#[test]
+fn a_snapshot_at_the_byte_bound_made_of_zero_pages_is_refused_by_the_count() {
+    // The largest number of entries the byte bound lets through: one shared run of zero pages,
+    // one byte each. Each would be kept as a whole `Contents`; the count refuses them first.
+    let header = bytes_of(&counted(0, 0, 0, 0)).len();
+    let room = usize::try_from(max_snapshot_bytes(ram())).unwrap() - header;
+    // The run's page count grows from one varint byte to three; leave room for it.
+    let pages = room - 2;
+    let body = counted(pages, 0, 0, 0);
+    let bytes = bytes_of(&body);
+    assert!(u64::try_from(bytes.len()).unwrap() <= max_snapshot_bytes(ram()));
+    assert_eq!(
+        rig().begin_restore(&bytes),
+        Err(PagesError::TooManyEntries {
+            count: u64::try_from(pages).unwrap(),
+            limit: max_entries(ram()),
+        })
+    );
+}
+
+#[test]
+fn the_encoding_is_checked_before_the_count() {
+    // Both faults: too many entries, and a byte after the body.
+    let mut bytes = bytes_of(&counted(usize::try_from(RAM_PAGES).unwrap() + 1, 0, 0, 0));
+    bytes.push(0);
+    assert_eq!(
+        rig().begin_restore(&bytes),
+        Err(PagesError::Format(FormatError::TrailingBytes {
+            name: "guest pages",
+            count: 1
+        }))
+    );
 }
 
 #[test]
@@ -1369,6 +1571,11 @@ fn every_error_reads_as_plain_words() {
             PagesError::TooLarge { size: 10, limit: 9 },
             "the guest pages snapshot is 10 bytes, more than the 9 bytes one of this guest RAM \
              can take",
+        ),
+        (
+            PagesError::TooManyEntries { count: 9, limit: 8 },
+            "the guest pages snapshot holds 9 pages and given-back runs, more than the 8 pages \
+             of this guest RAM",
         ),
         (
             PagesError::Next { next: 0x1001 },

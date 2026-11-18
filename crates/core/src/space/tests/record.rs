@@ -111,6 +111,9 @@ fn each_mutation_the_kernel_asks_for_is_one_map_event() {
     // Handing out and giving back pages maps nothing: neither is recorded.
 }
 
+/// What the mapper answers a call.
+type Answer = Result<(), MapperError>;
+
 #[test]
 fn a_refused_mutation_records_nothing() {
     let space = Arc::new(space());
@@ -120,21 +123,46 @@ fn a_refused_mutation_records_nothing() {
     mapper.map(LOW, PAGE_SIZE, Perms::ReadWrite).unwrap();
     assert_eq!(seen.take().len(), 1);
     let not_shared = BackingRange::new(RAM_BASE, PAGE_SIZE).unwrap();
-    let refusals: [(&str, Result<(), MapperError>); 5] = [
-        ("map", mapper.map(LOW, PAGE_SIZE, Perms::Read)),
-        ("unmap", mapper.unmap(FAR, PAGE_SIZE)),
-        ("protect", mapper.protect(FAR, PAGE_SIZE, Perms::Read)),
+    // Each refusal is the address space's own, for the reason the call is refused, in the
+    // words the kernel hears ([`refused`]).
+    let refusal = |error: SpaceError| -> Answer { Err(MapperError::Refused(error.to_string())) };
+    let refusals: [(&str, Answer, Answer); 5] = [
+        (
+            "map",
+            mapper.map(LOW, PAGE_SIZE, Perms::Read),
+            refusal(MapError::AlreadyMapped { va: LOW }.into()),
+        ),
+        (
+            "unmap",
+            mapper.unmap(FAR, PAGE_SIZE),
+            refusal(MapError::NotMapped { va: FAR }.into()),
+        ),
+        (
+            "protect",
+            mapper.protect(FAR, PAGE_SIZE, Perms::Read),
+            refusal(MapError::NotMapped { va: FAR }.into()),
+        ),
         (
             "map_shared",
             mapper.map_shared(FAR, not_shared, Perms::Read),
+            refusal(SpaceError::NotShared {
+                base: RAM_BASE,
+                size: PAGE_SIZE,
+            }),
         ),
         (
             "map_alias",
             mapper.map_alias(FAR, FAR + PAGE_SIZE, PAGE_SIZE, Perms::ReadWrite),
+            refusal(
+                MapError::NotMapped {
+                    va: FAR + PAGE_SIZE,
+                }
+                .into(),
+            ),
         ),
     ];
-    for (name, result) in refusals {
-        assert!(result.is_err(), "{name}");
+    for (name, result, expected) in refusals {
+        assert_eq!(result, expected, "{name}");
     }
     assert_eq!(seen.take(), [], "a refusal recorded an event");
 }

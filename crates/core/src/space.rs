@@ -143,7 +143,8 @@
 //! one in the new address space; and a page the snapshot restored that waits for its mapping
 //! (`Shadow::pending`) is backed with its own RAM, not new RAM, by whatever backs it first
 //! (an alias of it, a touch, a host write) or, for the rest, by
-//! [`AddressSpace::finish_restore`].
+//! [`AddressSpace::finish_restore`]. Until then a host read of it, where it is mapped, reads
+//! its restored bytes from that RAM, and backs nothing.
 //!
 //! PROVISIONAL, and what replaces each part:
 //!
@@ -159,9 +160,10 @@
 //!   touches more ends its run as an emulator error.
 //! - **A shared memory can be mapped only in the address space that handed it out** (or that
 //!   a snapshot restored it into, which records the run the same way): its run is recorded in
-//!   that [`AddressSpace`]'s shadow, and its pages are taken from that address space's RAM. System-wide guest RAM and one record of the shared runs (the execution
-//!   model's backing pools), instead of per-`AddressSpace` ones, replace it, so that any
-//!   process's address space can map any shared memory.
+//!   that [`AddressSpace`]'s shadow, and its pages are taken from that address space's RAM.
+//!   System-wide guest RAM and one record of the shared runs (the execution model's backing
+//!   pools), instead of per-`AddressSpace` ones, replace it, so that any process's address
+//!   space can map any shared memory.
 //! - **An alias backs its whole source at once**, however large: the RAM a guest can force is
 //!   bounded by the source, which the kernel has already counted against the pool, and guest
 //!   RAM refuses what it cannot hold ([`SpaceError::OutOfRam`], checked before anything is
@@ -821,7 +823,9 @@ impl<M: GuestMemory> AddressSpace<M> {
         }
     }
 
-    /// Where the bytes at `va` are, and how many bytes from there on are in the same page.
+    /// Where the bytes at `va` are, and how many bytes from there on are in the same page: a
+    /// mapped page that waits for its restored RAM (`Shadow::pending`) is in that RAM, which
+    /// holds what the snapshot restored.
     fn resolve(shadow: &Shadow, va: u64) -> Option<(Piece, u64)> {
         let page = page_of(va);
         let offset = va - page;
@@ -829,7 +833,10 @@ impl<M: GuestMemory> AddressSpace<M> {
             Piece::Backed(pa + offset)
         } else {
             shadow.mapping(page)?;
-            Piece::Unbacked
+            shadow
+                .pending
+                .get(&page)
+                .map_or(Piece::Unbacked, |pa| Piece::Backed(pa + offset))
         };
         Some((piece, PAGE_SIZE - offset))
     }
