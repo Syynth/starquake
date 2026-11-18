@@ -397,6 +397,27 @@ The title now gets past root 305 into nvsrv. It stops on eight ctrl-gpu and nvho
 | awaiting the owner | **216's completion and limit.** A 216 that takes something out completes after the GPU's barrier (PR completes at once), and 216 answers Busy at the job limit (PR has no such check) | #185 | graphics-server |
 | proposed | **A guess to confirm with a trace:** a part a 216 batch takes out and maps again in a later entry is a hole until the drain | #185 | area:gsv |
 
+### From wave 32 (ledger: #22)
+
+Landed: #300 (ctrl-gpu and nvhost-gpu ioctls and ctrl-gpu events, PR #304), #192 (present and pacing, PR #305), #221 (the run's date from the host, recorded, PR #302) and #208 (a process's system resource charged to its pool, PR #303).
+
+The title gets one ioctl further: nvsrv now logs only nvhost-gpu `ZCullBind` (`0xc010480b`), then the run waits until the time limit with no frame drawn. That is filed as #306 (in wave 33), which also covers the ioctls after it that have a reference handler.
+
+| Status | Proposal | Why | Suggested |
+|---|---|---|---|
+| proposed | **A services-framework call that frees a kernel event**, alongside the session-close hook proposed in wave 31. ctrl-gpu's and nvhost-gpu's events are never freed, so open and close cycles grow the kernel's object count; a closed vi2 session without 202 leaves its clients in the present table (bounded by `MAX_PRESENT_CLIENTS = 128`, a guess). Fold #243's process-end release in as a comment | #300, #192 | area:services |
+| proposed | **A run setting or command-line option that selects `Pacing::FenceWait`**; core always uses the buffer queue today | #192 | area:core |
+| proposed | **End-to-end tests that run in CI:** booting a program with a system resource and checking GetInfo 7 and 21; a whole-run replay whose recording lacks the date reading (core has no whole-run replay yet); persisting the `Env` recording | #208, #221 | area:core |
+| proposed | **Small hardening:** `EnvError`'s Display text names Rust variants ("the replay asked for WallClock"), not plain words; `GetProcessId` should share `GetInfo`'s `ProcessRecord::object` check; only the application pool's size is modelled; GetInfo 17 is still zero (no tracking of the secure resource's page use) | #221, #208 | area:kernel |
+| proposed | **For the GPU front (#12):** a destroyed image's memory can be released while its frame is queued or shown (PR keeps the backing until the buffer retires); nothing reads `SetErrorNotifier` or `SetPreemptionModes` state yet | #192, #300 | comment on #12 |
+| proposed | **Watch `machine::tests::graphics::a_held_page_request_is_answered_at_the_bound_by_the_timer_thread`**: it failed once while two nextest runs shared the machine, then passed 15 of 15 alone | #192's fix | area:core |
+| awaiting the owner | **The graphics-server spec paragraph after the nvsrv device table is out of date.** It still lists ctrl-gpu `QueryEvent` 1 and 2 as deferred, and says nvhost-gpu's events are made at open, where the code makes them at first query. #304 made ctrl-gpu's at open, as the spec says | #300 | graphics-server |
+| awaiting the owner | **`SetPreemptionModes` (`0xc008481f`)**: #304 ports PR #4588's refusals; NX2 sends it to its catch-all (echo and Success), which decision 8's "the larger" could be read as picking | #300 | graphics-server |
+| awaiting the owner | **Whether the vsync clock runs while a present waits.** #305 keeps it running, which changes slice 12's stop rule and its `DeadlineWithoutListeners` restore check; the spec does not say | #192 | graphics-server |
+| awaiting the owner | **The bound on a held 229 reply** under the fence-wait fallback | #192 | graphics-server |
+| awaiting the owner | **`--date <seconds>`**: #302 adds it because #221 asks the command line to pin a date; the observability spec's headless contract has no date flag. Its name, format (whole seconds since the epoch) and range are the owner's call. Also, the one reading at boot is taken as the RTC at uptime zero, where Eden subtracts the uptime at the moment it reads | #221 | observability |
+| awaiting the owner | **Horizon's "64-bit" loader check** is the bitwise test `flags & AddressSpace64Bit39`, which also passes 36-bit and 32-bit-no-alias spaces; #303 follows the code, not the comment. Also, Horizon takes application/applet from ACI0's program type while Eden's GetInfo 23 uses the ACID pool, and the two can disagree | #208 | area:kernel |
+
 ## House-rule candidates
 
 Rules distilled from review findings. A vetted rule moves into `CLAUDE.md`; until then it is
@@ -592,3 +613,14 @@ passed to build agents as a provisional rule for the next wave.
 - A restored counter that is later incremented is bounded so the next step cannot overflow, tested at `u64::MAX`.
 - A test a doc names as pinning a behaviour exercises that exact path, and its comments describe what it sends.
 - A constant taken from one reference while related bounds come from the other has its dependent bounds derived from it, or the coupling is flagged as an owner question.
+
+
+### From wave 32 (ledger: #22)
+
+- Every documented check or error order gets a test with both faults present at once, mutation-checked by swapping the order.
+- A relation check is tested with cases where the two similar inputs differ, so a mutation that substitutes one for the other fails.
+- Every error path after a partial side effect is listed and tested; test doubles get fault-injection knobs such as "fail from the Nth call".
+- Code reachable only through an environment the production wiring cannot vary has its decision extracted into a pure function, or is documented as unreachable.
+- Replay-sensitive code records the same notes as live, and a test feeds a live run's notes into a replay and asserts identical outputs.
+- A design departure that narrows compatibility or drops a spec-listed field is flagged as an owner question, not landed as the rule's outcome.
+- User-facing numeric inputs are validated against the downstream bound, and end-to-end tests pin dates, seeds and other environment inputs.
