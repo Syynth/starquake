@@ -33,6 +33,7 @@ use starquake_trace::{EnvCall, EnvError, HostIoReply, HostIoRequest, HostNanos};
 use super::*;
 use crate::hle::graphics::KernelHost;
 
+mod video;
 mod vsync;
 
 /// Where nvsrv's ioctl arguments and their out buffers go: the third page, in and out halves.
