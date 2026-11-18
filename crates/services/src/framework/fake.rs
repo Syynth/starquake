@@ -33,6 +33,17 @@
 //! `a_session_opened_before_the_table_filled_stays_open` (`framework/tests/handles.rs`); the
 //! kernel's behaviour is pinned by `tests/reply_rollback_on_the_kernel.rs`.
 //!
+//! # A restore's questions
+//!
+//! The fake answers a server's restore ([`RestoredKernel`]) from what it made: an event is the
+//! service's when [`FakeKernel::set_current_service`] named that service as it was made (the
+//! kernel notes the server handling the request), and a shared memory is one it made. It
+//! differs from the kernel's [`Dispatcher`](starquake_kernel::dispatch::Dispatcher) in one way:
+//! nothing the fake makes ever goes, so every id it made stays live, where the kernel's stay
+//! live while a reference is held (a server keeps its creator's reference to what it made, so
+//! the answers agree for those). The parity of the two is pinned by
+//! `the_fake_and_the_kernel_answer_a_restore_alike` (`tests/am_on_the_kernel.rs`).
+//!
 //! [`FakeHost`] puts a [`FakeKernel`] and several servers together, so that a session one
 //! service hands out for another ([`Kernel::connect`]) can be sent requests.
 //!
@@ -67,8 +78,8 @@ use starquake_kernel::ipc::message::Current;
 use starquake_kernel::memory::shared::span_within;
 use starquake_kernel::memory::testing::{device_share_token, standalone_shared_pages};
 use starquake_kernel::memory::{
-    DeviceShareToken, SharedPages, SvcPermission, TransferMemory, is_shared_memory_permission,
-    shared_memory_size,
+    DeviceShareToken, SharedMemory, SharedPages, SvcPermission, TransferMemory,
+    is_shared_memory_permission, shared_memory_size,
 };
 use starquake_kernel::result::{KernelError, ResultCode, SvcResult};
 use starquake_trace::{
@@ -76,6 +87,7 @@ use starquake_trace::{
 };
 
 use super::kernel::Kernel;
+use super::restored::RestoredKernel;
 use super::server::{Handled, Server, ServerError};
 
 /// The generation of every object id the fake mints.
@@ -118,6 +130,9 @@ pub struct FakeKernel {
     refs: RefCounts,
     minted: u32,
     events: BTreeMap<ObjectId, u32>,
+    /// The service whose server made each of the events: the current one
+    /// ([`FakeKernel::set_current_service`]) when it was made.
+    event_makers: BTreeMap<ObjectId, ServiceId>,
     /// The events made that are signalled now: a signal adds one, a clear takes it out.
     signalled: BTreeSet<ObjectId>,
     /// How often the caller asked to end its process.
@@ -167,6 +182,7 @@ impl FakeKernel {
             refs: RefCounts::new(),
             minted: 0,
             events: BTreeMap::new(),
+            event_makers: BTreeMap::new(),
             signalled: BTreeSet::new(),
             ends: 0,
             hooked: BTreeMap::new(),
@@ -212,7 +228,8 @@ impl FakeKernel {
     }
 
     /// Says which service's server handles the requests that follow: sessions made with
-    /// [`Kernel::create_session`] are on it.
+    /// [`Kernel::create_session`] are on it, and events made with [`Kernel::create_event`] and
+    /// [`Kernel::create_hooked_event`] are its ([`RestoredKernel::is_service_readable_event`]).
     pub fn set_current_service(&mut self, service: ServiceId) {
         self.current = service;
     }
@@ -434,6 +451,7 @@ impl Kernel for FakeKernel {
         }
         let event = self.new_object();
         self.events.insert(event, 0);
+        self.event_makers.insert(event, self.current);
         Ok(event)
     }
 
@@ -610,6 +628,22 @@ impl Kernel for FakeKernel {
             .ok_or(KernelError::InvalidCurrentMemory)?
             .copy_from_slice(data);
         Ok(())
+    }
+}
+
+/// The objects this fake made, as a restore asks about them (module docs, "A restore's
+/// questions").
+impl RestoredKernel for FakeKernel {
+    /// True for an id [`Kernel::create_event`] made, or the readable end
+    /// [`Kernel::create_hooked_event`] made, while `service` was the current service.
+    fn is_service_readable_event(&self, service: ServiceId, event: ObjectId) -> bool {
+        self.events.contains_key(&event) && self.event_makers.get(&event) == Some(&service)
+    }
+
+    /// A shared memory [`Kernel::create_shared_memory`] made, with its pages and permission.
+    fn shared_memory(&self, object: ObjectId) -> Option<SharedMemory> {
+        let (pages, permission) = self.shared.get(&object)?;
+        SharedMemory::new(pages.backing(), *permission).ok()
     }
 }
 

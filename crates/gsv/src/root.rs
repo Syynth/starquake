@@ -173,6 +173,44 @@
 //! ([`crate::video::camera`]); one built without answers them with the stubs. Before the
 //! bootstrap is complete each is logged and accepted, as the native commands are.
 //!
+//! # Restoring
+//!
+//! A snapshot is a file, so a restore believes nothing in the [`RootState`]. In this order, the
+//! first that fails refusing the snapshot and leaving the server as it was:
+//!
+//! 1. The relations between its fields, as it decodes ([`RootStateError`]; refused with
+//!    `SnapshotError::Decode(postcard::Error::SerdeDeCustom)`), 204's two events being two
+//!    objects among them (`a_saved_state_no_command_reaches_is_refused`).
+//! 2. Beside the kernel the server is restored beside (`Server::restore_beside`), 204's
+//!    events: each kept is a live readable event the root's server made, under the number it is
+//!    known by, as 204 makes them (`Context::create_event` returns an event's readable end), the
+//!    first before the second; the first that fails is refused with
+//!    [`SnapshotError::FamilyObject`] naming it (`each_syncpoint_event_restores_only_as_one_the_root_made`,
+//!    `the_first_syncpoint_event_is_checked_first`, `a_root_s_own_events_restore_and_carry_on`,
+//!    in `root/tests/restore.rs`). The server keeps kernel objects, so `Server::restore`, which
+//!    has no kernel, refuses its snapshots with [`SnapshotError::NeedsKernel`].
+//! 3. The gpu, syncpt, nvsrv, vi2 and video server numbers, in that order, as the run's wiring
+//!    ([`SnapshotError::FamilyWiring`]; "The family sessions"). They come after the events
+//!    (`the_events_are_checked_before_the_server_numbers`): the events are checked by the
+//!    server's check, which runs before the family loads, and the numbers as it loads
+//!    ([`RootFamily`]).
+//!
+//! Not checked here:
+//!
+//! - **The bootstrap's applet resource user id, and the other recorded words.** The root does
+//!   not check them live either ("Where this differs from the references"); none names a kernel
+//!   object.
+//! - **Which of the root's own events is which.** The kernel notes that the root's server made
+//!   an event, not which command made it, so a snapshot may swap 204's two events, or name in
+//!   them events the root made for another purpose (the shared page's answer event, in a root
+//!   built with one, is the page's: [`crate::shared::page`] checks it). 204 then hands out the
+//!   swapped or borrowed events.
+//! - **Whether the events' signalled state agrees with anything.** It is the kernel's, saved with
+//!   the kernel; 204's events are never signalled here.
+//! - **Which server made an event, across snapshots.** The kernel's IPC table, which holds that
+//!   note, has no snapshot of its own yet, so today a root restores only beside the tables it
+//!   ran on (`starquake_services::framework`'s `restored` module).
+//!
 //! # Where this differs from the references
 //!
 //! Each row is pinned by the test named, in `root/tests.rs`:
@@ -205,8 +243,8 @@ use serde::{Deserialize, Serialize};
 use starquake_kernel::id::ObjectId;
 use starquake_services::commands;
 use starquake_services::framework::{
-    Context, Family, Fault, Interfaces, NOT_SUPPORTED, Outcome, Reply, Request, Server,
-    SnapshotError, UnknownPolicy,
+    Context, Family, Fault, Interfaces, NOT_SUPPORTED, Outcome, Reply, Request, RestoredKernel,
+    Server, SnapshotError, UnknownPolicy,
 };
 use starquake_trace::ServiceId;
 
@@ -1228,6 +1266,40 @@ fn root_server_over(family: RootFamily, policy: UnknownPolicy) -> Server {
         .with_root(|| Box::new(GsvRoot))
         .with_interfaces(root_interfaces())
         .with_family(family)
+        .with_family_objects(syncpoint_event_objects)
+}
+
+/// The restore check of the kernel objects a [`RootState`] keeps (module docs, "Restoring"):
+/// each of 204's events it keeps is a live readable event the root's server made, as
+/// `syncpoint_events` makes them, the first before the second.
+fn syncpoint_event_objects(
+    saved: &RootState,
+    kernel: &dyn RestoredKernel,
+    service: ServiceId,
+) -> Result<(), &'static str> {
+    let (first, second) = match saved.syncpoint_events {
+        SyncpointEvents::None => (None, None),
+        SyncpointEvents::One(first) => (Some(first), None),
+        SyncpointEvents::Both(first, second) => (Some(first), Some(second)),
+    };
+    let kept = [
+        (
+            first,
+            "its root's first syncpoint event is not a live readable event its server made",
+        ),
+        (
+            second,
+            "its root's second syncpoint event is not a live readable event its server made",
+        ),
+    ];
+    for (event, refusal) in kept {
+        if let Some(event) = event
+            && !kernel.is_service_readable_event(service, event)
+        {
+            return Err(refusal);
+        }
+    }
+    Ok(())
 }
 
 /// What every root session shares (the root server's family): the [`RootState`], and in a run
@@ -1238,7 +1310,8 @@ fn root_server_over(family: RootFamily, policy: UnknownPolicy) -> Server {
 /// [`RootState`]'s own `serde` form, and loading one keeps the handle. Loading refuses a
 /// snapshot whose gpu, syncpt, nvsrv or vi2 server number is not the run's
 /// ([`SnapshotError::FamilyWiring`]), in that order, before it changes anything (module docs,
-/// "The family sessions").
+/// "The family sessions"). The root's server checks 204's events against the kernel before
+/// loading begins (module docs, "Restoring").
 pub struct RootFamily {
     state: RootState,
     shared: Option<Arc<Shared>>,

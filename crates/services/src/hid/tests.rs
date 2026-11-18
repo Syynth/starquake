@@ -440,7 +440,7 @@ fn a_restored_server_hands_out_the_saved_memory() {
     let saved = rig.server.save().unwrap();
 
     let mut restored = server(UnknownPolicy::Strict);
-    restored.restore(&saved).unwrap();
+    restored.restore_beside(&saved, &rig.kernel).unwrap();
     assert_eq!(restored.save().unwrap(), saved);
     rig.server = restored;
     // The restored resource answers with the same memory, and the restored table gives the
@@ -457,11 +457,12 @@ fn a_restored_server_hands_out_the_saved_memory() {
 #[test]
 fn a_restored_table_holds_at_most_the_rows_the_table_has_room_for() {
     let mut kernel = FakeKernel::new(0).unwrap();
-    // A server snapshot whose table has `rows` rows, made without the server's own commands.
-    let mut saved = |rows: usize| {
+    // A server snapshot whose table has `rows` rows, each with an input shared memory of its
+    // own, made without the server's own commands.
+    let saved = |kernel: &mut FakeKernel, rows: usize| {
         let mut resources = AppletResources::default();
         for aruid in 0..u64::try_from(rows).unwrap() {
-            resources.memories.insert(aruid, kernel.new_object());
+            resources.memories.insert(aruid, input_memory(kernel));
         }
         let server = Server::new(NAME, UnknownPolicy::Strict)
             .with_root(|| Box::new(IHidServer))
@@ -471,17 +472,17 @@ fn a_restored_table_holds_at_most_the_rows_the_table_has_room_for() {
     };
 
     // Exactly at the limit: restored as it was saved.
-    let (bytes, at_limit) = saved(ARUID_INDEX_MAX);
+    let (bytes, at_limit) = saved(&mut kernel, ARUID_INDEX_MAX);
     let mut restored = server(UnknownPolicy::Strict);
-    assert_eq!(restored.restore(&bytes), Ok(()));
+    assert_eq!(restored.restore_beside(&bytes, &kernel), Ok(()));
     assert_eq!(restored.family::<AppletResources>(), Some(&at_limit));
 
     // One past it: refused, and the server keeps the table it had.
-    let (bytes, _) = saved(ARUID_INDEX_MAX + 1);
+    let (bytes, _) = saved(&mut kernel, ARUID_INDEX_MAX + 1);
     // postcard reports a failed `try_from` as a custom error and drops its text, so the error
     // itself is checked on the same data.
     assert_eq!(
-        restored.restore(&bytes),
+        restored.restore_beside(&bytes, &kernel),
         Err(SnapshotError::Decode(postcard::Error::SerdeDeCustom))
     );
     assert_eq!(restored.family::<AppletResources>(), Some(&at_limit));
@@ -503,4 +504,174 @@ fn a_restored_table_holds_at_most_the_rows_the_table_has_room_for() {
             ARUID_INDEX_MAX + 1
         )
     );
+}
+
+// ----- restoring the table's memories ---------------------------------------------------------
+
+/// An input shared memory made on `kernel` as `CreateAppletResource` makes one.
+fn input_memory(kernel: &mut FakeKernel) -> ObjectId {
+    kernel
+        .create_shared_memory(SIZE, SvcPermission::Read)
+        .unwrap()
+        .0
+}
+
+/// One row of a table: an applet resource user id and its memory.
+type Row = (u64, ObjectId);
+
+/// A `hid` server snapshot whose table holds `rows`, made without the server's own commands.
+fn saved_table(rows: &[Row]) -> Vec<u8> {
+    let mut resources = AppletResources::default();
+    resources.memories.extend(rows.iter().copied());
+    Server::new(NAME, UnknownPolicy::Strict)
+        .with_root(|| Box::new(IHidServer))
+        .with_interfaces(interfaces())
+        .with_family(resources)
+        .save()
+        .unwrap()
+}
+
+/// What `server`'s table holds now.
+fn table_of(server: &Server) -> AppletResources {
+    server.family::<AppletResources>().unwrap().clone()
+}
+
+/// The refusal for a row's memory that names nothing live or an object of another kind.
+const NOT_SHARED_MEMORY: SnapshotError =
+    SnapshotError::FamilyObject("a hid applet resource's memory is not a live shared memory");
+/// The refusal for a row's memory of another size.
+const OTHER_SIZE: SnapshotError = SnapshotError::FamilyObject(
+    "a hid applet resource's memory is not the size of the input shared memory",
+);
+/// The refusal for a row's memory mapped otherwise than read-only.
+const NOT_READ_ONLY: SnapshotError =
+    SnapshotError::FamilyObject("a hid applet resource's memory is not mapped read-only");
+
+/// Each row's memory is restored only as a live shared memory of the input shared memory's size
+/// that processes map read-only, as `CreateAppletResource` makes one (module docs,
+/// "Restoring"): each other id is refused with its exact error and leaves the server as it was,
+/// and the next restore of a good table succeeds. With two faults in one memory, the size is
+/// reported before the permission.
+#[test]
+fn each_restored_memory_is_a_live_read_only_input_shared_memory() {
+    let mut kernel = FakeKernel::new(0).unwrap();
+    let good = input_memory(&mut kernel);
+    let event = kernel.create_event().unwrap();
+    let nothing = kernel.new_object();
+    let page = starquake_memory::PAGE_SIZE;
+    let smaller = kernel.create_shared_memory(SIZE - page, SvcPermission::Read);
+    let writable = kernel.create_shared_memory(SIZE, SvcPermission::ReadWrite);
+    let both = kernel.create_shared_memory(SIZE - page, SvcPermission::ReadWrite);
+    let (smaller, writable, both) = (smaller.unwrap().0, writable.unwrap().0, both.unwrap().0);
+    let cases = [
+        (event, NOT_SHARED_MEMORY),
+        (nothing, NOT_SHARED_MEMORY),
+        (smaller, OTHER_SIZE),
+        (writable, NOT_READ_ONLY),
+        (both, OTHER_SIZE),
+    ];
+    for (memory, refused) in cases {
+        let mut restored = server(UnknownPolicy::Strict);
+        let bytes = saved_table(&[(PROCESS_ID, memory)]);
+        assert_eq!(
+            restored.restore_beside(&bytes, &kernel),
+            Err(refused.clone()),
+            "{memory:?}"
+        );
+        assert_eq!(table_of(&restored), AppletResources::default());
+        let bytes = saved_table(&[(PROCESS_ID, good)]);
+        assert_eq!(restored.restore_beside(&bytes, &kernel), Ok(()));
+        assert_eq!(table_of(&restored).memory(PROCESS_ID), Some(good));
+    }
+}
+
+/// The rows are checked in id order, and the first refused one is reported: two faulty rows
+/// on both sides of the order, and a good row on either side of a faulty one.
+#[test]
+fn the_first_refused_row_in_id_order_is_reported() {
+    let mut kernel = FakeKernel::new(0).unwrap();
+    let good = input_memory(&mut kernel);
+    let nothing = kernel.new_object();
+    let writable = kernel
+        .create_shared_memory(SIZE, SvcPermission::ReadWrite)
+        .unwrap()
+        .0;
+    let cases = [
+        ([(1, nothing), (2, writable)], NOT_SHARED_MEMORY),
+        ([(1, writable), (2, nothing)], NOT_READ_ONLY),
+        ([(1, good), (2, writable)], NOT_READ_ONLY),
+        ([(1, nothing), (2, good)], NOT_SHARED_MEMORY),
+    ];
+    for (rows, refused) in cases {
+        let mut restored = server(UnknownPolicy::Strict);
+        assert_eq!(
+            restored.restore_beside(&saved_table(&rows), &kernel),
+            Err(refused),
+            "{rows:?}"
+        );
+    }
+}
+
+/// Each row keeps a memory of its own, as live operation leaves the table: two rows that keep
+/// one memory are refused before the kernel is asked, whichever two, and the error names the
+/// first row in id order whose memory an earlier row keeps. Rows with distinct memories restore.
+#[test]
+fn a_restored_table_keeps_each_memory_once() {
+    let mut kernel = FakeKernel::new(0).unwrap();
+    let [a, b, c] = [(); 3].map(|()| input_memory(&mut kernel));
+    let refused = SnapshotError::Decode(postcard::Error::SerdeDeCustom);
+    let shared: [(&[Row], (u64, u64)); 3] = [
+        (&[(1, a), (2, a)], (1, 2)),
+        (&[(1, a), (2, b), (3, a), (4, b)], (1, 3)),
+        (&[(1, a), (2, b), (3, c), (4, b)], (2, 4)),
+    ];
+    for (rows, (first, second)) in shared {
+        let mut restored = server(UnknownPolicy::Strict);
+        assert_eq!(
+            restored.restore_beside(&saved_table(rows), &kernel),
+            Err(refused.clone()),
+            "{rows:?}"
+        );
+        assert_eq!(table_of(&restored), AppletResources::default());
+        // postcard drops a failed `try_from`'s text, so the error itself is checked on the
+        // same data.
+        let mut resources = AppletResources::default();
+        resources.memories.extend(rows.iter().copied());
+        let data: AppletResourcesData =
+            postcard::from_bytes(&postcard::to_allocvec(&resources).unwrap()).unwrap();
+        let error = AppletResourcesLayoutError::SharedMemory { first, second };
+        assert_eq!(AppletResources::try_from(data).map(|_| ()), Err(error));
+    }
+    assert_eq!(
+        AppletResourcesLayoutError::SharedMemory {
+            first: 0x10,
+            second: 0x2A
+        }
+        .to_string(),
+        "applet resource user ids 0x10 and 0x2a keep one memory"
+    );
+    // The same ids with a memory each: restored, beside the kernel that made them.
+    let distinct = [(1, a), (2, b), (3, c)];
+    let mut restored = server(UnknownPolicy::Strict);
+    assert_eq!(
+        restored.restore_beside(&saved_table(&distinct), &kernel),
+        Ok(())
+    );
+    assert_eq!(table_of(&restored).len(), distinct.len());
+}
+
+/// A `hid` server keeps kernel objects, so `restore` refuses its snapshots whatever they hold,
+/// an empty table included, and leaves the server as it was.
+#[test]
+fn a_hid_server_is_restored_only_beside_the_kernel() {
+    let mut rig = Rig::new();
+    let resource = rig.resource();
+    rig.memory(resource);
+    let full = rig.server.save().unwrap();
+    for bytes in [full, saved_table(&[])] {
+        let mut restored = server(UnknownPolicy::Strict);
+        assert_eq!(restored.restore(&bytes), Err(SnapshotError::NeedsKernel));
+        assert_eq!(table_of(&restored), AppletResources::default());
+        assert_eq!(restored.restore_beside(&bytes, &rig.kernel), Ok(()));
+    }
 }

@@ -50,6 +50,36 @@
 //! memory, and its `GetSharedMemoryHandle` answers [`ARUID_NOT_REGISTERED`]: Eden's answer for
 //! an id with no row (`AppletResource::GetSharedMemoryHandle`, `index >= AruidIndexMax`).
 //!
+//! # Restoring
+//!
+//! A snapshot is a file, so a restore believes nothing in the table. In this order, the first
+//! that fails refusing the snapshot and leaving the server as it was:
+//!
+//! 1. At most [`ARUID_INDEX_MAX`] rows (`a_restored_table_holds_at_most_the_rows_the_table_has_room_for`),
+//!    then no memory kept by two rows, which `CreateAppletResource` never leaves
+//!    (`a_restored_table_keeps_each_memory_once`): both refused as the table decodes, with
+//!    [`SnapshotError::Decode`]`(postcard::Error::SerdeDeCustom)` ([`AppletResourcesLayoutError`]
+//!    says which).
+//! 2. Beside the kernel the server is restored beside ([`Server::restore_beside`]), each row's
+//!    memory, in id order: it names a live shared memory, of [`shared_memory::SIZE`] bytes
+//!    rounded up to whole pages as the kernel makes it, that processes map read-only, as
+//!    `CreateAppletResource` makes one; the first that fails is refused with
+//!    [`SnapshotError::FamilyObject`] saying which of the three it failed, checked in that order
+//!    (`each_restored_memory_is_a_live_read_only_input_shared_memory`,
+//!    `the_first_refused_row_in_id_order_is_reported`). The server keeps kernel objects, so
+//!    [`Server::restore`], which has no kernel, refuses its snapshots with
+//!    [`SnapshotError::NeedsKernel`] (`a_hid_server_is_restored_only_beside_the_kernel`).
+//!
+//! Not checked here:
+//!
+//! - **Which server made a row's memory.** The kernel notes which server made an event, not a
+//!   shared memory. A forged snapshot can name a read-only shared memory of the same size that
+//!   another server made; the guest is then handed that memory as its input memory. No other
+//!   service makes a shared memory of this size today (`time:u`'s is one page).
+//! - **The applet resource user ids.** Live, any id the kernel reports for a caller gets a row,
+//!   and an ended process's row stays; the ids are not checked against the kernel's processes.
+//! - **What the memory holds.** Its bytes are guest memory, saved with the guest's.
+//!
 //! # Where this differs from Eden
 //!
 //! Each difference is pinned by the test named, in `hid/tests.rs`:
@@ -93,6 +123,11 @@
 //!   the server's life (`closing_a_resource_keeps_its_row_and_memory`).
 //!
 //! [`INVALID_CMIF_REQUEST`]: crate::framework::result::INVALID_CMIF_REQUEST
+//! [`SnapshotError::Decode`]: crate::framework::SnapshotError::Decode
+//! [`SnapshotError::FamilyObject`]: crate::framework::SnapshotError::FamilyObject
+//! [`SnapshotError::NeedsKernel`]: crate::framework::SnapshotError::NeedsKernel
+//! [`Server::restore_beside`]: crate::framework::Server::restore_beside
+//! [`Server::restore`]: crate::framework::Server::restore
 
 use std::collections::BTreeMap;
 
@@ -101,11 +136,14 @@ use starquake_kernel::id::ObjectId;
 use starquake_kernel::memory::SvcPermission;
 use starquake_kernel::result::{KernelError, ResultCode};
 
+use starquake_trace::ServiceId;
+
 use crate::commands;
 use crate::framework::result::{INVALID_CMIF_REQUEST, code};
 use crate::framework::{
-    Context, Fault, Interfaces, Outcome, Reply, Request, Server, UnknownPolicy,
+    Context, Fault, Interfaces, Outcome, Reply, Request, RestoredKernel, Server, UnknownPolicy,
 };
+use crate::shared_image::{self, Refusals};
 
 pub mod shared_memory;
 
@@ -165,8 +203,9 @@ impl IAppletResource {
 /// shared memory (module docs, "The applet resources"). At most [`ARUID_INDEX_MAX`] rows.
 ///
 /// It is saved in a snapshot, so it derives `serde`. Deserialising goes through
-/// `AppletResourcesData`, which checks the one bound the server's own commands keep,
-/// [`ARUID_INDEX_MAX`] rows.
+/// `AppletResourcesData`, which checks what the server's own commands keep without a kernel:
+/// at most [`ARUID_INDEX_MAX`] rows, then no memory kept by two rows. A restore then checks
+/// each memory against the kernel (module docs, "Restoring").
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "AppletResourcesData")]
 pub struct AppletResources {
@@ -190,6 +229,14 @@ pub enum AppletResourcesLayoutError {
         /// The rows in the data.
         count: usize,
     },
+    /// Two rows keep one memory: `CreateAppletResource` makes each id a memory of its own.
+    #[error("applet resource user ids {first:#x} and {second:#x} keep one memory")]
+    SharedMemory {
+        /// The lower of the two ids.
+        first: u64,
+        /// The higher: the first row, in id order, whose memory an earlier row keeps.
+        second: u64,
+    },
 }
 
 impl TryFrom<AppletResourcesData> for AppletResources {
@@ -199,6 +246,16 @@ impl TryFrom<AppletResourcesData> for AppletResources {
         let count = data.memories.len();
         if count > ARUID_INDEX_MAX {
             return Err(AppletResourcesLayoutError::TooManyRows { count });
+        }
+        let mut kept = BTreeMap::new();
+        for (&aruid, &memory) in &data.memories {
+            if let Some(&first) = kept.get(&memory) {
+                return Err(AppletResourcesLayoutError::SharedMemory {
+                    first,
+                    second: aruid,
+                });
+            }
+            kept.insert(memory, aruid);
         }
         Ok(Self {
             memories: data.memories,
@@ -308,4 +365,31 @@ pub fn server(policy: UnknownPolicy) -> Server {
         .with_root(|| Box::new(IHidServer))
         .with_interfaces(interfaces())
         .with_family(AppletResources::default())
+        .with_family_objects(applet_resource_memories)
+}
+
+/// What a restore answers for a row's memory that fails [`shared_image::check_restored`].
+const MEMORY_REFUSALS: Refusals = Refusals {
+    not_shared_memory: "a hid applet resource's memory is not a live shared memory",
+    size: "a hid applet resource's memory is not the size of the input shared memory",
+    permission: "a hid applet resource's memory is not mapped read-only",
+};
+
+/// The restore check of the kernel objects the `hid` server's table keeps (module docs,
+/// "Restoring"): each row's memory, in id order, is a live shared memory of the input shared
+/// memory's size, mapped read-only, as [`make_memory`] makes one.
+fn applet_resource_memories(
+    saved: &AppletResources,
+    kernel: &dyn RestoredKernel,
+    _service: ServiceId,
+) -> Result<(), &'static str> {
+    saved.memories.values().try_for_each(|memory| {
+        shared_image::check_restored(
+            kernel,
+            *memory,
+            shared_memory::SIZE,
+            SvcPermission::Read,
+            &MEMORY_REFUSALS,
+        )
+    })
 }
