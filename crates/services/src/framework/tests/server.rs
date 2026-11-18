@@ -317,3 +317,45 @@ fn legacy_message_types_are_not_supported() {
         assert_eq!(reply, only(NOT_SUPPORTED), "{legacy:?}");
     }
 }
+
+/// A family that keeps, for each session closed, how many were still open
+/// ([`Family::session_closed`](super::super::Family::session_closed)). It saves nothing.
+#[derive(Default)]
+struct Closings(Vec<usize>);
+
+impl super::super::Family for Closings {
+    fn save_state(&self) -> Result<Vec<u8>, super::super::SnapshotError> {
+        Ok(Vec::new())
+    }
+
+    fn load_state(&mut self, _: &[u8]) -> Result<(), super::super::SnapshotError> {
+        Ok(())
+    }
+
+    fn session_closed(&mut self, open: usize) {
+        self.0.push(open);
+    }
+}
+
+#[test]
+fn the_family_is_told_how_many_sessions_are_left_as_each_closes() {
+    let mut rig = Rig::strict();
+    let server = std::mem::replace(&mut rig.server, Server::new("toy", UnknownPolicy::Strict));
+    rig.server = server.with_family(Closings::default());
+    let (first, second, third) = (rig.session, rig.second_session(), rig.second_session());
+    let closings = |rig: &Rig| rig.server.family::<Closings>().unwrap().0.clone();
+    // The client end goes (as a process's end closes it), then a close message, then the last.
+    rig.server.close(second).unwrap();
+    assert_eq!(closings(&rig), [2]);
+    let (handled, _) = rig.try_send_on(first, &RequestBuilder::close());
+    assert_eq!(handled, Ok(Handled::Closed));
+    assert_eq!(closings(&rig), [2, 1]);
+    rig.server.close(third).unwrap();
+    assert_eq!(closings(&rig), [2, 1, 0]);
+    // A session the server does not know tells the family nothing.
+    assert_eq!(
+        rig.server.close(second),
+        Err(ServerError::UnknownSession(second))
+    );
+    assert_eq!(closings(&rig), [2, 1, 0]);
+}
