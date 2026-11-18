@@ -431,6 +431,7 @@ fn run_reading(test: &str, romfs: RomFs, timeout: Duration) -> (RunReport, Seen)
         sd_card: Some(scratch.path()),
         romfs: Some(romfs),
         rtc: RtcAtBoot::eden_default(),
+        environment: crate::EnvSource::Live,
     };
     let report = run(
         vcpus(&mut main),
@@ -540,6 +541,7 @@ fn a_read_held_at_the_title_does_not_hold_up_a_card_read() {
         sd_card: Some(scratch.path()),
         romfs: Some(romfs),
         rtc: RtcAtBoot::eden_default(),
+        environment: crate::EnvSource::Live,
     };
     let memory = FlatMemory::new(RAM_BASE, RAM_SIZE);
     let session = session_over(&memory, &options);
@@ -632,7 +634,7 @@ fn a_runs_workers_read_through_environments_of_their_own() {
         checking.store(true, Ordering::SeqCst);
         real_services(dispatcher, given)
     };
-    let (dispatcher, _) = boot(guest.address_space(), &guest.placed, &guest.memory).unwrap();
+    let (dispatcher, _) = boot(guest.address_space(), &guest.placed, &guest.memory, &*env).unwrap();
     let (ending, ..) = drive(
         vcpus(&mut vcpu),
         dispatcher,
@@ -773,6 +775,7 @@ fn run_failed(
         sd_card: None,
         romfs: Some(romfs().0),
         rtc: RtcAtBoot::eden_default(),
+        environment: crate::EnvSource::Live,
     };
     let report = run_serving(
         vcpus(&mut main),

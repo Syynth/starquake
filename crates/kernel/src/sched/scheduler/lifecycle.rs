@@ -25,9 +25,11 @@
 //! Each is pinned by the named test in `sched/scheduler/lifecycle/tests.rs`, unless another
 //! file is named.
 //!
-//! - **`x18` starts at zero.** Eden's `ResetThreadContext64` seeds it with a random odd number
-//!   (`Common::Random::Random64(0) | 1`). Creation has no route to the environment's random
-//!   numbers yet. Test: `a_user_thread_starts_where_its_creator_says`.
+//! - **`x18` is left at zero here.** Eden's `ResetThreadContext64` seeds it with a random odd
+//!   number (`Common::Random::Random64(0) | 1`). The scheduler has no environment; its callers
+//!   set it on the new thread's context before anything else sees the thread
+//!   (`crate::process`, "What a process draws from the environment"). Test:
+//!   `a_user_thread_starts_where_its_creator_says`.
 //! - **A destroyed thread is taken off the cores at once.** Eden's `FinishTermination` waits
 //!   until no core runs the thread before it closes the thread's reference. Here the reference
 //!   is closed when the thread ends, and a destroyed thread's id is cleared from any core that

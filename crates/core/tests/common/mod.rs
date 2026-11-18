@@ -20,6 +20,7 @@ pub fn run(file: &[u8], timeout: Duration) -> Option<RunReport> {
         sd_card: None,
         romfs: None,
         rtc: starquake_core::RtcAtBoot::eden_default(),
+        environment: starquake_core::EnvSource::Live,
     };
     match System::new(file) {
         Ok(system) => Some(system.run(&options)),

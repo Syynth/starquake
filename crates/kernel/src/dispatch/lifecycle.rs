@@ -8,6 +8,7 @@
 use super::arbitration::origin;
 use super::{Call, Dispatcher, Now, Outcome, calling_core, fault, returning, signed, void};
 use crate::handle::{Handle, HandleTable};
+use crate::process::draw_cfi_value;
 use crate::sched::ThreadExit;
 use crate::svc::sync::Waiter;
 use crate::svc::{Convention, SvcId, process, thread};
@@ -192,6 +193,15 @@ fn sleep_thread(
     }
 }
 
+/// `CreateThread`'s arm. The new thread's `x18` is drawn from the caller's environment first
+/// (`crate::process`, "What a process draws from the environment"), under the kernel lock, so a
+/// replay feeds it back in the kernel's order. When the environment fails, the call does not run
+/// and writes nothing ([`Outcome::EnvFailed`]), as when its clock fails.
+///
+/// Divergence: the number is drawn before the call's checks, so a `CreateThread` the checks
+/// refuse has drawn one; Eden draws it in `KThread::Initialize`, after them. Nothing the guest
+/// sees differs, only the environment's recording. Test (`dispatch/lifecycle/tests.rs`):
+/// `a_refused_create_thread_has_still_drawn_its_x18`.
 fn create_thread(
     tables: (&mut HandleTable, &mut AddressSpace, &mut Scheduler),
     processes: &Processes,
@@ -199,6 +209,13 @@ fn create_thread(
     convention: &Convention,
     call: &mut Call<'_, '_>,
 ) -> Outcome {
+    let x18 = match draw_cfi_value(call.caller.env) {
+        Ok(x18) => x18,
+        Err(error) => {
+            tracing::error!(number = call.number, %error, "environment failed");
+            return Outcome::EnvFailed(error);
+        }
+    };
     let (core, memory) = (call.caller.core, call.caller.memory);
     returning(
         id,
@@ -211,6 +228,7 @@ fn create_thread(
                 stack_top,
                 priority: signed(priority)?,
                 core_id: signed(core_id)?,
+                x18,
             };
             let handle =
                 thread::create_thread(tables, processes, memory, calling_core(core)?, args)?;

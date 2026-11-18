@@ -165,6 +165,10 @@ pub struct CreateThread {
     pub priority: i32,
     /// Its virtual core, or [`IDEAL_CORE_USE_PROCESS_VALUE`].
     pub core_id: i32,
+    /// Its `x18`, the CFI value the dispatcher drew for it
+    /// ([`crate::process::CFI_REGISTER`]; `crate::process`, "What a process draws from the
+    /// environment"). Not a register the guest passes.
+    pub x18: u64,
 }
 
 /// `CreateThread`: a new thread of the calling process, not started, and a handle to it, which
@@ -209,7 +213,7 @@ pub fn create_thread(
         priority,
         virtual_core,
     };
-    let (_, handle) = create_thread_with_handle(tables, process, &spec, memory)?;
+    let (_, handle) = create_thread_with_handle(tables, process, (&spec, args.x18), memory)?;
     Ok(handle)
 }
 
