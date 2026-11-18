@@ -646,6 +646,100 @@ fn a_handler_ending_the_process_during_the_timers_delivery_ends_the_run_after_th
 }
 
 #[test]
+fn a_delivery_records_the_process_end_on_the_core_of_the_sender_that_asked() {
+    // The sender is a thread the main thread starts on core 1, not the timer thread's core 0,
+    // so the end recorded on the timer's own core would show.
+    const SENDER: u64 = 0xA;
+    const SENDER_CORE: u8 = 1;
+    assert_ne!(SENDER_CORE, crate::machine::CORE);
+    let guest = Guest::new(&programs::hello().unwrap());
+    let page = usize::try_from(crate::image::PAGE).unwrap();
+    let space = WithTls {
+        image: &guest.memory,
+        tls: FlatMemory::new(guest.tls, page),
+    };
+    let name = guest.start_of("main.rodata");
+    guest
+        .memory
+        .write(name, format!("{DEFER_PORT}\0").as_bytes())
+        .unwrap();
+    let order = Rc::new(RefCell::new(Vec::new()));
+    let main = ScriptedVcpu::new()
+        .then(
+            create(SENDER, 30, i32::from(SENDER_CORE)),
+            svc(SvcId::CreateThread),
+        )
+        .then(start_created, svc(SvcId::StartThread))
+        .then(succeeded, svc(SvcId::ExitThread));
+    // The sender's message buffer: its thread-local region, in the main thread's page.
+    let tls = Rc::new(std::cell::Cell::new(0));
+    let seen = Rc::clone(&tls);
+    let begin = begins(SENDER, &order);
+    let sender = ScriptedVcpu::new()
+        .then(
+            move |regs| {
+                begin(regs);
+                seen.set(regs.tpidrro);
+                regs.x[1] = name;
+            },
+            svc(SvcId::ConnectToNamedPort),
+        )
+        .then(start_created, svc(SvcId::SendSyncRequest));
+    let outcome = stepped(
+        &guest,
+        &space,
+        vec![main, sender],
+        &install_ending,
+        |_, machine| {
+            if let Err(ending) = crate::machine::timer::deliver(machine) {
+                machine.stop(ending);
+            }
+        },
+    );
+    assert_exited(&outcome);
+    assert_eq!(*order.borrow(), [SENDER]);
+    assert!(holds_the_reply(&space, tls.get()));
+    // The request and the process's end are both recorded for the sender, on its core.
+    let send = u32::from(SvcId::SendSyncRequest.number());
+    let sends: Vec<_> = outcome
+        .events
+        .iter()
+        .filter(|event| matches!(event.kind, EventKind::Svc { id, .. } if id == send))
+        .map(|event| (event.core, event.thread))
+        .collect();
+    let [(core, thread)] = sends.as_slice() else {
+        panic!("one request was sent: {sends:?}");
+    };
+    assert_eq!(*core, SENDER_CORE);
+    assert_ne!(*thread, MAIN_THREAD);
+    let ends: Vec<_> = outcome
+        .events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind,
+                EventKind::Lifecycle {
+                    phase: LifecyclePhase::ProcessExit,
+                    ..
+                }
+            )
+        })
+        .map(|event| (event.core, event.thread, event.kind))
+        .collect();
+    assert_eq!(
+        ends,
+        [(
+            SENDER_CORE,
+            *thread,
+            EventKind::Lifecycle {
+                phase: LifecyclePhase::ProcessExit,
+                subject: PROCESS_ID
+            }
+        )]
+    );
+}
+
+#[test]
 fn the_timer_thread_ends_the_run_when_a_delivery_ends_the_process() {
     let guest = Guest::new(&programs::hello().unwrap());
     let (space, mut main) = sending_once(&guest);

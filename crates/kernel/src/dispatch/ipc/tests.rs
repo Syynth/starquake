@@ -2446,6 +2446,101 @@ fn a_delivery_ends_the_process_of_the_request_that_asked_and_no_other() {
     assert_eq!(world.tls(B), [0xB0; BUFFER_SIZE]);
     assert_eq!(process_state(&world, other), (true, 0));
     assert_eq!(process_state(&world, own), (false, 1));
+    // Both senders were reported woken, in the order answered, before B's process ended: A,
+    // of the process that goes on, must reach its core.
+    assert_eq!(
+        world.dispatcher.take_woken(),
+        [
+            Woken {
+                thread: A,
+                core: core_of(A),
+                result: ResultCode::SUCCESS
+            },
+            Woken {
+                thread: B,
+                core: core_of(B),
+                result: ResultCode::SUCCESS
+            },
+        ]
+    );
+}
+
+#[test]
+fn a_deferred_reply_that_asks_to_end_ends_its_senders_process_and_no_other() {
+    let (world, own, other) = world_of_two_processes();
+    let handle = world.session();
+    let session = world.object(handle);
+    world
+        .first
+        .script(Box::new(|_, _, _| Ok(Handled::Deferred)));
+    // B, a thread of the other process, sends the deferred request.
+    assert_eq!(
+        world.send(B, handle, &request()).0.outcome,
+        Outcome::Waiting
+    );
+    // Its handler asks to end the process as it gives the reply, and the delivery is made on
+    // A's core, a core of the tables' own process.
+    lock(&world.first.hooks).take_reply = Some(Box::new(ask_to_end));
+    lock(&world.first.ready).push_back((session, Ok(0xB0)));
+    assert_eq!(
+        world.deliver(&world.first),
+        [Ended {
+            process: other,
+            thread: B,
+            core: core_of(B)
+        }]
+    );
+    assert_eq!(world.tls(B), [0xB0; BUFFER_SIZE]);
+    assert_eq!(process_state(&world, other), (true, 0));
+    assert_eq!(process_state(&world, own), (false, 1));
+}
+
+#[test]
+fn a_deferred_reply_that_fails_while_asking_to_end_ends_the_process_of_the_request_it_answered()
+{
+    let (world, own, other) = world_of_two_processes();
+    let handle = world.session();
+    let session = world.object(handle);
+    world
+        .first
+        .script(Box::new(|_, _, _| Ok(Handled::Deferred)));
+    // B, of the other process, sends the deferred request; A, of the tables' own, and then C,
+    // whose core runs no thread of a process and so sends for the tables' own, wait behind it.
+    for sender in [B, A, C] {
+        assert_eq!(
+            world.send(sender, handle, &request()).0.outcome,
+            Outcome::Waiting
+        );
+    }
+    // The handler asks to end the process and then fails to write B's reply: the session
+    // closes, which ends all three requests, and the end is B's, the request it answered.
+    lock(&world.first.hooks).take_reply = Some(Box::new(ask_to_end));
+    lock(&world.first.ready).push_back((session, Err(HandlerError("lost".to_owned()))));
+    assert_eq!(
+        world.deliver(&world.first),
+        [Ended {
+            process: other,
+            thread: B,
+            core: core_of(B)
+        }]
+    );
+    let closed = KernelError::SessionClosed.code();
+    let woken: Vec<_> = world
+        .dispatcher
+        .take_woken()
+        .iter()
+        .map(|woken| (woken.thread, woken.core, woken.result))
+        .collect();
+    assert_eq!(
+        woken,
+        [
+            (B, core_of(B), closed),
+            (A, core_of(A), closed),
+            (C, core_of(C), closed),
+        ]
+    );
+    assert_eq!(process_state(&world, other), (true, 0));
+    assert_eq!(process_state(&world, own), (false, 1));
 }
 
 #[test]
@@ -2784,6 +2879,88 @@ fn a_handler_ending_the_process_wakes_its_threads_waiters_as_exit_process_does()
             .collect::<Vec<_>>()
     );
     assert_eq!(by_handler.1, by_exit.1);
+}
+
+#[test]
+fn a_delivery_reports_its_sender_and_its_signals_wakes_before_the_wakes_of_the_end() {
+    // B, a host thread, waits for A's user thread to end (the end's wake); C, another host
+    // thread, waits on an event the handler signals as it gives A's deferred reply and asks
+    // to end the process (the signal's wake).
+    let world = world_with_a_host_thread_waiting_for_the_process();
+    let (_, regs) = world.call(A, SvcId::CreateEvent, 0, 0);
+    assert_eq!(result(&regs), ResultCode::SUCCESS);
+    let (writable, readable) = (regs.x[1], regs.x[2]);
+    let event = world.object(Handle::from_register(writable));
+    run_thread_for(&world, C);
+    let handles = NAMES + 8;
+    world
+        .memory
+        .write(handles, &Handle::from_register(readable).raw().to_le_bytes())
+        .unwrap();
+    let mut wait = GuestRegs::default();
+    wait.x[1] = handles;
+    wait.x[2] = 1;
+    // No timeout: -1.
+    wait.x[3] = u64::MAX;
+    wait.tpidrro = TLS_C;
+    let record = world.dispatcher.dispatch(
+        SvcId::WaitSynchronization.number(),
+        &mut wait,
+        &mut world.caller(C),
+    );
+    assert_eq!(record.outcome, Outcome::Waiting);
+
+    let handle = world.session();
+    let session = world.object(handle);
+    world
+        .first
+        .script(Box::new(|_, _, _| Ok(Handled::Deferred)));
+    assert_eq!(
+        world.send(A, handle, &request()).0.outcome,
+        Outcome::Waiting
+    );
+    lock(&world.first.hooks).take_reply = Some(Box::new(move |cx| {
+        cx.signal_event(event).unwrap();
+        cx.end_process();
+    }));
+    lock(&world.first.ready).push_back((session, Ok(0xA0)));
+    let before = world.events().len();
+    assert_eq!(world.deliver(&world.first).len(), 1);
+
+    // The sender first, then the wait its handler's signal ended, then the wait the end ended:
+    // reported woken in that order, and recorded in that order.
+    let success = ResultCode::SUCCESS;
+    assert_eq!(
+        world.dispatcher.take_woken(),
+        [
+            Woken {
+                thread: A,
+                core: core_of(A),
+                result: success
+            },
+            Woken {
+                thread: C,
+                core: core_of(C),
+                result: success
+            },
+            Woken {
+                thread: B,
+                core: core_of(B),
+                result: success
+            },
+        ]
+    );
+    let calls: Vec<_> = world.events()[before..]
+        .iter()
+        .filter_map(|event| match event.kind {
+            EventKind::Svc { id, result, .. } => Some((event.thread, id, result.0)),
+            _ => None,
+        })
+        .collect();
+    let send = u32::from(SvcId::SendSyncRequest.number());
+    let wait = u32::from(SvcId::WaitSynchronization.number());
+    let ok = success.raw();
+    assert_eq!(calls, [(A, send, ok), (C, wait, ok), (B, wait, ok)]);
 }
 
 // ----- Reading the handlers back ---------------------------------------------------------------
