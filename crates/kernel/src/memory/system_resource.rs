@@ -35,7 +35,8 @@
 //!   ([`SystemResource::required_secure_memory_size`]); `AllocateSecureMemory` checks
 //!   `R_UNLESS(Common::IsAligned(size, alignment), ResultInvalidSize)`, `alignment` being
 //!   `PageSize` for the system pool and `SecureAlignment` (128 KiB, [`SECURE_ALIGNMENT`]) for
-//!   any other ([`SystemResource::alignment`]).
+//!   the application and non-secure system pools ([`SystemResource::alignment`]). The applet
+//!   pool's checks are Horizon's (below, "Divergences from Eden").
 //! - `eden/src/core/hle/kernel/k_page_table_slab_heap.h`: `CalculateReferenceCountSize(size)` is
 //!   `(size / PageSize) * sizeof(RefCount)`, `RefCount` a `u16` ([`REFERENCE_COUNT_SIZE`]).
 //!
@@ -51,12 +52,29 @@
 //!   run of them; here the pool is a count (kernel spec, "Not planned": page heaps), so a
 //!   resource that passes the checks always gets its memory, and nothing reads or writes it
 //!   (the translation tables are the backend's own). The checks on the size are Eden's.
-//! - **A system resource in the applet pool** charges nothing, as in Eden, and is checked for
-//!   [`SECURE_ALIGNMENT`] like any pool but the system pool. Eden's `AllocateSecureMemory`
-//!   asserts first (`UNIMPLEMENTED_IF(pool == Applet)`, "Applet secure memory is handled
-//!   separately") and then makes the same check. What Horizon checks for it is a guess here;
-//!   a trace of an applet's creation would settle it. Test:
-//!   `an_applet_resource_charges_nothing_and_is_checked_like_an_applications`.
+//! - **A system resource in the applet pool** charges nothing, as in Eden, and is checked as
+//!   Horizon checks it, not as Eden does. Eden's `AllocateSecureMemory` asserts first
+//!   (`UNIMPLEMENTED_IF(pool == Applet)`, "Applet secure memory is handled separately") and
+//!   then checks [`SECURE_ALIGNMENT`]. Horizon's hands the applet pool to
+//!   `AllocateSecureMemoryForApplet` (fact only, path relative to the reference folder,
+//!   `atmosphere/libraries/libmesosphere/source/board/nintendo/nx/kern_k_system_control.cpp`
+//!   @ 4e3f3703), which checks, in this order, `R_UNLESS(util::IsAligned(size, PageSize),
+//!   svc::ResultInvalidSize())` and `R_UNLESS(size <= KSystemControl::SecureAppletMemorySize,
+//!   svc::ResultOutOfMemory())` ([`SECURE_APPLET_MEMORY_SIZE`], 4 MiB). Here the applet pool
+//!   aligns to a page ([`SystemResource::alignment`]), which every size passes, as a size is
+//!   whole pages by construction ([`SystemResource::new`]), and a size above the cap is
+//!   [`KernelError::OutOfMemory`]. Against Eden's path after its assert, an applet resource of
+//!   whole pages that are not whole 128 KiB blocks is accepted here and `ResultInvalidSize`
+//!   there, and one of whole 128 KiB blocks above 4 MiB is `OutOfMemory` here and accepted
+//!   there. Test: `an_applet_resource_charges_nothing_and_may_be_up_to_the_secure_applet_memory`.
+//!
+//! # Divergence from Horizon
+//!
+//! - **Each process's applet resource is its own.** Horizon's secure applet memory is a single
+//!   slot for the whole machine: `AllocateSecureMemoryForApplet` refuses a second one while
+//!   `g_secure_applet_memory_used` is set (`svc::ResultOutOfMemory()`, same file). Here no
+//!   memory is allocated (above), and each process's applet resource passes the checks on its
+//!   own, however many other processes hold one. Test: `each_process_s_applet_resource_is_its_own`.
 
 use starquake_memory::PAGE_SIZE;
 
@@ -67,6 +85,12 @@ use crate::result::{KernelError, SvcResult};
 /// `SecureAlignment = 128_KiB` (`eden/src/core/hle/kernel/board/nintendo/nx/k_system_control.cpp`
 /// @ cf654052).
 pub const SECURE_ALIGNMENT: u64 = 128 << 10;
+
+/// The most secure memory an applet's system resource may have: `SecureAppletMemorySize =
+/// 4_MB` (`eden/src/core/hle/kernel/board/nintendo/nx/k_system_control.h` @ cf654052; the
+/// same in `atmosphere/libraries/libmesosphere/include/mesosphere/board/nintendo/nx/
+/// kern_k_system_control.hpp` @ 4e3f3703, fact only).
+pub const SECURE_APPLET_MEMORY_SIZE: u64 = 4 << 20;
 
 /// Bytes of one page-table reference count: `sizeof(KPageTableSlabHeap::RefCount)`, a `u16`
 /// (`eden/src/core/hle/kernel/k_page_table_slab_heap.h` @ cf654052).
@@ -131,13 +155,24 @@ impl SystemResource {
         }
     }
 
-    /// The alignment its size must have (`AllocateSecureMemory`): the page size in the system
-    /// pool, [`SECURE_ALIGNMENT`] in any other.
+    /// The alignment its size must have: the page size in the system pool (`AllocateSecureMemory`)
+    /// and the applet pool (Horizon's `AllocateSecureMemoryForApplet`, module docs),
+    /// [`SECURE_ALIGNMENT`] in the application and non-secure system pools.
     #[must_use]
     pub const fn alignment(self) -> u64 {
         match self.pool {
-            Pool::System => PAGE_SIZE,
-            Pool::Application | Pool::Applet | Pool::SystemNonSecure => SECURE_ALIGNMENT,
+            Pool::System | Pool::Applet => PAGE_SIZE,
+            Pool::Application | Pool::SystemNonSecure => SECURE_ALIGNMENT,
+        }
+    }
+
+    /// The most bytes it may have: [`SECURE_APPLET_MEMORY_SIZE`] in the applet pool (Horizon's
+    /// `AllocateSecureMemoryForApplet`, module docs), no cap in any other (`None`).
+    #[must_use]
+    pub const fn cap(self) -> Option<u64> {
+        match self.pool {
+            Pool::Applet => Some(SECURE_APPLET_MEMORY_SIZE),
+            Pool::Application | Pool::System | Pool::SystemNonSecure => None,
         }
     }
 
@@ -150,16 +185,22 @@ impl SystemResource {
     }
 
     /// The checks `KSecureSystemResource::Initialize` makes after its reservation, in its order:
-    /// the size aligned to [`Self::alignment`], else [`KernelError::InvalidSize`]
-    /// (`AllocateSecureMemory`); then larger than [`Self::reference_count_size`], else
-    /// [`KernelError::OutOfMemory`]. No secure resource passes both (Eden does not initialize
-    /// one).
+    /// the size aligned to [`Self::alignment`], else [`KernelError::InvalidSize`]; at most
+    /// [`Self::cap`], else [`KernelError::OutOfMemory`] (these two are `AllocateSecureMemory`'s,
+    /// or Horizon's `AllocateSecureMemoryForApplet`'s in the applet pool); then larger than
+    /// [`Self::reference_count_size`], else [`KernelError::OutOfMemory`]. No secure resource
+    /// passes them all (Eden does not initialize one).
     pub const fn check_allocation(self) -> SvcResult<()> {
         if !self.is_secure() {
             return Ok(());
         }
         if !self.size.is_multiple_of(self.alignment()) {
             return Err(KernelError::InvalidSize);
+        }
+        if let Some(cap) = self.cap()
+            && self.size > cap
+        {
+            return Err(KernelError::OutOfMemory);
         }
         if self.size <= self.reference_count_size() {
             return Err(KernelError::OutOfMemory);

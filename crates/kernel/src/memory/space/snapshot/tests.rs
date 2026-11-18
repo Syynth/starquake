@@ -13,7 +13,7 @@ use crate::id::SlabId;
 use crate::memory::fixture::{CODE, DATA, RODATA, SHARED, loaded, shared_memory};
 use crate::memory::layout::LayoutError;
 use crate::memory::state::SvcPermission;
-use crate::memory::system_resource::SECURE_ALIGNMENT;
+use crate::memory::system_resource::{SECURE_ALIGNMENT, SECURE_APPLET_MEMORY_SIZE};
 use starquake_memory::Perms;
 
 use crate::memory::testing::{MapperCall, MapperLog, RecordingMapper};
@@ -2946,6 +2946,20 @@ fn a_system_resource_no_live_space_could_have_is_refused_with_its_check() {
         case.error(),
         SnapshotError::SystemResourcePages { size: page + 1 }
     );
+    // An applet resource a page above the secure applet memory is refused with the cap's
+    // check; at the cap it passes, and then the reservation is wrong.
+    let cap = u32::try_from(SECURE_APPLET_MEMORY_SIZE).unwrap();
+    case.body.request.pool = pool_number(Pool::Applet);
+    case.body.request.system_resource_size = cap + page;
+    assert_eq!(
+        case.error(),
+        SnapshotError::SystemResource {
+            size: cap + page,
+            error: KernelError::OutOfMemory
+        }
+    );
+    case.body.request.system_resource_size = cap;
+    assert!(matches!(case.error(), SnapshotError::Reservation { .. }));
 }
 
 #[test]
