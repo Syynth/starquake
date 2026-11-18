@@ -522,6 +522,75 @@ fn locks_beyond_the_kernel_s_are_refused_at_the_first_extra_one() {
     ));
 }
 
+/// A kernel that holds locks in several processes: how many live locks it holds, by `(process,
+/// address, size)`. Its contract is [`Locks`]'s for each process, the refusal being
+/// [`DeviceShareError::NotLocked`] when it holds no more locks on the range in that process
+/// than `earlier`; a process it holds nothing in is refused the same way, where [`Locks`] (one
+/// process) answers [`DeviceShareError::WrongProcess`].
+struct ProcessLocks(BTreeMap<(ProcessId, u64, u64), u32>);
+
+impl Reclaim for ProcessLocks {
+    fn reclaim(
+        &self,
+        process: ProcessId,
+        address: u64,
+        size: u64,
+        earlier: u32,
+    ) -> Result<starquake_kernel::memory::DeviceShareToken, DeviceShareError> {
+        if self.0.get(&(process, address, size)).copied().unwrap_or(0) <= earlier {
+            return Err(DeviceShareError::NotLocked { address, size });
+        }
+        Ok(device_share_token(process, address, size))
+    }
+}
+
+/// Earlier bindings are counted per process: two bindings of the same exact range in two
+/// processes, against a kernel that holds one lock on it in each, both take their lock back,
+/// each with its own process; a third in the first process is refused at its own index.
+#[test]
+fn locks_are_counted_per_process() {
+    let other = ProcessId::from_parts(5, 6);
+    let bound = |id, process| SavedMemory {
+        id,
+        mode: 0,
+        size: 0x1000,
+        retired: false,
+        binding: Some(SavedBinding {
+            address: 0x4000,
+            process,
+            source: SavedSource::Process(false),
+        }),
+    };
+    let mut state = State {
+        memories: vec![bound(1, process()), bound(2, other)],
+        images: Vec::new(),
+        next_memory: 4,
+        next_image: 1,
+    };
+    let locks = ProcessLocks(BTreeMap::from([
+        ((process(), 0x4000, 0x1000), 1),
+        ((other, 0x4000, 0x1000), 1),
+    ]));
+    let restored = NativeObjects::restore(&encode(&state), &locks).unwrap();
+    let token = |id| restored.memory(id).unwrap().binding().unwrap().token;
+    assert_eq!(token(1), device_share_token(process(), 0x4000, 0x1000));
+    assert_eq!(token(2), device_share_token(other, 0x4000, 0x1000));
+    state.memories.push(bound(3, process()));
+    assert_eq!(
+        NativeObjects::restore(&encode(&state), &locks)
+            .unwrap_err()
+            .to_string(),
+        SnapshotError::Release {
+            index: 2,
+            error: DeviceShareError::NotLocked {
+                address: 0x4000,
+                size: 0x1000
+            }
+        }
+        .to_string()
+    );
+}
+
 /// Saving runs the restore's checks: a table no command can make is not written.
 #[test]
 fn saving_checks_what_it_writes() {

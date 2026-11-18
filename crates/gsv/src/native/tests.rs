@@ -744,13 +744,30 @@ fn commands_before_the_bootstrap_are_accepted() {
 // ----- 423 -------------------------------------------------------------------------------------
 
 /// 423 binds part of a gpu worker registration: the range at the offset, its own lock taken.
+/// The memory id (3), the parent's handle (2) and the other registration's and memories'
+/// numbers all differ, so a decoder that swapped the id (word 2) and the parent (word 7) binds
+/// nothing here.
 #[test]
 fn a_gpu_bind_binds_part_of_a_registration() {
     let mut rig = Rig::new();
+    let other_registration = rig.register(NEIGHBOUR, PAGE);
     let parent = rig.register(MEMORY, 3 * PAGE);
+    let others = [rig.created(PAGE), rig.created(PAGE)];
     let id = rig.created(PAGE);
+    assert_eq!(
+        (other_registration, parent, others, id),
+        (
+            FIRST_ID,
+            FIRST_ID + 1,
+            [FIRST_ID, FIRST_ID + 1],
+            FIRST_ID + 2
+        )
+    );
     let reply = rig.bind_gpu(id, MEMORY + PAGE, PAGE, parent, PAGE, [0; 4]);
     assert_eq!(reply, success(BIND_NATIVE_GPU_MEMORY, &[], &[]));
+    for other in others {
+        assert_eq!(rig.native().memory(other).unwrap().binding(), None);
+    }
     let binding = *rig.native().memory(id).unwrap().binding().unwrap();
     assert_eq!(binding.address, MEMORY + PAGE);
     assert_eq!(
@@ -889,16 +906,39 @@ fn a_gpu_bind_checks_the_attribute() {
     assert_eq!(rig.native().memory(id).unwrap().binding(), None);
 }
 
-/// 423's parent is a gpu worker registration only: a bound native memory's id is `NotFound`
-/// (PR takes any bound nvmap handle of the process; a listed divergence).
+/// 423's parent is looked up among gpu worker registration handles only (PR takes any bound
+/// nvmap handle of the process; a listed divergence). Native memory ids and registration
+/// handles are separate counters that both start at [`FIRST_ID`], so a number names whatever
+/// registration has it: a bound native memory's id that no registration has is `NotFound`,
+/// and a native memory's id that equals a live registration's handle names that registration.
 #[test]
 fn a_gpu_bind_s_parent_is_a_registration() {
     let mut rig = Rig::new();
-    let native_parent = rig.bound(MEMORY, 2 * PAGE);
+    let registration = rig.register(MEMORY, 2 * PAGE);
+    let same_number = rig.created(PAGE);
+    let native_parent = rig.bound(MEMORY + 2 * PAGE, 2 * PAGE);
     let id = rig.created(PAGE);
     assert_eq!(
-        rig.bind_gpu(id, MEMORY, PAGE, native_parent, 0, [0; 4]),
+        (registration, same_number, native_parent),
+        (FIRST_ID, FIRST_ID, FIRST_ID + 1)
+    );
+    // A bound native memory's id, which no registration has, over the native memory's range.
+    assert_eq!(
+        rig.bind_gpu(id, MEMORY + 2 * PAGE, PAGE, native_parent, 0, [0; 4]),
         result_only(BIND_NATIVE_GPU_MEMORY, code(KernelError::NotFound))
+    );
+    assert_eq!(rig.native().memory(id).unwrap().binding(), None);
+    // An unbound native memory's id that is also the registration's handle: the registration.
+    assert_eq!(
+        rig.bind_gpu(id, MEMORY, PAGE, same_number, 0, [0; 4]),
+        success(BIND_NATIVE_GPU_MEMORY, &[], &[])
+    );
+    assert_eq!(
+        rig.native().memory(id).unwrap().binding().unwrap().source,
+        Source::Gpu {
+            parent: registration,
+            offset: 0
+        }
     );
 }
 
@@ -937,6 +977,39 @@ fn a_parent_destroy_leaves_the_bind_s_own_lock() {
     assert_eq!(rig.kernel.device_locks(MEMORY + PAGE, PAGE), 1);
     assert_eq!(rig.destroy(id), success(DESTROY_NATIVE_MEMORY, &[], &[]));
     assert_eq!(rig.kernel.device_locks(MEMORY + PAGE, PAGE), 0);
+}
+
+/// Closing the root session releases nothing: the tables live in gsv's shared state for the
+/// whole run, and every lock stays held (PR's `~IGraphicsSupervisor` releases every native
+/// memory and `~NativeImageRegistry` drains the retired ones; a listed divergence).
+#[test]
+fn closing_the_root_session_releases_nothing() {
+    let mut rig = Rig::new();
+    let parent = rig.register(MEMORY, 2 * PAGE);
+    let gpu = rig.created(PAGE);
+    rig.bind_gpu(gpu, MEMORY, PAGE, parent, 0, [0; 4]);
+    let live = rig.bound(MEMORY + 2 * PAGE, PAGE);
+    rig.image(&page_image(), live);
+    let retired = rig.bound(MEMORY + 3 * PAGE, PAGE);
+    rig.image(&page_image(), retired);
+    assert_eq!(
+        rig.destroy(retired),
+        success(DESTROY_NATIVE_MEMORY, &[], &[])
+    );
+    let ranges = [
+        (MEMORY, PAGE),
+        (MEMORY, 2 * PAGE),
+        (MEMORY + 2 * PAGE, PAGE),
+        (MEMORY + 3 * PAGE, PAGE),
+    ];
+    let locks = |rig: &Rig| ranges.map(|(address, size)| rig.kernel.device_locks(address, size));
+    let (tables, held) = (rig.native(), locks(&rig));
+    assert_eq!(held, [1; 4]);
+    assert_eq!(tables.memories().count(), 3);
+    assert_eq!(tables.images().count(), 2);
+    rig.server.close(rig.session).unwrap();
+    assert_eq!(rig.native(), tables);
+    assert_eq!(locks(&rig), held);
 }
 
 // ----- 429 and 430 -----------------------------------------------------------------------------
@@ -1206,7 +1279,11 @@ proptest! {
     #![proptest_config(config())]
 
     /// 114 and 423 laid out from generated fields record each where it belongs: the binding's
-    /// address, its lock's range (the memory's size) and its source.
+    /// address, its lock's range (the memory's size) and its source, on the memory the request
+    /// names and no other. Other registrations (over the neighbour page) and other unbound
+    /// memories are made first, so the memory id and the parent's handle always differ, either
+    /// one the larger: a decoder that swapped any two reads, the id (word 2) and the parent
+    /// (word 7) included, fails here.
     #[test]
     fn binds_read_each_field_from_its_own_words(
         first_page in 0..4_u64,
@@ -1214,6 +1291,9 @@ proptest! {
         offset_pages in 0..4_u64,
         gpu in any::<bool>(),
         gpu_accessible in any::<bool>(),
+        base in 0..2_u32,
+        gap in 1..3_u32,
+        parent_larger in any::<bool>(),
     ) {
         prop_assume!(offset_pages < pages);
         let mut rig = Rig::new();
@@ -1222,9 +1302,17 @@ proptest! {
         prop_assume!(offset_pages < parent_pages);
         let size = (parent_pages - offset_pages) * PAGE;
         let address = parent_start + offset_pages * PAGE;
+        let (other_registrations, other_memories) =
+            if parent_larger { (base + gap, base) } else { (base, base + gap) };
+        for _ in 0..other_registrations {
+            rig.register(NEIGHBOUR, PAGE);
+        }
+        let others: Vec<u32> = (0..other_memories).map(|_| rig.created(PAGE)).collect();
         let id = rig.created(size);
         let (reply, source) = if gpu {
             let parent = rig.register(parent_start, parent_pages * PAGE);
+            prop_assert_ne!(parent, id);
+            prop_assert_eq!(parent > id, parent_larger);
             let offset = offset_pages * PAGE;
             (
                 rig.bind_gpu(id, address, size, parent, offset, [0; 4]),
@@ -1236,6 +1324,10 @@ proptest! {
         };
         let command = if gpu { BIND_NATIVE_GPU_MEMORY } else { BIND_NATIVE_MEMORY };
         prop_assert_eq!(reply, success(command, &[], &[]));
+        let tables = rig.native();
+        for other in others {
+            prop_assert_eq!(tables.memory(other).unwrap().binding(), None);
+        }
         let binding = *rig.native().memory(id).unwrap().binding().unwrap();
         prop_assert_eq!(binding.address, address);
         prop_assert_eq!(binding.source, source);

@@ -92,15 +92,18 @@
 //!
 //! | Case | PR | Here |
 //! |---|---|---|
-//! | Any command before the bootstrap is complete, the image formats are set up (1502) or the GPU context is ready (402) | `InvalidState` | accepted and logged, as the root's other commands (decision 7): `commands_before_the_bootstrap_are_accepted` |
+//! | Any command before the bootstrap is complete, the image formats are set up (1502) or the GPU context is ready (402) | `InvalidState` | accepted and logged, as the root's other commands (decision 7): `commands_before_the_bootstrap_are_accepted`; one warning naming the command before, none once ready, in `crates/gsv/tests/native_unready_log.rs` |
 //! | A request whose header words are not PR's exact ones | `InvalidCombination` | too few data words is `INVALID_CMIF_REQUEST`; more are read, as the root's other commands (`a_short_request_changes_nothing`) |
 //! | A refused request's reply | the result, then the reply's data words, zero | the result only, as the service framework answers every refusal (`each_create_check_refuses_on_its_own`) |
 //! | Native memory ids | nvmap handle ids, a step of 4 from 4 (`eden-pr4588/src/core/hle/service/nvdrv/core/nvmap.h`, `HandleIdIncrement`) | **conflict**: NX2's, 1, 2, 3 and on (`next_memory{1}`), by decision 8's "the one a title ran on" (`ids_count_from_one`) |
 //! | No id left | memories: nvmap's counter wraps; images: `m_next_native_image_id != 0`, `OutOfResource` | both as PR's images: the last id is `u32::MAX`, then `OutOfResource` (`ids_run_out_after_the_last`) |
-//! | 423's parent | any nvmap handle of the process that is bound: a gpu worker registration, a native memory, or an nvsrv nvmap allocation | a gpu worker registration only (spec: "bind to GPU-accessible memory"); a native memory id is `NotFound` (`a_gpu_bind_s_parent_is_a_registration`) |
+//! | 423's parent | any nvmap handle of the process that is bound: a gpu worker registration, a native memory, or an nvsrv nvmap allocation | looked up among gpu worker registration handles only (spec: "bind to GPU-accessible memory"). Native memory ids and registration handles are separate counters that both start at [`FIRST_ID`], so the number names whatever registration has that handle: a native memory id that no registration has is `NotFound`, and one equal to a live registration's handle names that registration (`a_gpu_bind_s_parent_is_a_registration`) |
 //! | A 102 of a registration a 423 bound part of | held (`ReleaseState::Retained`) until the native memory is released | goes ahead; the native memory holds its own device-share lock on its range, released by its 112 (`a_parent_destroy_leaves_the_bind_s_own_lock`) |
 //! | 114 on I/O memory (`is_io`) | `NotImplemented` | not ported: the kernel's lock refuses a range whose state cannot be device mapped |
 //! | 114's nvmap allocation failing | `OutOfResource` | not ported: there is no nvmap allocation here |
+//! | 112 of a memory whose nvmap handle has other duplicates (`handle->dupes == 1`) | `Busy` | not ported: there are no nvmap handles to duplicate here; only an image's use retires a memory (`a_memory_in_use_is_retired_until_its_last_image_goes`) |
+//! | 429's duplicate of the memory's nvmap handle failing (`memory->Duplicate(true)`) | `OutOfResource` | not ported: there is no nvmap handle to duplicate; only the image count and the ids refuse with `OutOfResource` (`images_are_bounded_at_the_limit`, `ids_run_out_after_the_last`) |
+//! | The root object going (its session closed) | `~IGraphicsSupervisor` releases every native memory (`ReleaseNativeMemory`, or the nvmap free and unlock when that fails) and `~NativeImageRegistry` releases its images' memories and drains the retired ones, unlocking each range | the tables live in gsv's shared state for the whole run: closing the root session releases nothing, every memory, image and lock stays (`closing_the_root_session_releases_nothing`) |
 //!
 //! # Bounds
 //!
