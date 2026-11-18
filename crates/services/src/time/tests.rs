@@ -746,8 +746,10 @@ fn a_base_past_the_nanoseconds_an_i64_holds_is_an_overflow() {
         };
         set_up(&settings, source, Uptime(uptime)).map(|c| c.steady.time_point)
     };
-    let last = i64::MAX / NANOSECONDS_PER_SECOND;
-    let first = i64::MIN / NANOSECONDS_PER_SECOND;
+    let (first, last) = (FIRST_RTC_AT_BOOT, LAST_RTC_AT_BOOT);
+    // The bounds as written out: `i64::MAX` and `i64::MIN` nanoseconds in whole seconds,
+    // truncated toward zero.
+    assert_eq!((first, last), (-9_223_372_036, 9_223_372_036));
     let overflow = Err(Fault::Result(OVERFLOW));
     // The base: the last and first whole seconds that fit, and one past each.
     assert_eq!(at(last, 0), Ok(last * NANOSECONDS_PER_SECOND));
@@ -756,6 +758,7 @@ fn a_base_past_the_nanoseconds_an_i64_holds_is_an_overflow() {
     assert_eq!(at(first - 1, 0), overflow);
     // The base plus the uptime: exactly `i64::MAX`, and one past it.
     let room = i64::MAX - last * NANOSECONDS_PER_SECOND;
+    assert_eq!(room, 854_775_807);
     assert!(at(last, room).is_ok());
     assert_eq!(at(last, room + 1), overflow);
 

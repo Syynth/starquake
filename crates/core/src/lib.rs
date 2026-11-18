@@ -80,15 +80,17 @@ pub mod title;
 
 pub use image::LoadError;
 pub use report::{
-    ExitReason, Mapping, RunOptions, RunReport, Summary, ThreadPc, ThreadPcState, exit_code,
+    DateSource, ExitReason, Mapping, RunDate, RunOptions, RunReport, Summary, ThreadPc,
+    ThreadPcState, exit_code,
 };
 pub use space::SpaceError;
 pub use system::{Error, System};
 pub use title::TitleError;
 
-/// Where a run's date comes from ([`RunOptions::rtc`]), and the unit a pinned date is given in,
-/// for frontends, which see only this crate.
-pub use starquake_services::time::RtcAtBoot;
+/// Where a run's date comes from ([`RunOptions::rtc`]), the unit a pinned date is given in, and
+/// the first and last dates `time:u` can set its clocks up from, for frontends, which see only
+/// this crate.
+pub use starquake_services::time::{FIRST_RTC_AT_BOOT, LAST_RTC_AT_BOOT, RtcAtBoot};
 pub use starquake_trace::UnixSeconds;
 
 /// The loader's formats (NUP containers, NPDM, NSO), for frontends, which see only this crate

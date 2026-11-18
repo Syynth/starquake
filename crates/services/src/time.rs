@@ -203,6 +203,19 @@ pub const FAILED: ResultCode = code(TIME_MODULE, 801);
 /// Nanoseconds in a second.
 pub const NANOSECONDS_PER_SECOND: i64 = 1_000_000_000;
 
+/// The first RTC at boot, in seconds since 1970-01-01T00:00:00 UTC, whose nanoseconds fit an
+/// `i64`: the earliest base [`set_up`] can make (-9223372036, about 292 years before 1970). An
+/// earlier one is [`OVERFLOW`] at the guest's first request for the memory.
+pub const FIRST_RTC_AT_BOOT: i64 = i64::MIN / NANOSECONDS_PER_SECOND;
+
+/// The last RTC at boot, in seconds since 1970-01-01T00:00:00 UTC, whose nanoseconds fit an
+/// `i64`: the latest base [`set_up`] can make (9223372036, about 292 years after 1970). A later
+/// one is [`OVERFLOW`] at the guest's first request for the memory. At this one the base leaves
+/// `i64::MAX - LAST_RTC_AT_BOOT * NANOSECONDS_PER_SECOND` nanoseconds (854775807, under a
+/// second) for the uptime, so a guest that first asks for the memory later than that after
+/// tick zero is answered [`OVERFLOW`] too (`a_base_past_the_nanoseconds_an_i64_holds_is_an_overflow`).
+pub const LAST_RTC_AT_BOOT: i64 = i64::MAX / NANOSECONDS_PER_SECOND;
+
 /// The ids of the commands ported here, per interface (Eden's tables).
 pub mod command {
     /// `time:u`'s commands (`StaticService::StaticService`).

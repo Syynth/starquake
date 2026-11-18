@@ -23,6 +23,8 @@ use starquake_ipc::{BUFFER_SIZE, CommandType, ReplyBuilder, RequestBuilder, Requ
 use starquake_services::sm::{self, ServiceName};
 use starquake_testkit::programs::{self, SendOn, Step};
 
+mod common;
+
 /// The service the guest asks for, which nothing provides: a made-up name, so that no service
 /// a later change registers can take it (`lm`, the name used first, is now registered).
 const UNKNOWN: &str = "absent";
@@ -121,7 +123,7 @@ fn the_log_the_summary_and_the_crash_report_name_an_unknown_service_and_its_comm
     let program = folder.join("unknown.nro");
     std::fs::write(&program, guest()).unwrap();
     let artifacts = folder.join("artifacts");
-    let line: Vec<OsString> = vec![
+    let mut line: Vec<OsString> = vec![
         "starquake".into(),
         "run".into(),
         program.into(),
@@ -129,6 +131,7 @@ fn the_log_the_summary_and_the_crash_report_name_an_unknown_service_and_its_comm
         "--artifacts".into(),
         artifacts.clone().into(),
     ];
+    line.extend(common::pinned_date());
     let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
     let code = starquake::execute(&line, &mut stdout, &mut stderr);
     let stdout = String::from_utf8(stdout).unwrap();

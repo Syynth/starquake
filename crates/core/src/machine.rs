@@ -109,11 +109,21 @@
 //! - **The run's date** is read once as the run boots, before the services are installed: from
 //!   the environment's wall clock, which the live environment records, unless the run's settings
 //!   pin a date ([`RunOptions::rtc`]; `starquake_services::time`, "The run's date"). It is the
-//!   first answer in the environment's recording. `time:u`'s clocks start from it
-//!   ([`Given::time`]). A failure to read it ends the run as an emulator error before the guest
-//!   runs ([`date_at_boot`]; tests: `a_pinned_date_reaches_time_u_and_the_host_is_not_read`,
-//!   `the_hosts_date_reaches_time_u_through_a_real_runs_services`,
-//!   `a_replay_without_the_date_is_this_emulator_error`).
+//!   first answer in the environment's recording, and that recording is dropped as the run goes
+//!   on and when it ends, like the rest of it (above; [`Machine::finish`]). What keeps the date
+//!   is the run's report: [`RunReport::date`] (`summary.json`'s `date`) holds the RTC at boot and
+//!   whether it was the host's or pinned, so a run that read the host's date can be pinned to it
+//!   again with `--date` (test: `a_runs_report_keeps_its_date_and_where_it_came_from`).
+//!   `time:u`'s clocks start from it ([`Given::time`]; tests:
+//!   `a_pinned_date_reaches_time_u_and_the_host_is_not_read`,
+//!   `the_hosts_date_reaches_time_u_through_a_real_runs_services`). A failure to read it ends the
+//!   run as an emulator error before the services are installed and the guest runs
+//!   ([`set_up_services`]; test:
+//!   `a_failed_read_of_the_date_ends_the_run_before_the_services_are_installed`), but in a run
+//!   that branch cannot be reached yet: a run's environment is always a [`LiveEnv`], whose wall
+//!   clock always answers. It can be reached once a run's environment can be a replay.
+//!   `a_replay_without_the_date_is_this_emulator_error` pins the message [`date_at_boot`] gives,
+//!   not its wiring into [`Machine::start`].
 //!
 //! # When the environment fails a service
 //!
@@ -164,7 +174,7 @@ use starquake_services::lm;
 use starquake_services::time::{RtcAtBoot, TimeSettings};
 use starquake_trace::{
     DumpError, Env, EventKind, FlightRecorder, GuestTicks, HostClock, HostNanos, LifecyclePhase,
-    LiveEnv, Recorder, TextSink, ThreadId,
+    LiveEnv, Recorder, TextSink, ThreadId, UnixSeconds,
 };
 
 use crate::clock::Timebase;
@@ -172,7 +182,7 @@ use crate::crash::{Backtrace, CrashReport, Exception};
 use crate::hle::{FrontMode, FspHost, Graphics, HostFolder, Reads};
 use crate::image::{PAGE, Placement};
 use crate::report::{
-    ExitReason, GUEST_LOG_BYTES, Mapping, RunOptions, RunReport, ThreadPc, empty_dump,
+    ExitReason, GUEST_LOG_BYTES, Mapping, RunDate, RunOptions, RunReport, ThreadPc, empty_dump,
 };
 use crate::services_report::{LastStubbed, ServicesReport};
 use crate::space::Touch;
@@ -346,6 +356,23 @@ fn real_services(dispatcher: &Dispatcher, given: Given) -> Result<(), String> {
 fn date_at_boot(rtc: RtcAtBoot, env: &dyn Env) -> Result<TimeSettings, String> {
     TimeSettings::at_boot(rtc, env)
         .map_err(|error| format!("the run's date could not be read: {error}"))
+}
+
+/// Installs a run's services with its date, as [`Machine::start`] does: `date` is what reading
+/// it came to ([`date_at_boot`]), and `install` puts the services in front of the run's
+/// dispatcher with `time:u`'s clocks starting from the settings it is given. Returns those
+/// settings. A failed read ends the run with its message and `install` is not called; a failed
+/// install ends it as "the services could not be set up: ...", with the settings it was given.
+fn set_up_services(
+    date: Result<TimeSettings, String>,
+    install: impl FnOnce(TimeSettings) -> Result<(), String>,
+) -> Result<TimeSettings, (Ending, Option<TimeSettings>)> {
+    let time = date.map_err(|message| (Ending::Failed(message), None))?;
+    install(time).map_err(|error| {
+        let ending = Ending::Failed(format!("the services could not be set up: {error}"));
+        (ending, Some(time))
+    })?;
+    Ok(time)
 }
 
 /// A real run's `fsp-srv` workers: one thread on each of `envs`, keeping no record (module docs,
@@ -600,6 +627,9 @@ struct Aftermath {
     threads: Vec<StoppedThread>,
     /// What the services left behind, read from their servers after every core stopped.
     services: ServicesReport,
+    /// The date the run's clocks started from ([`RunReport::date`]); `None` when the run ended
+    /// before it was read.
+    date: Option<RunDate>,
 }
 
 /// One guest thread when the run stopped (see [`ThreadPc`], which this becomes).
@@ -611,6 +641,10 @@ struct StoppedThread {
     core: Option<u8>,
     pc: u64,
 }
+
+/// How a run that [`Machine::start`] could not start ended: the ending, the guest log and the
+/// call counts it had, and the date it read, if it read one.
+type Unstarted = (Ending, GuestLog, Tally, Option<RunDate>);
 
 /// What every core and the timer thread share during a run.
 struct Machine<'a, V: Vcpu, C> {
@@ -639,6 +673,8 @@ struct Machine<'a, V: Vcpu, C> {
     /// The program counter of each thread a core's vCPU held when the core stopped, with the
     /// core, by the thread's id as the guest knows it (`core_loop`'s `Core::leave`).
     held: Mutex<BTreeMap<u64, (u8, u64)>>,
+    /// The date the run's clocks started from, once [`Machine::start`] has read it.
+    date: Option<RunDate>,
 }
 
 impl<V: Vcpu, C: HostClock + Clone> Machine<'_, V, C> {
@@ -776,6 +812,7 @@ pub(crate) fn run_serving<V: Vcpu, C: HostClock + Clone + 'static>(
         stack,
         threads,
         services,
+        date,
     } = aftermath;
     let exit = match ending {
         Ending::Exited => ExitReason::ProcessExited,
@@ -828,6 +865,7 @@ pub(crate) fn run_serving<V: Vcpu, C: HostClock + Clone + 'static>(
         services,
         host_log: Vec::new(),
         host_log_dropped: 0,
+        date,
     }
 }
 
@@ -914,8 +952,12 @@ fn drive<V: Vcpu, C: HostClock + Clone + 'static>(
     let machine = match Machine::start(dispatcher, space, session, env, limits, install) {
         Ok(machine) => machine,
         Err(failed) => {
-            let (ending, log, tally) = *failed;
-            return (ending, log, tally, Aftermath::default());
+            let (ending, log, tally, date) = *failed;
+            let aftermath = Aftermath {
+                date,
+                ..Aftermath::default()
+            };
+            return (ending, log, tally, aftermath);
         }
     };
     let count = machine.cores.count();
@@ -958,8 +1000,12 @@ fn drive<V: Vcpu, C: HostClock + Clone + 'static>(
 
 impl<'a, V: Vcpu, C: HostClock + Clone> Machine<'a, V, C> {
     /// The machine over `dispatcher`'s tables with one core per core of its scheduler, with
-    /// the run's services installed ([`Install`]) and the process's start recorded. A failure
-    /// to install the services is how the run ends, with the guest log and call counts it had.
+    /// the run's date read ([`date_at_boot`]), the run's services installed with it
+    /// ([`Install`], [`set_up_services`]) and the process's start recorded. A failure to install
+    /// the services is how the run ends, with the guest log and call counts it had, and the date
+    /// it read. So would a failure to read the date, but that branch cannot be reached until a
+    /// run's environment can be a replay: `env` is a [`LiveEnv`], whose wall clock always
+    /// answers (module docs, "The run's date").
     fn start(
         dispatcher: Dispatcher,
         space: &'a dyn GuestSpace<V>,
@@ -967,7 +1013,7 @@ impl<'a, V: Vcpu, C: HostClock + Clone> Machine<'a, V, C> {
         env: &'a Arc<LiveEnv>,
         limits: Limits,
         install: &Install,
-    ) -> Result<Self, Box<(Ending, GuestLog, Tally)>>
+    ) -> Result<Self, Box<Unstarted>>
     where
         C: 'static,
     {
@@ -975,7 +1021,7 @@ impl<'a, V: Vcpu, C: HostClock + Clone> Machine<'a, V, C> {
             scheduler.core_count()
         });
         let bell = Arc::new(timer::Bell::default());
-        let machine = Self {
+        let mut machine = Self {
             session,
             space,
             dispatcher,
@@ -997,26 +1043,30 @@ impl<'a, V: Vcpu, C: HostClock + Clone> Machine<'a, V, C> {
             bell,
             reads: session.reads_environments(),
             held: Mutex::new(BTreeMap::new()),
+            date: None,
         };
-        let time = match date_at_boot(session.options.rtc, &**env) {
-            Ok(time) => time,
-            Err(message) => {
-                let ending = Ending::Failed(message);
-                return Err(Box::new((ending, take_log(&machine.log), Tally::default())));
+        let rtc = session.options.rtc;
+        // The `Err` of `date_at_boot` cannot happen here yet: `env` is a live environment, whose
+        // wall clock always answers (module docs, "The run's date").
+        let started = set_up_services(date_at_boot(rtc, &**env), |time| {
+            let given = Given {
+                env: Arc::<LiveEnv>::clone(env),
+                reads: machine.reads.clone(),
+                ready: machine.ready.clone(),
+                halt: Arc::<Halted>::clone(&machine.halted),
+                guest_log: Arc::new(ServicesLog(Arc::clone(&machine.log))),
+                graphics: Arc::clone(&machine.graphics),
+                time,
+            };
+            install(&machine.dispatcher, given)
+        });
+        let dated = |time: TimeSettings| RunDate::new(rtc, UnixSeconds(time.rtc_at_boot));
+        match started {
+            Ok(time) => machine.date = Some(dated(time)),
+            Err((ending, time)) => {
+                let log = take_log(&machine.log);
+                return Err(Box::new((ending, log, Tally::default(), time.map(dated))));
             }
-        };
-        let given = Given {
-            env: Arc::<LiveEnv>::clone(env),
-            reads: machine.reads.clone(),
-            ready: machine.ready.clone(),
-            halt: Arc::<Halted>::clone(&machine.halted),
-            guest_log: Arc::new(ServicesLog(Arc::clone(&machine.log))),
-            graphics: Arc::clone(&machine.graphics),
-            time,
-        };
-        if let Err(error) = install(&machine.dispatcher, given) {
-            let ending = Ending::Failed(format!("the services could not be set up: {error}"));
-            return Err(Box::new((ending, take_log(&machine.log), Tally::default())));
         }
         session.record(EventKind::Lifecycle {
             phase: LifecyclePhase::ProcessStart,
@@ -1043,14 +1093,17 @@ impl<'a, V: Vcpu, C: HostClock + Clone> Machine<'a, V, C> {
                 stack: stack_block(&self.dispatcher, regs),
                 threads: Vec::new(),
                 services,
+                date: self.date,
             },
             Ending::TimedOut => Aftermath {
                 stack: None,
                 threads: self.stopped_threads(),
                 services,
+                date: self.date,
             },
             Ending::Exited | Ending::Failed(_) => Aftermath {
                 services,
+                date: self.date,
                 ..Aftermath::default()
             },
         };

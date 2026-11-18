@@ -21,9 +21,18 @@
 //!
 //! The run's date is the host's, read once as the run boots and recorded, unless `--date` pins
 //! one: whole seconds since 1970-01-01T00:00:00 UTC, which may be negative (decision log,
-//! 2026-11-17, "The run's date comes from the host, recorded"; [`rtc_at_boot`]). The flag is
-//! starquake's own: the observability spec's headless contract names no flag for a date, and its
-//! `--clock fixed` fixes the monotonic clock only.
+//! 2026-11-17, "The run's date comes from the host, recorded"; [`rtc_at_boot`]). Either way
+//! `summary.json` says what it was and where it came from (its `date`), so a run that read the
+//! host's date can be run again pinned to it. The flag is starquake's own: the observability
+//! spec's headless contract names no flag for a date, and its `--clock fixed` fixes the monotonic
+//! clock only.
+//!
+//! A pinned date is refused, as a usage error, outside [`FIRST_RTC_AT_BOOT`] to
+//! [`LAST_RTC_AT_BOOT`] (-9223372036 to 9223372036): the seconds whose nanoseconds fit an `i64`,
+//! which is what `time:u` sets its clocks up from. One exception remains inside the range: at
+//! the last seconds, the room `time:u` has left for the uptime is under a second
+//! (`starquake_services::time::LAST_RTC_AT_BOOT`), so a guest that first asks `time:u` for its
+//! clocks' memory later than that is answered `OVERFLOW` and cannot set its clocks up.
 //!
 //! PROVISIONAL (walking skeleton, #74). Of the contract's flags only `--until timeout=<n>s` and
 //! `--artifacts` exist; `--script`, `--clock`, `--seed`, `--record`, `--snapshot-every` and the
@@ -53,7 +62,8 @@ use starquake_core::host_log::{HostLog, HostLogError};
 use starquake_core::loader::read_at::{Positional, ReadAt};
 use starquake_core::title::{self as title_api, RomFs};
 use starquake_core::{
-    ExitReason, RtcAtBoot, RunOptions, RunReport, System, UnixSeconds, artifacts, exit_code,
+    ExitReason, FIRST_RTC_AT_BOOT, LAST_RTC_AT_BOOT, RtcAtBoot, RunOptions, RunReport, System,
+    UnixSeconds, artifacts, exit_code,
 };
 
 pub mod title;
@@ -72,7 +82,8 @@ crash.txt when the guest crashed. Without --artifacts the folder is made under
 the system's temporary folder and its path is printed. Without --until the
 program runs until it exits or crashes, however long that takes. The guest's
 date is the host's, read once as the run starts, unless --date pins one:
-whole seconds since 1970-01-01T00:00:00 UTC, as in --date 1672531200.
+whole seconds since 1970-01-01T00:00:00 UTC, from -9223372036 to 9223372036,
+as in --date 1672531200. summary.json says which date the run used.
 exit codes: 0 the program exited, 1 the guest crashed, 2 emulator error, 3 timeout
 
 inspect: prints what a NUP title holds: its packages, the ExeFS of its newest
@@ -162,10 +173,13 @@ pub enum UsageError {
     /// `--until timeout=` with something other than a whole number of seconds.
     #[error("`--until {0}` is not a timeout: write a whole number of seconds, as in `timeout=60s`")]
     BadTimeout(String),
-    /// `--date` with something other than a whole number of seconds that fits an `i64`.
+    /// `--date` with something other than a whole number of seconds from [`FIRST_RTC_AT_BOOT`]
+    /// to [`LAST_RTC_AT_BOOT`].
     #[error(
-        "`--date {0}` is not a date: write whole seconds since 1970-01-01T00:00:00 UTC, as in \
-         `--date 1672531200`"
+        "`--date {0}` is not a date: write whole seconds since 1970-01-01T00:00:00 UTC, from \
+         {first} to {last}, as in `--date 1672531200`",
+        first = FIRST_RTC_AT_BOOT,
+        last = LAST_RTC_AT_BOOT
     )]
     BadDate(String),
 }
@@ -189,13 +203,14 @@ fn parse_until(condition: &str) -> Result<Duration, UsageError> {
         .ok_or_else(|| UsageError::BadTimeout(condition.to_owned()))
 }
 
-/// Parses `--date`'s value: an optional `-`, then one or more ASCII digits, as an `i64` of
-/// seconds since the Unix epoch.
+/// Parses `--date`'s value: an optional `-`, then one or more ASCII digits, as seconds since
+/// the Unix epoch from [`FIRST_RTC_AT_BOOT`] to [`LAST_RTC_AT_BOOT`] (module docs).
 fn parse_date(value: &str) -> Result<UnixSeconds, UsageError> {
     let digits = value.strip_prefix('-').unwrap_or(value);
     Some(digits)
         .filter(|digits| !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()))
-        .and_then(|_| value.parse().ok())
+        .and_then(|_| value.parse::<i64>().ok())
+        .filter(|seconds| (FIRST_RTC_AT_BOOT..=LAST_RTC_AT_BOOT).contains(seconds))
         .map(UnixSeconds)
         .ok_or_else(|| UsageError::BadDate(value.to_owned()))
 }
@@ -607,7 +622,11 @@ mod tests {
     }
 
     #[test]
-    fn a_date_is_whole_seconds_that_fit_an_i64() {
+    fn a_date_is_whole_seconds_whose_nanoseconds_fit_an_i64() {
+        let last = LAST_RTC_AT_BOOT.to_string();
+        let first = FIRST_RTC_AT_BOOT.to_string();
+        let past_last = (LAST_RTC_AT_BOOT + 1).to_string();
+        let before_first = (FIRST_RTC_AT_BOOT - 1).to_string();
         let max = i64::MAX.to_string();
         let min = i64::MIN.to_string();
         for (good, expected) in [
@@ -616,8 +635,9 @@ mod tests {
             ("007", 7),
             ("1672531200", 1_672_531_200),
             ("-1", -1),
-            (max.as_str(), i64::MAX),
-            (min.as_str(), i64::MIN),
+            // Exactly at each end.
+            (last.as_str(), LAST_RTC_AT_BOOT),
+            (first.as_str(), FIRST_RTC_AT_BOOT),
         ] {
             assert_eq!(parse_date(good), Ok(UnixSeconds(expected)), "{good}");
         }
@@ -633,6 +653,12 @@ mod tests {
             "2024-02-29",
             "0x10",
             // One past each end.
+            past_last.as_str(),
+            before_first.as_str(),
+            // Whole seconds that fit an `i64` but whose nanoseconds do not.
+            max.as_str(),
+            min.as_str(),
+            // And seconds past an `i64`.
             "9223372036854775808",
             "-9223372036854775809",
         ] {
@@ -645,7 +671,13 @@ mod tests {
         assert_eq!(
             UsageError::BadDate("2024-02-29".into()).to_string(),
             "`--date 2024-02-29` is not a date: write whole seconds since \
-             1970-01-01T00:00:00 UTC, as in `--date 1672531200`"
+             1970-01-01T00:00:00 UTC, from -9223372036 to 9223372036, as in \
+             `--date 1672531200`"
+        );
+        // Through the command line: the run is refused before anything runs.
+        assert_eq!(
+            parse(&args(&["run", "a.nro", "--date", &past_last])),
+            Err(UsageError::BadDate(past_last.clone()))
         );
     }
 
