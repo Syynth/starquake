@@ -40,15 +40,28 @@
 //!   asserts that the mapping asks for read or write; no HLE service uses it. Test:
 //!   `a_shared_memory_permission_is_read_or_read_write`.
 //!
+//! # The pages' lifetime
+//!
+//! The pages are taken last when a server makes a shared memory, after every check that can
+//! refuse (`IpcContext::create_shared_memory`), and running out of them is
+//! [`KernelError::OutOfMemory`], Eden's `ResultOutOfMemory`
+//! ([`AddressSpace::allocate_shared`](super::AddressSpace::allocate_shared)). They are given
+//! back when the last reference to the shared memory goes (`KSharedMemory::Finalize`), through
+//! [`Mapper::release_shared`](super::Mapper::release_shared), by the dispatcher as it lets the
+//! kernel lock go ([`crate::svc::shared_memory::free_released`]). Every mapping holds a
+//! reference, so none is left by then; the translation hands the pages out again only once the
+//! flushes the unmappings owe have run.
+//!
 //! # Not built
 //!
 //! - **No resource limit is charged.** Eden reserves the size from the system's resource limit
-//!   (`ResultLimitReached` when it has no room). Starquake has no system resource limit (only
-//!   each process's own, [`crate::resource_limit`]), so making shared memory never fails that
-//!   way. There is no limit for a test to exceed until one is built.
-//! - **Pages are not given back** when the last reference to a shared memory goes: the
-//!   [`Mapper`](super::Mapper) has no call for it, and its only implementation
-//!   (`starquake-core`) never reuses backing anyway (PROVISIONAL there).
+//!   (`kernel.GetSystemResourceLimit()`, `PhysicalMemoryMax`; `ResultLimitReached` when it has
+//!   no room) and releases it in `Finalize`. Starquake has no system resource limit, only each
+//!   process's own ([`crate::resource_limit`]), whose physical memory is the process's pool
+//!   ([`super::MemoryLimit`], which its system resource is charged to as well,
+//!   [`super::SystemResource`]). Eden charges neither for shared memory, so neither is charged
+//!   here, and making shared memory never fails that way. There is no limit for a test to
+//!   exceed until a system resource limit is built.
 
 use core::fmt;
 use std::sync::Arc;

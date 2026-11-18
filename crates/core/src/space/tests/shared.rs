@@ -4,6 +4,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use starquake_kernel::memory::testing::RecordingMapper;
 use starquake_memory::stage1::VA_SPACE_END;
 
 use super::*;
@@ -748,4 +749,77 @@ fn a_run_whose_zeroing_fails_is_not_handed_out_and_stays_reusable() {
     assert_eq!(snapshot(&space), before);
     space.tables.memory().refuse.store(false, Ordering::SeqCst);
     assert_eq!(space.allocate_shared(2 * PAGE_SIZE), Ok(ram(0, 2)));
+}
+
+/// What each step of [`give_back_scenario`] came to: `Ok`, or which kind of refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Came {
+    Ok,
+    Refused,
+    OutOfMemory,
+}
+
+fn came<T>(result: Result<T, MapperError>) -> Came {
+    match result {
+        Ok(_) => Came::Ok,
+        Err(MapperError::Refused(_)) => Came::Refused,
+        Err(MapperError::OutOfMemory(_)) => Came::OutOfMemory,
+    }
+}
+
+/// One shared memory made, mapped, given back too early, unmapped, given back twice, and a
+/// shared memory no translation has room for; and the pages of one of its size made after.
+fn give_back_scenario(mapper: &mut dyn Mapper) -> (Vec<Came>, BackingRange, BackingRange) {
+    let pages = mapper.allocate_shared(PAGE_SIZE).unwrap().backing();
+    let larger = BackingRange::new(pages.base(), 2 * PAGE_SIZE).unwrap();
+    let steps = vec![
+        came(mapper.map_shared(LOW, pages, Perms::ReadWrite)),
+        came(mapper.release_shared(pages)),
+        came(mapper.release_shared(larger)),
+        came(mapper.unmap(LOW, PAGE_SIZE)),
+        came(mapper.release_shared(pages)),
+        came(mapper.release_shared(pages)),
+        came(mapper.allocate_shared(u64::MAX - (PAGE_SIZE - 1))),
+    ];
+    (
+        steps,
+        pages,
+        mapper.allocate_shared(PAGE_SIZE).unwrap().backing(),
+    )
+}
+
+#[test]
+fn the_recording_mapper_gives_back_as_this_one_does_but_never_hands_out_again() {
+    let space = Arc::new(space());
+    let mut real = SpaceMapper(Arc::clone(&space));
+    // This one: a flush is owed for the unmapping until the tables hand it out, so the pages
+    // made after the scenario come from RAM never handed out; once it has run, they come back.
+    let (real_steps, real_pages, real_after) = give_back_scenario(&mut real);
+    let (mut recording, _log) = RecordingMapper::new();
+    let (recorded_steps, recorded_pages, recorded_after) = give_back_scenario(&mut recording);
+    let expected = [
+        Came::Ok,
+        Came::Refused,
+        Came::Refused,
+        Came::Ok,
+        Came::Ok,
+        Came::Refused,
+        Came::OutOfMemory,
+    ];
+    assert_eq!(real_steps, expected);
+    assert_eq!(recorded_steps, expected);
+    assert_ne!(real_after, real_pages);
+    space.tables().take_pending_flushes();
+    assert_eq!(
+        real.allocate_shared(PAGE_SIZE).map(|pages| pages.backing()),
+        Ok(real_pages)
+    );
+    // The difference the recording mapper lists: it never hands given-back pages out again.
+    assert_ne!(recorded_after, recorded_pages);
+    assert_eq!(
+        recording
+            .allocate_shared(PAGE_SIZE)
+            .map(|pages| pages.backing().base()),
+        Ok(recorded_after.end())
+    );
 }
