@@ -11,7 +11,7 @@ use starquake_memory::stage1::{Stage1Tables, VA_SPACE_END};
 use starquake_memory::{BackingRange, GuestMemory, PAGE_SIZE, Perms, Translation};
 
 use super::*;
-use crate::FaultStatus;
+use crate::{FaultStatus, host_counter};
 
 /// One VM per process: every test here holds this while it has one.
 static VM_LOCK: Mutex<()> = Mutex::new(());
@@ -236,7 +236,7 @@ fn a_guest_store_to_the_shim_or_its_tables_is_stopped_by_stage_2() {
     assert_eq!(bytes, shim);
 }
 
-/// `hv_sys_reg_t` of `CNTFRQ_EL0`: op0 3, op1 3, CRn 14, CRm 0, op2 0, encoded as `ffi`'s other
+/// `hv_sys_reg_t` of `CNTFRQ_EL0`: `op0` 3, `op1` 3, `CRn` 14, `CRm` 0, `op2` 0, encoded as `ffi`'s other
 /// system registers are. Not a register the SDK headers name (`hv_vcpu_types.h`); the test
 /// below checks that Hypervisor.framework refuses it.
 const CNTFRQ_EL0: u16 = (3 << 14) | (3 << 11) | (14 << 7);
@@ -307,4 +307,136 @@ fn the_guests_counter_frequency_cannot_be_changed() {
         .unwrap();
     assert_eq!(machine.probe(code, 0), Ok(Exit::Svc(1)));
     assert_eq!(machine.vcpu.regs().unwrap().x[1], host_hz);
+}
+
+/// `hvc` immediate the recovery test plants in the shim: one the shim never uses.
+const HVC_PLANTED: u16 = 7;
+/// `svc #0`.
+const SVC_0: u32 = 0xd400_0001;
+
+/// `mrs x<rt>, cntpct_el0` (Arm ARM, `MRS`: `op0` 3, `op1` 3, `CRn` 14, `CRm` 0, `op2` 1; `Rt` in bits 4:0).
+fn mrs_cntpct(rt: u32) -> u32 {
+    0xd53b_e020 | rt
+}
+
+/// A distinct value for register `n`, far from any counter reading.
+fn marker(n: usize) -> u64 {
+    let n = u64::try_from(n).unwrap();
+    0x5a5a_0000_0000_0000 | (n << 8) | n
+}
+
+/// Every offset on the shim's path for a trapped `mrs x<rt>, cntpct_el0`: the dispatcher from
+/// the vector to its branch, then the stub of `rt` to its `eret`.
+fn counter_path(rt: u32) -> Vec<usize> {
+    let stub = shim::STUBS + usize::try_from(rt).unwrap() * shim::STUB_LEN;
+    (shim::EL0_SYNC..=shim::ELR_BUMPED)
+        .step_by(4)
+        .chain((stub..=stub + shim::STUB_ERET).step_by(4))
+        .collect()
+}
+
+#[test]
+fn a_counter_read_stopped_anywhere_on_the_shims_path_is_recovered_exactly() {
+    // An interrupt can stop a vCPU at any instruction of the shim. To stop it at each one in
+    // turn, the test plants an `hvc` there, lets the guest's counter read trap into the shim
+    // and run up to it, puts the original word back and treats the vCPU as interrupted at that
+    // instruction: exactly the state an interrupt there leaves. Recovery must give back the
+    // guest's registers as they were (all but `Rt` when the read is complete), and the next run
+    // must finish the read with the scaled count.
+    let Some(mut machine) = Machine::new() else {
+        return;
+    };
+    let host_hz = machine.backend.counter_frequency();
+    let ratio = starquake_loader::patch::CounterRescale {
+        host_hz,
+        guest_hz: host_hz * 4,
+    }
+    .ratio()
+    .unwrap();
+    let scale = CounterScale::new(ratio.int(), ratio.frac());
+    let page = machine.backend.ram().base() + PAGE_SIZE;
+    let code = CODE + PAGE_SIZE;
+    machine
+        .tables
+        .map(
+            code,
+            BackingRange::new(page, PAGE_SIZE).unwrap(),
+            Perms::ReadExecute,
+        )
+        .unwrap();
+    machine.vcpu.set_counter_scale(scale).unwrap();
+    let mut stopped_at_eret = 0;
+    // A register of the guest's own, the three the shim borrows, and xzr.
+    let registers = [1, 9, 10, 11, 31];
+    for rt in registers {
+        let bytes: Vec<u8> = [mrs_cntpct(rt), SVC_0]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        machine.backend.physical().write(page, &bytes).unwrap();
+        for offset in counter_path(rt) {
+            let context = format!("x{rt}, shim offset {offset:#x}");
+            let at = CODE_OFFSET + u64::try_from(offset).unwrap();
+            let system = &machine.backend.vm.system;
+            system
+                .write(at, &shim::hvc(HVC_PLANTED).to_le_bytes())
+                .unwrap();
+            let vcpu = &mut machine.vcpu;
+            let mut regs = vcpu.regs().unwrap();
+            for (n, x) in regs.x.iter_mut().enumerate() {
+                *x = marker(n);
+            }
+            regs.pc = code;
+            vcpu.set_regs(&regs).unwrap();
+            let before = host_counter::read();
+            let exit = vcpu.enter().unwrap();
+            assert_eq!(exit.reason, ffi::EXIT_REASON_EXCEPTION, "{context}");
+            assert_eq!(
+                hvc_immediate(exit.exception.syndrome),
+                Some(HVC_PLANTED),
+                "{context}"
+            );
+            system
+                .write(at, &shim::WORDS[offset / 4].to_le_bytes())
+                .unwrap();
+            vcpu.set_reg(ffi::REG_PC, SHIM_VA + at - CODE_OFFSET)
+                .unwrap();
+            assert_eq!(vcpu.interrupted(), Ok(Exit::Interrupted), "{context}");
+            let recovered = vcpu.regs().unwrap();
+            let rt_index = usize::try_from(rt).unwrap();
+            for (n, &x) in recovered.x.iter().enumerate() {
+                if n != rt_index {
+                    assert_eq!(x, marker(n), "x{n} recovered, {context}");
+                }
+            }
+            // Stopped at the stub's `eret` the read is complete; anywhere else it runs again.
+            let complete = offset == shim::STUBS + rt_index * shim::STUB_LEN + shim::STUB_ERET;
+            stopped_at_eret += usize::from(complete);
+            assert_eq!(
+                recovered.pc,
+                if complete { code + 4 } else { code },
+                "{context}"
+            );
+            assert_eq!(vcpu.run(), Ok(Exit::Svc(0)), "{context}");
+            let after = host_counter::read();
+            let x = vcpu.regs().unwrap().x;
+            for (n, &value) in x.iter().enumerate() {
+                if n == rt_index {
+                    assert!(
+                        ratio.scale(before) <= value && value <= ratio.scale(after),
+                        "x{rt} read {value}, not in {}..={}, {context}",
+                        ratio.scale(before),
+                        ratio.scale(after)
+                    );
+                } else {
+                    assert_eq!(value, marker(n), "x{n} after the read, {context}");
+                }
+            }
+        }
+    }
+    assert_eq!(
+        stopped_at_eret,
+        registers.len(),
+        "each stub was stopped at its eret once"
+    );
 }

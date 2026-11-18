@@ -816,8 +816,7 @@ impl HvfVcpu {
     /// reads" in the module docs). Give it the scale the loader's patcher used for the program
     /// this vCPU runs, and an unpatched read gives the value a patched one would at the same
     /// count. Takes effect from the next [`Vcpu::run`]; a read the shim had begun when the vCPU
-    /// was last stopped runs again with the new scale. After an error the vCPU keeps the scale
-    /// it had.
+    /// was last stopped runs again with the new scale.
     pub fn set_counter_scale(&mut self, scale: CounterScale) -> Result<(), Error> {
         self.slot.vm.set_counter_scale(self.slot.index, scale)?;
         self.counter_scale = scale;

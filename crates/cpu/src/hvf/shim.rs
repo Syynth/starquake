@@ -91,7 +91,7 @@ pub(super) const STUB_LEN: usize = 4 * STUB_WORDS;
 const STUB_WORDS: usize = 8;
 /// Offset of the `eret` inside a counter stub (after it has written `Rt` and reloaded the
 /// borrowed registers).
-const STUB_ERET: usize = STUB_LEN - 4;
+pub(super) const STUB_ERET: usize = STUB_LEN - 4;
 /// End of the counter stubs.
 const STUBS_END: usize = STUBS + 32 * STUB_LEN;
 /// Entry point: invalidate x1 pages starting with the one x0 names, at every level.
@@ -510,7 +510,8 @@ mod tests {
                 LDP_X9_X10 => vec![X9, X10],
                 LDUR_X9 | LDUR_X10 | LDUR_X11 => vec![word & 0x1f],
                 NOP => vec![],
-                other => panic!("{other:#x} is not a reload"),
+                // Not a reload: a register no stub has, so the comparison below fails.
+                _ => vec![u32::MAX],
             }
         };
         for rt in 0..32u32 {
