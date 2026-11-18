@@ -20,6 +20,7 @@ fn request(thread: u64, fill: u8) -> Request {
             core: 2,
             message_address: 0x1000 * thread,
             session_handle: Handle::from_raw(0x100 + u32::try_from(thread).unwrap()),
+            process: crate::id::ProcessId::from_parts(0, 0),
         },
         message: Box::new([fill; BUFFER_SIZE]),
         translated: Translated::default(),

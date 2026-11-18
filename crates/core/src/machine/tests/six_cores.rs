@@ -411,12 +411,14 @@ fn time_slicing_takes_turns_between_threads_of_one_level_and_keeps_their_registe
 }
 
 /// A handler that defers every request and answers it when the timer thread delivers: what a
-/// service with a host worker does, without the worker.
+/// service with a host worker does, without the worker. When `end` says so, it asks to end the
+/// sender's process as it gives each reply, as a service that deferred `Exit` would.
 struct Deferring {
     ready: Ready,
     server: Arc<Mutex<Option<ServerId>>>,
     waiting: VecDeque<ObjectId>,
     fill: u8,
+    end: bool,
 }
 
 impl SessionHandler for Deferring {
@@ -441,11 +443,14 @@ impl SessionHandler for Deferring {
 
     fn take_reply(
         &mut self,
-        _: &mut IpcContext<'_>,
+        cx: &mut IpcContext<'_>,
         message: &mut [u8],
     ) -> Option<(ObjectId, Result<(), HandlerError>)> {
         let session = self.waiting.pop_front()?;
         message.fill(self.fill);
+        if self.end {
+            cx.end_process();
+        }
         Some((session, Ok(())))
     }
 }
@@ -457,12 +462,23 @@ const DEFER: ServiceId = ServiceId(0x77);
 const REPLY_FILL: u8 = 0x5D;
 
 fn install_deferring(dispatcher: &Dispatcher, given: Given) -> Result<(), String> {
+    install_deferring_with(dispatcher, given, false)
+}
+
+/// [`install_deferring`], with a handler that asks to end the sender's process as it gives each
+/// reply.
+fn install_ending(dispatcher: &Dispatcher, given: Given) -> Result<(), String> {
+    install_deferring_with(dispatcher, given, true)
+}
+
+fn install_deferring_with(dispatcher: &Dispatcher, given: Given, end: bool) -> Result<(), String> {
     let server = Arc::new(Mutex::new(None));
     let handler = Deferring {
         ready: given.ready,
         server: Arc::clone(&server),
         waiting: VecDeque::new(),
         fill: REPLY_FILL,
+        end,
     };
     let port = PortName::new(DEFER_PORT).map_err(|error| error.to_string())?;
     let id = dispatcher
@@ -560,6 +576,201 @@ fn a_deferred_reply_is_delivered_by_the_timers_turn_and_wakes_its_sender() {
         .collect();
     assert_eq!(sends.len(), 1);
     assert_eq!(sends[0].thread, MAIN_THREAD);
+}
+
+/// A guest whose main thread connects to the deferring service and sends it one request, as
+/// its last step: a run that went on after the reply would find no more steps and fail. Returns
+/// the guest, its memory with the thread's message buffer, and the main thread's script.
+fn sending_once(guest: &Guest) -> (WithTls<'_>, ScriptedVcpu) {
+    let page = usize::try_from(crate::image::PAGE).unwrap();
+    let space = WithTls {
+        image: &guest.memory,
+        tls: FlatMemory::new(guest.tls, page),
+    };
+    // The port's name goes where the kernel lets the guest read: the program's read-only data,
+    // which a scripted guest does not use.
+    let name = guest.start_of("main.rodata");
+    guest
+        .memory
+        .write(name, format!("{DEFER_PORT}\0").as_bytes())
+        .unwrap();
+    let main = ScriptedVcpu::new()
+        .then(move |regs| regs.x[1] = name, svc(SvcId::ConnectToNamedPort))
+        .then(start_created, svc(SvcId::SendSyncRequest));
+    (space, main)
+}
+
+/// Whether the main thread's message buffer holds the deferring service's reply.
+fn holds_the_reply(space: &WithTls<'_>, tls: u64) -> bool {
+    let mut reply = vec![0; starquake_ipc::BUFFER_SIZE];
+    space.tls.read(tls, &mut reply).unwrap();
+    reply.iter().all(|byte| *byte == REPLY_FILL)
+}
+
+#[test]
+fn a_handler_ending_the_process_during_the_timers_delivery_ends_the_run_after_the_reply() {
+    let guest = Guest::new(&programs::hello().unwrap());
+    let (space, main) = sending_once(&guest);
+    let outcome = stepped(&guest, &space, vec![main], &install_ending, |_, machine| {
+        // Every round is a timer turn, which stops the run as the timer thread does.
+        if let Err(ending) = crate::machine::timer::deliver(machine) {
+            machine.stop(ending);
+        }
+    });
+    assert_exited(&outcome);
+    assert!(holds_the_reply(&space, guest.tls));
+    // The request is recorded, answered with success, and then the process's end, for the
+    // sender, on its core.
+    let send = u32::from(SvcId::SendSyncRequest.number());
+    let tail: Vec<_> = outcome
+        .events
+        .iter()
+        .filter(|event| {
+            matches!(event.kind, EventKind::Svc { id, .. } if id == send)
+                || matches!(event.kind, EventKind::Lifecycle { .. })
+        })
+        .map(|event| (event.core, event.thread, event.kind))
+        .collect();
+    let success = starquake_trace::ResultCode(0);
+    assert!(
+        matches!(
+            tail.as_slice(),
+            [
+                (_, _, EventKind::Lifecycle { phase: LifecyclePhase::ProcessStart, .. }),
+                (0, MAIN_THREAD, EventKind::Svc { id, result, .. }),
+                (0, MAIN_THREAD, EventKind::Lifecycle { phase: LifecyclePhase::ProcessExit, subject }),
+            ] if *id == send && *result == success && *subject == PROCESS_ID
+        ),
+        "{tail:?}"
+    );
+}
+
+#[test]
+fn a_delivery_records_the_process_end_on_the_core_of_the_sender_that_asked() {
+    // The sender is a thread the main thread starts on core 1, not the timer thread's core 0,
+    // so the end recorded on the timer's own core would show.
+    const SENDER: u64 = 0xA;
+    const SENDER_CORE: u8 = 1;
+    assert_ne!(SENDER_CORE, crate::machine::CORE);
+    let guest = Guest::new(&programs::hello().unwrap());
+    let page = usize::try_from(crate::image::PAGE).unwrap();
+    let space = WithTls {
+        image: &guest.memory,
+        tls: FlatMemory::new(guest.tls, page),
+    };
+    let name = guest.start_of("main.rodata");
+    guest
+        .memory
+        .write(name, format!("{DEFER_PORT}\0").as_bytes())
+        .unwrap();
+    let order = Rc::new(RefCell::new(Vec::new()));
+    let main = ScriptedVcpu::new()
+        .then(
+            create(SENDER, 30, i32::from(SENDER_CORE)),
+            svc(SvcId::CreateThread),
+        )
+        .then(start_created, svc(SvcId::StartThread))
+        .then(succeeded, svc(SvcId::ExitThread));
+    // The sender's message buffer: its thread-local region, in the main thread's page.
+    let tls = Rc::new(std::cell::Cell::new(0));
+    let seen = Rc::clone(&tls);
+    let begin = begins(SENDER, &order);
+    let sender = ScriptedVcpu::new()
+        .then(
+            move |regs| {
+                begin(regs);
+                seen.set(regs.tpidrro);
+                regs.x[1] = name;
+            },
+            svc(SvcId::ConnectToNamedPort),
+        )
+        .then(start_created, svc(SvcId::SendSyncRequest));
+    let outcome = stepped(
+        &guest,
+        &space,
+        vec![main, sender],
+        &install_ending,
+        |_, machine| {
+            if let Err(ending) = crate::machine::timer::deliver(machine) {
+                machine.stop(ending);
+            }
+        },
+    );
+    assert_exited(&outcome);
+    assert_eq!(*order.borrow(), [SENDER]);
+    assert!(holds_the_reply(&space, tls.get()));
+    // The request and the process's end are both recorded for the sender, on its core.
+    let send = u32::from(SvcId::SendSyncRequest.number());
+    let sends: Vec<_> = outcome
+        .events
+        .iter()
+        .filter(|event| matches!(event.kind, EventKind::Svc { id, .. } if id == send))
+        .map(|event| (event.core, event.thread))
+        .collect();
+    assert_eq!(sends.len(), 1, "one request was sent: {sends:?}");
+    let (core, thread) = sends[0];
+    assert_eq!(core, SENDER_CORE);
+    assert_ne!(thread, MAIN_THREAD);
+    let ends: Vec<_> = outcome
+        .events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind,
+                EventKind::Lifecycle {
+                    phase: LifecyclePhase::ProcessExit,
+                    ..
+                }
+            )
+        })
+        .map(|event| (event.core, event.thread, event.kind))
+        .collect();
+    assert_eq!(
+        ends,
+        [(
+            SENDER_CORE,
+            thread,
+            EventKind::Lifecycle {
+                phase: LifecyclePhase::ProcessExit,
+                subject: PROCESS_ID
+            }
+        )]
+    );
+}
+
+#[test]
+fn the_timer_thread_ends_the_run_when_a_delivery_ends_the_process() {
+    let guest = Guest::new(&programs::hello().unwrap());
+    let (space, mut main) = sending_once(&guest);
+    let interrupters = Interrupters::default();
+    lock(&interrupters).push(main.interrupter());
+    let registry = Arc::clone(&interrupters);
+    let make = move |_: CoreId| -> Result<ScriptedVcpu, starquake_cpu::Error> {
+        let vcpu = ScriptedVcpu::new();
+        lock(&registry).push(vcpu.interrupter());
+        Ok(vcpu)
+    };
+    // Bounded twice: by the run's own timeout, which a run that missed the end would reach
+    // (and fail below), and by the watchdog, which interrupts every core.
+    let options = RunOptions {
+        timeout: Some(Duration::from_secs(10)),
+        ..RunOptions::default()
+    };
+    let report = bounded(&interrupters, || {
+        run_serving(
+            Vcpus {
+                first: &mut main,
+                make: &make,
+            },
+            guest.program(&space),
+            &options,
+            (Instant::now(), timebase()),
+            Limits::DEFAULT,
+            &install_ending,
+        )
+    });
+    assert_eq!(report.exit, ExitReason::ProcessExited, "{}", report.trace);
+    assert!(holds_the_reply(&space, guest.tls));
 }
 
 #[test]

@@ -18,6 +18,7 @@ use starquake_cpu::GuestRegs;
 
 use super::Dispatcher;
 use crate::id::ThreadId;
+use crate::process::ProcessState;
 use crate::sched::{AffinityMask, CoreId, CoreSignals, SchedError, ThreadState};
 use crate::tables::Scheduler;
 
@@ -131,7 +132,12 @@ impl Dispatcher {
     /// Whether no thread could ever run again by what the kernel knows: no thread is runnable
     /// (queued: a suspended thread is not), no wait has a timer, no server holds a deferred
     /// request, no thread waits for a reply ([`crate::sync::Wait::Reply`]), and every server's
-    /// handler is in its slot.
+    /// handler is in its slot. A run whose process (these tables',
+    /// [`crate::tables::Processes::own`]) has ended is never stalled: it is over, and whoever
+    /// ended it stops the run. That covers the moment between a delivery ending the process
+    /// ([`Dispatcher::deliver_replies`], on the timer thread) and the timer thread stopping the
+    /// run, when every core may have parked (test:
+    /// `a_run_whose_process_a_delivery_ended_is_not_stalled`).
     ///
     /// The last two cover the host threads that end replies without a core: a delivery
     /// ([`Dispatcher::deliver_replies`], the timer thread's) has completed a deferred request,
@@ -150,13 +156,18 @@ impl Dispatcher {
     pub fn is_stalled(&self) -> bool {
         let mut locked = self.lock::<(&Scheduler,)>();
         let handler_out = locked.state.handlers.values().any(Option::is_none);
+        let own = locked.state.tables.processes.own();
         let (scheduler,) = locked.tables();
+        let ended = scheduler
+            .process(own)
+            .is_ok_and(|record| record.state() == ProcessState::Terminated);
         let ipc = scheduler.ipc();
         let deferred = ipc.servers().any(|server| {
             ipc.queue(server)
                 .is_ok_and(|queue| queue.deferred().next().is_some())
         });
-        !scheduler.has_runnable_thread()
+        !ended
+            && !scheduler.has_runnable_thread()
             && scheduler.sync().next_deadline().is_none()
             && !deferred
             && !scheduler.sync().has_reply_wait()

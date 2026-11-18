@@ -244,7 +244,7 @@ mod tests;
 
 pub use cores::{Held, Loaded, Switch};
 pub use device::DeviceShareError;
-pub use ipc::{IpcContext, Woken};
+pub use ipc::{Ended, IpcContext, Woken};
 pub use sync::WakeError;
 
 /// The register that carries a call's result (Eden's wrappers: `SetArg64(args, 0, ret)`).

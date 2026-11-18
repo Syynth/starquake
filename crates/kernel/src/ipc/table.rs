@@ -36,7 +36,7 @@ use super::message::{MessageBuffer, Translated};
 use super::port::PortName;
 use super::queue::{Admission, QueueError, RequestQueue};
 use crate::handle::{Handle, ObjectRefs};
-use crate::id::{ObjectId, ServerId};
+use crate::id::{ObjectId, ProcessId, ServerId};
 use crate::object::{Object, ObjectError, Objects};
 use crate::result::{KernelError, SvcError};
 use crate::slab::Slab;
@@ -102,6 +102,9 @@ pub struct Sender {
     pub message_address: u64,
     /// The session handle it passed, for the system call's event.
     pub session_handle: Handle,
+    /// The process it sends for: the one its request's handler ends when it asks to
+    /// (`IpcContext::end_process`, `dispatch/ipc.rs`, "A handler ends the sender's process").
+    pub process: ProcessId,
 }
 
 /// A request: its sender, its message after the kernel's half of it was translated, and the
