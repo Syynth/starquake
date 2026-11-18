@@ -35,7 +35,10 @@ pub enum Handled {
 pub struct HandlerError(pub String);
 
 /// An HLE server's code. See the module docs.
-pub trait SessionHandler: Send {
+///
+/// `Any`, so whoever put a handler in front of the kernel can read its state back at the end of
+/// a run ([`Dispatcher::inspect_handlers`](crate::dispatch::Dispatcher::inspect_handlers)).
+pub trait SessionHandler: Send + core::any::Any {
     /// A client opened `session` on this server by connecting to it (a named port, or a session
     /// handed out for this server by another one): open it with the server's root interface.
     fn accept(&mut self, session: ObjectId) -> Result<(), HandlerError>;
