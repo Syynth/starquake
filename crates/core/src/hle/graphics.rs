@@ -15,23 +15,28 @@
 //!
 //! | Server | Number | Built with |
 //! |---|---|---|
-//! | root | [`GSV_ROOT`] | `root_server_with_page`, its [`RootState`] naming the three below: 202, 204, 497 and 1402 reach them |
+//! | root | [`GSV_ROOT`] | `root_server_with_page`, its [`RootState`] naming the four below: 202, 204, 497 and 1402 reach the first three, 902, 906 and 1002 the video server |
 //! | syncpt | [`GSV_SYNCPT`] | `syncpt_server` over the shared state |
 //! | gpu | [`GSV_GPU`] | `gpu_server` over the shared state and the front |
 //! | nvsrv | [`GSV_NVSRV`] | `nvsrv_server` over the shared state and the front, with the front as its channel front too, and told of deferred replies as `fsp-srv` is ([`super::Reads::ready`]) |
 //! | vi2 | [`GSV_VI2`] | `vi2_server` over the shared state, with the services' environment and halt ([`Graphics::add_vi2_server`], which [`install_with_graphics`](super::install_with_graphics) calls after the others) |
+//! | video | [`GSV_VIDEO`] | `video_server` over the shared state: the video context 902, 906 and 1002 hand out, and its decoder services with the null decoder (`starquake_gsv::video`, slice 15) |
 //!
 //! The root answers 202, 204, 497 and 1402 with its family's server (`starquake_gsv::root`,
-//! "The family sessions"), and 305 with the vi2 server ("The display session (305)"). Built with the shared state, the root also answers the native memory
-//! and image commands (111, 112, 114, 314, 315, 423, 429, 430, 435, 1510) from the native tables
-//! in it (`starquake_gsv::native`, slice 8; `the_root_answers_native_memory_and_images`); every
-//! other root command is still the root's logged stub. The vsync clock (slice 12,
-//! `starquake_gsv::shared::vsync`) needs no server: it is part of gsv's shared state and runs in
-//! the timer thread's turn (below), and vi2's request groups (slice 13) start it by listening
+//! "The family sessions"), 305 with the vi2 server ("The display session (305)"), and 902, 906
+//! and 1002 with the video server (`starquake_gsv::root`, "Video (slice 15)";
+//! `the_root_hands_out_video_sessions_that_count_frames`). Built with the shared state, the root
+//! also answers the native memory and image commands (111, 112, 114, 314, 315, 423, 429, 430,
+//! 435, 1510) from the native tables in it (`starquake_gsv::native`, slice 8;
+//! `the_root_answers_native_memory_and_images`), the video image pool commands (991, 911, 912,
+//! 961, 426 to 428) from the same tables (`starquake_gsv::native::pools`, slice 15), and 602 with
+//! a camera session (`starquake_gsv::video::camera`); every other root command is still the
+//! root's logged stub. The vsync clock (slice 12, `starquake_gsv::shared::vsync`) needs no
+//! server: it is part of gsv's shared state and runs in the timer thread's turn (below), and
+//! vi2's request groups (slice 13) start it by listening
 //! (`a_vi2_request_group_is_ticked_through_the_run_s_turn`, in `hle/tests/graphics/vsync.rs`).
-//! Slices 14 and 15 (present and video: issues 192 and 193) are not built: when they land,
-//! video adds its server here beside these and its number to the root, and the video commands
-//! stop being stubs.
+//! Slice 14 (present: issue 192) is not built: when it lands, it adds its server here beside
+//! these and its number to the root.
 //!
 //! # The GPU front
 //!
@@ -188,6 +193,7 @@ use starquake_gsv::shared::vsync::VsyncReplayError;
 use starquake_gsv::shared::{Shared, TimerHost};
 use starquake_gsv::syncpt;
 use starquake_gsv::vi2;
+use starquake_gsv::video;
 use starquake_kernel::dispatch::{DeviceShareError, Dispatcher, WakeError};
 use starquake_kernel::id::ObjectId;
 use starquake_kernel::memory::DeviceShareToken;
@@ -196,8 +202,10 @@ use starquake_memory::GuestMemory;
 use starquake_services::framework::{Halt, Notify, UnknownPolicy};
 use starquake_trace::{Env, EnvError, EventKind, HostNanos, Recorder, ThreadId};
 
-use super::GSV_VI2;
-use super::{Deliveries, Delivering, GSV_GPU, GSV_NVSRV, GSV_ROOT, GSV_SYNCPT, ServicesError};
+use super::{
+    Deliveries, Delivering, GSV_GPU, GSV_NVSRV, GSV_ROOT, GSV_SYNCPT, GSV_VI2, GSV_VIDEO,
+    ServicesError,
+};
 
 #[cfg(test)]
 mod tests;
@@ -421,11 +429,16 @@ impl Graphics {
             tracing::error!("nvsrv's server was numbered twice");
         }
 
+        let codecs =
+            video::video_server(Arc::clone(&self.shared), policy).with_service_id(GSV_VIDEO);
+        dispatcher.add_server(video::VIDEO_NAME, GSV_VIDEO, None, Box::new(codecs))?;
+
         let state = RootState::new()
             .with_syncpt_server(GSV_SYNCPT)
             .with_gpu_server(GSV_GPU)
             .with_nvsrv_server(GSV_NVSRV)
-            .with_vi2_server(GSV_VI2);
+            .with_vi2_server(GSV_VI2)
+            .with_video_server(GSV_VIDEO);
         let graphics_root = root::root_server_with_page(state, policy, Arc::clone(&self.shared))
             .with_service_id(GSV_ROOT);
         dispatcher.add_server(root::ROOT_NAME, GSV_ROOT, None, Box::new(graphics_root))?;

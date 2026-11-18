@@ -33,6 +33,7 @@ use starquake_trace::{EnvCall, EnvError, HostIoReply, HostIoRequest, HostNanos};
 use super::*;
 use crate::hle::graphics::KernelHost;
 
+mod video;
 mod vsync;
 
 /// Where nvsrv's ioctl arguments and their out buffers go: the third page, in and out halves.
@@ -229,7 +230,7 @@ impl Rig {
     fn gsv_servers(&self) -> Vec<(ServiceId, Vec<u8>)> {
         let mut saved = Vec::new();
         let out = self.dispatcher.inspect_handlers(|service, handler| {
-            let gsv = [GSV_ROOT, GSV_SYNCPT, GSV_GPU, GSV_NVSRV, GSV_VI2];
+            let gsv = [GSV_ROOT, GSV_SYNCPT, GSV_GPU, GSV_NVSRV, GSV_VI2, GSV_VIDEO];
             if gsv.contains(&service) {
                 let handler: &dyn core::any::Any = handler;
                 let server = handler

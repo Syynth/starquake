@@ -20,6 +20,8 @@
 //! The tables ([`NativeObjects`]) are in gsv's shared state ([`crate::shared::Locked::native`]),
 //! one per process, because vi2's presents and the video pools read them too (spec: "small
 //! tables in gsv's root, shared by vi2 (presents) and video (pools)"; "Concurrency inside gsv").
+//! The video image pools are kept in them too ([`pools`], slice 15): a pool lies in a native
+//! memory and takes its image ids from the native images' counter.
 //! The root answers these commands from them when it is built with gsv's shared state
 //! (`crate::root::root_server_with_page`, as a run builds it); a root built without answers
 //! them with its logged stubs, as before this slice. Each handler takes gsv's lock, then calls
@@ -52,8 +54,9 @@
 //! - 111: a mode over [`MAX_MODE`], `InvalidCombination`; a size of 0 or over
 //!   [`MAX_MEMORY_SIZE`], [`GSV_INVALID_SIZE`]; [`MAX_MEMORIES`] memories, or no id left,
 //!   `OutOfResource`.
-//! - 112: no such memory, `NotFound`. A memory an image uses is retired: it answers success, is
-//!   gone for every command, and keeps its lock until its last image is destroyed (PR
+//! - 112: no such memory, `NotFound`. A memory an image or a video image pool ([`pools`]) uses
+//!   is retired: it answers success, is gone for every command, and keeps its lock until its
+//!   last image and pool are destroyed (PR
 //!   `retired_memories`, "Keep the backing locked until display/image references have
 //!   retired"). Otherwise it is removed and its lock released; a release the kernel refuses
 //!   answers the kernel's error, the memory gone all the same (PR: `m_native_memories.erase(it)`
@@ -76,8 +79,8 @@
 //!   bound, `NotFound`; a memory smaller than the size, `InvalidSize`; [`MAX_IMAGES`] images, or
 //!   no id left, `OutOfResource`.
 //! - 430: no such image, `NotFound`; an image in a window pool, `Busy`. Destroying the last image
-//!   of a retired memory removes the memory and releases its lock (PR `DrainRetiredMemories`),
-//!   with 112's answer to a refused release.
+//!   or pool (912, [`pools`]) of a retired memory removes the memory and releases its lock (PR
+//!   `DrainRetiredMemories`), with 112's answer to a refused release.
 //! - 314 and 315: no such image, `NotFound`; 315 with a count not [`WINDOW_POOL_COUNT`],
 //!   `NotImplemented`; an image already in (315) or not in (314) a window pool, `InvalidState`.
 //! - 435 and 1510: the preference's kind not [`layout::KIND_NATIVE`] (435) or
@@ -110,9 +113,11 @@
 //! What a hostile title can make gsv hold: [`MAX_MEMORIES`] live memories and [`MAX_IMAGES`]
 //! images (PR's limits, pinned at the edge by `memories_are_bounded_at_the_limit` and
 //! `images_are_bounded_at_the_limit`). A retired memory is not counted among the live ones, as
-//! in PR, but each has at least one image, so there are at most [`MAX_IMAGES`] of them. A request
-//! walks at most these tables once (counting the live memories, or looking for an image of a
-//! memory), so its work is bounded by the limits, not by anything a title grows past them.
+//! in PR, but each has at least one image or pool, so there are at most [`MAX_IMAGES`] plus
+//! [`pools::MAX_POOLS`] of them. The pools add at most [`pools::MAX_POOLS`] pools and
+//! [`pools::MAX_MAPPINGS`] GPU mappings. A request walks at most these tables once (counting the
+//! live memories, or looking for an image or pool of a memory), so its work is bounded by the
+//! limits, not by anything a title grows past them.
 //!
 //! # What is recorded and what is snapshotted
 //!
@@ -122,6 +127,7 @@
 //! wiring slice's (16), as for the GPU memory.
 
 pub mod layout;
+pub mod pools;
 pub mod saved;
 
 #[cfg(test)]
@@ -285,15 +291,21 @@ impl NativeImage {
     }
 }
 
-/// The native memories and images of a process (module docs, "Where the tables live").
+/// The native memories and images of a process (module docs, "Where the tables live"), and the
+/// video image pools that lie in its memories ([`pools`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NativeObjects {
     memories: BTreeMap<u32, NativeMemory>,
     images: BTreeMap<u32, NativeImage>,
     /// The next memory id; 0 once [`u32::MAX`] has been handed out.
     next_memory: u32,
-    /// The next image id; 0 once [`u32::MAX`] has been handed out.
+    /// The next image id, shared by native images and pool images; 0 once [`u32::MAX`] has
+    /// been handed out.
     next_image: u32,
+    /// The video image pools, by first image id ([`pools`]).
+    pools: BTreeMap<u32, pools::VideoPool>,
+    /// The GPU mappings of pool images, by address space and image ([`pools`]).
+    mappings: BTreeMap<(u32, u32), pools::GpuMapping>,
 }
 
 impl Default for NativeObjects {
@@ -384,6 +396,8 @@ impl NativeObjects {
             images: BTreeMap::new(),
             next_memory: FIRST_ID,
             next_image: FIRST_ID,
+            pools: BTreeMap::new(),
+            mappings: BTreeMap::new(),
         }
     }
 
@@ -417,9 +431,26 @@ impl NativeObjects {
             .count()
     }
 
-    /// Whether an image lies in memory `id`.
+    /// Whether an image or a video image pool ([`pools`]) lies in memory `id`.
     fn in_use(&self, id: u32) -> bool {
-        self.images.values().any(|image| image.memory == id)
+        self.images.values().any(|image| image.memory == id) || self.pool_in(id)
+    }
+
+    /// After the last image or pool in memory `id` may have gone: if the memory is retired and
+    /// nothing uses it now, removes it and returns its lock to release, if it was bound (PR
+    /// `DrainRetiredMemories`, which 430 and 912 both run).
+    fn release_if_retired(&mut self, id: u32) -> Option<DeviceShareToken> {
+        let retired = self
+            .memories
+            .get(&id)
+            .is_some_and(|backing| backing.retired);
+        if !retired || self.in_use(id) {
+            return None;
+        }
+        self.memories
+            .remove(&id)
+            .and_then(|backing| backing.binding)
+            .map(|binding| binding.token)
     }
 
     /// Sets the next ids, for tests at the end of the id space.
@@ -587,18 +618,7 @@ impl NativeObjects {
         }
         let memory = image.memory;
         self.images.remove(&id);
-        let retired = self
-            .memories
-            .get(&memory)
-            .is_some_and(|backing| backing.retired);
-        if !retired || self.in_use(memory) {
-            return Ok(None);
-        }
-        Ok(self
-            .memories
-            .remove(&memory)
-            .and_then(|backing| backing.binding)
-            .map(|binding| binding.token))
+        Ok(self.release_if_retired(memory))
     }
 
     /// 315 (`create`, with its count) and 314: puts image `id` in a window alias image pool or

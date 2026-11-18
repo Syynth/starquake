@@ -26,6 +26,8 @@ use starquake_trace::{EventKind, IpcOutcome, ServiceId};
 
 use super::*;
 use crate::protocol::{HANDLE_KIND, Mark, ROOT_COMMANDS};
+
+mod video;
 use crate::testing::{
     SPECIAL, STALE, buffer_of, copied, halves, le, result_only, success, tipc_type,
 };
@@ -979,10 +981,11 @@ fn the_saved_root_layouts_are_pinned() {
                 syncpt_server: Some(ServiceId(0x0E)),
                 nvsrv_server: None,
                 vi2_server: Some(ServiceId(0x0F)),
+                video_server: None,
             },
             // phase 0; no bootstrap; count 0; mode Some(0x0B); One(index, generation); no gpu
-            // server; Some(syncpt server); no nvsrv server; Some(vi2 server).
-            &[0, 0, 0, 1, 0x0B, 1, 0x0C, 0x0D, 0, 1, 0x0E, 0, 1, 0x0F],
+            // server; Some(syncpt server); no nvsrv server; Some(vi2 server); no video server.
+            &[0, 0, 0, 1, 0x0B, 1, 0x0C, 0x0D, 0, 1, 0x0E, 0, 1, 0x0F, 0],
         ),
         (
             RootState {
@@ -995,12 +998,13 @@ fn the_saved_root_layouts_are_pinned() {
                 syncpt_server: None,
                 nvsrv_server: Some(ServiceId(0x1D)),
                 vi2_server: None,
+                video_server: Some(ServiceId(0x1E)),
             },
             // phase 1; Some(user id, flags, four parameters); count; no mode; Both(a, b); Some(gpu
-            // server); no syncpt server; Some(nvsrv server); no vi2 server.
+            // server); no syncpt server; Some(nvsrv server); no vi2 server; Some(video server).
             &[
                 1, 1, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0, 2, 0x18, 0x19, 0x1A, 0x1B, 1,
-                0x1C, 0, 1, 0x1D, 0,
+                0x1C, 0, 1, 0x1D, 0, 1, 0x1E,
             ],
         ),
         (
@@ -1014,9 +1018,11 @@ fn the_saved_root_layouts_are_pinned() {
                 syncpt_server: None,
                 nvsrv_server: None,
                 vi2_server: None,
+                video_server: None,
             },
-            // phase 2; no bootstrap; count; mode; no events; no gpu, syncpt, nvsrv or vi2 server.
-            &[2, 0, 0x21, 1, 0x22, 0, 0, 0, 0, 0],
+            // phase 2; no bootstrap; count; mode; no events; no gpu, syncpt, nvsrv, vi2 or video
+            // server.
+            &[2, 0, 0x21, 1, 0x22, 0, 0, 0, 0, 0, 0],
         ),
         (
             RootState {
@@ -1029,10 +1035,11 @@ fn the_saved_root_layouts_are_pinned() {
                 syncpt_server: Some(ServiceId(0x3C)),
                 nvsrv_server: Some(ServiceId(0x3D)),
                 vi2_server: Some(ServiceId(0x3E)),
+                video_server: Some(ServiceId(0x3F)),
             },
             &[
                 3, 1, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 1, 0x38, 1, 0x39, 0x3A, 1, 0x3B, 1,
-                0x3C, 1, 0x3D, 1, 0x3E,
+                0x3C, 1, 0x3D, 1, 0x3E, 1, 0x3F,
             ],
         ),
     ];
@@ -1126,6 +1133,7 @@ fn saved(state: RootState) -> SavedRootState {
         syncpt_server: state.syncpt_server,
         nvsrv_server: state.nvsrv_server,
         vi2_server: state.vi2_server,
+        video_server: state.video_server,
     }
 }
 
@@ -1298,6 +1306,7 @@ fn wired_with(state: RootState) -> Rig {
         state.syncpt_server,
         state.nvsrv_server,
         state.vi2_server,
+        state.video_server,
     ]
     .into_iter()
     .flatten()

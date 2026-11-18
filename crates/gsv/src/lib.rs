@@ -19,6 +19,9 @@
 //!   435, 1510) and their size.
 //! * [`vi2`]: the vi2 session (305): displays, clients, layers, request groups and monitors,
 //!   notifications and display state.
+//! * [`video`]: the video codec sessions (root 902, 906, 1002) with a null decoder, the video
+//!   image pools' layout (the pools are [`native::pools`]: root 911, 912, 961, 991, 426–428),
+//!   and the camera session (root 602).
 
 pub mod completion;
 pub mod gpu;
@@ -30,6 +33,7 @@ pub mod root;
 pub mod shared;
 pub mod syncpt;
 pub mod vi2;
+pub mod video;
 
 #[cfg(test)]
 mod testing;
