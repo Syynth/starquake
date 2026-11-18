@@ -690,6 +690,15 @@ fn get_global_access_log_mode_answers_eden_s_default() {
     assert_eq!(rig.env.asked(), []);
 }
 
+/// `GetGlobalAccessLogMode`'s id is the reference's: `{1005, D<&FSP_SRV::GetGlobalAccessLogMode>,
+/// "GetGlobalAccessLogMode"}` in `eden/src/core/hle/service/filesystem/fsp/fsp_srv.cpp` @
+/// cf654052, written out here, since every other test sends the shipping constant and so passes
+/// whatever its value.
+#[test]
+fn get_global_access_log_mode_s_id_is_the_reference_s() {
+    assert_eq!(GET_GLOBAL_ACCESS_LOG_MODE, 1005);
+}
+
 /// Divergence from Eden, whose `GetGlobalAccessLogMode` answers what `SetGlobalAccessLogMode`
 /// (1004) last set: 1004 is left out here, so it goes to the unknown-command policy and the mode
 /// stays Eden's default.

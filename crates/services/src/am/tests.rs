@@ -9,7 +9,7 @@ use starquake_ipc::{
     SFCO_MAGIC, SessionKind, SpecialHeader,
 };
 use starquake_kernel::handle::Handle;
-use starquake_kernel::id::ObjectId;
+use starquake_kernel::id::{ObjectId, SlabId};
 use starquake_kernel::ipc::message::Current;
 use starquake_kernel::result::{KernelError, ResultCode};
 
@@ -2396,8 +2396,8 @@ fn never_signalled_events() -> [(u32, u32, KeptEvent); 3] {
     ]
 }
 
-/// A restored suspended-tick, GPU-error or unknown event is checked against the kernel before its handle
-/// is copied (module docs, "The applet"): restored onto a kernel where the saved id
+/// A restored suspended-tick, GPU-error or unknown event is checked against the kernel before
+/// its handle is copied (module docs, "The applet"): restored onto a kernel where the saved id
 /// names another kind of object, or nothing the kernel made, the command answers the kernel's
 /// `InvalidHandle`, copies no handle and leaves the applet as it was, on every call.
 #[test]
@@ -2459,6 +2459,100 @@ fn a_restored_event_the_kernel_made_is_copied_unchanged() {
         assert_eq!(rig.kernel.signals(event), Some(0));
         assert_eq!(rig.kernel.is_signalled(event), Some(false));
     }
+}
+
+/// How a test sets the id the applet keeps for one of its events.
+type SetKeptEvent = fn(&mut Applet, Option<ObjectId>);
+
+/// The four events the applet keeps, by name, with how to set each.
+fn kept_event_slots() -> [(&'static str, SetKeptEvent); 4] {
+    [
+        ("message", |applet, id| applet.message_event = id),
+        ("suspended tick", |applet, id| {
+            applet.suspended_tick_event = id;
+        }),
+        ("GPU error", |applet, id| {
+            applet.gpu_error_detected_event = id;
+        }),
+        ("unknown", |applet, id| applet.unknown_event = id),
+    ]
+}
+
+/// An applet that keeps a distinct event in each slot: slot `i` keeps
+/// `ObjectId::from_parts(i + 1, 1)`.
+fn applet_with_distinct_events() -> Applet {
+    let mut applet = Applet::new(AppletSettings::eden_default());
+    for (index, (_, set)) in (1_u32..).zip(kept_event_slots()) {
+        set(&mut applet, Some(ObjectId::from_parts(index, 1)));
+    }
+    applet
+}
+
+/// A restore with `applet` as the snapshot's family state, into a fresh server: the result,
+/// and the server.
+fn restore_applet(applet: Applet) -> (Result<(), SnapshotError>, Server) {
+    let saved = oe_server_for(applet, UnknownPolicy::Strict).save().unwrap();
+    let mut server = oe_server(AppletSettings::eden_default(), UnknownPolicy::Strict);
+    let result = server.restore(&saved);
+    (result, server)
+}
+
+/// Live operation makes each kept event once, so the four ids are distinct; a snapshot that
+/// keeps one id in two slots is refused with the exact error, whichever two, and the server is
+/// left as it was (module docs, "The applet"). Each refused case has an accepted neighbour that
+/// differs only in that slot's id: its generation, or no event at all.
+#[test]
+fn a_snapshot_that_keeps_one_event_in_two_slots_is_refused() {
+    let fresh = Applet::new(AppletSettings::eden_default());
+    let refused = SnapshotError::Decode(postcard::Error::SerdeDeCustom);
+    let slots = kept_event_slots();
+    let mut pairs = 0;
+    for (first, (first_name, _)) in slots.iter().enumerate() {
+        for (second_name, set_second) in slots.iter().skip(first + 1) {
+            pairs += 1;
+            let shared = ObjectId::from_parts(u32::try_from(first + 1).unwrap(), 1);
+            let mut applet = applet_with_distinct_events();
+            set_second(&mut applet, Some(shared));
+            let (result, server) = restore_applet(applet);
+            assert_eq!(result, Err(refused.clone()), "{first_name} {second_name}");
+            assert_eq!(server.family::<Applet>(), Some(&fresh));
+            assert_eq!(server.session_count(), 0);
+
+            // The same index in another generation is another object; no event is none.
+            let other_generation = ObjectId::from_parts(u32::try_from(first + 1).unwrap(), 2);
+            for id in [Some(other_generation), None] {
+                let mut applet = applet_with_distinct_events();
+                set_second(&mut applet, id);
+                let (result, server) = restore_applet(applet.clone());
+                assert_eq!(result, Ok(()), "{first_name} {second_name} {id:?}");
+                assert_eq!(server.family::<Applet>(), Some(&applet));
+            }
+        }
+    }
+    assert_eq!(pairs, 6);
+    // No event in any slot, as at launch, restores: `None` is not an id.
+    assert_eq!(restore_applet(fresh.clone()).0, Ok(()));
+}
+
+/// The forgery the check closes: an applet whose unknown event is its message event. Restored,
+/// `GetUnknownEvent210`'s check would clear the message event while a message is pending, and a
+/// guest waiting on it would never wake; the snapshot is refused instead, so the message event
+/// of a run stays signalled.
+#[test]
+fn a_snapshot_whose_unknown_event_is_the_message_event_is_refused() {
+    let mut rig = Rig::new();
+    let (_, _, event) = rig.getter_with_event();
+    assert_eq!(rig.kernel.is_signalled(event), Some(true));
+    let mut forged = rig.applet();
+    forged.unknown_event = Some(event);
+    let saved = oe_server_for(forged, UnknownPolicy::Strict).save().unwrap();
+    let before = rig.applet();
+    assert_eq!(
+        rig.server.restore(&saved),
+        Err(SnapshotError::Decode(postcard::Error::SerdeDeCustom))
+    );
+    assert_eq!(rig.applet(), before);
+    assert_eq!(rig.kernel.is_signalled(event), Some(true));
 }
 
 // ----- ICommonStateGetter: ReceiveMessage and the messages -----------------------------------
@@ -3156,6 +3250,32 @@ fn cpu_boost_mode_accepts_eden_s_three_words_and_no_other() {
     }
     for raw in (modes..=0x1FF).chain([u32::MAX]) {
         assert_eq!(CpuBoostMode::from_raw(raw), None, "{raw}");
+    }
+}
+
+/// The ids of the five later start-up commands are the reference's rows, written out here, since
+/// every other test sends the shipping constant and so passes whatever its value: Eden @
+/// cf654052, `src/core/hle/service/am/service/application_functions.cpp`
+/// (`{21, .., "GetDesiredLanguage"}`, `{210, .., "Unknown210"}`), `common_state_getter.cpp`
+/// (`{66, .., "SetCpuBoostMode"}`) and `self_controller.cpp` (`{14, ..,
+/// "SetRestartMessageEnabled"}`); PR #4588 @ e5fb3b97,
+/// `eden-pr4588/src/core/hle/service/am/service/self_controller.cpp` (`{2400, ..,
+/// "SetRtcScreenSharingAudioEnabled"}`).
+#[test]
+fn the_later_start_up_command_ids_are_the_reference_s() {
+    let rows = [
+        ("GetDesiredLanguage", GET_DESIRED_LANGUAGE, 21),
+        ("GetUnknownEvent210", GET_UNKNOWN_EVENT_210, 210),
+        ("SetCpuBoostMode", SET_CPU_BOOST_MODE, 66),
+        ("SetRestartMessageEnabled", SET_RESTART_MESSAGE_ENABLED, 14),
+        (
+            "SetRtcScreenSharingAudioEnabled",
+            SET_RTC_SCREEN_SHARING_AUDIO_ENABLED,
+            2400,
+        ),
+    ];
+    for (name, shipping, reference) in rows {
+        assert_eq!(shipping, reference, "{name}");
     }
 }
 

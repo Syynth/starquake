@@ -186,19 +186,35 @@
 //!   (`applet_manager.cpp`: `SetFocusState(FocusState::InFocus)`, "Applet was started by
 //!   frontend, so it is foreground"), and nothing in a run changes it.
 //!
-//! A restore checks the graphics server's number against the run (see "The graphics server")
-//! and reads every queued message through [`AppletMessage::from_raw`] (see "The messages"); it
-//! has no kernel to check the applet's event ids against, so it believes them, and the commands
-//! check them when they use them:
+//! A restore checks the graphics server's number against the run (see "The graphics server"),
+//! reads every queued message through [`AppletMessage::from_raw`] (see "The messages"), and
+//! checks that the four event ids the applet keeps (message, suspended-tick, GPU-error and
+//! unknown) are distinct, as live operation always leaves them. It has no kernel to check the
+//! ids themselves against, so it believes them, and the commands check them when they use them:
 //!
+//! - **Two event slots holding one id** are refused with
+//!   [`SnapshotError::Decode`]`(postcard::Error::SerdeDeCustom)`, whichever two, and the server
+//!   is left as it was (`a_snapshot_that_keeps_one_event_in_two_slots_is_refused`). Slots with
+//!   no event (`None`) are not ids and may be any number. Without it, an applet whose unknown
+//!   or GPU-error event named its message event would have `GetUnknownEvent210` or
+//!   `GetGpuErrorDetectedSystemEvent` clear the signalled message event while a message is
+//!   pending, and a guest waiting on it would never wake
+//!   (`a_snapshot_whose_unknown_event_is_the_message_event_is_refused`).
 //! - **The suspended-tick, GPU-error and unknown events** are checked each time
 //!   `GetAccumulatedSuspendedTickChangedEvent`, `GetGpuErrorDetectedSystemEvent` or
-//!   `GetUnknownEvent210` returns a kept one, before its handle is copied: the kernel's `clear_event` answers `InvalidHandle`
-//!   for an id that is not an event this server made (another kind of object, another server's
-//!   or the guest's event, or nothing), and the command answers that error, copies nothing and
-//!   leaves the applet as it was (`a_restored_event_the_kernel_did_not_make_is_refused`). On
-//!   the server's own event the clear changes nothing, as neither event is ever signalled
-//!   (`a_restored_event_the_kernel_made_is_copied_unchanged`).
+//!   `GetUnknownEvent210` returns a kept one, before its handle is copied: the kernel's
+//!   `clear_event` answers `InvalidHandle` for an id that is not an event this server made
+//!   (another kind of object, another server's or the guest's event, or nothing), and the
+//!   command answers that error, copies nothing and leaves the applet as it was
+//!   (`a_restored_event_the_kernel_did_not_make_is_refused`). On the event this server made
+//!   for that same slot the clear changes nothing, as none of these three events is ever
+//!   signalled (`a_restored_event_the_kernel_made_is_copied_unchanged`).
+//! - **Not checked here: a kept id that names the event this server made for another slot,
+//!   when the snapshot leaves that slot empty or names another id in it.** Such an id is an
+//!   event this server made, so the kernel's `clear_event` accepts it; if it is the message
+//!   event, the clear empties it while a message may be pending, as above. Telling it apart
+//!   needs the kernel's record of which event the server made for which slot, which a restore
+//!   here cannot read.
 //! - **Not checked here: the message event** when `GetEventHandle` copies it. The kernel calls
 //!   that check an event id (`clear_event`, `signal_event`) change its state, and the guest may
 //!   have cleared the event itself, so no call checks it without changing what the guest sees;
@@ -1052,7 +1068,11 @@ impl Default for Notifications {
 }
 
 /// The part of Eden's `LifecycleManager` that the ported commands read and change, with Eden's
-/// initial values (`lifecycle_manager.h`).
+/// initial values (`lifecycle_manager.h`), but for one flag: `m_resume_notification_enabled`,
+/// which `SetRestartMessageEnabled` changes, is kept on the applet
+/// ([`Applet::resume_notification_enabled`]), since no message term here reads it. Eden's
+/// `RequestResumeNotification` reads it to raise `Resume`, so a port of resuming makes it
+/// lifecycle state and moves it here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Lifecycle {
     /// The notifications the applet asked for.
@@ -1189,7 +1209,13 @@ impl Lifecycle {
 /// and an error the kernel reports leaves the change kept. The one exception is
 /// `ReceiveMessage`, which clears the message event before it takes the message, and takes
 /// nothing if the clear fails (module docs, "The messages").
+///
+/// It is read back from a snapshot through [`SavedApplet`], which refuses an applet that keeps
+/// one kernel object in two of its event slots (module docs, "The applet"). Live operation
+/// cannot make such an applet: each slot's event is created once, by the kernel, which never
+/// hands out one id twice; so saving needs no check of its own.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "SavedApplet")]
 pub struct Applet {
     settings: AppletSettings,
     lifecycle: Lifecycle,
@@ -1224,6 +1250,66 @@ pub struct Applet {
     /// [`Lifecycle`], which holds the state that decides whether a message is available: this
     /// flag is not a term of it.
     resume_notification_enabled: bool,
+}
+
+/// An [`Applet`] as a snapshot holds it, before the check that turns it into one: the same
+/// fields in the same order, so the encoding is the applet's own.
+#[derive(Deserialize)]
+struct SavedApplet {
+    settings: AppletSettings,
+    lifecycle: Lifecycle,
+    message_event: Option<ObjectId>,
+    suspended_tick_event: Option<ObjectId>,
+    graphics_server: Option<ServiceId>,
+    graphics_scale_changed_notification_enabled: bool,
+    screenshot_permission: ScreenshotPermission,
+    game_play_recording_state: GamePlayRecordingState,
+    request_exit_to_library_applet_at_execute_next_program_enabled: bool,
+    gpu_error_detected_event: Option<ObjectId>,
+    unknown_event: Option<ObjectId>,
+    resume_notification_enabled: bool,
+}
+
+/// Why a snapshot's applet was refused. `postcard` keeps no text for it: a restore answers
+/// [`SnapshotError::Decode`]`(postcard::Error::SerdeDeCustom)`.
+///
+/// [`SnapshotError::Decode`]: crate::framework::SnapshotError::Decode
+#[derive(Debug, thiserror::Error)]
+#[error("the applet keeps one kernel object as two of its events")]
+struct SharedEvent;
+
+impl TryFrom<SavedApplet> for Applet {
+    type Error = SharedEvent;
+
+    fn try_from(saved: SavedApplet) -> Result<Self, SharedEvent> {
+        let kept = [
+            saved.message_event,
+            saved.suspended_tick_event,
+            saved.gpu_error_detected_event,
+            saved.unknown_event,
+        ];
+        for (index, id) in kept.iter().enumerate() {
+            if id.is_some() && kept.iter().skip(index + 1).any(|other| other == id) {
+                return Err(SharedEvent);
+            }
+        }
+        Ok(Self {
+            settings: saved.settings,
+            lifecycle: saved.lifecycle,
+            message_event: saved.message_event,
+            suspended_tick_event: saved.suspended_tick_event,
+            graphics_server: saved.graphics_server,
+            graphics_scale_changed_notification_enabled: saved
+                .graphics_scale_changed_notification_enabled,
+            screenshot_permission: saved.screenshot_permission,
+            game_play_recording_state: saved.game_play_recording_state,
+            request_exit_to_library_applet_at_execute_next_program_enabled: saved
+                .request_exit_to_library_applet_at_execute_next_program_enabled,
+            gpu_error_detected_event: saved.gpu_error_detected_event,
+            unknown_event: saved.unknown_event,
+            resume_notification_enabled: saved.resume_notification_enabled,
+        })
+    }
 }
 
 impl Applet {
@@ -2028,7 +2114,12 @@ impl ICommonStateGetter {
     /// SetCpuBoostMode` answers `ResultSuccess` whatever the mode). The mode is checked as
     /// Eden's `Controller::SetFromCpuBoostMode` checks it ([`CpuBoostMode::from_raw`]), which
     /// changes only what is logged: Eden records a performance configuration for a mode it
-    /// accepts, which nothing here keeps (module docs, "The title's later start-up commands").
+    /// accepts, which nothing here keeps (module docs, "The title's later start-up commands"),
+    /// and for a word that is not a mode only logs it (`LOG_ERROR(Service_APM, "{} invalid
+    /// mode", mode)`, `eden/src/core/hle/service/apm/apm_controller.cpp` @ cf654052,
+    /// `Controller::SetFromCpuBoostMode`). The branch below is log-only: neither the reply nor
+    /// any state depends on it, and no test captures the log, so a mutation that swaps or
+    /// deletes it is equivalent under the tests.
     fn set_cpu_boost_mode(
         _: &mut Self,
         _cx: &mut Context<'_>,
