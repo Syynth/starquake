@@ -69,7 +69,8 @@
 //!   every request to it is answered by the server's unknown-command policy, logged. NX2 began
 //!   the same way (`INx2NvsrvSession`, "a placeholder ... every command gets an empty success
 //!   and is logged"). The family's slice replaces it with a session on its own server: 202,
-//!   497 and 1402 do in a root wired to their servers (below, "The family sessions").
+//!   497 and 1402 do in a root wired to their servers (below, "The family sessions"), and 305
+//!   in one wired to the vi2 server (below, "The display session (305)").
 //! - **An event** (only 204's two) is a kernel event, unsignalled. They are made the first time
 //!   204 is asked and kept ([`RootState::syncpoint_events`]), so a repeated 204 hands out the
 //!   same two and a failure between the two keeps the first. A root built with gsv's shared
@@ -132,6 +133,20 @@
 //! the syncpt server's, then the nvsrv server's
 //! (`a_snapshot_with_other_family_servers_is_refused_gpu_first`).
 //!
+//! # The display session (305)
+//!
+//! 305 hands out a session on the vi2 server ([`RootState::with_vi2_server`], [`crate::vi2`]) as
+//! 497 does on the gpu server: one copied session handle and no data (observed: row 21; PR
+//! `OpenDisplaySession`; NX2 `OpenViSession`, which puts the handle at word 3 and the result at
+//! word 4). Its `u64` is read: PR requires one of [`DISPLAY_SESSION_FLAGS`]
+//! (`IsSupportedDisplaySession`, else `ResultInvalidCombination`) and 301 sent before it
+//! (`m_display_context_initialized`, else `ResultInvalidState`); here other flags are logged and
+//! accepted (decision 7: log first), the root keeps no state of 301 so it is not checked, and a
+//! 305 before the bootstrap is complete is logged and accepted, as for the other family
+//! commands. A root with no vi2 server answers 305 with the stub's placeholder. The server's
+//! number is the run's wiring, checked on a snapshot after the nvsrv server's
+//! (`a_snapshot_with_another_vi2_server_is_refused`).
+//!
 //! # Where this differs from the references
 //!
 //! Each row is pinned by the test named, in `root/tests.rs`:
@@ -149,6 +164,7 @@
 //! | The handle 202 and 1402 hand out | moved | copied | **conflict**: copied, NX2's (`a_family_session_reply_is_one_copied_handle_and_success`) |
 //! | 202 before 201 and 1402, or 1402 before the bootstrap is complete and the image formats are set up | `ResultInvalidState` | success | success (`each_family_command_hands_out_a_session_on_its_own_server`) |
 //! | 202 or 1402 whose header is not PR's exact one (here: a data word) | `ResultInvalidState` (202), `ResultInvalidCombination` (1402) | success | success: the data is not read (`a_family_command_with_a_data_word_is_accepted`) |
+//! | 305 with flags other than [`DISPLAY_SESSION_FLAGS`], or before 301 | `ResultInvalidCombination`, `ResultInvalidState` | success, the flags logged | success, the flags logged (decision 7; `open_display_session_copies_a_session_on_the_vi2_server`) |
 
 use std::sync::Arc;
 
@@ -284,6 +300,7 @@ pub struct RootState {
     gpu_server: Option<ServiceId>,
     syncpt_server: Option<ServiceId>,
     nvsrv_server: Option<ServiceId>,
+    vi2_server: Option<ServiceId>,
 }
 
 /// The serialised form of [`RootState`], field for field, and what deserialising validates.
@@ -297,6 +314,7 @@ struct SavedRootState {
     gpu_server: Option<ServiceId>,
     syncpt_server: Option<ServiceId>,
     nvsrv_server: Option<ServiceId>,
+    vi2_server: Option<ServiceId>,
 }
 
 /// Why a saved [`RootState`] could not be read back: it holds a combination of fields that no
@@ -345,6 +363,7 @@ impl TryFrom<SavedRootState> for RootState {
             gpu_server,
             syncpt_server,
             nvsrv_server,
+            vi2_server,
         } = saved;
         match (phase, bootstrap.is_some()) {
             (Phase::Created, true) => return Err(RootStateError::CreatedWithBootstrap),
@@ -375,6 +394,7 @@ impl TryFrom<SavedRootState> for RootState {
             gpu_server,
             syncpt_server,
             nvsrv_server,
+            vi2_server,
         })
     }
 }
@@ -398,6 +418,7 @@ impl RootState {
             gpu_server: None,
             syncpt_server: None,
             nvsrv_server: None,
+            vi2_server: None,
         }
     }
 
@@ -441,6 +462,20 @@ impl RootState {
     #[must_use]
     pub const fn nvsrv_server(&self) -> Option<ServiceId> {
         self.nvsrv_server
+    }
+
+    /// The root of a run whose vi2 server is known by `service` (module docs, "The display
+    /// session (305)").
+    #[must_use]
+    pub const fn with_vi2_server(mut self, service: ServiceId) -> Self {
+        self.vi2_server = Some(service);
+        self
+    }
+
+    /// The number of the vi2 server 305 hands sessions on, if the run has one.
+    #[must_use]
+    pub const fn vi2_server(&self) -> Option<ServiceId> {
+        self.vi2_server
     }
 
     /// Where the bootstrap is.
@@ -537,7 +572,7 @@ commands! {
         BIND_SYNCPOINT_MEMORY => bind_syncpoint_memory,
         INITIALIZE_DISPLAY_CONTEXT => stub,
         FINALIZE_DISPLAY_CONTEXT => stub,
-        OPEN_DISPLAY_SESSION => stub,
+        OPEN_DISPLAY_SESSION => open_display_session,
         INITIALIZE_GPU_CONTEXT => stub,
         ACTIVATE_GPU_CONTEXT => stub,
         REGISTER_GPU_ADDRESS_SPACE => stub,
@@ -697,6 +732,28 @@ impl GsvRoot {
             );
         }
         hand_out(cx, reply, OPEN_GPU_SESSION, gpu)
+    }
+
+    /// `OpenDisplaySession` (305). in: `u64` flags. out: copy handle, a session on the vi2
+    /// server (module docs, "The display session (305)"); the stub's placeholder in a run with
+    /// none.
+    fn open_display_session(
+        this: &mut Self,
+        cx: &mut Context<'_>,
+        req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        let Some(vi2) = root_state(cx)?.vi2_server else {
+            return Self::stub(this, cx, req, reply);
+        };
+        let flags = req.payload().read_u64()?;
+        if !DISPLAY_SESSION_FLAGS.contains(&flags) {
+            tracing::warn!(
+                flags,
+                "gsv: 305 with flags PR refuses; accepted (decision 7)"
+            );
+        }
+        hand_out(cx, reply, OPEN_DISPLAY_SESSION, vi2)
     }
 
     /// `GetSyncpointSession` (202). in: nothing. out: copy handle, a session on the syncpt
@@ -931,6 +988,10 @@ pub fn root_interfaces() -> Interfaces {
 /// "The root": "497 takes a u64 (4)").
 pub const GPU_SESSION_FLAGS: u64 = 4;
 
+/// The flags words 305 carries: PR's `IsSupportedDisplaySession` (`flags == 0x300020000ULL ||
+/// flags == 0x300030000ULL || flags == 0x300040000ULL`; graphics-server, "The root").
+pub const DISPLAY_SESSION_FLAGS: [u64; 3] = [0x3_0002_0000, 0x3_0003_0000, 0x3_0004_0000];
+
 /// The root's server: every session a [`GsvRoot`], sharing one [`RootState`], in a run with no
 /// gpu server.
 #[must_use]
@@ -983,7 +1044,7 @@ fn root_server_over(family: RootFamily, policy: UnknownPolicy) -> Server {
 ///
 /// It implements [`Family`] by hand: a snapshot holds the [`RootState`] alone, as the
 /// [`RootState`]'s own `serde` form, and loading one keeps the handle. Loading refuses a
-/// snapshot whose gpu, syncpt or nvsrv server number is not the run's
+/// snapshot whose gpu, syncpt, nvsrv or vi2 server number is not the run's
 /// ([`SnapshotError::FamilyWiring`]), in that order, before it changes anything (module docs,
 /// "The family sessions").
 pub struct RootFamily {
@@ -1011,7 +1072,7 @@ impl Family for RootFamily {
         self.state.save_state()
     }
 
-    /// Reads a [`RootState`] and, if its gpu, syncpt and nvsrv server numbers are the run's,
+    /// Reads a [`RootState`] and, if its gpu, syncpt, nvsrv and vi2 server numbers are the run's,
     /// takes it; the handle to gsv's shared state stays.
     fn load_state(&mut self, bytes: &[u8]) -> Result<(), SnapshotError> {
         let mut saved = RootState::new();
@@ -1029,6 +1090,11 @@ impl Family for RootFamily {
         if saved.nvsrv_server != self.state.nvsrv_server {
             return Err(SnapshotError::FamilyWiring(
                 "its root names another nvsrv server",
+            ));
+        }
+        if saved.vi2_server != self.state.vi2_server {
+            return Err(SnapshotError::FamilyWiring(
+                "its root names another vi2 server",
             ));
         }
         self.state = saved;

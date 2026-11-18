@@ -978,10 +978,11 @@ fn the_saved_root_layouts_are_pinned() {
                 gpu_server: None,
                 syncpt_server: Some(ServiceId(0x0E)),
                 nvsrv_server: None,
+                vi2_server: Some(ServiceId(0x0F)),
             },
             // phase 0; no bootstrap; count 0; mode Some(0x0B); One(index, generation); no gpu
-            // server; Some(syncpt server); no nvsrv server.
-            &[0, 0, 0, 1, 0x0B, 1, 0x0C, 0x0D, 0, 1, 0x0E, 0],
+            // server; Some(syncpt server); no nvsrv server; Some(vi2 server).
+            &[0, 0, 0, 1, 0x0B, 1, 0x0C, 0x0D, 0, 1, 0x0E, 0, 1, 0x0F],
         ),
         (
             RootState {
@@ -993,12 +994,13 @@ fn the_saved_root_layouts_are_pinned() {
                 gpu_server: Some(ServiceId(0x1C)),
                 syncpt_server: None,
                 nvsrv_server: Some(ServiceId(0x1D)),
+                vi2_server: None,
             },
             // phase 1; Some(user id, flags, four parameters); count; no mode; Both(a, b); Some(gpu
-            // server); no syncpt server; Some(nvsrv server).
+            // server); no syncpt server; Some(nvsrv server); no vi2 server.
             &[
                 1, 1, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0, 2, 0x18, 0x19, 0x1A, 0x1B, 1,
-                0x1C, 0, 1, 0x1D,
+                0x1C, 0, 1, 0x1D, 0,
             ],
         ),
         (
@@ -1011,9 +1013,10 @@ fn the_saved_root_layouts_are_pinned() {
                 gpu_server: None,
                 syncpt_server: None,
                 nvsrv_server: None,
+                vi2_server: None,
             },
-            // phase 2; no bootstrap; count; mode; no events; no gpu, syncpt or nvsrv server.
-            &[2, 0, 0x21, 1, 0x22, 0, 0, 0, 0],
+            // phase 2; no bootstrap; count; mode; no events; no gpu, syncpt, nvsrv or vi2 server.
+            &[2, 0, 0x21, 1, 0x22, 0, 0, 0, 0, 0],
         ),
         (
             RootState {
@@ -1025,10 +1028,11 @@ fn the_saved_root_layouts_are_pinned() {
                 gpu_server: Some(ServiceId(0x3B)),
                 syncpt_server: Some(ServiceId(0x3C)),
                 nvsrv_server: Some(ServiceId(0x3D)),
+                vi2_server: Some(ServiceId(0x3E)),
             },
             &[
                 3, 1, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 1, 0x38, 1, 0x39, 0x3A, 1, 0x3B, 1,
-                0x3C, 1, 0x3D,
+                0x3C, 1, 0x3D, 1, 0x3E,
             ],
         ),
     ];
@@ -1121,6 +1125,7 @@ fn saved(state: RootState) -> SavedRootState {
         gpu_server: state.gpu_server,
         syncpt_server: state.syncpt_server,
         nvsrv_server: state.nvsrv_server,
+        vi2_server: state.vi2_server,
     }
 }
 
@@ -1288,9 +1293,14 @@ const NVSRV: ServiceId = ServiceId(0x1402);
 fn wired_with(state: RootState) -> Rig {
     let mut kernel = FakeKernel::new(0).unwrap();
     kernel.set_current_service(ROOT);
-    for service in [state.gpu_server, state.syncpt_server, state.nvsrv_server]
-        .into_iter()
-        .flatten()
+    for service in [
+        state.gpu_server,
+        state.syncpt_server,
+        state.nvsrv_server,
+        state.vi2_server,
+    ]
+    .into_iter()
+    .flatten()
     {
         kernel.add_service(service);
     }
@@ -1486,5 +1496,129 @@ fn a_snapshot_with_other_family_servers_is_refused_gpu_first() {
         assert_eq!(rig.state(), run);
         let own = rig.server.save().unwrap();
         assert_eq!(rig.server.restore(&own), Ok(()));
+    }
+}
+
+// ----- 305 and the vi2 server ------------------------------------------------------------------
+
+/// The number the tests' vi2 server is known by.
+const VI2: ServiceId = ServiceId(0x0305);
+
+/// 305 (PR `OpenDisplaySession`: `packet[0] == 0x141 && packet[1] == 2`, the flags at words
+/// 2-3).
+fn open_display_session(flags: u64) -> Vec<u32> {
+    let [low, high] = halves(flags);
+    vec![0x141, 2, low, high]
+}
+
+/// PR's `IsSupportedDisplaySession`, written out: `flags == 0x300020000ULL || flags ==
+/// 0x300030000ULL || flags == 0x300040000ULL`.
+#[test]
+fn the_display_session_flags_are_prs() {
+    assert_eq!(tipc_type(OPEN_DISPLAY_SESSION), 0x141);
+    assert_eq!(
+        DISPLAY_SESSION_FLAGS,
+        [0x0003_0002_0000, 0x0003_0003_0000, 0x0003_0004_0000]
+    );
+}
+
+/// 305 copies a new session on the vi2 server for each flags word PR accepts, for flags PR
+/// refuses (logged, decision 7) and those flags' neighbours, before the bootstrap and after it;
+/// the reply is one copied handle and success, and no placeholder is made. A short request is
+/// refused before anything is handed out.
+#[test]
+fn open_display_session_copies_a_session_on_the_vi2_server() {
+    let mut rig = wired_with(RootState::new().with_vi2_server(VI2));
+    let flags = [
+        DISPLAY_SESSION_FLAGS[0],
+        DISPLAY_SESSION_FLAGS[1],
+        DISPLAY_SESSION_FLAGS[2],
+        DISPLAY_SESSION_FLAGS[0] - 1,
+        DISPLAY_SESSION_FLAGS[2] + 1,
+        0,
+    ];
+    for ready in [false, true] {
+        if ready {
+            rig.initialize(&local());
+            rig.bind_process();
+            rig.complete_bootstrap();
+            assert_eq!(rig.state().phase(), Phase::Ready);
+        }
+        for flags in flags {
+            assert_eq!(opened(&mut rig, &open_display_session(flags)), Some(VI2));
+            let reply = rig.send(&open_display_session(flags));
+            let handle = copied(&reply)[0];
+            let expected = le(&[0x141, SPECIAL | 1, ONE_COPY, handle, 0]);
+            assert_eq!(&reply[..expected.len()], &expected[..], "{flags:#x}");
+            rig.kernel.take_connections();
+        }
+    }
+    assert_eq!(rig.state().vi2_server(), Some(VI2));
+    let short = rig.send(&[0x141, 1, 0x0002_0000]);
+    assert_eq!(short, result_only(OPEN_DISPLAY_SESSION, INVALID_CMIF_REQUEST));
+    assert_eq!(rig.kernel.take_connections(), []);
+}
+
+/// A root wired to the other family servers but not to vi2 answers 305 with the stub's
+/// placeholder, flags or none, and a root wired to vi2 only answers 202 and 1402 with theirs.
+#[test]
+fn only_the_vi2_server_answers_305() {
+    let mut rig = wired_with(
+        RootState::new()
+            .with_gpu_server(GPU)
+            .with_syncpt_server(SYNCPT)
+            .with_nvsrv_server(NVSRV),
+    );
+    let flags = DISPLAY_SESSION_FLAGS[0];
+    assert_eq!(opened(&mut rig, &open_display_session(flags)), None);
+    assert_eq!(opened(&mut rig, &[0x141, 0]), None);
+    let mut rig = wired_with(RootState::new().with_vi2_server(VI2));
+    assert_eq!(opened(&mut rig, &GET_SYNCPOINT_SESSION_WORDS), None);
+    assert_eq!(opened(&mut rig, &GET_NVIDIA_DRIVER_WORDS), None);
+    assert_eq!(opened(&mut rig, &open_display_session(flags)), Some(VI2));
+}
+
+/// A snapshot whose vi2 server is not the run's is refused, after the nvsrv server's check: with
+/// both different, the nvsrv server's refusal is reported. The server keeps its own state, and
+/// still hands out the vi2 server's sessions.
+#[test]
+fn a_snapshot_with_another_vi2_server_is_refused() {
+    let run = RootState::new()
+        .with_nvsrv_server(NVSRV)
+        .with_vi2_server(VI2);
+    let other = ServiceId(0x0998);
+    let cases = [
+        (
+            RootState::new()
+                .with_nvsrv_server(other)
+                .with_vi2_server(other),
+            "its root names another nvsrv server",
+        ),
+        (
+            RootState::new()
+                .with_nvsrv_server(NVSRV)
+                .with_vi2_server(other),
+            "its root names another vi2 server",
+        ),
+        (
+            RootState::new().with_nvsrv_server(NVSRV),
+            "its root names another vi2 server",
+        ),
+    ];
+    for (saved, refusal) in cases {
+        let bytes = wired_with(saved).server.save().unwrap();
+        let mut rig = wired_with(run);
+        assert_eq!(
+            rig.server.restore(&bytes),
+            Err(SnapshotError::FamilyWiring(refusal)),
+            "{saved:?}"
+        );
+        assert_eq!(rig.state(), run);
+        let own = rig.server.save().unwrap();
+        assert_eq!(rig.server.restore(&own), Ok(()));
+        assert_eq!(
+            opened(&mut rig, &open_display_session(DISPLAY_SESSION_FLAGS[1])),
+            Some(VI2)
+        );
     }
 }

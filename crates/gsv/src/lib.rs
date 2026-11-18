@@ -17,6 +17,8 @@
 //! * [`gpu`]: the gpu session (497) and its worker: GPU memory, mappings and sparse regions.
 //! * [`native`]: native memory and native images (root 111, 112, 114, 314, 315, 423, 429, 430,
 //!   435, 1510) and their size.
+//! * [`vi2`]: the vi2 session (305): displays, clients, layers, request groups and monitors,
+//!   notifications and display state.
 
 pub mod completion;
 pub mod gpu;
@@ -27,6 +29,7 @@ pub mod protocol;
 pub mod root;
 pub mod shared;
 pub mod syncpt;
+pub mod vi2;
 
 #[cfg(test)]
 mod testing;
