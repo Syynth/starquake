@@ -20,13 +20,15 @@ use crate::framework::result::{INVALID_CMIF_REQUEST, UNKNOWN_COMMAND_ID};
 use crate::framework::{Handled, Kernel, Protocol, Session, SnapshotError};
 
 use super::command::application_functions::{
-    GET_GPU_ERROR_DETECTED_SYSTEM_EVENT,
-    GET_SCREEN_SHOT_AND_CONTINUOUS_RECORDING_INITIALLY_ENABLED, IS_GAME_PLAY_RECORDING_SUPPORTED,
-    NOTIFY_RUNNING, SET_GAME_PLAY_RECORDING_STATE, UNKNOWN_321, UNKNOWN_330,
+    GET_DESIRED_LANGUAGE, GET_GPU_ERROR_DETECTED_SYSTEM_EVENT,
+    GET_SCREEN_SHOT_AND_CONTINUOUS_RECORDING_INITIALLY_ENABLED, GET_UNKNOWN_EVENT_210,
+    IS_GAME_PLAY_RECORDING_SUPPORTED, NOTIFY_RUNNING, SET_GAME_PLAY_RECORDING_STATE, UNKNOWN_321,
+    UNKNOWN_330,
 };
 use super::command::common_state_getter::{
     GET_CURRENT_FOCUS_STATE, GET_EVENT_HANDLE, GET_OPERATION_MODE, GET_PERFORMANCE_MODE,
-    RECEIVE_MESSAGE, SET_REQUEST_EXIT_TO_LIBRARY_APPLET_AT_EXECUTE_NEXT_PROGRAM_ENABLED,
+    RECEIVE_MESSAGE, SET_CPU_BOOST_MODE,
+    SET_REQUEST_EXIT_TO_LIBRARY_APPLET_AT_EXECUTE_NEXT_PROGRAM_ENABLED,
 };
 use super::command::graphics_scaling_parameters_functions::{
     GET_GRAPHICS_SCALING_PARAMETERS, SET_GRAPHICS_SCALE_CHANGED_NOTIFICATION_ENABLED,
@@ -41,7 +43,7 @@ use super::command::self_controller::{
     EXIT, GET_ACCUMULATED_SUSPENDED_TICK_CHANGED_EVENT, GET_GRAPHICS_SUPERVISOR,
     SET_FOCUS_HANDLING_MODE, SET_OPERATION_MODE_CHANGED_NOTIFICATION,
     SET_OUT_OF_FOCUS_SUSPENDING_ENABLED, SET_PERFORMANCE_MODE_CHANGED_NOTIFICATION,
-    SET_SCREEN_SHOT_PERMISSION,
+    SET_RESTART_MESSAGE_ENABLED, SET_RTC_SCREEN_SHARING_AUDIO_ENABLED, SET_SCREEN_SHOT_PERMISSION,
 };
 use super::command::window_controller::{ACQUIRE_FOREGROUND_RIGHTS, GET_APPLET_RESOURCE_USER_ID};
 
@@ -945,6 +947,7 @@ fn the_tables_name_the_commands_as_eden_does() {
     assert_eq!(
         names(&IApplicationFunctions),
         [
+            (GET_DESIRED_LANGUAGE, "get_desired_language"),
             (NOTIFY_RUNNING, "notify_running"),
             (
                 IS_GAME_PLAY_RECORDING_SUPPORTED,
@@ -958,6 +961,7 @@ fn the_tables_name_the_commands_as_eden_does() {
                 GET_GPU_ERROR_DETECTED_SYSTEM_EVENT,
                 "get_gpu_error_detected_system_event"
             ),
+            (GET_UNKNOWN_EVENT_210, "get_unknown_event_210"),
             (
                 GET_SCREEN_SHOT_AND_CONTINUOUS_RECORDING_INITIALLY_ENABLED,
                 "get_screen_shot_and_continuous_recording_initially_enabled"
@@ -1000,6 +1004,7 @@ fn the_getter_and_controller_tables_name_the_commands_as_eden_does() {
             (GET_OPERATION_MODE, "get_operation_mode"),
             (GET_PERFORMANCE_MODE, "get_performance_mode"),
             (GET_CURRENT_FOCUS_STATE, "get_current_focus_state"),
+            (SET_CPU_BOOST_MODE, "set_cpu_boost_mode"),
             (
                 SET_REQUEST_EXIT_TO_LIBRARY_APPLET_AT_EXECUTE_NEXT_PROGRAM_ENABLED,
                 "set_request_exit_to_library_applet_at_execute_next_program_enabled"
@@ -1020,6 +1025,7 @@ fn the_getter_and_controller_tables_name_the_commands_as_eden_does() {
                 "set_performance_mode_changed_notification"
             ),
             (SET_FOCUS_HANDLING_MODE, "set_focus_handling_mode"),
+            (SET_RESTART_MESSAGE_ENABLED, "set_restart_message_enabled"),
             (
                 SET_OUT_OF_FOCUS_SUSPENDING_ENABLED,
                 "set_out_of_focus_suspending_enabled"
@@ -1029,6 +1035,10 @@ fn the_getter_and_controller_tables_name_the_commands_as_eden_does() {
                 "get_accumulated_suspended_tick_changed_event"
             ),
             (GET_GRAPHICS_SUPERVISOR, "get_graphics_supervisor"),
+            (
+                SET_RTC_SCREEN_SHARING_AUDIO_ENABLED,
+                "set_rtc_screen_sharing_audio_enabled"
+            ),
         ]
     );
     assert_eq!(
@@ -2364,9 +2374,9 @@ fn a_server_after_the_titles_start_up_commands_saves_and_restores() {
 /// How a test reads the id the applet keeps for one of its events.
 type KeptEvent = fn(&Applet) -> Option<ObjectId>;
 
-/// The two never-signalled events, each with the interface that returns it, the command, and
+/// The three never-signalled events, each with the interface that returns it, the command, and
 /// how to read the id the applet keeps for it.
-fn never_signalled_events() -> [(u32, u32, KeptEvent); 2] {
+fn never_signalled_events() -> [(u32, u32, KeptEvent); 3] {
     [
         (
             GET_SELF_CONTROLLER,
@@ -2378,10 +2388,15 @@ fn never_signalled_events() -> [(u32, u32, KeptEvent); 2] {
             GET_GPU_ERROR_DETECTED_SYSTEM_EVENT,
             Applet::gpu_error_detected_event,
         ),
+        (
+            GET_APPLICATION_FUNCTIONS,
+            GET_UNKNOWN_EVENT_210,
+            Applet::unknown_event,
+        ),
     ]
 }
 
-/// A restored suspended-tick or GPU-error event is checked against the kernel before its handle
+/// A restored suspended-tick, GPU-error or unknown event is checked against the kernel before its handle
 /// is copied (module docs, "The applet"): restored onto a kernel where the saved id
 /// names another kind of object, or nothing the kernel made, the command answers the kernel's
 /// `InvalidHandle`, copies no handle and leaves the applet as it was, on every call.
@@ -3048,4 +3063,260 @@ fn message_available_after_pop_agrees_with_a_pop() {
             }
         }
     }
+}
+
+// ----- The title's later start-up commands: 21, 210, 66, 14 and 2400 -------------------------
+
+/// `IApplicationFunctions` 21 answers Eden's language for an application whose metadata Eden
+/// cannot read, under Eden's default system language: `en-US`, as `set`'s language code writes
+/// it (a string, zero-padded to eight bytes). Nothing in the applet changes, and a second call
+/// answers the same.
+#[test]
+fn get_desired_language_answers_eden_s_answer_with_no_metadata() {
+    assert_eq!(LANGUAGE_CODE_EN_US.to_le_bytes(), *b"en-US\0\0\0");
+    assert_eq!(DESIRED_LANGUAGE_CODE, LANGUAGE_CODE_EN_US);
+    let mut rig = Rig::new();
+    let proxy = rig.proxy();
+    let functions = rig.open(proxy, GET_APPLICATION_FUNCTIONS);
+    let before = rig.applet();
+    for _ in 0..2 {
+        assert_eq!(
+            rig.object_raw(functions, GET_DESIRED_LANGUAGE, &[]),
+            domain_reply(ResultCode::SUCCESS, b"en-US\0\0\0", &[])
+        );
+        assert_eq!(rig.applet(), before);
+    }
+}
+
+/// `IApplicationFunctions` 210 copies one event, made the first time and never signalled: the
+/// same event on every call, and none of the applet's other events.
+#[test]
+fn get_unknown_event_210_copies_one_event_never_signalled() {
+    let mut rig = Rig::new();
+    let proxy = rig.proxy();
+    let functions = rig.open(proxy, GET_APPLICATION_FUNCTIONS);
+    let getter = rig.open(proxy, GET_COMMON_STATE_GETTER);
+    let controller = rig.open(proxy, GET_SELF_CONTROLLER);
+    assert_eq!(rig.applet().unknown_event(), None);
+    let raw = rig.object_raw(functions, GET_UNKNOWN_EVENT_210, &[]);
+    let first = parse(&raw, SessionKind::Domain).copies[0];
+    assert_eq!(raw, copied_handle_reply(first));
+    let event = rig.object_of(first);
+    assert_eq!(rig.applet().unknown_event(), Some(event));
+    assert_eq!(rig.kernel.signals(event), Some(0));
+    assert_eq!(rig.kernel.is_signalled(event), Some(false));
+
+    let again = rig.object_raw(functions, GET_UNKNOWN_EVENT_210, &[]);
+    let second = parse(&again, SessionKind::Domain).copies[0];
+    assert_eq!(again, copied_handle_reply(second));
+    assert_eq!(rig.object_of(second), event);
+
+    let others = [
+        rig.object(getter, GET_EVENT_HANDLE, &[]).copies[0],
+        rig.object(
+            controller,
+            GET_ACCUMULATED_SUSPENDED_TICK_CHANGED_EVENT,
+            &[],
+        )
+        .copies[0],
+        rig.object(functions, GET_GPU_ERROR_DETECTED_SYSTEM_EVENT, &[])
+            .copies[0],
+    ];
+    for other in others {
+        assert_ne!(rig.object_of(other), event);
+    }
+    assert_eq!(rig.applet().unknown_event(), Some(event));
+    assert_eq!(rig.kernel.signals(event), Some(0));
+}
+
+/// Eden's `CpuBoostMode` words, checked against libnx's `ApmCpuBoostMode` (`Normal = 0`,
+/// `FastLoad = 1`, `Type2 = 2`), and Eden's check: a word is a mode exactly when it is below the
+/// number of modes, so the last mode is accepted and the next word refused, and a word that
+/// differs from a mode only above its low byte is refused.
+#[test]
+fn cpu_boost_mode_accepts_eden_s_three_words_and_no_other() {
+    assert_eq!(
+        [
+            CpuBoostMode::Normal,
+            CpuBoostMode::FastLoad,
+            CpuBoostMode::Partial
+        ]
+        .map(CpuBoostMode::raw),
+        [0, 1, 2]
+    );
+    let modes = u32::try_from(CpuBoostMode::ALL.len()).unwrap();
+    let last = CpuBoostMode::ALL[CpuBoostMode::ALL.len() - 1];
+    assert_eq!(CpuBoostMode::from_raw(modes - 1), Some(last));
+    assert_eq!(CpuBoostMode::from_raw(modes), None);
+    for mode in CpuBoostMode::ALL {
+        assert_eq!(CpuBoostMode::from_raw(mode.raw()), Some(mode));
+        for above in [0x100, 0x1_0000, 0x100_0000] {
+            assert_eq!(CpuBoostMode::from_raw(mode.raw() | above), None, "{mode:?}");
+        }
+    }
+    for raw in (modes..=0x1FF).chain([u32::MAX]) {
+        assert_eq!(CpuBoostMode::from_raw(raw), None, "{raw}");
+    }
+}
+
+/// `ICommonStateGetter` 66 answers success and nothing else for every word, a mode or not, as
+/// Eden's does, and keeps nothing: Eden's performance configuration for the mode is not kept
+/// here (module docs, "The title's later start-up commands").
+#[test]
+fn set_cpu_boost_mode_answers_success_and_keeps_nothing() {
+    let mut rig = Rig::new();
+    let proxy = rig.proxy();
+    let getter = rig.open(proxy, GET_COMMON_STATE_GETTER);
+    let before = rig.applet();
+    let modes = u32::try_from(CpuBoostMode::ALL.len()).unwrap();
+    let words = CpuBoostMode::ALL.map(CpuBoostMode::raw).into_iter().chain([
+        modes,
+        modes - 1 + 0x100,
+        u32::MAX,
+    ]);
+    for word in words {
+        assert_eq!(
+            rig.object_raw(getter, SET_CPU_BOOST_MODE, &word.to_le_bytes()),
+            domain_reply(ResultCode::SUCCESS, &[], &[]),
+            "{word}"
+        );
+        assert_eq!(rig.applet(), before, "{word}");
+    }
+    // The reported performance mode is the settings', boost or not.
+    let reply = rig.object_raw(getter, GET_PERFORMANCE_MODE, &[]);
+    let mode = AppletSettings::eden_default().performance_mode().raw();
+    assert_eq!(
+        reply,
+        domain_reply(ResultCode::SUCCESS, &mode.to_le_bytes(), &[])
+    );
+}
+
+/// `ISelfController` 14 keeps its flag in the applet, initially false (Eden's
+/// `m_resume_notification_enabled{}`), reading any byte that is not zero as true. It never
+/// touches the message event, signalled or not, and changes nothing else in the applet.
+#[test]
+fn set_restart_message_enabled_keeps_its_flag_and_leaves_the_message_event() {
+    assert!(!Applet::new(AppletSettings::eden_default()).resume_notification_enabled());
+    let mut rig = Rig::new();
+    let proxy = rig.proxy();
+    let getter = rig.open(proxy, GET_COMMON_STATE_GETTER);
+    let controller = rig.open(proxy, GET_SELF_CONTROLLER);
+    let copied = rig.object(getter, GET_EVENT_HANDLE, &[]).copies[0];
+    let event = rig.object_of(copied);
+    let before = rig.applet();
+    assert!(!before.resume_notification_enabled());
+    let resume = |rig: &Rig| rig.applet().resume_notification_enabled();
+    // Signalled at launch; then with the event clear (the focus change received).
+    for signalled in [true, false] {
+        if !signalled {
+            rig.object(getter, RECEIVE_MESSAGE, &[]);
+        }
+        assert_eq!(rig.kernel.is_signalled(event), Some(signalled));
+        let signals = rig.kernel.signals(event);
+        for (byte, expected) in [(1, true), (1, true), (0, false), (2, true), (0, false)] {
+            assert_eq!(
+                rig.object_raw(controller, SET_RESTART_MESSAGE_ENABLED, &[byte]),
+                domain_reply(ResultCode::SUCCESS, &[], &[]),
+                "{byte}"
+            );
+            assert_eq!(resume(&rig), expected, "{byte}");
+            assert_eq!(rig.kernel.is_signalled(event), Some(signalled), "{byte}");
+            assert_eq!(rig.kernel.signals(event), signals, "{byte}");
+        }
+    }
+    rig.object(controller, SET_RESTART_MESSAGE_ENABLED, &[1]);
+    let mut expected = before;
+    expected.resume_notification_enabled = true;
+    expected.lifecycle.has_focus_state_changed = false;
+    assert_eq!(rig.applet(), expected);
+}
+
+/// `ISelfController` 2400 (Switch 2) answers success and nothing else for either flag, and keeps
+/// nothing, as PR #4588's only logs it.
+#[test]
+fn set_rtc_screen_sharing_audio_enabled_answers_success_and_keeps_nothing() {
+    let mut rig = Rig::new();
+    let proxy = rig.proxy();
+    let controller = rig.open(proxy, GET_SELF_CONTROLLER);
+    let before = rig.applet();
+    for byte in [1, 0, 2, 0xFF] {
+        assert_eq!(
+            rig.object_raw(controller, SET_RTC_SCREEN_SHARING_AUDIO_ENABLED, &[byte]),
+            domain_reply(ResultCode::SUCCESS, &[], &[]),
+            "{byte}"
+        );
+        assert_eq!(rig.applet(), before, "{byte}");
+    }
+}
+
+/// The two new flag commands refuse a payload with no byte for the flag, and the boost-mode one
+/// a payload of fewer than its word's four bytes (libnx's layout, whose domain `size` counts the
+/// exact argument bytes), with [`INVALID_CMIF_REQUEST`], and change nothing; the exact argument
+/// is accepted.
+#[test]
+fn the_later_commands_refuse_a_payload_too_short_and_change_nothing() {
+    let mut rig = Rig::new();
+    let proxy = rig.proxy();
+    let getter = rig.open(proxy, GET_COMMON_STATE_GETTER);
+    let controller = rig.open(proxy, GET_SELF_CONTROLLER);
+    let word = CpuBoostMode::FastLoad.raw().to_le_bytes();
+    let cases: [(u32, u32, &[u8]); 3] = [
+        (getter, SET_CPU_BOOST_MODE, &word),
+        (controller, SET_RESTART_MESSAGE_ENABLED, &[1]),
+        (controller, SET_RTC_SCREEN_SHARING_AUDIO_ENABLED, &[1]),
+    ];
+    for (object, command, argument) in cases {
+        for len in 0..=argument.len() {
+            let before = rig.applet();
+            let request = RequestBuilder::domain(CommandType::Request, object, command)
+                .layout(RequestLayout::Libnx)
+                .data(&argument[..len]);
+            let reply = rig.send_raw(rig.session, &request);
+            if len == argument.len() {
+                assert_eq!(
+                    reply,
+                    domain_reply(ResultCode::SUCCESS, &[], &[]),
+                    "{command}"
+                );
+            } else {
+                assert_eq!(
+                    reply,
+                    domain_reply(INVALID_CMIF_REQUEST, &[], &[]),
+                    "{command} {len}"
+                );
+                assert_eq!(rig.applet(), before, "{command} {len}");
+            }
+        }
+    }
+    assert!(rig.applet().resume_notification_enabled());
+}
+
+/// A server saved after the later start-up commands restores, and answers from what it saved:
+/// the restart-message flag, and the unknown event, copied again unchanged.
+#[test]
+fn a_server_after_the_later_start_up_commands_saves_and_restores() {
+    let mut rig = Rig::new();
+    let proxy = rig.proxy();
+    let controller = rig.open(proxy, GET_SELF_CONTROLLER);
+    let functions = rig.open(proxy, GET_APPLICATION_FUNCTIONS);
+    rig.object(controller, SET_RESTART_MESSAGE_ENABLED, &[1]);
+    rig.object(functions, GET_UNKNOWN_EVENT_210, &[]);
+    let event = rig.applet().unknown_event().unwrap();
+    let saved = rig.server.save().unwrap();
+
+    let mut restored = oe_server(AppletSettings::eden_default(), UnknownPolicy::Strict);
+    restored.restore(&saved).unwrap();
+    assert_eq!(restored.family::<Applet>(), Some(&rig.applet()));
+    assert_eq!(restored.save().unwrap(), saved);
+    rig.server = restored;
+
+    assert!(rig.applet().resume_notification_enabled());
+    let raw = rig.object_raw(functions, GET_UNKNOWN_EVENT_210, &[]);
+    let copied = parse(&raw, SessionKind::Domain).copies[0];
+    assert_eq!(raw, copied_handle_reply(copied));
+    assert_eq!(rig.object_of(copied), event);
+    assert_eq!(rig.kernel.signals(event), Some(0));
+    // The flag goes off again on the restored server.
+    rig.object(controller, SET_RESTART_MESSAGE_ENABLED, &[0]);
+    assert!(!rig.applet().resume_notification_enabled());
 }
