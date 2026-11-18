@@ -9,7 +9,7 @@
 //! [`Graphics::new`] builds, in the order the spec's "The pieces" (`starquake_gsv::shared`) asks:
 //! the [`CompletionQueue`] (rung through a [`Wake`] the run gives it), the `Syncpoints` that push
 //! to it, gsv's [`Shared`] state over both, recording its notes for the root's number
-//! ([`GSV_ROOT`]), and the GPU front ([`NullFront`]). [`install`](super::install) puts four of
+//! ([`GSV_ROOT`]), and the GPU front ([`NullFront`]). [`install`](super::install) puts five of
 //! gsv's per-family servers (decision 6) in front of the kernel, each known by its own number,
 //! none on a port and none in `sm:`'s registry:
 //!
@@ -19,17 +19,19 @@
 //! | syncpt | [`GSV_SYNCPT`] | `syncpt_server` over the shared state |
 //! | gpu | [`GSV_GPU`] | `gpu_server` over the shared state and the front |
 //! | nvsrv | [`GSV_NVSRV`] | `nvsrv_server` over the shared state and the front, with the front as its channel front too, and told of deferred replies as `fsp-srv` is ([`super::Reads::ready`]) |
+//! | vi2 | [`GSV_VI2`] | `vi2_server` over the shared state, with the services' environment and halt ([`Graphics::add_vi2_server`], which [`install_with_graphics`](super::install_with_graphics) calls after the others) |
 //!
 //! The root answers 202, 204, 497 and 1402 with its family's server (`starquake_gsv::root`,
-//! "The family sessions"). Built with the shared state, the root also answers the native memory
+//! "The family sessions"), and 305 with the vi2 server ("The display session (305)"). Built with the shared state, the root also answers the native memory
 //! and image commands (111, 112, 114, 314, 315, 423, 429, 430, 435, 1510) from the native tables
 //! in it (`starquake_gsv::native`, slice 8; `the_root_answers_native_memory_and_images`); every
 //! other root command is still the root's logged stub. The vsync clock (slice 12,
 //! `starquake_gsv::shared::vsync`) needs no server: it is part of gsv's shared state and runs in
-//! the timer thread's turn (below), and vi2 (slice 13) will start it by adding listeners. Slices
-//! 13 to 15 (vi2, present and video: issues 191 to 193) are not built: when they land, each adds
-//! its server here beside these and its number to the root, and 305 and the video commands stop
-//! being stubs.
+//! the timer thread's turn (below), and vi2's request groups (slice 13) start it by listening
+//! (`a_vi2_request_group_is_ticked_through_the_run_s_turn`, in `hle/tests/graphics/vsync.rs`).
+//! Slices 14 and 15 (present and video: issues 192 and 193) are not built: when they land,
+//! video adds its server here beside these and its number to the root, and the video commands
+//! stop being stubs.
 //!
 //! # The GPU front
 //!
@@ -138,7 +140,7 @@
 //!
 //! - **Replayed:** a session of requests whose GPU inputs are the notes above: the IPC events,
 //!   the notes in their order, the events the drain signals, and the state of gsv's shared
-//!   state, its GPU memory, the syncpoints and the four servers, when the notes are fed back at
+//!   state, its GPU memory, the syncpoints and the five servers, when the notes are fed back at
 //!   the turns the run drained them.
 //! - **Not replayed: the counters between a submission and its note.** In a run the front
 //!   performs a submission's increments when it is handed it; in a replay the counter moves only
@@ -185,14 +187,16 @@ use starquake_gsv::root::{self, RootState};
 use starquake_gsv::shared::vsync::VsyncReplayError;
 use starquake_gsv::shared::{Shared, TimerHost};
 use starquake_gsv::syncpt;
+use starquake_gsv::vi2;
 use starquake_kernel::dispatch::{DeviceShareError, Dispatcher, WakeError};
 use starquake_kernel::id::ObjectId;
 use starquake_kernel::memory::DeviceShareToken;
 use starquake_kernel::result::{KernelError, SvcError, SvcResult};
 use starquake_memory::GuestMemory;
-use starquake_services::framework::{Notify, UnknownPolicy};
+use starquake_services::framework::{Halt, Notify, UnknownPolicy};
 use starquake_trace::{Env, EnvError, EventKind, HostNanos, Recorder, ThreadId};
 
+use super::GSV_VI2;
 use super::{Deliveries, Delivering, GSV_GPU, GSV_NVSRV, GSV_ROOT, GSV_SYNCPT, ServicesError};
 
 #[cfg(test)]
@@ -420,10 +424,29 @@ impl Graphics {
         let state = RootState::new()
             .with_syncpt_server(GSV_SYNCPT)
             .with_gpu_server(GSV_GPU)
-            .with_nvsrv_server(GSV_NVSRV);
+            .with_nvsrv_server(GSV_NVSRV)
+            .with_vi2_server(GSV_VI2);
         let graphics_root = root::root_server_with_page(state, policy, Arc::clone(&self.shared))
             .with_service_id(GSV_ROOT);
         dispatcher.add_server(root::ROOT_NAME, GSV_ROOT, None, Box::new(graphics_root))?;
+        Ok(())
+    }
+
+    /// Puts gsv's vi2 server in front of `dispatcher` (module docs, "What is built"), reading
+    /// `env`, the services' environment, and telling `halt` when it fails: a request group that
+    /// starts listening to the vsync clock reads its clock (`starquake_gsv::vi2`, "The
+    /// server"). The root [`Graphics::add_servers`] adds names it as 305's server.
+    pub(super) fn add_vi2_server(
+        &self,
+        dispatcher: &Dispatcher,
+        policy: UnknownPolicy,
+        env: Arc<dyn Env>,
+        halt: Arc<dyn Halt>,
+    ) -> Result<(), ServicesError> {
+        let display = vi2::vi2_server(policy, Arc::clone(&self.shared))
+            .with_service_id(GSV_VI2)
+            .with_env(env, halt);
+        dispatcher.add_server(vi2::VI2_NAME, GSV_VI2, None, Box::new(display))?;
         Ok(())
     }
 

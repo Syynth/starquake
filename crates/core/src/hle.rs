@@ -14,8 +14,8 @@
 //! out, and `appletOE`'s `ISelfController` 2000 is given the same number, the constant
 //! [`GSV_ROOT`] that the private entry is registered under, to hand a session on it to the
 //! title. The root hands out sessions on the graphics server's other servers, [`GSV_SYNCPT`],
-//! [`GSV_GPU`] and [`GSV_NVSRV`], which are in no registry; [`graphics`] builds the graphics
-//! server and says what it wires.
+//! [`GSV_GPU`] and [`GSV_NVSRV`], and [`GSV_VI2`], which are in no registry; [`graphics`] builds
+//! the graphics server and says what it wires.
 //!
 //! Parental control's four names (`pctl`, `pctl:a`, `pctl:s`, `pctl:r`) are four servers, one
 //! per name, known by [`PCTL`], [`PCTL_A`], [`PCTL_S`] and [`PCTL_R`]: each name's factory has a
@@ -56,7 +56,7 @@
 
 use std::sync::{Arc, OnceLock};
 
-use starquake_gsv::{gpu, nvsrv, root, syncpt};
+use starquake_gsv::{gpu, nvsrv, root, syncpt, vi2};
 use starquake_kernel::dispatch::Dispatcher;
 use starquake_kernel::id::ServerId;
 use starquake_kernel::ipc::{IpcError, PortName, PortNameError};
@@ -116,6 +116,8 @@ pub const GSV_SYNCPT: ServiceId = ServiceId(19);
 pub const GSV_GPU: ServiceId = ServiceId(20);
 /// The number the kernel knows the graphics server's nvsrv server by.
 pub const GSV_NVSRV: ServiceId = ServiceId(21);
+/// The number the kernel knows the graphics server's vi2 server by.
+pub const GSV_VI2: ServiceId = ServiceId(22);
 
 /// The parental-control names, each with the number its server is known by: one server per
 /// name, since each name's factory has its own capability ([`pctl::Name::capability`]).
@@ -146,6 +148,7 @@ const SERVICES: &[(ServiceId, &str)] = &[
     (GSV_SYNCPT, syncpt::SYNCPT_NAME),
     (GSV_GPU, gpu::GPU_NAME),
     (GSV_NVSRV, nvsrv::NVSRV_NAME),
+    (GSV_VI2, vi2::VI2_NAME),
 ];
 
 /// The name of the service a number stands for, if a run has it.
@@ -316,6 +319,12 @@ pub fn install_with_graphics(
     dispatcher.add_server(am::OE_NAME, APPLET_OE, None, Box::new(applets))?;
 
     graphics.add_servers(dispatcher, policy, reads.ready)?;
+    graphics.add_vi2_server(
+        dispatcher,
+        policy,
+        Arc::clone(&env),
+        Arc::clone(&reads.halt),
+    )?;
 
     let input = hid::server(policy).with_service_id(HID);
     dispatcher.add_server(hid::NAME, HID, None, Box::new(input))?;

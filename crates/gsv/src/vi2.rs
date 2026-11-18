@@ -79,9 +79,11 @@
 //! What each checks, in order, answering the first failure (PR's checks, with PR's results):
 //!
 //! - **1, 3, 5** check nothing.
-//! - **11** refuses a word other than 0 with `InvalidCombination`; otherwise it makes the
-//!   session's notification event the first time, signals it if any notification is raised, and
-//!   hands it out. **13** refuses a word other than 0 the same way and does nothing else.
+//! - **11** reads its word and takes any value: it makes the session's notification event the
+//!   first time, signals it if any notification is raised, and hands it out. **13** reads its
+//!   word, takes any value, and does nothing else. PR refuses a word other than 0 with
+//!   `InvalidCombination` (`packet[2] == 0`); NX2 takes any (it logs `[2]`), and a title ran on
+//!   that, so decision 8 takes NX2's (below, "Where this differs").
 //! - **21** refuses an out buffer smaller than [`NOTIFICATIONS_SIZE`] with `InvalidSize`;
 //!   otherwise it writes the bitmap ([`NOTIFICATION_WORDS`] little-endian `u32`s), clears the
 //!   notification event if it has been made, and only then clears the bitmap, so a refused
@@ -213,6 +215,7 @@
 //! |---|---|---|---|
 //! | 1 and 3 | 0 | 1 | **conflict**: 1, the larger answer and the one a title ran on (decision 8; `the_limits_are_the_chosen_answers`) |
 //! | 11 | one event per session | a new event per call | PR's (`the_notification_event_is_made_once_and_signalled_while_raised`) |
+//! | 11 and 13 with a word other than 0 | `InvalidCombination` | 11 takes any word; 13 auto-stubbed | **conflict**: any word, NX2's, the one a title ran on (`notification_commands_take_any_word`) |
 //! | 31 and 32 | a group's event, ticked once registered for kind 0 | a new event per call, every one ticked | **conflict**: PR's, with NX2's ticking as the fallback (above; `an_unregistered_group_is_ticked_by_the_fallback`, `a_kind_zero_monitor_ticks_its_group`) |
 //! | The handle kind of 11, 31 and 32 | moved | copied | **conflict**: copied, as [`crate::protocol::HANDLE_KIND`] (`the_request_group_event_is_handed_out_copied`) |
 //! | 32 with a handle naming a live object that is not an event, and a group out of range | `InvalidHandle` (the handle is checked for a readable event first) | auto-stubbed | [`VI_OUT_OF_RANGE`]: the group is checked before the identity, and the server cannot tell an event from another object (`duplicate_checks_the_group_before_the_identity`) |
@@ -463,11 +466,11 @@ pub const FIRST_LAYER: u64 = 1;
 /// vi2 server's 40-entry display table" (its 39-entry array, then `"#ld01"`, `"#ldv"` and
 /// `"#ovl1"`, which it compares one by one).
 pub const KNOWN_DISPLAYS: [&str; 42] = [
-    "default", "cpyrght", "full", "overlay", "overlay0", "overlay1", "overlay2", "test", "adraw:s0",
-    "adraw:s1", "adraw:s2", "adraw:c0", "adraw:c1", "adraw:i0", "player1", "player2", "player3",
-    "chat0", "chat1", "chat2", "chat3", "chat4", "chat5", "chat6", "chat7", "chat8", "chat9",
-    "chat10", "chat11", "chat12", "chat13", "chat14", "chat15", "chvcam", "null", "#ld", "#ld0",
-    "#ld1", "#ovl0", "#ld01", "#ldv", "#ovl1",
+    "default", "cpyrght", "full", "overlay", "overlay0", "overlay1", "overlay2", "test",
+    "adraw:s0", "adraw:s1", "adraw:s2", "adraw:c0", "adraw:c1", "adraw:i0", "player1", "player2",
+    "player3", "chat0", "chat1", "chat2", "chat3", "chat4", "chat5", "chat6", "chat7", "chat8",
+    "chat9", "chat10", "chat11", "chat12", "chat13", "chat14", "chat15", "chvcam", "null", "#ld",
+    "#ld0", "#ld1", "#ovl0", "#ld01", "#ldv", "#ovl1",
 ];
 
 /// Whether `name` names a display of [`KNOWN_DISPLAYS`], as PR's `IsKnownDisplayName` reads it:
@@ -924,16 +927,16 @@ impl Vi2Session {
         reply.ok()
     }
 
-    /// `GetNotificationEvent` (11). in: `u32` 0. out: copy handle, the notification event.
+    /// `GetNotificationEvent` (11). in: `u32`, read and logged, any value (module docs,
+    /// "Commands"). out: copy handle, the notification event.
     fn get_notification_event(
         &mut self,
         cx: &mut Context<'_>,
         req: &Request<'_>,
         reply: &mut Reply,
     ) -> Outcome {
-        if req.payload().read_u32()? != 0 {
-            return Err(KernelError::InvalidCombination.into());
-        }
+        let word = req.payload().read_u32()?;
+        tracing::debug!(word, "gsv:vi2: notification event");
         let event = match self.notification_event {
             Some(event) => event,
             None => {
@@ -949,16 +952,16 @@ impl Vi2Session {
         reply.ok()
     }
 
-    /// `ReleaseNotificationEvent` (13). in: `u32` 0.
+    /// `ReleaseNotificationEvent` (13). in: `u32`, read and logged, any value (module docs,
+    /// "Commands").
     fn release_notification_event(
         _: &mut Self,
         _cx: &mut Context<'_>,
         req: &Request<'_>,
         reply: &mut Reply,
     ) -> Outcome {
-        if req.payload().read_u32()? != 0 {
-            return Err(KernelError::InvalidCombination.into());
-        }
+        let word = req.payload().read_u32()?;
+        tracing::debug!(word, "gsv:vi2: release notification event");
         reply.ok()
     }
 
@@ -1006,7 +1009,10 @@ impl Vi2Session {
         let shared = shared(cx)?;
         let mut state = shared.lock();
         if state.vsync().listeners().count() >= MAX_LISTENERS {
-            tracing::error!(group, "gsv:vi2: the vsync clock has no room for a request group");
+            tracing::error!(
+                group,
+                "gsv:vi2: the vsync clock has no room for a request group"
+            );
             return Err(KernelError::OutOfResource.into());
         }
         let event = cx.create_event()?;
@@ -1313,10 +1319,7 @@ impl Vi2Session {
             return Err(KernelError::NotFound.into());
         }
         let next_layer = self.next_layer;
-        let client = self
-            .clients
-            .get_mut(index)
-            .ok_or(KernelError::NotFound)?;
+        let client = self.clients.get_mut(index).ok_or(KernelError::NotFound)?;
         if client.layer.is_none() {
             let after = next_layer
                 .checked_add(1)
@@ -1519,7 +1522,11 @@ impl Vi2Session {
     ) -> Outcome {
         let mut payload = req.payload();
         let token = payload.read_u64()?;
-        let bits = [payload.read_u32()?, payload.read_u32()?, payload.read_u32()?];
+        let bits = [
+            payload.read_u32()?,
+            payload.read_u32()?,
+            payload.read_u32()?,
+        ];
         let client = self.known_client(token)?;
         if !levels_are_valid(bits.map(f32::from_bits)) {
             return Err(KernelError::InvalidCombination.into());

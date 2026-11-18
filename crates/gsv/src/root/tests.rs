@@ -1555,7 +1555,10 @@ fn open_display_session_copies_a_session_on_the_vi2_server() {
     }
     assert_eq!(rig.state().vi2_server(), Some(VI2));
     let short = rig.send(&[0x141, 1, 0x0002_0000]);
-    assert_eq!(short, result_only(OPEN_DISPLAY_SESSION, INVALID_CMIF_REQUEST));
+    assert_eq!(
+        short,
+        result_only(OPEN_DISPLAY_SESSION, INVALID_CMIF_REQUEST)
+    );
     assert_eq!(rig.kernel.take_connections(), []);
 }
 

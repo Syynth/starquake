@@ -62,8 +62,8 @@ use thiserror::Error;
 
 use super::{
     ALL_SLOTS, CLIENT_NOTIFICATIONS, Client, FIRST_LAYER, MAX_CLIENTS, MAX_DISPLAY_REFERENCES,
-    MONITOR_KINDS, NOTIFICATION_WORDS, REQUEST_GROUPS, RequestGroup, Vi2Session,
-    is_known_display, levels_are_valid,
+    MONITOR_KINDS, NOTIFICATION_WORDS, REQUEST_GROUPS, RequestGroup, Vi2Session, is_known_display,
+    levels_are_valid,
 };
 
 /// The serialised form of [`Vi2Session`], field for field, and what deserialising validates
@@ -131,9 +131,7 @@ pub enum Vi2SessionError {
         found: u32,
     },
     /// More display references than 101 counts.
-    #[error(
-        "a vi2 session's display is open {found} times, more than {MAX_DISPLAY_REFERENCES}"
-    )]
+    #[error("a vi2 session's display is open {found} times, more than {MAX_DISPLAY_REFERENCES}")]
     DisplayReferences {
         /// The count it holds.
         found: u32,
