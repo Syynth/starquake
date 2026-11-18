@@ -1581,8 +1581,9 @@ fn events_1_2_3_and_7_are_answered() {
 // ----- Saved state -----------------------------------------------------------------------------
 
 /// The saved layout of nvhost-gpu's channels, as `postcard` writes it: the channel count, each
-/// fd, its syncpoint, its GPU channel and space, its classes, and its three events (index and
-/// generation each). Each value distinct and non-zero.
+/// fd, its syncpoint, its GPU channel and space, its classes, its three events (index and
+/// generation each), and its settings (client data, error notifier, preemption modes, zcull
+/// bind). Each value distinct and non-zero.
 #[test]
 fn a_channel_s_saved_layout_is_pinned() {
     let channel = Channel {
@@ -1607,6 +1608,10 @@ fn a_channel_s_saved_layout_is_pinned() {
             graphics: preemption::GRAPHICS_MAX,
             compute: preemption::COMPUTE_MAX,
         },
+        zcull: Some(ZcullBind {
+            gpu_va: 0x66,
+            mode: 0x67,
+        }),
     };
     let gpu = NvhostGpu::try_from(SavedNvhostGpu {
         channels: BTreeMap::from([(0x0B, channel)]),
@@ -1621,8 +1626,8 @@ fn a_channel_s_saved_layout_is_pinned() {
     // Events: some (0x51, 0x52), none, some (0x53, 0x54).
     expected.extend([1, 0x51, 0x52, 0, 1, 0x53, 0x54]);
     // Client data 0x6162 as a varint; error notifier: some, offset 0x63, size 0x64, mem 0x65;
-    // preemption modes 1 and 2.
-    expected.extend([0xE2, 0xC2, 0x01, 1, 0x63, 0x64, 0x65, 1, 2]);
+    // preemption modes 1 and 2; zcull bind: some, address 0x66, mode 0x67.
+    expected.extend([0xE2, 0xC2, 0x01, 1, 0x63, 0x64, 0x65, 1, 2, 1, 0x66, 0x67]);
     assert_eq!(bytes, expected);
     let back: NvhostGpu = postcard::from_bytes(&bytes).unwrap();
     assert_eq!(back, gpu);
@@ -1663,7 +1668,8 @@ fn a_bound_channel_s_saved_layout_is_pinned() {
         expected
     );
     // One channel: fd 4, syncpoint some 1, GPU channel some 0x30 in space 6, no classes, no
-    // events, client data 0, no error notifier, both preemption modes the default.
+    // events, client data 0, no error notifier, both preemption modes the default, no zcull
+    // bind.
     let modes = u8::try_from(preemption::DEFAULT).unwrap();
     let expected = [
         1,
@@ -1681,6 +1687,7 @@ fn a_bound_channel_s_saved_layout_is_pinned() {
         0,
         modes,
         modes,
+        0,
     ];
     assert_eq!(postcard::to_allocvec(bench.state.gpu()).unwrap(), expected);
     // The whole state reads back as it was.
@@ -3181,3 +3188,5 @@ fn a_closed_channel_s_events_are_not_freed() {
 }
 
 mod settings;
+
+mod zcull;

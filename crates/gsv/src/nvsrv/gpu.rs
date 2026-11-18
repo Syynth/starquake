@@ -15,14 +15,16 @@
 //! in `AllocateObjectContext`, `BuildIncrementCountCommandList`, `QueryEvent`'s extra events),
 //! and Eden PR #4588's readings (GPL-3.0-or-later) @ e5fb3b97,
 //! `eden-pr4588/src/core/hle/service/nvdrv/devices/nvhost_gpu.cpp` (`QueryEvent`'s event 7,
-//! `GetNativeGpuContextSlot` in `native_gpu_context.h`). "Row N" is a row of
+//! `GetNativeGpuContextSlot` in `native_gpu_context.h`; `ZCullBind` and `IoctlZCullBind`, the
+//! same in Eden and NX2). "Row N" is a row of
 //! `eden-nx2/NX2_NOTES.md` @ 50fa86bb: rows 26 (channel setup: Ampere and class-0 objects), 31
 //! (the Ampere classes C797, C7C0, C7B5 and class 0 bound), 32 (NVN2 sets bit 8 and expects the
 //! increments though its commands hold none) and 34 (a per-channel event, `QueryEvent` 7), all
 //! observed. libnx (`libnx/nx/source/nvidia/ioctl/nvchannel.c` @ b156b477) sends the same
 //! numbers: `_NV_IOWR(0x48, 0x08, ..)` with the entries after the struct, `nvIoctl2` with
-//! `_NV_IOWR(0x48, 0x1B, ..)` and the entries inline, `_NV_IOWR(0x48, 0x09, ..)` and
-//! `_NV_IOWR(0x48, 0x1A, ..)`.
+//! `_NV_IOWR(0x48, 0x1B, ..)` and the entries inline, `_NV_IOWR(0x48, 0x09, ..)`,
+//! `_NV_IOWR(0x48, 0x1A, ..)`, and `_NV_IOWR(0x48, 0x0B, ..)` (`nvioctlChannel_ZCullBind`, with
+//! the same 16-byte struct).
 //!
 //! # The channel
 //!
@@ -58,6 +60,7 @@
 //! | `Ioctl` | 0x3 | `ChannelSetTimeout` | 0: timeout |
 //! | `Ioctl` | 0xC | `SetErrorNotifier` | 0: offset (`u64`), 8: size (`u64`), 16: mem, 20: padding |
 //! | `Ioctl` | 0x1F, only [`SET_PREEMPTION_MODES`] | `SetPreemptionModes` (PR's) | 0: graphics, 4: compute |
+//! | `Ioctl` | 0xB | `ZCullBind` | 0: GPU address (`u64`), 8: mode, 12: padding |
 //! | `Ioctl` | group `'G'` ([`CLIENT_GROUP`]) 0x14 | `SetClientData` | 0: data (`u64`) |
 //! | `Ioctl` | group `'G'` 0x15 | `GetClientData` | 0: data (`u64`) |
 //!
@@ -65,7 +68,8 @@
 //! The title of issue #300 sends `0x40044803`, `0xc018480c`, `0xc008481f` and `0x40084714`; no
 //! title is known to send `GetClientData`, which is built because it reads what
 //! `SetClientData` keeps (issue #300's scope). Its number is matched on the group and the
-//! command alone, as PR's `Ioctl1` does.
+//! command alone, as PR's `Ioctl1` does. The title of issue #306 sends `0xc010480b`
+//! (`ZCullBind`), matched the same way.
 //!
 //! **`AllocGPFIFOEx2`**, the first failing check answering: the channel has a syncpoint already,
 //! `AlreadyAllocated` (Eden: `channel_state->initialized`); no syncpoint is free,
@@ -131,8 +135,8 @@
 //!
 //! # The settings
 //!
-//! Five ioctls set or read a channel's settings (PR `nvhost_gpu.cpp` @ e5fb3b97,
-//! `ChannelSetTimeout`, `SetErrorNotifier`, `SetPreemptionModes`, `SetClientData`,
+//! Six ioctls set or read a channel's settings (PR `nvhost_gpu.cpp` @ e5fb3b97,
+//! `ChannelSetTimeout`, `SetErrorNotifier`, `SetPreemptionModes`, `ZCullBind`, `SetClientData`,
 //! `GetClientData`, each through `WrapFixed`). Each gives its struct back whole, the fields it
 //! does not set as sent, whatever the result. None calls the GPU front.
 //!
@@ -149,6 +153,15 @@
 //!   compute mode above [`preemption::COMPUTE_MAX`], `NotSupported`. Then each mode that is not
 //!   [`preemption::KEEP`] is kept ([`Channel::preemption`], each [`preemption::DEFAULT`] until
 //!   set), `Success`. Nothing reads them yet (PR: "Context switches follow complete commands").
+//! - **`ZCullBind`**: the GPU address and the mode are kept ([`Channel::zcull`]), `Success`,
+//!   whatever their values: PR, NX2 and Eden keep the struct (`zcull_params = params`) and check
+//!   nothing, and PR's comment names modes 0 to 3 ("0=global, 1=no_ctxsw, 2=separate_buffer,
+//!   3=part_of_regular_buf") without refusing others. The struct is read as far as the input
+//!   goes and the rest is zero, as for every `WrapFixed` ioctl, so no input size is refused.
+//!   Nothing reads the bind yet, in starquake or in the references (no reference reads
+//!   `zcull_params` after storing it): the address is where the channel's zcull context buffer
+//!   lives (its size is ctrl-gpu's `ZCullGetCtxSize`, [`super::ctrl_gpu`]), engine state that the
+//!   GPU front (#12) would read when it saves and restores a channel's zcull context.
 //! - **`SetClientData`**: the `u64` is kept ([`Channel::client_data`]), `Success`.
 //!   **`GetClientData`**: the struct's data set to the kept one, 0 if none was set (PR
 //!   `user_data{}`), `Success`. That is the only read of anything the settings keep.
@@ -156,8 +169,8 @@
 //! `ChannelSetTimeout` makes no channel; the setters that keep something make the fd's channel
 //! if it has none yet, as an event query does; `GetClientData` makes none.
 //!
-//! The logs (`ChannelSetTimeout`'s at info, `SetErrorNotifier`'s at debug, a refused
-//! `SetPreemptionModes` at warn) are log-only: no test captures them, so a change to their level
+//! The logs (`ChannelSetTimeout`'s at info, `SetErrorNotifier`'s and `ZCullBind`'s at debug, a
+//! refused `SetPreemptionModes` at warn) are log-only: no test captures them, so a change to their level
 //! or text is not observed.
 //!
 //! # Events
@@ -176,6 +189,7 @@
 //! larger"), except the event ids and `SetPreemptionModes`, and pinned by the test named, in
 //! `gpu/tests.rs` unless another file is given. The spec's verification item 1 lists the event
 //! ids; it does not list the others yet. The open question with each settles it.
+//! `ZCullBind` has none: Eden's, NX2's and PR's handlers and structs are the same.
 //!
 //! - **The class `AllocObjCtx` gives back.** NX2 gives back the Maxwell class it mapped onto
 //!   (`params.class_num = mapped`); PR gives back the class as sent. NX2's is used, the one a
@@ -249,9 +263,9 @@
 //!
 //! The channels ([`NvhostGpu`]) are plain data saved with the nvsrv state: per fd the syncpoint,
 //! the GPU channel and the space it was made in, the classes, the events and the settings (the
-//! client data, the error notifier, the preemption modes), checked on restore ([`GpuStateError`]:
-//! the preemption modes against what `SetPreemptionModes` can set; any client data and any
-//! error notifier can be set, so neither is checked; and against the open files and the
+//! client data, the error notifier, the preemption modes, the zcull bind), checked on restore ([`GpuStateError`]:
+//! the preemption modes against what `SetPreemptionModes` can set; any client data, any error
+//! notifier and any zcull bind can be set, so none of them is checked; and against the open files and the
 //! bindings by [`super::NvsrvStateError`]). The waiting submissions are saved with gsv's shared
 //! state by their own snapshot ([`submits`]), as ids (spec: "outstanding tickets and deferred
 //! replies, as ids").
@@ -264,7 +278,7 @@
 //!
 //! # Not built
 //!
-//! The rest of Eden's nvhost-gpu: `SetNVMAPfd` (0x1), `ZCullBind` (0xB), `SetChannelPriority`
+//! The rest of Eden's nvhost-gpu: `SetNVMAPfd` (0x1), `SetChannelPriority`
 //! (0xD), `AllocGPFIFOEx` (0x18), `ChannelSetTimeslice` (0x1D), `GetWaitbase` (group 0, 0x3),
 //! 0x1F with any number but [`SET_PREEMPTION_MODES`], 0x20 (row 26 names 0x1F and 0x20), and
 //! 0x1B on `Ioctl`. They go to the unknown-ioctl policy until a title needs one. What binding a
@@ -315,6 +329,9 @@ pub mod command {
     /// PR's `SetPreemptionModes` (`case 0x1f:`, answered only for [`super::SET_PREEMPTION_MODES`]
     /// on the native ABI).
     pub const SET_PREEMPTION_MODES: u32 = 0x1F;
+    /// `ZCullBind` (`case 0xb:`, through `WrapFixed`; the title of issue #306 sends
+    /// `0xc010480b`).
+    pub const ZCULL_BIND: u32 = 0xB;
 }
 
 /// nvhost-gpu's second group, `'G'`, which holds the client data pair (`nvhost_gpu::Ioctl1`:
@@ -415,6 +432,14 @@ pub mod layout {
     pub const CLIENT_DATA_BYTES: usize = 8;
     /// `data`, a `u64`.
     pub const CLIENT_DATA: usize = 0;
+
+    /// `IoctlZCullBind`: 16 bytes (`static_assert(sizeof(IoctlZCullBind) == 16)`).
+    pub const ZCULL_BIND_BYTES: usize = 16;
+    /// `gpu_va`, a `u64`.
+    pub const ZCULL_GPU_VA: usize = 0;
+    /// `mode` ("0=global, 1=no_ctxsw, 2=separate_buffer, 3=part_of_regular_buf"); a padding
+    /// word follows.
+    pub const ZCULL_MODE: usize = 8;
 }
 
 use layout::{
@@ -422,6 +447,7 @@ use layout::{
     ERROR_NOTIFIER_BYTES, NOTIFIER_MEM, NOTIFIER_OFFSET, NOTIFIER_SIZE, OBJ_CLASS, OBJ_CTX_BYTES,
     OBJ_FLAGS, PREEMPTION_BYTES, PREEMPTION_COMPUTE, PREEMPTION_GRAPHICS, SUBMIT_BYTES,
     SUBMIT_FENCE_ID, SUBMIT_FENCE_VALUE, SUBMIT_FLAGS, SUBMIT_NUM_ENTRIES, TIMEOUT, TIMEOUT_BYTES,
+    ZCULL_BIND_BYTES, ZCULL_GPU_VA, ZCULL_MODE,
 };
 
 /// `SubmitGPFIFO` flag bit 0: wait on the given fence first (`BitField<0, 1> fence_wait`).
@@ -680,6 +706,16 @@ pub struct ErrorNotifier {
     pub mem: u32,
 }
 
+/// What `ZCullBind` was given (`IoctlZCullBind`): kept, read by nothing yet (module docs, "The
+/// settings").
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ZcullBind {
+    /// `gpu_va`: where the channel's zcull context buffer is.
+    pub gpu_va: u64,
+    /// `mode`, as sent: no reference checks it.
+    pub mode: u32,
+}
+
 /// A channel's preemption modes (PR's `graphics_preemption_mode`, `compute_preemption_mode`):
 /// kept, read by nothing yet. Each starts at [`preemption::DEFAULT`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -717,6 +753,9 @@ pub struct Channel {
     pub error_notifier: Option<ErrorNotifier>,
     /// The modes `SetPreemptionModes` set.
     pub preemption: Preemption,
+    /// What `ZCullBind` was given last, if it was called (the references' `zcull_params`, all
+    /// zero until then; nothing reads it, so the two cannot be told apart).
+    pub zcull: Option<ZcullBind>,
 }
 
 impl Channel {
@@ -1090,6 +1129,7 @@ impl NvhostGpu {
             {
                 Some(self.set_preemption_modes(fd, call))
             }
+            (IoctlVariant::Ioctl, command::ZCULL_BIND) => Some(self.zcull_bind(fd, call)),
             _ => None,
         }
     }
@@ -1144,6 +1184,24 @@ impl NvhostGpu {
             );
         }
         IoctlAnswer::with(result, arg.into_output())
+    }
+
+    /// `ZCullBind` (module docs, "The settings"): kept, `Success`, the struct back (PR:
+    /// `zcull_params = params; .. return NvResult::Success;`).
+    fn zcull_bind(&mut self, fd: u32, call: &IoctlCall<'_>) -> IoctlAnswer {
+        let arg = Fixed::<ZCULL_BIND_BYTES>::from_input(call.input);
+        let zcull = ZcullBind {
+            gpu_va: arg.u64_at::<ZCULL_GPU_VA>(),
+            mode: arg.u32_at::<ZCULL_MODE>(),
+        };
+        tracing::debug!(
+            fd,
+            gpu_va = zcull.gpu_va,
+            mode = zcull.mode,
+            "nvsrv: a channel's zcull bind"
+        );
+        self.channels.entry(fd).or_default().zcull = Some(zcull);
+        IoctlAnswer::with(NvResult::Success, arg.into_output())
     }
 
     /// `SetClientData` (module docs, "The settings"): kept, `Success`, the struct back.
