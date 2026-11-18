@@ -62,7 +62,9 @@
 //!    a thread's row names this object back ([`ObjectFault::Thread`]); a process's row names
 //!    this object back ([`ObjectFault::Process`]); a session is one the IPC table holds
 //!    ([`ObjectFault::Session`]); an event's readable end is a live readable end or names
-//!    nothing live ([`ObjectFault::Readable`]), and no earlier event's ([`ObjectFault::SharedReadable`]);
+//!    nothing live ([`ObjectFault::Readable`]), is an id the object table has issued, live or
+//!    freed since, not a slot past its end or a generation its slot has not reached
+//!    ([`ObjectFault::ReadableNotIssued`]), and no earlier event's ([`ObjectFault::SharedReadable`]);
 //!    a shared memory has pages ([`starquake_memory::BackingRange`]: whole pages, not empty, not
 //!    wrapping) and a shared memory permission ([`ObjectFault::SharedMemory`]), and its pages
 //!    share none with an earlier one's ([`ObjectFault::SharedOverlap`]); a transfer memory's
@@ -106,7 +108,8 @@
 //!   ([`crate::ipc::Ipc::forget`], [`crate::ipc::Ipc::discard_session`]).
 //! - **Events.** [`Scheduler::create_event`] makes each writable end with a readable end of its
 //!   own. The writable end holds no reference to it, so the readable end may be gone; a slot is
-//!   reused only under a new generation, so the id then names nothing live.
+//!   reused only under a new generation, so the id then names nothing live, and it is an id the
+//!   table issued, so no later object gets it.
 //! - **Shared memory.** [`SharedMemory::new`] refuses another permission; its pages come from
 //!   the address space's [`crate::memory::Mapper::allocate_shared`], which gives each shared
 //!   memory pages of its own, and pages are never given back while (or after) a shared memory
@@ -144,6 +147,12 @@
 //!   them.
 //! - **A transfer memory's range**: its shape and where it lies are check 6's
 //!   ([`crate::memory::LendFault::Shape`]).
+//! - **That an event's live readable end was made with it.** Check 3 refuses a readable end
+//!   that an earlier event also names, comparing only the events in the snapshot. An event that
+//!   names a live readable end made with another event whose writable end is gone is accepted:
+//!   live code cannot leave this ([`Scheduler::create_event`] makes each writable end with its
+//!   own readable end), but a forged snapshot can, and the guest's signals through that event
+//!   then wake the waiters of the other event's readable end.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
@@ -256,6 +265,11 @@ pub enum ObjectFault {
     /// It is an event whose readable end names a live object that is no readable end.
     #[error("is an event whose readable end is another kind of object")]
     Readable,
+    /// It is an event whose readable end names an id the object table has not issued: a slot
+    /// past the table's end, or a slot under a generation it has not reached. The next object
+    /// made there would get that id, and the event would signal it.
+    #[error("is an event whose readable end names an id the object table has not made yet")]
+    ReadableNotIssued,
     /// It is an event whose readable end an earlier event names too.
     #[error("is an event whose readable end an earlier event signals too")]
     SharedReadable,
@@ -624,6 +638,9 @@ impl Body {
                     if names.is_ok_and(|named| !matches!(named, SavedObject::ReadableEvent { .. }))
                     {
                         return Err(fault(ObjectFault::Readable));
+                    }
+                    if !self.objects.issued(readable) {
+                        return Err(fault(ObjectFault::ReadableNotIssued));
                     }
                     if !readables.insert(readable) {
                         return Err(fault(ObjectFault::SharedReadable));

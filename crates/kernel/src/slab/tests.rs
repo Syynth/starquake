@@ -654,3 +654,36 @@ fn mapping_stops_at_the_first_error() {
     });
     assert_eq!((result, calls), (Err(2), 2));
 }
+
+#[test]
+fn an_id_is_issued_once_an_insert_has_returned_it() {
+    let mut slab = TestSlab::new();
+    let at = ObjectId::from_parts;
+    // Nothing yet: not even the first id a fresh slot gets, and never generation zero.
+    assert!(!slab.issued(at(0, FIRST_GENERATION)));
+    let first = slab.insert(1).unwrap();
+    assert_eq!(first, at(0, FIRST_GENERATION));
+    // Live: its own generation is issued, the next one and the slot past the end are not.
+    assert!(slab.issued(first));
+    assert!(!slab.issued(at(0, FIRST_GENERATION + 1)));
+    assert!(!slab.issued(at(0, 0)));
+    assert!(!slab.issued(at(1, FIRST_GENERATION)));
+    // Freed: still issued, while the generation the slot gives next is not.
+    slab.remove(first).unwrap();
+    assert!(slab.issued(first));
+    assert!(!slab.issued(at(0, FIRST_GENERATION + 1)));
+    assert!(!slab.issued(at(0, FIRST_GENERATION + 2)));
+    assert!(!slab.issued(at(0, 0)));
+    // Reused: both generations are issued, the one after them is not.
+    let second = slab.insert(2).unwrap();
+    assert_eq!(second, at(0, FIRST_GENERATION + 1));
+    assert!(slab.issued(first) && slab.issued(second));
+    assert!(!slab.issued(at(0, FIRST_GENERATION + 2)));
+    // A retired slot has issued every generation but zero.
+    slab.slots[0] = Slot::Retired;
+    slab.live -= 1;
+    assert!(slab.issued(at(0, u32::MAX)));
+    assert!(slab.issued(first));
+    assert!(!slab.issued(at(0, 0)));
+    assert!(!slab.issued(at(1, FIRST_GENERATION)));
+}

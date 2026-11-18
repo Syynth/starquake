@@ -352,6 +352,27 @@ impl<Id: SlabId, T> Slab<Id, T> {
         self.get(id).is_ok()
     }
 
+    /// Whether an [`insert`](Self::insert) has returned `id`: its row is live now or was freed
+    /// since. An id not issued yet may still be returned by a later insert (its slot is past
+    /// the end, or vacant or occupied under a generation below `id`'s), so a table that keeps
+    /// the id of a row that may be gone must take only an issued one. Generation zero is never
+    /// issued; a retired slot has issued every other generation.
+    #[must_use]
+    pub(crate) fn issued(&self, id: Id) -> bool {
+        let generation = id.generation();
+        if generation < FIRST_GENERATION {
+            return false;
+        }
+        match self.slots.get(id.index() as usize) {
+            None => false,
+            Some(Slot::Occupied {
+                generation: now, ..
+            }) => generation <= *now,
+            Some(Slot::Vacant { generation: next }) => generation < *next,
+            Some(Slot::Retired) => true,
+        }
+    }
+
     /// Frees the row `id` names and returns it. Every id minted for that row is stale afterwards.
     pub fn remove(&mut self, id: Id) -> Result<T, SlabError> {
         let Some(slot) = self.slots.get_mut(id.index() as usize) else {

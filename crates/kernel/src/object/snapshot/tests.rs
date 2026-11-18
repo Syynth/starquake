@@ -812,12 +812,60 @@ fn an_events_readable_end_is_a_readable_end_or_gone_and_its_own() {
         case.error(),
         object_error(kernel.lone, ObjectFault::SharedReadable)
     );
-    // Naming a slot under another generation names nothing live: accepted.
+    // The live readable end's slot under the next generation names an id the table has not
+    // issued: the next readable end made there would be signalled through this event.
     let mut case = Case::new(&kernel);
     case.row(writable).object = SavedObject::Event {
         readable: ObjectId::from_parts(readable.index(), readable.generation() + 1),
     };
+    assert_eq!(
+        case.error(),
+        object_error(writable, ObjectFault::ReadableNotIssued)
+    );
+}
+
+#[test]
+fn an_events_gone_readable_end_is_an_id_the_table_has_issued() {
+    let mut kernel = kernel();
+    // An event whose readable end is gone, made last, so its readable end's slot is the first
+    // a new object takes and the slot after its writable end's is past the table's end.
+    let (event, gone) = kernel.tables.scheduler.create_event().unwrap();
+    add_handle(&mut kernel.tables, event);
+    kernel.tables.scheduler.close_object(event).unwrap();
+    kernel.tables.scheduler.close_object(gone).unwrap();
+    // The ids the restored table hands out next, from the saved table itself: the gone readable
+    // end's slot under its next generation, then a fresh slot past the end.
+    let mut next = Case::new(&kernel).body.objects;
+    let row = *next.get(event).unwrap();
+    let vacant = next.insert(row).unwrap();
+    let fresh = next.insert(row).unwrap();
+    assert_eq!(
+        (vacant.index(), vacant.generation()),
+        (gone.index(), gone.generation() + 1)
+    );
+    let saved = Case::new(&kernel).body.objects;
+    assert!(saved.iter().all(|(id, _)| id.index() < fresh.index()));
+    assert_eq!(fresh.index(), event.index().max(gone.index()) + 1);
+    // Accepted: the gone readable end itself, one generation below the vacant slot's.
+    let mut case = Case::new(&kernel);
+    case.row(event).object = SavedObject::Event { readable: gone };
     assert!(case.restore().is_ok());
+    // Refused: the vacant slot's own generation and the one after it, and the fresh slot past
+    // the end under its first generation and the one after it.
+    for unissued in [
+        vacant,
+        ObjectId::from_parts(vacant.index(), vacant.generation() + 1),
+        fresh,
+        ObjectId::from_parts(fresh.index(), fresh.generation() + 1),
+    ] {
+        let mut case = Case::new(&kernel);
+        case.row(event).object = SavedObject::Event { readable: unissued };
+        assert_eq!(
+            case.error(),
+            object_error(event, ObjectFault::ReadableNotIssued),
+            "{unissued:?}"
+        );
+    }
 }
 
 #[test]
@@ -1403,6 +1451,11 @@ fn the_errors_read_as_plain_words() {
     assert_eq!(
         object_error(object, ObjectFault::NoReferences).to_string(),
         "object 4 (generation 2) has no references"
+    );
+    assert_eq!(
+        object_error(object, ObjectFault::ReadableNotIssued).to_string(),
+        "object 4 (generation 2) is an event whose readable end names an id the object table \
+         has not made yet"
     );
     assert_eq!(
         ObjectSnapshotError::PendingUnlocks { count: 1 }.to_string(),
