@@ -331,7 +331,7 @@ fn a_cmif_request_to_the_root_goes_to_the_policy() {
             UnknownPolicy::Strict => vec![],
             UnknownPolicy::AutoStub => vec![StubbedCommand {
                 interface: starquake_trace::InterfaceName::lossy(GsvRoot.name()),
-                protocol: Protocol::Cmif,
+                protocol: starquake_trace::IpcProtocol::Cmif,
                 id: INITIALIZE,
             }],
         };

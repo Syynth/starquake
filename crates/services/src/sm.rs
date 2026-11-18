@@ -436,7 +436,9 @@ impl Sm {
 /// Its [`Session::trace_name`] is the name that was asked for, so the trace, the server's
 /// [`Server::stubbed`] and its [`Server::requests`] name the service the title wanted, not
 /// `Stub` (test: `a_stub_is_traced_and_recorded_under_the_name_asked_for`). Its type name,
-/// [`Session::name`], is still `Stub`: a snapshot finds the type by it.
+/// [`Session::name`], is still `Stub`: a snapshot finds the type by it. Asked for `Sm`, a stub
+/// is named like `sm:`'s own interface and its requests cannot be told from that interface's
+/// (test: `a_stub_asked_for_by_sms_own_interface_name_is_counted_with_it`).
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Stub {
     /// The name that was asked for: kept so that a snapshot says what each stub stands in for.

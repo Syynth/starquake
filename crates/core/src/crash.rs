@@ -800,6 +800,8 @@ impl CrashReport {
 
 #[cfg(test)]
 mod tests {
+    use starquake_trace::IpcProtocol;
+
     use super::*;
 
     /// Registers that all differ, so a swapped pair shows.
@@ -1066,7 +1068,7 @@ mod tests {
                 stubbed: vec![StubbedCommand {
                     service: "sm:".into(),
                     interface: "aoc:u".into(),
-                    protocol: "cmif",
+                    protocol: IpcProtocol::Cmif,
                     command: 0x34,
                 }],
                 ..ServicesReport::default()
@@ -1076,7 +1078,7 @@ mod tests {
                 thread: 0x32,
                 service: "sm:".into(),
                 interface: "lm".into(),
-                protocol: "tipc",
+                protocol: IpcProtocol::Tipc,
                 command: 0x33,
             }],
         );
@@ -1248,14 +1250,17 @@ mod tests {
         };
         let services = ServicesReport {
             unknown_services: vec!["aoc:u".into(), "lm".into()],
-            stubbed: vec![command("aoc:u", "tipc", 9), command("lm", "cmif", 5)],
+            stubbed: vec![
+                command("aoc:u", IpcProtocol::Tipc, 9),
+                command("lm", IpcProtocol::Cmif, 5),
+            ],
             ..ServicesReport::default()
         };
         let two = report(Exception::UndefinedInstruction).with_services(
             &services,
             vec![
-                request(40, "lm", "cmif", 5),
-                request(41, "aoc:u", "tipc", 9),
+                request(40, "lm", IpcProtocol::Cmif, 5),
+                request(41, "aoc:u", IpcProtocol::Tipc, 9),
             ],
         );
         assert!(

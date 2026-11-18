@@ -64,8 +64,9 @@ pub struct StubbedCommand {
     /// `sm:` handed out for a name nothing provides, that name. A control command's is
     /// [`CONTROL_INTERFACE`](super::control::CONTROL_INTERFACE).
     pub interface: InterfaceName,
-    /// The protocol it came in.
-    pub protocol: Protocol,
+    /// The protocol it came in: [`IpcProtocol::Control`] for a control command, as its trace
+    /// event and [`Server::requests`] have it.
+    pub protocol: IpcProtocol,
     /// The command id.
     pub id: u32,
 }
@@ -994,9 +995,12 @@ impl Server {
                 );
                 Err(fault.into())
             }
-            (None, _) => Ok(Answered::Now(
-                self.unknown(label, protocol, command_id, frame),
-            )),
+            (None, _) => Ok(Answered::Now(self.unknown(
+                label,
+                trace::traced(protocol),
+                command_id,
+                frame,
+            ))),
         }
     }
 
@@ -1004,7 +1008,7 @@ impl Server {
     pub(super) fn unknown(
         &mut self,
         interface: InterfaceName,
-        protocol: Protocol,
+        protocol: IpcProtocol,
         id: u32,
         frame: Frame,
     ) -> Answer {

@@ -5,15 +5,17 @@
 use starquake_kernel::dispatch::IpcContext;
 use starquake_kernel::id::ObjectId;
 use starquake_kernel::ipc::{Handled, HandlerError, SessionHandler};
+use starquake_services::apm::{self, Apm};
 use starquake_services::framework::control::{
     CONTROL_COMMANDS, CONTROL_INTERFACE, QUERY_POINTER_BUFFER_SIZE,
 };
-use starquake_services::framework::{CountedCommand, Session, UnknownPolicy};
+use starquake_services::framework::{CountedCommand, Protocol, Session, UnknownPolicy};
 use starquake_services::sm::{self, Sm};
 use starquake_trace::{GuestTicks, ResultCode, SessionId, ThreadId};
 
 use super::*;
-use crate::hle::tests::dispatcher;
+use crate::hle;
+use crate::hle::tests::{Rig as HleRig, dispatcher, libnx};
 
 /// A count of `count` requests for `id` on `interface` in `protocol`, named `name`.
 fn count(
@@ -226,7 +228,7 @@ fn a_stubbed_request_is_named_after_its_server() {
                 thread: 0x43,
                 service: sm::PORT_NAME.to_owned(),
                 interface: "lm".to_owned(),
-                protocol: "tipc",
+                protocol: IpcProtocol::Tipc,
                 command: 5,
             },
             StubbedRequestReport {
@@ -234,9 +236,44 @@ fn a_stubbed_request_is_named_after_its_server() {
                 thread: 0x44,
                 service: "0x77".to_owned(),
                 interface: "IFoo".to_owned(),
-                protocol: "tipc",
+                protocol: IpcProtocol::Tipc,
                 command: 2,
             },
+        ]
+    );
+}
+
+/// The stubbed commands are sorted by service, not listed in the order the kernel holds the
+/// servers in: `sm:` is added before `apm` and has the lower number, but `apm` sorts first.
+#[test]
+fn the_stubbed_commands_are_in_service_order_whatever_the_kernels_order() {
+    let rig = HleRig::new();
+    // The kernel's order and the names' order differ.
+    assert!(hle::SM < hle::APM);
+    assert!(apm::NAME < sm::PORT_NAME);
+    // A command `apm`'s root does not have, and one sent to a session `sm:` hands out for a
+    // name nothing provides: each stubbed by its own server.
+    let missing = 99;
+    assert_eq!(Apm.commands().name(Protocol::Cmif, missing), None);
+    let performance = rig.service(apm::NAME);
+    let unknown = "lm";
+    let stub = rig.service(unknown);
+    for session in [stub, performance] {
+        let (code, _) = rig.send(session, &libnx(missing));
+        assert_eq!(code, starquake_kernel::result::ResultCode::SUCCESS);
+    }
+    let report = ServicesReport::read(&rig.dispatcher);
+    let stubbed = |service: &str, interface: &str| StubbedCommand {
+        service: service.to_owned(),
+        interface: interface.to_owned(),
+        protocol: IpcProtocol::Cmif,
+        command: missing,
+    };
+    assert_eq!(
+        report.stubbed,
+        [
+            stubbed(apm::NAME, Apm::interface()),
+            stubbed(sm::PORT_NAME, unknown),
         ]
     );
 }

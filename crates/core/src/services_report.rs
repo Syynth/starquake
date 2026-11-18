@@ -17,14 +17,17 @@
 //!
 //! Every name here is the services' own: a server's [`Server::name`], an interface's
 //! [`InterfaceName`] as its trace event names it (for a session `sm:` handed out for a name
-//! nothing provides, that name), a command's name in its table.
+//! nothing provides, that name), a command's name in its table. A stub asked for by the name of
+//! an interface its server serves (`Sm` on `sm:`) is counted and listed with that interface's
+//! own requests, and nothing here tells them apart: the services' trace docs list it as a
+//! divergence (`starquake_services::framework::trace`).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Mutex;
 
 use serde::Serialize;
 use starquake_kernel::dispatch::Dispatcher;
-use starquake_services::framework::{Protocol, RequestCount, Server};
+use starquake_services::framework::{RequestCount, Server};
 use starquake_services::sm::Registry;
 use starquake_trace::{Event, EventKind, InterfaceName, IpcOutcome, IpcProtocol, ServiceId, Sink};
 
@@ -46,8 +49,8 @@ fn key_suffix(protocol: IpcProtocol) -> &'static str {
 
 /// The key a count of requests has in `summary.json`'s `service_commands`:
 /// `<service>:<interface>::<command>`, with the command's name when its table has one and its
-/// id in decimal otherwise, and ` (tipc)` after a TIPC command (`set:sys:SetSys::GetFirmwareVersion`,
-/// `sm::lm::5`, `sm::Sm::GetService (tipc)`).
+/// id in decimal otherwise, and ` (tipc)` after a TIPC command. A table's names are its methods'
+/// names (`set:sys:SetSys::get_firmware_version`, `sm::lm::5`, `sm::Sm::get_service (tipc)`).
 #[must_use]
 pub fn command_key(service: &str, count: &RequestCount) -> String {
     let command = count
@@ -60,12 +63,17 @@ pub fn command_key(service: &str, count: &RequestCount) -> String {
     )
 }
 
-/// The protocol of a stubbed command, as `summary.json` writes it.
-const fn protocol_word(protocol: Protocol) -> &'static str {
-    match protocol {
-        Protocol::Cmif => "cmif",
-        Protocol::Tipc => "tipc",
-    }
+/// A protocol as `summary.json` and `crash.json` write it: its [`IpcProtocol::word`], `cmif`,
+/// `tipc` or `control`.
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's `serialize_with` hands the field over by reference"
+)]
+fn serialize_protocol<S: serde::Serializer>(
+    protocol: &IpcProtocol,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(protocol.word())
 }
 
 /// One command a server answered by auto-stub, in `summary.json`'s `stubbed_commands`.
@@ -76,8 +84,10 @@ pub struct StubbedCommand {
     /// The interface the command was sent to: for a session `sm:` handed out for a name nothing
     /// provides, that name; for a control command, `IpcController`.
     pub interface: String,
-    /// `cmif` or `tipc` (a control command is `cmif`).
-    pub protocol: &'static str,
+    /// The protocol it came in, written as its [`IpcProtocol::word`]: `control` for a control
+    /// command, as [`StubbedRequestReport::protocol`] writes the same request.
+    #[serde(serialize_with = "serialize_protocol")]
+    pub protocol: IpcProtocol,
     /// The command id.
     pub command: u32,
 }
@@ -88,7 +98,10 @@ impl StubbedCommand {
     pub fn text(&self) -> String {
         format!(
             "{} (on {}) {} command {}",
-            self.interface, self.service, self.protocol, self.command
+            self.interface,
+            self.service,
+            self.protocol.word(),
+            self.command
         )
     }
 }
@@ -102,7 +115,7 @@ pub struct ServicesReport {
     /// distinct commands ([`Server::uncounted_requests`]), summed over the servers.
     pub uncounted: u64,
     /// The commands the servers answered by auto-stub, in order of service, interface, protocol
-    /// and id. Each server keeps at most
+    /// (CMIF, TIPC, control) and id, whatever order the kernel holds the servers in. Each server keeps at most
     /// [`MAX_STUBBED_COMMANDS`](starquake_services::framework::MAX_STUBBED_COMMANDS).
     pub stubbed: Vec<StubbedCommand>,
     /// The service names a title asked `sm:` for that nothing provides, in order: at most
@@ -151,7 +164,7 @@ impl ServicesReport {
             .extend(server.stubbed().map(|stubbed| StubbedCommand {
                 service: name.to_owned(),
                 interface: stubbed.interface.as_str().to_owned(),
-                protocol: protocol_word(stubbed.protocol),
+                protocol: stubbed.protocol,
                 command: stubbed.id,
             }));
         if let Some(registry) = server.family::<Registry>() {
@@ -183,7 +196,7 @@ impl ServicesReport {
                 thread: request.thread,
                 service: self.service_name(request.service),
                 interface: request.interface.as_str().to_owned(),
-                protocol: request.protocol.word(),
+                protocol: request.protocol,
                 command: request.command,
             })
             .collect()
@@ -203,8 +216,10 @@ pub struct StubbedRequestReport {
     /// The interface it went to: for a session `sm:` handed out for a name nothing provides,
     /// that name.
     pub interface: String,
-    /// `cmif`, `tipc` or `control` ([`IpcProtocol::word`]).
-    pub protocol: &'static str,
+    /// The protocol it came in, written as its [`IpcProtocol::word`]: `cmif`, `tipc` or
+    /// `control`.
+    #[serde(serialize_with = "serialize_protocol")]
+    pub protocol: IpcProtocol,
     /// The command id.
     pub command: u32,
 }
@@ -216,7 +231,12 @@ impl StubbedRequestReport {
     pub fn text(&self) -> String {
         format!(
             "#{} thread {}: {} (on {}) {} command {}",
-            self.seq, self.thread, self.interface, self.service, self.protocol, self.command
+            self.seq,
+            self.thread,
+            self.interface,
+            self.service,
+            self.protocol.word(),
+            self.command
         )
     }
 }

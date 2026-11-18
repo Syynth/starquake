@@ -31,16 +31,28 @@
 //! on a domain), it is the session's own interface: for a domain, object
 //! `Domain::ROOT_OBJECT_ID`, the interface the session had before it became a domain. When that
 //! is gone too, it is [`InterfaceName::lossy`]'s name for nothing, one
-//! [`REPLACEMENT`](starquake_trace::REPLACEMENT). A deferred request keeps the name it had
+//! [`REPLACEMENT`](starquake_trace::REPLACEMENT). On these fallbacks the request is counted
+//! with no command name ([`RequestCount::name`](super::RequestCount::name) is `None`, so a
+//! report's key shows the command id): the interface named is not the one the request went to,
+//! and the name its table gives that id would read as if the title had called that command (test:
+//! `a_domain_request_names_the_object_it_went_to`). A deferred request keeps the name it had
 //! when it was deferred, and its protocol follows from how its reply is framed (control
 //! requests are never deferred).
-
+//!
 //! Exactly which messages produce an event: every message [`Server::handle`](super::Server::handle)
 //! answers with [`Handled::Replied`](super::Handled::Replied), when it answers; and every
 //! deferred request, when [`Server::deliver`](super::Server::deliver) writes its reply. A
 //! deferred request therefore has no event until it is answered, and the order of those events
 //! is the order deferred replies completed in. A close message and a message the server fails
 //! on ([`ServerError`](super::ServerError)) get no reply and no event.
+//!
+//! A divergence the name cannot avoid: a session [`sm`](crate::sm) hands out for a name nothing
+//! provides ([`Stub`](crate::sm::Stub)) is named by the name the title asked for, which is the
+//! guest's to choose. Asked for `Sm`, the name of `sm:`'s own interface, the stub's requests are
+//! traced, counted ([`Server::requests`](super::Server::requests)) and recorded as stubbed
+//! ([`Server::stubbed`](super::Server::stubbed)) under the same interface, protocol and id as
+//! the same command sent to `sm:` itself, and nothing tells the two apart (test:
+//! `a_stub_asked_for_by_sms_own_interface_name_is_counted_with_it`).
 //!
 //! The sizes are payload sizes, as the service spec says ("payload sizes"); the event type's own
 //! docs call them message sizes. The event has no field for the command's name: names are in
@@ -105,19 +117,25 @@ impl Asked {
                 CONTROL_COMMANDS.name(Protocol::Cmif, command),
             ),
             IpcProtocol::Cmif | IpcProtocol::Tipc => {
-                let addressed =
-                    addressee(message, targets, target).or_else(|| own_interface(targets, target));
                 let table = if protocol == IpcProtocol::Tipc {
                     Protocol::Tipc
                 } else {
                     Protocol::Cmif
                 };
-                match addressed {
+                match addressee(message, targets, target) {
                     Some(session) => (
                         InterfaceName::lossy(session.trace_name()),
                         session.commands().name(table, command),
                     ),
-                    None => (InterfaceName::lossy(""), None),
+                    // A fallback: the session's own interface is not what the request went to,
+                    // so its table does not name the request.
+                    None => (
+                        own_interface(targets, target).map_or_else(
+                            || InterfaceName::lossy(""),
+                            |session| InterfaceName::lossy(session.trace_name()),
+                        ),
+                        None,
+                    ),
                 }
             }
         };
@@ -161,6 +179,14 @@ fn own_interface(targets: &Targets, target: TargetId) -> Option<&dyn Session> {
         Err(_) => target,
     };
     targets.interface(own)
+}
+
+/// A CMIF or TIPC command's protocol as an event and a server's records hold it.
+pub(super) const fn traced(protocol: Protocol) -> IpcProtocol {
+    match protocol {
+        Protocol::Cmif => IpcProtocol::Cmif,
+        Protocol::Tipc => IpcProtocol::Tipc,
+    }
 }
 
 /// The protocol of a deferred request, from how its reply is framed: control requests are

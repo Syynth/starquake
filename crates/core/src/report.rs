@@ -475,7 +475,7 @@ mod tests {
                 stubbed: vec![StubbedCommand {
                     service: "sm:".to_owned(),
                     interface: "lm".to_owned(),
-                    protocol: "tipc",
+                    protocol: starquake_trace::IpcProtocol::Tipc,
                     command: 0x15,
                 }],
                 unknown_services: vec!["aoc:u".to_owned(), "lm".to_owned()],

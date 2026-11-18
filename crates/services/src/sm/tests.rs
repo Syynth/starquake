@@ -412,8 +412,8 @@ fn an_unknown_name_gets_a_stub_under_auto_stub() {
     assert_eq!(
         stubbed,
         [
-            stub("fsp-srv", Protocol::Tipc, 9),
-            stub("hid", Protocol::Cmif, 301)
+            stub("fsp-srv", IpcProtocol::Tipc, 9),
+            stub("hid", IpcProtocol::Cmif, 301)
         ]
     );
     // The trace marks the two requests as stubbed.
@@ -879,7 +879,7 @@ fn a_stub_is_traced_and_recorded_under_the_name_asked_for() {
         manager.stubbed().copied().collect::<Vec<_>>(),
         [StubbedCommand {
             interface: asked,
-            protocol: Protocol::Cmif,
+            protocol: IpcProtocol::Cmif,
             id: command,
         }]
     );
@@ -899,12 +899,12 @@ fn a_stub_is_traced_and_recorded_under_the_name_asked_for() {
         [
             StubbedCommand {
                 interface: other_asked,
-                protocol: Protocol::Cmif,
+                protocol: IpcProtocol::Cmif,
                 id: command,
             },
             StubbedCommand {
                 interface: asked,
-                protocol: Protocol::Cmif,
+                protocol: IpcProtocol::Cmif,
                 id: command,
             },
         ]
@@ -933,4 +933,47 @@ fn a_stub_is_traced_and_recorded_under_the_name_asked_for() {
         last_request(&host),
         (asked, IpcProtocol::Tipc, 9, IpcOutcome::Stubbed)
     );
+}
+
+/// The divergence the framework's trace docs list: a stub asked for by the name of `sm:`'s own
+/// interface, `Sm`, is named like that interface, so the same command sent to the stub and to
+/// `sm:` itself lands on one count and one stubbed record, and nothing tells them apart.
+#[test]
+fn a_stub_asked_for_by_sms_own_interface_name_is_counted_with_it() {
+    let (mut host, sm) = host(UnknownPolicy::AutoStub);
+    initialize(&mut host, sm);
+    let own = name(Sm::interface());
+    let stub = moved_handle(&send(&mut host, sm, &cmif_get_service(own.to_field())));
+    // A command `sm:`'s own table does not have, so both requests are stubbed.
+    let command = 5;
+    assert_eq!(Sm::default().commands().name(Protocol::Cmif, command), None);
+    for session in [stub, sm] {
+        send(
+            &mut host,
+            session,
+            &RequestBuilder::cmif(CommandType::Request, command),
+        );
+        let asked = InterfaceName::new(Sm::interface()).unwrap();
+        assert_eq!(
+            last_request(&host),
+            (asked, IpcProtocol::Cmif, command, IpcOutcome::Stubbed)
+        );
+    }
+    let asked = InterfaceName::new(Sm::interface()).unwrap();
+    let manager = host.server(SM).unwrap();
+    // One record, not two: the stub and the real interface are not told apart.
+    assert_eq!(
+        manager.stubbed().copied().collect::<Vec<_>>(),
+        [StubbedCommand {
+            interface: asked,
+            protocol: IpcProtocol::Cmif,
+            id: command,
+        }]
+    );
+    let counts: Vec<_> = manager
+        .requests()
+        .filter(|count| count.command.id == command)
+        .map(|count| (count.command.interface, count.command.protocol, count.count))
+        .collect();
+    assert_eq!(counts, [(asked, IpcProtocol::Cmif, 2)]);
 }

@@ -1,7 +1,7 @@
 //! What a server counts of the requests it is sent ([`Server::requests`](super::super::Server::requests)),
 //! and what the trace event of a request names: the interface it went to and its protocol.
 
-use starquake_ipc::RequestBuilder;
+use starquake_ipc::{CommandType, RequestBuilder};
 use starquake_kernel::result::ResultCode;
 use starquake_trace::{EventKind, InterfaceName, IpcOutcome, IpcProtocol};
 
@@ -188,15 +188,53 @@ fn a_domain_request_names_the_object_it_went_to() {
     let child_tag = Child { tag: 0 }.commands().name(Protocol::Cmif, child::TAG);
     let counts: Vec<_> = rig.server.requests().collect();
     assert!(counts.contains(&counted(child, IpcProtocol::Cmif, child::TAG, child_tag, 1)));
-    // The refused request is counted under the root, with the name the root's table gives
-    // that id (here the toy's command with the same id), as its event is.
-    assert!(counts.contains(&counted(
-        toy,
-        IpcProtocol::Cmif,
-        child::TAG,
-        toy_name(Protocol::Cmif, child::TAG),
-        1
-    )));
+    // The refused request is counted under the root, as its event is, but with no name: the
+    // root's table names that id (the toy's own command with the same id), and the request did
+    // not go to the root.
+    assert!(toy_name(Protocol::Cmif, child::TAG).is_some());
+    assert!(counts.contains(&counted(toy, IpcProtocol::Cmif, child::TAG, None, 1)));
+}
+
+/// A `ControlWithContext` request (type 7, which nnsdk titles send) is a control request like
+/// type 5: named [`CONTROL_INTERFACE`], counted under the control table's name.
+#[test]
+fn a_control_request_with_context_is_a_control_request() {
+    let mut rig = Rig::strict();
+    rig.send(&RequestBuilder::cmif(
+        CommandType::ControlWithContext,
+        QUERY_POINTER_BUFFER_SIZE,
+    ));
+    let control = InterfaceName::new(CONTROL_INTERFACE).unwrap();
+    assert_eq!(
+        events(&rig),
+        [(
+            control,
+            IpcProtocol::Control,
+            QUERY_POINTER_BUFFER_SIZE,
+            ResultCode::SUCCESS.raw(),
+            IpcOutcome::Done
+        )]
+    );
+    assert_eq!(
+        rig.server.requests().collect::<Vec<_>>(),
+        [counted(
+            control,
+            IpcProtocol::Control,
+            QUERY_POINTER_BUFFER_SIZE,
+            CONTROL_COMMANDS.name(Protocol::Cmif, QUERY_POINTER_BUFFER_SIZE),
+            1
+        )]
+    );
+    // The control table's name, which the toy's own table does not share for that id.
+    assert!(
+        CONTROL_COMMANDS
+            .name(Protocol::Cmif, QUERY_POINTER_BUFFER_SIZE)
+            .is_some()
+    );
+    assert_ne!(
+        CONTROL_COMMANDS.name(Protocol::Cmif, QUERY_POINTER_BUFFER_SIZE),
+        toy_name(Protocol::Cmif, QUERY_POINTER_BUFFER_SIZE)
+    );
 }
 
 #[test]
