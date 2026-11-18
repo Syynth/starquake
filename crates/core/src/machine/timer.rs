@@ -242,7 +242,10 @@ pub(super) fn deliver<V: Vcpu, C: HostClock + Clone>(
 pub(super) fn graphics<V: Vcpu, C: HostClock + Clone>(
     machine: &Machine<'_, V, C>,
 ) -> Result<(), Ending> {
-    if !machine.graphics.wants_turn(machine.session.clock.host_now()) {
+    if !machine
+        .graphics
+        .wants_turn(machine.session.clock.host_now())
+    {
         return Ok(());
     }
     let failed = |error| Ending::Failed(format!("{GRAPHICS_ENV_FAILED}: {error}"));

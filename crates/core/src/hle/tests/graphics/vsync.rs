@@ -33,7 +33,10 @@ fn a_vsync_listener_is_ticked_through_the_run_s_kernel() {
     let (writable, readable) = guest_event(&rig);
     let event = rig.object(writable);
     assert!(graphics.is_idle());
-    assert_eq!(graphics.shared().lock().listen_vsync(event, START), Ok(true));
+    assert_eq!(
+        graphics.shared().lock().listen_vsync(event, START),
+        Ok(true)
+    );
     assert!(!graphics.is_idle());
     assert_eq!(graphics.deadline(), Some(FIRST));
 
@@ -102,12 +105,20 @@ fn the_turn_s_deadline_is_the_earlier_of_the_page_s_and_the_clock_s() {
     // The clock's deadline a nanosecond before the page's.
     let early = HostNanos(page_due.0 - 1 - INTERVAL_NS);
     let listener = ObjectId::from_parts(1, 9);
-    graphics.shared().lock().listen_vsync(listener, early).unwrap();
+    graphics
+        .shared()
+        .lock()
+        .listen_vsync(listener, early)
+        .unwrap();
     assert_eq!(graphics.deadline(), Some(HostNanos(page_due.0 - 1)));
     // A nanosecond after it.
     assert!(graphics.shared().lock().unlisten_vsync(listener));
     let late = HostNanos(page_due.0 + 1 - INTERVAL_NS);
-    graphics.shared().lock().listen_vsync(listener, late).unwrap();
+    graphics
+        .shared()
+        .lock()
+        .listen_vsync(listener, late)
+        .unwrap();
     assert_eq!(graphics.deadline(), Some(page_due));
 }
 

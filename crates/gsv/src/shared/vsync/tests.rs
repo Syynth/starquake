@@ -134,7 +134,10 @@ fn the_first_listener_starts_the_clock_one_interval_out() {
     let shared = fresh();
     assert_eq!(shared.lock().listen_vsync(event(1), START), Ok(true));
     assert_eq!(shared.vsync_deadline(), Some(FIRST));
-    assert_eq!(shared.lock().vsync().listeners().collect::<Vec<_>>(), [event(1)]);
+    assert_eq!(
+        shared.lock().vsync().listeners().collect::<Vec<_>>(),
+        [event(1)]
+    );
     // Starting ticks nothing.
     assert_eq!(shared.lock().vsync().tick(), 0);
 }
@@ -162,7 +165,10 @@ fn a_tick_comes_at_exactly_the_deadline_and_not_before() {
     assert!(shared.lock().vsync().is_due(FIRST));
     assert_eq!(turn(&shared, FIRST.0), tick_of(1, &[event(1)]));
     assert_eq!(shared.lock().vsync().tick(), 1);
-    assert_eq!(shared.vsync_deadline(), Some(HostNanos(FIRST.0 + INTERVAL_NS)));
+    assert_eq!(
+        shared.vsync_deadline(),
+        Some(HostNanos(FIRST.0 + INTERVAL_NS))
+    );
 }
 
 #[test]
@@ -232,7 +238,10 @@ fn a_tick_late_by_less_than_an_interval_keeps_the_grid() {
     let shared = listening(&[event(1)]);
     let late = FIRST.0 + INTERVAL_NS - 1;
     assert_eq!(turn(&shared, late), tick_of(1, &[event(1)]));
-    assert_eq!(shared.vsync_deadline(), Some(HostNanos(FIRST.0 + INTERVAL_NS)));
+    assert_eq!(
+        shared.vsync_deadline(),
+        Some(HostNanos(FIRST.0 + INTERVAL_NS))
+    );
 }
 
 #[test]
@@ -269,7 +278,10 @@ fn the_last_listener_leaving_stops_the_clock_and_the_next_restarts_it() {
     assert!(!shared.lock().unlisten_vsync(event(1)));
     assert!(!shared.lock().unlisten_vsync(ObjectId::from_parts(2, 6)));
     assert_eq!(shared.vsync_deadline(), deadline);
-    assert_eq!(shared.lock().vsync().listeners().collect::<Vec<_>>(), [event(2)]);
+    assert_eq!(
+        shared.lock().vsync().listeners().collect::<Vec<_>>(),
+        [event(2)]
+    );
     // The last leaves: the clock stops, keeping its count.
     assert!(shared.lock().unlisten_vsync(event(2)));
     assert_eq!(shared.vsync_deadline(), None);
@@ -322,10 +334,7 @@ fn listeners_are_refused_past_the_cap() {
         assert_eq!(shared.lock().listen_vsync(event(n), START), Ok(true));
     }
     let before = shared.lock().vsync().clone();
-    let error = shared
-        .lock()
-        .listen_vsync(event(count), START)
-        .unwrap_err();
+    let error = shared.lock().listen_vsync(event(count), START).unwrap_err();
     assert_eq!(error, VsyncError::TooManyListeners);
     assert_eq!(
         error.to_string(),
@@ -471,13 +480,25 @@ fn a_tick_fed_back_out_of_order_is_refused_and_changes_nothing() {
     // A tick fed back and not delivered counts: the same one again is refused, the next taken.
     assert_eq!(shared.replay_vsync(1), Ok(()));
     let again = shared.replay_vsync(1).unwrap_err();
-    assert_eq!(again, VsyncReplayError::OutOfOrder { expected: 2, found: 1 });
+    assert_eq!(
+        again,
+        VsyncReplayError::OutOfOrder {
+            expected: 2,
+            found: 1
+        }
+    );
     assert_eq!(shared.replay_vsync(2), Ok(()));
     // A delivered tick counts too.
     let mut host = Journal::default();
     shared.tick_replayed_vsync(&mut host);
     let after = shared.replay_vsync(2).unwrap_err();
-    assert_eq!(after, VsyncReplayError::OutOfOrder { expected: 3, found: 2 });
+    assert_eq!(
+        after,
+        VsyncReplayError::OutOfOrder {
+            expected: 3,
+            found: 2
+        }
+    );
     assert_eq!(shared.replay_vsync(3), Ok(()));
 }
 
@@ -545,7 +566,10 @@ fn the_vsync_snapshot_layout_is_pinned() {
     expected.push(0x03);
     expected.extend([0x02, 0x01, 0x02, 0x04, 0x06]);
     assert_eq!(shared.save_vsync().unwrap(), expected);
-    assert_eq!(expected, snapshot(7, Some(5 + INTERVAL_NS), 3, &[(1, 2), (4, 6)]));
+    assert_eq!(
+        expected,
+        snapshot(7, Some(5 + INTERVAL_NS), 3, &[(1, 2), (4, 6)])
+    );
 }
 
 #[test]
@@ -682,7 +706,10 @@ fn a_snapshot_s_listeners_are_strictly_ascending() {
         .unwrap();
     // A misordered list and an overflowing count: the order first.
     let error = refused(&snapshot(u64::MAX, Some(FIRST.0), 1, &[(2, 5), (1, 5)]));
-    assert_eq!(error, VsyncSnapshotError::ListenersNotAscending { index: 1 });
+    assert_eq!(
+        error,
+        VsyncSnapshotError::ListenersNotAscending { index: 1 }
+    );
 }
 
 #[test]
@@ -694,8 +721,11 @@ fn a_snapshot_s_deadline_needs_a_listener() {
         "the vsync clock snapshot has a deadline but no listeners"
     );
     // Neither, or both, are taken; and listeners with no deadline (the end of the counts).
-    for (next, listeners) in [(None, &[][..]), (Some(FIRST.0), &[(1, 5)][..]), (None, &[(1, 5)][..])]
-    {
+    for (next, listeners) in [
+        (None, &[][..]),
+        (Some(FIRST.0), &[(1, 5)][..]),
+        (None, &[(1, 5)][..]),
+    ] {
         fresh()
             .restore_vsync(&snapshot(3, next, 0, listeners))
             .unwrap();

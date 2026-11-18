@@ -40,6 +40,8 @@ use starquake_testkit::nro::NroBuilder;
 use super::reads::WithTls;
 use super::*;
 
+mod vsync;
+
 /// Where in the thread-local page the port's name and the waited handle are.
 const NAME_AT: u64 = 0x300;
 const HANDLES_AT: u64 = 0x400;
