@@ -734,3 +734,68 @@ fn the_release_signals_the_event_made_before_or_after_the_client() {
         assert_eq!(rig.signals(event), 2);
     }
 }
+
+/// A restore refuses two clients holding one pending reply's token, at the second, though the
+/// token is pending: each held request is reissued once. One client holding it is taken.
+#[test]
+fn a_restore_refuses_one_held_reply_named_twice() {
+    use crate::shared::present::{
+        PresentSnapshotError, SNAPSHOT_MAGIC, SNAPSHOT_VERSION, SavedClient, SavedFrame,
+        SavedWaiting,
+    };
+    let mut rig = Rig::paced(Pacing::FenceWait);
+    rig.presenting_client();
+    let image = rig.image();
+    let mut buffer = vec![STALE; starquake_ipc::BUFFER_SIZE];
+    let bytes = le(&Present::of(image, 0).words());
+    buffer[..bytes.len()].copy_from_slice(&bytes);
+    let handled = rig.server.handle(&mut rig.kernel, rig.session, &mut buffer);
+    let Ok(Handled::Deferred(token)) = handled else {
+        unreachable!("the fallback holds its reply");
+    };
+    let frame = SavedFrame {
+        slot: 0,
+        image,
+        address: IMAGE_AT,
+        width: 16,
+        height: 16,
+        pitch: 1,
+        block_height_log2: PRESENT_BLOCK_HEIGHT,
+        format: PRESENT_FORMATS[0],
+        shown: [0, 0, 16, 16],
+        layer: FIRST_LAYER,
+        display: DEFAULT_DISPLAY,
+        fence: None,
+        reached: true,
+        holds_slot: false,
+    };
+    let client = |key: u64| SavedClient {
+        token: key,
+        available_bit: AVAILABLE,
+        event: None,
+        queued: vec![frame.clone()],
+        shown: None,
+        released: 0,
+        raised: false,
+        waiting: Some(SavedWaiting {
+            token: Some(token),
+            ahead: 0,
+        }),
+    };
+    let snapshot = |clients: Vec<SavedClient>| {
+        let mut bytes = SNAPSHOT_MAGIC.to_vec();
+        bytes.extend(postcard::to_allocvec(&SNAPSHOT_VERSION).unwrap());
+        bytes.extend(postcard::to_allocvec(&clients).unwrap());
+        bytes
+    };
+    let twice = snapshot(vec![client(TOKEN), client(TOKEN + 1)]);
+    assert_eq!(
+        rig.shared.restore_presents(&twice, &rig.server),
+        Err(PresentSnapshotError::DuplicateToken {
+            index: 1,
+            token: token.raw()
+        })
+    );
+    let once = snapshot(vec![client(TOKEN + 1)]);
+    assert_eq!(rig.shared.restore_presents(&once, &rig.server), Ok(()));
+}
