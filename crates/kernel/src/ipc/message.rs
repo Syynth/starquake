@@ -851,6 +851,14 @@ mod tests {
         usize::try_from(most.num_copy_handles).unwrap()
     }
 
+    /// Any raw handle value but [`Handle::INVALID`]'s, which a reply's handle list skips.
+    fn valid_raw_handle() -> impl proptest::strategy::Strategy<Value = u32> {
+        use proptest::strategy::Strategy as _;
+        proptest::prelude::any::<u32>().prop_filter("not the invalid handle", |raw| {
+            *raw != Handle::INVALID.raw()
+        })
+    }
+
     fn reply_config() -> proptest::test_runner::Config {
         proptest::test_runner::Config {
             rng_seed: proptest::test_runner::RngSeed::Fixed(0x0209),
@@ -867,8 +875,8 @@ mod tests {
         #[test]
         fn built_handles_come_back_in_order(
             pid in proptest::option::of(proptest::prelude::any::<u64>()),
-            copies in proptest::collection::vec(1_u32..=u32::MAX, 0..=most_handles()),
-            moves in proptest::collection::vec(1_u32..=u32::MAX, 0..=most_handles()),
+            copies in proptest::collection::vec(valid_raw_handle(), 0..=most_handles()),
+            moves in proptest::collection::vec(valid_raw_handle(), 0..=most_handles()),
         ) {
             let mut built = request();
             if let Some(pid) = pid {
