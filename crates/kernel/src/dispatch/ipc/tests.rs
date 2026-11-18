@@ -1876,6 +1876,35 @@ fn a_run_whose_only_thread_waits_for_a_deferred_reply_is_not_stalled() {
 }
 
 #[test]
+fn a_run_whose_process_a_delivery_ended_is_not_stalled() {
+    // What a core that parks after the timer thread's delivery ended the process, and before
+    // the timer thread stops the run, sees: nothing could run or end a wait, but the run is
+    // over, not deadlocked.
+    let (world, thread) = world_running_a_user_thread(A);
+    let handle = world.session();
+    let session = world.object(handle);
+    world
+        .first
+        .script(Box::new(|_, _, _| Ok(Handled::Deferred)));
+    world.send(A, handle, &request());
+    lock(&world.first.hooks).take_reply = Some(Box::new(|cx| cx.end_process()));
+    lock(&world.first.ready).push_back((session, Ok(0xA0)));
+    assert_eq!(world.deliver(&world.first).len(), 1);
+    assert_eq!(holdings(&world, thread), (0, 1, 0, true));
+    world.with_tables(|_, scheduler| {
+        assert!(!scheduler.has_runnable_thread());
+        assert_eq!(scheduler.sync().next_deadline(), None);
+        assert!(!scheduler.sync().has_reply_wait());
+        let ipc = scheduler.ipc();
+        assert!(ipc.servers().all(|server| {
+            ipc.queue(server)
+                .is_ok_and(|queue| queue.deferred().next().is_none())
+        }));
+    });
+    assert!(!world.dispatcher.is_stalled());
+}
+
+#[test]
 fn a_run_is_not_stalled_while_a_handler_is_out_of_its_slot() {
     // The sender is no scheduler thread: nothing is runnable or waits, and nothing is
     // deferred, but the handler running on another thread may still end something.
