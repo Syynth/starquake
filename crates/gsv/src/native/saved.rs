@@ -61,10 +61,12 @@ use starquake_memory::PAGE_SIZE;
 use thiserror::Error;
 
 use super::layout::{KIND_NATIVE, PREFERENCE_WORDS, WORD_KIND, requirements};
+use super::pools::{GpuMapping, MAX_MAPPINGS, MAX_POOL_IMAGES, MAX_POOLS, VideoPool};
 use super::{
     Binding, FIRST_ID, MAX_IMAGES, MAX_MEMORIES, MAX_MEMORY_SIZE, MAX_MODE, NativeImage,
     NativeMemory, NativeObjects, Source,
 };
+use crate::video::layout::{VideoLayout, layout};
 use crate::completion::Reclaim;
 
 #[cfg(test)]
@@ -74,7 +76,7 @@ mod tests;
 pub const SNAPSHOT_MAGIC: [u8; 4] = *b"SQNI";
 
 /// Layout version written into every native tables snapshot and required when reading one.
-pub const SNAPSHOT_VERSION: u32 = 1;
+pub const SNAPSHOT_VERSION: u32 = 2;
 
 /// The part of a snapshot a check names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,6 +85,10 @@ pub enum Part {
     Memory,
     /// A native image.
     Image,
+    /// A video image pool.
+    Pool,
+    /// A GPU mapping of a pool image.
+    Mapping,
 }
 
 impl fmt::Display for Part {
@@ -90,6 +96,8 @@ impl fmt::Display for Part {
         f.write_str(match self {
             Self::Memory => "native memory",
             Self::Image => "native image",
+            Self::Pool => "video image pool",
+            Self::Mapping => "GPU image mapping",
         })
     }
 }
@@ -157,8 +165,32 @@ pub enum SnapshotError {
         /// What it holds too many of.
         part: Part,
     },
-    /// A retired memory has no image: 430 removes it with its last one.
-    #[error("native memory {index} of the snapshot is retired but no image uses it")]
+    /// A pool names a memory the snapshot does not hold, or one that is not bound.
+    #[error("video image pool {index} of the snapshot names a memory that is missing or not bound")]
+    PoolDangling {
+        /// The pool's position in its list.
+        index: usize,
+    },
+    /// A pool's preference and count are not ones 911 accepts.
+    #[error("video image pool {index} of the snapshot has a preference or count 911 refuses")]
+    PoolLayout {
+        /// The pool's position in its list.
+        index: usize,
+    },
+    /// A pool's image ids include a native image's.
+    #[error("video image pool {index} of the snapshot holds the id of a native image")]
+    PoolOverlap {
+        /// The pool's position in its list.
+        index: usize,
+    },
+    /// A mapping names an image no pool of the snapshot holds.
+    #[error("GPU image mapping {index} of the snapshot names an image no pool holds")]
+    MappingDangling {
+        /// The mapping's position in its list.
+        index: usize,
+    },
+    /// A retired memory has no image and no pool: 430 and 912 remove it with its last one.
+    #[error("native memory {index} of the snapshot is retired but no image or pool uses it")]
     RetiredUnused {
         /// The memory's position in its list.
         index: usize,
@@ -218,6 +250,25 @@ struct SavedImage {
     window_pool: bool,
 }
 
+/// A video image pool, as saved: its first image id, memory, preference and count. Its layout
+/// is made again from the preference and count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct SavedPool {
+    first: u32,
+    memory: u32,
+    preference: [u32; PREFERENCE_WORDS],
+    count: u32,
+}
+
+/// A GPU mapping of a pool image, as saved: its address space, image and count. Its address and
+/// size are made again from the pool and its memory's binding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct SavedMapping {
+    space: u32,
+    image: u32,
+    references: u32,
+}
+
 /// The body.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct State {
@@ -225,6 +276,8 @@ struct State {
     images: Vec<SavedImage>,
     next_memory: u32,
     next_image: u32,
+    pools: Vec<SavedPool>,
+    mappings: Vec<SavedMapping>,
 }
 
 /// Whether `id` is one a table whose next id is `next` can have handed out: from
@@ -272,11 +325,32 @@ impl State {
                 window_pool: image.window_pool,
             })
             .collect();
+        let pools = objects
+            .pools
+            .iter()
+            .map(|(&first, pool)| SavedPool {
+                first,
+                memory: pool.memory,
+                preference: pool.preference,
+                count: pool.count,
+            })
+            .collect();
+        let mappings = objects
+            .mappings
+            .iter()
+            .map(|(&(space, image), mapping)| SavedMapping {
+                space,
+                image,
+                references: mapping.references,
+            })
+            .collect();
         Self {
             memories,
             images,
             next_memory: objects.next_memory,
             next_image: objects.next_image,
+            pools,
+            mappings,
         }
     }
 
@@ -358,7 +432,11 @@ impl State {
         if self.images.len() > MAX_IMAGES {
             return Err(SnapshotError::TooMany { part: image_part });
         }
-        let used: BTreeSet<u32> = self.images.iter().map(|image| image.memory).collect();
+        let pools = self.check_pools(&memories)?;
+        self.check_mappings(&pools, &memories)?;
+        let used: BTreeSet<u32> = (self.images.iter().map(|image| image.memory))
+            .chain(self.pools.iter().map(|pool| pool.memory))
+            .collect();
         for (index, memory) in self.memories.iter().enumerate() {
             if memory.retired && !used.contains(&memory.id) {
                 return Err(SnapshotError::RetiredUnused { index });
@@ -420,13 +498,139 @@ impl State {
                 )
             })
             .collect();
-        Ok(NativeObjects {
+        let mut objects = NativeObjects {
             memories,
             images,
             next_memory: self.next_memory,
             next_image: self.next_image,
-        })
+            pools: BTreeMap::new(),
+            mappings: BTreeMap::new(),
+        };
+        for (index, saved) in self.pools.iter().enumerate() {
+            let layout = layout(&saved.preference, saved.count)
+                .map_err(|_| SnapshotError::PoolLayout { index })?;
+            objects.pools.insert(
+                saved.first,
+                VideoPool {
+                    memory: saved.memory,
+                    preference: saved.preference,
+                    count: saved.count,
+                    layout,
+                },
+            );
+        }
+        for (index, saved) in self.mappings.iter().enumerate() {
+            let mapping = mapping_of(&objects, saved.image, saved.references)
+                .ok_or(SnapshotError::MappingDangling { index })?;
+            objects.mappings.insert((saved.space, saved.image), mapping);
+        }
+        Ok(objects)
     }
+
+    /// The pools' checks, in list order (module docs, "Checks"): each pool's ids, order,
+    /// overlap with the native images, memory, layout and size, then their number. Returns each
+    /// pool's layout, by first id.
+    fn check_pools(
+        &self,
+        memories: &BTreeMap<u32, &SavedMemory>,
+    ) -> Result<BTreeMap<u32, (VideoLayout, u32)>, SnapshotError> {
+        let part = Part::Pool;
+        let images: BTreeSet<u32> = self.images.iter().map(|image| image.id).collect();
+        let mut previous_end = None;
+        let mut pools = BTreeMap::new();
+        for (index, pool) in self.pools.iter().enumerate() {
+            let out_of_range = SnapshotError::OutOfRange { part, index };
+            let end = u64::from(pool.first) + u64::from(pool.count);
+            let limit = match self.next_image {
+                0 => 1 << 32,
+                next => u64::from(next),
+            };
+            if pool.first < FIRST_ID || end > limit {
+                return Err(out_of_range);
+            }
+            if previous_end.is_some_and(|before| u64::from(pool.first) < before) {
+                return Err(SnapshotError::Order { part, index });
+            }
+            previous_end = Some(end);
+            if images
+                .range(pool.first..)
+                .next()
+                .is_some_and(|&id| u64::from(id) < end)
+            {
+                return Err(SnapshotError::PoolOverlap { index });
+            }
+            let backing = memories
+                .get(&pool.memory)
+                .filter(|memory| memory.binding.is_some())
+                .ok_or(SnapshotError::PoolDangling { index })?;
+            let layout = layout(&pool.preference, pool.count)
+                .ok()
+                .filter(|_| pool.count <= MAX_POOL_IMAGES)
+                .ok_or(SnapshotError::PoolLayout { index })?;
+            if layout.size > backing.size {
+                return Err(out_of_range);
+            }
+            pools.insert(pool.first, (layout, pool.count));
+        }
+        if self.pools.len() > MAX_POOLS {
+            return Err(SnapshotError::TooMany { part });
+        }
+        Ok(pools)
+    }
+
+    /// The mappings' checks, in list order (module docs, "Checks"): each mapping's order, its
+    /// image, its count and its address, then their number.
+    fn check_mappings(
+        &self,
+        pools: &BTreeMap<u32, (VideoLayout, u32)>,
+        memories: &BTreeMap<u32, &SavedMemory>,
+    ) -> Result<(), SnapshotError> {
+        let part = Part::Mapping;
+        let memory_of: BTreeMap<u32, u32> =
+            self.pools.iter().map(|pool| (pool.first, pool.memory)).collect();
+        let mut previous = None;
+        for (index, mapping) in self.mappings.iter().enumerate() {
+            let key = (mapping.space, mapping.image);
+            if previous.is_some_and(|before| key <= before) {
+                return Err(SnapshotError::Order { part, index });
+            }
+            previous = Some(key);
+            let (first, (layout, _)) = pools
+                .range(..=mapping.image)
+                .next_back()
+                .filter(|(first, (_, count))| mapping.image - **first < *count)
+                .ok_or(SnapshotError::MappingDangling { index })?;
+            let address = layout
+                .offset(mapping.image - first)
+                .and_then(|offset| u32::try_from(offset).ok())
+                .and_then(|offset| {
+                    let memory = memory_of.get(first)?;
+                    let binding = memories.get(memory)?.binding?;
+                    binding.address.checked_add(u64::from(offset))
+                });
+            if mapping.references == 0 || address.is_none() {
+                return Err(SnapshotError::OutOfRange { part, index });
+            }
+        }
+        if self.mappings.len() > MAX_MAPPINGS {
+            return Err(SnapshotError::TooMany { part });
+        }
+        Ok(())
+    }
+}
+
+/// The mapping of image `image` with `references`, as 426 made it: the image's CPU address and
+/// bytes. `None` if no pool holds the image, its memory is not bound, or its offset does not fit
+/// in 32 bits.
+fn mapping_of(objects: &NativeObjects, image: u32, references: u32) -> Option<GpuMapping> {
+    let found = objects.pool_image(image)?;
+    let offset = u32::try_from(found.pool.layout.offset(found.index)?).ok()?;
+    let binding = objects.memories.get(&found.pool.memory)?.binding?;
+    Some(GpuMapping {
+        address: binding.address.checked_add(u64::from(offset))?,
+        size: u64::from(found.pool.layout.image_bytes),
+        references,
+    })
 }
 
 impl NativeObjects {

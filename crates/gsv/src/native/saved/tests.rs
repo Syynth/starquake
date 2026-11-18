@@ -83,7 +83,26 @@ fn golden() -> State {
         ],
         next_memory: 10,
         next_image: 11,
+        pools: vec![SavedPool {
+            first: 9,
+            memory: 6,
+            preference: video_pool(),
+            count: 1,
+        }],
+        mappings: vec![SavedMapping {
+            space: 2,
+            image: 9,
+            references: 3,
+        }],
     }
+}
+
+/// A one-image NV12 pool preference: code 1, 2x2 pixels, 4096 bytes (PR's smallest image).
+fn video_pool() -> Preference {
+    let mut words = [0; PREFERENCE_WORDS];
+    words[1] = 1;
+    words[2] = 1 | (1 << 16);
+    words
 }
 
 /// The bytes of `state` with the header.
@@ -126,7 +145,7 @@ fn the_snapshot_layout_is_pinned() {
     // 80 A0 01, 0x6000 80 C0 01, 1536 80 0C. The process is `from_parts(2, 3)`.
     let (pi, pg) = (0x02, 0x03);
     let mut expected: Vec<u8> = b"SQNI".to_vec();
-    expected.push(1); // version
+    expected.push(2); // version
     expected.push(4); // memories: four
     // 3: mode 1, 0x2000, live, bound at 0x4000 to process memory, not GPU-checked.
     expected.extend([3, 1, 0x80, 0x40, 0, 1, 0x80, 0x80, 0x01, pi, pg, 0, 0]);
@@ -150,6 +169,14 @@ fn the_snapshot_layout_is_pinned() {
     expected.extend([0; 8]);
     expected.extend([3, 0x80, 0x0C, 0]);
     expected.extend([10, 11]); // next ids
+    expected.push(1); // pools: one
+    // first image 9, memory 6, the preference (word 1: code 1; word 2: 1 | 1 << 16 = 0x10001,
+    // varint 81 80 04), count 1.
+    expected.extend([9, 6, 0, 1, 0x81, 0x80, 0x04]);
+    expected.extend([0; 13]);
+    expected.push(1);
+    expected.push(1); // mappings: one
+    expected.extend([2, 9, 3]); // address space 2, image 9, three references
     assert_eq!(encode(&golden()), expected);
     let restored = NativeObjects::restore(&expected, &kernel()).unwrap();
     assert_eq!(restored.save().unwrap(), expected);
@@ -195,6 +222,22 @@ fn a_restore_reads_every_field() {
     assert_eq!(image.preference(), &image_b());
     assert!(restored.image(4).unwrap().window_pool());
     assert_eq!((restored.next_memory, restored.next_image), (10, 11));
+    let pool = restored.pool_image(9).unwrap();
+    assert_eq!(
+        (pool.first, pool.index, pool.pool.memory(), pool.pool.count()),
+        (9, 0, 6, 1)
+    );
+    assert_eq!(pool.pool.preference(), &video_pool());
+    assert_eq!(pool.pool.layout().image_bytes, 4096);
+    let mappings: Vec<_> = restored.gpu_mappings().collect();
+    assert_eq!(mappings.len(), 1);
+    let ((space, image), mapping) = mappings[0];
+    assert_eq!((space, image), (crate::gpu::AsId(2), 9));
+    // The image's address: memory 6's binding, 0x5000, plus offset 0.
+    assert_eq!(
+        (mapping.address(), mapping.size(), mapping.references()),
+        (0x5000, 4096, 3)
+    );
 }
 
 /// The header and the framing, each refused with its own error.
@@ -207,11 +250,12 @@ fn the_header_and_framing_are_checked() {
         NativeObjects::restore(&magic, &kernel()),
         Err(SnapshotError::BadMagic)
     ));
+    // Version 1, the layout before the video pools, is no longer read.
     let mut version = good.clone();
-    version[4] = 2;
+    version[4] = 1;
     assert!(matches!(
         NativeObjects::restore(&version, &kernel()),
-        Err(SnapshotError::UnsupportedVersion { found: 2 })
+        Err(SnapshotError::UnsupportedVersion { found: 1 })
     ));
     assert!(matches!(
         NativeObjects::restore(&good[..good.len() - 1], &kernel()),
@@ -431,6 +475,8 @@ fn the_tables_are_bounded_at_the_limits() {
         images: Vec::new(),
         next_memory: limit + 2,
         next_image: 1,
+        pools: Vec::new(),
+        mappings: Vec::new(),
     };
     assert!(restore(&state).is_ok());
     state.memories.push(memory(limit + 1));
@@ -489,6 +535,8 @@ fn locks_beyond_the_kernel_s_are_refused_at_the_first_extra_one() {
         images: Vec::new(),
         next_memory: 5,
         next_image: 1,
+        pools: Vec::new(),
+        mappings: Vec::new(),
     };
     let locks = Locks {
         process: process(),
@@ -566,6 +614,8 @@ fn locks_are_counted_per_process() {
         images: Vec::new(),
         next_memory: 4,
         next_image: 1,
+        pools: Vec::new(),
+        mappings: Vec::new(),
     };
     let locks = ProcessLocks(BTreeMap::from([
         ((process(), 0x4000, 0x1000), 1),

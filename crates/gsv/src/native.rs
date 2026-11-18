@@ -122,6 +122,7 @@
 //! wiring slice's (16), as for the GPU memory.
 
 pub mod layout;
+pub mod pools;
 pub mod saved;
 
 #[cfg(test)]
@@ -285,15 +286,21 @@ impl NativeImage {
     }
 }
 
-/// The native memories and images of a process (module docs, "Where the tables live").
+/// The native memories and images of a process (module docs, "Where the tables live"), and the
+/// video image pools that lie in its memories ([`pools`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NativeObjects {
     memories: BTreeMap<u32, NativeMemory>,
     images: BTreeMap<u32, NativeImage>,
     /// The next memory id; 0 once [`u32::MAX`] has been handed out.
     next_memory: u32,
-    /// The next image id; 0 once [`u32::MAX`] has been handed out.
+    /// The next image id, shared by native images and pool images; 0 once [`u32::MAX`] has
+    /// been handed out.
     next_image: u32,
+    /// The video image pools, by first image id ([`pools`]).
+    pools: BTreeMap<u32, pools::VideoPool>,
+    /// The GPU mappings of pool images, by address space and image ([`pools`]).
+    mappings: BTreeMap<(u32, u32), pools::GpuMapping>,
 }
 
 impl Default for NativeObjects {
@@ -384,6 +391,8 @@ impl NativeObjects {
             images: BTreeMap::new(),
             next_memory: FIRST_ID,
             next_image: FIRST_ID,
+            pools: BTreeMap::new(),
+            mappings: BTreeMap::new(),
         }
     }
 
@@ -417,9 +426,23 @@ impl NativeObjects {
             .count()
     }
 
-    /// Whether an image lies in memory `id`.
+    /// Whether an image or a video image pool ([`pools`]) lies in memory `id`.
     fn in_use(&self, id: u32) -> bool {
-        self.images.values().any(|image| image.memory == id)
+        self.images.values().any(|image| image.memory == id) || self.pool_in(id)
+    }
+
+    /// After the last image or pool in memory `id` may have gone: if the memory is retired and
+    /// nothing uses it now, removes it and returns its lock to release, if it was bound (PR
+    /// `DrainRetiredMemories`, which 430 and 912 both run).
+    fn release_if_retired(&mut self, id: u32) -> Option<DeviceShareToken> {
+        let retired = self.memories.get(&id).is_some_and(|backing| backing.retired);
+        if !retired || self.in_use(id) {
+            return None;
+        }
+        self.memories
+            .remove(&id)
+            .and_then(|backing| backing.binding)
+            .map(|binding| binding.token)
     }
 
     /// Sets the next ids, for tests at the end of the id space.
@@ -587,18 +610,7 @@ impl NativeObjects {
         }
         let memory = image.memory;
         self.images.remove(&id);
-        let retired = self
-            .memories
-            .get(&memory)
-            .is_some_and(|backing| backing.retired);
-        if !retired || self.in_use(memory) {
-            return Ok(None);
-        }
-        Ok(self
-            .memories
-            .remove(&memory)
-            .and_then(|backing| backing.binding)
-            .map(|binding| binding.token))
+        Ok(self.release_if_retired(memory))
     }
 
     /// 315 (`create`, with its count) and 314: puts image `id` in a window alias image pool or

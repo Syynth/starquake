@@ -17,6 +17,9 @@
 //! * [`gpu`]: the gpu session (497) and its worker: GPU memory, mappings and sparse regions.
 //! * [`native`]: native memory and native images (root 111, 112, 114, 314, 315, 423, 429, 430,
 //!   435, 1510) and their size.
+//! * [`video`]: the video codec sessions (root 902, 906, 1002) with a null decoder, the video
+//!   image pools' layout (the pools are [`native::pools`]: root 911, 912, 961, 991, 426–428),
+//!   and the camera session (root 602).
 
 pub mod completion;
 pub mod gpu;
@@ -27,6 +30,7 @@ pub mod protocol;
 pub mod root;
 pub mod shared;
 pub mod syncpt;
+pub mod video;
 
 #[cfg(test)]
 mod testing;

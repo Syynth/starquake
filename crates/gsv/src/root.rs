@@ -132,6 +132,29 @@
 //! the syncpt server's, then the nvsrv server's
 //! (`a_snapshot_with_other_family_servers_is_refused_gpu_first`).
 //!
+//! # Video (slice 15)
+//!
+//! A root built for a run with a video server ([`RootState::with_video_server`]) answers 902,
+//! 906 and 1002 with a copied session on it, whose root interface is the video context
+//! ([`crate::video`]), as 497 does on the gpu server; one with no video server answers them
+//! with the stub's placeholder. 902 and 1002 read nothing; 906 reads a `u8` (word 2) and a
+//! `u64` library version (words 3–4) (PR `DecodeVideoContext`: `packet[2] > 1` is
+//! `InvalidCombination`, then a remote-memory flag or a version other than
+//! [`VIDEO_LIBRARY_VERSION`] is `NotImplemented`; NX2 reads nothing, row 146). Here they are
+//! logged and accepted, the larger answer by decision 8, and so is any of the three before 901
+//! (PR: `InvalidState`; decision 7). 1002 is the **conflict** the protocol table names: its
+//! context is the same as 902's ([`crate::video`], "The server").
+//!
+//! 901, 903, 1001 and 1003 stay the stubs: success, nothing kept. PR keeps whether each was
+//! sent, to refuse the other video commands without it (`InvalidState`), which decision 7 logs
+//! rather than refuses here; NX2 stubs 901 and 1001 and has no 903 or 1003.
+//!
+//! A root built with gsv's shared state ([`root_server_with_page`]) answers 991, 911, 912, 961,
+//! 426, 427 and 428 from the native tables ([`crate::native::pools`], which lists each
+//! command's words, checks and divergences), and 602 with a camera session
+//! ([`crate::video::camera`]); one built without answers them with the stubs. Before the
+//! bootstrap is complete each is logged and accepted, as the native commands are.
+//!
 //! # Where this differs from the references
 //!
 //! Each row is pinned by the test named, in `root/tests.rs`:
@@ -161,6 +184,7 @@ use starquake_services::framework::{
 };
 use starquake_trace::ServiceId;
 
+use crate::gpu::low_byte;
 use crate::native;
 use crate::protocol::command::{
     ACTIVATE_FRAME_CONTEXT, ACTIVATE_GPU_CONTEXT, BIND_NATIVE_GPU_MEMORY, BIND_NATIVE_MEMORY,
@@ -179,9 +203,11 @@ use crate::protocol::command::{
     QUERY_NATIVE_GPU_IMAGE, QUERY_VIDEO_IMAGE, REGISTER_GPU_ADDRESS_SPACE, SEQUENCE_COMMAND_1201,
     SEQUENCE_COMMAND_1202, SEQUENCE_COMMAND_1203, SET_GRAPHICS_CLASS_1111, UNMAP_NATIVE_GPU_IMAGE,
 };
+use crate::native::pools;
 use crate::protocol::{Handed, bootstrap, root_command};
 use crate::shared::Shared;
 use crate::shared::page;
+use crate::video::camera::{self, CameraSession};
 
 #[cfg(test)]
 mod tests;
@@ -284,6 +310,7 @@ pub struct RootState {
     gpu_server: Option<ServiceId>,
     syncpt_server: Option<ServiceId>,
     nvsrv_server: Option<ServiceId>,
+    video_server: Option<ServiceId>,
 }
 
 /// The serialised form of [`RootState`], field for field, and what deserialising validates.
@@ -297,6 +324,7 @@ struct SavedRootState {
     gpu_server: Option<ServiceId>,
     syncpt_server: Option<ServiceId>,
     nvsrv_server: Option<ServiceId>,
+    video_server: Option<ServiceId>,
 }
 
 /// Why a saved [`RootState`] could not be read back: it holds a combination of fields that no
@@ -345,6 +373,7 @@ impl TryFrom<SavedRootState> for RootState {
             gpu_server,
             syncpt_server,
             nvsrv_server,
+            video_server,
         } = saved;
         match (phase, bootstrap.is_some()) {
             (Phase::Created, true) => return Err(RootStateError::CreatedWithBootstrap),
@@ -375,6 +404,7 @@ impl TryFrom<SavedRootState> for RootState {
             gpu_server,
             syncpt_server,
             nvsrv_server,
+            video_server,
         })
     }
 }
@@ -398,6 +428,7 @@ impl RootState {
             gpu_server: None,
             syncpt_server: None,
             nvsrv_server: None,
+            video_server: None,
         }
     }
 
@@ -441,6 +472,20 @@ impl RootState {
     #[must_use]
     pub const fn nvsrv_server(&self) -> Option<ServiceId> {
         self.nvsrv_server
+    }
+
+    /// The root of a run whose video server is known by `service` (module docs, "Video (slice
+    /// 15)").
+    #[must_use]
+    pub const fn with_video_server(mut self, service: ServiceId) -> Self {
+        self.video_server = Some(service);
+        self
+    }
+
+    /// The number of the video server 902, 906 and 1002 hand sessions on, if the run has one.
+    #[must_use]
+    pub const fn video_server(&self) -> Option<ServiceId> {
+        self.video_server
     }
 
     /// Where the bootstrap is.
@@ -553,19 +598,19 @@ commands! {
         CALCULATE_IMAGE_REQUIREMENTS => calculate_image_requirements,
         DESTROY_NATIVE_WINDOW_ALIAS_IMAGE_POOL => native_window_pool,
         CREATE_NATIVE_WINDOW_ALIAS_IMAGE_POOL => native_window_pool,
-        MAP_NATIVE_GPU_IMAGE => stub,
-        UNMAP_NATIVE_GPU_IMAGE => stub,
-        QUERY_NATIVE_GPU_IMAGE => stub,
+        MAP_NATIVE_GPU_IMAGE => map_native_gpu_image,
+        UNMAP_NATIVE_GPU_IMAGE => unmap_native_gpu_image,
+        QUERY_NATIVE_GPU_IMAGE => query_native_gpu_image,
         INITIALIZE_VIDEO_DECODER => stub,
-        OPEN_VIDEO_DECODER_CONTEXT_902 => stub,
+        OPEN_VIDEO_DECODER_CONTEXT_902 => open_video_context,
         FINALIZE_VIDEO_DECODER => stub,
-        OPEN_VIDEO_DECODER_CONTEXT => stub,
-        CREATE_VIDEO_IMAGE_POOL => stub,
-        DESTROY_VIDEO_IMAGE_POOL => stub,
-        QUERY_VIDEO_IMAGE => stub,
-        CALCULATE_VIDEO_IMAGE_REQUIREMENTS => stub,
+        OPEN_VIDEO_DECODER_CONTEXT => open_video_context,
+        CREATE_VIDEO_IMAGE_POOL => create_video_image_pool,
+        DESTROY_VIDEO_IMAGE_POOL => destroy_video_image_pool,
+        QUERY_VIDEO_IMAGE => query_video_image,
+        CALCULATE_VIDEO_IMAGE_REQUIREMENTS => calculate_video_image_requirements,
         INITIALIZE_VIDEO_ENCODER => stub,
-        OPEN_VIDEO_ENCODER_CONTEXT => stub,
+        OPEN_VIDEO_ENCODER_CONTEXT => open_video_context,
         FINALIZE_VIDEO_ENCODER => stub,
         INITIALIZE_FRAME_CONTEXT => stub,
         ACTIVATE_FRAME_CONTEXT => stub,
@@ -579,7 +624,7 @@ commands! {
         INITIALIZE_IMAGE_CONTEXT_1501 => stub,
         INITIALIZE_IMAGE_CONTEXT_1502 => stub,
         CREATE_CAMERA_CONTEXT => stub,
-        OPEN_CAMERA_SESSION => stub,
+        OPEN_CAMERA_SESSION => open_camera_session,
     }
 }
 
@@ -849,6 +894,135 @@ impl GsvRoot {
         })
     }
 
+    /// 902, 906 and 1002: a copied session on the video server (module docs, "Video (slice
+    /// 15)"); the stub's placeholder in a run with none.
+    fn open_video_context(
+        this: &mut Self,
+        cx: &mut Context<'_>,
+        req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        let Some(video) = root_state(cx)?.video_server else {
+            return Self::stub(this, cx, req, reply);
+        };
+        let command = req.command_id();
+        if command == OPEN_VIDEO_DECODER_CONTEXT {
+            let mut words = req.payload();
+            let remote = low_byte(words.read_u32()?);
+            let version = words.read_u64()?;
+            if remote != 0 || version != VIDEO_LIBRARY_VERSION {
+                tracing::warn!(
+                    remote,
+                    version,
+                    "gsv: 906 with a remote-memory flag or library version PR refuses; accepted"
+                );
+            }
+        }
+        hand_out(cx, reply, command, video)
+    }
+
+    /// 602 `OpenCameraSession`: in a `u64` device type; out a copied camera session
+    /// ([`crate::video::camera`]); the stub's placeholder in a run without gsv's shared state.
+    fn open_camera_session(
+        this: &mut Self,
+        cx: &mut Context<'_>,
+        req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        if !cx.family::<RootFamily>()?.has_page() {
+            return Self::stub(this, cx, req, reply);
+        }
+        let device = req.payload().read_u64()?;
+        root_state(cx)?.note_unready(OPEN_CAMERA_SESSION);
+        if device > camera::MAX_DEVICE_TYPE {
+            return Err(camera::GSV_UNKNOWN_ARGUMENT.into());
+        }
+        reply.copy_session(Box::new(CameraSession));
+        reply.ok()
+    }
+
+    /// 991 `CalculateVideoImageRequirements`: [`pools::calculate_requirements`].
+    fn calculate_video_image_requirements(
+        this: &mut Self,
+        cx: &mut Context<'_>,
+        req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        Self::native(this, cx, req, reply, |_, _, req, reply| {
+            pools::calculate_requirements(req, reply)
+        })
+    }
+
+    /// 911 `CreateVideoImagePool`: [`pools::create_pool`].
+    fn create_video_image_pool(
+        this: &mut Self,
+        cx: &mut Context<'_>,
+        req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        Self::native(this, cx, req, reply, |shared, _, req, reply| {
+            pools::create_pool(shared, req, reply)
+        })
+    }
+
+    /// 912 `DestroyVideoImagePool`: [`pools::destroy_pool`].
+    fn destroy_video_image_pool(
+        this: &mut Self,
+        cx: &mut Context<'_>,
+        req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        Self::native(this, cx, req, reply, pools::destroy_pool)
+    }
+
+    /// 961 `QueryVideoImage`: [`pools::query_video_image`].
+    fn query_video_image(
+        this: &mut Self,
+        cx: &mut Context<'_>,
+        req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        Self::native(this, cx, req, reply, |shared, _, req, reply| {
+            pools::query_video_image(shared, req, reply)
+        })
+    }
+
+    /// 426 `MapNativeGpuImage`: [`pools::map_gpu_image`].
+    fn map_native_gpu_image(
+        this: &mut Self,
+        cx: &mut Context<'_>,
+        req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        Self::native(this, cx, req, reply, |shared, _, req, reply| {
+            pools::map_gpu_image(shared, req, reply)
+        })
+    }
+
+    /// 427 `UnmapNativeGpuImage`: [`pools::unmap_gpu_image`].
+    fn unmap_native_gpu_image(
+        this: &mut Self,
+        cx: &mut Context<'_>,
+        req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        Self::native(this, cx, req, reply, |shared, _, req, reply| {
+            pools::unmap_gpu_image(shared, req, reply)
+        })
+    }
+
+    /// 428 `QueryNativeGpuImage`: [`pools::query_gpu_image`].
+    fn query_native_gpu_image(
+        this: &mut Self,
+        cx: &mut Context<'_>,
+        req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        Self::native(this, cx, req, reply, |shared, _, req, reply| {
+            pools::query_gpu_image(shared, req, reply)
+        })
+    }
+
     /// Every other root command: logs it and replies success with its known reply shape (module
     /// docs, "Stubs").
     fn stub(_: &mut Self, cx: &mut Context<'_>, req: &Request<'_>, reply: &mut Reply) -> Outcome {
@@ -924,8 +1098,16 @@ fn syncpoint_events(cx: &mut Context<'_>) -> Result<[ObjectId; 2], Fault> {
 /// The interfaces a root server's sessions can be.
 #[must_use]
 pub fn root_interfaces() -> Interfaces {
-    Interfaces::new().with::<GsvRoot>().with::<Placeholder>()
+    Interfaces::new()
+        .with::<GsvRoot>()
+        .with::<Placeholder>()
+        .with::<CameraSession>()
 }
+
+/// The library version 906 carries that PR takes (`DecodeVideoContext`:
+/// `request->library_version == 0x300030000ULL`; NX2 row 146: "title 4 sends version
+/// 0x3'00030000"). Another is logged and accepted (module docs, "Video (slice 15)").
+pub const VIDEO_LIBRARY_VERSION: u64 = 0x3_0003_0000;
 
 /// The flags word 497 carries: PR's `OpenGpuSession` requires `flags == 4` (graphics-server,
 /// "The root": "497 takes a u64 (4)").
@@ -1029,6 +1211,11 @@ impl Family for RootFamily {
         if saved.nvsrv_server != self.state.nvsrv_server {
             return Err(SnapshotError::FamilyWiring(
                 "its root names another nvsrv server",
+            ));
+        }
+        if saved.video_server != self.state.video_server {
+            return Err(SnapshotError::FamilyWiring(
+                "its root names another video server",
             ));
         }
         self.state = saved;
