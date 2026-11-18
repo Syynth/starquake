@@ -27,10 +27,12 @@ use starquake_trace::{EventKind, IpcOutcome, ServiceId};
 use super::*;
 use crate::protocol::{HANDLE_KIND, Mark, ROOT_COMMANDS};
 
+mod restore;
 mod video;
 use crate::testing::{
     SPECIAL, STALE, buffer_of, copied, halves, le, result_only, success, tipc_type,
 };
+use restore::EveryEvent;
 
 /// The number the tests' root server is known by.
 const ROOT: ServiceId = ServiceId(0x0657);
@@ -905,7 +907,7 @@ fn a_root_saved_mid_bootstrap_restores_and_carries_on() {
     let saved = rig.server.save().unwrap();
 
     let mut restored = root_server(UnknownPolicy::Strict).with_service_id(ROOT);
-    restored.restore(&saved).unwrap();
+    restored.restore_beside(&saved, &rig.kernel).unwrap();
     assert_eq!(
         restored.family::<RootFamily>().map(RootFamily::state),
         Some(&state)
@@ -1148,7 +1150,11 @@ fn a_saved_state_no_command_reaches_is_refused() {
             .unwrap();
         let mut restored = root_server(UnknownPolicy::Strict);
         let refused = SnapshotError::Decode(postcard::Error::SerdeDeCustom);
-        assert_eq!(restored.restore(&bytes), Err(refused), "{state:?}");
+        assert_eq!(
+            restored.restore_beside(&bytes, &EveryEvent),
+            Err(refused),
+            "{state:?}"
+        );
         assert_eq!(
             restored.family::<RootFamily>().map(RootFamily::state),
             Some(&RootState::new())
@@ -1194,7 +1200,7 @@ fn a_saved_state_at_each_edge_is_accepted() {
             .save()
             .unwrap();
         let mut restored = root_server(UnknownPolicy::Strict);
-        restored.restore(&bytes).unwrap();
+        restored.restore_beside(&bytes, &EveryEvent).unwrap();
         assert_eq!(
             restored.family::<RootFamily>().map(RootFamily::state),
             Some(&state)
@@ -1281,14 +1287,14 @@ fn a_snapshot_with_another_gpu_server_is_refused() {
     let saved = unwired.server.save().unwrap();
     let mut rig = wired();
     assert_eq!(
-        rig.server.restore(&saved),
+        rig.server.restore_beside(&saved, &rig.kernel),
         Err(SnapshotError::FamilyWiring(
             "its root names another gpu server"
         ))
     );
     assert_eq!(rig.state().gpu_server(), Some(GPU));
     let own = rig.server.save().unwrap();
-    assert_eq!(rig.server.restore(&own), Ok(()));
+    assert_eq!(rig.server.restore_beside(&own, &rig.kernel), Ok(()));
 }
 
 // ----- 202, 1402 and their servers -------------------------------------------------------------
@@ -1498,13 +1504,13 @@ fn a_snapshot_with_other_family_servers_is_refused_gpu_first() {
         let bytes = wired_with(saved).server.save().unwrap();
         let mut rig = wired_with(run);
         assert_eq!(
-            rig.server.restore(&bytes),
+            rig.server.restore_beside(&bytes, &rig.kernel),
             Err(SnapshotError::FamilyWiring(refusal)),
             "{saved:?}"
         );
         assert_eq!(rig.state(), run);
         let own = rig.server.save().unwrap();
-        assert_eq!(rig.server.restore(&own), Ok(()));
+        assert_eq!(rig.server.restore_beside(&own, &rig.kernel), Ok(()));
     }
 }
 
@@ -1621,13 +1627,13 @@ fn a_snapshot_with_another_vi2_server_is_refused() {
         let bytes = wired_with(saved).server.save().unwrap();
         let mut rig = wired_with(run);
         assert_eq!(
-            rig.server.restore(&bytes),
+            rig.server.restore_beside(&bytes, &rig.kernel),
             Err(SnapshotError::FamilyWiring(refusal)),
             "{saved:?}"
         );
         assert_eq!(rig.state(), run);
         let own = rig.server.save().unwrap();
-        assert_eq!(rig.server.restore(&own), Ok(()));
+        assert_eq!(rig.server.restore_beside(&own, &rig.kernel), Ok(()));
         assert_eq!(
             opened(&mut rig, &open_display_session(DISPLAY_SESSION_FLAGS[1])),
             Some(VI2)

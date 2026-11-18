@@ -216,6 +216,7 @@ pub mod payload;
 pub use starquake_kernel::ipc::queue;
 mod reply;
 pub mod request;
+mod restored;
 pub mod result;
 mod server;
 pub mod snapshot;
@@ -236,6 +237,7 @@ pub use payload::{Reader, Writer};
 pub use queue::{Admission, DEFAULT_WORKERS, QueueError, RequestQueue};
 pub use reply::Reply;
 pub use request::{DeferredBuffer, InBuffer, OutBuffer, Request};
+pub use restored::RestoredKernel;
 pub use result::{
     Completion, DEFERRED_REPLY_DROPPED, Direction, Fault, HandleKind, NOT_SUPPORTED,
     OUT_OF_DOMAIN_ENTRIES, Outcome, TARGET_NOT_FOUND, UNKNOWN_COMMAND_ID,

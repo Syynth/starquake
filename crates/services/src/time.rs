@@ -158,6 +158,32 @@
 //! (`an_environment_failure_stops_the_run_and_keeps_nothing`, for each read, with a replay that
 //! runs out and one that disagrees). `time:u` sends no host I/O, so it has no host failure to
 //! answer with a result code.
+//!
+//! # Restoring
+//!
+//! A snapshot is a file, so a restore believes nothing in the clocks. Once set up, they keep one
+//! kernel object, their memory, and beside the kernel the server is restored beside
+//! ([`Server::restore_beside`](crate::framework::Server::restore_beside)) it must name a live
+//! shared memory, of [`shared_memory::SIZE`] bytes rounded up to whole pages as the kernel makes
+//! it, that processes map read-only, as the set-up makes it; the first of the three that fails
+//! refuses the snapshot with
+//! [`SnapshotError::FamilyObject`](crate::framework::SnapshotError::FamilyObject) saying which,
+//! checked in that order, and leaves the server as it was
+//! (`the_clocks_memory_restores_only_as_a_live_read_only_time_shared_memory`). The server can
+//! keep a kernel object, so [`Server::restore`](crate::framework::Server::restore), which has no
+//! kernel, refuses its snapshots with
+//! [`SnapshotError::NeedsKernel`](crate::framework::SnapshotError::NeedsKernel), clocks not set
+//! up included (`a_time_server_is_restored_only_beside_the_kernel`).
+//!
+//! Not checked here:
+//!
+//! - **Which server made the memory.** The kernel notes which server made an event, not a
+//!   shared memory. A forged snapshot can name a read-only one-page shared memory another server
+//!   made; the guest is then handed it as the time memory. No other service makes a shared
+//!   memory of this size today (`hid`'s is 64 pages).
+//! - **The settings, and whether the saved contents are what the memory holds.** Neither names
+//!   a kernel object or a service: the settings are the run's (a snapshot's are taken as they
+//!   are), and the memory's bytes are guest memory, saved with the guest's.
 
 use std::sync::Arc;
 
@@ -165,13 +191,15 @@ use serde::{Deserialize, Serialize};
 use starquake_kernel::id::ObjectId;
 use starquake_kernel::memory::SvcPermission;
 use starquake_kernel::result::{KernelError, ResultCode};
-use starquake_trace::{Env, EnvError, HostNanos, UnixSeconds};
+use starquake_trace::{Env, EnvError, HostNanos, ServiceId, UnixSeconds};
 
 use crate::commands;
 use crate::framework::result::code;
 use crate::framework::{
-    Context, Fault, Halt, Interfaces, Outcome, Reply, Request, Server, UnknownPolicy,
+    Context, Fault, Halt, Interfaces, Outcome, Reply, Request, RestoredKernel, Server,
+    UnknownPolicy,
 };
+use crate::shared_image::{self, Refusals};
 
 pub mod calendar;
 pub mod shared_memory;
@@ -656,5 +684,32 @@ pub fn server(
         .with_root(|| Box::new(IStaticService))
         .with_interfaces(interfaces())
         .with_family(Clocks::new(settings))
+        .with_family_objects(clocks_memory)
         .with_env(env, halt)
+}
+
+/// What a restore answers for a memory that fails [`shared_image::check_restored`].
+const MEMORY_REFUSALS: Refusals = Refusals {
+    not_shared_memory: "its clocks' memory is not a live shared memory",
+    size: "its clocks' memory is not the size of the time shared memory",
+    permission: "its clocks' memory is not mapped read-only",
+};
+
+/// The restore check of the kernel object the `time:u` server's clocks keep (module docs,
+/// "Restoring"): once set up, their memory is a live shared memory of the time shared memory's
+/// size, mapped read-only, as [`set_up_memory`] makes it.
+fn clocks_memory(
+    saved: &Clocks,
+    kernel: &dyn RestoredKernel,
+    _service: ServiceId,
+) -> Result<(), &'static str> {
+    saved.set_up.map_or(Ok(()), |done| {
+        shared_image::check_restored(
+            kernel,
+            done.memory,
+            shared_memory::SIZE,
+            SvcPermission::Read,
+            &MEMORY_REFUSALS,
+        )
+    })
 }
