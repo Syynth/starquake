@@ -87,6 +87,68 @@ fn a_host_io_record_that_fits_exactly_is_kept() {
 }
 
 #[test]
+fn a_kept_host_io_records_payload_counts_toward_the_limit() {
+    // Two identical host I/O records carrying 100 bytes each, into room for both less one
+    // byte: the second fits only if the running total undercounts the first by a byte or more,
+    // so it is dropped. The fit check counts the record it checks in full, so this is what
+    // fails when the running total counts the size of an `EnvRecord` alone, only part of the
+    // payload, or every record a byte short.
+    let record = host_io(100, 0);
+    let mut kept = Kept::new(2 * record_bytes(&record) - 1);
+    kept.push(vec![record.clone(), record.clone()]);
+    assert_eq!(kept.records(), std::slice::from_ref(&record));
+    assert_eq!(kept.dropped(), 1);
+
+    // The same edge across separate pushes: the running total carries over between them.
+    let mut apart = Kept::new(2 * record_bytes(&record) - 1);
+    apart.push(vec![record.clone()]);
+    apart.push(vec![record.clone()]);
+    assert_eq!(apart.records(), std::slice::from_ref(&record));
+    assert_eq!(apart.dropped(), 1);
+
+    // The accepted side of the same edge: room for exactly both keeps both.
+    let mut both = Kept::new(2 * record_bytes(&record));
+    both.push(vec![record.clone(), record.clone()]);
+    assert_eq!(both.records(), [record.clone(), record.clone()]);
+    assert_eq!(both.dropped(), 0);
+
+    // The same at the shipping cap: a first host I/O record whose reply is sized so that it and
+    // the two identical records come to one byte past the cap.
+    let filler = host_io(
+        0,
+        ENV_RECORDING_BYTES + 1 - 2 * record_bytes(&record) - one(),
+    );
+    assert_eq!(
+        record_bytes(&filler) + 2 * record_bytes(&record),
+        ENV_RECORDING_BYTES + 1
+    );
+    let mut capped = Kept::new(ENV_RECORDING_BYTES);
+    capped.push(vec![filler.clone(), record.clone(), record.clone()]);
+    // Compared without `assert_eq!`, which would print the filler's reply on a failure.
+    assert_eq!(capped.dropped(), 1);
+    assert!(
+        capped.records() == [filler.clone(), record.clone()],
+        "kept {} records, not the filler and one 100-byte record",
+        capped.records().len()
+    );
+
+    // The accepted side at the cap: a filler one byte smaller leaves room for both.
+    let smaller = host_io(0, ENV_RECORDING_BYTES - 2 * record_bytes(&record) - one());
+    assert_eq!(
+        record_bytes(&smaller) + 2 * record_bytes(&record),
+        ENV_RECORDING_BYTES
+    );
+    let mut at_cap = Kept::new(ENV_RECORDING_BYTES);
+    at_cap.push(vec![smaller.clone(), record.clone(), record.clone()]);
+    assert_eq!(at_cap.dropped(), 0);
+    assert!(
+        at_cap.records() == [smaller, record.clone(), record],
+        "kept {} records, not the filler and both 100-byte records",
+        at_cap.records().len()
+    );
+}
+
+#[test]
 fn a_live_run_env_answers_from_the_host_and_keeps_what_it_moved() {
     let env = RunEnv::new(&EnvSource::Live, live, ENV_RECORDING_BYTES);
     assert_eq!(env.now(), Ok(HostNanos(0)));
