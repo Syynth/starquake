@@ -33,6 +33,7 @@ use starquake_trace::{EnvCall, EnvError, HostIoReply, HostIoRequest, HostNanos};
 use super::*;
 use crate::hle::graphics::KernelHost;
 
+mod present;
 mod video;
 mod vsync;
 

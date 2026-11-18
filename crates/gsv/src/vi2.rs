@@ -278,7 +278,9 @@ use starquake_services::framework::{
 use starquake_trace::HostNanos;
 
 use crate::gpu::low_byte;
-use crate::native::layout::{WORD_BLOCK_HEIGHT, WORD_EXTENT, WORD_FORMAT, WORD_PITCH, extent};
+use crate::native::layout::{
+    FORMAT_RGB10A2, FORMAT_RGBA8, WORD_BLOCK_HEIGHT, WORD_EXTENT, WORD_FORMAT, WORD_PITCH, extent,
+};
 use crate::shared::present::{NewFrame, QueueError, Refresh, RegisterError, slot_bit, write_slots};
 use crate::shared::vsync::MAX_LISTENERS;
 use crate::shared::{Locked, Shared};
@@ -495,8 +497,8 @@ pub const PRESENT_LAYOUT: u32 = 3;
 /// `image->preference[4] == 7` ("the backend's 16-GOB block height" in its comment).
 pub const PRESENT_BLOCK_HEIGHT: u32 = 7;
 /// The formats (preference word 6) a presented image may have: PR `image->preference[6] == 1 ||
-/// image->preference[6] == 4` (spec: 1 RGBA8, 4 RGB10A2).
-pub const PRESENT_FORMATS: [u32; 2] = [1, 4];
+/// image->preference[6] == 4` (spec: 1 RGBA8, 4 RGB10A2), the two 429 already takes.
+pub const PRESENT_FORMATS: [u32; 2] = [FORMAT_RGBA8, FORMAT_RGB10A2];
 /// The 229 request word that holds the layout (PR `packet[8]`), the last word before the fence
 /// that 229 reads.
 pub const PRESENT_WORD_LAYOUT: usize = 8;

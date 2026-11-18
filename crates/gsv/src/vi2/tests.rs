@@ -10,6 +10,7 @@
 //! at word 3, the group at 4), which the tests write as they are. Replies are compared as whole
 //! message buffers.
 
+mod present;
 mod saved;
 
 use std::sync::Arc;
