@@ -21,6 +21,8 @@ use starquake_core::report::{ThreadPc, ThreadPcState};
 use starquake_core::{ExitReason, RunReport, exit_code};
 use starquake_testkit::programs;
 
+mod common;
+
 /// Helpers, in a `cfg(test)` module so they may unwrap like the tests do.
 #[cfg(test)]
 mod support {
@@ -65,8 +67,8 @@ mod support {
         }
     }
 
-    /// `run <program> --artifacts <folder>/artifacts`, plus `extra`; returns what it printed and
-    /// the artifacts folder.
+    /// `run <program> --artifacts <folder>/artifacts --date <the pinned date>`, plus `extra`;
+    /// returns what it printed and the artifacts folder.
     pub(crate) fn run(program: &Path, extra: &[&str]) -> (Ran, PathBuf) {
         let artifacts = program.parent().unwrap().join("artifacts");
         let mut args: Vec<OsString> = vec![
@@ -75,6 +77,7 @@ mod support {
             "--artifacts".into(),
             artifacts.clone().into(),
         ];
+        args.extend(common::pinned_date());
         args.extend(extra.iter().map(OsString::from));
         (starquake(&args.iter().collect::<Vec<_>>()), artifacts)
     }
@@ -142,6 +145,8 @@ fn a_program_file_that_does_not_exist_is_an_emulator_error_with_a_summary() {
     let summary = json(&artifacts, SUMMARY_FILE);
     assert_eq!(summary["exit_reason"], "emulator_error");
     assert_eq!(summary["exit_code"], 2);
+    // Nothing ran, so no date was read.
+    assert_eq!(summary["date"], serde_json::Value::Null);
     assert_eq!(text(&artifacts, TRACE_FILE), "");
 }
 
@@ -342,6 +347,15 @@ fn hello_exits_with_code_0_and_leaves_its_output_and_trace() {
     assert_eq!(summary["system_calls"]["OutputDebugString"], 2);
     assert_eq!(summary["system_calls"]["ExitProcess"], 1);
     assert_eq!(summary["guest_log_lines"], 2);
+    // The date the run pinned, and that it was pinned.
+    let [_, seconds] = common::pinned_date();
+    assert_eq!(
+        summary["date"],
+        serde_json::json!({
+            "rtc_at_boot": seconds.to_str().unwrap().parse::<i64>().unwrap(),
+            "source": "pinned",
+        })
+    );
     let trace = text(&artifacts, TRACE_FILE);
     assert!(
         trace.starts_with("thread 1\n  lifecycle ProcessStart 1\n"),
@@ -352,6 +366,43 @@ fn hello_exits_with_code_0_and_leaves_its_output_and_trace() {
     let events = starquake_trace::Dump::from_bytes(&dump).unwrap().merged();
     // Start, two lines each with its call, the exit call, and the exit.
     assert_eq!(events.len(), 7);
+}
+
+/// The one run here that does not pin a date: it reads the host's, and its summary says which
+/// date that was, so the run can be pinned to it again.
+#[test]
+fn a_run_without_a_date_reads_the_hosts_and_its_summary_says_which() {
+    if !can_run_guests() {
+        return;
+    }
+    let host_seconds = || {
+        let since = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        i64::try_from(since.as_secs()).unwrap()
+    };
+    let folder = scratch("host-date");
+    let hello = program(&folder, "hello.nro", &programs::hello().unwrap());
+    let artifacts = folder.join("artifacts");
+    let args: Vec<OsString> = vec![
+        "run".into(),
+        hello.into(),
+        "--artifacts".into(),
+        artifacts.clone().into(),
+        "--until".into(),
+        "timeout=30s".into(),
+    ];
+    let before = host_seconds();
+    let ran = starquake(&args.iter().collect::<Vec<_>>());
+    let after = host_seconds();
+    assert_eq!(ran.code, exit_code::STOP_CONDITION, "{}", ran.stdout);
+    let date = &json(&artifacts, SUMMARY_FILE)["date"];
+    assert_eq!(date["source"], "host");
+    let seconds = date["rtc_at_boot"].as_i64().unwrap();
+    assert!(
+        before <= seconds && seconds <= after,
+        "{before} {seconds} {after}"
+    );
 }
 
 #[test]
@@ -524,6 +575,7 @@ fn the_process_exit_status_is_the_runs_exit_code() {
         .arg(&file)
         .args(["--until", "timeout=30s", "--artifacts"])
         .arg(&artifacts)
+        .args(common::pinned_date())
         .output()
         .unwrap();
     assert_eq!(

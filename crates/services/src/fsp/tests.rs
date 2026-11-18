@@ -13,7 +13,7 @@ use starquake_ipc::{
 use starquake_kernel::handle::Handle;
 use starquake_kernel::id::ObjectId;
 use starquake_kernel::result::{KernelError, ResultCode};
-use starquake_trace::{EnvCall, EnvError, HostIoReply, HostIoRequest, HostNanos};
+use starquake_trace::{EnvCall, EnvError, HostIoReply, HostIoRequest, HostNanos, UnixSeconds};
 
 use super::host::{CHANNEL, HostFailure, HostRequest, Mount};
 use super::*;
@@ -200,6 +200,10 @@ impl Env for FakeEnv {
             Some((kind, answer)) if *kind == Asked::of(&decoded) => answer.clone(),
             _ => Ok(host.answer(&decoded)),
         }
+    }
+
+    fn wall_clock(&self) -> Result<UnixSeconds, EnvError> {
+        Ok(UnixSeconds(0))
     }
 }
 
@@ -743,6 +747,10 @@ impl Env for NoHost {
 
     fn host_io(&self, _: &HostIoRequest) -> Result<HostIoReply, EnvError> {
         Ok(HostIoReply::Unavailable)
+    }
+
+    fn wall_clock(&self) -> Result<UnixSeconds, EnvError> {
+        Ok(UnixSeconds(0))
     }
 }
 

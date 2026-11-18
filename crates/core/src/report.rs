@@ -11,7 +11,8 @@ use std::time::Duration;
 
 use serde::Serialize;
 use starquake_kernel::sched::ThreadState;
-use starquake_trace::Dump;
+use starquake_services::time::RtcAtBoot;
+use starquake_trace::{Dump, UnixSeconds};
 
 use crate::crash::{CrashReport, Location, Module, address_text};
 use crate::services_report::{ServicesReport, StubbedCommand};
@@ -38,7 +39,9 @@ pub mod exit_code {
 ///
 /// 2: `service_commands` is filled in, and `service_commands_uncounted`, `stubbed_commands`,
 /// `unknown_services`, `host_log_lines` and `host_log_lines_dropped` are added.
-pub const SUMMARY_VERSION: u32 = 2;
+///
+/// 3: `date` is added ([`RunDate`]).
+pub const SUMMARY_VERSION: u32 = 3;
 
 /// Bytes of guest log text a run keeps (`guest_log.txt`), and of the emulator's own warnings
 /// (`log.txt`, [`crate::host_log`]): whole lines from the first while their total fits.
@@ -61,6 +64,47 @@ pub struct RunOptions {
     /// `OpenDataStorageByCurrentProcess`), from the narrow title API (`crate::title::open`).
     /// `None`: the run has no data storage.
     pub romfs: Option<crate::title::RomFs>,
+    /// Where the run's date comes from: the host's wall clock, read once as the run boots and
+    /// recorded ([`RtcAtBoot::Host`]), or a pinned date (`--date`). The default pins Eden's
+    /// ([`RtcAtBoot::eden_default`]), so a run that does not say, as a test does not, has a date
+    /// that does not depend on the host (`starquake_services::time`, "The run's date").
+    pub rtc: RtcAtBoot,
+}
+
+/// The date a run's clocks started from, and where it came from: what `summary.json` keeps as
+/// `date`, so the date a run read from the host can be pinned again with `--date` to reproduce
+/// it (`starquake_services::time`, "The run's date").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct RunDate {
+    /// The RTC at uptime zero, in seconds since 1970-01-01T00:00:00 UTC.
+    pub rtc_at_boot: UnixSeconds,
+    /// Whether it was read from the host or pinned.
+    pub source: DateSource,
+}
+
+impl RunDate {
+    /// The date `rtc` asked for, which came to the RTC at boot `rtc_at_boot`.
+    #[must_use]
+    pub const fn new(rtc: RtcAtBoot, rtc_at_boot: UnixSeconds) -> Self {
+        Self {
+            rtc_at_boot,
+            source: match rtc {
+                RtcAtBoot::Host => DateSource::Host,
+                RtcAtBoot::Pinned(_) => DateSource::Pinned,
+            },
+        }
+    }
+}
+
+/// Where a run's date came from ([`RunDate::source`]), written in `summary.json` as `host` or
+/// `pinned`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DateSource {
+    /// Read once from the host's wall clock as the run booted ([`RtcAtBoot::Host`]).
+    Host,
+    /// Pinned by the run's settings ([`RtcAtBoot::Pinned`], `--date`).
+    Pinned,
 }
 
 /// How a run ended.
@@ -263,6 +307,10 @@ pub struct RunReport {
     pub host_log: Vec<String>,
     /// How many later lines of the emulator's log were not kept because the limit was reached.
     pub host_log_dropped: u64,
+    /// The date the run's clocks started from, read as the run booted. `None` when the run
+    /// ended before it was read: the program could not be loaded or the kernel set up, or the
+    /// read itself failed.
+    pub date: Option<RunDate>,
 }
 
 impl RunReport {
@@ -287,6 +335,7 @@ impl RunReport {
             services: ServicesReport::default(),
             host_log: Vec::new(),
             host_log_dropped: 0,
+            date: None,
         }
     }
 
@@ -336,6 +385,7 @@ impl RunReport {
             events_error: self.events_error.as_ref(),
             patched_counter_reads: self.patched_counter_reads.len(),
             threads: &self.threads,
+            date: self.date,
         }
     }
 }
@@ -402,6 +452,9 @@ pub struct Summary<'a> {
     /// For a run that ended at its timeout, where each guest thread was ([`ThreadPc`]); empty
     /// otherwise.
     pub threads: &'a [ThreadPc],
+    /// The date the run's clocks started from and where it came from ([`RunDate`]); `null` when
+    /// the run ended before it was read.
+    pub date: Option<RunDate>,
 }
 
 #[cfg(test)]
@@ -483,12 +536,13 @@ mod tests {
             },
             host_log: vec!["WARN a".to_owned(), "ERROR b".to_owned()],
             host_log_dropped: 10,
+            date: Some(RunDate::new(RtcAtBoot::Host, UnixSeconds(1_709_164_811))),
         };
         let json = serde_json::to_string_pretty(&report.summary()).unwrap();
         assert_eq!(
             json,
             r#"{
-  "version": 2,
+  "version": 3,
   "exit_reason": "emulator_error",
   "exit_code": 2,
   "message": "the vCPU failed",
@@ -526,7 +580,11 @@ mod tests {
   "trace_events_dropped": 9,
   "events_error": "the dump could not be encoded",
   "patched_counter_reads": 2,
-  "threads": []
+  "threads": [],
+  "date": {
+    "rtc_at_boot": 1709164811,
+    "source": "host"
+  }
 }"#
         );
         assert_eq!(report.summary().version, SUMMARY_VERSION);
@@ -652,6 +710,43 @@ mod tests {
         assert_eq!(report.summary().message, Some(&"no backend".to_owned()));
         assert_eq!(report.trace, "");
         assert_eq!(Dump::from_bytes(&report.events), Ok(Dump::new(Vec::new())));
+        // It never read a date.
+        assert_eq!(report.date, None);
+        let json = serde_json::to_value(report.summary()).unwrap();
+        assert_eq!(json["date"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn a_runs_date_says_where_it_came_from() {
+        // The RTC is the reading, not the pinned value `RtcAtBoot` carries: the two differ here
+        // so a date taken from the wrong one shows.
+        let cases = [
+            (RtcAtBoot::Host, 1_709_164_811, DateSource::Host, "host"),
+            (
+                RtcAtBoot::Pinned(UnixSeconds(-3)),
+                -86_399,
+                DateSource::Pinned,
+                "pinned",
+            ),
+        ];
+        for (rtc, seconds, source, name) in cases {
+            let date = RunDate::new(rtc, UnixSeconds(seconds));
+            assert_eq!(
+                date,
+                RunDate {
+                    rtc_at_boot: UnixSeconds(seconds),
+                    source,
+                }
+            );
+            let report = RunReport {
+                date: Some(date),
+                ..RunReport::emulator_error(String::new(), Duration::ZERO)
+            };
+            assert_eq!(
+                serde_json::to_string(&report.summary().date).unwrap(),
+                format!(r#"{{"rtc_at_boot":{seconds},"source":"{name}"}}"#)
+            );
+        }
     }
 
     #[test]

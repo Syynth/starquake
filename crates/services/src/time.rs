@@ -64,7 +64,7 @@
 //! - **The steady clock's base** is the RTC at uptime zero, in nanoseconds
 //!   (`StandardSteadyClockResource::SetCurrentTime`: `boot_time = rtc_time_s * one_second_ns -
 //!   uptime`), so the steady clock reads the RTC's seconds plus the uptime. The RTC is the run's
-//!   [`TimeSettings::rtc_at_boot`] (module docs, "Where this differs from Eden").
+//!   [`TimeSettings::rtc_at_boot`] ("The run's date", below).
 //! - **The local system clock's context** is set from the current time
 //!   (`StandardLocalSystemClockCore::Initialize` with no saved context: `SetCurrentTime(time)`,
 //!   whose `offset = time - steady_time_point`), where Eden's current time is the RTC
@@ -83,20 +83,40 @@
 //! (`SetupStandardSteadyClockCore`'s `GetRawTime` and `GetClockTicks`,
 //! `SetContinuousAdjustment`, and the local clock's `GetCurrentTimePoint`). The one reading here
 //! stands for those later reads. The earlier one is not needed: it only turns the host's RTC
-//! into a base at uptime zero, and here the RTC is a setting at uptime zero already
-//! ([`TimeSettings::rtc_at_boot`]).
+//! into a base at uptime zero, and here the RTC is given at uptime zero already
+//! ([`TimeSettings::rtc_at_boot`], "The run's date").
+//!
+//! # The run's date
+//!
+//! The RTC at uptime zero ([`TimeSettings::rtc_at_boot`]) is the host's date, read once as the
+//! run boots, unless a setting pins a date (decision log, 2026-11-17, "The run's date comes from
+//! the host, recorded"; `docs/specs/observability.md`, rule 1). [`RtcAtBoot`] says which, and
+//! [`TimeSettings::at_boot`] turns it into the settings: [`RtcAtBoot::Host`] reads the
+//! environment's wall clock ([`Env::wall_clock`]) once, which a live environment records and a
+//! replay feeds back, and [`RtcAtBoot::Pinned`] reads nothing. Tests always pin a date:
+//! [`TimeSettings::eden_default`] and [`RtcAtBoot::eden_default`] (which is also
+//! [`RtcAtBoot`]'s `Default`) pin the first second of Eden's `standard_user_clock_initial_year`
+//! (2023). `starquake-core` reads the date before it installs the services, from the run's
+//! settings (its `RunOptions`), and a failure to read it is an emulator error that ends the run
+//! before the guest runs (decision log, 2026-11-17, "Env failures"). `time:u` owns turning the
+//! RTC and the uptime into calendar time ([`set_up`], [`calendar`]); the kernel keeps owning
+//! ticks ([`Uptime`]).
 //!
 //! # Where this differs from Eden
 //!
 //! Each difference is pinned by the test named, in `time/tests.rs`:
 //!
-//! - **The RTC is a setting, not the host's clock.** Eden reads the host's wall clock
-//!   (`std::chrono::system_clock::now()`, plus `custom_rtc_offset`). The environment has no wall
-//!   clock, and nothing else may read the host's, so the run states the RTC at uptime zero
-//!   ([`TimeSettings::rtc_at_boot`]); [`TimeSettings::eden_default`] uses the first second of
-//!   Eden's `standard_user_clock_initial_year` (2023), the time Eden's clocks start from when the
-//!   host's clock is not used (`GetEpochTimeFromInitialYear`)
-//!   (`the_clocks_follow_the_settings_and_the_environment`).
+//! - **The host's date is read once, before the uptime starts to count, and a run can pin it.**
+//!   Eden reads the host's wall clock (`GetTimeInSeconds` in `glue/time/
+//!   standard_steady_clock_resource.cpp`: `system_clock::now()`, plus `custom_rtc_offset` when
+//!   `custom_rtc_enabled`) each time it sets the steady clock's base, and subtracts the uptime of
+//!   that moment. Here the one reading taken at boot is the RTC at uptime zero: the time between
+//!   guest tick zero and the reading (the run's boot, before the guest runs) is not subtracted, so
+//!   the RTC is later than Eden's by that much, which is less than a second on a normal boot
+//!   (a guess: nothing here measures it). Eden pins a date as an offset from the host's clock
+//!   (`custom_rtc_offset`); here a pinned date is the RTC itself, and the host's clock is not
+//!   read (`a_pinned_date_wins_over_the_hosts_and_reads_nothing`,
+//!   `the_hosts_date_is_the_rtc_at_boot`).
 //! - **The clocks are set up at the first request for the memory**, not at start-up (above).
 //!   Only the context's steady time point and the continuous adjustment's `rtc_offset` record
 //!   when that was; what the clocks read does not change
@@ -145,7 +165,7 @@ use serde::{Deserialize, Serialize};
 use starquake_kernel::id::ObjectId;
 use starquake_kernel::memory::SvcPermission;
 use starquake_kernel::result::{KernelError, ResultCode};
-use starquake_trace::{Env, HostNanos};
+use starquake_trace::{Env, EnvError, HostNanos, UnixSeconds};
 
 use crate::commands;
 use crate::framework::result::code;
@@ -183,6 +203,19 @@ pub const FAILED: ResultCode = code(TIME_MODULE, 801);
 /// Nanoseconds in a second.
 pub const NANOSECONDS_PER_SECOND: i64 = 1_000_000_000;
 
+/// The first RTC at boot, in seconds since 1970-01-01T00:00:00 UTC, whose nanoseconds fit an
+/// `i64`: the earliest base [`set_up`] can make (-9223372036, about 292 years before 1970). An
+/// earlier one is [`OVERFLOW`] at the guest's first request for the memory.
+pub const FIRST_RTC_AT_BOOT: i64 = i64::MIN / NANOSECONDS_PER_SECOND;
+
+/// The last RTC at boot, in seconds since 1970-01-01T00:00:00 UTC, whose nanoseconds fit an
+/// `i64`: the latest base [`set_up`] can make (9223372036, about 292 years after 1970). A later
+/// one is [`OVERFLOW`] at the guest's first request for the memory. At this one the base leaves
+/// `i64::MAX - LAST_RTC_AT_BOOT * NANOSECONDS_PER_SECOND` nanoseconds (854775807, under a
+/// second) for the uptime, so a guest that first asks for the memory later than that after
+/// tick zero is answered [`OVERFLOW`] too (`a_base_past_the_nanoseconds_an_i64_holds_is_an_overflow`).
+pub const LAST_RTC_AT_BOOT: i64 = i64::MAX / NANOSECONDS_PER_SECOND;
+
 /// The ids of the commands ported here, per interface (Eden's tables).
 pub mod command {
     /// `time:u`'s commands (`StaticService::StaticService`).
@@ -210,6 +243,34 @@ pub mod command {
     }
 }
 
+/// Where a run's RTC at boot comes from (module docs, "The run's date").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RtcAtBoot {
+    /// The host's date: one reading of the environment's wall clock ([`Env::wall_clock`]), taken
+    /// as the run boots and recorded, so a replay reproduces it.
+    Host,
+    /// A pinned date: the RTC at uptime zero is this, and the host's clock is not read.
+    Pinned(UnixSeconds),
+}
+
+impl RtcAtBoot {
+    /// The date tests pin: [`TimeSettings::EDEN_INITIAL_YEAR_START`], as
+    /// [`TimeSettings::eden_default`] does.
+    #[must_use]
+    pub const fn eden_default() -> Self {
+        Self::Pinned(UnixSeconds(TimeSettings::EDEN_INITIAL_YEAR_START))
+    }
+}
+
+impl Default for RtcAtBoot {
+    /// [`RtcAtBoot::eden_default`], a pinned date: a run that does not say gets a date that does
+    /// not depend on the host. The command line asks for [`RtcAtBoot::Host`] unless it is given
+    /// a date.
+    fn default() -> Self {
+        Self::eden_default()
+    }
+}
+
 /// The time a run's clocks start from (module docs, "The clocks").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TimeSettings {
@@ -231,10 +292,28 @@ impl TimeSettings {
     /// `user_system_clock_automatic_correction_enabled = true`).
     #[must_use]
     pub const fn eden_default() -> Self {
+        Self::with_rtc(UnixSeconds(Self::EDEN_INITIAL_YEAR_START))
+    }
+
+    /// Eden's defaults with the RTC at uptime zero `rtc`: the one place a wall-clock reading
+    /// becomes the RTC.
+    #[must_use]
+    pub const fn with_rtc(rtc: UnixSeconds) -> Self {
         Self {
-            rtc_at_boot: Self::EDEN_INITIAL_YEAR_START,
+            rtc_at_boot: rtc.0,
             automatic_correction: true,
         }
+    }
+
+    /// The settings a run boots with: Eden's defaults, with the RTC `rtc` says (module docs,
+    /// "The run's date"). [`RtcAtBoot::Host`] reads `env`'s wall clock once and
+    /// [`RtcAtBoot::Pinned`] reads nothing. The error is the environment's, which ends the run.
+    pub fn at_boot(rtc: RtcAtBoot, env: &dyn Env) -> Result<Self, EnvError> {
+        let rtc = match rtc {
+            RtcAtBoot::Pinned(date) => date,
+            RtcAtBoot::Host => env.wall_clock()?,
+        };
+        Ok(Self::with_rtc(rtc))
     }
 }
 

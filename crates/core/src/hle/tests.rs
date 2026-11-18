@@ -375,6 +375,46 @@ fn the_service_manager_is_on_its_port_and_set_sys_on_none() {
     assert_eq!(ipc.port(&PortName::new(fsp::NAME).unwrap()), None);
 }
 
+/// The settings `time:u`'s server was installed with on `dispatcher`, if it was.
+fn time_settings(dispatcher: &Dispatcher) -> Option<TimeSettings> {
+    let mut settings = None;
+    dispatcher.inspect_handlers(|service, handler| {
+        let handler: &dyn core::any::Any = handler;
+        if service == TIME_U {
+            settings = handler
+                .downcast_ref::<starquake_services::framework::Server>()
+                .and_then(|server| server.family::<time::Clocks>())
+                .map(|clocks| *clocks.settings());
+        }
+    });
+    settings
+}
+
+#[test]
+fn install_and_the_installs_built_on_it_keep_edens_pinned_date() {
+    // `install` goes through `install_with_guest_log` and `install_with_graphics`, which give
+    // `install_with_clocks` Eden's defaults.
+    let pinned = dispatcher();
+    install_with(&pinned, no_host()).unwrap();
+    assert_eq!(time_settings(&pinned), Some(TimeSettings::eden_default()));
+    // `install_with_clocks` installs the settings it is given instead.
+    let given_to = dispatcher();
+    let env = no_host();
+    let reads = reads_on(Arc::clone(&env), &Arc::default());
+    let graphics = Graphics::new(FrontMode::Live, None);
+    let given = TimeSettings::with_rtc(starquake_trace::UnixSeconds(-86_399));
+    install_with_clocks(
+        &given_to,
+        env,
+        reads,
+        Arc::new(NoGuestLog),
+        &graphics,
+        given,
+    )
+    .unwrap();
+    assert_eq!(time_settings(&given_to), Some(given));
+}
+
 #[test]
 fn installing_twice_is_refused_by_the_kernel() {
     let dispatcher = dispatcher();

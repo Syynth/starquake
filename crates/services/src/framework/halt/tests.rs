@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use starquake_ipc::{BUFFER_SIZE, Body, CommandType, Message, RequestBuilder, SessionKind};
 use starquake_kernel::id::ObjectId;
 use starquake_kernel::result::ResultCode;
-use starquake_trace::{EnvCall, EnvError, HostIoReply, HostIoRequest, HostNanos};
+use starquake_trace::{EnvCall, EnvError, HostIoReply, HostIoRequest, HostNanos, UnixSeconds};
 
 use super::*;
 use crate::commands;
@@ -25,6 +25,7 @@ mod probe {
     pub(super) const HOST_IO: u32 = 2;
     pub(super) const IGNORE: u32 = 3;
     pub(super) const COUNT_TOLD: u32 = 4;
+    pub(super) const WALL_CLOCK: u32 = 5;
 }
 
 /// The host I/O request the toy sends: distinct non-zero values.
@@ -70,6 +71,7 @@ commands! {
         probe::HOST_IO => host_io,
         probe::IGNORE => ignore,
         probe::COUNT_TOLD => count_told,
+        probe::WALL_CLOCK => wall_clock,
     }
 }
 
@@ -78,6 +80,18 @@ impl Probe {
     fn now(_: &mut Self, cx: &mut Context<'_>, _: &Request<'_>, reply: &mut Reply) -> Outcome {
         let reading = cx.env()?.now()?;
         reply.payload().write_u64(reading.0);
+        reply.ok()
+    }
+
+    /// out: `i64` the wall clock's reading.
+    fn wall_clock(
+        _: &mut Self,
+        cx: &mut Context<'_>,
+        _: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        let reading = cx.env()?.wall_clock()?;
+        reply.payload().write_i64(reading.0);
         reply.ok()
     }
 
@@ -126,6 +140,7 @@ struct Fixed {
     now: Result<HostNanos, EnvError>,
     random: Result<u64, EnvError>,
     host_io: Result<HostIoReply, EnvError>,
+    wall_clock: Result<UnixSeconds, EnvError>,
 }
 
 impl Env for Fixed {
@@ -140,6 +155,10 @@ impl Env for Fixed {
     fn host_io(&self, request: &HostIoRequest) -> Result<HostIoReply, EnvError> {
         assert_eq!(request, &toy_request());
         self.host_io.clone()
+    }
+
+    fn wall_clock(&self) -> Result<UnixSeconds, EnvError> {
+        self.wall_clock.clone()
     }
 }
 
@@ -163,12 +182,21 @@ fn host_io_failed() -> EnvError {
     EnvError::HostIoRequestMismatch { index: 7 }
 }
 
+fn wall_clock_failed() -> EnvError {
+    EnvError::Mismatch {
+        index: 9,
+        requested: EnvCall::WallClock,
+        recorded: EnvCall::Clock,
+    }
+}
+
 /// An environment that fails every call, each with its own error.
 fn failing() -> Fixed {
     Fixed {
         now: Err(now_failed()),
         random: Err(random_failed()),
         host_io: Err(host_io_failed()),
+        wall_clock: Err(wall_clock_failed()),
     }
 }
 
@@ -178,6 +206,7 @@ fn answering(host_io: HostIoReply) -> Fixed {
         now: Ok(HostNanos(0x1234_5678_9ABC)),
         random: Ok(0x0FED_CBA9_8765_4321),
         host_io: Ok(host_io),
+        wall_clock: Ok(UnixSeconds(-0x0123_4567_89AB)),
     }
 }
 
@@ -243,13 +272,14 @@ fn handler(service: &str, error: EnvError) -> Stop {
 
 #[test]
 fn every_call_that_fails_tells_the_halt_once() {
-    // Each of the three calls, on two servers with different names: the stop names the server
+    // Each of the four calls, on two servers with different names: the stop names the server
     // that read the environment, and carries exactly the error the call got. The request is
     // answered as one the server gave up on.
     let cases = [
         (probe::NOW, now_failed()),
         (probe::RANDOM, random_failed()),
         (probe::HOST_IO, host_io_failed()),
+        (probe::WALL_CLOCK, wall_clock_failed()),
     ];
     for name in ["halt:a", "clock:b"] {
         for (command, error) in cases.clone() {
@@ -274,6 +304,9 @@ fn answers_pass_through_and_tell_nothing() {
     let (result, data) = rig.send(probe::HOST_IO);
     assert_eq!(result, ResultCode::SUCCESS);
     assert_eq!(data[..3], [9, 8, 7]);
+    let (result, data) = rig.send(probe::WALL_CLOCK);
+    assert_eq!(result, ResultCode::SUCCESS);
+    assert_eq!(data, (-0x0123_4567_89AB_i64).to_le_bytes());
     assert_eq!(rig.stops(), []);
 }
 
@@ -313,6 +346,7 @@ fn every_environment_error_answers_as_a_request_given_up_on() {
         now_failed(),
         random_failed(),
         host_io_failed(),
+        wall_clock_failed(),
         EnvError::Unconsumed {
             index: 2,
             remaining: 4,

@@ -622,6 +622,7 @@ fn a_run_whose_threads_all_wait_on_nothing_that_can_end_is_an_emulator_error() {
         command_line: Vec::new(),
         sd_card: None,
         romfs: None,
+        rtc: RtcAtBoot::eden_default(),
     };
     let report = guest.run(main, &options);
     assert_eq!(report.exit, ExitReason::EmulatorError(WAITING.to_owned()));
@@ -739,6 +740,7 @@ fn the_runs_timeout_stops_every_core() {
                 command_line: Vec::new(),
                 sd_card: None,
                 romfs: None,
+                rtc: RtcAtBoot::eden_default(),
             },
             Instant::now(),
             timebase(),
