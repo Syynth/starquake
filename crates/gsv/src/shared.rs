@@ -88,13 +88,14 @@
 //! turn's time, which answers the shared page's requests ([`page`], "When a request is
 //! answered"), and sleeps no later than [`Shared::page_deadline`].
 //!
-//! # The timer thread, until the wiring
+//! # The timer thread
 //!
-//! The core loop's timer thread (kernel slice 10, `starquake-core`) does not call
-//! [`Shared::drain`] yet; the wiring slice (16) makes it do so each turn and when the queue's
-//! [`Wake`](crate::completion::Wake) rings it, with a [`TimerHost`] that records through the
-//! kernel and unlocks through `Dispatcher::unlock_device_share`. Until then tests play the
-//! timer thread with a fake host.
+//! In a run the core loop's timer thread (`starquake-core`'s `machine/timer.rs`) calls
+//! [`Shared::drain`], then [`Shared::tick_page`], each turn, and is rung by the queue's
+//! [`Wake`](crate::completion::Wake), with a [`TimerHost`] over the kernel's dispatcher that
+//! records through `Dispatcher::record_host_event` and unlocks through
+//! `Dispatcher::unlock_device_share` (`starquake-core`'s `hle::graphics`, the wiring slice, 16).
+//! This crate's tests play the timer thread with a fake host.
 //!
 //! # Snapshot format
 //!

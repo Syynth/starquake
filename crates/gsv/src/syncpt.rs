@@ -23,9 +23,9 @@
 //! keyed by slot event, because the timer thread fires them ([`crate::shared::Shared::drain`]).
 //! The family state ([`SyncptFamily`]) is the handle to gsv's shared state, nothing else.
 //!
-//! The root does not hand this server's sessions out yet: its 202 is still a logged stub
-//! returning a placeholder ([`crate::root`], "Stubs"), as its 1402 is for nvsrv. Pointing 202 at
-//! this server needs the server's number in the root, which the wiring (slice 16) gives.
+//! The root hands this server's sessions out with 202 once it is given the server's number
+//! ([`crate::root::RootState::with_syncpt_server`]; [`crate::root`], "The family sessions"),
+//! which the wiring (slice 16, `starquake-core`'s `hle::graphics`) does in a run.
 //!
 //! # Commands
 //!
