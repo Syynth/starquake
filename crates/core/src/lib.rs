@@ -78,7 +78,7 @@ mod space;
 pub mod system;
 pub mod title;
 
-pub use image::LoadError;
+pub use image::{LoadError, MEMORY_BLOCK_UNIT_SIZE, SYSTEM_RESOURCE_SIZE_MAX, SystemResourceFault};
 pub use report::{
     ExitReason, Mapping, RunOptions, RunReport, Summary, ThreadPc, ThreadPcState, exit_code,
 };

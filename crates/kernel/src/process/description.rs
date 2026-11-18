@@ -35,6 +35,7 @@
 
 use thiserror::Error;
 
+use crate::memory::{Pool, SystemResource};
 use crate::result::KernelError;
 use crate::sched::{AffinityMask, CoreId, LOWEST_THREAD_PRIORITY, MAX_CORES, Priority};
 use crate::time::CounterRate;
@@ -160,12 +161,14 @@ pub struct ProcessDescription {
     pub main_thread_core: u8,
     /// Bytes of the main thread's stack.
     pub main_thread_stack_size: u64,
-    /// Bytes of the system resource.
+    /// Bytes of the system resource, as the metadata records them (`META` 0x14).
     pub system_resource_size: u32,
     /// The handle table's size; zero or less means the maximum (`KHandleTable::Initialize`).
     pub handle_table_size: i32,
     /// The console it was built for.
     pub console: Console,
+    /// The pool it draws from, as its `ACID` names it (`metadata.GetPoolPartition()`).
+    pub pool: Pool,
 }
 
 impl ProcessDescription {
@@ -173,8 +176,9 @@ impl ProcessDescription {
     /// (`ProgramMetadata::GetDefault`, `eden/src/core/file_sys/program_metadata.cpp` @
     /// cf654052): cores 0-3, priorities 16-63 (capability `0x30043F7`), the main thread at
     /// priority 44 (`0x2c`) on core 0 with a 1 MiB stack, program id zero, no system resource,
-    /// a 39-bit address space and the largest handle table. The console is the caller's: an
-    /// NRO does not say which it was built for.
+    /// a 39-bit address space, the largest handle table and the application pool (the default
+    /// metadata's `ACID` is zero, and pool 0 is `Application`). The console is the caller's:
+    /// an NRO does not say which it was built for.
     #[must_use]
     pub fn homebrew(console: Console) -> Self {
         Self {
@@ -192,7 +196,16 @@ impl ProcessDescription {
             system_resource_size: 0,
             handle_table_size: 0,
             console,
+            pool: Pool::Application,
         }
+    }
+
+    /// The system resource the description asks for: its recorded size in whole pages, in
+    /// its pool ([`SystemResource::new`]). What its process's address space must be made with
+    /// ([`crate::memory::AddressSpace::with_system_resource`]).
+    #[must_use]
+    pub const fn system_resource(&self) -> SystemResource {
+        SystemResource::new(self.system_resource_size, self.pool)
     }
 }
 
@@ -240,6 +253,7 @@ pub struct ProcessInfo {
     system_resource_size: u32,
     handle_table_size: i32,
     console: Console,
+    pool: Pool,
 }
 
 /// A mask with bits `range.first..=range.last` set; `range.last` is below 64.
@@ -300,6 +314,7 @@ impl ProcessInfo {
             system_resource_size: description.system_resource_size,
             handle_table_size: description.handle_table_size,
             console: description.console,
+            pool: description.pool,
         })
     }
 
@@ -362,10 +377,30 @@ impl ProcessInfo {
         self.main_thread_stack_size
     }
 
-    /// Bytes of the system resource.
+    /// Bytes of the system resource, as the metadata records them.
     #[must_use]
     pub const fn system_resource_size(&self) -> u32 {
         self.system_resource_size
+    }
+
+    /// Its system resource ([`ProcessDescription::system_resource`]).
+    #[must_use]
+    pub const fn system_resource(&self) -> SystemResource {
+        SystemResource::new(self.system_resource_size, self.pool)
+    }
+
+    /// The pool it draws from.
+    #[must_use]
+    pub const fn pool(&self) -> Pool {
+        self.pool
+    }
+
+    /// Whether it is an application (`KProcess::IsApplication`): `LoadFromMetadata` sets it
+    /// when the pool is the application pool (`pool == KMemoryManager::Pool::Application`,
+    /// `eden/src/core/hle/kernel/k_process.cpp` @ cf654052).
+    #[must_use]
+    pub const fn is_application(&self) -> bool {
+        matches!(self.pool, Pool::Application)
     }
 
     /// The handle table's size, as [`crate::handle::HandleTable::new`] takes it.
@@ -420,6 +455,37 @@ mod tests {
         assert_eq!(info.main_thread_priority().get(), 44);
         assert_eq!(info.ideal_core(), 0);
         assert_eq!(info.process_id(), 0x51);
+        // `GetDefault`: no system resource, and a zero `ACID`, whose pool is the application's.
+        assert_eq!(description.system_resource_size, 0);
+        assert_eq!(description.pool, Pool::Application);
+        assert_eq!(info.system_resource(), SystemResource::NONE);
+        assert!(info.is_application());
+    }
+
+    #[test]
+    fn only_a_process_of_the_application_pool_is_an_application() {
+        for pool in Pool::ALL {
+            let mut description = homebrew();
+            description.pool = pool;
+            let info = ProcessInfo::new(&description, 1).unwrap();
+            assert_eq!(info.pool(), pool);
+            assert_eq!(info.is_application(), pool == Pool::Application, "{pool:?}");
+        }
+    }
+
+    #[test]
+    fn the_system_resource_is_the_recorded_size_in_whole_pages_in_the_process_s_pool() {
+        let page = u32::try_from(starquake_memory::PAGE_SIZE).unwrap();
+        for pool in Pool::ALL {
+            let mut description = homebrew();
+            description.pool = pool;
+            description.system_resource_size = 3 * page + 5;
+            let expected = SystemResource::new(3 * page, pool);
+            assert_eq!(description.system_resource(), expected);
+            let info = ProcessInfo::new(&description, 1).unwrap();
+            assert_eq!(info.system_resource(), expected);
+            assert_eq!(info.system_resource_size(), 3 * page + 5);
+        }
     }
 
     #[test]

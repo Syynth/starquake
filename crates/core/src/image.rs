@@ -55,9 +55,15 @@
 //! | address space | `META` flags bits 1-3 | `GetAddressSpaceType` |
 //! | cores, priorities | the `ACI0` kernel capabilities' thread info | `Initialize(kernel, params, metadata.GetKernelCapabilities(), ...)`, the `ACI0` list (`aci_kernel_capabilities`) |
 //! | main thread priority and core, stack size | `META` 0xE, 0xF, 0x1C | `LoadParameters{GetMainThreadPriority(), GetMainThreadStackSize()}`, `m_ideal_core_id = metadata.GetMainThreadCore()` |
-//! | system resource size | `META` 0x14 | `system_resource_num_pages = GetSystemResourceSize() / PageSize` |
+//! | system resource size | `META` 0x14, after Horizon's loader's checks (below) | `system_resource_num_pages = GetSystemResourceSize() / PageSize` |
 //! | handle table size | the `ACI0` handle-table capability, zero without one | `KCapabilities::SetHandleTableCapability`; `m_handle_table_size = 0` before the list is read |
 //! | console | Switch 2 when the `ACID` is in the Switch 2 layout | `m_uses_pauth_returns = metadata.UsesExtendedAcid()` (Eden PR #4588) |
+//! | pool | the `ACID` pool partition | `pool = static_cast<KMemoryManager::Pool>(metadata.GetPoolPartition())` |
+//!
+//! The system resource is set aside when the address space is made, as Eden's
+//! `KProcess::Initialize` does it: [`load_placed`] makes it with the description's resource
+//! (`starquake_kernel::memory::AddressSpace::with_system_resource`), which charges it to the
+//! process's memory count. Test: `every_pool_partition_is_counted_against_the_application_pool`.
 //!
 //! The console decides the counter rate (`crate::clock`), so the patcher's rate and the
 //! kernel's `GetSystemTick` follow the program's metadata, and the memory arrangement
@@ -79,14 +85,33 @@
 //!   when `metadata.Is64BitProgram()`, and `KProcess::InitializeInterfaces` then runs a process
 //!   without it under `Core::ArmDynarmic32`; starquake runs only 64-bit Arm code. Test:
 //!   `a_32_bit_program_is_refused`.
-//! - **The `ACID` pool partition is not read**, so the description does not follow
-//!   `KProcess::LoadFromMetadata` in this input. Eden sizes the process's resource limit from
-//!   `kernel.MemoryManager().GetSize(pool)`, with `pool` from `metadata.GetPoolPartition()`, and
-//!   sets `CreateProcessFlag::IsApplication` only for `KMemoryManager::Pool::Application`
-//!   (`KProcess::Initialize` then picks the application system resource, and NCE patching is
-//!   gated on it). Here the description has no such field: the resource limit is the console's
-//!   application pool whatever the partition ([`memory_arrangement`]), and no is-application
-//!   flag is kept. Test: `the_pool_partition_does_not_change_the_description`.
+//! - **The `ACID` pool partition does not size the memory count.** It is the description's
+//!   pool, which decides whether the process is an application (`GetInfo` 23) and what its
+//!   system resource charges, as in Eden; but Eden also sizes the process's resource limit from
+//!   `kernel.MemoryManager().GetSize(pool)`, and here the count is the console's application
+//!   pool whatever the partition ([`memory_arrangement`]; only that pool's size is modelled).
+//!   Test: `every_pool_partition_is_counted_against_the_application_pool`.
+//! - **A pool partition no pool has** (past `SystemNonSecure`) is [`LoadError::PoolPartition`],
+//!   checked after the thread info. Eden casts it to a `KMemoryManager::Pool` unchecked and
+//!   reads past its table of pool sizes; Horizon's loader refuses it (`R_THROW(
+//!   ldr::ResultInvalidMeta())`, the `default` of its pool switch in
+//!   `GetCreateProcessParameterFlags`; fact only,
+//!   `atmosphere/stratosphere/loader/source/ldr_process_creation.cpp` @ 4e3f3703). Test:
+//!   `each_pool_partition_names_its_pool_and_one_no_pool_has_is_refused`.
+//! - **The system resource size is checked as Horizon's loader checks it**, which Eden does
+//!   not: [`LoadError::SystemResource`], after the pool partition. In the loader's order
+//!   (`GetCreateProcessParameter`, the same file, fact only): a whole number of 2 MiB blocks
+//!   ([`MEMORY_BLOCK_UNIT_SIZE`], `ldr::ResultInvalidSize`); then, for a size that is not
+//!   zero, an address space that passes `flags & CreateProcessParameterFlag_AddressSpace64Bit39`
+//!   (a bitwise test that every type but the 32-bit one passes), an `ACI0` program type that
+//!   is an application or an applet, and at most [`SYSTEM_RESOURCE_SIZE_MAX`] (each
+//!   `ldr::ResultInvalidMeta`). So a program Eden would run with a size that is not whole
+//!   blocks, or above the maximum, is refused here before a VM is made. Tests:
+//!   `a_system_resource_must_be_whole_2_mib_blocks`,
+//!   `a_system_resource_may_be_up_to_the_maximum_and_no_more`,
+//!   `only_a_32_bit_address_space_fails_the_address_space_test`,
+//!   `only_an_application_or_an_applet_may_have_a_system_resource`,
+//!   `the_system_resource_checks_come_in_horizons_order`.
 //! - **No thread-info capability** is [`LoadError::NoThreadInfo`]. Eden leaves the process's
 //!   core and priority masks empty and goes on; its main thread then fails a soft assert
 //!   (`KThread::Initialize`). Test: `metadata_without_thread_info_is_refused`.
@@ -218,6 +243,8 @@
 
 mod metadata;
 
+pub use metadata::{MEMORY_BLOCK_UNIT_SIZE, SYSTEM_RESOURCE_SIZE_MAX};
+
 use starquake_kernel::memory::{
     AddressSpace as KernelSpace, CreateError, Mapper, MemoryArrangement, MemoryPermission,
     MemoryState, ProcessMemory, RegionOffsets, SvcPermission,
@@ -265,6 +292,14 @@ pub enum LoadError {
     /// priorities.
     #[error("the program's metadata gives its process no cores or priorities")]
     NoThreadInfo,
+    /// The program's `ACID` names a pool partition no memory pool has (see "The process's
+    /// description" in the module docs).
+    #[error("the program's metadata names memory pool {0}, which does not exist")]
+    PoolPartition(u8),
+    /// The program's system resource size (`META` 0x14) fails a check Horizon's loader makes
+    /// (see "The process's description" in the module docs).
+    #[error("the program's metadata asks for a system resource the console's loader refuses: {0}")]
+    SystemResource(SystemResourceFault),
     /// The kernel would refuse the process the metadata describes.
     #[error("the program's metadata describes a process the kernel refuses: {0}")]
     Process(#[from] ProcessError),
@@ -301,6 +336,33 @@ pub enum LoadError {
     /// The program could not be copied into guest memory.
     #[error("the program could not be written into guest memory: {0}")]
     Write(Fault),
+}
+
+/// Which of Horizon's loader's checks a program's system resource size fails
+/// ([`LoadError::SystemResource`]), in the order they are made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum SystemResourceFault {
+    /// The size is not a whole number of 2 MiB blocks (`os::MemoryBlockUnitSize`).
+    #[error("{size:#x} bytes is not a whole number of 2 MiB blocks")]
+    Unaligned {
+        /// The size the metadata records.
+        size: u32,
+    },
+    /// The address space type is the 32-bit one.
+    #[error("a process with a 32-bit address space cannot have one")]
+    AddressSpace,
+    /// The program is neither an application nor an applet (its `ACI0` program type).
+    #[error("only an application or an applet may have one")]
+    ProgramType,
+    /// The size is more than 0x1FE00000 bytes (`SystemResourceSizeMax`).
+    #[error(
+        "{size:#x} bytes is more than the {:#x} bytes a program may ask for",
+        metadata::SYSTEM_RESOURCE_SIZE_MAX
+    )]
+    TooLarge {
+        /// The size the metadata records.
+        size: u32,
+    },
 }
 
 impl From<NroOrCodeSetError> for LoadError {
@@ -710,7 +772,7 @@ pub(crate) fn load_placed(
 ) -> Result<Loaded, LoadError> {
     let description = program.description();
     let refused = |what: &'static str| move |error: SvcError| LoadError::Map { what, error };
-    let mut space = KernelSpace::new(
+    let mut space = KernelSpace::with_system_resource(
         &ProcessMemory {
             code_address: layout.entry,
             code_size: layout.code_end() - layout.entry,
@@ -718,6 +780,7 @@ pub(crate) fn load_placed(
             alias_region_extra: false,
             offsets: RegionOffsets::default(),
         },
+        description.system_resource(),
         mapper,
     )?;
     if let Some(trampolines) = layout.trampolines {
@@ -1789,6 +1852,75 @@ mod tests {
     fn load_program(program: &Program) -> Loaded {
         let (mapper, _log) = RecordingMapper::new();
         load(program, None, Box::new(mapper), &flat()).unwrap()
+    }
+
+    #[test]
+    fn every_pool_partition_is_counted_against_the_application_pool() {
+        // Loading makes the kernel's address space with the description's system resource, so
+        // its charge is in the memory count from the start: the resource's size in any pool
+        // but the applet pool, which charges nothing. The count's limit is the console's
+        // application pool whatever the partition (a divergence: Eden sizes it from the pool).
+        use starquake_kernel::memory::Pool;
+        use starquake_loader::npdm::PoolPartition;
+        let pool = MemoryArrangement::FourGb.application_pool_size();
+        for (partition, expected, charged) in [
+            (PoolPartition::Application, Pool::Application, true),
+            (PoolPartition::Applet, Pool::Applet, false),
+            (PoolPartition::System, Pool::System, true),
+            (PoolPartition::SystemNonSecure, Pool::SystemNonSecure, true),
+        ] {
+            let mut files = exefs(&["main"]);
+            files.npdm.acid.pool_partition = partition;
+            files.npdm.system_resource_size = MEMORY_BLOCK_UNIT_SIZE;
+            let program = Program::from_exefs(files).unwrap();
+            assert_eq!(program.description().pool, expected);
+            let space = load_program(&program).address_space;
+            assert_eq!(
+                space.system_resource(),
+                program.description().system_resource()
+            );
+            assert_eq!(space.limit().limit(), pool, "{partition:?}");
+            let charge = if charged {
+                u64::from(MEMORY_BLOCK_UNIT_SIZE)
+            } else {
+                0
+            };
+            assert_eq!(
+                space.limit().reserved(),
+                space.used_non_system_user_physical_memory_size() + charge,
+                "{partition:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_system_resource_the_pool_has_no_room_for_is_refused_when_the_space_is_made() {
+        // A description no metadata check stands in front of: the kernel's reservation refuses
+        // it, after the code's, and nothing is loaded.
+        let mut description = ProcessDescription::homebrew(NRO_CONSOLE);
+        let pool = memory_arrangement(NRO_CONSOLE).application_pool_size();
+        description.system_resource_size = u32::try_from(pool).unwrap();
+        let program = Program::new(
+            vec![ProgramModule {
+                name: "main".to_owned(),
+                code: nso(&[a64::nop()], 0),
+            }],
+            description,
+            None,
+        )
+        .unwrap();
+        let (mapper, log) = RecordingMapper::new();
+        let error = load(&program, None, Box::new(mapper), &flat()).unwrap_err();
+        assert_eq!(
+            error,
+            LoadError::AddressSpace(CreateError::SystemResource(KernelError::LimitReached))
+        );
+        assert_eq!(log.take(), []);
+        assert_eq!(
+            error.to_string(),
+            "the program's address space could not be created: the program's system resource \
+             could not be set aside: limit reached"
+        );
     }
 
     #[test]

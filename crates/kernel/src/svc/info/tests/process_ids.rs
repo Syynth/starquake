@@ -11,7 +11,9 @@ use super::*;
 use crate::dispatch::Tables;
 use crate::handle::MAX_TABLE_SIZE;
 use crate::id::ThreadId;
-use crate::memory::GUARD_PAGES;
+use crate::memory::fixture::loaded_with;
+use crate::memory::system_resource::SECURE_ALIGNMENT;
+use crate::memory::{GUARD_PAGES, Pool, SystemResource};
 use crate::process::{LEGACY_VIRTUAL_CORE_COUNT, MainThread, Range};
 use crate::resource_limit::{LimitableResource, ResourceLimit, THREAD_COUNT_LIMIT};
 use crate::sched::{APPLICATION_CORE_COUNT, CoreSignals, UserThread};
@@ -32,7 +34,7 @@ const STACK_TOP: u64 = 0x10_8000_0000;
 /// Pages of guest memory the tests give the thread-local pages: more than they use.
 const TLS_PAGES: u64 = 64;
 
-/// The calling process's description: a Switch 2 program on virtual cores 1-4 with
+/// The calling process's description: a Switch 2 application on virtual cores 1-4 with
 /// priorities 24-59, its main thread on [`CALLER_CORE`], and a system resource of
 /// [`OWN_RESOURCE_PAGES`] pages and a few bytes more.
 fn own_description(console: Console) -> ProcessDescription {
@@ -51,14 +53,15 @@ fn own_description(console: Console) -> ProcessDescription {
     description
 }
 
-/// Whole pages of the calling process's system resource.
-const OWN_RESOURCE_PAGES: u64 = 0x18;
+/// Whole pages of the calling process's system resource: two [`SECURE_ALIGNMENT`]s, the
+/// alignment an application's resource must have to be set aside.
+const OWN_RESOURCE_PAGES: u64 = 2 * SECURE_ALIGNMENT / PAGE_SIZE;
 /// Bytes of the calling process's system resource past its whole pages: less than a page.
 const OWN_RESOURCE_EXTRA: u64 = 0x123;
 
-/// The second process's description: a Switch 2 program on virtual cores 0-2 with priorities
-/// 30-40 and a system resource of [`SECOND_RESOURCE_PAGES`] whole pages; every fact differs
-/// from the calling process's.
+/// The second process's description: a Switch 2 applet (its `ACID` names the applet pool) on
+/// virtual cores 0-2 with priorities 30-40 and a system resource of [`SECOND_RESOURCE_PAGES`]
+/// whole pages; every fact differs from the calling process's.
 fn second_description() -> ProcessDescription {
     let mut description = ProcessDescription::homebrew(Console::Switch2);
     description.program_id = 0x0100_dddd_eeee_f000;
@@ -69,6 +72,7 @@ fn second_description() -> ProcessDescription {
     };
     description.main_thread_priority = 33;
     description.system_resource_size = u32::try_from(SECOND_RESOURCE_PAGES * PAGE_SIZE).unwrap();
+    description.pool = Pool::Applet;
     description
 }
 
@@ -96,9 +100,10 @@ impl Rig {
         Self::of(Console::Switch2)
     }
 
-    /// The rig, its calling process made from `description`.
+    /// The rig, its calling process made from `description`, in the fixture's loaded address
+    /// space made with the description's system resource.
     fn with(description: &ProcessDescription) -> Self {
-        Self::on(description, loaded().0)
+        Self::on(description, loaded_with(description.system_resource()).0)
     }
 
     /// The rig, its calling process made from `description` in `space`.
@@ -211,6 +216,21 @@ const ADDED_PROCESS_IDS: [InfoType; 10] = [
     InfoType::UsedNonSystemMemorySize,
     InfoType::IsApplication,
     InfoType::FreeThreadCount,
+];
+
+/// The rest of Eden's first group: the ids that read the calling process's address space.
+const ADDRESS_SPACE_IDS: [InfoType; 11] = [
+    InfoType::AliasRegionAddress,
+    InfoType::AliasRegionSize,
+    InfoType::HeapRegionAddress,
+    InfoType::HeapRegionSize,
+    InfoType::TotalMemorySize,
+    InfoType::UsedMemorySize,
+    InfoType::AslrRegionAddress,
+    InfoType::AslrRegionSize,
+    InfoType::StackRegionAddress,
+    InfoType::StackRegionSize,
+    InfoType::AliasRegionExtraSize,
 ];
 
 /// Handles that name no process: the invalid handle, the current-thread pseudo-handle and a
@@ -328,6 +348,8 @@ fn the_facts_are_the_named_process_s_and_the_sizes_the_caller_s() {
             THREAD_COUNT_LIMIT - 1,
             THREAD_COUNT_LIMIT - 3,
         ),
+        // The calling process is an application, the second an applet.
+        (InfoType::IsApplication, 1, 0),
     ];
     for (id, own_value, second_value) in facts {
         assert_ne!(own_value, second_value, "{id:?}");
@@ -342,18 +364,26 @@ fn the_facts_are_the_named_process_s_and_the_sizes_the_caller_s() {
             "{id:?}"
         );
     }
-    // The address-space sizes are the calling process's, whichever process is named.
+    // The address-space sizes are the calling process's, whichever process is named: its
+    // address space, and the resource it was made with.
     let space = &rig.tables.address_space;
-    let used = space.used_user_physical_memory_size();
+    let used = space.used_non_system_user_physical_memory_size();
+    let secure = OWN_RESOURCE_PAGES * PAGE_SIZE;
+    assert_eq!(space.secure_memory_size(), secure);
     let total = non_system_total(
         used,
         space.limit().free(),
         space.max_process_memory(),
-        OWN_RESOURCE_PAGES * PAGE_SIZE,
+        secure,
     );
     for (id, value) in [
         (InfoType::UsedNonSystemMemorySize, used),
         (InfoType::TotalNonSystemMemorySize, total),
+        (InfoType::UsedMemorySize, used + secure),
+        (
+            InfoType::TotalMemorySize,
+            space.total_user_physical_memory_size(),
+        ),
     ] {
         assert_ne!(value, 0, "{id:?}");
         for handle in [Handle::CURRENT_PROCESS, rig.second_handle] {
@@ -395,8 +425,9 @@ fn the_first_group_checks_the_sub_id_then_the_handle() {
 #[test]
 fn a_fact_about_a_process_with_no_row_is_an_internal_failure_after_the_checks() {
     // A process object always names a created process; one that does not is the kernel's own
-    // inconsistency, reported after the guest's checks. The ids that read the caller's
-    // address space, or a constant, need no row for the named process.
+    // inconsistency, reported after the guest's checks. Every id checks the id the object
+    // holds against the scheduler's rows before it reads anything, so the ids that read the
+    // caller's address space are refused too.
     let mut rig = Rig::new();
     let ghost = ProcessId::from_parts(9, 7);
     let object = rig
@@ -410,24 +441,81 @@ fn a_fact_about_a_process_with_no_row_is_an_internal_failure_after_the_checks() 
         .handles
         .add(rig.tables.scheduler.objects_mut(), object)
         .unwrap();
-    let no_fact = SvcError::internal(&rig.tables.processes.get(ghost).unwrap_err());
     let no_record = SvcError::from(rig.tables.scheduler.process(ghost).unwrap_err());
-    for id in ADDED_PROCESS_IDS {
-        let expected = match id {
-            InfoType::CoreMask
-            | InfoType::PriorityMask
-            | InfoType::SystemResourceSizeTotal
-            | InfoType::SystemResourceSizeUsed
-            | InfoType::ProgramId => Err(no_fact.clone()),
-            InfoType::FreeThreadCount => Err(no_record.clone()),
-            _ => rig.ask(id, Handle::CURRENT_PROCESS, 0),
-        };
-        assert_eq!(rig.ask(id, ghost_handle, 0), expected, "{id:?}");
+    for id in ADDED_PROCESS_IDS.into_iter().chain(ADDRESS_SPACE_IDS) {
+        assert!(rig.ask(id, Handle::CURRENT_PROCESS, 0).is_ok(), "{id:?}");
+        assert_eq!(
+            rig.ask(id, ghost_handle, 0),
+            Err(no_record.clone()),
+            "{id:?}"
+        );
         assert_eq!(
             rig.ask(id, ghost_handle, 1),
             kernel(KernelError::InvalidEnumValue),
             "{id:?}"
         );
+    }
+}
+
+#[test]
+fn a_process_object_that_is_not_its_process_s_own_is_an_internal_failure_after_the_checks() {
+    // The id a process object holds is checked against what was allocated: a second object
+    // naming the calling process, which only a kernel bug makes, is not the row's own object.
+    let mut rig = Rig::new();
+    let own = rig.own();
+    let twin = rig
+        .tables
+        .scheduler
+        .objects_mut()
+        .create(Object::Process(own))
+        .unwrap();
+    assert_ne!(rig.tables.scheduler.process(own).unwrap().object(), twin);
+    let twin_handle = rig
+        .tables
+        .handles
+        .add(rig.tables.scheduler.objects_mut(), twin)
+        .unwrap();
+    let not_its_own = Err(SvcError::Internal(
+        "a handle names a process object that is not its process's own".into(),
+    ));
+    for id in ADDED_PROCESS_IDS.into_iter().chain(ADDRESS_SPACE_IDS) {
+        assert_eq!(rig.ask(id, twin_handle, 0), not_its_own, "{id:?}");
+        assert_eq!(
+            rig.ask(id, twin_handle, 1),
+            kernel(KernelError::InvalidEnumValue),
+            "{id:?}"
+        );
+    }
+}
+
+#[test]
+fn a_scheduled_process_with_no_facts_is_an_internal_failure_for_the_fact_ids_only() {
+    // A process the scheduler has a row for (with its own object) and the process table has
+    // none: the ids that read the named process's facts fail with the table's message, and the
+    // ids that read the calling process's address space, or the scheduler, answer.
+    let mut rig = Rig::new();
+    let ghost = ProcessId::from_parts(9, 7);
+    rig.tables.scheduler.add_process(ghost).unwrap();
+    let object = rig.tables.scheduler.process(ghost).unwrap().object();
+    let ghost_handle = rig
+        .tables
+        .handles
+        .add(rig.tables.scheduler.objects_mut(), object)
+        .unwrap();
+    let no_fact = SvcError::internal(&rig.tables.processes.get(ghost).unwrap_err());
+    for id in ADDED_PROCESS_IDS.into_iter().chain(ADDRESS_SPACE_IDS) {
+        let expected = match id {
+            InfoType::CoreMask
+            | InfoType::PriorityMask
+            | InfoType::SystemResourceSizeTotal
+            | InfoType::SystemResourceSizeUsed
+            | InfoType::ProgramId
+            | InfoType::IsApplication => Err(no_fact.clone()),
+            // The ghost has no threads: the whole limit is free.
+            InfoType::FreeThreadCount => Ok(THREAD_COUNT_LIMIT),
+            _ => rig.ask(id, Handle::CURRENT_PROCESS, 0),
+        };
+        assert_eq!(rig.ask(id, ghost_handle, 0), expected, "{id:?}");
     }
 }
 
@@ -486,92 +574,64 @@ fn the_non_system_total_takes_edens_branch_at_the_exact_edge() {
     assert_eq!(non_system_total(used, max - used - 1, max, 0), max - 1);
 }
 
-/// Eden's `GetTotalNonSystemUserPhysicalMemorySize`, with the free memory Eden would have:
-/// the secure size already reserved from it.
-fn edens_non_system_total(used: u64, uncharged_free: u64, max: u64, secure: u64) -> u64 {
-    let free = uncharged_free - secure;
-    if used + secure + free > max {
-        max - secure
-    } else {
-        free + used
-    }
-}
-
-#[test]
-fn the_non_system_total_is_s_higher_than_edens_while_the_resource_is_not_charged() {
-    let (used, secure, max) = (0x30_0000, 0x5000, 0x100_0000);
-    // `used + free > max`: the two agree.
-    let free = max - used + 1;
-    assert_eq!(
-        non_system_total(used, free, max, secure),
-        edens_non_system_total(used, free, max, secure)
-    );
-    // `used + secure + free <= max`: `secure` higher here.
-    let free = max - used - secure;
-    assert_eq!(
-        non_system_total(used, free, max, secure),
-        edens_non_system_total(used, free, max, secure) + secure
-    );
-    // In between: `max - secure` here, `free - secure + used` in Eden.
-    let free = max - used;
-    assert_eq!(non_system_total(used, free, max, secure), max - secure);
-    assert_eq!(
-        edens_non_system_total(used, free, max, secure),
-        free - secure + used
-    );
-    // The process the rig makes is the second case: its pool is below its maximum, so its
-    // total is its free memory and its used memory, its system resource not taken off.
-    let mut rig = Rig::new();
-    let space = &rig.tables.address_space;
-    let (used, free) = (space.used_user_physical_memory_size(), space.limit().free());
-    assert!(used + OWN_RESOURCE_PAGES * PAGE_SIZE + free <= space.max_process_memory());
-    assert_eq!(
-        rig.ask(
-            InfoType::TotalNonSystemMemorySize,
-            Handle::CURRENT_PROCESS,
-            0
-        ),
-        Ok(free + used)
-    );
-}
-
-#[test]
-fn the_non_system_total_past_the_maximum_takes_the_calling_process_s_whole_page_resource() {
-    // A 12 GiB console's pool is below its maximum, so a system resource larger than the gap
-    // reaches `used + secure + free > max`, and 21 answers `max - secure`. The calling
-    // process's resource is just past that edge and a few bytes more than whole pages; the
-    // second process's is far below it: a total taken from the second process's resource,
-    // from none, or from the size not rounded to whole pages answers something else.
+/// The fixture's code and main thread's stack in an address space of `arrangement`, made with
+/// `resource`.
+fn charged_space(arrangement: MemoryArrangement, resource: SystemResource) -> AddressSpace {
     let (mapper, _log) = RecordingMapper::new();
     let mut space =
-        AddressSpace::new(&memory(MemoryArrangement::TwelveGb), Box::new(mapper)).unwrap();
+        AddressSpace::with_system_resource(&memory(arrangement), resource, Box::new(mapper))
+            .unwrap();
     space.create_main_thread_stack(STACK_SIZE).unwrap();
-    let max = space.max_process_memory();
-    let reachable = space.used_user_physical_memory_size() + space.limit().free();
-    assert!(reachable < max);
-    let pages = (max - reachable) / PAGE_SIZE + 1;
-    let mut description = own_description(Console::Switch2);
-    description.system_resource_size =
-        u32::try_from(pages * PAGE_SIZE + OWN_RESOURCE_EXTRA).unwrap();
-    let mut rig = Rig::on(&description, space);
-    let secure = pages * PAGE_SIZE;
-    assert_ne!(secure, SECOND_RESOURCE_PAGES * PAGE_SIZE);
-    let space = &rig.tables.address_space;
-    let (used, free) = (space.used_user_physical_memory_size(), space.limit().free());
-    assert!(used + secure + free > max);
-    assert!(used + SECOND_RESOURCE_PAGES * PAGE_SIZE + free <= max);
-    for handle in [Handle::CURRENT_PROCESS, rig.second_handle] {
-        assert_eq!(
-            rig.ask(InfoType::TotalNonSystemMemorySize, handle, 0),
-            Ok(max - secure),
-            "{handle:?}"
-        );
+    space
+}
+
+#[test]
+fn the_non_system_total_is_the_pool_less_the_calling_process_s_charge() {
+    // With the resource charged, `used + secure + free` is the whole pool, which on both
+    // arrangements is below the largest process memory: 21 is Eden's `free + used`, the pool
+    // less the charge, and its `max - secure` branch is out of reach of a live address space
+    // (`the_non_system_total_takes_edens_branch_at_the_exact_edge` pins it on the function).
+    // The charge is the calling process's, whichever process is named: the second process's
+    // resource differs.
+    for arrangement in [MemoryArrangement::FourGb, MemoryArrangement::TwelveGb] {
+        let pool = arrangement.application_pool_size();
+        for (pool_of_own, charge) in [
+            (Pool::Application, OWN_RESOURCE_PAGES * PAGE_SIZE),
+            // An applet's resource charges nothing, though 16 still reports its size.
+            (Pool::Applet, 0),
+        ] {
+            let mut description = own_description(Console::Switch2);
+            description.pool = pool_of_own;
+            let resource = description.system_resource();
+            let mut rig = Rig::on(&description, charged_space(arrangement, resource));
+            let space = &rig.tables.address_space;
+            assert!(pool < space.max_process_memory(), "{arrangement:?}");
+            let used = space.used_non_system_user_physical_memory_size();
+            assert_eq!(used + charge + space.limit().free(), pool);
+            assert_ne!(charge, SECOND_RESOURCE_PAGES * PAGE_SIZE);
+            for handle in [Handle::CURRENT_PROCESS, rig.second_handle] {
+                assert_eq!(
+                    rig.ask(InfoType::TotalNonSystemMemorySize, handle, 0),
+                    Ok(pool - charge),
+                    "{arrangement:?} {pool_of_own:?}"
+                );
+            }
+            assert_eq!(
+                rig.ask(
+                    InfoType::SystemResourceSizeTotal,
+                    Handle::CURRENT_PROCESS,
+                    0
+                ),
+                Ok(OWN_RESOURCE_PAGES * PAGE_SIZE)
+            );
+        }
     }
 }
 
 #[test]
 fn a_system_resource_larger_than_the_maximum_leaves_no_non_system_total() {
-    // Eden refuses to create such a process; here the total is zero, not a wrapped number.
+    // Eden refuses to create such a process, and so does the address space here; the function
+    // answers zero, not a wrapped number.
     let (used, free, max) = (0x30_0000, 0x10_0000, 0x100_0000);
     assert_eq!(non_system_total(used, free, max, max + 1), 0);
     assert_eq!(non_system_total(used, free, max, max), 0);
@@ -580,25 +640,37 @@ fn a_system_resource_larger_than_the_maximum_leaves_no_non_system_total() {
 }
 
 #[test]
-fn the_total_and_used_memory_leave_the_system_resource_out() {
-    // Divergence: Eden adds the secure size to 7, and to what 6 compares. Here a process with
-    // a system resource is told what one without is told, and 7 is 22's value.
+fn the_total_and_used_memory_count_the_system_resource_as_eden_does() {
+    // `GetUsedUserPhysicalMemorySize` adds the charge to the non-system used size (22), so 7
+    // is that much higher for a process with a resource than for the same process without;
+    // 6 is the used size and the free memory, the whole pool, for both.
     let mut with = Rig::new();
     let mut description = own_description(Console::Switch2);
     description.system_resource_size = 0;
     let mut without = Rig::with(&description);
-    for id in [InfoType::TotalMemorySize, InfoType::UsedMemorySize] {
-        let value = without.ask(id, Handle::CURRENT_PROCESS, 0);
-        assert!(value.is_ok());
-        assert_eq!(with.ask(id, Handle::CURRENT_PROCESS, 0), value, "{id:?}");
-    }
+    let charge = OWN_RESOURCE_PAGES * PAGE_SIZE;
+    let ask = |rig: &mut Rig, id| rig.ask(id, Handle::CURRENT_PROCESS, 0).unwrap();
+    let non_system = ask(&mut without, InfoType::UsedNonSystemMemorySize);
     assert_eq!(
-        with.ask(InfoType::UsedMemorySize, Handle::CURRENT_PROCESS, 0),
-        with.ask(
-            InfoType::UsedNonSystemMemorySize,
-            Handle::CURRENT_PROCESS,
-            0
-        )
+        ask(&mut with, InfoType::UsedNonSystemMemorySize),
+        non_system
+    );
+    assert_eq!(ask(&mut without, InfoType::UsedMemorySize), non_system);
+    assert_eq!(
+        ask(&mut with, InfoType::UsedMemorySize),
+        non_system + charge
+    );
+    let pool = MemoryArrangement::FourGb.application_pool_size();
+    assert_eq!(ask(&mut with, InfoType::TotalMemorySize), pool);
+    assert_eq!(ask(&mut without, InfoType::TotalMemorySize), pool);
+    // The resource limit's physical memory is the same count (#242): its current value is 7's.
+    let raw = with
+        .ask(InfoType::ResourceLimit, Handle::INVALID, 0)
+        .unwrap();
+    let limit = Handle::from_raw(u32::try_from(raw).unwrap());
+    assert_eq!(
+        with.limit_values(limit, LimitableResource::PhysicalMemory),
+        (pool, non_system + charge)
     );
 }
 
@@ -616,14 +688,21 @@ fn the_exception_context_address_is_zero() {
 }
 
 #[test]
-fn every_process_is_an_application() {
-    // Divergence: the description keeps no pool partition.
-    let mut rig = Rig::new();
-    assert_eq!(IS_APPLICATION, 1);
-    for handle in [Handle::CURRENT_PROCESS, rig.second_handle] {
+fn is_application_is_whether_the_named_process_draws_from_the_application_pool() {
+    // `*result = process->IsApplication()`, which `LoadFromMetadata` sets for the application
+    // pool. The second process is an applet whichever the calling process is.
+    for pool in Pool::ALL {
+        let mut description = own_description(Console::Switch2);
+        description.pool = pool;
+        let mut rig = Rig::with(&description);
         assert_eq!(
-            rig.ask(InfoType::IsApplication, handle, 0),
-            Ok(IS_APPLICATION)
+            rig.ask(InfoType::IsApplication, Handle::CURRENT_PROCESS, 0),
+            Ok(u64::from(pool == Pool::Application)),
+            "{pool:?}"
+        );
+        assert_eq!(
+            rig.ask(InfoType::IsApplication, rig.second_handle, 0),
+            Ok(0)
         );
     }
 }

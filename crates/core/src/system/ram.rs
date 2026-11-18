@@ -20,21 +20,25 @@
 //! | the main thread's thread-local page | [`THREAD_LOCAL_RAM`], one page | `starquake_kernel::process::run` takes the thread's region from a new page (`ThreadLocalPages::reserve`) and writes it |
 //! | working RAM | [`WORKING_RAM`], or what the maximum leaves of it | a guess: see the constant |
 //!
-//! Not counted: the process's system resource (`META` 0x14,
-//! `ProcessDescription::system_resource_size`). Eden makes it a `KSecureSystemResource` of that
-//! size for the kernel's own structures for the process, reserved from the same
-//! `PhysicalMemoryMax` limit as the code and the stack (see "Divergence from Eden" below). Here
-//! nothing is allocated from it: the translation tables live in the backend's own table pool,
-//! outside guest RAM (`starquake_cpu::hvf`, "Guest-physical memory"; the limit that pool sets is
-//! below), and the kernel's pool accounting does not charge it either. GPU-only memory is never
-//! guest memory (execution model, "Sparse and lazy memory").
+//! The process's system resource (`META` 0x14, `ProcessDescription::system_resource`) is counted
+//! against the pool but given no guest RAM. Eden makes it a `KSecureSystemResource` for the
+//! kernel's own structures for the process, reserved from the same `PhysicalMemoryMax` limit as
+//! the code and the stack, and so does the kernel here
+//! (`starquake_kernel::memory::AddressSpace::with_system_resource`, which charges
+//! `SystemResource::required_secure_memory_size`: its size, or nothing in the applet pool). So
+//! the fit check takes that charge off the pool before comparing (`available` below), and
+//! working RAM is cut to what the pool leaves after it. Nothing is allocated from the
+//! resource: the translation tables live in the backend's own table pool, outside guest RAM
+//! (`starquake_cpu::hvf`, "Guest-physical memory"; the limit that pool sets is below). GPU-only
+//! memory is never guest memory (execution model, "Sparse and lazy memory").
 //!
 //! # The maximum and the fit check
 //!
 //! The maximum is the application pool of the console the program is built for
 //! (`starquake_kernel::memory::MemoryArrangement::application_pool_size`, through
 //! `crate::image::memory_arrangement`): 3285 MiB for a Switch 1 program, 9809 MiB for a
-//! Switch 2 one. A program whose `needed` is above it is [`Error::OutOfRam`], before a VM is
+//! Switch 2 one, less the system resource's charge (`available`; zero when the charge is more
+//! than the pool). A program whose `needed` is above it is [`Error::OutOfRam`], before a VM is
 //! made. A program that fits has RAM for every page loading writes (the trampolines and the
 //! modules' bytes, all inside the counted extent), so loading it does not run out of RAM (the
 //! tables that map them are another matter: "The table pool", below); a
@@ -44,8 +48,10 @@
 //! A program that fits gets `needed` plus [`WORKING_RAM`], or the maximum if that is less: a
 //! program that fits with no byte to spare loads, with no working RAM. The backend rounds the
 //! size up to its own pages (`starquake_cpu::hvf::RamConfig::at_least`, 16 KiB), which never
-//! passes the maximum: both pool sizes are whole 16 KiB pages
-//! (`both_maximums_are_whole_host_pages`).
+//! passes the pool: both pool sizes are whole 16 KiB pages
+//! (`both_maximums_are_whole_host_pages`). It can pass `available` by less than 16 KiB only
+//! for a charge that is not whole 16 KiB pages, which no metadata Horizon's loader takes has
+//! (its sizes are whole 2 MiB blocks, `crate::image::MEMORY_BLOCK_UNIT_SIZE`).
 //!
 //! # The table pool: a second limit, not counted
 //!
@@ -78,10 +84,12 @@
 //!   (Eden has none). So a program whose code and stack fill the pool to within less than a
 //!   page (and its trampolines) loads under Eden and is [`Error::OutOfRam`] here. Test:
 //!   `code_and_stack_that_fill_the_pool_leave_no_room_for_the_thread_local_page`.
-//! - **Looser.** It does not count the system resource. So a program with a non-zero system
-//!   resource whose code and stack fill the pool fits here and is refused by Eden
-//!   (`ResultLimitReached`). Test:
-//!   `a_system_resource_is_not_counted_so_a_title_that_eden_refuses_still_fits`.
+//!
+//! The system resource is counted as Eden reserves it, so a program with a non-zero system
+//! resource whose code and stack fill the pool is refused here as Eden refuses it
+//! (`ResultLimitReached` there, [`Error::OutOfRam`] here, before a VM is made). Tests:
+//! `a_system_resource_is_counted_so_a_title_that_eden_refuses_is_refused`,
+//! `a_system_resource_that_fits_with_no_byte_to_spare_loads_and_one_page_more_does_not`.
 
 use starquake_kernel::process::ProcessDescription;
 use starquake_memory::PAGE_SIZE;
@@ -133,7 +141,12 @@ impl GuestRam {
             .checked_add(stack)
             .and_then(|sum| sum.checked_add(THREAD_LOCAL_RAM))
             .ok_or_else(overflow)?;
-        let available = memory_arrangement(description.console).application_pool_size();
+        // The system resource's charge comes off the pool, as the kernel reserves it from the
+        // same count when it makes the address space.
+        let charge = description.system_resource().required_secure_memory_size();
+        let available = memory_arrangement(description.console)
+            .application_pool_size()
+            .saturating_sub(charge);
         if needed > available {
             return Err(Error::OutOfRam { needed, available });
         }
@@ -145,7 +158,7 @@ impl GuestRam {
 
 #[cfg(test)]
 mod tests {
-    use starquake_kernel::memory::MemoryArrangement;
+    use starquake_kernel::memory::{MemoryArrangement, Pool};
     use starquake_kernel::process::Console;
     use starquake_loader::exefs::{ExeFs, MAIN_MODULE, NPDM_FILE};
     use starquake_loader::npdm::AcidLayout;
@@ -155,7 +168,7 @@ mod tests {
 
     use super::*;
     use crate::clock::NRO_CONSOLE;
-    use crate::image::{IMAGE_BASE, Program, place};
+    use crate::image::{IMAGE_BASE, MEMORY_BLOCK_UNIT_SIZE, Program, place};
 
     const NSO: &[u8] = include_bytes!("../../../../tests/homebrew/hello/hello.nso");
     const NPDM: &[u8] = include_bytes!("../../../../tests/homebrew/hello/main.npdm");
@@ -376,7 +389,7 @@ mod tests {
     }
 
     #[test]
-    fn a_system_resource_is_not_counted_so_a_title_that_eden_refuses_still_fits() {
+    fn a_system_resource_is_counted_so_a_title_that_eden_refuses_is_refused() {
         // A Switch 1 program that fits its pool with no byte to spare.
         let pool = memory_arrangement(Console::Switch1).application_pool_size();
         let no_stack = ram(&exefs(|e| e.npdm.main_thread_stack_size = 0))
@@ -386,23 +399,96 @@ mod tests {
         let program = exefs(|e| e.npdm.main_thread_stack_size = stack);
         assert_eq!(program.description().system_resource_size, 0);
         let layout = place(&program, IMAGE_BASE, Some(RESCALE)).unwrap();
-        let fits = GuestRam {
-            needed: pool,
-            size: pool,
-        };
         assert_eq!(
             GuestRam::for_program(&layout, program.description()),
-            Ok(fits)
+            Ok(GuestRam {
+                needed: pool,
+                size: pool,
+            })
         );
-        // The same program with a system resource of 256 pages: more than the trampolines and
-        // the thread-local page that the code and the stack leave of the pool, so Eden, which
-        // reserves code, stack and system resource from one limit, refuses it (the divergence
-        // in the module docs). Here it fits, with the same `needed`.
+        // The same program with a system resource of one 2 MiB block: Eden, which reserves code,
+        // stack and system resource from one limit, refuses it, and so does the fit check, with
+        // the same `needed` and the pool less the charge.
         let mut description = program.description().clone();
-        description.system_resource_size = u32::try_from(256 * PAGE_SIZE).unwrap();
-        let trampolines = layout.trampolines.map_or(0, |region| region.size);
-        assert!(u64::from(description.system_resource_size) > trampolines + THREAD_LOCAL_RAM);
-        assert_eq!(GuestRam::for_program(&layout, &description), Ok(fits));
+        description.system_resource_size = MEMORY_BLOCK_UNIT_SIZE;
+        let charge = u64::from(MEMORY_BLOCK_UNIT_SIZE);
+        assert_eq!(
+            GuestRam::for_program(&layout, &description),
+            Err(Error::OutOfRam {
+                needed: pool,
+                available: pool - charge
+            })
+        );
+        // In the applet pool the same resource charges nothing (`CalculateRequiredSecureMemorySize`),
+        // and the program fits again.
+        description.pool = Pool::Applet;
+        assert_eq!(
+            GuestRam::for_program(&layout, &description),
+            Ok(GuestRam {
+                needed: pool,
+                size: pool,
+            })
+        );
+    }
+
+    #[test]
+    fn a_system_resource_that_fits_with_no_byte_to_spare_loads_and_one_page_more_does_not() {
+        // The program's own pages and a resource that together are the pool, exactly.
+        let program = nro(0);
+        let layout = place(&program, IMAGE_BASE, Some(RESCALE)).unwrap();
+        let mut description = program.description().clone();
+        let needed = GuestRam::for_program(&layout, &description).unwrap().needed;
+        let pool = nro_pool();
+        let charge = pool - needed;
+        description.system_resource_size = u32::try_from(charge).unwrap();
+        assert_eq!(description.system_resource().size(), charge);
+        assert_eq!(
+            GuestRam::for_program(&layout, &description),
+            Ok(GuestRam {
+                needed,
+                size: needed
+            })
+        );
+        // A page more of resource: a page short.
+        description.system_resource_size += u32::try_from(PAGE_SIZE).unwrap();
+        assert_eq!(
+            GuestRam::for_program(&layout, &description),
+            Err(Error::OutOfRam {
+                needed,
+                available: needed - PAGE_SIZE
+            })
+        );
+        // A resource larger than the pool leaves nothing, rather than wrapping.
+        description.system_resource_size = u32::MAX;
+        assert!(description.system_resource().size() > pool);
+        assert_eq!(
+            GuestRam::for_program(&layout, &description),
+            Err(Error::OutOfRam {
+                needed,
+                available: 0
+            })
+        );
+    }
+
+    #[test]
+    fn working_ram_is_cut_to_what_the_resource_leaves() {
+        // A resource that leaves the program exactly working RAM's room, then a page less.
+        let program = nro(0);
+        let layout = place(&program, IMAGE_BASE, Some(RESCALE)).unwrap();
+        let mut description = program.description().clone();
+        let needed = GuestRam::for_program(&layout, &description).unwrap().needed;
+        let pool = nro_pool();
+        let roomy = pool - needed - WORKING_RAM;
+        description.system_resource_size = u32::try_from(roomy).unwrap();
+        assert_eq!(
+            GuestRam::for_program(&layout, &description).unwrap().size,
+            needed + WORKING_RAM
+        );
+        description.system_resource_size += u32::try_from(PAGE_SIZE).unwrap();
+        assert_eq!(
+            GuestRam::for_program(&layout, &description).unwrap().size,
+            needed + WORKING_RAM - PAGE_SIZE
+        );
     }
 
     #[test]

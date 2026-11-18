@@ -14,11 +14,17 @@
 //!   `switch`):
 //!   1. `info_sub_id == 0`, else `ResultInvalidEnumValue`.
 //!   2. The handle names a process (`GetObject<KProcess>`: the current-process pseudo-handle,
-//!      or a handle to a process), else `ResultInvalidHandle`.
+//!      or a handle to a process), else `ResultInvalidHandle`. The process id a process
+//!      object holds is then checked against what was allocated: the scheduler has a row for
+//!      it, whose own object ([`crate::process::ProcessRecord::object`]) is the one the
+//!      handle names. Either failing is the kernel's own inconsistency, an internal failure
+//!      after the guest's checks (Eden has nothing to check: its object is the process). Tests:
+//!      `a_fact_about_a_process_with_no_row_is_an_internal_failure_after_the_checks`,
+//!      `a_process_object_that_is_not_its_process_s_own_is_an_internal_failure_after_the_checks`.
 //!
 //!   Then the value. The **address-space ids** (2 to 7, 21, 22 and 28) read the calling
-//!   process's address space (see the divergences); the **fact ids** (0, 1, 16, 17, 18 and 24)
-//!   read the process the handle names; 20 and 23 are constants (see the divergences):
+//!   process's address space (see the divergences); the **fact ids** (0, 1, 16, 17, 18, 23 and
+//!   24) read the process the handle names; 20 is a constant (see the divergences):
 //!   - 0 `CoreMask` and 1 `PriorityMask`: `GetCoreMask` and `GetPriorityMask`, the masks of
 //!     the process's thread-info capability ([`ProcessInfo::core_mask`],
 //!     [`ProcessInfo::priority_mask`]).
@@ -28,7 +34,9 @@
 //!     `R_UNLESS(info_sub_id == 0, ResultInvalidCombination)` that the first check makes
 //!     unreachable.
 //!   - 6 `TotalMemorySize` and 7 `UsedMemorySize`: `GetTotalUserPhysicalMemorySize` and
-//!     `GetUsedUserPhysicalMemorySize`, without the system resource (see the divergences).
+//!     `GetUsedUserPhysicalMemorySize`, the system resource's charge counted
+//!     ([`AddressSpace::total_user_physical_memory_size`],
+//!     [`AddressSpace::used_user_physical_memory_size`]; "The system resource", below).
 //!   - 16 `SystemResourceSizeTotal`: `GetTotalSystemResourceSize`, the size of the process's
 //!     secure system resource ([`secure_resource_size`]).
 //!   - 17 `SystemResourceSizeUsed`: `GetUsedSystemResourceSize`; [`SYSTEM_RESOURCE_SIZE_USED`]
@@ -38,10 +46,12 @@
 //!     [`USER_EXCEPTION_CONTEXT_ADDRESS`] here (see the divergences).
 //!   - 21 `TotalNonSystemMemorySize` and 22 `UsedNonSystemMemorySize`:
 //!     `GetTotalNonSystemUserPhysicalMemorySize` and `GetUsedNonSystemUserPhysicalMemorySize`
-//!     ([`non_system_total`]; the used size is the normal memory (the heap and what
-//!     `MapPhysicalMemory` mapped), the code and the main thread's stack,
-//!     [`AddressSpace::used_user_physical_memory_size`]).
-//!   - 23 `IsApplication`: `IsApplication`; [`IS_APPLICATION`] here (see the divergences).
+//!     ([`non_system_total`] with the calling process's charge; the used size is the normal
+//!     memory (the heap and what `MapPhysicalMemory` mapped), the code and the main thread's
+//!     stack, [`AddressSpace::used_non_system_user_physical_memory_size`]).
+//!   - 23 `IsApplication`: `IsApplication` ([`is_application`]): one when the named process's
+//!     pool is the application pool, as `LoadFromMetadata` sets `m_is_application`. Test:
+//!     `is_application_is_whether_the_named_process_draws_from_the_application_pool`.
 //!   - 24 `FreeThreadCount`: the process's resource limit's `ThreadCountMax` limit less its
 //!     current value (`process->GetResourceLimit()`; [`crate::resource_limit`]), read through
 //!     the values `GetResourceLimitLimitValue` and `GetResourceLimitCurrentValue` answer
@@ -159,43 +169,42 @@
 //!
 //! # The system resource
 //!
-//! A process's system resource (`META` 0x14, [`ProcessInfo::system_resource_size`]) is what
-//! ids 16, 17 and 21 report on. Eden's `KProcess::LoadFromMetadata` asks for
+//! A process's system resource (`META` 0x14, [`ProcessInfo::system_resource`]) is what ids 6,
+//! 7, 16, 17 and 21 count. Eden's `KProcess::LoadFromMetadata` asks for
 //! `system_resource_num_pages = metadata.GetSystemResourceSize() / PageSize`; `Initialize`
-//! makes a `KSecureSystemResource` of that many pages when it is not zero, and otherwise gives
-//! an application the shared default resource (`m_is_default_application_system_resource`),
-//! which every one of Eden's `GetTotalSystemResourceSize`, `GetUsedSystemResourceSize`,
-//! `GetRequiredSecureMemorySize` and `GetRequiredSecureMemorySizeNonDefault` answers with
-//! zero. So all four read the recorded size rounded down to whole pages, zero below one page
-//! ([`secure_resource_size`]): for a secure resource `GetSize` is its size, and
-//! `CalculateRequiredSecureMemorySize` is the size too for any pool but the applet pool
-//! (`eden/src/core/hle/kernel/board/nintendo/nx/k_system_control.cpp` @ cf654052). The pool is
-//! the application pool here (see the divergences, `IsApplication`).
+//! makes a `KSecureSystemResource` of that many pages when it is not zero, reserving its
+//! charge from the process's `PhysicalMemoryMax` limit, and otherwise gives the process the
+//! shared default resource, which every one of Eden's `GetTotalSystemResourceSize`,
+//! `GetUsedSystemResourceSize`, `GetRequiredSecureMemorySize` and
+//! `GetRequiredSecureMemorySizeNonDefault` answers with zero. Here the address space is made
+//! with the resource and charges it to its memory count
+//! ([`crate::memory::AddressSpace::with_system_resource`], [`crate::memory::system_resource`]).
+//! So:
+//!
+//! - 16 is the size in whole pages, whatever the pool ([`secure_resource_size`]: `GetSize`).
+//! - 6, 7 and 21 take the charge, `S` below (`GetRequiredSecureMemorySize`, and the
+//!   `NonDefault` form, which is the same for a secure resource): the size for any pool but the
+//!   applet pool, zero for that one (`CalculateRequiredSecureMemorySize`,
+//!   `eden/src/core/hle/kernel/board/nintendo/nx/k_system_control.cpp` @ cf654052;
+//!   [`AddressSpace::secure_memory_size`]). With `U` the non-system used size, `F` the free
+//!   memory after the charge and `M` the process maximum ([`AddressSpace::max_process_memory`]),
+//!   7 is `U + S`; 6 is `M` when `U + S + F > M`, else `F + U + S`; 21 is `M - S` when
+//!   `U + S + F > M`, else `F + U`, Eden's formulas. `U + S + F` is the whole pool, which is
+//!   below `M` on both arrangements (4 GiB: pool 3285 MiB, `M` 8 GiB; 12 GiB: pool 9809 MiB,
+//!   `M` 12 GiB), so a live address space always takes the second branch: 6 is the pool and 21
+//!   the pool less `S`. The first branches are pinned on the functions
+//!   (`the_non_system_total_takes_edens_branch_at_the_exact_edge`, and the space's own tests).
+//!   Tests: `the_non_system_total_is_the_pool_less_the_calling_process_s_charge`,
+//!   `the_total_and_used_memory_count_the_system_resource_as_eden_does`.
+//! - The resource limit's `PhysicalMemoryMax` current value is the same count (#242,
+//!   [`crate::resource_limit`]), so it holds `S` too: in the second of those tests.
 //!
 //! # Divergences from Eden
 //!
-//! - **The system resource is not charged to the pool** (#208 adds that). Eden reserves the
-//!   secure resource's size from the process's `PhysicalMemoryMax` limit
-//!   (`KSecureSystemResource::Initialize`, `eden/src/core/hle/kernel/k_system_resource.cpp`
-//!   @ cf654052); here the address space's free memory ([`crate::memory::MemoryLimit::free`])
-//!   still holds it. So, for a process whose [`secure_resource_size`] `S` is not zero, and
-//!   `U` the non-system used size, `F` the free memory here and `M` the process maximum
-//!   ([`AddressSpace::max_process_memory`]), where Eden's free memory is `F - S`:
-//!   - **21** applies Eden's formula to `F`: `M - S` when `U + S + F > M`, else `F + U`. Eden
-//!     answers `M - S` when `U + F > M`, else `F - S + U`. So the two agree when
-//!     `U + F > M`; when `U + S + F <= M` the answer here is `S` higher (`F + U` against
-//!     `F - S + U`); and when `U + F <= M < U + S + F` it is `M - S` where Eden has
-//!     `F - S + U`. Test:
-//!     `the_non_system_total_is_s_higher_than_edens_while_the_resource_is_not_charged`.
-//!   - **An `S` larger than `M`** cannot arise in Eden (the reservation fails with
-//!     `ResultLimitReached` and the process is not created); here 21 answers zero rather than
-//!     wrapping. Test: `a_system_resource_larger_than_the_maximum_leaves_no_non_system_total`.
-//!   - **6 and 7 leave the system resource out.** Eden adds
-//!     `GetRequiredSecureMemorySize` (`S`) to the used size it compares in 6 and
-//!     `GetRequiredSecureMemorySizeNonDefault` (`S`) to 7's value; here 7 is the non-system
-//!     used size (22's value), and 6 is capped at `M` when `U + F > M`
-//!     ([`AddressSpace::total_user_physical_memory_size`]). With the pool uncharged, 6 equals
-//!     Eden's; 7 is `S` lower. Test: `the_total_and_used_memory_leave_the_system_resource_out`.
+//! - **[`non_system_total`] answers zero for an `S` larger than `M`**, rather than wrapping.
+//!   Neither Eden nor a live address space here can have one (the charge is at most the pool,
+//!   and its reservation fails with `ResultLimitReached` otherwise). Test:
+//!   `a_system_resource_larger_than_the_maximum_leaves_no_non_system_total`.
 //! - **17 is [`SYSTEM_RESOURCE_SIZE_USED`] (zero) for every process.** Eden's is the pages the
 //!   secure resource's dynamic page manager has handed out for the kernel's own structures
 //!   (`m_dynamic_page_manager.GetUsed() * PageSize`), which nothing here keeps; for a process
@@ -205,12 +214,6 @@
 //!   process-local region, which no process here has (`crate::process`, "Divergences from
 //!   `KProcess::Initialize`"). A guess, until the region is reserved. Test:
 //!   `the_exception_context_address_is_zero`.
-//! - **23 is [`IS_APPLICATION`] (one) for every process.** Eden sets `m_is_application` when
-//!   the NPDM's `ACID` names the application pool (`LoadFromMetadata`; a homebrew program's
-//!   default metadata does too, its `ACID` being zero). The process description keeps no pool
-//!   (`crates/core/src/image.rs`, "The `ACID` pool partition is not read"), so a program whose
-//!   `ACID` names another pool is told it is an application, and its system resource is
-//!   counted as for the application pool. Test: `every_process_is_an_application`.
 //! - **No CPU time is kept**, so 10 is [`IDLE_TICK_COUNT`] and 25 [`THREAD_TICK_COUNT`], both
 //!   zero, after Eden's checks. Eden's are the idle thread's CPU time (10) and, for the calling
 //!   thread, the ticks since its core's last context switch (25, with its CPU time added for
@@ -235,15 +238,11 @@
 //!     `a_switch_2_id_is_answered_by_the_console_of_the_process_the_handle_names`.
 //! - **The address-space ids (2 to 7, 21, 22 and 28) read the calling process's address
 //!   space, whatever process the handle names.** With one address space beside the tables, a
-//!   handle to another process object is answered as the pseudo-handle is; 21 also takes the
-//!   calling process's system resource, to match its address space. The resource changes 21
-//!   only once `U + S + F > M`. In the tests' 4 GiB address space (39-bit, `M` 8 GiB) the
-//!   pool is below `M` by more than any `u32` resource, so the branch is out of reach there;
-//!   on the 12 GiB arrangement (Switch 2: `M` 12 GiB, pool 9809 MiB) an NPDM
-//!   `system_resource_size` above `M` less the pool (2479 MiB) reaches it. Test, the calling
-//!   process's `S` just past that edge and the second process's far below it:
-//!   `the_non_system_total_past_the_maximum_takes_the_calling_process_s_whole_page_resource`.
-//!   The fact ids (0, 1, 16, 17, 18 and 24) and the Switch 2 ids do read the process the
+//!   handle to another process object is answered as the pseudo-handle is; 6, 7 and 21 also
+//!   take the charge of the calling process's system resource, the one its address space was
+//!   made with. Test, the second process's resource differing from the calling process's:
+//!   `the_non_system_total_is_the_pool_less_the_calling_process_s_charge`.
+//!   The fact ids (0, 1, 16, 17, 18, 23 and 24) and the Switch 2 ids do read the process the
 //!   handle names, from the process table and the scheduler; one the tables have no row for
 //!   is an internal failure, after the guest's checks. Tests: `a_handle_must_name_a_process`,
 //!   `the_facts_are_the_named_process_s_and_the_sizes_the_caller_s`,
@@ -413,12 +412,6 @@ pub const SYSTEM_RESOURCE_SIZE_USED: u64 = 0;
 /// the real value.
 pub const USER_EXCEPTION_CONTEXT_ADDRESS: u64 = 0;
 
-/// What `IsApplication` (23) tells every process: one, for an application. Eden's
-/// `KProcess::LoadFromMetadata` sets it when the NPDM's `ACID` names the application pool
-/// (`pool == KMemoryManager::Pool::Application`), as it does for a homebrew program's default
-/// metadata; the description here keeps no pool, so this is a guess for any other program.
-pub const IS_APPLICATION: u64 = 1;
-
 /// The sub id `IdleTickCount` (10) and `ThreadTickCount` (25) take for "every core" rather than
 /// one core's index: Eden compares with `0xFFFFFFFFFFFFFFFF`.
 pub const ALL_CORES: u64 = u64::MAX;
@@ -512,15 +505,22 @@ pub const fn encode_kernel_version(major: u32, minor: u32) -> u32 {
         | ((major & low_bits(KERNEL_VERSION_MAJOR_WIDTH)) << KERNEL_VERSION_MAJOR_SHIFT)
 }
 
-/// The size of the secure system resource of `process`, and the secure memory it needs: its
-/// recorded size ([`ProcessInfo::system_resource_size`]) rounded down to whole pages, which is
-/// zero below one page (see "The system resource" in the module docs). Eden's
-/// `GetTotalSystemResourceSize`, `GetRequiredSecureMemorySize` and
-/// `GetRequiredSecureMemorySizeNonDefault` for a process of the application pool.
+/// The size of the secure system resource of `process` (Eden's `GetTotalSystemResourceSize`,
+/// `GetInfo` 16): its recorded size ([`ProcessInfo::system_resource_size`]) rounded down to
+/// whole pages, which is zero below one page, whatever its pool (see "The system resource" in
+/// the module docs). What the resource charges is
+/// [`crate::memory::SystemResource::required_secure_memory_size`].
 #[must_use]
 pub const fn secure_resource_size(process: &ProcessInfo) -> u64 {
-    let size = process.system_resource_size() as u64;
-    size - size % PAGE_SIZE
+    process.system_resource().size()
+}
+
+/// What `IsApplication` (23) tells of `process`: one for an application
+/// ([`ProcessInfo::is_application`]: its pool is the application pool), zero otherwise
+/// (`*result = process->IsApplication()`).
+#[must_use]
+pub fn is_application(process: &ProcessInfo) -> u64 {
+    u64::from(process.is_application())
 }
 
 /// `KProcess::GetTotalNonSystemUserPhysicalMemorySize` (`eden/src/core/hle/kernel/k_process.cpp`
@@ -567,6 +567,12 @@ pub struct InfoTables<'t> {
 /// The process `handle` names (Eden's `GetObject<KProcess>`): the calling process
 /// ([`Processes::own`]) for the current-process pseudo-handle, or the process a handle to a
 /// process object names. [`KernelError::InvalidHandle`] for any other handle.
+///
+/// The id a process object holds is checked against what was allocated: the scheduler has a
+/// row for that process ([`Scheduler::process`]'s error otherwise), and the row's own object
+/// ([`crate::process::ProcessRecord::object`]) is the one the handle names (an internal
+/// failure otherwise). Both are the kernel's own inconsistency, which no guest input makes:
+/// only [`Scheduler::add_process`] makes a process object.
 fn process_from_handle(
     handles: &HandleTable,
     scheduler: &Scheduler,
@@ -577,7 +583,14 @@ fn process_from_handle(
         Resolved::CurrentProcess => Ok(processes.own()),
         Resolved::CurrentThread => Err(KernelError::InvalidHandle.into()),
         Resolved::Object(object) => match scheduler.objects().get(object)? {
-            Object::Process(process) => Ok(process),
+            Object::Process(process) => {
+                if scheduler.process(process)?.object() != object {
+                    return Err(SvcError::Internal(
+                        "a handle names a process object that is not its process's own".into(),
+                    ));
+                }
+                Ok(process)
+            }
             Object::Thread(_)
             | Object::Session
             | Object::Event(_)
@@ -620,8 +633,9 @@ pub fn get_info(
         InfoType::HeapRegionAddress => process(&|_| Ok(regions.heap.start)),
         InfoType::HeapRegionSize => process(&|_| Ok(regions.heap.size())),
         InfoType::TotalMemorySize => process(&|_| Ok(space.total_user_physical_memory_size())),
-        InfoType::UsedMemorySize | InfoType::UsedNonSystemMemorySize => {
-            process(&|_| Ok(space.used_user_physical_memory_size()))
+        InfoType::UsedMemorySize => process(&|_| Ok(space.used_user_physical_memory_size())),
+        InfoType::UsedNonSystemMemorySize => {
+            process(&|_| Ok(space.used_non_system_user_physical_memory_size()))
         }
         InfoType::AslrRegionAddress => process(&|_| Ok(regions.code.start)),
         InfoType::AslrRegionSize => process(&|_| Ok(regions.code.size())),
@@ -638,13 +652,13 @@ pub fn get_info(
         InfoType::UserExceptionContextAddress => process(&|_| Ok(USER_EXCEPTION_CONTEXT_ADDRESS)),
         InfoType::TotalNonSystemMemorySize => process(&|_| {
             Ok(non_system_total(
-                space.used_user_physical_memory_size(),
+                space.used_non_system_user_physical_memory_size(),
                 space.limit().free(),
                 space.max_process_memory(),
-                secure_resource_size(info_of(processes, processes.own())?),
+                space.secure_memory_size(),
             ))
         }),
-        InfoType::IsApplication => process(&|_| Ok(IS_APPLICATION)),
+        InfoType::IsApplication => process(&|named| Ok(is_application(info_of(processes, named)?))),
         InfoType::FreeThreadCount => process(&|named| free_thread_count(shared, space, named)),
         InfoType::AliasRegionExtraSize => process(&|_| Ok(regions.alias_region_extra_size)),
         // `case InfoType::DebuggerAttached: *result = 0; R_SUCCEED();`

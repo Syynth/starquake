@@ -5,7 +5,9 @@
 use starquake_memory::PAGE_SIZE;
 
 use super::testing::{MapperLog, RecordingMapper};
-use super::{AddressSpace, MemoryArrangement, ProcessMemory, RegionOffsets, SvcPermission};
+use super::{
+    AddressSpace, MemoryArrangement, ProcessMemory, RegionOffsets, SvcPermission, SystemResource,
+};
 
 /// Where the code goes: Eden's address for 39-bit code without randomisation
 /// (`KProcess::LoadFromMetadata`).
@@ -39,15 +41,26 @@ pub(crate) fn memory(arrangement: MemoryArrangement) -> ProcessMemory {
 /// A new address space on a 4 GiB console: the code mapped and nothing else. The log holds
 /// the code's mapping.
 pub(crate) fn created() -> (AddressSpace, MapperLog) {
+    created_with(SystemResource::NONE)
+}
+
+/// [`created`], for a process whose system resource is `resource`.
+pub(crate) fn created_with(resource: SystemResource) -> (AddressSpace, MapperLog) {
     let (mapper, log) = RecordingMapper::new();
-    let space = AddressSpace::new(&memory(MemoryArrangement::FourGb), Box::new(mapper)).unwrap();
+    let memory = memory(MemoryArrangement::FourGb);
+    let space = AddressSpace::with_system_resource(&memory, resource, Box::new(mapper)).unwrap();
     (space, log)
 }
 
 /// An address space as a loaded program's is when it starts: the segments reprotected and the
 /// main thread's stack mapped. The log is empty. Returns the stack's top as well.
 pub(crate) fn loaded() -> (AddressSpace, MapperLog, u64) {
-    let (mut space, log) = created();
+    loaded_with(SystemResource::NONE)
+}
+
+/// [`loaded`], for a process whose system resource is `resource`.
+pub(crate) fn loaded_with(resource: SystemResource) -> (AddressSpace, MapperLog, u64) {
+    let (mut space, log) = created_with(resource);
     for (address, pages, permission) in [
         (CODE, TEXT_PAGES, SvcPermission::ReadExecute),
         (RODATA, RODATA_PAGES, SvcPermission::Read),

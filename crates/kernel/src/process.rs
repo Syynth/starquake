@@ -100,17 +100,50 @@ pub enum CreateError {
     /// The scheduler refused the process.
     #[error("the scheduler refused the process: {0}")]
     Scheduler(#[from] crate::sched::SchedError),
+    /// The address space was made for another system resource than the description asks for
+    /// ([`AddressSpace::with_system_resource`]), so its memory count would not hold the
+    /// process's charge.
+    #[error(
+        "the process's address space was made for a system resource of {made:#x} bytes in the {} pool, not the {described:#x} bytes in the {} pool its description asks for",
+        .made_pool.name(),
+        .described_pool.name()
+    )]
+    SystemResource {
+        /// The size the description asks for.
+        described: u64,
+        /// The pool the description names.
+        described_pool: crate::memory::Pool,
+        /// The size the address space was made with.
+        made: u64,
+        /// The pool the address space was made with.
+        made_pool: crate::memory::Pool,
+    },
 }
 
 /// The tables of a new process (`KProcess::Initialize` and `LoadFromMetadata`, the parts that
 /// are not memory): its facts in a new [`Processes`] table, a handle table of the size the
 /// description asks for, and a scheduler with the process's row in it, in
-/// [`ProcessState::Created`]. `address_space` is its memory, created around its code.
+/// [`ProcessState::Created`]. `address_space` is its memory, created around its code with the
+/// description's system resource ([`ProcessDescription::system_resource`],
+/// [`AddressSpace::with_system_resource`]); one made for another resource is
+/// [`CreateError::SystemResource`], after the description's own checks.
 pub fn create(
     description: &ProcessDescription,
     address_space: AddressSpace,
 ) -> Result<Tables, CreateError> {
     let processes = Processes::new(description)?;
+    let (described, made) = (
+        description.system_resource(),
+        address_space.system_resource(),
+    );
+    if described != made {
+        return Err(CreateError::SystemResource {
+            described: described.size(),
+            described_pool: described.pool(),
+            made: made.size(),
+            made_pool: made.pool(),
+        });
+    }
     let handles = HandleTable::new(description.handle_table_size)?;
     let mut scheduler = Scheduler::default();
     scheduler.add_process(processes.own())?;

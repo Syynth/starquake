@@ -14,8 +14,15 @@
 //!   (`eden/src/core/hle/kernel/k_process.cpp`) gives a process a limit of its pool's size.
 //!
 //! Horizon's page heaps are not ported (kernel spec, "Not planned"): a pool here is a size and
-//! a count, and the count is what `GetInfo` reports. Only the application pool is modelled; the
-//! applet and the two system pools arrive with the first process that draws from them.
+//! a count, and the count is what `GetInfo` reports. Only the application pool's size is
+//! modelled: every process's count is that size, whatever [`Pool`] its `ACID` names. Eden sizes
+//! a process's limit from its own pool (`kernel.MemoryManager().GetSize(pool)` in
+//! `KProcess::LoadFromMetadata`), so a process of another pool may use the application pool's
+//! size here, a looser or stricter count by the difference between the two pools; the applet
+//! and the two system pools' sizes arrive with the first process that draws from them. The
+//! pool does decide what the process's system resource charges ([`super::system_resource`])
+//! and whether it is an application. Test (in `crates/core/src/image.rs`):
+//! `every_pool_partition_is_counted_against_the_application_pool`.
 //!
 //! Divergences from Eden:
 //!
@@ -99,6 +106,17 @@ impl Pool {
             Self::Applet => 1,
             Self::System => 2,
             Self::SystemNonSecure => 3,
+        }
+    }
+
+    /// The pool's name, in plain words.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Application => "application",
+            Self::Applet => "applet",
+            Self::System => "system",
+            Self::SystemNonSecure => "non-secure system",
         }
     }
 
