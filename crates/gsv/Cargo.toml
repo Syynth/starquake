@@ -27,4 +27,7 @@ starquake-services = { workspace = true, features = ["test-support"] }
 starquake-ipc.workspace = true
 # The page's restore tests drive the kernel's own dispatcher: a guest's registers.
 starquake-cpu.workspace = true
+# The native image sizer's cross-check against the layout crate (graphics-server slice 8; review
+# guide, M8): a dev-dependency only, as the spec asks.
+starquake-layout.workspace = true
 proptest.workspace = true

@@ -95,6 +95,14 @@
 //! graphics server number is: a snapshot that names another one is refused
 //! (`a_snapshot_with_another_gpu_server_is_refused`).
 //!
+//! # Native memory and images
+//!
+//! A root built for a run with gsv's shared state ([`root_server_with_page`]) answers 111, 112,
+//! 114, 314, 315, 423, 429, 430, 435 and 1510 from the native tables in that state
+//! ([`crate::native`], which lists each command's words, checks and divergences); one built
+//! without answers them with the stubs. 115 stays the root's own and keeps recording its mode.
+//! Before the bootstrap is complete each is logged and accepted, as the stubs are (decision 7).
+//!
 //! # The family sessions (202, 497, 1402)
 //!
 //! 202 and 1402 hand out sessions on the syncpt server ([`RootState::with_syncpt_server`],
@@ -170,6 +178,7 @@ use crate::protocol::command::{
     SEQUENCE_COMMAND_1202, SEQUENCE_COMMAND_1203, SET_GRAPHICS_CLASS_1111, UNMAP_NATIVE_GPU_IMAGE,
 };
 use crate::protocol::{Handed, bootstrap, root_command};
+use crate::native;
 use crate::shared::Shared;
 use crate::shared::page;
 
@@ -533,16 +542,16 @@ commands! {
         REGISTER_GPU_ADDRESS_SPACE => stub,
         OPEN_GPU_SESSION => open_gpu_session,
         GET_NVIDIA_DRIVER => get_nvidia_driver,
-        CREATE_NATIVE_MEMORY => stub,
-        DESTROY_NATIVE_MEMORY => stub,
-        BIND_NATIVE_MEMORY => stub,
-        BIND_NATIVE_GPU_MEMORY => stub,
-        CREATE_NATIVE_IMAGE => stub,
-        DESTROY_NATIVE_IMAGE => stub,
-        CALCULATE_NATIVE_IMAGE_SIZE => stub,
-        CALCULATE_IMAGE_REQUIREMENTS => stub,
-        DESTROY_NATIVE_WINDOW_ALIAS_IMAGE_POOL => stub,
-        CREATE_NATIVE_WINDOW_ALIAS_IMAGE_POOL => stub,
+        CREATE_NATIVE_MEMORY => create_native_memory,
+        DESTROY_NATIVE_MEMORY => destroy_native_memory,
+        BIND_NATIVE_MEMORY => bind_native_memory,
+        BIND_NATIVE_GPU_MEMORY => bind_native_gpu_memory,
+        CREATE_NATIVE_IMAGE => create_native_image,
+        DESTROY_NATIVE_IMAGE => destroy_native_image,
+        CALCULATE_NATIVE_IMAGE_SIZE => calculate_image_requirements,
+        CALCULATE_IMAGE_REQUIREMENTS => calculate_image_requirements,
+        DESTROY_NATIVE_WINDOW_ALIAS_IMAGE_POOL => native_window_pool,
+        CREATE_NATIVE_WINDOW_ALIAS_IMAGE_POOL => native_window_pool,
         MAP_NATIVE_GPU_IMAGE => stub,
         UNMAP_NATIVE_GPU_IMAGE => stub,
         QUERY_NATIVE_GPU_IMAGE => stub,
@@ -730,6 +739,113 @@ impl GsvRoot {
         };
         root_state(cx)?.note_unready(BIND_SYNCPOINT_MEMORY);
         page::bind(&shared, cx, req, reply)
+    }
+
+    /// A native memory or image command (module docs, "Native memory and images"): answered by
+    /// `handle` from gsv's shared state, the command logged if the bootstrap is not complete;
+    /// the stub's reply in a run without the shared state.
+    fn native(
+        this: &mut Self,
+        cx: &mut Context<'_>,
+        req: &Request<'_>,
+        reply: &mut Reply,
+        handle: fn(&Shared, &mut Context<'_>, &Request<'_>, &mut Reply) -> Outcome,
+    ) -> Outcome {
+        let Some(shared) = cx.family::<RootFamily>()?.shared.as_ref().map(Arc::clone) else {
+            return Self::stub(this, cx, req, reply);
+        };
+        root_state(cx)?.note_unready(req.command_id());
+        handle(&shared, cx, req, reply)
+    }
+
+    /// `CreateNativeMemory` (111): [`native::create_memory`].
+    fn create_native_memory(
+        this: &mut Self,
+        cx: &mut Context<'_>,
+        req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        Self::native(this, cx, req, reply, |shared, _, req, reply| {
+            native::create_memory(shared, req, reply)
+        })
+    }
+
+    /// `DestroyNativeMemory` (112): [`native::destroy_memory`].
+    fn destroy_native_memory(
+        this: &mut Self,
+        cx: &mut Context<'_>,
+        req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        Self::native(this, cx, req, reply, native::destroy_memory)
+    }
+
+    /// `BindNativeMemory` (114): [`native::bind_memory`].
+    fn bind_native_memory(
+        this: &mut Self,
+        cx: &mut Context<'_>,
+        req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        Self::native(this, cx, req, reply, native::bind_memory)
+    }
+
+    /// `BindNativeGpuMemory` (423): [`native::bind_gpu_memory`].
+    fn bind_native_gpu_memory(
+        this: &mut Self,
+        cx: &mut Context<'_>,
+        req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        Self::native(this, cx, req, reply, native::bind_gpu_memory)
+    }
+
+    /// `CreateNativeImage` (429): [`native::create_image`].
+    fn create_native_image(
+        this: &mut Self,
+        cx: &mut Context<'_>,
+        req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        Self::native(this, cx, req, reply, |shared, _, req, reply| {
+            native::create_image(shared, req, reply)
+        })
+    }
+
+    /// `DestroyNativeImage` (430): [`native::destroy_image`].
+    fn destroy_native_image(
+        this: &mut Self,
+        cx: &mut Context<'_>,
+        req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        Self::native(this, cx, req, reply, native::destroy_image)
+    }
+
+    /// `DestroyNativeWindowAliasImagePool` (314) and `CreateNativeWindowAliasImagePool` (315):
+    /// [`native::window_pool`].
+    fn native_window_pool(
+        this: &mut Self,
+        cx: &mut Context<'_>,
+        req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        Self::native(this, cx, req, reply, |shared, _, req, reply| {
+            native::window_pool(shared, req, reply)
+        })
+    }
+
+    /// `CalculateNativeImageSize` (435) and `CalculateImageRequirements` (1510):
+    /// [`native::calculate_requirements`].
+    fn calculate_image_requirements(
+        this: &mut Self,
+        cx: &mut Context<'_>,
+        req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        Self::native(this, cx, req, reply, |_, _, req, reply| {
+            native::calculate_requirements(req, reply)
+        })
     }
 
     /// Every other root command: logs it and replies success with its known reply shape (module
