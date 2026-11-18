@@ -13,12 +13,19 @@
 //! * [`hid`]: input, `hid` (an applet resource and its shared memory, as far as a libnx start-up
 //!   asks).
 //! * [`time`]: time, `time:u` (as far as a libnx start-up asks).
+//! * [`lm`]: the log manager, `lm` (a logger whose messages go to the run's guest log).
+//! * [`ectx`]: the error-context service as an application reaches it, `ectx:aw`.
+//! * [`aoc`]: the add-on content manager, `aoc:u` (no add-on content installed).
 
 pub mod am;
+pub mod aoc;
 pub mod apm;
+pub mod ectx;
+mod events;
 pub mod framework;
 pub mod fsp;
 pub mod hid;
+pub mod lm;
 pub mod set;
 mod shared_image;
 pub mod sm;
