@@ -101,7 +101,11 @@ fn encode(state: &State) -> Vec<u8> {
 fn kernel() -> Locks {
     Locks {
         process: process(),
-        live: BTreeMap::from([((0x4000, 0x2000), 1), ((0x6000, 0x3000), 1), ((0x5000, 0x1000), 1)]),
+        live: BTreeMap::from([
+            ((0x4000, 0x2000), 1),
+            ((0x6000, 0x3000), 1),
+            ((0x5000, 0x1000), 1),
+        ]),
     }
 }
 
@@ -127,7 +131,9 @@ fn the_snapshot_layout_is_pinned() {
     // 3: mode 1, 0x2000, live, bound at 0x4000 to process memory, not GPU-checked.
     expected.extend([3, 1, 0x80, 0x40, 0, 1, 0x80, 0x80, 0x01, pi, pg, 0, 0]);
     // 5: mode 2, 0x3000, retired, bound at 0x6000 to registration 7 at offset 0x1000.
-    expected.extend([5, 2, 0x80, 0x60, 1, 1, 0x80, 0xC0, 0x01, pi, pg, 1, 7, 0x80, 0x20]);
+    expected.extend([
+        5, 2, 0x80, 0x60, 1, 1, 0x80, 0xC0, 0x01, pi, pg, 1, 7, 0x80, 0x20,
+    ]);
     // 6: mode 3, 0x1000, live, bound at 0x5000 to process memory, GPU-checked.
     expected.extend([6, 3, 0x80, 0x20, 0, 1, 0x80, 0xA0, 0x01, pi, pg, 0, 1]);
     // 9: mode 1, 0x2000, live, unbound.
@@ -154,7 +160,10 @@ fn the_snapshot_layout_is_pinned() {
 fn a_restore_reads_every_field() {
     let restored = restore(&golden()).unwrap();
     let five = restored.memories().find(|(id, _)| *id == 5).unwrap().1;
-    assert_eq!((five.mode(), five.size(), five.retired()), (2, 0x3000, true));
+    assert_eq!(
+        (five.mode(), five.size(), five.retired()),
+        (2, 0x3000, true)
+    );
     assert_eq!(
         five.binding(),
         Some(&Binding {
@@ -175,7 +184,12 @@ fn a_restore_reads_every_field() {
     assert_eq!(restored.memory(9).unwrap().binding(), None);
     let image = restored.image(8).unwrap();
     assert_eq!(
-        (image.memory(), image.count(), image.size(), image.window_pool()),
+        (
+            image.memory(),
+            image.count(),
+            image.size(),
+            image.window_pool()
+        ),
         (3, 3, 1536, false)
     );
     assert_eq!(image.preference(), &image_b());
@@ -382,7 +396,10 @@ fn the_checks_run_in_order() {
     let mut state = golden();
     state.images[1].memory = 7;
     state.memories[3].retired = true;
-    assert_eq!(refusal(&state), SnapshotError::Dangling { index: 1 }.to_string());
+    assert_eq!(
+        refusal(&state),
+        SnapshotError::Dangling { index: 1 }.to_string()
+    );
     let mut state = golden();
     state.memories[3].retired = true;
     let none = Locks {

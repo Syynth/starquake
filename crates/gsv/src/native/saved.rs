@@ -129,7 +129,9 @@ pub enum SnapshotError {
         index: usize,
     },
     /// An entry's id is not above the one before it in its list.
-    #[error("{part} {index} of the native tables snapshot is out of order or repeats one before it")]
+    #[error(
+        "{part} {index} of the native tables snapshot is out of order or repeats one before it"
+    )]
     Order {
         /// What it is.
         part: Part,
@@ -306,7 +308,11 @@ impl State {
                 return Err(out_of_range);
             }
         }
-        let live = self.memories.iter().filter(|memory| !memory.retired).count();
+        let live = self
+            .memories
+            .iter()
+            .filter(|memory| !memory.retired)
+            .count();
         if live > MAX_MEMORIES {
             return Err(SnapshotError::TooMany { part: memory_part });
         }

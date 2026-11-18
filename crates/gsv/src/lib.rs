@@ -14,8 +14,8 @@
 //!   (ctrl-gpu characteristics, as-gpu address-space views, tsg-gpu timeslice groups).
 //! * [`syncpt`]: the syncpt session: slot events, armed waits and counter queries.
 //! * [`gpu`]: the gpu session (497) and its worker: GPU memory, mappings and sparse regions.
-//! * [`native`]: native memory and native images (root 111–115, 314, 315, 423, 429, 430, 435,
-//!   1510) and their size.
+//! * [`native`]: native memory and native images (root 111, 112, 114, 314, 315, 423, 429, 430,
+//!   435, 1510) and their size.
 
 pub mod completion;
 pub mod gpu;

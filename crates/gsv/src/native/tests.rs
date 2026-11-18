@@ -125,7 +125,9 @@ impl Rig {
         let mut buffer = vec![STALE; BUFFER_SIZE];
         let bytes = le(words);
         buffer[..bytes.len()].copy_from_slice(&bytes);
-        let handled = self.server.handle(&mut self.kernel, self.session, &mut buffer);
+        let handled = self
+            .server
+            .handle(&mut self.kernel, self.session, &mut buffer);
         assert_eq!(handled, Ok(Handled::Replied));
         buffer
     }
@@ -319,7 +321,10 @@ fn each_create_check_refuses_on_its_own() {
     assert_eq!(rig.native(), NativeObjects::new());
 
     // The accepted side of each edge.
-    assert_eq!(rig.create(0x103, 1), success(CREATE_NATIVE_MEMORY, &[], &[1]));
+    assert_eq!(
+        rig.create(0x103, 1),
+        success(CREATE_NATIVE_MEMORY, &[], &[1])
+    );
     assert_eq!(
         rig.create(0, 0x1_0000_0000_0000),
         success(CREATE_NATIVE_MEMORY, &[], &[2])
@@ -344,7 +349,10 @@ fn memories_are_bounded_at_the_limit() {
     rig.image(&page_image(), first);
     assert_eq!(rig.destroy(first), success(DESTROY_NATIVE_MEMORY, &[], &[]));
     let id = u32::try_from(MAX_MEMORIES).unwrap() + 1;
-    assert_eq!(rig.create(0, PAGE), success(CREATE_NATIVE_MEMORY, &[], &[id]));
+    assert_eq!(
+        rig.create(0, PAGE),
+        success(CREATE_NATIVE_MEMORY, &[], &[id])
+    );
     assert_eq!(rig.create(0, PAGE), full);
 }
 
@@ -353,10 +361,7 @@ fn memories_are_bounded_at_the_limit() {
 fn ids_run_out_after_the_last() {
     let mut rig = Rig::new();
     let memory = rig.bound(MEMORY, PAGE);
-    rig.shared
-        .lock()
-        .native()
-        .set_next_ids(u32::MAX, u32::MAX);
+    rig.shared.lock().native().set_next_ids(u32::MAX, u32::MAX);
     assert_eq!(
         rig.create(0, PAGE),
         success(CREATE_NATIVE_MEMORY, &[], &[u32::MAX])
@@ -404,7 +409,10 @@ fn a_memory_is_made_bound_imaged_and_destroyed() {
         (id, 1, 2 * PAGE, false)
     );
     assert_eq!(made.preference(), &two_page_image());
-    assert_eq!(rig.destroy_image(image), success(DESTROY_NATIVE_IMAGE, &[], &[]));
+    assert_eq!(
+        rig.destroy_image(image),
+        success(DESTROY_NATIVE_IMAGE, &[], &[])
+    );
     assert_eq!(rig.kernel.device_locks(MEMORY, 2 * PAGE), 1);
     assert_eq!(rig.destroy(id), success(DESTROY_NATIVE_MEMORY, &[], &[]));
     assert_eq!(rig.kernel.device_locks(MEMORY, 2 * PAGE), 0);
@@ -439,7 +447,11 @@ fn a_memory_in_use_is_retired_until_its_last_image_goes() {
     assert_eq!(rig.destroy(id), success(DESTROY_NATIVE_MEMORY, &[], &[]));
     let native = rig.native();
     assert!(native.memory(id).is_none());
-    assert!(native.memories().any(|(at, memory)| at == id && memory.retired()));
+    assert!(
+        native
+            .memories()
+            .any(|(at, memory)| at == id && memory.retired())
+    );
     assert_eq!(rig.kernel.device_locks(MEMORY, PAGE), 1);
 
     let not_found = |command| result_only(command, code(KernelError::NotFound));
@@ -453,10 +465,16 @@ fn a_memory_in_use_is_retired_until_its_last_image_goes() {
         not_found(BIND_NATIVE_MEMORY)
     );
 
-    assert_eq!(rig.destroy_image(first), success(DESTROY_NATIVE_IMAGE, &[], &[]));
+    assert_eq!(
+        rig.destroy_image(first),
+        success(DESTROY_NATIVE_IMAGE, &[], &[])
+    );
     assert_eq!(rig.kernel.device_locks(MEMORY, PAGE), 1);
     assert!(rig.native().memories().any(|(at, _)| at == id));
-    assert_eq!(rig.destroy_image(second), success(DESTROY_NATIVE_IMAGE, &[], &[]));
+    assert_eq!(
+        rig.destroy_image(second),
+        success(DESTROY_NATIVE_IMAGE, &[], &[])
+    );
     assert_eq!(rig.kernel.device_locks(MEMORY, PAGE), 0);
     assert_eq!(rig.native().memories().count(), 0);
 }
@@ -467,7 +485,10 @@ fn the_last_image_of_a_live_memory_keeps_it() {
     let mut rig = Rig::new();
     let id = rig.bound(MEMORY, PAGE);
     let image = rig.image(&page_image(), id);
-    assert_eq!(rig.destroy_image(image), success(DESTROY_NATIVE_IMAGE, &[], &[]));
+    assert_eq!(
+        rig.destroy_image(image),
+        success(DESTROY_NATIVE_IMAGE, &[], &[])
+    );
     assert!(rig.native().memory(id).is_some());
     assert_eq!(rig.kernel.device_locks(MEMORY, PAGE), 1);
 }
@@ -494,11 +515,22 @@ fn a_refused_release_is_the_answer_and_the_memory_goes() {
     let id = rig.bound(MEMORY, PAGE);
     let image = rig.image(&page_image(), id);
     rig.destroy(id);
-    let token = rig.native().memories().next().unwrap().1.binding().unwrap().token;
+    let token = rig
+        .native()
+        .memories()
+        .next()
+        .unwrap()
+        .1
+        .binding()
+        .unwrap()
+        .token;
     rig.kernel.unlock_device_share(token).unwrap();
     assert_eq!(
         rig.destroy_image(image),
-        result_only(DESTROY_NATIVE_IMAGE, code(KernelError::InvalidCurrentMemory))
+        result_only(
+            DESTROY_NATIVE_IMAGE,
+            code(KernelError::InvalidCurrentMemory)
+        )
     );
     assert_eq!(rig.native().memories().count(), 0);
     assert_eq!(rig.native().images().count(), 0);
@@ -519,26 +551,72 @@ fn each_bind_check_refuses_on_its_own() {
         (id, MEMORY, PAGE, 1, 0, KernelError::NotImplemented),
         (id, MEMORY, PAGE, 3, 0, KernelError::NotImplemented),
         // Differs from flags 2 only in the high word.
-        (id, MEMORY, PAGE, 0x1_0000_0002, 0, KernelError::NotImplemented),
+        (
+            id,
+            MEMORY,
+            PAGE,
+            0x1_0000_0002,
+            0,
+            KernelError::NotImplemented,
+        ),
         (id, MEMORY, PAGE, 0, 1, KernelError::NotImplemented),
-        (id, MEMORY, PAGE, 0, 0x1_0000_0000, KernelError::NotImplemented),
+        (
+            id,
+            MEMORY,
+            PAGE,
+            0,
+            0x1_0000_0000,
+            KernelError::NotImplemented,
+        ),
         (other, MEMORY, PAGE, 0, 0, KernelError::InvalidState),
         (id, MEMORY, PAGE - 1, 0, 0, KernelError::InvalidSize),
         (id, MEMORY, PAGE + 1, 0, 0, KernelError::InvalidSize),
-        (id, MEMORY, PAGE + 0x1_0000_0000, 0, 0, KernelError::InvalidSize),
+        (
+            id,
+            MEMORY,
+            PAGE + 0x1_0000_0000,
+            0,
+            0,
+            KernelError::InvalidSize,
+        ),
         (id, 0, PAGE, 0, 0, KernelError::InvalidSize),
-        (id, u64::MAX - PAGE + 1, PAGE, 0, 0, KernelError::InvalidSize),
+        (
+            id,
+            u64::MAX - PAGE + 1,
+            PAGE,
+            0,
+            0,
+            KernelError::InvalidSize,
+        ),
         (id, MEMORY + 1, PAGE, 0, 0, KernelError::InvalidAddress),
         (id, MEMORY + 0x800, PAGE, 0, 0, KernelError::InvalidAddress),
         // Not GPU accessible (the neighbour), with flags 2.
         (id, NEIGHBOUR, PAGE, 2, 0, KernelError::InvalidCurrentMemory),
         // Not mapped: the kernel's lock refuses it.
-        (id, NEIGHBOUR + PAGE, PAGE, 0, 0, KernelError::InvalidCurrentMemory),
-        (id, NEIGHBOUR + PAGE, PAGE, 2, 0, KernelError::InvalidCurrentMemory),
+        (
+            id,
+            NEIGHBOUR + PAGE,
+            PAGE,
+            0,
+            0,
+            KernelError::InvalidCurrentMemory,
+        ),
+        (
+            id,
+            NEIGHBOUR + PAGE,
+            PAGE,
+            2,
+            0,
+            KernelError::InvalidCurrentMemory,
+        ),
     ];
     for (memory, address, size, flags, offset, error) in cases {
         let reply = rig.bind(memory, address, size, flags, offset);
-        assert_eq!(reply, answer(error), "{memory} {address:#x} {size:#x} {flags} {offset}");
+        assert_eq!(
+            reply,
+            answer(error),
+            "{memory} {address:#x} {size:#x} {flags} {offset}"
+        );
         assert_eq!(rig.native().memory(id).unwrap().binding(), None);
         assert_eq!(rig.kernel.device_locks(address, size), 0);
     }
@@ -634,7 +712,10 @@ fn a_short_request_changes_nothing() {
     image.push(1);
     assert_eq!(rig.send(&image), short(CREATE_NATIVE_IMAGE));
     assert_eq!(rig.native().images().count(), 0);
-    assert_eq!(rig.send(&[0x14B, 1, 1]), short(CREATE_NATIVE_WINDOW_ALIAS_IMAGE_POOL));
+    assert_eq!(
+        rig.send(&[0x14B, 1, 1]),
+        short(CREATE_NATIVE_WINDOW_ALIAS_IMAGE_POOL)
+    );
     let mut calculate = vec![0x5F6, 16];
     calculate.extend(page_image());
     assert_eq!(rig.send(&calculate), short(CALCULATE_IMAGE_REQUIREMENTS));
@@ -654,7 +735,10 @@ fn commands_before_the_bootstrap_are_accepted() {
     assert_eq!(state, crate::root::Phase::Created);
     let id = rig.bound(MEMORY, PAGE);
     let image = rig.image(&page_image(), id);
-    assert_eq!(rig.pool(image, 1), success(CREATE_NATIVE_WINDOW_ALIAS_IMAGE_POOL, &[], &[]));
+    assert_eq!(
+        rig.pool(image, 1),
+        success(CREATE_NATIVE_WINDOW_ALIAS_IMAGE_POOL, &[], &[])
+    );
 }
 
 // ----- 423 -------------------------------------------------------------------------------------
@@ -691,8 +775,20 @@ fn gpu_bind_parent_checks() {
     let id = rig.created(PAGE);
     let answer = |error| result_only(BIND_NATIVE_GPU_MEMORY, code(error));
     let cases = [
-        (MEMORY + 2 * PAGE, 0, parent, 2 * PAGE, KernelError::InvalidSize),
-        (MEMORY + 3 * PAGE, 0, parent, 3 * PAGE, KernelError::NotFound),
+        (
+            MEMORY + 2 * PAGE,
+            0,
+            parent,
+            2 * PAGE,
+            KernelError::InvalidSize,
+        ),
+        (
+            MEMORY + 3 * PAGE,
+            0,
+            parent,
+            3 * PAGE,
+            KernelError::NotFound,
+        ),
         // A size reaching the parent's end exactly passes (then it is not the memory's size).
         (MEMORY, 2 * PAGE, parent, 0, KernelError::InvalidSize),
         (MEMORY, 2 * PAGE + 1, parent, 0, KernelError::NotFound),
@@ -703,11 +799,21 @@ fn gpu_bind_parent_checks() {
         // An offset that wraps the parent's start.
         (MEMORY, PAGE, parent, u64::MAX, KernelError::NotFound),
         // An offset that differs from the good one only in its high word.
-        (MEMORY + PAGE, PAGE, parent, PAGE + 0x1_0000_0000, KernelError::NotFound),
+        (
+            MEMORY + PAGE,
+            PAGE,
+            parent,
+            PAGE + 0x1_0000_0000,
+            KernelError::NotFound,
+        ),
     ];
     for (address, size, from, offset, error) in cases {
         let reply = rig.bind_gpu(id, address, size, from, offset, [0; 4]);
-        assert_eq!(reply, answer(error), "{address:#x} {size:#x} {from} {offset:#x}");
+        assert_eq!(
+            reply,
+            answer(error),
+            "{address:#x} {size:#x} {from} {offset:#x}"
+        );
         assert_eq!(rig.native().memory(id).unwrap().binding(), None);
     }
     assert_eq!(rig.kernel.device_locks(MEMORY + PAGE, PAGE), 0);
@@ -719,11 +825,18 @@ fn gpu_bind_trailing_words_must_be_zero() {
     let mut rig = Rig::new();
     let parent = rig.register(MEMORY, PAGE);
     let id = rig.created(PAGE);
-    let invalid = result_only(BIND_NATIVE_GPU_MEMORY, code(KernelError::InvalidCombination));
+    let invalid = result_only(
+        BIND_NATIVE_GPU_MEMORY,
+        code(KernelError::InvalidCombination),
+    );
     for at in 0..4 {
         let mut tail = [0; 4];
         tail[at] = 1;
-        assert_eq!(rig.bind_gpu(id, MEMORY, PAGE, parent, 0, tail), invalid, "{at}");
+        assert_eq!(
+            rig.bind_gpu(id, MEMORY, PAGE, parent, 0, tail),
+            invalid,
+            "{at}"
+        );
     }
     // Before the parent: both faults at once.
     assert_eq!(
@@ -768,7 +881,10 @@ fn a_gpu_bind_checks_the_attribute() {
     let id = rig.created(PAGE);
     assert_eq!(
         rig.bind_gpu(id, NEIGHBOUR, PAGE, parent, 0, [0; 4]),
-        result_only(BIND_NATIVE_GPU_MEMORY, code(KernelError::InvalidCurrentMemory))
+        result_only(
+            BIND_NATIVE_GPU_MEMORY,
+            code(KernelError::InvalidCurrentMemory)
+        )
     );
     assert_eq!(rig.native().memory(id).unwrap().binding(), None);
 }
@@ -795,7 +911,13 @@ fn a_parent_destroy_leaves_the_bind_s_own_lock() {
     let id = rig.created(PAGE);
     rig.bind_gpu(id, MEMORY + PAGE, PAGE, parent, PAGE, [0; 4]);
     let event = rig.kernel.new_object();
-    let token = rig.shared.lock().gpu_memory().registration(parent).unwrap().token;
+    let token = rig
+        .shared
+        .lock()
+        .gpu_memory()
+        .registration(parent)
+        .unwrap()
+        .token;
     rig.shared
         .lock()
         .gpu()
@@ -803,7 +925,13 @@ fn a_parent_destroy_leaves_the_bind_s_own_lock() {
         .unwrap();
     // The drain releases the parent's lock once the GPU is done; here, at once.
     rig.kernel.unlock_device_share(token).unwrap();
-    assert!(rig.shared.lock().gpu_memory().registration(parent).is_none());
+    assert!(
+        rig.shared
+            .lock()
+            .gpu_memory()
+            .registration(parent)
+            .is_none()
+    );
     assert_eq!(rig.kernel.device_locks(MEMORY, 2 * PAGE), 0);
     assert!(rig.native().memory(id).unwrap().binding().is_some());
     assert_eq!(rig.kernel.device_locks(MEMORY + PAGE, PAGE), 1);
@@ -906,16 +1034,25 @@ fn an_image_in_a_window_pool_is_busy() {
         rig.destroy_image(image + 1),
         result_only(DESTROY_NATIVE_IMAGE, code(KernelError::NotFound))
     );
-    assert_eq!(rig.pool(image, 1), success(CREATE_NATIVE_WINDOW_ALIAS_IMAGE_POOL, &[], &[]));
+    assert_eq!(
+        rig.pool(image, 1),
+        success(CREATE_NATIVE_WINDOW_ALIAS_IMAGE_POOL, &[], &[])
+    );
     assert!(rig.native().image(image).unwrap().window_pool());
     assert_eq!(
         rig.destroy_image(image),
         result_only(DESTROY_NATIVE_IMAGE, code(KernelError::Busy))
     );
     assert!(rig.native().image(image).is_some());
-    assert_eq!(rig.unpool(image), success(DESTROY_NATIVE_WINDOW_ALIAS_IMAGE_POOL, &[], &[]));
+    assert_eq!(
+        rig.unpool(image),
+        success(DESTROY_NATIVE_WINDOW_ALIAS_IMAGE_POOL, &[], &[])
+    );
     assert!(!rig.native().image(image).unwrap().window_pool());
-    assert_eq!(rig.destroy_image(image), success(DESTROY_NATIVE_IMAGE, &[], &[]));
+    assert_eq!(
+        rig.destroy_image(image),
+        success(DESTROY_NATIVE_IMAGE, &[], &[])
+    );
 }
 
 /// 314's and 315's checks, each alone, and both faults at once.
@@ -934,7 +1071,10 @@ fn window_pool_checks() {
     assert_eq!(rig.unpool(image), unpool(KernelError::InvalidState));
     assert_eq!(rig.unpool(image + 1), unpool(KernelError::NotFound));
     assert!(!rig.native().image(image).unwrap().window_pool());
-    assert_eq!(rig.pool(image, 1), success(CREATE_NATIVE_WINDOW_ALIAS_IMAGE_POOL, &[], &[]));
+    assert_eq!(
+        rig.pool(image, 1),
+        success(CREATE_NATIVE_WINDOW_ALIAS_IMAGE_POOL, &[], &[])
+    );
     assert_eq!(rig.pool(image, 1), pool(KernelError::InvalidState));
     // In a pool, a bad count is still `NotImplemented`: it comes before the state.
     assert_eq!(rig.pool(image, 2), pool(KernelError::NotImplemented));
@@ -967,12 +1107,21 @@ fn calculations_reply_the_size_and_alignment() {
     );
     // Each requires its own kind.
     let invalid = |command| result_only(command, code(KernelError::InvalidCombination));
-    assert_eq!(rig.calculate(0x1C3, &block, 1), invalid(CALCULATE_NATIVE_IMAGE_SIZE));
-    assert_eq!(rig.calculate(0x5F6, &native, 1), invalid(CALCULATE_IMAGE_REQUIREMENTS));
+    assert_eq!(
+        rig.calculate(0x1C3, &block, 1),
+        invalid(CALCULATE_NATIVE_IMAGE_SIZE)
+    );
+    assert_eq!(
+        rig.calculate(0x5F6, &native, 1),
+        invalid(CALCULATE_IMAGE_REQUIREMENTS)
+    );
     // A kind word that differs from 2 only above its low byte.
     let mut high = block;
     high[1] = 0x102;
-    assert_eq!(rig.calculate(0x5F6, &high, 1), invalid(CALCULATE_IMAGE_REQUIREMENTS));
+    assert_eq!(
+        rig.calculate(0x5F6, &high, 1),
+        invalid(CALCULATE_IMAGE_REQUIREMENTS)
+    );
 }
 
 /// A count of 0 with a good preference is gsv's result `0x100f3`; with a bad one, and any other
@@ -1033,7 +1182,10 @@ fn a_restored_table_answers_commands() {
         result_only(DESTROY_NATIVE_IMAGE, code(KernelError::NotFound))
     );
     *rig.shared.lock().native() = restored;
-    assert_eq!(rig.destroy_image(image), success(DESTROY_NATIVE_IMAGE, &[], &[]));
+    assert_eq!(
+        rig.destroy_image(image),
+        success(DESTROY_NATIVE_IMAGE, &[], &[])
+    );
     assert_eq!(rig.kernel.device_locks(MEMORY + 2 * PAGE, PAGE), 0);
     assert_eq!(rig.destroy(gpu), success(DESTROY_NATIVE_MEMORY, &[], &[]));
     assert_eq!(rig.kernel.device_locks(MEMORY, PAGE), 0);

@@ -60,7 +60,8 @@
 //!
 //! # Stubs
 //!
-//! Every other command of the table ([`crate::protocol::ROOT_COMMANDS`]) is a logged stub that
+//! Every other command of the table ([`crate::protocol::ROOT_COMMANDS`]), and in a root without
+//! gsv's shared state the native ones (below, "Native memory and images"), is a logged stub that
 //! replies success with its known reply shape ([`crate::protocol::ReplyShape`]): its handles,
 //! then its data words, all zero. Each handle is copied ([`crate::protocol::HANDLE_KIND`]):
 //!
@@ -160,6 +161,7 @@ use starquake_services::framework::{
 };
 use starquake_trace::ServiceId;
 
+use crate::native;
 use crate::protocol::command::{
     ACTIVATE_FRAME_CONTEXT, ACTIVATE_GPU_CONTEXT, BIND_NATIVE_GPU_MEMORY, BIND_NATIVE_MEMORY,
     BIND_PROCESS, BIND_SYNCPOINT_MEMORY, CALCULATE_IMAGE_REQUIREMENTS, CALCULATE_NATIVE_IMAGE_SIZE,
@@ -178,7 +180,6 @@ use crate::protocol::command::{
     SEQUENCE_COMMAND_1202, SEQUENCE_COMMAND_1203, SET_GRAPHICS_CLASS_1111, UNMAP_NATIVE_GPU_IMAGE,
 };
 use crate::protocol::{Handed, bootstrap, root_command};
-use crate::native;
 use crate::shared::Shared;
 use crate::shared::page;
 

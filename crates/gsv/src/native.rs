@@ -107,8 +107,9 @@
 //! What a hostile title can make gsv hold: [`MAX_MEMORIES`] live memories and [`MAX_IMAGES`]
 //! images (PR's limits, pinned at the edge by `memories_are_bounded_at_the_limit` and
 //! `images_are_bounded_at_the_limit`). A retired memory is not counted among the live ones, as
-//! in PR, but each has at least one image, so there are at most [`MAX_IMAGES`] of them. Every
-//! request walks at most the images of one memory.
+//! in PR, but each has at least one image, so there are at most [`MAX_IMAGES`] of them. A request
+//! walks at most these tables once (counting the live memories, or looking for an image of a
+//! memory), so its work is bounded by the limits, not by anything a title grows past them.
 //!
 //! # What is recorded and what is snapshotted
 //!
@@ -407,7 +408,10 @@ impl NativeObjects {
 
     /// The live memories (not retired).
     fn live_memories(&self) -> usize {
-        self.memories.values().filter(|memory| !memory.retired).count()
+        self.memories
+            .values()
+            .filter(|memory| !memory.retired)
+            .count()
     }
 
     /// Whether an image lies in memory `id`.
@@ -448,7 +452,11 @@ impl NativeObjects {
 
     /// 114's checks before the kernel's (PR `BindNativeMemoryBacking`, to the alignment
     /// check), for a bind by `source`.
-    fn admit(&mut self, request: &BindRequest, source: Source) -> Result<BindAdmission<'_>, ResultCode> {
+    fn admit(
+        &mut self,
+        request: &BindRequest,
+        source: Source,
+    ) -> Result<BindAdmission<'_>, ResultCode> {
         let memory = self
             .memories
             .get_mut(&request.id)
@@ -592,13 +600,11 @@ impl NativeObjects {
 
     /// 315 (`create`, with its count) and 314: puts image `id` in a window alias image pool or
     /// takes it out (module docs, "Checks, in order").
-    pub fn set_window_pool(
-        &mut self,
-        id: u32,
-        create: bool,
-        count: u32,
-    ) -> Result<(), ResultCode> {
-        let image = self.images.get_mut(&id).ok_or(KernelError::NotFound.code())?;
+    pub fn set_window_pool(&mut self, id: u32, create: bool, count: u32) -> Result<(), ResultCode> {
+        let image = self
+            .images
+            .get_mut(&id)
+            .ok_or(KernelError::NotFound.code())?;
         if create && count != WINDOW_POOL_COUNT {
             return Err(KernelError::NotImplemented.code());
         }
@@ -611,7 +617,11 @@ impl NativeObjects {
 }
 
 /// 435's and 1510's answer for a preference of `kind` (module docs, "Checks, in order").
-pub fn calculate(kind: u32, preference: &Preference, count: u32) -> Result<layout::Requirements, ResultCode> {
+pub fn calculate(
+    kind: u32,
+    preference: &Preference,
+    count: u32,
+) -> Result<layout::Requirements, ResultCode> {
     if preference[WORD_KIND] != kind {
         return Err(KernelError::InvalidCombination.code());
     }

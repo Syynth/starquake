@@ -147,20 +147,45 @@ fn each_preference_check_refuses_on_its_own() {
         (1, 0, PreferenceError::Kind(0)),
         (1, 3, PreferenceError::Kind(3)),
         (1, 0x101, PreferenceError::Kind(0x101)),
-        (3, 0x100, PreferenceError::WordNotZero { word: 3, value: 0x100 }),
+        (
+            3,
+            0x100,
+            PreferenceError::WordNotZero {
+                word: 3,
+                value: 0x100,
+            },
+        ),
         (6, 2, PreferenceError::Format(2)),
         (6, 0x104, PreferenceError::Format(0x104)),
         (7, 0, PreferenceError::WordNotOne(0)),
         (7, 0x101, PreferenceError::WordNotOne(0x101)),
         (4, 0x107, PreferenceError::BlockHeight(0x107)),
         (8, 1, PreferenceError::WordNotZero { word: 8, value: 1 }),
-        (15, 0x100, PreferenceError::WordNotZero { word: 15, value: 0x100 }),
-        (5, 79, PreferenceError::Pitch { pitch: 79, width: 1280 }),
+        (
+            15,
+            0x100,
+            PreferenceError::WordNotZero {
+                word: 15,
+                value: 0x100,
+            },
+        ),
+        (
+            5,
+            79,
+            PreferenceError::Pitch {
+                pitch: 79,
+                width: 1280,
+            },
+        ),
     ];
     for (word, value, error) in cases {
         let mut preference = hd();
         preference[word] = value;
-        assert_eq!(requirements(&preference, 1), Err(error), "word {word} = {value:#x}");
+        assert_eq!(
+            requirements(&preference, 1),
+            Err(error),
+            "word {word} = {value:#x}"
+        );
     }
     // Every tail word is checked, not only the first and last.
     for word in 8..16 {
@@ -197,7 +222,11 @@ fn checks_run_in_pr_s_order() {
             let mut both = alone;
             both[word_b] = value_b;
             // A count of 0 as well: every preference fault comes before it.
-            assert_eq!(requirements(&both, 0), Err(expected), "{word_a} then {word_b}");
+            assert_eq!(
+                requirements(&both, 0),
+                Err(expected),
+                "{word_a} then {word_b}"
+            );
         }
     }
 }
@@ -225,17 +254,42 @@ fn block_height_edges() {
 fn pitch_edges() {
     let zero = PreferenceError::ZeroCount;
     let cases = [
-        (17, 1, PreferenceError::Pitch { pitch: 1, width: 17 }),
+        (
+            17,
+            1,
+            PreferenceError::Pitch {
+                pitch: 1,
+                width: 17,
+            },
+        ),
         (17, 2, zero),
         (16, 1, zero),
         (17, 4096, zero),
-        (17, 4097, PreferenceError::Pitch { pitch: 4097, width: 17 }),
-        (65_536, 4095, PreferenceError::Pitch { pitch: 4095, width: 65_536 }),
+        (
+            17,
+            4097,
+            PreferenceError::Pitch {
+                pitch: 4097,
+                width: 17,
+            },
+        ),
+        (
+            65_536,
+            4095,
+            PreferenceError::Pitch {
+                pitch: 4095,
+                width: 65_536,
+            },
+        ),
         (65_536, 4096, zero),
     ];
     for (width, pitch, outcome) in cases {
         let preference = laid_out(1, width, 8, 3, pitch, 1);
-        assert_eq!(requirements(&preference, 0), Err(outcome), "{width} {pitch}");
+        assert_eq!(
+            requirements(&preference, 0),
+            Err(outcome),
+            "{width} {pitch}"
+        );
     }
     assert_eq!(min_pitch_gobs(16), 1);
     assert_eq!(min_pitch_gobs(17), 2);
@@ -288,8 +342,13 @@ fn layout_image(width_px: u32, height: u32, block: u32, count: u32) -> Image {
         extent_px: Extent4D::new(width_px, height, 1, count),
         levels: 1,
         sample_layout: SampleLayout::S1x1,
-        tiling: Tiling::new(GobType::TuringColor2d, 0, u8::try_from(block - 3).unwrap(), 0)
-            .unwrap(),
+        tiling: Tiling::new(
+            GobType::TuringColor2d,
+            0,
+            u8::try_from(block - 3).unwrap(),
+            0,
+        )
+        .unwrap(),
         pitch_b: None,
     };
     Image::new(&desc).unwrap()
@@ -312,12 +371,16 @@ fn the_size_agrees_with_the_layout_crate() {
                     // The same storage: a row of `pitch` GOBs holds `pitch * 16` texels.
                     let image = layout_image(pitch * 16, height, block, count);
                     let stride = image.array_stride_b() * u64::from(count);
-                    let kept = image.levels()[0].tiling.y_log2() == u8::try_from(block - 3).unwrap();
+                    let kept =
+                        image.levels()[0].tiling.y_log2() == u8::try_from(block - 3).unwrap();
                     if kept {
                         assert_eq!(ours.size, stride, "{width}x{height} block {block} x{count}");
                         agreed += 1;
                     } else {
-                        assert!(ours.size > stride, "{width}x{height} block {block} x{count}");
+                        assert!(
+                            ours.size > stride,
+                            "{width}x{height} block {block} x{count}"
+                        );
                         clamped += 1;
                     }
                     let tile = image.levels()[0].tiling.size_b();
