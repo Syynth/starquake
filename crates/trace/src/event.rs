@@ -136,8 +136,8 @@ pub enum EventKind {
         /// The service that owns the session.
         service: ServiceId,
         /// The interface the request was dispatched to, as the service framework names it: the
-        /// session's own interface, or the domain object's the request names (for a control
-        /// request, the session's).
+        /// session's own interface, or the domain object's the request names; for a control
+        /// request, whatever the session, the framework's control interface (`IpcController`).
         interface: InterfaceName,
         /// The protocol the request came in.
         protocol: IpcProtocol,

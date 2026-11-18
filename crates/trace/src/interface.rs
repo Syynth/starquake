@@ -30,7 +30,7 @@ pub const REPLACEMENT: u8 = b'?';
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum InterfaceNameError {
     /// The name is empty.
-    #[error("an interface name is not empty")]
+    #[error("an interface name is empty")]
     Empty,
     /// The name is longer than [`INTERFACE_NAME_CAPACITY`] bytes.
     #[error("an interface name of {len} bytes is longer than {INTERFACE_NAME_CAPACITY} bytes")]
@@ -233,7 +233,7 @@ mod tests {
     fn the_errors_are_plain_words() {
         assert_eq!(
             InterfaceNameError::Empty.to_string(),
-            "an interface name is not empty"
+            "an interface name is empty"
         );
         assert_eq!(
             InterfaceNameError::TooLong { len: 41 }.to_string(),
