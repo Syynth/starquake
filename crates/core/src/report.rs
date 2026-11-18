@@ -14,6 +14,7 @@ use starquake_kernel::sched::ThreadState;
 use starquake_trace::Dump;
 
 use crate::crash::{CrashReport, Location, Module, address_text};
+use crate::services_report::{ServicesReport, StubbedCommand};
 
 /// The process exit codes of `starquake run` (`docs/specs/observability.md`, "Headless runs").
 pub mod exit_code {
@@ -34,7 +35,16 @@ pub mod exit_code {
 
 /// Version of the `summary.json` layout. Bump it when a field is renamed, removed or changes
 /// meaning.
-pub const SUMMARY_VERSION: u32 = 1;
+///
+/// 2: `service_commands` is filled in, and `service_commands_uncounted`, `stubbed_commands`,
+/// `unknown_services`, `host_log_lines` and `host_log_lines_dropped` are added.
+pub const SUMMARY_VERSION: u32 = 2;
+
+/// Bytes of guest log text a run keeps (`guest_log.txt`), and of the emulator's own warnings
+/// (`log.txt`, [`crate::host_log`]): whole lines from the first while their total fits.
+/// starquake's own number; the observability spec asks for a size cap per run without fixing
+/// one ("These numbers are provisional").
+pub const GUEST_LOG_BYTES: usize = 4 << 20;
 
 /// What a run is asked to do.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -243,6 +253,16 @@ pub struct RunReport {
     /// Where each guest thread was when the run stopped, by thread id, for a run that ended at
     /// its timeout ([`ExitReason::Timeout`]); empty for every other ending.
     pub threads: Vec<ThreadPc>,
+    /// What the services left behind: requests by command, the commands they auto-stubbed and
+    /// the service names nothing provides. Empty if the run failed before its services were
+    /// set up.
+    pub services: ServicesReport,
+    /// The emulator's own warnings and errors during the run (`log.txt`), as the command-line
+    /// tool's [`HostLog`](crate::host_log::HostLog) kept them: up to [`GUEST_LOG_BYTES`] of
+    /// text, the first lines. Empty unless whoever ran the run put them here.
+    pub host_log: Vec<String>,
+    /// How many later lines of the emulator's log were not kept because the limit was reached.
+    pub host_log_dropped: u64,
 }
 
 impl RunReport {
@@ -264,6 +284,9 @@ impl RunReport {
             patched_counter_reads: Vec::new(),
             memory_map: Vec::new(),
             threads: Vec::new(),
+            services: ServicesReport::default(),
+            host_log: Vec::new(),
+            host_log_dropped: 0,
         }
     }
 
@@ -296,12 +319,19 @@ impl RunReport {
             duration_ms: u64::try_from(self.duration.as_millis()).unwrap_or(u64::MAX),
             frames: 0,
             system_calls: &self.system_calls,
-            service_commands: BTreeMap::new(),
+            service_commands: &self.services.commands,
+            service_commands_uncounted: self.services.uncounted,
             stubbed: &self.stubbed,
+            stubbed_commands: &self.services.stubbed,
+            unknown_services: &self.services.unknown_services,
             guest_log_lines: u64::try_from(self.guest_log.len())
                 .unwrap_or(u64::MAX)
                 .saturating_add(self.guest_log_dropped),
             guest_log_lines_dropped: self.guest_log_dropped,
+            host_log_lines: u64::try_from(self.host_log.len())
+                .unwrap_or(u64::MAX)
+                .saturating_add(self.host_log_dropped),
+            host_log_lines_dropped: self.host_log_dropped,
             trace_events_dropped: self.trace_events_dropped,
             events_error: self.events_error.as_ref(),
             patched_counter_reads: self.patched_counter_reads.len(),
@@ -336,15 +366,31 @@ pub struct Summary<'a> {
     pub frames: u64,
     /// Count per system call, by name.
     pub system_calls: &'a BTreeMap<String, u64>,
-    /// Count per service command. Always empty until there is a service framework.
-    pub service_commands: BTreeMap<String, u64>,
+    /// Requests per service command, by `<service>:<interface>::<command>`
+    /// ([`command_key`](crate::services_report::command_key)), in key order.
+    pub service_commands: &'a BTreeMap<String, u64>,
+    /// Requests missing from `service_commands` because a server had reached its bound of
+    /// distinct commands. Zero means `service_commands` counts every request.
+    pub service_commands_uncounted: u64,
     /// Every unimplemented system call the guest hit.
     pub stubbed: &'a BTreeSet<String>,
+    /// Every command the services answered by auto-stub, with its service, its interface (for
+    /// a session `sm:` handed out for a name nothing provides, that name), its protocol and its
+    /// id, in that order.
+    pub stubbed_commands: &'a [StubbedCommand],
+    /// The service names the guest asked `sm:` for that nothing provides, in order.
+    pub unknown_services: &'a [String],
     /// How many lines the guest wrote with `OutputDebugString`, kept or not.
     pub guest_log_lines: u64,
     /// How many of those lines are missing from `guest_log.txt` because the run reached its
     /// limit of guest log text. Zero means the file is complete.
     pub guest_log_lines_dropped: u64,
+    /// How many warnings and errors the emulator logged during the run (`log.txt`), kept or
+    /// not.
+    pub host_log_lines: u64,
+    /// How many of those lines are missing from `log.txt` because the run reached its limit.
+    /// Zero means the file is complete.
+    pub host_log_lines_dropped: u64,
     /// How many events are missing from the end of `trace.txt` because the run reached its
     /// limit of trace events. Zero means the trace is complete.
     pub trace_events_dropped: u64,
@@ -420,12 +466,29 @@ mod tests {
             patched_counter_reads: vec![0x8000_00b0, 0x8000_00c0],
             memory_map: Vec::new(),
             threads: Vec::new(),
+            services: ServicesReport {
+                commands: BTreeMap::from([
+                    ("sm::Sm::GetService".to_owned(), 3),
+                    ("sm::lm::5".to_owned(), 4),
+                ]),
+                uncounted: 6,
+                stubbed: vec![StubbedCommand {
+                    service: "sm:".to_owned(),
+                    interface: "lm".to_owned(),
+                    protocol: starquake_trace::IpcProtocol::Tipc,
+                    command: 0x15,
+                }],
+                unknown_services: vec!["aoc:u".to_owned(), "lm".to_owned()],
+                names: BTreeMap::new(),
+            },
+            host_log: vec!["WARN a".to_owned(), "ERROR b".to_owned()],
+            host_log_dropped: 10,
         };
         let json = serde_json::to_string_pretty(&report.summary()).unwrap();
         assert_eq!(
             json,
             r#"{
-  "version": 1,
+  "version": 2,
   "exit_reason": "emulator_error",
   "exit_code": 2,
   "message": "the vCPU failed",
@@ -435,13 +498,31 @@ mod tests {
     "ExitProcess": 1,
     "OutputDebugString": 7
   },
-  "service_commands": {},
+  "service_commands": {
+    "sm::Sm::GetService": 3,
+    "sm::lm::5": 4
+  },
+  "service_commands_uncounted": 6,
   "stubbed": [
     "0x99",
     "Break (0x26)"
   ],
+  "stubbed_commands": [
+    {
+      "service": "sm:",
+      "interface": "lm",
+      "protocol": "tipc",
+      "command": 21
+    }
+  ],
+  "unknown_services": [
+    "aoc:u",
+    "lm"
+  ],
   "guest_log_lines": 8,
   "guest_log_lines_dropped": 5,
+  "host_log_lines": 12,
+  "host_log_lines_dropped": 10,
   "trace_events_dropped": 9,
   "events_error": "the dump could not be encoded",
   "patched_counter_reads": 2,

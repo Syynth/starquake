@@ -13,7 +13,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use starquake_core::artifacts::{
-    CRASH_JSON_FILE, CRASH_TEXT_FILE, EVENTS_FILE, GUEST_LOG_FILE, SUMMARY_FILE, TRACE_FILE,
+    CRASH_JSON_FILE, CRASH_TEXT_FILE, EVENTS_FILE, GUEST_LOG_FILE, LOG_FILE, SUMMARY_FILE,
+    TRACE_FILE,
 };
 use starquake_core::crash::Location;
 use starquake_core::report::{ThreadPc, ThreadPcState};
@@ -114,7 +115,13 @@ mod support {
 use support::{can_run_guests, clean_report, files, json, program, run, scratch, starquake, text};
 
 /// The files every run leaves, crashed or not.
-const ALWAYS: [&str; 4] = [EVENTS_FILE, GUEST_LOG_FILE, SUMMARY_FILE, TRACE_FILE];
+const ALWAYS: [&str; 5] = [
+    EVENTS_FILE,
+    GUEST_LOG_FILE,
+    LOG_FILE,
+    SUMMARY_FILE,
+    TRACE_FILE,
+];
 
 #[test]
 fn a_program_file_that_does_not_exist_is_an_emulator_error_with_a_summary() {

@@ -1460,7 +1460,7 @@ fn a_snapshot_with_a_read_in_flight_restores_a_read_nothing_completes() {
 #[rustfmt::skip]
 const SNAPSHOT: &[u8] = &[
     // Header: magic, version.
-    b'S', b'Q', b'S', b'V', 1,
+    b'S', b'Q', b'S', b'V', 2,
     // The server's name.
     7, b'f', b's', b'p', b'-', b's', b'r', b'v',
     // Sessions: three, each a session object and the target it leads to.

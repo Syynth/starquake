@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use starquake_ipc::{BUFFER_SIZE, RequestBuilder};
 use starquake_kernel::id::ObjectId;
 use starquake_kernel::result::ResultCode;
+use starquake_trace::InterfaceName;
 
 use super::super::defer::{Framing, Pending, TokenId};
 use super::super::targets::Domain;
@@ -214,7 +215,7 @@ fn the_byte_layout_is_pinned() {
 #[rustfmt::skip]
 const GOLDEN: &[u8] = &[
     // Header: magic, version.
-    b'S', b'Q', b'S', b'V', 1,
+    b'S', b'Q', b'S', b'V', 2,
     // The server's name.
     3, b't', b'o', b'y',
     // Sessions: four, each a session object and the target it leads to.
@@ -244,11 +245,12 @@ const GOLDEN: &[u8] = &[
     2, 1,  1, 1,  0,
     3, 1,  1, 1,  0,
     // Deferred requests: three, each a token id, its session, its framing (0 CMIF, 1 domain,
-    // 2 TIPC with the command id), the command and the size of its arguments.
+    // 2 TIPC with the command id), the command, the size of its arguments, and the interface
+    // its event names.
     3,
-    0,  0, 1,  0,     14, 4,
-    1,  2, 1,  1,     14, 0,
-    2,  3, 1,  2, 3,  3,  0,
+    0,  0, 1,  0,     14, 4,  3, b'T', b'o', b'y',
+    1,  2, 1,  1,     14, 0,  3, b'T', b'o', b'y',
+    2,  3, 1,  2, 3,  3,  0,  3, b'T', b'o', b'y',
     // The id of the next token.
     3,
     // The family's state: present, one byte, two bumps.
@@ -569,6 +571,8 @@ fn a_snapshot_whose_requests_disagree_is_refused() {
                     framing: Framing::Cmif,
                     command: 0,
                     request_size: 0,
+                    interface: InterfaceName::new(<Toy as super::super::Session>::interface())
+                        .unwrap(),
                 };
                 rig.server.pending.insert(token, request);
             },
@@ -724,4 +728,73 @@ fn a_row_nothing_refers_to_is_refused_whatever_its_count() {
         refused(&rig.server.encode_state().unwrap()),
         SnapshotError::Inconsistent("a target has a reference count of zero")
     );
+}
+
+/// The interface of a deferred request, as the event of its reply names it, after a restore into
+/// a server that never saw the run.
+#[test]
+fn a_restored_deferred_request_keeps_the_interface_it_went_to() {
+    let mut rig = Rig::domain();
+    let open = domain_request(Domain::ROOT_OBJECT_ID, toy::OPEN_CHILD).data(&3_u32.to_le_bytes());
+    rig.send(&open);
+    // To the child, an object that is not the session's own interface (the toy).
+    let token = rig.defer_on(rig.session, &domain_request(FIRST, child::WAIT));
+    let saved = rig.server.save().unwrap();
+    drop(parked());
+
+    rig.server = toy_server(UnknownPolicy::Strict, &rig.wakes);
+    rig.server.restore(&saved).unwrap();
+    rig.server.reissue(token).unwrap().fail(ResultCode::SUCCESS);
+    let recorded = rig.kernel.recorded().len();
+    rig.deliver();
+    let delivered = rig.kernel.recorded();
+    assert_eq!(delivered.len(), recorded + 1);
+    let child = <super::Child as super::super::Session>::interface();
+    assert!(
+        matches!(
+            delivered[recorded].kind,
+            starquake_trace::EventKind::Ipc { interface, command, .. }
+                if interface.as_str() == child && command == child::WAIT
+        ),
+        "{:?}",
+        delivered[recorded].kind
+    );
+}
+
+/// [`GOLDEN`] with the first deferred request's interface name (`Toy`) replaced by `name`.
+fn golden_with_interface(name: &[u8]) -> Vec<u8> {
+    let first: &[u8] = &[14, 4, 3, b'T', b'o', b'y'];
+    let at = GOLDEN
+        .windows(first.len())
+        .position(|window| window == first)
+        .unwrap();
+    let mut bytes = GOLDEN[..at + 2].to_vec();
+    bytes.push(u8::try_from(name.len()).unwrap());
+    bytes.extend_from_slice(name);
+    bytes.extend_from_slice(&GOLDEN[at + first.len()..]);
+    bytes
+}
+
+#[test]
+fn a_deferred_request_whose_interface_name_is_not_one_is_refused() {
+    // The unchanged name restores, and so does the longest, so the edit is all that differs.
+    let longest = vec![b'a'; starquake_trace::INTERFACE_NAME_CAPACITY];
+    for name in [&b"Toy"[..], &longest] {
+        let mut restored = toy_server(UnknownPolicy::Strict, &Arc::default());
+        assert_eq!(
+            restored.restore(&golden_with_interface(name)),
+            Ok(()),
+            "{name:?}"
+        );
+    }
+    let too_long = vec![b'a'; starquake_trace::INTERFACE_NAME_CAPACITY + 1];
+    for name in [&b""[..], b"T\x7fy", &too_long] {
+        let mut restored = toy_server(UnknownPolicy::Strict, &Arc::default());
+        assert_eq!(
+            restored.restore(&golden_with_interface(name)),
+            Err(SnapshotError::Decode(postcard::Error::SerdeDeCustom)),
+            "{name:?}"
+        );
+        assert_eq!(restored.session_count(), 0, "{name:?}");
+    }
 }

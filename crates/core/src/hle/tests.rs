@@ -54,8 +54,8 @@ impl DebugSink for NoDebug {
 }
 
 /// The run's services behind a dispatcher, over memory the guest may read and write.
-struct Rig {
-    dispatcher: Dispatcher,
+pub(crate) struct Rig {
+    pub(crate) dispatcher: Dispatcher,
     memory: FlatMemory,
     env: Arc<LiveEnv>,
     recorder: Recorder,
@@ -126,7 +126,7 @@ fn install_with(dispatcher: &Dispatcher, env: Arc<dyn Env>) -> Result<(), Servic
 }
 
 /// A dispatcher over a process with nothing but its code mapped, read-write.
-fn dispatcher() -> Dispatcher {
+pub(crate) fn dispatcher() -> Dispatcher {
     let (mapper, _log) = RecordingMapper::new();
     let memory = ProcessMemory {
         code_address: BASE,
@@ -144,7 +144,7 @@ fn dispatcher() -> Dispatcher {
 }
 
 impl Rig {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::with_env(LiveEnv::new(FixedClock::new(0, 1), 0))
     }
 
@@ -227,7 +227,7 @@ impl Rig {
     }
 
     /// Sends `request` on `session`; returns the result and the message buffer afterwards.
-    fn send(&self, session: Handle, request: &RequestBuilder) -> (ResultCode, Vec<u8>) {
+    pub(crate) fn send(&self, session: Handle, request: &RequestBuilder) -> (ResultCode, Vec<u8>) {
         let mut buffer = [0; BUFFER_SIZE];
         request.build(&mut buffer).unwrap();
         self.memory.write(TLS, &buffer).unwrap();
@@ -301,7 +301,7 @@ fn command(interface: &dyn Session, name: &str) -> u32 {
 }
 
 /// A request laid out as libnx lays it out (`cmifMakeRequest`).
-fn libnx(id: u32) -> RequestBuilder {
+pub(crate) fn libnx(id: u32) -> RequestBuilder {
     RequestBuilder::cmif(CommandType::Request, id).layout(RequestLayout::Libnx)
 }
 
@@ -473,7 +473,7 @@ fn domain_reply(buffer: &[u8], size: usize) -> (u32, Vec<u8>, Vec<u32>) {
 
 impl Rig {
     /// A session on `name`, from the service manager, as libnx gets one (`smGetService`).
-    fn service(&self, name: &str) -> Handle {
+    pub(crate) fn service(&self, name: &str) -> Handle {
         self.memory.write(NAME, b"sm:\0").unwrap();
         let regs = self.call(SvcId::ConnectToNamedPort, 0, NAME);
         assert_eq!(result(&regs), ResultCode::SUCCESS);

@@ -143,9 +143,9 @@ fn romfs() -> (RomFs, Arc<Source>) {
 
 /// The guest's image, and its main thread's thread-local page, which the script's steps write
 /// and read too.
-struct WithTls<'a> {
-    image: &'a FlatMemory,
-    tls: Arc<FlatMemory>,
+pub(super) struct WithTls<'a> {
+    pub(super) image: &'a FlatMemory,
+    pub(super) tls: Arc<FlatMemory>,
 }
 
 impl GuestMemory for WithTls<'_> {
@@ -173,23 +173,23 @@ impl<V> GuestSpace<V> for WithTls<'_> {
 /// What the scripted guest saw: each reply's result word and payload, the handles it was
 /// given, and the bytes of each read.
 #[derive(Default)]
-struct Seen {
-    handles: Vec<u32>,
-    results: Vec<u32>,
-    reads: Vec<Vec<u8>>,
+pub(super) struct Seen {
+    pub(super) handles: Vec<u32>,
+    pub(super) results: Vec<u32>,
+    pub(super) reads: Vec<Vec<u8>>,
 }
 
 /// The scripted guest's view of its thread-local page.
 #[derive(Clone)]
-struct Script {
-    tls: Arc<FlatMemory>,
-    base: u64,
-    seen: Rc<RefCell<Seen>>,
+pub(super) struct Script {
+    pub(super) tls: Arc<FlatMemory>,
+    pub(super) base: u64,
+    pub(super) seen: Rc<RefCell<Seen>>,
 }
 
 impl Script {
     /// Writes `request` as the thread's message.
-    fn write(&self, request: &RequestBuilder) {
+    pub(super) fn write(&self, request: &RequestBuilder) {
         let mut buffer = [0; BUFFER_SIZE];
         request.build(&mut buffer).unwrap();
         self.tls.write(self.base, &buffer).unwrap();
@@ -197,7 +197,7 @@ impl Script {
 
     /// Reads the reply in the thread's message, with `size` bytes of payload, keeping its
     /// result word and any handle moved with it.
-    fn read_reply(&self, size: usize) -> Vec<u8> {
+    pub(super) fn read_reply(&self, size: usize) -> Vec<u8> {
         let mut buffer = [0; BUFFER_SIZE];
         self.tls.read(self.base, &mut buffer).unwrap();
         let message = Message::parse_reply_sized(&buffer, SessionKind::Session, size).unwrap();
@@ -218,12 +218,12 @@ impl Script {
     }
 
     /// The handle the last reply moved.
-    fn last_handle(&self) -> u64 {
+    pub(super) fn last_handle(&self) -> u64 {
         u64::from(*self.seen.borrow().handles.last().unwrap())
     }
 }
 
-fn libnx(id: u32) -> RequestBuilder {
+pub(super) fn libnx(id: u32) -> RequestBuilder {
     RequestBuilder::cmif(CommandType::Request, id).layout(RequestLayout::Libnx)
 }
 
@@ -238,7 +238,7 @@ fn room(guest: &Script, len: u64) -> BufferDescriptor {
 
 /// A step that sends what `write` writes to the handle `handle` gives, after the previous call
 /// succeeded. `handle` runs first, so it may read the last reply before `write` replaces it.
-fn send(
+pub(super) fn send(
     guest: &Script,
     handle: impl FnOnce(&Script) -> u64 + 'static,
     write: impl FnOnce(&Script) + 'static,

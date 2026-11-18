@@ -7,13 +7,16 @@
 //! Payloads that are not fixed-size (service-note text, guest log text, IPC bytes) belong to the
 //! full binary log, which is out of scope here; the flight recorder keeps "only sizes and hashes"
 //! (spec, "Replaying the kernel and services", rule 2), which is what [`EventKind::GuestLog`] and
-//! [`EventKind::Ipc`] carry.
+//! [`EventKind::Ipc`] carry. An IPC event's interface name is fixed-size too
+//! ([`InterfaceName`]).
 //!
 //! No reference source is ported here: the layout is this project's own design.
 
 use core::fmt;
 
 use serde::{Deserialize, Serialize};
+
+use crate::interface::{InterfaceName, IpcProtocol};
 
 /// Number of system-call argument registers an [`EventKind::Svc`] event carries.
 ///
@@ -132,7 +135,14 @@ pub enum EventKind {
         session: SessionId,
         /// The service that owns the session.
         service: ServiceId,
-        /// The command id.
+        /// The interface the request was dispatched to, as the service framework names it: the
+        /// session's own interface, or the domain object's the request names; for a control
+        /// request, whatever the session, the framework's control interface (`IpcController`).
+        interface: InterfaceName,
+        /// The protocol the request came in.
+        protocol: IpcProtocol,
+        /// The command id: the interface's for CMIF and TIPC, the control table's for a control
+        /// request.
         command: u32,
         /// Size in bytes of the request message.
         request_size: u32,
@@ -262,6 +272,8 @@ impl fmt::Display for EventKind {
             Self::Ipc {
                 session,
                 service,
+                interface,
+                protocol,
                 command,
                 request_size,
                 reply_size,
@@ -269,9 +281,12 @@ impl fmt::Display for EventKind {
                 outcome,
             } => write!(
                 f,
-                "ipc session={} service={} command={command} req={request_size} rep={reply_size} \
-                 -> {:#x} {outcome:?}",
-                session.0, service.0, result.0
+                "ipc session={} service={} interface={interface} {} command={command} \
+                 req={request_size} rep={reply_size} -> {:#x} {outcome:?}",
+                session.0,
+                service.0,
+                protocol.word(),
+                result.0
             ),
             Self::Wake { thread, reason } => write!(f, "wake thread={} {reason:?}", thread.0),
             Self::Schedule { core, from, to } => {
@@ -342,6 +357,54 @@ mod tests {
     }
 
     #[test]
+    fn an_ipc_line_names_the_interface_and_the_protocol() {
+        let request = |protocol| EventKind::Ipc {
+            session: SessionId(0x1_0000_0003),
+            service: ServiceId(5),
+            interface: InterfaceName::new("IApplicationProxy").unwrap(),
+            protocol,
+            command: 20,
+            request_size: 8,
+            reply_size: 4,
+            result: ResultCode(0x2a1),
+            outcome: IpcOutcome::Stubbed,
+        };
+        for (protocol, word) in [
+            (IpcProtocol::Cmif, "cmif"),
+            (IpcProtocol::Tipc, "tipc"),
+            (IpcProtocol::Control, "control"),
+        ] {
+            assert_eq!(
+                request(protocol).to_string(),
+                format!(
+                    "ipc session=4294967299 service=5 interface=IApplicationProxy {word} \
+                     command=20 req=8 rep=4 -> 0x2a1 Stubbed"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn an_ipc_event_is_no_larger_than_a_system_call() {
+        // The interface name is held inline (`interface.rs`): with its capacity the event must
+        // be no larger than one that only had to hold a system call, so the flight recorder's
+        // rings are no larger for it.
+        #[expect(dead_code, reason = "only the layout is measured")]
+        enum SvcOnly {
+            Svc {
+                id: u32,
+                args: [u64; SVC_ARG_COUNT],
+                result: ResultCode,
+            },
+            Other,
+        }
+        assert_eq!(
+            core::mem::size_of::<EventKind>(),
+            core::mem::size_of::<SvcOnly>()
+        );
+    }
+
+    #[test]
     fn the_golden_trace_holds_calls_requests_logs_and_lifecycle_only() {
         // Observability spec, "The event stream": "It holds system calls, IPC requests, guest
         // log lines and lifecycle events; wake, map, fault and schedule events are left out
@@ -355,6 +418,8 @@ mod tests {
             EventKind::Ipc {
                 session: SessionId(1),
                 service: ServiceId(2),
+                interface: InterfaceName::new("ISession").unwrap(),
+                protocol: IpcProtocol::Cmif,
                 command: 3,
                 request_size: 4,
                 reply_size: 5,

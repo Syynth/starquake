@@ -6,10 +6,11 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use starquake_core::artifacts::{
-    self, ArtifactError, CRASH_JSON_FILE, CRASH_TEXT_FILE, EVENTS_FILE, GUEST_LOG_FILE,
+    self, ArtifactError, CRASH_JSON_FILE, CRASH_TEXT_FILE, EVENTS_FILE, GUEST_LOG_FILE, LOG_FILE,
     SUMMARY_FILE, TRACE_FILE,
 };
 use starquake_core::crash::{CrashReport, Exception, Module};
+use starquake_core::services_report::ServicesReport;
 use starquake_core::{ExitReason, Mapping, RunReport};
 use starquake_cpu::GuestRegs;
 use starquake_trace::{CoreDump, Dump, Event, EventKind, GuestTicks, LifecyclePhase, ThreadId};
@@ -76,6 +77,9 @@ mod support {
             patched_counter_reads: vec![0x8000_00b0],
             memory_map: Vec::new(),
             threads: Vec::new(),
+            services: ServicesReport::default(),
+            host_log: vec!["WARN starquake_services::sm: one".to_owned()],
+            host_log_dropped: 0,
         }
     }
 
@@ -129,7 +133,13 @@ fn a_clean_run_writes_the_summary_trace_events_and_guest_log_and_no_crash_report
     artifacts::write(&folder, &report).unwrap();
     assert_eq!(
         files(&folder),
-        [EVENTS_FILE, GUEST_LOG_FILE, SUMMARY_FILE, TRACE_FILE]
+        [
+            EVENTS_FILE,
+            GUEST_LOG_FILE,
+            LOG_FILE,
+            SUMMARY_FILE,
+            TRACE_FILE
+        ]
     );
 
     let summary = json(&folder, SUMMARY_FILE);
@@ -147,6 +157,39 @@ fn a_clean_run_writes_the_summary_trace_events_and_guest_log_and_no_crash_report
         read(&folder, GUEST_LOG_FILE),
         b"plain\ntwo\\nlines and a \\\\\n\\xffx\\x00\n"
     );
+    // One line per warning the emulator logged.
+    assert_eq!(
+        read(&folder, LOG_FILE),
+        b"WARN starquake_services::sm: one\n"
+    );
+    assert_eq!(summary["host_log_lines"], 1);
+    assert_eq!(summary["host_log_lines_dropped"], 0);
+}
+
+#[test]
+fn the_emulators_log_says_when_it_was_cut_short_and_is_empty_when_nothing_was_logged() {
+    let folder = folder("host_log");
+    let report = RunReport {
+        host_log: vec!["WARN a".to_owned(), "ERROR b".to_owned()],
+        host_log_dropped: 4,
+        ..clean()
+    };
+    artifacts::write(&folder, &report).unwrap();
+    assert_eq!(
+        read(&folder, LOG_FILE),
+        b"WARN a\nERROR b\n[truncated: 4 later lines were not kept]\n"
+    );
+    let summary = json(&folder, SUMMARY_FILE);
+    assert_eq!(summary["host_log_lines"], 6);
+    assert_eq!(summary["host_log_lines_dropped"], 4);
+    let quiet = folder.join("quiet");
+    let report = RunReport {
+        host_log: Vec::new(),
+        ..clean()
+    };
+    artifacts::write(&quiet, &report).unwrap();
+    assert_eq!(read(&quiet, LOG_FILE), b"");
+    assert_eq!(json(&quiet, SUMMARY_FILE)["host_log_lines"], 0);
 }
 
 #[test]
@@ -189,6 +232,7 @@ fn a_crash_adds_the_crash_report_as_data_and_as_text() {
             CRASH_TEXT_FILE,
             EVENTS_FILE,
             GUEST_LOG_FILE,
+            LOG_FILE,
             SUMMARY_FILE,
             TRACE_FILE
         ]
@@ -215,7 +259,13 @@ fn a_later_run_in_the_same_folder_leaves_no_stale_crash_report() {
     artifacts::write(&folder, &clean()).unwrap();
     assert_eq!(
         files(&folder),
-        [EVENTS_FILE, GUEST_LOG_FILE, SUMMARY_FILE, TRACE_FILE]
+        [
+            EVENTS_FILE,
+            GUEST_LOG_FILE,
+            LOG_FILE,
+            SUMMARY_FILE,
+            TRACE_FILE
+        ]
     );
     assert_eq!(json(&folder, SUMMARY_FILE)["exit_reason"], "process_exited");
 }

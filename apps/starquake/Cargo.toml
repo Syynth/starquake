@@ -21,3 +21,7 @@ starquake-trace.workspace = true
 serde_json.workspace = true
 # Builds the synthetic NUP files that the `inspect` and `verify` tests read.
 starquake-loader = { workspace = true, features = ["test-support"] }
+# Build the messages of the synthetic guest that `run_log.rs` runs, with the service ids and
+# names it asks for.
+starquake-ipc.workspace = true
+starquake-services.workspace = true

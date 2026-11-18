@@ -17,8 +17,9 @@
 //!   saved; [`Server::reissue`] makes a new one for a saved id;
 //! - its family state ([`Family`]), once.
 //!
-//! Not saved: the record of auto-stubbed commands ([`Server::stubbed`]), which is a log of the
-//! run and not state a guest can observe; and a completion that was posted and that
+//! Not saved: the record of auto-stubbed commands ([`Server::stubbed`]) and the counts of
+//! requests ([`Server::requests`]), which are a log of the run and not state a guest can
+//! observe; and a completion that was posted and that
 //! [`Server::take_completed`] has not taken yet, whose request is saved as still deferred (a
 //! server restored from the snapshot has nothing to deliver for it, and the work is resumed
 //! with [`Server::reissue`]).
@@ -73,8 +74,10 @@
 //!
 //! Not checked, because the snapshot holds nothing to check them against: the values inside a
 //! session's or a family's state (see "Format") beyond what the state's own deserialisation
-//! and a family's check refuse, a deferred request's command id and argument
-//! size (they only go into its trace event), and whether a deferred request on a session that
+//! and a family's check refuse, a deferred request's command id, argument size and interface
+//! name (they only go into its trace event; the name is checked to be one
+//! [`InterfaceName`](starquake_trace::InterfaceName) can hold, and not against the server's
+//! interfaces, since a stub's name is the guest's), and whether a deferred request on a session that
 //! is not a domain was CMIF or TIPC.
 //!
 //! [`Server::save`] runs the same checks of the requests, the worker count aside, so a
@@ -100,7 +103,10 @@ use super::targets::{Row, TargetId, Targets};
 pub const SNAPSHOT_MAGIC: [u8; 4] = *b"SQSV";
 
 /// Layout version written into every server snapshot and required when reading one.
-pub const SNAPSHOT_VERSION: u32 = 1;
+///
+/// 2: a deferred request keeps the interface its trace event names
+/// ([`trace`](super::trace)), after the size of its arguments.
+pub const SNAPSHOT_VERSION: u32 = 2;
 
 /// Why a snapshot could not be written or read.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

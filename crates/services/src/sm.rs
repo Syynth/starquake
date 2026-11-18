@@ -91,7 +91,10 @@ use starquake_trace::ServiceId;
 
 use crate::commands;
 use crate::framework::result::code;
-use crate::framework::{Context, Interfaces, Outcome, Reply, Request, Server, UnknownPolicy};
+use crate::framework::{
+    CommandTable, Context, Interfaces, Outcome, Protocol, Reply, Request, Server, Session,
+    SnapshotError, UnknownPolicy, snapshot,
+};
 
 #[cfg(test)]
 mod tests;
@@ -429,14 +432,59 @@ impl Sm {
 /// an interface with no commands, so that every command a title sends it is answered by the
 /// server's auto-stub and shows up in the trace and in [`Server::stubbed`]. It is a session of
 /// the `sm:` server.
+///
+/// Its [`Session::trace_name`] is the name that was asked for, so the trace, the server's
+/// [`Server::stubbed`] and its [`Server::requests`] name the service the title wanted, not
+/// `Stub` (test: `a_stub_is_traced_and_recorded_under_the_name_asked_for`). Its type name,
+/// [`Session::name`], is still `Stub`: a snapshot finds the type by it. Asked for `Sm`, a stub
+/// is named like `sm:`'s own interface and its requests cannot be told from that interface's
+/// (test: `a_stub_asked_for_by_sms_own_interface_name_is_counted_with_it`).
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Stub {
     /// The name that was asked for: kept so that a snapshot says what each stub stands in for.
     name: ServiceName,
 }
 
-commands! {
-    impl Stub {}
+/// [`Stub`]'s command table: empty.
+const STUB_COMMANDS: CommandTable = CommandTable {
+    cmif: &[],
+    tipc: &[],
+};
+
+/// Written out rather than made by [`commands!`], which cannot give a session a
+/// [`Session::trace_name`] of its own; it is what `commands! { impl Stub {} }` would make, but
+/// for that.
+impl Session for Stub {
+    fn interface() -> &'static str {
+        "Stub"
+    }
+
+    fn name(&self) -> &'static str {
+        Self::interface()
+    }
+
+    fn trace_name(&self) -> &str {
+        self.name.as_str()
+    }
+
+    fn save(&self) -> Result<Vec<u8>, SnapshotError> {
+        snapshot::encode(self)
+    }
+
+    fn commands(&self) -> &'static CommandTable {
+        &STUB_COMMANDS
+    }
+
+    fn dispatch(
+        &mut self,
+        _protocol: Protocol,
+        _id: u32,
+        _cx: &mut Context<'_>,
+        _request: &Request<'_>,
+        _reply: &mut Reply,
+    ) -> Option<Outcome> {
+        None
+    }
 }
 
 /// The interfaces an `sm:` server's sessions can be.

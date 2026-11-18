@@ -603,6 +603,34 @@ impl Dispatcher {
         Ok(server)
     }
 
+    /// Shows `inspect` the handler of every server, with the number the server is known by, in
+    /// the order of the kernel's server ids: what the run's services leave behind (their counts,
+    /// their records of what they stubbed) is read this way once the run is over. A handler out
+    /// of its slot (a core is running a request through it, or delivering its replies) is not
+    /// shown; the number of such handlers is returned.
+    ///
+    /// `inspect` runs with the kernel lock held: it must not call the dispatcher, and it is
+    /// shown each handler only to read it.
+    pub fn inspect_handlers(
+        &self,
+        mut inspect: impl FnMut(ServiceId, &dyn SessionHandler),
+    ) -> usize {
+        let locked = self.lock::<(&Scheduler,)>();
+        let state = &*locked.state;
+        let ipc = state.tables.scheduler.ipc();
+        let mut out = 0;
+        for (server, slot) in &state.handlers {
+            let Ok(service) = ipc.server_service(*server) else {
+                continue;
+            };
+            match slot {
+                Some(handler) => inspect(service, &**handler),
+                None => out += 1,
+            }
+        }
+        out
+    }
+
     /// The guest threads woken since the last call, oldest first: senders whose request ended
     /// while another thread's dispatch ran. Each one's result and reply are written; the caller
     /// resumes it.

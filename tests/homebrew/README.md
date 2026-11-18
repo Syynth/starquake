@@ -63,19 +63,19 @@ thread 1
   svc 0x6(0x1080303fc8, 0x0, 0x1080303fc8) -> 0x0
   svc 0x6(0x1080303fc8, 0x0, 0x80006000) -> 0x0
   svc 0x1f(0x0, 0x80003148) -> 0x0
-  ipc session=4294967297 service=1 command=3 req=8 rep=2 -> 0x0 Done
+  ipc session=4294967297 service=1 interface=IpcController control command=3 req=8 rep=2 -> 0x0 Done
   svc 0x21(0x103fe) -> 0x0
-  ipc session=4294967297 service=1 command=0 req=12 rep=0 -> 0x0 Done
+  ipc session=4294967297 service=1 interface=Sm cmif command=0 req=12 rep=0 -> 0x0 Done
   svc 0x21(0x103fe) -> 0x0
   log len=25 hash=0xb51b0fbfdb3b5bd2
   svc 0x27(0x800030a0, 0x19) -> 0x0
   log len=25 hash=0x8dab36c055e5ad88
   svc 0x27(0x800030c0, 0x19) -> 0x0
-  ipc session=4294967297 service=1 command=1 req=16 rep=0 -> 0x0 Done
+  ipc session=4294967297 service=1 interface=Sm cmif command=1 req=16 rep=0 -> 0x0 Done
   svc 0x21(0x103fe) -> 0x0
-  ipc session=4294967298 service=2 command=3 req=8 rep=2 -> 0x0 Done
+  ipc session=4294967298 service=2 interface=IpcController control command=3 req=8 rep=2 -> 0x0 Done
   svc 0x21(0x183fd) -> 0x0
-  ipc session=4294967298 service=2 command=3 req=8 rep=0 -> 0x0 Done
+  ipc session=4294967298 service=2 interface=SetSys cmif command=3 req=8 rep=0 -> 0x0 Done
   svc 0x21(0x183fd) -> 0x0
   svc 0x21(0x183fd) -> 0xf601
   svc 0x16(0x183fd) -> 0x0

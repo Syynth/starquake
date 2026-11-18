@@ -3,6 +3,7 @@
 
 use starquake_ipc::{BufferDescriptor, ReceiveDescriptor, RequestBuilder, StaticDescriptor};
 use starquake_kernel::result::{KernelError, ResultCode};
+use starquake_trace::{InterfaceName, IpcProtocol};
 
 use super::super::result::{INVALID_CMIF_REQUEST, NOT_SUPPORTED, UNKNOWN_COMMAND_ID};
 use super::super::{
@@ -415,10 +416,10 @@ fn an_unknown_command_with_descriptors_goes_to_the_unknown_policy() {
         );
     }
     let stub = |protocol| StubbedCommand {
-        interface: "Toy",
+        interface: InterfaceName::new(super::Toy::interface()).unwrap(),
         protocol,
         id: missing,
     };
     let stubbed: Vec<_> = stubbing.server.stubbed().copied().collect();
-    assert_eq!(stubbed, [stub(Protocol::Cmif), stub(Protocol::Tipc)]);
+    assert_eq!(stubbed, [stub(IpcProtocol::Cmif), stub(IpcProtocol::Tipc)]);
 }

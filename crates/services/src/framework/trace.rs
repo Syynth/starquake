@@ -11,11 +11,33 @@
 //! |---|---|
 //! | `session` | the session the request came on ([`session_id`]) |
 //! | `service` | the server's number ([`Server::with_service_id`](super::Server::with_service_id)) |
+//! | `interface` | where the request went (below) |
+//! | `protocol` | `Control` for a CMIF control request, `Tipc` for a TIPC request, otherwise `Cmif` (a domain's close-object request included) |
 //! | `command` | the command id; [`NO_COMMAND_ID`] for a domain's close-object request, which has none |
 //! | `request_size` | bytes of the command's arguments: the raw payload a method reads |
 //! | `reply_size` | bytes of payload in the reply: what a method wrote, none on a failure |
 //! | `result` | the reply's result code |
 //! | `outcome` | `Stubbed` for an unknown command answered by auto-stub, `Deferred` for a request answered through a reply token, otherwise `Done` |
+//!
+//! The `interface` is the [`Session::trace_name`] of the interface the request is addressed to,
+//! as [`InterfaceName::lossy`] keeps it:
+//!
+//! - a control request: [`CONTROL_INTERFACE`], the name the reference gives the control
+//!   commands, whatever the session;
+//! - a domain request (a close-object request too): the object its domain header names;
+//! - any other request: the session's own interface.
+//!
+//! When that names no interface (an object id that is empty, or a request with no domain header
+//! on a domain), it is the session's own interface: for a domain, object
+//! `Domain::ROOT_OBJECT_ID`, the interface the session had before it became a domain. When that
+//! is gone too, it is [`InterfaceName::lossy`]'s name for nothing, one
+//! [`REPLACEMENT`](starquake_trace::REPLACEMENT). On these fallbacks the request is counted
+//! with no command name ([`RequestCount::name`](super::RequestCount::name) is `None`, so a
+//! report's key shows the command id): the interface named is not the one the request went to,
+//! and the name its table gives that id would read as if the title had called that command (test:
+//! `a_domain_request_names_the_object_it_went_to`). A deferred request keeps the name it had
+//! when it was deferred, and its protocol follows from how its reply is framed (control
+//! requests are never deferred).
 //!
 //! Exactly which messages produce an event: every message [`Server::handle`](super::Server::handle)
 //! answers with [`Handled::Replied`](super::Handled::Replied), when it answers; and every
@@ -24,18 +46,29 @@
 //! is the order deferred replies completed in. A close message and a message the server fails
 //! on ([`ServerError`](super::ServerError)) get no reply and no event.
 //!
+//! A divergence the name cannot avoid: a session [`sm`](crate::sm) hands out for a name nothing
+//! provides ([`Stub`](crate::sm::Stub)) is named by the name the title asked for, which is the
+//! guest's to choose. Asked for `Sm`, the name of `sm:`'s own interface, the stub's requests are
+//! traced, counted ([`Server::requests`](super::Server::requests)) and recorded as stubbed
+//! ([`Server::stubbed`](super::Server::stubbed)) under the same interface, protocol and id as
+//! the same command sent to `sm:` itself, and nothing tells the two apart (test:
+//! `a_stub_asked_for_by_sms_own_interface_name_is_counted_with_it`).
+//!
 //! The sizes are payload sizes, as the service spec says ("payload sizes"); the event type's own
-//! docs call them message sizes. The event has no field for the command's name, the protocol, or
-//! whether the request was a control request, so a CMIF command, the TIPC command and the
-//! control command with one id read the same in a trace. Names are in the command tables
-//! ([`Session::commands`](super::Session::commands),
-//! [`CONTROL_COMMANDS`](super::control::CONTROL_COMMANDS)). Both are gaps in the event type,
-//! which belongs to `starquake-trace`.
+//! docs call them message sizes. The event has no field for the command's name: names are in
+//! the command tables ([`Session::commands`](super::Session::commands),
+//! [`CONTROL_COMMANDS`]), and the server counts each request under its name
+//! ([`Server::requests`](super::Server::requests)).
 
-use starquake_ipc::{Body, CommandType, Message};
+use starquake_ipc::{Body, CmifRequest, CommandType, Message};
 use starquake_kernel::id::{ObjectId, SlabId};
 use starquake_kernel::result::ResultCode;
-use starquake_trace::{EventKind, IpcOutcome, ServiceId, SessionId};
+use starquake_trace::{EventKind, InterfaceName, IpcOutcome, IpcProtocol, ServiceId, SessionId};
+
+use super::commands::{Protocol, Session};
+use super::control::{CONTROL_COMMANDS, CONTROL_INTERFACE};
+use super::defer::Framing;
+use super::targets::{Domain, TargetId, Targets};
 
 /// The `command` of an event for a message that has no command id: a domain's close-object
 /// request.
@@ -52,25 +85,116 @@ pub fn session_id(session: ObjectId) -> SessionId {
     SessionId((u64::from(session.generation()) << u32::BITS) | u64::from(session.index()))
 }
 
-/// What a request's event says of the request itself.
+/// What a request's event says of the request itself, and the name it is counted under.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Asked {
+    pub(super) interface: InterfaceName,
+    pub(super) protocol: IpcProtocol,
     pub(super) command: u32,
     pub(super) request_size: u32,
+    /// The command's name in its table, if the table has it: what
+    /// [`Server::requests`](super::Server::requests) counts the request under. Not in the event.
+    pub(super) name: Option<&'static str>,
 }
 
 impl Asked {
-    /// The command id and argument size of a parsed request.
-    pub(super) fn of(message: &Message<'_>) -> Self {
+    /// What the event of a parsed request on a session that leads to `target` says: see the
+    /// [module docs](self) for the interface and the protocol.
+    pub(super) fn of(message: &Message<'_>, targets: &Targets, target: TargetId) -> Self {
         let (command, data) = match (&message.body, message.command_type) {
             (Body::CmifRequest(body), _) => (body.header.command_id, body.data),
             (Body::TipcRequest { data }, CommandType::Tipc(id)) => (u32::from(id), *data),
             _ => (NO_COMMAND_ID, &[][..]),
         };
+        let protocol = match message.command_type {
+            CommandType::Control | CommandType::ControlWithContext => IpcProtocol::Control,
+            CommandType::Tipc(_) => IpcProtocol::Tipc,
+            _ => IpcProtocol::Cmif,
+        };
+        let (interface, name) = match protocol {
+            IpcProtocol::Control => (
+                InterfaceName::lossy(CONTROL_INTERFACE),
+                CONTROL_COMMANDS.name(Protocol::Cmif, command),
+            ),
+            IpcProtocol::Cmif | IpcProtocol::Tipc => {
+                let table = if protocol == IpcProtocol::Tipc {
+                    Protocol::Tipc
+                } else {
+                    Protocol::Cmif
+                };
+                match addressee(message, targets, target) {
+                    Some(session) => (
+                        InterfaceName::lossy(session.trace_name()),
+                        session.commands().name(table, command),
+                    ),
+                    // A fallback: the session's own interface is not what the request went to,
+                    // so its table does not name the request.
+                    None => (
+                        own_interface(targets, target).map_or_else(
+                            || InterfaceName::lossy(""),
+                            |session| InterfaceName::lossy(session.trace_name()),
+                        ),
+                        None,
+                    ),
+                }
+            }
+        };
         Self {
+            interface,
+            protocol,
             command,
             request_size: size(data.len()),
+            name,
         }
+    }
+}
+
+/// The interface a CMIF or TIPC request is addressed to: the object a domain header (or a
+/// close-object request) names, or else the session's own; `None` if that is no interface.
+fn addressee<'t>(
+    message: &Message<'_>,
+    targets: &'t Targets,
+    target: TargetId,
+) -> Option<&'t dyn Session> {
+    let object_id = match &message.body {
+        Body::CmifRequest(CmifRequest {
+            domain: Some(header),
+            ..
+        })
+        | Body::DomainClose(header) => Some(header.object_id),
+        _ => None,
+    };
+    let object = match object_id {
+        Some(object_id) => targets.domain(target).ok()?.get(object_id)?,
+        None => target,
+    };
+    targets.interface(object)
+}
+
+/// The session's own interface: the one it leads to, or for a domain its object
+/// [`Domain::ROOT_OBJECT_ID`].
+fn own_interface(targets: &Targets, target: TargetId) -> Option<&dyn Session> {
+    let own = match targets.domain(target) {
+        Ok(domain) => domain.get(Domain::ROOT_OBJECT_ID)?,
+        Err(_) => target,
+    };
+    targets.interface(own)
+}
+
+/// A CMIF or TIPC command's protocol as an event and a server's records hold it.
+pub(super) const fn traced(protocol: Protocol) -> IpcProtocol {
+    match protocol {
+        Protocol::Cmif => IpcProtocol::Cmif,
+        Protocol::Tipc => IpcProtocol::Tipc,
+    }
+}
+
+/// The protocol of a deferred request, from how its reply is framed: control requests are
+/// answered at once, so a deferred one is CMIF or TIPC.
+pub(super) fn deferred_protocol(framing: Framing) -> IpcProtocol {
+    match framing {
+        Framing::Cmif | Framing::Domain => IpcProtocol::Cmif,
+        Framing::Tipc(_) => IpcProtocol::Tipc,
     }
 }
 
@@ -91,6 +215,8 @@ pub(super) fn event(
     EventKind::Ipc {
         session: session_id(session),
         service,
+        interface: asked.interface,
+        protocol: asked.protocol,
         command: asked.command,
         request_size: asked.request_size,
         reply_size,

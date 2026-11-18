@@ -53,8 +53,9 @@ use starquake_ipc::CmifRequest;
 use starquake_kernel::handle::Handle;
 use starquake_kernel::id::ObjectId;
 use starquake_kernel::result::ResultCode;
+use starquake_trace::{InterfaceName, IpcProtocol};
 
-use super::commands::{Command, CommandTable, Protocol};
+use super::commands::{Command, CommandTable};
 use super::kernel::Kernel;
 use super::payload::Reader;
 use super::result::{DOMAIN_OBJECT_NOT_FOUND, TARGET_NOT_DOMAIN};
@@ -133,7 +134,12 @@ impl Server {
             QUERY_POINTER_BUFFER_SIZE => {
                 Ok(Frame::Cmif.with_payload(&self.pointer_buffer_size.to_le_bytes()))
             }
-            id => Ok(self.unknown(CONTROL_INTERFACE, Protocol::Cmif, id, Frame::Cmif)),
+            id => Ok(self.unknown(
+                InterfaceName::lossy(CONTROL_INTERFACE),
+                IpcProtocol::Control,
+                id,
+                Frame::Cmif,
+            )),
         }
     }
 
