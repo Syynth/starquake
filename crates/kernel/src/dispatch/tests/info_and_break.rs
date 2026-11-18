@@ -213,7 +213,6 @@ fn other_ids_draw_nothing() {
     assert_eq!(entropy_of(&dispatcher), None);
 }
 
-
 #[test]
 fn a_switch_2_id_is_answered_by_the_calling_process_s_console() {
     // The arm hands the call the process table, so the console of the calling process decides

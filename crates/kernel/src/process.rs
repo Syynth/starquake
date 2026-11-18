@@ -36,9 +36,12 @@
 //!   only: `atmosphere/libraries/libmesosphere/source/arch/arm64/kern_k_thread_context.cpp`,
 //!   `ctx->x[18] = KSystemControl::GenerateRandomU64() | 1`). [`run_with_env`] draws the main
 //!   thread's; the dispatcher's `CreateThread` arm draws every other thread's
-//!   (`crate::dispatch`, "Random numbers"). Eden's `Random64` widens one 32-bit
-//!   `std::random_device` draw (`eden/src/common/random.cpp`), so its top half is always zero;
-//!   here the whole 64-bit word is drawn, as Atmosphère's `GenerateRandomU64` draws it.
+//!   (`dispatch/lifecycle.rs`, `create_thread`). Creation refuses every address-space width
+//!   but 39 bits ([`ProcessError::AddressSpace`]), which only a 64-bit program has, so every
+//!   thread here gets one; Eden's 32-bit path (`ResetThreadContext32`) sets none. Eden's
+//!   `Random64` widens one 32-bit `std::random_device` draw (`eden/src/common/random.cpp`), so
+//!   its top half is always zero; here the whole 64-bit word is drawn, as Atmosphère's
+//!   `GenerateRandomU64` draws it.
 //!
 //! A run draws them in this order: the four entropy words, then the main thread's `x18`
 //! (`starquake-core`'s boot). An environment that fails a draw (a replay that ran out or

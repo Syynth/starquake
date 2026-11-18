@@ -36,10 +36,7 @@ fn one() -> usize {
 fn a_record_counts_its_own_size_and_the_bytes_it_carries() {
     assert_eq!(record_bytes(&clock(1)), one());
     assert_eq!(record_bytes(&EnvRecord::Random(9)), one());
-    assert_eq!(
-        record_bytes(&EnvRecord::WallClock(UnixSeconds(5))),
-        one()
-    );
+    assert_eq!(record_bytes(&EnvRecord::WallClock(UnixSeconds(5))), one());
     assert_eq!(record_bytes(&host_io(3, 0)), one() + 3);
     assert_eq!(record_bytes(&host_io(0, 11)), one() + 11);
     assert_eq!(record_bytes(&host_io(3, 11)), one() + 14);

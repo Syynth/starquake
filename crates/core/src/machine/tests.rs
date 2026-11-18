@@ -877,9 +877,20 @@ fn the_environments_recording_moves_to_the_kept_recording_as_it_is_made() {
         recorder: Recorder::new(),
     };
     let env = session.environment();
+    // The most the environment held, unmoved, each time the guest ran: after the first call,
+    // every call's reading must already have been moved, so it held none.
+    let held = Rc::new(Cell::new(0_usize));
     let mut vcpu = ScriptedVcpu::new();
-    for _ in 0..CALLS {
-        vcpu = vcpu.then(|_| {}, svc(SvcId::GetSystemTick));
+    for call in 0..CALLS {
+        let (watched, held) = (Arc::clone(&env), Rc::clone(&held));
+        vcpu = vcpu.then(
+            move |_| {
+                if call > 0 {
+                    held.set(held.get().max(watched.recording().len()));
+                }
+            },
+            svc(SvcId::GetSystemTick),
+        );
     }
     let mut vcpu = vcpu.then(|_| {}, svc(SvcId::ExitProcess));
 
@@ -902,8 +913,9 @@ fn the_environments_recording_moves_to_the_kept_recording_as_it_is_made() {
             ("GetSystemTick".to_owned(), CALLS)
         ])
     );
-    // ...and none of their clock readings is still held. (The count, not the records: a
-    // failure would otherwise print one record per call.)
+    // ...and none of their clock readings was held while the guest ran, nor is now. (The
+    // count, not the records: a failure would otherwise print one record per call.)
+    assert_eq!(held.get(), 0);
     assert_eq!(env.recording().len(), 0);
     // They were kept, after the boot's draws: one clock reading per dispatch.
     let (kept, dropped) = env.kept();

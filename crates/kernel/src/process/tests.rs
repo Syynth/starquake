@@ -216,9 +216,13 @@ fn a_main_thread_that_fails_to_start_is_undone() {
             scheduler,
             ..
         } = &mut tables;
-        let (thread, handle) =
-            create_thread_with_handle((handles, address_space, scheduler), own, (&spec, 0), &memory)
-                .unwrap();
+        let (thread, handle) = create_thread_with_handle(
+            (handles, address_space, scheduler),
+            own,
+            (&spec, 0),
+            &memory,
+        )
+        .unwrap();
         scheduler.mark_running(own).unwrap();
         if started {
             scheduler.start(thread).unwrap();
@@ -349,7 +353,11 @@ const DRAWN: [u64; ENTROPY_COUNT + 1] = [
 
 /// The first `n` of [`DRAWN`], as a replay's records.
 fn drawn(n: usize) -> Vec<EnvRecord> {
-    DRAWN.iter().take(n).map(|&word| EnvRecord::Random(word)).collect()
+    DRAWN
+        .iter()
+        .take(n)
+        .map(|&word| EnvRecord::Random(word))
+        .collect()
 }
 
 /// The entropy words of [`DRAWN`].
@@ -510,7 +518,9 @@ fn a_process_that_is_not_created_is_refused_before_the_draw() {
     let empty = ReplayEnv::new(Vec::new());
     assert_eq!(
         run_with_env(&mut tables, &memory, (ENTRY, STACK_TOP), &empty),
-        Err(StartError::Call(SvcError::Kernel(KernelError::InvalidState)))
+        Err(StartError::Call(SvcError::Kernel(
+            KernelError::InvalidState
+        )))
     );
     assert_eq!(empty.consumed(), 0);
 }
@@ -540,7 +550,9 @@ fn a_start_refused_after_the_draw_has_still_drawn_one_number() {
     let env = ReplayEnv::new(drawn(1));
     assert_eq!(
         run_with_env(&mut tables, &memory, (ENTRY, STACK_TOP), &env),
-        Err(StartError::Call(SvcError::Kernel(KernelError::LimitReached)))
+        Err(StartError::Call(SvcError::Kernel(
+            KernelError::LimitReached
+        )))
     );
     assert_eq!(env.finish(), Ok(()));
 }

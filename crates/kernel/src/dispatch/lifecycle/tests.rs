@@ -12,8 +12,8 @@ use super::*;
 use crate::dispatch::{Caller, Record};
 use crate::memory::{GUARD_PAGES, fixture};
 use crate::process::{
-    CFI_REGISTER, CFI_VALUE_SET_BITS, Console, IDEAL_CORE_DONT_CARE, IDEAL_CORE_USE_PROCESS_VALUE, MainThread, ProcessDescription,
-    THREAD_LOCAL_REGION_SIZE,
+    CFI_REGISTER, CFI_VALUE_SET_BITS, Console, IDEAL_CORE_DONT_CARE, IDEAL_CORE_USE_PROCESS_VALUE,
+    MainThread, ProcessDescription, THREAD_LOCAL_REGION_SIZE,
 };
 use crate::result::KernelError;
 use crate::sched::{CoreId, CoreSignals, FIRST_THREAD_ID, ThreadState};
@@ -452,7 +452,11 @@ fn an_environment_that_fails_the_x18_draw_ends_create_thread_and_makes_nothing()
         })
     );
     assert_eq!(regs, before, "the call writes no register");
-    assert_eq!(world.made(), before_made, "no handle and no region was taken");
+    assert_eq!(
+        world.made(),
+        before_made,
+        "no handle and no region was taken"
+    );
     // The next attempt, with an environment that answers, makes the thread.
     let env = replay(Some(DRAWN_X18));
     let record = world.call_with(&env, SvcId::CreateThread, &mut regs);
