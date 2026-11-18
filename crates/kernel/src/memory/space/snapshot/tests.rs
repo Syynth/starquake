@@ -13,6 +13,7 @@ use crate::id::SlabId;
 use crate::memory::fixture::{CODE, DATA, RODATA, SHARED, loaded, shared_memory};
 use crate::memory::layout::LayoutError;
 use crate::memory::state::SvcPermission;
+use crate::memory::system_resource::SECURE_ALIGNMENT;
 use starquake_memory::Perms;
 
 use crate::memory::testing::{MapperCall, MapperLog, RecordingMapper};
@@ -486,6 +487,8 @@ fn golden_body() -> Body {
             arrangement: arrangement_tag(MemoryArrangement::TwelveGb),
             alias_region_extra: true,
             offsets: [0x3_0000, 0x4_0000, 0x5_0000, 0x6_0000],
+            system_resource_size: 0x3_1000,
+            pool: pool_number(Pool::SystemNonSecure),
         },
         regions: SavedRegions {
             address_space: (0x11, 0x12),
@@ -526,7 +529,7 @@ fn golden_body() -> Body {
 fn golden_bytes() -> Vec<u8> {
     let mut bytes = vec![
         // The request: code address 0x1_1000, code size 0x2000, arrangement tag 2, the alias
-        // extra, the four offsets.
+        // extra, the four offsets, the system resource's size 0x3_1000 and pool number 3.
         0x80,
         0xa0,
         0x04,
@@ -546,6 +549,10 @@ fn golden_bytes() -> Vec<u8> {
         0x80,
         0x80,
         0x18,
+        0x80,
+        0xa0,
+        0x0c,
+        3,
         // The regions, each start and end, then the alias extra size.
         0x11,
         0x12,
@@ -663,29 +670,70 @@ fn the_arrangement_tags_are_pinned() {
         arrangement: arrangement_tag(MemoryArrangement::FourGb),
         alias_region_extra: false,
         offsets: [0x30, 0x40, 0x50, 0x60],
+        system_resource_size: 0x70,
+        pool: pool_number(Pool::Applet),
     };
     assert_eq!(
         postcard::to_allocvec(&request).unwrap(),
-        [0x10, 0x20, 1, 0, 0x30, 0x40, 0x50, 0x60]
+        [0x10, 0x20, 1, 0, 0x30, 0x40, 0x50, 0x60, 0x70, 1]
+    );
+}
+
+#[test]
+fn the_pool_numbers_are_pinned() {
+    // `KMemoryManager::Pool`'s numbers, written out: the reference's, not starquake's own.
+    for (pool, number) in [
+        (Pool::Application, 0),
+        (Pool::Applet, 1),
+        (Pool::System, 2),
+        (Pool::SystemNonSecure, 3),
+    ] {
+        assert_eq!(pool_number(pool), number);
+        assert_eq!(pool_of(number), Ok(pool));
+    }
+    for number in [4, 5, u8::MAX] {
+        assert_eq!(pool_of(number), Err(SnapshotError::Pool { number }));
+    }
+    // The pool is the request's last field, after the system resource's size.
+    let request = SavedRequest {
+        code_address: 0x10,
+        code_size: 0x20,
+        arrangement: arrangement_tag(MemoryArrangement::TwelveGb),
+        alias_region_extra: true,
+        offsets: [0x30, 0x40, 0x50, 0x60],
+        system_resource_size: 0x70,
+        pool: pool_number(Pool::System),
+    };
+    assert_eq!(
+        postcard::to_allocvec(&request).unwrap(),
+        [0x10, 0x20, 2, 1, 0x30, 0x40, 0x50, 0x60, 0x70, 2]
     );
 }
 
 /// Any body: every field drawn on its own, so a read that takes another field's place shows.
 fn any_body() -> impl Strategy<Value = Body> {
     let request = (
-        any::<u64>(),
-        any::<u64>(),
-        any::<u8>(),
+        (any::<u64>(), any::<u64>(), any::<u8>()),
         any::<bool>(),
         any::<[u64; 4]>(),
+        any::<u32>(),
+        any::<u8>(),
     )
         .prop_map(
-            |(code_address, code_size, arrangement, alias_region_extra, offsets)| SavedRequest {
+            |(
+                (code_address, code_size, arrangement),
+                alias_region_extra,
+                offsets,
+                system_resource_size,
+                pool,
+            )| SavedRequest {
                 code_address,
                 code_size,
                 arrangement,
                 alias_region_extra,
                 offsets,
+                system_resource_size,
+                pool,
             },
         );
     let regions =
@@ -872,6 +920,10 @@ fn faults() -> Vec<(&'static str, Fault)> {
             case.body.request.arrangement = 0;
             SnapshotError::Arrangement { tag: 0 }
         }),
+        ("pool", |case, _| {
+            case.body.request.pool = 4;
+            SnapshotError::Pool { number: 4 }
+        }),
         ("layout", |case, _| {
             case.body.request.code_size += 1;
             SnapshotError::Layout(LayoutError::BadCode {
@@ -882,6 +934,19 @@ fn faults() -> Vec<(&'static str, Fault)> {
         ("regions", |case, _| {
             case.body.regions.alias.0 += PAGE_SIZE;
             SnapshotError::Regions
+        }),
+        ("system resource pages", |case, _| {
+            case.body.request.system_resource_size = 1;
+            SnapshotError::SystemResourcePages { size: 1 }
+        }),
+        ("system resource", |case, _| {
+            // One page in the application pool: not `SecureAlignment`.
+            let size = u32::try_from(PAGE_SIZE).unwrap();
+            case.body.request.system_resource_size = size;
+            SnapshotError::SystemResource {
+                size,
+                error: KernelError::InvalidSize,
+            }
         }),
         ("stack", |case, _| {
             case.body.main_thread_stack_size += 1;
@@ -2761,4 +2826,178 @@ fn an_unknown_merge_barrier_bit_restores_as_it_is() {
     let restored = case.restore().0.unwrap();
     let block = restored.query_info(tls).unwrap();
     assert_eq!(block.disable_merge().bits() & unknown, unknown);
+}
+
+// ----- The system resource --------------------------------------------------------------------
+
+/// The fixture's code and main thread's stack in a 4 GiB address space whose process has
+/// `resource`.
+fn charged(resource: SystemResource) -> AddressSpace {
+    let (mapper, _log) = RecordingMapper::new();
+    let memory = crate::memory::fixture::memory(MemoryArrangement::FourGb);
+    let mut space =
+        AddressSpace::with_system_resource(&memory, resource, Box::new(mapper)).unwrap();
+    space
+        .create_main_thread_stack(crate::memory::fixture::STACK_SIZE)
+        .unwrap();
+    space
+}
+
+/// An application's system resource of three [`SECURE_ALIGNMENT`]s.
+fn application_resource() -> SystemResource {
+    SystemResource::new(
+        u32::try_from(3 * SECURE_ALIGNMENT).unwrap(),
+        Pool::Application,
+    )
+}
+
+/// A case of `space` saved, with no shared memory to resolve.
+fn case_of(space: &AddressSpace) -> Case {
+    Case {
+        body: Body::of(space),
+        objects: Resolver::new(),
+        refuse: Vec::new(),
+    }
+}
+
+#[test]
+fn a_space_with_a_system_resource_restores_with_its_charge_and_is_used_as_the_original() {
+    let resource = application_resource();
+    let mut original = charged(resource);
+    let bytes = original.save().unwrap();
+    let mut restored = restore_with(&bytes, &Resolver::new()).0.unwrap();
+    assert_eq!(Body::of(&restored), Body::of(&original));
+    assert_eq!(restored.system_resource(), resource);
+    assert_eq!(restored.limit(), original.limit());
+    assert_eq!(
+        restored.used_user_physical_memory_size(),
+        restored.used_non_system_user_physical_memory_size() + resource.size()
+    );
+    // Both grow their heap to the largest 2 MiB multiple the charged pool leaves, and both
+    // refuse the next one for want of room.
+    let unit = 2 << 20;
+    let room = original.limit().free() / unit * unit;
+    assert!(room + unit <= original.max_heap_size());
+    for space in [&mut original, &mut restored] {
+        assert!(space.set_heap_size(room).is_ok());
+        assert_eq!(
+            space.set_heap_size(room + unit),
+            Err(KernelError::LimitReached.into())
+        );
+    }
+    assert_eq!(Body::of(&restored), Body::of(&original));
+}
+
+#[test]
+fn the_reservation_must_hold_the_system_resource_s_charge_exactly() {
+    let resource = application_resource();
+    let mut case = case_of(&charged(resource));
+    let reserved = case.body.reserved;
+    let without = reserved - resource.size();
+    assert!(case.restore().0.is_ok());
+    // The reservation without the charge, or with a page more.
+    for wrong in [without, reserved + PAGE_SIZE] {
+        case.body.reserved = wrong;
+        assert_eq!(
+            case.error(),
+            SnapshotError::Reservation {
+                reserved: wrong,
+                used: reserved
+            },
+            "{wrong:#x}"
+        );
+    }
+    // In the applet pool the same resource charges nothing: the reservation without it is
+    // right, and the one with it is not.
+    case.body.request.pool = pool_number(Pool::Applet);
+    case.body.reserved = without;
+    assert!(case.restore().0.is_ok());
+    case.body.reserved = reserved;
+    assert_eq!(
+        case.error(),
+        SnapshotError::Reservation {
+            reserved,
+            used: without
+        }
+    );
+}
+
+#[test]
+fn a_system_resource_no_live_space_could_have_is_refused_with_its_check() {
+    let mut case = case_of(&charged(application_resource()));
+    // One page in the system pool aligns, but holds only its own reference counts. The
+    // reservation is left as it was: the resource is checked first.
+    let page = u32::try_from(PAGE_SIZE).unwrap();
+    case.body.request.system_resource_size = page;
+    case.body.request.pool = pool_number(Pool::System);
+    assert_eq!(
+        case.error(),
+        SnapshotError::SystemResource {
+            size: page,
+            error: KernelError::OutOfMemory
+        }
+    );
+    // Two pages pass that check, and then the reservation is wrong.
+    case.body.request.system_resource_size = 2 * page;
+    assert!(matches!(case.error(), SnapshotError::Reservation { .. }));
+    // A size past whole pages is refused before its pool's checks.
+    case.body.request.system_resource_size = page + 1;
+    assert_eq!(
+        case.error(),
+        SnapshotError::SystemResourcePages { size: page + 1 }
+    );
+}
+
+#[test]
+fn saving_a_space_whose_system_resource_could_not_have_been_set_aside_is_refused() {
+    // A live space holding a resource no creation could have set aside: a kernel bug, which
+    // save reports with the restore's error.
+    let mut space = charged(application_resource());
+    let page = u32::try_from(PAGE_SIZE).unwrap();
+    space.system_resource = SystemResource::new(page, Pool::Application);
+    assert_eq!(
+        space.save(),
+        Err(SnapshotError::SystemResource {
+            size: page,
+            error: KernelError::InvalidSize
+        })
+    );
+    // And one whose charge the count does not hold.
+    let mut other = charged(application_resource());
+    other.system_resource = SystemResource::NONE;
+    assert!(matches!(
+        other.save(),
+        Err(SnapshotError::Reservation { .. })
+    ));
+}
+
+#[test]
+fn a_version_2_snapshot_is_refused_with_the_version_error() {
+    let space = charged(SystemResource::NONE);
+    let bytes = space.save().unwrap();
+    let mut header = ADDRESS_SPACE_MAGIC.to_vec();
+    header.extend(varint(u64::from(ADDRESS_SPACE_VERSION)));
+    let body = &bytes[header.len()..];
+    // Version 2's request ended at the offsets: this one without the resource's size and pool
+    // (one byte each for no resource in the application pool).
+    let request = postcard::to_allocvec(&Body::of(&space).request).unwrap();
+    let cut = request.len() - 2;
+    assert_eq!(request.get(cut..), Some(&[0, 0][..]));
+    let mut version_2_body = body[..cut].to_vec();
+    version_2_body.extend(&body[request.len()..]);
+    let mut old = ADDRESS_SPACE_MAGIC.to_vec();
+    old.extend(varint(2));
+    old.extend(&version_2_body);
+    assert_eq!(
+        restore_with(&old, &Resolver::new()).0.unwrap_err(),
+        SnapshotError::Format(FormatError::UnsupportedVersion {
+            name: "address space",
+            found: 2,
+            supported: ADDRESS_SPACE_VERSION
+        })
+    );
+    // The same body under this build's version is read wrongly and refused.
+    let mut misread = header;
+    misread.extend(&version_2_body);
+    assert!(restore_with(&misread, &Resolver::new()).0.is_err());
 }

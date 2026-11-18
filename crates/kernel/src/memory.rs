@@ -8,7 +8,8 @@
 //! - [`block_map`]: the sorted map of blocks, with merge and split.
 //! - [`layout`]: where the regions of a 39-bit address space go. Placement is deterministic by
 //!   default.
-//! - [`pool`]: the console's memory arrangement and a process's memory count.
+//! - [`pool`]: the console's memory arrangement, the pools and a process's memory count.
+//! - [`system_resource`]: a process's system resource, and what it charges to that count.
 //! - [`space`]: [`AddressSpace`], the table a system call declares, and its operations.
 //! - [`space::snapshot`]: the address space saved and restored ([`AddressSpace::save`],
 //!   [`AddressSpace::restore`]): the blocks and the counts, with the [`Mapper`] rebuilt, since a
@@ -41,13 +42,14 @@ pub mod pool;
 pub mod shared;
 pub mod space;
 pub mod state;
+pub mod system_resource;
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing;
 
 pub use block::{MemoryBlock, SvcMemoryInfo};
 pub use layout::{Region, RegionOffsets, Regions};
 pub use mapper::{Mapper, MapperError};
-pub use pool::{MemoryArrangement, MemoryLimit};
+pub use pool::{MemoryArrangement, MemoryLimit, Pool};
 pub use shared::{
     SharedMemory, SharedPages, TransferMemory, is_shared_memory_permission,
     is_transfer_memory_permission, shared_memory_size,
@@ -58,3 +60,4 @@ pub use space::snapshot::{
 };
 pub use space::{AddressSpace, CreateError, DeviceShareToken, GUARD_PAGES, ProcessMemory};
 pub use state::{MemoryAttribute, MemoryPermission, MemoryState, SvcPermission};
+pub use system_resource::SystemResource;

@@ -4,7 +4,8 @@
 //!
 //! # What is saved
 //!
-//! What the address space was created from (the code and the layout's inputs), the regions,
+//! What the address space was created from (the code, the layout's inputs and the system
+//! resource: its size and pool), the regions,
 //! every memory block with every count it keeps (the counts behind the merge barriers too), the
 //! heap's size, the largest heap, the main thread's stack size, the bytes reserved from the
 //! pool, the mapped physical memory size (`m_mapped_physical_memory_size`), the shared memory
@@ -23,7 +24,10 @@
 //!
 //! [`crate::snapshot`]'s header, with [`ADDRESS_SPACE_MAGIC`] and [`ADDRESS_SPACE_VERSION`], then
 //! the body, in this order: the creation request (code address, code size, arrangement tag,
-//! whether the alias region gets its extra size, the alias, heap, stack and kernel-map offsets);
+//! whether the alias region gets its extra size, the alias, heap, stack and kernel-map offsets,
+//! the system resource's size and its pool's number; version 3 added the last two, and a
+//! version 2 snapshot is refused with the version error:
+//! `a_version_2_snapshot_is_refused_with_the_version_error`);
 //! the regions (address space, code, alias, heap, stack, kernel map, each start and end, then
 //! the alias region's extra size); the heap size, the largest heap, the bytes reserved, the main
 //! thread's stack size and the mapped physical memory size; the blocks (each address, pages,
@@ -32,10 +36,12 @@
 //! mappings (each address, size, object); the device-share locks (each address, size, count);
 //! the aliases (each address, source, size; version 2 added them, and a version 1 snapshot is
 //! refused with the version error: `a_version_1_snapshot_is_refused_with_the_version_error`).
-//! The arrangement tag is starquake's own ([`ARRANGEMENT_TAGS`]); the state word is the
-//! reference's (`KMemoryState`, [`MemoryState::word`]), and the bit sets are the reference's
+//! The arrangement tag is starquake's own ([`ARRANGEMENT_TAGS`]); the pool number is the
+//! reference's (`KMemoryManager::Pool`, [`Pool::number`]), and so is the state word
+//! (`KMemoryState`, [`MemoryState::word`]), and the bit sets are the reference's
 //! bits ([`super::super::state`]). The golden-bytes tests `the_body_layout_is_pinned` and
-//! `the_arrangement_tags_are_pinned` (in `snapshot/tests.rs`) pin it; changing it means bumping
+//! `the_arrangement_tags_are_pinned` and `the_pool_numbers_are_pinned` (in `snapshot/tests.rs`)
+//! pin it; changing it means bumping
 //! [`ADDRESS_SPACE_VERSION`].
 //!
 //! # Checks
@@ -45,16 +51,23 @@
 //!
 //! 1. The header and the body's encoding ([`crate::snapshot::decode`]: header, magic, version,
 //!    body, trailing bytes).
-//! 2. The arrangement tag ([`SnapshotError::Arrangement`]), then that the code is whole pages and
+//! 2. The arrangement tag ([`SnapshotError::Arrangement`]), the system resource's pool number
+//!    ([`SnapshotError::Pool`]), then that the code is whole pages and
 //!    the request can be laid out ([`SnapshotError::Layout`]), then that the saved regions are
 //!    exactly where the layout puts them ([`SnapshotError::Regions`]).
-//! 3. The counts, each against what fixed it live: the stack is whole pages and, if there is
+//! 3. The counts, each against what fixed it live: the system resource is whole pages
+//!    ([`SnapshotError::SystemResourcePages`]) and passes the checks
+//!    `KSecureSystemResource::Initialize` makes after its reservation
+//!    ([`SnapshotError::SystemResource`]: aligned for its pool, larger than its reference
+//!    counts); the stack is whole pages and, if there is
 //!    one, it and the code fit the largest process memory ([`SnapshotError::Stack`]); the
 //!    largest heap is zero or what the stack left (`KProcess::Run`), and exactly that when
 //!    there is a stack ([`SnapshotError::MaxHeap`]); the heap is whole pages and at most the
 //!    largest heap, which is at most the heap region ([`SnapshotError::Heap`]); the reservation
-//!    is at most the pool ([`SnapshotError::OverLimit`]) and exactly the code, stack, heap and
-//!    mapped physical memory ([`SnapshotError::Reservation`]).
+//!    is at most the pool ([`SnapshotError::OverLimit`]) and exactly the code, stack, heap,
+//!    mapped physical memory and the system resource's charge
+//!    ([`crate::memory::SystemResource::required_secure_memory_size`];
+//!    [`SnapshotError::Reservation`]).
 //! 4. Each block in turn ([`SnapshotError::Block`], first failing check of the first failing
 //!    block): its shape, that it starts where the one before ended (the first at the address
 //!    space's start: [`BlockFault::Overlap`] below that, [`BlockFault::Gap`] above), that it
@@ -129,7 +142,9 @@
 //!
 //! # Why each relation holds live
 //!
-//! - **The reservation.** [`AddressSpace::new`] reserves the code, the main thread's stack is
+//! - **The reservation.** [`AddressSpace::with_system_resource`] reserves the code and then the
+//!   system resource's charge, after the resource passed its checks (and the address space
+//!   keeps that resource for its life), the main thread's stack is
 //!   reserved when it is made, heap growth reserves what it grows and a shrink releases it, and
 //!   `MapPhysicalMemory` reserves what it maps (and keeps what an undo could not unmap, counted
 //!   as mapped physical memory); nothing else reserves.
@@ -238,6 +253,13 @@
 //!   is saved, and other memory may have the `Stack` state), where the `Normal` and
 //!   `Locked` merge barriers sit, and which merge barrier bits a block has beyond the IPC and
 //!   device ones it checks (an unknown barrier bit restores as it is).
+//! - **Not checked here: that the system resource is the process's.** The address space does
+//!   not know its process, and the process table has no snapshot (it is made again from the
+//!   program's description). A restored space whose resource differs from the description's
+//!   is refused when the two are put together ([`crate::process::create`],
+//!   `crate::process::CreateError::SystemResource`); until then its `GetInfo` 6, 7 and 21
+//!   answers would take the saved resource's charge. Test (in `process/tests.rs`):
+//!   `a_space_made_for_another_system_resource_is_refused`.
 //! - **Not checked here, for the aliases:** that every block shaped like an alias's source is
 //!   one. A transfer memory lent with no permission leaves its owner's memory the same way
 //!   (`Normal`, `KernelRead | NotMapped`, `Locked`), so such a block that no alias names
@@ -284,10 +306,13 @@ use crate::memory::block_map::{BlockMap, BlockMapError};
 use crate::memory::layout::{LayoutError, Region, RegionOffsets, Regions};
 use crate::memory::mapper::{Mapper, MapperError};
 use crate::memory::pool::MemoryArrangement;
+use crate::memory::pool::Pool;
 use crate::memory::shared::SharedMemory;
 use crate::memory::state::{
     DisableMerge, MemoryAttribute, MemoryPermission, MemoryState, SvcPermission, flag,
 };
+use crate::memory::system_resource::SystemResource;
+use crate::result::KernelError;
 use crate::snapshot::{Format, FormatError, decode, encode};
 
 mod alias;
@@ -305,8 +330,9 @@ pub const ADDRESS_SPACE_MAGIC: [u8; 4] = *b"SQAS";
 
 /// Layout version written into every address space snapshot and required when reading one.
 ///
-/// Version 1 had no aliases; version 2 appends them to the body (module docs, "Format").
-pub const ADDRESS_SPACE_VERSION: u32 = 2;
+/// Version 1 had no aliases; version 2 appends them to the body; version 3 adds the system
+/// resource to the creation request (module docs, "Format").
+pub const ADDRESS_SPACE_VERSION: u32 = 3;
 
 /// The address space snapshot's header.
 const FORMAT: Format = Format {
@@ -454,12 +480,36 @@ pub enum SnapshotError {
         /// The tag found.
         tag: u8,
     },
+    /// The system resource's pool number is no pool ([`Pool::from_number`]).
+    #[error("the address space snapshot has the unknown memory pool number {number}")]
+    Pool {
+        /// The number found.
+        number: u8,
+    },
     /// The saved program cannot be laid out.
     #[error("the address space snapshot's program cannot be laid out: {0}")]
     Layout(LayoutError),
     /// The saved regions are not where the layout puts them.
     #[error("the address space snapshot's regions are not where its program's layout puts them")]
     Regions,
+    /// The system resource's size is not whole pages: a live one is always rounded down to
+    /// them ([`SystemResource::new`]).
+    #[error("the address space snapshot's system resource of {size:#x} bytes is not whole pages")]
+    SystemResourcePages {
+        /// The saved size.
+        size: u32,
+    },
+    /// The system resource fails a check of `KSecureSystemResource::Initialize` after its
+    /// reservation ([`SystemResource::check_allocation`]), so no live address space has it.
+    #[error(
+        "the address space snapshot's system resource of {size:#x} bytes could not have been set aside: {error}"
+    )]
+    SystemResource {
+        /// The saved size.
+        size: u32,
+        /// What the check gives.
+        error: KernelError,
+    },
     /// The main thread's stack is not whole pages, or it and the code do not fit.
     #[error("the address space snapshot's main thread stack of {size:#x} bytes does not fit")]
     Stack {
@@ -488,7 +538,8 @@ pub enum SnapshotError {
         /// The arrangement's pool.
         limit: u64,
     },
-    /// The reservation is not what the code, stack, heap and mapped physical memory use.
+    /// The reservation is not what the code, stack, heap, mapped physical memory and system
+    /// resource use.
     #[error("the address space snapshot reserves {reserved:#x} bytes but uses {used:#x}")]
     Reservation {
         /// The saved reservation.
@@ -595,6 +646,10 @@ struct SavedRequest {
     alias_region_extra: bool,
     /// Alias, heap, stack, kernel map.
     offsets: [u64; 4],
+    /// The system resource's size ([`SystemResource::size`]): whole pages of a `u32`.
+    system_resource_size: u32,
+    /// The system resource's pool, by its reference number ([`Pool::number`]).
+    pool: u8,
 }
 
 /// A region as saved: start, end.
@@ -665,6 +720,7 @@ struct Body {
 /// What checks 2 to 8 found: what a restore builds from.
 struct Checked {
     memory: ProcessMemory,
+    resource: SystemResource,
     regions: Regions,
     blocks: Vec<MemoryBlock>,
 }
@@ -715,6 +771,11 @@ impl Body {
                     offsets.stack,
                     offsets.kernel_map,
                 ],
+                // A live resource's size came from a `u32`; one that did not fit would be
+                // saved as a size that is not whole pages, which the save's own check refuses.
+                system_resource_size: u32::try_from(space.system_resource.size())
+                    .unwrap_or(u32::MAX),
+                pool: pool_number(space.system_resource.pool()),
             },
             regions: SavedRegions {
                 address_space: saved_region(regions.address_space),
@@ -755,8 +816,8 @@ impl Body {
 
     /// Checks 2 to 8 of the module docs, in order.
     fn check(&self) -> Result<Checked, SnapshotError> {
-        let (memory, regions) = self.check_layout()?;
-        self.check_counts(&memory, &regions)?;
+        let (memory, resource, regions) = self.check_layout()?;
+        self.check_counts(&memory, resource, &regions)?;
         let blocks = self.check_blocks(&regions)?;
         self.check_ranges(&memory, &regions, &blocks)?;
         self.check_shared(&blocks)?;
@@ -764,15 +825,18 @@ impl Body {
         alias::check(&self.aliases, &regions, &blocks)?;
         Ok(Checked {
             memory,
+            resource,
             regions,
             blocks,
         })
     }
 
-    /// Check 2: the arrangement, the layout and the regions.
-    fn check_layout(&self) -> Result<(ProcessMemory, Regions), SnapshotError> {
+    /// Check 2: the arrangement, the system resource's pool, the layout and the regions.
+    fn check_layout(&self) -> Result<(ProcessMemory, SystemResource, Regions), SnapshotError> {
         let request = &self.request;
         let arrangement = arrangement_of(request.arrangement)?;
+        let pool = pool_of(request.pool)?;
+        let resource = SystemResource::new(request.system_resource_size, pool);
         let [alias, heap, stack, kernel_map] = request.offsets;
         let memory = ProcessMemory {
             code_address: request.code_address,
@@ -800,11 +864,25 @@ impl Body {
         if saved != regions {
             return Err(SnapshotError::Regions);
         }
-        Ok((memory, regions))
+        Ok((memory, resource, regions))
     }
 
-    /// Check 3: the stack, the largest heap, the heap and the reservation.
-    fn check_counts(&self, memory: &ProcessMemory, regions: &Regions) -> Result<(), SnapshotError> {
+    /// Check 3: the system resource, the stack, the largest heap, the heap and the reservation.
+    fn check_counts(
+        &self,
+        memory: &ProcessMemory,
+        resource: SystemResource,
+        regions: &Regions,
+    ) -> Result<(), SnapshotError> {
+        // `SystemResource::new` rounds a recorded size down to whole pages, and the address
+        // space was made only once the resource passed `KSecureSystemResource::Initialize`.
+        let size = self.request.system_resource_size;
+        if u64::from(size) != resource.size() {
+            return Err(SnapshotError::SystemResourcePages { size });
+        }
+        resource
+            .check_allocation()
+            .map_err(|error| SnapshotError::SystemResource { size, error })?;
         let max = max_process_memory(regions);
         let stack = self.main_thread_stack_size;
         // `KProcess::Run`: the stack and the code together within the largest process memory.
@@ -834,7 +912,8 @@ impl Body {
             .code_size
             .saturating_add(stack)
             .saturating_add(heap)
-            .saturating_add(self.mapped_physical_memory_size);
+            .saturating_add(self.mapped_physical_memory_size)
+            .saturating_add(resource.required_secure_memory_size());
         if reserved != used {
             return Err(SnapshotError::Reservation { reserved, used });
         }
@@ -1023,6 +1102,16 @@ fn arrangement_of(tag: u8) -> Result<MemoryArrangement, SnapshotError> {
         .find(|(_, known)| *known == tag)
         .map(|&(arrangement, _)| arrangement)
         .ok_or(SnapshotError::Arrangement { tag })
+}
+
+/// The number `pool` is saved as: its reference number ([`Pool::number`]), which fits a byte.
+fn pool_number(pool: Pool) -> u8 {
+    u8::try_from(pool.number()).unwrap_or(u8::MAX)
+}
+
+/// The pool saved as `number`.
+fn pool_of(number: u8) -> Result<Pool, SnapshotError> {
+    Pool::from_number(u32::from(number)).ok_or(SnapshotError::Pool { number })
 }
 
 /// The block a saved one describes, after the per-block checks of check 4 but the region (in
@@ -1230,6 +1319,7 @@ impl AddressSpace {
         let body: Body = decode(FORMAT, bytes)?;
         let Checked {
             memory,
+            resource,
             regions,
             blocks,
         } = body.check()?;
@@ -1279,6 +1369,7 @@ impl AddressSpace {
             limit,
             code_size: memory.code_size,
             main_thread_stack_size: body.main_thread_stack_size,
+            system_resource: resource,
             shared: body
                 .shared
                 .iter()
