@@ -741,7 +741,7 @@ fn a_snapshot_s_deadline_needs_a_listener() {
     assert_eq!(error, VsyncSnapshotError::DeadlineWithoutListeners);
     assert_eq!(
         error.to_string(),
-        "the vsync clock snapshot has a deadline but no listeners"
+        "the vsync clock snapshot has a deadline but no listeners, and no present waits for a tick"
     );
     // Neither, or both, are taken; and listeners with no deadline (the end of the counts).
     for (next, listeners) in [

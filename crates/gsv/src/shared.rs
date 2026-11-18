@@ -60,7 +60,7 @@
 //!
 //! | Completion | What the drain does |
 //! |---|---|
-//! | `GpuCompletion::SyncpointChanged` | records `SyncpointObserved` ([`crate::note`]), then fires every armed wait on the id that the drained value satisfies: takes it out of the table, unwatches its id, and signals its event through the kernel ([`TimerHost::signal_event`]), in ascending event order (`a_change_fires_its_waits_after_its_note_in_event_order`) |
+//! | `GpuCompletion::SyncpointChanged` | records `SyncpointObserved` ([`crate::note`]), then fires every armed wait on the id that the drained value satisfies: takes it out of the table, unwatches its id, and signals its event through the kernel ([`TimerHost::signal_event`]), in ascending event order (`a_change_fires_its_waits_after_its_note_in_event_order`); then marks reached every queued present whose fence on the id the value reaches, and gives back its watch ([`present`], "Reached means drained") |
 //! | `GpuCompletion::GpuOrdered` | records `GpuOrderedDone`; then, if a gpu worker job waits on the ticket ([`crate::gpu::GpuMemory::ordered_done`]), publishes the ranges it removed again, releases its device-share locks as a `DeviceShareReleased` is released (below), and only then signals its event ([`TimerHost::signal_event`]) |
 //! | `GpuCompletion::GpuQueueRoom` | records `QueueRoom`; then gives the channel's waiting submissions to the front again, oldest first, completing the reply of each one it queues, until the front answers `Full` ([`crate::nvsrv::gpu::submits::Submits::room`]) |
 //! | [`Completion::GuestSignalled`] | records nothing (the guest's `SignalEvent` is recorded as its system call); if the event is the bound shared page's request event, marks the page signalled, and the next page turn ([`Shared::tick_page`]) reads the request and records what it answers ([`page`]) |
@@ -93,7 +93,9 @@
 //! **The vsync turn.** The timer thread also runs [`Shared::tick_vsync`] with the turn's time,
 //! after the drain, which ticks the vsync clock when its deadline has come, and sleeps no later
 //! than [`Shared::vsync_deadline`] ([`vsync`]). The clock saves itself
-//! ([`Shared::save_vsync`], [`Shared::restore_vsync`]).
+//! ([`Shared::save_vsync`], [`Shared::restore_vsync`]). Each tick also runs vi2's present
+//! latch ([`present`], "The latch") and returns the latched frames' requests, which the timer
+//! thread hands to the GPU front once the lock is released.
 //!
 //! # The timer thread
 //!
@@ -116,8 +118,9 @@
 //! [`SNAPSHOT_VERSION`]. Version 2 added the waits. The queue has its own snapshot
 //! ([`CompletionQueue::save`]), because it must exist before the `Syncpoints` that pushes to it.
 //! The GPU memory bookkeeping has its own too ([`crate::gpu::saved`]), and so has the shared page
-//! ([`Shared::save_page`], restored after this one by [`Shared::restore_page`]); composing them
-//! into this one is the wiring slice's (16).
+//! ([`Shared::save_page`], restored after this one by [`Shared::restore_page`]), and so have vi2's
+//! presents ([`Shared::save_presents`], restored after this one and before the vsync clock by
+//! [`Shared::restore_presents`]); composing them into this one is the wiring slice's (16).
 //!
 //! A snapshot is a file and is not trusted. [`Shared::restore`] checks, in this order, and
 //! returns the first failure: the magic, the version, that the body decodes, that no bytes
@@ -152,11 +155,13 @@ use crate::nvsrv::gpu::submits::Submits;
 use crate::syncpt::waiters::{SavedWait, SavedWaitError, Wait, Waiters};
 
 pub mod page;
+pub mod present;
 #[cfg(test)]
 mod tests;
 pub mod vsync;
 
 use page::Page;
+use present::Presents;
 use vsync::Vsync;
 
 /// [`SYNCPOINT_COUNT`] as an index bound.
@@ -238,6 +243,8 @@ pub struct GsvShared {
     vsync: Vsync,
     /// The native memories and images (slice 8).
     native: NativeObjects,
+    /// vi2's presents (slice 14).
+    presents: Presents,
 }
 
 impl GsvShared {
@@ -251,6 +258,7 @@ impl GsvShared {
             submits: Submits::new(),
             vsync: Vsync::new(),
             native: NativeObjects::new(),
+            presents: Presents::new(),
         }
     }
 
@@ -522,6 +530,9 @@ impl Shared {
                         for event in state.fire(id, value) {
                             signal(host, event);
                         }
+                        for _ in 0..state.state.presents.reach(id, value) {
+                            state.release(id);
+                        }
                     }
                     if let GpuCompletion::GpuQueueRoom { channel } = gpu {
                         state.submits().room(channel);
@@ -604,6 +615,7 @@ impl Shared {
             submits: Submits::new(),
             vsync: Vsync::new(),
             native: NativeObjects::new(),
+            presents: Presents::new(),
         };
         Ok(Self::with_state(state, syncpoints, queue, service))
     }

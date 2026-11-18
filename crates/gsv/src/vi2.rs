@@ -1,7 +1,8 @@
 //! The vi2 session gsv 305 returns: displays, clients and their layers, request groups and the
 //! display monitors registered on them, notifications, and display state
-//! (`docs/specs/graphics-server.md`, "Display: vi2"; port slice 13). Present (228, 229) and its
-//! pacing are slice 14's: until it lands they go to the server's unknown-command policy.
+//! (`docs/specs/graphics-server.md`, "Display: vi2"; port slice 13), and present and its pacing:
+//! 228 and 229, whose frames the vsync tick latches from gsv's shared state
+//! (`crate::shared::present`; "Present (229) and pacing", port slice 14).
 //!
 //! * [`saved`]: the session's saved form and the relations a restore checks.
 //!
@@ -14,8 +15,11 @@
 //!   `ClassifyRequestGroupEventDuplicate`, `IsSupportedDisplayParameter301`). PR names the
 //!   commands from the vi2 system module (`vi2.autogen` addresses in its comments).
 //! - **NX2:** Eden-NX2, `eden-nx2/src/core/hle/service/nx2_gsv.h` @ 50fa86bb
-//!   (`INx2Vi2Session`), and its blocker log `eden-nx2/NX2_NOTES.md` @ 50fa86bb, whose rows
-//!   "row N" names.
+//!   (`INx2Vi2Session`, its `PresentClientBuffer` and `CancelClientBuffer` among them), and its
+//!   blocker log `eden-nx2/NX2_NOTES.md` @ 50fa86bb, whose rows "row N" names.
+//! - **PR**'s present: `IVi2Session::PresentClientBuffer`, `QueueNativeImage`,
+//!   `CancelClientBuffer` and `RefreshReleasedBuffers` in the same file, and
+//!   `GraphicsSupervisorProtocol::DecodeBufferSlot` in `graphics_supervisor_protocol.h`.
 //!
 //! The VI result module and its description 7 and 5 are Eden's
 //! (`eden/src/core/hle/result.h` @ cf654052: `ErrorModule::VI = 114`;
@@ -68,6 +72,8 @@
 //! | 201 | `RegisterClientState` | `u64` client, `u32` retire bit, `u32` available bit | nothing | read (PR) |
 //! | 202 | `UnregisterClientState` | `u64` client | nothing | read (PR) |
 //! | 212 | `GetClientAvailability` | `u64` client | `u64` mask of free slots | read (PR) |
+//! | 228 | `CancelClientBuffer` | `u64` client, the slot in the low byte of a `u32`, sixteen words nothing reads | `u64` mask of free slots, four zero words | read (PR); NX2 names it |
+//! | 229 | `PresentClientBuffer` | `u64` client (w2–3), the slot in the low byte of w4, the native image (w5), the byte offset (w6), the shown extent `(width - 1) \| (height - 1) << 16` (w7), the layout (w8), the fence's `SyncCounterId` (w22, 0 for none), 0 (w23), its value (w24), 0 (w25) | `u64` mask of free slots, four zero words; under [`Pacing::FenceWait`] the reply is held, then every slot | observed (row 48); word layout read (PR `QueueNativeImage`; NX2 reads w4, w5, w22 and w24 alike) |
 //! | 251 | `BindClientDisplay` | `u64` client, `u64` name | nothing | read (PR) |
 //! | 252 | `UnbindClientDisplay` | `u64` client | nothing | read (PR) |
 //! | 261–272 | register (odd) and unregister (even) a display monitor | `u64` name, `u32` group | nothing | read (PR); kind 0 observed as the vsync (row 82) |
@@ -125,14 +131,45 @@
 //!   closes the endpoint.
 //! - **201** refuses a zero client, a bit at or past [`CLIENT_NOTIFICATIONS`], or the same bit
 //!   twice with `InvalidCombination`; a client already registered, or a bit another client holds,
-//!   with `InvalidState`; and a session with [`MAX_CLIENTS`] clients with `OutOfResource`.
-//!   Otherwise the client is registered with every slot free ([`ALL_SLOTS`]).
+//!   with `InvalidState`; and a session with [`MAX_CLIENTS`] clients with `OutOfResource`. Then
+//!   gsv's present table: a full table ([`crate::shared::present::MAX_PRESENT_CLIENTS`]),
+//!   `OutOfResource` (starquake's own bound). Otherwise the client is added to the table, which
+//!   gives it a number, and registered with that number and every slot free ([`ALL_SLOTS`]). A
+//!   token another session's client has is no refusal: a token names a client within its
+//!   session, as in PR (`a_token_is_a_client_per_session`).
 //! - **202** refuses a zero client with `InvalidCombination` and one not registered with
-//!   `NotFound`; otherwise it closes the endpoint if the client holds it, destroys its layer,
-//!   frees its bits, forgets it, and then raises its retire notification.
+//!   `NotFound`; otherwise it drops the client's presents (queued and shown frames), closes the
+//!   endpoint if the client holds it, destroys its layer, frees its bits, forgets it, and then
+//!   raises its retire notification.
 //! - **212** refuses a zero client with `InvalidCombination`, and one not registered or a display
 //!   not open with `NotFound`; otherwise it makes the client's layer on first use and answers its
 //!   free slots. A layer number past `u64::MAX` is `OutOfResource` (starquake's own).
+//! - **228** refuses a slot at or past [`SLOTS`] with `InvalidCombination` (PR checks it with the
+//!   header words, before the client), then a zero client or one not registered with `NotFound`;
+//!   otherwise it sets the slot's bit and answers the free slots. A frame that holds the slot
+//!   keeps holding it: PR's cancel leaves `queued[slot]`, so a 229 of the slot is still refused
+//!   until the frame is released (`a_cancel_gives_a_slot_back`).
+//! - **229**, in PR `QueueNativeImage`'s order: a zero client or one not registered,
+//!   `NotFound`; a client with no layer (212 makes it), not bound to the display (251), a slot
+//!   at or past [`SLOTS`] (under either pacing), or, under [`Pacing::BufferQueue`], a slot a
+//!   queued or shown frame holds (PR `!state.queued[slot]`), `InvalidState`; an image that does not exist or is not in
+//!   a window alias image pool (315), `NotFound`; a byte offset other than 0, a shown extent wider
+//!   or taller than the image, a layout other than [`PRESENT_LAYOUT`], an image whose block
+//!   height is not [`PRESENT_BLOCK_HEIGHT`] or whose format is not one of [`PRESENT_FORMATS`],
+//!   `NotImplemented`; a word 23 or 25 other than 0, or a fence word other than [`NO_FENCE`]
+//!   that names no allocated syncpoint, `InvalidCombination`. Then starquake's own, none of which
+//!   a command sequence reaches: an image whose memory has no binding (429 takes only bound
+//!   memory, and nothing unbinds it), `InvalidState`; a client with [`SLOTS`] frames queued, or a
+//!   fence whose syncpoint has `u32::MAX` waiters, `OutOfResource`
+//!   (`crate::shared::present::QueueError`). The `Env` clock is read only when the vsync clock is
+//!   stopped (the present starts it); under [`Pacing::FenceWait`] the request then takes its reply
+//!   token, and a refused token gives back the frame's watch. Every check runs before anything
+//!   changes (`each_present_check_refuses_its_fault`, `the_present_checks_come_in_order`,
+//!   `a_present_needs_a_layer_a_display_and_a_free_slot`). The format check cannot refuse: 429
+//!   and a native table restore refuse any other format first, through
+//!   `crate::native::layout::requirements`, so breaking it is an equivalent mutation. PR also
+//!   refuses a client bound to a player display (`NotImplemented`), which no client is here, and
+//!   an output encoding other than [`OUTPUT_ENCODING`], which 351 refuses first.
 //! - **251** refuses a zero client or one not registered with `NotFound`; on
 //!   [`DEFAULT_DISPLAY`], a display not open with `NotFound` and a client already bound with
 //!   `InvalidState`; on a player display's name, `InvalidState` (PR's answer for a player display
@@ -188,9 +225,41 @@
 //!
 //! **Layers.** A registered client owns at most one layer (spec, "Layers"), made by its first
 //! 212 on the open display and destroyed by 202. A layer is a number, counted up per session
-//! from 1 ([`FIRST_LAYER`]), which nothing outside the session reads yet: slice 14 hands it to
-//! the GPU with each present. Two sessions' layers may share a number; composition of several
+//! from 1 ([`FIRST_LAYER`]), which each present hands the GPU (`PresentRequest::layer`). Two sessions' layers may share a number; composition of several
 //! layers is deferred (spec, "Deferred, not ruled out").
+//!
+//! # Present
+//!
+//! **The buffer queue** (the owner's decision 1, [`Pacing::BufferQueue`], the default): 229
+//! queues its frame in gsv's shared state, clears the slot's bit in the client's free slots,
+//! and answers them at once. The vsync tick latches one frame per client, oldest first once its
+//! fence is reached, and releases the frame it replaces: its slot, the client's "buffer
+//! available" notification and the notification event (`crate::shared::present`, "The
+//! latch"). The tick cannot reach a session's state, so what it releases waits in the shared
+//! table until the session takes it into its own free slots and bitmap: at the start of 11, 21,
+//! 212, 228 and 229 (PR `RefreshReleasedBuffers`, which PR runs at the start of 212 and 229 and
+//! from a 1 ms poll; here 11, 21 and 228 take it too, so each answer is as fresh as PR's poll
+//! makes it). 21 holds gsv's lock from that refresh to clearing the event, so a release in
+//! between is not cleared away unseen. A frame's [`PresentRequest`] names the image's address,
+//! size, pitch, block height and format, the shown area from 0, 0, the client's layer and the
+//! default display ([`DEFAULT_DISPLAY`] as the `DisplayId`; a **guess** at what the GPU front
+//! wants to name a display by). The address is the address the image's native memory is bound
+//! at (114), handed over as the image's GPU address: that a 114 binding's address is the GPU
+//! address is a **guess**. The spec backs GPU address == CPU address only for memory the gpu
+//! worker's 101 registers (scoping doc row 30), not for native memory bound by 114; a trace of
+//! a present of 114-bound memory, or porting PR's path from the image's backing to its parent
+//! (`backing->parent_id` and its offset), would confirm or correct it.
+//!
+//! **The fence wait fallback** ([`Pacing::FenceWait`], the per-run setting of decision 1, given
+//! to [`vi2_server_paced`]): 229 makes the same checks but whether a frame holds the slot (a
+//! fallback present holds no slot, and NX2 checks none). It still refuses a slot at or past
+//! [`SLOTS`] with `InvalidState`, which NX2 does not check either: the latch's notes and the
+//! present table's snapshot hold only a slot below [`SLOTS`] (below, "Where this differs";
+//! `the_fallback_refuses_a_slot_past_the_last`). It queues the frame without clearing its bit,
+//! and holds its
+//! reply, which the vsync tick completes with every slot free on the first tick after the
+//! previous frame's fence (`crate::shared::present`, "The fence wait fallback";
+//! `the_fallback_s_reply_completes_on_the_first_tick_after_the_previous_frame_s_fence`).
 //!
 //! # Vsync
 //!
@@ -249,13 +318,23 @@
 //! | 106 | Eden's display resolution: 1 at 1280 × 720, `NotImplemented` otherwise | auto-stubbed | 1: the display is 1280 × 720 (handheld) until output sizes are read from a display description (spec, "Deferred") |
 //! | A failure's data words | written as zero | — | not written: the result word alone (`a_failure_reply_is_the_result_word_alone`) |
 //! | Header words other than PR's | `InvalidCombination` | read as they come | read as they come; only a missing word is refused (`a_short_request_is_refused_and_a_longer_one_is_read`) |
+//! | When a slot comes back | when the producer releases the buffer's fence, found by a 1 ms poll (`RefreshReleasedBuffers`) | never taken: every reply says every slot is free | on the vsync tick that latches the frame replacing it (the spec's buffer queue; `a_present_s_slot_comes_back_on_the_tick_that_latches_the_next`) |
+//! | A token another session's client holds (201) | accepted: each session keeps its own clients | auto-stubbed | accepted, as PR: gsv's present table keys each client by the number 201 gives it, not by its token (`a_token_is_a_client_per_session`) |
+//! | 228's and 212's refresh | 212 refreshes, 228 does not (its 1 ms poll does) | — | both refresh, as the poll would have (module docs, "Present") |
+//! | 229 of a slot a frame holds, under the fence wait fallback | — (PR has no fallback) | accepted: NX2 checks no slot | accepted (`the_fallback_s_reply_completes_on_the_first_tick_after_the_previous_frame_s_fence`) |
+//! | 229 of a slot at or past [`SLOTS`], under the fence wait fallback | — (PR has no fallback) | accepted: NX2 checks no slot | `InvalidState`, as under the buffer queue: the latch's notes and the present table's snapshot hold only a slot below [`SLOTS`] (`the_fallback_refuses_a_slot_past_the_last`) |
+//! | A present's image destroyed (314, then 430) while its frame is queued or shown | its backing stays locked until the buffer retires (`DrainRetiredMemories`) | — | the frame keeps the description it was queued with, and the memory goes when 430 and 112 say; not ported, a gap for the GPU front, which reads the image when it presents |
 //! | A closed session | its layers destroyed, its events closed, its group tick stopped (destructor) | its events closed | nothing: the framework tells a session nothing when it closes. Its group events stay made, and those that listen keep listening, so they count against [`crate::shared::vsync::MAX_LISTENERS`]: after eight sessions that made eight listening groups each are closed, a new 31 answers `OutOfResource` (`closed_sessions_keep_their_groups_listening`). **Not bounded:** a group event registered for a kind other than 0 does not listen, so it does not count, and neither does a session's notification event: a title that keeps opening sessions, making such events and closing the sessions grows the kernel's events without limit. A known gap, left for a follow-up that needs a close hook from the framework |
 //!
 //! # What is recorded and what is saved
 //!
 //! Every request is one IPC event, recorded by the service framework with its payload. The only
 //! input the session takes from outside the guest is the `Env` clock's reading when a group
-//! starts listening, which the environment records; the ticks are the vsync clock's notes. A
+//! starts listening, or when a present finds the vsync clock stopped, which the environment
+//! records; the ticks are the vsync clock's notes, and the latch's are `FrameLatched` and
+//! `BufferReleased` (`crate::note`). The presents are saved with gsv's shared state
+//! (`crate::shared::Shared::save_presents`), with the vi2 server, whose pending requests a held
+//! fallback reply names. A
 //! session is plain data saved with the server ([`saved`]), checked as it is read back
 //! ([`saved::Vi2SessionError`]). The family saves nothing ([`Vi2Family`]); the listeners are
 //! saved with the vsync clock ([`crate::shared::Shared::save_vsync`]).
@@ -265,7 +344,9 @@ pub mod saved;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use starquake_gpu::interface::LayerId;
+use starquake_gpu::interface::{
+    DisplayId, Fence, ImageDesc, LayerId, PresentRequest, Rect, SyncpointId,
+};
 use starquake_kernel::id::ObjectId;
 use starquake_kernel::result::{KernelError, MODULE_BITS, ResultCode};
 use starquake_services::commands;
@@ -275,20 +356,26 @@ use starquake_services::framework::{
 };
 use starquake_trace::HostNanos;
 
+use crate::completion::Completion;
+use crate::gpu::low_byte;
+use crate::native::layout::{
+    FORMAT_RGB10A2, FORMAT_RGBA8, WORD_BLOCK_HEIGHT, WORD_EXTENT, WORD_FORMAT, WORD_PITCH, extent,
+};
+use crate::shared::present::{NewFrame, QueueError, Refresh, RegisterError, slot_bit, write_slots};
 use crate::shared::vsync::MAX_LISTENERS;
 use crate::shared::{Locked, Shared};
 use command::{
-    BIND_CLIENT_DISPLAY, CLOSE_DISPLAY, CLOSE_ENDPOINT, CONFIGURE_REQUEST_GROUPS,
-    CREATE_REQUEST_GROUP_EVENT, DUPLICATE_REQUEST_GROUP_EVENT, GET_BUFFER_MAX_RESOLUTION,
-    GET_CLIENT_AVAILABILITY, GET_DISPLAY_STATE_105, GET_DISPLAY_STATE_107, GET_DISPLAY_STATE_354,
-    GET_HDR_STATUS, GET_NOTIFICATION_EVENT, GET_NOTIFICATION_LIMIT, GET_NOTIFICATIONS,
-    GET_REQUEST_GROUP_LIMIT, GET_SESSION_LIMIT, OPEN_DISPLAY, OPEN_ENDPOINT,
-    REGISTER_BUFFER_MAX_RESOLUTION_MONITOR, REGISTER_CLIENT_STATE, REGISTER_DISPLAY_EVENT_MONITOR,
-    REGISTER_DISPLAY_MONITOR_263, REGISTER_DISPLAY_MONITOR_267, REGISTER_DISPLAY_MONITOR_271,
-    REGISTER_HDR_STATUS_MONITOR, RELEASE_NOTIFICATION_EVENT, SET_CLIENT_OUTPUT_ENCODING,
-    SET_CLIENT_OUTPUT_LEVELS, SET_DISPLAY_PARAMETER_301, UNBIND_CLIENT_DISPLAY,
-    UNREGISTER_BUFFER_MAX_RESOLUTION_MONITOR, UNREGISTER_CLIENT_STATE,
-    UNREGISTER_DISPLAY_EVENT_MONITOR, UNREGISTER_DISPLAY_MONITOR_264,
+    BIND_CLIENT_DISPLAY, CANCEL_CLIENT_BUFFER, CLOSE_DISPLAY, CLOSE_ENDPOINT,
+    CONFIGURE_REQUEST_GROUPS, CREATE_REQUEST_GROUP_EVENT, DUPLICATE_REQUEST_GROUP_EVENT,
+    GET_BUFFER_MAX_RESOLUTION, GET_CLIENT_AVAILABILITY, GET_DISPLAY_STATE_105,
+    GET_DISPLAY_STATE_107, GET_DISPLAY_STATE_354, GET_HDR_STATUS, GET_NOTIFICATION_EVENT,
+    GET_NOTIFICATION_LIMIT, GET_NOTIFICATIONS, GET_REQUEST_GROUP_LIMIT, GET_SESSION_LIMIT,
+    OPEN_DISPLAY, OPEN_ENDPOINT, PRESENT_CLIENT_BUFFER, REGISTER_BUFFER_MAX_RESOLUTION_MONITOR,
+    REGISTER_CLIENT_STATE, REGISTER_DISPLAY_EVENT_MONITOR, REGISTER_DISPLAY_MONITOR_263,
+    REGISTER_DISPLAY_MONITOR_267, REGISTER_DISPLAY_MONITOR_271, REGISTER_HDR_STATUS_MONITOR,
+    RELEASE_NOTIFICATION_EVENT, SET_CLIENT_OUTPUT_ENCODING, SET_CLIENT_OUTPUT_LEVELS,
+    SET_DISPLAY_PARAMETER_301, UNBIND_CLIENT_DISPLAY, UNREGISTER_BUFFER_MAX_RESOLUTION_MONITOR,
+    UNREGISTER_CLIENT_STATE, UNREGISTER_DISPLAY_EVENT_MONITOR, UNREGISTER_DISPLAY_MONITOR_264,
     UNREGISTER_DISPLAY_MONITOR_268, UNREGISTER_DISPLAY_MONITOR_272, UNREGISTER_HDR_STATUS_MONITOR,
 };
 
@@ -349,6 +436,12 @@ pub mod command {
     pub const UNREGISTER_CLIENT_STATE: u32 = 202;
     /// PR `{212, &IVi2Session::GetClientAvailability, "GetClientAvailability"}`.
     pub const GET_CLIENT_AVAILABILITY: u32 = 212;
+    /// PR `{228, &IVi2Session::CancelClientBuffer, "CancelClientBuffer"}`; NX2 `{228,
+    /// &INx2Vi2Session::CancelClientBuffer, "CancelClientBuffer"}`.
+    pub const CANCEL_CLIENT_BUFFER: u32 = 228;
+    /// PR `{229, &IVi2Session::PresentClientBuffer, "PresentClientBuffer"}`; NX2 `{229,
+    /// &INx2Vi2Session::PresentClientBuffer, "PresentClientBuffer"}`.
+    pub const PRESENT_CLIENT_BUFFER: u32 = 229;
     /// PR `{251, &IVi2Session::BindClientDisplay, "BindClientDisplay"}`.
     pub const BIND_CLIENT_DISPLAY: u32 = 251;
     /// PR `{252, &IVi2Session::UnbindClientDisplay, "UnbindClientDisplay"}`.
@@ -472,9 +565,44 @@ pub const DEFAULT_DISPLAY: u64 = u64::from_le_bytes(*b"default\0");
 /// The flags 101 accepts, which PR keeps as the display's notification
 /// (`R_UNLESS(flags == 1, Kernel::ResultNotImplemented)`, `m_display_notification = flags`).
 pub const OPEN_DISPLAY_FLAGS: u32 = 1;
+/// The buffer slots a client has: PR `slot < 15` (228, 229) and `std::array<std::optional<s32>,
+/// 15> queued`; spec, "Fifteen slots".
+pub const SLOTS: u8 = 15;
 /// A fresh client's free slots: fifteen, PR `u64 available{0x7fff}`; NX2's 229 reply
 /// `AvailableSlots = 0x7fff` (row 48).
 pub const ALL_SLOTS: u64 = 0x7FFF;
+/// The layout 229 accepts at word 8: PR `packet[8] == 3`; spec "u32 layout (w8, 3)".
+pub const PRESENT_LAYOUT: u32 = 3;
+/// The block height (log2 of GOB rows, preference word 4) a presented image must have: PR
+/// `image->preference[4] == 7` ("the backend's 16-GOB block height" in its comment).
+pub const PRESENT_BLOCK_HEIGHT: u32 = 7;
+/// The formats (preference word 6) a presented image may have: PR `image->preference[6] == 1 ||
+/// image->preference[6] == 4` (spec: 1 RGBA8, 4 RGB10A2), the two 429 already takes.
+pub const PRESENT_FORMATS: [u32; 2] = [FORMAT_RGBA8, FORMAT_RGB10A2];
+/// The 229 request word that holds the layout (PR `packet[8]`), the last word before the fence
+/// that 229 reads.
+pub const PRESENT_WORD_LAYOUT: usize = 8;
+/// The 229 request word that holds the fence's `SyncCounterId` (PR `~packet[22]`, NX2 `~w[22]`;
+/// spec, "fence `SyncCounterId` (w22) and value (w24)"); words 23 and 25 must be 0 (PR
+/// `packet[23] == 0 && packet[25] == 0`), word 24 is the value.
+pub const PRESENT_WORD_FENCE: usize = 22;
+/// What 229's fence word is when the present has no fence: PR `fence_id == ~u32{0}` on `fence_id
+/// = ~packet[22]`, so the word itself is 0.
+pub const NO_FENCE: u32 = 0;
+
+/// How 229 paces the title (spec, "Present (229) and pacing"; the owner's decision 1): a per-run
+/// setting, given to the server ([`vi2_server_paced`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Pacing {
+    /// The buffer queue (decided by the owner, decision 1): 229 replies at once with the slots
+    /// still free, and a slot comes back on the tick that latches the frame replacing it.
+    #[default]
+    BufferQueue,
+    /// The fence wait fallback (NX2's): 229 holds its reply until the frame before it is
+    /// latched and reports every slot free ([`crate::shared::present`], "The fence wait
+    /// fallback").
+    FenceWait,
+}
 /// The only output encoding 351 accepts, and a client's: PR `u64 output_encoding{0x14}`, "Only
 /// the SDK's observed default output encoding is supported".
 pub const OUTPUT_ENCODING: u64 = 0x14;
@@ -612,10 +740,12 @@ const fn bit(index: u32) -> u32 {
     }
 }
 
-/// One registered client (PR `ClientState`, but its present queue, which is slice 14's).
+/// One registered client (PR `ClientState`, but its present queue, which is in gsv's shared
+/// state under the number 201 gave it: [`crate::shared::present`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Client {
     token: u64,
+    present: u8,
     retire: u32,
     available_bit: u32,
     bound: bool,
@@ -625,10 +755,12 @@ pub struct Client {
 }
 
 impl Client {
-    /// A client 201 registers: no display, no layer, every slot free.
-    const fn new(token: u64, retire: u32, available_bit: u32) -> Self {
+    /// A client 201 registers under number `present` of gsv's present table: no display, no
+    /// layer, every slot free.
+    const fn new(token: u64, present: u8, retire: u32, available_bit: u32) -> Self {
         Self {
             token,
+            present,
             retire,
             available_bit,
             bound: false,
@@ -644,13 +776,19 @@ impl Client {
         self.token
     }
 
+    /// Its number in gsv's present table ([`crate::shared::present`]).
+    #[must_use]
+    pub const fn present(&self) -> u8 {
+        self.present
+    }
+
     /// The notification 202 raises: PR `retire_notification`.
     #[must_use]
     pub const fn retire(&self) -> u32 {
         self.retire
     }
 
-    /// The notification a freed slot raises (slice 14): PR `available_notification`.
+    /// The notification a freed slot raises: PR `available_notification`.
     #[must_use]
     pub const fn available_bit(&self) -> u32 {
         self.available_bit
@@ -802,6 +940,18 @@ impl Vi2Session {
             .ok_or_else(|| VI_OUT_OF_RANGE.into())
     }
 
+    /// Takes into each client's free slots and the notification bitmap what the vsync ticks
+    /// released for it since the last time (PR `RefreshReleasedBuffers`; module docs, "Present").
+    fn refresh(&mut self, state: &mut Locked<'_>) {
+        for client in &mut self.clients {
+            let Refresh { released, raised } = state.presents_mut().take_refresh(client.present);
+            client.available |= released & ALL_SLOTS;
+            if raised {
+                self.notifications[0] |= bit(client.available_bit);
+            }
+        }
+    }
+
     /// Raises notification `index` and signals the notification event if 11 made it (module
     /// docs, "Notifications"). `index` is below [`CLIENT_NOTIFICATIONS`] or is
     /// [`OPEN_DISPLAY_FLAGS`], so it names a bit of the bitmap.
@@ -824,19 +974,35 @@ impl Vi2Session {
 /// as [`crate::syncpt::SyncptFamily`] holds nothing.
 pub struct Vi2Family {
     shared: Arc<Shared>,
+    pacing: Pacing,
 }
 
 impl Vi2Family {
-    /// The family over gsv's `shared` state.
+    /// The family over gsv's `shared` state, pacing with the buffer queue.
     #[must_use]
     pub fn new(shared: Arc<Shared>) -> Self {
-        Self { shared }
+        Self {
+            shared,
+            pacing: Pacing::BufferQueue,
+        }
+    }
+
+    /// The same family, pacing with `pacing`.
+    #[must_use]
+    pub fn with_pacing(self, pacing: Pacing) -> Self {
+        Self { pacing, ..self }
     }
 
     /// gsv's shared state.
     #[must_use]
     pub fn shared(&self) -> &Arc<Shared> {
         &self.shared
+    }
+
+    /// How 229 paces the title.
+    #[must_use]
+    pub const fn pacing(&self) -> Pacing {
+        self.pacing
     }
 }
 
@@ -859,6 +1025,11 @@ impl Family for Vi2Family {
 /// gsv's shared state, from the server's family.
 fn shared(cx: &mut Context<'_>) -> Result<Arc<Shared>, Fault> {
     Ok(Arc::clone(cx.family::<Vi2Family>()?.shared()))
+}
+
+/// How the server's family paces 229.
+fn pacing(cx: &mut Context<'_>) -> Result<Pacing, Fault> {
+    Ok(cx.family::<Vi2Family>()?.pacing())
 }
 
 /// The `Env` clock's reading on the handler's thread, which starts a stopped vsync clock.
@@ -888,6 +1059,60 @@ fn listen(state: &mut Locked<'_>, event: ObjectId, group: u32, now: HostNanos, f
     }
 }
 
+/// The words of a 229 request that 229 reads (module docs, "Present"), in request order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PresentWords {
+    /// w2–3: the client.
+    token: u64,
+    /// The low byte of w4: the buffer slot (PR `DecodeBufferSlot`).
+    slot: u8,
+    /// w5: the native image.
+    image: u32,
+    /// w6: the byte offset into the image.
+    offset: u32,
+    /// w7: the shown extent, `(width - 1) | (height - 1) << 16`.
+    shown: u32,
+    /// w8: the layout.
+    layout: u32,
+    /// w22: the fence's `SyncCounterId`, [`NO_FENCE`] for none.
+    fence_id: u32,
+    /// w23: 0.
+    fence_high: u32,
+    /// w24: the fence's value.
+    fence_value: u32,
+    /// w25: 0.
+    fence_tail: u32,
+}
+
+impl PresentWords {
+    /// Reads them from `req`; a request that ends before word 25 is the framework's
+    /// `INVALID_CMIF_REQUEST`.
+    fn read(req: &Request<'_>) -> Result<Self, Fault> {
+        let mut payload = req.payload();
+        let token = payload.read_u64()?;
+        let slot = low_byte(payload.read_u32()?);
+        let image = payload.read_u32()?;
+        let offset = payload.read_u32()?;
+        let shown = payload.read_u32()?;
+        let layout = payload.read_u32()?;
+        for _ in PRESENT_WORD_LAYOUT + 1..PRESENT_WORD_FENCE {
+            payload.read_u32()?;
+        }
+        Ok(Self {
+            token,
+            slot,
+            image,
+            offset,
+            shown,
+            layout,
+            fence_id: payload.read_u32()?,
+            fence_high: payload.read_u32()?,
+            fence_value: payload.read_u32()?,
+            fence_tail: payload.read_u32()?,
+        })
+    }
+}
+
 commands! {
     impl Vi2Session {}
     tipc {
@@ -911,6 +1136,8 @@ commands! {
         REGISTER_CLIENT_STATE => register_client_state,
         UNREGISTER_CLIENT_STATE => unregister_client_state,
         GET_CLIENT_AVAILABILITY => get_client_availability,
+        CANCEL_CLIENT_BUFFER => cancel_client_buffer,
+        PRESENT_CLIENT_BUFFER => present_client_buffer,
         BIND_CLIENT_DISPLAY => bind_client_display,
         UNBIND_CLIENT_DISPLAY => unbind_client_display,
         REGISTER_DISPLAY_EVENT_MONITOR => monitor,
@@ -976,16 +1203,23 @@ impl Vi2Session {
     ) -> Outcome {
         let word = req.payload().read_u32()?;
         tracing::debug!(word, "gsv:vi2: notification event");
+        let shared = shared(cx)?;
+        let mut state = shared.lock();
         let event = if let Some(event) = self.notification_event {
             event
         } else {
             let event = cx.create_event()?;
             self.notification_event = Some(event);
+            for client in &self.clients {
+                state.presents_mut().set_event(client.present, event);
+            }
             event
         };
+        self.refresh(&mut state);
         if self.notifications.iter().any(|&word| word != 0) {
             cx.signal_event(event)?;
         }
+        drop(state);
         reply.copy_handle(event);
         reply.ok()
     }
@@ -1012,10 +1246,15 @@ impl Vi2Session {
         req: &Request<'_>,
         reply: &mut Reply,
     ) -> Outcome {
+        let shared = shared(cx)?;
         let mut out = req.out_buffer(cx, 0)?;
         if out.len() < NOTIFICATIONS_SIZE {
             return Err(KernelError::InvalidSize.into());
         }
+        // Held to the clear, so that a tick's release between the refresh and the clear is not
+        // wiped out by it (module docs, "Present").
+        let mut state = shared.lock();
+        self.refresh(&mut state);
         let bytes: Vec<u8> = self
             .notifications
             .iter()
@@ -1027,6 +1266,7 @@ impl Vi2Session {
         }
         tracing::debug!(notifications = ?self.notifications, "gsv:vi2: notifications read");
         self.notifications = [0; NOTIFICATION_WORDS];
+        drop(state);
         reply.ok()
     }
 
@@ -1284,7 +1524,7 @@ impl Vi2Session {
     /// `RegisterClientState` (201). in: `u64` client, `u32` retire bit, `u32` available bit.
     fn register_client_state(
         &mut self,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
         req: &Request<'_>,
         reply: &mut Reply,
     ) -> Outcome {
@@ -1307,15 +1547,28 @@ impl Vi2Session {
             }
             return Err(KernelError::InvalidCombination.into());
         }
-        let client = Client::new(token, retire, available);
+        let bits = bit(retire) | bit(available);
         let held = self.clients.iter().fold(0, |held, c| held | c.bits());
-        if self.client(token).is_some() || held & client.bits() != 0 {
+        if self.client(token).is_some() || held & bits != 0 {
             return Err(KernelError::InvalidState.into());
         }
         if self.clients.len() >= MAX_CLIENTS {
             return Err(KernelError::OutOfResource.into());
         }
-        self.clients.push(client);
+        let shared = shared(cx)?;
+        let registered =
+            shared
+                .lock()
+                .presents_mut()
+                .register(token, available, self.notification_event);
+        let present = registered.map_err(|error| {
+            tracing::debug!(%error, "gsv:vi2: register client refused");
+            match error {
+                RegisterError::Full => KernelError::OutOfResource,
+            }
+        })?;
+        self.clients
+            .push(Client::new(token, present, retire, available));
         reply.ok()
     }
 
@@ -1331,7 +1584,11 @@ impl Vi2Session {
             return Err(KernelError::InvalidCombination.into());
         }
         let index = self.client(token).ok_or(KernelError::NotFound)?;
+        let shared = shared(cx)?;
         let client = self.clients.remove(index);
+        if !shared.lock().unregister_present(client.present) {
+            tracing::debug!(token, "gsv:vi2: a retired client had no presents to drop");
+        }
         if self.endpoint == Some(token) {
             self.endpoint = None;
         }
@@ -1344,11 +1601,13 @@ impl Vi2Session {
     /// client's layer on first use.
     fn get_client_availability(
         &mut self,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
         req: &Request<'_>,
         reply: &mut Reply,
     ) -> Outcome {
         let token = req.payload().read_u64()?;
+        let shared = shared(cx)?;
+        self.refresh(&mut shared.lock());
         if token == 0 {
             return Err(KernelError::InvalidCombination.into());
         }
@@ -1368,6 +1627,179 @@ impl Vi2Session {
         let available = client.available;
         reply.payload().write_u64(available);
         reply.ok()
+    }
+
+    /// `CancelClientBuffer` (228). in: `u64` client (w2–3), the slot in the low byte of w4 (PR
+    /// `DecodeBufferSlot(packet[4])`). out: `u64` free slots, four zero words (module docs,
+    /// "Present").
+    fn cancel_client_buffer(
+        &mut self,
+        cx: &mut Context<'_>,
+        req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        let mut payload = req.payload();
+        let token = payload.read_u64()?;
+        let slot = low_byte(payload.read_u32()?);
+        if slot >= SLOTS {
+            return Err(KernelError::InvalidCombination.into());
+        }
+        let shared = shared(cx)?;
+        self.refresh(&mut shared.lock());
+        let client = self.known_client(token)?;
+        client.available |= slot_bit(slot);
+        let available = client.available;
+        tracing::debug!(token, slot, available, "gsv:vi2: cancel buffer");
+        write_slots(reply, available);
+        reply.ok()
+    }
+
+    /// `PresentClientBuffer` (229). in: `u64` client (w2–3), the slot in the low byte of w4, the
+    /// native image (w5), the byte offset (w6), the shown extent (w7), the layout (w8), the
+    /// fence's `SyncCounterId` (w22), 0 (w23), the fence's value (w24), 0 (w25). out: `u64` free
+    /// slots and four zero words, or, under [`Pacing::FenceWait`], a held reply of every slot
+    /// (module docs, "Present").
+    fn present_client_buffer(
+        &mut self,
+        cx: &mut Context<'_>,
+        req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        let words = PresentWords::read(req)?;
+        let holds = pacing(cx)? == Pacing::BufferQueue;
+        let shared = shared(cx)?;
+        let mut state = shared.lock();
+        self.refresh(&mut state);
+        let index = self.client(words.token).ok_or(KernelError::NotFound)?;
+        let frame = self.frame(&mut state, index, &words, holds)?;
+        let now = if state.vsync().is_stopped() {
+            Some(now(cx)?)
+        } else {
+            None
+        };
+        let present = self
+            .clients
+            .get(index)
+            .ok_or(KernelError::NotFound)?
+            .present;
+        let prepared = state.prepare_frame(present, frame).map_err(|error| {
+            tracing::error!(%error, token = words.token, "gsv:vi2: a present could not be queued");
+            match error {
+                QueueError::NoClient { .. } => KernelError::InvalidState,
+                QueueError::Full { .. } | QueueError::Watch(_) => KernelError::OutOfResource,
+            }
+        })?;
+        tracing::debug!(
+            token = words.token,
+            slot = frame.slot,
+            image = frame.image,
+            fence = ?frame.fence,
+            "gsv:vi2: present queued"
+        );
+        if holds {
+            if let Some(change) = state.commit_frame(prepared, now, None) {
+                shared.queue().push(Completion::Gpu(change));
+            }
+            drop(state);
+            let client = self.clients.get_mut(index).ok_or(KernelError::NotFound)?;
+            client.available &= !slot_bit(frame.slot);
+            write_slots(reply, client.available);
+            return reply.ok();
+        }
+        match cx.defer() {
+            Ok(held) => {
+                if let Some(change) = state.commit_frame(prepared, now, Some(held)) {
+                    shared.queue().push(Completion::Gpu(change));
+                }
+                drop(state);
+                reply.deferred()
+            }
+            Err(fault) => {
+                state.abandon_frame(prepared);
+                Err(fault)
+            }
+        }
+    }
+
+    /// 229's checks after the client's (module docs, "Present"), in PR `QueueNativeImage`'s
+    /// order: the frame client `index` would queue, holding its slot if `holds`.
+    fn frame(
+        &self,
+        state: &mut Locked<'_>,
+        index: usize,
+        words: &PresentWords,
+        holds: bool,
+    ) -> Result<NewFrame, Fault> {
+        let client = self.clients.get(index).ok_or(KernelError::NotFound)?;
+        let slot = words.slot;
+        let busy = holds && state.presents_mut().holds(client.present, slot);
+        let layer = client
+            .layer()
+            .filter(|_| client.bound && slot < SLOTS && !busy)
+            .ok_or(KernelError::InvalidState)?;
+        let image = state
+            .native_objects()
+            .image(words.image)
+            .filter(|image| image.window_pool())
+            .copied()
+            .ok_or(KernelError::NotFound)?;
+        let preference = image.preference();
+        let (shown_width, shown_height) = extent(words.shown);
+        let (width, height) = extent(preference[WORD_EXTENT]);
+        let supported = words.offset == 0
+            && shown_width <= width
+            && shown_height <= height
+            && words.layout == PRESENT_LAYOUT
+            && preference[WORD_BLOCK_HEIGHT] == PRESENT_BLOCK_HEIGHT
+            && PRESENT_FORMATS.contains(&preference[WORD_FORMAT]);
+        if !supported {
+            return Err(KernelError::NotImplemented.into());
+        }
+        let fence = u8::try_from(!words.fence_id)
+            .ok()
+            .and_then(SyncpointId::new)
+            .filter(|&id| state.syncpoint_allocated(id))
+            .map(|id| Fence {
+                id,
+                value: words.fence_value,
+            });
+        let fenced = words.fence_id != NO_FENCE;
+        if words.fence_high != 0 || words.fence_tail != 0 || fenced && fence.is_none() {
+            return Err(KernelError::InvalidCombination.into());
+        }
+        // The binding's address, handed over as the GPU address: a guess for 114-bound memory
+        // (module docs, "Present").
+        let address = state
+            .native_objects()
+            .backing(image.memory())
+            .and_then(|memory| memory.binding())
+            .map(|binding| binding.address)
+            .ok_or(KernelError::InvalidState)?;
+        let dimension = |value: u64| u32::try_from(value).unwrap_or(u32::MAX);
+        Ok(NewFrame {
+            slot,
+            image: words.image,
+            request: PresentRequest {
+                image: ImageDesc {
+                    address,
+                    width: dimension(width),
+                    height: dimension(height),
+                    pitch: preference[WORD_PITCH],
+                    block_height_log2: preference[WORD_BLOCK_HEIGHT],
+                    format: preference[WORD_FORMAT],
+                },
+                shown: Rect {
+                    x: 0,
+                    y: 0,
+                    width: dimension(shown_width),
+                    height: dimension(shown_height),
+                },
+                layer,
+                display: DisplayId(DEFAULT_DISPLAY),
+            },
+            fence,
+            holds_slot: holds,
+        })
     }
 
     /// `BindClientDisplay` (251). in: `u64` client, `u64` name.
@@ -1577,13 +2009,21 @@ pub fn vi2_interfaces() -> Interfaces {
     Interfaces::new().with::<Vi2Session>()
 }
 
-/// The vi2 server over gsv's `shared` state: every session a [`Vi2Session`], sharing a
-/// [`Vi2Family`]. Give it the run's environment (`Server::with_env`): a group starting to
-/// listen to the vsync clock reads its clock (module docs, "The server").
+/// The vi2 server over gsv's `shared` state, pacing with the buffer queue: every session a
+/// [`Vi2Session`], sharing a [`Vi2Family`]. Give it the run's environment (`Server::with_env`):
+/// a group starting to listen to the vsync clock, and a present on a stopped clock, read its
+/// clock (module docs, "The server").
 #[must_use]
 pub fn vi2_server(policy: UnknownPolicy, shared: Arc<Shared>) -> Server {
+    vi2_server_paced(policy, shared, Pacing::BufferQueue)
+}
+
+/// The vi2 server of [`vi2_server`], pacing with `pacing` (the per-run setting of the owner's
+/// decision 1).
+#[must_use]
+pub fn vi2_server_paced(policy: UnknownPolicy, shared: Arc<Shared>, pacing: Pacing) -> Server {
     Server::new(VI2_NAME, policy)
         .with_root(|| Box::new(Vi2Session::new()))
         .with_interfaces(vi2_interfaces())
-        .with_family(Vi2Family::new(shared))
+        .with_family(Vi2Family::new(shared).with_pacing(pacing))
 }

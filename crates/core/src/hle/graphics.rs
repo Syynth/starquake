@@ -35,8 +35,12 @@
 //! server: it is part of gsv's shared state and runs in the timer thread's turn (below), and
 //! vi2's request groups (slice 13) start it by listening
 //! (`a_vi2_request_group_is_ticked_through_the_run_s_turn`, in `hle/tests/graphics/vsync.rs`).
-//! Slice 14 (present: issue 192) is not built: when it lands, it adds its server here beside
-//! these and its number to the root.
+//! Slice 14 (present, `starquake_gsv::shared::present`) needs no server of its own either: the
+//! vi2 server answers 228 and 229, and the vsync tick in the timer thread's turn latches the
+//! frames (`a_present_reaches_the_latch_on_a_vsync_tick`, in `hle/tests/graphics/present.rs`).
+//! The vi2 server paces with the buffer queue; the fence wait fallback
+//! (`starquake_gsv::vi2::Pacing::FenceWait`) is a per-run setting no command-line option
+//! reaches yet.
 //!
 //! # The GPU front
 //!
@@ -51,7 +55,9 @@
 //!   with; a class is bound to any channel it made;
 //! - a submission's commands are dropped, and its increments are performed at once on the
 //!   channel's syncpoint (`Syncpoints::increment_by`: one push if the syncpoint is watched,
-//!   however many increments), and it answers `Queued`, never `Full`.
+//!   however many increments), and it answers `Queued`, never `Full`;
+//! - a latched frame's present is counted ([`NullFront::presented`]) and dropped: nothing is
+//!   shown.
 //!
 //! Where it departs from what a GPU does, each pinned by the test named, in `graphics/tests.rs`:
 //!
@@ -61,6 +67,7 @@
 //! | A submission's wait fence (flag bit 0) | waited for before the increments | not waited for: the increments are performed at once whether it is reached or not (`a_submission_s_wait_fence_is_not_waited_for`) |
 //! | A full queue | `Full`, then `GpuQueueRoom` | never full (`a_submission_s_increments_are_performed_at_once`) |
 //! | A submission on a channel it did not make | the GPU's error | logged as an error, nothing performed, `Queued` (`a_submission_on_an_unknown_channel_does_nothing`) |
+//! | A present | shown, after the work before it | counted and dropped (`a_present_reaches_the_latch_on_a_vsync_tick`) |
 //!
 //! **Tickets are gsv's.** gsv's GPU memory numbers every ordered update and barrier it hands the
 //! front (`starquake_gsv::gpu::GpuMemory`, whose snapshot keeps the next ticket); the front
@@ -83,7 +90,9 @@
 //! (`Shared::drain`), then the shared page's turn (`Shared::tick_page`), then the vsync clock's:
 //! in a run ([`FrontMode::Live`]) the live turn at the turn's time (`Shared::tick_vsync`), in a
 //! replay ([`FrontMode::Replay`]) the delivery of the ticks fed back
-//! (`Shared::tick_replayed_vsync`; below, "Replay"). The thread sleeps no later than
+//! (`Shared::tick_replayed_vsync`; below, "Replay"). The frames the vsync tick latches are
+//! handed to the front ([`PresentFront::present`]) once the clock's turn has released gsv's
+//! lock, in the order the tick latched them. The thread sleeps no later than
 //! [`Graphics::deadline`], which in a run includes the vsync clock's deadline, and the queue's
 //! [`Wake`] rings it. The thread runs the turn only when [`Graphics::wants_turn`] says so: the
 //! graphics server is not idle but for the clock, or the clock's deadline has come by the loop's
@@ -134,6 +143,7 @@
 //! | `QueueRoom { channel }` | `GpuQueueRoom { channel }` pushed |
 //! | `VsyncTick { tick }` | fed back to the vsync clock (`Shared::replay_vsync`), which takes only the next number ([`ReplayError::Vsync`]); the next turn delivers it, counted, recorded and signalled as the run's was. In a replay the clock does not tick on its own |
 //! | `SyncptPageAnswered`, `SyncptPageAcknowledged` | refused ([`ReplayError::NotAnInput`]): they are what a page turn writes, not an input |
+//! | `FrameLatched`, `BufferReleased` | refused ([`ReplayError::NotAnInput`]): what the vsync tick's latch writes, from the ticks and the drained syncpoint values fed back above (`starquake_gsv::shared::present`, "What is recorded") |
 //!
 //! Each note is fed back and drained on its own, in the recorded order: the drain acts on its
 //! completions one at a time in the queue's order, so one drain of several notes and one drain
@@ -176,10 +186,11 @@
 //! built here.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use starquake_gpu::interface::{
-    ChannelId, Completions, GpuCompletion, SyncpointId, Ticket, VmUpdate,
+    ChannelId, Completions, GpuCompletion, PresentRequest, SyncpointId, Ticket, VmUpdate,
 };
 use starquake_gpu::syncpoint::Syncpoints;
 use starquake_gpu::vm::GpuVm;
@@ -189,6 +200,7 @@ use starquake_gsv::note::Note;
 use starquake_gsv::nvsrv::gpu::{ChannelConfig, ChannelFront, GpuError, Submission, Submitted};
 use starquake_gsv::nvsrv::{self, NvsrvFamily};
 use starquake_gsv::root::{self, RootState};
+use starquake_gsv::shared::present::PresentFront;
 use starquake_gsv::shared::vsync::VsyncReplayError;
 use starquake_gsv::shared::{Shared, TimerHost};
 use starquake_gsv::syncpt;
@@ -232,12 +244,13 @@ struct Channels {
 }
 
 /// The GPU front of a run with no GPU back end (module docs, "The GPU front"): gsv's
-/// [`GpuVmFront`] and [`ChannelFront`].
+/// [`GpuVmFront`], [`ChannelFront`] and [`PresentFront`].
 pub struct NullFront {
     mode: FrontMode,
     syncpoints: Arc<Syncpoints>,
     queue: Arc<CompletionQueue>,
     channels: Mutex<Channels>,
+    presented: AtomicU64,
 }
 
 impl NullFront {
@@ -252,7 +265,14 @@ impl NullFront {
                 next: FIRST_CHANNEL,
                 made: BTreeMap::new(),
             }),
+            presented: AtomicU64::new(0),
         }
+    }
+
+    /// How many presents it was handed.
+    #[must_use]
+    pub fn presented(&self) -> u64 {
+        self.presented.load(Ordering::Relaxed)
     }
 
     /// The channels it holds now, each with its syncpoint, in channel order.
@@ -283,6 +303,14 @@ impl GpuVmFront for NullFront {
 
     fn barrier(&self, done: Ticket) {
         self.done(done);
+    }
+}
+
+impl PresentFront for NullFront {
+    /// Counts the present and drops it: there is nothing to show it on.
+    fn present(&self, request: PresentRequest) {
+        tracing::trace!(?request, "the null GPU front was handed a present");
+        self.presented.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -336,7 +364,8 @@ impl ChannelFront for NullFront {
 /// Why a note could not be fed back ([`Graphics::replay`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ReplayError {
-    /// The note is one a page turn writes, not an input the run took from outside.
+    /// The note is one a page turn or the vsync tick's latch writes, not an input the run took
+    /// from outside.
     #[error(
         "a note with code {code} is what the graphics server wrote, not something it was told, so it is not fed back"
     )]
@@ -458,13 +487,17 @@ impl Graphics {
 
     /// The timer thread's turn (module docs, "The timer thread's turn"): drains the queue
     /// through `host`, then runs the shared page's turn at `now`, then the vsync clock's turn for
-    /// the front's mode. Returns what the drain took, in order.
+    /// the front's mode, and hands the frames it latched to the front. Returns what the drain
+    /// took, in order.
     pub fn turn(&self, host: &mut dyn TimerHost, now: HostNanos) -> Vec<Completion> {
         let taken = self.shared.drain(host);
         self.shared.tick_page(host, now);
-        match self.mode {
+        let presents = match self.mode {
             FrontMode::Live => self.shared.tick_vsync(host, now),
             FrontMode::Replay => self.shared.tick_replayed_vsync(host),
+        };
+        for request in presents {
+            self.front.present(request);
         }
         taken
     }
@@ -544,7 +577,10 @@ impl Graphics {
                 self.shared.replay_vsync(tick)?;
                 return Ok(());
             }
-            Note::SyncptPageAnswered { .. } | Note::SyncptPageAcknowledged { .. } => {
+            Note::SyncptPageAnswered { .. }
+            | Note::SyncptPageAcknowledged { .. }
+            | Note::FrameLatched { .. }
+            | Note::BufferReleased { .. } => {
                 return Err(ReplayError::NotAnInput { code: note.code() });
             }
         };
