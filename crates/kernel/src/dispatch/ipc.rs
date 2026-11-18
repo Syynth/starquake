@@ -119,8 +119,13 @@
 //!   the end, as a core does for [`Outcome::ProcessExited`]. That covers a deferred reply
 //!   whose `take_reply` asked, and a request the delivery started once the deferred one freed
 //!   the server. Tests: `an_end_asked_while_a_delivery_takes_a_deferred_reply_is_honoured_after_it`,
-//!   `an_end_asked_by_a_request_a_delivery_runs_is_honoured_after_the_replies`, and
-//!   `a_delivery_ends_the_process_of_the_request_that_asked_and_no_other`.
+//!   `an_end_asked_by_a_request_a_delivery_runs_is_honoured_after_the_replies`,
+//!   `a_delivery_ends_the_process_of_the_request_that_asked_and_no_other` (which also checks
+//!   that the sender of the process that goes on is reported woken), and
+//!   `a_deferred_reply_that_asks_to_end_ends_its_senders_process_and_no_other` (a `take_reply`
+//!   that asks for a sender of another process than the delivering core's). A `take_reply` that
+//!   asks and then fails closes the session, and the end is that of the request it answered,
+//!   the first that is over: `a_deferred_reply_that_fails_while_asking_to_end_ends_the_process_of_the_request_it_answered`.
 //!
 //! The sender's process is that of the scheduler's thread on its core, or, for a core that
 //! runs no thread of a process (the tests that drive the dispatcher without a core loop), the
@@ -1041,7 +1046,11 @@ impl Dispatcher {
     /// `own` woken ([`Dispatcher::take_woken`]), records and reports the waits the handlers'
     /// signals ended (`dispatch/sync.rs`), and then ends each process a handler asked to end
     /// ([`asked`], [`terminate_asked`]). Returns `own`'s result, when its request is one of
-    /// them, and the processes that ended.
+    /// them, and the processes that ended. The woken are reported in that order: the senders,
+    /// then the signals' waits, then the waits the ends ended. Test:
+    /// `a_delivery_reports_its_sender_and_its_signals_wakes_before_the_wakes_of_the_end` (the
+    /// events are recorded in the same order, but the ends' teardown would record a signal's
+    /// pending wait first anyway, so only the woken order tells a late report apart).
     ///
     /// When a process is to end, all of this happens under one hold of the lock, so that no
     /// core can run a sender of that process between its reply and the end: a sender the timer

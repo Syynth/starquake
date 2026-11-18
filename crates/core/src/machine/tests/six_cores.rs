@@ -707,11 +707,10 @@ fn a_delivery_records_the_process_end_on_the_core_of_the_sender_that_asked() {
         .filter(|event| matches!(event.kind, EventKind::Svc { id, .. } if id == send))
         .map(|event| (event.core, event.thread))
         .collect();
-    let [(core, thread)] = sends.as_slice() else {
-        panic!("one request was sent: {sends:?}");
-    };
-    assert_eq!(*core, SENDER_CORE);
-    assert_ne!(*thread, MAIN_THREAD);
+    assert_eq!(sends.len(), 1, "one request was sent: {sends:?}");
+    let (core, thread) = sends[0];
+    assert_eq!(core, SENDER_CORE);
+    assert_ne!(thread, MAIN_THREAD);
     let ends: Vec<_> = outcome
         .events
         .iter()
@@ -730,7 +729,7 @@ fn a_delivery_records_the_process_end_on_the_core_of_the_sender_that_asked() {
         ends,
         [(
             SENDER_CORE,
-            *thread,
+            thread,
             EventKind::Lifecycle {
                 phase: LifecyclePhase::ProcessExit,
                 subject: PROCESS_ID

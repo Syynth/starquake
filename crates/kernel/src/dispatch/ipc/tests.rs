@@ -2496,8 +2496,7 @@ fn a_deferred_reply_that_asks_to_end_ends_its_senders_process_and_no_other() {
 }
 
 #[test]
-fn a_deferred_reply_that_fails_while_asking_to_end_ends_the_process_of_the_request_it_answered()
-{
+fn a_deferred_reply_that_fails_while_asking_to_end_ends_the_process_of_the_request_it_answered() {
     let (world, own, other) = world_of_two_processes();
     let handle = world.session();
     let session = world.object(handle);
@@ -2895,7 +2894,10 @@ fn a_delivery_reports_its_sender_and_its_signals_wakes_before_the_wakes_of_the_e
     let handles = NAMES + 8;
     world
         .memory
-        .write(handles, &Handle::from_register(readable).raw().to_le_bytes())
+        .write(
+            handles,
+            &Handle::from_register(readable).raw().to_le_bytes(),
+        )
         .unwrap();
     let mut wait = GuestRegs::default();
     wait.x[1] = handles;

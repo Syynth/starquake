@@ -48,8 +48,9 @@
 //! ends as it ends for `ExitProcess` ([`Ending::Exited`]). The run has one process
 //! (PROVISIONAL, as in the kernel), so any process a delivery ends is the run's. Tests:
 //! `a_handler_ending_the_process_during_the_timers_delivery_ends_the_run_after_the_reply`
-//! (stepped), and `the_timer_thread_ends_the_run_when_a_delivery_ends_the_process` (the real
-//! timer thread).
+//! (stepped), `a_delivery_records_the_process_end_on_the_core_of_the_sender_that_asked`
+//! (stepped, with the sender on core 1, not this thread's [`CORE`]), and
+//! `the_timer_thread_ends_the_run_when_a_delivery_ends_the_process` (the real timer thread).
 //!
 //! # The graphics server's turn
 //!
