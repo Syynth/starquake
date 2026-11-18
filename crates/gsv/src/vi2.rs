@@ -1,7 +1,8 @@
 //! The vi2 session gsv 305 returns: displays, clients and their layers, request groups and the
 //! display monitors registered on them, notifications, and display state
-//! (`docs/specs/graphics-server.md`, "Display: vi2"; port slice 13). Present (228, 229) and its
-//! pacing are slice 14's: until it lands they go to the server's unknown-command policy.
+//! (`docs/specs/graphics-server.md`, "Display: vi2"; port slice 13), and present and its pacing:
+//! 228 and 229, whose frames the vsync tick latches from gsv's shared state
+//! (`crate::shared::present`; "Present (229) and pacing", port slice 14).
 //!
 //! * [`saved`]: the session's saved form and the relations a restore checks.
 //!
@@ -14,8 +15,11 @@
 //!   `ClassifyRequestGroupEventDuplicate`, `IsSupportedDisplayParameter301`). PR names the
 //!   commands from the vi2 system module (`vi2.autogen` addresses in its comments).
 //! - **NX2:** Eden-NX2, `eden-nx2/src/core/hle/service/nx2_gsv.h` @ 50fa86bb
-//!   (`INx2Vi2Session`), and its blocker log `eden-nx2/NX2_NOTES.md` @ 50fa86bb, whose rows
-//!   "row N" names.
+//!   (`INx2Vi2Session`, its `PresentClientBuffer` and `CancelClientBuffer` among them), and its
+//!   blocker log `eden-nx2/NX2_NOTES.md` @ 50fa86bb, whose rows "row N" names.
+//! - **PR**'s present: `IVi2Session::PresentClientBuffer`, `QueueNativeImage`,
+//!   `CancelClientBuffer` and `RefreshReleasedBuffers` in the same file, and
+//!   `GraphicsSupervisorProtocol::DecodeBufferSlot` in `graphics_supervisor_protocol.h`.
 //!
 //! The VI result module and its description 7 and 5 are Eden's
 //! (`eden/src/core/hle/result.h` @ cf654052: `ErrorModule::VI = 114`;
@@ -68,6 +72,8 @@
 //! | 201 | `RegisterClientState` | `u64` client, `u32` retire bit, `u32` available bit | nothing | read (PR) |
 //! | 202 | `UnregisterClientState` | `u64` client | nothing | read (PR) |
 //! | 212 | `GetClientAvailability` | `u64` client | `u64` mask of free slots | read (PR) |
+//! | 228 | `CancelClientBuffer` | `u64` client, the slot in the low byte of a `u32`, sixteen words nothing reads | `u64` mask of free slots, four zero words | read (PR); NX2 names it |
+//! | 229 | `PresentClientBuffer` | `u64` client (w2–3), the slot in the low byte of w4, the native image (w5), the byte offset (w6), the shown extent `(width - 1) \| (height - 1) << 16` (w7), the layout (w8), the fence's `SyncCounterId` (w22, 0 for none), 0 (w23), its value (w24), 0 (w25) | `u64` mask of free slots, four zero words; under [`Pacing::FenceWait`] the reply is held, then every slot | observed (row 48); word layout read (PR `QueueNativeImage`; NX2 reads w4, w5, w22 and w24 alike) |
 //! | 251 | `BindClientDisplay` | `u64` client, `u64` name | nothing | read (PR) |
 //! | 252 | `UnbindClientDisplay` | `u64` client | nothing | read (PR) |
 //! | 261–272 | register (odd) and unregister (even) a display monitor | `u64` name, `u32` group | nothing | read (PR); kind 0 observed as the vsync (row 82) |
@@ -125,14 +131,43 @@
 //!   closes the endpoint.
 //! - **201** refuses a zero client, a bit at or past [`CLIENT_NOTIFICATIONS`], or the same bit
 //!   twice with `InvalidCombination`; a client already registered, or a bit another client holds,
-//!   with `InvalidState`; and a session with [`MAX_CLIENTS`] clients with `OutOfResource`.
-//!   Otherwise the client is registered with every slot free ([`ALL_SLOTS`]).
+//!   with `InvalidState`; and a session with [`MAX_CLIENTS`] clients with `OutOfResource`. Then
+//!   gsv's present table: a token another session's client holds, `InvalidState`, and a full
+//!   table ([`crate::shared::present::MAX_PRESENT_CLIENTS`]), `OutOfResource`. Otherwise the
+//!   client is registered with every slot free ([`ALL_SLOTS`]), and added to the table.
 //! - **202** refuses a zero client with `InvalidCombination` and one not registered with
-//!   `NotFound`; otherwise it closes the endpoint if the client holds it, destroys its layer,
-//!   frees its bits, forgets it, and then raises its retire notification.
+//!   `NotFound`; otherwise it drops the client's presents (queued and shown frames), closes the
+//!   endpoint if the client holds it, destroys its layer, frees its bits, forgets it, and then
+//!   raises its retire notification.
 //! - **212** refuses a zero client with `InvalidCombination`, and one not registered or a display
 //!   not open with `NotFound`; otherwise it makes the client's layer on first use and answers its
 //!   free slots. A layer number past `u64::MAX` is `OutOfResource` (starquake's own).
+//! - **228** refuses a slot at or past [`SLOTS`] with `InvalidCombination` (PR checks it with the
+//!   header words, before the client), then a zero client or one not registered with `NotFound`;
+//!   otherwise it sets the slot's bit and answers the free slots. A frame that holds the slot
+//!   keeps holding it: PR's cancel leaves `queued[slot]`, so a 229 of the slot is still refused
+//!   until the frame is released (`a_cancel_gives_a_slot_back`).
+//! - **229**, in PR `QueueNativeImage`'s order: a zero client or one not registered,
+//!   `NotFound`; a client with no layer (212 makes it), not bound to the display (251), a slot
+//!   at or past [`SLOTS`], or, under [`Pacing::BufferQueue`], a slot a queued or shown frame
+//!   holds (PR `!state.queued[slot]`), `InvalidState`; an image that does not exist or is not in
+//!   a window alias image pool (315), `NotFound`; a byte offset other than 0, a shown extent wider
+//!   or taller than the image, a layout other than [`PRESENT_LAYOUT`], an image whose block
+//!   height is not [`PRESENT_BLOCK_HEIGHT`] or whose format is not one of [`PRESENT_FORMATS`],
+//!   `NotImplemented`; a word 23 or 25 other than 0, or a fence word other than [`NO_FENCE`]
+//!   that names no allocated syncpoint, `InvalidCombination`. Then starquake's own, none of which
+//!   a command sequence reaches: an image whose memory has no binding (429 takes only bound
+//!   memory, and nothing unbinds it), `InvalidState`; a client with [`SLOTS`] frames queued, or a
+//!   fence whose syncpoint has `u32::MAX` waiters, `OutOfResource`
+//!   (`crate::shared::present::QueueError`). The `Env` clock is read only when the vsync clock is
+//!   stopped (the present starts it); under [`Pacing::FenceWait`] the request then takes its reply
+//!   token, and a refused token gives back the frame's watch. Every check runs before anything
+//!   changes (`each_present_check_refuses_its_fault`, `the_present_checks_come_in_order`,
+//!   `a_present_needs_a_layer_a_display_and_a_free_slot`). The format check cannot refuse: 429
+//!   and a native table restore refuse any other format first, through
+//!   `crate::native::layout::requirements`, so breaking it is an equivalent mutation. PR also
+//!   refuses a client bound to a player display (`NotImplemented`), which no client is here, and
+//!   an output encoding other than [`OUTPUT_ENCODING`], which 351 refuses first.
 //! - **251** refuses a zero client or one not registered with `NotFound`; on
 //!   [`DEFAULT_DISPLAY`], a display not open with `NotFound` and a client already bound with
 //!   `InvalidState`; on a player display's name, `InvalidState` (PR's answer for a player display
@@ -188,9 +223,33 @@
 //!
 //! **Layers.** A registered client owns at most one layer (spec, "Layers"), made by its first
 //! 212 on the open display and destroyed by 202. A layer is a number, counted up per session
-//! from 1 ([`FIRST_LAYER`]), which nothing outside the session reads yet: slice 14 hands it to
-//! the GPU with each present. Two sessions' layers may share a number; composition of several
+//! from 1 ([`FIRST_LAYER`]), which each present hands the GPU (`PresentRequest::layer`). Two sessions' layers may share a number; composition of several
 //! layers is deferred (spec, "Deferred, not ruled out").
+//!
+//! # Present
+//!
+//! **The buffer queue** (the owner's decision 1, [`Pacing::BufferQueue`], the default): 229
+//! queues its frame in gsv's shared state, clears the slot's bit in the client's free slots,
+//! and answers them at once. The vsync tick latches one frame per client, oldest first once its
+//! fence is reached, and releases the frame it replaces: its slot, the client's "buffer
+//! available" notification and the notification event (`crate::shared::present`, "The
+//! latch"). The tick cannot reach a session's state, so what it releases waits in the shared
+//! table until the session takes it into its own free slots and bitmap: at the start of 11, 21,
+//! 212, 228 and 229 (PR `RefreshReleasedBuffers`, which PR runs at the start of 212 and 229 and
+//! from a 1 ms poll; here 11, 21 and 228 take it too, so each answer is as fresh as PR's poll
+//! makes it). 21 holds gsv's lock from that refresh to clearing the event, so a release in
+//! between is not cleared away unseen. A frame's [`PresentRequest`] names the image's address
+//! (its native memory's binding: GPU address == CPU address), size, pitch, block height and
+//! format, the shown area from 0, 0, the client's layer and the default display
+//! ([`DEFAULT_DISPLAY`] as the `DisplayId`; a **guess** at what the GPU front wants to name a
+//! display by).
+//!
+//! **The fence wait fallback** ([`Pacing::FenceWait`], the per-run setting of decision 1, given
+//! to [`vi2_server_paced`]): 229 makes the same checks but the slot one (a fallback present
+//! holds no slot, as NX2 checks none), queues the frame without clearing its bit, and holds its
+//! reply, which the vsync tick completes with every slot free on the first tick after the
+//! previous frame's fence (`crate::shared::present`, "The fence wait fallback";
+//! `the_fallback_s_reply_completes_on_the_first_tick_after_the_previous_frame_s_fence`).
 //!
 //! # Vsync
 //!
@@ -249,13 +308,22 @@
 //! | 106 | Eden's display resolution: 1 at 1280 × 720, `NotImplemented` otherwise | auto-stubbed | 1: the display is 1280 × 720 (handheld) until output sizes are read from a display description (spec, "Deferred") |
 //! | A failure's data words | written as zero | — | not written: the result word alone (`a_failure_reply_is_the_result_word_alone`) |
 //! | Header words other than PR's | `InvalidCombination` | read as they come | read as they come; only a missing word is refused (`a_short_request_is_refused_and_a_longer_one_is_read`) |
+//! | When a slot comes back | when the producer releases the buffer's fence, found by a 1 ms poll (`RefreshReleasedBuffers`) | never taken: every reply says every slot is free | on the vsync tick that latches the frame replacing it (the spec's buffer queue; `a_present_s_slot_comes_back_on_the_tick_that_latches_the_next`) |
+//! | A token another session's client holds (201) | accepted: each session keeps its own clients | auto-stubbed | `InvalidState`: gsv's present table is keyed by token across sessions, so that the vsync tick can find a client (`a_token_is_one_client_across_sessions`) |
+//! | 228's and 212's refresh | 212 refreshes, 228 does not (its 1 ms poll does) | — | both refresh, as the poll would have (module docs, "Present") |
+//! | 229 of a slot a frame holds, under the fence wait fallback | — (PR has no fallback) | accepted: NX2 checks no slot | accepted (`the_fallback_s_reply_completes_on_the_first_tick_after_the_previous_frame_s_fence`) |
+//! | A present's image destroyed (314, then 430) while its frame is queued or shown | its backing stays locked until the buffer retires (`DrainRetiredMemories`) | — | the frame keeps the description it was queued with, and the memory goes when 430 and 112 say; not ported, a gap for the GPU front, which reads the image when it presents |
 //! | A closed session | its layers destroyed, its events closed, its group tick stopped (destructor) | its events closed | nothing: the framework tells a session nothing when it closes. Its group events stay made, and those that listen keep listening, so they count against [`crate::shared::vsync::MAX_LISTENERS`]: after eight sessions that made eight listening groups each are closed, a new 31 answers `OutOfResource` (`closed_sessions_keep_their_groups_listening`). **Not bounded:** a group event registered for a kind other than 0 does not listen, so it does not count, and neither does a session's notification event: a title that keeps opening sessions, making such events and closing the sessions grows the kernel's events without limit. A known gap, left for a follow-up that needs a close hook from the framework |
 //!
 //! # What is recorded and what is saved
 //!
 //! Every request is one IPC event, recorded by the service framework with its payload. The only
 //! input the session takes from outside the guest is the `Env` clock's reading when a group
-//! starts listening, which the environment records; the ticks are the vsync clock's notes. A
+//! starts listening, or when a present finds the vsync clock stopped, which the environment
+//! records; the ticks are the vsync clock's notes, and the latch's are `FrameLatched` and
+//! `BufferReleased` (`crate::note`). The presents are saved with gsv's shared state
+//! (`crate::shared::Shared::save_presents`), with the vi2 server, whose pending requests a held
+//! fallback reply names. A
 //! session is plain data saved with the server ([`saved`]), checked as it is read back
 //! ([`saved::Vi2SessionError`]). The family saves nothing ([`Vi2Family`]); the listeners are
 //! saved with the vsync clock ([`crate::shared::Shared::save_vsync`]).

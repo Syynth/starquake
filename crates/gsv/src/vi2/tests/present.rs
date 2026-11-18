@@ -665,3 +665,72 @@ fn a_held_reply_is_saved_and_restored() {
         Some(slots_reply(PRESENT_CLIENT_BUFFER, ALL_SLOTS))
     );
 }
+
+/// A rig whose client [`TOKEN`] has had slot 0 released by a tick, with `notify` saying
+/// whether 11 made the notification event before the client registered, after it, or not at
+/// all: the rig and the image.
+fn released_slot_zero(notify: Notify) -> (Rig, u32) {
+    let mut rig = Rig::new();
+    if notify == Notify::Before {
+        rig.notification_event();
+    }
+    rig.presenting_client();
+    if notify == Notify::After {
+        rig.notification_event();
+    }
+    let image = rig.image();
+    rig.present(Present::of(image, 0));
+    rig.next_tick();
+    rig.present(Present::of(image, 1));
+    rig.next_tick();
+    (rig, image)
+}
+
+/// When 11 makes the notification event, relative to the client's 201.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Notify {
+    Before,
+    After,
+    Never,
+}
+
+/// Each command that answers from a client's free slots or the notification bitmap takes the
+/// tick's release first, on its own: 212, 228 and 229 answer slot 0 free, 21 hands out the
+/// "buffer available" bit, and an 11 that makes the event after the release signals it.
+#[test]
+fn each_refreshing_command_takes_the_tick_s_release() {
+    let freed = ALL_SLOTS & !slot_bit(1);
+    let (mut rig, _) = released_slot_zero(Notify::Never);
+    assert_eq!(rig.send(&client_only(0xE4, TOKEN)), slots_reply_212(freed));
+    let (mut rig, _) = released_slot_zero(Notify::Never);
+    assert_eq!(
+        rig.send(&cancel(TOKEN, 14)),
+        slots_reply(CANCEL_CLIENT_BUFFER, freed)
+    );
+    let (mut rig, image) = released_slot_zero(Notify::Never);
+    assert_eq!(
+        rig.present(Present::of(image, 2)),
+        freed & !slot_bit(2)
+    );
+    let (mut rig, _) = released_slot_zero(Notify::Never);
+    rig.ok(&get_notifications(128));
+    assert_eq!(
+        rig.kernel.memory(BUFFER, 4).unwrap(),
+        (1_u32 << AVAILABLE).to_le_bytes()
+    );
+    let (mut rig, _) = released_slot_zero(Notify::Never);
+    let event = rig.notification_event();
+    assert_eq!(rig.signals(event), 1);
+}
+
+/// The tick signals the session's notification event whether 11 made it before the client's
+/// 201 or after it.
+#[test]
+fn the_release_signals_the_event_made_before_or_after_the_client() {
+    for notify in [Notify::Before, Notify::After] {
+        let (mut rig, _) = released_slot_zero(notify);
+        let event = rig.notification_event();
+        // The tick's signal, then 11's own while the bit is raised.
+        assert_eq!(rig.signals(event), 2);
+    }
+}

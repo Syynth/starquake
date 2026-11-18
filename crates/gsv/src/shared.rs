@@ -93,7 +93,9 @@
 //! **The vsync turn.** The timer thread also runs [`Shared::tick_vsync`] with the turn's time,
 //! after the drain, which ticks the vsync clock when its deadline has come, and sleeps no later
 //! than [`Shared::vsync_deadline`] ([`vsync`]). The clock saves itself
-//! ([`Shared::save_vsync`], [`Shared::restore_vsync`]).
+//! ([`Shared::save_vsync`], [`Shared::restore_vsync`]). Each tick also runs vi2's present
+//! latch ([`present`], "The latch") and returns the latched frames' requests, which the timer
+//! thread hands to the GPU front once the lock is released.
 //!
 //! # The timer thread
 //!
@@ -116,8 +118,9 @@
 //! [`SNAPSHOT_VERSION`]. Version 2 added the waits. The queue has its own snapshot
 //! ([`CompletionQueue::save`]), because it must exist before the `Syncpoints` that pushes to it.
 //! The GPU memory bookkeeping has its own too ([`crate::gpu::saved`]), and so has the shared page
-//! ([`Shared::save_page`], restored after this one by [`Shared::restore_page`]); composing them
-//! into this one is the wiring slice's (16).
+//! ([`Shared::save_page`], restored after this one by [`Shared::restore_page`]), and so have vi2's
+//! presents ([`Shared::save_presents`], restored after this one and before the vsync clock by
+//! [`Shared::restore_presents`]); composing them into this one is the wiring slice's (16).
 //!
 //! A snapshot is a file and is not trusted. [`Shared::restore`] checks, in this order, and
 //! returns the first failure: the magic, the version, that the body decodes, that no bytes

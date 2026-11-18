@@ -38,7 +38,7 @@
 //! # The latch
 //!
 //! Each vsync tick, after it has signalled the clock's listeners ([`crate::shared::vsync`],
-//! "Tick"), runs the latch ([`Locked::latch`]) over the clients in ascending token order. For
+//! "Tick"), runs the latch (`Locked::latch`) over the clients in ascending token order. For
 //! each client:
 //!
 //! 1. If the oldest queued frame's fence is reached, it is taken out of the queue and becomes the
