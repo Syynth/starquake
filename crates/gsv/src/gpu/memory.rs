@@ -54,9 +54,10 @@
 //! then until the drain, every mapping in the region's range is gone from the table, though
 //! the bookkeeping keeps it: the 211 mappings inside the region, the registrations' own
 //! mappings there, and the shim if it is there; the drain shows them again
-//! (`a_sparse_region_is_destroyed_in_order`). A 212 sends its `ModifyKind` over its whole range,
-//! which gives the kind to every page the table maps there, the shim's page included, until its
-//! drain publishes the range again.
+//! (`a_sparse_region_is_destroyed_in_order`). A 212 sends its `ModifyKind` only over the runs
+//! of its range where its mapping is the top layer, so the shim's page keeps its kind
+//! (`a_kind_change_keeps_the_shim`); a 212 whose whole range is the shim's page sends none, and
+//! only its barrier.
 //!
 //! **Pages a waiting job holds.** The ranges a waiting job's updates cover are not written into
 //! the table by any publish (a request's, a restore's or another job's drain) until the last
@@ -127,8 +128,10 @@ use super::kind::{self, GENERIC_16BX2};
 use super::{AsId, GpuVmFront};
 
 pub(crate) mod cover;
+mod sparse;
 
 use cover::Cover;
+pub use sparse::{SparseAdmission, SparseCompletion};
 
 /// How many notification events a gpu session has: PR's `GpuDeviceRegistry::events`
 /// (`std::array<Kernel::KEvent*, 64>`). gpu 11 answers indices 0 to one less (graphics-server,
@@ -1097,11 +1100,18 @@ impl GpuMemory {
         {
             record.spans = spans;
         }
-        let update = VmUpdate::ModifyKind {
-            range,
-            kind: selected.backend,
-        };
-        self.order(front, &[(request.space, update)], event, Vec::new());
+        // Only where the mapping shows: not on the shim's page (module docs, "What a removal
+        // sends").
+        let mut updates = Vec::new();
+        if let Some(space) = self.spaces.get(&request.space) {
+            for (start, end) in self.shown(space, Layer::Mapping, range.start(), range.end()) {
+                if let Some(part) = page_range(start, end) {
+                    let kind = selected.backend;
+                    updates.push((request.space, VmUpdate::ModifyKind { range: part, kind }));
+                }
+            }
+        }
+        self.order(front, &updates, event, Vec::new());
         Ok(selected.selected)
     }
 
