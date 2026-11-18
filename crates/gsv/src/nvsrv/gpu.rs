@@ -669,7 +669,7 @@ pub struct Made {
 }
 
 /// What `SetErrorNotifier` was given (`IoctlSetErrorNotifier`): kept, read by nothing yet
-/// (module docs, "What the settings store").
+/// (module docs, "The settings").
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorNotifier {
     /// `offset`.

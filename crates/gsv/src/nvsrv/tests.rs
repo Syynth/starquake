@@ -1630,6 +1630,30 @@ fn a_kernel_that_cannot_make_an_event_opens_no_ctrl_gpu() {
     assert!(rig.state().ctrl_gpu().events(2).is_some());
 }
 
+/// A kernel that makes the first event and refuses the second fails `Open` of nvhost-ctrl-gpu
+/// with its error and uses no fd; the first event stays in the kernel with no owner, as
+/// `ctrl_gpu`'s "Where this differs from the references" lists. Once events can be made again,
+/// ctrl-gpu opens with fd 1 and two fresh events.
+#[test]
+fn a_ctrl_gpu_open_whose_second_event_fails_leaves_the_first() {
+    let mut rig = Rig::new();
+    let before = rig.kernel.new_object();
+    rig.kernel
+        .refuse_objects_after(1, Some(KernelError::OutOfResource));
+    let reply = rig.open(Device::NvhostCtrlGpu.path().as_bytes());
+    assert_eq!(reply.result, KernelError::OutOfResource.code().raw());
+    assert_eq!(rig.state().open_files(), 0);
+    assert_eq!(rig.state().ctrl_gpu().fds().count(), 0);
+    // One event was made: the index after `before`, a kernel event no fd holds.
+    let leaked = ObjectId::from_parts(before.index() + 1, before.generation());
+    assert_eq!(rig.kernel.signals(leaked), Some(0));
+    assert_eq!(next_index(&mut rig), before.index() + 2);
+    rig.kernel.refuse_objects(None);
+    assert_eq!(rig.open_device(Device::NvhostCtrlGpu), 1);
+    let events = rig.state().ctrl_gpu().events(1).unwrap();
+    assert!(![events.error_notifier, events.unknown].contains(&leaked));
+}
+
 /// [`NvsrvState::open`] keeps events only for nvhost-ctrl-gpu: without them, or with a pair
 /// [`ctrl_gpu::CtrlGpu::check`] refuses, it opens nothing and uses no fd; given for another
 /// device they are not kept and the device opens.

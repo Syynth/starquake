@@ -666,8 +666,9 @@ fn saved_table(pairs: &[(u32, u32, u32)]) -> SavedCtrlGpu {
 }
 
 /// A saved table `Open` cannot make is refused: an fd's two events one event; an event two fds
-/// share, either of the pair, the lower fd first. Both faults on one fd: the one event is
-/// reported. Events that differ only in their generation are distinct.
+/// share, either of the pair, the lower fd first. The walk is fd by fd, the first failing
+/// reported; within an fd, the one event before a shared one. Events that differ only in their
+/// generation are distinct.
 #[test]
 fn a_saved_ctrl_gpu_table_open_cannot_make_is_refused() {
     let shared = CtrlGpuStateError::SharedEvent {
@@ -688,6 +689,15 @@ fn a_saved_ctrl_gpu_table_open_cannot_make_is_refused() {
         (
             vec![(2, 5, 6), (3, 9, 9), (4, 5, 8)],
             CtrlGpuStateError::SameEvent { fd: 3 },
+        ),
+        // A shared event on fd 3 before a one-event fd 4: fd 3's is reported, which a walk
+        // checking every fd's pair before any sharing would not.
+        (
+            vec![(2, 5, 6), (3, 5, 7), (4, 9, 9)],
+            CtrlGpuStateError::SharedEvent {
+                first: 2,
+                second: 3,
+            },
         ),
     ];
     for (pairs, error) in refused {

@@ -178,13 +178,15 @@
 //! | `GetTPCMasks3`'s out buffer 1 past its first word | zeroed, whole words (`WrapGeneric` copies `inline_output.size() / 4` items, all zero but the first) | left as it was: only the mask word is written, so a title cannot make the server build a reply as large as its buffer (`tpc_masks_write_one_word`) |
 //! | A `VSMS_MAPPING` refusal's buffers | written with whatever the server's scratch buffers held | nothing written (`vsms_mapping_refuses_each_size_and_number`) |
 //! | A ctrl-gpu fd's kernel events when it closes | freed (`~nvhost_ctrl_gpu`: `events_interface.FreeEvent` of each) | not freed: the services framework has no call that frees an event, so each open and close of ctrl-gpu leaves the two kernel events the server made, with no bound over the run, as nvhost-gpu's channels do (`super::gpu`, "Where this differs"; `a_closed_ctrl_gpu_s_events_are_not_freed`) |
+//! | A ctrl-gpu `Open` whose second event cannot be made | opened, the device holding a null `unknown_event` (`ServiceContext::CreateEvent` in `kernel_helpers.cpp` logs and returns null when the event cannot be reserved or made; `nvhost_ctrl_gpu`'s constructor keeps what it returns) | `Open` fails with the kernel's error and uses no fd; the first event, made already, stays in the kernel with no owner, since the services framework has no call that frees an event (`a_ctrl_gpu_open_whose_second_event_fails_leaves_the_first`, in `nvsrv/tests.rs`) |
 //!
 //! # What is saved
 //!
 //! The events of each open ctrl-gpu fd ([`CtrlGpu`]) are saved with nvsrv's state. Restoring
-//! checks, in this order, the first that fails reported ([`CtrlGpuStateError`]): an fd's two
-//! events are not one event, then (in fd order) no event belongs to two fds; and then, with the
-//! open files ([`super::NvsrvStateError`]), that each fd with events is an open ctrl-gpu and that
+//! checks the fds one by one in fd order, the first failing reported ([`CtrlGpuStateError`]);
+//! within an fd, that its two events are not one event before that neither is a lower fd's
+//! (`a_saved_ctrl_gpu_table_open_cannot_make_is_refused`). Then, with the open files
+//! ([`super::NvsrvStateError`]), it checks that each fd with events is an open ctrl-gpu and that
 //! each open ctrl-gpu has its events (made at open, so none lacks them). `Open` refuses a pair
 //! that fails the first two checks ([`super::NvsrvState::open`]), so whatever is saved restores.
 //!

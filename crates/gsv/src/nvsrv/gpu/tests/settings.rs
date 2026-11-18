@@ -482,6 +482,41 @@ fn a_saved_preemption_mode_no_ioctl_sets_is_refused() {
         let saved = saved_channel(with(made, graphics, compute));
         assert!(NvhostGpu::try_from(saved).is_ok(), "{graphics} {compute}");
     }
+    // A syncpoint but no GPU channel: only the default restores, so the check reads whether the
+    // GPU channel is made, not whether the syncpoint is set.
+    let syncpoint_only = Channel {
+        syncpoint: Some(FIRST_ALLOCATABLE),
+        ..with(None, preemption::DEFAULT, preemption::COMPUTE_MAX)
+    };
+    assert_eq!(
+        NvhostGpu::try_from(saved_channel(syncpoint_only)),
+        Err(GpuStateError::Preemption {
+            fd: 7,
+            graphics: preemption::DEFAULT,
+            compute: preemption::COMPUTE_MAX,
+        })
+    );
+    // Bad modes on fd 7, and fds 7 and 9 sharing a syncpoint: the modes are reported.
+    let shared = SavedNvhostGpu {
+        channels: BTreeMap::from([
+            (7, with(made, preemption::KEEP, preemption::DEFAULT)),
+            (
+                9,
+                Channel {
+                    syncpoint: Some(FIRST_ALLOCATABLE),
+                    ..Channel::default()
+                },
+            ),
+        ]),
+    };
+    assert_eq!(
+        NvhostGpu::try_from(shared),
+        Err(GpuStateError::Preemption {
+            fd: 7,
+            graphics: preemption::KEEP,
+            compute: preemption::DEFAULT,
+        })
+    );
     // Both faults: the class is reported.
     let mut both = with(made, preemption::KEEP, preemption::KEEP);
     both.classes = vec![0x1234];
