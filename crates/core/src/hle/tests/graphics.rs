@@ -851,13 +851,21 @@ fn the_kernel_host_records_on_its_core_and_keeps_the_environment_s_first_failure
     assert_eq!(rig.all_events().last(), Some(&(3, ThreadId(0x77), note)));
 
     let failing = starquake_trace::ReplayEnv::new(Vec::new());
-    let mut host = KernelHost::new(&rig.dispatcher, &failing, &rig.recorder, &rig.memory, TIMER);
     let before = rig.all_events().len();
-    host.record(note);
-    assert_eq!(host.signal_event(event), Err(KernelError::NotImplemented));
-    assert!(matches!(
-        host.finish(),
-        Err(EnvError::Exhausted { index: 0, .. })
-    ));
+    // A failed record alone, a failed signal alone, and both.
+    for (records, signals) in [(true, false), (false, true), (true, true)] {
+        let mut host =
+            KernelHost::new(&rig.dispatcher, &failing, &rig.recorder, &rig.memory, TIMER);
+        if records {
+            host.record(note);
+        }
+        if signals {
+            assert_eq!(host.signal_event(event), Err(KernelError::NotImplemented));
+        }
+        assert!(
+            matches!(host.finish(), Err(EnvError::Exhausted { index: 0, .. })),
+            "{records} {signals}"
+        );
+    }
     assert_eq!(rig.all_events().len(), before);
 }

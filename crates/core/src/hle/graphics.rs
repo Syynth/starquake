@@ -443,6 +443,8 @@ impl Graphics {
     fn advance(&self, id: SyncpointId, value: u32) {
         let syncpoints = self.shared.syncpoints();
         let behind = value.wrapping_sub(syncpoints.read(id));
+        // `> 0`, not `>= 0`: the two differ only for a value equal to the counter, where adding
+        // 0 changes nothing either way (an equivalent mutation).
         if behind.cast_signed() > 0 {
             syncpoints.increment_by(id, behind);
         }
