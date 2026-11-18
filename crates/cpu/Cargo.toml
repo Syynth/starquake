@@ -18,3 +18,9 @@ test-support = []
 [dependencies]
 starquake-memory.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+# The hypervisor tests run the loader's patched counter reads beside the shim's unpatched ones
+# (`tests/hvf.rs`, "Counter scale"): the two must agree, and only the patcher's own output shows
+# that. A dev-dependency only; the loader depends on no crate above `memory`.
+starquake-loader.workspace = true
