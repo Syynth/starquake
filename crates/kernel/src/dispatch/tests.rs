@@ -1473,14 +1473,14 @@ proptest! {
 
 #[test]
 fn a_planned_call_returns_not_implemented_and_leaves_its_outputs_alone() {
-    // GetResourceLimitLimitValue's convention outputs x0 (result) and x1 (the value).
-    // Divergence from Eden's wrapper, which would write x1 too: only x0 changes. A void planned
-    // call, and a deferred call with a convention (light IPC, which outputs x0-x7), behave the
-    // same.
+    // GetLastThreadInfo's convention outputs x0 (result) and x1-x6 (the thread's context,
+    // its region and its flags). Divergence from Eden's wrapper, which would write x1-x6 too:
+    // only x0 changes. A void planned call, and a deferred call with a convention (light IPC,
+    // which outputs x0-x7), behave the same.
     let memory = FlatMemory::new(BASE, 0x10);
     let mut sink = Collect::default();
     for (id, status) in [
-        (SvcId::GetResourceLimitLimitValue, Status::Planned),
+        (SvcId::GetLastThreadInfo, Status::Planned),
         (SvcId::SetThreadActivity, Status::Planned),
         (SvcId::SynchronizePreemptionState, Status::Planned),
         (SvcId::SendSyncRequestLight, Status::Deferred),

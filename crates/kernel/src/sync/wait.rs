@@ -481,7 +481,8 @@ impl SyncTable {
 /// that starquake has. `KReadableEvent` derives from it directly (`k_readable_event.h`), and
 /// `KThread` and `KProcess` through `KWorkerTask` (`k_worker_task.h`). `KEvent` (`k_event.h`) and
 /// `KClientSession` (`k_client_session.h`) derive from `KAutoObject` only, so they are not, and
-/// nor are `KSharedMemory` (`k_shared_memory.h`) and `KTransferMemory` (`k_transfer_memory.h`).
+/// nor are `KSharedMemory` (`k_shared_memory.h`), `KTransferMemory` (`k_transfer_memory.h`) and
+/// `KResourceLimit` (`k_resource_limit.h`).
 #[must_use]
 pub const fn is_synchronization_object(object: Object) -> bool {
     match object {
@@ -489,7 +490,8 @@ pub const fn is_synchronization_object(object: Object) -> bool {
         Object::Event(_)
         | Object::Session
         | Object::SharedMemory(_)
-        | Object::TransferMemory(_) => false,
+        | Object::TransferMemory(_)
+        | Object::ResourceLimit(_) => false,
     }
 }
 
@@ -533,7 +535,8 @@ impl Scheduler {
             other @ (Object::Event(_)
             | Object::Session
             | Object::SharedMemory(_)
-            | Object::TransferMemory(_)) => Err(SvcError::Internal(format!(
+            | Object::TransferMemory(_)
+            | Object::ResourceLimit(_)) => Err(SvcError::Internal(format!(
                 "{object:?} is {other:?}, not a synchronisation object"
             ))),
         }

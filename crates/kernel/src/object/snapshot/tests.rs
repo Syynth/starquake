@@ -13,7 +13,11 @@ use crate::handle::{Closed, ObjectRefs, RefCounts};
 use crate::memory::fixture::{self, SHARED};
 use crate::memory::{GUARD_PAGES, LendFault, MemoryAttribute};
 use crate::process::{self, Console, MainThread, ProcessDescription};
+use crate::resource_limit::{LimitableResource, THREAD_COUNT_LIMIT};
 use crate::snapshot::FormatError;
+use crate::svc::resource_limit::{
+    LimitTables, get_resource_limit_current_value, get_resource_limit_limit_value,
+};
 use crate::svc::transfer_memory::{create_transfer_memory, unlock_released};
 
 /// The test servers' service numbers: distinct, so a lookup that ignores the number fails.
@@ -46,6 +50,8 @@ struct Kernel {
     shared: [ObjectId; 2],
     /// The heap's start.
     heap: u64,
+    /// The guest's handle to its process's resource limit, and the limit's object.
+    limit: (Handle, ObjectId),
 }
 
 impl Kernel {
@@ -125,6 +131,9 @@ fn kernel() -> Kernel {
     add_handle(&mut tables, thread_object);
     let process_object = tables.scheduler.process(own).unwrap().object();
     add_handle(&mut tables, process_object);
+    // The process's resource limit, as `GetInfo`'s `ResourceLimit` gives it out.
+    let limit_object = tables.scheduler.process(own).unwrap().resource_limit();
+    let limit = (add_handle(&mut tables, limit_object), limit_object);
     // The transfer memory.
     let heap = tables.address_space.set_heap_size(4 * PAGE_SIZE).unwrap();
     let Tables {
@@ -198,6 +207,7 @@ fn kernel() -> Kernel {
         hooks,
         shared,
         heap,
+        limit,
     }
 }
 
@@ -227,9 +237,10 @@ fn a_live_kernel_saves_restores_and_saves_the_same_bytes() {
             Object::ReadableEvent(_) => "readable event",
             Object::SharedMemory(_) => "shared memory",
             Object::TransferMemory(_) => "transfer memory",
+            Object::ResourceLimit(_) => "resource limit",
         })
         .collect();
-    assert_eq!(kinds.len(), 7, "{kinds:?}");
+    assert_eq!(kinds.len(), 8, "{kinds:?}");
     // Saved again, the bytes are the same.
     let own = kernel.own();
     let again = restored
@@ -304,6 +315,24 @@ fn the_restored_tables_work_as_the_saved_ones_did() {
         .tear_down(session_object, Object::Session)
         .unwrap();
     assert!(!kernel.tables.scheduler.ipc().is_session(session_object));
+    // The resource limit answers through the guest's handle, from the restored table.
+    let (limit, limit_object) = kernel.limit;
+    assert_eq!(kernel.tables.handles.get(limit), Ok(limit_object));
+    let tables = LimitTables {
+        handles: &kernel.tables.handles,
+        space: &kernel.tables.address_space,
+        scheduler: &kernel.tables.scheduler,
+        processes: &kernel.tables.processes,
+    };
+    let threads = LimitableResource::ThreadCount.number();
+    assert_eq!(
+        get_resource_limit_limit_value(tables, limit, threads),
+        Ok(THREAD_COUNT_LIMIT)
+    );
+    assert_eq!(
+        get_resource_limit_current_value(tables, limit, threads),
+        Ok(1)
+    );
 }
 
 #[test]
@@ -393,10 +422,10 @@ fn second_process(kernel: &mut Kernel) -> Second {
 
 /// A body with every object kind, each field a distinct non-zero value: slot 0 a thread, 1 a
 /// process, 2 a session, 3 vacant (freed once, so generation 2), 4 an event naming slot 5, 5 a
-/// signalled readable end, 6 a shared memory, 7 a transfer memory; one handle table; one hooked
-/// event.
+/// signalled readable end, 6 a shared memory, 7 a transfer memory, 8 a resource limit; one
+/// handle table; one hooked event.
 fn golden_body() -> Body {
-    let mut objects = Slab::with_max_slots(9);
+    let mut objects = Slab::with_max_slots(10);
     let rows = [
         SavedObject::Thread(ThreadId::from_parts(3, 4)),
         SavedObject::Process(ProcessId::from_parts(5, 6)),
@@ -417,6 +446,9 @@ fn golden_body() -> Body {
             size: 0x3000,
             owner_permission: SvcPermission::ReadWrite.bits(),
             locked: true,
+        },
+        SavedObject::ResourceLimit {
+            owner: ProcessId::from_parts(8, 9),
         },
     ];
     let mut ids = Vec::new();
@@ -446,9 +478,9 @@ fn golden_body() -> Body {
 #[rustfmt::skip]
 const GOLDEN: &[u8] = &[
     // Header: the magic, then the version.
-    b'S', b'Q', b'O', b'B', 1,
-    // The object table: eight slots.
-    8,
+    b'S', b'Q', b'O', b'B', 2,
+    // The object table: nine slots.
+    9,
     // Slot 0: occupied (tag 1), generation 1, a thread (tag 0) 3/4, 10 references.
     1, 1, 0, 3, 4, 10,
     // Slot 1: occupied, generation 1, a process (tag 1) 5/6, 11 references.
@@ -467,10 +499,12 @@ const GOLDEN: &[u8] = &[
     // Slot 7: occupied, generation 1, a transfer memory (tag 6): owner 5/6, address 0x9000,
     // size 0x3000, read-write (3), locked, 17 references.
     1, 1, 6, 5, 6, 0x80, 0xa0, 0x02, 0x80, 0x60, 3, 1, 17,
+    // Slot 8: occupied, generation 1, a resource limit (tag 7) of process 8/9, 18 references.
+    1, 1, 7, 8, 9, 18,
     // The free stack: one entry, slot 3.
     1, 3,
-    // The slot limit (9) and the live count (7).
-    9, 7,
+    // The slot limit (10) and the live count (8).
+    10, 8,
     // One handle table: process 5/6.
     1, 5, 6,
     // Its three entries: index 0 free, index 1 the transfer memory under linear id 2, index 2
@@ -494,7 +528,7 @@ fn the_body_layout_is_pinned() {
 #[test]
 fn the_magic_and_version_are_pinned_as_literals() {
     assert_eq!(OBJECTS_MAGIC, [0x53, 0x51, 0x4f, 0x42]);
-    assert_eq!(OBJECTS_VERSION, 1);
+    assert_eq!(OBJECTS_VERSION, 2);
 }
 
 fn config(cases: u32) -> ProptestConfig {
@@ -533,6 +567,9 @@ fn any_saved_object() -> impl Strategy<Value = SavedObject> {
                 locked,
             }
         ),
+        id().prop_map(|(i, g)| SavedObject::ResourceLimit {
+            owner: ProcessId::from_parts(i, g)
+        }),
     ]
 }
 
@@ -776,6 +813,58 @@ fn a_thread_or_process_object_is_the_one_its_row_names() {
     assert_eq!(
         case.error(),
         object_error(process_object, ObjectFault::Process)
+    );
+}
+
+#[test]
+fn a_resource_limit_is_the_one_its_process_s_row_names() {
+    let mut kernel = kernel();
+    let own = kernel.own();
+    let (_, limit) = kernel.limit;
+    let process_object = kernel.tables.scheduler.process(own).unwrap().object();
+    // A limit of a process the kernel does not have, and of one whose generation differs only.
+    for owner in [
+        ProcessId::from_parts(own.index() + 7, own.generation()),
+        ProcessId::from_parts(own.index(), own.generation() + 1),
+    ] {
+        let mut case = Case::new(&kernel);
+        case.row(limit).object = SavedObject::ResourceLimit { owner };
+        assert_eq!(
+            case.error(),
+            object_error(limit, ObjectFault::ResourceLimit)
+        );
+    }
+    // A second limit of the calling process, where its process object was: the row names the
+    // other one.
+    let mut case = Case::new(&kernel);
+    case.row(process_object).object = SavedObject::ResourceLimit { owner: own };
+    assert_eq!(
+        case.error(),
+        object_error(process_object, ObjectFault::ResourceLimit)
+    );
+    // The limit made a process object.
+    let mut case = Case::new(&kernel);
+    case.row(limit).object = SavedObject::Process(own);
+    assert_eq!(case.error(), object_error(limit, ObjectFault::Process));
+    // A second process's limit is accepted as its own, and refused as the first's.
+    let second = kernel
+        .tables
+        .processes
+        .create(&ProcessDescription::homebrew(Console::Switch2))
+        .unwrap();
+    kernel.tables.scheduler.add_process(second).unwrap();
+    let second_limit = kernel
+        .tables
+        .scheduler
+        .process(second)
+        .unwrap()
+        .resource_limit();
+    assert!(kernel.restore(&kernel.save().unwrap()).is_ok());
+    let mut case = Case::new(&kernel);
+    case.row(second_limit).object = SavedObject::ResourceLimit { owner: own };
+    assert_eq!(
+        case.error(),
+        object_error(second_limit, ObjectFault::ResourceLimit)
     );
 }
 
@@ -1451,6 +1540,10 @@ fn the_errors_read_as_plain_words() {
     assert_eq!(
         object_error(object, ObjectFault::NoReferences).to_string(),
         "object 4 (generation 2) has no references"
+    );
+    assert_eq!(
+        object_error(object, ObjectFault::ResourceLimit).to_string(),
+        "object 4 (generation 2) is a resource limit whose process's row does not name it back"
     );
     assert_eq!(
         object_error(object, ObjectFault::ReadableNotIssued).to_string(),

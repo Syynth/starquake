@@ -297,9 +297,13 @@ fn a_thread_that_exits_frees_its_tls_slot_and_the_slot_is_reused() {
 
 #[test]
 fn a_full_object_table_makes_no_thread_and_frees_its_region() {
-    // One object: the main thread's, so `CreateThread`'s object is refused.
+    // Three objects: the process's, its resource limit's and the main thread's, so
+    // `CreateThread`'s object is refused.
     let mut world = World::prepared(&ProcessDescription::homebrew(Console::Switch1), |tables| {
-        *tables.scheduler.objects_mut() = crate::object::Objects::with_max_slots(1);
+        let own = tables.processes.own();
+        tables.scheduler = crate::tables::Scheduler::default();
+        *tables.scheduler.objects_mut() = crate::object::Objects::with_max_slots(3);
+        tables.scheduler.add_process(own).unwrap();
     });
     assert_eq!(world.tls_used(), 1);
     assert_eq!(

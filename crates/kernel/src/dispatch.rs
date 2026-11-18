@@ -233,6 +233,7 @@ mod info;
 mod ipc;
 mod lifecycle;
 mod memory_objects;
+mod resource_limit;
 mod snapshot;
 mod sync;
 #[cfg(test)]
@@ -858,6 +859,9 @@ impl Dispatcher {
                 self.physical_memory(call, id, convention)
             }
             SvcId::GetInfo => self.get_info(call, id, convention),
+            SvcId::GetResourceLimitLimitValue | SvcId::GetResourceLimitCurrentValue => {
+                self.resource_limit(call, id, convention)
+            }
             SvcId::Break => self.break_call(call, id, convention),
             SvcId::ExitProcess
             | SvcId::ExitThread

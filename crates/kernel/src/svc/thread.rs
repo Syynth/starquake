@@ -88,7 +88,8 @@ pub fn thread_from_handle(
             | Object::Event(_)
             | Object::ReadableEvent(_)
             | Object::SharedMemory(_)
-            | Object::TransferMemory(_) => Err(KernelError::InvalidHandle.into()),
+            | Object::TransferMemory(_)
+            | Object::ResourceLimit(_) => Err(KernelError::InvalidHandle.into()),
         },
     }
 }
@@ -365,6 +366,9 @@ pub fn get_thread_id(
 
 #[cfg(test)]
 mod lifecycle_tests;
+
+#[cfg(test)]
+mod limit_tests;
 
 #[cfg(test)]
 mod tests {

@@ -43,7 +43,11 @@
 //!     [`AddressSpace::used_user_physical_memory_size`]).
 //!   - 23 `IsApplication`: `IsApplication`; [`IS_APPLICATION`] here (see the divergences).
 //!   - 24 `FreeThreadCount`: the process's resource limit's `ThreadCountMax` limit less its
-//!     current value ([`free_threads`]).
+//!     current value (`process->GetResourceLimit()`; [`crate::resource_limit`]), read through
+//!     the values `GetResourceLimitLimitValue` and `GetResourceLimitCurrentValue` answer
+//!     ([`crate::svc::resource_limit`]), so the three agree. Tests:
+//!     `the_free_thread_count_is_the_limit_less_the_process_s_threads`,
+//!     `the_free_thread_count_agrees_with_the_resource_limit_calls`.
 //! - **`DebuggerAttached`** (8): Eden checks neither the handle nor the sub id; the value is
 //!   zero (`*result = 0`). No debugger is ever attached here, so the value is the fact, not a
 //!   stub. Eden, and so starquake, is looser than Horizon here: Horizon checks
@@ -55,10 +59,12 @@
 //!   1. `handle == 0`, else `ResultInvalidHandle`.
 //!   2. `info_sub_id == 0`, else `ResultInvalidCombination`.
 //!
-//!   Then a new handle to the calling process's resource limit, or, for a process with none,
-//!   `Svc::InvalidHandle` (Eden: "the kernel considers this a successful operation either
-//!   way"). Here no process has one (see the divergences). Test:
-//!   `the_resource_limit_is_the_invalid_handle_after_edens_two_checks`.
+//!   Then a new handle to the calling process's resource limit is added to its handle table
+//!   (`handle_table.Add`), whose failure (`ResultOutOfHandles` for a full table) is the call's
+//!   result; the value is the new handle. Eden answers `Svc::InvalidHandle` for a process with
+//!   no limit, which every process here has ([`crate::sched::Scheduler::add_process`]). Tests:
+//!   `the_resource_limit_is_a_new_handle_to_the_calling_process_s_limit_after_edens_two_checks`,
+//!   `the_resource_limit_with_a_full_handle_table_is_out_of_handles`.
 //! - **`IdleTickCount`** (10):
 //!   1. `info_sub_id` is [`ALL_CORES`] or the calling core's index, else
 //!      `ResultInvalidCombination`.
@@ -205,21 +211,6 @@
 //!   (`crates/core/src/image.rs`, "The `ACID` pool partition is not read"), so a program whose
 //!   `ACID` names another pool is told it is an application, and its system resource is
 //!   counted as for the application pool. Test: `every_process_is_an_application`.
-//! - **No resource limit.** Eden gives every process it loads one
-//!   (`CreateResourceLimitForProcess`, `eden/src/core/hle/kernel/k_resource_limit.cpp` @
-//!   cf654052); here no process has one (`crate::process`, "Divergences from
-//!   `KProcess::Run`"). So:
-//!   - **9** answers `Svc::InvalidHandle`, Eden's answer for a process with no limit, where
-//!     Eden adds a handle to the limit. Test:
-//!     `the_resource_limit_is_the_invalid_handle_after_edens_two_checks`.
-//!   - **24** answers Eden's limit, [`THREAD_COUNT_LIMIT`], less the process's threads that
-//!     still have a row ([`crate::process::ProcessRecord::threads`]): Eden's current value
-//!     counts each thread from its reservation (`CreateThread`, `KProcess::Run`) to its
-//!     destruction (`KThread::PostDestroy`), the life of a row here. Nothing here refuses a
-//!     thread past the limit, as Eden does, so a process with more threads than the limit is
-//!     told zero rather than a wrapped count. Tests:
-//!     `the_free_thread_count_is_edens_limit_less_the_process_s_threads`,
-//!     `free_threads_stop_at_zero_past_the_limit`.
 //! - **No CPU time is kept**, so 10 is [`IDLE_TICK_COUNT`] and 25 [`THREAD_TICK_COUNT`], both
 //!   zero, after Eden's checks. Eden's are the idle thread's CPU time (10) and, for the calling
 //!   thread, the ticks since its core's last context switch (25, with its CPU time added for
@@ -277,8 +268,10 @@ use crate::id::ProcessId;
 use crate::memory::AddressSpace;
 use crate::object::Object;
 use crate::process::{Console, ENTROPY_COUNT, LEGACY_VIRTUAL_CORE_COUNT, ProcessInfo};
+use crate::resource_limit::LimitableResource;
 use crate::result::{CallResult, KernelError, SvcError};
 use crate::sched::{APPLICATION_CORE_COUNT, CoreId};
+use crate::svc::resource_limit::{self, LimitTables};
 use crate::svc::thread::thread_from_handle;
 use crate::tables::{Processes, Scheduler};
 use starquake_memory::PAGE_SIZE;
@@ -426,14 +419,6 @@ pub const USER_EXCEPTION_CONTEXT_ADDRESS: u64 = 0;
 /// metadata; the description here keeps no pool, so this is a guess for any other program.
 pub const IS_APPLICATION: u64 = 1;
 
-/// The `ThreadCountMax` limit of the resource limit Eden gives each process it loads:
-/// `SetLimitValue(LimitableResource::ThreadCountMax, 800)` in `CreateResourceLimitForProcess`
-/// (`eden/src/core/hle/kernel/k_resource_limit.cpp` @ cf654052; the same in
-/// `eden-pr4588/src/core/hle/kernel/k_resource_limit.cpp` @ e5fb3b97). Eden's own comment calls
-/// the values there "the system defaults", so for an application this is a guess that Eden
-/// makes too.
-pub const THREAD_COUNT_LIMIT: u64 = 800;
-
 /// The sub id `IdleTickCount` (10) and `ThreadTickCount` (25) take for "every core" rather than
 /// one core's index: Eden compares with `0xFFFFFFFFFFFFFFFF`.
 pub const ALL_CORES: u64 = u64::MAX;
@@ -555,14 +540,6 @@ pub const fn non_system_total(used_non_system: u64, free: u64, max: u64, secure:
     }
 }
 
-/// `FreeThreadCount` for a process with `threads` threads: [`THREAD_COUNT_LIMIT`] less
-/// `threads` (`limit_value - current_value`), or zero for a count at or past the limit, which
-/// Eden's reservation never lets a process pass (see the module docs).
-#[must_use]
-pub fn free_threads(threads: usize) -> u64 {
-    u64::try_from(threads).map_or(0, |threads| THREAD_COUNT_LIMIT.saturating_sub(threads))
-}
-
 impl InfoType {
     /// The id with this number, if it is listed.
     #[must_use]
@@ -606,7 +583,8 @@ fn process_from_handle(
             | Object::Event(_)
             | Object::ReadableEvent(_)
             | Object::SharedMemory(_)
-            | Object::TransferMemory(_) => Err(KernelError::InvalidHandle.into()),
+            | Object::TransferMemory(_)
+            | Object::ResourceLimit(_) => Err(KernelError::InvalidHandle.into()),
         },
     }
 }
@@ -667,13 +645,13 @@ pub fn get_info(
             ))
         }),
         InfoType::IsApplication => process(&|_| Ok(IS_APPLICATION)),
-        InfoType::FreeThreadCount => {
-            process(&|named| Ok(free_threads(scheduler_threads(shared, named)?)))
-        }
+        InfoType::FreeThreadCount => process(&|named| free_thread_count(shared, space, named)),
         InfoType::AliasRegionExtraSize => process(&|_| Ok(regions.alias_region_extra_size)),
         // `case InfoType::DebuggerAttached: *result = 0; R_SUCCEED();`
         InfoType::DebuggerAttached => Ok(0),
-        InfoType::ResourceLimit => resource_limit(handle, info_sub_id),
+        InfoType::ResourceLimit => {
+            resource_limit(handles, scheduler, processes, handle, info_sub_id)
+        }
         InfoType::IdleTickCount => idle_tick_count(core, handle, info_sub_id),
         InfoType::RandomEntropy => random_entropy(scheduler, processes.own(), handle, info_sub_id),
         InfoType::InitialProcessIdRange => initial_process_id_range(handle, info_sub_id),
@@ -729,14 +707,35 @@ fn process_info(
     value(process_from_handle(handles, scheduler, processes, handle)?)
 }
 
-/// How many of `process`'s threads still have a row in the scheduler.
-fn scheduler_threads((_, scheduler, _): Shared<'_>, process: ProcessId) -> CallResult<usize> {
-    Ok(scheduler.process(process)?.threads().count())
+/// `FreeThreadCount` (24) of `process`: its resource limit's thread limit less its current
+/// value (`limit_value - current_value`), read through the same values
+/// `GetResourceLimitLimitValue` and `GetResourceLimitCurrentValue` answer with
+/// ([`resource_limit::values`]), so the three always agree.
+fn free_thread_count(
+    (handles, scheduler, processes): Shared<'_>,
+    space: &AddressSpace,
+    process: ProcessId,
+) -> CallResult<u64> {
+    let limit = scheduler.resource_limit(process)?;
+    let tables = LimitTables {
+        handles,
+        space,
+        scheduler,
+        processes,
+    };
+    Ok(resource_limit::values(tables, limit, LimitableResource::ThreadCount)?.free())
 }
 
-/// `ResourceLimit` (9): Eden's two checks, then `Svc::InvalidHandle`, the answer for a process
-/// with no resource limit (see the module docs).
-fn resource_limit(handle: Handle, info_sub_id: u64) -> CallResult<u64> {
+/// `ResourceLimit` (9): Eden's two checks, then a new handle to the calling process's resource
+/// limit in its handle table (`handle_table.Add`), whose failure (`ResultOutOfHandles` for a
+/// full table) is the call's result.
+fn resource_limit(
+    handles: &mut HandleTable,
+    scheduler: &mut Scheduler,
+    processes: &Processes,
+    handle: Handle,
+    info_sub_id: u64,
+) -> CallResult<u64> {
     // `R_UNLESS(handle == 0, ResultInvalidHandle)`.
     if handle != Handle::INVALID {
         return Err(KernelError::InvalidHandle.into());
@@ -745,8 +744,12 @@ fn resource_limit(handle: Handle, info_sub_id: u64) -> CallResult<u64> {
     if info_sub_id != 0 {
         return Err(KernelError::InvalidCombination.into());
     }
-    // `*result = Svc::InvalidHandle;`
-    Ok(u64::from(Handle::INVALID.raw()))
+    // `R_TRY(handle_table.Add(system.Kernel(), std::addressof(resource_handle),
+    // resource_limit))`. Every process here has a limit, so Eden's `Svc::InvalidHandle` answer
+    // for a process with none is never given.
+    let object = scheduler.process(processes.own())?.resource_limit();
+    let added = handles.add(scheduler.objects_mut(), object)?;
+    Ok(u64::from(added.raw()))
 }
 
 /// `IdleTickCount` (10) for a call made on `core`: Eden's two checks, then
