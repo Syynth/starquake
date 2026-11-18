@@ -517,7 +517,6 @@ impl RootState {
     #[must_use]
     pub const fn vi2_server(&self) -> Option<ServiceId> {
         self.vi2_server
-
     }
 
     /// The root of a run whose video server is known by `service` (module docs, "Video (slice

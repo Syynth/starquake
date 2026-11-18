@@ -10,8 +10,8 @@
 //! name and the kind), the group count 51 recorded, the display's references, the clients (a
 //! length, then each one's token, retire bit, available bit, whether bound, layer, free slots and
 //! levels as `f32` bits), the endpoint's client, and the next layer number. The server's
-//! snapshot holds it within its own header; the golden-bytes test `the_saved_session_layout_is_pinned`
-//! (`vi2/tests.rs`) pins it.
+//! snapshot holds it within its own header; the golden-bytes test
+//! `the_saved_session_layout_is_pinned` (`vi2/tests/saved.rs`) pins it.
 //!
 //! # What a restore checks
 //!

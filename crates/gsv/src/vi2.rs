@@ -73,10 +73,11 @@
 //! | 261–272 | register (odd) and unregister (even) a display monitor | `u64` name, `u32` group | nothing | read (PR); kind 0 observed as the vsync (row 82) |
 //! | 301 | `SetDisplayParameter301` | `u64` name, `u64` value, `u64` mask | nothing | read (PR) |
 //! | 351 | `SetClientOutputEncoding` | `u64` client, `u64` encoding | nothing | read (PR) |
-//! | 352 | `SetClientOutputLevels` | `u64` client, three `f32` | nothing | read (PR) |
+//! | 352 | `SetClientOutputLevels` | `u64` client, three `f32` | nothing | read (PR); **conflict** on the refused levels' result (below) |
 //! | 354 | `GetDisplayState354` | `u64` name | `u64` 1 | read (PR) |
 //!
-//! What each checks, in order, answering the first failure (PR's checks, with PR's results):
+//! What each checks, in order, answering the first failure (PR's checks, with PR's results but
+//! where a bullet marks a **conflict**: 11, 13, 301 and 352):
 //!
 //! - **1, 3, 5** check nothing.
 //! - **11** reads its word and takes any value: it makes the session's notification event the
@@ -158,7 +159,13 @@
 //!   keeps nothing.
 //! - **352** refuses a zero client or one not registered with `NotFound`, and levels whose first
 //!   two are not within 0 to 1 or whose third is negative (a NaN is neither) with
-//!   `InvalidCombination` ([`levels_are_valid`]); otherwise it keeps them.
+//!   [`VI_OUT_OF_RANGE`] ([`levels_are_valid`]); otherwise it keeps them. **conflict:** PR's
+//!   code answers `InvalidCombination` for those levels, though its own comment reads the system
+//!   module's handler as answering VI result 4 ("vi2 0x63 handler 0xf4170 ... The first two must
+//!   be within [0, 1] and the third not negative (otherwise VI result 4)"); NX2 has no 352 (it
+//!   is auto-stubbed: success). Decision 8 takes the reading that cites the system module, so
+//!   the refusal is [`VI_OUT_OF_RANGE`] (`output_levels_are_refused_with_the_module_s_result`).
+//!   A title trace of a refused 352 would settle it.
 //!
 //! A request that lacks a data word, the handle or the buffer its command reads is the
 //! framework's `INVALID_CMIF_REQUEST`, before anything changes; one with more data words is read
@@ -170,8 +177,10 @@
 //! trace level only; a refused one is still logged at warning by the framework, as every failed
 //! command is. The vsync fallback is logged at info (below, "Vsync"), a clock with no room for a
 //! group at error, and 201's refusal of a bit at or past [`CLIENT_NOTIFICATIONS`] and 351's of
-//! an encoding at warning. `tests/vi2_log_levels.rs` pins the fallback, the full clock and the
-//! display state commands.
+//! an encoding at warning, each before the framework's own warning of the failed command.
+//! `tests/vi2_log_levels.rs` pins each of these: the fallback, the full clock, the display
+//! state commands, and 201's and 351's warnings (against a 201 and a 351 refused for another
+//! reason, which log only the framework's).
 //!
 //! **Notifications.** A notification is a bit of a [`NOTIFICATION_WORDS`]-word bitmap. Raising
 //! one sets its bit and signals the notification event, if 11 has made it. A signal the kernel
@@ -205,8 +214,10 @@
 //! So a group's event listens exactly while it has no registration or a kind-0 one. Where a
 //! full clock ([`crate::shared::vsync::MAX_LISTENERS`]) refuses a group that should listen, 31
 //! answers `OutOfResource` having made nothing, and 261 and an unregister log an error and
-//! succeed: the group is not ticked until an unregister that matches finds room, and after that
-//! a 261 (kind 0) (`a_full_clock_leaves_a_registered_group_unticked`).
+//! succeed, leaving the group not ticked. A group left registered for kind 0 listens again
+//! once an unregister that matches finds room (`a_full_clock_leaves_a_registered_group_unticked`);
+//! one left with no registration listens again once a 261 (kind 0) finds room
+//! (`a_kind_zero_registration_puts_an_unticked_group_back_on_the_clock`).
 //!
 //! **The fallback's first frame.** The spec ticks an unregistered group "after the first frame".
 //! The clock signals its listeners on every tick and offers vi2 no turn of its own, so the grace
@@ -224,14 +235,16 @@
 //!
 //! | Case | PR | NX2 | Here |
 //! |---|---|---|---|
-//! | 1 and 3 | 0 | 1 | **conflict**: 1, the larger answer and the one a title ran on (decision 8; `the_limits_are_the_chosen_answers`) |
+//! | 1 and 3 | 0 | 1 | **conflict**: 1, the larger answer and the one a title ran on (decision 8; `the_limits_are_the_chosen_answers`). An owner question: see [`NOTIFICATION_LIMIT`] for the coupling with 201's bound, the row below |
+//! | 1's answer and 201's bound together | 1 answers 0 (one word, bits 0 to 31), and 201 takes bits below 32 | 1 answers 1; 201 auto-stubbed (any bits) | 1 answers 1, two words (bits 0 to 63) if the SDK reads it as PR's comment says, while 201 and a restore take only bits below [`CLIENT_NOTIFICATIONS`], 32: a combination neither reference has, so a client the SDK gives a bit from 32 to 63 is refused (`a_client_bit_in_the_second_word_the_limit_names_is_refused`). Part of the owner question on 1 and 3 |
 //! | 11 | one event per session | a new event per call | PR's (`the_notification_event_is_made_once_and_signalled_while_raised`) |
 //! | 11 and 13 with a word other than 0 | `InvalidCombination` | 11 takes any word; 13 auto-stubbed | **conflict**: any word, NX2's, the one a title ran on (`notification_commands_take_any_word`) |
-//! | 31 and 32 | a group's event, ticked once registered for kind 0 | a new event per call, every one ticked | **conflict**: PR's, with NX2's ticking as the fallback (above; `an_unregistered_group_is_ticked_by_the_fallback`, `a_kind_zero_monitor_ticks_its_group`) |
+//! | 31 and 32 | a group's event, ticked once registered for kind 0 | a new event per call, every one ticked | **conflict**: PR's, with NX2's ticking as the fallback (above; `an_unregistered_group_is_ticked_by_the_fallback`, `a_kind_zero_monitor_ticks_its_group`, `a_kind_zero_registration_puts_an_unticked_group_back_on_the_clock`) |
 //! | The handle kind of 11, 31 and 32 | moved | copied | **conflict**: copied, as [`crate::protocol::HANDLE_KIND`] (`the_request_group_event_is_handed_out_copied`; 11 and 32 in `every_command_s_reply_bytes`) |
 //! | 32 with a handle naming a live object that is not an event, and a group out of range | `InvalidHandle` (the handle is checked for a readable event first) | auto-stubbed | [`VI_OUT_OF_RANGE`]: the group is checked before the identity, and the server cannot tell an event from another object (`duplicate_checks_the_group_before_the_identity`) |
 //! | 104, 105 | as here | success, no data | PR's (`every_command_s_reply_bytes`) |
 //! | Player displays (`"player1"`–`"player3"`) | opened, bound and closed for `GameShare` | auto-stubbed | not opened (101 `NotFound`); 102 and 251 answer as PR does for one with no reference (`player_displays_are_not_opened`). Deferred with other displays (spec) |
+//! | 352 with levels it refuses | `InvalidCombination` (its code), VI result 4 (its comment, reading the system module) | auto-stubbed: success | **conflict**: [`VI_OUT_OF_RANGE`], the reading that cites the module (decision 8; `output_levels_are_refused_with_the_module_s_result`) |
 //! | 301 with a mask or value other than PR's two forms | `InvalidCombination` | auto-stubbed: success | **conflict**: accepted on the default display, as PR reads the system module (`display_parameter_301_takes_any_flags_on_the_default_display`) |
 //! | 106 | Eden's display resolution: 1 at 1280 × 720, `NotImplemented` otherwise | auto-stubbed | 1: the display is 1280 × 720 (handheld) until output sizes are read from a display description (spec, "Deferred") |
 //! | A failure's data words | written as zero | — | not written: the result word alone (`a_failure_reply_is_the_result_word_alone`) |
@@ -403,7 +416,9 @@ const fn vi(description: u32) -> ResultCode {
 }
 
 /// PR's `Result{ErrorModule::VI, 4}`: a group index out of range, a zero display name, a 51
-/// count out of range. The name is starquake's; no reference names description 4.
+/// count out of range; and 352's refused levels, which PR's comment reads from the system module
+/// ("otherwise VI result 4") though its code answers `InvalidCombination` (module docs,
+/// "Commands": a **conflict**). The name is starquake's; no reference names description 4.
 pub const VI_OUT_OF_RANGE: ResultCode = vi(4);
 /// PR's `Result{ErrorModule::VI, 5}`: a group's event or registration that exists, a second 51.
 /// Eden's `ResultPermissionDenied{ErrorModule::VI, 5}` (`vi_results.h`).
@@ -416,6 +431,17 @@ pub const VI_NOT_FOUND: ResultCode = vi(7);
 /// `ReturnOne` 1 ("TIPC 1 -> u32 < 0x400"). Neither cites the system module for the value; 1
 /// contains 0 as an inclusive upper index (PR: "The SDK converts this inclusive upper group
 /// index into 32 client slots") and is the one a title ran on, so decision 8 takes it.
+///
+/// **Coupled with 201's bound, and an owner question.** Read as PR's comment reads it, 1 is an
+/// inclusive upper word index, so the SDK may hand clients bits from 0 to 63
+/// (`(NOTIFICATION_LIMIT + 1) * 32`). 201 and a restore still take only bits below
+/// [`CLIENT_NOTIFICATIONS`] (32, PR's `first < 32 && second < 32`, which matches PR's answer of
+/// 0), and the saved session refuses a bit raised past word 0. Answering 1 with 201 bounded at
+/// 32 is a combination neither reference has: a client given a bit from 32 to 63 is refused with
+/// `InvalidCombination` (`a_client_bit_in_the_second_word_the_limit_names_is_refused`). Whether
+/// to answer 0, or to widen 201, the client masks and the saved check to
+/// `(NOTIFICATION_LIMIT + 1) * 32`, is left to the owner with the 1 and 3 conflict (module docs,
+/// "Where this differs").
 pub const NOTIFICATION_LIMIT: u32 = 1;
 /// What 3 answers: the same **conflict** as [`NOTIFICATION_LIMIT`] (NX2 "TIPC 3 -> u32 < 8").
 pub const SESSION_LIMIT: u32 = 1;
@@ -1521,7 +1547,8 @@ impl Vi2Session {
         reply.ok()
     }
 
-    /// `SetClientOutputLevels` (352). in: `u64` client, three `f32`.
+    /// `SetClientOutputLevels` (352). in: `u64` client, three `f32`. Levels it refuses answer
+    /// [`VI_OUT_OF_RANGE`] (module docs, "Commands": a **conflict**).
     fn set_client_output_levels(
         &mut self,
         _cx: &mut Context<'_>,
@@ -1537,7 +1564,7 @@ impl Vi2Session {
         ];
         let client = self.known_client(token)?;
         if !levels_are_valid(bits.map(f32::from_bits)) {
-            return Err(KernelError::InvalidCombination.into());
+            return Err(VI_OUT_OF_RANGE.into());
         }
         client.levels = Some(bits);
         reply.ok()

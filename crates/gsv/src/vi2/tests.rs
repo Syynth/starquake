@@ -636,6 +636,140 @@ fn a_short_request_is_refused_and_a_longer_one_is_read() {
     );
 }
 
+/// Every command that reads data words, sent one word short of what it reads (the last word
+/// trimmed and the header's count lowered), is refused with `INVALID_CMIF_REQUEST` and changes
+/// nothing; the same request whole is read (any answer but that one). The rig has the display
+/// open, a client bound and group 0's event made, so most whole requests succeed. 13's word is
+/// otherwise ignored, so this is the only check that tells a malformed 13 from a valid one.
+#[test]
+fn a_request_one_word_short_is_refused_for_every_data_reading_command() {
+    const TOKEN: u64 = 0xA7;
+    let mut cases = vec![
+        (GET_NOTIFICATION_EVENT, get_notification_event(0)),
+        (RELEASE_NOTIFICATION_EVENT, release_notification_event(0)),
+        (CREATE_REQUEST_GROUP_EVENT, create_group(1)),
+        (CONFIGURE_REQUEST_GROUPS, configure_groups(1)),
+        (
+            OPEN_DISPLAY,
+            open_display(DEFAULT_DISPLAY, OPEN_DISPLAY_FLAGS),
+        ),
+        (CLOSE_DISPLAY, close_display(DEFAULT_DISPLAY)),
+        (GET_HDR_STATUS, named(0x78, DEFAULT_DISPLAY)),
+        (GET_DISPLAY_STATE_105, named(0x79, DEFAULT_DISPLAY)),
+        (GET_BUFFER_MAX_RESOLUTION, named(0x7A, DEFAULT_DISPLAY)),
+        (GET_DISPLAY_STATE_107, named(0x7B, DEFAULT_DISPLAY)),
+        (
+            OPEN_ENDPOINT,
+            open_endpoint(DEFAULT_DISPLAY, DEFAULT_DISPLAY, TOKEN),
+        ),
+        (
+            CLOSE_ENDPOINT,
+            close_endpoint(DEFAULT_DISPLAY, DEFAULT_DISPLAY),
+        ),
+        (REGISTER_CLIENT_STATE, register_client(TOKEN + 1, 5, 6)),
+        (UNREGISTER_CLIENT_STATE, client_only(0xDA, TOKEN)),
+        (GET_CLIENT_AVAILABILITY, client_only(0xE4, TOKEN)),
+        (BIND_CLIENT_DISPLAY, bind(TOKEN, DEFAULT_DISPLAY)),
+        (UNBIND_CLIENT_DISPLAY, client_only(0x10C, TOKEN)),
+        (
+            SET_DISPLAY_PARAMETER_301,
+            parameter_301(DEFAULT_DISPLAY, 0, DISPLAY_FLAG_63),
+        ),
+        (
+            SET_CLIENT_OUTPUT_ENCODING,
+            output_encoding(TOKEN, OUTPUT_ENCODING),
+        ),
+        (
+            SET_CLIENT_OUTPUT_LEVELS,
+            output_levels(TOKEN, [0.0, 1.0, 0.8]),
+        ),
+        (GET_DISPLAY_STATE_354, named(0x172, DEFAULT_DISPLAY)),
+    ];
+    cases.extend(
+        MONITORS
+            .into_iter()
+            .map(|command| (command, monitor(command, DEFAULT_DISPLAY, 0))),
+    );
+    let prepared = || {
+        let mut rig = Rig::new();
+        rig.bound_client(TOKEN, 1, 2);
+        rig.group_event(0);
+        rig
+    };
+    for (command, whole) in cases {
+        assert_eq!(whole[0] & 0xFFFF, tipc_type(command), "{command}");
+        let mut short = whole.clone();
+        short.pop();
+        short[1] -= 1;
+        let mut rig = prepared();
+        let before = rig.session_state();
+        let listeners = rig.listeners();
+        assert_eq!(
+            rig.send(&short),
+            result_only(command, INVALID_CMIF_REQUEST),
+            "{command}"
+        );
+        assert_eq!(rig.session_state(), before, "{command}");
+        assert_eq!(rig.listeners(), listeners, "{command}");
+        let mut rig = prepared();
+        assert_ne!(
+            rig.send(&whole),
+            result_only(command, INVALID_CMIF_REQUEST),
+            "{command}"
+        );
+    }
+}
+
+/// The listed **conflict** on 352: levels it refuses answer [`VI_OUT_OF_RANGE`], the VI result
+/// PR's comment reads from the system module, not PR's code's `InvalidCombination`. The pair at
+/// the first level's upper edge: 1.0 is kept, the next value above it is refused and keeps the
+/// earlier levels.
+#[test]
+fn output_levels_are_refused_with_the_module_s_result() {
+    let mut rig = Rig::new();
+    rig.ok(&register_client(0x93, 0, 1));
+    rig.ok(&output_levels(0x93, [1.0, 0.0, 0.0]));
+    let above = f32::from_bits(1.0_f32.to_bits() + 1);
+    let reply = rig.send(&output_levels(0x93, [above, 0.0, 0.0]));
+    assert_eq!(
+        reply,
+        result_only(SET_CLIENT_OUTPUT_LEVELS, VI_OUT_OF_RANGE)
+    );
+    assert_ne!(
+        reply,
+        refused(SET_CLIENT_OUTPUT_LEVELS, KernelError::InvalidCombination)
+    );
+    assert_eq!(
+        rig.session_state().clients()[0].levels(),
+        Some([1.0, 0.0, 0.0])
+    );
+}
+
+/// The listed coupling of 1's answer with 201's bound (an owner question, [`NOTIFICATION_LIMIT`]):
+/// read as an inclusive upper word index, the limit names bits up to `(limit + 1) * 32`, past
+/// [`CLIENT_NOTIFICATIONS`]; 201 takes the last bit of word 0 and refuses the first of word 1, as
+/// either the retire or the available bit.
+#[test]
+fn a_client_bit_in_the_second_word_the_limit_names_is_refused() {
+    let named_bits = (NOTIFICATION_LIMIT + 1) * u32::BITS;
+    assert!(CLIENT_NOTIFICATIONS < named_bits);
+    assert_eq!(CLIENT_NOTIFICATIONS, u32::BITS);
+    let mut rig = Rig::new();
+    for words in [
+        register_client(0x95, CLIENT_NOTIFICATIONS, 0),
+        register_client(0x95, 0, CLIENT_NOTIFICATIONS),
+    ] {
+        assert_eq!(
+            rig.send(&words),
+            refused(REGISTER_CLIENT_STATE, KernelError::InvalidCombination),
+            "{words:x?}"
+        );
+    }
+    assert_eq!(rig.session_state().clients(), []);
+    rig.ok(&register_client(0x95, CLIENT_NOTIFICATIONS - 1, 0));
+    assert_eq!(rig.session_state().clients().len(), 1);
+}
+
 /// The server is named, serves TIPC only, and leaves 228 and 229 (slice 14) to its policy.
 #[test]
 fn the_server_is_named_and_leaves_present_to_the_policy() {
@@ -1037,9 +1171,10 @@ fn a_full_vsync_clock_refuses_a_new_group() {
     assert_eq!(SlabId::index(next), SlabId::index(made) + 1);
 }
 
-/// With the clock full, a kind-0 registration of a group the clock refused succeeds and leaves
-/// it not listening; once room is made, a later kind-0 registration lets it in. An unregister
-/// that should make a group listen on a full clock succeeds too.
+/// With the clock full, an unregister that should make a group listen succeeds and leaves it not
+/// listening, and so does a kind-0 registration of that group; once room is made, an unregister
+/// of the kind-0 registration (262) lets it in. The path where a 261 (kind 0) is what lets a
+/// group in is `a_kind_zero_registration_puts_an_unticked_group_back_on_the_clock`.
 #[test]
 fn a_full_clock_leaves_a_registered_group_unticked() {
     let mut rig = Rig::new();
@@ -1065,6 +1200,45 @@ fn a_full_clock_leaves_a_registered_group_unticked() {
         0,
     ));
     assert!(rig.listeners().contains(&event));
+}
+
+/// A group left with no registration and not listening (the clock was full at the unregister
+/// that should have put it back) is let in by a 261 (kind 0) once room is made, not by an
+/// unregister: then it is ticked. Every other 261 (kind 0) test uses a group that already
+/// listens from 31, so only this one sees 261's own listen.
+#[test]
+fn a_kind_zero_registration_puts_an_unticked_group_back_on_the_clock() {
+    let mut rig = Rig::new();
+    let event = rig.group_event(0);
+    rig.ok(&monitor(REGISTER_HDR_STATUS_MONITOR, DEFAULT_DISPLAY, 0));
+    assert!(!rig.listeners().contains(&event));
+    let fillers: Vec<ObjectId> = (0..MAX_LISTENERS)
+        .map(|index| ObjectId::from_parts(u32::try_from(0x1000 + index).unwrap(), 9))
+        .collect();
+    for filler in &fillers {
+        rig.shared
+            .lock()
+            .listen_vsync(*filler, HostNanos(0))
+            .unwrap();
+    }
+    rig.ok(&monitor(UNREGISTER_HDR_STATUS_MONITOR, DEFAULT_DISPLAY, 0));
+    assert_eq!(rig.session_state().groups()[0].monitor(), None);
+    assert!(!rig.listeners().contains(&event));
+    rig.shared.lock().unlisten_vsync(fillers[0]);
+    // An unregister that does not match changes nothing: the group stays out.
+    rig.ok(&monitor(
+        UNREGISTER_DISPLAY_EVENT_MONITOR,
+        DEFAULT_DISPLAY,
+        0,
+    ));
+    assert!(!rig.listeners().contains(&event));
+    let signals = rig.signals(event);
+    rig.ok(&monitor(REGISTER_DISPLAY_EVENT_MONITOR, DEFAULT_DISPLAY, 0));
+    assert!(rig.listeners().contains(&event));
+    assert_eq!(rig.signals(event), signals);
+    let deadline = rig.shared.vsync_deadline().unwrap();
+    rig.tick(deadline.0);
+    assert_eq!(rig.signals(event), signals + 1);
 }
 
 // ----- The display ------------------------------------------------------------------------------
@@ -1550,7 +1724,7 @@ fn output_encoding_and_levels_follow_prs_ranges() {
     ] {
         assert_eq!(
             rig.send(&output_levels(0x91, levels)),
-            refused(SET_CLIENT_OUTPUT_LEVELS, KernelError::InvalidCombination),
+            result_only(SET_CLIENT_OUTPUT_LEVELS, VI_OUT_OF_RANGE),
             "{levels:?}"
         );
     }

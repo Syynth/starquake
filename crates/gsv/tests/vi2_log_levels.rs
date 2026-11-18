@@ -2,8 +2,11 @@
 //! "Commands"): the vsync fallback at info, when a group's event starts listening with no
 //! registration (31) and when an unregister leaves it with none; a kind-0 or other registration
 //! at nothing above debug; a vsync clock with no room at error; the display state commands
-//! 104 to 107 and 354, which a title calls about 75 times a second (row 119), at trace only; and
-//! the root's 305 with flags PR refuses at warning, with PR's flags at nothing above info.
+//! 104 to 107 and 354, which a title calls about 75 times a second (row 119), at trace only;
+//! 201's refusal of a bit at or past `CLIENT_NOTIFICATIONS` and 351's of an encoding at warning,
+//! each before the framework's own warning (a 201 or 351 refused for another reason logs only
+//! the framework's); and the root's 305 with flags PR refuses at warning, with PR's flags at
+//! nothing above info.
 //!
 //! # Why this file holds exactly one test
 //!
@@ -24,9 +27,12 @@ use starquake_gsv::shared::vsync::MAX_LISTENERS;
 use starquake_gsv::vi2::command::{
     CREATE_REQUEST_GROUP_EVENT, GET_BUFFER_MAX_RESOLUTION, GET_DISPLAY_STATE_105,
     GET_DISPLAY_STATE_107, GET_DISPLAY_STATE_354, GET_HDR_STATUS, OPEN_DISPLAY,
-    REGISTER_DISPLAY_EVENT_MONITOR, REGISTER_HDR_STATUS_MONITOR, UNREGISTER_HDR_STATUS_MONITOR,
+    REGISTER_CLIENT_STATE, REGISTER_DISPLAY_EVENT_MONITOR, REGISTER_HDR_STATUS_MONITOR,
+    SET_CLIENT_OUTPUT_ENCODING, UNREGISTER_HDR_STATUS_MONITOR,
 };
-use starquake_gsv::vi2::{DEFAULT_DISPLAY, OPEN_DISPLAY_FLAGS, vi2_server};
+use starquake_gsv::vi2::{
+    CLIENT_NOTIFICATIONS, DEFAULT_DISPLAY, OPEN_DISPLAY_FLAGS, OUTPUT_ENCODING, vi2_server,
+};
 use starquake_ipc::{BUFFER_SIZE, TIPC_COMMAND_OFFSET};
 use starquake_kernel::id::ObjectId;
 use starquake_kernel::slab::SlabId;
@@ -218,7 +224,32 @@ fn vi2_logs_the_fallback_at_info_and_the_display_state_not_at_all() {
             }
         }
 
-        // A full clock: 31 and a kind-0 registration it refuses each log one error.
+        // 201: a bit at or past CLIENT_NOTIFICATIONS logs its own warning before the
+        // framework's; a zero token with good bits, only the framework's.
+        let register = |token: u64, retire: u32| {
+            let [lo, hi] = halves(token);
+            vec![tipc_type(REGISTER_CLIENT_STATE), 4, lo, hi, retire, 0]
+        };
+        assert_ne!(rig.send(&register(0, 1)), 0);
+        assert_eq!(levels.take_from(Level::WARN), [Level::WARN]);
+        assert_ne!(rig.send(&register(9, CLIENT_NOTIFICATIONS)), 0);
+        assert_eq!(levels.take_from(Level::WARN), [Level::WARN, Level::WARN]);
+        // 351: an encoding other than OUTPUT_ENCODING logs its own warning before the
+        // framework's; a client not registered, only the framework's.
+        assert_eq!(rig.send(&register(9, 1)), 0);
+        levels.take();
+        let encode = |token: u64, encoding: u64| {
+            let [lo, hi] = halves(token);
+            let [elo, ehi] = halves(encoding);
+            vec![tipc_type(SET_CLIENT_OUTPUT_ENCODING), 4, lo, hi, elo, ehi]
+        };
+        assert_ne!(rig.send(&encode(10, OUTPUT_ENCODING)), 0);
+        assert_eq!(levels.take_from(Level::WARN), [Level::WARN]);
+        assert_ne!(rig.send(&encode(9, OUTPUT_ENCODING + 1)), 0);
+        assert_eq!(levels.take_from(Level::WARN), [Level::WARN, Level::WARN]);
+
+        // A full clock: 31, and an unregister (266) that would put a group back on it, each log
+        // one error.
         assert_eq!(rig.send(&[tipc_type(CREATE_REQUEST_GROUP_EVENT), 1, 2]), 0);
         assert_eq!(rig.send(&monitor(REGISTER_HDR_STATUS_MONITOR, 2)), 0);
         let listening = shared.lock().vsync().listeners().count();

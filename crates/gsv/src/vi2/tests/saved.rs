@@ -440,14 +440,28 @@ fn a_restored_session_carries_on() {
     rig.ok(&close_display(DEFAULT_DISPLAY));
 }
 
-/// A server snapshot holding an unreachable session is refused as a whole.
+/// A server snapshot holding an unreachable session (an endpoint naming no registered client)
+/// is refused as a whole, with the framework's error for a session state that does not decode.
+/// `postcard` carries no custom message ([`postcard::Error::SerdeDeCustom`]), so the cause is
+/// pinned on the same session read back alone: [`Vi2SessionError::EndpointWithoutClient`].
 #[test]
 fn a_server_snapshot_with_an_unreachable_session_is_refused() {
+    let unreachable = with(|s| s.endpoint = Some(0x0C));
+    assert_eq!(
+        read_back(&unreachable),
+        Err(Vi2SessionError::EndpointWithoutClient)
+    );
     let mut rig = Rig::new();
-    rig.replace(with(|s| s.endpoint = Some(0x0C)));
+    rig.replace(unreachable);
     let saved = rig.server.save().unwrap();
     let mut fresh = server_over(&fresh_shared(), UnknownPolicy::Strict);
-    assert!(fresh.restore(&saved).is_err());
+    assert_eq!(
+        fresh.restore(&saved),
+        Err(SnapshotError::State {
+            interface: Vi2Session::interface().to_owned(),
+            error: postcard::Error::SerdeDeCustom,
+        })
+    );
     assert_eq!(fresh.session_count(), 0);
 }
 
