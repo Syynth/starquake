@@ -28,67 +28,78 @@ const UNKNOWN: &str = "lm";
 /// The command it sends the service.
 const COMMAND: u32 = 5;
 
-/// `request` as the bytes of a message buffer.
-fn message(request: &RequestBuilder) -> Vec<u8> {
-    let mut buffer = vec![0; BUFFER_SIZE];
-    request.build(&mut buffer).unwrap();
-    buffer
-}
+/// Helpers, in a `cfg(test)` module so they may unwrap like the test does.
+#[cfg(test)]
+mod support {
+    use super::*;
 
-/// The 32-bit word of a reply that holds the one handle it moves, found in a reply built the
-/// way the services build them.
-fn moved_handle_word() -> u32 {
-    const MARKER: u32 = 0x5EA1_ED00;
-    let mut reply = vec![0; BUFFER_SIZE];
-    ReplyBuilder::cmif(0)
-        .move_handle(MARKER)
-        .build(&mut reply)
-        .unwrap();
-    let word = reply
-        .chunks_exact(4)
-        .position(|word| word == MARKER.to_le_bytes())
-        .unwrap();
-    u32::try_from(word).unwrap()
-}
+    /// `request` as the bytes of a message buffer.
+    fn message(request: &RequestBuilder) -> Vec<u8> {
+        let mut buffer = vec![0; BUFFER_SIZE];
+        request.build(&mut buffer).unwrap();
+        buffer
+    }
 
-/// The guest: `sm:`'s `Initialize`, `GetService(UNKNOWN)`, [`COMMAND`] on the session it gave,
-/// then a crash.
-fn guest() -> Vec<u8> {
-    let libnx = |id| RequestBuilder::cmif(CommandType::Request, id).layout(RequestLayout::Libnx);
-    let initialize = message(
-        &libnx(sm::command::INITIALIZE)
-            .send_pid(0)
-            .data(&0_u64.to_le_bytes()),
-    );
-    let name = ServiceName::new(UNKNOWN).unwrap().to_field();
-    let get_service = message(&libnx(sm::command::GET_SERVICE).data(&name));
-    let command = message(&libnx(COMMAND).data(&[0xEE; 8]));
-    let port = format!("{}\0", sm::PORT_NAME);
-    programs::requests(
-        port.as_bytes(),
-        &[
-            Step {
-                message: &initialize,
-                on: SendOn::Port,
-            },
-            Step {
-                message: &get_service,
-                on: SendOn::Port,
-            },
-            Step {
-                message: &command,
-                on: SendOn::Reply {
-                    word: moved_handle_word(),
+    /// The 32-bit word of a reply that holds the one handle it moves, found in a reply built the
+    /// way the services build them.
+    fn moved_handle_word() -> u32 {
+        const MARKER: u32 = 0x5EA1_ED00;
+        let mut reply = vec![0; BUFFER_SIZE];
+        ReplyBuilder::cmif(0)
+            .move_handle(MARKER)
+            .build(&mut reply)
+            .unwrap();
+        let word = reply
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .position(|word| *word == MARKER.to_le_bytes())
+            .unwrap();
+        u32::try_from(word).unwrap()
+    }
+
+    /// The guest: `sm:`'s `Initialize`, `GetService(UNKNOWN)`, [`COMMAND`] on the session it gave,
+    /// then a crash.
+    pub(crate) fn guest() -> Vec<u8> {
+        let libnx =
+            |id| RequestBuilder::cmif(CommandType::Request, id).layout(RequestLayout::Libnx);
+        let initialize = message(
+            &libnx(sm::command::INITIALIZE)
+                .send_pid(0)
+                .data(&0_u64.to_le_bytes()),
+        );
+        let name = ServiceName::new(UNKNOWN).unwrap().to_field();
+        let get_service = message(&libnx(sm::command::GET_SERVICE).data(&name));
+        let command = message(&libnx(COMMAND).data(&[0xEE; 8]));
+        let port = format!("{}\0", sm::PORT_NAME);
+        programs::requests(
+            port.as_bytes(),
+            &[
+                Step {
+                    message: &initialize,
+                    on: SendOn::Port,
                 },
-            },
-        ],
-    )
-    .unwrap()
+                Step {
+                    message: &get_service,
+                    on: SendOn::Port,
+                },
+                Step {
+                    message: &command,
+                    on: SendOn::Reply {
+                        word: moved_handle_word(),
+                    },
+                },
+            ],
+        )
+        .unwrap()
+    }
+
+    pub(crate) fn text(folder: &Path, name: &str) -> String {
+        std::fs::read_to_string(folder.join(name)).unwrap()
+    }
 }
 
-fn text(folder: &Path, name: &str) -> String {
-    std::fs::read_to_string(folder.join(name)).unwrap()
-}
+use support::{guest, text};
 
 #[test]
 fn the_log_the_summary_and_the_crash_report_name_an_unknown_service_and_its_command() {
@@ -136,8 +147,7 @@ fn the_log_the_summary_and_the_crash_report_name_an_unknown_service_and_its_comm
     );
 
     // The summary.
-    let summary: serde_json::Value =
-        serde_json::from_str(&text(&artifacts, SUMMARY_FILE)).unwrap();
+    let summary: serde_json::Value = serde_json::from_str(&text(&artifacts, SUMMARY_FILE)).unwrap();
     assert_eq!(summary["unknown_services"], serde_json::json!([UNKNOWN]));
     assert_eq!(
         summary["stubbed_commands"],

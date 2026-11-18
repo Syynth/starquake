@@ -1010,8 +1010,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_json_layout_is_pinned() {
+    /// A report with every part [`the_json_layout_is_pinned`] pins.
+    fn pinned_report() -> CrashReport {
         let mut report = report(Exception::DataAbort {
             address: 0x80f0_0010,
             write: true,
@@ -1039,6 +1039,12 @@ mod tests {
         }]);
         report.emulator = "starquake 9.9.9".into();
         report.registers.x.truncate(2);
+        report
+    }
+
+    #[test]
+    fn the_json_layout_is_pinned() {
+        let report = pinned_report();
         let json = serde_json::to_string_pretty(&report).unwrap();
         assert_eq!(
             json,

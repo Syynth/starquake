@@ -228,3 +228,18 @@ fn a_crash_after_it_names_the_last_auto_stubbed_command_and_its_service() {
     assert_eq!(json["last_stubbed"][0]["interface"], UNKNOWN);
     assert_eq!(json["last_stubbed"][0]["command"], COMMAND);
 }
+
+#[test]
+fn the_requests_programs_calls_and_buffer_are_the_kernels() {
+    // The testkit restates them from the reference; this is the cross-check.
+    for (restated, id) in [
+        (
+            programs::SVC_CONNECT_TO_NAMED_PORT,
+            SvcId::ConnectToNamedPort,
+        ),
+        (programs::SVC_SEND_SYNC_REQUEST, SvcId::SendSyncRequest),
+    ] {
+        assert_eq!(restated, u32::from(id.number()), "{}", id.name());
+    }
+    assert_eq!(programs::MESSAGE_LIMIT, starquake_ipc::BUFFER_SIZE);
+}

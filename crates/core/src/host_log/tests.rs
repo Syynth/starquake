@@ -105,7 +105,7 @@ fn lines_are_kept_while_they_fit_and_none_after_the_first_that_does_not() {
         tracing::warn!("");
         tracing::error!("y");
     });
-    assert_eq!(lines, [line.clone()]);
+    assert_eq!(lines, std::slice::from_ref(&line));
     assert_eq!(dropped, 3);
 
     // What was taken is gone, and the limit counts from the take.

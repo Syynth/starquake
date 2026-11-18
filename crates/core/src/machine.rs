@@ -760,22 +760,19 @@ pub(crate) fn run_serving<V: Vcpu, C: HostClock + Clone + 'static>(
         stubbed: tally.stubbed,
         patched_counter_reads: placed.counter_reads.clone(),
         memory_map: mappings,
-        threads: threads
-            .into_iter()
-            .map(|thread| {
-                ThreadPc::new(
-                    thread.id,
-                    thread.state,
-                    thread.core,
-                    thread.pc,
-                    &placed.modules,
-                )
-            })
-            .collect(),
+        threads: thread_pcs(threads, &placed.modules),
         services,
         host_log: Vec::new(),
         host_log_dropped: 0,
     }
+}
+
+/// The threads of a timed-out run as its report says them: each placed in `modules`.
+fn thread_pcs(threads: Vec<StoppedThread>, modules: &[crate::crash::Module]) -> Vec<ThreadPc> {
+    threads
+        .into_iter()
+        .map(|thread| ThreadPc::new(thread.id, thread.state, thread.core, thread.pc, modules))
+        .collect()
 }
 
 /// Settles what `events.bin` holds when the flight recorder could or could not be written out,

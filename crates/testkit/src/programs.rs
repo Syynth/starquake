@@ -3,9 +3,9 @@
 //! Each program is a handful of instructions that does one observable thing and then exits,
 //! crashes or loops, so a test (or a person reading a trace) can tell whether the emulator ran it
 //! correctly. They are written against Horizon's system-call ABI as a real program would be, and
-//! know nothing about the emulator: the two system-call numbers are restated here from the
-//! reference ([`SVC_EXIT_PROCESS`], [`SVC_OUTPUT_DEBUG_STRING`]), because this crate depends on
-//! none of the workspace's crates. Tests that run these programs cross-check the numbers against
+//! know nothing about the emulator: the system-call numbers they make are restated here from the
+//! reference ([`SVC_EXIT_PROCESS`], [`SVC_OUTPUT_DEBUG_STRING`] and the others), because this
+//! crate depends on none of the workspace's crates. Tests that run these programs cross-check the numbers against
 //! the kernel's table.
 //!
 //! Every program is position-independent: it finds its own data with `adr`, so it runs wherever
