@@ -978,6 +978,51 @@ fn exiting_the_process_unlocks_lent_pages_before_it_gives_back_shared_ones() {
 }
 
 #[test]
+fn exiting_the_process_releases_device_locks_and_keeps_the_unlock_and_give_back_order() {
+    // A lent page, a shared memory to give back, and two device-share locks on the page the
+    // port name was written to (`dispatch/device.rs`, "When the process ends"): the releases
+    // make no translation call, so the calls are still the unlock, then the give-back.
+    let world = World::new();
+    let (_, _, pages) = shared_then_lent(&world);
+    let (_, _, state, permission, _) = world.block(NAMES);
+    for _ in 0..2 {
+        world.dispatcher.lock_device_share(NAMES, PAGE_SIZE).unwrap();
+    }
+    assert_eq!(world.block(NAMES).4, MemoryAttribute::DEVICE_SHARED);
+    drop(world.log.take());
+    let mut exit = GuestRegs::default();
+    assert_eq!(
+        world.call(SvcId::ExitProcess, &mut exit).outcome,
+        Outcome::ProcessExited
+    );
+    assert_eq!(
+        world.log.take(),
+        [
+            MapperCall::Protect {
+                address: DATA,
+                size: PAGE_SIZE,
+                perms: Perms::ReadWrite,
+            },
+            MapperCall::ReleaseShared {
+                backing: pages.backing()
+            },
+        ]
+    );
+    assert_eq!(pending(&world), (false, false));
+    // The page is as it was before the locks: its block (merged with the unlocked page, now
+    // that neither is locked) has no attribute.
+    let (_, _, after_state, after_permission, attribute) = world.block(NAMES);
+    assert_eq!(
+        (after_state, after_permission, attribute),
+        (state, permission, MemoryAttribute::NONE)
+    );
+    let locks = world
+        .dispatcher
+        .with::<(&AddressSpace,), _>(|(space,)| space.device_share_locks().count());
+    assert_eq!(locks, 0);
+}
+
+#[test]
 fn a_refused_unlock_still_gives_back_shared_memory_under_the_same_lock() {
     let world = World::new();
     let (shared, lent, pages) = shared_then_lent(&world);

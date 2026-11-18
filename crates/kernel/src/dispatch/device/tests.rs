@@ -155,7 +155,8 @@ fn an_unlock_after_the_process_ended_is_refused_and_changes_nothing() {
         Err(DeviceShareError::ProcessEnded)
     );
     assert_eq!(blocks(&dispatcher), before);
-    assert_eq!(device_count(&dispatcher, DATA), 1);
+    // Ending the process released the lock: the late unlock had nothing left to release.
+    assert_eq!(device_count(&dispatcher, DATA), 0);
 }
 
 #[test]
@@ -214,7 +215,7 @@ fn the_process_is_checked_before_the_range() {
         dispatcher.unlock_device_share(forged),
         Err(DeviceShareError::WrongProcess)
     );
-    assert_eq!(device_count(&dispatcher, token.address()), 1);
+    assert_eq!(device_count(&dispatcher, token.address()), 0);
 }
 
 #[test]
@@ -333,4 +334,66 @@ fn a_server_sees_a_refused_token_as_invalid_current_memory() {
         DeviceShareError::Refused(KernelError::OutOfResource.into()).into_svc_error(),
         SvcError::Kernel(KernelError::OutOfResource)
     );
+}
+
+/// Every exact range the address space holds a live lock on, with its count.
+fn all_locks(dispatcher: &Dispatcher) -> Vec<(u64, u64, u32)> {
+    dispatcher.with::<(&AddressSpace,), _>(|(space,)| space.device_share_locks().collect())
+}
+
+#[test]
+fn ending_the_process_releases_every_lock_once_and_a_late_unlock_is_refused() {
+    // Two nested locks on two pages, and one on the neighbour that starts exactly at their end
+    // (module docs, "When the process ends").
+    let (dispatcher, own) = world();
+    let before = blocks(&dispatcher);
+    let first = dispatcher.lock_device_share(DATA, 2 * PAGE_SIZE).unwrap();
+    let second = dispatcher.lock_device_share(DATA, 2 * PAGE_SIZE).unwrap();
+    let neighbour = dispatcher
+        .lock_device_share(DATA + 2 * PAGE_SIZE, PAGE_SIZE)
+        .unwrap();
+    assert_eq!(
+        all_locks(&dispatcher),
+        [(DATA, 2 * PAGE_SIZE, 2), (DATA + 2 * PAGE_SIZE, PAGE_SIZE, 1)]
+    );
+    assert_eq!(device_count(&dispatcher, DATA), 2);
+    end(&dispatcher, own);
+    // Every lock went the way an unlock takes: the blocks are as they were before any lock.
+    assert_eq!(all_locks(&dispatcher), []);
+    assert_eq!(blocks(&dispatcher), before);
+    // A release that comes later (queued before the end, drained after it) is refused for the
+    // process, before its range is looked at, and releases nothing a second time.
+    for token in [first, second, neighbour] {
+        assert_eq!(
+            dispatcher.unlock_device_share(token),
+            Err(DeviceShareError::ProcessEnded)
+        );
+    }
+    assert_eq!(blocks(&dispatcher), before);
+}
+
+#[test]
+fn a_live_process_keeps_its_locks_across_calls() {
+    // The release looks at every lock drop while a lock is held; a live process's stay.
+    let (dispatcher, own, token) = locked();
+    let held = blocks(&dispatcher);
+    for _ in 0..2 {
+        dispatcher.with::<(&mut AddressSpace, &mut Scheduler), _>(|_| ());
+    }
+    assert_eq!(all_locks(&dispatcher), [(DATA, 2 * PAGE_SIZE, 1)]);
+    assert_eq!(blocks(&dispatcher), held);
+    assert_eq!(
+        dispatcher.reclaim_device_share(own, DATA, 2 * PAGE_SIZE, 0),
+        Ok(token)
+    );
+    assert_eq!(dispatcher.unlock_device_share(token), Ok(()));
+}
+
+#[test]
+fn ending_a_process_with_no_lock_changes_no_block() {
+    let (dispatcher, own) = world();
+    let before = blocks(&dispatcher);
+    end(&dispatcher, own);
+    assert_eq!(all_locks(&dispatcher), []);
+    assert_eq!(blocks(&dispatcher), before);
 }
