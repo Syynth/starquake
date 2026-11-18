@@ -469,6 +469,17 @@ Landed: #226's two missing tests (PR #317): host-I/O payload bytes count toward 
 |---|---|---|---|
 | proposed | **Whole-run replay across several cores:** calls from different cores and the timer thread reach the `Env` in host-timing order, and the timer thread reads an unrecorded copy of the clock, so a whole-run replay is not deterministic. Needs recorded ordering (observability rule 3) or the deterministic interpreter backend (#47). Later milestone | #226 | observability |
 
+### From closing milestone 2 (2026-11-18)
+
+#33 closed as delivered by PR #127 (decision log, 2026-11-18); its leftovers wait here until a title needs them. #33's folder argument for `starquake run` is not listed: `run` now loads a NUP title's ExeFS.
+
+| Status | Proposal | Why | Suggested |
+|---|---|---|---|
+| proposed | **Dynamic NRO loads through an `ldr:ro` service**: mapping and patching on the dynamic-load path. `CodeSet::parse_nro` and core's placement are what the service would call | #33 | area:loader |
+| proposed | **Trampoline reach for large module sets**: every module's trampolines sit in one run below the first module, so a counter read more than 128 MiB above it is refused (`BranchOutOfRange`). Lifting it means placing trampolines between modules, off Eden's addresses, and checking the guess that `rtld` walks the address space upwards for code | #33 | area:loader |
+| proposed | **The NPDM system-call mask check-and-log** (kernel spec, "System calls"): check whether process creation applies it; when #33 closed only the ACI0-against-ACID check was called, and it warned without refusing | #33 | area:kernel |
+| proposed | **`RemoteMemorySize` (META 0x10)** is parsed and exposed raw, and nothing uses it; no source yet says what it sizes | #33 | area:loader |
+
 ## House-rule candidates
 
 Rules distilled from review findings. A vetted rule moves into `CLAUDE.md`; until then it is
