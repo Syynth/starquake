@@ -1607,7 +1607,7 @@ fn closed_sessions_keep_their_groups_listening() {
             rig.group_event(group);
         }
         if session == 0 {
-            // One group of the first session monitors kind 1: it stops listening.
+            // One group of the first session monitors the HDR status, kind 2: it stops listening.
             rig.ok(&monitor(REGISTER_HDR_STATUS_MONITOR, DEFAULT_DISPLAY, 0));
             let state = rig.session_state();
             let listening: Vec<bool> = state.groups().iter().map(RequestGroup::listens).collect();
@@ -1615,7 +1615,7 @@ fn closed_sessions_keep_their_groups_listening() {
             expected[0] = false;
             assert_eq!(listening, expected);
             let monitor = state.groups()[0].monitor().unwrap();
-            assert_eq!((monitor.display(), monitor.kind()), (DEFAULT_DISPLAY, 1));
+            assert_eq!((monitor.display(), monitor.kind()), (DEFAULT_DISPLAY, 2));
         }
         rig.server.close(rig.session).unwrap();
     }
