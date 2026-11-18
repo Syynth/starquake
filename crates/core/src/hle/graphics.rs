@@ -107,8 +107,10 @@
 //! know that the timer thread's turn signals gsv's events, so the core loop asks
 //! [`Graphics::is_idle`] first: a run is stalled only if the graphics server is idle too
 //! (nothing queued, nothing held by the shared page, no page signal waiting, no vsync tick to
-//! come: in a run the clock stopped, in a replay no tick fed back) and then the kernel says so. With [`NullFront`] nothing is in flight on a GPU, so that is everything the
-//! turn could still signal; a GPU front with work in flight must add that (a follow-up for
+//! come: in a run the clock stopped, whatever a restored snapshot left fed back, which a live
+//! turn never delivers; in a replay no tick fed back) and then the kernel says so. With
+//! [`NullFront`] nothing is in flight on a GPU, so that is everything the turn could still
+//! signal; a GPU front with work in flight must add that (a follow-up for
 //! issue 12's front).
 //!
 //! # Replay
@@ -480,13 +482,19 @@ impl Graphics {
     }
 
     /// [`Graphics::is_idle`] but for a running vsync clock: nothing queued, nothing held or
-    /// signalled at the shared page, and no tick fed back for replay.
+    /// signalled at the shared page, and, in a replay, no tick fed back. In a run a tick fed
+    /// back (only a restored snapshot holds one) is not work: the live turn never delivers it
+    /// (`a_tick_fed_back_in_a_live_run_is_not_work`).
     fn is_idle_but_the_clock(&self) -> bool {
         let locked = self.shared.lock();
         let page = locked.page();
+        let fed_back = match self.mode {
+            FrontMode::Live => false,
+            FrontMode::Replay => locked.vsync().replayed() > 0,
+        };
         let idle = page.held().is_none()
             && !page.is_signalled()
-            && locked.vsync().replayed() == 0
+            && !fed_back
             && self.shared.queue().is_empty();
         drop(locked);
         idle

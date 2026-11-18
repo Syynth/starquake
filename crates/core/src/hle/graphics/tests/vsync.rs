@@ -161,3 +161,31 @@ fn a_vsync_tick_note_is_fed_back_to_the_clock_in_order() {
         (vec![ticked(1)], vec![listener()])
     );
 }
+
+/// A tick fed back is work only in a replay. In a run only a restored snapshot can hold one,
+/// and the live turn never delivers it, so it neither keeps the run busy nor wants a turn
+/// (`starquake_gsv::shared::vsync`, "Not checked here"); the same snapshot restored into a
+/// replay is work, and its turn delivers the tick.
+#[test]
+fn a_tick_fed_back_in_a_live_run_is_not_work() {
+    let source = graphics(FrontMode::Replay);
+    source.replay(Note::VsyncTick { tick: 1 }).unwrap();
+    let bytes = source.shared().save_vsync().unwrap();
+
+    let live = graphics(FrontMode::Live);
+    live.shared().restore_vsync(&bytes).unwrap();
+    assert_eq!(live.shared().lock().vsync().replayed(), 1);
+    assert!(live.is_idle());
+    assert!(!live.wants_turn(HostNanos(u64::MAX)));
+    let late = turn_at(&live, HostNanos(u64::MAX));
+    assert_eq!((late.0, late.1), (vec![], vec![]));
+    assert_eq!(live.shared().lock().vsync().replayed(), 1);
+
+    let replay = graphics(FrontMode::Replay);
+    replay.shared().restore_vsync(&bytes).unwrap();
+    assert!(!replay.is_idle());
+    assert!(replay.wants_turn(HostNanos(0)));
+    let delivered = turn_at(&replay, HostNanos(0));
+    assert_eq!(delivered.0, [ticked(1)]);
+    assert!(replay.is_idle());
+}

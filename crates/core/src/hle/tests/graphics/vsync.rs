@@ -1,6 +1,7 @@
 //! The vsync clock as a run installs the graphics server ([`install_with_graphics`]), behind the
 //! real dispatcher: a listener's event is signalled by the timer thread's turn through the
-//! kernel host, an event the kernel no longer holds is dropped, the turn's deadline is the
+//! kernel host, an event the kernel no longer holds is dropped, a restored listener is signalled
+//! whoever made its event, the turn's deadline is the
 //! earlier of the shared page's and the clock's, and a recorded tick replays to the same signal
 //! and state.
 
@@ -67,6 +68,45 @@ fn a_vsync_listener_is_ticked_through_the_run_s_kernel() {
     assert_eq!(graphics.shared().lock().vsync().listeners().count(), 0);
     assert_eq!(graphics.deadline(), None);
     assert!(graphics.is_idle());
+}
+
+/// A restored listener is signalled on the production host whoever made its event: a guest's
+/// own `CreateEvent` event, named by its writable end or its readable end, is signalled on every
+/// tick (`starquake_gsv::shared::vsync`, "Not checked here"); only an id the kernel does not hold
+/// is refused and dropped.
+#[test]
+fn a_restored_listener_is_signalled_whoever_made_its_event() {
+    let graphics = Graphics::new(FrontMode::Live, None);
+    let rig = rig_with(&graphics);
+    let (by_writable, writable_readable) = guest_event(&rig);
+    let (_, by_readable) = guest_event(&rig);
+    let gone = ObjectId::from_parts(0x0FFF, 9);
+    // The snapshot is written by another graphics server, so nothing here listened first.
+    let source = Graphics::new(FrontMode::Live, None);
+    for listener in [rig.object(by_writable), rig.object(by_readable), gone] {
+        assert_eq!(
+            source.shared().lock().listen_vsync(listener, START),
+            Ok(true)
+        );
+    }
+    let bytes = source.shared().save_vsync().unwrap();
+    graphics.shared().restore_vsync(&bytes).unwrap();
+
+    for n in 1..=2 {
+        assert_eq!(poll(&rig, writable_readable), KernelError::TimedOut.code());
+        assert_eq!(poll(&rig, by_readable), KernelError::TimedOut.code());
+        rig.turn_at(&graphics, HostNanos(START.0 + n * INTERVAL_NS));
+        assert_eq!(poll(&rig, writable_readable), ResultCode::SUCCESS);
+        assert_eq!(poll(&rig, by_readable), ResultCode::SUCCESS);
+        rig.reset(writable_readable);
+        rig.reset(by_readable);
+        // Only the id the kernel does not hold was dropped, at the first tick.
+        let listeners: Vec<ObjectId> = graphics.shared().lock().vsync().listeners().collect();
+        assert_eq!(
+            listeners,
+            [rig.object(by_writable), rig.object(by_readable)]
+        );
+    }
 }
 
 /// The turn's deadline is the shared page's while only it waits, the clock's when it comes

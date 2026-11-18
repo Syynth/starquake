@@ -110,6 +110,7 @@ fn the_interval_and_the_note_code_are_the_references_values() {
     // The note code the note table reserves for `VsyncTick`.
     assert_eq!(VSYNC_TICK, 4);
     assert_eq!(MAX_LISTENERS, 64);
+    assert_eq!(MAX_FED_BACK, 1);
     assert_eq!((SNAPSHOT_MAGIC, SNAPSHOT_VERSION), (*b"SQVS", 1));
 }
 
@@ -447,17 +448,40 @@ fn a_replayed_tick_is_delivered_as_the_live_one_was() {
 }
 
 #[test]
-fn ticks_fed_back_together_are_delivered_in_order() {
+fn a_tick_fed_back_past_the_bound_is_refused() {
     let shared = listening(&[event(1)]);
-    for tick in 1..=3 {
+    let bound = MAX_FED_BACK;
+    // Up to the bound, each next tick is taken.
+    for tick in 1..=bound {
         assert_eq!(shared.replay_vsync(tick), Ok(()));
     }
+    assert_eq!(shared.lock().vsync().replayed(), bound);
+    // One past it is refused, changing nothing; the next number out of order is refused as
+    // that first.
+    let before = shared.lock().vsync().clone();
+    let past = bound + 1;
+    let error = shared.replay_vsync(past).unwrap_err();
+    assert_eq!(error, VsyncReplayError::TooManyFedBack { found: past });
+    assert_eq!(
+        error.to_string(),
+        "vsync tick 2 was fed back while the most ticks a replay turn takes (1) already wait for it"
+    );
+    assert_eq!(*shared.lock().vsync(), before);
+    assert_eq!(
+        shared.replay_vsync(past + 1),
+        Err(VsyncReplayError::OutOfOrder {
+            expected: past,
+            found: past + 1
+        })
+    );
+    // The turn delivers what was fed back, in order, and the refused one is then taken.
     let mut host = Journal::default();
     shared.tick_replayed_vsync(&mut host);
-    let mut expected = tick_of(1, &[event(1)]);
-    expected.extend(tick_of(2, &[event(1)]));
-    expected.extend(tick_of(3, &[event(1)]));
+    let expected: Vec<Call> = (1..=bound)
+        .flat_map(|tick| tick_of(tick, &[event(1)]))
+        .collect();
     assert_eq!(host.calls, expected);
+    assert_eq!(shared.replay_vsync(past), Ok(()));
 }
 
 #[test]
@@ -487,9 +511,10 @@ fn a_tick_fed_back_out_of_order_is_refused_and_changes_nothing() {
             found: 1
         }
     );
-    assert_eq!(shared.replay_vsync(2), Ok(()));
     // A delivered tick counts too.
     let mut host = Journal::default();
+    shared.tick_replayed_vsync(&mut host);
+    assert_eq!(shared.replay_vsync(2), Ok(()));
     shared.tick_replayed_vsync(&mut host);
     let after = shared.replay_vsync(2).unwrap_err();
     assert_eq!(
@@ -545,16 +570,14 @@ fn the_live_and_replay_turns_each_ignore_the_other_s_input() {
 
 #[test]
 fn the_vsync_snapshot_layout_is_pinned() {
-    // Seven ticks delivered, three more fed back, two listeners started at 5.
+    // Seven ticks delivered, one more fed back (the bound), two listeners started at 5.
     let shared = fresh();
     for tick in 1..=7 {
         shared.replay_vsync(tick).unwrap();
+        shared.tick_replayed_vsync(&mut Journal::default());
     }
-    shared.tick_replayed_vsync(&mut Journal::default());
-    for tick in 8..=10 {
-        shared.replay_vsync(tick).unwrap();
-    }
-    let first = ObjectId::from_parts(1, 2);
+    shared.replay_vsync(8).unwrap();
+    let first = ObjectId::from_parts(3, 8);
     let second = ObjectId::from_parts(4, 6);
     shared.lock().listen_vsync(second, HostNanos(5)).unwrap();
     shared.lock().listen_vsync(first, HostNanos(5)).unwrap();
@@ -563,12 +586,12 @@ fn the_vsync_snapshot_layout_is_pinned() {
     let mut expected = vec![b'S', b'Q', b'V', b'S', 0x01];
     expected.push(0x07);
     expected.extend([0x01, 0xAF, 0xA0, 0xF9, 0x07]);
-    expected.push(0x03);
-    expected.extend([0x02, 0x01, 0x02, 0x04, 0x06]);
+    expected.push(0x01);
+    expected.extend([0x02, 0x03, 0x08, 0x04, 0x06]);
     assert_eq!(shared.save_vsync().unwrap(), expected);
     assert_eq!(
         expected,
-        snapshot(7, Some(5 + INTERVAL_NS), 3, &[(1, 2), (4, 6)])
+        snapshot(7, Some(5 + INTERVAL_NS), 1, &[(3, 8), (4, 6)])
     );
 }
 
@@ -737,16 +760,16 @@ fn a_snapshot_s_deadline_needs_a_listener() {
 
 #[test]
 fn a_snapshot_s_ticks_fit_a_u64() {
-    // A sum of exactly `u64::MAX` is taken, one more refused, either way round.
-    for (tick, replayed) in [(u64::MAX - 1, 1), (1, u64::MAX - 1), (u64::MAX, 0)] {
+    // A sum of exactly `u64::MAX` is taken, one more refused (the ticks fed back within their
+    // bound, which is checked first: `a_snapshot_holds_at_most_the_bound_of_ticks_fed_back`).
+    for (tick, replayed) in [(u64::MAX - MAX_FED_BACK, MAX_FED_BACK), (u64::MAX, 0)] {
         fresh()
             .restore_vsync(&snapshot(tick, None, replayed, &[]))
             .unwrap();
     }
-    for (tick, replayed) in [(u64::MAX, 1), (1, u64::MAX), (u64::MAX, u64::MAX)] {
-        let error = refused(&snapshot(tick, None, replayed, &[]));
-        assert_eq!(error, VsyncSnapshotError::TicksOverflow { tick, replayed });
-    }
+    let (tick, replayed) = (u64::MAX - MAX_FED_BACK + 1, MAX_FED_BACK);
+    let error = refused(&snapshot(tick, None, replayed, &[]));
+    assert_eq!(error, VsyncSnapshotError::TicksOverflow { tick, replayed });
     assert_eq!(
         VsyncSnapshotError::TicksOverflow {
             tick: 2,
@@ -756,4 +779,133 @@ fn a_snapshot_s_ticks_fit_a_u64() {
         "the vsync clock snapshot's 2 ticks and 3 ticks fed back add up past the largest tick \
          number"
     );
+}
+
+#[test]
+fn a_snapshot_holds_at_most_the_bound_of_ticks_fed_back() {
+    // At the bound: taken, and the replay turn delivers them.
+    let shared = fresh();
+    shared
+        .restore_vsync(&snapshot(0, Some(FIRST.0), MAX_FED_BACK, &[(1, 5)]))
+        .unwrap();
+    assert_eq!(shared.lock().vsync().replayed(), MAX_FED_BACK);
+    let mut host = Journal::default();
+    shared.tick_replayed_vsync(&mut host);
+    let expected: Vec<Call> = (1..=MAX_FED_BACK)
+        .flat_map(|tick| tick_of(tick, &[event(1)]))
+        .collect();
+    assert_eq!(host.calls, expected);
+    // One past it, and a count that a hostile snapshot could make a turn loop over for ages:
+    // refused, the clock unchanged.
+    for replayed in [MAX_FED_BACK + 1, u64::MAX - 1] {
+        let error = refused(&snapshot(0, Some(FIRST.0), replayed, &[(1, 5)]));
+        assert_eq!(error, VsyncSnapshotError::TooManyFedBack { replayed });
+    }
+    assert_eq!(
+        VsyncSnapshotError::TooManyFedBack { replayed: 2 }.to_string(),
+        "the vsync clock snapshot holds 2 ticks fed back, more than 1"
+    );
+    // Past the bound with a deadline and no listener: the deadline first. Past the bound with an
+    // overflowing sum: the bound first.
+    let error = refused(&snapshot(0, Some(FIRST.0), MAX_FED_BACK + 1, &[]));
+    assert_eq!(error, VsyncSnapshotError::DeadlineWithoutListeners);
+    let replayed = MAX_FED_BACK + 1;
+    let error = refused(&snapshot(u64::MAX, None, replayed, &[]));
+    assert_eq!(error, VsyncSnapshotError::TooManyFedBack { replayed });
+}
+
+#[test]
+fn trailing_bytes_are_refused_before_the_clock_s_relations() {
+    // A duplicate listener and a byte after the body: the trailing byte first.
+    let mut both = snapshot(1, Some(FIRST.0), 0, &[(1, 5), (1, 5)]);
+    assert_eq!(
+        refused(&both),
+        VsyncSnapshotError::ListenersNotAscending { index: 1 }
+    );
+    both.push(0);
+    assert_eq!(
+        refused(&both),
+        VsyncSnapshotError::TrailingBytes { count: 1 }
+    );
+}
+
+#[test]
+fn save_refuses_a_clock_that_breaks_a_relation() {
+    // Each relation broken in the clock itself, which only a bug could do: save refuses with the
+    // error a restore of the same bytes would give, and writes nothing.
+    let shared = fresh();
+    shared.lock().state.vsync.next = Some(FIRST);
+    assert_eq!(
+        shared.save_vsync(),
+        Err(VsyncSnapshotError::DeadlineWithoutListeners)
+    );
+
+    let shared = fresh();
+    shared.lock().state.vsync.replayed = MAX_FED_BACK + 1;
+    assert_eq!(
+        shared.save_vsync(),
+        Err(VsyncSnapshotError::TooManyFedBack {
+            replayed: MAX_FED_BACK + 1
+        })
+    );
+
+    let shared = fresh();
+    {
+        let mut state = shared.lock();
+        state.state.vsync.tick = u64::MAX;
+        state.state.vsync.replayed = MAX_FED_BACK;
+    }
+    assert_eq!(
+        shared.save_vsync(),
+        Err(VsyncSnapshotError::TicksOverflow {
+            tick: u64::MAX,
+            replayed: MAX_FED_BACK
+        })
+    );
+    // The same clock one tick short saves.
+    shared.lock().state.vsync.tick = u64::MAX - MAX_FED_BACK;
+    assert!(shared.save_vsync().is_ok());
+}
+
+#[test]
+fn a_new_listener_restarts_a_clock_stopped_with_listeners() {
+    // A restored clock stopped with a listener (no deadline): no turn ticks it.
+    let shared = fresh();
+    shared
+        .restore_vsync(&snapshot(3, None, 0, &[(1, 5)]))
+        .unwrap();
+    assert_eq!(turn(&shared, u64::MAX), []);
+    // The listener it holds, listened again, changes nothing: still stopped.
+    assert_eq!(shared.lock().listen_vsync(event(1), START), Ok(false));
+    assert_eq!(shared.vsync_deadline(), None);
+    // A new listener starts it one interval out; its first tick refuses the restored one, whose
+    // event the kernel does not hold, and drops it.
+    assert_eq!(shared.lock().listen_vsync(event(2), START), Ok(true));
+    assert_eq!(shared.vsync_deadline(), Some(FIRST));
+    let mut host = Journal {
+        refused: [event(1)].into(),
+        ..Journal::default()
+    };
+    shared.tick_vsync(&mut host, FIRST);
+    assert_eq!(host.calls, tick_of(4, &[event(1), event(2)]));
+    assert_eq!(
+        shared.lock().vsync().listeners().collect::<Vec<_>>(),
+        [event(2)]
+    );
+    assert_eq!(
+        shared.vsync_deadline(),
+        Some(HostNanos(FIRST.0 + INTERVAL_NS))
+    );
+
+    // A clock stopped at the end of its tick count: a new listener starts it, and its next turn
+    // delivers nothing and stops it again.
+    let shared = fresh();
+    shared
+        .restore_vsync(&snapshot(u64::MAX, None, 0, &[(1, 5)]))
+        .unwrap();
+    assert_eq!(shared.lock().listen_vsync(event(2), START), Ok(true));
+    assert_eq!(shared.vsync_deadline(), Some(FIRST));
+    assert_eq!(turn(&shared, FIRST.0), []);
+    assert_eq!(shared.vsync_deadline(), None);
+    assert_eq!(shared.lock().vsync().tick(), u64::MAX);
 }
