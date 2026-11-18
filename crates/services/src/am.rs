@@ -1438,21 +1438,15 @@ impl Applet {
 /// The event the server's applet keeps in `slot`, or a new one the kernel makes, kept there: how
 /// the applet makes each of its events that nothing signals.
 ///
-/// An event already in `slot` is checked first with [`Context::clear_event`], which the kernel
-/// answers `InvalidHandle` for any id that is not an event this server made (the kernel's
-/// `IpcContext::clear_event`), so a restored id that names another object, or nothing, is
-/// refused before a handle to it is copied (module docs, "The applet"). On an event the server
-/// made the clear changes nothing: nothing signals these events, and the guest is given only
-/// their readable end, which it cannot signal.
+/// An event already in `slot` is checked first ([`crate::events::unsignalled_event`]), so a
+/// restored id that names another object, or nothing, is refused before a handle to it is
+/// copied (module docs, "The applet").
 fn unsignalled_event_or_create(
     cx: &mut Context<'_>,
     slot: fn(&mut Applet) -> &mut Option<ObjectId>,
 ) -> Result<ObjectId, Fault> {
-    if let Some(event) = *slot(cx.family::<Applet>()?) {
-        cx.clear_event(event)?;
-        return Ok(event);
-    }
-    let event = cx.create_event()?;
+    let kept = *slot(cx.family::<Applet>()?);
+    let event = crate::events::unsignalled_event(cx, kept)?;
     *slot(cx.family::<Applet>()?) = Some(event);
     Ok(event)
 }

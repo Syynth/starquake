@@ -552,7 +552,12 @@ fn a_sources_blocks_must_be_alike() {
 fn each_part_of_the_destination_check_refuses_on_its_own() {
     let (body, _, stack) = side_by_side();
     let read = MemoryPermission::from_svc(SvcPermission::Read).bits();
-    let uncached = MemoryAttribute::UNCACHED.bits();
+    // `Locked`: the one attribute besides `DeviceShared` that check 4 lets a `Stack` block
+    // hold (it refuses `Uncached`, `GpuAccessible` and `PermissionLocked` there, since `Stack`
+    // has neither `CanChangeAttribute` nor `CanPermissionLock`:
+    // `an_uncached_destination_is_refused_by_the_block_check_first`). Which transfer memory
+    // holds a `Locked` range is #260's to check.
+    let locked = MemoryAttribute::LOCKED.bits();
     let destination = page(stack, 2);
     let cases: Vec<(&str, BodyChange)> = vec![
         (
@@ -560,8 +565,8 @@ fn each_part_of_the_destination_check_refuses_on_its_own() {
             Box::new(move |b| change_block(b, destination, |d| d.permission = read)),
         ),
         (
-            "an uncached destination",
-            Box::new(move |b| change_block(b, destination, |d| d.attribute |= uncached)),
+            "a locked destination",
+            Box::new(move |b| change_block(b, destination, |d| d.attribute |= locked)),
         ),
         (
             "a destination a page past the stack memory",
@@ -581,6 +586,24 @@ fn each_part_of_the_destination_check_refuses_on_its_own() {
         change(&mut case);
         assert_eq!(error_of(&case), alias(1, AliasFault::Destination), "{what}");
     }
+}
+
+#[test]
+fn an_uncached_destination_is_refused_by_the_block_check_first() {
+    // Two faults at once: an uncached `Stack` block fails check 4 (`Stack` has no
+    // `CanChangeAttribute`) before it could fail check 8's destination test.
+    let (mut body, _, stack) = side_by_side();
+    let destination = page(stack, 2);
+    let index = at(&body, destination);
+    let uncached = MemoryAttribute::UNCACHED.bits();
+    change_block(&mut body, destination, |d| d.attribute |= uncached);
+    assert_eq!(
+        error_of(&body),
+        SnapshotError::Block {
+            index,
+            fault: BlockFault::ChangedAttribute
+        }
+    );
 }
 
 #[test]

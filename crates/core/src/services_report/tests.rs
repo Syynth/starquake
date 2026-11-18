@@ -256,7 +256,8 @@ fn the_stubbed_commands_are_in_service_order_whatever_the_kernels_order() {
     let missing = 99;
     assert_eq!(Apm.commands().name(Protocol::Cmif, missing), None);
     let performance = rig.service(apm::NAME);
-    let unknown = "lm";
+    // A made-up name, which no service a later change registers can take.
+    let unknown = "absent";
     let stub = rig.service(unknown);
     for session in [stub, performance] {
         let (code, _) = rig.send(session, &libnx(missing));

@@ -23,8 +23,9 @@ use starquake_ipc::{BUFFER_SIZE, CommandType, ReplyBuilder, RequestBuilder, Requ
 use starquake_services::sm::{self, ServiceName};
 use starquake_testkit::programs::{self, SendOn, Step};
 
-/// The service the guest asks for, which nothing provides.
-const UNKNOWN: &str = "lm";
+/// The service the guest asks for, which nothing provides: a made-up name, so that no service
+/// a later change registers can take it (`lm`, the name used first, is now registered).
+const UNKNOWN: &str = "absent";
 /// The command it sends the service.
 const COMMAND: u32 = 5;
 

@@ -184,6 +184,26 @@ pub(super) const DEVICE_SHARE_LOCK_STATE: u32 =
 /// The state flag [`AddressSpace::unlock_device_share`] tests (`CanDeviceMap`).
 pub(super) const DEVICE_SHARE_UNLOCK_STATE: u32 = flag::CAN_DEVICE_MAP;
 
+/// The attributes [`AddressSpace::set_memory_attribute`] may change, each with the state flag
+/// every block of its range needs when the mask has one of them: `Uncached` and `GpuAccessible`
+/// need `CanChangeAttribute`, `PermissionLocked` needs `CanPermissionLock`
+/// (`KPageTableBase::SetMemoryAttribute`'s `state_test_mask`, in
+/// `eden/src/core/hle/kernel/k_page_table_base.cpp` @ cf654052; `GpuAccessible` joins `Uncached`
+/// in Eden-NX2's and PR #4588's copies of the same function). A restore refuses a block that has
+/// one of them on a state without its flag (`snapshot`, check 4).
+pub(super) const ATTRIBUTE_STATE_FLAGS: [(MemoryAttribute, u32); 2] = [
+    (
+        MemoryAttribute::from_bits(
+            MemoryAttribute::UNCACHED.bits() | MemoryAttribute::GPU_ACCESSIBLE.bits(),
+        ),
+        flag::CAN_CHANGE_ATTRIBUTE,
+    ),
+    (
+        MemoryAttribute::PERMISSION_LOCKED,
+        flag::CAN_PERMISSION_LOCK,
+    ),
+];
+
 /// Free pages kept on each side of a mapping the kernel places for a process
 /// (`KPageTableBase::GetNumGuardPages`, for a page table that is not the kernel's).
 pub const GUARD_PAGES: u64 = 4;
@@ -1007,19 +1027,10 @@ impl AddressSpace {
         let pages = self.pages_of(address, size)?;
         // Verify we can change the memory attribute.
         let test_mask = !(MemoryAttribute::SET_MASK | MemoryAttribute::DEVICE_SHARED);
-        let state_test = [
-            (
-                MemoryAttribute::UNCACHED | MemoryAttribute::GPU_ACCESSIBLE,
-                flag::CAN_CHANGE_ATTRIBUTE,
-            ),
-            (
-                MemoryAttribute::PERMISSION_LOCKED,
-                flag::CAN_PERMISSION_LOCK,
-            ),
-        ]
-        .into_iter()
-        .filter(|(bits, _)| !mask.excludes(*bits))
-        .fold(0, |flags, (_, flag)| flags | flag);
+        let state_test = ATTRIBUTE_STATE_FLAGS
+            .into_iter()
+            .filter(|(bits, _)| !mask.excludes(*bits))
+            .fold(0, |flags, (_, flag)| flags | flag);
         let check = Check {
             state_mask: state_test,
             state: state_test,
