@@ -2,10 +2,10 @@
 //!
 //! Guest code runs at EL0. Every exception it takes lands in this table at EL1, which either
 //! handles it in the guest (a trapped `mrs xN, cntpct_el0`, answered from the virtual counter
-//! rescaled to the guest's rate: "Counter reads" below) or hands it to the host with `hvc #2`. The host then reads `ESR_EL1`, `FAR_EL1` and `ELR_EL1`
-//! directly, so the shim passes nothing in general-purpose registers. Between runs a vCPU is
-//! *parked* on the shim's `eret`: its EL0 state lives in `ELR_EL1`/`SPSR_EL1`, and every run starts
-//! by returning to EL0.
+//! rescaled to the guest's rate: "Counter reads" below) or hands it to the host with `hvc #2`.
+//! The host then reads `ESR_EL1`, `FAR_EL1` and `ELR_EL1` directly, so the shim passes nothing
+//! in general-purpose registers. Between runs a vCPU is *parked* on the shim's `eret`: its EL0
+//! state lives in `ELR_EL1`/`SPSR_EL1`, and every run starts by returning to EL0.
 //!
 //! The shim borrows x9-x11 while it works and saves them in a per-vCPU scratch area just below
 //! `SP_EL1`. If the host interrupts a vCPU part-way through the shim, [`recovery`] says how to

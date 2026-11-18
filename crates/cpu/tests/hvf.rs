@@ -2150,7 +2150,8 @@ fn svc_reaches_the_host_whatever_x0_holds() {
 mod counter_scale {
     use super::*;
 
-    /// `mrs x<rt>, cntpct_el0` (Arm ARM, `MRS`: `op0` 3, `op1` 3, `CRn` 14, `CRm` 0, `op2` 1; `Rt` in bits 4:0).
+    /// `mrs x<rt>, cntpct_el0` (Arm ARM, `MRS`: `op0` 3, `op1` 3, `CRn` 14, `CRm` 0, `op2` 1;
+    /// `Rt` in bits 4:0).
     fn mrs_cntpct(rt: u32) -> u32 {
         0xd53b_e020 | rt
     }
@@ -2406,10 +2407,10 @@ mod counter_scale {
 
     #[test]
     fn interrupts_never_lose_or_repeat_a_rescaled_counter_read() {
-        // Like `interrupts_never_lose_or_repeat_guest_work`, with a scale four times the host's and
-        // a read into a borrowed register: an interrupt inside a counter stub is undone and the read
-        // runs again, so every read is a rescaled count, and the registers the shim borrows keep
-        // the guest's values.
+        // Like `interrupts_never_lose_or_repeat_guest_work`, with a scale four times the host's
+        // and a read into a borrowed register: an interrupt inside a counter stub is undone and
+        // the read runs again, so every read is a rescaled count, and the registers the shim
+        // borrows keep the guest's values.
         let Some(guest) = Guest::new() else { return };
         let host_hz = guest.backend.counter_frequency();
         let (ratio, scale) = ratio_and_scale(host_hz, host_hz * 4);

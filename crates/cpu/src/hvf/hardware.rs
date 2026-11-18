@@ -236,9 +236,9 @@ fn a_guest_store_to_the_shim_or_its_tables_is_stopped_by_stage_2() {
     assert_eq!(bytes, shim);
 }
 
-/// `hv_sys_reg_t` of `CNTFRQ_EL0`: `op0` 3, `op1` 3, `CRn` 14, `CRm` 0, `op2` 0, encoded as `ffi`'s other
-/// system registers are. Not a register the SDK headers name (`hv_vcpu_types.h`); the test
-/// below checks that Hypervisor.framework refuses it.
+/// `hv_sys_reg_t` of `CNTFRQ_EL0`: `op0` 3, `op1` 3, `CRn` 14, `CRm` 0, `op2` 0, encoded as
+/// `ffi`'s other system registers are. Not a register the SDK headers name (`hv_vcpu_types.h`);
+/// the test below checks that Hypervisor.framework refuses it.
 const CNTFRQ_EL0: u16 = (3 << 14) | (3 << 11) | (14 << 7);
 /// `HV_BAD_ARGUMENT` (`hv_error.h`).
 const HV_BAD_ARGUMENT: u32 = 0xfae9_4003;
@@ -314,7 +314,8 @@ const HVC_PLANTED: u16 = 7;
 /// `svc #0`.
 const SVC_0: u32 = 0xd400_0001;
 
-/// `mrs x<rt>, cntpct_el0` (Arm ARM, `MRS`: `op0` 3, `op1` 3, `CRn` 14, `CRm` 0, `op2` 1; `Rt` in bits 4:0).
+/// `mrs x<rt>, cntpct_el0` (Arm ARM, `MRS`: `op0` 3, `op1` 3, `CRn` 14, `CRm` 0, `op2` 1;
+/// `Rt` in bits 4:0).
 fn mrs_cntpct(rt: u32) -> u32 {
     0xd53b_e020 | rt
 }
