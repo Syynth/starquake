@@ -522,15 +522,26 @@ fn the_kernels_mapper_reports_a_shared_memory_refusal_in_words() {
              address space handed out"
         )))
     );
-    let shared = mapper.allocate_shared(PAGE_SIZE).unwrap();
+    let shared = mapper.allocate_shared(2 * PAGE_SIZE).unwrap();
     mapper
         .map_shared(LOW, shared.backing(), Perms::Read)
         .unwrap();
+    let size = 2 * PAGE_SIZE;
     assert_eq!(
         mapper.release_shared(shared.backing()),
         Err(MapperError::Refused(format!(
-            "the {PAGE_SIZE:#x} bytes of guest RAM at {RAM_BASE:#x} are still mapped, at \
-             {LOW:#x} among other places"
+            "the {size:#x} bytes of guest RAM at {RAM_BASE:#x} are still mapped: the lowest \
+             address that maps a page of them is {LOW:#x}"
+        )))
+    );
+    // One page left mapped, at one place: the words claim no other.
+    mapper.unmap(LOW, PAGE_SIZE).unwrap();
+    let left = LOW + PAGE_SIZE;
+    assert_eq!(
+        mapper.release_shared(shared.backing()),
+        Err(MapperError::Refused(format!(
+            "the {size:#x} bytes of guest RAM at {RAM_BASE:#x} are still mapped: the lowest \
+             address that maps a page of them is {left:#x}"
         )))
     );
 }
@@ -767,10 +778,14 @@ fn came<T>(result: &Result<T, MapperError>) -> Came {
     }
 }
 
-/// One shared memory made, mapped, given back too early, unmapped, given back twice, and a
-/// shared memory no translation has room for; and the pages of one of its size made after.
+/// One shared memory made, mapped, given back too early, unmapped, given back twice; a
+/// two-page one given back with only its first page unmapped, then with both; one given back
+/// while an alias of it is left after its own mapping went, then with neither; and a shared
+/// memory no translation has room for; and the pages of one of a page made after.
 fn give_back_scenario(mapper: &mut dyn Mapper) -> (Vec<Came>, BackingRange, BackingRange) {
     let pages = mapper.allocate_shared(PAGE_SIZE).unwrap().backing();
+    let two = mapper.allocate_shared(2 * PAGE_SIZE).unwrap().backing();
+    let aliased = mapper.allocate_shared(PAGE_SIZE).unwrap().backing();
     let larger = BackingRange::new(pages.base(), 2 * PAGE_SIZE).unwrap();
     let steps = vec![
         came(&mapper.map_shared(LOW, pages, Perms::ReadWrite)),
@@ -779,6 +794,19 @@ fn give_back_scenario(mapper: &mut dyn Mapper) -> (Vec<Came>, BackingRange, Back
         came(&mapper.unmap(LOW, PAGE_SIZE)),
         came(&mapper.release_shared(pages)),
         came(&mapper.release_shared(pages)),
+        // Partly unmapped: the second page is still mapped.
+        came(&mapper.map_shared(LOW, two, Perms::ReadWrite)),
+        came(&mapper.unmap(LOW, PAGE_SIZE)),
+        came(&mapper.release_shared(two)),
+        came(&mapper.unmap(LOW + PAGE_SIZE, PAGE_SIZE)),
+        came(&mapper.release_shared(two)),
+        // An alias of the pages outlives their own mapping.
+        came(&mapper.map_shared(LOW, aliased, Perms::ReadWrite)),
+        came(&mapper.map_alias(FAR, LOW, PAGE_SIZE, Perms::ReadWrite)),
+        came(&mapper.unmap(LOW, PAGE_SIZE)),
+        came(&mapper.release_shared(aliased)),
+        came(&mapper.unmap(FAR, PAGE_SIZE)),
+        came(&mapper.release_shared(aliased)),
         came(&mapper.allocate_shared(u64::MAX - (PAGE_SIZE - 1))),
     ];
     (
@@ -804,6 +832,19 @@ fn the_recording_mapper_gives_back_as_this_one_does_but_never_hands_out_again() 
         Came::Ok,
         Came::Ok,
         Came::Refused,
+        // Partly unmapped.
+        Came::Ok,
+        Came::Ok,
+        Came::Refused,
+        Came::Ok,
+        Came::Ok,
+        // The alias left.
+        Came::Ok,
+        Came::Ok,
+        Came::Ok,
+        Came::Refused,
+        Came::Ok,
+        Came::Ok,
         Came::OutOfMemory,
     ];
     assert_eq!(real_steps, expected);

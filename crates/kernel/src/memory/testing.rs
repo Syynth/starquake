@@ -22,9 +22,15 @@
 //!   one hands them out again once every flush owed by their unmappings has run; this one has
 //!   no flushes to wait for, and the tests that use it observe the call, not the reuse.
 //!   A release is refused, with nothing recorded, unless the pages are exactly a run it
-//!   handed out and not released yet, and no mapping of them is left, as the real one
-//!   refuses. Those two checks come before the refusal switches ([`MapperLog::refuse`],
-//!   [`MapperLog::refuse_calls`]), so a release they refuse is not counted as a call.
+//!   handed out and not released yet, and no page of them is mapped anywhere, as the real one
+//!   refuses. It tracks the mapped pages one by one, as the real one does: what
+//!   [`Mapper::map_shared`] maps, what [`Mapper::map_alias`] maps of those pages again, and
+//!   what [`Mapper::unmap`] takes away, a page at a time, so a mapping partly unmapped or an
+//!   alias left after the original went still holds the pages (tested against the real one
+//!   by `the_recording_mapper_gives_back_as_this_one_does_but_never_hands_out_again` in
+//!   `crates/core/src/space/tests/shared.rs`). Those two checks come before the refusal
+//!   switches ([`MapperLog::refuse`], [`MapperLog::refuse_calls`]), so a release they refuse
+//!   is not counted as a call.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -40,6 +46,9 @@ use crate::id::ProcessId;
 pub const SHARED_BASE: u64 = 0x10_0000_0000;
 /// How many bytes of shared memory a [`RecordingMapper`] can hand out in all: 64 pages.
 pub const SHARED_CAPACITY: u64 = 64 * PAGE_SIZE;
+
+/// [`PAGE_SIZE`] as a step for walking pages.
+const PAGE_STEP: usize = 1 << PAGE_SIZE.trailing_zeros();
 
 /// One call a [`RecordingMapper`] received.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,6 +125,9 @@ struct State {
     next: u64,
     /// What `map_shared` mapped and nothing has unmapped since: first address to the pages.
     shared: BTreeMap<u64, BackingRange>,
+    /// Every virtual page that maps a page of shared memory (through `map_shared` or a
+    /// `map_alias` of one) and that nothing has unmapped since, to that guest-physical page.
+    mapped_pages: BTreeMap<u64, u64>,
     /// The runs `allocate_shared` handed out and `release_shared` has not taken back: first
     /// address to one past the last.
     handed_out: BTreeMap<u64, u64>,
@@ -132,6 +144,7 @@ impl Default for State {
             physical: Arc::new(FlatMemory::new(SHARED_BASE, capacity)),
             next: SHARED_BASE,
             shared: BTreeMap::new(),
+            mapped_pages: BTreeMap::new(),
             handed_out: BTreeMap::new(),
         }
     }
@@ -278,6 +291,15 @@ impl Mapper for RecordingMapper {
             state
                 .shared
                 .retain(|start, _| !(address..end).contains(start));
+            // Bounded by the pages mapped, not by `size`.
+            let gone: Vec<u64> = state
+                .mapped_pages
+                .range(address..end)
+                .map(|(page, _)| *page)
+                .collect();
+            for page in gone {
+                state.mapped_pages.remove(&page);
+            }
         });
         Ok(())
     }
@@ -322,9 +344,9 @@ impl Mapper for RecordingMapper {
                 )));
             }
             if let Some(address) = state
-                .shared
+                .mapped_pages
                 .iter()
-                .find(|(_, mapped)| **mapped == backing)
+                .find(|(_, pa)| (base..backing.end()).contains(*pa))
                 .map(|(address, _)| *address)
             {
                 return Err(MapperError::Refused(format!(
@@ -350,7 +372,15 @@ impl Mapper for RecordingMapper {
             backing,
             perms,
         })?;
-        self.0.with(|state| state.shared.insert(address, backing));
+        self.0.with(|state| {
+            state.shared.insert(address, backing);
+            let pages = (backing.base()..backing.end()).step_by(PAGE_STEP);
+            for (offset, pa) in (0..).step_by(PAGE_STEP).zip(pages) {
+                if let Some(va) = address.checked_add(offset) {
+                    state.mapped_pages.insert(va, pa);
+                }
+            }
+        });
         Ok(())
     }
 
@@ -366,6 +396,20 @@ impl Mapper for RecordingMapper {
             source,
             size,
             perms,
-        })
+        })?;
+        // The alias maps again whichever shared pages the source maps, bounded by those pages.
+        self.0.with(|state| {
+            let end = source.saturating_add(size);
+            let aliased: Vec<(u64, u64)> = state
+                .mapped_pages
+                .range(source..end)
+                .filter_map(|(page, pa)| {
+                    let va = address.checked_add(page.checked_sub(source)?)?;
+                    Some((va, *pa))
+                })
+                .collect();
+            state.mapped_pages.extend(aliased);
+        });
+        Ok(())
     }
 }

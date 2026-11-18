@@ -181,8 +181,8 @@ pub enum SpaceError {
     /// Pages of a shared memory to be given back are still mapped
     /// ([`AddressSpace::release_shared`]).
     #[error(
-        "the {size:#x} bytes of guest RAM at {base:#x} are still mapped, at {va:#x} among other \
-         places"
+        "the {size:#x} bytes of guest RAM at {base:#x} are still mapped: the lowest address \
+         that maps a page of them is {va:#x}"
     )]
     StillMapped {
         /// The first guest-physical address of the pages.
