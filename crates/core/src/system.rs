@@ -113,15 +113,18 @@ pub(crate) mod host {
     use std::sync::{Arc, Mutex, PoisonError};
     use std::time::Instant;
 
-    use starquake_cpu::hvf::{HvfBackend, HvfVcpu, PacKeys, PhysicalMemory, RamConfig};
+    use starquake_cpu::hvf::{
+        CounterScale, HvfBackend, HvfVcpu, PacKeys, PhysicalMemory, RamConfig,
+    };
     use starquake_cpu::{Backend, Vcpu};
     use starquake_kernel::sched::CoreId;
-    use starquake_loader::patch::CounterRescale;
     use starquake_memory::Access;
+    use starquake_memory::stage1::TableRoot;
 
     use super::Error;
     use super::ram::GuestRam;
-    use crate::clock::{CounterClock, Timebase};
+    use crate::clock::{CounterClock, Timebase, shim_scale};
+    use crate::image::LoadError;
     use crate::image::{IMAGE_BASE, Loaded, Program, load_placed, place};
     use crate::machine::{self, GuestProgram, GuestSpace, Vcpus};
 
@@ -150,6 +153,23 @@ pub(crate) mod host {
         }
     }
 
+    /// A vCPU of `backend` for the run's one process: in the address space whose tables are at
+    /// `root`, with the process's pointer-authentication keys, and rescaling the counter reads
+    /// the patcher missed with `scale` ([`shim_scale`] of the patcher's rates). Every core's
+    /// vCPU is made here, so that a thread can move from core to core. PROVISIONAL: the keys
+    /// are fixed (zero), not the process's own (`crate::machine`, "Start state").
+    pub(crate) fn process_vcpu(
+        backend: &HvfBackend,
+        root: TableRoot,
+        scale: CounterScale,
+    ) -> Result<HvfVcpu, starquake_cpu::Error> {
+        let mut vcpu = backend.create_vcpu()?;
+        vcpu.set_address_space(root, PROCESS_ASID)?;
+        vcpu.set_pac_keys(&PacKeys::default())?;
+        vcpu.set_counter_scale(scale)?;
+        Ok(vcpu)
+    }
+
     pub(super) fn run(
         program: &Program,
         options: &RunOptions,
@@ -167,10 +187,10 @@ pub(crate) mod host {
                 starquake_cpu::Error::Host("the host counter reports a rate of zero".into())
             })?,
         };
-        let counter = CounterRescale {
-            host_hz,
-            guest_hz: time.rate().hz(),
-        };
+        let counter = time.counter_rescale(host_hz);
+        // The scale the backend answers the counter reads the patcher missed with: the
+        // patcher's own.
+        let scale = shim_scale(counter).map_err(LoadError::from)?;
         // The program is laid out and its guest RAM sized, or refused, before a VM exists.
         let layout = place(program, IMAGE_BASE, Some(counter))?;
         let guest_ram = GuestRam::for_program(&layout, program.description())?;
@@ -195,14 +215,8 @@ pub(crate) mod host {
             address_space,
         } = load_placed(program, layout, Box::new(mapper), &*space)?;
         // Every core's vCPU runs in the one address space, with the same pointer-authentication
-        // keys, so that a thread can move from core to core. PROVISIONAL: the keys are fixed
-        // (zero), not the process's own (`crate::machine`, "Start state").
-        let new_vcpu = || -> Result<HvfVcpu, starquake_cpu::Error> {
-            let mut vcpu = backend.create_vcpu()?;
-            vcpu.set_address_space(space.root(), PROCESS_ASID)?;
-            vcpu.set_pac_keys(&PacKeys::default())?;
-            Ok(vcpu)
-        };
+        // keys and counter scale.
+        let new_vcpu = || process_vcpu(&backend, space.root(), scale);
         let make = |_: CoreId| new_vcpu();
         // Core 0's vCPU, made on this thread, which runs core 0. Declared after the backend, so
         // it is dropped first, as the VM requires; the other cores' vCPUs are dropped on their

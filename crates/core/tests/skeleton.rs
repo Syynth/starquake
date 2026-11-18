@@ -195,8 +195,9 @@ fn the_counter_advances_through_patched_reads_and_reads_the_guest_rate() {
         "{:?}",
         report.crash()
     );
-    // All three reads were patched, so none of them reached the backend's own counter emulation
-    // (which would have read the host's rate, not the guest's).
+    // All three reads were patched, so none of them reached the backend. (There an unpatched
+    // `cntpct_el0` is rescaled to the guest's rate too, but an unpatched `cntfrq_el0` reads the
+    // host's: `starquake_cpu::hvf`, "Counter reads".)
     let base = image_base(&report);
     assert_eq!(
         report.patched_counter_reads,
