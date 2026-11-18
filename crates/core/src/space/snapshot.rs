@@ -81,7 +81,7 @@
 //!    page's RAM ([`PageFault::Duplicate`]), and its bytes a page long ([`PageFault::Length`]).
 //!
 //! Then, the last step that can fail, the bytes are written into RAM; a write RAM refuses is
-//! [`PagesError::Write`], and the pages written before it are zeroed again. Only then is
+//! [`PagesError::Ram`], and the pages written before it are zeroed again. Only then is
 //! anything recorded in the address space, so a refused restore leaves it new.
 //!
 //! [`AddressSpace::save_pages`] runs checks 4 to 7 on what it is about to write (a failure is a

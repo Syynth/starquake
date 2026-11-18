@@ -112,6 +112,39 @@
 //!   `space/tests/alias.rs`): `an_alias_is_refused_with_its_checks_in_order_and_maps_nothing`
 //!   and `an_alias_the_tables_refuse_part_way_unmaps_what_it_mapped`.
 //!
+//! # The Map recording point
+//!
+//! The observability spec's "the address space's mutators each call the recorder once" ("The
+//! event stream"): each change to the mappings the kernel asks [`SpaceMapper`] for and this
+//! address space makes ([`Mapper::map`], [`Mapper::map_shared`] and [`Mapper::map_alias`] as
+//! [`MapKind::Map`], [`Mapper::protect`] as [`MapKind::Protect`], [`Mapper::unmap`] as
+//! [`MapKind::Unmap`]) is one [`EventKind::Map`], with the range asked for and the guest's raw
+//! permission word ([`permission_word`]; zero for an unmapping), sent to the sink a run
+//! attaches ([`AddressSpace::record_maps`]). A refused change sends nothing; handing out and
+//! giving back shared memory ([`Mapper::allocate_shared`], [`Mapper::release_shared`]) and the
+//! backing of a page on first touch change no mapping and send nothing (a touch is the core
+//! loop's fault path). The sink is called once the change is made, with no lock of this
+//! address space held, and under the kernel's lock, which every mapper call holds, so the
+//! recorder's `seq` keeps the kernel's order. A run attaches its recorder before the kernel
+//! boots the process (`crate::machine`, `GuestSpace::record_maps`): the mappings the loader
+//! makes before that (the program's modules) are not recorded; the crash report's memory map
+//! lists them. Tests (in `space/tests/record.rs`):
+//! `each_mutation_the_kernel_asks_for_is_one_map_event`,
+//! `a_refused_mutation_records_nothing`,
+//! `the_sink_is_called_with_no_lock_of_the_address_space_held`; and through a run,
+//! `the_thread_local_page_the_kernel_maps_at_boot_is_a_map_event_in_the_dump`
+//! (`crates/core/tests/map_events.rs`).
+//!
+//! # Snapshots
+//!
+//! The pages that were touched are saved and restored by the `snapshot` module, beside the
+//! kernel's address space ([`snapshot::restore`]). A restore records the shared memory runs
+//! where they were, before the kernel maps them, so [`AddressSpace::map_shared`] accepts each
+//! one in the new address space; and a page the snapshot restored that waits for its mapping
+//! (`Shadow::pending`) is backed with its own RAM, not new RAM, by whatever backs it first
+//! (an alias of it, a touch, a host write) or, for the rest, by
+//! [`AddressSpace::finish_restore`].
+//!
 //! PROVISIONAL, and what replaces each part:
 //!
 //! - **Backing is handed out from the start of guest RAM, a page at a time (a run at a time
@@ -124,9 +157,9 @@
 //!   from the program a run loads, plus a working allowance (`crate::system`'s `ram` module),
 //!   which is usually far smaller than what the kernel lets a process reserve, and a guest that
 //!   touches more ends its run as an emulator error.
-//! - **A shared memory can be mapped only in the address space that handed it out**: its run
-//!   is recorded in that [`AddressSpace`]'s shadow, and its pages are taken from that address
-//!   space's RAM. System-wide guest RAM and one record of the shared runs (the execution
+//! - **A shared memory can be mapped only in the address space that handed it out** (or that
+//!   a snapshot restored it into, which records the run the same way): its run is recorded in
+//!   that [`AddressSpace`]'s shadow, and its pages are taken from that address space's RAM. System-wide guest RAM and one record of the shared runs (the execution
 //!   model's backing pools), instead of per-`AddressSpace` ones, replace it, so that any
 //!   process's address space can map any shared memory.
 //! - **An alias backs its whole source at once**, however large: the RAM a guest can force is
