@@ -42,9 +42,14 @@
 //! - **Physical memory**: the owner's address space's [`MemoryLimit`], the count every
 //!   reservation of code, heap, stack and `MapPhysicalMemory` goes through, and which `GetInfo`
 //!   6 (`TotalMemorySize`) and 7 (`UsedMemorySize`) read. The current value is what is reserved
-//!   ([`MemoryLimit::reserved`]), which is `GetInfo` 7's used size (code, normal memory and the
-//!   main thread's stack). The system resource is not charged to it yet (#208, which charges
-//!   it to the same count, so these values follow without a change here).
+//!   ([`MemoryLimit::reserved`]), which is `GetInfo` 7's used size (code, normal memory, the
+//!   main thread's stack and the system resource's charge). The system resource is charged to
+//!   this same count when the address space is made
+//!   ([`crate::memory::AddressSpace::with_system_resource`], as Eden's
+//!   `KSecureSystemResource::Initialize` reserves `PhysicalMemoryMax` from the process's limit),
+//!   so the current value holds it with no count of its own here. Test (in
+//!   `svc/info/tests/process_ids.rs`):
+//!   `the_total_and_used_memory_count_the_system_resource_as_eden_does`.
 //! - **Threads**: the owner's threads that still have a row
 //!   ([`crate::process::ProcessRecord::threads`]). Eden's current value counts a thread from its
 //!   reservation (`CreateThread`, `KProcess::Run`) to its destruction

@@ -49,7 +49,8 @@ fn a_version_1_snapshot_is_refused_with_the_version_error() {
     header.extend(varint(u64::from(ADDRESS_SPACE_VERSION)));
     assert_eq!(bytes.get(..header.len()), Some(&header[..]));
     // Version 1's body is this one without the aliases, which a space with none ends with as
-    // their count, one byte of zero.
+    // their count, one byte of zero (and without version 3's system resource, which the
+    // version check refuses before it reads the body).
     let body = &bytes[header.len()..];
     assert_eq!(body.last(), Some(&0));
     let version_1 = 1;

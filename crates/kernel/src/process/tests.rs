@@ -264,3 +264,72 @@ fn a_region_whose_end_does_not_fit_is_refused_at_the_exact_edge() {
         Err(RegionError::TopOfMemory { tls: last + 1 })
     );
 }
+
+#[test]
+fn a_space_made_for_another_system_resource_is_refused() {
+    use crate::memory::system_resource::SECURE_ALIGNMENT;
+    use crate::memory::testing::RecordingMapper;
+    use crate::memory::{MemoryArrangement, Pool, SystemResource};
+
+    let made_with = |resource| {
+        let (mapper, _log) = RecordingMapper::new();
+        let memory = fixture::memory(MemoryArrangement::FourGb);
+        AddressSpace::with_system_resource(&memory, resource, Box::new(mapper)).unwrap()
+    };
+    let size = 2 * SECURE_ALIGNMENT;
+    let mut described = description();
+    // A few bytes past whole pages, which the resource leaves out.
+    described.system_resource_size = u32::try_from(size + 5).unwrap();
+    let resource = SystemResource::new(u32::try_from(size).unwrap(), Pool::Application);
+    assert_eq!(described.system_resource(), resource);
+    assert!(create(&described, made_with(resource)).is_ok());
+    // No resource, another size, another pool: each refused, naming both.
+    let others = [
+        SystemResource::NONE,
+        SystemResource::new(
+            u32::try_from(3 * SECURE_ALIGNMENT).unwrap(),
+            Pool::Application,
+        ),
+        SystemResource::new(u32::try_from(size).unwrap(), Pool::Applet),
+    ];
+    for other in others {
+        assert_eq!(
+            create(&described, made_with(other)).map(|_| ()),
+            Err(CreateError::SystemResource {
+                described: size,
+                described_pool: Pool::Application,
+                made: other.size(),
+                made_pool: other.pool(),
+            }),
+            "{other:?}"
+        );
+    }
+    assert_eq!(
+        create(&described, made_with(SystemResource::NONE))
+            .map(|_| ())
+            .unwrap_err()
+            .to_string(),
+        "the process's address space was made for a system resource of 0x0 bytes in the \
+         application pool, not the 0x40000 bytes in the application pool its description asks \
+         for"
+    );
+    // The description's own checks come first, and the handle table after.
+    let mut both = described.clone();
+    both.cores = Range { first: 1, last: 0 };
+    assert_eq!(
+        create(&both, made_with(SystemResource::NONE)).map(|_| ()),
+        Err(CreateError::Process(ProcessError::Capability(
+            KernelError::InvalidCombination
+        )))
+    );
+    let mut handles = described;
+    handles.handle_table_size = i32::from(MAX_TABLE_SIZE) + 1;
+    assert!(matches!(
+        create(&handles, made_with(SystemResource::NONE)),
+        Err(CreateError::SystemResource { .. })
+    ));
+    assert!(matches!(
+        create(&handles, made_with(resource)),
+        Err(CreateError::Handles(_))
+    ));
+}

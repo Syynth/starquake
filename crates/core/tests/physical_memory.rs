@@ -45,10 +45,10 @@ mod support {
     pub(crate) const SIZE: u64 = 2 * PAGE_SIZE;
     /// The value the programs store and compare.
     pub(crate) const VALUE: u32 = 0x1234;
-    /// A system resource of one page: the smallest a process can have (`GetInfo` 16 reports
-    /// the size in whole pages).
+    /// A system resource of one 2 MiB block: the smallest a program's metadata may ask for
+    /// (Horizon's loader refuses a size that is not whole blocks).
     pub(crate) fn resource() -> u32 {
-        u32::try_from(PAGE_SIZE).unwrap()
+        starquake_core::MEMORY_BLOCK_UNIT_SIZE
     }
 
     /// What a program does once it has mapped the memory and used it.
@@ -259,13 +259,15 @@ fn memory_that_was_unmapped_is_not_there() {
 #[test]
 fn a_program_with_no_system_resource_is_refused_with_invalid_state() {
     let program = uses_physical_memory(Then::UnmapAndExit);
-    // The same program with a system resource one byte short of a page (none, in whole pages),
-    // and as an NRO alone (Eden's defaults for a program with no NPDM: no system resource).
-    let Some(short) = run(&program, resource() - 1) else {
+    // The same program with no system resource in its metadata, and as an NRO alone (Eden's
+    // defaults for a program with no NPDM: no system resource). (A size short of a whole page,
+    // which the kernel would count as none, is not a whole 2 MiB block, and Horizon's loader
+    // refuses it before a process exists.)
+    let Some(none) = run(&program, 0) else {
         return;
     };
     let alone = common::run(&program, GENEROUS).unwrap();
-    for report in [short, alone] {
+    for report in [none, alone] {
         // The refusal ends the program at its `brk`, an undefined-instruction crash.
         let crash = report.crash().expect("a crash report");
         assert_eq!(

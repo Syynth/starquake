@@ -5,15 +5,20 @@
 use super::*;
 use crate::svc::info::InfoType;
 
-/// One page: the smallest system resource a process can have.
+/// One page.
 const PAGE: u64 = starquake_memory::PAGE_SIZE;
 
-/// Fresh tables for a process whose metadata asks for a system resource of `size` bytes.
+/// The smallest system resource an application can be made with: one `SecureAlignment`.
+const SMALLEST: u64 = crate::memory::system_resource::SECURE_ALIGNMENT;
+
+/// Fresh tables for a process whose metadata asks for a system resource of `size` bytes, its
+/// address space made with that resource.
 fn tables_with_resource(size: u64) -> Tables {
     let mut description = ProcessDescription::homebrew(CONSOLE);
     description.handle_table_size = i32::from(MAX_TABLE_SIZE);
     description.system_resource_size = u32::try_from(size).unwrap();
-    crate::process::create(&description, fixture::loaded().0).expect("the fixture's process")
+    let space = fixture::loaded_with(description.system_resource()).0;
+    crate::process::create(&description, space).expect("the fixture's process")
 }
 
 /// The alias region's first address.
@@ -69,7 +74,7 @@ fn call(dispatcher: &Dispatcher, id: SvcId, address: u64, size: u64) -> u64 {
 
 #[test]
 fn mapped_physical_memory_is_used_memory_that_get_info_reports_and_unmapping_gives_it_back() {
-    let dispatcher = Dispatcher::new(tables_with_resource(PAGE));
+    let dispatcher = Dispatcher::new(tables_with_resource(SMALLEST));
     let alias = alias_start(&dispatcher);
     let size = 3 * PAGE;
     let [total, used, non_system_total, non_system_used] = memory_info(&dispatcher);
@@ -106,11 +111,15 @@ fn mapped_physical_memory_is_used_memory_that_get_info_reports_and_unmapping_giv
 #[test]
 fn a_process_with_less_than_a_page_of_system_resource_is_refused_with_invalid_state() {
     // `GetTotalSystemResourceSize() == 0`: the metadata's size in whole pages, so a size one
-    // byte short of a page is none, and exactly a page is one.
+    // byte short of a page is none. (A resource of one page cannot be made in the application
+    // pool, which needs `SecureAlignment`; the rounding's own edge is pinned by
+    // `memory::system_resource::tests::a_recorded_size_counts_in_whole_pages`.) The smallest
+    // resource that can be made, and the same with a part page past it, are one.
     for (resource, expected) in [
         (0, word(KernelError::InvalidState)),
         (PAGE - 1, word(KernelError::InvalidState)),
-        (PAGE, 0),
+        (SMALLEST, 0),
+        (SMALLEST + PAGE - 1, 0),
     ] {
         let dispatcher = Dispatcher::new(tables_with_resource(resource));
         let alias = alias_start(&dispatcher);
@@ -127,7 +136,7 @@ fn a_process_with_less_than_a_page_of_system_resource_is_refused_with_invalid_st
 
 #[test]
 fn the_physical_memory_calls_declare_the_address_space_exclusively() {
-    let dispatcher = Dispatcher::new(tables_with_resource(PAGE));
+    let dispatcher = Dispatcher::new(tables_with_resource(SMALLEST));
     for id in [SvcId::MapPhysicalMemory, SvcId::UnmapPhysicalMemory] {
         dispatch_on(&dispatcher, id.number(), &mut GuestRegs::default(), 0);
     }
