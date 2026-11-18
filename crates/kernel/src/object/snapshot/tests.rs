@@ -1676,3 +1676,31 @@ fn the_random_operations_reach_lends_signals_and_shared_handles() {
     };
     assert_eq!((locked(0), locked(1), locked(2)), (true, true, false));
 }
+
+#[test]
+fn a_restore_in_order_resolves_the_address_spaces_shared_memory_from_the_pending_table() {
+    // The order a whole restore takes: the object table, then the address space with the
+    // shared memories the pending table holds, then the lends against the new space.
+    let kernel = kernel();
+    let bytes = kernel.save().unwrap();
+    let space_bytes = kernel.tables.address_space.save().unwrap();
+    let pending = Objects::restore(&bytes, &kernel.tables.scheduler).unwrap();
+    assert_eq!(pending.hooked(), kernel.hooked.as_slice());
+    let [mapped, unmapped] = kernel.shared;
+    for object in [mapped, unmapped] {
+        let expected = match kernel.objects().get(object) {
+            Ok(Object::SharedMemory(memory)) => memory,
+            other => unreachable!("{other:?}"),
+        };
+        assert_eq!(pending.shared_memory(object), Some(expected));
+    }
+    let (_, transfer) = kernel.transfer;
+    assert_eq!(pending.shared_memory(transfer), None);
+    let (recording, _log) = crate::memory::testing::RecordingMapper::new();
+    let space = AddressSpace::restore(&space_bytes, Box::new(recording), |object| {
+        pending.shared_memory(object)
+    })
+    .unwrap();
+    let restored = pending.finish(&[(kernel.own(), &space)]).unwrap();
+    assert_eq!(&restored.objects, kernel.objects());
+}
