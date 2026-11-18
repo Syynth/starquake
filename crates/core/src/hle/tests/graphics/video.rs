@@ -183,3 +183,66 @@ fn the_root_hands_out_video_sessions_that_count_frames() {
         ]
     );
 }
+
+/// The wake path a title waits on: syncpt 201 armed at a decoder's sync handle (its
+/// `SyncCounterId` and value, mode 0) fires when the frame that reaches the value finishes and
+/// the timer thread's turn drains the increment, recording a `SyncpointObserved` note for it;
+/// not on a turn before the frame, and not before the turn.
+#[test]
+fn a_wait_on_a_decoder_s_handle_fires_when_its_frame_finishes() {
+    let graphics = Graphics::new(FrontMode::Live, None);
+    let rig = rig_with(&graphics);
+    let root = rig.graphics_root();
+    let syncpt = rig.family(root, root_command::GET_SYNCPOINT_SESSION);
+    // syncpt 21 (one slot) and 22 (slot 0's event), as the parent module's session sets them.
+    let count = rig.tipc(syncpt, &[tipc_type(syncpt_command::SET_EVENT_COUNT), 1, 1]);
+    assert_eq!(count.result, 0);
+    let slot = rig.tipc(syncpt, &[tipc_type(syncpt_command::GET_EVENT), 1, 0]);
+    assert_eq!((slot.result, slot.copied.len()), (0, 1));
+    let slot_event = slot.copied[0];
+
+    let first = pool(&graphics, 2);
+    let context = rig.family(root, root_command::OPEN_VIDEO_DECODER_CONTEXT_902);
+    let service = decoder(&rig, context);
+    let register = [tipc_type(video_command::REGISTER_IMAGE), 4, first, 0, 0, 0];
+    let handle = rig.tipc(service, &register);
+    assert_eq!(handle.result, 0);
+    let (counter, value) = (handle.data[0], handle.data[2]);
+    let syncpoint = starquake_gsv::syncpt::syncpoint_of(counter).unwrap();
+
+    // syncpt 201 (`0xd9, 5`: slot, `SyncCounterId`, threshold low and high, mode 0).
+    let arm = rig.tipc(
+        syncpt,
+        &[
+            tipc_type(syncpt_command::ARM_WAIT),
+            5,
+            0,
+            counter,
+            value,
+            0,
+            0,
+        ],
+    );
+    assert_eq!(arm.result, 0);
+    assert_eq!(poll(&rig, slot_event), KernelError::TimedOut.code());
+    // A turn before the frame: nothing to drain, nothing signalled.
+    let before = rig.all_events().len();
+    rig.turn(&graphics);
+    assert_eq!(notes(&rig.all_events()[before..]), []);
+    assert_eq!(poll(&rig, slot_event), KernelError::TimedOut.code());
+
+    let submitted = rig.tipc(service, &submit(1));
+    assert_eq!(submitted.result, 0);
+    // The frame moved the counter; the wait fires at the turn that drains it.
+    assert_eq!(poll(&rig, slot_event), KernelError::TimedOut.code());
+    let before = rig.all_events().len();
+    rig.turn(&graphics);
+    assert_eq!(
+        notes(&rig.all_events()[before..]),
+        [Note::SyncpointObserved {
+            id: syncpoint,
+            value
+        }]
+    );
+    assert_eq!(poll(&rig, slot_event), ResultCode::SUCCESS);
+}
