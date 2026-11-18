@@ -111,6 +111,9 @@ pub struct FakeKernel {
     pseudo: Current,
     /// What every call that makes a kernel object answers instead, if a test set it.
     refusal: Option<KernelError>,
+    /// How many calls that reach the refusal still succeed before it applies
+    /// ([`FakeKernel::refuse_objects_after`]).
+    allowance: u32,
     handles: HandleTable,
     refs: RefCounts,
     minted: u32,
@@ -159,6 +162,7 @@ impl FakeKernel {
             process_id: 0,
             pseudo: Current::default(),
             refusal: None,
+            allowance: 0,
             handles: HandleTable::new(handle_table_size)?,
             refs: RefCounts::new(),
             minted: 0,
@@ -241,7 +245,29 @@ impl FakeKernel {
     /// [`Kernel::create_shared_memory`]) fail with `refusal`, as the kernel's do when its object
     /// table is full ([`KernelError::OutOfResource`]); `None` lets them succeed again.
     pub fn refuse_objects(&mut self, refusal: Option<KernelError>) {
+        self.refuse_objects_after(0, refusal);
+    }
+
+    /// As [`refuse_objects`](Self::refuse_objects), but the next `allowed` calls that would be
+    /// refused succeed first, so a test can fail the Nth object a request makes. A call the
+    /// kernel's own checks refuse before the refusal (a shared memory's size or permission)
+    /// uses none of the allowance.
+    pub fn refuse_objects_after(&mut self, allowed: u32, refusal: Option<KernelError>) {
         self.refusal = refusal;
+        self.allowance = allowed;
+    }
+
+    /// The refusal a call that makes a kernel object meets now, if any; a call let through by
+    /// the allowance uses one of it.
+    fn refused(&mut self) -> Option<KernelError> {
+        let refusal = self.refusal?;
+        match self.allowance.checked_sub(1) {
+            Some(left) => {
+                self.allowance = left;
+                None
+            }
+            None => Some(refusal),
+        }
     }
 
     /// Mints a kernel object that is nothing in particular: something for a test to hold a
@@ -403,7 +429,7 @@ impl Kernel for FakeKernel {
     }
 
     fn create_event(&mut self) -> SvcResult<ObjectId> {
-        if let Some(refusal) = self.refusal {
+        if let Some(refusal) = self.refused() {
             return Err(refusal);
         }
         let event = self.new_object();
@@ -454,7 +480,7 @@ impl Kernel for FakeKernel {
         if !is_shared_memory_permission(permission) {
             return Err(KernelError::InvalidNewMemoryPermission);
         }
-        if let Some(refusal) = self.refusal {
+        if let Some(refusal) = self.refused() {
             return Err(refusal);
         }
         let pages = standalone_shared_pages(size).ok_or(KernelError::OutOfMemory)?;
@@ -904,6 +930,54 @@ mod tests {
             .create_shared_memory(SIZE, SvcPermission::Read)
             .unwrap();
         assert_eq!(memory, ObjectId::from_parts(1, GENERATION));
+    }
+
+    #[test]
+    fn a_refusal_after_an_allowance_lets_that_many_objects_be_made_first() {
+        const SIZE: u64 = 0x1000;
+        let mut kernel = FakeKernel::new(0).unwrap();
+        let refused = Err(KernelError::OutOfResource);
+        kernel.refuse_objects_after(2, Some(KernelError::OutOfResource));
+        assert_eq!(
+            kernel.create_event(),
+            Ok(ObjectId::from_parts(0, GENERATION))
+        );
+        // A call the kernel's own checks refuse uses none of the allowance.
+        assert_eq!(
+            kernel
+                .create_shared_memory(0, SvcPermission::Read)
+                .map(|(object, _)| object),
+            Err(KernelError::InvalidSize)
+        );
+        assert_eq!(
+            kernel
+                .create_shared_memory(SIZE, SvcPermission::Read)
+                .map(|(object, _)| object),
+            Ok(ObjectId::from_parts(1, GENERATION))
+        );
+        // The allowance is used: every later call is refused, and nothing is made.
+        assert_eq!(kernel.create_event(), refused);
+        assert_eq!(
+            kernel
+                .create_shared_memory(SIZE, SvcPermission::Read)
+                .map(|(object, _)| object),
+            refused
+        );
+        assert_eq!(kernel.create_event(), refused);
+        // `refuse_objects` sets no allowance, even after one was set.
+        kernel.refuse_objects_after(1, Some(KernelError::OutOfResource));
+        kernel.refuse_objects(Some(KernelError::OutOfResource));
+        assert_eq!(kernel.create_event(), refused);
+        // No refusal: every call succeeds, whatever the allowance.
+        kernel.refuse_objects_after(0, None);
+        assert_eq!(
+            kernel.create_event(),
+            Ok(ObjectId::from_parts(2, GENERATION))
+        );
+        assert_eq!(
+            kernel.create_event(),
+            Ok(ObjectId::from_parts(3, GENERATION))
+        );
     }
 
     #[test]

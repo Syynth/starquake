@@ -55,8 +55,17 @@
 //! | `Ioctl` | 0x9 | `AllocObjCtx` | 0: class, 4: flags, 8: object id (`u64`) |
 //! | `Ioctl` | 0x8 | `SubmitGPFIFO` | 0: address (`u64`, not read), 8: entry count, 12: flags, 16: fence (`s32` id, 20: `u32` value); the entries after the struct, 8 bytes each |
 //! | `Ioctl2` | 0x1B | `SubmitGPFIFO` (libnx `KickoffPb`) | as 0x8, the entries in the inline input (in buffer 1) |
+//! | `Ioctl` | 0x3 | `ChannelSetTimeout` | 0: timeout |
+//! | `Ioctl` | 0xC | `SetErrorNotifier` | 0: offset (`u64`), 8: size (`u64`), 16: mem, 20: padding |
+//! | `Ioctl` | 0x1F, only [`SET_PREEMPTION_MODES`] | `SetPreemptionModes` (PR's) | 0: graphics, 4: compute |
+//! | `Ioctl` | group `'G'` ([`CLIENT_GROUP`]) 0x14 | `SetClientData` | 0: data (`u64`) |
+//! | `Ioctl` | group `'G'` 0x15 | `GetClientData` | 0: data (`u64`) |
 //!
 //! Every other number, and `Ioctl3`, goes to the server's unknown-ioctl policy (see "Not built").
+//! The title of issue #300 sends `0x40044803`, `0xc018480c`, `0xc008481f` and `0x40084714`; no
+//! title is known to send `GetClientData`, which is built because it reads what
+//! `SetClientData` keeps (issue #300's scope). Its number is matched on the group and the
+//! command alone, as PR's `Ioctl1` does.
 //!
 //! **`AllocGPFIFOEx2`**, the first failing check answering: the channel has a syncpoint already,
 //! `AlreadyAllocated` (Eden: `channel_state->initialized`); no syncpoint is free,
@@ -120,6 +129,37 @@
 //! is queued (`a_waiting_submission_with_an_unwritable_out_buffer_still_counts`;
 //! [`submits`], "A submission without a token").
 //!
+//! # The settings
+//!
+//! Five ioctls set or read a channel's settings (PR `nvhost_gpu.cpp` @ e5fb3b97,
+//! `ChannelSetTimeout`, `SetErrorNotifier`, `SetPreemptionModes`, `SetClientData`,
+//! `GetClientData`, each through `WrapFixed`). Each gives its struct back whole, the fields it
+//! does not set as sent, whatever the result. None calls the GPU front.
+//!
+//! - **`ChannelSetTimeout`**: logged at info, nothing kept, `Success` (PR, NX2 and Eden alike).
+//! - **`SetErrorNotifier`**: the offset, size and nvmap handle are kept in the channel
+//!   ([`Channel::error_notifier`]), `Success`. Nothing reads them yet: an error notifier is
+//!   written when a channel fails, which is #12's (`GpuFront::channel_error`). PR, NX2 and Eden
+//!   log the call and keep nothing ("(STUBBED)"); keeping it changes nothing the guest sees.
+//! - **`SetPreemptionModes`** (PR's, `UsesNativeAbi() && command.raw == 0xc008481f`; nvsrv is
+//!   reached only through gsv 1402, by Switch 2 processes, so every caller is on the native ABI,
+//!   as for tsg-gpu, `super`, "Devices and fds"): the checks in order, the first failing
+//!   answering: the channel's GPU channel is not made, `InvalidState` (PR:
+//!   `!channel_state->initialized`); the graphics mode above [`preemption::GRAPHICS_MAX`] or the
+//!   compute mode above [`preemption::COMPUTE_MAX`], `NotSupported`. Then each mode that is not
+//!   [`preemption::KEEP`] is kept ([`Channel::preemption`], each [`preemption::DEFAULT`] until
+//!   set), `Success`. Nothing reads them yet (PR: "Context switches follow complete commands").
+//! - **`SetClientData`**: the `u64` is kept ([`Channel::client_data`]), `Success`.
+//!   **`GetClientData`**: the struct's data set to the kept one, 0 if none was set (PR
+//!   `user_data{}`), `Success`. That is the only read of anything the settings keep.
+//!
+//! `ChannelSetTimeout` makes no channel; the setters that keep something make the fd's channel
+//! if it has none yet, as an event query does; `GetClientData` makes none.
+//!
+//! The logs (`ChannelSetTimeout`'s at info, `SetErrorNotifier`'s at debug, a refused
+//! `SetPreemptionModes` at warn) are log-only: no test captures them, so a change to their level
+//! or text is not observed.
+//!
 //! # Events
 //!
 //! `QueryEvent` on an nvhost-gpu fd answers ids 1 (SM exception breakpoint interrupt), 2 (SM
@@ -133,9 +173,9 @@
 //! # Conflicts
 //!
 //! Each is picked by the house rule of decision 8 ("where one answer contains the other, the
-//! larger"), except the event ids, and pinned by the test named, in `gpu/tests.rs`. The spec's
-//! verification item 1 lists the event ids; it does not list the other three yet. The open
-//! question with each settles it.
+//! larger"), except the event ids and `SetPreemptionModes`, and pinned by the test named, in
+//! `gpu/tests.rs` unless another file is given. The spec's verification item 1 lists the event
+//! ids; it does not list the others yet. The open question with each settles it.
 //!
 //! - **The class `AllocObjCtx` gives back.** NX2 gives back the Maxwell class it mapped onto
 //!   (`params.class_num = mapped`); PR gives back the class as sent. NX2's is used, the one a
@@ -152,6 +192,17 @@
 //!   accepted departure from decision 8"). A listed divergence too. Open question, for a trace
 //!   (the spec's verification item 1): does NvRm ask for any id besides 7?
 //!   (`events_1_2_3_and_7_are_answered`.)
+//! - **`SetPreemptionModes` (0x1F).** PR has a handler (above); NX2 has none, and the number
+//!   reaches its catch-all for unknown Switch 2 ioctls (`nx2_stub_device.h`, `Nx2UnknownIoctl`:
+//!   `Success` and the input echoed; row 26: "logged echo for unknown ioctls", observed). The
+//!   spec replaces that catch-all with the services framework's unknown-ioctl policy
+//!   ("Channels and submission: nvsrv": "NX2 echoed the input instead, which the framework
+//!   forbids after row 96"), so the one handler, PR's, is ported, with its refusals. **Owner
+//!   question:** read as decision 8's "where one answer contains the other, the larger", NX2's
+//!   `Success` for every argument contains PR's; the code takes PR's because NX2's is not a
+//!   reading of this ioctl. Open question, for a trace: does NvRm send it before its channel is
+//!   made (PR answers `InvalidState`) or with modes above PR's limits (`NotSupported`)?
+//!   (`gpu/tests/settings.rs`: `preemption_modes_check_the_channel_then_the_modes`.)
 //! - **Increments past 64.** PR refuses a submission (`BadParameter`) when its ABI is the native
 //!   one, flag bit 8 is set and bit 1 is clear, and the fence value is above 64
 //!   (`SubmitGPFIFOImpl`: `native_completion = UsesNativeAbi() && increment_value &&
@@ -180,6 +231,7 @@
 //! | `QueryEvent` with any other id | NX2: a new event | `BadParameter` (`events_1_2_3_and_7_are_answered`) |
 //! | The channel's kernel events when its fd closes | freed (`~nvhost_gpu`: `events_interface.FreeEvent` of each) | not freed: each open, `QueryEvent` 1, 2 and 3, close leaves three kernel events the server made, with no bound over the run (`a_closed_channel_s_events_are_not_freed`) |
 //! | `SubmitGPFIFO` 0x1B on `Ioctl` (entries read from the guest's memory at the struct's address) | served | not served: the unknown-ioctl policy (`submissions_from_memory_go_to_the_policy`) |
+//! | `SetErrorNotifier`'s arguments | logged, not kept | kept in the channel and saved; nothing reads them, so the guest sees no difference (`gpu/tests/settings.rs`: `the_error_notifier_is_kept`) |
 //!
 //! # What is recorded and what is saved
 //!
@@ -196,11 +248,13 @@
 //! the record: a question for the spec.
 //!
 //! The channels ([`NvhostGpu`]) are plain data saved with the nvsrv state: per fd the syncpoint,
-//! the GPU channel and the space it was made in, the classes and the events, checked on restore
-//! ([`GpuStateError`], and against the open files and the bindings by
-//! [`super::NvsrvStateError`]). The waiting submissions are saved with gsv's shared state by
-//! their own snapshot ([`submits`]), as ids (spec: "outstanding tickets and deferred replies, as
-//! ids").
+//! the GPU channel and the space it was made in, the classes, the events and the settings (the
+//! client data, the error notifier, the preemption modes), checked on restore ([`GpuStateError`]:
+//! the preemption modes against what `SetPreemptionModes` can set; any client data and any
+//! error notifier can be set, so neither is checked; and against the open files and the
+//! bindings by [`super::NvsrvStateError`]). The waiting submissions are saved with gsv's shared
+//! state by their own snapshot ([`submits`]), as ids (spec: "outstanding tickets and deferred
+//! replies, as ids").
 //!
 //! Not checked here, but by [`NvhostGpu::check_syncpoints`] when a restore composes nvsrv's state
 //! with the restored `Syncpoints`: that each channel's syncpoint is allocated. Not checked at all
@@ -210,13 +264,12 @@
 //!
 //! # Not built
 //!
-//! The rest of Eden's nvhost-gpu: `SetNVMAPfd` (0x1), `ChannelSetTimeout` (0x3), `ZCullBind`
-//! (0xB), `SetErrorNotifier` (0xC), `SetChannelPriority` (0xD), `AllocGPFIFOEx` (0x18),
-//! `ChannelSetTimeslice` (0x1D), `GetWaitbase` (group 0, 0x3), `SetClientData` and
-//! `GetClientData` ('G' 0x14, 0x15), PR's `SetPreemptionModes` (0x1F), the ioctls row 26 names
-//! (0x1F, 0x20), and 0x1B on `Ioctl`. They go to the unknown-ioctl policy until a title needs
-//! one. What binding a channel to a timeslice group does to the channel (PR hands it the group's
-//! macro context) is engine state, #12's.
+//! The rest of Eden's nvhost-gpu: `SetNVMAPfd` (0x1), `ZCullBind` (0xB), `SetChannelPriority`
+//! (0xD), `AllocGPFIFOEx` (0x18), `ChannelSetTimeslice` (0x1D), `GetWaitbase` (group 0, 0x3),
+//! 0x1F with any number but [`SET_PREEMPTION_MODES`], 0x20 (row 26 names 0x1F and 0x20), and
+//! 0x1B on `Ioctl`. They go to the unknown-ioctl policy until a title needs one. What binding a
+//! channel to a timeslice group does to the channel (PR hands it the group's macro context) is
+//! engine state, #12's.
 
 pub mod submits;
 
@@ -253,6 +306,46 @@ pub mod command {
     /// `SubmitGPFIFO` with the entries inline, on `Ioctl2` (`case 0x1b:`, `SubmitGPFIFOBase2`;
     /// libnx `nvioctlChannel_KickoffPb`).
     pub const SUBMIT_GPFIFO_INLINE: u32 = 0x1B;
+    /// `ChannelSetTimeout` (`case 0x3:`; libnx `nvioctlChannel_SetTimeout`, `_NV_IOW(0x48,
+    /// 0x03, ..)`).
+    pub const CHANNEL_SET_TIMEOUT: u32 = 0x3;
+    /// `SetErrorNotifier` (`case 0xc:`; libnx `nvioctlChannel_SetErrorNotifier`,
+    /// `_NV_IOWR(0x48, 0x0C, ..)`).
+    pub const SET_ERROR_NOTIFIER: u32 = 0xC;
+    /// PR's `SetPreemptionModes` (`case 0x1f:`, answered only for [`super::SET_PREEMPTION_MODES`]
+    /// on the native ABI).
+    pub const SET_PREEMPTION_MODES: u32 = 0x1F;
+}
+
+/// nvhost-gpu's second group, `'G'`, which holds the client data pair (`nvhost_gpu::Ioctl1`:
+/// `case 'G':`).
+pub const CLIENT_GROUP: u32 = 0x47;
+
+/// nvhost-gpu's commands in [`CLIENT_GROUP`].
+pub mod client_command {
+    /// `SetClientData` (`case 0x14:`; libnx `nvioctlChannel_SetUserData`, `_NV_IOW(0x47, 0x14,
+    /// ..)`).
+    pub const SET_CLIENT_DATA: u32 = 0x14;
+    /// `GetClientData` (`case 0x15:`).
+    pub const GET_CLIENT_DATA: u32 = 0x15;
+}
+
+/// The one `SetPreemptionModes` number PR answers: `UsesNativeAbi() && command.raw ==
+/// 0xc008481f` (both directions, 8 bytes); any other number with command 0x1F is PR's
+/// `UNIMPLEMENTED_MSG`, here the unknown-ioctl policy.
+pub const SET_PREEMPTION_MODES: u32 = 0xC008_481F;
+
+/// The preemption modes `SetPreemptionModes` takes (PR `nvhost_gpu.cpp`, `SetPreemptionModes`;
+/// `nvhost_gpu.h`, `graphics_preemption_mode{1}`, `compute_preemption_mode{1}`).
+pub mod preemption {
+    /// Both modes a channel starts with: `{1}`.
+    pub const DEFAULT: u32 = 1;
+    /// "Zero retains the current mode."
+    pub const KEEP: u32 = 0;
+    /// The largest graphics mode: `params.graphics > 1` is `NotSupported`.
+    pub const GRAPHICS_MAX: u32 = 1;
+    /// The largest compute mode: `params.compute > 2` is `NotSupported`.
+    pub const COMPUTE_MAX: u32 = 2;
 }
 
 /// Where each field of each argument struct is, and each struct's size (`nvhost_gpu.h`:
@@ -295,11 +388,40 @@ pub mod layout {
     pub const SUBMIT_FENCE_ID: usize = 16;
     /// `fence.value`.
     pub const SUBMIT_FENCE_VALUE: usize = 20;
+
+    /// `IoctlChannelSetTimeout`: 4 bytes.
+    pub const TIMEOUT_BYTES: usize = 4;
+    /// `timeout`.
+    pub const TIMEOUT: usize = 0;
+
+    /// `IoctlSetErrorNotifier`: 24 bytes.
+    pub const ERROR_NOTIFIER_BYTES: usize = 24;
+    /// `offset`, a `u64`.
+    pub const NOTIFIER_OFFSET: usize = 0;
+    /// `size`, a `u64`.
+    pub const NOTIFIER_SIZE: usize = 8;
+    /// `mem`, "nvmap object handle" (libnx calls the word `enable`); a padding word follows.
+    pub const NOTIFIER_MEM: usize = 16;
+
+    /// PR's `IoctlPreemptionModes`: 8 bytes (`static_assert(sizeof(IoctlPreemptionModes) ==
+    /// 8)`).
+    pub const PREEMPTION_BYTES: usize = 8;
+    /// `graphics`.
+    pub const PREEMPTION_GRAPHICS: usize = 0;
+    /// `compute`.
+    pub const PREEMPTION_COMPUTE: usize = 4;
+
+    /// `IoctlClientData`: 8 bytes.
+    pub const CLIENT_DATA_BYTES: usize = 8;
+    /// `data`, a `u64`.
+    pub const CLIENT_DATA: usize = 0;
 }
 
 use layout::{
-    ALLOC_FENCE_ID, ALLOC_FENCE_VALUE, ALLOC_GPFIFO_BYTES, OBJ_CLASS, OBJ_CTX_BYTES, OBJ_FLAGS,
-    SUBMIT_BYTES, SUBMIT_FENCE_ID, SUBMIT_FENCE_VALUE, SUBMIT_FLAGS, SUBMIT_NUM_ENTRIES,
+    ALLOC_FENCE_ID, ALLOC_FENCE_VALUE, ALLOC_GPFIFO_BYTES, CLIENT_DATA, CLIENT_DATA_BYTES,
+    ERROR_NOTIFIER_BYTES, NOTIFIER_MEM, NOTIFIER_OFFSET, NOTIFIER_SIZE, OBJ_CLASS, OBJ_CTX_BYTES,
+    OBJ_FLAGS, PREEMPTION_BYTES, PREEMPTION_COMPUTE, PREEMPTION_GRAPHICS, SUBMIT_BYTES,
+    SUBMIT_FENCE_ID, SUBMIT_FENCE_VALUE, SUBMIT_FLAGS, SUBMIT_NUM_ENTRIES, TIMEOUT, TIMEOUT_BYTES,
 };
 
 /// `SubmitGPFIFO` flag bit 0: wait on the given fence first (`BitField<0, 1> fence_wait`).
@@ -546,6 +668,37 @@ pub struct Made {
     pub space: AsId,
 }
 
+/// What `SetErrorNotifier` was given (`IoctlSetErrorNotifier`): kept, read by nothing yet
+/// (module docs, "The settings").
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ErrorNotifier {
+    /// `offset`.
+    pub offset: u64,
+    /// `size`.
+    pub size: u64,
+    /// `mem`, the nvmap handle the notifier lives in.
+    pub mem: u32,
+}
+
+/// A channel's preemption modes (PR's `graphics_preemption_mode`, `compute_preemption_mode`):
+/// kept, read by nothing yet. Each starts at [`preemption::DEFAULT`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Preemption {
+    /// The graphics mode.
+    pub graphics: u32,
+    /// The compute mode.
+    pub compute: u32,
+}
+
+impl Default for Preemption {
+    fn default() -> Self {
+        Self {
+            graphics: preemption::DEFAULT,
+            compute: preemption::DEFAULT,
+        }
+    }
+}
+
 /// One nvhost-gpu fd's channel (module docs, "The channel").
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Channel {
@@ -557,6 +710,13 @@ pub struct Channel {
     pub classes: Vec<u32>,
     /// The events made so far, by slot ([`event_slot`]).
     pub events: [Option<ObjectId>; EVENT_SLOTS],
+    /// What `SetClientData` was given last, 0 before (PR `u64_le user_data{}`); `GetClientData`
+    /// gives it back.
+    pub client_data: u64,
+    /// What `SetErrorNotifier` was given last, if it was called.
+    pub error_notifier: Option<ErrorNotifier>,
+    /// The modes `SetPreemptionModes` set.
+    pub preemption: Preemption,
 }
 
 impl Channel {
@@ -572,6 +732,13 @@ impl Channel {
     fn syncpoint_id(&self) -> Option<SyncpointId> {
         self.syncpoint.and_then(SyncpointId::new)
     }
+}
+
+/// Whether a channel can hold preemption mode `mode` whose largest is `max`: the default, or,
+/// once its GPU channel is made (`channel_made`), any mode `SetPreemptionModes` sets (from 1 to
+/// `max`; module docs, "The settings").
+const fn settable_mode(mode: u32, max: u32, channel_made: bool) -> bool {
+    mode == preemption::DEFAULT || (channel_made && mode > preemption::KEEP && mode <= max)
 }
 
 /// Whether `id` is one `Syncpoints::allocate` can hand out: from [`FIRST_ALLOCATABLE`] up, below
@@ -596,7 +763,8 @@ struct SavedNvhostGpu {
 
 /// Why a saved [`NvhostGpu`] could not be read back. Deserialising checks, in this order, the
 /// first that fails reported: each channel's syncpoint (fd order), then its GPU channel, then its
-/// classes; then that no two channels share a syncpoint, then that no two share a GPU channel.
+/// classes, then its preemption modes; then that no two channels share a syncpoint, then that no
+/// two share a GPU channel.
 /// [`NvhostGpu::check_syncpoints`] checks the last against the restored syncpoints.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum GpuStateError {
@@ -621,6 +789,20 @@ pub enum GpuStateError {
         fd: u32,
         /// The class.
         class: u32,
+    },
+    /// A preemption mode `SetPreemptionModes` cannot set: other than the default, unless the GPU
+    /// channel is made and the mode is from 1 to its largest.
+    #[error(
+        "channel fd {fd} has graphics preemption mode {graphics} and compute mode {compute}, \
+         which it cannot have"
+    )]
+    Preemption {
+        /// The channel's fd.
+        fd: u32,
+        /// The graphics mode.
+        graphics: u32,
+        /// The compute mode.
+        compute: u32,
     },
     /// Two channels with one syncpoint.
     #[error("channel fds {first} and {second} share syncpoint {id}")]
@@ -674,6 +856,17 @@ impl TryFrom<SavedNvhostGpu> for NvhostGpu {
                     return Err(GpuStateError::Class { fd, class });
                 };
                 slots.push(slot);
+            }
+            let Preemption { graphics, compute } = channel.preemption;
+            let made = channel.made.is_some();
+            if !settable_mode(graphics, preemption::GRAPHICS_MAX, made)
+                || !settable_mode(compute, preemption::COMPUTE_MAX, made)
+            {
+                return Err(GpuStateError::Preemption {
+                    fd,
+                    graphics,
+                    compute,
+                });
             }
         }
         let mut syncpoints: BTreeMap<u8, u32> = BTreeMap::new();
@@ -859,6 +1052,17 @@ impl NvhostGpu {
         access: &mut ChannelAccess<'_>,
     ) -> Option<IoctlAnswer> {
         let ioctl = call.ioctl;
+        if ioctl.group() == CLIENT_GROUP {
+            return match (call.variant, ioctl.command()) {
+                (IoctlVariant::Ioctl, client_command::SET_CLIENT_DATA) => {
+                    Some(self.set_client_data(fd, call))
+                }
+                (IoctlVariant::Ioctl, client_command::GET_CLIENT_DATA) => {
+                    Some(self.get_client_data(fd, call))
+                }
+                _ => None,
+            };
+        }
         if ioctl.group() != GROUP {
             return None;
         }
@@ -877,8 +1081,87 @@ impl NvhostGpu {
             | (IoctlVariant::Ioctl2, command::SUBMIT_GPFIFO_INLINE) => {
                 Some(self.submit(fd, call, as_gpu, access))
             }
+            (IoctlVariant::Ioctl, command::CHANNEL_SET_TIMEOUT) => Some(set_timeout(fd, call)),
+            (IoctlVariant::Ioctl, command::SET_ERROR_NOTIFIER) => {
+                Some(self.set_error_notifier(fd, call))
+            }
+            (IoctlVariant::Ioctl, command::SET_PREEMPTION_MODES)
+                if ioctl.raw() == SET_PREEMPTION_MODES =>
+            {
+                Some(self.set_preemption_modes(fd, call))
+            }
             _ => None,
         }
+    }
+
+    /// `SetErrorNotifier` (module docs, "The settings"): kept, `Success`, the struct back.
+    fn set_error_notifier(&mut self, fd: u32, call: &IoctlCall<'_>) -> IoctlAnswer {
+        let arg = Fixed::<ERROR_NOTIFIER_BYTES>::from_input(call.input);
+        let notifier = ErrorNotifier {
+            offset: arg.u64_at::<NOTIFIER_OFFSET>(),
+            size: arg.u64_at::<NOTIFIER_SIZE>(),
+            mem: arg.u32_at::<NOTIFIER_MEM>(),
+        };
+        tracing::debug!(
+            fd,
+            offset = notifier.offset,
+            size = notifier.size,
+            mem = notifier.mem,
+            "nvsrv: a channel's error notifier"
+        );
+        self.channels.entry(fd).or_default().error_notifier = Some(notifier);
+        IoctlAnswer::with(NvResult::Success, arg.into_output())
+    }
+
+    /// `SetPreemptionModes` (module docs, "The settings"): the struct back whatever the result.
+    fn set_preemption_modes(&mut self, fd: u32, call: &IoctlCall<'_>) -> IoctlAnswer {
+        let arg = Fixed::<PREEMPTION_BYTES>::from_input(call.input);
+        let graphics = arg.u32_at::<PREEMPTION_GRAPHICS>();
+        let compute = arg.u32_at::<PREEMPTION_COMPUTE>();
+        let result = match self.channels.get_mut(&fd) {
+            Some(channel) if channel.made.is_some() => {
+                if graphics > preemption::GRAPHICS_MAX || compute > preemption::COMPUTE_MAX {
+                    NvResult::NotSupported
+                } else {
+                    if graphics != preemption::KEEP {
+                        channel.preemption.graphics = graphics;
+                    }
+                    if compute != preemption::KEEP {
+                        channel.preemption.compute = compute;
+                    }
+                    NvResult::Success
+                }
+            }
+            _ => NvResult::InvalidState,
+        };
+        if result != NvResult::Success {
+            tracing::warn!(
+                fd,
+                graphics,
+                compute,
+                result = result.raw(),
+                "nvsrv: preemption modes refused"
+            );
+        }
+        IoctlAnswer::with(result, arg.into_output())
+    }
+
+    /// `SetClientData` (module docs, "The settings"): kept, `Success`, the struct back.
+    fn set_client_data(&mut self, fd: u32, call: &IoctlCall<'_>) -> IoctlAnswer {
+        let arg = Fixed::<CLIENT_DATA_BYTES>::from_input(call.input);
+        self.channels.entry(fd).or_default().client_data = arg.u64_at::<CLIENT_DATA>();
+        IoctlAnswer::with(NvResult::Success, arg.into_output())
+    }
+
+    /// `GetClientData` (module docs, "The settings"): the kept data, 0 if none, `Success`.
+    fn get_client_data(&self, fd: u32, call: &IoctlCall<'_>) -> IoctlAnswer {
+        let mut arg = Fixed::<CLIENT_DATA_BYTES>::from_input(call.input);
+        let data = self
+            .channels
+            .get(&fd)
+            .map_or(0, |channel| channel.client_data);
+        arg.set_u64::<CLIENT_DATA>(data);
+        IoctlAnswer::with(NvResult::Success, arg.into_output())
     }
 
     /// `AllocGPFIFOEx2` (module docs, "The ioctls").
@@ -1054,6 +1337,19 @@ impl NvhostGpu {
         };
         Ok((id, fence, submission))
     }
+}
+
+/// `ChannelSetTimeout` (module docs, "The settings"): logged, nothing kept, `Success`, the struct
+/// back (PR: `LOG_INFO(.., "called, timeout={:#x}", params.timeout); return
+/// NvResult::Success;`).
+fn set_timeout(fd: u32, call: &IoctlCall<'_>) -> IoctlAnswer {
+    let arg = Fixed::<TIMEOUT_BYTES>::from_input(call.input);
+    tracing::info!(
+        fd,
+        timeout = arg.u32_at::<TIMEOUT>(),
+        "nvsrv: a channel's timeout"
+    );
+    IoctlAnswer::with(NvResult::Success, arg.into_output())
 }
 
 /// Makes `channel`'s GPU channel in `space` and binds its classes on it, in the order bound; a
