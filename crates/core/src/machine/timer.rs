@@ -45,9 +45,8 @@
 //! and returns it ([`Dispatcher::deliver_replies`], `starquake_kernel::dispatch::Ended`). The
 //! turn then records the process's end for the sender whose request asked, on its core, as a
 //! core records it for a thread whose call ended in `Outcome::ProcessExited`, and the run
-//! ends as it ends for `ExitProcess` ([`Ending::Exited`]); the servers still named ready are
-//! not delivered to. The run has one process (PROVISIONAL, as in the kernel), so any process a
-//! delivery ends is the run's. Tests:
+//! ends as it ends for `ExitProcess` ([`Ending::Exited`]). The run has one process
+//! (PROVISIONAL, as in the kernel), so any process a delivery ends is the run's. Tests:
 //! `a_handler_ending_the_process_during_the_timers_delivery_ends_the_run_after_the_reply`
 //! (stepped), and `the_timer_thread_ends_the_run_when_a_delivery_ends_the_process` (the real
 //! timer thread).
