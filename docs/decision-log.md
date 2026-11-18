@@ -490,3 +490,19 @@ Entry format:
 - **SCOPE:** moderate
 - **WHAT:** Auto-stub keeps answering success to unknown commands and unknown services. To make its failures easy to trace, the run artifacts name what was stubbed: summary.json and the crash report list the unknown service names and every auto-stubbed command with its interface, and the command-line tool writes the warning log to a run artifact. This is implementation under #207, not a spec change.
 - **WHY:** Auto-stub lets one run discover a title's whole service list, which a stricter policy would lose. A stub session for an unknown service has no command table, so it can't tell which commands should return an object anyway. The real cost has been diagnosis: three times (appletOE 10, ReceiveMessage, parental control) a stubbed success sent the title wrong far from the cause, and each time finding the cause needed a scratch build.
+
+## Milestone 2 is reached; file the GPU-front slices and continue into milestone 3
+- **WHEN:** 2026-11-18
+- **PROJECT:** starquake
+- **SYSTEM:** roadmap
+- **SCOPE:** moderate
+- **WHAT:** Milestone 2 counts as reached by its exit: a title gets as far as its first GPU submission. Whether that submission is correct is checked in milestone 3, when the GPU front executes it. The lead files gpu-protocol slices G8 to G23 as implementation issues and runs them in waves toward milestone 3 (first present), under the implementation-only delegation.
+- **WHY:** The title's next blocker is a GPU semaphore release that only the GPU back writes, so the GPU front is the shortest path forward. The slices follow an approved spec, so they fit the implementation delegation.
+
+## Close milestone 2: #33 closed, #205 deferred to milestone 4, #21 closed
+- **WHEN:** 2026-11-18
+- **PROJECT:** starquake
+- **SYSTEM:** roadmap
+- **SCOPE:** moderate
+- **WHAT:** #33 closes as delivered by PR #127. Its leftovers (dynamic NRO loads through `ldr:ro`, trampoline reach past 128 MiB for large module sets, the NPDM system-call mask check, what `RemoteMemorySize` sizes) go to `docs/proposals.md`. #205's open part (unpatched `cntfrq_el0` and `cntvct_el0` reads disagree with the guest's rate) moves to milestone 4 unchanged, to be decided there. #21 closes, and so does milestone 2.
+- **WHY:** The title already loads and runs, so #33's leftovers wait until a title needs them. #205 is deferred because milestone 4 is where a title's frame timing first shows, so the cost of trapping every counter read can be weighed against a real symptom.
