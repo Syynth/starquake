@@ -321,7 +321,7 @@ fn a_refused_alias_unmaps_the_aliases_made_then_the_rest() {
         SnapshotError::Translation {
             address: alias.address,
             size: alias.size,
-            error: MapperError("the test told the mapper to refuse".into()),
+            error: MapperError::Refused("the test told the mapper to refuse".into()),
             stuck: 0,
         }
     );

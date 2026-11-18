@@ -139,18 +139,26 @@ fn a_full_slab_refuses_to_grow_but_reuses_freed_slots() {
     let mut slab = TestSlab::with_max_slots(2);
     assert_eq!(slab.max_slots(), 2);
     let a = slab.insert(1).unwrap();
+    // One below the limit: not full.
+    assert!(!slab.is_full());
     slab.insert(2).unwrap();
+    // At the limit: full, and `insert` agrees.
+    assert!(slab.is_full());
     assert_eq!(slab.insert(3), Err(SlabError::Full { max_slots: 2 }));
     assert_eq!(slab.len(), 2);
     slab.remove(a).unwrap();
+    // A freed slot under the limit is room again.
+    assert!(!slab.is_full());
     let c = slab.insert(3).unwrap();
     assert_eq!(c.index(), a.index());
+    assert!(slab.is_full());
     assert_eq!(slab.insert(4), Err(SlabError::Full { max_slots: 2 }));
 }
 
 #[test]
 fn a_zero_sized_slab_is_always_full() {
     let mut slab = TestSlab::with_max_slots(0);
+    assert!(slab.is_full());
     assert_eq!(slab.insert(1), Err(SlabError::Full { max_slots: 0 }));
     assert!(slab.is_empty());
 }

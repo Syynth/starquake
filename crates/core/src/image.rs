@@ -1663,7 +1663,9 @@ mod tests {
             let refused = self.0 == 0;
             self.0 = self.0.wrapping_sub(1);
             if refused {
-                Err(starquake_kernel::memory::MapperError("refused".into()))
+                Err(starquake_kernel::memory::MapperError::Refused(
+                    "refused".into(),
+                ))
             } else {
                 Ok(())
             }

@@ -636,6 +636,29 @@ fn a_flush_that_runs_releases_the_freed_table_pages_and_one_that_fails_does_not(
 }
 
 #[test]
+fn a_flush_is_owed_from_an_unmap_or_protect_until_it_is_handed_out_and_not_while_it_fails() {
+    let t = tables(3);
+    assert!(!t.has_pending_flushes());
+    // `map` owes nothing.
+    t.map(0, backing(0x10_0000, 1), Perms::ReadWrite).unwrap();
+    assert!(!t.has_pending_flushes());
+    // `protect` owes one until `take_pending_flushes` hands it out.
+    t.protect(0, PAGE_SIZE, Perms::Read).unwrap();
+    assert!(t.has_pending_flushes());
+    assert_eq!(t.take_pending_flushes().len(), 1);
+    assert!(!t.has_pending_flushes());
+    // `unmap` owes one; a flush that fails still owes it, and one that runs does not.
+    t.unmap(0, PAGE_SIZE).unwrap();
+    assert!(t.has_pending_flushes());
+    let failed: Result<(), &str> = t.flush_pending_with(|_| Err("the vCPU failed"));
+    assert_eq!(failed, Err("the vCPU failed"));
+    assert!(t.has_pending_flushes());
+    let ran: Result<(), &str> = t.flush_pending_with(|_| Ok(()));
+    assert_eq!(ran, Ok(()));
+    assert!(!t.has_pending_flushes());
+}
+
+#[test]
 fn a_flush_with_nothing_pending_does_not_run() {
     let t = tables(3);
     // `map` records nothing.

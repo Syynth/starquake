@@ -223,6 +223,16 @@ impl<M: GuestMemory> Stage1Tables<M> {
         u64::try_from(self.lock().tables.len()).unwrap_or(u64::MAX)
     }
 
+    /// Whether a flush is owed: an `unmap` or `protect` recorded a range that neither
+    /// [`Self::take_pending_flushes`] nor a successful [`Self::flush_pending_with`] has handed
+    /// out since. `false` means every flush recorded so far has been handed out, so whatever
+    /// an earlier `unmap` took away is no longer reachable through a stale TLB entry once the
+    /// caller has kept the contract above: what lets an owner of the backing reuse pages it
+    /// unmapped.
+    pub fn has_pending_flushes(&self) -> bool {
+        !self.lock().pending.is_empty()
+    }
+
     /// Returns the ranges recorded since the last call, oldest first, and forgets them.
     ///
     /// The caller must execute the returned flushes before the next `map`, `unmap` or `protect`:

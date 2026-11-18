@@ -64,7 +64,10 @@
 //!   `CreateTransferMemory`) have arms of their own, in `dispatch/memory_objects.rs`. A
 //!   transfer memory's last reference can go in any call that drops references; the pages it
 //!   lent are unlocked before the kernel lock is let go, whichever call that was (`Locked`'s
-//!   `Drop`, [`crate::svc::transfer_memory::unlock_released`]).
+//!   `Drop`, [`crate::svc::transfer_memory::unlock_released`]). A shared memory's pages are
+//!   given back to the translation there too, after the unlocks (and even when one failed),
+//!   when its last reference has gone ([`crate::svc::shared_memory::free_released`]); the
+//!   translation's calls show the order (`Locked`'s docs name the tests).
 //! - **`ExitProcess`** ends the process ([`crate::svc::process::exit_process`]: its threads end
 //!   and its handles close, so the servers of its sessions are told) and the dispatch in
 //!   [`Outcome::ProcessExited`]; the caller stops running the guest. **`ExitThread`** ends the
@@ -220,7 +223,7 @@ use crate::sched::CoreId;
 use crate::svc::exception::Break;
 use crate::svc::{
     Convention, ConventionError, DebugSink, Kind, Status, SvcId, debug, handle, memory,
-    physical_memory, processor, thread, tick, transfer_memory,
+    physical_memory, processor, shared_memory, thread, tick, transfer_memory,
 };
 use crate::tables::{AddressSpace, Processes, Scheduler};
 
@@ -573,18 +576,33 @@ struct Locked<'d, B> {
 /// unlocked ([`transfer_memory::unlock_released`]): whatever call dropped the last reference,
 /// the next holder of the lock finds them as `KTransferMemory::Finalize` leaves them. A failure
 /// is the kernel's own bookkeeping, and is logged (see the divergences in
-/// [`crate::svc::transfer_memory`]).
+/// [`crate::svc::transfer_memory`]). Then the pages of every shared memory that went are given
+/// back to the translation ([`shared_memory::free_released`]), a failure logged the same way;
+/// they are given back even when an unlock failed. Both orders show in the translation's calls
+/// (an unlock is a `Mapper::protect`, a give-back a `Mapper::release_shared`), and are pinned
+/// by `exiting_the_process_unlocks_lent_pages_before_it_gives_back_shared_ones` and
+/// `a_refused_unlock_still_gives_back_shared_memory_under_the_same_lock` (in
+/// `dispatch/memory_objects/tests.rs`). The two log lines are log-only: no test captures them.
 impl<B> Drop for Locked<'_, B> {
     fn drop(&mut self) {
         let tables = &mut self.state.tables;
-        if !tables.scheduler.objects().has_unlocks() {
-            return;
+        if tables.scheduler.objects().has_unlocks() {
+            let own = tables.processes.own();
+            let unlocked = transfer_memory::unlock_released(
+                &mut tables.scheduler,
+                &mut tables.address_space,
+                own,
+            );
+            if let Err(error) = unlocked {
+                tracing::error!(%error, "unlocking a released transfer memory's pages failed");
+            }
         }
-        let own = tables.processes.own();
-        let unlocked =
-            transfer_memory::unlock_released(&mut tables.scheduler, &mut tables.address_space, own);
-        if let Err(error) = unlocked {
-            tracing::error!(%error, "unlocking a released transfer memory's pages failed");
+        if tables.scheduler.objects().has_frees() {
+            let freed =
+                shared_memory::free_released(&mut tables.scheduler, &mut tables.address_space);
+            if let Err(error) = freed {
+                tracing::error!(%error, "giving back a released shared memory's pages failed");
+            }
         }
     }
 }

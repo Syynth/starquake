@@ -31,7 +31,8 @@
 //!
 //! - **The pages are one run of guest RAM** ([`AddressSpace::allocate_shared`]), taken from
 //!   the same place as touched pages, so they read as zero (RAM starts zeroed and is never
-//!   handed out twice). Eden takes them as one run too
+//!   handed out twice), or from a run a shared memory gave back, zeroed then (below). Eden
+//!   takes them as one run too
 //!   (`MemoryManager().AllocateAndOpenContinuous` in `KSharedMemory::Initialize`,
 //!   `eden/src/core/hle/kernel/k_shared_memory.cpp` @ cf654052). The service reaches them
 //!   through the returned [`SharedPages`], by guest-physical address.
@@ -46,24 +47,37 @@
 //! - **Unmapping a shared mapping** is [`Mapper::unmap`], as for any mapping: the table
 //!   entries go and a flush is owed. The pages keep what they hold, for the service and for
 //!   any other mapping of them.
-//! - **The pages are never given back**, like every page this address space hands out (below):
-//!   the kernel has no call that says when the last reference to a shared memory is gone
-//!   (`starquake_kernel::memory::shared`, "Not built"). So no page of a shared memory is
-//!   reused while a mapping of it exists or a flush for one is pending. Test:
-//!   `unmapping_a_shared_mapping_keeps_its_pages_and_their_bytes_and_never_hands_them_out_again`.
-//!
-//! Divergences from Eden:
-//!
-//! - **Running out is the kernel's internal failure, not `ResultOutOfMemory`.** Eden answers
-//!   `ResultOutOfMemory` when its page heap has no run of the size
-//!   (`R_UNLESS(m_physical_address != 0, ResultOutOfMemory)` in `KSharedMemory::Initialize`).
-//!   Here guest RAM is [`SpaceError::OutOfRam`], which the kernel's address space turns into its
-//!   own failure (`SvcError::Internal`), and a server's `IpcContext::create_shared_memory` into
-//!   `InvalidState`. Tests: the `SvcError::Internal` half is
-//!   `running_out_of_ram_by_exactly_one_page_is_the_kernels_own_failure_and_not_a_panic`
-//!   (`space/tests/kernel.rs`); the `InvalidState` half is
-//!   `a_translation_with_no_backing_to_share_is_the_kernels_failure`
-//!   (`crates/kernel/src/dispatch/memory_objects/tests.rs`, on a mapper that refuses).
+//! - **Running out** is [`SpaceError::OutOfRam`], which [`SpaceMapper`] reports as
+//!   [`MapperError::OutOfMemory`], and the kernel answers `ResultOutOfMemory`, as Eden does when
+//!   its page heap has no run of the size (`R_UNLESS(m_physical_address != 0,
+//!   ResultOutOfMemory)` in `KSharedMemory::Initialize`,
+//!   `eden/src/core/hle/kernel/k_shared_memory.cpp` @ cf654052). Every other refusal is
+//!   [`MapperError::Refused`], the kernel's own failure. Tests:
+//!   `running_out_of_ram_by_exactly_one_page_is_out_of_memory_and_not_a_panic`
+//!   (`space/tests/kernel.rs`) and `the_kernels_mapper_reports_a_shared_memory_refusal_in_words`
+//!   (`space/tests/shared.rs`).
+//! - **Giving the pages back** is [`AddressSpace::release_shared`] ([`Mapper::release_shared`]),
+//!   which the kernel calls when the last reference to the shared memory has gone (its
+//!   `KSharedMemory::Finalize`). It is refused, with nothing changed, unless the pages are
+//!   exactly a run handed out and not given back yet ([`SpaceError::NotShared`]), and then
+//!   unless no mapping of them is left ([`SpaceError::StillMapped`]: the kernel's mappings each
+//!   hold a reference, so it never asks while one is left, and this layer checks it anyway).
+//!   The pages are not handed out again at once: a vCPU may still reach them through a TLB
+//!   entry of an unmapping whose flush has not run (CLAUDE.md: a freed resource is not
+//!   reusable until every pending follow-up on it has run). They wait until the tables owe no
+//!   flush at all ([`Stage1Tables::has_pending_flushes`]), which covers every unmapping of
+//!   them, all made before the release; the next [`AddressSpace::allocate_shared`] that finds
+//!   no flush owed makes them reusable. Then they are handed out again to a shared memory
+//!   whose size fits in them, zeroed first. Tests (in `space/tests/shared.rs`):
+//!   `given_back_pages_wait_for_every_flush_and_come_back_zeroed`,
+//!   `a_release_is_refused_unless_the_pages_are_a_run_handed_out_and_unmapped` and, through the
+//!   kernel, `the_last_reference_gives_the_pages_back_and_a_close_while_mapped_does_not`
+//!   (`space/tests/kernel.rs`).
+//! - **A service may still hold the pages' [`SharedPages`]** after they are given back: they
+//!   reach guest RAM by guest-physical address, and are not invalidated. No server lets go of a
+//!   shared memory it made today (`IpcContext::create_shared_memory`: the server keeps the
+//!   creator's reference for as long as it lives), so its last reference never goes while the
+//!   server holds its pages; a server that let go would have to drop its [`SharedPages`] first.
 //! - **Stricter: a shared mapping must name exactly a run [`AddressSpace::allocate_shared`]
 //!   handed out**, or it is [`SpaceError::NotShared`]. The run is recorded in the shadow of the
 //!   one address space that handed it out, so this holds only while a run has one process:
@@ -101,9 +115,12 @@
 //! PROVISIONAL, and what replaces each part:
 //!
 //! - **Backing is handed out from the start of guest RAM, a page at a time (a run at a time
-//!   for shared memory), and never returned**: an unmapped page's RAM is not reused. The
-//!   backing pools of the execution model replace it, sized as the kernel's pool accounting
-//!   says. Until then guest RAM is sized
+//!   for shared memory), and never returned**: an unmapped page's RAM is not reused. The one
+//!   exception is a shared memory's run once given back, which only a later shared memory
+//!   reuses (the first run, in address order, it fits in; what is left of the run stays
+//!   free); given-back runs are not merged with their neighbours, nor with the RAM never
+//!   handed out. The backing pools of the execution model replace it, sized as the kernel's
+//!   pool accounting says. Until then guest RAM is sized
 //!   from the program a run loads, plus a working allowance (`crate::system`'s `ram` module),
 //!   which is usually far smaller than what the kernel lets a process reserve, and a guest that
 //!   touches more ends its run as an emulator error.
@@ -144,7 +161,9 @@ pub enum SpaceError {
     OutOfRam {
         /// Bytes needed.
         size: u64,
-        /// Bytes of guest RAM not yet handed out.
+        /// Bytes of guest RAM left where the request may be taken from: the RAM never handed
+        /// out, and for a shared memory the largest of that and each given-back run that may
+        /// be handed out again.
         available: u64,
     },
     /// Pages a shared mapping names are not the pages of one shared memory this address
@@ -159,6 +178,24 @@ pub enum SpaceError {
         /// Their size in bytes.
         size: u64,
     },
+    /// Pages of a shared memory to be given back are still mapped
+    /// ([`AddressSpace::release_shared`]).
+    #[error(
+        "the {size:#x} bytes of guest RAM at {base:#x} are still mapped: the lowest address \
+         that maps a page of them is {va:#x}"
+    )]
+    StillMapped {
+        /// The first guest-physical address of the pages.
+        base: u64,
+        /// Their size in bytes.
+        size: u64,
+        /// The lowest virtual address a page of them is mapped at.
+        va: u64,
+    },
+    /// Guest RAM refused the write that zeroes given-back pages before they are handed out
+    /// again.
+    #[error("guest RAM refused the write that zeroes pages handed out again: {0}")]
+    Zeroing(Fault),
 }
 
 /// What the kernel mapped from some address up to `end`: what guest code may do there.
@@ -196,6 +233,13 @@ struct Shadow {
     /// The runs of RAM handed out as shared memory, by first guest-physical address: one past
     /// the last address of each.
     shared: BTreeMap<u64, u64>,
+    /// Runs of shared memory given back while the tables owed a flush, oldest first: not
+    /// reusable until the tables owe none (module docs, "Shared memory").
+    released: Vec<BackingRange>,
+    /// Runs given back that a shared memory may be handed out from again, by first
+    /// guest-physical address: one past the last address of each. They hold what they held;
+    /// a run is zeroed when it is handed out.
+    reusable: BTreeMap<u64, u64>,
 }
 
 impl Shadow {
@@ -329,6 +373,8 @@ impl<M: GuestMemory> AddressSpace<M> {
                 mapped: BTreeMap::new(),
                 backed: BTreeMap::new(),
                 shared: BTreeMap::new(),
+                released: Vec::new(),
+                reusable: BTreeMap::new(),
             }),
         })
     }
@@ -451,13 +497,96 @@ impl<M: GuestMemory> AddressSpace<M> {
 
     /// Hands out `size` bytes of RAM as the pages of one shared memory: one run, zeroed, that
     /// nothing else is handed out from, and that [`Self::map_shared`] maps. Maps nothing
-    /// itself. Refused as [`Self::next_ram`] says, with nothing changed.
+    /// itself.
+    ///
+    /// First, when the tables owe no flush, every run given back so far becomes reusable
+    /// ([`Self::release_shared`]); that changes nothing a caller can see, and stays done when
+    /// the call is refused. Then the pages are the first reusable run, in address order, that
+    /// holds `size` bytes (its start, zeroed; the rest of it stays reusable), or else RAM never
+    /// handed out ([`Self::next_ram`]). Refused, with nothing handed out: as
+    /// [`Self::next_ram`] says, where [`SpaceError::OutOfRam`]'s `available` is also the
+    /// largest reusable run when that is larger; and [`SpaceError::Zeroing`] when RAM refuses
+    /// the zeroing write.
     pub(crate) fn allocate_shared(&self, size: u64) -> Result<BackingRange, SpaceError> {
         let mut shadow = self.shadow();
-        let pages = self.next_ram(&shadow, size)?;
-        shadow.next = pages.end();
+        if !shadow.released.is_empty() && !self.tables.has_pending_flushes() {
+            let released = std::mem::take(&mut shadow.released);
+            shadow
+                .reusable
+                .extend(released.iter().map(|run| (run.base(), run.end())));
+        }
+        let reused = shadow
+            .reusable
+            .iter()
+            .find(|(base, end)| **end - **base >= size)
+            .map(|(base, end)| (*base, *end));
+        let pages = match reused {
+            Some((base, end)) if size.is_multiple_of(PAGE_SIZE) && size != 0 => {
+                let pages = BackingRange::new(base, size)?;
+                self.zero(pages)?;
+                shadow.reusable.remove(&base);
+                if pages.end() < end {
+                    shadow.reusable.insert(pages.end(), end);
+                }
+                pages
+            }
+            _ => {
+                let pages = self.next_ram(&shadow, size).map_err(|error| match error {
+                    SpaceError::OutOfRam { size, available } => SpaceError::OutOfRam {
+                        size,
+                        available: shadow
+                            .reusable
+                            .iter()
+                            .map(|(base, end)| end - base)
+                            .fold(available, u64::max),
+                    },
+                    other => other,
+                })?;
+                shadow.next = pages.end();
+                pages
+            }
+        };
         shadow.shared.insert(pages.base(), pages.end());
         Ok(pages)
+    }
+
+    /// Writes zeros over `pages`, a page at a time.
+    fn zero(&self, pages: BackingRange) -> Result<(), SpaceError> {
+        const ZEROS: [u8; PAGE_STEP] = [0; PAGE_STEP];
+        let memory = self.tables.memory();
+        (pages.base()..pages.end())
+            .step_by(PAGE_STEP)
+            .try_for_each(|page| memory.write(page, &ZEROS))
+            .map_err(SpaceError::Zeroing)
+    }
+
+    /// Takes back the pages of a shared memory whose last reference has gone (module docs,
+    /// "Shared memory"): they are handed out again ([`Self::allocate_shared`]) only once the
+    /// tables owe no flush.
+    ///
+    /// Checked in this order, and refused with nothing changed: the pages must be exactly one
+    /// run [`Self::allocate_shared`] handed out and not given back yet
+    /// ([`SpaceError::NotShared`]); then no page of them may be mapped
+    /// ([`SpaceError::StillMapped`], at the lowest virtual address one is). The check walks
+    /// every backed page, which the release of a shared memory, once per shared memory, can
+    /// afford.
+    pub(crate) fn release_shared(&self, pages: BackingRange) -> Result<(), SpaceError> {
+        let mut shadow = self.shadow();
+        let (base, end, size) = (pages.base(), pages.end(), pages.size());
+        if shadow.shared.get(&base) != Some(&end) {
+            return Err(SpaceError::NotShared { base, size });
+        }
+        if let Some(va) = shadow
+            .backed
+            .iter()
+            .find(|(_, pa)| (base..end).contains(*pa))
+            .map(|(va, _)| *va)
+        {
+            return Err(SpaceError::StillMapped { base, size, va });
+        }
+        shadow.shared.remove(&base);
+        shadow.released.push(pages);
+        Ok(())
     }
 
     /// Records that guest code may use the pages of the shared memory `pages` at `va` as
@@ -675,8 +804,17 @@ impl<M: GuestMemory> GuestMemory for AddressSpace<M> {
 #[derive(Debug)]
 pub(crate) struct SpaceMapper<M>(pub(crate) Arc<AddressSpace<M>>);
 
+/// How the kernel hears of a refusal: running out of guest RAM is
+/// [`MapperError::OutOfMemory`], and every other refusal [`MapperError::Refused`], in the
+/// address space's own words.
 fn refused(error: SpaceError) -> MapperError {
-    MapperError(error.to_string())
+    match error {
+        SpaceError::OutOfRam { .. } => MapperError::OutOfMemory(error.to_string()),
+        SpaceError::Map(_)
+        | SpaceError::NotShared { .. }
+        | SpaceError::StillMapped { .. }
+        | SpaceError::Zeroing(_) => MapperError::Refused(error.to_string()),
+    }
 }
 
 /// The guest-physical memory an address space's tables and backing lie in, addressed by
@@ -723,6 +861,10 @@ impl<M: GuestMemory + 'static> Mapper for SpaceMapper<M> {
         perms: Perms,
     ) -> Result<(), MapperError> {
         self.0.map_shared(address, backing, perms).map_err(refused)
+    }
+
+    fn release_shared(&mut self, backing: BackingRange) -> Result<(), MapperError> {
+        self.0.release_shared(backing).map_err(refused)
     }
 
     fn map_alias(

@@ -9,6 +9,28 @@
 //! bytes), and [`MapperLog::shared_view`] reads and writes guest addresses that
 //! [`Mapper::map_shared`] mapped, through the same pages, so a test can see a host write
 //! through a guest mapping and the reverse.
+//!
+//! # How it differs from the real translation
+//!
+//! `starquake-core`'s `SpaceMapper` is the translation the kernel runs on. This one keeps its
+//! contract for shared memory with these differences:
+//!
+//! - **Running out**: more than the room left ([`SHARED_CAPACITY`] in all) is
+//!   [`MapperError::OutOfMemory`], as the real one's is, but in words of its own.
+//! - **Released pages are never handed out again** ([`Mapper::release_shared`]): the call is
+//!   recorded ([`MapperCall::ReleaseShared`]) and checked, and the pages stay used. The real
+//!   one hands them out again once every flush owed by their unmappings has run; this one has
+//!   no flushes to wait for, and the tests that use it observe the call, not the reuse.
+//!   A release is refused, with nothing recorded, unless the pages are exactly a run it
+//!   handed out and not released yet, and no page of them is mapped anywhere, as the real one
+//!   refuses. It tracks the mapped pages one by one, as the real one does: what
+//!   [`Mapper::map_shared`] maps, what [`Mapper::map_alias`] maps of those pages again, and
+//!   what [`Mapper::unmap`] takes away, a page at a time, so a mapping partly unmapped or an
+//!   alias left after the original went still holds the pages (tested against the real one
+//!   by `the_recording_mapper_gives_back_as_this_one_does_but_never_hands_out_again` in
+//!   `crates/core/src/space/tests/shared.rs`). Those two checks come before the refusal
+//!   switches ([`MapperLog::refuse`], [`MapperLog::refuse_calls`]), so a release they refuse
+//!   is not counted as a call.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -24,6 +46,9 @@ use crate::id::ProcessId;
 pub const SHARED_BASE: u64 = 0x10_0000_0000;
 /// How many bytes of shared memory a [`RecordingMapper`] can hand out in all: 64 pages.
 pub const SHARED_CAPACITY: u64 = 64 * PAGE_SIZE;
+
+/// [`PAGE_SIZE`] as a step for walking pages.
+const PAGE_STEP: usize = 1 << PAGE_SIZE.trailing_zeros();
 
 /// One call a [`RecordingMapper`] received.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +81,11 @@ pub enum MapperCall {
     /// [`Mapper::allocate_shared`].
     AllocateShared {
         /// The pages handed out.
+        backing: BackingRange,
+    },
+    /// [`Mapper::release_shared`].
+    ReleaseShared {
+        /// The pages given back.
         backing: BackingRange,
     },
     /// [`Mapper::map_shared`].
@@ -95,6 +125,12 @@ struct State {
     next: u64,
     /// What `map_shared` mapped and nothing has unmapped since: first address to the pages.
     shared: BTreeMap<u64, BackingRange>,
+    /// Every virtual page that maps a page of shared memory (through `map_shared` or a
+    /// `map_alias` of one) and that nothing has unmapped since, to that guest-physical page.
+    mapped_pages: BTreeMap<u64, u64>,
+    /// The runs `allocate_shared` handed out and `release_shared` has not taken back: first
+    /// address to one past the last.
+    handed_out: BTreeMap<u64, u64>,
 }
 
 impl Default for State {
@@ -108,6 +144,8 @@ impl Default for State {
             physical: Arc::new(FlatMemory::new(SHARED_BASE, capacity)),
             next: SHARED_BASE,
             shared: BTreeMap::new(),
+            mapped_pages: BTreeMap::new(),
+            handed_out: BTreeMap::new(),
         }
     }
 }
@@ -227,7 +265,9 @@ impl RecordingMapper {
             let number = state.counted;
             state.counted = state.counted.saturating_add(1);
             if state.refuse || state.refuse_calls.contains(&number) {
-                return Err(MapperError("the test told the mapper to refuse".into()));
+                return Err(MapperError::Refused(
+                    "the test told the mapper to refuse".into(),
+                ));
             }
             state.calls.push(call);
             Ok(())
@@ -251,6 +291,15 @@ impl Mapper for RecordingMapper {
             state
                 .shared
                 .retain(|start, _| !(address..end).contains(start));
+            // Bounded by the pages mapped, not by `size`.
+            let gone: Vec<u64> = state
+                .mapped_pages
+                .range(address..end)
+                .map(|(page, _)| *page)
+                .collect();
+            for page in gone {
+                state.mapped_pages.remove(&page);
+            }
         });
         Ok(())
     }
@@ -271,13 +320,45 @@ impl Mapper for RecordingMapper {
                 .filter(|end| *end <= SHARED_BASE + SHARED_CAPACITY)
                 .and_then(|_| BackingRange::new(state.next, size).ok())
                 .ok_or_else(|| {
-                    MapperError(format!("no room for {size:#x} bytes of shared memory"))
+                    MapperError::OutOfMemory(format!(
+                        "no room for {size:#x} bytes of shared memory"
+                    ))
                 })?;
             Ok::<_, MapperError>((backing, Arc::clone(&state.physical)))
         })?;
         self.record(MapperCall::AllocateShared { backing })?;
-        self.0.with(|state| state.next = backing.end());
+        self.0.with(|state| {
+            state.next = backing.end();
+            state.handed_out.insert(backing.base(), backing.end());
+        });
         Ok(SharedPages::new(backing, physical))
+    }
+
+    fn release_shared(&mut self, backing: BackingRange) -> Result<(), MapperError> {
+        self.0.with(|state| {
+            let (base, size) = (backing.base(), backing.size());
+            if state.handed_out.get(&base) != Some(&backing.end()) {
+                return Err(MapperError::Refused(format!(
+                    "the {size:#x} bytes at {base:#x} are not a shared memory this mapper \
+                     handed out"
+                )));
+            }
+            if let Some(address) = state
+                .mapped_pages
+                .iter()
+                .find(|(_, pa)| (base..backing.end()).contains(*pa))
+                .map(|(address, _)| *address)
+            {
+                return Err(MapperError::Refused(format!(
+                    "the {size:#x} bytes at {base:#x} are still mapped at {address:#x}"
+                )));
+            }
+            Ok(())
+        })?;
+        self.record(MapperCall::ReleaseShared { backing })?;
+        self.0
+            .with(|state| state.handed_out.remove(&backing.base()));
+        Ok(())
     }
 
     fn map_shared(
@@ -291,7 +372,15 @@ impl Mapper for RecordingMapper {
             backing,
             perms,
         })?;
-        self.0.with(|state| state.shared.insert(address, backing));
+        self.0.with(|state| {
+            state.shared.insert(address, backing);
+            let pages = (backing.base()..backing.end()).step_by(PAGE_STEP);
+            for (offset, pa) in (0..).step_by(PAGE_STEP).zip(pages) {
+                if let Some(va) = address.checked_add(offset) {
+                    state.mapped_pages.insert(va, pa);
+                }
+            }
+        });
         Ok(())
     }
 
@@ -307,6 +396,20 @@ impl Mapper for RecordingMapper {
             source,
             size,
             perms,
-        })
+        })?;
+        // The alias maps again whichever shared pages the source maps, bounded by those pages.
+        self.0.with(|state| {
+            let end = source.saturating_add(size);
+            let aliased: Vec<(u64, u64)> = state
+                .mapped_pages
+                .range(source..end)
+                .filter_map(|(page, pa)| {
+                    let va = address.checked_add(page.checked_sub(source)?)?;
+                    Some((va, *pa))
+                })
+                .collect();
+            state.mapped_pages.extend(aliased);
+        });
+        Ok(())
     }
 }

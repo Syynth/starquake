@@ -53,6 +53,18 @@
 //! guest sees the pages locked by an object that is gone. Test:
 //! `releasing_a_locked_transfer_memory_leaves_its_unlock_to_do`.
 //!
+//! # A shared memory's last reference
+//!
+//! Destroying a shared memory gives its pages back (`KSharedMemory::Finalize` closes its page
+//! group), which needs the address space whose translation handed them out, so it is a
+//! follow-up in the same way: [`Objects::release`] keeps the shared memory
+//! ([`Objects::take_frees`]), and the dispatcher gives its pages back to the translation before
+//! it lets the kernel lock go ([`crate::svc::shared_memory::free_released`]). Every mapping of
+//! a shared memory holds a reference to it, so when the last one goes no mapping is left; the
+//! translation still waits for the flushes the unmappings owe before it hands the pages out
+//! again ([`crate::memory::Mapper::release_shared`]). Test:
+//! `releasing_a_shared_memory_leaves_its_pages_to_give_back`.
+//!
 //! # Snapshots
 //!
 //! [`snapshot`] saves and restores the table with each process's handle table and the hooked
@@ -165,6 +177,9 @@ pub struct Objects {
     /// Transfer memories whose last reference went while their owner's pages were locked, in
     /// the order they went: the pages are still to be unlocked (see the module docs).
     unlocks: Vec<TransferMemory>,
+    /// Shared memories whose last reference went, in the order they went: their pages are
+    /// still to be given back (see the module docs).
+    frees: Vec<SharedMemory>,
 }
 
 impl Default for Objects {
@@ -180,6 +195,7 @@ impl Objects {
         Self {
             rows: Slab::new(),
             unlocks: Vec::new(),
+            frees: Vec::new(),
         }
     }
 
@@ -189,11 +205,20 @@ impl Objects {
         Self {
             rows: Slab::with_max_slots(max_slots),
             unlocks: Vec::new(),
+            frees: Vec::new(),
         }
     }
 
     fn stale(id: ObjectId) -> ObjectError {
         ObjectError::Stale { id }
+    }
+
+    /// Whether [`Objects::create`] would refuse for want of room ([`ObjectError::Full`]): what
+    /// a caller that must take something before it creates the object checks first, so that
+    /// a full table refuses before anything is taken.
+    #[must_use]
+    pub fn is_full(&self) -> bool {
+        self.rows.is_full()
     }
 
     /// Creates an object with one reference, its creator's (`KAutoObject::Create`). The creator
@@ -244,7 +269,8 @@ impl Objects {
 
     /// Drops one reference to `id`. If it was the last, the object's row is freed and the
     /// object it held is returned, so the caller can tear down what it named. A transfer
-    /// memory whose owner's pages are locked is kept for [`Objects::take_unlocks`] as well.
+    /// memory whose owner's pages are locked is kept for [`Objects::take_unlocks`] as well, and
+    /// a shared memory for [`Objects::take_frees`].
     pub fn release(&mut self, id: ObjectId) -> Result<Option<Object>, ObjectError> {
         let row = self.rows.get_mut(id).map_err(|_| Self::stale(id))?;
         if let Some(left) = NonZeroU32::new(row.refs.get() - 1) {
@@ -256,6 +282,9 @@ impl Objects {
             && transfer.is_locked()
         {
             self.unlocks.push(transfer);
+        }
+        if let Object::SharedMemory(memory) = row.object {
+            self.frees.push(memory);
         }
         Ok(Some(row.object))
     }
@@ -271,6 +300,18 @@ impl Objects {
     /// ([`crate::svc::transfer_memory::unlock_released`]).
     pub fn take_unlocks(&mut self) -> Vec<TransferMemory> {
         std::mem::take(&mut self.unlocks)
+    }
+
+    /// Whether a shared memory is gone whose pages are still to be given back.
+    #[must_use]
+    pub fn has_frees(&self) -> bool {
+        !self.frees.is_empty()
+    }
+
+    /// The shared memories that are gone, oldest first, and forgets them: the caller gives
+    /// their pages back ([`crate::svc::shared_memory::free_released`]).
+    pub fn take_frees(&mut self) -> Vec<SharedMemory> {
+        std::mem::take(&mut self.frees)
     }
 }
 
@@ -479,6 +520,54 @@ mod tests {
         assert_eq!(objects.take_unlocks(), vec![locked]);
         assert!(!objects.has_unlocks());
         assert_eq!(objects.take_unlocks(), Vec::new());
+    }
+
+    #[test]
+    fn releasing_a_shared_memory_leaves_its_pages_to_give_back() {
+        use starquake_memory::{BackingRange, PAGE_SIZE};
+
+        use crate::memory::{SharedMemory, SvcPermission};
+        let memory = |base| {
+            let backing = BackingRange::new(base, 2 * PAGE_SIZE).unwrap();
+            SharedMemory::new(backing, SvcPermission::Read).unwrap()
+        };
+        let (first, second) = (memory(0x10_0000), memory(0x20_0000));
+        let mut objects = Objects::new();
+        let a = objects.create(Object::SharedMemory(first)).unwrap();
+        let b = objects.create(Object::SharedMemory(second)).unwrap();
+        // A reference left (a mapping's, say): nothing to give back yet.
+        objects.open(a).unwrap();
+        assert_eq!(objects.release(a), Ok(None));
+        assert!(!objects.has_frees());
+        // Other kinds leave nothing to give back.
+        let other = objects.create(thread(1)).unwrap();
+        objects.release(other).unwrap();
+        assert!(!objects.has_frees());
+        // The last references, the second first, by a release and by a handle's close: kept in
+        // the order they went, and nothing for a transfer memory to unlock.
+        assert_eq!(objects.release(b), Ok(Some(Object::SharedMemory(second))));
+        assert!(objects.has_frees());
+        assert_eq!(objects.close(a), Ok(Closed::Last));
+        assert!(!objects.has_unlocks());
+        assert_eq!(objects.take_frees(), vec![second, first]);
+        assert!(!objects.has_frees());
+        assert_eq!(objects.take_frees(), Vec::new());
+    }
+
+    #[test]
+    fn a_table_is_full_exactly_when_create_would_refuse() {
+        let mut objects = Objects::with_max_slots(2);
+        assert!(!objects.is_full());
+        let first = objects.create(thread(0)).unwrap();
+        assert!(!objects.is_full());
+        objects.create(thread(1)).unwrap();
+        assert!(objects.is_full());
+        assert_eq!(
+            objects.create(thread(2)),
+            Err(ObjectError::Full { max_slots: 2 })
+        );
+        objects.release(first).unwrap();
+        assert!(!objects.is_full());
     }
 
     #[test]

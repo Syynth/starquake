@@ -51,11 +51,14 @@ fn unmapped_at<M: GuestMemory>(space: &AddressSpace<M>, va: u64) -> bool {
 }
 
 /// What [`snapshot`] takes: the next page of RAM, the mappings, the backed pages, the runs of
-/// RAM handed out as shared memory, and how many table pages are in use.
+/// RAM handed out as shared memory, the runs given back (waiting for a flush, then reusable),
+/// and how many table pages are in use.
 type Snapshot = (
     u64,
     Vec<(u64, Mapped)>,
     Vec<(u64, u64)>,
+    Vec<(u64, u64)>,
+    Vec<BackingRange>,
     Vec<(u64, u64)>,
     u64,
 );
@@ -68,6 +71,8 @@ fn snapshot<M: GuestMemory>(space: &AddressSpace<M>) -> Snapshot {
         shadow.mapped.iter().map(|(k, v)| (*k, *v)).collect(),
         shadow.backed.iter().map(|(k, v)| (*k, *v)).collect(),
         shadow.shared.iter().map(|(k, v)| (*k, *v)).collect(),
+        shadow.released.clone(),
+        shadow.reusable.iter().map(|(k, v)| (*k, *v)).collect(),
         space.tables.table_pages_in_use(),
     )
 }
@@ -653,7 +658,7 @@ fn the_kernels_mapper_drives_the_address_space_and_reports_refusals_in_words() {
     assert!(unmapped_at(&space, LOW));
     assert!(space.shadow().mapped.is_empty());
 
-    let refusal = |text: &str| Err(MapperError(text.to_owned()));
+    let refusal = |text: &str| Err(MapperError::Refused(text.to_owned()));
     assert_eq!(mapper.map(LOW, PAGE_SIZE, Perms::Read), Ok(()));
     assert_eq!(
         mapper.map(LOW, PAGE_SIZE, Perms::Read),

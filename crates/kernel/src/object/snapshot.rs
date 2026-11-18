@@ -20,7 +20,10 @@
 //! Not saved: the transfer memories released while their pages were locked
 //! ([`Objects::take_unlocks`]). The dispatcher unlocks them before it lets the kernel lock go,
 //! and a snapshot is taken between calls, so there are none; [`Objects::save`] refuses a table
-//! that has some ([`ObjectSnapshotError::PendingUnlocks`]). Not saved because it is not the
+//! that has some ([`ObjectSnapshotError::PendingUnlocks`]). Nor the shared memories released
+//! whose pages are still to be given back ([`Objects::take_frees`]), for the same reason:
+//! [`Objects::save`] refuses a table that has some ([`ObjectSnapshotError::PendingFrees`]),
+//! checked after the unlocks. Not saved because it is not the
 //! object table's: what a thread, process or session's own row holds (the scheduler and IPC
 //! tables), a shared memory's pages (guest memory) and the address spaces.
 //!
@@ -124,8 +127,10 @@
 //!   table issued, so no later object gets it.
 //! - **Shared memory.** [`SharedMemory::new`] refuses another permission; its pages come from
 //!   the address space's [`crate::memory::Mapper::allocate_shared`], which gives each shared
-//!   memory pages of its own, and pages are never given back while (or after) a shared memory
-//!   holds them (`memory::shared`, "Not built").
+//!   memory pages of its own: a live shared memory's pages are its own. They are given back
+//!   ([`crate::memory::Mapper::release_shared`]) only after its last reference went, and the
+//!   translation hands them out again only once every flush their unmappings owe has run
+//!   (`memory::shared`, "The pages' lifetime").
 //! - **Transfer memory.** `CreateTransferMemory` checks the permission
 //!   ([`crate::memory::is_transfer_memory_permission`]); an object whose pages are not locked
 //!   lives only inside that call, which closes it on every path that fails before the lock
@@ -367,6 +372,15 @@ pub enum ObjectSnapshotError {
         "released transfer memories whose pages are still locked: {count} (a snapshot is taken between calls, when there are none)"
     )]
     PendingUnlocks {
+        /// How many.
+        count: usize,
+    },
+    /// The table holds released shared memories whose pages are still to be given back: a
+    /// snapshot is taken between calls, when it holds none.
+    #[error(
+        "released shared memories whose pages are still to be given back: {count} (a snapshot is taken between calls, when there are none)"
+    )]
+    PendingFrees {
         /// How many.
         count: usize,
     },
@@ -742,6 +756,7 @@ impl Body {
         Ok(Objects {
             rows,
             unlocks: Vec::new(),
+            frees: Vec::new(),
         })
     }
 }
@@ -903,7 +918,9 @@ impl Objects {
     /// after checks 2 to 6 on what it is about to write against `kernel` and `spaces` (each
     /// process's address space, in process order): a failure is a bug in the kernel. A table
     /// with released transfer memories still to unlock is
-    /// [`ObjectSnapshotError::PendingUnlocks`], checked first.
+    /// [`ObjectSnapshotError::PendingUnlocks`], checked first; then one with released shared
+    /// memories whose pages are still to be given back is
+    /// [`ObjectSnapshotError::PendingFrees`].
     pub fn save(
         &self,
         handles: &[(ProcessId, &HandleTable)],
@@ -914,6 +931,11 @@ impl Objects {
         if !self.unlocks.is_empty() {
             return Err(ObjectSnapshotError::PendingUnlocks {
                 count: self.unlocks.len(),
+            });
+        }
+        if !self.frees.is_empty() {
+            return Err(ObjectSnapshotError::PendingFrees {
+                count: self.frees.len(),
             });
         }
         let body = Body::of(self, handles, hooked);
