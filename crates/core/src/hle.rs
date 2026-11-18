@@ -15,6 +15,10 @@
 //! [`GSV_ROOT`] that the private entry is registered under, to hand a session on it to the
 //! title.
 //!
+//! Parental control's four names (`pctl`, `pctl:a`, `pctl:s`, `pctl:r`) are four servers, one
+//! per name, known by [`PCTL`], [`PCTL_A`], [`PCTL_S`] and [`PCTL_R`]: each name's factory has a
+//! capability of its own (`starquake_services::pctl`, "Capabilities").
+//!
 //! The numbers ([`SM`], [`SET_SYS`], [`FSP_SRV`], [`APM`], [`APPLET_OE`], [`HID`], [`TIME_U`],
 //! [`GSV_ROOT`]) are starquake's own:
 //! Horizon names a service by its name only. They appear in the trace, as the `service` of an IPC
@@ -55,6 +59,7 @@ use starquake_services::apm;
 use starquake_services::framework::{Executor, Halt, Notify, UnknownPolicy};
 use starquake_services::fsp;
 use starquake_services::hid;
+use starquake_services::pctl;
 use starquake_services::set::{self, FirmwareVersion, Settings};
 use starquake_services::sm::{self, NameError, Registry, RegistryError, ServiceName};
 use starquake_services::time::{self, TimeSettings};
@@ -82,6 +87,23 @@ pub const HID: ServiceId = ServiceId(6);
 pub const TIME_U: ServiceId = ServiceId(7);
 /// The number the kernel knows the graphics server's root's server by.
 pub const GSV_ROOT: ServiceId = ServiceId(8);
+/// The number the kernel knows `pctl`'s server by.
+pub const PCTL: ServiceId = ServiceId(12);
+/// The number the kernel knows `pctl:a`'s server by.
+pub const PCTL_A: ServiceId = ServiceId(13);
+/// The number the kernel knows `pctl:s`'s server by.
+pub const PCTL_S: ServiceId = ServiceId(14);
+/// The number the kernel knows `pctl:r`'s server by.
+pub const PCTL_R: ServiceId = ServiceId(15);
+
+/// The parental-control names, each with the number its server is known by: one server per
+/// name, since each name's factory has its own capability ([`pctl::Name::capability`]).
+const PCTL_SERVICES: [(ServiceId, pctl::Name); 4] = [
+    (PCTL, pctl::Name::Pctl),
+    (PCTL_A, pctl::Name::A),
+    (PCTL_S, pctl::Name::S),
+    (PCTL_R, pctl::Name::R),
+];
 
 /// The services a run has, with the names they are known by.
 const SERVICES: &[(ServiceId, &str)] = &[
@@ -93,6 +115,10 @@ const SERVICES: &[(ServiceId, &str)] = &[
     (HID, hid::NAME),
     (TIME_U, time::NAME),
     (GSV_ROOT, root::ROOT_NAME),
+    (PCTL, pctl::Name::Pctl.as_str()),
+    (PCTL_A, pctl::Name::A.as_str()),
+    (PCTL_S, pctl::Name::S.as_str()),
+    (PCTL_R, pctl::Name::R.as_str()),
 ];
 
 /// The name of the service a number stands for, if a run has it.
@@ -186,6 +212,9 @@ pub fn install(
     registry.register(ServiceName::new(hid::NAME)?, HID)?;
     registry.register(ServiceName::new(time::NAME)?, TIME_U)?;
     registry.register_private(ServiceName::new(root::ROOT_NAME)?, GSV_ROOT)?;
+    for (number, name) in PCTL_SERVICES {
+        registry.register(ServiceName::new(name.as_str())?, number)?;
+    }
 
     let manager = sm::server(registry, policy).with_service_id(SM);
     let port = PortName::new(sm::PORT_NAME)?;
@@ -228,6 +257,11 @@ pub fn install(
     let clocks =
         time::server(TimeSettings::eden_default(), policy, env, reads.halt).with_service_id(TIME_U);
     dispatcher.add_server(time::NAME, TIME_U, None, Box::new(clocks))?;
+
+    for (number, name) in PCTL_SERVICES {
+        let parental = pctl::server(name, policy).with_service_id(number);
+        dispatcher.add_server(name.as_str(), number, None, Box::new(parental))?;
+    }
     Ok(())
 }
 

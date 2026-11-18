@@ -326,8 +326,13 @@ fn every_service_has_its_name_and_no_other_number_has_one() {
     assert_eq!(service_name(HID), Some("hid"));
     assert_eq!(service_name(TIME_U), Some("time:u"));
     assert_eq!(service_name(GSV_ROOT), Some("gsv"));
+    assert_eq!(service_name(PCTL), Some("pctl"));
+    assert_eq!(service_name(PCTL_A), Some("pctl:a"));
+    assert_eq!(service_name(PCTL_S), Some("pctl:s"));
+    assert_eq!(service_name(PCTL_R), Some("pctl:r"));
     assert_eq!(service_name(ServiceId(0)), None);
     assert_eq!(service_name(ServiceId(9)), None);
+    assert_eq!(service_name(ServiceId(16)), None);
 }
 
 #[test]
@@ -870,4 +875,54 @@ fn time_u_hands_out_its_clocks_its_shared_memory_and_a_calendar_time() {
     assert_eq!(data[8..16], [0; 8]);
     assert_eq!(data[16..24], time::calendar::UTC_NAME);
     assert_eq!(rig.ipc().last(), Some(&(TIME_U, to_calendar)));
+}
+
+/// Each parental-control name, as libnx starts it (`_pctlInitialize`): the session made a
+/// domain, `CreateServiceWithoutInitialize` with the process id, then `Initialize` on the
+/// object it returned. `pctl`'s factory has a capability `Initialize` accepts; the other three
+/// names' have none (`pctl::Name::capability`).
+#[test]
+fn every_pctl_name_hands_out_a_service_that_initializes_by_its_capability() {
+    let rig = Rig::new();
+    let factory = pctl::IParentalControlServiceFactory;
+    let create = command(&factory, "create_service_without_initialize");
+    let initialize = command(&pctl::IParentalControlService::default(), "initialize");
+    for (number, name) in PCTL_SERVICES {
+        // The number a name is registered and dispatched under is the one the trace names it
+        // by, so a swapped pair in `PCTL_SERVICES` shows here.
+        assert_eq!(service_name(number), Some(name.as_str()));
+        let session = rig.service(name.as_str());
+        let root = rig.convert(session);
+        let request = domain(root, &factory, "create_service_without_initialize")
+            .send_pid(0)
+            .data(&0_u64.to_le_bytes());
+        let (code, buffer) = rig.send(session, &request);
+        let (word, _, objects) = domain_reply(&buffer, 0);
+        assert_eq!((code, word), (ResultCode::SUCCESS, 0), "{}", name.as_str());
+        assert_eq!(objects.len(), 1);
+
+        let request = domain(
+            objects[0],
+            &pctl::IParentalControlService::default(),
+            "initialize",
+        );
+        let (code, buffer) = rig.send(session, &request);
+        let (word, _, _) = domain_reply(&buffer, 0);
+        let expected = if name == pctl::Name::Pctl {
+            ResultCode::SUCCESS
+        } else {
+            pctl::NO_CAPABILITY
+        };
+        assert_eq!(
+            (code, word),
+            (ResultCode::SUCCESS, expected.raw()),
+            "{}",
+            name.as_str()
+        );
+        let ipc = rig.ipc();
+        assert_eq!(
+            ipc[ipc.len() - 2..],
+            [(number, create), (number, initialize)]
+        );
+    }
 }
