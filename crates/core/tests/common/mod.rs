@@ -19,6 +19,7 @@ pub fn run(file: &[u8], timeout: Duration) -> Option<RunReport> {
         command_line: Vec::new(),
         sd_card: None,
         romfs: None,
+        rtc: starquake_core::RtcAtBoot::eden_default(),
     };
     match System::new(file) {
         Ok(system) => Some(system.run(&options)),

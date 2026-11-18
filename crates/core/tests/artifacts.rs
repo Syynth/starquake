@@ -80,6 +80,7 @@ mod support {
             services: ServicesReport::default(),
             host_log: vec!["WARN starquake_services::sm: one".to_owned()],
             host_log_dropped: 0,
+            date: None,
         }
     }
 

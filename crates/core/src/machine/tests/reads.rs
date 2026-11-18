@@ -430,6 +430,7 @@ fn run_reading(test: &str, romfs: RomFs, timeout: Duration) -> (RunReport, Seen)
         command_line: Vec::new(),
         sd_card: Some(scratch.path()),
         romfs: Some(romfs),
+        rtc: RtcAtBoot::eden_default(),
     };
     let report = run(
         vcpus(&mut main),
@@ -538,6 +539,7 @@ fn a_read_held_at_the_title_does_not_hold_up_a_card_read() {
         command_line: Vec::new(),
         sd_card: Some(scratch.path()),
         romfs: Some(romfs),
+        rtc: RtcAtBoot::eden_default(),
     };
     let memory = FlatMemory::new(RAM_BASE, RAM_SIZE);
     let session = session_over(&memory, &options);
@@ -677,6 +679,10 @@ impl Env for FailsHostIo {
     fn host_io(&self, _: &HostIoRequest) -> Result<HostIoReply, EnvError> {
         Err(HOST_IO_FAILURE)
     }
+
+    fn wall_clock(&self) -> Result<starquake_trace::UnixSeconds, EnvError> {
+        self.0.wall_clock()
+    }
 }
 
 /// `sm:`'s `Initialize` and `GetService(service)`, then the requests `requests` makes, each sent
@@ -766,6 +772,7 @@ fn run_failed(
         command_line: Vec::new(),
         sd_card: None,
         romfs: Some(romfs().0),
+        rtc: RtcAtBoot::eden_default(),
     };
     let report = run_serving(
         vcpus(&mut main),
@@ -827,6 +834,10 @@ impl Env for FailsRandom {
 
     fn host_io(&self, request: &HostIoRequest) -> Result<HostIoReply, EnvError> {
         self.0.host_io(request)
+    }
+
+    fn wall_clock(&self) -> Result<starquake_trace::UnixSeconds, EnvError> {
+        self.0.wall_clock()
     }
 }
 
