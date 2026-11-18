@@ -33,6 +33,7 @@ use starquake_trace::{EnvCall, EnvError, HostIoReply, HostIoRequest, HostNanos};
 use super::*;
 use crate::hle::graphics::KernelHost;
 
+mod video;
 mod vsync;
 
 /// Where nvsrv's ioctl arguments and their out buffers go: the third page, in and out halves.
@@ -225,11 +226,11 @@ impl Rig {
             .collect()
     }
 
-    /// What each of gsv's four servers saves now, by number.
+    /// What each of gsv's five servers saves now, by number.
     fn gsv_servers(&self) -> Vec<(ServiceId, Vec<u8>)> {
         let mut saved = Vec::new();
         let out = self.dispatcher.inspect_handlers(|service, handler| {
-            let gsv = [GSV_ROOT, GSV_SYNCPT, GSV_GPU, GSV_NVSRV];
+            let gsv = [GSV_ROOT, GSV_SYNCPT, GSV_GPU, GSV_NVSRV, GSV_VIDEO];
             if gsv.contains(&service) {
                 let handler: &dyn core::any::Any = handler;
                 let server = handler
@@ -442,7 +443,7 @@ fn notes(events: &[(u8, ThreadId, EventKind)]) -> Vec<Note> {
 }
 
 /// The state a replay is compared on: gsv's shared state, the shared page, its GPU memory, the
-/// syncpoints, the queue, the four servers, and the GPU front's channels.
+/// syncpoints, the queue, the five servers, and the GPU front's channels.
 fn state_of(rig: &Rig, graphics: &Graphics) -> Vec<Vec<u8>> {
     let shared = graphics.shared();
     let mut state = vec![
@@ -611,7 +612,7 @@ fn a_run_s_turns_complete_what_waits_on_the_gpu() {
 /// ([`Graphics::replay`]) where the run's turns drained them, each note then a turn. The two
 /// event streams (every system call, IPC event, wake and note, by core and thread) are the
 /// same, and so is the state: gsv's shared state, its page, its GPU memory, the syncpoints, the
-/// queue, the front's channels and the four servers' snapshots.
+/// queue, the front's channels and the five servers' snapshots.
 #[test]
 fn a_recorded_session_replays_to_the_same_state() {
     let run = Graphics::new(FrontMode::Live, None);
