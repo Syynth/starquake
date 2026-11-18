@@ -193,6 +193,10 @@ impl Env for Broken {
     fn host_io(&self, _: &HostIoRequest) -> Result<HostIoReply, EnvError> {
         Err(broken_error())
     }
+
+    fn wall_clock(&self) -> Result<UnixSeconds, EnvError> {
+        Ok(UnixSeconds(0))
+    }
 }
 
 /// `OpenDataStorageByCurrentProcess` on a fresh server over `env`.

@@ -15,7 +15,9 @@ use starquake_kernel::handle::Handle;
 use starquake_kernel::id::ObjectId;
 use starquake_kernel::memory::SvcPermission;
 use starquake_kernel::result::{KernelError, ResultCode};
-use starquake_trace::{EnvCall, EnvError, EnvRecord, FixedClock, LiveEnv, ReplayEnv};
+use starquake_trace::{
+    EnvCall, EnvError, EnvRecord, FixedClock, FixedWallClock, LiveEnv, ReplayEnv, UnixSeconds,
+};
 
 use super::calendar::{REPLY_SIZE, SECONDS_PER_DAY, UTC_NAME, to_calendar_time_utc};
 use super::command::static_service::{
@@ -462,6 +464,155 @@ fn the_clocks_follow_the_settings_and_the_environment() {
     assert_eq!(read, TimeSettings::EDEN_INITIAL_YEAR_START + 3);
 }
 
+// ----- the run's date ------------------------------------------------------------------------
+
+/// A live environment whose wall clock reads `date`.
+fn dated(date: i64) -> LiveEnv {
+    LiveEnv::new(FixedClock::new(0, 1), SEED).with_wall_clock(FixedWallClock(UnixSeconds(date)))
+}
+
+#[test]
+fn the_defaults_pin_the_first_second_of_eden_s_initial_year() {
+    // 2023-01-01T00:00:00 UTC (`set/system_settings_server.cpp`: `ToBytes(s32{2023})`), written
+    // out, and automatic correction on (`system_settings.cpp`).
+    assert_eq!(
+        TimeSettings::eden_default(),
+        TimeSettings {
+            rtc_at_boot: 1_672_531_200,
+            automatic_correction: true,
+        }
+    );
+    assert_eq!(
+        RtcAtBoot::eden_default(),
+        RtcAtBoot::Pinned(UnixSeconds(1_672_531_200))
+    );
+    assert_eq!(RtcAtBoot::default(), RtcAtBoot::eden_default());
+    let env = dated(7);
+    assert_eq!(
+        TimeSettings::at_boot(RtcAtBoot::default(), &env),
+        Ok(TimeSettings::eden_default())
+    );
+    assert_eq!(env.recording(), []);
+}
+
+#[test]
+fn the_hosts_date_is_the_rtc_at_boot() {
+    for date in [-1, 0, 1_709_164_800] {
+        let env = dated(date);
+        assert_eq!(
+            TimeSettings::at_boot(RtcAtBoot::Host, &env),
+            Ok(TimeSettings {
+                rtc_at_boot: date,
+                automatic_correction: true,
+            })
+        );
+        // Read once, and recorded.
+        assert_eq!(env.recording(), [EnvRecord::WallClock(UnixSeconds(date))]);
+    }
+}
+
+#[test]
+fn a_pinned_date_wins_over_the_hosts_and_reads_nothing() {
+    let env = dated(1_709_164_800);
+    for pinned in [-86_399, 0, 951_782_400] {
+        assert_eq!(
+            TimeSettings::at_boot(RtcAtBoot::Pinned(UnixSeconds(pinned)), &env),
+            Ok(TimeSettings::with_rtc(UnixSeconds(pinned)))
+        );
+    }
+    assert_eq!(env.recording(), []);
+    // So a pinned run replays from a recording with no reading in it.
+    let replay = ReplayEnv::new(Vec::new());
+    assert_eq!(
+        TimeSettings::at_boot(RtcAtBoot::Pinned(UnixSeconds(5)), &replay),
+        Ok(TimeSettings::with_rtc(UnixSeconds(5)))
+    );
+    assert_eq!(replay.finish(), Ok(()));
+}
+
+#[test]
+fn a_live_reading_of_the_hosts_date_is_recorded_and_replayed_exactly() {
+    // The real host's clock, through the environment a run makes.
+    let live = LiveEnv::new(FixedClock::new(0, 1), SEED);
+    let settings = TimeSettings::at_boot(RtcAtBoot::Host, &live).unwrap();
+    let recording = live.recording();
+    assert_eq!(
+        recording,
+        [EnvRecord::WallClock(UnixSeconds(settings.rtc_at_boot))]
+    );
+    let replay = ReplayEnv::new(recording);
+    assert_eq!(
+        TimeSettings::at_boot(RtcAtBoot::Host, &replay),
+        Ok(settings)
+    );
+    assert_eq!(replay.finish(), Ok(()));
+}
+
+#[test]
+fn a_replay_without_the_date_is_the_environment_s_error() {
+    let missing = ReplayEnv::new(Vec::new());
+    assert_eq!(
+        TimeSettings::at_boot(RtcAtBoot::Host, &missing),
+        Err(EnvError::Exhausted {
+            index: 0,
+            requested: EnvCall::WallClock,
+        })
+    );
+    let other = ReplayEnv::new(vec![EnvRecord::Random(1_709_164_800)]);
+    assert_eq!(
+        TimeSettings::at_boot(RtcAtBoot::Host, &other),
+        Err(EnvError::Mismatch {
+            index: 0,
+            requested: EnvCall::WallClock,
+            recorded: EnvCall::Random,
+        })
+    );
+}
+
+#[test]
+fn the_calendar_answers_follow_the_rtc_at_the_edges() {
+    // The RTC from the host's reading, with no uptime: what libnx reads from the shared memory
+    // (`_timeReadClockFromSharedMem`: the context's offset plus the steady clock's seconds), sent
+    // to `ToCalendarTimeWithMyRule`, gives the RTC's calendar time. Each expectation is written
+    // out: (year, month, day, hour, minute, second, day of week, day of year).
+    let cases: [(i64, Fields); 7] = [
+        (-1, (1969, 12, 31, 23, 59, 59, 3, 364)), // the last second before the epoch
+        (0, (1970, 1, 1, 0, 0, 0, 4, 0)),         // the epoch second, a Thursday
+        (1, (1970, 1, 1, 0, 0, 1, 4, 0)),
+        (1_709_164_799, (2024, 2, 28, 23, 59, 59, 3, 58)), // the second before a leap day
+        (1_709_164_800, (2024, 2, 29, 0, 0, 0, 4, 59)),    // the leap day's first second
+        (1_709_251_199, (2024, 2, 29, 23, 59, 59, 4, 59)), // and its last
+        (1_709_251_200, (2024, 3, 1, 0, 0, 0, 5, 60)),     // the day after it
+    ];
+    for (date, expected) in cases {
+        let settings = TimeSettings::at_boot(RtcAtBoot::Host, &dated(date)).unwrap();
+        let mut rig = Rig::with(settings, 0);
+        rig.memory();
+        let contents = rig.clocks().set_up().unwrap().contents;
+        let now = contents.local.offset + contents.steady.time_point / NANOSECONDS_PER_SECOND;
+        assert_eq!(now, date, "{date}");
+        let zone = rig.open(GET_TIME_ZONE_SERVICE);
+        let request = libnx_request(TO_CALENDAR_TIME_WITH_MY_RULE).data(&now.to_le_bytes());
+        let reply = rig.send_raw(zone, &request);
+        let header = buffer_of(&[0, 6 + 8, 0, 0, SFCO_MAGIC, 0, ResultCode::SUCCESS.raw(), 0]);
+        assert_eq!(reply[..32], header[..32], "{date}");
+        let data = &reply[32..32 + REPLY_SIZE];
+        let byte = |at: usize| i8::from_le_bytes([data[at]]);
+        let word = |at: usize| i32::from_le_bytes(data[at..at + 4].try_into().unwrap());
+        let answered: Fields = (
+            i16::from_le_bytes([data[0], data[1]]),
+            byte(2),
+            byte(3),
+            byte(4),
+            byte(5),
+            byte(6),
+            word(8),
+            word(12),
+        );
+        assert_eq!(answered, expected, "{date}");
+    }
+}
+
 #[test]
 fn a_second_request_gets_the_same_memory_and_reads_nothing() {
     let mut rig = Rig::new();
@@ -595,8 +746,10 @@ fn a_base_past_the_nanoseconds_an_i64_holds_is_an_overflow() {
         };
         set_up(&settings, source, Uptime(uptime)).map(|c| c.steady.time_point)
     };
-    let last = i64::MAX / NANOSECONDS_PER_SECOND;
-    let first = i64::MIN / NANOSECONDS_PER_SECOND;
+    let (first, last) = (FIRST_RTC_AT_BOOT, LAST_RTC_AT_BOOT);
+    // The bounds as written out: `i64::MAX` and `i64::MIN` nanoseconds in whole seconds,
+    // truncated toward zero.
+    assert_eq!((first, last), (-9_223_372_036, 9_223_372_036));
     let overflow = Err(Fault::Result(OVERFLOW));
     // The base: the last and first whole seconds that fit, and one past each.
     assert_eq!(at(last, 0), Ok(last * NANOSECONDS_PER_SECOND));
@@ -605,6 +758,7 @@ fn a_base_past_the_nanoseconds_an_i64_holds_is_an_overflow() {
     assert_eq!(at(first - 1, 0), overflow);
     // The base plus the uptime: exactly `i64::MAX`, and one past it.
     let room = i64::MAX - last * NANOSECONDS_PER_SECOND;
+    assert_eq!(room, 854_775_807);
     assert!(at(last, room).is_ok());
     assert_eq!(at(last, room + 1), overflow);
 

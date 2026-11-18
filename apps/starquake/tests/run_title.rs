@@ -27,6 +27,8 @@ const NPDM: &[u8] = include_bytes!("../../../tests/homebrew/hello/main.npdm");
 /// A synthetic title id.
 const TITLE_ID: u64 = 0x0100_0000_0000_5000;
 
+mod common;
+
 /// Bytes that are not an NSO.
 const NOT_AN_NSO: &[u8] = b"nope";
 
@@ -82,11 +84,11 @@ mod support {
         write(folder, "title.nup", &build::build(packages).unwrap().bytes)
     }
 
-    /// `run <program> --artifacts <folder>/artifacts --until timeout=30s`; returns what it
-    /// printed and the artifacts folder.
+    /// `run <program> --artifacts <folder>/artifacts --until timeout=30s --date <the pinned
+    /// date>`; returns what it printed and the artifacts folder.
     pub(crate) fn run(program: &Path) -> (Ran, PathBuf) {
         let artifacts = program.parent().unwrap().join("artifacts");
-        let line: Vec<OsString> = vec![
+        let mut line: Vec<OsString> = vec![
             "starquake".into(),
             "run".into(),
             program.into(),
@@ -95,6 +97,7 @@ mod support {
             "--until".into(),
             "timeout=30s".into(),
         ];
+        line.extend(common::pinned_date());
         let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
         let code = starquake::execute(&line, &mut stdout, &mut stderr);
         let ran = Ran {

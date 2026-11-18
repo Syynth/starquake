@@ -9,8 +9,8 @@
 //! clock and file calls in the kernel and service crates is a separate piece of work (spec,
 //! "Order of work" step 2) and is not part of this crate.
 //!
-//! * [`LiveEnv`] reads a [`HostClock`], a seeded random generator and an optional
-//!   [`HostIoHandler`], and records every answer as an [`EnvRecord`].
+//! * [`LiveEnv`] reads a [`HostClock`], a [`HostWallClock`], a seeded random generator and an
+//!   optional [`HostIoHandler`], and records every answer as an [`EnvRecord`].
 //! * [`ReplayEnv`] is built from such a recording, hands the answers back in order, and reports
 //!   the first call that does not match.
 //!
@@ -24,6 +24,15 @@
 //! layered on it (or to replace it with typed methods) when its owning service is written; until
 //! then a [`LiveEnv`] with no handler answers [`HostIoReply::Unavailable`], and that answer is
 //! recorded and replayed like any other.
+//!
+//! **The wall clock.** The run's date is one reading of the host's wall clock, taken at boot and
+//! recorded, so a replay reproduces it (spec, rule 1, as amended on 2026-11-17: "The wall clock is
+//! one reading taken at boot and recorded"). [`Env::wall_clock`] is that reading. Reading it once
+//! is the caller's part: `starquake-core` reads it as a run boots, and only when no setting pins
+//! the date (`starquake_services::time::RtcAtBoot`). A replay whose recording has no reading where
+//! the boot asks for one fails like any other call ([`EnvError::Exhausted`] or
+//! [`EnvError::Mismatch`]), and that stops the run as an emulator error (decision log,
+//! 2026-11-17, "Env failures").
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -33,8 +42,21 @@ use crate::event::HostNanos;
 mod live;
 mod replay;
 
-pub use live::{FixedClock, HostClock, HostIoHandler, LiveEnv, SystemClock};
+pub use live::{
+    FixedClock, FixedWallClock, HostClock, HostIoHandler, HostWallClock, LiveEnv, SystemClock,
+    SystemWallClock,
+};
 pub use replay::ReplayEnv;
+
+/// A wall-clock reading: whole seconds since 1970-01-01T00:00:00 UTC, the unit of Horizon's RTC
+/// and of the reading Eden takes (`eden/src/core/hle/service/glue/time/
+/// standard_steady_clock_resource.cpp`, `GetTimeInSeconds`: `duration_cast<seconds>(
+/// system_clock::now().time_since_epoch()).count()`, an `s64`).
+///
+/// Not [`HostNanos`]: that is a monotonic reading from a zero the run chooses, and this is the
+/// calendar's. `starquake_services::time` is the one place a reading becomes the RTC.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct UnixSeconds(pub i64);
 
 /// A request on the host I/O extension point.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,6 +88,8 @@ pub enum EnvCall {
     Random,
     /// [`Env::host_io`].
     HostIo,
+    /// [`Env::wall_clock`].
+    WallClock,
 }
 
 /// One answer an [`Env`] gave, in the order given.
@@ -82,6 +106,8 @@ pub enum EnvRecord {
         /// What came back.
         reply: HostIoReply,
     },
+    /// A wall-clock reading (see [`Env::wall_clock`]).
+    WallClock(UnixSeconds),
 }
 
 impl EnvRecord {
@@ -92,6 +118,7 @@ impl EnvRecord {
             Self::Clock(_) => EnvCall::Clock,
             Self::Random(_) => EnvCall::Random,
             Self::HostIo { .. } => EnvCall::HostIo,
+            Self::WallClock(_) => EnvCall::WallClock,
         }
     }
 }
@@ -153,4 +180,12 @@ pub trait Env: Send + Sync {
     /// The host I/O extension point (see the module docs): send a request to the host and get its
     /// reply.
     fn host_io(&self, request: &HostIoRequest) -> Result<HostIoReply, EnvError>;
+
+    /// Read the host's wall clock: the calendar time now, in whole seconds (module docs, "The
+    /// wall clock").
+    ///
+    /// Not guest time and not [`Env::now`]'s clock: the two are read from different host clocks
+    /// and nothing relates their zeros. Successive readings may go backwards (the host's clock
+    /// can be set), which is why a run reads it once.
+    fn wall_clock(&self) -> Result<UnixSeconds, EnvError>;
 }

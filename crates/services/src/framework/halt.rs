@@ -87,7 +87,7 @@
 use std::sync::Arc;
 
 use starquake_kernel::result::ResultCode;
-use starquake_trace::{Env, EnvError, HostIoReply, HostIoRequest, HostNanos};
+use starquake_trace::{Env, EnvError, HostIoReply, HostIoRequest, HostNanos, UnixSeconds};
 
 use super::result::{DEFERRED_REPLY_DROPPED, Fault};
 use crate::fsp::worker::ReplayError;
@@ -183,6 +183,10 @@ impl Env for Watched {
 
     fn host_io(&self, request: &HostIoRequest) -> Result<HostIoReply, EnvError> {
         self.told(self.env.host_io(request))
+    }
+
+    fn wall_clock(&self) -> Result<UnixSeconds, EnvError> {
+        self.told(self.env.wall_clock())
     }
 }
 
