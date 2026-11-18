@@ -1876,6 +1876,55 @@ fn a_run_whose_only_thread_waits_for_a_deferred_reply_is_not_stalled() {
 }
 
 #[test]
+fn a_sender_whose_process_a_delivery_ends_is_never_seen_runnable() {
+    // Another thread (a core asking what to run) looks at A's thread, over and over, while
+    // the delivery answers A and ends its process. Its reply and the end come under one hold
+    // of the lock, so A goes from waiting to ended and no core could have run it in between.
+    // A watcher that sees it runnable proves the window open; one that does not cannot prove
+    // it shut, so this pins the order only as often as the watcher lands in the window.
+    const LOOKS: Duration = Duration::from_secs(10);
+    let (world, thread) = world_running_a_user_thread(A);
+    let handle = world.session();
+    let session = world.object(handle);
+    world
+        .first
+        .script(Box::new(|_, _, _| Ok(Handled::Deferred)));
+    world.send(A, handle, &request());
+    let a = world.with_tables(|_, scheduler| match scheduler.objects().get(thread) {
+        Ok(Object::Thread(id)) => id,
+        other => unreachable!("{other:?} is not a thread"),
+    });
+    lock(&world.first.hooks).take_reply = Some(Box::new(|cx| cx.end_process()));
+    lock(&world.first.ready).push_back((session, Ok(0xA0)));
+    let (watching, watched) = mpsc::sync_channel(1);
+    let world = &world;
+    let seen = std::thread::scope(|scope| {
+        let watcher = scope.spawn(move || {
+            let started = std::time::Instant::now();
+            let mut seen = Vec::new();
+            watching.send(()).unwrap();
+            while started.elapsed() < LOOKS {
+                let state =
+                    world.with_tables(|_, scheduler| scheduler.thread(a).unwrap().state());
+                if seen.last() != Some(&state) {
+                    seen.push(state);
+                }
+                if state == ThreadState::Terminated {
+                    break;
+                }
+            }
+            seen
+        });
+        watched.recv_timeout(LOOKS).unwrap();
+        assert_eq!(world.deliver(&world.first).len(), 1);
+        watcher.join().unwrap()
+    });
+    assert_eq!(seen.last(), Some(&ThreadState::Terminated), "{seen:?}");
+    assert!(!seen.contains(&ThreadState::Runnable), "{seen:?}");
+    assert_eq!(world.tls(A), [0xA0; BUFFER_SIZE]);
+}
+
+#[test]
 fn a_run_whose_process_a_delivery_ended_is_not_stalled() {
     // What a core that parks after the timer thread's delivery ended the process, and before
     // the timer thread stops the run, sees: nothing could run or end a wait, but the run is
@@ -2574,19 +2623,51 @@ fn a_dispatch_that_ends_another_process_returns_its_own_result() {
 }
 
 #[test]
-fn ending_a_process_that_has_ended_already_returns_the_calls_own_outcome() {
+fn ending_a_process_that_has_ended_already_fails_and_reports_nothing() {
     let (world, thread) = world_running_a_user_thread(A);
     let process = world.with_tables(|_, scheduler| process_of(scheduler, thread));
     let (record, _) = world.call(A, SvcId::ExitProcess, 0, 0);
     assert_eq!(record.outcome, Outcome::ProcessExited);
-    for own in [Outcome::Completed, Outcome::Waiting] {
-        assert_eq!(
-            world
-                .dispatcher
-                .end_process(process, own.clone(), &world.recorder, GuestTicks(0)),
-            own
-        );
-    }
+    drop(world.dispatcher.take_woken());
+    let before = world.events().len();
+    let mut locked = world.dispatcher.lock::<(&mut HandleTable, &mut Scheduler)>();
+    assert!(!terminate_asked(
+        &mut locked,
+        process,
+        &world.recorder,
+        GuestTicks(0)
+    ));
+    drop(locked);
+    assert_eq!(world.events().len(), before);
+    assert_eq!(world.dispatcher.take_woken(), []);
+}
+
+#[test]
+fn a_delivery_does_not_report_an_end_asked_for_a_process_that_ended_meanwhile() {
+    // A's request is deferred and still in flight, holding its session, when the process ends
+    // by `ExitProcess` (from C, a host thread). The handler then asks to end the process as it
+    // gives the reply: there is nothing left to end, and nothing is reported.
+    let (world, thread) = world_running_a_user_thread(A);
+    let handle = world.session();
+    let session = world.object(handle);
+    world
+        .first
+        .script(Box::new(|_, _, _| Ok(Handled::Deferred)));
+    world.send(A, handle, &request());
+    run_thread_for(&world, C);
+    let (record, _) = world.call(C, SvcId::ExitProcess, 0, 0);
+    assert_eq!(record.outcome, Outcome::ProcessExited);
+    assert_eq!(holdings(&world, thread).3, true);
+    let asked = Arc::new(Mutex::new(0));
+    let counted = Arc::clone(&asked);
+    lock(&world.first.hooks).take_reply = Some(Box::new(move |cx| {
+        cx.end_process();
+        *lock(&counted) += 1;
+    }));
+    lock(&world.first.ready).push_back((session, Ok(0xA0)));
+    assert_eq!(world.deliver(&world.first), []);
+    // The handler was asked for the reply, so the end was asked for.
+    assert_eq!(*lock(&asked), 1);
 }
 
 /// A world whose process runs a user thread on A's core, with a thread of no process on B's

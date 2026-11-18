@@ -46,9 +46,10 @@
 //! handles are taken back in the order they were placed (the framework places copies and then
 //! moves, `eden/src/core/hle/service/hle_ipc.cpp`, `WriteToOutgoingCommandBuffer`), before the
 //! sender is woken with its result, its request's references are released and its events are
-//! recorded (`Dispatcher::settle`). Those steps happen under one hold of the kernel lock, so no
-//! other thread sees between them: their order follows Eden's, and only the order in which the
-//! handles are taken back is observable (a taken-back session's server is told in that order).
+//! recorded (`settle_one` in `dispatch/ipc.rs`). Those steps happen under one hold of the
+//! kernel lock, so no other thread sees between them: their order follows Eden's, and only the
+//! order in which the handles are taken back is observable (a taken-back session's server is
+//! told in that order).
 //! Test: `rollback::taken_back_sessions_are_torn_down_and_their_servers_told_in_the_order_placed`.
 //!
 //! A taken-back handle is removed as `CloseHandle` removes one

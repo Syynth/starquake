@@ -166,8 +166,8 @@ use starquake_trace::{
 
 use super::sync::drain_wakes;
 use super::{
-    Call, Caller, Dispatcher, Outcome, State, Tables, complete, fault, mismatch, record_point,
-    recorded_args, result_word,
+    Call, Caller, Dispatcher, Locked, Outcome, State, Tables, complete, fault, mismatch,
+    record_point, recorded_args, result_word,
 };
 use crate::handle::{Handle, HandleError, HandleTable};
 use crate::id::{ObjectId, ProcessId, ServerId};
@@ -752,21 +752,9 @@ impl Dispatcher {
         drop(locked);
 
         let finished = self.deliver_owed(server, caller.memory, process_id);
-        let asked = asked(&finished);
-        let woken = self.settle(finished, caller.memory, caller.recorder, time);
-        let mut locked = self.lock::<()>();
-        locked.state.woken.extend(woken);
-        // Waits the handler's signals ended (`dispatch/sync.rs`).
-        drain_wakes(&mut locked.state, caller.recorder, time);
-        drop(locked);
-        // Only now that every reply is written and recorded (services spec: "the reply is
-        // sent, and then the kernel tears the process down").
-        let mut ended = Vec::new();
-        for end in asked {
-            if self.terminate_asked(end.process, caller.recorder, time) {
-                ended.push(end);
-            }
-        }
+        // No sender is the delivering thread's own: every one is reported woken.
+        let (_, ended) =
+            self.settle_and_end(finished, None, caller.memory, caller.recorder, time);
         self.settle_notices();
         Ok(ended)
     }
@@ -1011,83 +999,78 @@ impl Dispatcher {
         // Replies said to be ready while this core had the handler out are this core's to
         // deliver now that it is back.
         finished.extend(self.deliver_owed(server, call.caller.memory, process_id));
-        let own = call.caller.thread;
-        let asked = asked(&finished);
-        let mut woken = self.settle(finished, call.caller.memory, call.caller.recorder, time);
-        let outcome = match woken.iter().position(|woken| woken.thread == own) {
-            Some(index) => {
-                let mine = woken.remove(index);
-                answer(id, convention, call.regs, mine.result)
+        let (mine, ended) = self.settle_and_end(
+            finished,
+            Some(call.caller.thread),
+            call.caller.memory,
+            call.caller.recorder,
+            time,
+        );
+        let outcome = if ended.iter().any(|end| end.process == caller_process) {
+            // The caller's own process ended (module docs): its result is written, and the
+            // call ends as `ExitProcess` does.
+            if let Some(mine) = mine {
+                answer(id, convention, call.regs, mine.result);
             }
-            // Deferred: the caller waits for its reply.
-            None => Outcome::Waiting,
+            Outcome::ProcessExited
+        } else {
+            match mine {
+                Some(mine) => answer(id, convention, call.regs, mine.result),
+                // Deferred: the caller waits for its reply.
+                None => Outcome::Waiting,
+            }
         };
-        let mut locked = self.lock::<()>();
-        locked.state.woken.extend(woken);
-        // Waits the handler's signals ended (`dispatch/sync.rs`).
-        drain_wakes(&mut locked.state, call.caller.recorder, time);
-        drop(locked);
-        // Each process asked for ends once every request is settled; the call ends in
-        // `Outcome::ProcessExited` when its caller's own process is one of them (module docs).
-        let mut outcome = outcome;
-        for end in asked {
-            if end.process == caller_process {
-                outcome = self.end_process(end.process, outcome, call.caller.recorder, time);
-            } else {
-                self.terminate_asked(end.process, call.caller.recorder, time);
-            }
-        }
         self.settle_notices();
         outcome
     }
 
-    /// Ends `process` because a handler asked to ([`IpcContext::end_process`]), once the
-    /// requests that are over are settled: through [`crate::svc::process::terminate_process`],
-    /// the path `ExitProcess` takes, so its threads end and its handles close. Returns
-    /// [`Outcome::ProcessExited`], or, when ending fails (only the kernel's own bookkeeping
-    /// can make it: a process that has ended already), logs the failure and returns
-    /// `outcome`, the call's own, whose result is already written. Test:
-    /// `ending_a_process_that_has_ended_already_returns_the_calls_own_outcome`.
-    fn end_process(
+    /// Settles the requests that are over ([`settle_one`], in order), reports every sender but
+    /// `own` woken ([`Dispatcher::take_woken`]), records and reports the waits the handlers'
+    /// signals ended (`dispatch/sync.rs`), and then ends each process a handler asked to end
+    /// ([`asked`], [`terminate_asked`]). Returns `own`'s result, when its request is one of
+    /// them, and the processes that ended.
+    ///
+    /// When a process is to end, all of this happens under one hold of the lock, so that no
+    /// core can run a sender of that process between its reply and the end: a sender the timer
+    /// thread's delivery answers, or one a dispatch answers for another thread, is left as a
+    /// dispatch's own caller is, answered and ended before it could run again. Test:
+    /// `a_sender_whose_process_a_delivery_ends_is_never_seen_runnable`. Otherwise each request
+    /// is settled under a lock of its own, as before ends existed.
+    fn settle_and_end(
         &self,
-        process: ProcessId,
-        outcome: Outcome,
+        finished: Vec<Finished>,
+        own: Option<ThreadId>,
+        memory: &dyn GuestMemory,
         recorder: &Recorder,
         time: GuestTicks,
-    ) -> Outcome {
-        if self.terminate_asked(process, recorder, time) {
-            Outcome::ProcessExited
-        } else {
-            outcome
+    ) -> (Option<Woken>, Vec<Ended>) {
+        let asked = asked(&finished);
+        let mut woken = Vec::new();
+        if asked.is_empty() {
+            for finished in finished {
+                let mut locked = self.lock::<(&mut HandleTable, &mut Scheduler)>();
+                woken.extend(settle_one(&mut locked, finished, memory, recorder, time));
+            }
+            let mine = take_own(&mut woken, own);
+            let mut locked = self.lock::<()>();
+            report_woken(&mut locked.state, woken, recorder, time);
+            return (mine, Vec::new());
         }
-    }
-
-    /// Ends `process` because a handler asked to, through
-    /// [`crate::svc::process::terminate_process`], and records and reports the waits its
-    /// ending threads ended. Returns whether it ended; when it could not (only the kernel's own
-    /// bookkeeping can make that happen: a process that has ended already), the failure is
-    /// logged. What [`Dispatcher::end_process`] and [`Dispatcher::deliver_replies`] both end a
-    /// process with.
-    fn terminate_asked(&self, process: ProcessId, recorder: &Recorder, time: GuestTicks) -> bool {
         let mut locked = self.lock::<(&mut HandleTable, &mut Scheduler)>();
-        let (handles, scheduler) = locked.tables();
-        tracing::info!(?process, "a service ended the process after its reply");
-        let ended = terminate_process(handles, scheduler, process);
-        // Waits the ending threads ended (a thread's waiters wake as it terminates), recorded
-        // and reported now, as `ExitProcess` does. Test:
-        // `a_handler_ending_the_process_wakes_its_threads_waiters_as_exit_process_does`.
-        drain_wakes(&mut locked.state, recorder, time);
-        match ended {
-            Ok(()) => true,
-            Err(error) => {
-                tracing::error!(
-                    %error,
-                    ?process,
-                    "a service asked to end the process, and it could not end"
-                );
-                false
+        for finished in finished {
+            woken.extend(settle_one(&mut locked, finished, memory, recorder, time));
+        }
+        let mine = take_own(&mut woken, own);
+        report_woken(&mut locked.state, woken, recorder, time);
+        // Only now that every reply is written and recorded (services spec: "the reply is
+        // sent, and then the kernel tears the process down").
+        let mut ended = Vec::new();
+        for end in asked {
+            if terminate_asked(&mut locked, end.process, recorder, time) {
+                ended.push(end);
             }
         }
+        (mine, ended)
     }
 
     /// Runs the request in flight on `session`, a session of `server`, through the server's
@@ -1194,85 +1177,120 @@ impl Dispatcher {
         }
     }
 
-    /// Settles requests that are over, in order: writes each reply into its sender's message
-    /// buffer, releases what the request held, and records its events and then its system
-    /// call's event, all at `time`. Returns every sender's result, the calling thread's
-    /// included.
-    fn settle(
-        &self,
-        finished: Vec<Finished>,
-        memory: &dyn GuestMemory,
-        recorder: &Recorder,
-        time: GuestTicks,
-    ) -> Vec<Woken> {
-        let mut woken = Vec::new();
-        for Finished {
-            session,
-            done,
-            events,
-            end: _,
-            placed,
-        } in finished
-        {
-            let Done { request, result } = done;
-            let sender = request.sender;
-            let mut locked = self.lock::<(&mut HandleTable, &mut Scheduler)>();
-            let (handles, scheduler) = locked.tables();
-            // A sender that ended while it waited gets no reply: its message buffer may be
-            // another thread's by now.
-            let alive = is_alive(scheduler, sender);
-            let mut written = false;
-            let mut result = result;
-            if alive && result.is_ok() {
-                match memory.write(sender.message_address, &request.message[..]) {
-                    Ok(()) => written = true,
-                    Err(error) => {
-                        // `dispatch/ipc/placed.rs`, "Divergences from Eden".
-                        tracing::error!(
-                            ?error,
-                            "a reply could not be written to its sender's TLS block"
-                        );
-                        result = Err(KernelError::InvalidCurrentMemory);
-                    }
-                }
-            }
-            // The sender keeps the placed handles the reply it now holds names, and no others;
-            // they go before it is woken with its result (`dispatch/ipc/placed.rs`).
-            let kept = if written {
-                reply_handles(&request.message)
-            } else {
-                Vec::new()
-            };
-            placed.take_back(handles, scheduler, &kept);
-            let code = result.err().map_or(ResultCode::SUCCESS, KernelError::code);
-            // The reply is in place before the sender can run again: both happen under the
-            // lock.
-            if alive
-                && let Some(waiter) = sender.waiter
-                && let Err(error) = scheduler.end_reply_wait(waiter, session, code)
-            {
-                tracing::error!(%error, ?session, "a sender could not be woken");
-            }
-            let (objects, ipc) = scheduler.ipc_mut();
-            if let Err(error) = ipc.release_request(objects, session, &request) {
-                tracing::error!(%error, ?session, "a finished request could not let go");
-            }
-            for kind in events {
-                recorder.record(time, sender.core, sender.thread, kind);
-            }
-            if alive {
-                record_send(recorder, time, sender, code);
-            }
-            drop(locked);
-            if alive {
-                woken.push(Woken {
-                    thread: sender.thread,
-                    core: sender.core,
-                    result: code,
-                });
+}
+
+/// Settles one request that is over, under `locked`: writes its reply into its sender's
+/// message buffer, releases what the request held, and records its events and then its system
+/// call's event, all at `time`. Returns its sender's result, unless the sender has ended.
+fn settle_one(
+    locked: &mut Locked<'_, (&mut HandleTable, &mut Scheduler)>,
+    finished: Finished,
+    memory: &dyn GuestMemory,
+    recorder: &Recorder,
+    time: GuestTicks,
+) -> Option<Woken> {
+    let Finished {
+        session,
+        done,
+        events,
+        end: _,
+        placed,
+    } = finished;
+    let Done { request, result } = done;
+    let sender = request.sender;
+    let (handles, scheduler) = locked.tables();
+    // A sender that ended while it waited gets no reply: its message buffer may be another
+    // thread's by now.
+    let alive = is_alive(scheduler, sender);
+    let mut written = false;
+    let mut result = result;
+    if alive && result.is_ok() {
+        match memory.write(sender.message_address, &request.message[..]) {
+            Ok(()) => written = true,
+            Err(error) => {
+                // `dispatch/ipc/placed.rs`, "Divergences from Eden".
+                tracing::error!(
+                    ?error,
+                    "a reply could not be written to its sender's TLS block"
+                );
+                result = Err(KernelError::InvalidCurrentMemory);
             }
         }
-        woken
+    }
+    // The sender keeps the placed handles the reply it now holds names, and no others; they go
+    // before it is woken with its result (`dispatch/ipc/placed.rs`).
+    let kept = if written {
+        reply_handles(&request.message)
+    } else {
+        Vec::new()
+    };
+    placed.take_back(handles, scheduler, &kept);
+    let code = result.err().map_or(ResultCode::SUCCESS, KernelError::code);
+    // The reply is in place before the sender can run again: both happen under the lock.
+    if alive
+        && let Some(waiter) = sender.waiter
+        && let Err(error) = scheduler.end_reply_wait(waiter, session, code)
+    {
+        tracing::error!(%error, ?session, "a sender could not be woken");
+    }
+    let (objects, ipc) = scheduler.ipc_mut();
+    if let Err(error) = ipc.release_request(objects, session, &request) {
+        tracing::error!(%error, ?session, "a finished request could not let go");
+    }
+    for kind in events {
+        recorder.record(time, sender.core, sender.thread, kind);
+    }
+    if alive {
+        record_send(recorder, time, sender, code);
+    }
+    alive.then_some(Woken {
+        thread: sender.thread,
+        core: sender.core,
+        result: code,
+    })
+}
+
+/// Takes the result of `own`, the calling thread, out of `woken`: the first one that names it.
+fn take_own(woken: &mut Vec<Woken>, own: Option<ThreadId>) -> Option<Woken> {
+    let index = woken.iter().position(|woken| Some(woken.thread) == own)?;
+    Some(woken.remove(index))
+}
+
+/// Reports the senders `woken` ([`Dispatcher::take_woken`]), and then records and reports the
+/// waits the handlers' signals ended (`dispatch/sync.rs`).
+fn report_woken(state: &mut State, woken: Vec<Woken>, recorder: &Recorder, time: GuestTicks) {
+    state.woken.extend(woken);
+    drain_wakes(state, recorder, time);
+}
+
+/// Ends `process` because a handler asked to, under `locked`, through
+/// [`crate::svc::process::terminate_process`], and records and reports the waits its ending
+/// threads ended. Returns whether it ended; when it could not (only the kernel's own
+/// bookkeeping can make that happen: a process that has ended already), the failure is logged.
+/// Test: `ending_a_process_that_has_ended_already_fails_and_reports_nothing`.
+fn terminate_asked(
+    locked: &mut Locked<'_, (&mut HandleTable, &mut Scheduler)>,
+    process: ProcessId,
+    recorder: &Recorder,
+    time: GuestTicks,
+) -> bool {
+    let (handles, scheduler) = locked.tables();
+    tracing::info!(?process, "a service ended the process after its reply");
+    let ended = terminate_process(handles, scheduler, process);
+    // Waits the ending threads ended (a thread's waiters wake as it terminates), recorded and
+    // reported now, as `ExitProcess` does. Test:
+    // `a_handler_ending_the_process_wakes_its_threads_waiters_as_exit_process_does`.
+    drain_wakes(&mut locked.state, recorder, time);
+    match ended {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::error!(
+                %error,
+                ?process,
+                "a service asked to end the process, and it could not end"
+            );
+            false
+        }
     }
 }
 
@@ -1411,7 +1429,7 @@ fn sending_process(scheduler: &Scheduler, core: u8) -> Option<ProcessId> {
 /// then deferred). Returns whether the sender now waits; one with no scheduler thread does
 /// not, and is only reported woken. A sender that ended while its handler ran (its request is
 /// in flight, `Scheduler::forget_waits`) does not wait either: it stays ended, and its reply
-/// finds it so (`Dispatcher::settle`). A failure is the kernel's own bookkeeping, and is
+/// finds it so (`settle_one`). A failure is the kernel's own bookkeeping, and is
 /// logged.
 fn await_reply(scheduler: &mut Scheduler, sender: Sender, session: ObjectId) -> bool {
     let Some(waiter) = sender.waiter else {
