@@ -155,8 +155,8 @@
 //!   set), `Success`. Nothing reads them yet (PR: "Context switches follow complete commands").
 //! - **`ZCullBind`**: the GPU address and the mode are kept ([`Channel::zcull`]), `Success`,
 //!   whatever their values: PR, NX2 and Eden keep the struct (`zcull_params = params`) and check
-//!   nothing, and PR's comment names modes 0 to 3 ("0=global, 1=no_ctxsw, 2=separate_buffer,
-//!   3=part_of_regular_buf") without refusing others. The struct is read as far as the input
+//!   nothing, and PR's comment names modes 0 to 3 (`0=global, 1=no_ctxsw,
+//!   2=separate_buffer, 3=part_of_regular_buf`) without refusing others. The struct is read as far as the input
 //!   goes and the rest is zero, as for every `WrapFixed` ioctl, so no input size is refused.
 //!   Nothing reads the bind yet, in starquake or in the references (no reference reads
 //!   `zcull_params` after storing it): the address is where the channel's zcull context buffer
@@ -437,8 +437,8 @@ pub mod layout {
     pub const ZCULL_BIND_BYTES: usize = 16;
     /// `gpu_va`, a `u64`.
     pub const ZCULL_GPU_VA: usize = 0;
-    /// `mode` ("0=global, 1=no_ctxsw, 2=separate_buffer, 3=part_of_regular_buf"); a padding
-    /// word follows.
+    /// `mode` (PR's comment: `0=global, 1=no_ctxsw, 2=separate_buffer, 3=part_of_regular_buf`);
+    /// a padding word follows.
     pub const ZCULL_MODE: usize = 8;
 }
 
