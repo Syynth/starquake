@@ -770,14 +770,14 @@ fn a_client_bit_in_the_second_word_the_limit_names_is_refused() {
     assert_eq!(rig.session_state().clients().len(), 1);
 }
 
-/// The server is named, serves TIPC only, and leaves 228 and 229 (slice 14) to its policy.
+/// The server is named, serves TIPC only, and leaves the ids beside 228 and 229 to its policy.
 #[test]
-fn the_server_is_named_and_leaves_present_to_the_policy() {
+fn the_server_is_named_and_leaves_unknown_commands_to_the_policy() {
     let mut rig = Rig::new();
     assert_eq!(rig.server.name(), VI2_NAME);
     assert_eq!(VI2_NAME, "gsv:vi2");
     assert_eq!(Vi2Session::new().commands().cmif, []);
-    for command in [228, 229] {
+    for command in [227, 230] {
         assert_eq!(
             rig.send(&[tipc_type(command), 0]),
             result_only(command, UNKNOWN_COMMAND_ID)

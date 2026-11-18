@@ -265,7 +265,9 @@ pub mod saved;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use starquake_gpu::interface::LayerId;
+use starquake_gpu::interface::{
+    DisplayId, Fence, ImageDesc, LayerId, PresentRequest, Rect, SyncpointId,
+};
 use starquake_kernel::id::ObjectId;
 use starquake_kernel::result::{KernelError, MODULE_BITS, ResultCode};
 use starquake_services::commands;
@@ -275,15 +277,18 @@ use starquake_services::framework::{
 };
 use starquake_trace::HostNanos;
 
+use crate::gpu::low_byte;
+use crate::native::layout::{WORD_BLOCK_HEIGHT, WORD_EXTENT, WORD_FORMAT, WORD_PITCH, extent};
+use crate::shared::present::{NewFrame, QueueError, Refresh, RegisterError, slot_bit, write_slots};
 use crate::shared::vsync::MAX_LISTENERS;
 use crate::shared::{Locked, Shared};
 use command::{
-    BIND_CLIENT_DISPLAY, CLOSE_DISPLAY, CLOSE_ENDPOINT, CONFIGURE_REQUEST_GROUPS,
+    BIND_CLIENT_DISPLAY, CANCEL_CLIENT_BUFFER, CLOSE_DISPLAY, CLOSE_ENDPOINT, CONFIGURE_REQUEST_GROUPS,
     CREATE_REQUEST_GROUP_EVENT, DUPLICATE_REQUEST_GROUP_EVENT, GET_BUFFER_MAX_RESOLUTION,
     GET_CLIENT_AVAILABILITY, GET_DISPLAY_STATE_105, GET_DISPLAY_STATE_107, GET_DISPLAY_STATE_354,
     GET_HDR_STATUS, GET_NOTIFICATION_EVENT, GET_NOTIFICATION_LIMIT, GET_NOTIFICATIONS,
     GET_REQUEST_GROUP_LIMIT, GET_SESSION_LIMIT, OPEN_DISPLAY, OPEN_ENDPOINT,
-    REGISTER_BUFFER_MAX_RESOLUTION_MONITOR, REGISTER_CLIENT_STATE, REGISTER_DISPLAY_EVENT_MONITOR,
+    PRESENT_CLIENT_BUFFER, REGISTER_BUFFER_MAX_RESOLUTION_MONITOR, REGISTER_CLIENT_STATE, REGISTER_DISPLAY_EVENT_MONITOR,
     REGISTER_DISPLAY_MONITOR_263, REGISTER_DISPLAY_MONITOR_267, REGISTER_DISPLAY_MONITOR_271,
     REGISTER_HDR_STATUS_MONITOR, RELEASE_NOTIFICATION_EVENT, SET_CLIENT_OUTPUT_ENCODING,
     SET_CLIENT_OUTPUT_LEVELS, SET_DISPLAY_PARAMETER_301, UNBIND_CLIENT_DISPLAY,
@@ -349,6 +354,12 @@ pub mod command {
     pub const UNREGISTER_CLIENT_STATE: u32 = 202;
     /// PR `{212, &IVi2Session::GetClientAvailability, "GetClientAvailability"}`.
     pub const GET_CLIENT_AVAILABILITY: u32 = 212;
+    /// PR `{228, &IVi2Session::CancelClientBuffer, "CancelClientBuffer"}`; NX2 `{228,
+    /// &INx2Vi2Session::CancelClientBuffer, "CancelClientBuffer"}`.
+    pub const CANCEL_CLIENT_BUFFER: u32 = 228;
+    /// PR `{229, &IVi2Session::PresentClientBuffer, "PresentClientBuffer"}`; NX2 `{229,
+    /// &INx2Vi2Session::PresentClientBuffer, "PresentClientBuffer"}`.
+    pub const PRESENT_CLIENT_BUFFER: u32 = 229;
     /// PR `{251, &IVi2Session::BindClientDisplay, "BindClientDisplay"}`.
     pub const BIND_CLIENT_DISPLAY: u32 = 251;
     /// PR `{252, &IVi2Session::UnbindClientDisplay, "UnbindClientDisplay"}`.
@@ -472,9 +483,44 @@ pub const DEFAULT_DISPLAY: u64 = u64::from_le_bytes(*b"default\0");
 /// The flags 101 accepts, which PR keeps as the display's notification
 /// (`R_UNLESS(flags == 1, Kernel::ResultNotImplemented)`, `m_display_notification = flags`).
 pub const OPEN_DISPLAY_FLAGS: u32 = 1;
+/// The buffer slots a client has: PR `slot < 15` (228, 229) and `std::array<std::optional<s32>,
+/// 15> queued`; spec, "Fifteen slots".
+pub const SLOTS: u8 = 15;
 /// A fresh client's free slots: fifteen, PR `u64 available{0x7fff}`; NX2's 229 reply
 /// `AvailableSlots = 0x7fff` (row 48).
 pub const ALL_SLOTS: u64 = 0x7FFF;
+/// The layout 229 accepts at word 8: PR `packet[8] == 3`; spec "u32 layout (w8, 3)".
+pub const PRESENT_LAYOUT: u32 = 3;
+/// The block height (log2 of GOB rows, preference word 4) a presented image must have: PR
+/// `image->preference[4] == 7` ("the backend's 16-GOB block height" in its comment).
+pub const PRESENT_BLOCK_HEIGHT: u32 = 7;
+/// The formats (preference word 6) a presented image may have: PR `image->preference[6] == 1 ||
+/// image->preference[6] == 4` (spec: 1 RGBA8, 4 RGB10A2).
+pub const PRESENT_FORMATS: [u32; 2] = [1, 4];
+/// The 229 request word that holds the layout (PR `packet[8]`), the last word before the fence
+/// that 229 reads.
+pub const PRESENT_WORD_LAYOUT: usize = 8;
+/// The 229 request word that holds the fence's `SyncCounterId` (PR `~packet[22]`, NX2 `~w[22]`;
+/// spec, "fence `SyncCounterId` (w22) and value (w24)"); words 23 and 25 must be 0 (PR
+/// `packet[23] == 0 && packet[25] == 0`), word 24 is the value.
+pub const PRESENT_WORD_FENCE: usize = 22;
+/// What 229's fence word is when the present has no fence: PR `fence_id == ~u32{0}` on `fence_id
+/// = ~packet[22]`, so the word itself is 0.
+pub const NO_FENCE: u32 = 0;
+
+/// How 229 paces the title (spec, "Present (229) and pacing"; the owner's decision 1): a per-run
+/// setting, given to the server ([`vi2_server_paced`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Pacing {
+    /// The buffer queue (decided by the owner, decision 1): 229 replies at once with the slots
+    /// still free, and a slot comes back on the tick that latches the frame replacing it.
+    #[default]
+    BufferQueue,
+    /// The fence wait fallback (NX2's): 229 holds its reply until the frame before it is
+    /// latched and reports every slot free ([`crate::shared::present`], "The fence wait
+    /// fallback").
+    FenceWait,
+}
 /// The only output encoding 351 accepts, and a client's: PR `u64 output_encoding{0x14}`, "Only
 /// the SDK's observed default output encoding is supported".
 pub const OUTPUT_ENCODING: u64 = 0x14;
@@ -612,7 +658,8 @@ const fn bit(index: u32) -> u32 {
     }
 }
 
-/// One registered client (PR `ClientState`, but its present queue, which is slice 14's).
+/// One registered client (PR `ClientState`, but its present queue, which is in gsv's shared
+/// state: [`crate::shared::present`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Client {
     token: u64,
@@ -650,7 +697,7 @@ impl Client {
         self.retire
     }
 
-    /// The notification a freed slot raises (slice 14): PR `available_notification`.
+    /// The notification a freed slot raises: PR `available_notification`.
     #[must_use]
     pub const fn available_bit(&self) -> u32 {
         self.available_bit
@@ -802,6 +849,18 @@ impl Vi2Session {
             .ok_or_else(|| VI_OUT_OF_RANGE.into())
     }
 
+    /// Takes into each client's free slots and the notification bitmap what the vsync ticks
+    /// released for it since the last time (PR `RefreshReleasedBuffers`; module docs, "Present").
+    fn refresh(&mut self, state: &mut Locked<'_>) {
+        for client in &mut self.clients {
+            let Refresh { released, raised } = state.presents_mut().take_refresh(client.token);
+            client.available |= released & ALL_SLOTS;
+            if raised {
+                self.notifications[0] |= bit(client.available_bit);
+            }
+        }
+    }
+
     /// Raises notification `index` and signals the notification event if 11 made it (module
     /// docs, "Notifications"). `index` is below [`CLIENT_NOTIFICATIONS`] or is
     /// [`OPEN_DISPLAY_FLAGS`], so it names a bit of the bitmap.
@@ -824,19 +883,35 @@ impl Vi2Session {
 /// as [`crate::syncpt::SyncptFamily`] holds nothing.
 pub struct Vi2Family {
     shared: Arc<Shared>,
+    pacing: Pacing,
 }
 
 impl Vi2Family {
-    /// The family over gsv's `shared` state.
+    /// The family over gsv's `shared` state, pacing with the buffer queue.
     #[must_use]
     pub fn new(shared: Arc<Shared>) -> Self {
-        Self { shared }
+        Self {
+            shared,
+            pacing: Pacing::BufferQueue,
+        }
+    }
+
+    /// The same family, pacing with `pacing`.
+    #[must_use]
+    pub fn with_pacing(self, pacing: Pacing) -> Self {
+        Self { pacing, ..self }
     }
 
     /// gsv's shared state.
     #[must_use]
     pub fn shared(&self) -> &Arc<Shared> {
         &self.shared
+    }
+
+    /// How 229 paces the title.
+    #[must_use]
+    pub const fn pacing(&self) -> Pacing {
+        self.pacing
     }
 }
 
@@ -859,6 +934,11 @@ impl Family for Vi2Family {
 /// gsv's shared state, from the server's family.
 fn shared(cx: &mut Context<'_>) -> Result<Arc<Shared>, Fault> {
     Ok(Arc::clone(cx.family::<Vi2Family>()?.shared()))
+}
+
+/// How the server's family paces 229.
+fn pacing(cx: &mut Context<'_>) -> Result<Pacing, Fault> {
+    Ok(cx.family::<Vi2Family>()?.pacing())
 }
 
 /// The `Env` clock's reading on the handler's thread, which starts a stopped vsync clock.
@@ -888,6 +968,60 @@ fn listen(state: &mut Locked<'_>, event: ObjectId, group: u32, now: HostNanos, f
     }
 }
 
+/// The words of a 229 request that 229 reads (module docs, "Present"), in request order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PresentWords {
+    /// w2–3: the client.
+    token: u64,
+    /// The low byte of w4: the buffer slot (PR `DecodeBufferSlot`).
+    slot: u8,
+    /// w5: the native image.
+    image: u32,
+    /// w6: the byte offset into the image.
+    offset: u32,
+    /// w7: the shown extent, `(width - 1) | (height - 1) << 16`.
+    shown: u32,
+    /// w8: the layout.
+    layout: u32,
+    /// w22: the fence's `SyncCounterId`, [`NO_FENCE`] for none.
+    fence_id: u32,
+    /// w23: 0.
+    fence_high: u32,
+    /// w24: the fence's value.
+    fence_value: u32,
+    /// w25: 0.
+    fence_tail: u32,
+}
+
+impl PresentWords {
+    /// Reads them from `req`; a request that ends before word 25 is the framework's
+    /// `INVALID_CMIF_REQUEST`.
+    fn read(req: &Request<'_>) -> Result<Self, Fault> {
+        let mut payload = req.payload();
+        let token = payload.read_u64()?;
+        let slot = low_byte(payload.read_u32()?);
+        let image = payload.read_u32()?;
+        let offset = payload.read_u32()?;
+        let shown = payload.read_u32()?;
+        let layout = payload.read_u32()?;
+        for _ in PRESENT_WORD_LAYOUT + 1..PRESENT_WORD_FENCE {
+            payload.read_u32()?;
+        }
+        Ok(Self {
+            token,
+            slot,
+            image,
+            offset,
+            shown,
+            layout,
+            fence_id: payload.read_u32()?,
+            fence_high: payload.read_u32()?,
+            fence_value: payload.read_u32()?,
+            fence_tail: payload.read_u32()?,
+        })
+    }
+}
+
 commands! {
     impl Vi2Session {}
     tipc {
@@ -911,6 +1045,8 @@ commands! {
         REGISTER_CLIENT_STATE => register_client_state,
         UNREGISTER_CLIENT_STATE => unregister_client_state,
         GET_CLIENT_AVAILABILITY => get_client_availability,
+        CANCEL_CLIENT_BUFFER => cancel_client_buffer,
+        PRESENT_CLIENT_BUFFER => present_client_buffer,
         BIND_CLIENT_DISPLAY => bind_client_display,
         UNBIND_CLIENT_DISPLAY => unbind_client_display,
         REGISTER_DISPLAY_EVENT_MONITOR => monitor,
@@ -976,16 +1112,23 @@ impl Vi2Session {
     ) -> Outcome {
         let word = req.payload().read_u32()?;
         tracing::debug!(word, "gsv:vi2: notification event");
+        let shared = shared(cx)?;
+        let mut state = shared.lock();
         let event = if let Some(event) = self.notification_event {
             event
         } else {
             let event = cx.create_event()?;
             self.notification_event = Some(event);
+            for client in &self.clients {
+                state.presents_mut().set_event(client.token, event);
+            }
             event
         };
+        self.refresh(&mut state);
         if self.notifications.iter().any(|&word| word != 0) {
             cx.signal_event(event)?;
         }
+        drop(state);
         reply.copy_handle(event);
         reply.ok()
     }
@@ -1012,10 +1155,15 @@ impl Vi2Session {
         req: &Request<'_>,
         reply: &mut Reply,
     ) -> Outcome {
+        let shared = shared(cx)?;
         let mut out = req.out_buffer(cx, 0)?;
         if out.len() < NOTIFICATIONS_SIZE {
             return Err(KernelError::InvalidSize.into());
         }
+        // Held to the clear, so that a tick's release between the refresh and the clear is not
+        // wiped out by it (module docs, "Present").
+        let mut state = shared.lock();
+        self.refresh(&mut state);
         let bytes: Vec<u8> = self
             .notifications
             .iter()
@@ -1027,6 +1175,7 @@ impl Vi2Session {
         }
         tracing::debug!(notifications = ?self.notifications, "gsv:vi2: notifications read");
         self.notifications = [0; NOTIFICATION_WORDS];
+        drop(state);
         reply.ok()
     }
 
@@ -1284,7 +1433,7 @@ impl Vi2Session {
     /// `RegisterClientState` (201). in: `u64` client, `u32` retire bit, `u32` available bit.
     fn register_client_state(
         &mut self,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
         req: &Request<'_>,
         reply: &mut Reply,
     ) -> Outcome {
@@ -1315,6 +1464,19 @@ impl Vi2Session {
         if self.clients.len() >= MAX_CLIENTS {
             return Err(KernelError::OutOfResource.into());
         }
+        let shared = shared(cx)?;
+        let registered = shared
+            .lock()
+            .presents_mut()
+            .register(token, available, self.notification_event);
+        if let Err(error) = registered {
+            tracing::debug!(%error, "gsv:vi2: register client refused");
+            return Err(match error {
+                RegisterError::Held { .. } => KernelError::InvalidState,
+                RegisterError::Full => KernelError::OutOfResource,
+            }
+            .into());
+        }
         self.clients.push(client);
         reply.ok()
     }
@@ -1331,7 +1493,11 @@ impl Vi2Session {
             return Err(KernelError::InvalidCombination.into());
         }
         let index = self.client(token).ok_or(KernelError::NotFound)?;
+        let shared = shared(cx)?;
         let client = self.clients.remove(index);
+        if !shared.lock().unregister_present(token) {
+            tracing::debug!(token, "gsv:vi2: a retired client had no presents to drop");
+        }
         if self.endpoint == Some(token) {
             self.endpoint = None;
         }
@@ -1344,11 +1510,13 @@ impl Vi2Session {
     /// client's layer on first use.
     fn get_client_availability(
         &mut self,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
         req: &Request<'_>,
         reply: &mut Reply,
     ) -> Outcome {
         let token = req.payload().read_u64()?;
+        let shared = shared(cx)?;
+        self.refresh(&mut shared.lock());
         if token == 0 {
             return Err(KernelError::InvalidCombination.into());
         }
@@ -1368,6 +1536,168 @@ impl Vi2Session {
         let available = client.available;
         reply.payload().write_u64(available);
         reply.ok()
+    }
+
+    /// `CancelClientBuffer` (228). in: `u64` client (w2–3), the slot in the low byte of w4 (PR
+    /// `DecodeBufferSlot(packet[4])`). out: `u64` free slots, four zero words (module docs,
+    /// "Present").
+    fn cancel_client_buffer(
+        &mut self,
+        cx: &mut Context<'_>,
+        req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        let mut payload = req.payload();
+        let token = payload.read_u64()?;
+        let slot = low_byte(payload.read_u32()?);
+        if slot >= SLOTS {
+            return Err(KernelError::InvalidCombination.into());
+        }
+        let shared = shared(cx)?;
+        self.refresh(&mut shared.lock());
+        let client = self.known_client(token)?;
+        client.available |= slot_bit(slot);
+        let available = client.available;
+        tracing::debug!(token, slot, available, "gsv:vi2: cancel buffer");
+        write_slots(reply, available);
+        reply.ok()
+    }
+
+    /// `PresentClientBuffer` (229). in: `u64` client (w2–3), the slot in the low byte of w4, the
+    /// native image (w5), the byte offset (w6), the shown extent (w7), the layout (w8), the
+    /// fence's `SyncCounterId` (w22), 0 (w23), the fence's value (w24), 0 (w25). out: `u64` free
+    /// slots and four zero words, or, under [`Pacing::FenceWait`], a held reply of every slot
+    /// (module docs, "Present").
+    fn present_client_buffer(
+        &mut self,
+        cx: &mut Context<'_>,
+        req: &Request<'_>,
+        reply: &mut Reply,
+    ) -> Outcome {
+        let words = PresentWords::read(req)?;
+        let holds = pacing(cx)? == Pacing::BufferQueue;
+        let shared = shared(cx)?;
+        let mut state = shared.lock();
+        self.refresh(&mut state);
+        let index = self.client(words.token).ok_or(KernelError::NotFound)?;
+        let frame = self.frame(&mut state, index, &words, holds)?;
+        let now = if state.vsync().is_stopped() {
+            Some(now(cx)?)
+        } else {
+            None
+        };
+        let prepared = state.prepare_frame(words.token, frame).map_err(|error| {
+            tracing::error!(%error, token = words.token, "gsv:vi2: a present could not be queued");
+            match error {
+                QueueError::NoClient { .. } => KernelError::InvalidState,
+                QueueError::Full { .. } | QueueError::Watch(_) => KernelError::OutOfResource,
+            }
+        })?;
+        tracing::debug!(
+            token = words.token,
+            slot = frame.slot,
+            image = frame.image,
+            fence = ?frame.fence,
+            "gsv:vi2: present queued"
+        );
+        if holds {
+            state.commit_frame(prepared, now, None);
+            drop(state);
+            let client = self.clients.get_mut(index).ok_or(KernelError::NotFound)?;
+            client.available &= !slot_bit(frame.slot);
+            write_slots(reply, client.available);
+            return reply.ok();
+        }
+        match cx.defer() {
+            Ok(held) => {
+                state.commit_frame(prepared, now, Some(held));
+                drop(state);
+                reply.deferred()
+            }
+            Err(fault) => {
+                state.abandon_frame(prepared);
+                Err(fault)
+            }
+        }
+    }
+
+    /// 229's checks after the client's (module docs, "Present"), in PR `QueueNativeImage`'s
+    /// order: the frame client `index` would queue, holding its slot if `holds`.
+    fn frame(
+        &self,
+        state: &mut Locked<'_>,
+        index: usize,
+        words: &PresentWords,
+        holds: bool,
+    ) -> Result<NewFrame, Fault> {
+        let client = self.clients.get(index).ok_or(KernelError::NotFound)?;
+        let slot = words.slot;
+        let busy = holds && state.presents_mut().holds(words.token, slot);
+        let layer = client
+            .layer()
+            .filter(|_| client.bound && slot < SLOTS && !busy)
+            .ok_or(KernelError::InvalidState)?;
+        let image = state
+            .native_objects()
+            .image(words.image)
+            .filter(|image| image.window_pool())
+            .copied()
+            .ok_or(KernelError::NotFound)?;
+        let preference = image.preference();
+        let (shown_width, shown_height) = extent(words.shown);
+        let (width, height) = extent(preference[WORD_EXTENT]);
+        let supported = words.offset == 0
+            && shown_width <= width
+            && shown_height <= height
+            && words.layout == PRESENT_LAYOUT
+            && preference[WORD_BLOCK_HEIGHT] == PRESENT_BLOCK_HEIGHT
+            && PRESENT_FORMATS.contains(&preference[WORD_FORMAT]);
+        if !supported {
+            return Err(KernelError::NotImplemented.into());
+        }
+        let fence = u8::try_from(!words.fence_id)
+            .ok()
+            .and_then(SyncpointId::new)
+            .filter(|&id| state.syncpoint_allocated(id))
+            .map(|id| Fence {
+                id,
+                value: words.fence_value,
+            });
+        let fenced = words.fence_id != NO_FENCE;
+        if words.fence_high != 0 || words.fence_tail != 0 || fenced && fence.is_none() {
+            return Err(KernelError::InvalidCombination.into());
+        }
+        let address = state
+            .native_objects()
+            .backing(image.memory())
+            .and_then(|memory| memory.binding())
+            .map(|binding| binding.address)
+            .ok_or(KernelError::InvalidState)?;
+        let dimension = |value: u64| u32::try_from(value).unwrap_or(u32::MAX);
+        Ok(NewFrame {
+            slot,
+            image: words.image,
+            request: PresentRequest {
+                image: ImageDesc {
+                    address,
+                    width: dimension(width),
+                    height: dimension(height),
+                    pitch: preference[WORD_PITCH],
+                    block_height_log2: preference[WORD_BLOCK_HEIGHT],
+                    format: preference[WORD_FORMAT],
+                },
+                shown: Rect {
+                    x: 0,
+                    y: 0,
+                    width: dimension(shown_width),
+                    height: dimension(shown_height),
+                },
+                layer,
+                display: DisplayId(DEFAULT_DISPLAY),
+            },
+            fence,
+            holds_slot: holds,
+        })
     }
 
     /// `BindClientDisplay` (251). in: `u64` client, `u64` name.
@@ -1577,13 +1907,21 @@ pub fn vi2_interfaces() -> Interfaces {
     Interfaces::new().with::<Vi2Session>()
 }
 
-/// The vi2 server over gsv's `shared` state: every session a [`Vi2Session`], sharing a
-/// [`Vi2Family`]. Give it the run's environment (`Server::with_env`): a group starting to
-/// listen to the vsync clock reads its clock (module docs, "The server").
+/// The vi2 server over gsv's `shared` state, pacing with the buffer queue: every session a
+/// [`Vi2Session`], sharing a [`Vi2Family`]. Give it the run's environment (`Server::with_env`):
+/// a group starting to listen to the vsync clock, and a present on a stopped clock, read its
+/// clock (module docs, "The server").
 #[must_use]
 pub fn vi2_server(policy: UnknownPolicy, shared: Arc<Shared>) -> Server {
+    vi2_server_paced(policy, shared, Pacing::BufferQueue)
+}
+
+/// The vi2 server of [`vi2_server`], pacing with `pacing` (the per-run setting of the owner's
+/// decision 1).
+#[must_use]
+pub fn vi2_server_paced(policy: UnknownPolicy, shared: Arc<Shared>, pacing: Pacing) -> Server {
     Server::new(VI2_NAME, policy)
         .with_root(|| Box::new(Vi2Session::new()))
         .with_interfaces(vi2_interfaces())
-        .with_family(Vi2Family::new(shared))
+        .with_family(Vi2Family::new(shared).with_pacing(pacing))
 }

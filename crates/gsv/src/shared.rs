@@ -60,7 +60,7 @@
 //!
 //! | Completion | What the drain does |
 //! |---|---|
-//! | `GpuCompletion::SyncpointChanged` | records `SyncpointObserved` ([`crate::note`]), then fires every armed wait on the id that the drained value satisfies: takes it out of the table, unwatches its id, and signals its event through the kernel ([`TimerHost::signal_event`]), in ascending event order (`a_change_fires_its_waits_after_its_note_in_event_order`) |
+//! | `GpuCompletion::SyncpointChanged` | records `SyncpointObserved` ([`crate::note`]), then fires every armed wait on the id that the drained value satisfies: takes it out of the table, unwatches its id, and signals its event through the kernel ([`TimerHost::signal_event`]), in ascending event order (`a_change_fires_its_waits_after_its_note_in_event_order`); then marks reached every queued present whose fence on the id the value reaches, and gives back its watch ([`present`], "Reached means drained") |
 //! | `GpuCompletion::GpuOrdered` | records `GpuOrderedDone`; then, if a gpu worker job waits on the ticket ([`crate::gpu::GpuMemory::ordered_done`]), publishes the ranges it removed again, releases its device-share locks as a `DeviceShareReleased` is released (below), and only then signals its event ([`TimerHost::signal_event`]) |
 //! | `GpuCompletion::GpuQueueRoom` | records `QueueRoom`; then gives the channel's waiting submissions to the front again, oldest first, completing the reply of each one it queues, until the front answers `Full` ([`crate::nvsrv::gpu::submits::Submits::room`]) |
 //! | [`Completion::GuestSignalled`] | records nothing (the guest's `SignalEvent` is recorded as its system call); if the event is the bound shared page's request event, marks the page signalled, and the next page turn ([`Shared::tick_page`]) reads the request and records what it answers ([`page`]) |
@@ -152,11 +152,13 @@ use crate::nvsrv::gpu::submits::Submits;
 use crate::syncpt::waiters::{SavedWait, SavedWaitError, Wait, Waiters};
 
 pub mod page;
+pub mod present;
 #[cfg(test)]
 mod tests;
 pub mod vsync;
 
 use page::Page;
+use present::Presents;
 use vsync::Vsync;
 
 /// [`SYNCPOINT_COUNT`] as an index bound.
@@ -238,6 +240,8 @@ pub struct GsvShared {
     vsync: Vsync,
     /// The native memories and images (slice 8).
     native: NativeObjects,
+    /// vi2's presents (slice 14).
+    presents: Presents,
 }
 
 impl GsvShared {
@@ -251,6 +255,7 @@ impl GsvShared {
             submits: Submits::new(),
             vsync: Vsync::new(),
             native: NativeObjects::new(),
+            presents: Presents::new(),
         }
     }
 
@@ -522,6 +527,9 @@ impl Shared {
                         for event in state.fire(id, value) {
                             signal(host, event);
                         }
+                        for _ in 0..state.state.presents.reach(id, value) {
+                            state.release(id);
+                        }
                     }
                     if let GpuCompletion::GpuQueueRoom { channel } = gpu {
                         state.submits().room(channel);
@@ -604,6 +612,7 @@ impl Shared {
             submits: Submits::new(),
             vsync: Vsync::new(),
             native: NativeObjects::new(),
+            presents: Presents::new(),
         };
         Ok(Self::with_state(state, syncpoints, queue, service))
     }

@@ -14,7 +14,10 @@
 //! belongs here too when its slice lands.
 
 use starquake_memory::PageRange;
-use starquake_render::command::Rect;
+/// The area of an image a present shows ([`PresentRequest::shown`]): the render backend's
+/// rectangle, named here so that gsv, which builds a [`PresentRequest`] and does not depend on
+/// the render crate, can name it too.
+pub use starquake_render::command::Rect;
 
 /// A GPU channel, as gsv created it (`GpuFront::create_channel`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]

@@ -407,6 +407,13 @@ impl NativeObjects {
         self.memories.get(&id).filter(|memory| !memory.retired)
     }
 
+    /// Native memory `id`, retired or not: what an image lies in until its last image goes
+    /// (vi2's 229 reads an image's address from it).
+    #[must_use]
+    pub fn backing(&self, id: u32) -> Option<&NativeMemory> {
+        self.memories.get(&id)
+    }
+
     /// Every native memory, retired ones included, by id.
     pub fn memories(&self) -> impl Iterator<Item = (u32, &NativeMemory)> {
         self.memories.iter().map(|(&id, memory)| (id, memory))

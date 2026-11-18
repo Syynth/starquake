@@ -34,8 +34,9 @@
 //!   after each drain) ticks when the time has reached the deadline, never before
 //!   (`a_tick_comes_at_exactly_the_deadline_and_not_before`): it counts the tick, records it
 //!   ("What is recorded"), and signals every listener, in ascending event order
-//!   (`a_tick_records_its_number_then_signals_every_listener_in_event_order`). The slice-14
-//!   latch will run on the same tick.
+//!   (`a_tick_records_its_number_then_signals_every_listener_in_event_order`). Then it runs
+//!   vi2's present latch ([`crate::shared::present`], "The latch"), and returns the latched
+//!   frames' requests for the GPU front.
 //! - **The next deadline: no banking.** The spec's slice 12 ("no banking of lost time", citing
 //!   NX2 `PaceToVblank`) applies NX2's *present* pacing to the clock; neither reference's vsync
 //!   event works so (below, "Where this differs from the references": both catch up). The rule
@@ -51,8 +52,11 @@
 //!   (`a_tick_late_by_exactly_one_interval_keeps_the_grid`, beside
 //!   `a_tick_late_by_one_interval_and_a_nanosecond_restarts_the_grid`).
 //! - **Stop.** When the last listener leaves ([`Locked::unlisten_vsync`], or a refused signal
-//!   below) the clock stops: no deadline, so the timer thread neither wakes for it nor reads the
-//!   clock for it. The tick count is kept, and the next listener starts the clock again with a
+//!   below) the clock stops, unless vi2's presents have work for it (a queued frame or a held
+//!   reply: [`crate::shared::present`], "The clock runs while a present waits"), and so does a
+//!   tick that leaves no listener and no such work: no deadline, so the timer thread neither
+//!   wakes for it nor reads the clock for it. Queuing a frame starts a stopped clock as a new
+//!   listener does. The tick count is kept, and the next listener starts the clock again with a
 //!   new phase (`the_last_listener_leaving_stops_the_clock_and_the_next_restarts_it`). A new
 //!   listener starts any stopped clock, also one stopped with listeners (the end of the counts,
 //!   below, or a restored snapshot): [`Locked::listen_vsync`] starts the clock when it has no
@@ -151,7 +155,8 @@
 //! returns the first failure: the magic, the version, that the body decodes, that no bytes follow
 //! it, then the clock's own relations ([`VsyncSnapshotError`], in the order of its variants):
 //! at most [`MAX_LISTENERS`] listeners, the listeners strictly ascending (so none twice), a
-//! deadline only with a listener, at most [`MAX_FED_BACK`] ticks fed back, and a tick count and
+//! deadline only with a listener or while vi2's live presents have work (restore those first:
+//! [`crate::shared::present`], "Not checked here"), at most [`MAX_FED_BACK`] ticks fed back, and a tick count and
 //! fed-back ticks whose sum fits a `u64`.
 //! Only then is the clock replaced. [`Shared::save_vsync`] runs the same relation checks on what
 //! it is about to write.
@@ -183,6 +188,7 @@
 use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
+use starquake_gpu::interface::PresentRequest;
 use starquake_kernel::id::ObjectId;
 use starquake_trace::{HostNanos, ServiceId};
 use thiserror::Error;
@@ -267,14 +273,34 @@ impl Vsync {
         self.next.is_some_and(|next| now >= next)
     }
 
-    /// Takes `event` out of the listeners, stopping the clock if it was the last; whether it
-    /// listened.
-    fn remove(&mut self, event: ObjectId) -> bool {
+    /// Whether the clock is stopped: it has no deadline.
+    #[must_use]
+    pub const fn is_stopped(&self) -> bool {
+        self.next.is_none()
+    }
+
+    /// Starts a stopped clock one [`INTERVAL_NS`] after `now`, as a new listener does; a running
+    /// clock keeps its deadline (vi2's presents: module docs, "Stop").
+    pub(super) fn start(&mut self, now: HostNanos) {
+        if self.next.is_none() {
+            self.next = now.0.checked_add(INTERVAL_NS).map(HostNanos);
+        }
+    }
+
+    /// Takes `event` out of the listeners, stopping the clock if it was the last and vi2's
+    /// presents have no `work` for it; whether it listened.
+    fn remove(&mut self, event: ObjectId, work: bool) -> bool {
         let removed = self.listeners.remove(&event);
-        if self.listeners.is_empty() {
+        self.stop_if_idle(work);
+        removed
+    }
+
+    /// Stops the clock if it has no listener and vi2's presents have no `work` for it (module
+    /// docs, "Stop").
+    fn stop_if_idle(&mut self, work: bool) {
+        if self.listeners.is_empty() && !work {
             self.next = None;
         }
-        removed
     }
 
     /// The live turn's decision at `now` (module docs, "The next deadline: no banking"): whether
@@ -379,8 +405,9 @@ pub enum VsyncSnapshotError {
         /// Its index in the list.
         index: usize,
     },
-    /// A deadline with no listener: a clock runs only while something listens.
-    #[error("the vsync clock snapshot has a deadline but no listeners")]
+    /// A deadline with no listener while vi2's presents have no work: a clock runs only while
+    /// something listens or a present waits for a tick.
+    #[error("the vsync clock snapshot has a deadline but no listeners, and no present waits for a tick")]
     DeadlineWithoutListeners,
     /// More ticks fed back than [`MAX_FED_BACK`].
     #[error("the vsync clock snapshot holds {replayed} ticks fed back, more than {MAX_FED_BACK}")]
@@ -421,8 +448,9 @@ struct Saved {
 
 impl Saved {
     /// The relation checks [`Shared::save_vsync`] and [`Shared::restore_vsync`] share, in the
-    /// documented order; the clock the snapshot holds.
-    fn check(self) -> Result<Vsync, VsyncSnapshotError> {
+    /// documented order, `work` saying whether vi2's live presents have work for the clock; the
+    /// clock the snapshot holds.
+    fn check(self, work: bool) -> Result<Vsync, VsyncSnapshotError> {
         let count = self.listeners.len();
         if count > MAX_LISTENERS {
             return Err(VsyncSnapshotError::TooManyListeners { count });
@@ -434,7 +462,7 @@ impl Saved {
         {
             return Err(VsyncSnapshotError::ListenersNotAscending { index: index + 1 });
         }
-        if self.next.is_some() && self.listeners.is_empty() {
+        if self.next.is_some() && self.listeners.is_empty() && !work {
             return Err(VsyncSnapshotError::DeadlineWithoutListeners);
         }
         if self.replayed > MAX_FED_BACK {
@@ -486,22 +514,24 @@ impl Locked<'_> {
         Ok(true)
     }
 
-    /// Takes `event` out of the clock's listeners, stopping the clock if it was the last (module
-    /// docs, "The clock"); whether it was listening.
+    /// Takes `event` out of the clock's listeners, stopping the clock if it was the last and
+    /// vi2's presents have no work for it (module docs, "The clock"); whether it was listening.
     pub fn unlisten_vsync(&mut self, event: ObjectId) -> bool {
-        self.state.vsync.remove(event)
+        let work = self.state.presents.has_work();
+        self.state.vsync.remove(event, work)
     }
 
     /// Delivers the next tick through `host`, recording for `service` (module docs, "Tick"):
-    /// counts it, records it, signals every listener in ascending order, then drops each one the
-    /// kernel refused. A count at `u64::MAX` delivers none and stops the clock (module docs, "The
-    /// end of the counts").
-    fn deliver_tick(&mut self, host: &mut dyn TimerHost, service: ServiceId) {
+    /// counts it, records it, signals every listener in ascending order, runs vi2's present
+    /// latch, then drops each listener the kernel refused and stops the clock if nothing is left
+    /// for it. Returns the latched frames' requests. A count at `u64::MAX` delivers none and
+    /// stops the clock (module docs, "The end of the counts").
+    fn deliver_tick(&mut self, host: &mut dyn TimerHost, service: ServiceId) -> Vec<PresentRequest> {
         let vsync = &mut self.state.vsync;
         let Some(tick) = vsync.tick.checked_add(1) else {
             tracing::error!("gsv: the vsync clock has counted every tick a u64 holds; it stops");
             vsync.next = None;
-            return;
+            return Vec::new();
         };
         vsync.tick = tick;
         host.record(Note::VsyncTick { tick }.event(service));
@@ -521,20 +551,28 @@ impl Locked<'_> {
                 }
             })
             .collect();
+        let presents = self.latch(host, service);
+        let work = self.state.presents.has_work();
         for event in refused {
-            vsync.remove(event);
+            self.state.vsync.remove(event, work);
         }
+        self.state.vsync.stop_if_idle(work);
+        presents
     }
 }
 
 impl Shared {
     /// The timer thread's live vsync turn at `now`: call it after each [`Shared::drain`], with
     /// the time of that turn (module docs, "The clock"). It takes gsv's shared lock and ticks at
-    /// most once, signalling the listeners and recording through `host`.
-    pub fn tick_vsync(&self, host: &mut dyn TimerHost, now: HostNanos) {
+    /// most once, signalling the listeners, latching vi2's presents and recording through
+    /// `host`. Returns the latched frames' requests, in client order, for the caller to hand to
+    /// the GPU front ([`crate::shared::present::PresentFront`]) once the lock is released.
+    pub fn tick_vsync(&self, host: &mut dyn TimerHost, now: HostNanos) -> Vec<PresentRequest> {
         let mut state = self.lock();
         if state.state.vsync.advance(now) {
-            state.deliver_tick(host, self.service);
+            state.deliver_tick(host, self.service)
+        } else {
+            Vec::new()
         }
     }
 
@@ -578,17 +616,24 @@ impl Shared {
     /// ([`VsyncSnapshotError::TicksOverflow`]) both keep the count and the ticks fed back within
     /// a `u64`, and both keep the ticks fed back within [`MAX_FED_BACK`]
     /// ([`VsyncSnapshotError::TooManyFedBack`]).
-    pub fn tick_replayed_vsync(&self, host: &mut dyn TimerHost) {
+    ///
+    /// Returns the latched frames' requests, as [`Shared::tick_vsync`] does.
+    pub fn tick_replayed_vsync(&self, host: &mut dyn TimerHost) -> Vec<PresentRequest> {
         let mut state = self.lock();
+        let mut presents = Vec::new();
         while state.state.vsync.replayed > 0 {
             state.state.vsync.replayed -= 1;
-            state.deliver_tick(host, self.service);
+            presents.extend(state.deliver_tick(host, self.service));
         }
+        presents
     }
 
     /// Writes the vsync clock (module docs, "What is saved").
     pub fn save_vsync(&self) -> Result<Vec<u8>, VsyncSnapshotError> {
-        let vsync = self.lock().state.vsync.clone();
+        let (vsync, work) = {
+            let state = self.lock();
+            (state.state.vsync.clone(), state.state.presents.has_work())
+        };
         let saved = Saved {
             tick: vsync.tick,
             next: vsync.next,
@@ -601,7 +646,7 @@ impl Shared {
         })
         .map_err(VsyncSnapshotError::Encode)?;
         bytes.extend(postcard::to_allocvec(&saved).map_err(VsyncSnapshotError::Encode)?);
-        saved.check()?;
+        saved.check(work)?;
         Ok(bytes)
     }
 
@@ -623,8 +668,10 @@ impl Shared {
         if !rest.is_empty() {
             return Err(VsyncSnapshotError::TrailingBytes { count: rest.len() });
         }
-        let vsync = saved.check()?;
-        self.lock().state.vsync = vsync;
+        let mut state = self.lock();
+        let work = state.state.presents.has_work();
+        state.state.vsync = saved.check(work)?;
+        drop(state);
         Ok(())
     }
 }
