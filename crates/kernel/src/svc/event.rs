@@ -124,7 +124,8 @@ pub fn reset_signal(
             | Object::Session
             | Object::Event(_)
             | Object::SharedMemory(_)
-            | Object::TransferMemory(_) => Err(KernelError::InvalidHandle.into()),
+            | Object::TransferMemory(_)
+            | Object::ResourceLimit(_) => Err(KernelError::InvalidHandle.into()),
         },
     }
 }

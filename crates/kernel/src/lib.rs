@@ -21,6 +21,7 @@ pub mod ipc;
 pub mod memory;
 pub mod object;
 pub mod process;
+pub mod resource_limit;
 pub mod result;
 pub mod sched;
 pub mod slab;

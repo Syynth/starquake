@@ -41,6 +41,8 @@
 //! | `GetInfo` (0x29) | [`info::get_info`] | the handle table and the scheduler, both exclusive (`MesosphereCurrentProcess` adds a handle), the address space, shared, the calling process and the calling core (the dispatcher first draws the process's entropy from the environment the first time it is asked for) |
 //! | `MapPhysicalMemory` (0x2c) | [`physical_memory::map_physical_memory`] | the address space, exclusive, and the process facts (its system resource size) |
 //! | `UnmapPhysicalMemory` (0x2d) | [`physical_memory::unmap_physical_memory`] | the address space, exclusive, and the process facts (its system resource size) |
+//! | `GetResourceLimitLimitValue` (0x30) | [`resource_limit::get_resource_limit_limit_value`] | the handle table, the address space and the scheduler, all shared, and the process facts |
+//! | `GetResourceLimitCurrentValue` (0x31) | [`resource_limit::get_resource_limit_current_value`] | the handle table, the address space and the scheduler, all shared, and the process facts |
 //! | `WaitForAddress` (0x34) | [`arbitration::wait_for_address`] | the address space, shared, the scheduler, guest memory, the calling thread and the dispatch's clock reading |
 //! | `SignalToAddress` (0x35) | [`arbitration::signal_to_address`] | the address space, shared, the scheduler, guest memory and the calling core |
 //! | `CreateEvent` (0x45) | [`event::create_event`] | the handle table and the scheduler, both exclusive |
@@ -66,6 +68,7 @@ pub mod memory;
 pub mod physical_memory;
 pub mod process;
 pub mod processor;
+pub mod resource_limit;
 pub mod shared_memory;
 pub mod sync;
 pub mod thread;

@@ -348,10 +348,10 @@ mod on_the_kernel {
         let controller = rig.open(GET_SELF_CONTROLLER);
         // Six sessions (the port's twice, the two proxies, the getter and the controller), each
         // held by one handle, and the copied event; besides them the table holds the process,
-        // the event the service keeps the creator's reference to, and the calling thread,
-        // held by its creator's reference (`run_a_user_thread`).
+        // its resource limit, the event the service keeps the creator's reference to, and the
+        // calling thread, held by its creator's reference (`run_a_user_thread`).
         let sessions = 6;
-        assert_eq!(rig.holdings(), (sessions + 1, sessions + 3, false));
+        assert_eq!(rig.holdings(), (sessions + 1, sessions + 4, false));
         let before = rig.events.events().len();
 
         let (outcome, x0, answer) = rig.exchange(
@@ -380,8 +380,9 @@ mod on_the_kernel {
             ),
             "{recorded:?}"
         );
-        // Then the process ended: no handle is left, and of the objects only the process, the
-        // service's event and the ended thread's creator's reference remain.
-        assert_eq!(rig.holdings(), (0, 3, true));
+        // Then the process ended: no handle is left, and of the objects only the process, its
+        // resource limit, the service's event and the ended thread's creator's reference
+        // remain.
+        assert_eq!(rig.holdings(), (0, 4, true));
     }
 }

@@ -177,7 +177,8 @@ impl Scheduler {
                 | Object::Process(_)
                 | Object::Session
                 | Object::SharedMemory(_)
-                | Object::TransferMemory(_),
+                | Object::TransferMemory(_)
+                | Object::ResourceLimit(_),
             )
             | Err(_) => Err(KernelError::InvalidHandle.into()),
         }
@@ -196,7 +197,8 @@ impl Scheduler {
                 | Object::Process(_)
                 | Object::Session
                 | Object::SharedMemory(_)
-                | Object::TransferMemory(_),
+                | Object::TransferMemory(_)
+                | Object::ResourceLimit(_),
             )
             | Err(_) => Err(KernelError::InvalidHandle.into()),
         }

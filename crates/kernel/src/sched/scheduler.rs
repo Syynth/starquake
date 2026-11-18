@@ -164,10 +164,10 @@ impl Scheduler {
         &self.objects
     }
 
-    /// How many objects the table holds besides each process's own
-    /// ([`ProcessRecord::object`], one per process row, which outlives everything else): what
-    /// a test that checks nothing else is left counts. Panics unless each process's object is
-    /// live and names its process.
+    /// How many objects the table holds besides each process's own two
+    /// ([`ProcessRecord::object`] and [`ProcessRecord::resource_limit`], two per process row,
+    /// which outlive everything else): what a test that checks nothing else is left counts.
+    /// Panics unless each process's objects are live and name their process.
     #[cfg(test)]
     pub(crate) fn objects_besides_processes(&self) -> usize {
         for (id, record) in &self.processes {
@@ -175,8 +175,14 @@ impl Scheduler {
                 self.objects.get(record.object()),
                 Ok(crate::object::Object::Process(*id))
             );
+            assert_eq!(
+                self.objects.get(record.resource_limit()),
+                Ok(crate::object::Object::ResourceLimit(
+                    crate::resource_limit::ResourceLimit::of(*id)
+                ))
+            );
         }
-        self.objects.len() - self.processes.len()
+        self.objects.len() - 2 * self.processes.len()
     }
 
     /// The object table, to create objects in and to open and close references through.

@@ -13,7 +13,11 @@ use crate::handle::MAX_TABLE_SIZE;
 use crate::id::ThreadId;
 use crate::memory::GUARD_PAGES;
 use crate::process::{LEGACY_VIRTUAL_CORE_COUNT, MainThread, Range};
+use crate::resource_limit::{LimitableResource, ResourceLimit, THREAD_COUNT_LIMIT};
 use crate::sched::{APPLICATION_CORE_COUNT, CoreSignals, UserThread};
+use crate::svc::resource_limit::{
+    LimitTables, get_resource_limit_current_value, get_resource_limit_limit_value,
+};
 
 struct NoSignals;
 
@@ -176,6 +180,22 @@ impl Rig {
     fn own(&self) -> ProcessId {
         self.tables.processes.own()
     }
+
+    /// `GetResourceLimitLimitValue` and `GetResourceLimitCurrentValue` of `resource` in the
+    /// limit `handle` names.
+    fn limit_values(&self, handle: Handle, resource: LimitableResource) -> (u64, u64) {
+        let tables = LimitTables {
+            handles: &self.tables.handles,
+            space: &self.tables.address_space,
+            scheduler: &self.tables.scheduler,
+            processes: &self.tables.processes,
+        };
+        let which = resource.number();
+        (
+            get_resource_limit_limit_value(tables, handle, which).unwrap(),
+            get_resource_limit_current_value(tables, handle, which).unwrap(),
+        )
+    }
 }
 
 /// The process ids this slice adds to Eden's first group, the ones that were not answered
@@ -244,8 +264,8 @@ fn no_id_eden_answers_is_not_implemented() {
 
 #[test]
 fn only_the_current_process_id_changes_the_tables() {
-    // Every id but `MesosphereCurrentProcess` reads; that one adds a handle when it succeeds,
-    // and changes nothing when it fails.
+    // Every id but `MesosphereCurrentProcess` and `ResourceLimit` reads; those two add a
+    // handle when they succeed, and change nothing when they fail.
     let mut rig = Rig::new();
     for &id in InfoType::ALL {
         for (handle, sub_id) in [
@@ -256,7 +276,10 @@ fn only_the_current_process_id_changes_the_tables() {
             let (handles, scheduler) = (rig.tables.handles.clone(), rig.tables.scheduler.clone());
             let result = rig.ask(id, handle, sub_id);
             let changed = rig.tables.handles != handles || rig.tables.scheduler != scheduler;
-            let adds = id == InfoType::MesosphereCurrentProcess && result.is_ok();
+            let adds = matches!(
+                id,
+                InfoType::MesosphereCurrentProcess | InfoType::ResourceLimit
+            ) && result.is_ok();
             assert_eq!(
                 changed,
                 adds,
@@ -606,7 +629,7 @@ fn every_process_is_an_application() {
 }
 
 #[test]
-fn the_free_thread_count_is_edens_limit_less_the_process_s_threads() {
+fn the_free_thread_count_is_the_limit_less_the_process_s_threads() {
     let mut rig = Rig::new();
     let (own, second) = (rig.own(), rig.second);
     let free = |rig: &mut Rig, handle| rig.ask(InfoType::FreeThreadCount, handle, 0);
@@ -636,15 +659,37 @@ fn the_free_thread_count_is_edens_limit_less_the_process_s_threads() {
 }
 
 #[test]
-fn free_threads_stop_at_zero_past_the_limit() {
-    let limit = usize::try_from(THREAD_COUNT_LIMIT).unwrap();
-    assert_eq!(free_threads(0), THREAD_COUNT_LIMIT);
-    assert_eq!(free_threads(limit - 1), 1);
-    assert_eq!(free_threads(limit), 0);
-    assert_eq!(free_threads(limit + 1), 0);
-    assert_eq!(free_threads(usize::MAX), 0);
-    // Eden's value, a guess for an application (see the constant).
-    assert_eq!(THREAD_COUNT_LIMIT, 800);
+fn the_free_thread_count_agrees_with_the_resource_limit_calls() {
+    let mut rig = Rig::new();
+    let own = rig.own();
+    let raw = rig
+        .ask(InfoType::ResourceLimit, Handle::INVALID, 0)
+        .unwrap();
+    let limit = Handle::from_raw(u32::try_from(raw).unwrap());
+    let agree = |rig: &mut Rig| {
+        let free = rig
+            .ask(InfoType::FreeThreadCount, Handle::CURRENT_PROCESS, 0)
+            .unwrap();
+        let (value, current) = rig.limit_values(limit, LimitableResource::ThreadCount);
+        assert_eq!(value, THREAD_COUNT_LIMIT);
+        assert_eq!(free, value - current);
+        free
+    };
+    // The main thread; then up to the limit, where no more is free.
+    assert_eq!(agree(&mut rig), THREAD_COUNT_LIMIT - 1);
+    let mut objects = Vec::new();
+    while rig.tables.scheduler.process(own).unwrap().thread_count()
+        < usize::try_from(THREAD_COUNT_LIMIT).unwrap()
+    {
+        objects.push(rig.create_thread(own).1);
+    }
+    assert_eq!(agree(&mut rig), 0);
+    // One destroyed: one free again.
+    rig.tables
+        .scheduler
+        .close_object(objects.pop().unwrap())
+        .unwrap();
+    assert_eq!(agree(&mut rig), 1);
 }
 
 /// Handles other than the invalid one, for the ids that take only it.
@@ -658,17 +703,57 @@ fn not_invalid(rig: &Rig) -> [Handle; 4] {
 }
 
 #[test]
-fn the_resource_limit_is_the_invalid_handle_after_edens_two_checks() {
+fn the_resource_limit_is_a_new_handle_to_the_calling_process_s_limit_after_edens_two_checks() {
     let mut rig = Rig::new();
     let id = InfoType::ResourceLimit;
+    let limit = rig
+        .tables
+        .scheduler
+        .process(rig.own())
+        .unwrap()
+        .resource_limit();
+    // The second process's limit is another object.
+    let second_limit = rig
+        .tables
+        .scheduler
+        .process(rig.second)
+        .unwrap()
+        .resource_limit();
+    assert_ne!(limit, second_limit);
+    // The process row's reference.
+    assert_eq!(rig.tables.scheduler.objects().refs(limit), 1);
+    let mut added = Vec::new();
+    for refs in [2, 3] {
+        let raw = rig.ask(id, Handle::INVALID, 0).unwrap();
+        let handle = Handle::from_raw(u32::try_from(raw).unwrap());
+        assert_ne!(handle, Handle::INVALID);
+        assert_eq!(
+            rig.tables.handles.resolve(handle),
+            Ok(Resolved::Object(limit))
+        );
+        assert_eq!(
+            rig.tables.scheduler.objects().get(limit),
+            Ok(Object::ResourceLimit(ResourceLimit::of(rig.own())))
+        );
+        // Each handle holds a reference.
+        assert_eq!(rig.tables.scheduler.objects().refs(limit), refs);
+        added.push(handle);
+    }
+    // Each ask adds a handle of its own.
+    assert_ne!(added[0], added[1]);
+    // Closing every handle leaves the row's reference: the limit stays.
+    for handle in added {
+        crate::svc::handle::close_handle(
+            &mut rig.tables.handles,
+            &mut rig.tables.scheduler,
+            handle,
+        )
+        .unwrap();
+    }
+    assert_eq!(rig.tables.scheduler.objects().refs(limit), 1);
     let before = rig.tables.handles.clone();
-    assert_eq!(
-        rig.ask(id, Handle::INVALID, 0),
-        Ok(u64::from(Handle::INVALID.raw()))
-    );
-    // No handle was added.
-    assert_eq!(rig.tables.handles, before);
-    // `R_UNLESS(handle == 0, ResultInvalidHandle)` comes before the sub id's check.
+    // `R_UNLESS(handle == 0, ResultInvalidHandle)` comes before the sub id's check; neither
+    // adds a handle.
     for handle in not_invalid(&rig) {
         for sub_id in [0, 1] {
             assert_eq!(
@@ -686,6 +771,29 @@ fn the_resource_limit_is_the_invalid_handle_after_edens_two_checks() {
             kernel(KernelError::InvalidCombination)
         );
     }
+    assert_eq!(rig.tables.handles, before);
+}
+
+#[test]
+fn the_resource_limit_with_a_full_handle_table_is_out_of_handles() {
+    // A table of four: the main thread's handle and the rig's handle to the second process
+    // leave room for two.
+    let mut description = own_description(Console::Switch2);
+    description.handle_table_size = 4;
+    let mut rig = Rig::with(&description);
+    let id = InfoType::ResourceLimit;
+    for _ in 0..2 {
+        assert!(rig.ask(id, Handle::INVALID, 0).is_ok());
+    }
+    let before = (rig.tables.handles.clone(), rig.tables.scheduler.clone());
+    assert_eq!(
+        rig.ask(id, Handle::INVALID, 0),
+        kernel(KernelError::OutOfHandles)
+    );
+    assert_eq!(
+        (rig.tables.handles.clone(), rig.tables.scheduler.clone()),
+        before
+    );
 }
 
 #[test]

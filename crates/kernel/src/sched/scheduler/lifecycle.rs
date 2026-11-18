@@ -54,6 +54,7 @@ use crate::process::{
     ENTROPY_COUNT, IDEAL_CORE_DONT_CARE, IDEAL_CORE_NO_UPDATE, ProcessRecord, ProcessState,
     physical_core, physical_mask,
 };
+use crate::resource_limit::{ResourceLimit, Values};
 use crate::result::{CallResult, KernelError, SvcError};
 
 /// What a user thread is created with (`KThread::InitializeUserThread`'s arguments).
@@ -95,16 +96,55 @@ impl Scheduler {
     /// [`crate::handle::Handle::CURRENT_PROCESS`] in an IPC request names it
     /// ([`crate::ipc::message`]). Rows are never removed, so that reference is never closed.
     ///
+    /// The process's resource limit is made next ([`Object::ResourceLimit`],
+    /// [`ProcessRecord::resource_limit`], `CreateResourceLimitForProcess`), and the row holds
+    /// its one reference too, never closed for the same reason.
+    ///
     /// A process it already has is damaged bookkeeping ([`SchedError::Corrupt`]), checked
     /// before the object is made; a full object table is [`SchedError::Object`], with no row
-    /// added.
+    /// added and no object left (a process object made before the limit's refusal is released
+    /// again).
     pub fn add_process(&mut self, process: ProcessId) -> Result<(), SchedError> {
         if self.processes.contains_key(&process) {
             return Err(SchedError::Corrupt);
         }
         let object = self.objects.create(Object::Process(process))?;
-        self.processes.insert(process, ProcessRecord::new(object));
+        // `CreateResourceLimitForProcess` in `KProcess::LoadFromMetadata`: the row keeps the
+        // creator's reference, as `KProcess::Initialize` opens one and `LoadFromMetadata`
+        // closes its own.
+        let limit = match self
+            .objects
+            .create(Object::ResourceLimit(ResourceLimit::of(process)))
+        {
+            Ok(limit) => limit,
+            Err(error) => {
+                self.objects.release(object)?;
+                return Err(error.into());
+            }
+        };
+        self.processes
+            .insert(process, ProcessRecord::new(object, limit));
         Ok(())
+    }
+
+    /// The resource limit of `process`, as the object its row names holds it
+    /// ([`ProcessRecord::resource_limit`]). A row whose limit object is gone, is another kind
+    /// of object or belongs to another process is broken bookkeeping
+    /// ([`SchedError::Corrupt`], or [`SchedError::Object`] for an id that names nothing).
+    pub fn resource_limit(&self, process: ProcessId) -> Result<ResourceLimit, SchedError> {
+        let id = self.record(process)?.resource_limit;
+        match self.objects.get(id)? {
+            Object::ResourceLimit(limit) if limit.owner() == process => Ok(limit),
+            _ => Err(SchedError::Corrupt),
+        }
+    }
+
+    /// The thread values of `process`'s resource limit ([`crate::resource_limit`]): Eden's
+    /// limit and the process's threads that still have a row. Fails as
+    /// [`Scheduler::resource_limit`] does.
+    pub fn thread_values(&self, process: ProcessId) -> Result<Values, SchedError> {
+        self.resource_limit(process)?;
+        Ok(Values::threads(self.record(process)?.thread_count()))
     }
 
     /// What changes about a process while it runs.
@@ -180,7 +220,9 @@ impl Scheduler {
     /// one reference, its creator's. The creator adds a handle and closes that reference
     /// ([`Scheduler::close_object`]), as `CreateThread` and `KProcess::Run` do.
     ///
-    /// A virtual core with no physical core in this scheduler is
+    /// First, a process whose threads have reached its resource limit's
+    /// ([`Scheduler::thread_values`]) is [`KernelError::LimitReached`], with nothing made. Then
+    /// a virtual core with no physical core in this scheduler is
     /// [`KernelError::InvalidCoreId`]; a region that cannot be mapped fails with the address
     /// space's error; a full object or thread table with [`KernelError::OutOfResource`] or an
     /// internal failure. On any failure nothing is left behind: the region goes back and the
@@ -191,6 +233,10 @@ impl Scheduler {
         process: ProcessId,
         spec: &UserThread,
     ) -> CallResult<(ThreadId, ObjectId)> {
+        // `KScopedResourceReservation thread_reservation(.., ThreadCountMax)` and
+        // `R_UNLESS(thread_reservation.Succeeded(), ResultLimitReached)`, before the thread is
+        // made (`CreateThread`, `KProcess::Run`).
+        self.thread_values(process)?.reserve_one()?;
         let core = physical_core(spec.virtual_core)
             .filter(|core| self.core_mask().contains(*core))
             .ok_or(KernelError::InvalidCoreId)?;
@@ -238,7 +284,9 @@ impl Scheduler {
     /// decides what destroying each kind means. A session's client end goes and its server is
     /// told (`KClientSession::Destroy`); a thread is destroyed (`KThread::Finalize`); a process
     /// object names a row that outlives it; an event's end, and a shared memory, is its row,
-    /// which the object table has removed already. A transfer memory whose owner's pages are
+    /// which the object table has removed already; a resource limit holds no state of its own
+    /// (`KResourceLimit::Finalize` does nothing), and its process's row keeps a reference to it
+    /// for as long as the row lives. A transfer memory whose owner's pages are
     /// locked has left their unlock to the dispatcher ([`crate::object::Objects::take_unlocks`]),
     /// which holds the owner's address space.
     pub fn tear_down(&mut self, object: ObjectId, kind: Object) -> CallResult<()> {
@@ -249,7 +297,8 @@ impl Scheduler {
             | Object::Event(_)
             | Object::ReadableEvent(_)
             | Object::SharedMemory(_)
-            | Object::TransferMemory(_) => {}
+            | Object::TransferMemory(_)
+            | Object::ResourceLimit(_) => {}
         }
         Ok(())
     }

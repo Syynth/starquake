@@ -29,9 +29,15 @@
 //!   it must reschedule ([`Scheduler::needs_scheduling`]). WAIT SEAM (kernel slices 4 and 10):
 //!   the retry belongs with the core loop and the wait path. Test:
 //!   `changing_the_mask_of_a_running_thread_returns_without_waiting`.
-//! - **No resource limit**: `CreateThread` does not reserve from the process's thread limit
-//!   (`ThreadCountMax`) and so never fails with `ResultLimitReached`; the resource-limits slice
-//!   adds it. **No termination requests**: threads end at once
+//! - **The thread reservation does not wait.** `CreateThread` reserves from the process's
+//!   thread limit (`ThreadCountMax`) after the core and priority checks and fails with
+//!   `ResultLimitReached` past it, as Eden does ([`Scheduler::create_user_thread`]); Eden waits
+//!   up to 100 ms for an ended thread's pending release, and this does not
+//!   ([`crate::resource_limit`], "Divergences from Eden"). Tests (in
+//!   `svc/thread/limit_tests.rs`): `a_thread_fits_at_exactly_the_limit_and_one_past_it_is_limit_reached`,
+//!   `the_core_and_priority_are_checked_before_the_limit`,
+//!   `an_ended_thread_with_an_open_handle_still_counts_and_nothing_waits`.
+//! - **No termination requests**: threads end at once
 //!   ([`Scheduler::terminate_thread`]), so `StartThread` never sees one pending and never
 //!   returns `ResultTerminationRequested`.
 
@@ -88,7 +94,8 @@ pub fn thread_from_handle(
             | Object::Event(_)
             | Object::ReadableEvent(_)
             | Object::SharedMemory(_)
-            | Object::TransferMemory(_) => Err(KernelError::InvalidHandle.into()),
+            | Object::TransferMemory(_)
+            | Object::ResourceLimit(_) => Err(KernelError::InvalidHandle.into()),
         },
     }
 }
@@ -168,7 +175,9 @@ pub struct CreateThread {
 ///    core mask: [`KernelError::InvalidCoreId`].
 /// 3. The priority must be 0-63 and allowed by the process: [`KernelError::InvalidPriority`].
 ///
-/// Then a full object table is [`KernelError::OutOfResource`], a full handle table
+/// Then a process whose threads have reached its resource limit's thread limit is
+/// [`KernelError::LimitReached`] (`KScopedResourceReservation` of `ThreadCountMax`), then a
+/// full object table is [`KernelError::OutOfResource`], a full handle table
 /// [`KernelError::OutOfHandles`], and a thread-local page that cannot be mapped the address
 /// space's error; none leaves a thread behind.
 pub fn create_thread(
@@ -365,6 +374,9 @@ pub fn get_thread_id(
 
 #[cfg(test)]
 mod lifecycle_tests;
+
+#[cfg(test)]
+mod limit_tests;
 
 #[cfg(test)]
 mod tests {

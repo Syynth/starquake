@@ -148,8 +148,8 @@ svc_ids! {
     UnmapPhysicalMemory = 0x2d, Implemented;
     GetDebugFutureThreadInfo = 0x2e, Planned;
     GetLastThreadInfo = 0x2f, Planned;
-    GetResourceLimitLimitValue = 0x30, Planned;
-    GetResourceLimitCurrentValue = 0x31, Planned;
+    GetResourceLimitLimitValue = 0x30, Implemented;
+    GetResourceLimitCurrentValue = 0x31, Implemented;
     SetThreadActivity = 0x32, Planned;
     GetThreadContext3 = 0x33, Planned;
     WaitForAddress = 0x34, Implemented;
@@ -344,6 +344,8 @@ mod tests {
                 | SvcId::GetInfo
                 | SvcId::MapPhysicalMemory
                 | SvcId::UnmapPhysicalMemory
+                | SvcId::GetResourceLimitLimitValue
+                | SvcId::GetResourceLimitCurrentValue
                 | SvcId::SetGpuMemoryAttribute
                 // Not a retail call, but the kernel spec builds events (kernel slice 4).
                 | SvcId::CreateEvent => Status::Implemented,
