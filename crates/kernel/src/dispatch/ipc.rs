@@ -17,10 +17,11 @@
 //! 3. Start the server's next ready request, if one may start, on this core, and run it as in
 //!    step 2; repeat until none may.
 //! 4. Settle every request that is over, in the order they ended: its reply is written into its
-//!    sender's TLS block, and under the lock its references are released and its events
-//!    recorded, the IPC events its handler made and then its `SendSyncRequest` event. The
-//!    caller's own result goes into its registers; every other sender that was waiting is woken
-//!    ([`Dispatcher::take_woken`]).
+//!    sender's TLS block, the handles its handler placed in the sender's table that the reply
+//!    does not name are taken back (all of them when no reply is written; `dispatch/ipc/placed.rs`),
+//!    and under the lock its references are released and its events recorded, the IPC events
+//!    its handler made and then its `SendSyncRequest` event. The caller's own result goes into
+//!    its registers; every other sender that was waiting is woken ([`Dispatcher::take_woken`]).
 //!
 //! The handler leaves its slot at two other times. Its notices (accept a session, forget a
 //! closed one) are given to it under the lock: [`SessionHandler::accept`] and
@@ -149,7 +150,9 @@ use super::{
 };
 use crate::handle::{Handle, HandleError, HandleTable};
 use crate::id::{ObjectId, ProcessId, ServerId};
-use crate::ipc::message::{Current, MessageBuffer, Translated, Translation, translate};
+use crate::ipc::message::{
+    Current, MessageBuffer, Translated, Translation, reply_handles, translate,
+};
 use crate::ipc::{
     Admission, Done, EventHook, Finish, Handled, IpcError, Notice, PortName, Request, Sender,
     SessionHandler,
@@ -167,8 +170,11 @@ use crate::svc::{Convention, SvcId};
 use crate::sync::WaitOrigin;
 use crate::tables::Scheduler;
 
+mod placed;
 #[cfg(test)]
 mod tests;
+
+use placed::Placed;
 
 /// A guest thread whose blocking system call ended while it waited, and its result: a
 /// `SendSyncRequest`, whose reply, when the result is success, is already in its message
@@ -192,6 +198,9 @@ struct Finished {
     /// Whether its handler asked to end the sender's process ([`IpcContext::end_process`]):
     /// the process ends once the request is settled.
     end: bool,
+    /// The handles its handler placed in the sender's table: those its reply names are kept
+    /// when the reply is written, and the rest taken back (`dispatch/ipc/placed.rs`).
+    placed: Placed,
 }
 
 /// The kernel error a guest sees for a handle-table failure, logging the ones that are the
@@ -239,6 +248,8 @@ pub struct IpcContext<'a> {
     events: Vec<EventKind>,
     /// Whether the handler asked to end the sender's process ([`IpcContext::end_process`]).
     end: bool,
+    /// The handles the handler placed in the sender's table, through this context.
+    placed: Placed,
 }
 
 impl IpcContext<'_> {
@@ -260,13 +271,21 @@ impl IpcContext<'_> {
             .map_err(|error| handle_error(&error))
     }
 
-    /// Adds a handle to `object` to the sender's table.
+    /// Adds a handle to `object` to the sender's table, for the handler's reply to name.
+    ///
+    /// The sender keeps it only if the reply that is written into its message buffer names it
+    /// in its special header; otherwise it is taken back when the request is settled
+    /// (`dispatch/ipc/placed.rs`). The same holds for the handles
+    /// [`IpcContext::create_session`] and [`IpcContext::connect`] add.
     pub fn insert_handle(&mut self, object: ObjectId) -> SvcResult<Handle> {
-        self.dispatcher
+        let handle = self
+            .dispatcher
             .with::<(&mut HandleTable, &mut Scheduler), _>(|(handles, scheduler)| {
                 handles.add(scheduler.objects_mut(), object)
             })
-            .map_err(|error| handle_error(&error))
+            .map_err(|error| handle_error(&error))?;
+        self.placed.push(handle, object);
+        Ok(handle)
     }
 
     /// Creates an event for the server and returns its readable end
@@ -396,10 +415,13 @@ impl IpcContext<'_> {
     }
 
     fn open_session(&mut self, server: ServerId, notice: bool) -> SvcResult<(ObjectId, Handle)> {
-        self.dispatcher
+        let (session, handle) = self
+            .dispatcher
             .with::<(&mut HandleTable, &mut Scheduler), _>(|(handles, scheduler)| {
                 open_session_with_handle(handles, scheduler, server, notice)
-            })
+            })?;
+        self.placed.push(handle, session);
+        Ok((session, handle))
     }
 
     /// Copies the sender's memory at `address` into `out`, if the guest may read all of it;
@@ -746,27 +768,30 @@ impl Dispatcher {
             let Some((session, written)) = handler.take_reply(&mut cx, &mut message) else {
                 break;
             };
-            let mut locked = self.lock::<(&mut Scheduler,)>();
-            let (scheduler,) = locked.tables();
+            let mut locked = self.lock::<(&mut HandleTable, &mut Scheduler)>();
+            let (handles, scheduler) = locked.tables();
             let (_, ipc) = scheduler.ipc_mut();
-            match written {
+            let over = match written {
                 Ok(()) => match ipc.complete(session, Box::new(message)) {
-                    Ok(done) => finished.push(Finished {
+                    Ok(done) => vec![Finished {
                         session,
                         done,
                         events: cx.events,
                         end: cx.end,
-                    }),
+                        placed: Placed::default(),
+                    }],
                     Err(error) => {
                         tracing::error!(%error, ?session, "a deferred reply has no request");
+                        Vec::new()
                     }
                 },
                 Err(error) => {
                     tracing::error!(%error, ?server, ?session, "closing the session");
                     let closed = close_failed(ipc, server, session, cx.events);
-                    finished.extend(ending(closed, cx.end));
+                    ending(closed, cx.end)
                 }
-            }
+            };
+            finished.extend(carry(over, cx.placed, handles, scheduler));
         }
         finished
     }
@@ -787,6 +812,7 @@ impl Dispatcher {
             translated,
             events: Vec::new(),
             end: false,
+            placed: Placed::default(),
         }
     }
 
@@ -1007,8 +1033,8 @@ impl Dispatcher {
         let mut message: MessageBuffer = *request.message;
         let answered = handler.handle(&mut cx, session, &mut message);
 
-        let mut locked = self.lock::<(&mut Scheduler,)>();
-        let (scheduler,) = locked.tables();
+        let mut locked = self.lock::<(&mut HandleTable, &mut Scheduler)>();
+        let (handles, scheduler) = locked.tables();
         if matches!(answered, Ok(Handled::Deferred)) {
             // The sender waits for the reply now, before the lock goes, so that a reply
             // delivered as soon as it goes finds it waiting.
@@ -1026,6 +1052,7 @@ impl Dispatcher {
                 close_failed(ipc, server, session, cx.events)
             }
         };
+        let finished = carry(finished, cx.placed, handles, scheduler);
         let finished = ending(finished, cx.end);
         let parked = put_back(&mut locked.state, server, handler);
         (finished, parked)
@@ -1084,25 +1111,40 @@ impl Dispatcher {
             done,
             events,
             end: _,
+            placed,
         } in finished
         {
             let Done { request, result } = done;
             let sender = request.sender;
-            let code = result.err().map_or(ResultCode::SUCCESS, KernelError::code);
-            let mut locked = self.lock::<(&mut Scheduler,)>();
-            let (scheduler,) = locked.tables();
+            let mut locked = self.lock::<(&mut HandleTable, &mut Scheduler)>();
+            let (handles, scheduler) = locked.tables();
             // A sender that ended while it waited gets no reply: its message buffer may be
             // another thread's by now.
             let alive = is_alive(scheduler, sender);
-            if alive
-                && result.is_ok()
-                && let Err(error) = memory.write(sender.message_address, &request.message[..])
-            {
-                tracing::error!(
-                    ?error,
-                    "a reply could not be written to its sender's TLS block"
-                );
+            let mut written = false;
+            let mut result = result;
+            if alive && result.is_ok() {
+                match memory.write(sender.message_address, &request.message[..]) {
+                    Ok(()) => written = true,
+                    Err(error) => {
+                        // `dispatch/ipc/placed.rs`, "Divergences from Eden".
+                        tracing::error!(
+                            ?error,
+                            "a reply could not be written to its sender's TLS block"
+                        );
+                        result = Err(KernelError::InvalidCurrentMemory);
+                    }
+                }
             }
+            // The sender keeps the placed handles the reply it now holds names, and no others;
+            // they go before it is woken with its result (`dispatch/ipc/placed.rs`).
+            let kept = if written {
+                reply_handles(&request.message)
+            } else {
+                Vec::new()
+            };
+            placed.take_back(handles, scheduler, &kept);
+            let code = result.err().map_or(ResultCode::SUCCESS, KernelError::code);
             // The reply is in place before the sender can run again: both happen under the
             // lock.
             if alive
@@ -1321,8 +1363,27 @@ fn finish(
             done,
             events: events.take().unwrap_or_default(),
             end: false,
+            placed: Placed::default(),
         })
         .collect()
+}
+
+/// Gives the first of `finished`, the request a handler ran, the handles the handler `placed`
+/// in its sender's table, to be kept or taken back when it is settled. When nothing is over,
+/// they are taken back now, from `handles`: the handler deferred its reply (a deferred reply's
+/// handles are placed when it is written; `dispatch/ipc/placed.rs`), or ending the request
+/// failed on the kernel's own bookkeeping ([`finish`] logs that failure and returns nothing).
+fn carry(
+    mut finished: Vec<Finished>,
+    placed: Placed,
+    handles: &mut HandleTable,
+    scheduler: &mut Scheduler,
+) -> Vec<Finished> {
+    match finished.first_mut() {
+        Some(first) => first.placed = placed,
+        None => placed.take_back(handles, scheduler, &[]),
+    }
+    finished
 }
 
 /// Marks the first of `finished`, the request a handler ran, as asking to end its sender's

@@ -8,7 +8,7 @@ use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use starquake_ipc::{CommandType, RequestBuilder};
+use starquake_ipc::{CommandType, ReplyBuilder, RequestBuilder};
 use starquake_memory::{FlatMemory, PAGE_SIZE};
 use starquake_trace::{Event, FixedClock, LiveEnv, VecSink};
 
@@ -414,6 +414,16 @@ impl World {
 
 fn request() -> RequestBuilder {
     RequestBuilder::cmif(CommandType::Request, COMMAND).data(&[0x5A; 8])
+}
+
+/// Writes a successful reply that copies `handles` to the sender, as a server gives the handles
+/// it placed: the sender keeps exactly the placed handles its reply names
+/// (`dispatch/ipc/placed.rs`).
+fn name_in_reply(message: &mut [u8], handles: &[Handle]) {
+    let reply = handles.iter().fold(ReplyBuilder::cmif(0), |reply, handle| {
+        reply.copy_handle(handle.raw())
+    });
+    reply.build(message).unwrap();
 }
 
 fn result(regs: &GuestRegs) -> ResultCode {
@@ -1025,7 +1035,7 @@ fn a_handler_runs_without_the_lock_and_can_hand_out_sessions_on_either_server() 
         assert_eq!(cx.connect(ServiceId(0x99)), Err(KernelError::NotFound));
         assert_eq!(cx.resolve_handle(own.1), Ok(own.0));
         lock(&keep).extend([own, other]);
-        message.fill(0);
+        name_in_reply(message, &[own.1, other.1]);
         Ok(Handled::Replied)
     }));
     world.send(A, handle, &request());
@@ -2023,9 +2033,13 @@ fn clearing_an_event_the_server_did_not_make_is_an_invalid_handle_and_changes_no
 
     // An event the second server made and signalled, on a session the first one hands out.
     let connected = Arc::new(Mutex::new(Vec::new()));
-    world
-        .first
-        .script(step(&connected, |cx| cx.connect(SECOND).unwrap().1));
+    let keep = Arc::clone(&connected);
+    world.first.script(Box::new(move |cx, _, message| {
+        let (_, handle) = cx.connect(SECOND).unwrap();
+        lock(&keep).push(handle);
+        name_in_reply(message, &[handle]);
+        Ok(Handled::Replied)
+    }));
     world.send(A, handle, &request());
     let second = lock(&connected)[0];
     let made = Arc::new(Mutex::new(Vec::new()));

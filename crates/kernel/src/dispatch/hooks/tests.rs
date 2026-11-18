@@ -7,7 +7,7 @@ use std::thread;
 use std::time::Duration;
 
 use starquake_cpu::GuestRegs;
-use starquake_ipc::{BUFFER_SIZE, CommandType, RequestBuilder};
+use starquake_ipc::{BUFFER_SIZE, CommandType, ReplyBuilder, RequestBuilder};
 use starquake_memory::{FlatMemory, GuestMemory, PAGE_SIZE};
 use starquake_trace::{FixedClock, GuestTicks, LiveEnv, Recorder, ServiceId, ThreadId};
 
@@ -184,9 +184,14 @@ impl World {
     fn hooked_event(&self, hook: Arc<dyn EventHook>) -> (Handle, ObjectId, ObjectId) {
         let made = Arc::new(Mutex::new(None));
         let keep = Arc::clone(&made);
-        let result = self.request(Box::new(move |cx, _| {
+        let result = self.request(Box::new(move |cx, message| {
             let (writable, readable) = cx.create_hooked_event(Arc::clone(&hook)).unwrap();
             let handle = cx.insert_handle(writable).unwrap();
+            // The reply names the handle, so the guest keeps it (`dispatch/ipc/placed.rs`).
+            ReplyBuilder::cmif(0)
+                .copy_handle(handle.raw())
+                .build(message)
+                .unwrap();
             *keep.lock().unwrap() = Some((handle, writable, readable));
         }));
         assert_eq!(result, 0);
