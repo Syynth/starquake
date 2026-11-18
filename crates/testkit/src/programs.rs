@@ -60,6 +60,16 @@ pub enum ProgramError {
         /// The longest printable line.
         max: u32,
     },
+    /// A message is longer than a thread's message buffer.
+    #[error("message {index} is {len} bytes, longer than the {max} of a message buffer")]
+    MessageTooLong {
+        /// Which message, counting from zero.
+        index: usize,
+        /// Its length in bytes.
+        len: usize,
+        /// The longest message.
+        max: usize,
+    },
     /// An offset inside the image does not fit the arithmetic used to compute it.
     #[error("the program is too large to address")]
     TooLarge,
@@ -154,6 +164,18 @@ pub struct Crash {
 /// svc  #0x7            ; never reached
 /// ```
 pub fn crash() -> Result<Crash, ProgramError> {
+    let [base, value, store] = store_to_crash_address()?;
+    let code = [base, value, store, a64::svc(SVC_EXIT_PROCESS)?];
+    Ok(Crash {
+        nro: NroBuilder::new(&code).build()?,
+        fault_address: CRASH_ADDRESS,
+        store_offset: code_offset(2)?,
+    })
+}
+
+/// The three instructions of [`crash`] that fault: a store of `0x1234` to [`CRASH_ADDRESS`],
+/// through a base register that holds the address less the store's displacement.
+fn store_to_crash_address() -> Result<[u32; 3], ProgramError> {
     /// Offset of the store from the base register, so the fault address is not the register's
     /// value.
     const DISPLACEMENT: u32 = 8;
@@ -161,17 +183,11 @@ pub fn crash() -> Result<Crash, ProgramError> {
         .checked_sub(u64::from(DISPLACEMENT))
         .and_then(|base| u32::try_from(base).ok())
         .ok_or(ProgramError::TooLarge)?;
-    let code = [
+    Ok([
         a64::movz(0, base, 0)?,
         a64::movz(1, 0x1234, 0)?,
         a64::str(1, 0, DISPLACEMENT)?,
-        a64::svc(SVC_EXIT_PROCESS)?,
-    ];
-    Ok(Crash {
-        nro: NroBuilder::new(&code).build()?,
-        fault_address: CRASH_ADDRESS,
-        store_offset: code_offset(2)?,
-    })
+    ])
 }
 
 /// A program that never stops: `b .`.
@@ -429,6 +445,154 @@ pub fn threads() -> Result<Threads, ProgramError> {
     })
 }
 
+/// `svc 0x1f`, `ConnectToNamedPort` (`SvcId::ConnectToNamedPort` in
+/// `eden/src/core/hle/kernel/svc.h`): `x1` is the port name's address, and the session handle
+/// comes back in `x1` (`SvcWrap_ConnectToNamedPort64` in `eden/src/core/hle/kernel/svc.cpp`).
+pub const SVC_CONNECT_TO_NAMED_PORT: u32 = 0x1F;
+/// `svc 0x21`, `SendSyncRequest` (`SvcId::SendSyncRequest` in `eden/src/core/hle/kernel/svc.h`):
+/// `w0` is the session handle; the message is the calling thread's, at the start of the block
+/// `TPIDRRO_EL0` points to (`SvcWrap_SendSyncRequest64` in `eden/src/core/hle/kernel/svc.cpp`).
+pub const SVC_SEND_SYNC_REQUEST: u32 = 0x21;
+
+/// The size of a message a [`requests`] step may copy: the thread's whole message buffer, 0x100
+/// bytes (`COMMAND_BUFFER_LENGTH = 0x100 / sizeof(u32)` in `eden/src/core/hle/ipc.h`; restated
+/// here, as this crate depends on none of the workspace's).
+pub const MESSAGE_LIMIT: usize = 0x100;
+
+/// The session a [`requests`] step sends its message on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendOn {
+    /// The session `ConnectToNamedPort` gave.
+    Port,
+    /// The handle in 32-bit word `word` of the reply the previous step got (for a reply that
+    /// moves one handle and carries no process id, word 3: after the two header words and the
+    /// special header).
+    Reply {
+        /// The word's index from the start of the message.
+        word: u32,
+    },
+}
+
+/// One request of [`requests`]: its message, built by the test, and the session it goes on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Step<'a> {
+    /// The message's bytes, at most [`MESSAGE_LIMIT`].
+    pub message: &'a [u8],
+    /// Where it goes.
+    pub on: SendOn,
+}
+
+/// A program that connects to the named port `port` (its bytes, with the terminating zero),
+/// sends each of `steps` with `SendSyncRequest`, in order and whatever each reply holds, and
+/// then stores to [`CRASH_ADDRESS`] as [`crash`] does, so the run ends in a crash report. The
+/// fault address is [`CRASH_ADDRESS`].
+///
+/// ```text
+/// mrs  x19, tpidrro_el0
+/// adr  x1, <port>
+/// svc  #0x1f                ; ConnectToNamedPort
+/// mov  x20, x1
+/// ; each step:
+/// mov  x0, x20              ; Port, or for Reply { word }:
+/// ldr  x0, [x19, #<word / 2 * 8>]
+/// lsr  x0, x0, #32          ;   when the word is odd
+/// adr  x2, <message>
+/// ldr  x3, [x2, #8k]        ; for each 8 bytes of the message
+/// str  x3, [x19, #8k]
+/// svc  #0x21                ; SendSyncRequest
+/// ; then:
+/// movz x0, #0xdea0
+/// movz x1, #0x1234
+/// str  x1, [x0, #8]
+/// ```
+///
+/// A handle is loaded before the next message is copied over the reply that holds it. An even
+/// word leaves the next word in the register's upper half; `SendSyncRequest` reads the handle
+/// from `w0` alone.
+pub fn requests(port: &[u8], steps: &[Step<'_>]) -> Result<Vec<u8>, ProgramError> {
+    /// The thread pointer and the port's session, kept across the steps.
+    const TLS: u8 = 19;
+    const PORT: u8 = 20;
+    let eight = usize::try_from(a64::MEM_OFFSET_ALIGN).map_err(|_| ProgramError::TooLarge)?;
+    let padded = |bytes: &[u8]| {
+        let mut bytes = bytes.to_vec();
+        bytes.resize(bytes.len().next_multiple_of(eight), 0);
+        bytes
+    };
+    if let Some(index) = steps
+        .iter()
+        .position(|step| step.message.len() > MESSAGE_LIMIT)
+    {
+        return Err(ProgramError::MessageTooLong {
+            index,
+            len: steps.get(index).map_or(0, |step| step.message.len()),
+            max: MESSAGE_LIMIT,
+        });
+    }
+    let mut rodata = padded(port);
+    let mut message_offsets = Vec::with_capacity(steps.len());
+    for step in steps {
+        message_offsets.push(rodata.len());
+        rodata.extend(padded(step.message));
+    }
+
+    let emit_steps = |code: &mut Vec<u32>, rodata_offset: u64| -> Result<(), ProgramError> {
+        let adr_to = |code: &Vec<u32>, rodata_at: usize| -> Result<i64, ProgramError> {
+            let here = code_offset(code.len())?;
+            let to = u64::try_from(rodata_at)
+                .ok()
+                .and_then(|at| rodata_offset.checked_add(at))
+                .ok_or(ProgramError::TooLarge)?;
+            i64::try_from(to)
+                .ok()
+                .zip(i64::try_from(here).ok())
+                .and_then(|(to, from)| to.checked_sub(from))
+                .ok_or(ProgramError::TooLarge)
+        };
+        code.push(a64::mrs(TLS, SysReg::TpidrroEl0)?);
+        code.push(a64::adr(1, adr_to(code, 0)?)?);
+        code.push(a64::svc(SVC_CONNECT_TO_NAMED_PORT)?);
+        code.push(a64::mov(PORT, 1)?);
+        for (step, at) in steps.iter().zip(&message_offsets) {
+            match step.on {
+                SendOn::Port => code.push(a64::mov(0, PORT)?),
+                SendOn::Reply { word } => {
+                    let offset = (word / 2)
+                        .checked_mul(a64::MEM_OFFSET_ALIGN)
+                        .ok_or(ProgramError::TooLarge)?;
+                    code.push(a64::ldr(0, TLS, offset)?);
+                    if word % 2 == 1 {
+                        code.push(a64::lsr_imm(0, 0, u32::BITS)?);
+                    }
+                }
+            }
+            code.push(a64::adr(2, adr_to(code, *at)?)?);
+            let words = step.message.len().div_ceil(eight);
+            for k in 0..words {
+                let offset = k
+                    .checked_mul(eight)
+                    .and_then(|offset| u32::try_from(offset).ok())
+                    .ok_or(ProgramError::TooLarge)?;
+                code.push(a64::ldr(3, 2, offset)?);
+                code.push(a64::str(3, TLS, offset)?);
+            }
+            code.push(a64::svc(SVC_SEND_SYNC_REQUEST)?);
+        }
+        code.extend(store_to_crash_address()?);
+        Ok(())
+    };
+    // The layout depends on the number of instructions, not on what they are.
+    let mut sizing = Vec::new();
+    emit_steps(&mut sizing, 0)?;
+    let placeholder = vec![a64::nop(); sizing.len()];
+    let [_, rodata_offset, _] = NroBuilder::new(&placeholder)
+        .rodata(&rodata)
+        .segment_offsets()?;
+    let mut code = Vec::with_capacity(sizing.len());
+    emit_steps(&mut code, u64::from(rodata_offset))?;
+    Ok(NroBuilder::new(&code).rodata(&rodata).build()?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -612,5 +776,90 @@ mod tests {
         for (offset, code) in program.failure_offsets.iter().zip(1..) {
             assert_eq!(word_at(file, *offset), a64::brk(code).unwrap());
         }
+    }
+
+    #[test]
+    fn requests_sends_each_message_on_its_session_then_crashes() {
+        let first = [0x11_u8; 12];
+        let second: Vec<u8> = (1..=16).collect();
+        let third = [0x33_u8; 8];
+        let steps = [
+            Step {
+                message: &first,
+                on: SendOn::Port,
+            },
+            Step {
+                message: &second,
+                on: SendOn::Reply { word: 3 },
+            },
+            Step {
+                message: &third,
+                on: SendOn::Reply { word: 4 },
+            },
+        ];
+        let file = requests(b"sm:\0", &steps).unwrap();
+        // 4 to connect; per step a handle (1 or 2), an adr, a load and a store per 8 bytes, and
+        // the call; then the crash's 3.
+        let count = 4 + (1 + 1 + 2 * 2 + 1) + (2 + 1 + 2 * 2 + 1) + (1 + 1 + 2 + 1) + 3;
+        let words = code(&file, count);
+        let at = |word: usize| code_offset(word).unwrap();
+        let bytes_at = |word: usize, len: usize| {
+            let target = usize::try_from(adr_target(words[word], at(word))).unwrap();
+            file[target..target + len].to_vec()
+        };
+        assert_eq!(words[0], a64::mrs(19, SysReg::TpidrroEl0).unwrap());
+        assert_eq!(words[1] & 0x1F, 1, "the port's name goes in x1");
+        assert_eq!(bytes_at(1, 4), b"sm:\0");
+        assert_eq!(words[2], a64::svc(SVC_CONNECT_TO_NAMED_PORT).unwrap());
+        assert_eq!(words[3], a64::mov(20, 1).unwrap());
+        // The first step: on the port's session.
+        assert_eq!(words[4], a64::mov(0, 20).unwrap());
+        assert_eq!(bytes_at(5, first.len()), first);
+        assert_eq!(
+            words[6..10],
+            [
+                a64::ldr(3, 2, 0).unwrap(),
+                a64::str(3, 19, 0).unwrap(),
+                a64::ldr(3, 2, 8).unwrap(),
+                a64::str(3, 19, 8).unwrap(),
+            ]
+        );
+        assert_eq!(words[10], a64::svc(SVC_SEND_SYNC_REQUEST).unwrap());
+        // The second: the handle in word 3 of the reply, the upper half of its second
+        // doubleword, loaded before the message is copied over it.
+        assert_eq!(words[11], a64::ldr(0, 19, 8).unwrap());
+        assert_eq!(words[12], a64::lsr_imm(0, 0, 32).unwrap());
+        assert_eq!(bytes_at(13, second.len()), second);
+        assert_eq!(words[18], a64::svc(SVC_SEND_SYNC_REQUEST).unwrap());
+        // The third: word 4, the lower half of the third doubleword, needs no shift.
+        assert_eq!(words[19], a64::ldr(0, 19, 16).unwrap());
+        assert_eq!(bytes_at(20, third.len()), third);
+        assert_eq!(
+            words[21..23],
+            [a64::ldr(3, 2, 0).unwrap(), a64::str(3, 19, 0).unwrap()]
+        );
+        assert_eq!(words[23], a64::svc(SVC_SEND_SYNC_REQUEST).unwrap());
+        // Then the crash program's store to `CRASH_ADDRESS`.
+        let crash = crash().unwrap();
+        assert_eq!(words[24..27], code(&crash.nro, 3)[..]);
+    }
+
+    #[test]
+    fn requests_takes_a_message_as_long_as_a_message_buffer_and_no_longer() {
+        let longest = vec![1; MESSAGE_LIMIT];
+        let step = |message| Step {
+            message,
+            on: SendOn::Port,
+        };
+        assert!(requests(b"sm:\0", &[step(&longest)]).is_ok());
+        let too_long = vec![1; MESSAGE_LIMIT + 1];
+        assert_eq!(
+            requests(b"sm:\0", &[step(&longest), step(&too_long)]),
+            Err(ProgramError::MessageTooLong {
+                index: 1,
+                len: MESSAGE_LIMIT + 1,
+                max: MESSAGE_LIMIT
+            })
+        );
     }
 }
