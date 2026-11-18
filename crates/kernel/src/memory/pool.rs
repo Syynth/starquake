@@ -14,8 +14,15 @@
 //!   (`eden/src/core/hle/kernel/k_process.cpp`) gives a process a limit of its pool's size.
 //!
 //! Horizon's page heaps are not ported (kernel spec, "Not planned"): a pool here is a size and
-//! a count, and the count is what `GetInfo` reports. Only the application pool is modelled; the
-//! applet and the two system pools arrive with the first process that draws from them.
+//! a count, and the count is what `GetInfo` reports. Only the application pool's size is
+//! modelled: every process's count is that size, whatever [`Pool`] its `ACID` names. Eden sizes
+//! a process's limit from its own pool (`kernel.MemoryManager().GetSize(pool)` in
+//! `KProcess::LoadFromMetadata`), so a process of another pool may use the application pool's
+//! size here, a looser or stricter count by the difference between the two pools; the applet
+//! and the two system pools' sizes arrive with the first process that draws from them. The
+//! pool does decide what the process's system resource charges ([`super::system_resource`])
+//! and whether it is an application. Test (in `crates/core/src/image.rs`):
+//! `every_pool_partition_is_counted_against_the_application_pool`.
 //!
 //! Divergences from Eden:
 //!
@@ -61,6 +68,62 @@ impl MemoryArrangement {
             Self::FourGb => 3285 * MIB,
             Self::TwelveGb => 9809 * MIB,
         }
+    }
+}
+
+/// The pool a process draws its memory from (`KMemoryManager::Pool`,
+/// `eden/src/core/hle/kernel/k_memory_manager.h` @ cf654052), as the program's `ACID` names it
+/// (`KProcess::LoadFromMetadata`: `pool = metadata.GetPoolPartition()`). Every process's count
+/// is still the application pool's size whatever its pool (module docs): the pool decides
+/// whether the process is an application (`GetInfo` 23) and what its system resource charges
+/// ([`super::system_resource`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Pool {
+    /// `Application` (0).
+    Application,
+    /// `Applet` (1).
+    Applet,
+    /// `System` (2): the secure system pool.
+    System,
+    /// `SystemNonSecure` (3).
+    SystemNonSecure,
+}
+
+impl Pool {
+    /// Every pool, in number order.
+    pub const ALL: [Self; 4] = [
+        Self::Application,
+        Self::Applet,
+        Self::System,
+        Self::SystemNonSecure,
+    ];
+
+    /// The pool's number (`KMemoryManager::Pool`).
+    #[must_use]
+    pub const fn number(self) -> u32 {
+        match self {
+            Self::Application => 0,
+            Self::Applet => 1,
+            Self::System => 2,
+            Self::SystemNonSecure => 3,
+        }
+    }
+
+    /// The pool's name, in plain words.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Application => "application",
+            Self::Applet => "applet",
+            Self::System => "system",
+            Self::SystemNonSecure => "non-secure system",
+        }
+    }
+
+    /// The pool numbered `number`, or `None` past `SystemNonSecure` (`Pool::Count` is 4).
+    #[must_use]
+    pub fn from_number(number: u32) -> Option<Self> {
+        Self::ALL.into_iter().find(|pool| pool.number() == number)
     }
 }
 
@@ -140,6 +203,26 @@ mod tests {
         let twelve = MemoryArrangement::TwelveGb;
         assert_eq!(twelve.physical_memory_size(), 0x3_0000_0000);
         assert_eq!(twelve.application_pool_size(), 0x2_6510_0000);
+    }
+
+    #[test]
+    fn the_pools_have_the_references_numbers() {
+        // `KMemoryManager::Pool`, written out.
+        let pools = [
+            (Pool::Application, 0),
+            (Pool::Applet, 1),
+            (Pool::System, 2),
+            (Pool::SystemNonSecure, 3),
+        ];
+        for (pool, number) in pools {
+            assert_eq!(pool.number(), number);
+            assert_eq!(Pool::from_number(number), Some(pool));
+        }
+        assert_eq!(Pool::ALL.map(Pool::number), [0, 1, 2, 3]);
+        // `Pool::Count` and past it name no pool.
+        for number in [4, 5, 0xF, u32::MAX] {
+            assert_eq!(Pool::from_number(number), None);
+        }
     }
 
     #[test]

@@ -62,7 +62,8 @@ pub enum Error {
         /// What loading the program and starting its process need: its pages (modules,
         /// `.bss` and counter trampolines), its main thread's stack and thread-local page.
         needed: u64,
-        /// The application pool of the program's console.
+        /// The application pool of the program's console, less what the program's system
+        /// resource charges to it (the `ram` module docs).
         available: u64,
     },
 }
