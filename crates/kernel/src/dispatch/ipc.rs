@@ -769,7 +769,7 @@ impl Dispatcher {
                 break;
             };
             let mut locked = self.lock::<(&mut HandleTable, &mut Scheduler)>();
-            let (handles, scheduler) = locked.tables();
+            let (table, scheduler) = locked.tables();
             let (_, ipc) = scheduler.ipc_mut();
             let over = match written {
                 Ok(()) => match ipc.complete(session, Box::new(message)) {
@@ -791,7 +791,7 @@ impl Dispatcher {
                     ending(closed, cx.end)
                 }
             };
-            finished.extend(carry(over, cx.placed, handles, scheduler));
+            finished.extend(carry(over, cx.placed, table, scheduler));
         }
         finished
     }
@@ -1034,7 +1034,7 @@ impl Dispatcher {
         let answered = handler.handle(&mut cx, session, &mut message);
 
         let mut locked = self.lock::<(&mut HandleTable, &mut Scheduler)>();
-        let (handles, scheduler) = locked.tables();
+        let (table, scheduler) = locked.tables();
         if matches!(answered, Ok(Handled::Deferred)) {
             // The sender waits for the reply now, before the lock goes, so that a reply
             // delivered as soon as it goes finds it waiting.
@@ -1052,7 +1052,7 @@ impl Dispatcher {
                 close_failed(ipc, server, session, cx.events)
             }
         };
-        let finished = carry(finished, cx.placed, handles, scheduler);
+        let finished = carry(finished, cx.placed, table, scheduler);
         let finished = ending(finished, cx.end);
         let parked = put_back(&mut locked.state, server, handler);
         (finished, parked)

@@ -789,8 +789,8 @@ mod tests {
         let mut header = CommandHeader::decode(words).unwrap();
         assert!(header.has_special_header);
         header.has_special_header = false;
-        let [_, word1] = header.encode().unwrap();
-        message[HEADER_WORD_1..HEADER_WORD_1 + WORD].copy_from_slice(&word1.to_le_bytes());
+        let [_, second] = header.encode().unwrap();
+        message[HEADER_WORD_1..HEADER_WORD_1 + WORD].copy_from_slice(&second.to_le_bytes());
         assert_eq!(reply_handles(&message), []);
         let before = message;
         let Translation {

@@ -77,7 +77,7 @@ fn reply_result(world: &World, thread: ThreadId) -> ResultCode {
         starquake_ipc::Message::parse_reply(&tls, starquake_ipc::SessionKind::Session).unwrap();
     match reply.body {
         starquake_ipc::Body::CmifReply(reply) => ResultCode::from_raw(reply.header.result),
-        other => panic!("not a CMIF reply: {other:?}"),
+        other => unreachable!("not a CMIF reply: {other:?}"),
     }
 }
 
@@ -409,7 +409,8 @@ fn a_reply_that_cannot_be_written_takes_back_every_handle_and_fails() {
 fn a_handler_that_fails_or_closes_the_session_leaves_none_of_its_handles() {
     // How each ends, and whether the kernel tells the server it lost the session: a handler
     // that closes the session has forgotten it already (`Handled::Closed`).
-    let scripts: [(fn() -> Result<Handled, HandlerError>, bool); 2] = [
+    type Ending = fn() -> Result<Handled, HandlerError>;
+    let scripts: [(Ending, bool); 2] = [
         (|| Err(HandlerError("gave up".to_owned())), true),
         (|| Ok(Handled::Closed), false),
     ];
