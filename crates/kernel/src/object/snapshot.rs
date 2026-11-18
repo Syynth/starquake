@@ -78,7 +78,10 @@
 //!    object ([`HandleFault::Stale`]), and its object has a reference for it and for each
 //!    handle to it before it ([`HandleFault::Overused`]): each handle holds one reference
 //!    (`KHandleTable::Add` opens one), so an object with `n` references can have at most `n`
-//!    handles across the tables.
+//!    handles across the tables. A resource limit's process row also holds one (check 3 found
+//!    it names the limit), so a limit with `n` references can have at most `n - 1` handles: the
+//!    `n`th is [`HandleFault::LimitRow`], reported after [`HandleFault::Overused`] for the same
+//!    handle.
 //! 5. Each hooked event in turn ([`ObjectSnapshotError::Hook`]): it comes after the one before
 //!    ([`HookFault::Order`]), is a live writable end of an event ([`HookFault::NotAnEvent`]),
 //!    names a service the kernel has a server for ([`HookFault::UnknownService`]), and that
@@ -107,8 +110,11 @@
 //!   ([`Scheduler::tear_down`]). [`Scheduler::add_process`] records the process's object in
 //!   its row, and process rows are never removed.
 //! - **Resource limits.** [`Scheduler::add_process`] makes the process's limit beside its
-//!   object and records it in the row, which holds a reference to it and is never removed; no
-//!   other code makes one ([`crate::resource_limit`]).
+//!   object and records it in the row, which holds a reference to it and is never removed. No
+//!   other kernel path makes one, but the compiler does not enforce it:
+//!   [`ResourceLimit::of`] and [`Objects::create`] are public, so code in another crate can
+//!   make a second limit for a process. Its process row names the first, so [`Objects::save`]
+//!   refuses that state with [`ObjectFault::ResourceLimit`], as restore would.
 //! - **Sessions.** [`crate::ipc::Ipc::open_session`] makes the object and the session's row
 //!   together, and the row goes when the object's last reference does
 //!   ([`crate::ipc::Ipc::forget`], [`crate::ipc::Ipc::discard_session`]).
@@ -150,10 +156,11 @@
 //!   address space's restore checks (reserved within the pool and equal to what the blocks
 //!   use), and its thread count is the owner's thread rows, the scheduler's restore, not built
 //!   yet. A forged snapshot cannot give a limit other limit values, as none are saved.
-//! - **References beyond the handles'.** Check 4 counts only the handles: a thread's
-//!   reference to itself, a process row's, a server's creator reference to the events it made,
-//!   a request's to its session and a wait's are other tables' and are not counted, so a count
-//!   higher than the holders explain is not refused.
+//! - **References beyond the handles'.** Check 4 counts the handles and, for a resource limit,
+//!   its process row's reference: a thread's reference to itself, a process row's reference to
+//!   its process object, a server's creator reference to the events it made, a request's to its
+//!   session and a wait's are other tables' and are not counted, so a count higher than the
+//!   holders explain is not refused.
 //! - **A shared memory's pages against the mapper**: that its pages are pages the mapper
 //!   allocated. The mapper is rebuilt by the address space's restore and keeps no record of
 //!   them.
@@ -324,6 +331,10 @@ pub enum HandleFault {
     /// Its object has fewer references than the handles to it so far.
     #[error("is one handle more to its object than the object has references")]
     Overused,
+    /// Its object is a resource limit, and this handle is one more than its references leave
+    /// once the process row that names the limit (check 3) holds its own.
+    #[error("takes the reference its resource limit's process row holds")]
+    LimitRow,
 }
 
 /// What went wrong with one hooked event ([`ObjectSnapshotError::Hook`]).
@@ -735,7 +746,8 @@ impl Body {
     }
 }
 
-/// Check 4: each handle names a live object, and no object has more handles than references.
+/// Check 4: each handle names a live object, no object has more handles than references, and a
+/// resource limit has one reference more than its handles, its process row's.
 fn check_handles(
     objects: &Objects,
     handles: &[(ProcessId, HandleTable)],
@@ -756,6 +768,11 @@ fn check_handles(
             *handles_so_far = handles_so_far.saturating_add(1);
             if *handles_so_far > refs {
                 return Err(fault(HandleFault::Overused));
+            }
+            // A resource limit's process row, which check 3 found names it, holds one more.
+            let limit = matches!(objects.get(object), Ok(Object::ResourceLimit(_)));
+            if limit && *handles_so_far == refs {
+                return Err(fault(HandleFault::LimitRow));
             }
         }
     }

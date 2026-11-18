@@ -155,10 +155,13 @@ pub struct ResourceLimit {
 }
 
 impl ResourceLimit {
-    /// The resource limit of `owner` (`CreateResourceLimitForProcess`). Any code in the crate
-    /// may make one; the kernel makes one per process, in
-    /// [`crate::sched::Scheduler::add_process`], and the object table's restore remakes the ones
-    /// a snapshot holds after checking each against its owner's row.
+    /// The resource limit of `owner` (`CreateResourceLimitForProcess`). The constructor is
+    /// public, so any code, in this crate or another, may make one; the kernel makes one per
+    /// process, in [`crate::sched::Scheduler::add_process`], and the object table's restore
+    /// remakes the ones a snapshot holds after checking each against its owner's row. A limit
+    /// placed in the object table by any other path is one its owner's row does not name:
+    /// saving or restoring the table refuses it
+    /// ([`crate::object::snapshot::ObjectFault::ResourceLimit`]).
     #[must_use]
     pub const fn of(owner: ProcessId) -> Self {
         Self { owner }

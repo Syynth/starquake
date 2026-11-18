@@ -846,6 +846,18 @@ fn a_resource_limit_is_the_one_its_process_s_row_names() {
     let mut case = Case::new(&kernel);
     case.row(limit).object = SavedObject::Process(own);
     assert_eq!(case.error(), object_error(limit, ObjectFault::Process));
+    // The limit itself moved to the next generation of its slot: the row names the old one.
+    let mut case = Case::new(&kernel);
+    let saved = case.body.objects.remove(limit).unwrap();
+    let moved = case.body.objects.insert(saved).unwrap();
+    assert_eq!(
+        (moved.index(), moved.generation()),
+        (limit.index(), limit.generation() + 1)
+    );
+    assert_eq!(
+        case.error(),
+        object_error(moved, ObjectFault::ResourceLimit)
+    );
     // A second process's limit is accepted as its own, and refused as the first's.
     let second = kernel
         .tables
@@ -1125,6 +1137,57 @@ fn an_object_has_a_reference_for_every_handle_to_it() {
             handle: to_thread[1],
             fault: HandleFault::Overused
         }
+    );
+}
+
+#[test]
+fn a_second_limit_made_through_the_public_object_table_is_refused_by_save() {
+    // `ResourceLimit::of` and `Objects::create` are public, so code outside `add_process` can
+    // make a second limit for a process; its row names the first, so save refuses it.
+    let mut kernel = kernel();
+    let own = kernel.own();
+    let stray = kernel
+        .tables
+        .scheduler
+        .objects_mut()
+        .create(Object::ResourceLimit(ResourceLimit::of(own)))
+        .unwrap();
+    assert_eq!(
+        kernel.save().unwrap_err(),
+        object_error(stray, ObjectFault::ResourceLimit)
+    );
+}
+
+#[test]
+fn a_resource_limit_has_a_reference_for_its_process_s_row_besides_its_handles() {
+    let kernel = kernel();
+    let (handle, limit) = kernel.limit;
+    let to_limit: Vec<Handle> = kernel
+        .tables
+        .handles
+        .entries()
+        .filter(|(_, object)| *object == limit)
+        .map(|(handle, _)| handle)
+        .collect();
+    assert_eq!(to_limit, [handle]);
+    // The guest's handle and the process row's reference.
+    assert_eq!(kernel.objects().refs(limit), 2);
+    let mut case = Case::new(&kernel);
+    case.row(limit).refs = 2;
+    assert!(case.restore().is_ok());
+    // As many references as handles: the handle takes the row's reference.
+    case.row(limit).refs = 1;
+    assert_eq!(
+        case.error(),
+        ObjectSnapshotError::Handle {
+            process: kernel.own(),
+            handle,
+            fault: HandleFault::LimitRow
+        }
+    );
+    assert_eq!(
+        HandleFault::LimitRow.to_string(),
+        "takes the reference its resource limit's process row holds"
     );
 }
 
