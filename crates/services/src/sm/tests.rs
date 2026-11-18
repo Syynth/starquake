@@ -883,6 +883,32 @@ fn a_stub_is_traced_and_recorded_under_the_name_asked_for() {
             id: command,
         }]
     );
+    // A second name nothing provides, sent the same command, is recorded apart: the record is
+    // by the name asked for.
+    let other = name("aoc:u");
+    let second = moved_handle(&send(&mut host, sm, &cmif_get_service(other.to_field())));
+    send(
+        &mut host,
+        second,
+        &RequestBuilder::cmif(CommandType::Request, command),
+    );
+    let other_asked = InterfaceName::new(other.as_str()).unwrap();
+    let manager = host.server(SM).unwrap();
+    assert_eq!(
+        manager.stubbed().copied().collect::<Vec<_>>(),
+        [
+            StubbedCommand {
+                interface: other_asked,
+                protocol: Protocol::Cmif,
+                id: command,
+            },
+            StubbedCommand {
+                interface: asked,
+                protocol: Protocol::Cmif,
+                id: command,
+            },
+        ]
+    );
     let counted = manager
         .requests()
         .find(|count| count.command.interface == asked);
