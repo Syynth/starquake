@@ -134,6 +134,7 @@ use std::thread::JoinHandle;
 
 use starquake_trace::{
     Env, EnvCall, EnvError, EnvRecord, HostIoReply, HostIoRequest, HostNanos, ReplayEnv,
+    UnixSeconds,
 };
 
 use crate::framework::halt::{Halt, Stop};
@@ -182,6 +183,9 @@ pub enum Question {
     Random,
     /// This host I/O request ([`Env::host_io`]).
     HostIo(HostIoRequest),
+    /// The date ([`Env::wall_clock`]). No job asks for it today; a worker records and replays
+    /// it like the others.
+    WallClock,
 }
 
 impl Question {
@@ -192,6 +196,7 @@ impl Question {
             Self::Clock => EnvCall::Clock,
             Self::Random => EnvCall::Random,
             Self::HostIo(_) => EnvCall::HostIo,
+            Self::WallClock => EnvCall::WallClock,
         }
     }
 }
@@ -526,6 +531,14 @@ impl Env for Recorded<'_> {
             },
         )
     }
+
+    fn wall_clock(&self) -> Result<UnixSeconds, EnvError> {
+        self.ask(
+            || Question::WallClock,
+            |env| env.wall_clock(),
+            |reading| EnvRecord::WallClock(*reading),
+        )
+    }
 }
 
 /// Why a record cannot be replayed ([`Replay::new`]).
@@ -840,5 +853,9 @@ impl Env for Replayed {
             Some(request),
             self.answers.host_io(request),
         )
+    }
+
+    fn wall_clock(&self) -> Result<UnixSeconds, EnvError> {
+        self.answer(EnvCall::WallClock, None, self.answers.wall_clock())
     }
 }

@@ -33,8 +33,10 @@
 //! Unknown commands and names are auto-stubbed ([`UnknownPolicy::AutoStub`]), the policy for
 //! bringing up a title (`docs/specs/services.md`, decision 3). The firmware version `set:sys`
 //! reports is Eden's ([`FirmwareVersion::eden_default`]), and so is what `appletOE` reports
-//! ([`AppletSettings::eden_default`]). `time:u`'s clocks start from Eden's defaults
-//! ([`TimeSettings::eden_default`]) and read the run's environment (`install`'s `env`).
+//! ([`AppletSettings::eden_default`]). `time:u`'s clocks start from the settings
+//! [`install_with_clocks`] is given (a run's: its date, `starquake_services::time`, "The run's
+//! date"), or from Eden's defaults ([`TimeSettings::eden_default`], a pinned date) for the other
+//! installs, and read the run's environment (`install`'s `env`).
 //!
 //! `fsp-srv` reads the host through the environment it is given ([`install`]'s `env`): the SD
 //! card is the folder the run's configuration names, which [`HostFolder`] serves on the
@@ -273,6 +275,27 @@ pub fn install_with_graphics(
     guest_log: Arc<dyn lm::GuestLog>,
     graphics: &Graphics,
 ) -> Result<(), ServicesError> {
+    install_with_clocks(
+        dispatcher,
+        env,
+        reads,
+        guest_log,
+        graphics,
+        TimeSettings::eden_default(),
+    )
+}
+
+/// Puts the run's services in front of `dispatcher`, as [`install_with_graphics`] does, with
+/// `time:u`'s clocks starting from `clocks` (a run's are its date: `starquake_services::time`,
+/// "The run's date") instead of Eden's defaults.
+pub fn install_with_clocks(
+    dispatcher: &Dispatcher,
+    env: Arc<dyn Env>,
+    reads: Reads,
+    guest_log: Arc<dyn lm::GuestLog>,
+    graphics: &Graphics,
+    clocks: TimeSettings,
+) -> Result<(), ServicesError> {
     let policy = UnknownPolicy::AutoStub;
     let mut registry = Registry::new();
     registry.register(ServiceName::new(set::SYS_NAME)?, SET_SYS)?;
@@ -332,8 +355,7 @@ pub fn install_with_graphics(
     let input = hid::server(policy).with_service_id(HID);
     dispatcher.add_server(hid::NAME, HID, None, Box::new(input))?;
 
-    let clocks =
-        time::server(TimeSettings::eden_default(), policy, env, reads.halt).with_service_id(TIME_U);
+    let clocks = time::server(clocks, policy, env, reads.halt).with_service_id(TIME_U);
     dispatcher.add_server(time::NAME, TIME_U, None, Box::new(clocks))?;
 
     for (number, name) in PCTL_SERVICES {

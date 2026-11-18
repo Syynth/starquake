@@ -86,6 +86,11 @@ pub use space::SpaceError;
 pub use system::{Error, System};
 pub use title::TitleError;
 
+/// Where a run's date comes from ([`RunOptions::rtc`]), and the unit a pinned date is given in,
+/// for frontends, which see only this crate.
+pub use starquake_services::time::RtcAtBoot;
+pub use starquake_trace::UnixSeconds;
+
 /// The loader's formats (NUP containers, NPDM, NSO), for frontends, which see only this crate
 /// (`docs/architecture.md`, "Crates and dependency direction"): `starquake inspect` and
 /// `starquake verify` read titles through it.

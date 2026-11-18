@@ -39,6 +39,7 @@ mod support {
             command_line: Vec::new(),
             sd_card: None,
             romfs: None,
+            rtc: starquake_core::RtcAtBoot::eden_default(),
         }))
     }
 

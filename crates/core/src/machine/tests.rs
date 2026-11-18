@@ -468,6 +468,7 @@ fn a_data_abort_is_a_crash_that_names_the_address_and_the_instruction() {
         command_line: vec!["starquake".into(), "run".into(), "crash.nro".into()],
         sd_card: None,
         romfs: None,
+        rtc: RtcAtBoot::eden_default(),
     };
     let report = guest.run(vcpu, &options);
 
@@ -671,6 +672,7 @@ fn a_guest_that_never_stops_is_ended_by_the_timeout() {
         command_line: Vec::new(),
         sd_card: None,
         romfs: None,
+        rtc: RtcAtBoot::eden_default(),
     };
     let vcpu = ScriptedVcpu::new().then_spin();
     let interrupters = Interrupters::default();
@@ -690,6 +692,7 @@ fn a_run_that_ends_before_its_timeout_does_not_wait_for_it() {
         command_line: Vec::new(),
         sd_card: None,
         romfs: None,
+        rtc: RtcAtBoot::eden_default(),
     };
     let vcpu = ScriptedVcpu::new().then(|_| {}, svc(SvcId::ExitProcess));
     let started = Instant::now();
@@ -1420,6 +1423,7 @@ fn a_clock_for_another_console_than_the_descriptions_ends_the_run_before_the_gue
     );
 }
 
+mod date;
 mod graphics;
 mod guest_log;
 mod reads;

@@ -4,7 +4,7 @@ use std::sync::Mutex;
 
 use proptest::prelude::*;
 use proptest::test_runner::{Config, RngAlgorithm, RngSeed};
-use starquake_trace::{EnvError, HostNanos};
+use starquake_trace::{EnvError, HostNanos, UnixSeconds};
 
 use super::*;
 
@@ -321,6 +321,10 @@ impl Env for Scripted {
     fn host_io(&self, request: &HostIoRequest) -> Result<HostIoReply, EnvError> {
         self.asked.lock().unwrap().push(request.clone());
         self.reply.clone()
+    }
+
+    fn wall_clock(&self) -> Result<UnixSeconds, EnvError> {
+        Ok(UnixSeconds(0))
     }
 }
 

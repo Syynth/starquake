@@ -445,6 +445,7 @@ fn the_timer_thread_s_graphics_turn_ends_a_guest_s_wait() {
         command_line: Vec::new(),
         sd_card: None,
         romfs: None,
+        rtc: RtcAtBoot::eden_default(),
     };
     let report = run(
         vcpus(&mut main),
@@ -679,6 +680,7 @@ fn a_held_page_request_is_answered_at_the_bound_by_the_timer_thread() {
         command_line: Vec::new(),
         sd_card: None,
         romfs: None,
+        rtc: RtcAtBoot::eden_default(),
     };
     let report = run(
         vcpus(&mut main),

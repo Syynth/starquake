@@ -6,7 +6,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Condvar, MutexGuard};
 use std::time::Duration;
 
-use starquake_trace::EnvRecord;
+use starquake_trace::{EnvRecord, FixedClock, FixedWallClock, LiveEnv, ReplayEnv, UnixSeconds};
 
 use super::*;
 use crate::framework::{DEFERRED_REPLY_DROPPED, Finish};
@@ -125,6 +125,10 @@ impl Env for Gated {
             _ => {}
         }
         self.host.host_io(request)
+    }
+
+    fn wall_clock(&self) -> Result<UnixSeconds, EnvError> {
+        self.host.wall_clock()
     }
 }
 
@@ -585,6 +589,10 @@ impl Env for FailsSecond {
     }
 
     fn host_io(&self, _: &HostIoRequest) -> Result<HostIoReply, EnvError> {
+        unreachable!("the test asks for the time only")
+    }
+
+    fn wall_clock(&self) -> Result<UnixSeconds, EnvError> {
         unreachable!("the test asks for the time only")
     }
 }
@@ -1049,6 +1057,10 @@ impl Env for Rolls {
     fn host_io(&self, _: &HostIoRequest) -> Result<HostIoReply, EnvError> {
         unreachable!("the test asks for random numbers only")
     }
+
+    fn wall_clock(&self) -> Result<UnixSeconds, EnvError> {
+        unreachable!("the test asks for random numbers only")
+    }
 }
 
 /// A job that draws a random number and whose finish sends it on `drawn`.
@@ -1080,6 +1092,94 @@ fn a_random_number_a_worker_drew_is_recorded_and_replayed() {
     replay.submit(job_drawing(&send));
     assert_eq!(drawn.recv_timeout(WAIT), Ok(Ok(VALUE)));
     assert_eq!(replay.check(), Ok(()));
+}
+
+/// A job that reads the date and whose finish sends it on `read`.
+fn job_dating(read: &Sender<Result<UnixSeconds, EnvError>>) -> Job {
+    let read = read.clone();
+    Box::new(move |env: &dyn Env| {
+        let reading = env.wall_clock();
+        let finish: Finish = Box::new(move || read.send(reading).unwrap());
+        finish
+    })
+}
+
+#[test]
+fn a_date_a_worker_read_is_recorded_and_replayed() {
+    const DATE: UnixSeconds = UnixSeconds(-0x0D47_E000);
+    let env = LiveEnv::new(FixedClock::new(0, 1), 0).with_wall_clock(FixedWallClock(DATE));
+    let workers = Workers::new(each(Arc::new(env)), Recording::Kept, unwatched()).unwrap();
+    let (send, read) = mpsc::channel();
+    workers.submit(job_dating(&send));
+    assert_eq!(read.recv_timeout(WAIT), Ok(Ok(DATE)));
+    let record = workers.take_record();
+    let expected = Completed {
+        job: JobIndex::new(0),
+        answers: vec![EnvRecord::WallClock(DATE)],
+        failure: None,
+    };
+    assert_eq!(record, [expected]);
+
+    let replay = replay_of(record);
+    replay.submit(job_dating(&send));
+    assert_eq!(read.recv_timeout(WAIT), Ok(Ok(DATE)));
+    assert_eq!(replay.check(), Ok(()));
+}
+
+#[test]
+fn a_date_the_environment_failed_is_recorded_as_asked_and_replays_the_same_stop() {
+    let missing = EnvError::Exhausted {
+        index: 0,
+        requested: EnvCall::WallClock,
+    };
+    // A job whose environment fails has its finish dropped, so this one sends what it read
+    // before it returns.
+    let job_dating_early = |read: &Sender<Result<UnixSeconds, EnvError>>| -> Job {
+        let read = read.clone();
+        Box::new(move |env: &dyn Env| {
+            read.send(env.wall_clock()).unwrap();
+            let finish: Finish = Box::new(|| {});
+            finish
+        })
+    };
+    let (halt, halts) = halts();
+    let workers = Workers::new(
+        each(Arc::new(ReplayEnv::new(Vec::new()))),
+        Recording::Kept,
+        halt,
+    )
+    .unwrap();
+    let (send, read) = mpsc::channel();
+    workers.submit(job_dating_early(&send));
+    assert_eq!(read.recv_timeout(WAIT), Ok(Err(missing.clone())));
+    // The entry follows the dropped finish: wait for it, within the bound.
+    let mut record = Vec::new();
+    let started = std::time::Instant::now();
+    while record.is_empty() && started.elapsed() < WAIT {
+        record.extend(workers.take_record());
+        std::thread::yield_now();
+    }
+    drop(workers);
+    let expected = Completed {
+        job: JobIndex::new(0),
+        answers: Vec::new(),
+        failure: Some(Failure {
+            asked: Question::WallClock,
+            error: missing.clone(),
+        }),
+    };
+    assert_eq!(record, [expected]);
+    let stop = Stop::Job {
+        job: 0,
+        error: missing.clone(),
+    };
+    assert_eq!(halts.stops(), std::slice::from_ref(&stop));
+
+    let (replay, replayed) = replay_halting(record);
+    replay.submit(job_dating_early(&send));
+    assert_eq!(read.recv_timeout(WAIT), Ok(Err(missing)));
+    assert_eq!(replay.check(), Ok(()));
+    assert_eq!(replayed.stops(), [stop]);
 }
 
 #[test]

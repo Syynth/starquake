@@ -106,6 +106,14 @@
 //!   they are made too, and the workers keep no record of their own (`Recording::Off`, test:
 //!   `a_real_runs_workers_keep_no_record`): the order the reads became visible in is in the
 //!   event stream, as each delivery's request event.
+//! - **The run's date** is read once as the run boots, before the services are installed: from
+//!   the environment's wall clock, which the live environment records, unless the run's settings
+//!   pin a date ([`RunOptions::rtc`]; `starquake_services::time`, "The run's date"). It is the
+//!   first answer in the environment's recording. `time:u`'s clocks start from it
+//!   ([`Given::time`]). A failure to read it ends the run as an emulator error before the guest
+//!   runs ([`date_at_boot`]; tests: `a_pinned_date_reaches_time_u_and_the_host_is_not_read`,
+//!   `the_hosts_date_reaches_time_u_through_a_real_runs_services`,
+//!   `a_replay_without_the_date_is_this_emulator_error`).
 //!
 //! # When the environment fails a service
 //!
@@ -153,6 +161,7 @@ use starquake_memory::{Access, GuestMemory};
 use starquake_services::framework::{Halt, Stop};
 use starquake_services::fsp::worker::{self, Recording, StartError, Workers};
 use starquake_services::lm;
+use starquake_services::time::{RtcAtBoot, TimeSettings};
 use starquake_trace::{
     DumpError, Env, EventKind, FlightRecorder, GuestTicks, HostClock, HostNanos, LifecyclePhase,
     LiveEnv, Recorder, TextSink, ThreadId,
@@ -300,16 +309,18 @@ pub(crate) struct Given {
     /// The run's graphics server, whose turns the timer thread runs ([`crate::hle::graphics`]):
     /// a real run's services add its servers.
     pub(crate) graphics: Arc<Graphics>,
+    /// What `time:u`'s clocks start from: the run's date, read as it booted ([`date_at_boot`]).
+    pub(crate) time: TimeSettings,
 }
 
 /// Puts a run's services in front of its dispatcher, with what the run gives them ([`Given`]).
 /// A failure ends the run before the guest runs, with the message given.
 pub(crate) type Install = dyn Fn(&Dispatcher, Given) -> Result<(), String> + Sync;
 
-/// The services of a real run ([`crate::hle::install_with_graphics`], given the run's guest log
-/// through [`Given::guest_log`] and the run's graphics server, whose turns the timer thread runs,
-/// through [`Given::graphics`]), with `fsp-srv`'s reads on its workers, which keep no record
-/// (module docs, "The environment").
+/// The services of a real run ([`crate::hle::install_with_clocks`], given the run's guest log
+/// through [`Given::guest_log`], the run's graphics server, whose turns the timer thread runs,
+/// through [`Given::graphics`], and the run's date through [`Given::time`]), with `fsp-srv`'s
+/// reads on its workers, which keep no record (module docs, "The environment").
 fn real_services(dispatcher: &Dispatcher, given: Given) -> Result<(), String> {
     let workers =
         reads_workers(&given.reads, Arc::clone(&given.halt)).map_err(|error| error.to_string())?;
@@ -318,14 +329,23 @@ fn real_services(dispatcher: &Dispatcher, given: Given) -> Result<(), String> {
         ready: Arc::new(given.ready),
         halt: given.halt,
     };
-    crate::hle::install_with_graphics(
+    crate::hle::install_with_clocks(
         dispatcher,
         given.env,
         reads,
         given.guest_log,
         &given.graphics,
+        given.time,
     )
     .map_err(|error| error.to_string())
+}
+
+/// The settings `time:u`'s clocks start from, with the RTC at boot `rtc` says, read from `env`
+/// as the run boots (module docs, "The run's date"). The error is the words the run ends with,
+/// as an emulator error, when `env` fails the read.
+fn date_at_boot(rtc: RtcAtBoot, env: &dyn Env) -> Result<TimeSettings, String> {
+    TimeSettings::at_boot(rtc, env)
+        .map_err(|error| format!("the run's date could not be read: {error}"))
 }
 
 /// A real run's `fsp-srv` workers: one thread on each of `envs`, keeping no record (module docs,
@@ -978,6 +998,13 @@ impl<'a, V: Vcpu, C: HostClock + Clone> Machine<'a, V, C> {
             reads: session.reads_environments(),
             held: Mutex::new(BTreeMap::new()),
         };
+        let time = match date_at_boot(session.options.rtc, &**env) {
+            Ok(time) => time,
+            Err(message) => {
+                let ending = Ending::Failed(message);
+                return Err(Box::new((ending, take_log(&machine.log), Tally::default())));
+            }
+        };
         let given = Given {
             env: Arc::<LiveEnv>::clone(env),
             reads: machine.reads.clone(),
@@ -985,6 +1012,7 @@ impl<'a, V: Vcpu, C: HostClock + Clone> Machine<'a, V, C> {
             halt: Arc::<Halted>::clone(&machine.halted),
             guest_log: Arc::new(ServicesLog(Arc::clone(&machine.log))),
             graphics: Arc::clone(&machine.graphics),
+            time,
         };
         if let Err(error) = install(&machine.dispatcher, given) {
             let ending = Ending::Failed(format!("the services could not be set up: {error}"));

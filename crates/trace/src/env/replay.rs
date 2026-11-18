@@ -2,7 +2,7 @@
 
 use std::sync::Mutex;
 
-use crate::env::{Env, EnvCall, EnvError, EnvRecord, HostIoReply, HostIoRequest};
+use crate::env::{Env, EnvCall, EnvError, EnvRecord, HostIoReply, HostIoRequest, UnixSeconds};
 use crate::event::HostNanos;
 use crate::recorder::lock;
 
@@ -127,12 +127,19 @@ impl Env for ReplayEnv {
         state.failure = Some(error.clone());
         Err(error)
     }
+
+    fn wall_clock(&self) -> Result<UnixSeconds, EnvError> {
+        lock(&self.state).take(EnvCall::WallClock, |record| match record {
+            EnvRecord::WallClock(reading) => Some(*reading),
+            _ => None,
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::env::{FixedClock, LiveEnv};
+    use crate::env::{FixedClock, FixedWallClock, LiveEnv};
 
     fn io(channel: u32, payload: &[u8]) -> HostIoRequest {
         HostIoRequest {
@@ -145,6 +152,7 @@ mod tests {
     /// values.
     fn workload(env: &dyn Env) -> Result<Vec<String>, EnvError> {
         let mut out = Vec::new();
+        out.push(format!("{:?}", env.wall_clock()?));
         out.push(format!("{:?}", env.now()?));
         out.push(format!("{:?}", env.random_u64()?));
         out.push(format!("{:?}", env.host_io(&io(2, b"abc"))?));
@@ -153,9 +161,16 @@ mod tests {
         Ok(out)
     }
 
+    /// The date the live runs below read.
+    const DATE: UnixSeconds = UnixSeconds(1_709_164_800);
+
+    fn live() -> LiveEnv {
+        LiveEnv::new(FixedClock::new(500, 25), 99).with_wall_clock(FixedWallClock(DATE))
+    }
+
     #[test]
     fn replay_returns_the_recorded_values_in_order() {
-        let live = LiveEnv::new(FixedClock::new(500, 25), 99);
+        let live = live();
         let live_out = workload(&live).unwrap();
         let replay = ReplayEnv::new(live.recording());
         assert_eq!(workload(&replay).unwrap(), live_out);
@@ -269,6 +284,15 @@ mod tests {
                 host_io(HostIoReply::Unavailable),
                 vec![0x02, 0x03, 0x02, 0xAA, 0xBB, 0x02],
             ),
+            // An `i64` is a zigzag varint: 0x41 is 0x82 and -0x41 is 0x81, each two bytes.
+            (
+                EnvRecord::WallClock(UnixSeconds(0x41)),
+                vec![0x03, 0x82, 0x01],
+            ),
+            (
+                EnvRecord::WallClock(UnixSeconds(-0x41)),
+                vec![0x03, 0x81, 0x01],
+            ),
         ];
         for (record, bytes) in cases {
             assert_eq!(postcard::to_allocvec(&record).unwrap(), bytes, "{record:?}");
@@ -277,8 +301,56 @@ mod tests {
     }
 
     #[test]
+    fn a_live_wall_clock_reading_is_replayed_exactly() {
+        // The host's own clock, so the value is whatever the host said: the replay gives back
+        // that value, not one of its own.
+        let live = LiveEnv::new(FixedClock::new(0, 1), 0);
+        let reading = live.wall_clock().unwrap();
+        assert_eq!(live.recording(), [EnvRecord::WallClock(reading)]);
+        let replay = ReplayEnv::new(live.recording());
+        assert_eq!(replay.wall_clock(), Ok(reading));
+        assert_eq!(replay.finish(), Ok(()));
+        // And a recorded value that no host clock reads now.
+        let replay = ReplayEnv::new(vec![EnvRecord::WallClock(UnixSeconds(-7))]);
+        assert_eq!(replay.wall_clock(), Ok(UnixSeconds(-7)));
+    }
+
+    #[test]
+    fn a_replay_without_the_wall_clock_reading_fails_where_it_is_asked_for() {
+        let missing = ReplayEnv::new(Vec::new());
+        let exhausted = EnvError::Exhausted {
+            index: 0,
+            requested: EnvCall::WallClock,
+        };
+        assert_eq!(missing.wall_clock(), Err(exhausted.clone()));
+        assert_eq!(missing.first_error(), Some(exhausted));
+
+        let other = ReplayEnv::new(vec![EnvRecord::Clock(HostNanos(DATE.0.unsigned_abs()))]);
+        assert_eq!(
+            other.wall_clock(),
+            Err(EnvError::Mismatch {
+                index: 0,
+                requested: EnvCall::WallClock,
+                recorded: EnvCall::Clock,
+            })
+        );
+        assert_eq!(other.consumed(), 0);
+
+        // A wall-clock record answers no other kind of call.
+        let reading = ReplayEnv::new(vec![EnvRecord::WallClock(DATE)]);
+        assert_eq!(
+            reading.now(),
+            Err(EnvError::Mismatch {
+                index: 0,
+                requested: EnvCall::Clock,
+                recorded: EnvCall::WallClock,
+            })
+        );
+    }
+
+    #[test]
     fn a_recording_survives_postcard() {
-        let live = LiveEnv::new(FixedClock::new(500, 25), 99);
+        let live = live();
         workload(&live).unwrap();
         let records = live.recording();
         let bytes = postcard::to_allocvec(&records).unwrap();

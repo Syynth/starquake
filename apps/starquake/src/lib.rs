@@ -9,7 +9,7 @@
 //! read as an NRO. A title that cannot be loaded is an emulator error, like an NRO that cannot.
 //!
 //! ```text
-//! starquake run <program> [--until timeout=<n>s] [--artifacts <folder>]
+//! starquake run <program> [--until timeout=<n>s] [--artifacts <folder>] [--date <seconds>]
 //! starquake inspect <title.nup>
 //! starquake verify <title.nup>
 //! ```
@@ -18,6 +18,12 @@
 //! exited, 1 the guest crashed, 2 an emulator error, 3 the timeout passed. A command line this
 //! tool can't parse, a program file it can't read and an artifacts folder it can't write are
 //! emulator errors too: the contract has no other code for them.
+//!
+//! The run's date is the host's, read once as the run boots and recorded, unless `--date` pins
+//! one: whole seconds since 1970-01-01T00:00:00 UTC, which may be negative (decision log,
+//! 2026-11-17, "The run's date comes from the host, recorded"; [`rtc_at_boot`]). The flag is
+//! starquake's own: the observability spec's headless contract names no flag for a date, and its
+//! `--clock fixed` fixes the monotonic clock only.
 //!
 //! PROVISIONAL (walking skeleton, #74). Of the contract's flags only `--until timeout=<n>s` and
 //! `--artifacts` exist; `--script`, `--clock`, `--seed`, `--record`, `--snapshot-every` and the
@@ -46,13 +52,16 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use starquake_core::host_log::{HostLog, HostLogError};
 use starquake_core::loader::read_at::{Positional, ReadAt};
 use starquake_core::title::{self as title_api, RomFs};
-use starquake_core::{ExitReason, RunOptions, RunReport, System, artifacts, exit_code};
+use starquake_core::{
+    ExitReason, RtcAtBoot, RunOptions, RunReport, System, UnixSeconds, artifacts, exit_code,
+};
 
 pub mod title;
 
 /// What `starquake` prints for `--help`, and after a command line it can't parse.
 pub const USAGE: &str = "\
 usage: starquake run <program> [--until timeout=<n>s] [--artifacts <folder>]
+                     [--date <seconds>]
        starquake inspect <title.nup>
        starquake verify <title.nup>
 
@@ -61,7 +70,9 @@ or of its base), and writes what it did to an artifacts folder:
 summary.json, trace.txt, events.bin and guest_log.txt, plus crash.json and
 crash.txt when the guest crashed. Without --artifacts the folder is made under
 the system's temporary folder and its path is printed. Without --until the
-program runs until it exits or crashes, however long that takes.
+program runs until it exits or crashes, however long that takes. The guest's
+date is the host's, read once as the run starts, unless --date pins one:
+whole seconds since 1970-01-01T00:00:00 UTC, as in --date 1672531200.
 exit codes: 0 the program exited, 1 the guest crashed, 2 emulator error, 3 timeout
 
 inspect: prints what a NUP title holds: its packages, the ExeFS of its newest
@@ -90,6 +101,8 @@ pub struct RunArgs {
     pub timeout: Option<Duration>,
     /// `--artifacts <folder>`.
     pub artifacts: Option<PathBuf>,
+    /// `--date <seconds>`: the date the run pins. `None`: the host's.
+    pub date: Option<UnixSeconds>,
 }
 
 /// A parsed command line.
@@ -149,6 +162,12 @@ pub enum UsageError {
     /// `--until timeout=` with something other than a whole number of seconds.
     #[error("`--until {0}` is not a timeout: write a whole number of seconds, as in `timeout=60s`")]
     BadTimeout(String),
+    /// `--date` with something other than a whole number of seconds that fits an `i64`.
+    #[error(
+        "`--date {0}` is not a date: write whole seconds since 1970-01-01T00:00:00 UTC, as in \
+         `--date 1672531200`"
+    )]
+    BadDate(String),
 }
 
 /// An argument as text, with anything that is not UTF-8 replaced (for flags and messages; a
@@ -170,6 +189,23 @@ fn parse_until(condition: &str) -> Result<Duration, UsageError> {
         .ok_or_else(|| UsageError::BadTimeout(condition.to_owned()))
 }
 
+/// Parses `--date`'s value: an optional `-`, then one or more ASCII digits, as an `i64` of
+/// seconds since the Unix epoch.
+fn parse_date(value: &str) -> Result<UnixSeconds, UsageError> {
+    let digits = value.strip_prefix('-').unwrap_or(value);
+    Some(digits)
+        .filter(|digits| !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|_| value.parse().ok())
+        .map(UnixSeconds)
+        .ok_or_else(|| UsageError::BadDate(value.to_owned()))
+}
+
+/// Where a run's date comes from: the date `--date` pinned, or the host's.
+#[must_use]
+pub fn rtc_at_boot(date: Option<UnixSeconds>) -> RtcAtBoot {
+    date.map_or(RtcAtBoot::Host, RtcAtBoot::Pinned)
+}
+
 /// Parses the arguments after the program's own name.
 pub fn parse(args: &[OsString]) -> Result<Command, UsageError> {
     let Some((command, rest)) = args.split_first() else {
@@ -183,7 +219,7 @@ pub fn parse(args: &[OsString]) -> Result<Command, UsageError> {
         other => return Err(UsageError::UnknownCommand(other.to_owned())),
     }
 
-    let (mut program, mut timeout, mut artifacts) = (None, None, None);
+    let (mut program, mut timeout, mut artifacts, mut date) = (None, None, None, None);
     let mut rest = rest.iter();
     while let Some(arg) = rest.next() {
         let shown = text(arg);
@@ -214,6 +250,12 @@ pub fn parse(args: &[OsString]) -> Result<Command, UsageError> {
                     return Err(UsageError::Repeated("--artifacts"));
                 }
             }
+            "--date" => {
+                let value = text(&value("--date")?);
+                if date.replace(parse_date(&value)?).is_some() {
+                    return Err(UsageError::Repeated("--date"));
+                }
+            }
             flag if UNSUPPORTED_FLAGS.contains(&flag) => {
                 return Err(UsageError::UnsupportedFlag(flag.to_owned()));
             }
@@ -231,6 +273,7 @@ pub fn parse(args: &[OsString]) -> Result<Command, UsageError> {
         program: program.ok_or(UsageError::MissingProgram)?,
         timeout,
         artifacts,
+        date,
     }))
 }
 
@@ -348,6 +391,18 @@ fn load_program<S: ReadAt + 'static>(source: S) -> Result<Loaded, LoadFailure> {
     })
 }
 
+/// What the run `args` asks for is asked to do, with the command line that started it and the
+/// title's RomFS, if it has one.
+fn run_options(args: &RunArgs, command_line: Vec<String>, romfs: Option<RomFs>) -> RunOptions {
+    RunOptions {
+        timeout: args.timeout,
+        command_line,
+        sd_card: None,
+        romfs,
+        rtc: rtc_at_boot(args.date),
+    }
+}
+
 /// Runs the program `args` names and writes its artifacts. Returns the process exit code.
 fn run(
     args: &RunArgs,
@@ -358,12 +413,7 @@ fn run(
     let started = Instant::now();
     let mut report = match load(&args.program) {
         Err(message) => RunReport::emulator_error(message, started.elapsed()),
-        Ok(Loaded { system, romfs }) => system.run(&RunOptions {
-            timeout: args.timeout,
-            command_line,
-            sd_card: None,
-            romfs,
-        }),
+        Ok(Loaded { system, romfs }) => system.run(&run_options(args, command_line, romfs)),
     };
     if let Some(log) = HOST_LOG.get() {
         (report.host_log, report.host_log_dropped) = log.take();
@@ -477,10 +527,20 @@ mod tests {
     }
 
     fn run_args(program: &str, timeout: Option<u64>, artifacts: Option<&str>) -> Command {
+        dated_run_args(program, timeout, artifacts, None)
+    }
+
+    fn dated_run_args(
+        program: &str,
+        timeout: Option<u64>,
+        artifacts: Option<&str>,
+        date: Option<i64>,
+    ) -> Command {
         Command::Run(RunArgs {
             program: PathBuf::from(program),
             timeout: timeout.map(Duration::from_secs),
             artifacts: artifacts.map(PathBuf::from),
+            date: date.map(UnixSeconds),
         })
     }
 
@@ -518,6 +578,97 @@ mod tests {
         for (words, expected) in cases {
             assert_eq!(parse(&args(words)), Ok(expected), "{words:?}");
         }
+    }
+
+    #[test]
+    fn run_takes_a_date_in_either_form_beside_the_other_flags() {
+        let cases = [
+            (
+                &["run", "a.nro", "--date", "1709164800"][..],
+                dated_run_args("a.nro", None, None, Some(1_709_164_800)),
+            ),
+            (
+                &["run", "--date=-1", "a.nro"],
+                dated_run_args("a.nro", None, None, Some(-1)),
+            ),
+            // A negative value after a space is the flag's value, not a flag.
+            (
+                &["run", "--date", "-86399", "a.nro", "--until", "timeout=5s"],
+                dated_run_args("a.nro", Some(5), None, Some(-86_399)),
+            ),
+            (
+                &["run", "--artifacts", "out", "--date", "0", "a.nro"],
+                dated_run_args("a.nro", None, Some("out"), Some(0)),
+            ),
+        ];
+        for (words, expected) in cases {
+            assert_eq!(parse(&args(words)), Ok(expected), "{words:?}");
+        }
+    }
+
+    #[test]
+    fn a_date_is_whole_seconds_that_fit_an_i64() {
+        let max = i64::MAX.to_string();
+        let min = i64::MIN.to_string();
+        for (good, expected) in [
+            ("0", 0),
+            ("-0", 0),
+            ("007", 7),
+            ("1672531200", 1_672_531_200),
+            ("-1", -1),
+            (max.as_str(), i64::MAX),
+            (min.as_str(), i64::MIN),
+        ] {
+            assert_eq!(parse_date(good), Ok(UnixSeconds(expected)), "{good}");
+        }
+        for bad in [
+            "",
+            "-",
+            "--1",
+            "+1",
+            " 1",
+            "1 ",
+            "1.5",
+            "1e9",
+            "2024-02-29",
+            "0x10",
+            // One past each end.
+            "9223372036854775808",
+            "-9223372036854775809",
+        ] {
+            assert_eq!(
+                parse_date(bad),
+                Err(UsageError::BadDate(bad.to_owned())),
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            UsageError::BadDate("2024-02-29".into()).to_string(),
+            "`--date 2024-02-29` is not a date: write whole seconds since \
+             1970-01-01T00:00:00 UTC, as in `--date 1672531200`"
+        );
+    }
+
+    #[test]
+    fn a_run_pins_the_date_it_was_given_and_reads_the_hosts_otherwise() {
+        assert_eq!(rtc_at_boot(None), RtcAtBoot::Host);
+        for date in [i64::MIN, -1, 0, 1_709_164_800] {
+            assert_eq!(
+                rtc_at_boot(Some(UnixSeconds(date))),
+                RtcAtBoot::Pinned(UnixSeconds(date))
+            );
+        }
+        // And the run is asked for exactly that.
+        let Ok(Command::Run(dated)) = parse(&args(&["run", "a.nro", "--date", "-5"])) else {
+            unreachable!("not a run");
+        };
+        let options = run_options(&dated, vec!["x".into()], None);
+        assert_eq!(options.rtc, RtcAtBoot::Pinned(UnixSeconds(-5)));
+        assert_eq!(options.command_line, ["x"]);
+        let Ok(Command::Run(undated)) = parse(&args(&["run", "a.nro"])) else {
+            unreachable!("not a run");
+        };
+        assert_eq!(run_options(&undated, Vec::new(), None).rtc, RtcAtBoot::Host);
     }
 
     #[test]
@@ -580,6 +731,22 @@ mod tests {
             (
                 &["run", "a.nro", "--artifacts", "x", "--artifacts=y"],
                 UsageError::Repeated("--artifacts"),
+            ),
+            (
+                &["run", "a.nro", "--date", "1", "--date=1"],
+                UsageError::Repeated("--date"),
+            ),
+            (
+                &["run", "a.nro", "--date"],
+                UsageError::MissingValue("--date"),
+            ),
+            (
+                &["run", "a.nro", "--date", "today"],
+                UsageError::BadDate("today".into()),
+            ),
+            (
+                &["run", "a.nro", "--date="],
+                UsageError::BadDate(String::new()),
             ),
             (
                 &["run", "a.nro", "--until", "frames=600"],

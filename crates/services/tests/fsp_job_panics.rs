@@ -25,7 +25,7 @@ use starquake_services::framework::{Halt, Stop};
 use starquake_services::fsp::worker::{
     COUNT, Completed, FINISH_PANICKED, JOB_PANICKED, JobIndex, Recording, Replay, Workers,
 };
-use starquake_trace::{Env, EnvError, HostIoReply, HostIoRequest, HostNanos};
+use starquake_trace::{Env, EnvError, HostIoReply, HostIoRequest, HostNanos, UnixSeconds};
 use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Id, Record};
 use tracing::{Event, Level, Metadata, Subscriber};
@@ -130,6 +130,10 @@ impl Env for Unread {
 
     fn host_io(&self, _: &HostIoRequest) -> Result<HostIoReply, EnvError> {
         Ok(HostIoReply::Unavailable)
+    }
+
+    fn wall_clock(&self) -> Result<UnixSeconds, EnvError> {
+        Ok(UnixSeconds(0))
     }
 }
 

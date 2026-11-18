@@ -24,8 +24,9 @@ pub mod text;
 
 pub use dump::{CoreDump, DUMP_MAGIC, DUMP_VERSION, Dump, DumpError};
 pub use env::{
-    Env, EnvCall, EnvError, EnvRecord, FixedClock, HostClock, HostIoHandler, HostIoReply,
-    HostIoRequest, LiveEnv, ReplayEnv, SystemClock,
+    Env, EnvCall, EnvError, EnvRecord, FixedClock, FixedWallClock, HostClock, HostIoHandler,
+    HostIoReply, HostIoRequest, HostWallClock, LiveEnv, ReplayEnv, SystemClock, SystemWallClock,
+    UnixSeconds,
 };
 pub use event::{
     Event, EventKind, FaultAction, GuestTicks, HostNanos, IpcOutcome, LifecyclePhase, MapKind,

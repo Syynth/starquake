@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 use starquake_kernel::sched::ThreadState;
+use starquake_services::time::RtcAtBoot;
 use starquake_trace::Dump;
 
 use crate::crash::{CrashReport, Location, Module, address_text};
@@ -61,6 +62,11 @@ pub struct RunOptions {
     /// `OpenDataStorageByCurrentProcess`), from the narrow title API (`crate::title::open`).
     /// `None`: the run has no data storage.
     pub romfs: Option<crate::title::RomFs>,
+    /// Where the run's date comes from: the host's wall clock, read once as the run boots and
+    /// recorded ([`RtcAtBoot::Host`]), or a pinned date (`--date`). The default pins Eden's
+    /// ([`RtcAtBoot::eden_default`]), so a run that does not say, as a test does not, has a date
+    /// that does not depend on the host (`starquake_services::time`, "The run's date").
+    pub rtc: RtcAtBoot,
 }
 
 /// How a run ended.
