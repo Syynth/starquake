@@ -461,15 +461,22 @@ fn the_fixtures_conversation_with_sm_and_set_sys() {
             (SET_SYS, get_firmware_id),
         ]
     );
-    // Every session and handle is gone: the one object left is the process's own.
+    // Every session and handle is gone: the two objects left are the process's own and its
+    // resource limit.
     let tables = rig.dispatcher.into_tables();
     assert!(tables.handles.is_empty());
     let own = tables.processes.own();
-    let process = tables.scheduler.process(own).unwrap().object();
-    assert_eq!(tables.scheduler.objects().len(), 1);
+    let record = tables.scheduler.process(own).unwrap();
+    assert_eq!(tables.scheduler.objects().len(), 2);
     assert_eq!(
-        tables.scheduler.objects().get(process),
+        tables.scheduler.objects().get(record.object()),
         Ok(starquake_kernel::object::Object::Process(own))
+    );
+    assert_eq!(
+        tables.scheduler.objects().get(record.resource_limit()),
+        Ok(starquake_kernel::object::Object::ResourceLimit(
+            starquake_kernel::resource_limit::ResourceLimit::of(own)
+        ))
     );
     let names = set_interface.commands();
     assert_eq!(

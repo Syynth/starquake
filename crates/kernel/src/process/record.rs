@@ -4,6 +4,10 @@
 //! scheduler lock (`KProcess::ChangeState`, `CreateThreadLocalRegion`,
 //! `IncrementScheduledCount`, `eden/src/core/hle/kernel/k_process.cpp` @ cf654052).
 //!
+//! The row holds one reference to the process's resource limit (`KProcess::m_resource_limit`,
+//! opened in `KProcess::Initialize` and closed in `Finalize`; [`crate::resource_limit`]), which
+//! is never closed, as process rows are never removed.
+//!
 //! The row also keeps the process's random entropy (`KProcess::m_entropy`, which `GetInfo`'s
 //! `RandomEntropy` id reads). Horizon draws it in `KProcess::Initialize` (`GenerateRandom(
 //! m_entropy)`, `k_process.cpp` @ cf654052, line 239) and never changes it. Here it is drawn
@@ -40,6 +44,9 @@ pub enum ProcessState {
 pub struct ProcessRecord {
     /// The process's row in the object table, whose one reference this row holds.
     pub(crate) object: ObjectId,
+    /// Its resource limit's row in the object table ([`crate::object::Object::ResourceLimit`]),
+    /// one reference to which this row holds (`KProcess::m_resource_limit`).
+    pub(crate) resource_limit: ObjectId,
     pub(crate) state: ProcessState,
     /// Threads started and not yet ended (`m_num_running_threads`).
     pub(crate) running_threads: u32,
@@ -53,11 +60,13 @@ pub struct ProcessRecord {
 }
 
 impl ProcessRecord {
-    /// A newly created process, whose object is `object`.
+    /// A newly created process, whose object is `object` and whose resource limit's object is
+    /// `resource_limit`.
     #[must_use]
-    pub fn new(object: ObjectId) -> Self {
+    pub fn new(object: ObjectId, resource_limit: ObjectId) -> Self {
         Self {
             object,
+            resource_limit,
             state: ProcessState::Created,
             running_threads: 0,
             threads: BTreeSet::new(),
@@ -74,6 +83,13 @@ impl ProcessRecord {
         self.object
     }
 
+    /// Its resource limit's row in the object table: what `GetInfo`'s `ResourceLimit` id adds a
+    /// handle to ([`crate::resource_limit`]).
+    #[must_use]
+    pub const fn resource_limit(&self) -> ObjectId {
+        self.resource_limit
+    }
+
     /// Its state.
     #[must_use]
     pub const fn state(&self) -> ProcessState {
@@ -84,6 +100,13 @@ impl ProcessRecord {
     #[must_use]
     pub const fn running_threads(&self) -> u32 {
         self.running_threads
+    }
+
+    /// How many of its threads still have a row: the current value of its resource limit's
+    /// thread count ([`crate::resource_limit`]).
+    #[must_use]
+    pub fn thread_count(&self) -> usize {
+        self.threads.len()
     }
 
     /// Its threads, in id order.

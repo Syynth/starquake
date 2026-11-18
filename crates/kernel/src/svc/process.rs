@@ -85,7 +85,8 @@ pub fn get_process_id(
             | Object::Event(_)
             | Object::ReadableEvent(_)
             | Object::SharedMemory(_)
-            | Object::TransferMemory(_) => {
+            | Object::TransferMemory(_)
+            | Object::ResourceLimit(_) => {
                 return Err(KernelError::InvalidHandle.into());
             }
         },

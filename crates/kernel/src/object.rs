@@ -7,8 +7,8 @@
 //! keyed by the object's own id), and an event's two ends ([`Object::Event`],
 //! [`Object::ReadableEvent`], whose state is the row itself; see [`crate::sync`]), and shared
 //! and transfer memory ([`Object::SharedMemory`], [`Object::TransferMemory`], whose state is the
-//! row itself too; see [`crate::memory::shared`]). Resource limits get their variant from the
-//! slice that builds them, and the compiler then points at every match that must handle it.
+//! row itself too; see [`crate::memory::shared`]), and a process's resource limit
+//! ([`Object::ResourceLimit`], which names its process; see [`crate::resource_limit`]).
 //!
 //! Rows live in the scheduler table ([`Scheduler::objects`](crate::sched::Scheduler::objects)):
 //! the spec puts events and sessions under the scheduler's lock, and a thread's object row
@@ -73,6 +73,7 @@ pub use snapshot::{
 use crate::handle::{Closed, ObjectRefs, RefError};
 use crate::id::{ObjectId, ProcessId, ThreadId};
 use crate::memory::{SharedMemory, TransferMemory};
+use crate::resource_limit::ResourceLimit;
 use crate::result::{KernelError, SvcError};
 use crate::slab::{Slab, SlabError};
 use crate::sync::{Event, ReadableEvent};
@@ -96,6 +97,9 @@ pub enum Object {
     SharedMemory(SharedMemory),
     /// A transfer memory (Horizon's `KTransferMemory`): what `CreateTransferMemory` makes.
     TransferMemory(TransferMemory),
+    /// A process's resource limit (Horizon's `KResourceLimit`): what `GetInfo`'s
+    /// `ResourceLimit` id gives a handle to. See [`crate::resource_limit`].
+    ResourceLimit(ResourceLimit),
 }
 
 /// Why an object table operation failed.
