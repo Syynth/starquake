@@ -91,6 +91,25 @@
 //!   `kernel.MemoryManager().GetSize(pool)`, and here the count is the console's application
 //!   pool whatever the partition ([`memory_arrangement`]; only that pool's size is modelled).
 //!   Test: `every_pool_partition_is_counted_against_the_application_pool`.
+//! - **Conflict: the pool and `IsApplication` follow Eden, not Horizon's loader.** Eden's
+//!   `KProcess::LoadFromMetadata` (`eden/src/core/hle/kernel/k_process.cpp` @ cf654052) takes
+//!   the pool straight from the `ACID` pool partition and sets `IsApplication` only for the
+//!   application pool. Horizon's loader (`GetCreateProcessParameterFlags`, fact only,
+//!   `atmosphere/stratosphere/loader/source/ldr_process_creation.cpp` @ 4e3f3703) sets
+//!   `CreateProcessParameterFlag_IsApplication` from the `ACI0` program type
+//!   (`IsApplication(meta)`) whatever the pool, and maps an `ACID` application partition to
+//!   the applet pool when the `ACI0` program type is an applet (`IsApplet(meta)`); a TODO there
+//!   notes that current firmware no longer accepts that combination at all. Eden wins here:
+//!   it is the source the kernel's process description is ported from, and Horizon's two
+//!   readings of the combination (Atmosphère's remap, and current firmware's refusal, known
+//!   only from that comment) do not settle which one to follow. The system resource checks
+//!   above are Horizon's because Eden makes none, which this choice does not touch. So for an
+//!   `ACID` application partition with an `ACI0` applet type, starquake's pool is the
+//!   application pool, the system resource is charged in full and `GetInfo` 23 is 1 (Horizon:
+//!   the applet pool, no charge, 0); for an `ACID` system partition with an `ACI0` application
+//!   type, `GetInfo` 23 is 0 (Horizon: 1). Whether to refuse the first combination as current
+//!   firmware does is an owner question. Test:
+//!   `the_pool_and_is_application_follow_the_acid_not_the_aci0_program_type`.
 //! - **A pool partition no pool has** (past `SystemNonSecure`) is [`LoadError::PoolPartition`],
 //!   checked after the thread info. Eden casts it to a `KMemoryManager::Pool` unchecked and
 //!   reads past its table of pool sizes; Horizon's loader refuses it (`R_THROW(
@@ -1891,6 +1910,85 @@ mod tests {
                 "{partition:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_pool_and_is_application_follow_the_acid_not_the_aci0_program_type() {
+        // The conflict in the module docs: Eden's reading wins. An `ACID` application partition
+        // with an `ACI0` applet type stays in the application pool, is charged its resource in
+        // full and is an application (`GetInfo` 23 = 1), where Horizon's loader would put it in
+        // the applet pool, charge nothing and answer 0. An `ACID` system partition with an
+        // `ACI0` application type is not an application here (Horizon: 1).
+        use metadata::{PROGRAM_TYPE_APPLET, PROGRAM_TYPE_APPLICATION};
+        use starquake_kernel::memory::Pool;
+        use starquake_kernel::process::ProcessInfo;
+        use starquake_kernel::svc::info::is_application;
+        use starquake_loader::npdm::PoolPartition;
+        let resource = u64::from(MEMORY_BLOCK_UNIT_SIZE);
+        for (partition, program_type, pool, charge, application) in [
+            (
+                PoolPartition::Application,
+                PROGRAM_TYPE_APPLET,
+                Pool::Application,
+                resource,
+                1,
+            ),
+            (
+                PoolPartition::System,
+                PROGRAM_TYPE_APPLICATION,
+                Pool::System,
+                resource,
+                0,
+            ),
+        ] {
+            let mut files = exefs(&["main"]);
+            files.npdm.acid.pool_partition = partition;
+            files.npdm.aci.kernel_capabilities.program_type = Some(program_type);
+            files.npdm.system_resource_size = MEMORY_BLOCK_UNIT_SIZE;
+            let program = Program::from_exefs(files).unwrap();
+            let description = program.description();
+            assert_eq!(description.pool, pool, "{partition:?}");
+            let info = ProcessInfo::new(description, 1).unwrap();
+            assert_eq!(is_application(&info), application, "{partition:?}");
+            let space = load_program(&program).address_space;
+            assert_eq!(
+                space.limit().reserved(),
+                space.used_non_system_user_physical_memory_size() + charge,
+                "{partition:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_applet_resource_above_the_secure_applet_memory_is_refused_when_the_space_is_made() {
+        // Whole 2 MiB blocks, so the loader's checks pass; the kernel then caps an applet's
+        // resource at `SecureAppletMemorySize` (`AllocateSecureMemoryForApplet`). At the cap it
+        // loads; one block more is `OutOfMemory`, before any mapping.
+        use metadata::PROGRAM_TYPE_APPLET;
+        use starquake_kernel::memory::Pool;
+        use starquake_kernel::memory::system_resource::SECURE_APPLET_MEMORY_SIZE;
+        use starquake_loader::npdm::PoolPartition;
+        let cap = u32::try_from(SECURE_APPLET_MEMORY_SIZE).unwrap();
+        assert!(cap.is_multiple_of(MEMORY_BLOCK_UNIT_SIZE));
+        let applet = |size| {
+            let mut files = exefs(&["main"]);
+            files.npdm.acid.pool_partition = PoolPartition::Applet;
+            files.npdm.aci.kernel_capabilities.program_type = Some(PROGRAM_TYPE_APPLET);
+            files.npdm.system_resource_size = size;
+            Program::from_exefs(files).unwrap()
+        };
+        let at_cap = applet(cap);
+        assert_eq!(at_cap.description().pool, Pool::Applet);
+        let space = load_program(&at_cap).address_space;
+        assert_eq!(space.system_resource().size(), SECURE_APPLET_MEMORY_SIZE);
+        let over = applet(cap + MEMORY_BLOCK_UNIT_SIZE);
+        let (mapper, log) = RecordingMapper::new();
+        let error = load(&over, None, Box::new(mapper), &flat()).unwrap_err();
+        assert_eq!(
+            error,
+            LoadError::AddressSpace(CreateError::SystemResource(KernelError::OutOfMemory))
+        );
+        assert_eq!(log.take(), []);
     }
 
     #[test]
