@@ -16,8 +16,9 @@
 //! [`Locked::disarm`]; slice 4), the GPU memory bookkeeping ([`Locked::gpu`], slice 7), the
 //! shared syncpoint page ([`page`], slice 5) and the submissions that wait for room in a full GPU
 //! queue ([`Locked::submits`], slice 11: [`crate::nvsrv::gpu::submits`]) and the native memories
-//! and images ([`Locked::native`], slice 8: [`crate::native`]); later slices add vi2's queues
-//! (spec, "Concurrency inside gsv").
+//! and images ([`Locked::native`], slice 8: [`crate::native`]); the vsync clock ([`vsync`],
+//! slice 12) has its own place beside them; later slices add vi2's queues (spec, "Concurrency
+//! inside gsv").
 //!
 //! Each armed wait holds one watch of its syncpoint: [`Locked::arm`] takes it, and gives back
 //! the watch of the wait it replaces; [`Locked::disarm`] and the drain's firing give it back
@@ -89,6 +90,11 @@
 //! turn's time, which answers the shared page's requests ([`page`], "When a request is
 //! answered"), and sleeps no later than [`Shared::page_deadline`].
 //!
+//! **The vsync turn.** The timer thread also runs [`Shared::tick_vsync`] with the turn's time,
+//! after the drain, which ticks the vsync clock when its deadline has come, and sleeps no later
+//! than [`Shared::vsync_deadline`] ([`vsync`]). The clock saves itself
+//! ([`Shared::save_vsync`], [`Shared::restore_vsync`]).
+//!
 //! # The timer thread
 //!
 //! In a run the core loop's timer thread (`starquake-core`'s `machine/timer.rs`) calls
@@ -148,8 +154,10 @@ use crate::syncpt::waiters::{SavedWait, SavedWaitError, Wait, Waiters};
 pub mod page;
 #[cfg(test)]
 mod tests;
+pub mod vsync;
 
 use page::Page;
+use vsync::Vsync;
 
 /// [`SYNCPOINT_COUNT`] as an index bound.
 const COUNT: usize = SYNCPOINT_COUNT as usize;
@@ -226,6 +234,8 @@ pub struct GsvShared {
     page: Page,
     /// The submissions that wait for room (slice 11).
     submits: Submits,
+    /// The vsync clock (slice 12).
+    vsync: Vsync,
     /// The native memories and images (slice 8).
     native: NativeObjects,
 }
@@ -239,6 +249,7 @@ impl GsvShared {
             waiters: Waiters::default(),
             page: Page::default(),
             submits: Submits::new(),
+            vsync: Vsync::new(),
             native: NativeObjects::new(),
         }
     }
@@ -591,6 +602,7 @@ impl Shared {
             waiters,
             page: Page::default(),
             submits: Submits::new(),
+            vsync: Vsync::new(),
             native: NativeObjects::new(),
         };
         Ok(Self::with_state(state, syncpoints, queue, service))
