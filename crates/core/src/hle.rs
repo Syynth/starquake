@@ -19,6 +19,10 @@
 //! per name, known by [`PCTL`], [`PCTL_A`], [`PCTL_S`] and [`PCTL_R`]: each name's factory has a
 //! capability of its own (`starquake_services::pctl`, "Capabilities").
 //!
+//! `lm`, `ectx:aw` and `aoc:u` are one server each, known by [`LM`], [`ECTX_AW`] and [`AOC_U`].
+//! `lm`'s loggers write each finished message's text to the guest log [`install_with_guest_log`]
+//! is given (the run's, in a run); [`install`] gives them one that keeps nothing.
+//!
 //! The numbers ([`SM`], [`SET_SYS`], [`FSP_SRV`], [`APM`], [`APPLET_OE`], [`HID`], [`TIME_U`],
 //! [`GSV_ROOT`]) are starquake's own:
 //! Horizon names a service by its name only. They appear in the trace, as the `service` of an IPC
