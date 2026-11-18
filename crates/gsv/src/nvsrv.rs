@@ -270,7 +270,8 @@ pub enum NvResult {
     BadValue,
     /// `AlreadyAllocated = 0xD`: a channel's second `AllocGPFIFOEx2`, a class slot taken.
     AlreadyAllocated,
-    /// `Busy = 0xE`: a channel already bound to a timeslice group.
+    /// `Busy = 0xE`: a channel already bound to a timeslice group, and a `SubmitGPFIFO` past
+    /// the cap on its channel's waiting submissions ([`gpu::submits`], "The cap").
     Busy,
     /// `FileOperationFailed = 0x30003`: a path no device has.
     FileOperationFailed,

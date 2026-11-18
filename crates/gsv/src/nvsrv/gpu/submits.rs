@@ -15,7 +15,7 @@
 //!
 //! - [`Submits::push`] adds a submission behind the channel's others, then tries the channel's
 //!   queue ([`Submits::room`]), so a room report that came between the front's `Full` and the
-//!   push is not lost.
+//!   push is not lost; one past the cap it refuses (see "The cap").
 //! - [`Submits::room`] (the drain, on `GpuQueueRoom`) gives the channel's waiting submissions to
 //!   the front, oldest first, completing the reply of each one queued with `Success`, and stops
 //!   at the first `Full`: the front reports room again later.
@@ -35,20 +35,49 @@
 //!
 //! When such a submission is queued, no reply is completed.
 //!
-//! **What bounds the table: nothing yet.** A waiting submission with a token keeps its
-//! request's session busy (the service framework handles one request at a time per session),
-//! but one without a token holds nothing of the title's. So while a channel's queue stays full,
-//! a title can add one submission (with up to [`MAX_ENTRY_BYTES`](super::MAX_ENTRY_BYTES) of
-//! entries) per request it sends and then abandons, by closing the session or by giving an
-//! out buffer that cannot be written, without limit
-//! (`gpu/tests.rs`: `abandoned_submissions_are_not_bounded_yet`). A bound needs a guest-visible
-//! answer for a submission refused when the table is full, which neither reference has (neither
-//! waits); it is an open question for the owner.
-//!
 //! A completion posts the reply to the server's mailbox (`ReplyToken::complete`), which tells the
 //! kernel; it never blocks, and the kernel delivers the reply on a core thread. The drain calls
 //! it with gsv's lock held: gsv's lock, then whatever the kernel's notify takes, the documented
 //! order (`crate::shared`, "Lock order and the drain").
+//!
+//! # The cap
+//!
+//! A waiting submission with a token keeps its request's session busy (the service framework
+//! handles one request at a time per session), but one without a token holds nothing of the
+//! title's: while a channel's queue stays full, a title could add one submission per request it
+//! sends and then abandons, by closing the session or by giving an out buffer that cannot be
+//! written. So each channel's waiting submissions are capped at [`MAX_WAITING_ENTRIES`] entries,
+//! by the owner's ruling of 2026-11-17 (decision log: "Cap a channel's waiting submissions at
+//! 65,536 entries; past it, answer Busy"). Neither reference has a cap, because neither waits.
+//!
+//! - Each waiting submission counts its [`charge`] against the cap: its entries, and **at least
+//!   one**. The ruling counts entries; a submission with no entries would count nothing, and
+//!   such submissions could then wait behind a full channel without bound, which is what the
+//!   ruling is for. Charging them one entry is a **departure from the ruling's wording**, an open
+//!   question for the owner (`a_waiting_submission_is_charged_its_entries_and_at_least_one`,
+//!   `the_cap_takes_a_submission_that_reaches_it_and_refuses_one_past`).
+//! - `SubmitGPFIFO` refuses a submission that would take its channel past the cap
+//!   ([`Submits::admits`]) with `NvResult::Busy` (0xE), as check 7 of its steps, before the
+//!   channel syncpoint's maximum is raised, so no fence goes out for it, and nothing goes to the
+//!   front (`gpu` module docs, "The ioctls"; `abandoned_submissions_are_bounded_by_the_cap`). A
+//!   submission waits only while others of its channel wait or the front answers `Full`; with
+//!   nothing waiting it is charged at most [`CHANNEL_QUEUE_ENTRIES`] (check 2), which is the
+//!   cap, so it is never refused, whatever the front answers.
+//! - [`Submits::push`] refuses a submission past the cap too, whoever calls it: its token
+//!   answers `Busy` and nothing is added ([`OverCap`]; `a_push_past_the_cap_is_refused`). Through
+//!   nvsrv it is not reached: the handler holds the nvsrv family from the ioctl's check to the
+//!   push, so no other ioctl or close comes between, and the drain, which may, only takes
+//!   submissions out.
+//! - Restoring refuses a snapshot whose waiting submissions of a channel pass the cap
+//!   ([`SnapshotError::OverCap`]).
+//!
+//! The cap is per channel. A channel can submit only once it holds a syncpoint
+//! (`AllocGPFIFOEx2`), and closing its fd answers and drops its waiting submissions
+//! ([`Submits::cancel`]), so the table holds at most [`MAX_WAITING_ENTRIES`] charged entries for
+//! each allocated syncpoint (`the_cap_is_each_channel_s`).
+//!
+//! The running total is kept per channel as submissions come and go, so the check does not walk
+//! the channel's queue.
 //!
 //! # Snapshot format
 //!
@@ -64,7 +93,9 @@
 //! A snapshot is a file and is not trusted. [`Submits::restore`] checks, in this order, and
 //! returns the first failure: the magic, the version, that the body decodes, that no bytes follow
 //! it, then each entry in list order ([`SnapshotError`], in the order of its variants): its wait
-//! fence's syncpoint, its entry count, that its token id is not one an earlier entry has, that it
+//! fence's syncpoint, its entry count, that its channel's entries up to and with it, each
+//! counted by [`charge`], do not pass [`MAX_WAITING_ENTRIES`] (refused at the first entry that
+//! passes it), that its token id is not one an earlier entry has, that it
 //! comes after the entry before it (channel, then token id: a later request takes a later token),
 //! and that the server holds its request as pending ([`Server::pending`]); the last three only
 //! for an entry with a token. "After" means: a channel not below the one before it, and within a

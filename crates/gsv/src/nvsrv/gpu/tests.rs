@@ -2372,6 +2372,56 @@ fn a_waiting_table_no_run_reaches_is_refused() {
         let restored = Submits::restore(&snapshot_of(&edge), &live.rig.server, &front);
         assert_eq!(restored.map(|table| table.len()).ok(), Some(edge.len()));
     }
+    // A restored table counts its entries against the cap, and refuses a push past it.
+    let at_cap = [
+        SavedSubmit {
+            entries: vec![1; MAX_WAITING_ENTRIES - 1],
+            ..waiting_entry(0x30, 1)
+        },
+        SavedSubmit {
+            entries: Vec::new(),
+            ..tokenless(0x30)
+        },
+    ];
+    let mut restored = Submits::restore(&snapshot_of(&at_cap), &live.rig.server, &front).unwrap();
+    assert_eq!(
+        restored.waiting_entries(ChannelId(0x30)),
+        MAX_WAITING_ENTRIES
+    );
+    assert!(!restored.admits(ChannelId(0x30), 0));
+    let submission = Submission {
+        entries: Vec::new(),
+        wait: None,
+        increments: 0,
+        wfi: true,
+    };
+    let refused = restored.push(ChannelId(0x30), None, submission, Arc::clone(&front));
+    assert!(refused.is_err());
+}
+
+/// What a channel's waiting submissions count against the cap falls by each one's charge as
+/// room takes it, oldest first, so a partly drained channel takes again what was taken out.
+#[test]
+fn room_gives_back_what_it_takes_from_the_cap() {
+    let mut bench = Bench::new();
+    let (fd, _, _, channel) = bench.channel();
+    bench.fake.hold(channel, CHANNEL_QUEUE_ENTRIES);
+    wait_with(&mut bench, fd, 3);
+    wait_with(&mut bench, fd, 0);
+    wait_with(&mut bench, fd, MAX_WAITING_ENTRIES - 3 - 1);
+    assert_eq!(bench.submits.waiting_entries(channel), MAX_WAITING_ENTRIES);
+    // Room for the oldest two: the three entries and the empty one, charged one, go.
+    bench.fake.hold(channel, CHANNEL_QUEUE_ENTRIES - 3);
+    bench.submits.room(channel);
+    assert_eq!(bench.submits.waiting(channel), 1);
+    let left = MAX_WAITING_ENTRIES - 3 - 1;
+    assert_eq!(bench.submits.waiting_entries(channel), left);
+    // Exactly what went fits again, and one entry more does not.
+    assert!(bench.submits.admits(channel, 3 + 1));
+    assert!(!bench.submits.admits(channel, 3 + 2));
+    wait_with(&mut bench, fd, 3 + 1);
+    let (answer, deferral) = bench.submit(fd, &[], 0, (0, 0));
+    assert_eq!((answer.result, deferral), (NvResult::Busy, None));
 }
 
 #[test]

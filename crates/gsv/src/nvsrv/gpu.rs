@@ -89,7 +89,12 @@
 //!    indexes its table with it);
 //! 6. the channel has no syncpoint, or no GPU channel and no address space to make one in:
 //!    `InvalidState` (starquake's: Eden submits to a channel it never initialised); the GPU
-//!    refusing the channel made now: `InsufficientMemory` (a guess).
+//!    refusing the channel made now: `InsufficientMemory` (a guess);
+//! 7. the submission would take the channel's waiting submissions past
+//!    [`submits::MAX_WAITING_ENTRIES`] ([`submits::Submits::admits`]): `Busy` (the owner's ruling
+//!    of 2026-11-17, decision log: "Cap a channel's waiting submissions at 65,536 entries; past
+//!    it, answer Busy"; [`submits`], "The cap"). Only a channel whose submissions wait can be
+//!    refused; with nothing waiting, check 2 keeps every submission within the cap.
 //!
 //! Then the fence ([`plan`]): the increment is 2 if bit 1 ([`FENCE_INCREMENT`]) plus the fence
 //! value if bit 8 ([`INCREMENT_VALUE`]); the channel syncpoint's maximum is raised by it, and the
@@ -106,7 +111,8 @@
 //! front reports room (`GpuCompletion::GpuQueueRoom`), the timer thread's drain gives the
 //! channel's waiting submissions to the front again, oldest first, and completes the reply of
 //! each one queued, until the front answers `Full` again. Entries reach the front in the order
-//! the submissions came, whether they waited or not.
+//! the submissions came, whether they waited or not. A channel's waiting submissions are capped
+//! (check 7 above): past the cap the request answers `Busy` and gets no fence.
 //!
 //! The syncpoint's maximum is raised before the reply is written, so a submission that must wait
 //! waits even if its out buffer cannot be written or no reply token can be taken: the request
@@ -140,9 +146,11 @@
 //! - **Event ids.** NX2 makes an event for every id it is asked (`QueryEvent`'s `default:`
 //!   with `g_nx2_driver`); PR answers 1, 2, 3 and 7. NX2's answer contains PR's, so decision 8's
 //!   rule picks NX2's; this **departs from decision 8** and takes PR's, because NX2's makes a
-//!   new kernel event for each new id a title sends, without bound. A listed divergence too.
-//!   Open questions for the owner: is the departure accepted, and does NvRm ask for any id
-//!   besides 7? (`events_1_2_3_and_7_are_answered`.)
+//!   new kernel event for each new id a title sends, without bound. The owner accepted the
+//!   departure on 2026-11-17 (decision log: "nvhost-gpu answers event ids 1, 2, 3 and 7 only: an
+//!   accepted departure from decision 8"). A listed divergence too. Open question, for a trace
+//!   (the spec's verification item 1): does NvRm ask for any id besides 7?
+//!   (`events_1_2_3_and_7_are_answered`.)
 //! - **Increments past 64.** PR refuses a submission (`BadParameter`) when its ABI is the native
 //!   one, flag bit 8 is set and bit 1 is clear, and the fence value is above 64
 //!   (`SubmitGPFIFOImpl`: `native_completion = UsesNativeAbi() && increment_value &&
@@ -165,6 +173,7 @@
 //! | A submission before `AllocGPFIFOEx2`, or unbound | pushed to an uninitialised channel | `InvalidState` (`a_submission_needs_a_syncpoint_and_a_space`) |
 //! | More entries than [`CHANNEL_QUEUE_ENTRIES`] in one submission | taken | `InvalidSize` (`a_submission_larger_than_a_queue_is_refused`) |
 //! | A full queue | no queue bound | the reply waits for room (`a_full_queue_defers_and_room_completes`) |
+//! | A submission past the cap on a channel's waiting submissions | no cap: nothing waits | `Busy`, before the fence is raised; a submission with no entries counts as one ([`submits`], "The cap"; `the_cap_takes_a_submission_that_reaches_it_and_refuses_one_past`) |
 //! | The out buffer of a submission that waits | written when the ioctl returns | written at once, before the reply (`a_waiting_submission_writes_its_fence_at_once`) |
 //! | Closing a channel whose submissions wait | not possible: Eden never waits | each waiting reply answers `NotImplemented`, as a request on a closed fd does; the out buffer keeps the fence (`closing_a_channel_answers_its_waiting_submissions`) |
 //! | `QueryEvent` with any other id | NX2: a new event | `BadParameter` (`events_1_2_3_and_7_are_answered`) |
