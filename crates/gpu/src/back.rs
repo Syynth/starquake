@@ -13,6 +13,10 @@
 //! - [`fence`]: fences and completion (slice G15): the open command list, fenced releases,
 //!   increments and markers performed after host completion, the acquire waiter table they
 //!   latch, and the back thread's wait on its ring and on completion.
+//! - [`texture`]: the texture cache (slice G17): texture headers decoded, guest images to host
+//!   textures uploaded through the layout crate, render targets, write-back on demand, kept
+//!   coherent with CPU writes, dropped by ordered unmaps, evicted by the budget.
+//! - [`readback`]: the readback ids the caches' write-backs share.
 //!
 //! Later slices add draws (G18) and the executor that feeds them all from the ring (G19).
 
@@ -20,4 +24,6 @@ pub mod buffer;
 pub mod copy;
 pub mod fence;
 pub mod qmd;
+pub mod readback;
 pub mod state;
+pub mod texture;
