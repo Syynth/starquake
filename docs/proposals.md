@@ -535,6 +535,21 @@ Landed: G10 (back-thread engine mirrors, dirty groups and typed accessors, #321,
 | awaiting the owner | **The buffer cache re-reads a range on its first use after arming its watch** (from the review notes on #197); the spec-literal alternative is a one-line change in `Entry::upload_spans` | #327 | gpu-protocol |
 | awaiting the owner | **Buffer cache guesses:** `STREAMED_AFTER_FAULTS = 4` and the budget halves in `eviction_limits`; record them in the spec as guesses to confirm by trace | #327 | gpu-protocol |
 
+### From filing the shader and render slices (2026-11-18)
+
+The remaining shader-pipeline slices (#349 to #381, #348 before them) and render-backend slices (#382 to #389) are filed under the approved specs, in milestone 3 except slice 21 (milestone 4) and slice 22 (unscheduled, for a direct backend). Drafting them turned up these spec gaps.
+
+| Status | Proposal | Why | Suggested |
+|---|---|---|---|
+| awaiting the owner | **Render capture v2 is to be designed "before R5"** (decision log, 2026-11-16), and no design exists. R11b (#388) needs it; R5 (#382) is otherwise ready to start. Let R5 go ahead while the lead drafts the capture v2 design as a design PR, or hold R5 until it merges | #382, #388 | render-backend |
+| awaiting the owner | **Shader slice dependencies:** the spec's critical-path sentence disagrees with its own table (13 needs 12e, 12f, 8 and 9; 10 needs 3 and 9; 15 needs 2; every 12x needs 7) and leaves out the cache (19); slices 8, 11 and 18 test through the interpreter (7) without listing it; 6d builds on structs 6a, 6b and 6e make; 12h's branches become flow-analysis edges (10) | #348 to #381 | shader-pipeline |
+| awaiting the owner | **Work no shader slice owns,** placed by the drafts: the local and shared memory pass (pass 6) in slice 16; the IR build step between flow analysis and the translators in slices 10 and 11; `cargo xtask shader-nvdisasm`; the speed test in slice 17 | #362, #363, #375, #376 | shader-pipeline |
+| awaiting the owner | **One shader capture format:** the spec does not say whether `shader-replay` reads slice 20's format or the shader records inside the GPU capture (`SQGC`, G20 #331). The drafts make slice 20's format the one G20 embeds | #379, #331 | shader-pipeline |
+| awaiting the owner | **R9b and R12 are circular:** R9b needs a backend in core, and R12, which chooses it, depends on R9. R9b can take G21's recording-backend wiring instead; also, no spec says how core sets the GPU crate's dump flag | #386, #389 | render-backend |
+| awaiting the owner | **Small spec fixes:** PR #4588's test file is `src/tests/video_core/native_shader.cpp`; render-backend's "Open with #12: how the back thread wakes" line is stale since decision 14 | #348 to #389 | shader-pipeline, render-backend |
+| proposed | **Instructions with no reference source:** no encoding source for `JMX`, `UP2UR` and `BPT`; no translator in either Switch 2 reference for `IDP4`, `UP2UR`, `DSETP`, `AL2P` and `PIXLD` (Eden's Maxwell translators cover the last three). The decoder and translator issues mark them as guesses | #351 to #371 | area:shader |
+| proposed | **Render verification 3 (wgpu on lavapipe in Linux CI)** has no owner or issue; until it runs, every GPU test stays local-only | #382 | infra |
+
 ## House-rule candidates
 
 Rules distilled from review findings. A vetted rule moves into `CLAUDE.md`; until then it is
