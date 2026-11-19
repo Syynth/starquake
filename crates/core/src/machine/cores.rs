@@ -118,6 +118,11 @@ struct Parks {
     stopped: AtomicBool,
     /// The core armed for the GPU's next quiet signal, by index, if one is.
     armed: Mutex<Option<usize>>,
+    /// How many more quiet signals must reach an armed core before a question that comes to
+    /// "stalled" reads as stalled; until then it reads busy only because of the GPU, as if the
+    /// GPU stayed in a turn until then: a test's way to make questions land in GPU turns.
+    #[cfg(test)]
+    busy_turns: std::sync::atomic::AtomicU32,
 }
 
 impl Parks {
@@ -146,6 +151,12 @@ impl QuietWake for Parks {
         let Some(index) = armed.take() else {
             return;
         };
+        // Under the arming's lock, which every write here takes.
+        #[cfg(test)]
+        self.busy_turns.store(
+            self.busy_turns.load(Ordering::SeqCst).saturating_sub(1),
+            Ordering::SeqCst,
+        );
         if let Some(slot) = self.slots.get(index) {
             lock(&slot.state).quiet = true;
             slot.wake.notify_all();
@@ -160,10 +171,6 @@ pub(super) struct Cores<I> {
     parks: Arc<Parks>,
     /// How many cores are parked.
     idle: Mutex<usize>,
-    /// How many of the next questions that come to "stalled" are read as busy only because of
-    /// the GPU: a test's way to make a question land in a GPU turn.
-    #[cfg(test)]
-    gpu_busy_reads: std::sync::atomic::AtomicU32,
 }
 
 impl<I: Interrupter> Cores<I> {
@@ -175,10 +182,10 @@ impl<I: Interrupter> Cores<I> {
                 slots: (0..count).map(|_| ParkSlot::default()).collect(),
                 stopped: AtomicBool::new(false),
                 armed: Mutex::new(None),
+                #[cfg(test)]
+                busy_turns: std::sync::atomic::AtomicU32::new(0),
             }),
             idle: Mutex::new(0),
-            #[cfg(test)]
-            gpu_busy_reads: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -239,17 +246,19 @@ impl<I: Interrupter> Cores<I> {
             .is_some_and(|slot| std::mem::take(&mut lock(&slot.state).woken))
     }
 
-    /// Makes the next `count` questions that come to "stalled" read as busy only because of the
-    /// GPU, as if each had landed in a GPU turn.
+    /// Makes questions that come to "stalled" read as busy only because of the GPU until `turns`
+    /// quiet signals have reached an armed core, as if the GPU stayed in a turn until each of
+    /// them: the question lands in a GPU turn, and the GPU is busy until the turn ends.
     #[cfg(test)]
-    pub(super) fn read_gpu_busy(&self, count: u32) {
-        self.gpu_busy_reads.store(count, Ordering::SeqCst);
+    pub(super) fn read_gpu_busy(&self, turns: u32) {
+        self.parks.busy_turns.store(turns, Ordering::SeqCst);
     }
 
-    /// How many of the reads [`Cores::read_gpu_busy`] asked for are left.
+    /// How many of the quiet signals [`Cores::read_gpu_busy`] asked for have not yet reached an
+    /// armed core.
     #[cfg(test)]
-    pub(super) fn gpu_busy_reads(&self) -> u32 {
-        self.gpu_busy_reads.load(Ordering::SeqCst)
+    pub(super) fn busy_turns_left(&self) -> u32 {
+        self.parks.busy_turns.load(Ordering::SeqCst)
     }
 
     /// Stops every core: each is interrupted and woken, and parks no more.
@@ -279,16 +288,7 @@ impl<I: Interrupter> Cores<I> {
         let answer = ask();
         #[cfg(test)]
         let answer = match answer {
-            Stall::Stalled
-                if self
-                    .gpu_busy_reads
-                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
-                        left.checked_sub(1)
-                    })
-                    .is_ok() =>
-            {
-                Stall::OnlyTheGpu
-            }
+            Stall::Stalled if self.parks.busy_turns.load(Ordering::SeqCst) > 0 => Stall::OnlyTheGpu,
             other => other,
         };
         let for_quiet = retry && answer == Stall::OnlyTheGpu;

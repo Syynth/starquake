@@ -3,17 +3,19 @@
 //! told the run is stalled and the run ends as [`WAITING`], also when a question lands in a GPU
 //! turn. The cores run on threads of their own over the run's production wiring
 //! ([`Machine::start`], which gives the GPU the cores as its quiet wake), with the GPU's real
-//! threads on the host clock; a question that lands in a GPU turn is made by
-//! `Cores::read_gpu_busy`, which reads the next stalled answers as busy only because of the
-//! GPU, and the GPU's own front thread then tells the quiet signal that has them asked again.
-//! There is no timer thread: nothing here has a deadline.
+//! threads on the host clock. A question that lands in a GPU turn is made by
+//! `Cores::read_gpu_busy`: questions that come to "stalled" read busy only because of the GPU
+//! until a given number of the GPU front thread's own quiet signals have reached an armed core,
+//! as if the GPU stayed in a turn until each of them. Without the retry no core is ever armed,
+//! so such a run never ends on its own (each test here failed that way with the retry removed,
+//! at the test's bound). There is no timer thread: nothing here has a deadline.
 
 use std::sync::atomic::Ordering;
 
 use super::frames::stand_in_memory;
 use super::*;
-use crate::machine::cores::GPU_QUIET_RETRIES;
 use crate::machine::core_loop;
+use crate::machine::cores::GPU_QUIET_RETRIES;
 
 /// How long a run here may take before the test stops it and fails.
 const PATIENCE: Duration = Duration::from_secs(20);
@@ -21,13 +23,25 @@ const PATIENCE: Duration = Duration::from_secs(20);
 /// What the test stops a run with when it has not ended on its own.
 const STOPPED_BY_THE_TEST: &str = "the test stopped the run";
 
+type TestMachine<'m> = Machine<'m, ScriptedVcpu, FixedClock>;
+
+/// Stops the run when dropped, so a test whose check panics on the watching thread still ends
+/// the cores instead of hanging the gate.
+struct StopOnDrop<'a, 'm>(&'a TestMachine<'m>);
+
+impl Drop for StopOnDrop<'_, '_> {
+    fn drop(&mut self) {
+        self.0.stop(Ending::Failed(STOPPED_BY_THE_TEST.to_owned()));
+    }
+}
+
 /// Runs the hello program with the GPU, its main thread sleeping for ever on core 0, after
 /// `prepare` and with `during` run on a thread of its own while the cores run, until the run
 /// ends, or [`PATIENCE`] after `during` returned, when the test stops it with
 /// [`STOPPED_BY_THE_TEST`]. Returns how it ended.
 fn stalled_gpu_run(
-    prepare: impl FnOnce(&Machine<'_, ScriptedVcpu, FixedClock>),
-    during: impl FnOnce(&Machine<'_, ScriptedVcpu, FixedClock>) + Send,
+    prepare: impl FnOnce(&TestMachine<'_>),
+    during: impl FnOnce(&TestMachine<'_>) + Send,
 ) -> Ending {
     let guest = super::super::Guest::new(&programs::hello().unwrap());
     let space: &dyn GuestSpace<ScriptedVcpu> = &guest.memory;
@@ -68,14 +82,14 @@ fn stalled_gpu_run(
             scope.spawn(move || core_loop::run(machine, core, &mut ScriptedVcpu::default()));
         }
         scope.spawn(move || {
+            let stop = StopOnDrop(machine);
             during(machine);
             let deadline = Instant::now() + PATIENCE;
-            while !machine.stopped.load(Ordering::SeqCst) {
-                if Instant::now() >= deadline {
-                    machine.stop(Ending::Failed(STOPPED_BY_THE_TEST.to_owned()));
-                }
+            while !machine.stopped.load(Ordering::SeqCst) && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(1));
             }
+            // A run that ended on its own keeps its ending: the first one wins.
+            drop(stop);
         });
         // Core 0 runs on the test's thread, which made its vCPU, as a run's does.
         core_loop::run(machine, CoreId::new(CORE).unwrap(), &mut main);
@@ -98,18 +112,19 @@ fn a_stalled_run_with_the_gpu_ends_waiting() {
     assert_eq!(failed_with(&ending), WAITING);
 }
 
-/// The issue's case: the first question that finds the run stalled lands in a GPU turn and is
-/// read busy only because of the GPU. The GPU's front thread tells the quiet signal at its next
-/// idle turn, the parked core asks again, and the run still ends as `WAITING`, not at the
-/// test's bound.
+/// The issue's case: the first question that finds the run stalled lands in a GPU turn and
+/// reads busy only because of the GPU, until the turn ends. The GPU's front thread tells the
+/// quiet signal at the end of its next idle turn, the parked core asks again, and the run still
+/// ends as `WAITING`, not at the test's bound.
 #[test]
 fn a_stalled_run_whose_first_question_lands_in_a_gpu_turn_still_ends_waiting() {
     let ending = stalled_gpu_run(|machine| machine.cores.read_gpu_busy(1), |_| {});
     assert_eq!(failed_with(&ending), WAITING);
 }
 
-/// The retry bound at its limit, through the run: the first question and the first
-/// `GPU_QUIET_RETRIES - 1` retries are read busy, and the last retry is still asked.
+/// The retry bound at its limit, through the run: the GPU reads busy until its
+/// `GPU_QUIET_RETRIES`th quiet signal, so the first question and the first
+/// `GPU_QUIET_RETRIES - 1` retries read busy, and the last retry is still asked.
 #[test]
 fn a_stalled_run_whose_questions_land_in_gpu_turns_up_to_the_bound_ends_waiting() {
     let ending = stalled_gpu_run(
@@ -119,20 +134,23 @@ fn a_stalled_run_whose_questions_land_in_gpu_turns_up_to_the_bound_ends_waiting(
     assert_eq!(failed_with(&ending), WAITING);
 }
 
-/// One past the bound: every question the park may ask is read busy, and the core then waits
-/// as before, with no timeout: the run does not end on its own while several more safety-net
-/// turns of the GPU pass (`IDLE_PARK` each), and the test stops it.
+/// One past the bound: the GPU reads busy until one more quiet signal than a park waits for.
+/// Once the park has taken its `GPU_QUIET_RETRIES` signals the core is no longer armed and
+/// waits as before, with no timeout: no further signal reaches it, and the run does not end on
+/// its own while several more safety-net turns of the GPU pass (`IDLE_PARK` each), so the test
+/// stops it.
 #[test]
 fn past_the_bound_a_stalled_run_waits_for_a_wake() {
     let ending = stalled_gpu_run(
         |machine| machine.cores.read_gpu_busy(GPU_QUIET_RETRIES + 1),
         |machine| {
             let deadline = Instant::now() + PATIENCE;
-            while machine.cores.gpu_busy_reads() != 0 {
-                assert!(Instant::now() < deadline, "the questions were never asked");
+            while machine.cores.busy_turns_left() != 1 {
+                assert!(Instant::now() < deadline, "the retries were never asked");
                 std::thread::sleep(Duration::from_millis(1));
             }
             std::thread::sleep(starquake_gpu::front::IDLE_PARK.saturating_mul(3));
+            assert_eq!(machine.cores.busy_turns_left(), 1);
             assert!(
                 !machine.stopped.load(Ordering::SeqCst),
                 "the run ended though every question was read busy"

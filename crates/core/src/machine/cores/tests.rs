@@ -325,9 +325,7 @@ fn a_quiet_signal_while_another_core_runs_asks_nothing() {
             assert_eq!(other.join().unwrap(), Parked::Woken);
             assert_eq!(idle(&cores), 1);
             cores.parks.front_quiet();
-            wait_until("the last core takes the signal", || {
-                !quiet_flag(&cores, 1)
-            });
+            wait_until("the last core takes the signal", || !quiet_flag(&cores, 1));
             assert_eq!(answers.asked(), 1);
             assert_eq!(armed(&cores), None);
             assert!(!last.is_finished());
