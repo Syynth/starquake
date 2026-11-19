@@ -67,7 +67,12 @@ fn bounded(array: &'static str, index: u32, count: u32) -> Result<u32, StateErro
 }
 
 /// A 64-bit address from an upper and a lower register.
-fn address(upper: Reg, upper_field: Field, lower: Reg, lower_field: Field) -> Result<u64, StateError> {
+fn address(
+    upper: Reg,
+    upper_field: Field,
+    lower: Reg,
+    lower_field: Field,
+) -> Result<u64, StateError> {
     Ok(join(upper.field(upper_field)?, lower.field(lower_field)?))
 }
 
@@ -190,63 +195,92 @@ impl<'a> ThreeD<'a> {
     /// Viewport `index`, below [`VIEWPORTS`].
     pub fn viewport(&self, index: u32) -> Result<Viewport<'a>, StateError> {
         let index = bounded(arrays::VIEWPORT, index, VIEWPORTS)?;
-        Ok(Viewport { mirror: self.mirror, index })
+        Ok(Viewport {
+            mirror: self.mirror,
+            index,
+        })
     }
 
     /// Scissor `index`, below [`SCISSORS`].
     pub fn scissor(&self, index: u32) -> Result<Scissor<'a>, StateError> {
         let index = bounded(arrays::SCISSOR, index, SCISSORS)?;
-        Ok(Scissor { mirror: self.mirror, index })
+        Ok(Scissor {
+            mirror: self.mirror,
+            index,
+        })
     }
 
     /// The blend state shared by every target.
     pub fn blend(&self) -> Blend<'a> {
-        Blend { mirror: self.mirror }
+        Blend {
+            mirror: self.mirror,
+        }
     }
 
     /// Blend target `index`, below [`BLEND_TARGETS`].
     pub fn blend_per_target(&self, index: u32) -> Result<BlendPerTarget<'a>, StateError> {
         let index = bounded(arrays::BLEND_TARGET, index, BLEND_TARGETS)?;
-        Ok(BlendPerTarget { mirror: self.mirror, index })
+        Ok(BlendPerTarget {
+            mirror: self.mirror,
+            index,
+        })
     }
 
     /// Colour target `index`, below [`COLOR_TARGETS`].
     pub fn color_target(&self, index: u32) -> Result<ColorTarget<'a>, StateError> {
         let index = bounded(arrays::COLOR_TARGET, index, COLOR_TARGETS)?;
-        Ok(ColorTarget { mirror: self.mirror, index })
+        Ok(ColorTarget {
+            mirror: self.mirror,
+            index,
+        })
     }
 
     /// Which colour targets are drawn to.
     pub fn ct_select(&self) -> CtSelect<'a> {
-        CtSelect { mirror: self.mirror }
+        CtSelect {
+            mirror: self.mirror,
+        }
     }
 
     /// The depth target.
     pub fn zt(&self) -> Zt<'a> {
-        Zt { mirror: self.mirror }
+        Zt {
+            mirror: self.mirror,
+        }
     }
 
     /// Vertex stream `index`, below [`VERTEX_STREAMS`].
     pub fn vertex_stream(&self, index: u32) -> Result<VertexStream<'a>, StateError> {
         let index = bounded(arrays::VERTEX_STREAM, index, VERTEX_STREAMS)?;
-        Ok(VertexStream { mirror: self.mirror, index })
+        Ok(VertexStream {
+            mirror: self.mirror,
+            index,
+        })
     }
 
     /// Vertex attribute `index`, below [`VERTEX_ATTRIBUTES`].
     pub fn vertex_attribute(&self, index: u32) -> Result<VertexAttribute<'a>, StateError> {
         let index = bounded(arrays::VERTEX_ATTRIBUTE, index, VERTEX_ATTRIBUTES)?;
-        Ok(VertexAttribute { mirror: self.mirror, index })
+        Ok(VertexAttribute {
+            mirror: self.mirror,
+            index,
+        })
     }
 
     /// The index buffer.
     pub fn index_buffer(&self) -> IndexBuffer<'a> {
-        IndexBuffer { mirror: self.mirror }
+        IndexBuffer {
+            mirror: self.mirror,
+        }
     }
 
     /// Bind group `index`, below [`BIND_GROUPS`].
     pub fn bind_group(&self, index: u32) -> Result<BindGroup<'a>, StateError> {
         let index = bounded(arrays::BIND_GROUP, index, BIND_GROUPS)?;
-        Ok(BindGroup { mirror: self.mirror, index })
+        Ok(BindGroup {
+            mirror: self.mirror,
+            index,
+        })
     }
 
     /// The texture header and sampler pools.
@@ -260,17 +294,24 @@ impl<'a> ThreeD<'a> {
     /// Pipeline `index`, below [`PIPELINES`].
     pub fn pipeline(&self, index: u32) -> Result<Pipeline<'a>, StateError> {
         let index = bounded(arrays::PIPELINE, index, PIPELINES)?;
-        Ok(Pipeline { mirror: self.mirror, index })
+        Ok(Pipeline {
+            mirror: self.mirror,
+            index,
+        })
     }
 
     /// The rasterizer state.
     pub fn rasterizer(&self) -> Rasterizer<'a> {
-        Rasterizer { mirror: self.mirror }
+        Rasterizer {
+            mirror: self.mirror,
+        }
     }
 
     /// The depth and stencil state.
     pub fn depth_stencil(&self) -> DepthStencil<'a> {
-        DepthStencil { mirror: self.mirror }
+        DepthStencil {
+            mirror: self.mirror,
+        }
     }
 }
 
@@ -448,6 +489,9 @@ const CT_SELECT_TARGETS: [Field; 8] = [
     clc797::SET_CT_SELECT_TARGET7,
 ];
 
+// One select entry per colour target, so the entries' bound is [`COLOR_TARGETS`].
+const _: () = assert!(CT_SELECT_TARGETS.len() == COLOR_TARGETS as usize);
+
 getters!(CtSelect {
     /// `SET_CT_SELECT_TARGET_COUNT`.
     target_count: field clc797::SET_CT_SELECT, clc797::SET_CT_SELECT_TARGET_COUNT;
@@ -465,7 +509,6 @@ impl CtSelect<'_> {
     /// `SET_CT_SELECT_TARGET<entry>`, for `entry` below [`COLOR_TARGETS`]: the colour target
     /// drawn to as output `entry`.
     pub fn target(&self, entry: u32) -> Result<u32, StateError> {
-        let entry = bounded(arrays::CT_SELECT_TARGET, entry, COLOR_TARGETS)?;
         let field = usize::try_from(entry)
             .ok()
             .and_then(|entry| CT_SELECT_TARGETS.get(entry))
@@ -527,7 +570,12 @@ struct Halves {
 
 /// Element `index` of a two-half array whose halves hold `per_half` elements each: the field's
 /// method and element. The callers bound `index` by both halves together first.
-fn half(mirror: &Mirror, halves: Halves, index: u32, per_half: u32) -> Result<(Reg, Field), StateError> {
+fn half(
+    mirror: &Mirror,
+    halves: Halves,
+    index: u32,
+    per_half: u32,
+) -> Result<(Reg, Field), StateError> {
     let (method, field, element) = match index.checked_sub(per_half) {
         None => (halves.a.0, halves.a.1, index),
         Some(element) => (halves.b.0, halves.b.1, element),
@@ -548,8 +596,14 @@ impl VertexStream<'_> {
     /// `SET_VERTEX_STREAM_A_FORMAT_ENABLE` (or `_B_`).
     pub fn enable(&self) -> Result<&'static Value, StateError> {
         let (reg, field) = self.read(Halves {
-            a: (&clc797::SET_VERTEX_STREAM_A_FORMAT, clc797::SET_VERTEX_STREAM_A_FORMAT_ENABLE),
-            b: (&clc797::SET_VERTEX_STREAM_B_FORMAT, clc797::SET_VERTEX_STREAM_B_FORMAT_ENABLE),
+            a: (
+                &clc797::SET_VERTEX_STREAM_A_FORMAT,
+                clc797::SET_VERTEX_STREAM_A_FORMAT_ENABLE,
+            ),
+            b: (
+                &clc797::SET_VERTEX_STREAM_B_FORMAT,
+                clc797::SET_VERTEX_STREAM_B_FORMAT_ENABLE,
+            ),
         })?;
         reg.named(field)
     }
@@ -557,8 +611,14 @@ impl VertexStream<'_> {
     /// `SET_VERTEX_STREAM_A_FORMAT_STRIDE` (or `_B_`).
     pub fn stride(&self) -> Result<u32, StateError> {
         let (reg, field) = self.read(Halves {
-            a: (&clc797::SET_VERTEX_STREAM_A_FORMAT, clc797::SET_VERTEX_STREAM_A_FORMAT_STRIDE),
-            b: (&clc797::SET_VERTEX_STREAM_B_FORMAT, clc797::SET_VERTEX_STREAM_B_FORMAT_STRIDE),
+            a: (
+                &clc797::SET_VERTEX_STREAM_A_FORMAT,
+                clc797::SET_VERTEX_STREAM_A_FORMAT_STRIDE,
+            ),
+            b: (
+                &clc797::SET_VERTEX_STREAM_B_FORMAT,
+                clc797::SET_VERTEX_STREAM_B_FORMAT_STRIDE,
+            ),
         })?;
         reg.field(field)
     }
@@ -591,8 +651,14 @@ impl VertexStream<'_> {
     /// `SET_VERTEX_STREAM_A_FREQUENCY_V` (or `_B_`).
     pub fn frequency(&self) -> Result<u32, StateError> {
         let (reg, field) = self.read(Halves {
-            a: (&clc797::SET_VERTEX_STREAM_A_FREQUENCY, clc797::SET_VERTEX_STREAM_A_FREQUENCY_V),
-            b: (&clc797::SET_VERTEX_STREAM_B_FREQUENCY, clc797::SET_VERTEX_STREAM_B_FREQUENCY_V),
+            a: (
+                &clc797::SET_VERTEX_STREAM_A_FREQUENCY,
+                clc797::SET_VERTEX_STREAM_A_FREQUENCY_V,
+            ),
+            b: (
+                &clc797::SET_VERTEX_STREAM_B_FREQUENCY,
+                clc797::SET_VERTEX_STREAM_B_FREQUENCY_V,
+            ),
         })?;
         reg.field(field)
     }
@@ -617,9 +683,11 @@ impl VertexStream<'_> {
     pub fn size(&self) -> Result<u64, StateError> {
         let index = bounded(arrays::VERTEX_STREAM_SIZE, self.index, VERTEX_STREAM_SIZES)?;
         address(
-            self.mirror.reg(&clc797::SET_VERTEX_STREAM_SIZE_A, &[index])?,
+            self.mirror
+                .reg(&clc797::SET_VERTEX_STREAM_SIZE_A, &[index])?,
             clc797::SET_VERTEX_STREAM_SIZE_A_UPPER,
-            self.mirror.reg(&clc797::SET_VERTEX_STREAM_SIZE_B, &[index])?,
+            self.mirror
+                .reg(&clc797::SET_VERTEX_STREAM_SIZE_B, &[index])?,
             clc797::SET_VERTEX_STREAM_SIZE_B_LOWER,
         )
     }
@@ -761,21 +829,57 @@ struct TexPoolMethods {
 }
 
 const TEX_POOLS_3D: TexPoolMethods = TexPoolMethods {
-    header_a: (&clc797::SET_TEX_HEADER_POOL_A, clc797::SET_TEX_HEADER_POOL_A_OFFSET_UPPER),
-    header_b: (&clc797::SET_TEX_HEADER_POOL_B, clc797::SET_TEX_HEADER_POOL_B_OFFSET_LOWER),
-    header_c: (&clc797::SET_TEX_HEADER_POOL_C, clc797::SET_TEX_HEADER_POOL_C_MAXIMUM_INDEX),
-    sampler_a: (&clc797::SET_TEX_SAMPLER_POOL_A, clc797::SET_TEX_SAMPLER_POOL_A_OFFSET_UPPER),
-    sampler_b: (&clc797::SET_TEX_SAMPLER_POOL_B, clc797::SET_TEX_SAMPLER_POOL_B_OFFSET_LOWER),
-    sampler_c: (&clc797::SET_TEX_SAMPLER_POOL_C, clc797::SET_TEX_SAMPLER_POOL_C_MAXIMUM_INDEX),
+    header_a: (
+        &clc797::SET_TEX_HEADER_POOL_A,
+        clc797::SET_TEX_HEADER_POOL_A_OFFSET_UPPER,
+    ),
+    header_b: (
+        &clc797::SET_TEX_HEADER_POOL_B,
+        clc797::SET_TEX_HEADER_POOL_B_OFFSET_LOWER,
+    ),
+    header_c: (
+        &clc797::SET_TEX_HEADER_POOL_C,
+        clc797::SET_TEX_HEADER_POOL_C_MAXIMUM_INDEX,
+    ),
+    sampler_a: (
+        &clc797::SET_TEX_SAMPLER_POOL_A,
+        clc797::SET_TEX_SAMPLER_POOL_A_OFFSET_UPPER,
+    ),
+    sampler_b: (
+        &clc797::SET_TEX_SAMPLER_POOL_B,
+        clc797::SET_TEX_SAMPLER_POOL_B_OFFSET_LOWER,
+    ),
+    sampler_c: (
+        &clc797::SET_TEX_SAMPLER_POOL_C,
+        clc797::SET_TEX_SAMPLER_POOL_C_MAXIMUM_INDEX,
+    ),
 };
 
 const TEX_POOLS_COMPUTE: TexPoolMethods = TexPoolMethods {
-    header_a: (&clc7c0::SET_TEX_HEADER_POOL_A, clc7c0::SET_TEX_HEADER_POOL_A_OFFSET_UPPER),
-    header_b: (&clc7c0::SET_TEX_HEADER_POOL_B, clc7c0::SET_TEX_HEADER_POOL_B_OFFSET_LOWER),
-    header_c: (&clc7c0::SET_TEX_HEADER_POOL_C, clc7c0::SET_TEX_HEADER_POOL_C_MAXIMUM_INDEX),
-    sampler_a: (&clc7c0::SET_TEX_SAMPLER_POOL_A, clc7c0::SET_TEX_SAMPLER_POOL_A_OFFSET_UPPER),
-    sampler_b: (&clc7c0::SET_TEX_SAMPLER_POOL_B, clc7c0::SET_TEX_SAMPLER_POOL_B_OFFSET_LOWER),
-    sampler_c: (&clc7c0::SET_TEX_SAMPLER_POOL_C, clc7c0::SET_TEX_SAMPLER_POOL_C_MAXIMUM_INDEX),
+    header_a: (
+        &clc7c0::SET_TEX_HEADER_POOL_A,
+        clc7c0::SET_TEX_HEADER_POOL_A_OFFSET_UPPER,
+    ),
+    header_b: (
+        &clc7c0::SET_TEX_HEADER_POOL_B,
+        clc7c0::SET_TEX_HEADER_POOL_B_OFFSET_LOWER,
+    ),
+    header_c: (
+        &clc7c0::SET_TEX_HEADER_POOL_C,
+        clc7c0::SET_TEX_HEADER_POOL_C_MAXIMUM_INDEX,
+    ),
+    sampler_a: (
+        &clc7c0::SET_TEX_SAMPLER_POOL_A,
+        clc7c0::SET_TEX_SAMPLER_POOL_A_OFFSET_UPPER,
+    ),
+    sampler_b: (
+        &clc7c0::SET_TEX_SAMPLER_POOL_B,
+        clc7c0::SET_TEX_SAMPLER_POOL_B_OFFSET_LOWER,
+    ),
+    sampler_c: (
+        &clc7c0::SET_TEX_SAMPLER_POOL_C,
+        clc7c0::SET_TEX_SAMPLER_POOL_C_MAXIMUM_INDEX,
+    ),
 };
 
 /// The texture header and sampler pools of the 3D or compute class ([`ThreeD::tex_pools`],

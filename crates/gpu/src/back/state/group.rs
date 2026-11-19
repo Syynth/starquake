@@ -169,6 +169,9 @@ pub const GROUP_COUNT: u32 = {
     count
 };
 
+// Every group has its own bit in a `GroupSet`'s `u128`.
+const _: () = assert!(GROUP_COUNT <= u128::BITS);
+
 /// One state group: a kind and, for a kind per element, the element's index (0 otherwise).
 /// Made only through [`Group::new`] and [`Group::one`], so the index is always below the
 /// kind's [`GroupKind::count`].

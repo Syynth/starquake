@@ -98,8 +98,16 @@ pub const GROUPS_3D: &[GroupEntry] = &[
     all(&clc797::SET_VIEWPORT_OFFSET_X, VIEWPORTS, Viewport),
     all(&clc797::SET_VIEWPORT_OFFSET_Y, VIEWPORTS, Viewport),
     all(&clc797::SET_VIEWPORT_OFFSET_Z, VIEWPORTS, Viewport),
-    all(&clc797::SET_VIEWPORT_COORDINATE_SWIZZLE, VIEWPORTS, Viewport),
-    all(&clc797::SET_VIEWPORT_INCREASE_SNAP_GRID_PRECISION, VIEWPORTS, Viewport),
+    all(
+        &clc797::SET_VIEWPORT_COORDINATE_SWIZZLE,
+        VIEWPORTS,
+        Viewport,
+    ),
+    all(
+        &clc797::SET_VIEWPORT_INCREASE_SNAP_GRID_PRECISION,
+        VIEWPORTS,
+        Viewport,
+    ),
     all(&clc797::SET_VIEWPORT_CLIP_HORIZONTAL, VIEWPORTS, Viewport),
     all(&clc797::SET_VIEWPORT_CLIP_VERTICAL, VIEWPORTS, Viewport),
     all(&clc797::SET_VIEWPORT_CLIP_MIN_Z, VIEWPORTS, Viewport),
@@ -131,24 +139,99 @@ pub const GROUPS_3D: &[GroupEntry] = &[
     // Blend per target.
     each(&clc797::SET_BLEND, BLEND_TARGETS, BlendPerTarget, 0),
     each(&clc797::SET_CT_WRITE, BLEND_TARGETS, BlendPerTarget, 0),
-    each(&clc797::SET_BLEND_PER_TARGET_SEPARATE_FOR_ALPHA, BLEND_TARGETS, BlendPerTarget, 0),
-    each(&clc797::SET_BLEND_PER_TARGET_COLOR_OP, BLEND_TARGETS, BlendPerTarget, 0),
-    each(&clc797::SET_BLEND_PER_TARGET_COLOR_SOURCE_COEFF, BLEND_TARGETS, BlendPerTarget, 0),
-    each(&clc797::SET_BLEND_PER_TARGET_COLOR_DEST_COEFF, BLEND_TARGETS, BlendPerTarget, 0),
-    each(&clc797::SET_BLEND_PER_TARGET_ALPHA_OP, BLEND_TARGETS, BlendPerTarget, 0),
-    each(&clc797::SET_BLEND_PER_TARGET_ALPHA_SOURCE_COEFF, BLEND_TARGETS, BlendPerTarget, 0),
-    each(&clc797::SET_BLEND_PER_TARGET_ALPHA_DEST_COEFF, BLEND_TARGETS, BlendPerTarget, 0),
+    each(
+        &clc797::SET_BLEND_PER_TARGET_SEPARATE_FOR_ALPHA,
+        BLEND_TARGETS,
+        BlendPerTarget,
+        0,
+    ),
+    each(
+        &clc797::SET_BLEND_PER_TARGET_COLOR_OP,
+        BLEND_TARGETS,
+        BlendPerTarget,
+        0,
+    ),
+    each(
+        &clc797::SET_BLEND_PER_TARGET_COLOR_SOURCE_COEFF,
+        BLEND_TARGETS,
+        BlendPerTarget,
+        0,
+    ),
+    each(
+        &clc797::SET_BLEND_PER_TARGET_COLOR_DEST_COEFF,
+        BLEND_TARGETS,
+        BlendPerTarget,
+        0,
+    ),
+    each(
+        &clc797::SET_BLEND_PER_TARGET_ALPHA_OP,
+        BLEND_TARGETS,
+        BlendPerTarget,
+        0,
+    ),
+    each(
+        &clc797::SET_BLEND_PER_TARGET_ALPHA_SOURCE_COEFF,
+        BLEND_TARGETS,
+        BlendPerTarget,
+        0,
+    ),
+    each(
+        &clc797::SET_BLEND_PER_TARGET_ALPHA_DEST_COEFF,
+        BLEND_TARGETS,
+        BlendPerTarget,
+        0,
+    ),
     // Colour targets.
     each(&clc797::SET_COLOR_TARGET_A, COLOR_TARGETS, ColorTarget, 0),
     each(&clc797::SET_COLOR_TARGET_B, COLOR_TARGETS, ColorTarget, 0),
-    each(&clc797::SET_COLOR_TARGET_WIDTH, COLOR_TARGETS, ColorTarget, 0),
-    each(&clc797::SET_COLOR_TARGET_HEIGHT, COLOR_TARGETS, ColorTarget, 0),
-    each(&clc797::SET_COLOR_TARGET_FORMAT, COLOR_TARGETS, ColorTarget, 0),
-    each(&clc797::SET_COLOR_TARGET_MEMORY, COLOR_TARGETS, ColorTarget, 0),
-    each(&clc797::SET_COLOR_TARGET_THIRD_DIMENSION, COLOR_TARGETS, ColorTarget, 0),
-    each(&clc797::SET_COLOR_TARGET_ARRAY_PITCH, COLOR_TARGETS, ColorTarget, 0),
-    each(&clc797::SET_COLOR_TARGET_LAYER, COLOR_TARGETS, ColorTarget, 0),
-    each(&clc797::SET_COLOR_TARGET_C_ROP_SLICE_MAP, COLOR_TARGETS, ColorTarget, 0),
+    each(
+        &clc797::SET_COLOR_TARGET_WIDTH,
+        COLOR_TARGETS,
+        ColorTarget,
+        0,
+    ),
+    each(
+        &clc797::SET_COLOR_TARGET_HEIGHT,
+        COLOR_TARGETS,
+        ColorTarget,
+        0,
+    ),
+    each(
+        &clc797::SET_COLOR_TARGET_FORMAT,
+        COLOR_TARGETS,
+        ColorTarget,
+        0,
+    ),
+    each(
+        &clc797::SET_COLOR_TARGET_MEMORY,
+        COLOR_TARGETS,
+        ColorTarget,
+        0,
+    ),
+    each(
+        &clc797::SET_COLOR_TARGET_THIRD_DIMENSION,
+        COLOR_TARGETS,
+        ColorTarget,
+        0,
+    ),
+    each(
+        &clc797::SET_COLOR_TARGET_ARRAY_PITCH,
+        COLOR_TARGETS,
+        ColorTarget,
+        0,
+    ),
+    each(
+        &clc797::SET_COLOR_TARGET_LAYER,
+        COLOR_TARGETS,
+        ColorTarget,
+        0,
+    ),
+    each(
+        &clc797::SET_COLOR_TARGET_C_ROP_SLICE_MAP,
+        COLOR_TARGETS,
+        ColorTarget,
+        0,
+    ),
     // Which targets are drawn to.
     one(&clc797::SET_CT_SELECT, CtSelect),
     one(&clc797::SET_SURFACE_CLIP_HORIZONTAL, CtSelect),
@@ -167,21 +250,89 @@ pub const GROUPS_3D: &[GroupEntry] = &[
     one(&clc797::SET_ZT_SPARSE, Zt),
     one(&clc797::SET_ZT_READ_ONLY, Zt),
     // Vertex streams: the A half is streams 0 to 15, the B half 16 to 31.
-    each(&clc797::SET_VERTEX_STREAM_A_FORMAT, VERTEX_STREAMS_PER_HALF, VertexStream, 0),
-    each(&clc797::SET_VERTEX_STREAM_A_LOCATION_A, VERTEX_STREAMS_PER_HALF, VertexStream, 0),
-    each(&clc797::SET_VERTEX_STREAM_A_LOCATION_B, VERTEX_STREAMS_PER_HALF, VertexStream, 0),
-    each(&clc797::SET_VERTEX_STREAM_A_FREQUENCY, VERTEX_STREAMS_PER_HALF, VertexStream, 0),
-    each(&clc797::SET_VERTEX_STREAM_B_FORMAT, VERTEX_STREAMS_PER_HALF, VertexStream, VERTEX_STREAMS_PER_HALF),
-    each(&clc797::SET_VERTEX_STREAM_B_LOCATION_A, VERTEX_STREAMS_PER_HALF, VertexStream, VERTEX_STREAMS_PER_HALF),
-    each(&clc797::SET_VERTEX_STREAM_B_LOCATION_B, VERTEX_STREAMS_PER_HALF, VertexStream, VERTEX_STREAMS_PER_HALF),
-    each(&clc797::SET_VERTEX_STREAM_B_FREQUENCY, VERTEX_STREAMS_PER_HALF, VertexStream, VERTEX_STREAMS_PER_HALF),
-    each(&clc797::SET_VERTEX_STREAM_SIZE_A, VERTEX_STREAM_SIZES, VertexStream, 0),
-    each(&clc797::SET_VERTEX_STREAM_SIZE_B, VERTEX_STREAM_SIZES, VertexStream, 0),
-    each(&clc797::SET_VERTEX_STREAM_INSTANCE_A, VERTEX_STREAMS_PER_HALF, VertexStream, 0),
-    each(&clc797::SET_VERTEX_STREAM_INSTANCE_B, VERTEX_STREAMS_PER_HALF, VertexStream, VERTEX_STREAMS_PER_HALF),
+    each(
+        &clc797::SET_VERTEX_STREAM_A_FORMAT,
+        VERTEX_STREAMS_PER_HALF,
+        VertexStream,
+        0,
+    ),
+    each(
+        &clc797::SET_VERTEX_STREAM_A_LOCATION_A,
+        VERTEX_STREAMS_PER_HALF,
+        VertexStream,
+        0,
+    ),
+    each(
+        &clc797::SET_VERTEX_STREAM_A_LOCATION_B,
+        VERTEX_STREAMS_PER_HALF,
+        VertexStream,
+        0,
+    ),
+    each(
+        &clc797::SET_VERTEX_STREAM_A_FREQUENCY,
+        VERTEX_STREAMS_PER_HALF,
+        VertexStream,
+        0,
+    ),
+    each(
+        &clc797::SET_VERTEX_STREAM_B_FORMAT,
+        VERTEX_STREAMS_PER_HALF,
+        VertexStream,
+        VERTEX_STREAMS_PER_HALF,
+    ),
+    each(
+        &clc797::SET_VERTEX_STREAM_B_LOCATION_A,
+        VERTEX_STREAMS_PER_HALF,
+        VertexStream,
+        VERTEX_STREAMS_PER_HALF,
+    ),
+    each(
+        &clc797::SET_VERTEX_STREAM_B_LOCATION_B,
+        VERTEX_STREAMS_PER_HALF,
+        VertexStream,
+        VERTEX_STREAMS_PER_HALF,
+    ),
+    each(
+        &clc797::SET_VERTEX_STREAM_B_FREQUENCY,
+        VERTEX_STREAMS_PER_HALF,
+        VertexStream,
+        VERTEX_STREAMS_PER_HALF,
+    ),
+    each(
+        &clc797::SET_VERTEX_STREAM_SIZE_A,
+        VERTEX_STREAM_SIZES,
+        VertexStream,
+        0,
+    ),
+    each(
+        &clc797::SET_VERTEX_STREAM_SIZE_B,
+        VERTEX_STREAM_SIZES,
+        VertexStream,
+        0,
+    ),
+    each(
+        &clc797::SET_VERTEX_STREAM_INSTANCE_A,
+        VERTEX_STREAMS_PER_HALF,
+        VertexStream,
+        0,
+    ),
+    each(
+        &clc797::SET_VERTEX_STREAM_INSTANCE_B,
+        VERTEX_STREAMS_PER_HALF,
+        VertexStream,
+        VERTEX_STREAMS_PER_HALF,
+    ),
     // Vertex attributes.
-    all(&clc797::SET_VERTEX_ATTRIBUTE_A, VERTEX_ATTRIBUTES_PER_HALF, VertexAttribute),
-    all(&clc797::SET_VERTEX_ATTRIBUTE_B, VERTEX_ATTRIBUTES_PER_HALF, VertexAttribute),
+    all(
+        &clc797::SET_VERTEX_ATTRIBUTE_A,
+        VERTEX_ATTRIBUTES_PER_HALF,
+        VertexAttribute,
+    ),
+    all(
+        &clc797::SET_VERTEX_ATTRIBUTE_B,
+        VERTEX_ATTRIBUTES_PER_HALF,
+        VertexAttribute,
+    ),
     // The index buffer.
     one(&clc797::SET_INDEX_BUFFER_A, IndexBuffer),
     one(&clc797::SET_INDEX_BUFFER_B, IndexBuffer),
@@ -190,7 +341,12 @@ pub const GROUPS_3D: &[GroupEntry] = &[
     one(&clc797::SET_INDEX_BUFFER_SIZE_A, IndexBuffer),
     one(&clc797::SET_INDEX_BUFFER_SIZE_B, IndexBuffer),
     // Constant buffer bindings, per bind group.
-    each(&clc797::BIND_GROUP_CONSTANT_BUFFER, BIND_GROUPS, BindGroup, 0),
+    each(
+        &clc797::BIND_GROUP_CONSTANT_BUFFER,
+        BIND_GROUPS,
+        BindGroup,
+        0,
+    ),
     // The texture header and sampler pools.
     one(&clc797::SET_TEX_HEADER_POOL_A, TexPool),
     one(&clc797::SET_TEX_HEADER_POOL_B, TexPool),
@@ -204,9 +360,24 @@ pub const GROUPS_3D: &[GroupEntry] = &[
     each(&clc797::SET_PIPELINE_RESERVED_A, PIPELINES, Pipeline, 0),
     each(&clc797::SET_PIPELINE_REGISTER_COUNT, PIPELINES, Pipeline, 0),
     each(&clc797::SET_PIPELINE_BINDING, PIPELINES, Pipeline, 0),
-    each(&clc797::SET_PIPELINE_PROGRAM_ADDRESS_A, PIPELINES, Pipeline, 0),
-    each(&clc797::SET_PIPELINE_PROGRAM_ADDRESS_B, PIPELINES, Pipeline, 0),
-    each(&clc797::SET_PIPELINE_PROGRAM_PREFETCH, PIPELINES, Pipeline, 0),
+    each(
+        &clc797::SET_PIPELINE_PROGRAM_ADDRESS_A,
+        PIPELINES,
+        Pipeline,
+        0,
+    ),
+    each(
+        &clc797::SET_PIPELINE_PROGRAM_ADDRESS_B,
+        PIPELINES,
+        Pipeline,
+        0,
+    ),
+    each(
+        &clc797::SET_PIPELINE_PROGRAM_PREFETCH,
+        PIPELINES,
+        Pipeline,
+        0,
+    ),
     each(&clc797::SET_PIPELINE_RESERVED_E, PIPELINES, Pipeline, 0),
     // Rasterizer state.
     one(&clc797::SET_FRONT_POLYGON_MODE, Rasterizer),
@@ -321,10 +492,7 @@ impl GroupMap {
             _ => &OTHER,
         };
         cell.get_or_init(|| {
-            Self::build(
-                group_table(class),
-                ClassRules::for_class(class).registers(),
-            )
+            Self::build(group_table(class), ClassRules::for_class(class).registers())
         })
     }
 
