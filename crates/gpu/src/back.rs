@@ -7,9 +7,11 @@
 //!   inline uploads) and 2D blits (`902D`) through guest memory, on the CPU (slice G11).
 //! - [`qmd`]: compute dispatch through QMD 3.0 (slice G12): decoding a QMD, the PCAS scheduler
 //!   and its one QMD table for all channels, the inline QMD, and the releases a QMD makes.
+//! - [`state`]: the engine mirrors, their dirty state groups and typed views (slice G10).
 //!
-//! Later slices add the engine mirrors and dirty groups (G10), fences and
-//! completion (G15), draws (G18) and the executor that feeds them all from the ring (G19).
+//! Later slices add fences and completion (G15), draws (G18) and the executor that feeds them
+//! all from the ring (G19).
 
 pub mod copy;
 pub mod qmd;
+pub mod state;

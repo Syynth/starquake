@@ -326,4 +326,16 @@ impl ClassRules {
     pub const fn side_effects(&self) -> &'static [SideEffect] {
         self.side_effects
     }
+
+    /// The registers' values when a file of the class is made: the one starting state that
+    /// both the front's [`super::RegFile`] (and its shadow file) and the back's mirror
+    /// (`crate::back::state::Mirror`) begin from, so a same-value write the front drops is never
+    /// one the back has not seen. Every register is zero today. Eden sets some 3D registers to
+    /// non-zero defaults at boot (`InitializeRegisterDefaults` in
+    /// `eden-nx2/src/video_core/engines/maxwell_3d.cpp`, then copied into the shadow file);
+    /// seeding them belongs here, for both sides at once (an open follow-up of slice G9).
+    pub fn initial_values(&self) -> Box<[u32]> {
+        let registers = usize::try_from(self.registers).unwrap_or(0);
+        vec![0; registers].into_boxed_slice()
+    }
 }
