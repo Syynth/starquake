@@ -643,6 +643,29 @@ Landed: G21 (the `Gpu` front, its threads and wiring, #332, PR #414), R7 (draws 
 | proposed | **R7 refusals and gaps:** indirect draws that need an index rewrite; binding arrays (`Binding` has no array element, a gap in the render crate's command); feedback draws (read-only depth attachments would allow some); 16-bit strip draws cost a compute pass and a pass break (an index format in the pipeline key would avoid it); `MAX_INDIRECT_DRAWS` = 4096 is a guess; no bind group cache; rewrite scratch is not counted in `budget()`; the rewrite shader lives in render-wgpu, not `host_shaders`; Metal's list-topology restart and quad-strip winding are unverified | #384 | area:render |
 | awaiting the owner | **render-backend errata from R7:** the typed-output row is settled (wgpu demands typed outputs); the pass-close sentence ("when a copy or readback touches an attachment") cannot hold under wgpu, which needs every non-draw command outside a pass. R6's claim that wgpu restarts strips with no index format held on Metal only; R7 sets `Uint32` | #384 | render-backend |
 
+### From wave 43 (ledger: #22)
+
+Landed: R9b (frame dumps, `--until frames=N`, and the run's real `Gpu` over a recording backend with no call log, #386, PR #417), G20 (GPU capture and `starquake gpu-replay`, #331, PR #420), shader slice 10 (flow analysis, #362, PR #419), slice 7 (the IR interpreter, #360, PR #421) and decoder slices 6e and 6f (#355, #356; PRs #418, #416). Also fixed outside the wave: a flaky GPU idle test (PR #422). `main`'s macOS gate had failed on every push for about a day; PR #423 fixes the cause (below).
+
+| Status | Proposal | Why | Suggested |
+|---|---|---|---|
+| awaiting the owner | **A stalled run with a GPU can miss `WAITING`:** the last core to park asks `Graphics::is_idle` once and then waits with no timeout (`machine/cores.rs`). An idle GPU reads busy during each `IDLE_PARK` safety-net turn, so a question that lands in one never gets asked again, and the run goes to its timeout (about 1% of stalled runs, from the test's failure rate). Recommendation: the parked core asks again when the GPU next reports quiet, bounded by a named retry count; or a turn that takes nothing does not read busy | PR #422 review | gpu-protocol, observability |
+| awaiting the owner | **The macOS gate runs only on pushes to `main`,** so it failed on about 58 pushes in a row before anyone looked: macOS ends timed waits late at low priority, and the timer thread slept in one wait (PR #423). Recommendation: keep the cost rule, and the lead checks `main`'s last macOS run after every wave (adopted under delegation); the owner decides whether PRs that touch timing code also run it | PR #422, #423 | CI |
+| awaiting the owner | **PR #423's choices:** the timer thread sleeps in pieces sized by the measured lateness of its waits (several wake-ups per sleep on macOS; one precise wait would need `unsafe` outside `cpu`); the held-page test still times the guest's wake, including the core thread's scheduling; whether to tighten the vsync bound | #423 | observability |
+| awaiting the owner | **The run's recording backend keeps no call log,** against render-backend's "it keeps every submitted list", so a live run holds no more after fifty presents than after one. Name the mode in the spec, or have R12 use another backend for runs | #386 | render-backend |
+| awaiting the owner | **Frames:** when a fenced present counts as a frame depends on host GPU timing; dumping every present costs one wgpu readback per frame; observability does not say which frames "at the end" means or how many a run keeps; render-backend still says the dump flag's path "is decided in R9's second part" (it is `ExecConfig::dumps` in `GpuConfig::exec`) | #386 | observability, render-backend |
+| proposed | **The kernel half of `WriteWatch`** (with the GPU-accessible attribute that gpu 101 registration needs): the run's watch is never armed, so the caches re-read every range and every request stays in the watch for the run, about one per cache entry. It also blocks an end-to-end test of the GPU reading through gsv's own address space. Extends wave 42's row | #386 | area:kernel |
+| proposed | **A homebrew fixture that presents frames:** no real program drives `--until frames=N` or the run's finish and report path | #386 | area:core |
+| proposed | **Graphics observability in runs:** render and shader counters in `summary.json`; capture logs bounded | #386, #331 | area:core |
+| awaiting the owner | **G20's choices:** `--until present=N` past the capture's last present exits 0 and says so; the header carries render `Caps`, the budget, the wait setting, the fence mode and address spaces, and starting-state records carry address tables and syncpoints, none of which the spec lists; captures start from a fresh GPU, since no front or back snapshot exists; shader lookup records keep only requests and answer kinds until shader slice 20 | #331 | gpu-protocol |
+| proposed | **G20 follow-ups:** a front and back snapshot for captures of a running GPU; a live capture from the threaded wiring; a fixture that observes the back's `waiters` record; `Blobs::bytes()` is O(n) per new blob; unused `Collector` methods warn without `test-support` | #331 | area:gpu |
+| awaiting the owner | **Surface forms with a constant-buffer handle** (SULD 0xb97, SUST 0xb9b, SUATOM 0x593): PR #4588 translates them, so titles likely emit them, but NAK has no encoder. Recommendation: decode them from PR #4588, marked for the nvdisasm check | #356 | shader-pipeline |
+| awaiting the owner | **Memory decoder choices:** `MEMBAR` scopes are the union of NAK's and PR #4588's values (departs from decision 8's wording); `LDGSTS` and `ATOMS.POPC` use PR #4588's translator's fixed and rejected bits; `LDCG` (0x8b8) has no owning slice | #355 | shader-pipeline |
+| awaiting the owner | **Flow analysis bounds and choices:** `MAX_INLINE_DEPTH` = 16 and `MAX_FLOW_BLOCKS` = 2^18 are guesses (the reference has none); a `CbufWord` answer of "no word" reads as 0; merging waiting paths can change which fault is reported first | #362 | shader-pipeline |
+| awaiting the owner | **Interpreter choices:** the canonical NaN bits and the sign of an FMZ zero product are guesses; misaligned, out-of-bounds and missing-input accesses are errors (Eden aligns down, a robust host reads zero); `FPClamp` of NaN gives the low bound (PR #4588 passes it through); `GetPatch` and `SetPatch` share one map; whether `pub mod interp` moves behind `test-support` | #360 | shader-pipeline |
+| proposed | **Decoder framework, extended:** besides wave 42's F16 swizzle, `.F16` (bit 79) in the `.B` forms of TEX/TLD and in TLD4, and TLD's `.CL` (bit 77) outside TLD.UR, cannot be decoded if nvdisasm shows those bits exist | #356 | area:shader |
+| proposed | **nvdisasm (E2) for 6e and 6f:** LDGSTS, LDGDEPBAR, ERRBAR, ATOMS.POPC, bit 76 of LDG/STG, MEMBAR scope 5, bit 89 of TLD4.UR, and the texture and surface printed text outside NAK's bindless cases | #355, #356 | area:shader (M4) |
+
 ## House-rule candidates
 
 Rules distilled from review findings. A vetted rule moves into `CLAUDE.md`; until then it is
@@ -937,3 +960,13 @@ passed to build agents as a provisional rule for the next wave.
 - Recorded event payloads are capped in size, not only in number.
 - Every arm of a path split by mode applies the sibling arm's validations, or lists the gap as a divergence.
 - A state-closing step (close a pass, flush) runs before any early return or skip.
+
+### From wave 43 (ledger: #22)
+
+- A production backend runs in a mode that keeps nothing it doesn't need, with a test that what it holds does not grow with frames.
+- Every wiring step that ends in a report or artifact has a test through the production finish path, per ending.
+- Parse time and memory are bounded by what a hostile file can force, with sets for duplicate checks and a named memory budget.
+- Fields that carry an invariant are private; the writer applies the reader's checks.
+- No success message for a comparison that may not have happened.
+- Encodings come from a cited reference; conflicts and skipped paths are divergence rows with tests.
+- A timing test runs at low priority (`taskpolicy -c utility` on macOS) before it is trusted on a hosted runner.
