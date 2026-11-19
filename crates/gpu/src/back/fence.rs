@@ -96,9 +96,10 @@
 //!   [`GpuCompletion::SyncpointChanged`] when the syncpoint is watched.
 //! - **A marker** applies its [`OrderedUpdate`], if it has one: [`GpuVm::apply`], then
 //!   [`GpuCompletion::GpuOrdered`] with its ticket if it has one; its token goes in
-//!   [`Report::markers`] for the front. Not here yet: dropping the range from the buffer and
-//!   texture caches (G16, G17), the shader cache's `invalidate`, and freeing a destroyed sparse
-//!   region's GPU-only storage (G22); each joins this step when its slice lands.
+//!   [`Report::markers`] for the front. [`GpuVm::apply`] also frees a destroyed sparse region's
+//!   GPU-only storage (slice G22, its module docs' "The GPU-only store"). Not here yet: dropping
+//!   the range from the buffer and texture caches (G16, G17) and the shader cache's
+//!   `invalidate`; each joins this step when the executor (G19) wires it.
 //!
 //! **The debugging switch.** Under [`Mode::AtRecord`] every action is performed when it is
 //! attached, whatever is recorded or in flight (the owner's ruling: "performing at record time is
@@ -174,8 +175,12 @@
 //!   "from guest time", and the wiring slice (G21) picks the clock. It is not recorded, so a
 //!   replay that does not supply the same clock writes different timestamps.
 //! - Releases to the syncpoint shim (gpu-protocol, "Semaphore acquires") go through the
-//!   release's [`GpuMemory`] like any other; turning them into increments belongs to the
-//!   production memory (G22), which is the one that translates addresses.
+//!   release's [`GpuMemory`] like any other; the production memory
+//!   ([`crate::memory::VmMemory`], slice G22), which is the one that translates addresses, turns
+//!   one into an increment of that syncpoint. Such a release still latches waiters with the
+//!   words it would have written (its payload, and the timestamp of a 16-byte one), not with the
+//!   counter's new value: an open item, which a read-back of the words through the memory after
+//!   the write would settle.
 //! - Releases name no address space, so each [`FencedAction::Release`] carries the memory it
 //!   writes and that memory's [`AsId`], chosen by the executor when it attaches the action
 //!   (whether the ring's `Release` should name its channel is the executor's, slice G19); the
