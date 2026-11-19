@@ -23,10 +23,14 @@
 //! stage, the attributes and system values read and written, the pixel interpolation modes, the
 //! colour targets and the local memory size.
 //!
+//! Slice 3 captures a guest program ([`capture`]): it finds where the program ends, holds it to
+//! the instruction cap, extends it through jump-table targets, and hashes its bytes.
+//!
 //! Experiment E1, run before this slice, lives in `lower`'s tests and its results in the spec.
 
 #[cfg(feature = "test-support")]
 pub mod asm;
+pub mod capture;
 pub mod decode;
 pub mod driver_constants;
 pub mod exchange;

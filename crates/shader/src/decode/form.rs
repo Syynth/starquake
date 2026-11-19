@@ -235,11 +235,8 @@ impl Reader {
         )
     )]
     pub(crate) fn signed(&mut self, field: Field) -> i64 {
-        let raw = self.field(field);
-        let unused = 64_u32.saturating_sub(field.width);
-        // Shift the sign bit to bit 63 and back, arithmetically; a width of 0 reads 0.
-        let value = raw.checked_shl(unused).unwrap_or(0).cast_signed();
-        value.checked_shr(unused).unwrap_or(0)
+        self.field(field);
+        self.word.signed(field)
     }
 
     /// Reads a register field ([`Gpr::BITS`] wide).

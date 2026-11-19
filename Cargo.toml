@@ -49,7 +49,11 @@ postcard = { version = "1.1.3", default-features = false, features = ["alloc"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 thiserror = "2.0.21"
-toml = { version = "1.2.1", default-features = false, features = ["std", "parse", "serde"] }
+# The shader crate's content hash of captured programs (docs/specs/shader-pipeline.md, "Hash"):
+# XXH3-128, fast and non-cryptographic, and specified byte for byte, so it is stable across runs
+# and platforms. Pure Rust, and already in the graph through lz4_flex. Only the 128-bit variant.
+twox-hash = { version = "2.1.5", default-features = false, features = ["xxhash3_128"] }
+toml ={ version = "1.2.1", default-features = false, features = ["std", "parse", "serde"] }
 tracing = "0.1.44"
 
 # Dev-only

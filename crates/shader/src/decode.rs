@@ -64,9 +64,13 @@ use thiserror::Error;
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) use alu::{AluForm, Slot, Source};
 pub(crate) use fields::*;
+// `EXIT`'s fields, which program capture reads before full decoding (`crate::capture`).
 #[cfg(test)]
 pub(crate) use form::{GROUP_HOOKS, GROUPS};
 pub use instruction::{Field, Instruction, LengthError};
+pub(crate) use op::control::{
+    EXIT_KEEP_REF_COUNT, EXIT_NO_AT_EXIT, EXIT_OPCODE, EXIT_PRED, EXIT_PRED_NOT,
+};
 pub use op::*;
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) use op::{Named, attribute, control, float, integer, op_list};
