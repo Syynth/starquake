@@ -519,6 +519,22 @@ Landed: G13 (the front macro host, #324, PR #340) and G11 (DMA copy, inline-to-m
 | awaiting the owner | **Overlapping copies:** G11 reads each line whole before writing it for a pitch-to-pitch DMA copy, as Eden-NX2 does, and reads the whole source region first (at most `MAX_COPY_BYTES`) for a copy with a block-linear side and for every 2D blit. The spec does not say | #322 | gpu-protocol |
 | awaiting the owner | **Guessed bounds with no reference behind them:** at most 2^18 method writes and 0x1000 DMA words per macro run; `MAX_COPY_BYTES` (256 MiB) and `MAX_PENDING_RANGES` (1,024) for copies; vertex stream sizes (16 `SET_VERTEX_STREAM_SIZE` elements for 32 streams). Record them in the spec as guesses to confirm by trace | #321, #322, #324 | gpu-protocol |
 
+### From wave 38 (ledger: #22)
+
+Landed: G10 (back-thread engine mirrors, dirty groups and typed accessors, #321, PR #344, resumed from wave 37's branch), #342 (the 2026-11-18 rulings in `gpu::regs` and `gpu::back::qmd`, PR #345), G15 (fenced releases, completion and the completion wake, #326, PR #347) and G16 (the buffer cache, #327, PR #346). Shader-pipeline slice 9, which G18 waits on, is filed as #348 under the approved spec. Wiring notes are comments on #325, #328 and #329.
+
+| Status | Proposal | Why | Suggested |
+|---|---|---|---|
+| proposed | **GPU-written buffers and textures (milestone 4):** on-demand write-back (decision 4), keeping them out of routine eviction (row 139), a `ReadbackId` allocator shared by the buffer and texture caches, and a G15 hook so the guest write happens after the readback's list completes. Waits for the first host-GPU writer | #327 | area:gpu |
+| proposed | **`gpu::regs` and `gpu::back::state` follow-ups:** the front's `STATE_3D` still gives `SET_VERTEX_STREAM_SIZE` 16 elements where G10 gives 32; a contract and test for ungrouped registers; pin the legacy index registers 0x17d0, 0x17d4 and 0x17e0 | #321 | area:gpu |
+| proposed | **Test chores:** one shared `pub(crate)` tracing-capture test helper (the fence and macro tests each have a copy); whether the buffer cache's `Spans` should be the memory crate's `PageSet` | #326, #327 | area:gpu |
+| proposed | **The release timestamp's source:** `FenceClock::gpu_timestamp` is injected and not recorded; G21 picks the source (the spec's deferred queries say "from guest time"), and replay must supply the same clock | #326 | area:gpu |
+| awaiting the owner | **Ruling 6's wording:** the spec says "only state methods take the shadow value". #345 lets every method that is not a data load take it, triggers included, as Eden-NX2's `CallMethod` applies `ProcessShadowRam` to every method. Amend the sentence to "every method except data loads", or narrow the code | #342 | gpu-protocol |
+| awaiting the owner | **The 3D group table and typed accessors are hand-written,** keyed on the generated constants; the spec says they are generated (decision 6). Mesa's headers carry no group information. Accept hand-written tables, or extend `cargo xtask gen-classes` | #321 | gpu-protocol |
+| awaiting the owner | **Releases name no address space:** the ring's `Release` and the copy and QMD releases carry no channel, so the back cannot tell which `GpuMemory` a release writes. Add a channel to the ring's `Release` (with G19), or track the issuing channel | #326 | gpu-protocol |
+| awaiting the owner | **The buffer cache re-reads a range on its first use after arming its watch** (from the review notes on #197); the spec-literal alternative is a one-line change in `Entry::upload_spans` | #327 | gpu-protocol |
+| awaiting the owner | **Buffer cache guesses:** `STREAMED_AFTER_FAULTS = 4` and the budget halves in `eviction_limits`; record them in the spec as guesses to confirm by trace | #327 | gpu-protocol |
+
 ## House-rule candidates
 
 Rules distilled from review findings. A vetted rule moves into `CLAUDE.md`; until then it is
@@ -765,3 +781,14 @@ passed to build agents as a provisional rule for the next wave.
 - Reset and default register values come from the reference constructor, cited, and are tested with those registers left unwritten.
 - A function that promises a flush or cleanup on error has a failure-path test asserting the exact ordered events.
 - Register and field widths and signedness come from the reference types, tested with a value at or above 2^31.
+
+### From wave 38 (ledger: #22)
+
+- Table-driven mappings are pinned with hand-written literal cases from the reference, not expectations derived from the same table, covering each half of a paired entry.
+- Every typed getter has a test that each register it reads marks its view's group.
+- Set and bitmask operations are tested with operands that are not subsets and with clearing something already clean.
+- A worker that takes work in priority order has a bounded starvation test where the high-priority source never empties.
+- Ordering and carry-over logic is tested with two or more items in flight; removing the sole element of a collection is tested.
+- Every documented ordering between a signal and another side effect is pinned by a test double that observes the effect at the moment of the signal.
+- Every pool holding live bytes counts toward a documented memory cap, tested with a hostile growing sequence.
+- A doc that cites a reference name is checked against the reference tree; a doc that says code is generated or mirrors a spec sentence is checked literally.
