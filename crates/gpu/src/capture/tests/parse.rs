@@ -15,7 +15,7 @@ use crate::interface::{ChannelConfig, SYNCPOINT_COUNT};
 /// A capture with one space, one channel, the caps blob and nothing else.
 fn minimal() -> Capture {
     let mut blobs = Blobs::new();
-    let caps = blobs.insert(&postcard::to_allocvec(&caps()).unwrap());
+    let caps = blobs.insert(&postcard::to_allocvec(&config().caps).unwrap());
     Capture {
         header: Header {
             build_id: "b".to_owned(),

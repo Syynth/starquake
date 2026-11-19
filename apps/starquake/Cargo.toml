@@ -25,3 +25,6 @@ starquake-loader = { workspace = true, features = ["test-support"] }
 # names it asks for.
 starquake-ipc.workspace = true
 starquake-services.workspace = true
+# Build the synthetic GPU captures that `gpu_replay.rs` replays.
+starquake-gpu = { workspace = true, features = ["test-support"] }
+starquake-memory.workspace = true

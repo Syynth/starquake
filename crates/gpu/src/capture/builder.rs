@@ -100,6 +100,58 @@ pub struct BuilderConfig {
     pub mode: Mode,
 }
 
+impl BuilderConfig {
+    /// A configuration for synthetic fixtures: `guest_size` bytes of guest memory at
+    /// `guest_base`, a device that supports everything with limits large enough for that
+    /// memory (every buffer and staging size the guest's size), a budget of 1 GiB, the default
+    /// wait setting and fenced releases.
+    pub fn synthetic(build_id: &str, guest_base: u64, guest_size: usize) -> Self {
+        use starquake_render::caps::{
+            DynamicState, Features, FormatFeatures, FormatTable, Limits, SampleCounts,
+            StageSupport,
+        };
+        let size = u64::try_from(guest_size).unwrap_or(u64::MAX);
+        Self {
+            build_id: build_id.to_owned(),
+            caps: Caps {
+                limits: Limits {
+                    max_buffer_size: size,
+                    max_staging_size: size,
+                    max_texture_dimension_1d: 4096,
+                    max_texture_dimension_2d: 4096,
+                    max_texture_dimension_3d: 256,
+                    max_texture_array_layers: 64,
+                    max_sampler_anisotropy: 16,
+                    max_vertex_attributes: 16,
+                    max_vertex_buffers: 8,
+                    max_vertex_buffer_stride: 2048,
+                    max_color_attachments: 8,
+                    max_viewports: 1,
+                    max_bind_groups: 4,
+                    max_bindings_per_bind_group: 16,
+                    max_compute_workgroups_per_dimension: 64,
+                    max_uniform_buffers_per_stage: 12,
+                    max_storage_buffers_per_stage: 8,
+                    max_sampled_textures_per_stage: 16,
+                    max_storage_textures_per_stage: 4,
+                    max_samplers_per_stage: 16,
+                },
+                features: Features::ALL,
+                stages: StageSupport::ALL,
+                dynamic_state: DynamicState::ALL,
+                sample_counts: SampleCounts::X1,
+                view_swizzle: true,
+                formats: FormatTable::uniform(FormatFeatures::ALL),
+            },
+            memory_allowed: 1 << 30,
+            guest_base,
+            guest_size,
+            setting: WaitWhileCompiling::Wait,
+            mode: Mode::Fenced,
+        }
+    }
+}
+
 /// Why the builder failed.
 #[derive(Debug, Error)]
 pub enum BuildError {

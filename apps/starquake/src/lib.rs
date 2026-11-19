@@ -12,7 +12,11 @@
 //! starquake run <program> [--until timeout=<n>s] [--artifacts <folder>] [--date <seconds>]
 //! starquake inspect <title.nup>
 //! starquake verify <title.nup>
+//! starquake gpu-replay <capture> [--until present=<n>] [--dump ring|render|writes]
 //! ```
+//!
+//! `gpu-replay` replays a GPU capture with no game and no GPU ([`gpu_replay`]); its exit codes
+//! are 0 (replayed to its stop condition) and 2 (anything else).
 //!
 //! The process exit code says how the run ended (`starquake_core::exit_code`): 0 the program
 //! exited, 1 the guest crashed, 2 an emulator error, 3 the timeout passed. A command line this
@@ -66,6 +70,7 @@ use starquake_core::{
     UnixSeconds, artifacts, exit_code,
 };
 
+pub mod gpu_replay;
 pub mod title;
 
 /// What `starquake` prints for `--help`, and after a command line it can't parse.
@@ -74,6 +79,8 @@ usage: starquake run <program> [--until timeout=<n>s] [--artifacts <folder>]
                      [--date <seconds>]
        starquake inspect <title.nup>
        starquake verify <title.nup>
+       starquake gpu-replay <capture> [--until present=<n>]
+                            [--dump ring|render|writes]
 
 run: runs a program, an NRO or a NUP title (the ExeFS of its newest update,
 or of its base), and writes what it did to an artifacts folder:
@@ -92,6 +99,13 @@ verify: checks the SHA-256 of every file of a NUP title and names the first
 that does not match.
 exit codes: 0 done and intact, 1 the title is damaged or could not be parsed,
 2 the file could not be read or the command line is wrong
+
+gpu-replay: replays a GPU capture through the GPU's front and back with no
+game and no GPU, and checks the ring and the render stream against it. --until
+present=<n> stops after the n-th present; --dump prints the ring entries, the
+render commands or the writes after the summary line.
+exit codes: 0 replayed to its stop condition, 2 emulator error (an unreadable or
+malformed capture, or a replay that diverged)
 ";
 
 /// The flags of the headless contract that are not built yet.
@@ -125,6 +139,8 @@ pub enum Command {
     Inspect(PathBuf),
     /// `starquake verify <file>`.
     Verify(PathBuf),
+    /// `starquake gpu-replay ...`.
+    GpuReplay(starquake_core::gpu_replay::GpuReplayArgs),
     /// `starquake --help`, `starquake help`, or no arguments at all.
     Help,
 }
@@ -132,6 +148,9 @@ pub enum Command {
 /// Why a command line could not be parsed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum UsageError {
+    /// A `gpu-replay` command line that could not be parsed.
+    #[error(transparent)]
+    GpuReplay(#[from] gpu_replay::GpuReplayUsage),
     /// The first argument is not a command this tool has.
     #[error("unknown command `{0}`")]
     UnknownCommand(String),
@@ -231,6 +250,9 @@ pub fn parse(args: &[OsString]) -> Result<Command, UsageError> {
         "run" => {}
         "inspect" => return parse_file_command("inspect", rest, Command::Inspect),
         "verify" => return parse_file_command("verify", rest, Command::Verify),
+        "gpu-replay" => {
+            return Ok(gpu_replay::parse(rest)?.map_or(Command::Help, Command::GpuReplay));
+        }
         other => return Err(UsageError::UnknownCommand(other.to_owned())),
     }
 
@@ -527,6 +549,7 @@ pub fn execute(args: &[OsString], stdout: &mut dyn Write, stderr: &mut dyn Write
         }
         Ok(Command::Inspect(file)) => title::inspect(&file, stdout, stderr),
         Ok(Command::Verify(file)) => title::verify(&file, stdout, stderr),
+        Ok(Command::GpuReplay(replay)) => gpu_replay::run(&replay, stdout, stderr),
         Err(error) => {
             let _ = write!(stderr, "starquake: {error}\n\n{USAGE}");
             exit_code::EMULATOR_ERROR

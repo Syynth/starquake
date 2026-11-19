@@ -34,3 +34,5 @@ starquake-testkit.workspace = true
 insta.workspace = true
 # Builds the synthetic NUP titles that the `title` module's tests load.
 starquake-loader = { workspace = true, features = ["test-support"] }
+# The capture builder, for the `gpu_replay` module's tests.
+starquake-gpu = { workspace = true, features = ["test-support"] }
