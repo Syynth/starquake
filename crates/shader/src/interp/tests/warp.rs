@@ -198,9 +198,9 @@ fn quad_operations_read_within_the_quad() {
     };
     assert_eq!(broadcast(2), OWN);
     assert_eq!(
-        broadcast(6),
+        broadcast(10),
         OWN,
-        "only the low two bits of the index count"
+        "only the low two bits of the index count: 10 is lane 2 of the quad, not lane 14"
     );
     assert_eq!(broadcast(1), INACTIVE_LANE_VALUE);
     let swap = |direction: u32| {
