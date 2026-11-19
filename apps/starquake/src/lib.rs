@@ -40,7 +40,10 @@
 //! the run once `<n>` frames (1 or more) have been presented, with exit code 0. A frame is a
 //! present the graphics server hands the GPU, one for each frame its vsync tick latches
 //! (`starquake_core::hle::Graphics::frames`); `summary.json`'s `frames` counts the same, so a run
-//! that stops at `frames=<n>` says `<n>` there.
+//! that stops at `frames=<n>` says `<n>` there. A present with a fence the GPU reaches is latched
+//! only once the host GPU has completed that work, so the guest time at which such a run stops
+//! depends on host timing; for presents with no fence it does not
+//! (`starquake_core::hle::graphics`, "Frames").
 //!
 //! PROVISIONAL (walking skeleton, #74). Of the contract's flags only `--until` and `--artifacts`
 //! exist; `--script`, `--clock`, `--seed`, `--record`, `--snapshot-every` and the `trace=`

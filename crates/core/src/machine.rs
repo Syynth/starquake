@@ -712,7 +712,7 @@ impl Tally {
 const UNDEFINED: Exception = Exception::UndefinedInstruction;
 
 /// How the loop ended.
-enum Ending {
+pub(crate) enum Ending {
     Exited,
     /// The run presented the frames it was to stop at ([`RunOptions::until_frames`]).
     FramesReached,

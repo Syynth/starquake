@@ -367,7 +367,9 @@ pub struct RunReport {
 pub struct GraphicsReport {
     /// Frames presented: the presents the graphics server handed the GPU front, one per frame
     /// its vsync tick latched (`crate::hle::Graphics::frames`). The same count with the GPU and
-    /// with the null front.
+    /// with the null front for presents with no fence or an already-reached one; a present whose
+    /// fence the GPU reaches is latched at a tick that depends on when the host GPU completes
+    /// the work (`crate::hle::graphics`, "Frames").
     pub frames: u64,
     /// The frame dumps the run kept (`crate::frames`); empty for a run with no GPU.
     pub dumps: DumpedFrames,

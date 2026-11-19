@@ -112,6 +112,19 @@ fn frames_of_different_sizes_are_counted_by_their_own_bytes() {
 }
 
 #[test]
+fn an_evicted_frame_frees_its_own_bytes_not_the_new_frames() {
+    // 4, 16 and 16 bytes in a budget of 20: the third pushes out the first (4 bytes) and still
+    // does not fit (16 + 16 = 32), so it pushes out the second too. Freeing the new frame's 16
+    // bytes for the first instead would leave the count at 4 and keep 1 and 2, 32 bytes.
+    let one = RGBA8_BYTES;
+    let keeper = FrameKeeper::new(5 * one);
+    keeper.frame(frame(0, 1, 1, 1));
+    keeper.frame(frame(1, 2, 2, 2));
+    keeper.frame(frame(2, 2, 2, 3));
+    assert_eq!(taken(&keeper), (vec![2], 0, 2));
+}
+
+#[test]
 fn an_unknown_frame_is_counted_and_takes_no_room() {
     let keeper = FrameKeeper::new(SMALL);
     keeper.frame(frame(1, 2, 2, 1));

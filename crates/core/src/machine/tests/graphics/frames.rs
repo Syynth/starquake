@@ -2,7 +2,9 @@
 //! "Frames"; `machine/gpu.rs`): a scripted guest presents a native image through gsv's vi2
 //! session a given number of times and then sleeps, and a run with `until_frames` stops as soon
 //! as the timer thread's turn has handed the front the last frame it allows, with either front.
-//! A dead GPU thread ends the run; a run with the GPU reports its counters and flight recorder.
+//! A dead GPU thread ends the run; a run with the GPU reports its counters and flight recorder,
+//! and keeps its graphics report and kept frames whatever its ending, a crash and a timeout
+//! included.
 //!
 //! Requests are laid out by hand from PR's checks, as `crate::hle`'s present tests lay them out
 //! (`eden-pr4588/src/core/hle/service/am/service/graphics_supervisor.cpp` @ e5fb3b97):
@@ -24,6 +26,9 @@ use starquake_gsv::vi2::{
 };
 
 use super::*;
+// The image: 16 by 16 RGBA8 in two pages, as `crate::hle`'s present tests make it.
+use crate::hle::tests::graphics::present::{EXTENT, IMAGE_SIZE};
+use crate::image::PAGE;
 use crate::machine::gpu::GPU_STOPPED;
 
 /// The frame limit the runs here stop at.
@@ -34,32 +39,37 @@ const TOKEN: u64 = 0x0000_0055_0000_0066;
 const RETIRE: u32 = 1;
 const AVAILABLE: u32 = 2;
 
-/// The image: 16 by 16 RGBA8 in two pages (`crate::hle`'s present tests size it the same).
-const IMAGE_SIZE: u64 = 2 * 0x1000;
-const EXTENT: u32 = 15 | (15 << 16);
-
 /// How long the presenting guest sleeps after its presents, before it exits: far longer than
 /// the ticks that latch them (one each 16.7 ms).
 const SETTLE: Duration = Duration::from_secs(2);
 
 /// A program whose `.bss` holds the image, page-aligned: its code is never run.
 fn image_program() -> Vec<u8> {
-    let pages = u32::try_from(IMAGE_SIZE / 0x1000 + 1).unwrap();
+    let pages = IMAGE_SIZE / PAGE + 1;
     NroBuilder::new(&[a64::nop()])
-        .bss_size(pages * 0x1000)
+        .bss_size(u32::try_from(pages * PAGE).unwrap())
         .build()
         .unwrap()
+}
+
+/// How the presenting guest ends, once it has slept [`SETTLE`] after its presents.
+#[derive(Clone, Copy)]
+enum End {
+    /// It calls `ExitProcess`.
+    Exit,
+    /// It runs an undefined instruction at this address: a crash.
+    Crash(u64),
 }
 
 /// The scripted presenting guest: gets the root, makes and binds a native image at `image_at`
 /// in a window pool, opens a vi2 session and the default display, registers, binds and asks the
 /// availability of its client, presents the image `count` times, one slot each from slot 0, then
-/// sleeps [`SETTLE`] and exits.
+/// sleeps [`SETTLE`] and ends as `end` says.
 #[expect(
     clippy::too_many_lines,
     reason = "one step per request of the conversation, in order"
 )]
-fn presenting_guest(script: &Script, image_at: u64, count: u32) -> ScriptedVcpu {
+fn presenting_guest(script: &Script, image_at: u64, count: u32, end: End) -> ScriptedVcpu {
     let send = || svc(SvcId::SendSyncRequest);
     let [size_low, size_high] = halves(IMAGE_SIZE);
     let [at_low, at_high] = halves(image_at);
@@ -222,29 +232,47 @@ fn presenting_guest(script: &Script, image_at: u64, count: u32) -> ScriptedVcpu 
         );
     }
     let done = script.clone();
-    guest
-        .then(
-            step(script, |script, _| {
-                script.tipc();
-                u32::try_from(SETTLE.as_nanos()).unwrap_or(u32::MAX)
-            }),
-            svc(SvcId::SleepThread),
-        )
-        .then(
-            // `SleepThread` returns no result.
-            move |_| done.vars.borrow_mut().waited = Some(0),
-            svc(SvcId::ExitProcess),
-        )
+    let slept = guest.then(
+        step(script, |script, _| {
+            script.tipc();
+            u32::try_from(SETTLE.as_nanos()).unwrap_or(u32::MAX)
+        }),
+        svc(SvcId::SleepThread),
+    );
+    // `SleepThread` returns no result.
+    let wake = move |_: &mut GuestRegs| done.vars.borrow_mut().waited = Some(0);
+    match end {
+        End::Exit => slept.then(wake, svc(SvcId::ExitProcess)),
+        End::Crash(pc) => slept.then(
+            move |regs| {
+                wake(regs);
+                regs.pc = pc;
+            },
+            Exit::Undefined {
+                pc,
+                syndrome: Syndrome::undefined(),
+            },
+        ),
+    }
 }
 
 /// What a run of the presenting guest presenting `count` times came to, with `until_frames` at
 /// [`LIMIT`]; with a GPU over `gpu_memory` when given.
 fn presenting_run(count: u32, gpu_memory: Option<Arc<dyn GuestMemory>>) -> (RunReport, bool) {
+    presenting_run_until(count, gpu_memory, RUN_LIMIT, false)
+}
+
+/// [`presenting_run`] with the run's timeout at `timeout`, and a guest that crashes instead of
+/// exiting when `crash` is set.
+fn presenting_run_until(
+    count: u32,
+    gpu_memory: Option<Arc<dyn GuestMemory>>,
+    timeout: Duration,
+    crash: bool,
+) -> (RunReport, bool) {
     let guest = super::super::Guest::new(&image_program());
-    let image_at = guest
-        .start_of("main.bss")
-        .next_multiple_of(crate::image::PAGE);
-    let page = usize::try_from(crate::image::PAGE).unwrap();
+    let image_at = guest.start_of("main.bss").next_multiple_of(PAGE);
+    let page = usize::try_from(PAGE).unwrap();
     let tls = Arc::new(FlatMemory::new(guest.tls, page));
     let space = WithTls {
         image: &guest.memory,
@@ -256,9 +284,14 @@ fn presenting_run(count: u32, gpu_memory: Option<Arc<dyn GuestMemory>>) -> (RunR
         base: guest.tls,
         vars: Rc::clone(&vars),
     };
-    let mut main = presenting_guest(&script, image_at, count);
+    let end = if crash {
+        End::Crash(guest.placed.entry)
+    } else {
+        End::Exit
+    };
+    let mut main = presenting_guest(&script, image_at, count, end);
     let options = RunOptions {
-        timeout: Some(RUN_LIMIT),
+        timeout: Some(timeout),
         until_frames: NonZeroU64::new(u64::from(LIMIT)),
         ..RunOptions::default()
     };
@@ -279,7 +312,7 @@ fn presenting_run(count: u32, gpu_memory: Option<Arc<dyn GuestMemory>>) -> (RunR
 /// A stand-in for the guest memory a real run shares with the GPU: the scripted runs' flat
 /// memory is not shared, and the GPU here reads nothing the guest wrote.
 fn stand_in_memory() -> Arc<dyn GuestMemory> {
-    Arc::new(FlatMemory::new(0x8000_0000, 0x1000))
+    Arc::new(FlatMemory::new(0x8000_0000, usize::try_from(PAGE).unwrap()))
 }
 
 /// `--until frames=N` (issue #386, "Tests"): the guest presents `N - 1`, `N` and `N + 1`
@@ -312,6 +345,129 @@ fn a_run_stops_at_exactly_its_frame_limit() {
                 None => assert!(!gpu, "{what}"),
             }
         }
+    }
+}
+
+/// A run with the GPU that crashes, or times out, after its presents keeps its graphics report
+/// (`Machine::finish`'s crashed and timed-out arms): the frames counted, and the GPU's counters,
+/// which saw every frame the front was handed.
+#[test]
+fn a_crashed_or_timed_out_run_keeps_its_graphics_report() {
+    let count = LIMIT - 1;
+    for (timeout, crash) in [(RUN_LIMIT, true), (SETTLE / 2, false)] {
+        let (report, slept) = presenting_run_until(count, Some(stand_in_memory()), timeout, crash);
+        let what = if crash { "crashed" } else { "timed out" };
+        if crash {
+            assert!(report.crash().is_some(), "{what}: {}", report.trace);
+            assert!(slept, "{what}");
+        } else {
+            assert_eq!(report.exit, ExitReason::Timeout, "{what}: {}", report.trace);
+            assert!(!slept, "{what}");
+        }
+        assert_eq!(report.graphics.frames, u64::from(count), "{what}");
+        assert_eq!(report.summary().frames, u64::from(count), "{what}");
+        let counters = report.graphics.gpu.unwrap();
+        assert_eq!(counters.presents_pushed, u64::from(count), "{what}");
+        assert_eq!(report.summary().gpu, Some(counters), "{what}");
+    }
+}
+
+/// Runs `prepare` on a machine with the GPU over [`stand_in_memory`], started on the hello
+/// program with a real run's services and no thread of its own running, then finishes it: how it
+/// ended and its aftermath.
+fn finished_gpu_machine(
+    prepare: impl FnOnce(&Machine<'_, ScriptedVcpu, FixedClock>),
+) -> (Ending, Aftermath) {
+    let guest = super::super::Guest::new(&programs::hello().unwrap());
+    let space: &dyn GuestSpace<ScriptedVcpu> = &guest.memory;
+    let options = RunOptions::default();
+    let session = Session {
+        memory: space,
+        options: &options,
+        clock: RunClock::new(Timebase {
+            console: NRO_CONSOLE,
+            clock: FixedClock::new(CLOCK_STEP, CLOCK_STEP),
+        }),
+        recorder: Arc::new(Recorder::new()),
+        gpu_memory: Some(stand_in_memory()),
+    };
+    let env = session.environment();
+    let (dispatcher, _) = boot(guest.address_space(), &guest.placed, space, &*env).unwrap();
+    let Ok(machine) = Machine::start(
+        dispatcher,
+        space,
+        &session,
+        &env,
+        Limits::DEFAULT,
+        &real_services,
+    ) else {
+        unreachable!("the services could not be installed");
+    };
+    prepare(&machine);
+    let (ending, _, _, aftermath) = machine.finish();
+    (ending, aftermath)
+}
+
+/// Whatever the run's ending, `Machine::finish` hands the report the GPU's counters and the
+/// frames its keeper holds (`machine/gpu.rs`, "At the end"): a frame fed to the run's keeper is
+/// in the aftermath's dumps for every ending.
+#[test]
+fn every_ending_keeps_the_gpu_report_and_the_kept_frames() {
+    use starquake_render::command::PresentTransform;
+    use starquake_render::frame::RGBA8_BYTES;
+    use starquake_render::{Frame, FramePixels, FrameSink};
+
+    type Make = fn() -> Ending;
+    let endings: [(Make, &str); 5] = [
+        (|| Ending::Exited, "exited"),
+        (|| Ending::FramesReached, "frames reached"),
+        (
+            || {
+                Ending::Crashed(
+                    crate::crash::Exception::UndefinedInstruction,
+                    None,
+                    Box::default(),
+                )
+            },
+            "crashed",
+        ),
+        (|| Ending::TimedOut, "timed out"),
+        (|| Ending::Failed("the test's".to_owned()), "failed"),
+    ];
+    for (ending, what) in endings {
+        let (ended, aftermath) = finished_gpu_machine(|machine| {
+            let keeper = machine.dumps.as_ref().unwrap();
+            keeper.frame(Frame {
+                frame: 7,
+                width: 1,
+                height: 1,
+                transform: PresentTransform::Identity,
+                pixels: FramePixels::Rgba8(vec![0x42; RGBA8_BYTES]),
+            });
+            machine
+                .graphics
+                .front()
+                .barrier(starquake_gpu::interface::Ticket(9));
+            machine.stop(ending());
+        });
+        // The GPU stopped cleanly, so the ending is the one the run stopped with.
+        assert_eq!(
+            std::mem::discriminant(&ended),
+            std::mem::discriminant(&ending()),
+            "{what}"
+        );
+        let graphics = aftermath.graphics;
+        assert_eq!(
+            graphics.gpu.map(|counters| counters.ordered),
+            Some(1),
+            "{what}"
+        );
+        assert!(
+            graphics.gpu_recorder.contains("barrier, ticket 9"),
+            "{what}"
+        );
+        let numbers: Vec<u64> = graphics.dumps.files.iter().map(|file| file.frame).collect();
+        assert_eq!(numbers, [7], "{what}");
     }
 }
 
@@ -375,7 +531,7 @@ fn a_dead_gpu_thread_ends_the_run() {
 #[test]
 fn a_run_with_the_gpu_reports_its_counters_and_flight_recorder() {
     let guest = super::super::Guest::new(&programs::hello().unwrap());
-    let page = usize::try_from(crate::image::PAGE).unwrap();
+    let page = usize::try_from(PAGE).unwrap();
     let tls = Arc::new(FlatMemory::new(guest.tls, page));
     let space = WithTls {
         image: &guest.memory,

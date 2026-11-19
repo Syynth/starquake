@@ -35,12 +35,13 @@ const RETIRE: u32 = 1;
 const AVAILABLE: u32 = 2;
 
 /// The image's memory: the rig's last two pages, the size of one 16 by 16 image of one GOB a
-/// row in 128-row blocks (`1 * 64 * 128` bytes).
+/// row in 128-row blocks (`1 * 64 * 128` bytes). `crate::machine`'s frame tests present an image
+/// of this size too.
 const IMAGE_AT: u64 = BASE + 2 * PAGE_SIZE;
-const IMAGE_SIZE: u64 = 2 * PAGE_SIZE;
+pub(crate) const IMAGE_SIZE: u64 = 2 * PAGE_SIZE;
 
 /// The image's extent word: 16 by 16.
-const EXTENT: u32 = 15 | (15 << 16);
+pub(crate) const EXTENT: u32 = 15 | (15 << 16);
 
 /// The data words of a request for a `u64`.
 fn words_of(value: u64) -> [u32; 2] {
@@ -500,33 +501,22 @@ fn tiled_image(linear: &[u8]) -> Vec<u8> {
     tiled
 }
 
-/// The end-to-end frame dump (issue #386, "Tests"): a present of an image the guest wrote,
-/// through gsv's vi2 session and the timer thread's turn to the GPU a run builds
-/// (`crate::machine`'s `gpu` module) over the recording backend, comes out of the artifacts
-/// folder as `frames/000000.png`, whose decoded pixels are the image's.
-///
-/// Two stand-ins, each said where it is made: the GPU reads its own copy of guest memory (the
-/// rig's kernel writes the rig's), into which the test writes the image; and the GPU address
-/// space presents read through is made on the GPU front directly, mapping the image's pages at
-/// their own address, as a title's `nvhost-as-gpu` and gpu 101 registration would
-/// (`starquake_gsv::gpu::memory`, "What the table shows": registrations identity-map in every
-/// space).
-#[test]
-fn a_presented_image_is_dumped_as_a_png_of_its_pixels() {
-    use crate::frames::{FRAMES_FOLDER, frame_file_name};
-    use crate::machine::gpu;
-    use crate::report::{EnvSource, GraphicsReport, RunReport};
-
-    let linear = linear_image();
+/// The guest memory the GPU reads in these tests: the rig's pages, with the image the guest
+/// wrote at [`IMAGE_AT`], `linear` laid out as the GPU reads it.
+fn image_memory(linear: &[u8]) -> Arc<FlatMemory> {
     let memory = Arc::new(FlatMemory::new(
         BASE,
         usize::try_from(PAGES * PAGE_SIZE).unwrap(),
     ));
-    memory.write(IMAGE_AT, &tiled_image(&linear)).unwrap();
-    let shared: Arc<dyn GuestMemory> = Arc::<FlatMemory>::clone(&memory);
-    let (graphics, keeper) = gpu::graphics(&EnvSource::Live, Some(&shared), None, Arc::new(NoWake))
-        .unwrap_or_else(|error| unreachable!("{error}"));
-    let keeper = keeper.unwrap();
+    memory.write(IMAGE_AT, &tiled_image(linear)).unwrap();
+    memory
+}
+
+/// Makes the GPU address space presents read through on `graphics`'s front, mapping the image's
+/// pages at their own address, as a title's `nvhost-as-gpu` and gpu 101 registration would
+/// (`starquake_gsv::gpu::memory`, "What the table shows": registrations identity-map in every
+/// space).
+fn map_the_image(graphics: &Graphics) {
     let vm = Arc::new(starquake_gpu::vm::GpuVm::new());
     vm.map(
         starquake_memory::PageRange::new(IMAGE_AT, IMAGE_SIZE).unwrap(),
@@ -537,29 +527,61 @@ fn a_presented_image_is_dumped_as_a_png_of_its_pixels() {
     graphics
         .front()
         .create_address_space(starquake_gpu::interface::AsId(0x31), vm);
+}
+
+/// The longest a test here waits for the GPU.
+const GPU_WAIT: Duration = Duration::from_secs(20);
+
+/// Waits, at most [`GPU_WAIT`], until `gpu` has presented `count` frames and is idle.
+fn wait_for_presents(gpu: &starquake_gpu::wiring::Gpu, count: u64) {
+    let deadline = std::time::Instant::now() + GPU_WAIT;
+    while gpu.counters().presents < count || !gpu.is_idle() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the GPU presented {} of {count}",
+            gpu.counters().presents
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// The end-to-end frame dump (issue #386, "Tests"): a present of an image the guest wrote,
+/// through gsv's vi2 session and the timer thread's turn to the GPU a run builds
+/// (`crate::machine`'s `gpu` module) over the recording backend, and through the run's own end
+/// (`gpu::finish`, which drains and stops the GPU and reads the frame keeper), comes out of the
+/// artifacts folder as `frames/000000.png`, whose decoded pixels are the image's.
+///
+/// Two stand-ins, each said where it is made: the GPU reads its own copy of guest memory (the
+/// rig's kernel writes the rig's), into which the test writes the image ([`image_memory`]); and
+/// the GPU address space presents read through is made on the GPU front directly
+/// ([`map_the_image`]).
+#[test]
+fn a_presented_image_is_dumped_as_a_png_of_its_pixels() {
+    use crate::frames::{FRAMES_FOLDER, frame_file_name};
+    use crate::machine::{Ending, gpu};
+    use crate::report::{EnvSource, RunReport};
+
+    let linear = linear_image();
+    let shared: Arc<dyn GuestMemory> = image_memory(&linear);
+    let (graphics, keeper) = gpu::graphics(&EnvSource::Live, Some(&shared), None, Arc::new(NoWake))
+        .unwrap_or_else(|error| unreachable!("{error}"));
+    let keeper = keeper.unwrap();
+    map_the_image(&graphics);
 
     let rig = rig_with(&graphics);
     let turns = present_and_latch(&rig, &graphics, 1);
     assert_eq!(turns, [1]);
     let gpu = Arc::clone(graphics.gpu().unwrap());
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
-    while gpu.counters().presents < 1 || !gpu.is_idle() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the GPU never presented"
-        );
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    gpu.stop().unwrap();
+    wait_for_presents(&gpu, 1);
+    let mut ending = Ending::Exited;
     let report = RunReport {
-        graphics: GraphicsReport {
-            frames: graphics.frames(),
-            dumps: keeper.take(),
-            gpu: Some(gpu.counters()),
-            gpu_recorder: gpu.flight_recorder(),
-        },
+        graphics: gpu::finish(&graphics, Some(&keeper), &mut ending),
         ..RunReport::emulator_error(String::new(), Duration::ZERO)
     };
+    assert!(matches!(ending, Ending::Exited));
+    assert!(!gpu.is_running());
+    assert_eq!(report.graphics.gpu, Some(gpu.counters()));
+    assert_eq!(report.graphics.dumps.files.len(), 1);
     assert_eq!(
         (report.graphics.dumps.unknown, report.graphics.dumps.dropped),
         (0, 0)
@@ -580,4 +602,109 @@ fn a_presented_image_is_dumped_as_a_png_of_its_pixels() {
     let recorder = fs::read_to_string(folder.join(crate::artifacts::GPU_FILE)).unwrap();
     assert!(recorder.contains("present"), "{recorder}");
     assert_eq!(report.graphics.frames, 1);
+}
+
+/// What the run's render backend holds after `count` presents of the image, each latched and
+/// handed to the GPU before the next, alternating between two slots: the snapshot's length, the
+/// lists it kept, the present feedback waiting, and the bytes of its live resources.
+fn backend_held_after(count: u32) -> (usize, usize, usize, u64) {
+    use crate::machine::gpu;
+    use crate::report::EnvSource;
+    use starquake_render::Backend;
+
+    let shared: Arc<dyn GuestMemory> = image_memory(&linear_image());
+    let (graphics, built) =
+        gpu::graphics_and_backend(&EnvSource::Live, Some(&shared), None, Arc::new(NoWake))
+            .unwrap_or_else(|error| unreachable!("{error}"));
+    let (_keeper, backend) = built.unwrap();
+    map_the_image(&graphics);
+    let rig = rig_with(&graphics);
+    let (vi2, _, _, image) = presenting(&rig);
+    for n in 0..count {
+        let reply = rig.tipc(vi2, &present(image, n % 2));
+        assert_eq!(reply.result, 0, "present {n}");
+        let deadline = graphics.deadline().unwrap();
+        rig.turn_at(&graphics, deadline);
+    }
+    assert_eq!(graphics.frames(), u64::from(count));
+    let gpu = Arc::clone(graphics.gpu().unwrap());
+    wait_for_presents(&gpu, u64::from(count));
+    let held = (
+        backend.snapshot().len(),
+        backend.lists().len(),
+        backend.take_present_feedback().len(),
+        backend.budget().used,
+    );
+    gpu.stop().unwrap();
+    held
+}
+
+/// The run's render backend keeps no call log and no present feedback (`crate::machine`'s `gpu`
+/// module, "The GPU's parts"): after fifty presents it holds what it held after one. A backend
+/// that kept its log would hold every list, and every upload's staging bytes with it.
+#[test]
+fn the_run_s_backend_holds_no_more_after_fifty_presents_than_after_one() {
+    let one = backend_held_after(1);
+    let fifty = backend_held_after(50);
+    assert_eq!(fifty, one);
+    assert_eq!((one.0, one.1, one.2), (0, 0, 0));
+    // The image's texture is live: the backend still models its bytes.
+    assert!(one.3 > 0);
+}
+
+/// Guest memory whose every read panics: the GPU thread that reads it ends with a panic.
+struct PanickingMemory(Arc<FlatMemory>);
+
+impl GuestMemory for PanickingMemory {
+    fn read(&self, va: u64, _buf: &mut [u8]) -> Result<(), starquake_memory::Fault> {
+        unreachable!("the test's guest memory panics on every read, here at {va:#x}");
+    }
+
+    fn write(&self, va: u64, data: &[u8]) -> Result<(), starquake_memory::Fault> {
+        self.0.write(va, data)
+    }
+}
+
+/// A GPU thread that failed during a run that then reached its stop condition makes the run an
+/// emulator error once `gpu::finish` stops the GPU (`crate::machine`'s `gpu` module, "At the
+/// end"), and the report keeps the GPU's counters. Its threads have already ended, so `finish`
+/// does not wait for it to be idle.
+#[test]
+fn a_gpu_thread_that_failed_turns_a_clean_ending_into_an_emulator_error() {
+    use crate::machine::{Ending, gpu};
+    use crate::report::EnvSource;
+    use starquake_gpu::wiring::{BackError, WiringError};
+
+    for clean in [Ending::Exited, Ending::FramesReached] {
+        let shared: Arc<dyn GuestMemory> = Arc::new(PanickingMemory(image_memory(&linear_image())));
+        let (graphics, keeper) =
+            gpu::graphics(&EnvSource::Live, Some(&shared), None, Arc::new(NoWake))
+                .unwrap_or_else(|error| unreachable!("{error}"));
+        map_the_image(&graphics);
+        let rig = rig_with(&graphics);
+        assert_eq!(present_and_latch(&rig, &graphics, 1), [1]);
+        let gpu = Arc::clone(graphics.gpu().unwrap());
+        let deadline = std::time::Instant::now() + GPU_WAIT;
+        while gpu.is_running() {
+            assert!(std::time::Instant::now() < deadline, "the GPU never failed");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let mut ending = clean;
+        let started = std::time::Instant::now();
+        let report = gpu::finish(&graphics, keeper.as_deref(), &mut ending);
+        assert!(started.elapsed() < gpu::GPU_DRAIN_WAIT / 2);
+        match ending {
+            Ending::Failed(message) => assert_eq!(
+                message,
+                format!(
+                    "{}: {}",
+                    gpu::GPU_FAILED,
+                    WiringError::Back(BackError::Panicked)
+                )
+            ),
+            _ => unreachable!("a failed GPU thread must make the run an emulator error"),
+        }
+        assert!(report.gpu.is_some());
+        assert_eq!(report.frames, 1);
+    }
 }

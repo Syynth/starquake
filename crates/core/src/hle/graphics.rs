@@ -136,9 +136,20 @@
 //! for each frame the vsync tick latched, in either front and either mode. [`Graphics::frames`]
 //! counts them; it is `summary.json`'s `frames`, and what `--until frames=N` counts
 //! ([`Graphics::with_frame_limit`]). It is gsv's count, not the render backend's
-//! (`PresentFeedback`), so it is the same with the GPU and with the null front, and does not
-//! depend on when the host GPU gets to a frame: a run stops at the same frame in both, and in a
-//! replay, which latches the same frames on the ticks fed back.
+//! (`PresentFeedback`): the GPU never has to finish presenting a frame for it to count.
+//!
+//! **When a frame counts depends on its fence.** gsv latches a present only once its fence has
+//! been reached (render-backend, "Presenting a guest framebuffer", step 1). For a present with no
+//! fence ([`NO_FENCE`](starquake_gsv::vi2::NO_FENCE)), or one whose fence was already reached
+//! when the tick looked, the tick that counts it does not depend on the host: the count, and the
+//! guest time at which `--until frames=N` stops a run, are the same with the GPU and with the
+//! null front, and in a replay, which latches the same frames on the ticks fed back. For a present
+//! whose fence the GPU itself reaches (a syncpoint its work increments), they are not: with the
+//! GPU, the tick that counts the frame is the first after the host GPU completes that work,
+//! which depends on host timing, while the null front completes work at once. Such a run can
+//! count a frame at a later tick with the GPU than with the null front, or than in another live
+//! run, and so stop at `--until frames=N` at a different guest time. The frame tests with the GPU
+//! (`hle/tests/graphics/present.rs`, `machine/tests/graphics/frames.rs`) present with no fence.
 //!
 //! With a limit of `N`, a turn hands the front no more frames once `N` have been handed
 //! ([`frames_to_hand`]): a turn that latches more than the room left hands the first ones and
