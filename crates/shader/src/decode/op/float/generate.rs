@@ -52,7 +52,8 @@ fn any_float_type() -> impl Strategy<Value = FloatType> {
 }
 
 fn any_int_type() -> impl Strategy<Value = IntType> {
-    (0_u8..4, any::<bool>()).prop_map(|(size, signed)| IntType::new(size, signed))
+    (0..=IntType::MAX_SIZE, any::<bool>())
+        .prop_map(|(size, signed)| IntType::from_field(size, signed))
 }
 
 const fn is_uniform(src: AluSrc) -> bool {

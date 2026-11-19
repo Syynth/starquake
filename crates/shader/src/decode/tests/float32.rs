@@ -37,6 +37,11 @@ fn ur(index: u8) -> UniformReg {
     UniformReg::new(index).expect("a uniform register")
 }
 
+/// The integer type of size encoding `size` (0 to 3) and signedness.
+fn int(size: u8, signed: bool) -> IntType {
+    IntType::new(size, signed).expect("a size of 0 to 3")
+}
+
 fn imm(value: f32) -> AluSrc {
     AluSrc::Imm(value.to_bits())
 }
@@ -1176,6 +1181,61 @@ fn layout_bits_are_read_only_where_documented() {
     unknown(word(0x311, &[(84, 1), (60, 1)]), 0x311, 60);
 }
 
+/// NAK writes a 16-bit source's high-half select (bit 60) in every form and opcode
+/// (`encode_alu_base` passes `src_types()[0]`, and `encode_alu_reg`, `encode_alu_cb` and
+/// `encode_alu_ureg` each call `set_swizzle(60..62, ..)` for an `F16` source), but this decoder
+/// reads it only in `MUFU`'s and the narrow `F2I`'s form 1. Each word here is one NAK can emit
+/// (`opt_copy_prop` turns an `F16` source's high half into `SrcSwizzle::Yy`): refused with
+/// exactly bit 60 named, and decoded with bit 60 clear. These are the divergence-table rows
+/// "a 16-bit source's high half" in `op::float`'s module docs.
+#[test]
+fn nak_high_halves_outside_the_decoded_forms_are_refused() {
+    // (opcode, fields besides bit 60): the F16 source is size 1 at bit 84; .f16 is bit 73.
+    let cases: [(u16, &[(u32, u128)]); 17] = [
+        // F2F.F32.F16 of a high half (f2f32 of unpackHalf2x16's .y), forms 1, 5 and 6.
+        (0x304, &[(84, 1), (75, 2)]),
+        (0xb04, &[(84, 1), (75, 2)]),
+        (0xd04, &[(84, 1), (75, 2), (91, 1)]),
+        // The wide F2F.F64.F16.
+        (0x310, &[(84, 1), (75, 3)]),
+        // FRND with an F16 source, both opcodes.
+        (0x307, &[(84, 1)]),
+        (0x307, &[(84, 1), (75, 1)]),
+        (0xb07, &[(84, 1), (75, 1)]),
+        (0xd07, &[(84, 1), (75, 1), (91, 1)]),
+        (0x313, &[(84, 1), (75, 3)]),
+        // MUFU.F16 in forms 5 and 6.
+        (0xb08, &[(73, 1)]),
+        (0xd08, &[(73, 1), (91, 1)]),
+        // The narrow F2I.S32.F16 in forms 5 and 6.
+        (0xb05, &[(84, 1), (75, 2), (72, 1)]),
+        (0xd05, &[(84, 1), (75, 2), (72, 1), (91, 1)]),
+        // The wide F2I.S64.F16 in forms 1, 5 and 6.
+        (0x311, &[(84, 1), (75, 3), (72, 1)]),
+        (0xb11, &[(84, 1), (75, 3), (72, 1)]),
+        (0xd11, &[(84, 1), (75, 3), (72, 1), (91, 1)]),
+        // The wide F2I.S32.F16 (a 64-bit opcode NAK does not emit for these types).
+        (0x311, &[(84, 1), (75, 2), (72, 1)]),
+    ];
+    for (opcode, fields) in cases {
+        let clear = word(u128::from(opcode), fields);
+        assert!(
+            decode(clear).is_ok(),
+            "{opcode:#x} {fields:?} without bit 60"
+        );
+        let mut high = fields.to_vec();
+        high.push((60, 1));
+        assert_eq!(
+            decode(word(u128::from(opcode), &high)),
+            Err(DecodeError::UnknownBit { opcode, bit: 60 }),
+            "{opcode:#x} {fields:?}"
+        );
+    }
+    // The forms that do read it, for contrast: MUFU.F16 and the narrow F2I in form 1.
+    assert!(decode(word(0x308, &[(73, 1), (60, 1)])).is_ok());
+    assert!(decode(word(0x305, &[(84, 1), (75, 2), (60, 1)])).is_ok());
+}
+
 /// The order of checks with the group's faults present at once: a stray bit (step 2) before a
 /// missing fixed bit (step 3) and before an undefined value (step 4); a missing fixed bit before
 /// an undefined value; an undefined value before an unread bit (step 5).
@@ -1339,7 +1399,8 @@ fn fmul_scales_decode_every_value() {
 }
 
 /// Every pair of float sizes decodes in both `F2F` opcodes, each keeping its opcode, and prints
-/// the same text in both (the opcode is not printed).
+/// the same text in both (the opcode is not printed); `FRND` likewise prints each pair, its
+/// equal pairs other than F32 with one type.
 #[test]
 fn conversion_sizes_decode_every_value() {
     let names = [".f8", ".f16", ".f32", ".f64"];
@@ -1359,6 +1420,29 @@ fn conversion_sizes_decode_every_value() {
                 };
                 assert_eq!(op.wide, wide);
                 assert_eq!(assemble(&Instr::new(Op::F2F(op))), Ok(word));
+            }
+        }
+    }
+    // FRND prints both types when they differ, one when they are equal and not 32-bit, and
+    // none for F32 to F32 (NAK's `test_float_ops` pins `.f64` and the bare 32-bit form).
+    assert_eq!(
+        text(word(0x307, &[(16, 1), (32, 2), (75, 1), (84, 1)])),
+        "frnd.f16 r1, r2;"
+    );
+    assert_eq!(
+        text(word(0x307, &[(16, 1), (32, 2), (75, 0), (84, 0)])),
+        "frnd.f8 r1, r2;"
+    );
+    for (dst, dst_name) in (0..).zip(names) {
+        for (src, src_name) in (0..).zip(names) {
+            let expected = match (dst == src, dst_name) {
+                (true, ".f32") => "frnd r1, r2;".to_owned(),
+                (true, name) => format!("frnd{name} r1, r2;"),
+                (false, _) => format!("frnd{dst_name}{src_name} r1, r2;"),
+            };
+            for opcode in [0x307, 0x313] {
+                let word = word(opcode, &[(16, 1), (32, 2), (75, dst), (84, src)]);
+                assert_eq!(text(word), expected, "{opcode:#x} {dst} {src}");
             }
         }
     }
@@ -1488,10 +1572,10 @@ fn float_fields_match_the_references() {
         (fswzadd_op(2), (34, 2)),
         (fswzadd_op(3), (32, 2)),
         // PR #4588: 32 >> (3 + size) parts, so 2, 1, 0 and 0 bits.
-        (i2f_select(IntType::new(0, false)), (60, 2)),
-        (i2f_select(IntType::new(1, true)), (60, 1)),
-        (i2f_select(IntType::new(2, false)), (60, 0)),
-        (i2f_select(IntType::new(3, true)), (60, 0)),
+        (i2f_select(int(0, false)), (60, 2)),
+        (i2f_select(int(1, true)), (60, 1)),
+        (i2f_select(int(2, false)), (60, 0)),
+        (i2f_select(int(3, true)), (60, 0)),
     ];
     for (shipping, (start, width)) in fields {
         assert_eq!((shipping.start, shipping.width), (start, width));
@@ -1571,16 +1655,31 @@ fn float_enumerations_match_the_references() {
     }
     for (size, width) in [(0, 8), (1, 16), (2, 32), (3, 64)] {
         for signed in [false, true] {
-            let ty = IntType::new(size, signed);
+            let ty = IntType::new(size, signed).expect("a size of 0 to 3");
             assert_eq!(ty.size_bits(), u64::from(size));
             assert_eq!(ty.width(), width);
             assert_eq!(ty.is_signed(), signed);
         }
     }
-    assert_eq!(IntType::U32, IntType::new(2, false));
-    assert_eq!(IntType::S32, IntType::new(2, true));
+    // The constructor refuses a size the two-bit field cannot hold, from one past the largest.
+    assert_eq!(IntType::MAX_SIZE, 3);
+    assert_eq!(
+        u128::from(IntType::MAX_SIZE),
+        CVT_SRC_SIZE.mask() >> CVT_SRC_SIZE.start
+    );
+    assert_eq!(
+        u128::from(IntType::MAX_SIZE),
+        CVT_DST_SIZE.mask() >> CVT_DST_SIZE.start
+    );
+    assert!(IntType::new(IntType::MAX_SIZE, false).is_some());
+    for signed in [false, true] {
+        assert_eq!(IntType::new(IntType::MAX_SIZE + 1, signed), None);
+        assert_eq!(IntType::new(u8::MAX, signed), None);
+    }
+    assert_eq!(IntType::U32, int(2, false));
+    assert_eq!(IntType::S32, int(2, true));
     assert_eq!(IntType::S32.to_string(), ".s32");
-    assert_eq!(IntType::new(0, false).to_string(), ".u8");
+    assert_eq!(int(0, false).to_string(), ".u8");
     assert_eq!(FMulScale::None.bits(), 4);
     assert_eq!(FMulScale::D2.exponent(), -1);
     assert_eq!(FMulScale::M8.exponent(), 3);
@@ -1721,8 +1820,8 @@ fn unencodable_conversions_are_refused() {
             wide: false,
         })))
     };
-    let byte_type = IntType::new(0, false);
-    let half_type = IntType::new(1, false);
+    let byte_type = int(0, false);
+    let half_type = int(1, false);
     assert!(i2f(AluSrc::reg(r(2)), byte_type, 3).is_ok());
     assert_eq!(
         i2f(AluSrc::reg(r(2)), byte_type, 4),
@@ -1878,7 +1977,7 @@ fn unconfirmed_text_of_the_float_conversions() {
             Op::F2I(OpF2I {
                 dst: r(0),
                 src: AluSrc::reg(r(1)),
-                dst_type: IntType::new(1, true),
+                dst_type: int(1, true),
                 src_type: FloatType::F16,
                 rnd: RoundMode::PosInf,
                 ftz: true,
@@ -1893,7 +1992,7 @@ fn unconfirmed_text_of_the_float_conversions() {
                 dst: r(0),
                 src: AluSrc::reg(r(1)),
                 dst_type: FloatType::F16,
-                src_type: IntType::new(0, true),
+                src_type: int(0, true),
                 rnd: RoundMode::NearestEven,
                 select: 2,
                 wide: false,
