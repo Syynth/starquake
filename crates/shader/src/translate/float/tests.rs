@@ -810,6 +810,83 @@ fn a_refusal_names_the_instruction() {
     );
 }
 
+/// Golden IR for the emulated conversions and the swizzled add.
+#[test]
+fn golden_emulated_conversions() {
+    let f2f_op = OpF2F {
+        ftz: true,
+        ..f2f(r(0), reg(1), RoundMode::Zero)
+    };
+    let f2i_op = OpF2I {
+        ftz: true,
+        ..f2i(r(2), reg(3), int(1, true), RoundMode::NegInf)
+    };
+    let swizzle = fswzadd(r(4), r(5), r(6), FSWZADD_OPERATIONS[0].0);
+    for (op, golden) in [
+        (
+            Op::F2F(f2f_op),
+            "block0:\n\
+         \x20   %0: u32 = GetRegister r1\n\
+         \x20   %1: f32 = BitCastF32U32 %0\n\
+         \x20   %2: f32 = FPAbs32 %1\n\
+         \x20   %3: u1 = FPOrdLessThan32 %2, f32 0x800000 {fmz_none}\n\
+         \x20   %4: u32 = BitCastU32F32 %1\n\
+         \x20   %5: u32 = BitwiseAnd32 %4, u32 0x80000000\n\
+         \x20   %6: f32 = BitCastF32U32 %5\n\
+         \x20   %7: f32 = SelectF32 %3, %6, %1\n\
+         \x20   %8: f16 = ConvertF16F32 %7 {rz, ftz}\n\
+         \x20   %9: f16 = ConvertF16F32 f32 0x0\n\
+         \x20   %10: f16x2 = CompositeConstructF16x2 %8, %9\n\
+         \x20   %11: u32 = PackFloat2x16 %10\n\
+         \x20   %12: f32 = ConvertF32F16 %8 {rn, fmz_none}\n\
+         \x20   %13: u32 = ISub32 %11, u32 0x1\n\
+         \x20   %14: f32 = FPAbs32 %12\n\
+         \x20   %15: f32 = FPAbs32 %7\n\
+         \x20   %16: u1 = FPOrdGreaterThan32 %14, %15 {fmz_none}\n\
+         \x20   %17: u32 = SelectU32 %16, %13, %11\n\
+         \x20   %18: u32 = BitwiseAnd32 %17, u32 0x7c00\n\
+         \x20   %19: u1 = IEqual %18, u32 0x0\n\
+         \x20   %20: u32 = BitwiseAnd32 %17, u32 0x8000\n\
+         \x20   %21: u32 = SelectU32 %19, %20, %17\n\
+         \x20   %22 = SetRegister r0, %21\n\
+         \x20   return\n",
+        ),
+        (
+            Op::F2I(f2i_op),
+            "block0:\n\
+         \x20   %0: u32 = GetRegister r3\n\
+         \x20   %1: f32 = BitCastF32U32 %0\n\
+         \x20   %2: f32 = FPAbs32 %1\n\
+         \x20   %3: u1 = FPOrdLessThan32 %2, f32 0x800000 {fmz_none}\n\
+         \x20   %4: u32 = BitCastU32F32 %1\n\
+         \x20   %5: u32 = BitwiseAnd32 %4, u32 0x80000000\n\
+         \x20   %6: f32 = BitCastF32U32 %5\n\
+         \x20   %7: f32 = SelectF32 %3, %6, %1\n\
+         \x20   %8: f32 = FPFloor32 %7 {no_contraction, ftz}\n\
+         \x20   %9: f32 = FPClamp32 %8, f32 0xc7000000, f32 0x46fffe00\n\
+         \x20   %10: u32 = ConvertS32F32 %9\n\
+         \x20   %11: u1 = FPIsNan32 %1\n\
+         \x20   %12: u32 = SelectU32 %11, u32 0x0, %10\n\
+         \x20   %13 = SetRegister r2, %12\n\
+         \x20   return\n",
+        ),
+        (
+            Op::FSwzAdd(swizzle),
+            "block0:\n\
+         \x20   %0: u32 = GetRegister r5\n\
+         \x20   %1: f32 = BitCastF32U32 %0\n\
+         \x20   %2: u32 = GetRegister r6\n\
+         \x20   %3: f32 = BitCastF32U32 %2\n\
+         \x20   %4: f32 = FSwizzleAdd %1, %3, u32 0xa5 {rn, fmz_none}\n\
+         \x20   %5: u32 = BitCastU32F32 %4\n\
+         \x20   %6 = SetRegister r4, %5\n\
+         \x20   return\n",
+        ),
+    ] {
+        assert_eq!(translated(&[Instr::new(op)]).to_string(), golden, "{op}");
+    }
+}
+
 /// Every refusal is decided before anything is appended: the function is unchanged, and the
 /// builder stays in its block. One case per refusal reachable from a decoded operation.
 #[test]

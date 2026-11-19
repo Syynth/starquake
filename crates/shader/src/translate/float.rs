@@ -1299,10 +1299,9 @@ impl Emit<'_, '_> {
     ) -> Result<Operand, FloatError> {
         let raw = control(false, FpRounding::DontCare, FmzMode::None);
         let wide = self.emit_fp(Opcode::ConvertF32F16, &[half], NEAREST)?;
-        let up = self.emit(Opcode::IAdd32, &[bits, imm32(1)])?;
-        let down = self.emit(Opcode::ISub32, &[bits, imm32(1)])?;
         let (wrong, step) = match mode {
             RoundMode::Zero => {
+                let down = self.emit(Opcode::ISub32, &[bits, imm32(1)])?;
                 let wide_abs = self.emit(Opcode::FPAbs32, &[wide])?;
                 let input_abs = self.emit(Opcode::FPAbs32, &[input])?;
                 let wrong =
@@ -1310,6 +1309,8 @@ impl Emit<'_, '_> {
                 (wrong, down)
             }
             RoundMode::NegInf | RoundMode::PosInf => {
+                let up = self.emit(Opcode::IAdd32, &[bits, imm32(1)])?;
+                let down = self.emit(Opcode::ISub32, &[bits, imm32(1)])?;
                 let (compare, positive_step, negative_step) = if mode == RoundMode::NegInf {
                     (Opcode::FPOrdGreaterThan32, down, up)
                 } else {
