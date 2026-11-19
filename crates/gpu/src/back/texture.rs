@@ -787,6 +787,43 @@ impl TextureCache {
         Ok(RenderTarget { texture, view })
     }
 
+    /// Layer `layer` of the render target `info` describes, as [`TextureCache::render_target`]
+    /// does for every layer (uploaded first if it must be, marked GPU-modified): a view of its
+    /// first level and that one layer, for a clear of one layer (`back::draw::clear`). An image
+    /// of one layer, or a 3D image, gets [`TextureCache::render_target`]'s view, so a clear and
+    /// the draws share it.
+    ///
+    /// On an error nothing changes ([`TextureError`] gives the order of checks); a `layer` at or
+    /// past the image's layers is the backend's refusal of the view
+    /// ([`TextureError::Render`]).
+    pub fn render_target_layer<M: GpuMemory + ?Sized>(
+        &mut self,
+        mem: &M,
+        info: &ImageInfo,
+        layer: u32,
+        list: &mut CommandList,
+    ) -> Result<RenderTarget, TextureError> {
+        if view_layers(info) <= 1 && layer == 0 {
+            return self.render_target(mem, info, list);
+        }
+        let dimension = match info.dim {
+            ImageDim::D1 => ViewDimension::D1,
+            ImageDim::D2 | ImageDim::D3 => ViewDimension::D2,
+        };
+        let view = ViewDesc {
+            format: info.format,
+            dimension,
+            base_mip: 0,
+            mip_count: 1,
+            base_layer: layer,
+            layer_count: 1,
+            swizzle: Swizzle::IDENTITY,
+        };
+        let (texture, view) = self.use_image(mem, info, view, true, list)?;
+        self.gpu_written(texture);
+        Ok(RenderTarget { texture, view })
+    }
+
     /// Finds or makes the image, uploads it if due, makes the view, and records the use. Returns
     /// the texture and view.
     fn use_image<M: GpuMemory + ?Sized>(

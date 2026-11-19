@@ -2,24 +2,30 @@
 //!
 //! Ported by behaviour from PR #4588's native frontend
 //! (`eden-pr4588/src/shader_recompiler/frontend/ampere/` @ e5fb3b97, GPL-3.0-or-later):
-//! `ops_move.cpp` (`MOV`), `ops_alu.cpp` (`FFMA`) and `ops_attr.cpp` (`EXIT`) here, and one
-//! module per instruction group beside this one (spec, "Instruction translation"), joined by
-//! `GROUPS`: `attribute` (slice 12g: `ALD`, `AST`, `IPA`, `AL2P`, `S2R`, `CS2R`, `PIXLD`, and
-//! the deferred `OUT`, `ISBERD` and `ISBEWR`). Each of the PR's `Require` checks on these forms
-//! is kept with its constant and turns into an [`Unsupported`] rejection naming the same thing,
-//! except the colour-register bound of `EXIT`, which cannot fail here (see `Translator::exit`).
+//! `ops_move.cpp` (`MOV`) and `ops_attr.cpp` (`EXIT`) here, and one module per instruction
+//! group beside this one (spec, "Instruction translation"): `attribute` (slice 12g: `ALD`,
+//! `AST`, `IPA`, `AL2P`, `S2R`, `CS2R`, `PIXLD`, and the deferred `OUT`, `ISBERD` and
+//! `ISBEWR`), joined by `GROUPS`, and [`float`] (slice 12b: the 32-bit float and conversion
+//! group, slice 1's `FFMA` included), whose refusals are [`Unsupported::Float`]. Each of the
+//! PR's `Require` checks on these forms is kept with its constant and turns into an
+//! [`Unsupported`] rejection naming the same thing, except the colour-register bound of `EXIT`,
+//! which cannot fail here (see `Translator::exit`).
 //!
-//! **Guards.** In this order: an instruction under `@!PT` never runs and translates to nothing,
-//! as PR #4588's `Visitor::Run` returns when `guard.Never()` (`visitor.cpp`; `flow.h` defines
-//! it as `index == 7 && negated`); one under `PT` is translated as is; a guarded `EXIT` is
-//! rejected ([`Unsupported::Guard`], starquake's; see the list below). Any other guard is read
+//! **Guards.** An instruction of the float group ([`float::in_group`]) is handed to [`float`]
+//! before its guard is read, and takes its own guard: a guarded one becomes a conditional
+//! block, as the spec says, and one under `@!PT` is checked and put in a block that never runs
+//! (that module's "Guards" and its divergence table). For every other instruction, in this
+//! order: an instruction under `@!PT` never runs and translates to nothing, as PR #4588's
+//! `Visitor::Run` returns when `guard.Never()` (`visitor.cpp`; `flow.h` defines it as
+//! `index == 7 && negated`); one under `PT` is translated as is; a guarded `EXIT` is rejected
+//! ([`Unsupported::Guard`], starquake's; see the list below). Any other guard is read
 //! once, before the instruction's own IR, as `Visitor::Run` sets `guard_select` before it
 //! dispatches, and the instruction is translated by its class in flow analysis's table
 //! (`flow`'s `classify`, the PR's `classify.h`, `Classify`), looked up by the 12-bit opcode the
 //! decoder reads the operation from (`opcode`):
 //!
-//! - a **pure** instruction (`OpInfo::pure`: of the ones translated here `MOV`, `FFMA`, `ALD`,
-//!   `IPA`, `S2R`, `S2UR` and `CS2R`) keeps its guard as a select: every register it writes
+//! - a **pure** instruction (`OpInfo::pure`: of the ones translated here `MOV`, `ALD`, `IPA`,
+//!   `S2R`, `S2UR` and `CS2R`) keeps its guard as a select: every register it writes
 //!   gets `SelectU32` of the guard, the new value and the register's old value, and a uniform
 //!   register the same with its old uniform value, as the PR's `guard_select` does
 //!   (`visitor.cpp`, `Visitor::X` and `Visitor::UR`: `Select(*guard_select, value,
@@ -49,7 +55,8 @@
 //! predicate becomes a conditional block". A guarded pure instruction becomes a select instead,
 //! as in the PR and as `flow`'s block contract and [`control`]'s `VOTEU` already do; the
 //! registers come out the same, since a block that does not run leaves each register at its old
-//! value, the select's other side. Pinned by `tests::guarded_pure_instructions_become_selects`,
+//! value, the select's other side. The float group follows the spec sentence instead (see
+//! "Guards" above). Pinned by `tests::guarded_pure_instructions_become_selects`,
 //! `tests::guarded_side_effects_become_conditional_blocks`,
 //! `tests::a_guard_on_each_pure_uniform_op_reads_a_uniform_predicate`,
 //! `tests::guards_classify_by_the_flow_table`, `tests::a_guarded_exit_is_rejected` and
@@ -68,7 +75,7 @@
 //!   (the PR's control-flow builder resolves both, `ops_attr.cpp`: "extra exit condition");
 //! - the program must end with its first `EXIT`: no `EXIT` and instructions after it are
 //!   rejected (the extent of a program is the capture's job, slice 3);
-//! - `MOV` and `FFMA` take only register and immediate sources: a uniform-register or
+//! - `MOV` takes only register and immediate sources: a uniform-register or
 //!   constant-buffer source, which the decoder reads since slice 4, is rejected (the PR reads
 //!   both, `visitor.cpp`, `Visitor::Value`; constant buffers and uniform registers come with
 //!   the passes of slices 12 and 13);
@@ -80,6 +87,7 @@
 
 mod attribute;
 pub mod control;
+pub mod float;
 pub mod integer;
 #[cfg(test)]
 mod tests;
@@ -89,14 +97,11 @@ use std::fmt::{self, Display, Formatter};
 use thiserror::Error;
 
 use crate::decode::{
-    AluForm, AluSrc, EXIT_OPCODE, FFMA_OPCODE, Gpr, Instr, MOV_OPCODE, MovSrc, Op, OpExit, OpFFma,
-    OpMov, PredSrc, RoundMode, SpecialReg, UniformPred, UniformReg,
+    AluForm, EXIT_OPCODE, Gpr, Instr, MOV_OPCODE, MovSrc, Op, OpExit, OpMov, PredSrc, SpecialReg,
+    UniformPred, UniformReg,
 };
 use crate::flow::{OpInfo, classify};
-use crate::ir::{
-    BlockId, BuildError, Builder, Flags, FmzMode, FpControl, FpRounding, Function, Imm, Opcode,
-    Operand, Terminator, Value,
-};
+use crate::ir::{BlockId, BuildError, Builder, Function, Imm, Opcode, Operand, Terminator, Value};
 use crate::sph::PixelIo;
 
 pub use attribute::{AttributeRejection, Deferral};
@@ -174,15 +179,15 @@ pub enum Unsupported {
     /// The stage is not handled yet.
     #[error("{0} programs are not supported yet")]
     Stage(GuestStage),
-    /// An instruction no translator handles yet: in [`translate`], one that is neither `MOV`,
-    /// `FFMA` and `EXIT` nor taken by a group of `GROUPS`; in [`control::translate_control`],
+    /// An instruction no translator handles yet: in [`translate`], one that is neither `MOV`
+    /// and `EXIT`, nor in the [`float`] group, nor taken by a group of `GROUPS`; in [`control::translate_control`],
     /// `BMOV`, `NANOSLEEP`, `JMX` and `BPT`.
     #[error("{0}")]
     Instruction(&'static str),
     /// A control or warp form [`control::translate_control`] does not handle.
     #[error("{0}")]
     Control(#[from] control::ControlUnsupported),
-    /// A uniform-register or constant-buffer source of `MOV` or `FFMA` (PR #4588 reads both:
+    /// A uniform-register or constant-buffer source of `MOV` (PR #4588 reads both:
     /// `visitor.cpp`, `Visitor::Value`).
     #[error("a uniform-register or constant-buffer source")]
     Source,
@@ -194,9 +199,6 @@ pub enum Unsupported {
     /// A `MOV` lane mask other than `0xf` (`ops_move.cpp`: "native MOV lane mask").
     #[error("a mov with a partial lane mask")]
     MovLaneMask,
-    /// `FFMA`'s multiply-by-zero mode (`ops_alu.cpp`: "native FFMA multiply-zero mode").
-    #[error("ffma's multiply-by-zero mode")]
-    FfmaMultiplyZero,
     /// An attribute access with an offset register (`ops_misc.cpp`: "native indexed attribute
     /// access").
     #[error("an indexed attribute access")]
@@ -238,6 +240,9 @@ pub enum Unsupported {
     /// A special register other than the ones handled.
     #[error("special register {0}")]
     SpecialRegister(SpecialReg),
+    /// A form of the float and conversion group that is not translated ([`float`]).
+    #[error("{0}")]
+    Float(float::FloatUnsupported),
 }
 
 /// Why a program was not translated.
@@ -281,8 +286,9 @@ pub const ATTRIBUTE_SPACE_END: u32 = 0x400;
 pub const REGISTER_LIMIT: u32 = 255;
 
 /// Translates a straight-line program that ends with its first `EXIT`, into blocks that end in
-/// a return: one block, and two more for each guarded instruction that is not pure (see the
-/// module docs, "Guards").
+/// a return: one block, and two more (a then block and an after block) for each guarded
+/// instruction that is not pure and for each instruction of the [`float`] group under a guard
+/// other than `PT`, `@!PT` included (see the module docs, "Guards").
 /// Without the program's header, an `IPA` of a generic attribute is rejected
 /// ([`AttributeRejection::IpaNoHeader`]); [`translate_with_header`] takes it.
 pub fn translate(stage: Stage, program: &[Instr]) -> Result<Function, TranslateError> {
@@ -322,6 +328,15 @@ fn translate_inner(
             instr: *instr,
             what,
         };
+        if float::in_group(&instr.op) {
+            match float::translate_instr(&mut t.b, *instr, false) {
+                Ok(()) => continue,
+                Err(float::FloatError::Unsupported(what)) => {
+                    return Err(fail(Unsupported::Float(what)));
+                }
+                Err(float::FloatError::Build(error)) => return Err(error.into()),
+            }
+        }
         let after = match guarding(*instr) {
             Guarding::Never => continue,
             Guarding::Always => None,
@@ -336,7 +351,6 @@ fn translate_inner(
         };
         let done = match instr.op {
             Op::Mov(op) => t.mov(op).map(|()| false),
-            Op::FFma(op) => t.ffma(op).map(|()| false),
             Op::Exit(op) => t.exit(op).map(|()| true),
             other => t.group(other).map(|()| false),
         };
@@ -393,16 +407,6 @@ fn register_run(first: Gpr, count: u32) -> Option<u32> {
     (end <= REGISTER_LIMIT).then_some(end)
 }
 
-/// PR #4588's `RoundingOf` (`ops_alu.cpp`): the 2-bit rounding field as an IR rounding mode.
-const fn rounding_of(mode: RoundMode) -> FpRounding {
-    match mode {
-        RoundMode::NearestEven => FpRounding::Rn,
-        RoundMode::NegInf => FpRounding::Rm,
-        RoundMode::PosInf => FpRounding::Rp,
-        RoundMode::Zero => FpRounding::Rz,
-    }
-}
-
 /// A 32-bit immediate operand.
 const fn imm32(bits: u32) -> Operand {
     Operand::Imm(Imm::U32(bits))
@@ -455,15 +459,15 @@ fn guarding(instr: Instr) -> Guarding {
     }
 }
 
-/// The 12-bit opcode the decoder reads `op` from, for the operations [`translate`] takes:
-/// `MOV`, `FFMA` and `EXIT` here, the attribute group's from its module; `None` for any other.
-/// `MOV` and `FFMA` are given in their register form, since [`classify`] gives every operand
-/// form of the two the same class (its rows for them match the base operation; pinned by
+/// The 12-bit opcode the decoder reads `op` from, for the operations [`translate`] reads the
+/// guard of: `MOV` and `EXIT` here, the attribute group's from its module; `None` for any other
+/// (the [`float`] group, slice 1's `FFMA` included, takes its own guard and never gets here).
+/// `MOV` is given in its register form, since [`classify`] gives every operand form of it the
+/// same class (its rows for it match the base operation; pinned by
 /// `tests::guards_classify_by_the_flow_table`).
 fn opcode(op: Op) -> Option<u16> {
     match op {
         Op::Mov(_) => Some(AluForm::Reg.opcode(MOV_OPCODE)),
-        Op::FFma(_) => Some(AluForm::Reg.opcode(FFMA_OPCODE)),
         Op::Exit(_) => Some(EXIT_OPCODE),
         other => attribute::opcode(other),
     }
@@ -614,23 +618,6 @@ impl Translator<'_> {
         self.set(reg, bits.into())
     }
 
-    fn float_src(&mut self, src: AluSrc) -> Result<Value, Failure> {
-        match src {
-            AluSrc::Imm(bits) => self.op(Opcode::BitCastF32U32, &[imm32(bits)]),
-            AluSrc::Reg { reg, abs, neg } => {
-                let mut value = self.get_f32(reg)?;
-                if abs {
-                    value = self.op(Opcode::FPAbs32, &[value.into()])?;
-                }
-                if neg {
-                    value = self.op(Opcode::FPNeg32, &[value.into()])?;
-                }
-                Ok(value)
-            }
-            AluSrc::UniformReg { .. } | AluSrc::CBuf { .. } => Err(Unsupported::Source.into()),
-        }
-    }
-
     fn mov(&mut self, op: OpMov) -> Result<(), Failure> {
         require(op.quad_lanes == OpMov::ALL_LANES, Unsupported::MovLaneMask)?;
         let value = match op.src {
@@ -639,30 +626,6 @@ impl Translator<'_> {
             MovSrc::UniformReg(_) | MovSrc::CBuf(_) => return Err(Unsupported::Source.into()),
         };
         self.set(op.dst, value)
-    }
-
-    /// `FFMA` with PR #4588's controls (`ops_alu.cpp`, `FFMA`): no contraction, the rounding
-    /// field through `RoundingOf`, and `FTZ` or no flushing.
-    fn ffma(&mut self, op: OpFFma) -> Result<(), Failure> {
-        require(!op.dnz, Unsupported::FfmaMultiplyZero)?;
-        let [a, b, c] = op.srcs;
-        let a = self.float_src(a)?;
-        let b = self.float_src(b)?;
-        let c = self.float_src(c)?;
-        let control = FpControl {
-            no_contraction: true,
-            rounding: rounding_of(op.rnd),
-            fmz_mode: if op.ftz { FmzMode::Ftz } else { FmzMode::None },
-        };
-        let mut value = self.b.op_with(
-            Opcode::FPFma32,
-            &[a.into(), b.into(), c.into()],
-            Flags::Fp(control),
-        )?;
-        if op.saturate {
-            value = self.op(Opcode::FPSaturate32, &[value.into()])?;
-        }
-        self.set_f32(op.dst, value)
     }
 
     /// `EXIT`: for a pixel program, the registers hold the colour outputs, four per target in

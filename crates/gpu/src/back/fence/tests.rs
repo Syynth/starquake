@@ -2,6 +2,7 @@
 //! so ([`LateBackend`]), a fake GPU memory over flat guest memory, and recording doubles for the
 //! completion queue and the front's wake-up. Every wait is bounded.
 
+mod increment;
 mod production;
 mod seams;
 mod waiters;
@@ -557,7 +558,10 @@ fn nothing_is_visible_before_its_list_completes() {
     let release = r.action(four(SEM, 0xaabb_ccdd));
     assert_eq!(r.fences.attach(release), Ok(Attached::Open));
     assert_eq!(
-        r.fences.attach(FencedAction::Increment(watched)),
+        r.fences.attach(FencedAction::Increment {
+            id: watched,
+            count: 1
+        }),
         Ok(Attached::Open)
     );
     let marker = FencedAction::Marker {
@@ -842,7 +846,10 @@ fn actions_nobody_waits_on_leave_the_list_open() {
     for action in [
         r.action(four(SEM, 1)),
         r.action(four(SEM2, 1)),
-        FencedAction::Increment(syncpoint(7)),
+        FencedAction::Increment {
+            id: syncpoint(7),
+            count: 1,
+        },
     ] {
         assert_eq!(r.fences.attach(action), Ok(Attached::Open));
     }
@@ -1346,7 +1353,9 @@ fn a_watched_increment_is_pushed_and_an_unwatched_one_is_not() {
     r.syncpoints.watch(watched);
     r.fences.record(command(1)).unwrap();
     for id in [watched, unwatched] {
-        r.fences.attach(FencedAction::Increment(id)).unwrap();
+        r.fences
+            .attach(FencedAction::Increment { id, count: 1 })
+            .unwrap();
     }
     let fence = r.fences.close(CloseReason::Present).unwrap().unwrap();
     assert_eq!(

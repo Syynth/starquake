@@ -198,7 +198,8 @@ pub struct FrontCounters {
     pub words: u64,
     /// Submissions finished (every entry read, every increment pushed).
     pub submissions: u64,
-    /// Syncpoint increments pushed for submissions.
+    /// Syncpoint increments pushed for submissions, counted one per increment (a submission's
+    /// increments go out as one `Syncpoint` entry carrying their count).
     pub increments: u64,
     /// Acquires that parked a channel (met neither at the first read nor at the second).
     pub parks: u64,

@@ -109,8 +109,14 @@
 //! - A release whose memory access fails ([`GpuFault`]) writes nothing that the memory refused,
 //!   latches nothing, and is logged at warning level and listed in [`Report::failed`]; the
 //!   actions after it are still performed.
-//! - **An increment** calls [`Syncpoints::increment`], which pushes
-//!   [`GpuCompletion::SyncpointChanged`] when the syncpoint is watched.
+//! - **An increment** of count `n` calls [`Syncpoints::increment_by`] once: one wrapping
+//!   addition of `n` to the counter, as `n` of Eden's increments would leave it (the
+//!   `std::atomic<u32>` `fetch_add(1)` of `SyncpointManager::Increment` in
+//!   `eden/src/video_core/host1x/syncpoint_manager.cpp` @ cf654052 wraps past `u32::MAX`), and
+//!   at most one [`GpuCompletion::SyncpointChanged`], with the final value, when the syncpoint
+//!   is watched; a count of 0 changes and pushes nothing. The time it takes does not grow with
+//!   the count (`increment::u32_max_increments_take_one_addition`). [`Report::incremented`]
+//!   counts the increments. See "Waiters and a run of increments" below.
 //! - **A marker** applies its [`OrderedUpdate`], if it has one: [`GpuVm::apply`], then
 //!   [`GpuCompletion::GpuOrdered`] with its ticket if it has one; its token goes in
 //!   [`Report::markers`] for the front. [`GpuVm::apply`] also frees a destroyed sparse region's
@@ -160,6 +166,35 @@
 //! counted. A wake for a completion that an earlier [`Fences::complete`] already performed is
 //! left on the ring, and makes the next wait return an empty [`Woke::Completed`] at once (a
 //! spurious wake costs one look; pinned by `a_wake_for_work_already_performed_costs_one_look`).
+//!
+//! # Waiters and a run of increments
+//!
+//! Eden-NX2 performs a submission's increments one at a time
+//! (`BuildIncrementCountCommandList` in
+//! `eden-nx2/src/core/hle/service/nvdrv/devices/nvhost_gpu.cpp` @ 50fa86bb pushes one
+//! `SyncpointOperation` per increment; each reaches `FenceManager::SignalSyncPoint` in
+//! `eden-nx2/src/video_core/fence_manager.h`, which calls `SyncpointManager::IncrementGuest`
+//! and, after its fence, `IncrementHost`). `SyncpointManager::Increment`
+//! (`eden-nx2/src/video_core/host1x/syncpoint_manager.cpp` @ 50fa86bb, the same as mainline's)
+//! runs, after each `+ 1`, the registered actions in ascending `expected_value` order and stops
+//! at the first whose `expected_value` is above the new value: a waiter between the old and the
+//! final value is woken as the counter passes it. Here one action adds the whole count, so every
+//! waiter looks at the final value only:
+//!
+//! - gsv's waiters see it through the one `SyncpointChanged` push, and the front's fence waits
+//!   by reading the counter ([`Syncpoints::reached`]) after the report, both with the 32-bit
+//!   wrapping comparison ([`crate::syncpoint::wait_satisfied`], mode 0).
+//! - A waiter between, at threshold `t` with `old < t <= old + n` (as 32-bit values counted on
+//!   from `old`), is met by the final value when `old + n - t`, which is below `n`, is below
+//!   2^31 (the comparison's sign bit). So for every count up to 2^31 each waiter the run passes
+//!   is met, as in Eden.
+//! - **A divergence:** for a count above 2^31, a threshold more than 2^31 - 1 behind the final
+//!   value is not met, where Eden would have woken it on the way. Pinned by
+//!   `increment::a_run_meets_the_thresholds_it_passes_up_to_half_the_range`, at the edge on both
+//!   sides. It needs a guest to ask for more than 2^31 increments in one submission. One entry
+//!   per increment, as before the count, was not Eden's walk either: the front read the counter
+//!   after each batch of increments the back performed, and gsv's completion queue folds the
+//!   queued pushes of one id into the newest.
 //!
 //! # Divergences from Eden-NX2
 //!
@@ -299,8 +334,13 @@ pub enum FencedAction {
         /// What to write.
         release: Release,
     },
-    /// A syncpoint increment.
-    Increment(SyncpointId),
+    /// `count` increments of a syncpoint, added at once (module docs, "Completion").
+    Increment {
+        /// The syncpoint.
+        id: SyncpointId,
+        /// How many increments; 0 changes nothing.
+        count: u32,
+    },
     /// A marker: everything before it has been performed when it is.
     Marker {
         /// The token reported to the front.
@@ -361,7 +401,7 @@ pub struct ReleaseFailure {
 pub struct Report {
     /// Releases and reductions written.
     pub released: u64,
-    /// Syncpoint increments made.
+    /// Syncpoint increments made, one per increment (an action of count `n` adds `n`).
     pub incremented: u64,
     /// Whether a release latched a waiter.
     pub latched: bool,
@@ -759,7 +799,7 @@ impl Fences {
             FencedAction::Release {
                 space: s, release, ..
             } => *s == space && overlaps(release, &range),
-            FencedAction::Increment(_) | FencedAction::Marker { .. } => false,
+            FencedAction::Increment { .. } | FencedAction::Marker { .. } => false,
         };
         if self.open_actions.iter().any(writes) {
             self.close(CloseReason::CatchUp)?;
@@ -847,7 +887,7 @@ impl Fences {
             let waited_on = match &action {
                 FencedAction::Release { space, release, .. } => release_words(release)
                     .any(|(address, _)| self.env.waiters.has_waiter(*space, address)),
-                FencedAction::Increment(_) | FencedAction::Marker { .. } => false,
+                FencedAction::Increment { .. } | FencedAction::Marker { .. } => false,
             };
             self.open_actions.push(action);
             if waited_on {
@@ -1006,9 +1046,9 @@ impl Fences {
                     report.failed.push(failure);
                 }
             },
-            FencedAction::Increment(id) => {
-                self.env.syncpoints.increment(id);
-                report.incremented = report.incremented.saturating_add(1);
+            FencedAction::Increment { id, count } => {
+                self.env.syncpoints.increment_by(id, count);
+                report.incremented = report.incremented.saturating_add(u64::from(count));
             }
             FencedAction::Marker { token, ordered } => {
                 if let Some(ordered) = ordered {

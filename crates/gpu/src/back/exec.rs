@@ -53,9 +53,14 @@
 //! Each word reaches its engine one at a time, after the mirror stored it, since the engines
 //! read their registers from the mirror (an inline upload reads `LOAD_INLINE_DATA` there):
 //!
-//! - **3D (`C797`)**: [`Draws::method`] (draw triggers, conditional render), the inline upload
+//! - **3D (`C797`)**: [`Draws::method`] (draw triggers, `CLEAR_SURFACE` clears, conditional
+//!   render), the inline upload
 //!   ([`INLINE_C797`]), and each run of `LOAD_ROOT_TABLE` words to [`Draws::load_root_table`]
-//!   as a whole.
+//!   as a whole. Each `Write` or `Run` of `LOAD_CONSTANT_BUFFER(i)` words, once every word has
+//!   gone the way above, goes whole to the constant-buffer upload
+//!   ([`ConstantBufferLoad::method`], slice G25): written to guest memory, its ranges added to
+//!   the pending inline writes, so they reach the caches before the next draw, dispatch or
+//!   copy. A refused load is [`ExecError::ConstantBuffer`], with the words still in the mirror.
 //! - **Compute (`C7C0`)**: the inline upload ([`INLINE_C7C0`]) and [`QmdTable::compute_method`];
 //!   each dispatch it decides on becomes a `Command::Dispatch` (`compute`).
 //! - **DMA (`C7B5`)**: [`dma_method`]. **2D (`902D`)**: [`blit_method`]. **Inline (`A140`)**:
@@ -69,12 +74,13 @@
 //! ([`ShaderCache`]'s `invalidate`). Then, before a draw or dispatch, the merged inline writes
 //! ([`PendingWrites::flush`]) reach the caches (a DMA or 2D launch flushes them itself). A
 //! word "starts a draw" here when its method is one of the draw path's
-//! ([`crate::back::draw::call::DRAW_METHODS`], [`crate::back::draw::call::UNHANDLED_METHODS`]);
+//! ([`crate::back::draw::call::DRAW_METHODS`], [`crate::back::draw::call::UNHANDLED_METHODS`],
+//! and `CLEAR_SURFACE`, [`crate::back::draw::clear::CLEAR_METHODS`]);
 //! a dispatch, when it is the last inline QMD word or `SEND_SIGNALING_PCAS2_B`; a copy, when it
 //! is a `LAUNCH_DMA` or `PIXELS_FROM_MEMORY_SRC_Y0_INT`.
 //!
 //! Writes the back makes to guest memory go to every cache of the address space and the shader
-//! cache: a copy's destination and the inline writes (through [`CopySink::invalidate`](crate::back::copy::CopySink::invalidate)), the
+//! cache: a copy's destination, the inline writes and the constant-buffer loads (through [`CopySink::invalidate`](crate::back::copy::CopySink::invalidate)), the
 //! inline QMD's 256 bytes (the wiring note on issue #330: "invalidate the inline-QMD range in the
 //! back's caches"), and a write-back's ranges. An applied ordered update drops its range from
 //! that space's caches ([`BufferCache::apply_update`], [`TextureCache::apply_update`]) and goes
@@ -147,7 +153,9 @@
 //! path that did not make the last draw is told its targets are gone the same way
 //! (`tests::two_channels_drawing_into_one_list_each_set_their_targets`), and so is one drawing
 //! after a dispatch or present
-//! (`tests::a_dispatch_between_two_draws_makes_the_second_set_its_targets`).
+//! (`tests::a_dispatch_between_two_draws_makes_the_second_set_its_targets`), or after another
+//! engine's clear that drew (`back::draw::clear`, "The draw-based clear";
+//! `tests::clear::a_masked_clear_on_another_channel_makes_the_next_draw_set_its_targets`).
 //!
 //! # Presents
 //!
@@ -186,8 +194,6 @@
 //!
 //! # Not handled here
 //!
-//! - Writing a `LOAD_CONSTANT_BUFFER` run to guest memory (Eden's `ProcessCBMultiData`): no
-//!   slice of the spec's table owns it.
 //! - The compute class's texture and sampler pools: a dispatch whose shader binds a texture, a
 //!   sampler or the driver constants is refused (`compute`).
 //! - Indirect, inline-index, zero-index and auto draws (the draw path skips and counts them).
@@ -210,14 +216,16 @@ use starquake_render::{Backend, CommandList, FenceValue};
 use thiserror::Error;
 
 use crate::back::buffer::{BufferCache, InvalidationSink};
+use crate::back::cb_load::{ConstantBufferError, ConstantBufferLoad, is_constant_buffer_load};
 use crate::back::copy::{
     CopyError, INLINE_A140, INLINE_C7C0, INLINE_C797, InlineUpload, PendingWrites, blit_method,
     dma_method,
 };
 use crate::back::draw::call::{DRAW_METHODS, UNHANDLED_METHODS};
+use crate::back::draw::clear::CLEAR_METHODS;
 use crate::back::draw::conditional;
 use crate::back::draw::shaders::{HostShaders, ShaderLookup};
-use crate::back::draw::{DrawContext, DrawError, Draws, Outcome, WaitWhileCompiling};
+use crate::back::draw::{DrawContext, DrawError, Draws, WaitWhileCompiling};
 use crate::back::fence::{CloseReason, FenceError, FencedAction, Fences, Settled};
 use crate::back::pipeline::PipelineCache;
 use crate::back::qmd::{LAST_INLINE_QMD_METHOD, QMD_BYTES, QmdError, QmdTable, inline_qmd_address};
@@ -359,6 +367,9 @@ pub enum ExecError {
     /// A present arrived before [`Executor::set_present_space`] named the space it reads.
     #[error("a present arrived, but no address space is set for presents")]
     NoPresentSpace,
+    /// A constant-buffer load was refused, or faulted while writing.
+    #[error("constant-buffer load: {0}")]
+    ConstantBuffer(#[from] ConstantBufferError),
 }
 
 /// Counts of what the executor did, for counters and tests.
@@ -505,6 +516,8 @@ pub struct Executor {
     scratch: CommandList,
     /// The ranges of one CPU-write drain.
     drained: Vec<PageRange>,
+    /// The constant-buffer upload (slice G25) and its scratch bytes.
+    cb_load: ConstantBufferLoad,
 }
 
 impl Executor {
@@ -535,6 +548,7 @@ impl Executor {
             counters: ExecCounters::default(),
             scratch: CommandList::new(),
             drained: Vec::new(),
+            cb_load: ConstantBufferLoad::new(),
         }
     }
 
@@ -813,9 +827,12 @@ impl Executor {
                 });
                 self.then_deferred(own, deferred)
             }
-            RingEntry::Syncpoint { id } => {
+            RingEntry::Syncpoint { id, count } => {
                 let deferred = self.flush_deferred(None);
-                let own = self.attach(FencedAction::Increment(*id));
+                let own = self.attach(FencedAction::Increment {
+                    id: *id,
+                    count: *count,
+                });
                 self.then_deferred(own, deferred)
             }
             RingEntry::Marker { token } => {
@@ -1076,6 +1093,42 @@ impl Executor {
         for &word in words {
             self.word(channel, class, method, word)?;
         }
+        if class.0 == clc797::CLASS && is_constant_buffer_load(method) {
+            self.constant_buffer_load(channel, method, words)?;
+        }
+        Ok(())
+    }
+
+    /// The words of a `Write` or `Run` of `LOAD_CONSTANT_BUFFER(i)`, once the mirror stored
+    /// them, to the constant-buffer upload (module docs, "Routing").
+    fn constant_buffer_load(
+        &mut self,
+        channel: ChannelId,
+        method: u32,
+        words: &[u32],
+    ) -> Result<(), ExecError> {
+        let space = self.space_of(channel)?;
+        let class = ClassId(clc797::CLASS);
+        let Self {
+            channels,
+            spaces,
+            cb_load,
+            ..
+        } = self;
+        let engine = channels
+            .get(&channel)
+            .and_then(|c| c.engines.get(&class))
+            .ok_or(ExecError::Unbound { channel, class })?;
+        let state = spaces
+            .get_mut(&space)
+            .ok_or(ExecError::UnknownSpace { space })?;
+        cb_load.method(
+            &engine.mirror,
+            method,
+            words,
+            &*state.memory,
+            &mut state.pending,
+        )?;
         Ok(())
     }
 
@@ -1352,7 +1405,7 @@ impl Executor {
             }
             DrawStep::Flush => draws.flush(&mut ctx, &mut engine.mirror),
         };
-        if matches!(outcome, Ok(Some(Outcome::Drawn))) {
+        if matches!(&outcome, Ok(Some(o)) if o.drew()) {
             *last_drawer = Some((channel, class));
         }
         // Cache uploads made before a failure stay in the list (`back::draw`, "Errors and what
@@ -1507,8 +1560,8 @@ enum DrawStep {
     Flush,
 }
 
-/// The 3D methods a word to which may start a draw (module docs).
-const DRAW_STARTER_TABLES: [&[&Method]; 2] = [&DRAW_METHODS, &UNHANDLED_METHODS];
+/// The 3D methods a word to which may start a draw or a clear (module docs).
+const DRAW_STARTER_TABLES: [&[&Method]; 3] = [&DRAW_METHODS, &UNHANDLED_METHODS, &CLEAR_METHODS];
 
 /// The bits in one word of [`DRAW_STARTERS`].
 const STARTER_WORD_BITS: usize = u64::BITS as usize;

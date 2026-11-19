@@ -22,12 +22,18 @@
 //!   on the next boot.
 //!
 //! - [`draw`]: draws (slice G18): 3D state to a `Command::Draw`, with shader lookups, the
-//!   variant key, bindings through the caches, driver constants and conditional render.
+//!   variant key, bindings through the caches, driver constants and conditional render; and
+//!   clears (slice G24, [`draw::clear`]): `CLEAR_SURFACE` to a `Command::Clear`, or a draw for a
+//!   masked clear.
 //!
 //! - [`exec`]: the executor (slice G19): ring entries to the engines above, compute dispatches
 //!   to `Command::Dispatch`, presents to `Command::Present`, and the commands to the fence path.
+//!
+//! - [`cb_load`]: constant-buffer loads (slice G25): `LOAD_CONSTANT_BUFFER` words written to
+//!   guest memory at the selected buffer's address plus the upload offset.
 
 pub mod buffer;
+pub mod cb_load;
 pub mod copy;
 pub mod draw;
 pub mod exec;
