@@ -1100,6 +1100,47 @@ fn a_presented_frame_the_gpu_drew_is_its_render_target() {
     assert_eq!(texture_of(presented), texture_of(target));
 }
 
+/// The `dump` flag of every present follows [`ExecConfig::dumps`] (module docs, "Frame
+/// dumps"): two presents under each setting, both flagged or neither, and the recording backend
+/// reads back exactly the flagged ones.
+#[test]
+fn a_present_is_dumped_as_the_setting_says() {
+    // The default dumps nothing.
+    assert_eq!(ExecConfig::default().dumps, FrameDumps::Off);
+    assert_eq!(FrameDumps::default(), FrameDumps::Off);
+    for (dumps, flagged) in [(FrameDumps::Off, false), (FrameDumps::Every, true)] {
+        let recording = Arc::new(RecordingBackend::new(caps(), 1 << 40));
+        let config = ExecConfig {
+            dumps,
+            ..ExecConfig::default()
+        };
+        let mut rig = Rig::with(
+            Arc::<RecordingBackend>::clone(&recording),
+            compute_set(vec![]),
+            config,
+        );
+        rig.recording = Some(Arc::clone(&recording));
+        rig.exec.set_present_space(SPACE).unwrap();
+        rig.run(&(present() + &present()));
+        let presents: Vec<(u64, bool)> = rig
+            .commands()
+            .iter()
+            .filter_map(|command| match command {
+                Command::Present(desc) => Some((desc.frame, desc.dump)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(presents, [(0, flagged), (1, flagged)], "{dumps:?}");
+        let dumped: Vec<u64> = recording
+            .take_frame_dumps()
+            .iter()
+            .map(|dump| dump.frame)
+            .collect();
+        let expected: &[u64] = if flagged { &[0, 1] } else { &[] };
+        assert_eq!(dumped, expected, "{dumps:?}");
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // The drain, invalidations and deferred draws
 

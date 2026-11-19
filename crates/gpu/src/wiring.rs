@@ -140,8 +140,11 @@
 //!
 //! - The real shader cache: shader-pipeline slice 19 builds it, and an adapter from it to G18's
 //!   seam ([`ShaderCache`]) is the caller's to give, in [`GpuDeps::shaders`].
-//! - Choosing the render backend, and writing `gpu.txt` and the counters into a run's artifacts:
-//!   the run builds a `Gpu` once a backend is chosen (render-backend slice R12).
+//! - Choosing the render backend, and writing `gpu.txt` and the counters into a run's
+//!   artifacts: `core` does both. It builds a `Gpu` over the recording backend for a live run
+//!   (issue #386); render-backend slice R12 adds the choice of the wgpu backend.
+//! - Frame dumps: `core` asks for them with the executor's setting in [`GpuConfig::exec`]
+//!   ([`crate::back::exec::FrameDumps`]), and installs the frame sink on the backend it builds.
 
 mod back_thread;
 mod recorder;
@@ -246,7 +249,8 @@ pub struct GpuDeps {
 /// The [`Gpu`]'s settings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GpuConfig {
-    /// The executor's settings.
+    /// The executor's settings, among them which presents are dumped
+    /// ([`ExecConfig::dumps`]): the setting through which `core` asks for frame dumps.
     pub exec: ExecConfig,
     /// When fenced actions are performed ([`Mode::Fenced`] but for debugging).
     pub mode: Mode,

@@ -161,6 +161,17 @@
 //! decision of 2026-11-12, "Presents pace the game through a buffer queue"); it is ordered after
 //! every command before it by its place in the list, and the list is closed after it.
 //!
+//! # Frame dumps
+//!
+//! A present's `dump` flag is [`ExecConfig::dumps`]: with [`FrameDumps::Every`] every present
+//! the executor records asks the render backend to read the presented view back and hand it to
+//! the frame sink the app installed; with [`FrameDumps::Off`] (the default) none does. The
+//! setting reaches the executor through the [`Gpu`](crate::wiring::Gpu)'s config
+//! (`GpuConfig::exec`), which is how `core` asks for dumps (render-backend, "Frame dumps and
+//! headless runs": "How `core` asks the GPU crate to set the `dump` flag is decided in R9's
+//! second part"; issue #386). It is fixed for the run: nothing turns it on or off for one
+//! present (`tests::a_present_is_dumped_as_the_setting_says`).
+//!
 //! # Divergences
 //!
 //! - **Every `Invalidate` entry drains CPU writes.** Eden-NX2 gathers the CPU's dirty memory
@@ -246,14 +257,42 @@ pub struct ExecConfig {
     pub setting: WaitWhileCompiling,
     /// How long a catch-up or write-back waits for the host GPU.
     pub catch_up: Duration,
+    /// Which presents are read back for a frame dump (module docs, "Frame dumps").
+    pub dumps: FrameDumps,
 }
 
 impl Default for ExecConfig {
-    /// [`WaitWhileCompiling::Wait`] and [`CATCH_UP_TIMEOUT`].
+    /// [`WaitWhileCompiling::Wait`], [`CATCH_UP_TIMEOUT`] and [`FrameDumps::Off`].
     fn default() -> Self {
         Self {
             setting: WaitWhileCompiling::Wait,
             catch_up: CATCH_UP_TIMEOUT,
+            dumps: FrameDumps::Off,
+        }
+    }
+}
+
+/// Which presents the executor records with `PresentDesc::dump` set, so that the render backend
+/// reads them back for the frame sink the app installed (render-backend, "Frame dumps and
+/// headless runs"; module docs, "Frame dumps"). It is how `core` asks the GPU crate for frame
+/// dumps: a setting of the [`Gpu`](crate::wiring::Gpu)'s config, `GpuConfig::exec`, fixed for
+/// the run (slice R9's second part decides the path; issue #386).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FrameDumps {
+    /// No present is dumped.
+    #[default]
+    Off,
+    /// Every present is dumped.
+    Every,
+}
+
+impl FrameDumps {
+    /// Whether a present is recorded with `dump` set under this setting.
+    #[must_use]
+    pub const fn dumps(self) -> bool {
+        match self {
+            Self::Off => false,
+            Self::Every => true,
         }
     }
 }
@@ -1403,6 +1442,7 @@ impl Executor {
             last_drawer,
             frame,
             counters,
+            config,
             ..
         } = self;
         let state = spaces
@@ -1425,7 +1465,7 @@ impl Executor {
             src_rect: request.shown,
             transform: PresentTransform::Identity,
             frame: *frame,
-            dump: false,
+            dump: config.dumps.dumps(),
         }));
         *frame = frame.wrapping_add(1);
         *last_drawer = None;
