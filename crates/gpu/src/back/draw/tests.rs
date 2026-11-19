@@ -3146,3 +3146,163 @@ fn error_messages_are_plain_words() {
         assert_eq!(error.to_string(), text);
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Fixed-function values.
+
+#[test]
+fn viewports_and_scissors_flip_with_the_window_origin() {
+    let mut rig = Rig::new(ready(vec![], vec![]));
+    rig.basic();
+    rig.set(&clc797::SET_SCISSOR_ENABLE, &[0], 1);
+    rig.set(
+        &clc797::SET_SCISSOR_HORIZONTAL,
+        &[0],
+        fields(&[
+            (clc797::SET_SCISSOR_HORIZONTAL_XMIN, 1),
+            (clc797::SET_SCISSOR_HORIZONTAL_XMAX, 5),
+        ]),
+    );
+    rig.set(
+        &clc797::SET_SCISSOR_VERTICAL,
+        &[0],
+        fields(&[
+            (clc797::SET_SCISSOR_VERTICAL_YMIN, 2),
+            (clc797::SET_SCISSOR_VERTICAL_YMAX, 3),
+        ]),
+    );
+    rig.draw();
+    let draw = rig.last_draw();
+    let viewport = draw.dynamic.viewports[0];
+    // Offset 4, scale 4: x and y 0, width and height 8; depth 0.5 - 0.5 to 0.5 + 0.5 under
+    // the -1..1 clip range a register never written gives.
+    assert_eq!(
+        (viewport.x, viewport.y, viewport.width, viewport.height),
+        (0.0, 0.0, 8.0, 8.0)
+    );
+    assert_eq!((viewport.min_depth, viewport.max_depth), (0.0, 1.0));
+    let scissor = draw.dynamic.scissors[0];
+    assert_eq!(
+        (scissor.x, scissor.y, scissor.width, scissor.height),
+        (1, 2, 4, 1)
+    );
+    // A disabled scissor is the whole target, the largest i32 in each extent (Eden).
+    let whole = draw.dynamic.scissors[1];
+    assert_eq!((whole.width, whole.height), (0x7fff_ffff, 0x7fff_ffff));
+    // Only the window origin changes: both parts follow it. The clip height is 8.
+    rig.set(
+        &clc797::SET_WINDOW_ORIGIN,
+        &[],
+        fields(&[(
+            clc797::SET_WINDOW_ORIGIN_MODE,
+            clc797::SET_WINDOW_ORIGIN_MODE_LOWER_LEFT,
+        )]),
+    );
+    rig.draw();
+    let draw = rig.last_draw();
+    let viewport = draw.dynamic.viewports[0];
+    assert_eq!((viewport.y, viewport.height), (8.0, -8.0));
+    let scissor = draw.dynamic.scissors[0];
+    assert_eq!((scissor.y, scissor.height), (5, 1));
+    // A negative y swizzle then flips by the viewport's own height.
+    rig.set(
+        &clc797::SET_VIEWPORT_COORDINATE_SWIZZLE,
+        &[0],
+        fields(&[(
+            clc797::SET_VIEWPORT_COORDINATE_SWIZZLE_Y,
+            clc797::SET_VIEWPORT_COORDINATE_SWIZZLE_Y_NEG_Y,
+        )]),
+    );
+    rig.draw();
+    let viewport = rig.last_draw().dynamic.viewports[0];
+    assert_eq!((viewport.y, viewport.height), (0.0, 8.0));
+}
+
+#[test]
+fn depth_bias_applies_only_with_the_topologys_offset_enable() {
+    let mut rig = Rig::new(ready(vec![], vec![]));
+    rig.basic();
+    rig.set(&clc797::SET_DEPTH_BIAS, &[], 2.0f32.to_bits());
+    rig.set(&clc797::SET_SLOPE_SCALE_DEPTH_BIAS, &[], 3.0f32.to_bits());
+    rig.set(&clc797::SET_POLY_OFFSET_LINE, &[], 1);
+    // Triangles: the fill enable is off, so no bias.
+    rig.draw();
+    assert_eq!(rig.last_draw().dynamic.depth_bias.constant, 0.0);
+    // Lines: the line enable is on.
+    rig.draw_arrays(clc797::BEGIN_OP_LINES, 0, 2).unwrap();
+    let bias = rig.last_draw().dynamic.depth_bias;
+    assert_eq!((bias.constant, bias.slope_scale), (2.0, 3.0));
+    // Points: off again.
+    rig.draw_arrays(clc797::BEGIN_OP_POINTS, 0, 1).unwrap();
+    assert_eq!(rig.last_draw().dynamic.depth_bias.constant, 0.0);
+}
+
+#[test]
+fn a_zero_layer_depth_target_is_one_layer() {
+    let mut rig = Rig::new(ready(vec![], vec![]));
+    rig.basic();
+    rig.set(&clc797::SET_ZT_FORMAT, &[], clc797::SET_ZT_FORMAT_V_Z16);
+    rig.set(&clc797::SET_ZT_SELECT, &[], 1);
+    rig.set(&clc797::SET_ZT_SIZE_C, &[], 0);
+    let depth = targets::targets(&rig.mirror).unwrap().depth.unwrap();
+    assert_eq!(depth.layers, 1);
+    rig.set(
+        &clc797::SET_ZT_SIZE_C,
+        &[],
+        fields(&[(clc797::SET_ZT_SIZE_C_THIRD_DIMENSION, 3)]),
+    );
+    assert_eq!(
+        targets::targets(&rig.mirror).unwrap().depth.unwrap().layers,
+        3
+    );
+    // ARRAY_SIZE_IS_ONE wins over the third dimension.
+    rig.set(
+        &clc797::SET_ZT_SIZE_C,
+        &[],
+        fields(&[
+            (clc797::SET_ZT_SIZE_C_THIRD_DIMENSION, 3),
+            (
+                clc797::SET_ZT_SIZE_C_CONTROL,
+                clc797::SET_ZT_SIZE_C_CONTROL_ARRAY_SIZE_IS_ONE,
+            ),
+        ]),
+    );
+    assert_eq!(
+        targets::targets(&rig.mirror).unwrap().depth.unwrap().layers,
+        1
+    );
+}
+
+#[test]
+fn bank_24_answers_from_the_first_root_table() {
+    let mut rig = Rig::new(ready(vec![], vec![]));
+    rig.basic();
+    // A constant buffer bound to slot 24 too: the root table wins (PR #4588's `IsBank`).
+    rig.write_words(UNIFORMS, &[0xdead_beef]);
+    rig.bind(4, FIRST_ROOT_BANK, UNIFORMS, 0x10);
+    rig.set(&clc797::SET_ROOT_TABLE_SELECTOR, &[], 0);
+    rig.mirror
+        .run(clc797::LOAD_ROOT_TABLE.method(), &[0x2424])
+        .unwrap();
+    rig.draws.load_root_table(&rig.mirror, &[0x2424]).unwrap();
+    let answers = StateAnswers {
+        mirror: &rig.mirror,
+        roots: rig.draws.root_tables(),
+        memory: &rig.mem,
+    };
+    assert_eq!(
+        answers.cbuf_word(GuestStage::Pixel, FIRST_ROOT_BANK, 0),
+        Some(0x2424)
+    );
+    // Bank 23 is a bind group's.
+    rig.bind(4, FIRST_ROOT_BANK - 1, UNIFORMS, 0x10);
+    let answers = StateAnswers {
+        mirror: &rig.mirror,
+        roots: rig.draws.root_tables(),
+        memory: &rig.mem,
+    };
+    assert_eq!(
+        answers.cbuf_word(GuestStage::Pixel, FIRST_ROOT_BANK - 1, 0),
+        Some(0xdead_beef)
+    );
+}
