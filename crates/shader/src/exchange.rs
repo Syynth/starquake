@@ -165,8 +165,9 @@ pub trait Questioner {
 /// The answers a program's translation used: the record kept with each shader entry, ordered
 /// by [`Question`].
 ///
-/// Built only by [`exchange`] and [`Answers::reanswer`], so each answer is of its question's
-/// kind.
+/// Filled only by [`exchange`] and [`Answers::reanswer`] ([`Answers::new`] is empty), so each
+/// answer is of its question's kind, and the arms of [`Answers::cbuf_word`] and
+/// [`Answers::texture_kind`] that meet an answer of the other kind cannot be reached.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Answers(BTreeMap<Question, Answer>);
 
