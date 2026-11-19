@@ -76,7 +76,8 @@
 //! - **Eden-NX2's pitch adjustment changes nothing here.** `need_align_to_pitch` moves a pitch
 //!   source's address by `src_x0` pixels when its region passes `pitch / bpp`; pitch regions are
 //!   not bounded by their width here, so the same bytes are read either way.
-//! - **Not read, as in Eden-NX2:** `SET_*_LAYER` (Eden-NX2 logs a non-zero layer and goes on),
+//! - **Not read, as in Eden-NX2:** `SET_DST_LAYER` (the class has no source layer method;
+//!   Eden-NX2 logs a non-zero layer of either surface and goes on),
 //!   `SET_DST_COLOR_RENDER_TO_ZETA_SURFACE` (so a depth surface uses the colour GOB too; the
 //!   spec's verification item 9), `SET_PIXELS_FROM_MEMORY_DIRECTION`, `SET_COMPRESSION`, the
 //!   render enable and the sector promotion. Eden-NX2's delegation of large converted blits to
