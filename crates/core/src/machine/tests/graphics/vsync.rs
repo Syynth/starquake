@@ -247,17 +247,32 @@ fn tick_times(report: &RunReport) -> Vec<u64> {
 /// success, never sooner after the request than its tick's deadline can come (the `j`-th wake
 /// at least `j` intervals after the request, since each deadline is at least one interval after
 /// the one before), and the run records a `VsyncTick` for every wake. Each recorded tick comes
-/// at or after its deadline (the deadlines followed from the start by NX2's rule, as the clock
-/// does), within one counter tick of rounding, and, by the median, less than half of
-/// [`PREEMPTION_INTERVAL_NS`] after it.
+/// at or after its deadline, within one counter tick of rounding, and, by the median, less than
+/// half of [`PREEMPTION_INTERVAL_NS`] after it.
+///
+/// The deadlines are followed from the start by NX2's rule, as the clock follows it, but from
+/// the turn's time, which no note records: it lies between the deadline and the note's own
+/// time (read a little later, as the note is recorded). So the test keeps the earliest and the
+/// latest each deadline can be, checks each tick against the earliest and measures its lateness
+/// from the latest. The two differ only after a tick more than an interval late (a turn that may
+/// have restarted the clock); until then the lateness is exact, and after it a lower bound.
+/// (Restarting from the note's time instead failed once on CI: the next tick came 2.9 µs before
+/// the deadline so computed.)
 ///
 /// The median is what fails if the timer thread did not sleep to the clock's deadline
 /// (`Graphics::deadline` without it): a tick then waits for the next preemption turn, up to
-/// [`PREEMPTION_INTERVAL_NS`] later (and the host's sleeps overshoot), so the median comes 5.6
-/// to 9.7 ms late, against 1 to 2.5 ms with it (seen over 10 and 30 runs of [`ROUNDS`] ticks on
-/// a macOS host). It times the timer thread's own tick, read from the recorded note, and not
-/// the guest's wake, which also waits for a second host thread (the core's) and was seen over
-/// 5 ms late, by the median, on a loaded host.
+/// [`PREEMPTION_INTERVAL_NS`] later, so the median comes 4.3 to 5.9 ms late (19 of 20 runs of
+/// [`ROUNDS`] ticks on an Apple Silicon Mac at or over the bound), against 0.03 to 0.06 ms with
+/// it (30 runs). It times the timer thread's own tick, read from the recorded note, and not the
+/// guest's wake, which also waits for a second host thread (the core's) and was seen over 5 ms
+/// late, by the median, on a loaded host.
+///
+/// It is also what fails where the host ends the timer thread's timed waits late on purpose
+/// (macOS timer coalescing; `machine/timer.rs`, "Sleeping to a deadline") and the thread asks
+/// for each sleep in one wait, as it did before it measured that lateness: CI's hosted macOS
+/// runners then saw medians of 14 to 44 ms and the latest tick 33 to 69 ms late (12 runs), and
+/// the Mac under `taskpolicy -c utility` failed 20 runs of 20; with the waits sized by the
+/// measured lateness it passed 30 of 30 there, the worst median 0.19 ms.
 #[test]
 fn the_timer_thread_ticks_the_vsync_clock_and_wakes_a_listener_s_waiter() {
     let guest = Guest::new(&programs::hello().unwrap());
@@ -312,21 +327,25 @@ fn the_timer_thread_ticks_the_vsync_clock_and_wakes_a_listener_s_waiter() {
     let ticks = tick_times(&report);
     assert!(ticks.len() >= ROUNDS, "{ticks:?}");
     let rounding = 1_000_000_000_u64.div_ceil(timebase().rate().hz());
-    let mut deadline = lock(&started).unwrap().0 + INTERVAL_NS;
+    let first = lock(&started).unwrap().0 + INTERVAL_NS;
+    let (mut earliest, mut latest) = (first, first);
     let mut late = Vec::new();
     for &tick in &ticks {
         assert!(
-            tick + rounding >= deadline,
-            "a tick at {tick} for {deadline}"
+            tick + rounding >= earliest,
+            "a tick at {tick} for a deadline no earlier than {earliest}"
         );
-        late.push(Duration::from_nanos(tick.saturating_sub(deadline)));
-        // NX2 `PaceToVblank`, as the clock follows it.
-        let from = if tick > deadline + INTERVAL_NS {
-            tick
+        late.push(Duration::from_nanos(tick.saturating_sub(latest)));
+        // NX2 `PaceToVblank`, as the clock follows it from the turn's own time, which no note
+        // records: it is no earlier than the deadline and no later than the note's time. A turn
+        // can have restarted the clock from its time only if the note came more than an interval
+        // after the earliest deadline.
+        latest = if tick > earliest + INTERVAL_NS {
+            latest.max(tick)
         } else {
-            deadline
-        };
-        deadline = from + INTERVAL_NS;
+            latest
+        } + INTERVAL_NS;
+        earliest += INTERVAL_NS;
     }
     late.sort();
     let median = late[late.len() / 2];

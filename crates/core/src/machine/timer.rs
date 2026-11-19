@@ -91,6 +91,21 @@
 //! (`machine/gpu.rs`, "During the run"), and ends the run as an emulator error if one has ended
 //! (`a_dead_gpu_thread_ends_the_run`, in `machine/tests/graphics/frames.rs`). A run with the null front
 //! has no GPU threads and asks nothing.
+//!
+//! # Sleeping to a deadline
+//!
+//! A host may end a timed wait well after its deadline on purpose (macOS coalesces timers, by a
+//! leeway that grows with the wait's length: `leeway`'s module docs have the measurements), and
+//! then every deadline the thread sleeps for comes late by it: preemption, the kernel's
+//! timeouts, the syncpoint page's bound and the vsync ticks. So [`Bell::sleep`] does not ask for
+//! the whole sleep at once: it waits in shares of the time left, each short enough to end before
+//! the deadline even as late as the host has been ending the thread's waits ([`Leeway`]),
+//! measuring each wait that times out, until the time is up or the bell rings. Where waits end
+//! on time the estimate stays at zero and a sleep is a single wait. Tests:
+//! `against_a_host_that_ends_waits_late_a_sleep_learns_to_end_on_time` (the rule, against a
+//! modelled host), `a_sleep_lasts_its_limit_and_a_ring_ends_it` (the real wait), and the real
+//! runs whose deadlines are timed, `a_held_page_request_is_answered_at_the_bound_by_the_timer_thread`
+//! and `the_timer_thread_ticks_the_vsync_clock_and_wakes_a_listener_s_waiter`.
 
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -103,6 +118,9 @@ use starquake_trace::{Env, EventKind, HostClock, HostNanos, LifecyclePhase, Thre
 
 use super::{CORE, Ending, LogSink, Machine, PROCESS_ID, lock};
 use crate::hle::graphics::KernelHost;
+use leeway::Leeway;
+
+mod leeway;
 
 /// What the timer thread sleeps on: rung when it should look again.
 #[derive(Default)]
@@ -125,14 +143,34 @@ impl Bell {
         std::mem::take(&mut *lock(&self.rung))
     }
 
-    /// Sleeps for at most `limit`, or until rung.
-    fn sleep(&self, limit: Duration) {
+    /// Sleeps for `limit`, or until rung, in waits sized by `leeway`, which it updates with how
+    /// late each wait that timed out ended (module docs, "Sleeping to a deadline").
+    fn sleep(&self, limit: Duration, leeway: &mut Leeway) {
+        let start = Instant::now();
+        let end = start.checked_add(limit);
         let mut rung = lock(&self.rung);
-        if !*rung {
-            rung = self
-                .ring
-                .wait_timeout(rung, limit)
-                .map_or_else(|poisoned| poisoned.into_inner().0, |(rung, _)| rung);
+        while !*rung {
+            let now = Instant::now();
+            // A limit past the end of `Instant` is waited for in one go, as it always was.
+            let left = end.map_or(limit, |end| end.saturating_duration_since(now));
+            if left.is_zero() {
+                break;
+            }
+            let asked = leeway.slice(left);
+            let (guard, timed_out) = self.ring.wait_timeout(rung, asked).map_or_else(
+                |poisoned| {
+                    let (guard, result) = poisoned.into_inner();
+                    (guard, result.timed_out())
+                },
+                |(guard, result)| (guard, result.timed_out()),
+            );
+            rung = guard;
+            if timed_out && !*rung {
+                *leeway = leeway.measured(asked, now.elapsed());
+            }
+            if end.is_none() {
+                break;
+            }
         }
         *rung = false;
     }
@@ -174,6 +212,7 @@ fn turns<V: Vcpu, C: HostClock + Clone>(machine: &Machine<'_, V, C>) -> Result<(
         .and_then(|timeout| Instant::now().checked_add(timeout));
     let mut next_preemption = HostNanos(clock.host_now().0.saturating_add(PREEMPTION_INTERVAL_NS));
     let scheduler_failed = |error| Ending::Failed(format!("the scheduler failed: {error}"));
+    let mut leeway = Leeway::default();
     while !machine.is_stopped() {
         if end.is_some_and(|end| Instant::now() >= end) {
             return Err(Ending::TimedOut);
@@ -216,7 +255,7 @@ fn turns<V: Vcpu, C: HostClock + Clone>(machine: &Machine<'_, V, C>) -> Result<(
         if let Some(end) = end {
             sleep = sleep.min(end.saturating_duration_since(Instant::now()));
         }
-        machine.bell.sleep(sleep);
+        machine.bell.sleep(sleep, &mut leeway);
     }
     Ok(())
 }
@@ -325,4 +364,55 @@ fn next_deadline(dispatcher: &Dispatcher) -> Option<HostNanos> {
     dispatcher.with::<(&starquake_kernel::tables::Scheduler,), _>(|(scheduler,)| {
         scheduler.sync().next_deadline()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::thread;
+
+    use super::*;
+
+    /// Longer than any test here may take: a sleep that a ring ends must end well before it.
+    const LONG: Duration = Duration::from_secs(10);
+
+    /// A sleep nobody rings lasts at least its limit, whether it is one wait (no lateness
+    /// measured) or several (an estimate that slices it); a ring before the sleep keeps it from
+    /// starting, and a ring from another thread ends it, each long before its limit; and either
+    /// ring is used up by the sleep it ends.
+    #[test]
+    fn a_sleep_lasts_its_limit_and_a_ring_ends_it() {
+        let bell = Bell::default();
+        let limit = Duration::from_millis(30);
+        for estimate in [
+            Leeway::default(),
+            Leeway::new(4_000),
+            Leeway::new(leeway::MOST),
+        ] {
+            let mut leeway = estimate;
+            let start = Instant::now();
+            bell.sleep(limit, &mut leeway);
+            assert!(
+                start.elapsed() >= limit,
+                "{estimate:?}: {:?}",
+                start.elapsed()
+            );
+        }
+
+        bell.ring();
+        let start = Instant::now();
+        bell.sleep(LONG, &mut Leeway::new(4_000));
+        assert!(start.elapsed() < LONG / 2, "{:?}", start.elapsed());
+        assert!(!bell.take_ring());
+
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                thread::sleep(limit);
+                bell.ring();
+            });
+            let start = Instant::now();
+            bell.sleep(LONG, &mut Leeway::new(4_000));
+            assert!(start.elapsed() < LONG / 2, "{:?}", start.elapsed());
+        });
+        assert!(!bell.take_ring());
+    }
 }

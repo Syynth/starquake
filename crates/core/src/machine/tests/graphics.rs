@@ -659,6 +659,14 @@ fn page_guest(script: &Script, page: &Arc<FlatMemory>, writable: u64) -> Scripte
 /// It cannot see whether the queue rings the timer thread: the guest's timed wait gives the
 /// kernel a deadline, which wakes the thread soon after the signal anyway.
 /// `a_completion_queued_for_the_graphics_server_rings_the_timer_thread` pins the ring.
+///
+/// The thread must also sleep *to* the bound where the host ends timed waits late on purpose
+/// (macOS timer coalescing; `machine/timer.rs`, "Sleeping to a deadline"). Asking for each sleep
+/// in one wait, as it did before it measured that lateness, CI's hosted macOS runners saw
+/// medians of 5.07 to 5.19 ms (held waits of 1.75 to 5.68 ms, 5 runs), and an Apple Silicon Mac
+/// under `taskpolicy -c utility` failed 20 runs of 20; with the waits sized by the measured
+/// lateness it passed 30 of 30 there (the worst median 3.1 ms), and its medians without the
+/// clamp were 1.2 ms at most (30 runs).
 #[test]
 fn a_held_page_request_is_answered_at_the_bound_by_the_timer_thread() {
     let guest = super::Guest::new(&page_program());
