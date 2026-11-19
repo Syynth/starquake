@@ -173,7 +173,10 @@ fn jump_table(src: BrxSrc, base: u32) -> (Vec<Instruction>, BranchTables) {
 /// the immediate it is set to), the (address, target block) of each comparison, in order, and
 /// the block the chain ends in. Every comparison reads the variable again in its own block, so
 /// no value crosses blocks.
-fn chain(ir: &IrBlocks, first: usize) -> (Result<Operation, Operand>, Vec<(u32, BlockId)>, Terminator) {
+fn chain(
+    ir: &IrBlocks,
+    first: usize,
+) -> (Result<Operation, Operand>, Vec<(u32, BlockId)>, Terminator) {
     let mut block = nth(ir, first).1;
     let mut set = None;
     let mut targets = Vec::new();
@@ -183,7 +186,10 @@ fn chain(ir: &IrBlocks, first: usize) -> (Result<Operation, Operand>, Vec<(u32, 
             let (opcode, args) = op(ir, value);
             match opcode {
                 Opcode::SetIndirectBranchVariable => {
-                    assert!(set.is_none(), "the variable is set once, in the first block");
+                    assert!(
+                        set.is_none(),
+                        "the variable is set once, in the first block"
+                    );
                     set = Some(match args[0] {
                         Operand::Value(read) => {
                             assert!(block.insts.contains(&read), "read in the same block");
