@@ -937,7 +937,7 @@ fn keys_past_the_record_limit_are_counted_not_recorded() {
             keys: list.keys[..2].to_vec()
         }
     );
-    // A key already recorded is not counted again.
+    // The two keys already recorded are not counted again; the attempt the record refuses is.
     rig.cache.precompile(&list, &mut |_| None);
     assert_eq!(rig.cache.unrecorded(), 2);
     assert!(rig.cache.is_empty());
@@ -1009,6 +1009,220 @@ fn precompile_reports_every_outcome() {
             keys: list.keys[..4].to_vec()
         }
     );
+}
+
+const TC_STAMP: ShaderStamp = ShaderStamp::new(0x7C7C);
+const TE_STAMP: ShaderStamp = ShaderStamp::new(0x7E7E);
+
+#[test]
+fn precompile_maps_each_tessellation_stamp_to_its_own_shader() {
+    let mut rig = Rig::new(DynamicState::EMPTY);
+    let tcs = rig.spy.shader(ShaderStage::TessControl);
+    let tes = rig.spy.shader(ShaderStage::TessEval);
+    assert_ne!(tcs, tes);
+    let mut desc = rig.desc();
+    desc.stages.tess_control = Some(tcs);
+    desc.stages.tess_eval = Some(tes);
+    desc.topology = Topology::Patches;
+    let mut stamps = stamps();
+    stamps.tess_control = Some(TC_STAMP);
+    stamps.tess_eval = Some(TE_STAMP);
+    let list = KeyList {
+        keys: vec![PipelineKey::Graphics(Box::new(GraphicsKey {
+            stamps,
+            fixed: FixedState::of(&desc, DynamicState::EMPTY),
+        }))],
+    };
+    let (vs, fs) = (rig.vs, rig.fs);
+    let map = move |missing: Option<ShaderStamp>| {
+        move |stamp: ShaderStamp| {
+            if Some(stamp) == missing {
+                return None;
+            }
+            match stamp {
+                VS_STAMP => Some(vs),
+                FS_STAMP => Some(fs),
+                TC_STAMP => Some(tcs),
+                TE_STAMP => Some(tes),
+                _ => None,
+            }
+        }
+    };
+
+    // A stamp of either tessellation stage with no shader skips the key.
+    for missing in [TC_STAMP, TE_STAMP] {
+        let done = rig.cache.precompile(&list, &mut map(Some(missing)));
+        assert_eq!(
+            done,
+            Precompiled {
+                missing_shader: 1,
+                ..Precompiled::default()
+            },
+            "{missing:?}"
+        );
+        assert!(rig.spy.graphics().is_empty(), "{missing:?}");
+        assert!(rig.cache.is_empty(), "{missing:?}");
+    }
+
+    // With every shader known, the backend gets each stage's own shader.
+    let done = rig.cache.precompile(&list, &mut map(None));
+    assert_eq!(
+        done,
+        Precompiled {
+            queued: 1,
+            ..Precompiled::default()
+        }
+    );
+    assert_eq!(rig.spy.graphics(), vec![desc.clone()]);
+    assert_eq!(
+        rig.spy.graphics()[0].stages,
+        Stages {
+            vertex: vs,
+            tess_control: Some(tcs),
+            tess_eval: Some(tes),
+            geometry: None,
+            fragment: Some(fs),
+        }
+    );
+    // The draw finds the precompiled pipeline.
+    assert!(matches!(
+        rig.cache.lookup_graphics(&desc, &stamps),
+        Ok(Lookup::Ready(_))
+    ));
+    assert_eq!(rig.spy.graphics().len(), 1);
+}
+
+#[test]
+fn a_stamp_mismatch_is_reported_before_a_full_cache() {
+    let mut rig = Rig::build(caps(DynamicState::EMPTY), 1);
+    let a = rig.desc();
+    compiling(rig.graphics(&a));
+    let mut b = a.clone();
+    b.topology = Topology::Points;
+    // Each fault alone.
+    assert_eq!(
+        rig.cache.lookup_graphics(&b, &stamps()),
+        Err(PipelineCacheError::Full { limit: 1 })
+    );
+    let mut mismatched = stamps();
+    mismatched.geometry = Some(ShaderStamp::new(0x6565));
+    assert_eq!(
+        rig.cache.lookup_graphics(&a, &mismatched),
+        Err(PipelineCacheError::StampMismatch {
+            stage: ShaderStage::Geometry
+        })
+    );
+    // Both at once: the mismatch is named.
+    assert_eq!(
+        rig.cache.lookup_graphics(&b, &mismatched),
+        Err(PipelineCacheError::StampMismatch {
+            stage: ShaderStage::Geometry
+        })
+    );
+    assert_eq!(rig.cache.len(), 1);
+    assert_eq!(rig.spy.graphics().len(), 1);
+}
+
+#[test]
+fn the_first_lookup_reports_a_failure_precompile_found() {
+    let mut rig = Rig::new(DynamicState::EMPTY);
+    let mut bad = rig.desc();
+    // Two samples: a valid key, which this device refuses.
+    bad.targets.sample_count = 2;
+    let list = KeyList {
+        keys: vec![
+            PipelineKey::Graphics(Box::new(GraphicsKey {
+                stamps: stamps(),
+                fixed: FixedState::of(&bad, DynamicState::EMPTY),
+            })),
+            PipelineKey::Compute(CS_STAMP),
+        ],
+    };
+    let (vs, fs) = (rig.vs, rig.fs);
+    // The compute stamp maps to a vertex shader, which the backend refuses.
+    let done = rig.cache.precompile(&list, &mut |stamp| match stamp {
+        VS_STAMP | CS_STAMP => Some(vs),
+        FS_STAMP => Some(fs),
+        _ => None,
+    });
+    assert_eq!(
+        done,
+        Precompiled {
+            refused: 2,
+            ..Precompiled::default()
+        }
+    );
+    let refused = |newly, error| {
+        Ok(Lookup::Failed(Failure {
+            newly,
+            cause: FailCause::Refused(error),
+        }))
+    };
+    let samples = RenderError::SampleCount(2);
+    assert_eq!(
+        rig.cache.lookup_graphics(&bad, &stamps()),
+        refused(true, samples.clone())
+    );
+    assert_eq!(
+        rig.cache.lookup_graphics(&bad, &stamps()),
+        refused(false, samples)
+    );
+    let not_compute = RenderError::Invalid("a compute pipeline's shader is not a compute shader");
+    let compute = ComputePipelineDesc { shader: vs };
+    assert_eq!(
+        rig.cache.lookup_compute(compute, CS_STAMP),
+        refused(true, not_compute.clone())
+    );
+    assert_eq!(
+        rig.cache.lookup_compute(compute, CS_STAMP),
+        refused(false, not_compute)
+    );
+    assert_eq!(rig.spy.graphics().len(), 1);
+    assert_eq!(rig.spy.compute().len(), 1);
+}
+
+#[test]
+fn the_first_lookup_reports_a_compile_failure_precompile_saw() {
+    let failed = |newly| {
+        Ok(Lookup::Failed(Failure {
+            newly,
+            cause: FailCause::Compile,
+        }))
+    };
+    // `reported_first`: whether a lookup saw the failure before the precompile did.
+    for reported_first in [false, true] {
+        let mut rig = Rig::new(DynamicState::EMPTY);
+        let desc = rig.desc();
+        let id = compiling(rig.graphics(&desc));
+        rig.spy
+            .inner
+            .script_pipeline(id, vec![PipelineStatus::Failed])
+            .unwrap();
+        if reported_first {
+            assert_eq!(rig.cache.lookup_graphics(&desc, &stamps()), failed(true));
+        }
+        let list = rig.cache.key_list();
+        let (vs, fs) = (rig.vs, rig.fs);
+        let done = rig.cache.precompile(&list, &mut |stamp| match stamp {
+            VS_STAMP => Some(vs),
+            FS_STAMP => Some(fs),
+            _ => None,
+        });
+        assert_eq!(
+            done,
+            Precompiled {
+                known: 1,
+                ..Precompiled::default()
+            }
+        );
+        assert_eq!(
+            rig.cache.lookup_graphics(&desc, &stamps()),
+            failed(!reported_first),
+            "reported first: {reported_first}"
+        );
+        assert_eq!(rig.cache.lookup_graphics(&desc, &stamps()), failed(false));
+        assert_eq!(rig.spy.statuses(), 1);
+    }
 }
 
 #[test]

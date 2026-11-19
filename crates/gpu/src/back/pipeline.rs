@@ -33,9 +33,14 @@
 //! - a pipeline the backend refused to create (a [`RenderError`]) or reported failed is cached
 //!   as failed: it is not created or asked about again, and every later lookup reports
 //!   [`Lookup::Failed`] with the same [`FailCause`] (rows 90 and 112: cache rejections
-//!   negatively). [`Failure::newly`] is true only on the lookup that learned of the failure, so
-//!   the caller counts each failed pipeline once (render-backend: "skipped and counted once per
-//!   pipeline").
+//!   negatively). [`Failure::newly`] is true on exactly one lookup per failed pipeline, the
+//!   first lookup to report its failure, so the caller counts each failed pipeline once
+//!   (render-backend: "skipped and counted once per pipeline"). That is the lookup that learned
+//!   of the failure, or, when [`PipelineCache::precompile`] learned of it (the backend refused
+//!   the pipeline, or a status question precompile asked about a known compiling pipeline
+//!   answered failed), the first lookup of that pipeline afterwards. Pinned by
+//!   `tests::the_first_lookup_reports_a_failure_precompile_found` and
+//!   `tests::the_first_lookup_reports_a_compile_failure_precompile_saw`.
 //!
 //! What a draw does with a compiling pipeline is the one wait-while-compiling setting, which
 //! this crate owns and the caller applies (decision log 2026-11-12, the first of the twenty-one
@@ -62,7 +67,7 @@
 //! The cache holds at most [`MAX_PIPELINES`] entries (graphics and compute together, failed ones
 //! included) and records at most [`MAX_PIPELINES`] keys. A lookup of a new key in a full cache is
 //! [`PipelineCacheError::Full`] and creates nothing; a key that finds the record full is not
-//! recorded and counted ([`PipelineCache::unrecorded`]). Neither reference caps its pipeline
+//! recorded, and each such attempt is counted ([`PipelineCache::unrecorded`]). Neither reference caps its pipeline
 //! cache: the cap bounds what a hostile title can make the host hold, and its value is a
 //! **guess** (Eden-NX2's notes give no pipeline counts), stricter than both references.
 //!
@@ -101,6 +106,7 @@ use key::{FixedState, GraphicsKey, PipelineKey, mismatched_stage, resolve};
 use starquake_render::caps::DynamicState;
 use starquake_render::pipeline::{ComputePipelineDesc, GraphicsPipelineDesc, Stages};
 use starquake_render::{Backend, PipelineId, PipelineStatus, RenderError, ShaderId, ShaderStage};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
@@ -121,8 +127,8 @@ pub enum FailCause {
 /// A pipeline that cannot be used.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Failure {
-    /// Whether this lookup is the one that learned of the failure (module docs, "Status and
-    /// failures").
+    /// Whether this is the first lookup to report the failure: true on exactly one lookup per
+    /// failed pipeline (module docs, "Status and failures").
     pub newly: bool,
     /// Why it failed.
     pub cause: FailCause,
@@ -165,7 +171,8 @@ pub struct Precompiled {
     pub queued: usize,
     /// Keys whose pipeline the cache already held.
     pub known: usize,
-    /// Keys whose pipeline the backend refused to create.
+    /// Keys whose pipeline the backend refused to create. Each such pipeline is also reported
+    /// with [`Failure::newly`] on its first lookup.
     pub refused: usize,
     /// Graphics keys built under another set of dynamic states than this backend's, skipped.
     pub other_dynamic_state: usize,
@@ -179,14 +186,24 @@ pub struct Precompiled {
 struct Full;
 
 /// What [`PipelineCache::find_or_create`] did.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 enum Made {
     /// The entry was there already.
     Known,
-    /// The backend accepted the new pipeline.
-    Created,
+    /// The backend accepted the new pipeline, made for this key (a copy of the one stored).
+    Created(EntryKey),
     /// The backend refused the new pipeline; the entry is stored as failed.
     Refused,
+}
+
+/// Who asks [`PipelineCache::find_or_create`]: whether a failure it learns of reaches a lookup's
+/// caller now (module docs, "Status and failures").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Asker {
+    /// A lookup, which reports a failure it learns of as [`Failure::newly`].
+    Lookup,
+    /// [`PipelineCache::precompile`], which reports no failure, so the next lookup does.
+    Precompile,
 }
 
 /// One entry's state.
@@ -194,7 +211,11 @@ enum Made {
 enum Entry {
     Compiling(PipelineId),
     Ready(PipelineId),
-    Failed(FailCause),
+    /// `reported`: whether a lookup has reported the failure yet.
+    Failed {
+        cause: FailCause,
+        reported: bool,
+    },
 }
 
 /// What the cache tells pipelines apart by: shaders by id.
@@ -202,6 +223,18 @@ enum Entry {
 enum EntryKey {
     Graphics(Stages, Box<FixedState>),
     Compute(ShaderId),
+}
+
+impl EntryKey {
+    /// Has `backend` create the pipeline this key stands for.
+    fn create(&self, backend: &dyn Backend) -> Result<PipelineId, RenderError> {
+        match self {
+            Self::Graphics(stages, fixed) => backend.create_graphics_pipeline(fixed.desc(*stages)),
+            Self::Compute(shader) => {
+                backend.create_compute_pipeline(ComputePipelineDesc { shader: *shader })
+            }
+        }
+    }
 }
 
 /// The back thread's pipeline-key cache (module docs).
@@ -246,7 +279,9 @@ impl PipelineCache {
         self.entries.is_empty()
     }
 
-    /// How many keys were not recorded because the record was full.
+    /// How many times a key was not recorded because the record was full. This counts refused
+    /// record attempts, not distinct keys: a key refused again (by precompiling the same list a
+    /// second time, say) is counted again.
     pub fn unrecorded(&self) -> u64 {
         self.unrecorded
     }
@@ -264,20 +299,16 @@ impl PipelineCache {
         if let Some(stage) = mismatched_stage(&desc.stages, stamps) {
             return Err(PipelineCacheError::StampMismatch { stage });
         }
-        let fixed = FixedState::of(desc, self.dynamic);
-        let create =
-            |backend: &dyn Backend| backend.create_graphics_pipeline(fixed.desc(desc.stages));
+        let entry_key =
+            EntryKey::Graphics(desc.stages, Box::new(FixedState::of(desc, self.dynamic)));
         let (lookup, made) = self
-            .find_or_create(
-                EntryKey::Graphics(desc.stages, Box::new(fixed.clone())),
-                create,
-            )
+            .find_or_create(entry_key, Asker::Lookup)
             .map_err(|Full| self.full())?;
-        if made == Made::Created {
-            self.record(&PipelineKey::Graphics(Box::new(GraphicsKey {
+        if let Made::Created(EntryKey::Graphics(_, fixed)) = made {
+            self.record(Cow::Owned(PipelineKey::Graphics(Box::new(GraphicsKey {
                 stamps: *stamps,
-                fixed,
-            })));
+                fixed: *fixed,
+            }))));
         }
         Ok(lookup)
     }
@@ -292,12 +323,10 @@ impl PipelineCache {
         stamp: ShaderStamp,
     ) -> Result<Lookup, PipelineCacheError> {
         let (lookup, made) = self
-            .find_or_create(EntryKey::Compute(desc.shader), |backend| {
-                backend.create_compute_pipeline(desc)
-            })
+            .find_or_create(EntryKey::Compute(desc.shader), Asker::Lookup)
             .map_err(|Full| self.full())?;
-        if made == Made::Created {
-            self.record(&PipelineKey::Compute(stamp));
+        if let Made::Created(_) = made {
+            self.record(Cow::Owned(PipelineKey::Compute(stamp)));
         }
         Ok(lookup)
     }
@@ -329,7 +358,7 @@ impl PipelineCache {
     ) -> Precompiled {
         let mut done = Precompiled::default();
         for key in &list.keys {
-            self.record(key);
+            self.record(Cow::Borrowed(key));
             let outcome = match key {
                 PipelineKey::Graphics(graphics) => {
                     let fixed = &graphics.fixed;
@@ -343,7 +372,7 @@ impl PipelineCache {
                     };
                     self.find_or_create(
                         EntryKey::Graphics(stages, Box::new(fixed.clone())),
-                        |backend| backend.create_graphics_pipeline(fixed.desc(stages)),
+                        Asker::Precompile,
                     )
                 }
                 PipelineKey::Compute(stamp) => {
@@ -351,56 +380,56 @@ impl PipelineCache {
                         done.missing_shader += 1;
                         continue;
                     };
-                    let desc = ComputePipelineDesc { shader: id };
-                    self.find_or_create(EntryKey::Compute(id), |backend| {
-                        backend.create_compute_pipeline(desc)
-                    })
+                    self.find_or_create(EntryKey::Compute(id), Asker::Precompile)
                 }
             };
             let counter = match outcome {
                 Err(Full) => &mut done.full,
                 Ok((_, Made::Known)) => &mut done.known,
                 Ok((_, Made::Refused)) => &mut done.refused,
-                Ok((_, Made::Created)) => &mut done.queued,
+                Ok((_, Made::Created(_))) => &mut done.queued,
             };
             *counter += 1;
         }
         done
     }
 
-    /// The entry for `entry_key`, created through `create` when it is new. Returns the lookup
-    /// and what this call did. The one check that can refuse (a full cache) comes before the
-    /// backend is called; once it has been, the entry is stored and the call cannot fail.
+    /// The entry for `entry_key`, created through the backend when it is new. Returns the
+    /// lookup, as `asker` would report it, and what this call did. The one check that can refuse
+    /// (a full cache) comes before the backend is called; once it has been, the entry is stored
+    /// and the call cannot fail.
     fn find_or_create(
         &mut self,
         entry_key: EntryKey,
-        create: impl FnOnce(&dyn Backend) -> Result<PipelineId, RenderError>,
+        asker: Asker,
     ) -> Result<(Lookup, Made), Full> {
         if let Some(entry) = self.entries.get_mut(&entry_key) {
-            return Ok((poll(&*self.backend, entry), Made::Known));
+            return Ok((poll(&*self.backend, entry, asker), Made::Known));
         }
         if self.entries.len() >= self.limit {
             return Err(Full);
         }
-        match create(&*self.backend) {
+        match entry_key.create(&*self.backend) {
             Ok(id) => {
+                let made = Made::Created(entry_key.clone());
                 self.entries.insert(entry_key, Entry::Compiling(id));
-                Ok((Lookup::Compiling(id), Made::Created))
+                Ok((Lookup::Compiling(id), made))
             }
             Err(error) => {
                 let cause = FailCause::Refused(error);
-                self.entries.insert(entry_key, Entry::Failed(cause.clone()));
-                Ok((
-                    Lookup::Failed(Failure { newly: true, cause }),
-                    Made::Refused,
-                ))
+                let mut reported = false;
+                let lookup = report(&cause, &mut reported, asker);
+                self.entries
+                    .insert(entry_key, Entry::Failed { cause, reported });
+                Ok((lookup, Made::Refused))
             }
         }
     }
 
-    /// Records `key` unless it is recorded already; counts it when the record is full.
-    fn record(&mut self, key: &PipelineKey) {
-        if self.recorded.contains_key(key) {
+    /// Records `key` unless it is recorded already; counts the attempt when the record is full.
+    /// Copies `key` only when it is borrowed and recorded now.
+    fn record(&mut self, key: Cow<'_, PipelineKey>) {
+        if self.recorded.contains_key(key.as_ref()) {
             return;
         }
         if self.recorded.len() >= self.limit {
@@ -408,18 +437,15 @@ impl PipelineCache {
             return;
         }
         let at = self.recorded.len();
-        self.recorded.insert(key.clone(), at);
+        self.recorded.insert(key.into_owned(), at);
     }
 }
 
 /// A known entry's lookup: asks the backend only while the pipeline is compiling.
-fn poll(backend: &dyn Backend, entry: &mut Entry) -> Lookup {
+fn poll(backend: &dyn Backend, entry: &mut Entry, asker: Asker) -> Lookup {
     match entry {
         Entry::Ready(id) => Lookup::Ready(*id),
-        Entry::Failed(cause) => Lookup::Failed(Failure {
-            newly: false,
-            cause: cause.clone(),
-        }),
+        Entry::Failed { cause, reported } => report(cause, reported, asker),
         Entry::Compiling(id) => {
             let id = *id;
             match backend.pipeline_status(id) {
@@ -429,13 +455,24 @@ fn poll(backend: &dyn Backend, entry: &mut Entry) -> Lookup {
                     Lookup::Ready(id)
                 }
                 PipelineStatus::Failed => {
-                    *entry = Entry::Failed(FailCause::Compile);
-                    Lookup::Failed(Failure {
-                        newly: true,
-                        cause: FailCause::Compile,
-                    })
+                    let cause = FailCause::Compile;
+                    let mut reported = false;
+                    let lookup = report(&cause, &mut reported, asker);
+                    *entry = Entry::Failed { cause, reported };
+                    lookup
                 }
             }
         }
     }
+}
+
+/// The lookup of a pipeline that failed with `cause`, as `asker` reports it: newly failed when a
+/// lookup asks and no lookup has reported the failure yet (`reported`), which one then has.
+fn report(cause: &FailCause, reported: &mut bool, asker: Asker) -> Lookup {
+    let newly = asker == Asker::Lookup && !*reported;
+    *reported |= newly;
+    Lookup::Failed(Failure {
+        newly,
+        cause: cause.clone(),
+    })
 }

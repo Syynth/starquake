@@ -123,7 +123,7 @@ pub enum KeyListError {
 }
 
 /// The pipeline keys a [`super::PipelineCache`] has seen, in the order it first recorded them,
-/// each checked (module docs). Made by [`super::PipelineCache::key_list`] or read from a file's
+/// each checked when the list is written or read (module docs). Made by [`super::PipelineCache::key_list`] or read from a file's
 /// bytes, and handed to [`super::PipelineCache::precompile`] on the next boot.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct KeyList {
