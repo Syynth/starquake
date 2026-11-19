@@ -46,6 +46,7 @@ pub mod exchange;
 #[cfg(test)]
 mod gpu_harness;
 pub mod host;
+pub mod interp;
 pub mod ir;
 pub mod lookup;
 pub mod lower;
