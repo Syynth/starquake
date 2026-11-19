@@ -39,7 +39,7 @@
 //! | `IMAD` | negation | negation | negation | PR #4588 only (`Visitor::IMAD`: `neg_a`, `b.negate`, `c.negate`); NAK's sources are `ALU` |
 //! | `LEA`, `LEA.X` | (bit 72 is the shifted value's modifier) | negation in the wide slot only (bit 75 is the shift in forms 2, 3 and 7) | none | NAK `I32`/`B32` |
 //! | `IDP` | negation | negation | negation | NAK `I32` |
-//! | `POPC`, `FLO` | | not | | NAK: `set_field(63..64, not_mod)` |
+//! | `POPC`, `FLO` | | not, except in form 4 (see below) | | NAK: `set_field(63..64, not_mod)`; PR #4588: `not_source = Take(63, 1)` |
 //! | every other | none | none | none | NAK `ALU` |
 //!
 //! # Decisions taken here
@@ -52,12 +52,14 @@
 //! - **A field NAK writes as a constant (or not at all) that PR #4588 reads with a meaning is a
 //!   field of the op** (the control group's convention): `LOP3`'s predicate destination,
 //!   `ISETP`'s second destination, `LEA`'s `.SX32` (bit 73), `IMAD`'s `.X` (bit 74) and the
-//!   carry inputs of `IADD3`, `LEA` and `IMAD` without `.X` (87..91, and 77..81 for
-//!   `IADD3`). **Conflict** for those carry inputs: NAK's `IADD3` writes `!PT`, its `LEA` and
-//!   `IMAD` write nothing (0, `P0`), and PR #4588 requires `!PT` in all three. Kept as a field so
-//!   every such word decodes and re-assembles; printed only by the `.X` forms, as `nvdisasm`
-//!   leaves NAK's `P0` out of `LEA`'s text (`nvdisasm_tests.rs`, `test_lea`), so two words that
-//!   differ only there print the same.
+//!   carry inputs of `IADD3`, `LEA`, `IMAD` without `.X` and `IMAD.WIDE` (87..91, and 77..81
+//!   for `IADD3`). **Conflict** for those carry inputs: NAK's `IADD3` writes `!PT`, its `LEA`,
+//!   `IMAD` and `IMAD.WIDE` (`OpIMad64`) write nothing (0, `P0`), and PR #4588 requires `!PT` in
+//!   each of the four (`Visitor::IADD3`, `LEA`, `IMAD`, and `IMAD_WIDE`: `Require(Take(87, 4) ==
+//!   0xf, "native wide multiply carry input")`). Kept as a field so every such word decodes and
+//!   re-assembles; printed only by the `.X` forms (never by `IMAD.WIDE`, whose
+//!   [`OpIMad64::carry`] is never printed), as `nvdisasm` leaves NAK's `P0` out of `LEA`'s text
+//!   (`nvdisasm_tests.rs`, `test_lea`), so two words that differ only there print the same.
 //! - **`IMAD.HI` is a mode of [`OpIMad`]** ([`IMadMode::Hi`]), not a variant of its own, so the
 //!   `Op` enum is unchanged (the proposals' "Shader decoder follow-ups" left it unowned). Its
 //!   forms are PR #4588's rows: 1, 4 and 5 (`0x227`, `0x827`, `0xa27`).
@@ -74,6 +76,20 @@
 //! - **`IDP`'s bit 76** is PR #4588's `.2A` mode (`Visitor::IDP`: "IDP.2A.LO.U16.U8"), read in
 //!   form 1 only, the one row that marks it (`0x226`); NAK's `OpIDp4` is the `.4A` mode with the
 //!   bit clear. The text `idp.2a.lo` and the type names in that mode are guesses.
+//! - **`POPC`'s and `FLO`'s form 4 (`0x909`, `0x900`) read bit 63 as the immediate's bit 31.**
+//!   **Conflict**: both references read bit 63 as the bitwise-not modifier in every form. NAK
+//!   writes the 32-bit immediate (`encode_alu_imm`, bits 32..64) and then `set_field(63..64,
+//!   not_mod)` over its top bit, and its `legalize` for `OpPopC` and `OpFlo` lets an immediate
+//!   source through; PR #4588's `Visitor::POPC` and `Visitor::FLO` read `not_source = Take(63,
+//!   1)` in every form and also read the immediate as `Take(32, 32)` (`WideSlot`), bit 63
+//!   included. So for `popc r0, 0x80000000` (form 4, bit 63 set, bits 32..63 clear) this
+//!   decoder computes `popc(0x80000000)` = 1, PR #4588 `popc(~0x80000000)` = 31, and NAK's
+//!   encoder would have produced the word for `popc(~x)` with any `x` whose low 31 bits are
+//!   clear. The references disagree with each other on bit 31 of the value, and an
+//!   [`AluSrc::Imm`] has no modifier, so this decoder keeps the plain 32-bit immediate every
+//!   other integer instruction's form 4 has; owner question (which reading the hardware
+//!   follows needs an `nvdisasm` or hardware check). Pinned by
+//!   `decode::tests::integer::popc_and_flo_form_4_read_bit_63_as_immediate_bit_31`.
 //! - **`SGXT`'s bit 75** is `.W` (NAK: `set_bit(75, false); // .W (wrap vs clamp)`), a field
 //!   though NAK writes it clear and PR #4588 does not read it.
 //!
@@ -88,6 +104,18 @@
 //! | `IDP`'s bits 72 to 75 in its `.2A` mode | Read as in `.4A` (PR #4588 requires them clear) | `decode::tests::integer::hand_built_words_pin_each_field` |
 //! | `P2R`'s and `R2P`'s bit 39, `R2P`'s bits 16..24 | Rejected: PR #4588's translator requires them clear (`Visitor::P2R`, `Visitor::R2P`) though its rows mark them known | `integer_dropped_bits_are_refused` |
 //! | `MOV`'s bits 62 and 63 | Rejected (see `MOV`, below) | `decode::tests::mov_rejects_source_modifier_bits` |
+//! | `POPC`'s and `FLO`'s bit 63 in form 4 (`0x909`, `0x900`) | Read as the immediate's bit 31, not as PR #4588's (and NAK's) not modifier (see "Decisions taken here") | `decode::tests::integer::popc_and_flo_form_4_read_bit_63_as_immediate_bit_31` |
+//!
+//! # Divergence from NAK's encoder
+//!
+//! NAK asserts that hardware needs one of two operands unmodified: `IADD3` and `IADD3.X`
+//! (`assert!(self.srcs[0].is_unmodified() || self.srcs[1].is_unmodified())`, "Hardware requires
+//! at least one of these be unmodified") and `LEA` and `LEA.X` (`assert!(self.intermediate_mod
+//! == SrcMod::None || self.b.src_mod == SrcMod::None)`). This decoder and the assembler (`asm::integer`) are looser: they accept
+//! `IADD3` and `IADD3.X` with sources 0 and 1 both modified, and `LEA` and `LEA.X` with both the
+//! shifted value and `b` modified, words NAK's encoder never produces. Whether hardware refuses
+//! them is unconfirmed; they are decoded so that no word a reference might meet is lost. Pinned
+//! by `decode::tests::integer::both_modified_add_operands_are_accepted`.
 //!
 //! Every other row's mask is the form's exactly, fixed fields aside
 //! (`decode::tests::masks_match_the_reference_table`).
@@ -1623,7 +1651,7 @@ impl Display for OpIMad {
 fn decode_imad(reader: &mut Reader) -> Result<Op, DecodeError> {
     let form = alu::form(reader)?;
     fixed_field(reader, PRED_DST.mask());
-    let hi = reader.opcode() & 0x1ff == u64::from(IMAD_HI_OPCODE);
+    let hi = reader.opcode() == u64::from(form.opcode(IMAD_HI_OPCODE));
     let (kind, mode) = if hi {
         fixed_field(reader, NOT_PT_INPUT);
         (Alu::IMadHi, IMadMode::Hi)

@@ -405,6 +405,15 @@ fn hand_built_words_of_plop3_p2r_and_r2p_decode() {
         "r2p pr, r9.b2, 0x7f;"
     );
     assert_eq!(text(word(0x804, &[(24, 9), (32, 1)])), "r2p pr, r9, 0x1;");
+    // The byte suffix at both ends of the field past 0: byte 1 and byte 3 (bits 76..78).
+    assert_eq!(
+        text(word(0x804, &[(24, 9), (32, 1), (76, 1)])),
+        "r2p pr, r9.b1, 0x1;"
+    );
+    assert_eq!(
+        text(word(0x804, &[(24, 9), (32, 1), (76, 3)])),
+        "r2p pr, r9.b3, 0x1;"
+    );
 }
 
 /// One field case: the opcode, the fields beside [`field_text`]'s base, and the text.
@@ -517,7 +526,7 @@ const LOGIC_FIELDS: [FieldCase; 24] = [
 ];
 
 /// `IMAD`, `IMAD.WIDE`, `IMAD.HI` and `IDP`.
-const MULTIPLY_FIELDS: [FieldCase; 14] = [
+const MULTIPLY_FIELDS: [FieldCase; 15] = [
     (
         0x024,
         &[(72, 1), (81, 7), (87, 0xf)],
@@ -559,6 +568,11 @@ const MULTIPLY_FIELDS: [FieldCase; 14] = [
         0x026,
         &[(76, 1), (72, 1)],
         "idp.2a.lo.u16.u8 r1, -r2, r3, r5;",
+    ),
+    (
+        0x026,
+        &[(76, 1), (73, 1), (74, 1)],
+        "idp.2a.lo.s16.s8 r1, r2, r3, r5;",
     ),
 ];
 
@@ -777,7 +791,7 @@ fn integer_checks_run_in_the_documented_order() {
     // Step 3 cannot meet step 4 in one form of this group: the forms with fixed fields have no
     // field with undefined values.
     for form in integer::FORMS {
-        let refuses_values = [0x00c, 0x016].contains(&(form.opcode & 0x1ff));
+        let refuses_values = [0x00c, 0x016].contains(&base_of(form.opcode));
         assert!(!(refuses_values && form.fixed & !SLOT_UNIFORM.mask() != 0));
     }
 }
@@ -809,6 +823,89 @@ fn integer_dropped_bits_are_refused() {
     }
     // The bits every row drops, summed over the rows (a row that loses one fails).
     assert_eq!(refused, 212);
+}
+
+/// `POPC`'s and `FLO`'s form 4 read bit 63 as the immediate's bit 31, where NAK and PR #4588
+/// read it as the bitwise-not modifier (`op::integer`'s module docs, "Conflict" and the
+/// divergence table): a word with bit 63 set decodes to the immediate `0x80000000`, unmodified,
+/// and re-assembles to itself.
+#[test]
+fn popc_and_flo_form_4_read_bit_63_as_immediate_bit_31() {
+    let popc = word(0x909, &[(16, 1), (32, 0x8000_0000)]);
+    let decoded = decode(popc).expect("form 4 of POPC decodes");
+    assert_eq!(
+        decoded.op,
+        Op::PopC(OpPopC {
+            dst: r(1),
+            src: AluSrc::Imm(0x8000_0000),
+        })
+    );
+    assert_eq!(decoded.to_string(), "popc r1, 0x80000000;");
+    assert_eq!(assemble(&decoded).map(Instruction::bits), Ok(popc.bits()));
+    let flo = word(0x900, &[(16, 1), (32, 0x8000_0001), (81, 7)]);
+    let decoded = decode(flo).expect("form 4 of FLO decodes");
+    assert_eq!(
+        decoded.op,
+        Op::Flo(OpFlo {
+            dst: r(1),
+            src: AluSrc::Imm(0x8000_0001),
+            signed: false,
+            return_shift_amount: false,
+        })
+    );
+    assert_eq!(decoded.to_string(), "flo.u32 r1, 0x80000001;");
+    assert_eq!(assemble(&decoded).map(Instruction::bits), Ok(flo.bits()));
+}
+
+/// NAK's encoder asserts that `IADD3` and `IADD3.X` leave source 0 or source 1 unmodified and
+/// that `LEA` and `LEA.X` leave the shifted value or `b` unmodified ("Hardware requires at
+/// least one of these be unmodified"); this decoder and the assembler accept both modified
+/// (`op::integer`'s module docs, the divergence table). Each such form 1 word decodes, prints
+/// both modifiers and re-assembles to itself.
+#[test]
+fn both_modified_add_operands_are_accepted() {
+    let cases: [FieldCase; 4] = [
+        (
+            0x010,
+            &[(77, 0xf), (81, 7), (84, 7), (87, 0xf), (72, 1), (63, 1)],
+            "iadd3 r1, -r2, -r3, r5;",
+        ),
+        (
+            0x010,
+            &[
+                (77, 0xf),
+                (81, 7),
+                (84, 7),
+                (87, 0xf),
+                (72, 1),
+                (63, 1),
+                (74, 1),
+            ],
+            "iadd3.x r1, ~r2, ~r3, r5, !pt, !pt;",
+        ),
+        (
+            0x011,
+            &[(72, 1), (63, 1), (81, 7)],
+            "lea r1, -r2, -r3, r5, 0x0;",
+        ),
+        (
+            0x011,
+            &[(72, 1), (63, 1), (74, 1), (81, 7), (87, 0xf)],
+            "lea.x r1, ~r2, ~r3, r5, 0x0, !pt;",
+        ),
+    ];
+    for (opcode, own, expected) in cases {
+        assert_eq!(field_text(opcode, own), expected);
+        let mut fields = vec![(16, 1), (24, 2), (32, 3), (64, 5), (9, 1)];
+        fields.extend_from_slice(own);
+        let built = word(opcode, &fields);
+        let decoded = decode(built).expect("decodes");
+        assert_eq!(
+            assemble(&decoded).map(Instruction::bits),
+            Ok(built.bits()),
+            "{expected}"
+        );
+    }
 }
 
 /// The rows of PR #4588's table this group does not decode: forms 2, 3 and 7 of the
@@ -1378,7 +1475,7 @@ proptest! {
                 prop_assert!([3, 5].contains(&(opcode >> 9)), "{opcode:#x}");
             }
             Err(DecodeError::UnknownValue { opcode, bit, width, value }) => {
-                let base = opcode & 0x1ff;
+                let base = base_of(opcode);
                 prop_assert!(
                     (base == 0x00c && (bit, width, value) == (74, 2, 3))
                         || (base == 0x016 && (bit, width, value) == (72, 3, 7)),
