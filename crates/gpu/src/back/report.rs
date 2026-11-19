@@ -1,17 +1,15 @@
 //! The 3D class's report semaphore: what a write to `SET_REPORT_SEMAPHORE_D` asks the back to
-//! do (gpu-protocol spec, "Releases and completion", and "Deferred, not ruled out", "Queries":
-//! "report semaphores (`SET_REPORT_SEMAPHORE_A`–`D`) first write the values the front can know
-//! (payloads, a timestamp from guest time); host queries plug into the fenced completion path
-//! later").
+//! do (gpu-protocol spec, "Releases and completion", "Report semaphores", decided by the owner
+//! on 2026-11-19).
 //!
-//! This is the first half of that sentence, and only it: a report of **no counter**
-//! (`REPORT` = `NONE`) releases the payload in `SET_REPORT_SEMAPHORE_C` at the address in
-//! `SET_REPORT_SEMAPHORE_A/B`, as a fenced release like every other ([`FencedAction::Release`],
-//! `back::fence`). The native SDK ends a queue's work with one and waits for the word to
-//! change, so without it a title stops after its first submissions. Counter reports (occlusion
-//! counts, primitive counts, timestamps) are the second half and are still deferred. The
-//! compute class's report semaphore (`clc7c0.h`'s `SET_REPORT_SEMAPHORE_A`–`D`) is not handled
-//! here: it is issue #458.
+//! A report of **no counter** (`REPORT` = `NONE`) releases the payload in
+//! `SET_REPORT_SEMAPHORE_C` at the address in `SET_REPORT_SEMAPHORE_A/B`, as a fenced release
+//! like every other ([`FencedAction::Release`], `back::fence`). The native SDK ends a queue's
+//! work with one and waits for the word to change, so without it a title stops after its first
+//! submissions. A counter report (occlusion counts, primitive counts, timestamps) writes
+//! nothing, as the spec has it until a title needs one (below, "Divergences"). The compute
+//! class's report semaphore (`clc7c0.h`'s `SET_REPORT_SEMAPHORE_A`–`D`), which the spec's
+//! paragraph also covers, is not handled here: it is issue #458.
 //!
 //! Method numbers and fields are `clc797.h`'s (`mesa-nouveau/src/nouveau/headers/nvidia/classes/`
 //! @ 52238762, MIT), read through the generated [`clc797`]. The behaviour is that of Eden-NX2's
@@ -76,8 +74,8 @@
 //!   path's fake clock (`back::exec::tests::a_four_word_payload_report_writes_the_payload_and_the_timestamp`).
 //! - **A counter report writes nothing.** Eden-NX2 answers the kinds its backend counts from
 //!   host queries, and every other kind as a payload of 1 (`streamer == nullptr`:
-//!   `counter_type = QueryType::Payload; payload = 1U`). Which of those this project wants is
-//!   the deferred half of the spec's sentence; until then such a write is logged once per run
+//!   `counter_type = QueryType::Payload; payload = 1U`). The spec writes nothing until a title
+//!   needs one, then Eden-NX2's stand-in of 1; until then such a write is logged once per run
 //!   by the executor and nothing is written, so a title that waits on one still stops
 //!   (`tests::a_counter_report_is_not_a_release`).
 //! - **A release whose address is not mapped is a failed release**, found when it is performed
