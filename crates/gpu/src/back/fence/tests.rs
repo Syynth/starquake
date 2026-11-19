@@ -104,7 +104,7 @@ fn within<T: Send + 'static>(body: impl FnOnce() -> T + Send + 'static) -> T {
 
 /// A settable clock whose timestamps read [`TIMESTAMP`].
 #[derive(Default)]
-struct Clock(Mutex<Duration>);
+pub(crate) struct Clock(Mutex<Duration>);
 
 impl Clock {
     fn set(&self, now: Duration) {
@@ -123,7 +123,7 @@ impl FenceClock for Clock {
 
 /// gsv's completion queue, recorded.
 #[derive(Default)]
-struct Pushed(Mutex<Vec<GpuCompletion>>);
+pub(crate) struct Pushed(Mutex<Vec<GpuCompletion>>);
 
 impl Pushed {
     fn all(&self) -> Vec<GpuCompletion> {
@@ -139,7 +139,7 @@ impl Completions for Pushed {
 
 /// The front's wake-up, recorded.
 #[derive(Default)]
-struct Front(Mutex<Vec<Report>>);
+pub(crate) struct Front(Mutex<Vec<Report>>);
 
 impl Front {
     fn all(&self) -> Vec<Report> {
@@ -209,8 +209,8 @@ struct LateState {
 /// values can be scripted out of order ([`LateBackend::script`]); [`LateBackend::refuse_next`]
 /// refuses one list (after which the next is accepted); and [`LateBackend::finish_silently`]
 /// completes without the wake, to play a backend that breaks the contract.
-struct LateBackend {
-    inner: RecordingBackend,
+pub(crate) struct LateBackend {
+    pub(crate) inner: RecordingBackend,
     state: Mutex<LateState>,
     moved: Condvar,
     wake: CompletionWake,
@@ -218,8 +218,14 @@ struct LateBackend {
 
 impl LateBackend {
     fn new(wake: CompletionWake) -> Self {
+        Self::with_caps(caps(), 0, wake)
+    }
+
+    /// A late backend with `caps` and a memory budget of `memory_allowed` bytes (the executor's
+    /// tests, slice G19, draw through it).
+    pub(crate) fn with_caps(caps: Caps, memory_allowed: u64, wake: CompletionWake) -> Self {
         Self {
-            inner: RecordingBackend::new(caps(), 0),
+            inner: RecordingBackend::new(caps, memory_allowed),
             state: Mutex::new(LateState::default()),
             moved: Condvar::new(),
             wake,
@@ -238,7 +244,7 @@ impl LateBackend {
         self.state().refuse_next = true;
     }
 
-    fn submitted(&self) -> Vec<FenceValue> {
+    pub(crate) fn submitted(&self) -> Vec<FenceValue> {
         self.state().submitted.clone()
     }
 
@@ -248,7 +254,7 @@ impl LateBackend {
     }
 
     /// Completes everything up to `fence`, then wakes.
-    fn finish(&self, fence: FenceValue) {
+    pub(crate) fn finish(&self, fence: FenceValue) {
         self.set_completed(fence);
         self.wake.wake();
     }

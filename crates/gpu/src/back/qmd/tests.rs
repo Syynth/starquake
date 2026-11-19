@@ -59,7 +59,7 @@ fn set_element(words: &mut [u32; QMD_WORDS], array: MwArray, index: u32, value: 
 
 /// One release slot as the test encoder writes it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct SlotSpec {
+pub(crate) struct SlotSpec {
     address: u64,
     payload: u32,
     /// `RELEASE*_MEMBAR_TYPE` (bit 19 of the slot's second word).
@@ -75,7 +75,7 @@ struct SlotSpec {
 
 impl SlotSpec {
     /// A plain one-word release of `payload` to `address`.
-    fn write(address: u64, payload: u32) -> Self {
+    pub(crate) fn write(address: u64, payload: u32) -> Self {
         Self {
             address,
             payload,
@@ -91,13 +91,13 @@ impl SlotSpec {
 
 /// Everything the test encoder writes.
 #[derive(Clone, Copy, Debug)]
-struct Spec {
+pub(crate) struct Spec {
     major: u32,
     minor: u32,
     queue: bool,
     require_scheduling_pcas: bool,
     counter: u16,
-    dispatch: Dispatch,
+    pub(crate) dispatch: Dispatch,
     slots: [Option<SlotSpec>; RELEASE_SLOTS],
     dependent: Option<Dependent>,
     second_dependent: bool,
@@ -106,7 +106,7 @@ struct Spec {
 impl Spec {
     /// A runnable QMD: version 3.0, a 1x1x1 grid of 1x1x1 blocks, program `program`, nothing
     /// else.
-    fn new(program: u64) -> Self {
+    pub(crate) fn new(program: u64) -> Self {
         Self {
             major: QMD_MAJOR_VERSION,
             minor: QMD_MINOR_VERSION,
@@ -134,7 +134,7 @@ impl Spec {
         self
     }
 
-    fn slot(mut self, slot: usize, spec: SlotSpec) -> Self {
+    pub(crate) fn slot(mut self, slot: usize, spec: SlotSpec) -> Self {
         self.slots[slot] = Some(spec);
         self
     }
@@ -154,7 +154,7 @@ fn hi(x: u64) -> u32 {
 }
 
 /// The test encoder: every field through the decoder's own constants.
-fn encode(spec: &Spec) -> [u32; QMD_WORDS] {
+pub(crate) fn encode(spec: &Spec) -> [u32; QMD_WORDS] {
     let mut w = [0u32; QMD_WORDS];
     set(&mut w, q::QMDV03_00_QMD_MAJOR_VERSION, spec.major);
     set(&mut w, q::QMDV03_00_QMD_VERSION, spec.minor);

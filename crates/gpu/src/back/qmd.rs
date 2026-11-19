@@ -185,7 +185,7 @@
 //!   itself as the action; the issue for this slice covers only `SEND_SIGNALING_PCAS2_B`.
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use std::collections::BTreeMap;
 

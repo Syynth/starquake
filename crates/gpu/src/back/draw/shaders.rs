@@ -557,15 +557,29 @@ impl HostShaders {
 
     /// The host shader for `shader`, stamped `info.stamp`, made on first use.
     pub fn get(&mut self, shader: &HostShader, info: &StageInfo) -> Result<ShaderId, DrawError> {
+        self.get_as(shader, info, host_stage(shader.stage))
+    }
+
+    /// [`HostShaders::get`], made as a shader of `stage` whatever `shader.stage` says: the
+    /// executor's compute path (slice G19) makes compute shaders this way, since
+    /// [`HostStage`] has no compute stage yet.
+    pub fn get_as(
+        &mut self,
+        shader: &HostShader,
+        info: &StageInfo,
+        stage: ShaderStage,
+    ) -> Result<ShaderId, DrawError> {
         if let Some(&id) = self.by_stamp.get(&info.stamp) {
             return Ok(id);
         }
         if self.by_stamp.len() >= self.limit {
             return Err(DrawError::ShadersFull { limit: self.limit });
         }
+        let mut desc = shader_desc(shader, &info.resources);
+        desc.stage = stage;
         let id = self
             .backend
-            .create_shader(shader_desc(shader, &info.resources))
+            .create_shader(desc)
             .map_err(DrawError::Render)?;
         self.by_stamp.insert(info.stamp, id);
         Ok(id)

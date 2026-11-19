@@ -127,7 +127,7 @@ pub mod shaders;
 pub mod targets;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -546,6 +546,11 @@ impl Draws {
             }
             Started::Draw(call) => self.counted(ctx, mirror, &call).map(Some),
         }
+    }
+
+    /// Whether a begin/end has deferred instances for [`Draws::flush`] to draw.
+    pub fn has_deferred(&self) -> bool {
+        self.calls.has_deferred()
     }
 
     /// Draws the instances a begin/end deferred, if any (Eden's `DrawDeferred` after a macro).

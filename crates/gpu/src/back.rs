@@ -24,11 +24,13 @@
 //! - [`draw`]: draws (slice G18): 3D state to a `Command::Draw`, with shader lookups, the
 //!   variant key, bindings through the caches, driver constants and conditional render.
 //!
-//! A later slice adds the executor that feeds them all from the ring (G19).
+//! - [`exec`]: the executor (slice G19): ring entries to the engines above, compute dispatches
+//!   to `Command::Dispatch`, presents to `Command::Present`, and the commands to the fence path.
 
 pub mod buffer;
 pub mod copy;
 pub mod draw;
+pub mod exec;
 pub mod fence;
 pub mod pipeline;
 pub mod qmd;

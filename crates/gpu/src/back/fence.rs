@@ -194,7 +194,7 @@
 mod waiters;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 pub use waiters::{Waiter, WaiterTable};
 
@@ -491,6 +491,8 @@ pub struct Fences {
     counters: FenceCounters,
     /// The newest fence submitted since [`Fences::take_submitted`] last looked.
     submitted: Option<FenceValue>,
+    /// The newest fence ever submitted.
+    newest: FenceValue,
     /// Updates applied since [`Fences::take_applied`] last looked, in the order applied.
     applied: Vec<(AsId, VmUpdate)>,
 }
@@ -648,6 +650,7 @@ impl Fences {
             seen,
             counters: FenceCounters::default(),
             submitted: None,
+            newest: FenceValue::default(),
             applied: Vec::new(),
         }
     }
@@ -658,6 +661,12 @@ impl Fences {
     /// reasons of the fence path's own (a waiter, the elapsed time, an empty ring).
     pub fn take_submitted(&mut self) -> Option<FenceValue> {
         self.submitted.take()
+    }
+
+    /// The newest fence value any list was submitted with; [`FenceValue::default`] before the
+    /// first. [`Fences::take_submitted`] does not change it.
+    pub fn newest_submitted(&self) -> FenceValue {
+        self.newest
     }
 
     /// The ordered updates applied since the last call, with their address spaces, in the order
@@ -733,9 +742,7 @@ impl Fences {
         let report = self.complete();
         match waited {
             Ok(WaitOutcome::Reached) => Ok(Settled::Performed(report)),
-            Ok(WaitOutcome::TimedOut) => Err(FenceError::CatchUpTimedOut {
-                fence: fence.get(),
-            }),
+            Ok(WaitOutcome::TimedOut) => Err(FenceError::CatchUpTimedOut { fence: fence.get() }),
             Err(error) => Err(FenceError::Wait(error)),
         }
     }
@@ -814,6 +821,7 @@ impl Fences {
         match self.backend.submit(list) {
             Ok(fence) => {
                 self.submitted = Some(self.submitted.map_or(fence, |seen| seen.max(fence)));
+                self.newest = self.newest.max(fence);
                 self.counters.closed.count(reason);
                 tracing::trace!(?reason, fence = fence.get(), "command list submitted");
                 self.in_flight.push_back(InFlight { fence, actions });
