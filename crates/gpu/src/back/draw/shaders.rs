@@ -84,7 +84,7 @@ use starquake_render::shader::{
 };
 use starquake_render::{Backend, PixelFormat, ShaderId};
 use starquake_shader::exchange::{SampledType, TextureFormat, TextureKind};
-use starquake_shader::host::{GuestSlot, HostCode, HostShader, HostStage, SlotBinding, SlotType};
+use starquake_shader::host::{HostCode, HostShader, HostStage, SlotBinding, SlotType};
 use starquake_shader::lookup::{
     EngineState, GuestStage, ProgramMemory, ProgramRequest, Rejection, ShaderSet, Ticket, Unmapped,
     VariantKey,
@@ -391,16 +391,18 @@ pub const fn key_compare(compare: starquake_render::resource::CompareFunction) -
     }
 }
 
-/// The key's mirror of the backend's emulation flags; `alpha` is the alpha function, used only
-/// when `ALPHA_TEST` is set.
+/// The key's mirror of the backend's emulation flags; `alpha` is the alpha test's function
+/// (`None` while the test is off), copied in only when `ALPHA_TEST` is set. The backend's
+/// `emulation()` sets `ALPHA_TEST` only for `Some`, so the key's function is present exactly
+/// when the flag is.
 pub fn emulation_key(
     flags: EmulationFlags,
-    alpha: starquake_render::resource::CompareFunction,
+    alpha: Option<starquake_render::resource::CompareFunction>,
 ) -> EmulationKey {
     EmulationKey {
-        alpha_test: flags
-            .contains(EmulationFlags::ALPHA_TEST)
-            .then(|| key_compare(alpha)),
+        alpha_test: alpha
+            .filter(|_| flags.contains(EmulationFlags::ALPHA_TEST))
+            .map(key_compare),
         depth_range_rewrite: flags.contains(EmulationFlags::DEPTH_RANGE_REWRITE),
         primitive_restart_rewrite: flags.contains(EmulationFlags::PRIMITIVE_RESTART_REWRITE),
         attribute_fetch: flags.contains(EmulationFlags::ATTRIBUTE_FETCH),
@@ -477,7 +479,6 @@ pub fn shader_desc(shader: &HostShader, resources: &[ResourceUse]) -> ShaderDesc
     let HostCode::Naga { module, info } = &shader.code;
     let slots = |list: &[starquake_shader::host::InterfaceSlot]| {
         list.iter()
-            .filter(|slot| !matches!(slot.guest, GuestSlot::LaneId))
             .filter_map(|slot| variable(slot.binding, slot.ty))
             .collect()
     };

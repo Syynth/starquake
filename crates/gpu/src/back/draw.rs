@@ -12,7 +12,8 @@
 //!
 //! 1. **Conditional render** (`SET_RENDER_ENABLE_*`): a draw the guest disabled is skipped
 //!    ([`Skip::RenderDisabled`]) before anything is derived, as Eden checks `ShouldExecute`
-//!    before `rasterizer->Draw` ([`conditional`]).
+//!    before `rasterizer->Draw`. The answer is worked out when `SET_RENDER_ENABLE_C` is written
+//!    and kept, as Eden keeps `execute_on` ([`conditional`]).
 //! 2. **Parts** ([`fixed`]): each part is derived again only when a group it reads is dirty, and
 //!    the dirty groups are cleared once every part is derived. The render targets, the program
 //!    addresses, the alpha test, the topology override and the sample mode are read every draw.
@@ -362,6 +363,9 @@ pub struct Draws {
     uploaded: Option<Vec<u8>>,
     last_targets: Option<RenderTargets>,
     last_fence: FenceValue,
+    /// Whether draws render (Eden's `execute_on`, true until `SET_RENDER_ENABLE_C` says
+    /// otherwise).
+    execute: bool,
     counters: DrawCounters,
 }
 
@@ -398,6 +402,7 @@ impl Draws {
             uploaded: None,
             last_targets: None,
             last_fence: FenceValue::default(),
+            execute: true,
             counters: DrawCounters::default(),
         }
     }
@@ -452,6 +457,10 @@ impl Draws {
         method: u32,
         value: u32,
     ) -> Result<Option<Outcome>, DrawError> {
+        if method == clc797::SET_RENDER_ENABLE_C.method() {
+            self.execute = conditional::render_enabled(mirror, ctx.memory)?;
+            return Ok(None);
+        }
         match self.calls.method(mirror, method, value)? {
             Started::Nothing => Ok(None),
             Started::Unhandled(name) => {
@@ -608,7 +617,7 @@ impl Draws {
         call: &DrawCall,
     ) -> Result<Outcome, DrawError> {
         // Step 1.
-        if !conditional::render_enabled(mirror, ctx.memory)? {
+        if !self.execute {
             return Ok(Outcome::Skipped(Skip::RenderDisabled));
         }
         // Step 2.
@@ -631,11 +640,17 @@ impl Draws {
             .reg(&clc797::SET_ALPHA_TEST, &[])?
             .field(clc797::SET_ALPHA_TEST_ENABLE)?
             != 0;
-        let alpha_func = fixed::compare(
-            mirror
-                .reg(&clc797::SET_ALPHA_FUNC, &[])?
-                .named(clc797::SET_ALPHA_FUNC_V)?,
-        )?;
+        // The function is read only while the test is on: a register never written holds 0,
+        // which the header does not name.
+        let alpha_func = if alpha_on {
+            Some(fixed::compare(
+                mirror
+                    .reg(&clc797::SET_ALPHA_FUNC, &[])?
+                    .named(clc797::SET_ALPHA_FUNC_V)?,
+            )?)
+        } else {
+            None
+        };
         let alpha_ref = mirror.reg(&clc797::SET_ALPHA_REF, &[])?.float();
         let minus_one_to_one = mirror
             .reg(&clc797::SET_VIEWPORT_Z_CLIP, &[])?
@@ -648,7 +663,7 @@ impl Draws {
         let flags = emulation(
             &caps,
             &EmulationState {
-                alpha_test: alpha_on.then_some(alpha_func),
+                alpha_test: alpha_func,
                 depth_range: if minus_one_to_one {
                     DepthRange::MinusOneToOne
                 } else {

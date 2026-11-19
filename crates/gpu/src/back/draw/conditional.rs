@@ -1,6 +1,6 @@
-//! Conditional rendering: whether the guest let the next draw render (gpu-protocol spec, "3D:
-//! from state to a draw": "Conditional rendering (`SET_RENDER_ENABLE_*`) is evaluated here from
-//! the query value in guest memory").
+//! Conditional rendering: whether the guest lets draws render (gpu-protocol spec, "3D: from
+//! state to a draw": "Conditional rendering (`SET_RENDER_ENABLE_*`) is evaluated here from the
+//! query value in guest memory").
 //!
 //! A port of Eden-NX2's `ProcessQueryCondition`
 //! (`eden-nx2/src/video_core/engines/maxwell_3d.cpp` @ 50fa86bb, GPL-3.0-or-later), with the
@@ -14,17 +14,21 @@
 //! - `RENDER_IF_EQUAL`: when the initial sequence and mode equal the current ones;
 //! - `RENDER_IF_NOT_EQUAL`: when either differs.
 //!
+//! **When.** As in Eden, the answer is worked out when `SET_RENDER_ENABLE_C` is written, in
+//! stream order on the back thread, and kept for every draw until the next such write
+//! ([`super::Draws::method`] calls [`render_enabled`] for each such word); before the first
+//! write every draw renders (Eden's `execute_on{true}`), although the register then holds
+//! `FALSE`. A change to the override, the address or the report after the mode write changes
+//! nothing until the mode is written again, as in Eden.
+//!
 //! # Divergences from Eden-NX2
 //!
-//! - **Evaluated at each draw**, as the spec says, where Eden evaluates once when the mode
-//!   register is written and keeps the answer: a change to the report between the mode write and
-//!   a draw changes the answer here. `tests::conditional_render_reads_the_report_at_the_draw`.
 //! - **An undefined mode or override is an error** ([`DrawError::State`]), where Eden renders
-//!   for an undefined mode and logs. The mode field is three bits and the header names five
-//!   values; the override field is two bits and names three.
+//!   for an undefined mode and logs; the kept answer is then unchanged. The mode field is three
+//!   bits and the header names five values; the override field is two bits and names three.
 //!   `tests::an_undefined_render_enable_mode_is_an_error`.
-//! - **A report that cannot be read is an error** ([`DrawError::Fault`]); Eden's `ReadBlock`
-//!   reads whatever the memory manager gives.
+//! - **A report that cannot be read is an error** ([`DrawError::Fault`]), and the kept answer is
+//!   unchanged; Eden's `ReadBlock` reads whatever the memory manager gives.
 //!
 //! The catch-up the spec asks for "when that value is still pending" (a release not yet
 //! performed will write it) is the executor's (slice G19): this reads guest memory as it is.

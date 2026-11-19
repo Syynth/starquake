@@ -643,15 +643,14 @@ fn blend(three_d: ThreeD<'_>) -> Result<BlendPart, DrawError> {
             }
         }
         slot.write_mask = write_mask;
-        if index == 0 {
-            let (color, alpha) = equations(shared, &target, per_target)?;
-            dual_source = [color.src, color.dst, alpha.src, alpha.dst]
-                .iter()
-                .any(|factor| factor.is_dual_source());
-        }
         if on(target.enable()?) {
             let (color, alpha) = equations(shared, &target, per_target)?;
             slot.enabled = true;
+            if index == 0 {
+                dual_source = [color.src, color.dst, alpha.src, alpha.dst]
+                    .iter()
+                    .any(|factor| factor.is_dual_source());
+            }
             slot.color = color;
             slot.alpha = alpha;
         }
@@ -751,30 +750,34 @@ fn depth_stencil(three_d: ThreeD<'_>) -> Result<DepthStencilPart, DrawError> {
     } else {
         None
     };
-    let front = StencilFace {
-        compare: compare(d.stencil_func()?)?,
-        fail: stencil_op(d.stencil_op_fail()?)?,
-        depth_fail: stencil_op(d.stencil_op_zfail()?)?,
-        pass: stencil_op(d.stencil_op_zpass()?)?,
-    };
-    let back = if on(d.two_sided_stencil_test()?) {
-        StencilFace {
-            compare: compare(d.back_stencil_func()?)?,
-            fail: stencil_op(d.back_stencil_op_fail()?)?,
-            depth_fail: stencil_op(d.back_stencil_op_zfail()?)?,
-            pass: stencil_op(d.back_stencil_op_zpass()?)?,
-        }
-    } else {
-        front
-    };
     let read_mask = d.stencil_func_mask()?;
     let write_mask = d.stencil_mask()?;
-    let stencil = on(d.stencil_test()?).then_some(StencilState {
-        front,
-        back,
-        read_mask,
-        write_mask,
-    });
+    let stencil = if on(d.stencil_test()?) {
+        let front = StencilFace {
+            compare: compare(d.stencil_func()?)?,
+            fail: stencil_op(d.stencil_op_fail()?)?,
+            depth_fail: stencil_op(d.stencil_op_zfail()?)?,
+            pass: stencil_op(d.stencil_op_zpass()?)?,
+        };
+        let back = if on(d.two_sided_stencil_test()?) {
+            StencilFace {
+                compare: compare(d.back_stencil_func()?)?,
+                fail: stencil_op(d.back_stencil_op_fail()?)?,
+                depth_fail: stencil_op(d.back_stencil_op_zfail()?)?,
+                pass: stencil_op(d.back_stencil_op_zpass()?)?,
+            }
+        } else {
+            front
+        };
+        Some(StencilState {
+            front,
+            back,
+            read_mask,
+            write_mask,
+        })
+    } else {
+        None
+    };
     Ok(DepthStencilPart {
         state: DepthStencilState {
             depth_test,
@@ -827,19 +830,59 @@ pub fn vertex_kind(value: &'static Value) -> Result<(VertexKind, AttributeType),
     })
 }
 
-/// The vertex input part (module docs, "Sources"). An active attribute reading a stream that is
-/// not enabled is refused ([`DrawError::AttributeStream`]).
+/// The name `NUMERICAL_TYPE` gives 0, which Eden's `CastAttributeType` reads as disabled.
+const UNUSED_NUMERICAL_TYPE: &str = "UNUSED_ENUM_DO_NOT_USE_BECAUSE_IT_WILL_GO_AWAY";
+
+/// The vertex input part (module docs, "Sources").
+///
+/// An attribute is in the layout when it is `ACTIVE` and its numerical type is not the unused
+/// value (Eden's `CastAttributeType` reads that value as disabled, and a register file that was
+/// never written holds it, with `ACTIVE` as 0). Each stream an attribute reads becomes one
+/// buffer, in stream order; a stream that no attribute reads is not bound. An attribute reading
+/// a stream that is not enabled is refused ([`DrawError::AttributeStream`]).
+///
+/// Eden's pipeline also leaves out attributes the vertex program does not load
+/// (`stage_infos[0].loads.Generic(index)` in `vk_graphics_pipeline.cpp`); the seam's sets carry
+/// no such list yet, so every active attribute is described. A listed divergence:
+/// `tests::every_active_attribute_is_in_the_layout`.
 fn vertex(three_d: ThreeD<'_>) -> Result<VertexPart, DrawError> {
+    struct Active {
+        index: u32,
+        stream: u32,
+        offset: u32,
+        components: VertexComponents,
+        kind: VertexKind,
+    }
+    let mut types = [AttributeType::Disabled; VERTEX_ATTRIBUTES as usize];
+    let mut active = Vec::new();
+    for (index, ty) in (0..VERTEX_ATTRIBUTES).zip(types.iter_mut()) {
+        let attribute = three_d.vertex_attribute(index)?;
+        let numerical = attribute.numerical_type()?;
+        if attribute.source()?.name != "ACTIVE" || numerical.name == UNUSED_NUMERICAL_TYPE {
+            continue;
+        }
+        let (kind, key) = vertex_kind(numerical)?;
+        *ty = key;
+        active.push(Active {
+            index,
+            stream: attribute.stream()?,
+            offset: attribute.offset()?,
+            components: components(attribute.component_bit_widths()?)?,
+            kind,
+        });
+    }
     let mut layout = VertexLayout::default();
     let mut streams = Vec::new();
     let mut buffer_of = [None; VERTEX_STREAMS as usize];
     for (index, slot) in (0..VERTEX_STREAMS).zip(buffer_of.iter_mut()) {
+        if !active.iter().any(|a| a.stream == index) {
+            continue;
+        }
         let stream = three_d.vertex_stream(index)?;
         if !on(stream.enable()?) {
             continue;
         }
-        let buffer = u32::try_from(layout.buffers.len()).unwrap_or(u32::MAX);
-        *slot = Some(buffer);
+        *slot = Some(u32::try_from(layout.buffers.len()).unwrap_or(u32::MAX));
         layout.buffers.push(VertexBufferLayout {
             stride: stream.stride()?,
             step: if on(stream.instanced()?) {
@@ -854,29 +897,21 @@ fn vertex(three_d: ThreeD<'_>) -> Result<VertexPart, DrawError> {
             size: stream.size()?,
         });
     }
-    let mut types = [AttributeType::Disabled; VERTEX_ATTRIBUTES as usize];
-    for (index, ty) in (0..VERTEX_ATTRIBUTES).zip(types.iter_mut()) {
-        let attribute = three_d.vertex_attribute(index)?;
-        if attribute.source()?.name != "ACTIVE" {
-            continue;
-        }
-        let stream = attribute.stream()?;
+    for a in active {
         let buffer = buffer_of
-            .get(usize::try_from(stream).unwrap_or(usize::MAX))
+            .get(usize::try_from(a.stream).unwrap_or(usize::MAX))
             .copied()
             .flatten()
             .ok_or(DrawError::AttributeStream {
-                attribute: index,
-                stream,
+                attribute: a.index,
+                stream: a.stream,
             })?;
-        let (kind, key) = vertex_kind(attribute.numerical_type()?)?;
-        *ty = key;
         layout.attributes.push(HostAttribute {
-            location: index,
+            location: a.index,
             buffer,
-            offset: attribute.offset()?,
-            components: components(attribute.component_bit_widths()?)?,
-            kind,
+            offset: a.offset,
+            components: a.components,
+            kind: a.kind,
         });
     }
     Ok(VertexPart {
