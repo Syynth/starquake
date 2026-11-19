@@ -749,8 +749,8 @@ impl Rig {
 
 #[test]
 fn the_upload_offset_lives_in_the_code_store() {
-    // Owner question (module docs): the references keep the offset as a word offset in the
-    // store, three words per instruction, and leave method 0x45 as written.
+    // The spec's step 2 (module docs): the offset is a word offset in the store, three words
+    // per instruction, as both references keep it, and method 0x45 stays as written.
     let mut rig = make_rig();
     let mut chan = Chan::new(A);
     let pointer = THREE_D_METHODS.instruction_pointer;
