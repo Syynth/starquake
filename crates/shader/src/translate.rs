@@ -64,8 +64,9 @@
 //!
 //! The instruction groups' translators (port slices 12a to 12h) each have a module here that
 //! translates one instruction of a flow block (slice 10) at a time: [`control`] for the
-//! control and warp group, whose instructions [`translate`] keeps refusing, and [`integer`] for
-//! the integer ALU group (slice 12a). The attribute group (`attribute`) is joined to
+//! control and warp group, whose instructions [`translate`] keeps refusing, [`integer`] for
+//! the integer ALU group (slice 12a) and [`memory`] for the memory group (slice 12e). The
+//! attribute group (`attribute`) is joined to
 //! [`translate`] through `GROUPS` instead.
 //!
 //! Slice 1 handles linear flow only (spec, port slice 1). Where starquake is stricter than the
@@ -89,6 +90,7 @@ mod attribute;
 pub mod control;
 pub mod float;
 pub mod integer;
+pub mod memory;
 #[cfg(test)]
 mod tests;
 

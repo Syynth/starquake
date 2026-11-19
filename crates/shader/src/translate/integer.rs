@@ -446,8 +446,8 @@ const fn reads_negation(op: &Op) -> [bool; 3] {
 }
 
 /// The first successor of `block` with a phi naming `block`: the guard's split would leave that
-/// phi naming a block that no longer jumps to it.
-fn successor_phi(function: &Function, block: BlockId) -> Option<BlockId> {
+/// phi naming a block that no longer jumps to it. Shared with the memory translator (slice 12e).
+pub(super) fn successor_phi(function: &Function, block: BlockId) -> Option<BlockId> {
     let terminator = function.block(block)?.terminator;
     terminator.successors().find(|successor| {
         function.block(*successor).is_some_and(|next| {
@@ -460,6 +460,37 @@ fn successor_phi(function: &Function, block: BlockId) -> Option<BlockId> {
                 .any(|phi| phi.incoming.iter().any(|(from, _)| *from == block))
         })
     })
+}
+
+/// Makes the conditional block of an instruction under `guard`: the builder's block tests
+/// `guard` and branches to a new block, which jumps to a second new block that takes the first
+/// block's terminator. Leaves the builder in the new block that holds the instruction and
+/// returns the block after it. Shared with the memory translator (slice 12e).
+pub(super) fn split_for_guard(b: &mut Builder<'_>, guard: PredSrc) -> Result<BlockId, BuildError> {
+    let here = b.block();
+    let mut cond: Operand = b
+        .op(Opcode::GetPred, &[Operand::Imm(Imm::Pred(guard.reg))])?
+        .into();
+    if guard.negated {
+        cond = b.op(Opcode::LogicalNot, &[cond])?.into();
+    }
+    let old = b
+        .function()
+        .block(here)
+        .map(|block| block.terminator)
+        .ok_or(BuildError::NoBlock(here))?;
+    let then = b.add_block()?;
+    let join = b.add_block()?;
+    b.terminate(Terminator::Branch {
+        cond,
+        then,
+        otherwise: join,
+    })?;
+    b.switch_to(join)?;
+    b.terminate(old)?;
+    b.switch_to(then)?;
+    b.terminate(Terminator::Jump(join))?;
+    Ok(join)
 }
 
 /// `!PT` as a predicate source: the carry input that adds nothing.
@@ -530,35 +561,9 @@ impl Emitter<'_, '_> {
         Ok(self.b.op(opcode, args)?.into())
     }
 
-    /// Makes the conditional block: the current block tests `guard` and branches to a new
-    /// block, which jumps to a second new block that takes the current block's terminator.
+    /// Makes the conditional block ([`split_for_guard`]).
     fn split(&mut self, guard: PredSrc) -> Result<(), BuildError> {
-        let here = self.b.block();
-        let mut cond: Operand = self
-            .b
-            .op(Opcode::GetPred, &[Operand::Imm(Imm::Pred(guard.reg))])?
-            .into();
-        if guard.negated {
-            cond = self.b.op(Opcode::LogicalNot, &[cond])?.into();
-        }
-        let old = self
-            .b
-            .function()
-            .block(here)
-            .map(|block| block.terminator)
-            .ok_or(BuildError::NoBlock(here))?;
-        let then = self.b.add_block()?;
-        let join = self.b.add_block()?;
-        self.b.terminate(Terminator::Branch {
-            cond,
-            then,
-            otherwise: join,
-        })?;
-        self.b.switch_to(join)?;
-        self.b.terminate(old)?;
-        self.b.switch_to(then)?;
-        self.b.terminate(Terminator::Jump(join))?;
-        self.join = Some(join);
+        self.join = Some(split_for_guard(self.b, guard)?);
         Ok(())
     }
 
