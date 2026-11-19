@@ -436,7 +436,11 @@ fn atomics_return_the_old_value_and_store_the_new() {
         ("Dec", 5, 5, 4),
         ("Dec", 1, 5, 0),
     ];
-    for space in [AtomicSpace::Shared, AtomicSpace::Global, AtomicSpace::Storage] {
+    for space in [
+        AtomicSpace::Shared,
+        AtomicSpace::Global,
+        AtomicSpace::Storage,
+    ] {
         for (kind, old, value, new) in cases {
             assert_eq!(
                 space_atomic(space, kind, old, value),

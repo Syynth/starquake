@@ -402,16 +402,16 @@ fn double_precision_rounds_to_nearest_and_refuses_directed_rounding() {
     assert_eq!(f64_bits(eval("FPAdd64 f64 0x1, f64 0.0")), 1);
     assert_eq!(f64_bits(eval("FPAdd64 f64 0x1, f64 0.0 {ftz}")), 0);
     let max = format!("f64 {:#x}", f64::MAX.to_bits());
-    let max_plus_max_rz = format!("FPAdd64 {max}, {max} {{rz}}");
-    let max_plus_max_rm = format!("FPAdd64 {max}, {max} {{rm}}");
+    let toward_zero_overflow = format!("FPAdd64 {max}, {max} {{rz}}");
+    let downward_overflow = format!("FPAdd64 {max}, {max} {{rm}}");
     for (op, opcode) in [
         ("FPAdd64 f64 1.0, f64 2.0 {rz}", "FPAdd64"),
         ("FPMul64 f64 1.0, f64 2.0 {rm}", "FPMul64"),
         ("FPFma64 f64 1.0, f64 2.0, f64 3.0 {rp}", "FPFma64"),
         // A finite sum that overflows: Rz and Rm would give the largest finite value, not the
         // infinity that rounding to nearest gives, so it is refused too.
-        (max_plus_max_rz.as_str(), "FPAdd64"),
-        (max_plus_max_rm.as_str(), "FPAdd64"),
+        (toward_zero_overflow.as_str(), "FPAdd64"),
+        (downward_overflow.as_str(), "FPAdd64"),
     ] {
         assert_eq!(
             eval_error(op),
