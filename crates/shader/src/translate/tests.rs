@@ -4,7 +4,8 @@
 use proptest::prelude::*;
 
 use super::*;
-use crate::decode::{OpExit, Pred, PredSrc, RoundMode, UniformReg};
+use crate::decode::{OpALd, OpASt, OpExit, Pred, RoundMode, UniformReg};
+use crate::interp::Machine;
 use crate::testing::{any_instr, config};
 
 fn r(index: u8) -> Gpr {
@@ -197,10 +198,10 @@ fn s2r_lane_id() {
         ir.to_string(),
         "block0:\n    %0: u32 = LaneId\n    %1 = SetRegister r5, %0\n    return\n"
     );
-    let tid = s2r(SpecialReg::TID_X);
+    let clock = s2r(SpecialReg::CLOCK_LO);
     assert_eq!(
-        one(tid),
-        unsupported(tid, Unsupported::SpecialRegister(SpecialReg::TID_X))
+        one(clock),
+        unsupported(clock, Unsupported::SpecialRegister(SpecialReg::CLOCK_LO))
     );
 }
 
@@ -218,70 +219,199 @@ fn s2r_to_rz_reads_nothing() {
         let ir = translate(stage, &[s2r(SpecialReg::LANE_ID), exit()]).expect("translates");
         assert_eq!(ir.to_string(), "block0:\n    return\n");
     }
-    let tid = s2r(SpecialReg::TID_X);
+    let clock = s2r(SpecialReg::CLOCK_LO);
     assert_eq!(
-        one(tid),
-        unsupported(tid, Unsupported::SpecialRegister(SpecialReg::TID_X))
+        one(clock),
+        unsupported(clock, Unsupported::SpecialRegister(SpecialReg::CLOCK_LO))
     );
 }
 
-/// `S2UR`, `S2R` to a uniform register, is not handled yet, whatever its special register: the
-/// destination is checked before the register, and the rejection names `"s2ur"`, not `s2r` (a
-/// listed divergence: PR #4588 writes the uniform register through `Visitor::S2R`).
+/// `S2UR`, `S2R` to a uniform register, writes the uniform register class, as PR #4588 writes
+/// its uniform register through `Visitor::S2R` (`case 0x919: case 0x9c3:`, `WriteDst`).
 #[test]
-fn s2ur_is_unsupported() {
+fn s2ur_writes_the_uniform_register() {
     let ur1 = UniformReg::new(1).expect("a uniform register");
-    for sr in [SpecialReg::LANE_ID, SpecialReg::TID_X] {
-        let s2ur = Instr::new(Op::S2R(OpS2R {
-            dst: S2RDst::Uniform(ur1),
-            sr,
-        }));
-        assert_eq!(
-            one(s2ur),
-            unsupported(s2ur, Unsupported::Instruction("s2ur"))
-        );
-    }
+    let s2ur = Instr::new(Op::S2R(OpS2R {
+        dst: S2RDst::Uniform(ur1),
+        sr: SpecialReg::LANE_ID,
+    }));
+    let ir = one(s2ur).expect("translates");
+    assert_eq!(
+        ir.to_string(),
+        "block0:\n    %0: u32 = LaneId\n    %1 = SetUniformRegister ur1, %0\n    return\n"
+    );
 }
 
-/// A guard on a real predicate, plain or negated, needs flow analysis (a listed divergence: the
-/// PR selects a pure instruction's result or makes a side effect its own block).
+/// A guard on a real predicate, plain or negated, makes the instruction a conditional block:
+/// the predicate is read, the instruction runs in a block of its own, and translation goes on
+/// in the block after it. Run on the interpreter, the instruction takes effect exactly when the
+/// guard holds.
 #[test]
-fn guarded_instructions_are_rejected() {
+fn guarded_instructions_become_conditional_blocks() {
+    let p2 = Pred::new(2).expect("p2");
+    let guarded = |negated| {
+        Instr {
+            guard: PredSrc { reg: p2, negated },
+            ..mov(r(0), MovSrc::Imm(7))
+        }
+    };
+    let ir = translate(VERTEX, &[guarded(false), mov(r(1), MovSrc::Imm(9)), exit()])
+        .expect("translates");
+    assert_eq!(ir.verify(), Ok(()));
+    assert_eq!(
+        ir.to_string(),
+        "block0:\n\
+         \x20   %0: u1 = GetPred p2\n\
+         \x20   branch %0, block1, block2\n\
+         block1:\n\
+         \x20   %1 = SetRegister r0, u32 0x7\n\
+         \x20   jump block2\n\
+         block2:\n\
+         \x20   %2 = SetRegister r1, u32 0x9\n\
+         \x20   return\n"
+    );
+    let negated = translate(VERTEX, &[guarded(true), exit()]).expect("translates");
+    assert_eq!(
+        negated.to_string(),
+        "block0:\n\
+         \x20   %0: u1 = GetPred p2\n\
+         \x20   %1: u1 = LogicalNot %0\n\
+         \x20   branch %1, block1, block2\n\
+         block1:\n\
+         \x20   %2 = SetRegister r0, u32 0x7\n\
+         \x20   jump block2\n\
+         block2:\n\
+         \x20   return\n"
+    );
     for negated in [false, true] {
-        let guard = PredSrc {
-            reg: Pred::new(0).expect("p0"),
-            negated,
-        };
-        for instr in [
-            mov(r(0), MovSrc::Imm(1)),
-            Instr::new(Op::ASt(ast(r(0), 0x80, 1))),
-        ] {
-            let instr = Instr { guard, ..instr };
-            assert_eq!(one(instr), unsupported(instr, Unsupported::Guard));
+        let ir = translate(VERTEX, &[guarded(negated), exit()]).expect("translates");
+        for p in [false, true] {
+            let mut machine = Machine::default();
+            machine.regs[0] = 3;
+            machine.preds[usize::from(p2.index())] = p;
+            machine.run(&ir).expect("runs");
+            let runs = p != negated;
+            assert_eq!(machine.regs[0], if runs { 7 } else { 3 }, "p2 {p}, negated {negated}");
         }
     }
+    // A side effect too: the attribute is written only when the guard holds.
+    let store = Instr {
+        guard: PredSrc {
+            reg: p2,
+            negated: false,
+        },
+        ..Instr::new(Op::ASt(ast(r(0), 0x80, 1)))
+    };
+    let ir = translate(VERTEX, &[store, exit()]).expect("translates");
+    for p in [false, true] {
+        let mut machine = Machine::default();
+        machine.preds[usize::from(p2.index())] = p;
+        machine.regs[0] = 1.5_f32.to_bits();
+        machine.run(&ir).expect("runs");
+        let written = machine.outputs.get(&(crate::ir::Attribute(0x20), 0)).copied();
+        assert_eq!(written, p.then_some(1.5_f32.to_bits()));
+    }
 }
 
-/// `@!PT` never runs: the PR skips the instruction (`Visitor::Run`, `guard.Never()`), starquake
-/// rejects it (a listed divergence).
+/// A guarded `EXIT` is a conditional exit, which the straight-line translator does not build.
 #[test]
-fn never_guarded_instructions_are_rejected() {
+fn a_guarded_exit_is_rejected() {
+    let guarded = Instr {
+        guard: PredSrc {
+            reg: Pred::new(0).expect("p0"),
+            negated: false,
+        },
+        ..exit()
+    };
+    assert_eq!(
+        translate(VERTEX, &[guarded]),
+        Err(TranslateError::Unsupported {
+            index: 0,
+            instr: guarded,
+            what: Unsupported::Guard
+        })
+    );
+    assert_eq!(
+        translate(VERTEX, &[guarded]).map_err(|error| error.to_string()),
+        Err("instruction 0 (@p0 exit;): a guarded exit is not supported".into())
+    );
+}
+
+/// `S2UR`'s guard names a uniform predicate (PR #4588's `classify.h`), so it reads
+/// `GetUniformPred`; the same guard on `S2R` reads `GetPred`.
+#[test]
+fn a_guarded_s2ur_reads_a_uniform_predicate() {
+    let guard = PredSrc {
+        reg: Pred::new(3).expect("p3"),
+        negated: true,
+    };
+    let ur1 = UniformReg::new(1).expect("ur1");
+    let s2ur = Instr {
+        guard,
+        op: Op::S2R(OpS2R {
+            dst: S2RDst::Uniform(ur1),
+            sr: SpecialReg::LANE_ID,
+        }),
+    };
+    let ir = one(s2ur).expect("translates");
+    assert_eq!(
+        ir.to_string(),
+        "block0:\n\
+         \x20   %0: u1 = GetUniformPred up3\n\
+         \x20   %1: u1 = LogicalNot %0\n\
+         \x20   branch %1, block1, block2\n\
+         block1:\n\
+         \x20   %2: u32 = LaneId\n\
+         \x20   %3 = SetUniformRegister ur1, %2\n\
+         \x20   jump block2\n\
+         block2:\n\
+         \x20   return\n"
+    );
+    for up in [false, true] {
+        let mut machine = Machine::default();
+        machine.uniform_preds[3] = up;
+        machine.system.lane_id = 6;
+        machine.run(&ir).expect("runs");
+        assert_eq!(machine.uniform_regs[1], if up { 0 } else { 6 });
+    }
+    let s2r = Instr {
+        guard,
+        op: Op::S2R(OpS2R {
+            dst: S2RDst::Reg(r(1)),
+            sr: SpecialReg::LANE_ID,
+        }),
+    };
+    let ir = one(s2r).expect("translates");
+    assert!(ir.to_string().starts_with("block0:\n    %0: u1 = GetPred p3\n"));
+}
+
+/// `@!PT` never runs: it translates to nothing, as the PR skips it (`Visitor::Run`,
+/// `guard.Never()`), and an `EXIT` under it does not end the program.
+#[test]
+fn never_guarded_instructions_are_skipped() {
     let never = PredSrc {
         reg: Pred::PT,
         negated: true,
     };
-    for instr in [
-        mov(r(0), MovSrc::Imm(1)),
-        Instr::new(Op::ASt(ast(r(0), 0x80, 1))),
-    ] {
-        let instr = Instr {
-            guard: never,
-            ..instr
-        };
-        assert_eq!(one(instr), unsupported(instr, Unsupported::Guard));
-    }
-    // The same instruction under `PT` translates.
-    assert!(one(mov(r(0), MovSrc::Imm(1))).is_ok());
+    let skipped = |instr: Instr| Instr {
+        guard: never,
+        ..instr
+    };
+    let program = [
+        skipped(mov(r(0), MovSrc::Imm(1))),
+        skipped(Instr::new(Op::ASt(ast(r(0), 0x80, 1)))),
+        skipped(Instr::new(Op::Nop(crate::decode::OpNop {}))),
+        skipped(exit()),
+        exit(),
+    ];
+    let ir = translate(VERTEX, &program).expect("translates");
+    assert_eq!(ir.to_string(), "block0:\n    return\n");
+    // The same instruction under `PT` translates to something.
+    let ir = one(mov(r(0), MovSrc::Imm(1))).expect("translates");
+    assert_eq!(
+        ir.to_string(),
+        "block0:\n    %0 = SetRegister r0, u32 0x1\n    return\n"
+    );
 }
 
 #[test]
@@ -479,13 +609,6 @@ fn attribute_access_checks() {
             },
             Unsupported::OutputRead,
         ),
-        (
-            OpALd {
-                vtx: r(2),
-                ..ald(r(0), 0x80, 1)
-            },
-            Unsupported::AttributeVertex,
-        ),
         // Both the offset register and the patch bit: the offset is reported, first in the
         // PR's order.
         (
@@ -516,13 +639,6 @@ fn attribute_access_checks() {
             },
             Unsupported::PatchOrPhysical,
         ),
-        (
-            OpASt {
-                vtx: r(2),
-                ..ast(r(0), 0x80, 1)
-            },
-            Unsupported::AttributeVertex,
-        ),
     ];
     for (op, what) in ast_cases {
         let instr = Instr::new(Op::ASt(op));
@@ -531,7 +647,8 @@ fn attribute_access_checks() {
 }
 
 /// Instructions with two faults at once report the one the PR checks first (offset register,
-/// patch or physical, output, address, registers), then starquake's vertex register check.
+/// patch or physical, output, address, registers). A vertex register is no fault: it is read
+/// (the attribute translator's `tests::ald_and_ast_pass_the_vertex_register`).
 #[test]
 fn attribute_checks_report_in_the_prs_order() {
     for (op, what) in [
@@ -552,7 +669,7 @@ fn attribute_checks_report_in_the_prs_order() {
                 comps: 2,
             },
         ),
-        // Bad registers and a vertex register: the registers are reported first.
+        // Bad registers with a vertex register: the registers are reported.
         (
             OpASt {
                 vtx: r(2),

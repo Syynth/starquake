@@ -43,7 +43,9 @@
 //!   been proved to read the aligned offset"). `GetAttribute`, `GetAttributeU32` and
 //!   `GetAttributeIndexed` read [`Machine::attributes`] (an absent one is
 //!   [`InterpError::MissingInput`]; the indexed form names the word `offset >> 2`, as Eden's
-//!   `make_load` does), and the set forms write [`Machine::outputs`]. `GetPatch` and `SetPatch`
+//!   `make_load` does), and the set forms write [`Machine::outputs`]. `InterpolateAtOffset`, a
+//!   starquake opcode, reads [`Machine::interpolated`] by word and offset bits (an absent one
+//!   is [`InterpError::MissingInput`]). `GetPatch` and `SetPatch`
 //!   share [`Machine::patches`] (Eden reads a control program's output patch and an evaluation
 //!   program's input patch; one map serves both). `SetFragColor`, `SetFragDepth` and
 //!   `SetSampleMask` write their fields. System values come from [`SystemValues`];
@@ -101,12 +103,18 @@
 //!   texture information or argument values ([`InterpError::ImageMismatch`]), and then a reply
 //!   not of the opcode's result type ([`InterpError::ImageReply`]) are errors, checked in that
 //!   order, and a refused call leaves the script as it was. Tests stay pure.
-//! - **Warp operations**: only `LaneId` (from [`SystemValues`]); votes, shuffles, ballots and
-//!   derivatives need the rest of the warp and are not supported yet.
+//! - **Warp operations**: `LaneId` (from [`SystemValues`]), and the lane masks `SubgroupEqMask`,
+//!   `SubgroupLtMask`, `SubgroupLeMask`, `SubgroupGtMask` and `SubgroupGeMask` computed from it
+//!   for a warp of 32 lanes: bit `n` is set when lane `n` is equal to, below, at or below,
+//!   above, or at or above the lane id (`emit_spirv_warp.cpp` loads the first word of SPIR-V's
+//!   `SubgroupEqMask` and its siblings, `LoadMask`); a lane id of 32 or more is above every
+//!   lane of the word, so the equal mask is 0 and the below masks are all ones. Votes,
+//!   shuffles, ballots and derivatives need the rest of the warp and are not supported yet.
 //!
 //! An operation not listed (for example `PhiMove`, `Join`, the `Get*FromOp` pseudo-operations,
 //! `EmitVertex`, `EndPrimitive`, `InvocationInfo`, `RenderArea`, the `SR_WScaleFactor`
-//! values, the 64-bit and float atomics, the warp operations other than `LaneId`) is
+//! values, the 64-bit and float atomics, the warp operations other than `LaneId` and the lane
+//! masks) is
 //! [`InterpError::Unsupported`], naming the opcode; translator slices add semantics as they
 //! need them.
 //!
@@ -297,6 +305,13 @@ pub enum Input {
     },
     /// A patch word.
     Patch(Patch),
+    /// An input attribute word interpolated at an offset.
+    Interpolated {
+        /// The attribute word.
+        attribute: Attribute,
+        /// The offset's bits.
+        offset: u32,
+    },
 }
 
 impl std::fmt::Display for Input {
@@ -304,6 +319,9 @@ impl std::fmt::Display for Input {
         match self {
             Self::Attribute { attribute, vertex } => {
                 write!(f, "attribute {attribute} of vertex {vertex}")
+            }
+            Self::Interpolated { attribute, offset } => {
+                write!(f, "attribute {attribute} at offset {offset:#x}")
             }
             Self::Patch(patch) => write!(f, "{patch}"),
         }
@@ -484,6 +502,10 @@ pub struct Machine {
     pub cbufs: BTreeMap<u32, Vec<u8>>,
     /// Input attribute words, by word and vertex, as their bits.
     pub attributes: BTreeMap<(Attribute, u32), u32>,
+    /// Input attribute words interpolated at an offset, by word and the offset's bits, as their
+    /// bits: what `InterpolateAtOffset` reads (one invocation cannot interpolate, so a test
+    /// gives the result).
+    pub interpolated: BTreeMap<(Attribute, u32), u32>,
     /// Output attribute words, by word and vertex, as their bits.
     pub outputs: BTreeMap<(Attribute, u32), u32>,
     /// Patch words, as their bits (read and written; see the module docs).
@@ -524,6 +546,7 @@ impl Default for Machine {
             indirect_branch: 0,
             cbufs: BTreeMap::new(),
             attributes: BTreeMap::new(),
+            interpolated: BTreeMap::new(),
             outputs: BTreeMap::new(),
             patches: BTreeMap::new(),
             frag_colors: BTreeMap::new(),

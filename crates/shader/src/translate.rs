@@ -2,45 +2,44 @@
 //!
 //! Ported by behaviour from PR #4588's native frontend
 //! (`eden-pr4588/src/shader_recompiler/frontend/ampere/` @ e5fb3b97, GPL-3.0-or-later):
-//! `ops_move.cpp` (`MOV`), `ops_alu.cpp` (`FFMA`), `ops_misc.cpp` (`ALD`, `AST`, `S2R`) and
-//! `ops_attr.cpp` (`EXIT`). Each of the PR's `Require` checks on these forms is kept with its
-//! constant and turns into an [`Unsupported`] rejection naming the same thing, except the
-//! colour-register bound of `EXIT`, which cannot fail here (see `Translator::exit`).
+//! `ops_move.cpp` (`MOV`), `ops_alu.cpp` (`FFMA`) and `ops_attr.cpp` (`EXIT`) here, and one
+//! module per instruction group beside this one (spec, "Instruction translation"), joined by
+//! [`GROUPS`]: `attribute` (slice 12g: `ALD`, `AST`, `IPA`, `AL2P`, `S2R`, `CS2R`, `PIXLD`, and
+//! the deferred `OUT`, `ISBERD` and `ISBEWR`). Each of the PR's `Require` checks on these forms
+//! is kept with its constant and turns into an [`Unsupported`] rejection naming the same thing,
+//! except the colour-register bound of `EXIT`, which cannot fail here (see `Translator::exit`).
+//!
+//! **Guards.** An instruction under a guard predicate other than `PT` becomes a conditional
+//! block (spec, "Instruction translation"): the block it was in reads the predicate (through
+//! `flow`'s `read_pred`, as the flow graph's tests do) and branches to a block of its own,
+//! which holds the instruction and jumps to a new block where translation continues. An
+//! instruction under `@!PT` never runs and translates to nothing, as in the PR: `Visitor::Run`
+//! returns when `guard.Never()`, which `flow.h` defines as `index == 7 && negated`. The PR
+//! turns a guard on a pure instruction (`classify.h`, `Classify`) into a select of the result
+//! instead (`visitor.cpp`, `Visitor::Run`: `guard_select`) and makes only a guarded side effect
+//! its own conditional block (`flow.cpp`: "Guarded side effect: becomes its own conditional
+//! block"); the two give the same registers, since the block that does not run leaves them as
+//! the select's other side does. Pinned by `tests::guarded_instructions_become_conditional_blocks`
+//! and `tests::never_guarded_instructions_are_skipped`.
 //!
 //! Slice 1 handles linear flow only (spec, port slice 1). Where starquake is stricter than the
 //! PR, because the PR resolves the case in a part not built yet:
 //!
-//! - an instruction under a guard predicate other than `PT` and `!PT` is rejected (flow analysis
-//!   is slice 10). The PR turns a guard on a pure instruction (`MOV`, `FFMA`, `ALD` and `S2R`
-//!   here; `classify.h`, `Classify`) into a select of the result (`visitor.cpp`,
-//!   `Visitor::Run`: `guard_select`), and makes a guarded side effect (`AST` here) its own
-//!   conditional block (`flow.cpp`: "Guarded side effect: becomes its own conditional block");
-//! - an instruction under `@!PT` is rejected, where the PR skips it: `Visitor::Run` returns when
-//!   `guard.Never()`, which `flow.h` defines as `index == 7 && negated`;
-//! - an `EXIT` with its own predicate other than `PT` is rejected (the PR's control-flow builder
-//!   resolves it, `ops_attr.cpp`: "extra exit condition");
+//! - a guarded `EXIT` is rejected, and so is an `EXIT` with its own predicate other than `PT`
+//!   (the PR's control-flow builder resolves both, `ops_attr.cpp`: "extra exit condition");
 //! - the program must end with its first `EXIT`: no `EXIT` and instructions after it are
 //!   rejected (the extent of a program is the capture's job, slice 3);
-//! - `ALD` and `AST` take only `RZ` as the vertex register (the PR passes the register to the
-//!   IR; the vertex and pixel stages handled here have one vertex);
-//! - `S2R` reads only `SR_LANEID` (the PR also reads the thread and block ids, the W scale
-//!   factors and the lane masks);
-//! - the uniform form `S2UR` is rejected whatever register it reads, and the rejection names
-//!   `"s2ur"`, not the op's mnemonic `s2r`. The PR accepts it: `visitor.cpp` dispatches `0x9c3`
-//!   with `0x919` to `Visitor::S2R` (`case 0x919: case 0x9c3:`), which writes the uniform
-//!   register through `Dst` (`Take(16, uniform_op ? 6 : 8)`) and `WriteDst`;
 //! - `MOV` and `FFMA` take only register and immediate sources: a uniform-register or
 //!   constant-buffer source, which the decoder reads since slice 4, is rejected (the PR reads
 //!   both, `visitor.cpp`, `Visitor::Value`; constant buffers and uniform registers come with
 //!   the passes of slices 12 and 13);
 //! - every other instruction is rejected by its mnemonic.
 //!
-//! Pinned by `tests::guarded_instructions_are_rejected`, `never_guarded_instructions_are_rejected`,
-//! `exit_modes_and_predicates_are_rejected`, `the_program_ends_at_its_only_exit`,
-//! `attribute_access_checks`, `s2r_lane_id`, `s2ur_is_unsupported`,
-//! `uniform_and_constant_buffer_sources_are_rejected` and
-//! `other_instructions_are_rejected_by_mnemonic`.
+//! Pinned by `tests::exit_modes_and_predicates_are_rejected`,
+//! `the_program_ends_at_its_only_exit`, `uniform_and_constant_buffer_sources_are_rejected` and
+//! `other_instructions_are_rejected_by_mnemonic`. The group modules list their own divergences.
 
+mod attribute;
 #[cfg(test)]
 mod tests;
 
@@ -49,13 +48,16 @@ use std::fmt::{self, Display, Formatter};
 use thiserror::Error;
 
 use crate::decode::{
-    AluSrc, Gpr, Instr, MovSrc, Op, OpALd, OpASt, OpExit, OpFFma, OpMov, OpS2R, RoundMode, S2RDst,
-    SpecialReg,
+    AluSrc, Gpr, Instr, MovSrc, Op, OpExit, OpFFma, OpMov, OpS2R, PredSrc, RoundMode, S2RDst,
+    SpecialReg, UniformPred,
 };
 use crate::ir::{
-    Attribute, BuildError, Builder, Flags, FmzMode, FpControl, FpRounding, Function, Imm, Opcode,
+    BlockId, BuildError, Builder, Flags, FmzMode, FpControl, FpRounding, Function, Imm, Opcode,
     Operand, Terminator, Value,
 };
+use crate::sph::PixelIo;
+
+pub use attribute::{AttributeRejection, Deferral};
 
 /// The guest's pipeline stage of a program (spec, "What the GPU front/back protocol and engine
 /// state (#12) gets": `GuestStage`; slot types from `SET_PIPELINE_SHADER`).
@@ -130,15 +132,18 @@ pub enum Unsupported {
     /// The stage is not handled yet.
     #[error("{0} programs are not supported yet")]
     Stage(GuestStage),
-    /// An instruction the translator does not handle yet: every one but the six of slice 1.
+    /// An instruction no translator handles yet: neither `MOV`, `FFMA` and `EXIT` here nor a
+    /// group of [`GROUPS`].
     #[error("{0}")]
     Instruction(&'static str),
     /// A uniform-register or constant-buffer source of `MOV` or `FFMA` (PR #4588 reads both:
     /// `visitor.cpp`, `Visitor::Value`).
     #[error("a uniform-register or constant-buffer source")]
     Source,
-    /// A guard other than `PT` needs flow analysis.
-    #[error("a guarded instruction (flow analysis is not built yet)")]
+    /// An `EXIT` under a guard other than `PT` and `!PT`: a conditional exit is control flow,
+    /// which this straight-line translator does not build (every other guarded instruction
+    /// becomes a conditional block; see the module docs).
+    #[error("a guarded exit")]
     Guard,
     /// A `MOV` lane mask other than `0xf` (`ops_move.cpp`: "native MOV lane mask").
     #[error("a mov with a partial lane mask")]
@@ -174,9 +179,9 @@ pub enum Unsupported {
         /// The word count.
         comps: u8,
     },
-    /// An attribute access with a vertex register.
-    #[error("an attribute access with a vertex register")]
-    AttributeVertex,
+    /// A form of the attribute and system-value group (slice 12g) that is not handled.
+    #[error(transparent)]
+    Attribute(#[from] AttributeRejection),
     /// `EXIT` with a mode bit (`ops_attr.cpp`: "native conditional/special EXIT").
     #[error("an exit with a mode bit")]
     ExitMode,
@@ -228,9 +233,30 @@ pub const ATTRIBUTE_SPACE_END: u32 = 0x400;
 /// `dest + components <= 255`).
 pub const REGISTER_LIMIT: u32 = 255;
 
-/// Translates a straight-line program that ends with its first `EXIT`, into one block that ends
-/// in a return.
+/// Translates a straight-line program that ends with its first `EXIT`, into blocks that end in
+/// a return: one block, and two more for each guarded instruction (see the module docs).
+/// Without the program's header, an `IPA` of a generic attribute is rejected
+/// ([`AttributeRejection::IpaNoHeader`]); [`translate_with_header`] takes it.
 pub fn translate(stage: Stage, program: &[Instr]) -> Result<Function, TranslateError> {
+    translate_inner(stage, None, program)
+}
+
+/// [`translate`], with the pixel program's header, whose input map tells `IPA` how each
+/// generic attribute is interpolated (PR #4588's `IPA` reads it, `ops_attr.cpp`:
+/// `sph.ps.GenericInputMap`).
+pub fn translate_with_header(
+    stage: Stage,
+    header: &PixelIo,
+    program: &[Instr],
+) -> Result<Function, TranslateError> {
+    translate_inner(stage, Some(*header), program)
+}
+
+fn translate_inner(
+    stage: Stage,
+    header: Option<PixelIo>,
+    program: &[Instr],
+) -> Result<Function, TranslateError> {
     if !matches!(stage.stage, GuestStage::Vertex | GuestStage::Pixel) {
         return Err(TranslateError::Stage(Unsupported::Stage(stage.stage)));
     }
@@ -239,6 +265,7 @@ pub fn translate(stage: Stage, program: &[Instr]) -> Result<Function, TranslateE
     let mut t = Translator {
         b: Builder::new(&mut function, entry),
         stage,
+        header,
     };
     for (index, instr) in program.iter().enumerate() {
         let fail = |what| TranslateError::Unsupported {
@@ -246,20 +273,27 @@ pub fn translate(stage: Stage, program: &[Instr]) -> Result<Function, TranslateE
             instr: *instr,
             what,
         };
-        if !instr.guard.is_true() {
+        if never_runs(instr.guard) {
+            continue;
+        }
+        let guarded = !instr.guard.is_true();
+        if guarded && matches!(instr.op, Op::Exit(_)) {
             return Err(fail(Unsupported::Guard));
         }
+        let after = if guarded {
+            Some(t.begin_guard(instr.guard, uniform_guard(instr.op))?)
+        } else {
+            None
+        };
         let done = match instr.op {
             Op::Mov(op) => t.mov(op).map(|()| false),
             Op::FFma(op) => t.ffma(op).map(|()| false),
-            Op::ALd(op) => t.ald(op).map(|()| false),
-            Op::ASt(op) => t.ast(op).map(|()| false),
-            Op::S2R(op) => t.s2r(op).map(|()| false),
             Op::Exit(op) => t.exit(op).map(|()| true),
-            other => Err(Failure::Unsupported(Unsupported::Instruction(
-                other.mnemonic(),
-            ))),
+            other => t.group(other).map(|()| false),
         };
+        if let (Some(after), Ok(false)) = (after, &done) {
+            t.end_guard(after)?;
+        }
         match done {
             Ok(false) => {}
             Ok(true) => {
@@ -324,17 +358,92 @@ const fn imm32(bits: u32) -> Operand {
     Operand::Imm(Imm::U32(bits))
 }
 
-/// The vertex index of an attribute access: always zero here (`ALD` and `AST` take only `RZ` as
-/// the vertex register), as Eden's emitter passes `Imm32(0)` for a stage with one vertex
-/// (`ir_emitter.cpp`, `GetAttribute(attribute)`).
-const VERTEX_ZERO: Operand = imm32(0);
+/// Whether an instruction under `guard` never runs: `@!PT` (PR #4588's `Guard::Never`,
+/// `flow.h`: `index == 7 && negated`).
+const fn never_runs(guard: PredSrc) -> bool {
+    guard.reg.is_true() && guard.negated
+}
+
+/// Whether `op` is a uniform datapath instruction, whose guard names a uniform predicate (PR
+/// #4588's `classify.h`: "Uniform datapath instruction: its guard predicate is a uniform
+/// predicate"). Of the operations translated so far, only `S2UR` is one.
+const fn uniform_guard(op: Op) -> bool {
+    matches!(
+        op,
+        Op::S2R(OpS2R {
+            dst: S2RDst::Uniform(_),
+            ..
+        })
+    )
+}
+
+/// The value of guard `guard` read as a uniform predicate: `GetUniformPred`, then `LogicalNot`
+/// when negated (PR #4588's `UPred`); `UPT` is the immediate.
+fn read_uniform_guard(b: &mut Builder<'_>, guard: PredSrc) -> Result<Operand, TranslateError> {
+    let value = match UniformPred::new(guard.reg.index()) {
+        Some(pred) if !pred.is_true() => {
+            b.op(Opcode::GetUniformPred, &[Operand::Imm(Imm::UniformPred(pred))])?
+        }
+        _ => return Ok(Operand::Imm(Imm::U1(!guard.negated))),
+    };
+    if !guard.negated {
+        return Ok(value.into());
+    }
+    Ok(b.op(Opcode::LogicalNot, &[value.into()])?.into())
+}
+
+/// A group translator: translates `op` when it is in the group, else `None`.
+type GroupTranslator = fn(&mut Translator<'_>, Op) -> Option<Result<(), Failure>>;
+
+/// The instruction groups' translators, one module each (spec, "Instruction translation"),
+/// tried in this order; an operation none of them takes is rejected by its mnemonic.
+const GROUPS: &[GroupTranslator] = &[attribute::translate];
 
 struct Translator<'f> {
     b: Builder<'f>,
     stage: Stage,
+    /// The pixel program's header, when the caller gave it ([`translate_with_header`]).
+    header: Option<PixelIo>,
 }
 
 impl Translator<'_> {
+    /// Translates `op` with the group that takes it.
+    fn group(&mut self, op: Op) -> Result<(), Failure> {
+        for translate in GROUPS {
+            if let Some(result) = translate(self, op) {
+                return result;
+            }
+        }
+        Err(Unsupported::Instruction(op.mnemonic()).into())
+    }
+
+    /// Opens the conditional block of an instruction under `guard` (a uniform predicate when
+    /// `uniform`): branches on it to a new block and continues there. Returns the block after
+    /// the instruction, for [`Translator::end_guard`].
+    fn begin_guard(&mut self, guard: PredSrc, uniform: bool) -> Result<BlockId, TranslateError> {
+        let cond = if uniform {
+            read_uniform_guard(&mut self.b, guard)?
+        } else {
+            crate::flow::read_pred::<TranslateError>(&mut self.b, guard)?
+        };
+        let then = self.b.add_block()?;
+        let after = self.b.add_block()?;
+        self.b.terminate(Terminator::Branch {
+            cond,
+            then,
+            otherwise: after,
+        })?;
+        self.b.switch_to(then)?;
+        Ok(after)
+    }
+
+    /// Closes a conditional block: jumps to `after` and continues there.
+    fn end_guard(&mut self, after: BlockId) -> Result<(), TranslateError> {
+        self.b.terminate(Terminator::Jump(after))?;
+        self.b.switch_to(after)?;
+        Ok(())
+    }
+
     fn op(&mut self, opcode: Opcode, args: &[Operand]) -> Result<Value, Failure> {
         Ok(self.b.op(opcode, args)?)
     }
@@ -417,97 +526,6 @@ impl Translator<'_> {
             value = self.op(Opcode::FPSaturate32, &[value.into()])?;
         }
         self.set_f32(op.dst, value)
-    }
-
-    /// The address check `ALD` and `AST` share; returns the first attribute.
-    fn attribute(addr: u16, comps: u8) -> Result<u16, Failure> {
-        let end = u32::from(comps)
-            .checked_mul(4)
-            .and_then(|size| u32::from(addr).checked_add(size));
-        require(
-            addr.is_multiple_of(4) && end.is_some_and(|end| end <= ATTRIBUTE_SPACE_END),
-            Unsupported::AttributeAddress { addr, comps },
-        )?;
-        Ok(addr / 4)
-    }
-
-    /// `ALD`, with the PR's checks in its order: offset register, patch or physical, output,
-    /// address, registers; then starquake's vertex register check.
-    fn ald(&mut self, op: OpALd) -> Result<(), Failure> {
-        require(op.offset.is_zero(), Unsupported::IndexedAttribute)?;
-        require(!op.patch && !op.phys, Unsupported::PatchOrPhysical)?;
-        require(!op.output, Unsupported::OutputRead)?;
-        let first = Self::attribute(op.addr, op.comps)?;
-        require(
-            register_run(op.dst, u32::from(op.comps)).is_some(),
-            Unsupported::AttributeRegisters {
-                first: op.dst,
-                comps: op.comps,
-            },
-        )?;
-        require(op.vtx.is_zero(), Unsupported::AttributeVertex)?;
-        for element in 0..op.comps {
-            let attribute = Attribute(first.saturating_add(u16::from(element)));
-            let value = self.op(
-                Opcode::GetAttribute,
-                &[Operand::Imm(Imm::Attribute(attribute)), VERTEX_ZERO],
-            )?;
-            let reg = Gpr::new(op.dst.index().saturating_add(element));
-            self.set_f32(reg, value)?;
-        }
-        Ok(())
-    }
-
-    /// `AST`, with the PR's checks in its order: offset register, patch or physical, address,
-    /// registers; then starquake's vertex register check.
-    fn ast(&mut self, op: OpASt) -> Result<(), Failure> {
-        require(op.offset.is_zero(), Unsupported::IndexedAttribute)?;
-        require(!op.patch && !op.phys, Unsupported::PatchOrPhysical)?;
-        let first = Self::attribute(op.addr, op.comps)?;
-        // `RZ` as the data source stores zero for every component (`ops_misc.cpp`, `AST`).
-        require(
-            op.data.is_zero() || register_run(op.data, u32::from(op.comps)).is_some(),
-            Unsupported::AttributeRegisters {
-                first: op.data,
-                comps: op.comps,
-            },
-        )?;
-        require(op.vtx.is_zero(), Unsupported::AttributeVertex)?;
-        for element in 0..op.comps {
-            let reg = if op.data.is_zero() {
-                Gpr::RZ
-            } else {
-                Gpr::new(op.data.index().saturating_add(element))
-            };
-            let value = self.get_f32(reg)?;
-            let attribute = Attribute(first.saturating_add(u16::from(element)));
-            self.op(
-                Opcode::SetAttribute,
-                &[
-                    Operand::Imm(Imm::Attribute(attribute)),
-                    value.into(),
-                    VERTEX_ZERO,
-                ],
-            )?;
-        }
-        Ok(())
-    }
-
-    /// `S2R` to a per-thread register; the uniform form, `S2UR`, is not handled yet.
-    fn s2r(&mut self, op: OpS2R) -> Result<(), Failure> {
-        let S2RDst::Reg(dst) = op.dst else {
-            return Err(Failure::Unsupported(Unsupported::Instruction("s2ur")));
-        };
-        require(
-            op.sr == SpecialReg::LANE_ID,
-            Unsupported::SpecialRegister(op.sr),
-        )?;
-        // A write to `RZ` is dropped, so the lane id is not read and needs no capability.
-        if dst.is_zero() {
-            return Ok(());
-        }
-        let value = self.op(Opcode::LaneId, &[])?;
-        self.set(dst, value.into())
     }
 
     /// `EXIT`: for a pixel program, the registers hold the colour outputs, four per target in

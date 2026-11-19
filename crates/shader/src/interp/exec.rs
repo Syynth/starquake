@@ -1038,6 +1038,30 @@ impl Run<'_> {
             O::IsHelperInvocation => Val::U1(machine.system.is_helper || machine.demoted),
             O::YDirection => Val::F32(machine.system.y_direction),
             O::LaneId => Val::U32(machine.system.lane_id),
+            O::SubgroupEqMask => Val::U32(lane_masks(machine.system.lane_id).0),
+            O::SubgroupLtMask => Val::U32(lane_masks(machine.system.lane_id).1),
+            O::SubgroupLeMask => {
+                let (equal, below) = lane_masks(machine.system.lane_id);
+                Val::U32(below | equal)
+            }
+            O::SubgroupGtMask => {
+                let (equal, below) = lane_masks(machine.system.lane_id);
+                Val::U32(!(below | equal))
+            }
+            O::SubgroupGeMask => Val::U32(!lane_masks(machine.system.lane_id).1),
+            O::InterpolateAtOffset => {
+                let attribute = args.attribute(0)?;
+                let offset = args.u32(1)?;
+                let bits = machine
+                    .interpolated
+                    .get(&(attribute, offset))
+                    .copied()
+                    .ok_or(InterpError::MissingInput {
+                        at,
+                        input: Input::Interpolated { attribute, offset },
+                    })?;
+                Val::F32(bits)
+            }
 
             O::LoadLocal => {
                 let word = args.u32(0)?;
@@ -1557,6 +1581,14 @@ fn indexed_attribute(at: Value, offset: u32) -> Result<crate::ir::Attribute, Int
     u16::try_from(offset >> 2)
         .map(crate::ir::Attribute)
         .map_err(|_| InterpError::AttributeOffset { at, offset })
+}
+
+/// The masks of a warp of 32 lanes with the lanes equal to `lane` and below it: bit `n` for
+/// lane `n` (see the module docs). A lane of 32 or more equals no lane and is above them all.
+fn lane_masks(lane: u32) -> (u32, u32) {
+    let equal = 1_u32.checked_shl(lane).unwrap_or(0);
+    // For a lane below 32, the bits under its own; past the word, every bit (0 - 1 wraps).
+    (equal, equal.wrapping_sub(1))
 }
 
 /// A binary32 function of argument 0 (see [`float::unary_f32`]).
