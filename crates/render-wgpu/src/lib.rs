@@ -39,8 +39,10 @@
 //! `starquake_render::window`).
 //!
 //! Where this backend refuses what the recording backend accepts, each a
-//! `RenderError::Unsupported` whose message names the rule ([`rules`] lists them with their
-//! wgpu sources, and `rules::tests` pins each):
+//! `RenderError::Unsupported` whose message names the rule (except
+//! [`pipeline::NO_ENTRY_POINT`], a `RenderError::Invalid`): the transfer and resource rules are
+//! listed in [`rules`] with their wgpu sources, and `rules::tests` pins each; the shader and
+//! pipeline rules are in [`pipeline`] and its `layout` and `state` modules:
 //!
 //! - an upload or buffer-to-buffer copy whose buffer range is not 4-byte aligned, and a buffer
 //!   copy within one buffer;
@@ -57,7 +59,22 @@
 //! - a texture readback whose rows, padded to 256 bytes, would not fit the largest buffer (a
 //!   dumped frame in that case is not refused: its pixels are reported unknown);
 //! - a partial clear of a depth, stencil or multisampled view;
-//! - the texture shapes, view formats and border colours wgpu cannot make.
+//! - the texture shapes, view formats and border colours wgpu cannot make;
+//! - from slice R6, shaders and pipelines ([`pipeline`] gives each rule's reason and the order of
+//!   the checks): a shader that is not a naga module ([`pipeline::NAGA_ONLY`]), whose module has no
+//!   entry point of its name for its stage ([`pipeline::NO_ENTRY_POINT`]), or whose blocks nest
+//!   deeper than [`pipeline::MAX_SHADER_NESTING`] ([`pipeline::NESTING`]); a pipeline asked of a
+//!   backend without a compile pool ([`pipeline::NO_COMPILE_POOL`]), or with a shader that needs
+//!   subgroups of 32 on a device that cannot promise them ([`pipeline::SUBGROUP_SIZE`]); layouts
+//!   where two stages bind one group and binding as different resources
+//!   ([`pipeline::layout::STAGE_CONFLICT`]), with a binding array whose size is not a constant
+//!   ([`pipeline::layout::UNSIZED_BINDING_ARRAY`]), with a 1D array texture
+//!   ([`pipeline::layout::ONE_D_ARRAY`]) or with a storage texture whose format has no wgpu form
+//!   ([`pipeline::layout::STORAGE_FORMAT`]); and fixed-function state with a vertex attribute wgpu
+//!   has no format for ([`pipeline::state::VERTEX_FORMAT`]), a topology with adjacency
+//!   ([`pipeline::state::ADJACENCY`]), culling of both faces ([`pipeline::state::CULL_BOTH`]), a
+//!   target format with no wgpu form ([`pipeline::state::TARGET_FORMAT`]), or colour targets
+//!   without a fragment shader ([`pipeline::state::TARGETS_WITHOUT_FRAGMENT`]).
 //!
 //! The differential tests in `backend::tests` run the same lists on this backend and the
 //! recording backend (hand-built lists, and 40 lists drawn from a fixed seed, of uploads,
