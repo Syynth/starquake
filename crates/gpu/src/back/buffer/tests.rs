@@ -829,21 +829,32 @@ fn a_bind_past_the_budget_is_refused_at_the_exact_edge() {
     );
     assert_eq!(rig.list, list_before);
     assert_eq!(rig.cache.len(), 2);
-    // A join counts the bytes it frees: pages 0 to 4 replace pages 0 to 3, one page more.
+    // A join keeps the buffers it replaces until the open list is submitted: pages 0 to 4 beside
+    // the four pages they replace and the other entry's four.
     assert_eq!(
         rig.try_bind(page(3), 2 * PAGE_SIZE),
+        Err(BufferError::OverBudget {
+            bytes: allowed + 5 * PAGE_SIZE,
+            allowed
+        })
+    );
+    // A dropped entry the open list used still counts until that list is submitted...
+    rig.cache.apply_update(&VmUpdate::Unmap {
+        range: pages(10, 4),
+    });
+    assert_eq!(rig.cache.bytes(), 4 * PAGE_SIZE);
+    assert_eq!(
+        rig.try_bind(page(10), 1),
         Err(BufferError::OverBudget {
             bytes: allowed + PAGE_SIZE,
             allowed
         })
     );
-    // Dropping one entry makes room for a join to exactly the budget.
-    rig.cache.apply_update(&VmUpdate::Unmap {
-        range: pages(10, 4),
-    });
-    rig.bind(page(3), 2 * PAGE_SIZE);
-    rig.bind(page(10), 3 * PAGE_SIZE);
+    // ...and then makes room for a new entry at exactly the budget, evicting nothing.
+    rig.submit();
+    rig.bind(page(10), 4 * PAGE_SIZE);
     assert_eq!(rig.cache.bytes(), allowed);
+    assert_eq!(rig.cache.len(), 2);
 }
 
 #[test]
@@ -1230,4 +1241,262 @@ fn dropping_the_cache_destroys_a_buffer_its_open_list_had_dropped() {
     let log: Vec<String> = backend.snapshot().lines().map(str::to_owned).collect();
     line_index(&log, &destroy_line(doomed.buffer, fence.get()));
     assert_eq!(backend.budget().used, 0);
+}
+
+// --- Review fixes: carry-overs, re-watch ranges, the known gap and the hard cap ---
+
+/// Takes the watch requests waiting now, arms them, and returns their ranges.
+fn take_request_ranges(rig: &Rig) -> Vec<PageRange> {
+    let mut requests = Vec::new();
+    rig.watch.take_requests(&mut requests);
+    rig.watch.arm(&requests).unwrap();
+    requests.iter().map(|r| r.range()).collect()
+}
+
+#[test]
+fn a_join_uploads_a_page_the_back_thread_wrote_into_an_old_entry() {
+    let mut rig = Rig::new();
+    rig.bind(page(0), 2 * PAGE_SIZE);
+    rig.bind(page(3), 2 * PAGE_SIZE);
+    rig.enter();
+    rig.bind(page(0), 1);
+    rig.bind(page(3), 1);
+    rig.submit();
+    // A GPU-thread write to page 0: stale in A, while its watch stays armed and untouched.
+    rig.mem.guest().write(page(0) + 40, &[0xC3; 16]).unwrap();
+    rig.cache.invalidate(page(0) + 40..page(0) + 56);
+    assert_eq!(rig.entry(page(0)).stale_bytes, PAGE_SIZE);
+    assert_eq!(rig.entry(page(0)).unarmed_bytes, 0);
+    let joined = rig.bind(page(0), 4 * PAGE_SIZE);
+    assert_eq!(rig.entry(page(0)).range, pages(0, 5));
+    let whole = BufferSlice {
+        buffer: joined.buffer,
+        offset: 0,
+        size: 5 * PAGE_SIZE,
+    };
+    assert_eq!(
+        rig.host_bytes(whole),
+        rig.guest_bytes(page(0), 5 * PAGE_SIZE)
+    );
+}
+
+#[test]
+fn a_join_keeps_re_reading_an_old_entry_whose_watch_is_not_armed() {
+    let mut rig = Rig::new();
+    rig.bind(page(0), 2 * PAGE_SIZE);
+    rig.enter();
+    rig.bind(page(0), 1);
+    // B's watch is requested and not armed when the join takes it in.
+    rig.bind(page(3), 2 * PAGE_SIZE);
+    let joined = rig.bind(page(0), 5 * PAGE_SIZE);
+    assert_eq!(rig.entry(page(0)).range, pages(0, 5));
+    // B's two pages and the gap.
+    assert_eq!(rig.entry(page(0)).unarmed_bytes, 3 * PAGE_SIZE);
+    // Not protected yet, so the store faults nothing; only re-reading sees it.
+    assert_eq!(rig.cpu_write(page(3) + 77, &[0x3C; 5]), 0);
+    rig.bind(page(0), 1);
+    let whole = BufferSlice {
+        buffer: joined.buffer,
+        offset: 0,
+        size: 5 * PAGE_SIZE,
+    };
+    assert_eq!(
+        rig.host_bytes(whole),
+        rig.guest_bytes(page(0), 5 * PAGE_SIZE)
+    );
+}
+
+#[test]
+fn a_join_waits_for_the_newest_watch_of_its_old_entries() {
+    let mut rig = Rig::new();
+    rig.bind(page(0), 2 * PAGE_SIZE);
+    rig.enter();
+    rig.bind(page(0), 1);
+    // A's page 1 is re-watched and that watch armed, with no use of A since.
+    assert_eq!(rig.cpu_write(page(1), &[1]), 1);
+    rig.sync();
+    assert_eq!(rig.enter(), 1);
+    // B, at the higher address, holds the newer ticket, not armed.
+    rig.bind(page(3), 2 * PAGE_SIZE);
+    let joined = rig.bind(page(0), 5 * PAGE_SIZE);
+    assert_eq!(rig.cpu_write(page(4) + 3, &[0x99; 7]), 0);
+    rig.bind(page(0), 1);
+    let whole = BufferSlice {
+        buffer: joined.buffer,
+        offset: 0,
+        size: 5 * PAGE_SIZE,
+    };
+    assert_eq!(
+        rig.host_bytes(whole),
+        rig.guest_bytes(page(0), 5 * PAGE_SIZE)
+    );
+}
+
+#[test]
+fn a_drain_re_watches_only_the_entrys_own_part_of_a_dirty_range() {
+    let mut rig = Rig::new();
+    rig.bind(page(0), 2 * PAGE_SIZE);
+    // Pages 2 and 3 are watched by someone else on the same watch.
+    rig.watch.request(pages(2, 2));
+    rig.enter();
+    rig.bind(page(0), 1);
+    // Four bytes across the end of page 1 and the start of page 2: one coalesced dirty range.
+    assert_eq!(rig.cpu_write(page(2) - 2, &[1, 2, 3, 4]), 2);
+    assert_eq!(rig.sync(), [pages(1, 2)]);
+    assert_eq!(take_request_ranges(&rig), [pages(1, 1)]);
+}
+
+/// A GPU address far from the test memory, mapped onto a CPU page of it.
+const ELSEWHERE: u64 = 0x40_0000_0000;
+
+#[test]
+fn the_watch_is_requested_at_the_gpu_address_not_the_cpu_one() {
+    // The known gap (module docs, "Learning of CPU writes"): until slice G22 translates a GPU
+    // range to its CPU pages, the watch is asked for the GPU range. When the gap closes, this
+    // test flips to expect `pages(5, 1)`.
+    let mut rig = Rig::new();
+    let gpu = PageRange::new(ELSEWHERE, PAGE_SIZE).unwrap();
+    rig.mem.map(gpu, page(5)).unwrap();
+    let slice = rig.bind(ELSEWHERE, PAGE_SIZE);
+    assert_eq!(take_request_ranges(&rig), [gpu]);
+    // The bytes themselves come from the CPU page.
+    assert_eq!(rig.host_bytes(slice), rig.guest_bytes(page(5), PAGE_SIZE));
+}
+
+#[test]
+fn a_bind_over_the_budget_evicts_the_least_recently_used_idle_entry_first() {
+    let allowed = 8 * PAGE_SIZE;
+    let mut rig = Rig::with_budget(allowed);
+    let a = rig.bind(page(0), 4 * PAGE_SIZE);
+    let b = rig.bind(page(10), 4 * PAGE_SIZE);
+    let first = rig.submit();
+    // A is used again in a later list, so B, at the higher address, is least recently used.
+    rig.bind(page(0), 1);
+    rig.submit();
+    // Four pages fit exactly once B is gone.
+    let c = rig.bind(page(20), 4 * PAGE_SIZE);
+    let left: Vec<_> = rig.cache.entries().map(|e| (e.range, e.buffer)).collect();
+    assert_eq!(left, [(pages(0, 4), a.buffer), (pages(20, 4), c.buffer)]);
+    assert_eq!(rig.cache.bytes(), allowed);
+    let destroys: Vec<String> = rig
+        .log()
+        .into_iter()
+        .filter(|l| l.starts_with("destroy"))
+        .collect();
+    assert_eq!(destroys, [destroy_line(b.buffer, first.get())]);
+    assert_eq!(rig.backend.budget().used, allowed);
+
+    // One page more needs both idle entries gone.
+    let mut rig = Rig::with_budget(allowed);
+    let a = rig.bind(page(0), 4 * PAGE_SIZE);
+    let b = rig.bind(page(10), 4 * PAGE_SIZE);
+    let fence = rig.submit();
+    let c = rig.bind(page(20), 5 * PAGE_SIZE);
+    let left: Vec<_> = rig.cache.entries().map(|e| (e.range, e.buffer)).collect();
+    assert_eq!(left, [(pages(20, 5), c.buffer)]);
+    let destroys: Vec<String> = rig
+        .log()
+        .into_iter()
+        .filter(|l| l.starts_with("destroy"))
+        .collect();
+    assert_eq!(
+        destroys,
+        [
+            destroy_line(a.buffer, fence.get()),
+            destroy_line(b.buffer, fence.get())
+        ]
+    );
+}
+
+#[test]
+fn a_bind_that_would_need_an_entry_the_open_list_uses_is_refused_and_changes_nothing() {
+    let allowed = 8 * PAGE_SIZE;
+    let mut rig = Rig::with_budget(allowed);
+    let idle = rig.bind(page(10), 2 * PAGE_SIZE);
+    rig.submit();
+    let open = rig.bind(page(0), 4 * PAGE_SIZE);
+    rig.enter();
+    let list_before = rig.list.clone();
+    let log_before = rig.log();
+    // Five pages fit only with the open list's entry gone too: the idle one alone is not enough.
+    assert_eq!(
+        rig.try_bind(page(20), 5 * PAGE_SIZE),
+        Err(BufferError::OverBudget {
+            bytes: allowed + PAGE_SIZE,
+            allowed
+        })
+    );
+    assert_eq!(rig.list, list_before);
+    assert_eq!(rig.log(), log_before);
+    assert!(!rig.watch.has_requests());
+    let left: Vec<_> = rig.cache.entries().map(|e| (e.range, e.buffer)).collect();
+    assert_eq!(
+        left,
+        [(pages(0, 4), open.buffer), (pages(10, 2), idle.buffer)]
+    );
+    // At the edge, four pages evict the idle entry and leave the open list's alone.
+    let c = rig.bind(page(20), 4 * PAGE_SIZE);
+    let left: Vec<_> = rig.cache.entries().map(|e| (e.range, e.buffer)).collect();
+    assert_eq!(left, [(pages(0, 4), open.buffer), (pages(20, 4), c.buffer)]);
+    line_index(&rig.log(), &destroy_line(idle.buffer, 1));
+}
+
+#[test]
+fn a_join_never_evicts_the_entries_it_joins_and_counts_them_until_submitted() {
+    let allowed = 8 * PAGE_SIZE;
+    let mut rig = Rig::with_budget(allowed);
+    let a = rig.bind(page(0), 3 * PAGE_SIZE);
+    rig.submit();
+    let log_before = rig.log();
+    // Pages 0 to 5 replace A's three, which the open list then copies from: 3 + 6 pages.
+    assert_eq!(
+        rig.try_bind(page(2), 4 * PAGE_SIZE),
+        Err(BufferError::OverBudget {
+            bytes: allowed + PAGE_SIZE,
+            allowed
+        })
+    );
+    assert_eq!(rig.log(), log_before);
+    assert_eq!(rig.entry(page(0)).buffer, a.buffer);
+    // Pages 0 to 4: 3 + 5 pages, exactly the budget.
+    rig.bind(page(2), 3 * PAGE_SIZE);
+    assert_eq!(rig.entry(page(0)).range, pages(0, 5));
+    assert_eq!(rig.backend.budget().used, allowed);
+    let fence = rig.submit();
+    line_index(&rig.log(), &destroy_line(a.buffer, fence.get()));
+    assert_eq!(rig.backend.budget().used, 5 * PAGE_SIZE);
+}
+
+#[test]
+fn growing_joins_in_one_list_cannot_pass_the_budget() {
+    let allowed = 8 * PAGE_SIZE;
+    let mut rig = Rig::with_budget(allowed);
+    // The bytes held: the live entry and every buffer it replaced in this list.
+    let mut held = 0;
+    let mut refused = 0;
+    for len in 1..=8 {
+        let wanted = held + len * PAGE_SIZE;
+        let result = rig.try_bind(page(0), len * PAGE_SIZE);
+        if wanted <= allowed {
+            assert_eq!(result.map(|s| s.size), Ok(len * PAGE_SIZE), "{len}");
+            held = wanted;
+        } else {
+            assert_eq!(
+                result,
+                Err(BufferError::OverBudget {
+                    bytes: wanted,
+                    allowed
+                }),
+                "{len}"
+            );
+            refused += 1;
+        }
+        assert_eq!(rig.backend.budget().used, held, "{len}");
+        assert!(rig.backend.budget().used <= allowed, "{len}");
+    }
+    // 1 + 2 + 3 pages are held; four more would pass the budget, and so would each after.
+    assert_eq!((held, refused), (6 * PAGE_SIZE, 5));
+    rig.submit();
+    assert_eq!(rig.backend.budget().used, 3 * PAGE_SIZE);
+    rig.bind(page(0), 4 * PAGE_SIZE);
 }

@@ -68,7 +68,9 @@
 //! pages: guest stores to the real ones are missed, so the cache keeps stale bytes, and stores
 //! to the others cost spurious re-uploads. GPU-only memory has no CPU pages behind it, so only
 //! the second applies. This is a **known gap** until the production memory (slice G22) can
-//! translate a range to its CPU pages.
+//! translate a range to its CPU pages. Pinned by
+//! `tests::the_watch_is_requested_at_the_gpu_address_not_the_cpu_one`, which maps a GPU page onto
+//! a different CPU page and expects the GPU range in the request; G22 flips it.
 //!
 //! # Streamed ranges
 //!
@@ -103,13 +105,14 @@
 //!
 //! # Destruction
 //!
-//! A dropped, joined or evicted entry's buffer is destroyed with [`Backend::destroy`] after the
-//! fence of the last list that used it, so it outlives every list that names it. The cache learns
-//! a list's fence only when the executor reports its submission ([`BufferCache::submitted`]): an
-//! entry used since the last report belongs to the open list, and its buffer's destroy waits for
-//! that report. The buffers a join replaces are always in that case: the open list copies from
-//! them. Pinned by `tests::a_buffer_dropped_while_its_list_is_open_is_destroyed_after_that_list`
-//! and `tests::a_bind_overlapping_entries_joins_them_by_copy_and_uploads_only_the_gap`.
+//! A dropped, joined or evicted entry's buffer (evicted by the collector or by a bind making room
+//! under the hard cap) is destroyed with [`Backend::destroy`] after the fence of the last list
+//! that used it, so it outlives every list that names it. The cache learns a list's fence only
+//! when the executor reports its submission ([`BufferCache::submitted`]): an entry used since the
+//! last report belongs to the open list, and its buffer's destroy waits for that report. The
+//! buffers a join replaces are always in that case: the open list copies from them. Pinned by
+//! `tests::a_buffer_dropped_while_its_list_is_open_is_destroyed_after_that_list` and
+//! `tests::a_bind_overlapping_entries_joins_them_by_copy_and_uploads_only_the_gap`.
 //! Dropping the cache destroys every buffer it holds after the last fence it was told of, so it
 //! must be dropped after its open list is submitted or abandoned.
 //!
@@ -124,7 +127,8 @@
 //! or 64 iterations; it walks its LRU list from the least recently touched and destroys those at
 //! least that many frames old, before `++frame_tick`). Collection is sized by the cache's own
 //! bytes, not the device's use, as Eden-NX2 learned (row 139; `buffer_cache.h` in `eden-nx2`
-//! collects at `buffer_bytes >= 1_GiB`, aggressively at `2_GiB`).
+//! collects at `buffer_bytes >= 1_GiB`, aggressively at `2_GiB`). A bind also evicts idle
+//! entries when the hard cap needs room ("Divergences and guesses").
 //!
 //! # Divergences and guesses
 //!
@@ -132,11 +136,27 @@
 //!   caps them at half the budget's `allowed` and the whole of it, so a small device still
 //!   collects. The halves are not from a reference. Pinned by
 //!   `tests::eviction_limits_at_every_edge`.
-//! - **A hard cap (stricter than both references).** A bind that would take the cache's bytes past
-//!   the budget's `allowed` is refused ([`BufferError::OverBudget`]) before anything changes;
-//!   Eden has no cap, so a hostile guest binding fresh ranges faster than the 120-frame collector
-//!   frees them could grow it without bound. Pinned by
-//!   `tests::a_bind_past_the_budget_is_refused_at_the_exact_edge`.
+//! - **A hard cap (stricter than both references; an owner question).** A bind that makes a new
+//!   entry counts the bytes it would leave live: every entry's, the new entry's, and those of the
+//!   buffers the open list still reads (entries it used that were joined or dropped since, and the
+//!   entries this join replaces), which stay live until that list is submitted. When that passes
+//!   the budget's `allowed`, the bind first evicts *idle* entries (not used by the open list, not
+//!   among the entries it joins), least recently used first and then lowest address, until it
+//!   fits; each is destroyed after its own last fence, as the collector's are. Only when it still
+//!   does not fit with every idle entry gone is it refused ([`BufferError::OverBudget`]), before
+//!   anything changes; the evictions happen only once every fallible step has passed. Eden never
+//!   refuses a bind and has no cap, so a hostile guest binding fresh ranges faster than the
+//!   120-frame collector frees them could grow it without bound; the cap bounds this cache's own
+//!   live buffers within one list as well
+//!   (`tests::growing_joins_in_one_list_cannot_pass_the_budget`). The bind-time eviction differs
+//!   from the collector: it ignores [`EVICT_AFTER_FRAMES`] (an entry used in the previous list
+//!   may go) and has no per-call count. The cap does not count staging slices, other caches'
+//!   textures, or buffers destroyed but still waiting for their fence on the host; each makes the
+//!   device's real use higher than the cap sees. Pinned by
+//!   `tests::a_bind_past_the_budget_is_refused_at_the_exact_edge`,
+//!   `tests::a_bind_over_the_budget_evicts_the_least_recently_used_idle_entry_first`,
+//!   `tests::a_bind_that_would_need_an_entry_the_open_list_uses_is_refused_and_changes_nothing`
+//!   and `tests::a_join_never_evicts_the_entries_it_joins_and_counts_them_until_submitted`.
 //! - **GPU-written buffers.** Nothing writes a buffer on the host GPU yet: the copy engines write
 //!   guest memory on the CPU, and the first host-GPU writer is a storage buffer in a draw or
 //!   dispatch (slices G18 and G19). So this slice has no GPU-written state, no on-demand
@@ -171,8 +191,9 @@ use spans::Spans;
 
 /// The usage every cached buffer is made with: all of them, as Eden makes every cached buffer
 /// usable as transfer source and destination, uniform, storage, index, vertex and indirect
-/// buffer (`MakeBufferCreateInfo`, `eden/src/video_core/renderer_vulkan/vk_buffer_cache.cpp`),
-/// since one guest range may be bound in any role.
+/// buffer (the anonymous-namespace `CreateBuffer(const Device&, const MemoryAllocator&, u64,
+/// VkDeviceSize)` in `eden/src/video_core/renderer_vulkan/vk_buffer_cache.cpp`), since one guest
+/// range may be bound in any role.
 pub const BUFFER_USAGE: BufferUsage = BufferUsage::ALL;
 
 /// Drains finding an entry written, without a clean use between them, after which the entry is
@@ -266,7 +287,8 @@ pub const fn collection(bytes: u64, limits: EvictionLimits) -> Option<Collection
 /// decides between the two. Pinned by `tests::checks_run_in_their_documented_order`.
 ///
 /// Nothing changes on any of them: no entry, page state, watch request, live buffer or command is
-/// left behind (a buffer made for the bind is destroyed at once, being in no list).
+/// left behind (a buffer made for the bind is destroyed at once, being in no list), and no idle
+/// entry is evicted (a bind evicts to make room only once it can no longer fail).
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum BufferError {
     /// A binding of no bytes.
@@ -292,10 +314,12 @@ pub enum BufferError {
         /// `Limits::max_buffer_size`.
         max: u64,
     },
-    /// The new entry would take the cache's bytes past what the device allows.
+    /// The new entry would take the cache's live buffers past what the device allows, even with
+    /// every idle entry evicted.
     #[error("the buffer cache would hold {bytes:#x} bytes, more than the {allowed:#x} allowed")]
     OverBudget {
-        /// The cache's bytes with the new entry.
+        /// The bytes the cache's live buffers would take with the new entry and every idle entry
+        /// evicted: the entries', the new entry's and those the open list still reads.
         bytes: u64,
         /// The budget's `allowed`.
         allowed: u64,
@@ -396,6 +420,8 @@ pub struct BufferCache {
     open: Vec<u64>,
     /// Buffers of entries the open list used, dropped before it was submitted.
     doomed: Vec<BufferId>,
+    /// The sum of the sizes of the buffers in `doomed`: still live, and counted by the hard cap.
+    doomed_bytes: u64,
     /// The fence of the last submitted list the cache was told of.
     last_fence: FenceValue,
     /// The use counter.
@@ -427,8 +453,8 @@ struct JoinPlan {
     olds: Vec<u64>,
     /// The joined entry's range.
     range: PageRange,
-    /// The cache's bytes once the join is done.
-    bytes: u64,
+    /// Starts of the idle entries evicted to make room, least recently used first.
+    evict: Vec<u64>,
     /// The old entries' stale pages and the pages none held.
     stale: Spans,
     /// The old entries' unarmed pages.
@@ -455,6 +481,7 @@ impl BufferCache {
             bytes: 0,
             open: Vec::new(),
             doomed: Vec::new(),
+            doomed_bytes: 0,
             last_fence: FenceValue::ZERO,
             stamp: 0,
             frame: 0,
@@ -603,7 +630,7 @@ impl BufferCache {
         let JoinPlan {
             olds,
             range,
-            bytes,
+            evict,
             mut unarmed,
             uncovered,
             mut pending,
@@ -632,6 +659,11 @@ impl BufferCache {
             }
             self.retire(*s);
         }
+        // Idle entries: no list after the last submitted one names them, so each is destroyed
+        // after its own last fence.
+        for s in evict {
+            self.retire(s);
+        }
         let stamp = self.next_stamp();
         let mut entry = Entry {
             range,
@@ -649,7 +681,7 @@ impl BufferCache {
         };
         Self::record_use(&mut entry, stamp, self.frame, &mut self.open);
         self.entries.insert(start, entry);
-        self.bytes = bytes;
+        self.bytes = self.bytes.saturating_add(range.size());
         list.commands.append(&mut staged.commands);
         Ok((start, buffer))
     }
@@ -674,16 +706,7 @@ impl BufferCache {
         if size > max {
             return Err(BufferError::TooLarge { size, max });
         }
-        let old_bytes = olds
-            .iter()
-            .filter_map(old)
-            .map(|e| e.range.size())
-            .fold(0, u64::saturating_add);
-        let allowed = self.backend.budget().allowed;
-        let bytes = self.bytes.saturating_sub(old_bytes).saturating_add(size);
-        if bytes > allowed {
-            return Err(BufferError::OverBudget { bytes, allowed });
-        }
+        let evict = self.make_room(&olds, size)?;
         let range = PageRange::new(start, size).map_err(|_| BufferError::OutOfRange {
             va: cover.start(),
             len: cover.size(),
@@ -691,7 +714,7 @@ impl BufferCache {
         let mut plan = JoinPlan {
             olds: Vec::new(),
             range,
-            bytes,
+            evict,
             stale: Spans::default(),
             unarmed: Spans::default(),
             uncovered: Spans::default(),
@@ -713,6 +736,45 @@ impl BufferCache {
         plan.stale.insert_all(&plan.uncovered);
         plan.olds = olds;
         Ok(plan)
+    }
+
+    /// The idle entries to evict so that a new entry of `size` bytes, joining the entries at
+    /// `olds`, fits the budget's `allowed` (module docs, "Divergences and guesses", the hard
+    /// cap): least recently used first, then lowest address, and only as many as it takes. An
+    /// entry the open list uses, or one of `olds`, is never chosen. Changes nothing.
+    ///
+    /// The bytes counted are the entries', the doomed buffers' (the open list still reads them)
+    /// and the new entry's. The olds' bytes stay counted: once joined they are doomed until the
+    /// open list is submitted.
+    fn make_room(&self, olds: &[u64], size: u64) -> Result<Vec<u64>, BufferError> {
+        let allowed = self.backend.budget().allowed;
+        let mut bytes = self
+            .bytes
+            .saturating_add(self.doomed_bytes)
+            .saturating_add(size);
+        // Only skips the walk: the loop below stops at the same edge.
+        if bytes <= allowed {
+            return Ok(Vec::new());
+        }
+        let mut idle: Vec<(u64, u64, u64)> = self
+            .entries
+            .iter()
+            .filter(|(s, e)| !e.in_open && !olds.contains(s))
+            .map(|(&s, e)| (e.stamp, s, e.range.size()))
+            .collect();
+        idle.sort_unstable();
+        let mut evict = Vec::new();
+        for (_, start, entry_size) in idle {
+            if bytes <= allowed {
+                break;
+            }
+            bytes = bytes.saturating_sub(entry_size);
+            evict.push(start);
+        }
+        if bytes > allowed {
+            return Err(BufferError::OverBudget { bytes, allowed });
+        }
+        Ok(evict)
     }
 
     /// A copy of each old entry's buffer into its place in the joined `buffer` at `start`.
@@ -799,6 +861,7 @@ impl BufferCache {
         self.bytes = self.bytes.saturating_sub(entry.range.size());
         if entry.in_open {
             self.doomed.push(entry.buffer);
+            self.doomed_bytes = self.doomed_bytes.saturating_add(entry.range.size());
         } else {
             self.backend
                 .destroy(ResourceId::Buffer(entry.buffer), entry.last_fence);
@@ -906,6 +969,7 @@ impl BufferCache {
         for buffer in core::mem::take(&mut self.doomed) {
             self.backend.destroy(ResourceId::Buffer(buffer), fence);
         }
+        self.doomed_bytes = 0;
     }
 
     /// Ends a frame (module docs, "Eviction"): runs the collector if the cache's bytes reach the
