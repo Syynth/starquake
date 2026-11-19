@@ -52,27 +52,133 @@ fn the_draw_decision_for_every_status_and_setting() {
     }
 }
 
+/// An adapter as wgpu describes it, with the fields the subgroup rule reads set and the rest as
+/// wgpu-types 30.0.2's `AdapterInfo::new` leaves them (the Metal backend's starting point).
+fn adapter(backend: wgpu::Backend, name: &str, min: u32, max: u32) -> wgpu::AdapterInfo {
+    wgpu::AdapterInfo {
+        name: name.to_owned(),
+        subgroup_min_size: min,
+        subgroup_max_size: max,
+        ..wgpu::AdapterInfo::new(wgpu::DeviceType::IntegratedGpu, backend)
+    }
+}
+
+/// The reference values, written out: the guest's warp is 32 lanes (shader-pipeline, "Compute
+/// programs"); the Metal device name of this Mac's GPU, as measured through wgpu, is "Apple M2".
 #[test]
-fn subgroups_are_honoured_only_at_exactly_thirty_two() {
-    let s = wgpu::Features::SUBGROUP;
-    let none = wgpu::Features::empty();
+fn the_subgroup_constants_match_their_sources() {
     assert_eq!(GUEST_SUBGROUP_SIZE, 32);
-    for (features, min, max, honoured) in [
-        (s, 32, 32, true),
-        (none, 32, 32, false),
-        (s, 4, 64, false), // wgpu's Metal report
-        (s, 31, 32, false),
-        (s, 33, 33, false),
-        (s, 32, 33, false),
-        (s, 32, 31, false),
-        (s, 16, 32, false),
-        (s, 32, 64, false),
+    assert_eq!(APPLE_GPU_NAME_PREFIX, "Apple ");
+    assert!("Apple M2".starts_with(APPLE_GPU_NAME_PREFIX));
+}
+
+#[test]
+fn only_a_metal_adapter_named_apple_is_the_apple_gpu_family() {
+    use wgpu::Backend::{Gl, Metal, Vulkan};
+    for (backend, name, apple) in [
+        (Metal, "Apple M2", true), // measured on this Mac
+        (Metal, "Apple M1 Max", true),
+        (Metal, "Apple A14 GPU", true),
+        (Metal, "Apple ", true), // the prefix alone
+        (Metal, "Apple", false), // no space
+        (Metal, "AppleM2", false),
+        (Metal, "apple M2", false), // the case matters
+        (Metal, " Apple M2", false),
+        (Metal, "AMD Radeon Pro 5500M", false),
+        (Metal, "Intel(R) UHD Graphics 630", false),
+        (Metal, "", false),
+        (Vulkan, "Apple M2", false), // MoltenVK or a Linux driver: the range check applies
+        (Gl, "Apple M2", false),
     ] {
         assert_eq!(
-            subgroups_honoured(features, min, max),
-            honoured,
-            "{features:?} {min}..={max}"
+            apple_gpu_family(&adapter(backend, name, 4, 64)),
+            apple,
+            "{backend:?} {name:?}"
         );
+    }
+}
+
+#[test]
+fn the_apple_family_meets_subgroup_size_32_and_others_keep_the_range_check() {
+    use SubgroupSupport::{AppleFamily, Fixed32, NoSubgroups, Range};
+    use wgpu::Backend::{Metal, Vulkan};
+    let s = wgpu::Features::SUBGROUP;
+    let none = wgpu::Features::empty();
+    let g = GUEST_SUBGROUP_SIZE;
+    for (backend, name, features, min, max, support) in [
+        // wgpu's Metal report on an Apple GPU.
+        (Metal, "Apple M2", s, 4, 64, AppleFamily),
+        // Without the feature nothing meets it, the Apple family included.
+        (Metal, "Apple M2", none, 4, 64, NoSubgroups),
+        (Vulkan, "GPU", none, g, g, NoSubgroups),
+        // The family is decided first: a range of 32 to 32 on it reads as the family.
+        (Metal, "Apple M2", s, g, g, AppleFamily),
+        // A 4 to 64 adapter outside the family does not meet it.
+        (
+            Metal,
+            "AMD Radeon Pro 5500M",
+            s,
+            4,
+            64,
+            Range { min: 4, max: 64 },
+        ),
+        (Vulkan, "Apple M2", s, 4, 64, Range { min: 4, max: 64 }),
+        // A fixed-32 adapter does.
+        (Vulkan, "GPU", s, g, g, Fixed32),
+        (Metal, "Intel(R) UHD Graphics 630", s, g, g, Fixed32),
+        // The range check's edges, one off on each side of each end.
+        (Vulkan, "GPU", s, g - 1, g, Range { min: g - 1, max: g }),
+        (
+            Vulkan,
+            "GPU",
+            s,
+            g + 1,
+            g + 1,
+            Range {
+                min: g + 1,
+                max: g + 1,
+            },
+        ),
+        (Vulkan, "GPU", s, g, g + 1, Range { min: g, max: g + 1 }),
+        (Vulkan, "GPU", s, g, g - 1, Range { min: g, max: g - 1 }),
+        (Vulkan, "GPU", s, 16, g, Range { min: 16, max: g }),
+        (Vulkan, "GPU", s, g, 64, Range { min: g, max: 64 }),
+    ] {
+        let info = adapter(backend, name, min, max);
+        let got = SubgroupSupport::of(&info, features);
+        assert_eq!(
+            got, support,
+            "{backend:?} {name:?} {features:?} {min}..={max}"
+        );
+        assert_eq!(
+            got.honoured(),
+            matches!(support, AppleFamily | Fixed32),
+            "{support:?}"
+        );
+    }
+}
+
+#[test]
+fn the_subgroup_verdict_reads_as_plain_words() {
+    for (support, text) in [
+        (
+            SubgroupSupport::NoSubgroups,
+            "no (the device has no subgroups)",
+        ),
+        (
+            SubgroupSupport::AppleFamily,
+            "yes (Apple GPU family, 32-wide SIMD groups)",
+        ),
+        (
+            SubgroupSupport::Fixed32,
+            "yes (the reported range is 32 to 32)",
+        ),
+        (
+            SubgroupSupport::Range { min: 4, max: 64 },
+            "no (the reported range is 4 to 64)",
+        ),
+    ] {
+        assert_eq!(support.to_string(), text);
     }
 }
 
@@ -1148,14 +1254,82 @@ fn a_subgroup_pipeline_follows_the_device() {
             assert_eq!(result, Err(RenderError::Unsupported(SUBGROUP_SIZE)));
         }
         let info = gpu.device().adapter_info();
-        assert_eq!(
-            gpu.honours_subgroups(),
-            subgroups_honoured(
-                gpu.device().features(),
-                info.subgroup_min_size,
-                info.subgroup_max_size
-            )
-        );
+        let support = SubgroupSupport::of(&info, gpu.device().features());
+        assert_eq!(gpu.subgroup_support(), support);
+        assert_eq!(gpu.honours_subgroups(), support.honoured());
+        // The adapter report records the facts that decided it, and the verdict.
+        let report = gpu.adapter_report().to_string();
+        for line in [
+            format!("adapter: {}\n", info.name),
+            format!("backend: {:?}\n", info.backend),
+            format!(
+                "subgroup size range: {} to {}\n",
+                info.subgroup_min_size, info.subgroup_max_size
+            ),
+            format!("subgroups of 32: {support}\n"),
+        ] {
+            assert!(report.contains(&line), "{line:?} in {report}");
+        }
+        let family = if apple_gpu_family(&info) { "yes" } else { "no" };
+        let line = format!("Apple GPU family: {family}\n");
+        assert!(report.contains(&line), "{line:?} in {report}");
+    });
+}
+
+/// On an Apple GPU (every Apple-silicon Mac), a compute pipeline that uses a subgroup operation
+/// and a graphics pipeline whose fragment shader uses the subgroup invocation id both build and
+/// reach `Ready`, although wgpu reports a subgroup size range of 4 to 64 there. On an
+/// Apple-silicon Mac the adapter must be found to be an Apple GPU; on other hosts an adapter that
+/// is not one makes the test say so and stop, and `a_subgroup_pipeline_follows_the_device` covers
+/// it.
+#[test]
+fn on_an_apple_gpu_subgroup_pipelines_are_ready() {
+    bounded(|| {
+        let Some(gpu) = gpu(
+            "apple subgroups",
+            Arc::new(ThreadPool),
+            WhileCompiling::Wait,
+        ) else {
+            return;
+        };
+        let info = gpu.device().adapter_info();
+        // Every Apple-silicon Mac's GPU is an Apple GPU, so there the name rule must find it
+        // rather than let the test stop.
+        if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            assert!(
+                apple_gpu_family(&info),
+                "an Apple-silicon Mac's adapter is the Apple GPU family: {:?} on {:?}",
+                info.name,
+                info.backend
+            );
+        } else if !apple_gpu_family(&info) {
+            eprintln!(
+                "skipping apple subgroups: the adapter is not an Apple GPU ({:?} on {:?})",
+                info.name, info.backend
+            );
+            return;
+        }
+        assert_eq!(gpu.subgroup_support(), SubgroupSupport::AppleFamily);
+        assert!(gpu.honours_subgroups());
+        let cs = gpu
+            .create_shader(shader_desc(
+                ShaderStage::Compute,
+                "main",
+                wgsl(BALLOT),
+                storage_out(),
+            ))
+            .expect("the shader itself is accepted");
+        let compute = gpu
+            .create_compute_pipeline(ComputePipelineDesc { shader: cs })
+            .expect("a subgroup compute pipeline is accepted on an Apple GPU");
+        assert_eq!(settled(&gpu, compute), PipelineStatus::Ready);
+        let vs = bare_vertex(&gpu);
+        let fs = fragment(&gpu, SUBGROUP_FRAGMENT, storage_out());
+        let graphics = gpu
+            .create_graphics_pipeline(graphics_desc(vs, Some(fs)))
+            .expect("a subgroup graphics pipeline is accepted on an Apple GPU");
+        assert_eq!(settled(&gpu, graphics), PipelineStatus::Ready);
+        assert_eq!(gpu.host_errors(), 0);
     });
 }
 
@@ -1284,22 +1458,21 @@ fn nothing_is_created_once_the_device_is_lost() {
     });
 }
 
-/// Checks 4, 5 and 6 of the module docs' order with two faults at once, on a device that
-/// cannot promise subgroups of 32 (every Mac); elsewhere the test says so and stops.
+/// Checks 4, 5 and 6 of the module docs' order with two faults at once. The backend is told its
+/// device cannot promise subgroups of 32 (as a 4 to 64 adapter outside the Apple family), so the
+/// order is checked on every device, an Apple GPU included.
 #[test]
 fn requirements_come_after_the_ids_and_before_the_layout() {
     bounded(|| {
-        let Some(gpu) = gpu(
+        let Some(mut gpu) = gpu(
             "requirements order",
             Arc::new(ThreadPool),
             WhileCompiling::Wait,
         ) else {
             return;
         };
-        if gpu.honours_subgroups() {
-            eprintln!("skipping requirements order: this device honours subgroups of 32");
-            return;
-        }
+        gpu.set_subgroup_support(SubgroupSupport::Range { min: 4, max: 64 });
+        assert!(!gpu.honours_subgroups());
         let vs = vertex(&gpu);
         // A fragment shader that uses subgroups and binds (0, 0) as a storage buffer, which the
         // vertex shader binds as a uniform buffer.
