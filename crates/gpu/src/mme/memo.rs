@@ -257,6 +257,8 @@ struct Tracked<'a> {
     writes: &'a mut Vec<(u32, u32)>,
     /// Bit `i` is set once the call has written word `i`.
     written: &'a mut [u64],
+    /// The value each word held before the call first wrote it ([`MacroMemo::undo_data_ram`]).
+    undo: &'a mut Vec<(u32, u32)>,
     reason: &'a Cell<Option<NotMemoised>>,
 }
 
@@ -280,9 +282,13 @@ impl RamAccess for Tracked<'_> {
     }
 
     fn write(&mut self, index: u32, value: u32) -> Option<()> {
-        *self.ram.get_mut(index)? = value;
+        let slot = self.ram.get_mut(index)?;
+        let old = std::mem::replace(slot, value);
         let (word, bit) = Self::bit(index)?;
         if let Some(bits) = self.written.get_mut(word) {
+            if *bits & bit == 0 {
+                self.undo.push((index, old));
+            }
             *bits |= bit;
         }
         self.writes.push((index, value));
@@ -311,6 +317,9 @@ pub struct MacroMemo {
     data_ram_writes: Vec<(u32, u32)>,
     writes: Vec<(u32, u32)>,
     written: Box<[u64]>,
+    /// The last call's data RAM words as they were before it first wrote each, for
+    /// [`MacroMemo::undo_data_ram`]. At most one pair per word, as `written` marks them.
+    undo: Vec<(u32, u32)>,
 }
 
 impl Default for MacroMemo {
@@ -342,6 +351,7 @@ impl MacroMemo {
             data_ram_writes: Vec::new(),
             writes: Vec::new(),
             written: vec![0; DATA_RAM_WORDS.div_ceil(64)].into_boxed_slice(),
+            undo: Vec::new(),
         }
     }
 
@@ -373,7 +383,9 @@ impl MacroMemo {
         data_ram: &mut DataRam,
         host: &mut impl MacroHost,
     ) -> Result<CallOutcome, MacroError> {
+        self.undo.clear();
         if let Some(effects) = self.find(start, parameters, data_ram) {
+            self.written.fill(0);
             self.replay(&effects, data_ram, host);
             return Ok(CallOutcome::Replayed);
         }
@@ -395,6 +407,7 @@ impl MacroMemo {
             reads: &mut self.reads,
             writes: &mut self.data_ram_writes,
             written: &mut self.written,
+            undo: &mut self.undo,
             reason: &reason,
         };
         run_with(program, &mut ram, &mut recorder, self.limit)?;
@@ -407,6 +420,19 @@ impl MacroMemo {
         } else {
             Ok(CallOutcome::NotStored(NotMemoised::TooLarge))
         }
+    }
+
+    /// Puts back every data RAM word the last [`MacroMemo::call`] wrote, replayed or
+    /// interpreted, failed or not, to the value it held before that call: the macro host
+    /// (slice G13, `crate::macros`) commits nothing of a run it discards. A second undo, or one
+    /// after a call that wrote nothing, changes nothing.
+    pub(crate) fn undo_data_ram(&mut self, data_ram: &mut DataRam) {
+        for &(index, old) in self.undo.iter().rev() {
+            if let Some(word) = data_ram.get_mut(index) {
+                *word = old;
+            }
+        }
+        self.undo.clear();
     }
 
     /// The memo's counters.
@@ -506,8 +532,9 @@ impl MacroMemo {
         })
     }
 
-    /// Applies a matched record's effects.
-    fn replay(&self, effects: &Effects, data_ram: &mut DataRam, host: &mut impl MacroHost) {
+    /// Applies a matched record's effects, saving each data RAM word's old value the first
+    /// time it is written (`written` is empty when this starts).
+    fn replay(&mut self, effects: &Effects, data_ram: &mut DataRam, host: &mut impl MacroHost) {
         let arena = &self.arena;
         let data_ram_writes = arena
             .get(effects.data_ram_writes.clone())
@@ -515,7 +542,14 @@ impl MacroMemo {
         for &[index, value] in data_ram_writes.as_chunks().0 {
             // Every index was recorded from a write that succeeded, so it is in range.
             if let Some(word) = data_ram.get_mut(index) {
-                *word = value;
+                let old = std::mem::replace(word, value);
+                if let Some((at, bit)) = Tracked::bit(index)
+                    && let Some(bits) = self.written.get_mut(at)
+                    && *bits & bit == 0
+                {
+                    *bits |= bit;
+                    self.undo.push((index, old));
+                }
             }
         }
         let writes = arena.get(effects.writes.clone()).unwrap_or_default();

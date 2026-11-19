@@ -10,8 +10,9 @@
 //!   call's recorded effects when the data RAM words it read still hold, and interprets it
 //!   otherwise.
 //!
-//! Not here yet: a JIT, the wiring into the 3D and compute engines,
-//! the older Fermi macro processor, and MME DMA reads (see [`MacroHost::barrier`] for the hook).
+//! The wiring into the 3D and compute engines, and the MME DMA reads behind
+//! [`MacroHost::barrier`], are the front macro host's (`crate::macros`, slice G13). Not here
+//! yet: a JIT and the older Fermi macro processor.
 
 mod display;
 pub mod inst;
@@ -19,7 +20,7 @@ pub mod interp;
 pub mod memo;
 
 #[cfg(test)]
-mod testing;
+pub(crate) mod testing;
 #[cfg(test)]
 mod tests;
 
