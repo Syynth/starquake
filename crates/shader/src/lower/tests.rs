@@ -7,7 +7,7 @@ use super::*;
 use crate::asm::assemble_program;
 use crate::decode::{
     AluSrc, Gpr, Instr, MovSrc, Op, OpALd, OpASt, OpExit, OpFFma, OpMov, OpS2R, PredSrc, RoundMode,
-    SpecialReg,
+    S2RDst, SpecialReg,
 };
 use crate::gpu_harness::TestDevice;
 use crate::ir::ATTRIBUTE_WORD_BYTES;
@@ -89,7 +89,7 @@ fn ffma(dst: Gpr, srcs: [AluSrc; 3]) -> Instr {
 
 fn s2r_lane(dst: Gpr) -> Instr {
     Instr::new(Op::S2R(OpS2R {
-        dst,
+        dst: S2RDst::Reg(dst),
         sr: SpecialReg::LANE_ID,
     }))
 }

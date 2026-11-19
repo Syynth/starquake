@@ -382,7 +382,7 @@ impl Producer {
 
     /// Writes raw words, for tests of a corrupt ring.
     #[cfg(test)]
-    fn push_raw(&mut self, words: &[u64]) {
+    pub(crate) fn push_raw(&mut self, words: &[u64]) {
         self.scratch.clear();
         self.scratch.extend_from_slice(words);
         self.commit();

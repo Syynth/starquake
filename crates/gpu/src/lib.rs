@@ -23,3 +23,4 @@ pub mod syncpoint;
 #[cfg(test)]
 mod test_log;
 pub mod vm;
+pub mod wiring;

@@ -33,6 +33,7 @@ use starquake_trace::{EnvCall, EnvError, HostIoReply, HostIoRequest, HostNanos};
 use super::*;
 use crate::hle::graphics::KernelHost;
 
+mod gpu;
 mod present;
 mod video;
 mod vsync;
@@ -453,7 +454,7 @@ fn state_of(rig: &Rig, graphics: &Graphics) -> Vec<Vec<u8>> {
         shared.lock().gpu_memory().save().unwrap(),
         shared.syncpoints().save().unwrap(),
         shared.queue().save().unwrap(),
-        format!("{:?}", graphics.front().channels()).into_bytes(),
+        format!("{:?}", graphics.null_front().unwrap().channels()).into_bytes(),
     ];
     for (service, bytes) in rig.gsv_servers() {
         state.push(service.0.to_le_bytes().to_vec());

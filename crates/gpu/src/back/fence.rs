@@ -201,8 +201,10 @@
 //!   reference performs one. A trace of a `SEM_EXECUTE` reduction with `RELEASE_TIMESTAMP` set
 //!   would settle it.
 //! - The timestamp's source and unit are [`FenceClock`]'s; the spec's deferred queries take it
-//!   "from guest time", and the wiring slice (G21) picks the clock. It is not recorded, so a
-//!   replay that does not supply the same clock writes different timestamps.
+//!   "from guest time". The wiring (slice G21, `crate::wiring`) gives the host's monotonic clock,
+//!   nanoseconds since the GPU was made: a **guess**, and not guest time, an open question for
+//!   the owner. It is not recorded, so a replay that does not supply the same clock writes
+//!   different timestamps.
 //! - Releases to the syncpoint shim (gpu-protocol, "Semaphore acquires") go through the
 //!   release's [`GpuMemory`] like any other; the production memory
 //!   ([`crate::memory::VmMemory`], slice G22), which is the one that translates addresses, turns

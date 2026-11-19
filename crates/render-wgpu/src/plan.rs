@@ -20,14 +20,21 @@
 //! recording backend does. Errors wgpu would report later on the render thread are what rule 3
 //! exists to prevent; the backend counts any that still occur (`WgpuBackend::host_errors`).
 //!
-//! Blits, draws and dispatches are refused with [`BLITS_NOT_YET`] and [`DRAWS_NOT_YET`]: the
-//! wgpu backend has no pipelines until slices R6 and R7 (the present blit is R8's).
+//! Draws and dispatches (slice R7) are checked by [`crate::draw`], which lists their order; a
+//! `SetRenderTargets` that changes the targets becomes a [`Step::Targets`], and the list check
+//! tracks the render pass the render thread will have open, so a draw's step says whether it
+//! starts a new one (`crate::draw`, "Render passes"). Blits are refused with [`BLITS_NOT_YET`]:
+//! no slice builds the host shaders' blit pipelines into this backend yet (the present blit is
+//! R8's, drawn by `crate::window`).
 //!
 //! The steps carry wgpu's numbers: texture boxes in whole blocks (a region that ends at a
 //! compressed level's edge is rounded up to the block, which wgpu calls the physical size),
 //! and the tightly packed row layout of every buffer side (`starquake_render::validate::packed_size`).
 
+use crate::draw::check::ListDraws;
+use crate::draw::{DispatchStep, DrawLimits, DrawStep, RewriteScratch, Targets};
 use crate::format::texture_format;
+use crate::pipeline::Registry;
 use crate::rules::{self, HostTexture, TexelFlow};
 use starquake_render::command::{
     ClearDesc, ClearValue, CopyRegion, PresentDesc, Rect, RenderTargets, TextureRegion,
@@ -44,11 +51,10 @@ use std::collections::BTreeSet;
 /// A list with a blit.
 pub const BLITS_NOT_YET: &str =
     "the wgpu backend cannot blit yet (blits need the host shaders' pipelines, a later slice)";
-/// A list with a draw or a dispatch.
-pub const DRAWS_NOT_YET: &str =
-    "the wgpu backend cannot draw or dispatch yet (draws arrive with slice R7)";
 /// An id that names no live buffer.
 pub const NO_BUFFER: &str = "no live buffer has this id";
+/// An id that names no live sampler (the recording backend's words).
+pub const NO_SAMPLER: &str = "no live sampler has this id";
 /// An id that names no live texture.
 pub const NO_TEXTURE: &str = "no live texture has this id";
 /// An id that names no live view.
@@ -94,7 +100,8 @@ pub struct Tables {
 }
 
 impl Tables {
-    fn buffer(&self, id: BufferId) -> Result<&BufferDesc, RenderError> {
+    /// A live buffer's description.
+    pub(crate) fn buffer(&self, id: BufferId) -> Result<&BufferDesc, RenderError> {
         self.buffers
             .get(id.index(), id.generation())
             .ok_or(RenderError::Invalid(NO_BUFFER))
@@ -306,31 +313,59 @@ pub enum Step {
         /// pixels are unknown).
         read: Option<(TexelBox, Rows)>,
     },
+    /// New render targets: the open pass closes, and the next draw opens one on these
+    /// (`crate::draw`, "Render passes").
+    Targets(Targets),
+    /// A draw.
+    Draw(Box<DrawStep>),
+    /// A dispatch.
+    Dispatch(Box<DispatchStep>),
 }
 
-/// A checked list: its steps and the readback ids it reserves.
+/// A checked list: its steps, the readback ids it reserves, and its rewrites' scratch.
 #[derive(Debug, Default)]
 pub struct Checked {
     /// The steps, in order.
     pub steps: Vec<Step>,
     /// The readback ids the list uses, in order.
     pub readbacks: Vec<ReadbackId>,
+    /// The scratch the list's index rewrites use (`crate::draw`, "The index rewrite").
+    pub rewrites: RewriteScratch,
 }
 
-/// Checks `list` and turns it into steps (module docs). `taken` holds the readback ids waiting
-/// to be taken or in flight.
-/// `depth_copies` is whether the device can copy depth and stencil texels to and from buffers
-/// (`rules::check_buffer_texture`).
-pub fn check(
+/// What the device allows that the check reads.
+#[derive(Clone, Copy, Debug)]
+pub struct Rules<'a> {
+    /// The device's `Caps`.
+    pub caps: &'a Caps,
+    /// Whether the device can copy depth and stencil texels to and from buffers
+    /// (`rules::check_buffer_texture`).
+    pub depth_copies: bool,
+    /// What the device allows a draw beyond `Caps` (`crate::draw`).
+    pub draws: &'a DrawLimits,
+}
+
+/// Checks `list` and turns it into steps (module docs). `pipelines` holds the live pipelines;
+/// `taken` holds the readback ids waiting to be taken or in flight.
+pub(crate) fn check(
     tables: &Tables,
-    caps: &Caps,
-    depth_copies: bool,
+    pipelines: &Registry,
+    rules: &Rules<'_>,
     taken: &BTreeSet<ReadbackId>,
     list: CommandList,
 ) -> Result<Checked, RenderError> {
+    let caps = rules.caps;
+    let depth_copies = rules.depth_copies;
     let mut out = Checked::default();
     let mut used = BTreeSet::new();
+    let mut draws = ListDraws::default();
     for command in list.commands {
+        if !matches!(
+            command,
+            Command::Draw(_) | Command::SetRenderTargets(_) | Command::Marker(_)
+        ) {
+            draws.close_pass();
+        }
         let step = match command {
             Command::Upload { from, to } => upload_step(tables, depth_copies, from, &to)?,
             Command::Copy(copy) => {
@@ -340,13 +375,26 @@ pub fn check(
                 copy_step(src, dst, depth_copies)?
             }
             Command::Blit(_) => return Err(RenderError::Unsupported(BLITS_NOT_YET)),
-            Command::Draw(_) | Command::Dispatch(_) => {
-                return Err(RenderError::Unsupported(DRAWS_NOT_YET));
+            Command::Draw(draw) => {
+                match draws.draw(tables, pipelines, caps, rules.draws, &draw)? {
+                    Some(step) => Step::Draw(Box::new(step)),
+                    None => continue,
+                }
             }
+            Command::Dispatch(dispatch) => Step::Dispatch(Box::new(draws.dispatch(
+                tables,
+                pipelines,
+                caps,
+                rules.draws,
+                &dispatch,
+            )?)),
             Command::Clear(clear) => clear_step(tables, &clear)?,
             Command::SetRenderTargets(targets) => {
                 render_targets(tables, caps, &targets)?;
-                continue;
+                match draws.set_targets(tables, &targets)? {
+                    Some(resolved) => Step::Targets(resolved),
+                    None => continue,
+                }
             }
             Command::Readback { from, id } => {
                 let resolved = resolve(tables, &from)?;
@@ -377,6 +425,7 @@ pub fn check(
         };
         out.steps.push(step);
     }
+    out.rewrites = draws.scratch;
     Ok(out)
 }
 
@@ -643,8 +692,8 @@ pub fn clear_ops(value: ClearValue) -> ClearOps {
     }
 }
 
-/// Checks a `SetRenderTargets` (module docs, rule 4). The wgpu backend opens no pass until
-/// draws exist (slice R7), so the command changes nothing.
+/// Checks a `SetRenderTargets` (module docs, rule 4); `crate::draw` then resolves its
+/// attachments.
 fn render_targets(
     tables: &Tables,
     caps: &Caps,

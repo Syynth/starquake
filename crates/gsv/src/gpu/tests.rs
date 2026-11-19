@@ -10,9 +10,9 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
-use starquake_gpu::interface::{Completions, GpuCompletion, RegionId, Target};
+use starquake_gpu::interface::{Completions, GpuCompletion, RegionId, Target, Ticket, VmUpdate};
 use starquake_gpu::syncpoint::Syncpoints;
-use starquake_gpu::vm::Mapping;
+use starquake_gpu::vm::{GpuVm, Mapping};
 use starquake_ipc::{BUFFER_SIZE, Body, Message, SessionKind, TIPC_COMMAND_OFFSET};
 use starquake_kernel::dispatch::DeviceShareError;
 use starquake_kernel::id::SlabId;
@@ -1504,6 +1504,60 @@ fn a_sparse_region_is_destroyed_in_order() {
             .contains_key(&REGION),
         "the bookkeeping keeps the 211 mapping inside the destroyed region"
     );
+}
+
+/// The region a sparse mapping at `start` leads to, in `space`'s table.
+fn region_at(s: &Ready, start: u64) -> Option<RegionId> {
+    s.rig
+        .mappings(s.space)
+        .iter()
+        .find(|mapping| mapping.range.start() == start)
+        .and_then(|mapping| match mapping.target {
+            Target::GpuOnly { region, .. } => Some(region),
+            _ => None,
+        })
+}
+
+/// A destroyed region's id is not handed out again before the GPU reports the destroy done
+/// (the wiring note on issue #332: the GPU frees a destroyed region's pages when it applies the
+/// destroy, so an id reused before then would have the new region's pages freed too). Ids are
+/// never reused at all: one made after the report takes the next number too.
+#[test]
+fn a_destroyed_regions_id_is_not_reused_before_or_after_the_destroy_is_done() {
+    let mut s = ready();
+    let size = 8 * PAGE_SIZE;
+    let second = REGION + 2 * size;
+    let third = REGION + 4 * size;
+    s.rig.send_on(
+        s.worker,
+        &sparse_words(s.space, REGION, REGION + size - 1, 12, 0, s.device, 0, 0),
+    );
+    assert_eq!(region_at(&s, REGION), Some(RegionId(1)));
+    let destroy = range_words(
+        DESTROY_SPARSE_REGION,
+        s.space,
+        REGION,
+        REGION + size - 1,
+        0,
+        0,
+    );
+    assert_eq!(
+        result_of(&s.rig.send_on(s.worker, &destroy)),
+        ResultCode::SUCCESS
+    );
+    // The destroy is queued for the GPU and not applied.
+    s.rig.send_on(
+        s.worker,
+        &sparse_words(s.space, second, second + size - 1, 12, 0, s.device, 0, 0),
+    );
+    assert_eq!(region_at(&s, second), Some(RegionId(2)));
+    s.rig.apply();
+    s.rig.drain();
+    s.rig.send_on(
+        s.worker,
+        &sparse_words(s.space, third, third + size - 1, 12, 0, s.device, 0, 0),
+    );
+    assert_eq!(region_at(&s, third), Some(RegionId(3)));
 }
 
 // ----- Bounds and the shim ---------------------------------------------------------------------

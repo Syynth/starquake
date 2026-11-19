@@ -83,9 +83,40 @@ pub enum EncodeError {
         /// The field's width.
         bits: u32,
     },
-    /// `ALD` and `AST` move one to four words.
+    /// `ALD`, `AST` and `AL2P` move one to four words.
     #[error("an attribute access moves 1 to 4 words, not {0}")]
     Comps(u8),
+    /// The instruction has no encoding in the operand form its sources need (`IMAD.HI` has
+    /// forms 1, 4 and 5 only, and `IDP.2A` form 1 only: `decode::op::integer`).
+    #[error("{mnemonic} has no encoding in operand form {form}")]
+    NoForm {
+        /// The operation's mnemonic.
+        mnemonic: &'static str,
+        /// The form the sources need, 1 to 7.
+        form: u16,
+    },
+    /// The operand form or opcode the operation's other fields pick has no bits for this
+    /// operand or modifier (`decode::op::float`: `FMNMX`'s `.nan` and `FSET`'s combine
+    /// operation with a uniform-register source, among others).
+    #[error("{mnemonic} has no bits for {what}")]
+    NoBits {
+        /// The operation's mnemonic.
+        mnemonic: &'static str,
+        /// What cannot be encoded.
+        what: &'static str,
+    },
+    /// `IPA` and `LDTRAM` address attributes in whole words (NAK: `assert!(self.addr % 4 ==
+    /// 0)`).
+    #[error("attribute address {addr:#x} is not a multiple of {align}")]
+    AttrAlign {
+        /// The byte address given.
+        addr: u16,
+        /// The alignment the field needs.
+        align: u16,
+    },
+    /// `ISBEWR` writes only the map (0) and attributes (3) (NAK: "Invalid ISBEWR access type").
+    #[error("isbewr cannot write access type {0}")]
+    IsbewrAccess(u64),
 }
 
 /// Builds one instruction word field by field.
@@ -266,7 +297,7 @@ impl Writer {
 
 /// The operand form for sources 1 and 2 (`encode_alu_base`'s choice), or `None` when both need
 /// the wide slot.
-fn choose_form(src1: Option<AluSrc>, src2: Option<AluSrc>) -> Option<AluForm> {
+pub(crate) fn choose_form(src1: Option<AluSrc>, src2: Option<AluSrc>) -> Option<AluForm> {
     let wide = |src: Option<AluSrc>| match src {
         None | Some(AluSrc::Reg { .. }) => None,
         Some(AluSrc::Imm(_)) => Some((AluForm::ImmSrc1, AluForm::ImmSrc2)),
