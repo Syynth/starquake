@@ -26,8 +26,12 @@
 //!
 //! - [`exec`]: the executor (slice G19): ring entries to the engines above, compute dispatches
 //!   to `Command::Dispatch`, presents to `Command::Present`, and the commands to the fence path.
+//!
+//! - [`cb_load`]: constant-buffer loads (slice G25): `LOAD_CONSTANT_BUFFER` words written to
+//!   guest memory at the selected buffer's address plus the upload offset.
 
 pub mod buffer;
+pub mod cb_load;
 pub mod copy;
 pub mod draw;
 pub mod exec;
