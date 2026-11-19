@@ -1504,6 +1504,39 @@ fn f16_and_clamp_in_every_form_that_names_them() {
     assert!(known(0xb66, 77) && known(0x367, 77) && known(0xf66, 77));
 }
 
+/// `.F16` is bit 79 alone, as PR #4588 reads it (`ops_texture.cpp`, `TEX` and `TLD`:
+/// `Take(79, 1)`), though NAK's `OpTld` comment spans bits 79 and 80 ("bits 79..81: .F16", a
+/// half-open range): bit 80, the one past [`TEX_F16`], stays unknown in every `TEX` and `TLD`
+/// form (module docs, "Divergences from PR #4588's table").
+#[test]
+fn f16_is_bit_79_alone_and_bit_80_stays_unknown() {
+    // The reference literal: PR #4588's `Take(79, 1)`.
+    assert_eq!(TEX_F16, Field::bit(79));
+    let past_f16 = TEX_F16.start + TEX_F16.width;
+    let forms: Vec<u16> = [TEX_OPCODES, TLD_OPCODES]
+        .into_iter()
+        .flat_map(|opcodes| [Some(opcodes.cbuf), Some(opcodes.bindless), opcodes.uniform])
+        .flatten()
+        .collect();
+    assert_eq!(forms.len(), 6, "{forms:x?}");
+    for opcode in forms {
+        let fixed = lookup(opcode).expect("a form").fixed;
+        let mut fields: Vec<(u32, u128)> = (0..128)
+            .filter(|bit| fixed & (1 << bit) != 0)
+            .map(|bit| (bit, 1))
+            .collect();
+        fields.push((past_f16, 1));
+        assert_eq!(
+            decode(word(opcode.into(), &fields)),
+            Err(DecodeError::UnknownBit {
+                opcode,
+                bit: past_f16
+            }),
+            "{opcode:#x}"
+        );
+    }
+}
+
 /// The rows' own bits, before the forms add any: PR #4588's rows mark bit 79 known in the
 /// constant-buffer and `.UR` forms of `TEX` and `TLD` only, and bit 77 of `TLD` in its `.UR`
 /// form only, so the added bits are exactly the others (`framework::added_bits_are_the_listed_cases`).

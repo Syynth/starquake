@@ -1204,6 +1204,51 @@ fn split_high(op: Op) -> (bool, Op) {
     }
 }
 
+/// The group's generators make a high half (bit 60) with a constant-buffer source and with a
+/// uniform-register source in each of `MUFU`, `F2F`, `FRND` and `F2I`, so the generated
+/// assemble-then-decode round trips exercise the encoder's high half in those forms, not only
+/// the hand-built words of `nak_high_halves_decode_in_every_form_with_bit_60`. Fails if the
+/// generators' `has_high_half` narrows to registers. The draws are bounded and the seed fixed
+/// (`config`).
+#[test]
+fn generators_make_high_halves_beyond_registers() {
+    use proptest::strategy::ValueTree;
+    use proptest::test_runner::TestRunner;
+    use std::collections::BTreeSet;
+
+    /// Draws per generator: each of the eight cases below comes up in about one draw in 40.
+    const DRAWS: usize = 2048;
+    let mut runner = TestRunner::new(config());
+    let mut seen = BTreeSet::new();
+    for strategy in float::any_ops() {
+        for _ in 0..DRAWS {
+            let op = strategy.new_tree(&mut runner).expect("a value").current();
+            let mnemonic = op.mnemonic();
+            let (high, src) = match op {
+                Op::MuFu(op) => (op.high, op.src),
+                Op::F2F(op) => (op.high, op.src),
+                Op::FRnd(op) => (op.high, op.src),
+                Op::F2I(op) => (op.high, op.src),
+                // A generator of an op without a high half: one draw names it.
+                _ => break,
+            };
+            let kind = match src {
+                AluSrc::CBuf { .. } => "cbuf",
+                AluSrc::UniformReg { .. } => "ureg",
+                AluSrc::Reg { .. } | AluSrc::Imm(_) => continue,
+            };
+            if high {
+                seen.insert((mnemonic, kind));
+            }
+        }
+    }
+    let expected: BTreeSet<(&str, &str)> = ["mufu", "f2f", "frnd", "f2i"]
+        .into_iter()
+        .flat_map(|mnemonic| [(mnemonic, "cbuf"), (mnemonic, "ureg")])
+        .collect();
+    assert_eq!(seen, expected);
+}
+
 /// NAK writes a 16-bit source's high-half select (bit 60) in every form and opcode but the
 /// immediate one (`encode_alu_base` passes `src_types()[0]`, and `encode_alu_reg`,
 /// `encode_alu_cb` and `encode_alu_ureg` each call `set_swizzle(60..62, ..)` for an `F16`

@@ -70,10 +70,12 @@
 //! | `SULD` `0xb97`, `SUST` `0xb9b` and `SUATOM` `0x593`, surface forms with a constant-buffer handle | Unknown opcodes: no reference gives their full layout (NAK encodes none of them; PR #4588's translator reads them, `ops_texture.cpp`, but the slice's scope is NAK's forms and the `.UR` forms) | `decode::tests::texture::surface_rows_left_undecoded_are_unknown_opcodes` |
 //! | Bit 79 (`.F16`) of `TEX.B` (`0x361`) | Decoded as [`OpTex::f16`]: the form adds the bit, which PR #4588's translator reads in every `TEX` form it accepts, `0x361` included (`Visitor::TEX`: `register_handle = op == 0x361`, then `half = Take(79, 1) != 0`); its row for `0x361` leaves it out | `decode::tests::texture::f16_and_clamp_in_every_form_that_names_them`, `decode::tests::framework::added_bits_decode_print_and_round_trip` |
 //! | Bit 79 (`.F16`) of `TLD.B` (`0x367`) | Decoded as [`OpTld::f16`]: the form adds the bit, which NAK's `OpTld` encoder names for every handle in a comment ("bits 79..81: .F16"); PR #4588's row for `0x367` leaves it out, and its translator does not accept `0x367` (`Visitor::TLD` requires bit 59 clear outside `0xf66`) | as above |
+//! | Bit 80 of `TEX` and `TLD` (all six forms), inside NAK's `OpTld` comment "bits 79..81: .F16" | Not added: it stays unknown ([`DecodeError::UnknownBit`]). NAK's range is half-open, so it spans bits 79 and 80, but NAK writes neither bit and gives no meaning to a two-bit value; PR #4588 reads `.F16` as one bit (`Take(79, 1)` in `Visitor::TEX` and `Visitor::TLD`) and no row of its table has bit 80 in these forms. Taking bit 80 would invent a field; an `nvdisasm` check would settle it | `decode::tests::texture::f16_is_bit_79_alone_and_bit_80_stays_unknown` |
 //! | Bit 77 (`.CL`) of `TLD` (`0xb66`) and `TLD.B` (`0x367`) | Decoded as [`OpTld::clamp`]: the forms add the bit, which NAK's `OpTld` encoder names for every handle in a comment ("bit 77: .CL", below SM 12.0); PR #4588's rows leave it out but for `0xf66`, though its translator names it in every form it accepts (`Require(Take(77, 2) == 0, "native texel fetch multisample or clamp")`) | as above |
 //!
-//! Every other form's mask is its row's exactly, and the rows above differ from their forms by
-//! exactly the bits listed (`decode::tests::masks_match_the_reference_table`;
+//! Every other form's mask is its row's exactly, and the rows above that decode a bit differ
+//! from their forms by exactly the bits listed (bit 80 adds nothing: form and row agree that it
+//! is unknown; `decode::tests::masks_match_the_reference_table`;
 //! `decode::tests::framework::added_bits_are_the_listed_cases` lists every added bit and the
 //! reference that names it). The rows themselves differ between forms of one instruction (bit
 //! 79 is in the constant-buffer and `.UR` rows of `TEX` and `TLD` only, bit 77 in `TLD`'s `.UR`
@@ -180,7 +182,11 @@ pub(crate) const TEX_NDV: Field = Field::bit(77);
 pub(crate) const TEX_DC: Field = Field::bit(78);
 /// The `.F16` bit of `TEX` and `TLD`, in every form (PR #4588, `ops_texture.cpp`: "bit 79
 /// selects half precision results"; NAK's `OpTld` encoder: "bits 79..81: .F16", a comment;
-/// module docs). Not written by NAK: needs an `nvdisasm` check.
+/// module docs). Not written by NAK: needs an `nvdisasm` check. One bit, as PR #4588 reads it
+/// (`Take(79, 1)`): NAK's comment spans bits 79 and 80 (a half-open range), but neither
+/// reference reads, writes or names a meaning for bit 80, so bit 80 stays unknown (module
+/// docs, "Divergences from PR #4588's table";
+/// `decode::tests::texture::f16_is_bit_79_alone_and_bit_80_stays_unknown`).
 pub(crate) const TEX_F16: Field = Field::bit(79);
 /// The `.CL` bit of `TLD`, in every form (NAK's `OpTld` encoder: "bit 77: .CL", a comment;
 /// PR #4588: `Require(Take(77, 2) == 0, "native texel fetch multisample or clamp")`). Not

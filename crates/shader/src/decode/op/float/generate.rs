@@ -1,8 +1,9 @@
 //! Test generators of the 32-bit float group's decoded operations, one per operation, every
 //! field over its whole encodable range (`decode::tests` joins them through `form`'s
 //! `GROUP_HOOKS`). A field that only some layouts have (`FMNMX`'s `.NAN` and `FSET`'s combine
-//! operation without a uniform register, a high half only for a 16-bit register, `I2F`'s select
-//! by source width, `F2FP`'s `.H1` with `.MERGE_C`) is generated only where it can be encoded.
+//! operation without a uniform register, a high half only for a 16-bit source that is not an
+//! immediate, `I2F`'s select by source width, `F2FP`'s `.H1` with `.MERGE_C`) is generated only
+//! where it can be encoded.
 
 use proptest::prelude::*;
 use proptest::sample::select;

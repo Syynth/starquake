@@ -155,8 +155,13 @@
 //! range instead would be a listed divergence.
 //!
 //! Where the decoder reads more than the PR translates, this module refuses what the PR
-//! refuses, as a listed choice: the 64-bit float size ([`FloatUnsupported::F2iSourceSize`] and
-//! its siblings), the 64-bit conversion opcodes, which `Visitor::Run` sends to no translator ([`FloatUnsupported::WideConversion`]),
+//! refuses, as a listed choice: the float sizes the PR does not convert, which are 64 bits and
+//! some 16-bit sizes (an `F2I` source of 64 bits, [`FloatUnsupported::F2iSourceSize`]; an
+//! `FRND` source or destination of 16 or 64 bits, [`FloatUnsupported::FrndSourceSize`] and
+//! [`FloatUnsupported::FrndDestinationSize`]; an `F2F` source of 16 or 64 bits or destination
+//! of 32 or 64 bits, [`FloatUnsupported::F2fSourceSize`] and
+//! [`FloatUnsupported::F2fDestinationSize`]; an `I2F` destination of 16 or 64 bits,
+//! [`FloatUnsupported::I2fDestinationSize`]), the 64-bit conversion opcodes, which `Visitor::Run` sends to no translator ([`FloatUnsupported::WideConversion`]),
 //! `MUFU`'s immediate form `0x908`, which it sends nowhere either
 //! ([`FloatUnsupported::MufuImmediate`]), `MUFU.RCP64H`, `.RSQ64H` and `.TANH`, and the
 //! `FSWZADD` operations other than the PR's two
