@@ -21,10 +21,14 @@
 //!   only on what the device does not set per draw, and the list of keys seen for precompiling
 //!   on the next boot.
 //!
-//! Later slices add draws (G18) and the executor that feeds them all from the ring (G19).
+//! - [`draw`]: draws (slice G18): 3D state to a `Command::Draw`, with shader lookups, the
+//!   variant key, bindings through the caches, driver constants and conditional render.
+//!
+//! A later slice adds the executor that feeds them all from the ring (G19).
 
 pub mod buffer;
 pub mod copy;
+pub mod draw;
 pub mod fence;
 pub mod pipeline;
 pub mod qmd;

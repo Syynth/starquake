@@ -1130,6 +1130,7 @@ dependencies = [
 name = "starquake-gpu"
 version = "0.0.0"
 dependencies = [
+ "insta",
  "postcard",
  "proptest",
  "serde",
