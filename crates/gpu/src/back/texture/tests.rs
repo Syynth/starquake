@@ -585,15 +585,9 @@ fn a_3d_image_uploads_slice_by_slice() {
     assert_eq!(host, g5_untile(&rig.mem, &h.image, 0, 0));
 }
 
-#[test]
-fn a_pitch_image_uploads_its_rows() {
-    // Three rows a piece, so the pieces after the first start at a row other than 0.
-    let mut rig = Rig::with(
-        caps(3 * 400, false, FormatTable::uniform(FormatFeatures::ALL)),
-        LARGE_BUDGET,
-    );
-    let pitch = 512;
-    let h = decode(
+/// A pitch header of `A8B8G8R8_UNORM` at page 0: 100 by 10 texels, rows `pitch` bytes apart.
+fn pitch_header(pitch: u32) -> TextureHeader {
+    decode(
         Build::new()
             .set(
                 tex::TEXHEAD_PITCH_HEADER_VERSION,
@@ -616,7 +610,18 @@ fn a_pitch_image_uploads_its_rows() {
             .set(tex::TEXHEAD_PITCH_PITCH_BITS20TO5, pitch >> 5)
             .set(tex::TEXHEAD_PITCH_WIDTH_MINUS_ONE, 99)
             .set(tex::TEXHEAD_PITCH_HEIGHT_MINUS_ONE, 9),
+    )
+}
+
+#[test]
+fn a_pitch_image_uploads_its_rows() {
+    // Three rows a piece, so the pieces after the first start at a row other than 0.
+    let mut rig = Rig::with(
+        caps(3 * 400, false, FormatTable::uniform(FormatFeatures::ALL)),
+        LARGE_BUDGET,
     );
+    let pitch = 512;
+    let h = pitch_header(pitch);
     let view = rig.texture(&h).unwrap();
     let pieces: Vec<(u32, u32)> = uploads(&rig.list.commands)
         .iter()
@@ -659,6 +664,60 @@ fn an_upload_splits_into_whole_rows_at_the_staging_limit() {
     assert_eq!(uploads(&rig.list.commands), expected);
     let host = rig.host_bytes(region(t, 0, 0, (WIDTH, HEIGHT, 1)));
     assert_eq!(host, g5_untile(&rig.mem, &h.image, 0, 0));
+}
+
+/// A block-linear BC1 header at `address`: 16 by 10 texels, so its last row of 4-by-4 blocks is
+/// half outside the image.
+fn bc1_header(address: u64) -> TextureHeader {
+    decode(
+        bl_header(address)
+            .set(
+                tex::TEXHEAD_BL_COMPONENTS,
+                tex::TEXHEAD_BL_COMPONENTS_SIZES_DXT1,
+            )
+            .set(tex::TEXHEAD_BL_WIDTH_MINUS_ONE, 15)
+            .set(tex::TEXHEAD_BL_HEIGHT_MINUS_ONE, 9),
+    )
+}
+
+#[test]
+fn a_compressed_upload_clamps_its_last_piece_to_the_image() {
+    let h = bc1_header(page(0));
+    assert_eq!(h.image.format, PixelFormat::Bc1RgbaUnorm);
+    let (block_w, block_h) = (h.image.format.block_width(), h.image.format.block_height());
+    // One packed row of blocks a piece.
+    let row = u64::from(16 / block_w) * u64::from(h.image.format.bytes_per_block());
+    let mut rig = Rig::with(
+        caps(row, false, FormatTable::uniform(FormatFeatures::ALL)),
+        LARGE_BUDGET,
+    );
+    let t = rig.texture(&h).unwrap().texture;
+    let pieces: Vec<(u32, u32)> = uploads(&rig.list.commands)
+        .iter()
+        .map(|u| (u.2.1, u.3.1))
+        .collect();
+    assert_eq!(
+        pieces,
+        [
+            (0, block_h),
+            (block_h, block_h),
+            (2 * block_h, 10 - 2 * block_h)
+        ]
+    );
+    // The upload and a write-back round-trip through the layout crate.
+    let host = rig.host_bytes(region(t, 0, 0, (16, 10, 1)));
+    assert_eq!(host, g5_untile(&rig.mem, &h.image, 0, 0));
+    let drawn = pattern(11, host.len());
+    // Drawn a row of blocks at a time, as the staging limit allows.
+    let row_len = usize::try_from(row).unwrap();
+    for (&(y, height), bytes) in pieces.iter().zip(drawn.chunks(row_len)) {
+        let mut to = region(t, 0, 0, (16, height, 1));
+        to.origin.y = y;
+        rig.host_write(to, bytes);
+    }
+    rig.cache.gpu_written(t);
+    rig.write_back(page(0)..page(1)).unwrap();
+    assert_eq!(g5_untile(&rig.mem, &h.image, 0, 0), drawn);
 }
 
 #[test]
@@ -1085,6 +1144,162 @@ fn a_write_back_that_faults_while_reading_writes_nothing() {
     );
     assert_eq!(rig.guest_bytes(page(0), IMAGE_PAGES * PAGE_SIZE), before);
     assert!(rig.entry(a).gpu_modified && rig.entry(b).gpu_modified);
+}
+
+#[test]
+fn a_gpu_modified_image_stale_before_the_write_back_is_left_out() {
+    let mut rig = Rig::new();
+    let t = settle(&mut rig, page(0));
+    rig.cache.gpu_written(t);
+    // A newer CPU write: guest memory wins over the host copy.
+    rig.cpu_write(page(0) + 8, &[0xA5; 64]);
+    rig.drain();
+    assert!(rig.entry(t).stale && rig.entry(t).gpu_modified);
+    assert!(!rig.cache.needs_write_back(page(0)..page(1)));
+    let before = rig.list.commands.len();
+    let wb = rig
+        .cache
+        .begin_write_back(page(0)..page(1), &mut rig.ids, &mut rig.list);
+    assert!(wb.is_empty());
+    assert_eq!(wb.skipped(), [(t, Skip::Stale)]);
+    assert_eq!(rig.list.commands.len(), before, "no readback queued");
+    rig.submit();
+    let guest = rig.guest_bytes(page(0), IMAGE_PAGES * PAGE_SIZE);
+    assert_eq!(rig.cache.finish_write_back(&rig.mem, wb), Ok(Vec::new()));
+    assert_eq!(rig.guest_bytes(page(0), IMAGE_PAGES * PAGE_SIZE), guest);
+    assert_eq!(rig.guest_bytes(page(0) + 8, 64), [0xA5; 64]);
+    assert!(rig.entry(t).stale);
+}
+
+#[test]
+fn a_gpu_modified_image_turned_stale_between_the_halves_is_not_written_back() {
+    let mut rig = Rig::new();
+    let t = settle(&mut rig, page(0));
+    rig.host_write(
+        region(t, 0, 0, (WIDTH, HEIGHT, 1)),
+        &pattern(3, IMAGE_BYTES),
+    );
+    rig.cache.gpu_written(t);
+    assert!(rig.cache.needs_write_back(page(0)..page(1)));
+    let wb = rig
+        .cache
+        .begin_write_back(page(0)..page(1), &mut rig.ids, &mut rig.list);
+    assert_eq!(wb.textures().collect::<Vec<_>>(), [t]);
+    rig.submit();
+    // The CPU writes the image after its readback was queued.
+    rig.cpu_write(page(0), &[0x5A; 64]);
+    rig.drain();
+    let guest = rig.guest_bytes(page(0), IMAGE_PAGES * PAGE_SIZE);
+    assert_eq!(rig.cache.finish_write_back(&rig.mem, wb), Ok(Vec::new()));
+    assert_eq!(rig.guest_bytes(page(0), IMAGE_PAGES * PAGE_SIZE), guest);
+    let entry = rig.entry(t);
+    assert!(entry.stale && entry.gpu_modified);
+    // The next use uploads the CPU's bytes, which ends the GPU modification.
+    assert_eq!(rig.uploads_of(&header(page(0))).len(), 1);
+    let entry = rig.entry(t);
+    assert!(!entry.stale && !entry.gpu_modified);
+}
+
+#[test]
+fn an_image_a_later_image_overwrites_in_the_same_write_back_turns_stale() {
+    let mut rig = Rig::new();
+    let first = header(page(0));
+    let later = decode(bl_header(page(0)).set(tex::TEXHEAD_BL_GOBS_PER_BLOCK_HEIGHT, 1));
+    let a = rig.texture(&first).unwrap().texture;
+    let b = rig.texture(&later).unwrap().texture;
+    // A third image after both, over memory of its own.
+    let c = rig.texture(&header(page(4))).unwrap().texture;
+    let drawn = [pattern(10, IMAGE_BYTES), pattern(90, IMAGE_BYTES)];
+    rig.host_write(region(a, 0, 0, (WIDTH, HEIGHT, 1)), &drawn[0]);
+    rig.host_write(region(b, 0, 0, (WIDTH, HEIGHT, 1)), &drawn[1]);
+    for t in [a, b, c] {
+        rig.cache.gpu_written(t);
+    }
+    let wb = rig
+        .cache
+        .begin_write_back(page(0)..page(8), &mut rig.ids, &mut rig.list);
+    assert_eq!(wb.textures().collect::<Vec<_>>(), [a, b, c]);
+    rig.submit();
+    let written = rig.cache.finish_write_back(&rig.mem, wb).unwrap();
+    assert_eq!(
+        written.iter().map(|r| r.start).collect::<Vec<_>>(),
+        [page(0), page(0), page(4)]
+    );
+    // The later image's write is what guest memory holds.
+    assert_eq!(g5_untile(&rig.mem, &later.image, 0, 0), drawn[1]);
+    assert_ne!(g5_untile(&rig.mem, &first.image, 0, 0), drawn[0]);
+    let entry = rig.entry(a);
+    assert!(entry.stale && !entry.gpu_modified, "overwritten later");
+    for t in [b, c] {
+        let entry = rig.entry(t);
+        assert!(!entry.stale && !entry.gpu_modified, "{t:?}");
+    }
+    // Its next use uploads what guest memory holds.
+    assert_eq!(rig.uploads_of(&first).len(), 1);
+}
+
+#[test]
+fn a_pitch_image_writes_back_row_by_row_and_keeps_its_padding() {
+    let mut rig = Rig::new();
+    let pitch = 512;
+    let h = pitch_header(pitch);
+    let t = rig.texture(&h).unwrap().texture;
+    let row = 100 * 4;
+    let drawn = pattern(7, row * 10);
+    rig.host_write(region(t, 0, 0, (100, 10, 1)), &drawn);
+    rig.cache.gpu_written(t);
+    let span = 10 * u64::from(pitch);
+    let before = rig.guest_bytes(page(0), span);
+    rig.write_back(page(0)..page(1)).unwrap();
+    let after = rig.guest_bytes(page(0), span);
+    let pitch = usize::try_from(pitch).unwrap();
+    for y in 0..10 {
+        let at = y * pitch;
+        assert_eq!(
+            after[at..at + row],
+            drawn[y * row..(y + 1) * row],
+            "row {y}"
+        );
+        assert_eq!(
+            after[at + row..at + pitch],
+            before[at + row..at + pitch],
+            "padding {y}"
+        );
+    }
+}
+
+#[test]
+fn a_3d_image_writes_back_every_slice_of_every_level() {
+    let mut rig = Rig::new();
+    let h = decode(
+        bl_header(page(0))
+            .set(
+                tex::TEXHEAD_BL_TEXTURE_TYPE,
+                tex::TEXHEAD_BL_TEXTURE_TYPE_THREE_D,
+            )
+            .set(tex::TEXHEAD_BL_WIDTH_MINUS_ONE, 15)
+            .set(tex::TEXHEAD_BL_HEIGHT_MINUS_ONE, 15)
+            .set(tex::TEXHEAD_BL_DEPTH_MINUS_ONE, 3)
+            .set(tex::TEXHEAD_BL_GOBS_PER_BLOCK_DEPTH, 1)
+            .set(tex::TEXHEAD_BL_MAX_MIP_LEVEL, 1)
+            .set(tex::TEXHEAD_BL_RES_VIEW_MAX_MIP_LEVEL, 1),
+    );
+    let t = rig.texture(&h).unwrap().texture;
+    let mut drawn = Vec::new();
+    for level in 0..2 {
+        let extent = (16 >> level, 16 >> level, 4 >> level);
+        let bytes = pattern(
+            u8::try_from(level).unwrap() * 70 + 5,
+            usize::try_from(extent.0 * extent.1 * extent.2 * 4).unwrap(),
+        );
+        rig.host_write(region(t, level, 0, extent), &bytes);
+        drawn.push(bytes);
+    }
+    rig.cache.gpu_written(t);
+    rig.write_back(page(0)..page(1)).unwrap();
+    for (level, bytes) in (0..).zip(drawn) {
+        assert_eq!(g5_untile(&rig.mem, &h.image, level, 0), bytes, "{level}");
+    }
 }
 
 #[test]
@@ -1651,6 +1866,59 @@ fn a_render_target_the_device_cannot_render_is_refused() {
 }
 
 #[test]
+fn a_render_target_view_is_an_array_exactly_when_the_image_is_layered() {
+    let mut rig = Rig::new();
+    let base = header(page(0)).image;
+    let format = base.format;
+    let cases = [
+        (ImageDim::D2, 1, 3, "D2Array", page(0)),
+        (ImageDim::D2, HEIGHT, 1, "D2", page(8)),
+        (ImageDim::D1, 1, 2, "D1Array", page(16)),
+        (ImageDim::D1, 1, 1, "D1", page(24)),
+    ];
+    for (n, (dim, height, layers, view, address)) in (0u32..).zip(cases) {
+        let info = ImageInfo {
+            dim,
+            height: if dim == ImageDim::D2 { HEIGHT } else { height },
+            layers,
+            address,
+            ..base
+        };
+        rig.target(&info).unwrap();
+        let line = format!(
+            "create v{n}: view of t{n} as {format} {view}, mips 0+1, layers 0+{layers}, swizzle RGBA"
+        );
+        assert!(rig.log().contains(&line), "{line} in {:?}", rig.log());
+    }
+}
+
+#[test]
+fn gpu_modified_images_are_kept_until_the_budget_refuses_new_ones() {
+    // The divergence in the module docs: nothing collects or replaces a GPU-modified image.
+    let mut rig = Rig::with(
+        caps(1 << 20, false, FormatTable::uniform(FormatFeatures::ALL)),
+        2 * IMAGE,
+    );
+    let first = rig.target(&header(page(0)).image).unwrap().texture;
+    // A render target of another layout over the same memory does not replace it.
+    let taller = decode(bl_header(page(0)).set(tex::TEXHEAD_BL_GOBS_PER_BLOCK_HEIGHT, 1)).image;
+    let second = rig.target(&taller).unwrap().texture;
+    rig.submit();
+    for _ in 0..=2 * EVICT_AFTER_FRAMES {
+        assert_eq!(rig.cache.end_frame(), 0);
+    }
+    assert_eq!(
+        rig.target(&header(page(4)).image),
+        Err(TextureError::OverBudget {
+            bytes: 3 * IMAGE,
+            allowed: 2 * IMAGE
+        })
+    );
+    let left: Vec<TextureId> = rig.cache.entries().map(|e| e.texture).collect();
+    assert_eq!(left, [first, second]);
+}
+
+#[test]
 fn texture_usage_follows_the_format_table() {
     let mut formats = FormatTable::uniform(FormatFeatures::from_bits(0).unwrap());
     formats.set(PixelFormat::R8Unorm, FormatFeatures::SAMPLE);
@@ -1844,6 +2112,40 @@ fn error_messages_are_plain_words() {
     assert_eq!(
         TextureError::Fault(GpuFault::Unmapped { va: 0x1000 }).to_string(),
         "reading guest memory for a texture upload: GPU address 0x1000 is not mapped"
+    );
+}
+
+#[test]
+fn write_back_error_messages_are_plain_words() {
+    let texture = TextureId::new(3, 1);
+    assert_eq!(
+        WriteBackError::NotReady { texture, index: 0 }.to_string(),
+        "readback 0 of texture 3 (generation 1) is not ready"
+    );
+    assert_eq!(
+        WriteBackError::Unknown { texture }.to_string(),
+        "the bytes of texture 3 (generation 1) are not known"
+    );
+    assert_eq!(
+        WriteBackError::WrongSize {
+            texture,
+            len: 0,
+            expected: 16
+        }
+        .to_string(),
+        "a readback of texture 3 (generation 1) holds 0 bytes, where its level has 16"
+    );
+    assert_eq!(
+        WriteBackError::Layout(starquake_layout::LayoutError::ZeroExtent).to_string(),
+        "tiling a written-back level: an image extent has a zero dimension"
+    );
+    assert_eq!(
+        WriteBackError::Fault {
+            fault: GpuFault::Unmapped { va: 0x1000 },
+            written: Vec::new(),
+        }
+        .to_string(),
+        "writing an image back to guest memory: GPU address 0x1000 is not mapped"
     );
 }
 

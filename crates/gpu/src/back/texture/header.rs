@@ -15,11 +15,15 @@
 //!   (`eden/src/video_core/texture_cache/image_info.cpp` @ cf654052) and
 //!   `ImageViewInfo(const TICEntry&, s32)` (`image_view_info.cpp`): the level count is
 //!   `MAX_MIP_LEVEL + 1`; a 1D, 2D or cube header whose depth is above 1 is an array of that many
-//!   layers (six per cube); the view's levels are `RES_VIEW_MIN_MIP_LEVEL` to
+//!   layers (six per cube), but a 2D no-mipmap header is one layer whatever its depth (Eden's
+//!   depth promotion in `ImageInfo` leaves `Texture2DNoMipmap` out, and its case asserts
+//!   `Depth() == 1` and takes one layer; here the depth is ignored without a log, pinned by
+//!   `tests::header::a_2d_no_mipmap_header_is_one_layer_whatever_its_depth`); the view's levels are `RES_VIEW_MIN_MIP_LEVEL` to
 //!   `RES_VIEW_MAX_MIP_LEVEL`; the multisample modes give the sample grids of Eden's
 //!   `NumSamplesX` and `NumSamplesY` (`samples_helper.h`), the virtual-coverage modes those of
 //!   their plain grids.
-//! - The format is [`super::format::pixel_format`] (Eden's lookup table).
+//! - The format is [`super::format::pixel_format`] (Eden's lookup table, with Eden-NX2's added
+//!   row).
 //!
 //! The GOB of a block-linear image is the Switch 2 colour GOB, Mesa's `TuringColor2d` (row 69 of
 //! `eden-nx2/NX2_NOTES.md`; the layout crate's `tiling` docs), for colour formats, and
@@ -184,9 +188,12 @@ pub enum HeaderError {
         /// The `HEADER_VERSION` field.
         version: u32,
     },
-    /// The format fields name no format of Eden's table.
+    /// The format fields name no format of the table ([`super::format::FORMAT_TABLE`]).
     #[error(
-        "texture format {components:#x} with data types {types:?} and sRGB {srgb} is not known"
+        "texture format {components:#x} with data types {} (red to alpha) and sRGB conversion {} \
+         is not known",
+        data_types(.types),
+        on_off(*.srgb)
     )]
     UnknownFormat {
         /// `COMPONENTS`.
@@ -238,6 +245,17 @@ pub enum HeaderError {
         /// `MAX_MIP_LEVEL + 1`.
         levels: u32,
     },
+}
+
+/// Four data types in plain words: `1, 2, 3 and 4`.
+fn data_types(types: &[u32; 4]) -> String {
+    let [r, g, b, a] = types;
+    format!("{r}, {g}, {b} and {a}")
+}
+
+/// `on` or `off`.
+fn on_off(on: bool) -> &'static str {
+    if on { "on" } else { "off" }
 }
 
 /// Where one header form keeps the fields the decode reads.
@@ -479,14 +497,10 @@ fn shape(texture_type: u32, depth: u32) -> Option<(ImageDim, u32, u32, ViewDimen
         tex::TEXHEAD_BL_TEXTURE_TYPE_ONE_D | tex::TEXHEAD_BL_TEXTURE_TYPE_ONE_D_ARRAY => {
             (ImageDim::D1, depth, 1, ViewDimension::D1Array)
         }
-        tex::TEXHEAD_BL_TEXTURE_TYPE_TWO_D | tex::TEXHEAD_BL_TEXTURE_TYPE_TWO_D_NO_MIPMAP
-            if !arrayed =>
-        {
-            (ImageDim::D2, 1, 1, ViewDimension::D2)
-        }
-        tex::TEXHEAD_BL_TEXTURE_TYPE_TWO_D
-        | tex::TEXHEAD_BL_TEXTURE_TYPE_TWO_D_NO_MIPMAP
-        | tex::TEXHEAD_BL_TEXTURE_TYPE_TWO_D_ARRAY => {
+        // A 2D no-mipmap header is never an array, as in Eden (module docs).
+        tex::TEXHEAD_BL_TEXTURE_TYPE_TWO_D_NO_MIPMAP => (ImageDim::D2, 1, 1, ViewDimension::D2),
+        tex::TEXHEAD_BL_TEXTURE_TYPE_TWO_D if !arrayed => (ImageDim::D2, 1, 1, ViewDimension::D2),
+        tex::TEXHEAD_BL_TEXTURE_TYPE_TWO_D | tex::TEXHEAD_BL_TEXTURE_TYPE_TWO_D_ARRAY => {
             (ImageDim::D2, depth, 1, ViewDimension::D2Array)
         }
         tex::TEXHEAD_BL_TEXTURE_TYPE_THREE_D => (ImageDim::D3, 1, depth, ViewDimension::D3),

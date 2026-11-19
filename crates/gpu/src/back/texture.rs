@@ -19,7 +19,8 @@
 //! Paths are relative to the reference folder (`tools/refs-path.sh`), at the commits pinned in
 //! `docs/references.md`. Eden's texture cache (`eden/src/video_core/texture_cache/` @ cf654052,
 //! GPL-3.0-or-later) is a reference only, as the spec has it: no code is ported from it here
-//! except the format table ([`format`]). The header layout is Nvidia's ([`header`]).
+//! except the format table ([`FORMAT_TABLE`], with one row from Eden-NX2). The header layout is
+//! Nvidia's ([`TextureHeader`]).
 //!
 //! # Images
 //!
@@ -51,11 +52,11 @@
 //! `tests::a_sampled_texture_at_an_unmapped_address_is_an_error`.
 //!
 //! **Images whose bytes cannot be converted.** Two kinds of image are made without contents and
-//! never uploaded or written back, with the reason in [`TextureEntry::unconvertible`]:
-//! multisampled images (Eden's `RefreshContents` skips them when the runtime cannot upload
-//! multisampled images, `CanUploadMSAA`, and wgpu cannot copy into one) and block-linear images
-//! of a GOB the layout crate cannot copy (the guessed `FermiZs` depth GOB, [`header`]'s docs and
-//! the spec's verification item 9). Pinned by
+//! never uploaded or written back, with the reason in [`TextureEntry::source`]
+//! ([`Source::Unconvertible`]): multisampled images (Eden's `RefreshContents` skips them when the
+//! runtime cannot upload multisampled images, `CanUploadMSAA`, and wgpu cannot copy into one) and
+//! block-linear images of a GOB the layout crate cannot copy (the guessed `FermiZs` depth GOB,
+//! [`gob_for`] and the spec's verification item 9). Pinned by
 //! `tests::a_multisampled_image_is_made_without_contents` and
 //! `tests::a_depth_image_of_the_guessed_gob_is_made_without_contents`.
 //!
@@ -117,22 +118,32 @@
 //! images). Its host copy is then newer than guest memory, and it is written back only on demand
 //! (decision 4): when a DMA copy or inline write reads it as plain memory, when an MME DMA read
 //! touches it, or on request in tests. [`TextureCache::needs_write_back`] tells a caller whether a
-//! range holds such an image. A write-back has two halves:
+//! range holds such an image that can be written back. A write-back has two halves:
 //!
 //! 1. [`TextureCache::begin_write_back`] appends a [`Command::Readback`] of every level of every
-//!    layer of each GPU-modified image overlapping the range to the open list, with ids from the
-//!    back thread's [`ReadbackIds`], and returns a [`WriteBack`];
+//!    layer of each GPU-modified, non-stale image of guest memory overlapping the range to the
+//!    open list, with ids from the back thread's [`ReadbackIds`], and returns a [`WriteBack`];
 //! 2. once that list has completed, [`TextureCache::finish_write_back`] takes the readbacks,
 //!    tiles them through the layout crate into the image's guest bytes (read first, so padding
-//!    keeps its bytes) and writes them to guest memory. Each image it writes is no longer
-//!    GPU-modified, and every other image overlapping a written range turns stale. It returns
-//!    the written ranges, which the caller hands to the buffer cache's `invalidate`.
+//!    keeps its bytes) and writes them to guest memory, image by image in address order (at one
+//!    address, in the order they were made). Each image it writes is no longer GPU-modified. An
+//!    image overlapping a written range turns stale unless it is the image that wrote the range
+//!    or was written after it in the same call: an image whose bytes a later image of the same
+//!    call overwrote is stale, as guest memory no longer holds what it does. It returns the
+//!    written ranges, which the caller hands to the buffer cache's `invalidate`. Pinned by
+//!    `tests::a_write_back_makes_other_images_over_the_same_memory_stale` and
+//!    `tests::an_image_a_later_image_overwrites_in_the_same_write_back_turns_stale`.
 //!
-//! An image drawn into again between the halves (its GPU generation moved) or dropped meanwhile
-//! is left out of the second half: its readback no longer holds its newest contents. Pinned by
-//! `tests::an_image_drawn_into_between_the_halves_is_not_written_back`. Host-only and
-//! unconvertible images are never written back; [`WriteBack::skipped`] lists them with the
-//! reason.
+//! An image left out of the second half: one drawn into again between the halves (its GPU
+//! generation moved), dropped meanwhile, or stale (a CPU or back-thread write reached its memory
+//! after the readbacks were queued). Its readback no longer holds its newest contents, or guest
+//! memory is newer than it, as a CPU modification wins (Eden's `RefreshContents`, "Uses and
+//! uploads"). Pinned by `tests::an_image_drawn_into_between_the_halves_is_not_written_back`,
+//! `tests::an_image_dropped_between_the_halves_is_not_written_back` and
+//! `tests::a_gpu_modified_image_turned_stale_between_the_halves_is_not_written_back`.
+//! Host-only, unconvertible and stale images are left out of the first half too;
+//! [`WriteBack::skipped`] lists them with the reason ([`Skip`]; the source's reason when an image
+//! has two). Pinned by `tests::a_gpu_modified_image_stale_before_the_write_back_is_left_out`.
 //!
 //! [`TextureCache::invalidate`] takes a range the back thread itself wrote into guest memory (a
 //! DMA copy, an inline upload or a 2D blit on the CPU path): every image overlapping it turns
@@ -183,6 +194,16 @@
 //!   independent even where they overlap: a GPU-modified image's contents do not reach another
 //!   image over the same memory until it is written back and the other is used again. This
 //!   narrows nothing a later slice cannot add (aliases are a lookup over the same map).
+//! - **GPU-modified images pile up (owner question).** A GPU-modified image is never collected
+//!   (next item), and with no overlap resolution a new image over the same memory does not
+//!   replace it. A title that keeps rendering into new layouts or new addresses without anything
+//!   reading them back as plain memory grows the cache by each image's bytes until the hard cap
+//!   refuses every new image ([`TextureError::OverBudget`]). Eden-NX2 instead downloads such an
+//!   image and collects it under memory pressure (`RunGarbageCollector`'s high-priority mode, in
+//!   `eden-nx2/src/video_core/texture_cache/texture_cache.h` @ 50fa86bb). Whether to write back
+//!   and collect idle GPU-modified images under pressure, or drop one when a new render target is
+//!   made over the same range, is raised with the owner. Pinned by
+//!   `tests::gpu_modified_images_are_kept_until_the_budget_refuses_new_ones`.
 //! - **Ages and counts.** Eden's texture collector uses its own ages and counts (50, 25 or 10
 //!   frames; 10, 20 or 40 images; `RunGarbageCollector` in `texture_cache.h`) and downloads a
 //!   GPU-modified image before collecting it under memory pressure. This cache uses the buffer
@@ -331,7 +352,11 @@ pub enum TextureError {
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum WriteBackError {
     /// A readback is not there: its list has not completed (or its bytes were already taken).
-    #[error("readback {index} of texture {texture:?} is not ready")]
+    #[error(
+        "readback {index} of texture {} (generation {}) is not ready",
+        .texture.index(),
+        .texture.generation()
+    )]
     NotReady {
         /// The image's texture.
         texture: TextureId,
@@ -339,13 +364,21 @@ pub enum WriteBackError {
         index: usize,
     },
     /// The backend cannot know a readback's bytes (the recording backend, after a draw).
-    #[error("the bytes of texture {texture:?} are not known")]
+    #[error(
+        "the bytes of texture {} (generation {}) are not known",
+        .texture.index(),
+        .texture.generation()
+    )]
     Unknown {
         /// The image's texture.
         texture: TextureId,
     },
     /// A readback holds a different number of bytes than the level it read.
-    #[error("a readback of texture {texture:?} holds {len} bytes, its level {expected}")]
+    #[error(
+        "a readback of texture {} (generation {}) holds {len} bytes, where its level has {expected}",
+        .texture.index(),
+        .texture.generation()
+    )]
     WrongSize {
         /// The image's texture.
         texture: TextureId,
@@ -452,6 +485,9 @@ pub enum Skip {
     HostOnly,
     /// Its bytes cannot be converted.
     Unconvertible(Unconvertible),
+    /// It is stale: a CPU or back-thread write to its memory is newer than its host copy, and
+    /// wins.
+    Stale,
 }
 
 impl WriteBack {
@@ -578,6 +614,9 @@ pub struct TextureCache {
     watch: Arc<WriteWatch>,
     /// Images by address; at one address, in the order they were made.
     images: BTreeMap<u64, Vec<Image>>,
+    /// Each image's address by its texture, so a lookup by texture does not walk every image.
+    /// Updated where `images` gains or loses an image: in `make` and `retire`.
+    addresses: BTreeMap<TextureId, u64>,
     /// The sum of the images' bytes.
     bytes: u64,
     /// Textures of images the open list uses.
@@ -614,6 +653,7 @@ impl TextureCache {
             backend,
             watch,
             images: BTreeMap::new(),
+            addresses: BTreeMap::new(),
             bytes: 0,
             open: Vec::new(),
             doomed: Vec::new(),
@@ -660,12 +700,15 @@ impl TextureCache {
         self.images.get_mut(&address).and_then(|v| v.get_mut(index))
     }
 
+    /// Where the image of `texture` sits: its address from the index, then its place among the
+    /// images at that address.
     fn slot_of(&self, texture: TextureId) -> Option<Slot> {
-        self.images.iter().find_map(|(&address, v)| {
-            v.iter()
-                .position(|i| i.texture == texture)
-                .map(|index| (address, index))
-        })
+        let &address = self.addresses.get(&texture)?;
+        self.images
+            .get(&address)?
+            .iter()
+            .position(|i| i.texture == texture)
+            .map(|index| (address, index))
     }
 
     fn find(&self, info: &ImageInfo) -> Option<Slot> {
@@ -1030,6 +1073,7 @@ impl TextureCache {
         };
         Self::record_use(&mut image, stamp, self.frame, &mut self.open);
         self.bytes = self.bytes.saturating_add(image.bytes());
+        self.addresses.insert(texture, info.address);
         self.images.entry(info.address).or_default().push(image);
         list.commands.append(&mut commands);
         Ok((texture, view_id))
@@ -1134,6 +1178,7 @@ impl TextureCache {
         if v.is_empty() {
             self.images.remove(&address);
         }
+        self.addresses.remove(&image.texture);
         self.bytes = self.bytes.saturating_sub(image.bytes());
         let resources = image
             .views
@@ -1239,17 +1284,20 @@ impl TextureCache {
         true
     }
 
-    /// Whether a GPU-modified image that can be written back overlaps `range`.
+    /// Whether a GPU-modified image that can be written back overlaps `range`: one with guest
+    /// memory behind it, whose bytes can be converted, and that is not stale (a newer CPU or
+    /// back-thread write wins over its host copy).
     pub fn needs_write_back(&self, range: Range<u64>) -> bool {
         self.overlapping(&range).into_iter().any(|s| {
             self.get(s)
-                .is_some_and(|i| i.gpu_modified && i.source == Source::Guest)
+                .is_some_and(|i| i.gpu_modified && i.source == Source::Guest && !i.stale)
         })
     }
 
     /// The first half of a write-back (module docs, "GPU writes, write-back and unmaps"): queues
     /// a readback of every level of every layer of each GPU-modified image overlapping `range`
-    /// in `list`, the open list.
+    /// in `list`, the open list, leaving out host-only, unconvertible and stale images (listed
+    /// in [`WriteBack::skipped`]).
     pub fn begin_write_back(
         &mut self,
         range: Range<u64>,
@@ -1280,6 +1328,12 @@ impl TextureCache {
                         .push((image.texture, Skip::Unconvertible(reason)));
                     continue;
                 }
+            }
+            if image.stale {
+                // Guest memory is newer than the host copy: writing the copy back would undo a
+                // CPU write.
+                out.skipped.push((image.texture, Skip::Stale));
+                continue;
             }
             let mut reads = Vec::new();
             for level in 0..image.desc.mip_levels {
@@ -1326,6 +1380,7 @@ impl TextureCache {
 
     /// The second half of a write-back, once the list holding its readbacks has completed:
     /// tiles each image's readbacks into its guest bytes and writes them, in address order.
+    /// An image dropped, drawn into again or turned stale since the first half is left out.
     /// Returns the guest ranges written.
     ///
     /// Every readback is taken and every level tiled before the first write, so `NotReady`,
@@ -1363,11 +1418,13 @@ impl TextureCache {
                 .and_then(|s| self.get(s))
                 .filter(|i| {
                     i.gpu_modified
+                        && !i.stale
                         && i.gpu_generation == pending.generation
                         && i.info.address == pending.address
                 });
             let Some(image) = current else {
-                // Dropped, or drawn into again since the readbacks were queued.
+                // Dropped, drawn into again, or written by the CPU since the readbacks were
+                // queued.
                 continue;
             };
             let mut writes = Vec::with_capacity(bytes.len());
@@ -1403,11 +1460,13 @@ impl TextureCache {
             prepared.push((image.texture, writes));
         }
 
-        // The writes, in address order; a fault stops them.
+        // The writes, in address order; a fault stops them. `writers[i]` is the index in
+        // `prepared` of the image that wrote `written[i]`.
         let mut written: Vec<Range<u64>> = Vec::new();
+        let mut writers: Vec<usize> = Vec::new();
         let mut fault = None;
         let mut done: Vec<TextureId> = Vec::new();
-        'images: for (texture, writes) in &prepared {
+        'images: for (order, (texture, writes)) in prepared.iter().enumerate() {
             for (va, bytes) in writes {
                 if let Err(f) = mem.write(*va, bytes) {
                     fault = Some(f);
@@ -1416,10 +1475,25 @@ impl TextureCache {
                 // `read_level` read the same extent, so it does not overflow.
                 let end = va.saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
                 written.push(*va..end);
+                writers.push(order);
             }
             done.push(*texture);
         }
-        for texture in &done {
+        self.mark_written(&done, &written, &writers);
+        match fault {
+            Some(fault) => Err(WriteBackError::Fault { fault, written }),
+            None => Ok(written),
+        }
+    }
+
+    /// After a write-back's writes: each image in `done` (the images written, in write order) is
+    /// no longer GPU-modified or stale, and every image overlapping `written[i]`, written by the
+    /// image at index `writers[i]` of the write order, turns stale unless it wrote in this call
+    /// at or after that index (its own write, or a later one over the range): an image written
+    /// earlier whose bytes a later image overwrote is stale (module docs, "GPU writes,
+    /// write-back and unmaps").
+    fn mark_written(&mut self, done: &[TextureId], written: &[Range<u64>], writers: &[usize]) {
+        for texture in done {
             if let Some(slot) = self.slot_of(*texture)
                 && let Some(image) = self.get_mut(slot)
             {
@@ -1427,18 +1501,18 @@ impl TextureCache {
                 image.stale = false;
             }
         }
-        for range in &written {
+        for (range, &writer) in written.iter().zip(writers) {
             for slot in self.overlapping(range) {
-                if let Some(image) = self.get_mut(slot)
-                    && !done.contains(&image.texture)
-                {
-                    image.stale = true;
+                if let Some(image) = self.get_mut(slot) {
+                    let overwritten = done
+                        .iter()
+                        .position(|t| *t == image.texture)
+                        .is_none_or(|order| order < writer);
+                    if overwritten {
+                        image.stale = true;
+                    }
                 }
             }
-        }
-        match fault {
-            Some(fault) => Err(WriteBackError::Fault { fault, written }),
-            None => Ok(written),
         }
     }
 

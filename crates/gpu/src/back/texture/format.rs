@@ -1,4 +1,4 @@
-//! A texture header's format fields to a [`PixelFormat`].
+//! A texture header's format fields to a [`starquake_render::PixelFormat`].
 //!
 //! # Sources
 //!
@@ -8,7 +8,8 @@
 //! - The table is ported from `PixelFormatFromTextureInfo` in
 //!   `eden/src/video_core/texture_cache/format_lookup_table.cpp` @ cf654052 (Copyright 2026 Eden
 //!   Emulator Project, GPL-3.0-or-later; Copyright 2019 yuzu Emulator Project,
-//!   GPL-2.0-or-later): every `case` of its switch, in its order, one row of [`FORMAT_TABLE`] each (111 rows). Eden's
+//!   GPL-2.0-or-later): every `case` of its switch, in its order, one row of [`FORMAT_TABLE`]
+//!   each (111 rows), and one row Eden-NX2 adds (below), 112 in all. Eden's
 //!   `TextureFormat` and `ComponentType` values are the header's `COMPONENTS` and `*_DATA_TYPE`
 //!   values (`eden/src/video_core/textures/texture.h`), so the rows name the header's constants,
 //!   read through [`crate::classes::clc797tex`]. Seven of Eden's names differ from the header's
@@ -16,6 +17,12 @@
 //!   `E5B9G9R9_SHAREDEXP`, `B10G11R11` is `BF10GF11RF11`, `BC6H_S16` is `BC6H_SF16`, `BC6H_U16`
 //!   is `BC6H_UF16`); `tests::header::eden_format_values_match_the_header` pins every value the
 //!   table names against Eden's literal.
+//! - Eden-NX2 adds one `case` to the same switch, `Hash(TextureFormat::S8Z24, UNORM, UINT, UNORM,
+//!   UNORM, LINEAR)`, giving `D24_UNORM_S8_UINT`
+//!   (`eden-nx2/src/video_core/texture_cache/format_lookup_table.cpp` @ 50fa86bb, line 160; same
+//!   licence). It is in the table, in Eden-NX2's place, just before Eden's own `S8Z24` row; this is
+//!   the only row where the two tables differ. Pinned by
+//!   `tests::header::hand_written_rows_from_eden_s_table`.
 //! - Eden's `Hash(format, component, is_srgb)` form gives all four channels the same type; its
 //!   five-argument form names each. The rows spell all four out.
 //!
@@ -41,11 +48,11 @@ pub(super) const UINT: u32 = tex::TEXHEAD_BL_R_DATA_TYPE_NUM_UINT;
 /// `ComponentType::FLOAT` (the header's `NUM_FLOAT`).
 pub(super) const FLOAT: u32 = tex::TEXHEAD_BL_R_DATA_TYPE_NUM_FLOAT;
 
-/// One row of Eden's table: `COMPONENTS`, the red, green, blue and alpha data types, the
+/// One row of the table: `COMPONENTS`, the red, green, blue and alpha data types, the
 /// `S_R_G_B_CONVERSION` bit, and the format they name.
 pub type FormatRow = (u32, [u32; 4], bool, P);
 
-/// Eden's table, in its order (module docs).
+/// Eden's table, in its order, with Eden-NX2's added row (module docs).
 pub const FORMAT_TABLE: &[FormatRow] = &[
     (
         tex::TEXHEAD_BL_COMPONENTS_SIZES_A8B8G8R8,
@@ -383,6 +390,13 @@ pub const FORMAT_TABLE: &[FormatRow] = &[
         false,
         P::S8UintD24Unorm,
     ),
+    // Eden-NX2's added row (module docs).
+    (
+        tex::TEXHEAD_BL_COMPONENTS_SIZES_S8Z24,
+        [UNORM, UINT, UNORM, UNORM],
+        false,
+        P::D24UnormS8Uint,
+    ),
     (
         tex::TEXHEAD_BL_COMPONENTS_SIZES_S8Z24,
         [UNORM, UINT, UINT, UINT],
@@ -717,7 +731,7 @@ pub const FORMAT_TABLE: &[FormatRow] = &[
 
 /// The pixel format of a header whose `COMPONENTS` field is `components`, whose red, green,
 /// blue and alpha data types are `types`, and whose `S_R_G_B_CONVERSION` bit is `srgb`; `None`
-/// for a combination Eden's table does not list (module docs, "Divergence").
+/// for a combination the table does not list (module docs, "Divergence").
 pub fn pixel_format(components: u32, types: [u32; 4], srgb: bool) -> Option<P> {
     FORMAT_TABLE
         .iter()

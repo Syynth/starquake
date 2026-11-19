@@ -377,10 +377,11 @@ fn every_texture_type_gives_its_shape() {
             1,
             Some((ImageDim::D2, 1, 1, ViewDimension::D2)),
         ),
+        // Not promoted to an array (Eden's `ImageInfo`): one layer, whatever the depth.
         (
             TEXHEAD_BL_TEXTURE_TYPE_TWO_D_NO_MIPMAP,
             2,
-            Some((ImageDim::D2, 2, 1, ViewDimension::D2Array)),
+            Some((ImageDim::D2, 1, 1, ViewDimension::D2)),
         ),
         (
             TEXHEAD_BL_TEXTURE_TYPE_CUBEMAP_ARRAY,
@@ -413,6 +414,35 @@ fn every_texture_type_gives_its_shape() {
             ),
         }
     }
+}
+
+#[test]
+fn a_2d_no_mipmap_header_is_one_layer_whatever_its_depth() {
+    use tex::*;
+    // Eden promotes 1D, 2D and cube types to arrays when the depth is above 1, but not
+    // `Texture2DNoMipmap`, which asserts a depth of 1 and takes one layer (`eden/src/video_core/
+    // texture_cache/image_info.cpp` and `image_view_info.cpp` @ cf654052).
+    let shape = |texture_type, depth: u32| {
+        TextureHeader::decode(
+            &bl_header(0)
+                .set(TEXHEAD_BL_TEXTURE_TYPE, texture_type)
+                .set(TEXHEAD_BL_DEPTH_MINUS_ONE, depth - 1)
+                .words(),
+        )
+        .map(|h| (h.image.dim, h.image.layers, h.image.depth, h.view.dimension))
+    };
+    for depth in [1, 2, 7] {
+        assert_eq!(
+            shape(TEXHEAD_BL_TEXTURE_TYPE_TWO_D_NO_MIPMAP, depth),
+            Ok((ImageDim::D2, 1, 1, ViewDimension::D2)),
+            "{depth}"
+        );
+    }
+    // A plain 2D header of the same depth is an array.
+    assert_eq!(
+        shape(TEXHEAD_BL_TEXTURE_TYPE_TWO_D, 7),
+        Ok((ImageDim::D2, 7, 1, ViewDimension::D2Array))
+    );
 }
 
 #[test]
@@ -835,6 +865,34 @@ fn error_messages_are_plain_words() {
         .to_string(),
         "texture block of 1, 0 and 0 (log2 GOBs) is not one the header defines"
     );
+    assert_eq!(
+        HeaderError::UnknownFormat {
+            components: 0x1d,
+            types: [1, 2, 3, 4],
+            srgb: true
+        }
+        .to_string(),
+        "texture format 0x1d with data types 1, 2, 3 and 4 (red to alpha) and sRGB conversion on \
+         is not known"
+    );
+    assert_eq!(
+        HeaderError::UnknownFormat {
+            components: 0,
+            types: [0; 4],
+            srgb: false
+        }
+        .to_string(),
+        "texture format 0x0 with data types 0, 0, 0 and 0 (red to alpha) and sRGB conversion off \
+         is not known"
+    );
+    assert_eq!(
+        HeaderError::UnsupportedTextureType { texture_type: 6 }.to_string(),
+        "texture type 6 is not supported"
+    );
+    assert_eq!(
+        HeaderError::InvalidSampleMode { mode: 7 }.to_string(),
+        "texture multisample mode 7 is not defined"
+    );
 }
 
 // --- The format table ---
@@ -915,7 +973,8 @@ fn eden_format_values_match_the_header() {
 
 #[test]
 fn the_table_has_every_eden_row_and_each_row_is_found() {
-    assert_eq!(FORMAT_TABLE.len(), 111);
+    // Eden's 111 `case`s and the one Eden-NX2 adds.
+    assert_eq!(FORMAT_TABLE.len(), 112);
     for &(components, types, srgb, format) in FORMAT_TABLE {
         assert_eq!(pixel_format(components, types, srgb), Some(format));
     }
@@ -937,6 +996,9 @@ fn hand_written_rows_from_eden_s_table() {
         (0x29, [4, 2, 4, 4], false, PixelFormat::S8UintD24Unorm),
         (0x0e, [4, 2, 2, 2], false, PixelFormat::S8UintD24Unorm),
         (0x2b, [2, 4, 4, 4], false, PixelFormat::D24UnormS8Uint),
+        // Eden-NX2's added row (`eden-nx2/src/video_core/texture_cache/format_lookup_table.cpp`
+        // @ 50fa86bb, line 160).
+        (0x2b, [2, 4, 2, 2], false, PixelFormat::D24UnormS8Uint),
         (0x30, [7, 4, 2, 2], false, PixelFormat::D32FloatS8Uint),
         (0x05, [7, 4, 2, 2], false, PixelFormat::D32FloatS8Uint),
         (0x24, [2, 2, 2, 2], true, PixelFormat::Bc1RgbaSrgb),
