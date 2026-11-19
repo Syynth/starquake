@@ -698,12 +698,15 @@ fn turn_until_parks(r: &mut Rig, parks: u64) {
 
 /// Turns the front until a turn is idle (at most a few turns); how long it may park.
 fn next_idle_park(r: &mut Rig) -> Duration {
+    let mut idle = None;
     for _ in 0..8 {
         if let Turn::Idle { park } = r.turn() {
-            return park;
+            idle = Some(park);
+            break;
         }
     }
-    panic!("no idle turn");
+    assert!(idle.is_some(), "no idle turn");
+    idle.unwrap()
 }
 
 #[test]
