@@ -7,6 +7,7 @@ use super::*;
 use crate::interface::Fence;
 use crate::mme::testing::{finish, inst0, mov_reg, with_imm, with_out};
 use crate::mme::{AluOp, Instruction, LOAD_BARRIER, OutOp, Reg, encode_program};
+use crate::syncpoint::SIGN_BIT;
 
 /// A stream that binds 3D, acquires `SEM` with `op` and `payload`, then writes `value` to
 /// scratch `index`.
@@ -398,6 +399,47 @@ fn a_fence_already_reached_does_not_wait() {
 }
 
 #[test]
+fn one_counted_entry_meets_a_fence_it_passes_up_to_half_the_range() {
+    // A fence one past the counter, and another channel's run of increments: the front looks
+    // at the final value only (`back::fence`, "Waiters and a run of increments"). A run of 2^31
+    // meets the fence; a run one longer leaves it 2^31 behind, and the channel stays parked.
+    for (count, met) in [(SIGN_BIT, true), (SIGN_BIT + 1, false)] {
+        let mut r = rig();
+        let a = r.channel(5);
+        let b = r.channel(9);
+        let waits = Submission {
+            wait: Some(Fence {
+                id: syncpoint(9),
+                value: 1,
+            }),
+            ..plain(vec![r.entry(CMD_A, &write_scratch(0, 0xa1))])
+        };
+        r.shared.submit(a, waits);
+        r.settle();
+        assert_eq!(r.front.counters().fence_waits, 1, "{count:#x}");
+        r.shared.submit(
+            b,
+            Submission {
+                increments: count,
+                ..plain(vec![])
+            },
+        );
+        r.settle();
+        assert_eq!(r.syncpoints.read(syncpoint(9)), count, "{count:#x}");
+        let texts = r.take();
+        assert!(
+            has(&texts, &format!("syncpoint id=9 count={count}")),
+            "{count:#x}"
+        );
+        assert_eq!(
+            has(&texts, &scratch_text(a, 0, 0xa1)),
+            met,
+            "{count:#x}: {texts:?}"
+        );
+    }
+}
+
+#[test]
 fn a_fence_another_thread_increments_is_seen_by_the_poll() {
     // gsv's video worker increments syncpoints without the back: the poll sees it.
     let mut r = rig();
@@ -437,15 +479,8 @@ fn wait_for_idle_comes_before_the_increments_and_only_with_them() {
     let write = position(&texts, &scratch_text(a, 0, 0xa1));
     let tail: Vec<&str> = texts[write + 1..].iter().map(String::as_str).collect();
     let wfi = format!("wait-for-idle channel={}", a.0);
-    assert_eq!(
-        tail,
-        [
-            wfi.as_str(),
-            "syncpoint id=5",
-            "syncpoint id=5",
-            "syncpoint id=5"
-        ]
-    );
+    // One entry carries the three increments.
+    assert_eq!(tail, [wfi.as_str(), "syncpoint id=5 count=3"]);
     assert_eq!(r.syncpoints.read(syncpoint(5)), 3);
     assert_eq!(r.front.counters().increments, 3);
     assert_eq!(r.front.counters().submissions, 1);
@@ -465,31 +500,118 @@ fn wait_for_idle_comes_before_the_increments_and_only_with_them() {
         },
     );
     r.settle();
-    assert_eq!(r.take(), ["syncpoint id=5"]);
+    assert_eq!(r.take(), ["syncpoint id=5 count=1"]);
     assert_eq!(r.front.counters().submissions, 3);
+    assert_eq!(r.front.counters().increments, 4);
+    assert_eq!(r.syncpoints.read(syncpoint(5)), 4);
 }
 
 #[test]
-fn increments_past_a_quantum_go_out_a_quantum_at_a_time() {
+fn u32_max_increments_go_out_as_one_entry_in_one_turn() {
+    // One entry with the count, so the front's cost does not grow with it: the submission and
+    // another channel's both finish in one turn, and the counter goes from 0 to `u32::MAX`.
     let mut r = rig();
     let a = r.channel(5);
     let b = r.channel(6);
     r.shared.submit(
         a,
         Submission {
-            increments: QUANTUM + 1,
+            increments: u32::MAX,
             ..plain(vec![])
         },
     );
     r.submit(b, vec![r.entry(CMD_B, &write_scratch(1, 0xb1))]);
     r.front.turn().unwrap();
-    assert_eq!(r.front.counters().increments, u64::from(QUANTUM));
+    assert_eq!(r.front.counters().submissions, 2);
+    assert_eq!(r.front.counters().increments, u64::from(u32::MAX));
+    // A turn that worked publishes nothing yet; the next, idle one does.
+    r.settle();
+    let texts = r.take();
+    let syncpoints: Vec<&String> = texts
+        .iter()
+        .filter(|t| t.starts_with("syncpoint"))
+        .collect();
+    assert_eq!(syncpoints, ["syncpoint id=5 count=4294967295"]);
+    assert!(has(&texts, &scratch_text(b, 1, 0xb1)));
+    assert_eq!(r.syncpoints.read(syncpoint(5)), u32::MAX);
+}
+
+#[test]
+fn a_submission_that_uses_its_quantum_sends_its_increments_next_turn() {
+    // Exactly a quantum of words: nothing is left for the increments entry this turn.
+    let quantum = usize::try_from(QUANTUM).unwrap();
+    let mut r = rig();
+    let a = r.channel(5);
+    let nops = vec![0u32; quantum];
+    r.shared.submit(
+        a,
+        Submission {
+            increments: 7,
+            ..plain(vec![r.entry(CMD_A, &nops)])
+        },
+    );
+    r.front.turn().unwrap();
+    assert_eq!(r.front.counters().words, u64::from(QUANTUM));
+    assert_eq!(r.front.counters().increments, 0);
+    assert_eq!(r.front.counters().submissions, 0);
+    r.front.turn().unwrap();
+    assert_eq!(r.front.counters().increments, 7);
+    assert_eq!(r.front.counters().submissions, 1);
+    r.settle();
+    assert_eq!(r.take(), ["syncpoint id=5 count=7"]);
+    assert_eq!(r.syncpoints.read(syncpoint(5)), 7);
+}
+
+#[test]
+fn the_increments_entry_costs_one_unit_of_the_quantum() {
+    // A quantum less one of words, then the entry: it takes the last unit, so the channel's
+    // next submission, one word long, waits for the next turn.
+    let quantum = usize::try_from(QUANTUM).unwrap();
+    let mut r = rig();
+    let a = r.channel(5);
+    let nops = vec![0u32; quantum - 1];
+    r.shared.submit(
+        a,
+        Submission {
+            increments: 7,
+            ..plain(vec![r.entry(CMD_A, &nops)])
+        },
+    );
+    r.submit(a, vec![r.entry(CMD_FAR, &[0])]);
+    r.front.turn().unwrap();
+    assert_eq!(r.front.counters().words, u64::from(QUANTUM) - 1);
+    assert_eq!(r.front.counters().increments, 7);
     assert_eq!(r.front.counters().submissions, 1);
     r.front.turn().unwrap();
-    assert_eq!(r.front.counters().increments, u64::from(QUANTUM) + 1);
+    assert_eq!(r.front.counters().words, u64::from(QUANTUM));
     assert_eq!(r.front.counters().submissions, 2);
     r.settle();
-    assert_eq!(r.syncpoints.read(syncpoint(5)), QUANTUM + 1);
+    assert_eq!(r.take(), ["syncpoint id=5 count=7"]);
+}
+
+#[test]
+fn the_increments_entry_costs_no_more_than_one_unit_of_the_quantum() {
+    // A quantum less two of words, then the entry, which takes one unit: one is left, so the
+    // channel's next submission, one word long, finishes in the same turn. An entry that cost
+    // two units would leave nothing and hold it to the next turn.
+    let quantum = usize::try_from(QUANTUM).unwrap();
+    let mut r = rig();
+    let a = r.channel(5);
+    let nops = vec![0u32; quantum - 2];
+    r.shared.submit(
+        a,
+        Submission {
+            increments: 7,
+            ..plain(vec![r.entry(CMD_A, &nops)])
+        },
+    );
+    r.submit(a, vec![r.entry(CMD_FAR, &[0])]);
+    r.front.turn().unwrap();
+    assert_eq!(r.front.counters().submissions, 2);
+    assert_eq!(r.front.counters().words, u64::from(QUANTUM) - 1);
+    assert_eq!(r.front.counters().increments, 7);
+    r.settle();
+    assert_eq!(r.take(), ["syncpoint id=5 count=7"]);
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -202,8 +202,12 @@ impl Back {
                     };
                     self.fences.attach(action).unwrap();
                 }
-                RingEntry::Syncpoint { id } => {
-                    self.fences.attach(FencedAction::Increment(*id)).unwrap();
+                RingEntry::Syncpoint { id, count } => {
+                    let action = FencedAction::Increment {
+                        id: *id,
+                        count: *count,
+                    };
+                    self.fences.attach(action).unwrap();
                 }
                 RingEntry::Marker { token } => {
                     let action = FencedAction::Marker {

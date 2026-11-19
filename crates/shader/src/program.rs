@@ -53,7 +53,8 @@ pub fn program_ir(stage: Stage, code: &[u8]) -> Result<Function, Rejection> {
     Ok(translate(stage, &decode_program(code)?)?)
 }
 
-/// Translates a straight-line program of the six slice-1 instructions to a host shader.
+/// Translates a straight-line program to a host shader (the lowering handles slice 1's
+/// instructions; the translator, more).
 pub fn translate_program(stage: Stage, code: &[u8]) -> Result<HostShader, Rejection> {
     Ok(lower(stage.stage, &program_ir(stage, code)?)?)
 }

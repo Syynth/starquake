@@ -41,7 +41,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
 use thiserror::Error;
@@ -75,6 +75,25 @@ pub enum CreateError {
     #[error("every GPU channel id has been used")]
     OutOfIds,
 }
+
+/// Told each time the front ends a turn idle ([`FrontShared::set_quiet_wake`]): the GPU's quiet
+/// signal, which `core`'s parked cores wait for before they ask again whether a stalled run is
+/// stalled (gpu-protocol, "Idleness"; the wiring's module docs, "Idleness").
+pub trait QuietWake: Send + Sync {
+    /// The front ended a turn idle. Called on the front thread, after the turn's counters were
+    /// published (`Front::run_observed` runs its observer before it marks the turn idle) and
+    /// after the front marked itself quiet, with no lock of this crate held
+    /// (`the_quiet_wake_is_told_after_the_front_is_quiet_with_no_lock_held`). A request or
+    /// back report that arrives meanwhile can make [`FrontShared::is_quiet`] false again by the
+    /// time it runs. It must not block, and must not call `Gpu::is_idle`, which can wait for the
+    /// front thread that is calling it.
+    fn front_quiet(&self);
+}
+
+/// A second [`QuietWake`] given to one front ([`FrontShared::set_quiet_wake`]).
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+#[error("the GPU front already tells another listener when it ends a turn idle")]
+pub struct QuietWakeTaken;
 
 /// A call queued for the front thread, in call order.
 pub(super) enum Request {
@@ -164,6 +183,8 @@ pub struct FrontShared {
     /// Rung when the front ends a turn idle, for [`FrontShared::wait_quiet`].
     quieted: Condvar,
     dropped: AtomicU64,
+    /// Told after each idle turn, once set ([`FrontShared::set_quiet_wake`]).
+    quiet_wake: OnceLock<Arc<dyn QuietWake>>,
 }
 
 impl FrontShared {
@@ -309,12 +330,26 @@ impl FrontShared {
     }
 
     /// The front ended a turn idle ([`super::Turn::Idle`]): what it took has been acted on.
-    /// Wakes [`FrontShared::wait_quiet`].
+    /// Wakes [`FrontShared::wait_quiet`], then tells the [`QuietWake`], if one is set, with the
+    /// inbox's lock released.
     pub(crate) fn mark_idle(&self) {
         // A request or report that came since the turn's look keeps [`FrontShared::is_quiet`]
         // false on its own, so the flag can be cleared whatever arrived.
         self.lock().busy = false;
         self.quieted.notify_all();
+        if let Some(wake) = self.quiet_wake.get() {
+            wake.front_quiet();
+        }
+    }
+
+    /// Tells `wake` each time the front ends a turn idle, from the next idle turn on
+    /// ([`QuietWake`]). One front has at most one.
+    ///
+    /// # Errors
+    ///
+    /// [`QuietWakeTaken`] if a wake was set before; the first one is kept.
+    pub fn set_quiet_wake(&self, wake: Arc<dyn QuietWake>) -> Result<(), QuietWakeTaken> {
+        self.quiet_wake.set(wake).map_err(|_refused| QuietWakeTaken)
     }
 
     /// Waits at most `timeout` until [`FrontShared::is_quiet`]; whether it is. Woken when the
@@ -449,5 +484,70 @@ impl FrontWake for FrontShared {
         }
         inbox.signalled = true;
         self.wake.notify_one();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Weak;
+    use std::sync::mpsc;
+
+    use super::*;
+
+    /// Notes, at each call, whether the front it watches read quiet. Reading it takes the
+    /// inbox's lock, so a wake told under that lock never returns.
+    #[derive(Default)]
+    struct QuietNotes {
+        shared: Mutex<Weak<FrontShared>>,
+        seen: Mutex<Vec<bool>>,
+    }
+
+    impl QuietWake for QuietNotes {
+        fn front_quiet(&self) {
+            let shared = self.shared.lock().unwrap().upgrade();
+            let quiet = shared.is_some_and(|shared| shared.is_quiet());
+            self.seen.lock().unwrap().push(quiet);
+        }
+    }
+
+    /// Runs `mark_idle` on a thread of its own, failing the test (instead of hanging the gate)
+    /// if it has not returned within ten seconds.
+    fn mark_idle_bounded(shared: &Arc<FrontShared>) {
+        let (done, finished) = mpsc::channel();
+        let shared = Arc::clone(shared);
+        std::thread::spawn(move || {
+            shared.mark_idle();
+            // The receiver is gone only once the test has failed on its timeout.
+            done.send(()).unwrap_or_default();
+        });
+        assert!(
+            finished.recv_timeout(Duration::from_secs(10)).is_ok(),
+            "mark_idle never returned: the wake was told under the inbox's lock"
+        );
+    }
+
+    /// The quiet signal's order inside an idle turn ([`QuietWake::front_quiet`]): the wake is
+    /// told after the front is quiet, with the inbox's lock released, once per idle turn; with no
+    /// wake set an idle turn tells nothing.
+    #[test]
+    fn the_quiet_wake_is_told_after_the_front_is_quiet_with_no_lock_held() {
+        let shared = Arc::new(FrontShared::new());
+        // No wake yet: an idle turn is only marked.
+        drop(shared.take());
+        mark_idle_bounded(&shared);
+        assert!(shared.is_quiet());
+        let notes = Arc::new(QuietNotes::default());
+        *notes.shared.lock().unwrap() = Arc::downgrade(&shared);
+        assert_eq!(
+            shared.set_quiet_wake(Arc::<QuietNotes>::clone(&notes)),
+            Ok(())
+        );
+        assert_eq!(*notes.seen.lock().unwrap(), []);
+        for turn in 1..=2 {
+            drop(shared.take());
+            assert!(!shared.is_quiet());
+            mark_idle_bounded(&shared);
+            assert_eq!(*notes.seen.lock().unwrap(), vec![true; turn]);
+        }
     }
 }

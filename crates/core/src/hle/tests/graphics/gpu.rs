@@ -14,7 +14,7 @@ use starquake_render::recording::RecordingBackend;
 use starquake_shader::lookup::{EngineState, ProgramMemory, ProgramRequest, VariantKey};
 
 use super::*;
-use crate::hle::graphics::GpuParts;
+use crate::hle::graphics::{GpuParts, Idleness};
 
 /// How long any wait for the GPU's threads may take before the test fails.
 const PATIENCE: Duration = Duration::from_secs(20);
@@ -126,8 +126,8 @@ fn a_run_with_the_gpu_completes_what_waits_on_it() {
     });
     assert_eq!(graphics.shared().syncpoints().read(done.syncpoint), 2);
     assert!(matches!(turns[1].as_slice(), [Note::GpuOrderedDone { .. }]));
-    // The GPU did the work: its front took the submission and pushed both increments, and its
-    // back performed them.
+    // The GPU did the work: its front took the submission and pushed both increments (one
+    // entry with a count of 2), and its back performed them.
     let counters = gpu.counters();
     assert_eq!(counters.submissions, 1);
     assert_eq!(counters.increments, 2);
@@ -144,17 +144,17 @@ fn a_run_with_the_gpu_completes_what_waits_on_it() {
         "0 address space 1 made\n",
         &channel_made,
         "2 submission on channel 0: 0 entries, 2 increments, wait for idle: queued\n",
-        "3 performed 0 releases, 1 increments, 0 markers, no waiter latched\n",
-        "4 performed 0 releases, 1 increments, 0 markers, no waiter latched\n",
-        "5 address space 2 made\n",
+        // Both increments are one `Syncpoint` entry, performed as one action.
+        "3 performed 0 releases, 2 increments, 0 markers, no waiter latched\n",
+        "4 address space 2 made\n",
         &format!(
-            "6 ordered update of address space 2: sparse region destroy of {REGION_SIZE:#x} bytes \
+            "5 ordered update of address space 2: sparse region destroy of {REGION_SIZE:#x} bytes \
              at {REGION:#x} (region 1), no ticket\n"
         ),
-        &format!("7 barrier, ticket {}\n", ticket.0),
-        "8 performed 0 releases, 0 increments, 1 markers, no waiter latched\n",
-        &format!("9 pushed: ticket {} done\n", ticket.0),
-        "10 performed 0 releases, 0 increments, 1 markers, no waiter latched\n",
+        &format!("6 barrier, ticket {}\n", ticket.0),
+        "7 performed 0 releases, 0 increments, 1 markers, no waiter latched\n",
+        &format!("8 pushed: ticket {} done\n", ticket.0),
+        "9 performed 0 releases, 0 increments, 1 markers, no waiter latched\n",
     ]
     .concat();
     assert_eq!(gpu.flight_recorder(), expected);
@@ -177,6 +177,44 @@ fn a_graphics_server_with_a_busy_gpu_is_not_idle() {
     assert!(graphics.shared().queue().is_empty());
     assert!(!gpu.is_idle());
     assert!(!graphics.is_idle());
+    // The busy answer is the GPU's alone; with something queued too, the server is busy for
+    // more than the GPU.
+    assert_eq!(graphics.idleness(), Idleness::GpuBusy);
+    graphics
+        .shared()
+        .queue()
+        .push(starquake_gsv::completion::Completion::Gpu(
+            starquake_gpu::interface::GpuCompletion::GpuOrdered {
+                ticket: starquake_gpu::interface::Ticket(0x93),
+            },
+        ));
+    assert_eq!(graphics.idleness(), Idleness::Busy);
+    assert!(!graphics.is_idle());
+}
+
+/// A running GPU that is idle leaves the server idle once its turn ends; with a completion
+/// queued the server reads busy, not `GpuBusy`, whatever the GPU answers. An idle GPU does read
+/// busy while a safety-net turn runs, so the server can read `GpuBusy` meanwhile: idle is
+/// waited for, not asserted once.
+#[test]
+fn a_graphics_server_over_an_idle_gpu_becomes_idle_and_a_queued_completion_reads_busy() {
+    let graphics = with_gpu();
+    wait_until("the server over a new GPU is idle", || {
+        graphics.idleness() == Idleness::Idle
+    });
+    graphics
+        .shared()
+        .queue()
+        .push(starquake_gsv::completion::Completion::Gpu(
+            starquake_gpu::interface::GpuCompletion::GpuOrdered {
+                ticket: starquake_gpu::interface::Ticket(0x94),
+            },
+        ));
+    // Whatever the GPU answers, the queue makes the server busy.
+    for _ in 0..20 {
+        assert_eq!(graphics.idleness(), Idleness::Busy);
+    }
+    graphics.gpu().unwrap().stop().unwrap();
 }
 
 #[test]

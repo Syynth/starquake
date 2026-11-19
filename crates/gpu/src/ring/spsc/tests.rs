@@ -179,6 +179,7 @@ fn an_entry_of_exactly_the_capacity_fits_only_an_empty_ring() {
 
     let one_word = RingEntry::Syncpoint {
         id: SyncpointId::new(3).unwrap(),
+        count: u32::MAX,
     };
     producer.try_push(&one_word).unwrap();
     assert_eq!(

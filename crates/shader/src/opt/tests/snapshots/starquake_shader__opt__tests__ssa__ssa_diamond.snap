@@ -1,0 +1,19 @@
+---
+source: crates/shader/src/opt/tests/ssa.rs
+expression: "after(DIAMOND, Pass::SsaRewrite)"
+---
+block0:
+    %0: u32 = GetCbufU32 u32 0x0, u32 0x0
+    %1: u1 = INotEqual %0, u32 0x0
+    branch %1, block1, block2
+block1:
+    %2 = SetRegister r0, u32 0x1
+    jump block3
+block2:
+    %3 = SetRegister r0, u32 0x2
+    jump block3
+block3:
+    %6: u32 = Phi [block1: u32 0x1], [block2: u32 0x2]
+    %4: opaque = Identity %6
+    %5 = SetRegister r1, %4
+    return

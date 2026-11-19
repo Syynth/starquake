@@ -45,9 +45,19 @@
 //! spec): it runs one invocation of an IR function on plain machine state, so translator and
 //! IR-pass tests can compare the IR's results with values derived from documented behaviour.
 //!
+//! Slice 8 is the first IR passes ([`opt`]): the SSA rewrite, identity removal, constant
+//! propagation and dead code elimination, ported by behaviour from Eden and run in its order,
+//! with the verifier after each pass in tests and debug builds.
+//!
 //! Slice 10 rebuilds a captured program's control flow ([`flow`]): it finds and resolves the
 //! jump tables of `BRX`, walks the program under both convergence-barrier models, splits it
 //! into blocks, inlines every call, and builds the IR's basic blocks from the flow graph.
+//!
+//! Slice 12g translates the attribute and system-value group ([`translate`]'s `attribute`
+//! module): attribute loads and stores, interpolation (with the pixel header,
+//! [`translate::translate_with_header`]), the special registers of `S2R`, `S2UR`, `CS2R` and
+//! `PIXLD`, and `AL2P`; it rejects the geometry and mesh instructions by name. A guarded
+//! instruction becomes a conditional block.
 //!
 //! Experiment E1, run before this slice, lives in `lower`'s tests and its results in the spec.
 
@@ -65,8 +75,10 @@ pub mod interp;
 pub mod ir;
 pub mod lookup;
 pub mod lower;
+pub mod opt;
 pub mod program;
 pub mod sph;
+pub mod structure;
 #[cfg(test)]
 mod testing;
 pub mod translate;
