@@ -1,7 +1,10 @@
 //! A graphics pipeline's fixed-function state in wgpu's terms (docs/specs/render-backend.md,
 //! "What a pipeline is made of"). A pure conversion, made on the calling thread when the
-//! pipeline is created, so a description wgpu cannot express is refused there and then; the
-//! compile worker builds the pipeline from the result.
+//! pipeline is created, so a description with state wgpu has no form for (the named refusals
+//! below) is refused there and then; the compile worker builds the pipeline from the result.
+//! Three depth and stencil states wgpu-core would refuse are changed instead ("Rasterisation,
+//! depth and stencil"), and wgpu's own stride and offset rules are left to the build ("Vertex
+//! input").
 //!
 //! For policy only, the choices follow Eden's Vulkan back end, which turns the same guest state
 //! into Vulkan state (`eden/src/video_core/renderer_vulkan/maxwell_to_vk.cpp` and
