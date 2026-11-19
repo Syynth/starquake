@@ -20,4 +20,6 @@ pub mod regs;
 pub mod ring;
 pub mod sema;
 pub mod syncpoint;
+#[cfg(test)]
+mod test_log;
 pub mod vm;

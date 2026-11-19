@@ -27,5 +27,9 @@ tracing.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+# Golden draw descriptions (slice G18).
+insta.workspace = true
+# The test assembler, to translate real programs for the draw path's fake shader cache (G18).
+starquake-shader = { workspace = true, features = ["test-support"] }
 # `FakeWatchKernel`, for the buffer cache's tests (slice G16).
 starquake-memory = { workspace = true, features = ["test-support"] }
