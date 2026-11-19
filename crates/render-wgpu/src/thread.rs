@@ -722,7 +722,9 @@ impl Render {
     }
 
     /// Shows a present in the window, if there is one and the frame queue keeps it
-    /// (`crate::window`); the offscreen target shows every present.
+    /// (`crate::window`); the offscreen target shows every present. Every check that can drop
+    /// the frame runs before the window's texture is acquired (`crate::window`, "A frame that
+    /// cannot be shown"): the presented texture's host object, then `Presenter::prepare`.
     fn present(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -737,36 +739,7 @@ impl Render {
         if queued == PresentOutcome::Dropped {
             return queued;
         }
-        let dst = match self.presenter.target() {
-            Target::Offscreen | Target::Window(_) => self.presenter.acquire(&self.device),
-            Target::Lost => Err("the window's surface was lost"),
-            #[cfg(test)]
-            Target::Texture(id) => self
-                .textures
-                .get(id.index(), id.generation())
-                .cloned()
-                .ok_or("the test target is not a live texture"),
-        };
-        let shown = dst.and_then(|dst| {
-            let Some(src) = self
-                .textures
-                .get(source.texture.index(), source.texture.generation())
-            else {
-                self.shared
-                    .host_error(&"a checked texture had no host object");
-                return Err("the presented texture had no host object");
-            };
-            self.presenter.blit(
-                &self.device,
-                &self.queue,
-                encoder,
-                src,
-                source,
-                desc,
-                format,
-                &dst,
-            )
-        });
+        let shown = self.show(encoder, desc, format, source);
         match shown {
             Ok(()) => PresentOutcome::Shown,
             Err(why) => {
@@ -774,6 +747,49 @@ impl Render {
                 PresentOutcome::Dropped
             }
         }
+    }
+
+    /// [`Render::present`]'s checks, acquire and blit, in that order.
+    fn show(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        desc: &PresentDesc,
+        format: wgpu::TextureFormat,
+        source: TexelBox,
+    ) -> Result<(), &'static str> {
+        let Some(src) = self
+            .textures
+            .get(source.texture.index(), source.texture.generation())
+            .cloned()
+        else {
+            self.shared
+                .host_error(&"a checked texture had no host object");
+            return Err("the presented texture had no host object");
+        };
+        self.presenter.prepare(&self.device, source, format)?;
+        let dst = match self.presenter.target() {
+            Target::Offscreen | Target::Window(_) => self.presenter.acquire(&self.device)?,
+            Target::Lost => return Err("the window's surface was lost"),
+            #[cfg(test)]
+            Target::Texture(id, _) => {
+                let texture = self
+                    .textures
+                    .get(id.index(), id.generation())
+                    .cloned()
+                    .ok_or("the test target is not a live texture")?;
+                self.presenter.acquire_test(texture)
+            }
+        };
+        self.presenter.blit(
+            &self.device,
+            &self.queue,
+            encoder,
+            &src,
+            source,
+            desc,
+            format,
+            &dst,
+        )
     }
 
     fn clear(&self, encoder: &mut wgpu::CommandEncoder, step: &ClearStep, scratch: &mut Scratch) {

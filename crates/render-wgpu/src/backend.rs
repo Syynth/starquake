@@ -522,11 +522,16 @@ impl WgpuBackend {
     }
 
     /// Sends shown frames to the live texture `id` as if it were a window's (`crate::window`,
-    /// `Target::Texture`).
+    /// `Target::Texture`), and returns what the stand-in will count.
     #[cfg(test)]
-    pub(crate) fn set_test_target(&self, id: TextureId) {
+    pub(crate) fn set_test_target(&self, id: TextureId) -> Arc<window::TestWindow> {
+        let counts = Arc::new(window::TestWindow::default());
         let state = self.shared.state();
-        self.queue(state, Message::Target(Target::Texture(id)));
+        self.queue(
+            state,
+            Message::Target(Target::Texture(id, Arc::clone(&counts))),
+        );
+        counts
     }
 
     /// Makes the render thread lose the device, as a driver failure would.

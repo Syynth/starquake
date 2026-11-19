@@ -60,6 +60,23 @@
 //! backend bug the tests would show: a presented texture with no host object (counted as a
 //! host error, as `crate::thread` counts every such miss) and a present shader that does not
 //! parse (logged; R4's tests parse it).
+//!
+//! A dropped frame leaves the window showing the frame before it. That needs the window's
+//! texture never to be presented undrawn: wgpu-core clears a surface texture that was never
+//! rendered to and then presents it (`wgpu-core-30.0.2/src/present.rs`, `Queue::present`, which
+//! calls `prepare_surface_texture_for_present` in `device/queue.rs`), so the window would show a
+//! black frame while the feedback says `Dropped`. So the checks that can drop a shown frame run
+//! before the window's texture is acquired, in this order: the presented texture's host object
+//! (`crate::thread`), the block check, and making the blit's objects ([`Presenter::prepare`]).
+//! The acquire comes next, and the blit's own steps after it; if one of those fails anyway (the
+//! fit of an empty image or window, which the shared checks and [`surface_size`] rule out), the
+//! window's texture is discarded rather than presented: dropping a `SurfaceTexture` that was not
+//! presented discards it (`wgpu-30.0.2/src/api/surface_texture.rs`, its `Drop`). The stand-in
+//! target of the tests goes through the same acquire, discard and present steps and counts them
+//! ([`TestWindow`]); pinned by
+//! `backend::tests::window::a_compressed_present_inside_a_block_is_dropped` (nothing acquired for
+//! the dropped frame) and
+//! `backend::tests::window::a_blit_that_fails_after_the_acquire_discards_the_texture`.
 
 use crate::plan::TexelBox;
 use crate::present::{
@@ -72,6 +89,8 @@ use starquake_render::host_shaders::present as shader;
 use starquake_render::{HostShader, RenderError, WindowHandles, WindowSize};
 use std::collections::HashMap;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// A window surface asked for off the main thread on macOS (module docs).
 pub const NOT_MAIN_THREAD: &str =
@@ -141,11 +160,38 @@ pub enum Target {
     Window(WindowSurface),
     /// A window whose surface was lost: presents are dropped (module docs).
     Lost,
-    /// A texture of the backend's standing in for a window's, for the tests: drawn into as a
-    /// window's texture is, never presented. Its id is a live texture with the render-target
-    /// usage.
+    /// A texture of the backend's standing in for a window's, for the tests: acquired, drawn
+    /// into, discarded and presented as a window's texture is, where presenting only counts
+    /// ([`TestWindow`]). Its id is a live texture with the render-target usage.
     #[cfg(test)]
-    Texture(starquake_render::TextureId),
+    Texture(starquake_render::TextureId, Arc<TestWindow>),
+}
+
+/// What the stand-in target of the tests saw ([`Target::Texture`]): how many times its texture
+/// was acquired, presented and discarded (module docs, "A frame that cannot be shown"), and a
+/// fault to inject.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub struct TestWindow {
+    /// Textures acquired.
+    pub acquired: AtomicU64,
+    /// Acquired textures presented.
+    pub presented: AtomicU64,
+    /// Acquired textures discarded.
+    pub discarded: AtomicU64,
+    /// When set, the next blit fails after the acquire, before it encodes anything (cleared by
+    /// that blit).
+    pub fail_next_blit: AtomicBool,
+}
+
+/// The window's texture acquired for the list being encoded.
+#[derive(Debug)]
+enum Pending {
+    /// A window's.
+    Surface(wgpu::SurfaceTexture),
+    /// The tests' stand-in's (counted, never presented).
+    #[cfg(test)]
+    Test(Arc<TestWindow>),
 }
 
 /// The backend's sampled copy of the presented image.
@@ -183,7 +229,7 @@ pub struct Presenter {
     stale: bool,
     /// The window's texture drawn into by the list being encoded, presented after its last
     /// submission.
-    pending: Option<wgpu::SurfaceTexture>,
+    pending: Option<Pending>,
     blit: Option<Blit>,
     source: Option<Source>,
 }
@@ -250,7 +296,7 @@ impl Presenter {
                 (AcquireAction::Show { reconfigure }, Some(texture)) => {
                     self.stale = reconfigure;
                     let out = texture.texture.clone();
-                    self.pending = Some(texture);
+                    self.pending = Some(Pending::Surface(texture));
                     return Ok(out);
                 }
                 (AcquireAction::Retry, _) => configure(device, window, size),
@@ -270,16 +316,66 @@ impl Presenter {
         Err("the window's surface stayed out of date")
     }
 
+    /// Acquires the stand-in target's `texture` as [`Presenter::acquire`] acquires a window's,
+    /// counting it ([`TestWindow`]).
+    #[cfg(test)]
+    pub fn acquire_test(&mut self, texture: wgpu::Texture) -> wgpu::Texture {
+        if let Target::Texture(_, window) = &self.target {
+            window.acquired.fetch_add(1, Ordering::Relaxed);
+            self.pending = Some(Pending::Test(Arc::clone(window)));
+        }
+        texture
+    }
+
     /// Presents the window's texture the list drew into, if any; called after the list's last
     /// submission.
     pub fn finish(&mut self, queue: &wgpu::Queue) {
-        if let Some(texture) = self.pending.take() {
-            queue.present(texture);
+        match self.pending.take() {
+            Some(Pending::Surface(texture)) => queue.present(texture),
+            #[cfg(test)]
+            Some(Pending::Test(window)) => {
+                window.presented.fetch_add(1, Ordering::Relaxed);
+            }
+            None => {}
         }
     }
 
-    /// Encodes the blit of `at` in `src` (a present of `desc`, read as `format`) into `dst`
-    /// (module docs, "The present blit").
+    /// Lets the acquired window texture go without presenting it, so the window keeps its last
+    /// frame (module docs, "A frame that cannot be shown").
+    fn discard(&mut self) {
+        match self.pending.take() {
+            // Dropping a texture that was not presented discards it.
+            Some(Pending::Surface(texture)) => drop(texture),
+            #[cfg(test)]
+            Some(Pending::Test(window)) => {
+                window.discarded.fetch_add(1, Ordering::Relaxed);
+            }
+            None => {}
+        }
+    }
+
+    /// The checks of a present of `at` read as `format` that can drop it, run before the window's
+    /// texture is acquired (module docs, "A frame that cannot be shown"): the block check, then
+    /// making the blit's objects on the first present.
+    pub fn prepare(
+        &mut self,
+        device: &wgpu::Device,
+        at: TexelBox,
+        format: wgpu::TextureFormat,
+    ) -> Result<(), Dropped> {
+        let origin = (at.origin.x, at.origin.y);
+        if !present::starts_on_block(origin, format.block_dimensions()) {
+            return Err("the presented rectangle does not start on a compressed block");
+        }
+        if self.blit.is_none() {
+            self.blit = Some(make_blit(device)?);
+        }
+        Ok(())
+    }
+
+    /// Encodes the blit of `at` in `src` (a present of `desc`, read as `format`) into `dst`, the
+    /// texture just acquired, after [`Presenter::prepare`] passed (module docs, "The present
+    /// blit"). On an error the acquired texture is discarded, not presented.
     #[expect(
         clippy::too_many_arguments,
         reason = "the blit needs the device, the queue, the encoder, both textures and what the \
@@ -296,10 +392,43 @@ impl Presenter {
         format: wgpu::TextureFormat,
         dst: &wgpu::Texture,
     ) -> Result<(), Dropped> {
-        let origin = (at.origin.x, at.origin.y);
-        if !present::starts_on_block(origin, format.block_dimensions()) {
-            return Err("the presented rectangle does not start on a compressed block");
+        let drawn = self.encode(device, queue, encoder, src, at, desc, format, dst);
+        if drawn.is_err() {
+            self.discard();
         }
+        drawn
+    }
+
+    /// The fault [`TestWindow::fail_next_blit`] asks for, once.
+    #[cfg(test)]
+    fn test_fault(&self) -> Result<(), Dropped> {
+        match &self.pending {
+            Some(Pending::Test(window)) if window.fail_next_blit.swap(false, Ordering::Relaxed) => {
+                Err("a fault injected after the acquire")
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// [`Presenter::blit`]'s encoding.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the blit needs the device, the queue, the encoder, both textures and what the \
+                  present names; a struct for them would only carry them here"
+    )]
+    fn encode(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        src: &wgpu::Texture,
+        at: TexelBox,
+        desc: &PresentDesc,
+        format: wgpu::TextureFormat,
+        dst: &wgpu::Texture,
+    ) -> Result<(), Dropped> {
+        #[cfg(test)]
+        self.test_fault()?;
         let shown = shown_size(desc.src_rect, desc.transform);
         let target = (dst.width(), dst.height());
         let screen: ScreenRect = fit(shown, target).ok_or("the image or the window is empty")?;
@@ -309,9 +438,8 @@ impl Presenter {
         );
         let linear = present::filter(shown, screen, filterable) == wgpu::FilterMode::Linear;
         let written = write_format(dst.format(), format.is_srgb());
-        let blit = match &mut self.blit {
-            Some(blit) => blit,
-            slot @ None => slot.insert(make_blit(device)?),
+        let Some(blit) = &mut self.blit else {
+            return Err("the blit's objects were not made (prepare runs first)");
         };
         let source = source(&mut self.source, device, format, at);
         encoder.copy_texture_to_texture(
