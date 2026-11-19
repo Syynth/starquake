@@ -1,0 +1,64 @@
+block0:
+    %0: u1 = GetPred p0
+block1:
+    %1 = SetRegister r1, u32 0x1
+block2:
+    %2 = SetRegister r1, u32 0x2
+block3:
+block4:
+    %3 = Prologue
+    %4 = SetGotoVariable u32 0x3, u1 false
+    %5 = SetGotoVariable u32 0x2, u1 false
+    %6 = SetGotoVariable u32 0x1, u1 false
+    %7 = SetGotoVariable u32 0x4, u1 false
+    %8 = SetGotoVariable u32 0x0, u1 false
+    %9 = SetGotoVariable u32 0x0, u1 false
+block5:
+    %10 = SetGotoVariable u32 0x4, %0
+    %11: u1 = GetGotoVariable u32 0x4
+    %12 = SetGotoVariable u32 0x1, %11
+    %13: u1 = GetGotoVariable u32 0x1
+    %14: u1 = LogicalNot %13
+    %15: u1 = ConditionRef %14
+block6:
+    %16 = SetGotoVariable u32 0x2, u1 true
+block7:
+    %17: u1 = GetGotoVariable u32 0x1
+    %18: u1 = GetGotoVariable u32 0x2
+    %19: u1 = LogicalNot %18
+    %20: u1 = LogicalOr %17, %19
+    %21: u1 = ConditionRef %20
+block8:
+    %22 = SetGotoVariable u32 0x1, u1 false
+block9:
+    %23: u1 = GetGotoVariable u32 0x2
+    %24: u1 = LogicalNot u1 true
+    %25: u1 = LogicalOr %23, %24
+    %26: u1 = ConditionRef %25
+block10:
+    %27 = SetGotoVariable u32 0x2, u1 false
+block11:
+    %28 = SetGotoVariable u32 0x3, u1 false
+block12:
+    %29 = Epilogue
+structure:
+    block4
+    block0
+    block5
+    if %15 {
+        block6
+    }
+    block7
+    if %21 {
+        block8
+        block1
+    }
+    block9
+    if %26 {
+        block10
+        block2
+    }
+    block11
+    block3
+    block12
+    return

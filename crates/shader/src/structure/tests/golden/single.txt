@@ -1,0 +1,13 @@
+block0:
+    %0 = SetRegister r1, u32 0x7
+block1:
+    %1 = Prologue
+    %2 = SetGotoVariable u32 0x0, u1 false
+    %3 = SetGotoVariable u32 0x0, u1 false
+block2:
+    %4 = Epilogue
+structure:
+    block1
+    block0
+    block2
+    return

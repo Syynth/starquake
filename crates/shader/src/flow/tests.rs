@@ -9,6 +9,7 @@ mod ir;
 mod jump_tables;
 mod linear;
 mod models;
+mod structure;
 
 use std::collections::BTreeMap;
 use std::ops::Range;

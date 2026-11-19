@@ -1,0 +1,233 @@
+block0:
+    %0: u32 = GetRegister r0
+    %1 = SetIndirectBranchVariable %0
+    %2: u32 = GetIndirectBranchVariable
+    %3: u1 = IEqual %2, u32 0x10
+block1:
+    %4: u32 = GetIndirectBranchVariable
+    %5: u1 = IEqual %4, u32 0x20
+block2:
+    %6: u32 = GetIndirectBranchVariable
+    %7: u1 = IEqual %6, u32 0x30
+block3:
+    %8 = SetRegister r1, u32 0x1
+block4:
+    %9 = SetRegister r1, u32 0x2
+block5:
+    %10 = SetRegister r1, u32 0x3
+block6:
+block7:
+block8:
+    %11 = Prologue
+    %12 = SetGotoVariable u32 0x7, u1 false
+    %13 = SetGotoVariable u32 0x6, u1 false
+    %14 = SetGotoVariable u32 0x5, u1 false
+    %15 = SetGotoVariable u32 0x4, u1 false
+    %16 = SetGotoVariable u32 0x3, u1 false
+    %17 = SetGotoVariable u32 0xa, u1 false
+    %18 = SetGotoVariable u32 0x2, u1 false
+    %19 = SetGotoVariable u32 0x9, u1 false
+    %20 = SetGotoVariable u32 0x1, u1 false
+    %21 = SetGotoVariable u32 0x8, u1 false
+    %22 = SetGotoVariable u32 0x0, u1 false
+    %23 = SetGotoVariable u32 0x0, u1 false
+block9:
+    %24 = SetGotoVariable u32 0x8, %3
+    %25: u1 = GetGotoVariable u32 0x8
+    %26 = SetGotoVariable u32 0x3, %25
+    %27: u1 = GetGotoVariable u32 0x3
+    %28: u1 = LogicalNot %27
+    %29: u1 = ConditionRef %28
+block10:
+    %30 = SetGotoVariable u32 0x1, u1 false
+block11:
+    %31 = SetGotoVariable u32 0x9, %5
+    %32: u1 = GetGotoVariable u32 0x9
+    %33 = SetGotoVariable u32 0x4, %32
+block12:
+    %34: u1 = GetGotoVariable u32 0x3
+    %35: u1 = GetGotoVariable u32 0x4
+    %36: u1 = LogicalNot %35
+    %37: u1 = LogicalOr %34, %36
+    %38: u1 = ConditionRef %37
+block13:
+    %39: u1 = GetGotoVariable u32 0x3
+    %40 = SetGotoVariable u32 0x3, %39
+    %41: u1 = GetGotoVariable u32 0x3
+    %42: u1 = LogicalNot %41
+    %43: u1 = ConditionRef %42
+block14:
+    %44 = SetGotoVariable u32 0x2, u1 false
+block15:
+    %45 = SetGotoVariable u32 0xa, %7
+    %46: u1 = GetGotoVariable u32 0xa
+    %47 = SetGotoVariable u32 0x5, %46
+block16:
+    %48: u1 = GetGotoVariable u32 0x3
+    %49: u1 = GetGotoVariable u32 0x5
+    %50: u1 = LogicalNot %49
+    %51: u1 = LogicalOr %48, %50
+    %52: u1 = ConditionRef %51
+block17:
+    %53: u1 = GetGotoVariable u32 0x3
+    %54 = SetGotoVariable u32 0x3, %53
+    %55: u1 = GetGotoVariable u32 0x3
+    %56: u1 = LogicalNot %55
+    %57: u1 = ConditionRef %56
+block18:
+    %58 = SetGotoVariable u32 0x6, u1 true
+block19:
+    %59: u1 = GetGotoVariable u32 0x3
+    %60: u1 = GetGotoVariable u32 0x6
+    %61: u1 = LogicalNot %60
+    %62: u1 = LogicalOr %59, %61
+    %63: u1 = ConditionRef %62
+block20:
+    %64 = SetGotoVariable u32 0x3, u1 false
+block21:
+    %65: u1 = GetGotoVariable u32 0x4
+    %66: u1 = GetGotoVariable u32 0x5
+    %67: u1 = GetGotoVariable u32 0x6
+    %68: u1 = LogicalNot u1 true
+    %69: u1 = LogicalOr %67, %68
+    %70: u1 = LogicalOr %66, %69
+    %71: u1 = LogicalOr %65, %70
+    %72: u1 = ConditionRef %71
+block22:
+    %73: u1 = GetGotoVariable u32 0x4
+    %74 = SetGotoVariable u32 0x4, %73
+    %75: u1 = GetGotoVariable u32 0x4
+    %76: u1 = LogicalNot %75
+    %77: u1 = ConditionRef %76
+block23:
+    %78: u1 = GetGotoVariable u32 0x5
+    %79 = SetGotoVariable u32 0x5, %78
+block24:
+    %80: u1 = GetGotoVariable u32 0x4
+    %81: u1 = GetGotoVariable u32 0x5
+    %82: u1 = LogicalNot %81
+    %83: u1 = LogicalOr %80, %82
+    %84: u1 = ConditionRef %83
+block25:
+    %85: u1 = GetGotoVariable u32 0x4
+    %86 = SetGotoVariable u32 0x4, %85
+    %87: u1 = GetGotoVariable u32 0x4
+    %88: u1 = LogicalNot %87
+    %89: u1 = ConditionRef %88
+block26:
+    %90: u1 = GetGotoVariable u32 0x6
+    %91 = SetGotoVariable u32 0x6, %90
+block27:
+    %92: u1 = GetGotoVariable u32 0x4
+    %93: u1 = GetGotoVariable u32 0x6
+    %94: u1 = LogicalNot %93
+    %95: u1 = LogicalOr %92, %94
+    %96: u1 = ConditionRef %95
+block28:
+    %97 = SetGotoVariable u32 0x4, u1 false
+block29:
+    %98: u1 = GetGotoVariable u32 0x5
+    %99: u1 = GetGotoVariable u32 0x6
+    %100: u1 = LogicalNot u1 true
+    %101: u1 = LogicalOr %99, %100
+    %102: u1 = LogicalOr %98, %101
+    %103: u1 = ConditionRef %102
+block30:
+    %104: u1 = GetGotoVariable u32 0x5
+    %105 = SetGotoVariable u32 0x5, %104
+    %106: u1 = GetGotoVariable u32 0x5
+    %107: u1 = LogicalNot %106
+    %108: u1 = ConditionRef %107
+block31:
+    %109: u1 = GetGotoVariable u32 0x6
+    %110 = SetGotoVariable u32 0x6, %109
+block32:
+    %111: u1 = GetGotoVariable u32 0x5
+    %112: u1 = GetGotoVariable u32 0x6
+    %113: u1 = LogicalNot %112
+    %114: u1 = LogicalOr %111, %113
+    %115: u1 = ConditionRef %114
+block33:
+    %116 = SetGotoVariable u32 0x5, u1 false
+block34:
+    %117: u1 = GetGotoVariable u32 0x6
+    %118: u1 = LogicalNot u1 true
+    %119: u1 = LogicalOr %117, %118
+    %120: u1 = ConditionRef %119
+block35:
+    %121 = SetGotoVariable u32 0x6, u1 false
+block36:
+    %122 = SetGotoVariable u32 0x7, u1 false
+block37:
+    %123 = Epilogue
+structure:
+    block8
+    block0
+    block9
+    if %29 {
+        block10
+        block1
+        block11
+    }
+    block12
+    if %38 {
+        block13
+        if %43 {
+            block14
+            block2
+            block15
+        }
+        block16
+        if %52 {
+            block17
+            if %57 {
+                block18
+            }
+            block19
+            if %63 {
+                block20
+                block3
+            }
+        }
+    }
+    block21
+    if %72 {
+        block22
+        if %77 {
+            block23
+        }
+        block24
+        if %84 {
+            block25
+            if %89 {
+                block26
+            }
+            block27
+            if %96 {
+                block28
+                block4
+            }
+        }
+        block29
+        if %103 {
+            block30
+            if %108 {
+                block31
+            }
+            block32
+            if %115 {
+                block33
+                block5
+            }
+            block34
+            if %120 {
+                block35
+                block6
+                unreachable
+            }
+        }
+    }
+    block36
+    block7
+    block37
+    return

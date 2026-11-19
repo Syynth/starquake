@@ -1,0 +1,101 @@
+block0:
+block1:
+    %0: u32 = GetRegister r1
+    %1: u32 = IAdd32 %0, u32 0x1
+    %2 = SetRegister r1, %1
+block2:
+    %3: u32 = GetRegister r2
+    %4: u32 = IAdd32 %3, u32 0x1
+    %5 = SetRegister r2, %4
+    %6: u32 = GetRegister r3
+    %7: u1 = IEqual %4, %6
+block3:
+    %8: u32 = GetRegister r2
+    %9: u32 = BitwiseAnd32 %8, u32 0x3
+    %10: u1 = INotEqual %9, u32 0x0
+block4:
+    %11: u32 = GetRegister r1
+    %12: u1 = ULessThan %11, u32 0x3
+block5:
+block6:
+    %13 = Prologue
+    %14 = SetGotoVariable u32 0x5, u1 false
+    %15 = SetGotoVariable u32 0x8, u1 false
+    %16 = SetGotoVariable u32 0x4, u1 false
+    %17 = SetGotoVariable u32 0x7, u1 false
+    %18 = SetGotoVariable u32 0x3, u1 false
+    %19 = SetGotoVariable u32 0x6, u1 false
+    %20 = SetGotoVariable u32 0x2, u1 false
+    %21 = SetGotoVariable u32 0x1, u1 false
+    %22 = SetGotoVariable u32 0x0, u1 false
+    %23 = SetGotoVariable u32 0x0, u1 false
+block7:
+    %24 = SetGotoVariable u32 0x1, u1 true
+block8:
+    %25 = SetGotoVariable u32 0x1, u1 false
+block9:
+    %26 = SetGotoVariable u32 0x2, u1 true
+block10:
+    %27 = SetGotoVariable u32 0x2, u1 false
+block11:
+    %28 = SetGotoVariable u32 0x6, %7
+    %29: u1 = GetGotoVariable u32 0x6
+    %30 = SetGotoVariable u32 0x5, %29
+    %31: u1 = GetGotoVariable u32 0x5
+    %32: u1 = ConditionRef %31
+block12:
+    %33 = SetGotoVariable u32 0x3, u1 false
+block13:
+    %34 = SetGotoVariable u32 0x7, %10
+    %35: u1 = GetGotoVariable u32 0x7
+    %36 = SetGotoVariable u32 0x2, %35
+block14:
+    %37: u1 = GetGotoVariable u32 0x2
+    %38: u1 = ConditionRef %37
+block15:
+    %39: u1 = GetGotoVariable u32 0x5
+    %40 = SetGotoVariable u32 0x5, %39
+    %41: u1 = GetGotoVariable u32 0x5
+    %42: u1 = ConditionRef %41
+block16:
+    %43 = SetGotoVariable u32 0x4, u1 false
+block17:
+    %44 = SetGotoVariable u32 0x8, %12
+    %45: u1 = GetGotoVariable u32 0x8
+    %46 = SetGotoVariable u32 0x1, %45
+block18:
+    %47: u1 = GetGotoVariable u32 0x1
+    %48: u1 = ConditionRef %47
+block19:
+    %49 = SetGotoVariable u32 0x5, u1 false
+block20:
+    %50 = Epilogue
+structure:
+    block6
+    block0
+    block7
+    loop {
+        block8
+        block1
+        block9
+        loop {
+            block10
+            block2
+            block11
+            break %32
+            block12
+            block3
+            block13
+            block14
+        } repeat %38
+        block15
+        break %42
+        block16
+        block4
+        block17
+        block18
+    } repeat %48
+    block19
+    block5
+    block20
+    return
