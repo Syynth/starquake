@@ -12,7 +12,8 @@
 //! - **64-bit addition, multiplication and fused multiply-add** use the host's binary64
 //!   operations (`f64::mul_add` is fused on every host), which IEEE 754 defines exactly in
 //!   round-to-nearest-even; directed rounding on them is not modelled, and the caller reports
-//!   it as unsupported. Conversions to binary64 do honour every mode: an integer's exact value
+//!   it as unsupported whenever no operand is a NaN (a NaN operand gives the canonical NaN
+//!   first), including a finite sum that overflows. Conversions to binary64 do honour every mode: an integer's exact value
 //!   is a rounded binary64 value and its exact error, and the error says which neighbour a
 //!   directed mode takes.
 //! - **Division and square root** (`FPRecip32`, `FPSqrt`) are computed in binary64 and rounded
@@ -458,14 +459,13 @@ fn signed_zero_sum(sum: f64, a: f64, b: f64, rounding: FpRounding) -> f64 {
 
 /// The exactly rounded sum `a + b`.
 fn sum(format: Format, a: f64, b: f64, control: Control) -> Result<u64, DirectedF64> {
-    let rough = a + b;
-    if !rough.is_finite() {
-        return Ok(control.result(format, rough));
+    // Checked before the non-finite return: a finite sum that overflows rounds to the largest
+    // finite value, not infinity, under Rz and one of Rp or Rm.
+    if format == Format::F64 && !is_nearest(control.rounding) {
+        return Err(DirectedF64);
     }
-    if format == Format::F64 {
-        if !is_nearest(control.rounding) {
-            return Err(DirectedF64);
-        }
+    let rough = a + b;
+    if !rough.is_finite() || format == Format::F64 {
         return Ok(control.result(format, rough));
     }
     let error = two_sum_error(a, b, rough);

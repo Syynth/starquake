@@ -148,7 +148,14 @@ fn global_alignment_then_bounds() {
         err("LoadGlobal128 u64 0x1008", &mut machine),
         "%0: an access of 16 bytes to global memory at 0x1008 is not aligned"
     );
-    // An access whose end overflows the address space.
+    // An access far above the region.
+    assert_eq!(
+        err("LoadGlobal64 u64 0xfffffffffffffff8", &mut machine),
+        "%0: an access of 8 bytes to global memory at 0xfffffffffffffff8 is outside the 16 bytes it holds"
+    );
+    // An access whose end overflows the address space: with the region at 0, the offset is the
+    // address itself and offset + size wraps to 0, which a wrapping sum would accept.
+    machine.global.base = 0;
     assert_eq!(
         err("LoadGlobal64 u64 0xfffffffffffffff8", &mut machine),
         "%0: an access of 8 bytes to global memory at 0xfffffffffffffff8 is outside the 16 bytes it holds"
@@ -259,6 +266,17 @@ fn storage_buffers_by_binding() {
         machine.storage.get(&2).map(Vec::as_slice),
         Some(&[1, 0, 0, 0, 2, 0, 0, 0][..])
     );
+    // The 128-bit, 16-bit and signed 8-bit stores, each writing only its own bytes.
+    machine.storage.insert(6, bytes(16));
+    let narrow = "    %0 = CompositeConstructU32x4 u32 0x1, u32 0x2, u32 0x3, u32 0x4
+    %1 = WriteStorage128 u32 6, u32 0, %0
+    %2 = WriteStorageU16 u32 6, u32 0xe, u32 0xffff1234
+    %3 = WriteStorageS8 u32 6, u32 0xc, u32 0x99";
+    run(&format!("block0:\n{narrow}\n    return\n"), &mut machine).expect("runs");
+    assert_eq!(
+        machine.storage.get(&6).map(Vec::as_slice),
+        Some(&[1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 0x99, 0, 0x34, 0x12][..])
+    );
 }
 
 #[test]
@@ -350,13 +368,47 @@ fn local_memory_by_word() {
     assert_eq!(machine.local, [10, 99, 30]);
 }
 
-/// Runs `op` on shared memory word 0 holding `old`; returns the result and the new word.
-fn shared_atomic(op: &str, old: u32, value: u32) -> (u32, u32) {
+/// The memory spaces with 32-bit integer atomics.
+#[derive(Clone, Copy, Debug)]
+enum AtomicSpace {
+    /// Shared memory, word 0.
+    Shared,
+    /// Global memory, a 4-byte region at 0x1000.
+    Global,
+    /// Storage buffer 5, offset 0.
+    Storage,
+}
+
+/// Runs the atomic `kind` (`IAdd`, `SMin`, ...) in `space` on a word holding `old`; returns
+/// the result and the new word.
+fn space_atomic(space: AtomicSpace, kind: &str, old: u32, value: u32) -> (u32, u32) {
     let mut machine = Machine::new();
-    machine.shared = old.to_le_bytes().to_vec();
-    let result = op_on(&mut machine, &format!("{op} u32 0x0, u32 {value:#x}"));
+    let start = old.to_le_bytes().to_vec();
+    let op = match space {
+        AtomicSpace::Shared => {
+            machine.shared = start;
+            format!("SharedAtomic{kind}32 u32 0x0, u32 {value:#x}")
+        }
+        AtomicSpace::Global => {
+            machine.global = Region {
+                base: 0x1000,
+                bytes: start,
+            };
+            format!("GlobalAtomic{kind}32 u64 0x1000, u32 {value:#x}")
+        }
+        AtomicSpace::Storage => {
+            machine.storage.insert(5, start);
+            format!("StorageAtomic{kind}32 u32 5, u32 0x0, u32 {value:#x}")
+        }
+    };
+    let result = op_on(&mut machine, &op);
+    let stored = match space {
+        AtomicSpace::Shared => machine.shared.clone(),
+        AtomicSpace::Global => machine.global.bytes.clone(),
+        AtomicSpace::Storage => machine.storage.get(&5).cloned().unwrap_or_default(),
+    };
     let mut word = [0; 4];
-    word.copy_from_slice(&machine.shared);
+    word.copy_from_slice(&stored);
     (super::u32_of(result), u32::from_le_bytes(word))
 }
 
@@ -365,31 +417,33 @@ fn atomics_return_the_old_value_and_store_the_new() {
     // 0xfffffffe is -2 signed and large unsigned.
     let old = 0xffff_fffe;
     let cases = [
-        ("SharedAtomicIAdd32", old, 3, 1),
-        ("SharedAtomicSMin32", old, 1, old),
-        ("SharedAtomicUMin32", old, 1, 1),
-        ("SharedAtomicSMax32", old, 1, 1),
-        ("SharedAtomicUMax32", old, 1, old),
-        ("SharedAtomicAnd32", 0xf0f0, 0xff00, 0xf000),
-        ("SharedAtomicOr32", 0xf0f0, 0xff00, 0xfff0),
-        ("SharedAtomicXor32", 0xf0f0, 0xff00, 0x0ff0),
-        ("SharedAtomicExchange32", 7, 9, 9),
+        ("IAdd", old, 3, 1),
+        ("SMin", old, 1, old),
+        ("UMin", old, 1, 1),
+        ("SMax", old, 1, 1),
+        ("UMax", old, 1, old),
+        ("And", 0xf0f0, 0xff00, 0xf000),
+        ("Or", 0xf0f0, 0xff00, 0xfff0),
+        ("Xor", 0xf0f0, 0xff00, 0x0ff0),
+        ("Exchange", 7, 9, 9),
         // Increment wraps to 0 when old >= value.
-        ("SharedAtomicInc32", 5, 5, 0),
-        ("SharedAtomicInc32", 6, 5, 0),
-        ("SharedAtomicInc32", 4, 5, 5),
+        ("Inc", 5, 5, 0),
+        ("Inc", 6, 5, 0),
+        ("Inc", 4, 5, 5),
         // Decrement wraps to value when old is 0 or above value.
-        ("SharedAtomicDec32", 0, 5, 5),
-        ("SharedAtomicDec32", 6, 5, 5),
-        ("SharedAtomicDec32", 5, 5, 4),
-        ("SharedAtomicDec32", 1, 5, 0),
+        ("Dec", 0, 5, 5),
+        ("Dec", 6, 5, 5),
+        ("Dec", 5, 5, 4),
+        ("Dec", 1, 5, 0),
     ];
-    for (op, old, value, new) in cases {
-        assert_eq!(
-            shared_atomic(op, old, value),
-            (old, new),
-            "{op} {old:#x} {value:#x}"
-        );
+    for space in [AtomicSpace::Shared, AtomicSpace::Global, AtomicSpace::Storage] {
+        for (kind, old, value, new) in cases {
+            assert_eq!(
+                space_atomic(space, kind, old, value),
+                (old, new),
+                "{space:?} {kind} {old:#x} {value:#x}"
+            );
+        }
     }
 }
 

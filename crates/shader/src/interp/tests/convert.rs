@@ -113,6 +113,20 @@ fn integer_to_float_rounds_in_each_mode() {
         f64_bits(eval("ConvertF64U64 u64 0xffffffffffffffff {rz}")),
         0x43ef_ffff_ffff_ffff
     );
+    // u64::MAX is just below 2^64, so rounding up keeps the nearest result 2^64 rather than
+    // stepping past it.
+    assert_eq!(
+        f64_bits(eval("ConvertF64U64 u64 0xffffffffffffffff {rp}")),
+        2.0_f64.powi(64).to_bits()
+    );
+    // An exactly representable integer is unchanged by directed rounding in either direction.
+    for rounding in ["rz", "rp", "rm"] {
+        assert_eq!(
+            f64_bits(eval(&format!("ConvertF64U32 u32 1 {{{rounding}}}"))),
+            1.0_f64.to_bits(),
+            "{rounding}"
+        );
+    }
     assert_eq!(
         f64_bits(eval("ConvertF64S64 u64 0x8000000000000001 {rp}")),
         0xc3df_ffff_ffff_ffff

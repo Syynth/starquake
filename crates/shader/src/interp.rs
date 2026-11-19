@@ -116,7 +116,8 @@
 //!
 //! - `FPClamp32` of a NaN gives the low bound; PR #4588's `EvaluateVertex` uses `std::clamp`,
 //!   which passes the NaN through (`float::clamp_and_saturate_take_a_nan_to_the_low_bound`).
-//! - A misaligned global, storage, shared or local access is [`InterpError::Misaligned`];
+//! - A misaligned global, storage or shared access is [`InterpError::Misaligned`] (a local
+//!   access takes a word index, so it cannot be misaligned);
 //!   Eden's emitter divides the offset by the access size, which reads the aligned-down
 //!   address (`StorageIndex`, `emit_spirv_shared_memory.cpp`'s `Pointer`), and its shared
 //!   64- and 128-bit word path aligns only to 4 (`memory::global_alignment_then_bounds`,
