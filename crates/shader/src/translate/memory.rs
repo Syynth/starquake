@@ -109,9 +109,14 @@
 //!
 //! # Decisions taken here (the decoder's open readings)
 //!
-//! The decoder (slice 6e) left three readings to this slice. Each follows PR #4588's native
-//! translator, the reference a title ran on (decision 8 of the 2026-11-12 graphics rulings:
-//! "otherwise the one a title ran on"), and is a guess until an `nvdisasm` or hardware check:
+//! The decoder (slice 6e) left these readings to this slice. Each follows PR #4588's native
+//! translator, the frontend the spec ports, except bit 76 (the last bullet), and each is a guess
+//! until an `nvdisasm` or hardware check. The PR runs titles through its lowering to Maxwell by
+//! default and through the native translator only when asked
+//! (`eden-pr4588/src/video_core/shader_environment.cpp`: `EDEN_NATIVE_FRONTEND` unset keeps the
+//! lowering, `lower_to_maxwell.h`), so where the two parts read a field differently and the
+//! native translator would translate the word to something else, decision 8 of the 2026-11-12
+//! graphics rulings ("otherwise the one a title ran on") takes the lowering's reading:
 //!
 //! - **The uniform-address bits.** Bit 91 turns the uniform register on (`LDG`, `STG`, `ATOMG`:
 //!   `use_uniform = Take(91, 1)`). In the uniform `LDG` and `STG` the register's 64-bit flag is
@@ -131,6 +136,16 @@
 //! - **`LDC`'s 16-bit offset** is signed (`Visitor::LDC`: `static_cast<s16>(Take(38, 16))`),
 //!   where the decoder keeps NAK's unsigned `u16`
 //!   (`tests::constant::ldc_offsets_are_signed`).
+//! - **Bit 76 of the uniform `LDG` and `STG`** (`0x981`, `0x986`; the decoder's `bit76`, meaning
+//!   unknown there) with the uniform address on makes the uniform register a memory descriptor,
+//!   which is checked as an address register would be but not added to the address: the
+//!   lowering reads the word `0x0c1e1100` (bits 72, 76, 81..85, 90 and 91; the type masked) of
+//!   `LDG` as a "descriptor address" whose address is the register pair alone, and `0x0c101100`
+//!   of `STG` likewise (`lower_to_maxwell.h`, `descriptor_address` and `sized_store`; PR #4588's
+//!   test "Native descriptor-addressed global loads retain the explicit 64-bit pointer"). The
+//!   native translator ignores the bit with the memory order (`Ignore(76, 4)`) and adds the
+//!   uniform register. With the uniform address off the bit changes nothing
+//!   (`tests::global::bit_76_makes_the_uniform_register_a_descriptor`).
 //!
 //! # Constant buffers
 //!
@@ -165,6 +180,8 @@
 //! | `LDL` past the local memory size | each word selects 0 where the byte offset is not below `env.LocalMemorySize()` | no bound here: slice 16's pass 6 bounds every indexed local access | `tests::local::ldl_reads_without_a_bound` |
 //! | `LDC` with `RZ` | `IAdd(X(255), Imm32(offset))` | the immediate offset alone (the same value) | `tests::constant::only_a_register_offset_is_indexed` |
 //! | `LDG`'s load predicate | writes the registers, then rewrites each with a select of its new value | selects the loaded value before writing (the same values) | `tests::global::a_false_load_predicate_gives_zero` |
+//! | The uniform `LDG` and `STG` with bit 76 and the uniform address on | the native translator adds the uniform register; the lowering does not (above) | the lowering's reading: a descriptor, not added | `tests::global::bit_76_makes_the_uniform_register_a_descriptor`, `tests::pr4588::descriptor_addressed_global_loads_retain_the_explicit_64_bit_pointer` |
+//! | `LDGSTS`'s enable predicate | the native translator requires bits 85..90 clear ("native global-to-shared copy mode", `Take(85, 5) == 0`) and then reads bits 87..90 as the predicate, so only `P0` passes, against its own comment ("the enable predicate (87..89 plus the negate bit 70)"); the lowering takes any predicate (its test "Native global-to-shared copy retains its source predicate", `PT` included) | any predicate, as the decoder reads it (the lowering's reading, decision 8). **Owner question**: refuse all but `P0` as the native translator does | `tests::barriers::any_predicate_enables_a_copy` |
 //!
 //! # Not translated
 //!
@@ -189,7 +206,7 @@ use super::integer::{GuardMode, split_for_guard, successor_phi};
 use crate::decode::memory::MEM_OFFSET;
 use crate::decode::{
     AtomDst, AtomOp, AtomType, CBuf, DecodeError, Gpr, Instr, Instruction, LdcMode, MemAddr,
-    MemBarScope, MemOrder, MemScope, MemSpace, MemType, Op, OffsetStride, OpAtom, OpAtomsPopc,
+    MemBarScope, MemOrder, MemScope, MemSpace, MemType, OffsetStride, Op, OpAtom, OpAtomsPopc,
     OpLd, OpLdGsts, OpLdc, OpMemBar, OpSt, Pred, UniformReg, decode,
 };
 use crate::flow::read_pred;
@@ -298,12 +315,12 @@ pub enum MemoryUnsupported {
     /// A global address whose uniform register is `URZ`, or whose 64-bit uniform pair does not
     /// start at an even register below `UR62` (`Visitor::GlobalAddress`: "native global uniform
     /// address", `uniform < 63 && (!uniform_pair || (uniform % 2 == 0 && uniform + 1 < 63))`).
-    #[error("a global address in uniform register {reg} ({words} words)")]
+    #[error("a global address in uniform register {}{reg}", if *.pair { "pair " } else { "" })]
     GlobalUniformAddress {
         /// The uniform register.
         reg: UniformReg,
-        /// One for a word, two for a pair.
-        words: u8,
+        /// Whether it is the first of a pair.
+        pair: bool,
     },
     /// A global address register pair that does not start at an even register below `R254`
     /// (`Visitor::GlobalAddress`: "native global register address", `reg % 2 == 0 && reg + 1
@@ -361,10 +378,6 @@ pub enum MemoryUnsupported {
     /// || scope == 3 || scope == 5`).
     #[error("a membar at the sm scope")]
     BarrierScope(MemBarScope),
-    /// An `LDGSTS` enable predicate other than `P0` (`Visitor::LDGSTS`: "native global-to-shared
-    /// copy mode", `Take(85, 5) == 0`, which leaves only `P0` in bits 87..90).
-    #[error("an ldgsts enable predicate {0}")]
-    CopyEnable(Pred),
     /// `LDGSTS` registers out of range (`Visitor::LDGSTS`: "native global-to-shared copy
     /// registers", `global_reg % 2 == 0 && global_reg + 1 < 255 && shared_reg < 255`).
     #[error("ldgsts registers {shared} (shared) and {global} (global pair)")]
@@ -571,8 +584,7 @@ fn run_ok(first: Gpr, words: u8) -> bool {
         return true;
     }
     let index = u32::from(first.index());
-    index.is_multiple_of(u32::from(words))
-        && index + u32::from(words) - 1 < u32::from(REGISTER_END)
+    index.is_multiple_of(u32::from(words)) && index + u32::from(words) - 1 < u32::from(REGISTER_END)
 }
 
 /// How PR #4588 reads a global address (`Visitor::GlobalAddress`'s arguments).
@@ -584,21 +596,28 @@ struct GlobalAddr {
     reg_pair: bool,
     /// The uniform register and whether it is a pair, when the uniform address is on.
     uniform: Option<(UniformReg, bool)>,
+    /// The uniform register is a memory descriptor, not part of the address (module docs,
+    /// "Decisions taken here"): it is checked but not added.
+    descriptor: bool,
     /// The sign-extended byte offset.
     offset: i32,
 }
 
 /// `addr` read as PR #4588 reads it in the forms of `LDG`, `STG` and `ATOMG` (not `RED`, see
 /// [`reduction_addr`]): the decoder's fields carry the uniform and non-uniform layouts' flags
-/// where the PR reads them (module docs, "Decisions taken here").
-const fn global_addr(addr: MemAddr) -> GlobalAddr {
+/// where the PR reads them. With `bit76` (the uniform `LDG`'s and `STG`'s bit 76) and the
+/// uniform address on, the uniform register is a memory descriptor (module docs, "Decisions
+/// taken here").
+const fn global_addr(addr: MemAddr, bit76: bool) -> GlobalAddr {
+    let uniform = match addr.uniform {
+        Some(uniform) if uniform.enabled => Some((uniform.reg, uniform.wide)),
+        _ => None,
+    };
     GlobalAddr {
         reg: addr.reg,
         reg_pair: addr.reg_64,
-        uniform: match addr.uniform {
-            Some(uniform) if uniform.enabled => Some((uniform.reg, uniform.wide)),
-            _ => None,
-        },
+        uniform,
+        descriptor: bit76 && uniform.is_some(),
         offset: addr.offset,
     }
 }
@@ -613,6 +632,7 @@ const fn reduction_addr(addr: MemAddr) -> GlobalAddr {
             None => addr.reg_64,
         },
         uniform: None,
+        descriptor: false,
         offset: addr.offset,
     }
 }
@@ -624,10 +644,7 @@ fn check_global_addr(addr: GlobalAddr) -> Result<(), MemoryUnsupported> {
         let end = u32::from(UNIFORM_REGISTER_END);
         require(
             index < end && (!pair || (index.is_multiple_of(2) && index + 1 < end)),
-            MemoryUnsupported::GlobalUniformAddress {
-                reg,
-                words: if pair { 2 } else { 1 },
-            },
+            MemoryUnsupported::GlobalUniformAddress { reg, pair },
         )?;
     }
     if !addr.reg.is_zero() && addr.reg_pair {
@@ -678,7 +695,7 @@ fn check_ld(ld: OpLd) -> Result<(), MemoryUnsupported> {
                 ld.pred_dst.is_true(),
                 MemoryUnsupported::LoadResidency(ld.pred_dst),
             )?;
-            check_global_addr(global_addr(ld.addr))?;
+            check_global_addr(global_addr(ld.addr, ld.bit76))?;
             require(run_ok(ld.dst, words), destination)?;
             check_order(ld.space)
         }
@@ -699,9 +716,9 @@ fn check_ld(ld: OpLd) -> Result<(), MemoryUnsupported> {
         }
         MemSpace::Local(_) => {
             require(
-                !ld.addr.uniform.is_some_and(|uniform| {
-                    uniform.enabled || uniform.reg.index() != 0
-                }),
+                !ld.addr
+                    .uniform
+                    .is_some_and(|uniform| uniform.enabled || uniform.reg.index() != 0),
                 MemoryUnsupported::UniformAddress(space),
             )?;
             require(run_ok(ld.dst, words), destination)
@@ -719,7 +736,7 @@ fn check_st(st: OpSt) -> Result<(), MemoryUnsupported> {
     };
     match st.space {
         MemSpace::Global(_) => {
-            check_global_addr(global_addr(st.addr))?;
+            check_global_addr(global_addr(st.addr, st.bit76))?;
             require(run_ok(st.data, words), data)?;
             check_order(st.space)
         }
@@ -776,7 +793,7 @@ fn check_atom(atom: OpAtom) -> Result<(), MemoryUnsupported> {
                 MemoryUnsupported::AtomicPredicateOutput(atom.pred_dst),
             )?;
             require(narrow, atom_type)?;
-            check_global_addr(global_addr(atom.addr))?;
+            check_global_addr(global_addr(atom.addr, false))?;
             check_order(atom.space)
         }
         (MemSpace::Global(_), AtomDst::Reduction { ignored }) => {
@@ -820,11 +837,9 @@ fn check_membar(bar: OpMemBar) -> Result<(), MemoryUnsupported> {
     require(!bar.sc, MemoryUnsupported::BarrierSc)
 }
 
+/// `Visitor::LDGSTS`'s register check. Its `Require(Take(85, 5) == 0)` is not mirrored: it
+/// leaves only `P0` as the enable predicate (module docs, "Divergences from PR #4588").
 fn check_ldgsts(copy: OpLdGsts) -> Result<(), MemoryUnsupported> {
-    require(
-        copy.enable.reg.index() == 0,
-        MemoryUnsupported::CopyEnable(copy.enable.reg),
-    )?;
     let global = u32::from(copy.global.index());
     require(
         global.is_multiple_of(2)
@@ -999,12 +1014,13 @@ impl Emit<'_, '_> {
     fn global_address(&mut self, addr: GlobalAddr) -> Result<Operand, BuildError> {
         let zero = imm32(0);
         let have_reg = !addr.reg.is_zero();
-        let (low, high) = match addr.uniform {
+        let uniform = if addr.descriptor { None } else { addr.uniform };
+        let (low, high) = match uniform {
             Some((reg, pair)) => {
                 let u_low = self.uniform(reg)?;
                 let u_high = if pair {
-                    let next = UniformReg::new(reg.index().saturating_add(1))
-                        .unwrap_or(UniformReg::URZ);
+                    let next =
+                        UniformReg::new(reg.index().saturating_add(1)).unwrap_or(UniformReg::URZ);
                     self.uniform(next)?
                 } else {
                     zero
@@ -1100,7 +1116,7 @@ impl Emit<'_, '_> {
         let words = words_of(ld.mem_type);
         match ld.space {
             MemSpace::Global(_) => {
-                let address = self.global_address(global_addr(ld.addr))?;
+                let address = self.global_address(global_addr(ld.addr, ld.bit76))?;
                 let value = self.op(global_access(ld.mem_type).load, &[address])?;
                 if ld.pred.is_true() || ld.dst.is_zero() {
                     return self.set_words(ld.dst, value, words);
@@ -1180,7 +1196,7 @@ impl Emit<'_, '_> {
         let words = words_of(st.mem_type);
         match st.space {
             MemSpace::Global(_) => {
-                let address = self.global_address(global_addr(st.addr))?;
+                let address = self.global_address(global_addr(st.addr, st.bit76))?;
                 let value = self.get_words(st.data, words)?;
                 self.op(global_access(st.mem_type).store, &[address, value])
                     .map(drop)
@@ -1262,7 +1278,9 @@ impl Emit<'_, '_> {
         let space = Space::of(atom.space);
         let signed = atom.atom_type == AtomType::I32;
         let address = match (atom.space, atom.dst) {
-            (MemSpace::Global(_), AtomDst::Reg(_)) => self.global_address(global_addr(atom.addr))?,
+            (MemSpace::Global(_), AtomDst::Reg(_)) => {
+                self.global_address(global_addr(atom.addr, false))?
+            }
             (MemSpace::Global(_), AtomDst::Reduction { .. }) => {
                 self.global_address(reduction_addr(atom.addr))?
             }
@@ -1298,6 +1316,7 @@ impl Emit<'_, '_> {
                 reg: copy.global,
                 reg_pair: true,
                 uniform: None,
+                descriptor: false,
                 offset: global_offset.saturating_add(step),
             })?;
             let loaded = self.op(Opcode::LoadGlobal32, &[address])?;
