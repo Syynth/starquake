@@ -517,7 +517,7 @@ const LOGIC_FIELDS: [FieldCase; 24] = [
 ];
 
 /// `IMAD`, `IMAD.WIDE`, `IMAD.HI` and `IDP`.
-const MULTIPLY_FIELDS: [FieldCase; 13] = [
+const MULTIPLY_FIELDS: [FieldCase; 14] = [
     (
         0x024,
         &[(72, 1), (81, 7), (87, 0xf)],
@@ -555,6 +555,11 @@ const MULTIPLY_FIELDS: [FieldCase; 13] = [
     (0x026, &[(73, 1)], "idp.4a.s8.u8 r1, r2, r3, r5;"),
     (0x026, &[(74, 1)], "idp.4a.u8.s8 r1, r2, r3, r5;"),
     (0x026, &[(76, 1)], "idp.2a.lo.u16.u8 r1, r2, r3, r5;"),
+    (
+        0x026,
+        &[(76, 1), (72, 1)],
+        "idp.2a.lo.u16.u8 r1, -r2, r3, r5;",
+    ),
 ];
 
 /// Each instruction's own fields and source modifiers, each set alone in a form 1 word, against

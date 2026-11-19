@@ -13,7 +13,11 @@
 //! (`test_ldc`, `test_nanosleep`). Of the control group (`op::control`), `test_nop`,
 //! `test_redux`, `test_match` and `test_nanosleep` pin `nop`, every `redux` operation, `match`
 //! with and without its predicate and `.u64`, and `nanosleep` with each source kind and a hex
-//! immediate. **Everything else is a guess** in `nvdisasm`'s usual style that a developer with
+//! immediate. Of the integer group (`op::integer`), `test_lea`, `test_sgxt`, `test_plop3`,
+//! `test_iabs` and `test_imnmx` pin `lea` and `lea.hi` with the shifted value and `b` negated
+//! and the shift in hex, `sgxt` and `sgxt.u32`, `plop3.lut` with negated predicates and both
+//! truth tables in hex, `iabs`, and `imnmx` and `imnmx.u32` with a predicate. **Everything else
+//! is a guess** in `nvdisasm`'s usual style that a developer with
 //! `nvdisasm` should check (spec, "`nvdisasm` cross-check"): `urz` and `upt`, the `.rm`/`.rp`
 //! rounding names (taken from NAK's own `FRndMode` printer), `.fmz` for the `dnz` bit, float
 //! immediates other than small integers, `-`/`|..|` source modifiers (on registers, uniform
@@ -21,8 +25,9 @@
 //! and lane mask, the `ALD`/`AST` operand syntax and width suffixes, `EXIT`'s modifiers and
 //! predicate, the special-register names, the text of every other control instruction (branch
 //! offsets in particular print as a signed byte displacement from the next instruction, where
-//! `nvdisasm` prints the absolute target: `op::control`, `BranchOffset`), and every shell's
-//! mnemonic.
+//! `nvdisasm` prints the absolute target: `op::control`, `BranchOffset`), the text of every
+//! other integer instruction (its modifier names and operand order, and `~` for a bitwise-not
+//! source, which NAK's own printer writes `!`: `op::integer`), and every shell's mnemonic.
 
 use std::fmt::{self, Display, Formatter};
 

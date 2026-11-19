@@ -65,10 +65,12 @@
 //!   encoder). **Conflict**: PR #4588 reads 1 as `U32`, 2 as `S64` and 3 as `U64` and refuses 0
 //!   (`Visitor::SHF`). NAK's encoding is the one its compiler's shaders run with; owner question.
 //! - **`IADD3.X` and `LEA.X` are bit 74 in every form** (NAK: `set_bit(74, true)`).
-//!   **Conflict**: PR #4588 reads `IADD3.X` as source 2's absolute-value bit and `LEA.X` as
-//!   bit 74 but then refuses source 1's absolute value (`Visitor::IADD3`, `Visitor::LEA`), which
-//!   in forms 2, 3 and 7 is the same bit 74 (`IADD3`: bit 62 in forms 3 and 7, nothing in form
-//!   2). NAK wins (spec: the decoder is the inverse of NAK's encoder).
+//!   **Conflict**: PR #4588 reads `IADD3.X` as source 2's absolute-value bit (`Visitor::IADD3`:
+//!   `extended = c.abs`), which is bit 74 in forms 1, 4, 5 and 6, bit 62 in forms 3 and 7 and no
+//!   bit in form 2, and it refuses source 1's, which is bit 74 in forms 2, 3 and 7; it reads
+//!   `LEA.X` as bit 74 (`Visitor::LEA`: `carry_in = Take(74, 1)`) but refuses `b`'s absolute
+//!   value (`Require(!b.abs)`), the same bit in forms 2, 3 and 7. NAK wins (spec: the decoder is
+//!   the inverse of NAK's encoder); owner question.
 //! - **`IDP`'s bit 76** is PR #4588's `.2A` mode (`Visitor::IDP`: "IDP.2A.LO.U16.U8"), read in
 //!   form 1 only, the one row that marks it (`0x226`); NAK's `OpIDp4` is the `.4A` mode with the
 //!   bit clear. The text `idp.2a.lo` and the type names in that mode are guesses.
@@ -81,9 +83,9 @@
 //! |---|---|---|
 //! | Forms 2, 3 and 7 of `SEL`, `ISETP`, `IABS`, `IMNMX`, `SGXT`, `BMSK`, `FLO`, `BREV` and `POPC` | Unknown opcodes: without source 2, NAK's `encode_alu` puts source 1 in the wide slot, which only forms 1, 4, 5 and 6 have (as for `MOV`) | `decode::tests::integer::integer_rows_left_undecoded_are_unknown_opcodes` |
 //! | The absolute-value bits of integer sources (62, 73, 74) where they are not a field | Rejected (see "Source modifiers"); PR #4588's translator refuses them too where it reads them (`Visitor::IADD3`, `IMAD`, `LEA`, `IMAD_WIDE`) | `integer_dropped_bits_are_refused` |
-//! | The negation bits of sources that have none (see the table above) | Rejected: NAK writes them clear; PR #4588 refuses them (`SHF`, `IMNMX`, `PRMT`, `IMAD_WIDE`, `LOP3`, `SEL` and the one-source instructions read their sources without modifiers) | `integer_dropped_bits_are_refused` |
+//! | The negation bits of sources that have none (see the table above) | Rejected: NAK writes them clear; PR #4588's translator does not take them (`ISETP`, `SHF`, `IMNMX`, `PRMT`, `LOP3`, `SEL`, `SGXT`, `IABS` and `IMAD_HI` read their sources with `Source(.., false)`, `BREV` reads bits 32..40 alone) or requires them clear (`IMAD_WIDE`); it has no translator for `BMSK` | `integer_dropped_bits_are_refused` |
 //! | `LOP3`'s bit 80 (`.PAND`) | Rejected: NAK writes it clear, PR #4588 requires it clear | `integer_dropped_bits_are_refused` |
-//! | `IDP`'s bits 72 to 75 in its `.2A` mode | Read as in `.4A` (PR #4588 requires them clear) | `hand_built_integer_words_decode` |
+//! | `IDP`'s bits 72 to 75 in its `.2A` mode | Read as in `.4A` (PR #4588 requires them clear) | `decode::tests::integer::hand_built_words_pin_each_field` |
 //! | `P2R`'s and `R2P`'s bit 39, `R2P`'s bits 16..24 | Rejected: PR #4588's translator requires them clear (`Visitor::P2R`, `Visitor::R2P`) though its rows mark them known | `integer_dropped_bits_are_refused` |
 //! | `MOV`'s bits 62 and 63 | Rejected (see `MOV`, below) | `decode::tests::mov_rejects_source_modifier_bits` |
 //!
