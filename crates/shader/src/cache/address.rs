@@ -78,11 +78,6 @@ impl AddressMap {
         self.entries.insert(key(request), entry);
     }
 
-    /// Forgets `request`'s entry.
-    pub(super) fn remove(&mut self, request: ProgramRequest) {
-        self.entries.remove(&key(request));
-    }
-
     /// How many entries the map holds.
     pub(super) fn len(&self) -> usize {
         self.entries.len()
