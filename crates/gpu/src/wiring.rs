@@ -183,11 +183,11 @@ use crate::back::exec::{ExecConfig, Executor, ShaderCache};
 use crate::back::fence::{FenceClock, FenceEnv, Fences, FrontWake, Mode, Report};
 use crate::channel::ChannelError;
 use crate::front::Front;
-use crate::front::{QuietWake, QuietWakeTaken};
 use crate::front::{
     FrontClock, FrontCounters, FrontDeps, FrontError, FrontShared, FrontThread, HostClock,
     OrderedTable, POLL_LONGEST_SLEEP, spawn_observed,
 };
+use crate::front::{QuietWake, QuietWakeTaken};
 use crate::interface::{
     AsId, ChannelConfig, ChannelFront, ChannelId, Completions, GpuCompletion, GpuError, GpuFront,
     GpuVmFront, PresentFront, PresentRequest, Submission, Submitted, Ticket, VmUpdate,

@@ -161,7 +161,10 @@ fn the_production_front_thread_tells_its_one_quiet_wake() {
     let r = rig();
     let first = Arc::new(QuietCount::default());
     let second = Arc::new(QuietCount::default());
-    assert_eq!(r.gpu.set_quiet_wake(Arc::<QuietCount>::clone(&first)), Ok(()));
+    assert_eq!(
+        r.gpu.set_quiet_wake(Arc::<QuietCount>::clone(&first)),
+        Ok(())
+    );
     assert_eq!(
         r.gpu.set_quiet_wake(Arc::<QuietCount>::clone(&second)),
         Err(QuietWakeTaken)
