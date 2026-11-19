@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use proptest::prelude::*;
 use proptest::test_runner::{Config as ProptestConfig, RngSeed};
+use starquake_layout::SampleLayout;
 use starquake_memory::{FlatMemory, PAGE_SIZE, PageRange, WriteWatch};
 use starquake_render::caps::{DynamicState, StageSupport};
 use starquake_render::command::TextureRegion;
@@ -122,7 +123,12 @@ struct Rig {
 
 impl Rig {
     fn new() -> Self {
-        let backend = Arc::new(RecordingBackend::new(caps(), 1 << 40));
+        Self::with_caps(caps())
+    }
+
+    /// A rig whose backend reports `caps`.
+    fn with_caps(caps: Caps) -> Self {
+        let backend = Arc::new(RecordingBackend::new(caps, 1 << 40));
         let dyn_backend: Arc<dyn Backend> = Arc::<RecordingBackend>::clone(&backend);
         let watch = Arc::new(WriteWatch::new());
         Self {
@@ -194,14 +200,27 @@ impl Rig {
     /// Colour target `index` at `address`, [`WIDTH`] by [`HEIGHT`], block-linear, of `layers`
     /// layers and header format `format`.
     fn color_target(&mut self, index: u32, address: u64, format: u32, layers: u32) {
+        self.color_target_sized(index, address, format, layers, WIDTH, HEIGHT);
+    }
+
+    /// Colour target `index` as [`Rig::color_target`], `width` by `height`.
+    fn color_target_sized(
+        &mut self,
+        index: u32,
+        address: u64,
+        format: u32,
+        layers: u32,
+        width: u32,
+        height: u32,
+    ) {
         self.address(
             &clc797::SET_COLOR_TARGET_A,
             &clc797::SET_COLOR_TARGET_B,
             &[index],
             address,
         );
-        self.set(&clc797::SET_COLOR_TARGET_WIDTH, &[index], WIDTH);
-        self.set(&clc797::SET_COLOR_TARGET_HEIGHT, &[index], HEIGHT);
+        self.set(&clc797::SET_COLOR_TARGET_WIDTH, &[index], width);
+        self.set(&clc797::SET_COLOR_TARGET_HEIGHT, &[index], height);
         self.set(&clc797::SET_COLOR_TARGET_FORMAT, &[index], format);
         self.set(&clc797::SET_COLOR_TARGET_THIRD_DIMENSION, &[index], layers);
     }
@@ -1520,7 +1539,8 @@ fn stencil_registers_are_their_low_byte() {
     );
     let draw = rig.draws_of().pop().unwrap();
     assert_eq!(draw.dynamic.stencil_write_mask, 0xfe);
-    assert_eq!(draw.dynamic.stencil_read_mask, 0xc3);
+    // `SET_STENCIL_FUNC_MASK` is not read: the compare is `ALWAYS` (module docs).
+    assert_eq!(draw.dynamic.stencil_read_mask, STENCIL_READ_MASK);
     assert_eq!(draw.dynamic.stencil_reference, 0xab);
 }
 
@@ -1989,4 +2009,391 @@ fn clears_are_counted() {
             failed: 1,
         }
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Partial-area clears the render backend clears only whole, the render area's targets, and the
+// draw-based clear's keys.
+
+/// The caps of [`caps`] with four samples allowed too.
+fn msaa_caps() -> Caps {
+    Caps {
+        sample_counts: SampleCounts::X1.union(SampleCounts::X4),
+        ..caps()
+    }
+}
+
+/// `SET_ANTI_ALIAS` with four samples per pixel, 2 by 2.
+fn four_samples(rig: &mut Rig) {
+    rig.set(
+        &clc797::SET_ANTI_ALIAS,
+        &[],
+        fields(&[(
+            clc797::SET_ANTI_ALIAS_SAMPLES,
+            clc797::SET_ANTI_ALIAS_SAMPLES_MODE_2X2,
+        )]),
+    );
+}
+
+/// The entry point of the fragment shader of pipeline `id`, from the recording backend's text.
+fn fragment_entry(snapshot: &str, id: PipelineId) -> String {
+    let line = pipeline_line(snapshot, id);
+    let shader = line
+        .split("fragment ")
+        .nth(1)
+        .and_then(|rest| rest.split(',').next())
+        .unwrap();
+    let name = format!("create {shader}: shader fragment \"");
+    let created = snapshot.lines().find(|l| l.starts_with(&name)).unwrap();
+    created[name.len()..].split('"').next().unwrap().to_owned()
+}
+
+/// The only draw appended so far.
+fn only_draw(rig: &Rig) -> DrawDesc {
+    let draws = rig.draws_of();
+    assert_eq!(draws.len(), 1, "{:?}", rig.kinds());
+    draws[0].clone()
+}
+
+#[test]
+fn golden_scissored_depth() {
+    let mut rig = Rig::new();
+    rig.depth_target(clc797::SET_ZT_FORMAT_V_ZF32, WIDTH, HEIGHT, 1);
+    rig.clear_depth(0.5);
+    rig.scissor(1, 5, 2, 4);
+    assert_eq!(
+        rig.clear(depth_stencil(true, false)),
+        Cleared {
+            color: None,
+            depth_stencil: Some(Part::Drawn),
+        }
+    );
+    // No clear command: the wgpu backend clears a depth view only whole.
+    assert_eq!(rig.clears(), []);
+    let draw = only_draw(&rig);
+    assert_eq!(
+        draw.dynamic.scissors,
+        [Rect {
+            x: 1,
+            y: 2,
+            width: 4,
+            height: 2
+        }]
+    );
+    insta::assert_snapshot!(rig.submit());
+}
+
+#[test]
+fn golden_depth_larger_than_the_render_area() {
+    let mut rig = Rig::new();
+    rig.basic();
+    rig.depth_target(clc797::SET_ZT_FORMAT_V_ZF32_X24S8, WIDTH * 2, HEIGHT * 2, 1);
+    rig.clear_color([0.0, 1.0, 0.0, 1.0]);
+    rig.clear_depth(0.5);
+    rig.clear_stencil(0x5a, FULL_STENCIL_MASK, 0x3c);
+    let surface = ClearSurface {
+        depth: true,
+        stencil: true,
+        color: ColorWrites::ALL,
+        target: 0,
+        layer: 0,
+    };
+    assert_eq!(
+        rig.clear(surface),
+        Cleared {
+            color: Some(Part::Cleared),
+            depth_stencil: Some(Part::Drawn),
+        }
+    );
+    // The colour target is the render area, so its clear is whole; the depth target is twice
+    // as large, so its part of the area is drawn, writing every stencil bit.
+    let clears = rig.clears();
+    assert_eq!(clears.len(), 1);
+    assert_eq!(clears[0].rect, None);
+    assert!(matches!(clears[0].value, ClearValue::Float(_)));
+    let draw = only_draw(&rig);
+    assert_eq!(
+        draw.dynamic.scissors,
+        [Rect {
+            x: 0,
+            y: 0,
+            width: WIDTH,
+            height: HEIGHT
+        }]
+    );
+    assert_eq!(draw.dynamic.stencil_write_mask, FULL_STENCIL_MASK);
+    assert_eq!(draw.dynamic.stencil_reference, 0x5a);
+    insta::assert_snapshot!(rig.submit());
+}
+
+#[test]
+fn golden_scissored_msaa() {
+    let mut rig = Rig::with_caps(msaa_caps());
+    four_samples(&mut rig);
+    rig.basic();
+    rig.clear_color([0.0, 0.0, 1.0, 1.0]);
+    rig.scissor(1, 5, 2, 4);
+    assert_eq!(
+        rig.clear(color(ColorWrites::ALL)),
+        Cleared {
+            color: Some(Part::Drawn),
+            depth_stencil: None,
+        }
+    );
+    // No clear command: the wgpu backend clears a multisampled view only whole.
+    assert_eq!(rig.clears(), []);
+    let draw = only_draw(&rig);
+    let snapshot = rig.submit();
+    let samples = format!("{} samples", SampleLayout::S2x2.samples());
+    assert!(pipeline_line(&snapshot, draw.pipeline).contains(&samples));
+    insta::assert_snapshot!(snapshot);
+}
+
+#[test]
+fn a_whole_multisampled_clear_is_a_clear_command() {
+    let mut rig = Rig::with_caps(msaa_caps());
+    four_samples(&mut rig);
+    rig.basic();
+    assert_eq!(rig.clear(color(ColorWrites::ALL)), ONLY_COLOR);
+    assert_eq!(rig.clears()[0].rect, None);
+    assert_eq!(rig.draws_of(), []);
+    let target = rig
+        .textures
+        .entries()
+        .find(|e| e.info.address == TARGET0)
+        .unwrap()
+        .info;
+    assert_eq!(target.samples, SampleLayout::S2x2);
+}
+
+#[test]
+fn a_masked_multisampled_clear_draws_with_the_targets_samples() {
+    let mut rig = Rig::with_caps(msaa_caps());
+    four_samples(&mut rig);
+    rig.basic();
+    assert_eq!(rig.clear(color(ColorWrites::RED)).color, Some(Part::Drawn));
+    let draw = only_draw(&rig);
+    let snapshot = rig.submit();
+    let samples = format!("{} samples", SampleLayout::S2x2.samples());
+    assert!(
+        pipeline_line(&snapshot, draw.pipeline).contains(&samples),
+        "{snapshot}"
+    );
+    let texture = snapshot
+        .lines()
+        .find(|l| l.starts_with("create t0:"))
+        .unwrap();
+    assert!(texture.contains(&samples), "{texture}");
+}
+
+#[test]
+fn a_partial_area_depth_stencil_draw_writes_only_the_aspects_asked() {
+    // (depth asked, stencil asked, stencil mask): the pipeline's depth write and stencil state.
+    for (depth, stencil, mask, depth_state, stencil_state) in [
+        (
+            true,
+            false,
+            FULL_STENCIL_MASK,
+            "depth_test: Some(Always), depth_write: true",
+            "stencil: None",
+        ),
+        (
+            false,
+            true,
+            FULL_STENCIL_MASK,
+            "depth_test: None, depth_write: false",
+            "write_mask: 255",
+        ),
+        // A mask of 0 is a full clear (Eden's `stencil_partial`), so every bit is written.
+        (
+            false,
+            true,
+            0,
+            "depth_test: None, depth_write: false",
+            "write_mask: 255",
+        ),
+        (
+            true,
+            true,
+            0x0f,
+            "depth_test: Some(Always), depth_write: true",
+            "write_mask: 15",
+        ),
+    ] {
+        let mut rig = Rig::new();
+        rig.depth_target(clc797::SET_ZT_FORMAT_V_ZF32_X24S8, WIDTH, HEIGHT, 1);
+        rig.clear_depth(0.5);
+        rig.clear_stencil(0x44, mask, 0x3c);
+        rig.scissor(1, 5, 2, 4);
+        assert_eq!(
+            rig.clear(depth_stencil(depth, stencil)).depth_stencil,
+            Some(Part::Drawn)
+        );
+        assert_eq!(rig.clears(), []);
+        let draw = only_draw(&rig);
+        let snapshot = rig.submit();
+        let line = pipeline_line(&snapshot, draw.pipeline);
+        assert!(line.contains(depth_state), "{line}");
+        assert!(line.contains(stencil_state), "{line}");
+    }
+}
+
+#[test]
+fn the_render_area_is_over_the_unmapped_colour_targets() {
+    // `SET_CT_SELECT`: one target, output 0 drawing to colour target 1.
+    let map_to_one = |rig: &mut Rig| {
+        let word = fields(&[
+            (clc797::SET_CT_SELECT_TARGET_COUNT, 1),
+            (clc797::SET_CT_SELECT_TARGET0, 1),
+        ]);
+        rig.set(&clc797::SET_CT_SELECT, &[], word);
+    };
+    let format = clc797::SET_COLOR_TARGET_FORMAT_V_A8B8G8R8;
+    // Target 0 smaller than target 1: the clear of target 0 is whole, and the list submits.
+    let mut rig = Rig::new();
+    rig.color_target_sized(0, TARGET0, format, 1, WIDTH / 2, HEIGHT / 2);
+    rig.color_target(1, TARGET1, format, 1);
+    map_to_one(&mut rig);
+    assert_eq!(rig.clear(color(ColorWrites::ALL)), ONLY_COLOR);
+    assert_eq!(rig.clears()[0].rect, None);
+    let list = core::mem::take(&mut rig.list);
+    assert!(rig.backend.submit(list).is_ok());
+    // Target 0 larger than target 1: target 1 does not bound the area, so the clear is whole.
+    let mut rig = Rig::new();
+    rig.color_target(0, TARGET0, format, 1);
+    rig.color_target_sized(1, TARGET1, format, 1, WIDTH / 2, HEIGHT / 2);
+    map_to_one(&mut rig);
+    assert_eq!(rig.clear(color(ColorWrites::ALL)), ONLY_COLOR);
+    assert_eq!(rig.clears()[0].rect, None);
+    // Target 1 made part of the count bounds it.
+    rig.ct_select(2);
+    assert_eq!(rig.clear(color(ColorWrites::ALL)), ONLY_COLOR);
+    assert_eq!(
+        rig.clears()[1].rect,
+        Some(Rect {
+            x: 0,
+            y: 0,
+            width: WIDTH / 2,
+            height: HEIGHT / 2
+        })
+    );
+}
+
+#[test]
+fn the_surface_clip_does_not_bound_the_clear() {
+    let mut rig = Rig::new();
+    rig.basic();
+    rig.surface_clip(WIDTH / 2, HEIGHT / 2);
+    assert_eq!(rig.clear(color(ColorWrites::ALL)), ONLY_COLOR);
+    assert_eq!(rig.clears()[0].rect, None);
+}
+
+#[test]
+fn a_signed_then_unsigned_masked_clear_each_take_their_entry_point() {
+    let mut rig = Rig::new();
+    rig.color_target(
+        0,
+        TARGET0,
+        clc797::SET_COLOR_TARGET_FORMAT_V_AS8BS8GS8RS8,
+        1,
+    );
+    rig.ct_select(1);
+    assert_eq!(rig.clear(color(ColorWrites::RED)).color, Some(Part::Drawn));
+    rig.set(
+        &clc797::SET_COLOR_TARGET_FORMAT,
+        &[0],
+        clc797::SET_COLOR_TARGET_FORMAT_V_AU8BU8GU8RU8,
+    );
+    assert_eq!(rig.clear(color(ColorWrites::RED)).color, Some(Part::Drawn));
+    let draws = rig.draws_of();
+    assert_eq!(draws.len(), 2);
+    let snapshot = rig.submit();
+    assert_eq!(
+        fragment_entry(&snapshot, draws[0].pipeline),
+        host_shaders::clear::FRAGMENT_COLOR_SINT
+    );
+    assert_eq!(
+        fragment_entry(&snapshot, draws[1].pipeline),
+        host_shaders::clear::FRAGMENT_COLOR_UINT
+    );
+}
+
+#[test]
+fn a_stencil_only_word_skipped_before_the_targets_reports_its_part() {
+    let stencil = depth_stencil(false, true);
+    // Conditional render off.
+    let mut rig = Rig::new();
+    rig.depth_target(clc797::SET_ZT_FORMAT_V_S8, WIDTH, HEIGHT, 1);
+    rig.set(
+        &clc797::SET_RENDER_ENABLE_C,
+        &[],
+        clc797::SET_RENDER_ENABLE_C_MODE_FALSE,
+    );
+    assert_eq!(
+        rig.clear(stencil),
+        Cleared {
+            color: None,
+            depth_stencil: Some(Part::Skipped(ClearSkip::RenderDisabled)),
+        }
+    );
+    // On again, with an empty scissor.
+    rig.set(
+        &clc797::SET_RENDER_ENABLE_C,
+        &[],
+        clc797::SET_RENDER_ENABLE_C_MODE_TRUE,
+    );
+    rig.scissor(5, 3, 1, 4);
+    assert_eq!(
+        rig.clear(stencil),
+        Cleared {
+            color: None,
+            depth_stencil: Some(Part::Skipped(ClearSkip::EmptyArea)),
+        }
+    );
+    assert_eq!(rig.commands().len(), 0);
+    assert_eq!(
+        rig.draws.clear_counters(),
+        ClearCounters {
+            words: 2,
+            skipped: 2,
+            ..ClearCounters::default()
+        }
+    );
+}
+
+#[test]
+fn masked_stencil_clears_under_any_func_mask_share_one_pipeline() {
+    let mut rig = Rig::new();
+    rig.depth_target(clc797::SET_ZT_FORMAT_V_S8, WIDTH, HEIGHT, 1);
+    for func_mask in [0x00, 0x3c, FULL_STENCIL_MASK] {
+        rig.clear_stencil(0x44, 0x0f, func_mask);
+        assert_eq!(
+            rig.clear(depth_stencil(false, true)).depth_stencil,
+            Some(Part::Drawn)
+        );
+    }
+    assert_eq!(rig.draws.clear_pipelines(), 1);
+    // The compare is `ALWAYS`, so the read mask is the fixed full mask whatever the register.
+    for draw in rig.draws_of() {
+        assert_eq!(draw.dynamic.stencil_read_mask, FULL_STENCIL_MASK);
+    }
+}
+
+#[test]
+fn every_integer_colour_target_format_has_a_component_width() {
+    // `color_value`'s 0-bit fallback is unreachable: every integer format a colour target can
+    // have is in Eden's table.
+    let mut integers = 0;
+    for value in 0..=clc797::SET_COLOR_TARGET_FORMAT_V.max() {
+        if let Ok(Some(format)) = targets::color_format(value)
+            && format.is_integer()
+        {
+            integers += 1;
+            assert!(
+                integer_component_bits(format).is_some(),
+                "{value:#x} {format:?}"
+            );
+        }
+    }
+    assert!(integers > 0);
 }

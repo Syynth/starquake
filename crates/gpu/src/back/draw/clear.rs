@@ -3,9 +3,10 @@
 //! spec, "Clears" and slice G24; decided by the owner, 2026-11-19, ruling 9).
 //!
 //! The executor hands every word written to `CLEAR_SURFACE` to [`super::Draws::method`], which
-//! clears through [`Clears`]. A clear reads the register file the way a draw does: the targets
-//! G18 binds ([`super::targets`]), scissor 0 ([`super::fixed::guest_scissor`]), and the clear
-//! values, through G10's mirror ([`Mirror::reg`]).
+//! clears through [`Clears`]. A clear reads the register file the way a draw does: the target
+//! images through G18's decoders ([`super::targets`]), scissor 0
+//! ([`super::fixed::guest_scissor`]), and the clear values, through G10's mirror
+//! ([`Mirror::reg`]).
 //!
 //! # A clear, step by step
 //!
@@ -21,48 +22,72 @@
 //!    `use_stencil`). A word asking for none does nothing ([`Cleared::NOTHING`]).
 //! 3. **The area**: with `SET_CLEAR_SURFACE_CONTROL`'s `USE_SCISSOR0` (Eden's
 //!    `clear_control.use_scissor`), scissor 0 as Eden's `GetScissorState(regs, 0)` gives it;
-//!    otherwise the whole target. Then it is clamped to the render area, the smallest width and
-//!    height of the targets G18 binds (Eden's `Framebuffer::RenderArea`, the minimum over its
-//!    attachments in `vk_texture_cache.cpp`), as Eden's `clamp_rect_to_render_area`; an empty
-//!    area does nothing ([`ClearSkip::EmptyArea`]).
+//!    otherwise the whole target. Then it is clamped to the render area, as Eden's
+//!    `clamp_rect_to_render_area`: the smallest width and height of colour targets 0 to
+//!    `SET_CT_SELECT`'s count, not through its map, whose format is not `DISABLED`, and of the
+//!    depth target when `SET_ZT_SELECT`'s count is not 0. Those are the attachments of Eden's
+//!    framebuffer (`UpdateRenderTargets` fills it with `FindColorBuffer(index)` for each index,
+//!    which gives no view at or past the count), whose `Framebuffer::RenderArea` is their minimum
+//!    (`CreateFramebuffer` in `vk_texture_cache.cpp`); so the area never extends past the
+//!    cleared colour target, which is one of them (`tests::the_render_area_is_over_the_unmapped_colour_targets`).
+//!    Eden's area is also bounded by `SET_SURFACE_CLIP`, which is not read here (under
+//!    "Divergences"). An empty area does nothing ([`ClearSkip::EmptyArea`]).
 //! 4. **Colour** ([`ClearSurface::target`] is `MRT_SELECT`, Eden's `clear_surface.RT`): colour
 //!    target `MRT_SELECT` itself, not through `SET_CT_SELECT`'s map, when it is below
 //!    `SET_CT_SELECT`'s count and its format is not `DISABLED` (Eden's `FindColorBuffer(index)`
 //!    and `HasAspectColorBit`); otherwise nothing ([`ClearSkip::NotBound`]). The value is
 //!    `SET_COLOR_CLEAR_VALUE(0..3)` as floats, converted for an integer format by Eden's
-//!    formula ([`color_value`]). All four channels: a [`Command::Clear`]; some: a draw
-//!    ([`Part::Drawn`], below), as Eden's `blit_image.ClearColor`.
+//!    formula ([`color_value`]). All four channels: a [`Command::Clear`], unless the area is part
+//!    of a multisampled target ("Partial clears", below); some: a draw ([`Part::Drawn`], below),
+//!    as Eden's `blit_image.ClearColor`.
 //! 5. **Depth and stencil**: the depth target G18 binds (`SET_ZT_SELECT`'s count not 0, Eden's
 //!    `FindDepthBuffer`), the aspects asked that its format has (Eden's `HasAspectDepthBit`,
 //!    `HasAspectStencilBit`; none is [`ClearSkip::NoAspect`]). Depth is `SET_Z_CLEAR_VALUE`,
 //!    stencil `SET_STENCIL_CLEAR_VALUE`. A stencil clear whose `SET_STENCIL_MASK` is neither
 //!    `0xff` nor 0 is a draw writing through that mask, as Eden's `blit_image.ClearDepthStencil`
-//!    (with depth too when depth is asked); otherwise a [`Command::Clear`].
+//!    (with depth too when depth is asked); otherwise a [`Command::Clear`] when the area covers
+//!    the depth target, and a draw when it is part of it ("Partial clears", below).
 //!
 //! Colour comes before depth and stencil in the list, as in Eden.
 //!
 //! The clear of one target and layer is [`Command::Clear`] of a view of that layer
 //! ([`crate::back::texture::TextureCache::render_target_layer`]): the target's own view when
-//! it has one layer, so clears and draws share it. The rectangle is `None` when the clamped area covers the target.
+//! it has one layer, so clears and draws share it. The rectangle is `None` when the clamped area
+//! covers the target.
 //! Resolving a target marks it GPU-modified and uploads it first if guest memory is newer, as
 //! for a draw (`back::texture`, "Uses and uploads").
 //!
+//! # Partial clears
+//!
+//! The wgpu render backend clears a depth, stencil or multisampled view only whole: a clear
+//! with a rectangle that does not cover such a view fails the whole list
+//! (`render-wgpu`'s `rules::check_clear_area` and its `WHOLE_CLEAR` message). So a clear whose
+//! area is part of a depth target, or part of a multisampled colour target, is drawn (below)
+//! instead of being a [`Command::Clear`] with a rectangle; the pixels are the same. Only a
+//! single-sampled colour target is cleared in part by a [`Command::Clear`] with a rectangle.
+//! `tests::golden_scissored_depth`, `tests::golden_depth_larger_than_the_render_area`,
+//! `tests::golden_scissored_msaa`.
+//!
 //! # The draw-based clear
 //!
-//! The render backend's [`ClearDesc`] has no write mask, so a masked clear is drawn with the
-//! render crate's clear shader ([`HostShader::Clear`], ported from the Eden shaders that
-//! `blit_image` draws with): one triangle covering the target, the clear area as the scissor,
-//! the value in a 16-byte uniform buffer, and
+//! The render backend's [`ClearDesc`] has no write mask, so a masked clear, and a partial clear
+//! of a target a clear command clears only whole, is drawn with the render crate's clear shader
+//! ([`HostShader::Clear`], ported from the Eden shaders that `blit_image` draws with): one
+//! triangle covering the target, the clear area as the scissor, the value in a 16-byte uniform
+//! buffer, the pipeline of the target's own sample count, and
 //!
 //! - for colour, the target alone at colour slot 0, written through the channels asked
 //!   ([`ColorWrites`]), by the fragment entry point of the target's kind (float, signed or
 //!   unsigned integer);
-//! - for depth and stencil, the depth target alone, the stencil test `ALWAYS` with `REPLACE` on
-//!   pass, the reference the clear value, the write mask `SET_STENCIL_MASK` and the compare mask
-//!   `SET_STENCIL_FUNC_MASK`, and depth written with the test `ALWAYS` only when depth is asked
-//!   (Eden's `FindOrEmplaceClearStencilPipeline`). The fragment stage writes the depth value
+//! - for depth and stencil, the depth target alone, and depth written with the test `ALWAYS`
+//!   only when depth is asked (Eden's `FindOrEmplaceClearStencilPipeline`). When stencil is
+//!   asked, the stencil test is `ALWAYS` with `REPLACE` on pass, the reference the clear value,
+//!   the write mask `SET_STENCIL_MASK` when it is partial and `0xff` otherwise (a full clear
+//!   writes every bit), and the read mask [`STENCIL_READ_MASK`]; when it is not, the pipeline
+//!   has no stencil state, so the stencil is kept. The fragment stage writes the depth value
 //!   when the format has depth; a stencil-only target has no fragment stage
 //!   ([`host_shaders::clear::FRAGMENT_DEPTH`] says why).
+//!   `tests::a_partial_area_depth_stencil_draw_writes_only_the_aspects_asked`.
 //!
 //! The draw sets its own render targets ([`Command::SetRenderTargets`]), so the next guest draw
 //! sets the guest's again. Its pipelines are made through the backend and kept, at most
@@ -75,12 +100,16 @@
 //!
 //! gpu-protocol's slice table gives G24's test as "a whole-target clear of colour, depth and
 //! stencil each, and a masked and a scissored clear that become draws". Here a scissored clear
-//! with every channel is a [`Command::Clear`] with a rectangle, since the render backend's clear
-//! takes one ("colour, depth, stencil; whole or rect", render-backend, "Commands"), as the
+//! of a single-sampled colour target with every channel is a [`Command::Clear`] with a
+//! rectangle, since the render backend's clear takes one ("colour, depth, stencil; whole or
+//! rect", render-backend, "Commands") and the wgpu backend clears part of such a view, as the
 //! spec's "Clears" paragraph allows ("a draw when the clear is masked or scissored in a way a
 //! render-pass clear cannot express") and issue #428 asks ("a clear rectangle where the backend
-//! can"). Only a masked clear is a draw. An **owner question**: whether the table's wording
-//! should follow. `tests::golden_scissored`, `tests::golden_masked`.
+//! can"). A masked clear is a draw, and so is a scissored or otherwise partial clear of a depth,
+//! stencil or multisampled target ("Partial clears"). An **owner question**: whether the
+//! table's wording should follow. `tests::golden_scissored`, `tests::golden_masked`,
+//! `tests::golden_scissored_depth`, `tests::golden_depth_larger_than_the_render_area`,
+//! `tests::golden_scissored_msaa`.
 //!
 //! # Errors and what they leave
 //!
@@ -114,8 +143,8 @@
 //!   `RESPECT_STENCIL_MASK` 0:0, `USE_CLEAR_RECT` 4:4, `USE_SCISSOR0` 8:8,
 //!   `USE_VIEWPORT_CLIP0` 12:12), `SET_COLOR_CLEAR_VALUE(i)` (0x0d80 + 4i), `SET_Z_CLEAR_VALUE`
 //!   (0x0d90, a float in Mesa's `METHOD_IS_FLOAT`), `SET_STENCIL_CLEAR_VALUE` (0x0da0, `V`
-//!   7:0), `SET_STENCIL_MASK` (0x139c, `V` 7:0), `SET_STENCIL_FUNC_MASK` (0x1398, `V` 7:0),
-//!   `SET_SCISSOR_*(0)` (0x0e00 to 0x0e08). Eden's `Maxwell3D::Regs` places the same registers
+//!   7:0), `SET_STENCIL_MASK` (0x139c, `V` 7:0), `SET_STENCIL_FUNC_MASK` (0x1398, `V` 7:0; not
+//!   read, under "Divergences"), `SET_SCISSOR_*(0)` (0x0e00 to 0x0e08). Eden's `Maxwell3D::Regs` places the same registers
 //!   at the same offsets (`ASSERT_REG_POSITION` in `eden-nx2/src/video_core/engines/maxwell_3d.h`)
 //!   and its `ClearSurface` and `ClearControl` bit fields match. Pinned against these literals
 //!   by `tests::clear_registers_are_where_the_header_puts_them`.
@@ -163,6 +192,21 @@
 //!   them (a mask word of `0x1ff` is partial there and full here; Eden's draw then writes
 //!   through `u8(0x1ff)`, all eight bits, so the pixels agree). Decision 10 lets the header
 //!   settle the width. `stencil_registers_are_their_low_byte`.
+//! - **`SET_STENCIL_FUNC_MASK` is not read.** Eden's masked stencil clear sets it as the
+//!   pipeline's compare mask and keys its pipelines on it (`BlitDepthStencilPipelineKey`'s
+//!   `stencil_compare_mask`); with the compare `ALWAYS` the mask reads no bit, so here the read
+//!   mask is the fixed [`STENCIL_READ_MASK`] and a title's stencil-test state cannot multiply
+//!   clear pipelines toward [`MAX_CLEAR_PIPELINES`]. The pixels are the same.
+//!   `masked_stencil_clears_under_any_func_mask_share_one_pipeline`.
+//! - **A partial clear of a depth, stencil or multisampled target is a draw**, where Eden clears
+//!   the rectangle with `ClearAttachments` ("Partial clears"); the pixels are the same.
+//!   `golden_scissored_depth`, `golden_depth_larger_than_the_render_area`,
+//!   `golden_scissored_msaa`.
+//! - **`SET_SURFACE_CLIP` does not bound the render area.** Eden's framebuffer starts its render
+//!   area at the surface clip's width and height (`render_targets.size` in
+//!   `UpdateRenderTargets`) before taking the minimum over its attachments; here only the
+//!   targets bound it, so a surface clip smaller than the targets clears more than Eden.
+//!   `the_surface_clip_does_not_bound_the_clear`.
 //!
 //! # Not read
 //!
@@ -189,9 +233,6 @@
 //!   it. `integer_clear_values_follow_edens_formula`.
 //! - **A 3D target deeper than one slice is skipped** ([`ClearSkip::VolumeTarget`]): which
 //!   slice `RT_ARRAY_INDEX` names, and how the backend would clear one slice, is not built.
-//! - **The render area** is taken over the targets G18 binds, which go through `SET_CT_SELECT`'s
-//!   map; Eden's framebuffer holds colour targets 0 to the count, unmapped. They are the same set
-//!   when the map is a permutation of them, as titles are expected to write it.
 
 #[cfg(test)]
 mod tests;
@@ -205,6 +246,7 @@ use starquake_render::command::{
     Binding, BindingResource, BufferSlice, ClearDesc, ClearValue, CopyRegion, DrawDesc, DrawParams,
     DynamicValues, Rect, RenderTargets, Viewport,
 };
+use starquake_render::format::FormatAspect;
 use starquake_render::host_shaders::{self, OUTPUT_LOCATION};
 use starquake_render::pipeline::{
     BlendComponent, BlendFactor, BlendOperation, BlendState, ColorWrites, CullMode, DepthBias,
@@ -237,6 +279,10 @@ pub const MAX_CLEAR_PIPELINES: usize = 256;
 
 /// The value of a full `SET_STENCIL_MASK`: Eden's `stencil_partial` test compares with `0xFF`.
 pub const FULL_STENCIL_MASK: u32 = 0xff;
+
+/// The draw-based stencil clear's read mask: its compare is `ALWAYS`, which reads no bit, so the
+/// mask is fixed rather than `SET_STENCIL_FUNC_MASK` (module docs, "Divergences").
+pub const STENCIL_READ_MASK: u32 = FULL_STENCIL_MASK;
 
 /// The clear shader's parameter block, in bytes, as an array length.
 const PARAMS_LEN: usize = host_shaders::clear::PARAMS_SIZE as usize;
@@ -444,8 +490,11 @@ impl ClearCounters {
 /// floats (module docs, step 4): the floats for a float or normalised format, else Eden's
 /// conversion by [`integer_component_bits`]: `u32(f32(bits << 1) * value)` for an unsigned
 /// format and `s32(f32((bits - 1) << 1) * (value - 0.5))` for a signed one (a **guess**, module
-/// docs, "Guesses"). An integer format Eden's table does not list converts with 0 bits, as
-/// Eden's `default: return 0`.
+/// docs, "Guesses"). An integer format Eden's table does not list would convert with 0 bits,
+/// which no colour target reaches: every integer format [`super::targets::color_format`] gives
+/// is in the table (`tests::every_integer_colour_target_format_has_a_component_width`). Were one
+/// to, it would diverge from Eden for a signed format: the scale here saturates to 0, where
+/// Eden's `(int_size - 1) << 1` gives -2.
 pub fn color_value(format: PixelFormat, values: [f32; 4]) -> ClearValue {
     if !format.is_integer() {
         return ClearValue::Float(values);
@@ -534,7 +583,6 @@ struct Values {
     depth: f32,
     stencil: u32,
     stencil_mask: u32,
-    stencil_func_mask: u32,
 }
 
 impl Values {
@@ -554,9 +602,6 @@ impl Values {
             stencil_mask: mirror
                 .reg(&clc797::SET_STENCIL_MASK, &[])?
                 .field(clc797::SET_STENCIL_MASK_V)?,
-            stencil_func_mask: mirror
-                .reg(&clc797::SET_STENCIL_FUNC_MASK, &[])?
-                .field(clc797::SET_STENCIL_FUNC_MASK_V)?,
         })
     }
 }
@@ -570,12 +615,12 @@ enum PipelineKey {
         mask: u32,
         samples: u32,
     },
-    /// A depth and stencil clear.
+    /// A depth and stencil clear: depth written when `depth`, stencil through the write mask
+    /// `stencil` when it is `Some`. The stencil read mask is always [`STENCIL_READ_MASK`].
     DepthStencil {
         format: PixelFormat,
         depth: bool,
-        read_mask: u32,
-        write_mask: u32,
+        stencil: Option<u32>,
         samples: u32,
     },
 }
@@ -693,8 +738,6 @@ enum Plan {
 struct Common {
     /// The clear area, clamped to the render area.
     area: Rect,
-    /// The targets' sample count.
-    samples: u32,
     /// The clear values.
     values: Values,
 }
@@ -729,6 +772,18 @@ impl Target {
             height: self.info.height,
         };
         (area != whole).then_some(area)
+    }
+
+    /// The target's samples per pixel.
+    fn samples(&self) -> u32 {
+        self.info.samples.samples()
+    }
+
+    /// Whether a [`Command::Clear`] of `area` can clear it: the area covers it, or it is a
+    /// single-sampled colour target (module docs, "Partial clears").
+    fn clearable(&self, area: Rect) -> bool {
+        self.rect(area).is_none()
+            || (self.info.format.aspect() == FormatAspect::Color && self.samples() == 1)
     }
 }
 
@@ -797,7 +852,7 @@ impl Clears {
         }
         // Step 3.
         let three_d = mirror.three_d()?;
-        let bound = targets::targets(mirror)?;
+        let bound = Framebuffer::read(mirror)?;
         let control =
             ClearControl::from_word(mirror.reg(&clc797::SET_CLEAR_SURFACE_CONTROL, &[])?.word());
         let scissor = if control.use_scissor0() {
@@ -805,16 +860,15 @@ impl Clears {
         } else {
             WHOLE
         };
-        let (width, height) = render_area(&bound);
+        let (width, height) = bound.render_area();
         let Some(area) = clamp_to_area(scissor, width, height) else {
             return Ok(Cleared::skipped(&surface, ClearSkip::EmptyArea));
         };
         let values = Values::read(mirror)?;
-        let samples = bound.formats.sample_count;
 
         // Step 4: the checks, then the target.
         let color = if color_asked {
-            Some(match color_target(mirror, &surface)? {
+            Some(match bound.color_target(&surface) {
                 Ok(target) => {
                     let value = color_value(target.info.format, values.color);
                     Ok((target, value))
@@ -832,11 +886,7 @@ impl Clears {
         };
 
         // Every check passed or skipped; resolve and plan, appending no clear or draw.
-        let common = Common {
-            area,
-            samples,
-            values,
-        };
+        let common = Common { area, values };
         let mut plans: Vec<Plan> = Vec::with_capacity(2);
         let outcome = Cleared {
             color: match color {
@@ -879,7 +929,7 @@ impl Clears {
             .textures
             .render_target_layer(ctx.memory, &target.info, target.layer, ctx.list)?
             .view;
-        if mask == ColorWrites::ALL {
+        if mask == ColorWrites::ALL && target.clearable(common.area) {
             plans.push(Plan::Clear(ClearDesc {
                 target: view,
                 value,
@@ -890,7 +940,7 @@ impl Clears {
         let key = PipelineKey::Color {
             format: target.info.format,
             mask: mask.bits(),
-            samples: common.samples,
+            samples: target.samples(),
         };
         self.push_draw(plans, &key, target, view, value_bits(value), common)
     }
@@ -908,7 +958,7 @@ impl Clears {
             .textures
             .render_target_layer(ctx.memory, &target.info, target.layer, ctx.list)?
             .view;
-        if !part.partial {
+        if !part.partial && target.clearable(common.area) {
             plans.push(Plan::Clear(ClearDesc {
                 target: view,
                 value: part.value(),
@@ -916,12 +966,20 @@ impl Clears {
             }));
             return Ok(Part::Cleared);
         }
+        // A partial mask writes through it; an unmasked stencil (a mask of `0xff` or 0) writes
+        // every bit, as a clear command would.
+        let stencil = part.stencil.map(|_| {
+            if part.partial {
+                common.values.stencil_mask
+            } else {
+                FULL_STENCIL_MASK
+            }
+        });
         let key = PipelineKey::DepthStencil {
             format: target.info.format,
             depth: part.depth.is_some(),
-            read_mask: common.values.stencil_func_mask,
-            write_mask: common.values.stencil_mask,
-            samples: common.samples,
+            stencil,
+            samples: target.samples(),
         };
         let bits = [part.depth.unwrap_or(0.0).to_bits(), 0, 0, 0];
         self.push_draw(plans, &key, target, view, bits, common)
@@ -977,7 +1035,7 @@ impl Clears {
             ));
         };
         slot.copy_from_slice(&bytes);
-        let (targets, bindings, reference) = match key {
+        let (targets, bindings, reference, write_mask) = match *key {
             PipelineKey::Color { .. } => {
                 let mut colors = [None; GUEST_COLOR_TARGETS];
                 colors[0] = Some(view);
@@ -988,9 +1046,12 @@ impl Clears {
                     },
                     vec![params_binding(buffer)],
                     0,
+                    0,
                 )
             }
-            PipelineKey::DepthStencil { format, .. } => (
+            PipelineKey::DepthStencil {
+                format, stencil, ..
+            } => (
                 RenderTargets {
                     colors: [None; GUEST_COLOR_TARGETS],
                     depth_stencil: Some(view),
@@ -1001,6 +1062,7 @@ impl Clears {
                     Vec::new()
                 },
                 values.stencil,
+                stencil.unwrap_or(0),
             ),
         };
         #[expect(
@@ -1025,8 +1087,8 @@ impl Clears {
                 scissors: vec![common.area],
                 blend_constant: [0.0; 4],
                 stencil_reference: reference,
-                stencil_read_mask: values.stencil_func_mask,
-                stencil_write_mask: values.stencil_mask,
+                stencil_read_mask: STENCIL_READ_MASK,
+                stencil_write_mask: write_mask,
                 depth_bias: DepthBias::default(),
                 line_width: 1.0,
             },
@@ -1085,8 +1147,7 @@ impl Clears {
             PipelineKey::DepthStencil {
                 format,
                 depth,
-                read_mask,
-                write_mask,
+                stencil,
                 samples,
             } => {
                 let fragment = if format.has_depth() {
@@ -1106,10 +1167,10 @@ impl Clears {
                     DepthStencilState {
                         depth_test: depth.then_some(CompareFunction::Always),
                         depth_write: depth,
-                        stencil: Some(StencilState {
+                        stencil: stencil.map(|write_mask| StencilState {
                             front: face,
                             back: face,
-                            read_mask,
+                            read_mask: STENCIL_READ_MASK,
                             write_mask,
                         }),
                     },
@@ -1219,38 +1280,57 @@ const NO_BLEND: BlendComponent = BlendComponent {
     op: BlendOperation::Add,
 };
 
-/// The render area (module docs, step 3): the smallest width and height of the bound targets,
-/// or the largest values when none is bound.
-fn render_area(bound: &targets::Targets) -> (u32, u32) {
-    bound
-        .colors
-        .iter()
-        .flatten()
-        .chain(bound.depth.iter())
-        .fold((u32::MAX, u32::MAX), |(w, h), info| {
-            (w.min(info.width), h.min(info.height))
-        })
+/// The targets a clear's render area spans (module docs, step 3), as Eden's framebuffer holds
+/// them: colour targets 0 to `SET_CT_SELECT`'s count, not through its map, and the depth
+/// target.
+struct Framebuffer {
+    /// Colour target `i`'s image, for `i` below the count; `None` past it or when `DISABLED`.
+    colors: [Option<ImageInfo>; GUEST_COLOR_TARGETS],
+    /// The depth target's image, when `SET_ZT_SELECT`'s count is not 0.
+    depth: Option<ImageInfo>,
 }
 
-/// The colour target `surface` names, or why it is skipped (module docs, step 4).
-fn color_target(
-    mirror: &Mirror,
-    surface: &ClearSurface,
-) -> Result<Result<Target, ClearSkip>, DrawError> {
-    let three_d = mirror.three_d()?;
-    let count = three_d.ct_select().target_count()?.min(COLOR_TARGETS);
-    if surface.target >= count {
-        return Ok(Err(ClearSkip::NotBound));
+impl Framebuffer {
+    fn read(mirror: &Mirror) -> Result<Self, DrawError> {
+        let three_d = mirror.three_d()?;
+        let samples = targets::sample_layout(
+            mirror
+                .reg(&clc797::SET_ANTI_ALIAS, &[])?
+                .field(clc797::SET_ANTI_ALIAS_SAMPLES)?,
+        )?;
+        let count = three_d.ct_select().target_count()?.min(COLOR_TARGETS);
+        let mut colors = [None; GUEST_COLOR_TARGETS];
+        for (index, slot) in (0..count).zip(colors.iter_mut()) {
+            *slot = targets::color_target(three_d, index, samples)?;
+        }
+        let depth = if three_d.zt().target_count()? == 0 {
+            None
+        } else {
+            Some(targets::depth_target(three_d, samples)?)
+        };
+        Ok(Self { colors, depth })
     }
-    let samples = targets::sample_layout(
-        mirror
-            .reg(&clc797::SET_ANTI_ALIAS, &[])?
-            .field(clc797::SET_ANTI_ALIAS_SAMPLES)?,
-    )?;
-    let Some(info) = targets::color_target(three_d, surface.target, samples)? else {
-        return Ok(Err(ClearSkip::NotBound));
-    };
-    Ok(Target::check(info, surface.layer))
+
+    /// The render area: the smallest width and height of the targets, or the largest values
+    /// when there is none.
+    fn render_area(&self) -> (u32, u32) {
+        self.colors
+            .iter()
+            .flatten()
+            .chain(self.depth.iter())
+            .fold((u32::MAX, u32::MAX), |(w, h), info| {
+                (w.min(info.width), h.min(info.height))
+            })
+    }
+
+    /// The colour target `surface` names, or why it is skipped (module docs, step 4).
+    fn color_target(&self, surface: &ClearSurface) -> Result<Target, ClearSkip> {
+        let info = usize::try_from(surface.target)
+            .ok()
+            .and_then(|index| self.colors.get(index).copied().flatten())
+            .ok_or(ClearSkip::NotBound)?;
+        Target::check(info, surface.layer)
+    }
 }
 
 /// The depth and stencil part's target, aspects and values, once its checks passed.
@@ -1279,7 +1359,7 @@ impl DepthStencilPart {
 /// The depth and stencil part's checks (module docs, step 5), in order: a bound depth target,
 /// an aspect, the depth value, the target's slices and layers.
 fn depth_stencil_part(
-    bound: &targets::Targets,
+    bound: &Framebuffer,
     surface: &ClearSurface,
     values: &Values,
 ) -> Result<DepthStencilPart, ClearSkip> {
