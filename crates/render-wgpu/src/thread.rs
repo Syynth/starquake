@@ -748,10 +748,14 @@ impl Render {
                 .ok_or("the test target is not a live texture"),
         };
         let shown = dst.and_then(|dst| {
-            let src = self
+            let Some(src) = self
                 .textures
                 .get(source.texture.index(), source.texture.generation())
-                .ok_or("the presented texture had no host object")?;
+            else {
+                self.shared
+                    .host_error(&"a checked texture had no host object");
+                return Err("the presented texture had no host object");
+            };
             self.presenter.blit(
                 &self.device,
                 &self.queue,

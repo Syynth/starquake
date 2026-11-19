@@ -38,7 +38,8 @@
 //!
 //! Both are encoded before anything after the present in the list, and lists are submitted in
 //! order on one queue, so a later command that writes the presented image cannot change what
-//! the window shows ("Submit"; the ordering test in `backend::tests::window` pins it). The
+//! the window shows ("Submit"; pinned by
+//! `backend::tests::window::the_window_shows_the_presented_frame_after_the_image_is_written`). The
 //! window's texture is presented after the list's last submission.
 //!
 //! The backend's sampled copy, the parameter buffer, the shader, the pipelines (one per window
@@ -51,9 +52,14 @@
 //! A present the frame queue keeps is still dropped, counted in its feedback as
 //! `PresentOutcome::Dropped`, when: the window's size has a zero side (minimised); wgpu answers
 //! the acquire with a timeout, an occluded window, a validation error, or an outdated surface
-//! twice in a row ([`crate::present::acquire_action`]); or the surface was lost, which lets it
-//! go, so every later present to it is dropped until the frontend sets a window target again
-//! (on macOS only the main thread may make one).
+//! twice in a row ([`crate::present::acquire_action`]); the presented image is compressed and its
+//! rectangle starts inside a block ([`crate::present::starts_on_block`]); or the surface was
+//! lost, which lets it go, so every later present to it is dropped until the frontend sets a
+//! window target again (on macOS only the main thread may make one). In tests, a stand-in
+//! texture that is no longer live drops its frames too. Two more paths drop a frame, each a
+//! backend bug the tests would show: a presented texture with no host object (counted as a
+//! host error, as `crate::thread` counts every such miss) and a present shader that does not
+//! parse (logged; R4's tests parse it).
 
 use crate::plan::TexelBox;
 use crate::present::{
@@ -380,38 +386,49 @@ impl Presenter {
                 ],
             })
         });
-        let view = dst.create_view(&wgpu::TextureViewDescriptor {
-            format: Some(written),
-            usage: Some(wgpu::TextureUsages::RENDER_ATTACHMENT),
-            dimension: Some(wgpu::TextureViewDimension::D2),
-            base_array_layer: 0,
-            array_layer_count: Some(1),
-            base_mip_level: 0,
-            mip_level_count: Some(1),
-            ..wgpu::TextureViewDescriptor::default()
-        });
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("starquake present"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &view,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
-        pass.set_pipeline(pipeline);
-        pass.set_bind_group(shader::GROUP, &*group, &[]);
-        pass.draw(0..shader::VERTEX_COUNT, 0..1);
-        drop(pass);
+        draw(encoder, dst, written, pipeline, group);
         Ok(())
     }
+}
+
+/// Encodes the blit's render pass into `dst`, written as `format`: cleared to black (the bars
+/// around the image), then the strip drawn with `pipeline` and `group`.
+fn draw(
+    encoder: &mut wgpu::CommandEncoder,
+    dst: &wgpu::Texture,
+    format: wgpu::TextureFormat,
+    pipeline: &wgpu::RenderPipeline,
+    group: &wgpu::BindGroup,
+) {
+    let view = dst.create_view(&wgpu::TextureViewDescriptor {
+        format: Some(format),
+        usage: Some(wgpu::TextureUsages::RENDER_ATTACHMENT),
+        dimension: Some(wgpu::TextureViewDimension::D2),
+        base_array_layer: 0,
+        array_layer_count: Some(1),
+        base_mip_level: 0,
+        mip_level_count: Some(1),
+        ..wgpu::TextureViewDescriptor::default()
+    });
+    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("starquake present"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: &view,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(shader::GROUP, group, &[]);
+    pass.draw(0..shader::VERTEX_COUNT, 0..1);
 }
 
 /// Configures `window`'s surface at `size`.
